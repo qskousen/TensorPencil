@@ -482,6 +482,30 @@ export fn f32_to_h16() callconv(.spirv_kernel) void {
     d.data[idx] = @bitCast(@as(u32, @as(u16, @bitCast(v0))) | (@as(u32, @as(u16, @bitCast(v1))) << 16));
 }
 
+// f32_to_h16_pad: strided variant for the f16-weight coop path (VAE convs):
+// tight [rows][u1] f32 source rows become [*][u2] f16 rows (u2 >= u1, even),
+// zero in the column tail and beyond u3 source rows — the coop GEMM needs
+// k%64 and the im2col patch length is 9*ci, which usually isn't.
+// a = f32 source, d = packed f16 pairs. u0 = out words, u1 = src cols,
+// u2 = dst cols, u3 = src rows, f0 = scale.
+export fn f32_to_h16_pad() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const e0 = idx * 2;
+    const row = e0 / pc.u2;
+    const col = e0 % pc.u2; // u2 is even: e0+1 stays in the same row
+    var out: u32 = 0;
+    inline for (0..2) |j| {
+        const cc = col + j;
+        if (cc < pc.u1 and row < pc.u3) {
+            const v: f16 = @floatCast(a.data[row * pc.u1 + cc] * pc.f0);
+            out |= @as(u32, @as(u16, @bitCast(v))) << (16 * j);
+        }
+    }
+    d.data[idx] = @bitCast(out);
+}
+
 // silu_mul_h16: fused SwiGLU gate + f16 conversion feeding the coop GEMM:
 // d[word] = pack(f16(silu(a)*b*scale)) — skips the f32 intermediate the
 // GEMM conversion would immediately re-read. Same push layout as
@@ -581,6 +605,19 @@ export fn im2col() callconv(.spirv_kernel) void {
         v = a.data[(sy * pc.u3 + sx) * ci + cc];
     }
     d.data[idx] = v;
+}
+
+// bias_compact: after the column-padded coop GEMM, strip the padding and
+// add the conv bias in one pass: d[u3 + i] = a[(i/u1)*u2 + i%u1] + b[i%u1].
+// One thread per real output element. a = padded GEMM out [*][u2],
+// b = bias [u1], d = tight dst. u0 = positions*u1, u1 = co, u2 = n_pad,
+// u3 = dst offset (elements).
+export fn bias_compact() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const cc = idx % pc.u1;
+    d.data[pc.u3 + idx] = a.data[(idx / pc.u1) * pc.u2 + cc] + b.data[cc];
 }
 
 const attn_chunk = 32;

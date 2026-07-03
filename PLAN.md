@@ -269,23 +269,103 @@
          weights: 6144/16384/1536). B slab doubles to 32 KB so the total
          with the A slab is 48 KB = the device max; 2 wgs/SM needs regs
          <= 128/thread — likely requires f16 accumulators (parity risk).
+         LANDED (2026-07-02): buildGemmShared parameterized
+         (warps8/acc_h16 toggles at the top of coopmat.zig; fp8 pipe only,
+         the VAE f16w pipe stays 4-warp since its n_pads aren't %256;
+         dispatch divides rows by coopmat.coop_wgn). Parameterization is
+         regression-clean (parity 0.17520 exact at old-default toggles).
+         Same-session A/B on bench-matmul 4224x6144x6144:
+           4-warp f32-acc baseline:  6.4 ms (49.7 TF/s that session)
+           8-warp f32-acc:           7.5 ms — register-gated as predicted
+             (~165 regs x 256 threads > 1 wg/SM); toggle kept for retest.
+           8-warp + f16 accs:        5.5 ms (57.8 TF/s, 81% of tensor
+             peak) — the occupancy theory pays once regs fit 2 wgs/SM.
+         Step-level (1024px, same-session A/B): matmul 2.24 -> 1.88 s.
+         Numerics: DiT parity 0.17520 -> 0.16875 (marginally BETTER —
+         different rounding, same regime); same-seed image vs f32 accs is
+         compositionally identical at 0.53% mean pixel delta, the same
+         class as our drift vs ComfyUI. The coop matmul unit test gate is
+         now regime-aware (4 f16 ulps of the row's absolute-product sum —
+         rationale in the test). warps8 + acc_h16 are the DEFAULTS now.
+         Residual caveat: f16 accumulators cap at 65504; intermediate
+         sums are bounded by the row's absolute-product sum, fine on real
+         weights (fixture + full images), pathological inputs could
+         saturate — watch for it if future models misbehave.
+         STILL PENDING: 1120x1680 20-step re-baseline + comparison-image
+         regen (blocked on free VRAM — a game held 2.2 GB; estimated step
+         5.85 -> ~5.4 s, gap ~1.42 -> ~1.3x, to be confirmed cold).
       2. Attention residual (~1.5 s at 1120x1680): the S compute runs at
          ~1 TF/s because Q/K cooperative fragment loads are global with
-         12-15 KB row strides. Ideas: stage the K block (16 KB) in shared
-         inside the scores kernel next to the 32 KB S bounce (exactly 48
-         KB), or revisit flash with a 64-q workgroup (Q 16 KB + K 16 KB +
-         S 8 KB = 40 KB, all fragment loads ldmatrix).
-      3. VAE decode residual (~2.5 s): the f32 GEMM runs the ~11 TFLOP of
-         convs at ~7 TF/s; an f16-B variant of the coop kernel (B staging
-         becomes a plain f16 copy like the A slab) would cut decode to
-         ~1 s.
-      4. Cleanup candidates (no perf impact): coopmat.buildGemm (naive
+         12-15 KB row strides. K-STAGING BUILT AND MEASURED NEUTRAL
+         (2026-07-02): buildGemmScores can stage each 64-deep K slab into
+         the first 16 KB of the existing 32 KB S-bounce slab (dead until
+         after the MMAs) — B fragments become ldmatrix-from-shared, zero
+         extra workgroup memory, bit-identical output. Back-to-back A/B at
+         1120x1680: scores ~700 ms/step BOTH ways. So global K fragment
+         loads are NOT the scores bottleneck (same lesson as A-stride-34:
+         the driver's coop global loads are better than theory says).
+         Kept behind coopmat.scores_stage_k = false.
+         FLASH K-STAGING ALSO BUILT AND MEASURED (same day, closing the
+         "staged operands would fix flash" theory): buildFlashAttn gained
+         stage_k (K tile 16 KB next to the 16 KB S tile = 32 KB, 3 wgs/SM
+         vs 6; one shared copy replaces the 4x-redundant per-warp global K
+         fragments). Three-way A/B at 1120x1680, attn per step:
+           two-pass incumbent          1.75 s (scores .70 smax .30 out .73)
+           flash, global K             2.67 s (md .86, out 1.81)
+           flash, staged K             2.64 s (md 1.13, out 1.50)
+         Mechanism now understood: staged K sped the recompute-heavy out
+         pass 17% (loads DO matter there) but slowed the light md pass by
+         the same amount (occupancy 6->3 wgs/SM + copy + barrier), and
+         even a perfect out pass leaves flash ~0.6 s behind — the
+         materialized-f16-S two-pass is simply cheaper than recomputing S
+         twice at these shapes. 64-q/32-q retilings would stage Q too
+         (already known L1-served) at even lower occupancy — dead end,
+         not built. Flash stays behind use_flash=false / flash_stage_k=
+         false; attention micro-optimization is CLOSED on this backend
+         unless the driver's coopmat lowering changes.
+      3. Cleanup candidates (no perf impact): coopmat.buildGemm (naive
          single-tile reference) and the eltwise kernels `modulate`,
          `attention`, `softmax_rows` are dead code now; delete or keep as
          documented references. Also: `zig build test` prints a spurious
          "failed command ... --listen=-" stderr line while the Build
          Summary reports all steps succeeded — pre-existing test-runner
          quirk (binary passes when run directly), not a test failure.
+- [x] VAE convs on tensor cores (lever 3, 2026-07-02): buildGemmShared
+      gained a `b_f16` variant — B staging is a plain uvec4 f16 copy (two
+      quads per 16-element chunk) instead of the SWAR e4m3 decode;
+      everything else (tiling, double buffer, MMA, C store) identical.
+      Weights convert once on the CPU to zero-padded k-major f16
+      (weightBufferF16From32: co pads to the 128 n-tile, 9*ci pads to the
+      64 k-slab; a few MB per conv, cached like the fp8 uploads) and the
+      activation conversion pads the k tail (f32_to_h16_pad — im2col
+      output stays tight). C lands in a column-padded scratch and a new
+      bias_compact eltwise kernel strips the pad + adds the conv bias in
+      one pass into the tight destination. Convs with co >= 96 route to
+      tensor cores (384/192/96 stages); post_quant (16) and the 3-channel
+      head stay on the f32 GEMM. Decode at 1120x1680: 2.5 -> 1.7-1.8 s
+      (the residual includes the one-time CPU weight convert + upload,
+      im2col, norms, and the small non-coop convs). VAE fixture parity
+      2.1e-4 -> 8.6e-4 max_err (f16 weight rounding, same regime as the
+      f16 attention; comparison image delta vs ComfyUI unchanged at
+      0.61%). DiT parity untouched (0.17520). Full 1120x1680 20-step
+      image now ~119-120 s excl. loads (gap ~1.4x, GEMM-bound).
+- [ ] VRAM offloading (ComfyUI-style: exhaustion degrades to slowdown, not a
+      crash). Measured peak is ~17.5 GiB device memory at 1024x1024 (nvidia-smi
+      sampled over a full --gpu run, desktop baseline subtracted), so larger
+      sizes will OOM a 24 GB card that's also driving a desktop. Two stages:
+      1. Quick win: free the DiT session's device weights (~12 GiB) before the
+         VAE uploads — sampling is over by then; peak becomes
+         max(DiT, VAE) instead of the sum. Small change in pipeline.zig.
+      2. Full feature: budget-aware block streaming. The DiT is 28 identical
+         ~440 MB fp8 blocks; keep N resident and stream the rest per step.
+         The math strongly favors this on PCIe 4.0 x16: ~18 ms/block transfer
+         vs ~100 ms/block compute at 1024px, so fully-overlapped streaming is
+         ~free. Needs: VK_EXT_memory_budget query up front (Vulkan gives no
+         graceful OOM — plan, don't react), per-block residency in dit_gpu
+         instead of whole-model, double-buffered weight slots, and a dedicated
+         transfer queue for real overlap (the batched-submission work is the
+         intended foundation). Composes with int8/CONVROT plans (halves
+         streaming bandwidth).
 - [ ] M9 follow-ups:
       * Blocked upstream: NVIDIA 580 faults (DEVICE_LOST) on any Zig-emitted kernel using
         workgroup memory — even spirv-val-clean at workgroup size 1x1; RADV/llvmpipe run the

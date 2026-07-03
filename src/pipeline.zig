@@ -79,16 +79,21 @@ pub fn generate(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*s
     var cond_neg: ?Cond = null;
     {
         try note(progress, "loading text encoder...\n", .{});
+        const load_start = std.Io.Clock.real.now(io);
         var tok = try tokenizer_mod.Tokenizer.init(gpa);
         defer tok.deinit();
         var st = try safetensors.SafeTensors.open(gpa, io, opts.text_encoder_path);
         defer st.deinit();
         var enc = try qwen3.TextEncoder.load(gpa, &st);
         defer enc.deinit();
+        const enc_start = std.Io.Clock.real.now(io);
+        const load_s = @as(f64, @floatFromInt(enc_start.nanoseconds - load_start.nanoseconds)) / 1e9;
+        try note(progress, "text encoder loaded in {d:.1}s\n", .{load_s});
 
         cond_pos = try encodePrompt(io, gpa, &tok, &enc, opts.prompt);
         if (use_cfg) cond_neg = try encodePrompt(io, gpa, &tok, &enc, opts.negative);
-        try note(progress, "encoded prompt ({d} tokens{s})\n", .{ cond_pos.seq, if (use_cfg) " + negative" else "" });
+        const enc_s = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - enc_start.nanoseconds)) / 1e9;
+        try note(progress, "encoded prompt ({d} tokens{s}) in {d:.1}s\n", .{ cond_pos.seq, if (use_cfg) " + negative" else "", enc_s });
     }
     defer gpa.free(cond_pos.data);
     defer if (cond_neg) |c| gpa.free(c.data);
@@ -103,6 +108,7 @@ pub fn generate(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*s
 
     {
         try note(progress, "loading diffusion model...\n", .{});
+        const dit_start = std.Io.Clock.real.now(io);
         var st = try safetensors.SafeTensors.open(gpa, io, opts.dit_path);
         defer st.deinit();
         var dit = try dit_mod.DiT.load(gpa, &st);
@@ -125,6 +131,8 @@ pub fn generate(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*s
                 sess_neg = try dit_gpu.Session.init(gpa, io, gc, &dit, lat_h, lat_w, cond_neg.?.data, cond_neg.?.seq, sigmas);
             }
         }
+        const dit_s = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - dit_start.nanoseconds)) / 1e9;
+        try note(progress, "diffusion model ready in {d:.1}s\n", .{dit_s});
 
         for (0..opts.steps) |i| {
             const start = std.Io.Clock.real.now(io);

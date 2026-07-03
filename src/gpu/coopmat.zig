@@ -321,13 +321,42 @@ pub fn buildGemm(gpa: std.mem.Allocator) ![]align(4) u8 {
 /// loads), 2 = C (f32), 3 = B (raw fp8 viewed as uvec4).
 /// Push: {m, n, k, stride_bytes} u32; n, stride multiples of 128, k a
 /// multiple of 64, m of 128.
-pub fn buildGemmShared(gpa: std.mem.Allocator) ![]align(4) u8 {
-    // A slab geometry: 128 rows x 32 k f16 per sub-slab at base 8192 of the
-    // shared array. The row stride can carry padding to spread shared-memory
-    // banks, but stride 34 measured neutral vs 32 (the driver's coop loads
-    // evidently swizzle already), so no padding.
+/// GEMM occupancy experiment (lever 1) toggles for the fp8 coop pipeline;
+/// the f16-weight (VAE) pipeline always builds 4-warp/f32-acc since its
+/// padded widths aren't 256-multiples. coop_wgn is the wg tile N width the
+/// dispatch must divide rows by.
+pub const coop_warps8 = true;
+pub const coop_acc_h16 = true;
+pub const coop_wgn: u32 = if (coop_warps8) 256 else 128;
+
+/// `b_f16 = false`: B is raw k-major e4m3 (the DiT weights), SWAR-decoded
+/// to f16 in the staging loop. `b_f16 = true`: B is pre-converted k-major
+/// f16 (the VAE conv weights, zero-padded to rows%128 / cols%64 on the
+/// CPU) and staging is a plain uvec4 copy like the A slab. Everything else
+/// (tiling, double buffering, MMA section, C store) is identical.
+///
+/// `warps8`: 2x4 warp grid over a 128x256 wg tile (LocalSize (32,8), B
+/// slabs double to 32 KB -> 48 KB total shared, rows must be %256) instead
+/// of the 2x2 grid over 128x128 (32 KB, 3 wgs/SM). At ~165 regs/thread the
+/// wide tile is register-gated (occupancy experiment — lever 1); pair with
+/// `acc_h16` (f16 accumulators, converted to f32 at the C store) to fit
+/// 2 wgs/SM at <= 128 regs. acc_h16 changes accumulation NUMERICS — gate
+/// any keep on the DiT parity fixture.
+pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h16: bool) ![]align(4) u8 {
+    // A slab geometry: 128 rows x 32 k f16 per sub-slab at base A_BASE of
+    // the shared array. The row stride can carry padding to spread shared-
+    // memory banks, but stride 34 measured neutral vs 32 (the driver's coop
+    // loads evidently swizzle already), so no padding.
     const A_STRIDE: u32 = 32;
     const A_SLAB: u32 = 128 * A_STRIDE;
+    // Workgroup geometry. THREADS == WGN in both configs, which keeps the
+    // B staging at exactly 2 sixteen-element chunks per thread.
+    const WGN: u32 = if (warps8) 256 else 128; // wg tile N width
+    const THREADS: u32 = if (warps8) 256 else 128;
+    const NWARPS: u32 = if (warps8) 8 else 4;
+    const B_SLAB: u32 = 32 * WGN; // one 32-deep k sub-slab
+    const A_BASE: u32 = 2 * B_SLAB;
+    const AQ: usize = 512 / THREADS; // A staging quads per thread (512 uvec4/sub-slab)
 
     var a: Asm = .{ .gpa = gpa };
     defer a.words.deinit(gpa);
@@ -395,8 +424,10 @@ pub fn buildGemmShared(gpa: std.mem.Allocator) ![]align(4) u8 {
     const t_mat_a = a.id();
     const t_mat_b = a.id();
     const t_mat_c = a.id();
+    const t_mat_c32 = a.id(); // f32 store type when acc_h16
     const t_v2f16 = a.id();
     const c_f32_0 = a.id();
+    const c_f16_0 = a.id(); // acc_h16 accumulator init
     const c_h256 = a.id(); // f16 256.0: exact e4m3 -> f16 exponent rebias
     const c_v2_256 = a.id();
     const c_acc0 = a.id();
@@ -418,7 +449,7 @@ pub fn buildGemmShared(gpa: std.mem.Allocator) ![]align(4) u8 {
         try buf.appendSlice(gpa, &.{ gid_var, lid_var, v_c, v_b4, v_a4, v_push, v_bsh });
         try a.op(15, buf.items);
     }
-    try a.op(16, &.{ main_fn, 17, 32, 4, 1 }); // LocalSize 32 4 1
+    try a.op(16, &.{ main_fn, 17, 32, NWARPS, 1 }); // LocalSize 32 N 1
 
     try a.op(71, &.{ gid_var, 11, 26 }); // WorkgroupId
     try a.op(71, &.{ lid_var, 11, 27 }); // LocalInvocationId
@@ -472,9 +503,9 @@ pub fn buildGemmShared(gpa: std.mem.Allocator) ![]align(4) u8 {
     try a.op(32, &.{ t_ptr_pc_u32, 9, t_u32 });
     try a.op(32, &.{ t_ptr_sc_f32, 12, t_f32 });
 
-    // Workgroup slab (no layout decorations): B 2 x [32][128] f16 at 0,
-    // A 2 x [128][32] f16 at 8192.
-    try a.op(43, &.{ t_u32, c_bsh_len, 8192 + 2 * A_SLAB });
+    // Workgroup slab (no layout decorations): B 2 x [32][WGN] f16 at 0,
+    // A 2 x [128][32] f16 at A_BASE.
+    try a.op(43, &.{ t_u32, c_bsh_len, A_BASE + 2 * A_SLAB });
     try a.op(28, &.{ t_bsh, t_f16, c_bsh_len });
     try a.op(32, &.{ t_ptr_wg_bsh, 4, t_bsh });
     try a.op(59, &.{ t_ptr_wg_bsh, v_bsh, 4 });
@@ -504,20 +535,40 @@ pub fn buildGemmShared(gpa: std.mem.Allocator) ![]align(4) u8 {
 
     try a.op(4456, &.{ t_mat_a, t_f16, c_scope_sub, c_u16, c_u16, c_u0 });
     try a.op(4456, &.{ t_mat_b, t_f16, c_scope_sub, c_u16, c_u16, c_u1 });
-    try a.op(4456, &.{ t_mat_c, t_f32, c_scope_sub, c_u16, c_u16, c_u2 });
+    try a.op(4456, &.{ t_mat_c, if (acc_h16) t_f16 else t_f32, c_scope_sub, c_u16, c_u16, c_u2 });
+    if (acc_h16) try a.op(4456, &.{ t_mat_c32, t_f32, c_scope_sub, c_u16, c_u16, c_u2 });
     try a.op(23, &.{ t_v2f16, t_f16, 2 });
     try a.op(43, &.{ t_f32, c_f32_0, 0 });
+    if (acc_h16) try a.op(43, &.{ t_f16, c_f16_0, 0 });
     try a.op(43, &.{ t_f16, c_h256, 0x5C00 });
     try a.op(44, &.{ t_v2f16, c_v2_256, c_h256, c_h256 });
-    try a.op(44, &.{ t_mat_c, c_acc0, c_f32_0 });
+    try a.op(44, &.{ t_mat_c, c_acc0, if (acc_h16) c_f16_0 else c_f32_0 });
 
     // small u32 constants used in the body (must live in the global section)
-    var c_stage: [8]u32 = undefined; // t*128: B word strides per thread
+    // wg N width / thread count (equal in both configs).
+    const c_wgn = if (WGN == 128) c_u128 else blk: {
+        const c = a.id();
+        try a.op(43, &.{ t_u32, c, WGN });
+        break :blk c;
+    };
+    // B sub-slab parity offset and the B chunk row mask/shift.
+    const c_bslab = if (B_SLAB == 4096) c_u4096 else blk: {
+        const c = a.id();
+        try a.op(43, &.{ t_u32, c, B_SLAB });
+        break :blk c;
+    };
+    const c_bmask = if (WGN == 128) c_u7 else blk: {
+        const c = a.id();
+        try a.op(43, &.{ t_u32, c, WGN / 16 - 1 });
+        break :blk c;
+    };
+    const c_bshift = if (WGN == 128) c_u3 else c_u4; // log2(WGN/16)
+    var c_stage: [4]u32 = undefined; // t*THREADS: staging chunk strides
     c_stage[0] = c_u0;
-    c_stage[1] = c_u128;
-    for (2..8) |t| {
+    c_stage[1] = c_wgn;
+    for (2..4) |t| {
         c_stage[t] = a.id();
-        try a.op(43, &.{ t_u32, c_stage[t], @intCast(t * 128) });
+        try a.op(43, &.{ t_u32, c_stage[t], @intCast(t * THREADS) });
     }
     var c_k16: [4]u32 = undefined; // ks*16: A tile k offsets within a 64 step
     c_k16[0] = c_u0;
@@ -535,7 +586,7 @@ pub fn buildGemmShared(gpa: std.mem.Allocator) ![]align(4) u8 {
         c_col16[nt] = a.id();
         try a.op(43, &.{ t_u32, c_col16[nt], @intCast(nt * 16) });
     }
-    // b_sh tile offsets: parity*4096 + ks*2048 + nt*16.
+    // b_sh tile offsets: parity*B_SLAB + ks*(16*WGN) + nt*16.
     var c_bt: [2][2][8]u32 = undefined;
     for (0..2) |par| {
         for (0..2) |ks| {
@@ -544,7 +595,7 @@ pub fn buildGemmShared(gpa: std.mem.Allocator) ![]align(4) u8 {
                     c_bt[par][ks][nt] = c_col16[nt];
                 } else {
                     c_bt[par][ks][nt] = a.id();
-                    try a.op(43, &.{ t_u32, c_bt[par][ks][nt], @intCast(par * 4096 + ks * 2048 + nt * 16) });
+                    try a.op(43, &.{ t_u32, c_bt[par][ks][nt], @intCast(par * B_SLAB + ks * (16 * WGN) + nt * 16) });
                 }
             }
         }
@@ -563,7 +614,7 @@ pub fn buildGemmShared(gpa: std.mem.Allocator) ![]align(4) u8 {
         break :blk c;
     };
     const c_ash0 = a.id();
-    try a.op(43, &.{ t_u32, c_ash0, 8192 });
+    try a.op(43, &.{ t_u32, c_ash0, A_BASE });
     var c_at: [2][2][4]u32 = undefined;
     for (0..2) |par| {
         for (0..2) |ks| {
@@ -572,7 +623,7 @@ pub fn buildGemmShared(gpa: std.mem.Allocator) ![]align(4) u8 {
                     c_at[par][ks][r] = c_ash0;
                 } else {
                     c_at[par][ks][r] = a.id();
-                    try a.op(43, &.{ t_u32, c_at[par][ks][r], @intCast(8192 + par * A_SLAB + r * 16 * A_STRIDE + ks * 16) });
+                    try a.op(43, &.{ t_u32, c_at[par][ks][r], @intCast(A_BASE + par * A_SLAB + r * 16 * A_STRIDE + ks * 16) });
                 }
             }
         }
@@ -591,7 +642,7 @@ pub fn buildGemmShared(gpa: std.mem.Allocator) ![]align(4) u8 {
     try a.op(81, &.{ t_u32, tile_r, gidv, 1 });
     const col0 = a.id();
     const row0 = a.id();
-    try a.op(132, &.{ t_u32, col0, tile_c, c_u128 }); // 128 cols per wg
+    try a.op(132, &.{ t_u32, col0, tile_c, c_wgn }); // WGN cols per wg
     try a.op(132, &.{ t_u32, row0, tile_r, c_u128 }); // 128 rows per wg
 
     const lidv = a.id();
@@ -641,9 +692,9 @@ pub fn buildGemmShared(gpa: std.mem.Allocator) ![]align(4) u8 {
     try a.op(132, &.{ t_u32, a_shbase, wm64, c_astride });
 
     // Loop-invariant B staging indices: thread `flat`, uvec4 t (of 2)
-    // covers sub-slab elements 16v..16v+15 with v = flat + t*128, i.e. B
-    // k-row v/8, columns (v%8)*16 .. +15 of the workgroup's column window
-    // (consecutive lanes read consecutive 16-byte quads — 512 B per warp).
+    // covers sub-slab elements 16v..16v+15 with v = flat + t*THREADS, i.e.
+    // B k-row v/(WGN/16), columns (v%(WGN/16))*16 .. +15 of the workgroup's
+    // column window (consecutive lanes read consecutive 16-byte quads).
     var brow_t: [2]u32 = undefined;
     var bco_t: [2]u32 = undefined;
     var sbase0_t: [2]u32 = undefined;
@@ -652,13 +703,13 @@ pub fn buildGemmShared(gpa: std.mem.Allocator) ![]align(4) u8 {
         var v = flat;
         if (t > 0) {
             const vn = a.id();
-            try a.op(128, &.{ t_u32, vn, flat, c_u128 });
+            try a.op(128, &.{ t_u32, vn, flat, c_wgn });
             v = vn;
         }
         brow_t[t] = a.id();
-        try a.op(194, &.{ t_u32, brow_t[t], v, c_u3 }); // v / 8
+        try a.op(194, &.{ t_u32, brow_t[t], v, c_bshift }); // v / (WGN/16)
         const vmod = a.id();
-        try a.op(199, &.{ t_u32, vmod, v, c_u7 }); // v % 8
+        try a.op(199, &.{ t_u32, vmod, v, c_bmask }); // v % (WGN/16)
         const bcol16 = a.id();
         try a.op(196, &.{ t_u32, bcol16, vmod, c_u4 }); // * 16
         bco_t[t] = a.id();
@@ -666,18 +717,18 @@ pub fn buildGemmShared(gpa: std.mem.Allocator) ![]align(4) u8 {
         sbase0_t[t] = a.id();
         try a.op(196, &.{ t_u32, sbase0_t[t], v, c_u4 }); // * 16
         sbase1_t[t] = a.id();
-        try a.op(128, &.{ t_u32, sbase1_t[t], sbase0_t[t], c_u4096 });
+        try a.op(128, &.{ t_u32, sbase1_t[t], sbase0_t[t], c_bslab });
     }
 
-    // Loop-invariant A staging indices: thread `flat`, uvec4 t (of 4)
-    // covers sub-slab quad q = flat + t*128 -> A row q/4 (of the wg's 128),
-    // k-quad q%4 (8 f16 each; consecutive lanes cover a row's 4 quads then
-    // step rows). Global uvec4 index = ((row0 + row)*k + kb)/8 + q%4; shared
-    // f16 store base = 8192 + parity*A_SLAB + row*A_STRIDE + (q%4)*8.
+    // Loop-invariant A staging indices: thread `flat`, uvec4 t (of AQ)
+    // covers sub-slab quad q = flat + t*THREADS -> A row q/4 (of the wg's
+    // 128), k-quad q%4 (8 f16 each; consecutive lanes cover a row's 4 quads
+    // then step rows). Global uvec4 index = ((row0 + row)*k + kb)/8 + q%4;
+    // shared f16 store base = A_BASE + parity*A_SLAB + row*A_STRIDE + (q%4)*8.
     var a_inv_t: [4]u32 = undefined;
     var asb0_t: [4]u32 = undefined;
     var asb1_t: [4]u32 = undefined;
-    for (0..4) |t| {
+    for (0..AQ) |t| {
         var q = flat;
         if (t > 0) {
             const qn = a.id();
@@ -711,6 +762,7 @@ pub fn buildGemmShared(gpa: std.mem.Allocator) ![]align(4) u8 {
     // Staging emitters (loads separated from decode+store so the global
     // loads can issue before the MMA section they overlap with).
     const Stage = struct {
+        b_f16: bool,
         t_u32: u32,
         t_f16: u32,
         t_v2f16: u32,
@@ -725,6 +777,7 @@ pub fn buildGemmShared(gpa: std.mem.Allocator) ![]align(4) u8 {
         c_sgn_mask: u32,
         c_v2_256: u32,
         c_j: [4]u32,
+        c_j8: [8]u32,
         c_w4: [4]u32,
         c_u4: u32,
         t_v4u32: u32,
@@ -733,10 +786,11 @@ pub fn buildGemmShared(gpa: std.mem.Allocator) ![]align(4) u8 {
         brow: [2]u32,
         bco: [2]u32,
 
-        /// 2 uvec4 (128-bit) global loads for the sub-slab whose first
-        /// k-row is `kb`.
-        fn loads(st: @This(), asm_: *Asm, kb: u32) ![2]u32 {
-            var quads: [2]u32 = undefined;
+        /// Global loads for the sub-slab whose first k-row is `kb`: per
+        /// 16-element chunk, one uvec4 for fp8 B (16 bytes; entries 2/3
+        /// unused) or two for f16 B (32 bytes).
+        fn loads(st: @This(), asm_: *Asm, kb: u32) ![4]u32 {
+            var quads: [4]u32 = undefined;
             for (0..2) |t| {
                 const bk = asm_.id();
                 try asm_.op(128, &.{ st.t_u32, bk, kb, st.brow[t] });
@@ -744,20 +798,70 @@ pub fn buildGemmShared(gpa: std.mem.Allocator) ![]align(4) u8 {
                 try asm_.op(132, &.{ st.t_u32, bmul, bk, st.p_stride });
                 const boff = asm_.id();
                 try asm_.op(128, &.{ st.t_u32, boff, bmul, st.bco[t] });
-                const qidx = asm_.id();
-                try asm_.op(194, &.{ st.t_u32, qidx, boff, st.c_u4 }); // /16
-                const qptr = asm_.id();
-                try asm_.op(65, &.{ st.t_ptr_sb4_v4, qptr, st.v_b4, st.c_u0, qidx });
-                quads[t] = asm_.id();
-                try asm_.op(61, &.{ st.t_v4u32, quads[t], qptr });
+                if (st.b_f16) {
+                    const qidx0 = asm_.id();
+                    try asm_.op(194, &.{ st.t_u32, qidx0, boff, st.c_j[3] }); // /8 (f16 elems)
+                    for (0..2) |qi| {
+                        var qidx = qidx0;
+                        if (qi > 0) {
+                            const qn = asm_.id();
+                            try asm_.op(128, &.{ st.t_u32, qn, qidx0, st.c_j[1] });
+                            qidx = qn;
+                        }
+                        const qptr = asm_.id();
+                        try asm_.op(65, &.{ st.t_ptr_sb4_v4, qptr, st.v_b4, st.c_u0, qidx });
+                        quads[2 * t + qi] = asm_.id();
+                        try asm_.op(61, &.{ st.t_v4u32, quads[2 * t + qi], qptr });
+                    }
+                } else {
+                    const qidx = asm_.id();
+                    try asm_.op(194, &.{ st.t_u32, qidx, boff, st.c_u4 }); // /16 (bytes)
+                    const qptr = asm_.id();
+                    try asm_.op(65, &.{ st.t_ptr_sb4_v4, qptr, st.v_b4, st.c_u0, qidx });
+                    quads[t] = asm_.id();
+                    try asm_.op(61, &.{ st.t_v4u32, quads[t], qptr });
+                }
             }
             return quads;
         }
 
-        /// SWAR e4m3 -> f16 pair decode of the quads into the sub-slab whose
-        /// per-quad store bases are `sbase` (parity offset prefolded); same
-        /// bit trick as before (fields land on f16 layout, exact *256).
-        fn stores(st: @This(), asm_: *Asm, quads: [2]u32, sbase: [2]u32) !void {
+        /// Stage the quads into the sub-slab whose per-chunk store bases are
+        /// `sbase` (parity offset prefolded). fp8 B: SWAR e4m3 -> f16 pair
+        /// decode (fields land on f16 layout, exact *256). f16 B: plain
+        /// bitcast copy, 8 consecutive f16 per quad (same as the A slab).
+        fn stores(st: @This(), asm_: *Asm, quads: [4]u32, sbase: [2]u32) !void {
+            if (st.b_f16) {
+                for (0..2) |t| {
+                    for (0..2) |qi| {
+                        var qbase = sbase[t];
+                        if (qi > 0) {
+                            const qb = asm_.id();
+                            try asm_.op(128, &.{ st.t_u32, qb, sbase[t], st.c_u8 });
+                            qbase = qb;
+                        }
+                        for (0..4) |wi| {
+                            const wv = asm_.id();
+                            try asm_.op(81, &.{ st.t_u32, wv, quads[2 * t + qi], @intCast(wi) });
+                            const hv2 = asm_.id();
+                            try asm_.op(124, &.{ st.t_v2f16, hv2, wv }); // OpBitcast
+                            for (0..2) |j| {
+                                const hval = asm_.id();
+                                try asm_.op(81, &.{ st.t_f16, hval, hv2, @intCast(j) });
+                                var eidx = qbase;
+                                if (wi * 2 + j > 0) {
+                                    const ei = asm_.id();
+                                    try asm_.op(128, &.{ st.t_u32, ei, qbase, st.c_j8[wi * 2 + j] });
+                                    eidx = ei;
+                                }
+                                const bsptr = asm_.id();
+                                try asm_.op(65, &.{ st.t_ptr_wg_f16, bsptr, st.v_bsh, eidx });
+                                try asm_.op(62, &.{ bsptr, hval });
+                            }
+                        }
+                    }
+                }
+                return;
+            }
             for (0..2) |tq| {
                 for (0..4) |wi| {
                 const wv = asm_.id();
@@ -809,6 +913,7 @@ pub fn buildGemmShared(gpa: std.mem.Allocator) ![]align(4) u8 {
         }
     };
     const stage: Stage = .{
+        .b_f16 = b_f16,
         .t_u32 = t_u32,
         .t_f16 = t_f16,
         .t_v2f16 = t_v2f16,
@@ -823,6 +928,7 @@ pub fn buildGemmShared(gpa: std.mem.Allocator) ![]align(4) u8 {
         .c_sgn_mask = c_sgn_mask,
         .c_v2_256 = c_v2_256,
         .c_j = .{ c_u0, c_u1, c_u2, c_u3 },
+        .c_j8 = .{ c_u0, c_u1, c_u2, c_u3, c_u4, c_u5, c_u6, c_u7 },
         .c_w4 = .{ c_u0, c_u4, c_u8, c_u12 },
         .c_u4 = c_u4,
         .t_v4u32 = t_v4u32,
@@ -835,6 +941,7 @@ pub fn buildGemmShared(gpa: std.mem.Allocator) ![]align(4) u8 {
     // A staging: plain f16 copy into the shared A region (no decode — the
     // scale is already folded in), same load/store split as B.
     const AStage = struct {
+        aq: usize,
         t_u32: u32,
         t_f16: u32,
         t_v2f16: u32,
@@ -848,13 +955,13 @@ pub fn buildGemmShared(gpa: std.mem.Allocator) ![]align(4) u8 {
         c_j: [8]u32,
         a_inv: [4]u32,
 
-        /// 4 uvec4 (128-bit) global loads of the A sub-slab whose first
+        /// aq uvec4 (128-bit) global loads of the A sub-slab whose first
         /// k-column is `kb`.
         fn loads(st: @This(), asm_: *Asm, kb: u32) ![4]u32 {
             const kbq = asm_.id();
             try asm_.op(194, &.{ st.t_u32, kbq, kb, st.c_u3 }); // kb / 8
             var quads: [4]u32 = undefined;
-            for (0..4) |t| {
+            for (0..st.aq) |t| {
                 const qidx = asm_.id();
                 try asm_.op(128, &.{ st.t_u32, qidx, st.a_inv[t], kbq });
                 const qptr = asm_.id();
@@ -868,7 +975,7 @@ pub fn buildGemmShared(gpa: std.mem.Allocator) ![]align(4) u8 {
         /// Store the quads' 8 f16 each into the sub-slab whose per-quad
         /// store bases are `sbase` (parity offset prefolded).
         fn stores(st: @This(), asm_: *Asm, quads: [4]u32, sbase: [4]u32) !void {
-            for (0..4) |t| {
+            for (0..st.aq) |t| {
                 for (0..4) |wi| {
                     const wv = asm_.id();
                     try asm_.op(81, &.{ st.t_u32, wv, quads[t], @intCast(wi) });
@@ -892,6 +999,7 @@ pub fn buildGemmShared(gpa: std.mem.Allocator) ![]align(4) u8 {
         }
     };
     const astage: AStage = .{
+        .aq = AQ,
         .t_u32 = t_u32,
         .t_f16 = t_f16,
         .t_v2f16 = t_v2f16,
@@ -968,7 +1076,7 @@ pub fn buildGemmShared(gpa: std.mem.Allocator) ![]align(4) u8 {
             const bptr2 = a.id();
             try a.op(65, &.{ t_ptr_wg_f16, bptr2, v_bsh, boff });
             const mb = a.id();
-            try a.op(4457, &.{ t_mat_b, mb, bptr2, c_u0, c_u128 });
+            try a.op(4457, &.{ t_mat_b, mb, bptr2, c_u0, c_wgn });
             for (0..4) |r| {
                 const acc_out = a.id();
                 try a.op(4459, &.{ t_mat_c, acc_out, ma[r], mb, acc_cur[r][nt] });
@@ -1005,7 +1113,7 @@ pub fn buildGemmShared(gpa: std.mem.Allocator) ![]align(4) u8 {
             const bptr2 = a.id();
             try a.op(65, &.{ t_ptr_wg_f16, bptr2, v_bsh, boff });
             const mb = a.id();
-            try a.op(4457, &.{ t_mat_b, mb, bptr2, c_u0, c_u128 });
+            try a.op(4457, &.{ t_mat_b, mb, bptr2, c_u0, c_wgn });
             for (0..4) |r| {
                 const acc_out = if (ks == 1) acc_next[r][nt] else a.id();
                 try a.op(4459, &.{ t_mat_c, acc_out, ma[r], mb, acc_cur[r][nt] });
@@ -1040,7 +1148,14 @@ pub fn buildGemmShared(gpa: std.mem.Allocator) ![]align(4) u8 {
             try a.op(128, &.{ t_u32, cbase, c_rowmul, ccol });
             const cptr = a.id();
             try a.op(65, &.{ t_ptr_sc_f32, cptr, v_c, c_u0, cbase });
-            try a.op(4458, &.{ cptr, acc_phi[r][nt], c_u0, p_n });
+            var cval = acc_phi[r][nt];
+            if (acc_h16) {
+                // f16 accumulators store through an f32 conversion.
+                const cv = a.id();
+                try a.op(115, &.{ t_mat_c32, cv, cval }); // OpFConvert
+                cval = cv;
+            }
+            try a.op(4458, &.{ cptr, cval, c_u0, p_n });
         }
     }
     try a.op(253, &.{});
@@ -1051,6 +1166,13 @@ pub fn buildGemmShared(gpa: std.mem.Allocator) ![]align(4) u8 {
     @memcpy(out, std.mem.sliceAsBytes(a.words.items));
     return out;
 }
+
+/// K staging for buildGemmScores: measured NEUTRAL at DiT/VAE shapes
+/// (scores ~700 ms/step at 1120x1680 both ways, back-to-back A/B), so the
+/// direct global-load variant stays the default; the staged path is kept
+/// for retest on other drivers. The global K fragment loads were NOT the
+/// scores bottleneck — same lesson as the A-stride-34 experiment.
+pub const scores_stage_k = false;
 
 /// Attention-scores GEMM on tensor cores: S[z][q][j] = Qh . Kh^T for one
 /// batch of heads (gid.z = head-in-batch). Q/K are f16 in global memory and
@@ -1068,8 +1190,9 @@ pub fn buildGemmShared(gpa: std.mem.Allocator) ![]align(4) u8 {
 /// u4 = K head stride (hd*s_stride), u5 = S plane stride (m_pad*s_stride).
 /// `hd` (multiple of 16) sets the unrolled k-depth; the DiT uses 128, the
 /// VAE mid-block 384.
-pub fn buildGemmScores(gpa: std.mem.Allocator, hd: u32) ![]align(4) u8 {
+pub fn buildGemmScores(gpa: std.mem.Allocator, hd: u32, stage_k: bool) ![]align(4) u8 {
     std.debug.assert(hd % 16 == 0 and hd >= 64);
+    std.debug.assert(!stage_k or hd % 64 == 0);
     var a: Asm = .{ .gpa = gpa };
     defer a.words.deinit(gpa);
 
@@ -1370,11 +1493,10 @@ pub fn buildGemmScores(gpa: std.mem.Allocator, hd: u32) ![]align(4) u8 {
     const a_row16 = a.id();
     try a.op(132, &.{ t_u32, a_row16, c_u16, p_qstride });
 
-    // B (K) base: kv*k_head_stride + col_w; row stride s_stride.
+    // K block base: kv*k_head_stride. The global-load path folds col_w in
+    // below; the staged path addresses the whole 128-col tile from col0.
     const kvmul = a.id();
     try a.op(132, &.{ t_u32, kvmul, kvh, p_khead });
-    const b_base = a.id();
-    try a.op(128, &.{ t_u32, b_base, kvmul, col_w });
 
     // Copy-out invariants: thread `flat` writes u32 words w = flat + i*128
     // of the wg's 128x128 f16 tile (word w = slab row w/64, f16 columns
@@ -1411,46 +1533,144 @@ pub fn buildGemmScores(gpa: std.mem.Allocator, hd: u32) ![]align(4) u8 {
     for (&acc) |*row| for (row) |*v| {
         v.* = c_acc0;
     };
-    for (0..hd / 16) |ks| {
-        var a_off = a_base;
-        if (ks > 0) {
-            const ao = a.id();
-            try a.op(128, &.{ t_u32, ao, a_base, c_k16[ks] });
-            a_off = ao;
-        }
-        var ma: [4]u32 = undefined;
-        var ao_cur = a_off;
-        for (0..4) |r| {
-            if (r > 0) {
-                const a2 = a.id();
-                try a.op(128, &.{ t_u32, a2, ao_cur, a_row16 });
-                ao_cur = a2;
+    if (stage_k) {
+        // K staged through the bounce slab: the 32 KB S tile is dead until
+        // after the MMAs, so its first 16 KB holds each 64-deep K slab and
+        // the B fragment loads become ldmatrix-from-shared — no extra
+        // workgroup memory, occupancy unchanged. (The global K fragment
+        // loads were the ~1 TF/s bottleneck: 12-15 KB row strides.)
+        //
+        // Staging reuses the copy-out invariants: thread `flat` owns slab
+        // rows srow0, srow0+2, ... and the f16 column pair at scol2; the
+        // matching global elements are kvmul + (k0+row)*s_stride + col0 +
+        // scol2 (two scalar f16 loads — all four bindings are taken, so
+        // there is no u32 view of K to pair-load through).
+        const kbase0 = a.id();
+        try a.op(128, &.{ t_u32, kbase0, kvmul, col0 });
+        const kbase = a.id();
+        try a.op(128, &.{ t_u32, kbase, kbase0, scol2 });
+        const c2s = a.id();
+        try a.op(128, &.{ t_u32, c2s, p_sstride, p_sstride }); // 2 rows/iter
+        for (0..hd / 64) |s| {
+            // Stage K rows s*64 .. s*64+64 of the per-head k-major block.
+            const krow = a.id();
+            try a.op(128, &.{ t_u32, krow, c_k16[s * 4], srow0 });
+            const krowmul = a.id();
+            try a.op(132, &.{ t_u32, krowmul, krow, p_sstride });
+            var g = a.id();
+            try a.op(128, &.{ t_u32, g, kbase, krowmul });
+            var e = e0;
+            for (0..32) |i| {
+                if (i > 0) {
+                    const gn = a.id();
+                    try a.op(128, &.{ t_u32, gn, g, c2s });
+                    g = gn;
+                    const en = a.id();
+                    try a.op(128, &.{ t_u32, en, e, c_u256 });
+                    e = en;
+                }
+                const g1 = a.id();
+                try a.op(128, &.{ t_u32, g1, g, c_u1 });
+                const e1 = a.id();
+                try a.op(128, &.{ t_u32, e1, e, c_u1 });
+                const pairs = [2][2]u32{ .{ g, e }, .{ g1, e1 } };
+                for (pairs) |pair| {
+                    const kp = a.id();
+                    try a.op(65, &.{ t_ptr_sk_f16, kp, v_k, c_u0, pair[0] });
+                    const kv = a.id();
+                    try a.op(61, &.{ t_f16, kv, kp });
+                    const sp = a.id();
+                    try a.op(65, &.{ t_ptr_wg_f16, sp, v_ssh, pair[1] });
+                    try a.op(62, &.{ sp, kv });
+                }
             }
-            const aptr = a.id();
-            try a.op(65, &.{ t_ptr_sq_f16, aptr, v_q, c_u0, ao_cur });
-            ma[r] = a.id();
-            try a.op(4457, &.{ t_mat_a, ma[r], aptr, c_u0, p_qstride });
-        }
-        // B row block for this k-step starts at b_base + ks*16*s_stride.
-        const krowmul = a.id();
-        try a.op(132, &.{ t_u32, krowmul, c_k16[ks], p_sstride });
-        const b_ks = a.id();
-        try a.op(128, &.{ t_u32, b_ks, b_base, krowmul });
-        for (0..4) |nt| {
-            var b_off = b_ks;
-            if (nt > 0) {
-                const bo = a.id();
-                try a.op(128, &.{ t_u32, bo, b_ks, c_k16[nt] });
-                b_off = bo;
+            try a.op(224, &.{ c_scope_wg, c_scope_wg, c_u264 }); // staged
+            for (0..4) |kk| {
+                const ks = s * 4 + kk;
+                var a_off = a_base;
+                if (ks > 0) {
+                    const ao = a.id();
+                    try a.op(128, &.{ t_u32, ao, a_base, c_k16[ks] });
+                    a_off = ao;
+                }
+                var ma: [4]u32 = undefined;
+                var ao_cur = a_off;
+                for (0..4) |r| {
+                    if (r > 0) {
+                        const a2 = a.id();
+                        try a.op(128, &.{ t_u32, a2, ao_cur, a_row16 });
+                        ao_cur = a2;
+                    }
+                    const aptr = a.id();
+                    try a.op(65, &.{ t_ptr_sq_f16, aptr, v_q, c_u0, ao_cur });
+                    ma[r] = a.id();
+                    try a.op(4457, &.{ t_mat_a, ma[r], aptr, c_u0, p_qstride });
+                }
+                for (0..4) |nt| {
+                    // Shared B fragment: slab row kk*16, col wn64 + nt*16 —
+                    // c_st[kk][nt] is exactly kk*2048 + nt*16.
+                    const bidx = a.id();
+                    try a.op(128, &.{ t_u32, bidx, c_st[kk][nt], wn64 });
+                    const bptr = a.id();
+                    try a.op(65, &.{ t_ptr_wg_f16, bptr, v_ssh, bidx });
+                    const mb = a.id();
+                    try a.op(4457, &.{ t_mat_b, mb, bptr, c_u0, c_u128 });
+                    for (0..4) |r| {
+                        const acc_out = a.id();
+                        try a.op(4459, &.{ t_mat_c, acc_out, ma[r], mb, acc[r][nt] });
+                        acc[r][nt] = acc_out;
+                    }
+                }
             }
-            const bptr = a.id();
-            try a.op(65, &.{ t_ptr_sk_f16, bptr, v_k, c_u0, b_off });
-            const mb = a.id();
-            try a.op(4457, &.{ t_mat_b, mb, bptr, c_u0, p_sstride });
+            // Protects the next slab's staging — and, after the last slab,
+            // the S-tile stores into the same array below.
+            try a.op(224, &.{ c_scope_wg, c_scope_wg, c_u264 });
+        }
+    } else {
+        // B (K) base for direct global fragment loads: kv block + col_w.
+        const b_base = a.id();
+        try a.op(128, &.{ t_u32, b_base, kvmul, col_w });
+        for (0..hd / 16) |ks| {
+            var a_off = a_base;
+            if (ks > 0) {
+                const ao = a.id();
+                try a.op(128, &.{ t_u32, ao, a_base, c_k16[ks] });
+                a_off = ao;
+            }
+            var ma: [4]u32 = undefined;
+            var ao_cur = a_off;
             for (0..4) |r| {
-                const acc_out = a.id();
-                try a.op(4459, &.{ t_mat_c, acc_out, ma[r], mb, acc[r][nt] });
-                acc[r][nt] = acc_out;
+                if (r > 0) {
+                    const a2 = a.id();
+                    try a.op(128, &.{ t_u32, a2, ao_cur, a_row16 });
+                    ao_cur = a2;
+                }
+                const aptr = a.id();
+                try a.op(65, &.{ t_ptr_sq_f16, aptr, v_q, c_u0, ao_cur });
+                ma[r] = a.id();
+                try a.op(4457, &.{ t_mat_a, ma[r], aptr, c_u0, p_qstride });
+            }
+            // B row block for this k-step starts at b_base + ks*16*s_stride.
+            const krowmul = a.id();
+            try a.op(132, &.{ t_u32, krowmul, c_k16[ks], p_sstride });
+            const b_ks = a.id();
+            try a.op(128, &.{ t_u32, b_ks, b_base, krowmul });
+            for (0..4) |nt| {
+                var b_off = b_ks;
+                if (nt > 0) {
+                    const bo = a.id();
+                    try a.op(128, &.{ t_u32, bo, b_ks, c_k16[nt] });
+                    b_off = bo;
+                }
+                const bptr = a.id();
+                try a.op(65, &.{ t_ptr_sk_f16, bptr, v_k, c_u0, b_off });
+                const mb = a.id();
+                try a.op(4457, &.{ t_mat_b, mb, bptr, c_u0, p_sstride });
+                for (0..4) |r| {
+                    const acc_out = a.id();
+                    try a.op(4459, &.{ t_mat_c, acc_out, ma[r], mb, acc[r][nt] });
+                    acc[r][nt] = acc_out;
+                }
             }
         }
     }
@@ -1540,13 +1760,14 @@ pub fn buildGemmScores(gpa: std.mem.Allocator, hd: u32) ![]align(4) u8 {
 /// (heads*128), u1 = s_stride == MD plane stride, u2 = head_off, u3 =
 /// heads-per-kv group, u4 = V row stride (kv*128), u5 = MD offset in f32
 /// elements, f0 = valid j count (u32 bits).
-fn buildFlashAttn(gpa: std.mem.Allocator, out_phase: bool) ![]align(4) u8 {
+fn buildFlashAttn(gpa: std.mem.Allocator, out_phase: bool, stage_k: bool) ![]align(4) u8 {
     // Q staged resident in shared vs. cooperative-loaded from global per j
     // block: resident costs 32 KB shared (2 workgroups/SM instead of 6) and
     // measured SLOWER — each workgroup rereads the same 32 KB of Q, so L1
     // serves it either way, and the occupancy matters more.
     const STAGE_Q = false;
     const Q_SH: u32 = if (STAGE_Q) 16384 else 0; // s_sh region base
+    const K_SH: u32 = Q_SH + 8192; // k_sh region base (stage_k)
 
     var a: Asm = .{ .gpa = gpa };
     defer a.words.deinit(gpa);
@@ -1692,8 +1913,9 @@ fn buildFlashAttn(gpa: std.mem.Allocator, out_phase: bool) ![]align(4) u8 {
     try a.op(32, &.{ t_ptr_g_f16, 12, t_f16 });
     try a.op(32, &.{ t_ptr_o_f32, 12, t_f32 });
 
-    // Workgroup slab: optional q_sh 128x128 f16, then s_sh 64x128 f16.
-    try a.op(43, &.{ t_u32, c_wsh_len, Q_SH + 8192 });
+    // Workgroup slab: optional q_sh 128x128 f16, then s_sh 64x128 f16,
+    // then (stage_k) k_sh 128 hd x 64 j f16, k-major with row stride 64.
+    try a.op(43, &.{ t_u32, c_wsh_len, Q_SH + 8192 + @as(u32, if (stage_k) 8192 else 0) });
     try a.op(28, &.{ t_wsh, t_f16, c_wsh_len });
     try a.op(32, &.{ t_ptr_wg_wsh, 4, t_wsh });
     try a.op(59, &.{ t_ptr_wg_wsh, v_wsh, 4 });
@@ -1761,6 +1983,17 @@ fn buildFlashAttn(gpa: std.mem.Allocator, out_phase: bool) ![]align(4) u8 {
             try a.op(43, &.{ t_u32, c, val });
             break :blk c;
         };
+    }
+    // k_sh per-k-step tile bases (K_SH + ks*16*64) and the copy's j mask.
+    var c_kst: [8]u32 = undefined;
+    var c_u63: u32 = undefined;
+    if (stage_k) {
+        for (0..8) |ks| {
+            c_kst[ks] = a.id();
+            try a.op(43, &.{ t_u32, c_kst[ks], K_SH + @as(u32, @intCast(ks)) * 1024 });
+        }
+        c_u63 = a.id();
+        try a.op(43, &.{ t_u32, c_u63, 63 });
     }
 
     // --- function ---
@@ -1903,6 +2136,30 @@ fn buildFlashAttn(gpa: std.mem.Allocator, out_phase: bool) ![]align(4) u8 {
     const s_thread0 = a.id();
     try a.op(128, &.{ t_u32, s_thread0, c_ssh0, flat });
 
+    // K-staging copy invariants: thread `flat` owns k_sh column flat&63
+    // and rows flat>>6 + 2i (consecutive lanes read consecutive K columns
+    // — coalesced). Global element = kbase + j0 + (flat&63) +
+    // (flat>>6 + 2i)*s_stride; shared element = K_SH + flat + i*128.
+    var k_inv: u32 = undefined;
+    var k_e0: u32 = undefined;
+    var c2s: u32 = undefined;
+    if (stage_k) {
+        const kj = a.id();
+        try a.op(199, &.{ t_u32, kj, flat, c_u63 });
+        const kr0 = a.id();
+        try a.op(194, &.{ t_u32, kr0, flat, c_u6 });
+        const gj = a.id();
+        try a.op(128, &.{ t_u32, gj, kbase, kj });
+        const gr = a.id();
+        try a.op(132, &.{ t_u32, gr, kr0, p_sstride });
+        k_inv = a.id();
+        try a.op(128, &.{ t_u32, k_inv, gj, gr });
+        k_e0 = a.id();
+        try a.op(128, &.{ t_u32, k_e0, c_kst[0], flat });
+        c2s = a.id();
+        try a.op(128, &.{ t_u32, c2s, p_sstride, p_sstride });
+    }
+
     // Warp tiling for S compute: warp ly owns q rows [ly*32, ly*32+32).
     // Warp tiling for P@V (out phase): 2x2 grid, 64q x 64c per warp.
     const warp_m = a.id();
@@ -1969,6 +2226,33 @@ fn buildFlashAttn(gpa: std.mem.Allocator, out_phase: bool) ![]align(4) u8 {
     // Barrier: Q staging on the first pass; s_sh reuse on later passes.
     try a.op(224, &.{ c_scope_wg, c_scope_wg, c_u264 });
 
+    if (stage_k) {
+        // Stage this j-block's K tile into k_sh: all four warps consume
+        // IDENTICAL K fragments per (ks, ct), so one shared copy replaces
+        // 4x-redundant global fragment loads. 64 f16 per thread.
+        var g = a.id();
+        try a.op(128, &.{ t_u32, g, k_inv, j0v });
+        var e = k_e0;
+        for (0..64) |i| {
+            if (i > 0) {
+                const gn = a.id();
+                try a.op(128, &.{ t_u32, gn, g, c2s });
+                g = gn;
+                const en = a.id();
+                try a.op(128, &.{ t_u32, en, e, c_u128 });
+                e = en;
+            }
+            const gp = a.id();
+            try a.op(65, &.{ t_ptr_g_f16, gp, v_k, c_u0, g });
+            const hv = a.id();
+            try a.op(61, &.{ t_f16, hv, gp });
+            const sp = a.id();
+            try a.op(65, &.{ t_ptr_wg_f16, sp, v_wsh, e });
+            try a.op(62, &.{ sp, hv });
+        }
+        try a.op(224, &.{ c_scope_wg, c_scope_wg, c_u264 });
+    }
+
     // S block: warp ly computes q rows [ly32, ly32+32) x 64 j into s_sh
     // (column-major). 2 row blocks x 4 col tiles, 8 k-steps each.
     for (0..2) |rw| {
@@ -1995,16 +2279,27 @@ fn buildFlashAttn(gpa: std.mem.Allocator, out_phase: bool) ![]align(4) u8 {
                 }
                 const ma = a.id();
                 try a.op(4457, &.{ t_mat_a, ma, qptr, c_u0, if (STAGE_Q) c_u128 else p_qstride });
-                const krow = a.id();
-                try a.op(132, &.{ t_u32, krow, c_k16[ks], p_sstride });
-                const koff0 = a.id();
-                try a.op(128, &.{ t_u32, koff0, kbase, krow });
-                const koff = a.id();
-                try a.op(128, &.{ t_u32, koff, koff0, jg });
-                const kptr = a.id();
-                try a.op(65, &.{ t_ptr_g_f16, kptr, v_k, c_u0, koff });
-                const mb = a.id();
-                try a.op(4457, &.{ t_mat_b, mb, kptr, c_u0, p_sstride });
+                var mb: u32 = undefined;
+                if (stage_k) {
+                    // k_sh tile (ks*16, ct*16), row stride 64.
+                    const koff = a.id();
+                    try a.op(128, &.{ t_u32, koff, c_kst[ks], c_k16[ct] });
+                    const kptr = a.id();
+                    try a.op(65, &.{ t_ptr_wg_f16, kptr, v_wsh, koff });
+                    mb = a.id();
+                    try a.op(4457, &.{ t_mat_b, mb, kptr, c_u0, c_u64 });
+                } else {
+                    const krow = a.id();
+                    try a.op(132, &.{ t_u32, krow, c_k16[ks], p_sstride });
+                    const koff0 = a.id();
+                    try a.op(128, &.{ t_u32, koff0, kbase, krow });
+                    const koff = a.id();
+                    try a.op(128, &.{ t_u32, koff, koff0, jg });
+                    const kptr = a.id();
+                    try a.op(65, &.{ t_ptr_g_f16, kptr, v_k, c_u0, koff });
+                    mb = a.id();
+                    try a.op(4457, &.{ t_mat_b, mb, kptr, c_u0, p_sstride });
+                }
                 const acc_out = a.id();
                 try a.op(4459, &.{ t_mat_c, acc_out, ma, mb, acc });
                 acc = acc_out;
@@ -2180,13 +2475,19 @@ fn buildFlashAttn(gpa: std.mem.Allocator, out_phase: bool) ![]align(4) u8 {
 }
 
 /// Flash pass 1: online {m, 1/d} per q row (see buildFlashAttn).
+/// Stage each j-block's K tile in shared for both flash passes (S 16 KB +
+/// K 16 KB = 32 KB, 3 wgs/SM vs 6): the experiment that tests whether the
+/// flash S-recompute is fragment-load-bound (all four warps consume
+/// identical K fragments, so staging removes 4x-redundant global loads).
+pub const flash_stage_k = false;
+
 pub fn buildFlashMd(gpa: std.mem.Allocator) ![]align(4) u8 {
-    return buildFlashAttn(gpa, false);
+    return buildFlashAttn(gpa, false, flash_stage_k);
 }
 
 /// Flash pass 2: P@V with S recomputed per block (see buildFlashAttn).
 pub fn buildFlashOut(gpa: std.mem.Allocator) ![]align(4) u8 {
-    return buildFlashAttn(gpa, true);
+    return buildFlashAttn(gpa, true, flash_stage_k);
 }
 
 /// Attention P@V GEMM on tensor cores: out[q][head][c] = sum_j P[q,j] *

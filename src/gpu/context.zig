@@ -37,7 +37,7 @@ const Push = extern struct {
 };
 
 /// Eltwise/attention kernels and their workgroup shapes (kernels/eltwise.zig).
-pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, vae_norm, im2col };
+pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact };
 const elt_entry_sizes = [_]EntrySize{
     .{ .name = "rmsnorm", .x = 64, .y = 1 },
     .{ .name = "rms_partial", .x = 256, .y = 1 },
@@ -61,8 +61,10 @@ const elt_entry_sizes = [_]EntrySize{
     .{ .name = "softmax_rows", .x = 64, .y = 1 },
     .{ .name = "attn_out", .x = 16, .y = 16 },
     .{ .name = "f32_to_h16", .x = 256, .y = 1 },
+    .{ .name = "f32_to_h16_pad", .x = 256, .y = 1 },
     .{ .name = "vae_norm", .x = 64, .y = 1 },
     .{ .name = "im2col", .x = 256, .y = 1 },
+    .{ .name = "bias_compact", .x = 256, .y = 1 },
 };
 
 /// Push block shared by all eltwise entries; meaning per entry (see kernels).
@@ -249,6 +251,9 @@ pub const Context = struct {
     pipes_e: [elt_entry_sizes.len]vk.Pipeline,
     shader_coop: vk.ShaderModule = .null_handle,
     pipe_coop: vk.Pipeline = .null_handle,
+    /// f16-weight coop GEMM (VAE convs; present iff pipe_coop is).
+    shader_coop_f16w: vk.ShaderModule = .null_handle,
+    pipe_coop_f16w: vk.Pipeline = .null_handle,
     /// Tensor-core attention GEMMs (present iff pipe_coop is).
     shader_scores: vk.ShaderModule = .null_handle,
     pipe_scores: vk.Pipeline = .null_handle,
@@ -274,6 +279,8 @@ pub const Context = struct {
     y_dev: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
     /// f16 activation scratch for the cooperative-matrix path.
     x_h16: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
+    /// Column-padded f32 output scratch for the f16-weight coop path.
+    y_pad: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
     /// Device-local scratch for raw (untransposed) weight uploads.
     raw_dev: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
     /// Tiny valid buffer bound to unused descriptor slots.
@@ -575,23 +582,34 @@ pub const Context = struct {
         // device supports 16x16x16 f16->f32 subgroup matrices.
         var shader_coop: vk.ShaderModule = .null_handle;
         var pipe_coop: vk.Pipeline = .null_handle;
+        var shader_coop_f16w: vk.ShaderModule = .null_handle;
+        var pipe_coop_f16w: vk.Pipeline = .null_handle;
         if (coop_m == 16 and coop_n == 16 and coop_k == 16) {
-            const code = try coopmat.buildGemmShared(gpa);
-            defer gpa.free(code);
-            try check(d.CreateShaderModule(device, &.{
-                .code_size = code.len,
-                .p_code = @ptrCast(@alignCast(code.ptr)),
-            }, null, &shader_coop));
+            inline for (.{
+                .{ false, coopmat.coop_warps8, coopmat.coop_acc_h16, &shader_coop },
+                .{ true, false, false, &shader_coop_f16w },
+            }) |v| {
+                const code = try coopmat.buildGemmShared(gpa, v[0], v[1], v[2]);
+                defer gpa.free(code);
+                try check(d.CreateShaderModule(device, &.{
+                    .code_size = code.len,
+                    .p_code = @ptrCast(@alignCast(code.ptr)),
+                }, null, v[3]));
+            }
         }
         errdefer if (shader_coop != .null_handle) d.DestroyShaderModule(device, shader_coop, null);
+        errdefer if (shader_coop_f16w != .null_handle) d.DestroyShaderModule(device, shader_coop_f16w, null);
         if (shader_coop != .null_handle) {
-            const info: vk.ComputePipelineCreateInfo = .{
-                .stage = .{ .module = shader_coop, .p_name = "main" },
-                .layout = pipeline_layout,
-            };
-            try check(d.CreateComputePipelines(device, .null_handle, 1, @ptrCast(&info), null, @ptrCast(&pipe_coop)));
+            inline for (.{ .{ shader_coop, &pipe_coop }, .{ shader_coop_f16w, &pipe_coop_f16w } }) |v| {
+                const info: vk.ComputePipelineCreateInfo = .{
+                    .stage = .{ .module = v[0], .p_name = "main" },
+                    .layout = pipeline_layout,
+                };
+                try check(d.CreateComputePipelines(device, .null_handle, 1, @ptrCast(&info), null, @ptrCast(v[1])));
+            }
         }
         errdefer if (pipe_coop != .null_handle) d.DestroyPipeline(device, pipe_coop, null);
+        errdefer if (pipe_coop_f16w != .null_handle) d.DestroyPipeline(device, pipe_coop_f16w, null);
 
         // Attention-scores GEMM on the same cooperative-matrix support; uses
         // the eltwise pipeline layout (same 4-buffer set, EltPush-sized push).
@@ -602,7 +620,7 @@ pub const Context = struct {
         var pipe_scores_vae: vk.Pipeline = .null_handle;
         if (shader_coop != .null_handle) {
             inline for (.{ .{ 128, &shader_scores }, .{ 384, &shader_scores_vae } }) |v| {
-                const code = try coopmat.buildGemmScores(gpa, v[0]);
+                const code = try coopmat.buildGemmScores(gpa, v[0], coopmat.scores_stage_k);
                 defer gpa.free(code);
                 try check(d.CreateShaderModule(device, &.{
                     .code_size = code.len,
@@ -759,6 +777,8 @@ pub const Context = struct {
             .pipes_e = pipes_e,
             .shader_coop = shader_coop,
             .pipe_coop = pipe_coop,
+            .shader_coop_f16w = shader_coop_f16w,
+            .pipe_coop_f16w = pipe_coop_f16w,
             .shader_scores = shader_scores,
             .pipe_scores = pipe_scores,
             .shader_scores_vae = shader_scores_vae,
@@ -795,7 +815,7 @@ pub const Context = struct {
             }
             self.small_bufs.deinit(self.gpa);
         }
-        for ([_]*DeviceBuffer{ &self.x_dev, &self.y_dev, &self.raw_dev, &self.dummy, &self.x_h16 }) |db| {
+        for ([_]*DeviceBuffer{ &self.x_dev, &self.y_dev, &self.raw_dev, &self.dummy, &self.x_h16, &self.y_pad }) |db| {
             if (db.buf != .null_handle) {
                 self.d.DestroyBuffer(self.device, db.buf, null);
                 self.d.FreeMemory(self.device, db.mem, null);
@@ -814,6 +834,8 @@ pub const Context = struct {
         for (self.pipes_e) |pp| self.d.DestroyPipeline(self.device, pp, null);
         if (self.pipe_coop != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_coop, null);
         if (self.shader_coop != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_coop, null);
+        if (self.pipe_coop_f16w != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_coop_f16w, null);
+        if (self.shader_coop_f16w != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_coop_f16w, null);
         if (self.pipe_scores != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_scores, null);
         if (self.shader_scores != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_scores, null);
         if (self.pipe_scores_vae != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_scores_vae, null);
@@ -1225,7 +1247,7 @@ pub const Context = struct {
         cols: usize,
     ) Error!void {
         std.debug.assert(self.pipe_coop != .null_handle);
-        std.debug.assert(rows % 128 == 0 and cols % 64 == 0 and m_pad % 128 == 0);
+        std.debug.assert(rows % coopmat.coop_wgn == 0 and cols % 64 == 0 and m_pad % 128 == 0);
         const w_buf = try self.weightBuffer(w_bytes, 1, rows, cols);
         const push: [4]u32 = .{ @intCast(m_pad), @intCast(rows), @intCast(cols), @intCast(rows) };
         try self.opBegin();
@@ -1236,8 +1258,122 @@ pub const Context = struct {
         self.d.CmdBindPipeline(self.cmd, .compute, self.pipe_coop);
         self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout, vk.ShaderStage.compute, 0, 16, &push);
-        self.d.CmdDispatch(self.cmd, @intCast(rows / 128), @intCast(m_pad / 128), 1);
+        self.d.CmdDispatch(self.cmd, @intCast(rows / coopmat.coop_wgn), @intCast(m_pad / 128), 1);
         try self.opEnd();
+    }
+
+    /// Device f16 k-major weight buffer converted from tight f32
+    /// [rows][cols] on the CPU (element (k, col) at k * n_pad + col; zeros
+    /// in both pads so the GEMM's padded tiles contribute nothing).
+    /// Uploaded once and cached by host pointer; VAE conv weights are a few
+    /// MB each so the CPU pass is trivial next to the decode.
+    fn weightBufferF16From32(self: *Context, w: []const f32, rows: usize, cols: usize) Error!vk.Buffer {
+        const key = @intFromPtr(w.ptr);
+        if (self.weights.get(key)) |db| return db.buf;
+
+        const n_pad = std.mem.alignForward(usize, rows, 128);
+        const k_pad = std.mem.alignForward(usize, cols, 64);
+        const half = self.gpa.alloc(u16, k_pad * n_pad) catch return error.OutOfMemory;
+        defer self.gpa.free(half);
+        @memset(half, 0);
+        for (0..rows) |r| {
+            for (0..cols) |k| {
+                half[k * n_pad + r] = @bitCast(@as(f16, @floatCast(w[r * cols + k])));
+            }
+        }
+        const bytes = std.mem.sliceAsBytes(half);
+
+        const db = try self.createBuffer(
+            bytes.len,
+            vk.BufferUsage.storage_buffer | vk.BufferUsage.transfer_dst,
+            vk.MemoryProperty.device_local,
+        );
+        errdefer {
+            self.d.DestroyBuffer(self.device, db.buf, null);
+            self.d.FreeMemory(self.device, db.mem, null);
+        }
+        // Chunked staging upload + visibility barrier (same recipe as
+        // weightBuffer, minus the transpose — the layout is built on the CPU).
+        const cb = self.nowCmd();
+        const chunk: u64 = 256 << 20;
+        const mapped = try self.ensureHostBuffer(&self.staging, @min(bytes.len, chunk));
+        var off: u64 = 0;
+        while (off < bytes.len) {
+            const n: u64 = @min(chunk, bytes.len - off);
+            @memcpy(mapped[0..@intCast(n)], bytes[@intCast(off)..][0..@intCast(n)]);
+            try self.beginCmdBuf(cb);
+            const region: vk.BufferCopy = .{ .src_offset = 0, .dst_offset = off, .size = n };
+            self.d.CmdCopyBuffer(cb, self.staging.buf, db.buf, 1, @ptrCast(&region));
+            const to_shader: vk.BufferMemoryBarrier = .{
+                .src_access_mask = vk.Access.transfer_write,
+                .dst_access_mask = vk.Access.shader_read,
+                .buffer = db.buf,
+                .offset = 0,
+                .size = vk.WHOLE_SIZE,
+            };
+            self.d.CmdPipelineBarrier(cb, vk.PipelineStage.transfer, vk.PipelineStage.compute_shader, 0, 0, null, 1, @ptrCast(&to_shader), 0, null);
+            try self.submitAndWaitBuf(cb);
+            off += n;
+        }
+
+        try self.weights.put(self.gpa, key, db);
+        return db.buf;
+    }
+
+    /// Tensor-core GEMM for f32 weights (the VAE convs): B converts once to
+    /// zero-padded k-major f16 (cached), the f32 activations convert per
+    /// call with the k tail padded (f32_to_h16_pad, since 9*ci is rarely a
+    /// multiple of 64), C lands in the column-padded y_pad scratch, and
+    /// bias_compact strips the pad and adds the conv bias into `y` at
+    /// element offset `y_off`.
+    pub fn opMatmulCoopF16W(
+        self: *Context,
+        y: DeviceBuffer,
+        y_off: usize,
+        x: DeviceBuffer,
+        m: usize,
+        w: []const f32,
+        rows: usize,
+        cols: usize,
+        bias: []const f32,
+    ) Error!void {
+        std.debug.assert(self.pipe_coop_f16w != .null_handle);
+        const n_pad = std.mem.alignForward(usize, rows, 128);
+        const k_pad = std.mem.alignForward(usize, cols, 64);
+        const m_pad = std.mem.alignForward(usize, m, 128);
+        const w_buf = try self.weightBufferF16From32(w, rows, cols);
+        try self.ensureDeviceBuffer(&self.x_h16, m_pad * k_pad * 2);
+        try self.ensureDeviceBuffer(&self.y_pad, m_pad * n_pad * 4);
+
+        // x f32 [m][cols] -> f16 [m_pad][k_pad], zeros in both pads.
+        try self.opElt(.f32_to_h16_pad, x, null, null, self.x_h16, .{
+            .u0 = @intCast(m_pad * k_pad / 2),
+            .u1 = @intCast(cols),
+            .u2 = @intCast(k_pad),
+            .u3 = @intCast(m),
+            .f0 = 1.0,
+        }, m_pad * k_pad / 2, 1, 1);
+
+        const push: [4]u32 = .{ @intCast(m_pad), @intCast(n_pad), @intCast(k_pad), @intCast(n_pad) };
+        try self.opBegin();
+        var set = self.bind4(.{ self.x_h16.buf, self.x_h16.buf, self.y_pad.buf, w_buf });
+        self.d.CmdBindPipeline(self.cmd, .compute, self.pipe_coop_f16w);
+        self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
+        self.d.CmdPushConstants(self.cmd, self.pipeline_layout, vk.ShaderStage.compute, 0, 16, &push);
+        self.d.CmdDispatch(self.cmd, @intCast(n_pad / 128), @intCast(m_pad / 128), 1);
+        try self.opEnd();
+
+        const bias_buf: DeviceBuffer = .{
+            .buf = try self.smallBuffer(std.mem.sliceAsBytes(bias)),
+            .mem = .null_handle,
+            .size = 0,
+        };
+        try self.opElt(.bias_compact, self.y_pad, bias_buf, null, y, .{
+            .u0 = @intCast(m * rows),
+            .u1 = @intCast(rows),
+            .u2 = @intCast(n_pad),
+            .u3 = @intCast(y_off),
+        }, m * rows, 1, 1);
     }
 
     /// Attention-scores tensor-core GEMM (coopmat.buildGemmScores): grid is
@@ -1672,16 +1808,30 @@ test "gpu matmul matches cpu reference" {
         try ctx.tensorDownload(y_d, std.mem.sliceAsBytes(y));
 
         // Reference with f16-rounded operands (the kernel's exact regime),
-        // f64 accumulation.
+        // f64 accumulation. With f16 ACCUMULATORS (coop_acc_h16) each MMA
+        // step rounds the running sum at ~2^-11 relative of its magnitude,
+        // which is bounded by the row's absolute-product sum — this test's
+        // random e4m3 bytes drive that into the thousands (measured
+        // max_abs ~4 on sums bounded ~6700, i.e. a few f16 ulps), so the
+        // gate scales with that bound (4 ulps = 2^-9). The model-level
+        // gate stays the DiT parity fixture (0.169 with f16 accs).
         for (0..cm) |t| {
             for (0..crows) |r| {
                 var want: f64 = 0;
+                var want_abs: f64 = 0;
                 for (0..ccols) |k| {
                     const xa: f16 = @floatCast(x[t * ccols + k] * scale);
                     const wa: f16 = @floatCast(dtypes.f8e4m3ToF32(wbytes[r * ccols + k]));
-                    want += @as(f64, @floatCast(xa)) * @as(f64, @floatCast(wa));
+                    const prod = @as(f64, @floatCast(xa)) * @as(f64, @floatCast(wa));
+                    want += prod;
+                    want_abs += @abs(prod);
                 }
-                try std.testing.expectApproxEqAbs(@as(f32, @floatCast(want)), y[t * crows + r], 5e-3);
+                const wantf: f32 = @floatCast(want);
+                const tol: f32 = if (coopmat.coop_acc_h16)
+                    @max(5e-3, @as(f32, @floatCast(want_abs)) / 512.0)
+                else
+                    5e-3;
+                try std.testing.expectApproxEqAbs(wantf, y[t * crows + r], tol);
             }
         }
     }

@@ -3,8 +3,10 @@
 //! Mirrors `wan_vae.Decoder.decode` with the heavy work on the device:
 //! 3x3 convs run as banded im2col (kernels/eltwise.zig `im2col`, which also
 //! fuses the nearest-exact 2x upsample by halving source coordinates — the
-//! upsampled tensor is never materialized) followed by the f32 GEMM
-//! (`opMatmul`, bias included); 1x1 convs are direct GEMMs; the per-position
+//! upsampled tensor is never materialized) followed by a GEMM — tensor
+//! cores via `opMatmulCoopF16W` for co >= 96, the f32 register-tile GEMM
+//! (`opMatmul`, bias included) below that; 1x1 convs are direct GEMMs with
+//! the same routing; the per-position
 //! channel norms (+ their trailing silus) are the `vae_norm` kernel. Only
 //! the mid-block single-head attention core runs on the CPU (one qkv
 //! download + one attn-out upload); everything else stays device-resident
@@ -122,12 +124,18 @@ fn norm(ctx: *Context, src: *const DeviceBuffer, dst: *DeviceBuffer, n: usize, g
 
 /// Conv into `dst` ([n_out][co]); with `up`, the source is read through a
 /// fused nearest-exact 2x upsample and n_out covers the doubled dims.
+/// Convs with co >= 96 run on tensor cores (f16 weights/activations, f32
+/// accumulate — opMatmulCoopF16W); smaller ones (post_quant's 16, the
+/// 3-channel head) stay on the f32 GEMM, where padding co to the 128-wide
+/// coop tile would waste more than the tensor cores return.
 fn conv(ctx: *Context, bufs: *Bufs, src: *const DeviceBuffer, dst: *DeviceBuffer, h: usize, w: usize, cv: wan_vae.Conv2d, up: bool) !void {
     const wbytes = std.mem.sliceAsBytes(cv.w);
+    const coop = ctx.pipe_coop_f16w != .null_handle and cv.co >= 96;
     if (cv.k == 1) {
         std.debug.assert(!up);
         const n = h * w;
         try ctx.ensureDeviceBuffer(dst, n * cv.co * 4);
+        if (coop) return ctx.opMatmulCoopF16W(dst.*, 0, src.*, n, cv.w, cv.co, cv.ci, cv.b);
         return ctx.opMatmul(dst.*, 0, src.*, 0, n, wbytes, false, cv.co, cv.ci, 1.0, cv.b);
     }
     std.debug.assert(cv.k == 3);
@@ -155,7 +163,11 @@ fn conv(ctx: *Context, bufs: *Bufs, src: *const DeviceBuffer, dst: *DeviceBuffer
             .u5 = @intCast(p0),
             .f0 = if (up) 1.0 else 0.0,
         }, bn * patch_len, 1, 1);
-        try ctx.opMatmul(dst.*, p0 * cv.co * 4, bufs.patch, 0, bn, wbytes, false, cv.co, patch_len, 1.0, cv.b);
+        if (coop) {
+            try ctx.opMatmulCoopF16W(dst.*, p0 * cv.co, bufs.patch, bn, cv.w, cv.co, patch_len, cv.b);
+        } else {
+            try ctx.opMatmul(dst.*, p0 * cv.co * 4, bufs.patch, 0, bn, wbytes, false, cv.co, patch_len, 1.0, cv.b);
+        }
     }
 }
 

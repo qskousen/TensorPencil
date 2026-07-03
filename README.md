@@ -15,16 +15,20 @@ over 20 steps that difference accumulates as slight texture-level drift.
 |                 seed 252469767172722, 20 steps, cfg 1.0                  |                       same settings, 0.61% mean pixel delta                        |
 
 
+### AI Disclaimer
+TensorPencil is heavily AI-assisted code. Most of this stuff is over my head, I'm just tinkering here.
+The exception is this readme; I'm of the opinion that if you expect a human to take the time to read something, you should take the time to write it.
+
 Backends supported so far:
 - CPU
 - Vulkan
 
 The goal is for 100% Zig code other than needed 3rd party libraries for Vulkan and CUDA.
 
-Vulkan so far takes ~1.42x as long as ComfyUI CUDA (reference image: ~85 seconds in ComfyUI, ~121 seconds in TensorPencil). One
+Vulkan so far takes ~1.27x as long as ComfyUI CUDA (reference image: ~85 seconds in ComfyUI, ~108 seconds in TensorPencil). One
 limit right now is that there was an issue running flash attention in Vulkan because NVIDIA's 3090 Vulkan driver can only use 48 KB of workgroup shared memory,
 whereas CUDA has an opt-in to use 99 KB. This 48KB limit with the current tiling size causes extra traffic when using Flash Attention,
-leading to it being *slower* instead of faster in Vulkan. This may be correctable by using 40KB flash tiling; still untested.
+leading to it being *slower* instead of faster in Vulkan. Tried multiple ways to squeeze it in and so far hasn't worked out.
 
 This has been tested only on Linux with an RTX 3090. It's likely that other operating systems and GPUs will hit problems
 or run less efficiently.
