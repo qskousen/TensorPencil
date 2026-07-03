@@ -200,6 +200,38 @@ export fn rope_inter() callconv(.spirv_kernel) void {
     a.data[at + 1] = x0 * sin_v + x1 * cos_v;
 }
 
+// rope_half: rotate-half RoPE (Qwen/Llama convention) in place — pairs
+// element i with i+half rather than adjacent lanes. a = qk, c = freqs (cos
+// then sin halves). u0 = total (seq*n_heads*half), u1 = half, u2 = sin_off,
+// u3 = n_heads. Matches ops.rope.applyRotateHalf exactly.
+export fn rope_half() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const half = pc.u1;
+    const i = idx % half;
+    const pos = idx / (half * pc.u3);
+    const row = idx / half; // pos*n_heads + head
+    const cos_v = c.data[pos * half + i];
+    const sin_v = c.data[pc.u2 + pos * half + i];
+    const base = row * (2 * half);
+    const lo = a.data[base + i];
+    const hi = a.data[base + half + i];
+    a.data[base + i] = lo * cos_v - hi * sin_v;
+    a.data[base + half + i] = hi * cos_v + lo * sin_v;
+}
+
+// copy: b[u2 + idx] = a[idx]. Contiguous copy with a destination offset;
+// used to snapshot hidden-state taps into a tap-major output buffer on the
+// device (keeps the encoder forward in one batch). u0 = element count,
+// u2 = dest offset.
+export fn copy() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    b.data[pc.u2 + idx] = a.data[idx];
+}
+
 // --- GEMM-ified attention (scores buffer batched over head groups) -------
 // attn_scores: S[z][q][j] = scale * dot(Q[q, head, :], K[j, kv(head), :])
 //   where head = u4 + z. 4x4 register tile per thread; x = key tile,
@@ -405,6 +437,9 @@ export fn attn_out() callconv(.spirv_kernel) void {
         pb[i] = z * splane + @min(q0 + i, s_max) * sstr;
     }
     const vb = kv_head * hd + c0;
+    // f1 != 0 => causal: row q attends only to keys j <= q (encoder path;
+    // the DiT leaves f1 = 0 for full attention).
+    const causal: u32 = @bitCast(pc.f1);
 
     // Online softmax fused over raw scores: no separate softmax pass, no
     // extra scores traffic. Per-row running max/denominator in registers.
@@ -418,14 +453,16 @@ export fn attn_out() callconv(.spirv_kernel) void {
             vv[u] = c.data[j * kv_stride + vb + u];
         }
         inline for (0..amm_tile) |i| {
-            const s = a.data[pb[i] + j];
-            const m_new = @max(m[i], s);
-            const corr = @exp(m[i] - m_new);
-            const pv = @exp(s - m_new);
-            denom[i] = denom[i] * corr + pv;
-            m[i] = m_new;
-            inline for (0..amm_tile) |u| {
-                acc[i][u] = acc[i][u] * corr + pv * vv[u];
+            if (causal == 0 or j <= q0 + i) {
+                const s = a.data[pb[i] + j];
+                const m_new = @max(m[i], s);
+                const corr = @exp(m[i] - m_new);
+                const pv = @exp(s - m_new);
+                denom[i] = denom[i] * corr + pv;
+                m[i] = m_new;
+                inline for (0..amm_tile) |u| {
+                    acc[i][u] = acc[i][u] * corr + pv * vv[u];
+                }
             }
         }
     }
@@ -543,6 +580,138 @@ export fn sigmoid_mul_h16() callconv(.spirv_kernel) void {
         }
     }
     d.data[idx] = @bitCast(out);
+}
+
+// --- f16-input variants for the f16-C-store coop GEMM path ----------------
+// With f16 accumulators the coop GEMM's C values are exactly representable
+// in f16, so these kernels read the half-precision C directly and compute
+// in f32 — value-identical to the old f32-C + convert chain, at half the
+// GEMM-output traffic.
+
+// qknorm_rope16: fused per-head RMS norm + interleaved rope + output scale,
+// in place on the f16 QKV GEMM output. One thread per (pos, head) row; the
+// element pair of each u32 word is exactly one rope pair, and the operation
+// order matches the rmsnorm + rope_inter + f32_to_h16 chain it replaces.
+// a = q/k (f16 pair words, in place), b = norm weight, c = freqs (cos then
+// sin halves). u0 = rows (seq*n_heads), u1 = half (dim/2), u2 = sin_off,
+// u3 = n_heads, f0 = output scale, f1 = eps.
+export fn qknorm_rope16() callconv(.spirv_kernel) void {
+    decorate();
+    const row = gpu.global_invocation_id[0];
+    if (row >= pc.u0) return;
+    const half = pc.u1;
+    const pos = row / pc.u3;
+    const base_w = row * half;
+    var sum: f32 = 0;
+    var w: u32 = 0;
+    while (w < half) : (w += 1) {
+        const word: u32 = @bitCast(a.data[base_w + w]);
+        inline for (0..2) |j| {
+            const hv: f16 = @bitCast(@as(u16, @truncate(word >> (16 * j))));
+            const v: f32 = @floatCast(hv);
+            sum += v * v;
+        }
+    }
+    const inv = 1.0 / @sqrt(sum / @as(f32, @floatFromInt(half * 2)) + pc.f1);
+    w = 0;
+    while (w < half) : (w += 1) {
+        const word: u32 = @bitCast(a.data[base_w + w]);
+        const h0: f16 = @bitCast(@as(u16, @truncate(word)));
+        const h1: f16 = @bitCast(@as(u16, @truncate(word >> 16)));
+        const x0 = @as(f32, @floatCast(h0)) * inv * b.data[w * 2];
+        const x1 = @as(f32, @floatCast(h1)) * inv * b.data[w * 2 + 1];
+        const cos_v = c.data[pos * half + w];
+        const sin_v = c.data[pc.u2 + pos * half + w];
+        const o0: f16 = @floatCast((x0 * cos_v - x1 * sin_v) * pc.f0);
+        const o1: f16 = @floatCast((x0 * sin_v + x1 * cos_v) * pc.f0);
+        a.data[base_w + w] = @bitCast(@as(u32, @as(u16, @bitCast(o0))) | (@as(u32, @as(u16, @bitCast(o1))) << 16));
+    }
+}
+
+// gather_kmajor16: gather_kmajor_h16 with an f16 source — raw u16 moves, no
+// conversion. a = f16 [seq][kv][hd] pair words, d = packed f16 pairs
+// [kv][hd][s_stride]; positions >= seq write zero. u0 = out words, u1 = hd,
+// u2 = s_stride (even), u3 = seq, u4 = n_kv_heads.
+export fn gather_kmajor16() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const e0 = idx * 2;
+    const hd = pc.u1;
+    const sstride = pc.u2;
+    const plane = hd * sstride;
+    const h = e0 / plane;
+    const rem = e0 % plane;
+    const k = rem / sstride;
+    const s0 = rem % sstride;
+    var out: u32 = 0;
+    inline for (0..2) |j| {
+        const s = s0 + j;
+        if (s < pc.u3) {
+            const e = (s * pc.u4 + h) * hd + k;
+            const word: u32 = @bitCast(a.data[e / 2]);
+            const hv: u16 = @truncate(word >> @as(u5, @intCast((e & 1) * 16)));
+            out |= @as(u32, hv) << (16 * j);
+        }
+    }
+    d.data[idx] = @bitCast(out);
+}
+
+// silu_mul16: silu_mul_h16 with f16 gate/up inputs (the GEMM's zero pad
+// rows pass through as silu(0)*0 = 0, so no bound is needed).
+// a = gate words, b = up words, d = out words. u0 = words, f0 = scale.
+export fn silu_mul16() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const gw: u32 = @bitCast(a.data[idx]);
+    const uw: u32 = @bitCast(b.data[idx]);
+    var out: u32 = 0;
+    inline for (0..2) |j| {
+        const g: f32 = @floatCast(@as(f16, @bitCast(@as(u16, @truncate(gw >> (16 * j))))));
+        const u: f32 = @floatCast(@as(f16, @bitCast(@as(u16, @truncate(uw >> (16 * j))))));
+        const v: f16 = @floatCast(g / (1.0 + @exp(-g)) * u * pc.f0);
+        out |= @as(u32, @as(u16, @bitCast(v))) << (16 * j);
+    }
+    d.data[idx] = @bitCast(out);
+}
+
+// sigmoid_mul_g16: sigmoid_mul_h16 with an f16 gate. a = dst (f32, bound by
+// u1 — attention pad rows are never read), b = gate words, d = out words.
+// u0 = words, u1 = real elems, f0 = scale.
+export fn sigmoid_mul_g16() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const e0 = idx * 2;
+    const gw: u32 = @bitCast(b.data[idx]);
+    var out: u32 = 0;
+    inline for (0..2) |j| {
+        const e = e0 + j;
+        if (e < pc.u1) {
+            const g: f32 = @floatCast(@as(f16, @bitCast(@as(u16, @truncate(gw >> (16 * j))))));
+            const v: f16 = @floatCast(a.data[e] / (1.0 + @exp(-g)) * pc.f0);
+            out |= @as(u32, @as(u16, @bitCast(v))) << (16 * j);
+        }
+    }
+    d.data[idx] = @bitCast(out);
+}
+
+// gated_add16: gated_add with an f16 delta (the wo / mlp.down GEMM output).
+// a = x (f32, in place), b = delta words, c = vectors. u0 = words (n/2),
+// u1 = dim, u2 = gate_off.
+export fn gated_add16() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const e0 = idx * 2;
+    const w: u32 = @bitCast(b.data[idx]);
+    inline for (0..2) |j| {
+        const e = e0 + j;
+        const col = e % pc.u1;
+        const dv: f32 = @floatCast(@as(f16, @bitCast(@as(u16, @truncate(w >> (16 * j))))));
+        a.data[e] += c.data[pc.u2 + col] * dv;
+    }
 }
 
 // --- VAE decoder kernels ---------------------------------------------------

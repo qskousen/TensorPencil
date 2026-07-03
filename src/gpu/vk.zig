@@ -39,6 +39,8 @@ pub const MAX_MEMORY_TYPES = 32;
 pub const MAX_MEMORY_HEAPS = 16;
 /// `#define VK_MAX_PHYSICAL_DEVICE_NAME_SIZE 256U`
 pub const MAX_PHYSICAL_DEVICE_NAME_SIZE = 256;
+/// `#define VK_MAX_EXTENSION_NAME_SIZE 256U`
+pub const MAX_EXTENSION_NAME_SIZE = 256;
 /// `#define VK_UUID_SIZE 16U`
 pub const UUID_SIZE = 16;
 
@@ -159,7 +161,9 @@ pub const StructureType = enum(i32) {
     memory_barrier = 46,
     physical_device_vulkan_1_2_features = 51,
     physical_device_features_2 = 1000059000,
+    physical_device_memory_properties_2 = 1000059006,
     memory_allocate_flags_info = 1000060000,
+    physical_device_memory_budget_properties_ext = 1000237000,
     _,
 };
 
@@ -507,6 +511,25 @@ pub const PhysicalDeviceMemoryProperties = extern struct {
     memory_types: [MAX_MEMORY_TYPES]MemoryType,
     memory_heap_count: u32,
     memory_heaps: [MAX_MEMORY_HEAPS]MemoryHeap,
+};
+
+pub const PhysicalDeviceMemoryProperties2 = extern struct {
+    s_type: StructureType = .physical_device_memory_properties_2,
+    p_next: ?*anyopaque = null,
+    memory_properties: PhysicalDeviceMemoryProperties,
+};
+
+/// `VkPhysicalDeviceMemoryBudgetPropertiesEXT` (VK_EXT_memory_budget)
+pub const PhysicalDeviceMemoryBudgetPropertiesEXT = extern struct {
+    s_type: StructureType = .physical_device_memory_budget_properties_ext,
+    p_next: ?*anyopaque = null,
+    heap_budget: [MAX_MEMORY_HEAPS]DeviceSize,
+    heap_usage: [MAX_MEMORY_HEAPS]DeviceSize,
+};
+
+pub const ExtensionProperties = extern struct {
+    extension_name: [MAX_EXTENSION_NAME_SIZE]u8,
+    spec_version: u32,
 };
 
 pub const DeviceQueueCreateInfo = extern struct {
@@ -916,6 +939,8 @@ pub const PfnEnumeratePhysicalDevices = *const fn (Instance, *u32, ?[*]PhysicalD
 pub const PfnGetPhysicalDeviceProperties = *const fn (PhysicalDevice, *PhysicalDeviceProperties) callconv(.c) void;
 pub const PfnGetPhysicalDeviceQueueFamilyProperties = *const fn (PhysicalDevice, *u32, ?[*]QueueFamilyProperties) callconv(.c) void;
 pub const PfnGetPhysicalDeviceMemoryProperties = *const fn (PhysicalDevice, *PhysicalDeviceMemoryProperties) callconv(.c) void;
+pub const PfnGetPhysicalDeviceMemoryProperties2 = *const fn (PhysicalDevice, *PhysicalDeviceMemoryProperties2) callconv(.c) void;
+pub const PfnEnumerateDeviceExtensionProperties = *const fn (PhysicalDevice, ?[*:0]const u8, *u32, ?[*]ExtensionProperties) callconv(.c) Result;
 pub const PfnCreateDevice = *const fn (PhysicalDevice, *const DeviceCreateInfo, ?*const AllocationCallbacks, *Device) callconv(.c) Result;
 pub const PfnDestroyDevice = *const fn (Device, ?*const AllocationCallbacks) callconv(.c) void;
 pub const PfnGetDeviceQueue = *const fn (Device, u32, u32, *Queue) callconv(.c) void;

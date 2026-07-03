@@ -17,6 +17,12 @@ const DiT = dit.DiT;
 /// submission makes host-side timing exact).
 pub var profile: bool = false;
 
+/// When true, force the full-f32 path (opMatmul GEMMs + eltwise f32
+/// attention) even where the tensor-core / coop pipelines exist — the
+/// hardware-fallback path, exposed for A/B (speed vs f16 rounding). Must be
+/// set before Workspace.init, which sizes its buffers from the same choice.
+pub var force_f32: bool = false;
+
 const Prof = struct {
     matmul_ns: i96 = 0,
     attn_ns: i96 = 0,
@@ -32,6 +38,23 @@ const heads = dit.n_heads;
 const kv_heads = dit.n_kv_heads;
 const hd = dit.head_dim;
 const attn_scale: f32 = 1.0 / 11.313708498984761; // 1/sqrt(128)
+
+/// Flash attention (coopmat.buildFlashAttn) keeps the {m, 1/d} table in the
+/// tail of attn_d and never materializes S — but measured SLOWER than the
+/// two-pass path at DiT sizes (attn 1.49 -> 2.43 s at 1120x1680): the out
+/// pass recomputes S at the global-fragment-load rate (~0.8 s), which costs
+/// more than the coalesced S write + reads it eliminates (~0.5 s). It would
+/// win only with both operands staged in shared, which doesn't fit the 48 KB
+/// workgroup ceiling next to the S tile at this tiling. Kept behind this
+/// switch (kernels are unit-tested) for smaller-seq experiments or a future
+/// retiling.
+const use_flash = false;
+/// Two-pass softmax / parallel rmsnorm chunk counts: 32 interleaved chunks
+/// per row so a warp covers a row with coalesced reads.
+const nchunks = 32;
+const rms_ch = 32;
+/// Cap on the materialized attention-scores buffer; heads batch to fit it.
+const s_bytes_cap: usize = 2 << 30;
 
 /// Per-sampling-run cache: everything constant across steps — the text
 /// fusion tokens (a full CPU transformer pass), the rope table, and the
@@ -127,10 +150,110 @@ pub const Session = struct {
     }
 };
 
+/// Per-run device activation buffers, allocated once and reused every step
+/// (a forward used to create/destroy ~20 buffers per call — including the
+/// ~2 GiB scores buffer — and each tensorCreate is a raw vkAllocateMemory).
+/// Sized for a maximum sequence; one Workspace is shared by the positive and
+/// negative CFG sessions (they differ only in text length). Every kernel
+/// writes the regions it later reads (including zero padding), so reuse
+/// across steps and sessions needs no clearing.
+pub const Workspace = struct {
+    seq_cap: usize,
+    x_d: gpu.DeviceBuffer,
+    t1_d: gpu.DeviceBuffer,
+    q_d: gpu.DeviceBuffer,
+    k_d: gpu.DeviceBuffer,
+    v_d: gpu.DeviceBuffer,
+    g_d: gpu.DeviceBuffer,
+    attn_d: gpu.DeviceBuffer,
+    mg_d: gpu.DeviceBuffer,
+    mu_d: gpu.DeviceBuffer,
+    mv_d: gpu.DeviceBuffer,
+    fin_d: gpu.DeviceBuffer,
+    imgin_d: gpu.DeviceBuffer,
+    qt_d: gpu.DeviceBuffer,
+    kt_d: gpu.DeviceBuffer,
+    s_d: gpu.DeviceBuffer,
+    v16_d: gpu.DeviceBuffer,
+    part_d: gpu.DeviceBuffer,
+    md_d: gpu.DeviceBuffer,
+    rmsp_d: gpu.DeviceBuffer,
+    rmsi_d: gpu.DeviceBuffer,
+    h16_d: gpu.DeviceBuffer,
+
+    pub fn init(ctx: *gpu.Context, lat_h: usize, lat_w: usize, seq_txt_cap: usize) !Workspace {
+        const n_img = (lat_h / dit.patch) * (lat_w / dit.patch);
+        const seq = seq_txt_cap + n_img;
+        const seq_pad = std.mem.alignForward(usize, seq, 128);
+        const coop = !force_f32 and ctx.pipe_coop != .null_handle;
+        const tc_attn = !force_f32 and ctx.pipe_scores != .null_handle;
+        const flash = use_flash and ctx.pipe_flash_md != .null_handle;
+        const s_rows = if (tc_attn) seq_pad else seq;
+        const s_esize: usize = if (tc_attn) 2 else 4;
+        const hpb = headsPerBatch(s_rows, s_esize, null);
+
+        var ws: Workspace = undefined;
+        ws.seq_cap = seq;
+        var created: usize = 0;
+        errdefer inline for (buf_fields, 0..) |name, i| {
+            if (i < created) ctx.tensorDestroy(&@field(ws, name));
+        };
+        const sizes = [buf_fields.len]usize{
+            seq_pad * F * 4, // x_d
+            seq_pad * F * 4, // t1_d
+            seq_pad * heads * hd * 4, // q_d
+            seq_pad * kv_heads * hd * 4, // k_d
+            seq_pad * kv_heads * hd * 4, // v_d
+            seq_pad * F * 4, // g_d
+            seq_pad * F * 4 + if (flash) heads * seq_pad * 2 * 4 else 0, // attn_d
+            seq_pad * dit.mlp_dim * 4, // mg_d
+            seq_pad * dit.mlp_dim * 4, // mu_d
+            dit.n_blocks * 6 * F * 4, // mv_d
+            2 * F * 4, // fin_d
+            n_img * dit.channels * dit.patch * dit.patch * 4, // imgin_d
+            if (tc_attn) seq_pad * heads * hd * 2 else seq * heads * hd * 4 + 32, // qt_d
+            if (tc_attn) kv_heads * hd * seq_pad * 2 else seq * kv_heads * hd * 4 + 32, // kt_d
+            if (flash) 16 else hpb * s_rows * s_rows * s_esize, // s_d
+            if (tc_attn) seq_pad * kv_heads * hd * 2 else 16, // v16_d
+            if (tc_attn and !flash) hpb * seq * nchunks * 2 * 4 else 16, // part_d
+            if (tc_attn and !flash) hpb * seq_pad * 2 * 4 else 16, // md_d
+            seq * rms_ch * 4, // rmsp_d
+            seq * 4, // rmsi_d
+            if (coop) seq_pad * dit.mlp_dim * 2 else 16, // h16_d
+        };
+        inline for (buf_fields, sizes) |name, size| {
+            @field(ws, name) = try ctx.tensorCreate(size);
+            created += 1;
+        }
+        return ws;
+    }
+
+    pub fn deinit(self: *Workspace, ctx: *gpu.Context) void {
+        inline for (buf_fields) |name| ctx.tensorDestroy(&@field(self, name));
+        self.* = undefined;
+    }
+
+    const buf_fields = [_][]const u8{
+        "x_d",  "t1_d",  "q_d",    "k_d",  "v_d",     "g_d",  "attn_d",
+        "mg_d", "mu_d",  "mv_d",   "fin_d", "imgin_d", "qt_d", "kt_d",
+        "s_d",  "v16_d", "part_d", "md_d", "rmsp_d",  "rmsi_d", "h16_d",
+    };
+};
+
+/// How many heads' scores planes fit the byte cap (and, when reusing a
+/// Workspace built for a longer sequence, its actual buffer).
+fn headsPerBatch(s_rows: usize, s_esize: usize, ws_s_bytes: ?usize) usize {
+    const plane = s_rows * s_rows * s_esize;
+    var hb = @max(1, @min(heads, s_bytes_cap / plane));
+    if (ws_s_bytes) |cap| hb = @max(1, @min(hb, cap / plane));
+    return hb;
+}
+
 pub fn forward(
     model: *const DiT,
     ctx: *gpu.Context,
     sess: *const Session,
+    ws: *const Workspace,
     io: std.Io,
     gpa: std.mem.Allocator,
     out: []f32,
@@ -148,7 +271,7 @@ pub fn forward(
     // tiles); buffers that receive GEMM output are sized for seq_pad (pad
     // rows stay zero).
     const seq_pad = std.mem.alignForward(usize, seq, 128);
-    const coop = ctx.pipe_coop != .null_handle;
+    const coop = !force_f32 and ctx.pipe_coop != .null_handle;
     var prof: Prof = .{};
     var t_mark = std.Io.Clock.real.now(io);
     const mark = struct {
@@ -204,80 +327,50 @@ pub fn forward(
 
     mark(io, &t_mark, &prof.cpu_ns);
 
-    // Device tensors.
-    var x_d = try ctx.tensorCreate(seq_pad * F * 4);
-    defer ctx.tensorDestroy(&x_d);
-    var t1_d = try ctx.tensorCreate(seq_pad * F * 4);
-    defer ctx.tensorDestroy(&t1_d);
-    var q_d = try ctx.tensorCreate(seq_pad * heads * hd * 4);
-    defer ctx.tensorDestroy(&q_d);
-    var k_d = try ctx.tensorCreate(seq_pad * kv_heads * hd * 4);
-    defer ctx.tensorDestroy(&k_d);
-    var v_d = try ctx.tensorCreate(seq_pad * kv_heads * hd * 4);
-    defer ctx.tensorDestroy(&v_d);
-    var g_d = try ctx.tensorCreate(seq_pad * F * 4);
-    defer ctx.tensorDestroy(&g_d);
-    // Flash attention (coopmat.buildFlashAttn) keeps the {m, 1/d} table in
-    // the tail of attn_d and never materializes S — but measured SLOWER than
-    // the two-pass path at DiT sizes (attn 1.49 -> 2.43 s at 1120x1680): the
-    // out pass recomputes S at the global-fragment-load rate (~0.8 s), which
-    // costs more than the coalesced S write + reads it eliminates (~0.5 s).
-    // It would win only with both operands staged in shared, which doesn't
-    // fit the 48 KB workgroup ceiling next to the S tile at this tiling.
-    // Kept behind this switch (kernels are unit-tested) for smaller-seq
-    // experiments or a future retiling.
-    const use_flash = false;
+    // Device tensors come from the per-run Workspace (allocated once, reused
+    // every step and by both CFG sessions).
+    std.debug.assert(seq <= ws.seq_cap);
+    const x_d = ws.x_d;
+    const t1_d = ws.t1_d;
+    const q_d = ws.q_d;
+    const k_d = ws.k_d;
+    const v_d = ws.v_d;
+    const g_d = ws.g_d;
     const flash = use_flash and ctx.pipe_flash_md != .null_handle;
     const md_off = seq_pad * F;
-    var attn_d = try ctx.tensorCreate(seq_pad * F * 4 + if (flash) heads * seq_pad * 2 * 4 else 0);
-    defer ctx.tensorDestroy(&attn_d);
-    var mg_d = try ctx.tensorCreate(seq_pad * dit.mlp_dim * 4);
-    defer ctx.tensorDestroy(&mg_d);
-    var mu_d = try ctx.tensorCreate(seq_pad * dit.mlp_dim * 4);
-    defer ctx.tensorDestroy(&mu_d);
-    var mv_d = try ctx.tensorCreate(mv.len * 4);
-    defer ctx.tensorDestroy(&mv_d);
-    var fin_d = try ctx.tensorCreate(fin.len * 4);
-    defer ctx.tensorDestroy(&fin_d);
+    const attn_d = ws.attn_d;
+    const mg_d = ws.mg_d;
+    const mu_d = ws.mu_d;
+    const mv_d = ws.mv_d;
+    const fin_d = ws.fin_d;
     const freqs_d = sess.freqs_d;
-    var imgin_d = try ctx.tensorCreate(img_in.len * 4);
-    defer ctx.tensorDestroy(&imgin_d);
+    const imgin_d = ws.imgin_d;
     // Attention operands. With the tensor-core scores pipeline, Q converts
     // to f16 (softmax scale prefolded) and K gathers into a per-head k-major
     // f16 block with seq_pad columns (zero padded); the f32 fallback keeps
     // the old k-major gathers (+32 B pad: its edge tiles read a few elements
     // past the last position, masked at store).
     comptime std.debug.assert(hd == 128); // buildGemmScores unrolls hd/16
-    const tc_attn = ctx.pipe_scores != .null_handle;
-    var qt_d = try ctx.tensorCreate(if (tc_attn) seq_pad * heads * hd * 2 else seq * heads * hd * 4 + 32);
-    defer ctx.tensorDestroy(&qt_d);
-    var kt_d = try ctx.tensorCreate(if (tc_attn) kv_heads * hd * seq_pad * 2 else seq * kv_heads * hd * 4 + 32);
-    defer ctx.tensorDestroy(&kt_d);
-    // Attention scores batched over head groups to bound VRAM (~<= 2 GiB).
-    // The flash path never materializes S (or the softmax scratch).
+    const tc_attn = !force_f32 and ctx.pipe_scores != .null_handle;
+    const qt_d = ws.qt_d;
+    const kt_d = ws.kt_d;
+    // Attention scores batched over head groups to bound VRAM (~<= 2 GiB)
+    // and fit the Workspace buffers (which may be sized for a longer
+    // sequence, whose per-head planes and chunk tables divide differently).
     const s_rows = if (tc_attn) seq_pad else seq;
     const s_esize: usize = if (tc_attn) 2 else 4; // coop path stores S f16
-    const heads_per_batch: usize = @max(1, @min(heads, (2 << 30) / (s_rows * s_rows * s_esize)));
-    var s_d = try ctx.tensorCreate(if (flash) 16 else heads_per_batch * s_rows * s_rows * s_esize);
-    defer ctx.tensorDestroy(&s_d);
-    // Two-pass softmax state + f16 V for the tensor-core P@V GEMM. 32
-    // interleaved chunks per row: a warp covers a row with coalesced reads.
-    const nchunks = 32;
-    var v16_d = try ctx.tensorCreate(if (tc_attn) seq_pad * kv_heads * hd * 2 else 16);
-    defer ctx.tensorDestroy(&v16_d);
-    var part_d = try ctx.tensorCreate(if (tc_attn and !flash) heads_per_batch * seq * nchunks * 2 * 4 else 16);
-    defer ctx.tensorDestroy(&part_d);
-    var md_d = try ctx.tensorCreate(if (tc_attn and !flash) heads_per_batch * seq_pad * 2 * 4 else 16);
-    defer ctx.tensorDestroy(&md_d);
-    // Parallel rmsnorm state (32 interleaved chunks per row) and the f16
-    // scratch the fused gate kernels write for the wo / mlp.down GEMMs.
-    const rms_ch = 32;
-    var rmsp_d = try ctx.tensorCreate(seq * rms_ch * 4);
-    defer ctx.tensorDestroy(&rmsp_d);
-    var rmsi_d = try ctx.tensorCreate(seq * 4);
-    defer ctx.tensorDestroy(&rmsi_d);
-    var h16_d = try ctx.tensorCreate(if (coop) seq_pad * dit.mlp_dim * 2 else 16);
-    defer ctx.tensorDestroy(&h16_d);
+    var heads_per_batch = headsPerBatch(s_rows, s_esize, ws.s_d.size);
+    if (tc_attn and !flash) {
+        heads_per_batch = @max(1, @min(heads_per_batch, ws.part_d.size / (seq * nchunks * 2 * 4)));
+        heads_per_batch = @max(1, @min(heads_per_batch, ws.md_d.size / (seq_pad * 2 * 4)));
+    }
+    const s_d = ws.s_d;
+    const v16_d = ws.v16_d;
+    const part_d = ws.part_d;
+    const md_d = ws.md_d;
+    const rmsp_d = ws.rmsp_d;
+    const rmsi_d = ws.rmsi_d;
+    const h16_d = ws.h16_d;
 
     try ctx.tensorUpload(mv_d, std.mem.sliceAsBytes(mv));
     try ctx.tensorUpload(fin_d, std.mem.sliceAsBytes(fin));
@@ -330,6 +423,11 @@ pub fn forward(
             blk.attn.wq.scale == blk.attn.wk.scale and
             blk.attn.wq.scale == blk.attn.wv.scale and
             blk.attn.wq.scale == blk.attn.gate.scale;
+        // f16 C stores (exact under f16 accumulators): q/k/g come out of
+        // their GEMMs half-precision, V lands directly in the P@V layout,
+        // and the qk-norm + rope + convert chain collapses to one in-place
+        // pass per operand.
+        const att16 = qkv_shared and tc_attn and ctx.pipe_coop_c16 != .null_handle;
         if (qkv_shared) {
             try ctx.opElt(.rms_apply_mod_h16, x_d, h16_d, mv_d, rmsi_d, .{
                 .u0 = @intCast(seq_pad * F / 2),
@@ -340,9 +438,19 @@ pub fn forward(
                 .f0 = blk.attn.wq.scale,
             }, seq_pad * F / 2, 1, 1);
             mark(io, &t_mark, &prof.elt_ns);
-            inline for (.{ .{ q_d, "wq" }, .{ k_d, "wk" }, .{ v_d, "wv" }, .{ g_d, "gate" } }) |v| {
-                const w_ = @field(blk.attn, v[1]);
-                try ctx.opMatmulCoopH16(v[0], h16_d, seq_pad, w_.bytes, w_.rows, w_.cols);
+            // All four GEMMs read h16_d and write disjoint outputs: no
+            // barriers between them, so the small wk/wv grids (6 columns of
+            // workgroups) overlap the tails of their neighbors.
+            ctx.independent(4);
+            inline for (.{ .{ "wq", 0 }, .{ "wk", 1 }, .{ "wv", 2 }, .{ "gate", 3 } }) |v| {
+                const w_ = @field(blk.attn, v[0]);
+                const dst = switch (v[1]) {
+                    0 => q_d,
+                    1 => k_d,
+                    2 => if (att16) v16_d else v_d,
+                    else => g_d,
+                };
+                try ctx.opMatmulCoopH16(dst, h16_d, seq_pad, w_.bytes, w_.rows, w_.cols, att16);
                 mark(io, &t_mark, &prof.matmul_ns);
             }
         } else {
@@ -362,6 +470,42 @@ pub fn forward(
             try Gemm.go(ctx, coop, g_d, t1_d, seq, seq_pad, blk.attn.gate);
             mark(io, &t_mark, &prof.matmul_ns);
         }
+        if (att16) {
+            // Fused per-head norm + rope + scale, in place on the f16 GEMM
+            // outputs (value-identical to the chain below — see the kernel);
+            // K then gathers f16 -> f16 into the scores layout. V needs
+            // nothing: its GEMM already wrote the P@V operand.
+            ctx.independent(2);
+            try ctx.opElt(.qknorm_rope16, q_d, try normBuf(ctx, blk.attn.qnorm), freqs_d, null, .{
+                .u0 = @intCast(seq * heads),
+                .u1 = half,
+                .u2 = sin_off,
+                .u3 = heads,
+                .f0 = attn_scale,
+                .f1 = 1e-5,
+            }, seq * heads, 1, 1);
+            mark(io, &t_mark, &prof.elt_ns);
+            try ctx.opElt(.qknorm_rope16, k_d, try normBuf(ctx, blk.attn.knorm), freqs_d, null, .{
+                .u0 = @intCast(seq * kv_heads),
+                .u1 = half,
+                .u2 = sin_off,
+                .u3 = kv_heads,
+                .f0 = 1.0,
+                .f1 = 1e-5,
+            }, seq * kv_heads, 1, 1);
+            mark(io, &t_mark, &prof.elt_ns);
+            try ctx.opElt(.gather_kmajor16, k_d, null, null, kt_d, .{
+                .u0 = @intCast(kv_heads * hd * seq_pad / 2),
+                .u1 = hd,
+                .u2 = @intCast(seq_pad),
+                .u3 = @intCast(seq),
+                .u4 = kv_heads,
+            }, kv_heads * hd * seq_pad / 2, 1, 1);
+            mark(io, &t_mark, &prof.elt_ns);
+        } else {
+        // The q and k chains (norm -> rope -> convert/gather) touch disjoint
+        // buffers stage by stage; each stage pair/triple runs barrier-free.
+        ctx.independent(2);
         try ctx.opElt(.rmsnorm, q_d, q_d, try normBuf(ctx, blk.attn.qnorm), null, .{
             .u0 = @intCast(seq * heads),
             .u1 = hd,
@@ -374,6 +518,7 @@ pub fn forward(
             .f0 = 1e-5,
         }, seq * kv_heads, 1, 1);
         mark(io, &t_mark, &prof.elt_ns);
+        ctx.independent(2);
         try ctx.opElt(.rope_inter, q_d, null, freqs_d, null, .{
             .u0 = @intCast(seq * heads * half),
             .u1 = half,
@@ -389,6 +534,7 @@ pub fn forward(
         }, seq * kv_heads * half, 1, 1);
         mark(io, &t_mark, &prof.elt_ns);
         if (tc_attn) {
+            ctx.independent(3);
             try ctx.opElt(.f32_to_h16, q_d, null, null, qt_d, .{
                 .u0 = @intCast(seq_pad * heads * hd / 2),
                 .u1 = @intCast(seq * heads * hd),
@@ -407,6 +553,7 @@ pub fn forward(
                 .f0 = 1.0,
             }, seq_pad * kv_heads * hd / 2, 1, 1);
         } else {
+            ctx.independent(2);
             try ctx.opElt(.gather_kmajor, q_d, null, null, qt_d, .{
                 .u0 = @intCast(seq * heads * hd),
                 .u1 = heads,
@@ -420,6 +567,10 @@ pub fn forward(
                 .u3 = @intCast(seq),
             }, seq * kv_heads * hd, 1, 1);
         }
+        }
+        // On the f16-C path Q was normed/roped/scaled in place: it IS the
+        // scores operand.
+        const q_src = if (att16) q_d else qt_d;
         if (flash) {
             const push = gpu.EltPush{
                 .u0 = heads * hd,
@@ -430,10 +581,10 @@ pub fn forward(
                 .u5 = @intCast(md_off),
                 .f0 = @bitCast(@as(u32, @intCast(seq))),
             };
-            try ctx.opFlash(.md, qt_d, kt_d, v16_d, attn_d, push, seq_pad / 128, heads);
+            try ctx.opFlash(.md, q_src, kt_d, v16_d, attn_d, push, seq_pad / 128, heads);
             mark(io, &t_mark, &prof.scores_ns);
             mark(io, &t_mark, &prof.smax_ns);
-            try ctx.opFlash(.out, qt_d, kt_d, v16_d, attn_d, push, seq_pad / 128, heads);
+            try ctx.opFlash(.out, q_src, kt_d, v16_d, attn_d, push, seq_pad / 128, heads);
             mark(io, &t_mark, &prof.aout_ns);
         } else {
             const s_stride: u32 = @intCast(s_rows);
@@ -442,7 +593,7 @@ pub fn forward(
             while (h0 < heads) : (h0 += heads_per_batch) {
                 const hb = @min(heads_per_batch, heads - h0);
                 if (tc_attn) {
-                    try ctx.opAttnScores(s_d, qt_d, kt_d, .{
+                    try ctx.opAttnScores(s_d, q_src, kt_d, .{
                         .u0 = heads * hd,
                         .u1 = s_stride,
                         .u2 = @intCast(h0),
@@ -502,24 +653,40 @@ pub fn forward(
         }
         mark(io, &t_mark, &prof.attn_ns);
         if (coop) {
-            try ctx.opElt(.sigmoid_mul_h16, attn_d, g_d, null, h16_d, .{
-                .u0 = @intCast(seq_pad * F / 2),
-                .u1 = @intCast(seq * F),
-                .f0 = blk.attn.wo.scale,
-            }, seq_pad * F / 2, 1, 1);
+            if (att16) {
+                try ctx.opElt(.sigmoid_mul_g16, attn_d, g_d, null, h16_d, .{
+                    .u0 = @intCast(seq_pad * F / 2),
+                    .u1 = @intCast(seq * F),
+                    .f0 = blk.attn.wo.scale,
+                }, seq_pad * F / 2, 1, 1);
+            } else {
+                try ctx.opElt(.sigmoid_mul_h16, attn_d, g_d, null, h16_d, .{
+                    .u0 = @intCast(seq_pad * F / 2),
+                    .u1 = @intCast(seq * F),
+                    .f0 = blk.attn.wo.scale,
+                }, seq_pad * F / 2, 1, 1);
+            }
             mark(io, &t_mark, &prof.elt_ns);
-            try ctx.opMatmulCoopH16(t1_d, h16_d, seq_pad, blk.attn.wo.bytes, blk.attn.wo.rows, blk.attn.wo.cols);
+            try ctx.opMatmulCoopH16(t1_d, h16_d, seq_pad, blk.attn.wo.bytes, blk.attn.wo.rows, blk.attn.wo.cols, att16);
         } else {
             try ctx.opElt(.sigmoid_mul, attn_d, g_d, null, null, .{ .u0 = @intCast(seq * F) }, seq * F, 1, 1);
             mark(io, &t_mark, &prof.elt_ns);
             try Gemm.go(ctx, coop, t1_d, attn_d, seq, seq_pad, blk.attn.wo);
         }
         mark(io, &t_mark, &prof.matmul_ns);
-        try ctx.opElt(.gated_add, x_d, t1_d, mv_d, null, .{
-            .u0 = @intCast(seq * F),
-            .u1 = F,
-            .u2 = mv_base + 2 * F,
-        }, seq * F, 1, 1);
+        if (att16) {
+            try ctx.opElt(.gated_add16, x_d, t1_d, mv_d, null, .{
+                .u0 = @intCast(seq * F / 2),
+                .u1 = F,
+                .u2 = mv_base + 2 * F,
+            }, seq * F / 2, 1, 1);
+        } else {
+            try ctx.opElt(.gated_add, x_d, t1_d, mv_d, null, .{
+                .u0 = @intCast(seq * F),
+                .u1 = F,
+                .u2 = mv_base + 2 * F,
+            }, seq * F, 1, 1);
+        }
         mark(io, &t_mark, &prof.elt_ns);
 
         // MLP.
@@ -535,6 +702,7 @@ pub fn forward(
             .f0 = 1e-5,
         }, seq, 1, 1);
         const mlp_shared = coop and blk.mlp.gate.scale == blk.mlp.up.scale;
+        const mlp16 = mlp_shared and ctx.pipe_coop_c16 != .null_handle;
         if (mlp_shared) {
             try ctx.opElt(.rms_apply_mod_h16, x_d, h16_d, mv_d, rmsi_d, .{
                 .u0 = @intCast(seq_pad * F / 2),
@@ -545,9 +713,10 @@ pub fn forward(
                 .f0 = blk.mlp.gate.scale,
             }, seq_pad * F / 2, 1, 1);
             mark(io, &t_mark, &prof.elt_ns);
-            try ctx.opMatmulCoopH16(mg_d, h16_d, seq_pad, blk.mlp.gate.bytes, blk.mlp.gate.rows, blk.mlp.gate.cols);
+            ctx.independent(2);
+            try ctx.opMatmulCoopH16(mg_d, h16_d, seq_pad, blk.mlp.gate.bytes, blk.mlp.gate.rows, blk.mlp.gate.cols, mlp16);
             mark(io, &t_mark, &prof.matmul_ns);
-            try ctx.opMatmulCoopH16(mu_d, h16_d, seq_pad, blk.mlp.up.bytes, blk.mlp.up.rows, blk.mlp.up.cols);
+            try ctx.opMatmulCoopH16(mu_d, h16_d, seq_pad, blk.mlp.up.bytes, blk.mlp.up.rows, blk.mlp.up.cols, mlp16);
             mark(io, &t_mark, &prof.matmul_ns);
         } else {
             try ctx.opElt(.rms_apply_mod, x_d, t1_d, mv_d, rmsi_d, .{
@@ -563,24 +732,39 @@ pub fn forward(
             mark(io, &t_mark, &prof.matmul_ns);
         }
         if (coop) {
-            try ctx.opElt(.silu_mul_h16, mg_d, mu_d, null, h16_d, .{
-                .u0 = @intCast(seq_pad * dit.mlp_dim / 2),
-                .u1 = @intCast(seq * dit.mlp_dim),
-                .f0 = blk.mlp.down.scale,
-            }, seq_pad * dit.mlp_dim / 2, 1, 1);
+            if (mlp16) {
+                try ctx.opElt(.silu_mul16, mg_d, mu_d, null, h16_d, .{
+                    .u0 = @intCast(seq_pad * dit.mlp_dim / 2),
+                    .f0 = blk.mlp.down.scale,
+                }, seq_pad * dit.mlp_dim / 2, 1, 1);
+            } else {
+                try ctx.opElt(.silu_mul_h16, mg_d, mu_d, null, h16_d, .{
+                    .u0 = @intCast(seq_pad * dit.mlp_dim / 2),
+                    .u1 = @intCast(seq * dit.mlp_dim),
+                    .f0 = blk.mlp.down.scale,
+                }, seq_pad * dit.mlp_dim / 2, 1, 1);
+            }
             mark(io, &t_mark, &prof.elt_ns);
-            try ctx.opMatmulCoopH16(t1_d, h16_d, seq_pad, blk.mlp.down.bytes, blk.mlp.down.rows, blk.mlp.down.cols);
+            try ctx.opMatmulCoopH16(t1_d, h16_d, seq_pad, blk.mlp.down.bytes, blk.mlp.down.rows, blk.mlp.down.cols, mlp16);
         } else {
             try ctx.opElt(.silu_mul, mg_d, mu_d, null, null, .{ .u0 = @intCast(seq * dit.mlp_dim) }, seq * dit.mlp_dim, 1, 1);
             mark(io, &t_mark, &prof.elt_ns);
             try Gemm.go(ctx, coop, t1_d, mg_d, seq, seq_pad, blk.mlp.down);
         }
         mark(io, &t_mark, &prof.matmul_ns);
-        try ctx.opElt(.gated_add, x_d, t1_d, mv_d, null, .{
-            .u0 = @intCast(seq * F),
-            .u1 = F,
-            .u2 = mv_base + 5 * F,
-        }, seq * F, 1, 1);
+        if (mlp16) {
+            try ctx.opElt(.gated_add16, x_d, t1_d, mv_d, null, .{
+                .u0 = @intCast(seq * F / 2),
+                .u1 = F,
+                .u2 = mv_base + 5 * F,
+            }, seq * F / 2, 1, 1);
+        } else {
+            try ctx.opElt(.gated_add, x_d, t1_d, mv_d, null, .{
+                .u0 = @intCast(seq * F),
+                .u1 = F,
+                .u2 = mv_base + 5 * F,
+            }, seq * F, 1, 1);
+        }
         mark(io, &t_mark, &prof.elt_ns);
     }
 
@@ -680,7 +864,9 @@ test "gpu-resident forward matches comfyui fixture" {
     defer gpa.free(out);
     var sess = try Session.init(gpa, io, ctx, &model, 16, 16, cond, seq_txt, &.{0.875});
     defer sess.deinit(gpa, ctx);
-    try forward(&model, ctx, &sess, io, gpa, out, x_lat, 0.875);
+    var ws = try Workspace.init(ctx, 16, 16, seq_txt);
+    defer ws.deinit(ctx);
+    try forward(&model, ctx, &sess, &ws, io, gpa, out, x_lat, 0.875);
 
     var max_err: f32 = 0;
     var max_val: f32 = 0;
@@ -698,4 +884,32 @@ test "gpu-resident forward matches comfyui fixture" {
     // pixel delta ~0.9%). The scores kernel itself is verified to 5e-3
     // against an f16-rounded reference in gpu/context.zig.
     try std.testing.expect(max_err < 0.05 * @max(1.0, max_val));
+
+    // Full-f32 path (tensor-core pipelines forced off, Workspace re-sized to
+    // match): reports the f16-vs-f32 accuracy gap against the same fixture.
+    {
+        force_f32 = true;
+        defer force_f32 = false;
+        var ws32 = try Workspace.init(ctx, 16, 16, seq_txt);
+        defer ws32.deinit(ctx);
+        const out32 = try gpa.alloc(f32, dit.channels * 16 * 16);
+        defer gpa.free(out32);
+        try forward(&model, ctx, &sess, &ws32, io, gpa, out32, x_lat, 0.875);
+        var me: f32 = 0;
+        for (expected, out32) |e, a| me = if (std.math.isNan(a)) std.math.inf(f32) else @max(me, @abs(e - a));
+        std.debug.print("dit gpu parity (f32): max_err={d:.5} (f16 was {d:.5})\n", .{ me, max_err });
+        try std.testing.expect(me < 0.05 * @max(1.0, max_val));
+    }
+
+    // Weight streaming under memory pressure: force a budget far below the
+    // model size so the LRU weight cache evicts and re-uploads every block,
+    // then check the forward is BIT-IDENTICAL to the resident run (same
+    // weights, same kernels — only residency changed).
+    ctx.evictWeights();
+    ctx.budget_override = 3 << 30;
+    defer ctx.budget_override = 0;
+    const out2 = try gpa.alloc(f32, dit.channels * 16 * 16);
+    defer gpa.free(out2);
+    try forward(&model, ctx, &sess, &ws, io, gpa, out2, x_lat, 0.875);
+    for (out, out2) |a, b| try std.testing.expectEqual(a, b);
 }

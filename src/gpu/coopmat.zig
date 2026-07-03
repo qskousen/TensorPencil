@@ -342,7 +342,11 @@ pub const coop_wgn: u32 = if (coop_warps8) 256 else 128;
 /// `acc_h16` (f16 accumulators, converted to f32 at the C store) to fit
 /// 2 wgs/SM at <= 128 regs. acc_h16 changes accumulation NUMERICS — gate
 /// any keep on the DiT parity fixture.
-pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h16: bool) ![]align(4) u8 {
+pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h16: bool, c_h16: bool) ![]align(4) u8 {
+    // c_h16 stores C half-precision (binding 2 becomes an f16 array). Only
+    // meaningful with f16 accumulators, where it is exact: the f32 store it
+    // replaces was just a widening of the f16 accumulator values.
+    std.debug.assert(!c_h16 or acc_h16);
     // A slab geometry: 128 rows x 32 k f16 per sub-slab at base A_BASE of
     // the shared array. The row stride can carry padding to spread shared-
     // memory banks, but stride 34 measured neutral vs 32 (the driver's coop
@@ -453,7 +457,7 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
 
     try a.op(71, &.{ gid_var, 11, 26 }); // WorkgroupId
     try a.op(71, &.{ lid_var, 11, 27 }); // LocalInvocationId
-    try a.op(71, &.{ t_arr_f32, 6, 4 });
+    try a.op(71, &.{ t_arr_f32, 6, if (c_h16) 2 else 4 });
     try a.op(71, &.{ t_sc, 2 });
     try a.op(72, &.{ t_sc, 0, 35, 0 });
     try a.op(71, &.{ t_push, 2 });
@@ -484,7 +488,7 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
     try a.op(59, &.{ t_ptr_in_v3, lid_var, 1 });
 
     try a.op(43, &.{ t_u32, c_arrlen, 1 << 28 });
-    try a.op(28, &.{ t_arr_f32, t_f32, c_arrlen });
+    try a.op(28, &.{ t_arr_f32, if (c_h16) t_f16 else t_f32, c_arrlen });
     try a.op(23, &.{ t_v4u32, t_u32, 4 });
     try a.op(28, &.{ t_arr_v4, t_v4u32, c_arrlen });
     try a.op(30, &.{ t_sb4, t_arr_v4 });
@@ -501,7 +505,7 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
     try a.op(32, &.{ t_ptr_push, 9, t_push });
     try a.op(59, &.{ t_ptr_push, v_push, 9 });
     try a.op(32, &.{ t_ptr_pc_u32, 9, t_u32 });
-    try a.op(32, &.{ t_ptr_sc_f32, 12, t_f32 });
+    try a.op(32, &.{ t_ptr_sc_f32, 12, if (c_h16) t_f16 else t_f32 });
 
     // Workgroup slab (no layout decorations): B 2 x [32][WGN] f16 at 0,
     // A 2 x [128][32] f16 at A_BASE.
@@ -536,7 +540,7 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
     try a.op(4456, &.{ t_mat_a, t_f16, c_scope_sub, c_u16, c_u16, c_u0 });
     try a.op(4456, &.{ t_mat_b, t_f16, c_scope_sub, c_u16, c_u16, c_u1 });
     try a.op(4456, &.{ t_mat_c, if (acc_h16) t_f16 else t_f32, c_scope_sub, c_u16, c_u16, c_u2 });
-    if (acc_h16) try a.op(4456, &.{ t_mat_c32, t_f32, c_scope_sub, c_u16, c_u16, c_u2 });
+    if (acc_h16 and !c_h16) try a.op(4456, &.{ t_mat_c32, t_f32, c_scope_sub, c_u16, c_u16, c_u2 });
     try a.op(23, &.{ t_v2f16, t_f16, 2 });
     try a.op(43, &.{ t_f32, c_f32_0, 0 });
     if (acc_h16) try a.op(43, &.{ t_f16, c_f16_0, 0 });
@@ -1149,7 +1153,7 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
             const cptr = a.id();
             try a.op(65, &.{ t_ptr_sc_f32, cptr, v_c, c_u0, cbase });
             var cval = acc_phi[r][nt];
-            if (acc_h16) {
+            if (acc_h16 and !c_h16) {
                 // f16 accumulators store through an f32 conversion.
                 const cv = a.id();
                 try a.op(115, &.{ t_mat_c32, cv, cval }); // OpFConvert

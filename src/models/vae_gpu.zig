@@ -80,6 +80,19 @@ pub fn decode(dec: *const wan_vae.Decoder, ctx: *Context, io: std.Io, gpa: std.m
 
     try res(ctx, &bufs, h, w, dec.mid_res1);
     try attn(ctx, &bufs, io, gpa, h, w, dec.mid_attn);
+
+    // The attention scratch — above all the ~seq^2 scores plane (bufs.s,
+    // ~1.7 GB at 1120x1680) — is dead for the rest of the decode, but it sits
+    // at the START (mid-block runs at latent resolution) and would otherwise
+    // stay resident through the whole 8x upsampling, doubling peak VRAM. Free
+    // it now. endBatch does a submitAndWait, so no recorded dispatch still
+    // references these buffers when we destroy them (the Xid 109 lesson).
+    batched = false;
+    try ctx.endBatch();
+    inline for (.{ &bufs.qh, &bufs.kh, &bufs.vh, &bufs.s, &bufs.md, &bufs.pt }) |b| ctx.tensorDestroy(b);
+    try ctx.beginBatch();
+    batched = true;
+
     try res(ctx, &bufs, h, w, dec.mid_res2);
 
     for (dec.ups) |layer| switch (layer) {

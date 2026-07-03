@@ -291,9 +291,18 @@
          sums are bounded by the row's absolute-product sum, fine on real
          weights (fixture + full images), pathological inputs could
          saturate — watch for it if future models misbehave.
-         STILL PENDING: 1120x1680 20-step re-baseline + comparison-image
-         regen (blocked on free VRAM — a game held 2.2 GB; estimated step
-         5.85 -> ~5.4 s, gap ~1.42 -> ~1.3x, to be confirmed cold).
+         RE-BASELINED (same day, free GPU, warm-ish box): 1120x1680
+         20-step steady state 5.5 s/step (second run mean 5.59), ~112 s
+         excl model loads (110 sampling + 1.8 decode), 2m00s wall incl
+         loads => ComfyUI gap 112/85 = 1.32x (was 1.42x). Comparison
+         repro regenerated with the f16-acc numerics: 0.64% mean pixel
+         delta vs the ComfyUI ref (was 0.61% — same class).
+         Streaming curve (--vram-budget flag, same session, 3-step runs):
+         16 GiB ~6.8-7.1 s/step, 12 GiB ~7.2-8.0, 8 GiB ~7.4-10.3,
+         4 GiB ~6.8 — i.e. +25-90%, noisy and NON-monotonic (the sync
+         eviction design: flush + DeviceWaitIdle per eviction dominates
+         over pure PCIe bandwidth; mid budgets thrash hit/miss the most).
+         An async v2 would flatten this; good enough for degraded mode.
       2. Attention residual (~1.5 s at 1120x1680): the S compute runs at
          ~1 TF/s because Q/K cooperative fragment loads are global with
          12-15 KB row strides. K-STAGING BUILT AND MEASURED NEUTRAL
@@ -349,23 +358,83 @@
       f16 attention; comparison image delta vs ComfyUI unchanged at
       0.61%). DiT parity untouched (0.17520). Full 1120x1680 20-step
       image now ~119-120 s excl. loads (gap ~1.4x, GEMM-bound).
-- [ ] VRAM offloading (ComfyUI-style: exhaustion degrades to slowdown, not a
-      crash). Measured peak is ~17.5 GiB device memory at 1024x1024 (nvidia-smi
-      sampled over a full --gpu run, desktop baseline subtracted), so larger
-      sizes will OOM a 24 GB card that's also driving a desktop. Two stages:
-      1. Quick win: free the DiT session's device weights (~12 GiB) before the
-         VAE uploads — sampling is over by then; peak becomes
-         max(DiT, VAE) instead of the sum. Small change in pipeline.zig.
-      2. Full feature: budget-aware block streaming. The DiT is 28 identical
-         ~440 MB fp8 blocks; keep N resident and stream the rest per step.
-         The math strongly favors this on PCIe 4.0 x16: ~18 ms/block transfer
-         vs ~100 ms/block compute at 1024px, so fully-overlapped streaming is
-         ~free. Needs: VK_EXT_memory_budget query up front (Vulkan gives no
-         graceful OOM — plan, don't react), per-block residency in dit_gpu
-         instead of whole-model, double-buffered weight slots, and a dedicated
-         transfer queue for real overlap (the batched-submission work is the
-         intended foundation). Composes with int8/CONVROT plans (halves
-         streaming bandwidth).
+- [x] VRAM offloading v1 (2026-07-02): exhaustion degrades to weight
+      streaming instead of a crash. (Note: the originally-sketched "free
+      DiT weights before VAE" quick win turned out to ALREADY exist —
+      pipeline.zig's evictWeights() call predates this; the measured
+      17.5 GiB peak is during SAMPLING, not decode.) What landed, all in
+      the context layer (dit_gpu untouched — the lazy weightBuffer cache
+      makes streaming fall out of the cache layer):
+      * VK_EXT_memory_budget (vk.zig bindings machine-checked against
+        vulkan_core.h; enabled when present, physical-device-level query
+        via core-1.1 vkGetPhysicalDeviceMemoryProperties2) gives a live
+        budget that sees OTHER processes' VRAM; fallback is 90% of the
+        device-local heap. Context.budget_override is the test hook.
+      * device_used accounting on every createBuffer/free (all teardown
+        routed through freeDeviceBuffer).
+      * weights map is LRU-stamped; reserveForWeights evicts LRU entries
+        (flushing the pending batch first — recorded dispatches may
+        reference them; the Xid 109 lesson) until the new upload fits the
+        budget headroom. Since the DiT walks blocks in a fixed order, LRU
+        eviction IS sequential block streaming; evicted weights re-upload
+        on next use through the existing cached-upload path.
+      * Reactive backstop: createBuffer distinguishes
+        error_out_of_device_memory and retries after evicting, so
+        activation/scratch allocations survive pressure too.
+      Verified: gpu-gated test forces budget_override = 3 GiB (model is
+      12.4 GiB) — the streamed forward is BIT-IDENTICAL to the resident
+      one; and the real-world repro (1120x1680 with a game holding 2.2 GB
+      — previously died with error_out_of_device_memory) now completes at
+      5.5 s/step (light eviction, barely above the unpressured estimate).
+      Follow-ups for a v2 if streaming cost ever matters: async overlap
+      via a dedicated transfer queue + double-buffered weight slots (the
+      batched-submission work is the foundation; sync re-uploads flush
+      the batch per eviction today), and composing with int8/CONVROT
+      (halves streaming bandwidth).
+- [x] Orchestration round (2026-07-03, same-session A/B at 1120x1680,
+      4-step runs, steps 2-4): baseline 5.5-5.8 s/step -> 4.9-5.0 s/step
+      (~11%); 20-step run 106.7 s sampling + 1.9 decode ~= 108.6 s excl
+      loads (steady state crept 5.0 -> 5.3 warm) => gap ~1.28x. Everything
+      below is BIT-IDENTICAL end to end (4-step PNGs match the pre-change
+      baseline byte for byte, and the 20-step render matches the checked-in
+      comfyui_repro PNG); DiT parity 0.16875 unchanged. Three items:
+      * Workspace (dit_gpu.Workspace): the ~20 per-step tensorCreate/
+        Destroy pairs (incl. the ~2 GiB scores buffer; each a raw
+        vkAllocateMemory) moved to a per-run struct shared by both CFG
+        sessions (sized for the longer text; heads_per_batch re-derives
+        from the actual seq and clamps to the workspace buffers). Profile
+        xfer 61 -> 3 ms/step; also decouples step buffers from the VRAM
+        budget/eviction churn. Step 1 (weight upload) 7.3 -> 6.7 s.
+      * Barrier elision (Context.independent(n)): opEnd skips the global
+        compute barrier inside declared-independent groups (QKV/gate GEMM
+        quad, gate/up pair, q/k norm and rope pairs, conversion triple).
+        Measured NEUTRAL at 1120x1680 batched step times — the driver
+        evidently already absorbs the small-grid tails (same lesson as
+        K-staging / A-stride-34: theory says win, this driver says no).
+        Kept: zero cost, correct (mid-group flush is a stronger sync), and
+        smaller sizes with sub-wave grids may yet benefit. opMatmulCoop
+        asserts it is never grouped (it records two dependent ops).
+      * f16 C-store + fused f16 eltwise chain (the elt win: 573 -> 284
+        ms/step): buildGemmShared gained c_h16 (binding 2 becomes an f16
+        array, the accumulator stores directly — with acc_h16 the f32
+        store was just a widening of f16 values, so f16 C is EXACT, which
+        is why everything stays bit-identical). pipe_coop_c16 rides the
+        fp8 pipe's toggles (requires coop_acc_h16). On this path q/k/g
+        come out of their GEMMs f16, V's GEMM writes v16_d in the P@V
+        layout directly (its f32 buffer and conversion die), qt_d dies (Q
+        is normed/roped/scaled IN PLACE by the fused qknorm_rope16 kernel
+        — one pass instead of rmsnorm + rope_inter + f32_to_h16, same
+        operation order so f32 math is value-identical), K uses fused
+        norm/rope + a raw-u16 gather (gather_kmajor16), the MLP gate/up
+        GEMMs store f16 read by silu_mul16, and wo/down store f16 t1
+        consumed by gated_add16. sigmoid_mul_g16 reads the f16 gate next
+        to the f32 attention out. All old kernels/paths remain as
+        fallbacks (per-block scale check can still route to them; the f32
+        buffers stay allocated for that, ~140 MB slack).
+      Follow-up candidates if another round is wanted: attn_out f16 C
+      store (P@V accs are f32, so it would round — needs a parity look),
+      Workspace sizes could shrink q/k/g/t1/mg/mu to f16 when the c16
+      pipe exists, s_d ping-pong to overlap head-group scores with P@V.
 - [ ] M9 follow-ups:
       * Blocked upstream: NVIDIA 580 faults (DEVICE_LOST) on any Zig-emitted kernel using
         workgroup memory — even spirv-val-clean at workgroup size 1x1; RADV/llvmpipe run the

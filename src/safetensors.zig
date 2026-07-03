@@ -80,6 +80,13 @@ pub const SafeTensors = struct {
             0,
         );
         errdefer std.posix.munmap(mapping);
+        // Kick off an async read-ahead of the whole file. The weights are
+        // each touched once (GPU upload / transpose), so a cold file
+        // otherwise faults in synchronously on first access — a 12 GB DiT
+        // adds tens of seconds to the first sampling step, and the 4.9 GB
+        // text encoder inflates the encode. WILLNEED overlaps that disk read
+        // with setup/compute instead. Advisory and best-effort.
+        std.posix.madvise(@constCast(mapping.ptr), mapping.len, std.posix.MADV.WILLNEED) catch {};
         var st = try initFromSlice(gpa, mapping);
         st.mapping = mapping;
         return st;

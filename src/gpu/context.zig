@@ -37,7 +37,7 @@ const Push = extern struct {
 };
 
 /// Eltwise/attention kernels and their workgroup shapes (kernels/eltwise.zig).
-pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact };
+pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy };
 const elt_entry_sizes = [_]EntrySize{
     .{ .name = "rmsnorm", .x = 64, .y = 1 },
     .{ .name = "rms_partial", .x = 256, .y = 1 },
@@ -65,6 +65,13 @@ const elt_entry_sizes = [_]EntrySize{
     .{ .name = "vae_norm", .x = 64, .y = 1 },
     .{ .name = "im2col", .x = 256, .y = 1 },
     .{ .name = "bias_compact", .x = 256, .y = 1 },
+    .{ .name = "qknorm_rope16", .x = 64, .y = 1 },
+    .{ .name = "gather_kmajor16", .x = 256, .y = 1 },
+    .{ .name = "silu_mul16", .x = 256, .y = 1 },
+    .{ .name = "sigmoid_mul_g16", .x = 256, .y = 1 },
+    .{ .name = "gated_add16", .x = 256, .y = 1 },
+    .{ .name = "rope_half", .x = 256, .y = 1 },
+    .{ .name = "copy", .x = 256, .y = 1 },
 };
 
 /// Push block shared by all eltwise entries; meaning per entry (see kernels).
@@ -89,6 +96,9 @@ pub const Error = error{
     VulkanUnavailable,
     NoSuitableDevice,
     VulkanFailed,
+    /// Device allocation failed even after evicting every cached weight
+    /// buffer — the working set genuinely doesn't fit.
+    DeviceOutOfMemory,
     OutOfMemory,
 } || spv.Error;
 
@@ -146,6 +156,8 @@ const Dispatch = struct {
     GetPhysicalDeviceProperties: vk.PfnGetPhysicalDeviceProperties,
     GetPhysicalDeviceQueueFamilyProperties: vk.PfnGetPhysicalDeviceQueueFamilyProperties,
     GetPhysicalDeviceMemoryProperties: vk.PfnGetPhysicalDeviceMemoryProperties,
+    GetPhysicalDeviceMemoryProperties2: vk.PfnGetPhysicalDeviceMemoryProperties2,
+    EnumerateDeviceExtensionProperties: vk.PfnEnumerateDeviceExtensionProperties,
     CreateDevice: vk.PfnCreateDevice,
     DestroyDevice: vk.PfnDestroyDevice,
     GetDeviceQueue: vk.PfnGetDeviceQueue,
@@ -203,6 +215,15 @@ pub const DeviceBuffer = struct {
     size: u64,
 };
 
+/// Cached device weight buffer + LRU stamp. Since the DiT walks its blocks
+/// in the same order every step, LRU eviction under memory pressure turns
+/// the cache into sequential block streaming (evicted weights re-upload on
+/// next use).
+const WeightEntry = struct {
+    db: DeviceBuffer,
+    last_use: u64,
+};
+
 pub const Context = struct {
     gpa: std.mem.Allocator,
     lib: std.DynLib,
@@ -212,6 +233,18 @@ pub const Context = struct {
     queue: vk.Queue,
     queue_family: u32,
     mem_props: vk.PhysicalDeviceMemoryProperties,
+    /// Kept for live memory-budget queries (VK_EXT_memory_budget).
+    phys: vk.PhysicalDevice,
+    has_memory_budget: bool = false,
+    /// Device-local heap index backing our allocations.
+    device_heap: u32 = 0,
+    /// Bytes we hold in buffers created through createBuffer.
+    device_used: u64 = 0,
+    /// Monotonic stamp for the weight cache's LRU order.
+    use_counter: u64 = 0,
+    /// Test hook: when nonzero, caps the budget headroom calculation so
+    /// weight streaming can be forced without exhausting real VRAM.
+    budget_override: u64 = 0,
     device_name: [64]u8,
     device_name_len: usize,
     /// f16*f16->f32 subgroup cooperative-matrix shape (0 = unsupported).
@@ -234,6 +267,9 @@ pub const Context = struct {
     batch_sets: []vk.DescriptorSet,
     batching: bool = false,
     batch_n: usize = 0,
+    /// Countdown for `independent`: while > 1, opEnd skips the inter-dispatch
+    /// barrier so the group's dispatches may overlap on the device.
+    indep_remaining: usize = 0,
 
     dsl: vk.DescriptorSetLayout,
     pipeline_layout: vk.PipelineLayout,
@@ -251,6 +287,10 @@ pub const Context = struct {
     pipes_e: [elt_entry_sizes.len]vk.Pipeline,
     shader_coop: vk.ShaderModule = .null_handle,
     pipe_coop: vk.Pipeline = .null_handle,
+    /// fp8 coop GEMM with an f16 C store (exact under f16 accumulators;
+    /// present iff pipe_coop is and coop_acc_h16 is on).
+    shader_coop_c16: vk.ShaderModule = .null_handle,
+    pipe_coop_c16: vk.Pipeline = .null_handle,
     /// f16-weight coop GEMM (VAE convs; present iff pipe_coop is).
     shader_coop_f16w: vk.ShaderModule = .null_handle,
     pipe_coop_f16w: vk.Pipeline = .null_handle,
@@ -287,8 +327,9 @@ pub const Context = struct {
     dummy: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
     /// Small cached device uploads (biases, norm weights), keyed by host ptr.
     small_bufs: std.AutoHashMapUnmanaged(usize, DeviceBuffer) = .empty,
-    /// Device-local transposed weight buffers, keyed by host weight pointer.
-    weights: std.AutoHashMapUnmanaged(usize, DeviceBuffer) = .empty,
+    /// Device-local transposed weight buffers, keyed by host weight pointer,
+    /// LRU-evicted when the device memory budget runs out.
+    weights: std.AutoHashMapUnmanaged(usize, WeightEntry) = .empty,
 
     pub fn init(gpa: std.mem.Allocator) Error!*Context {
         var lib = openVulkanLib() orelse return error.VulkanUnavailable;
@@ -382,6 +423,26 @@ pub const Context = struct {
             }
         }
 
+        // VK_EXT_memory_budget: proactive VRAM budgeting for weight
+        // streaming (accounts for other processes; heap-size fallback
+        // otherwise).
+        var has_memory_budget = false;
+        {
+            var count: u32 = 0;
+            if (d.EnumerateDeviceExtensionProperties(phys, null, &count, null) == .success and count > 0) {
+                if (gpa.alloc(vk.ExtensionProperties, count)) |exts| {
+                    defer gpa.free(exts);
+                    if (d.EnumerateDeviceExtensionProperties(phys, null, &count, exts.ptr) == .success) {
+                        for (exts[0..count]) |e| {
+                            if (std.mem.eql(u8, std.mem.sliceTo(&e.extension_name, 0), "VK_EXT_memory_budget")) {
+                                has_memory_budget = true;
+                            }
+                        }
+                    }
+                } else |_| {}
+            }
+        }
+
         // Logical device with the features the Zig SPIR-V backend requires.
         var device: vk.Device = .null_handle;
         {
@@ -405,13 +466,22 @@ pub const Context = struct {
                 .queue_count = 1,
                 .p_queue_priorities = @ptrCast(&priority),
             };
-            const coop_ext: [1][*:0]const u8 = .{"VK_KHR_cooperative_matrix"};
+            var exts: [2][*:0]const u8 = undefined;
+            var ext_n: u32 = 0;
+            if (coop_m != 0) {
+                exts[ext_n] = "VK_KHR_cooperative_matrix";
+                ext_n += 1;
+            }
+            if (has_memory_budget) {
+                exts[ext_n] = "VK_EXT_memory_budget";
+                ext_n += 1;
+            }
             try check(d.CreateDevice(phys, &.{
                 .p_next = &features12,
                 .queue_create_info_count = 1,
                 .p_queue_create_infos = @ptrCast(&queue_info),
-                .enabled_extension_count = if (coop_m != 0) 1 else 0,
-                .pp_enabled_extension_names = if (coop_m != 0) &coop_ext else null,
+                .enabled_extension_count = ext_n,
+                .pp_enabled_extension_names = if (ext_n != 0) &exts else null,
                 .p_enabled_features = &features,
             }, null, &device));
         }
@@ -422,6 +492,13 @@ pub const Context = struct {
 
         var mem_props: vk.PhysicalDeviceMemoryProperties = undefined;
         d.GetPhysicalDeviceMemoryProperties(phys, &mem_props);
+        var device_heap: u32 = 0;
+        for (0..mem_props.memory_heap_count) |i| {
+            if (mem_props.memory_heaps[i].flags & vk.MemoryHeapFlagBits.device_local != 0) {
+                device_heap = @intCast(i);
+                break;
+            }
+        }
 
         // Command pool + primary buffer + fence.
         var cmd_pool: vk.CommandPool = .null_handle;
@@ -582,22 +659,35 @@ pub const Context = struct {
         // device supports 16x16x16 f16->f32 subgroup matrices.
         var shader_coop: vk.ShaderModule = .null_handle;
         var pipe_coop: vk.Pipeline = .null_handle;
+        var shader_coop_c16: vk.ShaderModule = .null_handle;
+        var pipe_coop_c16: vk.Pipeline = .null_handle;
         var shader_coop_f16w: vk.ShaderModule = .null_handle;
         var pipe_coop_f16w: vk.Pipeline = .null_handle;
         if (coop_m == 16 and coop_n == 16 and coop_k == 16) {
             inline for (.{
-                .{ false, coopmat.coop_warps8, coopmat.coop_acc_h16, &shader_coop },
-                .{ true, false, false, &shader_coop_f16w },
+                .{ false, coopmat.coop_warps8, coopmat.coop_acc_h16, false, &shader_coop },
+                .{ true, false, false, false, &shader_coop_f16w },
             }) |v| {
-                const code = try coopmat.buildGemmShared(gpa, v[0], v[1], v[2]);
+                const code = try coopmat.buildGemmShared(gpa, v[0], v[1], v[2], v[3]);
                 defer gpa.free(code);
                 try check(d.CreateShaderModule(device, &.{
                     .code_size = code.len,
                     .p_code = @ptrCast(@alignCast(code.ptr)),
-                }, null, v[3]));
+                }, null, v[4]));
+            }
+            // f16 C store rides the fp8 pipe's toggles; it only exists (and
+            // is only exact) with f16 accumulators.
+            if (coopmat.coop_acc_h16) {
+                const code = try coopmat.buildGemmShared(gpa, false, coopmat.coop_warps8, true, true);
+                defer gpa.free(code);
+                try check(d.CreateShaderModule(device, &.{
+                    .code_size = code.len,
+                    .p_code = @ptrCast(@alignCast(code.ptr)),
+                }, null, &shader_coop_c16));
             }
         }
         errdefer if (shader_coop != .null_handle) d.DestroyShaderModule(device, shader_coop, null);
+        errdefer if (shader_coop_c16 != .null_handle) d.DestroyShaderModule(device, shader_coop_c16, null);
         errdefer if (shader_coop_f16w != .null_handle) d.DestroyShaderModule(device, shader_coop_f16w, null);
         if (shader_coop != .null_handle) {
             inline for (.{ .{ shader_coop, &pipe_coop }, .{ shader_coop_f16w, &pipe_coop_f16w } }) |v| {
@@ -607,8 +697,16 @@ pub const Context = struct {
                 };
                 try check(d.CreateComputePipelines(device, .null_handle, 1, @ptrCast(&info), null, @ptrCast(v[1])));
             }
+            if (shader_coop_c16 != .null_handle) {
+                const info: vk.ComputePipelineCreateInfo = .{
+                    .stage = .{ .module = shader_coop_c16, .p_name = "main" },
+                    .layout = pipeline_layout,
+                };
+                try check(d.CreateComputePipelines(device, .null_handle, 1, @ptrCast(&info), null, @ptrCast(&pipe_coop_c16)));
+            }
         }
         errdefer if (pipe_coop != .null_handle) d.DestroyPipeline(device, pipe_coop, null);
+        errdefer if (pipe_coop_c16 != .null_handle) d.DestroyPipeline(device, pipe_coop_c16, null);
         errdefer if (pipe_coop_f16w != .null_handle) d.DestroyPipeline(device, pipe_coop_f16w, null);
 
         // Attention-scores GEMM on the same cooperative-matrix support; uses
@@ -750,6 +848,9 @@ pub const Context = struct {
             .queue = queue,
             .queue_family = queue_family,
             .mem_props = mem_props,
+            .phys = phys,
+            .has_memory_budget = has_memory_budget,
+            .device_heap = device_heap,
             .device_name = undefined,
             .device_name_len = 0,
             .coop_m = coop_m,
@@ -777,6 +878,8 @@ pub const Context = struct {
             .pipes_e = pipes_e,
             .shader_coop = shader_coop,
             .pipe_coop = pipe_coop,
+            .shader_coop_c16 = shader_coop_c16,
+            .pipe_coop_c16 = pipe_coop_c16,
             .shader_coop_f16w = shader_coop_f16w,
             .pipe_coop_f16w = pipe_coop_f16w,
             .shader_scores = shader_scores,
@@ -803,22 +906,19 @@ pub const Context = struct {
         _ = self.d.DeviceWaitIdle(self.device);
         var it = self.weights.valueIterator();
         while (it.next()) |wb| {
-            self.d.DestroyBuffer(self.device, wb.buf, null);
-            self.d.FreeMemory(self.device, wb.mem, null);
+            self.freeDeviceBuffer(wb.db);
         }
         self.weights.deinit(self.gpa);
         {
             var sit = self.small_bufs.valueIterator();
             while (sit.next()) |sb| {
-                self.d.DestroyBuffer(self.device, sb.buf, null);
-                self.d.FreeMemory(self.device, sb.mem, null);
+                self.freeDeviceBuffer(sb.*);
             }
             self.small_bufs.deinit(self.gpa);
         }
         for ([_]*DeviceBuffer{ &self.x_dev, &self.y_dev, &self.raw_dev, &self.dummy, &self.x_h16, &self.y_pad }) |db| {
             if (db.buf != .null_handle) {
-                self.d.DestroyBuffer(self.device, db.buf, null);
-                self.d.FreeMemory(self.device, db.mem, null);
+                self.freeDeviceBuffer(db.*);
             }
         }
         for ([_]*HostBuffer{ &self.x_buf, &self.y_buf, &self.bias_buf, &self.staging }) |hb| {
@@ -834,6 +934,8 @@ pub const Context = struct {
         for (self.pipes_e) |pp| self.d.DestroyPipeline(self.device, pp, null);
         if (self.pipe_coop != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_coop, null);
         if (self.shader_coop != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_coop, null);
+        if (self.pipe_coop_c16 != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_coop_c16, null);
+        if (self.shader_coop_c16 != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_coop_c16, null);
         if (self.pipe_coop_f16w != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_coop_f16w, null);
         if (self.shader_coop_f16w != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_coop_f16w, null);
         if (self.pipe_scores != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_scores, null);
@@ -879,19 +981,43 @@ pub const Context = struct {
     }
 
     fn createBuffer(self: *Context, size: u64, usage: u32, mem_flags: u32) Error!DeviceBuffer {
+        while (true) {
+            if (self.createBufferRaw(size, usage, mem_flags)) |db| {
+                self.device_used += size;
+                return db;
+            } else |err| {
+                if (err != error.DeviceOutOfMemory) return err;
+                // Degrade to weight re-uploads instead of failing: drop the
+                // least-recently-used cached weight buffer and retry.
+                if (!self.evictOneWeight()) return err;
+            }
+        }
+    }
+
+    fn createBufferRaw(self: *Context, size: u64, usage: u32, mem_flags: u32) Error!DeviceBuffer {
         var buf: vk.Buffer = .null_handle;
         try check(self.d.CreateBuffer(self.device, &.{ .size = size, .usage = usage }, null, &buf));
         errdefer self.d.DestroyBuffer(self.device, buf, null);
         var reqs: vk.MemoryRequirements = undefined;
         self.d.GetBufferMemoryRequirements(self.device, buf, &reqs);
         var mem: vk.DeviceMemory = .null_handle;
-        try check(self.d.AllocateMemory(self.device, &.{
+        const r = self.d.AllocateMemory(self.device, &.{
             .allocation_size = reqs.size,
             .memory_type_index = try self.findMemoryType(reqs.memory_type_bits, mem_flags),
-        }, null, &mem));
+        }, null, &mem);
+        if (r == .error_out_of_device_memory) return error.DeviceOutOfMemory;
+        try check(r);
         errdefer self.d.FreeMemory(self.device, mem, null);
         try check(self.d.BindBufferMemory(self.device, buf, mem, 0));
         return .{ .buf = buf, .mem = mem, .size = size };
+    }
+
+    /// Central device-buffer free — keeps `device_used` honest. All
+    /// DeviceBuffer teardown must route through here.
+    fn freeDeviceBuffer(self: *Context, db: DeviceBuffer) void {
+        self.d.DestroyBuffer(self.device, db.buf, null);
+        self.d.FreeMemory(self.device, db.mem, null);
+        self.device_used -|= db.size;
     }
 
     fn destroyHostBuffer(self: *Context, hb: *HostBuffer) void {
@@ -899,6 +1025,7 @@ pub const Context = struct {
         if (hb.mapped != null) self.d.UnmapMemory(self.device, hb.mem);
         self.d.DestroyBuffer(self.device, hb.buf, null);
         self.d.FreeMemory(self.device, hb.mem, null);
+        self.device_used -|= hb.size;
         hb.* = .{};
     }
 
@@ -925,10 +1052,15 @@ pub const Context = struct {
     /// beyond the staging memcpy.
     fn weightBuffer(self: *Context, bytes: []const u8, esize: u64, rows: usize, cols: usize) Error!vk.Buffer {
         const key = @intFromPtr(bytes.ptr);
-        if (self.weights.get(key)) |db| return db.buf;
+        self.use_counter += 1;
+        if (self.weights.getPtr(key)) |e| {
+            e.last_use = self.use_counter;
+            return e.db.buf;
+        }
 
         const stride = std.mem.alignForward(u64, rows, tile_n);
         const total = stride * cols * esize;
+        self.reserveForWeights(total);
         const db = try self.createBuffer(
             total,
             vk.BufferUsage.storage_buffer | vk.BufferUsage.transfer_dst,
@@ -1007,7 +1139,7 @@ pub const Context = struct {
             try self.submitAndWaitBuf(cb);
         }
 
-        try self.weights.put(self.gpa, key, db);
+        try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter });
         return db.buf;
     }
 
@@ -1018,11 +1150,19 @@ pub const Context = struct {
             // Recorded-but-unsubmitted dispatches may still reference the
             // old buffer; submit them before destroying it.
             if (self.batching) try self.flushBatch();
-            self.d.DestroyBuffer(self.device, db.buf, null);
-            self.d.FreeMemory(self.device, db.mem, null);
+            self.freeDeviceBuffer(db.*);
             db.* = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 };
         }
-        const alloc_size = std.math.ceilPowerOfTwo(u64, @max(size, 1 << 16)) catch return error.OutOfMemory;
+        // Grow with slack to avoid realloc churn, but don't power-of-two
+        // round large buffers: a 722 MB activation plane would jump to
+        // 1 GiB, wasting ~40% of VRAM per buffer — invisible on an empty
+        // card, fatal when another process holds most of it. Pow2 stays for
+        // small buffers (cheap, avoids churn); large ones round to 8 MiB.
+        const min_sz = @max(size, 1 << 16);
+        const alloc_size = if (min_sz <= (8 << 20))
+            std.math.ceilPowerOfTwo(u64, min_sz) catch return error.OutOfMemory
+        else
+            std.mem.alignForward(u64, min_sz, 8 << 20);
         db.* = try self.createBuffer(
             alloc_size,
             vk.BufferUsage.storage_buffer | vk.BufferUsage.transfer_src | vk.BufferUsage.transfer_dst,
@@ -1042,8 +1182,7 @@ pub const Context = struct {
 
     pub fn tensorDestroy(self: *Context, db: *DeviceBuffer) void {
         if (db.buf == .null_handle) return;
-        self.d.DestroyBuffer(self.device, db.buf, null);
-        self.d.FreeMemory(self.device, db.mem, null);
+        self.freeDeviceBuffer(db.*);
         db.* = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 };
     }
 
@@ -1223,6 +1362,9 @@ pub const Context = struct {
         scale: f32,
     ) Error!void {
         std.debug.assert(m_pad % 128 == 0);
+        // Two dependent recorded ops — must not sit inside an `independent`
+        // group, which would elide the barrier between them.
+        std.debug.assert(self.indep_remaining == 0);
         try self.ensureDeviceBuffer(&self.x_h16, m_pad * cols * 2);
 
         // x f32 -> f16 with the weight scale folded in (zero pad rows).
@@ -1231,12 +1373,14 @@ pub const Context = struct {
             .u1 = @intCast(m * cols),
             .f0 = scale,
         }, m_pad * cols / 2, 1, 1);
-        try self.opMatmulCoopH16(y, self.x_h16, m_pad, w_bytes, rows, cols);
+        try self.opMatmulCoopH16(y, self.x_h16, m_pad, w_bytes, rows, cols, false);
     }
 
     /// Tensor-core GEMM whose f16 activations were already produced (the
     /// fused gate kernels fold the weight scale in themselves): just the
-    /// coop dispatch on the cached raw fp8 weights.
+    /// coop dispatch on the cached raw fp8 weights. With `c16` the C tile
+    /// stores half-precision (y is an f16 buffer) — exact under f16
+    /// accumulators; callers must check pipe_coop_c16 exists.
     pub fn opMatmulCoopH16(
         self: *Context,
         y: DeviceBuffer,
@@ -1245,8 +1389,9 @@ pub const Context = struct {
         w_bytes: []const u8,
         rows: usize,
         cols: usize,
+        c16: bool,
     ) Error!void {
-        std.debug.assert(self.pipe_coop != .null_handle);
+        std.debug.assert(if (c16) self.pipe_coop_c16 != .null_handle else self.pipe_coop != .null_handle);
         std.debug.assert(rows % coopmat.coop_wgn == 0 and cols % 64 == 0 and m_pad % 128 == 0);
         const w_buf = try self.weightBuffer(w_bytes, 1, rows, cols);
         const push: [4]u32 = .{ @intCast(m_pad), @intCast(rows), @intCast(cols), @intCast(rows) };
@@ -1255,7 +1400,7 @@ pub const Context = struct {
         // uvec4 views: binding 0 = activations, binding 3 = raw fp8
         // weights (binding 1 is unused; the layout still needs a buffer).
         var set = self.bind4(.{ x16.buf, x16.buf, y.buf, w_buf });
-        self.d.CmdBindPipeline(self.cmd, .compute, self.pipe_coop);
+        self.d.CmdBindPipeline(self.cmd, .compute, if (c16) self.pipe_coop_c16 else self.pipe_coop);
         self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout, vk.ShaderStage.compute, 0, 16, &push);
         self.d.CmdDispatch(self.cmd, @intCast(rows / coopmat.coop_wgn), @intCast(m_pad / 128), 1);
@@ -1269,7 +1414,11 @@ pub const Context = struct {
     /// MB each so the CPU pass is trivial next to the decode.
     fn weightBufferF16From32(self: *Context, w: []const f32, rows: usize, cols: usize) Error!vk.Buffer {
         const key = @intFromPtr(w.ptr);
-        if (self.weights.get(key)) |db| return db.buf;
+        self.use_counter += 1;
+        if (self.weights.getPtr(key)) |e| {
+            e.last_use = self.use_counter;
+            return e.db.buf;
+        }
 
         const n_pad = std.mem.alignForward(usize, rows, 128);
         const k_pad = std.mem.alignForward(usize, cols, 64);
@@ -1283,6 +1432,7 @@ pub const Context = struct {
         }
         const bytes = std.mem.sliceAsBytes(half);
 
+        self.reserveForWeights(bytes.len);
         const db = try self.createBuffer(
             bytes.len,
             vk.BufferUsage.storage_buffer | vk.BufferUsage.transfer_dst,
@@ -1316,7 +1466,7 @@ pub const Context = struct {
             off += n;
         }
 
-        try self.weights.put(self.gpa, key, db);
+        try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter });
         return db.buf;
     }
 
@@ -1520,16 +1670,83 @@ pub const Context = struct {
         _ = self.d.DeviceWaitIdle(self.device);
         var it = self.weights.valueIterator();
         while (it.next()) |wb| {
-            self.d.DestroyBuffer(self.device, wb.buf, null);
-            self.d.FreeMemory(self.device, wb.mem, null);
+            self.freeDeviceBuffer(wb.db);
         }
         self.weights.clearRetainingCapacity();
         var sit = self.small_bufs.valueIterator();
         while (sit.next()) |sb| {
-            self.d.DestroyBuffer(self.device, sb.buf, null);
-            self.d.FreeMemory(self.device, sb.mem, null);
+            self.freeDeviceBuffer(sb.*);
         }
         self.small_bufs.clearRetainingCapacity();
+    }
+
+    /// How many more bytes we may allocate before hitting the device
+    /// memory budget. VK_EXT_memory_budget sees other processes' usage
+    /// live; the fallback assumes 90% of the device-local heap is ours.
+    fn budgetHeadroom(self: *Context) u64 {
+        // An explicit --vram-budget is a CEILING on our own footprint, but it
+        // must still yield to what's physically free: another process holding
+        // most of the card can leave less than the budget available. Take the
+        // min of the two so the budget never over-promises under external
+        // pressure (previously it ignored the live query entirely, which is
+        // why the same budget behaved fine on an empty card and OOM'd when
+        // ~17 GB was held elsewhere).
+        const live = self.liveHeadroom();
+        if (self.budget_override != 0) {
+            return @min(self.budget_override -| self.device_used, live);
+        }
+        return live;
+    }
+
+    /// Headroom from the driver's live view (VK_EXT_memory_budget sees other
+    /// processes; heap-size * 0.9 minus our own usage is the fallback).
+    fn liveHeadroom(self: *Context) u64 {
+        if (self.has_memory_budget) {
+            var budget: vk.PhysicalDeviceMemoryBudgetPropertiesEXT = .{
+                .heap_budget = @splat(0),
+                .heap_usage = @splat(0),
+            };
+            var props2: vk.PhysicalDeviceMemoryProperties2 = .{
+                .p_next = &budget,
+                .memory_properties = undefined,
+            };
+            self.d.GetPhysicalDeviceMemoryProperties2(self.phys, &props2);
+            const cap = budget.heap_budget[self.device_heap];
+            if (cap > 0) return (cap * 95 / 100) -| budget.heap_usage[self.device_heap];
+        }
+        return (self.mem_props.memory_heaps[self.device_heap].size * 9 / 10) -| self.device_used;
+    }
+
+    /// Evict the least-recently-used cached weight buffer (false when the
+    /// cache is empty). Any recorded-but-unsubmitted dispatches may still
+    /// reference it, so the pending batch is flushed first.
+    fn evictOneWeight(self: *Context) bool {
+        var lru_key: usize = undefined;
+        var lru_use: u64 = std.math.maxInt(u64);
+        var it = self.weights.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.last_use < lru_use) {
+                lru_use = e.value_ptr.last_use;
+                lru_key = e.key_ptr.*;
+            }
+        }
+        if (lru_use == std.math.maxInt(u64)) return false;
+        if (self.batching) self.flushBatch() catch return false;
+        _ = self.d.DeviceWaitIdle(self.device);
+        const e = self.weights.fetchRemove(lru_key).?;
+        self.freeDeviceBuffer(e.value.db);
+        return true;
+    }
+
+    /// Make room for a `need`-byte weight upload: evict LRU weights while
+    /// the budget lacks headroom. Exhaustion thereby degrades to per-step
+    /// weight re-uploads (streaming) instead of an allocation failure; if
+    /// this still can't free enough, createBuffer's OOM retry is the
+    /// reactive backstop.
+    fn reserveForWeights(self: *Context, need: u64) void {
+        while (self.budgetHeadroom() < need) {
+            if (!self.evictOneWeight()) return;
+        }
     }
 
     fn beginCmdBuf(self: *Context, cb: vk.CommandBuffer) Error!void {
@@ -1581,6 +1798,7 @@ pub const Context = struct {
     /// Submit everything recorded since beginBatch and wait for completion.
     pub fn endBatch(self: *Context) Error!void {
         std.debug.assert(self.batching);
+        std.debug.assert(self.indep_remaining == 0); // group left open
         self.batching = false;
         try self.submitAndWait();
     }
@@ -1589,6 +1807,7 @@ pub const Context = struct {
     /// dropped; the command buffer is reset on next use.
     pub fn abortBatch(self: *Context) void {
         self.batching = false;
+        self.indep_remaining = 0;
     }
 
     /// Submit the recording so far, wait, and resume with a fresh command
@@ -1616,15 +1835,32 @@ pub const Context = struct {
     /// around 100 ms while still eliding ~98% of the fence waits.
     const batch_flush_limit = 512;
 
+    /// Declare that the next `n` recorded ops are pairwise independent (no
+    /// op reads or writes a buffer another op in the group writes): no
+    /// barrier is recorded between them, so their dispatches may overlap on
+    /// the device — the tail waves of one fill with the next. One barrier is
+    /// still recorded after the group's last op. A mid-group flush (ring or
+    /// dispatch cap) is harmless: submit-and-wait is a stronger sync than
+    /// the elided barrier. Sync (non-batched) mode ignores grouping.
+    pub fn independent(self: *Context, n: usize) void {
+        std.debug.assert(self.indep_remaining == 0);
+        self.indep_remaining = n;
+    }
+
     /// Per-op epilogue: outside a batch, submit-and-wait; inside one, order
-    /// this dispatch's writes before every later dispatch's reads/writes.
+    /// this dispatch's writes before every later dispatch's reads/writes
+    /// (unless the op is inside an `independent` group).
     fn opEnd(self: *Context) Error!void {
+        const in_group = self.indep_remaining > 1;
+        if (self.indep_remaining > 0) self.indep_remaining -= 1;
         if (self.batching) {
-            const bar: vk.MemoryBarrier = .{
-                .src_access_mask = vk.Access.shader_write,
-                .dst_access_mask = vk.Access.shader_read | vk.Access.shader_write,
-            };
-            self.d.CmdPipelineBarrier(self.cmd, vk.PipelineStage.compute_shader, vk.PipelineStage.compute_shader, 0, 1, @ptrCast(&bar), 0, null, 0, null);
+            if (!in_group) {
+                const bar: vk.MemoryBarrier = .{
+                    .src_access_mask = vk.Access.shader_write,
+                    .dst_access_mask = vk.Access.shader_read | vk.Access.shader_write,
+                };
+                self.d.CmdPipelineBarrier(self.cmd, vk.PipelineStage.compute_shader, vk.PipelineStage.compute_shader, 0, 1, @ptrCast(&bar), 0, null, 0, null);
+            }
             if (self.batch_n >= batch_flush_limit) try self.flushBatch();
         } else {
             try self.submitAndWait();

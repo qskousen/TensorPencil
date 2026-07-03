@@ -64,6 +64,14 @@ pub fn main(init: std.process.Init) !void {
             \\      --seed 0           noise seed
             \\      --shift 1.15       flow-matching sigma shift
             \\      --gpu off          offload large GEMMs to Vulkan (on/off)
+            \\      --vram-budget 0    GiB of device memory to use (0 = ask the
+            \\                         driver); weights past it stream per step
+            \\      --encoder-f16 off  run the text encoder GEMMs on tensor
+            \\                         cores (f16): ~0.4s faster, slightly less
+            \\                         exact conditioning (on/off)
+            \\      --dit-f32 off      run the diffusion model in full f32
+            \\                         instead of the f16 tensor-core path
+            \\                         (slower, more exact) (on/off)
             \\      --out out.png      output file
             \\  TensorPencil inspect <file.safetensors>   list tensors in a checkpoint
             \\  TensorPencil bench-matmul                 time a DiT-sized fp8 GEMM
@@ -106,6 +114,13 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
             TensorPencil.models.dit_gpu.profile = std.mem.eql(u8, val, "on") or std.mem.eql(u8, val, "1");
         } else if (std.mem.eql(u8, flag, "--gpu")) {
             opts.use_gpu = std.mem.eql(u8, val, "on") or std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
+        } else if (std.mem.eql(u8, flag, "--vram-budget")) {
+            const gib = try std.fmt.parseFloat(f64, val);
+            opts.vram_budget = @intFromFloat(gib * (1 << 30));
+        } else if (std.mem.eql(u8, flag, "--encoder-f16")) {
+            opts.encoder_f16 = std.mem.eql(u8, val, "on") or std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
+        } else if (std.mem.eql(u8, flag, "--dit-f32")) {
+            TensorPencil.models.dit_gpu.force_f32 = std.mem.eql(u8, val, "on") or std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
         } else if (std.mem.eql(u8, flag, "--out")) {
             out_path = val;
         } else {

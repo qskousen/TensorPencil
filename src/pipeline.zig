@@ -11,6 +11,7 @@ const safetensors = @import("safetensors.zig");
 const sampler = @import("sampler.zig");
 const image = @import("image.zig");
 const qwen3 = @import("models/qwen3.zig");
+const qwen3_gpu = @import("models/qwen3_gpu.zig");
 const krea2_text = @import("models/krea2_text.zig");
 const dit_mod = @import("models/dit.zig");
 const dit_gpu = @import("models/dit_gpu.zig");
@@ -28,6 +29,12 @@ pub const Options = struct {
     shift: f32 = sampler.default_shift,
     /// Offload large GEMMs to Vulkan; falls back to CPU when unavailable.
     use_gpu: bool = false,
+    /// Cap on device memory (bytes; 0 = query the driver's live budget).
+    /// Weights past the cap stream per step instead of staying resident.
+    vram_budget: u64 = 0,
+    /// Run the GPU text encoder's GEMMs on tensor cores (f16). ~0.4s faster
+    /// encode but ~doubles its image-delta contribution; default f32.
+    encoder_f16: bool = false,
     text_encoder_path: []const u8 = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors",
     dit_path: []const u8 = "models/diffusion_model/krea2CenterSemiraw_v10Fp8.safetensors",
     vae_path: []const u8 = "models/vae/krea2RealVae_v10.safetensors",
@@ -58,11 +65,13 @@ pub fn generate(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*s
     const lat_w = opts.width / 8;
     const lat_len = wan_vae.latent_channels * lat_h * lat_w;
     const use_cfg = opts.cfg != 1.0;
+    const total_start = std.Io.Clock.real.now(io);
 
     var gpu_ctx: ?*gpu_mod.Context = null;
     if (opts.use_gpu) {
         if (gpu_mod.Context.init(gpa)) |ctx| {
             gpu_ctx = ctx;
+            ctx.budget_override = opts.vram_budget;
             ops.matmul.gpu = ctx;
             try note(progress, "gpu: {s}\n", .{ctx.deviceName()});
         } else |err| {
@@ -90,8 +99,8 @@ pub fn generate(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*s
         const load_s = @as(f64, @floatFromInt(enc_start.nanoseconds - load_start.nanoseconds)) / 1e9;
         try note(progress, "text encoder loaded in {d:.1}s\n", .{load_s});
 
-        cond_pos = try encodePrompt(io, gpa, &tok, &enc, opts.prompt);
-        if (use_cfg) cond_neg = try encodePrompt(io, gpa, &tok, &enc, opts.negative);
+        cond_pos = try encodePrompt(io, gpa, gpu_ctx, opts.encoder_f16, &tok, &enc, opts.prompt);
+        if (use_cfg) cond_neg = try encodePrompt(io, gpa, gpu_ctx, opts.encoder_f16, &tok, &enc, opts.negative);
         const enc_s = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - enc_start.nanoseconds)) / 1e9;
         try note(progress, "encoded prompt ({d} tokens{s}) in {d:.1}s\n", .{ cond_pos.seq, if (use_cfg) " + negative" else "", enc_s });
     }
@@ -125,25 +134,31 @@ pub fn generate(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*s
         defer if (sess_pos) |*sp| sp.deinit(gpa, gpu_ctx.?);
         var sess_neg: ?dit_gpu.Session = null;
         defer if (sess_neg) |*sn| sn.deinit(gpa, gpu_ctx.?);
+        // One workspace serves both sessions (sized for the longer text).
+        var ws: ?dit_gpu.Workspace = null;
+        defer if (ws) |*w| w.deinit(gpu_ctx.?);
         if (gpu_ctx) |gc| {
             sess_pos = try dit_gpu.Session.init(gpa, io, gc, &dit, lat_h, lat_w, cond_pos.data, cond_pos.seq, sigmas);
             if (use_cfg) {
                 sess_neg = try dit_gpu.Session.init(gpa, io, gc, &dit, lat_h, lat_w, cond_neg.?.data, cond_neg.?.seq, sigmas);
             }
+            const seq_txt_cap = @max(cond_pos.seq, if (cond_neg) |c| c.seq else 0);
+            ws = try dit_gpu.Workspace.init(gc, lat_h, lat_w, seq_txt_cap);
         }
         const dit_s = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - dit_start.nanoseconds)) / 1e9;
         try note(progress, "diffusion model ready in {d:.1}s\n", .{dit_s});
 
+        const sampling_start = std.Io.Clock.real.now(io);
         for (0..opts.steps) |i| {
             const start = std.Io.Clock.real.now(io);
             if (gpu_ctx) |gc| {
-                try dit_gpu.forward(&dit, gc, &sess_pos.?, io, gpa, v, x, sigmas[i]);
+                try dit_gpu.forward(&dit, gc, &sess_pos.?, &ws.?, io, gpa, v, x, sigmas[i]);
             } else {
                 try dit.forward(io, gpa, v, x, lat_h, lat_w, sigmas[i], cond_pos.data, cond_pos.seq);
             }
             if (use_cfg) {
                 if (gpu_ctx) |gc| {
-                    try dit_gpu.forward(&dit, gc, &sess_neg.?, io, gpa, v_neg.?, x, sigmas[i]);
+                    try dit_gpu.forward(&dit, gc, &sess_neg.?, &ws.?, io, gpa, v_neg.?, x, sigmas[i]);
                 } else try dit.forward(io, gpa, v_neg.?, x, lat_h, lat_w, sigmas[i], cond_neg.?.data, cond_neg.?.seq);
                 sampler.applyCfg(v, v_neg.?, opts.cfg);
             }
@@ -151,6 +166,8 @@ pub fn generate(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*s
             const ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - start.nanoseconds)) / 1e6;
             try note(progress, "step {d}/{d}  sigma {d:.3} -> {d:.3}  ({d:.1}s)\n", .{ i + 1, opts.steps, sigmas[i], sigmas[i + 1], ms / 1000.0 });
         }
+        const sampling_s = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - sampling_start.nanoseconds)) / 1e9;
+        try note(progress, "sampling {d} steps in {d:.1}s ({d:.2}s/step)\n", .{ opts.steps, sampling_s, sampling_s / @as(f64, @floatFromInt(opts.steps)) });
     }
 
     // DiT weight buffers are stale after this point; drop them so VAE
@@ -173,7 +190,21 @@ pub fn generate(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*s
     var vae = try wan_vae.Decoder.load(gpa, &st);
     defer vae.deinit();
     const planar = if (gpu_ctx) |gc|
-        try vae_gpu.decode(&vae, gc, io, gpa, x, lat_h, lat_w)
+        vae_gpu.decode(&vae, gc, io, gpa, x, lat_h, lat_w) catch |err| switch (err) {
+            // Not enough free VRAM for the decode activations (e.g. another
+            // process is holding the GPU). Fall back to a pure-CPU decode:
+            // its buffers live in system RAM, so it degrades gracefully
+            // instead of crashing. Disable GEMM offload for the duration so
+            // the fallback can't bounce straight back into the same OOM.
+            error.DeviceOutOfMemory => blk: {
+                try note(progress, "vae decode: out of VRAM, falling back to CPU decode\n", .{});
+                const saved = ops.matmul.gpu;
+                ops.matmul.gpu = null;
+                defer ops.matmul.gpu = saved;
+                break :blk try vae.decode(io, gpa, x, lat_h, lat_w);
+            },
+            else => return err,
+        }
     else
         try vae.decode(io, gpa, x, lat_h, lat_w);
     defer gpa.free(planar);
@@ -181,15 +212,24 @@ pub fn generate(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*s
     try note(progress, "decoded in {d:.1}s\n", .{dec_s});
 
     const rgb = try image.planarF32ToRgb8(gpa, planar, opts.width, opts.height);
+
+    const total_s = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - total_start.nanoseconds)) / 1e9;
+    try note(progress, "total time {d:.1}s\n", .{total_s});
+
     return .{ .rgb = rgb, .width = opts.width, .height = opts.height };
 }
 
-fn encodePrompt(io: std.Io, gpa: std.mem.Allocator, tok: *const tokenizer_mod.Tokenizer, enc: *const qwen3.TextEncoder, text: []const u8) !Cond {
+fn encodePrompt(io: std.Io, gpa: std.mem.Allocator, gpu_ctx: ?*gpu_mod.Context, encoder_f16: bool, tok: *const tokenizer_mod.Tokenizer, enc: *const qwen3.TextEncoder, text: []const u8) !Cond {
     var ids: std.ArrayList(u32) = .empty;
     defer ids.deinit(gpa);
     try krea2_text.buildIds(tok, gpa, text, &ids);
 
-    const full = try enc.encode(io, gpa, ids.items);
+    // GPU-resident encode (batched, keeps the device saturated) when Vulkan
+    // is up; the CPU forward is the fallback (and used on any GPU error).
+    const full = if (gpu_ctx) |gc|
+        qwen3_gpu.encode(enc, gc, io, gpa, ids.items, encoder_f16) catch try enc.encode(io, gpa, ids.items)
+    else
+        try enc.encode(io, gpa, ids.items);
     defer gpa.free(full);
 
     const offset = krea2_text.stripOffset(ids.items);
