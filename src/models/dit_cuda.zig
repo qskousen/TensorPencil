@@ -28,6 +28,18 @@ const channels = dit.channels; // 16
 const attn_scale: f32 = 1.0 / 11.313708498984761; // 1/sqrt(128)
 const eps: f32 = 1e-5;
 
+/// MLP sequence-tile: the gate/up/down GEMMs run over chunks of this many rows
+/// so the mg/mu intermediates are [tile][mlp_dim] instead of [seq][mlp_dim]
+/// (512 MiB → 128 MiB each at 1 MP). The MLP is per-row so chunks are independent.
+const mlp_tile: usize = 2048;
+
+/// A device-buffer sub-view offset `off_bytes` into `b` (CUDA buffers are raw
+/// pointers, so a mid-buffer view is just pointer arithmetic — the eltwise/GEMM
+/// kernels index from the given base).
+fn offsetBuf(b: DeviceBuffer, off_bytes: usize) DeviceBuffer {
+    return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off_bytes), .mem = .null_handle, .size = b.size - off_bytes };
+}
+
 /// Use the tensor-core GQA attention path (hgemm+softmax_row) instead of the
 /// naive one-thread-per-(q,head) kernel. On by default — it is O(seq²) faster on
 /// the tensor cores and the naive path is O(seq²) latency-bound. Toggle for A/B.
@@ -133,8 +145,10 @@ pub const Workspace = struct {
         ws.v_d = try be.tensorCreate(mpad * kv_heads * hd * 4);
         ws.g_d = try be.tensorCreate(mpad * F * 4);
         ws.attn_d = try be.tensorCreate(mpad * heads * hd * 4);
-        ws.mg_d = try be.tensorCreate(mpad * mlp_dim * 4);
-        ws.mu_d = try be.tensorCreate(mpad * mlp_dim * 4);
+        // mg/mu hold one MLP tile (see mlp_tile) — not the full padded sequence.
+        const mlp_rows = @min(mpad, std.mem.alignForward(usize, mlp_tile, 128));
+        ws.mg_d = try be.tensorCreate(mlp_rows * mlp_dim * 4);
+        ws.mu_d = try be.tensorCreate(mlp_rows * mlp_dim * 4);
         return ws;
     }
 
@@ -233,15 +247,21 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
         try be.opI8Prep(attn_d, seq, blk.attn.wo.cols);
         try be.opI8Gemm(t1_d, blk.attn.wo.bytes, blk.attn.wo.row_scale.?, blk.attn.wo.rows, false);
         try be.gatedAdd(x_d, t1_d, mv_d, seq * F, F, mb + 2 * F);
-        // --- mlp ---
-        try be.rmsMod(x_d, t1_d, mv_d, seq, F, mb + 3 * F, mb + 4 * F, eps);
-        try be.opI8Prep(t1_d, seq, F);
-        try be.opI8Gemm(mg_d, blk.mlp.gate.bytes, blk.mlp.gate.row_scale.?, blk.mlp.gate.rows, false);
-        try be.opI8Gemm(mu_d, blk.mlp.up.bytes, blk.mlp.up.row_scale.?, blk.mlp.up.rows, false);
-        try be.siluMul(mg_d, mu_d, seq * mlp_dim);
-        try be.opI8Prep(mg_d, seq, blk.mlp.down.cols);
-        try be.opI8Gemm(t1_d, blk.mlp.down.bytes, blk.mlp.down.row_scale.?, blk.mlp.down.rows, false);
-        try be.gatedAdd(x_d, t1_d, mv_d, seq * F, F, mb + 5 * F);
+        // --- mlp (sequence-tiled: mg/mu are [tile][mlp_dim]; each row-chunk is
+        // independent, so we walk seq in mlp_tile-row bands over offset x views) ---
+        var c0: usize = 0;
+        while (c0 < seq) : (c0 += mlp_tile) {
+            const tile: usize = @min(mlp_tile, seq - c0);
+            const xo = offsetBuf(x_d, c0 * F * 4);
+            try be.rmsMod(xo, t1_d, mv_d, tile, F, mb + 3 * F, mb + 4 * F, eps);
+            try be.opI8Prep(t1_d, tile, F);
+            try be.opI8Gemm(mg_d, blk.mlp.gate.bytes, blk.mlp.gate.row_scale.?, blk.mlp.gate.rows, false);
+            try be.opI8Gemm(mu_d, blk.mlp.up.bytes, blk.mlp.up.row_scale.?, blk.mlp.up.rows, false);
+            try be.siluMul(mg_d, mu_d, tile * mlp_dim);
+            try be.opI8Prep(mg_d, tile, blk.mlp.down.cols);
+            try be.opI8Gemm(t1_d, blk.mlp.down.bytes, blk.mlp.down.row_scale.?, blk.mlp.down.rows, false);
+            try be.gatedAdd(xo, t1_d, mv_d, tile * F, F, mb + 5 * F);
+        }
     }
 
     // --- final layer ---

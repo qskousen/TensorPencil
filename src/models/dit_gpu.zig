@@ -191,7 +191,7 @@ pub const Workspace = struct {
         const flash = use_flash and ctx.pipe_flash_md != .null_handle;
         const s_rows = if (tc_attn) seq_pad else seq;
         const s_esize: usize = if (tc_attn) 2 else 4;
-        const hpb = headsPerBatch(s_rows, s_esize, null);
+        const hpb = headsPerBatch(s_rows, s_esize, scoresCap(ctx.budget_override), null);
 
         var ws: Workspace = undefined;
         ws.seq_cap = seq;
@@ -243,11 +243,20 @@ pub const Workspace = struct {
 
 /// How many heads' scores planes fit the byte cap (and, when reusing a
 /// Workspace built for a longer sequence, its actual buffer).
-fn headsPerBatch(s_rows: usize, s_esize: usize, ws_s_bytes: ?usize) usize {
+fn headsPerBatch(s_rows: usize, s_esize: usize, cap: usize, ws_s_bytes: ?usize) usize {
     const plane = s_rows * s_rows * s_esize;
-    var hb = @max(1, @min(heads, s_bytes_cap / plane));
-    if (ws_s_bytes) |cap| hb = @max(1, @min(hb, cap / plane));
+    var hb = @max(1, @min(heads, cap / plane));
+    if (ws_s_bytes) |c| hb = @max(1, @min(hb, c / plane));
     return hb;
+}
+
+/// Byte budget for the materialized attention-scores buffer. Defaults to the
+/// 2 GiB cap; a `--vram-budget` shrinks it (attention batches over more head
+/// groups, trading a few launches for a much smaller `s_d` — the single biggest
+/// activation buffer at high resolution). Floored so at least one head fits.
+fn scoresCap(budget: u64) usize {
+    if (budget == 0) return s_bytes_cap;
+    return @min(s_bytes_cap, @max(64 << 20, budget / 4));
 }
 
 pub fn forward(
@@ -360,7 +369,7 @@ pub fn forward(
     // sequence, whose per-head planes and chunk tables divide differently).
     const s_rows = if (tc_attn) seq_pad else seq;
     const s_esize: usize = if (tc_attn) 2 else 4; // coop path stores S f16
-    var heads_per_batch = headsPerBatch(s_rows, s_esize, ws.s_d.size);
+    var heads_per_batch = headsPerBatch(s_rows, s_esize, s_bytes_cap, ws.s_d.size);
     if (tc_attn and !flash) {
         heads_per_batch = @max(1, @min(heads_per_batch, ws.part_d.size / (seq * nchunks * 2 * 4)));
         heads_per_batch = @max(1, @min(heads_per_batch, ws.md_d.size / (seq_pad * 2 * 4)));

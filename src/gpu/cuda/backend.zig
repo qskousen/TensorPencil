@@ -948,7 +948,10 @@ pub const Backend = struct {
         // scratch/head: S (f16) always; fused adds a tiny MD table, the materialized
         // path adds a full P (f16) — so the fused path fits ~2× the heads per launch.
         const per_head = if (fused) mpad * mpad * 2 + mpad * 8 else mpad * mpad * 4;
-        var g = self.attn_scratch_budget / per_head;
+        // A --vram-budget shrinks the scores scratch (more head-batches) — the
+        // single biggest activation buffer at high resolution.
+        const cap = if (self.budget_override != 0) @min(self.attn_scratch_budget, @max(64 << 20, self.budget_override / 4)) else self.attn_scratch_budget;
+        var g = cap / per_head;
         if (g < 1) g = 1;
         if (g > n_heads) g = n_heads;
 

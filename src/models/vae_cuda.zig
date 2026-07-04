@@ -24,8 +24,7 @@ const patch_band_bytes: usize = 256 << 20;
 const Bufs = struct {
     x: Buf = .{},
     t: Buf = .{},
-    u: Buf = .{},
-    v: Buf = .{},
+    u: Buf = .{}, // also serves as conv2's output (`v` aliases `u` — see res)
     patch: Buf = .{},
     // mid-block attention q/k/v/out (reused proj into aq).
     aq: Buf = .{},
@@ -147,19 +146,22 @@ fn conv(be: *Backend, bufs: *Bufs, src: *const Buf, dst: *Buf, h: usize, w: usiz
 }
 
 /// Residual block over bufs.x in place (result swapped back into bufs.x).
+/// `u` is reused for both conv outputs: conv1's result is consumed by norm2
+/// before conv2 overwrites it, so conv2 (the old `v`) can share the same buffer
+/// — one fewer full-resolution buffer (~720 MiB at 1 MP).
 fn res(be: *Backend, bufs: *Bufs, h: usize, w: usize, rb: wan_vae.ResBlock) !void {
     const n = h * w;
     try norm(be, &bufs.x, &bufs.t, n, rb.norm1, true);
     try conv(be, bufs, &bufs.t, &bufs.u, h, w, rb.conv1, false);
-    try norm(be, &bufs.u, &bufs.t, n, rb.norm2, true);
-    try conv(be, bufs, &bufs.t, &bufs.v, h, w, rb.conv2, false);
+    try norm(be, &bufs.u, &bufs.t, n, rb.norm2, true); // consumes u
+    try conv(be, bufs, &bufs.t, &bufs.u, h, w, rb.conv2, false); // reuses u
     if (rb.shortcut) |sc| {
         try conv(be, bufs, &bufs.x, &bufs.t, h, w, sc, false);
-        try be.opAdd(bufs.v, bufs.t, n * rb.conv2.co);
+        try be.opAdd(bufs.u, bufs.t, n * rb.conv2.co);
     } else {
-        try be.opAdd(bufs.v, bufs.x, n * rb.conv2.co);
+        try be.opAdd(bufs.u, bufs.x, n * rb.conv2.co);
     }
-    std.mem.swap(Buf, &bufs.x, &bufs.v);
+    std.mem.swap(Buf, &bufs.x, &bufs.u);
 }
 
 /// Mid-block single-head (dim c) self-attention: qkv GEMMs → tensor-core

@@ -185,19 +185,22 @@ fn conv(ctx: *Context, bufs: *Bufs, src: *const DeviceBuffer, dst: *DeviceBuffer
 }
 
 /// Residual block over bufs.x in place (result swapped back into bufs.x).
+/// conv2 reuses `u` (conv1's output is dead once norm2 has read it), so the
+/// full-resolution `v` allocation is avoided — `v` then only grows to the
+/// latent-resolution mid-attention size. One fewer full-res buffer (~720 MiB@1MP).
 fn res(ctx: *Context, bufs: *Bufs, h: usize, w: usize, rb: wan_vae.ResBlock) !void {
     const n = h * w;
     try norm(ctx, &bufs.x, &bufs.t, n, rb.norm1, true);
     try conv(ctx, bufs, &bufs.t, &bufs.u, h, w, rb.conv1, false);
-    try norm(ctx, &bufs.u, &bufs.t, n, rb.norm2, true);
-    try conv(ctx, bufs, &bufs.t, &bufs.v, h, w, rb.conv2, false);
+    try norm(ctx, &bufs.u, &bufs.t, n, rb.norm2, true); // consumes u
+    try conv(ctx, bufs, &bufs.t, &bufs.u, h, w, rb.conv2, false); // reuses u
     if (rb.shortcut) |sc| {
         try conv(ctx, bufs, &bufs.x, &bufs.t, h, w, sc, false);
-        try ctx.opElt(.add, bufs.v, bufs.t, null, null, .{ .u0 = @intCast(n * rb.conv2.co) }, n * rb.conv2.co, 1, 1);
+        try ctx.opElt(.add, bufs.u, bufs.t, null, null, .{ .u0 = @intCast(n * rb.conv2.co) }, n * rb.conv2.co, 1, 1);
     } else {
-        try ctx.opElt(.add, bufs.v, bufs.x, null, null, .{ .u0 = @intCast(n * rb.conv2.co) }, n * rb.conv2.co, 1, 1);
+        try ctx.opElt(.add, bufs.u, bufs.x, null, null, .{ .u0 = @intCast(n * rb.conv2.co) }, n * rb.conv2.co, 1, 1);
     }
-    std.mem.swap(DeviceBuffer, &bufs.x, &bufs.v);
+    std.mem.swap(DeviceBuffer, &bufs.x, &bufs.u);
 }
 
 /// Mid-block single-head attention, fully on the GPU when the tensor-core

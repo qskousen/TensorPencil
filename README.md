@@ -84,22 +84,24 @@ Run with no command to see the available options and defaults.
 ### VRAM offloading
 
 When running on GPU, if other processes are using vram or the `--vram-budget` option is set,
-weights past the available budget are streamed from the mmapped file. Assuming sufficient RAM,
-this streaming is nearly free performance-wise, as displayed in the chart below, tested all the
-way down to 1 GiB of VRAM.
+weights past the available budget are streamed from the mmapped file. Assuming sufficient RAM for cache,
+this streaming costs only ~20% per step and stays roughly flat across cap sizes — below full residency
+effectively every weight re-uploads each step, so a smaller cap is barely slower (see the chart below).
+You can pass `min` as the budget size to load only 2 weights at a time, ~150MiB (~40% performance loss per step).
 
 ** Note that the VRAM budget is only for the weights, the scores and activations are still in VRAM.**
-The amount of VRAM used for the scores and activations depends on the size of the image; at ~1.8MP, it will be roughly 4.5GiB.
+The amount of VRAM used for the scores and activations depends on the size of the image; at ~1.8MP, it will be roughly 3.1GiB.
 
-Measured on an RTX 3090 at 1120×1680, 4 steps, f16 DiT:
+Measured on an RTX 3090 at 1120×1680, 4 steps, INT8 ConvRot, vulkan backend:
 
 | VRAM cap                    | s/step | total  |
-|:----------------------------| :----- | :----- |
-| 0 (driver-managed, default) | 5.03   | 30.0 s |
-| 16 GiB                      | 6.04   | 33.9 s |
-| 12 GiB                      | 6.06   | 34.1 s |
-| 8 GiB                       | 6.23   | 34.7 s |
-| 6 GiB                       | 6.00   | 33.7 s |
-| 4 GiB                       | 6.05   | 34.0 s |
-| 2 GiB                       | 6.03   | 34.0 s |
-| 1 GiB                       | 6.04   | 33.8 s |
+|:----------------------------|:-------|:-------|
+| 0 (driver-managed, default) | 5.25   | 26.4 s |
+| 16 GiB                      | 6.39   | 31.0 s |
+| 12 GiB                      | 6.45   | 31.1 s |
+| 8 GiB                       | 6.46   | 31.1 s |
+| 6 GiB                       | 6.42   | 30.9 s |
+| 4 GiB                       | 6.33   | 30.5 s |
+| 2 GiB                       | 6.47   | 31.2 s |
+| 1 GiB                       | 6.53   | 31.3 s |
+| min (150MiB)                | 7.21   | 34.2 s |

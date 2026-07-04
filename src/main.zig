@@ -5,6 +5,11 @@ const Io = std.Io;
 
 const TensorPencil = @import("TensorPencil");
 
+/// `--vram-budget min`: hold only the in-flight weights (~2 at a time). 256 MiB
+/// comfortably fits the two largest int8 linears (~100 MiB each) plus scales, so
+/// no single op sync-thrashes, while every other weight streams per step.
+const min_vram_budget: u64 = 256 << 20;
+
 pub fn main(init: std.process.Init) !void {
     const arena: std.mem.Allocator = init.arena.allocator();
     const io = init.io;
@@ -109,7 +114,11 @@ pub fn main(init: std.process.Init) !void {
             \\                         (encoder + DiT + VAE) on the hand-PTX CUDA
             \\                         backend (needs an int8 convrot --dit ckpt)
             \\      --vram-budget 0    GiB of device memory to use (0 = ask the
-            \\                         driver); weights past it stream per step
+            \\                         driver); weights past it stream per step.
+            \\                         "min" holds only the in-flight weights
+            \\                         (~2 at a time) — lowest VRAM, but streams
+            \\                         every weight each step (slow; pair w/ a
+            \\                         small image for sub-GiB total)
             \\      --encoder-f16 off  run the text encoder GEMMs on tensor
             \\                         cores (f16): ~0.4s faster, slightly less
             \\                         exact conditioning (on/off)
@@ -887,8 +896,16 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
                 return error.InvalidArgs;
             };
         } else if (std.mem.eql(u8, flag, "--vram-budget")) {
-            const gib = try std.fmt.parseFloat(f64, val);
-            opts.vram_budget = @intFromFloat(gib * (1 << 30));
+            // "min" = bare-minimum weight residency: hold only the in-flight
+            // weights (~2 at a time) and stream everything else. Activations
+            // aren't streamable, so total VRAM is still weight-min + activations
+            // (resolution-bound); use a small image to get well under 1 GiB.
+            if (std.mem.eql(u8, val, "min")) {
+                opts.vram_budget = min_vram_budget;
+            } else {
+                const gib = try std.fmt.parseFloat(f64, val);
+                opts.vram_budget = @intFromFloat(gib * (1 << 30));
+            }
         } else if (std.mem.eql(u8, flag, "--encoder-f16")) {
             opts.encoder_f16 = std.mem.eql(u8, val, "on") or std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
         } else if (std.mem.eql(u8, flag, "--dit-f32")) {
