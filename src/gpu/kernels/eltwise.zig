@@ -628,6 +628,35 @@ export fn qknorm_rope16() callconv(.spirv_kernel) void {
     }
 }
 
+// qknorm_rope_f32: qknorm_rope16 entirely in f32, in place — fuses rmsnorm +
+// rope (2 int8-path passes into 1). a = x (f32 [rows][hd], in place), b = norm
+// weight, c = freqs. u0 = rows, u1 = half, u2 = sin_off, u3 = n_heads,
+// f0 = scale, f1 = eps.
+export fn qknorm_rope_f32() callconv(.spirv_kernel) void {
+    decorate();
+    const row = gpu.global_invocation_id[0];
+    if (row >= pc.u0) return;
+    const half = pc.u1;
+    const pos = row / pc.u3;
+    const base = row * half * 2;
+    var sum: f32 = 0;
+    var w: u32 = 0;
+    while (w < half * 2) : (w += 1) {
+        const v = a.data[base + w];
+        sum += v * v;
+    }
+    const inv = 1.0 / @sqrt(sum / @as(f32, @floatFromInt(half * 2)) + pc.f1);
+    w = 0;
+    while (w < half) : (w += 1) {
+        const x0 = a.data[base + w * 2] * inv * b.data[w * 2];
+        const x1 = a.data[base + w * 2 + 1] * inv * b.data[w * 2 + 1];
+        const cos_v = c.data[pos * half + w];
+        const sin_v = c.data[pc.u2 + pos * half + w];
+        a.data[base + w * 2] = (x0 * cos_v - x1 * sin_v) * pc.f0;
+        a.data[base + w * 2 + 1] = (x0 * sin_v + x1 * cos_v) * pc.f0;
+    }
+}
+
 // gather_kmajor16: gather_kmajor_h16 with an f16 source — raw u16 moves, no
 // conversion. a = f16 [seq][kv][hd] pair words, d = packed f16 pairs
 // [kv][hd][s_stride]; positions >= seq write zero. u0 = out words, u1 = hd,
@@ -712,6 +741,150 @@ export fn gated_add16() callconv(.spirv_kernel) void {
         const dv: f32 = @floatCast(@as(f16, @bitCast(@as(u16, @truncate(w >> (16 * j))))));
         a.data[e] += c.data[pc.u2 + col] * dv;
     }
+}
+
+// --- int8 (convrot) activation prep + output scaling ----------------------
+// The int8 tensor-core GEMM path quantizes activations dynamically per row
+// after the group-Hadamard rotation that matches the pre-rotated weights.
+
+// rotate: x_rot = x @ H per group_size (256) block along the columns (the
+// ConvRot rotation, applied online to activations). One thread per output
+// element; a = x, c = H (row-major [gs][gs]), b = x_rot. u0 = n (rows*cols),
+// u1 = gs (256). Both cols and rows*cols are multiples of gs, so the group a
+// column belongs to is just `idx - idx % gs`.
+export fn rotate() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const gs = pc.u1;
+    const local = idx % gs;
+    const base = idx - local;
+    var acc: f32 = 0;
+    var l: u32 = 0;
+    // H is symmetric (H[local][l] == H[l][local]); index as [l][local] so that
+    // consecutive threads (consecutive `local`) read consecutive H addresses —
+    // coalesced instead of stride-gs.
+    while (l < gs) : (l += 1) acc += c.data[l * gs + local] * a.data[base + l];
+    b.data[idx] = acc;
+}
+
+// rotate_fwht: same rotation as `rotate`, but one thread owns a whole 256
+// group and runs the radix-4 fast Walsh-Hadamard (4 passes, strides 1/4/16/64,
+// then /16) — ~16x fewer ops than the matvec, at the cost of a 256-f32 private
+// array per thread. Also emits the group's abs-max as a partial (d), so the
+// per-row quant scale becomes a cheap O(groups/row) reduction instead of a
+// latency-bound O(cols) row scan. a = x, b = x_rot, d = partial abs-max per
+// group. u0 = group count (n/256).
+export fn rotate_fwht() callconv(.spirv_kernel) void {
+    decorate();
+    const g = gpu.global_invocation_id[0];
+    if (g >= pc.u0) return;
+    const base = g * 256;
+    var v: [256]f32 = undefined;
+    var i: u32 = 0;
+    while (i < 256) : (i += 1) v[i] = a.data[base + i];
+    inline for (.{ 1, 4, 16, 64 }) |s| {
+        var bb: u32 = 0;
+        while (bb < 256) : (bb += s * 4) {
+            var o: u32 = 0;
+            while (o < s) : (o += 1) {
+                const p = bb + o;
+                const x0 = v[p];
+                const x1 = v[p + s];
+                const x2 = v[p + 2 * s];
+                const x3 = v[p + 3 * s];
+                v[p] = x0 + x1 + x2 - x3;
+                v[p + s] = x0 + x1 - x2 + x3;
+                v[p + 2 * s] = x0 - x1 + x2 + x3;
+                v[p + 3 * s] = -x0 + x1 + x2 + x3;
+            }
+        }
+    }
+    var amax: f32 = 0;
+    i = 0;
+    while (i < 256) : (i += 1) {
+        const r = v[i] / 16.0;
+        b.data[base + i] = r;
+        amax = @max(amax, @abs(r));
+    }
+    d.data[g] = amax;
+}
+
+// rowscale_i8: per-row int8 scale from the per-group partial abs-maxes.
+// a = partials [rows*ng], b = scale [rows]. u0 = rows, u1 = ng (groups/row).
+export fn rowscale_i8() callconv(.spirv_kernel) void {
+    decorate();
+    const row = gpu.global_invocation_id[0];
+    if (row >= pc.u0) return;
+    const ng = pc.u1;
+    var amax: f32 = 0;
+    var i: u32 = 0;
+    while (i < ng) : (i += 1) amax = @max(amax, a.data[row * ng + i]);
+    b.data[row] = @max(amax / 127.0, 1e-12);
+}
+
+// rowmax_i8: per-row dynamic int8 scale = max|x_rot[row]| / 127 (clamped off
+// zero). One thread per row. a = x_rot, b = scale [rows]. u0 = rows, u1 = cols.
+export fn rowmax_i8() callconv(.spirv_kernel) void {
+    decorate();
+    const row = gpu.global_invocation_id[0];
+    if (row >= pc.u0) return;
+    const cols = pc.u1;
+    const base = row * cols;
+    var amax: f32 = 0;
+    var i: u32 = 0;
+    while (i < cols) : (i += 1) amax = @max(amax, @abs(a.data[base + i]));
+    b.data[row] = @max(amax / 127.0, 1e-12);
+}
+
+// quantize_i8: pack 4 int8 per u32 word, q = clamp(round(x_rot/scale[row]),
+// -127, 127). a = x_rot, d = scale [rows], b = packed int8. u0 = words (n/4),
+// u1 = cols, u2 = real element count (words past it — GEMM pad rows — zero).
+export fn quantize_i8() callconv(.spirv_kernel) void {
+    decorate();
+    const w = gpu.global_invocation_id[0];
+    if (w >= pc.u0) return;
+    const e0 = w * 4;
+    if (e0 >= pc.u2) {
+        b.data[w] = 0; // padding row -> zeros
+        return;
+    }
+    const inv = 1.0 / d.data[e0 / pc.u1];
+    var out: u32 = 0;
+    inline for (0..4) |j| {
+        var qi: i32 = @intFromFloat(@round(a.data[e0 + j] * inv));
+        qi = @max(@as(i32, -127), @min(@as(i32, 127), qi));
+        out |= @as(u32, @as(u8, @bitCast(@as(i8, @intCast(qi))))) << @intCast(8 * j);
+    }
+    b.data[w] = @bitCast(out);
+}
+
+// scale_concat: assemble the fused int8 GEMM's scale buffer = [act(m_pad) |
+// weight(rows)] in one dispatch (batch-barrier-safe, no transfer/compute race).
+// a = act_scale (m entries on device), c = weight_scale (rows), b = concat out.
+// u0 = m_pad + rows (total), u1 = m (act count), u2 = m_pad (weight base).
+export fn scale_concat() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    if (idx < pc.u1) {
+        b.data[idx] = a.data[idx];
+    } else if (idx >= pc.u2) {
+        b.data[idx] = c.data[idx - pc.u2];
+    } else {
+        b.data[idx] = 0; // act pad rows (m..m_pad); outputs discarded
+    }
+}
+
+// scale_i32: y = int32_acc * act_scale[row] * weight_scale[col]. Reads the
+// s32 GEMM output through the f32 view. a = acc (s32 bits), c = weight_scale
+// [nout], d = act_scale [rows], b = y (f32). u0 = rows*nout, u1 = nout.
+export fn scale_i32() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const acc: i32 = @bitCast(a.data[idx]);
+    b.data[idx] = @as(f32, @floatFromInt(acc)) * d.data[idx / pc.u1] * c.data[idx % pc.u1];
 }
 
 // --- VAE decoder kernels ---------------------------------------------------

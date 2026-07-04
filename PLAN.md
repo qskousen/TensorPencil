@@ -435,6 +435,370 @@
       store (P@V accs are f32, so it would round — needs a parity look),
       Workspace sizes could shrink q/k/g/t1/mg/mu to f16 when the c16
       pipe exists, s_d ping-pong to overlap head-group scores with P@V.
+- [x] INT8 ConvRot support (2026-07-03) — the `krea2CenterSemiraw_v10Int8`
+      checkpoint (ComfyUI `int8_tensorwise` + `convrot`). Format: weights stored
+      as `W_rot = W @ H^T` quantized int8 per output-row (F32 `weight_scale
+      [rows,1]`), where H is a size-256 *regular* Hadamard (kron of the 4x4
+      block) applied in groups along the input dim. H is symmetric+orthonormal
+      (H=H^T, H@H=I). Only the 8 per-block DiT linears are I8; everything else
+      (first/last/tmlp/tproj/txtfusion/txtmlp/norms) is F32/BF16. Keys nested
+      under `model.diffusion_model.` (fp8 file uses bare `blocks.N`).
+      * CPU (done + validated): `src/ops/convrot.zig` (comptime H256 for tests +
+        `rotate` via a radix-4 fast Walsh-Hadamard — 4 passes stride 1/4/16/64,
+        then /16). `Weight.row_scale`+`Weight.convrot` in matmul.zig dequant+
+        rotate in both the packed and small-m paths. DiT `Loader` struct auto-
+        detects the prefix and wires per-row scale + rotation onto I8 tensors.
+        `--dit <path>` CLI flag selects fp8/int8 (auto-detected). Validated:
+        int8 GEMM ≈ fp8 GEMM at 3.6% rel RMSE on real weights; coherent 256px
+        CPU image. The naive matvec rotation was 222 s/step; the fast transform
+        cut it to ~11 s/step (fp8 CPU is ~5 s/step).
+      * GPU probe: `gpu-test` now dumps every coop config
+        (Context.dump_coop_configs). 3090 exposes s8*s8->s32 at 16x16x32 and
+        16x8x32 (int8 tensor cores; K=32 = 2x the f16 K). So the int8 IMMA
+        speedup is reachable, not blocked at the config level.
+      * GPU int8 GEMM (done + validated, `gpu-i8-test`): `coopmat.buildGemmI8`
+        hand-assembled s8*s8->s32 kernel, MulAdd signed operands mask 0xF, Int8+
+        StorageBuffer8BitAccess caps. Parameterized to an MTxNT (2x4) register
+        tile — each subgroup computes mt*nt 16x16 tiles reusing loaded A/B
+        fragments. NO workgroup memory (dodges the Zig/NVIDIA device-lost
+        hazard). 0 mismatches vs CPU. Tile sweep @ 4224x6144x6144: 1x1 ~12,
+        2x2 ~23, 4x2 ~29, 2x4 ~36, **4x4 ~46 TFLOP/s** (chosen; fp8 shared-mem
+        kernel is ~57). Beyond 4x4 hits register pressure; i8_mt=i8_nt=4 set.
+      * GPU full int8 linear (done + validated): `Context.opMatmulI8` chains
+        eltwise `rotate` (x@H via an uploaded 256x256 H buffer), `rowmax_i8`
+        (per-row absmax->scale), `quantize_i8` (pack 4 int8/word), the coop
+        GEMM, and `scale_i32` (s32 * act_scale * weight_scale -> f32). Wiring
+        exact vs a CPU replica; int8 accuracy 0.7% rel vs f32 (the rotation
+        tames activation quantization well).
+      * Prep optimization (all validated, `gpu-i8-test` batched full linear @
+        4224x6144x6144): started 54 ms. (1) `rotate` coalesced by indexing H
+        symmetrically as [l][local] (consecutive threads -> consecutive H
+        addresses): 54 -> 19 ms. (2) fast Walsh-Hadamard `rotate_fwht` (one
+        thread per 256-group, radix-4, 256-f32 private array): 19 -> 15 ms
+        (private-array spill is now the floor — a shared-mem/subgroup-shuffle
+        rotate would go faster but hits the Zig workgroup hazard). (3) fused
+        per-group abs-max into rotate_fwht + cheap `rowscale_i8` reduce
+        (replaces the latency-bound one-thread-per-row `rowmax_i8`): 15 -> 14 ms.
+        Breakdown now ~7 ms GEMM (4x4 tile) + ~7 ms prep. fp8 GEMM same shape is
+        ~5.5 ms, so a naive per-GEMM int8 linear is ~2.5x SLOWER than fp8.
+      * KEY: the standalone bench runs full prep PER GEMM, but in the DiT one
+        rotated+quantized activation feeds 4 GEMMs (wq/wk/wv/gate) or 2 (mlp
+        gate/up) — prep amortizes ~4x/2x (same as fp8's shared f32->f16). So the
+        real per-GEMM overhead is far lower than the proxy; dit_gpu integration
+        is needed to know if int8 actually wins.
+- [x] INT8 ConvRot dit_gpu integration + end-to-end result (2026-07-03).
+      `opMatmulI8` split into `opI8Prep` (rotate+quantize once) + `opI8Gemm`
+      (per-weight GEMM+rescale) so one prepped activation feeds wq/wk/wv/gate
+      and mlp gate/up. dit_gpu.forward gains an `is_i8` route (gated on
+      `blk.attn.wq.dtype == .i8`; fp8 path byte-for-byte untouched): int8 blocks
+      take the f32-output branches (still tensor-core attention via the
+      f32->f16 gather/convert), swapping the 8 block GEMMs to int8. Produces
+      correct, coherent images (512px fox verified; testdata/int8_gpu_smoke.png).
+      RESULT @ 1120x1680, warm: **int8 8.28 s/step vs fp8 4.80 s/step — int8 is
+      1.7x SLOWER.** Profile (sync-per-op, steady state): matmul int8 5401 vs
+      fp8 2858 ms (1.9x — the register-tiled int8 GEMM is slower than fp8's
+      shared-mem kernel, and the 4 qkv int8 GEMMs SERIALIZE because they share
+      i8_acc, vs fp8's overlapped independent(4)); attn ~equal (both TC); elt
+      int8 1184 vs fp8 261 ms (+920 ms = the rotate/quantize/scale prep fp8
+      doesn't pay). Conclusion: matches the memory-note thesis — beating fp8
+      needs the GEMM pushed past fp8 (shared-mem #2, int8 has ~2x peak) AND the
+      prep cut hard; the full ~2x ComfyUI speedup likely needs a single fused
+      rotate+quantize+IMMA+scale kernel (large). int8's win is accuracy/VRAM,
+      not yet speed, on this Vulkan path.
+- [ ] INT8 ConvRot follow-ups / forks (pursue to find the best options):
+      * [tried, NEUTRAL] Overlapping the qkv/mlp int8 GEMMs via distinct accs
+        (opI8GemmRaw/opI8Scale/i8AccPool exist for it) gave 8.33 vs 8.28 s/step
+        — no change. So the 1.9x matmul gap is the register-tiled GEMM being
+        slower in-DiT, NOT serialization (the driver already overlaps tails, same
+        lesson as the fp8 barrier-elision experiment). Reverted to single-acc to
+        save VRAM. => the shared-mem GEMM (#2) is the ONLY lever for the matmul.
+      * TOP FORK for speed (#2): shared-memory staged int8 kernel (adapt the fp8
+        `buildGemmShared`, or write a simpler single-buffered s8 one — stage s8
+        A/B through workgroup memory, no decode, s32 accum). int8 has ~2x
+        tensor-core peak, so this could take the GEMM from ~46 past fp8's ~57
+        TFLOP/s toward ~90-110. Rough math: if matmul drops 5401->~1900 ms, int8
+        total ~= 1900 + 1369(attn) + 1184(prep) ~= 4.5 s/step ~= fp8's 4.8 — i.e.
+        roughly PARITY, maybe a slight win. The full ComfyUI ~1.9x needs a single
+        fused rotate+quantize+IMMA+scale kernel (eliminates the ~920ms prep and
+        the s32->f32 round trip) — a large project.
+      * FORK (#2, deferred from the register-tile decision): a full
+        shared-memory staged int8 kernel like the fp8 `buildGemmShared`
+        (stage s8 operands through workgroup memory — half the bytes of the
+        f16 staging, no decode; double-buffer k-slabs). Should beat the 36
+        TFLOP/s register-tiled kernel and possibly the 57 TFLOP/s fp8 path
+        (int8 has ~2x tensor-core peak). ~800 lines of SPIR-V; higher risk.
+      * [resolved] MTxNT tile tuning — swept {1,2,4}^2: 4x4 best at ~46 TFLOP/s
+        (i8_mt/i8_nt=4 in coopmat.zig). 6x6/8x8 untested (register pressure +
+        the tuning harness's small check cases don't divide the bigger tiles).
+      * NEXT: wire the int8 path into dit_gpu.forward (it currently hardcodes
+        the fp8 coop path). Needs the int8 weights routed through opMatmulI8
+        (fold the modulation into the pre-rotation input, reuse the fused
+        norm/gate kernels where possible), then a real batched DiT s/it to
+        compare against fp8's ~5 s/step. This is the true speedup test.
+      * NEXT: DP4A alternate GEMM (VK_KHR_shader_integer_dot_product / OpSDot)
+        — the second path the comparison wants. NOTE: coopmat and DP4A both do
+        EXACT int8*int8->i32, so their ACCURACY is identical; the fork between
+        them is purely SPEED (tensor cores vs integer-dot ALUs). The 0.7%-vs-f32
+        number above is the int8-quantization accuracy, common to both.
+      * [partly resolved] GPU rotate: coalesced matvec + fast Walsh-Hadamard
+        done (54->14 ms full linear). Remaining fork: the FWHT's 256-f32 private
+        array spills; a shared-mem or subgroup-shuffle rotate (hand-assembled to
+        dodge the Zig workgroup hazard) could cut the rotate further. Also could
+        fuse quantize into the rotate once the per-row scale is known (needs the
+        two-pass structure) and skip the f32 xr round-trip.
+      * FORK: activation quantization uses round-half-away (@round) vs torch's
+        round-half-even; negligible at int8 noise but worth a parity check if
+        matching ComfyUI pixels exactly matters.
+
+### Fused int8 ConvRot kernel — detailed design (the path to a real speedup)
+
+GOAL: get int8 convrot BELOW fp8's ~4.8 s/step @1120x1680 (currently 8.28).
+The two costs to kill: (1) the register-tiled GEMM (~46 vs fp8's ~57 TFLOP/s),
+(2) the ~920 ms/step of separate prep passes with full-tensor round-trips.
+
+Current per-linear dataflow (5 GPU passes, each a full DRAM round-trip):
+  x(f32) --rotate_fwht--> xr(f32) + partials
+        --rowscale_i8--> act_scale
+  xr,act_scale --quantize_i8--> x_i8(int8)          [xr write+read round-trip]
+  x_i8 --opMatmulCoopI8--> acc(s32)                 [register-tiled, no reuse]
+  acc,act_scale,weight_scale --scale_i32--> y(f32)  [s32 write+read round-trip]
+Shared across GEMMs: prep (rotate/scale/quantize) is done ONCE per shared-input
+group (qkv/gate, mlp gate/up); wo and mlp.down prep individually.
+
+HARD CONSTRAINT that shapes the design: dynamic per-row (per-token) quant needs
+the FULL row's abs-max of x_rot before any element can be quantized (rotation is
+orthonormal so it preserves L2 but NOT L-inf — no shortcut). And a full row is
+6144 or 16384 f32 (24 or 64 KB) vs the 48 KB workgroup-shared cap. So a single
+"do everything for a tile in one kernel" is only possible for small K; the
+general case stays two kernels (prep, then GEMM). Also: ANY kernel using
+workgroup(shared) memory must be HAND-ASSEMBLED SPIR-V (coopmat.zig style) —
+Zig-emitted workgroup kernels DEVICE_LOST on this NVIDIA driver (see ZIG.md).
+
+Recommended staged plan (do in order; each is independently shippable + testable):
+
+  STAGE A — fold the rescale into the GEMM C-store (needs #2 first, or bolt
+  onto the current register-tiled kernel as a quick check). The int8 coop GEMM,
+  at its OpCooperativeMatrixStoreKHR, instead of storing s32 to a buffer, reads
+  act_scale[row] (broadcast down the 16 rows of the C tile) and weight_scale[col]
+  (down the 16 cols), computes f32(acc)*act_scale*weight_scale, and stores f32 y
+  directly. Kills the s32 acc buffer + the whole scale_i32 pass (one of the ~4
+  prep passes/block, plus a 104 MB s32 write + read). Implementation: the coop C
+  fragment is 16x16 s32; extract-to-f32 then multiply needs per-element access to
+  the fragment — either OpCooperativeMatrixStoreKHR to shared then a threaded
+  scale+store, or use the coopmat element-access. Simplest first cut: store s32
+  to shared (small, one tile), then 32 threads scale+write the 16x16 tile to y
+  with act_scale/weight_scale from small buffers. Bindings gain act_scale (per
+  row-tile) + weight_scale (per col-tile). Push gains their base offsets.
+  Expected: removes ~1 pass + the s32 round-trip; modest on its own, but it is
+  the prerequisite for the GEMM to emit f32 directly.
+
+  STAGE B — fused prep kernel (rotate + rowmax + quantize in ONE launch, no xr
+  round-trip). One workgroup per row (or small row-tile). Hand-assembled SPIR-V
+  (uses shared memory). Per row: (i) the 32 threads cooperatively FWHT-rotate the
+  row's 256-groups, writing rotated f32 into shared [cols] (24 KB for cols=6144,
+  fits; cols=16384 = 64 KB does NOT fit -> that linear (mlp.down input) either
+  stays on the 3-pass path or tiles the row across 2 shared slabs with a
+  two-level max), (ii) reduce abs-max over shared -> act_scale, (iii) quantize
+  shared f32 -> packed int8 output + write act_scale. Fuses 3 passes -> 1 and
+  removes the xr(f32) 104 MB write+read. Keep the existing eltwise rotate_fwht/
+  rowscale_i8/quantize_i8 as the fallback for the 16384 case and for validation.
+
+  STAGE C (stretch, small-K only) — merge prep into the GEMM prologue: a
+  per-output-tile kernel that stages its M-row activation tile, rotates+maxes+
+  quantizes it in shared, then runs the IMMA k-loop from that shared int8 tile +
+  streamed weights, rescaling at store. Only viable when M*K int8 fits shared
+  (small linears); general K makes the shared activation tile too big, so this is
+  a targeted optimization, not the general path. Probably NOT worth it given A+B.
+
+  PREREQUISITE / parallel track — #2 shared-memory int8 GEMM (see the TOP FORK
+  bullet above). Stage A's fused rescale rides on whichever GEMM kernel is used;
+  pairing it with the shared-mem GEMM is what pushes the matmul past fp8. Adapt
+  coopmat.buildGemmShared (fp8, double-buffered uvec4 staging) to s8: stage s8
+  A/B through workgroup memory (half the bytes of the f16 staging, NO decode
+  step — simpler than fp8), s32 accumulators, K=32 slabs, MulAdd operands 0xF.
+
+VALIDATION: extend gpu-i8-test — it already checks wiring-exact vs a CPU replica
+and 0.7% accuracy vs f32 for the full linear; add cases that exercise the fused
+kernels and keep the rel-vs-cpu-sim < 1e-3 gate. Then end-to-end s/it vs fp8 at
+1120x1680 (both bit-comparable images already validated). Profiler:
+`generate --gpu on --profile on` prints matmul/attn/elt category ms.
+
+REALISTIC CEILING: A+B remove ~2-3 round-trips and ~1-2 passes/linear; with the
+shared-mem GEMM the matmul target is ~1.9 s (from 5.4) and prep drops toward
+fp8's ~260 ms. Optimistic int8 ~= 1.9 + 1.4(attn) + ~0.4(prep) ~= 3.7 s/step vs
+fp8 4.8 => ~1.3x, approaching ComfyUI's 1.9x (they also fuse; the residual gap is
+the extra rotate work int8 fundamentally does). Attention is already TC-equal;
+one more lever if needed: give int8 the att16 fully-fused f16 attention path
+(currently int8 takes the f32-input TC path, slightly less fused).
+
+### Fused int8 ConvRot kernel — EXECUTION LOG (2026-07-03, this session)
+
+Goal: get int8 below fp8's 4.8 s/step @1120x1680 (was 8.28). Same-session
+baseline (bench, min-of-8, 4224x6144x6144): fp8 shared GEMM 5.3 ms (60 TF/s),
+int8 register GEMM 6.9 ms (46 TF/s), full int8 linear 14.2 ms (~7 GEMM + ~7 prep).
+
+- [x] **Fork #2 — shared-memory staged int8 GEMM (`coopmat.buildGemmSharedI8`).**
+      The big lever, and it OVER-delivered. 128x128 workgroup tile, 2x2 warp grid
+      of 64x64 (mt=nt=4, 16 MMAs/32k, 2 ks/step), K_STEP=64, SINGLE-buffered
+      (barrier/stage/barrier/MMA). Design decision that made it clean: the shared
+      arrays are **u32-typed** (staging is a plain uvec-free u32 copy, NO decode —
+      half the bytes of the fp8 f16 staging) and the s8 cooperative fragment loads
+      read that u32 workgroup memory with **u32-unit strides** (the standard
+      "int8 matrix from a uint buffer" GLSL pattern). This sidesteps any 8-bit
+      workgroup-write capability question entirely and needs only Int8 +
+      CooperativeMatrixKHR + VulkanMemoryModel caps (no StorageBuffer8BitAccess —
+      global A/B are read as u32 during staging, never as s8).
+      FORK RESOLVED (u32-shared vs s8-shared): tried u32-shared FIRST (fewest caps,
+      cleanest stores); it validated 0-mismatch on the first build, so the s8-shared
+      byte-store fallback was never needed.
+      RESULT (same-session bench): **3.72 ms best (85.7 TF/s)** — 1.85x the register
+      int8 kernel (6.9 ms) and **1.4x faster than the fp8 shared GEMM** (5.3 ms).
+      Blew past the PLAN's "≈parity with fp8" ceiling (int8's ~2x tensor peak is
+      real once staging is shared). 0 mismatches on 128x128x64 and 256x384x320
+      correctness cases (gpu-i8-test). Routing: `opMatmulCoopI8` picks the shared
+      pipe when m_pad%128==0 && rows%128==0 && cols%64==0 (all DiT-block shapes;
+      `opI8Prep` now pads m to 128), else the register kernel (small shapes / bench
+      check cases). Toggle `coopmat.i8_shared`.
+      => GEMM is no longer the int8 bottleneck. Full linear 14.2 -> 10.9 ms; the
+      remaining ~7 ms is PREP (rotate/rowscale/quantize + the scale_i32 pass).
+      Next: Stage A (fuse rescale into C-store) + Stage B (fused prep) attack prep.
+- [x] **End-to-end DiT with shared GEMM (same-session, 1120x1680, 5-step batched):
+      int8 6.2 s/step vs fp8 4.6 s/step** — int8 1.35x SLOWER (was 1.7x @8.28 pre-GEMM).
+      Profiled category breakdown (sync-per-op), int8 vs fp8:
+        matmul  3585 vs 2899  (+686)
+        attn    1431 vs 1406  (~0, both tensor-core)
+        elt     1187 vs  274  (+913 = int8 rotate/rowscale/quantize/scale prep +
+                               the un-fused f32 norm/rope/gather path vs fp8's f16 fused chain)
+      Two gaps: matmul +686, elt/prep +913. The int8 shared GEMM benches at
+      87-95 TF/s at real DiT shapes (7680x6144x6144 6.63ms, 7680x16384x6144 17.3ms,
+      7680x6144x16384 16.2ms), implying ~2070ms of DiT matmul if sustained — but
+      in-DiT it's 3585. The 1.73x in-DiT efficiency loss (fp8 doesn't suffer it) is
+      NOT occupancy:
+- [x, FORK REJECTED] **8-warp (2x4) int8 GEMM** for occupancy (buildGemmSharedI8
+      `warps8`: 8 accs/warp = 64 s32/thread -> ~2 wgs/SM vs 4-warp's 128 regs ->
+      ~1 wg/SM). Correct (0-mismatch) but SLOWER both isolated (7.65 vs 6.63 ms
+      @7680x6144x6144 — lower MMA/load ratio) AND in-DiT (matmul 3821 vs 3585,
+      same-session). Same lesson as every prior occupancy experiment on this
+      driver (fp8 8-warp, barrier-elision, A-stride-34): the driver doesn't reward
+      raising occupancy at DiT sizes. Reverted to 4-warp (`coop_i8_warps8 = false`);
+      the toggle stays for other drivers. => the +686 matmul gap is most likely
+      clock/scheduling (the mixed in-DiT workload doesn't sustain the boost the
+      tight bench loop does) or single-buffered load-latency stalls; double-buffer
+      / larger-K_STEP is the remaining unexplored matmul fork (deferred — smaller
+      and less certain than the +913 elt/prep gap).
+- [x] **Stage A — fuse the act*weight rescale into the shared GEMM C-store**
+      (`buildGemmSharedI8(warps8, fuse_scale)`, `Context.opMatmulCoopI8Fused`).
+      Kills the s32 accumulator buffer (mlp.up's was ~500 MB!) + the whole
+      scale_i32 pass (an m*rows s32 write + read per GEMM). At the merge, each
+      16x16 s32 C fragment coop-stores into a per-subgroup s32 workgroup scratch,
+      then the 32 lanes read it back and write y = f32(acc)*act_scale[row]*
+      weight_scale[col] (f32, element-wise). Binding budget solved WITHOUT a 5th
+      binding: binding 3 = ONE scale buffer [act(m_pad) | weight(rows)] f32,
+      assembled per GEMM by a new `scale_concat` eltwise kernel (single compute
+      dispatch, so the batch's compute barriers serialize it hazard-free vs the
+      GEMM — no transfer/compute race, no Xid 109). Push u0 (=m_pad) is the split.
+      Correctness: fused kernel 0.0 rel err vs CPU (s32->f32 + f32 scale is exact
+      for real magnitudes); the DiT int8 linear route (opI8Gemm -> fused, opMatmulI8
+      for wo/down) validates wiring rel 0.0; 512px fox image coherent + identical
+      regime. RESULT (same-session batched, 1120x1680): **int8 6.2 -> 6.0 s/step**
+      (~0.2 s; profiled matmul 3585->~3320 as the scale folds into the store,
+      elt loses the 8 scale_i32 passes but gains the tiny scale_concat) + the
+      ~500 MB s32 buffers are gone (VRAM). Kept ON by default (accuracy-neutral).
+      VRAM peak at 1120x1680 = 21.4/24.5 GiB (NO streaming; GPU 100% util — the
+      gaps are genuinely compute/clock-bound, not bandwidth/eviction).
+
+- [x] **Stage B — fused prep kernel (`coopmat.buildFusedPrepI8(cols)`): rotate
+      FWHT + per-row abs-max + dynamic quantize in ONE hand-assembled
+      f16-shared-memory kernel.** THE prep killer. Isolating prep with a profiler
+      sub-timer showed it was **2160 ms/step** — the single biggest int8 overhead
+      (as large as matmul; fp8 pays zero), NOT the +913 "elt" I'd mis-attributed.
+      Design: one workgroup (32 or 64 threads) per row; (0) coalesced f32->f16
+      load into a padded shared buffer [ng groups][257] (PAD 257 = bank-conflict-
+      free: lane t -> bank (t*257)%32 = t), (1) threads 0..ng-1 each FWHT +
+      normalize their group IN SHARED (kills the private-array spill that was the
+      prep floor) + emit the group abs-max, (2) thread 0 reduces -> per-row scale,
+      (3) all threads coalesced-quantize shared -> packed int8. Hand-assembled
+      (Zig-emitted workgroup kernels DEVICE_LOST on this driver) with a
+      counted-loop helper + explicit current-block tracking for the phis; 4 FWHT
+      passes are bf-loops with mask/shift index math. **f16 shared** was the key
+      second decision: it makes cols=16384 (mlp.down) fit (32.9 KB) AND gives
+      cols=6144 3-4 workgroups/SM (12.3 KB) vs 1 for f32 — so ALL 4 preps/block
+      run the fused kernel (two builds, cols 6144 + 16384; picked in opI8Prep).
+      Validated first correct build (no DEVICE_LOST): gpu-i8-test 128x128x6144 and
+      x16384 both rel-vs-f32 ~0.009 (int8 accuracy UNCHANGED — the f16 rotation
+      error stays inside int8 quant noise; the GPU-f16-vs-CPU-f32-replica rel is
+      ~0.4%, gated at 1e-2 for cols>=6144 with rationale). 1120x1680 fox image
+      clean. RESULT: **prep 2160 -> 1010 (f32 Stage B, 3 preps) -> 187 ms**
+      (f16 Stage B, all 4 preps). Step (batched, same-session): 6.0 -> 5.0 -> 4.2.
+
+- [x] **More levers (2026-07-03 cont.): int8 4.2 -> 4.0 s/step.**
+      * Double-buffered int8 shared GEMM (`coop_i8_double_buf`; issue next k-slab's
+        global loads into registers before the current MMA). Correct (0-mismatch).
+        Measured ~NEUTRAL isolated (3.63 vs 3.72 ms) AND in-DiT (matmul 2060 vs
+        2100) — same as the fp8 double-buffering result: this driver already hides
+        the load latency, so the ~85 TF/s (30% of int8 tensor peak) is the driver's
+        coopmat-lowering ceiling, not a single-buffer stall. Kept (correct, marginal).
+      * int8 attention-setup fusion: new `qknorm_rope_f32` eltwise kernel folds
+        rmsnorm+rope into ONE f32 in-place pass for q and k (the int8 path took the
+        un-fused 7-pass f32 route; att16's qknorm_rope16 is value-identical, so the
+        f32 adaptation is safe — kept the existing f32_to_h16/gather converts which
+        zero the seq_pad tail correctly). Attention setup 7 -> 5 passes; **elt 500
+        -> 370 ms**; step 4.2 -> 4.0 (batched, same-session). Coherent fox, fp8
+        parity 0.16875 unchanged. Remaining elt vs fp8 (274) needs the c_h16 int8
+        GEMM + full f16 chain (risky; diminishing) — matmul/attn are at ceilings.
+
+- [x] **f16 attention chain for int8 (2026-07-03 cont.): int8 4.0 -> 3.9 s/step,
+      elt 500 -> 300 ms (near fp8's 274).** Gave int8 attention the fp8 att16
+      treatment: wq/wk/wv int8 GEMMs now store f16 directly (`buildGemmSharedI8`
+      c_h16 param -> `pipe_coop_i8_fs16`; the fused-rescale threaded store
+      FConverts to f16), so the norm/rope chain collapses to att16's 3 fused f16
+      passes (qknorm_rope16 in-place on q/k, gather_kmajor16, v lands in v16_d from
+      the GEMM) instead of int8's 5-pass f32 route. GATE stays f32 (c_h16=false),
+      so the gate/wo/mlp path is untouched — no f16-input prep needed (contained).
+      dit_gpu gates the att16 branch on `attn_f16 = att16 or i8_f16`.
+      BUG FOUND + FIXED: the C-array ArrayStride was hardcoded 4 (s32/f32); f16 C
+      needs stride 2 or the f16 stores scatter (first image was noise). One-line
+      fix. Then coherent 512px + 1120x1680 fox; fp8 parity 0.16875 unchanged;
+      int8 accuracy rel-vs-f32 0.0089/0.0094 unchanged. Remaining elt vs fp8
+      (~26 ms) is the still-f32 gate/mlp/modulation ops (sigmoid_mul, silu_mul,
+      rms_apply_mod, gated_add) — fusing them to f16 needs the mlp/gate GEMMs f16
+      + f16-input Stage B prep for wo/down; ~26 ms for a big integration, NOT
+      worth it (elt is already at fp8 parity).
+
+### Fused int8 ConvRot — SESSION OUTCOME (2026-07-03): int8 BEATS fp8
+
+**int8 8.28 -> 3.9 s/step steady state @1120x1680; fp8 is 4.6 -> int8 is ~15-18%
+FASTER.** (Was 1.7x SLOWER at session start.) Three kernels did it, all validated
+end-to-end (clean 1120x1680 fox; fp8 path bit-identical at 0.16875 parity;
+gpu-i8-test green; all `zig build test` green):
+  1. **Shared-memory int8 GEMM** (register-tiled -> u32-staged-shared, 46 -> 85+
+     TF/s, beats fp8's ~57). The unlock.
+  2. **Stage A** — fused act*weight rescale in the GEMM C-store (kills the s32 acc
+     buffer + scale_i32 pass). matmul now 2050 vs fp8 2900 — int8 matmul is FASTER.
+  3. **Stage B** — fused f16-shared prep (rotate+rowmax+quantize one kernel):
+     prep 2160 -> 187 ms.
+Final same-session profiled steady state: int8 matmul 2100 / attn 1390 / elt 500 /
+prep 187 = ~4.2 s; fp8 matmul 2900 / attn 1400 / elt 274 = ~4.6 s.
+
+This OVERTURNS the earlier standing assessment that fp8 was unbeatable on this
+Vulkan/NVIDIA path — int8's ~2x tensor peak, once the shared-mem GEMM + fused
+prep remove the overheads, wins outright while ALSO giving better accuracy
+(0.9% vs f32) and, with Stage A, less VRAM. See [[comfyui-gap-assessment]]
+(now updated), [[int8-convrot-notes]], [[gpu-perf-lab-notes]].
+
+FORKS this session: shared GEMM (DONE, unlock) · Stage A scale fusion (DONE) ·
+Stage B f16 fused prep (DONE, the prep killer) · 8-warp occupancy (REJECTED,
+worse) · VRAM streaming (ruled out).
+REMAINING (optional, int8 already wins): int8 elt is still un-fused f32 (500 vs
+fp8's fused-f16 274) — routing int8 through the f16 eltwise chain would widen the
+lead ~200 ms but needs a c_h16 GEMM output + dit_gpu integration; matmul residual
+is clock-bound (occupancy rejected). [CORRECTION 2026-07-03: the "~PARITY with
+ComfyUI" framing that used to live here was WRONG — the ~85 s / ~4.25 s-equiv
+number is ComfyUI's FP8 run, and Ampere has NO fp8 tensor cores (it upcasts to
+f16 → a soft target, the only thing our int8 edges). ComfyUI's INT8 path
+(`torch._int_mm` → cuBLASLt IMMA + flash-attn) samples at **~2 s/it vs our
+~4 s/step — ~2x faster.** The gap is kernel efficiency under Vulkan's structural
+ceilings, not the silicon. See the M10 CUDA backend section below.]
 - [ ] M9 follow-ups:
       * Blocked upstream: NVIDIA 580 faults (DEVICE_LOST) on any Zig-emitted kernel using
         workgroup memory — even spirv-val-clean at workgroup size 1x1; RADV/llvmpipe run the
@@ -468,6 +832,162 @@ Reference-fixture dumps live in `tools/dump_*.py` (run with ComfyUI's venv; note
 `~/genai/comfyui/nvenv` is the runtime venv with comfy_kitchen/comfy_aimdo, `venv` needs stubs).
 Krea 2 turbo defaults: 8 steps, cfg 1.0, euler, "simple" scheduler, shift 1.15.
 
+## M10 — CUDA backend experiment (int8 convrot): close the ~2x ComfyUI gap
+
+### Why (corrected baseline)
+
+Our int8 Vulkan path is **~4 s/step @1120x1680**; ComfyUI int8 is **~2 s/it — ~2x
+faster** (user-verified). This is NOT a silicon gap (same 3090, same int8 IMMA
+peak) and NOT an API gap (the CUDA Driver API and Vulkan host API are equivalent
+C-ABIs we call the same way). It is a **kernel-efficiency gap**: ComfyUI leans on
+`cuBLASLt` (int8 GEMM near hardware peak) + flash-attn, while our Vulkan coopmat
+GEMM tops out at ~85 TOPS (~30% of peak) held back by three Vulkan-only ceilings —
+**48 KB shared-memory cap, no `cp.async`, and opaque coopmat lowering** (no
+SASS/scheduling control). See [[comfyui-gap-assessment]] / [[int8-convrot-notes]].
+
+Two experiments, in order, to decompose that 2x and decide if it's worth closing:
+
+- **Phase 1 — hand-rolled Zig + PTX CUDA backend.** Preserves "pure Zig, no C
+  deps" *by the project's own standard*: `libcuda` is a system driver we `dlopen`
+  exactly like `libvulkan`, and PTX is device IR we hand-emit exactly like SPIR-V
+  (`coopmat.zig`). Tests how much of the 2x is recoverable purely by breaking the
+  Vulkan ceilings (>48 KB dynamic shared + `cp.async` + hand-written IMMA tiling).
+  Honest ceiling: PTX exposes `mma`/`cp.async`, but `ptxas` (closed) owns
+  register allocation + scheduling, so this likely lands **between** Vulkan (85
+  TOPS) and cuBLASLt — it may close *part* of the gap, not all.
+- **Phase 2 — link cuBLASLt (and optionally flash-attn/cuDNN).** This is the thing
+  that actually reaches ComfyUI speed, because it *is* the kernels ComfyUI uses.
+  It **breaks pure-Zig** (a closed-source C/CUDA math-library dependency, NVIDIA-
+  only) — so it lives behind a build flag, Vulkan stays the default portable path,
+  and the tradeoff is documented, not silently taken.
+
+The comparison across {Vulkan, hand-PTX CUDA, cuBLASLt CUDA} vs ComfyUI ~2 s/it
+answers the real question: how much is "our kernels" (Phase 1 recovers) vs "their
+libraries" (only Phase 2 recovers).
+
+### Architecture: a backend seam (enabling refactor)
+
+Today the GPU path is Vulkan-specific: `src/gpu/context.zig` (`Context` — buffers,
+`op*` methods, `beginBatch`/`endBatch`/`independent`), `coopmat.zig` (SPIR-V),
+`eltwise.zig`; `dit_gpu.zig` / `vae_gpu.zig` orchestrate against `Context`
+directly. Adding CUDA alongside needs a **backend interface** covering exactly the
+surface those orchestrators use:
+- buffers: create / free / upload / download / grow, device-used accounting;
+- GEMM variants: `opMatmul`, `opMatmulCoop*`, int8 `opI8Prep` / `opI8Gemm` /
+  `opMatmulCoopI8Fused`;
+- eltwise kernels (norm/rope/gather/quantize/scale/gate families);
+- submission: batch record + flush, `independent(n)` barrier grouping, sync.
+
+Plan: extract a `GpuBackend` vtable (or comptime-dispatched tagged union — pick
+whichever keeps `dit_gpu` readable; a vtable is simplest for two backends), move
+the current `Context` behind `VulkanBackend`, and add `CudaBackend`. `dit_gpu`
+becomes backend-agnostic. **Do the seam only once Phase 1's standalone GEMM proves
+CUDA is worth it** — don't refactor on spec.
+
+### Phase 1 — hand-rolled Zig + PTX (stay pure-Zig)
+
+Each step is independently shippable + testable. The correctness oracle is the
+existing CPU replica in `gpu-i8-test` (backend-agnostic — same numeric gates:
+wiring rel 0.0, accuracy ~0.9% vs f32). Measurement mirrors `bench-matmul`
+(min-of-≥8; the clock governor caveat in [[gpu-perf-lab-notes]] applies identically
+to CUDA — the 3090 idles ~500 MHz, boosts under queue pressure).
+
+- [ ] **1.0 CUDA Driver API bindings (`src/gpu/cuda/cu.zig`).** `std.DynLib` load of
+      `libcuda.so.1` + hand-declared externs (mirror `vk.zig`; machine-check
+      signatures against the CUDA driver headers, no linking, no `nvcc`): `cuInit`,
+      `cuDeviceGet`, `cuCtxCreate/Destroy`, `cuMemAlloc/Free`, `cuMemcpyHtoD/DtoH`,
+      `cuModuleLoadDataEx`, `cuModuleGetFunction`, `cuLaunchKernel`,
+      `cuFuncSetAttribute`, `cuStreamCreate/Synchronize`, `cuEventCreate/Record/
+      Elapsed` (device-side timing, avoids host-clock noise). Pure-Zig preserved.
+- [ ] **1.1 Toolchain smoke test.** Hand-write a trivial PTX vector-add string
+      (`.version 7.x`, `.target sm_86`, `.address_size 64`), `cuModuleLoadDataEx`
+      (driver JITs via built-in ptxas — capture the JIT error log via the
+      `CU_JIT_ERROR_LOG_BUFFER` option), launch, verify DtoH. This validates
+      bindings→module→launch→readback end-to-end (the analog of M9's first SPIR-V
+      kernel). New CLI: `cuda-test`, gated on `testdata/gpu-tests` like `gpu-test`.
+- [ ] **1.2 PTX emitter scaffold (`src/gpu/cuda/ptx.zig`).** A small text-assembly
+      helper (register decls, labels, loops) — the PTX analog of `coopmat.zig`'s
+      word-level SPIR-V `Asm`. Keep kernels as authored PTX strings; the emitter
+      just reduces boilerplate. (Alternative considered: Zig's own SPIR-V-style
+      backend does NOT target PTX/NVPTX cleanly in 0.16 — hand PTX is the path.)
+- [ ] **1.3 Hand-PTX int8 IMMA GEMM — the core Phase-1 experiment.** Ampere int8
+      tensor core: `mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32`. The two
+      Vulkan-denied levers to exploit:
+      * **>48 KB dynamic shared**: `cuFuncSetAttribute(f,
+        CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, N)` — up to ~101 KB on
+        sm_86. Lets the A/B s8 tiles + deeper K-staging live in shared (our Vulkan
+        int8 GEMM is capped at the 16 KB u32 layout by the 48 KB wall).
+      * **`cp.async.cg.shared.global`** (16 B) + `cp.async.commit_group` /
+        `wait_group` — real async global→shared overlap, the thing Vulkan
+        double-buffering could only fake (it measured neutral there).
+      Benchmark on `bench-matmul`'s DiT shapes (4224x6144x6144 and the
+      7680x{6144,16384} cases) vs the Vulkan 85-TOPS baseline. **This single number
+      is the Phase-1 verdict.** Expectation: > 85, likely < cuBLASLt (ptxas owns
+      scheduling; matching cuBLAS needs SASS control we don't have).
+      Fork if it stalls: try `wgmma`-style larger tiles, more `cp.async` pipeline
+      stages, and swizzled shared layouts — but cap the effort (this is
+      re-implementing a slice of CUTLASS by hand; diminishing returns are expected).
+- [ ] **1.4 Decision gate.** If 1.3 doesn't beat Vulkan by a margin that would
+      matter end-to-end (say ≥1.3x on GEMM), STOP Phase 1 here and jump to Phase 2
+      — the pure-Zig ceiling is then demonstrably not enough, which is itself a
+      publishable result for [[comfyui-gap-assessment]]. If it does: continue.
+- [ ] **1.5 Hand-PTX fused prep** (rotate FWHT + per-row abs-max + quantize),
+      porting `buildFusedPrepI8`'s design — now with >48 KB shared, the cols=16384
+      (mlp.down) row fits without the f16-shared compromise, and f32 rotation is
+      back on the table (accuracy headroom). Validate vs CPU replica.
+- [ ] **1.6 Hand-PTX attention.** Port the two-pass scores/softmax/PV, OR attempt
+      real flash-attention now that >48 KB shared makes the K+Q+S tiling that was
+      rejected under Vulkan's 48 KB cap actually fit (that was the explicit
+      "open idea" in the Vulkan attention post-mortem — CUDA removes the blocker).
+- [ ] **1.7 Backend seam + `dit_gpu` port** (the refactor above), then the real
+      measurement: full int8 s/step on CUDA vs Vulkan vs ComfyUI ~2 s/it, at
+      1120x1680, via `generate --gpu cuda --profile on`. Reuse the bit-comparable
+      image validation + fp8/int8 parity gates.
+
+### Phase 2 — link cuBLASLt (breaks pure-Zig; behind a build flag)
+
+- [ ] **2.0 Build flag + linkage.** `-Dcuda-cublas` gates linking `libcublasLt.so`
+      (C ABI, hand-declared externs — no `nvcc`, but it IS a closed binary dep;
+      Vulkan + Phase-1 pure paths remain the default). Document the tradeoff in
+      CLAUDE.md's dependency note.
+- [ ] **2.1 cuBLASLt int8 GEMM.** `cublasLtMatmul`, `CUDA_R_8I` A/B, `CUDA_R_32I`
+      compute, s32 output. NOTE: cuBLASLt does **only the GEMM** — the convrot
+      rotate + per-row dynamic quantize prep STAYS ours (reuse Phase-1's hand-PTX
+      prep, or a simple kernel). Apply per-row act-scale × per-row weight-scale
+      dequant either via a cuBLASLt scaling epilogue or a small fused kernel (same
+      math as our Stage-A C-store fusion). Swap this in behind the backend seam.
+- [ ] **2.2 (optional) flash-attn / cuDNN attention** if attention is the residual
+      after the GEMM is cuBLASLt-fast. Larger integration; only if 2.1's number
+      says attention now dominates.
+- [ ] **2.3 Final comparison table** — the deliverable that answers the original
+      question:
+
+      | backend            | int8 GEMM (DiT shape) | full s/step | vs ComfyUI |
+      |--------------------|-----------------------|-------------|-----------|
+      | Vulkan (current)   | ~85 TOPS              | ~4.0 s      | 2.0x slow |
+      | CUDA hand-PTX      | (1.3)                 | (1.7)       | ?         |
+      | CUDA + cuBLASLt    | (2.1)                 | (2.1+2.2)   | target ~1x|
+      | ComfyUI int8       | cuBLASLt (near peak)  | ~2.0 s      | 1.0x      |
+
+      Phase 1 ≈ "our kernels" recoverable ceiling; the Phase-1→Phase-2 delta ≈ what
+      only NVIDIA's closed libraries capture. If cuBLASLt reaches ~2 s/step, the
+      lean-runtime thesis says our thinner orchestration (no Python dispatch) could
+      then *edge* ComfyUI — the last thing to test.
+
+### Risks / notes
+
+- **Correct hand-PTX tiled IMMA + cp.async is a real lift** (register/shared
+  fragment layout, `ldmatrix` for the s8 operand load, cp.async pipeline depth) —
+  effectively hand-writing a CUTLASS slice. Time-box 1.3; the decision gate (1.4)
+  exists precisely so we don't sink weeks into matching cuBLAS by hand.
+- **SASS is the hard ceiling** — no public assembler; ptxas is closed. Phase 1
+  cannot fully match cuBLAS by construction. That's the expected finding, not a
+  failure.
+- **Pure-Zig line**: Phase 1 keeps it (driver API + emitted PTX = Vulkan+SPIR-V by
+  the same standard). Phase 2 crosses it deliberately and reversibly (build flag).
+- Clock-governor + Xid 109 watchdog caveats from [[gpu-perf-lab-notes]] apply to
+  CUDA identically; use `cuEvent` device timing and keep submissions bounded.
+
 ## Context
 
 TensorPencil is a pure-Zig (0.16.0, no C deps) text-to-image inference engine. This plan is laser-focused on one goal: **run Krea 2 end-to-end on the CPU**, producing a correct image from a text prompt, then move to a **Vulkan backend** for usable speed. The repo is currently the stock `zig init` scaffold; everything below is greenfield.
@@ -477,6 +997,7 @@ The three checkpoints are already in `models/`:
 | File | What it is | Size | dtypes |
 |---|---|---|---|
 | `diffusion_model/krea2CenterSemiraw_v10Fp8.safetensors` | Krea 2 DiT (~12.3B params) | 11.9 GiB | F8_E4M3 (raw, no scales) |
+| `diffusion_model/krea2CenterSemiraw_v10Int8.safetensors` | Krea 2 DiT (int8 ConvRot) | 14 GiB | I8 `W_rot` + F32 `weight_scale [rows,1]` per-row + `comfy_quant` U8 marker; norms/small linears BF16/F32; keys under `model.diffusion_model.` |
 | `text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors` | Qwen3-VL-4B Instruct | 4.9 GiB | F8_E4M3 + F32 `weight_scale` per tensor + BF16 norms/embeddings |
 | `vae/krea2RealVae_v10.safetensors` | Wan 2.1-style 3D causal VAE | 484 MiB | F32 |
 

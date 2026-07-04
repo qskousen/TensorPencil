@@ -6,6 +6,7 @@ pub const norm = @import("ops/norm.zig");
 pub const rope = @import("ops/rope.zig");
 pub const matmul = @import("ops/matmul.zig");
 pub const attention = @import("ops/attention.zig");
+pub const convrot = @import("ops/convrot.zig");
 
 test {
     _ = vmath;
@@ -14,4 +15,5 @@ test {
     _ = rope;
     _ = matmul;
     _ = attention;
+    _ = convrot;
 }

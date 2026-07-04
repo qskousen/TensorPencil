@@ -12,11 +12,36 @@ const std = @import("std");
 pub const vk = @import("vk.zig");
 const spv = @import("spv.zig");
 const coopmat = @import("coopmat.zig");
+const convrot = @import("../ops/convrot.zig");
 
 const matmul_f8_spv = @embedFile("matmul_f8_spv");
 const matmul_f32_spv = @embedFile("matmul_f32_spv");
 const transpose_spv = @embedFile("transpose_spv");
 const eltwise_spv = @embedFile("eltwise_spv");
+
+/// Probe hook: when true, `Context.init` logs every cooperative-matrix config
+/// the device advertises (component types + M/N/K + scope). Used by
+/// `TensorPencil gpu-test` to survey int8 tensor-core availability.
+pub var dump_coop_configs: bool = false;
+
+/// Short name for a coopmat component type; panic-safe for values outside the
+/// known set (drivers may advertise types this build doesn't enumerate).
+fn componentName(t: vk.ComponentTypeKHR) []const u8 {
+    return switch (t) {
+        .float16 => "f16",
+        .float32 => "f32",
+        .float64 => "f64",
+        .sint8 => "s8",
+        .sint16 => "s16",
+        .sint32 => "s32",
+        .sint64 => "s64",
+        .uint8 => "u8",
+        .uint16 => "u16",
+        .uint32 => "u32",
+        .uint64 => "u64",
+        else => "?",
+    };
+}
 
 const wg_x = 16; // threads per workgroup, column direction
 const wg_y = 16; // threads per workgroup, token direction
@@ -37,7 +62,7 @@ const Push = extern struct {
 };
 
 /// Eltwise/attention kernels and their workgroup shapes (kernels/eltwise.zig).
-pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy };
+pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, scale_i32, scale_concat, qknorm_rope_f32 };
 const elt_entry_sizes = [_]EntrySize{
     .{ .name = "rmsnorm", .x = 64, .y = 1 },
     .{ .name = "rms_partial", .x = 256, .y = 1 },
@@ -72,6 +97,14 @@ const elt_entry_sizes = [_]EntrySize{
     .{ .name = "gated_add16", .x = 256, .y = 1 },
     .{ .name = "rope_half", .x = 256, .y = 1 },
     .{ .name = "copy", .x = 256, .y = 1 },
+    .{ .name = "rotate", .x = 256, .y = 1 },
+    .{ .name = "rotate_fwht", .x = 64, .y = 1 },
+    .{ .name = "rowmax_i8", .x = 64, .y = 1 },
+    .{ .name = "rowscale_i8", .x = 64, .y = 1 },
+    .{ .name = "quantize_i8", .x = 256, .y = 1 },
+    .{ .name = "scale_i32", .x = 256, .y = 1 },
+    .{ .name = "scale_concat", .x = 256, .y = 1 },
+    .{ .name = "qknorm_rope_f32", .x = 64, .y = 1 },
 };
 
 /// Push block shared by all eltwise entries; meaning per entry (see kernels).
@@ -251,6 +284,11 @@ pub const Context = struct {
     coop_m: u32 = 0,
     coop_n: u32 = 0,
     coop_k: u32 = 0,
+    /// sint8*sint8->sint32 subgroup cooperative-matrix shape (0 = unsupported).
+    /// Probed for the int8 (convrot) tensor-core GEMM path.
+    coop_i8_m: u32 = 0,
+    coop_i8_n: u32 = 0,
+    coop_i8_k: u32 = 0,
 
     cmd_pool: vk.CommandPool,
     cmd: vk.CommandBuffer,
@@ -294,6 +332,29 @@ pub const Context = struct {
     /// f16-weight coop GEMM (VAE convs; present iff pipe_coop is).
     shader_coop_f16w: vk.ShaderModule = .null_handle,
     pipe_coop_f16w: vk.Pipeline = .null_handle,
+    /// int8 tensor-core GEMM s8*s8->s32 (present iff coop_i8_m != 0).
+    shader_coop_i8: vk.ShaderModule = .null_handle,
+    pipe_coop_i8: vk.Pipeline = .null_handle,
+    /// Shared-memory-staged int8 GEMM (coopmat.buildGemmSharedI8): faster for
+    /// large 128-multiple shapes; the register-tiled pipe stays the fallback.
+    shader_coop_i8_sh: vk.ShaderModule = .null_handle,
+    pipe_coop_i8_sh: vk.Pipeline = .null_handle,
+    /// Stage A: shared int8 GEMM with the act*weight rescale fused into the
+    /// C-store (outputs f32 directly, kills the s32 acc buffer + scale_i32 pass).
+    /// Binding 3 = scale buffer [act(m_pad) | weight(rows)] f32.
+    shader_coop_i8_fs: vk.ShaderModule = .null_handle,
+    pipe_coop_i8_fs: vk.Pipeline = .null_handle,
+    /// f16-C variant of the fused GEMM (stores f16 directly) so int8 attention
+    /// GEMM outputs feed the fused f16 eltwise chain (att16/mlp16), no convert.
+    shader_coop_i8_fs16: vk.ShaderModule = .null_handle,
+    pipe_coop_i8_fs16: vk.Pipeline = .null_handle,
+    /// Stage B: fused int8 prep (rotate FWHT + rowmax + quantize) in one
+    /// f16-shared-memory kernel. Two builds: cols=6144 (qkv/wo/mlp-gu) and
+    /// cols=16384 (mlp.down). Replaces the 3-pass chain + its xr round-trip.
+    shader_i8_prep6144: vk.ShaderModule = .null_handle,
+    pipe_i8_prep6144: vk.Pipeline = .null_handle,
+    shader_i8_prep16384: vk.ShaderModule = .null_handle,
+    pipe_i8_prep16384: vk.Pipeline = .null_handle,
     /// Tensor-core attention GEMMs (present iff pipe_coop is).
     shader_scores: vk.ShaderModule = .null_handle,
     pipe_scores: vk.Pipeline = .null_handle,
@@ -323,6 +384,27 @@ pub const Context = struct {
     y_pad: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
     /// Device-local scratch for raw (untransposed) weight uploads.
     raw_dev: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
+    /// int8-path scratch: rotated f32 activations, per-row act scale, packed
+    /// int8 activations, s32 GEMM accumulator, and the resident Hadamard.
+    i8_xr: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
+    i8_scale: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
+    i8_x: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
+    i8_acc: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
+    // Extra s32 accumulators so a group of int8 GEMMs sharing one prepped
+    // activation (qkv/gate, mlp gate/up) can run overlapped instead of
+    // serializing on a single acc buffer.
+    i8_acc1: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
+    i8_acc2: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
+    i8_acc3: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
+    i8_hadamard: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
+    i8_partials: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
+    /// Stage A: assembled [act(m_pad) | weight(rows)] scale buffer for the
+    /// fused-rescale GEMM (rebuilt per GEMM by scale_concat; batch-safe).
+    i8_scalecat: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
+    /// Shape of the activation last prepped by opI8Prep (consumed by opI8Gemm).
+    i8_m: usize = 0,
+    i8_cols: usize = 0,
+    i8_mpad: usize = 0,
     /// Tiny valid buffer bound to unused descriptor slots.
     dummy: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
     /// Small cached device uploads (biases, norm weights), keyed by host ptr.
@@ -395,10 +477,15 @@ pub const Context = struct {
             if (phys == .null_handle) return error.NoSuitableDevice;
         }
 
-        // Cooperative matrix support: pick an f16xf16->f32 subgroup config.
+        // Cooperative matrix support: pick an f16xf16->f32 subgroup config for
+        // the current fp8/f16 GEMM path, and separately record an
+        // sint8xsint8->sint32 subgroup config for the int8 (convrot) path.
         var coop_m: u32 = 0;
         var coop_n: u32 = 0;
         var coop_k: u32 = 0;
+        var coop_i8_m: u32 = 0;
+        var coop_i8_n: u32 = 0;
+        var coop_i8_k: u32 = 0;
         if (gipa(instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR")) |pfn| {
             const get_props: vk.PfnGetPhysicalDeviceCooperativeMatrixPropertiesKHR = @ptrCast(pfn);
             var count: u32 = 0;
@@ -409,18 +496,37 @@ pub const Context = struct {
                     for (pb) |*cp| cp.* = .{};
                     if (get_props(phys, &count, pb.ptr) == .success) {
                         for (pb[0..count]) |cp| {
-                            if (cp.scope == .subgroup and cp.a_type == .float16 and cp.b_type == .float16 and
+                            if (dump_coop_configs) {
+                                std.log.info("coopmat cfg: {d}x{d}x{d} A={s} B={s} C={s} R={s} scope={d} sat={d}", .{
+                                    cp.m_size,           cp.n_size,             cp.k_size,
+                                    componentName(cp.a_type), componentName(cp.b_type), componentName(cp.c_type),
+                                    componentName(cp.result_type), @intFromEnum(cp.scope),
+                                    @intFromBool(cp.saturating_accumulation == vk.TRUE),
+                                });
+                            }
+                            if (coop_m == 0 and cp.scope == .subgroup and cp.a_type == .float16 and cp.b_type == .float16 and
                                 cp.c_type == .float32 and cp.result_type == .float32 and cp.m_size == 16)
                             {
                                 coop_m = cp.m_size;
                                 coop_n = cp.n_size;
                                 coop_k = cp.k_size;
-                                break;
+                            }
+                            if (coop_i8_m == 0 and cp.scope == .subgroup and cp.a_type == .sint8 and cp.b_type == .sint8 and
+                                cp.c_type == .sint32 and cp.result_type == .sint32)
+                            {
+                                coop_i8_m = cp.m_size;
+                                coop_i8_n = cp.n_size;
+                                coop_i8_k = cp.k_size;
                             }
                         }
                     }
                 }
             }
+        }
+        if (dump_coop_configs) {
+            std.log.info("selected f16 coop: {d}x{d}x{d}; int8 coop: {d}x{d}x{d}", .{
+                coop_m, coop_n, coop_k, coop_i8_m, coop_i8_n, coop_i8_k,
+            });
         }
 
         // VK_EXT_memory_budget: proactive VRAM budgeting for weight
@@ -709,6 +815,87 @@ pub const Context = struct {
         errdefer if (pipe_coop_c16 != .null_handle) d.DestroyPipeline(device, pipe_coop_c16, null);
         errdefer if (pipe_coop_f16w != .null_handle) d.DestroyPipeline(device, pipe_coop_f16w, null);
 
+        // int8 tensor-core GEMM (s8*s8->s32), independent of the f16 coop
+        // support: gated on the probed sint8 cooperative-matrix config.
+        var shader_coop_i8: vk.ShaderModule = .null_handle;
+        var pipe_coop_i8: vk.Pipeline = .null_handle;
+        if (coop_i8_m == 16 and coop_i8_n == 16 and coop_i8_k == 32) {
+            const code = try coopmat.buildGemmI8(gpa, coopmat.i8_mt, coopmat.i8_nt);
+            defer gpa.free(code);
+            try check(d.CreateShaderModule(device, &.{
+                .code_size = code.len,
+                .p_code = @ptrCast(@alignCast(code.ptr)),
+            }, null, &shader_coop_i8));
+            const info: vk.ComputePipelineCreateInfo = .{
+                .stage = .{ .module = shader_coop_i8, .p_name = "main" },
+                .layout = pipeline_layout,
+            };
+            try check(d.CreateComputePipelines(device, .null_handle, 1, @ptrCast(&info), null, @ptrCast(&pipe_coop_i8)));
+        }
+        errdefer if (shader_coop_i8 != .null_handle) d.DestroyShaderModule(device, shader_coop_i8, null);
+        errdefer if (pipe_coop_i8 != .null_handle) d.DestroyPipeline(device, pipe_coop_i8, null);
+
+        // Shared-memory-staged int8 GEMM (Fork #2): the fast path for large
+        // 128-multiple shapes.
+        var shader_coop_i8_sh: vk.ShaderModule = .null_handle;
+        var pipe_coop_i8_sh: vk.Pipeline = .null_handle;
+        var shader_coop_i8_fs: vk.ShaderModule = .null_handle;
+        var pipe_coop_i8_fs: vk.Pipeline = .null_handle;
+        var shader_coop_i8_fs16: vk.ShaderModule = .null_handle;
+        var pipe_coop_i8_fs16: vk.Pipeline = .null_handle;
+        if (coop_i8_m == 16 and coop_i8_n == 16 and coop_i8_k == 32 and coopmat.i8_shared) {
+            // (fuse_scale, c_h16, shader*, pipe*): raw-s32, fused-f32, fused-f16.
+            inline for (.{
+                .{ false, false, &shader_coop_i8_sh, &pipe_coop_i8_sh },
+                .{ true, false, &shader_coop_i8_fs, &pipe_coop_i8_fs },
+                .{ true, true, &shader_coop_i8_fs16, &pipe_coop_i8_fs16 },
+            }) |cfg| {
+                const code = try coopmat.buildGemmSharedI8(gpa, coopmat.coop_i8_warps8, cfg[0], coopmat.coop_i8_double_buf, cfg[1]);
+                defer gpa.free(code);
+                try check(d.CreateShaderModule(device, &.{
+                    .code_size = code.len,
+                    .p_code = @ptrCast(@alignCast(code.ptr)),
+                }, null, cfg[2]));
+                const info: vk.ComputePipelineCreateInfo = .{
+                    .stage = .{ .module = cfg[2].*, .p_name = "main" },
+                    .layout = pipeline_layout,
+                };
+                try check(d.CreateComputePipelines(device, .null_handle, 1, @ptrCast(&info), null, @ptrCast(cfg[3])));
+            }
+        }
+        errdefer if (shader_coop_i8_fs16 != .null_handle) d.DestroyShaderModule(device, shader_coop_i8_fs16, null);
+        errdefer if (pipe_coop_i8_fs16 != .null_handle) d.DestroyPipeline(device, pipe_coop_i8_fs16, null);
+        errdefer if (shader_coop_i8_sh != .null_handle) d.DestroyShaderModule(device, shader_coop_i8_sh, null);
+        errdefer if (pipe_coop_i8_sh != .null_handle) d.DestroyPipeline(device, pipe_coop_i8_sh, null);
+        errdefer if (shader_coop_i8_fs != .null_handle) d.DestroyShaderModule(device, shader_coop_i8_fs, null);
+        errdefer if (pipe_coop_i8_fs != .null_handle) d.DestroyPipeline(device, pipe_coop_i8_fs, null);
+
+        // Stage B: fused int8 prep kernels (f16-shared FWHT; hand-assembled),
+        // one per convrot cols (6144, 16384).
+        var shader_i8_prep6144: vk.ShaderModule = .null_handle;
+        var pipe_i8_prep6144: vk.Pipeline = .null_handle;
+        var shader_i8_prep16384: vk.ShaderModule = .null_handle;
+        var pipe_i8_prep16384: vk.Pipeline = .null_handle;
+        if (coop_i8_m == 16 and coop_i8_n == 16 and coop_i8_k == 32 and coopmat.i8_shared) {
+            inline for (.{ .{ 6144, &shader_i8_prep6144, &pipe_i8_prep6144 }, .{ 16384, &shader_i8_prep16384, &pipe_i8_prep16384 } }) |cfg| {
+                const code = try coopmat.buildFusedPrepI8(gpa, cfg[0]);
+                defer gpa.free(code);
+                try check(d.CreateShaderModule(device, &.{
+                    .code_size = code.len,
+                    .p_code = @ptrCast(@alignCast(code.ptr)),
+                }, null, cfg[1]));
+                const info: vk.ComputePipelineCreateInfo = .{
+                    .stage = .{ .module = cfg[1].*, .p_name = "main" },
+                    .layout = pipeline_layout,
+                };
+                try check(d.CreateComputePipelines(device, .null_handle, 1, @ptrCast(&info), null, @ptrCast(cfg[2])));
+            }
+        }
+        errdefer if (shader_i8_prep6144 != .null_handle) d.DestroyShaderModule(device, shader_i8_prep6144, null);
+        errdefer if (pipe_i8_prep6144 != .null_handle) d.DestroyPipeline(device, pipe_i8_prep6144, null);
+        errdefer if (shader_i8_prep16384 != .null_handle) d.DestroyShaderModule(device, shader_i8_prep16384, null);
+        errdefer if (pipe_i8_prep16384 != .null_handle) d.DestroyPipeline(device, pipe_i8_prep16384, null);
+
         // Attention-scores GEMM on the same cooperative-matrix support; uses
         // the eltwise pipeline layout (same 4-buffer set, EltPush-sized push).
         // Two head_dim variants: 128 (DiT) and 384 (VAE mid-block).
@@ -856,6 +1043,9 @@ pub const Context = struct {
             .coop_m = coop_m,
             .coop_n = coop_n,
             .coop_k = coop_k,
+            .coop_i8_m = coop_i8_m,
+            .coop_i8_n = coop_i8_n,
+            .coop_i8_k = coop_i8_k,
             .cmd_pool = cmd_pool,
             .cmd = cmd,
             .cmd_now = cmd_now,
@@ -878,6 +1068,18 @@ pub const Context = struct {
             .pipes_e = pipes_e,
             .shader_coop = shader_coop,
             .pipe_coop = pipe_coop,
+            .shader_coop_i8 = shader_coop_i8,
+            .pipe_coop_i8 = pipe_coop_i8,
+            .shader_coop_i8_sh = shader_coop_i8_sh,
+            .pipe_coop_i8_sh = pipe_coop_i8_sh,
+            .shader_coop_i8_fs = shader_coop_i8_fs,
+            .pipe_coop_i8_fs = pipe_coop_i8_fs,
+            .shader_coop_i8_fs16 = shader_coop_i8_fs16,
+            .pipe_coop_i8_fs16 = pipe_coop_i8_fs16,
+            .shader_i8_prep6144 = shader_i8_prep6144,
+            .pipe_i8_prep6144 = pipe_i8_prep6144,
+            .shader_i8_prep16384 = shader_i8_prep16384,
+            .pipe_i8_prep16384 = pipe_i8_prep16384,
             .shader_coop_c16 = shader_coop_c16,
             .pipe_coop_c16 = pipe_coop_c16,
             .shader_coop_f16w = shader_coop_f16w,
@@ -916,7 +1118,7 @@ pub const Context = struct {
             }
             self.small_bufs.deinit(self.gpa);
         }
-        for ([_]*DeviceBuffer{ &self.x_dev, &self.y_dev, &self.raw_dev, &self.dummy, &self.x_h16, &self.y_pad }) |db| {
+        for ([_]*DeviceBuffer{ &self.x_dev, &self.y_dev, &self.raw_dev, &self.dummy, &self.x_h16, &self.y_pad, &self.i8_xr, &self.i8_scale, &self.i8_x, &self.i8_acc, &self.i8_acc1, &self.i8_acc2, &self.i8_acc3, &self.i8_hadamard, &self.i8_partials, &self.i8_scalecat }) |db| {
             if (db.buf != .null_handle) {
                 self.freeDeviceBuffer(db.*);
             }
@@ -934,6 +1136,18 @@ pub const Context = struct {
         for (self.pipes_e) |pp| self.d.DestroyPipeline(self.device, pp, null);
         if (self.pipe_coop != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_coop, null);
         if (self.shader_coop != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_coop, null);
+        if (self.pipe_coop_i8 != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_coop_i8, null);
+        if (self.shader_coop_i8 != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_coop_i8, null);
+        if (self.pipe_coop_i8_sh != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_coop_i8_sh, null);
+        if (self.shader_coop_i8_sh != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_coop_i8_sh, null);
+        if (self.pipe_coop_i8_fs != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_coop_i8_fs, null);
+        if (self.shader_coop_i8_fs != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_coop_i8_fs, null);
+        if (self.pipe_coop_i8_fs16 != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_coop_i8_fs16, null);
+        if (self.shader_coop_i8_fs16 != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_coop_i8_fs16, null);
+        if (self.pipe_i8_prep6144 != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_i8_prep6144, null);
+        if (self.shader_i8_prep6144 != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_i8_prep6144, null);
+        if (self.pipe_i8_prep16384 != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_i8_prep16384, null);
+        if (self.shader_i8_prep16384 != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_i8_prep16384, null);
         if (self.pipe_coop_c16 != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_coop_c16, null);
         if (self.shader_coop_c16 != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_coop_c16, null);
         if (self.pipe_coop_f16w != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_coop_f16w, null);
@@ -1405,6 +1619,237 @@ pub const Context = struct {
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout, vk.ShaderStage.compute, 0, 16, &push);
         self.d.CmdDispatch(self.cmd, @intCast(rows / coopmat.coop_wgn), @intCast(m_pad / 128), 1);
         try self.opEnd();
+    }
+
+    /// Raw int8 tensor-core GEMM: `y(s32)[m_pad][rows] = x(s8)[m_pad][cols] @ W^T`,
+    /// where `w_bytes` is the raw int8 weight [rows][cols] (transposed to k-major
+    /// on upload, cached by pointer — same 1-byte path as fp8). No dequant scale
+    /// here; the caller scales the s32 result by act/weight per-row scales.
+    /// `x_i8` is row-major s8 [m_pad][cols]; `y` holds m_pad*rows s32.
+    /// m_pad/rows multiples of 16, cols a multiple of 32.
+    pub fn opMatmulCoopI8(
+        self: *Context,
+        y: DeviceBuffer,
+        x_i8: DeviceBuffer,
+        m_pad: usize,
+        w_bytes: []const u8,
+        rows: usize,
+        cols: usize,
+    ) Error!void {
+        const mtile = 16 * coopmat.i8_mt;
+        const ntile = 16 * coopmat.i8_nt;
+        std.debug.assert(self.pipe_coop_i8 != .null_handle);
+        std.debug.assert(m_pad % mtile == 0 and rows % ntile == 0 and cols % 32 == 0);
+        const w_buf = try self.weightBuffer(w_bytes, 1, rows, cols);
+        const w_stride: u32 = @intCast(std.mem.alignForward(usize, rows, tile_n));
+        const push: [4]u32 = .{ @intCast(m_pad), @intCast(rows), @intCast(cols), w_stride };
+        // Prefer the shared-memory kernel when the shape fits its 128x128 wg
+        // tile / 64-deep k step (all DiT-block shapes qualify); else the
+        // register-tiled kernel (small shapes, the standalone check cases).
+        const use_sh = self.pipe_coop_i8_sh != .null_handle and
+            m_pad % 128 == 0 and rows % 128 == 0 and cols % 64 == 0 and w_stride % 4 == 0;
+        try self.opBegin();
+        var set = self.bind4(.{ w_buf, x_i8.buf, y.buf, try self.dummyBuf() });
+        if (use_sh) {
+            self.d.CmdBindPipeline(self.cmd, .compute, self.pipe_coop_i8_sh);
+            self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
+            self.d.CmdPushConstants(self.cmd, self.pipeline_layout, vk.ShaderStage.compute, 0, 16, &push);
+            self.d.CmdDispatch(self.cmd, @intCast(rows / 128), @intCast(m_pad / 128), 1);
+        } else {
+            self.d.CmdBindPipeline(self.cmd, .compute, self.pipe_coop_i8);
+            self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
+            self.d.CmdPushConstants(self.cmd, self.pipeline_layout, vk.ShaderStage.compute, 0, 16, &push);
+            self.d.CmdDispatch(self.cmd, @intCast(rows / ntile), @intCast(m_pad / mtile), 1);
+        }
+        try self.opEnd();
+    }
+
+    /// Stage A: shared int8 GEMM with fused rescale — `y(f32)[m_pad][rows] =
+    /// (x @ W^T) * act_scale[row] * weight_scale[col]` in one kernel (no s32 acc
+    /// buffer, no scale_i32 pass). `scale_buf` holds [act(m_pad) | weight(rows)]
+    /// f32 (act at index 0, weight at index m_pad). Shape must fit the shared
+    /// kernel (m_pad/rows %128, cols %64). Returns false if unavailable/unfit so
+    /// the caller can fall back to the s32 GEMM + scale_i32 path.
+    pub fn opMatmulCoopI8Fused(
+        self: *Context,
+        y: DeviceBuffer,
+        x_i8: DeviceBuffer,
+        m_pad: usize,
+        w_bytes: []const u8,
+        rows: usize,
+        cols: usize,
+        scale_buf: vk.Buffer,
+        c_h16: bool,
+    ) Error!bool {
+        const pipe = if (c_h16) self.pipe_coop_i8_fs16 else self.pipe_coop_i8_fs;
+        const w_stride: u32 = @intCast(std.mem.alignForward(usize, rows, tile_n));
+        if (pipe == .null_handle or
+            m_pad % 128 != 0 or rows % 128 != 0 or cols % 64 != 0 or w_stride % 4 != 0)
+            return false;
+        const w_buf = try self.weightBuffer(w_bytes, 1, rows, cols);
+        const push: [4]u32 = .{ @intCast(m_pad), @intCast(rows), @intCast(cols), w_stride };
+        try self.opBegin();
+        var set = self.bind4(.{ w_buf, x_i8.buf, y.buf, scale_buf });
+        self.d.CmdBindPipeline(self.cmd, .compute, pipe);
+        self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
+        self.d.CmdPushConstants(self.cmd, self.pipeline_layout, vk.ShaderStage.compute, 0, 16, &push);
+        self.d.CmdDispatch(self.cmd, @intCast(rows / 128), @intCast(m_pad / 128), 1);
+        try self.opEnd();
+        return true;
+    }
+
+    /// Upload the resident group-Hadamard (256x256 f32) once for the int8 path.
+    fn ensureHadamard(self: *Context) Error!void {
+        if (self.i8_hadamard.buf != .null_handle) return;
+        const bytes = std.mem.asBytes(&convrot.H);
+        try self.ensureDeviceBuffer(&self.i8_hadamard, bytes.len);
+        try self.tensorUpload(self.i8_hadamard, bytes);
+    }
+
+    /// Full int8 (convrot) linear: `y[m][rows] = x[m][cols] @ W^T`, where
+    /// `w_bytes` is the raw int8 weight [rows][cols] (pre-rotated `W_rot`) and
+    /// `weight_scale` its per-output-row scale [rows]. Rotates x by the group
+    /// Hadamard, dynamically quantizes it per row to int8, runs the tensor-core
+    /// s8*s8->s32 GEMM, then rescales by act_scale*weight_scale. `cols` a
+    /// multiple of 256 (rotation group), `rows` a multiple of 16.
+    /// int8 activation prep: rotate x by the group Hadamard, dynamically
+    /// quantize per row to int8, leaving the packed int8 activation (i8_x) and
+    /// per-row scale (i8_scale) on the device for one or more opI8Gemm calls
+    /// (the DiT shares one prepped activation across wq/wk/wv/gate and mlp
+    /// gate/up). `cols` a multiple of 256.
+    pub fn opI8Prep(self: *Context, x: DeviceBuffer, m: usize, cols: usize) Error!void {
+        std.debug.assert(cols % convrot.group_size == 0);
+        const ng = cols / convrot.group_size;
+        // Pad to 128 rows when the shared-mem GEMM is enabled (its wg tile is
+        // 128x128); still a multiple of the register kernel's 64-row tile.
+        const m_align: usize = if (coopmat.i8_shared) 128 else 16 * coopmat.i8_mt;
+        const m_pad = std.mem.alignForward(usize, m, m_align);
+        self.i8_m = m;
+        self.i8_cols = cols;
+        self.i8_mpad = m_pad;
+        try self.ensureDeviceBuffer(&self.i8_scale, m * 4);
+        try self.ensureDeviceBuffer(&self.i8_x, m_pad * cols); // 1 byte/elem
+
+        // Stage B: one fused kernel (rotate FWHT + rowmax + quantize in f16
+        // shared) replaces the 3-pass chain + its xr round-trip. One build per
+        // convrot cols (6144 for qkv/wo/mlp-gu, 16384 for mlp.down).
+        const prep_pipe: vk.Pipeline = switch (cols) {
+            6144 => self.pipe_i8_prep6144,
+            16384 => self.pipe_i8_prep16384,
+            else => .null_handle,
+        };
+        if (prep_pipe != .null_handle) {
+            try self.opBegin();
+            var set = self.bind4(.{ x.buf, self.i8_x.buf, self.i8_scale.buf, try self.dummyBuf() });
+            self.d.CmdBindPipeline(self.cmd, .compute, prep_pipe);
+            self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
+            self.d.CmdDispatch(self.cmd, @intCast(m), 1, 1);
+            try self.opEnd();
+            return;
+        }
+
+        try self.ensureDeviceBuffer(&self.i8_xr, m * cols * 4);
+        try self.ensureDeviceBuffer(&self.i8_partials, m * ng * 4);
+        try self.opElt(.rotate_fwht, x, self.i8_xr, null, self.i8_partials, .{
+            .u0 = @intCast(m * ng),
+        }, m * ng, 1, 1);
+        try self.opElt(.rowscale_i8, self.i8_partials, self.i8_scale, null, null, .{
+            .u0 = @intCast(m),
+            .u1 = @intCast(ng),
+        }, m, 1, 1);
+        try self.opElt(.quantize_i8, self.i8_xr, self.i8_x, null, self.i8_scale, .{
+            .u0 = @intCast(m_pad * cols / 4),
+            .u1 = @intCast(cols),
+            .u2 = @intCast(m * cols),
+        }, m_pad * cols / 4, 1, 1);
+    }
+
+    /// int8 GEMM + rescale against the last opI8Prep activation: `y[m][rows] =
+    /// x_prepped @ W^T`, `w_bytes` the raw int8 [rows][cols], `weight_scale`
+    /// its per-row scale. `rows` a multiple of 16*i8_nt.
+    /// `c_h16` stores y half-precision (feeds the fused f16 attention chain);
+    /// only honored on the fused shared path (falls back to f32 s32+scale_i32).
+    pub fn opI8Gemm(self: *Context, y: DeviceBuffer, w_bytes: []const u8, weight_scale: []const f32, rows: usize, c_h16: bool) Error!void {
+        std.debug.assert(self.pipe_coop_i8 != .null_handle);
+        std.debug.assert(rows % (16 * coopmat.i8_nt) == 0);
+        const m = self.i8_m;
+        const ws_buf: DeviceBuffer = .{
+            .buf = try self.smallBuffer(std.mem.sliceAsBytes(weight_scale)),
+            .mem = .null_handle,
+            .size = 0,
+        };
+        // Stage A: fused rescale — assemble [act(m_pad) | weight(rows)] into one
+        // scale buffer (batch-barrier-safe scale_concat dispatch) and run the
+        // GEMM that stores y directly (f16 if c_h16), no s32 acc / scale_i32 pass.
+        if (self.pipe_coop_i8_fs != .null_handle and
+            self.i8_mpad % 128 == 0 and rows % 128 == 0 and self.i8_cols % 64 == 0)
+        {
+            const total = self.i8_mpad + rows;
+            try self.ensureDeviceBuffer(&self.i8_scalecat, total * 4);
+            try self.opElt(.scale_concat, self.i8_scale, self.i8_scalecat, ws_buf, null, .{
+                .u0 = @intCast(total),
+                .u1 = @intCast(m),
+                .u2 = @intCast(self.i8_mpad),
+            }, total, 1, 1);
+            if (try self.opMatmulCoopI8Fused(y, self.i8_x, self.i8_mpad, w_bytes, rows, self.i8_cols, self.i8_scalecat.buf, c_h16))
+                return;
+        }
+        // Fallback: s32 GEMM + separate scale_i32 pass.
+        try self.ensureDeviceBuffer(&self.i8_acc, self.i8_mpad * rows * 4);
+        try self.opMatmulCoopI8(self.i8_acc, self.i8_x, self.i8_mpad, w_bytes, rows, self.i8_cols);
+        try self.opElt(.scale_i32, self.i8_acc, y, ws_buf, self.i8_scale, .{
+            .u0 = @intCast(m * rows),
+            .u1 = @intCast(rows),
+        }, m * rows, 1, 1);
+    }
+
+    /// One of the 4 int8 accumulator buffers (round-robin), so a group of
+    /// GEMMs sharing the prepped activation can use distinct accs and overlap.
+    pub fn i8AccPool(self: *Context, i: usize) *DeviceBuffer {
+        return switch (i & 3) {
+            0 => &self.i8_acc,
+            1 => &self.i8_acc1,
+            2 => &self.i8_acc2,
+            else => &self.i8_acc3,
+        };
+    }
+
+    /// int8 GEMM into a caller-chosen accumulator (records a single dispatch,
+    /// so a set of these can run inside one `independent` group). Pairs with
+    /// opI8Scale, which reads the same acc after the group's barrier.
+    pub fn opI8GemmRaw(self: *Context, acc: *DeviceBuffer, w_bytes: []const u8, rows: usize) Error!void {
+        std.debug.assert(rows % (16 * coopmat.i8_nt) == 0);
+        try self.ensureDeviceBuffer(acc, self.i8_mpad * rows * 4);
+        try self.opMatmulCoopI8(acc.*, self.i8_x, self.i8_mpad, w_bytes, rows, self.i8_cols);
+    }
+
+    /// Rescale an int8 GEMM accumulator: y = acc * act_scale * weight_scale.
+    pub fn opI8Scale(self: *Context, y: DeviceBuffer, acc: DeviceBuffer, weight_scale: []const f32, rows: usize) Error!void {
+        const ws_buf: DeviceBuffer = .{
+            .buf = try self.smallBuffer(std.mem.sliceAsBytes(weight_scale)),
+            .mem = .null_handle,
+            .size = 0,
+        };
+        try self.opElt(.scale_i32, acc, y, ws_buf, self.i8_scale, .{
+            .u0 = @intCast(self.i8_m * rows),
+            .u1 = @intCast(rows),
+        }, self.i8_m * rows, 1, 1);
+    }
+
+    /// Full int8 (convrot) linear (prep + one GEMM); the standalone/bench path.
+    pub fn opMatmulI8(
+        self: *Context,
+        y: DeviceBuffer,
+        x: DeviceBuffer,
+        m: usize,
+        w_bytes: []const u8,
+        weight_scale: []const f32,
+        rows: usize,
+        cols: usize,
+    ) Error!void {
+        std.debug.assert(self.indep_remaining == 0);
+        try self.opI8Prep(x, m, cols);
+        try self.opI8Gemm(y, w_bytes, weight_scale, rows, false);
     }
 
     /// Device f16 k-major weight buffer converted from tight f32

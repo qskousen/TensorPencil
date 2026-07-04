@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const dtypes = @import("../dtype.zig");
+const convrot_mod = @import("convrot.zig");
 const gpu_context = @import("../gpu/context.zig");
 
 const DType = dtypes.DType;
@@ -48,6 +49,13 @@ pub const Weight = struct {
     cols: usize,
     /// Per-tensor dequant scale (ComfyUI fp8 format stores one per weight).
     scale: f32 = 1.0,
+    /// Per-output-row dequant scale (ComfyUI int8 `weight_scale`, `[rows]`).
+    /// When set, overrides `scale` for `.i8` weights.
+    row_scale: ?[]const f32 = null,
+    /// ConvRot group size (0 = none). When non-zero, `.i8` weights are stored
+    /// rotated by a group-wise Hadamard along the input dim and are un-rotated
+    /// at dequant time; `cols` must be a multiple of this. See ops/convrot.zig.
+    convrot: u32 = 0,
 
     pub fn init(bytes: []const u8, dtype: DType, rows: usize, cols: usize) Weight {
         std.debug.assert(bytes.len == rows * cols * dtype.byteSize());
@@ -76,9 +84,10 @@ pub fn matmul(
     std.debug.assert(y.len == m * w.rows);
     if (bias) |b| std.debug.assert(b.len == w.rows);
     switch (w.dtype) {
-        .f8_e4m3, .bf16, .f16, .f32 => {},
+        .f8_e4m3, .bf16, .f16, .f32, .i8 => {},
         else => return error.UnsupportedDType,
     }
+    if (w.dtype == .i8) std.debug.assert(w.row_scale != null and w.row_scale.?.len == w.rows);
     if (m == 0 or w.rows == 0) return;
 
     if (gpuEligible(m, w)) {
@@ -170,7 +179,7 @@ fn packedTask(
     panel: []f32,
 ) void {
     switch (w.dtype) {
-        inline .f8_e4m3, .bf16, .f16, .f32 => |dt| {
+        inline .f8_e4m3, .bf16, .f16, .f32, .i8 => |dt| {
             packedTaskTyped(dt, y, x, m, w, bias, row_start, row_end, panel);
         },
         else => unreachable, // validated in matmul()
@@ -204,11 +213,23 @@ fn packedTaskTyped(
             const sub = panel[nr * KC * NR ..][0 .. kl * NR];
             for (0..NR) |j| {
                 const row = row_start + nr * NR + j;
-                if (row < rows) {
-                    const src = w.bytes[(row * cols + kc0) * esize ..][0 .. kl * esize];
-                    for (0..kl) |k| sub[k * NR + j] = dequantOne(dt, src, k, w.scale);
-                } else {
+                if (row >= rows) {
                     for (0..kl) |k| sub[k * NR + j] = 0;
+                    continue;
+                }
+                const src = w.bytes[(row * cols + kc0) * esize ..][0 .. kl * esize];
+                if (dt == .i8) {
+                    // int8 dequant needs the whole 256-group present for the
+                    // ConvRot un-rotation, so dequant the k-slice row-major into
+                    // a temp (kc0/kl are group-aligned, so it holds whole groups)
+                    // then scatter k-major into the subpanel.
+                    var tmp: [KC]f32 = undefined;
+                    const rs = w.row_scale.?[row];
+                    for (0..kl) |k| tmp[k] = @as(f32, @floatFromInt(@as(i8, @bitCast(src[k])))) * rs;
+                    if (w.convrot != 0) convrot_mod.rotate(tmp[0..kl]);
+                    for (0..kl) |k| sub[k * NR + j] = tmp[k];
+                } else {
+                    for (0..kl) |k| sub[k * NR + j] = dequantOne(dt, src, k, w.scale);
                 }
             }
         }
@@ -334,7 +355,7 @@ fn runRange(
     scratch: []f32,
 ) void {
     switch (w.dtype) {
-        inline .f8_e4m3, .bf16, .f16, .f32 => |dt| {
+        inline .f8_e4m3, .bf16, .f16, .f32, .i8 => |dt| {
             runRangeTyped(dt, y, x, m, w, bias, row_start, row_end, scratch);
         },
         else => unreachable, // validated in matmul()
@@ -358,7 +379,10 @@ fn runRangeTyped(
         const nr = @min(panel_rows, row_end - r);
         for (0..nr) |j| {
             const src = w.bytes[(r + j) * cols * comptime dt.byteSize() ..][0 .. cols * comptime dt.byteSize()];
-            dequantRow(dt, scratch[j * cols ..][0..cols], src, w.scale);
+            const dst = scratch[j * cols ..][0..cols];
+            const rs = if (dt == .i8) w.row_scale.?[r + j] else w.scale;
+            dequantRow(dt, dst, src, rs);
+            if (dt == .i8 and w.convrot != 0) convrot_mod.rotate(dst);
         }
         for (0..m) |t| {
             const xrow = x[t * cols ..][0..cols];
@@ -396,6 +420,9 @@ fn dequantRow(comptime dt: DType, dst: []f32, src: []const u8, scale: f32) void 
         },
         .f8_e4m3 => for (dst, src) |*v, b| {
             v.* = dtypes.f8e4m3ToF32(b) * scale;
+        },
+        .i8 => for (dst, src) |*v, b| {
+            v.* = @as(f32, @floatFromInt(@as(i8, @bitCast(b)))) * scale;
         },
         .bf16 => for (dst, 0..) |*v, i| {
             v.* = dtypes.bf16ToF32(std.mem.readInt(u16, src[i * 2 ..][0..2], .little)) * scale;
@@ -515,6 +542,73 @@ test "packed path fp8 with scale" {
 
 test "packed path single wide row block" {
     try testAgainstNaive(small_m_max, NR, KC * 2, .f32, false, 1.0);
+}
+
+/// int8 ConvRot: quantized bytes + per-row scale, dequantized with the group
+/// rotation. The naive reference uses the fully un-rotated f32 weights, so this
+/// exercises the matmul's row-scale handling and group-aligned rotation in both
+/// the packed and small-m paths (convrot.zig separately validates the matrix).
+fn testI8ConvrotAgainstNaive(m: usize, rows: usize, cols: usize, with_bias: bool) !void {
+    std.debug.assert(cols % convrot_mod.group_size == 0);
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var prng = std.Random.DefaultPrng.init(99);
+    const rand = prng.random();
+
+    const x = try gpa.alloc(f32, m * cols);
+    defer gpa.free(x);
+    for (x) |*v| v.* = rand.floatNorm(f32);
+
+    const bias = if (with_bias) try gpa.alloc(f32, rows) else null;
+    defer if (bias) |b| gpa.free(b);
+    if (bias) |b| for (b) |*v| {
+        v.* = rand.floatNorm(f32);
+    };
+
+    const qbytes = try gpa.alloc(u8, rows * cols);
+    defer gpa.free(qbytes);
+    for (qbytes) |*b| b.* = @bitCast(@as(i8, @intCast(@as(i32, rand.int(i8)))));
+
+    const row_scale = try gpa.alloc(f32, rows);
+    defer gpa.free(row_scale);
+    for (row_scale) |*s| s.* = 0.001 + rand.float(f32) * 0.01;
+
+    // Reference weights: dequant then un-rotate each row's groups.
+    const w_f32 = try gpa.alloc(f32, rows * cols);
+    defer gpa.free(w_f32);
+    for (0..rows) |r| {
+        const dst = w_f32[r * cols ..][0..cols];
+        for (0..cols) |c| dst[c] = @as(f32, @floatFromInt(@as(i8, @bitCast(qbytes[r * cols + c])))) * row_scale[r];
+        convrot_mod.rotate(dst);
+    }
+
+    const y = try gpa.alloc(f32, m * rows);
+    defer gpa.free(y);
+    const y_ref = try gpa.alloc(f32, m * rows);
+    defer gpa.free(y_ref);
+
+    var w = Weight.init(qbytes, .i8, rows, cols);
+    w.row_scale = row_scale;
+    w.convrot = convrot_mod.group_size;
+    try matmul(io, gpa, y, x, m, w, bias);
+    naiveMatmul(y_ref, x, m, w_f32, rows, cols, bias);
+
+    for (y_ref, y) |e, a| {
+        const tol = 1e-3 + 1e-5 * @abs(e) * @sqrt(@as(f32, @floatFromInt(cols)));
+        try std.testing.expectApproxEqAbs(e, a, tol);
+    }
+}
+
+test "matmul i8 convrot small-m path" {
+    try testI8ConvrotAgainstNaive(1, 9, 256, false);
+    try testI8ConvrotAgainstNaive(4, 17, 512, true);
+}
+
+test "matmul i8 convrot packed path" {
+    try testI8ConvrotAgainstNaive(32, 64, 256, true);
+    // m % MR, rows % NR, cols spanning multiple KC blocks and groups.
+    try testI8ConvrotAgainstNaive(37, 61, 512, true);
+    try testI8ConvrotAgainstNaive(small_m_max, NR + 5, 256 * 3, false);
 }
 
 test "matmul rejects unsupported dtype" {

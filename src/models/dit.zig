@@ -99,35 +99,43 @@ pub const DiT = struct {
         errdefer arena.deinit();
         const alloc = arena.allocator();
 
+        // The fp8 checkpoint uses bare tensor names (`blocks.0…`); the int8
+        // convrot checkpoint nests them under `model.diffusion_model.`.
+        const pfx: []const u8 = if (st.get("model.diffusion_model.blocks.0.mod.lin") != null)
+            "model.diffusion_model."
+        else
+            "";
+        const l = Loader{ .st = st, .alloc = alloc, .pfx = pfx };
+
         const blocks = try alloc.alloc(Block, n_blocks);
         for (blocks, 0..) |*blk, i| {
             blk.* = .{
-                .mod = try vec(alloc, st, "blocks.{d}.mod.lin", .{i}, 6 * features),
-                .prenorm = try normScale(alloc, st, "blocks.{d}.prenorm.scale", .{i}, features),
-                .postnorm = try normScale(alloc, st, "blocks.{d}.postnorm.scale", .{i}, features),
-                .attn = try loadAttn(alloc, st, "blocks.{d}", .{i}, features, n_heads, n_kv_heads),
-                .mlp = try loadSwiglu(st, "blocks.{d}", .{i}, features, mlp_dim),
+                .mod = try l.vec("blocks.{d}.mod.lin", .{i}, 6 * features),
+                .prenorm = try l.normScale("blocks.{d}.prenorm.scale", .{i}, features),
+                .postnorm = try l.normScale("blocks.{d}.postnorm.scale", .{i}, features),
+                .attn = try l.loadAttn("blocks.{d}", .{i}, features, n_heads, n_kv_heads),
+                .mlp = try l.loadSwiglu("blocks.{d}", .{i}, features, mlp_dim),
             };
         }
 
         var txt_layerwise: [2]TxtBlock = undefined;
         var txt_refiner: [2]TxtBlock = undefined;
         for (0..2) |i| {
-            txt_layerwise[i] = try loadTxtBlock(alloc, st, "txtfusion.layerwise_blocks.{d}", i);
-            txt_refiner[i] = try loadTxtBlock(alloc, st, "txtfusion.refiner_blocks.{d}", i);
+            txt_layerwise[i] = try l.loadTxtBlock("txtfusion.layerwise_blocks.{d}", i);
+            txt_refiner[i] = try l.loadTxtBlock("txtfusion.refiner_blocks.{d}", i);
         }
 
-        const first = try loadLinear(alloc, st, "first", features, channels * patch * patch, true);
-        const tmlp0 = try loadLinear(alloc, st, "tmlp.0", features, tdim, true);
-        const tmlp2 = try loadLinear(alloc, st, "tmlp.2", features, features, true);
-        const tproj1 = try loadLinear(alloc, st, "tproj.1", 6 * features, features, true);
-        const txt_projector = try mat(st, "txtfusion.projector.weight", .{}, 1, txt_layers);
-        const txtmlp_norm = try normScale(alloc, st, "txtmlp.0.scale", .{}, txt_dim);
-        const txtmlp1 = try loadLinear(alloc, st, "txtmlp.1", features, txt_dim, true);
-        const txtmlp3 = try loadLinear(alloc, st, "txtmlp.3", features, features, true);
-        const last_norm = try normScale(alloc, st, "last.norm.scale", .{}, features);
-        const last_mod = try vec(alloc, st, "last.modulation.lin", .{}, 2 * features);
-        const last_linear = try loadLinear(alloc, st, "last.linear", channels * patch * patch, features, true);
+        const first = try l.loadLinear("first", features, channels * patch * patch, true);
+        const tmlp0 = try l.loadLinear("tmlp.0", features, tdim, true);
+        const tmlp2 = try l.loadLinear("tmlp.2", features, features, true);
+        const tproj1 = try l.loadLinear("tproj.1", 6 * features, features, true);
+        const txt_projector = try l.mat("txtfusion.projector.weight", .{}, 1, txt_layers);
+        const txtmlp_norm = try l.normScale("txtmlp.0.scale", .{}, txt_dim);
+        const txtmlp1 = try l.loadLinear("txtmlp.1", features, txt_dim, true);
+        const txtmlp3 = try l.loadLinear("txtmlp.3", features, features, true);
+        const last_norm = try l.normScale("last.norm.scale", .{}, features);
+        const last_mod = try l.vec("last.modulation.lin", .{}, 2 * features);
+        const last_linear = try l.loadLinear("last.linear", channels * patch * patch, features, true);
 
         return .{
             .arena = arena,
@@ -606,74 +614,96 @@ fn linear(io: std.Io, gpa: std.mem.Allocator, out: []f32, x: []const f32, m: usi
 
 // --- weight loading --------------------------------------------------------
 
-fn nameOf(buf: []u8, comptime fmt: []const u8, args: anytype, suffix: []const u8) ![]u8 {
-    var fbs = std.Io.Writer.fixed(buf);
-    try fbs.print(fmt, args);
-    try fbs.writeAll(suffix);
-    return fbs.buffered();
-}
+/// Resolves checkpoint tensor names (optionally under a runtime prefix) and
+/// builds `Weight`s, transparently attaching per-row scale + ConvRot metadata
+/// for int8-quantized (`I8`) tensors.
+const Loader = struct {
+    st: *const SafeTensors,
+    alloc: std.mem.Allocator,
+    pfx: []const u8, // "" (fp8) or "model.diffusion_model." (int8)
 
-fn mat(st: *const SafeTensors, comptime fmt: []const u8, args: anytype, rows: usize, cols: usize) !Weight {
-    var buf: [96]u8 = undefined;
-    const name = try nameOf(&buf, fmt, args, "");
-    const view = st.get(name) orelse return error.MissingTensor;
-    const shape = view.info.shape.slice();
-    if (shape.len != 2 or shape[0] != rows or shape[1] != cols) return error.ShapeMismatch;
-    return Weight.init(view.bytes, view.info.dtype, rows, cols);
-}
+    fn name(l: Loader, buf: []u8, comptime fmt: []const u8, args: anytype, suffix: []const u8) ![]u8 {
+        var fbs = std.Io.Writer.fixed(buf);
+        try fbs.writeAll(l.pfx);
+        try fbs.print(fmt, args);
+        try fbs.writeAll(suffix);
+        return fbs.buffered();
+    }
 
-fn vec(alloc: std.mem.Allocator, st: *const SafeTensors, comptime fmt: []const u8, args: anytype, len: usize) ![]f32 {
-    var buf: [96]u8 = undefined;
-    const name = try nameOf(&buf, fmt, args, "");
-    const view = st.get(name) orelse return error.MissingTensor;
-    if (view.info.elemCount() != len) return error.ShapeMismatch;
-    return view.toF32Alloc(alloc);
-}
+    fn mat(l: Loader, comptime fmt: []const u8, args: anytype, rows: usize, cols: usize) !Weight {
+        var buf: [160]u8 = undefined;
+        const nm = try l.name(&buf, fmt, args, "");
+        const view = l.st.get(nm) orelse return error.MissingTensor;
+        const shape = view.info.shape.slice();
+        if (shape.len != 2 or shape[0] != rows or shape[1] != cols) return error.ShapeMismatch;
+        var w = Weight.init(view.bytes, view.info.dtype, rows, cols);
+        if (view.info.dtype == .i8) {
+            // ComfyUI int8_tensorwise "convrot": per-output-row `weight_scale`
+            // and a size-256 group rotation folded out at dequant time.
+            var sbuf: [168]u8 = undefined;
+            const sname = try l.name(&sbuf, fmt, args, "_scale");
+            const sv = l.st.get(sname) orelse return error.MissingTensor;
+            if (sv.info.elemCount() != rows) return error.ShapeMismatch;
+            if (cols % ops.convrot.group_size != 0) return error.ShapeMismatch;
+            w.row_scale = try sv.toF32Alloc(l.alloc);
+            w.convrot = ops.convrot.group_size;
+        }
+        return w;
+    }
 
-/// Zero-centered norm scale -> effective (1 + scale) weight.
-fn normScale(alloc: std.mem.Allocator, st: *const SafeTensors, comptime fmt: []const u8, args: anytype, len: usize) ![]f32 {
-    const w = try vec(alloc, st, fmt, args, len);
-    for (w) |*v| v.* += 1.0;
-    return w;
-}
+    fn vec(l: Loader, comptime fmt: []const u8, args: anytype, len: usize) ![]f32 {
+        var buf: [160]u8 = undefined;
+        const nm = try l.name(&buf, fmt, args, "");
+        const view = l.st.get(nm) orelse return error.MissingTensor;
+        if (view.info.elemCount() != len) return error.ShapeMismatch;
+        return view.toF32Alloc(l.alloc);
+    }
 
-fn loadLinear(alloc: std.mem.Allocator, st: *const SafeTensors, comptime prefix: []const u8, rows: usize, cols: usize, bias: bool) !LinearW {
-    return .{
-        .w = try mat(st, prefix ++ ".weight", .{}, rows, cols),
-        .b = if (bias) try vec(alloc, st, prefix ++ ".bias", .{}, rows) else null,
-    };
-}
+    /// Zero-centered norm scale -> effective (1 + scale) weight.
+    fn normScale(l: Loader, comptime fmt: []const u8, args: anytype, len: usize) ![]f32 {
+        const w = try l.vec(fmt, args, len);
+        for (w) |*v| v.* += 1.0;
+        return w;
+    }
 
-fn loadAttn(alloc: std.mem.Allocator, st: *const SafeTensors, comptime prefix: []const u8, args: anytype, dim: usize, heads: usize, kv_heads: usize) !Attn {
-    return .{
-        .wq = try mat(st, prefix ++ ".attn.wq.weight", args, heads * head_dim, dim),
-        .wk = try mat(st, prefix ++ ".attn.wk.weight", args, kv_heads * head_dim, dim),
-        .wv = try mat(st, prefix ++ ".attn.wv.weight", args, kv_heads * head_dim, dim),
-        .wo = try mat(st, prefix ++ ".attn.wo.weight", args, dim, heads * head_dim),
-        .gate = try mat(st, prefix ++ ".attn.gate.weight", args, dim, dim),
-        .qnorm = try normScale(alloc, st, prefix ++ ".attn.qknorm.qnorm.scale", args, head_dim),
-        .knorm = try normScale(alloc, st, prefix ++ ".attn.qknorm.knorm.scale", args, head_dim),
-        .heads = heads,
-        .kv_heads = kv_heads,
-    };
-}
+    fn loadLinear(l: Loader, comptime prefix: []const u8, rows: usize, cols: usize, bias: bool) !LinearW {
+        return .{
+            .w = try l.mat(prefix ++ ".weight", .{}, rows, cols),
+            .b = if (bias) try l.vec(prefix ++ ".bias", .{}, rows) else null,
+        };
+    }
 
-fn loadSwiglu(st: *const SafeTensors, comptime prefix: []const u8, args: anytype, dim: usize, inner: usize) !Swiglu {
-    return .{
-        .gate = try mat(st, prefix ++ ".mlp.gate.weight", args, inner, dim),
-        .up = try mat(st, prefix ++ ".mlp.up.weight", args, inner, dim),
-        .down = try mat(st, prefix ++ ".mlp.down.weight", args, dim, inner),
-    };
-}
+    fn loadAttn(l: Loader, comptime prefix: []const u8, args: anytype, dim: usize, heads: usize, kv_heads: usize) !Attn {
+        return .{
+            .wq = try l.mat(prefix ++ ".attn.wq.weight", args, heads * head_dim, dim),
+            .wk = try l.mat(prefix ++ ".attn.wk.weight", args, kv_heads * head_dim, dim),
+            .wv = try l.mat(prefix ++ ".attn.wv.weight", args, kv_heads * head_dim, dim),
+            .wo = try l.mat(prefix ++ ".attn.wo.weight", args, dim, heads * head_dim),
+            .gate = try l.mat(prefix ++ ".attn.gate.weight", args, dim, dim),
+            .qnorm = try l.normScale(prefix ++ ".attn.qknorm.qnorm.scale", args, head_dim),
+            .knorm = try l.normScale(prefix ++ ".attn.qknorm.knorm.scale", args, head_dim),
+            .heads = heads,
+            .kv_heads = kv_heads,
+        };
+    }
 
-fn loadTxtBlock(alloc: std.mem.Allocator, st: *const SafeTensors, comptime prefix: []const u8, i: usize) !TxtBlock {
-    return .{
-        .prenorm = try normScale(alloc, st, prefix ++ ".prenorm.scale", .{i}, txt_dim),
-        .postnorm = try normScale(alloc, st, prefix ++ ".postnorm.scale", .{i}, txt_dim),
-        .attn = try loadAttn(alloc, st, prefix, .{i}, txt_dim, txt_heads, txt_heads),
-        .mlp = try loadSwiglu(st, prefix, .{i}, txt_dim, txt_mlp_dim),
-    };
-}
+    fn loadSwiglu(l: Loader, comptime prefix: []const u8, args: anytype, dim: usize, inner: usize) !Swiglu {
+        return .{
+            .gate = try l.mat(prefix ++ ".mlp.gate.weight", args, inner, dim),
+            .up = try l.mat(prefix ++ ".mlp.up.weight", args, inner, dim),
+            .down = try l.mat(prefix ++ ".mlp.down.weight", args, dim, inner),
+        };
+    }
+
+    fn loadTxtBlock(l: Loader, comptime prefix: []const u8, i: usize) !TxtBlock {
+        return .{
+            .prenorm = try l.normScale(prefix ++ ".prenorm.scale", .{i}, txt_dim),
+            .postnorm = try l.normScale(prefix ++ ".postnorm.scale", .{i}, txt_dim),
+            .attn = try l.loadAttn(prefix, .{i}, txt_dim, txt_heads, txt_heads),
+            .mlp = try l.loadSwiglu(prefix, .{i}, txt_dim, txt_mlp_dim),
+        };
+    }
+};
 
 // --- tests -----------------------------------------------------------------
 
@@ -683,6 +713,81 @@ test "modulate and gatedAdd broadcast over rows" {
     try std.testing.expectEqualSlices(f32, &.{ 11.5, 20, 14.5, 20 }, &x);
     gatedAdd(&x, &.{ 1, 1, 2, 2 }, &.{ 2, 0.5 });
     try std.testing.expectEqualSlices(f32, &.{ 13.5, 20.5, 18.5, 21 }, &x);
+}
+
+test "int8 convrot checkpoint loads with per-row scale + rotation metadata" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "models/diffusion_model/krea2CenterSemiraw_v10Int8.safetensors";
+    std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
+
+    var st = try SafeTensors.open(gpa, io, path);
+    defer st.deinit();
+    var model = try DiT.load(gpa, &st);
+    defer model.deinit();
+
+    // The 8 per-block linears are int8 convrot; scales/rotation must be wired.
+    const attn = model.blocks[0].attn;
+    for ([_]Weight{ attn.wq, attn.wk, attn.wv, attn.wo, attn.gate }) |w| {
+        try std.testing.expect(w.dtype == .i8);
+        try std.testing.expectEqual(@as(u32, ops.convrot.group_size), w.convrot);
+        try std.testing.expect(w.row_scale != null);
+        try std.testing.expectEqual(w.rows, w.row_scale.?.len);
+        try std.testing.expectEqual(@as(usize, 0), w.cols % ops.convrot.group_size);
+    }
+    // Non-quantized tensors stay full precision (F32 here), no per-row scale.
+    try std.testing.expect(model.first.w.dtype == .f32);
+    try std.testing.expect(model.first.w.row_scale == null);
+}
+
+// The int8 convrot weights should reconstruct the same linear map as the fp8
+// weights (both quantize the same base checkpoint), so a GEMM through each must
+// agree to within quantization noise. This validates the whole int8 path —
+// loader, per-row scale, and group un-rotation — against the trusted fp8 path.
+test "int8 convrot matmul agrees with fp8 within quant noise" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const i8_path = "models/diffusion_model/krea2CenterSemiraw_v10Int8.safetensors";
+    const fp8_path = "models/diffusion_model/krea2CenterSemiraw_v10Fp8.safetensors";
+    std.Io.Dir.cwd().access(io, i8_path, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fp8_path, .{}) catch return error.SkipZigTest;
+
+    var st_i8 = try SafeTensors.open(gpa, io, i8_path);
+    defer st_i8.deinit();
+    var m_i8 = try DiT.load(gpa, &st_i8);
+    defer m_i8.deinit();
+    var st_fp8 = try SafeTensors.open(gpa, io, fp8_path);
+    defer st_fp8.deinit();
+    var m_fp8 = try DiT.load(gpa, &st_fp8);
+    defer m_fp8.deinit();
+
+    const w_i8 = m_i8.blocks[0].attn.wq;
+    const w_fp8 = m_fp8.blocks[0].attn.wq;
+    try std.testing.expectEqual(w_fp8.rows, w_i8.rows);
+    try std.testing.expectEqual(w_fp8.cols, w_i8.cols);
+
+    const rows_m = 4;
+    const x = try gpa.alloc(f32, rows_m * w_i8.cols);
+    defer gpa.free(x);
+    var prng = std.Random.DefaultPrng.init(1234);
+    for (x) |*v| v.* = prng.random().floatNorm(f32);
+
+    const y_i8 = try gpa.alloc(f32, rows_m * w_i8.rows);
+    defer gpa.free(y_i8);
+    const y_fp8 = try gpa.alloc(f32, rows_m * w_fp8.rows);
+    defer gpa.free(y_fp8);
+    try ops.matmul.matmul(io, gpa, y_i8, x, rows_m, w_i8, null);
+    try ops.matmul.matmul(io, gpa, y_fp8, x, rows_m, w_fp8, null);
+
+    var num: f64 = 0;
+    var den: f64 = 0;
+    for (y_fp8, y_i8) |ref, got| {
+        num += @as(f64, (ref - got)) * (ref - got);
+        den += @as(f64, ref) * ref;
+    }
+    const rel = @sqrt(num / den);
+    std.debug.print("int8-vs-fp8 wq GEMM relative RMSE: {d:.4}\n", .{rel});
+    try std.testing.expect(rel < 0.05);
 }
 
 fn readF32File(gpa: std.mem.Allocator, io: std.Io, path: []const u8, n: usize) ![]f32 {

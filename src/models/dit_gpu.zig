@@ -30,6 +30,7 @@ const Prof = struct {
     smax_ns: i96 = 0,
     aout_ns: i96 = 0,
     elt_ns: i96 = 0,
+    prep_ns: i96 = 0, // int8 rotate/rowscale/quantize prep (opI8Prep)
     xfer_ns: i96 = 0,
     cpu_ns: i96 = 0,
 };
@@ -419,7 +420,12 @@ pub fn forward(
         // 2 DiT stores raw e4m3: all scales are 1), the modulated norm
         // converts straight to f16 once and feeds all four GEMMs — the f32
         // intermediate and three redundant conversions disappear.
-        const qkv_shared = coop and
+        // int8 (convrot) weights route through the int8 tensor-core path:
+        // one rotate+quantize of the modulated-norm input feeds all four
+        // GEMMs (opI8Prep/opI8Gemm), producing f32 q/k/v/g — so it takes the
+        // f32-output branches below (which still run tensor-core attention).
+        const is_i8 = blk.attn.wq.dtype == .i8;
+        const qkv_shared = coop and !is_i8 and
             blk.attn.wq.scale == blk.attn.wk.scale and
             blk.attn.wq.scale == blk.attn.wv.scale and
             blk.attn.wq.scale == blk.attn.gate.scale;
@@ -428,6 +434,11 @@ pub fn forward(
         // and the qk-norm + rope + convert chain collapses to one in-place
         // pass per operand.
         const att16 = qkv_shared and tc_attn and ctx.pipe_coop_c16 != .null_handle;
+        // int8 attention in f16: wq/wk/wv output f16 directly (c_h16 GEMM) so
+        // the fused att16 norm/rope/gather chain applies (gate stays f32, so the
+        // gate/wo/mlp path is unchanged — no f16-input prep needed).
+        const i8_f16 = is_i8 and tc_attn and ctx.pipe_coop_i8_fs16 != .null_handle;
+        const attn_f16 = att16 or i8_f16;
         if (qkv_shared) {
             try ctx.opElt(.rms_apply_mod_h16, x_d, h16_d, mv_d, rmsi_d, .{
                 .u0 = @intCast(seq_pad * F / 2),
@@ -461,16 +472,34 @@ pub fn forward(
                 .u3 = mv_base + 1 * F,
             }, seq * F, 1, 1);
             mark(io, &t_mark, &prof.elt_ns);
-            try Gemm.go(ctx, coop, q_d, t1_d, seq, seq_pad, blk.attn.wq);
-            mark(io, &t_mark, &prof.matmul_ns);
-            try Gemm.go(ctx, coop, k_d, t1_d, seq, seq_pad, blk.attn.wk);
-            mark(io, &t_mark, &prof.matmul_ns);
-            try Gemm.go(ctx, coop, v_d, t1_d, seq, seq_pad, blk.attn.wv);
-            mark(io, &t_mark, &prof.matmul_ns);
-            try Gemm.go(ctx, coop, g_d, t1_d, seq, seq_pad, blk.attn.gate);
-            mark(io, &t_mark, &prof.matmul_ns);
+            if (is_i8) {
+                // Prep the modulated norm once, then four int8 GEMMs share it.
+                // (Overlapping them via distinct accs was measured neutral on
+                // this driver — the register-tiled GEMM is the bottleneck, not
+                // serialization — so keep the single-acc path to save VRAM.)
+                try ctx.opI8Prep(t1_d, seq, F);
+                mark(io, &t_mark, &prof.prep_ns);
+                // i8_f16: q/k/v come out f16 (v lands in the P@V layout v16_d)
+                // for the att16 chain; gate stays f32 (downstream unchanged).
+                inline for (.{ "wq", "wk", "wv", "gate" }) |name| {
+                    const w_ = @field(blk.attn, name);
+                    const is_gate = comptime std.mem.eql(u8, name, "gate");
+                    const dst = if (comptime std.mem.eql(u8, name, "wq")) q_d else if (comptime std.mem.eql(u8, name, "wk")) k_d else if (comptime std.mem.eql(u8, name, "wv")) (if (i8_f16) v16_d else v_d) else g_d;
+                    try ctx.opI8Gemm(dst, w_.bytes, w_.row_scale.?, w_.rows, i8_f16 and !is_gate);
+                    mark(io, &t_mark, &prof.matmul_ns);
+                }
+            } else {
+                try Gemm.go(ctx, coop, q_d, t1_d, seq, seq_pad, blk.attn.wq);
+                mark(io, &t_mark, &prof.matmul_ns);
+                try Gemm.go(ctx, coop, k_d, t1_d, seq, seq_pad, blk.attn.wk);
+                mark(io, &t_mark, &prof.matmul_ns);
+                try Gemm.go(ctx, coop, v_d, t1_d, seq, seq_pad, blk.attn.wv);
+                mark(io, &t_mark, &prof.matmul_ns);
+                try Gemm.go(ctx, coop, g_d, t1_d, seq, seq_pad, blk.attn.gate);
+                mark(io, &t_mark, &prof.matmul_ns);
+            }
         }
-        if (att16) {
+        if (attn_f16) {
             // Fused per-head norm + rope + scale, in place on the f16 GEMM
             // outputs (value-identical to the chain below — see the kernel);
             // K then gathers f16 -> f16 into the scores layout. V needs
@@ -501,6 +530,48 @@ pub fn forward(
                 .u3 = @intCast(seq),
                 .u4 = kv_heads,
             }, kv_heads * hd * seq_pad / 2, 1, 1);
+            mark(io, &t_mark, &prof.elt_ns);
+        } else if (is_i8 and tc_attn) {
+            // int8 f32 GEMM outputs, tensor-core attention: fuse rmsnorm+rope
+            // into ONE f32 in-place pass for q and k (2 passes each -> 1), then
+            // the existing converts (which zero the seq_pad tail correctly).
+            // 7 f32 passes -> 5. q's attn_scale is applied at the f32_to_h16.
+            ctx.independent(2);
+            try ctx.opElt(.qknorm_rope_f32, q_d, try normBuf(ctx, blk.attn.qnorm), freqs_d, null, .{
+                .u0 = @intCast(seq * heads),
+                .u1 = half,
+                .u2 = sin_off,
+                .u3 = heads,
+                .f0 = 1.0,
+                .f1 = 1e-5,
+            }, seq * heads, 1, 1);
+            try ctx.opElt(.qknorm_rope_f32, k_d, try normBuf(ctx, blk.attn.knorm), freqs_d, null, .{
+                .u0 = @intCast(seq * kv_heads),
+                .u1 = half,
+                .u2 = sin_off,
+                .u3 = kv_heads,
+                .f0 = 1.0,
+                .f1 = 1e-5,
+            }, seq * kv_heads, 1, 1);
+            mark(io, &t_mark, &prof.elt_ns);
+            ctx.independent(3);
+            try ctx.opElt(.f32_to_h16, q_d, null, null, qt_d, .{
+                .u0 = @intCast(seq_pad * heads * hd / 2),
+                .u1 = @intCast(seq * heads * hd),
+                .f0 = attn_scale,
+            }, seq_pad * heads * hd / 2, 1, 1);
+            try ctx.opElt(.gather_kmajor_h16, k_d, null, null, kt_d, .{
+                .u0 = @intCast(kv_heads * hd * seq_pad / 2),
+                .u1 = hd,
+                .u2 = @intCast(seq_pad),
+                .u3 = @intCast(seq),
+                .u4 = kv_heads,
+            }, kv_heads * hd * seq_pad / 2, 1, 1);
+            try ctx.opElt(.f32_to_h16, v_d, null, null, v16_d, .{
+                .u0 = @intCast(seq_pad * kv_heads * hd / 2),
+                .u1 = @intCast(seq * kv_heads * hd),
+                .f0 = 1.0,
+            }, seq_pad * kv_heads * hd / 2, 1, 1);
             mark(io, &t_mark, &prof.elt_ns);
         } else {
         // The q and k chains (norm -> rope -> convert/gather) touch disjoint
@@ -570,7 +641,7 @@ pub fn forward(
         }
         // On the f16-C path Q was normed/roped/scaled in place: it IS the
         // scores operand.
-        const q_src = if (att16) q_d else qt_d;
+        const q_src = if (attn_f16) q_d else qt_d;
         if (flash) {
             const push = gpu.EltPush{
                 .u0 = heads * hd,
@@ -652,7 +723,7 @@ pub fn forward(
             }
         }
         mark(io, &t_mark, &prof.attn_ns);
-        if (coop) {
+        if (coop and !is_i8) {
             if (att16) {
                 try ctx.opElt(.sigmoid_mul_g16, attn_d, g_d, null, h16_d, .{
                     .u0 = @intCast(seq_pad * F / 2),
@@ -671,7 +742,13 @@ pub fn forward(
         } else {
             try ctx.opElt(.sigmoid_mul, attn_d, g_d, null, null, .{ .u0 = @intCast(seq * F) }, seq * F, 1, 1);
             mark(io, &t_mark, &prof.elt_ns);
-            try Gemm.go(ctx, coop, t1_d, attn_d, seq, seq_pad, blk.attn.wo);
+            if (is_i8) {
+                try ctx.opI8Prep(attn_d, seq, blk.attn.wo.cols);
+                mark(io, &t_mark, &prof.prep_ns);
+                try ctx.opI8Gemm(t1_d, blk.attn.wo.bytes, blk.attn.wo.row_scale.?, blk.attn.wo.rows, false);
+            } else {
+                try Gemm.go(ctx, coop, t1_d, attn_d, seq, seq_pad, blk.attn.wo);
+            }
         }
         mark(io, &t_mark, &prof.matmul_ns);
         if (att16) {
@@ -701,7 +778,7 @@ pub fn forward(
             .u2 = rms_ch,
             .f0 = 1e-5,
         }, seq, 1, 1);
-        const mlp_shared = coop and blk.mlp.gate.scale == blk.mlp.up.scale;
+        const mlp_shared = coop and !is_i8 and blk.mlp.gate.scale == blk.mlp.up.scale;
         const mlp16 = mlp_shared and ctx.pipe_coop_c16 != .null_handle;
         if (mlp_shared) {
             try ctx.opElt(.rms_apply_mod_h16, x_d, h16_d, mv_d, rmsi_d, .{
@@ -726,12 +803,21 @@ pub fn forward(
                 .u3 = mv_base + 4 * F,
             }, seq * F, 1, 1);
             mark(io, &t_mark, &prof.elt_ns);
-            try Gemm.go(ctx, coop, mg_d, t1_d, seq, seq_pad, blk.mlp.gate);
-            mark(io, &t_mark, &prof.matmul_ns);
-            try Gemm.go(ctx, coop, mu_d, t1_d, seq, seq_pad, blk.mlp.up);
-            mark(io, &t_mark, &prof.matmul_ns);
+            if (is_i8) {
+                try ctx.opI8Prep(t1_d, seq, F);
+                mark(io, &t_mark, &prof.prep_ns);
+                try ctx.opI8Gemm(mg_d, blk.mlp.gate.bytes, blk.mlp.gate.row_scale.?, blk.mlp.gate.rows, false);
+                mark(io, &t_mark, &prof.matmul_ns);
+                try ctx.opI8Gemm(mu_d, blk.mlp.up.bytes, blk.mlp.up.row_scale.?, blk.mlp.up.rows, false);
+                mark(io, &t_mark, &prof.matmul_ns);
+            } else {
+                try Gemm.go(ctx, coop, mg_d, t1_d, seq, seq_pad, blk.mlp.gate);
+                mark(io, &t_mark, &prof.matmul_ns);
+                try Gemm.go(ctx, coop, mu_d, t1_d, seq, seq_pad, blk.mlp.up);
+                mark(io, &t_mark, &prof.matmul_ns);
+            }
         }
-        if (coop) {
+        if (coop and !is_i8) {
             if (mlp16) {
                 try ctx.opElt(.silu_mul16, mg_d, mu_d, null, h16_d, .{
                     .u0 = @intCast(seq_pad * dit.mlp_dim / 2),
@@ -749,7 +835,13 @@ pub fn forward(
         } else {
             try ctx.opElt(.silu_mul, mg_d, mu_d, null, null, .{ .u0 = @intCast(seq * dit.mlp_dim) }, seq * dit.mlp_dim, 1, 1);
             mark(io, &t_mark, &prof.elt_ns);
-            try Gemm.go(ctx, coop, t1_d, mg_d, seq, seq_pad, blk.mlp.down);
+            if (is_i8) {
+                try ctx.opI8Prep(mg_d, seq, blk.mlp.down.cols);
+                mark(io, &t_mark, &prof.prep_ns);
+                try ctx.opI8Gemm(t1_d, blk.mlp.down.bytes, blk.mlp.down.row_scale.?, blk.mlp.down.rows, false);
+            } else {
+                try Gemm.go(ctx, coop, t1_d, mg_d, seq, seq_pad, blk.mlp.down);
+            }
         }
         mark(io, &t_mark, &prof.matmul_ns);
         if (mlp16) {
@@ -809,8 +901,8 @@ pub fn forward(
             }
         }.go;
         std.debug.print(
-            "dit gpu profile: matmul {d:.0}ms  attn {d:.0}ms (scores {d:.0} smax {d:.0} out {d:.0})  elt {d:.0}ms  xfer {d:.0}ms  cpu {d:.0}ms\n",
-            .{ ms(prof.matmul_ns), ms(prof.attn_ns + prof.scores_ns + prof.smax_ns + prof.aout_ns), ms(prof.scores_ns), ms(prof.smax_ns), ms(prof.aout_ns), ms(prof.elt_ns), ms(prof.xfer_ns), ms(prof.cpu_ns) },
+            "dit gpu profile: matmul {d:.0}ms  attn {d:.0}ms (scores {d:.0} smax {d:.0} out {d:.0})  elt {d:.0}ms  prep {d:.0}ms  xfer {d:.0}ms  cpu {d:.0}ms\n",
+            .{ ms(prof.matmul_ns), ms(prof.attn_ns + prof.scores_ns + prof.smax_ns + prof.aout_ns), ms(prof.scores_ns), ms(prof.smax_ns), ms(prof.aout_ns), ms(prof.elt_ns), ms(prof.prep_ns), ms(prof.xfer_ns), ms(prof.cpu_ns) },
         );
     }
 }

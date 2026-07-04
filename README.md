@@ -30,12 +30,17 @@ limit right now is that there was an issue running flash attention in Vulkan bec
 whereas CUDA has an opt-in to use 99 KB. This 48KB limit with the current tiling size causes extra traffic when using Flash Attention,
 leading to it being *slower* instead of faster in Vulkan. Tried multiple ways to squeeze it in and so far hasn't worked out.
 
+Now also supports INT8 ConvRot.
+The speed for this one is farther behind ComfyUI, but roughly matches ComfyUI FP8.
+ComfyUI INT8: ~2s/it, TensorPencil INT8: ~4s/it
+
 This has been tested only on Linux with an RTX 3090. It's likely that other operating systems and GPUs will hit problems
 or run less efficiently.
 
 Plans for the future:
-- Support CUDA
-- Support 8INT CONVROT format (should allow for speed ~doubling on a 3090)
+- Support CUDA in 2 ways for fun:
+  - hand-rolled zig PTX
+  - calling out to cuBLASLt directly
 
 ## Running it
 
