@@ -4,8 +4,8 @@
 
 TensorPencil is a test to see how far we can push diffusion performance in pure Zig (aside from Vulkan / CUDA libraries).
 
-It currently targets FP8 Krea 2, and that is the only model that has been tested.
-Currently the results differ slightly from ComfyUI but are pretty close - the Zig noise kernel was created to generate bit-identical initial noise,
+It currently targets FP8 and INT8 ConvRot Krea 2, and those are the only models that have been tested.
+Currently the Vulkan results differ slightly from ComfyUI but are pretty close - the Zig noise kernel was created to generate bit-identical initial noise,
 and any remaining difference is due to the Zig DiT kernels reducing in a different order than cuBLAS/FlashAttention;
 over 20 steps that difference accumulates as slight texture-level drift.
 
@@ -19,9 +19,12 @@ over 20 steps that difference accumulates as slight texture-level drift.
 TensorPencil is heavily AI-assisted code. Most of this stuff is over my head, I'm just tinkering here.
 The exception is this readme; I'm of the opinion that if you expect a human to take the time to read something, you should take the time to write it.
 
+## Details
+
 Backends supported so far:
 - CPU
 - Vulkan
+- Zig PTX (CUDA)
 
 The goal is for 100% Zig code other than needed 3rd party libraries for Vulkan and CUDA.
 
@@ -39,13 +42,13 @@ or run less efficiently.
 
 Plans for the future:
 - Support CUDA in 2 ways for fun:
-  - hand-rolled zig PTX
+  - hand-rolled zig PTX (completed)
   - calling out to cuBLASLt directly
 
 ## Running it
 
 Requires Zig 0.16.0. There are no build-time C dependencies; the only runtime library is the
-Vulkan loader (`libvulkan.so.1`, opened dynamically), and only for `--gpu on` — the CPU path
+Vulkan loader (`libvulkan.so.1`, opened dynamically), and only for `--backend vulkan` — the CPU path
 needs nothing. You'll also need a Vulkan driver for your GPU. On Ubuntu:
 
 ```
@@ -65,15 +68,15 @@ Model weights are not included. Place the three Krea 2 checkpoints at these exac
 (relative to where you run the binary — the paths are currently hardcoded):
 
 ```
-models/diffusion_model/krea2CenterSemiraw_v10Fp8.safetensors
-models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors
-models/vae/krea2RealVae_v10.safetensors
+models/diffusion_model/krea2CenterSemiraw_v10Fp8.safetensors (or any fp8/int8 krea 2 checkpoint)
+models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors (or any qwen 3 VL encoder)
+models/vae/krea2RealVae_v10.safetensors (or any WAN2.2-VAE)
 ```
 
 The Qwen 3 VL tokenizer is embedded in the binary, so no other files are needed. Then:
 
 ```
-zig-out/bin/TensorPencil generate --prompt "a fluffy orange cat sitting on a windowsill" --gpu on --out cat.png
+zig-out/bin/TensorPencil generate --prompt "a fluffy orange cat sitting on a windowsill" --backend vulkan --out cat.png
 ```
 
 Run with no command to see the available options and defaults.
