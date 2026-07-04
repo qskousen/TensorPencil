@@ -86,7 +86,10 @@ Run with no command to see the available options and defaults.
 When running on GPU, if other processes are using vram or the `--vram-budget` option is set,
 weights past the available budget are streamed from the mmapped file. Assuming sufficient RAM,
 this streaming is nearly free performance-wise, as displayed in the chart below, tested all the
-way down to 1 GB of VRAM.
+way down to 1 GiB of VRAM.
+
+** Note that the VRAM budget is only for the weights, the scores and activations are still in VRAM.**
+The amount of VRAM used for the scores and activations depends on the size of the image; at ~1.8MP, it will be roughly 4.5GiB.
 
 Measured on an RTX 3090 at 1120×1680, 4 steps, f16 DiT:
 
