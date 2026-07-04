@@ -43,6 +43,31 @@ pub fn main(init: std.process.Init) !void {
         try stdout.print("gpu matmul OK\n", .{});
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "gpu-i8-test")) {
         try gpuI8Test(arena, io, stdout);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-test")) {
+        try cudaTest(arena, stdout);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-i8-test")) {
+        try cudaI8Test(arena, io, stdout);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-dit-test")) {
+        const path = if (args.len >= 3) args[2] else "models/diffusion_model/krea2CenterSemiraw_v10Int8.safetensors";
+        const lat: usize = if (args.len >= 4) (std.fmt.parseInt(usize, args[3], 10) catch 32) else 32;
+        const loop = args.len >= 5 and std.mem.eql(u8, args[4], "loop");
+        try cudaDitTest(arena, io, stdout, path, lat, loop);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-attn-test")) {
+        const cuda = TensorPencil.gpu.cuda;
+        var ctx = cuda.Context.init(arena) catch |err| {
+            try stdout.print("cuda unavailable: {t}\n", .{err});
+            return;
+        };
+        defer ctx.deinit();
+        try stdout.print("cuda device: {s} (sm_{d}{d})\n", .{ ctx.deviceName(), ctx.cc_major, ctx.cc_minor });
+        try cuda.kernels.attnTest(&ctx, io, stdout);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-attn-cmp")) {
+        try cudaAttnCmp(arena, stdout);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-stream-test")) {
+        const path = if (args.len >= 3) args[2] else "models/diffusion_model/krea2CenterSemiraw_v10Int8.safetensors";
+        const lat: usize = if (args.len >= 4) (std.fmt.parseInt(usize, args[3], 10) catch 32) else 32;
+        const budget_gib: f64 = if (args.len >= 5) (std.fmt.parseFloat(f64, args[4]) catch 3.0) else 3.0;
+        try cudaStreamTest(arena, io, stdout, path, lat, budget_gib);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "generate")) {
         try generate(arena, io, stdout, args[2..]);
     } else if (args.len >= 6 and std.mem.eql(u8, args[1], "decode-latent")) {
@@ -328,6 +353,317 @@ fn gpuI8Test(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
     try stdout.print("int8 coop GEMM + linear OK\n", .{});
 }
 
+/// CUDA backend bring-up: load the driver, report device caps (incl. the
+/// >48 KB opt-in shared the Vulkan path cannot reach), and run the PTX vadd
+/// smoke test end to end.
+fn cudaTest(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    var ctx = cuda.Context.init(arena) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer ctx.deinit();
+    try stdout.print("cuda device: {s} (sm_{d}{d}), {d} SMs, opt-in shared {d} KB/block, {d} KB/SM, {d} MHz\n", .{
+        ctx.deviceName(),   ctx.cc_major,                    ctx.cc_minor,
+        ctx.sm_count,       @divTrunc(ctx.shared_optin_max, 1024),
+        @divTrunc(ctx.shared_per_sm, 1024), @divTrunc(ctx.clock_khz, 1000),
+    });
+    try cuda.kernels.smokeTest(&ctx);
+    try stdout.print("cuda vadd smoke test OK\n", .{});
+}
+
+/// CUDA int8 GEMM validation + benchmark against the Vulkan ~85 TOPS baseline.
+/// Uses the same CPU oracle as `gpu-i8-test`. (Filled in as the hand-PTX GEMM
+/// lands; for now reports device caps so the harness path is wired.)
+fn cudaI8Test(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    var ctx = cuda.Context.init(arena) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer ctx.deinit();
+    try stdout.print("cuda device: {s} (sm_{d}{d})\n", .{ ctx.deviceName(), ctx.cc_major, ctx.cc_minor });
+    try cuda.kernels.i8GemmTest(&ctx, io, stdout);
+    try cuda.kernels.i8LinearTest(&ctx, io, stdout);
+}
+
+/// Validate the CUDA DiT forward against the CPU int8 forward on the same
+/// (random) inputs: proves the hand-PTX backend computes a like-for-like DiT
+/// velocity. Requires the int8 convrot checkpoint.
+/// Compare the batched tensor-core attention (opAttnTCBatched) against the
+/// validated per-head loop (opAttnTCLoop) on identical random Q/K/V, at a
+/// no-padding size (seq=256) and a padded one (seq=264). Both should match a CPU
+/// GQA attention reference. Pinpoints the batched-path bug.
+fn cudaAttnCmp(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    var be = cuda.Backend.init(arena) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    const heads = 48;
+    const kv = 12;
+    const hd = 128;
+    const grp = heads / kv;
+    const scale: f32 = 1.0 / @sqrt(@as(f32, hd));
+    const cfgs = [_]struct { seq: usize, std: f32 }{
+        .{ .seq = 256, .std = 0.3 }, .{ .seq = 264, .std = 0.3 },
+        .{ .seq = 264, .std = 1.0 }, .{ .seq = 264, .std = 3.0 },
+    };
+    for (cfgs) |cfg| {
+        const seq = cfg.seq;
+        const mpad = std.mem.alignForward(usize, seq, 128);
+        var prng = std.Random.DefaultPrng.init(7);
+        const rnd = prng.random();
+        const q = try arena.alloc(f32, mpad * heads * hd);
+        const k = try arena.alloc(f32, mpad * kv * hd);
+        const v = try arena.alloc(f32, mpad * kv * hd);
+        @memset(q, 0);
+        @memset(k, 0);
+        @memset(v, 0);
+        for (0..seq) |s| {
+            for (0..heads * hd) |i| q[s * heads * hd + i] = rnd.floatNorm(f32) * cfg.std;
+            for (0..kv * hd) |i| {
+                k[s * kv * hd + i] = rnd.floatNorm(f32) * cfg.std;
+                v[s * kv * hd + i] = rnd.floatNorm(f32) * cfg.std;
+            }
+        }
+        var qd = try be.tensorCreate(q.len * 4);
+        defer be.tensorDestroy(&qd);
+        var kd = try be.tensorCreate(k.len * 4);
+        defer be.tensorDestroy(&kd);
+        var vd = try be.tensorCreate(v.len * 4);
+        defer be.tensorDestroy(&vd);
+        var ob = try be.tensorCreate(mpad * heads * hd * 4);
+        defer be.tensorDestroy(&ob);
+        var ol = try be.tensorCreate(mpad * heads * hd * 4);
+        defer be.tensorDestroy(&ol);
+        try be.tensorUpload(qd, std.mem.sliceAsBytes(q));
+        try be.tensorUpload(kd, std.mem.sliceAsBytes(k));
+        try be.tensorUpload(vd, std.mem.sliceAsBytes(v));
+        be.attn_batched = true;
+        try be.opAttnTC(qd, kd, vd, ob, seq, heads, kv, hd, scale);
+        be.attn_batched = false;
+        try be.opAttnTC(qd, kd, vd, ol, seq, heads, kv, hd, scale);
+        try be.endBatch();
+        const gb = try arena.alloc(f32, mpad * heads * hd);
+        const gl = try arena.alloc(f32, mpad * heads * hd);
+        try be.tensorDownload(ob, std.mem.sliceAsBytes(gb));
+        try be.tensorDownload(ol, std.mem.sliceAsBytes(gl));
+        // CPU reference + rel of batched/loop vs cpu, and batched vs loop.
+        var nb: f64 = 0;
+        var nl: f64 = 0;
+        var nbl: f64 = 0;
+        var den: f64 = 0;
+        const prow = try arena.alloc(f32, seq);
+        for (0..seq) |qi| {
+            for (0..heads) |h| {
+                const kvh = h / grp;
+                var mx: f32 = -std.math.inf(f32);
+                for (0..seq) |j| {
+                    var dot: f32 = 0;
+                    for (0..hd) |c| dot += q[(qi * heads + h) * hd + c] * k[(j * kv + kvh) * hd + c];
+                    prow[j] = dot * scale;
+                    mx = @max(mx, prow[j]);
+                }
+                var sum: f32 = 0;
+                for (0..seq) |j| {
+                    prow[j] = @exp(prow[j] - mx);
+                    sum += prow[j];
+                }
+                for (0..seq) |j| prow[j] /= sum;
+                for (0..hd) |c| {
+                    var acc: f32 = 0;
+                    for (0..seq) |j| acc += prow[j] * v[(j * kv + kvh) * hd + c];
+                    const idx = (qi * heads + h) * hd + c;
+                    const db = @as(f64, gb[idx]) - acc;
+                    const dl = @as(f64, gl[idx]) - acc;
+                    const dbl = @as(f64, gb[idx]) - gl[idx];
+                    nb += db * db;
+                    nl += dl * dl;
+                    nbl += dbl * dbl;
+                    den += @as(f64, acc) * acc;
+                }
+            }
+        }
+        try stdout.print("seq={d} std={d:.1} mpad={d}: batched rel {d:.5}, loop rel {d:.5}, batched-vs-loop {d:.5}\n", .{ seq, cfg.std, mpad, @sqrt(nb / den), @sqrt(nl / den), @sqrt(nbl / den) });
+        try stdout.flush();
+    }
+}
+
+/// Validate weight streaming: the CUDA DiT forward with a small --vram-budget
+/// (weights evicted+re-uploaded per step) must be BIT-IDENTICAL to the resident
+/// forward, and reports the s/step perf loss.
+fn cudaStreamTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []const u8, lat: usize, budget_gib: f64) !void {
+    const dit_mod = TensorPencil.models.dit;
+    const dit_cuda = TensorPencil.models.dit_cuda;
+    const cuda = TensorPencil.gpu.cuda;
+
+    var st = try TensorPencil.SafeTensors.open(arena, io, path);
+    defer st.deinit();
+    var model = try dit_mod.DiT.load(arena, &st);
+    defer model.deinit();
+    if (model.blocks[0].attn.wq.dtype != .i8) {
+        try stdout.print("cuda-stream-test needs the int8 convrot checkpoint\n", .{});
+        return;
+    }
+    const seq_txt: usize = 8;
+    const sigma: f32 = 0.7;
+    var prng = std.Random.DefaultPrng.init(1234);
+    const rand = prng.random();
+    const cond = try arena.alloc(f32, seq_txt * dit_mod.txt_layers * dit_mod.txt_dim);
+    for (cond) |*v| v.* = rand.floatNorm(f32) * 0.5;
+    const x = try arena.alloc(f32, dit_mod.channels * lat * lat);
+    for (x) |*v| v.* = rand.floatNorm(f32);
+
+    var be = cuda.Backend.init(arena) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    // Test the production (synchronous) streaming path.
+    // (enableAsyncStreaming() would exercise the dormant, measured-slower async path.)
+    try stdout.print("== cuda-stream-test lat={d} ({d}px), budget {d:.2} GiB (sync) ==\ncuda device: {s}\n", .{ lat, lat * 8, budget_gib, be.deviceName() });
+    var sess = try dit_cuda.Session.init(arena, io, be, &model, lat, lat, cond, seq_txt);
+    defer sess.deinit(be);
+    var ws = try dit_cuda.Workspace.init(be, lat, lat, seq_txt);
+    defer ws.deinit(be);
+
+    const out_res = try arena.alloc(f32, x.len);
+    const out_str = try arena.alloc(f32, x.len);
+    const budget: u64 = @intFromFloat(budget_gib * (1 << 30));
+
+    // Resident (no budget): warm-up + timed.
+    be.budget_override = 0;
+    try dit_cuda.forward(&model, be, &sess, &ws, io, arena, out_res, x, sigma);
+    var t_res: f64 = std.math.inf(f64);
+    for (0..3) |_| {
+        const a = std.Io.Clock.real.now(io);
+        try dit_cuda.forward(&model, be, &sess, &ws, io, arena, out_res, x, sigma);
+        const b = std.Io.Clock.real.now(io);
+        t_res = @min(t_res, @as(f64, @floatFromInt(b.nanoseconds - a.nanoseconds)) / 1e6);
+    }
+
+    // Streamed (small budget): evictWeights first so nothing is pre-resident.
+    be.evictWeights();
+    be.budget_override = budget;
+    try dit_cuda.forward(&model, be, &sess, &ws, io, arena, out_str, x, sigma);
+    var t_str: f64 = std.math.inf(f64);
+    for (0..3) |_| {
+        const a = std.Io.Clock.real.now(io);
+        try dit_cuda.forward(&model, be, &sess, &ws, io, arena, out_str, x, sigma);
+        const b = std.Io.Clock.real.now(io);
+        t_str = @min(t_str, @as(f64, @floatFromInt(b.nanoseconds - a.nanoseconds)) / 1e6);
+    }
+    be.budget_override = 0;
+
+    var maxdiff: f32 = 0;
+    var ndiff: usize = 0;
+    for (out_res, out_str) |a, b| {
+        const d = @abs(a - b);
+        if (d != 0) ndiff += 1;
+        maxdiff = @max(maxdiff, d);
+    }
+    try stdout.print("resident {d:.3} s/step, streamed {d:.3} s/step ({d:.1}% slower)\n", .{ t_res / 1000.0, t_str / 1000.0, (t_str / t_res - 1.0) * 100.0 });
+    try stdout.print("streamed vs resident: {d} / {d} elems differ, max abs diff {d}\n", .{ ndiff, out_res.len, maxdiff });
+    try stdout.flush();
+    if (ndiff != 0) return error.StreamMismatch; // must be bit-identical
+    try stdout.print("cuda weight streaming OK (bit-identical)\n", .{});
+}
+
+fn cudaDitTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []const u8, lat: usize, use_loop: bool) !void {
+    const dit_mod = TensorPencil.models.dit;
+    const dit_cuda = TensorPencil.models.dit_cuda;
+    const cuda = TensorPencil.gpu.cuda;
+
+    var st = try TensorPencil.SafeTensors.open(arena, io, path);
+    defer st.deinit();
+    var model = try dit_mod.DiT.load(arena, &st);
+    defer model.deinit();
+    if (model.blocks[0].attn.wq.dtype != .i8) {
+        try stdout.print("cuda-dit-test needs the int8 convrot checkpoint (wq.dtype={t})\n", .{model.blocks[0].attn.wq.dtype});
+        return;
+    }
+
+    const seq_txt: usize = 8;
+    const sigma: f32 = 0.7;
+    // CPU reference is O(seq^2) and unusably slow past ~256px; gate the rel check.
+    const check_cpu = lat <= 32;
+    try stdout.print("== cuda-dit-test lat={d} ({d}px), seq~{d} ==\n", .{ lat, lat * 8, seq_txt + (lat / 2) * (lat / 2) });
+    var prng = std.Random.DefaultPrng.init(1234);
+    const rand = prng.random();
+    const cond = try arena.alloc(f32, seq_txt * dit_mod.txt_layers * dit_mod.txt_dim);
+    for (cond) |*v| v.* = rand.floatNorm(f32) * 0.5;
+    const x = try arena.alloc(f32, dit_mod.channels * lat * lat);
+    for (x) |*v| v.* = rand.floatNorm(f32);
+
+    const out_cpu = try arena.alloc(f32, x.len);
+    if (check_cpu) {
+        const t0 = std.Io.Clock.real.now(io);
+        try model.forward(io, arena, out_cpu, x, lat, lat, sigma, cond, seq_txt);
+        const t1 = std.Io.Clock.real.now(io);
+        try stdout.print("cpu int8 forward: {d:.1} s\n", .{@as(f64, @floatFromInt(t1.nanoseconds - t0.nanoseconds)) / 1e9});
+        try stdout.flush();
+    }
+
+    var be = cuda.Backend.init(arena) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    try stdout.print("cuda device: {s}\n", .{be.deviceName()});
+    var sess = try dit_cuda.Session.init(arena, io, be, &model, lat, lat, cond, seq_txt);
+    defer sess.deinit(be);
+    var ws = try dit_cuda.Workspace.init(be, lat, lat, seq_txt);
+    defer ws.deinit(be);
+    if (use_loop) be.attn_batched = false;
+    const out_cuda = try arena.alloc(f32, x.len);
+
+    // Warm-up pass (uploads weights, JITs modules).
+    try dit_cuda.forward(&model, be, &sess, &ws, io, arena, out_cuda, x, sigma);
+    const reps: usize = if (lat <= 64) 4 else 2;
+    // Batched (profile off) timing — the real steady-state s/step.
+    var best_ms: f64 = std.math.inf(f64);
+    for (0..reps) |_| {
+        const ta = std.Io.Clock.real.now(io);
+        try dit_cuda.forward(&model, be, &sess, &ws, io, arena, out_cuda, x, sigma);
+        const tb = std.Io.Clock.real.now(io);
+        best_ms = @min(best_ms, @as(f64, @floatFromInt(tb.nanoseconds - ta.nanoseconds)) / 1e6);
+    }
+    try stdout.print("cuda int8 forward: {d:.3} s/step (best of {d}, batched)\n", .{ best_ms / 1000.0, reps });
+    // One profiled (sync-per-op) pass for the per-category breakdown.
+    be.profile = true;
+    be.prof.reset();
+    try dit_cuda.forward(&model, be, &sess, &ws, io, arena, out_cuda, x, sigma);
+    be.profile = false;
+    // matmul/prep/elt + attention (gather/scatter in `attn`, GEMMs/softmax split out).
+    const cats = [_][]const u8{ "matmul", "prep", "attn(g/s)", "elt", "  scores", "  softmax", "  pv" };
+    var sync_total: f64 = 0;
+    for (cats, 0..) |name, i| {
+        sync_total += be.prof.ms[i];
+        try stdout.print("  {s:<9} {d:>8.1} ms  ({d} launches)\n", .{ name, be.prof.ms[i], be.prof.n[i] });
+    }
+    try stdout.print("  {s:<9} {d:>8.1} ms  (sync-per-op sum)\n", .{ "total", sync_total });
+    try stdout.flush();
+
+    if (check_cpu) {
+        var num: f64 = 0;
+        var den: f64 = 0;
+        var maxabs: f32 = 0;
+        for (out_cpu, out_cuda) |a, b| {
+            const d = @as(f64, a) - b;
+            num += d * d;
+            den += @as(f64, a) * a;
+            maxabs = @max(maxabs, @abs(a));
+        }
+        const rel = @sqrt(num / den);
+        try stdout.print("DiT velocity: rel RMSE cuda-vs-cpu {d:.5} (max|v|={d:.3})\n", .{ rel, maxabs });
+        try stdout.flush();
+        if (rel > 0.08) return error.GpuMismatch;
+        try stdout.print("cuda DiT forward OK (like-for-like)\n", .{});
+    }
+}
+
 fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const []const u8) !void {
     var opts: TensorPencil.pipeline.Options = .{ .prompt = "" };
     var out_path: []const u8 = "out.png";
@@ -359,6 +695,8 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
             TensorPencil.models.dit_gpu.profile = std.mem.eql(u8, val, "on") or std.mem.eql(u8, val, "1");
         } else if (std.mem.eql(u8, flag, "--gpu")) {
             opts.use_gpu = std.mem.eql(u8, val, "on") or std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
+        } else if (std.mem.eql(u8, flag, "--dit-cuda")) {
+            opts.dit_cuda = std.mem.eql(u8, val, "on") or std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
         } else if (std.mem.eql(u8, flag, "--vram-budget")) {
             const gib = try std.fmt.parseFloat(f64, val);
             opts.vram_budget = @intFromFloat(gib * (1 << 30));

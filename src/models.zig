@@ -7,6 +7,7 @@ pub const qwen3_gpu = @import("models/qwen3_gpu.zig");
 pub const krea2_text = @import("models/krea2_text.zig");
 pub const dit = @import("models/dit.zig");
 pub const dit_gpu = @import("models/dit_gpu.zig");
+pub const dit_cuda = @import("models/dit_cuda.zig");
 
 test {
     _ = wan_vae;
@@ -16,4 +17,5 @@ test {
     _ = krea2_text;
     _ = dit;
     _ = dit_gpu;
+    _ = dit_cuda;
 }

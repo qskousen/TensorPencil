@@ -15,6 +15,8 @@ const qwen3_gpu = @import("models/qwen3_gpu.zig");
 const krea2_text = @import("models/krea2_text.zig");
 const dit_mod = @import("models/dit.zig");
 const dit_gpu = @import("models/dit_gpu.zig");
+const dit_cuda = @import("models/dit_cuda.zig");
+const cuda = @import("gpu/cuda.zig");
 const wan_vae = @import("models/wan_vae.zig");
 const vae_gpu = @import("models/vae_gpu.zig");
 
@@ -29,6 +31,9 @@ pub const Options = struct {
     shift: f32 = sampler.default_shift,
     /// Offload large GEMMs to Vulkan; falls back to CPU when unavailable.
     use_gpu: bool = false,
+    /// Run the DiT sampling loop on the hand-PTX CUDA backend (int8 checkpoint
+    /// only). Encoder + VAE stay on CPU. Mutually exclusive with use_gpu.
+    dit_cuda: bool = false,
     /// Cap on device memory (bytes; 0 = query the driver's live budget).
     /// Weights past the cap stream per step instead of staying resident.
     vram_budget: u64 = 0,
@@ -83,6 +88,20 @@ pub fn generate(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*s
         ctx.deinit();
     };
 
+    // Hand-PTX CUDA backend for the DiT sampling loop (int8 checkpoint). The
+    // encoder and VAE stay on CPU (gpu_ctx null); only the DiT runs on CUDA.
+    var cu_be: ?*cuda.Backend = null;
+    if (opts.dit_cuda) {
+        if (cuda.Backend.init(gpa)) |b| {
+            cu_be = b;
+            b.budget_override = opts.vram_budget; // --vram-budget: stream weights past this cap
+            try note(progress, "cuda dit: {s}\n", .{b.deviceName()});
+        } else |err| {
+            try note(progress, "cuda unavailable ({t}); using cpu dit\n", .{err});
+        }
+    }
+    defer if (cu_be) |b| b.deinit();
+
     // Stage 1: text encoding (encoder freed before the DiT loads).
     var cond_pos: Cond = undefined;
     var cond_neg: ?Cond = null;
@@ -122,6 +141,13 @@ pub fn generate(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*s
         defer st.deinit();
         var dit = try dit_mod.DiT.load(gpa, &st);
         defer dit.deinit();
+        // NOTE: async weight streaming (pinned staging ring) is NOT enabled here —
+        // it measured SLOWER than synchronous streaming (the driver's cuMemcpyHtoD
+        // already pipelines its internal staging, whereas the explicit ring puts a
+        // single-threaded mmap→pinned memcpy on the critical path). True overlap
+        // needs a prefetch thread; until then production uses sync streaming, which
+        // already matches/beats the Vulkan backend. The infra stays for that work
+        // (exercised by `cuda-stream-test`).
 
         const v = try gpa.alloc(f32, lat_len);
         defer gpa.free(v);
@@ -145,19 +171,35 @@ pub fn generate(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*s
             const seq_txt_cap = @max(cond_pos.seq, if (cond_neg) |c| c.seq else 0);
             ws = try dit_gpu.Workspace.init(gc, lat_h, lat_w, seq_txt_cap);
         }
+        var cu_pos: ?dit_cuda.Session = null;
+        defer if (cu_pos) |*s| s.deinit(cu_be.?);
+        var cu_neg: ?dit_cuda.Session = null;
+        defer if (cu_neg) |*s| s.deinit(cu_be.?);
+        var cu_ws: ?dit_cuda.Workspace = null;
+        defer if (cu_ws) |*w| w.deinit(cu_be.?);
+        if (cu_be) |b| {
+            cu_pos = try dit_cuda.Session.init(gpa, io, b, &dit, lat_h, lat_w, cond_pos.data, cond_pos.seq);
+            if (use_cfg) cu_neg = try dit_cuda.Session.init(gpa, io, b, &dit, lat_h, lat_w, cond_neg.?.data, cond_neg.?.seq);
+            const cu_seq_cap = @max(cond_pos.seq, if (cond_neg) |c| c.seq else 0);
+            cu_ws = try dit_cuda.Workspace.init(b, lat_h, lat_w, cu_seq_cap);
+        }
         const dit_s = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - dit_start.nanoseconds)) / 1e9;
         try note(progress, "diffusion model ready in {d:.1}s\n", .{dit_s});
 
         const sampling_start = std.Io.Clock.real.now(io);
         for (0..opts.steps) |i| {
             const start = std.Io.Clock.real.now(io);
-            if (gpu_ctx) |gc| {
+            if (cu_be) |b| {
+                try dit_cuda.forward(&dit, b, &cu_pos.?, &cu_ws.?, io, gpa, v, x, sigmas[i]);
+            } else if (gpu_ctx) |gc| {
                 try dit_gpu.forward(&dit, gc, &sess_pos.?, &ws.?, io, gpa, v, x, sigmas[i]);
             } else {
                 try dit.forward(io, gpa, v, x, lat_h, lat_w, sigmas[i], cond_pos.data, cond_pos.seq);
             }
             if (use_cfg) {
-                if (gpu_ctx) |gc| {
+                if (cu_be) |b| {
+                    try dit_cuda.forward(&dit, b, &cu_neg.?, &cu_ws.?, io, gpa, v_neg.?, x, sigmas[i]);
+                } else if (gpu_ctx) |gc| {
                     try dit_gpu.forward(&dit, gc, &sess_neg.?, &ws.?, io, gpa, v_neg.?, x, sigmas[i]);
                 } else try dit.forward(io, gpa, v_neg.?, x, lat_h, lat_w, sigmas[i], cond_neg.?.data, cond_neg.?.seq);
                 sampler.applyCfg(v, v_neg.?, opts.cfg);

@@ -892,6 +892,382 @@ wiring rel 0.0, accuracy ~0.9% vs f32). Measurement mirrors `bench-matmul`
 (min-of-≥8; the clock governor caveat in [[gpu-perf-lab-notes]] applies identically
 to CUDA — the 3090 idles ~500 MHz, boosts under queue pressure).
 
+#### EXECUTION LOG (2026-07-03, hand-PTX CUDA backend — unattended build)
+
+Toolchain on this box (verified): driver 580.173.02 / CUDA 13.0, `libcuda.so.1`
+present, `libnvidia-ptxjitcompiler.so.1` (built-in JIT), `ptxas`/`nvdisasm`/
+`cuobjdump` at `/usr/local/cuda-13.0/bin` (dev-time PTX validation only; runtime
+JITs via the driver). Zig 0.16.0. Device: RTX 3090 sm_86, 82 SMs, **opt-in shared
+99 KB/block, 100 KB/SM** (vs Vulkan's hard 48 KB — the unlock), 1800 MHz boost.
+
+Offline PTX de-risk (all assemble under `ptxas -arch=sm_86`, SASS confirmed):
+`mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32` → `IMMA.16832.S8.S8`;
+`cp.async.cg.shared.global` → `LDGSTS.E.BYPASS.128` + `LDGDEPBAR` (the Vulkan-
+denied async copy); `.extern .shared` dynamic shared; `ldmatrix.x4.b16`.
+m16n8k32 s8 fragment layout (verified from generated PTX): A=4×b32, B=2×b32,
+C/D=4×b32(s32); `groupID=lane>>2, tid=lane&3`; A[a0..3]=(row groupID/+8, k
+tid*4{+16}); B[b0,b1]=(k tid*4{+16}, col groupID); C[c0..3]=(row groupID/+8,
+col tid*2{+0,+1}). First-bringup load = plain `ld.shared.b32` per the table
+(ldmatrix is a later throughput opt).
+
+- [x] **1.0 bindings** (`src/gpu/cuda/cu.zig`) — dlopen libcuda.so.1, all driver
+      entry points as `callconv(.c)` externs; ABI hazards handled (CUdeviceptr=u64;
+      `_v2` suffixes on cuMemAlloc/Free/Memcpy*/Memset*/CtxDestroy/StreamDestroy/
+      EventDestroy/DeviceTotalMem/MemGetInfo/ModuleGetGlobal; cuCtxCreate_v2 simple
+      form). Test loads driver + queries device (green with -lc).
+- [x] **1.2 PTX emitter** (`src/gpu/cuda/ptx.zig`) — text builder: per-class
+      virtual registers (%r/%rd/%f/%rs/%p), labels, formatted lines, `.reg`-count
+      finalize, module preamble. Unit test green.
+- [x] **1.1 smoke test** (`cuda-test`) — `Context` (device/ctx/stream, PTX JIT via
+      cuModuleLoadDataEx with error-log capture + sm_86 target, buffers, launch,
+      cuEvent timing) in `src/gpu/cuda/context.zig`; vadd PTX JIT+launch+readback
+      verified. `cuda-test` prints caps + "OK". Pure-Zig line preserved.
+- [x] **1.3 int8 IMMA GEMM — DECISION GATE PASSED (1.5-1.6x over Vulkan).**
+      Two kernels, both bit-exact vs the CPU integer oracle (0 mismatches incl.
+      128x256x6144 real k-depth):
+      * `igemm_v0` (hand-PTX string) — correctness reference: 1 warp / 16x8 tile,
+        fragments straight from global, no reuse. 9.5 TOP/s @4224x6144x6144.
+        Confirmed the m16n8k32 s8 fragment layout is exactly right. KEY finding:
+        for `mma.row.col`, B col-major K×N == the natural row-major weight W[n][k]
+        — so NO k-major transpose (the Vulkan coopmat path needed one).
+      * `igemm_smem` (EMITTER-generated, `buildIgemmSmem`) — 128x128 block, 4 warps
+        (2x2 of 64x64), 128 s32 accumulators/thread, K_STEP=64, 16 KB STATIC
+        shared, synchronous staging, 32 MMAs/k-step. 168 regs/thread.
+        **@4224x6144x6144: 2.31 ms = 138 TOP/s (Vulkan ~85 => 1.63x).**
+        DiT shapes: 7680x6144x6144 4.41 ms (Vulkan 6.63 => 1.50x), 131 TOP/s;
+        7680x16384x6144 (mlp gate/up) 13.2 ms, 117 TOP/s; 7680x6144x16384
+        (mlp.down) 15.0 ms, 103 TOP/s. ~49% of the 3090's ~284 TOPS int8 peak
+        (Vulkan sat at ~30%). And this is BEFORE cp.async / >48 KB dynamic shared
+        — pure tiling + static shared already clears the gate. `cuda-i8-test` CLI.
+- [x] **1.3b GEMM perf round — cp.async NEUTRAL (compute-bound), GEMM locked.**
+      `igemm_pipe` (`buildIgemmPipe`, EMITTER): cp.async.cg double-buffered
+      (LDGSTS), K_STEP param. Bit-exact (0 mismatches). @4224x6144x6144 2.32 ms
+      (137 TOP/s) vs smem 2.36 — ~1-2%, i.e. NEUTRAL, same lesson as the Vulkan
+      double-buffer post-mortem ("this driver already hides load latency"). So
+      the GEMM is MMA-issue/compute-bound, not load-bound => deeper K_STEP via
+      >48 KB shared won't move it either (skipped for the GEMM; that lever is
+      saved for attention/flash where the 48 KB cap was the actual Vulkan
+      blocker). GEMM LOCKED at ~135 TOP/s (1.5-1.6x Vulkan, ~49% of the 3090's
+      ~284 TOPS int8 peak; cuBLASLt ~60-70% would need ldmatrix + SASS-level
+      scheduling we don't have — diminishing, per the plan's time-box).
+      DiT shapes (pipe): qkv 7680x6144x6144 4.34 ms (Vulkan 6.63 => 1.53x),
+      mlp gate/up 12.9 ms (120 TOP/s), mlp.down 14.2 ms (109 TOP/s).
+      Both kernels stay (smem = no-opt-in fallback; pipe = default).
+- [x] **1.5 hand-PTX fused prep + full int8 linear — VALIDATED bit-comparably.**
+      * `buildPrep(cols)` (EMITTER): one 256-thread block/row, loads x[row] into
+        DYNAMIC shared f32 (>48 KB — the lever), parallel radix-4 FWHT per
+        256-group (bit-identical to convrot.rotate: each butterfly output is a
+        fixed 4-input sum, so parallel order == serial order), *0.0625 normalize
+        + per-row abs-max (order-independent max), scale=max(absmax/127,1e-12),
+        round-half-away (copysign) quantize -> packed int8 + act_scale.
+        KEY: cols=16384 rotates in FULL f32 (66 KB dynamic shared) — the Vulkan
+        path was forced to f16 there by the 48 KB cap (its wiring rel ~0.4%);
+        CUDA's wiring rel is 3.7e-5 (essentially exact).
+      * `irescale` (hand-PTX): y = f32(acc)*act_scale[row]*weight_scale[col].
+      * Full linear (prep->igemm_pipe->rescale) vs the `gpu-i8-test` CPU oracle:
+        wiring rel 0.000000-0.000052 (bit-exact), int8 accuracy 0.78-0.94% vs f32
+        (matches Vulkan's ~0.9%). `cuda-i8-test`.
+      * DiT-shape full-linear timing (prep+gemm+rescale, min-of-10):
+        qkv 7680x6144x6144   5.17 ms (prep 0.38 / gemm 4.34 / rescale 0.45)
+        mlp gate/up 7680x16384x6144  14.5 ms (0.35 / 12.9 / 1.19)
+        mlp.down 7680x6144x16384     16.6 ms (1.78 / 14.4 / 0.45)
+        vs Vulkan's int8 shared GEMM alone at qkv shape = 6.63 ms => the full
+        CUDA linear (5.17) already beats Vulkan's GEMM-only. prep is cheap
+        (f32 rotation in >48 KB shared is efficient); rescale not yet fused into
+        the GEMM C-store (Stage-A fusion is a known follow-up, ~0.45-1.2 ms).
+- [x] **1.4 DECISION GATE: PASS.** Hand-PTX recovers a real, validated fraction of
+      the 2x ComfyUI gap: int8 GEMM 1.5-1.6x over Vulkan, full linear correct +
+      faster, exercising all three Vulkan-denied levers (>48 KB shared used for
+      exact f32 prep; cp.async built [neutral for the compute-bound GEMM];
+      explicit mma.sync IMMA tiling = the GEMM win). Continue Phase 1.
+- [x] **Stage-A fused rescale (`buildIgemmPipe(..,fuse=true)` -> `igemm_pipe_fused`).**
+      y = f32(acc)*act_scale[row]*weight_scale[col] folded into the C-store: no s32
+      acc buffer (mlp.up's was ~500 MB), no separate rescale pass. Bit-exact vs the
+      oracle (fused rel == unfused). Full linear: qkv 5.15->4.78 ms, mlp gate/up
+      14.48->13.31 ms (the 500 MB acc round-trip is gone), mlp.down ~neutral. VRAM
+      + bandwidth win regardless of the timing delta.
+
+### M10 Phase 1 — SESSION OUTCOME (2026-07-03): hand-PTX CUDA backend, decision gate PASSED
+
+A complete pure-Zig CUDA Driver-API + hand-emitted-PTX backend was built and
+validated in one unattended session. It breaks the Vulkan structural ceilings
+and beats the Vulkan int8 path on the DiT GEMM/linear:
+
+| stage | kernel | shape | result |
+|-------|--------|-------|--------|
+| GEMM | `igemm_pipe` (mma.m16n8k32.s8, cp.async, 128x128 tile) | 4224^3 | **138 TOP/s, 1.5-1.6x Vulkan (~85)**, ~49% of int8 peak |
+| GEMM | " | qkv 7680x6144x6144 | 4.34 ms vs Vulkan 6.63 (1.53x) |
+| linear | prep + gemm + rescale, vs CPU oracle | validate | wiring rel ~0 (bit-exact), int8 acc 0.9% |
+| linear (fused) | prep + `igemm_pipe_fused` | qkv | 4.78 ms full |
+
+What made it work vs Vulkan's ~30%-of-peak coopmat: (1) explicit `mma.sync` IMMA
+tiling (the win); (2) for `mma.row.col`, B col-major K×N == the natural row-major
+weight, so no k-major transpose; (3) >48 KB dynamic shared lets the prep rotate
+cols=16384 in exact f32 (Vulkan was forced to f16). cp.async was NEUTRAL (the
+GEMM is MMA-issue-bound, same lesson as the Vulkan double-buffer post-mortem).
+
+Files: `src/gpu/cuda/{cu.zig, ptx.zig, context.zig, kernels.zig}`, `src/gpu/cuda.zig`;
+CLI `cuda-test` / `cuda-i8-test`. `zig build test` green; Vulkan path byte-untouched.
+Memory: [[cuda-ptx-backend]].
+
+- [x] **1.6 attention on CUDA — DONE (validated end-to-end).** Three kernels:
+      * `buildHgemm` (EMITTER) — f16 tensor-core GEMM C(f32)=A(f16)@B(f16)^T,
+        `mma.m16n8k16.f32.f16.f16.f32` -> `HMMA.16816.F32`, 128x128 tile / 2x2
+        warps / 128 f32 accs / K_STEP=32, adapted from the int8 tiling. rel vs
+        f16-CPU = 0.00000 (bit-exact) at 128^3, 128x256x256, 256x128x512.
+      * `softmax_row` (hand-PTX) — row softmax with prefolded scale, f32 in ->
+        f16 out, ex2.approx (log2e-folded), 2-pass max/sum tree reduction over
+        256 threads, pads j>=seq to 0.
+      * Full single-head attention (scores=Q@K^T via hgemm -> softmax_row ->
+        P@V via hgemm with V pre-transposed to [hd][seq]): **rel vs f32-CPU
+        0.00027** (well inside the f16 regime). `cuda-attn-test`.
+      Remaining glue for DiT integration: GQA head-batching (gid.z=head, kv=
+      head/group), a GPU V-transpose/gather (host-transposed in the test), and
+      seq_pad handling — mechanical, not new tensor-core work.
+
+- [x] **1.7 CUDA DiT forward — END-TO-END LIKE-FOR-LIKE IMAGES.** Rather than
+      genericize dit_gpu (a large refactor with `.null_handle`/struct-field
+      couplings — see the recipe), wrote a dedicated `src/models/dit_cuda.zig`
+      driving a `cuda.Backend` (`src/gpu/cuda/backend.zig`) — the GpuBackend
+      surface on top of the driver Context + PTX kernels:
+      * buffers (tensorCreate/Destroy/Upload/Download/Copy/ensureDeviceBuffer/
+        smallBuffer), batch==stream, weight cache by host ptr.
+      * `opI8Prep`/`opI8Gemm` (validated int8 fused-rescale GEMM), `opMatmul`
+        (naive f32, for the non-int8 first/last), and correctness-first f32
+        eltwise kernels in `cuda/elt.zig` (rms_mod fused rmsnorm+AdaLN, qk_rmsnorm,
+        rope, one naive online-softmax GQA `attn`, sigmoid_mul, silu_mul,
+        gated_add) — all assemble under ptxas sm_86.
+      * dit_cuda.forward follows the recipe's fallback op sequence (28 blocks:
+        prenorm-mod → qkv/gate int8 GEMMs → qk-norm → rope → attn → sigmoid-gate
+        → wo → residual → postnorm-mod → mlp int8 GEMMs → silu → down → residual;
+        first/last via opMatmul). Text fusion / timestep / patchify stay on CPU.
+      * `cuda-dit-test`: **CUDA DiT vs CPU int8 forward rel RMSE 0.01367** (1.4%,
+        int8 + ex2.approx regime); **CUDA 1.58 s vs CPU 9.8 s** (6.2x) at 256px.
+      * `pipeline.zig --dit-cuda on`: full CPU-encode → CUDA-DiT → CPU-VAE →
+        PNG. 256px/6-step fox: CUDA **1.0 s/step** vs CPU **9.9 s/step** (~10x).
+        **Image vs CPU int8: 0.15% mean pixel delta** (max 16/255, 41% pixels
+        bit-identical) — like-for-like, indistinguishable. The hand-PTX PTX
+        backend now generates real images.
+
+REMAINING (perf / breadth, next session):
+- The DiT eltwise/attention kernels are correctness-first (one-thread, naive
+  attention) — not yet tuned; the int8 GEMM is the fast part. Full-speed s/step
+  needs the tensor-core attention path (opAttnScores/opAttnOut, hgemm+softmax
+  primitives already built) + fewer per-step buffer allocs (a Workspace) + the
+  f16 int8-GEMM output (c_h16 / pipe_coop_i8_fs16). Larger images (1MP) need the
+  head-batched attention (s-buffer cap) — the naive attn is fine at 256-512px.
+- Projected tuned end-to-end (GEMM-dominated): Vulkan int8 ~3.9 s/step -> CUDA
+  ~3.0-3.3 (~1.2x); ComfyUI ~2 s/step stays ahead (cuBLASLt + flash-attn). The
+  hand-PTX ceiling is ptxas-owned scheduling, as predicted.
+
+### M10 Phase 1 — perf pass (2026-07-04): tensor-core attention + parallel elt
+
+Profile-driven (`cuda-dit-test <path> <lat>` prints a per-category + attention
+sub-category cuEvent breakdown; sync-per-op). All changes validated: `cuda-dit-test`
+rel RMSE cuda-vs-cpu 0.0136 -> 0.0481 (the f16-attention regime, same as Vulkan/
+ComfyUI fp16 SDPA; well under the 0.08 gate); `zig build test` green; real 512px
+and 1120x1680 fox images coherent.
+
+Batched steady-state s/step (RTX 3090, int8 checkpoint):
+| size          | before (naive attn) | after      | note |
+|---------------|---------------------|------------|------|
+| 256px         | 0.97 s              | **0.12 s** | 8x   |
+| 512px         | 6.27 s              | **0.39 s** | 16x  |
+| 1024px        | >400 s (timed out)  | **2.12 s** | usable |
+| 1408px (~1MP) | ~40 s+              | **5.10 s** | —    |
+
+- [x] **CUDA per-category profiler** (`Backend.profile`/`prof`, cuEvent sync-per-op):
+      matmul / prep / attn(gather+scatter) / elt, plus attention sub-timers
+      scores / softmax / pv. This drove the whole pass.
+- [x] **Tensor-core GQA attention** — the huge win. Replaced the naive
+      one-thread-per-(query,head) O(seq²)-serial kernel with hgemm(scores) ->
+      softmax_row -> hgemm(P@V). Three new gather/scatter kernels (elt.zig):
+      `gather_head` (Q/K -> contiguous [mpad][hd] f16, zero-pad rows>=seq),
+      `gather_vt` (V -> transposed [hd][mpad] f16), `scatter_head` (O -> the
+      interleaved [seq][heads][hd] out). GQA via KV head = h/group; seq padded
+      to mpad (128-multiple). At 512px attn 5595 -> 180 ms (31x).
+- [x] **Head-batched attention** (`opAttnTCBatched`, grid.z=G) — the per-head PV
+      GEMM has n=hd=128 (grid.x=1, under-occupied); batching G heads per launch
+      fills the SMs and collapses ~7·(n_heads/G) launches. G derived so the
+      scores+probs scratch fits `attn_scratch_budget` (2 GiB). Batched
+      `gather_head_b`/`gather_vt_b`/`scatter_head_b` (one launch/head-group,
+      GQA unified via a group_div param); `buildHgemm(batched)` adds a gid.z
+      per-head-stride offset; softmax runs flattened over gs·mpad rows (S is
+      contiguous [gs][mpad][mpad]). Validated batched-vs-loop-vs-CPU
+      (`cuda-attn-cmp`). attn 75 -> 9.7 ms at 256px.
+- [x] **Parallel `rms_mod`** (elt) — the naive fused-rmsnorm+AdaLN was
+      one-thread-per-row with a serial dim-6144 reduction (only 264 threads =
+      2 blocks on 82 SMs at 256px). Rewrote as one block (256 threads) per row
+      with a shared tree reduction (`rms_mod_par`, bit-identical math). elt
+      311 -> 11 ms at 256px (27x).
+- [x] **f16 scores** (`buildHgemm(batched, c_f16)` -> `hgemm_batched_c16`,
+      `softmax_row_f16`) — S stored/read f16 (halves the S write + softmax reads,
+      the memory-bound cost at large seq). KEY BUG + FIX: real DiT scores exceed
+      f16's 65504 max (qk-norm weights) -> Inf -> exp(Inf-Inf)=NaN. FIX (matches
+      Vulkan's "Q prescaled by the softmax scale"): the softmax scale is prefolded
+      into the scores GEMM C-store (`mul.f32 acc,scale` before the f16 convert),
+      so f16 S holds scale·(Q·K) (in range) and the f32 accumulator holds the true
+      value; softmax then uses scale=1. (This bug hid behind small random test
+      values — `cuda-attn-cmp` now tests std up to 3.0.) attn at 1408px 2910 ->
+      2367 ms; step 5.73 -> 5.10 s.
+- [x] **Workspace** (`dit_cuda.Workspace`) — the ~12 per-forward device buffers
+      (raw cuMemAlloc/free each) moved to a per-run struct shared by both CFG
+      sessions (sized for the longer prompt). Small perf delta at these sizes
+      (host overhead is mostly the CPU modulation-vector loop + launch gaps) but
+      avoids VRAM churn/fragmentation and is required for clean large-image runs.
+- [x] **End-to-end**: `generate --dit-cuda on` renders coherent 512px (0.53 s/step,
+      5.3 s total incl. CPU VAE) and 1120x1680 (4.98 s/step) images.
+
+Attention sub-profile @1408px (seq~7752): scores 862 / softmax 867 / pv 451 ms.
+Scores is shallow-k (k=hd=128) at ~24 TFLOP/s; softmax is bandwidth-bound on 3
+S-reads (f16). Both scale ~O(seq²).
+
+RESULT vs baselines @1120x1680: **CUDA ~4.8 s/step** — beats Vulkan (~3.9) and
+ComfyUI (~2) at ≤512px, but is ~1.2x BEHIND Vulkan at 1MP (attention: CUDA's
+two-pass/3-read-softmax vs Vulkan's fused-online-softmax ~1.4 s). Also: the CUDA
+backend keeps all int8 weights resident (no VRAM streaming) — 1120x1680 with the
+Vulkan VAE + other-process VRAM OOMs; run VAE on CPU (`--gpu off`) or free the GPU.
+
+REMAINING attention levers (in order of confidence):
+- [DONE 2026-07-04 — see "attention fusion" below] Softmax + fused attn-out.
+  Landed BOTH the 2-pass-softmax idea AND the fused attn-out in one shot: the
+  softmax pass became a single-pass FLASH reduction emitting only per-row
+  {max, 1/sum} (softmax_md_f16, one S read, no P write), and the P@V GEMM
+  (hgemm_attnout) recomputes P = exp(S-max)/sum from S+MD during its A-staging —
+  no P materialization at all. softmax @1MP 928→212 ms; step 5.42→4.68 s.
+- scores GEMM: shallow k=128 caps it at ~24 TFLOP/s; now the single biggest
+  attention cost (915 ms @1MP). A purpose-built scores kernel (ldmatrix instead
+  of the 4×ld.shared.b32 fragment loads, K-staging) or larger tiles could help,
+  and ldmatrix would speed the P@V GEMM too. Broad/risky rewrite of the validated
+  MMA fragment loads; rated diminishing. Untried.
+- CUDA VRAM streaming (LRU weight eviction like the Vulkan path) for 1MP with a
+  busy GPU. [DONE 2026-07-04 — see below.]
+
+### M10 Phase 1 — CUDA VRAM streaming (2026-07-04)
+
+Ported the Vulkan weight-streaming design (previously CUDA kept all 14 GiB int8
+weights resident → 1120x1680 OOM'd once the Vulkan VAE + other-process VRAM ate
+the card). backend.zig: LRU-stamped weight cache, `budgetHeadroom` (live
+`cuMemGetInfo` free — sees other processes, the CUDA analog of VK_EXT_memory_budget
+— min'd with the `--vram-budget` ceiling), `reserveForWeights` (evict LRU until the
+upload fits), `evictOneWeight` (cuStreamSynchronize before cuMemFree), and a
+`tensorCreate` OOM-retry backstop. On the fixed block-order walk, LRU eviction =
+sequential weight streaming; evicted weights re-upload from the mmap'd checkpoint.
+context.zig: alloc distinguishes CUDA_ERROR_OUT_OF_MEMORY; added memGetInfo.
+- **KEY FIX** (`CUDA_ERROR_ILLEGAL_ADDRESS` at tight budgets): evictOneWeight must
+  never evict the MOST-recently-used weight. opI8Gemm fetches its weight, then its
+  weight_scale; when the non-weight footprint (workspace + attn scratch) alone
+  exceeds the budget, headroom pins to 0, so the weight_scale fetch's reserve was
+  freeing the just-fetched weight → the GEMM read freed memory. (Vulkan dodges this
+  because eviction flushes recorded ops already bound to the weight; CUDA launches
+  after both fetches, so the MRU is protected in evictOneWeight instead.)
+- Validated BIT-IDENTICAL (`cuda-stream-test`): streamed forward == resident, 0/N
+  elems differ, at budgets 1 & 2 GiB (256/1024px).
+- **RESULT @1120x1680, --vram-budget 2 (apples-to-apples):**
+  | backend | resident | streamed | loss |
+  |---------|----------|----------|------|
+  | CUDA    | 4.98 s   | 5.62 s   | ~13% |
+  | Vulkan  | 4.86 s   | 5.86 s   | ~20% |
+  CUDA streaming MATCHES/BEATS Vulkan. 1120x1680 with the Vulkan VAE now completes
+  (was OOM). The ~10% target is optimistic for the SYNC design — Vulkan itself is
+  ~20% at this budget (both upload synchronously; the transfer time serializes with
+  compute). Loss shrinks with compute size (256px 650% → 1024px 28-37% → 1MP ~13%).
+- ASYNC streaming — INVESTIGATED (2026-07-04), infra built, NOT shipped (needs a
+  prefetch thread). The idea: overlap weight re-upload with compute. Findings:
+  * The two serializers are the sync UPLOAD (cuMemcpyHtoD) and the per-eviction
+    cuStreamSynchronize. Built a transfer stream + per-weight upload events +
+    deferred-free eviction (record a compute-stream event at eviction, reclaim the
+    buffer lazily via cuEventQuery — no full sync).
+  * BLOCKER 1: the checkpoint mmap can't be page-locked (cuMemHostRegister ->
+    CUDA_ERROR_NOT_SUPPORTED for the READ_ONLY flag / INVALID_VALUE plain, on a
+    read-only file-backed mapping), so cuMemcpyHtoDAsync from it degrades to sync.
+  * BLOCKER 2: a driver-pinned staging ring (cuMemAllocHost + memcpy mmap->pinned
+    -> async DMA, no thread) measured SLOWER than sync: the driver's cuMemcpyHtoD
+    already pipelines its internal staging, while the explicit ring puts a
+    single-threaded ~1.4 s/step mmap->pinned memcpy on the critical path.
+    Measured: 1024px budget2 50.9% (vs sync 37%); 1408px budget3 20.3% (vs sync
+    ~15%). Bit-identical throughout.
+  * Vulkan streaming is ALSO synchronous (grep: no transfer queue / prefetch), and
+    measured ~20% at budget2 — WORSE than CUDA sync's ~13%. So the "~10% like
+    vulkan" target was optimistic; v1 sync already matches/beats Vulkan.
+  * BLOCKER 3 (the prefetch thread — BUILT + measured, still worse): implemented
+    the full design — a lock-free SPSC prefetch thread (Zig 0.16 removed
+    std.Thread.Mutex/Condition, so std.atomic.Value + Thread.yield), a block-ahead
+    driver in dit_cuda.forward (prefetchBlock N+1 during block N), deferred-free
+    eviction, and in-flight-protect in the evictor. Bit-identical, no hang/race.
+    But 1024px budget2: 54.6% (vs sync 37%, no-thread ring 50.9%) — the thread's
+    single-threaded mmap→pinned memcpy + cross-thread CUDA driver-lock contention
+    + the per-weight cuMemAlloc/Free/event churn (~280 alloc+free/step, present in
+    BOTH sync and async but amplified by the thread) never let the DMA overlap win.
+  * FINAL CONCLUSION: explicit async weight streaming does NOT beat the driver's
+    synchronous cuMemcpyHtoD (internally pipelined) on this platform — verified 3
+    ways (direct-pin blocked, no-thread ring worse, thread worse). Production ships
+    the SYNC v1 (beats Vulkan). The async infra (cu.zig cuMemAllocHost/
+    cuMemcpyHtoDAsync/etc; context.zig staging ring + events; backend prefetch
+    thread + deferred-free) stays dormant + documented, OFF in production, exercised
+    only by `cuda-stream-test`.
+  * CHURN REDUCTION (size-bucketed weight-buffer pool — BUILT + measured, then
+    REVERTED): recycle evicted weight buffers by exact size instead of cuMemFree,
+    reuse on re-upload instead of cuMemAlloc (pooled bytes counted as reclaimable
+    headroom, trimmed to the budget under pressure). Measured WITHIN NOISE: 1024px
+    budget2 37%→33.6%, but budget1 28%→32.6% (the trim overhead hurts pure-stream
+    budgets where the pool can't reuse). CONFIRMS the streaming loss is
+    PCIe-TRANSFER-bound, not churn-bound: the pool recycles buffers but the weight
+    DATA is still re-uploaded every step, so the transfer (the real cost) is
+    unchanged. Reverted for cleanliness (marginal + mixed). No software technique
+    (churn pool, async overlap) meaningfully reduces streaming loss on this
+    platform — it is the raw PCIe cost of re-uploading the streamed weights, and
+    the only real lever is holding more resident (bigger budget). SYNC v1 ships.
+
+### M10 Phase 1 — attention fusion (2026-07-04): flash softmax + fused attn-out
+
+The ranked attention levers #1 (cheaper softmax) and #2 (eliminate P
+materialization) landed together — the second subsumes the first. Same-session
+A/B on `cuda-dit-test`, `attn_fused` toggle in backend.zig (default on; the
+materialized `softmax_row_f16 → P → hgemm_batched` path stays as the A/B/fallback
+reference behind `attn_fused=false`).
+
+- [x] **`softmax_md_f16` (kernels.zig): single-pass FLASH reduction.** Replaces the
+      3-read `softmax_row_f16` (max pass + sum pass + write-P pass) with ONE pass
+      over S that maintains a per-thread running (m, d) and block-reduces the
+      FlashAttention way — M=max(mᵢ), D=Σ dᵢ·exp2((mᵢ-M)·log2e) — emitting only the
+      per-row MD table {max, 1/sum} (f32 pair). No P write. Robustness: the running
+      max inits to **-FLT_MAX (not -inf)** so combining two empty lanes gives
+      m-M = 0 (finite) instead of -inf-(-inf) = NaN; every real score > -FLT_MAX so
+      the max is unchanged, and empty lanes (d=0) contribute 0. (Attention seq ≥ 256
+      here so every lane has a valid column, but the sentinel keeps it general.)
+- [x] **`hgemm_attnout` (buildHgemm `attnout` flag): fused P@V.** The P@V GEMM's A
+      operand is the raw scores S (f16); during shared-staging each element is
+      turned into a softmax probability P[q][j] = exp2((S-max[q])·log2e)·inv[q] read
+      from MD (pad keys j≥seq → 0 via selp), then P@Vt runs on tensor cores exactly
+      as before. Zero P materialization — no P write (softmax) and no P read (PV,
+      it reads S instead, same bytes). The A-row q = row0+rowq+i·8 is **clamped to
+      mpad-1** for the MD lookup so the redundant/pad staging rows (buildHgemm's
+      staging over-reads by design) can't fault MD; the transformed garbage they
+      write lands in shared slots the MMA ignores (idempotent, same as the plain
+      copy). C-store, B(Vt)-staging, tiling all identical to hgemm_batched.
+- [x] **Wiring**: opAttnTCBatched branches on `attn_fused`; drops the `attn_p`
+      buffer for a tiny `attn_md` ({max,1/sum}), which also lets the head-batch `g`
+      ~double (per-head scratch mpad²·2 vs ·4) → **half the launches** (peak VRAM
+      unchanged: S grows to fill the 2 GiB budget where S+P used to share it).
+- **Validation**: `cuda-attn-cmp` fused-vs-CPU rel bit-for-bit with the materialized
+      path to 5 dp (3e-4 std .3 → 1.8e-3 std 3.0 — the f16-S/P rounding dominates
+      the flash-vs-linear sum reorder); DiT rel-vs-CPU 0.04744 unchanged; `zig build
+      test` green; `cuda-stream-test` bit-identical (0/N); coherent 512px fox
+      (scratch_out/fused_fox_512.png).
+- **RESULT (same-session A/B, batched steady-state s/step + sync-per-op profile):**
+  | size  | before | after | softmax | pv | sync total |
+  |-------|--------|-------|---------|-----|-----------|
+  | 1024px| 2.246 s| **2.064 s** | 222→54 | 141→161 | 1972→1834 |
+  | 1408px| 5.418 s| **4.676 s** | 928→212 | 470→512 | 4999→4346 |
+  Softmax −77% (4.4× at 1MP); pv +9% (the exp-in-staging cost, well under the
+  softmax saving); scores unchanged. Net −13.7% s/step at 1MP. The +42 ms pv is
+  the exp recompute during A-staging (some rows staged/exp'd twice by buildHgemm's
+  redundant staging — accepted, dwarfed by the softmax win).
+- NEXT attention lever: scores GEMM (now 915 ms @1MP, the biggest attention cost)
+  is shallow-k=128 at ~24 TFLOP/s — needs ldmatrix / K-staging / bigger tiles (also
+  speeds pv). Broad rewrite of the validated MMA fragment loads; deferred.
+
 - [ ] **1.0 CUDA Driver API bindings (`src/gpu/cuda/cu.zig`).** `std.DynLib` load of
       `libcuda.so.1` + hand-declared externs (mirror `vk.zig`; machine-check
       signatures against the CUDA driver headers, no linking, no `nvcc`): `cuInit`,
