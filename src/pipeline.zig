@@ -16,9 +16,31 @@ const krea2_text = @import("models/krea2_text.zig");
 const dit_mod = @import("models/dit.zig");
 const dit_gpu = @import("models/dit_gpu.zig");
 const dit_cuda = @import("models/dit_cuda.zig");
+const qwen3_cuda = @import("models/qwen3_cuda.zig");
 const cuda = @import("gpu/cuda.zig");
 const wan_vae = @import("models/wan_vae.zig");
 const vae_gpu = @import("models/vae_gpu.zig");
+const vae_cuda = @import("models/vae_cuda.zig");
+
+/// Compute backend for the diffusion model (and, for Vulkan, the encoder + VAE):
+///  - cpu:      everything on CPU.
+///  - vulkan:   encoder / DiT / VAE GEMMs offloaded to Vulkan (falls back to CPU
+///              per-stage when the device is unavailable / out of VRAM).
+///  - zig_cuda: DiT on the hand-PTX CUDA backend (int8 convrot checkpoint only);
+///              encoder + VAE stay on CPU. `--backend zig-cuda` on the CLI.
+pub const Backend = enum {
+    cpu,
+    vulkan,
+    zig_cuda,
+
+    /// Parse a CLI value ("cpu" / "vulkan" / "zig-cuda"); null if unrecognized.
+    pub fn fromStr(s: []const u8) ?Backend {
+        if (std.mem.eql(u8, s, "cpu")) return .cpu;
+        if (std.mem.eql(u8, s, "vulkan")) return .vulkan;
+        if (std.mem.eql(u8, s, "zig-cuda")) return .zig_cuda;
+        return null;
+    }
+};
 
 pub const Options = struct {
     prompt: []const u8,
@@ -29,11 +51,8 @@ pub const Options = struct {
     cfg: f32 = 1.0,
     seed: u64 = 0,
     shift: f32 = sampler.default_shift,
-    /// Offload large GEMMs to Vulkan; falls back to CPU when unavailable.
-    use_gpu: bool = false,
-    /// Run the DiT sampling loop on the hand-PTX CUDA backend (int8 checkpoint
-    /// only). Encoder + VAE stay on CPU. Mutually exclusive with use_gpu.
-    dit_cuda: bool = false,
+    /// Compute backend for the sampling loop (and encoder/VAE where supported).
+    backend: Backend = .cpu,
     /// Cap on device memory (bytes; 0 = query the driver's live budget).
     /// Weights past the cap stream per step instead of staying resident.
     vram_budget: u64 = 0,
@@ -72,8 +91,9 @@ pub fn generate(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*s
     const use_cfg = opts.cfg != 1.0;
     const total_start = std.Io.Clock.real.now(io);
 
+    // Vulkan context (--backend vulkan): encoder / DiT / VAE GEMMs on Vulkan.
     var gpu_ctx: ?*gpu_mod.Context = null;
-    if (opts.use_gpu) {
+    if (opts.backend == .vulkan) {
         if (gpu_mod.Context.init(gpa)) |ctx| {
             gpu_ctx = ctx;
             ctx.budget_override = opts.vram_budget;
@@ -88,10 +108,13 @@ pub fn generate(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*s
         ctx.deinit();
     };
 
-    // Hand-PTX CUDA backend for the DiT sampling loop (int8 checkpoint). The
-    // encoder and VAE stay on CPU (gpu_ctx null); only the DiT runs on CUDA.
+    // Hand-PTX CUDA backend (--backend zig-cuda): the WHOLE pipeline — text
+    // encoder (qwen3_cuda), DiT sampling (dit_cuda), and VAE decode (vae_cuda) —
+    // runs on the CUDA backend. All weights stream through its cache, so
+    // --vram-budget degrades to weight streaming and it coexists with other GPU
+    // workloads via the live cuMemGetInfo budget.
     var cu_be: ?*cuda.Backend = null;
-    if (opts.dit_cuda) {
+    if (opts.backend == .zig_cuda) {
         if (cuda.Backend.init(gpa)) |b| {
             cu_be = b;
             b.budget_override = opts.vram_budget; // --vram-budget: stream weights past this cap
@@ -118,11 +141,14 @@ pub fn generate(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*s
         const load_s = @as(f64, @floatFromInt(enc_start.nanoseconds - load_start.nanoseconds)) / 1e9;
         try note(progress, "text encoder loaded in {d:.1}s\n", .{load_s});
 
-        cond_pos = try encodePrompt(io, gpa, gpu_ctx, opts.encoder_f16, &tok, &enc, opts.prompt);
-        if (use_cfg) cond_neg = try encodePrompt(io, gpa, gpu_ctx, opts.encoder_f16, &tok, &enc, opts.negative);
+        cond_pos = try encodePrompt(io, gpa, gpu_ctx, cu_be, opts.encoder_f16, &tok, &enc, opts.prompt);
+        if (use_cfg) cond_neg = try encodePrompt(io, gpa, gpu_ctx, cu_be, opts.encoder_f16, &tok, &enc, opts.negative);
         const enc_s = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - enc_start.nanoseconds)) / 1e9;
         try note(progress, "encoded prompt ({d} tokens{s}) in {d:.1}s\n", .{ cond_pos.seq, if (use_cfg) " + negative" else "", enc_s });
     }
+    // The encoder's fp8 weights are stale now (its checkpoint mapping is closed);
+    // drop them so they don't linger in the CUDA cache through DiT sampling.
+    if (cu_be) |b| b.evictWeights();
     defer gpa.free(cond_pos.data);
     defer if (cond_neg) |c| gpa.free(c.data);
 
@@ -163,14 +189,18 @@ pub fn generate(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*s
         // One workspace serves both sessions (sized for the longer text).
         var ws: ?dit_gpu.Workspace = null;
         defer if (ws) |*w| w.deinit(gpu_ctx.?);
-        if (gpu_ctx) |gc| {
+        // DiT-on-Vulkan session, only when the DiT actually runs on Vulkan. Under
+        // --backend zig-cuda, gpu_ctx exists for the encoder + VAE but the DiT runs
+        // on cu_be, so skip this unused session (a full CPU text-fusion pass + its
+        // workspace VRAM).
+        if (cu_be == null) if (gpu_ctx) |gc| {
             sess_pos = try dit_gpu.Session.init(gpa, io, gc, &dit, lat_h, lat_w, cond_pos.data, cond_pos.seq, sigmas);
             if (use_cfg) {
                 sess_neg = try dit_gpu.Session.init(gpa, io, gc, &dit, lat_h, lat_w, cond_neg.?.data, cond_neg.?.seq, sigmas);
             }
             const seq_txt_cap = @max(cond_pos.seq, if (cond_neg) |c| c.seq else 0);
             ws = try dit_gpu.Workspace.init(gc, lat_h, lat_w, seq_txt_cap);
-        }
+        };
         var cu_pos: ?dit_cuda.Session = null;
         defer if (cu_pos) |*s| s.deinit(cu_be.?);
         var cu_neg: ?dit_cuda.Session = null;
@@ -212,9 +242,12 @@ pub fn generate(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*s
         try note(progress, "sampling {d} steps in {d:.1}s ({d:.2}s/step)\n", .{ opts.steps, sampling_s, sampling_s / @as(f64, @floatFromInt(opts.steps)) });
     }
 
-    // DiT weight buffers are stale after this point; drop them so VAE
-    // weights can't collide with a recycled host pointer in the cache.
+    // DiT weight buffers are stale after this point; drop them so VAE weights
+    // can't collide with a recycled host pointer in the cache, and — under
+    // --backend zig-cuda — so the resident DiT int8 weights (~14 GiB) free the
+    // VRAM the VAE decode needs (the CUDA VAE re-uploads its own f32 weights).
     if (gpu_ctx) |ctx| ctx.evictWeights();
+    if (cu_be) |b| b.evictWeights();
 
     // Stage 3: denormalize and decode.
     {
@@ -231,7 +264,9 @@ pub fn generate(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*s
     defer st.deinit();
     var vae = try wan_vae.Decoder.load(gpa, &st);
     defer vae.deinit();
-    const planar = if (gpu_ctx) |gc|
+    const planar = if (cu_be) |b|
+        try vae_cuda.decode(&vae, b, io, gpa, x, lat_h, lat_w)
+    else if (gpu_ctx) |gc|
         vae_gpu.decode(&vae, gc, io, gpa, x, lat_h, lat_w) catch |err| switch (err) {
             // Not enough free VRAM for the decode activations (e.g. another
             // process is holding the GPU). Fall back to a pure-CPU decode:
@@ -261,14 +296,17 @@ pub fn generate(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*s
     return .{ .rgb = rgb, .width = opts.width, .height = opts.height };
 }
 
-fn encodePrompt(io: std.Io, gpa: std.mem.Allocator, gpu_ctx: ?*gpu_mod.Context, encoder_f16: bool, tok: *const tokenizer_mod.Tokenizer, enc: *const qwen3.TextEncoder, text: []const u8) !Cond {
+fn encodePrompt(io: std.Io, gpa: std.mem.Allocator, gpu_ctx: ?*gpu_mod.Context, cu_be: ?*cuda.Backend, encoder_f16: bool, tok: *const tokenizer_mod.Tokenizer, enc: *const qwen3.TextEncoder, text: []const u8) !Cond {
     var ids: std.ArrayList(u32) = .empty;
     defer ids.deinit(gpa);
     try krea2_text.buildIds(tok, gpa, text, &ids);
 
-    // GPU-resident encode (batched, keeps the device saturated) when Vulkan
-    // is up; the CPU forward is the fallback (and used on any GPU error).
-    const full = if (gpu_ctx) |gc|
+    // GPU-resident encode (batched, keeps the device saturated): the CUDA
+    // backend when active, else Vulkan; the CPU forward is the fallback (and
+    // used on any GPU error).
+    const full = if (cu_be) |b|
+        qwen3_cuda.encode(enc, b, io, gpa, ids.items) catch try enc.encode(io, gpa, ids.items)
+    else if (gpu_ctx) |gc|
         qwen3_gpu.encode(enc, gc, io, gpa, ids.items, encoder_f16) catch try enc.encode(io, gpa, ids.items)
     else
         try enc.encode(io, gpa, ids.items);

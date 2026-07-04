@@ -47,6 +47,13 @@ pub fn main(init: std.process.Init) !void {
         try cudaTest(arena, stdout);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-i8-test")) {
         try cudaI8Test(arena, io, stdout);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-fp8-test")) {
+        try cudaFp8Test(arena, stdout);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-encode-test")) {
+        try cudaEncodeTest(arena, io, stdout);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-vae-test")) {
+        const zh: usize = if (args.len >= 3) (std.fmt.parseInt(usize, args[2], 10) catch 16) else 16;
+        try cudaVaeTest(arena, io, stdout, zh);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-dit-test")) {
         const path = if (args.len >= 3) args[2] else "models/diffusion_model/krea2CenterSemiraw_v10Int8.safetensors";
         const lat: usize = if (args.len >= 4) (std.fmt.parseInt(usize, args[3], 10) catch 32) else 32;
@@ -96,7 +103,11 @@ pub fn main(init: std.process.Init) !void {
             \\      --cfg 1.0          guidance scale (1.0 = no negative pass)
             \\      --seed 0           noise seed
             \\      --shift 1.15       flow-matching sigma shift
-            \\      --gpu off          offload large GEMMs to Vulkan (on/off)
+            \\      --backend cpu      compute backend: cpu | vulkan | zig-cuda.
+            \\                         vulkan offloads encoder/DiT/VAE GEMMs to
+            \\                         Vulkan; zig-cuda runs the whole pipeline
+            \\                         (encoder + DiT + VAE) on the hand-PTX CUDA
+            \\                         backend (needs an int8 convrot --dit ckpt)
             \\      --vram-budget 0    GiB of device memory to use (0 = ask the
             \\                         driver); weights past it stream per step
             \\      --encoder-f16 off  run the text encoder GEMMs on tensor
@@ -394,6 +405,179 @@ fn cudaI8Test(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
 /// validated per-head loop (opAttnTCLoop) on identical random Q/K/V, at a
 /// no-padding size (seq=256) and a padded one (seq=264). Both should match a CPU
 /// GQA attention reference. Pinpoints the batched-path bug.
+/// Validate the CUDA fp8-e4m3 GEMM (opMatmulFp8) against a CPU reference that
+/// dequantizes the same fp8 bytes through the e4m3 LUT: y[m][rows] = x @ Wᵀ.
+fn cudaFp8Test(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    var be = cuda.Backend.init(arena) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    try stdout.print("cuda device: {s}\n", .{be.deviceName()});
+    const cases = [_][3]usize{ .{ 130, 512, 256 }, .{ 264, 2560, 4096 }, .{ 8, 1024, 2560 } };
+    for (cases) |c| {
+        const m = c[0];
+        const rows = c[1];
+        const cols = c[2];
+        const mpad = std.mem.alignForward(usize, m, 128);
+        var prng = std.Random.DefaultPrng.init(99);
+        const rnd = prng.random();
+        const x = try arena.alloc(f32, m * cols);
+        for (x) |*v| v.* = rnd.floatNorm(f32) * 0.5;
+        const w = try arena.alloc(u8, rows * cols);
+        for (w) |*b| {
+            b.* = rnd.int(u8);
+            if (b.* == 0x7f) b.* = 0; // avoid the two e4m3 NaN encodings
+            if (b.* == 0xff) b.* = 0x80;
+        }
+        const scale: f32 = 0.35;
+
+        var xd = try be.tensorCreate(x.len * 4);
+        defer be.tensorDestroy(&xd);
+        try be.tensorUpload(xd, std.mem.sliceAsBytes(x));
+        var yd = try be.tensorCreate(mpad * rows * 4);
+        defer be.tensorDestroy(&yd);
+        try be.opMatmulFp8(yd, xd, m, w, scale, rows, cols);
+        try be.endBatch();
+        const y = try arena.alloc(f32, mpad * rows);
+        try be.tensorDownload(yd, std.mem.sliceAsBytes(y));
+
+        var num: f64 = 0;
+        var den: f64 = 0;
+        for (0..m) |i| {
+            for (0..rows) |r| {
+                var acc: f64 = 0;
+                for (0..cols) |cc| {
+                    const wv = TensorPencil.dtype.f8e4m3ToF32(w[r * cols + cc]) * scale;
+                    acc += @as(f64, x[i * cols + cc]) * wv;
+                }
+                const d = @as(f64, y[i * rows + r]) - acc;
+                num += d * d;
+                den += acc * acc;
+            }
+        }
+        try stdout.print("fp8 gemm m={d} rows={d} cols={d}: rel RMSE {d:.5}\n", .{ m, rows, cols, @sqrt(num / den) });
+        try stdout.flush();
+    }
+}
+
+/// Validate the CUDA text encoder (qwen3_cuda) against the CPU encode on the
+/// same prompt: proves the fp8 GEMM + rope_half + causal attention + norm chain
+/// produce a like-for-like Krea 2 conditioning stack.
+/// Validate the CUDA VAE decode (vae_cuda) against the CPU decode on a random
+/// latent: proves the im2col conv + vae_norm + tensor-core mid attention chain.
+fn cudaVaeTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, zh: usize) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    const wan_vae = TensorPencil.models.wan_vae;
+    const vae_cuda = TensorPencil.models.vae_cuda;
+    const vae_path = "models/vae/krea2RealVae_v10.safetensors";
+    std.Io.Dir.cwd().access(io, vae_path, .{}) catch {
+        try stdout.print("cuda-vae-test needs the VAE checkpoint\n", .{});
+        return;
+    };
+    const zw = zh;
+    var prng = std.Random.DefaultPrng.init(7);
+    const rnd = prng.random();
+    const z = try arena.alloc(f32, wan_vae.latent_channels * zh * zw);
+    for (z) |*v| v.* = rnd.floatNorm(f32);
+
+    var st = try TensorPencil.SafeTensors.open(arena, io, vae_path);
+    defer st.deinit();
+    var dec = try wan_vae.Decoder.load(arena, &st);
+    defer dec.deinit();
+
+    const want = try dec.decode(io, arena, z, zh, zw);
+
+    var be = cuda.Backend.init(arena) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    try stdout.print("== cuda-vae-test zh={d} ({d}x{d} px) ==\ncuda device: {s}\n", .{ zh, zh * 8, zw * 8, be.deviceName() });
+
+    const got0 = try vae_cuda.decode(&dec, be, io, arena, z, zh, zw);
+    arena.free(got0);
+    var best: f64 = std.math.inf(f64);
+    for (0..3) |_| {
+        const a = std.Io.Clock.real.now(io);
+        const g = try vae_cuda.decode(&dec, be, io, arena, z, zh, zw);
+        const b = std.Io.Clock.real.now(io);
+        arena.free(g);
+        best = @min(best, @as(f64, @floatFromInt(b.nanoseconds - a.nanoseconds)) / 1e6);
+    }
+    const got = try vae_cuda.decode(&dec, be, io, arena, z, zh, zw);
+
+    var max_err: f32 = 0;
+    var num: f64 = 0;
+    var den: f64 = 0;
+    for (want, got) |e, a| {
+        max_err = if (std.math.isNan(a)) std.math.inf(f32) else @max(max_err, @abs(e - a));
+        num += (@as(f64, e) - a) * (@as(f64, e) - a);
+        den += @as(f64, e) * e;
+    }
+    try stdout.print("cuda decode: {d:.3} s (best of 3)\n", .{best / 1000.0});
+    try stdout.print("cuda-vs-cpu: max_err={d:.6} rel RMSE={d:.6}\n", .{ max_err, @sqrt(num / den) });
+    try stdout.flush();
+}
+
+fn cudaEncodeTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    const qwen3 = TensorPencil.models.qwen3;
+    const qwen3_cuda = TensorPencil.models.qwen3_cuda;
+    const krea2_text = TensorPencil.models.krea2_text;
+    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    std.Io.Dir.cwd().access(io, te_path, .{}) catch {
+        try stdout.print("cuda-encode-test needs the text encoder checkpoint\n", .{});
+        return;
+    };
+    var tok = try TensorPencil.tokenizer.Tokenizer.init(arena);
+    defer tok.deinit();
+    var ids: std.ArrayList(u32) = .empty;
+    try krea2_text.buildIds(&tok, arena, "a fluffy orange cat sitting on a windowsill", &ids);
+
+    var st = try TensorPencil.SafeTensors.open(arena, io, te_path);
+    defer st.deinit();
+    var enc = try qwen3.TextEncoder.load(arena, &st);
+    defer enc.deinit();
+
+    const want = try enc.encode(io, arena, ids.items);
+
+    var be = cuda.Backend.init(arena) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    try stdout.print("== cuda-encode-test ({d} tokens) ==\ncuda device: {s}\n", .{ ids.items.len, be.deviceName() });
+
+    // warm-up (JIT + weight upload), then timed.
+    const got0 = try qwen3_cuda.encode(&enc, be, io, arena, ids.items);
+    arena.free(got0);
+    var best: f64 = std.math.inf(f64);
+    for (0..3) |_| {
+        const a = std.Io.Clock.real.now(io);
+        const g = try qwen3_cuda.encode(&enc, be, io, arena, ids.items);
+        const b = std.Io.Clock.real.now(io);
+        arena.free(g);
+        best = @min(best, @as(f64, @floatFromInt(b.nanoseconds - a.nanoseconds)) / 1e6);
+    }
+    const got = try qwen3_cuda.encode(&enc, be, io, arena, ids.items);
+
+    var max_err: f32 = 0;
+    var max_val: f32 = 0;
+    var num: f64 = 0;
+    var den: f64 = 0;
+    for (want, got) |e, a| {
+        max_err = if (std.math.isNan(a)) std.math.inf(f32) else @max(max_err, @abs(e - a));
+        max_val = @max(max_val, @abs(e));
+        num += (@as(f64, e) - a) * (@as(f64, e) - a);
+        den += @as(f64, e) * e;
+    }
+    try stdout.print("cuda encode: {d:.3} s (best of 3)\n", .{best / 1000.0});
+    try stdout.print("cuda-vs-cpu: max_err={d:.5} rel RMSE={d:.5} (max|v|={d:.1})\n", .{ max_err, @sqrt(num / den), max_val });
+    try stdout.flush();
+}
+
 fn cudaAttnCmp(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
     const cuda = TensorPencil.gpu.cuda;
     var be = cuda.Backend.init(arena) catch |err| {
@@ -665,6 +849,10 @@ fn cudaDitTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []con
 }
 
 fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const []const u8) !void {
+    // Flush buffered output on any error return so arg-validation messages
+    // ("unknown backend ...", "--prompt is required", ...) actually reach the
+    // terminal before the error unwinds past main's final flush.
+    errdefer stdout.flush() catch {};
     var opts: TensorPencil.pipeline.Options = .{ .prompt = "" };
     var out_path: []const u8 = "out.png";
     var i: usize = 0;
@@ -693,10 +881,11 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
             opts.shift = try std.fmt.parseFloat(f32, val);
         } else if (std.mem.eql(u8, flag, "--profile")) {
             TensorPencil.models.dit_gpu.profile = std.mem.eql(u8, val, "on") or std.mem.eql(u8, val, "1");
-        } else if (std.mem.eql(u8, flag, "--gpu")) {
-            opts.use_gpu = std.mem.eql(u8, val, "on") or std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
-        } else if (std.mem.eql(u8, flag, "--dit-cuda")) {
-            opts.dit_cuda = std.mem.eql(u8, val, "on") or std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
+        } else if (std.mem.eql(u8, flag, "--backend")) {
+            opts.backend = TensorPencil.pipeline.Backend.fromStr(val) orelse {
+                try stdout.print("unknown backend '{s}' (expected: cpu, vulkan, zig-cuda)\n", .{val});
+                return error.InvalidArgs;
+            };
         } else if (std.mem.eql(u8, flag, "--vram-budget")) {
             const gib = try std.fmt.parseFloat(f64, val);
             opts.vram_budget = @intFromFloat(gib * (1 << 30));

@@ -228,7 +228,7 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
         if (use_tc_attn)
             try be.opAttnTC(q_d, k_d, v_d, attn_d, seq, heads, kv_heads, hd, attn_scale)
         else
-            try be.attn(q_d, k_d, v_d, attn_d, seq, heads, kv_heads, hd, attn_scale);
+            try be.attn(q_d, k_d, v_d, attn_d, seq, heads, kv_heads, hd, attn_scale, false);
         try be.sigmoidMul(attn_d, g_d, seq * F);
         try be.opI8Prep(attn_d, seq, blk.attn.wo.cols);
         try be.opI8Gemm(t1_d, blk.attn.wo.bytes, blk.attn.wo.row_scale.?, blk.attn.wo.rows, false);

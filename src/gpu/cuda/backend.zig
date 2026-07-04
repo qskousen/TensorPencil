@@ -13,6 +13,7 @@ const cu = @import("cu.zig");
 const ctxmod = @import("context.zig");
 const kernels = @import("kernels.zig");
 const elt = @import("elt.zig");
+const dtypes = @import("../../dtype.zig");
 
 const Context = ctxmod.Context;
 
@@ -137,6 +138,20 @@ pub const Backend = struct {
     pf_shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     pf_gen: u64 = 0, // last assigned generation (main-only)
 
+    // fp8-e4m3 GEMM state (opMatmulFp8): the 256-entry e4m3->f32 LUT (uploaded
+    // once), and reused f16 scratch for the decoded weight + converted activations.
+    // Weights stay fp8 in the cache (streaming-friendly); decoded per GEMM into
+    // w16 scratch, activations converted into a16, then the validated f16 buildHgemm.
+    fp8_lut: DeviceBuffer = .{},
+    fp8_w16: DeviceBuffer = .{},
+    fp8_a16: DeviceBuffer = .{},
+
+    // f16 tensor-core VAE conv scratch (opConvF16): padded f16 weight + activation
+    // and the f32 GEMM output, reused across convs.
+    conv_w16: DeviceBuffer = .{},
+    conv_a16: DeviceBuffer = .{},
+    conv_c: DeviceBuffer = .{},
+
     // int8 prep state (opI8Prep -> opI8Gemm contract).
     i8_x: DeviceBuffer = .{},
     i8_scale: DeviceBuffer = .{},
@@ -253,6 +268,12 @@ pub const Backend = struct {
         for (self.elt_mods.items) |m| m.unload(self.ctx);
         self.elt_mods.deinit(self.gpa);
         self.elt_fns.deinit(self.gpa);
+        self.tensorDestroy(&self.fp8_lut);
+        self.tensorDestroy(&self.fp8_w16);
+        self.tensorDestroy(&self.fp8_a16);
+        self.tensorDestroy(&self.conv_w16);
+        self.tensorDestroy(&self.conv_a16);
+        self.tensorDestroy(&self.conv_c);
         self.tensorDestroy(&self.i8_x);
         self.tensorDestroy(&self.i8_scale);
         self.tensorDestroy(&self.attn_qh);
@@ -504,6 +525,20 @@ pub const Backend = struct {
         return (try self.cachedWeight(bytes)).buf;
     }
 
+    /// Free the tensor-core attention scratch (the ~seq² scores plane dominates).
+    /// The VAE calls this after its mid-block attention so the plane doesn't stay
+    /// resident through the 8× upsampling. Syncs first (recorded ops may read it).
+    pub fn freeAttnScratch(self: *Backend) void {
+        _ = self.ctx.api.cuStreamSynchronize(self.ctx.stream);
+        self.tensorDestroy(&self.attn_qh);
+        self.tensorDestroy(&self.attn_kh);
+        self.tensorDestroy(&self.attn_vth);
+        self.tensorDestroy(&self.attn_s);
+        self.tensorDestroy(&self.attn_p);
+        self.tensorDestroy(&self.attn_md);
+        self.tensorDestroy(&self.attn_oh);
+    }
+
     pub fn evictWeights(self: *Backend) void {
         _ = self.ctx.api.cuStreamSynchronize(self.ctx.stream);
         self.drainPending();
@@ -679,6 +714,57 @@ pub const Backend = struct {
         self.ctx.launch(f, .{ (total + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, 0, &pg) catch return error.CudaError;
     }
 
+    /// fp8-e4m3 GEMM: y[m][rows] f32 = x[m][cols] f32 @ Wᵀ, W fp8-e4m3 [rows][cols]
+    /// with a per-tensor `scale`. The fp8 weight streams through the cache; it is
+    /// decoded to an f16 scratch (dequant_fp8_f16, scale folded), the activations
+    /// are converted to f16 with the m→128 pad zeroed, and the validated f16
+    /// buildHgemm produces the f32 output. rows,cols must be multiples of 128,32.
+    /// (No y_off / bias — the text encoder writes each GEMM to its own buffer.)
+    pub fn opMatmulFp8(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, w_bytes: []const u8, scale: f32, rows: usize, cols: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.matmul);
+        if (self.fp8_lut.buf == .null_handle) {
+            self.fp8_lut = try self.tensorCreate(256 * 4);
+            try self.tensorUpload(self.fp8_lut, std.mem.sliceAsBytes(&dtypes.f8_e4m3_to_f32_table));
+        }
+        const w_db = try self.cachedWeight(w_bytes); // fp8 bytes, streams via the cache
+        const mpad = std.mem.alignForward(usize, m, 128);
+        try self.ensureDeviceBuffer(&self.fp8_w16, rows * cols * 2);
+        try self.ensureDeviceBuffer(&self.fp8_a16, mpad * cols * 2);
+        const f_deq = try self.eltFn(elt.dequant_fp8_f16_ptx, "dequant_fp8_f16");
+        try self.eltLaunch(f_deq, w_db, self.fp8_lut, self.fp8_w16, null, .{ @intCast(rows * cols), 0, 0, 0, 0, 0 }, .{ scale, 0 }, rows * cols);
+        const f_cvt = try self.eltFn(elt.f32_to_f16_ptx, "f32_to_f16");
+        try self.eltLaunch(f_cvt, x, self.fp8_a16, null, null, .{ @intCast(mpad * cols), @intCast(m * cols), 0, 0, 0, 0 }, .{ 0, 0 }, mpad * cols);
+        // C[mpad][rows] = A[mpad][cols] @ B[rows][cols]ᵀ  (m=mpad, n=rows, k=cols)
+        const f_hg = try self.hgemmFn();
+        try self.launchHgemm(f_hg, self.fp8_a16, self.fp8_w16, y, mpad, rows, cols);
+    }
+
+    /// f16 tensor-core conv/GEMM for the VAE: y[m][co] f32 = x[m][k] f32 @ Wᵀ + bias,
+    /// W f32 [co][k]. Weight and activation convert to f16 zero-padded to the coop
+    /// tile (co→128-mult, k→32-mult, m→128), the validated buildHgemm produces a
+    /// padded f32 tile, and bias_compact strips the pad + adds bias into `dst` at
+    /// `dst_off_elems`. Much faster than the f32 GEMM for the large (co≥96) convs.
+    pub fn opConvF16(self: *Backend, dst: DeviceBuffer, dst_off_elems: usize, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: []const f32) Error!void {
+        self.ptic();
+        defer self.ptoc(.matmul);
+        const co_pad = std.mem.alignForward(usize, co, 128);
+        const k_pad = std.mem.alignForward(usize, k, 32);
+        const m_pad = std.mem.alignForward(usize, m, 128);
+        const w_db = try self.cachedWeight(w_bytes);
+        const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias));
+        try self.ensureDeviceBuffer(&self.conv_w16, co_pad * k_pad * 2);
+        try self.ensureDeviceBuffer(&self.conv_a16, m_pad * k_pad * 2);
+        try self.ensureDeviceBuffer(&self.conv_c, m_pad * co_pad * 4);
+        const f_pad = try self.eltFn(elt.f32_to_f16_pad2d_ptx, "f32_to_f16_pad2d");
+        try self.eltLaunch(f_pad, w_db, self.conv_w16, null, null, .{ @intCast(co_pad * k_pad), @intCast(k_pad), @intCast(co), @intCast(k), 0, 0 }, .{ 0, 0 }, co_pad * k_pad);
+        try self.eltLaunch(f_pad, src, self.conv_a16, null, null, .{ @intCast(m_pad * k_pad), @intCast(k_pad), @intCast(m), @intCast(k), 0, 0 }, .{ 0, 0 }, m_pad * k_pad);
+        const f_hg = try self.hgemmFn();
+        try self.launchHgemm(f_hg, self.conv_a16, self.conv_w16, self.conv_c, m_pad, co_pad, k_pad);
+        const f_bc = try self.eltFn(elt.bias_compact_ptx, "bias_compact");
+        try self.eltLaunch(f_bc, self.conv_c, b_db, dst, null, .{ @intCast(m * co), @intCast(co), @intCast(co_pad), @intCast(dst_off_elems), 0, 0 }, .{ 0, 0 }, m * co);
+    }
+
     /// Rotate + per-row dynamic quantize x[m][cols] -> internal i8_x (s8) +
     /// i8_scale (per-row f32), padding m up to 128. Consumed by opI8Gemm.
     pub fn opI8Prep(self: *Backend, x: DeviceBuffer, m: usize, cols: usize) Error!void {
@@ -787,12 +873,51 @@ pub const Backend = struct {
         try self.eltLaunch(f, qk, null, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), 0, 0 }, .{ 0, 0 }, total);
     }
 
-    /// naive GQA attention, online softmax, f32. out[q][h][c].
-    pub fn attn(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, seq: usize, n_heads: usize, kv_heads: usize, hd: usize, scale: f32) Error!void {
+    /// naive GQA attention, online softmax, f32. out[q][h][c]. `causal` masks
+    /// keys j>q (each query attends only to itself and earlier tokens) — the
+    /// text-encoder path; the DiT passes false.
+    pub fn attn(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, seq: usize, n_heads: usize, kv_heads: usize, hd: usize, scale: f32, causal: bool) Error!void {
         self.ptic();
         defer self.ptoc(.attn);
         const f = try self.eltFn(elt.attn_ptx, "attn");
-        try self.eltLaunch(f, q, k, v, out, .{ @intCast(seq), @intCast(n_heads), @intCast(kv_heads), @intCast(hd), 0, 0 }, .{ scale, 0 }, seq * n_heads);
+        try self.eltLaunch(f, q, k, v, out, .{ @intCast(seq), @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intFromBool(causal), 0 }, .{ scale, 0 }, seq * n_heads);
+    }
+
+    /// rotate-half RoPE in place. total = rows*n_heads*half.
+    pub fn ropeHalf(self: *Backend, qk: DeviceBuffer, freqs: DeviceBuffer, rows: usize, n_heads: usize, half: usize, sin_off: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const f = try self.eltFn(elt.rope_half_ptx, "rope_half");
+        const total = rows * n_heads * half;
+        try self.eltLaunch(f, qk, null, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), 0, 0 }, .{ 0, 0 }, total);
+    }
+
+    /// a += b, in place (plain residual add). total = element count.
+    pub fn opAdd(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, total: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const f = try self.eltFn(elt.add_ptx, "add");
+        try self.eltLaunch(f, a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+    }
+
+    /// VAE per-position channel L2 norm (+ optional fused silu). x/out [n][c]
+    /// channel-last, gamma [c]. One thread per position.
+    pub fn opVaeNorm(self: *Backend, x: DeviceBuffer, out: DeviceBuffer, gamma: DeviceBuffer, n: usize, c: usize, silu: bool) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const f = try self.eltFn(elt.vae_norm_ptx, "vae_norm");
+        try self.eltLaunch(f, x, out, gamma, null, .{ @intCast(n), @intCast(c), @intFromBool(silu), 0, 0, 0 }, .{ 1e-12, 0 }, n);
+    }
+
+    /// im2col for a 3x3 conv band: patch[bn][9*ci] from src[h*w][ci], zero-padded;
+    /// `up` reads a fused nearest-exact 2x upsample (coords halve). p0 = first
+    /// output position of the band. One thread per output f32 (bn*9*ci total).
+    pub fn opIm2col(self: *Backend, src: DeviceBuffer, patch: DeviceBuffer, bn: usize, patch_len: usize, ci: usize, w: usize, h: usize, p0: usize, up: bool) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const f = try self.eltFn(elt.im2col_ptx, "im2col");
+        const total = bn * patch_len;
+        try self.eltLaunch(f, src, patch, null, null, .{ @intCast(total), @intCast(patch_len), @intCast(ci), @intCast(w), @intCast(h), @intCast(p0) }, .{ if (up) 1.0 else 0.0, 0 }, total);
     }
 
     /// Tensor-core GQA attention: out[q][h][hd] = softmax(scale·Q·Kᵀ)·V. Q/K/V are

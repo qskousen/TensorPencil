@@ -1268,6 +1268,52 @@ reference behind `attn_fused=false`).
   is shallow-k=128 at ~24 TFLOP/s — needs ldmatrix / K-staging / bigger tiles (also
   speeds pv). Broad rewrite of the validated MMA fragment loads; deferred.
 
+### M10 Phase 1 — full CUDA pipeline: encoder + VAE (2026-07-04)
+
+`--backend zig-cuda` now runs the WHOLE pipeline on the hand-PTX CUDA backend —
+text encoder, DiT, and VAE — with no Vulkan context at all. (This also replaced
+the old three-flag CLI: `--gpu`/`--dit-cuda` collapsed into
+`--backend cpu|vulkan|zig-cuda`.) All weights stream through the CUDA weight
+cache, so `--vram-budget` degrades to weight streaming across all three stages
+and coexists with other GPU workloads via the live `cuMemGetInfo` budget
+(verified: budgeted 512px runs stream and complete).
+
+- [x] **fp8-e4m3 GEMM (`opMatmulFp8`).** The encoder's GEMM weights are fp8-e4m3
+      (+f32 per-tensor scale); the CUDA backend had no fp8 path. Kept the weights
+      fp8 in the cache (4 GiB, streaming-friendly) and decode per GEMM into an f16
+      scratch (`dequant_fp8_f16`: the checkpoint's 256-entry e4m3→f32 LUT × scale
+      → f16), convert activations f32→f16 (`f32_to_f16`, m→128 pad zeroed), then
+      the validated f16 `buildHgemm`. Validated vs a CPU fp8 reference: rel RMSE
+      **0.00029** across encoder shapes.
+- [x] **CUDA text encoder (`qwen3_cuda.zig`).** The Vulkan `qwen3_gpu` mirror on
+      CUDA: 35-layer Qwen3 in one batched submission. fp8 GEMMs (opMatmulFp8),
+      RMSNorm/QK-norm reuse `qkNorm`, new `rope_half` (rotate-half RoPE) + `add`
+      (residual) kernels, causal flag added to the naive GQA attention (parity-
+      first — the prompt-length seq makes the O(seq²) kernel a ~0.2 s one-time
+      cost), tap snapshots via `tensorCopy`, embed gather + rope table CPU-side.
+      Validated (`cuda-encode-test`) vs CPU encode: **rel RMSE 0.00010**.
+- [x] **CUDA VAE decode (`vae_cuda.zig`).** The Vulkan `vae_gpu` mirror on CUDA:
+      3x3 convs as banded `im2col` (new kernel, +fused nearest-exact 2x upsample)
+      + GEMM; `vae_norm` (new, per-position channel L2 norm + fused silu); `add`
+      residuals; the mid-block single head (dim 384) REUSES the DiT tensor-core
+      attention (`opAttnTC` with n_heads=1, hd=384 — no VAE-specific attention
+      kernel; the Vulkan "3 fake heads" split was a coopmat limitation the CUDA
+      MMA doesn't have). `freeAttnScratch` drops the ~seq² scores plane after the
+      mid block. Validated (`cuda-vae-test`) vs CPU decode.
+      * First cut used the f32 register GEMM for convs — CORRECT but slow (27 s
+        @1MP). Added `opConvF16`: f32→f16 zero-padded weight+activation
+        (`f32_to_f16_pad2d`, co→128 / k→32 / m→128) → buildHgemm → `bias_compact`
+        (strip col pad + add bias); co≥96 convs route through it. **VAE decode
+        @1MP 27.3 → 1.23 s (22×)**; @512px 5.66 → 0.25 s. Parity rel RMSE
+        1e-5 (f32) → 2.5e-4 (f16 conv rounding, same regime as Vulkan's f16-w
+        VAE, well under the 5e-3 gate).
+- **End-to-end (all CUDA)**: coherent 512px (4.8 s total: enc 0.5 + DiT 0.53×6 +
+      VAE 0.3) and 1024px (19.3 s: 2.09 s/step + VAE 1.1) fox images; `zig build
+      test` green.
+- Follow-up: the encoder attention is naive-causal-f32 (fine at prompt lengths);
+      a tensor-core causal path (mask j>q in softmax_md + hgemm_attnout) would
+      only matter for very long prompts.
+
 - [ ] **1.0 CUDA Driver API bindings (`src/gpu/cuda/cu.zig`).** `std.DynLib` load of
       `libcuda.so.1` + hand-declared externs (mirror `vk.zig`; machine-check
       signatures against the CUDA driver headers, no linking, no `nvcc`): `cuInit`,

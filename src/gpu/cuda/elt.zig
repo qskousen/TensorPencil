@@ -192,9 +192,10 @@ pub const attn_ptx: [:0]const u8 =
     \\ZD:
     \\  mov.f32 %f10,0fFF800000;              // m = -inf
     \\  mov.f32 %f11,0f00000000;              // d = 0
+    \\  ld.param.u32 %r30,[u4]; add.u32 %r31,%r10,1; setp.ne.u32 %p2,%r30,0; selp.b32 %r30,%r31,%r5,%p2; // causal(u4): bound=q+1 else seq
     \\  mov.u32 %r17,0;                       // j
     \\JLOOP:
-    \\  setp.ge.u32 %p2,%r17,%r5; @%p2 bra JD;
+    \\  setp.ge.u32 %p2,%r17,%r30; @%p2 bra JD;
     \\  // kbase=(j*kv+kv_head)*hd ; vbase same
     \\  mad.lo.s32 %r18,%r17,%r8,%r13; mul.lo.s32 %r18,%r18,%r9;
     \\  mul.wide.u32 %rd9,%r18,4; add.s64 %rd10,%rd2,%rd9;  // K row
@@ -233,6 +234,233 @@ pub const attn_ptx: [:0]const u8 =
     \\  mul.wide.u32 %rd15,%r19,4; mov.u32 %r20, accl; cvt.u64.u32 %rd16,%r20; add.s64 %rd16,%rd16,%rd15;
     \\  ld.local.f32 %f8,[%rd16]; mul.f32 %f8,%f8,%f13; add.s64 %rd18,%rd17,%rd15; st.global.f32 [%rd18],%f8;
     \\  add.u32 %r19,%r19,1; bra WR;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// rotate-half RoPE, in place, one thread per (position, head, pair): the head
+/// vector splits into halves [0:half] and [half:2*half]; for pair i,
+/// lo' = lo*cos[i] - hi*sin[i], hi' = hi*cos[i] + lo*sin[i]. cos/sin are
+/// [seq][half] with sin offset u2. b0=qk(f32), b2=freqs(f32). u0=total
+/// (=seq*n_heads*half), u1=half, u2=sin_off, u3=n_heads.
+pub const rope_half_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry rope_half(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<2>;
+    \\  .reg .b32 %r<20>;
+    \\  .reg .f32 %f<8>;
+    \\  .reg .b64 %rd<12>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1];               // half
+    \\  ld.param.u32 %r7,[u2];               // sin_off
+    \\  ld.param.u32 %r8,[u3];               // n_heads
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd3,[p2];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd3,%rd3;
+    \\  rem.u32 %r9,%r4,%r6;                  // pair = idx % half
+    \\  div.u32 %r10,%r4,%r6;                 // hp = idx/half = pos*n_heads + head
+    \\  mul.lo.s32 %r11,%r6,%r8;              // half*n_heads
+    \\  div.u32 %r12,%r4,%r11;                // pos
+    \\  mad.lo.s32 %r13,%r12,%r6,%r9;         // cos idx = pos*half + pair
+    \\  mul.wide.u32 %rd4,%r13,4; add.s64 %rd5,%rd3,%rd4; ld.global.f32 %f1,[%rd5]; // cos
+    \\  add.s32 %r14,%r13,%r7;                // + sin_off
+    \\  mul.wide.u32 %rd6,%r14,4; add.s64 %rd7,%rd3,%rd6; ld.global.f32 %f2,[%rd7]; // sin
+    \\  shl.b32 %r15,%r6,1;                   // head_dim = 2*half
+    \\  mad.lo.s32 %r16,%r10,%r15,%r9;        // lo_idx = hp*head_dim + pair
+    \\  add.s32 %r17,%r16,%r6;                // hi_idx = lo_idx + half
+    \\  mul.wide.u32 %rd8,%r16,4; add.s64 %rd9,%rd1,%rd8; ld.global.f32 %f3,[%rd9];   // lo
+    \\  mul.wide.u32 %rd10,%r17,4; add.s64 %rd11,%rd1,%rd10; ld.global.f32 %f4,[%rd11]; // hi
+    \\  mul.f32 %f5,%f3,%f1; mul.f32 %f6,%f4,%f2; sub.f32 %f5,%f5,%f6; st.global.f32 [%rd9],%f5;  // lo*cos - hi*sin
+    \\  mul.f32 %f6,%f4,%f1; fma.rn.f32 %f6,%f3,%f2,%f6; st.global.f32 [%rd11],%f6;               // hi*cos + lo*sin
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// VAE per-position channel L2 norm: out[row][ch] = x[row][ch] * inv * gamma[ch],
+/// inv = sqrt(c)/max(||x_row||_2, eps); optional fused silu. One thread per
+/// position (channel-last [n][c]). b0=x, b1=out, b2=gamma. u0=n, u1=c, u2=silu,
+/// f0=eps (1e-12).
+pub const vae_norm_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry vae_norm(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<4>;
+    \\  .reg .b32 %r<12>;
+    \\  .reg .f32 %f<10>;
+    \\  .reg .b64 %rd<14>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1]; ld.param.u32 %r7,[u2]; ld.param.f32 %f8,[f0];
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
+    \\  mul.lo.s32 %r8,%r4,%r6;               // base = row*c
+    \\  mul.wide.u32 %rd4,%r8,4; add.s64 %rd5,%rd1,%rd4; add.s64 %rd6,%rd2,%rd4;  // x/out row ptrs
+    \\  mov.f32 %f1,0f00000000; mov.u32 %r9,0; mov.b64 %rd7,%rd5;
+    \\SS:
+    \\  setp.ge.u32 %p2,%r9,%r6; @%p2 bra SSD;
+    \\  ld.global.f32 %f2,[%rd7]; fma.rn.f32 %f1,%f2,%f2,%f1;
+    \\  add.s64 %rd7,%rd7,4; add.u32 %r9,%r9,1; bra SS;
+    \\SSD:
+    \\  sqrt.rn.f32 %f3,%f1; max.f32 %f3,%f3,%f8;         // max(||x||_2, eps)
+    \\  cvt.rn.f32.u32 %f4,%r6; sqrt.rn.f32 %f4,%f4;      // sqrt(c)
+    \\  div.rn.f32 %f5,%f4,%f3;                            // inv
+    \\  mov.u32 %r9,0; mov.b64 %rd7,%rd5; mov.b64 %rd8,%rd3; mov.b64 %rd9,%rd6;
+    \\AP:
+    \\  setp.ge.u32 %p2,%r9,%r6; @%p2 bra END;
+    \\  ld.global.f32 %f2,[%rd7]; ld.global.f32 %f6,[%rd8];
+    \\  mul.f32 %f2,%f2,%f5; mul.f32 %f2,%f2,%f6;         // v = x*inv*gamma
+    \\  setp.eq.u32 %p3,%r7,0; @%p3 bra STORE;
+    \\  neg.f32 %f7,%f2; mul.f32 %f7,%f7,0f3FB8AA3B; ex2.approx.f32 %f7,%f7; add.f32 %f7,%f7,0f3F800000; rcp.approx.f32 %f7,%f7;
+    \\  mul.f32 %f2,%f2,%f7;                               // silu(v) = v*sigmoid(v)
+    \\STORE:
+    \\  st.global.f32 [%rd9],%f2;
+    \\  add.s64 %rd7,%rd7,4; add.s64 %rd8,%rd8,4; add.s64 %rd9,%rd9,4; add.u32 %r9,%r9,1; bra AP;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// im2col for a zero-padded 3x3 conv over channel-last [h*w][ci] activations,
+/// producing a patch matrix [bn][9*ci] so the conv is a GEMM. With f0!=0 the
+/// source is read through a fused nearest-exact 2x upsample (coords halve; the
+/// upsampled tensor never materializes). One thread per output f32.
+/// b0=src, b1=out(patch). u0=bn*plen, u1=plen(9*ci), u2=ci, u3=src w, u4=src h,
+/// u5=first output position of the band, f0=upsample flag.
+pub const im2col_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry im2col(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<6>;
+    \\  .reg .b32 %r<24>;
+    \\  .reg .f32 %f<3>;
+    \\  .reg .b64 %rd<8>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1]; ld.param.u32 %r7,[u2]; ld.param.u32 %r8,[u3]; ld.param.u32 %r9,[u4]; ld.param.u32 %r10,[u5];
+    \\  ld.param.f32 %f1,[f0]; setp.neu.f32 %p2,%f1,0f00000000; selp.b32 %r11,1,0,%p2; // up
+    \\  shl.b32 %r12,%r8,%r11; shl.b32 %r13,%r9,%r11;      // ow, oh
+    \\  rem.u32 %r14,%r4,%r6; div.u32 %r15,%r4,%r6;        // col, band-row
+    \\  add.u32 %r16,%r10,%r15;                             // p = band start + band-row
+    \\  div.u32 %r17,%r14,%r7; rem.u32 %r18,%r14,%r7;      // tap, cc
+    \\  div.u32 %r19,%r16,%r12; rem.u32 %r20,%r16,%r12;    // oy, ox
+    \\  div.u32 %r21,%r17,3; rem.u32 %r22,%r17,3;          // ky, kx
+    \\  add.u32 %r19,%r19,%r21; add.u32 %r20,%r20,%r22;    // yk, xk
+    \\  mov.f32 %f2,0f00000000;
+    \\  setp.lt.u32 %p3,%r19,1; @%p3 bra STORE;
+    \\  setp.gt.u32 %p3,%r19,%r13; @%p3 bra STORE;
+    \\  setp.lt.u32 %p3,%r20,1; @%p3 bra STORE;
+    \\  setp.gt.u32 %p3,%r20,%r12; @%p3 bra STORE;
+    \\  sub.u32 %r19,%r19,1; shr.u32 %r19,%r19,%r11;       // sy
+    \\  sub.u32 %r20,%r20,1; shr.u32 %r20,%r20,%r11;       // sx
+    \\  mad.lo.s32 %r23,%r19,%r8,%r20; mad.lo.s32 %r23,%r23,%r7,%r18; // (sy*w+sx)*ci+cc
+    \\  ld.param.u64 %rd1,[p0]; cvta.to.global.u64 %rd1,%rd1;
+    \\  mul.wide.u32 %rd2,%r23,4; add.s64 %rd3,%rd1,%rd2; ld.global.f32 %f2,[%rd3];
+    \\STORE:
+    \\  ld.param.u64 %rd4,[p1]; cvta.to.global.u64 %rd4,%rd4;
+    \\  mul.wide.u32 %rd5,%r4,4; add.s64 %rd6,%rd4,%rd5; st.global.f32 [%rd6],%f2;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// Convert a tight f32 [rows][cols] matrix to a zero-padded f16 [*][cols_pad]
+/// (rows padded implicitly by the launch size) so it feeds the 128×n / k%32
+/// tensor-core GEMM. out[idx] with r=idx/cols_pad, c=idx%cols_pad =
+/// (r<rows and c<cols) ? f16(src[r*cols+c]) : 0. b0=src(f32), b1=out(f16).
+/// u0=total(rows_pad*cols_pad), u1=cols_pad, u2=rows, u3=cols.
+pub const f32_to_f16_pad2d_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry f32_to_f16_pad2d(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<4>;
+    \\  .reg .b32 %r<12>;
+    \\  .reg .f32 %f<2>;
+    \\  .reg .b16 %h<2>;
+    \\  .reg .b64 %rd<8>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1]; ld.param.u32 %r7,[u2]; ld.param.u32 %r8,[u3];
+    \\  ld.param.u64 %rd2,[p1]; cvta.to.global.u64 %rd2,%rd2;
+    \\  mul.wide.u32 %rd3,%r4,2; add.s64 %rd4,%rd2,%rd3;   // &out[idx] f16
+    \\  div.u32 %r9,%r4,%r6; rem.u32 %r10,%r4,%r6;         // r, c
+    \\  mov.b16 %h0,0x0000;
+    \\  setp.ge.u32 %p2,%r9,%r7; @%p2 bra STORE;
+    \\  setp.ge.u32 %p3,%r10,%r8; @%p3 bra STORE;
+    \\  mad.lo.s32 %r11,%r9,%r8,%r10;                       // r*cols + c
+    \\  ld.param.u64 %rd1,[p0]; cvta.to.global.u64 %rd1,%rd1;
+    \\  mul.wide.u32 %rd5,%r11,4; add.s64 %rd6,%rd1,%rd5; ld.global.f32 %f1,[%rd6]; cvt.rn.f16.f32 %h0,%f1;
+    \\STORE:
+    \\  st.global.b16 [%rd4],%h0;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// Strip the column padding from a [*][co_pad] f32 GEMM output and add the conv
+/// bias in one pass: dst[dst_off + i] = C[(i/co)*co_pad + i%co] + bias[i%co].
+/// b0=C(f32 padded), b1=bias(f32[co]), b2=dst(f32). u0=total(m*co), u1=co,
+/// u2=co_pad, u3=dst offset (elements).
+pub const bias_compact_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry bias_compact(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<2>;
+    \\  .reg .b32 %r<12>;
+    \\  .reg .f32 %f<4>;
+    \\  .reg .b64 %rd<10>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1]; ld.param.u32 %r7,[u2]; ld.param.u32 %r8,[u3];
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
+    \\  div.u32 %r9,%r4,%r6; rem.u32 %r10,%r4,%r6;          // r, c
+    \\  mad.lo.s32 %r11,%r9,%r7,%r10;                        // r*co_pad + c
+    \\  mul.wide.u32 %rd4,%r11,4; add.s64 %rd5,%rd1,%rd4; ld.global.f32 %f1,[%rd5];  // C
+    \\  mul.wide.u32 %rd6,%r10,4; add.s64 %rd7,%rd2,%rd6; ld.global.f32 %f2,[%rd7];  // bias[c]
+    \\  add.f32 %f1,%f1,%f2;
+    \\  add.s32 %r11,%r8,%r4;                                // dst_off + i
+    \\  mul.wide.u32 %rd8,%r11,4; add.s64 %rd9,%rd3,%rd8; st.global.f32 [%rd9],%f1;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// a[idx] += b[idx], in place (plain residual add). b0=a, b1=b. u0=total.
+pub const add_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry add(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<2>;
+    \\  .reg .b32 %r<8>;
+    \\  .reg .f32 %f<4>;
+    \\  .reg .b64 %rd<8>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2;
+    \\  mul.wide.u32 %rd3,%r4,4; add.s64 %rd4,%rd1,%rd3; add.s64 %rd5,%rd2,%rd3;
+    \\  ld.global.f32 %f1,[%rd4]; ld.global.f32 %f2,[%rd5]; add.f32 %f1,%f1,%f2; st.global.f32 [%rd4],%f1;
     \\END:
     \\  ret;
     \\}
@@ -526,6 +754,69 @@ pub const scatter_head_b_ptx: [:0]const u8 =
     \\  ld.param.u64 %rd2,[p1]; cvta.to.global.u64 %rd2,%rd2;
     \\  mul.wide.u32 %rd4,%r10,4; add.s64 %rd6,%rd2,%rd4;
     \\  st.global.f32 [%rd6],%f1;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// Dequantize fp8-e4m3 weights to f16: out[i] = f16(lut[in[i]] * scale). The
+/// e4m3 byte indexes a 256-entry f32 lookup table (dtype.f8_e4m3_to_f32_table),
+/// then the per-tensor weight scale is folded in. b0=in(u8 fp8), b1=lut(f32[256]),
+/// b2=out(f16). u0=total. f0=scale. One thread per element.
+pub const dequant_fp8_f16_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry dequant_fp8_f16(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<2>;
+    \\  .reg .b32 %r<8>;
+    \\  .reg .f32 %f<4>;
+    \\  .reg .b16 %h<2>;
+    \\  .reg .b64 %rd<10>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.f32 %f1,[f0];
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
+    \\  cvt.u64.u32 %rd4,%r4; add.s64 %rd5,%rd1,%rd4;      // &in[idx]
+    \\  ld.global.u8 %r6,[%rd5];                            // fp8 byte (0..255)
+    \\  mul.wide.u32 %rd6,%r6,4; add.s64 %rd7,%rd2,%rd6;    // &lut[byte]
+    \\  ld.global.f32 %f2,[%rd7]; mul.f32 %f2,%f2,%f1;      // lut[byte]*scale
+    \\  cvt.rn.f16.f32 %h0,%f2;
+    \\  mul.wide.u32 %rd8,%r4,2; add.s64 %rd9,%rd3,%rd8; st.global.b16 [%rd9],%h0;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// Convert f32 activations to f16, zero-padding rows past the real count so the
+/// 128-row-padded GEMM sees clean pad rows. out[i] = i<u1 ? f16(in[i]) : 0.
+/// b0=in(f32), b1=out(f16). u0=total(padded elems), u1=real elems. One thread/elem.
+pub const f32_to_f16_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry f32_to_f16(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<3>;
+    \\  .reg .b32 %r<8>;
+    \\  .reg .f32 %f<3>;
+    \\  .reg .b16 %h<2>;
+    \\  .reg .b64 %rd<8>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1];
+    \\  ld.param.u64 %rd2,[p1]; cvta.to.global.u64 %rd2,%rd2;
+    \\  mul.wide.u32 %rd3,%r4,2; add.s64 %rd4,%rd2,%rd3;    // &out[idx] (f16)
+    \\  setp.ge.u32 %p2,%r4,%r6; @%p2 bra ZERO;
+    \\  ld.param.u64 %rd1,[p0]; cvta.to.global.u64 %rd1,%rd1;
+    \\  mul.wide.u32 %rd5,%r4,4; add.s64 %rd6,%rd1,%rd5; ld.global.f32 %f1,[%rd6];
+    \\  cvt.rn.f16.f32 %h0,%f1; st.global.b16 [%rd4],%h0; bra END;
+    \\ZERO:
+    \\  mov.b16 %h0,0x0000; st.global.b16 [%rd4],%h0;
     \\END:
     \\  ret;
     \\}
