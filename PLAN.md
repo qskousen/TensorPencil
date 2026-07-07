@@ -1314,6 +1314,63 @@ and coexists with other GPU workloads via the live `cuMemGetInfo` budget
       a tensor-core causal path (mask j>q in softmax_md + hgemm_attnout) would
       only matter for very long prompts.
 
+### M10 Phase 1 — audit-driven perf follow-ups (2026-07-04)
+
+An 8-subsystem audit (each kernel deep-read, every proposed optimization
+adversarially verified against the dead-end log above) found the 2x ComfyUI gap
+is a kernel-efficiency gap concentrated in the int8 GEMM (~49% of peak) and the
+shallow-k attention scores GEMM — both capped by ptxas/driver opacity. cuBLASLt
+(the only path that closes it) is blocked by the pure-Zig invariant. What remains
+inside the pure-Zig constraint: `ldmatrix` on the GEMM/attention fragment loads
+(the real, neutral-risk swing) plus a set of small, bit-identical fusions and one
+streaming-policy bug-fix. All the "bigger" ideas (cuBLASLt, true single-pass flash
+attention [already shipped via `attn_fused`], cp.async on scores [same-op Vulkan
+K-staging was neutral], CUDA Graphs [GPU already 100% util], multi-stream overlap
+[one GEMM saturates 82 SMs]) were verified dead or blocked.
+
+Validation per step: `cuda-i8-test` (GEMM/prep vs CPU oracle, bit-exact),
+`cuda-dit-test <int8-ckpt> <lat>` (full-forward rel-RMSE + per-category profile),
+`cuda-stream-test` (streamed == resident, bit-identical), `bench-matmul` (GEMM
+min-of-≥8), `generate --backend zig-cuda` (coherent image). GPU-gated unit tests
+need `touch testdata/gpu-tests` (remove after). Measure with the ±40% clock-noise
+caveat — min-of-≥8 or whole-step profiles.
+
+Batch A — cheap, safe, bit-identical CUDA wins + the streaming bug-fix:
+- [ ] **A1. `opI8Prep`: memset only pad rows `[m..mpad)`, skip when `m==mpad`.**
+      The prep kernel fully overwrites rows `0..m-1`; zeroing them in `backend.zig`
+      before launch is pure waste. ~17 ms/step @1MP, zero correctness risk.
+- [ ] **A2. Cache `timestepVectors` per-schedule-sigma in `dit_cuda.Session`**
+      (parity with `dit_gpu`'s `tvs`). `forward` recomputes `timestepVectors(sigma)`
+      (reads ~900 MB tproj1) every step on the CPU critical path; precompute for the
+      fixed schedule sigmas at `Session.init`, look up in `forward`. ~10-40 ms/step.
+- [ ] **A3. Fuse qk-RMSNorm + RoPE into one in-place CUDA pass (per q, per k).**
+      Currently 4 separate passes (qkNorm q/k, rope q/k) round-trip q(190 MB)+k
+      through VRAM. Fuse to 2 passes. ~18 ms/step, bit-identical (f32 round-trip).
+- [ ] **A4. Fold the gated residual add into the int8 GEMM fused C-store**
+      (`wo` / `mlp.down`). `gated_add` is a separate naive-f32 kernel; fold
+      `fma(mod, y, x)` into `igemm_pipe_fused`'s epilogue. ~29 ms/step, accuracy-neutral.
+- [ ] **A5. Fold `rms_mod` + silu/sigmoid gates into `buildPrep`'s shared load.**
+      The remaining un-fused-f32 CUDA elt ops; fold into the prep kernel's pre-FWHT
+      shared store. ~80-90 ms/step (closes the CUDA elt gap; Vulkan did the f16-chain
+      equivalent). Largest of Batch A.
+- [ ] **A6. MRU-ward residency instead of LRU for cyclic DiT weight streaming.**
+      The block loop is a cyclic reference string; LRU is provably pessimal on a
+      loop larger than the cache (~0 hits, streams everything). MRU-ward eviction
+      keeps a stable resident subset (~C-1 hits/step). Fixes the non-monotonic
+      budget curve (8 GiB slower than 4 GiB). Situational (partial-pressure only),
+      but the correct policy. Must protect the per-op MRU fetch window (2 fetches:
+      weight then weight_scale). Validate bit-identical via `cuda-stream-test`.
+
+Batch B — the real swing at the gap (higher risk; a neutral result is itself the
+answer — that the ~49% floor is the driver's coopmat lowering, not our tiling):
+- [ ] **B1. `ldmatrix.x4` s8 fragment loads for the int8 GEMM (`igemm_pipe`).**
+      Kills the verified 4-way shared-bank conflict + cuts ~60% of `ld.shared`
+      instructions in the MMA inner loop. Target 49% → ~57-62% of int8 peak,
+      ~0.3-0.5 s/step @1MP. Gate on `bench-matmul` min-of-≥8; bit-exact vs oracle.
+- [ ] **B2. `ldmatrix` fragment loads in `buildHgemm` (attention scores + pv).**
+      Same technique on the shallow-k=128 attention GEMMs (scores is the biggest
+      attention cost at ~915 ms @1MP). Reuses B1's rewrite. ~0.1-0.26 s @1MP.
+
 - [ ] **1.0 CUDA Driver API bindings (`src/gpu/cuda/cu.zig`).** `std.DynLib` load of
       `libcuda.so.1` + hand-declared externs (mirror `vk.zig`; machine-check
       signatures against the CUDA driver headers, no linking, no `nvcc`): `cuInit`,

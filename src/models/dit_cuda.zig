@@ -40,6 +40,18 @@ fn offsetBuf(b: DeviceBuffer, off_bytes: usize) DeviceBuffer {
     return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off_bytes), .mem = .null_handle, .size = b.size - off_bytes };
 }
 
+/// Quantized-linear dispatch. A convrot checkpoint is homogeneous (every DiT
+/// linear is the same width), so `is_i4` picks the W4A4 prep/GEMM (m16n8k64.s4,
+/// activations quantized to s4) vs the W8A8 path at each call site.
+fn qPrep(be: *Backend, is_i4: bool, x: DeviceBuffer, m: usize, cols: usize) !void {
+    if (is_i4) return be.opI4Prep(x, m, cols);
+    return be.opI8Prep(x, m, cols);
+}
+fn qGemm(be: *Backend, is_i4: bool, y: DeviceBuffer, w: anytype) !void {
+    if (is_i4) return be.opI4Gemm(y, w.bytes, w.row_scale.?, w.rows);
+    return be.opI8Gemm(y, w.bytes, w.row_scale.?, w.rows, false);
+}
+
 /// Use the tensor-core GQA attention path (hgemm+softmax_row) instead of the
 /// naive one-thread-per-(q,head) kernel. On by default — it is O(seq²) faster on
 /// the tensor cores and the naive path is O(seq²) latency-bound. Toggle for A/B.
@@ -215,6 +227,9 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
     try be.beginBatch();
     errdefer if (be.batching()) be.abortBatch();
 
+    // int4 (W4A4) vs int8 (W8A8) convrot: gate the quantized-linear path once.
+    const is_i4 = model.blocks[0].attn.wq.dtype == .i4;
+
     // patch embed: x[seq_txt..] = img_in @ first^T + bias
     const first_f8 = model.first.w.dtype == .f8_e4m3;
     try be.opMatmul(x_d, seq_txt * F * 4, imgin_d, 0, n_img, model.first.w.bytes, first_f8, F, channels * patch * patch, model.first.w.scale, model.first.b);
@@ -228,11 +243,11 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
         const mb = b * 6 * F;
         // --- attention ---
         try be.rmsMod(x_d, t1_d, mv_d, seq, F, mb + 0 * F, mb + 1 * F, eps);
-        try be.opI8Prep(t1_d, seq, F);
-        try be.opI8Gemm(q_d, blk.attn.wq.bytes, blk.attn.wq.row_scale.?, blk.attn.wq.rows, false);
-        try be.opI8Gemm(k_d, blk.attn.wk.bytes, blk.attn.wk.row_scale.?, blk.attn.wk.rows, false);
-        try be.opI8Gemm(v_d, blk.attn.wv.bytes, blk.attn.wv.row_scale.?, blk.attn.wv.rows, false);
-        try be.opI8Gemm(g_d, blk.attn.gate.bytes, blk.attn.gate.row_scale.?, blk.attn.gate.rows, false);
+        try qPrep(be, is_i4, t1_d, seq, F);
+        try qGemm(be, is_i4, q_d, blk.attn.wq);
+        try qGemm(be, is_i4, k_d, blk.attn.wk);
+        try qGemm(be, is_i4, v_d, blk.attn.wv);
+        try qGemm(be, is_i4, g_d, blk.attn.gate);
         const qn = try normBuf(be, blk.attn.qnorm);
         const kn = try normBuf(be, blk.attn.knorm);
         try be.qkNorm(q_d, q_d, qn, seq * heads, hd, eps);
@@ -244,8 +259,8 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
         else
             try be.attn(q_d, k_d, v_d, attn_d, seq, heads, kv_heads, hd, attn_scale, false);
         try be.sigmoidMul(attn_d, g_d, seq * F);
-        try be.opI8Prep(attn_d, seq, blk.attn.wo.cols);
-        try be.opI8Gemm(t1_d, blk.attn.wo.bytes, blk.attn.wo.row_scale.?, blk.attn.wo.rows, false);
+        try qPrep(be, is_i4, attn_d, seq, blk.attn.wo.cols);
+        try qGemm(be, is_i4, t1_d, blk.attn.wo);
         try be.gatedAdd(x_d, t1_d, mv_d, seq * F, F, mb + 2 * F);
         // --- mlp (sequence-tiled: mg/mu are [tile][mlp_dim]; each row-chunk is
         // independent, so we walk seq in mlp_tile-row bands over offset x views) ---
@@ -254,12 +269,12 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
             const tile: usize = @min(mlp_tile, seq - c0);
             const xo = offsetBuf(x_d, c0 * F * 4);
             try be.rmsMod(xo, t1_d, mv_d, tile, F, mb + 3 * F, mb + 4 * F, eps);
-            try be.opI8Prep(t1_d, tile, F);
-            try be.opI8Gemm(mg_d, blk.mlp.gate.bytes, blk.mlp.gate.row_scale.?, blk.mlp.gate.rows, false);
-            try be.opI8Gemm(mu_d, blk.mlp.up.bytes, blk.mlp.up.row_scale.?, blk.mlp.up.rows, false);
+            try qPrep(be, is_i4, t1_d, tile, F);
+            try qGemm(be, is_i4, mg_d, blk.mlp.gate);
+            try qGemm(be, is_i4, mu_d, blk.mlp.up);
             try be.siluMul(mg_d, mu_d, tile * mlp_dim);
-            try be.opI8Prep(mg_d, tile, blk.mlp.down.cols);
-            try be.opI8Gemm(t1_d, blk.mlp.down.bytes, blk.mlp.down.row_scale.?, blk.mlp.down.rows, false);
+            try qPrep(be, is_i4, mg_d, tile, blk.mlp.down.cols);
+            try qGemm(be, is_i4, t1_d, blk.mlp.down);
             try be.gatedAdd(xo, t1_d, mv_d, tile * F, F, mb + 5 * F);
         }
     }

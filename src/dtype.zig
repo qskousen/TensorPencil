@@ -16,6 +16,12 @@ pub const DType = enum {
     f64,
     u8,
     i8,
+    /// Signed 4-bit, two values packed per byte (element 2k in the low nibble,
+    /// 2k+1 in the high nibble). Internal compute dtype only — int4 "convrot"
+    /// weights are stored on disk as raw `U8` (shape [rows, cols/2]) and the
+    /// DiT loader reinterprets them as `.i4` with the logical [rows, cols].
+    /// Sub-byte, so `byteSize` is undefined; use `storageBytes` for lengths.
+    i4,
     u16,
     i16,
     u32,
@@ -49,13 +55,41 @@ pub const DType = enum {
         return null;
     }
 
+    /// Bytes per element. Undefined for sub-byte types (`.i4`) — those are
+    /// unreachable here; use `storageBytes` for their packed on-disk length.
     pub fn byteSize(self: DType) usize {
         return switch (self) {
+            .i4 => unreachable,
             .f8_e4m3, .u8, .i8, .bool => 1,
             .f16, .bf16, .u16, .i16 => 2,
             .f32, .u32, .i32 => 4,
             .f64, .u64, .i64 => 8,
         };
+    }
+
+    /// Bits per element (4 for `.i4`, else `byteSize * 8`).
+    pub fn bitSize(self: DType) usize {
+        return switch (self) {
+            .i4 => 4,
+            else => self.byteSize() * 8,
+        };
+    }
+
+    /// Packed storage size in bytes for `count` elements. Handles sub-byte
+    /// types (`.i4`: two values per byte, rounding up). For whole-byte types
+    /// this is just `count * byteSize()`.
+    pub fn storageBytes(self: DType, count: usize) usize {
+        return switch (self) {
+            .i4 => (count + 1) / 2,
+            else => count * self.byteSize(),
+        };
+    }
+
+    /// Decode the signed 4-bit value stored in nibble `idx` (0 = low, 1 = high)
+    /// of `byte` to its integer value in [-8, 7].
+    pub inline fn nibbleI4(byte: u8, idx: u1) i8 {
+        const nib: u4 = @truncate(byte >> (@as(u3, idx) * 4));
+        return @as(i8, @as(i4, @bitCast(nib)));
     }
 };
 
@@ -120,6 +154,24 @@ test "dtype string round trip and sizes" {
     try std.testing.expectEqual(@as(usize, 1), DType.f8_e4m3.byteSize());
     try std.testing.expectEqual(@as(usize, 2), DType.bf16.byteSize());
     try std.testing.expectEqual(@as(usize, 8), DType.i64.byteSize());
+}
+
+test "i4 packing and nibble decode" {
+    // .i4 is an internal compute dtype, never a safetensors header string.
+    try std.testing.expectEqual(@as(?DType, null), DType.fromString("I4"));
+    try std.testing.expectEqual(@as(usize, 4), DType.i4.bitSize());
+    // Two values per byte, rounding up.
+    try std.testing.expectEqual(@as(usize, 128), DType.i4.storageBytes(256));
+    try std.testing.expectEqual(@as(usize, 1), DType.i4.storageBytes(1));
+    try std.testing.expectEqual(@as(usize, 1), DType.i4.storageBytes(2));
+
+    // Low nibble = element 0, high nibble = element 1; signed [-8, 7].
+    // 0xF7: low = 0x7 = 7, high = 0xF = -1.
+    try std.testing.expectEqual(@as(i8, 7), DType.nibbleI4(0xF7, 0));
+    try std.testing.expectEqual(@as(i8, -1), DType.nibbleI4(0xF7, 1));
+    // 0x80: low = 0, high = 0x8 = -8.
+    try std.testing.expectEqual(@as(i8, 0), DType.nibbleI4(0x80, 0));
+    try std.testing.expectEqual(@as(i8, -8), DType.nibbleI4(0x80, 1));
 }
 
 test "fp8 e4m3fn table matches torch.float8_e4m3fn" {

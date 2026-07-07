@@ -305,9 +305,15 @@ fn encodePrompt(io: std.Io, gpa: std.mem.Allocator, gpu_ctx: ?*gpu_mod.Context, 
     // backend when active, else Vulkan; the CPU forward is the fallback (and
     // used on any GPU error).
     const full = if (cu_be) |b|
-        qwen3_cuda.encode(enc, b, io, gpa, ids.items) catch try enc.encode(io, gpa, ids.items)
+        qwen3_cuda.encode(enc, b, io, gpa, ids.items) catch |err| blk: {
+            std.log.warn("cuda text encode failed ({t}); falling back to CPU (slow)", .{err});
+            break :blk try enc.encode(io, gpa, ids.items);
+        }
     else if (gpu_ctx) |gc|
-        qwen3_gpu.encode(enc, gc, io, gpa, ids.items, encoder_f16) catch try enc.encode(io, gpa, ids.items)
+        qwen3_gpu.encode(enc, gc, io, gpa, ids.items, encoder_f16) catch |err| blk: {
+            std.log.warn("vulkan text encode failed ({t}); falling back to CPU (slow)", .{err});
+            break :blk try enc.encode(io, gpa, ids.items);
+        }
     else
         try enc.encode(io, gpa, ids.items);
     defer gpa.free(full);

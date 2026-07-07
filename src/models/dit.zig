@@ -616,11 +616,11 @@ fn linear(io: std.Io, gpa: std.mem.Allocator, out: []f32, x: []const f32, m: usi
 
 /// Resolves checkpoint tensor names (optionally under a runtime prefix) and
 /// builds `Weight`s, transparently attaching per-row scale + ConvRot metadata
-/// for int8-quantized (`I8`) tensors.
+/// for int8/int4-quantized (`I8`/`I4`) tensors.
 const Loader = struct {
     st: *const SafeTensors,
     alloc: std.mem.Allocator,
-    pfx: []const u8, // "" (fp8) or "model.diffusion_model." (int8)
+    pfx: []const u8, // "" (fp8) or "model.diffusion_model." (int8/int4)
 
     fn name(l: Loader, buf: []u8, comptime fmt: []const u8, args: anytype, suffix: []const u8) ![]u8 {
         var fbs = std.Io.Writer.fixed(buf);
@@ -635,11 +635,20 @@ const Loader = struct {
         const nm = try l.name(&buf, fmt, args, "");
         const view = l.st.get(nm) orelse return error.MissingTensor;
         const shape = view.info.shape.slice();
-        if (shape.len != 2 or shape[0] != rows or shape[1] != cols) return error.ShapeMismatch;
-        var w = Weight.init(view.bytes, view.info.dtype, rows, cols);
-        if (view.info.dtype == .i8) {
-            // ComfyUI int8_tensorwise "convrot": per-output-row `weight_scale`
-            // and a size-256 group rotation folded out at dequant time.
+
+        // int4 convrot weights are stored as raw U8, nibble-packed two values
+        // per byte, so the on-disk shape is [rows, cols/2]; everything else
+        // (int8/fp8/f32) is one element per stored slot with shape [rows, cols].
+        const is_i4 = view.info.dtype == .u8;
+        const wdt = if (is_i4) @as(@TypeOf(view.info.dtype), .i4) else view.info.dtype;
+        const stored_cols = if (is_i4) cols / 2 else cols;
+        if (is_i4 and cols % 2 != 0) return error.ShapeMismatch;
+        if (shape.len != 2 or shape[0] != rows or shape[1] != stored_cols) return error.ShapeMismatch;
+
+        var w = Weight.init(view.bytes, wdt, rows, cols);
+        if (wdt == .i8 or wdt == .i4) {
+            // int8/int4 "convrot": per-output-row `weight_scale` and a size-256
+            // group rotation folded out at dequant time.
             var sbuf: [168]u8 = undefined;
             const sname = try l.name(&sbuf, fmt, args, "_scale");
             const sv = l.st.get(sname) orelse return error.MissingTensor;
@@ -788,6 +797,85 @@ test "int8 convrot matmul agrees with fp8 within quant noise" {
     const rel = @sqrt(num / den);
     std.debug.print("int8-vs-fp8 wq GEMM relative RMSE: {d:.4}\n", .{rel});
     try std.testing.expect(rel < 0.05);
+}
+
+test "int4 convrot checkpoint loads with per-row scale + rotation metadata" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "models/diffusion_model/krea2CenterSemiraw_v10Int4_CONVROT.safetensors";
+    std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
+
+    var st = try SafeTensors.open(gpa, io, path);
+    defer st.deinit();
+    var model = try DiT.load(gpa, &st);
+    defer model.deinit();
+
+    // The per-block linears are int4 convrot: stored U8 (nibble-packed) but
+    // reinterpreted as .i4 with the logical [rows, cols], scale + rotation wired.
+    const attn = model.blocks[0].attn;
+    for ([_]Weight{ attn.wq, attn.wk, attn.wv, attn.wo, attn.gate }) |w| {
+        try std.testing.expect(w.dtype == .i4);
+        try std.testing.expectEqual(@as(u32, ops.convrot.group_size), w.convrot);
+        try std.testing.expect(w.row_scale != null);
+        try std.testing.expectEqual(w.rows, w.row_scale.?.len);
+        try std.testing.expectEqual(@as(usize, 0), w.cols % ops.convrot.group_size);
+        // On-disk bytes are exactly half the logical element count (2 per byte).
+        try std.testing.expectEqual(w.rows * w.cols / 2, w.bytes.len);
+    }
+    try std.testing.expect(model.first.w.dtype == .f32);
+    try std.testing.expect(model.first.w.row_scale == null);
+}
+
+// Like the int8 test: the int4 convrot weights quantize the same base
+// checkpoint as fp8, so a GEMM through each must agree — but int4's 16 levels
+// give a looser bound than int8's 256. This validates the whole int4 path
+// (loader, U8→i4 reinterpret, nibble unpack, per-row scale, group un-rotation).
+test "int4 convrot matmul agrees with fp8 within quant noise" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const i4_path = "models/diffusion_model/krea2CenterSemiraw_v10Int4_CONVROT.safetensors";
+    const fp8_path = "models/diffusion_model/krea2CenterSemiraw_v10Fp8.safetensors";
+    std.Io.Dir.cwd().access(io, i4_path, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, fp8_path, .{}) catch return error.SkipZigTest;
+
+    var st_i4 = try SafeTensors.open(gpa, io, i4_path);
+    defer st_i4.deinit();
+    var m_i4 = try DiT.load(gpa, &st_i4);
+    defer m_i4.deinit();
+    var st_fp8 = try SafeTensors.open(gpa, io, fp8_path);
+    defer st_fp8.deinit();
+    var m_fp8 = try DiT.load(gpa, &st_fp8);
+    defer m_fp8.deinit();
+
+    const w_i4 = m_i4.blocks[0].attn.wq;
+    const w_fp8 = m_fp8.blocks[0].attn.wq;
+    try std.testing.expectEqual(w_fp8.rows, w_i4.rows);
+    try std.testing.expectEqual(w_fp8.cols, w_i4.cols);
+
+    const rows_m = 4;
+    const x = try gpa.alloc(f32, rows_m * w_i4.cols);
+    defer gpa.free(x);
+    var prng = std.Random.DefaultPrng.init(1234);
+    for (x) |*v| v.* = prng.random().floatNorm(f32);
+
+    const y_i4 = try gpa.alloc(f32, rows_m * w_i4.rows);
+    defer gpa.free(y_i4);
+    const y_fp8 = try gpa.alloc(f32, rows_m * w_fp8.rows);
+    defer gpa.free(y_fp8);
+    try ops.matmul.matmul(io, gpa, y_i4, x, rows_m, w_i4, null);
+    try ops.matmul.matmul(io, gpa, y_fp8, x, rows_m, w_fp8, null);
+
+    var num: f64 = 0;
+    var den: f64 = 0;
+    for (y_fp8, y_i4) |ref, got| {
+        num += @as(f64, (ref - got)) * (ref - got);
+        den += @as(f64, ref) * ref;
+    }
+    const rel = @sqrt(num / den);
+    std.debug.print("int4-vs-fp8 wq GEMM relative RMSE: {d:.4}\n", .{rel});
+    // int4 (16 levels) is much coarser than int8; convrot keeps it usable but
+    // the GEMM-level relative error is naturally several × higher.
+    try std.testing.expect(rel < 0.25);
 }
 
 fn readF32File(gpa: std.mem.Allocator, io: std.Io, path: []const u8, n: usize) ![]f32 {

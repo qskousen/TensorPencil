@@ -14,6 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Remember that the best code is often the simplest code. Tend towards simple solutions where possible, that will work for all the edge cases.
 - If the user asks for something that may cause issues, push back and get confirmation before doing it.
 - If you see existing code that may cause issues or is Band-Aid patch code, call it out and suggest a fix.
+- This is a research project. There's no risk to trying big complicated work. We want to try unusual things. Be bold and adventerous.
 
 ## Project
 

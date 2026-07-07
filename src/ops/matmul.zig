@@ -50,15 +50,16 @@ pub const Weight = struct {
     /// Per-tensor dequant scale (ComfyUI fp8 format stores one per weight).
     scale: f32 = 1.0,
     /// Per-output-row dequant scale (ComfyUI int8 `weight_scale`, `[rows]`).
-    /// When set, overrides `scale` for `.i8` weights.
+    /// When set, overrides `scale` for `.i8`/`.i4` weights.
     row_scale: ?[]const f32 = null,
-    /// ConvRot group size (0 = none). When non-zero, `.i8` weights are stored
-    /// rotated by a group-wise Hadamard along the input dim and are un-rotated
-    /// at dequant time; `cols` must be a multiple of this. See ops/convrot.zig.
+    /// ConvRot group size (0 = none). When non-zero, `.i8`/`.i4` weights are
+    /// stored rotated by a group-wise Hadamard along the input dim and are
+    /// un-rotated at dequant time; `cols` must be a multiple of this. i4 packs
+    /// two values per byte so `cols` is also even. See ops/convrot.zig.
     convrot: u32 = 0,
 
     pub fn init(bytes: []const u8, dtype: DType, rows: usize, cols: usize) Weight {
-        std.debug.assert(bytes.len == rows * cols * dtype.byteSize());
+        std.debug.assert(bytes.len == dtype.storageBytes(rows * cols));
         return .{ .bytes = bytes, .dtype = dtype, .rows = rows, .cols = cols };
     }
 
@@ -84,10 +85,11 @@ pub fn matmul(
     std.debug.assert(y.len == m * w.rows);
     if (bias) |b| std.debug.assert(b.len == w.rows);
     switch (w.dtype) {
-        .f8_e4m3, .bf16, .f16, .f32, .i8 => {},
+        .f8_e4m3, .bf16, .f16, .f32, .i8, .i4 => {},
         else => return error.UnsupportedDType,
     }
-    if (w.dtype == .i8) std.debug.assert(w.row_scale != null and w.row_scale.?.len == w.rows);
+    if (w.dtype == .i8 or w.dtype == .i4)
+        std.debug.assert(w.row_scale != null and w.row_scale.?.len == w.rows);
     if (m == 0 or w.rows == 0) return;
 
     if (gpuEligible(m, w)) {
@@ -178,6 +180,9 @@ fn packedTask(
     row_end: usize,
     panel: []f32,
 ) void {
+    // i4 is sub-byte packed (nibbles), so it can't ride the byteSize-based
+    // typed path; it has its own kernel that unpacks two values per byte.
+    if (w.dtype == .i4) return packedTaskI4(y, x, m, w, bias, row_start, row_end, panel);
     switch (w.dtype) {
         inline .f8_e4m3, .bf16, .f16, .f32, .i8 => |dt| {
             packedTaskTyped(dt, y, x, m, w, bias, row_start, row_end, panel);
@@ -231,6 +236,83 @@ fn packedTaskTyped(
                 } else {
                     for (0..kl) |k| sub[k * NR + j] = dequantOne(dt, src, k, w.scale);
                 }
+            }
+        }
+
+        var t0: usize = 0;
+        while (t0 < m) : (t0 += MR) {
+            const mr = @min(MR, m - t0);
+            for (0..n_nr) |nr| {
+                const sub = panel[nr * KC * NR ..][0 .. kl * NR];
+                const col0 = row_start + nr * NR;
+                switch (mr) {
+                    inline 1...MR => |mrc| microKernel(
+                        mrc,
+                        y,
+                        x,
+                        sub,
+                        t0,
+                        col0,
+                        rows,
+                        cols,
+                        kc0,
+                        kl,
+                        if (kc0 == 0) bias else null,
+                        kc0 != 0,
+                    ),
+                    else => unreachable,
+                }
+            }
+        }
+    }
+}
+
+/// Dequant `n` consecutive packed-i4 elements starting at logical element
+/// `elem0` (must be even, which holds for row-major weights whose `cols` is a
+/// multiple of the 256 ConvRot group) into `dst`: two signed nibbles per byte,
+/// element 2k in the low nibble, 2k+1 in the high, scaled by `scale`.
+inline fn dequantI4Slice(bytes: []const u8, elem0: usize, n: usize, scale: f32, dst: []f32) void {
+    std.debug.assert(elem0 % 2 == 0);
+    const byte0 = elem0 / 2;
+    for (0..n) |k| {
+        const v = dtypes.DType.nibbleI4(bytes[byte0 + k / 2], @intCast(k & 1));
+        dst[k] = @as(f32, @floatFromInt(v)) * scale;
+    }
+}
+
+/// Packed outer-product path for i4 convrot weights. Mirrors `packedTaskTyped`'s
+/// `.i8` branch (dequant a k-slice row-major, un-rotate the whole group, scatter
+/// k-major) but unpacks two 4-bit values per byte.
+fn packedTaskI4(
+    y: []f32,
+    x: []const f32,
+    m: usize,
+    w: Weight,
+    bias: ?[]const f32,
+    row_start: usize,
+    row_end: usize,
+    panel: []f32,
+) void {
+    const cols = w.cols;
+    const rows = w.rows;
+    const n_nr = std.math.divCeil(usize, row_end - row_start, NR) catch unreachable;
+
+    var kc0: usize = 0;
+    while (kc0 < cols) : (kc0 += KC) {
+        const kl: usize = @min(KC, cols - kc0);
+
+        for (0..n_nr) |nr| {
+            const sub = panel[nr * KC * NR ..][0 .. kl * NR];
+            for (0..NR) |j| {
+                const row = row_start + nr * NR + j;
+                if (row >= rows) {
+                    for (0..kl) |k| sub[k * NR + j] = 0;
+                    continue;
+                }
+                var tmp: [KC]f32 = undefined;
+                dequantI4Slice(w.bytes, row * cols + kc0, kl, w.row_scale.?[row], tmp[0..kl]);
+                if (w.convrot != 0) convrot_mod.rotate(tmp[0..kl]);
+                for (0..kl) |k| sub[k * NR + j] = tmp[k];
             }
         }
 
@@ -354,6 +436,7 @@ fn runRange(
     row_end: usize,
     scratch: []f32,
 ) void {
+    if (w.dtype == .i4) return runRangeI4(y, x, m, w, bias, row_start, row_end, scratch);
     switch (w.dtype) {
         inline .f8_e4m3, .bf16, .f16, .f32, .i8 => |dt| {
             runRangeTyped(dt, y, x, m, w, bias, row_start, row_end, scratch);
@@ -383,6 +466,54 @@ fn runRangeTyped(
             const rs = if (dt == .i8) w.row_scale.?[r + j] else w.scale;
             dequantRow(dt, dst, src, rs);
             if (dt == .i8 and w.convrot != 0) convrot_mod.rotate(dst);
+        }
+        for (0..m) |t| {
+            const xrow = x[t * cols ..][0..cols];
+            var acc: [panel_rows]Vec = @splat(@splat(0));
+            var tail: [panel_rows]f32 = @splat(0);
+            var k: usize = 0;
+            while (k + vlen <= cols) : (k += vlen) {
+                const xv: Vec = xrow[k..][0..vlen].*;
+                inline for (0..panel_rows) |j| {
+                    if (j < nr) {
+                        const wv: Vec = scratch[j * cols + k ..][0..vlen].*;
+                        acc[j] += xv * wv;
+                    }
+                }
+            }
+            while (k < cols) : (k += 1) {
+                for (0..nr) |j| tail[j] += xrow[k] * scratch[j * cols + k];
+            }
+            for (0..nr) |j| {
+                var sum = @reduce(.Add, acc[j]) + tail[j];
+                if (bias) |b| sum += b[r + j];
+                y[t * w.rows + r + j] = sum;
+            }
+        }
+    }
+}
+
+/// Small-m path for i4 convrot weights. Mirrors `runRangeTyped` but dequantizes
+/// each weight row from packed nibbles (+ per-row scale + un-rotation) before
+/// the dtype-independent GEMM accumulation.
+fn runRangeI4(
+    y: []f32,
+    x: []const f32,
+    m: usize,
+    w: Weight,
+    bias: ?[]const f32,
+    row_start: usize,
+    row_end: usize,
+    scratch: []f32,
+) void {
+    const cols = w.cols;
+    var r = row_start;
+    while (r < row_end) : (r += panel_rows) {
+        const nr = @min(panel_rows, row_end - r);
+        for (0..nr) |j| {
+            const dst = scratch[j * cols ..][0..cols];
+            dequantI4Slice(w.bytes, (r + j) * cols, cols, w.row_scale.?[r + j], dst);
+            if (w.convrot != 0) convrot_mod.rotate(dst);
         }
         for (0..m) |t| {
             const xrow = x[t * cols ..][0..cols];
@@ -609,6 +740,83 @@ test "matmul i8 convrot packed path" {
     // m % MR, rows % NR, cols spanning multiple KC blocks and groups.
     try testI8ConvrotAgainstNaive(37, 61, 512, true);
     try testI8ConvrotAgainstNaive(small_m_max, NR + 5, 256 * 3, false);
+}
+
+/// int4 ConvRot: two signed 4-bit weights packed per byte + per-row scale,
+/// dequantized with the group rotation. Same shape as the i8 helper — the
+/// naive reference uses the fully un-rotated f32 weights — but weights are
+/// int4 [-8,7] packed low-nibble-first.
+fn testI4ConvrotAgainstNaive(m: usize, rows: usize, cols: usize, with_bias: bool) !void {
+    std.debug.assert(cols % convrot_mod.group_size == 0);
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var prng = std.Random.DefaultPrng.init(123);
+    const rand = prng.random();
+
+    const x = try gpa.alloc(f32, m * cols);
+    defer gpa.free(x);
+    for (x) |*v| v.* = rand.floatNorm(f32);
+
+    const bias = if (with_bias) try gpa.alloc(f32, rows) else null;
+    defer if (bias) |b| gpa.free(b);
+    if (bias) |b| for (b) |*v| {
+        v.* = rand.floatNorm(f32);
+    };
+
+    // Random int4 values in [-8, 7], one per logical element.
+    const nibbles = try gpa.alloc(i8, rows * cols);
+    defer gpa.free(nibbles);
+    for (nibbles) |*v| v.* = @as(i8, rand.intRangeAtMost(i4, -8, 7));
+
+    // Pack two per byte, low nibble = even element.
+    const qbytes = try gpa.alloc(u8, rows * cols / 2);
+    defer gpa.free(qbytes);
+    for (qbytes, 0..) |*b, i| {
+        const lo: u8 = @as(u4, @bitCast(@as(i4, @intCast(nibbles[2 * i]))));
+        const hi: u8 = @as(u4, @bitCast(@as(i4, @intCast(nibbles[2 * i + 1]))));
+        b.* = lo | (hi << 4);
+    }
+
+    const row_scale = try gpa.alloc(f32, rows);
+    defer gpa.free(row_scale);
+    for (row_scale) |*s| s.* = 0.001 + rand.float(f32) * 0.01;
+
+    // Reference weights: dequant then un-rotate each row's groups.
+    const w_f32 = try gpa.alloc(f32, rows * cols);
+    defer gpa.free(w_f32);
+    for (0..rows) |r| {
+        const dst = w_f32[r * cols ..][0..cols];
+        for (0..cols) |c| dst[c] = @as(f32, @floatFromInt(nibbles[r * cols + c])) * row_scale[r];
+        convrot_mod.rotate(dst);
+    }
+
+    const y = try gpa.alloc(f32, m * rows);
+    defer gpa.free(y);
+    const y_ref = try gpa.alloc(f32, m * rows);
+    defer gpa.free(y_ref);
+
+    var w = Weight.init(qbytes, .i4, rows, cols);
+    w.row_scale = row_scale;
+    w.convrot = convrot_mod.group_size;
+    try matmul(io, gpa, y, x, m, w, bias);
+    naiveMatmul(y_ref, x, m, w_f32, rows, cols, bias);
+
+    for (y_ref, y) |e, a| {
+        const tol = 1e-3 + 1e-5 * @abs(e) * @sqrt(@as(f32, @floatFromInt(cols)));
+        try std.testing.expectApproxEqAbs(e, a, tol);
+    }
+}
+
+test "matmul i4 convrot small-m path" {
+    try testI4ConvrotAgainstNaive(1, 9, 256, false);
+    try testI4ConvrotAgainstNaive(4, 17, 512, true);
+}
+
+test "matmul i4 convrot packed path" {
+    try testI4ConvrotAgainstNaive(32, 64, 256, true);
+    // m % MR, rows % NR, cols spanning multiple KC blocks and groups.
+    try testI4ConvrotAgainstNaive(37, 61, 512, true);
+    try testI4ConvrotAgainstNaive(small_m_max, NR + 5, 256 * 3, false);
 }
 
 test "matmul rejects unsupported dtype" {

@@ -174,6 +174,11 @@ pub const Backend = struct {
     prep_owned: std.ArrayListUnmanaged(ctxmod.Module) = .empty,
     fused_mod: ?ctxmod.Module = null,
     fused_fn: cu.CUfunction = null,
+    // int4 (W4A4) variants: prep quantizes to s4 and the GEMM is m16n8k64.s4.
+    i4_prep_mods: std.AutoHashMapUnmanaged(usize, cu.CUfunction) = .empty,
+    i4_prep_owned: std.ArrayListUnmanaged(ctxmod.Module) = .empty,
+    i4_fused_mod: ?ctxmod.Module = null,
+    i4_fused_fn: cu.CUfunction = null,
     mm_mod: ?ctxmod.Module = null,
     mm_fn: cu.CUfunction = null,
     hgemm_mod: ?ctxmod.Module = null,
@@ -259,6 +264,10 @@ pub const Backend = struct {
         self.prep_mods.deinit(self.gpa);
         for (self.prep_owned.items) |m| m.unload(self.ctx);
         self.prep_owned.deinit(self.gpa);
+        self.i4_prep_mods.deinit(self.gpa);
+        for (self.i4_prep_owned.items) |m| m.unload(self.ctx);
+        self.i4_prep_owned.deinit(self.gpa);
+        if (self.i4_fused_mod) |m| m.unload(self.ctx);
         if (self.fused_mod) |m| m.unload(self.ctx);
         if (self.mm_mod) |m| m.unload(self.ctx);
         if (self.hgemm_mod) |m| m.unload(self.ctx);
@@ -610,7 +619,7 @@ pub const Backend = struct {
 
     fn prepFn(self: *Backend, cols: usize) Error!cu.CUfunction {
         if (self.prep_mods.get(cols)) |f| return f;
-        const ptx = kernels.buildPrep(self.gpa, cols) catch return error.OutOfMemory;
+        const ptx = kernels.buildPrep(self.gpa, cols, 8) catch return error.OutOfMemory;
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         const f = mod.getFunction(self.ctx, "iprep") catch return error.CudaError;
@@ -622,7 +631,7 @@ pub const Backend = struct {
 
     fn fusedFn(self: *Backend) Error!cu.CUfunction {
         if (self.fused_mod != null) return self.fused_fn;
-        const ptx = kernels.buildIgemmPipe(self.gpa, 64, true) catch return error.OutOfMemory;
+        const ptx = kernels.buildIgemmPipe(self.gpa, 64, true, 8) catch return error.OutOfMemory;
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         self.fused_fn = mod.getFunction(self.ctx, "igemm_pipe_fused") catch return error.CudaError;
@@ -773,9 +782,16 @@ pub const Backend = struct {
         const mpad = std.mem.alignForward(usize, m, 128);
         try self.ensureDeviceBuffer(&self.i8_x, mpad * cols);
         try self.ensureDeviceBuffer(&self.i8_scale, mpad * 4);
-        // pad rows m..mpad must be zero (GEMM pad rows -> 0 acc; scale 0).
-        self.ctx.memsetD8(.{ .ptr = self.i8_x.ptr(), .bytes = @intCast(self.i8_x.size) }, 0, mpad * cols) catch return error.CudaError;
-        self.ctx.memsetD32(.{ .ptr = self.i8_scale.ptr(), .bytes = @intCast(self.i8_scale.size) }, 0, mpad) catch return error.CudaError;
+        // The prep kernel (grid = {m,1,1}) fully overwrites rows 0..m-1 — every
+        // column (cols % 1024 == 0, see buildPrep) plus i8_scale[row] — so only
+        // the pad rows [m..mpad) need zeroing (GEMM pad rows -> 0 acc, scale 0).
+        // When m is already 128-aligned there is no pad, so skip the memset (and
+        // its NULL-stream sync bubble) entirely.
+        if (mpad > m) {
+            const pad = mpad - m;
+            self.ctx.memsetD8(.{ .ptr = self.i8_x.ptr() + @as(u64, @intCast(m * cols)), .bytes = @intCast(pad * cols) }, 0, pad * cols) catch return error.CudaError;
+            self.ctx.memsetD32(.{ .ptr = self.i8_scale.ptr() + @as(u64, @intCast(m * 4)), .bytes = @intCast(pad * 4) }, 0, pad) catch return error.CudaError;
+        }
         const f = try self.prepFn(cols);
         var px = x.ptr();
         var pq = self.i8_x.ptr();
@@ -796,6 +812,78 @@ pub const Backend = struct {
         const w_db = try self.cachedWeight(w_bytes);
         const ws_db = try self.cachedWeight(std.mem.sliceAsBytes(weight_scale));
         const f = try self.fusedFn();
+        var pa = self.i8_x.ptr();
+        var pb = w_db.ptr();
+        var pc = y.ptr();
+        var pn: u32 = @intCast(rows);
+        var pk: u32 = @intCast(self.i8_cols);
+        var pas = self.i8_scale.ptr();
+        var pws = ws_db.ptr();
+        var pg = [_]?*anyopaque{ @ptrCast(&pa), @ptrCast(&pb), @ptrCast(&pc), @ptrCast(&pn), @ptrCast(&pk), @ptrCast(&pas), @ptrCast(&pws) };
+        self.ctx.launch(f, .{ @intCast(rows / 128), @intCast(self.i8_mpad / 128), 1 }, .{ 128, 1, 1 }, 0, &pg) catch return error.CudaError;
+    }
+
+    // ---- int4 (W4A4) GEMM pair ----------------------------------------------
+
+    fn i4prepFn(self: *Backend, cols: usize) Error!cu.CUfunction {
+        if (self.i4_prep_mods.get(cols)) |f| return f;
+        const ptx = kernels.buildPrep(self.gpa, cols, 4) catch return error.OutOfMemory;
+        defer self.gpa.free(ptx);
+        var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
+        const f = mod.getFunction(self.ctx, "i4prep") catch return error.CudaError;
+        self.ctx.setMaxDynamicShared(f, kernels.prepSharedBytes(cols)) catch return error.CudaError;
+        self.i4_prep_owned.append(self.gpa, mod) catch return error.OutOfMemory;
+        self.i4_prep_mods.put(self.gpa, cols, f) catch return error.OutOfMemory;
+        return f;
+    }
+
+    fn i4fusedFn(self: *Backend) Error!cu.CUfunction {
+        if (self.i4_fused_mod != null) return self.i4_fused_fn;
+        const ptx = kernels.buildIgemmPipe(self.gpa, 64, true, 4) catch return error.OutOfMemory;
+        defer self.gpa.free(ptx);
+        var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
+        self.i4_fused_fn = mod.getFunction(self.ctx, "i4gemm_pipe_fused") catch return error.CudaError;
+        self.i4_fused_mod = mod;
+        return self.i4_fused_fn;
+    }
+
+    /// int4 (W4A4) analogue of opI8Prep: rotate + per-row dynamic quantize
+    /// x[m][cols] to s4 [-8,7], nibble-packed 2/byte -> i8_x (reused as the
+    /// packed-s4 activation scratch) + i8_scale (per-row f32), padding m up to
+    /// 128. Consumed by opI4Gemm. (The i8_* state is a homogeneous checkpoint's
+    /// single "prepped activation" slot — a run is all-i8 or all-i4.)
+    pub fn opI4Prep(self: *Backend, x: DeviceBuffer, m: usize, cols: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.prep);
+        const mpad = std.mem.alignForward(usize, m, 128);
+        const qbytes = cols / 2; // packed s4 bytes per row
+        try self.ensureDeviceBuffer(&self.i8_x, mpad * qbytes);
+        try self.ensureDeviceBuffer(&self.i8_scale, mpad * 4);
+        if (mpad > m) {
+            const pad = mpad - m;
+            self.ctx.memsetD8(.{ .ptr = self.i8_x.ptr() + @as(u64, @intCast(m * qbytes)), .bytes = @intCast(pad * qbytes) }, 0, pad * qbytes) catch return error.CudaError;
+            self.ctx.memsetD32(.{ .ptr = self.i8_scale.ptr() + @as(u64, @intCast(m * 4)), .bytes = @intCast(pad * 4) }, 0, pad) catch return error.CudaError;
+        }
+        const f = try self.i4prepFn(cols);
+        var px = x.ptr();
+        var pq = self.i8_x.ptr();
+        var pas = self.i8_scale.ptr();
+        var pp = [_]?*anyopaque{ @ptrCast(&px), @ptrCast(&pq), @ptrCast(&pas) };
+        self.ctx.launch(f, .{ @intCast(m), 1, 1 }, .{ 256, 1, 1 }, @intCast(kernels.prepSharedBytes(cols)), &pp) catch return error.CudaError;
+        self.i8_m = m;
+        self.i8_mpad = mpad;
+        self.i8_cols = cols;
+    }
+
+    /// int4 GEMM + fused rescale against the last opI4Prep. `w_bytes` are the
+    /// packed-s4 weight [rows][cols/2]; layout/params match opI8Gemm exactly
+    /// (the m16n8k64.s4 kernel derives the k/2 byte stride from the element k).
+    pub fn opI4Gemm(self: *Backend, y: DeviceBuffer, w_bytes: []const u8, weight_scale: []const f32, rows: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.matmul);
+        const w_db = try self.cachedWeight(w_bytes);
+        const ws_db = try self.cachedWeight(std.mem.sliceAsBytes(weight_scale));
+        const f = try self.i4fusedFn();
         var pa = self.i8_x.ptr();
         var pb = w_db.ptr();
         var pc = y.ptr();

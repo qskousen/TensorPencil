@@ -163,7 +163,7 @@ pub const SafeTensors = struct {
         const start: usize = @intCast(start_v.integer);
         const end: usize = @intCast(end_v.integer);
         if (end > payload_len) return error.InvalidOffsets;
-        if (end - start != shape.count() * dt.byteSize()) return error.InvalidOffsets;
+        if (end - start != dt.storageBytes(shape.count())) return error.InvalidOffsets;
 
         return .{ .name = name, .dtype = dt, .shape = shape, .start = start, .end = end };
     }
@@ -197,7 +197,7 @@ pub const SafeTensors = struct {
 /// Convert raw little-endian tensor bytes to f32. `bytes` may be unaligned
 /// (safetensors gives no alignment guarantees).
 pub fn convertToF32(dt: DType, bytes: []const u8, out: []f32) ConvertError!void {
-    if (bytes.len != out.len * dt.byteSize()) return error.LengthMismatch;
+    if (bytes.len != dt.storageBytes(out.len)) return error.LengthMismatch;
     switch (dt) {
         .f32 => {
             if (comptime builtin.cpu.arch.endian() == .little) {

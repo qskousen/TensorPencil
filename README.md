@@ -4,7 +4,8 @@
 
 TensorPencil is a test to see how far we can push diffusion performance in pure Zig (aside from Vulkan / CUDA libraries).
 
-It currently targets FP8 and INT8 ConvRot Krea 2, and those are the only models that have been tested.
+It currently targets FP8 and INT8/INT4 ConvRot Krea 2, and those are the only models that have been tested.
+I made up the INT4 format because I was curious, so you won't be able to find any INT4 ConvRot models. Sorry.
 Currently the Vulkan results differ slightly from ComfyUI but are pretty close - the Zig noise kernel was created to generate bit-identical initial noise,
 and any remaining difference is due to the Zig DiT kernels reducing in a different order than cuBLAS/FlashAttention;
 over 20 steps that difference accumulates as slight texture-level drift.

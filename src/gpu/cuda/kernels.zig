@@ -203,6 +203,120 @@ pub const igemm_v0_ptx: [:0]const u8 =
     \\}
 ;
 
+// ---------------------------------------------------------------------------
+// int4 IMMA GEMM (W4A4).  C[m][n] (s32) = A(s4)[m][k] @ B(s4)[n][k]^T.
+//
+// A and B are nibble-packed: two signed 4-bit values per byte, element 2j in
+// the low nibble, 2j+1 in the high (the on-disk convrot weight layout, and the
+// same layout opI4Prep writes for activations). k is contiguous, so 8
+// consecutive-k s4 values are exactly one u32 — loadable straight into an mma
+// fragment register, no repack (mirrors the s8 path's 4-consecutive-k u32).
+//
+// m16n8k64 s4 fragment layout: groupID = lane>>2, tid = lane&3.
+//   A: a0=(row gid, k tid*8+0..7), a1=(row gid+8, same k),
+//      a2=(row gid, k tid*8+32..39), a3=(row gid+8, k+32).  (8 s4 = 1 u32)
+//   B: b0=(col gid, k tid*8+0..7), b1=(col gid, k tid*8+32..39).
+//   C: identical to the s8 m16n8k32 case (s32 16x8 tile).
+// A/B byte addr of element (row,kk): row*(k/2) + kk/2 ; a u32 at
+//   row*(k/2) + tid*4 + k0/2 covers k = k0+tid*8 .. +7. a2/b1 sit +16 bytes.
+// ---------------------------------------------------------------------------
+
+/// v0 — correctness reference for the s4 tensor-core GEMM: one warp per 16x8
+/// output tile, fragments loaded straight from global, s32 accumulate over the
+/// full k. Slow (no reuse) but obviously correct. Requires m%16==0, n%8==0,
+/// k%64==0. Grid (n/8, m/16), 32 threads.
+pub const i4gemm_v0_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\
+    \\.visible .entry i4gemm_v0(
+    \\    .param .u64 p_a,
+    \\    .param .u64 p_b,
+    \\    .param .u64 p_c,
+    \\    .param .u32 p_n,
+    \\    .param .u32 p_k
+    \\)
+    \\{
+    \\    .reg .pred %p<2>;
+    \\    .reg .b32 %r<40>;
+    \\    .reg .b64 %rd<20>;
+    \\    .reg .b32 %c<4>;
+    \\    ld.param.u64 %rd1, [p_a];
+    \\    ld.param.u64 %rd2, [p_b];
+    \\    ld.param.u64 %rd3, [p_c];
+    \\    ld.param.u32 %r1, [p_n];
+    \\    ld.param.u32 %r2, [p_k];
+    \\    cvta.to.global.u64 %rd1, %rd1;
+    \\    cvta.to.global.u64 %rd2, %rd2;
+    \\    cvta.to.global.u64 %rd3, %rd3;
+    \\    mov.u32 %r3, %tid.x;
+    \\    and.b32 %r3, %r3, 31;
+    \\    shr.u32 %r4, %r3, 2;          // gid = lane>>2
+    \\    and.b32 %r5, %r3, 3;          // tid = lane&3
+    \\    mov.u32 %r6, %ctaid.y;
+    \\    mov.u32 %r7, %ctaid.x;
+    \\    shl.b32 %r8, %r6, 4;          // row0 = ctaid.y*16
+    \\    shl.b32 %r9, %r7, 3;          // col0 = ctaid.x*8
+    \\    add.u32 %r10, %r8, %r4;       // rowA = row0 + gid
+    \\    add.u32 %r11, %r10, 8;        // rowA8
+    \\    add.u32 %r12, %r9, %r4;       // colB = col0 + gid
+    \\    shr.u32 %r26, %r2, 1;         // khb = k/2 (row stride in bytes)
+    \\    shl.b32 %r13, %r5, 2;         // tid*4 (byte offset within row)
+    \\    // A row bases: rd4 = A + rowA*khb + tid*4 ; rd5 = A + rowA8*khb + tid*4
+    \\    mul.wide.u32 %rd4, %r10, %r26;
+    \\    add.s64 %rd4, %rd1, %rd4;
+    \\    mul.wide.u32 %rd5, %r11, %r26;
+    \\    add.s64 %rd5, %rd1, %rd5;
+    \\    // B row base: rd6 = B + colB*khb + tid*4
+    \\    mul.wide.u32 %rd6, %r12, %r26;
+    \\    add.s64 %rd6, %rd2, %rd6;
+    \\    cvt.u64.u32 %rd7, %r13;
+    \\    add.s64 %rd4, %rd4, %rd7;
+    \\    add.s64 %rd5, %rd5, %rd7;
+    \\    add.s64 %rd6, %rd6, %rd7;
+    \\    mov.u32 %c0, 0;
+    \\    mov.u32 %c1, 0;
+    \\    mov.u32 %c2, 0;
+    \\    mov.u32 %c3, 0;
+    \\    mov.u32 %r14, 0;              // koff (bytes), 0..khb step 32
+    \\LOOP:
+    \\    setp.ge.u32 %p1, %r14, %r26;
+    \\    @%p1 bra ENDLOOP;
+    \\    cvt.u64.u32 %rd8, %r14;
+    \\    add.s64 %rd9, %rd4, %rd8;
+    \\    ld.global.u32 %r20, [%rd9];       // a0 (rowA, k0..)
+    \\    ld.global.u32 %r22, [%rd9+16];    // a2 (rowA, k0+32..)
+    \\    add.s64 %rd10, %rd5, %rd8;
+    \\    ld.global.u32 %r21, [%rd10];      // a1 (rowA8, k0..)
+    \\    ld.global.u32 %r23, [%rd10+16];   // a3 (rowA8, k0+32..)
+    \\    add.s64 %rd11, %rd6, %rd8;
+    \\    ld.global.u32 %r24, [%rd11];      // b0 (colB, k0..)
+    \\    ld.global.u32 %r25, [%rd11+16];   // b1 (colB, k0+32..)
+    \\    mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32
+    \\      {%c0,%c1,%c2,%c3},
+    \\      {%r20,%r21,%r22,%r23},
+    \\      {%r24,%r25},
+    \\      {%c0,%c1,%c2,%c3};
+    \\    add.u32 %r14, %r14, 32;
+    \\    bra LOOP;
+    \\ENDLOOP:
+    \\    shl.b32 %r16, %r5, 1;         // tid*2
+    \\    add.u32 %r17, %r9, %r16;      // col = col0 + tid*2
+    \\    mad.lo.u32 %r18, %r10, %r1, %r17;
+    \\    mul.wide.u32 %rd12, %r18, 4;
+    \\    add.s64 %rd12, %rd3, %rd12;
+    \\    st.global.u32 [%rd12], %c0;
+    \\    st.global.u32 [%rd12+4], %c1;
+    \\    mad.lo.u32 %r19, %r11, %r1, %r17;
+    \\    mul.wide.u32 %rd13, %r19, 4;
+    \\    add.s64 %rd13, %rd3, %rd13;
+    \\    st.global.u32 [%rd13], %c2;
+    \\    st.global.u32 [%rd13+4], %c3;
+    \\    ret;
+    \\}
+;
+
 const ptx = @import("ptx.zig");
 
 /// v1 — shared-memory register-tiled IMMA GEMM. 128x128 block tile, 4 warps
@@ -440,7 +554,15 @@ pub fn buildIgemmSmem(alloc: std.mem.Allocator) ![:0]u8 {
 /// K_STEP is a parameter: 64 -> 32 KB shared (no opt-in); 128 -> 64 KB (needs
 /// cuFuncSetAttribute opt-in, the >48 KB lever). Requires m%128==0, n%128==0,
 /// k%K_STEP==0. Entry `igemm_pipe`.
-pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool) ![:0]u8 {
+pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool, bits: usize) ![:0]u8 {
+    std.debug.assert(bits == 8 or bits == 4);
+    // s8: one m16n8k32 per 32-byte substep (32 k). s4: one m16n8k64 per 32-byte
+    // substep (64 k). Staging/tile math is byte-based and identical; only the
+    // mma opcode and the global row byte-stride (k vs k/2) differ.
+    const mma_op = if (bits == 8)
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32"
+    else
+        "mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32";
     const BM = 128;
     const MT = 4;
     const NT = 8;
@@ -471,6 +593,9 @@ pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool) ![:0]u
     try b.linef("ld.param.u64 {s}, [p_c];", .{rd_c});
     try b.linef("ld.param.u32 {s}, [p_n];", .{r_n});
     try b.linef("ld.param.u32 {s}, [p_k];", .{r_k});
+    // r_k is used only as the global row byte-stride and the slab count divisor.
+    // s4 packs two elements per byte, so the byte stride is k/2.
+    if (bits == 4) try b.linef("shr.u32 {s}, {s}, 1;", .{ r_k, r_k });
     if (fuse) {
         try b.linef("ld.param.u64 {s}, [p_as];", .{rd_as});
         try b.linef("ld.param.u64 {s}, [p_ws];", .{rd_ws});
@@ -661,7 +786,8 @@ pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool) ![:0]u
             nj = 0;
             while (nj < NT) : (nj += 1) {
                 const a = acc[(mi * NT + nj) * 4 ..][0..4];
-                try b.linef("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {{{s},{s},{s},{s}}}, {{{s},{s},{s},{s}}}, {{{s},{s}}}, {{{s},{s},{s},{s}}};", .{
+                try b.linef("{s} {{{s},{s},{s},{s}}}, {{{s},{s},{s},{s}}}, {{{s},{s}}}, {{{s},{s},{s},{s}}};", .{
+                    mma_op,
                     a[0],           a[1],           a[2],           a[3],
                     af[mi * 4 + 0], af[mi * 4 + 1], af[mi * 4 + 2], af[mi * 4 + 3],
                     bf[nj * 2 + 0], bf[nj * 2 + 1], a[0],           a[1],
@@ -756,23 +882,36 @@ pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool) ![:0]u
         "    .param .u64 p_a,\n    .param .u64 p_b,\n    .param .u64 p_c,\n    .param .u32 p_n,\n    .param .u32 p_k,\n    .param .u64 p_as,\n    .param .u64 p_ws"
     else
         "    .param .u64 p_a,\n    .param .u64 p_b,\n    .param .u64 p_c,\n    .param .u32 p_n,\n    .param .u32 p_k";
-    return b.build(if (fuse) "igemm_pipe_fused" else "igemm_pipe", params, shared_decl);
+    const entry = if (bits == 8)
+        (if (fuse) "igemm_pipe_fused" else "igemm_pipe")
+    else
+        (if (fuse) "i4gemm_pipe_fused" else "i4gemm_pipe");
+    return b.build(entry, params, shared_decl);
 }
 
-/// Fused int8 activation prep, one block (256 threads) per row: load x[row]
-/// into dynamic shared f32, radix-4 FWHT per 256-group (bit-identical to
+/// Fused activation prep, one block (256 threads) per row: load x[row] into
+/// dynamic shared f32, radix-4 FWHT per 256-group (bit-identical to
 /// convrot.rotate — each butterfly output is a fixed 4-input sum, so the
 /// parallel order matches the serial CPU order exactly), /16 normalize +
-/// per-row abs-max, dynamic scale = max(absmax/127, 1e-12), then round-half-away
-/// quantize to packed int8 [m][cols/4] + act_scale[m]. Uses >48 KB dynamic
-/// shared for cols=16384 (the Vulkan path was forced to f16 there by the 48 KB
-/// cap; here f32 rotation is exact). Entry `iprep`. Requires cols%256==0,
-/// (cols/256)%4==0 (so ngroups*64 % 256 == 0). block 256, grid (m,1,1).
-pub fn buildPrep(alloc: std.mem.Allocator, cols: usize) ![:0]u8 {
+/// per-row abs-max, dynamic scale = max(absmax/maxq, 1e-12), then round-half-away
+/// quantize + pack. `bits` selects the output format: 8 → int8, 4 s8/u32,
+/// entry `iprep`, clamp [-128,127]; 4 → int4, 8 s4/u32, entry `i4prep`, clamp
+/// [-8,7]. Packed row is [m][cols/(32/bits)] u32. Uses >48 KB dynamic shared for
+/// cols=16384 (the Vulkan path was forced to f16 there by the 48 KB cap; here
+/// f32 rotation is exact). Requires cols%256==0, (cols/256)%4==0 (FWHT) and
+/// (cols/(32/bits))%256==0 (pack). block 256, grid (m,1,1).
+pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize) ![:0]u8 {
+    std.debug.assert(bits == 8 or bits == 4);
+    const per_word = 32 / bits; // s8: 4 elements/u32 ; s4: 8 elements/u32
+    const per_word_log2 = std.math.log2_int(usize, per_word);
+    const maxq: i32 = (@as(i32, 1) << @intCast(bits - 1)) - 1; // 127 / 7
+    const minq: i32 = -(@as(i32, 1) << @intCast(bits - 1)); // -128 / -8
+    const elt_mask: u32 = (@as(u32, 1) << @intCast(bits)) - 1; // 0xFF / 0xF
+    const maxq_hex: u32 = @bitCast(@as(f32, @floatFromInt(maxq))); // 127.0 / 7.0 bits
     const ngroups = cols / 256;
     const nbf = ngroups * 64 / 256; // butterflies/thread/pass (all 256 threads busy)
     const load_iters = cols / 256;
-    const word_iters = cols / 1024; // packed u32 words / thread
+    const word_iters = cols / (per_word * 256); // packed u32 words / thread
     const SMAX_OFF = cols * 4; // smax[256] f32 region
     const SCALE_OFF = SMAX_OFF + 256 * 4; // scale broadcast slot
 
@@ -926,8 +1065,8 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize) ![:0]u8 {
     try b.linef("setp.ne.u32 {s}, {s}, 0;", .{ p_red, r_t });
     try b.linef("@{s} bra {s};", .{ p_red, lbl_sk });
     try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ fsc, r_smem, SMAX_OFF }); // smax[0] = absmax
-    try b.linef("div.rn.f32 {s}, {s}, 0f42FE0000;", .{ fsc, fsc }); // /127.0
-    try b.linef("max.f32 {s}, {s}, 0f2B8CBCCC;", .{ fsc, fsc }); // 1e-12
+    try b.linef("div.rn.f32 {s}, {s}, 0f{X:0>8};", .{ fsc, fsc, maxq_hex }); // /127.0 (s8) or /7.0 (s4)
+    try b.linef("max.f32 {s}, {s}, 0f2B8CBCCC;", .{ fsc, fsc }); // 1e-12 zero-guard
     try b.linef("add.u32 {s}, {s}, {d};", .{ r_scaleaddr, r_smem, SCALE_OFF });
     try b.linef("st.shared.f32 [{s}], {s};", .{ r_scaleaddr, fsc });
     try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rd_srow, r_row });
@@ -948,32 +1087,32 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize) ![:0]u8 {
     const r_esha = try b.reg(.b32);
     // scale broadcast
     try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ fsc, r_smem, SCALE_OFF });
-    // q row base = p_q + row*(cols/4)*4
-    try b.linef("mul.wide.u32 {s}, {s}, {d};", .{ rd_qrow, r_row, (cols / 4) * 4 });
+    // q row base = p_q + row*(cols/per_word)*4 bytes  (= row*cols for s8, row*cols/2 for s4)
+    try b.linef("mul.wide.u32 {s}, {s}, {d};", .{ rd_qrow, r_row, (cols / per_word) * 4 });
     try b.linef("add.s64 {s}, {s}, {s};", .{ rd_qrow, rd_q, rd_qrow });
     {
         var i: usize = 0;
         while (i < word_iters) : (i += 1) {
             try b.linef("add.u32 {s}, {s}, {d};", .{ r_word, r_t, i * 256 });
             try b.linef("mov.u32 {s}, 0;", .{r_out});
-            // element base col = word*4 ; shared byte = smem + col*4
-            try b.linef("shl.b32 {s}, {s}, 2;", .{ r_ecol, r_word }); // col = word*4
+            // element base col = word*per_word ; shared byte = smem + col*4
+            try b.linef("shl.b32 {s}, {s}, {d};", .{ r_ecol, r_word, per_word_log2 });
             try b.linef("shl.b32 {s}, {s}, 2;", .{ r_esha, r_ecol }); // byte = col*4
             try b.linef("add.u32 {s}, {s}, {s};", .{ r_esha, r_esha, r_smem });
             var kk: usize = 0;
-            while (kk < 4) : (kk += 1) {
+            while (kk < per_word) : (kk += 1) {
                 try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ fv, r_esha, kk * 4 });
                 try b.linef("div.rn.f32 {s}, {s}, {s};", .{ fr, fv, fsc });
                 try b.linef("copysign.f32 {s}, {s}, 0f3F000000;", .{ fh, fr }); // copysign(0.5, r)
                 try b.linef("add.f32 {s}, {s}, {s};", .{ fr, fr, fh });
-                try b.linef("cvt.rzi.s32.f32 {s}, {s};", .{ r_q, fr }); // trunc
-                try b.linef("max.s32 {s}, {s}, -127;", .{ r_q, r_q });
-                try b.linef("min.s32 {s}, {s}, 127;", .{ r_q, r_q });
-                try b.linef("and.b32 {s}, {s}, 255;", .{ r_q, r_q });
+                try b.linef("cvt.rzi.s32.f32 {s}, {s};", .{ r_q, fr }); // round half away
+                try b.linef("max.s32 {s}, {s}, {d};", .{ r_q, r_q, minq });
+                try b.linef("min.s32 {s}, {s}, {d};", .{ r_q, r_q, maxq });
+                try b.linef("and.b32 {s}, {s}, {d};", .{ r_q, r_q, elt_mask });
                 if (kk == 0) {
                     try b.linef("mov.b32 {s}, {s};", .{ r_out, r_q });
                 } else {
-                    try b.linef("shl.b32 {s}, {s}, {d};", .{ r_q, r_q, kk * 8 });
+                    try b.linef("shl.b32 {s}, {s}, {d};", .{ r_q, r_q, kk * bits });
                     try b.linef("or.b32 {s}, {s}, {s};", .{ r_out, r_out, r_q });
                 }
             }
@@ -985,13 +1124,14 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize) ![:0]u8 {
     }
 
     return b.build(
-        "iprep",
+        if (bits == 8) "iprep" else "i4prep",
         "    .param .u64 p_x,\n    .param .u64 p_q,\n    .param .u64 p_s",
         ".extern .shared .align 16 .b8 smem[];",
     );
 }
 
-/// dynamic-shared byte requirement for a `buildPrep(cols)` launch.
+/// dynamic-shared byte requirement for a prep launch (bit-width-independent:
+/// the FWHT runs on the f32 activations in shared regardless of output bits).
 pub fn prepSharedBytes(cols: usize) usize {
     return cols * 4 + 256 * 4 + 256;
 }
@@ -1842,7 +1982,7 @@ pub fn i8GemmTest(ctx: *Context, io: anytype, stdout: anytype) !void {
     var mod1 = try ctx.loadModule(smem_ptx);
     defer mod1.unload(ctx);
     const f_smem = try mod1.getFunction(ctx, "igemm_smem");
-    const pipe_ptx = try buildIgemmPipe(gpa, 64, false);
+    const pipe_ptx = try buildIgemmPipe(gpa, 64, false, 8);
     defer gpa.free(pipe_ptx);
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = "/tmp/claude-1000/-dump-projects-zig-TensorPencil/eccfce6f-7c1f-4c32-b182-cc9c60d44a58/scratchpad/igemm_pipe.gen.ptx", .data = pipe_ptx }) catch {};
     var mod2 = try ctx.loadModule(pipe_ptx);
@@ -1958,6 +2098,220 @@ pub fn i8GemmTest(ctx: *Context, io: anytype, stdout: anytype) !void {
     }
 }
 
+/// Validate the raw int4 tensor-core GEMM (s4*s4->s32) against a CPU oracle.
+/// Random s4 [-8,7] operands, nibble-packed 2/byte, checked exactly (integer
+/// mma is bit-exact). This proves the m16n8k64.s4 fragment layout on this GPU.
+pub fn i4GemmTest(ctx: *Context, io: anytype, stdout: anytype) !void {
+    _ = io;
+    var mod0 = try ctx.loadModule(i4gemm_v0_ptx);
+    defer mod0.unload(ctx);
+    const f_v0 = try mod0.getFunction(ctx, "i4gemm_v0");
+
+    const Case = struct { m: usize, n: usize, k: usize };
+    const cases = [_]Case{
+        .{ .m = 16, .n = 8, .k = 64 },
+        .{ .m = 64, .n = 256, .k = 128 },
+        .{ .m = 128, .n = 128, .k = 256 },
+        .{ .m = 48, .n = 72, .k = 320 },
+    };
+    var prng = std.Random.DefaultPrng.init(7);
+    const rand = prng.random();
+
+    for (cases) |c| {
+        const m = c.m;
+        const n = c.n;
+        const k = c.k;
+        // Unpacked s4 values (as i8 in [-8,7]) for the oracle, plus the packed
+        // nibble buffers the kernel reads.
+        const au = try gpa.alloc(i8, m * k);
+        defer gpa.free(au);
+        const bu = try gpa.alloc(i8, n * k);
+        defer gpa.free(bu);
+        for (au) |*v| v.* = rand.intRangeAtMost(i4, -8, 7);
+        for (bu) |*v| v.* = rand.intRangeAtMost(i4, -8, 7);
+        const ab = try gpa.alloc(u8, m * k / 2);
+        defer gpa.free(ab);
+        const bb = try gpa.alloc(u8, n * k / 2);
+        defer gpa.free(bb);
+        for (ab, 0..) |*p, i| p.* = @as(u8, @as(u4, @bitCast(@as(i4, @intCast(au[2 * i]))))) |
+            (@as(u8, @as(u4, @bitCast(@as(i4, @intCast(au[2 * i + 1]))))) << 4);
+        for (bb, 0..) |*p, i| p.* = @as(u8, @as(u4, @bitCast(@as(i4, @intCast(bu[2 * i]))))) |
+            (@as(u8, @as(u4, @bitCast(@as(i4, @intCast(bu[2 * i + 1]))))) << 4);
+
+        var da = try ctx.alloc(m * k / 2);
+        defer ctx.free(&da);
+        var db = try ctx.alloc(n * k / 2);
+        defer ctx.free(&db);
+        var dc = try ctx.alloc(m * n * 4);
+        defer ctx.free(&dc);
+        try ctx.upload(da, ab);
+        try ctx.upload(db, bb);
+
+        var pa = da.ptr;
+        var pb = db.ptr;
+        var pc = dc.ptr;
+        var pn: u32 = @intCast(n);
+        var pk: u32 = @intCast(k);
+        var params = [_]?*anyopaque{ @ptrCast(&pa), @ptrCast(&pb), @ptrCast(&pc), @ptrCast(&pn), @ptrCast(&pk) };
+        try ctx.launch(f_v0, .{ @intCast(n / 8), @intCast(m / 16), 1 }, .{ 32, 1, 1 }, 0, &params);
+
+        const cg = try gpa.alloc(u8, m * n * 4);
+        defer gpa.free(cg);
+        try ctx.download(dc, cg);
+        const ci: []const i32 = @alignCast(std.mem.bytesAsSlice(i32, cg));
+        var mism: usize = 0;
+        for (0..m) |i| {
+            for (0..n) |j| {
+                var acc: i32 = 0;
+                for (0..k) |kk| acc += @as(i32, au[i * k + kk]) * @as(i32, bu[j * k + kk]);
+                if (ci[i * n + j] != acc) {
+                    if (mism < 5) try stdout.print("  MISMATCH [{d},{d}]: gpu={d} cpu={d}\n", .{ i, j, ci[i * n + j], acc });
+                    mism += 1;
+                }
+            }
+        }
+        try stdout.print("i4 v0 {d}x{d}x{d}: {d}/{d} mismatches\n", .{ m, n, k, mism, m * n });
+        if (mism != 0) return error.CudaError;
+    }
+}
+
+/// Full int4 (W4A4) convrot linear validation: i4prep (rotate + per-row
+/// quantize x to s4 [-8,7], pack 2/byte) -> s4 tensor-core GEMM (v0) ->
+/// irescale, checked against a CPU replica. rel-vs-cpu-sim = wiring exactness;
+/// rel-vs-f32 = int4 accuracy (naturally coarser than int8).
+pub fn i4LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
+    _ = io;
+    const convrot = @import("../../ops/convrot.zig");
+
+    // Performant fused s4 GEMM (rescale folded into the C-store), the path
+    // dit_cuda's opI4Gemm uses. Requires m%128, rows%128, cols%128.
+    const pipe_ptx = try buildIgemmPipe(gpa, 64, true, 4);
+    defer gpa.free(pipe_ptx);
+    var gmod = try ctx.loadModule(pipe_ptx);
+    defer gmod.unload(ctx);
+    const f_gemm = try gmod.getFunction(ctx, "i4gemm_pipe_fused");
+
+    const LCase = struct { m: usize, rows: usize, cols: usize };
+    const lcases = [_]LCase{
+        .{ .m = 128, .rows = 128, .cols = 2048 },
+        .{ .m = 128, .rows = 256, .cols = 6144 },
+        .{ .m = 128, .rows = 128, .cols = 16384 }, // mlp.down cols, >48KB shared in prep
+    };
+    var prng = std.Random.DefaultPrng.init(9);
+    const rand = prng.random();
+
+    for (lcases) |c| {
+        const m = c.m;
+        const rows = c.rows;
+        const cols = c.cols;
+
+        const prep_ptx = try buildPrep(gpa, cols, 4);
+        defer gpa.free(prep_ptx);
+        var pmod = try ctx.loadModule(prep_ptx);
+        defer pmod.unload(ctx);
+        const f_prep = try pmod.getFunction(ctx, "i4prep");
+        const shb = prepSharedBytes(cols);
+        try ctx.setMaxDynamicShared(f_prep, shb);
+
+        const xf = try gpa.alloc(f32, m * cols);
+        defer gpa.free(xf);
+        for (xf) |*v| v.* = rand.floatNorm(f32);
+        // Pre-rotated int4 weight, unpacked oracle + nibble-packed device bytes.
+        const wu = try gpa.alloc(i8, rows * cols);
+        defer gpa.free(wu);
+        for (wu) |*v| v.* = rand.intRangeAtMost(i4, -8, 7);
+        const wb = try gpa.alloc(u8, rows * cols / 2);
+        defer gpa.free(wb);
+        for (wb, 0..) |*p, i| p.* = @as(u8, @as(u4, @bitCast(@as(i4, @intCast(wu[2 * i]))))) |
+            (@as(u8, @as(u4, @bitCast(@as(i4, @intCast(wu[2 * i + 1]))))) << 4);
+        const wscale = try gpa.alloc(f32, rows);
+        defer gpa.free(wscale);
+        for (wscale) |*s| s.* = 0.001 + rand.float(f32) * 0.02;
+
+        var x_d = try ctx.alloc(m * cols * 4);
+        defer ctx.free(&x_d);
+        var q_d = try ctx.alloc(m * cols / 2); // packed int4 activations
+        defer ctx.free(&q_d);
+        var as_d = try ctx.alloc(m * 4);
+        defer ctx.free(&as_d);
+        var w_d = try ctx.alloc(rows * cols / 2);
+        defer ctx.free(&w_d);
+        var ws_d = try ctx.alloc(rows * 4);
+        defer ctx.free(&ws_d);
+        var y_d = try ctx.alloc(m * rows * 4);
+        defer ctx.free(&y_d);
+        try ctx.upload(x_d, std.mem.sliceAsBytes(xf));
+        try ctx.upload(w_d, wb);
+        try ctx.upload(ws_d, std.mem.sliceAsBytes(wscale));
+
+        // prep: x[m][cols] f32 -> q_d (packed s4) + as_d (per-row scale).
+        var px = x_d.ptr;
+        var pq = q_d.ptr;
+        var pas = as_d.ptr;
+        var pp = [_]?*anyopaque{ @ptrCast(&px), @ptrCast(&pq), @ptrCast(&pas) };
+        try ctx.launch(f_prep, .{ @intCast(m), 1, 1 }, .{ 256, 1, 1 }, @intCast(shb), &pp);
+        // fused gemm: A=q [m][cols], B=w [rows][cols] (packed s4) -> y [m][rows]
+        // f32, rescale (act_scale[row]*weight_scale[col]) folded into the store.
+        var pa = q_d.ptr;
+        var pb = w_d.ptr;
+        var pc = y_d.ptr;
+        var pn: u32 = @intCast(rows);
+        var pk: u32 = @intCast(cols);
+        var pas2 = as_d.ptr;
+        var pws2 = ws_d.ptr;
+        var pg = [_]?*anyopaque{ @ptrCast(&pa), @ptrCast(&pb), @ptrCast(&pc), @ptrCast(&pn), @ptrCast(&pk), @ptrCast(&pas2), @ptrCast(&pws2) };
+        try ctx.launch(f_gemm, .{ @intCast(rows / 128), @intCast(m / 128), 1 }, .{ 128, 1, 1 }, 0, &pg);
+
+        const yg = try gpa.alloc(u8, m * rows * 4);
+        defer gpa.free(yg);
+        try ctx.download(y_d, yg);
+        const y_gpu: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, yg));
+
+        // CPU replica of the same int4 pipeline.
+        const xr = try gpa.dupe(f32, xf);
+        defer gpa.free(xr);
+        const xi4 = try gpa.alloc(i8, m * cols);
+        defer gpa.free(xi4);
+        const ascale = try gpa.alloc(f32, m);
+        defer gpa.free(ascale);
+        for (0..m) |i| {
+            convrot.rotate(xr[i * cols ..][0..cols]);
+            var amax: f32 = 0;
+            for (xr[i * cols ..][0..cols]) |v| amax = @max(amax, @abs(v));
+            const s = @max(amax / 7.0, 1e-12);
+            ascale[i] = s;
+            for (0..cols) |k| {
+                var qi: i32 = @intFromFloat(@round(xr[i * cols + k] / s));
+                qi = @max(@as(i32, -8), @min(@as(i32, 7), qi));
+                xi4[i * cols + k] = @intCast(qi);
+            }
+        }
+        var num_sim: f64 = 0;
+        var num_truth: f64 = 0;
+        var den: f64 = 0;
+        for (0..m) |i| {
+            for (0..rows) |j| {
+                var acc: i32 = 0;
+                var truth: f64 = 0;
+                for (0..cols) |k| {
+                    acc += @as(i32, xi4[i * cols + k]) * @as(i32, wu[j * cols + k]);
+                    truth += @as(f64, xr[i * cols + k]) * (@as(f64, @floatFromInt(wu[j * cols + k])) * wscale[j]);
+                }
+                const sim: f64 = @as(f64, @floatFromInt(acc)) * ascale[i] * wscale[j];
+                const g: f64 = y_gpu[i * rows + j];
+                num_sim += (g - sim) * (g - sim);
+                num_truth += (g - truth) * (g - truth);
+                den += truth * truth;
+            }
+        }
+        const rel_sim = @sqrt(num_sim / den);
+        const rel_truth = @sqrt(num_truth / den);
+        try stdout.print("i4 linear {d}x{d}x{d}: rel vs cpu-sim {d:.6} (wiring), rel vs f32 {d:.4} (int4 acc)\n", .{ m, rows, cols, rel_sim, rel_truth });
+        try stdout.flush();
+        if (rel_sim > 1e-3) return error.CudaError;
+    }
+}
+
 /// Full int8 convrot linear validation: prep (rotate+quantize) -> IMMA GEMM ->
 /// rescale, checked against the same CPU replica as `gpu-i8-test`
 /// (rel-vs-cpu-sim = wiring exactness; rel-vs-f32 = int8 accuracy). Exercises
@@ -1965,7 +2319,7 @@ pub fn i8GemmTest(ctx: *Context, io: anytype, stdout: anytype) !void {
 pub fn i8LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
     const convrot = @import("../../ops/convrot.zig");
 
-    const pipe_ptx = try buildIgemmPipe(gpa, 64, false);
+    const pipe_ptx = try buildIgemmPipe(gpa, 64, false, 8);
     defer gpa.free(pipe_ptx);
     var gmod = try ctx.loadModule(pipe_ptx);
     defer gmod.unload(ctx);
@@ -1977,7 +2331,7 @@ pub fn i8LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
 
     // Stage-A fused GEMM: rescale folded into the C-store (no s32 acc buffer,
     // no separate rescale pass), output f32 y directly.
-    const fused_ptx = try buildIgemmPipe(gpa, 64, true);
+    const fused_ptx = try buildIgemmPipe(gpa, 64, true, 8);
     defer gpa.free(fused_ptx);
     var fmod = try ctx.loadModule(fused_ptx);
     defer fmod.unload(ctx);
@@ -1998,7 +2352,7 @@ pub fn i8LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         const rows = c.rows;
         const cols = c.cols;
 
-        const prep_ptx = try buildPrep(gpa, cols);
+        const prep_ptx = try buildPrep(gpa, cols, 8);
         defer gpa.free(prep_ptx);
         var pmod = try ctx.loadModule(prep_ptx);
         defer pmod.unload(ctx);
@@ -2143,7 +2497,7 @@ pub fn i8LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         const m = c.m;
         const rows = c.rows;
         const cols = c.cols;
-        const prep_ptx = try buildPrep(gpa, cols);
+        const prep_ptx = try buildPrep(gpa, cols, 8);
         defer gpa.free(prep_ptx);
         var pmod = try ctx.loadModule(prep_ptx);
         defer pmod.unload(ctx);

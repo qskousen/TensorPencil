@@ -52,6 +52,8 @@ pub fn main(init: std.process.Init) !void {
         try cudaTest(arena, stdout);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-i8-test")) {
         try cudaI8Test(arena, io, stdout);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-i4-test")) {
+        try cudaI4Test(arena, io, stdout);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-fp8-test")) {
         try cudaFp8Test(arena, stdout);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-encode-test")) {
@@ -405,6 +407,20 @@ fn cudaI8Test(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
     try stdout.print("cuda device: {s} (sm_{d}{d})\n", .{ ctx.deviceName(), ctx.cc_major, ctx.cc_minor });
     try cuda.kernels.i8GemmTest(&ctx, io, stdout);
     try cuda.kernels.i8LinearTest(&ctx, io, stdout);
+}
+
+/// int4 (W4A4) tensor-core validation, staged like `cuda-i8-test`: raw s4*s4
+/// GEMM against a CPU oracle first, then (as they land) the full convrot linear.
+fn cudaI4Test(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    var ctx = cuda.Context.init(arena) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer ctx.deinit();
+    try stdout.print("cuda device: {s} (sm_{d}{d})\n", .{ ctx.deviceName(), ctx.cc_major, ctx.cc_minor });
+    try cuda.kernels.i4GemmTest(&ctx, io, stdout);
+    try cuda.kernels.i4LinearTest(&ctx, io, stdout);
 }
 
 /// Validate the CUDA DiT forward against the CPU int8 forward on the same
@@ -773,10 +789,12 @@ fn cudaDitTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []con
     defer st.deinit();
     var model = try dit_mod.DiT.load(arena, &st);
     defer model.deinit();
-    if (model.blocks[0].attn.wq.dtype != .i8) {
-        try stdout.print("cuda-dit-test needs the int8 convrot checkpoint (wq.dtype={t})\n", .{model.blocks[0].attn.wq.dtype});
+    const wqt = model.blocks[0].attn.wq.dtype;
+    if (wqt != .i8 and wqt != .i4) {
+        try stdout.print("cuda-dit-test needs an int8 or int4 convrot checkpoint (wq.dtype={t})\n", .{wqt});
         return;
     }
+    const qtag: []const u8 = if (wqt == .i4) "int4" else "int8";
 
     const seq_txt: usize = 8;
     const sigma: f32 = 0.7;
@@ -795,7 +813,7 @@ fn cudaDitTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []con
         const t0 = std.Io.Clock.real.now(io);
         try model.forward(io, arena, out_cpu, x, lat, lat, sigma, cond, seq_txt);
         const t1 = std.Io.Clock.real.now(io);
-        try stdout.print("cpu int8 forward: {d:.1} s\n", .{@as(f64, @floatFromInt(t1.nanoseconds - t0.nanoseconds)) / 1e9});
+        try stdout.print("cpu {s} forward: {d:.1} s\n", .{ qtag, @as(f64, @floatFromInt(t1.nanoseconds - t0.nanoseconds)) / 1e9 });
         try stdout.flush();
     }
 
@@ -823,7 +841,7 @@ fn cudaDitTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []con
         const tb = std.Io.Clock.real.now(io);
         best_ms = @min(best_ms, @as(f64, @floatFromInt(tb.nanoseconds - ta.nanoseconds)) / 1e6);
     }
-    try stdout.print("cuda int8 forward: {d:.3} s/step (best of {d}, batched)\n", .{ best_ms / 1000.0, reps });
+    try stdout.print("cuda {s} forward: {d:.3} s/step (best of {d}, batched)\n", .{ qtag, best_ms / 1000.0, reps });
     // One profiled (sync-per-op) pass for the per-category breakdown.
     be.profile = true;
     be.prof.reset();
@@ -852,8 +870,14 @@ fn cudaDitTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []con
         const rel = @sqrt(num / den);
         try stdout.print("DiT velocity: rel RMSE cuda-vs-cpu {d:.5} (max|v|={d:.3})\n", .{ rel, maxabs });
         try stdout.flush();
-        if (rel > 0.08) return error.GpuMismatch;
-        try stdout.print("cuda DiT forward OK (like-for-like)\n", .{});
+        // The CPU reference is weight-only (W{4,8}A16: dequant weights, f32
+        // activations); CUDA also quantizes activations (W4A4 / W8A8). int8's
+        // activation-quant error is tiny (<0.08); int4's 16-level activation
+        // quant diverges ~0.15-0.20 from the f32-activation reference — that's
+        // the price of W4A4, not a wiring bug (the per-linear sim is bit-exact).
+        const tol: f32 = if (wqt == .i4) 0.25 else 0.08;
+        if (rel > tol) return error.GpuMismatch;
+        try stdout.print("cuda DiT forward OK ({s}; int4 vs W4A16 ref includes activation-quant)\n", .{qtag});
     }
 }
 
