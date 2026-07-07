@@ -75,6 +75,10 @@ pub fn main(init: std.process.Init) !void {
         defer ctx.deinit();
         try stdout.print("cuda device: {s} (sm_{d}{d})\n", .{ ctx.deviceName(), ctx.cc_major, ctx.cc_minor });
         try cuda.kernels.attnTest(&ctx, io, stdout);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-txtfusion-test")) {
+        const path = if (args.len >= 3) args[2] else "models/diffusion_model/krea2CenterSemiraw_v10Int8.safetensors";
+        const seq_txt: usize = if (args.len >= 4) (std.fmt.parseInt(usize, args[3], 10) catch 448) else 448;
+        try cudaTxtFusionTest(arena, io, stdout, path, seq_txt);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-attn-cmp")) {
         try cudaAttnCmp(arena, stdout);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-stream-test")) {
@@ -606,6 +610,64 @@ fn cudaEncodeTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
         den += @as(f64, e) * e;
     }
     try stdout.print("cuda encode: {d:.3} s (best of 3)\n", .{best / 1000.0});
+    try stdout.print("cuda-vs-cpu: max_err={d:.5} rel RMSE={d:.5} (max|v|={d:.1})\n", .{ max_err, @sqrt(num / den), max_val });
+    try stdout.flush();
+}
+
+/// Validate the CUDA text-fusion port against the CPU reference: same DiT, same
+/// synthetic conditioning, compare `DiT.textTokens` (CPU) vs `textTokensCuda`.
+fn cudaTxtFusionTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []const u8, seq_txt: usize) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    const dit = TensorPencil.models.dit;
+    const dit_cuda = TensorPencil.models.dit_cuda;
+    std.Io.Dir.cwd().access(io, path, .{}) catch {
+        try stdout.print("cuda-txtfusion-test needs an int8/int4 convrot checkpoint: {s}\n", .{path});
+        return;
+    };
+    var st = try TensorPencil.SafeTensors.open(arena, io, path);
+    defer st.deinit();
+    var model = try dit.DiT.load(arena, &st);
+    defer model.deinit();
+
+    // Deterministic conditioning [seq_txt, 12, txt_dim] (encoder-output-scale ~O(1)).
+    const cond = try arena.alloc(f32, seq_txt * dit.txt_layers * dit.txt_dim);
+    for (cond, 0..) |*c, i| {
+        const z: u32 = @truncate(i *% 2654435761 +% 40503);
+        c.* = (@as(f32, @floatFromInt(z >> 8)) / @as(f32, 1 << 24) - 0.5) * 2.0;
+    }
+
+    const want = try model.textTokens(io, arena, cond, seq_txt);
+
+    var be = cuda.Backend.init(arena) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    try stdout.print("== cuda-txtfusion-test (seq_txt={d}) ==\ncuda device: {s}\n", .{ seq_txt, be.deviceName() });
+
+    const warm = try dit_cuda.textTokensCuda(&model, be, arena, cond); // JIT + upload
+    arena.free(warm);
+    var best: f64 = std.math.inf(f64);
+    for (0..3) |_| {
+        const a = std.Io.Clock.real.now(io);
+        const g = try dit_cuda.textTokensCuda(&model, be, arena, cond);
+        const b = std.Io.Clock.real.now(io);
+        arena.free(g);
+        best = @min(best, @as(f64, @floatFromInt(b.nanoseconds - a.nanoseconds)) / 1e6);
+    }
+    const got = try dit_cuda.textTokensCuda(&model, be, arena, cond);
+
+    var max_err: f32 = 0;
+    var max_val: f32 = 0;
+    var num: f64 = 0;
+    var den: f64 = 0;
+    for (want, got) |e, a| {
+        max_err = if (std.math.isNan(a)) std.math.inf(f32) else @max(max_err, @abs(e - a));
+        max_val = @max(max_val, @abs(e));
+        num += (@as(f64, e) - a) * (@as(f64, e) - a);
+        den += @as(f64, e) * e;
+    }
+    try stdout.print("cuda txtfusion: {d:.3} s (best of 3)\n", .{best / 1000.0});
     try stdout.print("cuda-vs-cpu: max_err={d:.5} rel RMSE={d:.5} (max|v|={d:.1})\n", .{ max_err, @sqrt(num / den), max_val });
     try stdout.flush();
 }

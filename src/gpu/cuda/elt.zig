@@ -517,6 +517,36 @@ pub const silu_mul_ptx: [:0]const u8 =
     \\}
 ;
 
+/// a[idx] = geluTanh(a[idx]), in place. b0=a. u0=total. Tanh-gelu folds to
+/// x·sigmoid(w), w = x·(c1 + c2·x²) with c1=2·√(2/π), c2=c1·0.044715 — matches
+/// ops.act.geluTanh to f32 rounding (sigmoid via ex2.approx, as in silu_mul).
+pub const gelu_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry gelu(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<2>;
+    \\  .reg .b32 %r<6>;
+    \\  .reg .f32 %f<6>;
+    \\  .reg .b64 %rd<6>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u64 %rd1,[p0]; cvta.to.global.u64 %rd1,%rd1;
+    \\  mul.wide.u32 %rd3,%r4,4; add.s64 %rd4,%rd1,%rd3;
+    \\  ld.global.f32 %f1,[%rd4];
+    \\  mul.f32 %f2,%f1,%f1;                        // x^2
+    \\  fma.rn.f32 %f3,%f2,0f3D922279,0f3FCC422A;   // c1 + c2*x^2
+    \\  mul.f32 %f3,%f3,%f1;                        // w = x*(c1 + c2*x^2)
+    \\  neg.f32 %f4,%f3; mul.f32 %f4,%f4,0f3FB8AA3B; ex2.approx.f32 %f4,%f4; add.f32 %f4,%f4,0f3F800000; rcp.approx.f32 %f4,%f4;
+    \\  mul.f32 %f1,%f1,%f4;                        // x*sigmoid(w)
+    \\  st.global.f32 [%rd4],%f1;
+    \\END:
+    \\  ret;
+    \\}
+;
+
 /// a[idx] += mod[u2 + idx%u1] * b[idx], in place. b0=a, b1=b(delta), b2=mod.
 /// u0=total, u1=dim(F), u2=gate_off.
 pub const gated_add_ptx: [:0]const u8 =

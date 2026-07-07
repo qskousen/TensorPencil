@@ -1270,6 +1270,14 @@ pub const Backend = struct {
         try self.eltLaunch(f, a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
+    /// a = geluTanh(a), in place. total = element count.
+    pub fn gelu(self: *Backend, a: DeviceBuffer, total: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const f = try self.eltFn(elt.gelu_ptx, "gelu");
+        try self.eltLaunch(f, a, null, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+    }
+
     /// a += mod[gate_off + col] * b, in place (residual with gate). total=rows*dim.
     pub fn gatedAdd(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, mod: DeviceBuffer, total: usize, dim: usize, gate_off: usize) Error!void {
         self.ptic();

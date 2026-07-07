@@ -11,6 +11,7 @@
 const std = @import("std");
 const dit = @import("dit.zig");
 const cuda = @import("../gpu/cuda.zig");
+const safetensors = @import("../safetensors.zig");
 
 const DiT = dit.DiT;
 const Backend = cuda.Backend;
@@ -25,6 +26,10 @@ const mlp_dim = dit.mlp_dim; // 16384
 const n_blocks = dit.n_blocks; // 28
 const patch = dit.patch; // 2
 const channels = dit.channels; // 16
+const txt_dim = dit.txt_dim; // 2560
+const txt_heads = dit.txt_heads; // 20
+const txt_layers = dit.txt_layers; // 12
+const txt_mlp_dim = dit.txt_mlp_dim; // 6912
 const attn_scale: f32 = 1.0 / 11.313708498984761; // 1/sqrt(128)
 const eps: f32 = 1e-5;
 
@@ -57,6 +62,170 @@ fn qGemm(be: *Backend, is_i4: bool, y: DeviceBuffer, w: anytype) !void {
 /// the tensor cores and the naive path is O(seq²) latency-bound. Toggle for A/B.
 pub var use_tc_attn: bool = true;
 
+// ==== text fusion (CUDA) =====================================================
+//
+// The int8/int4 convrot checkpoints leave the text-fusion stack unquantized
+// (BF16 attn/mlp, F32 projector/txtmlp). Run on the CPU it is ~2 TFLOP of dense
+// GEMM — the entire "loading diffusion model" stall on --backend zig-cuda. This
+// mirrors DiT.txtFusion+textTokens on the backend: BF16 weights are dequantized
+// to f32 once and fed through the f32 `opMatmul` (no int GEMM applies here); the
+// block is the plain (no modulation, no RoPE) variant of the sampling block.
+
+/// f32 weight bytes for `opMatmul`: BF16 weights dequant into `arena` (kept alive
+/// for the whole fusion so the backend's pointer-keyed weight cache stays valid);
+/// F32 weights (projector, txtmlp) pass through their mmap bytes unchanged.
+fn txtF32(arena: std.mem.Allocator, w: anytype) ![]const u8 {
+    if (w.dtype == .f32) return w.bytes;
+    const out = try arena.alloc(f32, w.rows * w.cols);
+    try safetensors.convertToF32(w.dtype, w.bytes, out);
+    return std.mem.sliceAsBytes(out);
+}
+
+/// Device scratch for the text-fusion blocks, sized for the widest phase (the
+/// layerwise blocks over seq_txt·12 rows). Reused by the refiner and txtmlp.
+const TxtScratch = struct {
+    normed: DeviceBuffer,
+    q: DeviceBuffer,
+    k: DeviceBuffer,
+    v: DeviceBuffer,
+    g: DeviceBuffer,
+    attn: DeviceBuffer,
+    t1: DeviceBuffer,
+    gate: DeviceBuffer, // also holds txtmlp mid (seq_txt·6144 ≤ rows_lw·6912)
+    up: DeviceBuffer, // also holds txtmlp out
+
+    fn init(be: *Backend, rows_lw: usize) !TxtScratch {
+        var s: TxtScratch = undefined;
+        s.normed = try be.tensorCreate(rows_lw * txt_dim * 4);
+        s.q = try be.tensorCreate(rows_lw * txt_dim * 4);
+        s.k = try be.tensorCreate(rows_lw * txt_dim * 4);
+        s.v = try be.tensorCreate(rows_lw * txt_dim * 4);
+        s.g = try be.tensorCreate(rows_lw * txt_dim * 4);
+        s.attn = try be.tensorCreate(rows_lw * txt_dim * 4);
+        s.t1 = try be.tensorCreate(rows_lw * txt_dim * 4);
+        s.gate = try be.tensorCreate(rows_lw * txt_mlp_dim * 4);
+        s.up = try be.tensorCreate(rows_lw * txt_mlp_dim * 4);
+        return s;
+    }
+    fn deinit(s: *TxtScratch, be: *Backend) void {
+        inline for (@typeInfo(TxtScratch).@"struct".fields) |f| be.tensorDestroy(&@field(s, f.name));
+    }
+};
+
+/// One f16 tensor-core GEMM y[m][out] = x[m][in] @ Wᵀ (+bias), W dequant to f32.
+/// The naive f32 opMatmul is ~50× too slow for these widths; opConvF16 runs the
+/// validated hgemm on tensor cores. f16 is far finer than the int8/int4 the DiT
+/// blocks downstream run in, so text-fusion precision is not the bottleneck.
+/// `bias` is a real bias, or a zeros slice (≥ out long) for the no-bias linears.
+fn txtGemm(be: *Backend, arena: std.mem.Allocator, y: DeviceBuffer, x: DeviceBuffer, m: usize, w: anytype, out: usize, in: usize, bias: []const f32) !void {
+    try be.opConvF16(y, 0, x, m, try txtF32(arena, w), out, in, bias);
+}
+
+/// One TextFusionBlock on the backend: x += attn(rmsnorm(x)); x += mlp(rmsnorm(x)).
+/// `x_d` holds n_seqs sequences of seq_len rows of txt_dim (no RoPE, no mask, no
+/// modulation). qkNorm with hd=txt_dim is a plain per-row RMS-norm×weight.
+fn txtBlockCuda(be: *Backend, arena: std.mem.Allocator, blk: anytype, x_d: DeviceBuffer, s: *const TxtScratch, zero: []const f32, n_seqs: usize, seq_len: usize) !void {
+    const rows = n_seqs * seq_len;
+
+    // --- attention ---
+    try be.qkNorm(x_d, s.normed, try normBuf(be, blk.prenorm), rows, txt_dim, eps);
+    try txtGemm(be, arena, s.q, s.normed, rows, blk.attn.wq, txt_dim, txt_dim, zero);
+    try txtGemm(be, arena, s.k, s.normed, rows, blk.attn.wk, txt_dim, txt_dim, zero);
+    try txtGemm(be, arena, s.v, s.normed, rows, blk.attn.wv, txt_dim, txt_dim, zero);
+    try txtGemm(be, arena, s.g, s.normed, rows, blk.attn.gate, txt_dim, txt_dim, zero);
+    try be.qkNorm(s.q, s.q, try normBuf(be, blk.attn.qnorm), rows * txt_heads, hd, eps);
+    try be.qkNorm(s.k, s.k, try normBuf(be, blk.attn.knorm), rows * txt_heads, hd, eps);
+    // Each of the n_seqs sequences attends only within itself (12-long layerwise,
+    // or the whole prompt for the refiner) — the naive kernel handles one at a
+    // time; seq_len is small so the launch count is cheap and one-time.
+    for (0..n_seqs) |i| {
+        const off = i * seq_len * txt_dim * 4;
+        try be.attn(offsetBuf(s.q, off), offsetBuf(s.k, off), offsetBuf(s.v, off), offsetBuf(s.attn, off), seq_len, txt_heads, txt_heads, hd, attn_scale, false);
+    }
+    try be.sigmoidMul(s.attn, s.g, rows * txt_dim);
+    try txtGemm(be, arena, s.t1, s.attn, rows, blk.attn.wo, txt_dim, txt_dim, zero);
+    try be.opAdd(x_d, s.t1, rows * txt_dim);
+
+    // --- mlp (swiglu) ---
+    try be.qkNorm(x_d, s.normed, try normBuf(be, blk.postnorm), rows, txt_dim, eps);
+    try txtGemm(be, arena, s.gate, s.normed, rows, blk.mlp.gate, txt_mlp_dim, txt_dim, zero);
+    try txtGemm(be, arena, s.up, s.normed, rows, blk.mlp.up, txt_mlp_dim, txt_dim, zero);
+    try be.siluMul(s.gate, s.up, rows * txt_mlp_dim);
+    try txtGemm(be, arena, s.t1, s.gate, rows, blk.mlp.down, txt_dim, txt_mlp_dim, zero);
+    try be.opAdd(x_d, s.t1, rows * txt_dim);
+}
+
+/// CUDA port of `DiT.textTokens`: text conditioning [seq_txt·12·txt_dim] → the
+/// combined-sequence tokens [seq_txt·features] the sampler consumes. Runs the
+/// whole txtfusion + txtmlp stack on the backend so it no longer stalls the CPU.
+/// Transient f32 weights are dropped from the cache before returning.
+pub fn textTokensCuda(model: *const DiT, be: *Backend, gpa: std.mem.Allocator, cond: []const f32) ![]f32 {
+    const seq_txt = cond.len / (txt_layers * txt_dim);
+    std.debug.assert(cond.len == seq_txt * txt_layers * txt_dim);
+    const rows_lw = seq_txt * txt_layers;
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var x_d = try be.tensorCreate(rows_lw * txt_dim * 4);
+    defer be.tensorDestroy(&x_d);
+    var s = try TxtScratch.init(be, rows_lw);
+    defer s.deinit(be);
+    // Reclaim the transient f32 text weights (and small norm buffers) from the
+    // backend cache; they are unused during sampling and would otherwise pin VRAM.
+    defer be.evictWeights();
+
+    try be.tensorUpload(x_d, std.mem.sliceAsBytes(cond));
+
+    // Zero bias for the no-bias linears (opConvF16 always adds a bias; it reads
+    // only the first `out` entries, so one max-width zeros buffer serves all).
+    const zero = try arena.alloc(f32, txt_mlp_dim);
+    @memset(zero, 0);
+
+    // Layerwise blocks: seq_txt independent 12-long sequences (across the encoder
+    // layer axis per token).
+    try be.beginBatch();
+    errdefer if (be.batching()) be.abortBatch();
+    for (&model.txt_layerwise) |*blk| try txtBlockCuda(be, arena, blk, x_d, &s, zero, seq_txt, txt_layers);
+    try be.endBatch();
+
+    // Projector: collapse the 12-layer axis (projected[tok][d] = Σ_l pw[l]·x[tok·12+l][d]).
+    // Tiny [1,12] contraction — a host round-trip is simpler than a bespoke kernel.
+    {
+        const work = try arena.alloc(f32, rows_lw * txt_dim);
+        try be.tensorDownload(x_d, std.mem.sliceAsBytes(work));
+        var pw: [txt_layers]f32 = undefined;
+        try safetensors.convertToF32(model.txt_projector.dtype, model.txt_projector.bytes, &pw);
+        const projected = try arena.alloc(f32, seq_txt * txt_dim);
+        for (0..seq_txt) |tok| {
+            const dst = projected[tok * txt_dim ..][0..txt_dim];
+            @memset(dst, 0);
+            for (0..txt_layers) |l| {
+                const src = work[(tok * txt_layers + l) * txt_dim ..][0..txt_dim];
+                for (dst, src) |*d, sv| d.* += pw[l] * sv;
+            }
+        }
+        try be.tensorUpload(x_d, std.mem.sliceAsBytes(projected));
+    }
+
+    try be.beginBatch();
+    // Refiner blocks: one sequence of length seq_txt.
+    for (&model.txt_refiner) |*blk| try txtBlockCuda(be, arena, blk, x_d, &s, zero, 1, seq_txt);
+
+    // txtmlp: rmsnorm → Linear(2560→6144) → geluTanh → Linear(6144→6144).
+    try be.qkNorm(x_d, s.normed, try normBuf(be, model.txtmlp_norm), seq_txt, txt_dim, eps);
+    try txtGemm(be, arena, s.gate, s.normed, seq_txt, model.txtmlp1.w, F, txt_dim, model.txtmlp1.b.?);
+    try be.gelu(s.gate, seq_txt * F);
+    try txtGemm(be, arena, s.up, s.gate, seq_txt, model.txtmlp3.w, F, F, model.txtmlp3.b.?);
+    try be.endBatch();
+
+    const out = try gpa.alloc(f32, seq_txt * F);
+    errdefer gpa.free(out);
+    try be.tensorDownload(s.up, std.mem.sliceAsBytes(out));
+    return out;
+}
+
 /// Per-run constants: text-fusion tokens + rope table, uploaded once.
 pub const Session = struct {
     seq_txt: usize,
@@ -67,11 +236,12 @@ pub const Session = struct {
     freqs_d: DeviceBuffer,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, be: *Backend, model: *const DiT, lat_h: usize, lat_w: usize, cond: []const f32, seq_txt: usize) !Session {
+        _ = io; // text fusion runs on the backend (textTokensCuda), not the CPU
         const h = lat_h / patch;
         const w = lat_w / patch;
         const seq = seq_txt + h * w;
 
-        const txt_tokens = try model.textTokens(io, gpa, cond, seq_txt);
+        const txt_tokens = try textTokensCuda(model, be, gpa, cond);
         defer gpa.free(txt_tokens);
         var txt0_d = try be.tensorCreate(txt_tokens.len * 4);
         errdefer be.tensorDestroy(&txt0_d);
