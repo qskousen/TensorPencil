@@ -4,18 +4,25 @@
 #
 # Params (seed/steps/cfg/size/sampler) match the reference; override any via env:
 #   SEED=123 STEPS=8 WIDTH=512 HEIGHT=512 ./generate_unicorn_fp8.sh
-# BACKEND defaults to zig-cuda; use cpu for the CPU path.
+# BACKEND defaults to vulkan — fp8's GPU path. (zig-cuda is int8/int4-convrot
+# only; use cpu for the CPU path.)
+# Models are read from the ComfyUI models dir (NVMe); override MODELS/DIT/VAE/
+# TEXT_ENCODER to relocate. MMAP=off switches to buffered reads (for ZFS).
 set -euo pipefail
 cd "$(dirname "$0")"
 
-DIT=${DIT:-models/diffusion_model/krea2CenterSemiraw_v10Fp8.safetensors}
-BACKEND=${BACKEND:-zig-cuda}
+MODELS=${MODELS:-$HOME/genai/comfyui/models}
+DIT=${DIT:-$MODELS/diffusion_models/krea2/krea2CenterSemiraw_v10Fp8.safetensors}
+VAE=${VAE:-$MODELS/vae/krea2RealVae_v10.safetensors}
+TEXT_ENCODER=${TEXT_ENCODER:-$MODELS/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors}
+MMAP=${MMAP:-on}
+BACKEND=${BACKEND:-vulkan}
 SEED=${SEED:-252469767172722}
 STEPS=${STEPS:-20}
 CFG=${CFG:-1.0}
 WIDTH=${WIDTH:-1120}
 HEIGHT=${HEIGHT:-1680}
-OUT=${OUT:-testdata/fp8_unicorn_ref_params.png}
+OUT=${OUT:-scratch_out/fp8_unicorn_ref_params.png}
 
 # Positive prompt (verbatim from the reference image's PNG "parameters" chunk).
 # Single-quoted heredoc: no escaping of the inner quotes / dashes needed.
@@ -32,10 +39,14 @@ if [[ ! -x "$BIN" ]]; then
   zig build -Doptimize=ReleaseFast
 fi
 
+mkdir -p "$(dirname "$OUT")"
 set -x
 exec "$BIN" generate \
   --backend "$BACKEND" \
+  --mmap "$MMAP" \
   --dit "$DIT" \
+  --vae "$VAE" \
+  --text-encoder "$TEXT_ENCODER" \
   --prompt "$PROMPT" \
   --negative "" \
   --width "$WIDTH" \

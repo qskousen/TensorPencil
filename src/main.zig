@@ -127,8 +127,15 @@ pub fn main(init: std.process.Init) !void {
             \\      --dit-f32 off      run the diffusion model in full f32
             \\                         instead of the f16 tensor-core path
             \\                         (slower, more exact) (on/off)
-            \\      --dit <path>       diffusion checkpoint (fp8 or int8 convrot;
-            \\                         auto-detected). Default: krea2 ...Fp8
+            \\      --dit <path>       diffusion checkpoint (fp8 / int8 / int4
+            \\                         convrot; auto-detected). Default: krea2 Fp8
+            \\      --vae <path>       VAE decoder checkpoint
+            \\      --text-encoder <path>  text-encoder checkpoint (qwen3)
+            \\      --mmap on          checkpoint loading: on = mmap (default),
+            \\                         off = buffered read into RAM. Use off for
+            \\                         checkpoints on ZFS (mmap can deadlock there
+            \\                         under memory pressure); on is fine on
+            \\                         ext4/xfs/NVMe and warms the OS cache.
             \\      --out out.png      output file
             \\  TensorPencil inspect <file.safetensors>   list tensors in a checkpoint
             \\  TensorPencil bench-matmul                 time a DiT-sized fp8 GEMM
@@ -936,6 +943,13 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
             TensorPencil.models.dit_gpu.force_f32 = std.mem.eql(u8, val, "on") or std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
         } else if (std.mem.eql(u8, flag, "--dit")) {
             opts.dit_path = val;
+        } else if (std.mem.eql(u8, flag, "--vae")) {
+            opts.vae_path = val;
+        } else if (std.mem.eql(u8, flag, "--text-encoder")) {
+            opts.text_encoder_path = val;
+        } else if (std.mem.eql(u8, flag, "--mmap")) {
+            // off => buffered read instead of mmap (ZFS-safe; see safetensors.zig).
+            TensorPencil.safetensors.use_mmap = !(std.mem.eql(u8, val, "off") or std.mem.eql(u8, val, "0") or std.mem.eql(u8, val, "false"));
         } else if (std.mem.eql(u8, flag, "--out")) {
             out_path = val;
         } else {

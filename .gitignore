@@ -2,5 +2,4 @@
 /.zig-cache/
 /zig-out/
 /zig-pkg/
-/models/
 /scratch_out/

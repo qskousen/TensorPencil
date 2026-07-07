@@ -228,7 +228,12 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
     errdefer if (be.batching()) be.abortBatch();
 
     // int4 (W4A4) vs int8 (W8A8) convrot: gate the quantized-linear path once.
-    const is_i4 = model.blocks[0].attn.wq.dtype == .i4;
+    // The hand-PTX CUDA DiT only handles convrot checkpoints (per-row scale +
+    // packed int weights); an fp8/bf16 DiT has no row_scale, so reject it with a
+    // clear error instead of unwrapping a null scale into an illegal GPU access.
+    const wqt = model.blocks[0].attn.wq.dtype;
+    if (wqt != .i8 and wqt != .i4) return error.UnsupportedCheckpoint;
+    const is_i4 = wqt == .i4;
 
     // patch embed: x[seq_txt..] = img_in @ first^T + bias
     const first_f8 = model.first.w.dtype == .f8_e4m3;

@@ -50,9 +50,22 @@ pub const TensorView = struct {
     }
 };
 
+/// When true (default), `SafeTensors.open` mmaps the checkpoint; when false it
+/// reads the whole file into an owned heap buffer via buffered I/O. mmap is the
+/// better default (zero-copy, lazy paging, OS page-cache warmth across runs),
+/// but its fault path deadlocks on ZFS under memory pressure — set this false
+/// (CLI `--mmap off`) for checkpoints on ZFS, or just keep them on ext4/NVMe.
+pub var use_mmap: bool = true;
+
 pub const SafeTensors = struct {
-    /// Whole-file mapping; null when constructed from a caller-owned slice.
+    /// Whole-file mapping; null when constructed from a caller-owned slice or
+    /// the buffered-read path.
     mapping: ?[]align(std.heap.page_size_min) const u8,
+    /// Owned buffer backing `payload` in the buffered-read path (`use_mmap`
+    /// false); null for mmap and caller-owned slices. Freed with `gpa`.
+    owned: ?[]u8 = null,
+    /// Allocator that owns `owned` (and backs `arena`). Only used for freeing.
+    gpa: std.mem.Allocator = undefined,
     /// Data section (file bytes after the JSON header).
     payload: []const u8,
     /// Tensor name -> info, in header order. Names point into the header
@@ -71,6 +84,20 @@ pub const SafeTensors = struct {
         defer file.close(io);
         const len = try file.length(io);
         if (len < 8) return error.FileTooSmall;
+
+        if (!use_mmap) {
+            // Buffered read into an owned heap buffer: no mmap fault path (ZFS-
+            // safe), and the read is a single explicit up-front phase so weight
+            // access during compute never touches disk. Fails with a clean OOM
+            // under memory pressure instead of a D-state deadlock.
+            const buf = try gpa.alloc(u8, @intCast(len));
+            errdefer gpa.free(buf);
+            if (try file.readPositionalAll(io, buf, 0) != buf.len) return error.ShortRead;
+            var st = try initFromSlice(gpa, buf);
+            st.owned = buf;
+            return st;
+        }
+
         const mapping = try std.posix.mmap(
             null,
             @intCast(len),
@@ -132,6 +159,7 @@ pub const SafeTensors = struct {
             .index = index,
             .metadata = metadata,
             .arena = arena,
+            .gpa = gpa,
         };
     }
 
@@ -169,6 +197,7 @@ pub const SafeTensors = struct {
     }
 
     pub fn deinit(self: *SafeTensors) void {
+        if (self.owned) |b| self.gpa.free(b);
         self.arena.deinit();
         if (self.mapping) |m| std.posix.munmap(m);
         self.* = undefined;
@@ -350,6 +379,36 @@ test "open via mmap round trip" {
 
     var st = try SafeTensors.openIn(gpa, io, tmp.dir, "t.safetensors");
     defer st.deinit();
+    const w = try st.require("w");
+    const vals = try w.toF32Alloc(gpa);
+    defer gpa.free(vals);
+    try std.testing.expectEqualSlices(f32, &.{ 1.0, -2.0 }, vals);
+}
+
+test "open via buffered read round trip (use_mmap=false)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const header =
+        \\{"w":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]}}
+    ;
+    var payload: [4]u8 = undefined;
+    std.mem.writeInt(u16, payload[0..2], 0x3f80, .little); // 1.0
+    std.mem.writeInt(u16, payload[2..4], 0xc000, .little); // -2.0
+    const bytes = try buildTestFile(gpa, header, &payload);
+    defer gpa.free(bytes);
+    try tmp.dir.writeFile(io, .{ .sub_path = "t.safetensors", .data = bytes });
+
+    const prev = use_mmap;
+    use_mmap = false;
+    defer use_mmap = prev;
+
+    var st = try SafeTensors.openIn(gpa, io, tmp.dir, "t.safetensors");
+    defer st.deinit(); // must free the owned buffer, not munmap
+    try std.testing.expect(st.mapping == null and st.owned != null);
     const w = try st.require("w");
     const vals = try w.toF32Alloc(gpa);
     defer gpa.free(vals);
