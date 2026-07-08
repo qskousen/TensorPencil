@@ -51,4 +51,9 @@ Tests live in both modules; `zig build test` builds and runs two separate test e
 
 ## Dependencies
 
-None, and the goal is to keep it that way (pure Zig). If one ever becomes necessary, add it with `zig fetch --save <url>` (populates `build.zig.zon`).
+No build-time or Zig-package dependencies, and the goal is to keep it that way (pure Zig). If one ever becomes necessary, add it with `zig fetch --save <url>` (populates `build.zig.zon`).
+
+Runtime `dlopen`'d system libraries are allowed (no linking, no headers, no nvcc — device IR is hand-emitted), gated per backend:
+- Vulkan loader (`libvulkan.so.1`) — `--backend vulkan`.
+- CUDA driver (`libcuda.so.1`) — `--backend zig-cuda` (hand-emitted PTX; still "pure Zig" by the project's standard).
+- **`--backend cuda` deliberately crosses the pure-Zig line**: it `dlopen`s NVIDIA's closed-source math libraries `libcublasLt.so` (int8/f16 GEMM) and `libcudnn.so.9` (fused SDPA attention + conv). This is the one non-pure backend, added to measure the "our kernels vs their libraries" gap (M10 Phase 2). The CPU / Vulkan / zig-cuda backends stay pure and are the default; keep it that way when adding features.

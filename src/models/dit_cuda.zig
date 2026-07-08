@@ -50,7 +50,7 @@ fn offsetBuf(b: DeviceBuffer, off_bytes: usize) DeviceBuffer {
 /// activations quantized to s4) vs the W8A8 path at each call site.
 fn qPrep(be: *Backend, is_i4: bool, x: DeviceBuffer, m: usize, cols: usize) !void {
     if (is_i4) return be.opI4Prep(x, m, cols);
-    return be.opI8Prep(x, m, cols);
+    return be.opI8Prep(x, m, cols, false);
 }
 fn qGemm(be: *Backend, is_i4: bool, y: DeviceBuffer, w: anytype) !void {
     if (is_i4) return be.opI4Gemm(y, w.bytes, w.row_scale.?, w.rows);
@@ -404,6 +404,10 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
     const wqt = model.blocks[0].attn.wq.dtype;
     if (wqt != .i8 and wqt != .i4) return error.UnsupportedCheckpoint;
     const is_i4 = wqt == .i4;
+    // f16 activation chain (c16): only on the cuBLASLt/irescale int8 libs path.
+    // Halves the mlp gate/up/silu/down-input DRAM traffic (the biggest eltwise
+    // category). Hand-PTX (igemm_pipe_fused writes f32) and int4 keep f32.
+    const mlp_f16 = (be.kernels == .libs) and !is_i4;
 
     // patch embed: x[seq_txt..] = img_in @ first^T + bias
     const first_f8 = model.first.w.dtype == .f8_e4m3;
@@ -445,11 +449,20 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
             const xo = offsetBuf(x_d, c0 * F * 4);
             try be.rmsMod(xo, t1_d, mv_d, tile, F, mb + 3 * F, mb + 4 * F, eps);
             try qPrep(be, is_i4, t1_d, tile, F);
-            try qGemm(be, is_i4, mg_d, blk.mlp.gate);
-            try qGemm(be, is_i4, mu_d, blk.mlp.up);
-            try be.siluMul(mg_d, mu_d, tile * mlp_dim);
-            try qPrep(be, is_i4, mg_d, tile, blk.mlp.down.cols);
-            try qGemm(be, is_i4, t1_d, blk.mlp.down);
+            if (mlp_f16) {
+                // gate/up GEMMs emit f16 (irescale_h16); silu_mul_h16 reads/writes
+                // f16; the down prep reads f16 — halving the 16384-dim traffic.
+                try be.opI8Gemm(mg_d, blk.mlp.gate.bytes, blk.mlp.gate.row_scale.?, blk.mlp.gate.rows, true);
+                try be.opI8Gemm(mu_d, blk.mlp.up.bytes, blk.mlp.up.row_scale.?, blk.mlp.up.rows, true);
+                try be.siluMul16(mg_d, mu_d, tile * mlp_dim);
+                try be.opI8Prep(mg_d, tile, blk.mlp.down.cols, true);
+            } else {
+                try qGemm(be, is_i4, mg_d, blk.mlp.gate);
+                try qGemm(be, is_i4, mu_d, blk.mlp.up);
+                try be.siluMul(mg_d, mu_d, tile * mlp_dim);
+                try qPrep(be, is_i4, mg_d, tile, blk.mlp.down.cols);
+            }
+            try qGemm(be, is_i4, t1_d, blk.mlp.down); // down → f32 t1_d for gatedAdd
             try be.gatedAdd(xo, t1_d, mv_d, tile * F, F, mb + 5 * F);
         }
     }

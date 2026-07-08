@@ -129,6 +129,13 @@ fn conv(be: *Backend, bufs: *Bufs, src: *const Buf, dst: *Buf, h: usize, w: usiz
     const patch_len = 9 * cv.ci;
     try be.ensureDeviceBuffer(dst, n_out * cv.co * 4);
 
+    // Library backend: a fused cuDNN NHWC conv (no im2col) for the big non-upsample
+    // convs. Upsample convs keep the fused im2col-upsample path (cuDNN can't do the
+    // fused 2x resample); small convs stay on the GEMM (co padding not worth it).
+    if (be.kernels == .libs and coop and !up) {
+        return be.opConvCudnn(dst.*, 0, src.*, h, w, wbytes, cv.co, cv.ci, cv.b);
+    }
+
     // Band positions: multiple of 4 keeps the GEMM's y byte offset 16-aligned.
     const band = @max(4, @min(n_out, patch_band_bytes / (patch_len * 4)) & ~@as(usize, 3));
     try be.ensureDeviceBuffer(&bufs.patch, band * patch_len * 4);

@@ -23,10 +23,17 @@ pub const Buffer = context.Buffer;
 pub const backend = @import("cuda/backend.zig");
 pub const Backend = backend.Backend;
 
+/// cuBLASLt / cuDNN bindings for the library-backed `--backend cuda` (Phase 2):
+/// dlopen'd closed math libraries, same loading mechanism as the driver.
+pub const cublaslt = @import("cuda/cublaslt.zig");
+pub const cudnn = @import("cuda/cudnn.zig");
+
 test {
     _ = cu;
     _ = ptx;
     _ = kernels;
     _ = context;
     _ = backend;
+    _ = cublaslt;
+    _ = cudnn;
 }

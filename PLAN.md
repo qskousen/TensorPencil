@@ -1423,47 +1423,233 @@ answer — that the ~49% floor is the driver's coopmat lowering, not our tiling)
       1120x1680, via `generate --gpu cuda --profile on`. Reuse the bit-comparable
       image validation + fp8/int8 parity gates.
 
-### Phase 2 — link cuBLASLt (breaks pure-Zig; behind a build flag)
+### Phase 2 — library-backed CUDA backend (`--backend cuda`): cuBLASLt + cuDNN
 
-- [ ] **2.0 Build flag + linkage.** `-Dcuda-cublas` gates linking `libcublasLt.so`
-      (C ABI, hand-declared externs — no `nvcc`, but it IS a closed binary dep;
-      Vulkan + Phase-1 pure paths remain the default). Document the tradeoff in
-      CLAUDE.md's dependency note.
-- [ ] **2.1 cuBLASLt int8 GEMM.** `cublasLtMatmul`, `CUDA_R_8I` A/B, `CUDA_R_32I`
-      compute, s32 output. NOTE: cuBLASLt does **only the GEMM** — the convrot
-      rotate + per-row dynamic quantize prep STAYS ours (reuse Phase-1's hand-PTX
-      prep, or a simple kernel). Apply per-row act-scale × per-row weight-scale
-      dequant either via a cuBLASLt scaling epilogue or a small fused kernel (same
-      math as our Stage-A C-store fusion). Swap this in behind the backend seam.
-- [ ] **2.2 (optional) flash-attn / cuDNN attention** if attention is the residual
-      after the GEMM is cuBLASLt-fast. Larger integration; only if 2.1's number
-      says attention now dominates.
-- [ ] **2.3 Final comparison table** — the deliverable that answers the original
-      question:
+The 4th backend. Phase 1 (hand-PTX) recovered ~1.5-1.6x on the GEMM but plateaus
+at ~49% of int8 peak — the residual to ComfyUI (~2 s/it) is the closed libraries
+ComfyUI itself runs (cuBLASLt IMMA near peak + cuDNN/flash-attn). Phase 2 links
+those. Decisions (2026-07-08):
 
-      | backend            | int8 GEMM (DiT shape) | full s/step | vs ComfyUI |
-      |--------------------|-----------------------|-------------|-----------|
-      | Vulkan (current)   | ~85 TOPS              | ~4.0 s      | 2.0x slow |
-      | CUDA hand-PTX      | (1.3)                 | (1.7)       | ?         |
-      | CUDA + cuBLASLt    | (2.1)                 | (2.1+2.2)   | target ~1x|
-      | ComfyUI int8       | cuBLASLt (near peak)  | ~2.0 s      | 1.0x      |
+- **dlopen, not a build flag.** `libcublasLt.so.13` and `libcudnn.so.9` load at
+      runtime via `std.DynLib` + hand-declared externs — the *identical* mechanism
+      as `libcuda`/`libvulkan` (no `nvcc`, no headers, no link step). Missing `.so`
+      degrades gracefully like the other GPU backends. Keeps the project's own
+      "pure-Zig = runtime-loaded, hand-declared" definition; the only new thing is a
+      closed-source *math library* dependency (vs just the driver), documented in
+      README/CLAUDE.md. Verified present: cuBLASLt 13.2 (`/usr/local/cuda`), cuDNN
+      9.23.2 (full graph stack incl. the fused-SDPA engines).
+- **New `--backend cuda`** beside `--backend zig-cuda` (hand-PTX). Both drive the
+      SAME `dit_cuda`/`qwen3_cuda`/`vae_cuda` orchestrators through the existing
+      `cuda.Backend` seam; `cuda` sets `kernels = .libs` and the heavy op methods
+      branch to the library path. zig-cuda stays intact for the comparison table.
+- **Full scope**: cuBLASLt GEMM (int8 + fp8/f16) + cuDNN fused SDPA attention +
+      cuDNN conv for the VAE.
 
-      Phase 1 ≈ "our kernels" recoverable ceiling; the Phase-1→Phase-2 delta ≈ what
-      only NVIDIA's closed libraries capture. If cuBLASLt reaches ~2 s/step, the
-      lean-runtime thesis says our thinner orchestration (no Python dispatch) could
-      then *edge* ComfyUI — the last thing to test.
+**The seam is already built.** `cuda.Backend` (backend.zig) is the GpuBackend
+abstraction the orchestrators use; only these methods swap their compute (same
+signatures, so `dit_cuda`/etc. are untouched):
 
-### Risks / notes
+| op method | `.hand_ptx` (today) | `.libs` (new) |
+|-----------|---------------------|---------------|
+| `opI8Gemm` | `igemm_pipe_fused` (~49% peak) | cuBLASLt IMMA `CUDA_R_8I`→`R_32I` |
+| `opMatmulFp8` / f16 GEMM | `buildHgemm` | cuBLASLt `R_16F`→`R_32F` |
+| `opAttnTCBatched` | hgemm+`softmax_md`+fused PV | cuDNN fused SDPA |
+| `opConvF16` (VAE) | im2col+hgemm | `cudnnConvolutionForward` |
 
-- **Correct hand-PTX tiled IMMA + cp.async is a real lift** (register/shared
-  fragment layout, `ldmatrix` for the s8 operand load, cp.async pipeline depth) —
-  effectively hand-writing a CUTLASS slice. Time-box 1.3; the decision gate (1.4)
-  exists precisely so we don't sink weeks into matching cuBLAS by hand.
-- **SASS is the hard ceiling** — no public assembler; ptxas is closed. Phase 1
-  cannot fully match cuBLAS by construction. That's the expected finding, not a
-  failure.
-- **Pure-Zig line**: Phase 1 keeps it (driver API + emitted PTX = Vulkan+SPIR-V by
-  the same standard). Phase 2 crosses it deliberately and reversibly (build flag).
+Everything else — weight cache + LRU/streaming, the int8 **prep** (rotate FWHT +
+per-row quantize) and **rescale**, all `elt.zig`, profiler — stays byte-identical.
+cuBLASLt does ONLY the GEMM; our prep/rescale wrap it. Because s8·s8→s32 is exact
+integer math, the int8 GEMM result is **bit-identical to the CPU integer oracle**
+(`cuda-i8-test` wiring rel ~0); f16/fp8 GEMM and attention land in the f16 regime.
+
+- [x] **2.0 dlopen bindings + backend/CLI wiring.** `src/gpu/cuda/cublaslt.zig`
+      (DynLib `libcublasLt.so.13`, create/destroy/version + the matmul-descriptor
+      API, status→string, dtype/compute/order constants) and
+      `src/gpu/cuda/cudnn.zig` (DynLib `libcudnn.so.9`, create/destroy/version/
+      setStream/errorString). Added `Backend.KernelMode`/`Libs` + `initLibs` (loads
+      libs, creates handles bound to our stream, allocs a 32 MB cuBLASLt
+      workspace); `deinit` frees them. `--backend cuda` in `pipeline.Backend` +
+      `main.zig` help; `cuda-libs-test` smoke CLI. Ops still hand-PTX until 2.1 —
+      `--backend cuda` == `zig-cuda` behaviorally for now, but with the libs loaded
+      and reporting versions.
+- [x] **2.1 cuBLASLt int8 IMMA GEMM (the headline number) — VERDICT: DECISIVE.**
+      `opI8Gemm` routes to `cublasLtMatmul` in `.libs` mode; prep + `irescale`
+      (per-row act-scale × per-col weight-scale, into a reintroduced s32 acc
+      scratch) stay ours. KEY simplification vs the plan's expectation: **no COL32
+      transform needed** — the GEMM is cuBLASLt's ordinary-COL TN case
+      (`opA(W)=T, opB(A)=N`, `COMPUTE_32I`, s32 D). Our natural layouts map
+      directly: weight W[n][k] row-major == col-major [k][n] (the A operand,
+      transposed); prepped activation A[m][k] == col-major [k][m] (B, non-T); the
+      s32 D lands col-major [n][m] == row-major [m][n], exactly what `irescale`
+      consumes. Heuristic-selected algo + descriptors are cached per (n,m,k)
+      (`LtPlan`), so the timed matmul is a pure enqueue and the in-DiT path pays
+      the heuristic once. `cuda-libs-i8-test` (new CLI): **0 mismatches vs the CPU
+      integer oracle** (bit-exact, as predicted for exact s8·s8→s32), then min-of-N
+      TOP/s at the DiT shapes (RTX 3090):
+      | shape (m×n×k)        | cuBLASLt   | hand-PTX igemm_pipe | Vulkan |
+      |----------------------|------------|---------------------|--------|
+      | 4224×6144×6144       | 259.5 TOP/s (1.23 ms) | 138 (2.31 ms) | ~85 |
+      | 7680×6144×6144 (qkv) | 262.4 TOP/s (2.21 ms) | 131 (4.34 ms) | — |
+      | 7680×16384×6144 (up) | 264.4 TOP/s (5.85 ms) | 117 (12.9 ms) | — |
+      | 7680×6144×16384 (dn) | 302.3 TOP/s (5.11 ms) | 103 (14.2 ms) | — |
+      **~1.9–2.9× over hand-PTX, ~3× over Vulkan, ~91–106% of the ~284-TOPS int8
+      peak** — i.e. the GEMM gap to ComfyUI is essentially CLOSED (cuBLASLt IS
+      ComfyUI's kernel). The DiT is now attention/prep/elt-bound, not GEMM-bound;
+      confirm at the s/step level in 2.3.
+- [x] **2.2 cuBLASLt f16/fp8 GEMM — DONE (unit-validated).** `ltPlan`
+      generalized over an `LtKind {i8, f16}` (shared TN layout mapping; f16 uses
+      R_16F A/B, R_32F D, `COMPUTE_32F` = HMMA with f32 accumulate) + `ltRun`;
+      `ltMatmulF16` is the drop-in for the hand-PTX `buildHgemm`. Routed
+      `opMatmulFp8` (encoder fp8: decode→f16 stays ours, GEMM→cuBLASLt) and
+      `opConvF16` (VAE convs) through it in `.libs` mode; the hand-PTX path stays
+      as the `.hand_ptx` else-branch. DiT first/last stay on the naive f32 kernel
+      (`opMatmul`) — tiny, low value. `cuda-libs-f16-test` (new CLI): **rel vs a
+      CPU f32-accumulate reference 1e-6** (f16 inputs widen exactly; only
+      reduction order differs), and min-of-N: **65.8 TFLOP/s @4224³** (vs Vulkan
+      coop 51.7, ~93% of the ~71 TF/s f32-acc f16 peak), 57.3 @ enc-mlp, 62.1 @
+      vae-conv shapes. NOTE: end-to-end validation (encoder/VAE via
+      `cuda-encode-test`/`cuda-vae-test`/`generate`) needs the checkpoints, which
+      are ABSENT in the current checkout — deferred to 2.3, to run where the
+      14 GB int8 DiT + encoder + VAE are present.
+- [x] **2.3 measure GEMM-only — DONE, attention-bound confirmed.** Ran on the
+      real int8 checkpoint (`~/genai/comfyui/models/...krea2CenterSemiraw_v10Int8`,
+      see [[model-checkpoint-paths]]; NOT in the repo). `cuda-dit-test <ckpt> <lat>
+      [libs]` gained a `libs` switch to profile the cuBLASLt backend head-to-head
+      vs hand-PTX in one session.
+      * **Correctness**: full libs DiT forward vs CPU int8 ref rel RMSE **0.04519**
+        (f16 regime, == hand-PTX's 0.048); full `generate --backend cuda` 512px
+        renders a coherent AURORA-UNICORNS image (encoder fp8→cuBLASLt-f16, DiT
+        int8→cuBLASLt, VAE conv→cuBLASLt-f16 all exercised): 0.59 s/step, 5.9 s
+        total incl. loads. scratch_out/cuda_2p3_512.png.
+      * **1024px (lat=128, seq~4104) same-session profile:**
+        | category | hand-PTX | cuBLASLt libs |
+        |----------|----------|---------------|
+        | matmul   | 943.9 ms | **496.6 ms (1.90×)** |
+        | attn (scores 263 + softmax 55 + pv 163) | 465 ms | 481 ms (unchanged) |
+        | elt / prep / gather | ~330 ms | ~332 ms (unchanged) |
+        | **s/step (batched)** | **2.011 s** | **1.548 s (1.30×)** |
+      The 2.1 GEMM win (~1.9×) lands intact in-DiT; the ~23% s/step drop is exactly
+      that. **Attention (scores/pv/softmax, hand-PTX, O(seq²)) is now the largest
+      category (~480 ms) — it overtakes matmul.** So 2.4 (cuDNN fused SDPA) is the
+      real next lever, and matters more at 1120x1680 (seq~7661) where attention
+      dominates hardest. Plan sequencing (GEMM first, then attention) confirmed.
+- [x] **2.4 cuDNN fused SDPA attention — DONE, ~80× on the attention GEMMs.**
+      Used the dedicated `CUDNN_BACKEND_OPERATION_SDPA_FWD_DESCRIPTOR` (op 41) —
+      a single fused flash-attention node, NOT a hand-built softmax subgraph
+      (huge de-risk). Headers: the `nvidia-cudnn-cu12` wheel headers in
+      `~/genai/comfyui/nvenv` (9.13; backend enums stable across 9.x) — no apt
+      needed. `cudnn.zig` gained the backend-graph bindings (Create/Set/Get/
+      Finalize/Execute) + a `SdpaPlan` (tensors Q/K/V/O + by-value f32 scale →
+      SDPA op → operation graph → HEUR_MODE_A → engine-config → execution plan,
+      workspace-sized; cached per shape). `opAttnCudnn` converts the DiT's f32
+      [seq][heads][hd] q/k/v to f16 (new `f16_to_f32` elt for O back), runs the
+      op, converts O back — no per-head gather/scatter, no S materialization, no
+      seq padding, **native GQA**.
+      * **Isolation test (`cuda-libs-attn-test`)**: MHA + GQA (8/2) vs CPU rel
+        **3e-4**; timing at DiT shapes — **1024px (s=4104, 48/12) 6.07 ms** vs
+        hand-PTX ~481 ms (**~80×**); 1408px (s=7752) 22.8 ms vs ~1600 ms (~70×);
+        ~68 TFLOP/s ≈ f16 tensor peak.
+      * **In-DiT (`cuda-dit-test <ckpt> 128 libs`)**: rel vs CPU **0.04525**
+        (unchanged from hand-PTX 0.04519); coherent 512px `generate --backend
+        cuda` image (scratch_out/cuda_2p4_512.png). 1024px s/step **1.548 →
+        1.257 (1.23×; 1.60× total vs hand-PTX 2.011)**. Attention category
+        480 → 233 ms — the residual is the f32↔f16 conversions around the op
+        (raw SDPA ~6 ms/block); fusing f16 into rope/qknorm (Vulkan-c16-style)
+        is the follow-up, and cuDNN's edge grows at higher res (seq²).
+- [x] **2.5 cuDNN conv for VAE — DONE (as predicted, marginal).** `cudnn.zig`
+      gained the legacy conv-API bindings + a `ConvPlan` (NHWC f16 X/W → f16 Y,
+      3×3 pad-1 stride-1 cross-correlation, `IMPLICIT_PRECOMP_GEMM`, tensor-op
+      math — no im2col materialization). KEY: the checkpoint weight is stored
+      `[co][kh][kw][ci]` (wan_vae.zig) and activations are channel-last
+      `[h·w][ci]` — both EXACTLY cuDNN's NHWC layout, so zero layout
+      reconciliation. `opConvCudnn` (convert src+weight f32→f16, conv, new
+      `bias_add_f16` elt folds the per-channel bias into the f32 dst); wired into
+      `vae_cuda.conv` for the big (co≥96) NON-upsample 3×3 convs in `.libs` mode.
+      Upsample convs keep the fused im2col-2×-resample path (cuDNN can't fuse the
+      resample); they still use cuBLASLt for the GEMM. Validated end-to-end:
+      coherent 512px `generate --backend cuda` image (scratch_out/cuda_2p5_512.png;
+      VAE conv errors would be glaring — none), decode 0.6 → 0.4 s @512px.
+      Marginal (VAE is a one-time cost), exactly as scoped.
+- [x] **2.6 deliverable — DONE. The gap is closed from ~2.4× to 1.42×.**
+      Same-session `generate --backend {cuda,zig-cuda}` at 1120×1680, int8 convrot,
+      8 steps, steady-state (steps 2–8 flat); coherent production-quality poster
+      (scratch_out/cuda_2p6_1120x1680.png — crisp legible "AURORA UNICORNS" text).
+
+      | backend                 | int8 GEMM (DiT shape) | full s/step | vs ComfyUI |
+      |-------------------------|-----------------------|-------------|-----------|
+      | Vulkan                  | ~85 TOPS              | ~4.86 s     | ~2.4×     |
+      | CUDA hand-PTX (zig-cuda)| ~135 TOP/s (~49%)     | 4.76 s      | ~2.4×     |
+      | **CUDA + cuBLASLt/cuDNN** | **259–302 TOP/s (~peak)** | **2.83 s** | **1.42×** |
+      | ComfyUI int8            | cuBLASLt (near peak)  | ~2.0 s      | 1.0×      |
+
+      **Verdict on the original M10 question**: the closed libraries recover most
+      of the gap — **1.68× over our own hand-PTX in the same session**, GEMM at
+      hardware peak and attention at the flash kernel. The residual ~1.42× to
+      ComfyUI is NOT the heavy kernels (those now match); it's **orchestration /
+      fusion** — the un-fused f32 eltwise chain (~267 ms/step at 1024px) and the
+      f32↔f16 conversions around the cuDNN attention (ComfyUI fuses these into its
+      kernels). So the lean-runtime thesis lands qualified: our thinner dispatch
+      does NOT yet edge ComfyUI, because ComfyUI's advantage was never dispatch
+      overhead — it's kernel fusion we haven't matched. Closing the last 1.4×
+      means the eltwise-fusion follow-ups below, not more library calls.
+      Follow-ups (bit-identical, deferred): (1) fuse f16 conversion into
+      rope/qknorm so cuDNN attention reads f16 directly (Vulkan-c16-style) —
+      removes the ~2 ms/block converts; (2) fuse the int8 rms_mod/silu/sigmoid
+      f32 eltwise chain (the biggest remaining category); (3) cache the cuDNN conv
+      ConvPlan per shape.
+- [~] **2.7 f16-activation-chain redesign — Stage A (MLP) landed, MEASURED NEUTRAL.**
+      Built the f16 MLP sub-chain: `irescale_h16` (int8 GEMM → f16), `silu_mul_h16`,
+      `buildPrep(in_f16)` (prep reads f16), wired in `dit_cuda` behind
+      `mlp_f16 = kernels==.libs and !is_i4`. Validated: rel-vs-CPU 0.04668 (in
+      regime), coherent 1120×1680 poster. **Clean same-session A/B @1120×1680:
+      f16 MLP 2.77 vs f32 MLP 2.79 s/step — ~0.7%, NEUTRAL.** Kept (correct,
+      halves MLP activation DRAM for memory-pressured regimes), but the hypothesis
+      is FALSIFIED: the "elt = 267 ms" in the sync-per-op profile is an artifact
+      (a device sync after each of ~280 elt ops/step); the real BATCHED eltwise
+      cost is small. So follow-ups (1)/(2) above won't close the gap. CORRECTED
+      residual: the 1.42× is matmul (cuBLASLt ~peak) + SDPA (cuDNN ~peak) — both
+      == ComfyUI's kernels, immovable — plus the int8 prep + s32→f32 `irescale`
+      round-trip (cuBLASLt can't fuse per-row×per-col dequant into its IMMA
+      epilogue) plus per-step host/launch overhead (batched wall ≫ device
+      sync-sum). Real levers (larger/uncertain): (a) fuse dequant into the GEMM
+      epilogue — NOT via CUTLASS (header-only C++, needs nvcc build-dep, no
+      dlopen'able .so; cuBLASLt already IS NVIDIA's CUTLASS-based GEMM) but via a
+      cuDNN backend-graph int8-MATMUL→POINTWISE(row)→POINTWISE(col) fused op,
+      staying pure-dlopen; (b) CUDA Graphs for the host overhead.
+- [x] **2.7b cuDNN fused int8 GEMM+dequant — BUILT + VALIDATED, MEASURED NEUTRAL
+      (the pure-dlopen ceiling).** `cudnn.MatmulDequantPlan`: one backend-graph op
+      (int8 MATMUL -> s32 virtual -> POINTWISE mul act_scale[row] -> POINTWISE mul
+      weight_scale[col] -> f32/f16 D), the dlopen alternative to a CUTLASS epilogue
+      (weight [n][k] viewed as [k][n] via strides). Cached per (m,n,k,d_f16);
+      `use_fused_i8` toggle in `opI8GemmLibs`. `cuda-libs-i8fused-test`: **rel vs
+      CPU 0.000000 (bit-exact)**; in-DiT rel 0.04547; coherent image. The irescale
+      diagnostic (skip the pass -> valid timing) confirmed it IS a real batched
+      cost: **1120x1680 2.55 s/step with irescale skipped vs 2.77 with (~0.22 s,
+      ~8%)** — unlike the eltwise. BUT the clean same-session A/B: **fused 2.72 vs
+      cuBLASLt+irescale 2.71 s/step — NEUTRAL.** The fusion removes the ~0.22 s
+      round-trip, but **cuDNN's int8 matmul is ~0.22 s/step slower than cuBLASLt's
+      IMMA**, canceling exactly. CONCLUSION: within pure-dlopen you get peak GEMM
+      (cuBLASLt, no fusion) XOR fused dequant (cuDNN, slower GEMM), never both —
+      they net to a wash. Closing the last 1.42x needs a CUTLASS-class fused-
+      epilogue GEMM (nvcc build-dep, out of model) or CUDA Graphs for host overhead
+      (untried). **1.42x is the effective floor for the pure-dlopen library
+      backend.** Ships cuBLASLt+irescale (proven, equal speed); the fused graph
+      stays dormant + documented (`use_fused_i8=false`).
+
+### Risks / notes (Phase 2)
+
+- **IMMA layout (COL32)** is the one real int8 wrinkle — mitigated by
+  transform-once-at-upload, which fits the existing weight-cache/streaming pattern.
+- **cuDNN backend graph API** is verbose and version-sensitive — mitigated by the
+  cuBLASLt-batched-GEMM attention fallback (2.4).
+- **VRAM accounting**: cuBLASLt/cuDNN allocate workspace *outside* our
+  `device_used` accountant → the streaming budget under-counts. Register their
+  workspaces or reserve headroom for them.
+- **Version skew**: dlopen the explicit `/usr/local/cuda/lib64/libcublasLt.so.13`
+  ahead of the system `.so.12`.
+- **Pure-Zig line**: crossed deliberately for `--backend cuda` (closed math libs,
+  dlopen'd); CPU/Vulkan/zig-cuda stay pure and default. Same dlopen mechanism as
+  the driver, so no build-time dependency is added.
 - Clock-governor + Xid 109 watchdog caveats from [[gpu-perf-lab-notes]] apply to
   CUDA identically; use `cuEvent` device timing and keep submissions bounded.
 

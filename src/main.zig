@@ -50,6 +50,16 @@ pub fn main(init: std.process.Init) !void {
         try gpuI8Test(arena, io, stdout);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-test")) {
         try cudaTest(arena, stdout);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-libs-test")) {
+        try cudaLibsTest(arena, stdout);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-libs-i8-test")) {
+        try cudaLibsI8Test(arena, stdout);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-libs-f16-test")) {
+        try cudaLibsF16Test(arena, stdout);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-libs-attn-test")) {
+        try cudaLibsAttnTest(arena, stdout);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-libs-i8fused-test")) {
+        try cudaLibsI8FusedTest(arena, stdout);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-i8-test")) {
         try cudaI8Test(arena, io, stdout);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-i4-test")) {
@@ -64,8 +74,13 @@ pub fn main(init: std.process.Init) !void {
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-dit-test")) {
         const path = if (args.len >= 3) args[2] else "models/diffusion_model/krea2CenterSemiraw_v10Int8.safetensors";
         const lat: usize = if (args.len >= 4) (std.fmt.parseInt(usize, args[3], 10) catch 32) else 32;
-        const loop = args.len >= 5 and std.mem.eql(u8, args[4], "loop");
-        try cudaDitTest(arena, io, stdout, path, lat, loop);
+        var loop = false;
+        var libs = false;
+        for (args[2..]) |a| {
+            if (std.mem.eql(u8, a, "loop")) loop = true;
+            if (std.mem.eql(u8, a, "libs")) libs = true;
+        }
+        try cudaDitTest(arena, io, stdout, path, lat, loop, libs);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-attn-test")) {
         const cuda = TensorPencil.gpu.cuda;
         var ctx = cuda.Context.init(arena) catch |err| {
@@ -114,11 +129,13 @@ pub fn main(init: std.process.Init) !void {
             \\      --cfg 1.0          guidance scale (1.0 = no negative pass)
             \\      --seed 0           noise seed
             \\      --shift 1.15       flow-matching sigma shift
-            \\      --backend cpu      compute backend: cpu | vulkan | zig-cuda.
-            \\                         vulkan offloads encoder/DiT/VAE GEMMs to
-            \\                         Vulkan; zig-cuda runs the whole pipeline
-            \\                         (encoder + DiT + VAE) on the hand-PTX CUDA
-            \\                         backend (needs an int8 convrot --dit ckpt)
+            \\      --backend cpu      compute backend: cpu | vulkan | zig-cuda
+            \\                         | cuda. vulkan offloads encoder/DiT/VAE
+            \\                         GEMMs to Vulkan; zig-cuda runs the whole
+            \\                         pipeline on the pure-Zig hand-PTX CUDA
+            \\                         backend; cuda runs it on NVIDIA's dlopen'd
+            \\                         cuBLASLt/cuDNN kernels (both need an int8
+            \\                         convrot --dit ckpt)
             \\      --vram-budget 0    GiB of device memory to use (0 = ask the
             \\                         driver); weights past it stream per step.
             \\                         "min" holds only the in-flight weights
@@ -403,6 +420,409 @@ fn cudaTest(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
     });
     try cuda.kernels.smokeTest(&ctx);
     try stdout.print("cuda vadd smoke test OK\n", .{});
+}
+
+/// Phase-2 library backend bring-up (`--backend cuda`): dlopen cuBLASLt + cuDNN,
+/// create handles bound to the compute stream, report their versions. Validates
+/// bindings→handle end to end (the analog of `cuda-test` for the driver path).
+fn cudaLibsTest(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    var be = cuda.Backend.initLibs(arena) catch |err| {
+        try stdout.print("cuda libs unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    const L = be.libs.?;
+    try stdout.print("cuda device: {s}\n", .{be.deviceName()});
+    try stdout.print("cublasLt version: {d} (cudart {d})\n", .{ L.lt.cublasLtGetVersion(), L.lt.cublasLtGetCudartVersion() });
+    try stdout.print("cuDNN version: {d}\n", .{L.dnn.cudnnGetVersion()});
+    try stdout.print("cuda libs smoke test OK\n", .{});
+}
+
+/// Phase-2 milestone 2.1: cuBLASLt int8 IMMA GEMM. Bit-exact validation vs a CPU
+/// integer matmul (s8·s8→s32 is exact, so 0 mismatches expected), then a min-of-N
+/// TOP/s benchmark at the DiT GEMM shapes to compare against the hand-PTX
+/// `igemm_pipe` (~135 TOP/s) and the Vulkan coopmat (~85).
+fn cudaLibsI8Test(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    var be = cuda.Backend.initLibs(arena) catch |err| {
+        try stdout.print("cuda libs unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    try stdout.print("cuda device: {s}, cublasLt {d}\n", .{ be.deviceName(), be.libs.?.lt.cublasLtGetVersion() });
+
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const rnd = prng.random();
+
+    // ---- bit-exact validation vs a CPU integer matmul ----
+    const Case = struct { m: usize, n: usize, k: usize };
+    const checks = [_]Case{ .{ .m = 256, .n = 512, .k = 6144 }, .{ .m = 128, .n = 256, .k = 16384 } };
+    for (checks) |c| {
+        const a = try arena.alloc(i8, c.m * c.k);
+        const w = try arena.alloc(i8, c.n * c.k);
+        defer arena.free(a);
+        defer arena.free(w);
+        for (a) |*v| v.* = rnd.intRangeAtMost(i8, -127, 127);
+        for (w) |*v| v.* = rnd.intRangeAtMost(i8, -127, 127);
+        var da = try be.tensorCreate(c.m * c.k);
+        defer be.tensorDestroy(&da);
+        var dw = try be.tensorCreate(c.n * c.k);
+        defer be.tensorDestroy(&dw);
+        var dacc = try be.tensorCreate(c.m * c.n * 4);
+        defer be.tensorDestroy(&dacc);
+        try be.tensorUpload(da, std.mem.sliceAsBytes(a));
+        try be.tensorUpload(dw, std.mem.sliceAsBytes(w));
+        try be.ltMatmulI8(dacc, dw, da, c.n, c.m, c.k);
+        const acc = try arena.alloc(i32, c.m * c.n);
+        defer arena.free(acc);
+        try be.tensorDownload(dacc, std.mem.sliceAsBytes(acc));
+        var mism: usize = 0;
+        for (0..c.m) |i| {
+            for (0..c.n) |j| {
+                var s: i32 = 0;
+                for (0..c.k) |kk| s += @as(i32, a[i * c.k + kk]) * @as(i32, w[j * c.k + kk]);
+                if (s != acc[i * c.n + j]) mism += 1;
+            }
+        }
+        try stdout.print("i8 gemm {d}x{d}x{d}: {d} mismatches vs cpu s32\n", .{ c.m, c.n, c.k, mism });
+        if (mism != 0) return error.GpuMismatch;
+    }
+
+    // ---- min-of-N TOP/s at the DiT GEMM shapes ----
+    const Shape = struct { m: usize, n: usize, k: usize, name: []const u8 };
+    const shapes = [_]Shape{
+        .{ .m = 4224, .n = 6144, .k = 6144, .name = "square  " },
+        .{ .m = 7680, .n = 6144, .k = 6144, .name = "qkv     " },
+        .{ .m = 7680, .n = 16384, .k = 6144, .name = "mlp up  " },
+        .{ .m = 7680, .n = 6144, .k = 16384, .name = "mlp down" },
+    };
+    for (shapes) |s| {
+        var da = try be.tensorCreate(s.m * s.k);
+        defer be.tensorDestroy(&da);
+        var dw = try be.tensorCreate(s.n * s.k);
+        defer be.tensorDestroy(&dw);
+        var dacc = try be.tensorCreate(s.m * s.n * 4);
+        defer be.tensorDestroy(&dacc);
+        const timer = try be.ctx.timerCreate();
+        defer be.ctx.timerDestroy(timer);
+        try be.ltMatmulI8(dacc, dw, da, s.n, s.m, s.k); // warm: builds+caches the plan
+        var best: f32 = std.math.floatMax(f32);
+        for (0..12) |_| {
+            try be.ctx.timerBegin(timer);
+            try be.ltMatmulI8(dacc, dw, da, s.n, s.m, s.k);
+            const ms = try be.ctx.timerEndMs(timer);
+            best = @min(best, ms);
+        }
+        const macs: f64 = @floatFromInt(s.m * s.n * s.k);
+        const tops = 2.0 * macs / (@as(f64, best) / 1000.0) / 1e12;
+        try stdout.print("i8 gemm {s} {d}x{d}x{d}: {d:.3} ms, {d:.1} TOP/s\n", .{ s.name, s.m, s.n, s.k, best, tops });
+    }
+}
+
+/// Phase-2 milestone 2.2: cuBLASLt f16 GEMM (HMMA, f32 accumulate) — the drop-in
+/// for the hand-PTX `buildHgemm` behind the fp8 encoder GEMMs and the VAE convs.
+/// Validates D[m][n] f32 = A[m][k] @ W[n][k]ᵀ vs a CPU f32-accumulate reference
+/// (f16 inputs widen exactly; only the reduction order differs → f16 regime),
+/// then a min-of-N TFLOP/s bench.
+fn cudaLibsF16Test(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    var be = cuda.Backend.initLibs(arena) catch |err| {
+        try stdout.print("cuda libs unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    try stdout.print("cuda device: {s}, cublasLt {d}\n", .{ be.deviceName(), be.libs.?.lt.cublasLtGetVersion() });
+
+    var prng = std.Random.DefaultPrng.init(0xF16F16);
+    const rnd = prng.random();
+
+    // ---- validation vs CPU f32-accumulate reference ----
+    const Case = struct { m: usize, n: usize, k: usize };
+    const checks = [_]Case{ .{ .m = 256, .n = 512, .k = 2560 }, .{ .m = 128, .n = 256, .k = 6144 } };
+    for (checks) |c| {
+        const a = try arena.alloc(f16, c.m * c.k);
+        const w = try arena.alloc(f16, c.n * c.k);
+        defer arena.free(a);
+        defer arena.free(w);
+        for (a) |*v| v.* = @floatCast((rnd.float(f32) - 0.5) * 2.0);
+        for (w) |*v| v.* = @floatCast((rnd.float(f32) - 0.5) * 2.0);
+        var da = try be.tensorCreate(c.m * c.k * 2);
+        defer be.tensorDestroy(&da);
+        var dw = try be.tensorCreate(c.n * c.k * 2);
+        defer be.tensorDestroy(&dw);
+        var dd = try be.tensorCreate(c.m * c.n * 4);
+        defer be.tensorDestroy(&dd);
+        try be.tensorUpload(da, std.mem.sliceAsBytes(a));
+        try be.tensorUpload(dw, std.mem.sliceAsBytes(w));
+        try be.ltMatmulF16(dd, dw, da, c.n, c.m, c.k);
+        const d = try arena.alloc(f32, c.m * c.n);
+        defer arena.free(d);
+        try be.tensorDownload(dd, std.mem.sliceAsBytes(d));
+        var num: f64 = 0;
+        var den: f64 = 0;
+        for (0..c.m) |i| {
+            for (0..c.n) |j| {
+                var s: f32 = 0;
+                for (0..c.k) |kk| s += @as(f32, a[i * c.k + kk]) * @as(f32, w[j * c.k + kk]);
+                const diff = @as(f64, d[i * c.n + j]) - @as(f64, s);
+                num += diff * diff;
+                den += @as(f64, s) * @as(f64, s);
+            }
+        }
+        const rel = @sqrt(num / den);
+        try stdout.print("f16 gemm {d}x{d}x{d}: rel vs cpu-f32 {d:.6}\n", .{ c.m, c.n, c.k, rel });
+        if (rel > 5e-3) return error.GpuMismatch;
+    }
+
+    // ---- min-of-N TFLOP/s ----
+    const Shape = struct { m: usize, n: usize, k: usize, name: []const u8 };
+    const shapes = [_]Shape{
+        .{ .m = 4224, .n = 6144, .k = 6144, .name = "square    " },
+        .{ .m = 448, .n = 9728, .k = 2560, .name = "enc mlp   " },
+        .{ .m = 5376, .n = 384, .k = 3456, .name = "vae conv  " },
+    };
+    for (shapes) |s| {
+        var da = try be.tensorCreate(s.m * s.k * 2);
+        defer be.tensorDestroy(&da);
+        var dw = try be.tensorCreate(s.n * s.k * 2);
+        defer be.tensorDestroy(&dw);
+        var dd = try be.tensorCreate(s.m * s.n * 4);
+        defer be.tensorDestroy(&dd);
+        const timer = try be.ctx.timerCreate();
+        defer be.ctx.timerDestroy(timer);
+        try be.ltMatmulF16(dd, dw, da, s.n, s.m, s.k); // warm
+        var best: f32 = std.math.floatMax(f32);
+        for (0..12) |_| {
+            try be.ctx.timerBegin(timer);
+            try be.ltMatmulF16(dd, dw, da, s.n, s.m, s.k);
+            const ms = try be.ctx.timerEndMs(timer);
+            best = @min(best, ms);
+        }
+        const flops: f64 = @floatFromInt(s.m * s.n * s.k);
+        const tflops = 2.0 * flops / (@as(f64, best) / 1000.0) / 1e12;
+        try stdout.print("f16 gemm {s} {d}x{d}x{d}: {d:.3} ms, {d:.1} TFLOP/s\n", .{ s.name, s.m, s.n, s.k, best, tflops });
+    }
+}
+
+/// Phase-2 milestone 2.7: cuDNN fused int8 GEMM + per-row×per-col dequant (one
+/// op graph). Validates D = (A·B in s32)·act_scale·weight_scale vs a CPU
+/// reference (s32 matmul exact; dequant in f32), then a min-of-N bench vs the
+/// separate ltMatmulI8 + irescale path.
+fn cudaLibsI8FusedTest(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    const cudnn = cuda.cudnn;
+    var be = cuda.Backend.initLibs(arena) catch |err| {
+        try stdout.print("cuda libs unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    const api = &be.libs.?.dnn;
+    const handle = be.libs.?.dnn_handle;
+    try stdout.print("cuda device: {s}, cuDNN {d}\n", .{ be.deviceName(), api.cudnnGetVersion() });
+
+    const Case = struct { m: usize, n: usize, k: usize };
+    const cases = [_]Case{ .{ .m = 256, .n = 512, .k = 6144 }, .{ .m = 128, .n = 256, .k = 16384 } };
+    var prng = std.Random.DefaultPrng.init(0x1F00D);
+    const rnd = prng.random();
+    for (cases) |c| {
+        const a = try arena.alloc(i8, c.m * c.k);
+        const w = try arena.alloc(i8, c.n * c.k);
+        const asc = try arena.alloc(f32, c.m);
+        const wsc = try arena.alloc(f32, c.n);
+        defer arena.free(a);
+        defer arena.free(w);
+        defer arena.free(asc);
+        defer arena.free(wsc);
+        for (a) |*v| v.* = rnd.intRangeAtMost(i8, -127, 127);
+        for (w) |*v| v.* = rnd.intRangeAtMost(i8, -127, 127);
+        for (asc) |*v| v.* = 0.001 + rnd.float(f32) * 0.01;
+        for (wsc) |*v| v.* = 0.001 + rnd.float(f32) * 0.01;
+
+        var da = try be.tensorCreate(a.len);
+        defer be.tensorDestroy(&da);
+        var dw = try be.tensorCreate(w.len);
+        defer be.tensorDestroy(&dw);
+        var das = try be.tensorCreate(asc.len * 4);
+        defer be.tensorDestroy(&das);
+        var dws = try be.tensorCreate(wsc.len * 4);
+        defer be.tensorDestroy(&dws);
+        var dd = try be.tensorCreate(c.m * c.n * 4);
+        defer be.tensorDestroy(&dd);
+        try be.tensorUpload(da, std.mem.sliceAsBytes(a));
+        try be.tensorUpload(dw, std.mem.sliceAsBytes(w));
+        try be.tensorUpload(das, std.mem.sliceAsBytes(asc));
+        try be.tensorUpload(dws, std.mem.sliceAsBytes(wsc));
+
+        var plan = cudnn.MatmulDequantPlan.build(api, handle, c.m, c.n, c.k, false) catch |err| {
+            try stdout.print("fused build failed ({t}) for {d}x{d}x{d}\n", .{ err, c.m, c.n, c.k });
+            return;
+        };
+        defer plan.deinit(api);
+        var ws: cuda.backend.DeviceBuffer = .{};
+        if (plan.workspace_bytes > 0) ws = try be.tensorCreate(plan.workspace_bytes);
+        defer be.tensorDestroy(&ws);
+        try plan.execute(api, handle, da.ptr(), dw.ptr(), das.ptr(), dws.ptr(), dd.ptr(), ws.ptr());
+        try be.ctx.synchronize();
+
+        const d = try arena.alloc(f32, c.m * c.n);
+        defer arena.free(d);
+        try be.tensorDownload(dd, std.mem.sliceAsBytes(d));
+        var num: f64 = 0;
+        var den: f64 = 0;
+        for (0..c.m) |i| {
+            for (0..c.n) |j| {
+                var s: i32 = 0;
+                for (0..c.k) |kk| s += @as(i32, a[i * c.k + kk]) * @as(i32, w[j * c.k + kk]);
+                const ref = @as(f32, @floatFromInt(s)) * asc[i] * wsc[j];
+                const diff = @as(f64, d[i * c.n + j]) - @as(f64, ref);
+                num += diff * diff;
+                den += @as(f64, ref) * @as(f64, ref);
+            }
+        }
+        const rel = @sqrt(num / den);
+        try stdout.print("fused i8+dequant {d}x{d}x{d}: rel vs cpu {d:.6} (ws {d} B)\n", .{ c.m, c.n, c.k, rel, plan.workspace_bytes });
+        if (rel > 1e-3) return error.GpuMismatch;
+    }
+    try stdout.print("cuda libs fused int8+dequant test OK\n", .{});
+}
+
+/// Phase-2 milestone 2.4: cuDNN fused SDPA (flash attention). Validates the
+/// backend-graph SDPA op in ISOLATION — synthetic f16 Q/K/V (GQA), non-causal —
+/// vs a CPU softmax-attention reference, before any DiT wiring. Tensors stored
+/// [s,h,d] (the DiT layout). Scale = 1/sqrt(d).
+fn cudaLibsAttnTest(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    const cudnn = cuda.cudnn;
+    var be = cuda.Backend.initLibs(arena) catch |err| {
+        try stdout.print("cuda libs unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    const api = &be.libs.?.dnn;
+    const handle = be.libs.?.dnn_handle;
+    try stdout.print("cuda device: {s}, cuDNN {d}\n", .{ be.deviceName(), api.cudnnGetVersion() });
+
+    const Case = struct { hq: usize, hkv: usize, s: usize, d: usize };
+    const cases = [_]Case{
+        .{ .hq = 4, .hkv = 4, .s = 256, .d = 128 }, // MHA baseline
+        .{ .hq = 8, .hkv = 2, .s = 256, .d = 128 }, // GQA (group 4, the DiT ratio)
+    };
+    var prng = std.Random.DefaultPrng.init(0x5D9A);
+    const rnd = prng.random();
+    for (cases) |c| {
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(c.d)));
+        const group = c.hq / c.hkv;
+        const q = try arena.alloc(f16, c.s * c.hq * c.d);
+        const k = try arena.alloc(f16, c.s * c.hkv * c.d);
+        const v = try arena.alloc(f16, c.s * c.hkv * c.d);
+        defer arena.free(q);
+        defer arena.free(k);
+        defer arena.free(v);
+        for (q) |*x| x.* = @floatCast((rnd.float(f32) - 0.5) * 2.0);
+        for (k) |*x| x.* = @floatCast((rnd.float(f32) - 0.5) * 2.0);
+        for (v) |*x| x.* = @floatCast((rnd.float(f32) - 0.5) * 2.0);
+
+        var dq = try be.tensorCreate(q.len * 2);
+        defer be.tensorDestroy(&dq);
+        var dk = try be.tensorCreate(k.len * 2);
+        defer be.tensorDestroy(&dk);
+        var dv = try be.tensorCreate(v.len * 2);
+        defer be.tensorDestroy(&dv);
+        var do_ = try be.tensorCreate(c.s * c.hq * c.d * 2);
+        defer be.tensorDestroy(&do_);
+        try be.tensorUpload(dq, std.mem.sliceAsBytes(q));
+        try be.tensorUpload(dk, std.mem.sliceAsBytes(k));
+        try be.tensorUpload(dv, std.mem.sliceAsBytes(v));
+
+        var plan = cudnn.SdpaPlan.build(api, handle, 1, c.hq, c.hkv, c.s, c.d) catch |err| {
+            try stdout.print("SDPA build failed ({t}) for hq={d} hkv={d} s={d} d={d}\n", .{ err, c.hq, c.hkv, c.s, c.d });
+            return;
+        };
+        defer plan.deinit(api);
+        var ws: cuda.backend.DeviceBuffer = .{};
+        if (plan.workspace_bytes > 0) ws = try be.tensorCreate(plan.workspace_bytes);
+        defer be.tensorDestroy(&ws);
+        var sc = scale;
+        try plan.execute(api, handle, dq.ptr(), dk.ptr(), dv.ptr(), do_.ptr(), &sc, ws.ptr());
+        try be.ctx.synchronize();
+
+        const o = try arena.alloc(f16, c.s * c.hq * c.d);
+        defer arena.free(o);
+        try be.tensorDownload(do_, std.mem.sliceAsBytes(o));
+
+        // CPU reference: full softmax attention (f32), GQA via kv = h/group.
+        const row = try arena.alloc(f32, c.s);
+        defer arena.free(row);
+        var num: f64 = 0;
+        var den: f64 = 0;
+        for (0..c.hq) |h| {
+            const kv = h / group;
+            for (0..c.s) |i| {
+                var mx: f32 = -std.math.inf(f32);
+                for (0..c.s) |j| {
+                    var dot: f32 = 0;
+                    for (0..c.d) |dd| dot += @as(f32, q[i * c.hq * c.d + h * c.d + dd]) * @as(f32, k[j * c.hkv * c.d + kv * c.d + dd]);
+                    row[j] = dot * scale;
+                    mx = @max(mx, row[j]);
+                }
+                var sum: f32 = 0;
+                for (0..c.s) |j| {
+                    row[j] = @exp(row[j] - mx);
+                    sum += row[j];
+                }
+                for (0..c.d) |dd| {
+                    var acc: f32 = 0;
+                    for (0..c.s) |j| acc += row[j] * @as(f32, v[j * c.hkv * c.d + kv * c.d + dd]);
+                    const ref = acc / sum;
+                    const got = @as(f32, o[i * c.hq * c.d + h * c.d + dd]);
+                    const diff = @as(f64, got) - @as(f64, ref);
+                    num += diff * diff;
+                    den += @as(f64, ref) * @as(f64, ref);
+                }
+            }
+        }
+        const rel = @sqrt(num / den);
+        try stdout.print("sdpa hq={d} hkv={d} s={d} d={d}: rel vs cpu {d:.6} (ws {d} B)\n", .{ c.hq, c.hkv, c.s, c.d, rel, plan.workspace_bytes });
+        if (rel > 2e-2) return error.GpuMismatch;
+    }
+
+    // ---- min-of-N timing at DiT attention shapes (GQA 48/12, hd 128) ----
+    // Compare against the hand-PTX two-pass attention (2.3 profile @1024px:
+    // scores 263 + softmax 55 + pv 163 = ~481 ms; @1408px ~1.6 s).
+    const TShape = struct { s: usize, name: []const u8 };
+    const tshapes = [_]TShape{ .{ .s = 4104, .name = "1024px" }, .{ .s = 7752, .name = "1408px" } };
+    for (tshapes) |t| {
+        const hq: usize = 48;
+        const hkv: usize = 12;
+        const d: usize = 128;
+        var dq = try be.tensorCreate(t.s * hq * d * 2);
+        defer be.tensorDestroy(&dq);
+        var dk = try be.tensorCreate(t.s * hkv * d * 2);
+        defer be.tensorDestroy(&dk);
+        var dv = try be.tensorCreate(t.s * hkv * d * 2);
+        defer be.tensorDestroy(&dv);
+        var do2 = try be.tensorCreate(t.s * hq * d * 2);
+        defer be.tensorDestroy(&do2);
+        var plan = try cudnn.SdpaPlan.build(api, handle, 1, hq, hkv, t.s, d);
+        defer plan.deinit(api);
+        var ws: cuda.backend.DeviceBuffer = .{};
+        if (plan.workspace_bytes > 0) ws = try be.tensorCreate(plan.workspace_bytes);
+        defer be.tensorDestroy(&ws);
+        var sc: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(d)));
+        const timer = try be.ctx.timerCreate();
+        defer be.ctx.timerDestroy(timer);
+        try plan.execute(api, handle, dq.ptr(), dk.ptr(), dv.ptr(), do2.ptr(), &sc, ws.ptr()); // warm
+        var best: f32 = std.math.floatMax(f32);
+        for (0..12) |_| {
+            try be.ctx.timerBegin(timer);
+            try plan.execute(api, handle, dq.ptr(), dk.ptr(), dv.ptr(), do2.ptr(), &sc, ws.ptr());
+            const ms = try be.ctx.timerEndMs(timer);
+            best = @min(best, ms);
+        }
+        try stdout.print("sdpa {s} (s={d}, 48/12 hd128): {d:.3} ms  (hand-PTX ~{s})\n", .{ t.name, t.s, best, if (t.s == 4104) "481 ms" else "1600 ms" });
+    }
+    try stdout.print("cuda libs SDPA test OK\n", .{});
 }
 
 /// CUDA int8 GEMM validation + benchmark against the Vulkan ~85 TOPS baseline.
@@ -849,7 +1269,7 @@ fn cudaStreamTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []
     try stdout.print("cuda weight streaming OK (bit-identical)\n", .{});
 }
 
-fn cudaDitTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []const u8, lat: usize, use_loop: bool) !void {
+fn cudaDitTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []const u8, lat: usize, use_loop: bool, use_libs: bool) !void {
     const dit_mod = TensorPencil.models.dit;
     const dit_cuda = TensorPencil.models.dit_cuda;
     const cuda = TensorPencil.gpu.cuda;
@@ -886,12 +1306,12 @@ fn cudaDitTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []con
         try stdout.flush();
     }
 
-    var be = cuda.Backend.init(arena) catch |err| {
+    var be = (if (use_libs) cuda.Backend.initLibs(arena) else cuda.Backend.init(arena)) catch |err| {
         try stdout.print("cuda unavailable: {t}\n", .{err});
         return;
     };
     defer be.deinit();
-    try stdout.print("cuda device: {s}\n", .{be.deviceName()});
+    try stdout.print("cuda device: {s} (kernels: {s})\n", .{ be.deviceName(), if (use_libs) "cuBLASLt/cuDNN libs" else "hand-PTX" });
     var sess = try dit_cuda.Session.init(arena, io, be, &model, lat, lat, cond, seq_txt);
     defer sess.deinit(be);
     var ws = try dit_cuda.Workspace.init(be, lat, lat, seq_txt);

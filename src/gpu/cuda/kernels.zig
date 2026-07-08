@@ -900,8 +900,9 @@ pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool, bits: 
 /// cols=16384 (the Vulkan path was forced to f16 there by the 48 KB cap; here
 /// f32 rotation is exact). Requires cols%256==0, (cols/256)%4==0 (FWHT) and
 /// (cols/(32/bits))%256==0 (pack). block 256, grid (m,1,1).
-pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize) ![:0]u8 {
+pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: bool) ![:0]u8 {
     std.debug.assert(bits == 8 or bits == 4);
+    const in_bytes: usize = if (in_f16) 2 else 4; // activation elem width (f16 chain)
     const per_word = 32 / bits; // s8: 4 elements/u32 ; s4: 8 elements/u32
     const per_word_log2 = std.math.log2_int(usize, per_word);
     const maxq: i32 = (@as(i32, 1) << @intCast(bits - 1)) - 1; // 127 / 7
@@ -931,27 +932,33 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize) ![:0]u8 {
     const r_t = try b.reg(.b32);
     const r_row = try b.reg(.b32);
     const r_smem = try b.reg(.b32);
-    const rd_xrow = try b.reg(.b64); // p_x + row*cols*4
+    const rd_xrow = try b.reg(.b64); // p_x + row*cols*in_bytes
     const rd_tmp = try b.reg(.b64);
     try b.linef("mov.u32 {s}, %tid.x;", .{r_t});
     try b.linef("mov.u32 {s}, %ctaid.x;", .{r_row});
     try b.linef("mov.u32 {s}, smem;", .{r_smem});
-    try b.linef("mul.wide.u32 {s}, {s}, {d};", .{ rd_xrow, r_row, cols * 4 });
+    try b.linef("mul.wide.u32 {s}, {s}, {d};", .{ rd_xrow, r_row, cols * in_bytes });
     try b.linef("add.s64 {s}, {s}, {s};", .{ rd_xrow, rd_x, rd_xrow });
 
-    // ---- load x[row] -> shared f32 ----
+    // ---- load x[row] -> shared f32 (rotation runs in f32 regardless of input) ----
     const r_sh = try b.reg(.b32); // smem + t*4
     const rd_g = try b.reg(.b64);
     const r_ftmp = try b.reg(.f32);
     try b.linef("shl.b32 {s}, {s}, 2;", .{ r_sh, r_t });
     try b.linef("add.u32 {s}, {s}, {s};", .{ r_sh, r_sh, r_smem });
     try b.linef("cvt.u64.u32 {s}, {s};", .{ rd_tmp, r_t });
-    try b.linef("shl.b64 {s}, {s}, 2;", .{ rd_tmp, rd_tmp });
+    try b.linef("shl.b64 {s}, {s}, {d};", .{ rd_tmp, rd_tmp, if (in_f16) @as(usize, 1) else 2 });
     try b.linef("add.s64 {s}, {s}, {s};", .{ rd_g, rd_xrow, rd_tmp });
     {
+        const r_h = if (in_f16) try b.reg(.b16) else "";
         var i: usize = 0;
         while (i < load_iters) : (i += 1) {
-            try b.linef("ld.global.f32 {s}, [{s}+{d}];", .{ r_ftmp, rd_g, i * 256 * 4 });
+            if (in_f16) {
+                try b.linef("ld.global.b16 {s}, [{s}+{d}];", .{ r_h, rd_g, i * 256 * 2 });
+                try b.linef("cvt.f32.f16 {s}, {s};", .{ r_ftmp, r_h });
+            } else {
+                try b.linef("ld.global.f32 {s}, [{s}+{d}];", .{ r_ftmp, rd_g, i * 256 * 4 });
+            }
             try b.linef("st.shared.f32 [{s}+{d}], {s};", .{ r_sh, i * 256 * 4, r_ftmp });
         }
     }
@@ -1187,6 +1194,66 @@ pub const irescale_ptx: [:0]const u8 =
     \\    mul.f32 %f4, %f4, %f3;
     \\    add.s64 %rd11, %rd2, %rd5;
     \\    st.global.f32 [%rd11], %f4;
+    \\DONE:
+    \\    ret;
+    \\}
+;
+
+/// f16-output int8 rescale (the c16 chain): y[i][j] (f16) = f32(acc_s32[i][j]) *
+/// act_scale[i] * weight_scale[j]. acc is [m][rows] s32 (×4), y is f16 (×2).
+/// grid ceil(total/256), block 256. Entry `irescale_h16`.
+pub const irescale_h16_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry irescale_h16(
+    \\    .param .u64 p_acc,
+    \\    .param .u64 p_y,
+    \\    .param .u64 p_as,
+    \\    .param .u64 p_ws,
+    \\    .param .u32 p_rows,
+    \\    .param .u32 p_total
+    \\)
+    \\{
+    \\    .reg .pred %p<2>;
+    \\    .reg .b32 %r<12>;
+    \\    .reg .f32 %f<5>;
+    \\    .reg .b16 %h<2>;
+    \\    .reg .b64 %rd<16>;
+    \\    ld.param.u64 %rd1, [p_acc];
+    \\    ld.param.u64 %rd2, [p_y];
+    \\    ld.param.u64 %rd3, [p_as];
+    \\    ld.param.u64 %rd4, [p_ws];
+    \\    ld.param.u32 %r1, [p_rows];
+    \\    ld.param.u32 %r2, [p_total];
+    \\    mov.u32 %r3, %ctaid.x;
+    \\    mov.u32 %r4, %ntid.x;
+    \\    mov.u32 %r5, %tid.x;
+    \\    mad.lo.s32 %r6, %r3, %r4, %r5;
+    \\    setp.ge.u32 %p1, %r6, %r2;
+    \\    @%p1 bra DONE;
+    \\    div.u32 %r7, %r6, %r1;
+    \\    rem.u32 %r8, %r6, %r1;
+    \\    cvta.to.global.u64 %rd1, %rd1;
+    \\    cvta.to.global.u64 %rd2, %rd2;
+    \\    cvta.to.global.u64 %rd3, %rd3;
+    \\    cvta.to.global.u64 %rd4, %rd4;
+    \\    mul.wide.u32 %rd5, %r6, 4;
+    \\    add.s64 %rd6, %rd1, %rd5;
+    \\    ld.global.s32 %r9, [%rd6];
+    \\    cvt.rn.f32.s32 %f1, %r9;
+    \\    mul.wide.u32 %rd7, %r7, 4;
+    \\    add.s64 %rd8, %rd3, %rd7;
+    \\    ld.global.f32 %f2, [%rd8];
+    \\    mul.wide.u32 %rd9, %r8, 4;
+    \\    add.s64 %rd10, %rd4, %rd9;
+    \\    ld.global.f32 %f3, [%rd10];
+    \\    mul.f32 %f4, %f1, %f2;
+    \\    mul.f32 %f4, %f4, %f3;
+    \\    cvt.rn.f16.f32 %h0, %f4;
+    \\    mul.wide.u32 %rd12, %r6, 2;
+    \\    add.s64 %rd11, %rd2, %rd12;
+    \\    st.global.b16 [%rd11], %h0;
     \\DONE:
     \\    ret;
     \\}
@@ -2205,7 +2272,7 @@ pub fn i4LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         const rows = c.rows;
         const cols = c.cols;
 
-        const prep_ptx = try buildPrep(gpa, cols, 4);
+        const prep_ptx = try buildPrep(gpa, cols, 4, false);
         defer gpa.free(prep_ptx);
         var pmod = try ctx.loadModule(prep_ptx);
         defer pmod.unload(ctx);
@@ -2352,7 +2419,7 @@ pub fn i8LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         const rows = c.rows;
         const cols = c.cols;
 
-        const prep_ptx = try buildPrep(gpa, cols, 8);
+        const prep_ptx = try buildPrep(gpa, cols, 8, false);
         defer gpa.free(prep_ptx);
         var pmod = try ctx.loadModule(prep_ptx);
         defer pmod.unload(ctx);
@@ -2497,7 +2564,7 @@ pub fn i8LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         const m = c.m;
         const rows = c.rows;
         const cols = c.cols;
-        const prep_ptx = try buildPrep(gpa, cols, 8);
+        const prep_ptx = try buildPrep(gpa, cols, 8, false);
         defer gpa.free(prep_ptx);
         var pmod = try ctx.loadModule(prep_ptx);
         defer pmod.unload(ctx);

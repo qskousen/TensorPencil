@@ -13,11 +13,52 @@ const cu = @import("cu.zig");
 const ctxmod = @import("context.zig");
 const kernels = @import("kernels.zig");
 const elt = @import("elt.zig");
+const cublaslt = @import("cublaslt.zig");
+const cudnn = @import("cudnn.zig");
 const dtypes = @import("../../dtype.zig");
 
 const Context = ctxmod.Context;
 
 pub const Error = error{ CudaError, OutOfMemory, NoSuitableDevice, DeviceOutOfMemory };
+
+/// Which set of compute kernels the heavy op methods dispatch to.
+///  - hand_ptx: the pure-Zig hand-emitted PTX kernels (`--backend zig-cuda`).
+///  - libs:     NVIDIA's cuBLASLt / cuDNN, dlopen'd (`--backend cuda`, Phase 2).
+pub const KernelMode = enum { hand_ptx, libs };
+
+/// dlopen'd cuBLASLt + cuDNN handles for the `.libs` kernel mode. Handles are
+/// bound to the backend's CUDA stream; the workspace is cuBLASLt's scratch.
+pub const Libs = struct {
+    lt: cublaslt.Api,
+    lt_handle: cublaslt.Handle = null,
+    dnn: cudnn.Api,
+    dnn_handle: cudnn.Handle = null,
+    workspace: ctxmod.Buffer = .{},
+};
+
+/// cuBLASLt matmul workspace (device scratch); 32 MiB is ample for the DiT
+/// GEMM shapes on sm_86.
+const lt_workspace_bytes: usize = 32 << 20;
+
+/// DIAGNOSTIC ONLY: skip the int8 irescale pass (produces garbage output) to
+/// measure its batched cost — the ceiling on what fusing dequant could save.
+pub var bench_skip_rescale: bool = false;
+
+/// Numeric kind of a cuBLASLt matmul plan: int8 A/B → s32 D (32I compute) or
+/// f16 A/B → f32 D (32F compute, HMMA). Both are the TN case with the same
+/// layout mapping; only the data/compute/scale types differ.
+const LtKind = enum { i8, f16 };
+
+/// A cached cuBLASLt matmul plan for one (kind,n,m,k) shape: the operation
+/// descriptor, the three matrix layouts (no data pointer baked in), and the
+/// heuristic-selected algo. Destroyed in `Backend.deinit`.
+const LtPlan = struct {
+    desc: cublaslt.MatmulDesc,
+    adesc: cublaslt.MatrixLayout,
+    bdesc: cublaslt.MatrixLayout,
+    ddesc: cublaslt.MatrixLayout,
+    algo: cublaslt.MatmulAlgo,
+};
 
 /// Opaque device-buffer / memory token (a CUdeviceptr for `buf`; unused for
 /// `mem`). `null_handle` == 0 (a valid alloc never returns device ptr 0).
@@ -28,7 +69,7 @@ pub const DeviceBuffer = struct {
     mem: Handle = .null_handle,
     size: u64 = 0,
 
-    fn ptr(self: DeviceBuffer) cu.CUdeviceptr {
+    pub fn ptr(self: DeviceBuffer) cu.CUdeviceptr {
         return @intFromEnum(self.buf);
     }
 };
@@ -112,6 +153,11 @@ pub const Backend = struct {
 
     batching_on: bool = false,
 
+    // Compute-kernel dispatch: hand-PTX (default) or the dlopen'd libraries.
+    // `libs` is populated by initLibs when `kernels == .libs`.
+    kernels: KernelMode = .hand_ptx,
+    libs: ?Libs = null,
+
     // weight cache: host pointer -> uploaded device buffer (LRU-stamped for
     // streaming: under memory pressure the least-recently-used weights are
     // evicted and re-uploaded on next use — see reserveForWeights/evictOneWeight).
@@ -158,6 +204,10 @@ pub const Backend = struct {
     i8_m: usize = 0,
     i8_mpad: usize = 0,
     i8_cols: usize = 0,
+    // s32 GEMM accumulator scratch for the cuBLASLt int8 path (.libs mode): the
+    // hand-PTX fused kernel folds the rescale into the C-store and needs no acc
+    // buffer, but cuBLASLt emits raw s32, rescaled by a separate irescale pass.
+    i8_acc: DeviceBuffer = .{},
 
     // tensor-core attention scratch (per-head, reused across heads/calls; grown
     // to the largest seq seen). f16 Q/K/Vt tiles, f32 scores, f16 probs, f32 out.
@@ -169,11 +219,36 @@ pub const Backend = struct {
     attn_md: DeviceBuffer = .{}, // per-row {max, 1/sum} f32 pairs (fused path)
     attn_oh: DeviceBuffer = .{},
 
+    // cuDNN fused-SDPA attention (.libs mode): plan cache keyed by packed
+    // (heads,kv_heads,seq,hd), f16 Q/K/V/O scratch, and the SDPA workspace.
+    sdpa_plans: std.AutoHashMapUnmanaged(u64, cudnn.SdpaPlan) = .empty,
+    // fused int8-GEMM+dequant plans (cuDNN op graph), keyed by packed (m,n,k,d_f16).
+    // When `use_fused_i8`, opI8GemmLibs uses these instead of cuBLASLt+irescale —
+    // the s32 accumulator never round-trips to DRAM.
+    mdq_plans: std.AutoHashMapUnmanaged(u64, cudnn.MatmulDequantPlan) = .empty,
+    use_fused_i8: bool = false,
+    cudnn_q16: DeviceBuffer = .{},
+    cudnn_k16: DeviceBuffer = .{},
+    cudnn_v16: DeviceBuffer = .{},
+    cudnn_o16: DeviceBuffer = .{},
+    cudnn_ws: DeviceBuffer = .{},
+
     // cached PTX modules / functions.
     prep_mods: std.AutoHashMapUnmanaged(usize, cu.CUfunction) = .empty, // keyed by cols
     prep_owned: std.ArrayListUnmanaged(ctxmod.Module) = .empty,
     fused_mod: ?ctxmod.Module = null,
     fused_fn: cu.CUfunction = null,
+    // irescale (s32 acc * act_scale[row] * weight_scale[col] -> f32) for the
+    // cuBLASLt int8 path (.libs mode).
+    irescale_mod: ?ctxmod.Module = null,
+    irescale_fn: cu.CUfunction = null,
+    irescale_h16_mod: ?ctxmod.Module = null,
+    irescale_h16_fn: cu.CUfunction = null,
+    // cuBLASLt int8 matmul plans (desc + layouts + heuristic algo), keyed by
+    // packed (n,m,k). Layouts hold no data pointer, so a plan is reused across
+    // steps/blocks/weights of the same shape — the expensive heuristic query
+    // runs once, and the timed matmul is a pure enqueue.
+    lt_plans: std.AutoHashMapUnmanaged(u64, LtPlan) = .empty,
     // int4 (W4A4) variants: prep quantizes to s4 and the GEMM is m16n8k64.s4.
     i4_prep_mods: std.AutoHashMapUnmanaged(usize, cu.CUfunction) = .empty,
     i4_prep_owned: std.ArrayListUnmanaged(ctxmod.Module) = .empty,
@@ -247,7 +322,64 @@ pub const Backend = struct {
         return self;
     }
 
+    /// Build a backend in `.libs` mode: the normal driver Context plus dlopen'd
+    /// cuBLASLt + cuDNN handles bound to the compute stream. Returns an error
+    /// (caller falls back to CPU) if the driver, either library, or a handle is
+    /// unavailable. The CUDA context is current after `init`, which cuBLASLt /
+    /// cuDNN handle creation requires.
+    pub fn initLibs(gpa: std.mem.Allocator) Error!*Backend {
+        const self = try Backend.init(gpa);
+        errdefer self.deinit();
+        self.kernels = .libs;
+        // Ships OFF: the cuDNN fused int8 GEMM+dequant is bit-exact but measured
+        // NEUTRAL vs cuBLASLt+irescale (cuDNN's int8 matmul is ~0.22 s/step slower
+        // than cuBLASLt IMMA, exactly canceling the irescale round-trip it removes).
+        // cuBLASLt IMMA is the more-proven path; the fused graph stays dormant +
+        // documented (MatmulDequantPlan, cuda-libs-i8fused-test). See PLAN.md 2.7.
+        self.use_fused_i8 = false;
+
+        var lt = cublaslt.Api.load() catch return error.CudaError;
+        errdefer lt.deinit();
+        var lt_h: cublaslt.Handle = null;
+        if (lt.cublasLtCreate(&lt_h) != cublaslt.SUCCESS) return error.CudaError;
+        errdefer _ = lt.cublasLtDestroy(lt_h);
+
+        var dnn = cudnn.Api.load() catch return error.CudaError;
+        errdefer dnn.deinit();
+        var dnn_h: cudnn.Handle = null;
+        if (dnn.cudnnCreate(&dnn_h) != cudnn.SUCCESS) return error.CudaError;
+        errdefer _ = dnn.cudnnDestroy(dnn_h);
+        _ = dnn.cudnnSetStream(dnn_h, self.ctx.stream);
+
+        const ws = try self.ctx.alloc(lt_workspace_bytes);
+
+        self.libs = .{ .lt = lt, .lt_handle = lt_h, .dnn = dnn, .dnn_handle = dnn_h, .workspace = ws };
+        return self;
+    }
+
     pub fn deinit(self: *Backend) void {
+        if (self.libs) |*L| {
+            var sit = self.sdpa_plans.valueIterator();
+            while (sit.next()) |p| p.deinit(&L.dnn);
+            self.sdpa_plans.deinit(self.gpa);
+            var mit = self.mdq_plans.valueIterator();
+            while (mit.next()) |p| p.deinit(&L.dnn);
+            self.mdq_plans.deinit(self.gpa);
+            var pit = self.lt_plans.valueIterator();
+            while (pit.next()) |p| {
+                _ = L.lt.cublasLtMatmulDescDestroy(p.desc);
+                _ = L.lt.cublasLtMatrixLayoutDestroy(p.adesc);
+                _ = L.lt.cublasLtMatrixLayoutDestroy(p.bdesc);
+                _ = L.lt.cublasLtMatrixLayoutDestroy(p.ddesc);
+            }
+            self.lt_plans.deinit(self.gpa);
+            self.ctx.free(&L.workspace);
+            if (L.dnn_handle != null) _ = L.dnn.cudnnDestroy(L.dnn_handle);
+            if (L.lt_handle != null) _ = L.lt.cublasLtDestroy(L.lt_handle);
+            L.dnn.deinit();
+            L.lt.deinit();
+            self.libs = null;
+        }
         if (self.pf_thread) |t| {
             self.pf_shutdown.store(true, .release);
             t.join(); // drains queued prefetches, then exits
@@ -285,6 +417,14 @@ pub const Backend = struct {
         self.tensorDestroy(&self.conv_c);
         self.tensorDestroy(&self.i8_x);
         self.tensorDestroy(&self.i8_scale);
+        self.tensorDestroy(&self.i8_acc);
+        self.tensorDestroy(&self.cudnn_q16);
+        self.tensorDestroy(&self.cudnn_k16);
+        self.tensorDestroy(&self.cudnn_v16);
+        self.tensorDestroy(&self.cudnn_o16);
+        self.tensorDestroy(&self.cudnn_ws);
+        if (self.irescale_mod) |m| m.unload(self.ctx);
+        if (self.irescale_h16_mod) |m| m.unload(self.ctx);
         self.tensorDestroy(&self.attn_qh);
         self.tensorDestroy(&self.attn_kh);
         self.tensorDestroy(&self.attn_vth);
@@ -617,15 +757,16 @@ pub const Backend = struct {
 
     // ---- int8 GEMM pair -----------------------------------------------------
 
-    fn prepFn(self: *Backend, cols: usize) Error!cu.CUfunction {
-        if (self.prep_mods.get(cols)) |f| return f;
-        const ptx = kernels.buildPrep(self.gpa, cols, 8) catch return error.OutOfMemory;
+    fn prepFn(self: *Backend, cols: usize, in_f16: bool) Error!cu.CUfunction {
+        const key = cols | (if (in_f16) @as(usize, 1) << 40 else 0); // f16-input variant keyed separately
+        if (self.prep_mods.get(key)) |f| return f;
+        const ptx = kernels.buildPrep(self.gpa, cols, 8, in_f16) catch return error.OutOfMemory;
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         const f = mod.getFunction(self.ctx, "iprep") catch return error.CudaError;
         self.ctx.setMaxDynamicShared(f, kernels.prepSharedBytes(cols)) catch return error.CudaError;
         self.prep_owned.append(self.gpa, mod) catch return error.OutOfMemory;
-        self.prep_mods.put(self.gpa, cols, f) catch return error.OutOfMemory;
+        self.prep_mods.put(self.gpa, key, f) catch return error.OutOfMemory;
         return f;
     }
 
@@ -745,8 +886,12 @@ pub const Backend = struct {
         const f_cvt = try self.eltFn(elt.f32_to_f16_ptx, "f32_to_f16");
         try self.eltLaunch(f_cvt, x, self.fp8_a16, null, null, .{ @intCast(mpad * cols), @intCast(m * cols), 0, 0, 0, 0 }, .{ 0, 0 }, mpad * cols);
         // C[mpad][rows] = A[mpad][cols] @ B[rows][cols]ᵀ  (m=mpad, n=rows, k=cols)
-        const f_hg = try self.hgemmFn();
-        try self.launchHgemm(f_hg, self.fp8_a16, self.fp8_w16, y, mpad, rows, cols);
+        if (self.kernels == .libs) {
+            try self.ltMatmulF16(y, self.fp8_w16, self.fp8_a16, rows, mpad, cols);
+        } else {
+            const f_hg = try self.hgemmFn();
+            try self.launchHgemm(f_hg, self.fp8_a16, self.fp8_w16, y, mpad, rows, cols);
+        }
     }
 
     /// f16 tensor-core conv/GEMM for the VAE: y[m][co] f32 = x[m][k] f32 @ Wᵀ + bias,
@@ -768,15 +913,221 @@ pub const Backend = struct {
         const f_pad = try self.eltFn(elt.f32_to_f16_pad2d_ptx, "f32_to_f16_pad2d");
         try self.eltLaunch(f_pad, w_db, self.conv_w16, null, null, .{ @intCast(co_pad * k_pad), @intCast(k_pad), @intCast(co), @intCast(k), 0, 0 }, .{ 0, 0 }, co_pad * k_pad);
         try self.eltLaunch(f_pad, src, self.conv_a16, null, null, .{ @intCast(m_pad * k_pad), @intCast(k_pad), @intCast(m), @intCast(k), 0, 0 }, .{ 0, 0 }, m_pad * k_pad);
-        const f_hg = try self.hgemmFn();
-        try self.launchHgemm(f_hg, self.conv_a16, self.conv_w16, self.conv_c, m_pad, co_pad, k_pad);
+        if (self.kernels == .libs) {
+            try self.ltMatmulF16(self.conv_c, self.conv_w16, self.conv_a16, co_pad, m_pad, k_pad);
+        } else {
+            const f_hg = try self.hgemmFn();
+            try self.launchHgemm(f_hg, self.conv_a16, self.conv_w16, self.conv_c, m_pad, co_pad, k_pad);
+        }
         const f_bc = try self.eltFn(elt.bias_compact_ptx, "bias_compact");
         try self.eltLaunch(f_bc, self.conv_c, b_db, dst, null, .{ @intCast(m * co), @intCast(co), @intCast(co_pad), @intCast(dst_off_elems), 0, 0 }, .{ 0, 0 }, m * co);
     }
 
+    /// cuDNN fused 3×3 NHWC convolution (.libs mode) — the VAE's big convs.
+    /// dst[dst_off_elems..][n][co] f32 = conv3x3(src[n][ci] f32, W[co][3][3][ci]
+    /// f32) + bias. src/weight convert to f16 (tensor cores, f32 accumulate),
+    /// cuDNN writes f16, then `bias_add_f16` adds the per-channel bias into the
+    /// f32 dst. No im2col materialization (IMPLICIT_PRECOMP_GEMM). Same numeric
+    /// regime as `opConvF16` (f16 conv), validated vs the CPU VAE.
+    pub fn opConvCudnn(self: *Backend, dst: DeviceBuffer, dst_off_elems: usize, src: DeviceBuffer, h: usize, w: usize, w_bytes: []const u8, co: usize, ci: usize, bias: []const f32) Error!void {
+        self.ptic();
+        defer self.ptoc(.matmul);
+        const n = h * w;
+        const w_db = try self.cachedWeight(w_bytes);
+        const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias));
+        try self.ensureDeviceBuffer(&self.conv_a16, n * ci * 2);
+        try self.ensureDeviceBuffer(&self.conv_w16, co * 9 * ci * 2);
+        try self.ensureDeviceBuffer(&self.conv_c, n * co * 2);
+        const f_cvt = try self.eltFn(elt.f32_to_f16_ptx, "f32_to_f16");
+        try self.eltLaunch(f_cvt, src, self.conv_a16, null, null, .{ @intCast(n * ci), @intCast(n * ci), 0, 0, 0, 0 }, .{ 0, 0 }, n * ci);
+        try self.eltLaunch(f_cvt, w_db, self.conv_w16, null, null, .{ @intCast(co * 9 * ci), @intCast(co * 9 * ci), 0, 0, 0, 0 }, .{ 0, 0 }, co * 9 * ci);
+        const L = &self.libs.?;
+        var plan = cudnn.ConvPlan.build(&L.dnn, L.dnn_handle, h, w, ci, co) catch return error.CudaError;
+        defer plan.deinit(&L.dnn);
+        if (plan.workspace_bytes > 0) try self.ensureDeviceBuffer(&self.cudnn_ws, plan.workspace_bytes);
+        plan.execute(&L.dnn, L.dnn_handle, self.conv_a16.ptr(), self.conv_w16.ptr(), self.conv_c.ptr(), self.cudnn_ws.ptr()) catch return error.CudaError;
+        const f_bias = try self.eltFn(elt.bias_add_f16_ptx, "bias_add_f16");
+        try self.eltLaunch(f_bias, self.conv_c, b_db, dst, null, .{ @intCast(n * co), @intCast(co), @intCast(dst_off_elems), 0, 0, 0 }, .{ 0, 0 }, n * co);
+    }
+
+    // ---- cuBLASLt int8 GEMM (.libs mode) ------------------------------------
+
+    fn ltCheck(self: *Backend, s: cublaslt.Status, comptime what: []const u8) Error!void {
+        _ = self;
+        if (s == cublaslt.SUCCESS) return;
+        std.debug.print("cuBLASLt {s} failed: {s} ({d})\n", .{ what, cublaslt.statusName(s), s });
+        return error.CudaError;
+    }
+
+    fn irescaleFn(self: *Backend, c_h16: bool) Error!cu.CUfunction {
+        if (c_h16) {
+            if (self.irescale_h16_mod != null) return self.irescale_h16_fn;
+            var mod = self.ctx.loadModule(kernels.irescale_h16_ptx) catch return error.CudaError;
+            self.irescale_h16_fn = mod.getFunction(self.ctx, "irescale_h16") catch return error.CudaError;
+            self.irescale_h16_mod = mod;
+            return self.irescale_h16_fn;
+        }
+        if (self.irescale_mod != null) return self.irescale_fn;
+        var mod = self.ctx.loadModule(kernels.irescale_ptx) catch return error.CudaError;
+        self.irescale_fn = mod.getFunction(self.ctx, "irescale") catch return error.CudaError;
+        self.irescale_mod = mod;
+        return self.irescale_fn;
+    }
+
+    /// Build (or fetch cached) the cuBLASLt plan for a TN GEMM of shape
+    /// D[n,m] = op(W)ᵀ @ op(A) at these (kind,n,m,k). Layouts describe the STORED
+    /// (pre-op) col-major matrices: W is row-major [n][k] == col-major [k][n],
+    /// A is row-major [m][k] == col-major [k][m], D is col-major [n][m] ==
+    /// row-major [m][n] (what `irescale` / the f16 consumers expect). The
+    /// heuristic runs once per shape; the returned plan carries no data pointer.
+    fn ltPlan(self: *Backend, kind: LtKind, n: usize, m: usize, k: usize) Error!LtPlan {
+        const key: u64 = (@as(u64, @intFromEnum(kind)) << 62) | (@as(u64, n) << 42) | (@as(u64, m) << 21) | @as(u64, k);
+        if (self.lt_plans.get(key)) |p| return p;
+
+        const ab_type: c_int = switch (kind) {
+            .i8 => cublaslt.R_8I,
+            .f16 => cublaslt.R_16F,
+        };
+        const d_type: c_int = switch (kind) {
+            .i8 => cublaslt.R_32I,
+            .f16 => cublaslt.R_32F,
+        };
+        const compute: c_int = switch (kind) {
+            .i8 => cublaslt.COMPUTE_32I,
+            .f16 => cublaslt.COMPUTE_32F,
+        };
+        const scale: c_int = switch (kind) {
+            .i8 => cublaslt.R_32I,
+            .f16 => cublaslt.R_32F,
+        };
+
+        const L = &self.libs.?;
+        const lt = &L.lt;
+        var desc: cublaslt.MatmulDesc = null;
+        try self.ltCheck(lt.cublasLtMatmulDescCreate(&desc, compute, scale), "MatmulDescCreate");
+        errdefer _ = lt.cublasLtMatmulDescDestroy(desc);
+        var op_t: c_int = cublaslt.OP_T;
+        var op_n: c_int = cublaslt.OP_N;
+        try self.ltCheck(lt.cublasLtMatmulDescSetAttribute(desc, cublaslt.DESC_TRANSA, @ptrCast(&op_t), @sizeOf(c_int)), "SetTransA");
+        try self.ltCheck(lt.cublasLtMatmulDescSetAttribute(desc, cublaslt.DESC_TRANSB, @ptrCast(&op_n), @sizeOf(c_int)), "SetTransB");
+
+        var adesc: cublaslt.MatrixLayout = null; // W: [k,n] col-major, ld=k
+        try self.ltCheck(lt.cublasLtMatrixLayoutCreate(&adesc, ab_type, @intCast(k), @intCast(n), @intCast(k)), "A layout");
+        errdefer _ = lt.cublasLtMatrixLayoutDestroy(adesc);
+        var bdesc: cublaslt.MatrixLayout = null; // A: [k,m] col-major, ld=k
+        try self.ltCheck(lt.cublasLtMatrixLayoutCreate(&bdesc, ab_type, @intCast(k), @intCast(m), @intCast(k)), "B layout");
+        errdefer _ = lt.cublasLtMatrixLayoutDestroy(bdesc);
+        var ddesc: cublaslt.MatrixLayout = null; // D: [n,m] col-major, ld=n
+        try self.ltCheck(lt.cublasLtMatrixLayoutCreate(&ddesc, d_type, @intCast(n), @intCast(m), @intCast(n)), "D layout");
+        errdefer _ = lt.cublasLtMatrixLayoutDestroy(ddesc);
+
+        var pref: cublaslt.MatmulPreference = null;
+        try self.ltCheck(lt.cublasLtMatmulPreferenceCreate(&pref), "PreferenceCreate");
+        defer _ = lt.cublasLtMatmulPreferenceDestroy(pref);
+        var ws_bytes: usize = L.workspace.bytes;
+        try self.ltCheck(lt.cublasLtMatmulPreferenceSetAttribute(pref, cublaslt.PREF_MAX_WORKSPACE_BYTES, @ptrCast(&ws_bytes), @sizeOf(usize)), "PrefWorkspace");
+
+        var results: [1]cublaslt.HeuristicResult = .{.{}};
+        var count: c_int = 0;
+        try self.ltCheck(lt.cublasLtMatmulAlgoGetHeuristic(L.lt_handle, desc, adesc, bdesc, ddesc, ddesc, pref, 1, &results, &count), "AlgoGetHeuristic");
+        if (count < 1) {
+            std.debug.print("cuBLASLt: no {s} algo for n={d} m={d} k={d}\n", .{ @tagName(kind), n, m, k });
+            return error.CudaError;
+        }
+
+        const plan = LtPlan{ .desc = desc, .adesc = adesc, .bdesc = bdesc, .ddesc = ddesc, .algo = results[0].algo };
+        self.lt_plans.put(self.gpa, key, plan) catch return error.OutOfMemory;
+        return plan;
+    }
+
+    /// Issue a cuBLASLt matmul for a prepared plan against device pointers.
+    /// `alpha`/`beta` point to the scale values in the plan's scale type (i32 for
+    /// .i8, f32 for .f16). D and C are the same buffer (beta=0).
+    fn ltRun(self: *Backend, plan: LtPlan, d: DeviceBuffer, w: DeviceBuffer, a: DeviceBuffer, alpha: *const anyopaque, beta: *const anyopaque) Error!void {
+        const L = &self.libs.?;
+        const dp: *anyopaque = @ptrFromInt(d.ptr());
+        try self.ltCheck(L.lt.cublasLtMatmul(
+            L.lt_handle,
+            plan.desc,
+            alpha,
+            @ptrFromInt(w.ptr()),
+            plan.adesc,
+            @ptrFromInt(a.ptr()),
+            plan.bdesc,
+            beta,
+            dp,
+            plan.ddesc,
+            dp,
+            plan.ddesc,
+            &plan.algo,
+            @ptrFromInt(L.workspace.ptr),
+            L.workspace.bytes,
+            self.ctx.stream,
+        ), "Matmul");
+    }
+
+    /// s32 = Wᵀ @ A on int8 tensor cores via cuBLASLt. `w` is the weight W[n][k]
+    /// row-major; `a` the prepped activation A[m][k] row-major; `d` the s32
+    /// accumulator (row-major [m][n]). cuBLASLt does ONLY the GEMM — the
+    /// per-row×per-col rescale is a separate `irescale` pass.
+    pub fn ltMatmulI8(self: *Backend, d: DeviceBuffer, w: DeviceBuffer, a: DeviceBuffer, n: usize, m: usize, k: usize) Error!void {
+        const plan = try self.ltPlan(.i8, n, m, k);
+        var alpha: i32 = 1;
+        var beta: i32 = 0;
+        try self.ltRun(plan, d, w, a, @ptrCast(&alpha), @ptrCast(&beta));
+    }
+
+    /// f32 D[m][n] = A[m][k](f16) @ W[n][k](f16)ᵀ on the f16 tensor cores (HMMA,
+    /// f32 accumulate) via cuBLASLt — the drop-in for the hand-PTX `buildHgemm`
+    /// used by the fp8 encoder GEMMs and the VAE convs.
+    pub fn ltMatmulF16(self: *Backend, d: DeviceBuffer, w: DeviceBuffer, a: DeviceBuffer, n: usize, m: usize, k: usize) Error!void {
+        const plan = try self.ltPlan(.f16, n, m, k);
+        var alpha: f32 = 1;
+        var beta: f32 = 0;
+        try self.ltRun(plan, d, w, a, @ptrCast(&alpha), @ptrCast(&beta));
+    }
+
+    /// Fetch/build the cached cuDNN fused int8-GEMM+dequant plan for this shape.
+    fn mdqPlan(self: *Backend, m: usize, n: usize, k: usize, d_f16: bool) Error!cudnn.MatmulDequantPlan {
+        const key: u64 = (@as(u64, m) << 43) | (@as(u64, n) << 22) | (@as(u64, k) << 1) | @intFromBool(d_f16);
+        if (self.mdq_plans.get(key)) |p| return p;
+        const L = &self.libs.?;
+        const p = cudnn.MatmulDequantPlan.build(&L.dnn, L.dnn_handle, m, n, k, d_f16) catch return error.CudaError;
+        self.mdq_plans.put(self.gpa, key, p) catch return error.OutOfMemory;
+        return p;
+    }
+
+    /// cuBLASLt int8 linear: GEMM into the s32 scratch, then fused rescale to y.
+    /// With `use_fused_i8`, replaced by a single cuDNN op graph (GEMM+dequant
+    /// fused; no s32 round-trip, no separate irescale).
+    fn opI8GemmLibs(self: *Backend, y: DeviceBuffer, w_db: DeviceBuffer, ws_db: DeviceBuffer, rows: usize, c_h16: bool) Error!void {
+        const m = self.i8_mpad;
+        const k = self.i8_cols;
+        if (self.use_fused_i8) {
+            const plan = try self.mdqPlan(m, rows, k, c_h16);
+            if (plan.workspace_bytes > 0) try self.ensureDeviceBuffer(&self.cudnn_ws, plan.workspace_bytes);
+            const L = &self.libs.?;
+            plan.execute(&L.dnn, L.dnn_handle, self.i8_x.ptr(), w_db.ptr(), self.i8_scale.ptr(), ws_db.ptr(), y.ptr(), self.cudnn_ws.ptr()) catch return error.CudaError;
+            return;
+        }
+        try self.ensureDeviceBuffer(&self.i8_acc, m * rows * 4);
+        try self.ltMatmulI8(self.i8_acc, w_db, self.i8_x, rows, m, k);
+        if (bench_skip_rescale) return; // DIAGNOSTIC: measure irescale's batched cost
+        const f = try self.irescaleFn(c_h16);
+        const total = m * rows;
+        var pacc = self.i8_acc.ptr();
+        var py = y.ptr();
+        var pas = self.i8_scale.ptr();
+        var pws = ws_db.ptr();
+        var prows: u32 = @intCast(rows);
+        var ptot: u32 = @intCast(total);
+        var pr = [_]?*anyopaque{ @ptrCast(&pacc), @ptrCast(&py), @ptrCast(&pas), @ptrCast(&pws), @ptrCast(&prows), @ptrCast(&ptot) };
+        self.ctx.launch(f, .{ @intCast((total + 255) / 256), 1, 1 }, .{ 256, 1, 1 }, 0, &pr) catch return error.CudaError;
+    }
+
     /// Rotate + per-row dynamic quantize x[m][cols] -> internal i8_x (s8) +
     /// i8_scale (per-row f32), padding m up to 128. Consumed by opI8Gemm.
-    pub fn opI8Prep(self: *Backend, x: DeviceBuffer, m: usize, cols: usize) Error!void {
+    pub fn opI8Prep(self: *Backend, x: DeviceBuffer, m: usize, cols: usize, in_f16: bool) Error!void {
         self.ptic();
         defer self.ptoc(.prep);
         const mpad = std.mem.alignForward(usize, m, 128);
@@ -792,7 +1143,7 @@ pub const Backend = struct {
             self.ctx.memsetD8(.{ .ptr = self.i8_x.ptr() + @as(u64, @intCast(m * cols)), .bytes = @intCast(pad * cols) }, 0, pad * cols) catch return error.CudaError;
             self.ctx.memsetD32(.{ .ptr = self.i8_scale.ptr() + @as(u64, @intCast(m * 4)), .bytes = @intCast(pad * 4) }, 0, pad) catch return error.CudaError;
         }
-        const f = try self.prepFn(cols);
+        const f = try self.prepFn(cols, in_f16);
         var px = x.ptr();
         var pq = self.i8_x.ptr();
         var pas = self.i8_scale.ptr();
@@ -808,9 +1159,10 @@ pub const Backend = struct {
     pub fn opI8Gemm(self: *Backend, y: DeviceBuffer, w_bytes: []const u8, weight_scale: []const f32, rows: usize, c_h16: bool) Error!void {
         self.ptic();
         defer self.ptoc(.matmul);
-        std.debug.assert(!c_h16); // f16-C variant not yet built; caps_coop_i8_fs16 stays false
+        std.debug.assert(!c_h16 or self.kernels == .libs); // f16 output only on the cuBLASLt/irescale path
         const w_db = try self.cachedWeight(w_bytes);
         const ws_db = try self.cachedWeight(std.mem.sliceAsBytes(weight_scale));
+        if (self.kernels == .libs) return self.opI8GemmLibs(y, w_db, ws_db, rows, c_h16);
         const f = try self.fusedFn();
         var pa = self.i8_x.ptr();
         var pb = w_db.ptr();
@@ -827,7 +1179,7 @@ pub const Backend = struct {
 
     fn i4prepFn(self: *Backend, cols: usize) Error!cu.CUfunction {
         if (self.i4_prep_mods.get(cols)) |f| return f;
-        const ptx = kernels.buildPrep(self.gpa, cols, 4) catch return error.OutOfMemory;
+        const ptx = kernels.buildPrep(self.gpa, cols, 4, false) catch return error.OutOfMemory;
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         const f = mod.getFunction(self.ctx, "i4prep") catch return error.CudaError;
@@ -1015,6 +1367,11 @@ pub const Backend = struct {
     /// Dispatches to the head-batched path (grid.z fills the GPU) or the per-head
     /// loop reference.
     pub fn opAttnTC(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, seq: usize, n_heads: usize, kv_heads: usize, hd: usize, scale: f32) Error!void {
+        if (self.kernels == .libs) {
+            self.ptic();
+            defer self.ptoc(.attn);
+            return self.opAttnCudnn(q, k, v, out, seq, n_heads, kv_heads, hd, scale);
+        }
         if (self.attn_batched) {
             // sub-timed internally (attn_scores/softmax/pv + gather/scatter in .attn)
             try self.opAttnTCBatched(q, k, v, out, seq, n_heads, kv_heads, hd, scale);
@@ -1023,6 +1380,41 @@ pub const Backend = struct {
             defer self.ptoc(.attn);
             try self.opAttnTCLoop(q, k, v, out, seq, n_heads, kv_heads, hd, scale);
         }
+    }
+
+    /// Build (or fetch cached) a cuDNN fused-SDPA plan for this GQA shape.
+    fn sdpaPlan(self: *Backend, n_heads: usize, kv_heads: usize, seq: usize, hd: usize) Error!cudnn.SdpaPlan {
+        const key: u64 = (@as(u64, seq) << 24) | (@as(u64, n_heads) << 16) | (@as(u64, kv_heads) << 8) | @as(u64, hd / 8);
+        if (self.sdpa_plans.get(key)) |p| return p;
+        const L = &self.libs.?;
+        const p = cudnn.SdpaPlan.build(&L.dnn, L.dnn_handle, 1, n_heads, kv_heads, seq, hd) catch return error.CudaError;
+        self.sdpa_plans.put(self.gpa, key, p) catch return error.OutOfMemory;
+        return p;
+    }
+
+    /// cuDNN fused flash attention (.libs mode): O = softmax(scale·Q·Kᵀ)·V in one
+    /// fused kernel — no per-head gather/scatter, no S materialization, no seq
+    /// padding, native GQA. Q/K/V/O are the DiT's f32 [seq][heads][hd] buffers;
+    /// they convert to f16 for the op and O converts back to f32. Replaces the
+    /// whole hand-PTX scores/softmax/pv pipeline (~80× faster on the GEMMs).
+    fn opAttnCudnn(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, seq: usize, n_heads: usize, kv_heads: usize, hd: usize, scale: f32) Error!void {
+        const qn = seq * n_heads * hd;
+        const kn = seq * kv_heads * hd;
+        try self.ensureDeviceBuffer(&self.cudnn_q16, qn * 2);
+        try self.ensureDeviceBuffer(&self.cudnn_k16, kn * 2);
+        try self.ensureDeviceBuffer(&self.cudnn_v16, kn * 2);
+        try self.ensureDeviceBuffer(&self.cudnn_o16, qn * 2);
+        const f_cvt = try self.eltFn(elt.f32_to_f16_ptx, "f32_to_f16");
+        try self.eltLaunch(f_cvt, q, self.cudnn_q16, null, null, .{ @intCast(qn), @intCast(qn), 0, 0, 0, 0 }, .{ 0, 0 }, qn);
+        try self.eltLaunch(f_cvt, k, self.cudnn_k16, null, null, .{ @intCast(kn), @intCast(kn), 0, 0, 0, 0 }, .{ 0, 0 }, kn);
+        try self.eltLaunch(f_cvt, v, self.cudnn_v16, null, null, .{ @intCast(kn), @intCast(kn), 0, 0, 0, 0 }, .{ 0, 0 }, kn);
+        const plan = try self.sdpaPlan(n_heads, kv_heads, seq, hd);
+        if (plan.workspace_bytes > 0) try self.ensureDeviceBuffer(&self.cudnn_ws, plan.workspace_bytes);
+        var sc = scale;
+        const L = &self.libs.?;
+        plan.execute(&L.dnn, L.dnn_handle, self.cudnn_q16.ptr(), self.cudnn_k16.ptr(), self.cudnn_v16.ptr(), self.cudnn_o16.ptr(), &sc, self.cudnn_ws.ptr()) catch return error.CudaError;
+        const f_back = try self.eltFn(elt.f16_to_f32_ptx, "f16_to_f32");
+        try self.eltLaunch(f_back, self.cudnn_o16, out, null, null, .{ @intCast(qn), @intCast(qn), 0, 0, 0, 0 }, .{ 0, 0 }, qn);
     }
 
     /// Head-batched attention: process `G` heads per launch (grid.z=G) so the PV
@@ -1263,6 +1655,14 @@ pub const Backend = struct {
     }
 
     /// a = silu(a)*b, in place (a=gate, b=up).
+    /// f16 SwiGLU gate (c16 chain): a = silu(a)·b, all f16.
+    pub fn siluMul16(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, total: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const f = try self.eltFn(elt.silu_mul_h16_ptx, "silu_mul_h16");
+        try self.eltLaunch(f, a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+    }
+
     pub fn siluMul(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, total: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);

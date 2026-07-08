@@ -26,19 +26,29 @@ const vae_cuda = @import("models/vae_cuda.zig");
 ///  - cpu:      everything on CPU.
 ///  - vulkan:   encoder / DiT / VAE GEMMs offloaded to Vulkan (falls back to CPU
 ///              per-stage when the device is unavailable / out of VRAM).
-///  - zig_cuda: DiT on the hand-PTX CUDA backend (int8 convrot checkpoint only);
-///              encoder + VAE stay on CPU. `--backend zig-cuda` on the CLI.
+///  - zig_cuda: whole pipeline on the hand-PTX CUDA backend (pure-Zig; int8
+///              convrot checkpoint). `--backend zig-cuda`.
+///  - cuda:     whole pipeline on the CUDA backend with NVIDIA's dlopen'd
+///              cuBLASLt / cuDNN kernels (Phase 2). `--backend cuda`.
 pub const Backend = enum {
     cpu,
     vulkan,
     zig_cuda,
+    cuda,
 
-    /// Parse a CLI value ("cpu" / "vulkan" / "zig-cuda"); null if unrecognized.
+    /// Parse a CLI value ("cpu" / "vulkan" / "zig-cuda" / "cuda"); null if
+    /// unrecognized.
     pub fn fromStr(s: []const u8) ?Backend {
         if (std.mem.eql(u8, s, "cpu")) return .cpu;
         if (std.mem.eql(u8, s, "vulkan")) return .vulkan;
         if (std.mem.eql(u8, s, "zig-cuda")) return .zig_cuda;
+        if (std.mem.eql(u8, s, "cuda")) return .cuda;
         return null;
+    }
+
+    /// True for the CUDA-backed variants (both drive `cuda.Backend`).
+    pub fn isCuda(self: Backend) bool {
+        return self == .zig_cuda or self == .cuda;
     }
 };
 
@@ -114,11 +124,17 @@ pub fn generate(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*s
     // --vram-budget degrades to weight streaming and it coexists with other GPU
     // workloads via the live cuMemGetInfo budget.
     var cu_be: ?*cuda.Backend = null;
-    if (opts.backend == .zig_cuda) {
-        if (cuda.Backend.init(gpa)) |b| {
+    if (opts.backend.isCuda()) {
+        const res = if (opts.backend == .cuda) cuda.Backend.initLibs(gpa) else cuda.Backend.init(gpa);
+        if (res) |b| {
             cu_be = b;
             b.budget_override = opts.vram_budget; // --vram-budget: stream weights past this cap
-            try note(progress, "cuda dit: {s}\n", .{b.deviceName()});
+            if (opts.backend == .cuda) {
+                const L = b.libs.?;
+                try note(progress, "cuda ({s}): cublasLt {d}, cuDNN {d}\n", .{ b.deviceName(), L.lt.cublasLtGetVersion(), L.dnn.cudnnGetVersion() });
+            } else {
+                try note(progress, "cuda dit: {s}\n", .{b.deviceName()});
+            }
         } else |err| {
             try note(progress, "cuda unavailable ({t}); using cpu dit\n", .{err});
         }

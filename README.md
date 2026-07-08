@@ -6,14 +6,6 @@ TensorPencil is a test to see how far we can push diffusion performance in pure 
 
 It currently targets FP8 and INT8/INT4 ConvRot Krea 2, and those are the only models that have been tested.
 I made up the INT4 format because I was curious, so you won't be able to find any INT4 ConvRot models. Sorry.
-Currently the Vulkan results differ slightly from ComfyUI but are pretty close - the Zig noise kernel was created to generate bit-identical initial noise,
-and any remaining difference is due to the Zig DiT kernels reducing in a different order than cuBLAS/FlashAttention;
-over 20 steps that difference accumulates as slight texture-level drift.
-
-|                                 ComfyUI                                  |                                    TensorPencil                                    |                                                                                                                                                                               
-|:------------------------------------------------------------------------:|:----------------------------------------------------------------------------------:|
-| ![ComfyUI reference](testdata/comfyui_ref_252469767172722_1120x1680.png) | ![TensorPencil reproduction](testdata/comfyui_repro_252469767172722_1120x1680.png) |                                        
-|                 seed 252469767172722, 20 steps, cfg 1.0                  |                       same settings, 0.57% mean pixel delta                        |
 
 
 ### AI Disclaimer
@@ -23,34 +15,57 @@ The exception is this readme; I'm of the opinion that if you expect a human to t
 ## Details
 
 Backends supported so far:
-- CPU
-- Vulkan
-- Zig PTX (CUDA)
+- CPU - baseline reference, very slow (`--backend cpu`)
+- Vulkan - Zig hand-emitted SPIR-V (`--backend vulkan`)
+- Zig PTX (CUDA) - pure-Zig hand-emitted PTX (`--backend zig-cuda`)
+- CUDA libraries - NVIDIA cuBLASLt + cuDNN (`--backend cuda`)
+
+The backends all make images nearly pixel-identical to ComfyUI; here is a comparison image across the three GPU
+backends vs. a ComfyUI reference.
+
+![Backend image delta comparison](testdata/int8_backend_comparison.png)
 
 The goal is for 100% Zig code other than needed 3rd party libraries for Vulkan and CUDA.
+The CPU, Vulkan, and Zig-PTX backends stick to that pretty well: the drivers for Vulkan
+and CUDA are dlopen'd (they need to be installed). The `cuda` backend dlopen's NVIDIA's 
+closed-source math libraries (`libcublasLt.so`, `libcudnn.so`) and uses some C interop
+code to interact with them, so it's the least pure backend, but also the fastest.
 
-Vulkan so far takes ~1.3x as long as ComfyUI CUDA (warm cache, reference image: ~80 seconds - 3.86s/it in ComfyUI, ~103 seconds / 4.66s/it in TensorPencil). One
-limit right now is that there was an issue running flash attention in Vulkan because NVIDIA's 3090 Vulkan driver can only use 48 KB of workgroup shared memory,
-whereas CUDA has an opt-in to use 99 KB. This 48KB limit with the current tiling size causes extra traffic when using Flash Attention,
-leading to it being *slower* instead of faster in Vulkan. Tried multiple ways to squeeze it in and so far hasn't worked out.
+This has been tested only on Linux with an RTX 3090 and RTX 4090. It's likely that other
+operating systems and GPUs will hit problems or run less efficiently.
 
-Now also supports INT8 ConvRot.
-The speed for this one is farther behind ComfyUI, but roughly matches ComfyUI FP8.
-ComfyUI INT8: ~2s/it, TensorPencil INT8: ~4s/it
+Not all backends support all model formats yet.
 
-This has been tested only on Linux with an RTX 3090. It's likely that other operating systems and GPUs will hit problems
-or run less efficiently.
+| Model format | `cpu` | `vulkan` | `zig-cuda` | `cuda` |
+|:-------------|:-----:|:--------:|:----------:|:------:|
+| FP8          |   ✅   |    ✅     |     ❌      |   ❌    |
+| INT8 ConvRot |   ✅   |    ✅     |     ✅      |   ✅    |
+| INT4 ConvRot |   ✅   |    ❌     |     ✅      |   ✅    |
+
+Speeds vary widely depending on the model format and backend used. This table is from an RTX
+3090 / Ryzen 7 9800X3D generating a 4 step 1024x1024 cfg 1 image with full VRAM availability,
+across the different formats and backends.
+
+| Model format | `cpu` | `vulkan` | `zig-cuda` | `cuda` | ComfyUI w/CUDA |
+|:-------------|:-----:|:--------:|:----------:|:------:|:--------------:|
+| FP8          |  288  |   2.89   |     —      |   —    |      2.46      |
+| INT8 ConvRot |  289  |   2.39   |    1.94    |  1.28  |      1.14      |
+| INT4 ConvRot |  287  |    —     |    1.38    |  1.11  |       —        |
 
 Plans for the future:
-- Support CUDA in 2 ways for fun:
-  - hand-rolled zig PTX (completed)
-  - calling out to cuBLASLt directly
+- ???
 
 ## Running it
 
-Requires Zig 0.16.0. There are no build-time C dependencies; the only runtime library is the
-Vulkan loader (`libvulkan.so.1`, opened dynamically), and only for `--backend vulkan` — the CPU path
-needs nothing. You'll also need a Vulkan driver for your GPU. On Ubuntu:
+Requires Zig 0.16.0. There are no build-time C dependencies; all runtime libraries are
+opened dynamically (`dlopen`) and only for the backend that needs them — the CPU path
+needs nothing:
+- `--backend vulkan` → `libvulkan.so.1` (Vulkan loader)
+- `--backend zig-cuda` → `libcuda.so.1` (CUDA driver — for the hand-emitted PTX)
+- `--backend cuda` → `libcuda.so.1` + `libcublasLt.so` + `libcudnn.so.9` (NVIDIA's
+  math libraries; install cuDNN 9 + the CUDA 12/13 toolkit runtime)
+
+You'll also need a driver for your GPU. On Ubuntu:
 
 ```
 sudo apt install libvulkan1
@@ -65,19 +80,11 @@ Build with optimizations on (Debug is painfully slow for numeric code):
 zig build -Doptimize=ReleaseFast
 ```
 
-Model weights are not included. Place the three Krea 2 checkpoints at these exact paths
-(relative to where you run the binary — the paths are currently hardcoded):
+Model weights are not included. You will need a Krea 2 model in fp8/int8/int4 format, along
+with Qwen 3 VL 4b and Wan 2.2 VAE. Then:
 
 ```
-models/diffusion_model/krea2CenterSemiraw_v10Fp8.safetensors (or any fp8/int8 krea 2 checkpoint)
-models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors (or any qwen 3 VL encoder)
-models/vae/krea2RealVae_v10.safetensors (or any WAN2.2-VAE)
-```
-
-The Qwen 3 VL tokenizer is embedded in the binary, so no other files are needed. Then:
-
-```
-zig-out/bin/TensorPencil generate --prompt "a fluffy orange cat sitting on a windowsill" --backend vulkan --out cat.png
+zig-out/bin/TensorPencil generate --prompt "a fluffy orange cat sitting on a windowsill" --dit /path/to/krea2.safetensors --text-encoder /path/to/qwen3VL.safetensors --vae /path/to/vae.safetensors --backend vulkan --out cat.png
 ```
 
 Run with no command to see the available options and defaults.
@@ -91,7 +98,8 @@ effectively every weight re-uploads each step, so a smaller cap is barely slower
 You can pass `min` as the budget size to load only 2 weights at a time, ~150MiB (~40% performance loss per step).
 
 ** Note that the VRAM budget is only for the weights, the scores and activations are still in VRAM.**
-The amount of VRAM used for the scores and activations depends on the size of the image; at ~1.8MP, it will be roughly 3.1GiB.
+The amount of VRAM used for the scores and activations depends on the size of the image; at ~1.8MP, it will 
+be roughly 3.1GiB; this also varies by backend.
 
 Measured on an RTX 3090 at 1120×1680, 4 steps, INT8 ConvRot, vulkan backend:
 
