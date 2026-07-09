@@ -149,6 +149,30 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
+    // tp-llm: LLM inference CLI (see LLM_PLAN.md), a second thin driver over
+    // the same TensorPencil library module.
+    const llm_exe = b.addExecutable(.{
+        .name = "tp-llm",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/llm_main.zig"),
+            .link_libc = true,
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "TensorPencil", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(llm_exe);
+
+    const run_llm_step = b.step("run-llm", "Run tp-llm");
+    const run_llm_cmd = b.addRunArtifact(llm_exe);
+    run_llm_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_llm_cmd.addArgs(args);
+    }
+    run_llm_step.dependOn(&run_llm_cmd.step);
+
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
     // set the releative field.

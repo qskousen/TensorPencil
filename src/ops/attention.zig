@@ -13,7 +13,10 @@ pub const Params = struct {
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
-    /// Causal masking (Qwen text encoder); requires seq_q == seq_kv.
+    /// Causal masking (Qwen text encoder / LLM decode). Queries are the LAST
+    /// seq_q positions of the kv sequence: query i attends to keys
+    /// [0, seq_kv - seq_q + i]. seq_q == seq_kv is the classic full-sequence
+    /// case; seq_q == 1 with a longer seq_kv is KV-cached decode.
     causal: bool = false,
     /// Per-key boolean mask, true = attend (Krea 2 text refiner). Length seq_kv.
     key_mask: ?[]const bool = null,
@@ -40,7 +43,7 @@ pub fn attention(
     std.debug.assert(v.len == p.seq_kv * p.n_kv_heads * hd);
     std.debug.assert(out.len == q.len);
     std.debug.assert(p.n_heads % p.n_kv_heads == 0);
-    if (p.causal) std.debug.assert(p.seq_q == p.seq_kv);
+    if (p.causal) std.debug.assert(p.seq_q <= p.seq_kv);
     if (p.key_mask) |mask| std.debug.assert(mask.len == p.seq_kv);
 
     // Split each head's queries into chunks so even single-head attention
@@ -94,7 +97,7 @@ fn headTask(
 
     for (q_start..q_end) |i| {
         const qrow = q[i * q_stride + h * hd ..][0..hd];
-        const kv_end = if (p.causal) i + 1 else p.seq_kv;
+        const kv_end = if (p.causal) p.seq_kv - p.seq_q + i + 1 else p.seq_kv;
 
         var max_score = -std.math.inf(f32);
         for (0..kv_end) |j| {
@@ -190,6 +193,25 @@ test "causal attention matches torch sdpa" {
         .causal = true,
     });
     for (attn_causal_out, out) |e, a| try std.testing.expectApproxEqAbs(e, a, 3e-6);
+}
+
+test "cached decode attention matches the full causal rows" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    // seq_q < seq_kv, causal: query i is absolute position seq_kv - seq_q + i,
+    // so outputs must equal the corresponding rows of the full causal run.
+    inline for (.{ 1, 2 }) |seq_q| {
+        var out: [seq_q * 8]f32 = undefined;
+        try attention(io, gpa, &out, attn_q[(3 - seq_q) * 8 ..], &attn_k, &attn_v, .{
+            .seq_q = seq_q,
+            .seq_kv = 3,
+            .n_heads = 2,
+            .n_kv_heads = 1,
+            .head_dim = 4,
+            .causal = true,
+        });
+        for (attn_causal_out[(3 - seq_q) * 8 ..], out) |e, a| try std.testing.expectApproxEqAbs(e, a, 3e-6);
+    }
 }
 
 test "key mask restricts attention" {

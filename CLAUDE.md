@@ -18,14 +18,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-TensorPencil is a diffusion inference engine (text-to-image) written in pure Zig, targeting **Zig 0.16.0** (`minimum_zig_version` in build.zig.zon). "Pure Zig" means no C dependencies or bindings — tensor ops, model loading, tokenization, samplers, and image encoding are all to be implemented in Zig.
+TensorPencil is a diffusion inference engine (text-to-image) plus an LLM inference engine (`tp-llm`, see `LLM_PLAN.md`) written in pure Zig, targeting **Zig 0.16.0** (`minimum_zig_version` in build.zig.zon). "Pure Zig" means no C dependencies or bindings — tensor ops, model loading, tokenization, samplers, and image encoding are all to be implemented in Zig.
 
 The repo is currently the stock `zig init` scaffold; the engine has not been built yet.
 
 ## Commands
 
-- `zig build` — build the executable (installs to `zig-out/bin/TensorPencil`)
-- `zig build run -- <args>` — build and run with arguments
+- `zig build` — build the executables (installs to `zig-out/bin/TensorPencil` and `zig-out/bin/tp-llm`)
+- `zig build run -- <args>` — build and run the diffusion CLI with arguments
+- `zig build run-llm -- <args>` — build and run `tp-llm`, the LLM inference CLI (see `LLM_PLAN.md`)
 - `zig build test` — run all tests (both the library module and executable module test binaries)
 - `zig build test --fuzz` — run fuzz tests (`std.testing.fuzz`)
 - `zig build -Doptimize=ReleaseFast` — optimized build (important for benchmarking inference; Debug is very slow for numeric code)

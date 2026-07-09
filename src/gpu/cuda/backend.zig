@@ -894,6 +894,61 @@ pub const Backend = struct {
         }
     }
 
+    /// Fused fp8 GEMV for m=1 decode: y[rows] f32 = scale * (W fp8 [rows][cols] @ x).
+    /// One 256-thread block per row, inline LUT dequant — no f16 scratch, each
+    /// weight byte is read exactly once (memory-bound optimal for decode).
+    pub fn opGemvFp8(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, w_bytes: []const u8, scale: f32, rows: usize, cols: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.matmul);
+        std.debug.assert(cols % 8 == 0);
+        if (self.fp8_lut.buf == .null_handle) {
+            self.fp8_lut = try self.tensorCreate(256 * 4);
+            try self.tensorUpload(self.fp8_lut, std.mem.sliceAsBytes(&dtypes.f8_e4m3_to_f32_table));
+        }
+        const w_db = try self.cachedWeight(w_bytes);
+        const f = try self.eltFn(elt.gemv_fp8_ptx, "gemv_fp8");
+        try self.rowLaunch(f, w_db, x, y, self.fp8_lut, .{ @intCast(rows), @intCast(cols), 0, 0, 0, 0 }, .{ scale, 0 }, rows);
+    }
+
+    /// bf16 GEMV (tied LM head): y[rows] f32 = scale * (W bf16 [rows][cols] @ x).
+    pub fn opGemvBf16(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, w_bytes: []const u8, scale: f32, rows: usize, cols: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.matmul);
+        std.debug.assert(cols % 2 == 0);
+        const w_db = try self.cachedWeight(w_bytes);
+        const f = try self.eltFn(elt.gemv_bf16_ptx, "gemv_bf16");
+        try self.rowLaunch(f, w_db, x, y, null, .{ @intCast(rows), @intCast(cols), 0, 0, 0, 0 }, .{ scale, 0 }, rows);
+    }
+
+    /// Flash-decoding attention for a single query against seq_kv cached keys:
+    /// a warp per (head, KV chunk) in the split pass, then a merge pass.
+    /// scratch holds heads*nsplit*(hd+4) f32. hd must be 128.
+    pub fn opAttnDecode(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, seq_kv: usize, n_heads: usize, kv_heads: usize, hd: usize, nsplit: usize, scale: f32) Error!void {
+        self.ptic();
+        defer self.ptoc(.attn);
+        std.debug.assert(hd == 128);
+        const f_split = try self.eltFn(elt.attn_split_ptx, "attn_split");
+        try self.eltLaunch(f_split, q, k, v, scratch, .{ @intCast(seq_kv), @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intCast(nsplit), 0 }, .{ scale, 0 }, n_heads * nsplit * 32);
+        const f_merge = try self.eltFn(elt.attn_merge_ptx, "attn_merge");
+        try self.eltLaunch(f_merge, scratch, out, null, null, .{ @intCast(n_heads), @intCast(hd), @intCast(nsplit), 0, 0, 0 }, .{ 0, 0 }, n_heads * hd);
+    }
+
+    /// eltLaunch variant with one 256-thread block per row (`grid_rows` blocks).
+    fn rowLaunch(self: *Backend, f: cu.CUfunction, b0: ?DeviceBuffer, b1: ?DeviceBuffer, b2: ?DeviceBuffer, b3: ?DeviceBuffer, u: [6]u32, fp: [2]f32, grid_rows: usize) Error!void {
+        var p0: cu.CUdeviceptr = if (b0) |b| b.ptr() else 0;
+        var p1: cu.CUdeviceptr = if (b1) |b| b.ptr() else 0;
+        var p2: cu.CUdeviceptr = if (b2) |b| b.ptr() else 0;
+        var p3: cu.CUdeviceptr = if (b3) |b| b.ptr() else 0;
+        var uu = u;
+        var ff = fp;
+        var params = [_]?*anyopaque{
+            @ptrCast(&p0),    @ptrCast(&p1),    @ptrCast(&p2),    @ptrCast(&p3),
+            @ptrCast(&uu[0]), @ptrCast(&uu[1]), @ptrCast(&uu[2]), @ptrCast(&uu[3]),
+            @ptrCast(&uu[4]), @ptrCast(&uu[5]), @ptrCast(&ff[0]), @ptrCast(&ff[1]),
+        };
+        self.ctx.launch(f, .{ @intCast(grid_rows), 1, 1 }, .{ 256, 1, 1 }, 0, &params) catch return error.CudaError;
+    }
+
     /// f16 tensor-core conv/GEMM for the VAE: y[m][co] f32 = x[m][k] f32 @ Wᵀ + bias,
     /// W f32 [co][k]. Weight and activation convert to f16 zero-padded to the coop
     /// tile (co→128-mult, k→32-mult, m→128), the validated buildHgemm produces a
@@ -1300,6 +1355,13 @@ pub const Backend = struct {
     pub fn qkNorm(self: *Backend, x: DeviceBuffer, out: DeviceBuffer, weight: DeviceBuffer, rows: usize, hd: usize, eps: f32) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
+        // Few wide rows (LLM decode: 1 x 2560) serialize badly at one thread
+        // per row; hand them a block per row instead.
+        if (rows < 512) {
+            const f = try self.eltFn(elt.qk_rmsnorm_par_ptx, "qk_rmsnorm_par");
+            try self.rowLaunch(f, x, out, weight, null, .{ @intCast(rows), @intCast(hd), 0, 0, 0, 0 }, .{ eps, 0 }, rows);
+            return;
+        }
         const f = try self.eltFn(elt.qk_rmsnorm_ptx, "qk_rmsnorm");
         try self.eltLaunch(f, x, out, weight, null, .{ @intCast(rows), @intCast(hd), 0, 0, 0, 0 }, .{ eps, 0 }, rows);
     }
@@ -1313,23 +1375,26 @@ pub const Backend = struct {
         try self.eltLaunch(f, qk, null, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), 0, 0 }, .{ 0, 0 }, total);
     }
 
-    /// naive GQA attention, online softmax, f32. out[q][h][c]. `causal` masks
-    /// keys j>q (each query attends only to itself and earlier tokens) — the
-    /// text-encoder path; the DiT passes false.
-    pub fn attn(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, seq: usize, n_heads: usize, kv_heads: usize, hd: usize, scale: f32, causal: bool) Error!void {
+    /// naive GQA attention, online softmax, f32. out[q][h][c]. `causal`
+    /// treats the seq_q queries as the last positions of the seq_kv keys
+    /// (square when equal — text encoder; seq_q 1 — KV-cached LLM decode);
+    /// the DiT passes false.
+    pub fn attn(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, seq_q: usize, seq_kv: usize, n_heads: usize, kv_heads: usize, hd: usize, scale: f32, causal: bool) Error!void {
         self.ptic();
         defer self.ptoc(.attn);
+        std.debug.assert(seq_q <= seq_kv);
         const f = try self.eltFn(elt.attn_ptx, "attn");
-        try self.eltLaunch(f, q, k, v, out, .{ @intCast(seq), @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intFromBool(causal), 0 }, .{ scale, 0 }, seq * n_heads);
+        try self.eltLaunch(f, q, k, v, out, .{ @intCast(seq_q), @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intFromBool(causal), @intCast(seq_kv) }, .{ scale, 0 }, seq_q * n_heads);
     }
 
-    /// rotate-half RoPE in place. total = rows*n_heads*half.
-    pub fn ropeHalf(self: *Backend, qk: DeviceBuffer, freqs: DeviceBuffer, rows: usize, n_heads: usize, half: usize, sin_off: usize) Error!void {
+    /// rotate-half RoPE in place. total = rows*n_heads*half. `pos0` offsets
+    /// the freqs row (rows hold absolute positions pos0.. — KV-cached decode).
+    pub fn ropeHalf(self: *Backend, qk: DeviceBuffer, freqs: DeviceBuffer, rows: usize, n_heads: usize, half: usize, sin_off: usize, pos0: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
         const f = try self.eltFn(elt.rope_half_ptx, "rope_half");
         const total = rows * n_heads * half;
-        try self.eltLaunch(f, qk, null, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), 0, 0 }, .{ 0, 0 }, total);
+        try self.eltLaunch(f, qk, null, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), @intCast(pos0), 0 }, .{ 0, 0 }, total);
     }
 
     /// a += b, in place (plain residual add). total = element count.

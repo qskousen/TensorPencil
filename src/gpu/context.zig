@@ -62,7 +62,7 @@ const Push = extern struct {
 };
 
 /// Eltwise/attention kernels and their workgroup shapes (kernels/eltwise.zig).
-pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, scale_i32, scale_concat, qknorm_rope_f32 };
+pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine };
 const elt_entry_sizes = [_]EntrySize{
     .{ .name = "rmsnorm", .x = 64, .y = 1 },
     .{ .name = "rms_partial", .x = 256, .y = 1 },
@@ -105,6 +105,11 @@ const elt_entry_sizes = [_]EntrySize{
     .{ .name = "scale_i32", .x = 256, .y = 1 },
     .{ .name = "scale_concat", .x = 256, .y = 1 },
     .{ .name = "qknorm_rope_f32", .x = 64, .y = 1 },
+    .{ .name = "rms_apply_w", .x = 256, .y = 1 },
+    .{ .name = "attn_dsplit", .x = 256, .y = 1 },
+    .{ .name = "attn_dmerge", .x = 256, .y = 1 },
+    .{ .name = "gemv_partial", .x = 256, .y = 1 },
+    .{ .name = "gemv_combine", .x = 256, .y = 1 },
 };
 
 /// Push block shared by all eltwise entries; meaning per entry (see kernels).
@@ -1557,6 +1562,71 @@ pub const Context = struct {
             1,
         );
         try self.opEnd();
+    }
+
+    /// m=1 GEMV over the same cached transposed weights as opMatmul, split
+    /// over `nchunk` interleaved k chunks (gemv_partial + gemv_combine) so
+    /// the GPU sees rows*nchunk threads instead of the tiled GEMM's rows/8.
+    /// `partials` must hold rows*nchunk f32; `y_off_elems` offsets the
+    /// destination (the chunked LM head).
+    pub fn opGemv(
+        self: *Context,
+        y: DeviceBuffer,
+        y_off_elems: usize,
+        x: DeviceBuffer,
+        partials: DeviceBuffer,
+        w_bytes: []const u8,
+        dtype_f8: bool,
+        rows: usize,
+        cols: usize,
+        scale: f32,
+        nchunk: usize,
+    ) Error!void {
+        try self.opGemvPartial(x, partials, w_bytes, dtype_f8, rows, cols, nchunk);
+        try self.opGemvCombine(y, y_off_elems, partials, rows, scale, nchunk);
+    }
+
+    /// The two opGemv halves, exposed separately so callers can batch several
+    /// GEMVs' partial passes (distinct partials buffers) into one
+    /// `independent` group, then their combines into another.
+    pub fn opGemvPartial(
+        self: *Context,
+        x: DeviceBuffer,
+        partials: DeviceBuffer,
+        w_bytes: []const u8,
+        dtype_f8: bool,
+        rows: usize,
+        cols: usize,
+        nchunk: usize,
+    ) Error!void {
+        std.debug.assert(rows % 4 == 0);
+        const w_buf = try self.weightBuffer(w_bytes, if (dtype_f8) 1 else 4, rows, cols);
+        const w_db: DeviceBuffer = .{ .buf = w_buf, .mem = .null_handle, .size = 0 };
+        try self.opElt(.gemv_partial, w_db, x, null, partials, .{
+            .u0 = @intCast((rows / 4) * nchunk),
+            .u1 = @intCast(cols),
+            .u2 = @intCast(nchunk),
+            .u3 = @intCast(std.mem.alignForward(usize, rows, tile_n)),
+            .u4 = @intFromBool(dtype_f8),
+            .u5 = @intCast(rows),
+        }, (rows / 4) * nchunk, 1, 1);
+    }
+
+    pub fn opGemvCombine(
+        self: *Context,
+        y: DeviceBuffer,
+        y_off_elems: usize,
+        partials: DeviceBuffer,
+        rows: usize,
+        scale: f32,
+        nchunk: usize,
+    ) Error!void {
+        try self.opElt(.gemv_combine, partials, null, null, y, .{
+            .u0 = @intCast(rows),
+            .u1 = @intCast(nchunk),
+            .u2 = @intCast(y_off_elems),
+            .f0 = scale,
+        }, rows, 1, 1);
     }
 
     /// Tensor-core GEMM: the kernel reads the cached raw fp8 k-major weights

@@ -262,6 +262,361 @@ const Bufs = struct {
     const fields = [_][]const u8{ "x", "normed", "q", "k", "v", "qt", "kt", "s", "attn", "gate", "up", "t", "out" };
 };
 
+/// KV-cached causal LM on the Vulkan backend (tp-llm --backend vulkan).
+/// Mirrors qwen3_cuda.CudaLM: device-resident 36-layer stack, one batched
+/// submission per step. Prefill (seq > 1, empty cache) reuses the encoder's
+/// square attention (gather_kmajor + attn_scores + attn_out); decode uses the
+/// flash-decoding attn_dsplit/attn_dmerge pair against the per-layer KV
+/// cache. GEMMs are the f32-accumulate fp8 kernel with m = seq (m = 1 is a
+/// GEMV: each weight byte read once). Hidden-dim norms take the 3-pass
+/// parallel rmsnorm (rms_partial/rms_combine/rms_apply_w — one thread per
+/// row would serialize rows = 1). The tied LM head is the bf16 embedding
+/// converted to f32 once and split into 4 vocab chunks so each stays under
+/// the kernels' 1 GiB type-level buffer bound.
+pub const VulkanLM = struct {
+    lm: *const qwen3.CausalLM,
+    ctx: *gpu.Context,
+    gpa: std.mem.Allocator,
+    capacity: usize,
+    /// Committed cache length (absolute position of the next token).
+    len: usize = 0,
+    max_rows: usize,
+    sin_off: u32,
+    /// bf16 embedding converted to f32: LM-head weight source (weightBuffer
+    /// caches by host pointer, so this must stay alive) + CPU-side gather.
+    embed_f32: []f32,
+    k_cache: [n_layers]Buf,
+    v_cache: [n_layers]Buf,
+    freqs_d: Buf,
+    bufs: LmBufs,
+
+    /// LM-head vocab split (151936 / 4 = 37984 rows per chunk; y descriptor
+    /// offsets stay 16-byte aligned).
+    const vocab_chunks = 4;
+    const chunk_rows = qwen3.vocab_size / vocab_chunks;
+    /// KV chunks per head in the decode attention split pass.
+    const nsplit = 128;
+    /// Interleaved chunks per row in the 3-pass rmsnorm.
+    const rms_chunks = 64;
+    /// Interleaved k chunks per output column in the decode GEMV.
+    const gemv_nchunk = 32;
+
+    pub fn init(gpa: std.mem.Allocator, ctx: *gpu.Context, lm: *const qwen3.CausalLM, capacity: usize, first_seq: usize) !VulkanLM {
+        var self: VulkanLM = undefined;
+        self.lm = lm;
+        self.ctx = ctx;
+        self.gpa = gpa;
+        self.capacity = capacity;
+        self.len = 0;
+        self.max_rows = @max(first_seq, 1);
+        self.sin_off = @intCast(capacity * half);
+
+        self.embed_f32 = try gpa.alloc(f32, qwen3.vocab_size * hidden);
+        errdefer gpa.free(self.embed_f32);
+        try safetensors.convertToF32(.bf16, lm.embed_bytes, self.embed_f32);
+
+        var freqs = try ops.rope.rotateHalfFreqs(gpa, capacity, hd, qwen3.rope_theta);
+        defer freqs.deinit(gpa);
+        const fp = try gpa.alloc(f32, 2 * capacity * half);
+        defer gpa.free(fp);
+        @memcpy(fp[0 .. capacity * half], freqs.cos);
+        @memcpy(fp[capacity * half ..], freqs.sin);
+        self.freqs_d = try ctx.tensorCreate(fp.len * 4);
+        errdefer ctx.tensorDestroy(&self.freqs_d);
+        try ctx.tensorUpload(self.freqs_d, std.mem.sliceAsBytes(fp));
+
+        var created: usize = 0;
+        errdefer for (self.k_cache[0..created]) |*bf| ctx.tensorDestroy(bf);
+        for (&self.k_cache) |*bf| {
+            bf.* = try ctx.tensorCreate(capacity * kv_dim * 4);
+            created += 1;
+        }
+        var vcreated: usize = 0;
+        errdefer for (self.v_cache[0..vcreated]) |*bf| ctx.tensorDestroy(bf);
+        for (&self.v_cache) |*bf| {
+            bf.* = try ctx.tensorCreate(capacity * kv_dim * 4);
+            vcreated += 1;
+        }
+
+        self.bufs = try LmBufs.init(ctx, self.max_rows);
+        return self;
+    }
+
+    pub fn deinit(self: *VulkanLM) void {
+        for (&self.k_cache) |*bf| self.ctx.tensorDestroy(bf);
+        for (&self.v_cache) |*bf| self.ctx.tensorDestroy(bf);
+        self.ctx.tensorDestroy(&self.freqs_d);
+        self.bufs.deinit(self.ctx);
+        self.gpa.free(self.embed_f32);
+        self.* = undefined;
+    }
+
+    pub fn remaining(self: *const VulkanLM) usize {
+        return self.capacity - self.len;
+    }
+
+    /// Forward `ids` at positions [len, len+ids.len) (prefill first, then
+    /// single-token decode), then write last-position vocab logits.
+    pub fn step(self: *VulkanLM, io: std.Io, ids: []const u32, logits: []f32) !void {
+        _ = io;
+        const gpa = self.gpa;
+        const ctx = self.ctx;
+        const seq = ids.len;
+        std.debug.assert(seq > 0 and seq <= self.remaining() and seq <= self.max_rows);
+        const pos0 = self.len;
+
+        // CPU: embedding gather from the f32 copy, upload.
+        const x = try gpa.alloc(f32, seq * hidden);
+        defer gpa.free(x);
+        for (ids, 0..) |id, t| {
+            if (id >= qwen3.vocab_size) return error.TokenIdOutOfRange;
+            @memcpy(x[t * hidden ..][0..hidden], self.embed_f32[@as(usize, id) * hidden ..][0..hidden]);
+        }
+        try ctx.tensorUpload(self.bufs.x, std.mem.sliceAsBytes(x));
+
+        const b = &self.bufs;
+        try ctx.beginBatch();
+        errdefer if (ctx.batching) ctx.abortBatch();
+
+        for (self.lm.layers, 0..) |layer, l| {
+            // --- Attention ---
+            try self.normWide(b.x, b.normed, try nbuf(ctx, layer.input_norm), seq);
+            if (seq == 1) {
+                // Group the q/k/v GEMV halves so no barrier drains the GPU
+                // between independent dispatches.
+                ctx.independent(3);
+                try ctx.opGemvPartial(b.normed, b.gemv_partials[0], layer.q.bytes, layer.q.dtype == .f8_e4m3, q_dim, hidden, gemv_nchunk);
+                try ctx.opGemvPartial(b.normed, b.gemv_partials[1], layer.k.bytes, layer.k.dtype == .f8_e4m3, kv_dim, hidden, gemv_nchunk);
+                try ctx.opGemvPartial(b.normed, b.gemv_partials[2], layer.v.bytes, layer.v.dtype == .f8_e4m3, kv_dim, hidden, gemv_nchunk);
+                ctx.independent(3);
+                try ctx.opGemvCombine(b.q, 0, b.gemv_partials[0], q_dim, layer.q.scale, gemv_nchunk);
+                try ctx.opGemvCombine(b.k, 0, b.gemv_partials[1], kv_dim, layer.k.scale, gemv_nchunk);
+                try ctx.opGemvCombine(b.v, 0, b.gemv_partials[2], kv_dim, layer.v.scale, gemv_nchunk);
+            } else {
+                try self.gemm(b.q, b.normed, seq, layer.q, q_dim, hidden);
+                try self.gemm(b.k, b.normed, seq, layer.k, kv_dim, hidden);
+                try self.gemm(b.v, b.normed, seq, layer.v, kv_dim, hidden);
+            }
+            if (seq == 1) ctx.independent(2);
+            try rmsnorm(ctx, b.q, b.q, try nbuf(ctx, layer.q_norm), seq * n_heads, hd);
+            try rmsnorm(ctx, b.k, b.k, try nbuf(ctx, layer.k_norm), seq * kv_heads, hd);
+            if (seq == 1) ctx.independent(2);
+            try ctx.opElt(.rope_half, b.q, null, self.freqs_d, null, .{
+                .u0 = @intCast(seq * n_heads * half),
+                .u1 = half,
+                .u2 = self.sin_off,
+                .u3 = n_heads,
+                .u4 = @intCast(pos0),
+            }, seq * n_heads * half, 1, 1);
+            try ctx.opElt(.rope_half, b.k, null, self.freqs_d, null, .{
+                .u0 = @intCast(seq * kv_heads * half),
+                .u1 = half,
+                .u2 = self.sin_off,
+                .u3 = kv_heads,
+                .u4 = @intCast(pos0),
+            }, seq * kv_heads * half, 1, 1);
+            // Append K/V to the cache (in-batch device copy).
+            if (seq == 1) ctx.independent(2);
+            try ctx.opElt(.copy, b.k, self.k_cache[l], null, null, .{
+                .u0 = @intCast(seq * kv_dim),
+                .u2 = @intCast(pos0 * kv_dim),
+            }, seq * kv_dim, 1, 1);
+            try ctx.opElt(.copy, b.v, self.v_cache[l], null, null, .{
+                .u0 = @intCast(seq * kv_dim),
+                .u2 = @intCast(pos0 * kv_dim),
+            }, seq * kv_dim, 1, 1);
+
+            if (seq == 1) {
+                // Flash-decoding split/merge against the cached prefix.
+                try ctx.opElt(.attn_dsplit, b.q, self.k_cache[l], self.v_cache[l], b.attn_scratch, .{
+                    .u0 = @intCast(pos0 + 1),
+                    .u1 = n_heads,
+                    .u2 = kv_heads,
+                    .u3 = hd,
+                    .u4 = nsplit,
+                    .f0 = attn_scale,
+                }, n_heads * nsplit, 1, 1);
+                try ctx.opElt(.attn_dmerge, b.attn_scratch, null, null, b.attn, .{
+                    .u0 = n_heads,
+                    .u1 = hd,
+                    .u2 = nsplit,
+                }, n_heads * hd, 1, 1);
+            } else {
+                // Square causal attention (prefill starts from an empty cache).
+                std.debug.assert(pos0 == 0);
+                try ctx.opElt(.gather_kmajor, b.q, null, null, b.qt, .{
+                    .u0 = @intCast(seq * n_heads * hd),
+                    .u1 = n_heads,
+                    .u2 = hd,
+                    .u3 = @intCast(seq),
+                }, seq * n_heads * hd, 1, 1);
+                try ctx.opElt(.gather_kmajor, b.k, null, null, b.kt, .{
+                    .u0 = @intCast(seq * kv_heads * hd),
+                    .u1 = kv_heads,
+                    .u2 = hd,
+                    .u3 = @intCast(seq),
+                }, seq * kv_heads * hd, 1, 1);
+                const dc8 = std.math.divCeil(usize, seq, 8) catch unreachable;
+                try ctx.opElt(.attn_scores, b.qt, b.kt, null, b.s, .{
+                    .u0 = @intCast(seq),
+                    .u1 = n_heads,
+                    .u2 = kv_heads,
+                    .u3 = hd,
+                    .u4 = 0,
+                    .f0 = attn_scale,
+                }, dc8, dc8, n_heads);
+                try ctx.opElt(.attn_out, b.s, null, b.v, b.attn, .{
+                    .u0 = @intCast(seq),
+                    .u1 = n_heads,
+                    .u2 = kv_heads,
+                    .u3 = hd,
+                    .u4 = 0,
+                    .u5 = @intCast(seq),
+                    .f0 = @bitCast(@as(u32, @intCast(seq * seq))),
+                    .f1 = @bitCast(@as(u32, 1)), // causal
+                }, hd / 8, dc8, n_heads);
+            }
+            try self.gemm(b.t, b.attn, seq, layer.o, hidden, q_dim);
+            try ctx.opElt(.add, b.x, b.t, null, null, .{ .u0 = @intCast(seq * hidden) }, seq * hidden, 1, 1);
+
+            // --- MLP (SwiGLU) ---
+            try self.normWide(b.x, b.normed, try nbuf(ctx, layer.post_norm), seq);
+            if (seq == 1) {
+                ctx.independent(2);
+                try ctx.opGemvPartial(b.normed, b.gemv_partials[0], layer.gate.bytes, layer.gate.dtype == .f8_e4m3, intermediate, hidden, gemv_nchunk);
+                try ctx.opGemvPartial(b.normed, b.gemv_partials[1], layer.up.bytes, layer.up.dtype == .f8_e4m3, intermediate, hidden, gemv_nchunk);
+                ctx.independent(2);
+                try ctx.opGemvCombine(b.gate, 0, b.gemv_partials[0], intermediate, layer.gate.scale, gemv_nchunk);
+                try ctx.opGemvCombine(b.up, 0, b.gemv_partials[1], intermediate, layer.up.scale, gemv_nchunk);
+            } else {
+                try self.gemm(b.gate, b.normed, seq, layer.gate, intermediate, hidden);
+                try self.gemm(b.up, b.normed, seq, layer.up, intermediate, hidden);
+            }
+            try ctx.opElt(.silu_mul, b.gate, b.up, null, null, .{ .u0 = @intCast(seq * intermediate) }, seq * intermediate, 1, 1);
+            try self.gemm(b.t, b.gate, seq, layer.down, hidden, intermediate);
+            try ctx.opElt(.add, b.x, b.t, null, null, .{ .u0 = @intCast(seq * hidden) }, seq * hidden, 1, 1);
+        }
+
+        // Final norm on the last position + LM head (4 vocab chunks).
+        try ctx.opElt(.copy, b.x, b.t, null, null, .{
+            .u0 = hidden,
+            .u2 = 0,
+            .u3 = @intCast((seq - 1) * hidden),
+        }, hidden, 1, 1);
+        try self.normWide(b.t, b.normed, try nbuf(ctx, self.lm.final_norm), 1);
+        ctx.independent(vocab_chunks);
+        for (0..vocab_chunks) |ci| {
+            const w = self.embed_f32[ci * chunk_rows * hidden ..][0 .. chunk_rows * hidden];
+            try ctx.opGemvPartial(b.normed, b.gemv_partials[ci], std.mem.sliceAsBytes(w), false, chunk_rows, hidden, gemv_nchunk);
+        }
+        ctx.independent(vocab_chunks);
+        for (0..vocab_chunks) |ci| {
+            try ctx.opGemvCombine(b.logits, ci * chunk_rows, b.gemv_partials[ci], chunk_rows, 1.0, gemv_nchunk);
+        }
+        try ctx.endBatch();
+        self.len += seq;
+
+        try ctx.tensorDownload(b.logits, std.mem.sliceAsBytes(logits[0..qwen3.vocab_size]));
+    }
+
+    /// GEMM for prefill (tiled kernel), k-split GEMV for decode (m = 1).
+    fn gemm(self: *VulkanLM, y: Buf, x: Buf, m: usize, w: ops.matmul.Weight, rows: usize, cols: usize) !void {
+        if (m == 1) {
+            try self.ctx.opGemv(y, 0, x, self.bufs.gemv_partials[0], w.bytes, w.dtype == .f8_e4m3, rows, cols, w.scale, gemv_nchunk);
+        } else {
+            try self.ctx.opMatmul(y, 0, x, 0, m, w.bytes, w.dtype == .f8_e4m3, rows, cols, w.scale, null);
+        }
+    }
+
+    /// 3-pass parallel rmsnorm over [rows][hidden] (one thread per row would
+    /// serialize the decode path's rows = 1).
+    fn normWide(self: *VulkanLM, in: Buf, out: Buf, weight: Buf, rows: usize) !void {
+        const ctx = self.ctx;
+        try ctx.opElt(.rms_partial, in, null, null, self.bufs.rms_partials, .{
+            .u0 = @intCast(rows * rms_chunks),
+            .u1 = hidden,
+            .u2 = rms_chunks,
+        }, rows * rms_chunks, 1, 1);
+        try ctx.opElt(.rms_combine, self.bufs.rms_partials, null, null, self.bufs.rms_inv, .{
+            .u0 = @intCast(rows),
+            .u1 = hidden,
+            .u2 = rms_chunks,
+            .f0 = eps,
+        }, rows, 1, 1);
+        try ctx.opElt(.rms_apply_w, in, out, weight, self.bufs.rms_inv, .{
+            .u0 = @intCast(rows * hidden),
+            .u1 = hidden,
+        }, rows * hidden, 1, 1);
+    }
+};
+
+const LmBufs = struct {
+    x: Buf,
+    normed: Buf,
+    q: Buf,
+    k: Buf,
+    v: Buf,
+    qt: Buf,
+    kt: Buf,
+    s: Buf,
+    attn: Buf,
+    gate: Buf,
+    up: Buf,
+    t: Buf,
+    attn_scratch: Buf,
+    rms_partials: Buf,
+    rms_inv: Buf,
+    gemv_partials: [4]Buf,
+    logits: Buf,
+
+    fn init(ctx: *gpu.Context, rows: usize) !LmBufs {
+        var self: LmBufs = undefined;
+        var created: usize = 0;
+        errdefer inline for (fields, 0..) |name, i| {
+            if (i < created) ctx.tensorDestroy(&@field(self, name));
+        };
+        const sizes = [fields.len]usize{
+            rows * hidden * 4, // x
+            rows * hidden * 4, // normed
+            rows * q_dim * 4, // q
+            rows * kv_dim * 4, // k
+            rows * kv_dim * 4, // v
+            rows * q_dim * 4, // qt (prefill k-major)
+            rows * kv_dim * 4, // kt
+            n_heads * rows * rows * 4, // s (prefill scores)
+            rows * q_dim * 4, // attn
+            rows * intermediate * 4, // gate
+            rows * intermediate * 4, // up
+            rows * hidden * 4, // t (o/down GEMM out; also last-row scratch)
+            n_heads * VulkanLM.nsplit * (hd + 2) * 4, // attn_scratch
+            rows * VulkanLM.rms_chunks * 4, // rms_partials
+            rows * 4, // rms_inv
+            qwen3.vocab_size * 4, // logits
+        };
+        inline for (fields, sizes) |name, size| {
+            @field(self, name) = try ctx.tensorCreate(size);
+            created += 1;
+        }
+        // GEMV k-split partials: one per member of an `independent` group
+        // (q/k/v, gate/up, the 4 LM-head chunks). Sized for the largest user.
+        var pcreated: usize = 0;
+        errdefer for (self.gemv_partials[0..pcreated]) |*pb| ctx.tensorDestroy(pb);
+        for (&self.gemv_partials) |*pb| {
+            pb.* = try ctx.tensorCreate(VulkanLM.chunk_rows * VulkanLM.gemv_nchunk * 4);
+            pcreated += 1;
+        }
+        return self;
+    }
+
+    fn deinit(self: *LmBufs, ctx: *gpu.Context) void {
+        inline for (fields) |name| ctx.tensorDestroy(&@field(self, name));
+        for (&self.gemv_partials) |*pb| ctx.tensorDestroy(pb);
+        self.* = undefined;
+    }
+
+    const fields = [_][]const u8{ "x", "normed", "q", "k", "v", "qt", "kt", "s", "attn", "gate", "up", "t", "attn_scratch", "rms_partials", "rms_inv", "logits" };
+};
+
 // Parity against the CPU encode (same weights, same fixture prompt); gated on
 // the model + GPU marker. Compares the GPU-resident forward to the CPU forward
 // element-wise.

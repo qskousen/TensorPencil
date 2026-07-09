@@ -109,12 +109,20 @@ pub fn rotateHalfFreqs(gpa: std.mem.Allocator, seq: usize, head_dim: usize, thet
 /// (x[i], x[i+half]) -> (x[i] c_i - x[i+half] s_i, x[i+half] c_i + x[i] s_i).
 /// `x` is [seq, n_heads * head_dim] row-major.
 pub fn applyRotateHalf(x: []f32, freqs: Freqs, seq: usize, n_heads: usize, head_dim: usize) void {
+    applyRotateHalfAt(x, freqs, 0, seq, n_heads, head_dim);
+}
+
+/// applyRotateHalf for tokens whose absolute positions start at `pos0`
+/// (KV-cached decode: x holds only the new tokens). `freqs` must cover
+/// pos0 + seq positions.
+pub fn applyRotateHalfAt(x: []f32, freqs: Freqs, pos0: usize, seq: usize, n_heads: usize, head_dim: usize) void {
     const half = head_dim / 2;
     std.debug.assert(freqs.half == half);
     std.debug.assert(x.len == seq * n_heads * head_dim);
+    std.debug.assert(freqs.cos.len >= (pos0 + seq) * half);
     for (0..seq) |p| {
-        const cos = freqs.cos[p * half ..][0..half];
-        const sin = freqs.sin[p * half ..][0..half];
+        const cos = freqs.cos[(pos0 + p) * half ..][0..half];
+        const sin = freqs.sin[(pos0 + p) * half ..][0..half];
         for (0..n_heads) |h| {
             const base = (p * n_heads + h) * head_dim;
             for (0..half) |i| {

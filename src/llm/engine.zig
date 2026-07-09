@@ -1,0 +1,207 @@
+//! Autoregressive generation loop: one full-sequence prefill into the KV
+//! cache, then seq-1 decode steps (LLM_PLAN.md M2).
+
+const std = @import("std");
+const qwen3 = @import("../models/qwen3.zig");
+const tokenizer_mod = @import("../tokenizer.zig");
+const ops = @import("../ops.zig");
+const chat = @import("chat.zig");
+const sample = @import("sample.zig");
+const kv_cache_mod = @import("kv_cache.zig");
+
+const Tokenizer = tokenizer_mod.Tokenizer;
+const KvCache = kv_cache_mod.KvCache;
+
+pub const Options = struct {
+    max_new_tokens: usize = 256,
+    /// KV-cache capacity cap; the cache is sized to
+    /// min(max_context, prompt + max_new_tokens).
+    max_context: usize = 4096,
+    sampling: sample.Params = .{},
+    /// RNG seed for sampling (irrelevant when temperature = 0).
+    seed: u64 = 0,
+};
+
+/// KV-cache capacity for a given prompt; errors when the prompt alone
+/// overflows the window.
+pub fn capacityFor(opts: Options, prompt_len: usize) !usize {
+    if (prompt_len >= opts.max_context) return error.PromptTooLong;
+    return @min(opts.max_context, prompt_len + opts.max_new_tokens);
+}
+
+/// Extend `ids` in place until a stop token, the token budget, or a full
+/// context window. Decoded bytes stream to `out` (flushed per token, held
+/// back until UTF-8-complete) when non-null; the stop token is not appended.
+/// Returns the number of tokens generated.
+///
+/// `model` is a pointer to any backend stepper exposing
+///   step(io, ids_new: []const u32, logits: []f32) — forward the new tokens
+///     at the next cache positions and write last-position vocab logits, and
+///   remaining() usize — cache room left.
+/// The first step call carries the whole prompt (prefill); each later call
+/// carries the single sampled token (decode).
+pub fn generate(
+    model: anytype,
+    tok: *const Tokenizer,
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    ids: *std.ArrayList(u32),
+    opts: Options,
+    out: ?*std.Io.Writer,
+) !usize {
+    const logits = try gpa.alloc(f32, qwen3.vocab_size);
+    defer gpa.free(logits);
+
+    var sampler = sample.Sampler.init(opts.sampling, opts.seed);
+    var stream: Utf8Stream = .{};
+
+    try model.step(io, ids.items, logits);
+    var n: usize = 0;
+    while (n < opts.max_new_tokens) {
+        const next = sampler.next(logits, ids.items);
+        if (chat.isStop(next)) break;
+        try ids.append(gpa, next);
+        n += 1;
+        if (out) |w| {
+            const bytes = try tok.decodeAlloc(gpa, &.{next});
+            defer gpa.free(bytes);
+            try stream.write(w, bytes);
+            try w.flush();
+        }
+        if (model.remaining() == 0) break; // context window full
+        try model.step(io, &.{next}, logits);
+    }
+    return n;
+}
+
+/// CPU backend stepper: qwen3.CausalLM + host KvCache; the LM head is the
+/// tied bf16 embedding GEMV.
+pub const CpuModel = struct {
+    lm: *const qwen3.CausalLM,
+    gpa: std.mem.Allocator,
+    cache: KvCache,
+    freqs: ops.rope.Freqs,
+    last_hidden: []f32,
+
+    pub fn init(gpa: std.mem.Allocator, lm: *const qwen3.CausalLM, capacity: usize) !CpuModel {
+        var cache = try KvCache.init(gpa, qwen3.n_layers, capacity, qwen3.kv_dim);
+        errdefer cache.deinit(gpa);
+        var freqs = try ops.rope.rotateHalfFreqs(gpa, capacity, qwen3.head_dim, qwen3.rope_theta);
+        errdefer freqs.deinit(gpa);
+        const last_hidden = try gpa.alloc(f32, qwen3.hidden);
+        return .{ .lm = lm, .gpa = gpa, .cache = cache, .freqs = freqs, .last_hidden = last_hidden };
+    }
+
+    pub fn deinit(self: *CpuModel) void {
+        self.cache.deinit(self.gpa);
+        self.freqs.deinit(self.gpa);
+        self.gpa.free(self.last_hidden);
+        self.* = undefined;
+    }
+
+    pub fn remaining(self: *const CpuModel) usize {
+        return self.cache.remaining();
+    }
+
+    pub fn step(self: *CpuModel, io: std.Io, ids_new: []const u32, logits: []f32) !void {
+        try self.lm.forwardCached(io, self.gpa, ids_new, &self.cache, self.freqs, self.last_hidden);
+        try ops.matmul.matmul(io, self.gpa, logits, self.last_hidden, 1, self.lm.lmHead(), null);
+    }
+};
+
+/// Byte-level BPE tokens can split multi-byte UTF-8 sequences; hold back an
+/// incomplete trailing sequence until the token that completes it.
+pub const Utf8Stream = struct {
+    pending: [3]u8 = undefined,
+    pending_len: usize = 0,
+
+    pub fn write(self: *Utf8Stream, w: *std.Io.Writer, bytes: []const u8) !void {
+        var buf: [3 + 128]u8 = undefined; // decoded token bytes are <= 128
+        std.debug.assert(bytes.len <= 128);
+        @memcpy(buf[0..self.pending_len], self.pending[0..self.pending_len]);
+        @memcpy(buf[self.pending_len..][0..bytes.len], bytes);
+        const all = buf[0 .. self.pending_len + bytes.len];
+
+        const complete = completeUtf8Prefix(all);
+        try w.writeAll(all[0..complete]);
+        self.pending_len = all.len - complete;
+        @memcpy(self.pending[0..self.pending_len], all[complete..]);
+    }
+};
+
+/// Length of the longest prefix that does not end mid-codepoint. Invalid
+/// bytes are passed through rather than held forever.
+fn completeUtf8Prefix(bytes: []const u8) usize {
+    var back: usize = 0;
+    var i = bytes.len;
+    while (i > 0 and back < 4) {
+        i -= 1;
+        back += 1;
+        const b = bytes[i];
+        if (b & 0x80 == 0) return i + 1; // ASCII tail: complete
+        if (b & 0xC0 == 0xC0) { // leading byte of a multi-byte sequence
+            const need = std.unicode.utf8ByteSequenceLength(b) catch return bytes.len;
+            return if (bytes.len - i >= need) bytes.len else i;
+        }
+        // 0b10xxxxxx continuation: keep scanning backwards.
+    }
+    return bytes.len; // >= 4 trailing continuations: invalid, flush as-is
+}
+
+// --- tests -----------------------------------------------------------------
+
+test "utf8 stream holds back split codepoints" {
+    var buf: [64]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    var stream: Utf8Stream = .{};
+
+    // "é" (0xC3 0xA9) split across two writes; "😀" (4 bytes) split 1+3.
+    try stream.write(&w, "a\xC3");
+    try std.testing.expectEqualStrings("a", w.buffered());
+    try stream.write(&w, "\xA9b");
+    try std.testing.expectEqualStrings("a\xC3\xA9b", w.buffered());
+    try stream.write(&w, "\xF0");
+    try std.testing.expectEqualStrings("a\xC3\xA9b", w.buffered());
+    try stream.write(&w, "\x9F\x98\x80!");
+    try std.testing.expectEqualStrings("a\xC3\xA9b\xF0\x9F\x98\x80!", w.buffered());
+}
+
+test "utf8 prefix scanner" {
+    try std.testing.expectEqual(@as(usize, 3), completeUtf8Prefix("abc"));
+    try std.testing.expectEqual(@as(usize, 1), completeUtf8Prefix("a\xC3"));
+    try std.testing.expectEqual(@as(usize, 4), completeUtf8Prefix("ab\xC3\xA9"));
+    try std.testing.expectEqual(@as(usize, 1), completeUtf8Prefix("a\xF0\x9F\x98"));
+    try std.testing.expectEqual(@as(usize, 0), completeUtf8Prefix("\xF0\x9F"));
+}
+
+// End-to-end mechanics (forward -> lm_head -> argmax -> append) against the
+// real checkpoint; skipped when the model is absent. Kept to 2 tokens — each
+// costs a full 36-layer forward.
+test "greedy generation produces valid tokens" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const safetensors = @import("../safetensors.zig");
+    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
+
+    var st = try safetensors.SafeTensors.open(gpa, io, te_path);
+    defer st.deinit();
+    var lm = try qwen3.CausalLM.load(gpa, &st);
+    defer lm.deinit();
+    var tok = try Tokenizer.init(gpa);
+    defer tok.deinit();
+
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(gpa);
+    try chat.appendUser(&tok, gpa, "Say hi.", &ids);
+    try chat.openAssistant(&tok, gpa, &ids);
+    const prompt_len = ids.items.len;
+
+    const opts: Options = .{ .max_new_tokens = 2, .sampling = .{ .temperature = 0 } };
+    var model = try CpuModel.init(gpa, &lm, try capacityFor(opts, prompt_len));
+    defer model.deinit();
+    const n = try generate(&model, &tok, io, gpa, &ids, opts, null);
+    try std.testing.expectEqual(prompt_len + n, ids.items.len);
+    try std.testing.expect(n > 0); // "Say hi." should not stop on token one
+    for (ids.items[prompt_len..]) |id| try std.testing.expect(id < qwen3.vocab_size);
+}

@@ -114,3 +114,21 @@ Measured on an RTX 3090 at 1120×1680, 4 steps, INT8 ConvRot, vulkan backend:
 | 2 GiB                       | 6.47   | 31.2 s |
 | 1 GiB                       | 6.53   | 31.3 s |
 | min (150MiB)                | 7.21   | 34.2 s |
+
+### LLM
+
+Added another executable that processes LLM models, for fun: `tp-llm`. Only tested with the already-used Qwen 3 VL 4b
+text encoder model so far, but should generalize to other Qwen 3 models easily.
+
+Doesn't have REPL yet either, so it is single-turn only. Runs on all four backends:
+
+| Backend  | tok/s |
+|:---------|:------|
+| cpu      | 2.9   |
+| vulkan   | 26.5  |
+| zig-cuda | 67    |
+| cuda     | 69    |
+
+Run the command without arguments to see the usage. Example usage:
+
+`tp-llm --model qwen-3-vl-4b.safetensors --prompt "why is the sky blue" --backend zig-cuda`

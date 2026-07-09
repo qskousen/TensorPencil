@@ -140,7 +140,7 @@ fn txtBlockCuda(be: *Backend, arena: std.mem.Allocator, blk: anytype, x_d: Devic
     // time; seq_len is small so the launch count is cheap and one-time.
     for (0..n_seqs) |i| {
         const off = i * seq_len * txt_dim * 4;
-        try be.attn(offsetBuf(s.q, off), offsetBuf(s.k, off), offsetBuf(s.v, off), offsetBuf(s.attn, off), seq_len, txt_heads, txt_heads, hd, attn_scale, false);
+        try be.attn(offsetBuf(s.q, off), offsetBuf(s.k, off), offsetBuf(s.v, off), offsetBuf(s.attn, off), seq_len, seq_len, txt_heads, txt_heads, hd, attn_scale, false);
     }
     try be.sigmoidMul(s.attn, s.g, rows * txt_dim);
     try txtGemm(be, arena, s.t1, s.attn, rows, blk.attn.wo, txt_dim, txt_dim, zero);
@@ -436,7 +436,7 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
         if (use_tc_attn)
             try be.opAttnTC(q_d, k_d, v_d, attn_d, seq, heads, kv_heads, hd, attn_scale)
         else
-            try be.attn(q_d, k_d, v_d, attn_d, seq, heads, kv_heads, hd, attn_scale, false);
+            try be.attn(q_d, k_d, v_d, attn_d, seq, seq, heads, kv_heads, hd, attn_scale, false);
         try be.sigmoidMul(attn_d, g_d, seq * F);
         try qPrep(be, is_i4, attn_d, seq, blk.attn.wo.cols);
         try qGemm(be, is_i4, t1_d, blk.attn.wo);

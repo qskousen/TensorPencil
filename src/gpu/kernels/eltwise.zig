@@ -146,6 +146,17 @@ export fn rms_apply_mod() callconv(.spirv_kernel) void {
     b.data[idx] = a.data[idx] * d.data[idx / pc.u1] * c.data[pc.u2 + col] + c.data[pc.u3 + col];
 }
 
+// rms_apply_w: y = x*inv[row]*w[col] — the plain-weight epilogue of the
+//   3-pass parallel rmsnorm (rms_partial/rms_combine), for wide rows with a
+//   norm weight but no AdaLN modulation (the LLM decode path's rows=1
+//   hidden norms). a = x, b = out, c = weight, d = inv. u0 = n, u1 = dim.
+export fn rms_apply_w() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    b.data[idx] = a.data[idx] * d.data[idx / pc.u1] * c.data[idx % pc.u1];
+}
+
 export fn modulate() callconv(.spirv_kernel) void {
     decorate();
     const idx = gpu.global_invocation_id[0];
@@ -210,7 +221,9 @@ export fn rope_half() callconv(.spirv_kernel) void {
     if (idx >= pc.u0) return;
     const half = pc.u1;
     const i = idx % half;
-    const pos = idx / (half * pc.u3);
+    // u4 = absolute position of row 0 (0 for the full-sequence encoder;
+    // the KV-cached decode passes the cache length).
+    const pos = idx / (half * pc.u3) + pc.u4;
     const row = idx / half; // pos*n_heads + head
     const cos_v = c.data[pos * half + i];
     const sin_v = c.data[pc.u2 + pos * half + i];
@@ -221,15 +234,155 @@ export fn rope_half() callconv(.spirv_kernel) void {
     a.data[base + half + i] = hi * cos_v + lo * sin_v;
 }
 
-// copy: b[u2 + idx] = a[idx]. Contiguous copy with a destination offset;
-// used to snapshot hidden-state taps into a tap-major output buffer on the
-// device (keeps the encoder forward in one batch). u0 = element count,
-// u2 = dest offset.
+// --- k-split GEMV (m=1 decode; the tiled GEMM leaves rows/8 threads) ------
+// gemv_partial: y[col] = dot(W[:, col], x) split over u2 interleaved k
+//   chunks; one thread per (chunk, 4-column group) so an fp8 thread reads a
+//   whole u32 word per k (a warp touches 128 consecutive bytes — per-column
+//   threads would touch 32 and waste 4x bandwidth). Weight is the k-major
+//   transposed layout of the matmul kernels: element (k, col) at
+//   k*w_stride + col; rows must be a multiple of 4. a = W (raw words through
+//   the f32 view), b = x, d = partials [ch][rows]. u0 = (rows/4)*nchunk,
+//   u1 = cols, u2 = nchunk, u3 = w_stride, u4 = is_f8, u5 = rows.
+export fn gemv_partial() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const groups = pc.u5 / 4;
+    const ch = idx / groups;
+    const col0 = (idx % groups) * 4;
+    var sums: [4]f32 = @splat(0.0);
+    var k: u32 = ch;
+    if (pc.u4 != 0) {
+        while (k < pc.u1) : (k += pc.u2) {
+            const word: u32 = @bitCast(a.data[(k * pc.u3 + col0) / 4]);
+            const xv = b.data[k];
+            inline for (0..4) |j| {
+                sums[j] += e4m3ToF32((word >> (8 * j)) & 0xFF) * xv;
+            }
+        }
+    } else {
+        while (k < pc.u1) : (k += pc.u2) {
+            const base = k * pc.u3 + col0;
+            const xv = b.data[k];
+            inline for (0..4) |j| {
+                sums[j] += a.data[base + j] * xv;
+            }
+        }
+    }
+    const out = ch * pc.u5 + col0;
+    inline for (0..4) |j| {
+        d.data[out + j] = sums[j];
+    }
+}
+
+// gemv_combine: y[u2 + col] = scale * sum_ch partials[ch][rows + col].
+//   a = partials, d = y. u0 = rows, u1 = nchunk, u2 = dest element offset
+//   (the chunked LM head), f0 = scale.
+export fn gemv_combine() callconv(.spirv_kernel) void {
+    decorate();
+    const col = gpu.global_invocation_id[0];
+    if (col >= pc.u0) return;
+    var sum: f32 = 0;
+    var ch: u32 = 0;
+    while (ch < pc.u1) : (ch += 1) sum += a.data[ch * pc.u0 + col];
+    d.data[pc.u2 + col] = sum * pc.f0;
+}
+
+// e4m3 -> f32, branchless (same as common.zig's; duplicated so this module
+// stays free of common's buffer bindings).
+inline fn e4m3ToF32(byte: u32) f32 {
+    const man = byte & 0x7;
+    const sign: u32 = (byte & 0x80) << 24;
+    const magnitude = byte & 0x7F;
+    const normal: f32 = @bitCast(sign | ((magnitude << 20) + (120 << 23)));
+    const subnormal: f32 = @as(f32, @bitCast(sign | @as(u32, 0x3F800000))) *
+        (@as(f32, @floatFromInt(man)) * 0x1p-9);
+    return if (magnitude >= 8) normal else subnormal;
+}
+
+// --- flash-decoding attention (single query vs. the KV cache) ------------
+// attn_dsplit: pass 1 — one thread per (head, kv chunk): online softmax over
+//   the chunk, unnormalized partial (m, d, acc[hd]) to scratch at
+//   [(h*nsplit+i)*(hd+2)]. Empty chunks write (m=-3e38, d=0, acc=0), which
+//   the merge weights to zero. a = q [heads][hd], b = k [seq_kv][kv_dim],
+//   c = v, d = scratch. u0=seq_kv, u1=heads, u2=kv_heads, u3=hd(<=128),
+//   u4=nsplit, f0=scale.
+export fn attn_dsplit() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    const nsplit = pc.u4;
+    if (idx >= pc.u1 * nsplit) return;
+    const hd = pc.u3;
+    const h = idx / nsplit;
+    const i = idx % nsplit;
+    const chunk = (pc.u0 + nsplit - 1) / nsplit;
+    const kv0 = i * chunk;
+    const kv1 = @min(kv0 + chunk, pc.u0);
+    const kvh = h / (pc.u1 / pc.u2);
+    const qbase = h * hd;
+
+    var acc: [128]f32 = @splat(0.0); // type-level max; loops bound by hd
+    var m: f32 = -3.0e38;
+    var dsum: f32 = 0;
+    var j = kv0;
+    while (j < kv1) : (j += 1) {
+        const kbase = (j * pc.u2 + kvh) * hd;
+        var s: f32 = 0;
+        var t: u32 = 0;
+        while (t < hd) : (t += 1) s += a.data[qbase + t] * b.data[kbase + t];
+        s *= pc.f0;
+        const m2 = @max(m, s);
+        const corr = @exp(m - m2);
+        const p = @exp(s - m2);
+        dsum = dsum * corr + p;
+        m = m2;
+        var t2: u32 = 0;
+        while (t2 < hd) : (t2 += 1) acc[t2] = acc[t2] * corr + p * c.data[kbase + t2];
+    }
+    const base = idx * (hd + 2);
+    d.data[base] = m;
+    d.data[base + 1] = dsum;
+    var t: u32 = 0;
+    while (t < hd) : (t += 1) d.data[base + 2 + t] = acc[t];
+}
+
+// attn_dmerge: pass 2 — one thread per (head, dim c): M = max_i m_i,
+//   D = sum_i d_i*exp(m_i-M), out[h][c] = sum_i acc_i[c]*exp(m_i-M) / D.
+//   a = scratch (see attn_dsplit), d = out [heads][hd].
+//   u0=heads, u1=hd, u2=nsplit.
+export fn attn_dmerge() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    const hd = pc.u1;
+    if (idx >= pc.u0 * hd) return;
+    const h = idx / hd;
+    const ch = idx % hd;
+    const nsplit = pc.u2;
+    const stride = hd + 2;
+    const base = h * nsplit * stride;
+    var mx: f32 = -3.0e38;
+    var i: u32 = 0;
+    while (i < nsplit) : (i += 1) mx = @max(mx, a.data[base + i * stride]);
+    var dsum: f32 = 0;
+    var o: f32 = 0;
+    i = 0;
+    while (i < nsplit) : (i += 1) {
+        const w = @exp(a.data[base + i * stride] - mx);
+        dsum += a.data[base + i * stride + 1] * w;
+        o += a.data[base + i * stride + 2 + ch] * w;
+    }
+    d.data[idx] = o / dsum;
+}
+
+// copy: b[u2 + idx] = a[u3 + idx]. Contiguous copy with destination and
+// source element offsets; keeps tap snapshots / KV-cache appends / last-row
+// extraction inside one batch (tensorCopy would flush it). u0 = element
+// count, u2 = dest offset, u3 = src offset.
 export fn copy() callconv(.spirv_kernel) void {
     decorate();
     const idx = gpu.global_invocation_id[0];
     if (idx >= pc.u0) return;
-    b.data[pc.u2 + idx] = a.data[idx];
+    b.data[pc.u2 + idx] = a.data[pc.u3 + idx];
 }
 
 // --- GEMM-ified attention (scores buffer batched over head groups) -------

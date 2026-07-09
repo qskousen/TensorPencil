@@ -14,6 +14,7 @@ pub const models = @import("models.zig");
 pub const sampler = @import("sampler.zig");
 pub const pipeline = @import("pipeline.zig");
 pub const gpu = @import("gpu.zig");
+pub const llm = @import("llm.zig");
 
 pub const DType = dtype.DType;
 pub const Shape = tensor.Shape;
@@ -33,4 +34,5 @@ test {
     _ = sampler;
     _ = pipeline;
     _ = gpu;
+    _ = llm;
 }
