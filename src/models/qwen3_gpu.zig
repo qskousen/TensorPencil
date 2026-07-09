@@ -351,13 +351,30 @@ pub const VulkanLM = struct {
         self.* = undefined;
     }
 
+    pub fn cached(self: *const VulkanLM) usize {
+        return self.len;
+    }
+
     pub fn remaining(self: *const VulkanLM) usize {
         return self.capacity - self.len;
     }
 
-    /// Forward `ids` at positions [len, len+ids.len) (prefill first, then
-    /// single-token decode), then write last-position vocab logits.
+    /// Forward `ids` at positions [len, len+ids.len), then write
+    /// last-position vocab logits. The square attention path only handles a
+    /// fresh cache (attn_scores is seq x seq from position 0), so multi-turn
+    /// follow-up prefills run token-by-token through the flash-decoding path;
+    /// a fresh-cache prompt longer than the activation buffers chunks by
+    /// max_rows (first chunk square, the rest single-token).
     pub fn step(self: *VulkanLM, io: std.Io, ids: []const u32, logits: []f32) !void {
+        var off: usize = 0;
+        while (off < ids.len) {
+            const n = if (self.len == 0) @min(self.max_rows, ids.len) else 1;
+            try self.stepChunk(io, ids[off..][0..n], logits);
+            off += n;
+        }
+    }
+
+    fn stepChunk(self: *VulkanLM, io: std.Io, ids: []const u32, logits: []f32) !void {
         _ = io;
         const gpa = self.gpa;
         const ctx = self.ctx;

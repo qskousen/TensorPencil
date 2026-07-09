@@ -236,3 +236,16 @@ if (result.term != .Exited or result.term.Exited != 0) { ... }
 // New (0.16.0)
 if (result.term != .exited or result.term.exited != 0) { ... }
 ```
+
+## `Io.Reader.takeDelimiterExclusive` does not consume the delimiter
+
+`takeDelimiterExclusive('\n')` returns the line and tosses only `line.len`
+bytes — the `\n` stays buffered, so the next call returns an empty line
+forever (infinite loop hazard in read-line REPLs). For line reading use
+`takeDelimiter`, which consumes the delimiter and returns `null` at EOF:
+
+```zig
+var stdin_reader: Io.File.Reader = .initStreaming(.stdin(), io, &buf);
+const stdin = &stdin_reader.interface;
+const line = (try stdin.takeDelimiter('\n')) orelse break; // null = EOF
+```

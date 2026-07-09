@@ -36,10 +36,13 @@ pub fn capacityFor(opts: Options, prompt_len: usize) !usize {
 ///
 /// `model` is a pointer to any backend stepper exposing
 ///   step(io, ids_new: []const u32, logits: []f32) — forward the new tokens
-///     at the next cache positions and write last-position vocab logits, and
+///     at the next cache positions and write last-position vocab logits,
+///   cached() usize — committed cache length, and
 ///   remaining() usize — cache room left.
-/// The first step call carries the whole prompt (prefill); each later call
-/// carries the single sampled token (decode).
+/// The first step call carries the not-yet-cached prompt suffix (prefill —
+/// the whole prompt on turn one, only the new turn's tokens on later turns
+/// of a multi-turn session); each later call carries the single sampled
+/// token (decode).
 pub fn generate(
     model: anytype,
     tok: *const Tokenizer,
@@ -55,7 +58,9 @@ pub fn generate(
     var sampler = sample.Sampler.init(opts.sampling, opts.seed);
     var stream: Utf8Stream = .{};
 
-    try model.step(io, ids.items, logits);
+    const new = ids.items[model.cached()..];
+    if (new.len == 0 or new.len > model.remaining()) return error.ContextFull;
+    try model.step(io, new, logits);
     var n: usize = 0;
     while (n < opts.max_new_tokens) {
         const next = sampler.next(logits, ids.items);
@@ -68,6 +73,7 @@ pub fn generate(
             try stream.write(w, bytes);
             try w.flush();
         }
+        if (n == opts.max_new_tokens) break; // budget spent: skip the forward whose logits nobody reads
         if (model.remaining() == 0) break; // context window full
         try model.step(io, &.{next}, logits);
     }
@@ -97,6 +103,10 @@ pub const CpuModel = struct {
         self.freqs.deinit(self.gpa);
         self.gpa.free(self.last_hidden);
         self.* = undefined;
+    }
+
+    pub fn cached(self: *const CpuModel) usize {
+        return self.cache.len;
     }
 
     pub fn remaining(self: *const CpuModel) usize {
@@ -172,6 +182,45 @@ test "utf8 prefix scanner" {
     try std.testing.expectEqual(@as(usize, 4), completeUtf8Prefix("ab\xC3\xA9"));
     try std.testing.expectEqual(@as(usize, 1), completeUtf8Prefix("a\xF0\x9F\x98"));
     try std.testing.expectEqual(@as(usize, 0), completeUtf8Prefix("\xF0\x9F"));
+}
+
+// Multi-turn cache continuation: a second generate() on the same model must
+// prefill only the new turn's tokens (kept tiny — gated on the model).
+test "multi-turn generation continues the cache" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const safetensors = @import("../safetensors.zig");
+    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
+
+    var st = try safetensors.SafeTensors.open(gpa, io, te_path);
+    defer st.deinit();
+    var lm = try qwen3.CausalLM.load(gpa, &st);
+    defer lm.deinit();
+    var tok = try Tokenizer.init(gpa);
+    defer tok.deinit();
+
+    const opts: Options = .{ .max_new_tokens = 1, .sampling = .{ .temperature = 0 } };
+    var model = try CpuModel.init(gpa, &lm, 128);
+    defer model.deinit();
+
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(gpa);
+    try chat.appendUser(&tok, gpa, "Say hi.", &ids);
+    try chat.openAssistant(&tok, gpa, &ids);
+    _ = try generate(&model, &tok, io, gpa, &ids, opts, null);
+    // A max-tokens-truncated turn leaves exactly the last sampled token
+    // uncached (it is prefilled with the next turn instead).
+    try std.testing.expectEqual(ids.items.len - 1, model.cached());
+
+    // Second turn: only the new tokens are prefilled, on top of the cache.
+    try chat.closeAssistant(gpa, &ids);
+    try chat.appendUser(&tok, gpa, "Again.", &ids);
+    try chat.openAssistant(&tok, gpa, &ids);
+    const before = model.cached();
+    _ = try generate(&model, &tok, io, gpa, &ids, opts, null);
+    try std.testing.expect(model.cached() > before);
+    try std.testing.expectEqual(ids.items.len - 1, model.cached());
 }
 
 // End-to-end mechanics (forward -> lm_head -> argmax -> append) against the

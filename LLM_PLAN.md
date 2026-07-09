@@ -9,10 +9,17 @@ Usage (all sampling/backend parameters configurable; see `tp-llm` usage text):
 ```
 zig build -Doptimize=ReleaseFast
 ./zig-out/bin/tp-llm --model <qwen3VL-4B.safetensors> \
-    --prompt "..." [--backend cpu|zig-cuda|cuda|vulkan] [--system "..."] \
+    [--prompt "..."] [--backend cpu|zig-cuda|cuda|vulkan] [--system "..."] \
     [--max-tokens N] [--max-context N] [--temperature T] [--top-k K] \
     [--top-p P] [--repeat-penalty R] [--seed S] [--greedy] [--profile]
 ```
+
+Without `--prompt`, tp-llm runs an interactive multi-turn chat REPL: each
+stdin line is a user turn, the KV cache carries the whole conversation
+(follow-up turns prefill only their new tokens; on Vulkan they run through
+the flash-decoding path token-by-token, since the square attention kernel
+assumes position 0), and per-turn tok/s + context usage are printed. `/exit`
+or Ctrl-D quits; the session also ends when the context window fills.
 
 ## Why this is cheap: the text encoder is already an LLM
 
@@ -121,7 +128,7 @@ Per-token cost drops from O(n²) to O(n).
 *Accept:* identical output to M1 for the same prompt/seed; unit tests for
 cache append/read and qlen≠kvlen attention vs the full-seq reference.
 
-### M3 — sampling, chat REPL, streaming
+### M3 — sampling, chat REPL, streaming (REPL landed with the post-M4 follow-up)
 `sample.zig` (temperature/top-k/top-p/repetition penalty, seeded via
 `torch_rng` or plain PRNG), interactive multi-turn REPL in `llm_main.zig`,
 streamed stdout via `std.Io.Writer` with UTF-8-safe incremental detok,

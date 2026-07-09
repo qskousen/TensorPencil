@@ -120,7 +120,8 @@ Measured on an RTX 3090 at 1120×1680, 4 steps, INT8 ConvRot, vulkan backend:
 Added another executable that processes LLM models, for fun: `tp-llm`. Only tested with the already-used Qwen 3 VL 4b
 text encoder model so far, but should generalize to other Qwen 3 models easily.
 
-Doesn't have REPL yet either, so it is single-turn only. Runs on all four backends:
+Can run in single-response mode if you specify `--prompt <prompt>`, or runs in REPL (conversation) mode if you skip
+the prompt. In REPL mode, type `/exit` to exit. Runs on all four backends:
 
 | Backend  | tok/s |
 |:---------|:------|

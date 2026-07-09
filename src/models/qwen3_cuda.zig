@@ -203,15 +203,28 @@ pub const CudaLM = struct {
         self.* = undefined;
     }
 
+    pub fn cached(self: *const CudaLM) usize {
+        return self.len;
+    }
+
     pub fn remaining(self: *const CudaLM) usize {
         return self.capacity - self.len;
     }
 
-    /// Forward `ids` at positions [len, len+ids.len) (prefill on the first
-    /// call, single-token decode after), then write last-position vocab
-    /// logits. CPU work per step: embedding gather up, hidden-state row down,
-    /// final norm + LM head.
+    /// Forward `ids` at positions [len, len+ids.len), then write
+    /// last-position vocab logits. Multi-turn prefills longer than the
+    /// activation buffers run as max_rows-sized chunks (each chunk's LM head
+    /// is wasted except the last — negligible next to the layer GEMMs).
     pub fn step(self: *CudaLM, io: std.Io, ids: []const u32, logits: []f32) !void {
+        var off: usize = 0;
+        while (off < ids.len) {
+            const n = @min(self.max_rows, ids.len - off);
+            try self.stepChunk(io, ids[off..][0..n], logits);
+            off += n;
+        }
+    }
+
+    fn stepChunk(self: *CudaLM, io: std.Io, ids: []const u32, logits: []f32) !void {
         const gpa = self.gpa;
         const be = self.be;
         const seq = ids.len;

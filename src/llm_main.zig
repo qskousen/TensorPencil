@@ -1,7 +1,9 @@
 //! tp-llm — LLM chat CLI, a thin driver over the TensorPencil library.
 //!
-//! M1 (LLM_PLAN.md): greedy decoding with full-sequence recompute per token.
-//! Use -Doptimize=ReleaseFast; Debug is far too slow for a 4B model.
+//! One-shot (--prompt) or interactive multi-turn chat (no --prompt) over the
+//! Qwen3-VL-4B stack on the cpu / vulkan / zig-cuda / cuda backends; see
+//! LLM_PLAN.md. Use -Doptimize=ReleaseFast; Debug is far too slow for a 4B
+//! model.
 
 const std = @import("std");
 const Io = std.Io;
@@ -21,6 +23,8 @@ const usage =
     \\Sampling defaults follow Qwen3 non-thinking recommendations:
     \\temperature 0.7, top-k 20, top-p 0.8. --greedy = --temperature 0.
     \\Seed defaults to the clock; pass --seed for reproducible output.
+    \\Without --prompt, tp-llm runs an interactive multi-turn chat (one user
+    \\turn per stdin line; /exit or Ctrl-D quits).
     \\
 ;
 
@@ -88,11 +92,6 @@ pub fn main(init: std.process.Init) !void {
         try stdout.flush();
         return error.MissingArgument;
     };
-    const user_prompt = prompt orelse {
-        try stdout.writeAll(usage);
-        try stdout.flush();
-        return error.MissingArgument;
-    };
 
     var st = try TensorPencil.SafeTensors.open(arena, io, path);
     defer st.deinit();
@@ -101,19 +100,28 @@ pub fn main(init: std.process.Init) !void {
     var tok = try TensorPencil.tokenizer.Tokenizer.init(arena);
     defer tok.deinit();
 
+    // With --prompt: one-shot. Without: interactive chat (one user turn per
+    // line; the KV cache carries the whole conversation across turns).
     var ids: std.ArrayList(u32) = .empty;
     defer ids.deinit(gpa);
     if (system) |s| try llm.chat.appendSystem(&tok, gpa, s, &ids);
-    try llm.chat.appendUser(&tok, gpa, user_prompt, &ids);
-    try llm.chat.openAssistant(&tok, gpa, &ids);
+    if (prompt) |p| {
+        try llm.chat.appendUser(&tok, gpa, p, &ids);
+        try llm.chat.openAssistant(&tok, gpa, &ids);
+    }
 
-    try stdout.print("[{s} backend, {d} prompt tokens, max {d} new, temp {d:.2}, seed {d}]\n\n", .{
+    try stdout.print("[{s} backend, {d} prompt tokens, max {d} new/turn, temp {d:.2}, seed {d}]\n", .{
         @tagName(backend), ids.items.len, opts.max_new_tokens, opts.sampling.temperature, opts.seed,
     });
+    if (prompt == null) try stdout.writeAll("[interactive chat: empty line to re-prompt, /exit or Ctrl-D to quit]\n");
+    try stdout.writeAll("\n");
     try stdout.flush();
 
-    const capacity = try llm.engine.capacityFor(opts, ids.items.len);
-    const prompt_len = ids.items.len;
+    // One-shot sizes the cache to the request; a chat session gets the whole
+    // window. GPU activation buffers cover the first prefill (turn one for
+    // one-shot; longer inputs chunk).
+    const capacity = if (prompt == null) opts.max_context else try llm.engine.capacityFor(opts, ids.items.len);
+    const prompt_len = if (prompt == null) @min(512, capacity) else ids.items.len;
     const t_init = Io.Clock.real.now(io).nanoseconds;
     var t0: i96 = undefined; // set after backend/model setup: generation only
     const n = switch (backend) {
@@ -121,7 +129,7 @@ pub fn main(init: std.process.Init) !void {
             var model = try llm.engine.CpuModel.init(gpa, &lm, capacity);
             defer model.deinit();
             t0 = Io.Clock.real.now(io).nanoseconds;
-            break :blk try llm.engine.generate(&model, &tok, io, gpa, &ids, opts, stdout);
+            break :blk try runSession(&model, &tok, io, gpa, &ids, opts, stdout, prompt);
         },
         .@"zig-cuda", .cuda => blk: {
             const cuda_be = TensorPencil.gpu.cuda.Backend;
@@ -131,7 +139,7 @@ pub fn main(init: std.process.Init) !void {
             var model = try qwen3_cuda.CudaLM.init(gpa, be, &lm, capacity, prompt_len);
             defer model.deinit();
             t0 = Io.Clock.real.now(io).nanoseconds;
-            const count = try llm.engine.generate(&model, &tok, io, gpa, &ids, opts, stdout);
+            const count = try runSession(&model, &tok, io, gpa, &ids, opts, stdout, prompt);
             if (profile) {
                 try stdout.print("\n\nprofile (device, sync-per-op):\n", .{});
                 inline for (@typeInfo(cuda_be.ProfCat).@"enum".fields, 0..) |f, ci| {
@@ -147,19 +155,83 @@ pub fn main(init: std.process.Init) !void {
             var model = try TensorPencil.models.qwen3_gpu.VulkanLM.init(gpa, ctx, &lm, capacity, prompt_len);
             defer model.deinit();
             t0 = Io.Clock.real.now(io).nanoseconds;
-            break :blk try llm.engine.generate(&model, &tok, io, gpa, &ids, opts, stdout);
+            break :blk try runSession(&model, &tok, io, gpa, &ids, opts, stdout, prompt);
         },
     };
     const t_end = Io.Clock.real.now(io).nanoseconds;
     const setup_s = @as(f64, @floatFromInt(t0 - t_init)) / 1e9;
     const elapsed_s = @as(f64, @floatFromInt(t_end - t0)) / 1e9;
 
-    // Generation time includes the prefill + first-use weight upload; setup
-    // is backend/model initialization.
-    try stdout.print("\n\n[{d} tokens in {d:.1}s, {d:.2} tok/s; setup {d:.1}s]\n", .{
-        n, elapsed_s, @as(f64, @floatFromInt(n)) / elapsed_s, setup_s,
-    });
+    // One-shot summary (generation time includes the prefill + first-use
+    // weight upload; setup is backend/model initialization). Chat sessions
+    // print per-turn stats instead — elapsed here would count typing time.
+    if (prompt != null) {
+        try stdout.print("\n\n[{d} tokens in {d:.1}s, {d:.2} tok/s; setup {d:.1}s]\n", .{
+            n, elapsed_s, @as(f64, @floatFromInt(n)) / elapsed_s, setup_s,
+        });
+    } else {
+        try stdout.print("[session over: {d} tokens generated; setup was {d:.1}s]\n", .{ n, setup_s });
+    }
     try stdout.flush();
+}
+
+/// Drive one generation (--prompt) or an interactive chat loop (no
+/// --prompt): each stdin line becomes a user turn, the assistant's reply
+/// streams back, and the turn is sealed so the KV cache carries the whole
+/// conversation. Returns total tokens generated.
+fn runSession(
+    model: anytype,
+    tok: *const TensorPencil.tokenizer.Tokenizer,
+    io: Io,
+    gpa: std.mem.Allocator,
+    ids: *std.ArrayList(u32),
+    opts: llm.engine.Options,
+    stdout: *Io.Writer,
+    prompt: ?[]const u8,
+) !usize {
+    if (prompt != null) {
+        return llm.engine.generate(model, tok, io, gpa, ids, opts, stdout);
+    }
+
+    var stdin_buffer: [64 * 1024]u8 = undefined;
+    var stdin_reader: Io.File.Reader = .initStreaming(.stdin(), io, &stdin_buffer);
+    const stdin = &stdin_reader.interface;
+
+    var total: usize = 0;
+    while (true) {
+        try stdout.writeAll("\n> ");
+        try stdout.flush();
+        const raw = (try stdin.takeDelimiter('\n')) orelse break; // null = EOF
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        if (std.mem.eql(u8, line, "/exit")) break;
+
+        try llm.chat.appendUser(tok, gpa, line, ids);
+        try llm.chat.openAssistant(tok, gpa, ids);
+        const t0 = Io.Clock.real.now(io).nanoseconds;
+        const n = llm.engine.generate(model, tok, io, gpa, ids, opts, stdout) catch |err| switch (err) {
+            error.ContextFull => {
+                try stdout.writeAll("\n[context window full]\n");
+                try stdout.flush();
+                break;
+            },
+            else => return err,
+        };
+        try llm.chat.closeAssistant(gpa, ids);
+        total += n;
+
+        const dt = @as(f64, @floatFromInt(Io.Clock.real.now(io).nanoseconds - t0)) / 1e9;
+        try stdout.print("\n[{d} tok, {d:.1} tok/s, ctx {d}/{d}]\n", .{
+            n, @as(f64, @floatFromInt(n)) / dt, model.cached(), model.cached() + model.remaining(),
+        });
+        try stdout.flush();
+        if (model.remaining() == 0) {
+            try stdout.writeAll("[context window full]\n");
+            try stdout.flush();
+            break;
+        }
+    }
+    return total;
 }
 
 const BackendKind = enum { cpu, @"zig-cuda", cuda, vulkan };
