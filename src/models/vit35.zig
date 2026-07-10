@@ -191,8 +191,41 @@ pub const Vit = struct {
         }
     };
 
-    /// Encode interleaved RGB pixels to LLM embeddings.
-    pub fn encode(self: *const Vit, io: std.Io, gpa: std.mem.Allocator, rgb: []const u8, width: usize, height: usize) !Encoded {
+    /// Host-side prep shared by the CPU and CUDA encode paths: smart resize
+    /// + preprocess, the patch matrix in 2x2-merged token order (with
+    /// per-token patch coords), the interpolated position table, and the
+    /// 2-D vision-rope cos/sin tables.
+    pub const Prepared = struct {
+        /// Patch grid dims (pre-merge).
+        pw: usize,
+        ph: usize,
+        /// [np][3*patch*patch] patch rows, merged token order.
+        patches: []f32,
+        /// Per-token patch coordinates (position lookup + rope).
+        py: []u32,
+        px: []u32,
+        /// [ph][pw][dim] interpolated learned positions (grid order).
+        pos: []f32,
+        /// [max(pw,ph)][half] rope tables; half = headDim()/4 pairs per axis.
+        rope_cos: []f32,
+        rope_sin: []f32,
+
+        pub fn np(self: *const Prepared) usize {
+            return self.pw * self.ph;
+        }
+
+        pub fn deinit(self: *Prepared, gpa: std.mem.Allocator) void {
+            gpa.free(self.patches);
+            gpa.free(self.py);
+            gpa.free(self.px);
+            gpa.free(self.pos);
+            gpa.free(self.rope_cos);
+            gpa.free(self.rope_sin);
+            self.* = undefined;
+        }
+    };
+
+    pub fn prepare(self: *const Vit, gpa: std.mem.Allocator, rgb: []const u8, width: usize, height: usize) !Prepared {
         const cfg = self.cfg;
         const align_px = cfg.patch * cfg.merge;
 
@@ -204,17 +237,16 @@ pub const Vit = struct {
         const pw = target.w / cfg.patch;
         const ph = target.h / cfg.patch;
         const np = pw * ph;
-        const hd = cfg.headDim();
 
         // Patch matrix in the 2x2-merged token order, plus per-token patch
         // coordinates for the vision rope.
         const kdim = 3 * cfg.patch * cfg.patch;
         const patches = try gpa.alloc(f32, np * kdim);
-        defer gpa.free(patches);
+        errdefer gpa.free(patches);
         const py = try gpa.alloc(u32, np);
-        defer gpa.free(py);
+        errdefer gpa.free(py);
         const px = try gpa.alloc(u32, np);
-        defer gpa.free(px);
+        errdefer gpa.free(px);
         {
             var t: usize = 0;
             var y: usize = 0;
@@ -241,28 +273,19 @@ pub const Vit = struct {
             }
         }
 
-        // Patch embed GEMM + interpolated position embedding.
-        var x = try gpa.alloc(f32, np * cfg.dim);
-        defer gpa.free(x);
-        try ops.matmul.matmul(io, gpa, x, patches, np, Weight.fromF32(self.patch_w, cfg.dim, kdim), self.patch_b);
         const pos_interp = try interpolatePos(gpa, self.pos_embd, cfg.pos_grid, cfg.dim, pw, ph);
-        defer gpa.free(pos_interp);
-        for (0..np) |t| {
-            const src = pos_interp[(py[t] * pw + px[t]) * cfg.dim ..][0..cfg.dim];
-            const dst = x[t * cfg.dim ..][0..cfg.dim];
-            for (dst, src) |*d, s| d.* += s;
-        }
+        errdefer gpa.free(pos_interp);
 
         // Vision rope tables: pair p of 2*half pairs, theta = pos * base^(-2p'/n_dims)
         // with p' resetting at the section boundary (pairs 0..half-1 keyed by
         // row, half..2*half-1 by column); rotation pairs (d, d + n_dims).
-        const n_dims = hd / 2; // 36
+        const n_dims = cfg.headDim() / 2; // 36
         const half = n_dims / 2; // 18 pairs per axis
         const max_pos = @max(pw, ph);
         const rope_cos = try gpa.alloc(f32, max_pos * half);
-        defer gpa.free(rope_cos);
+        errdefer gpa.free(rope_cos);
         const rope_sin = try gpa.alloc(f32, max_pos * half);
-        defer gpa.free(rope_sin);
+        errdefer gpa.free(rope_sin);
         for (0..max_pos) |p| {
             for (0..half) |i| {
                 const theta = @as(f64, @floatFromInt(p)) * std.math.pow(f64, 10000.0, -2.0 * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(n_dims)));
@@ -270,6 +293,46 @@ pub const Vit = struct {
                 rope_sin[p * half + i] = @floatCast(@sin(theta));
             }
         }
+
+        return .{
+            .pw = pw,
+            .ph = ph,
+            .patches = patches,
+            .py = py,
+            .px = px,
+            .pos = pos_interp,
+            .rope_cos = rope_cos,
+            .rope_sin = rope_sin,
+        };
+    }
+
+    /// Encode interleaved RGB pixels to LLM embeddings.
+    pub fn encode(self: *const Vit, io: std.Io, gpa: std.mem.Allocator, rgb: []const u8, width: usize, height: usize) !Encoded {
+        const cfg = self.cfg;
+        const hd = cfg.headDim();
+        const half = hd / 4;
+
+        var prep = try self.prepare(gpa, rgb, width, height);
+        defer prep.deinit(gpa);
+        const pw = prep.pw;
+        const ph = prep.ph;
+        const np = prep.np();
+        const py = prep.py;
+        const px = prep.px;
+        const kdim = 3 * cfg.patch * cfg.patch;
+
+        // Patch embed GEMM + interpolated position embedding.
+        var x = try gpa.alloc(f32, np * cfg.dim);
+        defer gpa.free(x);
+        try ops.matmul.matmul(io, gpa, x, prep.patches, np, Weight.fromF32(self.patch_w, cfg.dim, kdim), self.patch_b);
+        for (0..np) |t| {
+            const src = prep.pos[(py[t] * pw + px[t]) * cfg.dim ..][0..cfg.dim];
+            const dst = x[t * cfg.dim ..][0..cfg.dim];
+            for (dst, src) |*d, s| d.* += s;
+        }
+
+        const rope_cos = prep.rope_cos;
+        const rope_sin = prep.rope_sin;
 
         var s = try Scratch.init(gpa, np, cfg);
         defer s.deinit(gpa);
@@ -322,7 +385,8 @@ pub const Vit = struct {
 /// The 2-D vision rope: per token, pairs (d, d+n_dims) for d < n_dims, the
 /// first `half` pairs keyed by the token's patch row, the next `half` by its
 /// column (llama.cpp GGML_ROPE_TYPE_VISION with sections {18,18,18,18}).
-fn applyVisionRope(qk: []f32, np: usize, n_heads: usize, hd: usize, py: []const u32, px: []const u32, cos: []const f32, sin: []const f32, half: usize) void {
+/// Pub as the CPU reference for the CUDA rope_vision kernel.
+pub fn applyVisionRope(qk: []f32, np: usize, n_heads: usize, hd: usize, py: []const u32, px: []const u32, cos: []const f32, sin: []const f32, half: usize) void {
     const n_dims = hd / 2;
     for (0..np) |t| {
         const yc = cos[py[t] * half ..][0..half];

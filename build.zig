@@ -163,6 +163,25 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    // Image DECODE for tp-llm (--image / @mentions): system libvips behind
+    // a tiny C shim (its varargs C API is un-importable directly), ported
+    // from DiffKeep. Linked into the tp-llm EXECUTABLE only — the
+    // TensorPencil library module stays pure Zig. Building needs
+    // libvips-dev + pkg-config.
+    const vips_module = b.createModule(.{
+        .root_source_file = b.path("src/vips.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    vips_module.addCSourceFile(.{
+        .file = b.path("lib/vips/vips_helper.c"),
+        .flags = &.{},
+    });
+    vips_module.addIncludePath(b.path("lib/vips"));
+    vips_module.linkSystemLibrary("vips", .{});
+    llm_exe.root_module.addImport("vips", vips_module);
+
     b.installArtifact(llm_exe);
 
     const run_llm_step = b.step("run-llm", "Run tp-llm");

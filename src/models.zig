@@ -7,6 +7,7 @@ pub const qwen3 = @import("models/qwen3.zig");
 pub const qwen35 = @import("models/qwen35.zig");
 pub const qwen35_cuda = @import("models/qwen35_cuda.zig");
 pub const vit35 = @import("models/vit35.zig");
+pub const vit35_cuda = @import("models/vit35_cuda.zig");
 pub const qwen3_gpu = @import("models/qwen3_gpu.zig");
 pub const qwen3_cuda = @import("models/qwen3_cuda.zig");
 pub const eagle3 = @import("models/eagle3.zig");
@@ -23,6 +24,7 @@ test {
     _ = qwen35;
     _ = qwen35_cuda;
     _ = vit35;
+    _ = vit35_cuda;
     _ = qwen3_gpu;
     _ = qwen3_cuda;
     _ = eagle3;

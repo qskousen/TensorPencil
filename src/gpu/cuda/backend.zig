@@ -124,6 +124,11 @@ const WeightEntry = struct {
     last_use: u64 = 0,
     /// Pinned entries (first-touch, up to pin_budget) are immune to eviction.
     pinned: bool = false,
+    /// Cached while a weight scope was open (weightScopeBegin): released as
+    /// a group by weightScopeEnd. The GPU ViT tags its weights so a
+    /// mid-session image encode can drop exactly them — not the resident
+    /// LLM weights a captured decode graph has baked pointers into.
+    scoped: bool = false,
     /// Prefetched but not yet read by any op. Shielded from eviction: evicting
     /// now would discard a transfer that hasn't paid for itself, and the op it
     /// was prefetched for would re-upload it synchronously (double transfer).
@@ -175,6 +180,9 @@ pub const Backend = struct {
     // evicted and re-uploaded on next use — see reserveForWeights/evictOneWeight).
     weights: std.AutoHashMapUnmanaged(usize, WeightEntry) = .empty,
     use_counter: u64 = 0,
+    /// A weight scope is open: new cache entries are tagged for group
+    /// release (see WeightEntry.scoped).
+    weight_scope: bool = false,
     /// --vram-budget ceiling on our own device footprint (bytes); 0 = no cap
     /// (only the live cuMemGetInfo headroom bounds the weight cache).
     budget_override: u64 = 0,
@@ -627,7 +635,7 @@ pub const Backend = struct {
         const gen = self.pf_gen;
         self.pf_ring[head % pf_ring_sz] = .{ .bytes = bytes, .db = db, .ev = ev, .gen = gen };
         self.pf_head.store(head + 1, .release); // publish the slot to the thread
-        self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .pinned = pin, .awaiting_use = true, .upload_ev = ev, .pf_gen = gen }) catch {};
+        self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .pinned = pin, .scoped = self.weight_scope, .awaiting_use = true, .upload_ev = ev, .pf_gen = gen }) catch {};
     }
 
     // ---- buffers ------------------------------------------------------------
@@ -866,6 +874,13 @@ pub const Backend = struct {
 
     pub fn ensureDeviceBuffer(self: *Backend, db: *DeviceBuffer, size: u64) Error!void {
         if (db.size >= size and db.buf != .null_handle) return;
+        // Queued-but-unexecuted kernels may still read the old buffer;
+        // cuMemFree does not wait for them (use-after-free, intermittent
+        // garbage under load — the CUDA twin of the Vulkan lab invariant
+        // "ensureDeviceBuffer flushes the batch before reallocating").
+        // Growth is rare (scratch reaches its high-water mark quickly), so
+        // the sync is cheap.
+        if (db.buf != .null_handle) _ = self.ctx.api.cuStreamSynchronize(self.ctx.stream);
         self.tensorDestroy(db);
         db.* = try self.tensorCreate(size);
     }
@@ -901,6 +916,40 @@ pub const Backend = struct {
         self.tensorDestroy(&self.attn_p);
         self.tensorDestroy(&self.attn_md);
         self.tensorDestroy(&self.attn_oh);
+    }
+
+    /// Open a weight scope: weights cached from now on are tagged and
+    /// released together by weightScopeEnd. Pre-existing entries (cache
+    /// hits during the scope) are untouched — the GPU ViT wraps its encode
+    /// in a scope so a mid-session image drops exactly the ViT's weights,
+    /// not the resident LLM weights whose device pointers a captured
+    /// decode graph has baked in.
+    pub fn weightScopeBegin(self: *Backend) void {
+        self.weight_scope = true;
+    }
+
+    /// Free every weight cached since weightScopeBegin and drop its cache
+    /// entry (the scope's host-pointer keys may die with the caller's
+    /// arena). Syncs first: recorded ops may still read the buffers. Not
+    /// an eviction — the `evictions` counter (the decode-graph guard)
+    /// stays untouched.
+    pub fn weightScopeEnd(self: *Backend) void {
+        self.weight_scope = false;
+        _ = self.ctx.api.cuStreamSynchronize(self.ctx.stream);
+        _ = self.ctx.api.cuStreamSynchronize(self.ctx.xfer_stream);
+        var doomed: std.ArrayListUnmanaged(usize) = .empty;
+        defer doomed.deinit(self.gpa);
+        var it = self.weights.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.scoped) doomed.append(self.gpa, e.key_ptr.*) catch return;
+        }
+        for (doomed.items) |key| {
+            const e = self.weights.fetchRemove(key).?.value;
+            if (e.upload_ev) |ev| self.ctx.eventDestroy(ev);
+            if (e.pinned) self.pinned_bytes -|= e.db.size else self.streamed_bytes -|= e.db.size;
+            var db = e.db;
+            self.tensorDestroy(&db);
+        }
     }
 
     pub fn evictWeights(self: *Backend) void {
@@ -951,7 +1000,7 @@ pub const Backend = struct {
         const pin = self.pinNew(bytes.len);
         const db = try self.weightBufAcquire(bytes.len, pin);
         try self.tensorUpload(db, bytes);
-        try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .pinned = pin });
+        try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .pinned = pin, .scoped = self.weight_scope });
         return db;
     }
 
@@ -1336,6 +1385,42 @@ pub const Backend = struct {
         try self.eltLaunch(f, qk, pos3s, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), packed_sections, @intCast(head_dim) }, .{ 0, 0 }, total);
     }
 
+    /// Classic LayerNorm with weight and bias (ViT ln1/ln2/post_ln):
+    /// out = (x - mean)/sqrt(var + eps) * w + b, one block per row. w/b are
+    /// host f32 slices cached device-side by pointer.
+    pub fn opLayerNorm(self: *Backend, x: DeviceBuffer, out: DeviceBuffer, w: []const f32, b: []const f32, rows: usize, dim: usize, eps: f32) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const w_db = try self.cachedWeight(std.mem.sliceAsBytes(w));
+        const b_db = try self.cachedWeight(std.mem.sliceAsBytes(b));
+        const f = try self.eltFn(elt.ln_bias_par_ptx, "ln_bias_par");
+        try self.rowLaunch(f, x, out, w_db, b_db, .{ @intCast(rows), @intCast(dim), 0, 0, 0, 0 }, .{ eps, 0 }, rows);
+    }
+
+    /// 2-D vision rope over [rows][n_heads][head_dim] q/k: rotation pairs
+    /// (p, p+2*half) for p < 2*half, first `half` pairs keyed by the token's
+    /// patch row (pos2[t][0]), the rest by its column (pos2[t][1]). Dims
+    /// beyond 4*half (head padding) pass through.
+    pub fn opRopeVision(self: *Backend, qk: DeviceBuffer, pos2: DeviceBuffer, freqs: DeviceBuffer, rows: usize, n_heads: usize, half: usize, sin_off: usize, head_dim: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        std.debug.assert(4 * half <= head_dim);
+        const f = try self.eltFn(elt.rope_vision_ptx, "rope_vision");
+        const total = rows * n_heads * 2 * half;
+        try self.eltLaunch(f, qk, pos2, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), @intCast(head_dim), 0 }, .{ 0, 0 }, total);
+    }
+
+    /// Restride per-head slices between packed layouts (ViT: pad 72-dim
+    /// heads to 128 for the tensor-core attention, and compact them back).
+    /// out[t][h][d < out_hd] = d < in_hd ? in[t*in_stride + in_off + h*in_hd + d] : 0.
+    pub fn opHeadPad(self: *Backend, out: DeviceBuffer, in: DeviceBuffer, rows: usize, heads: usize, out_hd: usize, in_hd: usize, in_stride: usize, in_off: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const f = try self.eltFn(elt.head_pad_ptx, "head_pad");
+        const total = rows * heads * out_hd;
+        try self.eltLaunch(f, in, out, null, null, .{ @intCast(total), @intCast(out_hd), @intCast(in_hd), @intCast(in_stride), @intCast(in_off), @intCast(heads) }, .{ 0, 0 }, total);
+    }
+
     /// Deinterleave the qwen35 attention q projection into query and gate
     /// ([q(hd) gate(hd)] per 2*hd-wide head slot).
     pub fn opDeinterleave2(self: *Backend, qg: DeviceBuffer, q: DeviceBuffer, gate: DeviceBuffer, total: usize, hd: usize) Error!void {
@@ -1464,6 +1549,49 @@ pub const Backend = struct {
         }
         const f_bc = try self.eltFn(elt.bias_compact_ptx, "bias_compact");
         try self.eltLaunch(f_bc, self.conv_c, b_db, dst, null, .{ @intCast(m * co), @intCast(co), @intCast(co_pad), @intCast(dst_off_elems), 0, 0 }, .{ 0, 0 }, m * co);
+    }
+
+    /// opConvF16's bf16-weight twin (ViT GEMMs over the mmproj's bf16
+    /// tensors): dst[m][co] f32 = src[m][k] f32 @ Wᵀ + bias, W bf16 [co][k]
+    /// straight from the GGUF mmap. Weight and activation convert to f16
+    /// zero-padded to the coop tile (co→128-mult, k→32-mult, m→128), then
+    /// bias_compact strips the pad + adds bias into the tight dst. Handles
+    /// any co/k (e.g. the ViT's ffn 4304).
+    pub fn opMatmulBf16(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: []const f32) Error!void {
+        self.ptic();
+        defer self.ptoc(.matmul);
+        std.debug.assert(w_bytes.len == co * k * 2 and bias.len == co);
+        const co_pad = std.mem.alignForward(usize, co, 128);
+        const k_pad = std.mem.alignForward(usize, k, 32);
+        const m_pad = std.mem.alignForward(usize, m, 128);
+        const w_db = try self.cachedWeight(w_bytes);
+        const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias));
+        try self.ensureDeviceBuffer(&self.conv_w16, co_pad * k_pad * 2);
+        try self.ensureDeviceBuffer(&self.conv_a16, m_pad * k_pad * 2);
+        try self.ensureDeviceBuffer(&self.conv_c, m_pad * co_pad * 4);
+        const f_wpad = try self.eltFn(elt.bf16_to_f16_pad2d_ptx, "bf16_to_f16_pad2d");
+        try self.eltLaunch(f_wpad, w_db, self.conv_w16, null, null, .{ @intCast(co_pad * k_pad), @intCast(k_pad), @intCast(co), @intCast(k), 0, 0 }, .{ 0, 0 }, co_pad * k_pad);
+        const f_apad = try self.eltFn(elt.f32_to_f16_pad2d_ptx, "f32_to_f16_pad2d");
+        try self.eltLaunch(f_apad, src, self.conv_a16, null, null, .{ @intCast(m_pad * k_pad), @intCast(k_pad), @intCast(m), @intCast(k), 0, 0 }, .{ 0, 0 }, m_pad * k_pad);
+        if (self.kernels == .libs) {
+            try self.ltMatmulF16(self.conv_c, self.conv_w16, self.conv_a16, co_pad, m_pad, k_pad);
+        } else {
+            const f_hg = try self.hgemmFn();
+            try self.launchHgemm(f_hg, self.conv_a16, self.conv_w16, self.conv_c, m_pad, co_pad, k_pad);
+        }
+        const f_bc = try self.eltFn(elt.bias_compact_ptx, "bias_compact");
+        try self.eltLaunch(f_bc, self.conv_c, b_db, dst, null, .{ @intCast(m * co), @intCast(co), @intCast(co_pad), 0, 0, 0 }, .{ 0, 0 }, m * co);
+    }
+
+    /// Free the shared GEMM conversion scratch (conv_w16/a16/c — the padded
+    /// f16 weight/activation planes and the padded f32 C). The GPU ViT calls
+    /// this after encoding so image-sized scratch doesn't stay resident
+    /// through the LLM session. Syncs first (recorded ops may still read it).
+    pub fn freeConvScratch(self: *Backend) void {
+        _ = self.ctx.api.cuStreamSynchronize(self.ctx.stream);
+        self.tensorDestroy(&self.conv_w16);
+        self.tensorDestroy(&self.conv_a16);
+        self.tensorDestroy(&self.conv_c);
     }
 
     /// cuDNN fused 3×3 NHWC convolution (.libs mode) — the VAE's big convs.
@@ -2531,6 +2659,194 @@ test "dp4a gemv quant kernels match CPU reference" {
                 for (row_f32, xnq[t * cols ..][0..cols]) |wv, xv| acc += @as(f64, wv) * xv;
                 try std.testing.expectApproxEqAbs(@as(f32, @floatCast(acc)), yn[t * rows + r], 2e-2);
             }
+        }
+    }
+}
+
+// Gated on a CUDA device: the ViT eltwise kernels (LayerNorm with bias,
+// 2-D vision rope, head restride) against their CPU references.
+test "vit eltwise kernels match CPU reference" {
+    const norm = @import("../../ops/norm.zig");
+    const vit35 = @import("../../models/vit35.zig");
+    const gpa = std.testing.allocator;
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+    var prng = std.Random.DefaultPrng.init(77);
+    const rand = prng.random();
+
+    // LayerNorm with weight+bias.
+    {
+        const rows = 5;
+        const dim = 384;
+        const x = try gpa.alloc(f32, rows * dim);
+        defer gpa.free(x);
+        for (x) |*v| v.* = rand.floatNorm(f32) * 2.0 + 0.5;
+        const w = try gpa.alloc(f32, dim);
+        defer gpa.free(w);
+        const b = try gpa.alloc(f32, dim);
+        defer gpa.free(b);
+        for (w) |*v| v.* = rand.floatNorm(f32);
+        for (b) |*v| v.* = rand.floatNorm(f32);
+
+        const x_d = try be.tensorCreate(rows * dim * 4);
+        const y_d = try be.tensorCreate(rows * dim * 4);
+        defer {
+            var xd = x_d;
+            var yd = y_d;
+            be.tensorDestroy(&xd);
+            be.tensorDestroy(&yd);
+        }
+        try be.tensorUpload(x_d, std.mem.sliceAsBytes(x));
+        try be.opLayerNorm(x_d, y_d, w, b, rows, dim, 1e-6);
+
+        const got = try gpa.alloc(f32, rows * dim);
+        defer gpa.free(got);
+        try be.tensorDownload(y_d, std.mem.sliceAsBytes(got));
+        const want = try gpa.alloc(f32, rows * dim);
+        defer gpa.free(want);
+        norm.layerNorm(want, x, w, b, 1e-6);
+        for (want, got) |e, a| try std.testing.expectApproxEqAbs(e, a, 1e-3);
+    }
+
+    // 2-D vision rope, packed heads (head_dim == 4*half).
+    const np = 6;
+    const heads = 2;
+    const half = 2;
+    const hd = 4 * half;
+    const max_pos = 4;
+    const py = [np]u32{ 0, 0, 1, 1, 2, 3 };
+    const px = [np]u32{ 0, 1, 0, 1, 3, 2 };
+    var freqs: [2 * max_pos * half]f32 = undefined; // cos then sin
+    const sin_off = max_pos * half;
+    for (0..max_pos) |p| {
+        for (0..half) |i| {
+            const theta = @as(f64, @floatFromInt(p)) * std.math.pow(f64, 10000.0, -2.0 * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(2 * half)));
+            freqs[p * half + i] = @floatCast(@cos(theta));
+            freqs[sin_off + p * half + i] = @floatCast(@sin(theta));
+        }
+    }
+    var q: [np * heads * hd]f32 = undefined;
+    for (&q) |*v| v.* = rand.floatNorm(f32);
+    var want_q: [q.len]f32 = undefined;
+    @memcpy(&want_q, &q);
+    vit35.applyVisionRope(&want_q, np, heads, hd, &py, &px, freqs[0..sin_off], freqs[sin_off..], half);
+
+    var pos2: [np * 2]u32 = undefined;
+    for (0..np) |t| {
+        pos2[t * 2] = py[t];
+        pos2[t * 2 + 1] = px[t];
+    }
+    const q_d = try be.tensorCreate(q.len * 4);
+    const pos2_d = try be.tensorCreate(pos2.len * 4);
+    const freqs_d = try be.tensorCreate(freqs.len * 4);
+    defer {
+        var qd = q_d;
+        var pd = pos2_d;
+        var fd = freqs_d;
+        be.tensorDestroy(&qd);
+        be.tensorDestroy(&pd);
+        be.tensorDestroy(&fd);
+    }
+    try be.tensorUpload(q_d, std.mem.sliceAsBytes(&q));
+    try be.tensorUpload(pos2_d, std.mem.sliceAsBytes(&pos2));
+    try be.tensorUpload(freqs_d, std.mem.sliceAsBytes(&freqs));
+    try be.opRopeVision(q_d, pos2_d, freqs_d, np, heads, half, sin_off, hd);
+    var got_q: [q.len]f32 = undefined;
+    try be.tensorDownload(q_d, std.mem.sliceAsBytes(&got_q));
+    for (want_q, got_q) |e, a| try std.testing.expectApproxEqAbs(e, a, 1e-5);
+
+    // Head restride: extract the middle third of a qkv-like row, pad
+    // 5-dim heads to 8, then compact back to the original.
+    {
+        const rows = 3;
+        const in_hd = 5;
+        const out_hd = 8;
+        const stride = 3 * heads * in_hd; // [q k v] fused rows
+        var src: [rows * stride]f32 = undefined;
+        for (&src) |*v| v.* = rand.floatNorm(f32);
+        const src_d = try be.tensorCreate(src.len * 4);
+        const pad_d = try be.tensorCreate(rows * heads * out_hd * 4);
+        const back_d = try be.tensorCreate(rows * heads * in_hd * 4);
+        defer {
+            var sd = src_d;
+            var pd = pad_d;
+            var bd = back_d;
+            be.tensorDestroy(&sd);
+            be.tensorDestroy(&pd);
+            be.tensorDestroy(&bd);
+        }
+        try be.tensorUpload(src_d, std.mem.sliceAsBytes(&src));
+        try be.opHeadPad(pad_d, src_d, rows, heads, out_hd, in_hd, stride, heads * in_hd);
+        var padded: [rows * heads * out_hd]f32 = undefined;
+        try be.tensorDownload(pad_d, std.mem.sliceAsBytes(&padded));
+        for (0..rows) |t| {
+            for (0..heads) |h| {
+                for (0..out_hd) |d| {
+                    const e: f32 = if (d < in_hd) src[t * stride + heads * in_hd + h * in_hd + d] else 0;
+                    try std.testing.expectEqual(e, padded[(t * heads + h) * out_hd + d]);
+                }
+            }
+        }
+        try be.opHeadPad(back_d, pad_d, rows, heads, in_hd, out_hd, heads * out_hd, 0);
+        var back: [rows * heads * in_hd]f32 = undefined;
+        try be.tensorDownload(back_d, std.mem.sliceAsBytes(&back));
+        for (0..rows) |t| {
+            for (0..heads) |h| {
+                for (0..in_hd) |d| {
+                    try std.testing.expectEqual(src[t * stride + heads * in_hd + h * in_hd + d], back[(t * heads + h) * in_hd + d]);
+                }
+            }
+        }
+    }
+}
+
+// Gated on a CUDA device: the bf16-weight f16 tensor-core GEMM (ViT blocks)
+// against a CPU f32 reference over the identical bf16-truncated weight.
+test "bf16 matmul op matches CPU reference" {
+    const gpa = std.testing.allocator;
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+    var prng = std.Random.DefaultPrng.init(99);
+    const rand = prng.random();
+
+    const m = 3;
+    const co = 40; // deliberately not 128-aligned
+    const k = 48; // deliberately not 32-aligned
+    const w16 = try gpa.alloc(u16, co * k);
+    defer gpa.free(w16);
+    for (w16) |*v| {
+        const f: f32 = rand.floatNorm(f32) * 0.5;
+        v.* = @intCast(@as(u32, @bitCast(f)) >> 16); // truncate to bf16
+    }
+    const bias = try gpa.alloc(f32, co);
+    defer gpa.free(bias);
+    for (bias) |*v| v.* = rand.floatNorm(f32);
+    const x = try gpa.alloc(f32, m * k);
+    defer gpa.free(x);
+    for (x) |*v| v.* = rand.floatNorm(f32);
+
+    const x_d = try be.tensorCreate(m * k * 4);
+    const y_d = try be.tensorCreate(m * co * 4);
+    defer {
+        var xd = x_d;
+        var yd = y_d;
+        be.tensorDestroy(&xd);
+        be.tensorDestroy(&yd);
+    }
+    try be.tensorUpload(x_d, std.mem.sliceAsBytes(x));
+    try be.opMatmulBf16(y_d, x_d, m, std.mem.sliceAsBytes(w16), co, k, bias);
+    const got = try gpa.alloc(f32, m * co);
+    defer gpa.free(got);
+    try be.tensorDownload(y_d, std.mem.sliceAsBytes(got));
+
+    for (0..m) |t| {
+        for (0..co) |r| {
+            var acc: f64 = bias[r];
+            for (0..k) |c| {
+                const wv: f32 = @bitCast(@as(u32, w16[r * k + c]) << 16);
+                acc += @as(f64, wv) * x[t * k + c];
+            }
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(acc)), got[t * co + r], 2e-2);
         }
     }
 }

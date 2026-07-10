@@ -645,6 +645,11 @@ pub const CudaLM = struct {
         // initial cachedWeight cuMemAlloc + upload are illegal on a
         // capturing stream.
         try self.embedGather();
+        // That upload (~874 MB for the 27B) may itself have evicted LRU
+        // weights under VRAM pressure — the capture would then re-upload
+        // them mid-capture (cuMemAlloc, illegal while capturing). Bail to
+        // per-op decode instead of starting a capture that must fail.
+        if (be.evictions != 0) return error.WeightsEvicted;
         try be.graphCaptureBegin();
         errdefer if (be.graphCaptureEnd()) |exec| be.graphDestroy(exec) else |_| {};
         try self.recordDecodeOps();

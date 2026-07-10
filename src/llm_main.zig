@@ -9,6 +9,7 @@ const std = @import("std");
 const Io = std.Io;
 
 const TensorPencil = @import("TensorPencil");
+const vips = @import("vips");
 const qwen3 = TensorPencil.models.qwen3;
 const qwen3_cuda = TensorPencil.models.qwen3_cuda;
 const llm = TensorPencil.llm;
@@ -22,7 +23,7 @@ const usage =
     \\              [--spec-k <n>] [--draft-model <qwen3.safetensors>]
     \\              [--eagle <eagle3.safetensors>] [--tree <nodes>]
     \\              [--vram-budget <GiB>|min]
-    \\              [--image <png> --mmproj <mmproj.gguf>]
+    \\              [--image <image> --mmproj <mmproj.gguf>]
     \\
     \\Sampling defaults follow Qwen3 non-thinking recommendations:
     \\temperature 0.7, top-k 20, top-p 0.8. --greedy = --temperature 0.
@@ -36,8 +37,14 @@ const usage =
     \\--tree drafts a branching token TREE per verify forward instead of a
     \\chain (up to <nodes> tree nodes, e.g. 16; requires --eagle and
     \\--greedy; still lossless — byte-identical to vanilla greedy).
-    \\Without --prompt, tp-llm runs an interactive multi-turn chat (one user
-    \\turn per stdin line; /exit or Ctrl-D quits).
+    \\Without --prompt, tp-llm runs an interactive multi-turn chat: Enter
+    \\sends the message, Shift-Enter (or Alt-Enter) inserts a newline, and
+    \\pasted multi-line text stays one message (bracketed paste); /exit or
+    \\Ctrl-D quits. Piped stdin reads one message per line. With --mmproj
+    \\on the zig-cuda/cuda backends, chat turns may attach images anywhere
+    \\in the message as @path.jpg or @"path with spaces.png" mentions
+    \\(multiple per turn; qwen35 GGUF models). Images decode via system
+    \\libvips: jpeg/png/webp/gif/tiff/bmp, EXIF rotation applied.
     \\--vram-budget caps device memory for the WEIGHTS (GPU backends). The
     \\first weights touched are pinned resident up to the cap (minus slack
     \\for in-flight streamed weights); the remainder streams from the
@@ -186,7 +193,7 @@ pub fn main(init: std.process.Init) !void {
                 return error.InvalidArgument;
             }
             if (prompt == null) {
-                try stdout.writeAll("--image requires --prompt (one-shot; no image chat yet)\n");
+                try stdout.writeAll("--image requires --prompt (one-shot); in interactive chat, attach images with @path.png mentions instead\n");
                 try stdout.flush();
                 return error.InvalidArgument;
             }
@@ -284,7 +291,7 @@ pub fn main(init: std.process.Init) !void {
     try stdout.print("[{s} backend, {d} prompt tokens, max {d} new/turn, temp {d:.2}, seed {d}]\n", .{
         @tagName(backend), ids.items.len, opts.max_new_tokens, opts.sampling.temperature, opts.seed,
     });
-    if (prompt == null) try stdout.writeAll("[interactive chat: empty line to re-prompt, /exit or Ctrl-D to quit]\n");
+    if (prompt == null) try stdout.writeAll("[interactive chat: Enter sends, Shift- or Alt-Enter adds a line, /exit or Ctrl-D quits]\n");
     try stdout.writeAll("\n");
     try stdout.flush();
 
@@ -306,10 +313,10 @@ pub fn main(init: std.process.Init) !void {
                 var drafter = try llm.spec.ModelDrafter(llm.engine.CpuModel).init(gpa, io, &draft);
                 defer drafter.deinit();
                 t0 = Io.Clock.real.now(io).nanoseconds;
-                break :blk try runSession(&model, &drafter, &tok, io, gpa, &ids, opts, stdout, prompt);
+                break :blk try runSession(&model, &drafter, &tok, io, gpa, &ids, opts, stdout, prompt, null);
             }
             t0 = Io.Clock.real.now(io).nanoseconds;
-            break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt);
+            break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt, null);
         },
         .@"zig-cuda", .cuda => blk: {
             const cuda_be = TensorPencil.gpu.cuda.Backend;
@@ -339,7 +346,7 @@ pub fn main(init: std.process.Init) !void {
                 var drafter = try TensorPencil.models.eagle3.Eagle3Drafter.init(gpa, &head, &model);
                 defer drafter.deinit();
                 t0 = Io.Clock.real.now(io).nanoseconds;
-                count = try runSession(&model, &drafter, &tok, io, gpa, &ids, opts, stdout, prompt);
+                count = try runSession(&model, &drafter, &tok, io, gpa, &ids, opts, stdout, prompt, null);
             } else if (draft_lm) |*dlm| {
                 var draft = try qwen3_cuda.CudaLM.init(gpa, be, dlm, capacity, prompt_len);
                 defer draft.deinit();
@@ -350,10 +357,10 @@ pub fn main(init: std.process.Init) !void {
                 var drafter = try llm.spec.ModelDrafter(qwen3_cuda.CudaLM).init(gpa, io, &draft);
                 defer drafter.deinit();
                 t0 = Io.Clock.real.now(io).nanoseconds;
-                count = try runSession(&model, &drafter, &tok, io, gpa, &ids, opts, stdout, prompt);
+                count = try runSession(&model, &drafter, &tok, io, gpa, &ids, opts, stdout, prompt, null);
             } else {
                 t0 = Io.Clock.real.now(io).nanoseconds;
-                count = try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt);
+                count = try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt, null);
             }
             if (profile) {
                 try stdout.print("\n\nprofile (device, sync-per-op):\n", .{});
@@ -372,7 +379,7 @@ pub fn main(init: std.process.Init) !void {
             var model = try TensorPencil.models.qwen3_gpu.VulkanLM.init(gpa, ctx, &lm, capacity, prompt_len);
             defer model.deinit();
             t0 = Io.Clock.real.now(io).nanoseconds;
-            break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt);
+            break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt, null);
         },
     };
     const t_end = Io.Clock.real.now(io).nanoseconds;
@@ -401,8 +408,123 @@ pub fn main(init: std.process.Init) !void {
     try stdout.flush();
 }
 
+/// Session-lifetime vision context for @image mentions in interactive
+/// turns (qwen35 on the CUDA backends).
+const ImageChat = struct {
+    vit: *const TensorPencil.models.vit35.Vit,
+    be: *TensorPencil.gpu.cuda.Backend,
+};
+
+/// Build and prefill an interactive turn containing @image mentions:
+/// encode each mentioned PNG on the session ViT, append the interleaved
+/// user turn + assistant open, then prefill everything through the last
+/// image (text via prefill, image rows via prefillImage) so the engine's
+/// cached()-based prefill takes over from the tail. Returns false — with
+/// a message, and ids untouched or rolled back — when images are
+/// unavailable, a file fails to decode, or the turn doesn't fit the
+/// remaining context.
+fn imageTurn(
+    model: anytype,
+    img_chat: ?ImageChat,
+    tok: *const TensorPencil.tokenizer.Tokenizer,
+    gpa: std.mem.Allocator,
+    parts: []const llm.chat.Part,
+    ids: *std.ArrayList(u32),
+    stdout: *Io.Writer,
+) !bool {
+    const M = switch (@typeInfo(@TypeOf(model))) {
+        .pointer => |p| p.child,
+        else => @TypeOf(model),
+    };
+    if (comptime !@hasDecl(M, "prefillImage")) {
+        try stdout.writeAll("[@image mentions need the zig-cuda or cuda backend]\n");
+        return false;
+    } else {
+        const ic = img_chat orelse {
+            try stdout.writeAll("[@image mentions need --mmproj <mmproj.gguf> and the zig-cuda or cuda backend]\n");
+            return false;
+        };
+
+        var encs: std.ArrayList(TensorPencil.models.vit35.Vit.Encoded) = .empty;
+        defer {
+            for (encs.items) |*e| e.deinit(gpa);
+            encs.deinit(gpa);
+        }
+        var segs: std.ArrayList(llm.chat.Segment) = .empty;
+        defer segs.deinit(gpa);
+        for (parts) |p| switch (p) {
+            .text => |t| try segs.append(gpa, .{ .text = t }),
+            .image => |path| {
+                const dec = vips.loadRgb(gpa, path) catch |err| {
+                    try stdout.print("[can't load {s}: {t}]\n", .{ path, err });
+                    return false;
+                };
+                defer gpa.free(dec.pixels);
+                try encs.ensureUnusedCapacity(gpa, 1);
+                const enc = try TensorPencil.models.vit35_cuda.encode(ic.vit, ic.be, gpa, dec.pixels, dec.width, dec.height);
+                encs.appendAssumeCapacity(enc);
+                try segs.append(gpa, .{ .image = .{ .grid_w = enc.grid_w, .grid_h = enc.grid_h } });
+                try stdout.print("[{s}: {d}x{d} -> {d} rows]\n", .{ path, dec.width, dec.height, enc.grid_w * enc.grid_h });
+                try stdout.flush();
+            },
+        };
+
+        const ids_before = ids.items.len;
+        var image_rows: std.ArrayList(usize) = .empty;
+        defer image_rows.deinit(gpa);
+        try llm.chat.appendUserSegments(tok, gpa, segs.items, ids, &image_rows);
+        try llm.chat.openAssistant(tok, gpa, ids);
+        if (ids.items.len - model.cached() > model.remaining()) {
+            try stdout.print("[turn needs {d} rows, only {d} left in context]\n", .{ ids.items.len - model.cached(), model.remaining() });
+            ids.shrinkRetainingCapacity(ids_before);
+            return false;
+        }
+        // Interleave text prefill with the image embeddings, exactly like
+        // the one-shot --image path; the engine's generate() prefills the
+        // remaining tail from cached().
+        for (image_rows.items, encs.items) |row, e| {
+            const pending = ids.items[model.cached()..row];
+            if (pending.len > 0) try model.prefill(pending);
+            try model.prefillImage(e.embeds, e.grid_w, e.grid_h);
+        }
+        return true;
+    }
+}
+
+/// Read one interactive message with the raw-mode editor (Shift/Alt-Enter
+/// insert newlines, bracketed paste keeps pasted newlines literal). The
+/// tty is raw and the terminal modes are enabled only inside this call —
+/// generation runs with the terminal cooked again, so Ctrl-C still kills
+/// a running reply. Returns null at end of session (Ctrl-D, closed stdin).
+fn readEditorMessage(ed: *llm.repl.Editor, fd: std.posix.fd_t, stdin: *Io.Reader, gpa: std.mem.Allocator, stdout: *Io.Writer) !?[]const u8 {
+    var raw = try llm.repl.RawTty.enter(fd);
+    defer raw.leave();
+    try stdout.writeAll(llm.repl.enter_seq);
+    try stdout.flush();
+    defer {
+        stdout.writeAll(llm.repl.leave_seq) catch {};
+        stdout.flush() catch {};
+    }
+    ed.reset();
+    while (true) {
+        const b = stdin.takeByte() catch |err| switch (err) {
+            error.EndOfStream => return null,
+            else => |e| return e,
+        };
+        switch (try ed.feed(gpa, b, stdout)) {
+            .none => try stdout.flush(),
+            .cancel => {
+                try stdout.writeAll("> ");
+                try stdout.flush();
+            },
+            .submit => return ed.message(),
+            .eof => return null,
+        }
+    }
+}
+
 /// Drive one generation (--prompt) or an interactive chat loop (no
-/// --prompt): each stdin line becomes a user turn, the assistant's reply
+/// --prompt): each message becomes a user turn, the assistant's reply
 /// streams back, and the turn is sealed so the KV cache carries the whole
 /// conversation. `drafter` is null (vanilla / n-gram speculative via
 /// engine.generate) or a *spec.ModelDrafter. Returns total tokens generated.
@@ -416,26 +538,52 @@ fn runSession(
     opts: llm.engine.Options,
     stdout: *Io.Writer,
     prompt: ?[]const u8,
+    img_chat: ?ImageChat,
 ) !usize {
     if (prompt != null) {
         return doGenerate(model, drafter, tok, io, gpa, ids, opts, stdout);
     }
 
+    const stdin_file: Io.File = .stdin();
     var stdin_buffer: [64 * 1024]u8 = undefined;
-    var stdin_reader: Io.File.Reader = .initStreaming(.stdin(), io, &stdin_buffer);
+    var stdin_reader: Io.File.Reader = .initStreaming(stdin_file, io, &stdin_buffer);
     const stdin = &stdin_reader.interface;
+    // A real terminal gets the raw-mode editor (multi-line paste stays one
+    // message, Shift/Alt-Enter insert newlines); piped stdin keeps one
+    // message per line so scripted sessions are unchanged.
+    const tty = stdin_file.isTty(io) catch false;
+    var ed: llm.repl.Editor = .{};
+    defer ed.deinit(gpa);
 
     var total: usize = 0;
     while (true) {
         try stdout.writeAll("\n> ");
         try stdout.flush();
-        const raw = (try stdin.takeDelimiter('\n')) orelse break; // null = EOF
-        const line = std.mem.trim(u8, raw, " \t\r");
+        const msg = if (tty)
+            (try readEditorMessage(&ed, stdin_file.handle, stdin, gpa, stdout)) orelse break
+        else
+            (try stdin.takeDelimiter('\n')) orelse break; // null = EOF
+        const line = std.mem.trim(u8, msg, " \t\r\n");
         if (line.len == 0) continue;
         if (std.mem.eql(u8, line, "/exit")) break;
 
-        try llm.chat.appendUser(tok, gpa, line, ids);
-        try llm.chat.openAssistant(tok, gpa, ids);
+        // @image mentions become interleaved vision blocks, prefilled
+        // (with prefillImage) before the engine sees the turn's tail.
+        var parts: std.ArrayList(llm.chat.Part) = .empty;
+        defer parts.deinit(gpa);
+        var has_image = false;
+        if (std.mem.indexOfScalar(u8, line, '@') != null) {
+            try llm.chat.parseImageMentions(gpa, line, &parts);
+            for (parts.items) |p| {
+                if (p == .image) has_image = true;
+            }
+        }
+        if (has_image) {
+            if (!try imageTurn(model, img_chat, tok, gpa, parts.items, ids, stdout)) continue;
+        } else {
+            try llm.chat.appendUser(tok, gpa, line, ids);
+            try llm.chat.openAssistant(tok, gpa, ids);
+        }
         const t0 = Io.Clock.real.now(io).nanoseconds;
         const n = doGenerate(model, drafter, tok, io, gpa, ids, opts, stdout) catch |err| switch (err) {
             error.ContextFull => {
@@ -504,28 +652,54 @@ fn runQwen35(
     defer tok.deinit();
     llm.chat.applyTokenizer(&tok);
 
-    // Encode the image on CPU first (the ViT is small); the embeddings are
-    // injected during prefill. Wrapping mirrors llama.cpp mtmd: the image
-    // leads the user turn as <|vision_start|>[embeddings]<|vision_end|>.
+    // Debug escape hatch: force the CPU ViT on GPU backends (A/B the CUDA
+    // vision tower against the reference path).
+    const debug_cpu_vit = false;
+
+    // CUDA backends create the device context up front so the ViT (image
+    // encode) can run on it before the LLM claims the VRAM.
+    const cuda_be = TensorPencil.gpu.cuda.Backend;
+    const be_cuda: ?*cuda_be = switch (backend) {
+        .cuda => try cuda_be.initLibs(arena),
+        .@"zig-cuda" => try cuda_be.init(arena),
+        else => null,
+    };
+    defer if (be_cuda) |be| be.deinit();
+
+    // The vision tower stays loaded for the whole session when --mmproj is
+    // given: --image encodes up front (one-shot), and interactive turns can
+    // attach images with @path.png mentions at any point. The tower's host
+    // side is cheap (mmap + a small arena); its device weights are scoped
+    // per encode and never stay resident under the LLM.
+    var mmg: ?TensorPencil.Gguf = null;
+    defer if (mmg) |*mg| mg.deinit();
+    var vit: ?TensorPencil.models.vit35.Vit = null;
+    defer if (vit) |*v| v.deinit();
+    if (mmproj_path) |mp| {
+        mmg = try TensorPencil.Gguf.open(arena, io, mp);
+        vit = try TensorPencil.models.vit35.Vit.load(arena, &mmg.?);
+    }
+    const img_chat: ?ImageChat = if (vit != null and be_cuda != null and !debug_cpu_vit)
+        .{ .vit = &vit.?, .be = be_cuda.? }
+    else
+        null;
+
+    // Encode a --image up front; the embeddings are injected during
+    // prefill. Wrapping mirrors llama.cpp mtmd: the image leads the user
+    // turn as <|vision_start|>[embeddings]<|vision_end|>.
     var img: ?TensorPencil.models.vit35.Vit.Encoded = null;
     defer if (img) |*e| e.deinit(gpa);
     if (image_path) |ip| {
-        var mmg = try TensorPencil.Gguf.open(arena, io, mmproj_path.?);
-        defer mmg.deinit();
-        var vit = try TensorPencil.models.vit35.Vit.load(arena, &mmg);
-        defer vit.deinit();
-        const file = try std.Io.Dir.cwd().openFile(io, ip, .{ .mode = .read_only });
-        defer file.close(io);
-        const png = try gpa.alloc(u8, @intCast(try file.length(io)));
-        defer gpa.free(png);
-        if (try file.readPositionalAll(io, png, 0) != png.len) return error.ShortRead;
-        const dec = try TensorPencil.image.decodePngRgb(gpa, png);
+        const dec = try vips.loadRgb(gpa, ip);
         defer gpa.free(dec.pixels);
         const t_vit = Io.Clock.real.now(io).nanoseconds;
-        img = try vit.encode(io, gpa, dec.pixels, dec.width, dec.height);
+        img = if (img_chat) |ic|
+            try TensorPencil.models.vit35_cuda.encode(ic.vit, ic.be, gpa, dec.pixels, dec.width, dec.height)
+        else
+            try vit.?.encode(io, gpa, dec.pixels, dec.width, dec.height);
         const vit_s = @as(f64, @floatFromInt(Io.Clock.real.now(io).nanoseconds - t_vit)) / 1e9;
-        try stdout.print("[image {d}x{d} -> {d}x{d} tokens; vit {d:.1}s]\n", .{
-            dec.width, dec.height, img.?.grid_w, img.?.grid_h, vit_s,
+        try stdout.print("[image {d}x{d} -> {d}x{d} tokens; vit {d:.1}s ({s})]\n", .{
+            dec.width, dec.height, img.?.grid_w, img.?.grid_h, vit_s, if (img_chat != null) "gpu" else "cpu",
         });
         try stdout.flush();
     }
@@ -554,7 +728,10 @@ fn runQwen35(
     try stdout.print("[{s} backend, qwen35 {d}L hybrid, {d} prompt tokens, max {d} new/turn, temp {d:.2}, seed {d}]\n", .{
         @tagName(backend), lm.cfg.n_layers, ids.items.len, opts.max_new_tokens, opts.sampling.temperature, opts.seed,
     });
-    if (prompt == null) try stdout.writeAll("[interactive chat: empty line to re-prompt, /exit or Ctrl-D to quit]\n");
+    if (prompt == null) {
+        try stdout.writeAll("[interactive chat: Enter sends, Shift- or Alt-Enter adds a line, /exit or Ctrl-D quits]\n");
+        if (img_chat != null) try stdout.writeAll("[attach images with @path.jpg / @\"path with spaces.png\" (png/jpeg/webp/gif/tiff), anywhere in a message]\n");
+    }
     try stdout.writeAll("\n");
     try stdout.flush();
 
@@ -564,9 +741,8 @@ fn runQwen35(
     // <n> prompt tokens, layer by layer, then exit.
     if (debug_batch > 0) {
         const dbg_n = debug_batch;
-        const cuda_be = TensorPencil.gpu.cuda.Backend;
-        const be = try cuda_be.init(arena);
-        defer be.deinit();
+        const be = be_cuda orelse try cuda_be.init(arena);
+        defer if (be_cuda == null) be.deinit();
         var model = try TensorPencil.models.qwen35_cuda.CudaLM.init(gpa, be, &lm, capacity);
         defer model.deinit();
         const nl = lm.cfg.n_layers;
@@ -625,12 +801,10 @@ fn runQwen35(
             var model = try qwen35.CpuModel.init(gpa, &lm, capacity);
             defer model.deinit();
             t0 = Io.Clock.real.now(io).nanoseconds;
-            break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt);
+            break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt, null);
         },
         .@"zig-cuda", .cuda => blk: {
-            const cuda_be = TensorPencil.gpu.cuda.Backend;
-            const be = if (backend == .cuda) try cuda_be.initLibs(arena) else try cuda_be.init(arena);
-            defer be.deinit();
+            const be = be_cuda.?;
             be.profile = profile;
             defer if (profile) {
                 inline for (@typeInfo(cuda_be.ProfCat).@"enum".fields, 0..) |f, ci| {
@@ -651,7 +825,7 @@ fn runQwen35(
                 try model.prefill(ids.items[n_pre + n_img .. ids.items.len - 1]);
             }
             t0 = Io.Clock.real.now(io).nanoseconds;
-            break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt);
+            break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt, img_chat);
         },
         .vulkan => unreachable, // rejected in main
     };

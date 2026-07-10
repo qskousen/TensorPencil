@@ -509,7 +509,7 @@ would add ~10 pts acceptance on top.
   always measure the crossover). Remaining headroom: q6_k GEMV load
   alignment (repack at upload time), the grouped kernel's per-pass cost
   (165 us is ~4.7x a single-x pass for 8x the rows — the sequential
-  8-input blocks expose latency), GPU ViT.
+  8-input blocks expose latency).
   VISION (2026-07): `models/vit35.zig` implements the qwen3vl_merger mmproj
   (llama.cpp tools/mtmd port: smart-resize + fit/pad bilinear preprocessing,
   summed dual patch convs, antialias-interpolated 48x48 position grid,
@@ -519,10 +519,92 @@ would add ~10 pts acceptance on top.
   injects the embeddings during prefill with interleaved M-RoPE grid
   positions (`rope_imrope` kernel, sections from GGUF; text collapses to
   the 1-D path bit-identically). Validated word-identical to llama-mtmd-cli
-  greedy on a 768x768 image, and semantically on non-aligned sizes. Image
-  prefill is batched now (see above); the remaining slow spot is the CPU
-  ViT (~167s at 2304 patches) — GPU ViT is the follow-up. PNG decode
-  (8-bit RGB/RGBA) landed in image.zig; layerNorm in ops/norm.zig.
+  greedy on a 768x768 image, and semantically on non-aligned sizes. PNG
+  decode (8-bit RGB/RGBA) landed in image.zig; layerNorm in ops/norm.zig.
+  GPU VIT (2026-07-10): `models/vit35_cuda.zig` runs the whole tower
+  device-side on the CUDA backends — 2304 patches 14.5s (threaded CPU) ->
+  0.3s, 1024 patches 3.9s -> 0.2s on the 3090. Host keeps only the cheap
+  prep (`Vit.prepare`, shared with the CPU path). The bf16 mmproj weights
+  feed the f16 tensor-core GEMM straight from the GGUF mmap via
+  `opMatmulBf16` (an `opConvF16` twin with a `bf16_to_f16_pad2d` weight
+  convert; pad-handles the non-aligned ffn 4304). The 72-dim heads are
+  zero-padded to 128 on device (`head_pad` restride kernel) so the DiT's
+  `opAttnTC` applies unchanged (PV GEMM needs n=head_dim 128-mult; the
+  pads are exact zeros end to end, scale stays 1/sqrt(72)). New eltwise
+  PTX: `ln_bias_par` (two-pass LayerNorm w/ bias, block-per-row),
+  `rope_vision` (pairs (p, p+36), row/col sections, per-token (py,px)),
+  `head_pad`. Encode drops the backend weight cache + attention/GEMM
+  scratch afterward (evictWeights/freeAttnScratch/freeConvScratch) — both
+  for VRAM (the 27B needs the card) and correctness (cache keys point
+  into the Vit arena the caller frees). Validated: kernel unit tests vs
+  CPU refs, GPU-vs-CPU encode cos > 0.999 / rel RMSE < 0.05 on the real
+  mmproj, and word-identical 27B greedy output at 512px (768px diverges
+  in the tail wording only — the f16 regime under greedy amplification).
+  Landing it exposed a latent decode-graph bug: `captureDecodeGraph`'s
+  embed-table warm upload (~874 MB) can evict LRU weights under VRAM
+  pressure, and the capture then died re-uploading them mid-capture
+  (cuMemAlloc is illegal while capturing). Fixed by bailing to per-op
+  decode when `evictions != 0` after the warm upload — capture now either
+  succeeds or degrades cleanly. `debug_cpu_vit` in llm_main.zig A/Bs the
+  CPU tower on GPU backends.
+  IMAGE CHAT (2026-07-10, follow-up): interactive turns attach images as
+  inline `@path.png` / `@"path with spaces.png"` mentions (multiple per
+  turn, anywhere in the message — each becomes a
+  <|vision_start|>[pads]<|vision_end|> block at its mention point, the
+  interleaving Qwen3-VL is trained on; non-.png @tokens like emails stay
+  text). Pieces: `chat.parseImageMentions` + `chat.appendUserSegments`
+  (segmented user turn recording per-image pad-row offsets),
+  `llm_main.imageTurn` (encode mentions on the session ViT, budget-check
+  with ids rollback, then interleave prefill/prefillImage so the engine's
+  cached()-based prefill takes the tail — the one-shot --image pattern per
+  turn). The Vit + mmproj stay loaded for the session; VRAM safety comes
+  from a new backend weight SCOPE (weightScopeBegin/End: entries cached
+  inside the scope are tagged and freed as a group, evictions counter
+  untouched) replacing the ViT's old evictWeights — a mid-session encode
+  must not drop resident LLM weights whose device pointers the captured
+  decode graph baked in. If the encode itself evicts LLM weights under
+  pressure, the existing evictions guard falls decode back to per-op
+  (correct, ~as fast — capture was measured +0%). Validated live: 4-turn
+  session with text / single-image / two-image / recall turns (27B,
+  3090), and a live-captured-graph session with a mid-session encode.
+  Follow-up if wanted: graph recapture after pressure events (today one
+  eviction disables capture for the session), JPEG decode, per-path
+  Encoded cache.
+  REPL LINE EDITOR (2026-07-10, follow-up): interactive input moved off
+  the cooked-mode line reader (which fired one turn per pasted line and
+  had no way to type a newline) to `llm/repl.zig` — a raw-termios,
+  byte-fed editor state machine (unit-tested without a tty): Enter sends,
+  Shift-Enter (kitty keyboard protocol `CSI 13;2u`, enabled via `CSI >1u`
+  push around each read; harmlessly ignored elsewhere) or Alt-Enter
+  (ESC CR — the fallback for terminals without the protocol; plain
+  Shift-Enter is indistinguishable from Enter in legacy input) inserts a
+  newline, bracketed paste (`CSI ?2004h`, 200~/201~) keeps pasted
+  newlines literal so a multi-line paste is ONE message, backspace edits
+  within the line, Ctrl-C cancels the message (ISIG is off only while
+  reading; generation runs cooked so Ctrl-C still kills it), Ctrl-D ends
+  the session. Piped stdin keeps one-message-per-line (scripted sessions
+  unchanged); @image mention parsing treats '\n' as a path delimiter.
+  Validated through a `script` pty: Shift-Enter + 3-line paste = two
+  turns, correct replies, mode sequences balanced around each read.
+  IMAGE FORMATS VIA LIBVIPS (2026-07-10, follow-up): --image and
+  @mentions decode through system libvips (jpeg incl. progressive, png,
+  webp, gif, tiff; EXIF autorotation; alpha flattened over white) — the
+  C shim `lib/vips/vips_helper.c` + `src/vips.zig` wrapper are ported
+  from DiffKeep (its varargs C API can't be @cImport'ed directly).
+  DELIBERATELY linked into the tp-llm EXECUTABLE only: the TensorPencil
+  library module stays pure Zig (image.zig's PNG encode/decode
+  untouched); building tp-llm now needs libvips-dev + pkg-config — see
+  CLAUDE.md Dependencies. Validated e2e: baseline jpg (fur colors right
+  => channel order right), progressive jpg + webp judged identical to
+  the source png, EXIF-rotated jpg seen upright, png-via-vips unchanged.
+  CHASING THE VIT PARITY TEST'S FLAKINESS FOUND A LATENT BACKEND BUG: CUDA
+  `ensureDeviceBuffer` freed the old buffer without syncing — queued
+  kernels could still read it (cuMemFree doesn't wait), an intermittent
+  use-after-free whenever grow-on-demand scratch resized mid-batch (the
+  ViT's per-GEMM conv-scratch growth hit it ~weekly-lottery style;
+  Vulkan's ensureDeviceBuffer has had the flush invariant all along —
+  see gpu lab notes). Now syncs before reallocating; vit parity is
+  bit-stable across runs (min token cos 0.999996, rel 0.0039).
 - Batched serving, paged KV — research toys.
 - `--backend cuda` (cuBLASLt/cuDNN) LLM path — optional; the pure backends are
   the point. Revisit only to measure a gap, as with diffusion (M10 Phase 2).
