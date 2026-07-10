@@ -454,13 +454,39 @@ would add ~10 pts acceptance on top.
   Validated: greedy output is token-identical to llama.cpp over 72-token
   generations. Speculative decoding rejected up front (recurrent state
   cannot roll back). Backends: cpu (~0.35 tok/s, memory-bound) and
-  **zig-cuda / cuda** (`models/qwen35_cuda.zig`, ~18 tok/s steady on the
-  3090 after the warp-per-row q5_k/q6_k GEMV rewrite; llama.cpp does 30.2
-  with dp4a mmvq — int8 dot-product GEMV is the next decode lever):
+  **zig-cuda / cuda** (`models/qwen35_cuda.zig`, ~29.7 tok/s steady decode
+  on the 3090 — llama.cpp mmvq does 30.2 on the same file, parity):
   weights resident, new PTX in elt.zig — `gdn_delta_step` (block-per-v-head
-  two-pass delta rule), `gdn_conv_step`, `gdn_gates`, `l2norm_rows`,
+  two-pass delta rule, state walks x4-unrolled for memory-level
+  parallelism), `gdn_conv_step`, `gdn_gates`, `l2norm_rows`,
   `deinterleave2`, `mul_sigmoid`, `rope_half_part`, and `attn_split_h256`
-  (8 dims/lane; attn_merge was already hd-generic). BATCHED PREFILL
+  (8 dims/lane; attn_merge was already hd-generic).
+  DP4A DECODE GEMV (2026-07-10, 17.4 -> 22.7 tok/s): `quantize_q8_1`
+  quantizes each decode activation once to int8 (SoA: f32 d[cols/32] then
+  i8 qs[cols]; opGemvQuantizeX, one launch per distinct x), and
+  `gemv_q5_k_q8` / `gemv_q6_k_q8` (opGemvQuantQ8) do dp4a integer dot
+  products with llama.cpp's vec_dot math (q5_K vmmq / q6_K mmvq): 16-elem
+  units per lane so the inline 6-bit scale decode amortizes, sum-of-u dp4a
+  for the dmin*m / -32 terms, integer sc/m muls, one v4.u32 header load.
+  Kernel-level test vs a CPU emulation of the same activation quantization
+  (`dp4a gemv quant kernels match CPU reference`). q8_0/q4_k keep the f32
+  GEMVs (4B path unchanged, and its decode measures 72 tok/s now).
+  DECODE-GRAPH CAPTURE (2026-07-10): the M6 pattern ported — after the
+  first (warm) decode step the whole forward replays as one cuGraphLaunch;
+  {token, len} land in g_state, the M-RoPE triple in pos3_d, KV appends
+  via kv_append_s and attention length via the new `attn_split_h256_s`
+  (decode_state_ptx). Gotcha: the embed table had to be gathered ONCE
+  outside capture — warm steps embed on host, so the first cachedWeight
+  upload (cuMemAlloc) of the 875 MB table otherwise lands inside the
+  capture and CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED's it. Capture itself
+  was worth ~0 (the async queue already hid launches — measured, not
+  assumed) but shields the now-faster kernels from launch overhead.
+  Steady decode is 33.6 ms/token: q5 GEMVs ~21 ms (~660 GB/s eff), q6
+  GEMVs ~6.4 ms (563 GB/s, 2-byte-aligned 210 B blocks resist vector
+  loads), gdn_delta_step ~2 ms, norms ~1.5 ms. The printed tok/s
+  (~23.7) is dragged by ~2.2 s of fixed start cost — mostly the
+  small-batch prefill full-dequantizing every weight (see below).
+  BATCHED PREFILL
   (2026-07-10): `stepBatch` runs 128-row chunks — projections/MLP via
   opMatmulQuant (dequant-to-f16 tensor-core GEMM, output padded to 128
   rows, so activation buffers are sized pc=128), attention via
@@ -472,9 +498,10 @@ would add ~10 pts acceptance on top.
   `@min(prefill_chunk, ...)` yields u7, so `pos3s[0 .. n * 3]` overflowed
   and chunks with n >= 43 passed a truncated slice — stepBatch silently
   processed n' = ((n*3)&127)/3 rows. Fixed with `const n: usize =
-  @min(...)`. Remaining headroom:
-  dp4a GEMV, per-op launch overhead (~1200/token, no decode-graph capture
-  yet), GPU ViT.
+  @min(...)`. Remaining headroom: small-batch prefill (opMatmulQuant
+  dequantizes the ENTIRE weight matrix to f16 even for an 8-row chunk —
+  ~0.5-0.7 s per short prompt; a grouped-N dp4a GEMV for n <= 8 would fix
+  it), q6_k GEMV load alignment (repack at upload time), GPU ViT.
   VISION (2026-07): `models/vit35.zig` implements the qwen3vl_merger mmproj
   (llama.cpp tools/mtmd port: smart-resize + fit/pad bilinear preprocessing,
   summed dual patch convs, antialias-interpolated 48x48 position grid,

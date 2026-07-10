@@ -1,12 +1,12 @@
 //! Qwen3.5/3.6 hybrid LM on the CUDA backend (tp-llm --backend zig-cuda /
 //! cuda): the 64-layer gated-DeltaNet + gated-attention stack runs
-//! device-resident, one token per step. Prefill loops single-token steps
-//! through the same path — the recurrence is sequential across tokens
-//! anyway, and chat prompts are short; a batched/chunked prefill is a later
-//! optimization. Weights stay in GGUF block-quant dtype and dequantize
-//! inside the fused GEMV kernels (opGemvQuant); the 27B Q5_K_M fits a 24 GB
-//! card resident. Speculative decoding is unsupported (recurrent state
-//! cannot roll back), and there is no decode-graph capture yet.
+//! device-resident. Decode quantizes each activation to int8 once
+//! (opGemvQuantizeX) and runs dp4a GEMVs in the GGUF block-quant dtype
+//! (opGemvQuantQ8 for q5_k/q6_k, opGemvQuant otherwise); after the first
+//! decode step the whole forward replays as one captured CUDA graph
+//! (stepDecodeGraph). Prefill runs batched 128-row chunks (stepBatch).
+//! The 27B Q5_K_M fits a 24 GB card resident. Speculative decoding is
+//! unsupported (recurrent state cannot roll back).
 
 const std = @import("std");
 const qwen35 = @import("qwen35.zig");
@@ -67,6 +67,18 @@ pub const CudaLM = struct {
     /// processed token (seq appends at op_dump_row; batch writes all rows).
     op_dump: ?[]f32 = null,
     op_dump_row: usize = 0,
+    /// Which activation (and its width) the backend q8 scratch currently
+    /// holds — gemv() asserts the dp4a path reads what quantizeX staged.
+    q8_for: Buf = .{},
+    q8_cols: usize = 0,
+    /// Captured decode step (CUDA graph): one launch replays the whole
+    /// forward, with {token, len} read from device state and the M-RoPE
+    /// triple from pos3_d. Null until the second single-token step.
+    graph_exec: cuda.cu.CUgraphExec = null,
+    /// First single-token decode ran (capture is safe now).
+    decode_warm: bool = false,
+    /// Cleared permanently if capture fails or weights evict.
+    graph_ok: bool = true,
     arena: std.heap.ArenaAllocator,
 
     pub fn init(gpa: std.mem.Allocator, be: *Backend, lm: *const qwen35.Model, capacity: usize) !CudaLM {
@@ -86,6 +98,15 @@ pub const CudaLM = struct {
         self.layer_dump = null;
         self.op_dump = null;
         self.op_dump_row = 0;
+        self.q8_for = .{};
+        self.q8_cols = 0;
+        self.graph_exec = null;
+        self.decode_warm = false;
+        // The graph path needs a device-side embedding gather kernel.
+        self.graph_ok = switch (lm.embed.dtype) {
+            .bf16, .q8_0, .q4_k, .q5_k, .q6_k => true,
+            else => false,
+        };
 
         // Rope table for the rotated span (rope_dim), like qwen3_cuda's.
         var freqs = try ops.rope.rotateHalfFreqs(gpa, capacity, cfg.rope_dim, cfg.rope_theta);
@@ -143,6 +164,7 @@ pub const CudaLM = struct {
 
     pub fn deinit(self: *CudaLM) void {
         const be = self.be;
+        if (self.graph_exec != null) be.graphDestroy(self.graph_exec);
         for (self.k_cache) |*b| be.tensorDestroy(b);
         for (self.v_cache) |*b| be.tensorDestroy(b);
         be.tensorDestroy(&self.conv_state);
@@ -180,13 +202,25 @@ pub const CudaLM = struct {
 
     /// Forward `ids_new` (batched prefill for all but the last token, one
     /// decode step for it); `logits` receives the last position's LM head.
+    /// Single-token decode replays a captured CUDA graph (one launch instead
+    /// of ~1700) once the first decode step has warmed weight residency;
+    /// --profile and capture failures fall back to per-op launches.
     pub fn step(self: *CudaLM, io: std.Io, ids_new: []const u32, logits: []f32) !void {
         _ = io;
         const be = self.be;
         std.debug.assert(ids_new.len >= 1 and ids_new.len <= self.remaining());
         std.debug.assert(logits.len == self.cfg.vocab);
-        if (ids_new.len > 1) try self.prefill(ids_new[0 .. ids_new.len - 1]);
-        try self.stepOne(ids_new[ids_new.len - 1], true);
+        // Any weight eviction (--vram-budget streaming, or live VRAM
+        // pressure) means device weight pointers are not stable, and a
+        // captured graph would replay against freed buffers.
+        if (be.evictions != 0) self.graph_ok = false;
+        if (ids_new.len == 1 and self.graph_ok and !be.profile and self.decode_warm) {
+            try self.stepDecodeGraph(ids_new[0]);
+        } else {
+            if (ids_new.len > 1) try self.prefill(ids_new[0 .. ids_new.len - 1]);
+            try self.stepOne(ids_new[ids_new.len - 1], true);
+            self.decode_warm = true;
+        }
         try be.tensorDownload(offsetBufSized(self.bufs.logits, 0, self.cfg.vocab * 4), std.mem.sliceAsBytes(logits));
     }
 
@@ -332,8 +366,9 @@ pub const CudaLM = struct {
                     const ssm = offsetBufSized(self.ssm_state, ssm_off, heads * d * d * 4);
                     for (0..n) |t| {
                         const normed_t = offsetBufSized(b.normed, t * cfg.hidden * 4, cfg.hidden * 4);
-                        try be.opGemvQuant(ll.alpha.dtype, offsetBufSized(b.ab, 0, heads * 4), normed_t, ll.alpha.bytes, ll.alpha.scale, heads, cfg.hidden);
-                        try be.opGemvQuant(ll.beta.dtype, offsetBufSized(b.ab, heads * 4, heads * 4), normed_t, ll.beta.bytes, ll.beta.scale, heads, cfg.hidden);
+                        try self.quantizeX(normed_t, cfg.hidden);
+                        try self.gemv(offsetBufSized(b.ab, 0, heads * 4), normed_t, ll.alpha);
+                        try self.gemv(offsetBufSized(b.ab, heads * 4, heads * 4), normed_t, ll.beta);
                         try be.opGdnGates(b.ab, try nbuf(be, self.a_dt[lin_idx]), b.gates, heads);
                         try be.opGdnConvStep(
                             conv_state,
@@ -383,14 +418,15 @@ pub const CudaLM = struct {
 
     /// GEMV for one row, dequant-to-f16 tensor-core GEMM for a batch.
     fn gemm(self: *CudaLM, y: Buf, x: Buf, w: ops.matmul.Weight, n: usize) !void {
-        if (n == 1) return self.gemv(y, x, w);
+        if (n == 1) {
+            try self.quantizeX(x, w.cols);
+            return self.gemv(y, x, w);
+        }
         if (debug_gemv_prefill) {
             for (0..n) |t| {
-                try self.gemv(
-                    offsetBufSized(y, t * w.rows * 4, w.rows * 4),
-                    offsetBufSized(x, t * w.cols * 4, w.cols * 4),
-                    w,
-                );
+                const x_t = offsetBufSized(x, t * w.cols * 4, w.cols * 4);
+                try self.quantizeX(x_t, w.cols);
+                try self.gemv(offsetBufSized(y, t * w.rows * 4, w.rows * 4), x_t, w);
             }
             return;
         }
@@ -421,22 +457,34 @@ pub const CudaLM = struct {
     /// (t, h, w) M-RoPE positions.
     fn stepHidden(self: *CudaLM, x_host: []const f32, pos3: [3]u32, want_logits: bool) !void {
         const be = self.be;
-        const cfg = self.cfg;
-        const b = &self.bufs;
-        const hd = cfg.head_dim;
-        const eps = cfg.rms_eps;
-
-        try be.tensorUpload(offsetBufSized(b.x, 0, cfg.hidden * 4), std.mem.sliceAsBytes(x_host));
+        try be.tensorUpload(offsetBufSized(self.bufs.x, 0, self.cfg.hidden * 4), std.mem.sliceAsBytes(x_host));
         try be.tensorUpload(self.pos3_d, std.mem.sliceAsBytes(&pos3));
 
         try be.beginBatch();
         errdefer if (be.batching()) be.abortBatch();
+        try self.decodeBody(false, want_logits);
+        try be.endBatch();
+        self.len += 1;
+    }
+
+    /// The single-token decode forward shared by the per-op path
+    /// (stepHidden) and the captured-graph recording: identical kernels and
+    /// order, except graph mode appends KV rows and reads the attention
+    /// length via g_state[1] (the M-RoPE triple comes from pos3_d either
+    /// way), and skips the host-download debug taps. Does not bump len.
+    fn decodeBody(self: *CudaLM, comptime graph: bool, want_logits: bool) !void {
+        const be = self.be;
+        const cfg = self.cfg;
+        const b = &self.bufs;
+        const hd = cfg.head_dim;
+        const eps = cfg.rms_eps;
 
         for (self.lm.layers, 0..) |*layer, l| {
             switch (layer.*) {
                 .attn => |*al| {
                     const slot = l / cfg.full_attn_interval;
                     try be.qkNorm(b.x, b.normed, try nbuf(be, al.input_norm), 1, cfg.hidden, eps);
+                    try self.quantizeX(b.normed, cfg.hidden);
                     try self.gemv(b.qg, b.normed, al.qg);
                     try self.gemv(b.k, b.normed, al.k);
                     try self.gemv(b.v, b.normed, al.v);
@@ -445,11 +493,18 @@ pub const CudaLM = struct {
                     try be.qkNorm(b.k, b.k, try nbuf(be, al.k_norm), cfg.n_kv_heads, hd, eps);
                     try be.opRopeImrope(b.q, self.pos3_d, self.freqs_d, cfg.n_heads, cfg.rope_dim / 2, self.sin_off, cfg.rope_sections, hd);
                     try be.opRopeImrope(b.k, self.pos3_d, self.freqs_d, cfg.n_kv_heads, cfg.rope_dim / 2, self.sin_off, cfg.rope_sections, hd);
-                    try be.tensorCopy(self.k_cache[slot], self.len * cfg.kvDim() * 4, b.k, 0, cfg.kvDim() * 4);
-                    try be.tensorCopy(self.v_cache[slot], self.len * cfg.kvDim() * 4, b.v, 0, cfg.kvDim() * 4);
                     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
-                    try be.opAttnDecode(b.q, self.k_cache[slot], self.v_cache[slot], b.attn, b.attn_scratch, self.len + 1, 1, cfg.n_heads, cfg.n_kv_heads, hd, nsplit, scale);
+                    if (graph) {
+                        try be.opKvAppendS(self.k_cache[slot], b.k, cfg.kvDim(), cfg.kvDim(), 0);
+                        try be.opKvAppendS(self.v_cache[slot], b.v, cfg.kvDim(), cfg.kvDim(), 0);
+                        try be.opAttnDecodeSGraph(b.q, self.k_cache[slot], self.v_cache[slot], b.attn, b.attn_scratch, cfg.n_heads, cfg.n_kv_heads, hd, nsplit, scale);
+                    } else {
+                        try be.tensorCopy(self.k_cache[slot], self.len * cfg.kvDim() * 4, b.k, 0, cfg.kvDim() * 4);
+                        try be.tensorCopy(self.v_cache[slot], self.len * cfg.kvDim() * 4, b.v, 0, cfg.kvDim() * 4);
+                        try be.opAttnDecode(b.q, self.k_cache[slot], self.v_cache[slot], b.attn, b.attn_scratch, self.len + 1, 1, cfg.n_heads, cfg.n_kv_heads, hd, nsplit, scale);
+                    }
                     try be.opMulSigmoid(b.attn, b.gate, cfg.qDim());
+                    try self.quantizeX(b.attn, cfg.qDim());
                     try self.gemv(b.t, b.attn, al.o);
                     try be.opAdd(b.x, b.t, cfg.hidden);
                 },
@@ -459,12 +514,15 @@ pub const CudaLM = struct {
                     const d = cfg.lin_head_dim;
                     const heads = cfg.lin_v_heads;
                     try be.qkNorm(b.x, b.normed, try nbuf(be, ll.input_norm), 1, cfg.hidden, eps);
-                    if (self.op_dump) |od| {
-                        if (l == 0) {
-                            try be.tensorDownload(offsetBufSized(b.normed, 0, cfg.hidden * 4), std.mem.sliceAsBytes(od[self.op_dump_row * cfg.hidden ..][0..cfg.hidden]));
-                            self.op_dump_row += 1;
+                    if (!graph) {
+                        if (self.op_dump) |od| {
+                            if (l == 0) {
+                                try be.tensorDownload(offsetBufSized(b.normed, 0, cfg.hidden * 4), std.mem.sliceAsBytes(od[self.op_dump_row * cfg.hidden ..][0..cfg.hidden]));
+                                self.op_dump_row += 1;
+                            }
                         }
                     }
+                    try self.quantizeX(b.normed, cfg.hidden);
                     try self.gemv(b.lin_qkv, b.normed, ll.qkv);
                     try self.gemv(b.lin_z, b.normed, ll.z);
                     try self.gemv(offsetBufSized(b.ab, 0, heads * 4), b.normed, ll.alpha);
@@ -492,6 +550,7 @@ pub const CudaLM = struct {
                     );
                     try be.qkNorm(b.lin_o, b.lin_o, try nbuf(be, ll.ssm_norm), heads, d, eps);
                     try be.siluMul(b.lin_z, b.lin_o, cfg.linVDim());
+                    try self.quantizeX(b.lin_z, cfg.linVDim());
                     try self.gemv(b.t, b.lin_z, ll.out);
                     try be.opAdd(b.x, b.t, cfg.hidden);
                 },
@@ -501,32 +560,116 @@ pub const CudaLM = struct {
                 .linear => |*ll| &ll.mlp,
             };
             try be.qkNorm(b.x, b.normed, try nbuf(be, mlp.post_norm), 1, cfg.hidden, eps);
+            try self.quantizeX(b.normed, cfg.hidden);
             try self.gemv(b.mlp_gate, b.normed, mlp.gate);
             try self.gemv(b.mlp_up, b.normed, mlp.up);
             try be.siluMul(b.mlp_gate, b.mlp_up, cfg.intermediate);
+            try self.quantizeX(b.mlp_gate, cfg.intermediate);
             try self.gemv(b.t, b.mlp_gate, mlp.down);
             try be.opAdd(b.x, b.t, cfg.hidden);
-            if (self.layer_dump) |dump| {
-                try be.tensorDownload(
-                    offsetBufSized(b.x, 0, cfg.hidden * 4),
-                    std.mem.sliceAsBytes(dump[l * cfg.hidden ..][0..cfg.hidden]),
-                );
+            if (!graph) {
+                if (self.layer_dump) |dump| {
+                    try be.tensorDownload(
+                        offsetBufSized(b.x, 0, cfg.hidden * 4),
+                        std.mem.sliceAsBytes(dump[l * cfg.hidden ..][0..cfg.hidden]),
+                    );
+                }
             }
         }
 
         if (want_logits) {
             try be.qkNorm(b.x, b.t, try nbuf(be, self.lm.final_norm), 1, cfg.hidden, eps);
-            try be.opGemvQuant(self.lm.head.dtype, b.logits, b.t, self.lm.head.bytes, 1.0, cfg.vocab, cfg.hidden);
+            const head = self.lm.head;
+            if (head.dtype == .q5_k or head.dtype == .q6_k) {
+                try self.quantizeX(b.t, cfg.hidden);
+                try be.opGemvQuantQ8(head.dtype, b.logits, head.bytes, 1.0, cfg.vocab, cfg.hidden);
+            } else {
+                try be.opGemvQuant(head.dtype, b.logits, b.t, head.bytes, 1.0, cfg.vocab, cfg.hidden);
+            }
         }
-        try be.endBatch();
+    }
+
+    /// Single-token decode as one captured-graph replay: {token, len} land
+    /// in g_state and the M-RoPE triple in pos3_d before the launch (the
+    /// graph's kernels read both). Captured on the second decode step — the
+    /// first (per-op) step warms weight residency, JIT, and the activation
+    /// scratch sizes. Any weight eviction invalidates baked device pointers,
+    /// so capture failures and eviction fall back to per-op decode for good.
+    fn stepDecodeGraph(self: *CudaLM, id: u32) !void {
+        const be = self.be;
+        std.debug.assert(self.remaining() >= 1);
+        try be.setDecodeState(id, @intCast(self.len));
+        const p: u32 = @intCast(self.pos_next);
+        try be.tensorUpload(self.pos3_d, std.mem.sliceAsBytes(&[3]u32{ p, p, p }));
+        if (self.graph_exec == null) {
+            self.captureDecodeGraph() catch |err| {
+                std.debug.print("[decode graph capture failed ({t}); falling back to per-op launches]\n", .{err});
+                self.graph_ok = false;
+                return self.stepOne(id, true);
+            };
+        }
+        if (be.evictions != 0) {
+            // Capture itself ran the cache over budget: the fresh graph may
+            // already hold evicted-weight pointers. Decode per-op instead.
+            self.graph_ok = false;
+            return self.stepOne(id, true);
+        }
+        try be.graphLaunch(self.graph_exec);
         self.len += 1;
+        self.pos_next += 1;
+    }
+
+    fn captureDecodeGraph(self: *CudaLM) !void {
+        const be = self.be;
+        // The embed table is only touched device-side by the graph (warm
+        // steps embed on host), so gather once outside capture first: its
+        // initial cachedWeight cuMemAlloc + upload are illegal on a
+        // capturing stream.
+        try self.embedGather();
+        try be.graphCaptureBegin();
+        errdefer if (be.graphCaptureEnd()) |exec| be.graphDestroy(exec) else |_| {};
+        try self.recordDecodeOps();
+        self.graph_exec = try be.graphCaptureEnd();
+    }
+
+    /// Device-side embedding gather of g_state[0]'s row into bufs.x.
+    fn embedGather(self: *CudaLM) !void {
+        const cfg = self.cfg;
+        const x = offsetBufSized(self.bufs.x, 0, cfg.hidden * 4);
+        if (self.lm.embed.dtype == .bf16) {
+            try self.be.opEmbedGatherS(x, self.lm.embed.bytes, cfg.hidden);
+        } else {
+            try self.be.opEmbedGatherQuant(self.lm.embed.dtype, x, self.lm.embed.bytes, cfg.hidden);
+        }
+    }
+
+    /// The recorded decode step: device-side embedding gather (token id from
+    /// g_state[0]) followed by the shared decode body in graph mode. No
+    /// uploads, downloads, or batch bookkeeping — those live outside the
+    /// replay.
+    fn recordDecodeOps(self: *CudaLM) !void {
+        try self.embedGather();
+        try self.decodeBody(true, true);
+    }
+
+    /// Quantize a decode activation to the backend's shared q8 scratch for
+    /// the dp4a GEMVs that follow; every gemv() reading `x` must be preceded
+    /// by a quantizeX(x) with no other quantizeX in between (asserted).
+    fn quantizeX(self: *CudaLM, x: Buf, cols: usize) !void {
+        try self.be.opGemvQuantizeX(x, cols);
+        self.q8_for = x;
+        self.q8_cols = cols;
     }
 
     /// Fused GEMV in the weight's storage dtype (all qwen35 GGUF linear
-    /// weights are block-quantized).
+    /// weights are block-quantized). q5_k/q6_k take the dp4a path against
+    /// the activation staged by quantizeX; other dtypes read x directly.
     fn gemv(self: *CudaLM, y: Buf, x: Buf, w: ops.matmul.Weight) !void {
         const be = self.be;
-        if (w.dtype.isBlockQuant()) {
+        if (w.dtype == .q5_k or w.dtype == .q6_k) {
+            std.debug.assert(self.q8_for.buf == x.buf and self.q8_cols == w.cols);
+            try be.opGemvQuantQ8(w.dtype, y, w.bytes, w.scale, w.rows, w.cols);
+        } else if (w.dtype.isBlockQuant()) {
             try be.opGemvQuant(w.dtype, y, x, w.bytes, w.scale, w.rows, w.cols);
         } else if (w.dtype == .bf16) {
             try be.opGemvBf16(y, x, w.bytes, w.scale, w.rows, w.cols);

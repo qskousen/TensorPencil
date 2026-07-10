@@ -245,6 +245,8 @@ pub const Backend = struct {
     fp8_lut: DeviceBuffer = .{},
     fp8_w16: DeviceBuffer = .{},
     fp8_a16: DeviceBuffer = .{},
+    /// q8-quantized decode activation (opGemvQuantizeX / opGemvQuantQ8).
+    q8_act: DeviceBuffer = .{},
 
     // Decode-graph state (see stateSetup): device address of g_state and the
     // graph-mode kernel entries sharing it.
@@ -253,6 +255,7 @@ pub const Backend = struct {
     f_kv_append_s: cu.CUfunction = null,
     f_rope_half_s: cu.CUfunction = null,
     f_attn_split_s: cu.CUfunction = null,
+    f_attn_split_h256_s: cu.CUfunction = null,
     f_embed_gather_q8_0: cu.CUfunction = null,
     f_embed_gather_q4_k: cu.CUfunction = null,
     f_embed_gather_q5_k: cu.CUfunction = null,
@@ -486,6 +489,7 @@ pub const Backend = struct {
         self.tensorDestroy(&self.fp8_lut);
         self.tensorDestroy(&self.fp8_w16);
         self.tensorDestroy(&self.fp8_a16);
+        self.tensorDestroy(&self.q8_act);
         self.tensorDestroy(&self.conv_w16);
         self.tensorDestroy(&self.conv_a16);
         self.tensorDestroy(&self.conv_c);
@@ -1178,6 +1182,38 @@ pub const Backend = struct {
         try self.rowLaunch(f, w_db, x, y, null, .{ @intCast(rows), @intCast(cols), 0, 0, 0, 0 }, .{ scale, 0 }, grid);
     }
 
+    /// Quantize a decode activation vector x (f32[cols]) into the shared q8
+    /// scratch (SoA: f32 d[cols/32] then i8 qs[cols], so the GEMVs load
+    /// vectors) for the dp4a GEMV path. Call once per distinct x, then any
+    /// number of opGemvQuantQ8.
+    pub fn opGemvQuantizeX(self: *Backend, x: DeviceBuffer, cols: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        std.debug.assert(cols % 32 == 0);
+        const nblk = cols / 32;
+        try self.ensureDeviceBuffer(&self.q8_act, nblk * 4 + cols);
+        const f = try self.eltFn(elt.quantize_q8_1_ptx, "quantize_q8_1");
+        try self.rowLaunch(f, x, self.q8_act, null, null, .{ @intCast(nblk), 0, 0, 0, 0, 0 }, .{ 0, 0 }, (nblk + 7) / 8);
+    }
+
+    /// dp4a block-quant GEMV for m=1 decode against the q8 activation
+    /// written by opGemvQuantizeX: y[rows] f32 = scale * (W quant @ x̂).
+    /// Integer dot products (llama.cpp mmvq math) — ~2.5x less ALU than
+    /// opGemvQuant's f32 path, which stays as the q8_0/q4_k fallback.
+    pub fn opGemvQuantQ8(self: *Backend, dt: dtypes.DType, y: DeviceBuffer, w_bytes: []const u8, scale: f32, rows: usize, cols: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.matmul);
+        std.debug.assert(cols % 256 == 0 and rows % 8 == 0);
+        std.debug.assert(self.q8_act.size >= cols / 32 * 4 + cols);
+        const w_db = try self.cachedWeight(w_bytes);
+        const f = switch (dt) {
+            .q5_k => try self.eltFn(elt.gemv_q5_k_q8_ptx, "gemv_q5_k_q8"),
+            .q6_k => try self.eltFn(elt.gemv_q6_k_q8_ptx, "gemv_q6_k_q8"),
+            else => unreachable,
+        };
+        try self.rowLaunch(f, w_db, self.q8_act, y, null, .{ @intCast(rows), @intCast(cols), 0, 0, 0, 0 }, .{ scale, 0 }, rows / 8);
+    }
+
     /// ggml block-quant GEMM (prefill): the opMatmulFp8 shape — dequant the
     /// weight to the shared f16 scratch, convert/pad the activations, run the
     /// f16 tensor-core GEMM. rows,cols must be multiples of 128,32.
@@ -1330,6 +1366,7 @@ pub const Backend = struct {
     /// block per v-head over its [d][d] state (d <= 128 so the staging
     /// threads fit the block).
     pub fn opGdnDeltaStep(self: *Backend, state: DeviceBuffer, conv_out: DeviceBuffer, gates: DeviceBuffer, o: DeviceBuffer, heads: usize, d: usize, k_heads: usize, scale: f32) Error!void {
+        std.debug.assert(d % 4 == 0); // the state walks are x4 unrolled
         self.ptic();
         defer self.ptoc(.attn);
         std.debug.assert(d <= 128);
@@ -1751,6 +1788,7 @@ pub const Backend = struct {
         self.f_kv_append_s = mod.getFunction(self.ctx, "kv_append_s") catch return error.CudaError;
         self.f_rope_half_s = mod.getFunction(self.ctx, "rope_half_s") catch return error.CudaError;
         self.f_attn_split_s = mod.getFunction(self.ctx, "attn_split_s") catch return error.CudaError;
+        self.f_attn_split_h256_s = mod.getFunction(self.ctx, "attn_split_h256_s") catch return error.CudaError;
         self.f_embed_gather_q8_0 = mod.getFunction(self.ctx, "embed_gather_q8_0") catch return error.CudaError;
         self.f_embed_gather_q4_k = mod.getFunction(self.ctx, "embed_gather_q4_k") catch return error.CudaError;
         self.f_embed_gather_q5_k = mod.getFunction(self.ctx, "embed_gather_q5_k") catch return error.CudaError;
@@ -1831,8 +1869,9 @@ pub const Backend = struct {
     }
 
     pub fn opAttnDecodeSGraph(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, n_heads: usize, kv_heads: usize, hd: usize, nsplit: usize, scale: f32) Error!void {
-        std.debug.assert(hd == 128);
-        try self.eltLaunch(self.f_attn_split_s, q, k, v, scratch, .{ 0, @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intCast(nsplit), 0 }, .{ scale, 0 }, n_heads * nsplit * 32);
+        std.debug.assert(hd == 128 or hd == 256);
+        const f_split = if (hd == 128) self.f_attn_split_s else self.f_attn_split_h256_s;
+        try self.eltLaunch(f_split, q, k, v, scratch, .{ 0, @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intCast(nsplit), 1 }, .{ scale, 0 }, n_heads * nsplit * 32);
         const f_merge = try self.eltFn(elt.attn_merge_ptx, "attn_merge");
         try self.eltLaunch(f_merge, scratch, out, null, null, .{ @intCast(n_heads), @intCast(hd), @intCast(nsplit), 0, 0, 0 }, .{ 0, 0 }, n_heads * hd);
     }
@@ -2362,6 +2401,71 @@ test "gemv quant kernels match CPU reference" {
             quants.dequantSlice(dt, w[r * row_bytes ..][0..row_bytes], 0, cols, row_f32);
             var acc: f64 = 0;
             for (row_f32, x) |wv, xv| acc += @as(f64, wv) * xv;
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(acc)), y[r], 2e-2);
+        }
+    }
+}
+
+// Gated on a CUDA device: the dp4a GEMV path (opGemvQuantizeX +
+// opGemvQuantQ8) against a CPU reference that emulates the same q8
+// activation quantization (d = amax/127 per 32-elem block); the GPU then
+// differs only by accumulation order and rni tie-rounding.
+test "dp4a gemv quant kernels match CPU reference" {
+    const quants = @import("../../quants.zig");
+    const gpa = std.testing.allocator;
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+
+    const rows = 16;
+    const cols = 512;
+    var prng = std.Random.DefaultPrng.init(1337);
+    const rand = prng.random();
+
+    const x = try gpa.alloc(f32, cols);
+    defer gpa.free(x);
+    for (x) |*xi| xi.* = rand.float(f32) * 2.0 - 1.0;
+    const x_d = try be.tensorCreate(cols * 4);
+    const y_d = try be.tensorCreate(rows * 4);
+    defer {
+        var xd = x_d;
+        var yd = y_d;
+        be.tensorDestroy(&xd);
+        be.tensorDestroy(&yd);
+    }
+    try be.tensorUpload(x_d, std.mem.sliceAsBytes(x));
+    try be.opGemvQuantizeX(x_d, cols);
+
+    // CPU emulation of quantize_q8_1: x̂ = d * rni(x * 127/amax) per block.
+    const xq = try gpa.alloc(f32, cols);
+    defer gpa.free(xq);
+    var blk: usize = 0;
+    while (blk < cols / 32) : (blk += 1) {
+        var amax: f32 = 0;
+        for (x[blk * 32 ..][0..32]) |xi| amax = @max(amax, @abs(xi));
+        const d: f32 = amax / 127.0;
+        const inv: f32 = if (amax == 0) 0 else 127.0 / amax;
+        for (0..32) |i| xq[blk * 32 + i] = d * @round(x[blk * 32 + i] * inv);
+    }
+
+    const row_f32 = try gpa.alloc(f32, cols);
+    defer gpa.free(row_f32);
+    const y = try gpa.alloc(f32, rows);
+    defer gpa.free(y);
+
+    const dts = [_]dtypes.DType{ .q5_k, .q6_k };
+    var ws: [dts.len][]u8 = undefined;
+    inline for (dts, 0..) |dt, i| ws[i] = try testQuantWeightBytes(gpa, dt, rows, cols, 300 + i);
+    defer for (ws) |w| gpa.free(w);
+
+    inline for (dts, 0..) |dt, i| {
+        const w = ws[i];
+        try be.opGemvQuantQ8(dt, y_d, w, 1.0, rows, cols);
+        try be.tensorDownload(y_d, std.mem.sliceAsBytes(y));
+        const row_bytes = dt.storageBytes(cols);
+        for (0..rows) |r| {
+            quants.dequantSlice(dt, w[r * row_bytes ..][0..row_bytes], 0, cols, row_f32);
+            var acc: f64 = 0;
+            for (row_f32, xq) |wv, xv| acc += @as(f64, wv) * xv;
             try std.testing.expectApproxEqAbs(@as(f32, @floatCast(acc)), y[r], 2e-2);
         }
     }
