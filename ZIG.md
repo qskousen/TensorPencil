@@ -287,3 +287,34 @@ handling misreporting a silent-but-alive test runner. Judge test runs by
 the exit code (or run the binary directly with
 `zig test -lc src/root.zig --test-filter "<name>"`), not by the presence
 of this line.
+
+## `@min`/`@max` narrow their result type — `@min(65, x) * 3` overflows u7
+
+`@TypeOf(@min(65, some_usize))` is **`u7`**, not usize: when one operand is
+an untyped `comptime_int`, `@min`/`@max` narrow the result type to fit the
+comptime bound (accepted proposal ziglang/zig#14039, since 0.11). So
+
+```zig
+const n = @min(prefill_chunk, ids.len - off); // n: u7 when prefill_chunk = 65!
+try stepBatch(x, pos3s[0 .. n * 3]);          // n*3 is u7 math: 195 overflows
+```
+
+is an arithmetic overflow by the language rules. In ReleaseSafe it panics
+"integer overflow"; in ReleaseFast it silently truncates — slice lengths
+arrived as `(n*3) & 0x7f` (n=56 → 40, not 168), which cost a full day of
+"memory corruption" chasing. Two traps stacked:
+
+1. The overflow is invisible at the use site — nothing looks narrower than
+   usize, and the panic only fires when the runtime value is big enough
+   (n ≥ 43 here), so small tests pass.
+2. In optimized builds all overflow checks in a function share one panic
+   block, so the ReleaseSafe panic reports an **arbitrary unrelated source
+   line** (we saw `Allocator.zig rawFree`, unrelated `@intCast` lines).
+   Don't trust panic line numbers through shared panic pads; find the real
+   site by breakpointing the `jo`/`jb` jumps into the pad (objdump for the
+   pad address), or by checking `@TypeOf` on suspect expressions.
+
+Fix: annotate the result type at the `@min` — `const n: usize = @min(...)`.
+The result is then usize and all downstream arithmetic is full-width.
+Audit hint: any `@min(comptime_const, runtime)` (or `@max`) whose result
+feeds arithmetic or slice bounds needs the annotation.

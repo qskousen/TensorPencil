@@ -22,6 +22,28 @@ pub fn rmsNorm(out: []f32, x: []const f32, weight: []const f32, eps: f32) void {
     }
 }
 
+/// Classic LayerNorm with weight and bias, in rows of `weight.len`:
+/// out = (x - mean) / sqrt(var + eps) * weight + bias (the qwen3vl vision
+/// tower's ln1/ln2/post_ln). `out` may alias `x`.
+pub fn layerNorm(out: []f32, x: []const f32, weight: []const f32, bias: []const f32, eps: f32) void {
+    std.debug.assert(x.len == out.len and weight.len == bias.len);
+    const dim = weight.len;
+    std.debug.assert(x.len % dim == 0);
+    const dim_f: f32 = @floatFromInt(dim);
+    var row: usize = 0;
+    while (row < x.len) : (row += dim) {
+        const xr = x[row..][0..dim];
+        const or_ = out[row..][0..dim];
+        var sum: f32 = 0;
+        for (xr) |v| sum += v;
+        const mean = sum / dim_f;
+        var var_sum: f32 = 0;
+        for (xr) |v| var_sum += (v - mean) * (v - mean);
+        const inv = 1.0 / @sqrt(var_sum / dim_f + eps);
+        for (or_, xr, weight, bias) |*o, xv, wv, bv| o.* = (xv - mean) * inv * wv + bv;
+    }
+}
+
 /// 1 / sqrt(mean(x^2) + eps), with vectorized partial sums.
 pub fn invRms(x: []const f32, eps: f32) f32 {
     const vlen = comptime std.simd.suggestVectorLength(f32) orelse 8;

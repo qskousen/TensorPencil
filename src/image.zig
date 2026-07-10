@@ -158,6 +158,100 @@ fn writeChunk(gpa: std.mem.Allocator, out: *std.ArrayList(u8), chunk_type: *cons
     try out.appendSlice(gpa, &crcbuf);
 }
 
+pub const DecodedPng = struct {
+    /// Interleaved [h][w][3] u8 RGB.
+    pixels: []u8,
+    width: usize,
+    height: usize,
+};
+
+/// Decode an 8-bit non-interlaced truecolor PNG (color type 2 RGB or
+/// 6 RGBA — alpha is dropped) to interleaved RGB. Covers what image
+/// editors and ComfyUI emit; not a general PNG reader (no palette, no
+/// 16-bit, no interlacing). Caller frees `pixels`.
+pub fn decodePngRgb(gpa: std.mem.Allocator, data: []const u8) !DecodedPng {
+    if (data.len < 8 or !std.mem.eql(u8, data[0..8], "\x89PNG\r\n\x1a\n")) return error.InvalidPng;
+
+    var width: usize = 0;
+    var height: usize = 0;
+    var channels: usize = 0;
+    var idat: std.ArrayList(u8) = .empty;
+    defer idat.deinit(gpa);
+
+    var i: usize = 8;
+    while (i + 12 <= data.len) {
+        const len = std.mem.readInt(u32, data[i..][0..4], .big);
+        if (i + 12 + len > data.len) return error.InvalidPng;
+        const chunk_type = data[i + 4 ..][0..4];
+        const payload = data[i + 8 ..][0..len];
+        if (std.mem.eql(u8, chunk_type, "IHDR")) {
+            if (len != 13) return error.InvalidPng;
+            width = std.mem.readInt(u32, payload[0..4], .big);
+            height = std.mem.readInt(u32, payload[4..8], .big);
+            const bit_depth = payload[8];
+            const color_type = payload[9];
+            const interlace = payload[12];
+            if (bit_depth != 8 or interlace != 0) return error.UnsupportedPng;
+            channels = switch (color_type) {
+                2 => 3, // truecolor
+                6 => 4, // truecolor + alpha
+                else => return error.UnsupportedPng,
+            };
+        } else if (std.mem.eql(u8, chunk_type, "IDAT")) {
+            try idat.appendSlice(gpa, payload);
+        } else if (std.mem.eql(u8, chunk_type, "IEND")) {
+            break;
+        }
+        i += 12 + len;
+    }
+    if (width == 0 or height == 0 or channels == 0 or idat.items.len == 0) return error.InvalidPng;
+
+    // Inflate the zlib stream to filtered scanlines.
+    var in_reader: std.Io.Reader = .fixed(idat.items);
+    const dbuf = try gpa.alloc(u8, flate.max_window_len);
+    defer gpa.free(dbuf);
+    var dc = flate.Decompress.init(&in_reader, .zlib, dbuf);
+    const raw = try dc.reader.allocRemaining(gpa, .unlimited);
+    defer gpa.free(raw);
+
+    const stride = width * channels;
+    if (raw.len != height * (stride + 1)) return error.InvalidPng;
+
+    // Reverse the per-row filters in place over a reconstruction buffer.
+    const recon = try gpa.alloc(u8, height * stride);
+    defer gpa.free(recon);
+    for (0..height) |y| {
+        const ft = raw[y * (stride + 1)];
+        const row = raw[y * (stride + 1) + 1 ..][0..stride];
+        for (0..stride) |x| {
+            const a: u8 = if (x >= channels) recon[y * stride + x - channels] else 0;
+            const b: u8 = if (y > 0) recon[(y - 1) * stride + x] else 0;
+            const c: u8 = if (y > 0 and x >= channels) recon[(y - 1) * stride + x - channels] else 0;
+            const pred: u8 = switch (ft) {
+                0 => 0,
+                1 => a,
+                2 => b,
+                3 => @intCast((@as(u16, a) + b) / 2),
+                4 => paeth(a, b, c),
+                else => return error.InvalidPng,
+            };
+            recon[y * stride + x] = row[x] +% pred;
+        }
+    }
+
+    // Drop alpha if present.
+    const pixels = try gpa.alloc(u8, width * height * 3);
+    errdefer gpa.free(pixels);
+    if (channels == 3) {
+        @memcpy(pixels, recon);
+    } else {
+        for (0..width * height) |p| {
+            @memcpy(pixels[p * 3 ..][0..3], recon[p * 4 ..][0..3]);
+        }
+    }
+    return .{ .pixels = pixels, .width = width, .height = height };
+}
+
 /// Convert decoder output in [-1, 1] (planar [3][h][w], torch layout) to
 /// interleaved [h][w][3] u8, matching ComfyUI's (x/2 + 0.5).clamp(0,1) * 255.
 pub fn planarF32ToRgb8(gpa: std.mem.Allocator, planar: []const f32, width: usize, height: usize) ![]u8 {
@@ -279,6 +373,30 @@ test "png round-trips through deflate and filtering" {
         }
     }
     try std.testing.expectEqualSlices(u8, &pixels, recon);
+}
+
+test "png decode round-trips encode" {
+    const gpa = std.testing.allocator;
+    const width = 13;
+    const height = 9;
+    var pixels: [width * height * 3]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(5);
+    prng.random().bytes(&pixels); // random pixels exercise all filter types
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try encodePngRgb(gpa, &out, &pixels, width, height);
+
+    const dec = try decodePngRgb(gpa, out.items);
+    defer gpa.free(dec.pixels);
+    try std.testing.expectEqual(width, dec.width);
+    try std.testing.expectEqual(height, dec.height);
+    try std.testing.expectEqualSlices(u8, &pixels, dec.pixels);
+}
+
+test "png decode rejects garbage" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.InvalidPng, decodePngRgb(gpa, "not a png at all"));
 }
 
 test "planar conversion clamps and scales" {

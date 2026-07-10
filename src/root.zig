@@ -7,6 +7,9 @@ const std = @import("std");
 pub const dtype = @import("dtype.zig");
 pub const tensor = @import("tensor.zig");
 pub const safetensors = @import("safetensors.zig");
+pub const gguf = @import("gguf.zig");
+pub const quants = @import("quants.zig");
+pub const weights = @import("weights.zig");
 pub const ops = @import("ops.zig");
 pub const tokenizer = @import("tokenizer.zig");
 pub const image = @import("image.zig");
@@ -22,11 +25,16 @@ pub const Tensor = tensor.Tensor;
 pub const TensorInfo = tensor.TensorInfo;
 pub const SafeTensors = safetensors.SafeTensors;
 pub const TensorView = safetensors.TensorView;
+pub const Gguf = gguf.Gguf;
+pub const WeightStore = weights.WeightStore;
 
 test {
     _ = dtype;
     _ = tensor;
     _ = safetensors;
+    _ = gguf;
+    _ = quants;
+    _ = weights;
     _ = ops;
     _ = tokenizer;
     _ = image;

@@ -81,7 +81,7 @@ pub fn generate(
         var drafter: spec.NgramDrafter = .{};
         return spec.generate(model, &drafter, tok, io, gpa, ids, opts, out);
     }
-    const logits = try gpa.alloc(f32, qwen3.vocab_size);
+    const logits = try gpa.alloc(f32, model.vocab());
     defer gpa.free(logits);
 
     var sampler = sample.Sampler.init(opts.sampling, opts.seed);
@@ -148,6 +148,11 @@ pub const CpuModel = struct {
 
     pub fn remaining(self: *const CpuModel) usize {
         return self.cache.remaining();
+    }
+
+    pub fn vocab(self: *const CpuModel) usize {
+        _ = self;
+        return qwen3.vocab_size;
     }
 
     pub fn step(self: *CpuModel, io: std.Io, ids_new: []const u32, logits: []f32) !void {
@@ -280,7 +285,7 @@ test "multi-turn generation continues the cache" {
 
     var st = try safetensors.SafeTensors.open(gpa, io, te_path);
     defer st.deinit();
-    var lm = try qwen3.CausalLM.load(gpa, &st);
+    var lm = try qwen3.CausalLM.load(gpa, .{ .safetensors = &st });
     defer lm.deinit();
     var tok = try Tokenizer.init(gpa);
     defer tok.deinit();
@@ -320,7 +325,7 @@ test "greedy generation produces valid tokens" {
 
     var st = try safetensors.SafeTensors.open(gpa, io, te_path);
     defer st.deinit();
-    var lm = try qwen3.CausalLM.load(gpa, &st);
+    var lm = try qwen3.CausalLM.load(gpa, .{ .safetensors = &st });
     defer lm.deinit();
     var tok = try Tokenizer.init(gpa);
     defer tok.deinit();

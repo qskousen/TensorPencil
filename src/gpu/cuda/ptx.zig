@@ -49,6 +49,8 @@ pub const Builder = struct {
     body: std.ArrayList(u8) = .empty,
     /// Owned register-name strings, freed on deinit.
     owned: std.ArrayList([]u8) = .empty,
+    /// Owned register-name slices handed out by regs(), freed on deinit.
+    owned_slices: std.ArrayList([][]const u8) = .empty,
     /// Owned label strings.
     counts: [5]u32 = .{ 0, 0, 0, 0, 0 },
     label_next: u32 = 0,
@@ -60,6 +62,8 @@ pub const Builder = struct {
     pub fn deinit(self: *Builder) void {
         for (self.owned.items) |s| self.gpa.free(s);
         self.owned.deinit(self.gpa);
+        for (self.owned_slices.items) |s| self.gpa.free(s);
+        self.owned_slices.deinit(self.gpa);
         self.body.deinit(self.gpa);
     }
 
@@ -77,7 +81,9 @@ pub const Builder = struct {
     /// names. Useful for MMA fragment register vectors.
     pub fn regs(self: *Builder, c: RegClass, n: usize) ![]const []const u8 {
         const out = try self.gpa.alloc([]const u8, n);
+        errdefer self.gpa.free(out);
         for (out) |*r| r.* = try self.reg(c);
+        try self.owned_slices.append(self.gpa, out);
         return out;
     }
 

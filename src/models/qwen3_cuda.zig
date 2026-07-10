@@ -183,6 +183,16 @@ pub const CudaLM = struct {
     graph_ok: bool = true,
 
     pub fn init(gpa: std.mem.Allocator, be: *Backend, lm: *const qwen3.CausalLM, capacity: usize, first_seq: usize) !CudaLM {
+        // Embedding/LM-head kernels exist for bf16 and the ggml block-quant
+        // formats (tied or untied head); anything else has no gather kernel.
+        switch (lm.embed.dtype) {
+            .bf16, .q8_0, .q4_k, .q5_k, .q6_k => {},
+            else => return error.UnsupportedModelConfig,
+        }
+        switch (lm.head.dtype) {
+            .bf16, .q8_0, .q4_k, .q5_k, .q6_k => {},
+            else => return error.UnsupportedModelConfig,
+        }
         const c = lm.cfg;
         var self: CudaLM = undefined;
         self.lm = lm;
@@ -365,7 +375,11 @@ pub const CudaLM = struct {
         const be = self.be;
         const c = self.cfg;
         const b = &self.bufs;
-        try be.opEmbedGatherS(offsetBufSized(b.x, 0, c.hidden * 4), self.lm.embed_bytes, c.hidden);
+        if (self.lm.embed.dtype == .bf16) {
+            try be.opEmbedGatherS(offsetBufSized(b.x, 0, c.hidden * 4), self.lm.embed.bytes, c.hidden);
+        } else {
+            try be.opEmbedGatherQuant(self.lm.embed.dtype, offsetBufSized(b.x, 0, c.hidden * 4), self.lm.embed.bytes, c.hidden);
+        }
         for (self.lm.layers, 0..) |layer, l| {
             if (self.taps_on) {
                 for (self.tap_layers, 0..) |tl, j| {
@@ -393,7 +407,7 @@ pub const CudaLM = struct {
             try be.opAdd(b.x, b.t, c.hidden);
         }
         try be.qkNorm(offsetBufSized(b.x, 0, c.hidden * 4), b.t, try nbuf(be, self.lm.final_norm), 1, c.hidden, eps);
-        try be.opGemvBf16(b.logits, b.t, self.lm.embed_bytes, 1.0, qwen3.vocab_size, c.hidden);
+        try self.lmHeadGemv(b.logits, b.t);
     }
 
     /// step, but with vocab logits for every new token ([ids.len, vocab]
@@ -414,19 +428,7 @@ pub const CudaLM = struct {
         // b.t is 128-row padded, so gemv_bf16n's 4-row reads stay in bounds.
         const h = self.cfg.hidden;
         try be.qkNorm(b.x, b.t, try nbuf(be, self.lm.final_norm), seq, h, eps);
-        var off: usize = 0;
-        while (off < seq) : (off += 4) {
-            const n: usize = @min(4, seq - off); // annotated: @min would narrow to u3
-            try be.opGemvBf16N(
-                offsetBufSized(b.logits, off * qwen3.vocab_size * 4, n * qwen3.vocab_size * 4),
-                offsetBufSized(b.t, off * h * 4, 4 * h * 4),
-                self.lm.embed_bytes,
-                1.0,
-                qwen3.vocab_size,
-                h,
-                n,
-            );
-        }
+        try self.lmHeadAll(b.logits, b.t, seq);
         try be.endBatch();
         self.len += seq;
 
@@ -487,14 +489,10 @@ pub const CudaLM = struct {
         try be.tensorUpload(offsetBufSized(tb.pos, 0, n * 4), std.mem.sliceAsBytes(pos[0..n]));
         try be.tensorUpload(offsetBufSized(tb.scratch, meta_off * 4, n * (n + 1) * 4), std.mem.sliceAsBytes(meta[0 .. n * (n + 1)]));
 
-        // CPU: embedding gather (bf16 -> f32), upload.
+        // CPU: embedding gather (storage dtype -> f32), upload.
         const x = try gpa.alloc(f32, n * c.hidden);
         defer gpa.free(x);
-        for (tokens, 0..) |id, t| {
-            if (id >= qwen3.vocab_size) return error.TokenIdOutOfRange;
-            const row = self.lm.embed_bytes[@as(usize, id) * c.hidden * 2 ..][0 .. c.hidden * 2];
-            try safetensors.convertToF32(.bf16, row, x[t * c.hidden ..][0..c.hidden]);
-        }
+        try qwen3.embedTokens(self.lm.embed, tokens, x);
         try be.tensorUpload(offsetBufSized(b.x, 0, n * c.hidden * 4), std.mem.sliceAsBytes(x));
 
         try be.beginBatch();
@@ -535,19 +533,7 @@ pub const CudaLM = struct {
         // groups (b.t is 128-row padded, so the 4-row reads stay in bounds).
         const h = c.hidden;
         try be.qkNorm(b.x, b.t, try nbuf(be, self.lm.final_norm), n, h, eps);
-        var off: usize = 0;
-        while (off < n) : (off += 4) {
-            const g: usize = @min(4, n - off); // annotated: @min would narrow to u3
-            try be.opGemvBf16N(
-                offsetBufSized(tb.logits, off * qwen3.vocab_size * 4, g * qwen3.vocab_size * 4),
-                offsetBufSized(b.t, off * h * 4, 4 * h * 4),
-                self.lm.embed_bytes,
-                1.0,
-                qwen3.vocab_size,
-                h,
-                g,
-            );
-        }
+        try self.lmHeadAll(tb.logits, b.t, n);
         try be.endBatch();
         self.tree_n = n;
 
@@ -593,7 +579,7 @@ pub const CudaLM = struct {
         // Final norm on the last position + tied bf16 LM head, on device.
         const h = self.cfg.hidden;
         try be.qkNorm(offsetBufSized(b.x, (seq - 1) * h * 4, h * 4), b.t, try nbuf(be, self.lm.final_norm), 1, h, eps);
-        try be.opGemvBf16(b.logits, b.t, self.lm.embed_bytes, 1.0, qwen3.vocab_size, h);
+        try self.lmHeadGemv(b.logits, b.t);
         self.prefetchLayer(0); // next token's first layer DMAs behind the LM head
         try be.endBatch();
         self.len += seq;
@@ -614,14 +600,10 @@ pub const CudaLM = struct {
         std.debug.assert(seq > 0 and seq <= self.remaining() and seq <= self.max_rows);
         const pos0 = self.len;
 
-        // CPU: embedding gather (bf16 -> f32), upload.
+        // CPU: embedding gather (storage dtype -> f32), upload.
         const x = try gpa.alloc(f32, seq * c.hidden);
         defer gpa.free(x);
-        for (ids, 0..) |id, t| {
-            if (id >= qwen3.vocab_size) return error.TokenIdOutOfRange;
-            const row = self.lm.embed_bytes[@as(usize, id) * c.hidden * 2 ..][0 .. c.hidden * 2];
-            try safetensors.convertToF32(.bf16, row, x[t * c.hidden ..][0..c.hidden]);
-        }
+        try qwen3.embedTokens(self.lm.embed, ids, x);
         try be.tensorUpload(offsetBufSized(self.bufs.x, 0, seq * c.hidden * 4), std.mem.sliceAsBytes(x));
 
         const b = &self.bufs;
@@ -681,7 +663,8 @@ pub const CudaLM = struct {
                 try be.warmWeight(w.bytes);
             }
         }
-        try be.warmWeight(self.lm.embed_bytes);
+        try be.warmWeight(self.lm.embed.bytes);
+        if (self.lm.head.bytes.ptr != self.lm.embed.bytes.ptr) try be.warmWeight(self.lm.head.bytes);
     }
 
     /// Queue layer `l`'s linear weights (or, past the last layer, the tied
@@ -698,7 +681,59 @@ pub const CudaLM = struct {
                 be.prefetchWeight(w.bytes);
             }
         } else {
-            be.prefetchWeight(self.lm.embed_bytes);
+            be.prefetchWeight(self.lm.embed.bytes);
+            if (self.lm.head.bytes.ptr != self.lm.embed.bytes.ptr) be.prefetchWeight(self.lm.head.bytes);
+        }
+    }
+
+    pub fn vocab(self: *const CudaLM) usize {
+        _ = self;
+        return qwen3.vocab_size;
+    }
+
+    /// LM head over one normed hidden row: y[vocab] = head @ x.
+    fn lmHeadGemv(self: *CudaLM, y: Buf, x: Buf) !void {
+        const head = self.lm.head;
+        if (head.dtype.isBlockQuant()) {
+            try self.be.opGemvQuant(head.dtype, y, x, head.bytes, 1.0, qwen3.vocab_size, self.cfg.hidden);
+        } else {
+            try self.be.opGemvBf16(y, x, head.bytes, 1.0, qwen3.vocab_size, self.cfg.hidden);
+        }
+    }
+
+    /// LM head over `seq` normed rows (x is 4-row-group padded) into
+    /// y [seq][vocab]: grouped bf16 GEMVs reading the weight once per 4
+    /// inputs, or per-row fused GEMVs for ggml block-quant heads.
+    fn lmHeadAll(self: *CudaLM, y: Buf, x: Buf, seq: usize) !void {
+        const be = self.be;
+        const h = self.cfg.hidden;
+        const head = self.lm.head;
+        if (head.dtype.isBlockQuant()) {
+            for (0..seq) |i| {
+                try be.opGemvQuant(
+                    head.dtype,
+                    offsetBufSized(y, i * qwen3.vocab_size * 4, qwen3.vocab_size * 4),
+                    offsetBufSized(x, i * h * 4, h * 4),
+                    head.bytes,
+                    1.0,
+                    qwen3.vocab_size,
+                    h,
+                );
+            }
+            return;
+        }
+        var off: usize = 0;
+        while (off < seq) : (off += 4) {
+            const n: usize = @min(4, seq - off); // annotated: @min would narrow to u3
+            try be.opGemvBf16N(
+                offsetBufSized(y, off * qwen3.vocab_size * 4, n * qwen3.vocab_size * 4),
+                offsetBufSized(x, off * h * 4, 4 * h * 4),
+                head.bytes,
+                1.0,
+                qwen3.vocab_size,
+                h,
+                n,
+            );
         }
     }
 
@@ -712,6 +747,17 @@ pub const CudaLM = struct {
     /// tiny, so a dedicated GEMM path isn't worth it.
     fn linear(self: *CudaLM, y: Buf, x: Buf, w: ops.matmul.Weight, rows_out: usize, cols: usize, seq: usize) !void {
         const be = self.be;
+        if (w.dtype.isBlockQuant()) {
+            // GGUF k-quants: fused GEMV for decode; everything larger takes
+            // the dequant-to-f16 GEMM (no grouped-N variants yet, so small
+            // verify batches pay the scratch round trip).
+            if (seq == 1) {
+                try be.opGemvQuant(w.dtype, y, x, w.bytes, w.scale, rows_out, cols);
+            } else {
+                try be.opMatmulQuant(w.dtype, y, x, seq, w.bytes, rows_out, cols);
+            }
+            return;
+        }
         if (w.dtype != .f8_e4m3) {
             std.debug.assert(w.dtype == .bf16);
             if (seq == 1) {
@@ -876,7 +922,7 @@ test "cuda tree spec matches vanilla greedy on the real model" {
 
     var st = try safetensors.SafeTensors.open(gpa, io, te_path);
     defer st.deinit();
-    var lm = try qwen3.CausalLM.load(gpa, &st);
+    var lm = try qwen3.CausalLM.load(gpa, .{ .safetensors = &st });
     defer lm.deinit();
     var tok = try tokenizer_mod.Tokenizer.init(gpa);
     defer tok.deinit();
@@ -930,7 +976,7 @@ test "cuda weight streaming matches resident greedy on the real model" {
     const be = Backend.init(gpa) catch return error.SkipZigTest;
     defer be.deinit();
 
-    var lm = try qwen3.CausalLM.load(gpa, &st);
+    var lm = try qwen3.CausalLM.load(gpa, .{ .safetensors = &st });
     defer lm.deinit();
     var tok = try tokenizer_mod.Tokenizer.init(gpa);
     defer tok.deinit();

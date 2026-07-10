@@ -104,7 +104,7 @@ pub const Eagle3Head = struct {
 
         var self: Eagle3Head = undefined;
         self.be = be;
-        self.embed_bytes = target.embed_bytes;
+        self.embed_bytes = target.embed.bytes;
         self.capacity = capacity;
         self.len = 0;
 
@@ -684,7 +684,7 @@ test "eagle drafter matches vanilla greedy on the real models" {
 
     var st = try SafeTensors.open(gpa, io, te_path);
     defer st.deinit();
-    var lm = try qwen3.CausalLM.load(gpa, &st);
+    var lm = try qwen3.CausalLM.load(gpa, .{ .safetensors = &st });
     defer lm.deinit();
     var est = try SafeTensors.open(gpa, io, head_path);
     defer est.deinit();
@@ -738,7 +738,7 @@ test "eagle tree drafter matches vanilla greedy on the real models" {
 
     var st = try SafeTensors.open(gpa, io, te_path);
     defer st.deinit();
-    var lm = try qwen3.CausalLM.load(gpa, &st);
+    var lm = try qwen3.CausalLM.load(gpa, .{ .safetensors = &st });
     defer lm.deinit();
     var est = try SafeTensors.open(gpa, io, head_path);
     defer est.deinit();

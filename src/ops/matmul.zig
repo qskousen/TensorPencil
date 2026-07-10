@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const dtypes = @import("../dtype.zig");
+const quants = @import("../quants.zig");
 const convrot_mod = @import("convrot.zig");
 const gpu_context = @import("../gpu/context.zig");
 
@@ -86,6 +87,10 @@ pub fn matmul(
     if (bias) |b| std.debug.assert(b.len == w.rows);
     switch (w.dtype) {
         .f8_e4m3, .bf16, .f16, .f32, .i8, .i4 => {},
+        .q8_0, .q4_k, .q5_k, .q6_k => {
+            // ggml rows are whole blocks; block-aligned k-slicing depends on it.
+            std.debug.assert(w.cols % w.dtype.blockElems() == 0);
+        },
         else => return error.UnsupportedDType,
     }
     if (w.dtype == .i8 or w.dtype == .i4)
@@ -187,7 +192,77 @@ fn packedTask(
         inline .f8_e4m3, .bf16, .f16, .f32, .i8 => |dt| {
             packedTaskTyped(dt, y, x, m, w, bias, row_start, row_end, panel);
         },
+        inline .q8_0, .q4_k, .q5_k, .q6_k => |dt| {
+            packedTaskBlock(dt, y, x, m, w, bias, row_start, row_end, panel);
+        },
         else => unreachable, // validated in matmul()
+    }
+}
+
+/// Packed outer-product path for ggml block-quantized weights. Mirrors
+/// `packedTaskI4` (dequant a k-slice of each row into a temp, scatter
+/// k-major) with quants.zig doing the block decode. KC is a multiple of the
+/// 256-element super-block, so k-slices stay block-aligned.
+fn packedTaskBlock(
+    comptime dt: DType,
+    y: []f32,
+    x: []const f32,
+    m: usize,
+    w: Weight,
+    bias: ?[]const f32,
+    row_start: usize,
+    row_end: usize,
+    panel: []f32,
+) void {
+    comptime std.debug.assert(KC % 256 == 0);
+    const cols = w.cols;
+    const rows = w.rows;
+    const row_bytes = dt.storageBytes(cols);
+    const n_nr = std.math.divCeil(usize, row_end - row_start, NR) catch unreachable;
+
+    var kc0: usize = 0;
+    while (kc0 < cols) : (kc0 += KC) {
+        const kl: usize = @min(KC, cols - kc0);
+
+        for (0..n_nr) |nr| {
+            const sub = panel[nr * KC * NR ..][0 .. kl * NR];
+            for (0..NR) |j| {
+                const row = row_start + nr * NR + j;
+                if (row >= rows) {
+                    for (0..kl) |k| sub[k * NR + j] = 0;
+                    continue;
+                }
+                var tmp: [KC]f32 = undefined;
+                quants.dequantSlice(dt, w.bytes[row * row_bytes ..][0..row_bytes], kc0, kl, tmp[0..kl]);
+                for (0..kl) |k| sub[k * NR + j] = tmp[k];
+            }
+        }
+
+        var t0: usize = 0;
+        while (t0 < m) : (t0 += MR) {
+            const mr = @min(MR, m - t0);
+            for (0..n_nr) |nr| {
+                const sub = panel[nr * KC * NR ..][0 .. kl * NR];
+                const col0 = row_start + nr * NR;
+                switch (mr) {
+                    inline 1...MR => |mrc| microKernel(
+                        mrc,
+                        y,
+                        x,
+                        sub,
+                        t0,
+                        col0,
+                        rows,
+                        cols,
+                        kc0,
+                        kl,
+                        if (kc0 == 0) bias else null,
+                        kc0 != 0,
+                    ),
+                    else => unreachable,
+                }
+            }
+        }
     }
 }
 
@@ -441,7 +516,58 @@ fn runRange(
         inline .f8_e4m3, .bf16, .f16, .f32, .i8 => |dt| {
             runRangeTyped(dt, y, x, m, w, bias, row_start, row_end, scratch);
         },
+        inline .q8_0, .q4_k, .q5_k, .q6_k => |dt| {
+            runRangeBlock(dt, y, x, m, w, bias, row_start, row_end, scratch);
+        },
         else => unreachable, // validated in matmul()
+    }
+}
+
+/// Small-m path for ggml block-quantized weights. Mirrors `runRangeTyped`
+/// with quants.zig decoding whole weight rows into the panel scratch.
+fn runRangeBlock(
+    comptime dt: DType,
+    y: []f32,
+    x: []const f32,
+    m: usize,
+    w: Weight,
+    bias: ?[]const f32,
+    row_start: usize,
+    row_end: usize,
+    scratch: []f32,
+) void {
+    const cols = w.cols;
+    const row_bytes = dt.storageBytes(cols);
+    var r = row_start;
+    while (r < row_end) : (r += panel_rows) {
+        const nr = @min(panel_rows, row_end - r);
+        for (0..nr) |j| {
+            const src = w.bytes[(r + j) * row_bytes ..][0..row_bytes];
+            quants.dequantSlice(dt, src, 0, cols, scratch[j * cols ..][0..cols]);
+        }
+        for (0..m) |t| {
+            const xrow = x[t * cols ..][0..cols];
+            var acc: [panel_rows]Vec = @splat(@splat(0));
+            var tail: [panel_rows]f32 = @splat(0);
+            var k: usize = 0;
+            while (k + vlen <= cols) : (k += vlen) {
+                const xv: Vec = xrow[k..][0..vlen].*;
+                inline for (0..panel_rows) |j| {
+                    if (j < nr) {
+                        const wv: Vec = scratch[j * cols + k ..][0..vlen].*;
+                        acc[j] += xv * wv;
+                    }
+                }
+            }
+            while (k < cols) : (k += 1) {
+                for (0..nr) |j| tail[j] += xrow[k] * scratch[j * cols + k];
+            }
+            for (0..nr) |j| {
+                var sum = @reduce(.Add, acc[j]) + tail[j];
+                if (bias) |b| sum += b[r + j];
+                y[t * w.rows + r + j] = sum;
+            }
+        }
     }
 }
 
@@ -817,6 +943,88 @@ test "matmul i4 convrot packed path" {
     // m % MR, rows % NR, cols spanning multiple KC blocks and groups.
     try testI4ConvrotAgainstNaive(37, 61, 512, true);
     try testI4ConvrotAgainstNaive(small_m_max, NR + 5, 256 * 3, false);
+}
+
+/// ggml block-quantized weights: random block bytes with pinned-finite f16
+/// scales, decoded to f32 by quants.zig for the naive reference — exercises
+/// the block dequant plumbing in both the small-m and packed paths.
+fn testBlockQuantAgainstNaive(m: usize, rows: usize, cols: usize, dt: DType, with_bias: bool) !void {
+    const quants_mod = @import("../quants.zig");
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var prng = std.Random.DefaultPrng.init(7);
+    const rand = prng.random();
+
+    const x = try gpa.alloc(f32, m * cols);
+    defer gpa.free(x);
+    for (x) |*v| v.* = rand.floatNorm(f32);
+
+    const bias = if (with_bias) try gpa.alloc(f32, rows) else null;
+    defer if (bias) |b| gpa.free(b);
+    if (bias) |b| for (b) |*v| {
+        v.* = rand.floatNorm(f32);
+    };
+
+    const row_bytes = dt.storageBytes(cols);
+    const wbytes = try gpa.alloc(u8, rows * row_bytes);
+    defer gpa.free(wbytes);
+    rand.bytes(wbytes);
+    // Pin every block's f16 scale fields to small finite values (random u16
+    // bit patterns include NaN/inf).
+    const d16: u16 = 0x2A66; // 0.05
+    const min16: u16 = 0x251F; // 0.02
+    const bb = dt.blockBytes();
+    var off: usize = 0;
+    while (off < wbytes.len) : (off += bb) {
+        switch (dt) {
+            .q8_0 => std.mem.writeInt(u16, wbytes[off..][0..2], d16, .little),
+            .q4_k, .q5_k => {
+                std.mem.writeInt(u16, wbytes[off..][0..2], d16, .little);
+                std.mem.writeInt(u16, wbytes[off + 2 ..][0..2], min16, .little);
+            },
+            .q6_k => std.mem.writeInt(u16, wbytes[off + 208 ..][0..2], d16, .little),
+            else => unreachable,
+        }
+    }
+
+    const w_f32 = try gpa.alloc(f32, rows * cols);
+    defer gpa.free(w_f32);
+    for (0..rows) |r| {
+        quants_mod.dequantSlice(dt, wbytes[r * row_bytes ..][0..row_bytes], 0, cols, w_f32[r * cols ..][0..cols]);
+    }
+
+    const y = try gpa.alloc(f32, m * rows);
+    defer gpa.free(y);
+    const y_ref = try gpa.alloc(f32, m * rows);
+    defer gpa.free(y_ref);
+
+    const w = Weight.init(wbytes, dt, rows, cols);
+    try matmul(io, gpa, y, x, m, w, bias);
+    naiveMatmul(y_ref, x, m, w_f32, rows, cols, bias);
+
+    for (y_ref, y) |e, a| {
+        const tol = 1e-4 + 1e-5 * @abs(e) * @sqrt(@as(f32, @floatFromInt(cols)));
+        try std.testing.expectApproxEqAbs(e, a, tol);
+    }
+}
+
+test "matmul q8_0 small-m path" {
+    try testBlockQuantAgainstNaive(1, 9, 64, .q8_0, false);
+    try testBlockQuantAgainstNaive(3, 12, 96, .q8_0, true);
+}
+
+test "matmul k-quants small-m path" {
+    try testBlockQuantAgainstNaive(1, 9, 256, .q4_k, false);
+    try testBlockQuantAgainstNaive(2, 7, 512, .q5_k, true);
+    try testBlockQuantAgainstNaive(1, 11, 256, .q6_k, false);
+}
+
+test "matmul block quants packed path" {
+    // rows % NR != 0, cols spanning multiple KC slices with a partial last one.
+    try testBlockQuantAgainstNaive(32, 61, KC + 256, .q8_0, true);
+    try testBlockQuantAgainstNaive(37, NR + 5, KC + 256, .q4_k, false);
+    try testBlockQuantAgainstNaive(19, 33, 512, .q5_k, true);
+    try testBlockQuantAgainstNaive(small_m_max, NR, KC + 256, .q6_k, false);
 }
 
 test "matmul rejects unsupported dtype" {

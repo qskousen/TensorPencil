@@ -311,6 +311,10 @@ pub const VulkanLM = struct {
         // This stepper is still hardwired to the 4B dims (module constants);
         // the 0.6B draft model runs on the CPU/CUDA steppers only for now.
         if (lm.cfg.n_layers != n_layers or lm.cfg.hidden != hidden) return error.UnsupportedModelConfig;
+        // bf16 embedding doubling as the tied LM head is baked into the
+        // kernels; GGUF-quantized models are CPU-only for now.
+        if (lm.embed.dtype != .bf16 or lm.head.bytes.ptr != lm.embed.bytes.ptr)
+            return error.UnsupportedModelConfig;
         var self: VulkanLM = undefined;
         self.lm = lm;
         self.ctx = ctx;
@@ -323,7 +327,7 @@ pub const VulkanLM = struct {
 
         self.embed_f32 = try gpa.alloc(f32, qwen3.vocab_size * hidden);
         errdefer gpa.free(self.embed_f32);
-        try safetensors.convertToF32(.bf16, lm.embed_bytes, self.embed_f32);
+        try safetensors.convertToF32(.bf16, lm.embed.bytes, self.embed_f32);
 
         var freqs = try ops.rope.rotateHalfFreqs(gpa, capacity, hd, qwen3.rope_theta);
         defer freqs.deinit(gpa);
@@ -363,6 +367,11 @@ pub const VulkanLM = struct {
 
     pub fn cached(self: *const VulkanLM) usize {
         return self.len;
+    }
+
+    pub fn vocab(self: *const VulkanLM) usize {
+        _ = self;
+        return qwen3.vocab_size;
     }
 
     pub fn remaining(self: *const VulkanLM) usize {
@@ -783,7 +792,7 @@ test "vulkan spec decode matches vanilla greedy" {
 
     var st = try safetensors.SafeTensors.open(gpa, io, te_path);
     defer st.deinit();
-    var lm = try qwen3.CausalLM.load(gpa, &st);
+    var lm = try qwen3.CausalLM.load(gpa, .{ .safetensors = &st });
     defer lm.deinit();
     var tok = try tokenizer_mod.Tokenizer.init(gpa);
     defer tok.deinit();

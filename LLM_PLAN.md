@@ -425,8 +425,69 @@ would add ~10 pts acceptance on top.
 ### Later / non-goals for now
 - Other architectures (Llama, Gemma) — config struct is the extension point;
   first new arch import will force weight-name mapping tables.
-- GGUF import — safetensors-only keeps loading consistent; revisit if a wanted
-  model only ships as GGUF.
+- ~~GGUF import~~ — DONE (2026-07): `src/gguf.zig` (container, llama.cpp→HF
+  name canonicalization, config from `qwen3.*` metadata), `src/quants.zig`
+  (Q8_0/Q4_K/Q5_K/Q6_K dequant, bit-exact vs ggml-quants.c golden fixtures),
+  `src/weights.zig` (WeightStore over safetensors/GGUF). `tp-llm --model
+  x.gguf` runs on **cpu / zig-cuda / cuda** (vulkan still gated). The
+  zig-cuda path adds per-format PTX: fused GEMV (decode, `elt.gemv_q*`),
+  dequant-to-f16 feeding the existing hgemm/cuBLASLt tail (prefill,
+  `opMatmulQuant`), and graph-mode embed gathers in `decode_state_ptx`;
+  untied `output.weight` heads supported (`CudaLM.lmHeadGemv/lmHeadAll`).
+  Qwen3-4B Q4_K_M decodes at 47 tok/s greedy (word-identical to CPU), Q8_0
+  at 44. Known wrinkles: no grouped-N quant GEMV yet (spec verify batches
+  take the dequant-GEMM), and decode-graph capture falls back to per-op
+  launches under partial-pin `--vram-budget` (mid-capture weight upload).
+  Tokenizer: `Tokenizer.initFromGguf` builds the BPE from the
+  `tokenizer.ggml.*` kv arrays (control tokens → verbatim specials; template
+  and stop ids resolve per-vocab and reach chat.zig via
+  `chat.applyTokenizer`); files without tokenizer arrays fall back to the
+  embedded Qwen3 tokenizer. Unknown `tokenizer.ggml.pre` values warn and use
+  the qwen2 regex — verify before trusting a new family's tokenization.
+  Target model: Qwen3.6 27B Q5_K_M — SUPPORTED (2026-07): `models/qwen35.zig`
+  implements the hybrid gated-DeltaNet architecture (48 linear-attention +
+  16 gated-attention layers, head_dim 256, partial neox RoPE over 64 dims,
+  per-channel causal conv + delta-rule recurrence ported from llama.cpp's
+  qwen35.cpp / delta-net-base.cpp), with its own `State` (16-layer KV cache
+  + conv/recurrent states) and CPU stepper. The qwen35 pretokenizer
+  ([\p{L}\p{M}] runs) is implemented and golden-tested vs llama-tokenize.
+  Validated: greedy output is token-identical to llama.cpp over 72-token
+  generations. Speculative decoding rejected up front (recurrent state
+  cannot roll back). Backends: cpu (~0.35 tok/s, memory-bound) and
+  **zig-cuda / cuda** (`models/qwen35_cuda.zig`, ~18 tok/s steady on the
+  3090 after the warp-per-row q5_k/q6_k GEMV rewrite; llama.cpp does 30.2
+  with dp4a mmvq — int8 dot-product GEMV is the next decode lever):
+  weights resident, new PTX in elt.zig — `gdn_delta_step` (block-per-v-head
+  two-pass delta rule), `gdn_conv_step`, `gdn_gates`, `l2norm_rows`,
+  `deinterleave2`, `mul_sigmoid`, `rope_half_part`, and `attn_split_h256`
+  (8 dims/lane; attn_merge was already hd-generic). BATCHED PREFILL
+  (2026-07-10): `stepBatch` runs 128-row chunks — projections/MLP via
+  opMatmulQuant (dequant-to-f16 tensor-core GEMM, output padded to 128
+  rows, so activation buffers are sized pc=128), attention via
+  opAttnDecode seq_q=n (`rope_imrope_pos` applies per-row M-RoPE triples),
+  DeltaNet conv/delta recurrence stays sequential per token inside the
+  chunk. Text prefill ~80 tok/s (409-token fox prompt ~5s vs ~35s seq),
+  image setup 52s -> 6.5s. Landing it surfaced a **Zig @min type-narrowing
+  footgun** (see ZIG.md "@min/@max narrow their result type"):
+  `@min(prefill_chunk, ...)` yields u7, so `pos3s[0 .. n * 3]` overflowed
+  and chunks with n >= 43 passed a truncated slice — stepBatch silently
+  processed n' = ((n*3)&127)/3 rows. Fixed with `const n: usize =
+  @min(...)`. Remaining headroom:
+  dp4a GEMV, per-op launch overhead (~1200/token, no decode-graph capture
+  yet), GPU ViT.
+  VISION (2026-07): `models/vit35.zig` implements the qwen3vl_merger mmproj
+  (llama.cpp tools/mtmd port: smart-resize + fit/pad bilinear preprocessing,
+  summed dual patch convs, antialias-interpolated 48x48 position grid,
+  27 pre-LN blocks with 2-D vision RoPE {18,18} pairs, full attention,
+  GELU-tanh FFN, post_ln, 2x2 merge -> mm.0/mm.2 projector; no deepstack),
+  running on CPU; `tp-llm --image x.png --mmproj m.gguf` (zig-cuda/cuda)
+  injects the embeddings during prefill with interleaved M-RoPE grid
+  positions (`rope_imrope` kernel, sections from GGUF; text collapses to
+  the 1-D path bit-identically). Validated word-identical to llama-mtmd-cli
+  greedy on a 768x768 image, and semantically on non-aligned sizes. Image
+  prefill is batched now (see above); the remaining slow spot is the CPU
+  ViT (~167s at 2304 patches) — GPU ViT is the follow-up. PNG decode
+  (8-bit RGB/RGBA) landed in image.zig; layerNorm in ops/norm.zig.
 - Batched serving, paged KV — research toys.
 - `--backend cuda` (cuBLASLt/cuDNN) LLM path — optional; the pure backends are
   the point. Revisit only to measure a gap, as with diffusion (M10 Phase 2).

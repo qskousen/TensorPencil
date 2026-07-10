@@ -19,8 +19,22 @@ const Tokenizer = tokenizer_mod.Tokenizer;
 /// "\n" as a single token, used by the template glue.
 pub const newline_id: u32 = 198;
 
+/// Vocab-dependent template/stop ids. Defaults match the embedded Qwen3
+/// tokenizer; a GGUF-embedded tokenizer overrides them via applyTokenizer
+/// (process-global, like the tokenizer itself in tp-llm).
+pub var turn_end: u32 = tokenizer_mod.im_end;
+pub var pad: u32 = tokenizer_mod.pad_token;
+pub var newline: u32 = newline_id;
+
+/// Point the template glue and stop check at `tok`'s vocab.
+pub fn applyTokenizer(tok: *const Tokenizer) void {
+    turn_end = tok.turn_end;
+    pad = tok.pad;
+    newline = tok.newline;
+}
+
 pub fn isStop(id: u32) bool {
-    return id == tokenizer_mod.im_end or id == tokenizer_mod.pad_token;
+    return id == turn_end or id == pad;
 }
 
 pub fn appendSystem(tok: *const Tokenizer, gpa: std.mem.Allocator, text: []const u8, out: *std.ArrayList(u32)) !void {
@@ -39,17 +53,17 @@ pub fn openAssistant(tok: *const Tokenizer, gpa: std.mem.Allocator, out: *std.Ar
 /// Close a generated assistant turn so another user turn can follow (the
 /// stop token itself is never appended by the engine).
 pub fn closeAssistant(gpa: std.mem.Allocator, out: *std.ArrayList(u32)) !void {
-    try out.append(gpa, tokenizer_mod.im_end);
-    try out.append(gpa, newline_id);
+    try out.append(gpa, turn_end);
+    try out.append(gpa, newline);
 }
 
 fn appendTurn(tok: *const Tokenizer, gpa: std.mem.Allocator, role: []const u8, text: []const u8, out: *std.ArrayList(u32)) !void {
     try tok.encode(gpa, "<|im_start|>", out);
     try tok.encode(gpa, role, out);
-    try out.append(gpa, newline_id);
+    try out.append(gpa, newline);
     try tok.encode(gpa, text, out);
-    try out.append(gpa, tokenizer_mod.im_end);
-    try out.append(gpa, newline_id);
+    try out.append(gpa, turn_end);
+    try out.append(gpa, newline);
 }
 
 // --- tests -----------------------------------------------------------------

@@ -442,6 +442,11 @@ const ToyModel = struct {
         return self.hist.items.len;
     }
 
+    pub fn vocab(self: *const ToyModel) usize {
+        _ = self;
+        return qwen3.vocab_size;
+    }
+
     pub fn remaining(self: *const ToyModel) usize {
         return self.capacity - self.hist.items.len;
     }
@@ -857,6 +862,11 @@ const SpreadToy = struct {
     pub fn cached(self: *const SpreadToy) usize {
         return self.hist.items.len;
     }
+    pub fn vocab(self: *const SpreadToy) usize {
+        _ = self;
+        return qwen3.vocab_size;
+    }
+
     pub fn remaining(self: *const SpreadToy) usize {
         return self.capacity - self.hist.items.len;
     }
@@ -987,7 +997,7 @@ test "spec matches vanilla greedy on the real model" {
 
     var st = try safetensors.SafeTensors.open(gpa, io, te_path);
     defer st.deinit();
-    var lm = try qwen3.CausalLM.load(gpa, &st);
+    var lm = try qwen3.CausalLM.load(gpa, .{ .safetensors = &st });
     defer lm.deinit();
     var tok = try Tokenizer.init(gpa);
     defer tok.deinit();
@@ -1034,7 +1044,7 @@ test "tree spec matches vanilla greedy on the real model" {
 
     var st = try safetensors.SafeTensors.open(gpa, io, te_path);
     defer st.deinit();
-    var lm = try qwen3.CausalLM.load(gpa, &st);
+    var lm = try qwen3.CausalLM.load(gpa, .{ .safetensors = &st });
     defer lm.deinit();
     var tok = try Tokenizer.init(gpa);
     defer tok.deinit();
@@ -1082,11 +1092,11 @@ test "model drafter matches vanilla greedy on the real models" {
 
     var st = try safetensors.SafeTensors.open(gpa, io, te_path);
     defer st.deinit();
-    var lm = try qwen3.CausalLM.load(gpa, &st);
+    var lm = try qwen3.CausalLM.load(gpa, .{ .safetensors = &st });
     defer lm.deinit();
     var dst = try safetensors.SafeTensors.open(gpa, io, draft_path);
     defer dst.deinit();
-    var dlm = try qwen3.CausalLM.load(gpa, &dst);
+    var dlm = try qwen3.CausalLM.load(gpa, .{ .safetensors = &dst });
     defer dlm.deinit();
     try std.testing.expectEqual(@as(usize, 28), dlm.cfg.n_layers);
     var tok = try Tokenizer.init(gpa);

@@ -22,6 +22,7 @@ const usage =
     \\              [--spec-k <n>] [--draft-model <qwen3.safetensors>]
     \\              [--eagle <eagle3.safetensors>] [--tree <nodes>]
     \\              [--vram-budget <GiB>|min]
+    \\              [--image <png> --mmproj <mmproj.gguf>]
     \\
     \\Sampling defaults follow Qwen3 non-thinking recommendations:
     \\temperature 0.7, top-k 20, top-p 0.8. --greedy = --temperature 0.
@@ -72,6 +73,9 @@ pub fn main(init: std.process.Init) !void {
     const stdout = &stdout_file_writer.interface;
 
     var model_path: ?[]const u8 = null;
+    var debug_batch: usize = 0;
+    var image_path: ?[]const u8 = null;
+    var mmproj_path: ?[]const u8 = null;
     var draft_path: ?[]const u8 = null;
     var eagle_path: ?[]const u8 = null;
     var prompt: ?[]const u8 = null;
@@ -86,6 +90,12 @@ pub fn main(init: std.process.Init) !void {
         const a = args[i];
         if (std.mem.eql(u8, a, "--model")) {
             model_path = try nextArg(args, &i);
+        } else if (std.mem.eql(u8, a, "--debug-batch")) {
+            debug_batch = try std.fmt.parseInt(usize, try nextArg(args, &i), 10);
+        } else if (std.mem.eql(u8, a, "--image")) {
+            image_path = try nextArg(args, &i);
+        } else if (std.mem.eql(u8, a, "--mmproj")) {
+            mmproj_path = try nextArg(args, &i);
         } else if (std.mem.eql(u8, a, "--prompt")) {
             prompt = try nextArg(args, &i);
         } else if (std.mem.eql(u8, a, "--system")) {
@@ -143,17 +153,78 @@ pub fn main(init: std.process.Init) !void {
         return error.MissingArgument;
     };
 
-    var st = try TensorPencil.SafeTensors.open(arena, io, path);
+    // Container chosen by extension: .gguf or safetensors.
+    var st = try ModelFile.open(arena, io, path);
     defer st.deinit();
-    var lm = try qwen3.CausalLM.load(arena, &st);
+
+    // Architecture dispatch: qwen35 (hybrid DeltaNet) has its own model and
+    // steppers (cpu / zig-cuda / cuda), and no speculative decoding (the
+    // recurrent state cannot roll back past rejected drafts).
+    if (st == .gguf and st.gguf.getStr("general.architecture") != null and
+        std.mem.eql(u8, st.gguf.getStr("general.architecture").?, "qwen35"))
+    {
+        if (backend == .vulkan) {
+            try stdout.writeAll("qwen35 (hybrid DeltaNet) models run on cpu / zig-cuda / cuda only for now\n");
+            try stdout.flush();
+            return error.InvalidArgument;
+        }
+        if (draft_path != null or eagle_path != null or opts.spec_k > 0 or opts.tree_nodes > 0) {
+            try stdout.writeAll("speculative decoding is not supported for qwen35 models (recurrent state cannot roll back)\n");
+            try stdout.flush();
+            return error.InvalidArgument;
+        }
+        if (vram_budget != 0) try stdout.writeAll("[--vram-budget ignored for qwen35 (weights stay resident)]\n");
+        if (image_path != null) {
+            if (backend == .cpu) {
+                try stdout.writeAll("--image requires the zig-cuda or cuda backend\n");
+                try stdout.flush();
+                return error.InvalidArgument;
+            }
+            if (mmproj_path == null) {
+                try stdout.writeAll("--image requires --mmproj <mmproj.gguf> (the vision tower ships separately)\n");
+                try stdout.flush();
+                return error.InvalidArgument;
+            }
+            if (prompt == null) {
+                try stdout.writeAll("--image requires --prompt (one-shot; no image chat yet)\n");
+                try stdout.flush();
+                return error.InvalidArgument;
+            }
+        }
+        return runQwen35(arena, gpa, io, &st.gguf, backend, image_path, mmproj_path, prompt, system, opts, profile, debug_batch, stdout);
+    }
+
+    if (image_path != null) {
+        try stdout.writeAll("--image is only supported for qwen35 (Qwen3.5/3.6) GGUF models\n");
+        try stdout.flush();
+        return error.InvalidArgument;
+    }
+
+    var lm = try qwen3.CausalLM.load(arena, st.store());
     defer lm.deinit();
-    var tok = try TensorPencil.tokenizer.Tokenizer.init(arena);
+    if (backend == .vulkan and lm.hasBlockQuantWeights()) {
+        try stdout.writeAll("GGUF block-quantized weights (Q8_0/Q4_K/Q5_K/Q6_K) run on cpu / zig-cuda / cuda only for now\n");
+        try stdout.flush();
+        return error.InvalidArgument;
+    }
+    // Tokenizer: a GGUF checkpoint carries its own vocab (which may differ
+    // from the embedded Qwen3 one — e.g. Qwen3.6's 248k tokens); fall back
+    // to the embedded tokenizer when the file has none (ComfyUI-style
+    // conversions strip it).
+    var tok = switch (st) {
+        .gguf => |*g| TensorPencil.tokenizer.Tokenizer.initFromGguf(arena, g) catch |err| switch (err) {
+            error.MissingTokenizer => try TensorPencil.tokenizer.Tokenizer.init(arena),
+            else => return err,
+        },
+        .safetensors => try TensorPencil.tokenizer.Tokenizer.init(arena),
+    };
     defer tok.deinit();
+    llm.chat.applyTokenizer(&tok);
 
     // Draft model for speculative decoding (same tokenizer family; its own
-    // KV cache and stepper). Implies spec decoding. The mapped safetensors
+    // KV cache and stepper). Implies spec decoding. The mapped checkpoint
     // must outlive the session — weights are views into it.
-    var draft_st: ?TensorPencil.SafeTensors = null;
+    var draft_st: ?ModelFile = null;
     defer if (draft_st) |*s| s.deinit();
     var draft_lm: ?qwen3.CausalLM = null;
     defer if (draft_lm) |*d| d.deinit();
@@ -163,8 +234,8 @@ pub fn main(init: std.process.Init) !void {
             try stdout.flush();
             return error.InvalidArgument;
         }
-        draft_st = try TensorPencil.SafeTensors.open(arena, io, dp);
-        draft_lm = try qwen3.CausalLM.load(arena, &draft_st.?);
+        draft_st = try ModelFile.open(arena, io, dp);
+        draft_lm = try qwen3.CausalLM.load(arena, draft_st.?.store());
         if (opts.spec_k == 0) opts.spec_k = 4;
     }
     // EAGLE-3 head (reads the target's tapped hidden states; CUDA only).
@@ -253,8 +324,8 @@ pub fn main(init: std.process.Init) !void {
                 // directly at full PCIe bandwidth, prefetched one layer
                 // ahead of compute (skipped when everything stays resident:
                 // registration pins host RAM for no benefit).
-                if (st.mapping) |m| be.enableDirectStreaming(m);
-                if (draft_st) |ds| if (ds.mapping) |m| be.enableDirectStreaming(m);
+                if (st.mapping()) |m| be.enableDirectStreaming(m);
+                if (draft_st) |ds| if (ds.mapping()) |m| be.enableDirectStreaming(m);
                 if (eagle_st) |es| if (es.mapping) |m| be.enableDirectStreaming(m);
             }
             var model = try qwen3_cuda.CudaLM.init(gpa, be, &lm, capacity, prompt_len);
@@ -410,7 +481,225 @@ fn doGenerate(
     }
 }
 
+/// One-shot / chat session for a qwen35 hybrid model (cpu stepper).
+fn runQwen35(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    io: Io,
+    g: *const TensorPencil.Gguf,
+    backend: BackendKind,
+    image_path: ?[]const u8,
+    mmproj_path: ?[]const u8,
+    prompt: ?[]const u8,
+    system: ?[]const u8,
+    opts: llm.engine.Options,
+    profile: bool,
+    debug_batch: usize,
+    stdout: *Io.Writer,
+) !void {
+    const qwen35 = TensorPencil.models.qwen35;
+    var lm = try qwen35.Model.load(arena, g);
+    defer lm.deinit();
+    var tok = try TensorPencil.tokenizer.Tokenizer.initFromGguf(arena, g);
+    defer tok.deinit();
+    llm.chat.applyTokenizer(&tok);
+
+    // Encode the image on CPU first (the ViT is small); the embeddings are
+    // injected during prefill. Wrapping mirrors llama.cpp mtmd: the image
+    // leads the user turn as <|vision_start|>[embeddings]<|vision_end|>.
+    var img: ?TensorPencil.models.vit35.Vit.Encoded = null;
+    defer if (img) |*e| e.deinit(gpa);
+    if (image_path) |ip| {
+        var mmg = try TensorPencil.Gguf.open(arena, io, mmproj_path.?);
+        defer mmg.deinit();
+        var vit = try TensorPencil.models.vit35.Vit.load(arena, &mmg);
+        defer vit.deinit();
+        const file = try std.Io.Dir.cwd().openFile(io, ip, .{ .mode = .read_only });
+        defer file.close(io);
+        const png = try gpa.alloc(u8, @intCast(try file.length(io)));
+        defer gpa.free(png);
+        if (try file.readPositionalAll(io, png, 0) != png.len) return error.ShortRead;
+        const dec = try TensorPencil.image.decodePngRgb(gpa, png);
+        defer gpa.free(dec.pixels);
+        const t_vit = Io.Clock.real.now(io).nanoseconds;
+        img = try vit.encode(io, gpa, dec.pixels, dec.width, dec.height);
+        const vit_s = @as(f64, @floatFromInt(Io.Clock.real.now(io).nanoseconds - t_vit)) / 1e9;
+        try stdout.print("[image {d}x{d} -> {d}x{d} tokens; vit {d:.1}s]\n", .{
+            dec.width, dec.height, img.?.grid_w, img.?.grid_h, vit_s,
+        });
+        try stdout.flush();
+    }
+
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(gpa);
+    // For an image one-shot, the tokens before/after the embedding block are
+    // tracked so prefill can interleave them with prefillImage.
+    var n_pre: usize = 0;
+    if (system) |s| try llm.chat.appendSystem(&tok, gpa, s, &ids);
+    if (img) |*e| {
+        try tok.encode(gpa, "<|im_start|>user\n<|vision_start|>", &ids);
+        n_pre = ids.items.len;
+        // Placeholders keep ids aligned with cache rows (sampling penalties
+        // and the engine's cached()-based prefill both index by row).
+        const pad_id = tok.specialId("<|image_pad|>") orelse tok.pad;
+        try ids.appendNTimes(gpa, pad_id, e.grid_w * e.grid_h);
+        try tok.encode(gpa, "<|vision_end|>", &ids);
+        try tok.encode(gpa, prompt.?, &ids);
+        try tok.encode(gpa, "<|im_end|>\n<|im_start|>assistant\n", &ids);
+    } else if (prompt) |p| {
+        try llm.chat.appendUser(&tok, gpa, p, &ids);
+        try llm.chat.openAssistant(&tok, gpa, &ids);
+    }
+
+    try stdout.print("[{s} backend, qwen35 {d}L hybrid, {d} prompt tokens, max {d} new/turn, temp {d:.2}, seed {d}]\n", .{
+        @tagName(backend), lm.cfg.n_layers, ids.items.len, opts.max_new_tokens, opts.sampling.temperature, opts.seed,
+    });
+    if (prompt == null) try stdout.writeAll("[interactive chat: empty line to re-prompt, /exit or Ctrl-D to quit]\n");
+    try stdout.writeAll("\n");
+    try stdout.flush();
+
+    const capacity = if (prompt == null) opts.max_context else try llm.engine.capacityFor(opts, ids.items.len);
+
+    // --debug-batch <n>: diff sequential vs batched prefill of the first
+    // <n> prompt tokens, layer by layer, then exit.
+    if (debug_batch > 0) {
+        const dbg_n = debug_batch;
+        const cuda_be = TensorPencil.gpu.cuda.Backend;
+        const be = try cuda_be.init(arena);
+        defer be.deinit();
+        var model = try TensorPencil.models.qwen35_cuda.CudaLM.init(gpa, be, &lm, capacity);
+        defer model.deinit();
+        const nl = lm.cfg.n_layers;
+        const dump_seq = try gpa.alloc(f32, nl * lm.cfg.hidden);
+        defer gpa.free(dump_seq);
+        const dump_bat = try gpa.alloc(f32, nl * lm.cfg.hidden);
+        defer gpa.free(dump_bat);
+        const op_seq = try gpa.alloc(f32, dbg_n * lm.cfg.hidden);
+        defer gpa.free(op_seq);
+        const op_bat = try gpa.alloc(f32, dbg_n * lm.cfg.hidden);
+        defer gpa.free(op_bat);
+        @memset(op_seq, 0);
+        @memset(op_bat, 0);
+        const toks = ids.items[0..dbg_n];
+
+        // Sequential reference: capture layer-0 normed per token.
+        model.op_dump = op_seq;
+        model.op_dump_row = 0;
+        for (toks[0 .. dbg_n - 1]) |id| try model.debugStepOne(id);
+        model.layer_dump = dump_seq;
+        try model.debugStepOne(toks[dbg_n - 1]);
+        model.layer_dump = null;
+        model.op_dump = null;
+
+        try model.debugReset();
+        model.layer_dump = dump_bat;
+        model.op_dump = op_bat;
+        try model.prefill(toks);
+        model.layer_dump = null;
+        model.op_dump = null;
+
+        for (0..nl) |l| {
+            var worst: f32 = 0;
+            var rel: f32 = 0;
+            for (dump_seq[l * lm.cfg.hidden ..][0..lm.cfg.hidden], dump_bat[l * lm.cfg.hidden ..][0..lm.cfg.hidden]) |a, bb| {
+                worst = @max(worst, @abs(a - bb));
+                rel = @max(rel, @abs(a - bb) / (@abs(a) + 1e-3));
+            }
+            try stdout.print("layer {d:>2} ({s}): max abs diff {d:.6} rel {d:.4}\n", .{ l, if (lm.cfg.isRecurrent(l)) "lin " else "attn", worst, rel });
+        }
+        for (0..dbg_n) |r| {
+            var worst: f32 = 0;
+            for (op_seq[r * lm.cfg.hidden ..][0..lm.cfg.hidden], op_bat[r * lm.cfg.hidden ..][0..lm.cfg.hidden]) |a, bb| {
+                worst = @max(worst, @abs(a - bb));
+            }
+            if (worst > 1e-4) try stdout.print("layer0 normed row {d:>3}: max diff {d:.6}\n", .{ r, worst });
+        }
+        try stdout.flush();
+        return;
+    }
+
+    const t_init = Io.Clock.real.now(io).nanoseconds;
+    var t0: i96 = undefined;
+    const n = switch (backend) {
+        .cpu => blk: {
+            var model = try qwen35.CpuModel.init(gpa, &lm, capacity);
+            defer model.deinit();
+            t0 = Io.Clock.real.now(io).nanoseconds;
+            break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt);
+        },
+        .@"zig-cuda", .cuda => blk: {
+            const cuda_be = TensorPencil.gpu.cuda.Backend;
+            const be = if (backend == .cuda) try cuda_be.initLibs(arena) else try cuda_be.init(arena);
+            defer be.deinit();
+            be.profile = profile;
+            defer if (profile) {
+                inline for (@typeInfo(cuda_be.ProfCat).@"enum".fields, 0..) |f, ci| {
+                    if (be.prof.n[ci] > 0)
+                        stdout.print("  {s:<9} {d:>8.1} ms  ({d} launches)\n", .{ f.name, be.prof.ms[ci], be.prof.n[ci] }) catch {};
+                }
+                stdout.flush() catch {};
+            };
+            var model = try TensorPencil.models.qwen35_cuda.CudaLM.init(gpa, be, &lm, capacity);
+            defer model.deinit();
+            if (img) |*e| {
+                // Mixed prefill: tokens, then the image embeddings (in place
+                // of the placeholder rows), then all but the last token —
+                // the engine's generate() prefills that one and samples.
+                const n_img = e.grid_w * e.grid_h;
+                try model.prefill(ids.items[0..n_pre]);
+                try model.prefillImage(e.embeds, e.grid_w, e.grid_h);
+                try model.prefill(ids.items[n_pre + n_img .. ids.items.len - 1]);
+            }
+            t0 = Io.Clock.real.now(io).nanoseconds;
+            break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt);
+        },
+        .vulkan => unreachable, // rejected in main
+    };
+    const t_end = Io.Clock.real.now(io).nanoseconds;
+    const setup_s = @as(f64, @floatFromInt(t0 - t_init)) / 1e9;
+    const elapsed_s = @as(f64, @floatFromInt(t_end - t0)) / 1e9;
+    if (prompt != null) {
+        try stdout.print("\n\n[{d} tokens in {d:.1}s, {d:.2} tok/s; setup {d:.1}s]\n", .{
+            n, elapsed_s, @as(f64, @floatFromInt(n)) / elapsed_s, setup_s,
+        });
+    } else {
+        try stdout.print("[session over: {d} tokens generated; setup was {d:.1}s]\n", .{ n, setup_s });
+    }
+    try stdout.flush();
+}
+
 const BackendKind = enum { cpu, @"zig-cuda", cuda, vulkan };
+
+/// A checkpoint opened from disk, container chosen by file extension
+/// (".gguf" or safetensors otherwise).
+const ModelFile = union(enum) {
+    safetensors: TensorPencil.SafeTensors,
+    gguf: TensorPencil.Gguf,
+
+    fn open(gpa: std.mem.Allocator, io: Io, path: []const u8) !ModelFile {
+        if (std.ascii.endsWithIgnoreCase(path, ".gguf"))
+            return .{ .gguf = try TensorPencil.Gguf.open(gpa, io, path) };
+        return .{ .safetensors = try TensorPencil.SafeTensors.open(gpa, io, path) };
+    }
+
+    fn store(self: *const ModelFile) TensorPencil.WeightStore {
+        return switch (self.*) {
+            .safetensors => |*s| .{ .safetensors = s },
+            .gguf => |*g| .{ .gguf = g },
+        };
+    }
+
+    fn mapping(self: *const ModelFile) ?[]align(std.heap.page_size_min) const u8 {
+        return self.store().mapping();
+    }
+
+    fn deinit(self: *ModelFile) void {
+        switch (self.*) {
+            .safetensors => |*s| s.deinit(),
+            .gguf => |*g| g.deinit(),
+        }
+    }
+};
 
 fn nextArg(args: []const [:0]const u8, i: *usize) ![]const u8 {
     i.* += 1;

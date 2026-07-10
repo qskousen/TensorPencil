@@ -19,11 +19,14 @@
 
 const std = @import("std");
 const safetensors = @import("../safetensors.zig");
+const gguf_mod = @import("../gguf.zig");
+const weights_mod = @import("../weights.zig");
 const dtypes = @import("../dtype.zig");
 const ops = @import("../ops.zig");
 const kv_cache_mod = @import("../llm/kv_cache.zig");
 
 const SafeTensors = safetensors.SafeTensors;
+const WeightStore = weights_mod.WeightStore;
 const Weight = ops.matmul.Weight;
 const KvCache = kv_cache_mod.KvCache;
 
@@ -93,16 +96,61 @@ pub const Config = struct {
         .prefix = "model.",
     };
 
-    /// Pick the preset matching a checkpoint by its embedding tensor name
-    /// and shape (rope_theta is not recoverable from weights, so only known
-    /// configurations load).
-    pub fn detect(st: *const SafeTensors) !Config {
+    /// Pick the configuration for a checkpoint. GGUFs with llama.cpp
+    /// metadata build it from the `qwen3.*` keys; everything else matches a
+    /// preset by its embedding tensor name and shape (rope_theta is not
+    /// recoverable from weights, so only known configurations load).
+    pub fn detect(store: WeightStore) !Config {
+        if (store == .gguf) return detectGguf(store.gguf);
         inline for (.{ vl_4b, qwen3_0_6b, qwen3_4b }) |cfg| {
             var buf: [96]u8 = undefined;
             const name = try std.fmt.bufPrint(&buf, "{s}embed_tokens.weight", .{cfg.prefix});
-            if (st.get(name)) |view| {
+            if (store.get(name)) |view| {
                 const shape = view.info.shape.slice();
                 if (shape.len == 2 and shape[0] == vocab_size and shape[1] == cfg.hidden) return cfg;
+            }
+        }
+        return error.UnknownModelConfig;
+    }
+
+    fn detectGguf(g: *const gguf_mod.Gguf) !Config {
+        if (g.getStr("general.architecture")) |arch| {
+            if (!std.mem.eql(u8, arch, "qwen3")) return error.UnknownModelConfig;
+        }
+        // Full llama.cpp metadata: build the config from the qwen3.* keys.
+        if (g.getUint("qwen3.block_count")) |block_count| {
+            if (block_count == 0 or block_count > max_layers) return error.UnknownModelConfig;
+            // head_dim is a kernel invariant, not configurable.
+            if ((g.getUint("qwen3.attention.key_length") orelse head_dim) != head_dim or
+                (g.getUint("qwen3.attention.value_length") orelse head_dim) != head_dim)
+                return error.UnknownModelConfig;
+            return .{
+                .n_layers = @intCast(block_count),
+                .hidden = @intCast(g.getUint("qwen3.embedding_length") orelse return error.UnknownModelConfig),
+                .n_heads = @intCast(g.getUint("qwen3.attention.head_count") orelse return error.UnknownModelConfig),
+                .n_kv_heads = @intCast(g.getUint("qwen3.attention.head_count_kv") orelse return error.UnknownModelConfig),
+                .intermediate = @intCast(g.getUint("qwen3.feed_forward_length") orelse return error.UnknownModelConfig),
+                .rope_theta = g.getFloat("qwen3.rope.freq_base") orelse 1e6,
+                .prefix = "",
+            };
+        }
+        // Hyperparameter-less GGUF (ComfyUI-style conversion, bare HF names,
+        // at most an architecture tag): match a plain-Qwen3 preset by
+        // embedding shape. rope_theta is unrecoverable, so a VL-derived
+        // conversion would silently get the plain-Qwen3 theta — hence the
+        // warning.
+        const view = g.get("embed_tokens.weight") orelse return error.UnknownModelConfig;
+        const shape = view.info.shape.slice();
+        if (shape.len != 2 or shape[0] != vocab_size) return error.UnknownModelConfig;
+        inline for (.{ qwen3_0_6b, qwen3_4b }) |preset| {
+            if (shape[1] == preset.hidden) {
+                var cfg = preset;
+                cfg.prefix = "";
+                std.log.warn(
+                    "gguf has no hyperparameter metadata; assuming plain Qwen3 (rope_theta {d})",
+                    .{cfg.rope_theta},
+                );
+                return cfg;
             }
         }
         return error.UnknownModelConfig;
@@ -171,7 +219,7 @@ pub const TextEncoder = struct {
 
         const x = try gpa.alloc(f32, seq * hidden);
         defer gpa.free(x);
-        try embedTokens(self.embed_bytes, hidden, ids, x);
+        try embedTokens(Weight.init(self.embed_bytes, .bf16, vocab_size, hidden), ids, x);
 
         var freqs = try ops.rope.rotateHalfFreqs(gpa, seq, head_dim, rope_theta);
         defer freqs.deinit(gpa);
@@ -201,26 +249,41 @@ pub const TextEncoder = struct {
 pub const CausalLM = struct {
     arena: std.heap.ArenaAllocator,
     cfg: Config,
-    /// bf16 [vocab, hidden] view into the mapped file; also the tied LM head.
-    embed_bytes: []const u8,
+    /// [vocab, hidden] embedding table view into the mapped file, in the
+    /// checkpoint's storage dtype (bf16 for safetensors; GGUFs quantize it).
+    embed: Weight,
+    /// LM head ([vocab, hidden]): `embed` when tied (Qwen3-4B ships no
+    /// lm_head), a separate tensor when the checkpoint carries one (GGUF
+    /// "output.weight").
+    head: Weight,
     layers: []Layer,
     final_norm: []const f32,
 
-    pub fn load(gpa: std.mem.Allocator, st: *const SafeTensors) !CausalLM {
-        const cfg = try Config.detect(st);
+    pub fn load(gpa: std.mem.Allocator, store: WeightStore) !CausalLM {
+        const cfg = try Config.detect(store);
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const alloc = arena.allocator();
 
         var buf: [96]u8 = undefined;
-        const embed = try st.require(try std.fmt.bufPrint(&buf, "{s}embed_tokens.weight", .{cfg.prefix}));
-        if (embed.info.dtype != .bf16 or embed.info.elemCount() != vocab_size * cfg.hidden)
+        const embed_view = try store.require(try std.fmt.bufPrint(&buf, "{s}embed_tokens.weight", .{cfg.prefix}));
+        const eshape = embed_view.info.shape.slice();
+        if (eshape.len != 2 or eshape[0] != vocab_size or eshape[1] != cfg.hidden)
             return error.ShapeMismatch;
+        const embed = Weight.init(embed_view.bytes, embed_view.info.dtype, vocab_size, cfg.hidden);
 
-        const layers = try loadLayersCfg(alloc, st, cfg, cfg.n_layers);
-        const final_norm = try loadNormNamed(alloc, st, try std.fmt.bufPrint(&buf, "{s}norm.weight", .{cfg.prefix}), cfg.hidden);
+        var head = embed;
+        if (store.get(try std.fmt.bufPrint(&buf, "{s}lm_head.weight", .{cfg.prefix}))) |hv| {
+            const hshape = hv.info.shape.slice();
+            if (hshape.len != 2 or hshape[0] != vocab_size or hshape[1] != cfg.hidden)
+                return error.ShapeMismatch;
+            head = Weight.init(hv.bytes, hv.info.dtype, vocab_size, cfg.hidden);
+        }
 
-        return .{ .arena = arena, .cfg = cfg, .embed_bytes = embed.bytes, .layers = layers, .final_norm = final_norm };
+        const layers = try loadLayersCfg(alloc, store, cfg, cfg.n_layers);
+        const final_norm = try loadNormNamed(alloc, store, try std.fmt.bufPrint(&buf, "{s}norm.weight", .{cfg.prefix}), cfg.hidden);
+
+        return .{ .arena = arena, .cfg = cfg, .embed = embed, .head = head, .layers = layers, .final_norm = final_norm };
     }
 
     pub fn deinit(self: *CausalLM) void {
@@ -228,9 +291,21 @@ pub const CausalLM = struct {
         self.* = undefined;
     }
 
-    /// Tied LM head: logits = hidden @ embed^T, [vocab] per position.
+    /// LM head: logits = hidden @ head^T, [vocab] per position.
     pub fn lmHead(self: *const CausalLM) Weight {
-        return Weight.init(self.embed_bytes, .bf16, vocab_size, self.cfg.hidden);
+        return self.head;
+    }
+
+    /// True when any weight is a ggml block-quantized dtype — such models
+    /// only run on the cpu backend until the GPU kernels land.
+    pub fn hasBlockQuantWeights(self: *const CausalLM) bool {
+        if (self.embed.dtype.isBlockQuant() or self.head.dtype.isBlockQuant()) return true;
+        for (self.layers) |l| {
+            inline for (.{ l.q, l.k, l.v, l.o, l.gate, l.up, l.down }) |w| {
+                if (w.dtype.isBlockQuant()) return true;
+            }
+        }
+        return false;
     }
 
     /// Forward `ids` at absolute positions [cache.len, cache.len + ids.len),
@@ -255,7 +330,7 @@ pub const CausalLM = struct {
 
         const x = try gpa.alloc(f32, seq * cfg.hidden);
         defer gpa.free(x);
-        try embedTokens(self.embed_bytes, cfg.hidden, ids, x);
+        try embedTokens(self.embed, ids, x);
 
         var scratch = try Scratch.init(gpa, seq, cfg);
         defer scratch.deinit(gpa);
@@ -310,7 +385,7 @@ pub const CausalLM = struct {
 
         const x = try gpa.alloc(f32, n * cfg.hidden);
         defer gpa.free(x);
-        try embedTokens(self.embed_bytes, cfg.hidden, ids, x);
+        try embedTokens(self.embed, ids, x);
 
         var s = try Scratch.init(gpa, n, cfg);
         defer s.deinit(gpa);
@@ -351,12 +426,16 @@ pub const CausalLM = struct {
     }
 };
 
-/// Look up bf16 embedding rows for `ids` into `x` [ids.len, h] f32.
-fn embedTokens(embed_bytes: []const u8, h: usize, ids: []const u32, x: []f32) !void {
+/// Look up embedding rows for `ids` into `x` [ids.len, h] f32, dequantizing
+/// from the table's storage dtype (bf16, or a GGUF block-quantized format).
+/// Shared with the GPU steppers' host-side prefill gathers.
+pub fn embedTokens(embed: Weight, ids: []const u32, x: []f32) !void {
+    const h = embed.cols;
+    const row_bytes = embed.dtype.storageBytes(h);
     for (ids, 0..) |id, t| {
-        if (id >= vocab_size) return error.TokenIdOutOfRange;
-        const row = embed_bytes[@as(usize, id) * h * 2 ..][0 .. h * 2];
-        try safetensors.convertToF32(.bf16, row, x[t * h ..][0..h]);
+        if (id >= embed.rows) return error.TokenIdOutOfRange;
+        const row = embed.bytes[@as(usize, id) * row_bytes ..][0..row_bytes];
+        try safetensors.convertToF32(embed.dtype, row, x[t * h ..][0..h]);
     }
 }
 
@@ -484,51 +563,51 @@ fn layerForwardCached(
 }
 
 fn loadLayers(alloc: std.mem.Allocator, st: *const SafeTensors, count: usize) ![]Layer {
-    return loadLayersCfg(alloc, st, Config.vl_4b, count);
+    return loadLayersCfg(alloc, .{ .safetensors = st }, Config.vl_4b, count);
 }
 
-fn loadLayersCfg(alloc: std.mem.Allocator, st: *const SafeTensors, cfg: Config, count: usize) ![]Layer {
+fn loadLayersCfg(alloc: std.mem.Allocator, store: WeightStore, cfg: Config, count: usize) ![]Layer {
     const layers = try alloc.alloc(Layer, count);
     for (layers, 0..) |*layer, i| {
         layer.* = .{
-            .input_norm = try loadNorm(alloc, st, cfg, i, "input_layernorm.weight", cfg.hidden),
-            .q = try loadWeight(st, cfg, i, "self_attn.q_proj.weight", cfg.qDim(), cfg.hidden),
-            .k = try loadWeight(st, cfg, i, "self_attn.k_proj.weight", cfg.kvDim(), cfg.hidden),
-            .v = try loadWeight(st, cfg, i, "self_attn.v_proj.weight", cfg.kvDim(), cfg.hidden),
-            .o = try loadWeight(st, cfg, i, "self_attn.o_proj.weight", cfg.hidden, cfg.qDim()),
-            .q_norm = try loadNorm(alloc, st, cfg, i, "self_attn.q_norm.weight", head_dim),
-            .k_norm = try loadNorm(alloc, st, cfg, i, "self_attn.k_norm.weight", head_dim),
-            .post_norm = try loadNorm(alloc, st, cfg, i, "post_attention_layernorm.weight", cfg.hidden),
-            .gate = try loadWeight(st, cfg, i, "mlp.gate_proj.weight", cfg.intermediate, cfg.hidden),
-            .up = try loadWeight(st, cfg, i, "mlp.up_proj.weight", cfg.intermediate, cfg.hidden),
-            .down = try loadWeight(st, cfg, i, "mlp.down_proj.weight", cfg.hidden, cfg.intermediate),
+            .input_norm = try loadNorm(alloc, store, cfg, i, "input_layernorm.weight", cfg.hidden),
+            .q = try loadWeight(store, cfg, i, "self_attn.q_proj.weight", cfg.qDim(), cfg.hidden),
+            .k = try loadWeight(store, cfg, i, "self_attn.k_proj.weight", cfg.kvDim(), cfg.hidden),
+            .v = try loadWeight(store, cfg, i, "self_attn.v_proj.weight", cfg.kvDim(), cfg.hidden),
+            .o = try loadWeight(store, cfg, i, "self_attn.o_proj.weight", cfg.hidden, cfg.qDim()),
+            .q_norm = try loadNorm(alloc, store, cfg, i, "self_attn.q_norm.weight", head_dim),
+            .k_norm = try loadNorm(alloc, store, cfg, i, "self_attn.k_norm.weight", head_dim),
+            .post_norm = try loadNorm(alloc, store, cfg, i, "post_attention_layernorm.weight", cfg.hidden),
+            .gate = try loadWeight(store, cfg, i, "mlp.gate_proj.weight", cfg.intermediate, cfg.hidden),
+            .up = try loadWeight(store, cfg, i, "mlp.up_proj.weight", cfg.intermediate, cfg.hidden),
+            .down = try loadWeight(store, cfg, i, "mlp.down_proj.weight", cfg.hidden, cfg.intermediate),
         };
     }
     return layers;
 }
 
-fn loadNorm(alloc: std.mem.Allocator, st: *const SafeTensors, cfg: Config, layer: usize, comptime suffix: []const u8, len: usize) ![]f32 {
+fn loadNorm(alloc: std.mem.Allocator, store: WeightStore, cfg: Config, layer: usize, comptime suffix: []const u8, len: usize) ![]f32 {
     var buf: [96]u8 = undefined;
     const name = try std.fmt.bufPrint(&buf, "{s}layers.{d}." ++ suffix, .{ cfg.prefix, layer });
-    return loadNormNamed(alloc, st, name, len);
+    return loadNormNamed(alloc, store, name, len);
 }
 
-fn loadNormNamed(alloc: std.mem.Allocator, st: *const SafeTensors, name: []const u8, len: usize) ![]f32 {
-    const view = st.get(name) orelse return error.MissingTensor;
+fn loadNormNamed(alloc: std.mem.Allocator, store: WeightStore, name: []const u8, len: usize) ![]f32 {
+    const view = store.get(name) orelse return error.MissingTensor;
     if (view.info.elemCount() != len) return error.ShapeMismatch;
     return view.toF32Alloc(alloc);
 }
 
-fn loadWeight(st: *const SafeTensors, cfg: Config, layer: usize, comptime suffix: []const u8, rows: usize, cols: usize) !Weight {
+fn loadWeight(store: WeightStore, cfg: Config, layer: usize, comptime suffix: []const u8, rows: usize, cols: usize) !Weight {
     var buf: [96]u8 = undefined;
     const name = try std.fmt.bufPrint(&buf, "{s}layers.{d}." ++ suffix, .{ cfg.prefix, layer });
-    const view = st.get(name) orelse return error.MissingTensor;
+    const view = store.get(name) orelse return error.MissingTensor;
     const shape = view.info.shape.slice();
     if (shape.len != 2 or shape[0] != rows or shape[1] != cols) return error.ShapeMismatch;
     var w = Weight.init(view.bytes, view.info.dtype, rows, cols);
     var scale_buf: [112]u8 = undefined;
     const scale_name = try std.fmt.bufPrint(&scale_buf, "{s}_scale", .{name});
-    if (st.get(scale_name)) |scale_view| {
+    if (store.get(scale_name)) |scale_view| {
         w.scale = try scale_view.asScalarF32();
     }
     return w;
@@ -544,6 +623,36 @@ fn readF32File(gpa: std.mem.Allocator, io: std.Io, path: []const u8, n: usize) !
     const bytes = std.mem.sliceAsBytes(out);
     if (try file.readPositionalAll(io, bytes, 0) != bytes.len) return error.ShortRead;
     return out;
+}
+
+// Config detection + weight wiring against a real llama.cpp GGUF; skipped
+// when the checkpoint is absent. Load-only — generation quality is validated
+// end-to-end via tp-llm (a Debug 4B forward is too slow for the suite).
+test "causal lm loads from real qwen3-4b gguf" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "models/text_encoders/Qwen3-4B-Q4_K_M.gguf";
+    std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
+
+    var g = try gguf_mod.Gguf.open(gpa, io, path);
+    defer g.deinit();
+    var lm = try CausalLM.load(gpa, .{ .gguf = &g });
+    defer lm.deinit();
+
+    try std.testing.expectEqual(@as(usize, 36), lm.cfg.n_layers);
+    try std.testing.expectEqual(@as(usize, 2560), lm.cfg.hidden);
+    try std.testing.expectEqual(@as(usize, 32), lm.cfg.n_heads);
+    try std.testing.expectEqual(@as(usize, 8), lm.cfg.n_kv_heads);
+    try std.testing.expectEqual(@as(usize, 9728), lm.cfg.intermediate);
+    try std.testing.expectEqual(@as(f64, 1e6), lm.cfg.rope_theta);
+    try std.testing.expectEqualStrings("", lm.cfg.prefix);
+
+    try std.testing.expectEqual(dtypes.DType.q6_k, lm.embed.dtype);
+    // No output.weight in this file: the head ties to the embedding.
+    try std.testing.expectEqual(lm.embed.bytes.ptr, lm.head.bytes.ptr);
+    try std.testing.expect(lm.hasBlockQuantWeights());
+    try std.testing.expectEqual(dtypes.DType.q4_k, lm.layers[0].q.dtype);
+    try std.testing.expectEqual(@as(usize, 2560), lm.layers[0].input_norm.len);
 }
 
 // Parity against ComfyUI's Krea 2 conditioning (f32), post prefix-strip.

@@ -29,6 +29,15 @@ pub const DType = enum {
     u64,
     i64,
     bool,
+    /// ggml/GGUF block-quantized formats: a block of elements shares packed
+    /// scale metadata, so the per-element size is fractional — `byteSize` is
+    /// undefined; use `storageBytes` (whole blocks only). Never appears in
+    /// safetensors headers; produced by the GGUF loader. Layouts and
+    /// dequantization live in quants.zig.
+    q8_0, // 32 elems / 34 B: f16 scale + 32 x i8
+    q4_k, // 256 elems / 144 B: f16 d + f16 dmin + 12 B 6-bit scales/mins + 128 B nibbles
+    q5_k, // 256 elems / 176 B: q4_k + 32 B high bits
+    q6_k, // 256 elems / 210 B: 128 B low nibbles + 64 B high 2-bits + 16 x i8 scales + f16 d
 
     const name_table = .{
         .{ "F8_E4M3", DType.f8_e4m3 },
@@ -55,11 +64,12 @@ pub const DType = enum {
         return null;
     }
 
-    /// Bytes per element. Undefined for sub-byte types (`.i4`) — those are
-    /// unreachable here; use `storageBytes` for their packed on-disk length.
+    /// Bytes per element. Undefined for sub-byte (`.i4`) and block-quantized
+    /// types — those are unreachable here; use `storageBytes` for their
+    /// packed on-disk length.
     pub fn byteSize(self: DType) usize {
         return switch (self) {
-            .i4 => unreachable,
+            .i4, .q8_0, .q4_k, .q5_k, .q6_k => unreachable,
             .f8_e4m3, .u8, .i8, .bool => 1,
             .f16, .bf16, .u16, .i16 => 2,
             .f32, .u32, .i32 => 4,
@@ -67,20 +77,55 @@ pub const DType = enum {
         };
     }
 
-    /// Bits per element (4 for `.i4`, else `byteSize * 8`).
+    /// Bits per element (4 for `.i4`, else `byteSize * 8`). Undefined for
+    /// block-quantized types (fractional).
     pub fn bitSize(self: DType) usize {
         return switch (self) {
             .i4 => 4,
+            .q8_0, .q4_k, .q5_k, .q6_k => unreachable,
             else => self.byteSize() * 8,
         };
     }
 
+    /// True for the ggml block-quantized formats (GGUF weights).
+    pub fn isBlockQuant(self: DType) bool {
+        return switch (self) {
+            .q8_0, .q4_k, .q5_k, .q6_k => true,
+            else => false,
+        };
+    }
+
+    /// Elements per quantization block (1 for scalar dtypes).
+    pub fn blockElems(self: DType) usize {
+        return switch (self) {
+            .q8_0 => 32,
+            .q4_k, .q5_k, .q6_k => 256,
+            else => 1,
+        };
+    }
+
+    /// Bytes per quantization block. Undefined for scalar dtypes.
+    pub fn blockBytes(self: DType) usize {
+        return switch (self) {
+            .q8_0 => 34,
+            .q4_k => 144,
+            .q5_k => 176,
+            .q6_k => 210,
+            else => unreachable,
+        };
+    }
+
     /// Packed storage size in bytes for `count` elements. Handles sub-byte
-    /// types (`.i4`: two values per byte, rounding up). For whole-byte types
-    /// this is just `count * byteSize()`.
+    /// types (`.i4`: two values per byte, rounding up) and block-quantized
+    /// types (`count` must be a multiple of the block size — ggml rows are
+    /// whole blocks). For whole-byte types this is just `count * byteSize()`.
     pub fn storageBytes(self: DType, count: usize) usize {
         return switch (self) {
             .i4 => (count + 1) / 2,
+            .q8_0, .q4_k, .q5_k, .q6_k => blk: {
+                std.debug.assert(count % self.blockElems() == 0);
+                break :blk (count / self.blockElems()) * self.blockBytes();
+            },
             else => count * self.byteSize(),
         };
     }

@@ -8,6 +8,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dtypes = @import("dtype.zig");
+const quants = @import("quants.zig");
 const tensors = @import("tensor.zig");
 
 const DType = dtypes.DType;
@@ -244,6 +245,10 @@ pub fn convertToF32(dt: DType, bytes: []const u8, out: []f32) ConvertError!void 
         .f16 => for (out, 0..) |*v, i| {
             v.* = dtypes.f16ToF32(std.mem.readInt(u16, bytes[i * 2 ..][0..2], .little));
         },
+        // ggml block-quantized GGUF tensors (rows are whole blocks, which the
+        // GGUF parser validated, so the length check above already enforced
+        // block alignment).
+        .q8_0, .q4_k, .q5_k, .q6_k => quants.dequantSlice(dt, bytes, 0, out.len, out),
         else => return error.UnsupportedDType,
     }
 }

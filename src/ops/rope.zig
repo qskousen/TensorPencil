@@ -135,6 +135,39 @@ pub fn applyRotateHalfAt(x: []f32, freqs: Freqs, pos0: usize, seq: usize, n_head
     }
 }
 
+/// applyRotateHalfAt over only the first `rot_dim` dims of each head —
+/// partial RoPE (Qwen3.5 rotates 64 of 256 head dims; the rest pass
+/// through). `freqs` must be built with head_dim = rot_dim; pairs are
+/// (i, i + rot_dim/2) within the rotated span.
+pub fn applyRotateHalfPartialAt(
+    x: []f32,
+    freqs: Freqs,
+    pos0: usize,
+    seq: usize,
+    n_heads: usize,
+    head_dim: usize,
+    rot_dim: usize,
+) void {
+    const half = rot_dim / 2;
+    std.debug.assert(rot_dim <= head_dim);
+    std.debug.assert(freqs.half == half);
+    std.debug.assert(x.len == seq * n_heads * head_dim);
+    std.debug.assert(freqs.cos.len >= (pos0 + seq) * half);
+    for (0..seq) |p| {
+        const cos = freqs.cos[(pos0 + p) * half ..][0..half];
+        const sin = freqs.sin[(pos0 + p) * half ..][0..half];
+        for (0..n_heads) |h| {
+            const base = (p * n_heads + h) * head_dim;
+            for (0..half) |i| {
+                const lo = x[base + i];
+                const hi = x[base + half + i];
+                x[base + i] = lo * cos[i] - hi * sin[i];
+                x[base + half + i] = hi * cos[i] + lo * sin[i];
+            }
+        }
+    }
+}
+
 /// applyRotateHalf with an explicit absolute position per row (speculative
 /// tree-verify batches: node positions are depth-based, not consecutive).
 /// `freqs` must cover max(positions) + 1.
