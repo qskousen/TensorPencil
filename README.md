@@ -121,7 +121,7 @@ Added another executable that processes LLM models, for fun: `tp-llm`. Only test
 text encoder model (embedded tables) and now supports gguf models and qwen 3.6 27b, with vision.
 
 Can run in single-response mode if you specify `--prompt <prompt>`, or runs in REPL (conversation) mode if you skip
-the prompt. In REPL mode, type `/exit` to exit. Runs on all four backends:
+the prompt. In REPL mode, type `/exit` to exit. Runs on all four backends. Qwen 3 VL 4b:
 
 | Backend  | tok/s |
 |:---------|:------|
