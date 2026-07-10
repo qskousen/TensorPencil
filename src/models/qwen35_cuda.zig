@@ -416,7 +416,16 @@ pub const CudaLM = struct {
         self.len += n;
     }
 
-    /// GEMV for one row, dequant-to-f16 tensor-core GEMM for a batch.
+    /// Prefill chunks up to this many rows take the grouped dp4a GEMV
+    /// (weight streamed ceil(n/8) times) instead of opMatmulQuant's full
+    /// dequant-to-f16 GEMM. Measured on the 3090 27B: one grouped pass is
+    /// ~165 us vs ~0.92 ms per weight per chunk for dequant+hgemm
+    /// (n-independent), so the crossover sits near n = 44 — grouped wins
+    /// 3-6x on chat-turn-sized chunks, GEMM wins on full 128-row chunks.
+    const grouped_prefill_max = 40;
+
+    /// GEMV for one row, grouped dp4a GEMV for small batches,
+    /// dequant-to-f16 tensor-core GEMM beyond.
     fn gemm(self: *CudaLM, y: Buf, x: Buf, w: ops.matmul.Weight, n: usize) !void {
         if (n == 1) {
             try self.quantizeX(x, w.cols);
@@ -427,6 +436,16 @@ pub const CudaLM = struct {
                 const x_t = offsetBufSized(x, t * w.cols * 4, w.cols * 4);
                 try self.quantizeX(x_t, w.cols);
                 try self.gemv(offsetBufSized(y, t * w.rows * 4, w.rows * 4), x_t, w);
+            }
+            return;
+        }
+        if ((w.dtype == .q5_k or w.dtype == .q6_k) and n <= grouped_prefill_max) {
+            try self.quantizeX(x, n * w.cols);
+            var off: usize = 0;
+            while (off < n) : (off += 8) {
+                // usize annotation: @min range-narrows (ZIG.md).
+                const ng: usize = @min(8, n - off);
+                try self.be.opGemvQuantQ8N(w.dtype, offsetBufSized(y, off * w.rows * 4, ng * w.rows * 4), w.bytes, w.scale, w.rows, w.cols, ng, off, n);
             }
             return;
         }

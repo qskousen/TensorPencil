@@ -1214,6 +1214,25 @@ pub const Backend = struct {
         try self.rowLaunch(f, w_db, self.q8_act, y, null, .{ @intCast(rows), @intCast(cols), 0, 0, 0, 0 }, .{ scale, 0 }, rows / 8);
     }
 
+    /// Grouped dp4a GEMV for small-batch prefill: y[i][rows] f32 = scale *
+    /// (W quant @ x̂_(row_off+i)) for ng <= 8 activation rows staged by ONE
+    /// opGemvQuantizeX(x, n*cols) — the weight streams once per pass instead
+    /// of the dequant-to-f16 GEMM's ~6.5x traffic for small chunks.
+    pub fn opGemvQuantQ8N(self: *Backend, dt: dtypes.DType, y: DeviceBuffer, w_bytes: []const u8, scale: f32, rows: usize, cols: usize, ng: usize, row_off: usize, n_total: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.matmul);
+        std.debug.assert(cols % 256 == 0 and rows % 8 == 0);
+        std.debug.assert(ng >= 1 and ng <= 8 and row_off + ng <= n_total);
+        std.debug.assert(self.q8_act.size >= n_total * cols / 32 * 4 + n_total * cols);
+        const w_db = try self.cachedWeight(w_bytes);
+        const f = switch (dt) {
+            .q5_k => try self.eltFn(elt.gemv_q5_k_q8n_ptx, "gemv_q5_k_q8n"),
+            .q6_k => try self.eltFn(elt.gemv_q6_k_q8n_ptx, "gemv_q6_k_q8n"),
+            else => unreachable,
+        };
+        try self.rowLaunch(f, w_db, self.q8_act, y, null, .{ @intCast(rows), @intCast(cols), @intCast(ng), @intCast(row_off), @intCast(n_total * cols / 32), 0 }, .{ scale, 0 }, rows / 8);
+    }
+
     /// ggml block-quant GEMM (prefill): the opMatmulFp8 shape — dequant the
     /// weight to the shared f16 scratch, convert/pad the activations, run the
     /// f16 tensor-core GEMM. rows,cols must be multiples of 128,32.
@@ -2467,6 +2486,51 @@ test "dp4a gemv quant kernels match CPU reference" {
             var acc: f64 = 0;
             for (row_f32, xq) |wv, xv| acc += @as(f64, wv) * xv;
             try std.testing.expectApproxEqAbs(@as(f32, @floatCast(acc)), y[r], 2e-2);
+        }
+    }
+
+    // Grouped variant (small-batch prefill): 3 activation rows quantized as
+    // one vector, each output row must match the same CPU reference.
+    const n = 3;
+    const xn = try gpa.alloc(f32, n * cols);
+    defer gpa.free(xn);
+    for (xn) |*xi| xi.* = rand.float(f32) * 2.0 - 1.0;
+    const xn_d = try be.tensorCreate(n * cols * 4);
+    const yn_d = try be.tensorCreate(n * rows * 4);
+    defer {
+        var xd = xn_d;
+        var yd = yn_d;
+        be.tensorDestroy(&xd);
+        be.tensorDestroy(&yd);
+    }
+    try be.tensorUpload(xn_d, std.mem.sliceAsBytes(xn));
+    try be.opGemvQuantizeX(xn_d, n * cols);
+
+    const xnq = try gpa.alloc(f32, n * cols);
+    defer gpa.free(xnq);
+    blk = 0;
+    while (blk < n * cols / 32) : (blk += 1) {
+        var amax: f32 = 0;
+        for (xn[blk * 32 ..][0..32]) |xi| amax = @max(amax, @abs(xi));
+        const d: f32 = amax / 127.0;
+        const inv: f32 = if (amax == 0) 0 else 127.0 / amax;
+        for (0..32) |j| xnq[blk * 32 + j] = d * @round(xn[blk * 32 + j] * inv);
+    }
+
+    const yn = try gpa.alloc(f32, n * rows);
+    defer gpa.free(yn);
+    inline for (dts, 0..) |dt, i| {
+        const w = ws[i];
+        try be.opGemvQuantQ8N(dt, yn_d, w, 1.0, rows, cols, n, 0, n);
+        try be.tensorDownload(yn_d, std.mem.sliceAsBytes(yn));
+        const row_bytes = dt.storageBytes(cols);
+        for (0..n) |t| {
+            for (0..rows) |r| {
+                quants.dequantSlice(dt, w[r * row_bytes ..][0..row_bytes], 0, cols, row_f32);
+                var acc: f64 = 0;
+                for (row_f32, xnq[t * cols ..][0..cols]) |wv, xv| acc += @as(f64, wv) * xv;
+                try std.testing.expectApproxEqAbs(@as(f32, @floatCast(acc)), yn[t * rows + r], 2e-2);
+            }
         }
     }
 }

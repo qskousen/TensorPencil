@@ -11,6 +11,8 @@
 /// only `rows` threads, e.g. 264 at 256px = 2 blocks on 82 SMs, each doing a
 /// 6144-long serial reduction). Same math/order-independent result. b0=x, b1=out,
 /// b2=mod. u0=rows, u1=dim, u2=premul_off, u3=shift_off, f0=eps. grid=(rows,1,1).
+const std = @import("std");
+
 pub const rms_mod_par_ptx: [:0]const u8 =
     \\.version 8.0
     \\.target sm_86
@@ -1143,6 +1145,317 @@ pub const gemv_q6_k_q8_ptx: [:0]const u8 =
     \\  ret;
     \\}
 ;
+
+/// Grouped dp4a GEMV (small-batch prefill): one pass streams each weight
+/// row once and dots it against up to 8 quantized activation rows staged by
+/// a single quantize_q8_1 over all n rows (llama.cpp mmvq ncols_y<=8 idea;
+/// gemv_fp8n precedent). The W-side walk, scale decode, and v-word assembly
+/// are shared per 16-elem unit; the per-input block (v2 d8 + 2x v2 u loads,
+/// 8 dp4a, scale muls, acc fma) is comptime-generated 8x with a warp-uniform
+/// early-out at ng. xq layout: f32 d[n*cols/32] then i8 qs[n*cols]; input i
+/// (global row row_off+i) reads d at (row_off+i)*cols/32 and qs at
+/// (row_off+i)*cols. y[i][rows] per group. cols % 256 == 0, rows % 8 == 0.
+/// b0=W, b1=xq, b2=y. u0=rows, u1=cols, u2=ng (1..8), u3=row_off,
+/// u4=nblk_total (n*cols/32). f0=scale.
+pub const gemv_q5_k_q8n_ptx: [:0]const u8 = q5n_head ++ q8nInputs(q5nInput) ++ q8n_step ++ q8n_epi_head ++ q8nInputs(q8nEpilogue) ++ q8n_tail;
+
+const q5n_head =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry gemv_q5_k_q8n(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<8>;
+    \\  .reg .b16 %h<4>;
+    \\  .reg .b32 %r<64>;
+    \\  .reg .f32 %f<48>;
+    \\  .reg .b64 %rd<28>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r3,%tid.x;
+    \\  shr.u32 %r5,%r3,5;                     // warp
+    \\  and.b32 %r6,%r3,31;                    // lane
+    \\  shl.b32 %r7,%r1,3; add.u32 %r7,%r7,%r5;            // row
+    \\  ld.param.u32 %r2,[u0]; setp.ge.u32 %p1,%r7,%r2; @%p1 bra END;
+    \\  ld.param.u32 %r4,[u1];                 // cols
+    \\  ld.param.u32 %r61,[u2];                // ng
+    \\  ld.param.u32 %r62,[u3];                // row_off
+    \\  ld.param.u32 %r63,[u4];                // nblk_total
+    \\  ld.param.f32 %f1,[f0];                 // scale
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
+    \\  shr.u32 %r9,%r4,8; mul.lo.u32 %r10,%r9,176;        // row bytes
+    \\  mul.wide.u32 %rd7,%r7,%r10; add.s64 %rd8,%rd1,%rd7; // W row base
+    \\  shl.b32 %r10,%r63,2; cvt.u64.u32 %rd4,%r10; add.s64 %rd4,%rd2,%rd4; // qs region base
+    \\  shr.u32 %r10,%r4,3; cvt.u64.u32 %rd25,%r10;        // d row step (cols/8 bytes)
+    \\  mul.lo.u32 %r11,%r62,%r10; cvt.u64.u32 %rd5,%r11; add.s64 %rd5,%rd2,%rd5; // d base at row_off
+    \\  mul.lo.u32 %r11,%r62,%r4; cvt.u64.u32 %rd6,%r11; add.s64 %rd6,%rd4,%rd6;  // qs base at row_off
+    \\  cvt.u64.u32 %rd26,%r4;                 // qs row step
+    \\  mov.u32 %r55,0; mov.u32 %r57,0x01010101;
+    \\  mov.f32 %f40,0f00000000; mov.f32 %f41,0f00000000; mov.f32 %f42,0f00000000; mov.f32 %f43,0f00000000;
+    \\  mov.f32 %f44,0f00000000; mov.f32 %f45,0f00000000; mov.f32 %f46,0f00000000; mov.f32 %f47,0f00000000;
+    \\  shr.u32 %r30,%r4,4;                    // nu = cols/16
+    \\  mov.u32 %r8,%r6;                       // unit = lane
+    \\LOOP:
+    \\  setp.ge.u32 %p4,%r8,%r30; @%p4 bra LD;
+    \\  shr.u32 %r9,%r8,4;                     // sb
+    \\  and.b32 %r11,%r8,15;                   // within
+    \\  shr.u32 %r12,%r11,2;                   // grp
+    \\  and.b32 %r13,%r11,3; shl.b32 %r13,%r13,3;          // ch8 = chunk*8
+    \\  mul.lo.u32 %r10,%r9,176;
+    \\  cvt.u64.u32 %rd9,%r10; add.s64 %rd10,%rd8,%rd9;    // super-block base
+    \\  shl.b32 %r14,%r12,5; add.u32 %r14,%r14,%r13; add.u32 %r14,%r14,48;
+    \\  cvt.u64.u32 %rd11,%r14; add.s64 %rd12,%rd10,%rd11;
+    \\  ld.global.v2.u32 {%r15,%r16},[%rd12];              // qs0, qs1
+    \\  cvt.u64.u32 %rd13,%r13; add.s64 %rd14,%rd10,%rd13;
+    \\  ld.global.v2.u32 {%r17,%r18},[%rd14+16];           // qh0, qh1
+    \\  ld.global.v4.u32 {%r35,%r36,%r37,%r38},[%rd10];    // d|dmin, s[0..3], s[4..7], s[8..11]
+    \\  mov.b32 {%h0,%h1},%r35;
+    \\  cvt.f32.f16 %f24,%h0;                  // d
+    \\  cvt.f32.f16 %f25,%h1;                  // dmin
+    \\  neg.f32 %f12,%f25;
+    \\  shl.b32 %r22,%r12,1;                   // is0 = grp*2
+    \\  shl.b32 %r39,%r22,3;                   // is0*8
+    \\  setp.ge.u32 %p5,%r22,4; @%p5 bra SHI;
+    \\  shr.u32 %r31,%r36,%r39; and.b32 %r31,%r31,63;      // sc0
+    \\  shr.u32 %r32,%r37,%r39; and.b32 %r32,%r32,63;      // m0
+    \\  add.u32 %r40,%r39,8;
+    \\  shr.u32 %r33,%r36,%r40; and.b32 %r33,%r33,63;      // sc1
+    \\  shr.u32 %r34,%r37,%r40; and.b32 %r34,%r34,63;      // m1
+    \\  bra SDONE;
+    \\SHI:
+    \\  add.u32 %r41,%r39,-32;                 // k0*8
+    \\  shr.u32 %r42,%r38,%r41; and.b32 %r31,%r42,15;
+    \\  shr.u32 %r43,%r36,%r41; shr.u32 %r43,%r43,6; and.b32 %r43,%r43,3; shl.b32 %r43,%r43,4; or.b32 %r31,%r31,%r43;
+    \\  shr.u32 %r44,%r42,4; and.b32 %r32,%r44,15;
+    \\  shr.u32 %r43,%r37,%r41; shr.u32 %r43,%r43,6; and.b32 %r43,%r43,3; shl.b32 %r43,%r43,4; or.b32 %r32,%r32,%r43;
+    \\  add.u32 %r41,%r41,8;                   // k1*8
+    \\  shr.u32 %r42,%r38,%r41; and.b32 %r33,%r42,15;
+    \\  shr.u32 %r43,%r36,%r41; shr.u32 %r43,%r43,6; and.b32 %r43,%r43,3; shl.b32 %r43,%r43,4; or.b32 %r33,%r33,%r43;
+    \\  shr.u32 %r44,%r42,4; and.b32 %r34,%r44,15;
+    \\  shr.u32 %r43,%r37,%r41; shr.u32 %r43,%r43,6; and.b32 %r43,%r43,3; shl.b32 %r43,%r43,4; or.b32 %r34,%r34,%r43;
+    \\SDONE:
+    \\  // v words (shared across inputs)
+    \\  and.b32 %r47,%r15,0x0f0f0f0f;
+    \\  shr.u32 %r48,%r17,%r22; shl.b32 %r48,%r48,4; and.b32 %r48,%r48,0x10101010; or.b32 %r47,%r47,%r48; // v_lo0
+    \\  and.b32 %r49,%r16,0x0f0f0f0f;
+    \\  shr.u32 %r50,%r18,%r22; shl.b32 %r50,%r50,4; and.b32 %r50,%r50,0x10101010; or.b32 %r49,%r49,%r50; // v_lo1
+    \\  add.u32 %r21,%r22,1;
+    \\  shr.u32 %r51,%r15,4; and.b32 %r51,%r51,0x0f0f0f0f;
+    \\  shr.u32 %r52,%r17,%r21; shl.b32 %r52,%r52,4; and.b32 %r52,%r52,0x10101010; or.b32 %r51,%r51,%r52; // v_hi0
+    \\  shr.u32 %r53,%r16,4; and.b32 %r53,%r53,0x0f0f0f0f;
+    \\  shr.u32 %r54,%r18,%r21; shl.b32 %r54,%r54,4; and.b32 %r54,%r54,0x10101010; or.b32 %r53,%r53,%r54; // v_hi1
+    \\  // moving input pointers for this unit (d pair, quants)
+    \\  shl.b32 %r45,%r9,3; add.u32 %r45,%r45,%r22; shl.b32 %r46,%r45,2;
+    \\  cvt.u64.u32 %rd15,%r46; add.s64 %rd16,%rd5,%rd15;
+    \\  shl.b32 %r46,%r9,8; shl.b32 %r20,%r12,6; add.u32 %r46,%r46,%r20; add.u32 %r46,%r46,%r13;
+    \\  cvt.u64.u32 %rd17,%r46; add.s64 %rd18,%rd6,%rd17;
+    \\
+;
+
+/// One grouped-GEMV input block (q5_k): dot the unit's shared v words with
+/// input i's quants, scale, accumulate into %f4{0+i}.
+fn q5nInput(comptime i: u32) []const u8 {
+    return std.fmt.comptimePrint(
+        \\  setp.le.u32 %p6,%r61,{d}; @%p6 bra UDONE;
+        \\  ld.global.v2.f32 {{%f26,%f27}},[%rd16];
+        \\  ld.global.v2.u32 {{%r19,%r20}},[%rd18];
+        \\  ld.global.v2.u32 {{%r23,%r24}},[%rd18+32];
+        \\  dp4a.u32.s32 %r56,%r49,%r20,%r55;
+        \\  dp4a.u32.s32 %r56,%r47,%r19,%r56;
+        \\  dp4a.u32.s32 %r58,%r57,%r20,%r55;
+        \\  dp4a.u32.s32 %r58,%r57,%r19,%r58;
+        \\  dp4a.u32.s32 %r59,%r53,%r24,%r55;
+        \\  dp4a.u32.s32 %r59,%r51,%r23,%r59;
+        \\  dp4a.u32.s32 %r60,%r57,%r24,%r55;
+        \\  dp4a.u32.s32 %r60,%r57,%r23,%r60;
+        \\  mul.lo.s32 %r56,%r56,%r31;
+        \\  mul.lo.s32 %r58,%r58,%r32;
+        \\  mul.lo.s32 %r59,%r59,%r33;
+        \\  mul.lo.s32 %r60,%r60,%r34;
+        \\  cvt.rn.f32.s32 %f6,%r56; cvt.rn.f32.s32 %f7,%r58;
+        \\  cvt.rn.f32.s32 %f8,%r59; cvt.rn.f32.s32 %f9,%r60;
+        \\  mul.f32 %f10,%f6,%f26; fma.rn.f32 %f10,%f8,%f27,%f10;
+        \\  mul.f32 %f11,%f7,%f26; fma.rn.f32 %f11,%f9,%f27,%f11;
+        \\  fma.rn.f32 %f{d},%f10,%f24,%f{d};
+        \\  fma.rn.f32 %f{d},%f11,%f12,%f{d};
+        \\  add.s64 %rd16,%rd16,%rd25;
+        \\  add.s64 %rd18,%rd18,%rd26;
+        \\
+    , .{ i, 40 + i, 40 + i, 40 + i, 40 + i });
+}
+
+/// Concat the 8 per-input blocks of a grouped kernel.
+fn q8nInputs(comptime block: anytype) []const u8 {
+    comptime {
+        var s: []const u8 = "";
+        var i: u32 = 0;
+        while (i < 8) : (i += 1) s = s ++ block(i);
+        return s;
+    }
+}
+
+const q8n_step =
+    \\UDONE:
+    \\  add.u32 %r8,%r8,32; bra LOOP;
+    \\
+;
+
+const q8n_epi_head =
+    \\LD:
+    \\  mul.wide.u32 %rd15,%r7,4; add.s64 %rd24,%rd3,%rd15; // y + row*4
+    \\  shl.b32 %r10,%r2,2; cvt.u64.u32 %rd27,%r10;         // y row step
+    \\
+;
+
+/// Grouped-GEMV epilogue block: butterfly-reduce acc i across the warp
+/// (uniform early-out at ng — all 32 lanes branch together), lane 0 stores
+/// y[i*rows + row].
+fn q8nEpilogue(comptime i: u32) []const u8 {
+    return std.fmt.comptimePrint(
+        \\  setp.le.u32 %p6,%r61,{d}; @%p6 bra END;
+        \\  mov.b32 %r19,%f{d}; shfl.sync.bfly.b32 %r24,%r19,16,0x1f,0xffffffff; mov.b32 %f9,%r24; add.f32 %f{d},%f{d},%f9;
+        \\  mov.b32 %r19,%f{d}; shfl.sync.bfly.b32 %r24,%r19,8,0x1f,0xffffffff;  mov.b32 %f9,%r24; add.f32 %f{d},%f{d},%f9;
+        \\  mov.b32 %r19,%f{d}; shfl.sync.bfly.b32 %r24,%r19,4,0x1f,0xffffffff;  mov.b32 %f9,%r24; add.f32 %f{d},%f{d},%f9;
+        \\  mov.b32 %r19,%f{d}; shfl.sync.bfly.b32 %r24,%r19,2,0x1f,0xffffffff;  mov.b32 %f9,%r24; add.f32 %f{d},%f{d},%f9;
+        \\  mov.b32 %r19,%f{d}; shfl.sync.bfly.b32 %r24,%r19,1,0x1f,0xffffffff;  mov.b32 %f9,%r24; add.f32 %f{d},%f{d},%f9;
+        \\  setp.ne.u32 %p7,%r6,0; @%p7 bra SK{d};
+        \\  mul.f32 %f{d},%f{d},%f1; st.global.f32 [%rd24],%f{d};
+        \\SK{d}:
+        \\  add.s64 %rd24,%rd24,%rd27;
+        \\
+    , .{
+        i,
+        40 + i, 40 + i, 40 + i,
+        40 + i, 40 + i, 40 + i,
+        40 + i, 40 + i, 40 + i,
+        40 + i, 40 + i, 40 + i,
+        40 + i, 40 + i, 40 + i,
+        i,
+        40 + i, 40 + i, 40 + i,
+        i,
+    });
+}
+
+const q8n_tail =
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// gemv_q5_k_q8n's q6_k twin: shared W-side v assembly and integer scales
+/// per 16-elem unit, comptime-generated per-input blocks (v4 d8 + 4 u32
+/// loads, 8 dp4a, dot - 32*sum, acc fma). Same xq layout and params.
+pub const gemv_q6_k_q8n_ptx: [:0]const u8 = q6n_head ++ q8nInputs(q6nInput) ++ q8n_step ++ q8n_epi_head ++ q8nInputs(q8nEpilogue) ++ q8n_tail;
+
+const q6n_head =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry gemv_q6_k_q8n(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<8>;
+    \\  .reg .b16 %h<2>;
+    \\  .reg .b32 %r<64>;
+    \\  .reg .f32 %f<48>;
+    \\  .reg .b64 %rd<28>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r3,%tid.x;
+    \\  shr.u32 %r5,%r3,5;                     // warp
+    \\  and.b32 %r6,%r3,31;                    // lane
+    \\  shl.b32 %r7,%r1,3; add.u32 %r7,%r7,%r5;            // row
+    \\  ld.param.u32 %r2,[u0]; setp.ge.u32 %p1,%r7,%r2; @%p1 bra END;
+    \\  ld.param.u32 %r4,[u1];                 // cols
+    \\  ld.param.u32 %r61,[u2];                // ng
+    \\  ld.param.u32 %r62,[u3];                // row_off
+    \\  ld.param.u32 %r63,[u4];                // nblk_total
+    \\  ld.param.f32 %f1,[f0];                 // scale
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
+    \\  shr.u32 %r9,%r4,8; mul.lo.u32 %r10,%r9,210;        // row bytes
+    \\  mul.wide.u32 %rd7,%r7,%r10; add.s64 %rd8,%rd1,%rd7; // W row base
+    \\  shl.b32 %r10,%r63,2; cvt.u64.u32 %rd4,%r10; add.s64 %rd4,%rd2,%rd4; // qs region base
+    \\  shr.u32 %r10,%r4,3; cvt.u64.u32 %rd25,%r10;        // d row step (cols/8 bytes)
+    \\  mul.lo.u32 %r11,%r62,%r10; cvt.u64.u32 %rd5,%r11; add.s64 %rd5,%rd2,%rd5; // d base at row_off
+    \\  mul.lo.u32 %r11,%r62,%r4; cvt.u64.u32 %rd6,%r11; add.s64 %rd6,%rd4,%rd6;  // qs base at row_off
+    \\  cvt.u64.u32 %rd26,%r4;                 // qs row step
+    \\  mov.u32 %r48,0; mov.u32 %r49,0x01010101;
+    \\  mov.f32 %f40,0f00000000; mov.f32 %f41,0f00000000; mov.f32 %f42,0f00000000; mov.f32 %f43,0f00000000;
+    \\  mov.f32 %f44,0f00000000; mov.f32 %f45,0f00000000; mov.f32 %f46,0f00000000; mov.f32 %f47,0f00000000;
+    \\  shr.u32 %r30,%r4,4;                    // nu = cols/16
+    \\  mov.u32 %r8,%r6;                       // unit = lane
+    \\LOOP:
+    \\  setp.ge.u32 %p4,%r8,%r30; @%p4 bra LD;
+    \\  shr.u32 %r9,%r8,4;                     // sb
+    \\  and.b32 %r11,%r8,15;                   // lu
+    \\  mul.lo.u32 %r10,%r9,210;
+    \\  cvt.u64.u32 %rd9,%r10; add.s64 %rd10,%rd8,%rd9;    // super-block base
+    \\  shr.u32 %r12,%r11,3;                   // half
+    \\  and.b32 %r13,%r11,7; shl.b32 %r13,%r13,2;          // lb
+    \\  shl.b32 %r15,%r12,6; add.u32 %r15,%r15,%r13;       // ql off
+    \\  cvt.u64.u32 %rd11,%r15; add.s64 %rd12,%rd10,%rd11;
+    \\  ld.global.u16 %r16,[%rd12]; ld.global.u16 %r17,[%rd12+2];
+    \\  shl.b32 %r17,%r17,16; or.b32 %r16,%r16,%r17;       // w_lo
+    \\  ld.global.u16 %r18,[%rd12+32]; ld.global.u16 %r19,[%rd12+34];
+    \\  shl.b32 %r19,%r19,16; or.b32 %r18,%r18,%r19;       // w_32
+    \\  shl.b32 %r20,%r12,5; add.u32 %r20,%r20,%r13;       // half*32 + lb
+    \\  cvt.u64.u32 %rd13,%r20; add.s64 %rd17,%rd10,%rd13;
+    \\  ld.global.u16 %r21,[%rd17+128]; ld.global.u16 %r22,[%rd17+130];
+    \\  shl.b32 %r22,%r22,16; or.b32 %r21,%r21,%r22;       // w_h
+    \\  ld.global.b16 %h0,[%rd10+208]; cvt.f32.f16 %f24,%h0; // d
+    \\  shl.b32 %r23,%r12,3; shr.u32 %r25,%r13,4; add.u32 %r23,%r23,%r25;
+    \\  cvt.u64.u32 %rd14,%r23; add.s64 %rd15,%rd10,%rd14;
+    \\  ld.global.s8 %r26,[%rd15+192];         // sc0
+    \\  ld.global.s8 %r29,[%rd15+194];         // sc1
+    \\  ld.global.s8 %r31,[%rd15+196];         // sc2
+    \\  ld.global.s8 %r32,[%rd15+198];         // sc3
+    \\  // v words (shared across inputs)
+    \\  and.b32 %r40,%r16,0x0f0f0f0f; and.b32 %r41,%r21,0x03030303; shl.b32 %r41,%r41,4; or.b32 %r40,%r40,%r41;                  // v_0
+    \\  and.b32 %r42,%r18,0x0f0f0f0f; shr.u32 %r43,%r21,2; and.b32 %r43,%r43,0x03030303; shl.b32 %r43,%r43,4; or.b32 %r42,%r42,%r43; // v_1
+    \\  shr.u32 %r44,%r16,4; and.b32 %r44,%r44,0x0f0f0f0f; shr.u32 %r45,%r21,4; and.b32 %r45,%r45,0x03030303; shl.b32 %r45,%r45,4; or.b32 %r44,%r44,%r45; // v_2
+    \\  shr.u32 %r46,%r18,4; and.b32 %r46,%r46,0x0f0f0f0f; shr.u32 %r47,%r21,6; and.b32 %r47,%r47,0x03030303; shl.b32 %r47,%r47,4; or.b32 %r46,%r46,%r47; // v_3
+    \\  // moving input pointers for this unit (d quad, quants)
+    \\  shl.b32 %r33,%r9,3; shl.b32 %r34,%r12,2; add.u32 %r33,%r33,%r34;
+    \\  shl.b32 %r34,%r33,2;
+    \\  cvt.u64.u32 %rd18,%r34; add.s64 %rd22,%rd5,%rd18;
+    \\  shl.b32 %r34,%r9,8; shl.b32 %r35,%r12,7; add.u32 %r34,%r34,%r35; add.u32 %r34,%r34,%r13;
+    \\  cvt.u64.u32 %rd20,%r34; add.s64 %rd23,%rd6,%rd20;
+    \\
+;
+
+/// One grouped-GEMV input block (q6_k): shared v words vs input i's quants;
+/// the -32 offset folds in as dot - 32*sum(u), scales stay integer.
+fn q6nInput(comptime i: u32) []const u8 {
+    return std.fmt.comptimePrint(
+        \\  setp.le.u32 %p6,%r61,{d}; @%p6 bra UDONE;
+        \\  ld.global.v4.f32 {{%f4,%f5,%f10,%f11}},[%rd22];
+        \\  ld.global.u32 %r36,[%rd23];
+        \\  ld.global.u32 %r37,[%rd23+32];
+        \\  ld.global.u32 %r38,[%rd23+64];
+        \\  ld.global.u32 %r39,[%rd23+96];
+        \\  dp4a.u32.s32 %r50,%r40,%r36,%r48;
+        \\  dp4a.u32.s32 %r51,%r49,%r36,%r48;
+        \\  dp4a.u32.s32 %r52,%r42,%r37,%r48;
+        \\  dp4a.u32.s32 %r53,%r49,%r37,%r48;
+        \\  dp4a.u32.s32 %r54,%r44,%r38,%r48;
+        \\  dp4a.u32.s32 %r55,%r49,%r38,%r48;
+        \\  dp4a.u32.s32 %r56,%r46,%r39,%r48;
+        \\  dp4a.u32.s32 %r57,%r49,%r39,%r48;
+        \\  shl.b32 %r51,%r51,5; sub.s32 %r50,%r50,%r51; mul.lo.s32 %r50,%r50,%r26;
+        \\  shl.b32 %r53,%r53,5; sub.s32 %r52,%r52,%r53; mul.lo.s32 %r52,%r52,%r29;
+        \\  shl.b32 %r55,%r55,5; sub.s32 %r54,%r54,%r55; mul.lo.s32 %r54,%r54,%r31;
+        \\  shl.b32 %r57,%r57,5; sub.s32 %r56,%r56,%r57; mul.lo.s32 %r56,%r56,%r32;
+        \\  cvt.rn.f32.s32 %f6,%r50; cvt.rn.f32.s32 %f7,%r52;
+        \\  cvt.rn.f32.s32 %f8,%r54; cvt.rn.f32.s32 %f9,%r56;
+        \\  mul.f32 %f12,%f6,%f4;
+        \\  fma.rn.f32 %f12,%f7,%f5,%f12;
+        \\  fma.rn.f32 %f12,%f8,%f10,%f12;
+        \\  fma.rn.f32 %f12,%f9,%f11,%f12;
+        \\  fma.rn.f32 %f{d},%f12,%f24,%f{d};
+        \\  add.s64 %rd22,%rd22,%rd25;
+        \\  add.s64 %rd23,%rd23,%rd26;
+        \\
+    , .{ i, 40 + i, 40 + i });
+}
 
 /// attn_split for head_dim 256 (qwen35): identical flash-decoding split to
 /// attn_split, but each lane owns EIGHT dims (two v4 fragments) instead of

@@ -498,10 +498,18 @@ would add ~10 pts acceptance on top.
   `@min(prefill_chunk, ...)` yields u7, so `pos3s[0 .. n * 3]` overflowed
   and chunks with n >= 43 passed a truncated slice — stepBatch silently
   processed n' = ((n*3)&127)/3 rows. Fixed with `const n: usize =
-  @min(...)`. Remaining headroom: small-batch prefill (opMatmulQuant
-  dequantizes the ENTIRE weight matrix to f16 even for an 8-row chunk —
-  ~0.5-0.7 s per short prompt; a grouped-N dp4a GEMV for n <= 8 would fix
-  it), q6_k GEMV load alignment (repack at upload time), GPU ViT.
+  @min(...)`. GROUPED SMALL-BATCH PREFILL (2026-07-10 evening):
+  `gemv_q5_k_q8n`/`gemv_q6_k_q8n` (opGemvQuantQ8N) stream each weight row
+  once against up to 8 quantized activation rows (comptime-generated
+  per-input PTX blocks; one quantize_q8_1 stages the whole chunk). Routed
+  in gemm() for chunks <= 40 rows — MEASURED crossover: one grouped pass
+  is ~165 us/weight vs dequant+hgemm's flat ~0.92 ms/weight/chunk, so
+  grouped wins 3-6x on chat-turn-sized prefills and loses ~2.5x at 128
+  rows (first attempt routed everything and made long prompts 4x slower —
+  always measure the crossover). Remaining headroom: q6_k GEMV load
+  alignment (repack at upload time), the grouped kernel's per-pass cost
+  (165 us is ~4.7x a single-x pass for 8x the rows — the sequential
+  8-input blocks expose latency), GPU ViT.
   VISION (2026-07): `models/vit35.zig` implements the qwen3vl_merger mmproj
   (llama.cpp tools/mtmd port: smart-resize + fit/pad bilinear preprocessing,
   summed dual patch convs, antialias-interpolated 48x48 position grid,
