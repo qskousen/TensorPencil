@@ -18,6 +18,7 @@ const qwen3 = @import("qwen3.zig");
 const cuda = @import("../gpu/cuda.zig");
 const safetensors = @import("../safetensors.zig");
 const ops = @import("../ops.zig");
+const spec = @import("../llm/spec.zig");
 
 const Backend = cuda.Backend;
 const Buf = cuda.backend.DeviceBuffer;
@@ -147,28 +148,63 @@ pub const CudaLM = struct {
     lm: *const qwen3.CausalLM,
     be: *Backend,
     gpa: std.mem.Allocator,
+    /// Model shape (mirrors lm.cfg): the 4B target or the 0.6B draft.
+    cfg: qwen3.Config,
     capacity: usize,
     /// Committed cache length (absolute position of the next token).
     len: usize = 0,
     /// Activation-buffer row budget: the prompt for prefill, 1 afterwards.
     max_rows: usize,
     sin_off: usize,
-    k_cache: [n_layers]Buf,
-    v_cache: [n_layers]Buf,
+    /// Only cfg.n_layers entries are live.
+    k_cache: [qwen3.Config.max_layers]Buf,
+    v_cache: [qwen3.Config.max_layers]Buf,
     freqs_d: Buf,
     bufs: LmBufs,
+    /// Hidden-state taps for the EAGLE-3 drafter (enableTaps): the residual
+    /// stream ENTERING each tap layer, device-resident for every committed
+    /// position — [3][capacity][hidden] f32. Zero size when disabled.
+    tap_layers: [3]usize = .{ 0, 0, 0 },
+    tap_d: Buf = .{},
+    taps_on: bool = false,
+    /// Tree-verify state (enableTree, LLM_PLAN.md M8): batch K/V rows live
+    /// at rows [capacity, capacity + spec.max_tree_nodes) of the (enlarged)
+    /// per-layer caches; TreeBufs holds positions/meta/logits/tap rows.
+    tree: ?TreeBufs = null,
+    /// Node count of the last stepAllTree (commitTreePath bound).
+    tree_n: usize = 0,
+    /// Captured decode step (CUDA graph): one launch replays the whole
+    /// forward, with {token, pos0} read from device state. Null until the
+    /// second single-token step (the first warms weight residency + JIT).
+    graph_exec: cuda.cu.CUgraphExec = null,
+    /// First single-token decode ran (capture is safe now).
+    decode_warm: bool = false,
+    /// Cleared permanently if capture fails — falls back to per-op launches.
+    graph_ok: bool = true,
 
     pub fn init(gpa: std.mem.Allocator, be: *Backend, lm: *const qwen3.CausalLM, capacity: usize, first_seq: usize) !CudaLM {
+        const c = lm.cfg;
         var self: CudaLM = undefined;
         self.lm = lm;
         self.be = be;
         self.gpa = gpa;
+        self.cfg = c;
         self.capacity = capacity;
         self.len = 0;
-        self.max_rows = @max(first_seq, 1);
+        // Activation buffers always cover a speculative verify batch; padded
+        // GEMM buffers are 128-row anyway, so the floor is nearly free.
+        self.max_rows = @max(@max(first_seq, 1), spec.max_draft + 1);
         self.sin_off = capacity * half;
+        self.graph_exec = null;
+        self.decode_warm = false;
+        self.graph_ok = true;
+        self.tap_layers = .{ 0, 0, 0 };
+        self.tap_d = .{};
+        self.taps_on = false;
+        self.tree = null;
+        self.tree_n = 0;
 
-        var freqs = try ops.rope.rotateHalfFreqs(gpa, capacity, hd, qwen3.rope_theta);
+        var freqs = try ops.rope.rotateHalfFreqs(gpa, capacity, hd, c.rope_theta);
         defer freqs.deinit(gpa);
         const fp = try gpa.alloc(f32, 2 * capacity * half);
         defer gpa.free(fp);
@@ -180,24 +216,78 @@ pub const CudaLM = struct {
 
         var created: usize = 0;
         errdefer for (self.k_cache[0..created]) |*b| be.tensorDestroy(b);
-        for (&self.k_cache) |*b| {
-            b.* = try be.tensorCreate(capacity * kv_dim * 4);
+        for (self.k_cache[0..c.n_layers]) |*b| {
+            b.* = try be.tensorCreate(capacity * c.kvDim() * 4);
             created += 1;
         }
         var vcreated: usize = 0;
         errdefer for (self.v_cache[0..vcreated]) |*b| be.tensorDestroy(b);
-        for (&self.v_cache) |*b| {
-            b.* = try be.tensorCreate(capacity * kv_dim * 4);
+        for (self.v_cache[0..c.n_layers]) |*b| {
+            b.* = try be.tensorCreate(capacity * c.kvDim() * 4);
             vcreated += 1;
         }
 
-        self.bufs = try LmBufs.init(be, self.max_rows);
+        self.bufs = try LmBufs.init(be, self.max_rows, c);
         return self;
     }
 
+    /// Record the residual stream entering `layers` for every forwarded
+    /// position (the EAGLE-3 drafter's fused-feature inputs). Call before
+    /// any forward; costs 3 x capacity x hidden f32 of VRAM.
+    pub fn enableTaps(self: *CudaLM, layers: [3]usize) !void {
+        std.debug.assert(!self.taps_on);
+        for (layers) |l| std.debug.assert(l < self.cfg.n_layers);
+        self.tap_d = try self.be.tensorCreate(3 * self.capacity * self.cfg.hidden * 4);
+        self.tap_layers = layers;
+        self.taps_on = true;
+    }
+
+    /// Enable the tree-verify path (spec.generateTree): rebuilds the K/V
+    /// caches with spec.max_tree_nodes extra rows (the batch region — tree
+    /// nodes cannot append linearly, sibling branches collide at the same
+    /// position), grows the activation buffers to cover a full tree batch,
+    /// and allocates the tree buffers. Call before any forward.
+    pub fn enableTree(self: *CudaLM) !void {
+        const be = self.be;
+        const c = self.cfg;
+        std.debug.assert(self.tree == null and self.len == 0);
+
+        const kv_bytes = (self.capacity + spec.max_tree_nodes) * c.kvDim() * 4;
+        var nk: [qwen3.Config.max_layers]Buf = undefined;
+        var nv: [qwen3.Config.max_layers]Buf = undefined;
+        var created: usize = 0;
+        errdefer for (0..created) |i| {
+            be.tensorDestroy(if (i < c.n_layers) &nk[i] else &nv[i - c.n_layers]);
+        };
+        for (nk[0..c.n_layers]) |*b| {
+            b.* = try be.tensorCreate(kv_bytes);
+            created += 1;
+        }
+        for (nv[0..c.n_layers]) |*b| {
+            b.* = try be.tensorCreate(kv_bytes);
+            created += 1;
+        }
+        var tb = try TreeBufs.init(be, c);
+        errdefer tb.deinit(be);
+        if (self.max_rows < spec.max_tree_nodes) {
+            const bufs = try LmBufs.init(be, spec.max_tree_nodes, c);
+            self.bufs.deinit(be);
+            self.bufs = bufs;
+            self.max_rows = spec.max_tree_nodes;
+        }
+        for (self.k_cache[0..c.n_layers]) |*b| be.tensorDestroy(b);
+        for (self.v_cache[0..c.n_layers]) |*b| be.tensorDestroy(b);
+        self.k_cache = nk;
+        self.v_cache = nv;
+        self.tree = tb;
+    }
+
     pub fn deinit(self: *CudaLM) void {
-        for (&self.k_cache) |*b| self.be.tensorDestroy(b);
-        for (&self.v_cache) |*b| self.be.tensorDestroy(b);
+        if (self.tree) |*tb| tb.deinit(self.be);
+        if (self.taps_on) self.be.tensorDestroy(&self.tap_d);
+        if (self.graph_exec != null) self.be.graphDestroy(self.graph_exec);
+        for (self.k_cache[0..self.cfg.n_layers]) |*b| self.be.tensorDestroy(b);
+        for (self.v_cache[0..self.cfg.n_layers]) |*b| self.be.tensorDestroy(b);
         self.be.tensorDestroy(&self.freqs_d);
         self.bufs.deinit(self.be);
         self.* = undefined;
@@ -215,7 +305,18 @@ pub const CudaLM = struct {
     /// last-position vocab logits. Multi-turn prefills longer than the
     /// activation buffers run as max_rows-sized chunks (each chunk's LM head
     /// is wasted except the last — negligible next to the layer GEMMs).
+    /// Single-token decode replays a captured CUDA graph (one launch instead
+    /// of ~700-950) once the first decode step has warmed weight residency;
+    /// --profile and capture failures fall back to per-op launches.
     pub fn step(self: *CudaLM, io: std.Io, ids: []const u32, logits: []f32) !void {
+        // Any weight eviction (--vram-budget streaming, or live VRAM pressure
+        // from another process) means device weight pointers are not stable,
+        // and a captured graph would replay against freed buffers.
+        if (self.be.evictions != 0) self.graph_ok = false;
+        if (ids.len == 1 and self.graph_ok and !self.be.profile) {
+            if (self.decode_warm) return self.stepDecodeGraph(io, ids[0], logits);
+            self.decode_warm = true;
+        }
         var off: usize = 0;
         while (off < ids.len) {
             const n = @min(self.max_rows, ids.len - off);
@@ -224,79 +325,440 @@ pub const CudaLM = struct {
         }
     }
 
+    fn stepDecodeGraph(self: *CudaLM, io: std.Io, id: u32, logits: []f32) !void {
+        const be = self.be;
+        std.debug.assert(self.remaining() >= 1);
+        try be.setDecodeState(id, @intCast(self.len));
+        if (self.graph_exec == null) {
+            self.captureDecodeGraph() catch |err| {
+                // Leave graph mode permanently and decode this token normally.
+                std.debug.print("[decode graph capture failed ({t}); falling back to per-op launches]\n", .{err});
+                self.graph_ok = false;
+                return self.stepChunk(io, &.{id}, logits);
+            };
+        }
+        if (be.evictions != 0) {
+            // Capture itself ran the cache over budget: the fresh graph may
+            // already hold evicted-weight pointers. Decode per-op instead.
+            self.graph_ok = false;
+            return self.stepChunk(io, &.{id}, logits);
+        }
+        try be.graphLaunch(self.graph_exec);
+        self.len += 1;
+        try be.tensorDownload(offsetBufSized(self.bufs.logits, 0, qwen3.vocab_size * 4), std.mem.sliceAsBytes(logits[0..qwen3.vocab_size]));
+    }
+
+    fn captureDecodeGraph(self: *CudaLM) !void {
+        const be = self.be;
+        try be.graphCaptureBegin();
+        errdefer if (be.graphCaptureEnd()) |exec| be.graphDestroy(exec) else |_| {};
+        try self.recordDecodeOps();
+        self.graph_exec = try be.graphCaptureEnd();
+    }
+
+    /// The full single-token decode forward, recorded for graph capture:
+    /// identical kernels and order to stepChunk at seq == 1, except the
+    /// embedding gather runs on device and pos0/token come from g_state
+    /// (bitwise-identical logits either way). No batch bookkeeping, no
+    /// downloads — the caller launches the graph and reads bufs.logits.
+    fn recordDecodeOps(self: *CudaLM) !void {
+        const be = self.be;
+        const c = self.cfg;
+        const b = &self.bufs;
+        try be.opEmbedGatherS(offsetBufSized(b.x, 0, c.hidden * 4), self.lm.embed_bytes, c.hidden);
+        for (self.lm.layers, 0..) |layer, l| {
+            if (self.taps_on) {
+                for (self.tap_layers, 0..) |tl, j| {
+                    if (l == tl) try be.opKvAppendS(self.tap_d, b.x, c.hidden, c.hidden, j * self.capacity * c.hidden);
+                }
+            }
+            try be.qkNorm(b.x, b.normed, try nbuf(be, layer.input_norm), 1, c.hidden, eps);
+            try self.linear(b.q, b.normed, layer.q, c.qDim(), c.hidden, 1);
+            try self.linear(b.k, b.normed, layer.k, c.kvDim(), c.hidden, 1);
+            try self.linear(b.v, b.normed, layer.v, c.kvDim(), c.hidden, 1);
+            try be.qkNorm(b.q, b.q, try nbuf(be, layer.q_norm), c.n_heads, hd, eps);
+            try be.qkNorm(b.k, b.k, try nbuf(be, layer.k_norm), c.n_kv_heads, hd, eps);
+            try be.opRopeHalfS(b.q, self.freqs_d, c.n_heads, half, self.sin_off);
+            try be.opRopeHalfS(b.k, self.freqs_d, c.n_kv_heads, half, self.sin_off);
+            try be.opKvAppendS(self.k_cache[l], b.k, c.kvDim(), c.kvDim(), 0);
+            try be.opKvAppendS(self.v_cache[l], b.v, c.kvDim(), c.kvDim(), 0);
+            try be.opAttnDecodeSGraph(b.q, self.k_cache[l], self.v_cache[l], b.attn, b.attn_scratch, c.n_heads, c.n_kv_heads, hd, nsplit, attn_scale);
+            try self.linear(b.t, b.attn, layer.o, c.hidden, c.qDim(), 1);
+            try be.opAdd(b.x, b.t, c.hidden);
+            try be.qkNorm(b.x, b.normed, try nbuf(be, layer.post_norm), 1, c.hidden, eps);
+            try self.linear(b.gate, b.normed, layer.gate, c.intermediate, c.hidden, 1);
+            try self.linear(b.up, b.normed, layer.up, c.intermediate, c.hidden, 1);
+            try be.siluMul(b.gate, b.up, c.intermediate);
+            try self.linear(b.t, b.gate, layer.down, c.hidden, c.intermediate, 1);
+            try be.opAdd(b.x, b.t, c.hidden);
+        }
+        try be.qkNorm(offsetBufSized(b.x, 0, c.hidden * 4), b.t, try nbuf(be, self.lm.final_norm), 1, c.hidden, eps);
+        try be.opGemvBf16(b.logits, b.t, self.lm.embed_bytes, 1.0, qwen3.vocab_size, c.hidden);
+    }
+
+    /// step, but with vocab logits for every new token ([ids.len, vocab]
+    /// row-major) — the speculative-decode verify forward. The batch is
+    /// engine-capped at spec.max_draft + 1, which max_rows always covers.
+    pub fn stepAll(self: *CudaLM, io: std.Io, ids: []const u32, logits: []f32) !void {
+        const be = self.be;
+        const seq = ids.len;
+        std.debug.assert(logits.len == seq * qwen3.vocab_size);
+        std.debug.assert(seq > 0 and seq <= spec.max_draft + 1 and seq <= self.max_rows);
+        const b = &self.bufs;
+
+        try self.layersForward(ids);
+        errdefer if (be.batching()) be.abortBatch();
+
+        // Final norm on every new position, then the tied bf16 LM head in
+        // 4-input groups (each group reads the vocab x hidden weight once).
+        // b.t is 128-row padded, so gemv_bf16n's 4-row reads stay in bounds.
+        const h = self.cfg.hidden;
+        try be.qkNorm(b.x, b.t, try nbuf(be, self.lm.final_norm), seq, h, eps);
+        var off: usize = 0;
+        while (off < seq) : (off += 4) {
+            const n: usize = @min(4, seq - off); // annotated: @min would narrow to u3
+            try be.opGemvBf16N(
+                offsetBufSized(b.logits, off * qwen3.vocab_size * 4, n * qwen3.vocab_size * 4),
+                offsetBufSized(b.t, off * h * 4, 4 * h * 4),
+                self.lm.embed_bytes,
+                1.0,
+                qwen3.vocab_size,
+                h,
+                n,
+            );
+        }
+        try be.endBatch();
+        self.len += seq;
+
+        try be.tensorDownload(offsetBufSized(b.logits, 0, seq * qwen3.vocab_size * 4), std.mem.sliceAsBytes(logits));
+        _ = io;
+    }
+
+    /// Roll the KV cache back to `new_len` tokens (speculative-decode
+    /// rejection); device rows past `new_len` are overwritten by later steps.
+    pub fn truncate(self: *CudaLM, new_len: usize) void {
+        std.debug.assert(new_len <= self.len);
+        self.len = new_len;
+    }
+
+    /// Tree-verify forward (spec.generateTree): vocab logits for every tree
+    /// node. Node i sits at position len + depth(i) (per-row rope), attends
+    /// the committed prefix plus its ancestor chain (attn_split_tree), and
+    /// its K/V rows land in the batch region at cache row capacity + i —
+    /// the linear cache and `len` are untouched until commitTreePath.
+    pub fn stepAllTree(self: *CudaLM, io: std.Io, tokens: []const u32, parents: []const u32, logits: []f32) !void {
+        _ = io;
+        const be = self.be;
+        const c = self.cfg;
+        const gpa = self.gpa;
+        const n = tokens.len;
+        std.debug.assert(self.tree != null);
+        std.debug.assert(n >= 1 and n <= spec.max_tree_nodes and n <= self.max_rows);
+        std.debug.assert(parents.len == n and logits.len == n * qwen3.vocab_size);
+        const tb = &self.tree.?;
+        const b = &self.bufs;
+
+        // Host: depth-based positions + the attention meta table (per-query
+        // kv_len, then the ancestor NODE indices in depth order — the split
+        // kernel adds the batch-region base itself).
+        var pos: [spec.max_tree_nodes]u32 = undefined;
+        var depth: [spec.max_tree_nodes]u32 = undefined;
+        pos[0] = @intCast(self.len);
+        depth[0] = 0;
+        for (parents[1..], 1..) |p, i| {
+            std.debug.assert(p < i);
+            depth[i] = depth[p] + 1;
+            pos[i] = pos[0] + depth[i];
+            std.debug.assert(pos[i] < self.capacity);
+        }
+        var meta: [spec.max_tree_nodes * (spec.max_tree_nodes + 1)]u32 = undefined;
+        for (0..n) |i| {
+            meta[i * (n + 1)] = @intCast(self.len + depth[i] + 1);
+            var j: u32 = @intCast(i);
+            var d = depth[i];
+            while (true) {
+                meta[i * (n + 1) + 1 + d] = j;
+                if (j == 0) break;
+                j = parents[j];
+                d -= 1;
+            }
+        }
+        const meta_off = n * c.n_heads * nsplit * (hd + 4);
+        try be.tensorUpload(offsetBufSized(tb.pos, 0, n * 4), std.mem.sliceAsBytes(pos[0..n]));
+        try be.tensorUpload(offsetBufSized(tb.scratch, meta_off * 4, n * (n + 1) * 4), std.mem.sliceAsBytes(meta[0 .. n * (n + 1)]));
+
+        // CPU: embedding gather (bf16 -> f32), upload.
+        const x = try gpa.alloc(f32, n * c.hidden);
+        defer gpa.free(x);
+        for (tokens, 0..) |id, t| {
+            if (id >= qwen3.vocab_size) return error.TokenIdOutOfRange;
+            const row = self.lm.embed_bytes[@as(usize, id) * c.hidden * 2 ..][0 .. c.hidden * 2];
+            try safetensors.convertToF32(.bf16, row, x[t * c.hidden ..][0..c.hidden]);
+        }
+        try be.tensorUpload(offsetBufSized(b.x, 0, n * c.hidden * 4), std.mem.sliceAsBytes(x));
+
+        try be.beginBatch();
+        errdefer if (be.batching()) be.abortBatch();
+        self.prefetchLayer(0);
+        for (self.lm.layers, 0..) |layer, l| {
+            self.prefetchLayer(l + 1); // == layers.len prefetches the LM head
+            if (self.taps_on) {
+                for (self.tap_layers, 0..) |tl, j| {
+                    if (l == tl) try be.opCopyOff(tb.taps, j * spec.max_tree_nodes * c.hidden, b.x, 0, n * c.hidden);
+                }
+            }
+            // --- Attention ---
+            try be.qkNorm(b.x, b.normed, try nbuf(be, layer.input_norm), n, c.hidden, eps);
+            try self.linear(b.q, b.normed, layer.q, c.qDim(), c.hidden, n);
+            try self.linear(b.k, b.normed, layer.k, c.kvDim(), c.hidden, n);
+            try self.linear(b.v, b.normed, layer.v, c.kvDim(), c.hidden, n);
+            try be.qkNorm(b.q, b.q, try nbuf(be, layer.q_norm), n * c.n_heads, hd, eps);
+            try be.qkNorm(b.k, b.k, try nbuf(be, layer.k_norm), n * c.n_kv_heads, hd, eps);
+            try be.opRopeHalfPos(b.q, tb.pos, self.freqs_d, n, c.n_heads, half, self.sin_off);
+            try be.opRopeHalfPos(b.k, tb.pos, self.freqs_d, n, c.n_kv_heads, half, self.sin_off);
+            try be.tensorCopy(self.k_cache[l], self.capacity * c.kvDim() * 4, b.k, 0, n * c.kvDim() * 4);
+            try be.tensorCopy(self.v_cache[l], self.capacity * c.kvDim() * 4, b.v, 0, n * c.kvDim() * 4);
+            try be.opAttnDecodeTree(b.q, self.k_cache[l], self.v_cache[l], b.attn, tb.scratch, self.len, self.capacity, n, c.n_heads, c.n_kv_heads, hd, nsplit, attn_scale);
+            try self.linear(b.t, b.attn, layer.o, c.hidden, c.qDim(), n);
+            try be.opAdd(b.x, b.t, n * c.hidden);
+
+            // --- MLP (SwiGLU) ---
+            try be.qkNorm(b.x, b.normed, try nbuf(be, layer.post_norm), n, c.hidden, eps);
+            try self.linear(b.gate, b.normed, layer.gate, c.intermediate, c.hidden, n);
+            try self.linear(b.up, b.normed, layer.up, c.intermediate, c.hidden, n);
+            try be.siluMul(b.gate, b.up, n * c.intermediate);
+            try self.linear(b.t, b.gate, layer.down, c.hidden, c.intermediate, n);
+            try be.opAdd(b.x, b.t, n * c.hidden);
+        }
+
+        // Final norm on every node, then the tied bf16 LM head in 4-input
+        // groups (b.t is 128-row padded, so the 4-row reads stay in bounds).
+        const h = c.hidden;
+        try be.qkNorm(b.x, b.t, try nbuf(be, self.lm.final_norm), n, h, eps);
+        var off: usize = 0;
+        while (off < n) : (off += 4) {
+            const g: usize = @min(4, n - off); // annotated: @min would narrow to u3
+            try be.opGemvBf16N(
+                offsetBufSized(tb.logits, off * qwen3.vocab_size * 4, g * qwen3.vocab_size * 4),
+                offsetBufSized(b.t, off * h * 4, 4 * h * 4),
+                self.lm.embed_bytes,
+                1.0,
+                qwen3.vocab_size,
+                h,
+                g,
+            );
+        }
+        try be.endBatch();
+        self.tree_n = n;
+
+        try be.tensorDownload(offsetBufSized(tb.logits, 0, n * qwen3.vocab_size * 4), std.mem.sliceAsBytes(logits));
+    }
+
+    /// Copy the accepted root path's K/V rows (and tap rows, when the
+    /// EAGLE-3 taps are on) from the batch region into the linear cache at
+    /// positions [len, len + path.len), then advance len. ~2 * n_layers *
+    /// depth copy_off launches — small next to a verify forward.
+    pub fn commitTreePath(self: *CudaLM, path: []const usize) !void {
+        const be = self.be;
+        const c = self.cfg;
+        std.debug.assert(self.tree != null and path.len >= 1 and path[0] == 0);
+        std.debug.assert(self.len + path.len <= self.capacity);
+        const kvd = c.kvDim();
+        for (0..c.n_layers) |l| {
+            for (path, 0..) |idx, j| {
+                std.debug.assert(idx < self.tree_n);
+                try be.opCopyOff(self.k_cache[l], (self.len + j) * kvd, self.k_cache[l], (self.capacity + idx) * kvd, kvd);
+                try be.opCopyOff(self.v_cache[l], (self.len + j) * kvd, self.v_cache[l], (self.capacity + idx) * kvd, kvd);
+            }
+        }
+        if (self.taps_on) {
+            const tb = &self.tree.?;
+            for (0..3) |t| {
+                for (path, 0..) |idx, j| {
+                    try be.opCopyOff(self.tap_d, (t * self.capacity + self.len + j) * c.hidden, tb.taps, (t * spec.max_tree_nodes + idx) * c.hidden, c.hidden);
+                }
+            }
+        }
+        self.len += path.len;
+    }
+
     fn stepChunk(self: *CudaLM, io: std.Io, ids: []const u32, logits: []f32) !void {
+        const be = self.be;
+        const seq = ids.len;
+        const b = &self.bufs;
+
+        try self.layersForward(ids);
+        errdefer if (be.batching()) be.abortBatch();
+
+        // Final norm on the last position + tied bf16 LM head, on device.
+        const h = self.cfg.hidden;
+        try be.qkNorm(offsetBufSized(b.x, (seq - 1) * h * 4, h * 4), b.t, try nbuf(be, self.lm.final_norm), 1, h, eps);
+        try be.opGemvBf16(b.logits, b.t, self.lm.embed_bytes, 1.0, qwen3.vocab_size, h);
+        self.prefetchLayer(0); // next token's first layer DMAs behind the LM head
+        try be.endBatch();
+        self.len += seq;
+
+        try be.tensorDownload(offsetBufSized(b.logits, 0, qwen3.vocab_size * 4), std.mem.sliceAsBytes(logits[0..qwen3.vocab_size]));
+        _ = io;
+    }
+
+    /// The layer stack over `ids` at positions [len, len+seq): embedding
+    /// upload, then the whole transformer inside an open batch. The caller
+    /// finishes the batch (LM head variants differ) — on success the batch is
+    /// still open, with the final hidden states in bufs.x.
+    fn layersForward(self: *CudaLM, ids: []const u32) !void {
         const gpa = self.gpa;
         const be = self.be;
+        const c = self.cfg;
         const seq = ids.len;
         std.debug.assert(seq > 0 and seq <= self.remaining() and seq <= self.max_rows);
         const pos0 = self.len;
 
         // CPU: embedding gather (bf16 -> f32), upload.
-        const x = try gpa.alloc(f32, seq * hidden);
+        const x = try gpa.alloc(f32, seq * c.hidden);
         defer gpa.free(x);
         for (ids, 0..) |id, t| {
             if (id >= qwen3.vocab_size) return error.TokenIdOutOfRange;
-            const row = self.lm.embed_bytes[@as(usize, id) * hidden * 2 ..][0 .. hidden * 2];
-            try safetensors.convertToF32(.bf16, row, x[t * hidden ..][0..hidden]);
+            const row = self.lm.embed_bytes[@as(usize, id) * c.hidden * 2 ..][0 .. c.hidden * 2];
+            try safetensors.convertToF32(.bf16, row, x[t * c.hidden ..][0..c.hidden]);
         }
-        try be.tensorUpload(offsetBufSized(self.bufs.x, 0, seq * hidden * 4), std.mem.sliceAsBytes(x));
+        try be.tensorUpload(offsetBufSized(self.bufs.x, 0, seq * c.hidden * 4), std.mem.sliceAsBytes(x));
 
         const b = &self.bufs;
         try be.beginBatch();
         errdefer if (be.batching()) be.abortBatch();
 
+        self.prefetchLayer(0);
         for (self.lm.layers, 0..) |layer, l| {
+            self.prefetchLayer(l + 1); // == layers.len prefetches the LM head
+            if (self.taps_on) {
+                for (self.tap_layers, 0..) |tl, j| {
+                    if (l == tl) try be.opCopyOff(self.tap_d, (j * self.capacity + pos0) * c.hidden, b.x, 0, seq * c.hidden);
+                }
+            }
             // --- Attention ---
-            try be.qkNorm(b.x, b.normed, try nbuf(be, layer.input_norm), seq, hidden, eps);
-            if (seq == 1) {
-                try be.opGemvFp8(b.q, b.normed, layer.q.bytes, layer.q.scale, q_dim, hidden);
-                try be.opGemvFp8(b.k, b.normed, layer.k.bytes, layer.k.scale, kv_dim, hidden);
-                try be.opGemvFp8(b.v, b.normed, layer.v.bytes, layer.v.scale, kv_dim, hidden);
+            try be.qkNorm(b.x, b.normed, try nbuf(be, layer.input_norm), seq, c.hidden, eps);
+            try self.linear(b.q, b.normed, layer.q, c.qDim(), c.hidden, seq);
+            try self.linear(b.k, b.normed, layer.k, c.kvDim(), c.hidden, seq);
+            try self.linear(b.v, b.normed, layer.v, c.kvDim(), c.hidden, seq);
+            try be.qkNorm(b.q, b.q, try nbuf(be, layer.q_norm), seq * c.n_heads, hd, eps);
+            try be.qkNorm(b.k, b.k, try nbuf(be, layer.k_norm), seq * c.n_kv_heads, hd, eps);
+            try be.ropeHalf(b.q, self.freqs_d, seq, c.n_heads, half, self.sin_off, pos0);
+            try be.ropeHalf(b.k, self.freqs_d, seq, c.n_kv_heads, half, self.sin_off, pos0);
+            try be.tensorCopy(self.k_cache[l], pos0 * c.kvDim() * 4, b.k, 0, seq * c.kvDim() * 4);
+            try be.tensorCopy(self.v_cache[l], pos0 * c.kvDim() * 4, b.v, 0, seq * c.kvDim() * 4);
+            if (seq <= gemv_batch_max) {
+                // Batched flash-decoding: the naive square kernel has too
+                // little parallelism for a handful of queries.
+                try be.opAttnDecode(b.q, self.k_cache[l], self.v_cache[l], b.attn, b.attn_scratch, pos0 + 1, seq, c.n_heads, c.n_kv_heads, hd, nsplit, attn_scale);
             } else {
-                try be.opMatmulFp8(b.q, b.normed, seq, layer.q.bytes, layer.q.scale, q_dim, hidden);
-                try be.opMatmulFp8(b.k, b.normed, seq, layer.k.bytes, layer.k.scale, kv_dim, hidden);
-                try be.opMatmulFp8(b.v, b.normed, seq, layer.v.bytes, layer.v.scale, kv_dim, hidden);
+                try be.attn(b.q, self.k_cache[l], self.v_cache[l], b.attn, seq, pos0 + seq, c.n_heads, c.n_kv_heads, hd, attn_scale, true);
             }
-            try be.qkNorm(b.q, b.q, try nbuf(be, layer.q_norm), seq * n_heads, hd, eps);
-            try be.qkNorm(b.k, b.k, try nbuf(be, layer.k_norm), seq * kv_heads, hd, eps);
-            try be.ropeHalf(b.q, self.freqs_d, seq, n_heads, half, self.sin_off, pos0);
-            try be.ropeHalf(b.k, self.freqs_d, seq, kv_heads, half, self.sin_off, pos0);
-            try be.tensorCopy(self.k_cache[l], pos0 * kv_dim * 4, b.k, 0, seq * kv_dim * 4);
-            try be.tensorCopy(self.v_cache[l], pos0 * kv_dim * 4, b.v, 0, seq * kv_dim * 4);
-            if (seq == 1) {
-                try be.opAttnDecode(b.q, self.k_cache[l], self.v_cache[l], b.attn, b.attn_scratch, pos0 + 1, n_heads, kv_heads, hd, nsplit, attn_scale);
-                try be.opGemvFp8(b.t, b.attn, layer.o.bytes, layer.o.scale, hidden, q_dim);
-            } else {
-                try be.attn(b.q, self.k_cache[l], self.v_cache[l], b.attn, seq, pos0 + seq, n_heads, kv_heads, hd, attn_scale, true);
-                try be.opMatmulFp8(b.t, b.attn, seq, layer.o.bytes, layer.o.scale, hidden, q_dim);
-            }
-            try be.opAdd(b.x, b.t, seq * hidden);
+            try self.linear(b.t, b.attn, layer.o, c.hidden, c.qDim(), seq);
+            try be.opAdd(b.x, b.t, seq * c.hidden);
 
             // --- MLP (SwiGLU) ---
-            try be.qkNorm(b.x, b.normed, try nbuf(be, layer.post_norm), seq, hidden, eps);
-            if (seq == 1) {
-                try be.opGemvFp8(b.gate, b.normed, layer.gate.bytes, layer.gate.scale, intermediate, hidden);
-                try be.opGemvFp8(b.up, b.normed, layer.up.bytes, layer.up.scale, intermediate, hidden);
-                try be.siluMul(b.gate, b.up, intermediate);
-                try be.opGemvFp8(b.t, b.gate, layer.down.bytes, layer.down.scale, hidden, intermediate);
-            } else {
-                try be.opMatmulFp8(b.gate, b.normed, seq, layer.gate.bytes, layer.gate.scale, intermediate, hidden);
-                try be.opMatmulFp8(b.up, b.normed, seq, layer.up.bytes, layer.up.scale, intermediate, hidden);
-                try be.siluMul(b.gate, b.up, seq * intermediate);
-                try be.opMatmulFp8(b.t, b.gate, seq, layer.down.bytes, layer.down.scale, hidden, intermediate);
-            }
-            try be.opAdd(b.x, b.t, seq * hidden);
+            try be.qkNorm(b.x, b.normed, try nbuf(be, layer.post_norm), seq, c.hidden, eps);
+            try self.linear(b.gate, b.normed, layer.gate, c.intermediate, c.hidden, seq);
+            try self.linear(b.up, b.normed, layer.up, c.intermediate, c.hidden, seq);
+            try be.siluMul(b.gate, b.up, seq * c.intermediate);
+            try self.linear(b.t, b.gate, layer.down, c.hidden, c.intermediate, seq);
+            try be.opAdd(b.x, b.t, seq * c.hidden);
         }
-
-        // Final norm on the last position + tied bf16 LM head, on device.
-        try be.qkNorm(offsetBufSized(b.x, (seq - 1) * hidden * 4, hidden * 4), b.t, try nbuf(be, self.lm.final_norm), 1, hidden, eps);
-        try be.opGemvBf16(b.logits, b.t, self.lm.embed_bytes, 1.0, qwen3.vocab_size, hidden);
-        try be.endBatch();
-        self.len += seq;
-
-        try be.tensorDownload(b.logits, std.mem.sliceAsBytes(logits[0..qwen3.vocab_size]));
-        _ = io;
     }
+
+    /// Upload every linear weight and the LM head now, claiming pin residency
+    /// (first-touch, up to the backend's pin_budget) ahead of any model that
+    /// forwards later. Under --vram-budget the CLI calls this on the DRAFT
+    /// model before the target's first forward: the draft is read once per
+    /// drafted token, so pinning it buys more transfer savings per byte than
+    /// pinning the same bytes of the target (which verify reads only once per
+    /// ~k accepted tokens).
+    pub fn prewarmWeights(self: *CudaLM) !void {
+        const be = self.be;
+        for (self.lm.layers) |layer| {
+            inline for (.{ layer.q, layer.k, layer.v, layer.o, layer.gate, layer.up, layer.down }) |w| {
+                try be.warmWeight(w.bytes);
+            }
+        }
+        try be.warmWeight(self.lm.embed_bytes);
+    }
+
+    /// Queue layer `l`'s linear weights (or, past the last layer, the tied
+    /// bf16 LM head) for async prefetch — called one layer ahead so streamed
+    /// weights DMA from the page-locked mmap while the previous layer
+    /// computes (the dit_cuda.prefetchBlock analogue). No-op when direct
+    /// streaming is off; a cheap cache re-stamp when the weights are resident.
+    fn prefetchLayer(self: *CudaLM, l: usize) void {
+        const be = self.be;
+        if (!be.async_uploads) return;
+        if (l < self.lm.layers.len) {
+            const layer = self.lm.layers[l];
+            inline for (.{ layer.q, layer.k, layer.v, layer.o, layer.gate, layer.up, layer.down }) |w| {
+                be.prefetchWeight(w.bytes);
+            }
+        } else {
+            be.prefetchWeight(self.lm.embed_bytes);
+        }
+    }
+
+    /// Dense linear over `seq` rows, kernel picked by weight dtype and batch
+    /// size. fp8 (the 4B target): fused GEMV (1 row), grouped multi-input
+    /// GEMV (small batches — speculative verify and short multi-turn
+    /// prefills; each fp8 weight row is read once per 4 inputs), or the f16
+    /// tensor-core GEMM (large prefills, where the dequant-to-f16 scratch
+    /// round trip amortizes). bf16 (the 0.6B draft model): fused GEMV /
+    /// grouped GEMVs for everything — draft prompts are small and the model
+    /// tiny, so a dedicated GEMM path isn't worth it.
+    fn linear(self: *CudaLM, y: Buf, x: Buf, w: ops.matmul.Weight, rows_out: usize, cols: usize, seq: usize) !void {
+        const be = self.be;
+        if (w.dtype != .f8_e4m3) {
+            std.debug.assert(w.dtype == .bf16);
+            if (seq == 1) {
+                try be.opGemvBf16(y, x, w.bytes, w.scale, rows_out, cols);
+            } else {
+                var off: usize = 0;
+                while (off < seq) : (off += 4) {
+                    const n: usize = @min(4, seq - off); // annotated: @min would narrow to u3
+                    try be.opGemvBf16N(
+                        offsetBufSized(y, off * rows_out * 4, n * rows_out * 4),
+                        offsetBufSized(x, off * cols * 4, 4 * cols * 4),
+                        w.bytes,
+                        w.scale,
+                        rows_out,
+                        cols,
+                        n,
+                    );
+                }
+            }
+            return;
+        }
+        if (seq == 1) {
+            try be.opGemvFp8(y, x, w.bytes, w.scale, rows_out, cols);
+        } else if (seq <= gemv_batch_max) {
+            var off: usize = 0;
+            while (off < seq) : (off += 4) {
+                const n: usize = @min(4, seq - off); // annotated: @min would narrow to u3
+                try be.opGemvFp8N(
+                    offsetBufSized(y, off * rows_out * 4, n * rows_out * 4),
+                    offsetBufSized(x, off * cols * 4, 4 * cols * 4),
+                    w.bytes,
+                    w.scale,
+                    rows_out,
+                    cols,
+                    n,
+                );
+            }
+        } else {
+            try be.opMatmulFp8(y, x, seq, w.bytes, w.scale, rows_out, cols);
+        }
+    }
+
+    /// Largest batch that goes through grouped GEMVs + batched flash-decode
+    /// instead of the GEMM + square-attention prefill path: covers every
+    /// speculative verify batch, and ceil(seq/4) fused weight reads stay
+    /// well below the GEMM's ~5x dequant-scratch traffic.
+    const gemv_batch_max = spec.max_draft + 1;
 
     /// KV chunks per head in the decode attention split pass (one warp each:
     /// 32 heads x 32 splits x 32 lanes = 32k threads).
@@ -321,25 +783,26 @@ const LmBufs = struct {
     attn_scratch: Buf,
     logits: Buf,
 
-    fn init(be: *Backend, rows: usize) !LmBufs {
+    fn init(be: *Backend, rows: usize, c: qwen3.Config) !LmBufs {
         const rp = std.mem.alignForward(usize, rows, 128); // GEMM outputs are 128-row padded
+        const r4 = std.mem.alignForward(usize, rows, 4); // grouped-GEMV inputs are read 4 rows at a time
         var self: LmBufs = undefined;
         var created: usize = 0;
         errdefer inline for (fields, 0..) |name, i| {
             if (i < created) be.tensorDestroy(&@field(self, name));
         };
         const sizes = [fields.len]usize{
-            rows * hidden * 4, // x
-            rows * hidden * 4, // normed
-            rp * q_dim * 4, // q
-            rp * kv_dim * 4, // k
-            rp * kv_dim * 4, // v
-            rows * q_dim * 4, // attn
-            rp * intermediate * 4, // gate
-            rp * intermediate * 4, // up
-            rp * hidden * 4, // t
-            n_heads * CudaLM.nsplit * (hd + 4) * 4, // attn_scratch
-            qwen3.vocab_size * 4, // logits
+            rows * c.hidden * 4, // x
+            r4 * c.hidden * 4, // normed
+            rp * c.qDim() * 4, // q
+            rp * c.kvDim() * 4, // k
+            rp * c.kvDim() * 4, // v
+            r4 * c.qDim() * 4, // attn
+            rp * c.intermediate * 4, // gate
+            rp * c.intermediate * 4, // up
+            rp * c.hidden * 4, // t
+            CudaLM.gemv_batch_max * c.n_heads * CudaLM.nsplit * (hd + 4) * 4, // attn_scratch (a row per verify query)
+            (spec.max_draft + 1) * qwen3.vocab_size * 4, // logits (verify writes a row per position)
         };
         inline for (fields, sizes) |name, size| {
             @field(self, name) = try be.tensorCreate(size);
@@ -355,6 +818,151 @@ const LmBufs = struct {
 
     const fields = [_][]const u8{ "x", "normed", "q", "k", "v", "attn", "gate", "up", "t", "attn_scratch", "logits" };
 };
+
+/// Tree-verify buffers (CudaLM.enableTree): node positions, the tree
+/// split-kernel scratch (partials + the meta table at its tail), per-node
+/// vocab logits, and per-node tap rows for the EAGLE-3 drafter.
+const TreeBufs = struct {
+    pos: Buf, // [max_tree_nodes] u32 absolute positions
+    scratch: Buf, // attn partials [n][heads][nsplit][hd+4] + meta tail
+    logits: Buf, // [max_tree_nodes][vocab]
+    taps: Buf, // [3][max_tree_nodes][hidden] residual entering each tap layer
+
+    fn init(be: *Backend, c: qwen3.Config) !TreeBufs {
+        const m = spec.max_tree_nodes;
+        var self: TreeBufs = undefined;
+        var created: usize = 0;
+        errdefer inline for (fields, 0..) |name, i| {
+            if (i < created) be.tensorDestroy(&@field(self, name));
+        };
+        const sizes = [fields.len]usize{
+            m * 4, // pos
+            (m * c.n_heads * CudaLM.nsplit * (hd + 4) + m * (m + 1)) * 4, // scratch
+            m * qwen3.vocab_size * 4, // logits
+            3 * m * c.hidden * 4, // taps
+        };
+        inline for (fields, sizes) |name, size| {
+            @field(self, name) = try be.tensorCreate(size);
+            created += 1;
+        }
+        return self;
+    }
+
+    fn deinit(self: *TreeBufs, be: *Backend) void {
+        inline for (fields) |name| be.tensorDestroy(&@field(self, name));
+        self.* = undefined;
+    }
+
+    const fields = [_][]const u8{ "pos", "scratch", "logits", "taps" };
+};
+
+// Gated on a CUDA device + the checkpoint: tree-verify greedy output
+// through CudaLM (enableTree + stepAllTree + commitTreePath, the tree
+// attention/rope kernels) must equal vanilla greedy. The n-gram chain rides
+// ChainAsTree so real drafts and rejections flow through the tree path; the
+// repetitive prompt guarantees accepted drafts. Kept tiny — Debug forwards
+// are slow.
+test "cuda tree spec matches vanilla greedy on the real model" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const engine = @import("../llm/engine.zig");
+    const chat = @import("../llm/chat.zig");
+    const tokenizer_mod = @import("../tokenizer.zig");
+    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+
+    var st = try safetensors.SafeTensors.open(gpa, io, te_path);
+    defer st.deinit();
+    var lm = try qwen3.CausalLM.load(gpa, &st);
+    defer lm.deinit();
+    var tok = try tokenizer_mod.Tokenizer.init(gpa);
+    defer tok.deinit();
+
+    var opts: engine.Options = .{ .max_new_tokens = 4, .sampling = .{ .temperature = 0 } };
+    var ids_vanilla: std.ArrayList(u32) = .empty;
+    defer ids_vanilla.deinit(gpa);
+    try chat.appendUser(&tok, gpa, "Count: one two three one two", &ids_vanilla);
+    try chat.openAssistant(&tok, gpa, &ids_vanilla);
+    var ids_tree: std.ArrayList(u32) = .empty;
+    defer ids_tree.deinit(gpa);
+    try ids_tree.appendSlice(gpa, ids_vanilla.items);
+
+    {
+        var model = try CudaLM.init(gpa, be, &lm, try engine.capacityFor(opts, ids_vanilla.items.len), ids_vanilla.items.len);
+        defer model.deinit();
+        _ = try engine.generate(&model, &tok, io, gpa, &ids_vanilla, opts, null);
+    }
+    {
+        opts.tree_nodes = 4;
+        var stats: spec.Stats = .{};
+        opts.spec_stats = &stats;
+        var model = try CudaLM.init(gpa, be, &lm, try engine.capacityFor(opts, ids_tree.items.len), ids_tree.items.len);
+        defer model.deinit();
+        try model.enableTree();
+        var ngram: spec.NgramDrafter = .{};
+        var drafter: spec.ChainAsTree(spec.NgramDrafter) = .{ .inner = &ngram };
+        _ = try spec.generate(&model, &drafter, &tok, io, gpa, &ids_tree, opts, null);
+        try std.testing.expect(stats.forwards > 0);
+    }
+    try std.testing.expectEqualSlices(u32, ids_vanilla.items, ids_tree.items);
+}
+
+// Gated on a CUDA device + the checkpoint: greedy decode under a --vram-budget
+// far below the checkpoint size (a first-touch prefix pinned resident, the
+// rest LRU-evicted and re-uploaded every token; the eviction guard keeps
+// decode off the captured graph) must equal resident greedy decode exactly.
+test "cuda weight streaming matches resident greedy on the real model" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const engine = @import("../llm/engine.zig");
+    const chat = @import("../llm/chat.zig");
+    const tokenizer_mod = @import("../tokenizer.zig");
+    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
+    // st before be: Backend.deinit unregisters the page-locked mmap, so the
+    // mapping must still exist when it runs (defers are LIFO).
+    var st = try safetensors.SafeTensors.open(gpa, io, te_path);
+    defer st.deinit();
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+
+    var lm = try qwen3.CausalLM.load(gpa, &st);
+    defer lm.deinit();
+    var tok = try tokenizer_mod.Tokenizer.init(gpa);
+    defer tok.deinit();
+
+    const opts: engine.Options = .{ .max_new_tokens = 4, .sampling = .{ .temperature = 0 } };
+    var ids_resident: std.ArrayList(u32) = .empty;
+    defer ids_resident.deinit(gpa);
+    try chat.appendUser(&tok, gpa, "Count: one two three one two", &ids_resident);
+    try chat.openAssistant(&tok, gpa, &ids_resident);
+    var ids_streamed: std.ArrayList(u32) = .empty;
+    defer ids_streamed.deinit(gpa);
+    try ids_streamed.appendSlice(gpa, ids_resident.items);
+
+    {
+        var model = try CudaLM.init(gpa, be, &lm, try engine.capacityFor(opts, ids_resident.items.len), ids_resident.items.len);
+        defer model.deinit();
+        _ = try engine.generate(&model, &tok, io, gpa, &ids_resident, opts, null);
+    }
+    be.evictWeights();
+    be.budget_override = 1 << 30; // ~1/4 of the fp8 checkpoint: forces streaming
+    be.pin_budget = 1 << 29; // first ~512 MiB of weights pinned, rest streams
+    if (st.mapping) |m| be.enableDirectStreaming(m); // prefetched direct-DMA path
+    {
+        var model = try CudaLM.init(gpa, be, &lm, try engine.capacityFor(opts, ids_streamed.items.len), ids_streamed.items.len);
+        defer model.deinit();
+        try model.prewarmWeights(); // the draft-pinning path: first claim on pin_budget
+        _ = try engine.generate(&model, &tok, io, gpa, &ids_streamed, opts, null);
+    }
+    try std.testing.expect(be.pinned_bytes > 0); // a prefix actually pinned
+    try std.testing.expect(be.evictions > 0); // and the remainder streamed
+    try std.testing.expectEqualSlices(u32, ids_resident.items, ids_streamed.items);
+}
 
 const Bufs = struct {
     x: Buf, // residual stream [seq][hidden]

@@ -143,6 +143,102 @@ fn headTask(
     }
 }
 
+pub const TreeParams = struct {
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    /// Score scale; defaults to 1/sqrt(head_dim).
+    scale: ?f32 = null,
+};
+
+/// Tree-verify attention (speculative tree drafting, LLM_PLAN.md M8):
+/// `parents.len` query nodes, node i attending the full committed prefix
+/// plus its own ancestor chain among the batch rows (parents[i] < i;
+/// parents[0] == 0 is the root, which attends only the prefix and itself).
+/// q/out are [n][n_heads*hd]; k/v_prefix are the cached rows
+/// [prefix_len][n_kv_heads*hd]; k/v_tree are the batch rows [n][kv_dim].
+/// Serial per (node, head) — verify batches are tiny and this is the
+/// reference implementation for the GPU kernels, not a production CPU path.
+pub fn attentionTree(
+    gpa: std.mem.Allocator,
+    out: []f32,
+    q: []const f32,
+    k_prefix: []const f32,
+    v_prefix: []const f32,
+    k_tree: []const f32,
+    v_tree: []const f32,
+    parents: []const u32,
+    p: TreeParams,
+) error{OutOfMemory}!void {
+    const hd = p.head_dim;
+    const n = parents.len;
+    const q_stride = p.n_heads * hd;
+    const kv_stride = p.n_kv_heads * hd;
+    const prefix_len = k_prefix.len / kv_stride;
+    std.debug.assert(q.len == n * q_stride and out.len == q.len);
+    std.debug.assert(k_prefix.len == prefix_len * kv_stride and v_prefix.len == k_prefix.len);
+    std.debug.assert(k_tree.len == n * kv_stride and v_tree.len == k_tree.len);
+    std.debug.assert(p.n_heads % p.n_kv_heads == 0);
+    const rep = p.n_heads / p.n_kv_heads;
+    const scale = p.scale orelse 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+
+    const scores = try gpa.alloc(f32, prefix_len + n);
+    defer gpa.free(scores);
+    var anc: [64]u32 = undefined; // ancestor chain, root first (n <= spec.max_tree_nodes)
+    std.debug.assert(n <= anc.len);
+
+    for (0..n) |i| {
+        // Node i's ancestor chain (including itself), depth order.
+        var depth: usize = 0;
+        {
+            var j: u32 = @intCast(i);
+            while (true) {
+                anc[depth] = j;
+                depth += 1;
+                if (j == 0) break;
+                std.debug.assert(parents[j] < j);
+                j = parents[j];
+            }
+            std.mem.reverse(u32, anc[0..depth]);
+        }
+        const kv_len = prefix_len + depth;
+
+        for (0..p.n_heads) |h| {
+            const h_kv = h / rep;
+            const qrow = q[i * q_stride + h * hd ..][0..hd];
+
+            var max_score = -std.math.inf(f32);
+            for (0..kv_len) |j| {
+                const krow = if (j < prefix_len)
+                    k_prefix[j * kv_stride + h_kv * hd ..][0..hd]
+                else
+                    k_tree[anc[j - prefix_len] * kv_stride + h_kv * hd ..][0..hd];
+                const s = dot(qrow, krow) * scale;
+                scores[j] = s;
+                max_score = @max(max_score, s);
+            }
+
+            var denom: f32 = 0;
+            for (scores[0..kv_len]) |*s| {
+                s.* = @exp(s.* - max_score);
+                denom += s.*;
+            }
+            const inv = 1.0 / denom;
+
+            const orow = out[i * q_stride + h * hd ..][0..hd];
+            @memset(orow, 0);
+            for (0..kv_len) |j| {
+                const weight = scores[j] * inv;
+                const vrow = if (j < prefix_len)
+                    v_prefix[j * kv_stride + h_kv * hd ..][0..hd]
+                else
+                    v_tree[anc[j - prefix_len] * kv_stride + h_kv * hd ..][0..hd];
+                for (orow, vrow) |*o, vv| o.* += weight * vv;
+            }
+        }
+    }
+}
+
 fn dot(a: []const f32, b: []const f32) f32 {
     const vlen = comptime std.simd.suggestVectorLength(f32) orelse 8;
     const Vec = @Vector(vlen, f32);
@@ -235,6 +331,53 @@ test "key mask restricts attention" {
             }
         }
     }
+}
+
+test "tree attention on a chain matches causal attention" {
+    const gpa = std.testing.allocator;
+    // Prefix = position 0; tree = a 2-node chain at positions 1, 2. Every
+    // node's output must equal the corresponding full-causal row.
+    const parents = [_]u32{ 0, 0 }; // node 1 is the root's child
+    var out: [16]f32 = undefined;
+    try attentionTree(
+        gpa,
+        &out,
+        attn_q[8..24], // queries for positions 1, 2
+        attn_k[0..4], // prefix K (position 0)
+        attn_v[0..4],
+        attn_k[4..12], // batch K (positions 1, 2)
+        attn_v[4..12],
+        &parents,
+        .{ .n_heads = 2, .n_kv_heads = 1, .head_dim = 4 },
+    );
+    for (attn_causal_out[8..24], out) |e, a| try std.testing.expectApproxEqAbs(e, a, 3e-6);
+}
+
+test "tree attention: a node never sees its sibling branch" {
+    const gpa = std.testing.allocator;
+    // Nodes: A (root, position 1), B and C both children of A (position 2).
+    // B carries garbage K/V; C's output must still equal the full-causal row
+    // for the chain prefix->A->C — proof it attends only its own ancestors.
+    const junk = [_]f32{ 100, -100, 100, -100 };
+    const q = attn_q[8..16] ++ junk ++ junk ++ attn_q[16..24];
+    const k_tree = attn_k[4..8] ++ junk ++ attn_k[8..12];
+    const v_tree = attn_v[4..8] ++ junk ++ attn_v[8..12];
+    const parents = [_]u32{ 0, 0, 0 };
+    var out: [24]f32 = undefined;
+    try attentionTree(
+        gpa,
+        &out,
+        q,
+        attn_k[0..4],
+        attn_v[0..4],
+        k_tree,
+        v_tree,
+        &parents,
+        .{ .n_heads = 2, .n_kv_heads = 1, .head_dim = 4 },
+    );
+    // Node A (row 0) = causal row 1; node C (row 2) = causal row 2.
+    for (attn_causal_out[8..16], out[0..8]) |e, a| try std.testing.expectApproxEqAbs(e, a, 3e-6);
+    for (attn_causal_out[16..24], out[16..24]) |e, a| try std.testing.expectApproxEqAbs(e, a, 3e-6);
 }
 
 test "fully masked rows produce zeros" {

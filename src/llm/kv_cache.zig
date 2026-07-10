@@ -63,6 +63,13 @@ pub const KvCache = struct {
         std.debug.assert(self.len + n <= self.capacity);
         self.len += n;
     }
+
+    /// Roll back to `new_len` committed tokens (speculative-decode rejection):
+    /// rows past `new_len` are simply overwritten by the next write.
+    pub fn truncate(self: *KvCache, new_len: usize) void {
+        std.debug.assert(new_len <= self.len);
+        self.len = new_len;
+    }
 };
 
 // --- tests -----------------------------------------------------------------
@@ -91,4 +98,23 @@ test "write/commit/view round trip" {
     cache.commit(1);
     try std.testing.expectEqualSlices(f32, &(k0 ++ k2), cache.kView(0, 0));
     try std.testing.expectEqualSlices(f32, &(v0 ++ k2), cache.vView(0, 0));
+}
+
+test "truncate rolls back and rows are rewritten" {
+    const gpa = std.testing.allocator;
+    var cache = try KvCache.init(gpa, 1, 4, 2);
+    defer cache.deinit(gpa);
+
+    const a = [_]f32{ 1, 2, 3, 4, 5, 6 }; // three tokens
+    cache.write(0, &a, &a);
+    cache.commit(3);
+    cache.truncate(1);
+    try std.testing.expectEqual(@as(usize, 1), cache.len);
+    try std.testing.expectEqual(@as(usize, 3), cache.remaining());
+
+    // New tokens land at row 1, replacing the rolled-back ones.
+    const b = [_]f32{ 9, 10 };
+    cache.write(0, &b, &b);
+    cache.commit(1);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 9, 10 }, cache.kView(0, 0));
 }

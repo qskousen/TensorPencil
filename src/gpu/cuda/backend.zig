@@ -122,6 +122,12 @@ pub const Elt = enum {
 const WeightEntry = struct {
     db: DeviceBuffer,
     last_use: u64 = 0,
+    /// Pinned entries (first-touch, up to pin_budget) are immune to eviction.
+    pinned: bool = false,
+    /// Prefetched but not yet read by any op. Shielded from eviction: evicting
+    /// now would discard a transfer that hasn't paid for itself, and the op it
+    /// was prefetched for would re-upload it synchronously (double transfer).
+    awaiting_use: bool = false,
     upload_ev: cu.CUevent = null,
     /// prefetch generation (0 = not prefetched / synchronously uploaded). A hit
     /// with pf_gen > pf_completed is still in flight on the prefetch thread; the
@@ -132,7 +138,13 @@ const WeightEntry = struct {
 /// A queued weight upload for the prefetch thread: memcpy `bytes` (mmap) into a
 /// pinned slot then async-DMA into `db`, recording `ev` (compute waits on it).
 const PrefetchReq = struct { bytes: []const u8, db: DeviceBuffer, ev: cu.CUevent, gen: u64 };
-const pf_ring_sz = 64;
+const pf_ring_sz = 512;
+
+/// Weight-cache entries at or below this size are never evicted (see
+/// evictOneWeight): eviction reclaims negligible VRAM and the synchronous
+/// re-upload stalls the host behind the full compute queue, which collapses
+/// the streaming pipeline.
+const evict_min_size: u64 = 4 << 20;
 
 /// A weight buffer evicted but not yet freed: its `ev` (recorded on the compute
 /// stream at eviction) signals once the weight's last GEMM finishes, at which
@@ -166,12 +178,54 @@ pub const Backend = struct {
     /// --vram-budget ceiling on our own device footprint (bytes); 0 = no cap
     /// (only the live cuMemGetInfo headroom bounds the weight cache).
     budget_override: u64 = 0,
-    /// async weight uploads: set once the checkpoint mmap is page-locked, so
+    /// Total weights evicted over the backend's lifetime. Nonzero means weight
+    /// streaming is (or has been) active — device weight pointers are not
+    /// stable, so anything that bakes them in (the CudaLM decode graph) must
+    /// stay on per-op launches.
+    evictions: u64 = 0,
+    /// First-touch weight pinning: newly cached weights are pinned (immune to
+    /// eviction) until their total reaches this cap; later weights stream.
+    /// For a fixed repeating walk (LLM decode) this turns the LRU cliff —
+    /// where any cap below full residency re-uploads EVERYTHING — into cost
+    /// proportional to the streamed fraction. 0 = off. Must stay off for the
+    /// diffusion pipeline: first-touch would pin the single-use text encoder
+    /// and stream the whole DiT.
+    pin_budget: u64 = 0,
+    /// Bytes currently claimed against pin_budget.
+    pinned_bytes: u64 = 0,
+    /// async weight uploads: set once a prefetch thread is running, so
     /// re-uploads run on the transfer stream (overlapping compute) with a
     /// per-weight completion event the compute stream waits on.
     async_uploads: bool = false,
+    /// Host ranges page-locked via enableDirectStreaming (checkpoint mmaps).
+    /// Prefetches whose source lies inside one DMA straight from the mmap,
+    /// skipping the staging memcpy. Fixed slots + atomic count so the
+    /// prefetch thread can scan while the main thread registers another
+    /// model (slot written before the count is published).
+    registered: [4][]const u8 = undefined,
+    n_registered: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     /// evicted-but-not-yet-freed weight buffers (deferred free; async path only).
     free_pending: std.ArrayListUnmanaged(PendingFree) = .empty,
+    /// Bytes held by free_pending. Counted as available by reserveForWeights:
+    /// deferred frees keep device_used inflated until their events signal, and
+    /// without this credit the headroom loop would evict the entire unpinned
+    /// cache (including just-prefetched weights) on every upload.
+    pending_free_bytes: u64 = 0,
+    /// Recycled streamed-weight buffers by exact size (async path). Streamed
+    /// decode cycles the same handful of weight sizes every token, and
+    /// cuMemAlloc/cuMemFree cost ~0.3-1 ms each under an active DMA queue —
+    /// per-token churn was 2x slower than the transfers themselves. Buffers
+    /// here still count in ctx.device_used (they are still held).
+    weight_pool: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(DeviceBuffer)) = .empty,
+    /// Total bytes in streamed circulation (unpinned cache entries + deferred
+    /// frees + pool). weightBufAcquire paces the main thread against this:
+    /// past stream_window it blocks on the oldest deferred free (compute
+    /// progress) and recycles, instead of allocating more — bounding streamed
+    /// VRAM to the window and keeping steady state free of cuMemAlloc/Free.
+    streamed_bytes: u64 = 0,
+    /// Cap for streamed_bytes; set alongside pin_budget by the CLI. 0 = no
+    /// pacing (weights fully resident or the sync path).
+    stream_window: u64 = 0,
 
     // ---- prefetch thread (block-ahead async weight streaming) ----
     // Lock-free single-producer (main) / single-consumer (thread) ring — Zig 0.16
@@ -191,6 +245,14 @@ pub const Backend = struct {
     fp8_lut: DeviceBuffer = .{},
     fp8_w16: DeviceBuffer = .{},
     fp8_a16: DeviceBuffer = .{},
+
+    // Decode-graph state (see stateSetup): device address of g_state and the
+    // graph-mode kernel entries sharing it.
+    state_ptr: cu.CUdeviceptr = 0,
+    f_embed_gather_s: cu.CUfunction = null,
+    f_kv_append_s: cu.CUfunction = null,
+    f_rope_half_s: cu.CUfunction = null,
+    f_attn_split_s: cu.CUfunction = null,
 
     // f16 tensor-core VAE conv scratch (opConvF16): padded f16 weight + activation
     // and the f32 GEMM output, reused across convs.
@@ -384,8 +446,16 @@ pub const Backend = struct {
             self.pf_shutdown.store(true, .release);
             t.join(); // drains queued prefetches, then exits
         }
+        // Unregister page-locked checkpoint ranges after all transfer-stream
+        // DMAs from them are done (the caller munmaps after Backend.deinit).
+        if (self.n_registered.load(.monotonic) > 0) {
+            _ = self.ctx.api.cuStreamSynchronize(self.ctx.xfer_stream);
+            for (self.registered[0..self.n_registered.load(.monotonic)]) |r| self.ctx.unregisterHost(r);
+        }
         self.drainPending();
         self.free_pending.deinit(self.gpa);
+        self.drainPool();
+        self.weight_pool.deinit(self.gpa);
         var it = self.weights.valueIterator();
         while (it.next()) |e| {
             if (e.upload_ev) |ev| self.ctx.eventDestroy(ev);
@@ -455,6 +525,36 @@ pub const Backend = struct {
         self.async_uploads = true;
     }
 
+    /// Enable direct async weight streaming from `bytes` (a checkpoint mmap):
+    /// page-lock the range and spawn the prefetch thread. Prefetched weights
+    /// then DMA straight from the mmap on the transfer stream at full PCIe
+    /// bandwidth. (The staging-ring path above measured SLOWER than sync
+    /// uploads for the DiT — its extra host memcpy caps throughput below the
+    /// driver's pageable copy. Direct DMA has no host copy.) Registration
+    /// faults the range in and pins that much host RAM; no-op on failure
+    /// (uploads stay synchronous). Call once per checkpoint, before decode.
+    pub fn enableDirectStreaming(self: *Backend, bytes: []const u8) void {
+        const n = self.n_registered.load(.monotonic);
+        if (n == self.registered.len) return;
+        if (!self.ctx.registerHost(bytes)) return;
+        self.registered[n] = bytes;
+        self.n_registered.store(n + 1, .release);
+        if (self.pf_thread == null) {
+            self.pf_thread = std.Thread.spawn(.{}, prefetchLoop, .{self}) catch null;
+        }
+        self.async_uploads = self.pf_thread != null;
+    }
+
+    /// Whether `bytes` lies inside a page-locked range (prefetch thread or main).
+    fn isRegistered(self: *Backend, bytes: []const u8) bool {
+        const a = @intFromPtr(bytes.ptr);
+        for (self.registered[0..self.n_registered.load(.acquire)]) |r| {
+            const r0 = @intFromPtr(r.ptr);
+            if (a >= r0 and a + bytes.len <= r0 + r.len) return true;
+        }
+        return false;
+    }
+
     /// Prefetch-thread body: drain the request ring, uploading each weight through
     /// the pinned staging ring on the transfer stream (blocks THIS thread on the
     /// mmap→pinned memcpy and slot reuse — never the main thread). Advances
@@ -471,10 +571,22 @@ pub const Backend = struct {
             }
             const req = self.pf_ring[tail % pf_ring_sz];
             const cb = ctxmod.Buffer{ .ptr = req.db.ptr(), .bytes = @intCast(req.db.size) };
-            self.ctx.uploadStaged(cb, req.bytes, req.ev) catch {};
+            if (self.isRegistered(req.bytes)) {
+                self.ctx.uploadDirect(cb, req.bytes, req.ev) catch {};
+            } else {
+                self.ctx.uploadStaged(cb, req.bytes, req.ev) catch {};
+            }
             self.pf_tail.store(tail + 1, .release);
             self.pf_completed.store(req.gen, .release); // FIFO: gens complete in order
         }
+    }
+
+    /// Upload a weight through the cache immediately (pinned while pin_budget
+    /// has room). Lets a caller give specific weights first claim on the pin
+    /// budget before the main model's first forward — e.g. the spec-decode
+    /// draft model, whose weights are read once per drafted token.
+    pub fn warmWeight(self: *Backend, bytes: []const u8) Error!void {
+        _ = try self.cachedWeight(bytes);
     }
 
     /// Queue a weight upload for the prefetch thread (main thread). Allocates the
@@ -489,24 +601,25 @@ pub const Backend = struct {
             return; // already resident or in flight
         }
         self.reserveForWeights(bytes.len);
-        const db = self.tensorCreate(bytes.len) catch return; // best-effort; cachedWeight sync-falls-back on miss
+        const pin = self.pinNew(bytes.len);
+        const db = self.weightBufAcquire(bytes.len, pin) catch return; // best-effort; cachedWeight sync-falls-back on miss
         const ev = self.ctx.eventCreate() catch {
-            var d = db;
-            self.tensorDestroy(&d);
+            if (pin) self.streamed_bytes += db.size; // returning to circulation
+            self.poolPut(db);
             return;
         };
         const head = self.pf_head.load(.monotonic);
         if (head - self.pf_tail.load(.acquire) >= pf_ring_sz) { // ring full — drop (sync fallback later)
             self.ctx.eventDestroy(ev);
-            var d = db;
-            self.tensorDestroy(&d);
+            if (pin) self.streamed_bytes += db.size; // returning to circulation
+            self.poolPut(db);
             return;
         }
         self.pf_gen += 1;
         const gen = self.pf_gen;
         self.pf_ring[head % pf_ring_sz] = .{ .bytes = bytes, .db = db, .ev = ev, .gen = gen };
         self.pf_head.store(head + 1, .release); // publish the slot to the thread
-        self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .upload_ev = ev, .pf_gen = gen }) catch {};
+        self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .pinned = pin, .awaiting_use = true, .upload_ev = ev, .pf_gen = gen }) catch {};
     }
 
     // ---- buffers ------------------------------------------------------------
@@ -537,6 +650,7 @@ pub const Backend = struct {
             self.tensorDestroy(&db);
         }
         self.free_pending.clearRetainingCapacity();
+        self.pending_free_bytes = 0;
     }
 
     /// Headroom for a new weight upload (bytes). Bounded by the live device-free
@@ -558,8 +672,8 @@ pub const Backend = struct {
             const pf = self.free_pending.items[i];
             if (self.ctx.api.cuEventQuery(pf.ev) == cu.CUDA_SUCCESS) {
                 self.ctx.eventDestroy(pf.ev);
-                var db = pf.db;
-                self.tensorDestroy(&db);
+                self.pending_free_bytes -= pf.db.size;
+                self.poolPut(pf.db); // recycle — cuMemFree under DMA load costs ~1 ms
                 _ = self.free_pending.swapRemove(i);
             } else i += 1;
         }
@@ -572,6 +686,8 @@ pub const Backend = struct {
         const pf = self.free_pending.orderedRemove(0);
         _ = self.ctx.api.cuEventSynchronize(pf.ev);
         self.ctx.eventDestroy(pf.ev);
+        self.pending_free_bytes -= pf.db.size;
+        self.streamed_bytes -|= pf.db.size;
         var db = pf.db;
         self.tensorDestroy(&db);
         return true;
@@ -603,21 +719,33 @@ pub const Backend = struct {
         var lru_use: u64 = std.math.maxInt(u64);
         var it = self.weights.iterator();
         while (it.next()) |e| {
+            if (e.value_ptr.pinned) continue; // pinned prefix never streams
+            if (e.value_ptr.awaiting_use) continue; // prefetched, not yet consumed
             if (e.value_ptr.last_use == mru_use) continue; // protect the MRU
             if (e.value_ptr.pf_gen > completed) continue; // protect in-flight prefetch
+            if (e.value_ptr.db.size <= evict_min_size) continue; // norms/scales: not worth a sync stall
             if (e.value_ptr.last_use < lru_use) {
                 lru_use = e.value_ptr.last_use;
                 lru_key = e.key_ptr.*;
             }
         }
         if (lru_use == std.math.maxInt(u64)) return false; // only the MRU remains
+        self.evictions += 1;
         const e = self.weights.fetchRemove(lru_key).?;
-        if (e.value.upload_ev) |ev| self.ctx.eventDestroy(ev);
+        if (e.value.upload_ev) |ev| {
+            // The buffer may still be the target of an in-flight prefetch DMA
+            // (evicted before any GEMM consumed it): make the compute stream
+            // wait on the upload event first, so the deferred-free event below
+            // cannot signal before the transfer-stream write has finished.
+            self.ctx.computeWaitEvent(ev) catch {};
+            self.ctx.eventDestroy(ev);
+        }
         const db = e.value.db;
         if (self.async_uploads) {
             if (self.ctx.eventCreate()) |rev| {
                 _ = self.ctx.api.cuEventRecord(rev, self.ctx.stream); // after this weight's last GEMM
                 if (self.free_pending.append(self.gpa, .{ .db = db, .ev = rev })) |_| {
+                    self.pending_free_bytes += db.size;
                     return true; // deferred free; reclaimed lazily
                 } else |_| self.ctx.eventDestroy(rev);
             } else |_| {}
@@ -625,9 +753,85 @@ pub const Backend = struct {
         // sync path (async off, or event/append failed): a launch may still
         // reference the buffer, so synchronize before freeing.
         _ = self.ctx.api.cuStreamSynchronize(self.ctx.stream);
+        self.streamed_bytes -|= db.size;
         var d = db;
         self.tensorDestroy(&d);
         return true;
+    }
+
+    /// Get a device buffer for a weight upload. Exact-size reuse from the
+    /// recycling pool first — streamed decode cycles the same handful of
+    /// sizes every token, and cuMemAlloc/cuMemFree under an active DMA queue
+    /// cost more than the transfers they serve. Past stream_window, block on
+    /// the oldest deferred free (i.e. wait for compute to consume the oldest
+    /// streamed weight) and recycle it: this paces the enqueue against
+    /// compute progress and bounds streamed VRAM to the window. Falls back
+    /// to a fresh allocation (soft window) when nothing is pending.
+    fn weightBufAcquire(self: *Backend, size: u64, pinned: bool) Error!DeviceBuffer {
+        if (self.poolPop(size)) |db| {
+            if (pinned) self.streamed_bytes -|= size; // leaves streamed circulation
+            return db;
+        }
+        if (!pinned and self.stream_window != 0) {
+            while (self.streamed_bytes + size > self.stream_window) {
+                if (self.blockOldestRecycle()) {
+                    if (self.poolPop(size)) |db| return db;
+                    continue;
+                }
+                // Nothing pending: push a consumed weight into the deferred
+                // queue so the next iteration can wait on and recycle it.
+                if (!self.evictOneWeight()) break; // nothing reclaimable: soft overshoot
+            }
+        }
+        const db = try self.tensorCreate(size);
+        if (!pinned) self.streamed_bytes += size;
+        return db;
+    }
+
+    fn poolPop(self: *Backend, size: u64) ?DeviceBuffer {
+        const list = self.weight_pool.getPtr(size) orelse return null;
+        if (list.items.len == 0) return null;
+        list.items.len -= 1;
+        return list.items.ptr[list.items.len];
+    }
+
+    /// Return a buffer to the recycling pool (real-freed only if bookkeeping
+    /// allocation fails).
+    fn poolPut(self: *Backend, db: DeviceBuffer) void {
+        const g = self.weight_pool.getOrPut(self.gpa, db.size) catch return self.poolPutFailed(db);
+        if (!g.found_existing) g.value_ptr.* = .empty;
+        g.value_ptr.append(self.gpa, db) catch return self.poolPutFailed(db);
+    }
+
+    fn poolPutFailed(self: *Backend, db: DeviceBuffer) void {
+        self.streamed_bytes -|= db.size;
+        var d = db;
+        self.tensorDestroy(&d);
+    }
+
+    /// Wait for the oldest deferred free's event (compute progress) and move
+    /// its buffer to the recycling pool. False if nothing is pending.
+    fn blockOldestRecycle(self: *Backend) bool {
+        if (self.free_pending.items.len == 0) return false;
+        const pf = self.free_pending.orderedRemove(0);
+        _ = self.ctx.api.cuEventSynchronize(pf.ev);
+        self.ctx.eventDestroy(pf.ev);
+        self.pending_free_bytes -= pf.db.size;
+        self.poolPut(pf.db);
+        return true;
+    }
+
+    /// Free every pooled buffer for real (evictWeights / deinit).
+    fn drainPool(self: *Backend) void {
+        var it = self.weight_pool.valueIterator();
+        while (it.next()) |list| {
+            for (list.items) |db| {
+                var d = db;
+                self.tensorDestroy(&d);
+            }
+            list.deinit(self.gpa);
+        }
+        self.weight_pool.clearRetainingCapacity();
     }
 
     /// Make room for a `need`-byte weight upload: reclaim ready deferred-frees, then
@@ -636,7 +840,10 @@ pub const Backend = struct {
     /// the reactive backstop if this can't free enough.
     fn reserveForWeights(self: *Backend, need: u64) void {
         self.reclaimPending();
-        while (self.budgetHeadroom() < need) {
+        // pending_free_bytes: deferred frees WILL come back without another
+        // eviction; counting them stops the loop from over-evicting while
+        // their events are still in flight.
+        while (self.budgetHeadroom() + self.pending_free_bytes < need) {
             if (!self.evictOneWeight()) return;
         }
     }
@@ -690,6 +897,7 @@ pub const Backend = struct {
 
     pub fn evictWeights(self: *Backend) void {
         _ = self.ctx.api.cuStreamSynchronize(self.ctx.stream);
+        _ = self.ctx.api.cuStreamSynchronize(self.ctx.xfer_stream); // in-flight prefetch DMAs
         self.drainPending();
         var it = self.weights.valueIterator();
         while (it.next()) |e| {
@@ -698,6 +906,9 @@ pub const Backend = struct {
             self.tensorDestroy(&db);
         }
         self.weights.clearRetainingCapacity();
+        self.drainPool();
+        self.pinned_bytes = 0;
+        self.streamed_bytes = 0;
     }
 
     /// Upload+cache a weight blob (int8 weights / scales), keyed by host pointer.
@@ -711,6 +922,7 @@ pub const Backend = struct {
         self.use_counter += 1;
         if (self.weights.getPtr(key)) |e| {
             e.last_use = self.use_counter;
+            e.awaiting_use = false; // consumed: the prefetch paid off, evictable again
             const gen = e.pf_gen;
             const ev = e.upload_ev;
             const db = e.db;
@@ -728,10 +940,19 @@ pub const Backend = struct {
         // upload. The staging ring is used ONLY by the prefetch thread, so the main
         // thread never touches it here (no race).
         self.reserveForWeights(bytes.len);
-        const db = try self.tensorCreate(bytes.len);
+        const pin = self.pinNew(bytes.len);
+        const db = try self.weightBufAcquire(bytes.len, pin);
         try self.tensorUpload(db, bytes);
-        try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter });
+        try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .pinned = pin });
         return db;
+    }
+
+    /// Claim pin residency for a newly cached `size`-byte weight (first-touch
+    /// order): true while the claims fit under pin_budget.
+    fn pinNew(self: *Backend, size: u64) bool {
+        if (self.pinned_bytes + size > self.pin_budget) return false;
+        self.pinned_bytes += size;
+        return true;
     }
 
     // ---- submission (single-stream: batch == stream) ------------------------
@@ -910,6 +1131,25 @@ pub const Backend = struct {
         try self.rowLaunch(f, w_db, x, y, self.fp8_lut, .{ @intCast(rows), @intCast(cols), 0, 0, 0, 0 }, .{ scale, 0 }, rows);
     }
 
+    /// Multi-input fused fp8 GEMV: y[i][rows] f32 = scale * (W @ x_i) for
+    /// i < n (n <= 4), reading the fp8 weight once for all inputs — the
+    /// small-batch regime (speculative verify, short multi-turn prefills)
+    /// where opMatmulFp8's dequant-to-f16-scratch round trip costs ~5x the
+    /// weight traffic. x must have 4 rows of backing store; rows beyond n
+    /// may be garbage (their outputs are predicated off).
+    pub fn opGemvFp8N(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, w_bytes: []const u8, scale: f32, rows: usize, cols: usize, n: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.matmul);
+        std.debug.assert(cols % 8 == 0 and rows % 8 == 0 and n >= 1 and n <= 4);
+        if (self.fp8_lut.buf == .null_handle) {
+            self.fp8_lut = try self.tensorCreate(256 * 4);
+            try self.tensorUpload(self.fp8_lut, std.mem.sliceAsBytes(&dtypes.f8_e4m3_to_f32_table));
+        }
+        const w_db = try self.cachedWeight(w_bytes);
+        const f = try self.eltFn(elt.gemv_fp8n_ptx, "gemv_fp8n");
+        try self.rowLaunch(f, w_db, x, y, self.fp8_lut, .{ @intCast(rows), @intCast(cols), @intCast(n), 0, 0, 0 }, .{ scale, 0 }, rows / 8);
+    }
+
     /// bf16 GEMV (tied LM head): y[rows] f32 = scale * (W bf16 [rows][cols] @ x).
     pub fn opGemvBf16(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, w_bytes: []const u8, scale: f32, rows: usize, cols: usize) Error!void {
         self.ptic();
@@ -920,17 +1160,60 @@ pub const Backend = struct {
         try self.rowLaunch(f, w_db, x, y, null, .{ @intCast(rows), @intCast(cols), 0, 0, 0, 0 }, .{ scale, 0 }, rows);
     }
 
-    /// Flash-decoding attention for a single query against seq_kv cached keys:
-    /// a warp per (head, KV chunk) in the split pass, then a merge pass.
-    /// scratch holds heads*nsplit*(hd+4) f32. hd must be 128.
-    pub fn opAttnDecode(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, seq_kv: usize, n_heads: usize, kv_heads: usize, hd: usize, nsplit: usize, scale: f32) Error!void {
+    /// Multi-input bf16 GEMV (speculative-decode LM head): y[i][rows] f32 =
+    /// scale * (W @ x_i) for i < n (n <= 4), reading W once for all inputs.
+    /// x must have 4 rows of backing store; rows beyond n may be garbage
+    /// (their outputs are predicated off).
+    pub fn opGemvBf16N(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, w_bytes: []const u8, scale: f32, rows: usize, cols: usize, n: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.matmul);
+        std.debug.assert(cols % 2 == 0 and rows % 8 == 0 and n >= 1 and n <= 4);
+        const w_db = try self.cachedWeight(w_bytes);
+        const f = try self.eltFn(elt.gemv_bf16n_ptx, "gemv_bf16n");
+        try self.rowLaunch(f, w_db, x, y, null, .{ @intCast(rows), @intCast(cols), @intCast(n), 0, 0, 0 }, .{ scale, 0 }, rows / 8);
+    }
+
+    /// Flash-decoding attention for seq_q consecutive causal queries against
+    /// the KV cache (seq_q == 1 is plain decode; > 1 is the speculative
+    /// verify batch): a warp per (query, head, KV chunk) in the split pass,
+    /// then a merge pass over seq_q*heads rows. Query t sees kv_len0 + t
+    /// keys. scratch holds seq_q*heads*nsplit*(hd+4) f32. hd must be 128.
+    pub fn opAttnDecode(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, kv_len0: usize, seq_q: usize, n_heads: usize, kv_heads: usize, hd: usize, nsplit: usize, scale: f32) Error!void {
         self.ptic();
         defer self.ptoc(.attn);
-        std.debug.assert(hd == 128);
+        std.debug.assert(hd == 128 and seq_q >= 1);
         const f_split = try self.eltFn(elt.attn_split_ptx, "attn_split");
-        try self.eltLaunch(f_split, q, k, v, scratch, .{ @intCast(seq_kv), @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intCast(nsplit), 0 }, .{ scale, 0 }, n_heads * nsplit * 32);
+        try self.eltLaunch(f_split, q, k, v, scratch, .{ @intCast(kv_len0), @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intCast(nsplit), @intCast(seq_q) }, .{ scale, 0 }, seq_q * n_heads * nsplit * 32);
         const f_merge = try self.eltFn(elt.attn_merge_ptx, "attn_merge");
-        try self.eltLaunch(f_merge, scratch, out, null, null, .{ @intCast(n_heads), @intCast(hd), @intCast(nsplit), 0, 0, 0 }, .{ 0, 0 }, n_heads * hd);
+        try self.eltLaunch(f_merge, scratch, out, null, null, .{ @intCast(seq_q * n_heads), @intCast(hd), @intCast(nsplit), 0, 0, 0 }, .{ 0, 0 }, seq_q * n_heads * hd);
+    }
+
+    /// Tree-verify flash-decoding attention (LLM_PLAN.md M8): seq_q tree
+    /// nodes, node t attending kv rows [0, prefix_len) of the linear cache
+    /// plus its ancestor chain stored at rows tree_base+idx of the SAME k/v
+    /// buffers. Per-query kv lengths and ancestor row lists live in a meta
+    /// table at the scratch tail (see elt.attn_split_tree_ptx; the caller
+    /// uploads it before the batch). Chunking matches the decode kernel at
+    /// the same kv_len — merged outputs are bitwise-identical to plain
+    /// decode. hd must be 128.
+    pub fn opAttnDecodeTree(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, prefix_len: usize, tree_base: usize, seq_q: usize, n_heads: usize, kv_heads: usize, hd: usize, nsplit: usize, scale: f32) Error!void {
+        self.ptic();
+        defer self.ptoc(.attn);
+        std.debug.assert(hd == 128 and seq_q >= 1);
+        const f_split = try self.eltFn(elt.attn_split_tree_ptx, "attn_split_tree");
+        try self.eltLaunch(f_split, q, k, v, scratch, .{ @intCast(prefix_len), @intCast(n_heads), @intCast(kv_heads), @intCast(tree_base), @intCast(nsplit), @intCast(seq_q) }, .{ scale, 0 }, seq_q * n_heads * nsplit * 32);
+        const f_merge = try self.eltFn(elt.attn_merge_ptx, "attn_merge");
+        try self.eltLaunch(f_merge, scratch, out, null, null, .{ @intCast(seq_q * n_heads), @intCast(hd), @intCast(nsplit), 0, 0, 0 }, .{ 0, 0 }, seq_q * n_heads * hd);
+    }
+
+    /// rotate-half RoPE with an explicit absolute u32 position per row
+    /// (tree-verify batches: node positions are depth-based).
+    pub fn opRopeHalfPos(self: *Backend, qk: DeviceBuffer, positions: DeviceBuffer, freqs: DeviceBuffer, rows: usize, n_heads: usize, half: usize, sin_off: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const f = try self.eltFn(elt.rope_half_pos_ptx, "rope_half_pos");
+        const total = rows * n_heads * half;
+        try self.eltLaunch(f, qk, positions, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// eltLaunch variant with one 256-thread block per row (`grid_rows` blocks).
@@ -1303,6 +1586,88 @@ pub const Backend = struct {
     }
 
     // ---- eltwise / attention (correctness-first f32 kernels) ----------------
+
+    // --- decode-graph support (CUDA graphs, LLM_PLAN.md M6) ----------------
+
+    /// Lazy-load the decode-state module (one g_state global shared by the
+    /// graph-mode kernel entries) and resolve its pieces.
+    fn stateSetup(self: *Backend) Error!void {
+        if (self.state_ptr != 0) return;
+        var mod = self.ctx.loadModule(elt.decode_state_ptx) catch return error.CudaError;
+        self.elt_mods.append(self.gpa, mod) catch return error.OutOfMemory;
+        var sz: usize = 0;
+        self.ctx.check(self.ctx.api.cuModuleGetGlobal(&self.state_ptr, &sz, mod.mod, "g_state"), "cuModuleGetGlobal") catch return error.CudaError;
+        std.debug.assert(sz == 8);
+        self.f_embed_gather_s = mod.getFunction(self.ctx, "embed_gather_s") catch return error.CudaError;
+        self.f_kv_append_s = mod.getFunction(self.ctx, "kv_append_s") catch return error.CudaError;
+        self.f_rope_half_s = mod.getFunction(self.ctx, "rope_half_s") catch return error.CudaError;
+        self.f_attn_split_s = mod.getFunction(self.ctx, "attn_split_s") catch return error.CudaError;
+    }
+
+    /// Write the per-token dynamic state ({token id, cache position}) the
+    /// graph-mode kernels read. Synchronous 8-byte upload; the legacy null
+    /// stream orders it before the following graph launch.
+    pub fn setDecodeState(self: *Backend, token: u32, pos0: u32) Error!void {
+        try self.stateSetup();
+        const state = [2]u32{ token, pos0 };
+        self.ctx.check(self.ctx.api.cuMemcpyHtoD(self.state_ptr, &state, 8), "cuMemcpyHtoD state") catch return error.CudaError;
+    }
+
+    /// Capture everything launched between begin and end on the compute
+    /// stream into an executable graph.
+    pub fn graphCaptureBegin(self: *Backend) Error!void {
+        self.ctx.check(self.ctx.api.cuStreamBeginCapture(self.ctx.stream, 0), "cuStreamBeginCapture") catch return error.CudaError;
+    }
+
+    pub fn graphCaptureEnd(self: *Backend) Error!cu.CUgraphExec {
+        var graph: cu.CUgraph = null;
+        self.ctx.check(self.ctx.api.cuStreamEndCapture(self.ctx.stream, &graph), "cuStreamEndCapture") catch return error.CudaError;
+        defer _ = self.ctx.api.cuGraphDestroy(graph);
+        var exec: cu.CUgraphExec = null;
+        self.ctx.check(self.ctx.api.cuGraphInstantiateWithFlags(&exec, graph, 0), "cuGraphInstantiate") catch return error.CudaError;
+        return exec;
+    }
+
+    pub fn graphLaunch(self: *Backend, exec: cu.CUgraphExec) Error!void {
+        self.ctx.check(self.ctx.api.cuGraphLaunch(exec, self.ctx.stream), "cuGraphLaunch") catch return error.CudaError;
+    }
+
+    pub fn graphDestroy(self: *Backend, exec: cu.CUgraphExec) void {
+        _ = self.ctx.api.cuGraphExecDestroy(exec);
+    }
+
+    /// Graph-mode ops: parameter-identical to their twins except the dynamic
+    /// value comes from g_state (see elt.decode_state_ptx).
+    pub fn opEmbedGatherS(self: *Backend, x: DeviceBuffer, embed_bytes: []const u8, h: usize) Error!void {
+        try self.stateSetup();
+        const w_db = try self.cachedWeight(embed_bytes);
+        try self.eltLaunch(self.f_embed_gather_s, w_db, x, null, null, .{ @intCast(h), 0, 0, 0, 0, 0 }, .{ 0, 0 }, h);
+    }
+
+    /// dst[base + pos0*stride + i] = src[i], pos0 from g_state (graph-safe
+    /// KV appends and tap-row snapshots).
+    pub fn opKvAppendS(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, count: usize, stride: usize, base: usize) Error!void {
+        try self.eltLaunch(self.f_kv_append_s, src, dst, null, null, .{ @intCast(count), @intCast(stride), @intCast(base), 0, 0, 0 }, .{ 0, 0 }, count);
+    }
+
+    /// dst[dst_off + i] = src[src_off + i] as a kernel — usable inside
+    /// recorded batches and graph captures (unlike the null-stream memcpy).
+    pub fn opCopyOff(self: *Backend, dst: DeviceBuffer, dst_off_elems: usize, src: DeviceBuffer, src_off_elems: usize, count: usize) Error!void {
+        const f = try self.eltFn(elt.copy_off_ptx, "copy_off");
+        try self.eltLaunch(f, src, dst, null, null, .{ @intCast(count), @intCast(dst_off_elems), @intCast(src_off_elems), 0, 0, 0 }, .{ 0, 0 }, count);
+    }
+
+    pub fn opRopeHalfS(self: *Backend, qk: DeviceBuffer, freqs: DeviceBuffer, n_heads: usize, half: usize, sin_off: usize) Error!void {
+        const total = n_heads * half;
+        try self.eltLaunch(self.f_rope_half_s, qk, null, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), 0, 0 }, .{ 0, 0 }, total);
+    }
+
+    pub fn opAttnDecodeSGraph(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, n_heads: usize, kv_heads: usize, hd: usize, nsplit: usize, scale: f32) Error!void {
+        std.debug.assert(hd == 128);
+        try self.eltLaunch(self.f_attn_split_s, q, k, v, scratch, .{ 0, @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intCast(nsplit), 0 }, .{ scale, 0 }, n_heads * nsplit * 32);
+        const f_merge = try self.eltFn(elt.attn_merge_ptx, "attn_merge");
+        try self.eltLaunch(f_merge, scratch, out, null, null, .{ @intCast(n_heads), @intCast(hd), @intCast(nsplit), 0, 0, 0 }, .{ 0, 0 }, n_heads * hd);
+    }
 
     fn eltFn(self: *Backend, ptx: [:0]const u8, entry: [:0]const u8) Error!cu.CUfunction {
         const key = @intFromPtr(ptx.ptr);
@@ -1755,3 +2120,252 @@ pub const Backend = struct {
 test {
     _ = Backend;
 }
+
+// Gated on a CUDA device: gemv_fp8n against a CPU LUT reference, including
+// the n < 4 predicated-store tail.
+test "gemv_fp8n matches CPU reference" {
+    const gpa = std.testing.allocator;
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+
+    const rows = 48;
+    const cols = 256; // multiple of 8
+    const n = 3;
+    var prng = std.Random.DefaultPrng.init(999);
+    const rand = prng.random();
+
+    const w = try gpa.alloc(u8, rows * cols);
+    defer gpa.free(w);
+    rand.bytes(w);
+    for (w) |*wb| {
+        if (wb.* & 0x7F == 0x7F) wb.* = 0; // e4m3 NaN encodings
+    }
+    const x = try gpa.alloc(f32, 4 * cols);
+    defer gpa.free(x);
+    for (x) |*xi| xi.* = rand.float(f32) * 2.0 - 1.0;
+
+    const x_d = try be.tensorCreate(4 * cols * 4);
+    const y_d = try be.tensorCreate(4 * rows * 4);
+    defer {
+        var xd = x_d;
+        var yd = y_d;
+        be.tensorDestroy(&xd);
+        be.tensorDestroy(&yd);
+    }
+    try be.tensorUpload(x_d, std.mem.sliceAsBytes(x));
+    const y = try gpa.alloc(f32, 4 * rows);
+    defer gpa.free(y);
+    @memset(y, -777.0);
+    try be.tensorUpload(y_d, std.mem.sliceAsBytes(y));
+
+    const scale: f32 = 0.25;
+    try be.opGemvFp8N(y_d, x_d, w, scale, rows, cols, n);
+    try be.tensorDownload(y_d, std.mem.sliceAsBytes(y));
+
+    for (0..n) |i| {
+        for (0..rows) |r| {
+            var acc: f32 = 0;
+            for (0..cols) |c| acc += dtypes.f8_e4m3_to_f32_table[w[r * cols + c]] * x[i * cols + c];
+            try std.testing.expectApproxEqAbs(acc * scale, y[i * rows + r], 1e-2);
+        }
+    }
+    for (0..rows) |r| try std.testing.expectEqual(@as(f32, -777.0), y[3 * rows + r]);
+}
+
+// Gated on a CUDA device: gemv_bf16n against a CPU reference, including the
+// n < 4 predicated-store tail (untouched output rows must stay untouched).
+test "gemv_bf16n matches CPU reference" {
+    const gpa = std.testing.allocator;
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+
+    const rows = 64;
+    const cols = 128;
+    const n = 3;
+    var prng = std.Random.DefaultPrng.init(12345);
+    const rand = prng.random();
+
+    // bf16 weights with exactly-representable values via f32 truncation.
+    const w = try gpa.alloc(u16, rows * cols);
+    defer gpa.free(w);
+    const w_f32 = try gpa.alloc(f32, rows * cols);
+    defer gpa.free(w_f32);
+    for (w, w_f32) |*wi, *wf| {
+        const v = rand.float(f32) * 2.0 - 1.0;
+        wi.* = @truncate(@as(u32, @bitCast(v)) >> 16);
+        wf.* = @bitCast(@as(u32, wi.*) << 16);
+    }
+    const x = try gpa.alloc(f32, 4 * cols); // 4 rows of backing store, n=3 live
+    defer gpa.free(x);
+    for (x) |*xi| xi.* = rand.float(f32) * 2.0 - 1.0;
+
+    const x_d = try be.tensorCreate(4 * cols * 4);
+    const y_d = try be.tensorCreate(4 * rows * 4);
+    defer {
+        var xd = x_d;
+        var yd = y_d;
+        be.tensorDestroy(&xd);
+        be.tensorDestroy(&yd);
+    }
+    try be.tensorUpload(x_d, std.mem.sliceAsBytes(x));
+    // Poison y so the predicated-off 4th row is provably untouched.
+    const y = try gpa.alloc(f32, 4 * rows);
+    defer gpa.free(y);
+    @memset(y, -777.0);
+    try be.tensorUpload(y_d, std.mem.sliceAsBytes(y));
+
+    const scale: f32 = 0.5;
+    try be.opGemvBf16N(y_d, x_d, std.mem.sliceAsBytes(w), scale, rows, cols, n);
+    try be.tensorDownload(y_d, std.mem.sliceAsBytes(y));
+
+    for (0..n) |i| {
+        for (0..rows) |r| {
+            var acc: f32 = 0;
+            for (0..cols) |c| acc += w_f32[r * cols + c] * x[i * cols + c];
+            try std.testing.expectApproxEqAbs(acc * scale, y[i * rows + r], 1e-3);
+        }
+    }
+    for (0..rows) |r| try std.testing.expectEqual(@as(f32, -777.0), y[3 * rows + r]);
+}
+
+// Gated on a CUDA device: rope_half_pos against the CPU per-row-position
+// reference (out-of-order, repeated positions).
+test "rope_half_pos matches CPU reference" {
+    const gpa = std.testing.allocator;
+    const ops = @import("../../ops.zig");
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+
+    const n_heads = 2;
+    const half = 8;
+    const head_dim = 2 * half;
+    const positions = [_]usize{ 5, 0, 9, 5 };
+    const rows = positions.len;
+
+    var prng = std.Random.DefaultPrng.init(77);
+    const rand = prng.random();
+    const x = try gpa.alloc(f32, rows * n_heads * head_dim);
+    defer gpa.free(x);
+    for (x) |*xi| xi.* = rand.float(f32) * 2.0 - 1.0;
+    const expected = try gpa.alloc(f32, x.len);
+    defer gpa.free(expected);
+    @memcpy(expected, x);
+
+    var freqs = try ops.rope.rotateHalfFreqs(gpa, 10, head_dim, 5e6);
+    defer freqs.deinit(gpa);
+    ops.rope.applyRotateHalfPos(expected, freqs, &positions, n_heads, head_dim);
+
+    const fp = try gpa.alloc(f32, 2 * 10 * half);
+    defer gpa.free(fp);
+    @memcpy(fp[0 .. 10 * half], freqs.cos);
+    @memcpy(fp[10 * half ..], freqs.sin);
+    var pos32: [rows]u32 = undefined;
+    for (positions, 0..) |p, i| pos32[i] = @intCast(p);
+
+    var x_d = try be.tensorCreate(x.len * 4);
+    defer be.tensorDestroy(&x_d);
+    var pos_d = try be.tensorCreate(rows * 4);
+    defer be.tensorDestroy(&pos_d);
+    var f_d = try be.tensorCreate(fp.len * 4);
+    defer be.tensorDestroy(&f_d);
+    try be.tensorUpload(x_d, std.mem.sliceAsBytes(x));
+    try be.tensorUpload(pos_d, std.mem.sliceAsBytes(&pos32));
+    try be.tensorUpload(f_d, std.mem.sliceAsBytes(fp));
+
+    try be.opRopeHalfPos(x_d, pos_d, f_d, rows, n_heads, half, 10 * half);
+    try be.tensorDownload(x_d, std.mem.sliceAsBytes(x));
+    for (expected, x) |e, a| try std.testing.expectApproxEqAbs(e, a, 1e-5);
+}
+
+// Gated on a CUDA device: attn_split_tree + attn_merge against the CPU
+// tree-attention reference — branching tree, GQA, prefix + ancestor rows in
+// one K/V buffer with the batch rows at tree_base.
+test "tree flash-decode attention matches CPU reference" {
+    const gpa = std.testing.allocator;
+    const ops = @import("../../ops.zig");
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+
+    const n_heads = 4;
+    const kv_heads = 2;
+    const hd = 128;
+    const kv_dim = kv_heads * hd;
+    const q_dim = n_heads * hd;
+    const prefix_len = 10;
+    const tree_base = 16;
+    const parents = [_]u32{ 0, 0, 1, 1, 0 }; // root, two children, two grandchildren under node 1
+    const n = parents.len;
+    const nsplit = 4;
+    const scale: f32 = 1.0 / 8.0;
+
+    var prng = std.Random.DefaultPrng.init(4242);
+    const rand = prng.random();
+    const q = try gpa.alloc(f32, n * q_dim);
+    defer gpa.free(q);
+    const k = try gpa.alloc(f32, (tree_base + n) * kv_dim);
+    defer gpa.free(k);
+    const v = try gpa.alloc(f32, (tree_base + n) * kv_dim);
+    defer gpa.free(v);
+    for (q) |*e| e.* = rand.float(f32) * 2.0 - 1.0;
+    for (k) |*e| e.* = rand.float(f32) * 2.0 - 1.0;
+    for (v) |*e| e.* = rand.float(f32) * 2.0 - 1.0;
+
+    const expected = try gpa.alloc(f32, n * q_dim);
+    defer gpa.free(expected);
+    try ops.attention.attentionTree(
+        gpa,
+        expected,
+        q,
+        k[0 .. prefix_len * kv_dim],
+        v[0 .. prefix_len * kv_dim],
+        k[tree_base * kv_dim ..],
+        v[tree_base * kv_dim ..],
+        &parents,
+        .{ .n_heads = n_heads, .n_kv_heads = kv_heads, .head_dim = hd, .scale = scale },
+    );
+
+    // Meta table: [kv_len, anc_0..] per query, stride n+1, at the scratch tail.
+    const meta_off = n * n_heads * nsplit * (hd + 4);
+    var meta = [_]u32{0} ** (n * (n + 1));
+    var depth: [n]usize = undefined;
+    depth[0] = 0;
+    for (parents[1..], 1..) |p, i| depth[i] = depth[p] + 1;
+    for (0..n) |i| {
+        meta[i * (n + 1)] = @intCast(prefix_len + depth[i] + 1);
+        var j: u32 = @intCast(i);
+        var d = depth[i];
+        while (true) {
+            meta[i * (n + 1) + 1 + d] = j;
+            if (j == 0) break;
+            j = parents[j];
+            d -= 1;
+        }
+    }
+
+    var q_d = try be.tensorCreate(q.len * 4);
+    defer be.tensorDestroy(&q_d);
+    var k_d = try be.tensorCreate(k.len * 4);
+    defer be.tensorDestroy(&k_d);
+    var v_d = try be.tensorCreate(v.len * 4);
+    defer be.tensorDestroy(&v_d);
+    var out_d = try be.tensorCreate(n * q_dim * 4);
+    defer be.tensorDestroy(&out_d);
+    var scratch_d = try be.tensorCreate((meta_off + meta.len) * 4);
+    defer be.tensorDestroy(&scratch_d);
+    try be.tensorUpload(q_d, std.mem.sliceAsBytes(q));
+    try be.tensorUpload(k_d, std.mem.sliceAsBytes(k));
+    try be.tensorUpload(v_d, std.mem.sliceAsBytes(v));
+    const meta_dst: DeviceBuffer = .{
+        .buf = @enumFromInt(@intFromEnum(scratch_d.buf) + meta_off * 4),
+        .mem = scratch_d.mem,
+        .size = meta.len * 4,
+    };
+    try be.tensorUpload(meta_dst, std.mem.sliceAsBytes(&meta));
+
+    try be.opAttnDecodeTree(q_d, k_d, v_d, out_d, scratch_d, prefix_len, tree_base, n, n_heads, kv_heads, hd, nsplit, scale);
+    const out = try gpa.alloc(f32, n * q_dim);
+    defer gpa.free(out);
+    try be.tensorDownload(out_d, std.mem.sliceAsBytes(out));
+    for (expected, out) |e, a| try std.testing.expectApproxEqAbs(e, a, 2e-4);
+}
+

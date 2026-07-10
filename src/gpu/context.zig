@@ -62,7 +62,7 @@ const Push = extern struct {
 };
 
 /// Eltwise/attention kernels and their workgroup shapes (kernels/eltwise.zig).
-pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine };
+pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4 };
 const elt_entry_sizes = [_]EntrySize{
     .{ .name = "rmsnorm", .x = 64, .y = 1 },
     .{ .name = "rms_partial", .x = 256, .y = 1 },
@@ -110,6 +110,8 @@ const elt_entry_sizes = [_]EntrySize{
     .{ .name = "attn_dmerge", .x = 256, .y = 1 },
     .{ .name = "gemv_partial", .x = 256, .y = 1 },
     .{ .name = "gemv_combine", .x = 256, .y = 1 },
+    .{ .name = "gemv_partial4", .x = 256, .y = 1 },
+    .{ .name = "gemv_combine4", .x = 256, .y = 1 },
 };
 
 /// Push block shared by all eltwise entries; meaning per entry (see kernels).
@@ -260,6 +262,8 @@ pub const DeviceBuffer = struct {
 const WeightEntry = struct {
     db: DeviceBuffer,
     last_use: u64,
+    /// Pinned entries (first-touch, up to pin_budget) are immune to eviction.
+    pinned: bool = false,
 };
 
 pub const Context = struct {
@@ -283,6 +287,16 @@ pub const Context = struct {
     /// Test hook: when nonzero, caps the budget headroom calculation so
     /// weight streaming can be forced without exhausting real VRAM.
     budget_override: u64 = 0,
+    /// First-touch weight pinning: newly cached weights are pinned (immune to
+    /// eviction) until their total reaches this cap; later weights stream.
+    /// For a fixed repeating walk (LLM decode) this turns the LRU cliff —
+    /// where any cap below full residency re-uploads EVERYTHING — into cost
+    /// proportional to the streamed fraction. 0 = off. Must stay off for the
+    /// diffusion pipeline: first-touch would pin the single-use text encoder
+    /// and stream the whole DiT.
+    pin_budget: u64 = 0,
+    /// Bytes currently claimed against pin_budget (device sizes, padded).
+    pinned_bytes: u64 = 0,
     device_name: [64]u8,
     device_name_len: usize,
     /// f16*f16->f32 subgroup cooperative-matrix shape (0 = unsupported).
@@ -1358,7 +1372,7 @@ pub const Context = struct {
             try self.submitAndWaitBuf(cb);
         }
 
-        try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter });
+        try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .pinned = self.pinNew(total) });
         return db.buf;
     }
 
@@ -1627,6 +1641,60 @@ pub const Context = struct {
             .u2 = @intCast(y_off_elems),
             .f0 = scale,
         }, rows, 1, 1);
+    }
+
+    /// opGemvPartial for four input vectors at once (speculative-decode
+    /// verify): each weight word is read once for all four inputs; results
+    /// are bitwise equal to four single-input GEMVs. `x` must have 4 rows of
+    /// backing store past `x_off_elems`; `partials` must hold 4*rows*nchunk
+    /// f32. rows % 8 == 0.
+    pub fn opGemvPartial4(
+        self: *Context,
+        x: DeviceBuffer,
+        x_off_elems: usize,
+        partials: DeviceBuffer,
+        w_bytes: []const u8,
+        dtype_f8: bool,
+        rows: usize,
+        cols: usize,
+        nchunk: usize,
+    ) Error!void {
+        std.debug.assert(rows % 8 == 0);
+        const w_buf = try self.weightBuffer(w_bytes, if (dtype_f8) 1 else 4, rows, cols);
+        const w_db: DeviceBuffer = .{ .buf = w_buf, .mem = .null_handle, .size = 0 };
+        try self.opElt(.gemv_partial4, w_db, x, null, partials, .{
+            .u0 = @intCast((rows / 8) * nchunk),
+            .u1 = @intCast(cols),
+            .u2 = @intCast(nchunk),
+            .u3 = @intCast(std.mem.alignForward(usize, rows, tile_n)),
+            .u4 = @intFromBool(dtype_f8),
+            .u5 = @intCast(rows),
+            .f1 = @bitCast(@as(u32, @intCast(x_off_elems))),
+        }, (rows / 8) * nchunk, 1, 1);
+    }
+
+    /// Reduce gemv_partial4 partials into `n` (1..4) live outputs, each at
+    /// y_off + i*y_stride elements.
+    pub fn opGemvCombine4(
+        self: *Context,
+        y: DeviceBuffer,
+        y_off_elems: usize,
+        y_stride_elems: usize,
+        partials: DeviceBuffer,
+        rows: usize,
+        scale: f32,
+        nchunk: usize,
+        n: usize,
+    ) Error!void {
+        std.debug.assert(n >= 1 and n <= 4);
+        try self.opElt(.gemv_combine4, partials, null, null, y, .{
+            .u0 = @intCast(rows),
+            .u1 = @intCast(nchunk),
+            .u2 = @intCast(y_off_elems),
+            .u3 = @intCast(y_stride_elems),
+            .u4 = @intCast(n),
+            .f0 = scale,
+        }, n * rows, 1, 1);
     }
 
     /// Tensor-core GEMM: the kernel reads the cached raw fp8 k-major weights
@@ -1981,7 +2049,7 @@ pub const Context = struct {
             off += n;
         }
 
-        try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter });
+        try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .pinned = self.pinNew(bytes.len) });
         return db.buf;
     }
 
@@ -2188,6 +2256,7 @@ pub const Context = struct {
             self.freeDeviceBuffer(wb.db);
         }
         self.weights.clearRetainingCapacity();
+        self.pinned_bytes = 0;
         var sit = self.small_bufs.valueIterator();
         while (sit.next()) |sb| {
             self.freeDeviceBuffer(sb.*);
@@ -2240,6 +2309,7 @@ pub const Context = struct {
         var lru_use: u64 = std.math.maxInt(u64);
         var it = self.weights.iterator();
         while (it.next()) |e| {
+            if (e.value_ptr.pinned) continue; // pinned prefix never streams
             if (e.value_ptr.last_use < lru_use) {
                 lru_use = e.value_ptr.last_use;
                 lru_key = e.key_ptr.*;
@@ -2262,6 +2332,14 @@ pub const Context = struct {
         while (self.budgetHeadroom() < need) {
             if (!self.evictOneWeight()) return;
         }
+    }
+
+    /// Claim pin residency for a newly cached `size`-byte weight (first-touch
+    /// order): true while the claims fit under pin_budget.
+    fn pinNew(self: *Context, size: u64) bool {
+        if (self.pinned_bytes + size > self.pin_budget) return false;
+        self.pinned_bytes += size;
+        return true;
     }
 
     fn beginCmdBuf(self: *Context, cb: vk.CommandBuffer) Error!void {

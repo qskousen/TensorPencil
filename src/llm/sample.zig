@@ -26,6 +26,55 @@ pub const Params = struct {
 /// noise) and this keeps the candidate buffer fixed-size.
 const max_candidates = 512;
 
+/// The fully processed next-token distribution (repetition penalty,
+/// temperature, top-k, top-p all applied): the exact distribution `next`
+/// draws from, exposed so speculative decoding can verify drafted tokens
+/// against it. Greedy (temperature 0) is a point mass on the argmax.
+pub const Dist = struct {
+    ids: [max_candidates]u32,
+    /// Normalized over the kept candidates, descending.
+    probs: [max_candidates]f32,
+    n: usize,
+
+    /// Probability of `id` under this distribution (0 when filtered out).
+    pub fn probOf(self: *const Dist, id: u32) f32 {
+        for (self.ids[0..self.n], self.probs[0..self.n]) |i, p| {
+            if (i == id) return p;
+        }
+        return 0;
+    }
+
+    pub fn sample(self: *const Dist, rand: std.Random) u32 {
+        if (self.n == 1) return self.ids[0]; // greedy: no rng draw
+        var r = rand.float(f32);
+        for (self.ids[0..self.n], self.probs[0..self.n]) |id, p| {
+            r -= p;
+            if (r <= 0) return id;
+        }
+        return self.ids[self.n - 1]; // float round-off fallthrough
+    }
+
+    /// Draw from the distribution with `excl` removed and the rest
+    /// renormalized — the speculative-decode residual for a rejected token
+    /// proposed by a deterministic drafter (max(p - q, 0) with q a point
+    /// mass at `excl`).
+    pub fn sampleExcluding(self: *const Dist, rand: std.Random, excl: u32) u32 {
+        std.debug.assert(self.n > 0);
+        const mass = 1 - self.probOf(excl);
+        if (mass <= 0) return self.ids[0]; // degenerate: p was a point mass on excl
+        var fallback: u32 = self.ids[0];
+        if (self.n == 1) return fallback; // greedy: excl lost to the argmax, no rng draw
+        var r = rand.float(f32) * mass;
+        for (self.ids[0..self.n], self.probs[0..self.n]) |id, p| {
+            if (id == excl) continue;
+            r -= p;
+            if (r <= 0) return id;
+            fallback = id;
+        }
+        return fallback;
+    }
+};
+
 pub const Sampler = struct {
     params: Params,
     rng: std.Random.DefaultPrng,
@@ -37,6 +86,23 @@ pub const Sampler = struct {
     /// Pick the next token. `logits` is modified in place (repetition
     /// penalty); `recent` is the trailing context window for the penalty.
     pub fn next(self: *Sampler, logits: []f32, recent: []const u32) u32 {
+        const d = self.dist(logits, recent);
+        return d.sample(self.rng.random());
+    }
+
+    /// Speculative-decode acceptance: keep a drafted token with probability
+    /// equal to its mass under the target distribution (the drafter is
+    /// deterministic, so q(draft) = 1). Greedy draws no randomness.
+    pub fn accept(self: *Sampler, d: *const Dist, draft: u32) bool {
+        const p = d.probOf(draft);
+        if (p >= 1) return true;
+        if (p <= 0) return false;
+        return self.rng.random().float(f32) < p;
+    }
+
+    /// Build the processed next-token distribution. `logits` is modified in
+    /// place (repetition penalty); `recent` is the penalty's context window.
+    pub fn dist(self: *Sampler, logits: []f32, recent: []const u32) Dist {
         const p = self.params;
         if (p.repeat_penalty != 1.0) {
             const n = @min(p.repeat_last_n, recent.len);
@@ -45,7 +111,13 @@ pub const Sampler = struct {
                 l.* = if (l.* > 0) l.* / p.repeat_penalty else l.* * p.repeat_penalty;
             }
         }
-        if (p.temperature <= 0) return argmax(logits);
+        var d: Dist = undefined;
+        if (p.temperature <= 0) {
+            d.n = 1;
+            d.ids[0] = argmax(logits);
+            d.probs[0] = 1;
+            return d;
+        }
 
         // Top-k candidates (id, logit), highest first.
         const k = @min(if (p.top_k == 0) max_candidates else p.top_k, max_candidates);
@@ -73,15 +145,15 @@ pub const Sampler = struct {
             }
         }
 
-        // Categorical draw over the kept prefix.
+        // Normalize the kept prefix.
         var kept_mass: f32 = 0;
         for (probs[0..keep]) |prob| kept_mass += prob;
-        var r = self.rng.random().float(f32) * kept_mass;
-        for (cands[0..keep], probs[0..keep]) |c, prob| {
-            r -= prob;
-            if (r <= 0) return c.id;
+        for (cands[0..keep], probs[0..keep], 0..) |c, prob, i| {
+            d.ids[i] = c.id;
+            d.probs[i] = prob / kept_mass;
         }
-        return cands[keep - 1].id; // float round-off fallthrough
+        d.n = keep;
+        return d;
     }
 };
 
@@ -204,6 +276,57 @@ test "repetition penalty suppresses a repeated token" {
     var logits = [_]f32{ 3.0, 2.0, 0.0 };
     const recent = [_]u32{0};
     try std.testing.expectEqual(@as(u32, 1), s.next(&logits, &recent));
+}
+
+test "dist matches next() and normalizes" {
+    var s = Sampler.init(.{ .temperature = 1.0, .top_k = 3, .top_p = 1.0 }, 5);
+    var logits = [_]f32{ 2.0, 1.0, 0.0, -50.0 };
+    const d = s.dist(&logits, &.{});
+    try std.testing.expectEqual(@as(usize, 3), d.n);
+    try std.testing.expectEqual(@as(u32, 0), d.ids[0]);
+    var sum: f32 = 0;
+    for (d.probs[0..d.n]) |p| sum += p;
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), sum, 1e-5);
+    try std.testing.expectEqual(@as(f32, 0), d.probOf(3)); // filtered out
+    try std.testing.expect(d.probOf(0) > d.probOf(1));
+}
+
+test "greedy dist is a point mass and draws no rng" {
+    var s = Sampler.init(.{ .temperature = 0 }, 0);
+    var logits = [_]f32{ 0.0, 4.0, 1.0 };
+    const d = s.dist(&logits, &.{});
+    try std.testing.expectEqual(@as(usize, 1), d.n);
+    try std.testing.expectEqual(@as(f32, 1), d.probOf(1));
+    try std.testing.expect(s.accept(&d, 1));
+    try std.testing.expect(!s.accept(&d, 0));
+    // Residual after a greedy rejection is the argmax itself.
+    try std.testing.expectEqual(@as(u32, 1), d.sampleExcluding(s.rng.random(), 0));
+}
+
+// Speculative acceptance is lossless: accept draft w.p. p(draft), else
+// resample from the renormalized residual. The emitted-token distribution
+// must equal the target distribution itself.
+test "accept + sampleExcluding preserves the target distribution" {
+    const logits_base = [_]f32{ 1.5, 1.0, 0.5, 0.0 };
+    const draft: u32 = 1; // a mid-probability candidate
+    var counts_spec = [_]usize{0} ** 4;
+    var counts_direct = [_]usize{0} ** 4;
+    const trials = 20000;
+
+    var s = Sampler.init(.{ .temperature = 1.0, .top_k = 0, .top_p = 1.0 }, 424242);
+    for (0..trials) |_| {
+        var l1 = logits_base;
+        const d = s.dist(&l1, &.{});
+        const emitted = if (s.accept(&d, draft)) draft else d.sampleExcluding(s.rng.random(), draft);
+        counts_spec[emitted] += 1;
+        var l2 = logits_base;
+        counts_direct[s.next(&l2, &.{})] += 1;
+    }
+    for (counts_spec, counts_direct) |a, b| {
+        const fa = @as(f64, @floatFromInt(a)) / trials;
+        const fb = @as(f64, @floatFromInt(b)) / trials;
+        try std.testing.expectApproxEqAbs(fa, fb, 0.02); // ~4 sigma at n=20k
+    }
 }
 
 test "sampling stays within the top-k set and is seed-deterministic" {

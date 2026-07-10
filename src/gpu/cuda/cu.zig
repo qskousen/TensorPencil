@@ -20,6 +20,8 @@ pub const CUdeviceptr = u64;
 pub const CUdevice = c_int;
 pub const CUcontext = ?*anyopaque;
 pub const CUmodule = ?*anyopaque;
+pub const CUgraph = ?*anyopaque;
+pub const CUgraphExec = ?*anyopaque;
 pub const CUfunction = ?*anyopaque;
 pub const CUstream = ?*anyopaque;
 pub const CUevent = ?*anyopaque;
@@ -122,6 +124,12 @@ const PFN_cuModuleLoadDataEx = *const fn (*CUmodule, *const anyopaque, c_uint, ?
 const PFN_cuModuleUnload = *const fn (CUmodule) callconv(.c) CUresult;
 const PFN_cuModuleGetFunction = *const fn (*CUfunction, CUmodule, [*:0]const u8) callconv(.c) CUresult;
 const PFN_cuModuleGetGlobal = *const fn (*CUdeviceptr, *usize, CUmodule, [*:0]const u8) callconv(.c) CUresult;
+const PFN_cuStreamBeginCapture = *const fn (CUstream, c_int) callconv(.c) CUresult;
+const PFN_cuStreamEndCapture = *const fn (CUstream, *CUgraph) callconv(.c) CUresult;
+const PFN_cuGraphInstantiateWithFlags = *const fn (*CUgraphExec, CUgraph, c_ulonglong) callconv(.c) CUresult;
+const PFN_cuGraphLaunch = *const fn (CUgraphExec, CUstream) callconv(.c) CUresult;
+const PFN_cuGraphDestroy = *const fn (CUgraph) callconv(.c) CUresult;
+const PFN_cuGraphExecDestroy = *const fn (CUgraphExec) callconv(.c) CUresult;
 const PFN_cuLaunchKernel = *const fn (
     CUfunction,
     c_uint,
@@ -188,6 +196,12 @@ pub const Api = struct {
     cuModuleUnload: PFN_cuModuleUnload,
     cuModuleGetFunction: PFN_cuModuleGetFunction,
     cuModuleGetGlobal: PFN_cuModuleGetGlobal,
+    cuStreamBeginCapture: PFN_cuStreamBeginCapture,
+    cuStreamEndCapture: PFN_cuStreamEndCapture,
+    cuGraphInstantiateWithFlags: PFN_cuGraphInstantiateWithFlags,
+    cuGraphLaunch: PFN_cuGraphLaunch,
+    cuGraphDestroy: PFN_cuGraphDestroy,
+    cuGraphExecDestroy: PFN_cuGraphExecDestroy,
     cuLaunchKernel: PFN_cuLaunchKernel,
     cuFuncSetAttribute: PFN_cuFuncSetAttribute,
     cuFuncGetAttribute: PFN_cuFuncGetAttribute,
@@ -246,6 +260,12 @@ pub const Api = struct {
             .{ "cuModuleUnload", "cuModuleUnload" },
             .{ "cuModuleGetFunction", "cuModuleGetFunction" },
             .{ "cuModuleGetGlobal", "cuModuleGetGlobal_v2" },
+            .{ "cuStreamBeginCapture", "cuStreamBeginCapture_v2" },
+            .{ "cuStreamEndCapture", "cuStreamEndCapture" },
+            .{ "cuGraphInstantiateWithFlags", "cuGraphInstantiateWithFlags" },
+            .{ "cuGraphLaunch", "cuGraphLaunch" },
+            .{ "cuGraphDestroy", "cuGraphDestroy" },
+            .{ "cuGraphExecDestroy", "cuGraphExecDestroy" },
             .{ "cuLaunchKernel", "cuLaunchKernel" },
             .{ "cuFuncSetAttribute", "cuFuncSetAttribute" },
             .{ "cuFuncGetAttribute", "cuFuncGetAttribute" },

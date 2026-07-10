@@ -7,6 +7,7 @@ const tokenizer_mod = @import("../tokenizer.zig");
 const ops = @import("../ops.zig");
 const chat = @import("chat.zig");
 const sample = @import("sample.zig");
+const spec = @import("spec.zig");
 const kv_cache_mod = @import("kv_cache.zig");
 
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -20,6 +21,17 @@ pub const Options = struct {
     sampling: sample.Params = .{},
     /// RNG seed for sampling (irrelevant when temperature = 0).
     seed: u64 = 0,
+    /// Speculative decoding: max drafted tokens per verify forward
+    /// (0 = off). Requires a backend stepper with stepAll + truncate.
+    spec_k: usize = 0,
+    /// Tree drafting (LLM_PLAN.md M8): total tree size per verify forward —
+    /// the root (pending token) plus up to tree_nodes-1 drafted branch nodes
+    /// (0 = chain drafting). Greedy-only in v1; requires a drafter exposing
+    /// proposeTree and a stepper exposing stepAllTree + commitTreePath
+    /// (error.TreeUnsupported otherwise).
+    tree_nodes: usize = 0,
+    /// When set, speculative decoding accumulates draft/accept counts here.
+    spec_stats: ?*spec.Stats = null,
 };
 
 /// KV-cache capacity for a given prompt; errors when the prompt alone
@@ -39,6 +51,14 @@ pub fn capacityFor(opts: Options, prompt_len: usize) !usize {
 ///     at the next cache positions and write last-position vocab logits,
 ///   cached() usize — committed cache length, and
 ///   remaining() usize — cache room left.
+/// Speculative decoding (opts.spec_k > 0) additionally requires
+///   stepAll(io, ids_new, logits) — one vocab row per new token, and
+///   truncate(new_len) — roll the cache back to `new_len` tokens;
+/// backends without them return error.SpecUnsupported.
+/// Tree drafting (opts.tree_nodes > 0, spec.generateTree) requires
+///   stepAllTree(io, tokens, parents, logits) — tree-verify forward, and
+///   commitTreePath(path) — append the accepted root path to the cache;
+/// plus a drafter exposing proposeTree (error.TreeUnsupported otherwise).
 /// The first step call carries the not-yet-cached prompt suffix (prefill —
 /// the whole prompt on turn one, only the new turn's tokens on later turns
 /// of a multi-turn session); each later call carries the single sampled
@@ -52,6 +72,15 @@ pub fn generate(
     opts: Options,
     out: ?*std.Io.Writer,
 ) !usize {
+    if (opts.spec_k > 0) {
+        const M = switch (@typeInfo(@TypeOf(model))) {
+            .pointer => |p| p.child,
+            else => @TypeOf(model),
+        };
+        if (comptime !@hasDecl(M, "stepAll")) return error.SpecUnsupported;
+        var drafter: spec.NgramDrafter = .{};
+        return spec.generate(model, &drafter, tok, io, gpa, ids, opts, out);
+    }
     const logits = try gpa.alloc(f32, qwen3.vocab_size);
     defer gpa.free(logits);
 
@@ -88,13 +117,19 @@ pub const CpuModel = struct {
     cache: KvCache,
     freqs: ops.rope.Freqs,
     last_hidden: []f32,
+    /// Retained per-layer batch K/V of the last tree verify
+    /// ([n_layers][tree_n][kv_dim]); lazily allocated to
+    /// n_layers * spec.max_tree_nodes rows on first stepAllTree.
+    tree_k: ?[]f32 = null,
+    tree_v: ?[]f32 = null,
+    tree_n: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator, lm: *const qwen3.CausalLM, capacity: usize) !CpuModel {
-        var cache = try KvCache.init(gpa, qwen3.n_layers, capacity, qwen3.kv_dim);
+        var cache = try KvCache.init(gpa, lm.cfg.n_layers, capacity, lm.cfg.kvDim());
         errdefer cache.deinit(gpa);
-        var freqs = try ops.rope.rotateHalfFreqs(gpa, capacity, qwen3.head_dim, qwen3.rope_theta);
+        var freqs = try ops.rope.rotateHalfFreqs(gpa, capacity, qwen3.head_dim, lm.cfg.rope_theta);
         errdefer freqs.deinit(gpa);
-        const last_hidden = try gpa.alloc(f32, qwen3.hidden);
+        const last_hidden = try gpa.alloc(f32, lm.cfg.hidden);
         return .{ .lm = lm, .gpa = gpa, .cache = cache, .freqs = freqs, .last_hidden = last_hidden };
     }
 
@@ -102,6 +137,8 @@ pub const CpuModel = struct {
         self.cache.deinit(self.gpa);
         self.freqs.deinit(self.gpa);
         self.gpa.free(self.last_hidden);
+        if (self.tree_k) |t| self.gpa.free(t);
+        if (self.tree_v) |t| self.gpa.free(t);
         self.* = undefined;
     }
 
@@ -116,6 +153,54 @@ pub const CpuModel = struct {
     pub fn step(self: *CpuModel, io: std.Io, ids_new: []const u32, logits: []f32) !void {
         try self.lm.forwardCached(io, self.gpa, ids_new, &self.cache, self.freqs, self.last_hidden);
         try ops.matmul.matmul(io, self.gpa, logits, self.last_hidden, 1, self.lm.lmHead(), null);
+    }
+
+    /// step, but with vocab logits for every new token ([ids_new.len, vocab]
+    /// row-major) — the speculative-decode verify forward.
+    pub fn stepAll(self: *CpuModel, io: std.Io, ids_new: []const u32, logits: []f32) !void {
+        const n = ids_new.len;
+        std.debug.assert(logits.len == n * qwen3.vocab_size);
+        const hid = try self.gpa.alloc(f32, n * self.lm.cfg.hidden);
+        defer self.gpa.free(hid);
+        try self.lm.forwardCached(io, self.gpa, ids_new, &self.cache, self.freqs, hid);
+        try ops.matmul.matmul(io, self.gpa, logits, hid, n, self.lm.lmHead(), null);
+    }
+
+    pub fn truncate(self: *CpuModel, new_len: usize) void {
+        self.cache.truncate(new_len);
+    }
+
+    /// Tree-verify forward (spec.generateTree): vocab logits for every tree
+    /// node; the batch K/V rows are retained (NOT committed to the cache)
+    /// until commitTreePath copies the accepted path in.
+    pub fn stepAllTree(self: *CpuModel, io: std.Io, tokens: []const u32, parents: []const u32, logits: []f32) !void {
+        const cfg = self.lm.cfg;
+        const n = tokens.len;
+        std.debug.assert(n >= 1 and n <= spec.max_tree_nodes);
+        std.debug.assert(logits.len == n * qwen3.vocab_size);
+        if (self.tree_k == null) {
+            self.tree_k = try self.gpa.alloc(f32, cfg.n_layers * spec.max_tree_nodes * cfg.kvDim());
+            self.tree_v = try self.gpa.alloc(f32, cfg.n_layers * spec.max_tree_nodes * cfg.kvDim());
+        }
+        const hid = try self.gpa.alloc(f32, n * cfg.hidden);
+        defer self.gpa.free(hid);
+        try self.lm.forwardTree(io, self.gpa, tokens, parents, &self.cache, self.freqs, self.tree_k.?, self.tree_v.?, hid);
+        try ops.matmul.matmul(io, self.gpa, logits, hid, n, self.lm.lmHead(), null);
+        self.tree_n = n;
+    }
+
+    /// Copy the accepted root path's K/V rows from the retained tree batch
+    /// into the cache (path[0] == 0; strictly ascending node indices).
+    pub fn commitTreePath(self: *CpuModel, path: []const usize) !void {
+        const kvd = self.lm.cfg.kvDim();
+        for (path) |idx| {
+            std.debug.assert(idx < self.tree_n);
+            for (0..self.lm.cfg.n_layers) |l| {
+                const row = (l * self.tree_n + idx) * kvd;
+                self.cache.write(l, self.tree_k.?[row..][0..kvd], self.tree_v.?[row..][0..kvd]);
+            }
+            self.cache.commit(1);
+        }
     }
 };
 

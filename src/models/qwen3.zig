@@ -37,6 +37,82 @@ pub const vocab_size = 151936;
 pub const rms_eps: f32 = 1e-6;
 pub const rope_theta: f64 = 5000000.0;
 
+/// Runtime model configuration for `CausalLM` — the extension point for
+/// other Qwen3-family checkpoints (LLM_PLAN.md M5 uses Qwen3-0.6B as the
+/// speculative-decoding draft model). All checkpoints share head_dim 128
+/// (the flash-decoding kernels require it), rms_eps 1e-6, a tied bf16 LM
+/// head, and the 151936-token vocab; everything else varies.
+pub const Config = struct {
+    n_layers: usize,
+    hidden: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    intermediate: usize,
+    rope_theta: f64,
+    /// Tensor-name prefix up to "layers.N." / "embed_tokens." / "norm.".
+    prefix: []const u8,
+
+    pub fn qDim(self: Config) usize {
+        return self.n_heads * head_dim;
+    }
+    pub fn kvDim(self: Config) usize {
+        return self.n_kv_heads * head_dim;
+    }
+
+    /// The Krea 2 text-encoder checkpoint: Qwen3-VL-4B.
+    pub const vl_4b: Config = .{
+        .n_layers = 36,
+        .hidden = 2560,
+        .n_heads = 32,
+        .n_kv_heads = 8,
+        .intermediate = 9728,
+        .rope_theta = 5000000.0,
+        .prefix = "model.language_model.",
+    };
+
+    /// Qwen3-0.6B (base or instruct) — the draft model.
+    pub const qwen3_0_6b: Config = .{
+        .n_layers = 28,
+        .hidden = 1024,
+        .n_heads = 16,
+        .n_kv_heads = 8,
+        .intermediate = 3072,
+        .rope_theta = 1000000.0,
+        .prefix = "model.",
+    };
+
+    /// Vanilla Qwen3-4B (text-only): the VL's dims but rope_theta 1e6 and
+    /// bare tensor names — the EAGLE-3 head's actual training target.
+    pub const qwen3_4b: Config = .{
+        .n_layers = 36,
+        .hidden = 2560,
+        .n_heads = 32,
+        .n_kv_heads = 8,
+        .intermediate = 9728,
+        .rope_theta = 1000000.0,
+        .prefix = "model.",
+    };
+
+    /// Pick the preset matching a checkpoint by its embedding tensor name
+    /// and shape (rope_theta is not recoverable from weights, so only known
+    /// configurations load).
+    pub fn detect(st: *const SafeTensors) !Config {
+        inline for (.{ vl_4b, qwen3_0_6b, qwen3_4b }) |cfg| {
+            var buf: [96]u8 = undefined;
+            const name = try std.fmt.bufPrint(&buf, "{s}embed_tokens.weight", .{cfg.prefix});
+            if (st.get(name)) |view| {
+                const shape = view.info.shape.slice();
+                if (shape.len == 2 and shape[0] == vocab_size and shape[1] == cfg.hidden) return cfg;
+            }
+        }
+        return error.UnknownModelConfig;
+    }
+
+    /// Largest n_layers across presets — backend steppers use fixed-size
+    /// per-layer arrays.
+    pub const max_layers = 36;
+};
+
 /// Tap k is the hidden state before layer k runs.
 pub const tap_layers = [_]usize{ 2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35 };
 pub const tap_count = tap_layers.len;
@@ -95,12 +171,12 @@ pub const TextEncoder = struct {
 
         const x = try gpa.alloc(f32, seq * hidden);
         defer gpa.free(x);
-        try embedTokens(self.embed_bytes, ids, x);
+        try embedTokens(self.embed_bytes, hidden, ids, x);
 
         var freqs = try ops.rope.rotateHalfFreqs(gpa, seq, head_dim, rope_theta);
         defer freqs.deinit(gpa);
 
-        var scratch = try Scratch.init(gpa, seq);
+        var scratch = try Scratch.init(gpa, seq, Config.vl_4b);
         defer scratch.deinit(gpa);
 
         var tap_idx: usize = 0;
@@ -119,28 +195,32 @@ pub const TextEncoder = struct {
     }
 };
 
-/// The full Qwen3-VL-4B text stack as a language model: all 36 layers, final
-/// norm, and the embedding matrix doubling as the tied LM head.
+/// A Qwen3-family text stack as a language model: all layers, final norm,
+/// and the embedding matrix doubling as the tied LM head. The checkpoint's
+/// configuration is auto-detected (Config.detect).
 pub const CausalLM = struct {
     arena: std.heap.ArenaAllocator,
+    cfg: Config,
     /// bf16 [vocab, hidden] view into the mapped file; also the tied LM head.
     embed_bytes: []const u8,
     layers: []Layer,
     final_norm: []const f32,
 
     pub fn load(gpa: std.mem.Allocator, st: *const SafeTensors) !CausalLM {
+        const cfg = try Config.detect(st);
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const alloc = arena.allocator();
 
-        const embed = try st.require("model.language_model.embed_tokens.weight");
-        if (embed.info.dtype != .bf16 or embed.info.elemCount() != vocab_size * hidden)
+        var buf: [96]u8 = undefined;
+        const embed = try st.require(try std.fmt.bufPrint(&buf, "{s}embed_tokens.weight", .{cfg.prefix}));
+        if (embed.info.dtype != .bf16 or embed.info.elemCount() != vocab_size * cfg.hidden)
             return error.ShapeMismatch;
 
-        const layers = try loadLayers(alloc, st, n_layers);
-        const final_norm = try loadNormNamed(alloc, st, "model.language_model.norm.weight", hidden);
+        const layers = try loadLayersCfg(alloc, st, cfg, cfg.n_layers);
+        const final_norm = try loadNormNamed(alloc, st, try std.fmt.bufPrint(&buf, "{s}norm.weight", .{cfg.prefix}), cfg.hidden);
 
-        return .{ .arena = arena, .embed_bytes = embed.bytes, .layers = layers, .final_norm = final_norm };
+        return .{ .arena = arena, .cfg = cfg, .embed_bytes = embed.bytes, .layers = layers, .final_norm = final_norm };
     }
 
     pub fn deinit(self: *CausalLM) void {
@@ -150,14 +230,15 @@ pub const CausalLM = struct {
 
     /// Tied LM head: logits = hidden @ embed^T, [vocab] per position.
     pub fn lmHead(self: *const CausalLM) Weight {
-        return Weight.init(self.embed_bytes, .bf16, vocab_size, hidden);
+        return Weight.init(self.embed_bytes, .bf16, vocab_size, self.cfg.hidden);
     }
 
     /// Forward `ids` at absolute positions [cache.len, cache.len + ids.len),
     /// appending their K/V to the cache: prefill when the cache is empty,
     /// single-token decode when ids.len == 1. `freqs` must cover the final
-    /// position. When `out` ([hidden]) is set, it receives the final-normed
-    /// hidden state of the last new position, ready for the LM head.
+    /// position. When `out` ([n * hidden], n <= ids.len) is set, it receives
+    /// the final-normed hidden states of the last n new positions, ready for
+    /// the LM head (n = 1 for decode, n = draft+1 for speculative verify).
     pub fn forwardCached(
         self: *const CausalLM,
         io: std.Io,
@@ -167,38 +248,119 @@ pub const CausalLM = struct {
         freqs: ops.rope.Freqs,
         out: ?[]f32,
     ) !void {
+        const cfg = self.cfg;
         const seq = ids.len;
         std.debug.assert(seq > 0 and seq <= cache.remaining());
-        std.debug.assert(cache.n_layers == n_layers and cache.kv_dim == kv_dim);
+        std.debug.assert(cache.n_layers == cfg.n_layers and cache.kv_dim == cfg.kvDim());
 
-        const x = try gpa.alloc(f32, seq * hidden);
+        const x = try gpa.alloc(f32, seq * cfg.hidden);
         defer gpa.free(x);
-        try embedTokens(self.embed_bytes, ids, x);
+        try embedTokens(self.embed_bytes, cfg.hidden, ids, x);
 
-        var scratch = try Scratch.init(gpa, seq);
+        var scratch = try Scratch.init(gpa, seq, cfg);
         defer scratch.deinit(gpa);
 
         for (self.layers, 0..) |layer, l| {
-            try layerForwardCached(io, gpa, layer, x, seq, freqs, cache, l, &scratch);
+            try layerForwardCached(io, gpa, cfg, layer, x, seq, freqs, cache, l, &scratch);
         }
         cache.commit(seq);
         if (out) |o| {
-            std.debug.assert(o.len == hidden);
-            ops.norm.rmsNorm(o, x[(seq - 1) * hidden ..][0..hidden], self.final_norm, rms_eps);
+            std.debug.assert(o.len % cfg.hidden == 0);
+            const n = o.len / cfg.hidden;
+            std.debug.assert(n >= 1 and n <= seq);
+            ops.norm.rmsNorm(o, x[(seq - n) * cfg.hidden ..][0 .. n * cfg.hidden], self.final_norm, rms_eps);
         }
+    }
+
+    /// Tree-verify forward (speculative tree drafting, LLM_PLAN.md M8):
+    /// `ids.len` tree nodes forwarded against the committed cache WITHOUT
+    /// appending to it. Node i (parents[i] < i; node 0 is the root) sits at
+    /// absolute position cache.len + depth(i) and attends the committed
+    /// prefix plus its own ancestor chain; per-layer K/V rows are retained
+    /// in tree_k/tree_v ([n_layers][ids.len][kv_dim] row-major) so the
+    /// caller can commit the accepted path afterwards. `out` receives the
+    /// final-normed hidden states of ALL nodes ([ids.len][hidden]).
+    pub fn forwardTree(
+        self: *const CausalLM,
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        ids: []const u32,
+        parents: []const u32,
+        cache: *const KvCache,
+        freqs: ops.rope.Freqs,
+        tree_k: []f32,
+        tree_v: []f32,
+        out: []f32,
+    ) !void {
+        const cfg = self.cfg;
+        const n = ids.len;
+        std.debug.assert(n > 0 and parents.len == n);
+        std.debug.assert(tree_k.len >= cfg.n_layers * n * cfg.kvDim() and tree_v.len >= tree_k.len);
+        std.debug.assert(out.len == n * cfg.hidden);
+        std.debug.assert(cache.n_layers == cfg.n_layers and cache.kv_dim == cfg.kvDim());
+
+        const positions = try gpa.alloc(usize, n);
+        defer gpa.free(positions);
+        positions[0] = cache.len;
+        for (parents[1..], 1..) |p, i| {
+            std.debug.assert(p < i);
+            positions[i] = positions[p] + 1;
+            std.debug.assert(positions[i] < cache.capacity);
+        }
+
+        const x = try gpa.alloc(f32, n * cfg.hidden);
+        defer gpa.free(x);
+        try embedTokens(self.embed_bytes, cfg.hidden, ids, x);
+
+        var s = try Scratch.init(gpa, n, cfg);
+        defer s.deinit(gpa);
+
+        for (self.layers, 0..) |layer, l| {
+            const kvd = cfg.kvDim();
+            const lk = tree_k[l * n * kvd ..][0 .. n * kvd];
+            const lv = tree_v[l * n * kvd ..][0 .. n * kvd];
+
+            // Attention.
+            ops.norm.rmsNorm(s.normed, x, layer.input_norm, rms_eps);
+            try ops.matmul.matmul(io, gpa, s.q, s.normed, n, layer.q, null);
+            try ops.matmul.matmul(io, gpa, s.k, s.normed, n, layer.k, null);
+            try ops.matmul.matmul(io, gpa, s.v, s.normed, n, layer.v, null);
+            ops.norm.rmsNorm(s.q, s.q, layer.q_norm, rms_eps); // per-head: rows of head_dim
+            ops.norm.rmsNorm(s.k, s.k, layer.k_norm, rms_eps);
+            ops.rope.applyRotateHalfPos(s.q, freqs, positions, cfg.n_heads, head_dim);
+            ops.rope.applyRotateHalfPos(s.k, freqs, positions, cfg.n_kv_heads, head_dim);
+            @memcpy(lk, s.k[0 .. n * kvd]);
+            @memcpy(lv, s.v[0 .. n * kvd]);
+            try ops.attention.attentionTree(gpa, s.attn_out, s.q, cache.kView(l, 0), cache.vView(l, 0), lk, lv, parents, .{
+                .n_heads = cfg.n_heads,
+                .n_kv_heads = cfg.n_kv_heads,
+                .head_dim = head_dim,
+            });
+            try ops.matmul.matmul(io, gpa, s.tmp, s.attn_out, n, layer.o, null);
+            for (x, s.tmp) |*xi, ti| xi.* += ti;
+
+            // MLP.
+            ops.norm.rmsNorm(s.normed, x, layer.post_norm, rms_eps);
+            try ops.matmul.matmul(io, gpa, s.gate, s.normed, n, layer.gate, null);
+            try ops.matmul.matmul(io, gpa, s.up, s.normed, n, layer.up, null);
+            ops.act.siluMul(s.gate, s.up);
+            try ops.matmul.matmul(io, gpa, s.tmp, s.gate, n, layer.down, null);
+            for (x, s.tmp) |*xi, ti| xi.* += ti;
+        }
+        ops.norm.rmsNorm(out, x, self.final_norm, rms_eps);
     }
 };
 
-/// Look up bf16 embedding rows for `ids` into `x` [ids.len, hidden] f32.
-fn embedTokens(embed_bytes: []const u8, ids: []const u32, x: []f32) !void {
+/// Look up bf16 embedding rows for `ids` into `x` [ids.len, h] f32.
+fn embedTokens(embed_bytes: []const u8, h: usize, ids: []const u32, x: []f32) !void {
     for (ids, 0..) |id, t| {
         if (id >= vocab_size) return error.TokenIdOutOfRange;
-        const row = embed_bytes[@as(usize, id) * hidden * 2 ..][0 .. hidden * 2];
-        try safetensors.convertToF32(.bf16, row, x[t * hidden ..][0..hidden]);
+        const row = embed_bytes[@as(usize, id) * h * 2 ..][0 .. h * 2];
+        try safetensors.convertToF32(.bf16, row, x[t * h ..][0..h]);
     }
 }
 
-/// Per-forward activation buffers, sized for `seq` tokens.
+/// Per-forward activation buffers, sized for `seq` tokens of `cfg`.
 const Scratch = struct {
     normed: []f32,
     tmp: []f32,
@@ -209,23 +371,23 @@ const Scratch = struct {
     gate: []f32,
     up: []f32,
 
-    fn init(gpa: std.mem.Allocator, seq: usize) !Scratch {
+    fn init(gpa: std.mem.Allocator, seq: usize, cfg: Config) !Scratch {
         var s: Scratch = undefined;
-        s.normed = try gpa.alloc(f32, seq * hidden);
+        s.normed = try gpa.alloc(f32, seq * cfg.hidden);
         errdefer gpa.free(s.normed);
-        s.tmp = try gpa.alloc(f32, seq * hidden);
+        s.tmp = try gpa.alloc(f32, seq * cfg.hidden);
         errdefer gpa.free(s.tmp);
-        s.q = try gpa.alloc(f32, seq * q_dim);
+        s.q = try gpa.alloc(f32, seq * cfg.qDim());
         errdefer gpa.free(s.q);
-        s.k = try gpa.alloc(f32, seq * kv_dim);
+        s.k = try gpa.alloc(f32, seq * cfg.kvDim());
         errdefer gpa.free(s.k);
-        s.v = try gpa.alloc(f32, seq * kv_dim);
+        s.v = try gpa.alloc(f32, seq * cfg.kvDim());
         errdefer gpa.free(s.v);
-        s.attn_out = try gpa.alloc(f32, seq * q_dim);
+        s.attn_out = try gpa.alloc(f32, seq * cfg.qDim());
         errdefer gpa.free(s.attn_out);
-        s.gate = try gpa.alloc(f32, seq * intermediate);
+        s.gate = try gpa.alloc(f32, seq * cfg.intermediate);
         errdefer gpa.free(s.gate);
-        s.up = try gpa.alloc(f32, seq * intermediate);
+        s.up = try gpa.alloc(f32, seq * cfg.intermediate);
         errdefer gpa.free(s.up);
         return s;
     }
@@ -280,6 +442,7 @@ fn layerForward(io: std.Io, gpa: std.mem.Allocator, layer: Layer, x: []f32, seq:
 fn layerForwardCached(
     io: std.Io,
     gpa: std.mem.Allocator,
+    cfg: Config,
     layer: Layer,
     x: []f32,
     seq: usize,
@@ -297,14 +460,14 @@ fn layerForwardCached(
     try ops.matmul.matmul(io, gpa, s.v, s.normed, seq, layer.v, null);
     ops.norm.rmsNorm(s.q, s.q, layer.q_norm, rms_eps); // per-head: rows of head_dim
     ops.norm.rmsNorm(s.k, s.k, layer.k_norm, rms_eps);
-    ops.rope.applyRotateHalfAt(s.q, freqs, pos0, seq, n_heads, head_dim);
-    ops.rope.applyRotateHalfAt(s.k, freqs, pos0, seq, n_kv_heads, head_dim);
-    cache.write(l, s.k[0 .. seq * kv_dim], s.v[0 .. seq * kv_dim]);
+    ops.rope.applyRotateHalfAt(s.q, freqs, pos0, seq, cfg.n_heads, head_dim);
+    ops.rope.applyRotateHalfAt(s.k, freqs, pos0, seq, cfg.n_kv_heads, head_dim);
+    cache.write(l, s.k[0 .. seq * cfg.kvDim()], s.v[0 .. seq * cfg.kvDim()]);
     try ops.attention.attention(io, gpa, s.attn_out, s.q, cache.kView(l, seq), cache.vView(l, seq), .{
         .seq_q = seq,
         .seq_kv = pos0 + seq,
-        .n_heads = n_heads,
-        .n_kv_heads = n_kv_heads,
+        .n_heads = cfg.n_heads,
+        .n_kv_heads = cfg.n_kv_heads,
         .head_dim = head_dim,
         .causal = true,
     });
@@ -321,28 +484,32 @@ fn layerForwardCached(
 }
 
 fn loadLayers(alloc: std.mem.Allocator, st: *const SafeTensors, count: usize) ![]Layer {
+    return loadLayersCfg(alloc, st, Config.vl_4b, count);
+}
+
+fn loadLayersCfg(alloc: std.mem.Allocator, st: *const SafeTensors, cfg: Config, count: usize) ![]Layer {
     const layers = try alloc.alloc(Layer, count);
     for (layers, 0..) |*layer, i| {
         layer.* = .{
-            .input_norm = try loadNorm(alloc, st, i, "input_layernorm.weight", hidden),
-            .q = try loadWeight(alloc, st, i, "self_attn.q_proj.weight", q_dim, hidden),
-            .k = try loadWeight(alloc, st, i, "self_attn.k_proj.weight", kv_dim, hidden),
-            .v = try loadWeight(alloc, st, i, "self_attn.v_proj.weight", kv_dim, hidden),
-            .o = try loadWeight(alloc, st, i, "self_attn.o_proj.weight", hidden, q_dim),
-            .q_norm = try loadNorm(alloc, st, i, "self_attn.q_norm.weight", head_dim),
-            .k_norm = try loadNorm(alloc, st, i, "self_attn.k_norm.weight", head_dim),
-            .post_norm = try loadNorm(alloc, st, i, "post_attention_layernorm.weight", hidden),
-            .gate = try loadWeight(alloc, st, i, "mlp.gate_proj.weight", intermediate, hidden),
-            .up = try loadWeight(alloc, st, i, "mlp.up_proj.weight", intermediate, hidden),
-            .down = try loadWeight(alloc, st, i, "mlp.down_proj.weight", hidden, intermediate),
+            .input_norm = try loadNorm(alloc, st, cfg, i, "input_layernorm.weight", cfg.hidden),
+            .q = try loadWeight(st, cfg, i, "self_attn.q_proj.weight", cfg.qDim(), cfg.hidden),
+            .k = try loadWeight(st, cfg, i, "self_attn.k_proj.weight", cfg.kvDim(), cfg.hidden),
+            .v = try loadWeight(st, cfg, i, "self_attn.v_proj.weight", cfg.kvDim(), cfg.hidden),
+            .o = try loadWeight(st, cfg, i, "self_attn.o_proj.weight", cfg.hidden, cfg.qDim()),
+            .q_norm = try loadNorm(alloc, st, cfg, i, "self_attn.q_norm.weight", head_dim),
+            .k_norm = try loadNorm(alloc, st, cfg, i, "self_attn.k_norm.weight", head_dim),
+            .post_norm = try loadNorm(alloc, st, cfg, i, "post_attention_layernorm.weight", cfg.hidden),
+            .gate = try loadWeight(st, cfg, i, "mlp.gate_proj.weight", cfg.intermediate, cfg.hidden),
+            .up = try loadWeight(st, cfg, i, "mlp.up_proj.weight", cfg.intermediate, cfg.hidden),
+            .down = try loadWeight(st, cfg, i, "mlp.down_proj.weight", cfg.hidden, cfg.intermediate),
         };
     }
     return layers;
 }
 
-fn loadNorm(alloc: std.mem.Allocator, st: *const SafeTensors, layer: usize, comptime suffix: []const u8, len: usize) ![]f32 {
+fn loadNorm(alloc: std.mem.Allocator, st: *const SafeTensors, cfg: Config, layer: usize, comptime suffix: []const u8, len: usize) ![]f32 {
     var buf: [96]u8 = undefined;
-    const name = try std.fmt.bufPrint(&buf, "model.language_model.layers.{d}." ++ suffix, .{layer});
+    const name = try std.fmt.bufPrint(&buf, "{s}layers.{d}." ++ suffix, .{ cfg.prefix, layer });
     return loadNormNamed(alloc, st, name, len);
 }
 
@@ -352,13 +519,12 @@ fn loadNormNamed(alloc: std.mem.Allocator, st: *const SafeTensors, name: []const
     return view.toF32Alloc(alloc);
 }
 
-fn loadWeight(alloc: std.mem.Allocator, st: *const SafeTensors, layer: usize, comptime suffix: []const u8, rows: usize, cols: usize) !Weight {
+fn loadWeight(st: *const SafeTensors, cfg: Config, layer: usize, comptime suffix: []const u8, rows: usize, cols: usize) !Weight {
     var buf: [96]u8 = undefined;
-    const name = try std.fmt.bufPrint(&buf, "model.language_model.layers.{d}." ++ suffix, .{layer});
+    const name = try std.fmt.bufPrint(&buf, "{s}layers.{d}." ++ suffix, .{ cfg.prefix, layer });
     const view = st.get(name) orelse return error.MissingTensor;
     const shape = view.info.shape.slice();
     if (shape.len != 2 or shape[0] != rows or shape[1] != cols) return error.ShapeMismatch;
-    _ = alloc;
     var w = Weight.init(view.bytes, view.info.dtype, rows, cols);
     var scale_buf: [112]u8 = undefined;
     const scale_name = try std.fmt.bufPrint(&scale_buf, "{s}_scale", .{name});

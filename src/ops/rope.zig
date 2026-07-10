@@ -135,6 +135,29 @@ pub fn applyRotateHalfAt(x: []f32, freqs: Freqs, pos0: usize, seq: usize, n_head
     }
 }
 
+/// applyRotateHalf with an explicit absolute position per row (speculative
+/// tree-verify batches: node positions are depth-based, not consecutive).
+/// `freqs` must cover max(positions) + 1.
+pub fn applyRotateHalfPos(x: []f32, freqs: Freqs, positions: []const usize, n_heads: usize, head_dim: usize) void {
+    const half = head_dim / 2;
+    std.debug.assert(freqs.half == half);
+    std.debug.assert(x.len == positions.len * n_heads * head_dim);
+    for (positions, 0..) |pos, p| {
+        std.debug.assert((pos + 1) * half <= freqs.cos.len);
+        const cos = freqs.cos[pos * half ..][0..half];
+        const sin = freqs.sin[pos * half ..][0..half];
+        for (0..n_heads) |h| {
+            const base = (p * n_heads + h) * head_dim;
+            for (0..half) |i| {
+                const lo = x[base + i];
+                const hi = x[base + half + i];
+                x[base + i] = lo * cos[i] - hi * sin[i];
+                x[base + half + i] = hi * cos[i] + lo * sin[i];
+            }
+        }
+    }
+}
+
 /// FLUX sinusoidal timestep embedding: out = [cos(t' w_i) .. sin(t' w_i) ..]
 /// with t' = 1000 t, w_i = max_period^(-i/half). `out.len` must be even.
 pub fn timestepEmbedding(out: []f32, t: f32, max_period: f32) void {

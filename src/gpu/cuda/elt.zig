@@ -431,15 +431,629 @@ pub const gemv_bf16_ptx: [:0]const u8 =
     \\}
 ;
 
-/// Flash-decoding pass 1: split the KV range of a single query (seq_q == 1)
-/// across nsplit chunks, one WARP per (head, split). Requires hd == 128: each
-/// lane owns 4 dims (q/k/v as v4.f32), the k·q dot closes with a shfl.bfly
-/// tree (all lanes get the sum), softmax scalars are computed redundantly per
-/// lane, and the accumulator lives in 4 registers per lane — no local memory.
-/// Partial (m, d, pad, pad, acc[hd]) rows go to scratch, stride hd+4 so the
-/// lane v4 stores stay 16B-aligned.
-/// b0=q[heads][hd], b1=k[seq_kv][kv][hd], b2=v, b3=scratch.
-/// u0=seq_kv, u1=heads, u2=kv_heads, u3=hd(=128), u4=nsplit, f0=scale.
+/// Multi-input fp8 GEMV (speculative-decode verify / short prefills):
+/// y[i][row] = scale * dot(W[row], x_i) for n <= 4 input vectors. One block
+/// per EIGHT weight rows (rows % 8 == 0): with block-per-row, every block
+/// re-reads all four x rows and the kernel saturates L2 at ~80 GB/s of
+/// weight traffic; amortizing x over 8 rows restores the W-stream-bound
+/// regime. Per-thread element order matches gemv_fp8 (c = tid*8, stride
+/// 2048) and each accumulator sums in that same order, so results are
+/// bitwise identical to the single-input kernel — greedy speculative decode
+/// stays byte-identical to vanilla. x must have 4 rows of backing store
+/// (garbage rows beyond n are computed and discarded via predicated stores);
+/// W streams with .cs (evict-first). 32 accumulators (8 rows x 4 inputs)
+/// reduce through 32 shared arrays.
+/// b0=W, b1=x [4][cols], b2=y [n][rows], b3=lut. u0=rows, u1=cols, u2=n, f0=scale.
+pub const gemv_fp8n_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry gemv_fp8n(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<12>;
+    \\  .reg .b32 %r<40>;
+    \\  .reg .f32 %f<80>;
+    \\  .reg .b64 %rd<40>;
+    \\  .shared .align 4 .b8 lut_s[1024];
+    \\  .shared .align 4 .b8 red[32768];
+    \\  mov.u32 %r1,%ctaid.x;                  // row group (8 weight rows)
+    \\  ld.param.u32 %r2,[u0];                 // rows
+    \\  shl.b32 %r35,%r1,3;                    // r0 = group*8
+    \\  setp.ge.u32 %p1,%r35,%r2; @%p1 bra END;
+    \\  mov.u32 %r3,%tid.x;
+    \\  ld.param.u32 %r4,[u1];                 // cols
+    \\  ld.param.u32 %r20,[u2];                // n inputs (1..4)
+    \\  ld.param.f32 %f1,[f0];                 // scale
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2]; ld.param.u64 %rd4,[p3];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3; cvta.to.global.u64 %rd4,%rd4;
+    \\  // stage the fp8->f32 LUT: lut_s[tid] = lut[tid]
+    \\  shl.b32 %r5,%r3,2;
+    \\  mul.wide.u32 %rd5,%r3,4; add.s64 %rd6,%rd4,%rd5; ld.global.f32 %f2,[%rd6];
+    \\  mov.u32 %r6,lut_s; add.u32 %r7,%r6,%r5; st.shared.f32 [%r7],%f2;
+    \\  bar.sync 0;
+    \\  // x row base pointers rd20..rd23 = x + i*cols*4
+    \\  mul.wide.u32 %rd16,%r4,4;
+    \\  mov.u64 %rd20,%rd2;
+    \\  add.s64 %rd21,%rd20,%rd16;
+    \\  add.s64 %rd22,%rd21,%rd16;
+    \\  add.s64 %rd23,%rd22,%rd16;
+    \\  // W row base pointers rd24..rd31 = W + (r0+j)*cols
+    \\  mul.wide.u32 %rd7,%r35,%r4; add.s64 %rd24,%rd1,%rd7;
+    \\  cvt.u64.u32 %rd8,%r4;
+    \\  add.s64 %rd25,%rd24,%rd8;
+    \\  add.s64 %rd26,%rd25,%rd8;
+    \\  add.s64 %rd27,%rd26,%rd8;
+    \\  add.s64 %rd28,%rd27,%rd8;
+    \\  add.s64 %rd29,%rd28,%rd8;
+    \\  add.s64 %rd30,%rd29,%rd8;
+    \\  add.s64 %rd31,%rd30,%rd8;
+    \\  mov.f32 %f44,0f00000000;
+    \\  mov.f32 %f45,0f00000000;
+    \\  mov.f32 %f46,0f00000000;
+    \\  mov.f32 %f47,0f00000000;
+    \\  mov.f32 %f48,0f00000000;
+    \\  mov.f32 %f49,0f00000000;
+    \\  mov.f32 %f50,0f00000000;
+    \\  mov.f32 %f51,0f00000000;
+    \\  mov.f32 %f52,0f00000000;
+    \\  mov.f32 %f53,0f00000000;
+    \\  mov.f32 %f54,0f00000000;
+    \\  mov.f32 %f55,0f00000000;
+    \\  mov.f32 %f56,0f00000000;
+    \\  mov.f32 %f57,0f00000000;
+    \\  mov.f32 %f58,0f00000000;
+    \\  mov.f32 %f59,0f00000000;
+    \\  mov.f32 %f60,0f00000000;
+    \\  mov.f32 %f61,0f00000000;
+    \\  mov.f32 %f62,0f00000000;
+    \\  mov.f32 %f63,0f00000000;
+    \\  mov.f32 %f64,0f00000000;
+    \\  mov.f32 %f65,0f00000000;
+    \\  mov.f32 %f66,0f00000000;
+    \\  mov.f32 %f67,0f00000000;
+    \\  mov.f32 %f68,0f00000000;
+    \\  mov.f32 %f69,0f00000000;
+    \\  mov.f32 %f70,0f00000000;
+    \\  mov.f32 %f71,0f00000000;
+    \\  mov.f32 %f72,0f00000000;
+    \\  mov.f32 %f73,0f00000000;
+    \\  mov.f32 %f74,0f00000000;
+    \\  mov.f32 %f75,0f00000000;
+    \\  shl.b32 %r8,%r3,3;                     // c = tid*8 (same order as gemv_fp8: bitwise-stable)
+    \\LOOP:
+    \\  setp.ge.u32 %p2,%r8,%r4; @%p2 bra LD;
+    \\  // all 4 inputs' elems c..c+7 (32 registers), loaded once per row GROUP:
+    \\  // amortizing x L2 traffic over 8 weight rows is the whole point.
+    \\  mul.wide.u32 %rd11,%r8,4;
+    \\  add.s64 %rd12,%rd20,%rd11; ld.global.v4.f32 {%f2,%f3,%f4,%f5},[%rd12];    ld.global.v4.f32 {%f6,%f7,%f8,%f9},[%rd12+16];
+    \\  add.s64 %rd13,%rd21,%rd11; ld.global.v4.f32 {%f10,%f11,%f12,%f13},[%rd13]; ld.global.v4.f32 {%f14,%f15,%f16,%f17},[%rd13+16];
+    \\  add.s64 %rd14,%rd22,%rd11; ld.global.v4.f32 {%f18,%f19,%f20,%f21},[%rd14]; ld.global.v4.f32 {%f22,%f23,%f24,%f25},[%rd14+16];
+    \\  add.s64 %rd15,%rd23,%rd11; ld.global.v4.f32 {%f26,%f27,%f28,%f29},[%rd15]; ld.global.v4.f32 {%f30,%f31,%f32,%f33},[%rd15+16];
+    \\  cvt.u64.u32 %rd9,%r8;
+    \\  // row 0: decode 8 fp8 once, 32 FMAs interleaved across the 4 accumulators
+    \\  add.s64 %rd10,%rd24,%rd9; ld.global.cs.v2.u32 {%r9,%r18},[%rd10];
+    \\  and.b32 %r10,%r9,255;                shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f34,[%r12];
+    \\  shr.u32 %r10,%r9,8; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f35,[%r12];
+    \\  shr.u32 %r10,%r9,16; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f36,[%r12];
+    \\  shr.u32 %r10,%r9,24;                 shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f37,[%r12];
+    \\  and.b32 %r10,%r18,255;                shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f38,[%r12];
+    \\  shr.u32 %r10,%r18,8; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f39,[%r12];
+    \\  shr.u32 %r10,%r18,16; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f40,[%r12];
+    \\  shr.u32 %r10,%r18,24;                 shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f41,[%r12];
+    \\  fma.rn.f32 %f44,%f34,%f2,%f44; fma.rn.f32 %f45,%f34,%f10,%f45; fma.rn.f32 %f46,%f34,%f18,%f46; fma.rn.f32 %f47,%f34,%f26,%f47;
+    \\  fma.rn.f32 %f44,%f35,%f3,%f44; fma.rn.f32 %f45,%f35,%f11,%f45; fma.rn.f32 %f46,%f35,%f19,%f46; fma.rn.f32 %f47,%f35,%f27,%f47;
+    \\  fma.rn.f32 %f44,%f36,%f4,%f44; fma.rn.f32 %f45,%f36,%f12,%f45; fma.rn.f32 %f46,%f36,%f20,%f46; fma.rn.f32 %f47,%f36,%f28,%f47;
+    \\  fma.rn.f32 %f44,%f37,%f5,%f44; fma.rn.f32 %f45,%f37,%f13,%f45; fma.rn.f32 %f46,%f37,%f21,%f46; fma.rn.f32 %f47,%f37,%f29,%f47;
+    \\  fma.rn.f32 %f44,%f38,%f6,%f44; fma.rn.f32 %f45,%f38,%f14,%f45; fma.rn.f32 %f46,%f38,%f22,%f46; fma.rn.f32 %f47,%f38,%f30,%f47;
+    \\  fma.rn.f32 %f44,%f39,%f7,%f44; fma.rn.f32 %f45,%f39,%f15,%f45; fma.rn.f32 %f46,%f39,%f23,%f46; fma.rn.f32 %f47,%f39,%f31,%f47;
+    \\  fma.rn.f32 %f44,%f40,%f8,%f44; fma.rn.f32 %f45,%f40,%f16,%f45; fma.rn.f32 %f46,%f40,%f24,%f46; fma.rn.f32 %f47,%f40,%f32,%f47;
+    \\  fma.rn.f32 %f44,%f41,%f9,%f44; fma.rn.f32 %f45,%f41,%f17,%f45; fma.rn.f32 %f46,%f41,%f25,%f46; fma.rn.f32 %f47,%f41,%f33,%f47;
+    \\  // row 1: decode 8 fp8 once, 32 FMAs interleaved across the 4 accumulators
+    \\  add.s64 %rd10,%rd25,%rd9; ld.global.cs.v2.u32 {%r9,%r18},[%rd10];
+    \\  and.b32 %r10,%r9,255;                shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f34,[%r12];
+    \\  shr.u32 %r10,%r9,8; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f35,[%r12];
+    \\  shr.u32 %r10,%r9,16; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f36,[%r12];
+    \\  shr.u32 %r10,%r9,24;                 shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f37,[%r12];
+    \\  and.b32 %r10,%r18,255;                shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f38,[%r12];
+    \\  shr.u32 %r10,%r18,8; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f39,[%r12];
+    \\  shr.u32 %r10,%r18,16; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f40,[%r12];
+    \\  shr.u32 %r10,%r18,24;                 shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f41,[%r12];
+    \\  fma.rn.f32 %f48,%f34,%f2,%f48; fma.rn.f32 %f49,%f34,%f10,%f49; fma.rn.f32 %f50,%f34,%f18,%f50; fma.rn.f32 %f51,%f34,%f26,%f51;
+    \\  fma.rn.f32 %f48,%f35,%f3,%f48; fma.rn.f32 %f49,%f35,%f11,%f49; fma.rn.f32 %f50,%f35,%f19,%f50; fma.rn.f32 %f51,%f35,%f27,%f51;
+    \\  fma.rn.f32 %f48,%f36,%f4,%f48; fma.rn.f32 %f49,%f36,%f12,%f49; fma.rn.f32 %f50,%f36,%f20,%f50; fma.rn.f32 %f51,%f36,%f28,%f51;
+    \\  fma.rn.f32 %f48,%f37,%f5,%f48; fma.rn.f32 %f49,%f37,%f13,%f49; fma.rn.f32 %f50,%f37,%f21,%f50; fma.rn.f32 %f51,%f37,%f29,%f51;
+    \\  fma.rn.f32 %f48,%f38,%f6,%f48; fma.rn.f32 %f49,%f38,%f14,%f49; fma.rn.f32 %f50,%f38,%f22,%f50; fma.rn.f32 %f51,%f38,%f30,%f51;
+    \\  fma.rn.f32 %f48,%f39,%f7,%f48; fma.rn.f32 %f49,%f39,%f15,%f49; fma.rn.f32 %f50,%f39,%f23,%f50; fma.rn.f32 %f51,%f39,%f31,%f51;
+    \\  fma.rn.f32 %f48,%f40,%f8,%f48; fma.rn.f32 %f49,%f40,%f16,%f49; fma.rn.f32 %f50,%f40,%f24,%f50; fma.rn.f32 %f51,%f40,%f32,%f51;
+    \\  fma.rn.f32 %f48,%f41,%f9,%f48; fma.rn.f32 %f49,%f41,%f17,%f49; fma.rn.f32 %f50,%f41,%f25,%f50; fma.rn.f32 %f51,%f41,%f33,%f51;
+    \\  // row 2: decode 8 fp8 once, 32 FMAs interleaved across the 4 accumulators
+    \\  add.s64 %rd10,%rd26,%rd9; ld.global.cs.v2.u32 {%r9,%r18},[%rd10];
+    \\  and.b32 %r10,%r9,255;                shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f34,[%r12];
+    \\  shr.u32 %r10,%r9,8; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f35,[%r12];
+    \\  shr.u32 %r10,%r9,16; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f36,[%r12];
+    \\  shr.u32 %r10,%r9,24;                 shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f37,[%r12];
+    \\  and.b32 %r10,%r18,255;                shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f38,[%r12];
+    \\  shr.u32 %r10,%r18,8; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f39,[%r12];
+    \\  shr.u32 %r10,%r18,16; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f40,[%r12];
+    \\  shr.u32 %r10,%r18,24;                 shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f41,[%r12];
+    \\  fma.rn.f32 %f52,%f34,%f2,%f52; fma.rn.f32 %f53,%f34,%f10,%f53; fma.rn.f32 %f54,%f34,%f18,%f54; fma.rn.f32 %f55,%f34,%f26,%f55;
+    \\  fma.rn.f32 %f52,%f35,%f3,%f52; fma.rn.f32 %f53,%f35,%f11,%f53; fma.rn.f32 %f54,%f35,%f19,%f54; fma.rn.f32 %f55,%f35,%f27,%f55;
+    \\  fma.rn.f32 %f52,%f36,%f4,%f52; fma.rn.f32 %f53,%f36,%f12,%f53; fma.rn.f32 %f54,%f36,%f20,%f54; fma.rn.f32 %f55,%f36,%f28,%f55;
+    \\  fma.rn.f32 %f52,%f37,%f5,%f52; fma.rn.f32 %f53,%f37,%f13,%f53; fma.rn.f32 %f54,%f37,%f21,%f54; fma.rn.f32 %f55,%f37,%f29,%f55;
+    \\  fma.rn.f32 %f52,%f38,%f6,%f52; fma.rn.f32 %f53,%f38,%f14,%f53; fma.rn.f32 %f54,%f38,%f22,%f54; fma.rn.f32 %f55,%f38,%f30,%f55;
+    \\  fma.rn.f32 %f52,%f39,%f7,%f52; fma.rn.f32 %f53,%f39,%f15,%f53; fma.rn.f32 %f54,%f39,%f23,%f54; fma.rn.f32 %f55,%f39,%f31,%f55;
+    \\  fma.rn.f32 %f52,%f40,%f8,%f52; fma.rn.f32 %f53,%f40,%f16,%f53; fma.rn.f32 %f54,%f40,%f24,%f54; fma.rn.f32 %f55,%f40,%f32,%f55;
+    \\  fma.rn.f32 %f52,%f41,%f9,%f52; fma.rn.f32 %f53,%f41,%f17,%f53; fma.rn.f32 %f54,%f41,%f25,%f54; fma.rn.f32 %f55,%f41,%f33,%f55;
+    \\  // row 3: decode 8 fp8 once, 32 FMAs interleaved across the 4 accumulators
+    \\  add.s64 %rd10,%rd27,%rd9; ld.global.cs.v2.u32 {%r9,%r18},[%rd10];
+    \\  and.b32 %r10,%r9,255;                shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f34,[%r12];
+    \\  shr.u32 %r10,%r9,8; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f35,[%r12];
+    \\  shr.u32 %r10,%r9,16; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f36,[%r12];
+    \\  shr.u32 %r10,%r9,24;                 shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f37,[%r12];
+    \\  and.b32 %r10,%r18,255;                shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f38,[%r12];
+    \\  shr.u32 %r10,%r18,8; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f39,[%r12];
+    \\  shr.u32 %r10,%r18,16; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f40,[%r12];
+    \\  shr.u32 %r10,%r18,24;                 shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f41,[%r12];
+    \\  fma.rn.f32 %f56,%f34,%f2,%f56; fma.rn.f32 %f57,%f34,%f10,%f57; fma.rn.f32 %f58,%f34,%f18,%f58; fma.rn.f32 %f59,%f34,%f26,%f59;
+    \\  fma.rn.f32 %f56,%f35,%f3,%f56; fma.rn.f32 %f57,%f35,%f11,%f57; fma.rn.f32 %f58,%f35,%f19,%f58; fma.rn.f32 %f59,%f35,%f27,%f59;
+    \\  fma.rn.f32 %f56,%f36,%f4,%f56; fma.rn.f32 %f57,%f36,%f12,%f57; fma.rn.f32 %f58,%f36,%f20,%f58; fma.rn.f32 %f59,%f36,%f28,%f59;
+    \\  fma.rn.f32 %f56,%f37,%f5,%f56; fma.rn.f32 %f57,%f37,%f13,%f57; fma.rn.f32 %f58,%f37,%f21,%f58; fma.rn.f32 %f59,%f37,%f29,%f59;
+    \\  fma.rn.f32 %f56,%f38,%f6,%f56; fma.rn.f32 %f57,%f38,%f14,%f57; fma.rn.f32 %f58,%f38,%f22,%f58; fma.rn.f32 %f59,%f38,%f30,%f59;
+    \\  fma.rn.f32 %f56,%f39,%f7,%f56; fma.rn.f32 %f57,%f39,%f15,%f57; fma.rn.f32 %f58,%f39,%f23,%f58; fma.rn.f32 %f59,%f39,%f31,%f59;
+    \\  fma.rn.f32 %f56,%f40,%f8,%f56; fma.rn.f32 %f57,%f40,%f16,%f57; fma.rn.f32 %f58,%f40,%f24,%f58; fma.rn.f32 %f59,%f40,%f32,%f59;
+    \\  fma.rn.f32 %f56,%f41,%f9,%f56; fma.rn.f32 %f57,%f41,%f17,%f57; fma.rn.f32 %f58,%f41,%f25,%f58; fma.rn.f32 %f59,%f41,%f33,%f59;
+    \\  // row 4: decode 8 fp8 once, 32 FMAs interleaved across the 4 accumulators
+    \\  add.s64 %rd10,%rd28,%rd9; ld.global.cs.v2.u32 {%r9,%r18},[%rd10];
+    \\  and.b32 %r10,%r9,255;                shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f34,[%r12];
+    \\  shr.u32 %r10,%r9,8; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f35,[%r12];
+    \\  shr.u32 %r10,%r9,16; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f36,[%r12];
+    \\  shr.u32 %r10,%r9,24;                 shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f37,[%r12];
+    \\  and.b32 %r10,%r18,255;                shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f38,[%r12];
+    \\  shr.u32 %r10,%r18,8; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f39,[%r12];
+    \\  shr.u32 %r10,%r18,16; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f40,[%r12];
+    \\  shr.u32 %r10,%r18,24;                 shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f41,[%r12];
+    \\  fma.rn.f32 %f60,%f34,%f2,%f60; fma.rn.f32 %f61,%f34,%f10,%f61; fma.rn.f32 %f62,%f34,%f18,%f62; fma.rn.f32 %f63,%f34,%f26,%f63;
+    \\  fma.rn.f32 %f60,%f35,%f3,%f60; fma.rn.f32 %f61,%f35,%f11,%f61; fma.rn.f32 %f62,%f35,%f19,%f62; fma.rn.f32 %f63,%f35,%f27,%f63;
+    \\  fma.rn.f32 %f60,%f36,%f4,%f60; fma.rn.f32 %f61,%f36,%f12,%f61; fma.rn.f32 %f62,%f36,%f20,%f62; fma.rn.f32 %f63,%f36,%f28,%f63;
+    \\  fma.rn.f32 %f60,%f37,%f5,%f60; fma.rn.f32 %f61,%f37,%f13,%f61; fma.rn.f32 %f62,%f37,%f21,%f62; fma.rn.f32 %f63,%f37,%f29,%f63;
+    \\  fma.rn.f32 %f60,%f38,%f6,%f60; fma.rn.f32 %f61,%f38,%f14,%f61; fma.rn.f32 %f62,%f38,%f22,%f62; fma.rn.f32 %f63,%f38,%f30,%f63;
+    \\  fma.rn.f32 %f60,%f39,%f7,%f60; fma.rn.f32 %f61,%f39,%f15,%f61; fma.rn.f32 %f62,%f39,%f23,%f62; fma.rn.f32 %f63,%f39,%f31,%f63;
+    \\  fma.rn.f32 %f60,%f40,%f8,%f60; fma.rn.f32 %f61,%f40,%f16,%f61; fma.rn.f32 %f62,%f40,%f24,%f62; fma.rn.f32 %f63,%f40,%f32,%f63;
+    \\  fma.rn.f32 %f60,%f41,%f9,%f60; fma.rn.f32 %f61,%f41,%f17,%f61; fma.rn.f32 %f62,%f41,%f25,%f62; fma.rn.f32 %f63,%f41,%f33,%f63;
+    \\  // row 5: decode 8 fp8 once, 32 FMAs interleaved across the 4 accumulators
+    \\  add.s64 %rd10,%rd29,%rd9; ld.global.cs.v2.u32 {%r9,%r18},[%rd10];
+    \\  and.b32 %r10,%r9,255;                shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f34,[%r12];
+    \\  shr.u32 %r10,%r9,8; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f35,[%r12];
+    \\  shr.u32 %r10,%r9,16; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f36,[%r12];
+    \\  shr.u32 %r10,%r9,24;                 shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f37,[%r12];
+    \\  and.b32 %r10,%r18,255;                shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f38,[%r12];
+    \\  shr.u32 %r10,%r18,8; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f39,[%r12];
+    \\  shr.u32 %r10,%r18,16; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f40,[%r12];
+    \\  shr.u32 %r10,%r18,24;                 shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f41,[%r12];
+    \\  fma.rn.f32 %f64,%f34,%f2,%f64; fma.rn.f32 %f65,%f34,%f10,%f65; fma.rn.f32 %f66,%f34,%f18,%f66; fma.rn.f32 %f67,%f34,%f26,%f67;
+    \\  fma.rn.f32 %f64,%f35,%f3,%f64; fma.rn.f32 %f65,%f35,%f11,%f65; fma.rn.f32 %f66,%f35,%f19,%f66; fma.rn.f32 %f67,%f35,%f27,%f67;
+    \\  fma.rn.f32 %f64,%f36,%f4,%f64; fma.rn.f32 %f65,%f36,%f12,%f65; fma.rn.f32 %f66,%f36,%f20,%f66; fma.rn.f32 %f67,%f36,%f28,%f67;
+    \\  fma.rn.f32 %f64,%f37,%f5,%f64; fma.rn.f32 %f65,%f37,%f13,%f65; fma.rn.f32 %f66,%f37,%f21,%f66; fma.rn.f32 %f67,%f37,%f29,%f67;
+    \\  fma.rn.f32 %f64,%f38,%f6,%f64; fma.rn.f32 %f65,%f38,%f14,%f65; fma.rn.f32 %f66,%f38,%f22,%f66; fma.rn.f32 %f67,%f38,%f30,%f67;
+    \\  fma.rn.f32 %f64,%f39,%f7,%f64; fma.rn.f32 %f65,%f39,%f15,%f65; fma.rn.f32 %f66,%f39,%f23,%f66; fma.rn.f32 %f67,%f39,%f31,%f67;
+    \\  fma.rn.f32 %f64,%f40,%f8,%f64; fma.rn.f32 %f65,%f40,%f16,%f65; fma.rn.f32 %f66,%f40,%f24,%f66; fma.rn.f32 %f67,%f40,%f32,%f67;
+    \\  fma.rn.f32 %f64,%f41,%f9,%f64; fma.rn.f32 %f65,%f41,%f17,%f65; fma.rn.f32 %f66,%f41,%f25,%f66; fma.rn.f32 %f67,%f41,%f33,%f67;
+    \\  // row 6: decode 8 fp8 once, 32 FMAs interleaved across the 4 accumulators
+    \\  add.s64 %rd10,%rd30,%rd9; ld.global.cs.v2.u32 {%r9,%r18},[%rd10];
+    \\  and.b32 %r10,%r9,255;                shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f34,[%r12];
+    \\  shr.u32 %r10,%r9,8; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f35,[%r12];
+    \\  shr.u32 %r10,%r9,16; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f36,[%r12];
+    \\  shr.u32 %r10,%r9,24;                 shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f37,[%r12];
+    \\  and.b32 %r10,%r18,255;                shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f38,[%r12];
+    \\  shr.u32 %r10,%r18,8; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f39,[%r12];
+    \\  shr.u32 %r10,%r18,16; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f40,[%r12];
+    \\  shr.u32 %r10,%r18,24;                 shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f41,[%r12];
+    \\  fma.rn.f32 %f68,%f34,%f2,%f68; fma.rn.f32 %f69,%f34,%f10,%f69; fma.rn.f32 %f70,%f34,%f18,%f70; fma.rn.f32 %f71,%f34,%f26,%f71;
+    \\  fma.rn.f32 %f68,%f35,%f3,%f68; fma.rn.f32 %f69,%f35,%f11,%f69; fma.rn.f32 %f70,%f35,%f19,%f70; fma.rn.f32 %f71,%f35,%f27,%f71;
+    \\  fma.rn.f32 %f68,%f36,%f4,%f68; fma.rn.f32 %f69,%f36,%f12,%f69; fma.rn.f32 %f70,%f36,%f20,%f70; fma.rn.f32 %f71,%f36,%f28,%f71;
+    \\  fma.rn.f32 %f68,%f37,%f5,%f68; fma.rn.f32 %f69,%f37,%f13,%f69; fma.rn.f32 %f70,%f37,%f21,%f70; fma.rn.f32 %f71,%f37,%f29,%f71;
+    \\  fma.rn.f32 %f68,%f38,%f6,%f68; fma.rn.f32 %f69,%f38,%f14,%f69; fma.rn.f32 %f70,%f38,%f22,%f70; fma.rn.f32 %f71,%f38,%f30,%f71;
+    \\  fma.rn.f32 %f68,%f39,%f7,%f68; fma.rn.f32 %f69,%f39,%f15,%f69; fma.rn.f32 %f70,%f39,%f23,%f70; fma.rn.f32 %f71,%f39,%f31,%f71;
+    \\  fma.rn.f32 %f68,%f40,%f8,%f68; fma.rn.f32 %f69,%f40,%f16,%f69; fma.rn.f32 %f70,%f40,%f24,%f70; fma.rn.f32 %f71,%f40,%f32,%f71;
+    \\  fma.rn.f32 %f68,%f41,%f9,%f68; fma.rn.f32 %f69,%f41,%f17,%f69; fma.rn.f32 %f70,%f41,%f25,%f70; fma.rn.f32 %f71,%f41,%f33,%f71;
+    \\  // row 7: decode 8 fp8 once, 32 FMAs interleaved across the 4 accumulators
+    \\  add.s64 %rd10,%rd31,%rd9; ld.global.cs.v2.u32 {%r9,%r18},[%rd10];
+    \\  and.b32 %r10,%r9,255;                shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f34,[%r12];
+    \\  shr.u32 %r10,%r9,8; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f35,[%r12];
+    \\  shr.u32 %r10,%r9,16; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f36,[%r12];
+    \\  shr.u32 %r10,%r9,24;                 shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f37,[%r12];
+    \\  and.b32 %r10,%r18,255;                shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f38,[%r12];
+    \\  shr.u32 %r10,%r18,8; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f39,[%r12];
+    \\  shr.u32 %r10,%r18,16; and.b32 %r10,%r10,255; shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f40,[%r12];
+    \\  shr.u32 %r10,%r18,24;                 shl.b32 %r11,%r10,2; add.u32 %r12,%r6,%r11; ld.shared.f32 %f41,[%r12];
+    \\  fma.rn.f32 %f72,%f34,%f2,%f72; fma.rn.f32 %f73,%f34,%f10,%f73; fma.rn.f32 %f74,%f34,%f18,%f74; fma.rn.f32 %f75,%f34,%f26,%f75;
+    \\  fma.rn.f32 %f72,%f35,%f3,%f72; fma.rn.f32 %f73,%f35,%f11,%f73; fma.rn.f32 %f74,%f35,%f19,%f74; fma.rn.f32 %f75,%f35,%f27,%f75;
+    \\  fma.rn.f32 %f72,%f36,%f4,%f72; fma.rn.f32 %f73,%f36,%f12,%f73; fma.rn.f32 %f74,%f36,%f20,%f74; fma.rn.f32 %f75,%f36,%f28,%f75;
+    \\  fma.rn.f32 %f72,%f37,%f5,%f72; fma.rn.f32 %f73,%f37,%f13,%f73; fma.rn.f32 %f74,%f37,%f21,%f74; fma.rn.f32 %f75,%f37,%f29,%f75;
+    \\  fma.rn.f32 %f72,%f38,%f6,%f72; fma.rn.f32 %f73,%f38,%f14,%f73; fma.rn.f32 %f74,%f38,%f22,%f74; fma.rn.f32 %f75,%f38,%f30,%f75;
+    \\  fma.rn.f32 %f72,%f39,%f7,%f72; fma.rn.f32 %f73,%f39,%f15,%f73; fma.rn.f32 %f74,%f39,%f23,%f74; fma.rn.f32 %f75,%f39,%f31,%f75;
+    \\  fma.rn.f32 %f72,%f40,%f8,%f72; fma.rn.f32 %f73,%f40,%f16,%f73; fma.rn.f32 %f74,%f40,%f24,%f74; fma.rn.f32 %f75,%f40,%f32,%f75;
+    \\  fma.rn.f32 %f72,%f41,%f9,%f72; fma.rn.f32 %f73,%f41,%f17,%f73; fma.rn.f32 %f74,%f41,%f25,%f74; fma.rn.f32 %f75,%f41,%f33,%f75;
+    \\  add.u32 %r8,%r8,2048; bra LOOP;
+    \\LD:
+    \\  // red is 32 arrays of 256 f32: &red[a][tid] = red + a*1024 + tid*4, a = j*4 + i
+    \\  mov.u32 %r13,red; add.u32 %r14,%r13,%r5;
+    \\  st.shared.f32 [%r14+0],%f44;
+    \\  st.shared.f32 [%r14+1024],%f45;
+    \\  st.shared.f32 [%r14+2048],%f46;
+    \\  st.shared.f32 [%r14+3072],%f47;
+    \\  st.shared.f32 [%r14+4096],%f48;
+    \\  st.shared.f32 [%r14+5120],%f49;
+    \\  st.shared.f32 [%r14+6144],%f50;
+    \\  st.shared.f32 [%r14+7168],%f51;
+    \\  st.shared.f32 [%r14+8192],%f52;
+    \\  st.shared.f32 [%r14+9216],%f53;
+    \\  st.shared.f32 [%r14+10240],%f54;
+    \\  st.shared.f32 [%r14+11264],%f55;
+    \\  st.shared.f32 [%r14+12288],%f56;
+    \\  st.shared.f32 [%r14+13312],%f57;
+    \\  st.shared.f32 [%r14+14336],%f58;
+    \\  st.shared.f32 [%r14+15360],%f59;
+    \\  st.shared.f32 [%r14+16384],%f60;
+    \\  st.shared.f32 [%r14+17408],%f61;
+    \\  st.shared.f32 [%r14+18432],%f62;
+    \\  st.shared.f32 [%r14+19456],%f63;
+    \\  st.shared.f32 [%r14+20480],%f64;
+    \\  st.shared.f32 [%r14+21504],%f65;
+    \\  st.shared.f32 [%r14+22528],%f66;
+    \\  st.shared.f32 [%r14+23552],%f67;
+    \\  st.shared.f32 [%r14+24576],%f68;
+    \\  st.shared.f32 [%r14+25600],%f69;
+    \\  st.shared.f32 [%r14+26624],%f70;
+    \\  st.shared.f32 [%r14+27648],%f71;
+    \\  st.shared.f32 [%r14+28672],%f72;
+    \\  st.shared.f32 [%r14+29696],%f73;
+    \\  st.shared.f32 [%r14+30720],%f74;
+    \\  st.shared.f32 [%r14+31744],%f75;
+    \\  bar.sync 0;
+    \\  mov.u32 %r15,128;
+    \\RED:
+    \\  setp.eq.u32 %p3,%r15,0; @%p3 bra REDD;
+    \\  setp.ge.u32 %p4,%r3,%r15; @%p4 bra REDS;
+    \\  shl.b32 %r16,%r15,2; add.u32 %r17,%r14,%r16;
+    \\  ld.shared.f32 %f2,[%r14+0]; ld.shared.f32 %f3,[%r17+0]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+0],%f2;
+    \\  ld.shared.f32 %f2,[%r14+1024]; ld.shared.f32 %f3,[%r17+1024]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+1024],%f2;
+    \\  ld.shared.f32 %f2,[%r14+2048]; ld.shared.f32 %f3,[%r17+2048]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+2048],%f2;
+    \\  ld.shared.f32 %f2,[%r14+3072]; ld.shared.f32 %f3,[%r17+3072]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+3072],%f2;
+    \\  ld.shared.f32 %f2,[%r14+4096]; ld.shared.f32 %f3,[%r17+4096]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+4096],%f2;
+    \\  ld.shared.f32 %f2,[%r14+5120]; ld.shared.f32 %f3,[%r17+5120]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+5120],%f2;
+    \\  ld.shared.f32 %f2,[%r14+6144]; ld.shared.f32 %f3,[%r17+6144]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+6144],%f2;
+    \\  ld.shared.f32 %f2,[%r14+7168]; ld.shared.f32 %f3,[%r17+7168]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+7168],%f2;
+    \\  ld.shared.f32 %f2,[%r14+8192]; ld.shared.f32 %f3,[%r17+8192]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+8192],%f2;
+    \\  ld.shared.f32 %f2,[%r14+9216]; ld.shared.f32 %f3,[%r17+9216]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+9216],%f2;
+    \\  ld.shared.f32 %f2,[%r14+10240]; ld.shared.f32 %f3,[%r17+10240]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+10240],%f2;
+    \\  ld.shared.f32 %f2,[%r14+11264]; ld.shared.f32 %f3,[%r17+11264]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+11264],%f2;
+    \\  ld.shared.f32 %f2,[%r14+12288]; ld.shared.f32 %f3,[%r17+12288]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+12288],%f2;
+    \\  ld.shared.f32 %f2,[%r14+13312]; ld.shared.f32 %f3,[%r17+13312]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+13312],%f2;
+    \\  ld.shared.f32 %f2,[%r14+14336]; ld.shared.f32 %f3,[%r17+14336]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+14336],%f2;
+    \\  ld.shared.f32 %f2,[%r14+15360]; ld.shared.f32 %f3,[%r17+15360]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+15360],%f2;
+    \\  ld.shared.f32 %f2,[%r14+16384]; ld.shared.f32 %f3,[%r17+16384]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+16384],%f2;
+    \\  ld.shared.f32 %f2,[%r14+17408]; ld.shared.f32 %f3,[%r17+17408]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+17408],%f2;
+    \\  ld.shared.f32 %f2,[%r14+18432]; ld.shared.f32 %f3,[%r17+18432]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+18432],%f2;
+    \\  ld.shared.f32 %f2,[%r14+19456]; ld.shared.f32 %f3,[%r17+19456]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+19456],%f2;
+    \\  ld.shared.f32 %f2,[%r14+20480]; ld.shared.f32 %f3,[%r17+20480]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+20480],%f2;
+    \\  ld.shared.f32 %f2,[%r14+21504]; ld.shared.f32 %f3,[%r17+21504]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+21504],%f2;
+    \\  ld.shared.f32 %f2,[%r14+22528]; ld.shared.f32 %f3,[%r17+22528]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+22528],%f2;
+    \\  ld.shared.f32 %f2,[%r14+23552]; ld.shared.f32 %f3,[%r17+23552]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+23552],%f2;
+    \\  ld.shared.f32 %f2,[%r14+24576]; ld.shared.f32 %f3,[%r17+24576]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+24576],%f2;
+    \\  ld.shared.f32 %f2,[%r14+25600]; ld.shared.f32 %f3,[%r17+25600]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+25600],%f2;
+    \\  ld.shared.f32 %f2,[%r14+26624]; ld.shared.f32 %f3,[%r17+26624]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+26624],%f2;
+    \\  ld.shared.f32 %f2,[%r14+27648]; ld.shared.f32 %f3,[%r17+27648]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+27648],%f2;
+    \\  ld.shared.f32 %f2,[%r14+28672]; ld.shared.f32 %f3,[%r17+28672]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+28672],%f2;
+    \\  ld.shared.f32 %f2,[%r14+29696]; ld.shared.f32 %f3,[%r17+29696]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+29696],%f2;
+    \\  ld.shared.f32 %f2,[%r14+30720]; ld.shared.f32 %f3,[%r17+30720]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+30720],%f2;
+    \\  ld.shared.f32 %f2,[%r14+31744]; ld.shared.f32 %f3,[%r17+31744]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+31744],%f2;
+    \\REDS:
+    \\  bar.sync 0; shr.u32 %r15,%r15,1; bra RED;
+    \\REDD:
+    \\  setp.ne.u32 %p5,%r3,0; @%p5 bra END;
+    \\  // y[i*rows + r0 + j] = scale * red[j*4+i][0], stores predicated on i < n
+    \\  mul.wide.u32 %rd13,%r35,4; add.s64 %rd14,%rd3,%rd13;
+    \\  mul.wide.u32 %rd15,%r2,4;
+    \\  setp.lt.u32 %p6,1,%r20; setp.lt.u32 %p7,2,%r20; setp.lt.u32 %p8,3,%r20;
+    \\  ld.shared.f32 %f2,[%r13+0]; mul.f32 %f2,%f2,%f1; st.global.f32 [%rd14+0],%f2;
+    \\  ld.shared.f32 %f2,[%r13+4096]; mul.f32 %f2,%f2,%f1; st.global.f32 [%rd14+4],%f2;
+    \\  ld.shared.f32 %f2,[%r13+8192]; mul.f32 %f2,%f2,%f1; st.global.f32 [%rd14+8],%f2;
+    \\  ld.shared.f32 %f2,[%r13+12288]; mul.f32 %f2,%f2,%f1; st.global.f32 [%rd14+12],%f2;
+    \\  ld.shared.f32 %f2,[%r13+16384]; mul.f32 %f2,%f2,%f1; st.global.f32 [%rd14+16],%f2;
+    \\  ld.shared.f32 %f2,[%r13+20480]; mul.f32 %f2,%f2,%f1; st.global.f32 [%rd14+20],%f2;
+    \\  ld.shared.f32 %f2,[%r13+24576]; mul.f32 %f2,%f2,%f1; st.global.f32 [%rd14+24],%f2;
+    \\  ld.shared.f32 %f2,[%r13+28672]; mul.f32 %f2,%f2,%f1; st.global.f32 [%rd14+28],%f2;
+    \\  add.s64 %rd14,%rd14,%rd15;
+    \\  ld.shared.f32 %f2,[%r13+1024]; mul.f32 %f2,%f2,%f1; @%p6 st.global.f32 [%rd14+0],%f2;
+    \\  ld.shared.f32 %f2,[%r13+5120]; mul.f32 %f2,%f2,%f1; @%p6 st.global.f32 [%rd14+4],%f2;
+    \\  ld.shared.f32 %f2,[%r13+9216]; mul.f32 %f2,%f2,%f1; @%p6 st.global.f32 [%rd14+8],%f2;
+    \\  ld.shared.f32 %f2,[%r13+13312]; mul.f32 %f2,%f2,%f1; @%p6 st.global.f32 [%rd14+12],%f2;
+    \\  ld.shared.f32 %f2,[%r13+17408]; mul.f32 %f2,%f2,%f1; @%p6 st.global.f32 [%rd14+16],%f2;
+    \\  ld.shared.f32 %f2,[%r13+21504]; mul.f32 %f2,%f2,%f1; @%p6 st.global.f32 [%rd14+20],%f2;
+    \\  ld.shared.f32 %f2,[%r13+25600]; mul.f32 %f2,%f2,%f1; @%p6 st.global.f32 [%rd14+24],%f2;
+    \\  ld.shared.f32 %f2,[%r13+29696]; mul.f32 %f2,%f2,%f1; @%p6 st.global.f32 [%rd14+28],%f2;
+    \\  add.s64 %rd14,%rd14,%rd15;
+    \\  ld.shared.f32 %f2,[%r13+2048]; mul.f32 %f2,%f2,%f1; @%p7 st.global.f32 [%rd14+0],%f2;
+    \\  ld.shared.f32 %f2,[%r13+6144]; mul.f32 %f2,%f2,%f1; @%p7 st.global.f32 [%rd14+4],%f2;
+    \\  ld.shared.f32 %f2,[%r13+10240]; mul.f32 %f2,%f2,%f1; @%p7 st.global.f32 [%rd14+8],%f2;
+    \\  ld.shared.f32 %f2,[%r13+14336]; mul.f32 %f2,%f2,%f1; @%p7 st.global.f32 [%rd14+12],%f2;
+    \\  ld.shared.f32 %f2,[%r13+18432]; mul.f32 %f2,%f2,%f1; @%p7 st.global.f32 [%rd14+16],%f2;
+    \\  ld.shared.f32 %f2,[%r13+22528]; mul.f32 %f2,%f2,%f1; @%p7 st.global.f32 [%rd14+20],%f2;
+    \\  ld.shared.f32 %f2,[%r13+26624]; mul.f32 %f2,%f2,%f1; @%p7 st.global.f32 [%rd14+24],%f2;
+    \\  ld.shared.f32 %f2,[%r13+30720]; mul.f32 %f2,%f2,%f1; @%p7 st.global.f32 [%rd14+28],%f2;
+    \\  add.s64 %rd14,%rd14,%rd15;
+    \\  ld.shared.f32 %f2,[%r13+3072]; mul.f32 %f2,%f2,%f1; @%p8 st.global.f32 [%rd14+0],%f2;
+    \\  ld.shared.f32 %f2,[%r13+7168]; mul.f32 %f2,%f2,%f1; @%p8 st.global.f32 [%rd14+4],%f2;
+    \\  ld.shared.f32 %f2,[%r13+11264]; mul.f32 %f2,%f2,%f1; @%p8 st.global.f32 [%rd14+8],%f2;
+    \\  ld.shared.f32 %f2,[%r13+15360]; mul.f32 %f2,%f2,%f1; @%p8 st.global.f32 [%rd14+12],%f2;
+    \\  ld.shared.f32 %f2,[%r13+19456]; mul.f32 %f2,%f2,%f1; @%p8 st.global.f32 [%rd14+16],%f2;
+    \\  ld.shared.f32 %f2,[%r13+23552]; mul.f32 %f2,%f2,%f1; @%p8 st.global.f32 [%rd14+20],%f2;
+    \\  ld.shared.f32 %f2,[%r13+27648]; mul.f32 %f2,%f2,%f1; @%p8 st.global.f32 [%rd14+24],%f2;
+    \\  ld.shared.f32 %f2,[%r13+31744]; mul.f32 %f2,%f2,%f1; @%p8 st.global.f32 [%rd14+28],%f2;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// Multi-input bf16 GEMV (speculative-decode LM head): y[i][row] =
+/// scale * dot(W[row], x_i) for n <= 4 input vectors. One block per EIGHT
+/// weight rows (rows % 8 == 0) so the four x rows are re-read from L2 once
+/// per 8 rows instead of once per row (at vocab-size rows that is GBs of L2
+/// traffic otherwise). Per-thread element order matches gemv_bf16 (c =
+/// tid*2, stride 512) and each accumulator sums in that order, so results
+/// are bitwise identical to the single-input kernel. x must have 4 rows of
+/// backing store; W streams with .cs. 32 accumulators (8 rows x 4 inputs)
+/// reduce through 32 shared arrays.
+/// b0=W, b1=x [4][cols], b2=y [n][rows]. u0=rows, u1=cols, u2=n, f0=scale.
+pub const gemv_bf16n_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry gemv_bf16n(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<12>;
+    \\  .reg .b32 %r<40>;
+    \\  .reg .f32 %f<80>;
+    \\  .reg .b64 %rd<40>;
+    \\  .shared .align 4 .b8 red[32768];
+    \\  mov.u32 %r1,%ctaid.x;                  // row group (8 weight rows)
+    \\  ld.param.u32 %r2,[u0];                 // rows
+    \\  shl.b32 %r35,%r1,3;                    // r0 = group*8
+    \\  setp.ge.u32 %p1,%r35,%r2; @%p1 bra END;
+    \\  mov.u32 %r3,%tid.x;
+    \\  ld.param.u32 %r4,[u1];                 // cols
+    \\  ld.param.u32 %r20,[u2];                // n inputs (1..4)
+    \\  ld.param.f32 %f1,[f0];                 // scale
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
+    \\  shl.b32 %r5,%r3,2;
+    \\  // x row base pointers rd20..rd23 = x + i*cols*4
+    \\  mul.wide.u32 %rd16,%r4,4;
+    \\  mov.u64 %rd20,%rd2;
+    \\  add.s64 %rd21,%rd20,%rd16;
+    \\  add.s64 %rd22,%rd21,%rd16;
+    \\  add.s64 %rd23,%rd22,%rd16;
+    \\  // W row base pointers rd24..rd31 = W + (r0+j)*cols*2
+    \\  mul.wide.u32 %rd7,%r35,%r4; shl.b64 %rd7,%rd7,1; add.s64 %rd24,%rd1,%rd7;
+    \\  cvt.u64.u32 %rd8,%r4; shl.b64 %rd8,%rd8,1;
+    \\  add.s64 %rd25,%rd24,%rd8;
+    \\  add.s64 %rd26,%rd25,%rd8;
+    \\  add.s64 %rd27,%rd26,%rd8;
+    \\  add.s64 %rd28,%rd27,%rd8;
+    \\  add.s64 %rd29,%rd28,%rd8;
+    \\  add.s64 %rd30,%rd29,%rd8;
+    \\  add.s64 %rd31,%rd30,%rd8;
+    \\  mov.f32 %f44,0f00000000;
+    \\  mov.f32 %f45,0f00000000;
+    \\  mov.f32 %f46,0f00000000;
+    \\  mov.f32 %f47,0f00000000;
+    \\  mov.f32 %f48,0f00000000;
+    \\  mov.f32 %f49,0f00000000;
+    \\  mov.f32 %f50,0f00000000;
+    \\  mov.f32 %f51,0f00000000;
+    \\  mov.f32 %f52,0f00000000;
+    \\  mov.f32 %f53,0f00000000;
+    \\  mov.f32 %f54,0f00000000;
+    \\  mov.f32 %f55,0f00000000;
+    \\  mov.f32 %f56,0f00000000;
+    \\  mov.f32 %f57,0f00000000;
+    \\  mov.f32 %f58,0f00000000;
+    \\  mov.f32 %f59,0f00000000;
+    \\  mov.f32 %f60,0f00000000;
+    \\  mov.f32 %f61,0f00000000;
+    \\  mov.f32 %f62,0f00000000;
+    \\  mov.f32 %f63,0f00000000;
+    \\  mov.f32 %f64,0f00000000;
+    \\  mov.f32 %f65,0f00000000;
+    \\  mov.f32 %f66,0f00000000;
+    \\  mov.f32 %f67,0f00000000;
+    \\  mov.f32 %f68,0f00000000;
+    \\  mov.f32 %f69,0f00000000;
+    \\  mov.f32 %f70,0f00000000;
+    \\  mov.f32 %f71,0f00000000;
+    \\  mov.f32 %f72,0f00000000;
+    \\  mov.f32 %f73,0f00000000;
+    \\  mov.f32 %f74,0f00000000;
+    \\  mov.f32 %f75,0f00000000;
+    \\  shl.b32 %r8,%r3,1;                     // c = tid*2 (same order as gemv_bf16: bitwise-stable)
+    \\LOOP:
+    \\  setp.ge.u32 %p2,%r8,%r4; @%p2 bra LD;
+    \\  // all 4 inputs' elems c,c+1 loaded once per 8-row group (x L2 amortization)
+    \\  mul.wide.u32 %rd11,%r8,4;
+    \\  add.s64 %rd12,%rd20,%rd11; ld.global.v2.f32 {%f2,%f3},[%rd12];
+    \\  add.s64 %rd13,%rd21,%rd11; ld.global.v2.f32 {%f4,%f5},[%rd13];
+    \\  add.s64 %rd14,%rd22,%rd11; ld.global.v2.f32 {%f6,%f7},[%rd14];
+    \\  add.s64 %rd15,%rd23,%rd11; ld.global.v2.f32 {%f8,%f9},[%rd15];
+    \\  mul.wide.u32 %rd9,%r8,2;
+    \\  add.s64 %rd10,%rd24,%rd9; ld.global.cs.u32 %r9,[%rd10]; // row 0: 2 bf16
+    \\  shl.b32 %r10,%r9,16; mov.b32 %f10,%r10; and.b32 %r10,%r9,0xffff0000; mov.b32 %f11,%r10;
+    \\  fma.rn.f32 %f44,%f10,%f2,%f44; fma.rn.f32 %f45,%f10,%f4,%f45; fma.rn.f32 %f46,%f10,%f6,%f46; fma.rn.f32 %f47,%f10,%f8,%f47;
+    \\  fma.rn.f32 %f44,%f11,%f3,%f44; fma.rn.f32 %f45,%f11,%f5,%f45; fma.rn.f32 %f46,%f11,%f7,%f46; fma.rn.f32 %f47,%f11,%f9,%f47;
+    \\  add.s64 %rd10,%rd25,%rd9; ld.global.cs.u32 %r9,[%rd10]; // row 1: 2 bf16
+    \\  shl.b32 %r10,%r9,16; mov.b32 %f10,%r10; and.b32 %r10,%r9,0xffff0000; mov.b32 %f11,%r10;
+    \\  fma.rn.f32 %f48,%f10,%f2,%f48; fma.rn.f32 %f49,%f10,%f4,%f49; fma.rn.f32 %f50,%f10,%f6,%f50; fma.rn.f32 %f51,%f10,%f8,%f51;
+    \\  fma.rn.f32 %f48,%f11,%f3,%f48; fma.rn.f32 %f49,%f11,%f5,%f49; fma.rn.f32 %f50,%f11,%f7,%f50; fma.rn.f32 %f51,%f11,%f9,%f51;
+    \\  add.s64 %rd10,%rd26,%rd9; ld.global.cs.u32 %r9,[%rd10]; // row 2: 2 bf16
+    \\  shl.b32 %r10,%r9,16; mov.b32 %f10,%r10; and.b32 %r10,%r9,0xffff0000; mov.b32 %f11,%r10;
+    \\  fma.rn.f32 %f52,%f10,%f2,%f52; fma.rn.f32 %f53,%f10,%f4,%f53; fma.rn.f32 %f54,%f10,%f6,%f54; fma.rn.f32 %f55,%f10,%f8,%f55;
+    \\  fma.rn.f32 %f52,%f11,%f3,%f52; fma.rn.f32 %f53,%f11,%f5,%f53; fma.rn.f32 %f54,%f11,%f7,%f54; fma.rn.f32 %f55,%f11,%f9,%f55;
+    \\  add.s64 %rd10,%rd27,%rd9; ld.global.cs.u32 %r9,[%rd10]; // row 3: 2 bf16
+    \\  shl.b32 %r10,%r9,16; mov.b32 %f10,%r10; and.b32 %r10,%r9,0xffff0000; mov.b32 %f11,%r10;
+    \\  fma.rn.f32 %f56,%f10,%f2,%f56; fma.rn.f32 %f57,%f10,%f4,%f57; fma.rn.f32 %f58,%f10,%f6,%f58; fma.rn.f32 %f59,%f10,%f8,%f59;
+    \\  fma.rn.f32 %f56,%f11,%f3,%f56; fma.rn.f32 %f57,%f11,%f5,%f57; fma.rn.f32 %f58,%f11,%f7,%f58; fma.rn.f32 %f59,%f11,%f9,%f59;
+    \\  add.s64 %rd10,%rd28,%rd9; ld.global.cs.u32 %r9,[%rd10]; // row 4: 2 bf16
+    \\  shl.b32 %r10,%r9,16; mov.b32 %f10,%r10; and.b32 %r10,%r9,0xffff0000; mov.b32 %f11,%r10;
+    \\  fma.rn.f32 %f60,%f10,%f2,%f60; fma.rn.f32 %f61,%f10,%f4,%f61; fma.rn.f32 %f62,%f10,%f6,%f62; fma.rn.f32 %f63,%f10,%f8,%f63;
+    \\  fma.rn.f32 %f60,%f11,%f3,%f60; fma.rn.f32 %f61,%f11,%f5,%f61; fma.rn.f32 %f62,%f11,%f7,%f62; fma.rn.f32 %f63,%f11,%f9,%f63;
+    \\  add.s64 %rd10,%rd29,%rd9; ld.global.cs.u32 %r9,[%rd10]; // row 5: 2 bf16
+    \\  shl.b32 %r10,%r9,16; mov.b32 %f10,%r10; and.b32 %r10,%r9,0xffff0000; mov.b32 %f11,%r10;
+    \\  fma.rn.f32 %f64,%f10,%f2,%f64; fma.rn.f32 %f65,%f10,%f4,%f65; fma.rn.f32 %f66,%f10,%f6,%f66; fma.rn.f32 %f67,%f10,%f8,%f67;
+    \\  fma.rn.f32 %f64,%f11,%f3,%f64; fma.rn.f32 %f65,%f11,%f5,%f65; fma.rn.f32 %f66,%f11,%f7,%f66; fma.rn.f32 %f67,%f11,%f9,%f67;
+    \\  add.s64 %rd10,%rd30,%rd9; ld.global.cs.u32 %r9,[%rd10]; // row 6: 2 bf16
+    \\  shl.b32 %r10,%r9,16; mov.b32 %f10,%r10; and.b32 %r10,%r9,0xffff0000; mov.b32 %f11,%r10;
+    \\  fma.rn.f32 %f68,%f10,%f2,%f68; fma.rn.f32 %f69,%f10,%f4,%f69; fma.rn.f32 %f70,%f10,%f6,%f70; fma.rn.f32 %f71,%f10,%f8,%f71;
+    \\  fma.rn.f32 %f68,%f11,%f3,%f68; fma.rn.f32 %f69,%f11,%f5,%f69; fma.rn.f32 %f70,%f11,%f7,%f70; fma.rn.f32 %f71,%f11,%f9,%f71;
+    \\  add.s64 %rd10,%rd31,%rd9; ld.global.cs.u32 %r9,[%rd10]; // row 7: 2 bf16
+    \\  shl.b32 %r10,%r9,16; mov.b32 %f10,%r10; and.b32 %r10,%r9,0xffff0000; mov.b32 %f11,%r10;
+    \\  fma.rn.f32 %f72,%f10,%f2,%f72; fma.rn.f32 %f73,%f10,%f4,%f73; fma.rn.f32 %f74,%f10,%f6,%f74; fma.rn.f32 %f75,%f10,%f8,%f75;
+    \\  fma.rn.f32 %f72,%f11,%f3,%f72; fma.rn.f32 %f73,%f11,%f5,%f73; fma.rn.f32 %f74,%f11,%f7,%f74; fma.rn.f32 %f75,%f11,%f9,%f75;
+    \\  add.u32 %r8,%r8,512; bra LOOP;
+    \\LD:
+    \\  // red is 32 arrays of 256 f32: &red[a][tid] = red + a*1024 + tid*4, a = j*4 + i
+    \\  mov.u32 %r13,red; add.u32 %r14,%r13,%r5;
+    \\  st.shared.f32 [%r14+0],%f44;
+    \\  st.shared.f32 [%r14+1024],%f45;
+    \\  st.shared.f32 [%r14+2048],%f46;
+    \\  st.shared.f32 [%r14+3072],%f47;
+    \\  st.shared.f32 [%r14+4096],%f48;
+    \\  st.shared.f32 [%r14+5120],%f49;
+    \\  st.shared.f32 [%r14+6144],%f50;
+    \\  st.shared.f32 [%r14+7168],%f51;
+    \\  st.shared.f32 [%r14+8192],%f52;
+    \\  st.shared.f32 [%r14+9216],%f53;
+    \\  st.shared.f32 [%r14+10240],%f54;
+    \\  st.shared.f32 [%r14+11264],%f55;
+    \\  st.shared.f32 [%r14+12288],%f56;
+    \\  st.shared.f32 [%r14+13312],%f57;
+    \\  st.shared.f32 [%r14+14336],%f58;
+    \\  st.shared.f32 [%r14+15360],%f59;
+    \\  st.shared.f32 [%r14+16384],%f60;
+    \\  st.shared.f32 [%r14+17408],%f61;
+    \\  st.shared.f32 [%r14+18432],%f62;
+    \\  st.shared.f32 [%r14+19456],%f63;
+    \\  st.shared.f32 [%r14+20480],%f64;
+    \\  st.shared.f32 [%r14+21504],%f65;
+    \\  st.shared.f32 [%r14+22528],%f66;
+    \\  st.shared.f32 [%r14+23552],%f67;
+    \\  st.shared.f32 [%r14+24576],%f68;
+    \\  st.shared.f32 [%r14+25600],%f69;
+    \\  st.shared.f32 [%r14+26624],%f70;
+    \\  st.shared.f32 [%r14+27648],%f71;
+    \\  st.shared.f32 [%r14+28672],%f72;
+    \\  st.shared.f32 [%r14+29696],%f73;
+    \\  st.shared.f32 [%r14+30720],%f74;
+    \\  st.shared.f32 [%r14+31744],%f75;
+    \\  bar.sync 0;
+    \\  mov.u32 %r15,128;
+    \\RED:
+    \\  setp.eq.u32 %p3,%r15,0; @%p3 bra REDD;
+    \\  setp.ge.u32 %p4,%r3,%r15; @%p4 bra REDS;
+    \\  shl.b32 %r16,%r15,2; add.u32 %r17,%r14,%r16;
+    \\  ld.shared.f32 %f2,[%r14+0]; ld.shared.f32 %f3,[%r17+0]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+0],%f2;
+    \\  ld.shared.f32 %f2,[%r14+1024]; ld.shared.f32 %f3,[%r17+1024]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+1024],%f2;
+    \\  ld.shared.f32 %f2,[%r14+2048]; ld.shared.f32 %f3,[%r17+2048]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+2048],%f2;
+    \\  ld.shared.f32 %f2,[%r14+3072]; ld.shared.f32 %f3,[%r17+3072]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+3072],%f2;
+    \\  ld.shared.f32 %f2,[%r14+4096]; ld.shared.f32 %f3,[%r17+4096]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+4096],%f2;
+    \\  ld.shared.f32 %f2,[%r14+5120]; ld.shared.f32 %f3,[%r17+5120]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+5120],%f2;
+    \\  ld.shared.f32 %f2,[%r14+6144]; ld.shared.f32 %f3,[%r17+6144]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+6144],%f2;
+    \\  ld.shared.f32 %f2,[%r14+7168]; ld.shared.f32 %f3,[%r17+7168]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+7168],%f2;
+    \\  ld.shared.f32 %f2,[%r14+8192]; ld.shared.f32 %f3,[%r17+8192]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+8192],%f2;
+    \\  ld.shared.f32 %f2,[%r14+9216]; ld.shared.f32 %f3,[%r17+9216]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+9216],%f2;
+    \\  ld.shared.f32 %f2,[%r14+10240]; ld.shared.f32 %f3,[%r17+10240]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+10240],%f2;
+    \\  ld.shared.f32 %f2,[%r14+11264]; ld.shared.f32 %f3,[%r17+11264]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+11264],%f2;
+    \\  ld.shared.f32 %f2,[%r14+12288]; ld.shared.f32 %f3,[%r17+12288]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+12288],%f2;
+    \\  ld.shared.f32 %f2,[%r14+13312]; ld.shared.f32 %f3,[%r17+13312]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+13312],%f2;
+    \\  ld.shared.f32 %f2,[%r14+14336]; ld.shared.f32 %f3,[%r17+14336]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+14336],%f2;
+    \\  ld.shared.f32 %f2,[%r14+15360]; ld.shared.f32 %f3,[%r17+15360]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+15360],%f2;
+    \\  ld.shared.f32 %f2,[%r14+16384]; ld.shared.f32 %f3,[%r17+16384]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+16384],%f2;
+    \\  ld.shared.f32 %f2,[%r14+17408]; ld.shared.f32 %f3,[%r17+17408]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+17408],%f2;
+    \\  ld.shared.f32 %f2,[%r14+18432]; ld.shared.f32 %f3,[%r17+18432]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+18432],%f2;
+    \\  ld.shared.f32 %f2,[%r14+19456]; ld.shared.f32 %f3,[%r17+19456]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+19456],%f2;
+    \\  ld.shared.f32 %f2,[%r14+20480]; ld.shared.f32 %f3,[%r17+20480]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+20480],%f2;
+    \\  ld.shared.f32 %f2,[%r14+21504]; ld.shared.f32 %f3,[%r17+21504]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+21504],%f2;
+    \\  ld.shared.f32 %f2,[%r14+22528]; ld.shared.f32 %f3,[%r17+22528]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+22528],%f2;
+    \\  ld.shared.f32 %f2,[%r14+23552]; ld.shared.f32 %f3,[%r17+23552]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+23552],%f2;
+    \\  ld.shared.f32 %f2,[%r14+24576]; ld.shared.f32 %f3,[%r17+24576]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+24576],%f2;
+    \\  ld.shared.f32 %f2,[%r14+25600]; ld.shared.f32 %f3,[%r17+25600]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+25600],%f2;
+    \\  ld.shared.f32 %f2,[%r14+26624]; ld.shared.f32 %f3,[%r17+26624]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+26624],%f2;
+    \\  ld.shared.f32 %f2,[%r14+27648]; ld.shared.f32 %f3,[%r17+27648]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+27648],%f2;
+    \\  ld.shared.f32 %f2,[%r14+28672]; ld.shared.f32 %f3,[%r17+28672]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+28672],%f2;
+    \\  ld.shared.f32 %f2,[%r14+29696]; ld.shared.f32 %f3,[%r17+29696]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+29696],%f2;
+    \\  ld.shared.f32 %f2,[%r14+30720]; ld.shared.f32 %f3,[%r17+30720]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+30720],%f2;
+    \\  ld.shared.f32 %f2,[%r14+31744]; ld.shared.f32 %f3,[%r17+31744]; add.f32 %f2,%f2,%f3; st.shared.f32 [%r14+31744],%f2;
+    \\REDS:
+    \\  bar.sync 0; shr.u32 %r15,%r15,1; bra RED;
+    \\REDD:
+    \\  setp.ne.u32 %p5,%r3,0; @%p5 bra END;
+    \\  // y[i*rows + r0 + j] = scale * red[j*4+i][0], stores predicated on i < n
+    \\  mul.wide.u32 %rd13,%r35,4; add.s64 %rd14,%rd3,%rd13;
+    \\  mul.wide.u32 %rd15,%r2,4;
+    \\  setp.lt.u32 %p6,1,%r20; setp.lt.u32 %p7,2,%r20; setp.lt.u32 %p8,3,%r20;
+    \\  ld.shared.f32 %f2,[%r13+0]; mul.f32 %f2,%f2,%f1; st.global.f32 [%rd14+0],%f2;
+    \\  ld.shared.f32 %f2,[%r13+4096]; mul.f32 %f2,%f2,%f1; st.global.f32 [%rd14+4],%f2;
+    \\  ld.shared.f32 %f2,[%r13+8192]; mul.f32 %f2,%f2,%f1; st.global.f32 [%rd14+8],%f2;
+    \\  ld.shared.f32 %f2,[%r13+12288]; mul.f32 %f2,%f2,%f1; st.global.f32 [%rd14+12],%f2;
+    \\  ld.shared.f32 %f2,[%r13+16384]; mul.f32 %f2,%f2,%f1; st.global.f32 [%rd14+16],%f2;
+    \\  ld.shared.f32 %f2,[%r13+20480]; mul.f32 %f2,%f2,%f1; st.global.f32 [%rd14+20],%f2;
+    \\  ld.shared.f32 %f2,[%r13+24576]; mul.f32 %f2,%f2,%f1; st.global.f32 [%rd14+24],%f2;
+    \\  ld.shared.f32 %f2,[%r13+28672]; mul.f32 %f2,%f2,%f1; st.global.f32 [%rd14+28],%f2;
+    \\  add.s64 %rd14,%rd14,%rd15;
+    \\  ld.shared.f32 %f2,[%r13+1024]; mul.f32 %f2,%f2,%f1; @%p6 st.global.f32 [%rd14+0],%f2;
+    \\  ld.shared.f32 %f2,[%r13+5120]; mul.f32 %f2,%f2,%f1; @%p6 st.global.f32 [%rd14+4],%f2;
+    \\  ld.shared.f32 %f2,[%r13+9216]; mul.f32 %f2,%f2,%f1; @%p6 st.global.f32 [%rd14+8],%f2;
+    \\  ld.shared.f32 %f2,[%r13+13312]; mul.f32 %f2,%f2,%f1; @%p6 st.global.f32 [%rd14+12],%f2;
+    \\  ld.shared.f32 %f2,[%r13+17408]; mul.f32 %f2,%f2,%f1; @%p6 st.global.f32 [%rd14+16],%f2;
+    \\  ld.shared.f32 %f2,[%r13+21504]; mul.f32 %f2,%f2,%f1; @%p6 st.global.f32 [%rd14+20],%f2;
+    \\  ld.shared.f32 %f2,[%r13+25600]; mul.f32 %f2,%f2,%f1; @%p6 st.global.f32 [%rd14+24],%f2;
+    \\  ld.shared.f32 %f2,[%r13+29696]; mul.f32 %f2,%f2,%f1; @%p6 st.global.f32 [%rd14+28],%f2;
+    \\  add.s64 %rd14,%rd14,%rd15;
+    \\  ld.shared.f32 %f2,[%r13+2048]; mul.f32 %f2,%f2,%f1; @%p7 st.global.f32 [%rd14+0],%f2;
+    \\  ld.shared.f32 %f2,[%r13+6144]; mul.f32 %f2,%f2,%f1; @%p7 st.global.f32 [%rd14+4],%f2;
+    \\  ld.shared.f32 %f2,[%r13+10240]; mul.f32 %f2,%f2,%f1; @%p7 st.global.f32 [%rd14+8],%f2;
+    \\  ld.shared.f32 %f2,[%r13+14336]; mul.f32 %f2,%f2,%f1; @%p7 st.global.f32 [%rd14+12],%f2;
+    \\  ld.shared.f32 %f2,[%r13+18432]; mul.f32 %f2,%f2,%f1; @%p7 st.global.f32 [%rd14+16],%f2;
+    \\  ld.shared.f32 %f2,[%r13+22528]; mul.f32 %f2,%f2,%f1; @%p7 st.global.f32 [%rd14+20],%f2;
+    \\  ld.shared.f32 %f2,[%r13+26624]; mul.f32 %f2,%f2,%f1; @%p7 st.global.f32 [%rd14+24],%f2;
+    \\  ld.shared.f32 %f2,[%r13+30720]; mul.f32 %f2,%f2,%f1; @%p7 st.global.f32 [%rd14+28],%f2;
+    \\  add.s64 %rd14,%rd14,%rd15;
+    \\  ld.shared.f32 %f2,[%r13+3072]; mul.f32 %f2,%f2,%f1; @%p8 st.global.f32 [%rd14+0],%f2;
+    \\  ld.shared.f32 %f2,[%r13+7168]; mul.f32 %f2,%f2,%f1; @%p8 st.global.f32 [%rd14+4],%f2;
+    \\  ld.shared.f32 %f2,[%r13+11264]; mul.f32 %f2,%f2,%f1; @%p8 st.global.f32 [%rd14+8],%f2;
+    \\  ld.shared.f32 %f2,[%r13+15360]; mul.f32 %f2,%f2,%f1; @%p8 st.global.f32 [%rd14+12],%f2;
+    \\  ld.shared.f32 %f2,[%r13+19456]; mul.f32 %f2,%f2,%f1; @%p8 st.global.f32 [%rd14+16],%f2;
+    \\  ld.shared.f32 %f2,[%r13+23552]; mul.f32 %f2,%f2,%f1; @%p8 st.global.f32 [%rd14+20],%f2;
+    \\  ld.shared.f32 %f2,[%r13+27648]; mul.f32 %f2,%f2,%f1; @%p8 st.global.f32 [%rd14+24],%f2;
+    \\  ld.shared.f32 %f2,[%r13+31744]; mul.f32 %f2,%f2,%f1; @%p8 st.global.f32 [%rd14+28],%f2;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// Flash-decoding pass 1: split each query's KV range across nsplit chunks,
+/// one WARP per (query, head, split). Queries are consecutive positions with
+/// causal attention: query t sees kv_len0 + t keys (kv_len0 = pos0 + 1), so
+/// seq_q == 1 is plain decode and seq_q > 1 is the speculative-verify batch.
+/// Requires hd == 128: each lane owns 4 dims (q/k/v as v4.f32), the k·q dot
+/// closes with a shfl.bfly tree (all lanes get the sum), softmax scalars are
+/// computed redundantly per lane, and the accumulator lives in 4 registers
+/// per lane — no local memory. Partial (m, d, pad, pad, acc[hd]) rows go to
+/// scratch at row `warp` — [t][h][split] order — stride hd+4 so the lane v4
+/// stores stay 16B-aligned (attn_merge then runs with heads' = seq_q*heads).
+/// b0=q[seq_q][heads][hd], b1=k[seq_kv][kv][hd], b2=v, b3=scratch.
+/// u0=kv_len0, u1=heads, u2=kv_heads, u3=hd(=128), u4=nsplit, u5=seq_q, f0=scale.
 pub const attn_split_ptx: [:0]const u8 =
     \\.version 8.0
     \\.target sm_86
@@ -455,25 +1069,30 @@ pub const attn_split_ptx: [:0]const u8 =
     \\  mad.lo.s32 %r4,%r1,%r2,%r3;           // global thread
     \\  shr.u32 %r27,%r4,5;                   // warp = idx/32
     \\  and.b32 %r28,%r4,31;                  // lane
-    \\  ld.param.u32 %r5,[u0];                // seq_kv
+    \\  ld.param.u32 %r5,[u0];                // kv_len0
     \\  ld.param.u32 %r6,[u1];                // heads
     \\  ld.param.u32 %r26,[u4];               // nsplit
-    \\  mul.lo.s32 %r7,%r6,%r26;              // heads*nsplit warps
-    \\  setp.ge.u32 %p1,%r27,%r7; @%p1 bra END;
+    \\  ld.param.u32 %r30,[u5];               // seq_q
+    \\  mul.lo.s32 %r7,%r6,%r26;              // heads*nsplit warps per query
+    \\  mul.lo.s32 %r31,%r7,%r30;
+    \\  setp.ge.u32 %p1,%r27,%r31; @%p1 bra END;
     \\  ld.param.u32 %r8,[u2];                // kv_heads
     \\  ld.param.u32 %r9,[u3];                // hd (=128)
     \\  ld.param.f32 %f1,[f0];                // scale
     \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2]; ld.param.u64 %rd4,[p3];
     \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3; cvta.to.global.u64 %rd4,%rd4;
-    \\  div.u32 %r10,%r27,%r26;               // h
-    \\  rem.u32 %r21,%r27,%r26;               // split i
+    \\  div.u32 %r31,%r27,%r7;                // query t
+    \\  rem.u32 %r2,%r27,%r7;                 // warp within query
+    \\  add.u32 %r5,%r5,%r31;                 // this query's kv len (causal: kv_len0 + t)
+    \\  div.u32 %r10,%r2,%r26;                // h
+    \\  rem.u32 %r21,%r2,%r26;                // split i
     \\  add.u32 %r22,%r5,%r26; sub.u32 %r22,%r22,1; div.u32 %r22,%r22,%r26; // chunk
     \\  mul.lo.s32 %r17,%r21,%r22;            // kv0
     \\  add.u32 %r23,%r17,%r22; min.u32 %r23,%r23,%r5; // kv1
     \\  div.u32 %r12,%r6,%r8;                 // group
     \\  div.u32 %r13,%r10,%r12;               // kv head
-    \\  // q fragment: q[h*hd + lane*4 ..][4]
-    \\  mul.lo.s32 %r14,%r10,%r9; shl.b32 %r15,%r28,2; add.u32 %r14,%r14,%r15;
+    \\  // q fragment: q[(t*heads + h)*hd + lane*4 ..][4]
+    \\  mad.lo.s32 %r14,%r31,%r6,%r10; mul.lo.s32 %r14,%r14,%r9; shl.b32 %r15,%r28,2; add.u32 %r14,%r14,%r15;
     \\  mul.wide.u32 %rd5,%r14,4; add.s64 %rd6,%rd1,%rd5;
     \\  ld.global.v4.f32 {%f2,%f3,%f4,%f5},[%rd6];
     \\  mov.f32 %f10,0fFF800000;              // m
@@ -576,6 +1195,117 @@ pub const attn_merge_ptx: [:0]const u8 =
     \\}
 ;
 
+/// Tree-verify attn_split (speculative tree drafting, LLM_PLAN.md M8):
+/// seq_q tree-node queries, query t attending kv rows [0, L) of the linear
+/// cache plus its ancestor chain, whose K/V live at rows tree_base+idx of
+/// the SAME k/v buffers. Per-query kv lengths and ancestor row lists come
+/// from a meta table at the scratch tail (element offset
+/// seq_q*heads*nsplit*(hd+4), row stride seq_q+1, row t = [kv_len_t,
+/// anc_0, anc_1, ...] u32, ancestors in depth order): kv index j maps to
+/// row j when j < L, else tree_base + anc[j - L]. Chunking, math, and
+/// iteration order are identical to attn_split at the same kv_len, so
+/// merged outputs stay bitwise-identical to plain decode. hd is hardcoded
+/// 128 (as attn_split requires); its param slot carries tree_base.
+/// b0=q[seq_q][heads][128], b1=k, b2=v, b3=scratch(+meta).
+/// u0=L, u1=heads, u2=kv_heads, u3=tree_base, u4=nsplit, u5=seq_q, f0=scale.
+pub const attn_split_tree_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry attn_split_tree(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<6>;
+    \\  .reg .b32 %r<40>;
+    \\  .reg .f32 %f<40>;
+    \\  .reg .b64 %rd<26>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x;
+    \\  mad.lo.s32 %r4,%r1,%r2,%r3;           // global thread
+    \\  shr.u32 %r27,%r4,5;                   // warp = idx/32
+    \\  and.b32 %r28,%r4,31;                  // lane
+    \\  ld.param.u32 %r36,[u0];               // L (committed prefix len)
+    \\  ld.param.u32 %r6,[u1];                // heads
+    \\  ld.param.u32 %r26,[u4];               // nsplit
+    \\  ld.param.u32 %r30,[u5];               // seq_q
+    \\  mul.lo.s32 %r7,%r6,%r26;              // heads*nsplit warps per query
+    \\  mul.lo.s32 %r31,%r7,%r30;
+    \\  setp.ge.u32 %p1,%r27,%r31; @%p1 bra END;
+    \\  ld.param.u32 %r8,[u2];                // kv_heads
+    \\  ld.param.u32 %r35,[u3];               // tree_base (batch K/V row offset)
+    \\  ld.param.f32 %f1,[f0];                // scale
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2]; ld.param.u64 %rd4,[p3];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3; cvta.to.global.u64 %rd4,%rd4;
+    \\  div.u32 %r31,%r27,%r7;                // query t
+    \\  rem.u32 %r2,%r27,%r7;                 // warp within query
+    \\  // meta row t: scratch elem off = seq_q*heads*nsplit*(hd+4) + t*(seq_q+1)
+    \\  mul.lo.s32 %r32,%r7,%r30;
+    \\  mul.lo.s32 %r32,%r32,132;             // partial region elems (hd+4 = 132)
+    \\  add.u32 %r33,%r30,1;                  // meta row stride = seq_q+1
+    \\  mad.lo.s32 %r34,%r31,%r33,%r32;
+    \\  mul.wide.u32 %rd21,%r34,4; add.s64 %rd22,%rd4,%rd21;
+    \\  ld.global.u32 %r5,[%rd22];            // this query's kv len (L + depth + 1)
+    \\  add.s64 %rd23,%rd22,4;                // ancestor row list base
+    \\  div.u32 %r10,%r2,%r26;                // h
+    \\  rem.u32 %r21,%r2,%r26;                // split i
+    \\  add.u32 %r22,%r5,%r26; sub.u32 %r22,%r22,1; div.u32 %r22,%r22,%r26; // chunk
+    \\  mul.lo.s32 %r17,%r21,%r22;            // kv0
+    \\  add.u32 %r23,%r17,%r22; min.u32 %r23,%r23,%r5; // kv1
+    \\  div.u32 %r12,%r6,%r8;                 // group
+    \\  div.u32 %r13,%r10,%r12;               // kv head
+    \\  // q fragment: q[(t*heads + h)*hd + lane*4 ..][4]
+    \\  mad.lo.s32 %r14,%r31,%r6,%r10; mul.lo.s32 %r14,%r14,128; shl.b32 %r15,%r28,2; add.u32 %r14,%r14,%r15;
+    \\  mul.wide.u32 %rd5,%r14,4; add.s64 %rd6,%rd1,%rd5;
+    \\  ld.global.v4.f32 {%f2,%f3,%f4,%f5},[%rd6];
+    \\  mov.f32 %f10,0fFF800000;              // m
+    \\  mov.f32 %f11,0f00000000;              // d
+    \\  mov.f32 %f20,0f00000000; mov.f32 %f21,0f00000000; mov.f32 %f22,0f00000000; mov.f32 %f23,0f00000000; // acc
+    \\JLOOP:
+    \\  setp.ge.u32 %p2,%r17,%r23; @%p2 bra JD;
+    \\  // kv row: j < L -> j (cache), else tree_base + anc[j - L] (batch row)
+    \\  mov.u32 %r37,%r17;
+    \\  setp.lt.u32 %p4,%r17,%r36; @%p4 bra HAVEROW;
+    \\  sub.u32 %r38,%r17,%r36;
+    \\  mul.wide.u32 %rd19,%r38,4; add.s64 %rd20,%rd23,%rd19; ld.global.u32 %r37,[%rd20];
+    \\  add.u32 %r37,%r37,%r35;
+    \\HAVEROW:
+    \\  mad.lo.s32 %r18,%r37,%r8,%r13; mul.lo.s32 %r18,%r18,128; add.u32 %r18,%r18,%r15;
+    \\  mul.wide.u32 %rd9,%r18,4; add.s64 %rd10,%rd2,%rd9;
+    \\  ld.global.v4.f32 {%f24,%f25,%f26,%f27},[%rd10];
+    \\  mul.f32 %f6,%f2,%f24; fma.rn.f32 %f6,%f3,%f25,%f6; fma.rn.f32 %f6,%f4,%f26,%f6; fma.rn.f32 %f6,%f5,%f27,%f6;
+    \\  // butterfly all-reduce: every lane ends with the full dot
+    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,16,0x1f,0xffffffff; mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
+    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,8,0x1f,0xffffffff;  mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
+    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,4,0x1f,0xffffffff;  mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
+    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,2,0x1f,0xffffffff;  mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
+    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,1,0x1f,0xffffffff;  mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
+    \\  mul.f32 %f6,%f6,%f1;                  // s
+    \\  max.f32 %f12,%f10,%f6;                // m2
+    \\  sub.f32 %f8,%f10,%f12; mul.f32 %f8,%f8,0f3FB8AA3B; ex2.approx.f32 %f8,%f8;  // corr
+    \\  sub.f32 %f9,%f6,%f12; mul.f32 %f9,%f9,0f3FB8AA3B; ex2.approx.f32 %f9,%f9;   // p
+    \\  mul.f32 %f11,%f11,%f8; add.f32 %f11,%f11,%f9;
+    \\  mov.f32 %f10,%f12;
+    \\  add.s64 %rd11,%rd3,%rd9;              // V fragment (same offsets)
+    \\  ld.global.v4.f32 {%f24,%f25,%f26,%f27},[%rd11];
+    \\  mul.f32 %f20,%f20,%f8; fma.rn.f32 %f20,%f9,%f24,%f20;
+    \\  mul.f32 %f21,%f21,%f8; fma.rn.f32 %f21,%f9,%f25,%f21;
+    \\  mul.f32 %f22,%f22,%f8; fma.rn.f32 %f22,%f9,%f26,%f22;
+    \\  mul.f32 %f23,%f23,%f8; fma.rn.f32 %f23,%f9,%f27,%f23;
+    \\  add.u32 %r17,%r17,1; bra JLOOP;
+    \\JD:
+    \\  // scratch row = warp*(hd+4): lane 0 stores m,d; every lane its acc4
+    \\  mul.lo.s32 %r25,%r27,132;
+    \\  mul.wide.u32 %rd17,%r25,4; add.s64 %rd18,%rd4,%rd17;
+    \\  setp.ne.u32 %p3,%r28,0; @%p3 bra WRACC;
+    \\  st.global.f32 [%rd18],%f10; st.global.f32 [%rd18+4],%f11;
+    \\WRACC:
+    \\  shl.b32 %r29,%r28,4; add.u32 %r29,%r29,16;   // byte off = 16 + lane*16
+    \\  cvt.u64.u32 %rd19,%r29; add.s64 %rd20,%rd18,%rd19;
+    \\  st.global.v4.f32 [%rd20],{%f20,%f21,%f22,%f23};
+    \\END:
+    \\  ret;
+    \\}
+;
+
 /// rotate-half RoPE, in place, one thread per (position, head, pair): the head
 /// vector splits into halves [0:half] and [half:2*half]; for pair i,
 /// lo' = lo*cos[i] - hi*sin[i], hi' = hi*cos[i] + lo*sin[i]. cos/sin are
@@ -604,6 +1334,51 @@ pub const rope_half_ptx: [:0]const u8 =
     \\  mul.lo.s32 %r11,%r6,%r8;              // half*n_heads
     \\  div.u32 %r12,%r4,%r11;                // pos
     \\  ld.param.u32 %r18,[u4]; add.u32 %r12,%r12,%r18; // pos += pos0 (u4): cached decode offset
+    \\  mad.lo.s32 %r13,%r12,%r6,%r9;         // cos idx = pos*half + pair
+    \\  mul.wide.u32 %rd4,%r13,4; add.s64 %rd5,%rd3,%rd4; ld.global.f32 %f1,[%rd5]; // cos
+    \\  add.s32 %r14,%r13,%r7;                // + sin_off
+    \\  mul.wide.u32 %rd6,%r14,4; add.s64 %rd7,%rd3,%rd6; ld.global.f32 %f2,[%rd7]; // sin
+    \\  shl.b32 %r15,%r6,1;                   // head_dim = 2*half
+    \\  mad.lo.s32 %r16,%r10,%r15,%r9;        // lo_idx = hp*head_dim + pair
+    \\  add.s32 %r17,%r16,%r6;                // hi_idx = lo_idx + half
+    \\  mul.wide.u32 %rd8,%r16,4; add.s64 %rd9,%rd1,%rd8; ld.global.f32 %f3,[%rd9];   // lo
+    \\  mul.wide.u32 %rd10,%r17,4; add.s64 %rd11,%rd1,%rd10; ld.global.f32 %f4,[%rd11]; // hi
+    \\  mul.f32 %f5,%f3,%f1; mul.f32 %f6,%f4,%f2; sub.f32 %f5,%f5,%f6; st.global.f32 [%rd9],%f5;  // lo*cos - hi*sin
+    \\  mul.f32 %f6,%f4,%f1; fma.rn.f32 %f6,%f3,%f2,%f6; st.global.f32 [%rd11],%f6;               // hi*cos + lo*sin
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// rope_half with an explicit absolute position per row (tree-verify
+/// batches: node positions are depth-based, not consecutive): pos =
+/// b1[row] (u32), row = idx / (half*n_heads). Per-element math identical
+/// to rope_half at the same position. b0=qk(f32), b1=positions(u32),
+/// b2=freqs(f32). u0=total (=rows*n_heads*half), u1=half, u2=sin_off,
+/// u3=n_heads.
+pub const rope_half_pos_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry rope_half_pos(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<2>;
+    \\  .reg .b32 %r<20>;
+    \\  .reg .f32 %f<8>;
+    \\  .reg .b64 %rd<16>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1];               // half
+    \\  ld.param.u32 %r7,[u2];               // sin_off
+    \\  ld.param.u32 %r8,[u3];               // n_heads
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
+    \\  rem.u32 %r9,%r4,%r6;                  // pair = idx % half
+    \\  div.u32 %r10,%r4,%r6;                 // hp = idx/half = row*n_heads + head
+    \\  mul.lo.s32 %r11,%r6,%r8;              // half*n_heads
+    \\  div.u32 %r12,%r4,%r11;                // row
+    \\  mul.wide.u32 %rd12,%r12,4; add.s64 %rd13,%rd2,%rd12; ld.global.u32 %r12,[%rd13]; // pos = positions[row]
     \\  mad.lo.s32 %r13,%r12,%r6,%r9;         // cos idx = pos*half + pair
     \\  mul.wide.u32 %rd4,%r13,4; add.s64 %rd5,%rd3,%rd4; ld.global.f32 %f1,[%rd5]; // cos
     \\  add.s32 %r14,%r13,%r7;                // + sin_off
@@ -1271,6 +2046,203 @@ pub const f32_to_f16_ptx: [:0]const u8 =
     \\  cvt.rn.f16.f32 %h0,%f1; st.global.b16 [%rd4],%h0; bra END;
     \\ZERO:
     \\  mov.b16 %h0,0x0000; st.global.b16 [%rd4],%h0;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// Decode-graph state module (CUDA graphs, LLM_PLAN.md M6): the per-token
+/// dynamic values — sampled token id and cache position — live in the
+/// g_state module global instead of kernel parameters, so the captured
+/// decode graph replays unmodified: one 8-byte HtoD + one cuGraphLaunch per
+/// token. Entries mirror their param-driven twins exactly (same math, same
+/// order — byte-identical logits): embed_gather_s replaces the CPU
+/// embedding gather + upload, rope_half_s takes pos0 from g_state[1],
+/// kv_append_s replaces the KV-append memcpy, attn_split_s is the seq_q=1
+/// flash-decode split with kv_len = g_state[1] + 1. g_state = [token, pos0].
+pub const decode_state_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .global .align 8 .b32 g_state[2];
+    \\
+    \\// x[i] = f32(embed_bf16[g_state[0]*hidden + i]); b0=embed, b1=x, u0=hidden
+    \\.visible .entry embed_gather_s(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<2>;
+    \\  .reg .b32 %r<12>;
+    \\  .reg .f32 %f<4>;
+    \\  .reg .b64 %rd<10>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.global.u32 %r6,[g_state];          // token id
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2;
+    \\  mad.lo.s32 %r7,%r6,%r5,%r4;           // elem = token*hidden + i
+    \\  mul.wide.u32 %rd3,%r7,2; add.s64 %rd4,%rd1,%rd3; ld.global.u16 %r8,[%rd4];
+    \\  shl.b32 %r9,%r8,16; mov.b32 %f1,%r9;  // bf16 -> f32
+    \\  mul.wide.u32 %rd5,%r4,4; add.s64 %rd6,%rd2,%rd5; st.global.f32 [%rd6],%f1;
+    \\END:
+    \\  ret;
+    \\}
+    \\
+    \\// dst[u2 + g_state[1]*u1 + i] = src[i]; b0=src, b1=dst, u0=count,
+    \\// u1=row stride, u2=base offset (KV appends and decode-graph tap rows).
+    \\.visible .entry kv_append_s(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<2>;
+    \\  .reg .b32 %r<12>;
+    \\  .reg .f32 %f<3>;
+    \\  .reg .b64 %rd<10>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1];
+    \\  ld.param.u32 %r9,[u2];
+    \\  ld.global.u32 %r7,[g_state+4];        // pos0
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2;
+    \\  mul.wide.u32 %rd3,%r4,4; add.s64 %rd4,%rd1,%rd3; ld.global.f32 %f1,[%rd4];
+    \\  mad.lo.s32 %r8,%r7,%r6,%r4;           // dst = base + pos0*stride + i
+    \\  add.u32 %r8,%r8,%r9;
+    \\  mul.wide.u32 %rd5,%r8,4; add.s64 %rd6,%rd2,%rd5; st.global.f32 [%rd6],%f1;
+    \\END:
+    \\  ret;
+    \\}
+    \\
+    \\// rope_half with pos0 = g_state[1] (otherwise identical to rope_half).
+    \\.visible .entry rope_half_s(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<2>;
+    \\  .reg .b32 %r<20>;
+    \\  .reg .f32 %f<8>;
+    \\  .reg .b64 %rd<12>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1];               // half
+    \\  ld.param.u32 %r7,[u2];               // sin_off
+    \\  ld.param.u32 %r8,[u3];               // n_heads
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd3,[p2];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd3,%rd3;
+    \\  rem.u32 %r9,%r4,%r6;                  // pair = idx % half
+    \\  div.u32 %r10,%r4,%r6;                 // hp = idx/half = pos*n_heads + head
+    \\  mul.lo.s32 %r11,%r6,%r8;              // half*n_heads
+    \\  div.u32 %r12,%r4,%r11;                // pos
+    \\  ld.global.u32 %r18,[g_state+4]; add.u32 %r12,%r12,%r18; // pos += pos0 (device state)
+    \\  mad.lo.s32 %r13,%r12,%r6,%r9;         // cos idx = pos*half + pair
+    \\  mul.wide.u32 %rd4,%r13,4; add.s64 %rd5,%rd3,%rd4; ld.global.f32 %f1,[%rd5]; // cos
+    \\  add.s32 %r14,%r13,%r7;                // + sin_off
+    \\  mul.wide.u32 %rd6,%r14,4; add.s64 %rd7,%rd3,%rd6; ld.global.f32 %f2,[%rd7]; // sin
+    \\  shl.b32 %r15,%r6,1;                   // head_dim = 2*half
+    \\  mad.lo.s32 %r16,%r10,%r15,%r9;        // lo_idx = hp*head_dim + pair
+    \\  add.s32 %r17,%r16,%r6;                // hi_idx = lo_idx + half
+    \\  mul.wide.u32 %rd8,%r16,4; add.s64 %rd9,%rd1,%rd8; ld.global.f32 %f3,[%rd9];   // lo
+    \\  mul.wide.u32 %rd10,%r17,4; add.s64 %rd11,%rd1,%rd10; ld.global.f32 %f4,[%rd11]; // hi
+    \\  mul.f32 %f5,%f3,%f1; mul.f32 %f6,%f4,%f2; sub.f32 %f5,%f5,%f6; st.global.f32 [%rd9],%f5;  // lo*cos - hi*sin
+    \\  mul.f32 %f6,%f4,%f1; fma.rn.f32 %f6,%f3,%f2,%f6; st.global.f32 [%rd11],%f6;               // hi*cos + lo*sin
+    \\END:
+    \\  ret;
+    \\}
+    \\
+    \\// attn_split for the single decode query with kv_len = g_state[1] + 1
+    \\// (otherwise identical math/order to attn_split at seq_q = 1).
+    \\.visible .entry attn_split_s(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<5>;
+    \\  .reg .b32 %r<32>;
+    \\  .reg .f32 %f<40>;
+    \\  .reg .b64 %rd<24>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x;
+    \\  mad.lo.s32 %r4,%r1,%r2,%r3;           // global thread
+    \\  shr.u32 %r27,%r4,5;                   // warp = idx/32
+    \\  and.b32 %r28,%r4,31;                  // lane
+    \\  ld.global.u32 %r5,[g_state+4]; add.u32 %r5,%r5,1; // kv_len = pos0 + 1
+    \\  ld.param.u32 %r6,[u1];                // heads
+    \\  ld.param.u32 %r26,[u4];               // nsplit
+    \\  mul.lo.s32 %r7,%r6,%r26;              // heads*nsplit warps
+    \\  setp.ge.u32 %p1,%r27,%r7; @%p1 bra END;
+    \\  ld.param.u32 %r8,[u2];                // kv_heads
+    \\  ld.param.u32 %r9,[u3];                // hd (=128)
+    \\  ld.param.f32 %f1,[f0];                // scale
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2]; ld.param.u64 %rd4,[p3];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3; cvta.to.global.u64 %rd4,%rd4;
+    \\  div.u32 %r10,%r27,%r26;               // h
+    \\  rem.u32 %r21,%r27,%r26;               // split i
+    \\  add.u32 %r22,%r5,%r26; sub.u32 %r22,%r22,1; div.u32 %r22,%r22,%r26; // chunk
+    \\  mul.lo.s32 %r17,%r21,%r22;            // kv0
+    \\  add.u32 %r23,%r17,%r22; min.u32 %r23,%r23,%r5; // kv1
+    \\  div.u32 %r12,%r6,%r8;                 // group
+    \\  div.u32 %r13,%r10,%r12;               // kv head
+    \\  // q fragment: q[h*hd + lane*4 ..][4]
+    \\  mul.lo.s32 %r14,%r10,%r9; shl.b32 %r15,%r28,2; add.u32 %r14,%r14,%r15;
+    \\  mul.wide.u32 %rd5,%r14,4; add.s64 %rd6,%rd1,%rd5;
+    \\  ld.global.v4.f32 {%f2,%f3,%f4,%f5},[%rd6];
+    \\  mov.f32 %f10,0fFF800000;              // m
+    \\  mov.f32 %f11,0f00000000;              // d
+    \\  mov.f32 %f20,0f00000000; mov.f32 %f21,0f00000000; mov.f32 %f22,0f00000000; mov.f32 %f23,0f00000000; // acc
+    \\JLOOP:
+    \\  setp.ge.u32 %p2,%r17,%r23; @%p2 bra JD;
+    \\  mad.lo.s32 %r18,%r17,%r8,%r13; mul.lo.s32 %r18,%r18,%r9; add.u32 %r18,%r18,%r15;
+    \\  mul.wide.u32 %rd9,%r18,4; add.s64 %rd10,%rd2,%rd9;
+    \\  ld.global.v4.f32 {%f24,%f25,%f26,%f27},[%rd10];
+    \\  mul.f32 %f6,%f2,%f24; fma.rn.f32 %f6,%f3,%f25,%f6; fma.rn.f32 %f6,%f4,%f26,%f6; fma.rn.f32 %f6,%f5,%f27,%f6;
+    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,16,0x1f,0xffffffff; mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
+    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,8,0x1f,0xffffffff;  mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
+    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,4,0x1f,0xffffffff;  mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
+    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,2,0x1f,0xffffffff;  mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
+    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,1,0x1f,0xffffffff;  mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
+    \\  mul.f32 %f6,%f6,%f1;                  // s
+    \\  max.f32 %f12,%f10,%f6;                // m2
+    \\  sub.f32 %f8,%f10,%f12; mul.f32 %f8,%f8,0f3FB8AA3B; ex2.approx.f32 %f8,%f8;  // corr
+    \\  sub.f32 %f9,%f6,%f12; mul.f32 %f9,%f9,0f3FB8AA3B; ex2.approx.f32 %f9,%f9;   // p
+    \\  mul.f32 %f11,%f11,%f8; add.f32 %f11,%f11,%f9;
+    \\  mov.f32 %f10,%f12;
+    \\  add.s64 %rd11,%rd3,%rd9;              // V fragment (same offsets)
+    \\  ld.global.v4.f32 {%f24,%f25,%f26,%f27},[%rd11];
+    \\  mul.f32 %f20,%f20,%f8; fma.rn.f32 %f20,%f9,%f24,%f20;
+    \\  mul.f32 %f21,%f21,%f8; fma.rn.f32 %f21,%f9,%f25,%f21;
+    \\  mul.f32 %f22,%f22,%f8; fma.rn.f32 %f22,%f9,%f26,%f22;
+    \\  mul.f32 %f23,%f23,%f8; fma.rn.f32 %f23,%f9,%f27,%f23;
+    \\  add.u32 %r17,%r17,1; bra JLOOP;
+    \\JD:
+    \\  add.u32 %r24,%r9,4; mul.lo.s32 %r25,%r27,%r24;
+    \\  mul.wide.u32 %rd17,%r25,4; add.s64 %rd18,%rd4,%rd17;
+    \\  setp.ne.u32 %p3,%r28,0; @%p3 bra WRACC;
+    \\  st.global.f32 [%rd18],%f10; st.global.f32 [%rd18+4],%f11;
+    \\WRACC:
+    \\  shl.b32 %r29,%r28,4; add.u32 %r29,%r29,16;   // byte off = 16 + lane*16
+    \\  cvt.u64.u32 %rd19,%r29; add.s64 %rd20,%rd18,%rd19;
+    \\  st.global.v4.f32 [%rd20],{%f20,%f21,%f22,%f23};
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// Plain element copy with source/destination element offsets — keeps
+/// hidden-state tap snapshots inside a recorded batch (cuMemcpyDtoD runs on
+/// the null stream, which a graph capture rejects and a batch would flush).
+/// b0=src, b1=dst. u0=count, u1=dst offset, u2=src offset.
+pub const copy_off_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry copy_off(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<2>;
+    \\  .reg .b32 %r<10>;
+    \\  .reg .f32 %f<3>;
+    \\  .reg .b64 %rd<10>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1]; ld.param.u32 %r7,[u2];
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2;
+    \\  add.u32 %r8,%r4,%r7; mul.wide.u32 %rd3,%r8,4; add.s64 %rd4,%rd1,%rd3; ld.global.f32 %f1,[%rd4];
+    \\  add.u32 %r9,%r4,%r6; mul.wide.u32 %rd5,%r9,4; add.s64 %rd6,%rd2,%rd5; st.global.f32 [%rd6],%f1;
     \\END:
     \\  ret;
     \\}

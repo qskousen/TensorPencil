@@ -132,6 +132,17 @@ std.posix.MAP{ .TYPE = .SHARED }
 .{ .TYPE = .SHARED }
 ```
 
+## `std.posix.mprotect` removed
+
+Like the other thin wrappers below, use the raw Linux syscall (takes the
+packed `PROT` struct; address must be page-aligned, length is rounded up
+by the kernel):
+
+```zig
+const rc = std.os.linux.mprotect(bytes.ptr, bytes.len, .{ .READ = true, .WRITE = true });
+if (std.posix.errno(rc) != .SUCCESS) return false;
+```
+
 ## `std.posix.write`, `std.posix.close`, `std.posix.ftruncate` removed
 
 These thin POSIX wrappers were removed. For contexts without `std.Io`, use raw
@@ -249,3 +260,30 @@ var stdin_reader: Io.File.Reader = .initStreaming(.stdin(), io, &buf);
 const stdin = &stdin_reader.interface;
 const line = (try stdin.takeDelimiter('\n')) orelse break; // null = EOF
 ```
+
+## `zig test src/root.zig` needs `-lc` for dlopen-based (GPU) tests
+
+The CUDA/Vulkan backends `dlopen` their drivers. Without libc, `std.DynLib`
+falls back to Zig's own ELF loader, which cannot load glibc-heavy libraries
+like `libcuda.so.1` — `Api.load()` fails and every GPU-gated test silently
+SKIPs. `zig build test` links libc already; for direct single-file runs use:
+
+```sh
+zig test -lc src/root.zig --test-filter "<name>"
+```
+
+## `zig build test` prints "failed command:" for long-running tests (cosmetic)
+
+A test binary containing a test that runs for a long stretch without output
+(e.g. the ~90 s Debug krea2 parity test) makes `zig build test` print
+`failed command: ...zig-cache/o/<hash>/test ... --listen=-` — with no test
+name, no error, and **exit code 0**. The test actually ran to completion
+(strace shows the binary exiting 0 after finishing), all tests pass when
+the binary is run directly, and an immediate rerun reports the step as
+cached success. Reproduced at a clean checkout (de2a5a0), independent of
+the `testdata/gpu-tests` marker; `--test-timeout 10m` does not change it —
+it appears to be the 0.16 build-runner's listen-protocol response-timeout
+handling misreporting a silent-but-alive test runner. Judge test runs by
+the exit code (or run the binary directly with
+`zig test -lc src/root.zig --test-filter "<name>"`), not by the presence
+of this line.

@@ -133,3 +133,5 @@ the prompt. In REPL mode, type `/exit` to exit. Runs on all four backends:
 Run the command without arguments to see the usage. Example usage:
 
 `tp-llm --model qwen-3-vl-4b.safetensors --prompt "why is the sky blue" --backend zig-cuda`
+
+LLM mode also has some types of speculative decoding and VRAM offloading.

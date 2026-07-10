@@ -176,12 +176,258 @@ ceiling; int4 ≈ 2 GB/tok → ~400 tok/s ceiling. Real-world 50–70% of ceilin
 *Accept:* GPU output matches CPU for greedy; tok/s reported by the CLI;
 ≥50 tok/s int4 on the 3090 as the initial bar.
 
+### M5 — speculative decoding (landed 2026-07-09: all four backends)
+
+Lossless speculative decoding behind `--spec-k <n>` (0 = off): a drafter
+proposes up to k tokens, one batched forward verifies them all, the KV cache
+rolls back past the first rejection. Acceptance draws each drafted token with
+its probability under the *fully processed* sampling distribution (penalty →
+temperature → top-k → top-p, `sample.Dist`), resampling rejections from the
+renormalized residual — the output distribution is exactly vanilla's, and
+greedy is byte-identical (verified: verify kernels reproduce the decode
+kernels' reduction order bitwise).
+
+Pieces:
+- `llm/spec.zig` — verify loop (`spec.generate`), `NgramDrafter`
+  (prompt-lookup: longest 4→2-gram suffix match, most recent occurrence),
+  draft/accept stats. Engine dispatches on `Options.spec_k`; backends without
+  `stepAll`/`truncate` return `error.SpecUnsupported` (comptime-gated).
+- Stepper interface grew `stepAll` (logits for every new row) and
+  `truncate(len)` (cache rollback — a host-side counter on all backends).
+- CUDA small-batch regime (`linearFp8`, seq ≤ 17): new `gemv_fp8n` /
+  `gemv_bf16n` kernels — 8 weight rows per block × 4 inputs per weight read.
+  Block-per-row multi-input GEMV saturates L2 re-reading the inputs (80 GB/s);
+  the 8-row grouping restores 221 GB/s. `attn_split/merge` generalized to
+  warp-per-(query, head, split) with per-query causal KV caps, replacing the
+  naive square kernel (0.87 ms → 43 µs/layer at verify sizes). Short
+  multi-turn prefills ride the same path (the old seq>1 route dequantized
+  every fp8 weight to f16 scratch — ~5x weight traffic).
+
+- Vulkan small-batch regime: `gemv_partial4`/`gemv_combine4` (4-input
+  k-split GEMV, weight word read once per 4 inputs, per-column k order
+  preserved → bitwise equal to the decode GEMV) and `attn_dsplit`
+  generalized to thread-per-(query, head, chunk) with per-query causal KV
+  caps (`u5 = seq_q`; `attn_dmerge` unchanged — it just runs with
+  heads' = seq_q*heads). Follow-up (pos0 > 0) prefills now chunk through
+  this path instead of going token-by-token — the old square-attention
+  pos0=0 limitation is gone.
+
+Measured (3090, greedy, 200-token runs, byte-identical output):
+- zig-cuda: listing prompt 67 → 73 tok/s at k=3 (30% acceptance);
+  exact-repetition ceiling 54 → 76 tok/s at k=8–16 (85% acceptance, 6–9
+  tokens/verify). Novel-prose worst case ≈ break-even.
+- vulkan: ≈ break-even on the listing prompt (verify ≈ decode cost because
+  decode is dispatch-overhead-bound, and acceptance only buys 1.25
+  tokens/verify there); the win is the multi-turn prefill fix.
+
+The drafter, not the verify path, is now the binding constraint — a trained
+draft head (EAGLE-style) or small draft model is the next lever.
+
+**Draft-model drafting (landed 2026-07-09, same day):** `--draft-model
+<path>` runs a second, smaller CausalLM as the drafter (`spec.ModelDrafter`:
+greedy rollout on its own stepper + KV cache, re-synced to the accepted
+prefix by truncate + prefill after rejections; drafter failure degrades to
+vanilla decode). Enablers: `qwen3.Config` (runtime dims + tensor-name
+prefix, auto-detected from the checkpoint — Qwen3-0.6B loads alongside the
+VL 4B), cfg-aware CpuModel/CudaLM, and a bf16 linear path in CudaLM
+(gemv_bf16/bf16n; the 0.6B ships bf16, no fp8 scales). Vulkan stepper is
+still 4B-only (guards with error.UnsupportedModelConfig).
+
+Measured (3090, zig-cuda, greedy, Qwen3-0.6B-*base* drafting for the 4B —
+instruct scored no better): acceptance 45% (novel prose) / 79–86% (listing)
+/ 94% (exact repetition); k=3 is the sweet spot. Net: listing 69 → 79 tok/s
+(1.15x, beats n-gram's 73); prose 61 → 54 (0.9x); repetition 54 → 57 (worse
+than free n-gram drafting there). The economics: a 0.6B draft step costs
+4.9 ms (202 tok/s standalone) vs the target's 14.5 ms — both are
+DISPATCH-BOUND (~700 launches/step), so the small model only gets 3x
+cheaper, not the ~7x its size suggests. Break-even needs ~2.4 accepted
+tokens/round at k=3. **Next lever is draft-step latency, not acceptance:**
+CUDA graphs (capture the decode step, replay per token) would take the
+draft to ~1.5 ms and make prose ~1.4x. Choose the drafter per workload
+until then: `--spec-k` alone (n-gram, free) for repetitive/grounded text,
+`--draft-model` for everything else.
+
+### M6 — CUDA graphs for decode (landed 2026-07-09)
+
+Single-token decode (seq == 1, zig-cuda + cuda) is captured once as a CUDA
+graph and replayed per token: one 8-byte state upload + one cuGraphLaunch
+instead of ~700–950 kernel launches. Full device-side indirection makes the
+graph static: `g_state` (a module global shared by graph-mode kernel
+variants in `elt.decode_state_ptx`) holds {token, pos0}; `embed_gather_s`
+replaces the CPU embedding gather + upload, `rope_half_s` / `kv_append_s` /
+`attn_split_s` read pos0 from state (per-thread math and order identical to
+their param twins — logits stay bitwise equal, greedy output byte-identical).
+The first decode step runs normally to warm weight residency + JIT (uploads
+during capture would fail); capture failure falls back permanently.
+--profile bypasses graphs (event timers cannot be captured).
+
+Measured: 4B 69 → 70.7 tok/s (it was already GPU-memory-bound — the CPU
+queues 950 async launches faster than the GPU drains them); 0.6B 202 → 219
+(kernel EXECUTION latency, ~10 µs x 364 serialized kernels, is the floor,
+not launch API overhead — per-layer kernel fusion is the next lever there).
+
+### M7 — EAGLE-3 head drafter (landed 2026-07-09)
+
+`--eagle <head.safetensors>` drafts with a trained one-layer EAGLE-3 head
+(AngelSlim/Qwen3-4B_eagle3, 218M bf16) reading the TARGET's own hidden
+states — the third drafter option alongside `--spec-k` (n-gram) and
+`--draft-model`. Pieces:
+- `CudaLM.enableTaps`: the residual stream entering 3 layers, device-
+  resident for every committed position ([3][capacity][hidden], 126 MB);
+  written by `copy_off` in batched forwards and by state-driven appends
+  inside the decode graph.
+- `models/eagle3.zig`: head loader (fc 3*hidden->hidden fusion, one
+  llama-style layer over concat(normed embed, normed hidden), 32k draft
+  vocab with delta `d2t`), GPU forward reusing the bf16 GEMV + batched
+  flash-decode kernels, and `Eagle3Drafter` — grounds head rows from target
+  features after each verify (re-syncing across rejections like
+  ModelDrafter), then rolls out feeding the head its own hidden states.
+- Tap convention measured empirically: OUTPUTS of layers (2, N/2, N-3) —
+  i.e. taps at [3,19,34] — beat the input-side variants (51% vs 43–46%
+  acceptance on the listing prompt).
+
+Measured (3090, zig-cuda, greedy, byte-identical): listing 69 → **92 tok/s
+(1.34x, k=3, 51% acceptance)** — the best speculative result in the repo;
+prose 22% acceptance ≈ break-even; repetition 43% (n-gram still wins there,
+free). The head was trained on vanilla Qwen3-4B-Instruct and still gets
+37–57% acceptance against the Heretic-abliterated VL fp8 target.
+
+**Matched-target control (vanilla Qwen3-4B bf16 as the target,
+`qwen3_4b_instruct.safetensors`, `/no_think`):** listing acceptance 51% →
+62% (54.6 → 78.5 tok/s, 1.44x), prose 22% → 24%. So the Heretic/VL/fp8
+feature drift costs ~10 points of acceptance on structured text and almost
+nothing on prose — the low prose ceiling is intrinsic to this head + greedy
+chain drafting, not the checkpoint mismatch (consistent with AngelSlim's
+reported 1.8–3.5 accept lengths). A head trained on the actual target would
+recover the ~10 points; bigger prose gains need tree drafting or a
+better-trained head. Note: without `/no_think` the hybrid Qwen3-4B thinks,
+and thinking traces accept like prose (~29%).
+
+Drafter menu (tok/s, zig-cuda greedy; vanilla 69/61/54):
+
+| workload   | n-gram | 0.6B draft | EAGLE-3 |
+|------------|--------|------------|---------|
+| listing    | 73     | 80         | **92**  |
+| prose      | 60     | 55         | 56      |
+| repetition | **76** | 57         | 49      |
+
+### M8 — tree drafting (landed 2026-07-09)
+
+Shipped behind `--tree <nodes>` (requires `--eagle` + `--greedy`): the
+drafter proposes a branching token tree (Eagle3Drafter.proposeTree:
+level-synchronous beam, top-2 per node, beam 2, cumulative-logprob
+ranking), one `stepAllTree` forward verifies every node (depth-based rope
+via `rope_half_pos`, prefix + ancestor-chain attention via
+`attn_split_tree` with decode-identical chunking, batch K/V retained at
+cache rows [capacity, capacity+64)), a greedy walk keeps the deepest
+matching root path, and `commitTreePath` copies the accepted rows (and
+EAGLE tap rows) into the linear cache. Chain and tree coexist; dispatch is
+`opts.tree_nodes > 0` + `@hasDecl` gates, v1 greedy-only as planned. The
+CPU stepper implements the same interface (`ops.attentionTree`,
+`CausalLM.forwardTree`) as the reference; toy acceptance-walk tests plus
+gated CPU/CUDA/EAGLE real-model tests all verify byte-identical output vs
+vanilla greedy (also spot-checked at 200 tokens on both targets).
+
+**Measured (3090, zig-cuda, greedy, listing prompt, 200 tok):** trees WIN
+their verify-cost class but LOSE the overall race on this rig. Matched
+target (vanilla 4B bf16, /no_think): vanilla 54.7, chain k=3 **67–68.5**
+(2.17 tok/verify), tree-7 44.9 (2.30 tok/verify — beats chain k=4's 2.17
+at the same 2-pass verify cost), tree-15 25. VL fp8 target: chain k=3
+70.2, tree-16 26, tree-31 13. The economics: grouped-GEMV verify costs one
+FULL weight pass per 4 rows at ~220 GB/s effective (bf16 8 GB, fp8
+3.6 GB), and beyond 17 rows the fp8 GEMM path's ~5x dequant traffic is
+worse still — while this head's acceptance concentrates in its top-1
+(39% chain acceptance; extra branches add only ~+0.1–0.3 tok/verify per
+verify-cost doubling). Chain k=3 fills exactly one 4-row pass and stays
+the global optimum.
+
+Levers that would flip the sign (in order): (1) a faster multi-input GEMV
+— 8/16 inputs per weight read instead of 4 would halve/quarter the
+marginal node cost and is now the single binding constraint (gemv_fp8n/
+bf16n sit at ~220 GB/s); (2) a head trained on the actual target with
+calibrated top-2/3 mass (SpecForge), which is what the paper's 3–6.5x
+tree numbers assume; (3) hardware where a 16–64-row verify is
+compute-bound and ~free. The machinery is correct, lossless, and waiting.
+
+Design notes below kept as-written (all implemented, one deviation:
+`proposeTree` takes an explicit `max_depth` cap, and per-query kv row
+indirection replaced the "extra partial + merge nsplit+1" scheme so tree
+logits stay bitwise-identical to decode):
+
+Chain drafting caps the win: a k-deep chain dies at its first wrong token
+(~2.9 tokens/verify at 62% acceptance), which is why we sit at 1.3–1.4x
+while the EAGLE-3 paper reports 3–6.5x — their numbers are TREE drafting
+(~a few dozen draft nodes as a branching tree, one verify forward with a
+tree-attention mask, keep the best accepted path; also bigger targets and
+slower baselines, so don't expect the full multiplier here). Trees stay
+OPTIONAL: chain (`propose`) and tree (`proposeTree`) coexist, chosen by
+what the drafter implements and a CLI flag.
+
+Design (worked out 2026-07-09, from the M5–M7 machinery):
+
+- **Drafter interface**: optional `proposeTree(ids, tokens: []u32,
+  parents: []u32) usize` — node i's token + parent index (parent < i,
+  root's parent = itself/sentinel; root continues `pending`). Budget ~16–64
+  nodes, depth ~6–8. spec.generate dispatches on `@hasDecl` like the
+  engine's stepAll gate. Eagle3Drafter expands top-N children per node
+  ranked by cumulative draft probability (needs head logits top-N, not just
+  argmax — trivial, logits are already on host). ModelDrafter can emit
+  trees too (top-N per step) — same interface, so the 0.6B path benefits.
+- **Verify forward** (`stepAllTree`): all nodes in one batch. Three chain
+  assumptions break:
+  1. *Rope positions* are depth-based (prefix_len + depth(node)), not
+     row-sequential — needs a rope variant taking a per-row position
+     buffer (upload a small u32 array per verify).
+  2. *Attention* = full committed prefix (dense, same for every node) +
+     the node's ANCESTOR CHAIN inside the batch (sparse, <= depth rows).
+     Reuse the flash-decode split/merge: attn_split's scratch rows are
+     unnormalized partials (m, d, pad, pad, acc[hd]) at stride hd+4,
+     laid out [node][head][split] — add ONE extra partial per (node, head)
+     computed by a new small kernel over the node's ancestor list (batch
+     K/V + ancestor index buffer), then run attn_merge with nsplit+1.
+     attn_merge needs no other change.
+  3. *KV cache*: in-batch nodes CANNOT append to the linear cache (sibling
+     branches collide at the same position). Retain per-layer batch K/V in
+     dedicated buffers ([n_layers][max_nodes][kv_dim] f32 — ~19 MB for 64
+     nodes) and, after acceptance, copy the ACCEPTED PATH's rows per layer
+     into the cache (copy_off per layer per accepted node; 36*depth
+     dispatches, fine) instead of truncate-past-rejection.
+- **Acceptance** (greedy first): walk from the root; at each node compare
+  the target argmax of that node's logits row against its children's
+  tokens; descend on match, else stop and emit the target token
+  (correction). Emitted = accepted path + 1. Byte-identical to vanilla
+  greedy by the same argument as chains. Temperature > 0 needs recursive
+  multi-child rejection sampling (SpecInfer/EAGLE-style residual updates
+  per rejected child) — v1 ships greedy-only trees and falls back to chain
+  drafting when temperature > 0.
+- **EAGLE head tree expansion**: the head's own K/V for tree nodes follows
+  the same ancestor-mask problem at 1 layer — small enough to just
+  re-forward each path prefix, or reuse the same extra-partial trick.
+  Grounding/re-sync machinery (Eagle3Drafter.grounded) is unchanged: only
+  the accepted path ever becomes grounded rows.
+- **CPU backend**: ops.attention needs an ancestor-mask variant (or
+  per-node scalar loops — seq is tiny); worth doing for the toy-model
+  tests: a ToyModel with tree verify validates acceptance-walk + cache
+  path-append against rule rollouts exactly like the chain tests in
+  llm/spec.zig.
+
+Key code entry points: `llm/spec.zig` (generate loop, drafters, toy
+tests), `models/eagle3.zig` (head forward + drafter), `models/qwen3_cuda.zig`
+(stepAll/layersForward/linear dispatch, taps, decode graph),
+`gpu/cuda/elt.zig` (attn_split/attn_merge partial format, kv_append_s,
+copy_off), `gpu/cuda/backend.zig` (opAttnDecode, graph capture). Baselines
+to beat (3090, zig-cuda, greedy): chain EAGLE 92 tok/s listing / 56 prose
+on the VL target (69/61 vanilla); 78.5/— on vanilla Qwen3-4B bf16 (54.6
+vanilla, `/no_think`). Estimate with the AngelSlim head: ~2–2.5x
+structured, ~1.5x prose; a SpecForge-trained head on the actual target
+would add ~10 pts acceptance on top.
+
 ### Later / non-goals for now
 - Other architectures (Llama, Gemma) — config struct is the extension point;
   first new arch import will force weight-name mapping tables.
 - GGUF import — safetensors-only keeps loading consistent; revisit if a wanted
   model only ships as GGUF.
-- Batched serving, speculative decoding, paged KV — research toys after M4.
+- Batched serving, paged KV — research toys.
 - `--backend cuda` (cuBLASLt/cuDNN) LLM path — optional; the pure backends are
   the point. Revisit only to measure a gap, as with diffusion (M10 Phase 2).
 

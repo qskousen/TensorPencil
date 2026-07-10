@@ -17,6 +17,7 @@ const qwen3 = @import("qwen3.zig");
 const gpu = @import("../gpu/context.zig");
 const safetensors = @import("../safetensors.zig");
 const ops = @import("../ops.zig");
+const spec = @import("../llm/spec.zig");
 
 const hidden = qwen3.hidden;
 const n_heads = qwen3.n_heads;
@@ -296,19 +297,28 @@ pub const VulkanLM = struct {
     const chunk_rows = qwen3.vocab_size / vocab_chunks;
     /// KV chunks per head in the decode attention split pass.
     const nsplit = 128;
+    /// Largest batch that runs the small-batch path (4-input grouped GEMVs +
+    /// batched flash-decoding): every speculative verify batch, and the
+    /// chunk size for follow-up (pos0 > 0) prefills — which previously went
+    /// token-by-token because the square attention kernel is pos0=0-only.
+    const gemv_batch_max = spec.max_draft + 1;
     /// Interleaved chunks per row in the 3-pass rmsnorm.
     const rms_chunks = 64;
     /// Interleaved k chunks per output column in the decode GEMV.
     const gemv_nchunk = 32;
 
     pub fn init(gpa: std.mem.Allocator, ctx: *gpu.Context, lm: *const qwen3.CausalLM, capacity: usize, first_seq: usize) !VulkanLM {
+        // This stepper is still hardwired to the 4B dims (module constants);
+        // the 0.6B draft model runs on the CPU/CUDA steppers only for now.
+        if (lm.cfg.n_layers != n_layers or lm.cfg.hidden != hidden) return error.UnsupportedModelConfig;
         var self: VulkanLM = undefined;
         self.lm = lm;
         self.ctx = ctx;
         self.gpa = gpa;
         self.capacity = capacity;
         self.len = 0;
-        self.max_rows = @max(first_seq, 1);
+        // Activation buffers always cover a speculative verify batch.
+        self.max_rows = @max(@max(first_seq, 1), gemv_batch_max);
         self.sin_off = @intCast(capacity * half);
 
         self.embed_f32 = try gpa.alloc(f32, qwen3.vocab_size * hidden);
@@ -360,22 +370,100 @@ pub const VulkanLM = struct {
     }
 
     /// Forward `ids` at positions [len, len+ids.len), then write
-    /// last-position vocab logits. The square attention path only handles a
-    /// fresh cache (attn_scores is seq x seq from position 0), so multi-turn
-    /// follow-up prefills run token-by-token through the flash-decoding path;
-    /// a fresh-cache prompt longer than the activation buffers chunks by
-    /// max_rows (first chunk square, the rest single-token).
+    /// last-position vocab logits. A fresh-cache prompt chunks by max_rows
+    /// through the square-attention GEMM path; follow-up (pos0 > 0) prefills
+    /// chunk by gemv_batch_max through the batched flash-decoding path.
     pub fn step(self: *VulkanLM, io: std.Io, ids: []const u32, logits: []f32) !void {
         var off: usize = 0;
         while (off < ids.len) {
-            const n = if (self.len == 0) @min(self.max_rows, ids.len) else 1;
+            const n = if (self.len == 0)
+                @min(self.max_rows, ids.len - off)
+            else
+                @min(gemv_batch_max, ids.len - off);
             try self.stepChunk(io, ids[off..][0..n], logits);
             off += n;
         }
     }
 
+    /// step, but with vocab logits for every new token ([ids.len, vocab]
+    /// row-major) — the speculative-decode verify forward. The batch is
+    /// engine-capped at spec.max_draft + 1.
+    pub fn stepAll(self: *VulkanLM, io: std.Io, ids: []const u32, logits: []f32) !void {
+        _ = io;
+        const ctx = self.ctx;
+        const seq = ids.len;
+        std.debug.assert(logits.len == seq * qwen3.vocab_size);
+        std.debug.assert(seq > 0 and seq <= gemv_batch_max);
+        const b = &self.bufs;
+
+        try self.layersForward(ids);
+        errdefer if (ctx.batching) ctx.abortBatch();
+
+        // Final norm on every new position, then the LM head as 4 vocab
+        // chunks x 4-input groups (each weight chunk read once per group).
+        try self.normWide(b.x, b.normed, try nbuf(ctx, self.lm.final_norm), seq);
+        var g: usize = 0;
+        while (g * 4 < seq) : (g += 1) {
+            const n: usize = @min(4, seq - g * 4);
+            ctx.independent(vocab_chunks);
+            for (0..vocab_chunks) |ci| {
+                const w = self.embed_f32[ci * chunk_rows * hidden ..][0 .. chunk_rows * hidden];
+                try ctx.opGemvPartial4(b.normed, g * 4 * hidden, b.gemv_partials[ci], std.mem.sliceAsBytes(w), false, chunk_rows, hidden, gemv_nchunk);
+            }
+            ctx.independent(vocab_chunks);
+            for (0..vocab_chunks) |ci| {
+                try ctx.opGemvCombine4(b.logits, g * 4 * qwen3.vocab_size + ci * chunk_rows, qwen3.vocab_size, b.gemv_partials[ci], chunk_rows, 1.0, gemv_nchunk, n);
+            }
+        }
+        try ctx.endBatch();
+        self.len += seq;
+
+        try ctx.tensorDownload(b.logits, std.mem.sliceAsBytes(logits));
+    }
+
+    /// Roll the KV cache back to `new_len` tokens (speculative-decode
+    /// rejection); device rows past `new_len` are overwritten by later steps.
+    pub fn truncate(self: *VulkanLM, new_len: usize) void {
+        std.debug.assert(new_len <= self.len);
+        self.len = new_len;
+    }
+
     fn stepChunk(self: *VulkanLM, io: std.Io, ids: []const u32, logits: []f32) !void {
         _ = io;
+        const ctx = self.ctx;
+        const seq = ids.len;
+        const b = &self.bufs;
+
+        try self.layersForward(ids);
+        errdefer if (ctx.batching) ctx.abortBatch();
+
+        // Final norm on the last position + LM head (4 vocab chunks).
+        try ctx.opElt(.copy, b.x, b.t, null, null, .{
+            .u0 = hidden,
+            .u2 = 0,
+            .u3 = @intCast((seq - 1) * hidden),
+        }, hidden, 1, 1);
+        try self.normWide(b.t, b.normed, try nbuf(ctx, self.lm.final_norm), 1);
+        ctx.independent(vocab_chunks);
+        for (0..vocab_chunks) |ci| {
+            const w = self.embed_f32[ci * chunk_rows * hidden ..][0 .. chunk_rows * hidden];
+            try ctx.opGemvPartial(b.normed, b.gemv_partials[ci], std.mem.sliceAsBytes(w), false, chunk_rows, hidden, gemv_nchunk);
+        }
+        ctx.independent(vocab_chunks);
+        for (0..vocab_chunks) |ci| {
+            try ctx.opGemvCombine(b.logits, ci * chunk_rows, b.gemv_partials[ci], chunk_rows, 1.0, gemv_nchunk);
+        }
+        try ctx.endBatch();
+        self.len += seq;
+
+        try ctx.tensorDownload(b.logits, std.mem.sliceAsBytes(logits[0..qwen3.vocab_size]));
+    }
+
+    /// The 36-layer stack over `ids` at positions [len, len+seq): embedding
+    /// upload, then the whole transformer inside an open batch. The caller
+    /// finishes the batch (LM head variants differ) — on success the batch
+    /// is still open, with the final hidden states in bufs.x.
+    fn layersForward(self: *VulkanLM, ids: []const u32) !void {
         const gpa = self.gpa;
         const ctx = self.ctx;
         const seq = ids.len;
@@ -443,21 +531,25 @@ pub const VulkanLM = struct {
                 .u2 = @intCast(pos0 * kv_dim),
             }, seq * kv_dim, 1, 1);
 
-            if (seq == 1) {
-                // Flash-decoding split/merge against the cached prefix.
+            if (seq <= gemv_batch_max) {
+                // Batched flash-decoding split/merge against the cached
+                // prefix: query t sees pos0 + 1 + t keys (causal), so this
+                // covers decode (seq == 1), speculative verify, and
+                // follow-up prefill chunks at any pos0.
                 try ctx.opElt(.attn_dsplit, b.q, self.k_cache[l], self.v_cache[l], b.attn_scratch, .{
                     .u0 = @intCast(pos0 + 1),
                     .u1 = n_heads,
                     .u2 = kv_heads,
                     .u3 = hd,
                     .u4 = nsplit,
+                    .u5 = @intCast(seq),
                     .f0 = attn_scale,
-                }, n_heads * nsplit, 1, 1);
+                }, seq * n_heads * nsplit, 1, 1);
                 try ctx.opElt(.attn_dmerge, b.attn_scratch, null, null, b.attn, .{
-                    .u0 = n_heads,
+                    .u0 = @intCast(seq * n_heads),
                     .u1 = hd,
                     .u2 = nsplit,
-                }, n_heads * hd, 1, 1);
+                }, seq * n_heads * hd, 1, 1);
             } else {
                 // Square causal attention (prefill starts from an empty cache).
                 std.debug.assert(pos0 == 0);
@@ -513,35 +605,25 @@ pub const VulkanLM = struct {
             try self.gemm(b.t, b.gate, seq, layer.down, hidden, intermediate);
             try ctx.opElt(.add, b.x, b.t, null, null, .{ .u0 = @intCast(seq * hidden) }, seq * hidden, 1, 1);
         }
-
-        // Final norm on the last position + LM head (4 vocab chunks).
-        try ctx.opElt(.copy, b.x, b.t, null, null, .{
-            .u0 = hidden,
-            .u2 = 0,
-            .u3 = @intCast((seq - 1) * hidden),
-        }, hidden, 1, 1);
-        try self.normWide(b.t, b.normed, try nbuf(ctx, self.lm.final_norm), 1);
-        ctx.independent(vocab_chunks);
-        for (0..vocab_chunks) |ci| {
-            const w = self.embed_f32[ci * chunk_rows * hidden ..][0 .. chunk_rows * hidden];
-            try ctx.opGemvPartial(b.normed, b.gemv_partials[ci], std.mem.sliceAsBytes(w), false, chunk_rows, hidden, gemv_nchunk);
-        }
-        ctx.independent(vocab_chunks);
-        for (0..vocab_chunks) |ci| {
-            try ctx.opGemvCombine(b.logits, ci * chunk_rows, b.gemv_partials[ci], chunk_rows, 1.0, gemv_nchunk);
-        }
-        try ctx.endBatch();
-        self.len += seq;
-
-        try ctx.tensorDownload(b.logits, std.mem.sliceAsBytes(logits[0..qwen3.vocab_size]));
     }
 
-    /// GEMM for prefill (tiled kernel), k-split GEMV for decode (m = 1).
+    /// Dense linear over `m` rows, kernel picked by batch size: k-split GEMV
+    /// (m = 1), grouped 4-input GEMVs (small batches — speculative verify
+    /// and follow-up prefill chunks; bitwise equal to the m = 1 path), or
+    /// the tiled GEMM (large fresh prefills).
     fn gemm(self: *VulkanLM, y: Buf, x: Buf, m: usize, w: ops.matmul.Weight, rows: usize, cols: usize) !void {
+        const ctx = self.ctx;
         if (m == 1) {
-            try self.ctx.opGemv(y, 0, x, self.bufs.gemv_partials[0], w.bytes, w.dtype == .f8_e4m3, rows, cols, w.scale, gemv_nchunk);
+            try ctx.opGemv(y, 0, x, self.bufs.gemv_partials[0], w.bytes, w.dtype == .f8_e4m3, rows, cols, w.scale, gemv_nchunk);
+        } else if (m <= gemv_batch_max) {
+            var g: usize = 0;
+            while (g * 4 < m) : (g += 1) {
+                const n: usize = @min(4, m - g * 4);
+                try ctx.opGemvPartial4(x, g * 4 * cols, self.bufs.gemv_partials[0], w.bytes, w.dtype == .f8_e4m3, rows, cols, gemv_nchunk);
+                try ctx.opGemvCombine4(y, g * 4 * rows, rows, self.bufs.gemv_partials[0], rows, w.scale, gemv_nchunk, n);
+            }
         } else {
-            try self.ctx.opMatmul(y, 0, x, 0, m, w.bytes, w.dtype == .f8_e4m3, rows, cols, w.scale, null);
+            try ctx.opMatmul(y, 0, x, 0, m, w.bytes, w.dtype == .f8_e4m3, rows, cols, w.scale, null);
         }
     }
 
@@ -592,34 +674,36 @@ const LmBufs = struct {
         errdefer inline for (fields, 0..) |name, i| {
             if (i < created) ctx.tensorDestroy(&@field(self, name));
         };
+        const r4 = std.mem.alignForward(usize, rows, 4); // grouped-GEMV inputs are read 4 rows at a time
         const sizes = [fields.len]usize{
             rows * hidden * 4, // x
-            rows * hidden * 4, // normed
+            r4 * hidden * 4, // normed
             rows * q_dim * 4, // q
             rows * kv_dim * 4, // k
             rows * kv_dim * 4, // v
             rows * q_dim * 4, // qt (prefill k-major)
             rows * kv_dim * 4, // kt
             n_heads * rows * rows * 4, // s (prefill scores)
-            rows * q_dim * 4, // attn
-            rows * intermediate * 4, // gate
+            r4 * q_dim * 4, // attn
+            r4 * intermediate * 4, // gate
             rows * intermediate * 4, // up
             rows * hidden * 4, // t (o/down GEMM out; also last-row scratch)
-            n_heads * VulkanLM.nsplit * (hd + 2) * 4, // attn_scratch
+            VulkanLM.gemv_batch_max * n_heads * VulkanLM.nsplit * (hd + 2) * 4, // attn_scratch (a row per verify query)
             rows * VulkanLM.rms_chunks * 4, // rms_partials
             rows * 4, // rms_inv
-            qwen3.vocab_size * 4, // logits
+            VulkanLM.gemv_batch_max * qwen3.vocab_size * 4, // logits (verify writes a row per position)
         };
         inline for (fields, sizes) |name, size| {
             @field(self, name) = try ctx.tensorCreate(size);
             created += 1;
         }
         // GEMV k-split partials: one per member of an `independent` group
-        // (q/k/v, gate/up, the 4 LM-head chunks). Sized for the largest user.
+        // (q/k/v, gate/up, the 4 LM-head chunks). Sized for the largest
+        // user, times 4 for the 4-input verify variant.
         var pcreated: usize = 0;
         errdefer for (self.gemv_partials[0..pcreated]) |*pb| ctx.tensorDestroy(pb);
         for (&self.gemv_partials) |*pb| {
-            pb.* = try ctx.tensorCreate(VulkanLM.chunk_rows * VulkanLM.gemv_nchunk * 4);
+            pb.* = try ctx.tensorCreate(4 * VulkanLM.chunk_rows * VulkanLM.gemv_nchunk * 4);
             pcreated += 1;
         }
         return self;
@@ -678,4 +762,52 @@ test "gpu encode matches cpu encode" {
         std.debug.print("qwen gpu parity (f16={}): max_err={d:.5} max_val={d:.2}\n", .{ cfg[0], max_err, max_val });
         try std.testing.expect(max_err < cfg[1] * @max(1.0, max_val));
     }
+}
+
+// Speculative decoding on the Vulkan stepper must be byte-identical to
+// vanilla greedy: the grouped 4-input GEMVs and the batched flash-decoding
+// attention reproduce the decode path's summation orders bitwise. Gated on
+// the model + GPU marker; kept tiny (each token is a full 36-layer forward).
+test "vulkan spec decode matches vanilla greedy" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const tokenizer_mod = @import("../tokenizer.zig");
+    const chat = @import("../llm/chat.zig");
+    const engine = @import("../llm/engine.zig");
+    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
+
+    var ctx = gpu.Context.init(gpa) catch return error.SkipZigTest;
+    defer ctx.deinit();
+
+    var st = try safetensors.SafeTensors.open(gpa, io, te_path);
+    defer st.deinit();
+    var lm = try qwen3.CausalLM.load(gpa, &st);
+    defer lm.deinit();
+    var tok = try tokenizer_mod.Tokenizer.init(gpa);
+    defer tok.deinit();
+
+    var opts: engine.Options = .{ .max_new_tokens = 3, .sampling = .{ .temperature = 0 } };
+
+    var ids_vanilla: std.ArrayList(u32) = .empty;
+    defer ids_vanilla.deinit(gpa);
+    try chat.appendUser(&tok, gpa, "Count: one two three one two", &ids_vanilla);
+    try chat.openAssistant(&tok, gpa, &ids_vanilla);
+    var ids_spec: std.ArrayList(u32) = .empty;
+    defer ids_spec.deinit(gpa);
+    try ids_spec.appendSlice(gpa, ids_vanilla.items);
+
+    {
+        var model = try VulkanLM.init(gpa, ctx, &lm, try engine.capacityFor(opts, ids_vanilla.items.len), ids_vanilla.items.len);
+        defer model.deinit();
+        _ = try engine.generate(&model, &tok, io, gpa, &ids_vanilla, opts, null);
+    }
+    {
+        opts.spec_k = 2;
+        var model = try VulkanLM.init(gpa, ctx, &lm, try engine.capacityFor(opts, ids_spec.items.len), ids_spec.items.len);
+        defer model.deinit();
+        _ = try engine.generate(&model, &tok, io, gpa, &ids_spec, opts, null);
+    }
+    try std.testing.expectEqualSlices(u32, ids_vanilla.items, ids_spec.items);
 }

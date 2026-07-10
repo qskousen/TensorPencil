@@ -288,6 +288,81 @@ export fn gemv_combine() callconv(.spirv_kernel) void {
     d.data[pc.u2 + col] = sum * pc.f0;
 }
 
+// gemv_partial4: gemv_partial for FOUR input vectors at once (speculative-
+//   decode verify): one thread per (chunk, 8-column group) computes 32 dots,
+//   reading each weight word once for all four inputs and each x value once
+//   for eight columns. Per-(column, input) k order is identical to
+//   gemv_partial (k = ch, stride nchunk), so results are bitwise equal to
+//   four single-input GEMVs — greedy speculative decode stays byte-identical
+//   to vanilla. x must have 4 rows of backing store past the offset (garbage
+//   rows beyond the live count are discarded by gemv_combine4's n). rows
+//   must be a multiple of 8. a = W (k-major), b = x, d = partials
+//   [ch][4][rows]. u0 = (rows/8)*nchunk, u1 = cols, u2 = nchunk,
+//   u3 = w_stride, u4 = is_f8, u5 = rows, f1 = x element offset (bitcast u32
+//   — the input-group base for seq > 4 verifies).
+export fn gemv_partial4() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const rows = pc.u5;
+    const cols = pc.u1;
+    const x0: u32 = @bitCast(pc.f1);
+    const groups = rows / 8;
+    const ch = idx / groups;
+    const col0 = (idx % groups) * 8;
+    var sums: [4][8]f32 = @splat(@splat(0.0));
+    var k: u32 = ch;
+    if (pc.u4 != 0) {
+        while (k < cols) : (k += pc.u2) {
+            const base = (k * pc.u3 + col0) / 4;
+            const w0: u32 = @bitCast(a.data[base]);
+            const w1: u32 = @bitCast(a.data[base + 1]);
+            inline for (0..4) |i| {
+                const xv = b.data[x0 + i * cols + k];
+                inline for (0..4) |j| {
+                    sums[i][j] += e4m3ToF32((w0 >> (8 * j)) & 0xFF) * xv;
+                    sums[i][4 + j] += e4m3ToF32((w1 >> (8 * j)) & 0xFF) * xv;
+                }
+            }
+        }
+    } else {
+        while (k < cols) : (k += pc.u2) {
+            const base = k * pc.u3 + col0;
+            inline for (0..4) |i| {
+                const xv = b.data[x0 + i * cols + k];
+                inline for (0..8) |j| {
+                    sums[i][j] += a.data[base + j] * xv;
+                }
+            }
+        }
+    }
+    inline for (0..4) |i| {
+        const out = (ch * 4 + i) * rows + col0;
+        inline for (0..8) |j| {
+            d.data[out + j] = sums[i][j];
+        }
+    }
+}
+
+// gemv_combine4: y[u2 + i*u3 + col] = scale * sum_ch partials[ch][i][col]
+//   for the n live inputs — the reduce half of gemv_partial4. Same ascending
+//   chunk order as gemv_combine (bitwise equal). a = partials [ch][4][rows],
+//   d = y. u0 = rows, u1 = nchunk, u2 = dest element offset, u3 = dest row
+//   stride (elements between consecutive inputs' outputs), u4 = n (1..4),
+//   f0 = scale. Dispatch n * rows threads.
+export fn gemv_combine4() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    const rows = pc.u0;
+    if (idx >= pc.u4 * rows) return;
+    const i = idx / rows;
+    const col = idx % rows;
+    var sum: f32 = 0;
+    var ch: u32 = 0;
+    while (ch < pc.u1) : (ch += 1) sum += a.data[(ch * 4 + i) * rows + col];
+    d.data[pc.u2 + i * pc.u3 + col] = sum * pc.f0;
+}
+
 // e4m3 -> f32, branchless (same as common.zig's; duplicated so this module
 // stays free of common's buffer bindings).
 inline fn e4m3ToF32(byte: u32) f32 {
@@ -300,26 +375,34 @@ inline fn e4m3ToF32(byte: u32) f32 {
     return if (magnitude >= 8) normal else subnormal;
 }
 
-// --- flash-decoding attention (single query vs. the KV cache) ------------
-// attn_dsplit: pass 1 — one thread per (head, kv chunk): online softmax over
-//   the chunk, unnormalized partial (m, d, acc[hd]) to scratch at
-//   [(h*nsplit+i)*(hd+2)]. Empty chunks write (m=-3e38, d=0, acc=0), which
-//   the merge weights to zero. a = q [heads][hd], b = k [seq_kv][kv_dim],
-//   c = v, d = scratch. u0=seq_kv, u1=heads, u2=kv_heads, u3=hd(<=128),
-//   u4=nsplit, f0=scale.
+// --- flash-decoding attention (queries vs. the KV cache) ------------------
+// attn_dsplit: pass 1 — one thread per (query, head, kv chunk): online
+//   softmax over the chunk, unnormalized partial (m, d, acc[hd]) to scratch
+//   at [idx*(hd+2)] ([t][h][i] order — attn_dmerge runs with heads' =
+//   seq_q*heads). Queries are consecutive causal positions: query t sees
+//   kv_len0 + t keys, so seq_q == 1 is plain decode and seq_q > 1 the
+//   speculative-verify batch / multi-turn prefill chunk. Empty chunks write
+//   (m=-3e38, d=0, acc=0), which the merge weights to zero.
+//   a = q [seq_q][heads][hd], b = k [seq_kv][kv_dim], c = v, d = scratch.
+//   u0=kv_len0, u1=heads, u2=kv_heads, u3=hd(<=128), u4=nsplit,
+//   u5=seq_q (0 = 1), f0=scale.
 export fn attn_dsplit() callconv(.spirv_kernel) void {
     decorate();
     const idx = gpu.global_invocation_id[0];
     const nsplit = pc.u4;
-    if (idx >= pc.u1 * nsplit) return;
+    const seq_q = @max(pc.u5, 1);
+    if (idx >= seq_q * pc.u1 * nsplit) return;
     const hd = pc.u3;
-    const h = idx / nsplit;
+    const per_q = pc.u1 * nsplit;
+    const tq = idx / per_q;
+    const h = (idx % per_q) / nsplit;
     const i = idx % nsplit;
-    const chunk = (pc.u0 + nsplit - 1) / nsplit;
+    const kv_len = pc.u0 + tq; // causal: query tq's visible keys
+    const chunk = (kv_len + nsplit - 1) / nsplit;
     const kv0 = i * chunk;
-    const kv1 = @min(kv0 + chunk, pc.u0);
+    const kv1 = @min(kv0 + chunk, kv_len);
     const kvh = h / (pc.u1 / pc.u2);
-    const qbase = h * hd;
+    const qbase = (tq * pc.u1 + h) * hd;
 
     var acc: [128]f32 = @splat(0.0); // type-level max; loops bound by hd
     var m: f32 = -3.0e38;
