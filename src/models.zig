@@ -1,6 +1,8 @@
 //! Model implementations (text encoder, DiT, VAE).
 
 pub const wan_vae = @import("models/wan_vae.zig");
+pub const taehv = @import("models/taehv.zig");
+pub const taehv_cuda = @import("models/taehv_cuda.zig");
 pub const vae_gpu = @import("models/vae_gpu.zig");
 pub const vae_cuda = @import("models/vae_cuda.zig");
 pub const qwen3 = @import("models/qwen3.zig");

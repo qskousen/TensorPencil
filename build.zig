@@ -192,6 +192,57 @@ pub fn build(b: *std.Build) void {
     }
     run_llm_step.dependOn(&run_llm_cmd.step);
 
+    // tp-gui: desktop GUI (dvui + SDL3) — a conversational image studio that
+    // drives the same TensorPencil library (LLM chat + diffusion). GUI deps
+    // (dvui/SDL3, X11/Wayland) are lazy: only fetched/built when the gui or
+    // run-gui step is actually requested, so `zig build test` stays lean and
+    // dependency-free. Mirrors DiffKeep's proven dvui-0.5.0-dev wiring.
+    const gui_step = b.step("gui", "Build tp-gui (desktop GUI)");
+    const run_gui_step = b.step("run-gui", "Run tp-gui");
+    if (b.lazyDependency("dvui", .{
+        .target = target,
+        .optimize = optimize,
+        .backend = .sdl3,
+    })) |dvui_dep| {
+        if (b.lazyDependency("known_folders", .{})) |kf| {
+            const gui_exe = b.addExecutable(.{
+                .name = "tp-gui",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/gui_main.zig"),
+                    .link_libc = true,
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "TensorPencil", .module = mod },
+                        .{ .name = "dvui", .module = dvui_dep.module("dvui_sdl3") },
+                        .{ .name = "backend", .module = dvui_dep.module("sdl3") },
+                        // Reuse the same libvips decode shim as tp-llm (jpeg/webp/
+                        // etc. for dropped / @mentioned images).
+                        .{ .name = "vips", .module = vips_module },
+                        // Platform config-dir resolution for the settings file.
+                        .{ .name = "known-folders", .module = kf.module("known-folders") },
+                    },
+                }),
+            });
+            // SDL3 backend windowing system libraries (per DiffKeep's build.zig).
+            if (target.result.os.tag == .linux) {
+                gui_exe.root_module.linkSystemLibrary("X11", .{});
+                gui_exe.root_module.linkSystemLibrary("Xcursor", .{});
+                gui_exe.root_module.linkSystemLibrary("Xi", .{});
+                gui_exe.root_module.linkSystemLibrary("wayland-client", .{});
+            }
+            // Install only via the `gui` / `run-gui` steps, never the default
+            // step, so `zig build` / `zig build test` stay free of the GUI deps.
+            const install_gui = b.addInstallArtifact(gui_exe, .{});
+            gui_step.dependOn(&install_gui.step);
+
+            const run_gui_cmd = b.addRunArtifact(gui_exe);
+            run_gui_cmd.step.dependOn(&install_gui.step);
+            if (b.args) |args| run_gui_cmd.addArgs(args);
+            run_gui_step.dependOn(&run_gui_cmd.step);
+        }
+    }
+
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
     // set the releative field.

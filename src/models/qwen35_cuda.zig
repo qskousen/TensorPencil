@@ -732,6 +732,8 @@ pub const CudaLM = struct {
             try be.opGemvQuant(w.dtype, y, x, w.bytes, w.scale, w.rows, w.cols);
         } else if (w.dtype == .bf16) {
             try be.opGemvBf16(y, x, w.bytes, w.scale, w.rows, w.cols);
+        } else if (w.dtype == .f16) {
+            try be.opGemvF16(y, x, w.bytes, w.scale, w.rows, w.cols);
         } else {
             return error.UnsupportedDType;
         }

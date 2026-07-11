@@ -28,6 +28,50 @@ pub const spatial_scale = 8;
 pub const latents_mean = [latent_channels]f32{ -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508, 0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921 };
 pub const latents_std = [latent_channels]f32{ 2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743, 3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160 };
 
+/// Linear latent→RGB approximation (WAN 2.1 factors, from ComfyUI's
+/// latent_formats.Wan21). Maps the 16-channel sampler latent to a rough RGB
+/// preview with a per-pixel 16×3 matmul — no VAE needed, cheap enough to run
+/// every sampling step for a live preview.
+pub const latent_rgb_factors = [latent_channels][3]f32{
+    .{ -0.1299, -0.1692, 0.2932 },
+    .{ 0.0671, 0.0406, 0.0442 },
+    .{ 0.3568, 0.2548, 0.1747 },
+    .{ 0.0372, 0.2344, 0.1420 },
+    .{ 0.0313, 0.0189, -0.0328 },
+    .{ 0.0296, -0.0956, -0.0665 },
+    .{ -0.3477, -0.4059, -0.2925 },
+    .{ 0.0166, 0.1902, 0.1975 },
+    .{ -0.0412, 0.0267, -0.1364 },
+    .{ -0.1293, 0.0740, 0.1636 },
+    .{ 0.0680, 0.3019, 0.1128 },
+    .{ 0.0032, 0.0581, 0.0639 },
+    .{ -0.1251, 0.0927, 0.1699 },
+    .{ 0.0060, -0.0633, 0.0005 },
+    .{ 0.3477, 0.2275, 0.2950 },
+    .{ 0.1984, 0.0913, 0.1861 },
+};
+pub const latent_rgb_bias = [3]f32{ -0.1835, -0.0868, -0.3360 };
+
+/// Fill `rgb_out` ([zh*zw][3] RGB8) with the latent2rgb preview of the planar
+/// [16][zh*zw] normalized sampler latent `z`.
+pub fn latentPreviewInto(rgb_out: []u8, z: []const f32, zh: usize, zw: usize) void {
+    const plane = zh * zw;
+    std.debug.assert(rgb_out.len >= plane * 3 and z.len >= latent_channels * plane);
+    for (0..plane) |p| {
+        var acc = latent_rgb_bias;
+        inline for (0..latent_channels) |c| {
+            const v = z[c * plane + p];
+            acc[0] += v * latent_rgb_factors[c][0];
+            acc[1] += v * latent_rgb_factors[c][1];
+            acc[2] += v * latent_rgb_factors[c][2];
+        }
+        inline for (0..3) |ch| {
+            const u = std.math.clamp((acc[ch] + 1.0) * 0.5, 0.0, 1.0) * 255.0;
+            rgb_out[p * 3 + ch] = @intFromFloat(u);
+        }
+    }
+}
+
 pub const Conv2d = struct {
     /// Repacked [co][kh][kw][ci] to match im2col patch layout.
     w: []const f32,
@@ -271,7 +315,7 @@ fn channelRmsNorm(x: []f32, gamma: []const f32) void {
 
 /// Zero-padded conv over channel-last activations via row-blocked im2col +
 /// the shared GEMM. `out` is [h*w, conv.co]; may not alias `in`.
-fn conv2d(io: std.Io, gpa: std.mem.Allocator, out: []f32, in: []const f32, h: usize, w: usize, conv: Conv2d) !void {
+pub fn conv2d(io: std.Io, gpa: std.mem.Allocator, out: []f32, in: []const f32, h: usize, w: usize, conv: Conv2d) !void {
     const ci = conv.ci;
     std.debug.assert(in.len == h * w * ci);
     std.debug.assert(out.len == h * w * conv.co);
@@ -314,7 +358,7 @@ fn conv2d(io: std.Io, gpa: std.mem.Allocator, out: []f32, in: []const f32, h: us
 }
 
 /// Nearest-exact 2x spatial upsample of channel-last activations.
-fn nearest2x(gpa: std.mem.Allocator, x: []const f32, h: usize, w: usize, c: usize) ![]f32 {
+pub fn nearest2x(gpa: std.mem.Allocator, x: []const f32, h: usize, w: usize, c: usize) ![]f32 {
     const out = try gpa.alloc(f32, 4 * h * w * c);
     for (0..2 * h) |y| {
         for (0..2 * w) |xx| {
@@ -351,11 +395,10 @@ fn loadGamma(alloc: std.mem.Allocator, st: *const SafeTensors, name: []const u8,
 
 /// Load a conv weight (+bias), collapsing a causal temporal axis if present
 /// (last kt slice) and repacking to [co][kh][kw][ci].
-fn loadConv(alloc: std.mem.Allocator, st: *const SafeTensors, prefix: []const u8, ci: usize, co: usize, k: usize) !Conv2d {
+pub fn loadConv(alloc: std.mem.Allocator, st: *const SafeTensors, prefix: []const u8, ci: usize, co: usize, k: usize) !Conv2d {
     const wname = try std.fmt.allocPrint(alloc, "{s}.weight", .{prefix});
     const bname = try std.fmt.allocPrint(alloc, "{s}.bias", .{prefix});
     const wview = st.get(wname) orelse return error.MissingTensor;
-    const bview = st.get(bname) orelse return error.MissingTensor;
 
     const shape = wview.info.shape.slice();
     const kt: usize = switch (shape.len) {
@@ -381,8 +424,16 @@ fn loadConv(alloc: std.mem.Allocator, st: *const SafeTensors, prefix: []const u8
         }
     }
 
-    if (bview.info.elemCount() != co) return error.ShapeMismatch;
-    const bias = try bview.toF32Alloc(alloc);
+    // Bias may be absent (bias=False convs, e.g. TAEHV's TGrow/stage convs) —
+    // synthesize zeros then.
+    const bias = if (st.get(bname)) |bv| blk: {
+        if (bv.info.elemCount() != co) return error.ShapeMismatch;
+        break :blk try bv.toF32Alloc(alloc);
+    } else blk: {
+        const z = try alloc.alloc(f32, co);
+        @memset(z, 0);
+        break :blk z;
+    };
     return .{ .w = packed_w, .b = bias, .co = co, .ci = ci, .k = k };
 }
 

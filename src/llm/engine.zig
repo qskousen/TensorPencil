@@ -36,6 +36,10 @@ pub const Options = struct {
     tree_nodes: usize = 0,
     /// When set, speculative decoding accumulates draft/accept counts here.
     spec_stats: ?*spec.Stats = null,
+    /// Cooperative cancellation: checked before each decode step; when it
+    /// reads true, generation stops and returns the tokens produced so far
+    /// (a clean stop, not an error). Lets a UI interrupt a long reply.
+    cancel: ?*std.atomic.Value(bool) = null,
 };
 
 /// KV-cache capacity ceiling for a given prompt; errors when the prompt
@@ -119,6 +123,7 @@ pub fn generate(
     try model.step(io, new, logits);
     var n: usize = 0;
     while (n < opts.max_new_tokens) {
+        if (opts.cancel) |c| if (c.load(.acquire)) break;
         const next = sampler.next(logits, ids.items);
         if (chat.isStop(next)) break;
         try ids.append(gpa, next);

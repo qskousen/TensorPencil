@@ -399,6 +399,16 @@ pub const Backend = struct {
         return self;
     }
 
+    /// Make this backend's CUDA context current on the calling thread. CUDA
+    /// driver contexts are per-thread state: a thread that issues device work
+    /// (memcpy, launches) must have the context current or the driver returns
+    /// CUDA_ERROR_INVALID_CONTEXT. `init` leaves the context current on the
+    /// creating thread; any other thread that drives the backend (e.g. a UI
+    /// app's generation worker) must call this once before its first device op.
+    pub fn bindThread(self: *Backend) void {
+        _ = self.ctx.api.cuCtxSetCurrent(self.ctx.ctx);
+    }
+
     /// Build a backend in `.libs` mode: the normal driver Context plus dlopen'd
     /// cuBLASLt + cuDNN handles bound to the compute stream. Returns an error
     /// (caller falls back to CPU) if the driver, either library, or a handle is
@@ -1354,23 +1364,29 @@ pub const Backend = struct {
         defer self.ptoc(.matmul);
         const w_db = try self.cachedWeight(w_bytes);
         const mpad = std.mem.alignForward(usize, m, 128);
-        try self.ensureDeviceBuffer(&self.fp8_w16, rows * cols * 2);
         try self.ensureDeviceBuffer(&self.fp8_a16, mpad * cols * 2);
-        const f_deq = switch (dt) {
-            .q8_0 => try self.eltFn(elt.dequant_q8_0_f16_ptx, "dequant_q8_0_f16"),
-            .q4_k => try self.eltFn(elt.dequant_q4_k_f16_ptx, "dequant_q4_k_f16"),
-            .q5_k => try self.eltFn(elt.dequant_q5_k_f16_ptx, "dequant_q5_k_f16"),
-            .q6_k => try self.eltFn(elt.dequant_q6_k_f16_ptx, "dequant_q6_k_f16"),
-            else => unreachable,
+        // Weight as f16 [rows][cols]: block-quant weights dequant into scratch;
+        // an f16 weight (some GGUF quants keep small matrices at f16, e.g.
+        // Unsloth ssm_out) is already in that layout and is used directly.
+        const w16 = if (dt == .f16) w_db else blk: {
+            try self.ensureDeviceBuffer(&self.fp8_w16, rows * cols * 2);
+            const f_deq = switch (dt) {
+                .q8_0 => try self.eltFn(elt.dequant_q8_0_f16_ptx, "dequant_q8_0_f16"),
+                .q4_k => try self.eltFn(elt.dequant_q4_k_f16_ptx, "dequant_q4_k_f16"),
+                .q5_k => try self.eltFn(elt.dequant_q5_k_f16_ptx, "dequant_q5_k_f16"),
+                .q6_k => try self.eltFn(elt.dequant_q6_k_f16_ptx, "dequant_q6_k_f16"),
+                else => unreachable,
+            };
+            try self.eltLaunch(f_deq, w_db, self.fp8_w16, null, null, .{ @intCast(rows * cols), 0, 0, 0, 0, 0 }, .{ 0, 0 }, rows * cols);
+            break :blk self.fp8_w16;
         };
-        try self.eltLaunch(f_deq, w_db, self.fp8_w16, null, null, .{ @intCast(rows * cols), 0, 0, 0, 0, 0 }, .{ 0, 0 }, rows * cols);
         const f_cvt = try self.eltFn(elt.f32_to_f16_ptx, "f32_to_f16");
         try self.eltLaunch(f_cvt, x, self.fp8_a16, null, null, .{ @intCast(mpad * cols), @intCast(m * cols), 0, 0, 0, 0 }, .{ 0, 0 }, mpad * cols);
         if (self.kernels == .libs) {
-            try self.ltMatmulF16(y, self.fp8_w16, self.fp8_a16, rows, mpad, cols);
+            try self.ltMatmulF16(y, w16, self.fp8_a16, rows, mpad, cols);
         } else {
             const f_hg = try self.hgemmFn();
-            try self.launchHgemm(f_hg, self.fp8_a16, self.fp8_w16, y, mpad, rows, cols);
+            try self.launchHgemm(f_hg, self.fp8_a16, w16, y, mpad, rows, cols);
         }
     }
 
@@ -1381,6 +1397,18 @@ pub const Backend = struct {
         std.debug.assert(cols % 2 == 0);
         const w_db = try self.cachedWeight(w_bytes);
         const f = try self.eltFn(elt.gemv_bf16_ptx, "gemv_bf16");
+        try self.rowLaunch(f, w_db, x, y, null, .{ @intCast(rows), @intCast(cols), 0, 0, 0, 0 }, .{ scale, 0 }, rows);
+    }
+
+    /// f16 GEMV (small high-precision weights some GGUF quants keep at f16,
+    /// e.g. Unsloth ssm_alpha/ssm_beta). Same call shape as `opGemvBf16`; the
+    /// only difference is the kernel's per-lane f16→f32 decode.
+    pub fn opGemvF16(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, w_bytes: []const u8, scale: f32, rows: usize, cols: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.matmul);
+        std.debug.assert(cols % 2 == 0);
+        const w_db = try self.cachedWeight(w_bytes);
+        const f = try self.eltFn(elt.gemv_f16_ptx, "gemv_f16");
         try self.rowLaunch(f, w_db, x, y, null, .{ @intCast(rows), @intCast(cols), 0, 0, 0, 0 }, .{ scale, 0 }, rows);
     }
 
@@ -1634,6 +1662,35 @@ pub const Backend = struct {
         try self.ensureDeviceBuffer(&self.conv_a16, m_pad * k_pad * 2);
         try self.ensureDeviceBuffer(&self.conv_c, m_pad * co_pad * 4);
         const f_wpad = try self.eltFn(elt.bf16_to_f16_pad2d_ptx, "bf16_to_f16_pad2d");
+        try self.eltLaunch(f_wpad, w_db, self.conv_w16, null, null, .{ @intCast(co_pad * k_pad), @intCast(k_pad), @intCast(co), @intCast(k), 0, 0 }, .{ 0, 0 }, co_pad * k_pad);
+        const f_apad = try self.eltFn(elt.f32_to_f16_pad2d_ptx, "f32_to_f16_pad2d");
+        try self.eltLaunch(f_apad, src, self.conv_a16, null, null, .{ @intCast(m_pad * k_pad), @intCast(k_pad), @intCast(m), @intCast(k), 0, 0 }, .{ 0, 0 }, m_pad * k_pad);
+        if (self.kernels == .libs) {
+            try self.ltMatmulF16(self.conv_c, self.conv_w16, self.conv_a16, co_pad, m_pad, k_pad);
+        } else {
+            const f_hg = try self.hgemmFn();
+            try self.launchHgemm(f_hg, self.conv_a16, self.conv_w16, self.conv_c, m_pad, co_pad, k_pad);
+        }
+        const f_bc = try self.eltFn(elt.bias_compact_ptx, "bias_compact");
+        try self.eltLaunch(f_bc, self.conv_c, b_db, dst, null, .{ @intCast(m * co), @intCast(co), @intCast(co_pad), 0, 0, 0 }, .{ 0, 0 }, m * co);
+    }
+
+    /// Like `opMatmulBf16` but for an f16 weight (some GGUF mmproj towers ship
+    /// f16, e.g. Qwen3.5-9B's). Identical except the weight is padded with a
+    /// straight f16 copy instead of a bf16→f16 convert.
+    pub fn opMatmulF16(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: []const f32) Error!void {
+        self.ptic();
+        defer self.ptoc(.matmul);
+        std.debug.assert(w_bytes.len == co * k * 2 and bias.len == co);
+        const co_pad = std.mem.alignForward(usize, co, 128);
+        const k_pad = std.mem.alignForward(usize, k, 32);
+        const m_pad = std.mem.alignForward(usize, m, 128);
+        const w_db = try self.cachedWeight(w_bytes);
+        const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias));
+        try self.ensureDeviceBuffer(&self.conv_w16, co_pad * k_pad * 2);
+        try self.ensureDeviceBuffer(&self.conv_a16, m_pad * k_pad * 2);
+        try self.ensureDeviceBuffer(&self.conv_c, m_pad * co_pad * 4);
+        const f_wpad = try self.eltFn(elt.f16_pad2d_ptx, "f16_pad2d");
         try self.eltLaunch(f_wpad, w_db, self.conv_w16, null, null, .{ @intCast(co_pad * k_pad), @intCast(k_pad), @intCast(co), @intCast(k), 0, 0 }, .{ 0, 0 }, co_pad * k_pad);
         const f_apad = try self.eltFn(elt.f32_to_f16_pad2d_ptx, "f32_to_f16_pad2d");
         try self.eltLaunch(f_apad, src, self.conv_a16, null, null, .{ @intCast(m_pad * k_pad), @intCast(k_pad), @intCast(m), @intCast(k), 0, 0 }, .{ 0, 0 }, m_pad * k_pad);
@@ -2186,6 +2243,14 @@ pub const Backend = struct {
         defer self.ptoc(.elt);
         const f = try self.eltFn(elt.add_ptx, "add");
         try self.eltLaunch(f, a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+    }
+
+    /// ReLU in place: a[i] = max(0, a[i]).
+    pub fn opRelu(self: *Backend, a: DeviceBuffer, total: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const f = try self.eltFn(elt.relu_ptx, "relu");
+        try self.eltLaunch(f, a, null, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
     /// VAE per-position channel L2 norm (+ optional fused silu). x/out [n][c]

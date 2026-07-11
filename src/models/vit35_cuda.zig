@@ -34,6 +34,7 @@ const Weight = ops.matmul.Weight;
 fn gemm(be: *Backend, dst: Buf, src: Buf, m: usize, w: Weight, bias: []const f32) !void {
     switch (w.dtype) {
         .bf16 => try be.opMatmulBf16(dst, src, m, w.bytes, w.rows, w.cols, bias),
+        .f16 => try be.opMatmulF16(dst, src, m, w.bytes, w.rows, w.cols, bias),
         .f32 => try be.opConvF16(dst, 0, src, m, w.bytes, w.rows, w.cols, bias),
         else => return error.UnsupportedDType,
     }

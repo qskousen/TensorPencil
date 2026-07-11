@@ -343,7 +343,7 @@ pub const Workspace = struct {
 
 /// One DiT forward evaluation: velocity `out` from latent `x_lat` at `sigma`.
 /// `ws` must be sized for a sequence ≥ seq_txt + n_img (see Workspace.init).
-pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const Workspace, io: std.Io, gpa: std.mem.Allocator, out: []f32, x_lat: []const f32, sigma: f32) !void {
+pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const Workspace, io: std.Io, gpa: std.mem.Allocator, out: []f32, x_lat: []const f32, sigma: f32, cancel: ?*std.atomic.Value(bool)) !void {
     const lat_h = sess.lat_h;
     const lat_w = sess.lat_w;
     const seq_txt = sess.seq_txt;
@@ -418,6 +418,11 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
     if (be.async_uploads) prefetchBlock(be, model.blocks[0]);
 
     for (model.blocks, 0..) |blk, b| {
+        // Poll cancel between blocks so a stop lands mid-step (≈1/28 of a step)
+        // rather than only at step boundaries — matters most under weight
+        // streaming, where each block waits on its uploaded weights. The
+        // `errdefer` above aborts the in-flight CUDA batch on the way out.
+        if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
         if (be.async_uploads and b + 1 < model.blocks.len) prefetchBlock(be, model.blocks[b + 1]);
         const mb = b * 6 * F;
         // --- attention ---

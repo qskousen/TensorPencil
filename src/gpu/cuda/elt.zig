@@ -516,6 +516,64 @@ pub const gemv_bf16_ptx: [:0]const u8 =
     \\}
 ;
 
+/// f16 GEMV: identical to `gemv_bf16` (same [rows][cols] 2-byte layout, thread
+/// t loads one u32 = two f16 at c = 2t stride 512, x as v2.f32) except each
+/// 16-bit lane is decoded with a true `cvt.rn.f32.f16` instead of a bf16 shift.
+/// Used for the small f16 weights some GGUF quants keep at higher precision
+/// (e.g. Unsloth's ssm_alpha/ssm_beta). cols must be a multiple of 2.
+/// b0=W, b1=x, b2=y. u0=rows, u1=cols, f0=scale.
+pub const gemv_f16_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry gemv_f16(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<6>;
+    \\  .reg .b16 %rs<4>;
+    \\  .reg .b32 %r<24>;
+    \\  .reg .f32 %f<14>;
+    \\  .reg .b64 %rd<18>;
+    \\  .shared .align 4 .b8 red[1024];
+    \\  mov.u32 %r1,%ctaid.x;                  // row
+    \\  ld.param.u32 %r2,[u0]; setp.ge.u32 %p1,%r1,%r2; @%p1 bra END;
+    \\  mov.u32 %r3,%tid.x;
+    \\  ld.param.u32 %r4,[u1];                 // cols
+    \\  ld.param.f32 %f1,[f0];                 // scale
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
+    \\  mov.f32 %f3,0f00000000;                // acc
+    \\  shl.b32 %r8,%r3,1;                     // c = tid*2
+    \\  mul.wide.u32 %rd7,%r1,%r4; shl.b64 %rd7,%rd7,1; add.s64 %rd8,%rd1,%rd7; // W row base (bytes = row*cols*2)
+    \\LOOP:
+    \\  setp.ge.u32 %p2,%r8,%r4; @%p2 bra LD;
+    \\  mul.wide.u32 %rd9,%r8,2; add.s64 %rd10,%rd8,%rd9; ld.global.u32 %r9,[%rd10]; // 2 f16
+    \\  mul.wide.u32 %rd11,%r8,4; add.s64 %rd12,%rd2,%rd11;
+    \\  ld.global.v2.f32 {%f4,%f5},[%rd12];
+    \\  mov.b32 {%rs1,%rs2},%r9;                                     // split into two f16
+    \\  cvt.f32.f16 %f6,%rs1; fma.rn.f32 %f3,%f6,%f4,%f3;           // elem c
+    \\  cvt.f32.f16 %f6,%rs2; fma.rn.f32 %f3,%f6,%f5,%f3;           // elem c+1
+    \\  add.u32 %r8,%r8,512; bra LOOP;
+    \\LD:
+    \\  shl.b32 %r5,%r3,2; mov.u32 %r13,red; add.u32 %r14,%r13,%r5;
+    \\  st.shared.f32 [%r14],%f3; bar.sync 0;
+    \\  mov.u32 %r15,128;
+    \\RED:
+    \\  setp.eq.u32 %p3,%r15,0; @%p3 bra REDD;
+    \\  setp.ge.u32 %p4,%r3,%r15; @%p4 bra REDS;
+    \\  ld.shared.f32 %f9,[%r14]; shl.b32 %r16,%r15,2; add.u32 %r16,%r14,%r16;
+    \\  ld.shared.f32 %f10,[%r16]; add.f32 %f9,%f9,%f10; st.shared.f32 [%r14],%f9;
+    \\REDS:
+    \\  bar.sync 0; shr.u32 %r15,%r15,1; bra RED;
+    \\REDD:
+    \\  setp.ne.u32 %p5,%r3,0; @%p5 bra END;
+    \\  ld.shared.f32 %f11,[%r13]; mul.f32 %f11,%f11,%f1;
+    \\  mul.wide.u32 %rd13,%r1,4; add.s64 %rd14,%rd3,%rd13; st.global.f32 [%rd14],%f11;
+    \\END:
+    \\  ret;
+    \\}
+;
+
 /// ggml q8_0 GEMV: y[row] = scale * dot(W[row], x), W q8_0 [rows][cols/32
 /// blocks of 34 B: f16 d + 32 i8]. Same block-per-row layout as gemv_bf16;
 /// thread t owns elems c = 2t stride 512. Blocks are only 2-byte aligned
@@ -3292,6 +3350,41 @@ pub const bf16_to_f16_pad2d_ptx: [:0]const u8 =
     \\}
 ;
 
+/// f16 → f16 2-D pad: copy W[co][cols] into a [rows][cols_pad] f16 tile,
+/// zero-padding the tail. Same shape as `bf16_to_f16_pad2d` but the source is
+/// already f16, so each lane is a straight 16-bit copy (no conversion). Used by
+/// `opMatmulF16` for GGUF mmproj weights stored as f16.
+/// b0=W(f16), b1=out(f16). u0=total(rows*cols_pad), u1=cols_pad, u2=co, u3=cols.
+pub const f16_pad2d_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry f16_pad2d(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<4>;
+    \\  .reg .b32 %r<12>;
+    \\  .reg .b16 %h<2>;
+    \\  .reg .b64 %rd<8>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1]; ld.param.u32 %r7,[u2]; ld.param.u32 %r8,[u3];
+    \\  ld.param.u64 %rd2,[p1]; cvta.to.global.u64 %rd2,%rd2;
+    \\  mul.wide.u32 %rd3,%r4,2; add.s64 %rd4,%rd2,%rd3;   // &out[idx] f16
+    \\  div.u32 %r9,%r4,%r6; rem.u32 %r10,%r4,%r6;         // r, c (padded)
+    \\  mov.b16 %h0,0x0000;
+    \\  setp.ge.u32 %p2,%r9,%r7; @%p2 bra STORE;
+    \\  setp.ge.u32 %p3,%r10,%r8; @%p3 bra STORE;
+    \\  mad.lo.s32 %r11,%r9,%r8,%r10;                       // r*cols + c
+    \\  ld.param.u64 %rd1,[p0]; cvta.to.global.u64 %rd1,%rd1;
+    \\  mul.wide.u32 %rd5,%r11,2; add.s64 %rd6,%rd1,%rd5; ld.global.u16 %h0,[%rd6]; // f16 as-is
+    \\STORE:
+    \\  st.global.b16 [%rd4],%h0;
+    \\END:
+    \\  ret;
+    \\}
+;
+
 /// Strip the column padding from a [*][co_pad] f32 GEMM output and add the conv
 /// bias in one pass: dst[dst_off + i] = C[(i/co)*co_pad + i%co] + bias[i%co].
 /// b0=C(f32 padded), b1=bias(f32[co]), b2=dst(f32). u0=total(m*co), u1=co,
@@ -3342,6 +3435,28 @@ pub const add_ptx: [:0]const u8 =
     \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2;
     \\  mul.wide.u32 %rd3,%r4,4; add.s64 %rd4,%rd1,%rd3; add.s64 %rd5,%rd2,%rd3;
     \\  ld.global.f32 %f1,[%rd4]; ld.global.f32 %f2,[%rd5]; add.f32 %f1,%f1,%f2; st.global.f32 [%rd4],%f1;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// ReLU in place: a[idx] = max(0, a[idx]). b0=a. u0=total.
+pub const relu_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry relu(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<2>;
+    \\  .reg .b32 %r<6>;
+    \\  .reg .f32 %f<2>;
+    \\  .reg .b64 %rd<5>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u64 %rd1,[p0]; cvta.to.global.u64 %rd1,%rd1;
+    \\  mul.wide.u32 %rd3,%r4,4; add.s64 %rd4,%rd1,%rd3;
+    \\  ld.global.f32 %f1,[%rd4]; max.f32 %f1,%f1,0f00000000; st.global.f32 [%rd4],%f1;
     \\END:
     \\  ret;
     \\}

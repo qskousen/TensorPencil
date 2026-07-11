@@ -1233,11 +1233,11 @@ fn cudaStreamTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []
 
     // Resident (no budget): warm-up + timed.
     be.budget_override = 0;
-    try dit_cuda.forward(&model, be, &sess, &ws, io, arena, out_res, x, sigma);
+    try dit_cuda.forward(&model, be, &sess, &ws, io, arena, out_res, x, sigma, null);
     var t_res: f64 = std.math.inf(f64);
     for (0..3) |_| {
         const a = std.Io.Clock.real.now(io);
-        try dit_cuda.forward(&model, be, &sess, &ws, io, arena, out_res, x, sigma);
+        try dit_cuda.forward(&model, be, &sess, &ws, io, arena, out_res, x, sigma, null);
         const b = std.Io.Clock.real.now(io);
         t_res = @min(t_res, @as(f64, @floatFromInt(b.nanoseconds - a.nanoseconds)) / 1e6);
     }
@@ -1245,11 +1245,11 @@ fn cudaStreamTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []
     // Streamed (small budget): evictWeights first so nothing is pre-resident.
     be.evictWeights();
     be.budget_override = budget;
-    try dit_cuda.forward(&model, be, &sess, &ws, io, arena, out_str, x, sigma);
+    try dit_cuda.forward(&model, be, &sess, &ws, io, arena, out_str, x, sigma, null);
     var t_str: f64 = std.math.inf(f64);
     for (0..3) |_| {
         const a = std.Io.Clock.real.now(io);
-        try dit_cuda.forward(&model, be, &sess, &ws, io, arena, out_str, x, sigma);
+        try dit_cuda.forward(&model, be, &sess, &ws, io, arena, out_str, x, sigma, null);
         const b = std.Io.Clock.real.now(io);
         t_str = @min(t_str, @as(f64, @floatFromInt(b.nanoseconds - a.nanoseconds)) / 1e6);
     }
@@ -1320,13 +1320,13 @@ fn cudaDitTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []con
     const out_cuda = try arena.alloc(f32, x.len);
 
     // Warm-up pass (uploads weights, JITs modules).
-    try dit_cuda.forward(&model, be, &sess, &ws, io, arena, out_cuda, x, sigma);
+    try dit_cuda.forward(&model, be, &sess, &ws, io, arena, out_cuda, x, sigma, null);
     const reps: usize = if (lat <= 64) 4 else 2;
     // Batched (profile off) timing — the real steady-state s/step.
     var best_ms: f64 = std.math.inf(f64);
     for (0..reps) |_| {
         const ta = std.Io.Clock.real.now(io);
-        try dit_cuda.forward(&model, be, &sess, &ws, io, arena, out_cuda, x, sigma);
+        try dit_cuda.forward(&model, be, &sess, &ws, io, arena, out_cuda, x, sigma, null);
         const tb = std.Io.Clock.real.now(io);
         best_ms = @min(best_ms, @as(f64, @floatFromInt(tb.nanoseconds - ta.nanoseconds)) / 1e6);
     }
@@ -1334,7 +1334,7 @@ fn cudaDitTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []con
     // One profiled (sync-per-op) pass for the per-category breakdown.
     be.profile = true;
     be.prof.reset();
-    try dit_cuda.forward(&model, be, &sess, &ws, io, arena, out_cuda, x, sigma);
+    try dit_cuda.forward(&model, be, &sess, &ws, io, arena, out_cuda, x, sigma, null);
     be.profile = false;
     // matmul/prep/elt + attention (gather/scatter in `attn`, GEMMs/softmax split out).
     const cats = [_][]const u8{ "matmul", "prep", "attn(g/s)", "elt", "  scores", "  softmax", "  pv" };
@@ -1434,6 +1434,13 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
             TensorPencil.safetensors.use_mmap = !(std.mem.eql(u8, val, "off") or std.mem.eql(u8, val, "0") or std.mem.eql(u8, val, "false"));
         } else if (std.mem.eql(u8, flag, "--out")) {
             out_path = val;
+        } else if (std.mem.eql(u8, flag, "--taew")) {
+            // Preview mode: "none"/"latent2rgb" => latent2rgb; else a taew2_1
+            // path => taesd approx-VAE. Saves the last step's preview to
+            // <out>.preview.png. (No --taew flag at all => no preview.)
+            opts.preview = true;
+            if (!std.mem.eql(u8, val, "none") and !std.mem.eql(u8, val, "latent2rgb"))
+                opts.taew_path = val;
         } else {
             try stdout.print("unknown flag {s}\n", .{flag});
             return error.InvalidArgs;
@@ -1444,6 +1451,9 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
         return error.InvalidArgs;
     }
 
+    var cap: PreviewCap = .{ .arena = arena };
+    if (opts.preview) opts.on_step = .{ .ctx = &cap, .step = PreviewCap.onStep };
+
     var img = try TensorPencil.pipeline.generate(io, arena, opts, stdout);
     defer img.deinit(arena);
 
@@ -1452,7 +1462,36 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
     try TensorPencil.image.encodePngRgb(arena, &png, img.rgb, img.width, img.height);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = png.items });
     try stdout.print("wrote {s} ({d}x{d})\n", .{ out_path, img.width, img.height });
+
+    if (cap.rgb) |rgb| {
+        var ppng: std.ArrayList(u8) = .empty;
+        defer ppng.deinit(arena);
+        try TensorPencil.image.encodePngRgb(arena, &ppng, rgb, cap.w, cap.h);
+        const ppath = try std.fmt.allocPrint(arena, "{s}.preview.png", .{out_path});
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = ppath, .data = ppng.items });
+        try stdout.print("wrote {s} ({d}x{d}) [taew preview]\n", .{ ppath, cap.w, cap.h });
+    }
 }
+
+/// Captures the latest per-step preview (for --taew validation).
+const PreviewCap = struct {
+    arena: std.mem.Allocator,
+    rgb: ?[]u8 = null,
+    w: usize = 0,
+    h: usize = 0,
+
+    fn onStep(ctx: *anyopaque, done: usize, total: usize, preview: ?TensorPencil.pipeline.Preview) void {
+        _ = done;
+        _ = total;
+        const self: *PreviewCap = @ptrCast(@alignCast(ctx));
+        const pv = preview orelse return;
+        const buf = self.arena.alloc(u8, pv.rgb.len) catch return;
+        @memcpy(buf, pv.rgb);
+        self.rgb = buf;
+        self.w = pv.width;
+        self.h = pv.height;
+    }
+};
 
 /// Decode a planar f32 [16][zh][zw] latent file (VAE space) to a PNG.
 fn decodeLatent(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, z_path: []const u8, zh_s: []const u8, zw_s: []const u8, out_path: []const u8) !void {

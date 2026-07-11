@@ -32,6 +32,15 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
+        // dvui (immediate-mode GUI) + its SDL3 backend, for the tp-gui
+        // executable ONLY. Pinned to the same commit DiffKeep uses (known-good
+        // on Zig 0.16.0). Like libvips, this stays out of the pure TensorPencil
+        // library module — it is linked into the tp-gui exe alone.
+        .dvui = .{
+            .url = "git+https://github.com/david-vanderson/dvui#14703fa6d6fea0c608886b5ce2071ef49323c8c0",
+            .hash = "dvui-0.5.0-dev-AQFJmbHY9QA1qvhf_l3RPazRT7QOF0pGjLtU4amMq2F-",
+            .lazy = true,
+        },
         // See `zig fetch --save <url>` for a command-line interface for adding dependencies.
         //.example = .{
         //    // When updating this field to a new URL, be sure to delete the corresponding
@@ -61,6 +70,14 @@
         //    // actually used.
         //    .lazy = false,
         //},
+        // Platform config-dir resolution for the tp-gui settings file. Lazy +
+        // gui-only, same policy as dvui — keeps `zig build` / `zig build test`
+        // free of GUI deps and the library module pure Zig.
+        .known_folders = .{
+            .url = "git+https://github.com/ziglibs/known-folders#207c34a16e4365edc20d92c7892f962b3bed46e8",
+            .hash = "known_folders-0.0.0-Fy-PJsbKAACbDh9bBxR0MMThxZSS6A9RH4apWphNHY70",
+            .lazy = true,
+        },
     },
     // Specifies the set of files and directories that are included in this package.
     // Only files and directories listed here are included in the `hash` that

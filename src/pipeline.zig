@@ -19,6 +19,8 @@ const dit_cuda = @import("models/dit_cuda.zig");
 const qwen3_cuda = @import("models/qwen3_cuda.zig");
 const cuda = @import("gpu/cuda.zig");
 const wan_vae = @import("models/wan_vae.zig");
+const taehv_mod = @import("models/taehv.zig");
+const taehv_cuda_mod = @import("models/taehv_cuda.zig");
 const vae_gpu = @import("models/vae_gpu.zig");
 const vae_cuda = @import("models/vae_cuda.zig");
 
@@ -52,6 +54,18 @@ pub const Backend = enum {
     }
 };
 
+/// A cheap latent2rgb preview of the in-progress latent (RGB8, latent
+/// resolution). Valid only for the duration of the `step` callback — copy it.
+pub const Preview = struct { rgb: []const u8, width: usize, height: usize };
+
+/// Per-step progress hook. `step(ctx, done, total, preview)` is called once
+/// after each sampling step, so a caller (e.g. a GUI) can show a live bar and
+/// (when `Options.preview` is set) a live latent2rgb preview.
+pub const Progress = struct {
+    ctx: *anyopaque,
+    step: *const fn (ctx: *anyopaque, done: usize, total: usize, preview: ?Preview) void,
+};
+
 pub const Options = struct {
     prompt: []const u8,
     negative: []const u8 = "",
@@ -72,6 +86,17 @@ pub const Options = struct {
     text_encoder_path: []const u8 = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors",
     dit_path: []const u8 = "models/diffusion_model/krea2CenterSemiraw_v10Fp8.safetensors",
     vae_path: []const u8 = "models/vae/krea2RealVae_v10.safetensors",
+    /// Optional per-step progress hook (see `Progress`).
+    on_step: ?Progress = null,
+    /// Compute a latent2rgb preview each step and pass it to `on_step`.
+    preview: bool = false,
+    /// Optional taew2_1 approx-VAE (TAEHV) checkpoint for a higher-quality
+    /// preview; falls back to latent2rgb when null or unloadable.
+    taew_path: ?[]const u8 = null,
+    /// Optional cancel flag, polled between sampling steps and before the VAE
+    /// decode. When it flips true, `generate` unwinds and returns
+    /// `error.Canceled` (a caller-driven stop, not a failure).
+    cancel: ?*std.atomic.Value(bool) = null,
 };
 
 pub const Image = struct {
@@ -232,11 +257,36 @@ pub fn generate(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*s
         const dit_s = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - dit_start.nanoseconds)) / 1e9;
         try note(progress, "diffusion model ready in {d:.1}s\n", .{dit_s});
 
+        // Scratch for the per-step latent2rgb preview (latent resolution RGB8).
+        const preview_scratch: ?[]u8 = if (opts.preview and opts.on_step != null)
+            try gpa.alloc(u8, lat_h * lat_w * 3)
+        else
+            null;
+        defer if (preview_scratch) |ps| gpa.free(ps);
+
+        // Optional taew2_1 (TAEHV) approx-VAE for a sharper preview. Decoded at
+        // reduced latent resolution each step; falls back to latent2rgb.
+        var taew_st: ?safetensors.SafeTensors = null;
+        defer if (taew_st) |*s| s.deinit();
+        var taehv_dec: ?taehv_mod.Decoder = null;
+        defer if (taehv_dec) |*d| d.deinit();
+        const preview_ds: usize = @max(1, @max(lat_h, lat_w) / 32); // downsample so preview ≈ 256px
+        if (opts.preview and opts.on_step != null) if (opts.taew_path) |tp| {
+            if (safetensors.SafeTensors.open(gpa, io, tp)) |tst| {
+                taew_st = tst;
+                if (taehv_mod.Decoder.load(gpa, &taew_st.?)) |d| {
+                    taehv_dec = d;
+                    try note(progress, "preview: taew2_1 approx-VAE (1/{d} latent)\n", .{preview_ds});
+                } else |err| try note(progress, "taew2_1 load failed ({t}); latent2rgb preview\n", .{err});
+            } else |err| try note(progress, "taew2_1 open failed ({t}); latent2rgb preview\n", .{err});
+        };
+
         const sampling_start = std.Io.Clock.real.now(io);
         for (0..opts.steps) |i| {
+            if (opts.cancel) |c| if (c.load(.acquire)) return error.Canceled;
             const start = std.Io.Clock.real.now(io);
             if (cu_be) |b| {
-                try dit_cuda.forward(&dit, b, &cu_pos.?, &cu_ws.?, io, gpa, v, x, sigmas[i]);
+                try dit_cuda.forward(&dit, b, &cu_pos.?, &cu_ws.?, io, gpa, v, x, sigmas[i], opts.cancel);
             } else if (gpu_ctx) |gc| {
                 try dit_gpu.forward(&dit, gc, &sess_pos.?, &ws.?, io, gpa, v, x, sigmas[i]);
             } else {
@@ -244,7 +294,7 @@ pub fn generate(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*s
             }
             if (use_cfg) {
                 if (cu_be) |b| {
-                    try dit_cuda.forward(&dit, b, &cu_neg.?, &cu_ws.?, io, gpa, v_neg.?, x, sigmas[i]);
+                    try dit_cuda.forward(&dit, b, &cu_neg.?, &cu_ws.?, io, gpa, v_neg.?, x, sigmas[i], opts.cancel);
                 } else if (gpu_ctx) |gc| {
                     try dit_gpu.forward(&dit, gc, &sess_neg.?, &ws.?, io, gpa, v_neg.?, x, sigmas[i]);
                 } else try dit.forward(io, gpa, v_neg.?, x, lat_h, lat_w, sigmas[i], cond_neg.?.data, cond_neg.?.seq);
@@ -253,10 +303,34 @@ pub fn generate(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*s
             sampler.eulerStep(x, v, sigmas[i], sigmas[i + 1]);
             const ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - start.nanoseconds)) / 1e6;
             try note(progress, "step {d}/{d}  sigma {d:.3} -> {d:.3}  ({d:.1}s)\n", .{ i + 1, opts.steps, sigmas[i], sigmas[i + 1], ms / 1000.0 });
+            if (opts.on_step) |p| {
+                var pv: ?Preview = null;
+                var taew_rgb: ?[]u8 = null;
+                defer if (taew_rgb) |r| gpa.free(r);
+                if (taehv_dec) |*d| taew_blk: {
+                    const th = lat_h / preview_ds;
+                    const tw = lat_w / preview_ds;
+                    const small = downsampleLatent(gpa, x, lat_h, lat_w, preview_ds) catch break :taew_blk;
+                    defer gpa.free(small);
+                    const rgb = if (cu_be) |b|
+                        (taehv_cuda_mod.decode(d, b, gpa, small, th, tw) catch break :taew_blk)
+                    else
+                        (d.decode(io, gpa, small, th, tw) catch break :taew_blk);
+                    taew_rgb = rgb;
+                    pv = .{ .rgb = rgb, .width = tw * taehv_mod.spatial_scale, .height = th * taehv_mod.spatial_scale };
+                }
+                if (pv == null) if (preview_scratch) |ps| {
+                    wan_vae.latentPreviewInto(ps, x, lat_h, lat_w);
+                    pv = .{ .rgb = ps, .width = lat_w, .height = lat_h };
+                };
+                p.step(p.ctx, i + 1, opts.steps, pv);
+            }
         }
         const sampling_s = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - sampling_start.nanoseconds)) / 1e9;
         try note(progress, "sampling {d} steps in {d:.1}s ({d:.2}s/step)\n", .{ opts.steps, sampling_s, sampling_s / @as(f64, @floatFromInt(opts.steps)) });
     }
+
+    if (opts.cancel) |c| if (c.load(.acquire)) return error.Canceled;
 
     // DiT weight buffers are stale after this point; drop them so VAE weights
     // can't collide with a recycled host pointer in the cache, and — under
@@ -340,6 +414,28 @@ fn encodePrompt(io: std.Io, gpa: std.mem.Allocator, gpu_ctx: ?*gpu_mod.Context, 
     const data = try gpa.alloc(f32, seq * row);
     @memcpy(data, full[offset * row ..][0 .. seq * row]);
     return .{ .data = data, .seq = seq };
+}
+
+/// Box-average a planar [C][h][w] latent down by integer factor `f`
+/// (→ [C][h/f][w/f]) so the taew preview decode stays cheap.
+fn downsampleLatent(gpa: std.mem.Allocator, x: []const f32, h: usize, w: usize, f: usize) ![]f32 {
+    const c = wan_vae.latent_channels;
+    const th = h / f;
+    const tw = w / f;
+    const out = try gpa.alloc(f32, c * th * tw);
+    const inv: f32 = 1.0 / @as(f32, @floatFromInt(f * f));
+    for (0..c) |ch| {
+        const src = x[ch * h * w ..];
+        const dst = out[ch * th * tw ..];
+        for (0..th) |oy| for (0..tw) |ox| {
+            var sum: f32 = 0;
+            for (0..f) |dy| for (0..f) |dx| {
+                sum += src[(oy * f + dy) * w + (ox * f + dx)];
+            };
+            dst[oy * tw + ox] = sum * inv;
+        };
+    }
+    return out;
 }
 
 fn note(progress: ?*std.Io.Writer, comptime fmt: []const u8, args: anytype) !void {
