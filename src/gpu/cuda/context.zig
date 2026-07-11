@@ -62,6 +62,10 @@ pub const Context = struct {
 
     device_used: usize = 0,
 
+    /// Physical-chunk granularity for VMM growable buffers (bytes, typically
+    /// 2 MB); 0 when the driver lacks the VMM entry points.
+    vmm_granularity: usize = 0,
+
     /// Last JIT log (error or info) from loadModule; valid until the next call.
     jit_log: [16384]u8 = undefined,
     jit_log_len: usize = 0,
@@ -95,6 +99,8 @@ pub const Context = struct {
         _ = self.api.cuDeviceGetAttribute(&self.shared_optin_max, cu.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, self.dev);
         _ = self.api.cuDeviceGetAttribute(&self.shared_per_sm, cu.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR, self.dev);
         _ = self.api.cuDeviceGetAttribute(&self.clock_khz, cu.CU_DEVICE_ATTRIBUTE_CLOCK_RATE, self.dev);
+
+        self.vmm_granularity = self.vmmQueryGranularity();
 
         return self;
     }
@@ -279,6 +285,71 @@ pub const Context = struct {
         var total_b: usize = 0;
         if (self.api.cuMemGetInfo(&free_b, &total_b) != cu.CUDA_SUCCESS) return .{ .free = 0, .total = 0 };
         return .{ .free = free_b, .total = total_b };
+    }
+
+    // ---- VMM growable buffers (reserve VA once, commit physical chunks) ------
+
+    fn vmmProp(self: *const Context) cu.CUmemAllocationProp {
+        return .{
+            .type = cu.CU_MEM_ALLOCATION_TYPE_PINNED,
+            .location = .{ .type = cu.CU_MEM_LOCATION_TYPE_DEVICE, .id = self.dev },
+        };
+    }
+
+    fn vmmQueryGranularity(self: *Context) usize {
+        const f = self.api.cuMemGetAllocationGranularity orelse return 0;
+        if (self.api.cuMemAddressReserve == null or self.api.cuMemAddressFree == null or
+            self.api.cuMemCreate == null or self.api.cuMemRelease == null or
+            self.api.cuMemMap == null or self.api.cuMemUnmap == null or
+            self.api.cuMemSetAccess == null) return 0;
+        var g: usize = 0;
+        const prop = self.vmmProp();
+        if (f(&g, &prop, cu.CU_MEM_ALLOC_GRANULARITY_MINIMUM) != cu.CUDA_SUCCESS) return 0;
+        return g;
+    }
+
+    pub fn vmmAvailable(self: *const Context) bool {
+        return self.vmm_granularity != 0;
+    }
+
+    /// Reserve `size` bytes of device virtual address space (no physical
+    /// memory backs it until vmmCommit). `size` must be granularity-aligned.
+    pub fn vmmReserve(self: *Context, size: usize) Error!cu.CUdeviceptr {
+        var ptr: cu.CUdeviceptr = 0;
+        try self.check(self.api.cuMemAddressReserve.?(&ptr, size, 0, 0, 0), "cuMemAddressReserve");
+        return ptr;
+    }
+
+    /// Commit `size` bytes of physical memory at `base + offset` (both
+    /// granularity multiples) inside a vmmReserve'd range. Returns the
+    /// allocation handle (needed for release at teardown). OOM is returned
+    /// distinctly so the backend can evict cached weights and retry.
+    pub fn vmmCommit(self: *Context, base: cu.CUdeviceptr, offset: usize, size: usize) Error!cu.CUmemGenericAllocationHandle {
+        const prop = self.vmmProp();
+        var h: cu.CUmemGenericAllocationHandle = 0;
+        const r = self.api.cuMemCreate.?(&h, size, &prop, 0);
+        if (r == cu.CUDA_ERROR_OUT_OF_MEMORY) return error.DeviceOutOfMemory;
+        try self.check(r, "cuMemCreate");
+        errdefer _ = self.api.cuMemRelease.?(h);
+        try self.check(self.api.cuMemMap.?(base + offset, size, 0, h, 0), "cuMemMap");
+        errdefer _ = self.api.cuMemUnmap.?(base + offset, size);
+        const desc = [1]cu.CUmemAccessDesc{.{
+            .location = .{ .type = cu.CU_MEM_LOCATION_TYPE_DEVICE, .id = self.dev },
+            .flags = cu.CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
+        }};
+        try self.check(self.api.cuMemSetAccess.?(base + offset, size, &desc, 1), "cuMemSetAccess");
+        self.device_used += size;
+        return h;
+    }
+
+    /// Unmap and release a growable buffer's committed prefix and handles,
+    /// then free the VA reservation. All device work reading the range must
+    /// have completed (callers sync the stream first).
+    pub fn vmmFree(self: *Context, base: cu.CUdeviceptr, va_size: usize, committed: usize, handles: []const cu.CUmemGenericAllocationHandle) void {
+        if (committed != 0) _ = self.api.cuMemUnmap.?(base, committed);
+        for (handles) |h| _ = self.api.cuMemRelease.?(h);
+        _ = self.api.cuMemAddressFree.?(base, va_size);
+        self.device_used -|= committed;
     }
 
     pub fn upload(self: *Context, buf: Buffer, data: []const u8) Error!void {

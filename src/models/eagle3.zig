@@ -701,14 +701,14 @@ test "eagle drafter matches vanilla greedy on the real models" {
     try ids_spec.appendSlice(gpa, ids_vanilla.items);
 
     {
-        var model = try qwen3_cuda.CudaLM.init(gpa, be, &lm, try engine.capacityFor(opts, ids_vanilla.items.len), ids_vanilla.items.len);
+        var model = try qwen3_cuda.CudaLM.init(gpa, be, &lm, .fixed(try engine.capacityFor(opts, ids_vanilla.items.len)), ids_vanilla.items.len);
         defer model.deinit();
         _ = try engine.generate(&model, &tok, io, gpa, &ids_vanilla, opts, null);
     }
     {
         opts.spec_k = 2;
         const cap = try engine.capacityFor(opts, ids_spec.items.len);
-        var model = try qwen3_cuda.CudaLM.init(gpa, be, &lm, cap, ids_spec.items.len);
+        var model = try qwen3_cuda.CudaLM.init(gpa, be, &lm, .fixed(cap), ids_spec.items.len);
         defer model.deinit();
         try model.enableTaps(default_tap_layers);
         var head = try Eagle3Head.load(gpa, be, &est, &lm, cap);
@@ -755,7 +755,7 @@ test "eagle tree drafter matches vanilla greedy on the real models" {
     try ids_tree.appendSlice(gpa, ids_vanilla.items);
 
     {
-        var model = try qwen3_cuda.CudaLM.init(gpa, be, &lm, try engine.capacityFor(opts, ids_vanilla.items.len), ids_vanilla.items.len);
+        var model = try qwen3_cuda.CudaLM.init(gpa, be, &lm, .fixed(try engine.capacityFor(opts, ids_vanilla.items.len)), ids_vanilla.items.len);
         defer model.deinit();
         _ = try engine.generate(&model, &tok, io, gpa, &ids_vanilla, opts, null);
     }
@@ -764,7 +764,7 @@ test "eagle tree drafter matches vanilla greedy on the real models" {
         var stats: spec.Stats = .{};
         opts.spec_stats = &stats;
         const cap = try engine.capacityFor(opts, ids_tree.items.len);
-        var model = try qwen3_cuda.CudaLM.init(gpa, be, &lm, cap, ids_tree.items.len);
+        var model = try qwen3_cuda.CudaLM.init(gpa, be, &lm, .fixed(cap), ids_tree.items.len);
         defer model.deinit();
         try model.enableTaps(default_tap_layers);
         try model.enableTree();

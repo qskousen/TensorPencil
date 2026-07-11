@@ -6,6 +6,7 @@ pub const repl = @import("llm/repl.zig");
 pub const sample = @import("llm/sample.zig");
 pub const engine = @import("llm/engine.zig");
 pub const spec = @import("llm/spec.zig");
+pub const kv_cache = @import("llm/kv_cache.zig");
 
 test {
     _ = chat;
@@ -13,4 +14,5 @@ test {
     _ = sample;
     _ = engine;
     _ = spec;
+    _ = kv_cache;
 }

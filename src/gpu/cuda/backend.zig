@@ -872,6 +872,70 @@ pub const Backend = struct {
         db.* = .{};
     }
 
+    /// A device buffer that grows in place (KV caches under dynamic context):
+    /// `buf.buf` is the base of a `va_size`-byte VMM virtual-address
+    /// reservation with `buf.size` bytes of physical memory committed. Growth
+    /// commits more physical chunks — the pointer never moves, so recorded
+    /// offsets and captured graphs stay valid. When the driver lacks the VMM
+    /// entry points, or initial == max, `va_size` is 0 and `buf` is a plain
+    /// full-size allocation (committed up front; growth is then free).
+    pub const GrowableTensor = struct {
+        buf: DeviceBuffer = .{},
+        va_size: u64 = 0,
+        handles: std.ArrayListUnmanaged(cu.CUmemGenericAllocationHandle) = .empty,
+    };
+
+    pub fn growableCreate(self: *Backend, initial: u64, max: u64) Error!GrowableTensor {
+        std.debug.assert(initial <= max and max > 0);
+        if (initial == max or !self.ctx.vmmAvailable()) {
+            return .{ .buf = try self.tensorCreate(max) };
+        }
+        const gran: u64 = self.ctx.vmm_granularity;
+        const va = (max + gran - 1) / gran * gran;
+        const base = self.ctx.vmmReserve(@intCast(va)) catch return error.CudaError;
+        var gt: GrowableTensor = .{ .buf = dbFromPtr(base, 0), .va_size = va };
+        errdefer self.growableDestroy(&gt);
+        try self.growableEnsure(&gt, initial);
+        return gt;
+    }
+
+    /// Grow the committed size to at least `min_bytes` (granularity-rounded).
+    /// Under VRAM pressure this evicts LRU weights into the streaming path
+    /// (the tensorCreate backstop) before giving up. In place: no copies, no
+    /// synchronization, existing contents untouched.
+    pub fn growableEnsure(self: *Backend, gt: *GrowableTensor, min_bytes: u64) Error!void {
+        if (gt.buf.size >= min_bytes) return;
+        if (gt.va_size == 0 or min_bytes > gt.va_size) return error.DeviceOutOfMemory;
+        const gran: u64 = self.ctx.vmm_granularity;
+        const target = @min(gt.va_size, (min_bytes + gran - 1) / gran * gran);
+        const delta = target - gt.buf.size; // committed size stays gran-aligned
+        try gt.handles.ensureUnusedCapacity(self.gpa, 1);
+        while (true) {
+            const h = self.ctx.vmmCommit(gt.buf.ptr(), @intCast(gt.buf.size), @intCast(delta)) catch |err| {
+                if (err != error.DeviceOutOfMemory) return error.CudaError;
+                self.reclaimPending();
+                if (self.blockOldestPending()) continue;
+                if (self.evictOneWeight()) continue;
+                return error.DeviceOutOfMemory;
+            };
+            gt.handles.appendAssumeCapacity(h);
+            gt.buf.size = target;
+            return;
+        }
+    }
+
+    pub fn growableDestroy(self: *Backend, gt: *GrowableTensor) void {
+        if (gt.va_size != 0) {
+            // In-flight kernels may still read the range; unmap is immediate.
+            _ = self.ctx.api.cuStreamSynchronize(self.ctx.stream);
+            self.ctx.vmmFree(gt.buf.ptr(), @intCast(gt.va_size), @intCast(gt.buf.size), gt.handles.items);
+            gt.handles.deinit(self.gpa);
+        } else if (gt.buf.buf != .null_handle) {
+            self.tensorDestroy(&gt.buf);
+        }
+        gt.* = .{};
+    }
+
     pub fn ensureDeviceBuffer(self: *Backend, db: *DeviceBuffer, size: u64) Error!void {
         if (db.size >= size and db.buf != .null_handle) return;
         // Queued-but-unexecuted kernels may still read the old buffer;
@@ -2498,6 +2562,49 @@ fn testQuantWeightBytes(gpa: std.mem.Allocator, dt: dtypes.DType, rows: usize, c
         }
     }
     return wbytes;
+}
+
+// Gated on a CUDA device with VMM support: a growable tensor keeps its base
+// pointer and earlier contents across in-place growth (the property dynamic
+// KV caches — and the decode graphs holding their pointers — rely on).
+test "growable tensor grows in place" {
+    const gpa = std.testing.allocator;
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+    if (!be.ctx.vmmAvailable()) return error.SkipZigTest;
+
+    const initial: u64 = 1 << 20;
+    const max: u64 = 16 << 20;
+    var gt = try be.growableCreate(initial, max);
+    defer be.growableDestroy(&gt);
+    try std.testing.expect(gt.va_size >= max);
+    try std.testing.expect(gt.buf.size >= initial and gt.buf.size < max);
+    const base = gt.buf.ptr();
+
+    // Fill the initial commit, grow twice, then read the whole range back.
+    const n0: usize = @intCast(initial / 4);
+    const host = try gpa.alloc(f32, n0);
+    defer gpa.free(host);
+    for (host, 0..) |*v, i| v.* = @floatFromInt(i % 251);
+    try be.tensorUpload(gt.buf, std.mem.sliceAsBytes(host));
+
+    try be.growableEnsure(&gt, 5 << 20);
+    try std.testing.expectEqual(base, gt.buf.ptr());
+    try std.testing.expect(gt.buf.size >= 5 << 20);
+    const mid = gt.buf.size;
+    try be.growableEnsure(&gt, max);
+    try std.testing.expectEqual(base, gt.buf.ptr());
+    try std.testing.expect(gt.buf.size >= max and gt.buf.size > mid);
+
+    // The pre-growth contents survive, and the grown tail is writable.
+    const back = try gpa.alloc(f32, n0);
+    defer gpa.free(back);
+    try be.tensorDownload(dbFromPtr(base, initial), std.mem.sliceAsBytes(back));
+    try std.testing.expectEqualSlices(f32, host, back);
+    try be.tensorUpload(dbFromPtr(base + max - 4096, 4096), std.mem.sliceAsBytes(host[0..1024]));
+
+    // Past the reservation is a hard error, not silent growth.
+    try std.testing.expectError(error.DeviceOutOfMemory, be.growableEnsure(&gt, max + (32 << 20)));
 }
 
 // Gated on a CUDA device: the fused block-quant GEMVs against the CPU

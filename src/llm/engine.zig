@@ -13,10 +13,14 @@ const kv_cache_mod = @import("kv_cache.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
 const KvCache = kv_cache_mod.KvCache;
 
+pub const Capacity = kv_cache_mod.Capacity;
+
 pub const Options = struct {
     max_new_tokens: usize = 256,
-    /// KV-cache capacity cap; the cache is sized to
-    /// min(max_context, prompt + max_new_tokens).
+    /// Context-window ceiling. The KV cache's growth limit is
+    /// min(max_context, prompt + max_new_tokens) for one-shot prompts and
+    /// max_context for chat sessions; only a small initial slice is
+    /// committed up front (see capacityPlanFor / kv_cache.Capacity).
     max_context: usize = 4096,
     sampling: sample.Params = .{},
     /// RNG seed for sampling (irrelevant when temperature = 0).
@@ -34,11 +38,33 @@ pub const Options = struct {
     spec_stats: ?*spec.Stats = null,
 };
 
-/// KV-cache capacity for a given prompt; errors when the prompt alone
-/// overflows the window.
+/// KV-cache capacity ceiling for a given prompt; errors when the prompt
+/// alone overflows the window.
 pub fn capacityFor(opts: Options, prompt_len: usize) !usize {
     if (prompt_len >= opts.max_context) return error.PromptTooLong;
     return @min(opts.max_context, prompt_len + opts.max_new_tokens);
+}
+
+/// Dynamic sizing plan for a one-shot prompt: commit only enough rows for
+/// the prompt (or the kv_cache.initial_context floor) and grow toward the
+/// capacityFor ceiling as generation actually uses it. Backends without
+/// growth support treat `.max` as the (old, fixed) capacity.
+pub fn capacityPlanFor(opts: Options, prompt_len: usize) !Capacity {
+    const max = try capacityFor(opts, prompt_len);
+    return .{ .initial = @min(max, @max(prompt_len + 1, kv_cache_mod.initial_context)), .max = max };
+}
+
+/// Make room for `need` more rows, growing dynamic-capacity models (steppers
+/// exposing ensureCapacity). error.ContextFull when the window — or the
+/// memory backing its growth — can't cover the rows.
+fn ensureRoom(model: anytype, need: usize) !void {
+    if (need <= model.remaining()) return;
+    const M = switch (@typeInfo(@TypeOf(model))) {
+        .pointer => |p| p.child,
+        else => @TypeOf(model),
+    };
+    if (comptime !@hasDecl(M, "ensureCapacity")) return error.ContextFull;
+    try model.ensureCapacity(model.cached() + need);
 }
 
 /// Extend `ids` in place until a stop token, the token budget, or a full
@@ -88,7 +114,8 @@ pub fn generate(
     var stream: Utf8Stream = .{};
 
     const new = ids.items[model.cached()..];
-    if (new.len == 0 or new.len > model.remaining()) return error.ContextFull;
+    if (new.len == 0) return error.ContextFull;
+    try ensureRoom(model, new.len);
     try model.step(io, new, logits);
     var n: usize = 0;
     while (n < opts.max_new_tokens) {
@@ -103,7 +130,16 @@ pub fn generate(
             try w.flush();
         }
         if (n == opts.max_new_tokens) break; // budget spent: skip the forward whose logits nobody reads
-        if (model.remaining() == 0) break; // context window full
+        if (model.remaining() == 0) {
+            // Dynamic capacity: commit more rows (possibly evicting weights
+            // into the streaming path) before declaring the window full.
+            // (Runtime comparison, not a switch: models whose ensureCapacity
+            // can only fail with ContextFull would make an else unreachable.)
+            ensureRoom(model, 1) catch |err| {
+                if (err == error.ContextFull) break;
+                return err;
+            };
+        }
         try model.step(io, &.{next}, logits);
     }
     return n;
@@ -117,6 +153,8 @@ pub const CpuModel = struct {
     cache: KvCache,
     freqs: ops.rope.Freqs,
     last_hidden: []f32,
+    /// Growth ceiling (rows); the cache starts at cap.initial and grows here.
+    max_capacity: usize,
     /// Retained per-layer batch K/V of the last tree verify
     /// ([n_layers][tree_n][kv_dim]); lazily allocated to
     /// n_layers * spec.max_tree_nodes rows on first stepAllTree.
@@ -124,13 +162,29 @@ pub const CpuModel = struct {
     tree_v: ?[]f32 = null,
     tree_n: usize = 0,
 
-    pub fn init(gpa: std.mem.Allocator, lm: *const qwen3.CausalLM, capacity: usize) !CpuModel {
-        var cache = try KvCache.init(gpa, lm.cfg.n_layers, capacity, lm.cfg.kvDim());
+    pub fn init(gpa: std.mem.Allocator, lm: *const qwen3.CausalLM, cap: Capacity) !CpuModel {
+        var cache = try KvCache.init(gpa, lm.cfg.n_layers, cap.initial, lm.cfg.kvDim());
         errdefer cache.deinit(gpa);
-        var freqs = try ops.rope.rotateHalfFreqs(gpa, capacity, qwen3.head_dim, lm.cfg.rope_theta);
+        var freqs = try ops.rope.rotateHalfFreqs(gpa, cap.initial, qwen3.head_dim, lm.cfg.rope_theta);
         errdefer freqs.deinit(gpa);
         const last_hidden = try gpa.alloc(f32, lm.cfg.hidden);
-        return .{ .lm = lm, .gpa = gpa, .cache = cache, .freqs = freqs, .last_hidden = last_hidden };
+        return .{ .lm = lm, .gpa = gpa, .cache = cache, .freqs = freqs, .last_hidden = last_hidden, .max_capacity = cap.max };
+    }
+
+    pub fn capacityMax(self: *const CpuModel) usize {
+        return self.max_capacity;
+    }
+
+    /// Grow the cache (and the RoPE table) to hold at least `min_rows`.
+    /// error.ContextFull past the window or when host memory runs out.
+    pub fn ensureCapacity(self: *CpuModel, min_rows: usize) !void {
+        if (min_rows <= self.cache.capacity) return;
+        if (min_rows > self.max_capacity) return error.ContextFull;
+        const target = kv_cache_mod.growTarget(self.cache.capacity, min_rows, self.max_capacity);
+        self.cache.grow(self.gpa, target) catch return error.ContextFull;
+        const freqs = ops.rope.rotateHalfFreqs(self.gpa, target, qwen3.head_dim, self.lm.cfg.rope_theta) catch return error.ContextFull;
+        self.freqs.deinit(self.gpa);
+        self.freqs = freqs;
     }
 
     pub fn deinit(self: *CpuModel) void {
@@ -291,7 +345,7 @@ test "multi-turn generation continues the cache" {
     defer tok.deinit();
 
     const opts: Options = .{ .max_new_tokens = 1, .sampling = .{ .temperature = 0 } };
-    var model = try CpuModel.init(gpa, &lm, 128);
+    var model = try CpuModel.init(gpa, &lm, .fixed(128));
     defer model.deinit();
 
     var ids: std.ArrayList(u32) = .empty;
@@ -311,6 +365,44 @@ test "multi-turn generation continues the cache" {
     _ = try generate(&model, &tok, io, gpa, &ids, opts, null);
     try std.testing.expect(model.cached() > before);
     try std.testing.expectEqual(ids.items.len - 1, model.cached());
+}
+
+// Dynamic-capacity growth is transparent: a cache that starts far too small
+// for the prompt (growing during prefill) must produce the same greedy token
+// as a full-size cache. Gated on the checkpoint; kept to 1 token.
+test "generation with a growing cache matches fixed capacity" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const safetensors = @import("../safetensors.zig");
+    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
+
+    var st = try safetensors.SafeTensors.open(gpa, io, te_path);
+    defer st.deinit();
+    var lm = try qwen3.CausalLM.load(gpa, .{ .safetensors = &st });
+    defer lm.deinit();
+    var tok = try Tokenizer.init(gpa);
+    defer tok.deinit();
+
+    var prompt: std.ArrayList(u32) = .empty;
+    defer prompt.deinit(gpa);
+    try chat.appendUser(&tok, gpa, "Say hi.", &prompt);
+    try chat.openAssistant(&tok, gpa, &prompt);
+
+    const opts: Options = .{ .max_new_tokens = 1, .sampling = .{ .temperature = 0 } };
+    var out_fixed: u32 = undefined;
+    var out_grown: u32 = undefined;
+    for ([2]Capacity{ .fixed(128), .{ .initial = 4, .max = 128 } }, [2]*u32{ &out_fixed, &out_grown }) |cap, out| {
+        var model = try CpuModel.init(gpa, &lm, cap);
+        defer model.deinit();
+        var ids: std.ArrayList(u32) = .empty;
+        defer ids.deinit(gpa);
+        try ids.appendSlice(gpa, prompt.items);
+        const n = try generate(&model, &tok, io, gpa, &ids, opts, null);
+        try std.testing.expectEqual(@as(usize, 1), n);
+        out.* = ids.items[ids.items.len - 1];
+    }
+    try std.testing.expectEqual(out_fixed, out_grown);
 }
 
 // End-to-end mechanics (forward -> lm_head -> argmax -> append) against the
@@ -337,7 +429,7 @@ test "greedy generation produces valid tokens" {
     const prompt_len = ids.items.len;
 
     const opts: Options = .{ .max_new_tokens = 2, .sampling = .{ .temperature = 0 } };
-    var model = try CpuModel.init(gpa, &lm, try capacityFor(opts, prompt_len));
+    var model = try CpuModel.init(gpa, &lm, try capacityPlanFor(opts, prompt_len));
     defer model.deinit();
     const n = try generate(&model, &tok, io, gpa, &ids, opts, null);
     try std.testing.expectEqual(prompt_len + n, ids.items.len);

@@ -19,9 +19,11 @@ const cuda = @import("../gpu/cuda.zig");
 const safetensors = @import("../safetensors.zig");
 const ops = @import("../ops.zig");
 const spec = @import("../llm/spec.zig");
+const kvmod = @import("../llm/kv_cache.zig");
 
 const Backend = cuda.Backend;
 const Buf = cuda.backend.DeviceBuffer;
+const Growable = Backend.GrowableTensor;
 
 const hidden = qwen3.hidden; // 2560
 const n_heads = qwen3.n_heads; // 32
@@ -150,15 +152,19 @@ pub const CudaLM = struct {
     gpa: std.mem.Allocator,
     /// Model shape (mirrors lm.cfg): the 4B target or the 0.6B draft.
     cfg: qwen3.Config,
+    /// Committed KV rows; grows in place toward max_capacity (ensureCapacity).
     capacity: usize,
+    /// Growth ceiling — the VA reservation behind each KV cache and the RoPE
+    /// table are sized to this, so growth never moves a device pointer.
+    max_capacity: usize,
     /// Committed cache length (absolute position of the next token).
     len: usize = 0,
     /// Activation-buffer row budget: the prompt for prefill, 1 afterwards.
     max_rows: usize,
     sin_off: usize,
     /// Only cfg.n_layers entries are live.
-    k_cache: [qwen3.Config.max_layers]Buf,
-    v_cache: [qwen3.Config.max_layers]Buf,
+    k_cache: [qwen3.Config.max_layers]Growable,
+    v_cache: [qwen3.Config.max_layers]Growable,
     freqs_d: Buf,
     bufs: LmBufs,
     /// Hidden-state taps for the EAGLE-3 drafter (enableTaps): the residual
@@ -182,7 +188,7 @@ pub const CudaLM = struct {
     /// Cleared permanently if capture fails — falls back to per-op launches.
     graph_ok: bool = true,
 
-    pub fn init(gpa: std.mem.Allocator, be: *Backend, lm: *const qwen3.CausalLM, capacity: usize, first_seq: usize) !CudaLM {
+    pub fn init(gpa: std.mem.Allocator, be: *Backend, lm: *const qwen3.CausalLM, cap: kvmod.Capacity, first_seq: usize) !CudaLM {
         // Embedding/LM-head kernels exist for bf16 and the ggml block-quant
         // formats (tied or untied head); anything else has no gather kernel.
         switch (lm.embed.dtype) {
@@ -199,12 +205,15 @@ pub const CudaLM = struct {
         self.be = be;
         self.gpa = gpa;
         self.cfg = c;
-        self.capacity = capacity;
+        self.capacity = cap.initial;
+        self.max_capacity = cap.max;
         self.len = 0;
         // Activation buffers always cover a speculative verify batch; padded
         // GEMM buffers are 128-row anyway, so the floor is nearly free.
         self.max_rows = @max(@max(first_seq, 1), spec.max_draft + 1);
-        self.sin_off = capacity * half;
+        // RoPE table (and its sin offset, baked into captured graphs as a
+        // kernel param) cover max_capacity so KV growth never touches them.
+        self.sin_off = cap.max * half;
         self.graph_exec = null;
         self.decode_warm = false;
         self.graph_ok = true;
@@ -214,26 +223,26 @@ pub const CudaLM = struct {
         self.tree = null;
         self.tree_n = 0;
 
-        var freqs = try ops.rope.rotateHalfFreqs(gpa, capacity, hd, c.rope_theta);
+        var freqs = try ops.rope.rotateHalfFreqs(gpa, cap.max, hd, c.rope_theta);
         defer freqs.deinit(gpa);
-        const fp = try gpa.alloc(f32, 2 * capacity * half);
+        const fp = try gpa.alloc(f32, 2 * cap.max * half);
         defer gpa.free(fp);
-        @memcpy(fp[0 .. capacity * half], freqs.cos);
-        @memcpy(fp[capacity * half ..], freqs.sin);
+        @memcpy(fp[0 .. cap.max * half], freqs.cos);
+        @memcpy(fp[cap.max * half ..], freqs.sin);
         self.freqs_d = try be.tensorCreate(fp.len * 4);
         errdefer be.tensorDestroy(&self.freqs_d);
         try be.tensorUpload(self.freqs_d, std.mem.sliceAsBytes(fp));
 
         var created: usize = 0;
-        errdefer for (self.k_cache[0..created]) |*b| be.tensorDestroy(b);
+        errdefer for (self.k_cache[0..created]) |*b| be.growableDestroy(b);
         for (self.k_cache[0..c.n_layers]) |*b| {
-            b.* = try be.tensorCreate(capacity * c.kvDim() * 4);
+            b.* = try be.growableCreate(cap.initial * c.kvDim() * 4, cap.max * c.kvDim() * 4);
             created += 1;
         }
         var vcreated: usize = 0;
-        errdefer for (self.v_cache[0..vcreated]) |*b| be.tensorDestroy(b);
+        errdefer for (self.v_cache[0..vcreated]) |*b| be.growableDestroy(b);
         for (self.v_cache[0..c.n_layers]) |*b| {
-            b.* = try be.tensorCreate(capacity * c.kvDim() * 4);
+            b.* = try be.growableCreate(cap.initial * c.kvDim() * 4, cap.max * c.kvDim() * 4);
             vcreated += 1;
         }
 
@@ -262,19 +271,22 @@ pub const CudaLM = struct {
         const c = self.cfg;
         std.debug.assert(self.tree == null and self.len == 0);
 
+        // The batch region sits at rows [capacity, capacity + max_tree_nodes)
+        // — capacity is baked into the layout, so tree sessions stay fixed.
+        std.debug.assert(self.capacity == self.max_capacity);
         const kv_bytes = (self.capacity + spec.max_tree_nodes) * c.kvDim() * 4;
-        var nk: [qwen3.Config.max_layers]Buf = undefined;
-        var nv: [qwen3.Config.max_layers]Buf = undefined;
+        var nk: [qwen3.Config.max_layers]Growable = undefined;
+        var nv: [qwen3.Config.max_layers]Growable = undefined;
         var created: usize = 0;
         errdefer for (0..created) |i| {
-            be.tensorDestroy(if (i < c.n_layers) &nk[i] else &nv[i - c.n_layers]);
+            be.growableDestroy(if (i < c.n_layers) &nk[i] else &nv[i - c.n_layers]);
         };
         for (nk[0..c.n_layers]) |*b| {
-            b.* = try be.tensorCreate(kv_bytes);
+            b.* = try be.growableCreate(kv_bytes, kv_bytes);
             created += 1;
         }
         for (nv[0..c.n_layers]) |*b| {
-            b.* = try be.tensorCreate(kv_bytes);
+            b.* = try be.growableCreate(kv_bytes, kv_bytes);
             created += 1;
         }
         var tb = try TreeBufs.init(be, c);
@@ -285,8 +297,8 @@ pub const CudaLM = struct {
             self.bufs = bufs;
             self.max_rows = spec.max_tree_nodes;
         }
-        for (self.k_cache[0..c.n_layers]) |*b| be.tensorDestroy(b);
-        for (self.v_cache[0..c.n_layers]) |*b| be.tensorDestroy(b);
+        for (self.k_cache[0..c.n_layers]) |*b| be.growableDestroy(b);
+        for (self.v_cache[0..c.n_layers]) |*b| be.growableDestroy(b);
         self.k_cache = nk;
         self.v_cache = nv;
         self.tree = tb;
@@ -296,8 +308,8 @@ pub const CudaLM = struct {
         if (self.tree) |*tb| tb.deinit(self.be);
         if (self.taps_on) self.be.tensorDestroy(&self.tap_d);
         if (self.graph_exec != null) self.be.graphDestroy(self.graph_exec);
-        for (self.k_cache[0..self.cfg.n_layers]) |*b| self.be.tensorDestroy(b);
-        for (self.v_cache[0..self.cfg.n_layers]) |*b| self.be.tensorDestroy(b);
+        for (self.k_cache[0..self.cfg.n_layers]) |*b| self.be.growableDestroy(b);
+        for (self.v_cache[0..self.cfg.n_layers]) |*b| self.be.growableDestroy(b);
         self.be.tensorDestroy(&self.freqs_d);
         self.bufs.deinit(self.be);
         self.* = undefined;
@@ -309,6 +321,34 @@ pub const CudaLM = struct {
 
     pub fn remaining(self: *const CudaLM) usize {
         return self.capacity - self.len;
+    }
+
+    pub fn capacityMax(self: *const CudaLM) usize {
+        return self.max_capacity;
+    }
+
+    /// Commit more KV rows, in place: device pointers (and the captured
+    /// decode graph — sin_off and the KV strides are capacity-independent)
+    /// stay valid. Under VRAM pressure the commit evicts LRU weights into
+    /// the streaming path, which flips the graph off via the evictions guard
+    /// in step(). error.ContextFull past the window, when even eviction
+    /// can't free enough device memory, or when the tap/tree layouts (which
+    /// stride by capacity) pin the session to a fixed size.
+    pub fn ensureCapacity(self: *CudaLM, min_rows: usize) !void {
+        if (min_rows <= self.capacity) return;
+        if (min_rows > self.max_capacity) return error.ContextFull;
+        if (self.taps_on or self.tree != null) return error.ContextFull;
+        const target = kvmod.growTarget(self.capacity, min_rows, self.max_capacity);
+        const bytes = target * self.cfg.kvDim() * 4;
+        for ([2][]Growable{ self.k_cache[0..self.cfg.n_layers], self.v_cache[0..self.cfg.n_layers] }) |caches| {
+            for (caches) |*b| {
+                self.be.growableEnsure(b, bytes) catch |err| switch (err) {
+                    error.DeviceOutOfMemory, error.OutOfMemory => return error.ContextFull,
+                    else => return err,
+                };
+            }
+        }
+        self.capacity = target;
     }
 
     /// Forward `ids` at positions [len, len+ids.len), then write
@@ -394,9 +434,9 @@ pub const CudaLM = struct {
             try be.qkNorm(b.k, b.k, try nbuf(be, layer.k_norm), c.n_kv_heads, hd, eps);
             try be.opRopeHalfS(b.q, self.freqs_d, c.n_heads, half, self.sin_off);
             try be.opRopeHalfS(b.k, self.freqs_d, c.n_kv_heads, half, self.sin_off);
-            try be.opKvAppendS(self.k_cache[l], b.k, c.kvDim(), c.kvDim(), 0);
-            try be.opKvAppendS(self.v_cache[l], b.v, c.kvDim(), c.kvDim(), 0);
-            try be.opAttnDecodeSGraph(b.q, self.k_cache[l], self.v_cache[l], b.attn, b.attn_scratch, c.n_heads, c.n_kv_heads, hd, nsplit, attn_scale);
+            try be.opKvAppendS(self.k_cache[l].buf, b.k, c.kvDim(), c.kvDim(), 0);
+            try be.opKvAppendS(self.v_cache[l].buf, b.v, c.kvDim(), c.kvDim(), 0);
+            try be.opAttnDecodeSGraph(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, c.n_heads, c.n_kv_heads, hd, nsplit, attn_scale);
             try self.linear(b.t, b.attn, layer.o, c.hidden, c.qDim(), 1);
             try be.opAdd(b.x, b.t, c.hidden);
             try be.qkNorm(b.x, b.normed, try nbuf(be, layer.post_norm), 1, c.hidden, eps);
@@ -514,9 +554,9 @@ pub const CudaLM = struct {
             try be.qkNorm(b.k, b.k, try nbuf(be, layer.k_norm), n * c.n_kv_heads, hd, eps);
             try be.opRopeHalfPos(b.q, tb.pos, self.freqs_d, n, c.n_heads, half, self.sin_off);
             try be.opRopeHalfPos(b.k, tb.pos, self.freqs_d, n, c.n_kv_heads, half, self.sin_off);
-            try be.tensorCopy(self.k_cache[l], self.capacity * c.kvDim() * 4, b.k, 0, n * c.kvDim() * 4);
-            try be.tensorCopy(self.v_cache[l], self.capacity * c.kvDim() * 4, b.v, 0, n * c.kvDim() * 4);
-            try be.opAttnDecodeTree(b.q, self.k_cache[l], self.v_cache[l], b.attn, tb.scratch, self.len, self.capacity, n, c.n_heads, c.n_kv_heads, hd, nsplit, attn_scale);
+            try be.tensorCopy(self.k_cache[l].buf, self.capacity * c.kvDim() * 4, b.k, 0, n * c.kvDim() * 4);
+            try be.tensorCopy(self.v_cache[l].buf, self.capacity * c.kvDim() * 4, b.v, 0, n * c.kvDim() * 4);
+            try be.opAttnDecodeTree(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, tb.scratch, self.len, self.capacity, n, c.n_heads, c.n_kv_heads, hd, nsplit, attn_scale);
             try self.linear(b.t, b.attn, layer.o, c.hidden, c.qDim(), n);
             try be.opAdd(b.x, b.t, n * c.hidden);
 
@@ -553,8 +593,8 @@ pub const CudaLM = struct {
         for (0..c.n_layers) |l| {
             for (path, 0..) |idx, j| {
                 std.debug.assert(idx < self.tree_n);
-                try be.opCopyOff(self.k_cache[l], (self.len + j) * kvd, self.k_cache[l], (self.capacity + idx) * kvd, kvd);
-                try be.opCopyOff(self.v_cache[l], (self.len + j) * kvd, self.v_cache[l], (self.capacity + idx) * kvd, kvd);
+                try be.opCopyOff(self.k_cache[l].buf, (self.len + j) * kvd, self.k_cache[l].buf, (self.capacity + idx) * kvd, kvd);
+                try be.opCopyOff(self.v_cache[l].buf, (self.len + j) * kvd, self.v_cache[l].buf, (self.capacity + idx) * kvd, kvd);
             }
         }
         if (self.taps_on) {
@@ -627,14 +667,14 @@ pub const CudaLM = struct {
             try be.qkNorm(b.k, b.k, try nbuf(be, layer.k_norm), seq * c.n_kv_heads, hd, eps);
             try be.ropeHalf(b.q, self.freqs_d, seq, c.n_heads, half, self.sin_off, pos0);
             try be.ropeHalf(b.k, self.freqs_d, seq, c.n_kv_heads, half, self.sin_off, pos0);
-            try be.tensorCopy(self.k_cache[l], pos0 * c.kvDim() * 4, b.k, 0, seq * c.kvDim() * 4);
-            try be.tensorCopy(self.v_cache[l], pos0 * c.kvDim() * 4, b.v, 0, seq * c.kvDim() * 4);
+            try be.tensorCopy(self.k_cache[l].buf, pos0 * c.kvDim() * 4, b.k, 0, seq * c.kvDim() * 4);
+            try be.tensorCopy(self.v_cache[l].buf, pos0 * c.kvDim() * 4, b.v, 0, seq * c.kvDim() * 4);
             if (seq <= gemv_batch_max) {
                 // Batched flash-decoding: the naive square kernel has too
                 // little parallelism for a handful of queries.
-                try be.opAttnDecode(b.q, self.k_cache[l], self.v_cache[l], b.attn, b.attn_scratch, pos0 + 1, seq, c.n_heads, c.n_kv_heads, hd, nsplit, attn_scale);
+                try be.opAttnDecode(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, pos0 + 1, seq, c.n_heads, c.n_kv_heads, hd, nsplit, attn_scale);
             } else {
-                try be.attn(b.q, self.k_cache[l], self.v_cache[l], b.attn, seq, pos0 + seq, c.n_heads, c.n_kv_heads, hd, attn_scale, true);
+                try be.attn(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, seq, pos0 + seq, c.n_heads, c.n_kv_heads, hd, attn_scale, true);
             }
             try self.linear(b.t, b.attn, layer.o, c.hidden, c.qDim(), seq);
             try be.opAdd(b.x, b.t, seq * c.hidden);
@@ -937,7 +977,7 @@ test "cuda tree spec matches vanilla greedy on the real model" {
     try ids_tree.appendSlice(gpa, ids_vanilla.items);
 
     {
-        var model = try CudaLM.init(gpa, be, &lm, try engine.capacityFor(opts, ids_vanilla.items.len), ids_vanilla.items.len);
+        var model = try CudaLM.init(gpa, be, &lm, .fixed(try engine.capacityFor(opts, ids_vanilla.items.len)), ids_vanilla.items.len);
         defer model.deinit();
         _ = try engine.generate(&model, &tok, io, gpa, &ids_vanilla, opts, null);
     }
@@ -945,7 +985,7 @@ test "cuda tree spec matches vanilla greedy on the real model" {
         opts.tree_nodes = 4;
         var stats: spec.Stats = .{};
         opts.spec_stats = &stats;
-        var model = try CudaLM.init(gpa, be, &lm, try engine.capacityFor(opts, ids_tree.items.len), ids_tree.items.len);
+        var model = try CudaLM.init(gpa, be, &lm, .fixed(try engine.capacityFor(opts, ids_tree.items.len)), ids_tree.items.len);
         defer model.deinit();
         try model.enableTree();
         var ngram: spec.NgramDrafter = .{};
@@ -991,7 +1031,7 @@ test "cuda weight streaming matches resident greedy on the real model" {
     try ids_streamed.appendSlice(gpa, ids_resident.items);
 
     {
-        var model = try CudaLM.init(gpa, be, &lm, try engine.capacityFor(opts, ids_resident.items.len), ids_resident.items.len);
+        var model = try CudaLM.init(gpa, be, &lm, .fixed(try engine.capacityFor(opts, ids_resident.items.len)), ids_resident.items.len);
         defer model.deinit();
         _ = try engine.generate(&model, &tok, io, gpa, &ids_resident, opts, null);
     }
@@ -1000,7 +1040,7 @@ test "cuda weight streaming matches resident greedy on the real model" {
     be.pin_budget = 1 << 29; // first ~512 MiB of weights pinned, rest streams
     if (st.mapping) |m| be.enableDirectStreaming(m); // prefetched direct-DMA path
     {
-        var model = try CudaLM.init(gpa, be, &lm, try engine.capacityFor(opts, ids_streamed.items.len), ids_streamed.items.len);
+        var model = try CudaLM.init(gpa, be, &lm, .fixed(try engine.capacityFor(opts, ids_streamed.items.len)), ids_streamed.items.len);
         defer model.deinit();
         try model.prewarmWeights(); // the draft-pinning path: first claim on pin_budget
         _ = try engine.generate(&model, &tok, io, gpa, &ids_streamed, opts, null);

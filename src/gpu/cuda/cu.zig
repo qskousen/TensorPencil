@@ -92,6 +92,39 @@ pub const CU_FUNC_CACHE_PREFER_SHARED: c_int = 0x01;
 pub const CU_FUNC_CACHE_PREFER_L1: c_int = 0x02;
 pub const CU_FUNC_CACHE_PREFER_EQUAL: c_int = 0x03;
 
+// ---- Virtual memory management (cuMemAddressReserve/cuMemCreate/cuMemMap;
+// driver >= CUDA 10.2). Used for growable buffers: reserve VA once, commit
+// physical 2 MB-granularity chunks as needed — the device pointer never moves.
+pub const CUmemGenericAllocationHandle = u64;
+
+pub const CU_MEM_ALLOCATION_TYPE_PINNED: c_int = 0x1;
+pub const CU_MEM_LOCATION_TYPE_DEVICE: c_int = 0x1;
+pub const CU_MEM_ACCESS_FLAGS_PROT_READWRITE: c_int = 0x3;
+pub const CU_MEM_ALLOC_GRANULARITY_MINIMUM: c_int = 0x0;
+
+pub const CUmemLocation = extern struct {
+    type: c_int = 0,
+    id: c_int = 0,
+};
+
+pub const CUmemAllocationProp = extern struct {
+    type: c_int = 0,
+    requestedHandleType: c_int = 0,
+    location: CUmemLocation = .{},
+    win32HandleMetaData: ?*anyopaque = null,
+    allocFlags: extern struct {
+        compressionType: u8 = 0,
+        gpuDirectRDMACapable: u8 = 0,
+        usage: u16 = 0,
+        reserved: [4]u8 = @splat(0),
+    } = .{},
+};
+
+pub const CUmemAccessDesc = extern struct {
+    location: CUmemLocation = .{},
+    flags: c_int = 0,
+};
+
 // ---- Function-pointer types --------------------------------------------------
 const PFN_cuInit = *const fn (c_uint) callconv(.c) CUresult;
 const PFN_cuDriverGetVersion = *const fn (*c_int) callconv(.c) CUresult;
@@ -156,6 +189,14 @@ const PFN_cuEventElapsedTime = *const fn (*f32, CUevent, CUevent) callconv(.c) C
 const PFN_cuEventDestroy = *const fn (CUevent) callconv(.c) CUresult;
 const PFN_cuGetErrorString = *const fn (CUresult, *?[*:0]const u8) callconv(.c) CUresult;
 const PFN_cuGetErrorName = *const fn (CUresult, *?[*:0]const u8) callconv(.c) CUresult;
+const PFN_cuMemGetAllocationGranularity = *const fn (*usize, *const CUmemAllocationProp, c_int) callconv(.c) CUresult;
+const PFN_cuMemAddressReserve = *const fn (*CUdeviceptr, usize, usize, CUdeviceptr, c_ulonglong) callconv(.c) CUresult;
+const PFN_cuMemAddressFree = *const fn (CUdeviceptr, usize) callconv(.c) CUresult;
+const PFN_cuMemCreate = *const fn (*CUmemGenericAllocationHandle, usize, *const CUmemAllocationProp, c_ulonglong) callconv(.c) CUresult;
+const PFN_cuMemRelease = *const fn (CUmemGenericAllocationHandle) callconv(.c) CUresult;
+const PFN_cuMemMap = *const fn (CUdeviceptr, usize, usize, CUmemGenericAllocationHandle, c_ulonglong) callconv(.c) CUresult;
+const PFN_cuMemUnmap = *const fn (CUdeviceptr, usize) callconv(.c) CUresult;
+const PFN_cuMemSetAccess = *const fn (CUdeviceptr, usize, [*]const CUmemAccessDesc, usize) callconv(.c) CUresult;
 
 pub const Error = error{CudaError};
 
@@ -216,6 +257,17 @@ pub const Api = struct {
     cuEventDestroy: PFN_cuEventDestroy,
     cuGetErrorString: PFN_cuGetErrorString,
     cuGetErrorName: PFN_cuGetErrorName,
+
+    // Optional VMM entry points (null on pre-10.2 drivers; growable buffers
+    // then fall back to full-size upfront allocation).
+    cuMemGetAllocationGranularity: ?PFN_cuMemGetAllocationGranularity = null,
+    cuMemAddressReserve: ?PFN_cuMemAddressReserve = null,
+    cuMemAddressFree: ?PFN_cuMemAddressFree = null,
+    cuMemCreate: ?PFN_cuMemCreate = null,
+    cuMemRelease: ?PFN_cuMemRelease = null,
+    cuMemMap: ?PFN_cuMemMap = null,
+    cuMemUnmap: ?PFN_cuMemUnmap = null,
+    cuMemSetAccess: ?PFN_cuMemSetAccess = null,
 
     /// dlopen the driver and resolve every symbol. Returns error.CudaError if
     /// the library or any required symbol is missing.
@@ -285,6 +337,22 @@ pub const Api = struct {
             const sym: [:0]const u8 = pair[1];
             const T = @TypeOf(@field(api, field));
             @field(api, field) = api.lib.lookup(T, sym) orelse return error.CudaError;
+        }
+
+        // Optional entry points: absent symbols leave the field null (the
+        // exported names carry no _v2 suffixes).
+        inline for (.{
+            "cuMemGetAllocationGranularity",
+            "cuMemAddressReserve",
+            "cuMemAddressFree",
+            "cuMemCreate",
+            "cuMemRelease",
+            "cuMemMap",
+            "cuMemUnmap",
+            "cuMemSetAccess",
+        }) |name| {
+            const Child = @typeInfo(@TypeOf(@field(api, name))).optional.child;
+            @field(api, name) = api.lib.lookup(Child, name);
         }
 
         return api;

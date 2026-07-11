@@ -13,9 +13,11 @@ const qwen35 = @import("qwen35.zig");
 const qwen3 = @import("qwen3.zig");
 const cuda = @import("../gpu/cuda.zig");
 const ops = @import("../ops.zig");
+const kvmod = @import("../llm/kv_cache.zig");
 
 const Backend = cuda.Backend;
 const Buf = cuda.backend.DeviceBuffer;
+const Growable = Backend.GrowableTensor;
 
 fn nbuf(be: *Backend, weights: []const f32) !Buf {
     return .{ .buf = try be.smallBuffer(std.mem.sliceAsBytes(weights)), .mem = .null_handle, .size = 0 };
@@ -37,13 +39,17 @@ pub const CudaLM = struct {
     be: *Backend,
     gpa: std.mem.Allocator,
     cfg: qwen35.Config,
+    /// Committed KV rows; grows in place toward max_capacity (ensureCapacity).
     capacity: usize,
+    /// Growth ceiling — the VA reservation behind each KV cache and the RoPE
+    /// table are sized to this, so growth never moves a device pointer.
+    max_capacity: usize,
     len: usize,
 
     bufs: Bufs,
-    /// Per-attention-slot KV caches, [capacity][kvDim] f32.
-    k_cache: []Buf,
-    v_cache: []Buf,
+    /// Per-attention-slot KV caches, [capacity][kvDim] f32 (growable).
+    k_cache: []Growable,
+    v_cache: []Growable,
     /// [n_lin][channels][kernel-1] rolling conv tails.
     conv_state: Buf,
     /// [n_lin][heads][d][d] delta-rule states.
@@ -81,7 +87,7 @@ pub const CudaLM = struct {
     graph_ok: bool = true,
     arena: std.heap.ArenaAllocator,
 
-    pub fn init(gpa: std.mem.Allocator, be: *Backend, lm: *const qwen35.Model, capacity: usize) !CudaLM {
+    pub fn init(gpa: std.mem.Allocator, be: *Backend, lm: *const qwen35.Model, cap: kvmod.Capacity) !CudaLM {
         const cfg = lm.cfg;
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
@@ -92,7 +98,8 @@ pub const CudaLM = struct {
         self.be = be;
         self.gpa = gpa;
         self.cfg = cfg;
-        self.capacity = capacity;
+        self.capacity = cap.initial;
+        self.max_capacity = cap.max;
         self.len = 0;
         self.pos_next = 0;
         self.layer_dump = null;
@@ -108,15 +115,17 @@ pub const CudaLM = struct {
             else => false,
         };
 
-        // Rope table for the rotated span (rope_dim), like qwen3_cuda's.
-        var freqs = try ops.rope.rotateHalfFreqs(gpa, capacity, cfg.rope_dim, cfg.rope_theta);
+        // Rope table for the rotated span (rope_dim), like qwen3_cuda's —
+        // computed to max_capacity up front so sin_off (baked into captured
+        // graphs as a kernel param) never changes when the KV caches grow.
+        var freqs = try ops.rope.rotateHalfFreqs(gpa, cap.max, cfg.rope_dim, cfg.rope_theta);
         defer freqs.deinit(gpa);
         const half = cfg.rope_dim / 2;
-        const fp = try gpa.alloc(f32, 2 * capacity * half);
+        const fp = try gpa.alloc(f32, 2 * cap.max * half);
         defer gpa.free(fp);
-        @memcpy(fp[0 .. capacity * half], freqs.cos);
-        @memcpy(fp[capacity * half ..], freqs.sin);
-        self.sin_off = capacity * half;
+        @memcpy(fp[0 .. cap.max * half], freqs.cos);
+        @memcpy(fp[cap.max * half ..], freqs.sin);
+        self.sin_off = cap.max * half;
         self.freqs_d = try be.tensorCreate(fp.len * 4);
         try be.tensorUpload(self.freqs_d, std.mem.sliceAsBytes(fp));
         self.pos3_d = try be.tensorCreate(3 * 4);
@@ -125,11 +134,11 @@ pub const CudaLM = struct {
         self.bufs = try Bufs.init(be, cfg);
 
         const n_attn = cfg.nAttnLayers();
-        self.k_cache = try alloc.alloc(Buf, n_attn);
-        self.v_cache = try alloc.alloc(Buf, n_attn);
+        self.k_cache = try alloc.alloc(Growable, n_attn);
+        self.v_cache = try alloc.alloc(Growable, n_attn);
         for (self.k_cache, self.v_cache) |*kb, *vb| {
-            kb.* = try be.tensorCreate(capacity * cfg.kvDim() * 4);
-            vb.* = try be.tensorCreate(capacity * cfg.kvDim() * 4);
+            kb.* = try be.growableCreate(cap.initial * cfg.kvDim() * 4, cap.max * cfg.kvDim() * 4);
+            vb.* = try be.growableCreate(cap.initial * cfg.kvDim() * 4, cap.max * cfg.kvDim() * 4);
         }
 
         const n_lin = cfg.n_layers - n_attn;
@@ -165,8 +174,8 @@ pub const CudaLM = struct {
     pub fn deinit(self: *CudaLM) void {
         const be = self.be;
         if (self.graph_exec != null) be.graphDestroy(self.graph_exec);
-        for (self.k_cache) |*b| be.tensorDestroy(b);
-        for (self.v_cache) |*b| be.tensorDestroy(b);
+        for (self.k_cache) |*b| be.growableDestroy(b);
+        for (self.v_cache) |*b| be.growableDestroy(b);
         be.tensorDestroy(&self.conv_state);
         be.tensorDestroy(&self.ssm_state);
         be.tensorDestroy(&self.freqs_d);
@@ -183,6 +192,32 @@ pub const CudaLM = struct {
 
     pub fn remaining(self: *const CudaLM) usize {
         return self.capacity - self.len;
+    }
+
+    pub fn capacityMax(self: *const CudaLM) usize {
+        return self.max_capacity;
+    }
+
+    /// Commit more KV rows, in place: device pointers (and the captured
+    /// decode graph — sin_off and the KV strides are capacity-independent)
+    /// stay valid. Under VRAM pressure the commit evicts LRU weights into
+    /// the streaming path, which flips the graph off via the evictions guard
+    /// in step(). error.ContextFull past the window or when even eviction
+    /// can't free enough device memory.
+    pub fn ensureCapacity(self: *CudaLM, min_rows: usize) !void {
+        if (min_rows <= self.capacity) return;
+        if (min_rows > self.max_capacity) return error.ContextFull;
+        const target = kvmod.growTarget(self.capacity, min_rows, self.max_capacity);
+        const bytes = target * self.cfg.kvDim() * 4;
+        for ([2][]Growable{ self.k_cache, self.v_cache }) |caches| {
+            for (caches) |*b| {
+                self.be.growableEnsure(b, bytes) catch |err| switch (err) {
+                    error.DeviceOutOfMemory, error.OutOfMemory => return error.ContextFull,
+                    else => return err,
+                };
+            }
+        }
+        self.capacity = target;
     }
 
     pub fn vocab(self: *const CudaLM) usize {
@@ -322,15 +357,15 @@ pub const CudaLM = struct {
                     try be.qkNorm(b.k, b.k, try nbuf(be, al.k_norm), n * cfg.n_kv_heads, hd, eps);
                     try be.opRopeImropePos(b.q, self.pos3s_d, self.freqs_d, n, cfg.n_heads, cfg.rope_dim / 2, self.sin_off, cfg.rope_sections, hd);
                     try be.opRopeImropePos(b.k, self.pos3s_d, self.freqs_d, n, cfg.n_kv_heads, cfg.rope_dim / 2, self.sin_off, cfg.rope_sections, hd);
-                    try be.tensorCopy(self.k_cache[slot], self.len * cfg.kvDim() * 4, b.k, 0, n * cfg.kvDim() * 4);
-                    try be.tensorCopy(self.v_cache[slot], self.len * cfg.kvDim() * 4, b.v, 0, n * cfg.kvDim() * 4);
+                    try be.tensorCopy(self.k_cache[slot].buf, self.len * cfg.kvDim() * 4, b.k, 0, n * cfg.kvDim() * 4);
+                    try be.tensorCopy(self.v_cache[slot].buf, self.len * cfg.kvDim() * 4, b.v, 0, n * cfg.kvDim() * 4);
                     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
                     if (debug_seq_attn) {
                         for (0..n) |t| {
                             try be.opAttnDecode(
                                 offsetBufSized(b.q, t * cfg.qDim() * 4, cfg.qDim() * 4),
-                                self.k_cache[slot],
-                                self.v_cache[slot],
+                                self.k_cache[slot].buf,
+                                self.v_cache[slot].buf,
                                 offsetBufSized(b.attn, t * cfg.qDim() * 4, cfg.qDim() * 4),
                                 b.attn_scratch,
                                 self.len + 1 + t,
@@ -343,7 +378,7 @@ pub const CudaLM = struct {
                             );
                         }
                     } else {
-                        try be.opAttnDecode(b.q, self.k_cache[slot], self.v_cache[slot], b.attn, b.attn_scratch, self.len + 1, n, cfg.n_heads, cfg.n_kv_heads, hd, nsplit_prefill, scale);
+                        try be.opAttnDecode(b.q, self.k_cache[slot].buf, self.v_cache[slot].buf, b.attn, b.attn_scratch, self.len + 1, n, cfg.n_heads, cfg.n_kv_heads, hd, nsplit_prefill, scale);
                     }
                     try be.opMulSigmoid(b.attn, b.gate, n * cfg.qDim());
                     try self.gemm(b.t, b.attn, al.o, n);
@@ -514,13 +549,13 @@ pub const CudaLM = struct {
                     try be.opRopeImrope(b.k, self.pos3_d, self.freqs_d, cfg.n_kv_heads, cfg.rope_dim / 2, self.sin_off, cfg.rope_sections, hd);
                     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
                     if (graph) {
-                        try be.opKvAppendS(self.k_cache[slot], b.k, cfg.kvDim(), cfg.kvDim(), 0);
-                        try be.opKvAppendS(self.v_cache[slot], b.v, cfg.kvDim(), cfg.kvDim(), 0);
-                        try be.opAttnDecodeSGraph(b.q, self.k_cache[slot], self.v_cache[slot], b.attn, b.attn_scratch, cfg.n_heads, cfg.n_kv_heads, hd, nsplit, scale);
+                        try be.opKvAppendS(self.k_cache[slot].buf, b.k, cfg.kvDim(), cfg.kvDim(), 0);
+                        try be.opKvAppendS(self.v_cache[slot].buf, b.v, cfg.kvDim(), cfg.kvDim(), 0);
+                        try be.opAttnDecodeSGraph(b.q, self.k_cache[slot].buf, self.v_cache[slot].buf, b.attn, b.attn_scratch, cfg.n_heads, cfg.n_kv_heads, hd, nsplit, scale);
                     } else {
-                        try be.tensorCopy(self.k_cache[slot], self.len * cfg.kvDim() * 4, b.k, 0, cfg.kvDim() * 4);
-                        try be.tensorCopy(self.v_cache[slot], self.len * cfg.kvDim() * 4, b.v, 0, cfg.kvDim() * 4);
-                        try be.opAttnDecode(b.q, self.k_cache[slot], self.v_cache[slot], b.attn, b.attn_scratch, self.len + 1, 1, cfg.n_heads, cfg.n_kv_heads, hd, nsplit, scale);
+                        try be.tensorCopy(self.k_cache[slot].buf, self.len * cfg.kvDim() * 4, b.k, 0, cfg.kvDim() * 4);
+                        try be.tensorCopy(self.v_cache[slot].buf, self.len * cfg.kvDim() * 4, b.v, 0, cfg.kvDim() * 4);
+                        try be.opAttnDecode(b.q, self.k_cache[slot].buf, self.v_cache[slot].buf, b.attn, b.attn_scratch, self.len + 1, 1, cfg.n_heads, cfg.n_kv_heads, hd, nsplit, scale);
                     }
                     try be.opMulSigmoid(b.attn, b.gate, cfg.qDim());
                     try self.quantizeX(b.attn, cfg.qDim());

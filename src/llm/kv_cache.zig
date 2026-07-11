@@ -7,6 +7,34 @@
 
 const std = @import("std");
 
+/// Sizing plan for a session's KV cache: start with `initial` rows committed
+/// and grow on demand up to `max`. `initial == max` is a fixed-capacity cache
+/// (no growth) — required whenever the capacity is baked into device layouts
+/// (speculative tree batch regions, EAGLE tap strides).
+pub const Capacity = struct {
+    initial: usize,
+    max: usize,
+
+    pub fn fixed(n: usize) Capacity {
+        return .{ .initial = n, .max = n };
+    }
+};
+
+/// Default committed rows for a dynamic session (the growth floor): sessions
+/// start here and grow toward --max-context as the conversation fills.
+pub const initial_context = 4096;
+
+/// Minimum growth increment (rows).
+pub const grow_step = 1024;
+
+/// Capacity to grow to when at least `min` rows are needed: geometric (1.5x,
+/// at least grow_step) so repeated growth stays cheap, clamped to [min, max].
+pub fn growTarget(cur: usize, min: usize, max: usize) usize {
+    std.debug.assert(min <= max);
+    const stepped = cur + @max(cur / 2, grow_step);
+    return @min(max, @max(min, stepped));
+}
+
 pub const KvCache = struct {
     k: []f32,
     v: []f32,
@@ -70,6 +98,26 @@ pub const KvCache = struct {
         std.debug.assert(new_len <= self.len);
         self.len = new_len;
     }
+
+    /// Grow to `new_capacity` rows per layer. The per-layer blocks are
+    /// re-strided into fresh arrays (committed rows copied, the rest left
+    /// uninitialized, exactly like init). No-op when already large enough.
+    pub fn grow(self: *KvCache, gpa: std.mem.Allocator, new_capacity: usize) !void {
+        if (new_capacity <= self.capacity) return;
+        const nk = try gpa.alloc(f32, self.n_layers * new_capacity * self.kv_dim);
+        errdefer gpa.free(nk);
+        const nv = try gpa.alloc(f32, self.n_layers * new_capacity * self.kv_dim);
+        const used = self.len * self.kv_dim;
+        for (0..self.n_layers) |l| {
+            @memcpy(nk[l * new_capacity * self.kv_dim ..][0..used], self.k[l * self.capacity * self.kv_dim ..][0..used]);
+            @memcpy(nv[l * new_capacity * self.kv_dim ..][0..used], self.v[l * self.capacity * self.kv_dim ..][0..used]);
+        }
+        gpa.free(self.k);
+        gpa.free(self.v);
+        self.k = nk;
+        self.v = nv;
+        self.capacity = new_capacity;
+    }
 };
 
 // --- tests -----------------------------------------------------------------
@@ -98,6 +146,38 @@ test "write/commit/view round trip" {
     cache.commit(1);
     try std.testing.expectEqualSlices(f32, &(k0 ++ k2), cache.kView(0, 0));
     try std.testing.expectEqualSlices(f32, &(v0 ++ k2), cache.vView(0, 0));
+}
+
+test "grow preserves committed rows across the re-stride" {
+    const gpa = std.testing.allocator;
+    var cache = try KvCache.init(gpa, 2, 2, 3);
+    defer cache.deinit(gpa);
+
+    const k0 = [_]f32{ 1, 2, 3, 4, 5, 6 }; // two tokens
+    const k1 = [_]f32{ 10, 20, 30, 40, 50, 60 };
+    cache.write(0, &k0, &k1);
+    cache.write(1, &k1, &k0);
+    cache.commit(2);
+
+    try cache.grow(gpa, 5);
+    try std.testing.expectEqual(@as(usize, 5), cache.capacity);
+    try std.testing.expectEqual(@as(usize, 3), cache.remaining());
+    try std.testing.expectEqualSlices(f32, &k0, cache.kView(0, 0));
+    try std.testing.expectEqualSlices(f32, &k1, cache.vView(0, 0));
+    try std.testing.expectEqualSlices(f32, &k1, cache.kView(1, 0));
+
+    // New rows land after the preserved ones.
+    const k2 = [_]f32{ 7, 8, 9 };
+    cache.write(0, &k2, &k2);
+    cache.commit(1);
+    try std.testing.expectEqualSlices(f32, &(k0 ++ k2), cache.kView(0, 0));
+}
+
+test "growTarget is geometric and clamped" {
+    try std.testing.expectEqual(@as(usize, 6144), growTarget(4096, 4097, 32768));
+    try std.testing.expectEqual(@as(usize, 8192), growTarget(6000, 6001, 8192));
+    try std.testing.expectEqual(@as(usize, 9000), growTarget(4096, 9000, 32768));
+    try std.testing.expectEqual(@as(usize, 2048), growTarget(1024, 1025, 32768));
 }
 
 test "truncate rolls back and rows are rewritten" {

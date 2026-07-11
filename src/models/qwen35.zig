@@ -622,14 +622,34 @@ pub const CpuModel = struct {
     state: State,
     freqs: ops.rope.Freqs,
     last_hidden: []f32,
+    /// Growth ceiling (rows); the KV cache starts at cap.initial and grows here.
+    max_capacity: usize,
 
-    pub fn init(gpa: std.mem.Allocator, lm: *const Model, capacity: usize) !CpuModel {
-        var state = try State.init(gpa, lm.cfg, capacity);
+    pub fn init(gpa: std.mem.Allocator, lm: *const Model, cap: kv_cache_mod.Capacity) !CpuModel {
+        var state = try State.init(gpa, lm.cfg, cap.initial);
         errdefer state.deinit(gpa);
-        var freqs = try ops.rope.rotateHalfFreqs(gpa, capacity, lm.cfg.rope_dim, lm.cfg.rope_theta);
+        var freqs = try ops.rope.rotateHalfFreqs(gpa, cap.initial, lm.cfg.rope_dim, lm.cfg.rope_theta);
         errdefer freqs.deinit(gpa);
         const last_hidden = try gpa.alloc(f32, lm.cfg.hidden);
-        return .{ .lm = lm, .gpa = gpa, .state = state, .freqs = freqs, .last_hidden = last_hidden };
+        return .{ .lm = lm, .gpa = gpa, .state = state, .freqs = freqs, .last_hidden = last_hidden, .max_capacity = cap.max };
+    }
+
+    pub fn capacityMax(self: *const CpuModel) usize {
+        return self.max_capacity;
+    }
+
+    /// Grow the attention KV cache (and the RoPE table) to hold at least
+    /// `min_rows`; the recurrent conv/ssm states are position-independent
+    /// and never grow. error.ContextFull past the window or on host OOM.
+    pub fn ensureCapacity(self: *CpuModel, min_rows: usize) !void {
+        if (min_rows <= self.state.capacity) return;
+        if (min_rows > self.max_capacity) return error.ContextFull;
+        const target = kv_cache_mod.growTarget(self.state.capacity, min_rows, self.max_capacity);
+        self.state.kv.grow(self.gpa, target) catch return error.ContextFull;
+        self.state.capacity = target;
+        const freqs = ops.rope.rotateHalfFreqs(self.gpa, target, self.lm.cfg.rope_dim, self.lm.cfg.rope_theta) catch return error.ContextFull;
+        self.freqs.deinit(self.gpa);
+        self.freqs = freqs;
     }
 
     pub fn deinit(self: *CpuModel) void {

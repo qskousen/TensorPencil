@@ -1014,7 +1014,7 @@ test "spec matches vanilla greedy on the real model" {
     try ids_spec.appendSlice(gpa, ids_vanilla.items);
 
     {
-        var model = try engine.CpuModel.init(gpa, &lm, try engine.capacityFor(opts, ids_vanilla.items.len));
+        var model = try engine.CpuModel.init(gpa, &lm, .fixed(try engine.capacityFor(opts, ids_vanilla.items.len)));
         defer model.deinit();
         _ = try engine.generate(&model, &tok, io, gpa, &ids_vanilla, opts, null);
     }
@@ -1022,7 +1022,7 @@ test "spec matches vanilla greedy on the real model" {
         opts.spec_k = 2;
         var stats: Stats = .{};
         opts.spec_stats = &stats;
-        var model = try engine.CpuModel.init(gpa, &lm, try engine.capacityFor(opts, ids_spec.items.len));
+        var model = try engine.CpuModel.init(gpa, &lm, .fixed(try engine.capacityFor(opts, ids_spec.items.len)));
         defer model.deinit();
         _ = try engine.generate(&model, &tok, io, gpa, &ids_spec, opts, null);
         try std.testing.expect(stats.forwards > 0);
@@ -1060,7 +1060,7 @@ test "tree spec matches vanilla greedy on the real model" {
     try ids_tree.appendSlice(gpa, ids_vanilla.items);
 
     {
-        var model = try engine.CpuModel.init(gpa, &lm, try engine.capacityFor(opts, ids_vanilla.items.len));
+        var model = try engine.CpuModel.init(gpa, &lm, .fixed(try engine.capacityFor(opts, ids_vanilla.items.len)));
         defer model.deinit();
         _ = try engine.generate(&model, &tok, io, gpa, &ids_vanilla, opts, null);
     }
@@ -1068,7 +1068,7 @@ test "tree spec matches vanilla greedy on the real model" {
         opts.tree_nodes = 4;
         var stats: Stats = .{};
         opts.spec_stats = &stats;
-        var model = try engine.CpuModel.init(gpa, &lm, try engine.capacityFor(opts, ids_tree.items.len));
+        var model = try engine.CpuModel.init(gpa, &lm, .fixed(try engine.capacityFor(opts, ids_tree.items.len)));
         defer model.deinit();
         var ngram: NgramDrafter = .{};
         var drafter: ChainAsTree(NgramDrafter) = .{ .inner = &ngram };
@@ -1113,15 +1113,15 @@ test "model drafter matches vanilla greedy on the real models" {
     try ids_spec.appendSlice(gpa, ids_vanilla.items);
 
     {
-        var model = try engine.CpuModel.init(gpa, &lm, try engine.capacityFor(opts, ids_vanilla.items.len));
+        var model = try engine.CpuModel.init(gpa, &lm, .fixed(try engine.capacityFor(opts, ids_vanilla.items.len)));
         defer model.deinit();
         _ = try engine.generate(&model, &tok, io, gpa, &ids_vanilla, opts, null);
     }
     {
         opts.spec_k = 2;
-        var model = try engine.CpuModel.init(gpa, &lm, try engine.capacityFor(opts, ids_spec.items.len));
+        var model = try engine.CpuModel.init(gpa, &lm, .fixed(try engine.capacityFor(opts, ids_spec.items.len)));
         defer model.deinit();
-        var draft = try engine.CpuModel.init(gpa, &dlm, try engine.capacityFor(opts, ids_spec.items.len));
+        var draft = try engine.CpuModel.init(gpa, &dlm, .fixed(try engine.capacityFor(opts, ids_spec.items.len)));
         defer draft.deinit();
         var drafter = try ModelDrafter(engine.CpuModel).init(gpa, io, &draft);
         defer drafter.deinit();

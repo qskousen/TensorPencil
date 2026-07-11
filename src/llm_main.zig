@@ -25,6 +25,13 @@ const usage =
     \\              [--vram-budget <GiB>|min]
     \\              [--image <image> --mmproj <mmproj.gguf>]
     \\
+    \\--max-context sets the context-window CEILING. Only a small initial
+    \\slice of KV rows (4096, or the prompt size) is committed up front; the
+    \\cache grows in place on demand, so a large window costs VRAM only as
+    \\the conversation actually fills it. Under VRAM pressure growth evicts
+    \\least-recently-used weights into the streaming path (slower decode)
+    \\instead of failing. Speculative runs (--spec-k/--draft-model/--eagle/
+    \\--tree) reserve the whole window up front, as does --backend vulkan.
     \\Sampling defaults follow Qwen3 non-thinking recommendations:
     \\temperature 0.7, top-k 20, top-p 0.8. --greedy = --temperature 0.
     \\Seed defaults to the clock; pass --seed for reproducible output.
@@ -295,20 +302,23 @@ pub fn main(init: std.process.Init) !void {
     try stdout.writeAll("\n");
     try stdout.flush();
 
-    // One-shot sizes the cache to the request; a chat session gets the whole
-    // window. GPU activation buffers cover the first prefill (turn one for
-    // one-shot; longer inputs chunk).
-    const capacity = if (prompt == null) opts.max_context else try llm.engine.capacityFor(opts, ids.items.len);
-    const prompt_len = if (prompt == null) @min(512, capacity) else ids.items.len;
+    // One-shot caps the window at the request; a chat session gets the whole
+    // --max-context window. Either way only a small initial slice of KV rows
+    // is committed up front — the cache grows in place as generation fills it
+    // (evicting weights into the streaming path under VRAM pressure).
+    // Speculative runs stay fixed-capacity: the tree batch region and EAGLE
+    // tap buffers stride by capacity, so it cannot move mid-session.
+    const cap = try capacityPlan(opts, prompt, ids.items.len, opts.spec_k > 0 or opts.tree_nodes > 0 or draft_path != null or eagle_path != null);
+    const prompt_len = if (prompt == null) @min(512, cap.max) else ids.items.len;
     const t_init = Io.Clock.real.now(io).nanoseconds;
     var t0: i96 = undefined; // set after backend/model setup: generation only
     const n = switch (backend) {
         .cpu => blk: {
             if (vram_budget != 0) try stdout.writeAll("[--vram-budget ignored on the cpu backend]\n");
-            var model = try llm.engine.CpuModel.init(gpa, &lm, capacity);
+            var model = try llm.engine.CpuModel.init(gpa, &lm, cap);
             defer model.deinit();
             if (draft_lm) |*dlm| {
-                var draft = try llm.engine.CpuModel.init(gpa, dlm, capacity);
+                var draft = try llm.engine.CpuModel.init(gpa, dlm, cap);
                 defer draft.deinit();
                 var drafter = try llm.spec.ModelDrafter(llm.engine.CpuModel).init(gpa, io, &draft);
                 defer drafter.deinit();
@@ -335,20 +345,20 @@ pub fn main(init: std.process.Init) !void {
                 if (draft_st) |ds| if (ds.mapping()) |m| be.enableDirectStreaming(m);
                 if (eagle_st) |es| if (es.mapping) |m| be.enableDirectStreaming(m);
             }
-            var model = try qwen3_cuda.CudaLM.init(gpa, be, &lm, capacity, prompt_len);
+            var model = try qwen3_cuda.CudaLM.init(gpa, be, &lm, cap, prompt_len);
             defer model.deinit();
             var count: usize = undefined;
             if (eagle_st) |*est| {
                 try model.enableTaps(TensorPencil.models.eagle3.default_tap_layers);
                 if (opts.tree_nodes > 0) try model.enableTree();
-                var head = try TensorPencil.models.eagle3.Eagle3Head.load(gpa, be, est, &lm, capacity);
+                var head = try TensorPencil.models.eagle3.Eagle3Head.load(gpa, be, est, &lm, cap.max);
                 defer head.deinit();
                 var drafter = try TensorPencil.models.eagle3.Eagle3Drafter.init(gpa, &head, &model);
                 defer drafter.deinit();
                 t0 = Io.Clock.real.now(io).nanoseconds;
                 count = try runSession(&model, &drafter, &tok, io, gpa, &ids, opts, stdout, prompt, null);
             } else if (draft_lm) |*dlm| {
-                var draft = try qwen3_cuda.CudaLM.init(gpa, be, dlm, capacity, prompt_len);
+                var draft = try qwen3_cuda.CudaLM.init(gpa, be, dlm, cap, prompt_len);
                 defer draft.deinit();
                 // First claim on the pin budget goes to the draft: its weights
                 // are read once per drafted token, the target's only once per
@@ -376,7 +386,8 @@ pub fn main(init: std.process.Init) !void {
             defer ctx.deinit();
             ctx.budget_override = vram_budget; // --vram-budget: stream weights past this cap
             ctx.pin_budget = vram_budget -| pin_slack; // pin the first-touched prefix, stream the rest
-            var model = try TensorPencil.models.qwen3_gpu.VulkanLM.init(gpa, ctx, &lm, capacity, prompt_len);
+            // Vulkan has no growable buffers yet: reserve the whole window.
+            var model = try TensorPencil.models.qwen3_gpu.VulkanLM.init(gpa, ctx, &lm, cap.max, prompt_len);
             defer model.deinit();
             t0 = Io.Clock.real.now(io).nanoseconds;
             break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt, null);
@@ -475,9 +486,14 @@ fn imageTurn(
         try llm.chat.appendUserSegments(tok, gpa, segs.items, ids, &image_rows);
         try llm.chat.openAssistant(tok, gpa, ids);
         if (ids.items.len - model.cached() > model.remaining()) {
-            try stdout.print("[turn needs {d} rows, only {d} left in context]\n", .{ ids.items.len - model.cached(), model.remaining() });
-            ids.shrinkRetainingCapacity(ids_before);
-            return false;
+            // Growable caches commit more rows first (image turns are the
+            // usual way a turn outgrows the committed slice).
+            if (comptime @hasDecl(M, "ensureCapacity")) model.ensureCapacity(ids.items.len) catch {};
+            if (ids.items.len - model.cached() > model.remaining()) {
+                try stdout.print("[turn needs {d} rows, only {d} left in context]\n", .{ ids.items.len - model.cached(), model.remaining() });
+                ids.shrinkRetainingCapacity(ids_before);
+                return false;
+            }
         }
         // Interleave text prefill with the image embeddings, exactly like
         // the one-shot --image path; the engine's generate() prefills the
@@ -596,12 +612,20 @@ fn runSession(
         try llm.chat.closeAssistant(gpa, ids);
         total += n;
 
+        // The window a growable cache reports is its ceiling, not the
+        // currently committed slice; the session is only over when the
+        // ceiling itself is reached.
+        const M = switch (@typeInfo(@TypeOf(model))) {
+            .pointer => |p| p.child,
+            else => @TypeOf(model),
+        };
+        const window = if (comptime @hasDecl(M, "capacityMax")) model.capacityMax() else model.cached() + model.remaining();
         const dt = @as(f64, @floatFromInt(Io.Clock.real.now(io).nanoseconds - t0)) / 1e9;
         try stdout.print("\n[{d} tok, {d:.1} tok/s, ctx {d}/{d}]\n", .{
-            n, @as(f64, @floatFromInt(n)) / dt, model.cached(), model.cached() + model.remaining(),
+            n, @as(f64, @floatFromInt(n)) / dt, model.cached(), window,
         });
         try stdout.flush();
-        if (model.remaining() == 0) {
+        if (model.cached() >= window) {
             try stdout.writeAll("[context window full]\n");
             try stdout.flush();
             break;
@@ -735,7 +759,9 @@ fn runQwen35(
     try stdout.writeAll("\n");
     try stdout.flush();
 
-    const capacity = if (prompt == null) opts.max_context else try llm.engine.capacityFor(opts, ids.items.len);
+    // Commit a small initial KV slice and grow toward the window on demand
+    // (no speculative decoding for qwen35, so sessions are always dynamic).
+    const cap = try capacityPlan(opts, prompt, ids.items.len, false);
 
     // --debug-batch <n>: diff sequential vs batched prefill of the first
     // <n> prompt tokens, layer by layer, then exit.
@@ -743,7 +769,7 @@ fn runQwen35(
         const dbg_n = debug_batch;
         const be = be_cuda orelse try cuda_be.init(arena);
         defer if (be_cuda == null) be.deinit();
-        var model = try TensorPencil.models.qwen35_cuda.CudaLM.init(gpa, be, &lm, capacity);
+        var model = try TensorPencil.models.qwen35_cuda.CudaLM.init(gpa, be, &lm, cap);
         defer model.deinit();
         const nl = lm.cfg.n_layers;
         const dump_seq = try gpa.alloc(f32, nl * lm.cfg.hidden);
@@ -798,7 +824,7 @@ fn runQwen35(
     var t0: i96 = undefined;
     const n = switch (backend) {
         .cpu => blk: {
-            var model = try qwen35.CpuModel.init(gpa, &lm, capacity);
+            var model = try qwen35.CpuModel.init(gpa, &lm, cap);
             defer model.deinit();
             t0 = Io.Clock.real.now(io).nanoseconds;
             break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt, null);
@@ -813,7 +839,7 @@ fn runQwen35(
                 }
                 stdout.flush() catch {};
             };
-            var model = try TensorPencil.models.qwen35_cuda.CudaLM.init(gpa, be, &lm, capacity);
+            var model = try TensorPencil.models.qwen35_cuda.CudaLM.init(gpa, be, &lm, cap);
             defer model.deinit();
             if (img) |*e| {
                 // Mixed prefill: tokens, then the image embeddings (in place
@@ -840,6 +866,16 @@ fn runQwen35(
         try stdout.print("[session over: {d} tokens generated; setup was {d:.1}s]\n", .{ n, setup_s });
     }
     try stdout.flush();
+}
+
+/// KV-cache sizing for a session: the ceiling is the old fixed capacity
+/// (one-shot request size, or the whole --max-context window for chat);
+/// dynamic sessions commit only min(4096, prompt + 1) rows up front and grow
+/// toward it. `fixed` forces initial == max (speculative decoding).
+fn capacityPlan(opts: llm.engine.Options, prompt: ?[]const u8, n_prompt: usize, fixed: bool) !llm.engine.Capacity {
+    const max = if (prompt == null) opts.max_context else try llm.engine.capacityFor(opts, n_prompt);
+    if (fixed) return .fixed(max);
+    return .{ .initial = @min(max, @max(n_prompt + 1, llm.kv_cache.initial_context)), .max = max };
 }
 
 const BackendKind = enum { cpu, @"zig-cuda", cuda, vulkan };
