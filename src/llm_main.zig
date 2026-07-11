@@ -25,13 +25,16 @@ const usage =
     \\              [--vram-budget <GiB>|min]
     \\              [--image <image> --mmproj <mmproj.gguf>]
     \\
-    \\--max-context sets the context-window CEILING. Only a small initial
-    \\slice of KV rows (4096, or the prompt size) is committed up front; the
-    \\cache grows in place on demand, so a large window costs VRAM only as
-    \\the conversation actually fills it. Under VRAM pressure growth evicts
+    \\--max-context caps the context window; the default is the model's
+    \\trained context length (up to 128k). Only a small initial slice of KV
+    \\rows (4096, or the prompt size) is committed up front; the cache grows
+    \\in place on demand, so a large window costs VRAM only as the
+    \\conversation actually fills it. Under VRAM pressure growth evicts
     \\least-recently-used weights into the streaming path (slower decode)
-    \\instead of failing. Speculative runs (--spec-k/--draft-model/--eagle/
-    \\--tree) reserve the whole window up front, as does --backend vulkan.
+    \\instead of failing, and the session ends only when nothing more can be
+    \\freed. Speculative runs (--spec-k/--draft-model/--eagle/--tree) and
+    \\--backend vulkan reserve the whole window physically up front, so
+    \\their default window stays 4096.
     \\Sampling defaults follow Qwen3 non-thinking recommendations:
     \\temperature 0.7, top-k 20, top-p 0.8. --greedy = --temperature 0.
     \\Seed defaults to the clock; pass --seed for reproducible output.
@@ -97,6 +100,7 @@ pub fn main(init: std.process.Init) !void {
     var backend: BackendKind = .cpu;
     var profile = false;
     var vram_budget: u64 = 0;
+    var max_context_arg: ?usize = null;
     var opts: llm.engine.Options = .{ .seed = @truncate(@as(u96, @bitCast(Io.Clock.real.now(io).nanoseconds))) };
 
     var i: usize = 1;
@@ -117,7 +121,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--max-tokens")) {
             opts.max_new_tokens = try std.fmt.parseInt(usize, try nextArg(args, &i), 10);
         } else if (std.mem.eql(u8, a, "--max-context")) {
-            opts.max_context = try std.fmt.parseInt(usize, try nextArg(args, &i), 10);
+            max_context_arg = try std.fmt.parseInt(usize, try nextArg(args, &i), 10);
         } else if (std.mem.eql(u8, a, "--temperature")) {
             opts.sampling.temperature = try std.fmt.parseFloat(f32, try nextArg(args, &i));
         } else if (std.mem.eql(u8, a, "--top-k")) {
@@ -170,6 +174,16 @@ pub fn main(init: std.process.Init) !void {
     // Container chosen by extension: .gguf or safetensors.
     var st = try ModelFile.open(arena, io, path);
     defer st.deinit();
+
+    // Default context ceiling: the model's trained context length (growth
+    // commits KV rows only as the conversation fills, so a big ceiling costs
+    // VRAM lazily — and stops gracefully when even weight eviction can't
+    // free enough). Fixed-capacity sessions (speculative decoding, vulkan)
+    // allocate the whole window physically up front, so without an explicit
+    // --max-context they keep the old 4096 default.
+    const fixed_session = opts.spec_k > 0 or opts.tree_nodes > 0 or draft_path != null or eagle_path != null;
+    opts.max_context = max_context_arg orelse
+        (if (fixed_session or backend == .vulkan) 4096 else @min(trainedContext(&st), auto_context_cap));
 
     // Architecture dispatch: qwen35 (hybrid DeltaNet) has its own model and
     // steppers (cpu / zig-cuda / cuda), and no speculative decoding (the
@@ -295,8 +309,8 @@ pub fn main(init: std.process.Init) !void {
         try llm.chat.openAssistant(&tok, gpa, &ids);
     }
 
-    try stdout.print("[{s} backend, {d} prompt tokens, max {d} new/turn, temp {d:.2}, seed {d}]\n", .{
-        @tagName(backend), ids.items.len, opts.max_new_tokens, opts.sampling.temperature, opts.seed,
+    try stdout.print("[{s} backend, {d} prompt tokens, ctx window {d}, max {d} new/turn, temp {d:.2}, seed {d}]\n", .{
+        @tagName(backend), ids.items.len, opts.max_context, opts.max_new_tokens, opts.sampling.temperature, opts.seed,
     });
     if (prompt == null) try stdout.writeAll("[interactive chat: Enter sends, Shift- or Alt-Enter adds a line, /exit or Ctrl-D quits]\n");
     try stdout.writeAll("\n");
@@ -749,8 +763,8 @@ fn runQwen35(
         try llm.chat.openAssistant(&tok, gpa, &ids);
     }
 
-    try stdout.print("[{s} backend, qwen35 {d}L hybrid, {d} prompt tokens, max {d} new/turn, temp {d:.2}, seed {d}]\n", .{
-        @tagName(backend), lm.cfg.n_layers, ids.items.len, opts.max_new_tokens, opts.sampling.temperature, opts.seed,
+    try stdout.print("[{s} backend, qwen35 {d}L hybrid, {d} prompt tokens, ctx window {d}, max {d} new/turn, temp {d:.2}, seed {d}]\n", .{
+        @tagName(backend), lm.cfg.n_layers, ids.items.len, opts.max_context, opts.max_new_tokens, opts.sampling.temperature, opts.seed,
     });
     if (prompt == null) {
         try stdout.writeAll("[interactive chat: Enter sends, Shift- or Alt-Enter adds a line, /exit or Ctrl-D quits]\n");
@@ -866,6 +880,27 @@ fn runQwen35(
         try stdout.print("[session over: {d} tokens generated; setup was {d:.1}s]\n", .{ n, setup_s });
     }
     try stdout.flush();
+}
+
+/// Ceiling for the auto (no --max-context) window: bounds the up-front RoPE
+/// table (rows x head_dim/2 x 2 f32 — 64 MB at 128k for head_dim 128) and
+/// the per-layer VA reservations. Physical VRAM, not this, is what actually
+/// limits a session; pass --max-context to raise it.
+const auto_context_cap: usize = 128 << 10;
+
+/// The model's trained context length (`<arch>.context_length`), when the
+/// container records one. Safetensors checkpoints carry no metadata — fall
+/// back to the native Qwen3 window.
+fn trainedContext(st: *const ModelFile) usize {
+    switch (st.*) {
+        .gguf => |*g| {
+            const arch = g.getStr("general.architecture") orelse return 32768;
+            var buf: [64]u8 = undefined;
+            const key = std.fmt.bufPrint(&buf, "{s}.context_length", .{arch}) catch return 32768;
+            return @intCast(g.getUint(key) orelse 32768);
+        },
+        .safetensors => return 32768,
+    }
 }
 
 /// KV-cache sizing for a session: the ceiling is the old fixed capacity
