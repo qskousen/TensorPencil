@@ -18,6 +18,7 @@ pub const sampler = @import("sampler.zig");
 pub const pipeline = @import("pipeline.zig");
 pub const gpu = @import("gpu.zig");
 pub const llm = @import("llm.zig");
+pub const prof = @import("prof.zig");
 
 pub const DType = dtype.DType;
 pub const Shape = tensor.Shape;

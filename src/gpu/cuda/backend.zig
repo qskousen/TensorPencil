@@ -682,6 +682,11 @@ pub const Backend = struct {
     /// Headroom for a new weight upload (bytes). Bounded by the live device-free
     /// query (cuMemGetInfo — sees other processes) and, if set, our --vram-budget
     /// ceiling minus what we already hold.
+    /// Live free device memory (headroom), for the dynamic KV/layer offload
+    /// scheduler to decide when to migrate a layer to the host.
+    pub fn headroom(self: *Backend) u64 {
+        return self.budgetHeadroom();
+    }
     fn budgetHeadroom(self: *Backend) u64 {
         const live = (self.ctx.memGetInfo().free) * 9 / 10; // 10% margin (frag/overhead)
         if (self.budget_override != 0) {
@@ -732,6 +737,26 @@ pub const Backend = struct {
     /// weight's last GEMM signals) so eviction doesn't stall the pipeline — the
     /// buffer lingers a moment (soft-over-budget, physical VRAM has room) and the
     /// next weight uploads concurrently. Sync path: cuStreamSynchronize then free.
+    /// Total device bytes currently held (weights + KV + buffers).
+    pub fn deviceUsed(self: *Backend) u64 {
+        return self.ctx.device_used;
+    }
+
+    /// Free a specific weight's device copy — the dynamic offload scheduler
+    /// migrates a layer to the host, so its weights won't be read on the device
+    /// again. No-op if not resident.
+    pub fn evictWeightBytes(self: *Backend, bytes: []const u8) void {
+        const e = self.weights.fetchRemove(@intFromPtr(bytes.ptr)) orelse return;
+        if (e.value.upload_ev) |ev| {
+            self.ctx.computeWaitEvent(ev) catch {};
+            self.ctx.eventDestroy(ev);
+        }
+        _ = self.ctx.api.cuStreamSynchronize(self.ctx.stream);
+        self.streamed_bytes -|= e.value.db.size;
+        var d = e.value.db;
+        self.tensorDestroy(&d);
+    }
+
     fn evictOneWeight(self: *Backend) bool {
         // In-flight prefetches (pf_gen > pf_completed) must not be freed — the
         // prefetch thread is about to DMA into them.

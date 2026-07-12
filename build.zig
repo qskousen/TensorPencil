@@ -1,4 +1,5 @@
 const std = @import("std");
+const ggml_build = @import("build_ggml.zig");
 
 // Although this function looks imperative, it does not perform the build
 // directly and instead it mutates the build graph (`b`) that will be then
@@ -73,6 +74,29 @@ pub fn build(b: *std.Build) void {
     for (kernel_names, kernel_objs) |kname, obj| {
         mod.addAnonymousImport(b.fmt("{s}_spv", .{kname}), .{ .root_source_file = obj.getEmittedBin() });
     }
+
+    // ggml (llama.cpp tensor lib, vendor/ggml submodule) is a first-class
+    // dependency: its AVX2 CPU quant kernels are ~30x faster than our Zig ones,
+    // so the library uses them directly (@import("ggml")). Built once with the
+    // fast flags (build_ggml.zig) at ReleaseFast and linked into every artifact.
+    // `linkGgml` attaches the lib + libc++ to a Compile's root module; do this
+    // for anything that transitively uses the TensorPencil module.
+    const ggml_lib = ggml_build.buildLib(b, target, .ReleaseFast);
+    const ggml_mod = b.createModule(.{
+        .root_source_file = b.path("src/ggml.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    ggml_mod.addIncludePath(b.path("vendor/ggml/include"));
+    mod.addImport("ggml", ggml_mod);
+    const linkGgml = struct {
+        fn f(m: *std.Build.Module, lib: *std.Build.Step.Compile) void {
+            m.linkLibrary(lib);
+            m.link_libcpp = true;
+        }
+    }.f;
+    linkGgml(mod, ggml_lib);
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -241,6 +265,29 @@ pub fn build(b: *std.Build) void {
             if (b.args) |args| run_gui_cmd.addArgs(args);
             run_gui_step.dependOn(&run_gui_cmd.step);
         }
+    }
+
+    // ggml-bench: benchmark comparing TensorPencil's CPU quant kernels against
+    // ggml's. `zig build ggml-bench`. ggml links transitively via the
+    // TensorPencil module; the shared `ggml` import gives direct C access.
+    {
+        const bench_step = b.step("ggml-bench", "Build+run the ggml vs TensorPencil CPU-kernel benchmark");
+        const bench_exe = b.addExecutable(.{
+            .name = "ggml-bench",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/ggml_bench.zig"),
+                .link_libc = true,
+                .target = target,
+                .optimize = .ReleaseFast,
+                .imports = &.{
+                    .{ .name = "TensorPencil", .module = mod },
+                    .{ .name = "ggml", .module = ggml_mod },
+                },
+            }),
+        });
+        const run_bench = b.addRunArtifact(bench_exe);
+        if (b.args) |args| run_bench.addArgs(args);
+        bench_step.dependOn(&run_bench.step);
     }
 
     // Creates an executable that will run `test` blocks from the provided module.

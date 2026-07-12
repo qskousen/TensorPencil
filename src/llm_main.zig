@@ -22,7 +22,7 @@ const usage =
     \\              [--repeat-penalty <r>] [--seed <n>] [--greedy]
     \\              [--spec-k <n>] [--draft-model <qwen3.safetensors>]
     \\              [--eagle <eagle3.safetensors>] [--tree <nodes>]
-    \\              [--vram-budget <GiB>|min]
+    \\              [--vram-budget <GiB>|min] [--cpu-layers tail|attn] [--offload-grow]
     \\              [--image <image> --mmproj <mmproj.gguf>]
     \\
     \\--max-context caps the context window; the default is the model's
@@ -62,6 +62,19 @@ const usage =
     \\to the streamed fraction. "min" pins nothing and streams everything.
     \\KV cache and activations are not streamed and live outside the cap.
     \\0 (default) = driver-managed.
+    \\--cpu-layers (qwen35 GGUF, zig-cuda/cuda, text-only) fits the model under
+    \\--vram-budget a different way: instead of streaming weights, it runs whole
+    \\layers on the CPU (their weights never touch the device). The layer count
+    \\is derived from the budget; "tail" keeps a contiguous device prefix (the
+    \\last N layers go to CPU), "attn" evicts the KV-growing attention layers
+    \\first. Requires --vram-budget. Trades PCIe streaming for host compute —
+    \\faster than streaming only when the CPU keeps up (slow PCIe / fast CPU);
+    \\degrades gradually with the budget and avoids the graph-eviction cliff.
+    \\--offload-grow (implies the split, attn policy unless --cpu-layers given)
+    \\is the DYNAMIC form: it starts with as many layers on the GPU as fit under
+    \\--vram-budget and migrates more to the CPU on demand as the KV cache grows,
+    \\so short contexts run at full speed and long ones degrade gradually instead
+    \\of hitting the streaming cliff.
     \\
 ;
 
@@ -100,6 +113,8 @@ pub fn main(init: std.process.Init) !void {
     var backend: BackendKind = .cpu;
     var profile = false;
     var vram_budget: u64 = 0;
+    var cpu_split: ?TensorPencil.models.qwen35_cuda.CpuSplitPolicy = null;
+    var dynamic_offload = false;
     var max_context_arg: ?usize = null;
     var opts: llm.engine.Options = .{ .seed = @truncate(@as(u96, @bitCast(Io.Clock.real.now(io).nanoseconds))) };
 
@@ -150,6 +165,15 @@ pub fn main(init: std.process.Init) !void {
                 const gib = try std.fmt.parseFloat(f64, val);
                 vram_budget = @intFromFloat(gib * (1 << 30));
             }
+        } else if (std.mem.eql(u8, a, "--cpu-layers")) {
+            const name = try nextArg(args, &i);
+            cpu_split = std.meta.stringToEnum(TensorPencil.models.qwen35_cuda.CpuSplitPolicy, name) orelse {
+                try stdout.print("unknown --cpu-layers policy: {s} (tail | attn)\n", .{name});
+                try stdout.flush();
+                return error.InvalidArgument;
+            };
+        } else if (std.mem.eql(u8, a, "--offload-grow")) {
+            dynamic_offload = true;
         } else if (std.mem.eql(u8, a, "--profile")) {
             profile = true;
         } else if (std.mem.eql(u8, a, "--backend")) {
@@ -201,7 +225,6 @@ pub fn main(init: std.process.Init) !void {
             try stdout.flush();
             return error.InvalidArgument;
         }
-        if (vram_budget != 0) try stdout.writeAll("[--vram-budget ignored for qwen35 (weights stay resident)]\n");
         if (image_path != null) {
             if (backend == .cpu) {
                 try stdout.writeAll("--image requires the zig-cuda or cuda backend\n");
@@ -219,7 +242,13 @@ pub fn main(init: std.process.Init) !void {
                 return error.InvalidArgument;
             }
         }
-        return runQwen35(arena, gpa, io, &st.gguf, backend, image_path, mmproj_path, prompt, system, opts, profile, debug_batch, stdout);
+        return runQwen35(arena, gpa, io, &st.gguf, backend, vram_budget, cpu_split, dynamic_offload, image_path, mmproj_path, prompt, system, opts, profile, debug_batch, stdout);
+    }
+
+    if (cpu_split != null or dynamic_offload) {
+        try stdout.writeAll("--cpu-layers / --offload-grow (hybrid CPU/GPU split) is only supported for qwen35 (Qwen3.5/3.6) models for now\n");
+        try stdout.flush();
+        return error.InvalidArgument;
     }
 
     if (image_path != null) {
@@ -674,6 +703,9 @@ fn runQwen35(
     io: Io,
     g: *const TensorPencil.Gguf,
     backend: BackendKind,
+    vram_budget: u64,
+    cpu_split: ?TensorPencil.models.qwen35_cuda.CpuSplitPolicy,
+    dynamic_offload: bool,
     image_path: ?[]const u8,
     mmproj_path: ?[]const u8,
     prompt: ?[]const u8,
@@ -689,6 +721,27 @@ fn runQwen35(
     var tok = try TensorPencil.tokenizer.Tokenizer.initFromGguf(arena, g);
     defer tok.deinit();
     llm.chat.applyTokenizer(&tok);
+
+    // Hybrid CPU/GPU layer split (--cpu-layers / --offload-grow): CUDA-only,
+    // needs a budget as the VRAM ceiling, and text-only (the CPU path uses
+    // scalar RoPE, which matches M-RoPE for text but not image positions).
+    if (cpu_split != null or dynamic_offload) {
+        if (backend != .@"zig-cuda" and backend != .cuda) {
+            try stdout.writeAll("--cpu-layers / --offload-grow requires the zig-cuda or cuda backend\n");
+            try stdout.flush();
+            return error.InvalidArgument;
+        }
+        if (vram_budget == 0) {
+            try stdout.writeAll("--cpu-layers needs --vram-budget <GiB> to size the CPU/GPU split\n");
+            try stdout.flush();
+            return error.InvalidArgument;
+        }
+        if (image_path != null or mmproj_path != null) {
+            try stdout.writeAll("--cpu-layers is not supported with images yet (CPU layers use scalar RoPE; M-RoPE positions differ per axis)\n");
+            try stdout.flush();
+            return error.InvalidArgument;
+        }
+    }
 
     // Debug escape hatch: force the CPU ViT on GPU backends (A/B the CUDA
     // vision tower against the reference path).
@@ -838,14 +891,36 @@ fn runQwen35(
     var t0: i96 = undefined;
     const n = switch (backend) {
         .cpu => blk: {
+            if (vram_budget != 0) try stdout.writeAll("[--vram-budget ignored on the cpu backend]\n");
             var model = try qwen35.CpuModel.init(gpa, &lm, cap);
             defer model.deinit();
+            // --profile on the cpu backend: wall-time breakdown of the forward
+            // pass (matmul now ggml; this surfaces the arch-specific ops).
+            if (profile) {
+                TensorPencil.prof.reset();
+                TensorPencil.prof.enabled = true;
+            }
+            defer if (profile) TensorPencil.prof.report(stdout) catch {};
             t0 = Io.Clock.real.now(io).nanoseconds;
             break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt, null);
         },
         .@"zig-cuda", .cuda => blk: {
             const be = be_cuda.?;
             be.profile = profile;
+            // Three ways to fit under --vram-budget, mutually exclusive: stream
+            // weights past the cap (default), move whole layers to the CPU
+            // (--cpu-layers, static), or migrate layers as the context grows
+            // (--offload-grow, dynamic). The two split modes keep GPU-resident
+            // weights fully resident (no streaming) and size themselves below.
+            if (cpu_split == null and !dynamic_offload) {
+                be.budget_override = vram_budget; // --vram-budget: stream weights past this cap
+                be.pin_budget = vram_budget -| pin_slack; // pin the first-touched prefix, stream the rest
+                be.stream_window = @min(pin_slack, vram_budget); // in-flight streamed-weight cap / enqueue pacing
+                // Page-lock the checkpoint mmap so streamed weights DMA directly at
+                // full PCIe bandwidth, prefetched one layer ahead (mirrors the dense
+                // path; skipped when everything stays resident or the file isn't mmap'd).
+                if (vram_budget != 0) if (g.mapping) |m| be.enableDirectStreaming(m);
+            }
             defer if (profile) {
                 inline for (@typeInfo(cuda_be.ProfCat).@"enum".fields, 0..) |f, ci| {
                     if (be.prof.n[ci] > 0)
@@ -855,6 +930,19 @@ fn runQwen35(
             };
             var model = try TensorPencil.models.qwen35_cuda.CudaLM.init(gpa, be, &lm, cap);
             defer model.deinit();
+            if (cpu_split != null or dynamic_offload) {
+                // Dynamic offload defaults to the attn policy (frees KV-growing
+                // layers first, recovering the most VRAM per migration).
+                const pol = cpu_split orelse .attn;
+                try model.enableCpuSplit(pol, vram_budget, dynamic_offload);
+                if (model.split) |sp| {
+                    const mode = if (sp.dynamic) "offload-grow" else "cpu-layers";
+                    try stdout.print("[--{s} {s}: {d}/{d} layers on CPU at start, {d} on GPU]\n", .{ mode, @tagName(sp.policy), sp.n_cpu, lm.cfg.n_layers, lm.cfg.n_layers - sp.n_cpu });
+                } else {
+                    try stdout.writeAll("[--cpu-layers: model fits under --vram-budget; no split needed]\n");
+                }
+                try stdout.flush();
+            }
             if (img) |*e| {
                 // Mixed prefill: tokens, then the image embeddings (in place
                 // of the placeholder rows), then all but the last token —

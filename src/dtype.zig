@@ -191,6 +191,35 @@ pub inline fn f16ToF32(bits: u16) f32 {
     return @floatCast(h);
 }
 
+/// Vectorized f16 (little-endian bytes) -> f32 row, scaled. `@floatCast` on an
+/// 8-wide f16 vector emits hardware vcvtph2ps (F16C) — ~10x the per-element
+/// scalar loop it replaces. `src` holds dst.len little-endian u16s.
+pub fn f16ToF32Row(src: []const u8, dst: []f32, scale: f32) void {
+    const V = 8;
+    const sv: @Vector(V, f32) = @splat(scale);
+    var i: usize = 0;
+    while (i + V <= dst.len) : (i += V) {
+        const bits: @Vector(V, u16) = @bitCast(src[i * 2 ..][0 .. V * 2].*);
+        const h: @Vector(V, f16) = @bitCast(bits);
+        dst[i..][0..V].* = @as(@Vector(V, f32), @floatCast(h)) * sv;
+    }
+    while (i < dst.len) : (i += 1) dst[i] = f16ToF32(std.mem.readInt(u16, src[i * 2 ..][0..2], .little)) * scale;
+}
+
+/// Vectorized bf16 (little-endian bytes) -> f32 row, scaled (bf16 is the high
+/// 16 bits of f32, so this is a widening shift — no rounding).
+pub fn bf16ToF32Row(src: []const u8, dst: []f32, scale: f32) void {
+    const V = 8;
+    const sv: @Vector(V, f32) = @splat(scale);
+    var i: usize = 0;
+    while (i + V <= dst.len) : (i += V) {
+        const bits: @Vector(V, u16) = @bitCast(src[i * 2 ..][0 .. V * 2].*);
+        const wide: @Vector(V, u32) = @as(@Vector(V, u32), bits) << @splat(16);
+        dst[i..][0..V].* = @as(@Vector(V, f32), @bitCast(wide)) * sv;
+    }
+    while (i < dst.len) : (i += 1) dst[i] = bf16ToF32(std.mem.readInt(u16, src[i * 2 ..][0..2], .little)) * scale;
+}
+
 test "dtype string round trip and sizes" {
     try std.testing.expectEqual(DType.f8_e4m3, DType.fromString("F8_E4M3").?);
     try std.testing.expectEqual(DType.bf16, DType.fromString("BF16").?);

@@ -239,12 +239,8 @@ pub fn convertToF32(dt: DType, bytes: []const u8, out: []f32) ConvertError!void 
         .f8_e4m3 => for (out, 0..) |*v, i| {
             v.* = dtypes.f8e4m3ToF32(bytes[i]);
         },
-        .bf16 => for (out, 0..) |*v, i| {
-            v.* = dtypes.bf16ToF32(std.mem.readInt(u16, bytes[i * 2 ..][0..2], .little));
-        },
-        .f16 => for (out, 0..) |*v, i| {
-            v.* = dtypes.f16ToF32(std.mem.readInt(u16, bytes[i * 2 ..][0..2], .little));
-        },
+        .bf16 => dtypes.bf16ToF32Row(bytes, out, 1.0),
+        .f16 => dtypes.f16ToF32Row(bytes, out, 1.0),
         // ggml block-quantized GGUF tensors (rows are whole blocks, which the
         // GGUF parser validated, so the length check above already enforced
         // block alignment).

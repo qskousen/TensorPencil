@@ -33,6 +33,7 @@ const weights_mod = @import("../weights.zig");
 const qwen3 = @import("qwen3.zig");
 const ops = @import("../ops.zig");
 const kv_cache_mod = @import("../llm/kv_cache.zig");
+const prof = @import("../prof.zig");
 
 const Gguf = gguf_mod.Gguf;
 const WeightStore = weights_mod.WeightStore;
@@ -170,7 +171,7 @@ const LinLayer = struct {
     mlp: Mlp,
 };
 
-const Layer = union(enum) {
+pub const Layer = union(enum) {
     attn: AttnLayer,
     linear: LinLayer,
 };
@@ -335,6 +336,49 @@ pub const Model = struct {
             ops.norm.rmsNorm(o, x[(seq - n) * cfg.hidden ..][0 .. n * cfg.hidden], self.final_norm, cfg.rms_eps);
         }
     }
+
+    /// Run one transformer layer (attn-or-linear sublayer + its MLP) on the
+    /// CPU over `seq` already-embedded rows in `x` ([seq*hidden], updated in
+    /// place), using host-side `state` for KV / conv / ssm and `s` for
+    /// scratch. Attention positions run [state.kv.len, state.kv.len+seq); the
+    /// caller must keep `state` in lockstep with the device (grow capacity,
+    /// then `state.kv.commit(seq)` + advance `state.len` once per step, after
+    /// all layers). This is the CPU half of the hybrid CPU/GPU layer split:
+    /// GPU-resident layers run on the device, the rest here.
+    ///
+    /// RoPE is scalar (pos, pos, pos) — position-correct for text tokens only.
+    /// Image/M-RoPE positions differ per axis, so a split session must stay
+    /// all-GPU while an image is in context (the caller guards this).
+    pub fn cpuLayer(
+        self: *const Model,
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        l: usize,
+        x: []f32,
+        seq: usize,
+        freqs: ops.rope.Freqs,
+        state: *State,
+        s: *Scratch,
+    ) !void {
+        const cfg = self.cfg;
+        const layer = &self.layers[l];
+        // The activation ops (rmsNorm etc.) require scratch sized exactly to
+        // `seq`; the split's shared scratch is sized to the max prefill chunk,
+        // so slice a view to this call's seq. `lin_conv`/`lin_m`/`lin_d` are
+        // per-token (seq-independent) and stay full.
+        var sv = s.viewSeq(seq, cfg);
+        switch (layer.*) {
+            .attn => |*al| {
+                const slot = l / cfg.full_attn_interval;
+                try attnLayerForward(io, gpa, cfg, al, x, seq, freqs, &state.kv, slot, &sv);
+            },
+            .linear => |*ll| {
+                const lin_idx = l - l / cfg.full_attn_interval;
+                try linLayerForward(io, gpa, cfg, ll, x, seq, state.convState(cfg, lin_idx), state.ssmState(cfg, lin_idx), &sv);
+            },
+        }
+        try mlpForward(io, gpa, cfg, layerMlp(layer), x, seq, &sv);
+    }
 };
 
 /// Pointer into the layer's stored Mlp (the layer must be passed by
@@ -383,6 +427,7 @@ fn attnLayerForward(
     ops.rope.applyRotateHalfPartialAt(s.k[0 .. seq * cfg.kvDim()], freqs, pos0, seq, cfg.n_kv_heads, hd, cfg.rope_dim);
 
     cache.write(slot, s.k[0 .. seq * cfg.kvDim()], s.v[0 .. seq * cfg.kvDim()]);
+    const _ta = prof.tic();
     try ops.attention.attention(io, gpa, s.attn_out, s.q[0 .. seq * cfg.qDim()], cache.kView(slot, seq), cache.vView(slot, seq), .{
         .seq_q = seq,
         .seq_kv = pos0 + seq,
@@ -391,6 +436,7 @@ fn attnLayerForward(
         .head_dim = hd,
         .causal = true,
     });
+    prof.toc(.attention, _ta);
 
     // Output gating: attn * sigmoid(gate), elementwise per head dim.
     for (s.attn_out[0 .. seq * cfg.qDim()], s.gate[0 .. seq * cfg.qDim()]) |*a, g| {
@@ -434,6 +480,7 @@ fn linLayerForward(
 
         // Depthwise causal conv over [state | current], SiLU; the state
         // rolls forward one column. w[0] hits the oldest tap.
+        const _tc = prof.tic();
         for (0..channels) |c| {
             const st = conv_state[c * (taps - 1) ..][0 .. taps - 1];
             const w = layer.conv_w[c * taps ..][0..taps];
@@ -443,6 +490,7 @@ fn linLayerForward(
             st[taps - 2] = qkv_t[c];
             conv_t[c] = acc / (1.0 + @exp(-acc)); // SiLU
         }
+        prof.toc(.conv, _tc);
 
         // Split and L2-normalize q/k per head (clamped, ggml_l2_norm).
         const qc = conv_t[0..qkdim];
@@ -453,6 +501,7 @@ fn linLayerForward(
 
         // Per-head delta rule; v-head h uses k-head h % lin_k_heads.
         const o_t = s.lin_o[t * vdim ..][0..vdim];
+        const _td = prof.tic();
         for (0..heads) |h| {
             const decay = @exp(layer.a[h] * softplus(s.lin_alpha[t * heads + h] + layer.dt_bias[h]));
             const beta = 1.0 / (1.0 + @exp(-s.lin_beta[t * heads + h]));
@@ -487,6 +536,7 @@ fn linLayerForward(
                 }
             }
         }
+        prof.toc(.deltanet, _td);
     }
 
     // Gated per-head RMS norm: rmsnorm(o; ssm_norm) * silu(z).
@@ -525,7 +575,7 @@ fn softplus(v: f32) f32 {
 }
 
 /// Per-forward activation buffers for `seq` tokens.
-const Scratch = struct {
+pub const Scratch = struct {
     normed: []f32,
     tmp: []f32,
     // Full attention.
@@ -548,7 +598,7 @@ const Scratch = struct {
     mlp_gate: []f32,
     mlp_up: []f32,
 
-    fn init(gpa: std.mem.Allocator, seq: usize, cfg: Config) !Scratch {
+    pub fn init(gpa: std.mem.Allocator, seq: usize, cfg: Config) !Scratch {
         var s: Scratch = undefined;
         var done: usize = 0;
         errdefer { // free the fields allocated before the failing one
@@ -583,11 +633,38 @@ const Scratch = struct {
         return s;
     }
 
-    fn deinit(s: *Scratch, gpa: std.mem.Allocator) void {
+    pub fn deinit(s: *Scratch, gpa: std.mem.Allocator) void {
         inline for (@typeInfo(Scratch).@"struct".fields) |f| {
             gpa.free(@field(s, f.name));
         }
         s.* = undefined;
+    }
+
+    /// A view of this scratch sliced to `seq` tokens (fields are borrowed
+    /// slices — no allocation, do not deinit). Used by the CPU/GPU split, whose
+    /// shared scratch is sized to the max prefill chunk but runs layers at a
+    /// smaller seq (1 for decode). `lin_conv`/`lin_m`/`lin_d` are per-token.
+    pub fn viewSeq(s: *Scratch, seq: usize, cfg: Config) Scratch {
+        return .{
+            .normed = s.normed[0 .. seq * cfg.hidden],
+            .tmp = s.tmp[0 .. seq * cfg.hidden],
+            .qg = s.qg[0 .. seq * cfg.qDim() * 2],
+            .q = s.q[0 .. seq * cfg.qDim()],
+            .gate = s.gate[0 .. seq * cfg.qDim()],
+            .k = s.k[0 .. seq * cfg.kvDim()],
+            .v = s.v[0 .. seq * cfg.kvDim()],
+            .attn_out = s.attn_out[0 .. seq * cfg.qDim()],
+            .lin_qkv = s.lin_qkv[0 .. seq * cfg.convChannels()],
+            .lin_conv = s.lin_conv,
+            .lin_z = s.lin_z[0 .. seq * cfg.linVDim()],
+            .lin_o = s.lin_o[0 .. seq * cfg.linVDim()],
+            .lin_alpha = s.lin_alpha[0 .. seq * cfg.lin_v_heads],
+            .lin_beta = s.lin_beta[0 .. seq * cfg.lin_v_heads],
+            .lin_m = s.lin_m,
+            .lin_d = s.lin_d,
+            .mlp_gate = s.mlp_gate[0 .. seq * cfg.intermediate],
+            .mlp_up = s.mlp_up[0 .. seq * cfg.intermediate],
+        };
     }
 };
 

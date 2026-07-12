@@ -61,6 +61,15 @@ Use the `std.Io` clock API instead:
 const now_ns = std.Io.Clock.real.now(io).nanoseconds;
 ```
 
+`std.time.Timer`/`std.time.Instant` and `std.posix.clock_gettime` are gone too.
+Without an `io` in scope (e.g. a `test` block), reach for the raw syscall:
+
+```zig
+var ts: std.os.linux.timespec = undefined;
+_ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
+const ns = @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+```
+
 ## File / directory I/O uses `std.Io`
 
 Most I/O operations now require passing an `std.Io` value through the call stack.
