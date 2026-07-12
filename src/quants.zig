@@ -56,82 +56,6 @@ pub fn dequantSlice(dt: DType, row: []const u8, elem0: usize, n: usize, dst: []f
     ggml.c.ggml_get_type_traits(gt).*.to_float.?(x, dst.ptr, @intCast(n));
 }
 
-inline fn f16At(b: []const u8, off: usize) f32 {
-    return dtypes.f16ToF32(std.mem.readInt(u16, b[off..][0..2], .little));
-}
-
-// --- int8 activation · block-quant weight dot (decode GEMV) ----------------
-//
-// The f32 decode GEMV (matmul.runRangeBlock) spends ~75% of its time
-// dequantizing the weight to f32 before an f32 dot. Instead, quantize the
-// activation to int8 once (per 256-block scale, "q8_K"-style) and dot it
-// directly against the packed weight quants with integer arithmetic — the
-// CPU twin of the GPU dp4a path (llama.cpp vec_dot_q6_K_q8_K). No f32 weight
-// expansion, no scratch round-trip.
-
-/// Quantize one activation vector to int8 with a per-256-block scale.
-/// `xi8` is [cols] i8; `xd` is [cols/256] f32 (block scale = amax/127).
-/// `cols` must be a multiple of 256 (matches the q6_k super-block).
-pub fn quantizeActQ8K(x: []const f32, xi8: []i8, xd: []f32) void {
-    const cols = x.len;
-    std.debug.assert(cols % 256 == 0 and xi8.len == cols and xd.len == cols / 256);
-    var blk: usize = 0;
-    while (blk * 256 < cols) : (blk += 1) {
-        const xs = x[blk * 256 ..][0..256];
-        var amax: f32 = 0;
-        for (xs) |v| amax = @max(amax, @abs(v));
-        if (amax == 0) {
-            xd[blk] = 0;
-            @memset(xi8[blk * 256 ..][0..256], 0);
-            continue;
-        }
-        xd[blk] = amax / 127.0;
-        const inv = 127.0 / amax;
-        for (xs, 0..) |v, i| {
-            const q = @round(v * inv);
-            xi8[blk * 256 + i] = @intFromFloat(std.math.clamp(q, -127.0, 127.0));
-        }
-    }
-}
-
-/// Dot a q6_k weight row (`row` = its packed bytes) with an int8-quantized
-/// activation (`xi8`/`xd` from quantizeActQ8K). Mirrors dequantBlockQ6K's
-/// element/scale layout exactly, so it agrees with the f32 path up to the
-/// activation's int8 rounding. `cols` = elements in the row (multiple of 256).
-pub fn dotQ6KQ8K(row: []const u8, xi8: []const i8, xd: []const f32, cols: usize) f32 {
-    std.debug.assert(cols % 256 == 0);
-    const block_bytes = comptime DType.q6_k.blockBytes();
-    var acc: f32 = 0;
-    var blk: usize = 0;
-    while (blk * 256 < cols) : (blk += 1) {
-        const b = row[blk * block_bytes ..][0..block_bytes];
-        const d = f16At(b, 208);
-        const sc = b[192..208]; // 16 i8 sub-block scales
-        var isum: [16]i32 = @splat(0); // per sub-block: sum (q-32)*xi8
-        for (0..2) |half| {
-            const ql = b[half * 64 ..][0..64];
-            const qh = b[128 + half * 32 ..][0..32];
-            const base = blk * 256 + half * 128;
-            const s0 = half * 8;
-            for (0..32) |l| {
-                const li = l / 16; // 0 or 1 within the 16-element sub-block
-                const q1 = @as(i32, (ql[l] & 0xF) | (@as(u8, (qh[l] >> 0) & 3) << 4)) - 32;
-                const q2 = @as(i32, (ql[l + 32] & 0xF) | (@as(u8, (qh[l] >> 2) & 3) << 4)) - 32;
-                const q3 = @as(i32, (ql[l] >> 4) | (@as(u8, (qh[l] >> 4) & 3) << 4)) - 32;
-                const q4 = @as(i32, (ql[l + 32] >> 4) | (@as(u8, (qh[l] >> 6) & 3) << 4)) - 32;
-                isum[s0 + 0 + li] += q1 * xi8[base + l];
-                isum[s0 + 2 + li] += q2 * xi8[base + l + 32];
-                isum[s0 + 4 + li] += q3 * xi8[base + l + 64];
-                isum[s0 + 6 + li] += q4 * xi8[base + l + 96];
-            }
-        }
-        var block_i: i64 = 0;
-        for (0..16) |si| block_i += @as(i64, @as(i8, @bitCast(sc[si]))) * isum[si];
-        acc += d * xd[blk] * @as(f32, @floatFromInt(block_i));
-    }
-    return acc;
-}
-
 // --- tests -----------------------------------------------------------------
 
 const fixtures = @import("quants_fixtures.zig");
@@ -163,31 +87,6 @@ test "q5_k dequant matches ggml reference" {
 
 test "q6_k dequant matches ggml reference" {
     try expectGolden(.q6_k, &fixtures.q6_k_block, &fixtures.q6_k_expected_bits);
-}
-
-test "q6_k int8 dot agrees with f32 dequant-dot" {
-    const cols = 256;
-    // Reference weights, and the f32 dot for a random activation.
-    var wf32: [cols]f32 = undefined;
-    dequantSlice(.q6_k, &fixtures.q6_k_block, 0, cols, &wf32);
-    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
-    const rnd = prng.random();
-    var x: [cols]f32 = undefined;
-    for (&x) |*v| v.* = (rnd.float(f32) - 0.5) * 3.0;
-
-    var ref: f32 = 0;
-    for (wf32, x) |wv, xv| ref += wv * xv;
-
-    var xi8: [cols]i8 = undefined;
-    var xd: [cols / 256]f32 = undefined;
-    quantizeActQ8K(&x, &xi8, &xd);
-    const got = dotQ6KQ8K(&fixtures.q6_k_block, &xi8, &xd, cols);
-
-    const rel = @abs(got - ref) / (@abs(ref) + 1e-3);
-    std.testing.expect(rel < 0.02) catch |err| {
-        std.debug.print("q6_k int8 dot: ref {d:.5} got {d:.5} rel {d:.5}\n", .{ ref, got, rel });
-        return err;
-    };
 }
 
 test "dequantSlice block-aligned sub-ranges" {

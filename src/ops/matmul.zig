@@ -587,58 +587,9 @@ fn runRange(
         inline .f8_e4m3, .bf16, .f16, .f32, .i8 => |dt| {
             runRangeTyped(dt, y, x, m, w, bias, row_start, row_end, scratch);
         },
-        inline .q8_0, .q4_k, .q5_k, .q6_k => |dt| {
-            runRangeBlock(dt, y, x, m, w, bias, row_start, row_end, scratch);
-        },
+        // Block-quant never reaches runRange: small-m goes to ggmlQuantGemv and
+        // large-m to matmulPacked (see matmul()).
         else => unreachable, // validated in matmul()
-    }
-}
-
-/// Small-m path for ggml block-quantized weights. Mirrors `runRangeTyped`
-/// with quants.zig decoding whole weight rows into the panel scratch.
-fn runRangeBlock(
-    comptime dt: DType,
-    y: []f32,
-    x: []const f32,
-    m: usize,
-    w: Weight,
-    bias: ?[]const f32,
-    row_start: usize,
-    row_end: usize,
-    scratch: []f32,
-) void {
-    const cols = w.cols;
-    const row_bytes = dt.storageBytes(cols);
-    var r = row_start;
-    while (r < row_end) : (r += panel_rows) {
-        const nr = @min(panel_rows, row_end - r);
-        for (0..nr) |j| {
-            const src = w.bytes[(r + j) * row_bytes ..][0..row_bytes];
-            quants.dequantSlice(dt, src, 0, cols, scratch[j * cols ..][0..cols]);
-        }
-        for (0..m) |t| {
-            const xrow = x[t * cols ..][0..cols];
-            var acc: [panel_rows]Vec = @splat(@splat(0));
-            var tail: [panel_rows]f32 = @splat(0);
-            var k: usize = 0;
-            while (k + vlen <= cols) : (k += vlen) {
-                const xv: Vec = xrow[k..][0..vlen].*;
-                inline for (0..panel_rows) |j| {
-                    if (j < nr) {
-                        const wv: Vec = scratch[j * cols + k ..][0..vlen].*;
-                        acc[j] += xv * wv;
-                    }
-                }
-            }
-            while (k < cols) : (k += 1) {
-                for (0..nr) |j| tail[j] += xrow[k] * scratch[j * cols + k];
-            }
-            for (0..nr) |j| {
-                var sum = @reduce(.Add, acc[j]) + tail[j];
-                if (bias) |b| sum += b[r + j];
-                y[t * w.rows + r + j] = sum;
-            }
-        }
     }
 }
 
