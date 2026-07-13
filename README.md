@@ -2,7 +2,7 @@
 
 **This is an experimental work in progress.**
 
-TensorPencil is a test to see how far we can push diffusion performance in pure Zig (aside from Vulkan / CUDA libraries).
+TensorPencil is a test to see how far we can push diffusion performance in Zig.
 
 It currently targets FP8 and INT8/INT4 ConvRot Krea 2, and those are the only models that have been tested.
 I made up the INT4 format because I was curious, so you won't be able to find any INT4 ConvRot models. Sorry.
@@ -17,19 +17,13 @@ The exception is this readme; I'm of the opinion that if you expect a human to t
 Backends supported so far:
 - CPU - baseline reference, very slow (`--backend cpu`)
 - Vulkan - Zig hand-emitted SPIR-V (`--backend vulkan`)
-- Zig PTX (CUDA) - pure-Zig hand-emitted PTX (`--backend zig-cuda`)
+- Zig PTX (CUDA) - Zig hand-emitted PTX (`--backend zig-cuda`)
 - CUDA libraries - NVIDIA cuBLASLt + cuDNN (`--backend cuda`)
 
 The backends all make images nearly pixel-identical to ComfyUI; here is a comparison image across the three GPU
 backends vs. a ComfyUI reference.
 
 ![Backend image delta comparison](testdata/int8_backend_comparison.png)
-
-The goal is for 100% Zig code other than needed 3rd party libraries for Vulkan and CUDA.
-The CPU, Vulkan, and Zig-PTX backends stick to that pretty well: the drivers for Vulkan
-and CUDA are dlopen'd (they need to be installed). The `cuda` backend dlopen's NVIDIA's 
-closed-source math libraries (`libcublasLt.so`, `libcudnn.so`) and uses some C interop
-code to interact with them, so it's the least pure backend, but also the fastest.
 
 This has been tested only on Linux with an RTX 3090 and RTX 4090. It's likely that other
 operating systems and GPUs will hit problems or run less efficiently.
@@ -53,11 +47,17 @@ across the different formats and backends.
 | INT4 ConvRot |  287  |    —     |    1.38    |  1.11  |       —        |
 
 Plans for the future:
-- ???
+- Unclear, but I keep finding more things to add
 
 ## Running it
 
 Requires Zig 0.16.0 and `libvips`.
+
+The GGUF loading code uses ggml, as a submodule. Make sure you've checked out with submodules:
+
+```
+git submodule update --init --recursive
+```
 
 Backends other than `cpu` require additional runtime libraries:
 

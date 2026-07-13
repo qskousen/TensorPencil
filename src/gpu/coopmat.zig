@@ -1,310 +1,39 @@
-//! Hand-assembled SPIR-V cooperative-matrix GEMM (tensor cores).
+//! SPIR-V cooperative-matrix (tensor-core) GEMM and attention kernels.
 //!
-//! Zig's SPIR-V backend cannot express OpTypeCooperativeMatrixKHR, so this
-//! module is built instruction-by-instruction at runtime. One subgroup (a
-//! 32-thread workgroup) computes a 16x16 f32 tile of C = A @ B with f16
-//! operands: A is x in row-major f16 [m][k]; B is the k-major f16 weight
-//! layout [k][stride] (exactly our transposed-weight convention, so B needs
-//! no further rearranging); C stores f32 directly into the output buffer.
+//! Zig's SPIR-V backend cannot express OpTypeCooperativeMatrixKHR, so these
+//! kernels are authored as SPIR-V *assembly text* and turned into the binary
+//! word stream at runtime by the small in-tree assembler in `spirv_asm.zig`
+//! (no external tool). Each `build*` function emits the text for one kernel
+//! variant and returns `sasm.assembleChecked(...)`.
 //!
-//! All dimensions must be multiples of 16 (callers pad m; n/k already are).
-//! Bindings (set 0): 0 = B (weights, f16), 1 = A (x, f16), 2 = C (y, f32) —
-//! matching the regular matmul binding order. Push: {m, n, k, stride} u32.
+//! The GEMM kernels compute C = A @ B with the k-major (transposed) weight
+//! layout used across the matmul backends, so B needs no rearranging; C is
+//! stored directly. Dimensions are multiples of the fragment tile (callers
+//! pad m; n/k already align). Bindings (set 0): 0 = B (weights), 1 = A (x),
+//! 2 = C (y); push constants carry {m, n, k, stride}.
 
 const std = @import("std");
+const sasm = @import("spirv_asm.zig");
 
-const Asm = struct {
-    words: std.ArrayList(u32) = .empty,
+/// Helper for authoring a kernel as SPIR-V assembly text (see spirv_asm.zig).
+/// `id()` hands out fresh `%tN` names for anonymous SSA temporaries (mirroring
+/// the old `Asm.id()` counter, so there are never naming collisions); fixed
+/// types/constants/labels are referenced by readable names in the text.
+const Emit = struct {
+    w: *std.ArrayList(u8),
     gpa: std.mem.Allocator,
-    next: u32 = 1,
+    idc: u32 = 0,
 
-    fn id(self: *Asm) u32 {
-        const r = self.next;
-        self.next += 1;
-        return r;
+    fn id(self: *Emit) u32 {
+        self.idc += 1;
+        return self.idc;
     }
 
-    fn op(self: *Asm, opcode: u16, operands: []const u32) !void {
-        try self.words.append(self.gpa, (@as(u32, @intCast(operands.len + 1)) << 16) | opcode);
-        try self.words.appendSlice(self.gpa, operands);
-    }
-
-    /// Opcode with a trailing string literal (null-terminated, word-padded).
-    fn opStr(self: *Asm, opcode: u16, pre: []const u32, s: []const u8) !void {
-        const str_words = s.len / 4 + 1;
-        try self.words.append(self.gpa, (@as(u32, @intCast(pre.len + str_words + 1)) << 16) | opcode);
-        try self.words.appendSlice(self.gpa, pre);
-        var i: usize = 0;
-        while (i < str_words * 4) : (i += 4) {
-            var w: u32 = 0;
-            for (0..4) |b| {
-                if (i + b < s.len) w |= @as(u32, s[i + b]) << @intCast(8 * b);
-            }
-            try self.words.append(self.gpa, w);
-        }
+    fn line(self: *Emit, comptime fmt: []const u8, args: anytype) !void {
+        try self.w.print(self.gpa, fmt, args);
+        try self.w.append(self.gpa, '\n');
     }
 };
-
-/// Build the module; caller frees the returned words as bytes.
-pub fn buildGemm(gpa: std.mem.Allocator) ![]align(4) u8 {
-    var a: Asm = .{ .gpa = gpa };
-    defer a.words.deinit(gpa);
-
-    // --- id pre-allocation ---------------------------------------------
-    const main_fn = a.id();
-    const gid_var = a.id();
-    const t_void = a.id();
-    const t_fnvoid = a.id();
-    const t_u32 = a.id();
-    const t_f16 = a.id();
-    const t_f32 = a.id();
-    const t_v3u = a.id();
-    const t_ptr_in_v3 = a.id();
-    const c_arrlen = a.id();
-    const t_arr_f16 = a.id();
-    const t_arr_f32 = a.id();
-    const t_sb = a.id(); // struct { [N]f16 } (B / weights)
-    const t_sa = a.id(); // struct { [N]f16 } (A / x) — distinct id, same shape
-    const t_sc = a.id(); // struct { [N]f32 }
-    const t_ptr_sb = a.id();
-    const t_ptr_sa = a.id();
-    const t_ptr_sc = a.id();
-    const v_b = a.id();
-    const v_a = a.id();
-    const v_c = a.id();
-    const t_push = a.id();
-    const t_ptr_push = a.id();
-    const v_push = a.id();
-    const t_ptr_pc_u32 = a.id();
-    const t_ptr_sb_f16 = a.id();
-    const t_ptr_sa_f16 = a.id();
-    const t_ptr_sc_f32 = a.id();
-    const c_u0 = a.id();
-    const c_u1 = a.id();
-    const c_u2 = a.id();
-    const c_u3 = a.id();
-    const c_u16 = a.id();
-    const c_scope_sub = a.id(); // 3
-    const c_use_a = a.id(); // 0 (reuses value of c_u0 but must be distinct? use c_u0)
-    _ = c_use_a;
-    const t_mat_a = a.id();
-    const t_mat_b = a.id();
-    const t_mat_c = a.id();
-    const c_f32_0 = a.id();
-    const c_acc0 = a.id();
-    const t_ptr_fn_matc = a.id();
-    const t_ptr_fn_u32 = a.id();
-
-    // --- header ----------------------------------------------------------
-    // magic, version 1.5, generator 0, bound (patched at end), 0
-    try a.words.appendSlice(gpa, &.{ 0x0723_0203, 0x0001_0500, 0, 0, 0 });
-
-    try a.op(17, &.{1}); // OpCapability Shader
-    try a.op(17, &.{9}); // Float16
-    try a.op(17, &.{5345}); // VulkanMemoryModel
-    try a.op(17, &.{6022}); // CooperativeMatrixKHR
-    try a.opStr(10, &.{}, "SPV_KHR_cooperative_matrix");
-    try a.opStr(10, &.{}, "SPV_KHR_vulkan_memory_model");
-    try a.opStr(10, &.{}, "SPV_KHR_16bit_storage");
-    try a.op(14, &.{ 0, 3 }); // OpMemoryModel Logical Vulkan
-    // OpEntryPoint GLCompute %main "main" <interface: gid, buffers, push>
-    {
-        var pre: [2]u32 = .{ 5, main_fn };
-        var post: [5]u32 = .{ gid_var, v_b, v_a, v_c, v_push };
-        var buf: std.ArrayList(u32) = .empty;
-        defer buf.deinit(gpa);
-        try buf.appendSlice(gpa, &pre);
-        // name "main\0" = 2 words
-        try buf.appendSlice(gpa, &.{ std.mem.bytesToValue(u32, "main"), 0 });
-        try buf.appendSlice(gpa, &post);
-        try a.op(15, buf.items);
-    }
-    try a.op(16, &.{ main_fn, 17, 32, 1, 1 }); // ExecutionMode LocalSize 32 1 1
-
-    // --- decorations -------------------------------------------------------
-    try a.op(71, &.{ gid_var, 11, 26 }); // BuiltIn WorkgroupId
-    try a.op(71, &.{ t_arr_f16, 6, 2 }); // ArrayStride 2
-    try a.op(71, &.{ t_arr_f32, 6, 4 });
-    inline for (.{ t_sb, t_sa, t_sc }) |t| {
-        try a.op(71, &.{ t, 2 }); // Block
-        try a.op(72, &.{ t, 0, 35, 0 }); // member 0 Offset 0
-    }
-    try a.op(71, &.{ t_push, 2 }); // push Block
-    inline for (0..4) |m| {
-        try a.op(72, &.{ t_push, @intCast(m), 35, @intCast(m * 4) });
-    }
-    inline for (.{ v_b, v_a, v_c }, 0..) |v, binding| {
-        try a.op(71, &.{ v, 34, 0 }); // DescriptorSet 0
-        try a.op(71, &.{ v, 33, @intCast(binding) }); // Binding
-    }
-
-    // --- types / constants --------------------------------------------------
-    try a.op(19, &.{t_void});
-    try a.op(33, &.{ t_fnvoid, t_void });
-    try a.op(21, &.{ t_u32, 32, 0 });
-    try a.op(22, &.{ t_f16, 16 });
-    try a.op(22, &.{ t_f32, 32 });
-    try a.op(23, &.{ t_v3u, t_u32, 3 });
-    try a.op(32, &.{ t_ptr_in_v3, 1, t_v3u }); // Input
-    try a.op(59, &.{ t_ptr_in_v3, gid_var, 1 });
-
-    try a.op(43, &.{ t_u32, c_arrlen, 1 << 28 });
-    try a.op(28, &.{ t_arr_f16, t_f16, c_arrlen });
-    try a.op(28, &.{ t_arr_f32, t_f32, c_arrlen });
-    try a.op(30, &.{ t_sb, t_arr_f16 });
-    try a.op(30, &.{ t_sa, t_arr_f16 });
-    try a.op(30, &.{ t_sc, t_arr_f32 });
-    try a.op(32, &.{ t_ptr_sb, 12, t_sb }); // StorageBuffer
-    try a.op(32, &.{ t_ptr_sa, 12, t_sa });
-    try a.op(32, &.{ t_ptr_sc, 12, t_sc });
-    try a.op(59, &.{ t_ptr_sb, v_b, 12 });
-    try a.op(59, &.{ t_ptr_sa, v_a, 12 });
-    try a.op(59, &.{ t_ptr_sc, v_c, 12 });
-    try a.op(30, &.{ t_push, t_u32, t_u32, t_u32, t_u32 });
-    try a.op(32, &.{ t_ptr_push, 9, t_push }); // PushConstant
-    try a.op(59, &.{ t_ptr_push, v_push, 9 });
-    try a.op(32, &.{ t_ptr_pc_u32, 9, t_u32 });
-    try a.op(32, &.{ t_ptr_sb_f16, 12, t_f16 });
-    try a.op(32, &.{ t_ptr_sa_f16, 12, t_f16 });
-    try a.op(32, &.{ t_ptr_sc_f32, 12, t_f32 });
-
-    try a.op(43, &.{ t_u32, c_u0, 0 });
-    try a.op(43, &.{ t_u32, c_u1, 1 });
-    try a.op(43, &.{ t_u32, c_u2, 2 });
-    try a.op(43, &.{ t_u32, c_u3, 3 });
-    try a.op(43, &.{ t_u32, c_u16, 16 });
-    try a.op(43, &.{ t_u32, c_scope_sub, 3 }); // Scope Subgroup
-    const t_bool = a.id();
-    try a.op(20, &.{t_bool});
-
-    // OpTypeCooperativeMatrixKHR: component, scope, rows, cols, use.
-    try a.op(4456, &.{ t_mat_a, t_f16, c_scope_sub, c_u16, c_u16, c_u0 });
-    try a.op(4456, &.{ t_mat_b, t_f16, c_scope_sub, c_u16, c_u16, c_u1 });
-    try a.op(4456, &.{ t_mat_c, t_f32, c_scope_sub, c_u16, c_u16, c_u2 });
-    try a.op(43, &.{ t_f32, c_f32_0, 0 }); // f32 0.0 bits
-    try a.op(44, &.{ t_mat_c, c_acc0, c_f32_0 }); // OpConstantComposite (replicated)
-    try a.op(32, &.{ t_ptr_fn_matc, 7, t_mat_c }); // Function
-    try a.op(32, &.{ t_ptr_fn_u32, 7, t_u32 });
-
-    // --- function ------------------------------------------------------------
-    const lb_entry = a.id();
-    const lb_head = a.id();
-    const lb_body = a.id();
-    const lb_cont = a.id();
-    const lb_merge = a.id();
-
-    try a.op(54, &.{ t_void, main_fn, 0, t_fnvoid }); // OpFunction
-    try a.op(248, &.{lb_entry}); // OpLabel
-
-    const acc_var = a.id();
-    const k0_var = a.id();
-    try a.op(59, &.{ t_ptr_fn_matc, acc_var, 7 });
-    try a.op(59, &.{ t_ptr_fn_u32, k0_var, 7 });
-
-    // gid -> col0/row0
-    const gidv = a.id();
-    try a.op(61, &.{ t_v3u, gidv, gid_var });
-    const tile_c = a.id();
-    const tile_r = a.id();
-    try a.op(81, &.{ t_u32, tile_c, gidv, 0 }); // CompositeExtract x
-    try a.op(81, &.{ t_u32, tile_r, gidv, 1 });
-    const col0 = a.id();
-    const row0 = a.id();
-    try a.op(132, &.{ t_u32, col0, tile_c, c_u16 }); // IMul
-    try a.op(132, &.{ t_u32, row0, tile_r, c_u16 });
-
-    // push loads: m(0) n(1) k(2) stride(3)
-    var push_vals: [4]u32 = undefined;
-    inline for (0..4) |m| {
-        const pptr = a.id();
-        const pval = a.id();
-        const cidx = switch (m) {
-            0 => c_u0,
-            1 => c_u1,
-            2 => c_u2,
-            else => c_u3,
-        };
-        try a.op(65, &.{ t_ptr_pc_u32, pptr, v_push, cidx });
-        try a.op(61, &.{ t_u32, pval, pptr });
-        push_vals[m] = pval;
-    }
-    const p_n = push_vals[1];
-    const p_k = push_vals[2];
-    const p_stride = push_vals[3];
-
-    // a_row_base = row0 * k; c_base = row0 * n + col0
-    const a_row_base = a.id();
-    try a.op(132, &.{ t_u32, a_row_base, row0, p_k });
-    const c_rowmul = a.id();
-    const c_base = a.id();
-    try a.op(132, &.{ t_u32, c_rowmul, row0, p_n });
-    try a.op(128, &.{ t_u32, c_base, c_rowmul, col0 }); // IAdd
-
-    try a.op(62, &.{ acc_var, c_acc0 }); // OpStore acc = 0
-    try a.op(62, &.{ k0_var, c_u0 });
-    try a.op(249, &.{lb_head}); // OpBranch
-
-    // loop header
-    try a.op(248, &.{lb_head});
-    try a.op(246, &.{ lb_merge, lb_cont, 0 }); // OpLoopMerge
-    const cond_blk = a.id();
-    try a.op(249, &.{cond_blk});
-    try a.op(248, &.{cond_blk});
-    const k0v = a.id();
-    try a.op(61, &.{ t_u32, k0v, k0_var });
-    const cmp = a.id();
-    try a.op(176, &.{ t_bool, cmp, k0v, p_k }); // ULessThan
-    try a.op(250, &.{ cmp, lb_body, lb_merge }); // BranchConditional
-
-    // body
-    try a.op(248, &.{lb_body});
-    const a_off = a.id();
-    try a.op(128, &.{ t_u32, a_off, a_row_base, k0v });
-    const a_ptr = a.id();
-    try a.op(65, &.{ t_ptr_sa_f16, a_ptr, v_a, c_u0, a_off });
-    const ma = a.id();
-    // OpCooperativeMatrixLoadKHR: result-type, result, ptr, layout(id), stride(id)
-    try a.op(4457, &.{ t_mat_a, ma, a_ptr, c_u0, p_k });
-    const b_rowmul = a.id();
-    try a.op(132, &.{ t_u32, b_rowmul, k0v, p_stride });
-    const b_off = a.id();
-    try a.op(128, &.{ t_u32, b_off, b_rowmul, col0 });
-    const b_ptr = a.id();
-    try a.op(65, &.{ t_ptr_sb_f16, b_ptr, v_b, c_u0, b_off });
-    const mb = a.id();
-    try a.op(4457, &.{ t_mat_b, mb, b_ptr, c_u0, p_stride });
-    const acc_in = a.id();
-    try a.op(61, &.{ t_mat_c, acc_in, acc_var });
-    const acc_out = a.id();
-    try a.op(4459, &.{ t_mat_c, acc_out, ma, mb, acc_in }); // MulAdd
-    try a.op(62, &.{ acc_var, acc_out });
-    try a.op(249, &.{lb_cont});
-
-    // continue: k0 += 16
-    try a.op(248, &.{lb_cont});
-    const k0n = a.id();
-    try a.op(128, &.{ t_u32, k0n, k0v, c_u16 });
-    try a.op(62, &.{ k0_var, k0n });
-    try a.op(249, &.{lb_head});
-
-    // merge: store C
-    try a.op(248, &.{lb_merge});
-    const c_ptr = a.id();
-    try a.op(65, &.{ t_ptr_sc_f32, c_ptr, v_c, c_u0, c_base });
-    const acc_fin = a.id();
-    try a.op(61, &.{ t_mat_c, acc_fin, acc_var });
-    // OpCooperativeMatrixStoreKHR: ptr, object, layout(id), stride(id)
-    try a.op(4458, &.{ c_ptr, acc_fin, c_u0, p_n });
-    try a.op(253, &.{}); // OpReturn
-    try a.op(56, &.{}); // OpFunctionEnd
-
-    // patch bound
-    a.words.items[3] = a.next;
-
-    const out = try gpa.alignedAlloc(u8, .of(u32), a.words.items.len * 4);
-    @memcpy(out, std.mem.sliceAsBytes(a.words.items));
-    return out;
-}
 
 /// int8 tensor-core GEMM: `C(s32) = A(s8) @ B(s8)` with a 16x16x32 subgroup
 /// cooperative matrix (sint8 in, sint32 accumulate). One subgroup (a 32-thread
@@ -320,300 +49,220 @@ pub fn buildGemm(gpa: std.mem.Allocator) ![]align(4) u8 {
 /// 2 = C (s32). Push: {m,n,k,stride}. `mt`,`nt` in 1..4.
 pub fn buildGemmI8(gpa: std.mem.Allocator, mt: u32, nt: u32) ![]align(4) u8 {
     std.debug.assert(mt >= 1 and mt <= 8 and nt >= 1 and nt <= 8);
-    var a: Asm = .{ .gpa = gpa };
-    defer a.words.deinit(gpa);
 
-    // u32 constant pool: SPIR-V forbids duplicate OpConstant, so intern by
-    // value. Emitted in the types section below; referenced via `cu`.
-    var cvals: [40]u32 = undefined;
-    var cids: [40]u32 = undefined;
-    var cn: usize = 0;
+    var t: std.ArrayList(u8) = .empty;
+    defer t.deinit(gpa);
+    const w = &t;
+
+    // u32 index-constant pool, deduped by value and emitted in a fixed order;
+    // each value v is referenced as `%cu_<v>`, so the assembler interns it once.
+    var pool: [40]u32 = undefined;
+    var pn: usize = 0;
     const addC = struct {
-        fn f(vals: []u32, ids: []u32, n: *usize, asm_: *Asm, v: u32) void {
-            for (vals[0..n.*]) |ex| if (ex == v) return;
-            vals[n.*] = v;
-            ids[n.*] = asm_.id();
+        fn f(p: []u32, n: *usize, v: u32) void {
+            for (p[0..n.*]) |ex| if (ex == v) return;
+            p[n.*] = v;
             n.* += 1;
         }
     }.f;
-    addC(&cvals, &cids, &cn, &a, 0);
-    addC(&cvals, &cids, &cn, &a, 1);
-    addC(&cvals, &cids, &cn, &a, 2);
-    addC(&cvals, &cids, &cn, &a, 3);
-    addC(&cvals, &cids, &cn, &a, 16);
-    addC(&cvals, &cids, &cn, &a, 32);
-    addC(&cvals, &cids, &cn, &a, 16 * mt);
-    addC(&cvals, &cids, &cn, &a, 16 * nt);
-    for (0..mt) |i| addC(&cvals, &cids, &cn, &a, @intCast(16 * i));
-    for (0..nt) |j| addC(&cvals, &cids, &cn, &a, @intCast(16 * j));
-    const cu = struct {
-        fn f(vals: []const u32, ids: []const u32, n: usize, v: u32) u32 {
-            for (0..n) |i| if (vals[i] == v) return ids[i];
-            unreachable;
-        }
-    }.f;
+    addC(&pool, &pn, 0);
+    addC(&pool, &pn, 1);
+    addC(&pool, &pn, 2);
+    addC(&pool, &pn, 3);
+    addC(&pool, &pn, 16);
+    addC(&pool, &pn, 32);
+    addC(&pool, &pn, 16 * mt);
+    addC(&pool, &pn, 16 * nt);
+    for (0..mt) |i| addC(&pool, &pn, @intCast(16 * i));
+    for (0..nt) |j| addC(&pool, &pn, @intCast(16 * j));
 
-    const main_fn = a.id();
-    const gid_var = a.id();
-    const t_void = a.id();
-    const t_fnvoid = a.id();
-    const t_u32 = a.id();
-    const t_s8 = a.id();
-    const t_s32 = a.id();
-    const t_v3u = a.id();
-    const t_ptr_in_v3 = a.id();
-    const c_arrlen = a.id();
-    const t_arr_s8 = a.id();
-    const t_arr_s32 = a.id();
-    const t_sb = a.id(); // struct { [N]s8 } (B / weights)
-    const t_sa = a.id(); // struct { [N]s8 } (A / x)
-    const t_sc = a.id(); // struct { [N]s32 } (C / y)
-    const t_ptr_sb = a.id();
-    const t_ptr_sa = a.id();
-    const t_ptr_sc = a.id();
-    const v_b = a.id();
-    const v_a = a.id();
-    const v_c = a.id();
-    const t_push = a.id();
-    const t_ptr_push = a.id();
-    const v_push = a.id();
-    const t_ptr_pc_u32 = a.id();
-    const t_ptr_sb_s8 = a.id();
-    const t_ptr_sa_s8 = a.id();
-    const t_ptr_sc_s32 = a.id();
-    const t_mat_a = a.id();
-    const t_mat_b = a.id();
-    const t_mat_c = a.id();
-    const c_s32_0 = a.id();
-    const c_acc0 = a.id();
-    const t_ptr_fn_matc = a.id();
-    const t_ptr_fn_u32 = a.id();
-    const t_bool = a.id();
+    // --- header / decorations ------------------------------------------------
+    try w.print(gpa,
+        \\OpCapability Shader
+        \\OpCapability Int8
+        \\OpCapability StorageBuffer8BitAccess
+        \\OpCapability VulkanMemoryModel
+        \\OpCapability CooperativeMatrixKHR
+        \\OpExtension "SPV_KHR_cooperative_matrix"
+        \\OpExtension "SPV_KHR_vulkan_memory_model"
+        \\OpExtension "SPV_KHR_8bit_storage"
+        \\OpMemoryModel Logical Vulkan
+        \\OpEntryPoint GLCompute %main "main" %gid %vb %va %vc %vpush
+        \\OpExecutionMode %main LocalSize 32 1 1
+        \\OpDecorate %gid BuiltIn WorkgroupId
+        \\OpDecorate %arr_s8 ArrayStride 1
+        \\OpDecorate %arr_s32 ArrayStride 4
+        \\OpDecorate %sb Block
+        \\OpMemberDecorate %sb 0 Offset 0
+        \\OpDecorate %sa Block
+        \\OpMemberDecorate %sa 0 Offset 0
+        \\OpDecorate %sc Block
+        \\OpMemberDecorate %sc 0 Offset 0
+        \\OpDecorate %push Block
+        \\OpMemberDecorate %push 0 Offset 0
+        \\OpMemberDecorate %push 1 Offset 4
+        \\OpMemberDecorate %push 2 Offset 8
+        \\OpMemberDecorate %push 3 Offset 12
+        \\OpDecorate %vb DescriptorSet 0
+        \\OpDecorate %vb Binding 0
+        \\OpDecorate %va DescriptorSet 0
+        \\OpDecorate %va Binding 1
+        \\OpDecorate %vc DescriptorSet 0
+        \\OpDecorate %vc Binding 2
+        \\
+    , .{});
 
-    // --- header ----------------------------------------------------------
-    try a.words.appendSlice(gpa, &.{ 0x0723_0203, 0x0001_0500, 0, 0, 0 });
+    // --- types --------------------------------------------------------------
+    try w.print(gpa,
+        \\%void = OpTypeVoid
+        \\%fnvoid = OpTypeFunction %void
+        \\%u32 = OpTypeInt 32 0
+        \\%s8 = OpTypeInt 8 1
+        \\%s32 = OpTypeInt 32 1
+        \\%v3u = OpTypeVector %u32 3
+        \\%ptr_in_v3 = OpTypePointer Input %v3u
+        \\%gid = OpVariable %ptr_in_v3 Input
+        \\%c_arrlen = OpConstant %u32 268435456
+        \\%arr_s8 = OpTypeArray %s8 %c_arrlen
+        \\%arr_s32 = OpTypeArray %s32 %c_arrlen
+        \\%sb = OpTypeStruct %arr_s8
+        \\%sa = OpTypeStruct %arr_s8
+        \\%sc = OpTypeStruct %arr_s32
+        \\%ptr_sb = OpTypePointer StorageBuffer %sb
+        \\%ptr_sa = OpTypePointer StorageBuffer %sa
+        \\%ptr_sc = OpTypePointer StorageBuffer %sc
+        \\%vb = OpVariable %ptr_sb StorageBuffer
+        \\%va = OpVariable %ptr_sa StorageBuffer
+        \\%vc = OpVariable %ptr_sc StorageBuffer
+        \\%push = OpTypeStruct %u32 %u32 %u32 %u32
+        \\%ptr_push = OpTypePointer PushConstant %push
+        \\%vpush = OpVariable %ptr_push PushConstant
+        \\%ptr_pc_u32 = OpTypePointer PushConstant %u32
+        \\%ptr_sb_s8 = OpTypePointer StorageBuffer %s8
+        \\%ptr_sa_s8 = OpTypePointer StorageBuffer %s8
+        \\%ptr_sc_s32 = OpTypePointer StorageBuffer %s32
+        \\
+    , .{});
 
-    try a.op(17, &.{1}); // OpCapability Shader
-    try a.op(17, &.{39}); // Int8
-    try a.op(17, &.{4448}); // StorageBuffer8BitAccess
-    try a.op(17, &.{5345}); // VulkanMemoryModel
-    try a.op(17, &.{6022}); // CooperativeMatrixKHR
-    try a.opStr(10, &.{}, "SPV_KHR_cooperative_matrix");
-    try a.opStr(10, &.{}, "SPV_KHR_vulkan_memory_model");
-    try a.opStr(10, &.{}, "SPV_KHR_8bit_storage");
-    try a.op(14, &.{ 0, 3 }); // OpMemoryModel Logical Vulkan
-    {
-        var buf: std.ArrayList(u32) = .empty;
-        defer buf.deinit(gpa);
-        try buf.appendSlice(gpa, &.{ 5, main_fn });
-        try buf.appendSlice(gpa, &.{ std.mem.bytesToValue(u32, "main"), 0 });
-        try buf.appendSlice(gpa, &.{ gid_var, v_b, v_a, v_c, v_push });
-        try a.op(15, buf.items);
-    }
-    try a.op(16, &.{ main_fn, 17, 32, 1, 1 }); // ExecutionMode LocalSize 32 1 1
+    // Index-constant pool.
+    for (pool[0..pn]) |v| try w.print(gpa, "%cu_{d} = OpConstant %u32 {d}\n", .{ v, v });
 
-    // --- decorations -------------------------------------------------------
-    try a.op(71, &.{ gid_var, 11, 26 }); // BuiltIn WorkgroupId
-    try a.op(71, &.{ t_arr_s8, 6, 1 }); // ArrayStride 1
-    try a.op(71, &.{ t_arr_s32, 6, 4 }); // ArrayStride 4
-    inline for (.{ t_sb, t_sa, t_sc }) |t| {
-        try a.op(71, &.{ t, 2 }); // Block
-        try a.op(72, &.{ t, 0, 35, 0 }); // member 0 Offset 0
-    }
-    try a.op(71, &.{ t_push, 2 });
-    inline for (0..4) |m| {
-        try a.op(72, &.{ t_push, @intCast(m), 35, @intCast(m * 4) });
-    }
-    inline for (.{ v_b, v_a, v_c }, 0..) |v, binding| {
-        try a.op(71, &.{ v, 34, 0 }); // DescriptorSet 0
-        try a.op(71, &.{ v, 33, @intCast(binding) }); // Binding
-    }
+    // Cooperative-matrix types (scope Subgroup = %cu_3). A=16x32 use 0,
+    // B=32x16 use 1, C=16x16 use 2. Accumulator initialised to zeros.
+    try w.print(gpa,
+        \\%bool = OpTypeBool
+        \\%mat_a = OpTypeCooperativeMatrixKHR %s8 %cu_3 %cu_16 %cu_32 %cu_0
+        \\%mat_b = OpTypeCooperativeMatrixKHR %s8 %cu_3 %cu_32 %cu_16 %cu_1
+        \\%mat_c = OpTypeCooperativeMatrixKHR %s32 %cu_3 %cu_16 %cu_16 %cu_2
+        \\%c_s32_0 = OpConstant %s32 0
+        \\%c_acc0 = OpConstantComposite %mat_c %c_s32_0
+        \\%ptr_fn_matc = OpTypePointer Function %mat_c
+        \\%ptr_fn_u32 = OpTypePointer Function %u32
+        \\
+    , .{});
 
-    // --- types / constants --------------------------------------------------
-    try a.op(19, &.{t_void});
-    try a.op(33, &.{ t_fnvoid, t_void });
-    try a.op(21, &.{ t_u32, 32, 0 }); // unsigned 32 (indices)
-    try a.op(21, &.{ t_s8, 8, 1 }); // signed 8
-    try a.op(21, &.{ t_s32, 32, 1 }); // signed 32 (accumulator)
-    try a.op(23, &.{ t_v3u, t_u32, 3 });
-    try a.op(32, &.{ t_ptr_in_v3, 1, t_v3u }); // Input
-    try a.op(59, &.{ t_ptr_in_v3, gid_var, 1 });
-
-    try a.op(43, &.{ t_u32, c_arrlen, 1 << 28 });
-    try a.op(28, &.{ t_arr_s8, t_s8, c_arrlen });
-    try a.op(28, &.{ t_arr_s32, t_s32, c_arrlen });
-    try a.op(30, &.{ t_sb, t_arr_s8 });
-    try a.op(30, &.{ t_sa, t_arr_s8 });
-    try a.op(30, &.{ t_sc, t_arr_s32 });
-    try a.op(32, &.{ t_ptr_sb, 12, t_sb }); // StorageBuffer
-    try a.op(32, &.{ t_ptr_sa, 12, t_sa });
-    try a.op(32, &.{ t_ptr_sc, 12, t_sc });
-    try a.op(59, &.{ t_ptr_sb, v_b, 12 });
-    try a.op(59, &.{ t_ptr_sa, v_a, 12 });
-    try a.op(59, &.{ t_ptr_sc, v_c, 12 });
-    try a.op(30, &.{ t_push, t_u32, t_u32, t_u32, t_u32 });
-    try a.op(32, &.{ t_ptr_push, 9, t_push }); // PushConstant
-    try a.op(59, &.{ t_ptr_push, v_push, 9 });
-    try a.op(32, &.{ t_ptr_pc_u32, 9, t_u32 });
-    try a.op(32, &.{ t_ptr_sb_s8, 12, t_s8 });
-    try a.op(32, &.{ t_ptr_sa_s8, 12, t_s8 });
-    try a.op(32, &.{ t_ptr_sc_s32, 12, t_s32 });
-
-    for (0..cn) |i| try a.op(43, &.{ t_u32, cids[i], cvals[i] });
-    const c0 = cu(&cvals, &cids, cn, 0);
-    const c16 = cu(&cvals, &cids, cn, 16);
-    const c32 = cu(&cvals, &cids, cn, 32);
-    const c_scope = cu(&cvals, &cids, cn, 3); // Scope Subgroup == 3
-    try a.op(20, &.{t_bool});
-
-    // OpTypeCooperativeMatrixKHR: component, scope, rows, cols, use.
-    // A = 16x32 (use 0), B = 32x16 (use 1), C = 16x16 (use 2).
-    try a.op(4456, &.{ t_mat_a, t_s8, c_scope, c16, c32, c0 });
-    try a.op(4456, &.{ t_mat_b, t_s8, c_scope, c32, c16, cu(&cvals, &cids, cn, 1) });
-    try a.op(4456, &.{ t_mat_c, t_s32, c_scope, c16, c16, cu(&cvals, &cids, cn, 2) });
-    try a.op(43, &.{ t_s32, c_s32_0, 0 });
-    try a.op(44, &.{ t_mat_c, c_acc0, c_s32_0 }); // acc filled with 0
-    try a.op(32, &.{ t_ptr_fn_matc, 7, t_mat_c }); // Function
-    try a.op(32, &.{ t_ptr_fn_u32, 7, t_u32 });
-
-    // --- function ------------------------------------------------------------
-    const lb_entry = a.id();
-    const lb_head = a.id();
-    const lb_body = a.id();
-    const lb_cont = a.id();
-    const lb_merge = a.id();
-
-    try a.op(54, &.{ t_void, main_fn, 0, t_fnvoid }); // OpFunction
-    try a.op(248, &.{lb_entry});
-
-    // Function-local variables (all in the first block): mt*nt accumulators + k0.
+    // --- function -----------------------------------------------------------
     const nt_tiles = mt * nt;
-    var acc_var: [64]u32 = undefined;
-    for (0..nt_tiles) |i| {
-        acc_var[i] = a.id();
-        try a.op(59, &.{ t_ptr_fn_matc, acc_var[i], 7 });
+    try w.print(gpa,
+        \\%main = OpFunction %void None %fnvoid
+        \\%entry = OpLabel
+        \\
+    , .{});
+    // mt*nt accumulator vars + the k0 induction var (all in the entry block).
+    for (0..nt_tiles) |i| try w.print(gpa, "%acc_{d} = OpVariable %ptr_fn_matc Function\n", .{i});
+    try w.print(gpa,
+        \\%k0_var = OpVariable %ptr_fn_u32 Function
+        \\%gidv = OpLoad %v3u %gid
+        \\%tile_c = OpCompositeExtract %u32 %gidv 0
+        \\%tile_r = OpCompositeExtract %u32 %gidv 1
+        \\
+    , .{});
+    try w.print(gpa, "%col0 = OpIMul %u32 %tile_c %cu_{d}\n", .{16 * nt});
+    try w.print(gpa, "%row0 = OpIMul %u32 %tile_r %cu_{d}\n", .{16 * mt});
+
+    // Push constants: {m, n, k, stride}. We use n (1), k (2), stride (3).
+    for (0..4) |m| {
+        try w.print(gpa, "%pptr_{d} = OpAccessChain %ptr_pc_u32 %vpush %cu_{d}\n", .{ m, m });
+        try w.print(gpa, "%pval_{d} = OpLoad %u32 %pptr_{d}\n", .{ m, m });
     }
-    const k0_var = a.id();
-    try a.op(59, &.{ t_ptr_fn_u32, k0_var, 7 });
 
-    const gidv = a.id();
-    try a.op(61, &.{ t_v3u, gidv, gid_var });
-    const tile_c = a.id();
-    const tile_r = a.id();
-    try a.op(81, &.{ t_u32, tile_c, gidv, 0 });
-    try a.op(81, &.{ t_u32, tile_r, gidv, 1 });
-    const col0 = a.id();
-    const row0 = a.id();
-    try a.op(132, &.{ t_u32, col0, tile_c, cu(&cvals, &cids, cn, 16 * nt) });
-    try a.op(132, &.{ t_u32, row0, tile_r, cu(&cvals, &cids, cn, 16 * mt) });
-
-    var push_vals: [4]u32 = undefined;
-    inline for (0..4) |m| {
-        const pptr = a.id();
-        const pval = a.id();
-        try a.op(65, &.{ t_ptr_pc_u32, pptr, v_push, cu(&cvals, &cids, cn, @intCast(m)) });
-        try a.op(61, &.{ t_u32, pval, pptr });
-        push_vals[m] = pval;
-    }
-    const p_n = push_vals[1];
-    const p_k = push_vals[2];
-    const p_stride = push_vals[3];
-
-    // Per-tile invariants: A row base [mi] (row*k), B column [nj] (col0+16*nj),
-    // C base [mi][nj] (row*n + col). row = row0 + 16*mi.
-    var a_row_base: [8]u32 = undefined;
-    var c_row_n: [8]u32 = undefined;
+    // Per-tile invariants. row = row0 + 16*mi; a_row_base = row*k;
+    // c_row_n = row*n; col_n = col0 + 16*nj.
     for (0..mt) |mi| {
-        const rowmi = a.id();
-        try a.op(128, &.{ t_u32, rowmi, row0, cu(&cvals, &cids, cn, @intCast(16 * mi)) });
-        a_row_base[mi] = a.id();
-        try a.op(132, &.{ t_u32, a_row_base[mi], rowmi, p_k });
-        c_row_n[mi] = a.id();
-        try a.op(132, &.{ t_u32, c_row_n[mi], rowmi, p_n });
+        try w.print(gpa, "%rowmi_{d} = OpIAdd %u32 %row0 %cu_{d}\n", .{ mi, 16 * mi });
+        try w.print(gpa, "%arb_{d} = OpIMul %u32 %rowmi_{d} %pval_2\n", .{ mi, mi });
+        try w.print(gpa, "%crn_{d} = OpIMul %u32 %rowmi_{d} %pval_1\n", .{ mi, mi });
     }
-    var col_n: [8]u32 = undefined;
-    for (0..nt) |nj| {
-        col_n[nj] = a.id();
-        try a.op(128, &.{ t_u32, col_n[nj], col0, cu(&cvals, &cids, cn, @intCast(16 * nj)) });
-    }
+    for (0..nt) |nj| try w.print(gpa, "%coln_{d} = OpIAdd %u32 %col0 %cu_{d}\n", .{ nj, 16 * nj });
 
-    for (0..nt_tiles) |i| try a.op(62, &.{ acc_var[i], c_acc0 });
-    try a.op(62, &.{ k0_var, c0 });
-    try a.op(249, &.{lb_head});
+    for (0..nt_tiles) |i| try w.print(gpa, "OpStore %acc_{d} %c_acc0\n", .{i});
+    try w.print(gpa,
+        \\OpStore %k0_var %cu_0
+        \\OpBranch %head
+        \\%head = OpLabel
+        \\OpLoopMerge %merge %cont None
+        \\OpBranch %cond
+        \\%cond = OpLabel
+        \\%k0v = OpLoad %u32 %k0_var
+        \\%cmp = OpULessThan %bool %k0v %pval_2
+        \\OpBranchConditional %cmp %body %merge
+        \\%body = OpLabel
+        \\
+    , .{});
 
-    try a.op(248, &.{lb_head});
-    try a.op(246, &.{ lb_merge, lb_cont, 0 }); // OpLoopMerge
-    const cond_blk = a.id();
-    try a.op(249, &.{cond_blk});
-    try a.op(248, &.{cond_blk});
-    const k0v = a.id();
-    try a.op(61, &.{ t_u32, k0v, k0_var });
-    const cmp = a.id();
-    try a.op(176, &.{ t_bool, cmp, k0v, p_k }); // ULessThan
-    try a.op(250, &.{ cmp, lb_body, lb_merge });
-
-    try a.op(248, &.{lb_body});
     // Load mt A fragments and nt B fragments for this k-slab.
-    var ma: [8]u32 = undefined;
     for (0..mt) |mi| {
-        const a_off = a.id();
-        try a.op(128, &.{ t_u32, a_off, a_row_base[mi], k0v });
-        const a_ptr = a.id();
-        try a.op(65, &.{ t_ptr_sa_s8, a_ptr, v_a, c0, a_off });
-        ma[mi] = a.id();
-        try a.op(4457, &.{ t_mat_a, ma[mi], a_ptr, c0, p_k }); // Load A RowMajor
+        try w.print(gpa, "%aoff_{d} = OpIAdd %u32 %arb_{d} %k0v\n", .{ mi, mi });
+        try w.print(gpa, "%aptr_{d} = OpAccessChain %ptr_sa_s8 %va %cu_0 %aoff_{d}\n", .{ mi, mi });
+        try w.print(gpa, "%ma_{d} = OpCooperativeMatrixLoadKHR %mat_a %aptr_{d} %cu_0 %pval_2\n", .{ mi, mi });
     }
-    var mb: [8]u32 = undefined;
-    const b_rowmul = a.id();
-    try a.op(132, &.{ t_u32, b_rowmul, k0v, p_stride });
+    try w.print(gpa, "%b_rowmul = OpIMul %u32 %k0v %pval_3\n", .{});
     for (0..nt) |nj| {
-        const b_off = a.id();
-        try a.op(128, &.{ t_u32, b_off, b_rowmul, col_n[nj] });
-        const b_ptr = a.id();
-        try a.op(65, &.{ t_ptr_sb_s8, b_ptr, v_b, c0, b_off });
-        mb[nj] = a.id();
-        try a.op(4457, &.{ t_mat_b, mb[nj], b_ptr, c0, p_stride }); // Load B RowMajor
+        try w.print(gpa, "%boff_{d} = OpIAdd %u32 %b_rowmul %coln_{d}\n", .{ nj, nj });
+        try w.print(gpa, "%bptr_{d} = OpAccessChain %ptr_sb_s8 %vb %cu_0 %boff_{d}\n", .{ nj, nj });
+        try w.print(gpa, "%mb_{d} = OpCooperativeMatrixLoadKHR %mat_b %bptr_{d} %cu_0 %pval_3\n", .{ nj, nj });
     }
-    // mt*nt MMAs, reusing the loaded fragments.
+    // mt*nt MMAs, reusing the loaded fragments. Operands-mask 15 = A|B|C|Result
+    // all signed.
     for (0..mt) |mi| {
         for (0..nt) |nj| {
             const ti = mi * nt + nj;
-            const acc_in = a.id();
-            try a.op(61, &.{ t_mat_c, acc_in, acc_var[ti] });
-            const acc_out = a.id();
-            // MulAdd, signed operands mask (A|B|C|Result signed = 0xF).
-            try a.op(4459, &.{ t_mat_c, acc_out, ma[mi], mb[nj], acc_in, 0xF });
-            try a.op(62, &.{ acc_var[ti], acc_out });
+            try w.print(gpa, "%accin_{d} = OpLoad %mat_c %acc_{d}\n", .{ ti, ti });
+            try w.print(gpa, "%accout_{d} = OpCooperativeMatrixMulAddKHR %mat_c %ma_{d} %mb_{d} %accin_{d} 15\n", .{ ti, mi, nj, ti });
+            try w.print(gpa, "OpStore %acc_{d} %accout_{d}\n", .{ ti, ti });
         }
     }
-    try a.op(249, &.{lb_cont});
 
-    try a.op(248, &.{lb_cont});
-    const k0n = a.id();
-    try a.op(128, &.{ t_u32, k0n, k0v, c32 }); // k0 += 32
-    try a.op(62, &.{ k0_var, k0n });
-    try a.op(249, &.{lb_head});
+    try w.print(gpa,
+        \\OpBranch %cont
+        \\%cont = OpLabel
+        \\
+    , .{});
+    try w.print(gpa, "%k0n = OpIAdd %u32 %k0v %cu_32\n", .{}); // k0 += 32
+    try w.print(gpa,
+        \\OpStore %k0_var %k0n
+        \\OpBranch %head
+        \\%merge = OpLabel
+        \\
+    , .{});
 
-    try a.op(248, &.{lb_merge});
+    // Store each C tile.
     for (0..mt) |mi| {
         for (0..nt) |nj| {
             const ti = mi * nt + nj;
-            const c_base = a.id();
-            try a.op(128, &.{ t_u32, c_base, c_row_n[mi], col_n[nj] });
-            const c_ptr = a.id();
-            try a.op(65, &.{ t_ptr_sc_s32, c_ptr, v_c, c0, c_base });
-            const acc_fin = a.id();
-            try a.op(61, &.{ t_mat_c, acc_fin, acc_var[ti] });
-            try a.op(4458, &.{ c_ptr, acc_fin, c0, p_n }); // Store C RowMajor
+            try w.print(gpa, "%cbase_{d} = OpIAdd %u32 %crn_{d} %coln_{d}\n", .{ ti, mi, nj });
+            try w.print(gpa, "%cptr_{d} = OpAccessChain %ptr_sc_s32 %vc %cu_0 %cbase_{d}\n", .{ ti, ti });
+            try w.print(gpa, "%accfin_{d} = OpLoad %mat_c %acc_{d}\n", .{ ti, ti });
+            try w.print(gpa, "OpCooperativeMatrixStoreKHR %cptr_{d} %accfin_{d} %cu_0 %pval_1\n", .{ ti, ti });
         }
     }
-    try a.op(253, &.{}); // OpReturn
-    try a.op(56, &.{}); // OpFunctionEnd
+    try w.print(gpa,
+        \\OpReturn
+        \\OpFunctionEnd
+        \\
+    , .{});
 
-    a.words.items[3] = a.next;
-    const out = try gpa.alignedAlloc(u8, .of(u32), a.words.items.len * 4);
-    @memcpy(out, std.mem.sliceAsBytes(a.words.items));
-    return out;
+    return sasm.assembleChecked(gpa, sasm.version_1_5, t.items);
 }
 
 /// Register tile (16x16 fragments per subgroup) for the int8 coop GEMM.
@@ -658,363 +307,233 @@ pub const coop_i8_double_buf = true;
 /// stride a multiple of 4.
 pub fn buildGemmSharedI8(gpa: std.mem.Allocator, warps8: bool, fuse_scale: bool, double_buf: bool, c_h16: bool) ![]align(4) u8 {
     std.debug.assert(!c_h16 or fuse_scale);
-    const WGM: u32 = 128;
     const WGN: u32 = 128;
     const K_STEP: u32 = 64;
     const NWARPS: u32 = if (warps8) 8 else 4;
     const THREADS: u32 = 32 * NWARPS;
-    // Warp grid: 2 warps along m (each 64 rows), NWARPS/2 along n. Each warp
-    // is MT=4 x NT fragments (16x16). 4-warp: 2x2 grid, 64x64/warp (NT=4, 16
-    // accs/warp = 128 s32/thread, ~1 wg/SM). 8-warp: 2x4 grid, 64x32/warp
-    // (NT=2, 8 accs = 64 s32/thread, ~2 wgs/SM — the occupancy lever, since
-    // int8 accumulators are forced s32 and can't shrink like fp8's f16 accs).
     const WARP_N: u32 = NWARPS / 2; // warps along n
     const WARP_W: u32 = WGN / WARP_N; // n-cols per warp (64 or 32)
     const MT: u32 = 4;
     const NT: u32 = WARP_W / 16; // 4 or 2
-    // Shared u32 layout: A [128 rows][16 u32]=2048, then B [64 krows][32 u32]=2048.
-    const A_U32: u32 = WGM * (K_STEP / 4); // 2048; B slab starts here (B_BASE)
+    const A_U32: u32 = 128 * (K_STEP / 4); // 2048; B slab starts here (B_BASE)
     const SH_LEN: u32 = A_U32 + K_STEP * (WGN / 4); // 4096 (16 KB)
     const A_QUADS: u32 = A_U32 / THREADS; // u32/thread for A staging (16 or 8)
     const B_QUADS: u32 = (K_STEP * (WGN / 4)) / THREADS; // (16 or 8) for B staging
 
-    var a: Asm = .{ .gpa = gpa };
-    defer a.words.deinit(gpa);
+    const c_elem = if (c_h16) "f16" else if (fuse_scale) "f32" else "s32";
 
-    // --- constant interning (u32 pool) ---
-    var cvals: [96]u32 = undefined;
-    var cids: [96]u32 = undefined;
-    var cn: usize = 0;
+    var t: std.ArrayList(u8) = .empty;
+    defer t.deinit(gpa);
+    var em = Emit{ .w = &t, .gpa = gpa };
+
+    // u32 index-constant pool, deduped by value and emitted in a fixed order;
+    // referenced as `%cu_<v>`.
+    var pool: [96]u32 = undefined;
+    var pn: usize = 0;
     const addC = struct {
-        fn f(vals: []u32, ids: []u32, n: *usize, asm_: *Asm, v: u32) void {
-            for (vals[0..n.*]) |ex| if (ex == v) return;
-            vals[n.*] = v;
-            ids[n.*] = asm_.id();
+        fn f(p: []u32, n: *usize, v: u32) void {
+            for (p[0..n.*]) |ex| if (ex == v) return;
+            p[n.*] = v;
             n.* += 1;
         }
     }.f;
-    // scalars used everywhere
     for ([_]u32{ 0, 1, 2, 3, 4, 5, 8, 15, 16, 31, 32, 48, 64, 128, 256, 512, 768, 1024, 2048, 0x108 }) |v|
-        addC(&cvals, &cids, &cn, &a, v);
-    // staging per-thread chunk strides t*THREADS
-    for (0..@max(A_QUADS, B_QUADS)) |t| addC(&cvals, &cids, &cn, &a, @intCast(t * THREADS));
-    // A frag offsets mi*256, ks*8 ; B frag offsets ks*1024, nj*4, B_BASE
-    for (0..MT) |mi| addC(&cvals, &cids, &cn, &a, @intCast(mi * 256));
-    for (0..NT) |nj| addC(&cvals, &cids, &cn, &a, @intCast(nj * 4));
-    addC(&cvals, &cids, &cn, &a, WARP_W / 4); // warp_n u32 column step
-    // Stage A (fuse_scale): per-subgroup s32 scratch base ly*256, scratch len,
-    // and the 8 interleaved lane strides i*32 (256 elems / 32 lanes).
+        addC(&pool, &pn, v);
+    for (0..@max(A_QUADS, B_QUADS)) |tt| addC(&pool, &pn, @intCast(tt * THREADS));
+    for (0..MT) |mi| addC(&pool, &pn, @intCast(mi * 256));
+    for (0..NT) |nj| addC(&pool, &pn, @intCast(nj * 4));
+    addC(&pool, &pn, WARP_W / 4);
     if (fuse_scale) {
-        addC(&cvals, &cids, &cn, &a, NWARPS * 256);
-        for (0..8) |i| addC(&cvals, &cids, &cn, &a, @intCast(i * 32));
+        addC(&pool, &pn, NWARPS * 256);
+        for (0..8) |i| addC(&pool, &pn, @intCast(i * 32));
     }
-    const cu = struct {
-        fn f(vals: []const u32, ids: []const u32, n: usize, v: u32) u32 {
-            for (0..n) |i| if (vals[i] == v) return ids[i];
-            unreachable;
-        }
-    }.f;
-
-    const main_fn = a.id();
-    const gid_var = a.id();
-    const lid_var = a.id();
-    const t_void = a.id();
-    const t_fnvoid = a.id();
-    const t_u32 = a.id();
-    const t_s8 = a.id();
-    const t_s32 = a.id();
-    const t_v3u = a.id();
-    const t_ptr_in_v3 = a.id();
-    const t_bool = a.id();
-    const c_arrlen = a.id();
-    const t_arr_u32 = a.id(); // storage-buffer u32 arrays (A/B views)
-    const t_arr_s32 = a.id();
-    const t_sb = a.id(); // struct{[N]u32} B view (binding 0)
-    const t_sa = a.id(); // struct{[N]u32} A view (binding 1)
-    const t_sc = a.id(); // struct{[N]s32} C (binding 2)
-    const t_ptr_sb = a.id();
-    const t_ptr_sa = a.id();
-    const t_ptr_sc = a.id();
-    const v_b = a.id();
-    const v_a = a.id();
-    const v_c = a.id();
-    const t_ptr_sb_u32 = a.id();
-    const t_ptr_sa_u32 = a.id();
-    const t_ptr_sc_s32 = a.id();
-    const t_push = a.id();
-    const t_ptr_push = a.id();
-    const v_push = a.id();
-    const t_ptr_pc_u32 = a.id();
-    // workgroup u32 array
-    const c_shlen = a.id();
-    const t_sh = a.id();
-    const t_ptr_wg_sh = a.id();
-    const v_sh = a.id();
-    const t_ptr_wg_u32 = a.id();
-    // coop matrix types
-    const t_mat_a = a.id();
-    const t_mat_b = a.id();
-    const t_mat_c = a.id();
-    const c_s32_0 = a.id();
-    const c_acc0 = a.id();
-    // Stage A (fuse_scale) extras: C stores f32, binding 3 = scale buffer
-    // [act(m_pad) | weight(rows)] f32, and a per-subgroup s32 workgroup scratch
-    // that the 16x16 C fragments coop-store into so the 32 lanes can rescale +
-    // write f32 element-wise (act[row]*weight[col]).
-    const t_f32 = a.id();
-    const t_f16 = a.id(); // C store type when c_h16
-    const t_arr_f32 = a.id();
-    const t_scale = a.id();
-    const t_ptr_scale = a.id();
-    const v_scale = a.id();
-    const t_ptr_scale_f32 = a.id();
-    const c_scrlen = a.id();
-    const t_scr = a.id();
-    const t_ptr_wg_scr = a.id();
-    const v_scr = a.id();
-    const t_ptr_wg_s32 = a.id();
 
     // --- header ---
-    try a.words.appendSlice(gpa, &.{ 0x0723_0203, 0x0001_0500, 0, 0, 0 });
-    try a.op(17, &.{1}); // Shader
-    try a.op(17, &.{39}); // Int8
-    if (c_h16) try a.op(17, &.{9}); // Float16 (C stored f16)
-    try a.op(17, &.{5345}); // VulkanMemoryModel
-    try a.op(17, &.{6022}); // CooperativeMatrixKHR
-    try a.opStr(10, &.{}, "SPV_KHR_cooperative_matrix");
-    try a.opStr(10, &.{}, "SPV_KHR_vulkan_memory_model");
-    try a.op(14, &.{ 0, 3 }); // Logical Vulkan
-    {
-        var buf: std.ArrayList(u32) = .empty;
-        defer buf.deinit(gpa);
-        try buf.appendSlice(gpa, &.{ 5, main_fn });
-        try buf.appendSlice(gpa, &.{ std.mem.bytesToValue(u32, "main"), 0 });
-        try buf.appendSlice(gpa, &.{ gid_var, lid_var, v_b, v_a, v_c, v_push, v_sh });
-        if (fuse_scale) try buf.appendSlice(gpa, &.{ v_scale, v_scr });
-        try a.op(15, buf.items);
-    }
-    try a.op(16, &.{ main_fn, 17, 32, NWARPS, 1 }); // LocalSize 32 NWARPS 1
+    try em.line("OpCapability Shader", .{});
+    try em.line("OpCapability Int8", .{});
+    if (c_h16) try em.line("OpCapability Float16", .{});
+    try em.line("OpCapability VulkanMemoryModel", .{});
+    try em.line("OpCapability CooperativeMatrixKHR", .{});
+    try em.line("OpExtension \"SPV_KHR_cooperative_matrix\"", .{});
+    try em.line("OpExtension \"SPV_KHR_vulkan_memory_model\"", .{});
+    try em.line("OpMemoryModel Logical Vulkan", .{});
+    if (fuse_scale)
+        try em.line("OpEntryPoint GLCompute %main \"main\" %gid %lid %vb %va %vc %vpush %vsh %vscale %vscr", .{})
+    else
+        try em.line("OpEntryPoint GLCompute %main \"main\" %gid %lid %vb %va %vc %vpush %vsh", .{});
+    try em.line("OpExecutionMode %main LocalSize 32 {d} 1", .{NWARPS});
 
     // --- decorations ---
-    try a.op(71, &.{ gid_var, 11, 26 }); // WorkgroupId
-    try a.op(71, &.{ lid_var, 11, 27 }); // LocalInvocationId
-    try a.op(71, &.{ t_arr_u32, 6, 4 }); // ArrayStride 4
-    try a.op(71, &.{ t_arr_s32, 6, if (c_h16) 2 else 4 }); // C stride: f16=2 else 4
-    inline for (.{ t_sb, t_sa, t_sc }) |t| {
-        try a.op(71, &.{ t, 2 }); // Block
-        try a.op(72, &.{ t, 0, 35, 0 }); // member 0 Offset 0
+    try em.line("OpDecorate %gid BuiltIn WorkgroupId", .{});
+    try em.line("OpDecorate %lid BuiltIn LocalInvocationId", .{});
+    try em.line("OpDecorate %arr_u32 ArrayStride 4", .{});
+    try em.line("OpDecorate %arr_s32 ArrayStride {d}", .{@as(u32, if (c_h16) 2 else 4)});
+    for ([_][]const u8{ "sb", "sa", "sc" }) |s| {
+        try em.line("OpDecorate %{s} Block", .{s});
+        try em.line("OpMemberDecorate %{s} 0 Offset 0", .{s});
     }
-    try a.op(71, &.{ t_push, 2 });
-    inline for (0..4) |m| try a.op(72, &.{ t_push, @intCast(m), 35, @intCast(m * 4) });
-    inline for (.{ v_b, v_a, v_c }, 0..) |v, binding| {
-        try a.op(71, &.{ v, 34, 0 }); // DescriptorSet 0
-        try a.op(71, &.{ v, 33, @intCast(binding) });
+    try em.line("OpDecorate %push Block", .{});
+    for (0..4) |m| try em.line("OpMemberDecorate %push {d} Offset {d}", .{ m, m * 4 });
+    for ([_][]const u8{ "vb", "va", "vc" }, 0..) |v, b| {
+        try em.line("OpDecorate %{s} DescriptorSet 0", .{v});
+        try em.line("OpDecorate %{s} Binding {d}", .{ v, b });
     }
     if (fuse_scale) {
-        try a.op(71, &.{ t_arr_f32, 6, 4 }); // ArrayStride 4
-        try a.op(71, &.{ t_scale, 2 }); // Block
-        try a.op(72, &.{ t_scale, 0, 35, 0 });
-        try a.op(71, &.{ v_scale, 34, 0 });
-        try a.op(71, &.{ v_scale, 33, 3 }); // binding 3 = scale buffer
+        try em.line("OpDecorate %arr_f32 ArrayStride 4", .{});
+        try em.line("OpDecorate %scale Block", .{});
+        try em.line("OpMemberDecorate %scale 0 Offset 0", .{});
+        try em.line("OpDecorate %vscale DescriptorSet 0", .{});
+        try em.line("OpDecorate %vscale Binding 3", .{});
     }
 
     // --- types / constants ---
-    try a.op(19, &.{t_void});
-    try a.op(33, &.{ t_fnvoid, t_void });
-    try a.op(21, &.{ t_u32, 32, 0 });
-    try a.op(21, &.{ t_s8, 8, 1 });
-    try a.op(21, &.{ t_s32, 32, 1 });
-    try a.op(20, &.{t_bool});
-    try a.op(23, &.{ t_v3u, t_u32, 3 });
-    try a.op(32, &.{ t_ptr_in_v3, 1, t_v3u });
-    try a.op(59, &.{ t_ptr_in_v3, gid_var, 1 });
-    try a.op(59, &.{ t_ptr_in_v3, lid_var, 1 });
-
-    if (fuse_scale) try a.op(22, &.{ t_f32, 32 }); // OpTypeFloat 32
-    if (c_h16) try a.op(22, &.{ t_f16, 16 }); // OpTypeFloat 16
-    const t_c_elem = if (c_h16) t_f16 else if (fuse_scale) t_f32 else t_s32;
-
-    try a.op(43, &.{ t_u32, c_arrlen, 1 << 28 });
-    try a.op(28, &.{ t_arr_u32, t_u32, c_arrlen });
-    // C array element: f16 (c_h16), f32 (fuse_scale), or s32 (raw).
-    try a.op(28, &.{ t_arr_s32, t_c_elem, c_arrlen });
-    try a.op(30, &.{ t_sb, t_arr_u32 });
-    try a.op(30, &.{ t_sa, t_arr_u32 });
-    try a.op(30, &.{ t_sc, t_arr_s32 });
-    try a.op(32, &.{ t_ptr_sb, 12, t_sb });
-    try a.op(32, &.{ t_ptr_sa, 12, t_sa });
-    try a.op(32, &.{ t_ptr_sc, 12, t_sc });
-    try a.op(59, &.{ t_ptr_sb, v_b, 12 });
-    try a.op(59, &.{ t_ptr_sa, v_a, 12 });
-    try a.op(59, &.{ t_ptr_sc, v_c, 12 });
-    try a.op(32, &.{ t_ptr_sb_u32, 12, t_u32 });
-    try a.op(32, &.{ t_ptr_sa_u32, 12, t_u32 });
-    // C element pointer: f16 (c_h16), f32 (fuse_scale), or s32 (raw).
-    try a.op(32, &.{ t_ptr_sc_s32, 12, t_c_elem });
-    try a.op(30, &.{ t_push, t_u32, t_u32, t_u32, t_u32 });
-    try a.op(32, &.{ t_ptr_push, 9, t_push });
-    try a.op(59, &.{ t_ptr_push, v_push, 9 });
-    try a.op(32, &.{ t_ptr_pc_u32, 9, t_u32 });
-
+    try em.line("%void = OpTypeVoid", .{});
+    try em.line("%fnvoid = OpTypeFunction %void", .{});
+    try em.line("%u32 = OpTypeInt 32 0", .{});
+    try em.line("%s8 = OpTypeInt 8 1", .{});
+    try em.line("%s32 = OpTypeInt 32 1", .{});
+    try em.line("%bool = OpTypeBool", .{});
+    try em.line("%v3u = OpTypeVector %u32 3", .{});
+    try em.line("%ptr_in_v3 = OpTypePointer Input %v3u", .{});
+    try em.line("%gid = OpVariable %ptr_in_v3 Input", .{});
+    try em.line("%lid = OpVariable %ptr_in_v3 Input", .{});
+    if (fuse_scale) try em.line("%f32 = OpTypeFloat 32", .{});
+    if (c_h16) try em.line("%f16 = OpTypeFloat 16", .{});
+    try em.line("%c_arrlen = OpConstant %u32 268435456", .{});
+    try em.line("%arr_u32 = OpTypeArray %u32 %c_arrlen", .{});
+    try em.line("%arr_s32 = OpTypeArray %{s} %c_arrlen", .{c_elem});
+    try em.line("%sb = OpTypeStruct %arr_u32", .{});
+    try em.line("%sa = OpTypeStruct %arr_u32", .{});
+    try em.line("%sc = OpTypeStruct %arr_s32", .{});
+    try em.line("%ptr_sb = OpTypePointer StorageBuffer %sb", .{});
+    try em.line("%ptr_sa = OpTypePointer StorageBuffer %sa", .{});
+    try em.line("%ptr_sc = OpTypePointer StorageBuffer %sc", .{});
+    try em.line("%vb = OpVariable %ptr_sb StorageBuffer", .{});
+    try em.line("%va = OpVariable %ptr_sa StorageBuffer", .{});
+    try em.line("%vc = OpVariable %ptr_sc StorageBuffer", .{});
+    try em.line("%ptr_sb_u32 = OpTypePointer StorageBuffer %u32", .{});
+    try em.line("%ptr_sa_u32 = OpTypePointer StorageBuffer %u32", .{});
+    try em.line("%ptr_sc_s32 = OpTypePointer StorageBuffer %{s}", .{c_elem});
+    try em.line("%push = OpTypeStruct %u32 %u32 %u32 %u32", .{});
+    try em.line("%ptr_push = OpTypePointer PushConstant %push", .{});
+    try em.line("%vpush = OpVariable %ptr_push PushConstant", .{});
+    try em.line("%ptr_pc_u32 = OpTypePointer PushConstant %u32", .{});
     if (fuse_scale) {
-        // binding 3 = scale buffer struct{[N]f32}; per-subgroup s32 scratch wg.
-        try a.op(28, &.{ t_arr_f32, t_f32, c_arrlen });
-        try a.op(30, &.{ t_scale, t_arr_f32 });
-        try a.op(32, &.{ t_ptr_scale, 12, t_scale });
-        try a.op(59, &.{ t_ptr_scale, v_scale, 12 });
-        try a.op(32, &.{ t_ptr_scale_f32, 12, t_f32 });
-        try a.op(43, &.{ t_u32, c_scrlen, NWARPS * 256 });
-        try a.op(28, &.{ t_scr, t_s32, c_scrlen });
-        try a.op(32, &.{ t_ptr_wg_scr, 4, t_scr });
-        try a.op(59, &.{ t_ptr_wg_scr, v_scr, 4 });
-        try a.op(32, &.{ t_ptr_wg_s32, 4, t_s32 });
+        try em.line("%arr_f32 = OpTypeArray %f32 %c_arrlen", .{});
+        try em.line("%scale = OpTypeStruct %arr_f32", .{});
+        try em.line("%ptr_scale = OpTypePointer StorageBuffer %scale", .{});
+        try em.line("%vscale = OpVariable %ptr_scale StorageBuffer", .{});
+        try em.line("%ptr_scale_f32 = OpTypePointer StorageBuffer %f32", .{});
+        try em.line("%c_scrlen = OpConstant %u32 {d}", .{NWARPS * 256});
+        try em.line("%scr = OpTypeArray %s32 %c_scrlen", .{});
+        try em.line("%ptr_wg_scr = OpTypePointer Workgroup %scr", .{});
+        try em.line("%vscr = OpVariable %ptr_wg_scr Workgroup", .{});
+        try em.line("%ptr_wg_s32 = OpTypePointer Workgroup %s32", .{});
     }
+    try em.line("%c_shlen = OpConstant %u32 {d}", .{SH_LEN});
+    try em.line("%sh = OpTypeArray %u32 %c_shlen", .{});
+    try em.line("%ptr_wg_sh = OpTypePointer Workgroup %sh", .{});
+    try em.line("%vsh = OpVariable %ptr_wg_sh Workgroup", .{});
+    try em.line("%ptr_wg_u32 = OpTypePointer Workgroup %u32", .{});
 
-    // workgroup u32 array (no ArrayStride — Workgroup class)
-    try a.op(43, &.{ t_u32, c_shlen, SH_LEN });
-    try a.op(28, &.{ t_sh, t_u32, c_shlen });
-    try a.op(32, &.{ t_ptr_wg_sh, 4, t_sh });
-    try a.op(59, &.{ t_ptr_wg_sh, v_sh, 4 });
-    try a.op(32, &.{ t_ptr_wg_u32, 4, t_u32 });
+    for (pool[0..pn]) |v| try em.line("%cu_{d} = OpConstant %u32 {d}", .{ v, v });
 
-    for (0..cn) |i| try a.op(43, &.{ t_u32, cids[i], cvals[i] });
-    const c0 = cu(&cvals, &cids, cn, 0);
-    const c1 = cu(&cvals, &cids, cn, 1);
-    const c2 = cu(&cvals, &cids, cn, 2);
-    const c3 = cu(&cvals, &cids, cn, 3);
-    const c4 = cu(&cvals, &cids, cn, 4);
-    const c16 = cu(&cvals, &cids, cn, 16);
-    const c32 = cu(&cvals, &cids, cn, 32);
-    const c64 = cu(&cvals, &cids, cn, 64);
-    const c128 = cu(&cvals, &cids, cn, 128);
-    const c1024 = cu(&cvals, &cids, cn, 1024);
-    const c2048 = cu(&cvals, &cids, cn, 2048);
-    const c_bsem = cu(&cvals, &cids, cn, 0x108);
-    const c_scope = c3; // Subgroup scope == 3 (coop matrices)
-    const c_scope_wg = c2; // Workgroup scope == 2 (barrier)
-
-    // A=16x32 (use 0), B=32x16 (use 1), C=16x16 (use 2), all s8/s32.
-    try a.op(4456, &.{ t_mat_a, t_s8, c_scope, c16, c32, c0 });
-    try a.op(4456, &.{ t_mat_b, t_s8, c_scope, c32, c16, c1 });
-    try a.op(4456, &.{ t_mat_c, t_s32, c_scope, c16, c16, c2 });
-    try a.op(43, &.{ t_s32, c_s32_0, 0 });
-    try a.op(44, &.{ t_mat_c, c_acc0, c_s32_0 });
+    try em.line("%mat_a = OpTypeCooperativeMatrixKHR %s8 %cu_3 %cu_16 %cu_32 %cu_0", .{});
+    try em.line("%mat_b = OpTypeCooperativeMatrixKHR %s8 %cu_3 %cu_32 %cu_16 %cu_1", .{});
+    try em.line("%mat_c = OpTypeCooperativeMatrixKHR %s32 %cu_3 %cu_16 %cu_16 %cu_2", .{});
+    try em.line("%c_s32_0 = OpConstant %s32 0", .{});
+    try em.line("%c_acc0 = OpConstantComposite %mat_c %c_s32_0", .{});
 
     // --- function ---
-    const lb_entry = a.id();
-    try a.op(54, &.{ t_void, main_fn, 0, t_fnvoid });
-    try a.op(248, &.{lb_entry});
+    try em.line("%main = OpFunction %void None %fnvoid", .{});
+    try em.line("%entry = OpLabel", .{});
 
-    // ids / block labels
-    const gidv = a.id();
-    try a.op(61, &.{ t_v3u, gidv, gid_var });
-    const tile_c = a.id();
-    const tile_r = a.id();
-    try a.op(81, &.{ t_u32, tile_c, gidv, 0 });
-    try a.op(81, &.{ t_u32, tile_r, gidv, 1 });
-    const col0 = a.id();
-    const row0 = a.id();
-    try a.op(132, &.{ t_u32, col0, tile_c, c128 });
-    try a.op(132, &.{ t_u32, row0, tile_r, c128 });
+    const gidv = em.id();
+    try em.line("%t{d} = OpLoad %v3u %gid", .{gidv});
+    const tile_c = em.id();
+    try em.line("%t{d} = OpCompositeExtract %u32 %t{d} 0", .{ tile_c, gidv });
+    const tile_r = em.id();
+    try em.line("%t{d} = OpCompositeExtract %u32 %t{d} 1", .{ tile_r, gidv });
+    const col0 = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %cu_128", .{ col0, tile_c });
+    const row0 = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %cu_128", .{ row0, tile_r });
 
-    const lidv = a.id();
-    try a.op(61, &.{ t_v3u, lidv, lid_var });
-    const lx = a.id();
-    const ly = a.id();
-    try a.op(81, &.{ t_u32, lx, lidv, 0 });
-    try a.op(81, &.{ t_u32, ly, lidv, 1 });
-    const flat = a.id();
-    const lymul = a.id();
-    try a.op(132, &.{ t_u32, lymul, ly, c32 });
-    try a.op(128, &.{ t_u32, flat, lymul, lx });
+    const lidv = em.id();
+    try em.line("%t{d} = OpLoad %v3u %lid", .{lidv});
+    const lx = em.id();
+    try em.line("%t{d} = OpCompositeExtract %u32 %t{d} 0", .{ lx, lidv });
+    const ly = em.id();
+    try em.line("%t{d} = OpCompositeExtract %u32 %t{d} 1", .{ ly, lidv });
+    const lymul = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %cu_32", .{ lymul, ly });
+    const flat = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ flat, lymul, lx });
 
-    // push values
-    var push_vals: [4]u32 = undefined;
-    inline for (0..4) |m| {
-        const pptr = a.id();
-        const pval = a.id();
-        const cidx = switch (m) {
-            0 => c0,
-            1 => c1,
-            2 => c2,
-            else => c3,
-        };
-        try a.op(65, &.{ t_ptr_pc_u32, pptr, v_push, cidx });
-        try a.op(61, &.{ t_u32, pval, pptr });
-        push_vals[m] = pval;
+    // push values: {m, n, k, stride}.
+    const pnames = [_][]const u8{ "pm", "pn", "pk", "pstride" };
+    for (0..4) |m| {
+        const pptr = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_pc_u32 %vpush %cu_{d}", .{ pptr, m });
+        try em.line("%{s} = OpLoad %u32 %t{d}", .{ pnames[m], pptr });
     }
-    const p_n = push_vals[1];
-    const p_k = push_vals[2];
-    const p_stride = push_vals[3];
 
-    // warp = ly (0..3): warp_m = ly&1, warp_n = ly>>1.
-    const warp_m = a.id();
-    try a.op(199, &.{ t_u32, warp_m, ly, c1 });
-    const warp_n = a.id();
-    try a.op(194, &.{ t_u32, warp_n, ly, c1 });
-    // A warp base (u32): warp_m*64 rows * 16 u32 = warp_m*1024.
-    const a_warp = a.id();
-    try a.op(132, &.{ t_u32, a_warp, warp_m, c1024 });
-    // B warp col u32 offset: warp_n*WARP_W cols / 4.
-    const b_warp = a.id();
-    try a.op(132, &.{ t_u32, b_warp, warp_n, cu(&cvals, &cids, cn, WARP_W / 4) });
-    // C warp row base (rows): row0 + warp_m*64 ; C warp col base: col0 + warp_n*WARP_W.
-    const wm64 = a.id();
-    try a.op(132, &.{ t_u32, wm64, warp_m, c64 });
-    const c_row0 = a.id();
-    try a.op(128, &.{ t_u32, c_row0, row0, wm64 });
-    const wn64 = a.id();
-    try a.op(132, &.{ t_u32, wn64, warp_n, cu(&cvals, &cids, cn, WARP_W) });
-    const c_col0 = a.id();
-    try a.op(128, &.{ t_u32, c_col0, col0, wn64 });
+    const warp_m = em.id();
+    try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %cu_1", .{ warp_m, ly });
+    const warp_n = em.id();
+    try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_1", .{ warp_n, ly });
+    const a_warp = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %cu_1024", .{ a_warp, warp_m });
+    const b_warp = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %cu_{d}", .{ b_warp, warp_n, WARP_W / 4 });
+    const wm64 = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %cu_64", .{ wm64, warp_m });
+    const c_row0 = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ c_row0, row0, wm64 });
+    const wn64 = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %cu_{d}", .{ wn64, warp_n, WARP_W });
+    const c_col0 = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ c_col0, col0, wn64 });
 
-    // Loop-invariant A staging indices: quad q = flat + t*128 (0..2048),
-    // A_sh row = q/16, u32-col kq = q%16. global u32 = (row0+row)*(k/4) + k0/4 + kq
-    // = ((row0+row)*k + k0)/4 + kq. Precompute arowbase_t = (row0+row)*k (s8) and
-    // kq_t, and sh index = q.
+    // A staging index precompute.
     var a_shidx: [16]u32 = undefined;
-    var a_rowk: [16]u32 = undefined; // (row0+row)*k
+    var a_rowk: [16]u32 = undefined;
     var a_kq: [16]u32 = undefined;
-    for (0..A_QUADS) |t| {
+    for (0..A_QUADS) |tt| {
         var q = flat;
-        if (t > 0) {
-            const qn = a.id();
-            try a.op(128, &.{ t_u32, qn, flat, cu(&cvals, &cids, cn, @intCast(t * THREADS)) });
+        if (tt > 0) {
+            const qn = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ qn, flat, tt * THREADS });
             q = qn;
         }
-        a_shidx[t] = q;
-        const row = a.id();
-        try a.op(194, &.{ t_u32, row, q, c4 }); // q/16
-        a_kq[t] = a.id();
-        try a.op(199, &.{ t_u32, a_kq[t], q, cu(&cvals, &cids, cn, 15) });
-        const grow = a.id();
-        try a.op(128, &.{ t_u32, grow, row0, row });
-        a_rowk[t] = a.id();
-        try a.op(132, &.{ t_u32, a_rowk[t], grow, p_k });
+        a_shidx[tt] = q;
+        const row = em.id();
+        try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_4", .{ row, q });
+        a_kq[tt] = em.id();
+        try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %cu_15", .{ a_kq[tt], q });
+        const grow = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ grow, row0, row });
+        a_rowk[tt] = em.id();
+        try em.line("%t{d} = OpIMul %u32 %t{d} %pk", .{ a_rowk[tt], grow });
     }
-    // B staging: quad q, B_sh krow = q/32, u32-col cq = q%32.
-    // global u32 = ((k0+krow)*stride + col0)/4 + cq. Precompute krow_t, cq_t.
+    // B staging index precompute.
     var b_shidx: [16]u32 = undefined;
     var b_krow: [16]u32 = undefined;
     var b_cq: [16]u32 = undefined;
-    for (0..B_QUADS) |t| {
+    for (0..B_QUADS) |tt| {
         var q = flat;
-        if (t > 0) {
-            const qn = a.id();
-            try a.op(128, &.{ t_u32, qn, flat, cu(&cvals, &cids, cn, @intCast(t * THREADS)) });
+        if (tt > 0) {
+            const qn = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ qn, flat, tt * THREADS });
             q = qn;
         }
-        b_shidx[t] = q;
-        b_krow[t] = a.id();
-        try a.op(194, &.{ t_u32, b_krow[t], q, cu(&cvals, &cids, cn, 5) }); // q/32
-        b_cq[t] = a.id();
-        try a.op(199, &.{ t_u32, b_cq[t], q, cu(&cvals, &cids, cn, 31) }); // q%32
+        b_shidx[tt] = q;
+        b_krow[tt] = em.id();
+        try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_5", .{ b_krow[tt], q });
+        b_cq[tt] = em.id();
+        try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %cu_31", .{ b_cq[tt], q });
     }
 
-    // Staging helpers: load(kb) reads the k-slab from global into registers;
-    // store(regs) writes them into shared (k0-invariant offsets). Splitting them
-    // lets the double-buffered loop issue the next slab's global loads before the
-    // current MMA section, hiding load latency under tensor-core work.
     const DB = struct {
         aq: usize,
         bq: usize,
@@ -1024,62 +543,51 @@ pub fn buildGemmSharedI8(gpa: std.mem.Allocator, warps8: bool, fuse_scale: bool,
         b_krow: [16]u32,
         b_cq: [16]u32,
         b_shidx: [16]u32,
-        v_a: u32,
-        v_b: u32,
-        v_sh: u32,
-        t_psa: u32,
-        t_psb: u32,
-        t_pwg: u32,
-        t_u32: u32,
-        c0: u32,
-        c2: u32,
-        c2048: u32,
-        p_stride: u32,
         col0: u32,
-        fn load(st: @This(), asm_: *Asm, kb: u32) ![32]u32 {
+        fn load(st: @This(), e: *Emit, kb: []const u8) ![32]u32 {
             var regs: [32]u32 = undefined;
-            for (0..st.aq) |t| {
-                const gs8 = asm_.id();
-                try asm_.op(128, &.{ st.t_u32, gs8, st.a_rowk[t], kb });
-                const gu = asm_.id();
-                try asm_.op(194, &.{ st.t_u32, gu, gs8, st.c2 });
-                const gidx = asm_.id();
-                try asm_.op(128, &.{ st.t_u32, gidx, gu, st.a_kq[t] });
-                const gptr = asm_.id();
-                try asm_.op(65, &.{ st.t_psa, gptr, st.v_a, st.c0, gidx });
-                regs[t] = asm_.id();
-                try asm_.op(61, &.{ st.t_u32, regs[t], gptr });
+            for (0..st.aq) |tt| {
+                const gs8 = e.id();
+                try e.line("%t{d} = OpIAdd %u32 %t{d} {s}", .{ gs8, st.a_rowk[tt], kb });
+                const gu = e.id();
+                try e.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_2", .{ gu, gs8 });
+                const gidx = e.id();
+                try e.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ gidx, gu, st.a_kq[tt] });
+                const gptr = e.id();
+                try e.line("%t{d} = OpAccessChain %ptr_sa_u32 %va %cu_0 %t{d}", .{ gptr, gidx });
+                regs[tt] = e.id();
+                try e.line("%t{d} = OpLoad %u32 %t{d}", .{ regs[tt], gptr });
             }
-            for (0..st.bq) |t| {
-                const kk = asm_.id();
-                try asm_.op(128, &.{ st.t_u32, kk, kb, st.b_krow[t] });
-                const kmul = asm_.id();
-                try asm_.op(132, &.{ st.t_u32, kmul, kk, st.p_stride });
-                const gs8 = asm_.id();
-                try asm_.op(128, &.{ st.t_u32, gs8, kmul, st.col0 });
-                const gu = asm_.id();
-                try asm_.op(194, &.{ st.t_u32, gu, gs8, st.c2 });
-                const gidx = asm_.id();
-                try asm_.op(128, &.{ st.t_u32, gidx, gu, st.b_cq[t] });
-                const gptr = asm_.id();
-                try asm_.op(65, &.{ st.t_psb, gptr, st.v_b, st.c0, gidx });
-                regs[16 + t] = asm_.id();
-                try asm_.op(61, &.{ st.t_u32, regs[16 + t], gptr });
+            for (0..st.bq) |tt| {
+                const kk = e.id();
+                try e.line("%t{d} = OpIAdd %u32 {s} %t{d}", .{ kk, kb, st.b_krow[tt] });
+                const kmul = e.id();
+                try e.line("%t{d} = OpIMul %u32 %t{d} %pstride", .{ kmul, kk });
+                const gs8 = e.id();
+                try e.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ gs8, kmul, st.col0 });
+                const gu = e.id();
+                try e.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_2", .{ gu, gs8 });
+                const gidx = e.id();
+                try e.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ gidx, gu, st.b_cq[tt] });
+                const gptr = e.id();
+                try e.line("%t{d} = OpAccessChain %ptr_sb_u32 %vb %cu_0 %t{d}", .{ gptr, gidx });
+                regs[16 + tt] = e.id();
+                try e.line("%t{d} = OpLoad %u32 %t{d}", .{ regs[16 + tt], gptr });
             }
             return regs;
         }
-        fn store(st: @This(), asm_: *Asm, regs: [32]u32) !void {
-            for (0..st.aq) |t| {
-                const sptr = asm_.id();
-                try asm_.op(65, &.{ st.t_pwg, sptr, st.v_sh, st.a_shidx[t] });
-                try asm_.op(62, &.{ sptr, regs[t] });
+        fn store(st: @This(), e: *Emit, regs: [32]u32) !void {
+            for (0..st.aq) |tt| {
+                const sptr = e.id();
+                try e.line("%t{d} = OpAccessChain %ptr_wg_u32 %vsh %t{d}", .{ sptr, st.a_shidx[tt] });
+                try e.line("OpStore %t{d} %t{d}", .{ sptr, regs[tt] });
             }
-            for (0..st.bq) |t| {
-                const sidx = asm_.id();
-                try asm_.op(128, &.{ st.t_u32, sidx, st.b_shidx[t], st.c2048 });
-                const sptr = asm_.id();
-                try asm_.op(65, &.{ st.t_pwg, sptr, st.v_sh, sidx });
-                try asm_.op(62, &.{ sptr, regs[16 + t] });
+            for (0..st.bq) |tt| {
+                const sidx = e.id();
+                try e.line("%t{d} = OpIAdd %u32 %t{d} %cu_2048", .{ sidx, st.b_shidx[tt] });
+                const sptr = e.id();
+                try e.line("%t{d} = OpAccessChain %ptr_wg_u32 %vsh %t{d}", .{ sptr, sidx });
+                try e.line("OpStore %t{d} %t{d}", .{ sptr, regs[16 + tt] });
             }
         }
     };
@@ -1092,73 +600,58 @@ pub fn buildGemmSharedI8(gpa: std.mem.Allocator, warps8: bool, fuse_scale: bool,
         .b_krow = b_krow,
         .b_cq = b_cq,
         .b_shidx = b_shidx,
-        .v_a = v_a,
-        .v_b = v_b,
-        .v_sh = v_sh,
-        .t_psa = t_ptr_sa_u32,
-        .t_psb = t_ptr_sb_u32,
-        .t_pwg = t_ptr_wg_u32,
-        .t_u32 = t_u32,
-        .c0 = c0,
-        .c2 = c2,
-        .c2048 = c2048,
-        .p_stride = p_stride,
         .col0 = col0,
     };
 
-    // Loop skeleton with phi-carried k0 and 16 accumulators.
-    const lb_head = a.id();
-    const lb_cond = a.id();
-    const lb_body = a.id();
-    const lb_cont = a.id();
-    const lb_merge = a.id();
-    const k0n = a.id();
-    var acc_next: [4][4]u32 = undefined; // [MT][NT] used
+    // Pre-allocate phi-carried ids (k0 induction + accumulators), referenced in
+    // the head-block phis before their defining instructions.
+    const k0n = em.id();
+    var acc_next: [4][4]u32 = undefined;
     for (0..MT) |mi| for (0..NT) |nj| {
-        acc_next[mi][nj] = a.id();
+        acc_next[mi][nj] = em.id();
     };
 
-    // Double-buffer prologue: preload slab 0 into shared before the loop.
     if (double_buf) {
-        const regs0 = try db.load(&a, c0);
-        try db.store(&a, regs0);
-        try a.op(224, &.{ c_scope_wg, c_scope_wg, c_bsem });
+        const regs0 = try db.load(&em, "%cu_0");
+        try db.store(&em, regs0);
+        try em.line("OpControlBarrier %cu_2 %cu_2 %cu_264", .{});
     }
 
-    try a.op(249, &.{lb_head});
-    try a.op(248, &.{lb_head});
-    const k0v = a.id();
-    try a.op(245, &.{ t_u32, k0v, c0, lb_entry, k0n, lb_cont });
+    try em.line("OpBranch %head", .{});
+    try em.line("%head = OpLabel", .{});
+    const k0v = em.id();
+    try em.line("%t{d} = OpPhi %u32 %cu_0 %entry %t{d} %cont", .{ k0v, k0n });
     var acc_phi: [4][4]u32 = undefined;
     for (0..MT) |mi| for (0..NT) |nj| {
-        acc_phi[mi][nj] = a.id();
-        try a.op(245, &.{ t_mat_c, acc_phi[mi][nj], c_acc0, lb_entry, acc_next[mi][nj], lb_cont });
+        acc_phi[mi][nj] = em.id();
+        try em.line("%t{d} = OpPhi %mat_c %c_acc0 %entry %t{d} %cont", .{ acc_phi[mi][nj], acc_next[mi][nj] });
     };
-    try a.op(246, &.{ lb_merge, lb_cont, 0 });
-    try a.op(249, &.{lb_cond});
-    try a.op(248, &.{lb_cond});
-    const cmp = a.id();
-    try a.op(176, &.{ t_bool, cmp, k0v, p_k });
-    try a.op(250, &.{ cmp, lb_body, lb_merge });
+    try em.line("OpLoopMerge %merge %cont None", .{});
+    try em.line("OpBranch %cond", .{});
+    try em.line("%cond = OpLabel", .{});
+    const cmp = em.id();
+    try em.line("%t{d} = OpULessThan %bool %t{d} %pk", .{ cmp, k0v });
+    try em.line("OpBranchConditional %t{d} %body %merge", .{cmp});
+    try em.line("%body = OpLabel", .{});
 
-    try a.op(248, &.{lb_body});
     var regs_next: [32]u32 = undefined;
     if (!double_buf) {
-        // Single-buffered: barrier / stage / barrier / MMA.
-        try a.op(224, &.{ c_scope_wg, c_scope_wg, c_bsem });
-        const regs = try db.load(&a, k0v);
-        try db.store(&a, regs);
-        try a.op(224, &.{ c_scope_wg, c_scope_wg, c_bsem });
+        try em.line("OpControlBarrier %cu_2 %cu_2 %cu_264", .{});
+        const k0v_name = try std.fmt.allocPrint(gpa, "%t{d}", .{k0v});
+        defer gpa.free(k0v_name);
+        const regs = try db.load(&em, k0v_name);
+        try db.store(&em, regs);
+        try em.line("OpControlBarrier %cu_2 %cu_2 %cu_264", .{});
     } else {
-        // Double-buffered: issue next slab's global loads (clamped so the last
-        // iteration doesn't read OOB — its result is stored but never MMA'd).
-        const kb = a.id();
-        try a.op(128, &.{ t_u32, kb, k0v, c64 });
-        const ok = a.id();
-        try a.op(176, &.{ t_bool, ok, kb, p_k });
-        const kbc = a.id();
-        try a.op(169, &.{ t_u32, kbc, ok, kb, c0 }); // OpSelect
-        regs_next = try db.load(&a, kbc);
+        const kb = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_64", .{ kb, k0v });
+        const ok = em.id();
+        try em.line("%t{d} = OpULessThan %bool %t{d} %pk", .{ ok, kb });
+        const kbc = em.id();
+        try em.line("%t{d} = OpSelect %u32 %t{d} %t{d} %cu_0", .{ kbc, ok, kb });
+        const kbc_name = try std.fmt.allocPrint(gpa, "%t{d}", .{kbc});
+        defer gpa.free(kbc_name);
+        regs_next = try db.load(&em, kbc_name);
     }
 
     // MMA: 2 ks of 32 k each, reading the current shared slab.
@@ -1166,154 +659,137 @@ pub fn buildGemmSharedI8(gpa: std.mem.Allocator, warps8: bool, fuse_scale: bool,
     for (0..2) |ks| {
         var ma: [4]u32 = undefined;
         for (0..MT) |mi| {
-            const off1 = a.id();
-            try a.op(128, &.{ t_u32, off1, a_warp, cu(&cvals, &cids, cn, @intCast(mi * 256)) });
-            const off = a.id();
-            try a.op(128, &.{ t_u32, off, off1, cu(&cvals, &cids, cn, @intCast(ks * 8)) });
-            const aptr = a.id();
-            try a.op(65, &.{ t_ptr_wg_u32, aptr, v_sh, off });
-            ma[mi] = a.id();
-            try a.op(4457, &.{ t_mat_a, ma[mi], aptr, c0, c16 });
+            const off1 = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ off1, a_warp, mi * 256 });
+            const off = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ off, off1, ks * 8 });
+            const aptr = em.id();
+            try em.line("%t{d} = OpAccessChain %ptr_wg_u32 %vsh %t{d}", .{ aptr, off });
+            ma[mi] = em.id();
+            try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_a %t{d} %cu_0 %cu_16", .{ ma[mi], aptr });
         }
         for (0..NT) |nj| {
-            const off1 = a.id();
-            try a.op(128, &.{ t_u32, off1, c2048, cu(&cvals, &cids, cn, @intCast(ks * 1024)) });
-            const off2 = a.id();
-            try a.op(128, &.{ t_u32, off2, off1, b_warp });
-            const off = a.id();
-            try a.op(128, &.{ t_u32, off, off2, cu(&cvals, &cids, cn, @intCast(nj * 4)) });
-            const bptr = a.id();
-            try a.op(65, &.{ t_ptr_wg_u32, bptr, v_sh, off });
-            const mb = a.id();
-            try a.op(4457, &.{ t_mat_b, mb, bptr, c0, c32 });
+            const off1 = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %cu_2048 %cu_{d}", .{ off1, ks * 1024 });
+            const off2 = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ off2, off1, b_warp });
+            const off = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ off, off2, nj * 4 });
+            const bptr = em.id();
+            try em.line("%t{d} = OpAccessChain %ptr_wg_u32 %vsh %t{d}", .{ bptr, off });
+            const mb = em.id();
+            try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_b %t{d} %cu_0 %cu_32", .{ mb, bptr });
             for (0..MT) |mi| {
-                const acc_out = if (ks == 1) acc_next[mi][nj] else a.id();
-                try a.op(4459, &.{ t_mat_c, acc_out, ma[mi], mb, acc_cur[mi][nj], 0xF });
+                const acc_out = if (ks == 1) acc_next[mi][nj] else em.id();
+                try em.line("%t{d} = OpCooperativeMatrixMulAddKHR %mat_c %t{d} %t{d} %t{d} 15", .{ acc_out, ma[mi], mb, acc_cur[mi][nj] });
                 acc_cur[mi][nj] = acc_out;
             }
         }
     }
 
     if (double_buf) {
-        // Barrier: current-slab reads done; store next slab; barrier: visible.
-        try a.op(224, &.{ c_scope_wg, c_scope_wg, c_bsem });
-        try db.store(&a, regs_next);
-        try a.op(224, &.{ c_scope_wg, c_scope_wg, c_bsem });
+        try em.line("OpControlBarrier %cu_2 %cu_2 %cu_264", .{});
+        try db.store(&em, regs_next);
+        try em.line("OpControlBarrier %cu_2 %cu_2 %cu_264", .{});
     }
-    try a.op(249, &.{lb_cont});
+    try em.line("OpBranch %cont", .{});
+    try em.line("%cont = OpLabel", .{});
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_64", .{ k0n, k0v });
+    try em.line("OpBranch %head", .{});
 
-    try a.op(248, &.{lb_cont});
-    try a.op(128, &.{ t_u32, k0n, k0v, c64 });
-    try a.op(249, &.{lb_head});
-
-    // merge: store MTxNT C tiles at (c_row0 + mi*16, c_col0 + nj*16), stride p_n.
-    try a.op(248, &.{lb_merge});
+    try em.line("%merge = OpLabel", .{});
     if (!fuse_scale) {
         for (0..MT) |mi| {
-            const rowmi = a.id();
-            try a.op(128, &.{ t_u32, rowmi, c_row0, cu(&cvals, &cids, cn, @intCast(mi * 16)) });
-            const rowmul = a.id();
-            try a.op(132, &.{ t_u32, rowmul, rowmi, p_n });
+            const rowmi = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ rowmi, c_row0, mi * 16 });
+            const rowmul = em.id();
+            try em.line("%t{d} = OpIMul %u32 %t{d} %pn", .{ rowmul, rowmi });
             for (0..NT) |nj| {
-                const ccol = a.id();
-                try a.op(128, &.{ t_u32, ccol, c_col0, cu(&cvals, &cids, cn, @intCast(nj * 16)) });
-                const cbase = a.id();
-                try a.op(128, &.{ t_u32, cbase, rowmul, ccol });
-                const cptr = a.id();
-                try a.op(65, &.{ t_ptr_sc_s32, cptr, v_c, c0, cbase });
-                try a.op(4458, &.{ cptr, acc_phi[mi][nj], c0, p_n });
+                const ccol = em.id();
+                try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ ccol, c_col0, nj * 16 });
+                const cbase = em.id();
+                try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ cbase, rowmul, ccol });
+                const cptr = em.id();
+                try em.line("%t{d} = OpAccessChain %ptr_sc_s32 %vc %cu_0 %t{d}", .{ cptr, cbase });
+                try em.line("OpCooperativeMatrixStoreKHR %t{d} %t{d} %cu_0 %pn", .{ cptr, acc_phi[mi][nj] });
             }
         }
     } else {
-        // Stage A: rescale + f32 store, per element. Each 16x16 s32 fragment
-        // coop-stores into this subgroup's 256-s32 scratch region, then the 32
-        // lanes read it back and write y = f32(acc) * act_scale[row] *
-        // weight_scale[col]. scale buffer (binding 3) = [act(m_pad) | weight(rows)].
-        const p_m = push_vals[0];
-        const c15 = cu(&cvals, &cids, cn, 15);
-        const c256 = cu(&cvals, &cids, cn, 256);
-        const scr_base = a.id();
-        try a.op(132, &.{ t_u32, scr_base, ly, c256 }); // ly*256
+        const scr_base = em.id();
+        try em.line("%t{d} = OpIMul %u32 %t{d} %cu_256", .{ scr_base, ly });
         for (0..MT) |mi| {
-            const rowmi = a.id();
-            try a.op(128, &.{ t_u32, rowmi, c_row0, cu(&cvals, &cids, cn, @intCast(mi * 16)) });
-            const rowmul = a.id();
-            try a.op(132, &.{ t_u32, rowmul, rowmi, p_n });
+            const rowmi = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ rowmi, c_row0, mi * 16 });
+            const rowmul = em.id();
+            try em.line("%t{d} = OpIMul %u32 %t{d} %pn", .{ rowmul, rowmi });
             for (0..NT) |nj| {
-                const ccol = a.id();
-                try a.op(128, &.{ t_u32, ccol, c_col0, cu(&cvals, &cids, cn, @intCast(nj * 16)) });
-                // coop-store the s32 fragment into scratch (RowMajor, stride 16).
-                const scrptr = a.id();
-                try a.op(65, &.{ t_ptr_wg_s32, scrptr, v_scr, scr_base });
-                try a.op(4458, &.{ scrptr, acc_phi[mi][nj], c0, c16 });
-                try a.op(224, &.{ c_scope_wg, c_scope_wg, c_bsem });
+                const ccol = em.id();
+                try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ ccol, c_col0, nj * 16 });
+                const scrptr = em.id();
+                try em.line("%t{d} = OpAccessChain %ptr_wg_s32 %vscr %t{d}", .{ scrptr, scr_base });
+                try em.line("OpCooperativeMatrixStoreKHR %t{d} %t{d} %cu_0 %cu_16", .{ scrptr, acc_phi[mi][nj] });
+                try em.line("OpControlBarrier %cu_2 %cu_2 %cu_264", .{});
                 for (0..8) |i| {
-                    var e = lx;
+                    var elem = lx;
                     if (i > 0) {
-                        const en = a.id();
-                        try a.op(128, &.{ t_u32, en, lx, cu(&cvals, &cids, cn, @intCast(i * 32)) });
-                        e = en;
+                        const en = em.id();
+                        try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ en, lx, i * 32 });
+                        elem = en;
                     }
-                    const lrow = a.id();
-                    try a.op(194, &.{ t_u32, lrow, e, c4 }); // e/16
-                    const lcol = a.id();
-                    try a.op(199, &.{ t_u32, lcol, e, c15 }); // e%16
-                    const grow = a.id();
-                    try a.op(128, &.{ t_u32, grow, rowmi, lrow });
-                    const gcol = a.id();
-                    try a.op(128, &.{ t_u32, gcol, ccol, lcol });
-                    // s32 scratch load + convert to f32.
-                    const sidx = a.id();
-                    try a.op(128, &.{ t_u32, sidx, scr_base, e });
-                    const sptr = a.id();
-                    try a.op(65, &.{ t_ptr_wg_s32, sptr, v_scr, sidx });
-                    const s32v = a.id();
-                    try a.op(61, &.{ t_s32, s32v, sptr });
-                    const fv = a.id();
-                    try a.op(111, &.{ t_f32, fv, s32v }); // OpConvertSToF
-                    // act_scale[grow], weight_scale[m_pad + gcol].
-                    const aptr = a.id();
-                    try a.op(65, &.{ t_ptr_scale_f32, aptr, v_scale, c0, grow });
-                    const asv = a.id();
-                    try a.op(61, &.{ t_f32, asv, aptr });
-                    const widx = a.id();
-                    try a.op(128, &.{ t_u32, widx, p_m, gcol });
-                    const wptr = a.id();
-                    try a.op(65, &.{ t_ptr_scale_f32, wptr, v_scale, c0, widx });
-                    const wsv = a.id();
-                    try a.op(61, &.{ t_f32, wsv, wptr });
-                    const prod = a.id();
-                    try a.op(133, &.{ t_f32, prod, asv, wsv }); // OpFMul
-                    const yv = a.id();
-                    try a.op(133, &.{ t_f32, yv, fv, prod });
-                    // y[grow*p_n + gcol] = yv.
-                    const lrowmul = a.id();
-                    try a.op(132, &.{ t_u32, lrowmul, lrow, p_n });
-                    const yb = a.id();
-                    try a.op(128, &.{ t_u32, yb, rowmul, lrowmul });
-                    const yidx = a.id();
-                    try a.op(128, &.{ t_u32, yidx, yb, gcol });
-                    const yptr = a.id();
-                    try a.op(65, &.{ t_ptr_sc_s32, yptr, v_c, c0, yidx });
+                    const lrow = em.id();
+                    try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_4", .{ lrow, elem });
+                    const lcol = em.id();
+                    try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %cu_15", .{ lcol, elem });
+                    const grow = em.id();
+                    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ grow, rowmi, lrow });
+                    const gcol = em.id();
+                    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ gcol, ccol, lcol });
+                    const sidx = em.id();
+                    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ sidx, scr_base, elem });
+                    const sptr = em.id();
+                    try em.line("%t{d} = OpAccessChain %ptr_wg_s32 %vscr %t{d}", .{ sptr, sidx });
+                    const s32v = em.id();
+                    try em.line("%t{d} = OpLoad %s32 %t{d}", .{ s32v, sptr });
+                    const fv = em.id();
+                    try em.line("%t{d} = OpConvertSToF %f32 %t{d}", .{ fv, s32v });
+                    const aptr = em.id();
+                    try em.line("%t{d} = OpAccessChain %ptr_scale_f32 %vscale %cu_0 %t{d}", .{ aptr, grow });
+                    const asv = em.id();
+                    try em.line("%t{d} = OpLoad %f32 %t{d}", .{ asv, aptr });
+                    const widx = em.id();
+                    try em.line("%t{d} = OpIAdd %u32 %pm %t{d}", .{ widx, gcol });
+                    const wptr = em.id();
+                    try em.line("%t{d} = OpAccessChain %ptr_scale_f32 %vscale %cu_0 %t{d}", .{ wptr, widx });
+                    const wsv = em.id();
+                    try em.line("%t{d} = OpLoad %f32 %t{d}", .{ wsv, wptr });
+                    const prod = em.id();
+                    try em.line("%t{d} = OpFMul %f32 %t{d} %t{d}", .{ prod, asv, wsv });
+                    const yv = em.id();
+                    try em.line("%t{d} = OpFMul %f32 %t{d} %t{d}", .{ yv, fv, prod });
+                    const lrowmul = em.id();
+                    try em.line("%t{d} = OpIMul %u32 %t{d} %pn", .{ lrowmul, lrow });
+                    const yb = em.id();
+                    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ yb, rowmul, lrowmul });
+                    const yidx = em.id();
+                    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ yidx, yb, gcol });
+                    const yptr = em.id();
+                    try em.line("%t{d} = OpAccessChain %ptr_sc_s32 %vc %cu_0 %t{d}", .{ yptr, yidx });
                     if (c_h16) {
-                        const yh = a.id();
-                        try a.op(115, &.{ t_f16, yh, yv }); // OpFConvert f32->f16
-                        try a.op(62, &.{ yptr, yh });
+                        const yh = em.id();
+                        try em.line("%t{d} = OpFConvert %f16 %t{d}", .{ yh, yv });
+                        try em.line("OpStore %t{d} %t{d}", .{ yptr, yh });
                     } else {
-                        try a.op(62, &.{ yptr, yv });
+                        try em.line("OpStore %t{d} %t{d}", .{ yptr, yv });
                     }
                 }
-                try a.op(224, &.{ c_scope_wg, c_scope_wg, c_bsem });
+                try em.line("OpControlBarrier %cu_2 %cu_2 %cu_264", .{});
             }
         }
     }
-    try a.op(253, &.{});
-    try a.op(56, &.{});
+    try em.line("OpReturn", .{});
+    try em.line("OpFunctionEnd", .{});
 
-    a.words.items[3] = a.next;
-    const out = try gpa.alignedAlloc(u8, .of(u32), a.words.items.len * 4);
-    @memcpy(out, std.mem.sliceAsBytes(a.words.items));
-    return out;
+    return sasm.assembleChecked(gpa, sasm.version_1_5, t.items);
 }
 
 /// Stage B — fused int8 prep: rotate (radix-4 FWHT) + per-row abs-max +
@@ -1342,505 +818,450 @@ pub fn buildFusedPrepI8(gpa: std.mem.Allocator, cols: u32) ![]align(4) u8 {
     const LOADS: u32 = cols / WG;
     const WORDS: u32 = (cols / 4) / WG;
 
-    var a: Asm = .{ .gpa = gpa };
-    defer a.words.deinit(gpa);
+    var t: std.ArrayList(u8) = .empty;
+    defer t.deinit(gpa);
+    var em = Emit{ .w = &t, .gpa = gpa };
 
-    var cvals: [80]u32 = undefined;
-    var cids: [80]u32 = undefined;
-    var cn: usize = 0;
+    var arena_inst = std.heap.ArenaAllocator.init(gpa);
+    defer arena_inst.deinit();
+    const ar = arena_inst.allocator();
+    const H = struct {
+        fn cst(a2: std.mem.Allocator, v: u32) ![]const u8 {
+            return std.fmt.allocPrint(a2, "%cu_{d}", .{v});
+        }
+        fn tmp(a2: std.mem.Allocator, i: u32) ![]const u8 {
+            return std.fmt.allocPrint(a2, "%t{d}", .{i});
+        }
+    };
+
+    var pool: [80]u32 = undefined;
+    var pn: usize = 0;
     const addC = struct {
-        fn f(vals: []u32, ids: []u32, n: *usize, asm_: *Asm, v: u32) void {
-            for (vals[0..n.*]) |ex| if (ex == v) return;
-            vals[n.*] = v;
-            ids[n.*] = asm_.id();
+        fn f(p: []u32, n: *usize, v: u32) void {
+            for (p[0..n.*]) |ex| if (ex == v) return;
+            p[n.*] = v;
             n.* += 1;
         }
     }.f;
     for ([_]u32{ 0, 1, 2, 3, 4, 8, 12, 15, 16, 24, 32, 48, 63, 64, 128, 192, 255, 256, 257, 0xFF, 0x108, NG, ROT, INV, WG, LOADS, WORDS, cols, cols / 4 }) |v|
-        addC(&cvals, &cids, &cn, &a, v);
-    const cu = struct {
-        fn f(vals: []const u32, ids: []const u32, n: usize, v: u32) u32 {
-            for (0..n) |i| if (vals[i] == v) return ids[i];
-            unreachable;
-        }
-    }.f;
+        addC(&pool, &pn, v);
 
-    const main_fn = a.id();
-    const gid_var = a.id();
-    const lid_var = a.id();
-    const ext = a.id();
-    const t_void = a.id();
-    const t_fnvoid = a.id();
-    const t_u32 = a.id();
-    const t_s32 = a.id();
-    const t_f32 = a.id();
-    const t_f16 = a.id();
-    const t_bool = a.id();
-    const t_v3u = a.id();
-    const t_ptr_in_v3 = a.id();
-    const c_arrlen = a.id();
-    const t_arr_f32 = a.id();
-    const t_arr_u32 = a.id();
-    const t_sx = a.id();
-    const t_sq = a.id();
-    const t_ss = a.id();
-    const t_ptr_sx = a.id();
-    const t_ptr_sq = a.id();
-    const t_ptr_ss = a.id();
-    const v_x = a.id();
-    const v_q = a.id();
-    const v_s = a.id();
-    const t_ptr_sx_f32 = a.id();
-    const t_ptr_sq_u32 = a.id();
-    const t_ptr_ss_f32 = a.id();
-    const c_shlen = a.id();
-    const t_sh = a.id();
-    const t_ptr_wg_sh = a.id();
-    const v_sh = a.id();
-    const t_ptr_wg_f16 = a.id();
-    const cf16_inv16 = a.id();
-    const cf16_0 = a.id();
-    const cf_inv127 = a.id();
-    const cf_tiny = a.id();
-    const cf_half = a.id();
-    const cf_1 = a.id();
-    const cs_127 = a.id();
-    const cs_m127 = a.id();
-
-    try a.words.appendSlice(gpa, &.{ 0x0723_0203, 0x0001_0500, 0, 0, 0 });
-    try a.op(17, &.{1});
-    try a.op(17, &.{9}); // Float16
-    try a.op(17, &.{5345});
-    try a.opStr(10, &.{}, "SPV_KHR_vulkan_memory_model");
-    try a.opStr(11, &.{ext}, "GLSL.std.450");
-    try a.op(14, &.{ 0, 3 });
-    {
-        var buf: std.ArrayList(u32) = .empty;
-        defer buf.deinit(gpa);
-        try buf.appendSlice(gpa, &.{ 5, main_fn });
-        try buf.appendSlice(gpa, &.{ std.mem.bytesToValue(u32, "main"), 0 });
-        try buf.appendSlice(gpa, &.{ gid_var, lid_var, v_x, v_q, v_s, v_sh });
-        try a.op(15, buf.items);
-    }
-    try a.op(16, &.{ main_fn, 17, WG, 1, 1 });
-
-    try a.op(71, &.{ gid_var, 11, 26 });
-    try a.op(71, &.{ lid_var, 11, 27 });
-    try a.op(71, &.{ t_arr_f32, 6, 4 });
-    try a.op(71, &.{ t_arr_u32, 6, 4 });
-    inline for (.{ t_sx, t_sq, t_ss }) |t| {
-        try a.op(71, &.{ t, 2 });
-        try a.op(72, &.{ t, 0, 35, 0 });
-    }
-    inline for (.{ v_x, v_q, v_s }, 0..) |v, binding| {
-        try a.op(71, &.{ v, 34, 0 });
-        try a.op(71, &.{ v, 33, @intCast(binding) });
-    }
-
-    try a.op(19, &.{t_void});
-    try a.op(33, &.{ t_fnvoid, t_void });
-    try a.op(21, &.{ t_u32, 32, 0 });
-    try a.op(21, &.{ t_s32, 32, 1 });
-    try a.op(22, &.{ t_f32, 32 });
-    try a.op(22, &.{ t_f16, 16 });
-    try a.op(20, &.{t_bool});
-    try a.op(23, &.{ t_v3u, t_u32, 3 });
-    try a.op(32, &.{ t_ptr_in_v3, 1, t_v3u });
-    try a.op(59, &.{ t_ptr_in_v3, gid_var, 1 });
-    try a.op(59, &.{ t_ptr_in_v3, lid_var, 1 });
-
-    try a.op(43, &.{ t_u32, c_arrlen, 1 << 28 });
-    try a.op(28, &.{ t_arr_f32, t_f32, c_arrlen });
-    try a.op(28, &.{ t_arr_u32, t_u32, c_arrlen });
-    try a.op(30, &.{ t_sx, t_arr_f32 });
-    try a.op(30, &.{ t_sq, t_arr_u32 });
-    try a.op(30, &.{ t_ss, t_arr_f32 });
-    try a.op(32, &.{ t_ptr_sx, 12, t_sx });
-    try a.op(32, &.{ t_ptr_sq, 12, t_sq });
-    try a.op(32, &.{ t_ptr_ss, 12, t_ss });
-    try a.op(59, &.{ t_ptr_sx, v_x, 12 });
-    try a.op(59, &.{ t_ptr_sq, v_q, 12 });
-    try a.op(59, &.{ t_ptr_ss, v_s, 12 });
-    try a.op(32, &.{ t_ptr_sx_f32, 12, t_f32 });
-    try a.op(32, &.{ t_ptr_sq_u32, 12, t_u32 });
-    try a.op(32, &.{ t_ptr_ss_f32, 12, t_f32 });
-
-    try a.op(43, &.{ t_u32, c_shlen, SH_LEN });
-    try a.op(28, &.{ t_sh, t_f16, c_shlen });
-    try a.op(32, &.{ t_ptr_wg_sh, 4, t_sh });
-    try a.op(59, &.{ t_ptr_wg_sh, v_sh, 4 });
-    try a.op(32, &.{ t_ptr_wg_f16, 4, t_f16 });
-
-    for (0..cn) |i| try a.op(43, &.{ t_u32, cids[i], cvals[i] });
-    try a.op(43, &.{ t_f16, cf16_inv16, @as(u32, @as(u16, @bitCast(@as(f16, 1.0 / 16.0)))) });
-    try a.op(43, &.{ t_f16, cf16_0, 0 });
-    try a.op(43, &.{ t_f32, cf_inv127, @bitCast(@as(f32, 1.0 / 127.0)) });
-    try a.op(43, &.{ t_f32, cf_tiny, @bitCast(@as(f32, 1e-12)) });
-    try a.op(43, &.{ t_f32, cf_half, @bitCast(@as(f32, 0.5)) });
-    try a.op(43, &.{ t_f32, cf_1, @bitCast(@as(f32, 1.0)) });
-    try a.op(43, &.{ t_s32, cs_127, 127 });
-    try a.op(43, &.{ t_s32, cs_m127, @bitCast(@as(i32, -127)) });
-
-    const c0 = cu(&cvals, &cids, cn, 0);
-    const c1 = cu(&cvals, &cids, cn, 1);
-    const c2 = cu(&cvals, &cids, cn, 2);
-    const c8 = cu(&cvals, &cids, cn, 8);
-    const c255 = cu(&cvals, &cids, cn, 255);
-    const c256 = cu(&cvals, &cids, cn, 256);
-    const c257 = cu(&cvals, &cids, cn, 257);
-    const cff = cu(&cvals, &cids, cn, 0xFF);
-    const c_bsem = cu(&cvals, &cids, cn, 0x108);
-    const c_wg = cu(&cvals, &cids, cn, WG);
-    const c_ng = cu(&cvals, &cids, cn, NG);
-    const c_rot = cu(&cvals, &cids, cn, ROT);
-    const c_inv = cu(&cvals, &cids, cn, INV);
-    const c64 = cu(&cvals, &cids, cn, 64);
-
+    // Loop helpers: phi-carried counter loops (open emits the header/cond/body,
+    // close emits the increment/back-edge/merge).
+    const Loop = struct { head: u32, cont: u32, merge: u32, iv: u32, inx: u32 };
     const openLoop = struct {
-        fn f(asm_: *Asm, tu: u32, tb: u32, cz: u32, count: u32, pred: u32) !struct { head: u32, cont: u32, merge: u32, iv: u32, inx: u32 } {
-            const head = asm_.id();
-            const cont = asm_.id();
-            const merge = asm_.id();
-            const iv = asm_.id();
-            const inx = asm_.id();
-            const cond = asm_.id();
-            const body = asm_.id();
-            try asm_.op(249, &.{head});
-            try asm_.op(248, &.{head});
-            try asm_.op(245, &.{ tu, iv, cz, pred, inx, cont });
-            try asm_.op(246, &.{ merge, cont, 0 });
-            try asm_.op(249, &.{cond});
-            try asm_.op(248, &.{cond});
-            const cmp = asm_.id();
-            try asm_.op(176, &.{ tb, cmp, iv, count });
-            try asm_.op(250, &.{ cmp, body, merge });
-            try asm_.op(248, &.{body});
+        fn f(e: *Emit, tu: []const u8, tb: []const u8, cz: []const u8, count: []const u8, pred: []const u8) !Loop {
+            const head = e.id();
+            const cont = e.id();
+            const merge = e.id();
+            const iv = e.id();
+            const inx = e.id();
+            const cond = e.id();
+            const body = e.id();
+            try e.line("OpBranch %t{d}", .{head});
+            try e.line("%t{d} = OpLabel", .{head});
+            try e.line("%t{d} = OpPhi {s} {s} {s} %t{d} %t{d}", .{ iv, tu, cz, pred, inx, cont });
+            try e.line("OpLoopMerge %t{d} %t{d} None", .{ merge, cont });
+            try e.line("OpBranch %t{d}", .{cond});
+            try e.line("%t{d} = OpLabel", .{cond});
+            const cmp = e.id();
+            try e.line("%t{d} = OpULessThan {s} %t{d} {s}", .{ cmp, tb, iv, count });
+            try e.line("OpBranchConditional %t{d} %t{d} %t{d}", .{ cmp, body, merge });
+            try e.line("%t{d} = OpLabel", .{body});
             return .{ .head = head, .cont = cont, .merge = merge, .iv = iv, .inx = inx };
         }
     }.f;
     const closeLoop = struct {
-        fn f(asm_: *Asm, tu: u32, one: u32, L: anytype) !void {
-            try asm_.op(249, &.{L.cont});
-            try asm_.op(248, &.{L.cont});
-            try asm_.op(128, &.{ tu, L.inx, L.iv, one });
-            try asm_.op(249, &.{L.head});
-            try asm_.op(248, &.{L.merge});
+        fn f(e: *Emit, tu: []const u8, one: []const u8, L: Loop) !void {
+            try e.line("OpBranch %t{d}", .{L.cont});
+            try e.line("%t{d} = OpLabel", .{L.cont});
+            try e.line("%t{d} = OpIAdd {s} %t{d} {s}", .{ L.inx, tu, L.iv, one });
+            try e.line("OpBranch %t{d}", .{L.head});
+            try e.line("%t{d} = OpLabel", .{L.merge});
         }
     }.f;
 
-    const lb_entry = a.id();
-    try a.op(54, &.{ t_void, main_fn, 0, t_fnvoid });
-    try a.op(248, &.{lb_entry});
+    // --- header ---
+    try em.line("OpCapability Shader", .{});
+    try em.line("OpCapability Float16", .{});
+    try em.line("OpCapability VulkanMemoryModel", .{});
+    try em.line("OpExtension \"SPV_KHR_vulkan_memory_model\"", .{});
+    try em.line("%ext = OpExtInstImport \"GLSL.std.450\"", .{});
+    try em.line("OpMemoryModel Logical Vulkan", .{});
+    try em.line("OpEntryPoint GLCompute %main \"main\" %gid %lid %vx %vq %vs %vsh", .{});
+    try em.line("OpExecutionMode %main LocalSize {d} 1 1", .{WG});
 
-    const gidv = a.id();
-    try a.op(61, &.{ t_v3u, gidv, gid_var });
-    const row = a.id();
-    try a.op(81, &.{ t_u32, row, gidv, 0 });
-    const lidv = a.id();
-    try a.op(61, &.{ t_v3u, lidv, lid_var });
-    const tid = a.id();
-    try a.op(81, &.{ t_u32, tid, lidv, 0 });
-    const rowcols = a.id();
-    try a.op(132, &.{ t_u32, rowcols, row, cu(&cvals, &cids, cn, cols) });
-    var cur = lb_entry;
+    // --- decorations ---
+    try em.line("OpDecorate %gid BuiltIn WorkgroupId", .{});
+    try em.line("OpDecorate %lid BuiltIn LocalInvocationId", .{});
+    try em.line("OpDecorate %arr_f32 ArrayStride 4", .{});
+    try em.line("OpDecorate %arr_u32 ArrayStride 4", .{});
+    for ([_][]const u8{ "sx", "sq", "ss" }) |s| {
+        try em.line("OpDecorate %{s} Block", .{s});
+        try em.line("OpMemberDecorate %{s} 0 Offset 0", .{s});
+    }
+    for ([_][]const u8{ "vx", "vq", "vs" }, 0..) |v, b| {
+        try em.line("OpDecorate %{s} DescriptorSet 0", .{v});
+        try em.line("OpDecorate %{s} Binding {d}", .{ v, b });
+    }
+
+    // --- types / constants ---
+    try em.line("%void = OpTypeVoid", .{});
+    try em.line("%fnvoid = OpTypeFunction %void", .{});
+    try em.line("%u32 = OpTypeInt 32 0", .{});
+    try em.line("%s32 = OpTypeInt 32 1", .{});
+    try em.line("%f32 = OpTypeFloat 32", .{});
+    try em.line("%f16 = OpTypeFloat 16", .{});
+    try em.line("%bool = OpTypeBool", .{});
+    try em.line("%v3u = OpTypeVector %u32 3", .{});
+    try em.line("%ptr_in_v3 = OpTypePointer Input %v3u", .{});
+    try em.line("%gid = OpVariable %ptr_in_v3 Input", .{});
+    try em.line("%lid = OpVariable %ptr_in_v3 Input", .{});
+    try em.line("%c_arrlen = OpConstant %u32 268435456", .{});
+    try em.line("%arr_f32 = OpTypeArray %f32 %c_arrlen", .{});
+    try em.line("%arr_u32 = OpTypeArray %u32 %c_arrlen", .{});
+    try em.line("%sx = OpTypeStruct %arr_f32", .{});
+    try em.line("%sq = OpTypeStruct %arr_u32", .{});
+    try em.line("%ss = OpTypeStruct %arr_f32", .{});
+    try em.line("%ptr_sx = OpTypePointer StorageBuffer %sx", .{});
+    try em.line("%ptr_sq = OpTypePointer StorageBuffer %sq", .{});
+    try em.line("%ptr_ss = OpTypePointer StorageBuffer %ss", .{});
+    try em.line("%vx = OpVariable %ptr_sx StorageBuffer", .{});
+    try em.line("%vq = OpVariable %ptr_sq StorageBuffer", .{});
+    try em.line("%vs = OpVariable %ptr_ss StorageBuffer", .{});
+    try em.line("%ptr_sx_f32 = OpTypePointer StorageBuffer %f32", .{});
+    try em.line("%ptr_sq_u32 = OpTypePointer StorageBuffer %u32", .{});
+    try em.line("%ptr_ss_f32 = OpTypePointer StorageBuffer %f32", .{});
+    try em.line("%c_shlen = OpConstant %u32 {d}", .{SH_LEN});
+    try em.line("%sh = OpTypeArray %f16 %c_shlen", .{});
+    try em.line("%ptr_wg_sh = OpTypePointer Workgroup %sh", .{});
+    try em.line("%vsh = OpVariable %ptr_wg_sh Workgroup", .{});
+    try em.line("%ptr_wg_f16 = OpTypePointer Workgroup %f16", .{});
+
+    for (pool[0..pn]) |v| try em.line("%cu_{d} = OpConstant %u32 {d}", .{ v, v });
+    try em.line("%cf16_inv16 = OpConstant %f16 {d}", .{@as(u32, @as(u16, @bitCast(@as(f16, 1.0 / 16.0))))});
+    try em.line("%cf16_0 = OpConstant %f16 0", .{});
+    try em.line("%cf_inv127 = OpConstant %f32 {d}", .{@as(u32, @bitCast(@as(f32, 1.0 / 127.0)))});
+    try em.line("%cf_tiny = OpConstant %f32 {d}", .{@as(u32, @bitCast(@as(f32, 1e-12)))});
+    try em.line("%cf_half = OpConstant %f32 {d}", .{@as(u32, @bitCast(@as(f32, 0.5)))});
+    try em.line("%cf_1 = OpConstant %f32 {d}", .{@as(u32, @bitCast(@as(f32, 1.0)))});
+    try em.line("%cs_127 = OpConstant %s32 127", .{});
+    try em.line("%cs_m127 = OpConstant %s32 {d}", .{@as(u32, @bitCast(@as(i32, -127)))});
+
+    // --- function ---
+    try em.line("%main = OpFunction %void None %fnvoid", .{});
+    try em.line("%entry = OpLabel", .{});
+    const gidv = em.id();
+    try em.line("%t{d} = OpLoad %v3u %gid", .{gidv});
+    const row = em.id();
+    try em.line("%t{d} = OpCompositeExtract %u32 %t{d} 0", .{ row, gidv });
+    const lidv = em.id();
+    try em.line("%t{d} = OpLoad %v3u %lid", .{lidv});
+    const tid = em.id();
+    try em.line("%t{d} = OpCompositeExtract %u32 %t{d} 0", .{ tid, lidv });
+    const rowcols = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %cu_{d}", .{ rowcols, row, cols });
+    var cur: []const u8 = "%entry";
 
     // Phase 0: coalesced load f32 -> f16 into padded shared.
     {
-        const L = try openLoop(&a, t_u32, t_bool, c0, cu(&cvals, &cids, cn, LOADS), cur);
-        const iw = a.id();
-        try a.op(132, &.{ t_u32, iw, L.iv, c_wg });
-        const j = a.id();
-        try a.op(128, &.{ t_u32, j, tid, iw });
-        const g = a.id();
-        try a.op(194, &.{ t_u32, g, j, c8 });
-        const l = a.id();
-        try a.op(199, &.{ t_u32, l, j, c255 });
-        const gp = a.id();
-        try a.op(132, &.{ t_u32, gp, g, c257 });
-        const shi = a.id();
-        try a.op(128, &.{ t_u32, shi, gp, l });
-        const gi = a.id();
-        try a.op(128, &.{ t_u32, gi, rowcols, j });
-        const xp = a.id();
-        try a.op(65, &.{ t_ptr_sx_f32, xp, v_x, c0, gi });
-        const valf = a.id();
-        try a.op(61, &.{ t_f32, valf, xp });
-        const valh = a.id();
-        try a.op(115, &.{ t_f16, valh, valf }); // FConvert f32->f16
-        const sp = a.id();
-        try a.op(65, &.{ t_ptr_wg_f16, sp, v_sh, shi });
-        try a.op(62, &.{ sp, valh });
-        try closeLoop(&a, t_u32, c1, L);
-        cur = L.merge;
+        const L = try openLoop(&em, "%u32", "%bool", "%cu_0", try H.cst(ar, LOADS), cur);
+        const iw = em.id();
+        try em.line("%t{d} = OpIMul %u32 %t{d} %cu_{d}", .{ iw, L.iv, WG });
+        const j = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ j, tid, iw });
+        const g = em.id();
+        try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_8", .{ g, j });
+        const l = em.id();
+        try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %cu_255", .{ l, j });
+        const gp = em.id();
+        try em.line("%t{d} = OpIMul %u32 %t{d} %cu_257", .{ gp, g });
+        const shi = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ shi, gp, l });
+        const gi = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ gi, rowcols, j });
+        const xp = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_sx_f32 %vx %cu_0 %t{d}", .{ xp, gi });
+        const valf = em.id();
+        try em.line("%t{d} = OpLoad %f32 %t{d}", .{ valf, xp });
+        const valh = em.id();
+        try em.line("%t{d} = OpFConvert %f16 %t{d}", .{ valh, valf });
+        const sp = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vsh %t{d}", .{ sp, shi });
+        try em.line("OpStore %t{d} %t{d}", .{ sp, valh });
+        try closeLoop(&em, "%u32", "%cu_1", L);
+        cur = try H.tmp(ar, L.merge);
     }
-    try a.op(224, &.{ c2, c2, c_bsem });
+    try em.line("OpControlBarrier %cu_2 %cu_2 %cu_264", .{});
 
     // Phase 1: FWHT (f16) + normalize (tid < NG).
     {
-        const sel = a.id();
-        const do = a.id();
-        const cmp = a.id();
-        try a.op(176, &.{ t_bool, cmp, tid, c_ng });
-        try a.op(247, &.{ sel, 0 });
-        try a.op(250, &.{ cmp, do, sel });
-        try a.op(248, &.{do});
-        var cur1 = do;
-        const t257 = a.id();
-        try a.op(132, &.{ t_u32, t257, tid, c257 });
+        const sel = em.id();
+        const do = em.id();
+        const cmp = em.id();
+        try em.line("%t{d} = OpULessThan %bool %t{d} %cu_{d}", .{ cmp, tid, NG });
+        try em.line("OpSelectionMerge %t{d} None", .{sel});
+        try em.line("OpBranchConditional %t{d} %t{d} %t{d}", .{ cmp, do, sel });
+        try em.line("%t{d} = OpLabel", .{do});
+        var cur1: []const u8 = try H.tmp(ar, do);
+        const t257 = em.id();
+        try em.line("%t{d} = OpIMul %u32 %t{d} %cu_257", .{ t257, tid });
         inline for (.{ 1, 4, 16, 64 }) |s| {
-            const css = cu(&cvals, &cids, cn, s);
-            const cs2 = cu(&cvals, &cids, cn, 2 * s);
-            const cs3 = cu(&cvals, &cids, cn, 3 * s);
-            const L = try openLoop(&a, t_u32, t_bool, c0, c64, cur1);
-            const lo = if (s == 1) c0 else blk: {
-                const x = a.id();
-                try a.op(199, &.{ t_u32, x, L.iv, cu(&cvals, &cids, cn, s - 1) });
-                break :blk x;
-            };
-            const hi = if (s == 1) L.iv else blk: {
-                const x = a.id();
-                try a.op(130, &.{ t_u32, x, L.iv, lo });
-                break :blk x;
-            };
-            const hi4 = a.id();
-            try a.op(196, &.{ t_u32, hi4, hi, c2 });
-            const p0 = if (s == 1) hi4 else blk: {
-                const x = a.id();
-                try a.op(128, &.{ t_u32, x, hi4, lo });
-                break :blk x;
-            };
-            const base = a.id();
-            try a.op(128, &.{ t_u32, base, t257, p0 });
+            const L = try openLoop(&em, "%u32", "%bool", "%cu_0", "%cu_64", cur1);
+            var lo: []const u8 = "%cu_0";
+            if (s != 1) {
+                const x = em.id();
+                try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %cu_{d}", .{ x, L.iv, s - 1 });
+                lo = try H.tmp(ar, x);
+            }
+            var hi: []const u8 = try H.tmp(ar, L.iv);
+            if (s != 1) {
+                const x = em.id();
+                try em.line("%t{d} = OpISub %u32 %t{d} {s}", .{ x, L.iv, lo });
+                hi = try H.tmp(ar, x);
+            }
+            const hi4 = em.id();
+            try em.line("%t{d} = OpShiftLeftLogical %u32 {s} %cu_2", .{ hi4, hi });
+            var p0: []const u8 = try H.tmp(ar, hi4);
+            if (s != 1) {
+                const x = em.id();
+                try em.line("%t{d} = OpIAdd %u32 %t{d} {s}", .{ x, hi4, lo });
+                p0 = try H.tmp(ar, x);
+            }
+            const base = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} {s}", .{ base, t257, p0 });
+            const offs = [_][]const u8{ "%cu_0", try H.cst(ar, s), try H.cst(ar, 2 * s), try H.cst(ar, 3 * s) };
             var e: [4]u32 = undefined;
-            inline for (.{ c0, css, cs2, cs3 }, 0..) |off, k| {
-                const idx = if (k == 0) base else blk: {
-                    const x = a.id();
-                    try a.op(128, &.{ t_u32, x, base, off });
-                    break :blk x;
-                };
-                const pp = a.id();
-                try a.op(65, &.{ t_ptr_wg_f16, pp, v_sh, idx });
-                e[k] = a.id();
-                try a.op(61, &.{ t_f16, e[k], pp });
+            for (offs, 0..) |off, k| {
+                var idx: []const u8 = try H.tmp(ar, base);
+                if (k != 0) {
+                    const x = em.id();
+                    try em.line("%t{d} = OpIAdd %u32 %t{d} {s}", .{ x, base, off });
+                    idx = try H.tmp(ar, x);
+                }
+                const pp = em.id();
+                try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vsh {s}", .{ pp, idx });
+                e[k] = em.id();
+                try em.line("%t{d} = OpLoad %f16 %t{d}", .{ e[k], pp });
             }
-            const pq = a.id();
-            try a.op(129, &.{ t_f16, pq, e[0], e[1] });
-            const qd = a.id();
-            try a.op(131, &.{ t_f16, qd, e[2], e[3] });
-            const rd = a.id();
-            try a.op(131, &.{ t_f16, rd, e[0], e[1] });
-            const sd = a.id();
-            try a.op(129, &.{ t_f16, sd, e[2], e[3] });
+            const pq = em.id();
+            try em.line("%t{d} = OpFAdd %f16 %t{d} %t{d}", .{ pq, e[0], e[1] });
+            const qd = em.id();
+            try em.line("%t{d} = OpFSub %f16 %t{d} %t{d}", .{ qd, e[2], e[3] });
+            const rd = em.id();
+            try em.line("%t{d} = OpFSub %f16 %t{d} %t{d}", .{ rd, e[0], e[1] });
+            const sd = em.id();
+            try em.line("%t{d} = OpFAdd %f16 %t{d} %t{d}", .{ sd, e[2], e[3] });
             var nn: [4]u32 = undefined;
-            nn[0] = a.id();
-            try a.op(129, &.{ t_f16, nn[0], pq, qd });
-            nn[1] = a.id();
-            try a.op(131, &.{ t_f16, nn[1], pq, qd });
-            nn[2] = a.id();
-            try a.op(129, &.{ t_f16, nn[2], rd, sd });
-            nn[3] = a.id();
-            try a.op(131, &.{ t_f16, nn[3], sd, rd });
-            inline for (.{ c0, css, cs2, cs3 }, 0..) |off, k| {
-                const idx = if (k == 0) base else blk: {
-                    const x = a.id();
-                    try a.op(128, &.{ t_u32, x, base, off });
-                    break :blk x;
-                };
-                const pp = a.id();
-                try a.op(65, &.{ t_ptr_wg_f16, pp, v_sh, idx });
-                try a.op(62, &.{ pp, nn[k] });
+            nn[0] = em.id();
+            try em.line("%t{d} = OpFAdd %f16 %t{d} %t{d}", .{ nn[0], pq, qd });
+            nn[1] = em.id();
+            try em.line("%t{d} = OpFSub %f16 %t{d} %t{d}", .{ nn[1], pq, qd });
+            nn[2] = em.id();
+            try em.line("%t{d} = OpFAdd %f16 %t{d} %t{d}", .{ nn[2], rd, sd });
+            nn[3] = em.id();
+            try em.line("%t{d} = OpFSub %f16 %t{d} %t{d}", .{ nn[3], sd, rd });
+            for (offs, 0..) |off, k| {
+                var idx: []const u8 = try H.tmp(ar, base);
+                if (k != 0) {
+                    const x = em.id();
+                    try em.line("%t{d} = OpIAdd %u32 %t{d} {s}", .{ x, base, off });
+                    idx = try H.tmp(ar, x);
+                }
+                const pp = em.id();
+                try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vsh {s}", .{ pp, idx });
+                try em.line("OpStore %t{d} %t{d}", .{ pp, nn[k] });
             }
-            try closeLoop(&a, t_u32, c1, L);
-            cur1 = L.merge;
+            try closeLoop(&em, "%u32", "%cu_1", L);
+            cur1 = try H.tmp(ar, L.merge);
         }
         // normalize /16 + abs-max (2-phi loop, f16)
-        const nh = a.id();
-        const ncond = a.id();
-        const nbd = a.id();
-        const nct = a.id();
-        const nmg = a.id();
-        const niv = a.id();
-        const ninx = a.id();
-        const namax = a.id();
-        const namaxn = a.id();
-        try a.op(249, &.{nh});
-        try a.op(248, &.{nh});
-        try a.op(245, &.{ t_u32, niv, c0, cur1, ninx, nct });
-        try a.op(245, &.{ t_f16, namax, cf16_0, cur1, namaxn, nct });
-        try a.op(246, &.{ nmg, nct, 0 });
-        try a.op(249, &.{ncond});
-        try a.op(248, &.{ncond});
-        const ncmp = a.id();
-        try a.op(176, &.{ t_bool, ncmp, niv, c256 });
-        try a.op(250, &.{ ncmp, nbd, nmg });
-        try a.op(248, &.{nbd});
-        const nidx = a.id();
-        try a.op(128, &.{ t_u32, nidx, t257, niv });
-        const npp = a.id();
-        try a.op(65, &.{ t_ptr_wg_f16, npp, v_sh, nidx });
-        const raw = a.id();
-        try a.op(61, &.{ t_f16, raw, npp });
-        const v16 = a.id();
-        try a.op(133, &.{ t_f16, v16, raw, cf16_inv16 });
-        try a.op(62, &.{ npp, v16 });
-        const av = a.id();
-        try a.op(12, &.{ t_f16, av, ext, 4, v16 });
-        try a.op(12, &.{ t_f16, namaxn, ext, 40, namax, av });
-        try a.op(249, &.{nct});
-        try a.op(248, &.{nct});
-        try a.op(128, &.{ t_u32, ninx, niv, c1 });
-        try a.op(249, &.{nh});
-        try a.op(248, &.{nmg});
-        const gidx = a.id();
-        try a.op(128, &.{ t_u32, gidx, c_rot, tid });
-        const gpp = a.id();
-        try a.op(65, &.{ t_ptr_wg_f16, gpp, v_sh, gidx });
-        try a.op(62, &.{ gpp, namax });
-        try a.op(249, &.{sel});
-        try a.op(248, &.{sel});
-        cur = sel;
+        const nh = em.id();
+        const ncond = em.id();
+        const nbd = em.id();
+        const nct = em.id();
+        const nmg = em.id();
+        const niv = em.id();
+        const ninx = em.id();
+        const namax = em.id();
+        const namaxn = em.id();
+        try em.line("OpBranch %t{d}", .{nh});
+        try em.line("%t{d} = OpLabel", .{nh});
+        try em.line("%t{d} = OpPhi %u32 %cu_0 {s} %t{d} %t{d}", .{ niv, cur1, ninx, nct });
+        try em.line("%t{d} = OpPhi %f16 %cf16_0 {s} %t{d} %t{d}", .{ namax, cur1, namaxn, nct });
+        try em.line("OpLoopMerge %t{d} %t{d} None", .{ nmg, nct });
+        try em.line("OpBranch %t{d}", .{ncond});
+        try em.line("%t{d} = OpLabel", .{ncond});
+        const ncmp = em.id();
+        try em.line("%t{d} = OpULessThan %bool %t{d} %cu_256", .{ ncmp, niv });
+        try em.line("OpBranchConditional %t{d} %t{d} %t{d}", .{ ncmp, nbd, nmg });
+        try em.line("%t{d} = OpLabel", .{nbd});
+        const nidx = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ nidx, t257, niv });
+        const npp = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vsh %t{d}", .{ npp, nidx });
+        const raw = em.id();
+        try em.line("%t{d} = OpLoad %f16 %t{d}", .{ raw, npp });
+        const v16 = em.id();
+        try em.line("%t{d} = OpFMul %f16 %t{d} %cf16_inv16", .{ v16, raw });
+        try em.line("OpStore %t{d} %t{d}", .{ npp, v16 });
+        const av = em.id();
+        try em.line("%t{d} = OpExtInst %f16 %ext 4 %t{d}", .{ av, v16 });
+        try em.line("%t{d} = OpExtInst %f16 %ext 40 %t{d} %t{d}", .{ namaxn, namax, av });
+        try em.line("OpBranch %t{d}", .{nct});
+        try em.line("%t{d} = OpLabel", .{nct});
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_1", .{ ninx, niv });
+        try em.line("OpBranch %t{d}", .{nh});
+        try em.line("%t{d} = OpLabel", .{nmg});
+        const gidx = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %cu_{d} %t{d}", .{ gidx, ROT, tid });
+        const gpp = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vsh %t{d}", .{ gpp, gidx });
+        try em.line("OpStore %t{d} %t{d}", .{ gpp, namax });
+        try em.line("OpBranch %t{d}", .{sel});
+        try em.line("%t{d} = OpLabel", .{sel});
+        cur = try H.tmp(ar, sel);
     }
-    try a.op(224, &.{ c2, c2, c_bsem });
+    try em.line("OpControlBarrier %cu_2 %cu_2 %cu_264", .{});
 
     // Phase 2: reduce over gmax[0..NG] -> scale[row], inv (tid == 0).
     {
-        const sel = a.id();
-        const do = a.id();
-        const cmp = a.id();
-        try a.op(170, &.{ t_bool, cmp, tid, c0 });
-        try a.op(247, &.{ sel, 0 });
-        try a.op(250, &.{ cmp, do, sel });
-        try a.op(248, &.{do});
-        const mh = a.id();
-        const mcond = a.id();
-        const mbd = a.id();
-        const mct = a.id();
-        const mmg = a.id();
-        const miv = a.id();
-        const minx = a.id();
-        const mx = a.id();
-        const mxn = a.id();
-        try a.op(249, &.{mh});
-        try a.op(248, &.{mh});
-        try a.op(245, &.{ t_u32, miv, c0, do, minx, mct });
-        try a.op(245, &.{ t_f16, mx, cf16_0, do, mxn, mct });
-        try a.op(246, &.{ mmg, mct, 0 });
-        try a.op(249, &.{mcond});
-        try a.op(248, &.{mcond});
-        const mcmp = a.id();
-        try a.op(176, &.{ t_bool, mcmp, miv, c_ng });
-        try a.op(250, &.{ mcmp, mbd, mmg });
-        try a.op(248, &.{mbd});
-        const gidx = a.id();
-        try a.op(128, &.{ t_u32, gidx, c_rot, miv });
-        const gpp = a.id();
-        try a.op(65, &.{ t_ptr_wg_f16, gpp, v_sh, gidx });
-        const gv = a.id();
-        try a.op(61, &.{ t_f16, gv, gpp });
-        try a.op(12, &.{ t_f16, mxn, ext, 40, mx, gv });
-        try a.op(249, &.{mct});
-        try a.op(248, &.{mct});
-        try a.op(128, &.{ t_u32, minx, miv, c1 });
-        try a.op(249, &.{mh});
-        try a.op(248, &.{mmg});
-        const mxf = a.id();
-        try a.op(115, &.{ t_f32, mxf, mx }); // f16->f32
-        const sc0 = a.id();
-        try a.op(133, &.{ t_f32, sc0, mxf, cf_inv127 });
-        const sc = a.id();
-        try a.op(12, &.{ t_f32, sc, ext, 40, sc0, cf_tiny });
-        const scp = a.id();
-        try a.op(65, &.{ t_ptr_ss_f32, scp, v_s, c0, row });
-        try a.op(62, &.{ scp, sc });
-        const invf = a.id();
-        try a.op(136, &.{ t_f32, invf, cf_1, sc });
-        const invh = a.id();
-        try a.op(115, &.{ t_f16, invh, invf }); // f32->f16
-        const ip = a.id();
-        try a.op(65, &.{ t_ptr_wg_f16, ip, v_sh, c_inv });
-        try a.op(62, &.{ ip, invh });
-        try a.op(249, &.{sel});
-        try a.op(248, &.{sel});
-        cur = sel;
+        const sel = em.id();
+        const do = em.id();
+        const cmp = em.id();
+        try em.line("%t{d} = OpIEqual %bool %t{d} %cu_0", .{ cmp, tid });
+        try em.line("OpSelectionMerge %t{d} None", .{sel});
+        try em.line("OpBranchConditional %t{d} %t{d} %t{d}", .{ cmp, do, sel });
+        try em.line("%t{d} = OpLabel", .{do});
+        const mh = em.id();
+        const mcond = em.id();
+        const mbd = em.id();
+        const mct = em.id();
+        const mmg = em.id();
+        const miv = em.id();
+        const minx = em.id();
+        const mx = em.id();
+        const mxn = em.id();
+        try em.line("OpBranch %t{d}", .{mh});
+        try em.line("%t{d} = OpLabel", .{mh});
+        try em.line("%t{d} = OpPhi %u32 %cu_0 %t{d} %t{d} %t{d}", .{ miv, do, minx, mct });
+        try em.line("%t{d} = OpPhi %f16 %cf16_0 %t{d} %t{d} %t{d}", .{ mx, do, mxn, mct });
+        try em.line("OpLoopMerge %t{d} %t{d} None", .{ mmg, mct });
+        try em.line("OpBranch %t{d}", .{mcond});
+        try em.line("%t{d} = OpLabel", .{mcond});
+        const mcmp = em.id();
+        try em.line("%t{d} = OpULessThan %bool %t{d} %cu_{d}", .{ mcmp, miv, NG });
+        try em.line("OpBranchConditional %t{d} %t{d} %t{d}", .{ mcmp, mbd, mmg });
+        try em.line("%t{d} = OpLabel", .{mbd});
+        const gidx = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %cu_{d} %t{d}", .{ gidx, ROT, miv });
+        const gpp = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vsh %t{d}", .{ gpp, gidx });
+        const gv = em.id();
+        try em.line("%t{d} = OpLoad %f16 %t{d}", .{ gv, gpp });
+        try em.line("%t{d} = OpExtInst %f16 %ext 40 %t{d} %t{d}", .{ mxn, mx, gv });
+        try em.line("OpBranch %t{d}", .{mct});
+        try em.line("%t{d} = OpLabel", .{mct});
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_1", .{ minx, miv });
+        try em.line("OpBranch %t{d}", .{mh});
+        try em.line("%t{d} = OpLabel", .{mmg});
+        const mxf = em.id();
+        try em.line("%t{d} = OpFConvert %f32 %t{d}", .{ mxf, mx });
+        const sc0 = em.id();
+        try em.line("%t{d} = OpFMul %f32 %t{d} %cf_inv127", .{ sc0, mxf });
+        const sc = em.id();
+        try em.line("%t{d} = OpExtInst %f32 %ext 40 %t{d} %cf_tiny", .{ sc, sc0 });
+        const scp = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_ss_f32 %vs %cu_0 %t{d}", .{ scp, row });
+        try em.line("OpStore %t{d} %t{d}", .{ scp, sc });
+        const invf = em.id();
+        try em.line("%t{d} = OpFDiv %f32 %cf_1 %t{d}", .{ invf, sc });
+        const invh = em.id();
+        try em.line("%t{d} = OpFConvert %f16 %t{d}", .{ invh, invf });
+        const ip = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vsh %cu_{d}", .{ ip, INV });
+        try em.line("OpStore %t{d} %t{d}", .{ ip, invh });
+        try em.line("OpBranch %t{d}", .{sel});
+        try em.line("%t{d} = OpLabel", .{sel});
+        cur = try H.tmp(ar, sel);
     }
-    try a.op(224, &.{ c2, c2, c_bsem });
+    try em.line("OpControlBarrier %cu_2 %cu_2 %cu_264", .{});
 
     // Phase 3: coalesced quantize (f16 shared -> f32 math -> packed int8).
     {
-        const ip = a.id();
-        try a.op(65, &.{ t_ptr_wg_f16, ip, v_sh, c_inv });
-        const invh = a.id();
-        try a.op(61, &.{ t_f16, invh, ip });
-        const inv = a.id();
-        try a.op(115, &.{ t_f32, inv, invh }); // f16->f32
-        const roww = a.id();
-        try a.op(132, &.{ t_u32, roww, row, cu(&cvals, &cids, cn, cols / 4) });
-        const L = try openLoop(&a, t_u32, t_bool, c0, cu(&cvals, &cids, cn, WORDS), cur);
-        const iw = a.id();
-        try a.op(132, &.{ t_u32, iw, L.iv, c_wg });
-        const word = a.id();
-        try a.op(128, &.{ t_u32, word, tid, iw });
-        const be = a.id();
-        try a.op(196, &.{ t_u32, be, word, c2 });
-        const g = a.id();
-        try a.op(194, &.{ t_u32, g, be, c8 });
-        const l = a.id();
-        try a.op(199, &.{ t_u32, l, be, c255 });
-        const gp = a.id();
-        try a.op(132, &.{ t_u32, gp, g, c257 });
-        const base = a.id();
-        try a.op(128, &.{ t_u32, base, gp, l });
-        var out = c0;
+        const ip = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vsh %cu_{d}", .{ ip, INV });
+        const invh = em.id();
+        try em.line("%t{d} = OpLoad %f16 %t{d}", .{ invh, ip });
+        const inv = em.id();
+        try em.line("%t{d} = OpFConvert %f32 %t{d}", .{ inv, invh });
+        const roww = em.id();
+        try em.line("%t{d} = OpIMul %u32 %t{d} %cu_{d}", .{ roww, row, cols / 4 });
+        const L = try openLoop(&em, "%u32", "%bool", "%cu_0", try H.cst(ar, WORDS), cur);
+        const iw = em.id();
+        try em.line("%t{d} = OpIMul %u32 %t{d} %cu_{d}", .{ iw, L.iv, WG });
+        const word = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ word, tid, iw });
+        const be = em.id();
+        try em.line("%t{d} = OpShiftLeftLogical %u32 %t{d} %cu_2", .{ be, word });
+        const g = em.id();
+        try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_8", .{ g, be });
+        const l = em.id();
+        try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %cu_255", .{ l, be });
+        const gp = em.id();
+        try em.line("%t{d} = OpIMul %u32 %t{d} %cu_257", .{ gp, g });
+        const base = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ base, gp, l });
+        var out: []const u8 = "%cu_0";
         inline for (0..4) |k| {
-            const idx = if (k == 0) base else blk: {
-                const x = a.id();
-                try a.op(128, &.{ t_u32, x, base, cu(&cvals, &cids, cn, @intCast(k)) });
-                break :blk x;
-            };
-            const pp = a.id();
-            try a.op(65, &.{ t_ptr_wg_f16, pp, v_sh, idx });
-            const vh = a.id();
-            try a.op(61, &.{ t_f16, vh, pp });
-            const v = a.id();
-            try a.op(115, &.{ t_f32, v, vh }); // f16->f32
-            const r = a.id();
-            try a.op(133, &.{ t_f32, r, v, inv });
-            const sgn = a.id();
-            try a.op(12, &.{ t_f32, sgn, ext, 6, r });
-            const hh = a.id();
-            try a.op(133, &.{ t_f32, hh, sgn, cf_half });
-            const added = a.id();
-            try a.op(129, &.{ t_f32, added, r, hh });
-            const qi = a.id();
-            try a.op(110, &.{ t_s32, qi, added });
-            const qc = a.id();
-            try a.op(12, &.{ t_s32, qc, ext, 45, qi, cs_m127, cs_127 });
-            const qub = a.id();
-            try a.op(124, &.{ t_u32, qub, qc });
-            const qb = a.id();
-            try a.op(199, &.{ t_u32, qb, qub, cff });
-            const shk = a.id();
-            try a.op(196, &.{ t_u32, shk, qb, cu(&cvals, &cids, cn, @intCast(8 * k)) });
-            const no = a.id();
-            try a.op(197, &.{ t_u32, no, out, shk });
-            out = no;
+            var idx: []const u8 = try H.tmp(ar, base);
+            if (k != 0) {
+                const x = em.id();
+                try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ x, base, k });
+                idx = try H.tmp(ar, x);
+            }
+            const pp = em.id();
+            try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vsh {s}", .{ pp, idx });
+            const vh = em.id();
+            try em.line("%t{d} = OpLoad %f16 %t{d}", .{ vh, pp });
+            const v = em.id();
+            try em.line("%t{d} = OpFConvert %f32 %t{d}", .{ v, vh });
+            const r = em.id();
+            try em.line("%t{d} = OpFMul %f32 %t{d} %t{d}", .{ r, v, inv });
+            const sgn = em.id();
+            try em.line("%t{d} = OpExtInst %f32 %ext 6 %t{d}", .{ sgn, r });
+            const hh = em.id();
+            try em.line("%t{d} = OpFMul %f32 %t{d} %cf_half", .{ hh, sgn });
+            const added = em.id();
+            try em.line("%t{d} = OpFAdd %f32 %t{d} %t{d}", .{ added, r, hh });
+            const qi = em.id();
+            try em.line("%t{d} = OpConvertFToS %s32 %t{d}", .{ qi, added });
+            const qc = em.id();
+            try em.line("%t{d} = OpExtInst %s32 %ext 45 %t{d} %cs_m127 %cs_127", .{ qc, qi });
+            const qub = em.id();
+            try em.line("%t{d} = OpBitcast %u32 %t{d}", .{ qub, qc });
+            const qb = em.id();
+            try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %cu_255", .{ qb, qub });
+            const shk = em.id();
+            try em.line("%t{d} = OpShiftLeftLogical %u32 %t{d} %cu_{d}", .{ shk, qb, 8 * k });
+            const no = em.id();
+            try em.line("%t{d} = OpBitwiseOr %u32 {s} %t{d}", .{ no, out, shk });
+            out = try H.tmp(ar, no);
         }
-        const wi = a.id();
-        try a.op(128, &.{ t_u32, wi, roww, word });
-        const qp = a.id();
-        try a.op(65, &.{ t_ptr_sq_u32, qp, v_q, c0, wi });
-        try a.op(62, &.{ qp, out });
-        try closeLoop(&a, t_u32, c1, L);
-        cur = L.merge;
+        const wi = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ wi, roww, word });
+        const qp = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_sq_u32 %vq %cu_0 %t{d}", .{ qp, wi });
+        try em.line("OpStore %t{d} {s}", .{ qp, out });
+        try closeLoop(&em, "%u32", "%cu_1", L);
+        cur = try H.tmp(ar, L.merge);
     }
+    _ = &cur;
 
-    try a.op(253, &.{});
-    try a.op(56, &.{});
+    try em.line("OpReturn", .{});
+    try em.line("OpFunctionEnd", .{});
 
-    a.words.items[3] = a.next;
-    const out = try gpa.alignedAlloc(u8, .of(u32), a.words.items.len * 4);
-    @memcpy(out, std.mem.sliceAsBytes(a.words.items));
-    return out;
+    return sasm.assembleChecked(gpa, sasm.version_1_5, t.items);
 }
 /// Shared-memory staged variant with fused fp8 decode and double-buffered
 /// k sub-slabs: LocalSize (32,4) = 4 subgroups; each workgroup computes a
@@ -1898,504 +1319,374 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
     const A_BASE: u32 = 2 * B_SLAB;
     const AQ: usize = 512 / THREADS; // A staging quads per thread (512 uvec4/sub-slab)
 
-    var a: Asm = .{ .gpa = gpa };
-    defer a.words.deinit(gpa);
+    var t: std.ArrayList(u8) = .empty;
+    defer t.deinit(gpa);
+    var em = Emit{ .w = &t, .gpa = gpa };
 
-    const main_fn = a.id();
-    const gid_var = a.id();
-    const lid_var = a.id();
-    const t_void = a.id();
-    const t_fnvoid = a.id();
-    const t_u32 = a.id();
-    const t_f16 = a.id();
-    const t_f32 = a.id();
-    const t_v3u = a.id();
-    const t_ptr_in_v3 = a.id();
-    const c_arrlen = a.id();
-    const t_arr_f32 = a.id();
-    const t_sc = a.id(); // struct { [N]f32 }
-    const t_ptr_sc = a.id();
-    const v_c = a.id();
-    const t_push = a.id();
-    const t_ptr_push = a.id();
-    const v_push = a.id();
-    const t_ptr_pc_u32 = a.id();
-    const t_ptr_sc_f32 = a.id();
-    const t_bool = a.id();
-    // uvec4 views: B is the fp8 weight buffer (binding 3), A the f16
-    // activation buffer (binding 0) — both for 128-bit staging loads.
-    const t_v4u32 = a.id();
-    const t_arr_v4 = a.id();
-    const t_sb4 = a.id();
-    const t_ptr_sb4 = a.id();
-    const v_b4 = a.id();
-    const t_ptr_sb4_v4 = a.id();
-    const t_sa4 = a.id();
-    const t_ptr_sa4 = a.id();
-    const v_a4 = a.id();
-    // workgroup slab: B two 32x128 f16 sub-slabs, then A two 128x32
-    const c_bsh_len = a.id();
-    const t_bsh = a.id();
-    const t_ptr_wg_bsh = a.id();
-    const v_bsh = a.id();
-    const t_ptr_wg_f16 = a.id();
-
-    const c_u0 = a.id();
-    const c_u1 = a.id();
-    const c_u2 = a.id();
-    const c_u3 = a.id();
-    const c_u4 = a.id();
-    const c_u5 = a.id();
-    const c_u6 = a.id();
-    const c_u7 = a.id();
-    const c_u8 = a.id();
-    const c_u12 = a.id();
-    const c_u31 = a.id();
-    const c_u16 = a.id();
-    const c_u32c = a.id();
-    const c_u64 = a.id();
-    const c_u128 = a.id();
-    const c_u4096 = a.id(); // parity offset between the two sub-slabs
-    const c_mag_mask = a.id(); // 0x007F007F: e4m3 magnitude bits, bytes 0/2
-    const c_sgn_mask = a.id(); // 0x00800080: e4m3 sign bits, bytes 0/2
-    const c_u264 = a.id(); // barrier semantics: AcquireRelease|WorkgroupMemory
-    const c_scope_sub = a.id();
-    const c_scope_wg = a.id();
-    const t_mat_a = a.id();
-    const t_mat_b = a.id();
-    const t_mat_c = a.id();
-    const t_mat_c32 = a.id(); // f32 store type when acc_h16
-    const t_v2f16 = a.id();
-    const c_f32_0 = a.id();
-    const c_f16_0 = a.id(); // acc_h16 accumulator init
-    const c_h256 = a.id(); // f16 256.0: exact e4m3 -> f16 exponent rebias
-    const c_v2_256 = a.id();
-    const c_acc0 = a.id();
-
-    try a.words.appendSlice(gpa, &.{ 0x0723_0203, 0x0001_0500, 0, 0, 0 });
-    try a.op(17, &.{1});
-    try a.op(17, &.{9});
-    try a.op(17, &.{5345});
-    try a.op(17, &.{6022});
-    try a.opStr(10, &.{}, "SPV_KHR_cooperative_matrix");
-    try a.opStr(10, &.{}, "SPV_KHR_vulkan_memory_model");
-    try a.opStr(10, &.{}, "SPV_KHR_16bit_storage");
-    try a.op(14, &.{ 0, 3 });
-    {
-        var buf: std.ArrayList(u32) = .empty;
-        defer buf.deinit(gpa);
-        try buf.appendSlice(gpa, &.{ 5, main_fn });
-        try buf.appendSlice(gpa, &.{ std.mem.bytesToValue(u32, "main"), 0 });
-        try buf.appendSlice(gpa, &.{ gid_var, lid_var, v_c, v_b4, v_a4, v_push, v_bsh });
-        try a.op(15, buf.items);
+    // Derived constant/index names are formatted from indices; allocated ones
+    // are tracked here and freed at the end.
+    var names: std.ArrayList([]u8) = .empty;
+    defer {
+        for (names.items) |s| gpa.free(s);
+        names.deinit(gpa);
     }
-    try a.op(16, &.{ main_fn, 17, 32, NWARPS, 1 }); // LocalSize 32 N 1
+    const Nm = struct {
+        nl: *std.ArrayList([]u8),
+        g: std.mem.Allocator,
+        fn f(self: @This(), comptime fmt: []const u8, args: anytype) ![]const u8 {
+            const s = try std.fmt.allocPrint(self.g, fmt, args);
+            try self.nl.append(self.g, s);
+            return s;
+        }
+    };
+    const nm = Nm{ .nl = &names, .g = gpa };
 
-    try a.op(71, &.{ gid_var, 11, 26 }); // WorkgroupId
-    try a.op(71, &.{ lid_var, 11, 27 }); // LocalInvocationId
-    try a.op(71, &.{ t_arr_f32, 6, if (c_h16) 2 else 4 });
-    try a.op(71, &.{ t_sc, 2 });
-    try a.op(72, &.{ t_sc, 0, 35, 0 });
-    try a.op(71, &.{ t_push, 2 });
-    inline for (0..4) |m| {
-        try a.op(72, &.{ t_push, @intCast(m), 35, @intCast(m * 4) });
-    }
-    try a.op(71, &.{ v_c, 34, 0 });
-    try a.op(71, &.{ v_c, 33, 2 });
-    try a.op(71, &.{ v_b4, 34, 0 });
-    try a.op(71, &.{ v_b4, 33, 3 });
-    try a.op(71, &.{ v_a4, 34, 0 });
-    try a.op(71, &.{ v_a4, 33, 0 });
-    try a.op(71, &.{ t_arr_v4, 6, 16 }); // ArrayStride 16
-    inline for (.{ t_sb4, t_sa4 }) |t| {
-        try a.op(71, &.{ t, 2 });
-        try a.op(72, &.{ t, 0, 35, 0 });
+    // --- header ---
+    try em.line("OpCapability Shader", .{});
+    try em.line("OpCapability Float16", .{});
+    try em.line("OpCapability VulkanMemoryModel", .{});
+    try em.line("OpCapability CooperativeMatrixKHR", .{});
+    try em.line("OpExtension \"SPV_KHR_cooperative_matrix\"", .{});
+    try em.line("OpExtension \"SPV_KHR_vulkan_memory_model\"", .{});
+    try em.line("OpExtension \"SPV_KHR_16bit_storage\"", .{});
+    try em.line("OpMemoryModel Logical Vulkan", .{});
+    try em.line("OpEntryPoint GLCompute %main \"main\" %gid %lid %vc %vb4 %va4 %vpush %vbsh", .{});
+    try em.line("OpExecutionMode %main LocalSize 32 {d} 1", .{NWARPS});
+
+    // --- decorations ---
+    try em.line("OpDecorate %gid BuiltIn WorkgroupId", .{});
+    try em.line("OpDecorate %lid BuiltIn LocalInvocationId", .{});
+    try em.line("OpDecorate %arr_c ArrayStride {d}", .{@as(u32, if (c_h16) 2 else 4)});
+    try em.line("OpDecorate %sc Block", .{});
+    try em.line("OpMemberDecorate %sc 0 Offset 0", .{});
+    try em.line("OpDecorate %push Block", .{});
+    for (0..4) |m| try em.line("OpMemberDecorate %push {d} Offset {d}", .{ m, m * 4 });
+    try em.line("OpDecorate %vc DescriptorSet 0", .{});
+    try em.line("OpDecorate %vc Binding 2", .{});
+    try em.line("OpDecorate %vb4 DescriptorSet 0", .{});
+    try em.line("OpDecorate %vb4 Binding 3", .{});
+    try em.line("OpDecorate %va4 DescriptorSet 0", .{});
+    try em.line("OpDecorate %va4 Binding 0", .{});
+    try em.line("OpDecorate %arr_v4 ArrayStride 16", .{});
+    for ([_][]const u8{ "sb4", "sa4" }) |s| {
+        try em.line("OpDecorate %{s} Block", .{s});
+        try em.line("OpMemberDecorate %{s} 0 Offset 0", .{s});
     }
 
-    try a.op(19, &.{t_void});
-    try a.op(33, &.{ t_fnvoid, t_void });
-    try a.op(21, &.{ t_u32, 32, 0 });
-    try a.op(22, &.{ t_f16, 16 });
-    try a.op(22, &.{ t_f32, 32 });
-    try a.op(20, &.{t_bool});
-    try a.op(23, &.{ t_v3u, t_u32, 3 });
-    try a.op(32, &.{ t_ptr_in_v3, 1, t_v3u });
-    try a.op(59, &.{ t_ptr_in_v3, gid_var, 1 });
-    try a.op(59, &.{ t_ptr_in_v3, lid_var, 1 });
-
-    try a.op(43, &.{ t_u32, c_arrlen, 1 << 28 });
-    try a.op(28, &.{ t_arr_f32, if (c_h16) t_f16 else t_f32, c_arrlen });
-    try a.op(23, &.{ t_v4u32, t_u32, 4 });
-    try a.op(28, &.{ t_arr_v4, t_v4u32, c_arrlen });
-    try a.op(30, &.{ t_sb4, t_arr_v4 });
-    try a.op(32, &.{ t_ptr_sb4, 12, t_sb4 });
-    try a.op(59, &.{ t_ptr_sb4, v_b4, 12 });
-    try a.op(32, &.{ t_ptr_sb4_v4, 12, t_v4u32 });
-    try a.op(30, &.{ t_sa4, t_arr_v4 });
-    try a.op(32, &.{ t_ptr_sa4, 12, t_sa4 });
-    try a.op(59, &.{ t_ptr_sa4, v_a4, 12 });
-    try a.op(30, &.{ t_sc, t_arr_f32 });
-    try a.op(32, &.{ t_ptr_sc, 12, t_sc });
-    try a.op(59, &.{ t_ptr_sc, v_c, 12 });
-    try a.op(30, &.{ t_push, t_u32, t_u32, t_u32, t_u32 });
-    try a.op(32, &.{ t_ptr_push, 9, t_push });
-    try a.op(59, &.{ t_ptr_push, v_push, 9 });
-    try a.op(32, &.{ t_ptr_pc_u32, 9, t_u32 });
-    try a.op(32, &.{ t_ptr_sc_f32, 12, if (c_h16) t_f16 else t_f32 });
+    // --- types ---
+    const c_elem = if (c_h16) "f16" else "f32";
+    try em.line("%void = OpTypeVoid", .{});
+    try em.line("%fnvoid = OpTypeFunction %void", .{});
+    try em.line("%u32 = OpTypeInt 32 0", .{});
+    try em.line("%f16 = OpTypeFloat 16", .{});
+    try em.line("%f32 = OpTypeFloat 32", .{});
+    try em.line("%bool = OpTypeBool", .{});
+    try em.line("%v3u = OpTypeVector %u32 3", .{});
+    try em.line("%ptr_in_v3 = OpTypePointer Input %v3u", .{});
+    try em.line("%gid = OpVariable %ptr_in_v3 Input", .{});
+    try em.line("%lid = OpVariable %ptr_in_v3 Input", .{});
+    try em.line("%c_arrlen = OpConstant %u32 268435456", .{});
+    try em.line("%arr_c = OpTypeArray %{s} %c_arrlen", .{c_elem});
+    try em.line("%v4u32 = OpTypeVector %u32 4", .{});
+    try em.line("%arr_v4 = OpTypeArray %v4u32 %c_arrlen", .{});
+    try em.line("%sb4 = OpTypeStruct %arr_v4", .{});
+    try em.line("%ptr_sb4 = OpTypePointer StorageBuffer %sb4", .{});
+    try em.line("%vb4 = OpVariable %ptr_sb4 StorageBuffer", .{});
+    try em.line("%ptr_sb4_v4 = OpTypePointer StorageBuffer %v4u32", .{});
+    try em.line("%sa4 = OpTypeStruct %arr_v4", .{});
+    try em.line("%ptr_sa4 = OpTypePointer StorageBuffer %sa4", .{});
+    try em.line("%va4 = OpVariable %ptr_sa4 StorageBuffer", .{});
+    try em.line("%sc = OpTypeStruct %arr_c", .{});
+    try em.line("%ptr_sc = OpTypePointer StorageBuffer %sc", .{});
+    try em.line("%vc = OpVariable %ptr_sc StorageBuffer", .{});
+    try em.line("%push = OpTypeStruct %u32 %u32 %u32 %u32", .{});
+    try em.line("%ptr_push = OpTypePointer PushConstant %push", .{});
+    try em.line("%vpush = OpVariable %ptr_push PushConstant", .{});
+    try em.line("%ptr_pc_u32 = OpTypePointer PushConstant %u32", .{});
+    try em.line("%ptr_sc_f32 = OpTypePointer StorageBuffer %{s}", .{c_elem});
 
     // Workgroup slab (no layout decorations): B 2 x [32][WGN] f16 at 0,
     // A 2 x [128][32] f16 at A_BASE.
-    try a.op(43, &.{ t_u32, c_bsh_len, A_BASE + 2 * A_SLAB });
-    try a.op(28, &.{ t_bsh, t_f16, c_bsh_len });
-    try a.op(32, &.{ t_ptr_wg_bsh, 4, t_bsh });
-    try a.op(59, &.{ t_ptr_wg_bsh, v_bsh, 4 });
-    try a.op(32, &.{ t_ptr_wg_f16, 4, t_f16 });
+    try em.line("%c_bsh_len = OpConstant %u32 {d}", .{A_BASE + 2 * A_SLAB});
+    try em.line("%t_bsh = OpTypeArray %f16 %c_bsh_len", .{});
+    try em.line("%ptr_wg_bsh = OpTypePointer Workgroup %t_bsh", .{});
+    try em.line("%vbsh = OpVariable %ptr_wg_bsh Workgroup", .{});
+    try em.line("%ptr_wg_f16 = OpTypePointer Workgroup %f16", .{});
 
-    try a.op(43, &.{ t_u32, c_u0, 0 });
-    try a.op(43, &.{ t_u32, c_u1, 1 });
-    try a.op(43, &.{ t_u32, c_u2, 2 });
-    try a.op(43, &.{ t_u32, c_u3, 3 });
-    try a.op(43, &.{ t_u32, c_u4, 4 });
-    try a.op(43, &.{ t_u32, c_u5, 5 });
-    try a.op(43, &.{ t_u32, c_u6, 6 });
-    try a.op(43, &.{ t_u32, c_u7, 7 });
-    try a.op(43, &.{ t_u32, c_u8, 8 });
-    try a.op(43, &.{ t_u32, c_u12, 12 });
-    try a.op(43, &.{ t_u32, c_u31, 31 });
-    try a.op(43, &.{ t_u32, c_u16, 16 });
-    try a.op(43, &.{ t_u32, c_u32c, 32 });
-    try a.op(43, &.{ t_u32, c_u64, 64 });
-    try a.op(43, &.{ t_u32, c_u128, 128 });
-    try a.op(43, &.{ t_u32, c_u4096, 4096 });
-    try a.op(43, &.{ t_u32, c_mag_mask, 0x007F007F });
-    try a.op(43, &.{ t_u32, c_sgn_mask, 0x00800080 });
-    try a.op(43, &.{ t_u32, c_u264, 0x108 });
-    try a.op(43, &.{ t_u32, c_scope_sub, 3 });
-    try a.op(43, &.{ t_u32, c_scope_wg, 2 });
+    // Named u32 constant block (mirrors the original — note duplicate values
+    // like c_u3 vs c_scope_sub are intentional and must be preserved).
+    for ([_]struct { []const u8, u32 }{
+        .{ "c_u0", 0 },   .{ "c_u1", 1 },   .{ "c_u2", 2 },     .{ "c_u3", 3 },
+        .{ "c_u4", 4 },   .{ "c_u5", 5 },   .{ "c_u6", 6 },     .{ "c_u7", 7 },
+        .{ "c_u8", 8 },   .{ "c_u12", 12 }, .{ "c_u31", 31 },   .{ "c_u16", 16 },
+        .{ "c_u32c", 32 }, .{ "c_u64", 64 }, .{ "c_u128", 128 }, .{ "c_u4096", 4096 },
+        .{ "c_mag_mask", 0x007F007F }, .{ "c_sgn_mask", 0x00800080 }, .{ "c_u264", 0x108 },
+        .{ "c_scope_sub", 3 }, .{ "c_scope_wg", 2 },
+    }) |cv| try em.line("%{s} = OpConstant %u32 {d}", .{ cv[0], cv[1] });
 
-    try a.op(4456, &.{ t_mat_a, t_f16, c_scope_sub, c_u16, c_u16, c_u0 });
-    try a.op(4456, &.{ t_mat_b, t_f16, c_scope_sub, c_u16, c_u16, c_u1 });
-    try a.op(4456, &.{ t_mat_c, if (acc_h16) t_f16 else t_f32, c_scope_sub, c_u16, c_u16, c_u2 });
-    if (acc_h16 and !c_h16) try a.op(4456, &.{ t_mat_c32, t_f32, c_scope_sub, c_u16, c_u16, c_u2 });
-    try a.op(23, &.{ t_v2f16, t_f16, 2 });
-    try a.op(43, &.{ t_f32, c_f32_0, 0 });
-    if (acc_h16) try a.op(43, &.{ t_f16, c_f16_0, 0 });
-    try a.op(43, &.{ t_f16, c_h256, 0x5C00 });
-    try a.op(44, &.{ t_v2f16, c_v2_256, c_h256, c_h256 });
-    try a.op(44, &.{ t_mat_c, c_acc0, if (acc_h16) c_f16_0 else c_f32_0 });
+    const c_acc_elem = if (acc_h16) "f16" else "f32";
+    try em.line("%mat_a = OpTypeCooperativeMatrixKHR %f16 %c_scope_sub %c_u16 %c_u16 %c_u0", .{});
+    try em.line("%mat_b = OpTypeCooperativeMatrixKHR %f16 %c_scope_sub %c_u16 %c_u16 %c_u1", .{});
+    try em.line("%mat_c = OpTypeCooperativeMatrixKHR %{s} %c_scope_sub %c_u16 %c_u16 %c_u2", .{c_acc_elem});
+    if (acc_h16 and !c_h16) try em.line("%mat_c32 = OpTypeCooperativeMatrixKHR %f32 %c_scope_sub %c_u16 %c_u16 %c_u2", .{});
+    try em.line("%v2f16 = OpTypeVector %f16 2", .{});
+    try em.line("%c_f32_0 = OpConstant %f32 0", .{});
+    if (acc_h16) try em.line("%c_f16_0 = OpConstant %f16 0", .{});
+    try em.line("%c_h256 = OpConstant %f16 23552", .{}); // 0x5C00
+    try em.line("%c_v2_256 = OpConstantComposite %v2f16 %c_h256 %c_h256", .{});
+    try em.line("%c_acc0 = OpConstantComposite %mat_c %{s}", .{if (acc_h16) "c_f16_0" else "c_f32_0"});
 
-    // small u32 constants used in the body (must live in the global section)
-    // wg N width / thread count (equal in both configs).
-    const c_wgn = if (WGN == 128) c_u128 else blk: {
-        const c = a.id();
-        try a.op(43, &.{ t_u32, c, WGN });
-        break :blk c;
+    // Body index constants (with the original's value-aliasing so emission
+    // order and set match golden exactly).
+    const c_wgn = if (WGN == 128) "c_u128" else blk: {
+        try em.line("%c_wgn = OpConstant %u32 {d}", .{WGN});
+        break :blk "c_wgn";
     };
-    // B sub-slab parity offset and the B chunk row mask/shift.
-    const c_bslab = if (B_SLAB == 4096) c_u4096 else blk: {
-        const c = a.id();
-        try a.op(43, &.{ t_u32, c, B_SLAB });
-        break :blk c;
+    const c_bslab = if (B_SLAB == 4096) "c_u4096" else blk: {
+        try em.line("%c_bslab = OpConstant %u32 {d}", .{B_SLAB});
+        break :blk "c_bslab";
     };
-    const c_bmask = if (WGN == 128) c_u7 else blk: {
-        const c = a.id();
-        try a.op(43, &.{ t_u32, c, WGN / 16 - 1 });
-        break :blk c;
+    const c_bmask = if (WGN == 128) "c_u7" else blk: {
+        try em.line("%c_bmask = OpConstant %u32 {d}", .{WGN / 16 - 1});
+        break :blk "c_bmask";
     };
-    const c_bshift = if (WGN == 128) c_u3 else c_u4; // log2(WGN/16)
-    var c_stage: [4]u32 = undefined; // t*THREADS: staging chunk strides
-    c_stage[0] = c_u0;
+    const c_bshift = if (WGN == 128) "c_u3" else "c_u4"; // log2(WGN/16)
+    var c_stage: [4][]const u8 = undefined; // t*THREADS
+    c_stage[0] = "c_u0";
     c_stage[1] = c_wgn;
-    for (2..4) |t| {
-        c_stage[t] = a.id();
-        try a.op(43, &.{ t_u32, c_stage[t], @intCast(t * THREADS) });
+    for (2..4) |i| {
+        try em.line("%c_stage_{d} = OpConstant %u32 {d}", .{ i, @as(u32, @intCast(i)) * THREADS });
+        c_stage[i] = try nm.f("c_stage_{d}", .{i});
     }
-    var c_k16: [4]u32 = undefined; // ks*16: A tile k offsets within a 64 step
-    c_k16[0] = c_u0;
-    c_k16[1] = c_u16;
-    c_k16[2] = c_u32c;
-    c_k16[3] = a.id();
-    try a.op(43, &.{ t_u32, c_k16[3], 48 });
-    var c_col16: [8]u32 = undefined; // nt*16: C col offsets
-    c_col16[0] = c_u0;
-    c_col16[1] = c_u16;
-    c_col16[2] = c_u32c;
-    c_col16[3] = c_k16[3];
-    c_col16[4] = c_u64;
-    for (5..8) |nt| {
-        c_col16[nt] = a.id();
-        try a.op(43, &.{ t_u32, c_col16[nt], @intCast(nt * 16) });
+    var c_k16: [4][]const u8 = undefined;
+    c_k16[0] = "c_u0";
+    c_k16[1] = "c_u16";
+    c_k16[2] = "c_u32c";
+    try em.line("%c_k16_3 = OpConstant %u32 48", .{});
+    c_k16[3] = "c_k16_3";
+    var c_col16: [8][]const u8 = undefined;
+    c_col16[0] = "c_u0";
+    c_col16[1] = "c_u16";
+    c_col16[2] = "c_u32c";
+    c_col16[3] = "c_k16_3";
+    c_col16[4] = "c_u64";
+    for (5..8) |i| {
+        try em.line("%c_col16_{d} = OpConstant %u32 {d}", .{ i, @as(u32, @intCast(i)) * 16 });
+        c_col16[i] = try nm.f("c_col16_{d}", .{i});
     }
-    // b_sh tile offsets: parity*B_SLAB + ks*(16*WGN) + nt*16.
-    var c_bt: [2][2][8]u32 = undefined;
-    for (0..2) |par| {
-        for (0..2) |ks| {
-            for (0..8) |nt| {
-                if (par == 0 and ks == 0) {
-                    c_bt[par][ks][nt] = c_col16[nt];
-                } else {
-                    c_bt[par][ks][nt] = a.id();
-                    try a.op(43, &.{ t_u32, c_bt[par][ks][nt], @intCast(par * B_SLAB + ks * (16 * WGN) + nt * 16) });
-                }
-            }
+    var c_bt: [2][2][8][]const u8 = undefined;
+    for (0..2) |par| for (0..2) |ks| for (0..8) |nt| {
+        if (par == 0 and ks == 0) {
+            c_bt[par][ks][nt] = c_col16[nt];
+        } else {
+            try em.line("%c_bt_{d}_{d}_{d} = OpConstant %u32 {d}", .{ par, ks, nt, @as(u32, @intCast(par * B_SLAB + ks * (16 * WGN) + nt * 16)) });
+            c_bt[par][ks][nt] = try nm.f("c_bt_{d}_{d}_{d}", .{ par, ks, nt });
         }
-    }
-    // A slab constants: row stride and sub-slab size (alias the generic
-    // constants when the values coincide), region base, and the a_sh tile
-    // offsets 8192 + parity*A_SLAB + r*16*A_STRIDE + ks*16.
-    const c_astride = if (A_STRIDE == 32) c_u32c else blk: {
-        const c = a.id();
-        try a.op(43, &.{ t_u32, c, A_STRIDE });
-        break :blk c;
     };
-    const c_aslab = if (A_SLAB == 4096) c_u4096 else blk: {
-        const c = a.id();
-        try a.op(43, &.{ t_u32, c, A_SLAB });
-        break :blk c;
+    const c_astride = if (A_STRIDE == 32) "c_u32c" else blk: {
+        try em.line("%c_astride = OpConstant %u32 {d}", .{A_STRIDE});
+        break :blk "c_astride";
     };
-    const c_ash0 = a.id();
-    try a.op(43, &.{ t_u32, c_ash0, A_BASE });
-    var c_at: [2][2][4]u32 = undefined;
-    for (0..2) |par| {
-        for (0..2) |ks| {
-            for (0..4) |r| {
-                if (par == 0 and ks == 0 and r == 0) {
-                    c_at[par][ks][r] = c_ash0;
-                } else {
-                    c_at[par][ks][r] = a.id();
-                    try a.op(43, &.{ t_u32, c_at[par][ks][r], @intCast(A_BASE + par * A_SLAB + r * 16 * A_STRIDE + ks * 16) });
-                }
-            }
+    const c_aslab = if (A_SLAB == 4096) "c_u4096" else blk: {
+        try em.line("%c_aslab = OpConstant %u32 {d}", .{A_SLAB});
+        break :blk "c_aslab";
+    };
+    try em.line("%c_ash0 = OpConstant %u32 {d}", .{A_BASE});
+    var c_at: [2][2][4][]const u8 = undefined;
+    for (0..2) |par| for (0..2) |ks| for (0..4) |r| {
+        if (par == 0 and ks == 0 and r == 0) {
+            c_at[par][ks][r] = "c_ash0";
+        } else {
+            try em.line("%c_at_{d}_{d}_{d} = OpConstant %u32 {d}", .{ par, ks, r, @as(u32, @intCast(A_BASE + par * A_SLAB + r * 16 * A_STRIDE + ks * 16)) });
+            c_at[par][ks][r] = try nm.f("c_at_{d}_{d}_{d}", .{ par, ks, r });
         }
-    }
+    };
 
     // --- function ---
-    const lb_entry = a.id();
-    try a.op(54, &.{ t_void, main_fn, 0, t_fnvoid });
-    try a.op(248, &.{lb_entry});
+    try em.line("%main = OpFunction %void None %fnvoid", .{});
+    try em.line("%entry = OpLabel", .{});
 
-    const gidv = a.id();
-    try a.op(61, &.{ t_v3u, gidv, gid_var });
-    const tile_c = a.id();
-    const tile_r = a.id();
-    try a.op(81, &.{ t_u32, tile_c, gidv, 0 });
-    try a.op(81, &.{ t_u32, tile_r, gidv, 1 });
-    const col0 = a.id();
-    const row0 = a.id();
-    try a.op(132, &.{ t_u32, col0, tile_c, c_wgn }); // WGN cols per wg
-    try a.op(132, &.{ t_u32, row0, tile_r, c_u128 }); // 128 rows per wg
+    const gidv = em.id();
+    try em.line("%t{d} = OpLoad %v3u %gid", .{gidv});
+    const tile_c = em.id();
+    try em.line("%t{d} = OpCompositeExtract %u32 %t{d} 0", .{ tile_c, gidv });
+    const tile_r = em.id();
+    try em.line("%t{d} = OpCompositeExtract %u32 %t{d} 1", .{ tile_r, gidv });
+    const col0 = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %{s}", .{ col0, tile_c, c_wgn });
+    const row0 = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %c_u128", .{ row0, tile_r });
 
-    const lidv = a.id();
-    try a.op(61, &.{ t_v3u, lidv, lid_var });
-    const lx = a.id();
-    const ly = a.id(); // subgroup index 0..7
-    try a.op(81, &.{ t_u32, lx, lidv, 0 });
-    try a.op(81, &.{ t_u32, ly, lidv, 1 });
-    const flat = a.id(); // ly*32 + lx, 0..127
-    const lymul = a.id();
-    try a.op(132, &.{ t_u32, lymul, ly, c_u32c });
-    try a.op(128, &.{ t_u32, flat, lymul, lx });
+    const lidv = em.id();
+    try em.line("%t{d} = OpLoad %v3u %lid", .{lidv});
+    const lx = em.id();
+    try em.line("%t{d} = OpCompositeExtract %u32 %t{d} 0", .{ lx, lidv });
+    const ly = em.id();
+    try em.line("%t{d} = OpCompositeExtract %u32 %t{d} 1", .{ ly, lidv });
+    const lymul = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %c_u32c", .{ lymul, ly });
+    const flat = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ flat, lymul, lx });
 
-    var push_vals: [4]u32 = undefined;
-    inline for (0..4) |m| {
-        const pptr = a.id();
-        const pval = a.id();
-        const cidx = switch (m) {
-            0 => c_u0,
-            1 => c_u1,
-            2 => c_u2,
-            else => c_u3,
-        };
-        try a.op(65, &.{ t_ptr_pc_u32, pptr, v_push, cidx });
-        try a.op(61, &.{ t_u32, pval, pptr });
-        push_vals[m] = pval;
+    const pnames = [_][]const u8{ "pm", "pn", "pk", "pstride" };
+    for (0..4) |m| {
+        const pptr = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_pc_u32 %vpush %c_u{d}", .{ pptr, m });
+        try em.line("%{s} = OpLoad %u32 %t{d}", .{ pnames[m], pptr });
     }
-    const p_n = push_vals[1];
-    const p_k = push_vals[2];
-    const p_stride = push_vals[3];
 
-    // Warp tiling: a 2x2 grid of 64x64 tiles per warp — 4 A x 4 B fragments
-    // feed 16 MMAs per k-step (2 MMAs per fragment load).
-    const warp_m = a.id(); // ly & 1
-    try a.op(199, &.{ t_u32, warp_m, ly, c_u1 });
-    const warp_n = a.id(); // ly >> 1
-    try a.op(194, &.{ t_u32, warp_n, ly, c_u1 });
-    const wm64 = a.id();
-    try a.op(132, &.{ t_u32, wm64, warp_m, c_u64 });
-    const row_s = a.id();
-    try a.op(128, &.{ t_u32, row_s, row0, wm64 });
-    const wn64 = a.id();
-    try a.op(132, &.{ t_u32, wn64, warp_n, c_u64 });
-    const col_s = a.id(); // warp's first column tile (of 4)
-    try a.op(128, &.{ t_u32, col_s, col0, wn64 });
-    const a_shbase = a.id(); // warp's A row-block base within an A sub-slab
-    try a.op(132, &.{ t_u32, a_shbase, wm64, c_astride });
+    const warp_m = em.id();
+    try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %c_u1", .{ warp_m, ly });
+    const warp_n = em.id();
+    try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %c_u1", .{ warp_n, ly });
+    const wm64 = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %c_u64", .{ wm64, warp_m });
+    const row_s = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ row_s, row0, wm64 });
+    const wn64 = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %c_u64", .{ wn64, warp_n });
+    const col_s = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ col_s, col0, wn64 });
+    const a_shbase = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %{s}", .{ a_shbase, wm64, c_astride });
 
-    // Loop-invariant B staging indices: thread `flat`, uvec4 t (of 2)
-    // covers sub-slab elements 16v..16v+15 with v = flat + t*THREADS, i.e.
-    // B k-row v/(WGN/16), columns (v%(WGN/16))*16 .. +15 of the workgroup's
-    // column window (consecutive lanes read consecutive 16-byte quads).
+    // Loop-invariant B staging indices.
     var brow_t: [2]u32 = undefined;
     var bco_t: [2]u32 = undefined;
     var sbase0_t: [2]u32 = undefined;
     var sbase1_t: [2]u32 = undefined;
-    for (0..2) |t| {
+    for (0..2) |i| {
         var v = flat;
-        if (t > 0) {
-            const vn = a.id();
-            try a.op(128, &.{ t_u32, vn, flat, c_wgn });
+        if (i > 0) {
+            const vn = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ vn, flat, c_wgn });
             v = vn;
         }
-        brow_t[t] = a.id();
-        try a.op(194, &.{ t_u32, brow_t[t], v, c_bshift }); // v / (WGN/16)
-        const vmod = a.id();
-        try a.op(199, &.{ t_u32, vmod, v, c_bmask }); // v % (WGN/16)
-        const bcol16 = a.id();
-        try a.op(196, &.{ t_u32, bcol16, vmod, c_u4 }); // * 16
-        bco_t[t] = a.id();
-        try a.op(128, &.{ t_u32, bco_t[t], col0, bcol16 });
-        sbase0_t[t] = a.id();
-        try a.op(196, &.{ t_u32, sbase0_t[t], v, c_u4 }); // * 16
-        sbase1_t[t] = a.id();
-        try a.op(128, &.{ t_u32, sbase1_t[t], sbase0_t[t], c_bslab });
+        brow_t[i] = em.id();
+        try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %{s}", .{ brow_t[i], v, c_bshift });
+        const vmod = em.id();
+        try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %{s}", .{ vmod, v, c_bmask });
+        const bcol16 = em.id();
+        try em.line("%t{d} = OpShiftLeftLogical %u32 %t{d} %c_u4", .{ bcol16, vmod });
+        bco_t[i] = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ bco_t[i], col0, bcol16 });
+        sbase0_t[i] = em.id();
+        try em.line("%t{d} = OpShiftLeftLogical %u32 %t{d} %c_u4", .{ sbase0_t[i], v });
+        sbase1_t[i] = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ sbase1_t[i], sbase0_t[i], c_bslab });
     }
 
-    // Loop-invariant A staging indices: thread `flat`, uvec4 t (of AQ)
-    // covers sub-slab quad q = flat + t*THREADS -> A row q/4 (of the wg's
-    // 128), k-quad q%4 (8 f16 each; consecutive lanes cover a row's 4 quads
-    // then step rows). Global uvec4 index = ((row0 + row)*k + kb)/8 + q%4;
-    // shared f16 store base = A_BASE + parity*A_SLAB + row*A_STRIDE + (q%4)*8.
+    // Loop-invariant A staging indices.
     var a_inv_t: [4]u32 = undefined;
     var asb0_t: [4]u32 = undefined;
     var asb1_t: [4]u32 = undefined;
-    for (0..AQ) |t| {
+    for (0..AQ) |i| {
         var q = flat;
-        if (t > 0) {
-            const qn = a.id();
-            try a.op(128, &.{ t_u32, qn, flat, c_stage[t] });
+        if (i > 0) {
+            const qn = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ qn, flat, c_stage[i] });
             q = qn;
         }
-        const arow = a.id();
-        try a.op(194, &.{ t_u32, arow, q, c_u2 }); // q / 4
-        const aqc = a.id();
-        try a.op(199, &.{ t_u32, aqc, q, c_u3 }); // q % 4
-        const grow = a.id();
-        try a.op(128, &.{ t_u32, grow, row0, arow });
-        const gmul = a.id();
-        try a.op(132, &.{ t_u32, gmul, grow, p_k });
-        const gq = a.id();
-        try a.op(194, &.{ t_u32, gq, gmul, c_u3 }); // f16 -> uvec4 index
-        a_inv_t[t] = a.id();
-        try a.op(128, &.{ t_u32, a_inv_t[t], gq, aqc });
-        const srow = a.id();
-        try a.op(132, &.{ t_u32, srow, arow, c_astride });
-        const scol = a.id();
-        try a.op(196, &.{ t_u32, scol, aqc, c_u3 }); // * 8
-        const s0 = a.id();
-        try a.op(128, &.{ t_u32, s0, srow, scol });
-        asb0_t[t] = a.id();
-        try a.op(128, &.{ t_u32, asb0_t[t], s0, c_ash0 });
-        asb1_t[t] = a.id();
-        try a.op(128, &.{ t_u32, asb1_t[t], asb0_t[t], c_aslab });
+        const arow = em.id();
+        try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %c_u2", .{ arow, q });
+        const aqc = em.id();
+        try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %c_u3", .{ aqc, q });
+        const grow = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ grow, row0, arow });
+        const gmul = em.id();
+        try em.line("%t{d} = OpIMul %u32 %t{d} %pk", .{ gmul, grow });
+        const gq = em.id();
+        try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %c_u3", .{ gq, gmul });
+        a_inv_t[i] = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ a_inv_t[i], gq, aqc });
+        const srow = em.id();
+        try em.line("%t{d} = OpIMul %u32 %t{d} %{s}", .{ srow, arow, c_astride });
+        const scol = em.id();
+        try em.line("%t{d} = OpShiftLeftLogical %u32 %t{d} %c_u3", .{ scol, aqc });
+        const s0 = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ s0, srow, scol });
+        asb0_t[i] = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %c_ash0", .{ asb0_t[i], s0 });
+        asb1_t[i] = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ asb1_t[i], asb0_t[i], c_aslab });
     }
 
-    // Staging emitters (loads separated from decode+store so the global
-    // loads can issue before the MMA section they overlap with).
+    // Staging emitters (loads separated from decode+store).
     const Stage = struct {
+        em: *Emit,
         b_f16: bool,
-        t_u32: u32,
-        t_f16: u32,
-        t_v2f16: u32,
-        t_ptr_wg_f16: u32,
-        v_bsh: u32,
-        p_stride: u32,
-        c_u0: u32,
-        c_u2: u32,
-        c_u7: u32,
-        c_u8: u32,
-        c_mag_mask: u32,
-        c_sgn_mask: u32,
-        c_v2_256: u32,
-        c_j: [4]u32,
-        c_j8: [8]u32,
-        c_w4: [4]u32,
-        c_u4: u32,
-        t_v4u32: u32,
-        t_ptr_sb4_v4: u32,
-        v_b4: u32,
+        c_v2_256: []const u8,
+        c_j: [4][]const u8,
+        c_j8: [8][]const u8,
+        c_w4: [4][]const u8,
         brow: [2]u32,
         bco: [2]u32,
 
-        /// Global loads for the sub-slab whose first k-row is `kb`: per
-        /// 16-element chunk, one uvec4 for fp8 B (16 bytes; entries 2/3
-        /// unused) or two for f16 B (32 bytes).
-        fn loads(st: @This(), asm_: *Asm, kb: u32) ![4]u32 {
+        fn loads(st: @This(), kb: []const u8) ![4]u32 {
+            const e = st.em;
             var quads: [4]u32 = undefined;
-            for (0..2) |t| {
-                const bk = asm_.id();
-                try asm_.op(128, &.{ st.t_u32, bk, kb, st.brow[t] });
-                const bmul = asm_.id();
-                try asm_.op(132, &.{ st.t_u32, bmul, bk, st.p_stride });
-                const boff = asm_.id();
-                try asm_.op(128, &.{ st.t_u32, boff, bmul, st.bco[t] });
+            for (0..2) |i| {
+                const bk = e.id();
+                try e.line("%t{d} = OpIAdd %u32 %{s} %t{d}", .{ bk, kb, st.brow[i] });
+                const bmul = e.id();
+                try e.line("%t{d} = OpIMul %u32 %t{d} %pstride", .{ bmul, bk });
+                const boff = e.id();
+                try e.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ boff, bmul, st.bco[i] });
                 if (st.b_f16) {
-                    const qidx0 = asm_.id();
-                    try asm_.op(194, &.{ st.t_u32, qidx0, boff, st.c_j[3] }); // /8 (f16 elems)
+                    const qidx0 = e.id();
+                    try e.line("%t{d} = OpShiftRightLogical %u32 %t{d} %{s}", .{ qidx0, boff, st.c_j[3] }); // /8
                     for (0..2) |qi| {
                         var qidx = qidx0;
                         if (qi > 0) {
-                            const qn = asm_.id();
-                            try asm_.op(128, &.{ st.t_u32, qn, qidx0, st.c_j[1] });
+                            const qn = e.id();
+                            try e.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ qn, qidx0, st.c_j[1] });
                             qidx = qn;
                         }
-                        const qptr = asm_.id();
-                        try asm_.op(65, &.{ st.t_ptr_sb4_v4, qptr, st.v_b4, st.c_u0, qidx });
-                        quads[2 * t + qi] = asm_.id();
-                        try asm_.op(61, &.{ st.t_v4u32, quads[2 * t + qi], qptr });
+                        const qptr = e.id();
+                        try e.line("%t{d} = OpAccessChain %ptr_sb4_v4 %vb4 %c_u0 %t{d}", .{ qptr, qidx });
+                        quads[2 * i + qi] = e.id();
+                        try e.line("%t{d} = OpLoad %v4u32 %t{d}", .{ quads[2 * i + qi], qptr });
                     }
                 } else {
-                    const qidx = asm_.id();
-                    try asm_.op(194, &.{ st.t_u32, qidx, boff, st.c_u4 }); // /16 (bytes)
-                    const qptr = asm_.id();
-                    try asm_.op(65, &.{ st.t_ptr_sb4_v4, qptr, st.v_b4, st.c_u0, qidx });
-                    quads[t] = asm_.id();
-                    try asm_.op(61, &.{ st.t_v4u32, quads[t], qptr });
+                    const qidx = e.id();
+                    try e.line("%t{d} = OpShiftRightLogical %u32 %t{d} %c_u4", .{ qidx, boff }); // /16
+                    const qptr = e.id();
+                    try e.line("%t{d} = OpAccessChain %ptr_sb4_v4 %vb4 %c_u0 %t{d}", .{ qptr, qidx });
+                    quads[i] = e.id();
+                    try e.line("%t{d} = OpLoad %v4u32 %t{d}", .{ quads[i], qptr });
                 }
             }
             return quads;
         }
 
-        /// Stage the quads into the sub-slab whose per-chunk store bases are
-        /// `sbase` (parity offset prefolded). fp8 B: SWAR e4m3 -> f16 pair
-        /// decode (fields land on f16 layout, exact *256). f16 B: plain
-        /// bitcast copy, 8 consecutive f16 per quad (same as the A slab).
-        fn stores(st: @This(), asm_: *Asm, quads: [4]u32, sbase: [2]u32) !void {
+        fn stores(st: @This(), quads: [4]u32, sbase: [2]u32) !void {
+            const e = st.em;
             if (st.b_f16) {
-                for (0..2) |t| {
+                for (0..2) |i| {
                     for (0..2) |qi| {
-                        var qbase = sbase[t];
+                        var qbase = sbase[i];
                         if (qi > 0) {
-                            const qb = asm_.id();
-                            try asm_.op(128, &.{ st.t_u32, qb, sbase[t], st.c_u8 });
+                            const qb = e.id();
+                            try e.line("%t{d} = OpIAdd %u32 %t{d} %c_u8", .{ qb, sbase[i] });
                             qbase = qb;
                         }
                         for (0..4) |wi| {
-                            const wv = asm_.id();
-                            try asm_.op(81, &.{ st.t_u32, wv, quads[2 * t + qi], @intCast(wi) });
-                            const hv2 = asm_.id();
-                            try asm_.op(124, &.{ st.t_v2f16, hv2, wv }); // OpBitcast
+                            const wv = e.id();
+                            try e.line("%t{d} = OpCompositeExtract %u32 %t{d} {d}", .{ wv, quads[2 * i + qi], wi });
+                            const hv2 = e.id();
+                            try e.line("%t{d} = OpBitcast %v2f16 %t{d}", .{ hv2, wv });
                             for (0..2) |j| {
-                                const hval = asm_.id();
-                                try asm_.op(81, &.{ st.t_f16, hval, hv2, @intCast(j) });
+                                const hval = e.id();
+                                try e.line("%t{d} = OpCompositeExtract %f16 %t{d} {d}", .{ hval, hv2, j });
                                 var eidx = qbase;
                                 if (wi * 2 + j > 0) {
-                                    const ei = asm_.id();
-                                    try asm_.op(128, &.{ st.t_u32, ei, qbase, st.c_j8[wi * 2 + j] });
+                                    const ei = e.id();
+                                    try e.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ ei, qbase, st.c_j8[wi * 2 + j] });
                                     eidx = ei;
                                 }
-                                const bsptr = asm_.id();
-                                try asm_.op(65, &.{ st.t_ptr_wg_f16, bsptr, st.v_bsh, eidx });
-                                try asm_.op(62, &.{ bsptr, hval });
+                                const bsptr = e.id();
+                                try e.line("%t{d} = OpAccessChain %ptr_wg_f16 %vbsh %t{d}", .{ bsptr, eidx });
+                                try e.line("OpStore %t{d} %t{d}", .{ bsptr, hval });
                             }
                         }
                     }
@@ -2404,307 +1695,263 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
             }
             for (0..2) |tq| {
                 for (0..4) |wi| {
-                const wv = asm_.id();
-                try asm_.op(81, &.{ st.t_u32, wv, quads[tq], @intCast(wi) }); // CompositeExtract
-                var pair_vals: [2]u32 = undefined; // v2f16: bytes 0/2, bytes 1/3
-                for (0..2) |half| {
-                    var src = wv;
-                    if (half == 1) {
-                        const shd = asm_.id();
-                        try asm_.op(194, &.{ st.t_u32, shd, wv, st.c_u8 });
-                        src = shd;
+                    const wv = e.id();
+                    try e.line("%t{d} = OpCompositeExtract %u32 %t{d} {d}", .{ wv, quads[tq], wi });
+                    var pair_vals: [2]u32 = undefined;
+                    for (0..2) |half| {
+                        var src = wv;
+                        if (half == 1) {
+                            const shd = e.id();
+                            try e.line("%t{d} = OpShiftRightLogical %u32 %t{d} %c_u8", .{ shd, wv });
+                            src = shd;
+                        }
+                        const magp = e.id();
+                        try e.line("%t{d} = OpBitwiseAnd %u32 %t{d} %c_mag_mask", .{ magp, src });
+                        const sgnp = e.id();
+                        try e.line("%t{d} = OpBitwiseAnd %u32 %t{d} %c_sgn_mask", .{ sgnp, src });
+                        const mag_sh = e.id();
+                        try e.line("%t{d} = OpShiftLeftLogical %u32 %t{d} %c_u7", .{ mag_sh, magp });
+                        const sgn_sh = e.id();
+                        try e.line("%t{d} = OpShiftLeftLogical %u32 %t{d} %c_u8", .{ sgn_sh, sgnp });
+                        const hbits = e.id();
+                        try e.line("%t{d} = OpBitwiseOr %u32 %t{d} %t{d}", .{ hbits, mag_sh, sgn_sh });
+                        const hv2 = e.id();
+                        try e.line("%t{d} = OpBitcast %v2f16 %t{d}", .{ hv2, hbits });
+                        pair_vals[half] = e.id();
+                        try e.line("%t{d} = OpFMul %v2f16 %t{d} %{s}", .{ pair_vals[half], hv2, st.c_v2_256 });
                     }
-                    const magp = asm_.id();
-                    try asm_.op(199, &.{ st.t_u32, magp, src, st.c_mag_mask });
-                    const sgnp = asm_.id();
-                    try asm_.op(199, &.{ st.t_u32, sgnp, src, st.c_sgn_mask });
-                    const mag_sh = asm_.id();
-                    try asm_.op(196, &.{ st.t_u32, mag_sh, magp, st.c_u7 });
-                    const sgn_sh = asm_.id();
-                    try asm_.op(196, &.{ st.t_u32, sgn_sh, sgnp, st.c_u8 });
-                    const hbits = asm_.id();
-                    try asm_.op(197, &.{ st.t_u32, hbits, mag_sh, sgn_sh });
-                    const hv2 = asm_.id();
-                    try asm_.op(124, &.{ st.t_v2f16, hv2, hbits });
-                    pair_vals[half] = asm_.id();
-                    try asm_.op(133, &.{ st.t_v2f16, pair_vals[half], hv2, st.c_v2_256 });
-                }
-                var wbase = sbase[tq];
-                if (wi > 0) {
-                    const wb = asm_.id();
-                    try asm_.op(128, &.{ st.t_u32, wb, sbase[tq], st.c_w4[wi] });
-                    wbase = wb;
-                }
-                for (0..4) |j| {
-                    const hval = asm_.id();
-                    try asm_.op(81, &.{ st.t_f16, hval, pair_vals[j & 1], @intCast(j >> 1) });
-                    var eidx = wbase;
-                    if (j > 0) {
-                        const ei = asm_.id();
-                        try asm_.op(128, &.{ st.t_u32, ei, wbase, st.c_j[j] });
-                        eidx = ei;
+                    var wbase = sbase[tq];
+                    if (wi > 0) {
+                        const wb = e.id();
+                        try e.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ wb, sbase[tq], st.c_w4[wi] });
+                        wbase = wb;
                     }
-                    const bsptr = asm_.id();
-                    try asm_.op(65, &.{ st.t_ptr_wg_f16, bsptr, st.v_bsh, eidx });
-                    try asm_.op(62, &.{ bsptr, hval });
-                }
+                    for (0..4) |j| {
+                        const hval = e.id();
+                        try e.line("%t{d} = OpCompositeExtract %f16 %t{d} {d}", .{ hval, pair_vals[j & 1], j >> 1 });
+                        var eidx = wbase;
+                        if (j > 0) {
+                            const ei = e.id();
+                            try e.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ ei, wbase, st.c_j[j] });
+                            eidx = ei;
+                        }
+                        const bsptr = e.id();
+                        try e.line("%t{d} = OpAccessChain %ptr_wg_f16 %vbsh %t{d}", .{ bsptr, eidx });
+                        try e.line("OpStore %t{d} %t{d}", .{ bsptr, hval });
+                    }
                 }
             }
         }
     };
     const stage: Stage = .{
+        .em = &em,
         .b_f16 = b_f16,
-        .t_u32 = t_u32,
-        .t_f16 = t_f16,
-        .t_v2f16 = t_v2f16,
-        .t_ptr_wg_f16 = t_ptr_wg_f16,
-        .v_bsh = v_bsh,
-        .p_stride = p_stride,
-        .c_u0 = c_u0,
-        .c_u2 = c_u2,
-        .c_u7 = c_u7,
-        .c_u8 = c_u8,
-        .c_mag_mask = c_mag_mask,
-        .c_sgn_mask = c_sgn_mask,
-        .c_v2_256 = c_v2_256,
-        .c_j = .{ c_u0, c_u1, c_u2, c_u3 },
-        .c_j8 = .{ c_u0, c_u1, c_u2, c_u3, c_u4, c_u5, c_u6, c_u7 },
-        .c_w4 = .{ c_u0, c_u4, c_u8, c_u12 },
-        .c_u4 = c_u4,
-        .t_v4u32 = t_v4u32,
-        .t_ptr_sb4_v4 = t_ptr_sb4_v4,
-        .v_b4 = v_b4,
+        .c_v2_256 = "c_v2_256",
+        .c_j = .{ "c_u0", "c_u1", "c_u2", "c_u3" },
+        .c_j8 = .{ "c_u0", "c_u1", "c_u2", "c_u3", "c_u4", "c_u5", "c_u6", "c_u7" },
+        .c_w4 = .{ "c_u0", "c_u4", "c_u8", "c_u12" },
         .brow = brow_t,
         .bco = bco_t,
     };
 
-    // A staging: plain f16 copy into the shared A region (no decode — the
-    // scale is already folded in), same load/store split as B.
+    // A staging: plain f16 copy into the shared A region.
     const AStage = struct {
+        em: *Emit,
         aq: usize,
-        t_u32: u32,
-        t_f16: u32,
-        t_v2f16: u32,
-        t_v4u32: u32,
-        t_ptr_sb4_v4: u32,
-        v_a4: u32,
-        t_ptr_wg_f16: u32,
-        v_bsh: u32,
-        c_u0: u32,
-        c_u3: u32,
-        c_j: [8]u32,
+        c_j: [8][]const u8,
         a_inv: [4]u32,
 
-        /// aq uvec4 (128-bit) global loads of the A sub-slab whose first
-        /// k-column is `kb`.
-        fn loads(st: @This(), asm_: *Asm, kb: u32) ![4]u32 {
-            const kbq = asm_.id();
-            try asm_.op(194, &.{ st.t_u32, kbq, kb, st.c_u3 }); // kb / 8
+        fn loads(st: @This(), kb: []const u8) ![4]u32 {
+            const e = st.em;
+            const kbq = e.id();
+            try e.line("%t{d} = OpShiftRightLogical %u32 %{s} %c_u3", .{ kbq, kb }); // kb/8
             var quads: [4]u32 = undefined;
-            for (0..st.aq) |t| {
-                const qidx = asm_.id();
-                try asm_.op(128, &.{ st.t_u32, qidx, st.a_inv[t], kbq });
-                const qptr = asm_.id();
-                try asm_.op(65, &.{ st.t_ptr_sb4_v4, qptr, st.v_a4, st.c_u0, qidx });
-                quads[t] = asm_.id();
-                try asm_.op(61, &.{ st.t_v4u32, quads[t], qptr });
+            for (0..st.aq) |i| {
+                const qidx = e.id();
+                try e.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ qidx, st.a_inv[i], kbq });
+                const qptr = e.id();
+                try e.line("%t{d} = OpAccessChain %ptr_sb4_v4 %va4 %c_u0 %t{d}", .{ qptr, qidx });
+                quads[i] = e.id();
+                try e.line("%t{d} = OpLoad %v4u32 %t{d}", .{ quads[i], qptr });
             }
             return quads;
         }
 
-        /// Store the quads' 8 f16 each into the sub-slab whose per-quad
-        /// store bases are `sbase` (parity offset prefolded).
-        fn stores(st: @This(), asm_: *Asm, quads: [4]u32, sbase: [4]u32) !void {
-            for (0..st.aq) |t| {
+        fn stores(st: @This(), quads: [4]u32, sbase: [4]u32) !void {
+            const e = st.em;
+            for (0..st.aq) |i| {
                 for (0..4) |wi| {
-                    const wv = asm_.id();
-                    try asm_.op(81, &.{ st.t_u32, wv, quads[t], @intCast(wi) });
-                    const hv2 = asm_.id();
-                    try asm_.op(124, &.{ st.t_v2f16, hv2, wv }); // OpBitcast
+                    const wv = e.id();
+                    try e.line("%t{d} = OpCompositeExtract %u32 %t{d} {d}", .{ wv, quads[i], wi });
+                    const hv2 = e.id();
+                    try e.line("%t{d} = OpBitcast %v2f16 %t{d}", .{ hv2, wv });
                     for (0..2) |j| {
-                        const hval = asm_.id();
-                        try asm_.op(81, &.{ st.t_f16, hval, hv2, @intCast(j) });
-                        var eidx = sbase[t];
+                        const hval = e.id();
+                        try e.line("%t{d} = OpCompositeExtract %f16 %t{d} {d}", .{ hval, hv2, j });
+                        var eidx = sbase[i];
                         if (wi * 2 + j > 0) {
-                            const ei = asm_.id();
-                            try asm_.op(128, &.{ st.t_u32, ei, sbase[t], st.c_j[wi * 2 + j] });
+                            const ei = e.id();
+                            try e.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ ei, sbase[i], st.c_j[wi * 2 + j] });
                             eidx = ei;
                         }
-                        const bsptr = asm_.id();
-                        try asm_.op(65, &.{ st.t_ptr_wg_f16, bsptr, st.v_bsh, eidx });
-                        try asm_.op(62, &.{ bsptr, hval });
+                        const bsptr = e.id();
+                        try e.line("%t{d} = OpAccessChain %ptr_wg_f16 %vbsh %t{d}", .{ bsptr, eidx });
+                        try e.line("OpStore %t{d} %t{d}", .{ bsptr, hval });
                     }
                 }
             }
         }
     };
     const astage: AStage = .{
+        .em = &em,
         .aq = AQ,
-        .t_u32 = t_u32,
-        .t_f16 = t_f16,
-        .t_v2f16 = t_v2f16,
-        .t_v4u32 = t_v4u32,
-        .t_ptr_sb4_v4 = t_ptr_sb4_v4,
-        .v_a4 = v_a4,
-        .t_ptr_wg_f16 = t_ptr_wg_f16,
-        .v_bsh = v_bsh,
-        .c_u0 = c_u0,
-        .c_u3 = c_u3,
-        .c_j = .{ c_u0, c_u1, c_u2, c_u3, c_u4, c_u5, c_u6, c_u7 },
+        .c_j = .{ "c_u0", "c_u1", "c_u2", "c_u3", "c_u4", "c_u5", "c_u6", "c_u7" },
         .a_inv = a_inv_t,
     };
 
     // Prologue: fill sub-slab 0 with the first 32 k-rows/columns.
     {
-        const w0 = try stage.loads(&a, c_u0);
-        const x0 = try astage.loads(&a, c_u0);
-        try stage.stores(&a, w0, sbase0_t);
-        try astage.stores(&a, x0, asb0_t);
+        const w0 = try stage.loads("c_u0");
+        const x0 = try astage.loads("c_u0");
+        try stage.stores(w0, sbase0_t);
+        try astage.stores(x0, asb0_t);
     }
 
-    const lb_head = a.id();
-    const lb_cond = a.id();
-    const lb_body = a.id();
-    const lb_cont = a.id();
-    const lb_merge = a.id();
     // Pre-allocated ids for the loop-carried values (phi back-edges).
-    const k0n = a.id();
-    var acc_next: [4][4]u32 = undefined; // final MulAdd per (row block, col tile)
+    const k0n = em.id();
+    var acc_next: [4][4]u32 = undefined;
     for (&acc_next) |*row| for (row) |*v| {
-        v.* = a.id();
+        v.* = em.id();
     };
 
-    try a.op(249, &.{lb_head});
-    try a.op(248, &.{lb_head});
-    const k0v = a.id();
-    try a.op(245, &.{ t_u32, k0v, c_u0, lb_entry, k0n, lb_cont }); // OpPhi
+    try em.line("OpBranch %head", .{});
+    try em.line("%head = OpLabel", .{});
+    const k0v = em.id();
+    try em.line("%t{d} = OpPhi %u32 %c_u0 %entry %t{d} %cont", .{ k0v, k0n });
     var acc_phi: [4][4]u32 = undefined;
     for (&acc_phi, acc_next) |*prow, nrow| {
         for (prow, nrow) |*ap, an| {
-            ap.* = a.id();
-            try a.op(245, &.{ t_mat_c, ap.*, c_acc0, lb_entry, an, lb_cont });
+            ap.* = em.id();
+            try em.line("%t{d} = OpPhi %mat_c %c_acc0 %entry %t{d} %cont", .{ ap.*, an });
         }
     }
-    try a.op(246, &.{ lb_merge, lb_cont, 0 });
-    try a.op(249, &.{lb_cond});
-    try a.op(248, &.{lb_cond});
-    const cmp = a.id();
-    try a.op(176, &.{ t_bool, cmp, k0v, p_k });
-    try a.op(250, &.{ cmp, lb_body, lb_merge });
+    try em.line("OpLoopMerge %merge %cont None", .{});
+    try em.line("OpBranch %cond", .{});
+    try em.line("%cond = OpLabel", .{});
+    const cmp = em.id();
+    try em.line("%t{d} = OpULessThan %bool %t{d} %pk", .{ cmp, k0v });
+    try em.line("OpBranchConditional %t{d} %body %merge", .{cmp});
 
-    try a.op(248, &.{lb_body});
+    try em.line("%body = OpLabel", .{});
     var acc_cur = acc_phi;
     // Half-step 0: consume sub-slab 0, prefetch k0+32 into sub-slab 1.
-    try a.op(224, &.{ c_scope_wg, c_scope_wg, c_u264 }); // OpControlBarrier
-    const kb1 = a.id();
-    try a.op(128, &.{ t_u32, kb1, k0v, c_u32c });
-    const w1 = try stage.loads(&a, kb1);
-    const x1 = try astage.loads(&a, kb1);
+    try em.line("OpControlBarrier %c_scope_wg %c_scope_wg %c_u264", .{});
+    const kb1 = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %c_u32c", .{ kb1, k0v });
+    const kb1n = try nm.f("t{d}", .{kb1});
+    const w1 = try stage.loads(kb1n);
+    const x1 = try astage.loads(kb1n);
     for (0..2) |ks| {
         var ma: [4]u32 = undefined;
         for (0..4) |r| {
-            const aoff = a.id();
-            try a.op(128, &.{ t_u32, aoff, a_shbase, c_at[0][ks][r] });
-            const aptr = a.id();
-            try a.op(65, &.{ t_ptr_wg_f16, aptr, v_bsh, aoff });
-            ma[r] = a.id();
-            try a.op(4457, &.{ t_mat_a, ma[r], aptr, c_u0, c_astride });
+            const aoff = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ aoff, a_shbase, c_at[0][ks][r] });
+            const aptr = em.id();
+            try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vbsh %t{d}", .{ aptr, aoff });
+            ma[r] = em.id();
+            try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_a %t{d} %c_u0 %{s}", .{ ma[r], aptr, c_astride });
         }
         for (0..4) |nt| {
-            const boff = a.id();
-            try a.op(128, &.{ t_u32, boff, c_bt[0][ks][nt], wn64 });
-            const bptr2 = a.id();
-            try a.op(65, &.{ t_ptr_wg_f16, bptr2, v_bsh, boff });
-            const mb = a.id();
-            try a.op(4457, &.{ t_mat_b, mb, bptr2, c_u0, c_wgn });
+            const boff = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %{s} %t{d}", .{ boff, c_bt[0][ks][nt], wn64 });
+            const bptr2 = em.id();
+            try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vbsh %t{d}", .{ bptr2, boff });
+            const mb = em.id();
+            try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_b %t{d} %c_u0 %{s}", .{ mb, bptr2, c_wgn });
             for (0..4) |r| {
-                const acc_out = a.id();
-                try a.op(4459, &.{ t_mat_c, acc_out, ma[r], mb, acc_cur[r][nt] });
+                const acc_out = em.id();
+                try em.line("%t{d} = OpCooperativeMatrixMulAddKHR %mat_c %t{d} %t{d} %t{d}", .{ acc_out, ma[r], mb, acc_cur[r][nt] });
                 acc_cur[r][nt] = acc_out;
             }
         }
     }
-    try stage.stores(&a, w1, sbase1_t);
-    try astage.stores(&a, x1, asb1_t);
-    // Half-step 1: consume sub-slab 1, prefetch k0+64 (clamped to 0 on the
-    // last iteration — the garbage fill is never consumed) into sub-slab 0.
-    try a.op(224, &.{ c_scope_wg, c_scope_wg, c_u264 });
-    const kb2 = a.id();
-    try a.op(128, &.{ t_u32, kb2, k0v, c_u64 });
-    const kb2_ok = a.id();
-    try a.op(176, &.{ t_bool, kb2_ok, kb2, p_k }); // ULessThan
-    const kb2s = a.id();
-    try a.op(169, &.{ t_u32, kb2s, kb2_ok, kb2, c_u0 }); // Select
-    const w2 = try stage.loads(&a, kb2s);
-    const x2 = try astage.loads(&a, kb2s);
+    try stage.stores(w1, sbase1_t);
+    try astage.stores(x1, asb1_t);
+    // Half-step 1: consume sub-slab 1, prefetch k0+64 (clamped) into sub-slab 0.
+    try em.line("OpControlBarrier %c_scope_wg %c_scope_wg %c_u264", .{});
+    const kb2 = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %c_u64", .{ kb2, k0v });
+    const kb2_ok = em.id();
+    try em.line("%t{d} = OpULessThan %bool %t{d} %pk", .{ kb2_ok, kb2 });
+    const kb2s = em.id();
+    try em.line("%t{d} = OpSelect %u32 %t{d} %t{d} %c_u0", .{ kb2s, kb2_ok, kb2 });
+    const kb2sn = try nm.f("t{d}", .{kb2s});
+    const w2 = try stage.loads(kb2sn);
+    const x2 = try astage.loads(kb2sn);
     for (0..2) |ks| {
         var ma: [4]u32 = undefined;
         for (0..4) |r| {
-            const aoff = a.id();
-            try a.op(128, &.{ t_u32, aoff, a_shbase, c_at[1][ks][r] });
-            const aptr = a.id();
-            try a.op(65, &.{ t_ptr_wg_f16, aptr, v_bsh, aoff });
-            ma[r] = a.id();
-            try a.op(4457, &.{ t_mat_a, ma[r], aptr, c_u0, c_astride });
+            const aoff = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ aoff, a_shbase, c_at[1][ks][r] });
+            const aptr = em.id();
+            try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vbsh %t{d}", .{ aptr, aoff });
+            ma[r] = em.id();
+            try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_a %t{d} %c_u0 %{s}", .{ ma[r], aptr, c_astride });
         }
         for (0..4) |nt| {
-            const boff = a.id();
-            try a.op(128, &.{ t_u32, boff, c_bt[1][ks][nt], wn64 });
-            const bptr2 = a.id();
-            try a.op(65, &.{ t_ptr_wg_f16, bptr2, v_bsh, boff });
-            const mb = a.id();
-            try a.op(4457, &.{ t_mat_b, mb, bptr2, c_u0, c_wgn });
+            const boff = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %{s} %t{d}", .{ boff, c_bt[1][ks][nt], wn64 });
+            const bptr2 = em.id();
+            try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vbsh %t{d}", .{ bptr2, boff });
+            const mb = em.id();
+            try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_b %t{d} %c_u0 %{s}", .{ mb, bptr2, c_wgn });
             for (0..4) |r| {
-                const acc_out = if (ks == 1) acc_next[r][nt] else a.id();
-                try a.op(4459, &.{ t_mat_c, acc_out, ma[r], mb, acc_cur[r][nt] });
+                const acc_out = if (ks == 1) acc_next[r][nt] else em.id();
+                try em.line("%t{d} = OpCooperativeMatrixMulAddKHR %mat_c %t{d} %t{d} %t{d}", .{ acc_out, ma[r], mb, acc_cur[r][nt] });
                 acc_cur[r][nt] = acc_out;
             }
         }
     }
-    try stage.stores(&a, w2, sbase0_t);
-    try astage.stores(&a, x2, asb0_t);
-    try a.op(249, &.{lb_cont});
+    try stage.stores(w2, sbase0_t);
+    try astage.stores(x2, asb0_t);
+    try em.line("OpBranch %cont", .{});
 
-    try a.op(248, &.{lb_cont});
-    try a.op(128, &.{ t_u32, k0n, k0v, c_u64 });
-    try a.op(249, &.{lb_head});
+    try em.line("%cont = OpLabel", .{});
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %c_u64", .{ k0n, k0v });
+    try em.line("OpBranch %head", .{});
 
     // merge: store 4x4 C tiles at (row_s + r*16, col_s + nt*16)
-    try a.op(248, &.{lb_merge});
-    const rn16 = a.id();
-    try a.op(132, &.{ t_u32, rn16, c_u16, p_n });
-    var c_rowmul = a.id();
-    try a.op(132, &.{ t_u32, c_rowmul, row_s, p_n });
+    try em.line("%merge = OpLabel", .{});
+    const rn16 = em.id();
+    try em.line("%t{d} = OpIMul %u32 %c_u16 %pn", .{rn16});
+    var c_rowmul = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %pn", .{ c_rowmul, row_s });
     for (0..4) |r| {
         if (r > 0) {
-            const nx = a.id();
-            try a.op(128, &.{ t_u32, nx, c_rowmul, rn16 });
+            const nx = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ nx, c_rowmul, rn16 });
             c_rowmul = nx;
         }
         for (0..4) |nt| {
-            const ccol = a.id();
-            try a.op(128, &.{ t_u32, ccol, col_s, c_col16[nt] });
-            const cbase = a.id();
-            try a.op(128, &.{ t_u32, cbase, c_rowmul, ccol });
-            const cptr = a.id();
-            try a.op(65, &.{ t_ptr_sc_f32, cptr, v_c, c_u0, cbase });
+            const ccol = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ ccol, col_s, c_col16[nt] });
+            const cbase = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ cbase, c_rowmul, ccol });
+            const cptr = em.id();
+            try em.line("%t{d} = OpAccessChain %ptr_sc_f32 %vc %c_u0 %t{d}", .{ cptr, cbase });
             var cval = acc_phi[r][nt];
             if (acc_h16 and !c_h16) {
-                // f16 accumulators store through an f32 conversion.
-                const cv = a.id();
-                try a.op(115, &.{ t_mat_c32, cv, cval }); // OpFConvert
+                const cv = em.id();
+                try em.line("%t{d} = OpFConvert %mat_c32 %t{d}", .{ cv, cval });
                 cval = cv;
             }
-            try a.op(4458, &.{ cptr, cval, c_u0, p_n });
+            try em.line("OpCooperativeMatrixStoreKHR %t{d} %t{d} %c_u0 %pn", .{ cptr, cval });
         }
     }
-    try a.op(253, &.{});
-    try a.op(56, &.{});
+    try em.line("OpReturn", .{});
+    try em.line("OpFunctionEnd", .{});
 
-    a.words.items[3] = a.next;
-    const out = try gpa.alignedAlloc(u8, .of(u32), a.words.items.len * 4);
-    @memcpy(out, std.mem.sliceAsBytes(a.words.items));
-    return out;
+    return sasm.assembleChecked(gpa, sasm.version_1_5, t.items);
 }
 
 /// K staging for buildGemmScores: measured NEUTRAL at DiT/VAE shapes
@@ -2733,543 +1980,428 @@ pub const scores_stage_k = false;
 pub fn buildGemmScores(gpa: std.mem.Allocator, hd: u32, stage_k: bool) ![]align(4) u8 {
     std.debug.assert(hd % 16 == 0 and hd >= 64);
     std.debug.assert(!stage_k or hd % 64 == 0);
-    var a: Asm = .{ .gpa = gpa };
-    defer a.words.deinit(gpa);
 
-    const main_fn = a.id();
-    const gid_var = a.id();
-    const lid_var = a.id();
-    const t_void = a.id();
-    const t_fnvoid = a.id();
-    const t_u32 = a.id();
-    const t_f16 = a.id();
-    const t_f32 = a.id();
-    const t_v3u = a.id();
-    const t_ptr_in_v3 = a.id();
-    const c_arrlen = a.id();
-    const t_arr_f16 = a.id();
-    const t_arr_f32b = a.id(); // second f16 array (distinct id for S)
-    const t_sk = a.id(); // struct { [N]f16 } (K)
-    const t_sq = a.id(); // struct { [N]f16 } (Q)
-    const t_ss = a.id(); // struct { [N]f16 } (S, half-precision scores)
-    const t_ptr_sk = a.id();
-    const t_ptr_sq = a.id();
-    const t_ptr_ss = a.id();
-    const v_k = a.id();
-    const v_q = a.id();
-    const v_s = a.id();
-    const t_push = a.id();
-    const t_ptr_push = a.id();
-    const v_push = a.id();
-    const t_ptr_pc_u32 = a.id();
-    const t_ptr_sk_f16 = a.id();
-    const t_ptr_sq_f16 = a.id();
-    const t_ptr_ss_f32 = a.id();
-    // u32 view of S (bound again at binding 3) for the coalesced copy-out,
-    // plus the 128x128 f16 workgroup bounce slab.
-    const t_arr_u32s = a.id();
-    const t_ss4 = a.id();
-    const t_ptr_ss4 = a.id();
-    const v_s4 = a.id();
-    const t_ptr_ss4_u32 = a.id();
-    const t_v2f16 = a.id();
-    const c_ssh_len = a.id();
-    const t_ssh = a.id();
-    const t_ptr_wg_ssh = a.id();
-    const v_ssh = a.id();
-    const t_ptr_wg_f16 = a.id();
+    var t: std.ArrayList(u8) = .empty;
+    defer t.deinit(gpa);
+    var em = Emit{ .w = &t, .gpa = gpa };
 
-    const c_u0 = a.id();
-    const c_u1 = a.id();
-    const c_u2 = a.id();
-    const c_u3 = a.id();
-    const c_u4 = a.id();
-    const c_u5 = a.id();
-    const c_u6 = a.id();
-    const c_u63 = a.id();
-    const c_u16 = a.id();
-    const c_u32c = a.id();
-    const c_u64 = a.id();
-    const c_u128 = a.id();
-    const c_u264 = a.id();
-    const c_scope_sub = a.id();
-    const c_scope_wg = a.id();
-    const t_mat_a = a.id();
-    const t_mat_b = a.id();
-    const t_mat_c = a.id();
-    const t_mat_h = a.id(); // f16 store type: S is written half-precision
-    const c_f32_0 = a.id();
-    const c_acc0 = a.id();
-
-    try a.words.appendSlice(gpa, &.{ 0x0723_0203, 0x0001_0500, 0, 0, 0 });
-    try a.op(17, &.{1});
-    try a.op(17, &.{9});
-    try a.op(17, &.{5345});
-    try a.op(17, &.{6022});
-    try a.opStr(10, &.{}, "SPV_KHR_cooperative_matrix");
-    try a.opStr(10, &.{}, "SPV_KHR_vulkan_memory_model");
-    try a.opStr(10, &.{}, "SPV_KHR_16bit_storage");
-    try a.op(14, &.{ 0, 3 });
-    {
-        var buf: std.ArrayList(u32) = .empty;
-        defer buf.deinit(gpa);
-        try buf.appendSlice(gpa, &.{ 5, main_fn });
-        try buf.appendSlice(gpa, &.{ std.mem.bytesToValue(u32, "main"), 0 });
-        try buf.appendSlice(gpa, &.{ gid_var, lid_var, v_k, v_q, v_s, v_s4, v_push, v_ssh });
-        try a.op(15, buf.items);
+    var names: std.ArrayList([]u8) = .empty;
+    defer {
+        for (names.items) |s| gpa.free(s);
+        names.deinit(gpa);
     }
-    try a.op(16, &.{ main_fn, 17, 32, 4, 1 }); // LocalSize 32 4 1
+    const Nm = struct {
+        nl: *std.ArrayList([]u8),
+        g: std.mem.Allocator,
+        fn f(self: @This(), comptime fmt: []const u8, args: anytype) ![]const u8 {
+            const s = try std.fmt.allocPrint(self.g, fmt, args);
+            try self.nl.append(self.g, s);
+            return s;
+        }
+    };
+    const nm = Nm{ .nl = &names, .g = gpa };
 
-    try a.op(71, &.{ gid_var, 11, 26 }); // WorkgroupId
-    try a.op(71, &.{ lid_var, 11, 27 }); // LocalInvocationId
-    try a.op(71, &.{ t_arr_f16, 6, 2 });
-    try a.op(71, &.{ t_arr_f32b, 6, 2 }); // S is stored f16
-    try a.op(71, &.{ t_arr_u32s, 6, 4 });
-    inline for (.{ t_sk, t_sq, t_ss, t_ss4 }) |t| {
-        try a.op(71, &.{ t, 2 });
-        try a.op(72, &.{ t, 0, 35, 0 });
+    // --- header ---
+    try em.line("OpCapability Shader", .{});
+    try em.line("OpCapability Float16", .{});
+    try em.line("OpCapability VulkanMemoryModel", .{});
+    try em.line("OpCapability CooperativeMatrixKHR", .{});
+    try em.line("OpExtension \"SPV_KHR_cooperative_matrix\"", .{});
+    try em.line("OpExtension \"SPV_KHR_vulkan_memory_model\"", .{});
+    try em.line("OpExtension \"SPV_KHR_16bit_storage\"", .{});
+    try em.line("OpMemoryModel Logical Vulkan", .{});
+    try em.line("OpEntryPoint GLCompute %main \"main\" %gid %lid %vk %vq %vs %vs4 %vpush %vssh", .{});
+    try em.line("OpExecutionMode %main LocalSize 32 4 1", .{});
+
+    // --- decorations ---
+    try em.line("OpDecorate %gid BuiltIn WorkgroupId", .{});
+    try em.line("OpDecorate %lid BuiltIn LocalInvocationId", .{});
+    try em.line("OpDecorate %arr_f16 ArrayStride 2", .{});
+    try em.line("OpDecorate %arr_f16s ArrayStride 2", .{});
+    try em.line("OpDecorate %arr_u32s ArrayStride 4", .{});
+    for ([_][]const u8{ "sk", "sq", "ss", "ss4" }) |s| {
+        try em.line("OpDecorate %{s} Block", .{s});
+        try em.line("OpMemberDecorate %{s} 0 Offset 0", .{s});
     }
-    try a.op(71, &.{ t_push, 2 });
-    inline for (0..8) |m| {
-        try a.op(72, &.{ t_push, @intCast(m), 35, @intCast(m * 4) });
+    try em.line("OpDecorate %push Block", .{});
+    for (0..8) |m| try em.line("OpMemberDecorate %push {d} Offset {d}", .{ m, m * 4 });
+    for ([_][]const u8{ "vk", "vq", "vs" }, 0..) |v, b| {
+        try em.line("OpDecorate %{s} DescriptorSet 0", .{v});
+        try em.line("OpDecorate %{s} Binding {d}", .{ v, b });
     }
-    inline for (.{ v_k, v_q, v_s }, 0..) |v, binding| {
-        try a.op(71, &.{ v, 34, 0 });
-        try a.op(71, &.{ v, 33, @intCast(binding) });
-    }
-    try a.op(71, &.{ v_s4, 34, 0 });
-    try a.op(71, &.{ v_s4, 33, 3 });
+    try em.line("OpDecorate %vs4 DescriptorSet 0", .{});
+    try em.line("OpDecorate %vs4 Binding 3", .{});
 
-    try a.op(19, &.{t_void});
-    try a.op(33, &.{ t_fnvoid, t_void });
-    try a.op(21, &.{ t_u32, 32, 0 });
-    try a.op(22, &.{ t_f16, 16 });
-    try a.op(22, &.{ t_f32, 32 });
-    try a.op(23, &.{ t_v3u, t_u32, 3 });
-    try a.op(32, &.{ t_ptr_in_v3, 1, t_v3u });
-    try a.op(59, &.{ t_ptr_in_v3, gid_var, 1 });
-    try a.op(59, &.{ t_ptr_in_v3, lid_var, 1 });
+    // --- types ---
+    try em.line("%void = OpTypeVoid", .{});
+    try em.line("%fnvoid = OpTypeFunction %void", .{});
+    try em.line("%u32 = OpTypeInt 32 0", .{});
+    try em.line("%f16 = OpTypeFloat 16", .{});
+    try em.line("%f32 = OpTypeFloat 32", .{});
+    try em.line("%v3u = OpTypeVector %u32 3", .{});
+    try em.line("%ptr_in_v3 = OpTypePointer Input %v3u", .{});
+    try em.line("%gid = OpVariable %ptr_in_v3 Input", .{});
+    try em.line("%lid = OpVariable %ptr_in_v3 Input", .{});
+    try em.line("%c_arrlen = OpConstant %u32 268435456", .{});
+    try em.line("%arr_f16 = OpTypeArray %f16 %c_arrlen", .{});
+    try em.line("%arr_f16s = OpTypeArray %f16 %c_arrlen", .{});
+    try em.line("%arr_u32s = OpTypeArray %u32 %c_arrlen", .{});
+    try em.line("%sk = OpTypeStruct %arr_f16", .{});
+    try em.line("%sq = OpTypeStruct %arr_f16", .{});
+    try em.line("%ss = OpTypeStruct %arr_f16s", .{});
+    try em.line("%ss4 = OpTypeStruct %arr_u32s", .{});
+    try em.line("%ptr_sk = OpTypePointer StorageBuffer %sk", .{});
+    try em.line("%ptr_sq = OpTypePointer StorageBuffer %sq", .{});
+    try em.line("%ptr_ss = OpTypePointer StorageBuffer %ss", .{});
+    try em.line("%ptr_ss4 = OpTypePointer StorageBuffer %ss4", .{});
+    try em.line("%vk = OpVariable %ptr_sk StorageBuffer", .{});
+    try em.line("%vq = OpVariable %ptr_sq StorageBuffer", .{});
+    try em.line("%vs = OpVariable %ptr_ss StorageBuffer", .{});
+    try em.line("%vs4 = OpVariable %ptr_ss4 StorageBuffer", .{});
+    try em.line("%v2f16 = OpTypeVector %f16 2", .{});
+    try em.line("%push = OpTypeStruct %u32 %u32 %u32 %u32 %u32 %u32 %u32 %u32", .{});
+    try em.line("%ptr_push = OpTypePointer PushConstant %push", .{});
+    try em.line("%vpush = OpVariable %ptr_push PushConstant", .{});
+    try em.line("%ptr_pc_u32 = OpTypePointer PushConstant %u32", .{});
+    try em.line("%ptr_sk_f16 = OpTypePointer StorageBuffer %f16", .{});
+    try em.line("%ptr_sq_f16 = OpTypePointer StorageBuffer %f16", .{});
+    try em.line("%ptr_ss_f32 = OpTypePointer StorageBuffer %f16", .{});
+    try em.line("%ptr_ss4_u32 = OpTypePointer StorageBuffer %u32", .{});
 
-    try a.op(43, &.{ t_u32, c_arrlen, 1 << 28 });
-    try a.op(28, &.{ t_arr_f16, t_f16, c_arrlen });
-    try a.op(28, &.{ t_arr_f32b, t_f16, c_arrlen });
-    try a.op(28, &.{ t_arr_u32s, t_u32, c_arrlen });
-    try a.op(30, &.{ t_sk, t_arr_f16 });
-    try a.op(30, &.{ t_sq, t_arr_f16 });
-    try a.op(30, &.{ t_ss, t_arr_f32b });
-    try a.op(30, &.{ t_ss4, t_arr_u32s });
-    try a.op(32, &.{ t_ptr_sk, 12, t_sk });
-    try a.op(32, &.{ t_ptr_sq, 12, t_sq });
-    try a.op(32, &.{ t_ptr_ss, 12, t_ss });
-    try a.op(32, &.{ t_ptr_ss4, 12, t_ss4 });
-    try a.op(59, &.{ t_ptr_sk, v_k, 12 });
-    try a.op(59, &.{ t_ptr_sq, v_q, 12 });
-    try a.op(59, &.{ t_ptr_ss, v_s, 12 });
-    try a.op(59, &.{ t_ptr_ss4, v_s4, 12 });
-    try a.op(23, &.{ t_v2f16, t_f16, 2 });
-    // Push block: 8 words (u0..u5, f0, f1) to match the eltwise layout.
-    try a.op(30, &.{ t_push, t_u32, t_u32, t_u32, t_u32, t_u32, t_u32, t_u32, t_u32 });
-    try a.op(32, &.{ t_ptr_push, 9, t_push });
-    try a.op(59, &.{ t_ptr_push, v_push, 9 });
-    try a.op(32, &.{ t_ptr_pc_u32, 9, t_u32 });
-    try a.op(32, &.{ t_ptr_sk_f16, 12, t_f16 });
-    try a.op(32, &.{ t_ptr_sq_f16, 12, t_f16 });
-    try a.op(32, &.{ t_ptr_ss_f32, 12, t_f16 });
-    try a.op(32, &.{ t_ptr_ss4_u32, 12, t_u32 });
+    // Workgroup bounce slab: [128][128] f16.
+    try em.line("%c_ssh_len = OpConstant %u32 16384", .{});
+    try em.line("%t_ssh = OpTypeArray %f16 %c_ssh_len", .{});
+    try em.line("%ptr_wg_ssh = OpTypePointer Workgroup %t_ssh", .{});
+    try em.line("%vssh = OpVariable %ptr_wg_ssh Workgroup", .{});
+    try em.line("%ptr_wg_f16 = OpTypePointer Workgroup %f16", .{});
 
-    // Workgroup bounce slab (no layout decorations): [128][128] f16.
-    try a.op(43, &.{ t_u32, c_ssh_len, 16384 });
-    try a.op(28, &.{ t_ssh, t_f16, c_ssh_len });
-    try a.op(32, &.{ t_ptr_wg_ssh, 4, t_ssh });
-    try a.op(59, &.{ t_ptr_wg_ssh, v_ssh, 4 });
-    try a.op(32, &.{ t_ptr_wg_f16, 4, t_f16 });
+    for ([_]struct { []const u8, u32 }{
+        .{ "c_u0", 0 },  .{ "c_u1", 1 },   .{ "c_u2", 2 },     .{ "c_u3", 3 },
+        .{ "c_u4", 4 },  .{ "c_u5", 5 },   .{ "c_u6", 6 },     .{ "c_u63", 63 },
+        .{ "c_u16", 16 }, .{ "c_u32c", 32 }, .{ "c_u64", 64 }, .{ "c_u128", 128 },
+        .{ "c_u264", 0x108 }, .{ "c_scope_sub", 3 }, .{ "c_scope_wg", 2 },
+    }) |cv| try em.line("%{s} = OpConstant %u32 {d}", .{ cv[0], cv[1] });
 
-    try a.op(43, &.{ t_u32, c_u0, 0 });
-    try a.op(43, &.{ t_u32, c_u1, 1 });
-    try a.op(43, &.{ t_u32, c_u2, 2 });
-    try a.op(43, &.{ t_u32, c_u3, 3 });
-    try a.op(43, &.{ t_u32, c_u4, 4 });
-    try a.op(43, &.{ t_u32, c_u5, 5 });
-    try a.op(43, &.{ t_u32, c_u6, 6 });
-    try a.op(43, &.{ t_u32, c_u63, 63 });
-    try a.op(43, &.{ t_u32, c_u16, 16 });
-    try a.op(43, &.{ t_u32, c_u32c, 32 });
-    try a.op(43, &.{ t_u32, c_u64, 64 });
-    try a.op(43, &.{ t_u32, c_u128, 128 });
-    try a.op(43, &.{ t_u32, c_u264, 0x108 });
-    try a.op(43, &.{ t_u32, c_scope_sub, 3 });
-    try a.op(43, &.{ t_u32, c_scope_wg, 2 });
-
-    try a.op(4456, &.{ t_mat_a, t_f16, c_scope_sub, c_u16, c_u16, c_u0 });
-    try a.op(4456, &.{ t_mat_b, t_f16, c_scope_sub, c_u16, c_u16, c_u1 });
-    try a.op(4456, &.{ t_mat_c, t_f32, c_scope_sub, c_u16, c_u16, c_u2 });
-    try a.op(4456, &.{ t_mat_h, t_f16, c_scope_sub, c_u16, c_u16, c_u2 });
-    try a.op(43, &.{ t_f32, c_f32_0, 0 });
-    try a.op(44, &.{ t_mat_c, c_acc0, c_f32_0 });
+    try em.line("%mat_a = OpTypeCooperativeMatrixKHR %f16 %c_scope_sub %c_u16 %c_u16 %c_u0", .{});
+    try em.line("%mat_b = OpTypeCooperativeMatrixKHR %f16 %c_scope_sub %c_u16 %c_u16 %c_u1", .{});
+    try em.line("%mat_c = OpTypeCooperativeMatrixKHR %f32 %c_scope_sub %c_u16 %c_u16 %c_u2", .{});
+    try em.line("%mat_h = OpTypeCooperativeMatrixKHR %f16 %c_scope_sub %c_u16 %c_u16 %c_u2", .{});
+    try em.line("%c_f32_0 = OpConstant %f32 0", .{});
+    try em.line("%c_acc0 = OpConstantComposite %mat_c %c_f32_0", .{});
 
     // ks*16 k-offsets up to hd (also reused as nt*16 column offsets).
-    const c_k16 = try gpa.alloc(u32, @max(hd / 16, 4));
+    const klen = @max(hd / 16, 4);
+    const c_k16 = try gpa.alloc([]const u8, klen);
     defer gpa.free(c_k16);
-    c_k16[0] = c_u0;
-    c_k16[1] = c_u16;
-    c_k16[2] = c_u32c;
-    for (3..c_k16.len) |i| {
+    c_k16[0] = "c_u0";
+    c_k16[1] = "c_u16";
+    c_k16[2] = "c_u32c";
+    for (3..klen) |i| {
         if (i * 16 == 128) {
-            c_k16[i] = c_u128;
+            c_k16[i] = "c_u128";
             continue;
         }
-        c_k16[i] = a.id();
-        try a.op(43, &.{ t_u32, c_k16[i], @intCast(i * 16) });
+        try em.line("%c_k16_{d} = OpConstant %u32 {d}", .{ i, @as(u32, @intCast(i * 16)) });
+        c_k16[i] = try nm.f("c_k16_{d}", .{i});
     }
     const c_hd = switch (hd) {
-        128 => c_u128,
-        64 => c_u64,
+        128 => "c_u128",
+        64 => "c_u64",
         else => blk: {
-            const c = a.id();
-            try a.op(43, &.{ t_u32, c, hd });
-            break :blk c;
+            try em.line("%c_hd = OpConstant %u32 {d}", .{hd});
+            break :blk "c_hd";
         },
     };
     // s_sh tile offsets within the bounce slab: r*16*128 + nt*16.
-    var c_st: [4][4]u32 = undefined;
-    for (0..4) |r| {
-        for (0..4) |nt| {
-            if (r == 0) {
-                c_st[r][nt] = c_k16[nt];
-            } else {
-                c_st[r][nt] = a.id();
-                try a.op(43, &.{ t_u32, c_st[r][nt], @intCast(r * 2048 + nt * 16) });
-            }
+    var c_st: [4][4][]const u8 = undefined;
+    for (0..4) |r| for (0..4) |nt| {
+        if (r == 0) {
+            c_st[r][nt] = c_k16[nt];
+        } else {
+            try em.line("%c_st_{d}_{d} = OpConstant %u32 {d}", .{ r, nt, @as(u32, @intCast(r * 2048 + nt * 16)) });
+            c_st[r][nt] = try nm.f("c_st_{d}_{d}", .{ r, nt });
         }
-    }
-    // 256 = 16*16 already exists in c_k16 for wide-hd builds.
-    const c_u256 = if (c_k16.len > 16) c_k16[16] else blk: {
-        const c = a.id();
-        try a.op(43, &.{ t_u32, c, 256 });
-        break :blk c;
+    };
+    const c_u256 = if (klen > 16) c_k16[16] else blk: {
+        try em.line("%c_u256 = OpConstant %u32 256", .{});
+        break :blk "c_u256";
     };
 
     // --- function (straight-line) ---
-    const lb_entry = a.id();
-    try a.op(54, &.{ t_void, main_fn, 0, t_fnvoid });
-    try a.op(248, &.{lb_entry});
+    try em.line("%main = OpFunction %void None %fnvoid", .{});
+    try em.line("%entry = OpLabel", .{});
 
-    const gidv = a.id();
-    try a.op(61, &.{ t_v3u, gidv, gid_var });
-    const tile_c = a.id();
-    const tile_r = a.id();
-    const zidx = a.id();
-    try a.op(81, &.{ t_u32, tile_c, gidv, 0 });
-    try a.op(81, &.{ t_u32, tile_r, gidv, 1 });
-    try a.op(81, &.{ t_u32, zidx, gidv, 2 });
-    const col0 = a.id();
-    const row0 = a.id();
-    try a.op(132, &.{ t_u32, col0, tile_c, c_u128 });
-    try a.op(132, &.{ t_u32, row0, tile_r, c_u128 });
+    const gidv = em.id();
+    try em.line("%t{d} = OpLoad %v3u %gid", .{gidv});
+    const tile_c = em.id();
+    try em.line("%t{d} = OpCompositeExtract %u32 %t{d} 0", .{ tile_c, gidv });
+    const tile_r = em.id();
+    try em.line("%t{d} = OpCompositeExtract %u32 %t{d} 1", .{ tile_r, gidv });
+    const zidx = em.id();
+    try em.line("%t{d} = OpCompositeExtract %u32 %t{d} 2", .{ zidx, gidv });
+    const col0 = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %c_u128", .{ col0, tile_c });
+    const row0 = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %c_u128", .{ row0, tile_r });
 
-    const lidv = a.id();
-    try a.op(61, &.{ t_v3u, lidv, lid_var });
-    const lx = a.id();
-    const ly = a.id();
-    try a.op(81, &.{ t_u32, lx, lidv, 0 });
-    try a.op(81, &.{ t_u32, ly, lidv, 1 });
-    const flat = a.id(); // ly*32 + lx, 0..127
-    const lymul = a.id();
-    try a.op(132, &.{ t_u32, lymul, ly, c_u32c });
-    try a.op(128, &.{ t_u32, flat, lymul, lx });
+    const lidv = em.id();
+    try em.line("%t{d} = OpLoad %v3u %lid", .{lidv});
+    const lx = em.id();
+    try em.line("%t{d} = OpCompositeExtract %u32 %t{d} 0", .{ lx, lidv });
+    const ly = em.id();
+    try em.line("%t{d} = OpCompositeExtract %u32 %t{d} 1", .{ ly, lidv });
+    const lymul = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %c_u32c", .{ lymul, ly });
+    const flat = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ flat, lymul, lx });
 
-    var push_vals: [6]u32 = undefined;
-    inline for (0..6) |m| {
-        const pptr = a.id();
-        const pval = a.id();
-        const cidx = switch (m) {
-            0 => c_u0,
-            1 => c_u1,
-            2 => c_u2,
-            3 => c_u3,
-            4 => c_u4,
-            else => c_u5,
-        };
-        try a.op(65, &.{ t_ptr_pc_u32, pptr, v_push, cidx });
-        try a.op(61, &.{ t_u32, pval, pptr });
-        push_vals[m] = pval;
+    const pnames = [_][]const u8{ "pqstride", "psstride", "pheadoff", "pgroup", "pkhead", "psplane" };
+    for (0..6) |m| {
+        const pptr = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_pc_u32 %vpush %c_u{d}", .{ pptr, m });
+        try em.line("%{s} = OpLoad %u32 %t{d}", .{ pnames[m], pptr });
     }
-    const p_qstride = push_vals[0];
-    const p_sstride = push_vals[1];
-    const p_headoff = push_vals[2];
-    const p_group = push_vals[3];
-    const p_khead = push_vals[4];
-    const p_splane = push_vals[5];
 
     // head = head_off + z; kv = head / group.
-    const head = a.id();
-    try a.op(128, &.{ t_u32, head, p_headoff, zidx });
-    const kvh = a.id();
-    try a.op(134, &.{ t_u32, kvh, head, p_group }); // UDiv
+    const head = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %pheadoff %t{d}", .{ head, zidx });
+    const kvh = em.id();
+    try em.line("%t{d} = OpUDiv %u32 %t{d} %pgroup", .{ kvh, head });
 
-    // Warp tiling: 2x2 grid of 64x64 tiles — 4 A x 4 B fragments feed 16
-    // MMAs per k-step (all loads are global here, so halving them matters
-    // double).
-    const warp_m = a.id();
-    try a.op(199, &.{ t_u32, warp_m, ly, c_u1 }); // ly & 1
-    const warp_n = a.id();
-    try a.op(194, &.{ t_u32, warp_n, ly, c_u1 }); // ly >> 1
-    const wm64 = a.id();
-    try a.op(132, &.{ t_u32, wm64, warp_m, c_u64 });
-    const row_s = a.id();
-    try a.op(128, &.{ t_u32, row_s, row0, wm64 });
-    const wn64 = a.id();
-    try a.op(132, &.{ t_u32, wn64, warp_n, c_u64 });
-    const col_w = a.id();
-    try a.op(128, &.{ t_u32, col_w, col0, wn64 });
+    // Warp tiling: 2x2 grid of 64x64 tiles.
+    const warp_m = em.id();
+    try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %c_u1", .{ warp_m, ly });
+    const warp_n = em.id();
+    try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %c_u1", .{ warp_n, ly });
+    const wm64 = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %c_u64", .{ wm64, warp_m });
+    const row_s = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ row_s, row0, wm64 });
+    const wn64 = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %c_u64", .{ wn64, warp_n });
+    const col_w = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ col_w, col0, wn64 });
 
     // A (Q) base: row_s*q_stride + head*hd; row stride q_stride.
-    const a_rowmul = a.id();
-    try a.op(132, &.{ t_u32, a_rowmul, row_s, p_qstride });
-    const headmul = a.id();
-    try a.op(132, &.{ t_u32, headmul, head, c_hd });
-    const a_base = a.id();
-    try a.op(128, &.{ t_u32, a_base, a_rowmul, headmul });
-    const a_row16 = a.id();
-    try a.op(132, &.{ t_u32, a_row16, c_u16, p_qstride });
+    const a_rowmul = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %pqstride", .{ a_rowmul, row_s });
+    const headmul = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %{s}", .{ headmul, head, c_hd });
+    const a_base = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ a_base, a_rowmul, headmul });
+    const a_row16 = em.id();
+    try em.line("%t{d} = OpIMul %u32 %c_u16 %pqstride", .{a_row16});
 
-    // K block base: kv*k_head_stride. The global-load path folds col_w in
-    // below; the staged path addresses the whole 128-col tile from col0.
-    const kvmul = a.id();
-    try a.op(132, &.{ t_u32, kvmul, kvh, p_khead });
+    // K block base: kv*k_head_stride.
+    const kvmul = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %pkhead", .{ kvmul, kvh });
 
-    // Copy-out invariants: thread `flat` writes u32 words w = flat + i*128
-    // of the wg's 128x128 f16 tile (word w = slab row w/64, f16 columns
-    // (w%64)*2 — consecutive lanes write consecutive global words). The low
-    // 6 bits of w never change across i, so the f16 column pair and the
-    // global/shared bases are loop-invariant with fixed steps.
-    const zmul = a.id();
-    try a.op(132, &.{ t_u32, zmul, zidx, p_splane });
-    const srow0 = a.id();
-    try a.op(194, &.{ t_u32, srow0, flat, c_u6 }); // flat / 64
-    const scol2 = a.id();
-    const fmask = a.id();
-    try a.op(199, &.{ t_u32, fmask, flat, c_u63 });
-    try a.op(196, &.{ t_u32, scol2, fmask, c_u1 }); // * 2
-    const grow0 = a.id();
-    try a.op(128, &.{ t_u32, grow0, row0, srow0 });
-    const growmul = a.id();
-    try a.op(132, &.{ t_u32, growmul, grow0, p_sstride });
-    const gsum0 = a.id();
-    try a.op(128, &.{ t_u32, gsum0, zmul, growmul });
-    const gsum1 = a.id();
-    try a.op(128, &.{ t_u32, gsum1, gsum0, col0 });
-    const gsum2 = a.id();
-    try a.op(128, &.{ t_u32, gsum2, gsum1, scol2 });
-    const gword0 = a.id();
-    try a.op(194, &.{ t_u32, gword0, gsum2, c_u1 }); // f16 elems -> u32 words
-    const erow = a.id();
-    try a.op(132, &.{ t_u32, erow, srow0, c_u128 });
-    const e0 = a.id();
-    try a.op(128, &.{ t_u32, e0, erow, scol2 });
+    // Copy-out invariants.
+    const zmul = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %psplane", .{ zmul, zidx });
+    const srow0 = em.id();
+    try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %c_u6", .{ srow0, flat }); // flat / 64
+    const fmask = em.id();
+    try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %c_u63", .{ fmask, flat });
+    const scol2 = em.id();
+    try em.line("%t{d} = OpShiftLeftLogical %u32 %t{d} %c_u1", .{ scol2, fmask }); // * 2
+    const grow0 = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ grow0, row0, srow0 });
+    const growmul = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %psstride", .{ growmul, grow0 });
+    const gsum0 = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ gsum0, zmul, growmul });
+    const gsum1 = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ gsum1, gsum0, col0 });
+    const gsum2 = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ gsum2, gsum1, scol2 });
+    const gword0 = em.id();
+    try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %c_u1", .{ gword0, gsum2 });
+    const erow = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %c_u128", .{ erow, srow0 });
+    const e0 = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ e0, erow, scol2 });
 
-    // acc[r][nt] over hd/16 unrolled k-steps.
-    var acc: [4][4]u32 = undefined;
+    // acc[r][nt] as reference names (init to the zero composite).
+    var acc: [4][4][]const u8 = undefined;
     for (&acc) |*row| for (row) |*v| {
-        v.* = c_acc0;
+        v.* = "c_acc0";
     };
     if (stage_k) {
-        // K staged through the bounce slab: the 32 KB S tile is dead until
-        // after the MMAs, so its first 16 KB holds each 64-deep K slab and
-        // the B fragment loads become ldmatrix-from-shared — no extra
-        // workgroup memory, occupancy unchanged. (The global K fragment
-        // loads were the ~1 TF/s bottleneck: 12-15 KB row strides.)
-        //
-        // Staging reuses the copy-out invariants: thread `flat` owns slab
-        // rows srow0, srow0+2, ... and the f16 column pair at scol2; the
-        // matching global elements are kvmul + (k0+row)*s_stride + col0 +
-        // scol2 (two scalar f16 loads — all four bindings are taken, so
-        // there is no u32 view of K to pair-load through).
-        const kbase0 = a.id();
-        try a.op(128, &.{ t_u32, kbase0, kvmul, col0 });
-        const kbase = a.id();
-        try a.op(128, &.{ t_u32, kbase, kbase0, scol2 });
-        const c2s = a.id();
-        try a.op(128, &.{ t_u32, c2s, p_sstride, p_sstride }); // 2 rows/iter
+        const kbase0 = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ kbase0, kvmul, col0 });
+        const kbase = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ kbase, kbase0, scol2 });
+        const c2s = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %psstride %psstride", .{c2s}); // 2 rows/iter
         for (0..hd / 64) |s| {
-            // Stage K rows s*64 .. s*64+64 of the per-head k-major block.
-            const krow = a.id();
-            try a.op(128, &.{ t_u32, krow, c_k16[s * 4], srow0 });
-            const krowmul = a.id();
-            try a.op(132, &.{ t_u32, krowmul, krow, p_sstride });
-            var g = a.id();
-            try a.op(128, &.{ t_u32, g, kbase, krowmul });
+            const krow = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %{s} %t{d}", .{ krow, c_k16[s * 4], srow0 });
+            const krowmul = em.id();
+            try em.line("%t{d} = OpIMul %u32 %t{d} %psstride", .{ krowmul, krow });
+            var g = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ g, kbase, krowmul });
             var e = e0;
             for (0..32) |i| {
                 if (i > 0) {
-                    const gn = a.id();
-                    try a.op(128, &.{ t_u32, gn, g, c2s });
+                    const gn = em.id();
+                    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ gn, g, c2s });
                     g = gn;
-                    const en = a.id();
-                    try a.op(128, &.{ t_u32, en, e, c_u256 });
+                    const en = em.id();
+                    try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ en, e, c_u256 });
                     e = en;
                 }
-                const g1 = a.id();
-                try a.op(128, &.{ t_u32, g1, g, c_u1 });
-                const e1 = a.id();
-                try a.op(128, &.{ t_u32, e1, e, c_u1 });
+                const g1 = em.id();
+                try em.line("%t{d} = OpIAdd %u32 %t{d} %c_u1", .{ g1, g });
+                const e1 = em.id();
+                try em.line("%t{d} = OpIAdd %u32 %t{d} %c_u1", .{ e1, e });
                 const pairs = [2][2]u32{ .{ g, e }, .{ g1, e1 } };
                 for (pairs) |pair| {
-                    const kp = a.id();
-                    try a.op(65, &.{ t_ptr_sk_f16, kp, v_k, c_u0, pair[0] });
-                    const kv = a.id();
-                    try a.op(61, &.{ t_f16, kv, kp });
-                    const sp = a.id();
-                    try a.op(65, &.{ t_ptr_wg_f16, sp, v_ssh, pair[1] });
-                    try a.op(62, &.{ sp, kv });
+                    const kp = em.id();
+                    try em.line("%t{d} = OpAccessChain %ptr_sk_f16 %vk %c_u0 %t{d}", .{ kp, pair[0] });
+                    const kv = em.id();
+                    try em.line("%t{d} = OpLoad %f16 %t{d}", .{ kv, kp });
+                    const sp = em.id();
+                    try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vssh %t{d}", .{ sp, pair[1] });
+                    try em.line("OpStore %t{d} %t{d}", .{ sp, kv });
                 }
             }
-            try a.op(224, &.{ c_scope_wg, c_scope_wg, c_u264 }); // staged
+            try em.line("OpControlBarrier %c_scope_wg %c_scope_wg %c_u264", .{});
             for (0..4) |kk| {
                 const ks = s * 4 + kk;
                 var a_off = a_base;
                 if (ks > 0) {
-                    const ao = a.id();
-                    try a.op(128, &.{ t_u32, ao, a_base, c_k16[ks] });
+                    const ao = em.id();
+                    try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ ao, a_base, c_k16[ks] });
                     a_off = ao;
                 }
                 var ma: [4]u32 = undefined;
                 var ao_cur = a_off;
                 for (0..4) |r| {
                     if (r > 0) {
-                        const a2 = a.id();
-                        try a.op(128, &.{ t_u32, a2, ao_cur, a_row16 });
+                        const a2 = em.id();
+                        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ a2, ao_cur, a_row16 });
                         ao_cur = a2;
                     }
-                    const aptr = a.id();
-                    try a.op(65, &.{ t_ptr_sq_f16, aptr, v_q, c_u0, ao_cur });
-                    ma[r] = a.id();
-                    try a.op(4457, &.{ t_mat_a, ma[r], aptr, c_u0, p_qstride });
+                    const aptr = em.id();
+                    try em.line("%t{d} = OpAccessChain %ptr_sq_f16 %vq %c_u0 %t{d}", .{ aptr, ao_cur });
+                    ma[r] = em.id();
+                    try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_a %t{d} %c_u0 %pqstride", .{ ma[r], aptr });
                 }
                 for (0..4) |nt| {
-                    // Shared B fragment: slab row kk*16, col wn64 + nt*16 —
-                    // c_st[kk][nt] is exactly kk*2048 + nt*16.
-                    const bidx = a.id();
-                    try a.op(128, &.{ t_u32, bidx, c_st[kk][nt], wn64 });
-                    const bptr = a.id();
-                    try a.op(65, &.{ t_ptr_wg_f16, bptr, v_ssh, bidx });
-                    const mb = a.id();
-                    try a.op(4457, &.{ t_mat_b, mb, bptr, c_u0, c_u128 });
+                    const bidx = em.id();
+                    try em.line("%t{d} = OpIAdd %u32 %{s} %t{d}", .{ bidx, c_st[kk][nt], wn64 });
+                    const bptr = em.id();
+                    try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vssh %t{d}", .{ bptr, bidx });
+                    const mb = em.id();
+                    try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_b %t{d} %c_u0 %c_u128", .{ mb, bptr });
                     for (0..4) |r| {
-                        const acc_out = a.id();
-                        try a.op(4459, &.{ t_mat_c, acc_out, ma[r], mb, acc[r][nt] });
-                        acc[r][nt] = acc_out;
+                        const acc_out = em.id();
+                        try em.line("%t{d} = OpCooperativeMatrixMulAddKHR %mat_c %t{d} %t{d} %{s}", .{ acc_out, ma[r], mb, acc[r][nt] });
+                        acc[r][nt] = try nm.f("t{d}", .{acc_out});
                     }
                 }
             }
-            // Protects the next slab's staging — and, after the last slab,
-            // the S-tile stores into the same array below.
-            try a.op(224, &.{ c_scope_wg, c_scope_wg, c_u264 });
+            try em.line("OpControlBarrier %c_scope_wg %c_scope_wg %c_u264", .{});
         }
     } else {
-        // B (K) base for direct global fragment loads: kv block + col_w.
-        const b_base = a.id();
-        try a.op(128, &.{ t_u32, b_base, kvmul, col_w });
+        const b_base = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ b_base, kvmul, col_w });
         for (0..hd / 16) |ks| {
             var a_off = a_base;
             if (ks > 0) {
-                const ao = a.id();
-                try a.op(128, &.{ t_u32, ao, a_base, c_k16[ks] });
+                const ao = em.id();
+                try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ ao, a_base, c_k16[ks] });
                 a_off = ao;
             }
             var ma: [4]u32 = undefined;
             var ao_cur = a_off;
             for (0..4) |r| {
                 if (r > 0) {
-                    const a2 = a.id();
-                    try a.op(128, &.{ t_u32, a2, ao_cur, a_row16 });
+                    const a2 = em.id();
+                    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ a2, ao_cur, a_row16 });
                     ao_cur = a2;
                 }
-                const aptr = a.id();
-                try a.op(65, &.{ t_ptr_sq_f16, aptr, v_q, c_u0, ao_cur });
-                ma[r] = a.id();
-                try a.op(4457, &.{ t_mat_a, ma[r], aptr, c_u0, p_qstride });
+                const aptr = em.id();
+                try em.line("%t{d} = OpAccessChain %ptr_sq_f16 %vq %c_u0 %t{d}", .{ aptr, ao_cur });
+                ma[r] = em.id();
+                try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_a %t{d} %c_u0 %pqstride", .{ ma[r], aptr });
             }
-            // B row block for this k-step starts at b_base + ks*16*s_stride.
-            const krowmul = a.id();
-            try a.op(132, &.{ t_u32, krowmul, c_k16[ks], p_sstride });
-            const b_ks = a.id();
-            try a.op(128, &.{ t_u32, b_ks, b_base, krowmul });
+            const krowmul = em.id();
+            try em.line("%t{d} = OpIMul %u32 %{s} %psstride", .{ krowmul, c_k16[ks] });
+            const b_ks = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ b_ks, b_base, krowmul });
             for (0..4) |nt| {
                 var b_off = b_ks;
                 if (nt > 0) {
-                    const bo = a.id();
-                    try a.op(128, &.{ t_u32, bo, b_ks, c_k16[nt] });
+                    const bo = em.id();
+                    try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ bo, b_ks, c_k16[nt] });
                     b_off = bo;
                 }
-                const bptr = a.id();
-                try a.op(65, &.{ t_ptr_sk_f16, bptr, v_k, c_u0, b_off });
-                const mb = a.id();
-                try a.op(4457, &.{ t_mat_b, mb, bptr, c_u0, p_sstride });
+                const bptr = em.id();
+                try em.line("%t{d} = OpAccessChain %ptr_sk_f16 %vk %c_u0 %t{d}", .{ bptr, b_off });
+                const mb = em.id();
+                try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_b %t{d} %c_u0 %psstride", .{ mb, bptr });
                 for (0..4) |r| {
-                    const acc_out = a.id();
-                    try a.op(4459, &.{ t_mat_c, acc_out, ma[r], mb, acc[r][nt] });
-                    acc[r][nt] = acc_out;
+                    const acc_out = em.id();
+                    try em.line("%t{d} = OpCooperativeMatrixMulAddKHR %mat_c %t{d} %t{d} %{s}", .{ acc_out, ma[r], mb, acc[r][nt] });
+                    acc[r][nt] = try nm.f("t{d}", .{acc_out});
                 }
             }
         }
     }
 
-    // Stage the warp's 4x4 f16 tiles into the bounce slab, then copy the
-    // whole 128x128 tile out as coalesced u32 words.
-    const wbase0 = a.id();
-    try a.op(132, &.{ t_u32, wbase0, wm64, c_u128 });
-    const wbase = a.id();
-    try a.op(128, &.{ t_u32, wbase, wbase0, wn64 });
+    // Stage the warp's 4x4 f16 tiles into the bounce slab, then copy out.
+    const wbase0 = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %c_u128", .{ wbase0, wm64 });
+    const wbase = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ wbase, wbase0, wn64 });
     for (0..4) |r| {
         for (0..4) |nt| {
-            const hacc = a.id();
-            try a.op(115, &.{ t_mat_h, hacc, acc[r][nt] }); // OpFConvert
-            const sidx = a.id();
-            try a.op(128, &.{ t_u32, sidx, wbase, c_st[r][nt] });
-            const sptr = a.id();
-            try a.op(65, &.{ t_ptr_wg_f16, sptr, v_ssh, sidx });
-            try a.op(4458, &.{ sptr, hacc, c_u0, c_u128 });
+            const hacc = em.id();
+            try em.line("%t{d} = OpFConvert %mat_h %{s}", .{ hacc, acc[r][nt] });
+            const sidx = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ sidx, wbase, c_st[r][nt] });
+            const sptr = em.id();
+            try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vssh %t{d}", .{ sptr, sidx });
+            try em.line("OpCooperativeMatrixStoreKHR %t{d} %t{d} %c_u0 %c_u128", .{ sptr, hacc });
         }
     }
-    try a.op(224, &.{ c_scope_wg, c_scope_wg, c_u264 }); // OpControlBarrier
-    // 8192 words for the 128x128 tile -> 64 per thread, 2 rows apart.
+    try em.line("OpControlBarrier %c_scope_wg %c_scope_wg %c_u264", .{});
+    // 8192 words -> 64 per thread, 2 rows apart.
     var e = e0;
     var gw = gword0;
     for (0..64) |i| {
         if (i > 0) {
-            const en = a.id();
-            try a.op(128, &.{ t_u32, en, e, c_u256 });
+            const en = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ en, e, c_u256 });
             e = en;
-            const gn = a.id();
-            try a.op(128, &.{ t_u32, gn, gw, p_sstride });
+            const gn = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %psstride", .{ gn, gw });
             gw = gn;
         }
-        const p0 = a.id();
-        try a.op(65, &.{ t_ptr_wg_f16, p0, v_ssh, e });
-        const h0 = a.id();
-        try a.op(61, &.{ t_f16, h0, p0 });
-        const e1 = a.id();
-        try a.op(128, &.{ t_u32, e1, e, c_u1 });
-        const p1 = a.id();
-        try a.op(65, &.{ t_ptr_wg_f16, p1, v_ssh, e1 });
-        const h1 = a.id();
-        try a.op(61, &.{ t_f16, h1, p1 });
-        const pair = a.id();
-        try a.op(80, &.{ t_v2f16, pair, h0, h1 }); // OpCompositeConstruct
-        const word = a.id();
-        try a.op(124, &.{ t_u32, word, pair }); // OpBitcast
-        const gptr = a.id();
-        try a.op(65, &.{ t_ptr_ss4_u32, gptr, v_s4, c_u0, gw });
-        try a.op(62, &.{ gptr, word });
+        const p0 = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vssh %t{d}", .{ p0, e });
+        const h0 = em.id();
+        try em.line("%t{d} = OpLoad %f16 %t{d}", .{ h0, p0 });
+        const e1 = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %c_u1", .{ e1, e });
+        const p1 = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vssh %t{d}", .{ p1, e1 });
+        const h1 = em.id();
+        try em.line("%t{d} = OpLoad %f16 %t{d}", .{ h1, p1 });
+        const pair = em.id();
+        try em.line("%t{d} = OpCompositeConstruct %v2f16 %t{d} %t{d}", .{ pair, h0, h1 });
+        const word = em.id();
+        try em.line("%t{d} = OpBitcast %u32 %t{d}", .{ word, pair });
+        const gptr = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_ss4_u32 %vs4 %c_u0 %t{d}", .{ gptr, gw });
+        try em.line("OpStore %t{d} %t{d}", .{ gptr, word });
     }
-    try a.op(253, &.{});
-    try a.op(56, &.{});
+    try em.line("OpReturn", .{});
+    try em.line("OpFunctionEnd", .{});
 
-    a.words.items[3] = a.next;
-    const out = try gpa.alignedAlloc(u8, .of(u32), a.words.items.len * 4);
-    @memcpy(out, std.mem.sliceAsBytes(a.words.items));
-    return out;
+    return sasm.assembleChecked(gpa, sasm.version_1_5, t.items);
 }
 
 /// Flash attention on tensor cores (head_dim 128), two-pass recompute: the
@@ -3301,717 +2433,594 @@ pub fn buildGemmScores(gpa: std.mem.Allocator, hd: u32, stage_k: bool) ![]align(
 /// heads-per-kv group, u4 = V row stride (kv*128), u5 = MD offset in f32
 /// elements, f0 = valid j count (u32 bits).
 fn buildFlashAttn(gpa: std.mem.Allocator, out_phase: bool, stage_k: bool) ![]align(4) u8 {
-    // Q staged resident in shared vs. cooperative-loaded from global per j
-    // block: resident costs 32 KB shared (2 workgroups/SM instead of 6) and
-    // measured SLOWER — each workgroup rereads the same 32 KB of Q, so L1
-    // serves it either way, and the occupancy matters more.
     const STAGE_Q = false;
     const Q_SH: u32 = if (STAGE_Q) 16384 else 0; // s_sh region base
     const K_SH: u32 = Q_SH + 8192; // k_sh region base (stage_k)
 
-    var a: Asm = .{ .gpa = gpa };
-    defer a.words.deinit(gpa);
+    var t: std.ArrayList(u8) = .empty;
+    defer t.deinit(gpa);
+    var em = Emit{ .w = &t, .gpa = gpa };
 
-    const main_fn = a.id();
-    const ext_glsl = a.id();
-    const gid_var = a.id();
-    const lid_var = a.id();
-    const t_void = a.id();
-    const t_fnvoid = a.id();
-    const t_u32 = a.id();
-    const t_f16 = a.id();
-    const t_f32 = a.id();
-    const t_bool = a.id();
-    const t_v3u = a.id();
-    const t_ptr_in_v3 = a.id();
-    const c_arrlen = a.id();
-    const t_arr_f16k = a.id();
-    const t_arr_f16q = a.id();
-    const t_arr_f32o = a.id();
-    const t_arr_f16v = a.id();
-    const t_sk = a.id();
-    const t_sq = a.id();
-    const t_so = a.id();
-    const t_sv = a.id();
-    const t_ptr_sk = a.id();
-    const t_ptr_sq = a.id();
-    const t_ptr_so = a.id();
-    const t_ptr_sv = a.id();
-    const v_k = a.id();
-    const v_q = a.id();
-    const v_o = a.id();
-    const v_v = a.id();
-    const t_push = a.id();
-    const t_ptr_push = a.id();
-    const v_push = a.id();
-    const t_ptr_pc_u32 = a.id();
-    const t_ptr_g_f16 = a.id(); // storage-buffer f16 element (K/Q/V share)
-    const t_ptr_o_f32 = a.id();
-    // workgroup slab: q_sh [128][128] f16 at 0, s_sh [64 j][128 q] at 16384
-    const c_wsh_len = a.id();
-    const t_wsh = a.id();
-    const t_ptr_wg_wsh = a.id();
-    const v_wsh = a.id();
-    const t_ptr_wg_f16 = a.id();
-
-    const c_u0 = a.id();
-    const c_u1 = a.id();
-    const c_u2 = a.id();
-    const c_u3 = a.id();
-    const c_u4 = a.id();
-    const c_u5 = a.id();
-    const c_u6 = a.id();
-    const c_u7 = a.id();
-    const c_u16 = a.id();
-    const c_u32c = a.id();
-    const c_u64 = a.id();
-    const c_u128 = a.id();
-    const c_u264 = a.id();
-    const c_scope_sub = a.id();
-    const c_scope_wg = a.id();
-    const t_mat_a = a.id();
-    const t_mat_b = a.id();
-    const t_mat_c = a.id();
-    const t_mat_h = a.id();
-    const c_f32_0 = a.id();
-    const c_f32_1 = a.id();
-    const c_f32_ninf = a.id(); // -3.4e38 sentinel (matches the softmax kernels)
-    const c_f16_0 = a.id();
-    const c_acc0 = a.id();
-
-    try a.words.appendSlice(gpa, &.{ 0x0723_0203, 0x0001_0500, 0, 0, 0 });
-    try a.op(17, &.{1});
-    try a.op(17, &.{9});
-    try a.op(17, &.{5345});
-    try a.op(17, &.{6022});
-    try a.opStr(10, &.{}, "SPV_KHR_cooperative_matrix");
-    try a.opStr(10, &.{}, "SPV_KHR_vulkan_memory_model");
-    try a.opStr(10, &.{}, "SPV_KHR_16bit_storage");
-    try a.opStr(11, &.{ext_glsl}, "GLSL.std.450");
-    try a.op(14, &.{ 0, 3 });
-    {
-        var buf: std.ArrayList(u32) = .empty;
-        defer buf.deinit(gpa);
-        try buf.appendSlice(gpa, &.{ 5, main_fn });
-        try buf.appendSlice(gpa, &.{ std.mem.bytesToValue(u32, "main"), 0 });
-        try buf.appendSlice(gpa, &.{ gid_var, lid_var, v_k, v_q, v_o, v_v, v_push, v_wsh });
-        try a.op(15, buf.items);
+    var names: std.ArrayList([]u8) = .empty;
+    defer {
+        for (names.items) |s| gpa.free(s);
+        names.deinit(gpa);
     }
-    try a.op(16, &.{ main_fn, 17, 32, 4, 1 }); // LocalSize 32 4 1
-
-    try a.op(71, &.{ gid_var, 11, 26 }); // WorkgroupId
-    try a.op(71, &.{ lid_var, 11, 27 }); // LocalInvocationId
-    inline for (.{ t_arr_f16k, t_arr_f16q, t_arr_f16v }) |t| {
-        try a.op(71, &.{ t, 6, 2 });
-    }
-    try a.op(71, &.{ t_arr_f32o, 6, 4 });
-    inline for (.{ t_sk, t_sq, t_so, t_sv }) |t| {
-        try a.op(71, &.{ t, 2 });
-        try a.op(72, &.{ t, 0, 35, 0 });
-    }
-    try a.op(71, &.{ t_push, 2 });
-    inline for (0..8) |m| {
-        try a.op(72, &.{ t_push, @intCast(m), 35, @intCast(m * 4) });
-    }
-    inline for (.{ v_k, v_q, v_o, v_v }, 0..) |v, binding| {
-        try a.op(71, &.{ v, 34, 0 });
-        try a.op(71, &.{ v, 33, @intCast(binding) });
-    }
-
-    try a.op(19, &.{t_void});
-    try a.op(33, &.{ t_fnvoid, t_void });
-    try a.op(21, &.{ t_u32, 32, 0 });
-    try a.op(22, &.{ t_f16, 16 });
-    try a.op(22, &.{ t_f32, 32 });
-    try a.op(20, &.{t_bool});
-    try a.op(23, &.{ t_v3u, t_u32, 3 });
-    try a.op(32, &.{ t_ptr_in_v3, 1, t_v3u });
-    try a.op(59, &.{ t_ptr_in_v3, gid_var, 1 });
-    try a.op(59, &.{ t_ptr_in_v3, lid_var, 1 });
-
-    try a.op(43, &.{ t_u32, c_arrlen, 1 << 28 });
-    try a.op(28, &.{ t_arr_f16k, t_f16, c_arrlen });
-    try a.op(28, &.{ t_arr_f16q, t_f16, c_arrlen });
-    try a.op(28, &.{ t_arr_f32o, t_f32, c_arrlen });
-    try a.op(28, &.{ t_arr_f16v, t_f16, c_arrlen });
-    try a.op(30, &.{ t_sk, t_arr_f16k });
-    try a.op(30, &.{ t_sq, t_arr_f16q });
-    try a.op(30, &.{ t_so, t_arr_f32o });
-    try a.op(30, &.{ t_sv, t_arr_f16v });
-    try a.op(32, &.{ t_ptr_sk, 12, t_sk });
-    try a.op(32, &.{ t_ptr_sq, 12, t_sq });
-    try a.op(32, &.{ t_ptr_so, 12, t_so });
-    try a.op(32, &.{ t_ptr_sv, 12, t_sv });
-    try a.op(59, &.{ t_ptr_sk, v_k, 12 });
-    try a.op(59, &.{ t_ptr_sq, v_q, 12 });
-    try a.op(59, &.{ t_ptr_so, v_o, 12 });
-    try a.op(59, &.{ t_ptr_sv, v_v, 12 });
-    try a.op(30, &.{ t_push, t_u32, t_u32, t_u32, t_u32, t_u32, t_u32, t_u32, t_u32 });
-    try a.op(32, &.{ t_ptr_push, 9, t_push });
-    try a.op(59, &.{ t_ptr_push, v_push, 9 });
-    try a.op(32, &.{ t_ptr_pc_u32, 9, t_u32 });
-    try a.op(32, &.{ t_ptr_g_f16, 12, t_f16 });
-    try a.op(32, &.{ t_ptr_o_f32, 12, t_f32 });
-
-    // Workgroup slab: optional q_sh 128x128 f16, then s_sh 64x128 f16,
-    // then (stage_k) k_sh 128 hd x 64 j f16, k-major with row stride 64.
-    try a.op(43, &.{ t_u32, c_wsh_len, Q_SH + 8192 + @as(u32, if (stage_k) 8192 else 0) });
-    try a.op(28, &.{ t_wsh, t_f16, c_wsh_len });
-    try a.op(32, &.{ t_ptr_wg_wsh, 4, t_wsh });
-    try a.op(59, &.{ t_ptr_wg_wsh, v_wsh, 4 });
-    try a.op(32, &.{ t_ptr_wg_f16, 4, t_f16 });
-
-    try a.op(43, &.{ t_u32, c_u0, 0 });
-    try a.op(43, &.{ t_u32, c_u1, 1 });
-    try a.op(43, &.{ t_u32, c_u2, 2 });
-    try a.op(43, &.{ t_u32, c_u3, 3 });
-    try a.op(43, &.{ t_u32, c_u4, 4 });
-    try a.op(43, &.{ t_u32, c_u5, 5 });
-    try a.op(43, &.{ t_u32, c_u6, 6 });
-    try a.op(43, &.{ t_u32, c_u7, 7 });
-    try a.op(43, &.{ t_u32, c_u16, 16 });
-    try a.op(43, &.{ t_u32, c_u32c, 32 });
-    try a.op(43, &.{ t_u32, c_u64, 64 });
-    try a.op(43, &.{ t_u32, c_u128, 128 });
-    try a.op(43, &.{ t_u32, c_u264, 0x108 });
-    try a.op(43, &.{ t_u32, c_scope_sub, 3 });
-    try a.op(43, &.{ t_u32, c_scope_wg, 2 });
-
-    try a.op(4456, &.{ t_mat_a, t_f16, c_scope_sub, c_u16, c_u16, c_u0 });
-    try a.op(4456, &.{ t_mat_b, t_f16, c_scope_sub, c_u16, c_u16, c_u1 });
-    try a.op(4456, &.{ t_mat_c, t_f32, c_scope_sub, c_u16, c_u16, c_u2 });
-    try a.op(4456, &.{ t_mat_h, t_f16, c_scope_sub, c_u16, c_u16, c_u2 });
-    try a.op(43, &.{ t_f32, c_f32_0, 0 });
-    try a.op(43, &.{ t_f32, c_f32_1, 0x3F800000 });
-    try a.op(43, &.{ t_f32, c_f32_ninf, @as(u32, @bitCast(@as(f32, -3.4e38))) });
-    const c_f32_minf = a.id(); // true -inf: masks padded j (exp -> exactly 0)
-    try a.op(43, &.{ t_f32, c_f32_minf, 0xFF800000 });
-    try a.op(43, &.{ t_f16, c_f16_0, 0 });
-    try a.op(44, &.{ t_mat_c, c_acc0, c_f32_0 });
-
-    // i*16 offsets (k-steps, tile columns).
-    var c_k16: [8]u32 = undefined;
-    c_k16[0] = c_u0;
-    c_k16[1] = c_u16;
-    c_k16[2] = c_u32c;
-    for (3..8) |i| {
-        c_k16[i] = a.id();
-        try a.op(43, &.{ t_u32, c_k16[i], @intCast(i * 16) });
-    }
-    // Per-column s_sh offsets col*128 (col-major tile rows) — also reused as
-    // "col << 7" values for the validity compare against limit*128.
-    var c_col: [64]u32 = undefined;
-    c_col[0] = c_u0;
-    c_col[1] = c_u128;
-    for (2..64) |i| {
-        c_col[i] = a.id();
-        try a.op(43, &.{ t_u32, c_col[i], @intCast(i * 128) });
-    }
-    // s_sh tile bases for the col-major store/load: Q_SH + (ct*16)*128.
-    // Values may collide with c_col entries when Q_SH == 0.
-    const c_ssh0 = if (Q_SH == 0) c_u0 else blk: {
-        const c = a.id();
-        try a.op(43, &.{ t_u32, c, Q_SH });
-        break :blk c;
+    const Nm = struct {
+        nl: *std.ArrayList([]u8),
+        g: std.mem.Allocator,
+        fn f(self: @This(), comptime fmt: []const u8, args: anytype) ![]const u8 {
+            const s = try std.fmt.allocPrint(self.g, fmt, args);
+            try self.nl.append(self.g, s);
+            return s;
+        }
     };
-    var c_sct: [4]u32 = undefined;
+    const nm = Nm{ .nl = &names, .g = gpa };
+
+    // --- header ---
+    try em.line("OpCapability Shader", .{});
+    try em.line("OpCapability Float16", .{});
+    try em.line("OpCapability VulkanMemoryModel", .{});
+    try em.line("OpCapability CooperativeMatrixKHR", .{});
+    try em.line("OpExtension \"SPV_KHR_cooperative_matrix\"", .{});
+    try em.line("OpExtension \"SPV_KHR_vulkan_memory_model\"", .{});
+    try em.line("OpExtension \"SPV_KHR_16bit_storage\"", .{});
+    try em.line("%glsl = OpExtInstImport \"GLSL.std.450\"", .{});
+    try em.line("OpMemoryModel Logical Vulkan", .{});
+    try em.line("OpEntryPoint GLCompute %main \"main\" %gid %lid %vk %vq %vo %vv %vpush %vwsh", .{});
+    try em.line("OpExecutionMode %main LocalSize 32 4 1", .{});
+
+    // --- decorations ---
+    try em.line("OpDecorate %gid BuiltIn WorkgroupId", .{});
+    try em.line("OpDecorate %lid BuiltIn LocalInvocationId", .{});
+    for ([_][]const u8{ "arr_f16k", "arr_f16q", "arr_f16v" }) |s| try em.line("OpDecorate %{s} ArrayStride 2", .{s});
+    try em.line("OpDecorate %arr_f32o ArrayStride 4", .{});
+    for ([_][]const u8{ "sk", "sq", "so", "sv" }) |s| {
+        try em.line("OpDecorate %{s} Block", .{s});
+        try em.line("OpMemberDecorate %{s} 0 Offset 0", .{s});
+    }
+    try em.line("OpDecorate %push Block", .{});
+    for (0..8) |m| try em.line("OpMemberDecorate %push {d} Offset {d}", .{ m, m * 4 });
+    for ([_][]const u8{ "vk", "vq", "vo", "vv" }, 0..) |v, b| {
+        try em.line("OpDecorate %{s} DescriptorSet 0", .{v});
+        try em.line("OpDecorate %{s} Binding {d}", .{ v, b });
+    }
+
+    // --- types ---
+    try em.line("%void = OpTypeVoid", .{});
+    try em.line("%fnvoid = OpTypeFunction %void", .{});
+    try em.line("%u32 = OpTypeInt 32 0", .{});
+    try em.line("%f16 = OpTypeFloat 16", .{});
+    try em.line("%f32 = OpTypeFloat 32", .{});
+    try em.line("%bool = OpTypeBool", .{});
+    try em.line("%v3u = OpTypeVector %u32 3", .{});
+    try em.line("%ptr_in_v3 = OpTypePointer Input %v3u", .{});
+    try em.line("%gid = OpVariable %ptr_in_v3 Input", .{});
+    try em.line("%lid = OpVariable %ptr_in_v3 Input", .{});
+    try em.line("%c_arrlen = OpConstant %u32 268435456", .{});
+    try em.line("%arr_f16k = OpTypeArray %f16 %c_arrlen", .{});
+    try em.line("%arr_f16q = OpTypeArray %f16 %c_arrlen", .{});
+    try em.line("%arr_f32o = OpTypeArray %f32 %c_arrlen", .{});
+    try em.line("%arr_f16v = OpTypeArray %f16 %c_arrlen", .{});
+    try em.line("%sk = OpTypeStruct %arr_f16k", .{});
+    try em.line("%sq = OpTypeStruct %arr_f16q", .{});
+    try em.line("%so = OpTypeStruct %arr_f32o", .{});
+    try em.line("%sv = OpTypeStruct %arr_f16v", .{});
+    try em.line("%ptr_sk = OpTypePointer StorageBuffer %sk", .{});
+    try em.line("%ptr_sq = OpTypePointer StorageBuffer %sq", .{});
+    try em.line("%ptr_so = OpTypePointer StorageBuffer %so", .{});
+    try em.line("%ptr_sv = OpTypePointer StorageBuffer %sv", .{});
+    try em.line("%vk = OpVariable %ptr_sk StorageBuffer", .{});
+    try em.line("%vq = OpVariable %ptr_sq StorageBuffer", .{});
+    try em.line("%vo = OpVariable %ptr_so StorageBuffer", .{});
+    try em.line("%vv = OpVariable %ptr_sv StorageBuffer", .{});
+    try em.line("%push = OpTypeStruct %u32 %u32 %u32 %u32 %u32 %u32 %u32 %u32", .{});
+    try em.line("%ptr_push = OpTypePointer PushConstant %push", .{});
+    try em.line("%vpush = OpVariable %ptr_push PushConstant", .{});
+    try em.line("%ptr_pc_u32 = OpTypePointer PushConstant %u32", .{});
+    try em.line("%ptr_g_f16 = OpTypePointer StorageBuffer %f16", .{});
+    try em.line("%ptr_o_f32 = OpTypePointer StorageBuffer %f32", .{});
+
+    // Workgroup slab.
+    try em.line("%c_wsh_len = OpConstant %u32 {d}", .{Q_SH + 8192 + @as(u32, if (stage_k) 8192 else 0)});
+    try em.line("%t_wsh = OpTypeArray %f16 %c_wsh_len", .{});
+    try em.line("%ptr_wg_wsh = OpTypePointer Workgroup %t_wsh", .{});
+    try em.line("%vwsh = OpVariable %ptr_wg_wsh Workgroup", .{});
+    try em.line("%ptr_wg_f16 = OpTypePointer Workgroup %f16", .{});
+
+    for ([_]struct { []const u8, u32 }{
+        .{ "c_u0", 0 },  .{ "c_u1", 1 },  .{ "c_u2", 2 },  .{ "c_u3", 3 },
+        .{ "c_u4", 4 },  .{ "c_u5", 5 },  .{ "c_u6", 6 },  .{ "c_u7", 7 },
+        .{ "c_u16", 16 }, .{ "c_u32c", 32 }, .{ "c_u64", 64 }, .{ "c_u128", 128 },
+        .{ "c_u264", 0x108 }, .{ "c_scope_sub", 3 }, .{ "c_scope_wg", 2 },
+    }) |cv| try em.line("%{s} = OpConstant %u32 {d}", .{ cv[0], cv[1] });
+
+    try em.line("%mat_a = OpTypeCooperativeMatrixKHR %f16 %c_scope_sub %c_u16 %c_u16 %c_u0", .{});
+    try em.line("%mat_b = OpTypeCooperativeMatrixKHR %f16 %c_scope_sub %c_u16 %c_u16 %c_u1", .{});
+    try em.line("%mat_c = OpTypeCooperativeMatrixKHR %f32 %c_scope_sub %c_u16 %c_u16 %c_u2", .{});
+    try em.line("%mat_h = OpTypeCooperativeMatrixKHR %f16 %c_scope_sub %c_u16 %c_u16 %c_u2", .{});
+    try em.line("%c_f32_0 = OpConstant %f32 0", .{});
+    try em.line("%c_f32_1 = OpConstant %f32 1065353216", .{}); // 0x3F800000
+    try em.line("%c_f32_ninf = OpConstant %f32 {d}", .{@as(u32, @bitCast(@as(f32, -3.4e38)))});
+    try em.line("%c_f32_minf = OpConstant %f32 4286578688", .{}); // 0xFF800000
+    try em.line("%c_f16_0 = OpConstant %f16 0", .{});
+    try em.line("%c_acc0 = OpConstantComposite %mat_c %c_f32_0", .{});
+
+    // i*16 offsets.
+    var c_k16: [8][]const u8 = undefined;
+    c_k16[0] = "c_u0";
+    c_k16[1] = "c_u16";
+    c_k16[2] = "c_u32c";
+    for (3..8) |i| {
+        try em.line("%c_k16_{d} = OpConstant %u32 {d}", .{ i, i * 16 });
+        c_k16[i] = try nm.f("c_k16_{d}", .{i});
+    }
+    // Per-column s_sh offsets col*128.
+    var c_col: [64][]const u8 = undefined;
+    c_col[0] = "c_u0";
+    c_col[1] = "c_u128";
+    for (2..64) |i| {
+        try em.line("%c_col_{d} = OpConstant %u32 {d}", .{ i, i * 128 });
+        c_col[i] = try nm.f("c_col_{d}", .{i});
+    }
+    // s_sh tile bases Q_SH + ct*16*128 (alias c_col when Q_SH == 0).
+    const c_ssh0 = if (Q_SH == 0) "c_u0" else blk: {
+        try em.line("%c_ssh0 = OpConstant %u32 {d}", .{Q_SH});
+        break :blk "c_ssh0";
+    };
+    var c_sct: [4][]const u8 = undefined;
     c_sct[0] = c_ssh0;
     for (1..4) |ct| {
         const val: u32 = Q_SH + @as(u32, @intCast(ct)) * 16 * 128;
-        c_sct[ct] = if (Q_SH == 0) c_col[val / 128] else blk: {
-            const c = a.id();
-            try a.op(43, &.{ t_u32, c, val });
-            break :blk c;
-        };
+        if (Q_SH == 0) {
+            c_sct[ct] = c_col[val / 128];
+        } else {
+            try em.line("%c_sct_{d} = OpConstant %u32 {d}", .{ ct, val });
+            c_sct[ct] = try nm.f("c_sct_{d}", .{ct});
+        }
     }
-    // k_sh per-k-step tile bases (K_SH + ks*16*64) and the copy's j mask.
-    var c_kst: [8]u32 = undefined;
-    var c_u63: u32 = undefined;
+    var c_kst: [8][]const u8 = undefined;
     if (stage_k) {
         for (0..8) |ks| {
-            c_kst[ks] = a.id();
-            try a.op(43, &.{ t_u32, c_kst[ks], K_SH + @as(u32, @intCast(ks)) * 1024 });
+            try em.line("%c_kst_{d} = OpConstant %u32 {d}", .{ ks, K_SH + @as(u32, @intCast(ks)) * 1024 });
+            c_kst[ks] = try nm.f("c_kst_{d}", .{ks});
         }
-        c_u63 = a.id();
-        try a.op(43, &.{ t_u32, c_u63, 63 });
+        try em.line("%c_u63 = OpConstant %u32 63", .{});
     }
 
     // --- function ---
-    const lb_entry = a.id();
-    try a.op(54, &.{ t_void, main_fn, 0, t_fnvoid });
-    try a.op(248, &.{lb_entry});
+    try em.line("%main = OpFunction %void None %fnvoid", .{});
+    try em.line("%entry = OpLabel", .{});
 
-    const gidv = a.id();
-    try a.op(61, &.{ t_v3u, gidv, gid_var });
-    const tile_r = a.id();
-    const zidx = a.id();
-    try a.op(81, &.{ t_u32, tile_r, gidv, 1 });
-    try a.op(81, &.{ t_u32, zidx, gidv, 2 });
-    const row0 = a.id();
-    try a.op(132, &.{ t_u32, row0, tile_r, c_u128 });
+    const gidv = em.id();
+    try em.line("%t{d} = OpLoad %v3u %gid", .{gidv});
+    const tile_r = em.id();
+    try em.line("%t{d} = OpCompositeExtract %u32 %t{d} 1", .{ tile_r, gidv });
+    const zidx = em.id();
+    try em.line("%t{d} = OpCompositeExtract %u32 %t{d} 2", .{ zidx, gidv });
+    const row0 = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %c_u128", .{ row0, tile_r });
 
-    const lidv = a.id();
-    try a.op(61, &.{ t_v3u, lidv, lid_var });
-    const lx = a.id();
-    const ly = a.id();
-    try a.op(81, &.{ t_u32, lx, lidv, 0 });
-    try a.op(81, &.{ t_u32, ly, lidv, 1 });
-    const flat = a.id();
-    const lymul = a.id();
-    try a.op(132, &.{ t_u32, lymul, ly, c_u32c });
-    try a.op(128, &.{ t_u32, flat, lymul, lx });
+    const lidv = em.id();
+    try em.line("%t{d} = OpLoad %v3u %lid", .{lidv});
+    const lx = em.id();
+    try em.line("%t{d} = OpCompositeExtract %u32 %t{d} 0", .{ lx, lidv });
+    const ly = em.id();
+    try em.line("%t{d} = OpCompositeExtract %u32 %t{d} 1", .{ ly, lidv });
+    const lymul = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %c_u32c", .{ lymul, ly });
+    const flat = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ flat, lymul, lx });
 
-    var push_vals: [7]u32 = undefined;
-    inline for (0..7) |m| {
-        const pptr = a.id();
-        const pval = a.id();
-        const cidx = switch (m) {
-            0 => c_u0,
-            1 => c_u1,
-            2 => c_u2,
-            3 => c_u3,
-            4 => c_u4,
-            5 => c_u5,
-            else => c_u6,
-        };
-        try a.op(65, &.{ t_ptr_pc_u32, pptr, v_push, cidx });
-        try a.op(61, &.{ t_u32, pval, pptr });
-        push_vals[m] = pval;
+    const pnames = [_][]const u8{ "pqstride", "psstride", "pheadoff", "pgroup", "pvstride", "pmdoff", "pseq" };
+    for (0..7) |m| {
+        const pptr = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_pc_u32 %vpush %c_u{d}", .{ pptr, m });
+        try em.line("%{s} = OpLoad %u32 %t{d}", .{ pnames[m], pptr });
     }
-    const p_qstride = push_vals[0];
-    const p_sstride = push_vals[1];
-    const p_headoff = push_vals[2];
-    const p_group = push_vals[3];
-    const p_vstride = push_vals[4];
-    const p_mdoff = push_vals[5];
-    const p_seq = push_vals[6];
 
-    const head = a.id();
-    try a.op(128, &.{ t_u32, head, p_headoff, zidx });
-    const kvh = a.id();
-    try a.op(134, &.{ t_u32, kvh, head, p_group }); // UDiv
-    const headmul = a.id();
-    try a.op(132, &.{ t_u32, headmul, head, c_u128 });
-    // K head base: kv * (128 * s_stride).
-    const khead = a.id();
-    try a.op(196, &.{ t_u32, khead, p_sstride, c_u7 }); // s_stride << 7
-    const kbase = a.id();
-    try a.op(132, &.{ t_u32, kbase, kvh, khead });
-    const kvmul_v = a.id();
-    try a.op(132, &.{ t_u32, kvmul_v, kvh, c_u128 });
+    const head = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %pheadoff %t{d}", .{ head, zidx });
+    const kvh = em.id();
+    try em.line("%t{d} = OpUDiv %u32 %t{d} %pgroup", .{ kvh, head });
+    const headmul = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %c_u128", .{ headmul, head });
+    const khead = em.id();
+    try em.line("%t{d} = OpShiftLeftLogical %u32 %psstride %c_u7", .{khead});
+    const kbase = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %t{d}", .{ kbase, kvh, khead });
+    const kvmul_v = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %c_u128", .{ kvmul_v, kvh });
 
-    // Per-warp Q row-block bases: warp ly owns q rows [ly*32, ly*32+32).
-    // With STAGE_Q the rows copy into shared once (coop load global -> coop
-    // store shared); otherwise the S compute cooperative-loads Q straight
-    // from global each j block (L1 keeps the workgroup's 32 KB hot).
-    const ly32 = a.id();
-    try a.op(132, &.{ t_u32, ly32, ly, c_u32c });
-    const qrow_g0 = a.id();
-    try a.op(128, &.{ t_u32, qrow_g0, row0, ly32 });
-    var qg_base: [2]u32 = undefined; // global f16 index of the row block
+    // Per-warp Q row-block bases.
+    const ly32 = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %c_u32c", .{ ly32, ly });
+    const qrow_g0 = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ qrow_g0, row0, ly32 });
+    var qg_base: [2]u32 = undefined;
     for (0..2) |rw| {
-        const grow = if (rw == 0) qrow_g0 else blk: {
-            const g = a.id();
-            try a.op(128, &.{ t_u32, g, qrow_g0, c_u16 });
-            break :blk g;
-        };
-        const gmul = a.id();
-        try a.op(132, &.{ t_u32, gmul, grow, p_qstride });
-        qg_base[rw] = a.id();
-        try a.op(128, &.{ t_u32, qg_base[rw], gmul, headmul });
+        var grow = qrow_g0;
+        if (rw != 0) {
+            const g = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %c_u16", .{ g, qrow_g0 });
+            grow = g;
+        }
+        const gmul = em.id();
+        try em.line("%t{d} = OpIMul %u32 %t{d} %pqstride", .{ gmul, grow });
+        qg_base[rw] = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ qg_base[rw], gmul, headmul });
     }
     if (STAGE_Q) {
         for (0..2) |rw| {
-            const smul = a.id();
-            try a.op(128, &.{ t_u32, smul, ly32, if (rw == 0) c_u0 else c_u16 });
-            const sbase = a.id();
-            try a.op(132, &.{ t_u32, sbase, smul, c_u128 });
+            const smul = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ smul, ly32, if (rw == 0) "c_u0" else "c_u16" });
+            const sbase = em.id();
+            try em.line("%t{d} = OpIMul %u32 %t{d} %c_u128", .{ sbase, smul });
             for (0..8) |kt| {
-                const goff = a.id();
-                try a.op(128, &.{ t_u32, goff, qg_base[rw], c_k16[kt] });
-                const gptr = a.id();
-                try a.op(65, &.{ t_ptr_g_f16, gptr, v_q, c_u0, goff });
-                const mq = a.id();
-                try a.op(4457, &.{ t_mat_a, mq, gptr, c_u0, p_qstride });
-                const soff = a.id();
-                try a.op(128, &.{ t_u32, soff, sbase, c_k16[kt] });
-                const sptr = a.id();
-                try a.op(65, &.{ t_ptr_wg_f16, sptr, v_wsh, soff });
-                try a.op(4458, &.{ sptr, mq, c_u0, c_u128 });
+                const goff = em.id();
+                try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ goff, qg_base[rw], c_k16[kt] });
+                const gptr = em.id();
+                try em.line("%t{d} = OpAccessChain %ptr_g_f16 %vq %c_u0 %t{d}", .{ gptr, goff });
+                const mq = em.id();
+                try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_a %t{d} %c_u0 %pqstride", .{ mq, gptr });
+                const soff = em.id();
+                try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ soff, sbase, c_k16[kt] });
+                const sptr = em.id();
+                try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vwsh %t{d}", .{ sptr, soff });
+                try em.line("OpCooperativeMatrixStoreKHR %t{d} %t{d} %c_u0 %c_u128", .{ sptr, mq });
             }
         }
     }
 
-    // Per-thread row state (thread owns q row `flat` of the tile).
-    // md phase: running online (m, d), loop-carried. out phase: m and 1/d
-    // loaded once from the MD table.
-    const mdrow = a.id(); // (z*s_stride + row0 + flat)*2 + mdoff
+    // Per-thread row MD index.
+    const mdrow = em.id();
     {
-        const zr = a.id();
-        try a.op(132, &.{ t_u32, zr, zidx, p_sstride });
-        const qr = a.id();
-        try a.op(128, &.{ t_u32, qr, zr, row0 });
-        const qr2 = a.id();
-        try a.op(128, &.{ t_u32, qr2, qr, flat });
-        const dbl = a.id();
-        try a.op(196, &.{ t_u32, dbl, qr2, c_u1 });
-        try a.op(128, &.{ t_u32, mdrow, dbl, p_mdoff });
+        const zr = em.id();
+        try em.line("%t{d} = OpIMul %u32 %t{d} %psstride", .{ zr, zidx });
+        const qr = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ qr, zr, row0 });
+        const qr2 = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ qr2, qr, flat });
+        const dbl = em.id();
+        try em.line("%t{d} = OpShiftLeftLogical %u32 %t{d} %c_u1", .{ dbl, qr2 });
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %pmdoff", .{ mdrow, dbl });
     }
     var m_hoist: u32 = undefined;
     var invd_hoist: u32 = undefined;
     if (out_phase) {
-        const mptr = a.id();
-        try a.op(65, &.{ t_ptr_o_f32, mptr, v_o, c_u0, mdrow });
-        m_hoist = a.id();
-        try a.op(61, &.{ t_f32, m_hoist, mptr });
-        const di = a.id();
-        try a.op(128, &.{ t_u32, di, mdrow, c_u1 });
-        const dptr = a.id();
-        try a.op(65, &.{ t_ptr_o_f32, dptr, v_o, c_u0, di });
-        invd_hoist = a.id();
-        try a.op(61, &.{ t_f32, invd_hoist, dptr });
+        const mptr = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_o_f32 %vo %c_u0 %t{d}", .{ mptr, mdrow });
+        m_hoist = em.id();
+        try em.line("%t{d} = OpLoad %f32 %t{d}", .{ m_hoist, mptr });
+        const di = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %c_u1", .{ di, mdrow });
+        const dptr = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_o_f32 %vo %c_u0 %t{d}", .{ dptr, di });
+        invd_hoist = em.id();
+        try em.line("%t{d} = OpLoad %f32 %t{d}", .{ invd_hoist, dptr });
     }
-    // Thread's s_sh column base (col-major tile: element (j, q) at
-    // 16384 + j*128 + q).
-    const s_thread0 = a.id();
-    try a.op(128, &.{ t_u32, s_thread0, c_ssh0, flat });
+    const s_thread0 = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %{s} %t{d}", .{ s_thread0, c_ssh0, flat });
 
-    // K-staging copy invariants: thread `flat` owns k_sh column flat&63
-    // and rows flat>>6 + 2i (consecutive lanes read consecutive K columns
-    // — coalesced). Global element = kbase + j0 + (flat&63) +
-    // (flat>>6 + 2i)*s_stride; shared element = K_SH + flat + i*128.
     var k_inv: u32 = undefined;
     var k_e0: u32 = undefined;
     var c2s: u32 = undefined;
     if (stage_k) {
-        const kj = a.id();
-        try a.op(199, &.{ t_u32, kj, flat, c_u63 });
-        const kr0 = a.id();
-        try a.op(194, &.{ t_u32, kr0, flat, c_u6 });
-        const gj = a.id();
-        try a.op(128, &.{ t_u32, gj, kbase, kj });
-        const gr = a.id();
-        try a.op(132, &.{ t_u32, gr, kr0, p_sstride });
-        k_inv = a.id();
-        try a.op(128, &.{ t_u32, k_inv, gj, gr });
-        k_e0 = a.id();
-        try a.op(128, &.{ t_u32, k_e0, c_kst[0], flat });
-        c2s = a.id();
-        try a.op(128, &.{ t_u32, c2s, p_sstride, p_sstride });
+        const kj = em.id();
+        try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %c_u63", .{ kj, flat });
+        const kr0 = em.id();
+        try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %c_u6", .{ kr0, flat });
+        const gj = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ gj, kbase, kj });
+        const gr = em.id();
+        try em.line("%t{d} = OpIMul %u32 %t{d} %psstride", .{ gr, kr0 });
+        k_inv = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ k_inv, gj, gr });
+        k_e0 = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %{s} %t{d}", .{ k_e0, c_kst[0], flat });
+        c2s = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %psstride %psstride", .{c2s});
     }
 
-    // Warp tiling for S compute: warp ly owns q rows [ly*32, ly*32+32).
-    // Warp tiling for P@V (out phase): 2x2 grid, 64q x 64c per warp.
-    const warp_m = a.id();
-    try a.op(199, &.{ t_u32, warp_m, ly, c_u1 });
-    const warp_n = a.id();
-    try a.op(194, &.{ t_u32, warp_n, ly, c_u1 });
-    const wm64 = a.id();
-    try a.op(132, &.{ t_u32, wm64, warp_m, c_u64 });
-    const wn64 = a.id();
-    try a.op(132, &.{ t_u32, wn64, warp_n, c_u64 });
-    // Hoisted per-warp offsets: q/out row-block starts and the V column base.
+    // Warp tiling.
+    const warp_m = em.id();
+    try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %c_u1", .{ warp_m, ly });
+    const warp_n = em.id();
+    try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %c_u1", .{ warp_n, ly });
+    const wm64 = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %c_u64", .{ wm64, warp_m });
+    const wn64 = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %c_u64", .{ wn64, warp_n });
     var wmr: [4]u32 = undefined;
     wmr[0] = wm64;
     for (1..4) |r| {
-        wmr[r] = a.id();
-        try a.op(128, &.{ t_u32, wmr[r], wm64, c_k16[r] });
+        wmr[r] = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ wmr[r], wm64, c_k16[r] });
     }
-    const vcol_base = a.id();
-    try a.op(128, &.{ t_u32, vcol_base, kvmul_v, wn64 });
+    const vcol_base = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ vcol_base, kvmul_v, wn64 });
 
-    // Loop preamble: loop-carried values.
-    const lb_head = a.id();
-    const lb_cond = a.id();
-    const lb_body = a.id();
-    const lb_cont = a.id();
-    const lb_merge = a.id();
-    const j0n = a.id();
-    // md phase: m/d next values; out phase: 16 acc next values.
-    const mn_next = a.id();
-    const dn_next = a.id();
+    // Loop-carried back-edge ids.
+    const j0n = em.id();
+    const mn_next = em.id();
+    const dn_next = em.id();
     var acc_next: [4][4]u32 = undefined;
     for (&acc_next) |*row| for (row) |*v| {
-        v.* = a.id();
+        v.* = em.id();
     };
 
-    try a.op(249, &.{lb_head});
-    try a.op(248, &.{lb_head});
-    const j0v = a.id();
-    try a.op(245, &.{ t_u32, j0v, c_u0, lb_entry, j0n, lb_cont }); // OpPhi
+    try em.line("OpBranch %head", .{});
+    try em.line("%head = OpLabel", .{});
+    const j0v = em.id();
+    try em.line("%t{d} = OpPhi %u32 %c_u0 %entry %t{d} %cont", .{ j0v, j0n });
     var m_phi: u32 = undefined;
     var d_phi: u32 = undefined;
     var acc_phi: [4][4]u32 = undefined;
     if (!out_phase) {
-        m_phi = a.id();
-        try a.op(245, &.{ t_f32, m_phi, c_f32_ninf, lb_entry, mn_next, lb_cont });
-        d_phi = a.id();
-        try a.op(245, &.{ t_f32, d_phi, c_f32_0, lb_entry, dn_next, lb_cont });
+        m_phi = em.id();
+        try em.line("%t{d} = OpPhi %f32 %c_f32_ninf %entry %t{d} %cont", .{ m_phi, mn_next });
+        d_phi = em.id();
+        try em.line("%t{d} = OpPhi %f32 %c_f32_0 %entry %t{d} %cont", .{ d_phi, dn_next });
     } else {
         for (&acc_phi, acc_next) |*prow, nrow| {
             for (prow, nrow) |*ap, an| {
-                ap.* = a.id();
-                try a.op(245, &.{ t_mat_c, ap.*, c_acc0, lb_entry, an, lb_cont });
+                ap.* = em.id();
+                try em.line("%t{d} = OpPhi %mat_c %c_acc0 %entry %t{d} %cont", .{ ap.*, an });
             }
         }
     }
-    try a.op(246, &.{ lb_merge, lb_cont, 0 });
-    try a.op(249, &.{lb_cond});
-    try a.op(248, &.{lb_cond});
-    const cmp = a.id();
-    try a.op(176, &.{ t_bool, cmp, j0v, p_sstride });
-    try a.op(250, &.{ cmp, lb_body, lb_merge });
+    try em.line("OpLoopMerge %merge %cont None", .{});
+    try em.line("OpBranch %cond", .{});
+    try em.line("%cond = OpLabel", .{});
+    const cmp = em.id();
+    try em.line("%t{d} = OpULessThan %bool %t{d} %psstride", .{ cmp, j0v });
+    try em.line("OpBranchConditional %t{d} %body %merge", .{cmp});
 
-    try a.op(248, &.{lb_body});
-    // Barrier: Q staging on the first pass; s_sh reuse on later passes.
-    try a.op(224, &.{ c_scope_wg, c_scope_wg, c_u264 });
+    try em.line("%body = OpLabel", .{});
+    try em.line("OpControlBarrier %c_scope_wg %c_scope_wg %c_u264", .{});
 
     if (stage_k) {
-        // Stage this j-block's K tile into k_sh: all four warps consume
-        // IDENTICAL K fragments per (ks, ct), so one shared copy replaces
-        // 4x-redundant global fragment loads. 64 f16 per thread.
-        var g = a.id();
-        try a.op(128, &.{ t_u32, g, k_inv, j0v });
+        var g = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ g, k_inv, j0v });
         var e = k_e0;
         for (0..64) |i| {
             if (i > 0) {
-                const gn = a.id();
-                try a.op(128, &.{ t_u32, gn, g, c2s });
+                const gn = em.id();
+                try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ gn, g, c2s });
                 g = gn;
-                const en = a.id();
-                try a.op(128, &.{ t_u32, en, e, c_u128 });
+                const en = em.id();
+                try em.line("%t{d} = OpIAdd %u32 %t{d} %c_u128", .{ en, e });
                 e = en;
             }
-            const gp = a.id();
-            try a.op(65, &.{ t_ptr_g_f16, gp, v_k, c_u0, g });
-            const hv = a.id();
-            try a.op(61, &.{ t_f16, hv, gp });
-            const sp = a.id();
-            try a.op(65, &.{ t_ptr_wg_f16, sp, v_wsh, e });
-            try a.op(62, &.{ sp, hv });
+            const gp = em.id();
+            try em.line("%t{d} = OpAccessChain %ptr_g_f16 %vk %c_u0 %t{d}", .{ gp, g });
+            const hv = em.id();
+            try em.line("%t{d} = OpLoad %f16 %t{d}", .{ hv, gp });
+            const sp = em.id();
+            try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vwsh %t{d}", .{ sp, e });
+            try em.line("OpStore %t{d} %t{d}", .{ sp, hv });
         }
-        try a.op(224, &.{ c_scope_wg, c_scope_wg, c_u264 });
+        try em.line("OpControlBarrier %c_scope_wg %c_scope_wg %c_u264", .{});
     }
 
-    // S block: warp ly computes q rows [ly32, ly32+32) x 64 j into s_sh
-    // (column-major). 2 row blocks x 4 col tiles, 8 k-steps each.
+    // S block.
     for (0..2) |rw| {
-        const q_shbase = a.id(); // (ly32 + rw*16) * 128 (STAGE_Q layout)
+        const q_shbase = em.id();
         {
-            const qr = a.id();
-            try a.op(128, &.{ t_u32, qr, ly32, if (rw == 0) c_u0 else c_u16 });
-            try a.op(132, &.{ t_u32, q_shbase, qr, c_u128 });
+            const qr = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ qr, ly32, if (rw == 0) "c_u0" else "c_u16" });
+            try em.line("%t{d} = OpIMul %u32 %t{d} %c_u128", .{ q_shbase, qr });
         }
-        const s_qoff = a.id(); // ly32 + rw*16 (column offset in s_sh)
-        try a.op(128, &.{ t_u32, s_qoff, ly32, if (rw == 0) c_u0 else c_u16 });
+        const s_qoff = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ s_qoff, ly32, if (rw == 0) "c_u0" else "c_u16" });
         for (0..4) |ct| {
-            var acc: u32 = c_acc0;
-            const jg = a.id(); // global j of this tile: j0 + ct*16
-            try a.op(128, &.{ t_u32, jg, j0v, c_k16[ct] });
+            var acc: []const u8 = "c_acc0";
+            const jg = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ jg, j0v, c_k16[ct] });
             for (0..8) |ks| {
-                const qoff = a.id();
-                try a.op(128, &.{ t_u32, qoff, if (STAGE_Q) q_shbase else qg_base[rw], c_k16[ks] });
-                const qptr = a.id();
+                const qoff = em.id();
                 if (STAGE_Q) {
-                    try a.op(65, &.{ t_ptr_wg_f16, qptr, v_wsh, qoff });
+                    try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ qoff, q_shbase, c_k16[ks] });
                 } else {
-                    try a.op(65, &.{ t_ptr_g_f16, qptr, v_q, c_u0, qoff });
+                    try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ qoff, qg_base[rw], c_k16[ks] });
                 }
-                const ma = a.id();
-                try a.op(4457, &.{ t_mat_a, ma, qptr, c_u0, if (STAGE_Q) c_u128 else p_qstride });
+                const qptr = em.id();
+                if (STAGE_Q) {
+                    try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vwsh %t{d}", .{ qptr, qoff });
+                } else {
+                    try em.line("%t{d} = OpAccessChain %ptr_g_f16 %vq %c_u0 %t{d}", .{ qptr, qoff });
+                }
+                const ma = em.id();
+                if (STAGE_Q) {
+                    try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_a %t{d} %c_u0 %c_u128", .{ ma, qptr });
+                } else {
+                    try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_a %t{d} %c_u0 %pqstride", .{ ma, qptr });
+                }
                 var mb: u32 = undefined;
                 if (stage_k) {
-                    // k_sh tile (ks*16, ct*16), row stride 64.
-                    const koff = a.id();
-                    try a.op(128, &.{ t_u32, koff, c_kst[ks], c_k16[ct] });
-                    const kptr = a.id();
-                    try a.op(65, &.{ t_ptr_wg_f16, kptr, v_wsh, koff });
-                    mb = a.id();
-                    try a.op(4457, &.{ t_mat_b, mb, kptr, c_u0, c_u64 });
+                    const koff = em.id();
+                    try em.line("%t{d} = OpIAdd %u32 %{s} %{s}", .{ koff, c_kst[ks], c_k16[ct] });
+                    const kptr = em.id();
+                    try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vwsh %t{d}", .{ kptr, koff });
+                    mb = em.id();
+                    try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_b %t{d} %c_u0 %c_u64", .{ mb, kptr });
                 } else {
-                    const krow = a.id();
-                    try a.op(132, &.{ t_u32, krow, c_k16[ks], p_sstride });
-                    const koff0 = a.id();
-                    try a.op(128, &.{ t_u32, koff0, kbase, krow });
-                    const koff = a.id();
-                    try a.op(128, &.{ t_u32, koff, koff0, jg });
-                    const kptr = a.id();
-                    try a.op(65, &.{ t_ptr_g_f16, kptr, v_k, c_u0, koff });
-                    mb = a.id();
-                    try a.op(4457, &.{ t_mat_b, mb, kptr, c_u0, p_sstride });
+                    const krow = em.id();
+                    try em.line("%t{d} = OpIMul %u32 %{s} %psstride", .{ krow, c_k16[ks] });
+                    const koff0 = em.id();
+                    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ koff0, kbase, krow });
+                    const koff = em.id();
+                    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ koff, koff0, jg });
+                    const kptr = em.id();
+                    try em.line("%t{d} = OpAccessChain %ptr_g_f16 %vk %c_u0 %t{d}", .{ kptr, koff });
+                    mb = em.id();
+                    try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_b %t{d} %c_u0 %psstride", .{ mb, kptr });
                 }
-                const acc_out = a.id();
-                try a.op(4459, &.{ t_mat_c, acc_out, ma, mb, acc });
-                acc = acc_out;
+                const acc_out = em.id();
+                try em.line("%t{d} = OpCooperativeMatrixMulAddKHR %mat_c %t{d} %t{d} %{s}", .{ acc_out, ma, mb, acc });
+                acc = try nm.f("t{d}", .{acc_out});
             }
-            const hacc = a.id();
-            try a.op(115, &.{ t_mat_h, hacc, acc }); // FConvert
-            const soff = a.id();
-            try a.op(128, &.{ t_u32, soff, c_sct[ct], s_qoff });
-            const sptr = a.id();
-            try a.op(65, &.{ t_ptr_wg_f16, sptr, v_wsh, soff });
-            try a.op(4458, &.{ sptr, hacc, c_u1, c_u128 }); // ColumnMajor
+            const hacc = em.id();
+            try em.line("%t{d} = OpFConvert %mat_h %{s}", .{ hacc, acc });
+            const soff = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %{s} %t{d}", .{ soff, c_sct[ct], s_qoff });
+            const sptr = em.id();
+            try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vwsh %t{d}", .{ sptr, soff });
+            try em.line("OpCooperativeMatrixStoreKHR %t{d} %t{d} %c_u1 %c_u128", .{ sptr, hacc }); // ColumnMajor
         }
     }
-    try a.op(224, &.{ c_scope_wg, c_scope_wg, c_u264 });
+    try em.line("OpControlBarrier %c_scope_wg %c_scope_wg %c_u264", .{});
 
-    // Validity horizon for this block: columns col with col*128 <
-    // (seq - j0)*128 are real j positions; the rest mask to -inf / 0.
-    const over = a.id();
-    try a.op(176, &.{ t_bool, over, j0v, p_seq }); // j0 < seq
-    const rem = a.id();
-    try a.op(130, &.{ t_u32, rem, p_seq, j0v }); // ISub
-    const limit = a.id();
-    try a.op(169, &.{ t_u32, limit, over, rem, c_u0 }); // Select
-    const limit128 = a.id();
-    try a.op(196, &.{ t_u32, limit128, limit, c_u7 });
+    // Validity horizon.
+    const over = em.id();
+    try em.line("%t{d} = OpULessThan %bool %t{d} %pseq", .{ over, j0v });
+    const rem = em.id();
+    try em.line("%t{d} = OpISub %u32 %pseq %t{d}", .{ rem, j0v });
+    const limit = em.id();
+    try em.line("%t{d} = OpSelect %u32 %t{d} %t{d} %c_u0", .{ limit, over, rem });
+    const limit128 = em.id();
+    try em.line("%t{d} = OpShiftLeftLogical %u32 %t{d} %c_u7", .{ limit128, limit });
 
     if (!out_phase) {
-        // Online (m, d) over the 64 shared columns of the thread's row.
         var m_cur = m_phi;
         var d_cur = d_phi;
         for (0..64) |col| {
             var eidx = s_thread0;
             if (col > 0) {
-                const ei = a.id();
-                try a.op(128, &.{ t_u32, ei, s_thread0, c_col[col] });
+                const ei = em.id();
+                try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ ei, s_thread0, c_col[col] });
                 eidx = ei;
             }
-            const sptr = a.id();
-            try a.op(65, &.{ t_ptr_wg_f16, sptr, v_wsh, eidx });
-            const hval = a.id();
-            try a.op(61, &.{ t_f16, hval, sptr });
-            const s32 = a.id();
-            try a.op(115, &.{ t_f32, s32, hval }); // FConvert
-            const valid = a.id();
-            try a.op(176, &.{ t_bool, valid, c_col[col], limit128 });
-            const s_eff = a.id();
-            try a.op(169, &.{ t_f32, s_eff, valid, s32, c_f32_minf });
-            const m_new = if (col == 63) mn_next else a.id();
-            try a.op(12, &.{ t_f32, m_new, ext_glsl, 40, m_cur, s_eff }); // FMax
-            const dm = a.id();
-            try a.op(131, &.{ t_f32, dm, m_cur, m_new }); // FSub
-            const corr = a.id();
-            try a.op(12, &.{ t_f32, corr, ext_glsl, 27, dm }); // Exp
-            const ds = a.id();
-            try a.op(131, &.{ t_f32, ds, s_eff, m_new });
-            const p = a.id();
-            try a.op(12, &.{ t_f32, p, ext_glsl, 27, ds });
-            const dscaled = a.id();
-            try a.op(133, &.{ t_f32, dscaled, d_cur, corr }); // FMul
-            const d_new = if (col == 63) dn_next else a.id();
-            try a.op(129, &.{ t_f32, d_new, dscaled, p }); // FAdd
+            const sptr = em.id();
+            try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vwsh %t{d}", .{ sptr, eidx });
+            const hval = em.id();
+            try em.line("%t{d} = OpLoad %f16 %t{d}", .{ hval, sptr });
+            const s32 = em.id();
+            try em.line("%t{d} = OpFConvert %f32 %t{d}", .{ s32, hval });
+            const valid = em.id();
+            try em.line("%t{d} = OpULessThan %bool %{s} %t{d}", .{ valid, c_col[col], limit128 });
+            const s_eff = em.id();
+            try em.line("%t{d} = OpSelect %f32 %t{d} %t{d} %c_f32_minf", .{ s_eff, valid, s32 });
+            const m_new = if (col == 63) mn_next else em.id();
+            try em.line("%t{d} = OpExtInst %f32 %glsl 40 %t{d} %t{d}", .{ m_new, m_cur, s_eff }); // FMax
+            const dm = em.id();
+            try em.line("%t{d} = OpFSub %f32 %t{d} %t{d}", .{ dm, m_cur, m_new });
+            const corr = em.id();
+            try em.line("%t{d} = OpExtInst %f32 %glsl 27 %t{d}", .{ corr, dm }); // Exp
+            const ds = em.id();
+            try em.line("%t{d} = OpFSub %f32 %t{d} %t{d}", .{ ds, s_eff, m_new });
+            const p = em.id();
+            try em.line("%t{d} = OpExtInst %f32 %glsl 27 %t{d}", .{ p, ds });
+            const dscaled = em.id();
+            try em.line("%t{d} = OpFMul %f32 %t{d} %t{d}", .{ dscaled, d_cur, corr });
+            const d_new = if (col == 63) dn_next else em.id();
+            try em.line("%t{d} = OpFAdd %f32 %t{d} %t{d}", .{ d_new, dscaled, p });
             m_cur = m_new;
             d_cur = d_new;
         }
     } else {
-        // Transform the shared S block in place to P = exp(S - m) * invd
-        // (padded j forced to zero), then accumulate P@V.
         for (0..64) |col| {
             var eidx = s_thread0;
             if (col > 0) {
-                const ei = a.id();
-                try a.op(128, &.{ t_u32, ei, s_thread0, c_col[col] });
+                const ei = em.id();
+                try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ ei, s_thread0, c_col[col] });
                 eidx = ei;
             }
-            const sptr = a.id();
-            try a.op(65, &.{ t_ptr_wg_f16, sptr, v_wsh, eidx });
-            const hval = a.id();
-            try a.op(61, &.{ t_f16, hval, sptr });
-            const s32 = a.id();
-            try a.op(115, &.{ t_f32, s32, hval });
-            const ds = a.id();
-            try a.op(131, &.{ t_f32, ds, s32, m_hoist });
-            const e = a.id();
-            try a.op(12, &.{ t_f32, e, ext_glsl, 27, ds });
-            const p = a.id();
-            try a.op(133, &.{ t_f32, p, e, invd_hoist });
-            const valid = a.id();
-            try a.op(176, &.{ t_bool, valid, c_col[col], limit128 });
-            const pm = a.id();
-            try a.op(169, &.{ t_f32, pm, valid, p, c_f32_0 });
-            const hp = a.id();
-            try a.op(115, &.{ t_f16, hp, pm });
-            try a.op(62, &.{ sptr, hp });
+            const sptr = em.id();
+            try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vwsh %t{d}", .{ sptr, eidx });
+            const hval = em.id();
+            try em.line("%t{d} = OpLoad %f16 %t{d}", .{ hval, sptr });
+            const s32 = em.id();
+            try em.line("%t{d} = OpFConvert %f32 %t{d}", .{ s32, hval });
+            const ds = em.id();
+            try em.line("%t{d} = OpFSub %f32 %t{d} %t{d}", .{ ds, s32, m_hoist });
+            const e = em.id();
+            try em.line("%t{d} = OpExtInst %f32 %glsl 27 %t{d}", .{ e, ds });
+            const p = em.id();
+            try em.line("%t{d} = OpFMul %f32 %t{d} %t{d}", .{ p, e, invd_hoist });
+            const valid = em.id();
+            try em.line("%t{d} = OpULessThan %bool %{s} %t{d}", .{ valid, c_col[col], limit128 });
+            const pm = em.id();
+            try em.line("%t{d} = OpSelect %f32 %t{d} %t{d} %c_f32_0", .{ pm, valid, p });
+            const hp = em.id();
+            try em.line("%t{d} = OpFConvert %f16 %t{d}", .{ hp, pm });
+            try em.line("OpStore %t{d} %t{d}", .{ sptr, hp });
         }
-        try a.op(224, &.{ c_scope_wg, c_scope_wg, c_u264 });
+        try em.line("OpControlBarrier %c_scope_wg %c_scope_wg %c_u264", .{});
 
         var acc_cur = acc_phi;
         for (0..4) |kk| {
             var ma: [4]u32 = undefined;
             for (0..4) |r| {
-                const aoff = a.id();
-                try a.op(128, &.{ t_u32, aoff, c_sct[kk], wmr[r] });
-                const aptr = a.id();
-                try a.op(65, &.{ t_ptr_wg_f16, aptr, v_wsh, aoff });
-                ma[r] = a.id();
-                try a.op(4457, &.{ t_mat_a, ma[r], aptr, c_u1, c_u128 }); // ColMajor
+                const aoff = em.id();
+                try em.line("%t{d} = OpIAdd %u32 %{s} %t{d}", .{ aoff, c_sct[kk], wmr[r] });
+                const aptr = em.id();
+                try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vwsh %t{d}", .{ aptr, aoff });
+                ma[r] = em.id();
+                try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_a %t{d} %c_u1 %c_u128", .{ ma[r], aptr }); // ColMajor
             }
-            const jg2 = a.id();
-            try a.op(128, &.{ t_u32, jg2, j0v, c_k16[kk] });
-            const vrow = a.id();
-            try a.op(132, &.{ t_u32, vrow, jg2, p_vstride });
-            const vb0 = a.id();
-            try a.op(128, &.{ t_u32, vb0, vrow, vcol_base });
+            const jg2 = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ jg2, j0v, c_k16[kk] });
+            const vrow = em.id();
+            try em.line("%t{d} = OpIMul %u32 %t{d} %pvstride", .{ vrow, jg2 });
+            const vb0 = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ vb0, vrow, vcol_base });
             for (0..4) |ct| {
-                const voff = a.id();
-                try a.op(128, &.{ t_u32, voff, vb0, c_k16[ct] });
-                const vptr = a.id();
-                try a.op(65, &.{ t_ptr_g_f16, vptr, v_v, c_u0, voff });
-                const mb = a.id();
-                try a.op(4457, &.{ t_mat_b, mb, vptr, c_u0, p_vstride });
+                const voff = em.id();
+                try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ voff, vb0, c_k16[ct] });
+                const vptr = em.id();
+                try em.line("%t{d} = OpAccessChain %ptr_g_f16 %vv %c_u0 %t{d}", .{ vptr, voff });
+                const mb = em.id();
+                try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_b %t{d} %c_u0 %pvstride", .{ mb, vptr });
                 for (0..4) |r| {
-                    const acc_out = if (kk == 3) acc_next[r][ct] else a.id();
-                    try a.op(4459, &.{ t_mat_c, acc_out, ma[r], mb, acc_cur[r][ct] });
+                    const acc_out = if (kk == 3) acc_next[r][ct] else em.id();
+                    try em.line("%t{d} = OpCooperativeMatrixMulAddKHR %mat_c %t{d} %t{d} %t{d}", .{ acc_out, ma[r], mb, acc_cur[r][ct] });
                     acc_cur[r][ct] = acc_out;
                 }
             }
         }
     }
-    try a.op(249, &.{lb_cont});
+    try em.line("OpBranch %cont", .{});
 
-    try a.op(248, &.{lb_cont});
-    try a.op(128, &.{ t_u32, j0n, j0v, c_u64 });
-    try a.op(249, &.{lb_head});
+    try em.line("%cont = OpLabel", .{});
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %c_u64", .{ j0n, j0v });
+    try em.line("OpBranch %head", .{});
 
-    try a.op(248, &.{lb_merge});
+    try em.line("%merge = OpLabel", .{});
     if (!out_phase) {
-        const invd = a.id();
-        try a.op(136, &.{ t_f32, invd, c_f32_1, d_phi }); // FDiv
-        const mptr = a.id();
-        try a.op(65, &.{ t_ptr_o_f32, mptr, v_o, c_u0, mdrow });
-        try a.op(62, &.{ mptr, m_phi });
-        const di = a.id();
-        try a.op(128, &.{ t_u32, di, mdrow, c_u1 });
-        const dptr = a.id();
-        try a.op(65, &.{ t_ptr_o_f32, dptr, v_o, c_u0, di });
-        try a.op(62, &.{ dptr, invd });
+        const invd = em.id();
+        try em.line("%t{d} = OpFDiv %f32 %c_f32_1 %t{d}", .{ invd, d_phi });
+        const mptr = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_o_f32 %vo %c_u0 %t{d}", .{ mptr, mdrow });
+        try em.line("OpStore %t{d} %t{d}", .{ mptr, m_phi });
+        const di = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %c_u1", .{ di, mdrow });
+        const dptr = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_o_f32 %vo %c_u0 %t{d}", .{ dptr, di });
+        try em.line("OpStore %t{d} %t{d}", .{ dptr, invd });
     } else {
         for (0..4) |r| {
-            const orow = a.id();
-            try a.op(128, &.{ t_u32, orow, row0, wmr[r] });
-            const omul = a.id();
-            try a.op(132, &.{ t_u32, omul, orow, p_qstride });
-            const ob = a.id();
-            try a.op(128, &.{ t_u32, ob, omul, headmul });
-            const ob2 = a.id();
-            try a.op(128, &.{ t_u32, ob2, ob, wn64 });
+            const orow = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ orow, row0, wmr[r] });
+            const omul = em.id();
+            try em.line("%t{d} = OpIMul %u32 %t{d} %pqstride", .{ omul, orow });
+            const ob = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ ob, omul, headmul });
+            const ob2 = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ ob2, ob, wn64 });
             for (0..4) |ct| {
-                const ooff = a.id();
-                try a.op(128, &.{ t_u32, ooff, ob2, c_k16[ct] });
-                const optr = a.id();
-                try a.op(65, &.{ t_ptr_o_f32, optr, v_o, c_u0, ooff });
-                try a.op(4458, &.{ optr, acc_phi[r][ct], c_u0, p_qstride });
+                const ooff = em.id();
+                try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ ooff, ob2, c_k16[ct] });
+                const optr = em.id();
+                try em.line("%t{d} = OpAccessChain %ptr_o_f32 %vo %c_u0 %t{d}", .{ optr, ooff });
+                try em.line("OpCooperativeMatrixStoreKHR %t{d} %t{d} %c_u0 %pqstride", .{ optr, acc_phi[r][ct] });
             }
         }
     }
-    try a.op(253, &.{});
-    try a.op(56, &.{});
+    try em.line("OpReturn", .{});
+    try em.line("OpFunctionEnd", .{});
 
-    a.words.items[3] = a.next;
-    const out = try gpa.alignedAlloc(u8, .of(u32), a.words.items.len * 4);
-    @memcpy(out, std.mem.sliceAsBytes(a.words.items));
-    return out;
+    return sasm.assembleChecked(gpa, sasm.version_1_5, t.items);
 }
 
 /// Flash pass 1: online {m, 1/d} per q row (see buildFlashAttn).
@@ -4049,508 +3058,376 @@ pub fn buildFlashOut(gpa: std.mem.Allocator) ![]align(4) u8 {
 /// seq_pad, wider-head callers batching a head as several 128-column fake
 /// heads pass 0 along with u1 = 0 so all fakes share plane 0).
 pub fn buildGemmAttnOut(gpa: std.mem.Allocator) ![]align(4) u8 {
-    var a: Asm = .{ .gpa = gpa };
-    defer a.words.deinit(gpa);
+    var t: std.ArrayList(u8) = .empty;
+    defer t.deinit(gpa);
+    var em = Emit{ .w = &t, .gpa = gpa };
 
-    const main_fn = a.id();
-    const ext_glsl = a.id();
-    const gid_var = a.id();
-    const lid_var = a.id();
-    const t_void = a.id();
-    const t_fnvoid = a.id();
-    const t_u32 = a.id();
-    const t_f16 = a.id();
-    const t_f32 = a.id();
-    const t_v3u = a.id();
-    const t_ptr_in_v3 = a.id();
-    const c_arrlen = a.id();
-    const t_arr_f16 = a.id();
-    const t_arr_f32 = a.id();
-    const t_arr_f32b = a.id();
-    const t_arr_f32c = a.id();
-    const t_ss = a.id(); // struct { [N]u32 } (S as packed f16 pairs)
-    const t_sv = a.id(); // struct { [N]f16 } (V)
-    const t_so = a.id(); // struct { [N]f32 } (OUT)
-    const t_smd = a.id(); // struct { [N]f32 } (MD)
-    const t_ptr_ss = a.id();
-    const t_ptr_sv = a.id();
-    const t_ptr_so = a.id();
-    const t_ptr_smd = a.id();
-    const v_s = a.id();
-    const v_v = a.id();
-    const v_o = a.id();
-    const v_md = a.id();
-    const t_push = a.id();
-    const t_ptr_push = a.id();
-    const v_push = a.id();
-    const t_ptr_pc_u32 = a.id();
-    const t_ptr_ss_f32 = a.id(); // u32 element pointer (f16 pair words)
-    const t_v2f16 = a.id();
-    const t_ptr_sv_f16 = a.id();
-    const t_ptr_so_f32 = a.id();
-    const t_ptr_smd_f32 = a.id();
-    const t_bool = a.id();
-    // workgroup P slab: [128 q][64 j] f16
-    const c_psh_len = a.id();
-    const t_psh = a.id();
-    const t_ptr_wg_psh = a.id();
-    const v_psh = a.id();
-    const t_ptr_wg_f16 = a.id();
+    // --- header ---
+    try em.line("OpCapability Shader", .{});
+    try em.line("OpCapability Float16", .{});
+    try em.line("OpCapability VulkanMemoryModel", .{});
+    try em.line("OpCapability CooperativeMatrixKHR", .{});
+    try em.line("OpExtension \"SPV_KHR_cooperative_matrix\"", .{});
+    try em.line("OpExtension \"SPV_KHR_vulkan_memory_model\"", .{});
+    try em.line("OpExtension \"SPV_KHR_16bit_storage\"", .{});
+    try em.line("%glsl = OpExtInstImport \"GLSL.std.450\"", .{});
+    try em.line("OpMemoryModel Logical Vulkan", .{});
+    try em.line("OpEntryPoint GLCompute %main \"main\" %gid %lid %vs %vv %vo %vmd %vpush %vpsh", .{});
+    try em.line("OpExecutionMode %main LocalSize 32 4 1", .{});
 
-    const c_u0 = a.id();
-    const c_u1 = a.id();
-    const c_u2 = a.id();
-    const c_u3 = a.id();
-    const c_u4 = a.id();
-    const c_u5 = a.id();
-    const c_u6 = a.id();
-    const c_u7 = a.id();
-    const c_u31 = a.id();
-    const c_u16 = a.id();
-    const c_u32c = a.id();
-    const c_u63 = a.id();
-    const c_u64 = a.id();
-    const c_u128 = a.id();
-    const c_u1024 = a.id();
-    const c_u264 = a.id();
-    const c_scope_sub = a.id();
-    const c_scope_wg = a.id();
-    const t_mat_a = a.id();
-    const t_mat_b = a.id();
-    const t_mat_c = a.id();
-    const c_f32_0 = a.id();
-    const c_acc0 = a.id();
-
-    try a.words.appendSlice(gpa, &.{ 0x0723_0203, 0x0001_0500, 0, 0, 0 });
-    try a.op(17, &.{1});
-    try a.op(17, &.{9});
-    try a.op(17, &.{5345});
-    try a.op(17, &.{6022});
-    try a.opStr(10, &.{}, "SPV_KHR_cooperative_matrix");
-    try a.opStr(10, &.{}, "SPV_KHR_vulkan_memory_model");
-    try a.opStr(10, &.{}, "SPV_KHR_16bit_storage");
-    try a.opStr(11, &.{ext_glsl}, "GLSL.std.450"); // OpExtInstImport
-    try a.op(14, &.{ 0, 3 });
-    {
-        var buf: std.ArrayList(u32) = .empty;
-        defer buf.deinit(gpa);
-        try buf.appendSlice(gpa, &.{ 5, main_fn });
-        try buf.appendSlice(gpa, &.{ std.mem.bytesToValue(u32, "main"), 0 });
-        try buf.appendSlice(gpa, &.{ gid_var, lid_var, v_s, v_v, v_o, v_md, v_push, v_psh });
-        try a.op(15, buf.items);
+    // --- decorations ---
+    try em.line("OpDecorate %gid BuiltIn WorkgroupId", .{});
+    try em.line("OpDecorate %lid BuiltIn LocalInvocationId", .{});
+    try em.line("OpDecorate %arr_f16 ArrayStride 2", .{});
+    try em.line("OpDecorate %arr_ss ArrayStride 4", .{});
+    try em.line("OpDecorate %arr_o ArrayStride 4", .{});
+    try em.line("OpDecorate %arr_md ArrayStride 4", .{});
+    for ([_][]const u8{ "ss", "sv", "so", "smd" }) |s| {
+        try em.line("OpDecorate %{s} Block", .{s});
+        try em.line("OpMemberDecorate %{s} 0 Offset 0", .{s});
     }
-    try a.op(16, &.{ main_fn, 17, 32, 4, 1 }); // LocalSize 32 4 1
-
-    try a.op(71, &.{ gid_var, 11, 26 }); // WorkgroupId
-    try a.op(71, &.{ lid_var, 11, 27 }); // LocalInvocationId
-    try a.op(71, &.{ t_arr_f16, 6, 2 });
-    try a.op(71, &.{ t_arr_f32, 6, 4 });
-    try a.op(71, &.{ t_arr_f32b, 6, 4 });
-    try a.op(71, &.{ t_arr_f32c, 6, 4 });
-    inline for (.{ t_ss, t_sv, t_so, t_smd }) |t| {
-        try a.op(71, &.{ t, 2 });
-        try a.op(72, &.{ t, 0, 35, 0 });
-    }
-    try a.op(71, &.{ t_push, 2 });
-    inline for (0..8) |m| {
-        try a.op(72, &.{ t_push, @intCast(m), 35, @intCast(m * 4) });
-    }
-    inline for (.{ v_s, v_v, v_o, v_md }, 0..) |v, binding| {
-        try a.op(71, &.{ v, 34, 0 });
-        try a.op(71, &.{ v, 33, @intCast(binding) });
+    try em.line("OpDecorate %push Block", .{});
+    for (0..8) |m| try em.line("OpMemberDecorate %push {d} Offset {d}", .{ m, m * 4 });
+    for ([_][]const u8{ "vs", "vv", "vo", "vmd" }, 0..) |v, b| {
+        try em.line("OpDecorate %{s} DescriptorSet 0", .{v});
+        try em.line("OpDecorate %{s} Binding {d}", .{ v, b });
     }
 
-    try a.op(19, &.{t_void});
-    try a.op(33, &.{ t_fnvoid, t_void });
-    try a.op(21, &.{ t_u32, 32, 0 });
-    try a.op(22, &.{ t_f16, 16 });
-    try a.op(22, &.{ t_f32, 32 });
-    try a.op(20, &.{t_bool});
-    try a.op(23, &.{ t_v3u, t_u32, 3 });
-    try a.op(32, &.{ t_ptr_in_v3, 1, t_v3u });
-    try a.op(59, &.{ t_ptr_in_v3, gid_var, 1 });
-    try a.op(59, &.{ t_ptr_in_v3, lid_var, 1 });
+    // --- types ---
+    try em.line("%void = OpTypeVoid", .{});
+    try em.line("%fnvoid = OpTypeFunction %void", .{});
+    try em.line("%u32 = OpTypeInt 32 0", .{});
+    try em.line("%f16 = OpTypeFloat 16", .{});
+    try em.line("%f32 = OpTypeFloat 32", .{});
+    try em.line("%bool = OpTypeBool", .{});
+    try em.line("%v3u = OpTypeVector %u32 3", .{});
+    try em.line("%ptr_in_v3 = OpTypePointer Input %v3u", .{});
+    try em.line("%gid = OpVariable %ptr_in_v3 Input", .{});
+    try em.line("%lid = OpVariable %ptr_in_v3 Input", .{});
+    try em.line("%c_arrlen = OpConstant %u32 268435456", .{});
+    try em.line("%arr_f16 = OpTypeArray %f16 %c_arrlen", .{});
+    try em.line("%arr_ss = OpTypeArray %u32 %c_arrlen", .{}); // S words (f16 pairs)
+    try em.line("%arr_o = OpTypeArray %f32 %c_arrlen", .{});
+    try em.line("%arr_md = OpTypeArray %f32 %c_arrlen", .{});
+    try em.line("%v2f16 = OpTypeVector %f16 2", .{});
+    try em.line("%ss = OpTypeStruct %arr_ss", .{});
+    try em.line("%sv = OpTypeStruct %arr_f16", .{});
+    try em.line("%so = OpTypeStruct %arr_o", .{});
+    try em.line("%smd = OpTypeStruct %arr_md", .{});
+    try em.line("%ptr_ss = OpTypePointer StorageBuffer %ss", .{});
+    try em.line("%ptr_sv = OpTypePointer StorageBuffer %sv", .{});
+    try em.line("%ptr_so = OpTypePointer StorageBuffer %so", .{});
+    try em.line("%ptr_smd = OpTypePointer StorageBuffer %smd", .{});
+    try em.line("%vs = OpVariable %ptr_ss StorageBuffer", .{});
+    try em.line("%vv = OpVariable %ptr_sv StorageBuffer", .{});
+    try em.line("%vo = OpVariable %ptr_so StorageBuffer", .{});
+    try em.line("%vmd = OpVariable %ptr_smd StorageBuffer", .{});
+    try em.line("%push = OpTypeStruct %u32 %u32 %u32 %u32 %u32 %u32 %u32 %u32", .{});
+    try em.line("%ptr_push = OpTypePointer PushConstant %push", .{});
+    try em.line("%vpush = OpVariable %ptr_push PushConstant", .{});
+    try em.line("%ptr_pc_u32 = OpTypePointer PushConstant %u32", .{});
+    try em.line("%ptr_ss_f32 = OpTypePointer StorageBuffer %u32", .{});
+    try em.line("%ptr_sv_f16 = OpTypePointer StorageBuffer %f16", .{});
+    try em.line("%ptr_so_f32 = OpTypePointer StorageBuffer %f32", .{});
+    try em.line("%ptr_smd_f32 = OpTypePointer StorageBuffer %f32", .{});
 
-    try a.op(43, &.{ t_u32, c_arrlen, 1 << 28 });
-    try a.op(28, &.{ t_arr_f16, t_f16, c_arrlen });
-    try a.op(28, &.{ t_arr_f32, t_u32, c_arrlen }); // S words (f16 pairs)
-    try a.op(28, &.{ t_arr_f32b, t_f32, c_arrlen });
-    try a.op(28, &.{ t_arr_f32c, t_f32, c_arrlen });
-    try a.op(23, &.{ t_v2f16, t_f16, 2 });
-    try a.op(30, &.{ t_ss, t_arr_f32 });
-    try a.op(30, &.{ t_sv, t_arr_f16 });
-    try a.op(30, &.{ t_so, t_arr_f32b });
-    try a.op(30, &.{ t_smd, t_arr_f32c });
-    try a.op(32, &.{ t_ptr_ss, 12, t_ss });
-    try a.op(32, &.{ t_ptr_sv, 12, t_sv });
-    try a.op(32, &.{ t_ptr_so, 12, t_so });
-    try a.op(32, &.{ t_ptr_smd, 12, t_smd });
-    try a.op(59, &.{ t_ptr_ss, v_s, 12 });
-    try a.op(59, &.{ t_ptr_sv, v_v, 12 });
-    try a.op(59, &.{ t_ptr_so, v_o, 12 });
-    try a.op(59, &.{ t_ptr_smd, v_md, 12 });
-    try a.op(30, &.{ t_push, t_u32, t_u32, t_u32, t_u32, t_u32, t_u32, t_u32, t_u32 });
-    try a.op(32, &.{ t_ptr_push, 9, t_push });
-    try a.op(59, &.{ t_ptr_push, v_push, 9 });
-    try a.op(32, &.{ t_ptr_pc_u32, 9, t_u32 });
-    try a.op(32, &.{ t_ptr_ss_f32, 12, t_u32 });
-    try a.op(32, &.{ t_ptr_sv_f16, 12, t_f16 });
-    try a.op(32, &.{ t_ptr_so_f32, 12, t_f32 });
-    try a.op(32, &.{ t_ptr_smd_f32, 12, t_f32 });
+    // Workgroup P slab: [128][64] f16.
+    try em.line("%c_psh_len = OpConstant %u32 8192", .{});
+    try em.line("%t_psh = OpTypeArray %f16 %c_psh_len", .{});
+    try em.line("%ptr_wg_psh = OpTypePointer Workgroup %t_psh", .{});
+    try em.line("%vpsh = OpVariable %ptr_wg_psh Workgroup", .{});
+    try em.line("%ptr_wg_f16 = OpTypePointer Workgroup %f16", .{});
 
-    // Workgroup P slab (no layout decorations): [128][64] f16.
-    try a.op(43, &.{ t_u32, c_psh_len, 8192 });
-    try a.op(28, &.{ t_psh, t_f16, c_psh_len });
-    try a.op(32, &.{ t_ptr_wg_psh, 4, t_psh });
-    try a.op(59, &.{ t_ptr_wg_psh, v_psh, 4 });
-    try a.op(32, &.{ t_ptr_wg_f16, 4, t_f16 });
+    for ([_]struct { []const u8, u32 }{
+        .{ "c_u0", 0 },  .{ "c_u1", 1 },   .{ "c_u2", 2 },     .{ "c_u3", 3 },
+        .{ "c_u4", 4 },  .{ "c_u5", 5 },   .{ "c_u6", 6 },     .{ "c_u7", 7 },
+        .{ "c_u31", 31 }, .{ "c_u16", 16 }, .{ "c_u32c", 32 }, .{ "c_u63", 63 },
+        .{ "c_u64", 64 }, .{ "c_u128", 128 }, .{ "c_u1024", 1024 }, .{ "c_u264", 0x108 },
+        .{ "c_scope_sub", 3 }, .{ "c_scope_wg", 2 },
+    }) |cv| try em.line("%{s} = OpConstant %u32 {d}", .{ cv[0], cv[1] });
 
-    try a.op(43, &.{ t_u32, c_u0, 0 });
-    try a.op(43, &.{ t_u32, c_u1, 1 });
-    try a.op(43, &.{ t_u32, c_u2, 2 });
-    try a.op(43, &.{ t_u32, c_u3, 3 });
-    try a.op(43, &.{ t_u32, c_u4, 4 });
-    try a.op(43, &.{ t_u32, c_u5, 5 });
-    try a.op(43, &.{ t_u32, c_u6, 6 });
-    try a.op(43, &.{ t_u32, c_u7, 7 });
-    try a.op(43, &.{ t_u32, c_u31, 31 });
-    try a.op(43, &.{ t_u32, c_u16, 16 });
-    try a.op(43, &.{ t_u32, c_u32c, 32 });
-    try a.op(43, &.{ t_u32, c_u63, 63 });
-    try a.op(43, &.{ t_u32, c_u64, 64 });
-    try a.op(43, &.{ t_u32, c_u128, 128 });
-    try a.op(43, &.{ t_u32, c_u1024, 1024 });
-    try a.op(43, &.{ t_u32, c_u264, 0x108 });
-    try a.op(43, &.{ t_u32, c_scope_sub, 3 });
-    try a.op(43, &.{ t_u32, c_scope_wg, 2 });
+    try em.line("%mat_a = OpTypeCooperativeMatrixKHR %f16 %c_scope_sub %c_u16 %c_u16 %c_u0", .{});
+    try em.line("%mat_b = OpTypeCooperativeMatrixKHR %f16 %c_scope_sub %c_u16 %c_u16 %c_u1", .{});
+    try em.line("%mat_c = OpTypeCooperativeMatrixKHR %f32 %c_scope_sub %c_u16 %c_u16 %c_u2", .{});
+    try em.line("%c_f32_0 = OpConstant %f32 0", .{});
+    try em.line("%c_acc0 = OpConstantComposite %mat_c %c_f32_0", .{});
 
-    try a.op(4456, &.{ t_mat_a, t_f16, c_scope_sub, c_u16, c_u16, c_u0 });
-    try a.op(4456, &.{ t_mat_b, t_f16, c_scope_sub, c_u16, c_u16, c_u1 });
-    try a.op(4456, &.{ t_mat_c, t_f32, c_scope_sub, c_u16, c_u16, c_u2 });
-    try a.op(43, &.{ t_f32, c_f32_0, 0 });
-    try a.op(44, &.{ t_mat_c, c_acc0, c_f32_0 });
-
-    var c_k16: [4]u32 = undefined; // ks*16
-    c_k16[0] = c_u0;
-    c_k16[1] = c_u16;
-    c_k16[2] = c_u32c;
-    c_k16[3] = a.id();
-    try a.op(43, &.{ t_u32, c_k16[3], 48 });
-    var c_col16: [8]u32 = undefined; // nt*16
-    c_col16[0] = c_u0;
-    c_col16[1] = c_u16;
-    c_col16[2] = c_u32c;
-    c_col16[3] = c_k16[3];
-    c_col16[4] = c_u64;
+    // c_k16[ks*16], c_col16[nt*16].
+    const c_k16 = [_][]const u8{ "c_u0", "c_u16", "c_u32c", "c_k16_3" };
+    try em.line("%c_k16_3 = OpConstant %u32 48", .{});
+    var c_col16: [8][]const u8 = .{ "c_u0", "c_u16", "c_u32c", "c_k16_3", "c_u64", "", "", "" };
     for (5..8) |nt| {
-        c_col16[nt] = a.id();
-        try a.op(43, &.{ t_u32, c_col16[nt], @intCast(nt * 16) });
+        try em.line("%c_col16_{d} = OpConstant %u32 {d}", .{ nt, nt * 16 });
     }
-
+    c_col16[5] = "c_col16_5";
+    c_col16[6] = "c_col16_6";
+    c_col16[7] = "c_col16_7";
 
     // --- function ---
-    const lb_entry = a.id();
-    try a.op(54, &.{ t_void, main_fn, 0, t_fnvoid });
-    try a.op(248, &.{lb_entry});
+    try em.line("%main = OpFunction %void None %fnvoid", .{});
+    try em.line("%entry = OpLabel", .{});
 
-    const gidv = a.id();
-    try a.op(61, &.{ t_v3u, gidv, gid_var });
-    const tile_r = a.id();
-    const zidx = a.id();
-    try a.op(81, &.{ t_u32, tile_r, gidv, 1 });
-    try a.op(81, &.{ t_u32, zidx, gidv, 2 });
-    const row0 = a.id();
-    try a.op(132, &.{ t_u32, row0, tile_r, c_u128 });
+    const gidv = em.id();
+    try em.line("%t{d} = OpLoad %v3u %gid", .{gidv});
+    const tile_r = em.id();
+    try em.line("%t{d} = OpCompositeExtract %u32 %t{d} 1", .{ tile_r, gidv });
+    const zidx = em.id();
+    try em.line("%t{d} = OpCompositeExtract %u32 %t{d} 2", .{ zidx, gidv });
+    const row0 = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %c_u128", .{ row0, tile_r });
 
-    const lidv = a.id();
-    try a.op(61, &.{ t_v3u, lidv, lid_var });
-    const lx = a.id();
-    const ly = a.id();
-    try a.op(81, &.{ t_u32, lx, lidv, 0 });
-    try a.op(81, &.{ t_u32, ly, lidv, 1 });
-    const flat = a.id();
-    const lymul = a.id();
-    try a.op(132, &.{ t_u32, lymul, ly, c_u32c });
-    try a.op(128, &.{ t_u32, flat, lymul, lx });
+    const lidv = em.id();
+    try em.line("%t{d} = OpLoad %v3u %lid", .{lidv});
+    const lx = em.id();
+    try em.line("%t{d} = OpCompositeExtract %u32 %t{d} 0", .{ lx, lidv });
+    const ly = em.id();
+    try em.line("%t{d} = OpCompositeExtract %u32 %t{d} 1", .{ ly, lidv });
+    const lymul = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %c_u32c", .{ lymul, ly });
+    const flat = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ flat, lymul, lx });
 
-    var push_vals: [8]u32 = undefined;
-    inline for (0..8) |m| {
-        const pptr = a.id();
-        const pval = a.id();
-        const cidx = switch (m) {
-            0 => c_u0,
-            1 => c_u1,
-            2 => c_u2,
-            3 => c_u3,
-            4 => c_u4,
-            5 => c_u5,
-            6 => c_u6,
-            else => c_u7,
-        };
-        try a.op(65, &.{ t_ptr_pc_u32, pptr, v_push, cidx });
-        try a.op(61, &.{ t_u32, pval, pptr });
-        push_vals[m] = pval;
+    const pnames = [_][]const u8{ "psstride", "psplane", "pheadoff", "pgroup", "pvstride", "postride", "pseq", "pmdplane" };
+    for (0..8) |m| {
+        const pptr = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_pc_u32 %vpush %c_u{d}", .{ pptr, m });
+        try em.line("%{s} = OpLoad %u32 %t{d}", .{ pnames[m], pptr });
     }
-    const p_sstride = push_vals[0];
-    const p_splane = push_vals[1];
-    const p_headoff = push_vals[2];
-    const p_group = push_vals[3];
-    const p_vstride = push_vals[4];
-    const p_ostride = push_vals[5];
-    const p_seq = push_vals[6]; // valid j count (f0 push word, u32 bits)
-    const p_mdplane = push_vals[7]; // MD rows per plane (f1 push word)
 
-    const head = a.id();
-    try a.op(128, &.{ t_u32, head, p_headoff, zidx });
-    const kvh = a.id();
-    try a.op(134, &.{ t_u32, kvh, head, p_group }); // UDiv
-    const headmul = a.id();
-    try a.op(132, &.{ t_u32, headmul, head, c_u128 });
-    const kvmul = a.id();
-    try a.op(132, &.{ t_u32, kvmul, kvh, c_u128 });
+    const head = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %pheadoff %t{d}", .{ head, zidx });
+    const kvh = em.id();
+    try em.line("%t{d} = OpUDiv %u32 %t{d} %pgroup", .{ kvh, head });
+    const headmul = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %c_u128", .{ headmul, head });
+    const kvmul = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %c_u128", .{ kvmul, kvh });
 
-    // Warp tiling: 2x2 grid of 64x64 tiles (out cols = head_dim = 128).
-    const warp_m = a.id();
-    try a.op(199, &.{ t_u32, warp_m, ly, c_u1 }); // ly & 1
-    const warp_n = a.id();
-    try a.op(194, &.{ t_u32, warp_n, ly, c_u1 }); // ly >> 1
-    const wm64 = a.id();
-    try a.op(132, &.{ t_u32, wm64, warp_m, c_u64 });
-    const row_s = a.id();
-    try a.op(128, &.{ t_u32, row_s, row0, wm64 });
-    const wn64 = a.id();
-    try a.op(132, &.{ t_u32, wn64, warp_n, c_u64 });
+    // Warp tiling: 2x2 grid of 64x64 tiles.
+    const warp_m = em.id();
+    try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %c_u1", .{ warp_m, ly });
+    const warp_n = em.id();
+    try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %c_u1", .{ warp_n, ly });
+    const wm64 = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %c_u64", .{ wm64, warp_m });
+    const row_s = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ row_s, row0, wm64 });
+    const wn64 = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %c_u64", .{ wn64, warp_n });
 
-    // Loop-invariant staging indices: thread `flat`, element t (of 64) is
-    // slab element e = flat + t*128, i.e. P row e/64 (q = row0 + row),
-    // column e%64 (j = k0 + column). Per element the row's {m, 1/d} pair
-    // is loaded from MD at (z*s_stride + q)*2.
-    const s_zbase = a.id();
-    try a.op(132, &.{ t_u32, s_zbase, zidx, p_splane });
-    const md_zrow = a.id();
-    try a.op(132, &.{ t_u32, md_zrow, zidx, p_mdplane });
-    // Per thread: 32 S words, each an f16 pair covering slab elements
-    // 2v/2v+1 with v = flat + t*128 (slab row v/32, columns (v%32)*2).
-    var srow_t: [32]u32 = undefined; // (row0 + v/32) * s_stride + z*splane
-    var mdi_t: [32]u32 = undefined; // ((z*sstride) + row0 + v/32) * 2
-    var jcol_t: [32]u32 = undefined; // (v % 32) * 2
-    var e_t: [32]u32 = undefined; // slab element base = v*2
+    // Loop-invariant staging indices (32 f16-pair words per thread).
+    const s_zbase = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %psplane", .{ s_zbase, zidx });
+    const md_zrow = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %pmdplane", .{ md_zrow, zidx });
+    var srow_t: [32]u32 = undefined;
+    var mdi_t: [32]u32 = undefined;
+    var jcol_t: [32]u32 = undefined;
+    var e_t: [32]u32 = undefined;
     var v_prev: u32 = 0;
-    for (0..32) |t| {
+    for (0..32) |i| {
         var v = flat;
-        if (t > 0) {
-            const vn = a.id();
-            try a.op(128, &.{ t_u32, vn, v_prev, c_u128 });
+        if (i > 0) {
+            const vn = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %c_u128", .{ vn, v_prev });
             v = vn;
         }
         v_prev = v;
-        e_t[t] = a.id();
-        try a.op(196, &.{ t_u32, e_t[t], v, c_u1 });
-        const erow = a.id();
-        try a.op(194, &.{ t_u32, erow, v, c_u5 }); // v / 32
-        const vmod = a.id();
-        try a.op(199, &.{ t_u32, vmod, v, c_u31 });
-        jcol_t[t] = a.id();
-        try a.op(196, &.{ t_u32, jcol_t[t], vmod, c_u1 }); // * 2
-        const qrow = a.id();
-        try a.op(128, &.{ t_u32, qrow, row0, erow });
-        const qmul = a.id();
-        try a.op(132, &.{ t_u32, qmul, qrow, p_sstride });
-        srow_t[t] = a.id();
-        try a.op(128, &.{ t_u32, srow_t[t], s_zbase, qmul });
-        const mdrow = a.id();
-        try a.op(128, &.{ t_u32, mdrow, md_zrow, qrow });
-        mdi_t[t] = a.id();
-        try a.op(196, &.{ t_u32, mdi_t[t], mdrow, c_u1 }); // ShiftLeftLogical: *2
+        e_t[i] = em.id();
+        try em.line("%t{d} = OpShiftLeftLogical %u32 %t{d} %c_u1", .{ e_t[i], v });
+        const erow = em.id();
+        try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %c_u5", .{ erow, v }); // v / 32
+        const vmod = em.id();
+        try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %c_u31", .{ vmod, v });
+        jcol_t[i] = em.id();
+        try em.line("%t{d} = OpShiftLeftLogical %u32 %t{d} %c_u1", .{ jcol_t[i], vmod }); // * 2
+        const qrow = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ qrow, row0, erow });
+        const qmul = em.id();
+        try em.line("%t{d} = OpIMul %u32 %t{d} %psstride", .{ qmul, qrow });
+        srow_t[i] = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ srow_t[i], s_zbase, qmul });
+        const mdrow = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ mdrow, md_zrow, qrow });
+        mdi_t[i] = em.id();
+        try em.line("%t{d} = OpShiftLeftLogical %u32 %t{d} %c_u1", .{ mdi_t[i], mdrow }); // *2
     }
 
-    const lb_head = a.id();
-    const lb_cond = a.id();
-    const lb_body = a.id();
-    const lb_cont = a.id();
-    const lb_merge = a.id();
-    const k0n = a.id();
+    // Pre-allocated ids for the loop-carried values (phi back-edges).
+    const k0n = em.id();
     var acc_next: [4][4]u32 = undefined;
     for (&acc_next) |*row| for (row) |*v| {
-        v.* = a.id();
+        v.* = em.id();
     };
 
-    try a.op(249, &.{lb_head});
-    try a.op(248, &.{lb_head});
-    const k0v = a.id();
-    try a.op(245, &.{ t_u32, k0v, c_u0, lb_entry, k0n, lb_cont }); // OpPhi
+    try em.line("OpBranch %head", .{});
+    try em.line("%head = OpLabel", .{});
+    const k0v = em.id();
+    try em.line("%t{d} = OpPhi %u32 %c_u0 %entry %t{d} %cont", .{ k0v, k0n });
     var acc_phi: [4][4]u32 = undefined;
     for (&acc_phi, acc_next) |*prow, nrow| {
         for (prow, nrow) |*ap, an| {
-            ap.* = a.id();
-            try a.op(245, &.{ t_mat_c, ap.*, c_acc0, lb_entry, an, lb_cont });
+            ap.* = em.id();
+            try em.line("%t{d} = OpPhi %mat_c %c_acc0 %entry %t{d} %cont", .{ ap.*, an });
         }
     }
-    try a.op(246, &.{ lb_merge, lb_cont, 0 });
-    try a.op(249, &.{lb_cond});
-    try a.op(248, &.{lb_cond});
-    const cmp = a.id();
-    try a.op(176, &.{ t_bool, cmp, k0v, p_sstride }); // j count == s_stride
-    try a.op(250, &.{ cmp, lb_body, lb_merge });
+    try em.line("OpLoopMerge %merge %cont None", .{});
+    try em.line("OpBranch %cond", .{});
+    try em.line("%cond = OpLabel", .{});
+    const cmp = em.id();
+    try em.line("%t{d} = OpULessThan %bool %t{d} %psstride", .{ cmp, k0v });
+    try em.line("OpBranchConditional %t{d} %body %merge", .{cmp});
 
-    try a.op(248, &.{lb_body});
-    // Stage P = exp(S - m) * invd into the slab, 32 f16-pair words per
-    // thread (S is stored half-precision by the scores kernel).
-    for (0..32) |t| {
-        const soff = a.id();
-        try a.op(128, &.{ t_u32, soff, srow_t[t], k0v });
-        const soff2 = a.id();
-        try a.op(128, &.{ t_u32, soff2, soff, jcol_t[t] });
-        const widx = a.id();
-        try a.op(194, &.{ t_u32, widx, soff2, c_u1 }); // element -> word
-        const sptr = a.id();
-        try a.op(65, &.{ t_ptr_ss_f32, sptr, v_s, c_u0, widx });
-        const sword = a.id();
-        try a.op(61, &.{ t_u32, sword, sptr });
-        const spair = a.id();
-        try a.op(124, &.{ t_v2f16, spair, sword }); // Bitcast
-        const mptr = a.id();
-        try a.op(65, &.{ t_ptr_smd_f32, mptr, v_md, c_u0, mdi_t[t] });
-        const mval = a.id();
-        try a.op(61, &.{ t_f32, mval, mptr });
-        const mdi1 = a.id();
-        try a.op(128, &.{ t_u32, mdi1, mdi_t[t], c_u1 });
-        const dptr = a.id();
-        try a.op(65, &.{ t_ptr_smd_f32, dptr, v_md, c_u0, mdi1 });
-        const dval = a.id();
-        try a.op(61, &.{ t_f32, dval, dptr });
-        const jj0 = a.id();
-        try a.op(128, &.{ t_u32, jj0, k0v, jcol_t[t] });
+    try em.line("%body = OpLabel", .{});
+    // Stage P = exp(S - m) * invd into the slab.
+    for (0..32) |i| {
+        const soff = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ soff, srow_t[i], k0v });
+        const soff2 = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ soff2, soff, jcol_t[i] });
+        const widx = em.id();
+        try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %c_u1", .{ widx, soff2 }); // element -> word
+        const sptr = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_ss_f32 %vs %c_u0 %t{d}", .{ sptr, widx });
+        const sword = em.id();
+        try em.line("%t{d} = OpLoad %u32 %t{d}", .{ sword, sptr });
+        const spair = em.id();
+        try em.line("%t{d} = OpBitcast %v2f16 %t{d}", .{ spair, sword });
+        const mptr = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_smd_f32 %vmd %c_u0 %t{d}", .{ mptr, mdi_t[i] });
+        const mval = em.id();
+        try em.line("%t{d} = OpLoad %f32 %t{d}", .{ mval, mptr });
+        const mdi1 = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %c_u1", .{ mdi1, mdi_t[i] });
+        const dptr = em.id();
+        try em.line("%t{d} = OpAccessChain %ptr_smd_f32 %vmd %c_u0 %t{d}", .{ dptr, mdi1 });
+        const dval = em.id();
+        try em.line("%t{d} = OpLoad %f32 %t{d}", .{ dval, dptr });
+        const jj0 = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ jj0, k0v, jcol_t[i] });
         for (0..2) |half| {
-            const hf = a.id();
-            try a.op(81, &.{ t_f16, hf, spair, @intCast(half) }); // CompositeExtract
-            const sval = a.id();
-            try a.op(115, &.{ t_f32, sval, hf }); // FConvert f16 -> f32
-            const shifted = a.id();
-            try a.op(131, &.{ t_f32, shifted, sval, mval }); // FSub
-            const eval = a.id();
-            try a.op(12, &.{ t_f32, eval, ext_glsl, 27, shifted }); // Exp
-            const pval = a.id();
-            try a.op(133, &.{ t_f32, pval, eval, dval }); // FMul
-            // Padded j columns hold S = 0; with a negative row max that P
-            // overflows f16 (Inf * V(0) = NaN), so force it to zero.
+            const hf = em.id();
+            try em.line("%t{d} = OpCompositeExtract %f16 %t{d} {d}", .{ hf, spair, half });
+            const sval = em.id();
+            try em.line("%t{d} = OpFConvert %f32 %t{d}", .{ sval, hf });
+            const shifted = em.id();
+            try em.line("%t{d} = OpFSub %f32 %t{d} %t{d}", .{ shifted, sval, mval });
+            const eval = em.id();
+            try em.line("%t{d} = OpExtInst %f32 %glsl 27 %t{d}", .{ eval, shifted }); // Exp
+            const pval = em.id();
+            try em.line("%t{d} = OpFMul %f32 %t{d} %t{d}", .{ pval, eval, dval });
             var jj = jj0;
             if (half == 1) {
-                const j1 = a.id();
-                try a.op(128, &.{ t_u32, j1, jj0, c_u1 });
+                const j1 = em.id();
+                try em.line("%t{d} = OpIAdd %u32 %t{d} %c_u1", .{ j1, jj0 });
                 jj = j1;
             }
-            const j_ok = a.id();
-            try a.op(176, &.{ t_bool, j_ok, jj, p_seq }); // ULessThan
-            const pclamp = a.id();
-            try a.op(169, &.{ t_f32, pclamp, j_ok, pval, c_f32_0 }); // Select
-            const hval = a.id();
-            try a.op(115, &.{ t_f16, hval, pclamp }); // FConvert
-            var eidx = e_t[t];
+            const j_ok = em.id();
+            try em.line("%t{d} = OpULessThan %bool %t{d} %pseq", .{ j_ok, jj });
+            const pclamp = em.id();
+            try em.line("%t{d} = OpSelect %f32 %t{d} %t{d} %c_f32_0", .{ pclamp, j_ok, pval });
+            const hval = em.id();
+            try em.line("%t{d} = OpFConvert %f16 %t{d}", .{ hval, pclamp });
+            var eidx = e_t[i];
             if (half == 1) {
-                const e1 = a.id();
-                try a.op(128, &.{ t_u32, e1, e_t[t], c_u1 });
+                const e1 = em.id();
+                try em.line("%t{d} = OpIAdd %u32 %t{d} %c_u1", .{ e1, e_t[i] });
                 eidx = e1;
             }
-            const pptr = a.id();
-            try a.op(65, &.{ t_ptr_wg_f16, pptr, v_psh, eidx });
-            try a.op(62, &.{ pptr, hval });
+            const pptr = em.id();
+            try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vpsh %t{d}", .{ pptr, eidx });
+            try em.line("OpStore %t{d} %t{d}", .{ pptr, hval });
         }
     }
-    try a.op(224, &.{ c_scope_wg, c_scope_wg, c_u264 }); // OpControlBarrier
+    try em.line("OpControlBarrier %c_scope_wg %c_scope_wg %c_u264", .{});
 
-    // 4 j sub-steps: P tiles from the slab, V tiles straight from global;
-    // 2x2 of 64x64 per warp (16 MMAs per 8 fragment loads).
+    // 4 j sub-steps: P tiles from the slab, V tiles from global.
     var acc_cur = acc_phi;
-    const a_shbase = a.id();
-    try a.op(132, &.{ t_u32, a_shbase, wm64, c_u64 }); // warp_m*64 rows * 64 cols
+    const a_shbase = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %c_u64", .{ a_shbase, wm64 });
     for (0..4) |ks| {
         var a_off = a_shbase;
         if (ks > 0) {
-            const ao = a.id();
-            try a.op(128, &.{ t_u32, ao, a_shbase, c_k16[ks] });
+            const ao = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ ao, a_shbase, c_k16[ks] });
             a_off = ao;
         }
         var ma: [4]u32 = undefined;
         var ao_cur = a_off;
         for (0..4) |r| {
             if (r > 0) {
-                const a2 = a.id();
-                try a.op(128, &.{ t_u32, a2, ao_cur, c_u1024 }); // +16 rows * 64
+                const a2 = em.id();
+                try em.line("%t{d} = OpIAdd %u32 %t{d} %c_u1024", .{ a2, ao_cur });
                 ao_cur = a2;
             }
-            const aptr = a.id();
-            try a.op(65, &.{ t_ptr_wg_f16, aptr, v_psh, ao_cur });
-            ma[r] = a.id();
-            try a.op(4457, &.{ t_mat_a, ma[r], aptr, c_u0, c_u64 });
+            const aptr = em.id();
+            try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vpsh %t{d}", .{ aptr, ao_cur });
+            ma[r] = em.id();
+            try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_a %t{d} %c_u0 %c_u64", .{ ma[r], aptr });
         }
-        // V row block: j = k0 + ks*16; warp's column quarter.
-        const jrow = a.id();
-        try a.op(128, &.{ t_u32, jrow, k0v, c_k16[ks] });
-        const jmul = a.id();
-        try a.op(132, &.{ t_u32, jmul, jrow, p_vstride });
-        const vb0 = a.id();
-        try a.op(128, &.{ t_u32, vb0, jmul, kvmul });
-        const vbase = a.id();
-        try a.op(128, &.{ t_u32, vbase, vb0, wn64 });
+        const jrow = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ jrow, k0v, c_k16[ks] });
+        const jmul = em.id();
+        try em.line("%t{d} = OpIMul %u32 %t{d} %pvstride", .{ jmul, jrow });
+        const vb0 = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ vb0, jmul, kvmul });
+        const vbase = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ vbase, vb0, wn64 });
         for (0..4) |nt| {
             var v_off = vbase;
             if (nt > 0) {
-                const vo = a.id();
-                try a.op(128, &.{ t_u32, vo, vbase, c_col16[nt] });
+                const vo = em.id();
+                try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ vo, vbase, c_col16[nt] });
                 v_off = vo;
             }
-            const vptr = a.id();
-            try a.op(65, &.{ t_ptr_sv_f16, vptr, v_v, c_u0, v_off });
-            const mb = a.id();
-            try a.op(4457, &.{ t_mat_b, mb, vptr, c_u0, p_vstride });
+            const vptr = em.id();
+            try em.line("%t{d} = OpAccessChain %ptr_sv_f16 %vv %c_u0 %t{d}", .{ vptr, v_off });
+            const mb = em.id();
+            try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_b %t{d} %c_u0 %pvstride", .{ mb, vptr });
             for (0..4) |r| {
-                const acc_out = if (ks == 3) acc_next[r][nt] else a.id();
-                try a.op(4459, &.{ t_mat_c, acc_out, ma[r], mb, acc_cur[r][nt] });
+                const acc_out = if (ks == 3) acc_next[r][nt] else em.id();
+                try em.line("%t{d} = OpCooperativeMatrixMulAddKHR %mat_c %t{d} %t{d} %t{d}", .{ acc_out, ma[r], mb, acc_cur[r][nt] });
                 acc_cur[r][nt] = acc_out;
             }
         }
     }
-    try a.op(224, &.{ c_scope_wg, c_scope_wg, c_u264 });
-    try a.op(249, &.{lb_cont});
+    try em.line("OpControlBarrier %c_scope_wg %c_scope_wg %c_u264", .{});
+    try em.line("OpBranch %cont", .{});
 
-    try a.op(248, &.{lb_cont});
-    try a.op(128, &.{ t_u32, k0n, k0v, c_u64 });
-    try a.op(249, &.{lb_head});
+    try em.line("%cont = OpLabel", .{});
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %c_u64", .{ k0n, k0v });
+    try em.line("OpBranch %head", .{});
 
-    // merge: store 4x4 OUT tiles at (row_s + r*16, head*128 + wn64 + nt*16).
-    try a.op(248, &.{lb_merge});
-    const orn16 = a.id();
-    try a.op(132, &.{ t_u32, orn16, c_u16, p_ostride });
-    var o_rowmul = a.id();
-    try a.op(132, &.{ t_u32, o_rowmul, row_s, p_ostride });
-    const o_head = a.id();
-    try a.op(128, &.{ t_u32, o_head, headmul, wn64 });
+    // merge: store 4x4 OUT tiles.
+    try em.line("%merge = OpLabel", .{});
+    const orn16 = em.id();
+    try em.line("%t{d} = OpIMul %u32 %c_u16 %postride", .{orn16});
+    var o_rowmul = em.id();
+    try em.line("%t{d} = OpIMul %u32 %t{d} %postride", .{ o_rowmul, row_s });
+    const o_head = em.id();
+    try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ o_head, headmul, wn64 });
     for (0..4) |r| {
         if (r > 0) {
-            const nx = a.id();
-            try a.op(128, &.{ t_u32, nx, o_rowmul, orn16 });
+            const nx = em.id();
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ nx, o_rowmul, orn16 });
             o_rowmul = nx;
         }
-        const o_base = a.id();
-        try a.op(128, &.{ t_u32, o_base, o_rowmul, o_head });
+        const o_base = em.id();
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ o_base, o_rowmul, o_head });
         for (0..4) |nt| {
             var ob = o_base;
             if (nt > 0) {
-                const oc = a.id();
-                try a.op(128, &.{ t_u32, oc, o_base, c_col16[nt] });
+                const oc = em.id();
+                try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ oc, o_base, c_col16[nt] });
                 ob = oc;
             }
-            const optr = a.id();
-            try a.op(65, &.{ t_ptr_so_f32, optr, v_o, c_u0, ob });
-            try a.op(4458, &.{ optr, acc_phi[r][nt], c_u0, p_ostride });
+            const optr = em.id();
+            try em.line("%t{d} = OpAccessChain %ptr_so_f32 %vo %c_u0 %t{d}", .{ optr, ob });
+            try em.line("OpCooperativeMatrixStoreKHR %t{d} %t{d} %c_u0 %postride", .{ optr, acc_phi[r][nt] });
         }
     }
-    try a.op(253, &.{});
-    try a.op(56, &.{});
+    try em.line("OpReturn", .{});
+    try em.line("OpFunctionEnd", .{});
 
-    a.words.items[3] = a.next;
-    const out = try gpa.alignedAlloc(u8, .of(u32), a.words.items.len * 4);
-    @memcpy(out, std.mem.sliceAsBytes(a.words.items));
-    return out;
+    return sasm.assembleChecked(gpa, sasm.version_1_5, t.items);
 }
