@@ -1,8 +1,13 @@
 //! qwen35 hybrid (gated DeltaNet) on the Vulkan backend. Text-only, fixed KV
 //! capacity, one token at a time (no batched prefill, CUDA-graph capture, or
-//! CPU split) — a correctness-first port of qwen35_cuda.zig that reuses the
-//! validated block-quant GEMV + GDN + RoPE + attention Context ops. Every op
-//! submits synchronously (no batching), so it is unoptimized but simple.
+//! CPU split) — a port of qwen35_cuda.zig that reuses the validated
+//! block-quant GEMV + GDN + RoPE + attention Context ops.
+//!
+//! Each token's whole layer stack is recorded into one command buffer
+//! (beginBatch/endBatch) and submitted once, so the GPU stays saturated
+//! instead of paying a submit+wait per op. The KV append is an in-batch
+//! device copy (not tensorCopy, which would flush the recording every layer).
+//! Prefill still runs a token at a time; batched prefill is a follow-up.
 
 const std = @import("std");
 const qwen3 = @import("qwen3.zig");
@@ -47,6 +52,8 @@ pub const VulkanLM = struct {
     mlp_gate: Buf,
     mlp_up: Buf,
     logits: Buf,
+    // k-split GEMV partials scratch [nchunk][max_rows]; reduced by gemv_combine.
+    partials: Buf,
 
     // Per-attention-slot KV caches [capacity][kvDim]; recurrent conv/ssm states.
     k_cache: []Buf,
@@ -59,6 +66,11 @@ pub const VulkanLM = struct {
     sin_off: usize,
     // Per-linear-layer [a | dt_bias] host constants for gdn_gates.
     a_dt: [][]f32,
+
+    /// Superblock chunks per output row in the transposed k-split GEMV. One
+    /// thread per (row, chunk); enough chunks to give the 3090 the warps it
+    /// needs to hide memory latency (one-thread-per-row is ~1.4 warps/SM).
+    const gemv_nchunk = 16;
 
     fn zeroBuf(ctx: *gpu.Context, gpa: std.mem.Allocator, buf: Buf, bytes: usize) !void {
         const zeros = try gpa.alloc(u8, bytes);
@@ -112,6 +124,10 @@ pub const VulkanLM = struct {
         self.mlp_gate = try ctx.tensorCreate(cfg.intermediate * 4);
         self.mlp_up = try ctx.tensorCreate(cfg.intermediate * 4);
         self.logits = try ctx.tensorCreate(cfg.vocab * 4);
+        // Split-GEMV partials, sized for the largest GEMV output (LM head,
+        // rows = vocab) times nchunk.
+        const max_rows = @max(cfg.vocab, @max(cfg.convChannels(), @max(cfg.intermediate, cfg.qDim() * 2)));
+        self.partials = try ctx.tensorCreate(max_rows * gemv_nchunk * 4);
 
         const n_attn = cfg.nAttnLayers();
         self.k_cache = try alloc.alloc(Buf, n_attn);
@@ -152,7 +168,7 @@ pub const VulkanLM = struct {
 
     pub fn deinit(self: *VulkanLM) void {
         const ctx = self.ctx;
-        inline for (.{ "x", "normed", "qg", "q", "gate", "k", "v", "attn", "t", "lin_qkv", "lin_conv", "lin_z", "lin_o", "ab", "gates", "mlp_gate", "mlp_up", "logits", "freqs_d" }) |f| {
+        inline for (.{ "x", "normed", "qg", "q", "gate", "k", "v", "attn", "t", "lin_qkv", "lin_conv", "lin_z", "lin_o", "ab", "gates", "mlp_gate", "mlp_up", "logits", "partials", "freqs_d" }) |f| {
             ctx.tensorDestroy(&@field(self, f));
         }
         for (self.k_cache) |*b| ctx.tensorDestroy(b);
@@ -176,9 +192,15 @@ pub const VulkanLM = struct {
     }
 
     /// GEMV of a block-quant weight against the (f32) activation `x` into
-    /// `y[y_off..]`; dequant-on-the-fly.
+    /// `y[y_off..]`; dequant-on-the-fly. Block-quant formats read the
+    /// 32-row-group transposed layout with a k-split reduction (coalesced warp
+    /// loads + enough warps to hide latency); anything else falls back to the
+    /// raw row-major kernel.
     fn gemvW(self: *VulkanLM, y: Buf, y_off: usize, x: Buf, w: Weight) !void {
-        try self.ctx.opGemvQuant(w.dtype, y, y_off, x, w.bytes, w.scale, w.rows, w.cols);
+        switch (w.dtype) {
+            .q8_0, .q4_k, .q5_k, .q6_k => try self.ctx.opGemvQuantT(w.dtype, y, y_off, x, w.bytes, w.scale, w.rows, w.cols, gemv_nchunk, self.partials),
+            else => try self.ctx.opGemvQuant(w.dtype, y, y_off, x, w.bytes, w.scale, w.rows, w.cols),
+        }
     }
 
     fn rms(self: *VulkanLM, in: Buf, out: Buf, weight: []const f32, rows: usize, dim: usize) !void {
@@ -202,8 +224,13 @@ pub const VulkanLM = struct {
         defer self.gpa.free(xh);
         for (ids_new, 0..) |id, i| {
             try qwen3.embedTokens(self.lm.embed, &.{id}, xh);
+            // Upload the embedded token before opening the batch (uploads of
+            // batch-visible buffers would otherwise flush the recording).
             try self.ctx.tensorUpload(self.x, std.mem.sliceAsBytes(xh));
+            try self.ctx.beginBatch();
+            errdefer if (self.ctx.batching) self.ctx.abortBatch();
             try self.decodeBody(i + 1 == ids_new.len);
+            try self.ctx.endBatch();
             self.len += 1;
         }
         try self.ctx.tensorDownload(self.logits, std.mem.sliceAsBytes(logits));
@@ -230,8 +257,11 @@ pub const VulkanLM = struct {
                     try self.rms(self.k, self.k, al.k_norm, cfg.n_kv_heads, hd);
                     try ctx.opRopeQwen35(self.q, self.freqs_d, cfg.n_heads, half, self.sin_off, hd, pos);
                     try ctx.opRopeQwen35(self.k, self.freqs_d, cfg.n_kv_heads, half, self.sin_off, hd, pos);
-                    try ctx.tensorCopy(self.k_cache[slot], pos * kvdim * 4, self.k, 0, kvdim * 4);
-                    try ctx.tensorCopy(self.v_cache[slot], pos * kvdim * 4, self.v, 0, kvdim * 4);
+                    // Append K/V to the cache with in-batch device copies
+                    // (copy kernel: dst[u2+i] = src[u3+i]) — tensorCopy would
+                    // flush the recording and drain the GPU every layer.
+                    try ctx.opElt(.copy, self.k, self.k_cache[slot], null, null, .{ .u0 = @intCast(kvdim), .u2 = @intCast(pos * kvdim) }, kvdim, 1, 1);
+                    try ctx.opElt(.copy, self.v, self.v_cache[slot], null, null, .{ .u0 = @intCast(kvdim), .u2 = @intCast(pos * kvdim) }, kvdim, 1, 1);
                     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
                     try ctx.opAttnDecodeQ35(self.q, self.k_cache[slot], self.v_cache[slot], self.attn, cfg.n_heads, cfg.n_kv_heads, hd, pos + 1, scale);
                     try ctx.opElt(.sigmoid_mul, self.attn, self.gate, null, null, .{ .u0 = @intCast(cfg.qDim()) }, cfg.qDim(), 1, 1);

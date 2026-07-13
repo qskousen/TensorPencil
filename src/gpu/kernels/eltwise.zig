@@ -337,6 +337,38 @@ inline fn wi8(bo: u32) i32 {
     return @as(i32, @bitCast(wbyte(bo) << 24)) >> 24; // sign-extend low byte
 }
 
+// --- transposed block-quant readers (32-row-group byte interleave) --------
+// The `*_t` GEMV kernels read a weight repacked so logical byte `j` of row
+// `row` lives at physical byte grp_base + j*32 (grp_base = (row/32)*row_bytes*32
+// + row%32). A 32-lane warp = one full row-group, so at every read the warp
+// touches 32 consecutive bytes = one coalesced transaction (the raw row-major
+// layout has lanes row_bytes apart — ~1.7% of peak bandwidth). `gb` is the
+// caller's grp_base; `j` is the logical byte within the row.
+const GROUP = 32;
+inline fn tbyte(gb: u32, j: u32) u32 {
+    const p = gb + j * GROUP;
+    const word: u32 = @bitCast(a.data[p / 4]);
+    const sh: u5 = @intCast(8 * (p % 4));
+    return (word >> sh) & 0xFF;
+}
+inline fn tf16(gb: u32, j: u32) f32 { // f16's two bytes are 32 B apart here
+    const bits: u16 = @intCast(tbyte(gb, j) | (tbyte(gb, j + 1) << 8));
+    return @floatCast(@as(f16, @bitCast(bits)));
+}
+inline fn ti8(gb: u32, j: u32) i32 {
+    return @as(i32, @bitCast(tbyte(gb, j) << 24)) >> 24; // sign-extend low byte
+}
+// scaleMinK4 over the transposed layout (logical byte offsets via tbyte).
+inline fn scaleMinK4T(gb: u32, sbase: u32, j: u32) ScaleMin {
+    if (j < 4) {
+        return .{ .sc = tbyte(gb, sbase + j) & 63, .m = tbyte(gb, sbase + j + 4) & 63 };
+    }
+    return .{
+        .sc = (tbyte(gb, sbase + j + 4) & 0x0F) | ((tbyte(gb, sbase + j - 4) >> 6) << 4),
+        .m = (tbyte(gb, sbase + j + 4) >> 4) | ((tbyte(gb, sbase + j) >> 6) << 4),
+    };
+}
+
 // q4_k / q5_k 6-bit sub-block scale+min unpack (ggml get_scale_min_k4).
 // sbase = byte offset of the 12 packed scale bytes; j = sub-block 0..7.
 const ScaleMin = struct { sc: u32, m: u32 };
@@ -480,6 +512,201 @@ export fn gemv_q6_k() callconv(.spirv_kernel) void {
         }
     }
     d.data[pc.u2 + row] = acc * pc.f0;
+}
+
+// gemv_q6_k_t: gemv_q6_k over the 32-row-group transposed weight layout
+//   (see the transposed readers) AND k-split over superblocks. Thread
+//   (row, ch) sums the contiguous superblock range [ch*chunk, (ch+1)*chunk)
+//   into partials[ch*rows + row]; gemv_combine reduces over ch and applies
+//   the scale. Transposed => a 32-lane warp (consecutive rows, same ch) reads
+//   coalesced; split => rows*nchunk threads give the SM enough warps to hide
+//   memory latency (one-thread-per-row is only ~1.4 warps/SM). Per-superblock
+//   math is byte-identical to gemv_q6_k. a = W (transposed), b = x [cols],
+//   d = partials [nchunk][rows]. u0 = rows*nchunk, u1 = cols, u2 = nchunk,
+//   u3 = rows.
+export fn gemv_q6_k_t() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const rows = pc.u3;
+    const nchunk = pc.u2;
+    const ch = idx / rows;
+    const row = idx % rows;
+    const nsb = pc.u1 / 256;
+    const row_bytes = nsb * 210;
+    const gb = (row / GROUP) * (row_bytes * GROUP) + (row % GROUP);
+    const chunk = (nsb + nchunk - 1) / nchunk;
+    const start = ch * chunk;
+    const stop = @min(start + chunk, nsb);
+    var acc: f32 = 0;
+    var sb: u32 = start;
+    while (sb < stop) : (sb += 1) {
+        const bb = sb * 210; // logical byte offset of this superblock in the row
+        const sd = tf16(gb, bb + 208);
+        const xb = sb * 256;
+        var half: u32 = 0;
+        while (half < 2) : (half += 1) {
+            const qlh = bb + half * 64; // ql
+            const qhh = bb + 128 + half * 32; // qh
+            const sch = bb + 192 + half * 8; // scales (i8)
+            const xh = xb + half * 128;
+            var l: u32 = 0;
+            while (l < 32) : (l += 1) {
+                const is = l / 16;
+                const ql_l = tbyte(gb, qlh + l);
+                const ql_h = tbyte(gb, qlh + l + 32);
+                const qh = tbyte(gb, qhh + l);
+                const q1 = @as(i32, @intCast((ql_l & 0xF) | (((qh >> 0) & 3) << 4))) - 32;
+                const q2 = @as(i32, @intCast((ql_h & 0xF) | (((qh >> 2) & 3) << 4))) - 32;
+                const q3 = @as(i32, @intCast((ql_l >> 4) | (((qh >> 4) & 3) << 4))) - 32;
+                const q4 = @as(i32, @intCast((ql_h >> 4) | (((qh >> 6) & 3) << 4))) - 32;
+                const sc1 = ti8(gb, sch + is + 0);
+                const sc2 = ti8(gb, sch + is + 2);
+                const sc3 = ti8(gb, sch + is + 4);
+                const sc4 = ti8(gb, sch + is + 6);
+                acc += sd * @as(f32, @floatFromInt(sc1 * q1)) * b.data[xh + l];
+                acc += sd * @as(f32, @floatFromInt(sc2 * q2)) * b.data[xh + l + 32];
+                acc += sd * @as(f32, @floatFromInt(sc3 * q3)) * b.data[xh + l + 64];
+                acc += sd * @as(f32, @floatFromInt(sc4 * q4)) * b.data[xh + l + 96];
+            }
+        }
+    }
+    d.data[ch * rows + row] = acc;
+}
+
+// gemv_q8_0_t: transposed + block-split gemv_q8_0. Thread (row, ch) sums the
+//   contiguous 32-elem-block range for its chunk into partials[ch*rows+row].
+//   a = W (transposed), b = x, d = partials. u0=rows*nchunk u1=cols u2=nchunk
+//   u3=rows.
+export fn gemv_q8_0_t() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const rows = pc.u3;
+    const nchunk = pc.u2;
+    const ch = idx / rows;
+    const row = idx % rows;
+    const nblk = pc.u1 / 32;
+    const row_bytes = nblk * 34;
+    const gb = (row / GROUP) * (row_bytes * GROUP) + (row % GROUP);
+    const chunk = (nblk + nchunk - 1) / nchunk;
+    const start = ch * chunk;
+    const stop = @min(start + chunk, nblk);
+    var acc: f32 = 0;
+    var blk: u32 = start;
+    while (blk < stop) : (blk += 1) {
+        const bb = blk * 34; // logical byte offset of this block in the row
+        const sc = tf16(gb, bb);
+        var bsum: f32 = 0;
+        var i: u32 = 0;
+        while (i < 32) : (i += 1) {
+            const q = ti8(gb, bb + 2 + i);
+            bsum += @as(f32, @floatFromInt(q)) * b.data[blk * 32 + i];
+        }
+        acc += sc * bsum;
+    }
+    d.data[ch * rows + row] = acc;
+}
+
+// gemv_q4_k_t: transposed + superblock-split gemv_q4_k. Same math as gemv_q4_k
+//   (v = d*sc*q - dmin*m) over the transposed layout. u0=rows*nchunk u1=cols
+//   u2=nchunk u3=rows.
+export fn gemv_q4_k_t() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const rows = pc.u3;
+    const nchunk = pc.u2;
+    const ch = idx / rows;
+    const row = idx % rows;
+    const nsb = pc.u1 / 256;
+    const row_bytes = nsb * 144;
+    const gb = (row / GROUP) * (row_bytes * GROUP) + (row % GROUP);
+    const chunk = (nsb + nchunk - 1) / nchunk;
+    const start = ch * chunk;
+    const stop = @min(start + chunk, nsb);
+    var acc: f32 = 0;
+    var sb: u32 = start;
+    while (sb < stop) : (sb += 1) {
+        const bb = sb * 144;
+        const sd = tf16(gb, bb);
+        const sdmin = tf16(gb, bb + 2);
+        const sbase = bb + 4;
+        const qbase = bb + 16;
+        const xb = sb * 256;
+        var g: u32 = 0;
+        while (g < 4) : (g += 1) {
+            const s1 = scaleMinK4T(gb, sbase, 2 * g);
+            const s2 = scaleMinK4T(gb, sbase, 2 * g + 1);
+            const d1 = sd * @as(f32, @floatFromInt(s1.sc));
+            const m1 = sdmin * @as(f32, @floatFromInt(s1.m));
+            const d2 = sd * @as(f32, @floatFromInt(s2.sc));
+            const m2 = sdmin * @as(f32, @floatFromInt(s2.m));
+            const qg = qbase + g * 32;
+            const xg = xb + g * 64;
+            var l: u32 = 0;
+            while (l < 32) : (l += 1) {
+                const q = tbyte(gb, qg + l);
+                const wlo = d1 * @as(f32, @floatFromInt(q & 0xF)) - m1;
+                const whi = d2 * @as(f32, @floatFromInt(q >> 4)) - m2;
+                acc += wlo * b.data[xg + l];
+                acc += whi * b.data[xg + 32 + l];
+            }
+        }
+    }
+    d.data[ch * rows + row] = acc;
+}
+
+// gemv_q5_k_t: transposed + superblock-split gemv_q5_k (q4_k layout + 32 B qh
+//   of 5th bits). u0=rows*nchunk u1=cols u2=nchunk u3=rows.
+export fn gemv_q5_k_t() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const rows = pc.u3;
+    const nchunk = pc.u2;
+    const ch = idx / rows;
+    const row = idx % rows;
+    const nsb = pc.u1 / 256;
+    const row_bytes = nsb * 176;
+    const gb = (row / GROUP) * (row_bytes * GROUP) + (row % GROUP);
+    const chunk = (nsb + nchunk - 1) / nchunk;
+    const start = ch * chunk;
+    const stop = @min(start + chunk, nsb);
+    var acc: f32 = 0;
+    var sb: u32 = start;
+    while (sb < stop) : (sb += 1) {
+        const bb = sb * 176;
+        const sd = tf16(gb, bb);
+        const sdmin = tf16(gb, bb + 2);
+        const sbase = bb + 4;
+        const qhbase = bb + 16;
+        const qbase = bb + 48;
+        const xb = sb * 256;
+        var g: u32 = 0;
+        while (g < 4) : (g += 1) {
+            const s1 = scaleMinK4T(gb, sbase, 2 * g);
+            const s2 = scaleMinK4T(gb, sbase, 2 * g + 1);
+            const d1 = sd * @as(f32, @floatFromInt(s1.sc));
+            const m1 = sdmin * @as(f32, @floatFromInt(s1.m));
+            const d2 = sd * @as(f32, @floatFromInt(s2.sc));
+            const m2 = sdmin * @as(f32, @floatFromInt(s2.m));
+            const qg = qbase + g * 32;
+            const xg = xb + g * 64;
+            const mlo: u32 = @as(u32, 1) << @as(u5, @intCast(2 * g));
+            const mhi: u32 = @as(u32, 1) << @as(u5, @intCast(2 * g + 1));
+            var l: u32 = 0;
+            while (l < 32) : (l += 1) {
+                const q = tbyte(gb, qg + l);
+                const qh = tbyte(gb, qhbase + l);
+                const lo: u32 = (q & 0xF) + (if (qh & mlo != 0) @as(u32, 16) else 0);
+                const hi: u32 = (q >> 4) + (if (qh & mhi != 0) @as(u32, 16) else 0);
+                acc += (d1 * @as(f32, @floatFromInt(lo)) - m1) * b.data[xg + l];
+                acc += (d2 * @as(f32, @floatFromInt(hi)) - m2) * b.data[xg + 32 + l];
+            }
+        }
+    }
+    d.data[ch * rows + row] = acc;
 }
 
 // --- qwen35 hybrid (gated DeltaNet) kernels -----------------------------

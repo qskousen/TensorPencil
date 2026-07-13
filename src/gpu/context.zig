@@ -62,7 +62,7 @@ const Push = extern struct {
 };
 
 /// Eltwise/attention kernels and their workgroup shapes (kernels/eltwise.zig).
-pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, rope_qwen35, attn_decode_q35 };
+pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, rope_qwen35, attn_decode_q35, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t };
 const elt_entry_sizes = [_]EntrySize{
     .{ .name = "rmsnorm", .x = 64, .y = 1 },
     .{ .name = "rms_partial", .x = 256, .y = 1 },
@@ -123,6 +123,10 @@ const elt_entry_sizes = [_]EntrySize{
     .{ .name = "gdn_delta_step", .x = 16, .y = 1 },
     .{ .name = "rope_qwen35", .x = 256, .y = 1 },
     .{ .name = "attn_decode_q35", .x = 16, .y = 1 },
+    .{ .name = "gemv_q6_k_t", .x = 256, .y = 1 },
+    .{ .name = "gemv_q8_0_t", .x = 256, .y = 1 },
+    .{ .name = "gemv_q4_k_t", .x = 256, .y = 1 },
+    .{ .name = "gemv_q5_k_t", .x = 256, .y = 1 },
 };
 
 /// Push block shared by all eltwise entries; meaning per entry (see kernels).
@@ -1427,6 +1431,66 @@ pub const Context = struct {
         return db.buf;
     }
 
+    /// Like weightBufferRaw, but byte-transposes the row-major block-quant
+    /// weight into 32-row groups so the `*_t` GEMV kernels read coalesced:
+    /// logical byte `j` of row `row` moves to grp_base + j*32 (grp_base =
+    /// (row/32)*row_bytes*32 + row%32). The bytes are unchanged (bit-identical
+    /// dequant); only their order changes. Transpose is host-side and one-time
+    /// (cached by host pointer). Rows are padded up to a multiple of 32; the
+    /// pad slots are never read (out-of-range threads exit).
+    fn weightBufferRawT(self: *Context, bytes: []const u8, row_bytes: usize) Error!vk.Buffer {
+        const key = @intFromPtr(bytes.ptr);
+        self.use_counter += 1;
+        if (self.weights.getPtr(key)) |e| {
+            e.last_use = self.use_counter;
+            return e.db.buf;
+        }
+        const G: usize = 32;
+        std.debug.assert(bytes.len % row_bytes == 0);
+        const rows = bytes.len / row_bytes;
+        const ngrp = (rows + G - 1) / G;
+        const packed_size = ngrp * G * row_bytes;
+        const total = std.mem.alignForward(u64, packed_size, 4);
+        self.reserveForWeights(total);
+        const db = try self.createBuffer(
+            total,
+            vk.BufferUsage.storage_buffer | vk.BufferUsage.transfer_dst,
+            vk.MemoryProperty.device_local,
+        );
+        errdefer {
+            self.d.DestroyBuffer(self.device, db.buf, null);
+            self.d.FreeMemory(self.device, db.mem, null);
+        }
+
+        // Host byte-transpose into a scratch, then upload verbatim.
+        const scratch = try self.gpa.alloc(u8, @intCast(total));
+        defer self.gpa.free(scratch);
+        if (packed_size != bytes.len) @memset(scratch, 0); // zero pad slots
+        var row: usize = 0;
+        while (row < rows) : (row += 1) {
+            const base = (row / G) * row_bytes * G + (row % G);
+            const src = bytes[row * row_bytes ..][0..row_bytes];
+            var j: usize = 0;
+            while (j < row_bytes) : (j += 1) scratch[base + j * G] = src[j];
+        }
+
+        const cb = self.nowCmd();
+        const chunk: u64 = 256 << 20;
+        const mapped = try self.ensureHostBuffer(&self.staging, @min(total, chunk));
+        var off: u64 = 0;
+        while (off < scratch.len) {
+            const n: u64 = @min(chunk, scratch.len - off);
+            @memcpy(mapped[0..@intCast(n)], scratch[@intCast(off)..][0..@intCast(n)]);
+            try self.beginCmdBuf(cb);
+            const region: vk.BufferCopy = .{ .src_offset = 0, .dst_offset = off, .size = n };
+            self.d.CmdCopyBuffer(cb, self.staging.buf, db.buf, 1, @ptrCast(&region));
+            try self.submitAndWaitBuf(cb);
+            off += n;
+        }
+        try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .pinned = self.pinNew(total) });
+        return db.buf;
+    }
+
     /// Grow-on-demand device-local storage buffer.
     pub fn ensureDeviceBuffer(self: *Context, db: *DeviceBuffer, size: u64) Error!void {
         if (db.size >= size) return;
@@ -1708,6 +1772,52 @@ pub const Context = struct {
             .u2 = @intCast(y_off),
             .f0 = scale,
         }, rows, 1, 1);
+    }
+
+    /// Coalesced + k-split block-quant GEMV: same math as opGemvQuant but
+    /// reads the 32-row-group transposed weight (weightBufferRawT + a `*_t`
+    /// kernel) so a warp touches consecutive bytes, and splits each row across
+    /// `nchunk` superblock chunks so the GPU has enough warps to hide memory
+    /// latency. `partials` holds rows*nchunk f32; gemv_combine reduces+scales.
+    /// Output is bit-close to opGemvQuant (only the reduction is chunked).
+    pub fn opGemvQuantT(
+        self: *Context,
+        dt: @import("../dtype.zig").DType,
+        y: DeviceBuffer,
+        y_off: usize,
+        x: DeviceBuffer,
+        w_bytes: []const u8,
+        scale: f32,
+        rows: usize,
+        cols: usize,
+        nchunk: usize,
+        partials: DeviceBuffer,
+    ) Error!void {
+        std.debug.assert(cols % 32 == 0);
+        const row_bytes: usize = switch (dt) {
+            .q8_0 => (cols / 32) * 34,
+            .q4_k => (cols / 256) * 144,
+            .q5_k => (cols / 256) * 176,
+            .q6_k => (cols / 256) * 210,
+            else => return error.UnsupportedDType,
+        };
+        const entry: Elt = switch (dt) {
+            .q8_0 => .gemv_q8_0_t,
+            .q4_k => .gemv_q4_k_t,
+            .q5_k => .gemv_q5_k_t,
+            .q6_k => .gemv_q6_k_t,
+            else => return error.UnsupportedDType,
+        };
+        if (dt != .q8_0) std.debug.assert(cols % 256 == 0);
+        const w_buf = try self.weightBufferRawT(w_bytes, row_bytes);
+        const w_db: DeviceBuffer = .{ .buf = w_buf, .mem = .null_handle, .size = 0 };
+        try self.opElt(entry, w_db, x, null, partials, .{
+            .u0 = @intCast(rows * nchunk),
+            .u1 = @intCast(cols),
+            .u2 = @intCast(nchunk),
+            .u3 = @intCast(rows),
+        }, rows * nchunk, 1, 1);
+        try self.opGemvCombine(y, y_off, partials, rows, scale, nchunk);
     }
 
     // --- qwen35 hybrid (gated DeltaNet) ops ---
@@ -2923,6 +3033,31 @@ test "gpu block-quant gemv matches cpu reference" {
             for (row_f32, x) |wv, xv| acc += @as(f64, wv) * xv;
             std.testing.expectApproxEqAbs(@as(f32, @floatCast(acc)), y[r], 2e-2) catch |e| {
                 std.debug.print("dtype {s} row {d}: gpu {d} cpu {d}\n", .{ @tagName(dt), r, y[r], acc });
+                return e;
+            };
+        }
+    }
+
+    // Transposed + k-split path (opGemvQuantT): same CPU reference. Uses
+    // SEPARATE weight buffers (the device cache is keyed by host pointer, and
+    // the raw vs transposed uploads must not alias).
+    const nchunk = 16;
+    var part_d = try ctx.tensorCreate(rows * nchunk * 4);
+    defer ctx.tensorDestroy(&part_d);
+    var wsT: [dts.len][]u8 = undefined;
+    inline for (dts, 0..) |_, i| wsT[i] = try gpa.dupe(u8, ws[i]);
+    defer for (wsT) |w| gpa.free(w);
+    inline for (dts, 0..) |dt, i| {
+        try ctx.opGemvQuantT(dt, y_d, 0, x_d, wsT[i], 1.0, rows, cols, nchunk, part_d);
+        try ctx.tensorDownload(y_d, std.mem.sliceAsBytes(y));
+
+        const row_bytes = dt.storageBytes(cols);
+        for (0..rows) |r| {
+            quants.dequantSlice(dt, wsT[i][r * row_bytes ..][0..row_bytes], 0, cols, row_f32);
+            var acc: f64 = 0;
+            for (row_f32, x) |wv, xv| acc += @as(f64, wv) * xv;
+            std.testing.expectApproxEqAbs(@as(f32, @floatCast(acc)), y[r], 2e-2) catch |e| {
+                std.debug.print("dtype {s} (transposed) row {d}: gpu {d} cpu {d}\n", .{ @tagName(dt), r, y[r], acc });
                 return e;
             };
         }
