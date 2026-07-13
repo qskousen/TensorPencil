@@ -290,6 +290,29 @@ pub fn build(b: *std.Build) void {
         bench_step.dependOn(&run_bench.step);
     }
 
+    // qgemv-bench: grouped-N dp4a quant GEMV vs dequant->f16 GEMM, on device.
+    // `zig build qgemv-bench`. Measures whether grouped-N is a real gain over
+    // the m>1 dequant-GEMM fallback for small (speculative-verify) batches.
+    {
+        const qb_step = b.step("qgemv-bench", "Build+run the grouped-N GEMV vs dequant-GEMM device benchmark");
+        const qb_exe = b.addExecutable(.{
+            .name = "qgemv-bench",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/qgemv_bench.zig"),
+                .link_libc = true,
+                .target = target,
+                .optimize = .ReleaseFast,
+                .imports = &.{
+                    .{ .name = "TensorPencil", .module = mod },
+                    .{ .name = "ggml", .module = ggml_mod },
+                },
+            }),
+        });
+        const run_qb = b.addRunArtifact(qb_exe);
+        if (b.args) |args| run_qb.addArgs(args);
+        qb_step.dependOn(&run_qb.step);
+    }
+
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
     // set the releative field.

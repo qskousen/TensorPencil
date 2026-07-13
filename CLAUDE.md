@@ -5,6 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Ground Rules
 
 - Never run `git add` or `git commit` unless directly requested.
+- Don't bring up "this code is uncommitted"; don't worry about commits or checkpoints or anything like that.
 - `zig build` produces no output on success; any output indicates a warning or error.
 - **Read `ZIG.md` before doing any work.** It documents Zig 0.16.0 breaking changes relevant to this codebase. When you encounter and resolve a new 0.16.0 change, add it to `ZIG.md`.
 - We want the code to be clean, with clear seperation of concerns, modular, and testable.
@@ -18,9 +19,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-TensorPencil is a diffusion inference engine (text-to-image) plus an LLM inference engine (`tp-llm`, see `LLM_PLAN.md`) written in pure Zig, targeting **Zig 0.16.0** (`minimum_zig_version` in build.zig.zon). "Pure Zig" means no C dependencies or bindings — tensor ops, model loading, tokenization, samplers, and image encoding are all to be implemented in Zig.
-
-The repo is currently the stock `zig init` scaffold; the engine has not been built yet.
+TensorPencil is a diffusion inference engine (text-to-image) plus an LLM inference engine (`tp-llm`, see `LLM_PLAN.md`) written in Zig, targeting **Zig 0.16.0** (`minimum_zig_version` in build.zig.zon).
 
 ## Commands
 
@@ -52,11 +51,7 @@ Tests live in both modules; `zig build test` builds and runs two separate test e
 
 ## Dependencies
 
-No build-time or Zig-package dependencies, and the goal is to keep it that way (pure Zig). If one ever becomes necessary, add it with `zig fetch --save <url>` (populates `build.zig.zon`).
-
-Runtime `dlopen`'d system libraries are allowed (no linking, no headers, no nvcc — device IR is hand-emitted), gated per backend:
+Runtime `dlopen`'d system libraries, gated per backend:
 - Vulkan loader (`libvulkan.so.1`) — `--backend vulkan`.
-- CUDA driver (`libcuda.so.1`) — `--backend zig-cuda` (hand-emitted PTX; still "pure Zig" by the project's standard).
-- **`--backend cuda` deliberately crosses the pure-Zig line**: it `dlopen`s NVIDIA's closed-source math libraries `libcublasLt.so` (int8/f16 GEMM) and `libcudnn.so.9` (fused SDPA attention + conv). This is the one non-pure backend, added to measure the "our kernels vs their libraries" gap (M10 Phase 2). The CPU / Vulkan / zig-cuda backends stay pure and are the default; keep it that way when adding features.
-
-One build-time C linkage exists, contained to the **tp-llm executable** (the TensorPencil library module stays pure Zig): image DECODE for `--image` / chat `@mentions` goes through system **libvips** via a tiny C shim (`lib/vips/vips_helper.c` + `src/vips.zig`, ported from DiffKeep) — jpeg/png/webp/gif/tiff input with EXIF rotation. Building needs `libvips-dev` + pkg-config. The library's own pure-Zig PNG encode/decode in `image.zig` is unaffected (diffusion output, tests). Don't spread vips into the library module.
+- CUDA driver (`libcuda.so.1`) — `--backend zig-cuda` (hand-emitted PTX).
+- `--backend cuda`: `dlopen`s NVIDIA's closed-source math libraries `libcublasLt.so` (int8/f16 GEMM) and `libcudnn.so.9` (fused SDPA attention + conv).

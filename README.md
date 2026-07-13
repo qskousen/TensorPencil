@@ -57,9 +57,10 @@ Plans for the future:
 
 ## Running it
 
-Requires Zig 0.16.0. There are no build-time C dependencies; all runtime libraries are
-opened dynamically (`dlopen`) and only for the backend that needs them — the CPU path
-needs nothing:
+Requires Zig 0.16.0 and `libvips`.
+
+Backends other than `cpu` require additional runtime libraries:
+
 - `--backend vulkan` → `libvulkan.so.1` (Vulkan loader)
 - `--backend zig-cuda` → `libcuda.so.1` (CUDA driver — for the hand-emitted PTX)
 - `--backend cuda` → `libcuda.so.1` + `libcublasLt.so` + `libcudnn.so.9` (NVIDIA's

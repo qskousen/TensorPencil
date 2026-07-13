@@ -1374,6 +1374,8 @@ pub const Backend = struct {
         std.debug.assert(self.q8_act.size >= n_total * cols / 32 * 4 + n_total * cols);
         const w_db = try self.cachedWeight(w_bytes);
         const f = switch (dt) {
+            .q8_0 => try self.eltFn(elt.gemv_q8_0_q8n_ptx, "gemv_q8_0_q8n"),
+            .q4_k => try self.eltFn(elt.gemv_q4_k_q8n_ptx, "gemv_q4_k_q8n"),
             .q5_k => try self.eltFn(elt.gemv_q5_k_q8n_ptx, "gemv_q5_k_q8n"),
             .q6_k => try self.eltFn(elt.gemv_q6_k_q8n_ptx, "gemv_q6_k_q8n"),
             else => unreachable,
@@ -2854,6 +2856,71 @@ test "dp4a gemv quant kernels match CPU reference" {
                 quants.dequantSlice(dt, w[r * row_bytes ..][0..row_bytes], 0, cols, row_f32);
                 var acc: f64 = 0;
                 for (row_f32, xnq[t * cols ..][0..cols]) |wv, xv| acc += @as(f64, wv) * xv;
+                try std.testing.expectApproxEqAbs(@as(f32, @floatCast(acc)), yn[t * rows + r], 2e-2);
+            }
+        }
+    }
+}
+
+// Gated on a CUDA device: the q4_k and q8_0 grouped dp4a GEMVs (opGemvQuantQ8N)
+// vs a CPU dequant-dot reference. Neither has an m=1 dp4a kernel, so both are
+// covered only via the grouped path (here ng=5, one partial group); the CPU
+// side emulates the same q8_1 activation quantization, so it differs only by
+// rounding order. q8_0 also exercises the signed-weight dp4a.s32.s32 path.
+test "q4_k/q8_0 grouped dp4a gemv matches CPU reference" {
+    const quants = @import("../../quants.zig");
+    const gpa = std.testing.allocator;
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+
+    const rows = 24; // % 8
+    const cols = 512; // % 256
+    const n = 5; // ng=5 partial group
+    var prng = std.Random.DefaultPrng.init(4242);
+    const rand = prng.random();
+
+    const xn = try gpa.alloc(f32, n * cols);
+    defer gpa.free(xn);
+    for (xn) |*v| v.* = rand.float(f32) * 2.0 - 1.0;
+    const xn_d = try be.tensorCreate(n * cols * 4);
+    const yn_d = try be.tensorCreate(n * rows * 4);
+    defer {
+        var xd = xn_d;
+        var yd = yn_d;
+        be.tensorDestroy(&xd);
+        be.tensorDestroy(&yd);
+    }
+    try be.tensorUpload(xn_d, std.mem.sliceAsBytes(xn));
+    try be.opGemvQuantizeX(xn_d, n * cols);
+
+    // CPU emulation of quantize_q8_1: x̂ = d * rni(x * 127/amax) per 32-block.
+    const xq = try gpa.alloc(f32, n * cols);
+    defer gpa.free(xq);
+    var blk: usize = 0;
+    while (blk < n * cols / 32) : (blk += 1) {
+        var amax: f32 = 0;
+        for (xn[blk * 32 ..][0..32]) |xi| amax = @max(amax, @abs(xi));
+        const d: f32 = amax / 127.0;
+        const inv: f32 = if (amax == 0) 0 else 127.0 / amax;
+        for (0..32) |j| xq[blk * 32 + j] = d * @round(xn[blk * 32 + j] * inv);
+    }
+
+    const yn = try gpa.alloc(f32, n * rows);
+    defer gpa.free(yn);
+    const row_f32 = try gpa.alloc(f32, cols);
+    defer gpa.free(row_f32);
+
+    inline for (.{ dtypes.DType.q4_k, dtypes.DType.q8_0 }, .{ 314, 271 }) |dt, seed| {
+        const w = try testQuantWeightBytes(gpa, dt, rows, cols, seed);
+        defer gpa.free(w);
+        try be.opGemvQuantQ8N(dt, yn_d, w, 1.0, rows, cols, n, 0, n);
+        try be.tensorDownload(yn_d, std.mem.sliceAsBytes(yn));
+        const row_bytes = dt.storageBytes(cols);
+        for (0..n) |t| {
+            for (0..rows) |r| {
+                quants.dequantSlice(dt, w[r * row_bytes ..][0..row_bytes], 0, cols, row_f32);
+                var acc: f64 = 0;
+                for (row_f32, xq[t * cols ..][0..cols]) |wv, xv| acc += @as(f64, wv) * xv;
                 try std.testing.expectApproxEqAbs(@as(f32, @floatCast(acc)), yn[t * rows + r], 2e-2);
             }
         }

@@ -62,7 +62,7 @@ const Push = extern struct {
 };
 
 /// Eltwise/attention kernels and their workgroup shapes (kernels/eltwise.zig).
-pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4 };
+pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, rope_qwen35, attn_decode_q35 };
 const elt_entry_sizes = [_]EntrySize{
     .{ .name = "rmsnorm", .x = 64, .y = 1 },
     .{ .name = "rms_partial", .x = 256, .y = 1 },
@@ -112,6 +112,17 @@ const elt_entry_sizes = [_]EntrySize{
     .{ .name = "gemv_combine", .x = 256, .y = 1 },
     .{ .name = "gemv_partial4", .x = 256, .y = 1 },
     .{ .name = "gemv_combine4", .x = 256, .y = 1 },
+    .{ .name = "gemv_q8_0", .x = 256, .y = 1 },
+    .{ .name = "gemv_q4_k", .x = 256, .y = 1 },
+    .{ .name = "gemv_q5_k", .x = 256, .y = 1 },
+    .{ .name = "gemv_q6_k", .x = 256, .y = 1 },
+    .{ .name = "l2norm_rows", .x = 64, .y = 1 },
+    .{ .name = "deinterleave2", .x = 256, .y = 1 },
+    .{ .name = "gdn_gates", .x = 32, .y = 1 },
+    .{ .name = "gdn_conv_step", .x = 256, .y = 1 },
+    .{ .name = "gdn_delta_step", .x = 16, .y = 1 },
+    .{ .name = "rope_qwen35", .x = 256, .y = 1 },
+    .{ .name = "attn_decode_q35", .x = 16, .y = 1 },
 };
 
 /// Push block shared by all eltwise entries; meaning per entry (see kernels).
@@ -140,6 +151,8 @@ pub const Error = error{
     /// buffer — the working set genuinely doesn't fit.
     DeviceOutOfMemory,
     OutOfMemory,
+    /// A GGUF block-quant dtype without a Vulkan GEMV kernel yet.
+    UnsupportedDType,
 } || spv.Error;
 
 /// Patch a Zig-emitted kernel into strict-Vulkan shape (LocalSize per entry,
@@ -1376,6 +1389,44 @@ pub const Context = struct {
         return db.buf;
     }
 
+    /// Like weightBuffer, but uploads the bytes VERBATIM (no k-major transpose)
+    /// — for GGUF block-quant weights whose row-major block layout the quant
+    /// GEMV kernels read directly. Cached by host pointer, same residency.
+    fn weightBufferRaw(self: *Context, bytes: []const u8) Error!vk.Buffer {
+        const key = @intFromPtr(bytes.ptr);
+        self.use_counter += 1;
+        if (self.weights.getPtr(key)) |e| {
+            e.last_use = self.use_counter;
+            return e.db.buf;
+        }
+        const total = std.mem.alignForward(u64, bytes.len, 4);
+        self.reserveForWeights(total);
+        const db = try self.createBuffer(
+            total,
+            vk.BufferUsage.storage_buffer | vk.BufferUsage.transfer_dst,
+            vk.MemoryProperty.device_local,
+        );
+        errdefer {
+            self.d.DestroyBuffer(self.device, db.buf, null);
+            self.d.FreeMemory(self.device, db.mem, null);
+        }
+        const cb = self.nowCmd();
+        const chunk: u64 = 256 << 20;
+        const mapped = try self.ensureHostBuffer(&self.staging, @min(total, chunk));
+        var off: u64 = 0;
+        while (off < bytes.len) {
+            const n: u64 = @min(chunk, bytes.len - off);
+            @memcpy(mapped[0..@intCast(n)], bytes[@intCast(off)..][0..@intCast(n)]);
+            try self.beginCmdBuf(cb);
+            const region: vk.BufferCopy = .{ .src_offset = 0, .dst_offset = off, .size = n };
+            self.d.CmdCopyBuffer(cb, self.staging.buf, db.buf, 1, @ptrCast(&region));
+            try self.submitAndWaitBuf(cb);
+            off += n;
+        }
+        try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .pinned = self.pinNew(total) });
+        return db.buf;
+    }
+
     /// Grow-on-demand device-local storage buffer.
     pub fn ensureDeviceBuffer(self: *Context, db: *DeviceBuffer, size: u64) Error!void {
         if (db.size >= size) return;
@@ -1624,6 +1675,66 @@ pub const Context = struct {
             .u4 = @intFromBool(dtype_f8),
             .u5 = @intCast(rows),
         }, (rows / 4) * nchunk, 1, 1);
+    }
+
+    /// Fused dequant GEMV for GGUF block-quant weights (decode, m=1): one
+    /// thread per output row dequants that row's blocks on the fly and dots
+    /// them with x. y[rows] = scale * (dequant(W) @ x). cols % 32 == 0. The
+    /// weight is uploaded raw (row-major blocks) via weightBufferRaw.
+    pub fn opGemvQuant(
+        self: *Context,
+        dt: @import("../dtype.zig").DType,
+        y: DeviceBuffer,
+        y_off: usize,
+        x: DeviceBuffer,
+        w_bytes: []const u8,
+        scale: f32,
+        rows: usize,
+        cols: usize,
+    ) Error!void {
+        std.debug.assert(cols % 32 == 0);
+        const entry: Elt = switch (dt) {
+            .q8_0 => .gemv_q8_0,
+            .q4_k => .gemv_q4_k,
+            .q5_k => .gemv_q5_k,
+            .q6_k => .gemv_q6_k,
+            else => return error.UnsupportedDType,
+        };
+        const w_buf = try self.weightBufferRaw(w_bytes);
+        const w_db: DeviceBuffer = .{ .buf = w_buf, .mem = .null_handle, .size = 0 };
+        try self.opElt(entry, w_db, x, null, y, .{
+            .u0 = @intCast(rows),
+            .u1 = @intCast(cols),
+            .u2 = @intCast(y_off),
+            .f0 = scale,
+        }, rows, 1, 1);
+    }
+
+    // --- qwen35 hybrid (gated DeltaNet) ops ---
+    pub fn opL2NormRows(self: *Context, x: DeviceBuffer, rows: usize, dim: usize, eps: f32) Error!void {
+        try self.opElt(.l2norm_rows, x, null, null, null, .{ .u0 = @intCast(rows), .u1 = @intCast(dim), .f0 = eps }, rows, 1, 1);
+    }
+    pub fn opDeinterleave2(self: *Context, qg: DeviceBuffer, q: DeviceBuffer, gate: DeviceBuffer, total: usize, hd: usize) Error!void {
+        try self.opElt(.deinterleave2, qg, null, q, gate, .{ .u0 = @intCast(total), .u1 = @intCast(hd) }, total, 1, 1);
+    }
+    pub fn opGdnGates(self: *Context, alpha_beta: DeviceBuffer, a_dt: DeviceBuffer, out: DeviceBuffer, heads: usize) Error!void {
+        try self.opElt(.gdn_gates, alpha_beta, a_dt, null, out, .{ .u0 = @intCast(heads) }, heads, 1, 1);
+    }
+    pub fn opGdnConvStep(self: *Context, conv_state: DeviceBuffer, x: DeviceBuffer, conv_w: DeviceBuffer, out: DeviceBuffer, channels: usize, taps: usize) Error!void {
+        try self.opElt(.gdn_conv_step, conv_state, x, conv_w, out, .{ .u0 = @intCast(channels), .u1 = @intCast(taps) }, channels, 1, 1);
+    }
+    pub fn opGdnDeltaStep(self: *Context, state: DeviceBuffer, conv_out: DeviceBuffer, gates: DeviceBuffer, o: DeviceBuffer, heads: usize, d: usize, k_heads: usize, scale: f32) Error!void {
+        try self.opElt(.gdn_delta_step, state, conv_out, gates, o, .{ .u0 = @intCast(heads), .u1 = @intCast(d), .u2 = @intCast(k_heads), .f0 = scale }, heads, 1, 1);
+    }
+    /// Partial rotate-half RoPE over the first rope_dim head dims (text-only
+    /// decode). qk in place; freqs = cos then sin at sin_off. half = rope_dim/2.
+    pub fn opRopeQwen35(self: *Context, qk: DeviceBuffer, freqs: DeviceBuffer, n_heads: usize, half: usize, sin_off: usize, head_dim: usize, pos: usize) Error!void {
+        try self.opElt(.rope_qwen35, qk, null, freqs, null, .{ .u0 = @intCast(n_heads * half), .u1 = @intCast(half), .u2 = @intCast(sin_off), .u3 = @intCast(head_dim), .u4 = @intCast(pos) }, n_heads * half, 1, 1);
+    }
+    /// Causal GQA attention for one decode query (online softmax, one thread
+    /// per query head). k/v caches: position j at j*(n_kv*hd) + kvh*hd.
+    pub fn opAttnDecodeQ35(self: *Context, q: DeviceBuffer, k_cache: DeviceBuffer, v_cache: DeviceBuffer, out: DeviceBuffer, n_heads: usize, n_kv: usize, head_dim: usize, kv_len: usize, scale: f32) Error!void {
+        try self.opElt(.attn_decode_q35, q, k_cache, v_cache, out, .{ .u0 = @intCast(n_heads), .u1 = @intCast(n_kv), .u2 = @intCast(head_dim), .u3 = @intCast(kv_len), .f0 = scale }, n_heads, 1, 1);
     }
 
     pub fn opGemvCombine(
@@ -2264,6 +2375,13 @@ pub const Context = struct {
         self.small_bufs.clearRetainingCapacity();
     }
 
+    /// Free device memory available to us right now (live driver view;
+    /// VK_EXT_memory_budget sees other processes). Used at setup to default
+    /// the weight-pin budget so a model that fits stays fully resident.
+    pub fn liveVram(self: *Context) u64 {
+        return self.liveHeadroom();
+    }
+
     /// How many more bytes we may allocate before hitting the device
     /// memory budget. VK_EXT_memory_budget sees other processes' usage
     /// live; the fallback assumes 90% of the device-local heap is ours.
@@ -2570,6 +2688,247 @@ pub const Context = struct {
 // when opted in via the `testdata/gpu-tests` marker: the NVIDIA 580 driver
 // faults on Zig-emitted workgroup-storage kernels (validator-clean; fine on
 // RADV/llvmpipe), which would kill the test process. See PLAN.md (M9).
+test "gpu gdn kernels match cpu reference" {
+    const gpa = std.testing.allocator;
+    std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa) catch return error.SkipZigTest;
+    defer ctx.deinit();
+    var prng = std.Random.DefaultPrng.init(555);
+    const rand = prng.random();
+    const expect = std.testing.expectApproxEqAbs;
+
+    // --- gdn_gates: decay = exp(a*softplus(alpha+dt)), beta = sigmoid(braw) ---
+    {
+        const heads = 16;
+        const ab = try gpa.alloc(f32, 2 * heads); // [alpha | beta_raw]
+        defer gpa.free(ab);
+        const adt = try gpa.alloc(f32, 2 * heads); // [a | dt_bias]
+        defer gpa.free(adt);
+        for (ab) |*v| v.* = rand.floatNorm(f32);
+        for (adt) |*v| v.* = rand.floatNorm(f32) * 0.5;
+        var ab_d = try ctx.tensorCreate(2 * heads * 4);
+        var adt_d = try ctx.tensorCreate(2 * heads * 4);
+        var g_d = try ctx.tensorCreate(2 * heads * 4);
+        defer {
+            ctx.tensorDestroy(&ab_d);
+            ctx.tensorDestroy(&adt_d);
+            ctx.tensorDestroy(&g_d);
+        }
+        try ctx.tensorUpload(ab_d, std.mem.sliceAsBytes(ab));
+        try ctx.tensorUpload(adt_d, std.mem.sliceAsBytes(adt));
+        try ctx.opGdnGates(ab_d, adt_d, g_d, heads);
+        const g = try gpa.alloc(f32, 2 * heads);
+        defer gpa.free(g);
+        try ctx.tensorDownload(g_d, std.mem.sliceAsBytes(g));
+        for (0..heads) |h| {
+            const s = ab[h] + adt[heads + h];
+            const sp = if (s > 20.0) s else @log(1.0 + @exp(s));
+            try expect(@exp(adt[h] * sp), g[h], 1e-4);
+            try expect(1.0 / (1.0 + @exp(-ab[heads + h])), g[heads + h], 1e-4);
+        }
+    }
+
+    // --- gdn_conv_step: depthwise causal conv (taps 4) + SiLU, rolling state ---
+    {
+        const ch = 96;
+        const taps = 4;
+        const st = try gpa.alloc(f32, ch * (taps - 1));
+        defer gpa.free(st);
+        const x = try gpa.alloc(f32, ch);
+        defer gpa.free(x);
+        const w = try gpa.alloc(f32, ch * taps);
+        defer gpa.free(w);
+        for (st) |*v| v.* = rand.floatNorm(f32);
+        for (x) |*v| v.* = rand.floatNorm(f32);
+        for (w) |*v| v.* = rand.floatNorm(f32);
+        // CPU reference (mutates copies).
+        const st_ref = try gpa.dupe(f32, st);
+        defer gpa.free(st_ref);
+        const out_ref = try gpa.alloc(f32, ch);
+        defer gpa.free(out_ref);
+        for (0..ch) |c| {
+            const s = st_ref[c * (taps - 1) ..][0 .. taps - 1];
+            const ww = w[c * taps ..][0..taps];
+            var acc: f32 = ww[taps - 1] * x[c];
+            for (0..taps - 1) |k| acc += ww[k] * s[k];
+            for (0..taps - 2) |k| s[k] = s[k + 1];
+            s[taps - 2] = x[c];
+            out_ref[c] = acc / (1.0 + @exp(-acc));
+        }
+        var st_d = try ctx.tensorCreate(ch * (taps - 1) * 4);
+        var x_d = try ctx.tensorCreate(ch * 4);
+        var w_d = try ctx.tensorCreate(ch * taps * 4);
+        var o_d = try ctx.tensorCreate(ch * 4);
+        defer {
+            ctx.tensorDestroy(&st_d);
+            ctx.tensorDestroy(&x_d);
+            ctx.tensorDestroy(&w_d);
+            ctx.tensorDestroy(&o_d);
+        }
+        try ctx.tensorUpload(st_d, std.mem.sliceAsBytes(st));
+        try ctx.tensorUpload(x_d, std.mem.sliceAsBytes(x));
+        try ctx.tensorUpload(w_d, std.mem.sliceAsBytes(w));
+        try ctx.opGdnConvStep(st_d, x_d, w_d, o_d, ch, taps);
+        const o = try gpa.alloc(f32, ch);
+        defer gpa.free(o);
+        const st_out = try gpa.alloc(f32, ch * (taps - 1));
+        defer gpa.free(st_out);
+        try ctx.tensorDownload(o_d, std.mem.sliceAsBytes(o));
+        try ctx.tensorDownload(st_d, std.mem.sliceAsBytes(st_out));
+        for (o, out_ref) |gv, rv| try expect(rv, gv, 1e-4);
+        for (st_out, st_ref) |gv, rv| try expect(rv, gv, 1e-4);
+    }
+
+    // --- gdn_delta_step: per-head delta rule over dd x dd state ---
+    {
+        const heads = 4;
+        const dd = 16;
+        const kheads = 2;
+        const scale: f32 = 1.0 / @sqrt(@as(f32, dd));
+        const qkdim = kheads * dd;
+        const vdim = heads * dd;
+        const co = try gpa.alloc(f32, 2 * qkdim + vdim); // q | k | v
+        defer gpa.free(co);
+        const gates = try gpa.alloc(f32, 2 * heads); // decay | beta
+        defer gpa.free(gates);
+        const state = try gpa.alloc(f32, heads * dd * dd);
+        defer gpa.free(state);
+        for (co) |*v| v.* = rand.floatNorm(f32) * 0.3;
+        for (state) |*v| v.* = rand.floatNorm(f32) * 0.1;
+        for (0..heads) |h| {
+            gates[h] = 0.9 + rand.float(f32) * 0.09; // decay in (0.9,0.99)
+            gates[heads + h] = rand.float(f32); // beta in (0,1)
+        }
+        // CPU reference.
+        const st_ref = try gpa.dupe(f32, state);
+        defer gpa.free(st_ref);
+        const o_ref = try gpa.alloc(f32, vdim);
+        defer gpa.free(o_ref);
+        var m: [128]f32 = undefined;
+        var dl: [128]f32 = undefined;
+        for (0..heads) |h| {
+            const decay = gates[h];
+            const beta = gates[heads + h];
+            const kh = co[qkdim + (h % kheads) * dd ..][0..dd];
+            const qh = co[(h % kheads) * dd ..][0..dd];
+            const vh = co[2 * qkdim + h * dd ..][0..dd];
+            const S = st_ref[h * dd * dd ..][0 .. dd * dd];
+            for (0..dd) |j| m[j] = 0;
+            for (0..dd) |i| {
+                for (0..dd) |j| {
+                    S[i * dd + j] *= decay;
+                    m[j] += S[i * dd + j] * kh[i];
+                }
+            }
+            for (0..dd) |j| dl[j] = (vh[j] - m[j]) * beta;
+            const oh = o_ref[h * dd ..][0..dd];
+            for (0..dd) |j| oh[j] = 0;
+            for (0..dd) |i| {
+                const qi = qh[i] * scale;
+                for (0..dd) |j| {
+                    S[i * dd + j] += kh[i] * dl[j];
+                    oh[j] += S[i * dd + j] * qi;
+                }
+            }
+        }
+        var co_d = try ctx.tensorCreate(co.len * 4);
+        var g_d = try ctx.tensorCreate(gates.len * 4);
+        var s_d = try ctx.tensorCreate(state.len * 4);
+        var o_d = try ctx.tensorCreate(vdim * 4);
+        defer {
+            ctx.tensorDestroy(&co_d);
+            ctx.tensorDestroy(&g_d);
+            ctx.tensorDestroy(&s_d);
+            ctx.tensorDestroy(&o_d);
+        }
+        try ctx.tensorUpload(co_d, std.mem.sliceAsBytes(co));
+        try ctx.tensorUpload(g_d, std.mem.sliceAsBytes(gates));
+        try ctx.tensorUpload(s_d, std.mem.sliceAsBytes(state));
+        try ctx.opGdnDeltaStep(s_d, co_d, g_d, o_d, heads, dd, kheads, scale);
+        const o = try gpa.alloc(f32, vdim);
+        defer gpa.free(o);
+        const s_out = try gpa.alloc(f32, state.len);
+        defer gpa.free(s_out);
+        try ctx.tensorDownload(o_d, std.mem.sliceAsBytes(o));
+        try ctx.tensorDownload(s_d, std.mem.sliceAsBytes(s_out));
+        for (o, o_ref) |gv, rv| try expect(rv, gv, 1e-3);
+        for (s_out, st_ref) |gv, rv| try expect(rv, gv, 1e-3);
+    }
+}
+
+test "gpu block-quant gemv matches cpu reference" {
+    const gpa = std.testing.allocator;
+    std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa) catch return error.SkipZigTest;
+    defer ctx.deinit();
+    const dtypes = @import("../dtype.zig");
+    const quants = @import("../quants.zig");
+
+    const rows = 64;
+    const cols = 512; // two 256-elem super-blocks: exercises the shared scale table
+    var prng = std.Random.DefaultPrng.init(77);
+    const rand = prng.random();
+
+    const x = try gpa.alloc(f32, cols);
+    defer gpa.free(x);
+    for (x) |*v| v.* = rand.floatNorm(f32) * 2.0 - 1.0;
+    var x_d = try ctx.tensorCreate(cols * 4);
+    var y_d = try ctx.tensorCreate(rows * 4);
+    defer {
+        ctx.tensorDestroy(&x_d);
+        ctx.tensorDestroy(&y_d);
+    }
+    try ctx.tensorUpload(x_d, std.mem.sliceAsBytes(x));
+
+    const y = try gpa.alloc(f32, rows);
+    defer gpa.free(y);
+    const row_f32 = try gpa.alloc(f32, cols);
+    defer gpa.free(row_f32);
+
+    const dts = [_]dtypes.DType{ .q8_0, .q4_k, .q5_k, .q6_k };
+    const d16: u16 = 0x2A66; // ~0.05
+    const min16: u16 = 0x251F; // ~0.02
+
+    // All weight buffers stay alive for the whole test: the device weight
+    // cache is keyed by host pointer, so free-then-realloc at the same address
+    // would alias a stale upload.
+    var ws: [dts.len][]u8 = undefined;
+    inline for (dts, 0..) |dt, i| {
+        ws[i] = try gpa.alloc(u8, dt.storageBytes(rows * cols));
+        rand.bytes(ws[i]);
+        const bb = dt.blockBytes();
+        var off: usize = 0;
+        while (off < ws[i].len) : (off += bb) {
+            switch (dt) {
+                .q8_0 => std.mem.writeInt(u16, ws[i][off..][0..2], d16, .little),
+                .q4_k, .q5_k => {
+                    std.mem.writeInt(u16, ws[i][off..][0..2], d16, .little);
+                    std.mem.writeInt(u16, ws[i][off + 2 ..][0..2], min16, .little);
+                },
+                .q6_k => std.mem.writeInt(u16, ws[i][off + 208 ..][0..2], d16, .little),
+                else => unreachable,
+            }
+        }
+    }
+    defer for (ws) |w| gpa.free(w);
+
+    inline for (dts, 0..) |dt, i| {
+        try ctx.opGemvQuant(dt, y_d, 0, x_d, ws[i], 1.0, rows, cols);
+        try ctx.tensorDownload(y_d, std.mem.sliceAsBytes(y));
+
+        const row_bytes = dt.storageBytes(cols);
+        for (0..rows) |r| {
+            quants.dequantSlice(dt, ws[i][r * row_bytes ..][0..row_bytes], 0, cols, row_f32);
+            var acc: f64 = 0;
+            for (row_f32, x) |wv, xv| acc += @as(f64, wv) * xv;
+            std.testing.expectApproxEqAbs(@as(f32, @floatCast(acc)), y[r], 2e-2) catch |e| {
+                std.debug.print("dtype {s} row {d}: gpu {d} cpu {d}\n", .{ @tagName(dt), r, y[r], acc });
+                return e;
+            };
+        }
+    }
+}
+
 test "gpu matmul matches cpu reference" {
     const gpa = std.testing.allocator;
     std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;

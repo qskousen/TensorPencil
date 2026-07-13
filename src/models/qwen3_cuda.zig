@@ -788,11 +788,33 @@ pub const CudaLM = struct {
     fn linear(self: *CudaLM, y: Buf, x: Buf, w: ops.matmul.Weight, rows_out: usize, cols: usize, seq: usize) !void {
         const be = self.be;
         if (w.dtype.isBlockQuant()) {
-            // GGUF k-quants: fused GEMV for decode; everything larger takes
-            // the dequant-to-f16 GEMM (no grouped-N variants yet, so small
-            // verify batches pay the scratch round trip).
+            // GGUF quants: fused GEMV for decode. For small batches (speculative
+            // verify — always <= spec.max_draft+1 = 17 — and short prefills), the
+            // grouped dp4a GEMV streams each weight ceil(seq/8)x: measured 5-20x
+            // faster than the dequant-to-f16 GEMM below the crossover (qgemv-bench
+            // on the 3090, ~n=40). Every block-quant (q4_k/q5_k/q6_k/q8_0) now has
+            // a grouped kernel; larger seq amortizes the GEMM's one-shot dequant.
             if (seq == 1) {
                 try be.opGemvQuant(w.dtype, y, x, w.bytes, w.scale, rows_out, cols);
+            } else if (w.dtype.isBlockQuant() and seq <= grouped_gemv_max and
+                cols % 256 == 0 and rows_out % 8 == 0)
+            {
+                try be.opGemvQuantizeX(x, seq * cols); // one q8 activation for all groups
+                var off: usize = 0;
+                while (off < seq) : (off += 8) {
+                    const ng: usize = @min(8, seq - off); // annotated: @min would narrow to u4
+                    try be.opGemvQuantQ8N(
+                        w.dtype,
+                        offsetBufSized(y, off * rows_out * 4, ng * rows_out * 4),
+                        w.bytes,
+                        w.scale,
+                        rows_out,
+                        cols,
+                        ng,
+                        off,
+                        seq,
+                    );
+                }
             } else {
                 try be.opMatmulQuant(w.dtype, y, x, seq, w.bytes, rows_out, cols);
             }
@@ -845,6 +867,12 @@ pub const CudaLM = struct {
     /// speculative verify batch, and ceil(seq/4) fused weight reads stay
     /// well below the GEMM's ~5x dequant-scratch traffic.
     const gemv_batch_max = spec.max_draft + 1;
+
+    /// q5_k/q6_k batches at or below this take the grouped dp4a GEMV instead of
+    /// opMatmulQuant's dequant-to-f16 GEMM. Measured crossover (qgemv-bench,
+    /// 3090): ~48 rows q5_k, ~35 q6_k; 40 matches qwen35's grouped_prefill_max
+    /// and covers every speculative-verify batch (<= spec.max_draft + 1 = 17).
+    const grouped_gemv_max = 40;
 
     /// KV chunks per head in the decode attention split pass (one warp each:
     /// 32 heads x 32 splits x 32 lanes = 32k threads).

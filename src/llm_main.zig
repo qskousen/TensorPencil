@@ -32,9 +32,12 @@ const usage =
     \\conversation actually fills it. Under VRAM pressure growth evicts
     \\least-recently-used weights into the streaming path (slower decode)
     \\instead of failing, and the session ends only when nothing more can be
-    \\freed. Speculative runs (--spec-k/--draft-model/--eagle/--tree) and
-    \\--backend vulkan reserve the whole window physically up front, so
-    \\their default window stays 4096.
+    \\freed. Speculative runs (--spec-k/--draft-model/--eagle/--tree) reserve
+    \\the whole window physically up front, so their default window stays 4096.
+    \\--backend vulkan also reserves the whole window up front (no growable
+    \\buffers), so without an explicit --max-context it auto-sizes to the
+    \\largest window whose KV reservation fits in VRAM beside the weights,
+    \\capped at the trained length.
     \\Sampling defaults follow Qwen3 non-thinking recommendations:
     \\temperature 0.7, top-k 20, top-p 0.8. --greedy = --temperature 0.
     \\Seed defaults to the clock; pass --seed for reproducible output.
@@ -61,7 +64,9 @@ const usage =
     \\mmapped file every token at PCIe speed, so decode slows in proportion
     \\to the streamed fraction. "min" pins nothing and streams everything.
     \\KV cache and activations are not streamed and live outside the cap.
-    \\0 (default) = driver-managed.
+    \\0 (default) = pin as much of the model as the free VRAM holds, so a
+    \\model that fits stays fully resident (streaming a model that fits is
+    \\~3.6x slower); only a model larger than VRAM streams its tail.
     \\--cpu-layers (qwen35 GGUF, zig-cuda/cuda, text-only) fits the model under
     \\--vram-budget a different way: instead of streaming weights, it runs whole
     \\layers on the CPU (their weights never touch the device). The layer count
@@ -89,6 +94,17 @@ const min_vram_budget: u64 = 256 << 20;
 /// table, to keep the DMA pipeline deep) plus GEMM scratch. The budget is
 /// soft, so a transient overshoot degrades gracefully rather than failing.
 const pin_slack: u64 = 1 << 30;
+
+/// Weight budget to use when the user passes no --vram-budget (0). Defaults to
+/// the free VRAM at setup so a model that fits stays FULLY PINNED (resident)
+/// rather than streaming every weight from host each token — streaming a model
+/// that fits in VRAM is dramatically slower (measured 9B Q6_K on a 3090:
+/// 18 -> 66 tok/s, ~3.6x). A model larger than the free VRAM streams its tail,
+/// exactly as an explicit --vram-budget would. budget_override stays 0 (no hard
+/// weight cap), so the KV cache + activations grow into the VRAM left unpinned.
+fn defaultWeightBudget(be: *TensorPencil.gpu.cuda.Backend, user_budget: u64) u64 {
+    return if (user_budget != 0) user_budget else be.ctx.memGetInfo().free;
+}
 
 pub fn main(init: std.process.Init) !void {
     const arena: std.mem.Allocator = init.arena.allocator();
@@ -202,9 +218,11 @@ pub fn main(init: std.process.Init) !void {
     // Default context ceiling: the model's trained context length (growth
     // commits KV rows only as the conversation fills, so a big ceiling costs
     // VRAM lazily — and stops gracefully when even weight eviction can't
-    // free enough). Fixed-capacity sessions (speculative decoding, vulkan)
-    // allocate the whole window physically up front, so without an explicit
-    // --max-context they keep the old 4096 default.
+    // free enough). Speculative sessions allocate the whole window physically
+    // up front, so without an explicit --max-context they keep the 4096
+    // default. Vulkan also reserves up front but AUTO-SIZES to what VRAM holds
+    // in its backend block below; 4096 here is a transient placeholder it
+    // overrides (it must be set before capacityPlan runs).
     const fixed_session = opts.spec_k > 0 or opts.tree_nodes > 0 or draft_path != null or eagle_path != null;
     opts.max_context = max_context_arg orelse
         (if (fixed_session or backend == .vulkan) 4096 else @min(trainedContext(&st), auto_context_cap));
@@ -215,18 +233,13 @@ pub fn main(init: std.process.Init) !void {
     if (st == .gguf and st.gguf.getStr("general.architecture") != null and
         std.mem.eql(u8, st.gguf.getStr("general.architecture").?, "qwen35"))
     {
-        if (backend == .vulkan) {
-            try stdout.writeAll("qwen35 (hybrid DeltaNet) models run on cpu / zig-cuda / cuda only for now\n");
-            try stdout.flush();
-            return error.InvalidArgument;
-        }
         if (draft_path != null or eagle_path != null or opts.spec_k > 0 or opts.tree_nodes > 0) {
             try stdout.writeAll("speculative decoding is not supported for qwen35 models (recurrent state cannot roll back)\n");
             try stdout.flush();
             return error.InvalidArgument;
         }
         if (image_path != null) {
-            if (backend == .cpu) {
+            if (backend == .cpu or backend == .vulkan) {
                 try stdout.writeAll("--image requires the zig-cuda or cuda backend\n");
                 try stdout.flush();
                 return error.InvalidArgument;
@@ -338,6 +351,30 @@ pub fn main(init: std.process.Init) !void {
         try llm.chat.openAssistant(&tok, gpa, &ids);
     }
 
+    // Vulkan reserves the whole KV window up front (no growable buffers), so
+    // bring its device up now and auto-size the context to what VRAM holds
+    // before the banner and capacityPlan below read opts.max_context. CUDA
+    // instead defaults to the trained length and grows KV lazily. Pick the
+    // largest window whose KV reservation fits beside the resident weights
+    // (over-estimated by the whole mmapped file — the host-side embed is
+    // counted too — keeping the choice safely under budget), capped at the
+    // trained length. An explicit --max-context always wins. The context is
+    // held here and reused by the .vulkan arm below.
+    var vk_ctx: ?*TensorPencil.gpu.Context = null;
+    defer if (vk_ctx) |c| c.deinit();
+    if (backend == .vulkan) {
+        const ctx = try TensorPencil.gpu.Context.init(arena);
+        vk_ctx = ctx;
+        if (max_context_arg == null) {
+            const free = ctx.liveVram();
+            const weight_est: u64 = if (st.mapping()) |m| m.len else 0;
+            const per_tok = TensorPencil.models.qwen3_gpu.VulkanLM.kvWindowBytes(1);
+            const avail = free -| weight_est -| (pin_slack * 2); // activations + freqs + margin
+            const trained = @min(trainedContext(&st), auto_context_cap);
+            opts.max_context = std.math.clamp(avail / per_tok, 4096, trained);
+        }
+    }
+
     try stdout.print("[{s} backend, {d} prompt tokens, ctx window {d}, max {d} new/turn, temp {d:.2}, seed {d}]\n", .{
         @tagName(backend), ids.items.len, opts.max_context, opts.max_new_tokens, opts.sampling.temperature, opts.seed,
     });
@@ -376,9 +413,10 @@ pub fn main(init: std.process.Init) !void {
             const be = if (backend == .cuda) try cuda_be.initLibs(arena) else try cuda_be.init(arena);
             defer be.deinit();
             be.profile = profile;
-            be.budget_override = vram_budget; // --vram-budget: stream weights past this cap
-            be.pin_budget = vram_budget -| pin_slack; // pin the first-touched prefix, stream the rest
-            be.stream_window = @min(pin_slack, vram_budget); // in-flight streamed-weight cap / enqueue pacing
+            const eff_budget = defaultWeightBudget(be, vram_budget);
+            be.budget_override = vram_budget; // --vram-budget: hard weight cap (0 = driver-managed)
+            be.pin_budget = eff_budget -| pin_slack; // default: pin the whole model if it fits, else the prefix
+            be.stream_window = @min(pin_slack, eff_budget); // in-flight streamed-weight cap / enqueue pacing
             if (vram_budget != 0) {
                 // Page-lock the checkpoint mmaps so streamed weights DMA
                 // directly at full PCIe bandwidth, prefetched one layer
@@ -425,12 +463,18 @@ pub fn main(init: std.process.Init) !void {
             break :blk count;
         },
         .vulkan => blk: {
-            var ctx = try TensorPencil.gpu.Context.init(arena);
-            defer ctx.deinit();
-            ctx.budget_override = vram_budget; // --vram-budget: stream weights past this cap
-            ctx.pin_budget = vram_budget -| pin_slack; // pin the first-touched prefix, stream the rest
-            // Vulkan has no growable buffers yet: reserve the whole window.
-            var model = try TensorPencil.models.qwen3_gpu.VulkanLM.init(gpa, ctx, &lm, cap.max, prompt_len);
+            const ctx = vk_ctx.?; // created + context-auto-sized above the banner
+            const Vk = TensorPencil.models.qwen3_gpu.VulkanLM;
+            // Default (no --vram-budget): pin what fits so a model that fits
+            // stays resident instead of streaming every weight each step. Unlike
+            // the CUDA path, Vulkan reserves the whole KV window up front and
+            // pinned weights are never evicted, so the default must leave that
+            // window's VRAM unpinned — subtract it here.
+            const kv_window = Vk.kvWindowBytes(cap.max);
+            const eff_budget = if (vram_budget != 0) vram_budget else ctx.liveVram() -| kv_window;
+            ctx.budget_override = vram_budget; // --vram-budget: hard weight cap (0 = driver-managed)
+            ctx.pin_budget = eff_budget -| pin_slack; // default: pin the whole model if it fits, else the prefix
+            var model = try Vk.init(gpa, ctx, &lm, cap.max, prompt_len);
             defer model.deinit();
             t0 = Io.Clock.real.now(io).nanoseconds;
             break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt, null);
@@ -913,9 +957,10 @@ fn runQwen35(
             // (--offload-grow, dynamic). The two split modes keep GPU-resident
             // weights fully resident (no streaming) and size themselves below.
             if (cpu_split == null and !dynamic_offload) {
-                be.budget_override = vram_budget; // --vram-budget: stream weights past this cap
-                be.pin_budget = vram_budget -| pin_slack; // pin the first-touched prefix, stream the rest
-                be.stream_window = @min(pin_slack, vram_budget); // in-flight streamed-weight cap / enqueue pacing
+                const eff_budget = defaultWeightBudget(be, vram_budget);
+                be.budget_override = vram_budget; // --vram-budget: hard weight cap (0 = driver-managed)
+                be.pin_budget = eff_budget -| pin_slack; // default: pin the whole model if it fits, else the prefix
+                be.stream_window = @min(pin_slack, eff_budget); // in-flight streamed-weight cap / enqueue pacing
                 // Page-lock the checkpoint mmap so streamed weights DMA directly at
                 // full PCIe bandwidth, prefetched one layer ahead (mirrors the dense
                 // path; skipped when everything stays resident or the file isn't mmap'd).
@@ -955,7 +1000,19 @@ fn runQwen35(
             t0 = Io.Clock.real.now(io).nanoseconds;
             break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt, img_chat);
         },
-        .vulkan => unreachable, // rejected in main
+        .vulkan => blk: {
+            var ctx = try TensorPencil.gpu.Context.init(arena);
+            defer ctx.deinit();
+            // Pin what fits (block-quant weights stay resident); KV is fixed
+            // capacity up front (no growable buffers on Vulkan yet).
+            const eff = if (vram_budget != 0) vram_budget else ctx.liveVram();
+            ctx.budget_override = vram_budget;
+            ctx.pin_budget = eff -| pin_slack;
+            var model = try TensorPencil.models.qwen35_gpu.VulkanLM.init(gpa, ctx, &lm, cap);
+            defer model.deinit();
+            t0 = Io.Clock.real.now(io).nanoseconds;
+            break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt, null);
+        },
     };
     const t_end = Io.Clock.real.now(io).nanoseconds;
     const setup_s = @as(f64, @floatFromInt(t0 - t_init)) / 1e9;

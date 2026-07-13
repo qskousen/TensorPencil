@@ -288,6 +288,398 @@ export fn gemv_combine() callconv(.spirv_kernel) void {
     d.data[pc.u2 + col] = sum * pc.f0;
 }
 
+// gemv_q8_0: y[row] = scale * dot(dequant(W[row]), x), ONE thread per output
+//   row (no cross-thread reduction, so no workgroup memory). GGUF q8_0 row
+//   layout is row-major blocks of 32: cols/32 blocks x 34 bytes =
+//   [f16 d][32 x i8 qs]. Weight is uploaded RAW (weightBufferRaw, no k-major
+//   transpose) and read through the u32 view of a. a = W bytes, b = x [cols],
+//   d = y [rows]. u0 = rows, u1 = cols, f0 = scale.
+export fn gemv_q8_0() callconv(.spirv_kernel) void {
+    decorate();
+    const row = gpu.global_invocation_id[0];
+    if (row >= pc.u0) return;
+    const nblk = pc.u1 / 32;
+    const row_base = row * nblk * 34; // byte offset of this weight row
+    var acc: f32 = 0;
+    var blk: u32 = 0;
+    while (blk < nblk) : (blk += 1) {
+        const bb = row_base + blk * 34;
+        const dword: u32 = @bitCast(a.data[bb / 4]);
+        const dbits: u16 = if (bb % 4 == 0) @truncate(dword) else @truncate(dword >> 16);
+        const sc: f32 = @floatCast(@as(f16, @bitCast(dbits)));
+        var bsum: f32 = 0;
+        var i: u32 = 0;
+        while (i < 32) : (i += 1) {
+            const bo = bb + 2 + i;
+            const w: u32 = @bitCast(a.data[bo / 4]);
+            const sh: u5 = @intCast(8 * (bo % 4));
+            const ub: u32 = (w >> sh) & 0xFF;
+            const q: i32 = @as(i32, @bitCast(ub << 24)) >> 24; // sign-extend low byte
+            bsum += @as(f32, @floatFromInt(q)) * b.data[blk * 32 + i];
+        }
+        acc += sc * bsum;
+    }
+    d.data[pc.u2 + row] = acc * pc.f0;
+}
+
+// --- block-quant readers (weight buffer `a`, read through its u32 view) ---
+inline fn wbyte(bo: u32) u32 {
+    const word: u32 = @bitCast(a.data[bo / 4]);
+    const sh: u5 = @intCast(8 * (bo % 4));
+    return (word >> sh) & 0xFF;
+}
+inline fn wf16(bo: u32) f32 { // bo is 2-byte aligned
+    const word: u32 = @bitCast(a.data[bo / 4]);
+    const bits: u16 = if (bo % 4 == 0) @truncate(word) else @truncate(word >> 16);
+    return @floatCast(@as(f16, @bitCast(bits)));
+}
+inline fn wi8(bo: u32) i32 {
+    return @as(i32, @bitCast(wbyte(bo) << 24)) >> 24; // sign-extend low byte
+}
+
+// q4_k / q5_k 6-bit sub-block scale+min unpack (ggml get_scale_min_k4).
+// sbase = byte offset of the 12 packed scale bytes; j = sub-block 0..7.
+const ScaleMin = struct { sc: u32, m: u32 };
+inline fn scaleMinK4(sbase: u32, j: u32) ScaleMin {
+    if (j < 4) {
+        return .{ .sc = wbyte(sbase + j) & 63, .m = wbyte(sbase + j + 4) & 63 };
+    }
+    return .{
+        .sc = (wbyte(sbase + j + 4) & 0x0F) | ((wbyte(sbase + j - 4) >> 6) << 4),
+        .m = (wbyte(sbase + j + 4) >> 4) | ((wbyte(sbase + j) >> 6) << 4),
+    };
+}
+
+// gemv_q4_k: y[row] = scale * dot(dequant(W[row]), x), one thread per row.
+//   GGUF q4_k super-block (256 elems / 144 B): f16 d, f16 dmin, 12 B packed
+//   sub-block scales/mins, 128 B low nibbles. v = d*sc*q - dmin*m (ggml
+//   dequantize_row_q4_K element order). u0 = rows, u1 = cols, f0 = scale.
+export fn gemv_q4_k() callconv(.spirv_kernel) void {
+    decorate();
+    const row = gpu.global_invocation_id[0];
+    if (row >= pc.u0) return;
+    const nsb = pc.u1 / 256;
+    const row_base = row * nsb * 144;
+    var acc: f32 = 0;
+    var sb: u32 = 0;
+    while (sb < nsb) : (sb += 1) {
+        const bb = row_base + sb * 144;
+        const sd = wf16(bb);
+        const sdmin = wf16(bb + 2);
+        const sbase = bb + 4;
+        const qbase = bb + 16;
+        const xb = sb * 256;
+        var g: u32 = 0;
+        while (g < 4) : (g += 1) {
+            const s1 = scaleMinK4(sbase, 2 * g);
+            const s2 = scaleMinK4(sbase, 2 * g + 1);
+            const d1 = sd * @as(f32, @floatFromInt(s1.sc));
+            const m1 = sdmin * @as(f32, @floatFromInt(s1.m));
+            const d2 = sd * @as(f32, @floatFromInt(s2.sc));
+            const m2 = sdmin * @as(f32, @floatFromInt(s2.m));
+            const qg = qbase + g * 32;
+            const xg = xb + g * 64;
+            var l: u32 = 0;
+            while (l < 32) : (l += 1) {
+                const q = wbyte(qg + l);
+                const wlo = d1 * @as(f32, @floatFromInt(q & 0xF)) - m1;
+                const whi = d2 * @as(f32, @floatFromInt(q >> 4)) - m2;
+                acc += wlo * b.data[xg + l];
+                acc += whi * b.data[xg + 32 + l];
+            }
+        }
+    }
+    d.data[pc.u2 + row] = acc * pc.f0;
+}
+
+// gemv_q5_k: q4_k layout + 32 B of per-element 5th bits (qh) after the scales.
+//   super-block 176 B: f16 d, f16 dmin, 12 B scales, 32 B qh, 128 B qs.
+//   v = d*sc*(nibble + 16*bit) - dmin*m. u0 = rows, u1 = cols, f0 = scale.
+export fn gemv_q5_k() callconv(.spirv_kernel) void {
+    decorate();
+    const row = gpu.global_invocation_id[0];
+    if (row >= pc.u0) return;
+    const nsb = pc.u1 / 256;
+    const row_base = row * nsb * 176;
+    var acc: f32 = 0;
+    var sb: u32 = 0;
+    while (sb < nsb) : (sb += 1) {
+        const bb = row_base + sb * 176;
+        const sd = wf16(bb);
+        const sdmin = wf16(bb + 2);
+        const sbase = bb + 4;
+        const qhbase = bb + 16;
+        const qbase = bb + 48;
+        const xb = sb * 256;
+        var g: u32 = 0;
+        while (g < 4) : (g += 1) {
+            const s1 = scaleMinK4(sbase, 2 * g);
+            const s2 = scaleMinK4(sbase, 2 * g + 1);
+            const d1 = sd * @as(f32, @floatFromInt(s1.sc));
+            const m1 = sdmin * @as(f32, @floatFromInt(s1.m));
+            const d2 = sd * @as(f32, @floatFromInt(s2.sc));
+            const m2 = sdmin * @as(f32, @floatFromInt(s2.m));
+            const qg = qbase + g * 32;
+            const xg = xb + g * 64;
+            const mlo: u32 = @as(u32, 1) << @as(u5, @intCast(2 * g));
+            const mhi: u32 = @as(u32, 1) << @as(u5, @intCast(2 * g + 1));
+            var l: u32 = 0;
+            while (l < 32) : (l += 1) {
+                const q = wbyte(qg + l);
+                const qh = wbyte(qhbase + l);
+                const lo: u32 = (q & 0xF) + (if (qh & mlo != 0) @as(u32, 16) else 0);
+                const hi: u32 = (q >> 4) + (if (qh & mhi != 0) @as(u32, 16) else 0);
+                acc += (d1 * @as(f32, @floatFromInt(lo)) - m1) * b.data[xg + l];
+                acc += (d2 * @as(f32, @floatFromInt(hi)) - m2) * b.data[xg + 32 + l];
+            }
+        }
+    }
+    d.data[pc.u2 + row] = acc * pc.f0;
+}
+
+// gemv_q6_k: super-block 210 B / 256 elems: 128 B low nibbles (ql), 64 B high
+//   2-bit pairs (qh), 16 x i8 sub-block scales, f16 d. v = d*sc*(q - 32),
+//   16 sub-blocks of 16 (ggml dequantize_row_q6_K). u0=rows u1=cols f0=scale.
+export fn gemv_q6_k() callconv(.spirv_kernel) void {
+    decorate();
+    const row = gpu.global_invocation_id[0];
+    if (row >= pc.u0) return;
+    const nsb = pc.u1 / 256;
+    const row_base = row * nsb * 210;
+    var acc: f32 = 0;
+    var sb: u32 = 0;
+    while (sb < nsb) : (sb += 1) {
+        const bb = row_base + sb * 210;
+        const sd = wf16(bb + 208);
+        const xb = sb * 256;
+        var half: u32 = 0;
+        while (half < 2) : (half += 1) {
+            const qlh = bb + half * 64; // ql
+            const qhh = bb + 128 + half * 32; // qh
+            const sch = bb + 192 + half * 8; // scales (i8)
+            const xh = xb + half * 128;
+            var l: u32 = 0;
+            while (l < 32) : (l += 1) {
+                const is = l / 16;
+                const ql_l = wbyte(qlh + l);
+                const ql_h = wbyte(qlh + l + 32);
+                const qh = wbyte(qhh + l);
+                const q1 = @as(i32, @intCast((ql_l & 0xF) | (((qh >> 0) & 3) << 4))) - 32;
+                const q2 = @as(i32, @intCast((ql_h & 0xF) | (((qh >> 2) & 3) << 4))) - 32;
+                const q3 = @as(i32, @intCast((ql_l >> 4) | (((qh >> 4) & 3) << 4))) - 32;
+                const q4 = @as(i32, @intCast((ql_h >> 4) | (((qh >> 6) & 3) << 4))) - 32;
+                const sc1 = wi8(sch + is + 0);
+                const sc2 = wi8(sch + is + 2);
+                const sc3 = wi8(sch + is + 4);
+                const sc4 = wi8(sch + is + 6);
+                acc += sd * @as(f32, @floatFromInt(sc1 * q1)) * b.data[xh + l];
+                acc += sd * @as(f32, @floatFromInt(sc2 * q2)) * b.data[xh + l + 32];
+                acc += sd * @as(f32, @floatFromInt(sc3 * q3)) * b.data[xh + l + 64];
+                acc += sd * @as(f32, @floatFromInt(sc4 * q4)) * b.data[xh + l + 96];
+            }
+        }
+    }
+    d.data[pc.u2 + row] = acc * pc.f0;
+}
+
+// --- qwen35 hybrid (gated DeltaNet) kernels -----------------------------
+
+// l2norm_rows: in-place per-row L2 normalize (ggml_l2_norm, clamped by eps).
+//   a = x (in place). u0 = rows, u1 = dim, f0 = eps. One thread per row.
+export fn l2norm_rows() callconv(.spirv_kernel) void {
+    decorate();
+    const r = gpu.global_invocation_id[0];
+    if (r >= pc.u0) return;
+    const dim = pc.u1;
+    const base = r * dim;
+    var ss: f32 = 0;
+    var i: u32 = 0;
+    while (i < dim) : (i += 1) {
+        const v = a.data[base + i];
+        ss += v * v;
+    }
+    const scale = 1.0 / @max(@sqrt(ss), pc.f0);
+    i = 0;
+    while (i < dim) : (i += 1) a.data[base + i] *= scale;
+}
+
+// deinterleave2: split per-head interleaved [q(hd) gate(hd)] into q and gate.
+//   a = qg [heads*2*hd], c = q [heads*hd], d = gate [heads*hd]. u0 = heads*hd
+//   (total output elems), u1 = hd. One thread per output element.
+export fn deinterleave2() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const hd = pc.u1;
+    const h = idx / hd;
+    const j = idx % hd;
+    c.data[idx] = a.data[h * 2 * hd + j];
+    d.data[idx] = a.data[h * 2 * hd + hd + j];
+}
+
+// gdn_gates: per-head decay = exp(a * softplus(alpha + dt_bias)),
+//   beta = sigmoid(beta_raw). a = [alpha(heads) | beta_raw(heads)],
+//   b = a_dt [a(heads) | dt_bias(heads)], d = [decay(heads) | beta(heads)].
+//   u0 = heads. One thread per head.
+export fn gdn_gates() callconv(.spirv_kernel) void {
+    decorate();
+    const h = gpu.global_invocation_id[0];
+    if (h >= pc.u0) return;
+    const heads = pc.u0;
+    const alpha = a.data[h];
+    const beta_raw = a.data[heads + h];
+    const av = b.data[h];
+    const dt = b.data[heads + h];
+    const s = alpha + dt;
+    const sp = if (s > 20.0) s else @log(1.0 + @exp(s));
+    d.data[h] = @exp(av * sp);
+    d.data[heads + h] = 1.0 / (1.0 + @exp(-beta_raw));
+}
+
+// gdn_conv_step: per-channel depthwise causal conv over [state | current] +
+//   SiLU; the 3-column state rolls forward. a = conv_state [ch*(taps-1)] (in
+//   place), b = x [ch], c = conv_w [ch*taps], d = out [ch]. u0 = channels,
+//   u1 = taps (4). One thread per channel.
+export fn gdn_conv_step() callconv(.spirv_kernel) void {
+    decorate();
+    const ch = gpu.global_invocation_id[0];
+    if (ch >= pc.u0) return;
+    const taps = pc.u1;
+    const stb = ch * (taps - 1);
+    const wb = ch * taps;
+    var acc = c.data[wb + taps - 1] * b.data[ch];
+    var k: u32 = 0;
+    while (k < taps - 1) : (k += 1) acc += c.data[wb + k] * a.data[stb + k];
+    k = 0;
+    while (k < taps - 2) : (k += 1) a.data[stb + k] = a.data[stb + k + 1];
+    a.data[stb + taps - 2] = b.data[ch];
+    d.data[ch] = acc / (1.0 + @exp(-acc));
+}
+
+// gdn_delta_step: per-v-head delta rule over a dd x dd state (ggml
+//   build_delta_net_autoregressive, one token). a = state [heads*dd*dd] (in
+//   place), b = conv_out [q(kheads*dd) | k(kheads*dd) | v(heads*dd)],
+//   c = gates [decay(heads) | beta(heads)], d = o [heads*dd]. u0 = heads,
+//   u1 = dd (<=128), u2 = kheads, f0 = readout scale. One thread per head.
+export fn gdn_delta_step() callconv(.spirv_kernel) void {
+    decorate();
+    const h = gpu.global_invocation_id[0];
+    if (h >= pc.u0) return;
+    const heads = pc.u0;
+    const dd = pc.u1;
+    const kheads = pc.u2;
+    const scale = pc.f0;
+    const qkdim = kheads * dd;
+    const qbase = (h % kheads) * dd;
+    const kbase = qkdim + (h % kheads) * dd;
+    const vbase = 2 * qkdim + h * dd;
+    const sbase = h * dd * dd;
+    const decay = c.data[h];
+    const beta = c.data[heads + h];
+
+    var m: [128]f32 = undefined;
+    var j: u32 = 0;
+    while (j < dd) : (j += 1) m[j] = 0;
+    var i: u32 = 0;
+    while (i < dd) : (i += 1) {
+        const ki = b.data[kbase + i];
+        const rb = sbase + i * dd;
+        j = 0;
+        while (j < dd) : (j += 1) {
+            const sij = a.data[rb + j] * decay;
+            a.data[rb + j] = sij;
+            m[j] += sij * ki;
+        }
+    }
+    var dl: [128]f32 = undefined;
+    j = 0;
+    while (j < dd) : (j += 1) dl[j] = (b.data[vbase + j] - m[j]) * beta;
+    var o: [128]f32 = undefined;
+    j = 0;
+    while (j < dd) : (j += 1) o[j] = 0;
+    i = 0;
+    while (i < dd) : (i += 1) {
+        const ki = b.data[kbase + i];
+        const qi = b.data[qbase + i] * scale;
+        const rb = sbase + i * dd;
+        j = 0;
+        while (j < dd) : (j += 1) {
+            const sij = a.data[rb + j] + ki * dl[j];
+            a.data[rb + j] = sij;
+            o[j] += sij * qi;
+        }
+    }
+    j = 0;
+    while (j < dd) : (j += 1) d.data[h * dd + j] = o[j];
+}
+
+// rope_qwen35: partial rotate-half RoPE over the first rope_dim head dims,
+//   in place (text-only decode: single position for all M-RoPE sections).
+//   a = qk [n_heads*head_dim], c = freqs (cos then sin). u0 = n_heads*half
+//   (total pairs), u1 = half (rope_dim/2), u2 = sin_off, u3 = head_dim,
+//   u4 = pos. Matches ops.rope.applyRotateHalfPartialAt.
+export fn rope_qwen35() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const half = pc.u1;
+    const sin_off = pc.u2;
+    const hd = pc.u3;
+    const pos = pc.u4;
+    const h = idx / half;
+    const i = idx % half;
+    const cosv = c.data[pos * half + i];
+    const sinv = c.data[sin_off + pos * half + i];
+    const base = h * hd + i;
+    const lo = a.data[base];
+    const hi = a.data[base + half];
+    a.data[base] = lo * cosv - hi * sinv;
+    a.data[base + half] = hi * cosv + lo * sinv;
+}
+
+// attn_decode_q35: causal GQA attention for one query (decode), one thread per
+//   query head, online softmax. a = q [n_heads*hd], b = k_cache
+//   [kv_len*kvDim], c = v_cache [kv_len*kvDim] (kvDim = n_kv*hd, position j at
+//   j*kvDim + kvh*hd), d = out [n_heads*hd]. u0 = n_heads, u1 = n_kv_heads,
+//   u2 = head_dim (<=256), u3 = kv_len, f0 = scale.
+export fn attn_decode_q35() callconv(.spirv_kernel) void {
+    decorate();
+    const h = gpu.global_invocation_id[0];
+    if (h >= pc.u0) return;
+    const n_heads = pc.u0;
+    const n_kv = pc.u1;
+    const hd = pc.u2;
+    const kv_len = pc.u3;
+    const scale = pc.f0;
+    const kvh = h / (n_heads / n_kv);
+    const qb = h * hd;
+    const kvdim = n_kv * hd;
+    const kvbase = kvh * hd;
+    var acc: [256]f32 = undefined;
+    var t: u32 = 0;
+    while (t < hd) : (t += 1) acc[t] = 0;
+    var mx: f32 = -3.4e38;
+    var denom: f32 = 0;
+    var j: u32 = 0;
+    while (j < kv_len) : (j += 1) {
+        const kb = j * kvdim + kvbase;
+        var sc: f32 = 0;
+        t = 0;
+        while (t < hd) : (t += 1) sc += a.data[qb + t] * b.data[kb + t];
+        sc *= scale;
+        const newmax = @max(mx, sc);
+        const corr = @exp(mx - newmax);
+        const p = @exp(sc - newmax);
+        denom = denom * corr + p;
+        t = 0;
+        while (t < hd) : (t += 1) acc[t] = acc[t] * corr + p * c.data[kb + t];
+        mx = newmax;
+    }
+    const inv = 1.0 / denom;
+    t = 0;
+    while (t < hd) : (t += 1) d.data[qb + t] = acc[t] * inv;
+}
+
 // gemv_partial4: gemv_partial for FOUR input vectors at once (speculative-
 //   decode verify): one thread per (chunk, 8-column group) computes 32 dots,
 //   reading each weight word once for all four inputs and each x value once

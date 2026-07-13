@@ -307,6 +307,14 @@ pub const VulkanLM = struct {
     /// Interleaved k chunks per output column in the decode GEMV.
     const gemv_nchunk = 32;
 
+    /// Device bytes the KV cache reserves up front for `capacity` tokens (k +
+    /// v across all layers). Vulkan has no growable buffers, so this whole
+    /// window is allocated in init() — callers sizing a default weight-pin
+    /// budget must leave this much VRAM unpinned for it.
+    pub fn kvWindowBytes(capacity: usize) usize {
+        return 2 * n_layers * capacity * kv_dim * 4;
+    }
+
     pub fn init(gpa: std.mem.Allocator, ctx: *gpu.Context, lm: *const qwen3.CausalLM, capacity: usize, first_seq: usize) !VulkanLM {
         // This stepper is still hardwired to the 4B dims (module constants);
         // the 0.6B draft model runs on the CPU/CUDA steppers only for now.
