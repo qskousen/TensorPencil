@@ -45,6 +45,11 @@ fn offsetBufSized(b: Buf, off_bytes: usize, size: usize) Buf {
     return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off_bytes), .mem = b.mem, .size = size };
 }
 
+/// Which layers a hybrid CPU/GPU split pushes to the host. Gemma3 is uniform
+/// attention, so both policies reduce to a descending-layer order (last layer
+/// migrates first); kept for interface parity with qwen35_cuda.
+pub const CpuSplitPolicy = enum { tail, attn };
+
 pub const CudaLM = struct {
     lm: *const gemma3.Model,
     be: *Backend,
@@ -52,7 +57,18 @@ pub const CudaLM = struct {
     cfg: gemma3.Config,
     capacity: usize,
     max_capacity: usize,
+    /// The KV capacity a fresh session starts at; resetResidency shrinks back to
+    /// it so a new chat frees the grown KV VRAM.
+    initial_capacity: usize,
     len: usize,
+    /// Io for the host matmuls of a hybrid split's CPU-resident layers; set by
+    /// `step`. Undefined until the first `step` — the offload host path only
+    /// runs after generation starts (text-only sessions), same as qwen35_cuda.
+    io: std.Io = undefined,
+    /// Hybrid CPU/GPU split: CPU-resident layers run host matmuls (dynamic
+    /// offload migrates more to the host as the KV cache grows). null = fully
+    /// device-resident. Forces the per-op path (already the gemma3 default).
+    split: ?Split = null,
     /// half = head_dim/2; the sin table starts at cap.max*half in each freqs
     /// buffer (baked capacity-independent, like qwen3_cuda).
     sin_off: usize,
@@ -64,6 +80,38 @@ pub const CudaLM = struct {
     v_cache: []Growable,
     bufs: Bufs,
     arena: std.heap.ArenaAllocator,
+
+    /// CPU-resident layers of a hybrid split + the host state they need.
+    /// Allocated with `gpa`; freed in `deinit`. Mirrors qwen35_cuda.Split,
+    /// simplified: gemma3 is all-attention (no conv/ssm), so the host state is
+    /// just a KvCache (K/V for the CPU layers) plus the dual RoPE tables.
+    pub const Split = struct {
+        /// Per-layer: compute on the device? (false = host).
+        on_gpu: []bool,
+        n_cpu: usize,
+        policy: CpuSplitPolicy,
+        /// Host K/V for the CPU-resident layers (full n_layers slots; only the
+        /// CPU layers' slots are used). Grows in lockstep with the device caches;
+        /// `len` tracks the device `len`.
+        cache: kvmod.KvCache,
+        /// Host activation scratch, sized for a full prefill chunk (viewed down
+        /// to the actual chunk length per call).
+        scratch: gemma3.Scratch,
+        /// Host RoPE tables (global + local), grown with capacity — text only.
+        freqs_global: ops.rope.Freqs,
+        freqs_local: ops.rope.Freqs,
+        /// Host hidden buffer ([prefill_chunk * hidden]).
+        hx: []f32,
+        /// Does the live hidden currently sit in `hx` (vs device `bufs.x`)?
+        on_host: bool = false,
+        /// Dynamic offload: migrate more layers GPU->CPU as the KV grows.
+        dynamic: bool = false,
+        /// Migration priority (layer indices); order[0..next) are already on CPU.
+        order: []usize = &.{},
+        next: usize = 0,
+        /// VRAM ceiling (bytes) the dynamic scheduler keeps device usage under.
+        budget: u64 = 0,
+    };
 
     pub fn init(gpa: std.mem.Allocator, be: *Backend, lm: *const gemma3.Model, cap: kvmod.Capacity) !CudaLM {
         const cfg = lm.cfg;
@@ -83,8 +131,10 @@ pub const CudaLM = struct {
         self.gpa = gpa;
         self.cfg = cfg;
         self.capacity = cap.initial;
+        self.initial_capacity = cap.initial;
         self.max_capacity = cap.max;
         self.len = 0;
+        self.split = null;
         self.sin_off = cap.max * (cfg.head_dim / 2);
 
         self.freqs_global = try uploadFreqs(be, gpa, cap.max, cfg.head_dim, cfg.rope_theta, cfg.rope_freq_scale);
@@ -126,6 +176,15 @@ pub const CudaLM = struct {
         be.tensorDestroy(&self.freqs_global);
         be.tensorDestroy(&self.freqs_local);
         self.bufs.deinit(be);
+        if (self.split) |*sp| {
+            sp.cache.deinit(self.gpa);
+            sp.scratch.deinit(self.gpa);
+            sp.freqs_global.deinit(self.gpa);
+            sp.freqs_local.deinit(self.gpa);
+            self.gpa.free(sp.hx);
+            self.gpa.free(sp.on_gpu);
+            self.gpa.free(sp.order);
+        }
         self.arena.deinit();
         self.* = undefined;
     }
@@ -139,8 +198,271 @@ pub const CudaLM = struct {
     pub fn capacityMax(self: *const CudaLM) usize {
         return self.max_capacity;
     }
+    /// Reset the session to an empty context (GUI "new chat"). Gemma3 is a plain
+    /// attention model with no recurrent/conv state, so the KV rows (overwritten
+    /// lazily on the next prefill) only need the position counter cleared.
+    pub fn resetCache(self: *CudaLM) !void {
+        self.len = 0;
+    }
     pub fn vocab(self: *const CudaLM) usize {
         return self.cfg.vocab;
+    }
+
+    /// Total device footprint of one layer's streamable weights (quantized
+    /// bytes) — the projection + MLP matrices; norms are negligible. `anytype`
+    /// avoids naming gemma3's private `Layer` type.
+    fn layerDeviceBytes(layer: anytype) usize {
+        return layer.q.bytes.len + layer.k.bytes.len + layer.v.bytes.len + layer.o.bytes.len +
+            layer.gate.bytes.len + layer.up.bytes.len + layer.down.bytes.len;
+    }
+
+    /// Layers whose KV still lives on the device (gemma3 is all-attention, so
+    /// this is just the on-GPU count).
+    fn liveSlots(self: *CudaLM) usize {
+        var count: usize = 0;
+        for (0..self.cfg.n_layers) |l| {
+            if (self.split) |*sp| if (!sp.on_gpu[l]) continue;
+            count += 1;
+        }
+        return count;
+    }
+
+    /// Migrate the next layer in the offload order to the host (dynamic mode).
+    /// Returns false when nothing is left to migrate.
+    fn migrateNextLayer(self: *CudaLM) !bool {
+        const sp = &self.split.?;
+        if (sp.next >= sp.order.len) return false;
+        const l = sp.order[sp.next];
+        sp.next += 1;
+        try self.migrateLayer(l);
+        return true;
+    }
+
+    /// Move layer `l`'s live K/V device->host, free its device K/V + weights,
+    /// and mark it CPU-resident. Mirrors qwen35_cuda.migrateLayer (attention
+    /// case only — gemma3 has no recurrent/conv state).
+    fn migrateLayer(self: *CudaLM, l: usize) !void {
+        const cfg = self.cfg;
+        const sp = &self.split.?;
+        const kvd = cfg.kvDim();
+        if (self.len > 0) {
+            const cap = sp.cache.capacity;
+            const hk = sp.cache.k[l * cap * kvd ..][0 .. self.len * kvd];
+            const hv = sp.cache.v[l * cap * kvd ..][0 .. self.len * kvd];
+            try self.be.tensorDownload(offsetBufSized(self.k_cache[l].buf, 0, self.len * kvd * 4), std.mem.sliceAsBytes(hk));
+            try self.be.tensorDownload(offsetBufSized(self.v_cache[l].buf, 0, self.len * kvd * 4), std.mem.sliceAsBytes(hv));
+        }
+        self.be.growableDestroy(&self.k_cache[l]);
+        self.be.growableDestroy(&self.v_cache[l]);
+        // Free the migrated layer's device weights (the host path reads them from
+        // the GGUF mapping) — the bulk of the reclaimed VRAM.
+        const layer = &self.lm.layers[l];
+        self.be.evictWeightBytes(layer.q.bytes);
+        self.be.evictWeightBytes(layer.k.bytes);
+        self.be.evictWeightBytes(layer.v.bytes);
+        self.be.evictWeightBytes(layer.o.bytes);
+        self.be.evictWeightBytes(layer.gate.bytes);
+        self.be.evictWeightBytes(layer.up.bytes);
+        self.be.evictWeightBytes(layer.down.bytes);
+        sp.on_gpu[l] = false;
+        sp.n_cpu += 1;
+        std.debug.print("[offload] layer {d} (attn) -> CPU at ctx {d} ({d}/{d} on CPU)\n", .{ l, self.len, sp.n_cpu, cfg.n_layers });
+    }
+
+    /// Migrate layers to the host until `@min(budget - deviceUsed, headroom)`
+    /// reaches `needed_free` bytes, or nothing is left. Fixed-target variant used
+    /// by the VRAM coordinator (free room for the image model). No-op without a
+    /// dynamic split. (ensureCapacity keeps its own loop, whose target shrinks per
+    /// iteration as liveSlots drops — a fixed target here can't express that.)
+    pub fn offloadUntilFree(self: *CudaLM, needed_free: u64) !void {
+        if (self.split == null) return;
+        const sp = &self.split.?;
+        if (!sp.dynamic) return;
+        while (true) {
+            const free = @min(sp.budget -| self.be.deviceUsed(), self.be.headroom());
+            if (free >= needed_free) break;
+            if (!(try self.migrateNextLayer())) break; // nothing left
+        }
+    }
+
+    /// Migrate layers until the LLM's actual total device usage is ≤ `target`
+    /// bytes (balanced mode: settle the LLM to its share only when an image model
+    /// loads). Live `deviceUsed()`, one-way + idempotent. See qwen35_cuda.
+    pub fn offloadToBudget(self: *CudaLM, target: u64) !void {
+        if (self.split == null or target == 0) return;
+        const sp = &self.split.?;
+        if (!sp.dynamic) return;
+        while (self.be.deviceUsed() > target) {
+            if (!(try self.migrateNextLayer())) break;
+        }
+    }
+
+    /// Bring layer `l` back onto the GPU, preserving its accumulated K/V: re-create
+    /// the device K/V at the current capacity and upload the host rows [0,len).
+    /// Weights re-cache lazily on the next GPU forward. Reverse of migrateLayer.
+    fn promoteLayer(self: *CudaLM, l: usize) !void {
+        const cfg = self.cfg;
+        const sp = &self.split.?;
+        const kvd = cfg.kvDim();
+        self.k_cache[l] = try self.be.growableCreate(self.capacity * kvd * 4, self.max_capacity * kvd * 4);
+        self.v_cache[l] = try self.be.growableCreate(self.capacity * kvd * 4, self.max_capacity * kvd * 4);
+        if (self.len > 0) {
+            const cap = sp.cache.capacity;
+            const hk = sp.cache.k[l * cap * kvd ..][0 .. self.len * kvd];
+            const hv = sp.cache.v[l * cap * kvd ..][0 .. self.len * kvd];
+            try self.be.tensorUpload(offsetBufSized(self.k_cache[l].buf, 0, self.len * kvd * 4), std.mem.sliceAsBytes(hk));
+            try self.be.tensorUpload(offsetBufSized(self.v_cache[l].buf, 0, self.len * kvd * 4), std.mem.sliceAsBytes(hv));
+        }
+        sp.on_gpu[l] = true;
+        sp.n_cpu -= 1;
+        std.debug.print("[promote] layer {d} -> GPU at ctx {d} ({d}/{d} on CPU)\n", .{ l, self.len, sp.n_cpu, cfg.n_layers });
+    }
+
+    /// Migrate CPU layers back onto the GPU (LIFO by offload order), stopping
+    /// before the next one would overflow `budget` — so the caller (VRAM
+    /// coordinator, after image generation) reclaims LLM residency while leaving
+    /// room for whatever else stays resident. Keeps the split armed (offload can
+    /// fire again). Returns the number promoted; 0 without a split.
+    pub fn promoteLayers(self: *CudaLM, budget: u64) !usize {
+        if (self.split == null) return 0;
+        const sp = &self.split.?;
+        const kv_at_cap = 2 * self.capacity * self.cfg.kvDim() * 4;
+        var promoted: usize = 0;
+        while (sp.next > 0) {
+            const l = sp.order[sp.next - 1];
+            const cost = layerDeviceBytes(&self.lm.layers[l]) + kv_at_cap + (64 << 20);
+            const free = @min(budget -| self.be.deviceUsed(), self.be.headroom());
+            if (free < cost) break;
+            try self.promoteLayer(l);
+            sp.next -= 1;
+            promoted += 1;
+        }
+        return promoted;
+    }
+
+    /// New-chat reset: drop the split, shrink every K/V cache back to the initial
+    /// capacity (frees the grown VRAM), clear the context, and re-arm dynamic
+    /// offload for the fresh small context. KV is discarded, so no host->device
+    /// copy is needed (unlike promoteLayers).
+    pub fn resetResidency(self: *CudaLM, budget: u64) !void {
+        const cfg = self.cfg;
+        const kvd = cfg.kvDim();
+        if (self.split) |*sp| {
+            sp.cache.deinit(self.gpa);
+            sp.scratch.deinit(self.gpa);
+            sp.freqs_global.deinit(self.gpa);
+            sp.freqs_local.deinit(self.gpa);
+            self.gpa.free(sp.hx);
+            self.gpa.free(sp.on_gpu);
+            self.gpa.free(sp.order);
+            self.split = null;
+        }
+        for (self.k_cache, self.v_cache) |*kb, *vb| {
+            self.be.growableDestroy(kb);
+            self.be.growableDestroy(vb);
+            kb.* = try self.be.growableCreate(self.initial_capacity * kvd * 4, self.max_capacity * kvd * 4);
+            vb.* = try self.be.growableCreate(self.initial_capacity * kvd * 4, self.max_capacity * kvd * 4);
+        }
+        self.capacity = self.initial_capacity;
+        try self.resetCache();
+        _ = try self.autoOffload(budget);
+    }
+
+    /// Always arm the dynamic split (text sessions; `budget == 0` = no offload).
+    /// Free when the model fits (0 layers on CPU, per-op decode), and migrates
+    /// layers on demand as the KV cache grows — so over-budget growth degrades
+    /// via CPU offload (faster than weight streaming) rather than the streaming
+    /// fallback. See qwen35_cuda.autoOffload for the measured rationale.
+    pub fn autoOffload(self: *CudaLM, budget: u64) !bool {
+        if (budget == 0) return false;
+        try self.enableCpuSplit(.attn, budget, true);
+        return true;
+    }
+
+    /// Place layers on the host until the device-resident weights fit under
+    /// `budget` (bytes). Must run right after init (before any tokens) with
+    /// `budget != 0`. `dynamic` packs the GPU now (head-only reserve) and
+    /// migrates on demand as the KV grows; static reserves generously. Forces
+    /// the per-op path (already the gemma3 default). No-op static split (all fit)
+    /// leaves `self.split == null`. Mirrors qwen35_cuda.enableCpuSplit.
+    pub fn enableCpuSplit(self: *CudaLM, policy: CpuSplitPolicy, budget: u64, dynamic: bool) !void {
+        const cfg = self.cfg;
+        const n = cfg.n_layers;
+        const gpa = self.gpa;
+
+        const per = try gpa.alloc(usize, n);
+        defer gpa.free(per);
+        var total_weight: usize = 0;
+        for (self.lm.layers, 0..) |*layer, l| {
+            per[l] = layerDeviceBytes(layer);
+            total_weight += per[l];
+        }
+
+        // Device memory that must stay resident: KV at capacity + LM head + slack.
+        const kv_bytes = 2 * n * self.capacity * cfg.kvDim() * 4;
+        const reserve = if (dynamic)
+            self.lm.head.bytes.len
+        else
+            kv_bytes + self.lm.head.bytes.len + (512 << 20);
+        const gpu_weight_budget: usize = if (budget > reserve) budget - reserve else 0;
+
+        // Eviction order: last layer leaves first (descending). gemma3 is
+        // all-attention, so `.attn` and `.tail` coincide.
+        const order = try gpa.alloc(usize, n);
+        errdefer gpa.free(order);
+        for (0..n) |i| order[i] = n - 1 - i;
+
+        const on_gpu = try gpa.alloc(bool, n);
+        errdefer gpa.free(on_gpu);
+        @memset(on_gpu, true);
+        var gpu_weight = total_weight;
+        var n_cpu: usize = 0;
+        while (gpu_weight > gpu_weight_budget and n_cpu < n) {
+            const l = order[n_cpu];
+            on_gpu[l] = false;
+            gpu_weight -= per[l];
+            n_cpu += 1;
+        }
+        if (n_cpu == 0 and !dynamic) {
+            gpa.free(on_gpu);
+            gpa.free(order);
+            return; // everything fits resident — no split needed
+        }
+
+        // Host state for the CPU-resident layers (sized to the current KV
+        // capacity; grows with the device via ensureCapacity; len starts at 0).
+        var cache = try kvmod.KvCache.init(gpa, n, self.capacity, cfg.kvDim());
+        errdefer cache.deinit(gpa);
+        var scratch = try gemma3.Scratch.init(gpa, prefill_chunk, cfg);
+        errdefer scratch.deinit(gpa);
+        var fg = try ops.rope.rotateHalfFreqsScaled(gpa, self.capacity, cfg.head_dim, cfg.rope_theta, cfg.rope_freq_scale);
+        errdefer fg.deinit(gpa);
+        var fl = try ops.rope.rotateHalfFreqsScaled(gpa, self.capacity, cfg.head_dim, cfg.rope_theta_local, 1.0);
+        errdefer fl.deinit(gpa);
+        const hx = try gpa.alloc(f32, prefill_chunk * cfg.hidden);
+        errdefer gpa.free(hx);
+
+        self.split = .{
+            .on_gpu = on_gpu,
+            .n_cpu = n_cpu,
+            .policy = policy,
+            .cache = cache,
+            .scratch = scratch,
+            .freqs_global = fg,
+            .freqs_local = fl,
+            .hx = hx,
+            .dynamic = dynamic,
+            .order = order,
+            .next = n_cpu,
+            .budget = budget,
+        };
+
+        // Free the device K/V of layers placed on the host up front (len is 0
+        // here, nothing to copy). Weights are reclaimed lazily by the cache.
+        for (order[0..n_cpu]) |l| {
+            self.be.growableDestroy(&self.k_cache[l]);
+            self.be.growableDestroy(&self.v_cache[l]);
+        }
     }
 
     pub fn ensureCapacity(self: *CudaLM, min_rows: usize) !void {
@@ -148,13 +470,42 @@ pub const CudaLM = struct {
         if (min_rows > self.max_capacity) return error.ContextFull;
         const target = kvmod.growTarget(self.capacity, min_rows, self.max_capacity);
         const bytes = target * self.cfg.kvDim() * 4;
-        for ([2][]Growable{ self.k_cache, self.v_cache }) |caches| {
-            for (caches) |*b| {
+
+        // Dynamic offload: migrate layers GPU->CPU until there's headroom to grow
+        // the device KV, instead of streaming weights (the cliff). Each migrated
+        // layer frees its device KV + weight VRAM. Mirrors qwen35_cuda.
+        if (self.split) |*sp| if (sp.dynamic) {
+            const add = (target - self.capacity) * self.cfg.kvDim() * 4;
+            while (true) {
+                const need = self.liveSlots() * 2 * add + (32 << 20); // + margin
+                const free = @min(sp.budget -| self.be.deviceUsed(), self.be.headroom());
+                std.debug.print("[dyn] target={d} used={d}MB budget={d}MB free={d}MB need={d}MB\n", .{ target, self.be.deviceUsed() >> 20, sp.budget >> 20, free >> 20, need >> 20 });
+                if (free >= need) break;
+                if (!(try self.migrateNextLayer())) break; // nothing left; fall through
+            }
+        };
+
+        // Grow device KV of the layers still on the GPU.
+        for (0..self.cfg.n_layers) |l| {
+            if (self.split) |*sp| if (!sp.on_gpu[l]) continue;
+            for ([2]*Growable{ &self.k_cache[l], &self.v_cache[l] }) |b| {
                 self.be.growableEnsure(b, bytes) catch |err| switch (err) {
                     error.DeviceOutOfMemory, error.OutOfMemory => return error.ContextFull,
                     else => return err,
                 };
             }
+        }
+        // A hybrid split keeps host KV/RoPE for its CPU layers; grow them in
+        // lockstep so host positions stay aligned with the device len.
+        if (self.split) |*sp| {
+            sp.cache.grow(self.gpa, target) catch return error.ContextFull;
+            const cfg = self.cfg;
+            const fg = ops.rope.rotateHalfFreqsScaled(self.gpa, target, cfg.head_dim, cfg.rope_theta, cfg.rope_freq_scale) catch return error.ContextFull;
+            sp.freqs_global.deinit(self.gpa);
+            sp.freqs_global = fg;
+            const fl = ops.rope.rotateHalfFreqsScaled(self.gpa, target, cfg.head_dim, cfg.rope_theta_local, 1.0) catch return error.ContextFull;
+            sp.freqs_local.deinit(self.gpa);
+            sp.freqs_local = fl;
         }
         self.capacity = target;
     }
@@ -163,7 +514,7 @@ pub const CudaLM = struct {
     /// vocab logits. Prefill runs in prefill_chunk-sized batches (only the
     /// final chunk computes the LM head).
     pub fn step(self: *CudaLM, io: std.Io, ids: []const u32, logits: []f32) !void {
-        _ = io;
+        self.io = io; // the CPU half of a hybrid split runs host matmuls through it
         std.debug.assert(ids.len >= 1 and ids.len <= self.remaining());
         std.debug.assert(logits.len == self.cfg.vocab);
         var off: usize = 0;
@@ -233,8 +584,29 @@ pub const CudaLM = struct {
         try be.beginBatch();
         errdefer if (be.batching()) be.abortBatch();
 
+        // Hybrid split: each chunk begins with the hidden on the device (bufs.x).
+        if (self.split) |*sp| sp.on_host = false;
+
         const attn_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
         for (self.lm.layers, 0..) |*layer, l| {
+            // Hybrid CPU/GPU split: run host-resident layers on the CPU via the
+            // shared gemma3.layerForward, ferrying the hidden across the
+            // device<->host boundary only when residency changes.
+            if (self.split) |*sp| {
+                if (!sp.on_gpu[l]) {
+                    if (!sp.on_host) {
+                        try be.tensorDownload(offsetBufSized(b.x, 0, n * cfg.hidden * 4), std.mem.sliceAsBytes(sp.hx[0 .. n * cfg.hidden]));
+                        sp.on_host = true;
+                    }
+                    var sv = sp.scratch.viewSeq(n, cfg);
+                    try gemma3.layerForward(self.io, self.gpa, cfg, layer, sp.hx[0 .. n * cfg.hidden], n, sp.freqs_global, sp.freqs_local, &sp.cache, l, &sv);
+                    continue;
+                }
+                if (sp.on_host) {
+                    try be.tensorUpload(offsetBufSized(b.x, 0, n * cfg.hidden * 4), std.mem.sliceAsBytes(sp.hx[0 .. n * cfg.hidden]));
+                    sp.on_host = false;
+                }
+            }
             const global = cfg.isGlobal(l);
             const freqs = if (global) self.freqs_global else self.freqs_local;
             const window: usize = if (global) 0 else cfg.sliding_window;
@@ -267,16 +639,26 @@ pub const CudaLM = struct {
             try be.opAdd(b.x, b.t, n * cfg.hidden);
         }
 
+        // If the last layers ran on the host (the `.attn`/`.tail` order migrates
+        // the last layers first, so this is the common case), bring the final
+        // hidden back to the device for the LM head.
+        if (self.split) |*sp| if (sp.on_host) {
+            try be.tensorUpload(offsetBufSized(b.x, 0, n * cfg.hidden * 4), std.mem.sliceAsBytes(sp.hx[0 .. n * cfg.hidden]));
+            sp.on_host = false;
+        };
+
         if (logits) |out| {
             const h = cfg.hidden;
             try be.qkNorm(offsetBufSized(b.x, (n - 1) * h * 4, h * 4), b.t, try nbuf(be, self.lm.final_norm), 1, h, eps);
             try self.lmHead(b.logits, b.t);
             try be.endBatch();
             self.len += n;
+            if (self.split) |*sp| sp.cache.commit(n); // keep host len == device len
             try be.tensorDownload(offsetBufSized(b.logits, 0, cfg.vocab * 4), std.mem.sliceAsBytes(out));
         } else {
             try be.endBatch();
             self.len += n;
+            if (self.split) |*sp| sp.cache.commit(n);
         }
     }
 

@@ -14,6 +14,7 @@ const fonts = @import("fonts.zig");
 const viewer = @import("viewer.zig");
 const config = @import("config.zig");
 const config_view = @import("config_view.zig");
+const status_bar = @import("status_bar.zig");
 const vips = @import("vips");
 
 // dvui frames are argless, so app state is process-global (the dvui idiom).
@@ -28,11 +29,19 @@ var g_session_arena: ?*std.heap.ArenaAllocator = null; // load-once weights, fre
 var g_loading: std.atomic.Value(bool) = .init(false);
 var g_loader: ?std.Thread = null;
 var g_reload_requested: bool = false;
+// The conversation transcript carried across a model-swap reload (detached from
+// the old session before teardown, adopted by the new one) so a settings save
+// never wipes the chat. Owned by g_gpa; freed if there's no new session to adopt.
+var g_carry: ?std.ArrayList(chat.Message) = null;
 
 // Persistent settings + which full-window view is showing. `g_config_path`
 // (from `--config`) overrides the well-known settings-file location; null uses
 // the platform config dir.
 var g_config: config.Config = .{};
+// The config as of the last load/apply, to diff against on the next Apply: only
+// a change to a load-affecting field (model path or VRAM limit) forces a session
+// reload; everything else is applied live so saving settings never wipes the chat.
+var g_config_baseline: config.Config = .{};
 var g_config_path: ?[]const u8 = null;
 var g_view: View = .chat;
 const View = enum { chat, config };
@@ -100,6 +109,7 @@ pub fn run(init: std.process.Init) !void {
     // Load persisted settings (all fields default to unset / disabled).
     g_config = config.Config.load(init.io, gpa, init.environ_map, g_config_path);
     if (model_override) |m| g_config.llm_model.set(m);
+    g_config_baseline = g_config;
 
     var back = try SDLBackend.initWindow(.{
         .io = init.io,
@@ -139,6 +149,8 @@ pub fn run(init: std.process.Init) !void {
             a.deinit();
             g_gpa.destroy(a);
         }
+        freeCarry();
+        status_bar.deinit();
     }
     defer if (g_viewer) |v| v.deinit();
 
@@ -198,6 +210,12 @@ pub fn run(init: std.process.Init) !void {
         }
 
         // ── Viewer window ────────────────────────────────────────────────
+        // Closed (window's X, or a "new chat" that freed its image): tear down
+        // without rendering, since `v.cur` may now be dangling.
+        if (g_viewer) |v| if (!v.open) {
+            v.deinit();
+            g_viewer = null;
+        };
         if (g_viewer) |v| {
             try v.win.begin(nstime);
             _ = SDLBackend.c.SDL_SetRenderDrawColor(v.back.renderer, 0, 0, 0, 255);
@@ -296,10 +314,11 @@ fn frame() void {
     // reports its full content height as its min size, so as a plain flex child
     // it would push the input off-screen (dvui's box sums every child's min
     // height). max_size_content caps that.
-    const list_h = @max(120, root.data().contentRect().h - g_input_h);
+    const list_h = @max(120, root.data().contentRect().h - g_input_h - status_bar.bar_height);
 
     renderMessages(s, list_h);
     renderInput(s);
+    status_bar.render(s);
 }
 
 /// Chat view while the session (re)loads on the background thread.
@@ -335,16 +354,47 @@ fn openSettings() void {
     g_view = .config;
 }
 
-/// Apply button: persist settings and (re)load the session with them.
+/// Apply button: persist settings, then apply them WITHOUT wiping the chat.
+/// - LLM/vision/VRAM-limit change, or an image-tool enable/disable toggle →
+///   a transcript-preserving reload (loaderMain carries the chat across).
+/// - Everything else (image defaults, preview, priority, and a diffusion-model
+///   swap) → applied live to the running session.
 fn applyConfig() void {
     g_config.save(g_io, g_gpa, g_environ, g_config_path) catch |err| std.log.err("save settings failed: {t}", .{err});
-    g_reload_requested = true;
+    const llm_changed = !g_config.llmReloadEql(&g_config_baseline);
+    const tool_toggled = g_config.diffEnabled() != g_config_baseline.diffEnabled();
+    if (llm_changed or tool_toggled) {
+        g_reload_requested = true; // transcript-preserving (see loaderMain)
+    } else {
+        applyLiveSettings();
+    }
+    g_config_baseline = g_config;
     g_view = .chat;
+}
+
+/// Push live-applicable settings into the running session without a reload:
+/// image defaults, preview method, VRAM priority, and — when the diffusion model
+/// set changed but the tool stayed enabled — a deferred diffusion-model swap
+/// (in-flight/queued images finish on the current model first). Only touches
+/// `g_session` while no load is in flight (release/acquire, like the render path).
+fn applyLiveSettings() void {
+    if (g_loading.load(.acquire)) return;
+    const s = g_session orelse return;
+    s.updateSettings(&g_config);
+    if (!g_config.diffPathsEql(&g_config_baseline) and g_config.diffEnabled()) {
+        s.requestDiffPaths(
+            g_config.diffusion_model.opt().?,
+            g_config.vae.opt().?,
+            g_config.text_encoder.opt().?,
+            g_config.taesd.opt(),
+        );
+    }
 }
 
 /// Cancel button: discard unsaved edits by reloading the on-disk settings.
 fn cancelConfig() void {
     g_config = config.Config.load(g_io, g_gpa, g_environ, g_config_path);
+    g_config_baseline = g_config;
     g_view = .chat;
 }
 
@@ -376,10 +426,22 @@ fn maybeStartReload() void {
 /// `g_session` and clears `g_loading` (release) so the UI thread can adopt it.
 fn loaderMain() void {
     // Tear down the previous session first. Its CUDA context must be current on
-    // this thread to free device memory, so bind it before deinit.
+    // this thread to free device memory, so bind it before deinit. Before
+    // freeing it, stop the LLM turn but let any in-flight image FINISH (don't
+    // cancel it), then detach the transcript so the chat survives the swap.
     if (g_session) |s| {
         s.be.bindThread();
         s.requestCancel();
+        if (s.worker) |t| {
+            t.join();
+            s.worker = null;
+        }
+        if (s.diff_thread) |t| {
+            t.join();
+            s.diff_thread = null;
+            s.diff_busy.store(false, .release);
+        }
+        g_carry = s.detachTranscript();
         s.deinit();
         g_session = null;
     }
@@ -390,7 +452,9 @@ fn loaderMain() void {
     }
 
     if (g_config.llm_model.opt() == null) {
-        // Nothing to load (LLM cleared): leave the notice showing.
+        // Nothing to load (LLM cleared): drop the carried transcript and leave
+        // the notice showing.
+        freeCarry();
         g_loading.store(false, .release);
         wakeupFrame();
         return;
@@ -406,12 +470,30 @@ fn loaderMain() void {
         arena_obj.deinit();
         g_gpa.destroy(arena_obj);
         g_session_arena = null;
+        freeCarry(); // no session to adopt the transcript
         return finishLoad(err);
     };
+    // Replay the carried transcript into the new model (KV empty; the next turn's
+    // prefill replays it) so a model swap keeps the chat.
+    if (g_carry) |m| {
+        s.be.bindThread();
+        s.adoptTranscript(m) catch |err| std.log.err("adopt transcript failed: {t}", .{err});
+        g_carry = null;
+    }
     const dt = @as(f64, @floatFromInt(std.Io.Clock.real.now(g_io).nanoseconds - t0)) / 1e9;
     std.log.info("session ready in {d:.1}s", .{dt});
     g_session = s;
     finishLoad(null);
+}
+
+/// Free a carried transcript that has no destination (LLM cleared or load
+/// failed). Messages are gpa-owned.
+fn freeCarry() void {
+    if (g_carry) |*m| {
+        for (m.items) |*msg| msg.deinit(g_gpa);
+        m.deinit(g_gpa);
+        g_carry = null;
+    }
 }
 
 /// Publish the load result: record any error, then clear the loading flag
@@ -454,13 +536,19 @@ fn buildSession(arena: std.mem.Allocator) !*chat.Session {
 
     const system_prompt = g_config.system_prompt.opt() orelse config.default_system_prompt;
 
-    return chat.Session.init(arena, g_gpa, g_io, wakeupFrame, .{
+    const s = try chat.Session.init(arena, g_gpa, g_io, wakeupFrame, .{
         .model_path = try arena.dupe(u8, llm),
         .system_prompt = try arena.dupe(u8, system_prompt),
         .seed = @truncate(@as(u96, @bitCast(std.Io.Clock.real.now(g_io).nanoseconds))),
         .diff = diff,
         .mmproj_path = mmproj,
+        .vram_limit_bytes = if (g_config.max_vram_gib > 0)
+            @intFromFloat(g_config.max_vram_gib * @as(f32, 1 << 30))
+        else
+            0,
+        .vram_priority = g_config.vram_priority,
     });
+    return s;
 }
 
 fn renderMessages(s: *chat.Session, list_h: f32) void {
@@ -789,6 +877,16 @@ fn renderInput(s: *chat.Session) void {
     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = dvui.Rect.all(8) });
     defer row.deinit();
 
+    const busy = s.busy();
+
+    // New chat: drop the conversation and start fresh (model stays resident).
+    // Disabled mid-turn so it can't race the generation worker.
+    if (dvui.buttonIcon(@src(), "new-chat", dvui.entypo.plus, .{}, .{}, .{
+        .gravity_y = 0.5,
+        .min_size_content = .{ .w = 22, .h = 22 },
+        .margin = .{ .w = 6 },
+    }) and !busy) newChat();
+
     // Gear: switch to the settings view.
     if (dvui.buttonIcon(@src(), "settings", dvui.entypo.cog, .{}, .{}, .{
         .gravity_y = 0.5,
@@ -796,7 +894,6 @@ fn renderInput(s: *chat.Session) void {
         .margin = .{ .w = 6 },
     })) openSettings();
 
-    const busy = s.busy();
     var send = false;
 
     // Enter (without Shift) on the focused input sends. Consume the key before
@@ -855,7 +952,22 @@ fn renderInput(s: *chat.Session) void {
     }
 
     if (send and !busy) {
-        s.submit(buf[0..n]) catch |err| std.log.err("submit failed: {t}", .{err});
+        // `/new` on its own line starts a fresh chat instead of sending.
+        if (std.mem.eql(u8, std.mem.trim(u8, buf[0..n], " \t\r\n"), "/new")) {
+            newChat();
+        } else {
+            s.submit(buf[0..n]) catch |err| std.log.err("submit failed: {t}", .{err});
+        }
         @memset(&g_input_buf, 0);
     }
+}
+
+/// Start a fresh conversation on the resident session, clearing the input box.
+/// No-op if no session is loaded (nothing to reset).
+fn newChat() void {
+    // Close the image viewer first: reset frees the GenImages it points at.
+    if (g_viewer) |v| v.open = false;
+    if (g_session) |s| s.reset();
+    @memset(&g_input_buf, 0);
+    g_follow_bottom = true;
 }

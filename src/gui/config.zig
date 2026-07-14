@@ -27,6 +27,32 @@ pub const max_prompt = 8192;
 /// when a diffusion model is configured — this stays tool-agnostic.
 pub const default_system_prompt = "You are a helpful assistant.";
 
+/// Which workload gets VRAM preference when chat and image generation compete
+/// for the card (see GUI_VRAM.md). `chat` keeps the LLM resident and streams
+/// diffusion in the leftover VRAM; `image` evicts LLM layers to the CPU (only as
+/// many as needed) so the image model fits resident, then migrates them back
+/// once the image queue drains.
+pub const Priority = enum(u8) {
+    chat,
+    balanced,
+    image,
+
+    pub fn label(self: Priority) []const u8 {
+        return switch (self) {
+            .chat => "Chat (keep LLM resident)",
+            .balanced => "Balanced (share VRAM, no shuffling)",
+            .image => "Image generation",
+        };
+    }
+
+    fn fromStr(s: []const u8) ?Priority {
+        inline for (@typeInfo(Priority).@"enum".fields) |f| {
+            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        }
+        return null;
+    }
+};
+
 /// Live-preview method for image generation.
 pub const Preview = enum(u8) {
     none,
@@ -128,7 +154,42 @@ pub const Config = struct {
     width: usize = 1024,
     height: usize = 1024,
     preview: Preview = .taesd,
+    /// Max VRAM (GiB) the chat model may keep resident. 0 = auto (use the live
+    /// free VRAM at load). As the conversation grows past this, LLM layers
+    /// migrate to the CPU (see GUI_VRAM.md). Load-affecting: changing it reloads.
+    max_vram_gib: f32 = 0,
+    /// Who gets VRAM preference when chat and image generation compete. Default
+    /// `balanced` — keep as much of both resident as fits, no per-image shuffling.
+    vram_priority: Priority = .balanced,
     system_prompt: TextBuf(max_prompt) = TextBuf(max_prompt).lit(default_system_prompt),
+
+    /// The LLM side (model, vision tower, VRAM limit) matches. A change here
+    /// needs a reload — but a transcript-preserving one: the chat is carried
+    /// across and replayed into the new model, never wiped.
+    pub fn llmReloadEql(a: *const Config, b: *const Config) bool {
+        return pathEql(&a.llm_model, &b.llm_model) and
+            pathEql(&a.vision_tower, &b.vision_tower) and
+            a.max_vram_gib == b.max_vram_gib;
+    }
+
+    /// The diffusion model set (dit/text-encoder/vae/taesd) matches. A change
+    /// while the image tool stays enabled applies live (deferred until the image
+    /// queue drains); no LLM reload.
+    pub fn diffPathsEql(a: *const Config, b: *const Config) bool {
+        return pathEql(&a.diffusion_model, &b.diffusion_model) and
+            pathEql(&a.text_encoder, &b.text_encoder) and
+            pathEql(&a.vae, &b.vae) and
+            pathEql(&a.taesd, &b.taesd);
+    }
+
+    /// Whether the image-generation tool is enabled: dit + text-encoder + VAE
+    /// must all be set (matches app.buildSession). Toggling this needs a reload
+    /// (the system prompt gains/loses the image-tool instructions).
+    pub fn diffEnabled(self: *const Config) bool {
+        return self.diffusion_model.opt() != null and
+            self.text_encoder.opt() != null and
+            self.vae.opt() != null;
+    }
 
     /// Resolve the config directory (`<config>/tp-gui`); caller frees. Null if
     /// the platform has no known config location.
@@ -185,7 +246,15 @@ pub const Config = struct {
             self.height = std.fmt.parseInt(usize, val, 10) catch self.height;
         } else if (std.mem.eql(u8, key, "preview")) {
             if (Preview.fromStr(val)) |p| self.preview = p;
+        } else if (std.mem.eql(u8, key, "max_vram_gib")) {
+            self.max_vram_gib = std.fmt.parseFloat(f32, val) catch self.max_vram_gib;
+        } else if (std.mem.eql(u8, key, "vram_priority")) {
+            if (Priority.fromStr(val)) |p| self.vram_priority = p;
         }
+    }
+
+    fn pathEql(a: *const PathBuf, b: *const PathBuf) bool {
+        return std.mem.eql(u8, a.slice(), b.slice());
     }
 
     /// Serialize settings to disk (creating the parent dir if needed).
@@ -210,6 +279,8 @@ pub const Config = struct {
             \\width = {d}
             \\height = {d}
             \\preview = {s}
+            \\max_vram_gib = {d}
+            \\vram_priority = {s}
             \\system_prompt = {s}
             \\
         , .{
@@ -218,6 +289,7 @@ pub const Config = struct {
             self.vae.slice(),             self.taesd.slice(),
             self.steps,                   self.width,
             self.height,                  @tagName(self.preview),
+            self.max_vram_gib,            @tagName(self.vram_priority),
             prompt_esc,
         });
         defer gpa.free(content);
@@ -284,4 +356,50 @@ test "system prompt escapes/unescapes newlines round-trip" {
 test "default system prompt is populated on a fresh Config" {
     const cfg: Config = .{};
     try std.testing.expectEqualStrings(default_system_prompt, cfg.system_prompt.slice());
+}
+
+test "apply parses max_vram_gib and vram_priority" {
+    var cfg: Config = .{};
+    cfg.apply("max_vram_gib", "12.5");
+    cfg.apply("vram_priority", "image");
+    try std.testing.expectEqual(@as(f32, 12.5), cfg.max_vram_gib);
+    try std.testing.expectEqual(Priority.image, cfg.vram_priority);
+    cfg.apply("vram_priority", "bogus"); // unchanged on junk
+    try std.testing.expectEqual(Priority.image, cfg.vram_priority);
+}
+
+test "llmReloadEql: LLM/vision/VRAM force reload; diff + live fields don't" {
+    var a: Config = .{};
+    var b: Config = .{};
+    a.llm_model.set("/m.gguf");
+    b.llm_model.set("/m.gguf");
+    try std.testing.expect(a.llmReloadEql(&b));
+
+    // Live-only + diffusion-path changes: LLM side still equal (no LLM reload).
+    b.steps = 40;
+    b.vram_priority = .image;
+    b.vae.set("/vae.safetensors");
+    b.diffusion_model.set("/dit.safetensors");
+    try std.testing.expect(a.llmReloadEql(&b));
+    try std.testing.expect(!a.diffPathsEql(&b)); // but the diff set differs
+
+    // Vision tower change: LLM reload required.
+    b.vision_tower.set("/mmproj.gguf");
+    try std.testing.expect(!a.llmReloadEql(&b));
+    b.vision_tower.set("");
+    try std.testing.expect(a.llmReloadEql(&b));
+
+    // VRAM-limit change: LLM reload required.
+    b.max_vram_gib = 8;
+    try std.testing.expect(!a.llmReloadEql(&b));
+}
+
+test "diffEnabled requires dit + text-encoder + vae" {
+    var c: Config = .{};
+    try std.testing.expect(!c.diffEnabled());
+    c.diffusion_model.set("/dit.safetensors");
+    c.text_encoder.set("/te.safetensors");
+    try std.testing.expect(!c.diffEnabled()); // vae still missing
+    c.vae.set("/vae.safetensors");
+    try std.testing.expect(c.diffEnabled());
 }

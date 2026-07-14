@@ -27,6 +27,16 @@ fn offsetBufSized(b: Buf, off_bytes: usize, size: usize) Buf {
     return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off_bytes), .mem = b.mem, .size = size };
 }
 
+/// Whether the captured-decode-graph path is available for this embedding dtype
+/// (the graph needs a device-side embedding gather kernel). Used at init and to
+/// restore graph_ok after a split is dropped (resetResidency).
+fn graphOkFor(dtype: anytype) bool {
+    return switch (dtype) {
+        .bf16, .q8_0, .q4_k, .q5_k, .q6_k => true,
+        else => false,
+    };
+}
+
 /// KV chunks per head in the decode attention split pass.
 const nsplit = 32;
 /// Batched-prefill chunk (rows per stepBatch) and its attention split count
@@ -50,6 +60,9 @@ pub const CudaLM = struct {
     /// Growth ceiling — the VA reservation behind each KV cache and the RoPE
     /// table are sized to this, so growth never moves a device pointer.
     max_capacity: usize,
+    /// The KV capacity a fresh session starts at; resetResidency shrinks back to
+    /// it so a new chat frees the grown KV VRAM.
+    initial_capacity: usize,
     len: usize,
 
     bufs: Bufs,
@@ -146,6 +159,7 @@ pub const CudaLM = struct {
         self.gpa = gpa;
         self.cfg = cfg;
         self.capacity = cap.initial;
+        self.initial_capacity = cap.initial;
         self.max_capacity = cap.max;
         self.len = 0;
         self.pos_next = 0;
@@ -158,10 +172,7 @@ pub const CudaLM = struct {
         self.split = null;
         self.decode_warm = false;
         // The graph path needs a device-side embedding gather kernel.
-        self.graph_ok = switch (lm.embed.dtype) {
-            .bf16, .q8_0, .q4_k, .q5_k, .q6_k => true,
-            else => false,
-        };
+        self.graph_ok = graphOkFor(lm.embed.dtype);
 
         // Rope table for the rotated span (rope_dim), like qwen3_cuda's —
         // computed to max_capacity up front so sin_off (baked into captured
@@ -526,9 +537,150 @@ pub const CudaLM = struct {
         return self.cfg.vocab;
     }
 
-    /// Debug: reset the session (cache rows are overwritten lazily; conv and
-    /// recurrent states must be re-zeroed).
-    pub fn debugReset(self: *CudaLM) !void {
+    /// Arm dynamic CPU offload iff the projected max-context footprint (all layer
+    /// weights + KV grown to `max_capacity` + reserve slack) won't fit under
+    /// `budget` bytes. When it fits, do nothing — the model stays fully resident
+    /// on the fast path. When it doesn't, `enableCpuSplit(.attn, budget, dynamic)`
+    /// packs the GPU now and migrates layers to the host as the KV cache grows
+    /// (instead of the weight-streaming cliff). Must run before any tokens.
+    /// `budget == 0` is treated as "no limit" (never offload). Text sessions
+    /// only — the host layer path uses scalar RoPE (see enableCpuSplit / the GUI
+    /// guard). Returns whether a split was armed.
+    pub fn autoOffload(self: *CudaLM, budget: u64) !bool {
+        if (budget == 0) return false; // no budget → fully resident, no offload path
+        // Always arm the dynamic split. When the model fits its budget it places
+        // ZERO layers on the CPU — measured free (per-op decode ties the captured
+        // graph: 76.2 vs 77.2 tok/s on the 9B) — and migrates layers on demand as
+        // the KV cache grows. Arming unconditionally means over-budget growth
+        // degrades via CPU offload (measured ~2.5x FASTER than weight streaming on
+        // this box: 18.3 vs 7.0 tok/s) instead of falling into the slow streaming
+        // fallback that a "does it fit?" check would leave it in.
+        try self.enableCpuSplit(.attn, budget, true);
+        return true;
+    }
+
+    /// Migrate layers to the host until `@min(budget - deviceUsed, headroom)`
+    /// reaches `needed_free` bytes, or nothing is left. Fixed-target variant used
+    /// by the VRAM coordinator (free room for the image model). No-op without a
+    /// dynamic split. (ensureCapacity keeps its own loop, whose target shrinks per
+    /// iteration as liveAttnSlots drops — a fixed target here can't express that.)
+    pub fn offloadUntilFree(self: *CudaLM, needed_free: u64) !void {
+        if (self.split == null) return;
+        const sp = &self.split.?;
+        if (!sp.dynamic) return;
+        while (true) {
+            const free = @min(sp.budget -| self.be.deviceUsed(), self.be.headroom());
+            if (free >= needed_free) break;
+            if (!(try self.migrateNextLayer())) break; // nothing left
+        }
+    }
+
+    /// Migrate layers to the host until the LLM's ACTUAL total device usage is at
+    /// or under `target` bytes — used by the GUI's `balanced` mode to settle the
+    /// LLM to its share (e.g. 75% of the limit) ONLY when an image model loads
+    /// (contention); with no image loaded the LLM keeps the whole limit. Uses live
+    /// `deviceUsed()` (robust — no size estimation), so it must run after the
+    /// weights are on the device. One-way + idempotent: once under `target` it's a
+    /// no-op, so repeat calls (per image) don't re-shuffle.
+    pub fn offloadToBudget(self: *CudaLM, target: u64) !void {
+        if (self.split == null or target == 0) return;
+        const sp = &self.split.?;
+        if (!sp.dynamic) return;
+        while (self.be.deviceUsed() > target) {
+            if (!(try self.migrateNextLayer())) break; // nothing left to migrate
+        }
+    }
+
+    /// Bring layer `l` back onto the GPU, preserving its accumulated state
+    /// (reverse of migrateLayer): attention layers re-create the device K/V at the
+    /// current capacity and upload the host rows [0,len); linear layers re-upload
+    /// their conv/ssm state into the shared device buffers. Weights re-cache
+    /// lazily on the next GPU forward.
+    fn promoteLayer(self: *CudaLM, l: usize) !void {
+        const cfg = self.cfg;
+        const sp = &self.split.?;
+        if (!cfg.isRecurrent(l)) {
+            const s = l / cfg.full_attn_interval;
+            const kvd = cfg.kvDim();
+            self.k_cache[s] = try self.be.growableCreate(self.capacity * kvd * 4, self.max_capacity * kvd * 4);
+            self.v_cache[s] = try self.be.growableCreate(self.capacity * kvd * 4, self.max_capacity * kvd * 4);
+            if (self.len > 0) {
+                const cap = sp.state.kv.capacity;
+                const hk = sp.state.kv.k[s * cap * kvd ..][0 .. self.len * kvd];
+                const hv = sp.state.kv.v[s * cap * kvd ..][0 .. self.len * kvd];
+                try self.be.tensorUpload(offsetBufSized(self.k_cache[s].buf, 0, self.len * kvd * 4), std.mem.sliceAsBytes(hk));
+                try self.be.tensorUpload(offsetBufSized(self.v_cache[s].buf, 0, self.len * kvd * 4), std.mem.sliceAsBytes(hv));
+            }
+        } else {
+            const lin_idx = l - l / cfg.full_attn_interval;
+            const conv_n = cfg.convChannels() * (cfg.conv_kernel - 1);
+            const ssm_n = cfg.lin_v_heads * cfg.lin_head_dim * cfg.lin_head_dim;
+            const hc = sp.state.conv[lin_idx * conv_n ..][0..conv_n];
+            const hs = sp.state.ssm[lin_idx * ssm_n ..][0..ssm_n];
+            try self.be.tensorUpload(offsetBufSized(self.conv_state, lin_idx * conv_n * 4, conv_n * 4), std.mem.sliceAsBytes(hc));
+            try self.be.tensorUpload(offsetBufSized(self.ssm_state, lin_idx * ssm_n * 4, ssm_n * 4), std.mem.sliceAsBytes(hs));
+        }
+        sp.on_gpu[l] = true;
+        sp.n_cpu -= 1;
+        std.debug.print("[promote] layer {d} ({s}) -> GPU at ctx {d} ({d}/{d} on CPU)\n", .{ l, if (cfg.isRecurrent(l)) "lin" else "attn", self.len, sp.n_cpu, cfg.n_layers });
+    }
+
+    /// Migrate CPU layers back onto the GPU (LIFO by offload order), stopping
+    /// before the next would overflow `budget` — so the caller (VRAM coordinator,
+    /// after image generation) reclaims LLM residency while leaving room for
+    /// whatever else stays resident. Keeps the split armed. Returns the count
+    /// promoted; 0 without a split.
+    pub fn promoteLayers(self: *CudaLM, budget: u64) !usize {
+        if (self.split == null) return 0;
+        const sp = &self.split.?;
+        const kvd = self.cfg.kvDim();
+        var promoted: usize = 0;
+        while (sp.next > 0) {
+            const l = sp.order[sp.next - 1];
+            const kv_cost: usize = if (!self.cfg.isRecurrent(l)) 2 * self.capacity * kvd * 4 else 0;
+            const cost = layerDeviceBytes(&self.lm.layers[l]) + kv_cost + (64 << 20);
+            const free = @min(budget -| self.be.deviceUsed(), self.be.headroom());
+            if (free < cost) break;
+            try self.promoteLayer(l);
+            sp.next -= 1;
+            promoted += 1;
+        }
+        return promoted;
+    }
+
+    /// New-chat reset: drop the split (restoring the resident fast path + graph),
+    /// shrink every K/V cache back to the initial capacity (frees the grown VRAM),
+    /// clear the context, and re-arm dynamic offload for the fresh small context.
+    /// KV is discarded, so no host->device copy is needed (unlike promoteLayers).
+    pub fn resetResidency(self: *CudaLM, budget: u64) !void {
+        const cfg = self.cfg;
+        const kvd = cfg.kvDim();
+        if (self.split) |*sp| {
+            sp.state.deinit(self.gpa);
+            sp.scratch.deinit(self.gpa);
+            sp.freqs.deinit(self.gpa);
+            self.gpa.free(sp.hx);
+            self.gpa.free(sp.on_gpu);
+            self.gpa.free(sp.order);
+            self.split = null;
+            self.graph_ok = graphOkFor(self.lm.embed.dtype);
+            self.decode_warm = false;
+        }
+        for (self.k_cache, self.v_cache) |*kb, *vb| {
+            self.be.growableDestroy(kb);
+            self.be.growableDestroy(vb);
+            kb.* = try self.be.growableCreate(self.initial_capacity * kvd * 4, self.max_capacity * kvd * 4);
+            vb.* = try self.be.growableCreate(self.initial_capacity * kvd * 4, self.max_capacity * kvd * 4);
+        }
+        self.capacity = self.initial_capacity;
+        try self.resetCache();
+        _ = try self.autoOffload(budget);
+    }
+
+    /// Reset the session to an empty context (used by the layer-parity debug
+    /// harness and by the GUI's "new chat"): KV rows are overwritten lazily, so
+    /// only the position counters and the conv/recurrent states need clearing.
+    pub fn resetCache(self: *CudaLM) !void {
         const cfg = self.cfg;
         const n_lin = cfg.n_layers - cfg.nAttnLayers();
         try zeroBuffer(self.be, self.gpa, self.conv_state, n_lin * cfg.convChannels() * (cfg.conv_kernel - 1) * 4);

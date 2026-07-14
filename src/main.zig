@@ -1377,6 +1377,7 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
     errdefer stdout.flush() catch {};
     var opts: TensorPencil.pipeline.Options = .{ .prompt = "" };
     var out_path: []const u8 = "out.png";
+    var repeat: usize = 1; // --repeat N: reuse one pipeline.Session for N images (bench cross-queue residency)
     var i: usize = 0;
     while (i < args.len) : (i += 2) {
         const flag = args[i];
@@ -1387,6 +1388,8 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
         const val = args[i + 1];
         if (std.mem.eql(u8, flag, "--prompt")) {
             opts.prompt = val;
+        } else if (std.mem.eql(u8, flag, "--repeat")) {
+            repeat = try std.fmt.parseInt(usize, val, 10);
         } else if (std.mem.eql(u8, flag, "--negative")) {
             opts.negative = val;
         } else if (std.mem.eql(u8, flag, "--width")) {
@@ -1453,6 +1456,29 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
 
     var cap: PreviewCap = .{ .arena = arena };
     if (opts.preview) opts.on_step = .{ .ctx = &cap, .step = PreviewCap.onStep };
+
+    // --repeat N>1: keep ONE pipeline.Session resident across N images (the GUI's
+    // cross-queue path) and time each — the model loads only on image 1; images
+    // 2..N should skip the reload/weight-upload warmup. seed advances per image.
+    if (repeat > 1) {
+        var sess = try TensorPencil.pipeline.Session.init(io, arena, opts, stdout);
+        defer sess.deinit();
+        for (0..repeat) |n| {
+            var per = opts;
+            per.seed = opts.seed +% n;
+            const t0 = std.Io.Clock.real.now(io);
+            var im = try sess.generate(per, stdout);
+            defer im.deinit(arena);
+            const dt = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0.nanoseconds)) / 1e9;
+            var png: std.ArrayList(u8) = .empty;
+            defer png.deinit(arena);
+            try TensorPencil.image.encodePngRgb(arena, &png, im.rgb, im.width, im.height);
+            const p = try std.fmt.allocPrint(arena, "{s}.{d}.png", .{ out_path, n });
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = png.items });
+            try stdout.print("[repeat] image {d}/{d} in {d:.1}s -> {s}\n", .{ n + 1, repeat, dt, p });
+        }
+        return;
+    }
 
     var img = try TensorPencil.pipeline.generate(io, arena, opts, stdout);
     defer img.deinit(arena);

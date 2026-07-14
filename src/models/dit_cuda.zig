@@ -174,7 +174,13 @@ pub fn textTokensCuda(model: *const DiT, be: *Backend, gpa: std.mem.Allocator, c
     defer s.deinit(be);
     // Reclaim the transient f32 text weights (and small norm buffers) from the
     // backend cache; they are unused during sampling and would otherwise pin VRAM.
-    defer be.evictWeights();
+    // SCOPED (not evictWeights, which nukes ALL cached weights): this runs per
+    // image inside a persistent pipeline.Session, and a full evict would drop the
+    // resident DiT that the next queued image reuses (GUI_VRAM.md Phase 4). The
+    // scope drops exactly the weights cached here — the DiT (cached later, in the
+    // sampling loop, and pinned) survives.
+    be.weightScopeBegin();
+    defer be.weightScopeEnd();
 
     try be.tensorUpload(x_d, std.mem.sliceAsBytes(cond));
 

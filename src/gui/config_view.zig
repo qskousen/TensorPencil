@@ -24,6 +24,7 @@ var seeded: bool = false;
 var steps_buf: [16]u8 = [_]u8{0} ** 16;
 var width_buf: [16]u8 = [_]u8{0} ** 16;
 var height_buf: [16]u8 = [_]u8{0} ** 16;
+var vram_buf: [16]u8 = [_]u8{0} ** 16;
 
 const gguf_filters = [_][]const u8{"*.gguf"};
 const safetensors_filters = [_][]const u8{"*.safetensors"};
@@ -37,12 +38,18 @@ fn seed(cfg: *const config.Config) void {
     _ = std.fmt.bufPrintZ(&steps_buf, "{d}", .{cfg.steps}) catch {};
     _ = std.fmt.bufPrintZ(&width_buf, "{d}", .{cfg.width}) catch {};
     _ = std.fmt.bufPrintZ(&height_buf, "{d}", .{cfg.height}) catch {};
+    _ = std.fmt.bufPrintZ(&vram_buf, "{d}", .{cfg.max_vram_gib}) catch {};
     seeded = true;
 }
 
 fn parseNum(buf: []const u8, fallback: usize) usize {
     const s = std.mem.trim(u8, std.mem.sliceTo(buf, 0), " \t\r");
     return std.fmt.parseInt(usize, s, 10) catch fallback;
+}
+
+fn parseFloat(buf: []const u8, fallback: f32) f32 {
+    const s = std.mem.trim(u8, std.mem.sliceTo(buf, 0), " \t\r");
+    return std.fmt.parseFloat(f32, s) catch fallback;
 }
 
 /// Round to a multiple of 16 within the pipeline's supported range.
@@ -56,6 +63,7 @@ fn commitNumbers(cfg: *config.Config) void {
     cfg.steps = std.math.clamp(parseNum(&steps_buf, cfg.steps), 1, 100);
     cfg.width = clampDim(parseNum(&width_buf, cfg.width));
     cfg.height = clampDim(parseNum(&height_buf, cfg.height));
+    cfg.max_vram_gib = @max(0, parseFloat(&vram_buf, cfg.max_vram_gib));
 }
 
 pub fn render(cfg: *config.Config, cb: Callbacks) void {
@@ -103,6 +111,20 @@ pub fn render(cfg: *config.Config, cb: Callbacks) void {
         defer row.deinit();
         dvui.label(@src(), "Live preview", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
         _ = dvui.dropdownEnum(@src(), config.Preview, .{ .choice = &cfg.preview }, .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 200 } });
+    }
+
+    section(22, "VRAM & performance");
+    help(2, "Max VRAM the chat model may keep resident (GiB; 0 = use all available). " ++
+        "As the conversation grows past this, layers migrate to the CPU — and back " ++
+        "when a new chat starts. Priority decides who gets VRAM when chat and image " ++
+        "generation compete: keep chat resident (diffusion streams), or free chat " ++
+        "layers so the image model fits (they return when the queue drains).");
+    numRow(20, "Max VRAM (GiB)", &vram_buf);
+    {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 4 } });
+        defer row.deinit();
+        dvui.label(@src(), "Priority", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
+        _ = dvui.dropdownEnum(@src(), config.Priority, .{ .choice = &cfg.vram_priority }, .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 240 } });
     }
 
     section(30, "System prompt");

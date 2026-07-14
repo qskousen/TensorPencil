@@ -934,7 +934,7 @@ fn runQwen35(
         model.layer_dump = null;
         model.op_dump = null;
 
-        try model.debugReset();
+        try model.resetCache();
         model.layer_dump = dump_bat;
         model.op_dump = op_bat;
         try model.prefill(toks);

@@ -248,7 +248,9 @@ pub const Model = struct {
 
 /// One Gemma layer over `x` [seq, hidden], residuals added in place. `x`
 /// holds only the `seq` new tokens (at absolute positions cache.len..).
-fn layerForward(
+/// Public so the CUDA hybrid CPU/GPU split (gemma3_cuda) can run host-resident
+/// layers through the exact same code path.
+pub fn layerForward(
     io: std.Io,
     gpa: std.mem.Allocator,
     cfg: Config,
@@ -302,8 +304,9 @@ fn layerForward(
     for (x, s.tmp) |*xi, ti| xi.* += ti;
 }
 
-/// Per-forward activation buffers, sized for `seq` tokens of `cfg`.
-const Scratch = struct {
+/// Per-forward activation buffers, sized for `seq` tokens of `cfg`. Public so
+/// the CUDA hybrid split can allocate one for its host-resident layers.
+pub const Scratch = struct {
     normed: []f32,
     tmp: []f32,
     q: []f32,
@@ -313,7 +316,26 @@ const Scratch = struct {
     gate: []f32,
     up: []f32,
 
-    fn init(gpa: std.mem.Allocator, seq: usize, cfg: Config) !Scratch {
+    /// A borrowed view of the first `seq` rows of a larger scratch (no alloc).
+    /// The CUDA split sizes its scratch to a full prefill chunk once, then views
+    /// it down to the actual chunk length each call — `layerForward`'s ops
+    /// require exact-length slices, so passing the oversized buffer would trip a
+    /// length assert (the qwen35 split hit this; same fix here). Never deinit a
+    /// view — it aliases the parent scratch's memory.
+    pub fn viewSeq(self: *const Scratch, seq: usize, cfg: Config) Scratch {
+        return .{
+            .normed = self.normed[0 .. seq * cfg.hidden],
+            .tmp = self.tmp[0 .. seq * cfg.hidden],
+            .q = self.q[0 .. seq * cfg.qDim()],
+            .k = self.k[0 .. seq * cfg.kvDim()],
+            .v = self.v[0 .. seq * cfg.kvDim()],
+            .attn_out = self.attn_out[0 .. seq * cfg.qDim()],
+            .gate = self.gate[0 .. seq * cfg.intermediate],
+            .up = self.up[0 .. seq * cfg.intermediate],
+        };
+    }
+
+    pub fn init(gpa: std.mem.Allocator, seq: usize, cfg: Config) !Scratch {
         var s: Scratch = undefined;
         var done: usize = 0;
         errdefer inline for (@typeInfo(Scratch).@"struct".fields, 0..) |f, i| {
@@ -336,7 +358,7 @@ const Scratch = struct {
         return s;
     }
 
-    fn deinit(self: *Scratch, gpa: std.mem.Allocator) void {
+    pub fn deinit(self: *Scratch, gpa: std.mem.Allocator) void {
         inline for (@typeInfo(Scratch).@"struct".fields) |f| gpa.free(@field(self, f.name));
         self.* = undefined;
     }
