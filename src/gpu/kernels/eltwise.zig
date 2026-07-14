@@ -195,6 +195,96 @@ export fn sigmoid_mul() callconv(.spirv_kernel) void {
     a.data[idx] *= 1.0 / (1.0 + @exp(-b.data[idx]));
 }
 
+// GeGLU gate (Gemma FFN): a = geluTanh(a) * b. Folded tanh-gelu as
+// x·sigmoid(2c·(x + c3·x³)), c = √(2/π), c3 = 0.044715 (2c = 1.59576912) —
+// matches the CPU ops.act.geluTanhMul / the CUDA gelu_mul to f32 rounding.
+export fn gelu_mul() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const x = a.data[idx];
+    const inner: f32 = 1.5957691216057308 * (x + 0.044715 * x * x * x);
+    a.data[idx] = x / (1.0 + @exp(-inner)) * b.data[idx];
+}
+
+// Plain tanh-gelu, in place (SigLIP FFN): a = geluTanh(a). a=in/out. u0=total.
+export fn gelu() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const x = a.data[idx];
+    const inner: f32 = 1.5957691216057308 * (x + 0.044715 * x * x * x);
+    a.data[idx] = x / (1.0 + @exp(-inner));
+}
+
+// LayerNorm with weight + bias, one thread per row (SigLIP ln1/ln2/post_ln):
+// out = (x - mean)/sqrt(var + eps) * w + b. a=in, b=out, c=weight, d=bias.
+// u0=rows, u1=dim, f0=eps.
+export fn layernorm() callconv(.spirv_kernel) void {
+    decorate();
+    const row = gpu.global_invocation_id[0];
+    if (row >= pc.u0) return;
+    const dim = pc.u1;
+    const base = row * dim;
+    const dimf: f32 = @floatFromInt(dim);
+    var mean: f32 = 0;
+    var i: u32 = 0;
+    while (i < dim) : (i += 1) mean += a.data[base + i];
+    mean /= dimf;
+    var vsum: f32 = 0;
+    i = 0;
+    while (i < dim) : (i += 1) {
+        const dv = a.data[base + i] - mean;
+        vsum += dv * dv;
+    }
+    const inv = 1.0 / @sqrt(vsum / dimf + pc.f0);
+    i = 0;
+    while (i < dim) : (i += 1) b.data[base + i] = (a.data[base + i] - mean) * inv * c.data[i] + d.data[i];
+}
+
+// Full non-causal attention, one thread per (query, head) — arbitrary
+// head_dim (unlike the 32-slice `attention` kernel). a=q, b=k, c=v, d=out,
+// each [seq][n_heads*hd] (position j at j*n_kv*hd + kvh*hd). u0=seq,
+// u1=n_heads, u2=n_kv_heads, u3=head_dim (<=256), f0=scale. Online softmax.
+export fn attn_full() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    const seq = pc.u0;
+    const n_heads = pc.u1;
+    if (idx >= seq * n_heads) return;
+    const n_kv = pc.u2;
+    const hd = pc.u3;
+    const scale = pc.f0;
+    const head = idx % n_heads;
+    const kvh = head / (n_heads / n_kv);
+    const qb = idx * hd;
+    const kvdim = n_kv * hd;
+    const kvbase = kvh * hd;
+    var acc: [256]f32 = undefined;
+    var t: u32 = 0;
+    while (t < hd) : (t += 1) acc[t] = 0;
+    var mx: f32 = -3.4e38;
+    var denom: f32 = 0;
+    var j: u32 = 0;
+    while (j < seq) : (j += 1) {
+        const kb = j * kvdim + kvbase;
+        var sc: f32 = 0;
+        t = 0;
+        while (t < hd) : (t += 1) sc += a.data[qb + t] * b.data[kb + t];
+        sc *= scale;
+        const newmax = @max(mx, sc);
+        const corr = @exp(mx - newmax);
+        const p = @exp(sc - newmax);
+        denom = denom * corr + p;
+        t = 0;
+        while (t < hd) : (t += 1) acc[t] = acc[t] * corr + p * c.data[kb + t];
+        mx = newmax;
+    }
+    const inv = 1.0 / denom;
+    t = 0;
+    while (t < hd) : (t += 1) d.data[qb + t] = acc[t] * inv;
+}
+
 export fn rope_inter() callconv(.spirv_kernel) void {
     decorate();
     const idx = gpu.global_invocation_id[0];
@@ -868,7 +958,9 @@ export fn rope_qwen35() callconv(.spirv_kernel) void {
 //   query head, online softmax. a = q [n_heads*hd], b = k_cache
 //   [kv_len*kvDim], c = v_cache [kv_len*kvDim] (kvDim = n_kv*hd, position j at
 //   j*kvDim + kvh*hd), d = out [n_heads*hd]. u0 = n_heads, u1 = n_kv_heads,
-//   u2 = head_dim (<=256), u3 = kv_len, f0 = scale.
+//   u2 = head_dim (<=256), u3 = kv_len, u4 = window (0 = full causal;
+//   sliding-window for Gemma 3 local layers — attend only the last `window`
+//   keys), f0 = scale.
 export fn attn_decode_q35() callconv(.spirv_kernel) void {
     decorate();
     const h = gpu.global_invocation_id[0];
@@ -877,17 +969,19 @@ export fn attn_decode_q35() callconv(.spirv_kernel) void {
     const n_kv = pc.u1;
     const hd = pc.u2;
     const kv_len = pc.u3;
+    const window = pc.u4;
     const scale = pc.f0;
     const kvh = h / (n_heads / n_kv);
     const qb = h * hd;
     const kvdim = n_kv * hd;
     const kvbase = kvh * hd;
+    const kv_start: u32 = if (window != 0 and kv_len > window) kv_len - window else 0;
     var acc: [256]f32 = undefined;
     var t: u32 = 0;
     while (t < hd) : (t += 1) acc[t] = 0;
     var mx: f32 = -3.4e38;
     var denom: f32 = 0;
-    var j: u32 = 0;
+    var j: u32 = kv_start;
     while (j < kv_len) : (j += 1) {
         const kb = j * kvdim + kvbase;
         var sc: f32 = 0;

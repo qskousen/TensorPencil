@@ -672,7 +672,7 @@ pub const CudaLM = struct {
             if (seq <= gemv_batch_max) {
                 // Batched flash-decoding: the naive square kernel has too
                 // little parallelism for a handful of queries.
-                try be.opAttnDecode(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, pos0 + 1, seq, c.n_heads, c.n_kv_heads, hd, nsplit, attn_scale);
+                try be.opAttnDecode(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, pos0 + 1, seq, c.n_heads, c.n_kv_heads, hd, nsplit, attn_scale, 0);
             } else {
                 try be.attn(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, seq, pos0 + seq, c.n_heads, c.n_kv_heads, hd, attn_scale, true);
             }

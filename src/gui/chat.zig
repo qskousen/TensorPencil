@@ -17,6 +17,19 @@ const qwen35 = tp.models.qwen35;
 const qwen35_cuda = tp.models.qwen35_cuda;
 const vit35 = tp.models.vit35;
 const vit35_cuda = tp.models.vit35_cuda;
+const gemma3 = tp.models.gemma3;
+const gemma3_cuda = tp.models.gemma3_cuda;
+const gemma_vit = tp.models.gemma_vit;
+const gemma_vit_cuda = tp.models.gemma_vit_cuda;
+
+/// The resident LLM + its vision tower, one variant per supported GGUF
+/// architecture. `model` retains a `*const lm`, so the bundle must live at a
+/// stable address (it does — inside the heap-pinned Session) and its tag is
+/// never reassigned after init.
+const Arch = union(enum) {
+    qwen35: struct { lm: qwen35.Model, model: qwen35_cuda.CudaLM, vit: ?vit35.Vit = null },
+    gemma3: struct { lm: gemma3.Model, model: gemma3_cuda.CudaLM, vit: ?gemma_vit.Vit = null },
+};
 const cuda = tp.gpu.cuda;
 const engine = tp.llm.engine;
 const chat = tp.llm.chat;
@@ -239,10 +252,9 @@ pub const Session = struct {
 
     // Load-once state (backed by the caller's arena; must outlive the session).
     gguf: Gguf,
-    lm: qwen35.Model,
+    arch: Arch,
     tok: Tokenizer,
     be: *cuda.Backend,
-    model: qwen35_cuda.CudaLM,
 
     ids: std.ArrayList(u32) = .empty,
     opts: engine.Options,
@@ -264,9 +276,9 @@ pub const Session = struct {
     diff_busy: std.atomic.Value(bool) = .init(false),
     diff_thread: ?std.Thread = null,
 
-    // Vision (dropped/attached images the model can see). Loaded once.
+    // Vision (dropped/attached images the model can see). Loaded once; the
+    // tower itself lives in `arch` (per-architecture type).
     mmproj_gguf: ?Gguf = null,
-    vit: ?vit35.Vit = null,
     // Images attached for the next message: `attach_view` are display copies
     // (RGBA, shown as a strip + moved into the sent message); `attach_rgb` are
     // the parallel raw RGB the worker encodes. On submit they move to the
@@ -296,11 +308,7 @@ pub const Session = struct {
 
         self.gguf = try Gguf.open(arena, io, cfg.model_path);
         errdefer self.gguf.deinit();
-        const arch = self.gguf.getStr("general.architecture") orelse "";
-        if (!std.mem.eql(u8, arch, "qwen35")) return error.UnsupportedArchitecture;
-
-        self.lm = try qwen35.Model.load(arena, &self.gguf);
-        errdefer self.lm.deinit();
+        const arch_str = self.gguf.getStr("general.architecture") orelse "";
 
         self.tok = try Tokenizer.initFromGguf(arena, &self.gguf);
         errdefer self.tok.deinit();
@@ -309,14 +317,36 @@ pub const Session = struct {
         self.be = try cuda.Backend.init(arena);
         errdefer self.be.deinit();
 
-        // Vision tower (optional). Its device weights are scoped per-encode and
-        // never stay resident under the LLM; the host side is cheap.
         self.mmproj_gguf = null;
-        self.vit = null;
-        if (cfg.mmproj_path) |mp| {
-            self.mmproj_gguf = try Gguf.open(arena, io, mp);
-            self.vit = try vit35.Vit.load(arena, &self.mmproj_gguf.?);
-        }
+        if (cfg.mmproj_path) |mp| self.mmproj_gguf = try Gguf.open(arena, io, mp);
+
+        // Interactive session: grow from a small floor toward the full window.
+        const cap: engine.Capacity = .{
+            .initial = @min(cfg.max_context, 4096),
+            .max = cfg.max_context,
+        };
+
+        // Architecture dispatch: each variant bundles {lm, model, vit}. The
+        // model retains a `*const lm` into the union, which is stable (self is
+        // heap-pinned and the tag is set once). Vision towers are scoped
+        // per-encode and never stay resident under the LLM.
+        if (std.mem.eql(u8, arch_str, "qwen35")) {
+            chat.setFamily(.chatml);
+            self.arch = .{ .qwen35 = .{ .lm = try qwen35.Model.load(arena, &self.gguf), .model = undefined } };
+            const a = &self.arch.qwen35;
+            errdefer a.lm.deinit();
+            if (self.mmproj_gguf) |*mg| a.vit = try vit35.Vit.load(arena, mg);
+            errdefer if (a.vit) |*v| v.deinit();
+            a.model = try qwen35_cuda.CudaLM.init(gpa, self.be, &a.lm, cap);
+        } else if (std.mem.eql(u8, arch_str, "gemma3")) {
+            chat.setFamily(.gemma);
+            self.arch = .{ .gemma3 = .{ .lm = try gemma3.Model.load(arena, &self.gguf), .model = undefined } };
+            const a = &self.arch.gemma3;
+            errdefer a.lm.deinit();
+            if (self.mmproj_gguf) |*mg| a.vit = try gemma_vit.Vit.load(arena, mg);
+            errdefer if (a.vit) |*v| v.deinit();
+            a.model = try gemma3_cuda.CudaLM.init(gpa, self.be, &a.lm, cap);
+        } else return error.UnsupportedArchitecture;
 
         self.opts = .{
             .max_new_tokens = cfg.max_new_tokens,
@@ -324,13 +354,6 @@ pub const Session = struct {
             .seed = cfg.seed,
             .sampling = .{ .temperature = cfg.temperature },
         };
-        // Interactive session: grow from a small floor toward the full window.
-        const cap: engine.Capacity = .{
-            .initial = @min(cfg.max_context, 4096),
-            .max = cfg.max_context,
-        };
-        self.model = try qwen35_cuda.CudaLM.init(gpa, self.be, &self.lm, cap);
-        errdefer self.model.deinit();
 
         self.gpa = gpa;
         self.io = io;
@@ -366,6 +389,11 @@ pub const Session = struct {
             .taew_path = d.taew_path, // taew2_1 approx-VAE if available, else latent2rgb
         } else null;
 
+        // Gemma prompts begin with a single BOS ({{ bos_token }}); ChatML has none.
+        if (self.arch == .gemma3) {
+            if (self.tok.specialId("<bos>")) |bos| try self.ids.append(gpa, bos);
+        }
+
         // System prompt: the configured base prompt, with the image-tool
         // description appended when the image tool is available. Prefilled on
         // the first turn (the uncached prefix of `ids`); never shown in the UI.
@@ -398,19 +426,32 @@ pub const Session = struct {
         for (self.turn_images.items) |im| self.gpa.free(im.rgb);
         self.turn_images.deinit(self.gpa);
         if (self.turn_text.len > 0) self.gpa.free(self.turn_text);
-        if (self.vit) |*v| v.deinit();
+        switch (self.arch) {
+            inline else => |*a| {
+                a.model.deinit();
+                if (a.vit) |*v| v.deinit();
+            },
+        }
         if (self.mmproj_gguf) |*g| g.deinit();
         for (self.messages.items) |*m| m.deinit(self.gpa);
         self.messages.deinit(self.gpa);
         self.pending.deinit(self.gpa);
         self.ids.deinit(self.gpa);
-        self.model.deinit();
         self.be.deinit();
         self.tok.deinit();
-        self.lm.deinit();
+        switch (self.arch) {
+            inline else => |*a| a.lm.deinit(),
+        }
         self.gguf.deinit();
         const gpa = self.gpa;
         gpa.destroy(self);
+    }
+
+    /// Vision tower loaded for the active architecture?
+    fn hasVit(self: *const Session) bool {
+        return switch (self.arch) {
+            inline else => |*a| a.vit != null,
+        };
     }
 
     pub fn busy(self: *Session) bool {
@@ -418,13 +459,13 @@ pub const Session = struct {
     }
 
     pub fn visionEnabled(self: *const Session) bool {
-        return self.vit != null;
+        return self.hasVit();
     }
 
     /// Attach a decoded image (packed RGB) to the next message. Shown as a
     /// thumbnail strip now; encoded and interleaved into the turn on send.
     pub fn attachImage(self: *Session, rgb_src: []const u8, w: usize, h: usize) !void {
-        if (self.vit == null) {
+        if (!self.hasVit()) {
             std.log.warn("dropped image ignored: vision tower not loaded", .{});
             return;
         }
@@ -454,7 +495,7 @@ pub const Session = struct {
     /// Attach an RGBA image (e.g. a generated one) to the next message so the
     /// model can see it — converts to the RGB the encoder expects.
     pub fn attachRgba(self: *Session, rgba: []const u8, w: usize, h: usize) !void {
-        if (self.vit == null) return;
+        if (!self.hasVit()) return;
         const px = w * h;
         const rgb = try self.gpa.alloc(u8, px * 3);
         defer self.gpa.free(rgb);
@@ -524,10 +565,14 @@ pub const Session = struct {
             .iface = .{ .vtable = &TokenSink.vtable, .buffer = &self.sink_buf },
             .session = self,
         };
-        _ = engine.generate(&self.model, &self.tok, self.io, self.gpa, &self.ids, self.opts, &sink.iface) catch |err| {
-            self.gen_err = err;
-            std.log.err("generation failed: {t}", .{err});
-        };
+        switch (self.arch) {
+            inline else => |*a| {
+                _ = engine.generate(&a.model, &self.tok, self.io, self.gpa, &self.ids, self.opts, &sink.iface) catch |err| {
+                    self.gen_err = err;
+                    std.log.err("generation failed: {t}", .{err});
+                };
+            },
+        }
         // Close the assistant turn so the next turn's context is well-formed.
         chat.closeAssistant(self.gpa, &self.ids) catch {};
         self.freeTurn();
@@ -536,41 +581,56 @@ pub const Session = struct {
     }
 
     /// Build this turn's tokens and prefill them. Text-only turns defer prefill
-    /// to `engine.generate`; image turns encode each image (vit35 on CUDA),
-    /// build the interleaved vision token layout, and inject the embeddings at
-    /// their pad rows — mirroring `llm_main.imageTurn`.
+    /// to `engine.generate`; image turns encode each image (the arch's vision
+    /// tower on CUDA), build the interleaved vision token layout, and inject
+    /// the embeddings at their pad rows — mirroring `llm_main.imageTurn`.
     fn buildAndPrefillTurn(self: *Session) !void {
-        if (self.turn_images.items.len > 0 and self.vit != null) {
-            var encs: std.ArrayList(vit35.Vit.Encoded) = .empty;
-            defer {
-                for (encs.items) |*e| e.deinit(self.gpa);
-                encs.deinit(self.gpa);
-            }
-            var segs: std.ArrayList(chat.Segment) = .empty;
-            defer segs.deinit(self.gpa);
-            for (self.turn_images.items) |im| {
-                const enc = try vit35_cuda.encode(&self.vit.?, self.be, self.gpa, im.rgb, im.width, im.height);
-                try encs.append(self.gpa, enc);
-                try segs.append(self.gpa, .{ .image = .{ .grid_w = enc.grid_w, .grid_h = enc.grid_h } });
-            }
-            if (self.turn_text.len > 0) try segs.append(self.gpa, .{ .text = self.turn_text });
-
-            var image_rows: std.ArrayList(usize) = .empty;
-            defer image_rows.deinit(self.gpa);
-            try chat.appendUserSegments(&self.tok, self.gpa, segs.items, &self.ids, &image_rows);
-            try chat.openAssistant(&self.tok, self.gpa, &self.ids);
-
-            if (self.ids.items.len > self.model.cached() + self.model.remaining()) {
-                try self.model.ensureCapacity(self.ids.items.len);
-            }
-            for (image_rows.items, encs.items) |row, e| {
-                const before = self.ids.items[self.model.cached()..row];
-                if (before.len > 0) try self.model.prefill(before);
-                try self.model.prefillImage(e.embeds, e.grid_w, e.grid_h);
+        if (self.turn_images.items.len > 0 and self.hasVit()) {
+            switch (self.arch) {
+                .qwen35 => |*a| try self.imageTurn(a, false),
+                .gemma3 => |*a| try self.imageTurn(a, true),
             }
         } else {
             try chat.appendUser(&self.tok, self.gpa, self.turn_text, &self.ids);
             try chat.openAssistant(&self.tok, self.gpa, &self.ids);
+        }
+    }
+
+    /// Encode this turn's images on the arch's vision tower, build the
+    /// interleaved segment layout (family-aware), and inject each image's
+    /// embeddings at its placeholder rows. `a` is a pointer to the active
+    /// arch bundle; `gemma` selects the (io-taking) gemma vision encoder.
+    fn imageTurn(self: *Session, a: anytype, comptime gemma: bool) !void {
+        const Enc = if (gemma) gemma_vit.Vit.Encoded else vit35.Vit.Encoded;
+        var encs: std.ArrayList(Enc) = .empty;
+        defer {
+            for (encs.items) |*e| e.deinit(self.gpa);
+            encs.deinit(self.gpa);
+        }
+        var segs: std.ArrayList(chat.Segment) = .empty;
+        defer segs.deinit(self.gpa);
+        for (self.turn_images.items) |im| {
+            const enc = if (gemma)
+                try gemma_vit_cuda.encode(&a.vit.?, self.be, self.io, self.gpa, im.rgb, im.width, im.height)
+            else
+                try vit35_cuda.encode(&a.vit.?, self.be, self.gpa, im.rgb, im.width, im.height);
+            try encs.append(self.gpa, enc);
+            try segs.append(self.gpa, .{ .image = .{ .grid_w = enc.grid_w, .grid_h = enc.grid_h } });
+        }
+        if (self.turn_text.len > 0) try segs.append(self.gpa, .{ .text = self.turn_text });
+
+        var image_rows: std.ArrayList(usize) = .empty;
+        defer image_rows.deinit(self.gpa);
+        try chat.appendUserSegments(&self.tok, self.gpa, segs.items, &self.ids, &image_rows);
+        try chat.openAssistant(&self.tok, self.gpa, &self.ids);
+
+        if (self.ids.items.len > a.model.cached() + a.model.remaining()) {
+            try a.model.ensureCapacity(self.ids.items.len);
+        }
+        for (image_rows.items, encs.items) |row, e| {
+            const before = self.ids.items[a.model.cached()..row];
+            if (before.len > 0) try a.model.prefill(before);
+            try a.model.prefillImage(e.embeds, e.grid_w, e.grid_h);
         }
     }
 

@@ -694,10 +694,11 @@ pub const CudaLM = struct {
                                 hd,
                                 nsplit,
                                 scale,
+                                0,
                             );
                         }
                     } else {
-                        try be.opAttnDecode(b.q, self.k_cache[slot].buf, self.v_cache[slot].buf, b.attn, b.attn_scratch, self.len + 1, n, cfg.n_heads, cfg.n_kv_heads, hd, nsplit_prefill, scale);
+                        try be.opAttnDecode(b.q, self.k_cache[slot].buf, self.v_cache[slot].buf, b.attn, b.attn_scratch, self.len + 1, n, cfg.n_heads, cfg.n_kv_heads, hd, nsplit_prefill, scale, 0);
                     }
                     try be.opMulSigmoid(b.attn, b.gate, n * cfg.qDim());
                     try self.gemm(b.t, b.attn, al.o, n);
@@ -900,7 +901,7 @@ pub const CudaLM = struct {
                     } else {
                         try be.tensorCopy(self.k_cache[slot].buf, self.len * cfg.kvDim() * 4, b.k, 0, cfg.kvDim() * 4);
                         try be.tensorCopy(self.v_cache[slot].buf, self.len * cfg.kvDim() * 4, b.v, 0, cfg.kvDim() * 4);
-                        try be.opAttnDecode(b.q, self.k_cache[slot].buf, self.v_cache[slot].buf, b.attn, b.attn_scratch, self.len + 1, 1, cfg.n_heads, cfg.n_kv_heads, hd, nsplit, scale);
+                        try be.opAttnDecode(b.q, self.k_cache[slot].buf, self.v_cache[slot].buf, b.attn, b.attn_scratch, self.len + 1, 1, cfg.n_heads, cfg.n_kv_heads, hd, nsplit, scale, 0);
                     }
                     try be.opMulSigmoid(b.attn, b.gate, cfg.qDim());
                     try self.quantizeX(b.attn, cfg.qDim());

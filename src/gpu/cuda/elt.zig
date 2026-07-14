@@ -1818,8 +1818,16 @@ pub const attn_split_h256_ptx: [:0]const u8 =
     \\  add.u32 %r5,%r5,%r31;                 // this query's kv len (causal)
     \\  div.u32 %r10,%r2,%r26;                // h
     \\  rem.u32 %r21,%r2,%r26;                // split i
-    \\  add.u32 %r22,%r5,%r26; sub.u32 %r22,%r22,1; div.u32 %r22,%r22,%r26; // chunk
-    \\  mul.lo.s32 %r17,%r21,%r22;            // kv0
+    \\  // Sliding window (f1, 0 = full causal): kv_start = max(0, kv_len - window).
+    \\  ld.param.f32 %f30,[f1]; cvt.rzi.u32.f32 %r11,%f30;
+    \\  mov.u32 %r16,0;                       // kv_start
+    \\  setp.eq.u32 %p4,%r11,0; @%p4 bra NOWIN;
+    \\  setp.le.u32 %p4,%r5,%r11; @%p4 bra NOWIN;
+    \\  sub.u32 %r16,%r5,%r11;                // kv_start = kv_len - window
+    \\NOWIN:
+    \\  sub.u32 %r22,%r5,%r16;                // span = kv_len - kv_start
+    \\  add.u32 %r22,%r22,%r26; sub.u32 %r22,%r22,1; div.u32 %r22,%r22,%r26; // chunk = ceil(span/nsplit)
+    \\  mad.lo.s32 %r17,%r21,%r22,%r16;       // kv0 = kv_start + split_i*chunk
     \\  add.u32 %r23,%r17,%r22; min.u32 %r23,%r23,%r5; // kv1
     \\  div.u32 %r12,%r6,%r8;                 // group
     \\  div.u32 %r13,%r10,%r12;               // kv head
@@ -2536,8 +2544,16 @@ pub const attn_split_ptx: [:0]const u8 =
     \\  add.u32 %r5,%r5,%r31;                 // this query's kv len (causal: kv_len0 + t)
     \\  div.u32 %r10,%r2,%r26;                // h
     \\  rem.u32 %r21,%r2,%r26;                // split i
-    \\  add.u32 %r22,%r5,%r26; sub.u32 %r22,%r22,1; div.u32 %r22,%r22,%r26; // chunk
-    \\  mul.lo.s32 %r17,%r21,%r22;            // kv0
+    \\  // Sliding window (f1, 0 = full causal): kv_start = max(0, kv_len - window).
+    \\  ld.param.f32 %f30,[f1]; cvt.rzi.u32.f32 %r11,%f30;
+    \\  mov.u32 %r16,0;                       // kv_start
+    \\  setp.eq.u32 %p4,%r11,0; @%p4 bra NOWIN;
+    \\  setp.le.u32 %p4,%r5,%r11; @%p4 bra NOWIN;
+    \\  sub.u32 %r16,%r5,%r11;                // kv_start = kv_len - window
+    \\NOWIN:
+    \\  sub.u32 %r22,%r5,%r16;                // span = kv_len - kv_start
+    \\  add.u32 %r22,%r22,%r26; sub.u32 %r22,%r22,1; div.u32 %r22,%r22,%r26; // chunk = ceil(span/nsplit)
+    \\  mad.lo.s32 %r17,%r21,%r22,%r16;       // kv0 = kv_start + split_i*chunk
     \\  add.u32 %r23,%r17,%r22; min.u32 %r23,%r23,%r5; // kv1
     \\  div.u32 %r12,%r6,%r8;                 // group
     \\  div.u32 %r13,%r10,%r12;               // kv head
@@ -2697,8 +2713,16 @@ pub const attn_split_tree_ptx: [:0]const u8 =
     \\  add.s64 %rd23,%rd22,4;                // ancestor row list base
     \\  div.u32 %r10,%r2,%r26;                // h
     \\  rem.u32 %r21,%r2,%r26;                // split i
-    \\  add.u32 %r22,%r5,%r26; sub.u32 %r22,%r22,1; div.u32 %r22,%r22,%r26; // chunk
-    \\  mul.lo.s32 %r17,%r21,%r22;            // kv0
+    \\  // Sliding window (f1, 0 = full causal): kv_start = max(0, kv_len - window).
+    \\  ld.param.f32 %f30,[f1]; cvt.rzi.u32.f32 %r11,%f30;
+    \\  mov.u32 %r16,0;                       // kv_start
+    \\  setp.eq.u32 %p4,%r11,0; @%p4 bra NOWIN;
+    \\  setp.le.u32 %p4,%r5,%r11; @%p4 bra NOWIN;
+    \\  sub.u32 %r16,%r5,%r11;                // kv_start = kv_len - window
+    \\NOWIN:
+    \\  sub.u32 %r22,%r5,%r16;                // span = kv_len - kv_start
+    \\  add.u32 %r22,%r22,%r26; sub.u32 %r22,%r22,1; div.u32 %r22,%r22,%r26; // chunk = ceil(span/nsplit)
+    \\  mad.lo.s32 %r17,%r21,%r22,%r16;       // kv0 = kv_start + split_i*chunk
     \\  add.u32 %r23,%r17,%r22; min.u32 %r23,%r23,%r5; // kv1
     \\  div.u32 %r12,%r6,%r8;                 // group
     \\  div.u32 %r13,%r10,%r12;               // kv head
@@ -3754,6 +3778,38 @@ pub const gelu_ptx: [:0]const u8 =
     \\}
 ;
 
+/// GeGLU gate: a[idx] = geluTanh(a[idx]) * b[idx], in place (Gemma FFN).
+/// Same folded tanh-gelu as `gelu` (x·sigmoid(w), w = x·(c1 + c2·x²)),
+/// then multiplied by the up projection b — the fused twin of silu_mul.
+/// b0=a (gate), b1=b (up). u0=total.
+pub const gelu_mul_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry gelu_mul(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<2>;
+    \\  .reg .b32 %r<6>;
+    \\  .reg .f32 %f<8>;
+    \\  .reg .b64 %rd<8>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2;
+    \\  mul.wide.u32 %rd3,%r4,4; add.s64 %rd4,%rd1,%rd3; add.s64 %rd5,%rd2,%rd3;
+    \\  ld.global.f32 %f1,[%rd4]; ld.global.f32 %f2,[%rd5];
+    \\  mul.f32 %f5,%f1,%f1;                        // x^2
+    \\  fma.rn.f32 %f3,%f5,0f3D922279,0f3FCC422A;   // c1 + c2*x^2
+    \\  mul.f32 %f3,%f3,%f1;                        // w = x*(c1 + c2*x^2)
+    \\  neg.f32 %f4,%f3; mul.f32 %f4,%f4,0f3FB8AA3B; ex2.approx.f32 %f4,%f4; add.f32 %f4,%f4,0f3F800000; rcp.approx.f32 %f4,%f4;
+    \\  mul.f32 %f1,%f1,%f4;                        // geluTanh(x) = x*sigmoid(w)
+    \\  mul.f32 %f1,%f1,%f2; st.global.f32 [%rd4],%f1;
+    \\END:
+    \\  ret;
+    \\}
+;
+
 /// a[idx] += mod[u2 + idx%u1] * b[idx], in place. b0=a, b1=b(delta), b2=mod.
 /// u0=total, u1=dim(F), u2=gate_off.
 pub const gated_add_ptx: [:0]const u8 =
@@ -4713,8 +4769,16 @@ pub const decode_state_ptx: [:0]const u8 =
     \\  add.u32 %r5,%r5,%r31;                 // this query's kv len (causal)
     \\  div.u32 %r10,%r2,%r26;                // h
     \\  rem.u32 %r21,%r2,%r26;                // split i
-    \\  add.u32 %r22,%r5,%r26; sub.u32 %r22,%r22,1; div.u32 %r22,%r22,%r26; // chunk
-    \\  mul.lo.s32 %r17,%r21,%r22;            // kv0
+    \\  // Sliding window (f1, 0 = full causal): kv_start = max(0, kv_len - window).
+    \\  ld.param.f32 %f30,[f1]; cvt.rzi.u32.f32 %r11,%f30;
+    \\  mov.u32 %r16,0;                       // kv_start
+    \\  setp.eq.u32 %p4,%r11,0; @%p4 bra NOWIN;
+    \\  setp.le.u32 %p4,%r5,%r11; @%p4 bra NOWIN;
+    \\  sub.u32 %r16,%r5,%r11;                // kv_start = kv_len - window
+    \\NOWIN:
+    \\  sub.u32 %r22,%r5,%r16;                // span = kv_len - kv_start
+    \\  add.u32 %r22,%r22,%r26; sub.u32 %r22,%r22,1; div.u32 %r22,%r22,%r26; // chunk = ceil(span/nsplit)
+    \\  mad.lo.s32 %r17,%r21,%r22,%r16;       // kv0 = kv_start + split_i*chunk
     \\  add.u32 %r23,%r17,%r22; min.u32 %r23,%r23,%r5; // kv1
     \\  div.u32 %r12,%r6,%r8;                 // group
     \\  div.u32 %r13,%r10,%r12;               // kv head

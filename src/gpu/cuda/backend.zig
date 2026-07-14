@@ -1323,10 +1323,12 @@ pub const Backend = struct {
             .q6_k => try self.eltFn(elt.gemv_q6_k_ptx, "gemv_q6_k"),
             else => unreachable,
         };
-        // q5_k/q6_k run warp-per-row (8 rows per block).
+        // q5_k/q6_k run warp-per-row (8 rows per block); the kernel guards
+        // `row < rows`, so a non-multiple-of-8 row count (e.g. Gemma 3's
+        // 262145-token tied head) just leaves the last block's extra warps
+        // idle — round the grid UP so every row is covered.
         const warp_per_row = dt == .q5_k or dt == .q6_k;
-        if (warp_per_row) std.debug.assert(rows % 8 == 0);
-        const grid = if (warp_per_row) rows / 8 else rows;
+        const grid = if (warp_per_row) (rows + 7) / 8 else rows;
         try self.rowLaunch(f, w_db, x, y, null, .{ @intCast(rows), @intCast(cols), 0, 0, 0, 0 }, .{ scale, 0 }, grid);
     }
 
@@ -1458,7 +1460,12 @@ pub const Backend = struct {
     /// then a merge pass over seq_q*heads rows. Query t sees kv_len0 + t
     /// keys. scratch holds seq_q*heads*nsplit*(hd+4) f32. hd is 128 (4 dims
     /// per lane) or 256 (8 dims per lane, qwen35).
-    pub fn opAttnDecode(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, kv_len0: usize, seq_q: usize, n_heads: usize, kv_heads: usize, hd: usize, nsplit: usize, scale: f32) Error!void {
+    /// Flash-decode attention. `window` (0 = full causal) enables a sliding
+    /// window: query at absolute position p attends only keys in
+    /// (p - window, p] — Gemma 3 local layers, and any future SWA arch. The
+    /// bound is applied per query (kv_len0 + t), so it works for both a single
+    /// decode row and a batched prefill.
+    pub fn opAttnDecode(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, kv_len0: usize, seq_q: usize, n_heads: usize, kv_heads: usize, hd: usize, nsplit: usize, scale: f32, window: usize) Error!void {
         self.ptic();
         defer self.ptoc(.attn);
         std.debug.assert((hd == 128 or hd == 256) and seq_q >= 1);
@@ -1466,7 +1473,7 @@ pub const Backend = struct {
             try self.eltFn(elt.attn_split_ptx, "attn_split")
         else
             try self.eltFn(elt.attn_split_h256_ptx, "attn_split_h256");
-        try self.eltLaunch(f_split, q, k, v, scratch, .{ @intCast(kv_len0), @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intCast(nsplit), @intCast(seq_q) }, .{ scale, 0 }, seq_q * n_heads * nsplit * 32);
+        try self.eltLaunch(f_split, q, k, v, scratch, .{ @intCast(kv_len0), @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intCast(nsplit), @intCast(seq_q) }, .{ scale, @floatFromInt(window) }, seq_q * n_heads * nsplit * 32);
         const f_merge = try self.eltFn(elt.attn_merge_ptx, "attn_merge");
         try self.eltLaunch(f_merge, scratch, out, null, null, .{ @intCast(seq_q * n_heads), @intCast(hd), @intCast(nsplit), 0, 0, 0 }, .{ 0, 0 }, seq_q * n_heads * hd);
     }
@@ -2610,6 +2617,14 @@ pub const Backend = struct {
         try self.eltLaunch(f, a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
+    /// GeGLU gate: a = geluTanh(a) * b, in place (Gemma FFN). total = elements.
+    pub fn geluMul(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, total: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const f = try self.eltFn(elt.gelu_mul_ptx, "gelu_mul");
+        try self.eltLaunch(f, a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+    }
+
     /// a = geluTanh(a), in place. total = element count.
     pub fn gelu(self: *Backend, a: DeviceBuffer, total: usize) Error!void {
         self.ptic();
@@ -3396,7 +3411,7 @@ test "qwen35 attention ops match CPU reference" {
     try be.tensorUpload(q_d, std.mem.sliceAsBytes(&q));
     try be.tensorUpload(k_d, std.mem.sliceAsBytes(&k));
     try be.tensorUpload(v_d, std.mem.sliceAsBytes(&v));
-    try be.opAttnDecode(q_d, k_d, v_d, out_d, scratch_d, kv_len, 1, heads, kv_heads, hd, 8, scale);
+    try be.opAttnDecode(q_d, k_d, v_d, out_d, scratch_d, kv_len, 1, heads, kv_heads, hd, 8, scale, 0);
     var got: [heads * hd]f32 = undefined;
     try be.tensorDownload(out_d, std.mem.sliceAsBytes(&got));
     for (ref, got) |e, a| try std.testing.expectApproxEqAbs(e, a, 2e-3);
@@ -3576,7 +3591,7 @@ test "attn decode seq_q batch matches CPU reference" {
     try be.tensorUpload(q_d, std.mem.sliceAsBytes(q));
     try be.tensorUpload(k_d, std.mem.sliceAsBytes(k));
     try be.tensorUpload(v_d, std.mem.sliceAsBytes(v));
-    try be.opAttnDecode(q_d, k_d, v_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale);
+    try be.opAttnDecode(q_d, k_d, v_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale, 0);
     const got = try gpa.alloc(f32, q.len);
     defer gpa.free(got);
     try be.tensorDownload(o_d, std.mem.sliceAsBytes(got));
@@ -3593,6 +3608,90 @@ test "attn decode seq_q batch matches CPU reference" {
         std.debug.print("worst {d} at elem {d} (t={d} h={d} c={d}): want {d} got {d}\n", .{ worst, worst_i, worst_i / (heads * hd), (worst_i / hd) % heads, worst_i % hd, ref[worst_i], got[worst_i] });
         return error.TestExpectedApproxEqAbs;
     }
+}
+
+// Gated on a CUDA device: the sliding-window path of attn_split_h256
+// (Gemma 3 local layers). Exercises kv_start > 0 — query t attends only the
+// last `window` keys — which short generations (context < window) never hit.
+test "attn decode sliding window matches CPU reference" {
+    const gpa = std.testing.allocator;
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+
+    const heads = 4;
+    const kv_heads = 2;
+    const hd = 256;
+    const seq_q = 40;
+    const kv_len0 = 60; // committed prefix; query t sees absolute position kv_len0+t
+    const window = 24;
+    const kv_total = kv_len0 + seq_q;
+    const nsp = 8;
+    var prng = std.Random.DefaultPrng.init(7);
+    const rand = prng.random();
+
+    const q = try gpa.alloc(f32, seq_q * heads * hd);
+    defer gpa.free(q);
+    const k = try gpa.alloc(f32, kv_total * kv_heads * hd);
+    defer gpa.free(k);
+    const v = try gpa.alloc(f32, kv_total * kv_heads * hd);
+    defer gpa.free(v);
+    for (q) |*x| x.* = rand.floatNorm(f32) * 0.3;
+    for (k) |*x| x.* = rand.floatNorm(f32) * 0.3;
+    for (v) |*x| x.* = rand.floatNorm(f32);
+    const scale = 1.0 / @sqrt(@as(f32, hd));
+
+    // CPU sliding-window causal reference: query t attends [kv_start, klen),
+    // kv_start = max(0, klen - window).
+    const ref = try gpa.alloc(f32, seq_q * heads * hd);
+    defer gpa.free(ref);
+    const scores = try gpa.alloc(f32, kv_total);
+    defer gpa.free(scores);
+    for (0..seq_q) |t| {
+        const klen = kv_len0 + t + 1;
+        const kv_start = if (klen > window) klen - window else 0;
+        for (0..heads) |h| {
+            const kvh = h / (heads / kv_heads);
+            var mx: f32 = -std.math.inf(f32);
+            for (kv_start..klen) |j| {
+                var sacc: f32 = 0;
+                for (0..hd) |c| sacc += q[(t * heads + h) * hd + c] * k[(j * kv_heads + kvh) * hd + c];
+                scores[j] = sacc * scale;
+                mx = @max(mx, scores[j]);
+            }
+            var den: f32 = 0;
+            for (kv_start..klen) |j| {
+                scores[j] = @exp(scores[j] - mx);
+                den += scores[j];
+            }
+            for (0..hd) |c| {
+                var acc: f32 = 0;
+                for (kv_start..klen) |j| acc += scores[j] * v[(j * kv_heads + kvh) * hd + c];
+                ref[(t * heads + h) * hd + c] = acc / den;
+            }
+        }
+    }
+
+    const q_d = try be.tensorCreate(q.len * 4);
+    const k_d = try be.tensorCreate(k.len * 4);
+    const v_d = try be.tensorCreate(v.len * 4);
+    const o_d = try be.tensorCreate(q.len * 4);
+    const s_d = try be.tensorCreate(seq_q * heads * nsp * (hd + 4) * 4);
+    defer {
+        inline for (.{ q_d, k_d, v_d, o_d, s_d }) |b| {
+            var bb = b;
+            be.tensorDestroy(&bb);
+        }
+    }
+    try be.tensorUpload(q_d, std.mem.sliceAsBytes(q));
+    try be.tensorUpload(k_d, std.mem.sliceAsBytes(k));
+    try be.tensorUpload(v_d, std.mem.sliceAsBytes(v));
+    try be.opAttnDecode(q_d, k_d, v_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale, window);
+    const got = try gpa.alloc(f32, q.len);
+    defer gpa.free(got);
+    try be.tensorDownload(o_d, std.mem.sliceAsBytes(got));
+    var worst: f32 = 0;
+    for (ref, got) |e, a| worst = @max(worst, @abs(e - a));
+    try std.testing.expect(worst <= 2e-3);
 }
 
 // Gated on a CUDA device: rope_imrope_pos with DIFFERING (t, h, w)

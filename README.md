@@ -2,11 +2,12 @@
 
 **This is an experimental work in progress.**
 
-TensorPencil is a test to see how far we can push diffusion performance in Zig.
+TensorPencil is about running inference backed by Zig so we have better control over memory.
 
-It currently targets FP8 and INT8/INT4 ConvRot Krea 2, and those are the only models that have been tested.
-I made up the INT4 format because I was curious, so you won't be able to find any INT4 ConvRot models. Sorry.
-
+It currently targets FP8 and INT8/INT4 ConvRot Krea 2, and those are the only models that have been tested for diffusion.
+For LLM side, it works with Qwen 3/3.5/3.6 of various sizes, and Gemma 3 12b. LLM's are only tested in GGUF currently
+(with the exception of the krea 2 text encoder, which is safetensors),
+while diffusion models are only supported in safetensors.
 
 ### AI Disclaimer
 TensorPencil is heavily AI-assisted code. Most of this stuff is over my head, I'm just tinkering here.
@@ -16,7 +17,7 @@ The exception is this readme; I'm of the opinion that if you expect a human to t
 
 Backends supported so far:
 - CPU - baseline reference, very slow (`--backend cpu`)
-- Vulkan - Zig hand-emitted SPIR-V (`--backend vulkan`)
+- Vulkan - Zig SPIR-V (`--backend vulkan`)
 - Zig PTX (CUDA) - Zig hand-emitted PTX (`--backend zig-cuda`)
 - CUDA libraries - NVIDIA cuBLASLt + cuDNN (`--backend cuda`)
 

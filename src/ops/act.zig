@@ -69,6 +69,25 @@ pub fn siluMul(gate: []f32, up: []const f32) void {
     while (i < gate.len) : (i += 1) gate[i] = siluScalar(gate[i]) * up[i];
 }
 
+/// GeGLU gating (Gemma FFN): gate[i] = gelu_tanh(gate[i]) * up[i].
+pub fn geluTanhMul(gate: []f32, up: []const f32) void {
+    std.debug.assert(gate.len == up.len);
+    const c: Vec = @splat(0.7978845608028654);
+    const c3: Vec = @splat(0.044715);
+    const one: Vec = @splat(1.0);
+    const two: Vec = @splat(2.0);
+    const half: Vec = @splat(0.5);
+    var i: usize = 0;
+    while (i + vlen <= gate.len) : (i += vlen) {
+        const x: Vec = gate[i..][0..vlen].*;
+        const u: Vec = up[i..][0..vlen].*;
+        const inner = c * (x + c3 * x * x * x);
+        const tanh_v = one - two / (vmath.expVec(two * inner) + one);
+        gate[i..][0..vlen].* = half * x * (one + tanh_v) * u;
+    }
+    while (i < gate.len) : (i += 1) gate[i] = geluTanhScalar(gate[i]) * up[i];
+}
+
 /// Sigmoid gating (Krea 2 attention output): dst[i] *= sigmoid(gate[i]).
 pub fn sigmoidMul(dst: []f32, gate: []const f32) void {
     std.debug.assert(dst.len == gate.len);

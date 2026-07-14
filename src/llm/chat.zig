@@ -26,6 +26,21 @@ pub var turn_end: u32 = tokenizer_mod.im_end;
 pub var pad: u32 = tokenizer_mod.pad_token;
 pub var newline: u32 = newline_id;
 
+/// Chat template family. `chatml` is Qwen's `<|im_start|>role\n…<|im_end|>`;
+/// `gemma` is Gemma 3's `<start_of_turn>role\n…<end_of_turn>\n` (roles user /
+/// model, no system role — its content prefixes the first user turn).
+pub const Family = enum { chatml, gemma };
+pub var family: Family = .chatml;
+/// Gemma: a user turn was opened by appendSystem (the system prefix) and the
+/// next appendUser continues it rather than starting a fresh turn.
+var gemma_user_open: bool = false;
+
+/// Select the chat template family (process-global, like the tokenizer).
+pub fn setFamily(f: Family) void {
+    family = f;
+    gemma_user_open = false;
+}
+
 /// Point the template glue and stop check at `tok`'s vocab.
 pub fn applyTokenizer(tok: *const Tokenizer) void {
     turn_end = tok.turn_end;
@@ -38,11 +53,29 @@ pub fn isStop(id: u32) bool {
 }
 
 pub fn appendSystem(tok: *const Tokenizer, gpa: std.mem.Allocator, text: []const u8, out: *std.ArrayList(u32)) !void {
-    try appendTurn(tok, gpa, "system", text, out);
+    switch (family) {
+        .chatml => try appendTurn(tok, gpa, "system", text, out),
+        .gemma => {
+            // Gemma has no system role: the content prefixes the first user
+            // turn (first_user_prefix + "\n\n"), which appendUser completes.
+            try tok.encode(gpa, "<start_of_turn>user\n", out);
+            try tok.encode(gpa, text, out);
+            try tok.encode(gpa, "\n\n", out);
+            gemma_user_open = true;
+        },
+    }
 }
 
 pub fn appendUser(tok: *const Tokenizer, gpa: std.mem.Allocator, text: []const u8, out: *std.ArrayList(u32)) !void {
-    try appendTurn(tok, gpa, "user", text, out);
+    switch (family) {
+        .chatml => try appendTurn(tok, gpa, "user", text, out),
+        .gemma => {
+            if (!gemma_user_open) try tok.encode(gpa, "<start_of_turn>user\n", out);
+            gemma_user_open = false;
+            try tok.encode(gpa, text, out);
+            try tok.encode(gpa, "<end_of_turn>\n", out);
+        },
+    }
 }
 
 /// One piece of an interleaved user turn.
@@ -60,24 +93,56 @@ pub const Segment = union(enum) {
 /// row index is appended to image_rows so the caller can interleave
 /// prefill() with prefillImage().
 pub fn appendUserSegments(tok: *const Tokenizer, gpa: std.mem.Allocator, segments: []const Segment, out: *std.ArrayList(u32), image_rows: *std.ArrayList(usize)) !void {
-    const pad_id = tok.specialId("<|image_pad|>") orelse tok.pad;
-    try tok.encode(gpa, "<|im_start|>user\n", out);
-    for (segments) |seg| switch (seg) {
-        .text => |t| try tok.encode(gpa, t, out),
-        .image => |im| {
-            try tok.encode(gpa, "<|vision_start|>", out);
-            try image_rows.append(gpa, out.items.len);
-            try out.appendNTimes(gpa, pad_id, im.grid_w * im.grid_h);
-            try tok.encode(gpa, "<|vision_end|>", out);
+    switch (family) {
+        .gemma => {
+            try tok.encode(gpa, "<start_of_turn>user\n", out);
+            for (segments) |seg| switch (seg) {
+                .text => |t| try tok.encode(gpa, t, out),
+                .image => |im| {
+                    const row = try appendGemmaImage(tok, gpa, im.grid_w * im.grid_h, out);
+                    try image_rows.append(gpa, row);
+                },
+            };
+            try tok.encode(gpa, "<end_of_turn>\n", out);
         },
-    };
-    try out.append(gpa, turn_end);
-    try out.append(gpa, newline);
+        .chatml => {
+            const pad_id = tok.specialId("<|image_pad|>") orelse tok.pad;
+            try tok.encode(gpa, "<|im_start|>user\n", out);
+            for (segments) |seg| switch (seg) {
+                .text => |t| try tok.encode(gpa, t, out),
+                .image => |im| {
+                    try tok.encode(gpa, "<|vision_start|>", out);
+                    try image_rows.append(gpa, out.items.len);
+                    try out.appendNTimes(gpa, pad_id, im.grid_w * im.grid_h);
+                    try tok.encode(gpa, "<|vision_end|>", out);
+                },
+            };
+            try out.append(gpa, turn_end);
+            try out.append(gpa, newline);
+        },
+    }
 }
 
-/// Start the assistant turn the model completes: <|im_start|>assistant\n
+/// Gemma image block: `<start_of_image>` + `n_tokens` `<image_soft_token>`
+/// placeholders + `<end_of_image>`. Returns the index of the first
+/// placeholder row so the caller can splice the ViT embeddings in with
+/// prefillImage (the placeholders keep `ids` aligned with cache rows).
+pub fn appendGemmaImage(tok: *const Tokenizer, gpa: std.mem.Allocator, n_tokens: usize, out: *std.ArrayList(u32)) !usize {
+    const soft = tok.specialId("<image_soft_token>") orelse return error.MissingImageToken;
+    try tok.encode(gpa, "<start_of_image>", out);
+    const first = out.items.len;
+    try out.appendNTimes(gpa, soft, n_tokens);
+    try tok.encode(gpa, "<end_of_image>", out);
+    return first;
+}
+
+/// Start the assistant turn the model completes (ChatML: `<|im_start|>
+/// assistant\n`; Gemma: `<start_of_turn>model\n`).
 pub fn openAssistant(tok: *const Tokenizer, gpa: std.mem.Allocator, out: *std.ArrayList(u32)) !void {
-    try tok.encode(gpa, "<|im_start|>assistant\n", out);
+    try tok.encode(gpa, switch (family) {
+        .chatml => "<|im_start|>assistant\n",
+        .gemma => "<start_of_turn>model\n",
+    }, out);
 }
 
 /// Close a generated assistant turn so another user turn can follow (the
@@ -173,6 +238,52 @@ test "turn building matches whole-template tokenization" {
         &ref,
     );
     try std.testing.expectEqualSlices(u32, ref.items, ids.items);
+}
+
+// Gemma turn building (family = gemma) must match one-shot tokenization of
+// the same template string; gated on the Gemma 3 GGUF. Also confirms the
+// BOS/turn glue against llama.cpp's chat template shape.
+test "gemma turn building matches whole-template tokenization" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const gguf_mod = @import("../gguf.zig");
+    const path = "/home/qt/genai/lmstudio/models/mradermacher/Gemma-3-Starshine-12B-Alt-GGUF/Gemma-3-Starshine-12B-Alt.Q4_K_M.gguf";
+    std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
+
+    var g = try gguf_mod.Gguf.open(gpa, io, path);
+    defer g.deinit();
+    var tok = try Tokenizer.initFromGguf(gpa, &g);
+    defer tok.deinit();
+    applyTokenizer(&tok);
+    setFamily(.gemma);
+    defer setFamily(.chatml); // restore process-global for other tests
+
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(gpa);
+    const bos = tok.specialId("<bos>").?;
+    try ids.append(gpa, bos);
+    try appendSystem(&tok, gpa, "You are terse.", &ids);
+    try appendUser(&tok, gpa, "Hi there", &ids);
+    try openAssistant(&tok, gpa, &ids);
+
+    var ref: std.ArrayList(u32) = .empty;
+    defer ref.deinit(gpa);
+    try ref.append(gpa, bos);
+    try tok.encode(
+        gpa,
+        "<start_of_turn>user\nYou are terse.\n\nHi there<end_of_turn>\n<start_of_turn>model\n",
+        &ref,
+    );
+    try std.testing.expectEqualSlices(u32, ref.items, ids.items);
+
+    // closeAssistant emits <end_of_turn>\n via the vocab-driven glue ids.
+    try std.testing.expectEqual(@as(u32, 106), turn_end); // <end_of_turn>
+    ids.clearRetainingCapacity();
+    try closeAssistant(gpa, &ids);
+    var ref2: std.ArrayList(u32) = .empty;
+    defer ref2.deinit(gpa);
+    try tok.encode(gpa, "<end_of_turn>\n", &ref2);
+    try std.testing.expectEqualSlices(u32, ref2.items, ids.items);
 }
 
 test "segment turn interleaves image pads at the mention points" {

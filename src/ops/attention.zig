@@ -22,6 +22,10 @@ pub const Params = struct {
     key_mask: ?[]const bool = null,
     /// Score scale; defaults to 1/sqrt(head_dim).
     scale: ?f32 = null,
+    /// Sliding-window attention (Gemma 3 local layers): 0 = disabled (full
+    /// causal). When > 0 (and causal), query at absolute position p attends
+    /// only keys in [p - window + 1, p]. Requires causal.
+    window: usize = 0,
 };
 
 pub const Error = error{OutOfMemory} || std.Io.Cancelable;
@@ -98,9 +102,11 @@ fn headTask(
     for (q_start..q_end) |i| {
         const qrow = q[i * q_stride + h * hd ..][0..hd];
         const kv_end = if (p.causal) p.seq_kv - p.seq_q + i + 1 else p.seq_kv;
+        // Sliding window: drop keys older than `window` positions back.
+        const kv_start = if (p.window != 0 and kv_end > p.window) kv_end - p.window else 0;
 
         var max_score = -std.math.inf(f32);
-        for (0..kv_end) |j| {
+        for (kv_start..kv_end) |j| {
             if (p.key_mask) |mask| if (!mask[j]) {
                 scores[j] = -std.math.inf(f32);
                 continue;
@@ -120,7 +126,7 @@ fn headTask(
             const vlen = vmath.vlen;
             const mx: vmath.Vec = @splat(max_score);
             var acc: vmath.Vec = @splat(0);
-            var j: usize = 0;
+            var j: usize = kv_start;
             while (j + vlen <= kv_end) : (j += vlen) {
                 const e = vmath.expVec(@as(vmath.Vec, scores[j..][0..vlen].*) - mx);
                 scores[j..][0..vlen].* = e;
@@ -134,7 +140,7 @@ fn headTask(
             }
         }
         const inv = 1.0 / denom;
-        for (0..kv_end) |j| {
+        for (kv_start..kv_end) |j| {
             const weight = scores[j] * inv;
             if (weight == 0) continue;
             const vrow = v[j * kv_stride + h_kv * hd ..][0..hd];
@@ -289,6 +295,36 @@ test "causal attention matches torch sdpa" {
         .causal = true,
     });
     for (attn_causal_out, out) |e, a| try std.testing.expectApproxEqAbs(e, a, 3e-6);
+}
+
+test "sliding-window attention" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const p: Params = .{ .seq_q = 3, .seq_kv = 3, .n_heads = 2, .n_kv_heads = 1, .head_dim = 4, .causal = true };
+
+    // window >= seq_kv is identical to full causal.
+    {
+        var out: [24]f32 = undefined;
+        var pw = p;
+        pw.window = 3;
+        try attention(io, gpa, &out, &attn_q, &attn_k, &attn_v, pw);
+        for (attn_causal_out, out) |e, a| try std.testing.expectApproxEqAbs(e, a, 3e-6);
+    }
+    // window == 1: query i attends only key i, so each output row is that
+    // position's V (softmax over a single key), for both GQA heads.
+    {
+        var out: [24]f32 = undefined;
+        var pw = p;
+        pw.window = 1;
+        try attention(io, gpa, &out, &attn_q, &attn_k, &attn_v, pw);
+        for (0..3) |i| {
+            for (0..2) |h| {
+                for (0..4) |d| {
+                    try std.testing.expectApproxEqAbs(attn_v[i * 4 + d], out[i * 8 + h * 4 + d], 3e-6);
+                }
+            }
+        }
+    }
 }
 
 test "cached decode attention matches the full causal rows" {

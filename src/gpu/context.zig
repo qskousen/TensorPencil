@@ -62,7 +62,7 @@ const Push = extern struct {
 };
 
 /// Eltwise/attention kernels and their workgroup shapes (kernels/eltwise.zig).
-pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, rope_qwen35, attn_decode_q35, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t };
+pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, rope_qwen35, attn_decode_q35, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full };
 const elt_entry_sizes = [_]EntrySize{
     .{ .name = "rmsnorm", .x = 64, .y = 1 },
     .{ .name = "rms_partial", .x = 256, .y = 1 },
@@ -127,6 +127,10 @@ const elt_entry_sizes = [_]EntrySize{
     .{ .name = "gemv_q8_0_t", .x = 256, .y = 1 },
     .{ .name = "gemv_q4_k_t", .x = 256, .y = 1 },
     .{ .name = "gemv_q5_k_t", .x = 256, .y = 1 },
+    .{ .name = "gelu_mul", .x = 256, .y = 1 },
+    .{ .name = "gelu", .x = 256, .y = 1 },
+    .{ .name = "layernorm", .x = 64, .y = 1 },
+    .{ .name = "attn_full", .x = 64, .y = 1 },
 };
 
 /// Push block shared by all eltwise entries; meaning per entry (see kernels).
@@ -1843,8 +1847,8 @@ pub const Context = struct {
     }
     /// Causal GQA attention for one decode query (online softmax, one thread
     /// per query head). k/v caches: position j at j*(n_kv*hd) + kvh*hd.
-    pub fn opAttnDecodeQ35(self: *Context, q: DeviceBuffer, k_cache: DeviceBuffer, v_cache: DeviceBuffer, out: DeviceBuffer, n_heads: usize, n_kv: usize, head_dim: usize, kv_len: usize, scale: f32) Error!void {
-        try self.opElt(.attn_decode_q35, q, k_cache, v_cache, out, .{ .u0 = @intCast(n_heads), .u1 = @intCast(n_kv), .u2 = @intCast(head_dim), .u3 = @intCast(kv_len), .f0 = scale }, n_heads, 1, 1);
+    pub fn opAttnDecodeQ35(self: *Context, q: DeviceBuffer, k_cache: DeviceBuffer, v_cache: DeviceBuffer, out: DeviceBuffer, n_heads: usize, n_kv: usize, head_dim: usize, kv_len: usize, scale: f32, window: usize) Error!void {
+        try self.opElt(.attn_decode_q35, q, k_cache, v_cache, out, .{ .u0 = @intCast(n_heads), .u1 = @intCast(n_kv), .u2 = @intCast(head_dim), .u3 = @intCast(kv_len), .u4 = @intCast(window), .f0 = scale }, n_heads, 1, 1);
     }
 
     pub fn opGemvCombine(

@@ -89,6 +89,15 @@ pub fn applyInterleaved(x: []f32, freqs: Freqs, seq: usize, n_heads: usize, head
 /// Half-split ("rotate half") frequency table for Qwen/Llama-style RoPE:
 /// freq_i = pos * theta^(-2i/head_dim), i in [0, head_dim/2).
 pub fn rotateHalfFreqs(gpa: std.mem.Allocator, seq: usize, head_dim: usize, theta: f64) !Freqs {
+    return rotateHalfFreqsScaled(gpa, seq, head_dim, theta, 1.0);
+}
+
+/// rotateHalfFreqs with a linear position scale (llama.cpp `freq_scale` /
+/// HF "linear" rope scaling): the effective position is `p * freq_scale`
+/// (position interpolation). `freq_scale == 1.0` reproduces rotateHalfFreqs.
+/// Gemma 3 global layers use freq_scale = 1/8; local (sliding-window) layers
+/// use 1.0.
+pub fn rotateHalfFreqsScaled(gpa: std.mem.Allocator, seq: usize, head_dim: usize, theta: f64, freq_scale: f64) !Freqs {
     const half = head_dim / 2;
     const cos = try gpa.alloc(f32, seq * half);
     errdefer gpa.free(cos);
@@ -97,7 +106,7 @@ pub fn rotateHalfFreqs(gpa: std.mem.Allocator, seq: usize, head_dim: usize, thet
     for (0..seq) |p| {
         for (0..half) |i| {
             const inv = 1.0 / std.math.pow(f64, theta, @as(f64, @floatFromInt(2 * i)) / @as(f64, @floatFromInt(head_dim)));
-            const angle = @as(f64, @floatFromInt(p)) * inv;
+            const angle = @as(f64, @floatFromInt(p)) * freq_scale * inv;
             cos[p * half + i] = @floatCast(@cos(angle));
             sin[p * half + i] = @floatCast(@sin(angle));
         }

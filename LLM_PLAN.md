@@ -423,8 +423,107 @@ structured, ~1.5x prose; a SpecForge-trained head on the actual target
 would add ~10 pts acceptance on top.
 
 ### Later / non-goals for now
-- Other architectures (Llama, Gemma) — config struct is the extension point;
+- Other architectures (Llama) — config struct is the extension point;
   first new arch import will force weight-name mapping tables.
+- Gemma 3 (GGUF arch "gemma3") — **cpu + zig-cuda/cuda + vulkan DONE (2026-07-14), incl. vision**:
+  `models/gemma3.zig` (Config.detect + `Model` + `CpuModel` stepper). New vs
+  the Qwen stack: "sandwich" norms (input / post-attention / pre-FFN /
+  post-FFN RMSNorm, the two post-norms applied to the sublayer output before
+  its residual add; +1 already folded into the GGUF weights), embeddings
+  scaled by sqrt(hidden), GeGLU (gelu-tanh) FFN, per-head QK-norm then full
+  rotate-half RoPE whose base/scale ALTERNATE by layer — every 6th layer
+  (`sliding_window_pattern`) is GLOBAL (theta 1e6, linear scale 1/8, full
+  causal attention), the rest LOCAL (theta 1e4, no scale, sliding-window
+  causal mask window 1024). head_dim 256 with the 12B's 1/sqrt(256) attention
+  scale is exactly the engine default, so ops.attention only grew a `window`
+  param; ops also gained `rope.rotateHalfFreqsScaled` (freq_scale) and
+  `act.geluTanhMul`. Tied LM head, no softcapping. **New tokenizer path**:
+  SentencePiece (`tokenizer.ggml.model == "llama"`) —
+  `Tokenizer.initSpmFromGguf` + `encodeSpm`: ▁-escape, score-ranked bigram
+  merge (llama.cpp llm_tokenizer_spm), byte fallback (`<0xNN>`), and
+  CONTROL/USER_DEFINED tokens matched verbatim longest-first
+  (tokenizer_st_partition). Chat template family (`chat.setFamily(.gemma)`):
+  `<bos><start_of_turn>{user|model}\n…<end_of_turn>\n`, no system role (its
+  content prefixes the first user turn), stop on `<end_of_turn>` (106).
+  Validated: SPM tokenization + full chat template token-identical to
+  llama-tokenize; greedy CPU generation coherent and matching llama.cpp
+  (early divergence only where GPU-f16 vs CPU-f32 flips a near-tie argmax).
+  Dispatched in llm_main via `general.architecture == "gemma3"`
+  (spec-decode / images / cpu-split rejected). SigLIP vision tower (mmproj)
+  is the remaining follow-up.
+  GPU (zig-cuda/cuda, 2026-07-14): `models/gemma3_cuda.zig` runs the stack
+  device-resident — prefill in 128-row chunks (opMatmulQuant / grouped dp4a
+  GEMVs), per-op decode (no graph capture: measured +0% on this
+  memory-bound regime). Two RoPE tables (global theta 1e6 scale 1/8, local
+  theta 1e4) live on device; each layer picks one. Two generalized backend
+  primitives landed and are reused by any future arch: `be.geluMul`
+  (fused GeGLU gate, `gelu_mul` PTX) and a `window` arg on `opAttnDecode`
+  (sliding-window via `attn_split`/`attn_split_h256` — computes kv_start =
+  max(0, kv_len - window) and partitions [kv_start, kv_len); f1 carries the
+  window, 0 = full causal, so existing qwen callers are unchanged). Embed
+  scale is host-side (embedding always gathers on host without a decode
+  graph). Validated on the 3090: greedy byte-identical to the CPU path and
+  to llama.cpp on low-entropy prompts, coherent otherwise; ~22-25 tok/s
+  (12B Q4_K_M) vs ~2.3 CPU. Kernel unit test `attn decode sliding window
+  matches CPU reference` exercises the kv_start>0 path (short generations
+  stay under the 1024 window). Vulkan is the last backend TODO.
+  VISION (2026-07-14): `models/gemma_vit.zig` — the SigLIP-So400m tower +
+  Gemma projector (llama.cpp tools/mtmd clip.cpp build_gemma3 + siglip.cpp
+  port, CPU f32). Pipeline: bilinear aspect-preserving resize to 896x896 +
+  center pad (PAD_CEIL) + normalize ((p/255-0.5)/0.5) -> patch conv 14x14
+  (im2col GEMM) -> add the learned [4096][1152] position embedding -> 27
+  pre-LN SigLIP blocks (LayerNorm+bias, separate q/k/v+bias, full
+  bidirectional MHA 16x72 scaled 1/sqrt(72), GELU-tanh FFN 1152->4304) ->
+  post_ln -> projector: 4x4 avg-pool over the 64x64 grid -> 256 tokens,
+  soft_emb_norm (RMSNorm, +1 folded into the weight), mm.input_projection
+  1152->3840 (stored [in,out], transposed at load). Each image = 256 soft
+  tokens, wrapped `<start_of_image>`(255999) + 256 x `<image_soft_token>`
+  (262144) + `<end_of_image>`(256000), injected UNSCALED (Gemma scales only
+  text embeddings by sqrt(hidden)) at sequential positions via new
+  `prefill`/`prefillImage`/`forwardHidden`/`forwardRows` on the cpu + cuda
+  steppers (interleaved text/image/text prefill in runGemma3, like qwen35's
+  one-shot). `tp-llm --model x.gguf --mmproj mmproj.gguf --image a.png
+  --prompt "..."` on cpu / zig-cuda / cuda. Validated vs llama-mtmd-cli: 274
+  prompt tokens identical, caption accurate, first clause identical (then a
+  near-tie divergence — f32 CPU ViT vs f16 GPU ViT + quant path).
+  GPU VIT (2026-07-14): `models/gemma_vit_cuda.zig` runs the 27 SigLIP
+  blocks device-side (mirrors vit35_cuda: opConvF16 patch embed, learned
+  pos-embed add, head-pad 72->128 + opAttnTC full attention, LN+bias,
+  gelu-tanh FFN; the cheap projector — 4x4 pool + soft_emb_norm + proj —
+  stays on host via the shared `Vit.project`). 512px image encode 39s (CPU)
+  -> 0.4s (GPU), identical caption; used automatically on the CUDA backends.
+  DP4A DECODE (2026-07-14): gemma3_cuda.linear decode now quantizes the
+  activation once (opGemvQuantizeX) and runs int8 dp4a GEMVs
+  (opGemvQuantQ8 for q5_k/q6_k, opGemvQuantQ8N ng=1 for q4_k/q8_0) instead
+  of the f32-dequant opGemvQuant — same regime as qwen35/llama.cpp mmvq.
+  12B Q4_K_M: ~22 -> ~35 tok/s (1.6x); greedy count-prompt still
+  byte-identical (the LM head keeps the f32 GEMV: vocab rows aren't %8).
+  INTERACTIVE @IMAGE (2026-07-14): the tp-llm REPL @path.png mention path
+  now works for gemma3 — the ViT stays loaded for the session, mentions
+  encode on the GPU ViT, and inject via the shared imageTurn (ImageChat is
+  now a per-arch union; the segment wrapping is family-aware).
+  VULKAN (2026-07-14): `models/gemma3_gpu.zig` (VulkanLM, text-only, mirrors
+  qwen35_gpu) — sandwich norms, dual global/local RoPE tables (full
+  rotate-half via opRopeQwen35 half=hd/2), per-layer windowed attention,
+  GeGLU, tied head, host embed×sqrt(hidden). Two generalized Vulkan
+  primitives added: the `gelu_mul` eltwise kernel and a `window` arg on
+  `attn_decode_q35`/opAttnDecodeQ35 (kv_start = max(0, kv_len-window); 0 =
+  full causal, qwen35 caller passes 0). Validated on the 3090: greedy output
+  matches the CUDA/CPU path ("...Paris", count-prompt prefix identical).
+  Correctness-first — ~1.9 tok/s (12B; dispatch-bound, no batching, like the
+  rest of the Vulkan LLM path); perf is the follow-up.
+  VULKAN VISION (2026-07-14): `models/gemma_vit_gpu.zig` (VitGpu) runs the 27
+  SigLIP blocks device-side on Vulkan; the projector stays on host (shared
+  Vit.project). Vulkan has no f16 GEMM, so the block weights dequantize to
+  f32 once at load and feed the f32 opMatmul (+bias). Three eltwise kernels
+  added: `layernorm` (LN+bias — SigLIP; Vulkan only had RMSNorm), `gelu`
+  (plain tanh-gelu), and `attn_full` (full non-causal attention, arbitrary
+  head_dim — the existing `attention` kernel needs hd%32). `tp-llm --backend
+  vulkan --mmproj m.gguf --image a.png` one-shot; the SigLIP encode is
+  ~23.7s (per-op submit, f32 GEMMs — one-time, correctness-first) vs 0.4s
+  CUDA. Interactive @image on Vulkan is not wired (one-shot only). Validated:
+  Vulkan caption byte-identical to the CUDA/CPU ViT ("A red fox sits alertly
+  in a snowy forest, its ..."). gemma3 now runs on ALL backends incl. vision.
 - ~~GGUF import~~ — DONE (2026-07): `src/gguf.zig` (container, llama.cpp→HF
   name canonicalization, config from `qwen3.*` metadata), `src/quants.zig`
   (Q8_0/Q4_K/Q5_K/Q6_K dequant, bit-exact vs ggml-quants.c golden fixtures),

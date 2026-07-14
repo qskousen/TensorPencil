@@ -258,6 +258,23 @@ pub fn main(init: std.process.Init) !void {
         return runQwen35(arena, gpa, io, &st.gguf, backend, vram_budget, cpu_split, dynamic_offload, image_path, mmproj_path, prompt, system, opts, profile, debug_batch, stdout);
     }
 
+    // Gemma 3 (sandwich norms, dual local/global RoPE): its own CPU model.
+    if (st == .gguf and st.gguf.getStr("general.architecture") != null and
+        std.mem.eql(u8, st.gguf.getStr("general.architecture").?, "gemma3"))
+    {
+        if (draft_path != null or eagle_path != null or opts.spec_k > 0 or opts.tree_nodes > 0) {
+            try stdout.writeAll("speculative decoding is not supported for gemma3 models yet\n");
+            try stdout.flush();
+            return error.InvalidArgument;
+        }
+        if (cpu_split != null or dynamic_offload) {
+            try stdout.writeAll("--cpu-layers / --offload-grow is only supported for qwen35 models\n");
+            try stdout.flush();
+            return error.InvalidArgument;
+        }
+        return runGemma3(arena, gpa, io, &st.gguf, backend, vram_budget, image_path, mmproj_path, prompt, system, opts, profile, stdout);
+    }
+
     if (cpu_split != null or dynamic_offload) {
         try stdout.writeAll("--cpu-layers / --offload-grow (hybrid CPU/GPU split) is only supported for qwen35 (Qwen3.5/3.6) models for now\n");
         try stdout.flush();
@@ -508,9 +525,11 @@ pub fn main(init: std.process.Init) !void {
 
 /// Session-lifetime vision context for @image mentions in interactive
 /// turns (qwen35 on the CUDA backends).
-const ImageChat = struct {
-    vit: *const TensorPencil.models.vit35.Vit,
-    be: *TensorPencil.gpu.cuda.Backend,
+/// The session's vision tower + backend for interactive @image mentions,
+/// one variant per architecture (Qwen3-VL's ViT vs Gemma 3's SigLIP tower).
+const ImageChat = union(enum) {
+    qwen35: struct { vit: *const TensorPencil.models.vit35.Vit, be: *TensorPencil.gpu.cuda.Backend },
+    gemma3: struct { vit: *const TensorPencil.models.gemma_vit.Vit, be: *TensorPencil.gpu.cuda.Backend, io: Io },
 };
 
 /// Build and prefill an interactive turn containing @image mentions:
@@ -543,10 +562,13 @@ fn imageTurn(
             return false;
         };
 
-        var encs: std.ArrayList(TensorPencil.models.vit35.Vit.Encoded) = .empty;
+        // Encoded image (embeds owned by gpa), arch-independent so both
+        // vision towers feed the same prefill loop.
+        const Img = struct { embeds: []f32, grid_w: usize, grid_h: usize };
+        var imgs: std.ArrayList(Img) = .empty;
         defer {
-            for (encs.items) |*e| e.deinit(gpa);
-            encs.deinit(gpa);
+            for (imgs.items) |im| gpa.free(im.embeds);
+            imgs.deinit(gpa);
         }
         var segs: std.ArrayList(llm.chat.Segment) = .empty;
         defer segs.deinit(gpa);
@@ -558,11 +580,19 @@ fn imageTurn(
                     return false;
                 };
                 defer gpa.free(dec.pixels);
-                try encs.ensureUnusedCapacity(gpa, 1);
-                const enc = try TensorPencil.models.vit35_cuda.encode(ic.vit, ic.be, gpa, dec.pixels, dec.width, dec.height);
-                encs.appendAssumeCapacity(enc);
-                try segs.append(gpa, .{ .image = .{ .grid_w = enc.grid_w, .grid_h = enc.grid_h } });
-                try stdout.print("[{s}: {d}x{d} -> {d} rows]\n", .{ path, dec.width, dec.height, enc.grid_w * enc.grid_h });
+                const im: Img = switch (ic) {
+                    .qwen35 => |q| blk: {
+                        const e = try TensorPencil.models.vit35_cuda.encode(q.vit, q.be, gpa, dec.pixels, dec.width, dec.height);
+                        break :blk .{ .embeds = e.embeds, .grid_w = e.grid_w, .grid_h = e.grid_h };
+                    },
+                    .gemma3 => |g| blk: {
+                        const e = try TensorPencil.models.gemma_vit_cuda.encode(g.vit, g.be, g.io, gpa, dec.pixels, dec.width, dec.height);
+                        break :blk .{ .embeds = e.embeds, .grid_w = e.grid_w, .grid_h = e.grid_h };
+                    },
+                };
+                try imgs.append(gpa, im);
+                try segs.append(gpa, .{ .image = .{ .grid_w = im.grid_w, .grid_h = im.grid_h } });
+                try stdout.print("[{s}: {d}x{d} -> {d} rows]\n", .{ path, dec.width, dec.height, im.grid_w * im.grid_h });
                 try stdout.flush();
             },
         };
@@ -585,10 +615,10 @@ fn imageTurn(
         // Interleave text prefill with the image embeddings, exactly like
         // the one-shot --image path; the engine's generate() prefills the
         // remaining tail from cached().
-        for (image_rows.items, encs.items) |row, e| {
+        for (image_rows.items, imgs.items) |row, im| {
             const pending = ids.items[model.cached()..row];
             if (pending.len > 0) try model.prefill(pending);
-            try model.prefillImage(e.embeds, e.grid_w, e.grid_h);
+            try model.prefillImage(im.embeds, im.grid_w, im.grid_h);
         }
         return true;
     }
@@ -815,7 +845,7 @@ fn runQwen35(
         vit = try TensorPencil.models.vit35.Vit.load(arena, &mmg.?);
     }
     const img_chat: ?ImageChat = if (vit != null and be_cuda != null and !debug_cpu_vit)
-        .{ .vit = &vit.?, .be = be_cuda.? }
+        .{ .qwen35 = .{ .vit = &vit.?, .be = be_cuda.? } }
     else
         null;
 
@@ -829,7 +859,7 @@ fn runQwen35(
         defer gpa.free(dec.pixels);
         const t_vit = Io.Clock.real.now(io).nanoseconds;
         img = if (img_chat) |ic|
-            try TensorPencil.models.vit35_cuda.encode(ic.vit, ic.be, gpa, dec.pixels, dec.width, dec.height)
+            try TensorPencil.models.vit35_cuda.encode(ic.qwen35.vit, ic.qwen35.be, gpa, dec.pixels, dec.width, dec.height)
         else
             try vit.?.encode(io, gpa, dec.pixels, dec.width, dec.height);
         const vit_s = @as(f64, @floatFromInt(Io.Clock.real.now(io).nanoseconds - t_vit)) / 1e9;
@@ -1015,6 +1045,207 @@ fn runQwen35(
         },
     };
     const t_end = Io.Clock.real.now(io).nanoseconds;
+    const setup_s = @as(f64, @floatFromInt(t0 - t_init)) / 1e9;
+    const elapsed_s = @as(f64, @floatFromInt(t_end - t0)) / 1e9;
+    if (prompt != null) {
+        try stdout.print("\n\n[{d} tokens in {d:.1}s, {d:.2} tok/s; setup {d:.1}s]\n", .{
+            n, elapsed_s, @as(f64, @floatFromInt(n)) / elapsed_s, setup_s,
+        });
+    } else {
+        try stdout.print("[session over: {d} tokens generated; setup was {d:.1}s]\n", .{ n, setup_s });
+    }
+    try stdout.flush();
+}
+
+/// One-shot / chat session for a Gemma 3 model (cpu / zig-cuda / cuda,
+/// text-only).
+fn runGemma3(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    io: Io,
+    g: *const TensorPencil.Gguf,
+    backend: BackendKind,
+    vram_budget: u64,
+    image_path: ?[]const u8,
+    mmproj_path: ?[]const u8,
+    prompt: ?[]const u8,
+    system: ?[]const u8,
+    opts: llm.engine.Options,
+    profile: bool,
+    stdout: *Io.Writer,
+) !void {
+    if (image_path != null) {
+        if (mmproj_path == null) {
+            try stdout.writeAll("--image requires --mmproj <mmproj.gguf> (the SigLIP vision tower ships separately)\n");
+            try stdout.flush();
+            return error.InvalidArgument;
+        }
+        if (prompt == null) {
+            try stdout.writeAll("--image requires --prompt (one-shot captioning)\n");
+            try stdout.flush();
+            return error.InvalidArgument;
+        }
+    }
+    const gemma3 = TensorPencil.models.gemma3;
+    var lm = try gemma3.Model.load(arena, g);
+    defer lm.deinit();
+    var tok = try TensorPencil.tokenizer.Tokenizer.initFromGguf(arena, g);
+    defer tok.deinit();
+    llm.chat.applyTokenizer(&tok);
+    llm.chat.setFamily(.gemma);
+
+    // CUDA backend created up front (so the ViT can encode before the LLM
+    // claims VRAM); null on cpu. Budget/pinning set here for the session.
+    const cuda_be = TensorPencil.gpu.cuda.Backend;
+    const be_cuda: ?*cuda_be = switch (backend) {
+        .cuda => try cuda_be.initLibs(arena),
+        .@"zig-cuda" => try cuda_be.init(arena),
+        else => null,
+    };
+    defer if (be_cuda) |b| b.deinit();
+    if (be_cuda) |b| {
+        b.profile = profile;
+        const eff_budget = defaultWeightBudget(b, vram_budget);
+        b.budget_override = vram_budget;
+        b.pin_budget = eff_budget -| pin_slack;
+        b.stream_window = @min(pin_slack, eff_budget);
+        if (vram_budget != 0) if (g.mapping) |m| b.enableDirectStreaming(m);
+    }
+    // Vulkan context created up front too (shared by the ViT and the LLM).
+    const vk_ctx: ?*TensorPencil.gpu.Context = if (backend == .vulkan) try TensorPencil.gpu.Context.init(arena) else null;
+    defer if (vk_ctx) |c| c.deinit();
+
+    // Vision tower stays loaded for the whole session (--mmproj): --image
+    // encodes up front (one-shot). The projected embeddings are injected
+    // UNSCALED during prefill. On CUDA the tower runs device-side (GPU ViT)
+    // and interactive @path.png mentions are supported; on Vulkan --image
+    // runs the SigLIP blocks device-side too (gemma_vit_gpu).
+    var mmg: ?TensorPencil.Gguf = null;
+    defer if (mmg) |*mg| mg.deinit();
+    var vit: ?TensorPencil.models.gemma_vit.Vit = null;
+    defer if (vit) |*v| v.deinit();
+    var vit_gpu: ?TensorPencil.models.gemma_vit_gpu.VitGpu = null;
+    defer if (vit_gpu) |*v| v.deinit();
+    if (mmproj_path) |mp| {
+        mmg = try TensorPencil.Gguf.open(arena, io, mp);
+        vit = try TensorPencil.models.gemma_vit.Vit.load(arena, &mmg.?);
+        if (vk_ctx != null) vit_gpu = try TensorPencil.models.gemma_vit_gpu.VitGpu.load(arena, &vit.?);
+    }
+    const img_chat: ?ImageChat = if (vit != null and be_cuda != null)
+        .{ .gemma3 = .{ .vit = &vit.?, .be = be_cuda.?, .io = io } }
+    else
+        null;
+
+    var img: ?TensorPencil.models.gemma_vit.Vit.Encoded = null;
+    defer if (img) |*e| e.deinit(gpa);
+    if (image_path) |ip| {
+        const dec = try vips.loadRgb(gpa, ip);
+        defer gpa.free(dec.pixels);
+        const t_vit = Io.Clock.real.now(io).nanoseconds;
+        img = if (be_cuda) |b|
+            try TensorPencil.models.gemma_vit_cuda.encode(&vit.?, b, io, gpa, dec.pixels, dec.width, dec.height)
+        else if (vk_ctx) |c|
+            try vit_gpu.?.encode(c, io, gpa, dec.pixels, dec.width, dec.height)
+        else
+            try vit.?.encode(io, gpa, dec.pixels, dec.width, dec.height);
+        const dev = if (be_cuda != null or vk_ctx != null) "gpu" else "cpu";
+        const vit_s = @as(f64, @floatFromInt(Io.Clock.real.now(io).nanoseconds - t_vit)) / 1e9;
+        try stdout.print("[image {d}x{d} -> {d} tokens; vit {d:.1}s ({s})]\n", .{ dec.width, dec.height, img.?.grid_w * img.?.grid_h, vit_s, dev });
+        try stdout.flush();
+    }
+
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(gpa);
+    // Gemma prompts begin with a single BOS ({{ bos_token }} in the template).
+    if (tok.specialId("<bos>")) |bos| try ids.append(gpa, bos);
+    // Rows before the image block, and the block's soft-token count — the
+    // one-shot prefill interleaves text / image / text around them.
+    var n_pre: usize = 0;
+    var n_img: usize = 0;
+    if (img) |*e| {
+        n_img = e.grid_w * e.grid_h;
+        try tok.encode(gpa, "<start_of_turn>user\n", &ids);
+        try tok.encode(gpa, "<start_of_image>", &ids);
+        n_pre = ids.items.len;
+        try ids.appendNTimes(gpa, tok.specialId("<image_soft_token>") orelse return error.MissingImageToken, n_img);
+        try tok.encode(gpa, "<end_of_image>", &ids);
+        try tok.encode(gpa, prompt.?, &ids);
+        try tok.encode(gpa, "<end_of_turn>\n", &ids);
+        try llm.chat.openAssistant(&tok, gpa, &ids);
+    } else {
+        if (system) |s| try llm.chat.appendSystem(&tok, gpa, s, &ids);
+        if (prompt) |p| {
+            try llm.chat.appendUser(&tok, gpa, p, &ids);
+            try llm.chat.openAssistant(&tok, gpa, &ids);
+        }
+    }
+
+    try stdout.print("[{s} backend, gemma3 {d}L, {d} prompt tokens, ctx window {d}, max {d} new/turn, temp {d:.2}, seed {d}]\n", .{
+        @tagName(backend), lm.cfg.n_layers, ids.items.len, opts.max_context, opts.max_new_tokens, opts.sampling.temperature, opts.seed,
+    });
+    if (prompt == null) {
+        try stdout.writeAll("[interactive chat: Enter sends, Shift- or Alt-Enter adds a line, /exit or Ctrl-D quits]\n");
+        if (img_chat != null) try stdout.writeAll("[attach images with @path.jpg / @\"path with spaces.png\" (png/jpeg/webp/gif/tiff), anywhere in a message]\n");
+    }
+    try stdout.writeAll("\n");
+    try stdout.flush();
+
+    const cap = try capacityPlan(opts, prompt, ids.items.len, false);
+    if (profile) {
+        TensorPencil.prof.reset();
+        TensorPencil.prof.enabled = true;
+    }
+    defer if (profile) TensorPencil.prof.report(stdout) catch {};
+
+    const t_init = Io.Clock.real.now(io).nanoseconds;
+    var t0: i96 = undefined;
+    const n = switch (backend) {
+        .cpu => blk: {
+            if (vram_budget != 0) try stdout.writeAll("[--vram-budget ignored on the cpu backend]\n");
+            var model = try gemma3.CpuModel.init(gpa, &lm, cap);
+            defer model.deinit();
+            model.io = io; // image prefill runs before the first step
+            if (img) |*e| {
+                try model.prefill(ids.items[0..n_pre]);
+                try model.prefillImage(e.embeds, e.grid_w, e.grid_h);
+                try model.prefill(ids.items[n_pre + n_img .. ids.items.len - 1]);
+            }
+            t0 = Io.Clock.real.now(io).nanoseconds;
+            break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt, img_chat);
+        },
+        .@"zig-cuda", .cuda => blk: {
+            const be = be_cuda.?; // created up front (budget/pinning set there)
+            var model = try TensorPencil.models.gemma3_cuda.CudaLM.init(gpa, be, &lm, cap);
+            defer model.deinit();
+            if (img) |*e| {
+                try model.prefill(ids.items[0..n_pre]);
+                try model.prefillImage(e.embeds, e.grid_w, e.grid_h);
+                try model.prefill(ids.items[n_pre + n_img .. ids.items.len - 1]);
+            }
+            t0 = Io.Clock.real.now(io).nanoseconds;
+            break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt, img_chat);
+        },
+        .vulkan => blk: {
+            const ctx = vk_ctx.?; // created up front (shared with the ViT)
+            // Vulkan reserves the whole KV window up front and never evicts
+            // pinned weights, so leave that window's VRAM unpinned.
+            const kv_window = 2 * lm.cfg.n_layers * cap.max * lm.cfg.kvDim() * 4;
+            const eff = if (vram_budget != 0) vram_budget else ctx.liveVram() -| kv_window;
+            ctx.budget_override = vram_budget;
+            ctx.pin_budget = eff -| pin_slack;
+            var model = try TensorPencil.models.gemma3_gpu.VulkanLM.init(gpa, ctx, &lm, cap);
+            defer model.deinit();
+            if (img) |*e| {
+                try model.prefill(ids.items[0..n_pre]);
+                try model.prefillImage(e.embeds, e.grid_w, e.grid_h);
+                try model.prefill(ids.items[n_pre + n_img .. ids.items.len - 1]);
+            }
+            t0 = Io.Clock.real.now(io).nanoseconds;
+            break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt, null);
+        },
+    };
+    const t_end = Io.Clock.real.now(io).nanoseconds;
+
     const setup_s = @as(f64, @floatFromInt(t0 - t_init)) / 1e9;
     const elapsed_s = @as(f64, @floatFromInt(t_end - t0)) / 1e9;
     if (prompt != null) {

@@ -214,6 +214,11 @@ pub const Gguf = struct {
             slot.value_ptr.* = value; // duplicate keys: last wins, like llama.cpp
         }
 
+        const arch: []const u8 = if (kv.get("general.architecture")) |v|
+            (if (v == .str) v.str else "")
+        else
+            "";
+
         var alignment: usize = 32;
         if (kv.get("general.alignment")) |v| switch (v) {
             .uint => |a| if (a != 0 and std.math.isPowerOfTwo(a)) {
@@ -246,7 +251,7 @@ pub const Gguf = struct {
             if (ne[0] % dt.blockElems() != 0) return error.InvalidShape;
             if (offset % alignment != 0) return error.InvalidOffsets;
             ri.* = .{
-                .name = try canonicalName(alloc, raw_name),
+                .name = try canonicalName(alloc, raw_name, arch),
                 .dt = dt,
                 .shape = .{ .dims = dims, .rank = n_dims },
                 .offset = @intCast(offset),
@@ -383,11 +388,33 @@ const layer_suffix_map = [_][2][]const u8{
     .{ "ffn_down.weight", "mlp.down_proj.weight" },
 };
 
+/// Gemma 3 layer-tensor suffixes -> HF-style suffixes. Gemma's "sandwich"
+/// norms mean `ffn_norm` is the PRE-feedforward norm (not the post-attention
+/// norm as in the Qwen/llama map above), and it carries two extra norms
+/// (`post_attention_norm`, `post_ffw_norm`) that would otherwise collide.
+const gemma3_layer_suffix_map = [_][2][]const u8{
+    .{ "attn_norm.weight", "input_layernorm.weight" },
+    .{ "attn_q.weight", "self_attn.q_proj.weight" },
+    .{ "attn_k.weight", "self_attn.k_proj.weight" },
+    .{ "attn_v.weight", "self_attn.v_proj.weight" },
+    .{ "attn_output.weight", "self_attn.o_proj.weight" },
+    .{ "attn_q_norm.weight", "self_attn.q_norm.weight" },
+    .{ "attn_k_norm.weight", "self_attn.k_norm.weight" },
+    .{ "post_attention_norm.weight", "post_attention_layernorm.weight" },
+    .{ "ffn_norm.weight", "pre_feedforward_layernorm.weight" },
+    .{ "post_ffw_norm.weight", "post_feedforward_layernorm.weight" },
+    .{ "ffn_gate.weight", "mlp.gate_proj.weight" },
+    .{ "ffn_up.weight", "mlp.up_proj.weight" },
+    .{ "ffn_down.weight", "mlp.down_proj.weight" },
+};
+
 /// Translate a llama.cpp tensor name to the HF-style name the model loaders
-/// use (prefix-less, e.g. "layers.3.self_attn.q_proj.weight"). Names that
-/// don't match the convention (including ComfyUI-style GGUFs that already
-/// carry HF names) pass through unchanged.
-pub fn canonicalName(alloc: std.mem.Allocator, raw: []const u8) ![]const u8 {
+/// use (prefix-less, e.g. "layers.3.self_attn.q_proj.weight"). The per-layer
+/// suffix map is `arch`-dependent (gemma3 differs from the Qwen/llama
+/// family — see gemma3_layer_suffix_map). Names that don't match the
+/// convention (including ComfyUI-style GGUFs that already carry HF names)
+/// pass through unchanged.
+pub fn canonicalName(alloc: std.mem.Allocator, raw: []const u8, arch: []const u8) ![]const u8 {
     if (std.mem.eql(u8, raw, "token_embd.weight")) return "embed_tokens.weight";
     if (std.mem.eql(u8, raw, "output_norm.weight")) return "norm.weight";
     if (std.mem.eql(u8, raw, "output.weight")) return "lm_head.weight";
@@ -397,7 +424,11 @@ pub fn canonicalName(alloc: std.mem.Allocator, raw: []const u8) ![]const u8 {
         const layer = rest[0..dot];
         const suffix = rest[dot + 1 ..];
         _ = std.fmt.parseInt(u32, layer, 10) catch return raw;
-        for (layer_suffix_map) |entry| {
+        const map: []const [2][]const u8 = if (std.mem.eql(u8, arch, "gemma3"))
+            &gemma3_layer_suffix_map
+        else
+            &layer_suffix_map;
+        for (map) |entry| {
             if (std.mem.eql(u8, suffix, entry[0])) {
                 return std.fmt.allocPrint(alloc, "layers.{s}.{s}", .{ layer, entry[1] });
             }
@@ -605,28 +636,47 @@ test "canonical name translation" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    try std.testing.expectEqualStrings("embed_tokens.weight", try canonicalName(alloc, "token_embd.weight"));
-    try std.testing.expectEqualStrings("lm_head.weight", try canonicalName(alloc, "output.weight"));
-    try std.testing.expectEqualStrings("norm.weight", try canonicalName(alloc, "output_norm.weight"));
+    try std.testing.expectEqualStrings("embed_tokens.weight", try canonicalName(alloc, "token_embd.weight", "qwen3"));
+    try std.testing.expectEqualStrings("lm_head.weight", try canonicalName(alloc, "output.weight", "qwen3"));
+    try std.testing.expectEqualStrings("norm.weight", try canonicalName(alloc, "output_norm.weight", "qwen3"));
     try std.testing.expectEqualStrings(
         "layers.17.mlp.down_proj.weight",
-        try canonicalName(alloc, "blk.17.ffn_down.weight"),
+        try canonicalName(alloc, "blk.17.ffn_down.weight", "qwen3"),
     );
     try std.testing.expectEqualStrings(
         "layers.0.self_attn.k_norm.weight",
-        try canonicalName(alloc, "blk.0.attn_k_norm.weight"),
+        try canonicalName(alloc, "blk.0.attn_k_norm.weight", "qwen3"),
     );
     // Unmapped blk suffixes keep their name under the layers.N. prefix;
     // non-blk names pass through.
-    try std.testing.expectEqualStrings("layers.0.ssm_conv1d.weight", try canonicalName(alloc, "blk.0.ssm_conv1d.weight"));
-    try std.testing.expectEqualStrings("layers.5.ssm_dt.bias", try canonicalName(alloc, "blk.5.ssm_dt.bias"));
+    try std.testing.expectEqualStrings("layers.0.ssm_conv1d.weight", try canonicalName(alloc, "blk.0.ssm_conv1d.weight", "qwen35"));
+    try std.testing.expectEqualStrings("layers.5.ssm_dt.bias", try canonicalName(alloc, "blk.5.ssm_dt.bias", "qwen35"));
     try std.testing.expectEqualStrings(
         "layers.2.post_attention_layernorm.weight",
-        try canonicalName(alloc, "blk.2.post_attention_norm.weight"),
+        try canonicalName(alloc, "blk.2.post_attention_norm.weight", "qwen3"),
     );
     try std.testing.expectEqualStrings(
         "layers.3.self_attn.q_proj.weight",
-        try canonicalName(alloc, "layers.3.self_attn.q_proj.weight"),
+        try canonicalName(alloc, "layers.3.self_attn.q_proj.weight", "qwen3"),
+    );
+
+    // Gemma 3: the two extra norms must NOT collide, and ffn_norm is the
+    // PRE-feedforward norm (not post-attention as in the Qwen/llama map).
+    try std.testing.expectEqualStrings(
+        "layers.0.pre_feedforward_layernorm.weight",
+        try canonicalName(alloc, "blk.0.ffn_norm.weight", "gemma3"),
+    );
+    try std.testing.expectEqualStrings(
+        "layers.0.post_attention_layernorm.weight",
+        try canonicalName(alloc, "blk.0.post_attention_norm.weight", "gemma3"),
+    );
+    try std.testing.expectEqualStrings(
+        "layers.0.post_feedforward_layernorm.weight",
+        try canonicalName(alloc, "blk.0.post_ffw_norm.weight", "gemma3"),
+    );
+    try std.testing.expectEqualStrings(
+        "layers.7.self_attn.o_proj.weight",
+        try canonicalName(alloc, "blk.7.attn_output.weight", "gemma3"),
     );
 }
 
