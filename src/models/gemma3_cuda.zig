@@ -22,6 +22,8 @@ const qwen3 = @import("qwen3.zig");
 const cuda = @import("../gpu/cuda.zig");
 const ops = @import("../ops.zig");
 const kvmod = @import("../llm/kv_cache.zig");
+const transformer = @import("transformer.zig");
+const transformer_gpu = @import("transformer_gpu.zig");
 
 const Backend = cuda.Backend;
 const Buf = cuda.backend.DeviceBuffer;
@@ -569,12 +571,93 @@ pub const CudaLM = struct {
     /// One batched forward over `n` pre-embedded input rows `x_host`
     /// ([n*hidden]) at positions [len, len+n). When `logits` is set, the last
     /// row's final-normed hidden feeds the LM head. Advances len by n.
+    // --- transformer_gpu.decoderLayer stepper methods (faithful lift of the
+    // former forwardRows device path; the hybrid CPU-split stays a loop-top
+    // hook). ---
+
+    pub fn normInput(self: *CudaLM, layer: anytype, seq: usize) !void {
+        const cfg = self.cfg;
+        try self.be.qkNorm(self.bufs.x, self.bufs.normed, try nbuf(self.be, layer.input_norm), seq, cfg.hidden, cfg.rms_eps);
+    }
+    pub fn projectQKV(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
+        _ = l; // gemma3: uniform geometry
+        const cfg = self.cfg;
+        const b = &self.bufs;
+        try self.linear(b.q, b.normed, layer.q, cfg.qDim(), cfg.hidden, seq);
+        try self.linear(b.k, b.normed, layer.k, cfg.kvDim(), cfg.hidden, seq);
+        try self.linear(b.v, b.normed, layer.v, cfg.kvDim(), cfg.hidden, seq);
+    }
+    pub fn normQK(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
+        _ = l;
+        const cfg = self.cfg;
+        const b = &self.bufs;
+        try self.be.qkNorm(b.q, b.q, try nbuf(self.be, layer.q_norm), seq * cfg.n_heads, cfg.head_dim, cfg.rms_eps);
+        try self.be.qkNorm(b.k, b.k, try nbuf(self.be, layer.k_norm), seq * cfg.n_kv_heads, cfg.head_dim, cfg.rms_eps);
+    }
+    pub fn applyRope(self: *CudaLM, l: usize, seq: usize, pos0: usize) !void {
+        const cfg = self.cfg;
+        const b = &self.bufs;
+        const freqs = if (cfg.isGlobal(l)) self.freqs_global else self.freqs_local;
+        try self.be.ropeHalf(b.q, freqs, seq, cfg.n_heads, cfg.head_dim / 2, self.sin_off, pos0);
+        try self.be.ropeHalf(b.k, freqs, seq, cfg.n_kv_heads, cfg.head_dim / 2, self.sin_off, pos0);
+    }
+    pub fn appendKV(self: *CudaLM, l: usize, seq: usize, pos0: usize) !void {
+        const cfg = self.cfg;
+        const b = &self.bufs;
+        try self.be.tensorCopy(self.k_cache[l].buf, pos0 * cfg.kvDim() * 4, b.k, 0, seq * cfg.kvDim() * 4);
+        try self.be.tensorCopy(self.v_cache[l].buf, pos0 * cfg.kvDim() * 4, b.v, 0, seq * cfg.kvDim() * 4);
+    }
+    pub fn attention(self: *CudaLM, l: usize, seq: usize, pos0: usize) !void {
+        const cfg = self.cfg;
+        const b = &self.bufs;
+        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
+        const window: usize = if (cfg.isGlobal(l)) 0 else cfg.sliding_window;
+        const ns: usize = if (seq == 1) nsplit else nsplit_prefill;
+        try self.be.opAttnDecode(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, pos0 + 1, seq, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, ns, scale, window);
+    }
+    pub fn projectO(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
+        _ = l;
+        const cfg = self.cfg;
+        try self.linear(self.bufs.t, self.bufs.attn, layer.o, cfg.hidden, cfg.qDim(), seq);
+    }
+    pub fn postAttnNorm(self: *CudaLM, layer: anytype, seq: usize) !void {
+        const cfg = self.cfg;
+        try self.be.qkNorm(self.bufs.t, self.bufs.t, try nbuf(self.be, layer.post_attn_norm), seq, cfg.hidden, cfg.rms_eps);
+    }
+    pub fn addResidual(self: *CudaLM, seq: usize) !void {
+        try self.be.opAdd(self.bufs.x, self.bufs.t, seq * self.cfg.hidden);
+    }
+    pub fn normPreFfn(self: *CudaLM, layer: anytype, seq: usize) !void {
+        const cfg = self.cfg;
+        try self.be.qkNorm(self.bufs.x, self.bufs.normed, try nbuf(self.be, layer.pre_ffn_norm), seq, cfg.hidden, cfg.rms_eps);
+    }
+    pub fn projectGateUp(self: *CudaLM, layer: anytype, seq: usize) !void {
+        const cfg = self.cfg;
+        const b = &self.bufs;
+        try self.linear(b.gate, b.normed, layer.gate, cfg.intermediate, cfg.hidden, seq);
+        try self.linear(b.up, b.normed, layer.up, cfg.intermediate, cfg.hidden, seq);
+    }
+    pub fn activate(self: *CudaLM, comptime act: transformer.Activation, seq: usize) !void {
+        const n = seq * self.cfg.intermediate;
+        switch (act) {
+            .silu_mul => try self.be.siluMul(self.bufs.gate, self.bufs.up, n),
+            .gelu_tanh_mul => try self.be.geluMul(self.bufs.gate, self.bufs.up, n),
+        }
+    }
+    pub fn projectDown(self: *CudaLM, layer: anytype, seq: usize) !void {
+        const cfg = self.cfg;
+        try self.linear(self.bufs.t, self.bufs.gate, layer.down, cfg.hidden, cfg.intermediate, seq);
+    }
+    pub fn postFfnNorm(self: *CudaLM, layer: anytype, seq: usize) !void {
+        const cfg = self.cfg;
+        try self.be.qkNorm(self.bufs.t, self.bufs.t, try nbuf(self.be, layer.post_ffn_norm), seq, cfg.hidden, cfg.rms_eps);
+    }
+
     fn forwardRows(self: *CudaLM, x_host: []const f32, logits: ?[]f32) !void {
         const be = self.be;
         const cfg = self.cfg;
         const b = &self.bufs;
         const n = x_host.len / cfg.hidden;
-        const hd = cfg.head_dim;
         const eps = cfg.rms_eps;
         const pos0 = self.len;
         std.debug.assert(n >= 1 and n <= prefill_chunk and n <= self.remaining());
@@ -587,7 +670,6 @@ pub const CudaLM = struct {
         // Hybrid split: each chunk begins with the hidden on the device (bufs.x).
         if (self.split) |*sp| sp.on_host = false;
 
-        const attn_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
         for (self.lm.layers, 0..) |*layer, l| {
             // Hybrid CPU/GPU split: run host-resident layers on the CPU via the
             // shared gemma3.layerForward, ferrying the hidden across the
@@ -607,36 +689,7 @@ pub const CudaLM = struct {
                     sp.on_host = false;
                 }
             }
-            const global = cfg.isGlobal(l);
-            const freqs = if (global) self.freqs_global else self.freqs_local;
-            const window: usize = if (global) 0 else cfg.sliding_window;
-
-            // --- Attention ---
-            try be.qkNorm(b.x, b.normed, try nbuf(be, layer.input_norm), n, cfg.hidden, eps);
-            try self.linear(b.q, b.normed, layer.q, cfg.qDim(), cfg.hidden, n);
-            try self.linear(b.k, b.normed, layer.k, cfg.kvDim(), cfg.hidden, n);
-            try self.linear(b.v, b.normed, layer.v, cfg.kvDim(), cfg.hidden, n);
-            try be.qkNorm(b.q, b.q, try nbuf(be, layer.q_norm), n * cfg.n_heads, hd, eps);
-            try be.qkNorm(b.k, b.k, try nbuf(be, layer.k_norm), n * cfg.n_kv_heads, hd, eps);
-            try be.ropeHalf(b.q, freqs, n, cfg.n_heads, hd / 2, self.sin_off, pos0);
-            try be.ropeHalf(b.k, freqs, n, cfg.n_kv_heads, hd / 2, self.sin_off, pos0);
-            try be.tensorCopy(self.k_cache[l].buf, pos0 * cfg.kvDim() * 4, b.k, 0, n * cfg.kvDim() * 4);
-            try be.tensorCopy(self.v_cache[l].buf, pos0 * cfg.kvDim() * 4, b.v, 0, n * cfg.kvDim() * 4);
-            const ns: usize = if (n == 1) nsplit else nsplit_prefill;
-            try be.opAttnDecode(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, pos0 + 1, n, cfg.n_heads, cfg.n_kv_heads, hd, ns, attn_scale, window);
-            // o_proj, then post-attention norm on the attn output BEFORE the residual.
-            try self.linear(b.t, b.attn, layer.o, cfg.hidden, cfg.qDim(), n);
-            try be.qkNorm(b.t, b.t, try nbuf(be, layer.post_attn_norm), n, cfg.hidden, eps);
-            try be.opAdd(b.x, b.t, n * cfg.hidden);
-
-            // --- MLP (GeGLU) ---
-            try be.qkNorm(b.x, b.normed, try nbuf(be, layer.pre_ffn_norm), n, cfg.hidden, eps);
-            try self.linear(b.gate, b.normed, layer.gate, cfg.intermediate, cfg.hidden, n);
-            try self.linear(b.up, b.normed, layer.up, cfg.intermediate, cfg.hidden, n);
-            try be.geluMul(b.gate, b.up, n * cfg.intermediate);
-            try self.linear(b.t, b.gate, layer.down, cfg.hidden, cfg.intermediate, n);
-            try be.qkNorm(b.t, b.t, try nbuf(be, layer.post_ffn_norm), n, cfg.hidden, eps);
-            try be.opAdd(b.x, b.t, n * cfg.hidden);
+            try transformer_gpu.decoderLayer(transformer.gemma3_spec, self, layer, l, n, pos0);
         }
 
         // If the last layers ran on the host (the `.attn`/`.tail` order migrates

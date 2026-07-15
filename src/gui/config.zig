@@ -75,6 +75,41 @@ pub const Preview = enum(u8) {
     }
 };
 
+/// Compute backend. Mirrors `pipeline.Backend`; kept here so the config data
+/// model stays free of an engine dependency (app.zig maps it across). Diffusion
+/// supports all four; the chat LLM only supports the two CUDA variants today
+/// (non-CUDA selections error at load — see chat.Session.init).
+pub const Backend = enum(u8) {
+    cpu,
+    vulkan,
+    zig_cuda,
+    cuda,
+
+    fn fromStr(s: []const u8) ?Backend {
+        inline for (@typeInfo(Backend).@"enum".fields) |f| {
+            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        }
+        return null;
+    }
+};
+
+/// VAE decode-path override for image generation. `auto` is the adaptive chain
+/// (whole-image → GPU-tiled → CPU-tiled with OOM fallback); the others force the
+/// starting strategy but still degrade gracefully on OOM (see pipeline.zig).
+pub const VaeDecode = enum(u8) {
+    auto,
+    whole,
+    gpu_tiled,
+    cpu_tiled,
+
+    fn fromStr(s: []const u8) ?VaeDecode {
+        inline for (@typeInfo(VaeDecode).@"enum".fields) |f| {
+            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        }
+        return null;
+    }
+};
+
 /// A fixed-capacity, nul-terminated text buffer. `data` is handed directly to
 /// dvui's `textEntry` as its backing store, so the buffer is the single source
 /// of truth for the edited value (no separate edit state).
@@ -161,6 +196,15 @@ pub const Config = struct {
     /// Who gets VRAM preference when chat and image generation compete. Default
     /// `balanced` — keep as much of both resident as fits, no per-image shuffling.
     vram_priority: Priority = .balanced,
+    /// Compute backend for the chat LLM. Only the CUDA variants work today
+    /// (non-CUDA errors cleanly at load). Changing it forces a reload.
+    llm_backend: Backend = .zig_cuda,
+    /// Compute backend for image generation. Independent of `llm_backend` — the
+    /// two run as separate backend objects, so e.g. LLM on CUDA + diffusion on
+    /// Vulkan is fine. Changing it rebuilds the diffusion session live.
+    diff_backend: Backend = .zig_cuda,
+    /// VAE decode-path override (see `VaeDecode`). Applied live like diff paths.
+    vae_decode: VaeDecode = .auto,
     system_prompt: TextBuf(max_prompt) = TextBuf(max_prompt).lit(default_system_prompt),
 
     /// The LLM side (model, vision tower, VRAM limit) matches. A change here
@@ -169,7 +213,8 @@ pub const Config = struct {
     pub fn llmReloadEql(a: *const Config, b: *const Config) bool {
         return pathEql(&a.llm_model, &b.llm_model) and
             pathEql(&a.vision_tower, &b.vision_tower) and
-            a.max_vram_gib == b.max_vram_gib;
+            a.max_vram_gib == b.max_vram_gib and
+            a.llm_backend == b.llm_backend;
     }
 
     /// The diffusion model set (dit/text-encoder/vae/taesd) matches. A change
@@ -180,6 +225,15 @@ pub const Config = struct {
             pathEql(&a.text_encoder, &b.text_encoder) and
             pathEql(&a.vae, &b.vae) and
             pathEql(&a.taesd, &b.taesd);
+    }
+
+    /// The full diffusion config (paths + backend + decode path) matches. A
+    /// change while the tool stays enabled rebuilds the diffusion session live
+    /// (deferred until the image queue drains); no LLM reload.
+    pub fn diffReloadEql(a: *const Config, b: *const Config) bool {
+        return diffPathsEql(a, b) and
+            a.diff_backend == b.diff_backend and
+            a.vae_decode == b.vae_decode;
     }
 
     /// Whether the image-generation tool is enabled: dit + text-encoder + VAE
@@ -250,6 +304,12 @@ pub const Config = struct {
             self.max_vram_gib = std.fmt.parseFloat(f32, val) catch self.max_vram_gib;
         } else if (std.mem.eql(u8, key, "vram_priority")) {
             if (Priority.fromStr(val)) |p| self.vram_priority = p;
+        } else if (std.mem.eql(u8, key, "llm_backend")) {
+            if (Backend.fromStr(val)) |b| self.llm_backend = b;
+        } else if (std.mem.eql(u8, key, "diff_backend")) {
+            if (Backend.fromStr(val)) |b| self.diff_backend = b;
+        } else if (std.mem.eql(u8, key, "vae_decode")) {
+            if (VaeDecode.fromStr(val)) |v| self.vae_decode = v;
         }
     }
 
@@ -281,6 +341,9 @@ pub const Config = struct {
             \\preview = {s}
             \\max_vram_gib = {d}
             \\vram_priority = {s}
+            \\llm_backend = {s}
+            \\diff_backend = {s}
+            \\vae_decode = {s}
             \\system_prompt = {s}
             \\
         , .{
@@ -290,7 +353,8 @@ pub const Config = struct {
             self.steps,                   self.width,
             self.height,                  @tagName(self.preview),
             self.max_vram_gib,            @tagName(self.vram_priority),
-            prompt_esc,
+            @tagName(self.llm_backend),   @tagName(self.diff_backend),
+            @tagName(self.vae_decode),    prompt_esc,
         });
         defer gpa.free(content);
 
@@ -368,6 +432,52 @@ test "apply parses max_vram_gib and vram_priority" {
     try std.testing.expectEqual(Priority.image, cfg.vram_priority);
 }
 
+test "apply parses backends and vae_decode, tolerates junk" {
+    var cfg: Config = .{};
+    // Defaults.
+    try std.testing.expectEqual(Backend.zig_cuda, cfg.llm_backend);
+    try std.testing.expectEqual(Backend.zig_cuda, cfg.diff_backend);
+    try std.testing.expectEqual(VaeDecode.auto, cfg.vae_decode);
+
+    cfg.apply("llm_backend", "cuda");
+    cfg.apply("diff_backend", "vulkan");
+    cfg.apply("vae_decode", "cpu_tiled");
+    try std.testing.expectEqual(Backend.cuda, cfg.llm_backend);
+    try std.testing.expectEqual(Backend.vulkan, cfg.diff_backend);
+    try std.testing.expectEqual(VaeDecode.cpu_tiled, cfg.vae_decode);
+
+    // Unrecognized values leave the field unchanged.
+    cfg.apply("diff_backend", "bogus");
+    cfg.apply("vae_decode", "sideways");
+    try std.testing.expectEqual(Backend.vulkan, cfg.diff_backend);
+    try std.testing.expectEqual(VaeDecode.cpu_tiled, cfg.vae_decode);
+}
+
+test "save/load round-trips the new backend + decode fields" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    // `path_override` is used verbatim and bypasses the known-folders lookup, so
+    // a plain relative file in cwd exercises the real save/load template path.
+    const file = ".gui-config-roundtrip-test";
+    defer std.Io.Dir.cwd().deleteFile(io, file) catch {};
+
+    var environ: Environ = .init(gpa); // unused with an override; just needs to exist
+    defer environ.deinit();
+
+    var a: Config = .{};
+    a.llm_model.set("/m.gguf");
+    a.llm_backend = .cuda;
+    a.diff_backend = .vulkan;
+    a.vae_decode = .gpu_tiled;
+    try a.save(io, gpa, &environ, file);
+
+    const b = Config.load(io, gpa, &environ, file);
+    try std.testing.expectEqual(Backend.cuda, b.llm_backend);
+    try std.testing.expectEqual(Backend.vulkan, b.diff_backend);
+    try std.testing.expectEqual(VaeDecode.gpu_tiled, b.vae_decode);
+    try std.testing.expectEqualStrings("/m.gguf", b.llm_model.opt().?);
+}
+
 test "llmReloadEql: LLM/vision/VRAM force reload; diff + live fields don't" {
     var a: Config = .{};
     var b: Config = .{};
@@ -392,6 +502,34 @@ test "llmReloadEql: LLM/vision/VRAM force reload; diff + live fields don't" {
     // VRAM-limit change: LLM reload required.
     b.max_vram_gib = 8;
     try std.testing.expect(!a.llmReloadEql(&b));
+    b.max_vram_gib = 0;
+    try std.testing.expect(a.llmReloadEql(&b));
+
+    // LLM backend change: LLM reload required.
+    b.llm_backend = .cuda;
+    try std.testing.expect(!a.llmReloadEql(&b));
+}
+
+test "diffReloadEql: diff paths, backend, and decode all trigger a diff rebuild" {
+    var a: Config = .{};
+    var b: Config = .{};
+    try std.testing.expect(a.diffReloadEql(&b));
+
+    // Diffusion-model path change.
+    b.diffusion_model.set("/dit.safetensors");
+    try std.testing.expect(!a.diffReloadEql(&b));
+    b = a;
+
+    // Diffusion backend change (but LLM side unaffected).
+    b.diff_backend = .vulkan;
+    try std.testing.expect(!a.diffReloadEql(&b));
+    try std.testing.expect(a.llmReloadEql(&b));
+    b = a;
+
+    // VAE decode-path change.
+    b.vae_decode = .cpu_tiled;
+    try std.testing.expect(!a.diffReloadEql(&b));
+    try std.testing.expect(a.llmReloadEql(&b));
 }
 
 test "diffEnabled requires dit + text-encoder + vae" {

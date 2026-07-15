@@ -21,6 +21,7 @@ const gguf_mod = @import("../gguf.zig");
 const test_gate = @import("../test_gate.zig");
 const weights_mod = @import("../weights.zig");
 const ops = @import("../ops.zig");
+const loader = @import("loader.zig");
 
 const Gguf = gguf_mod.Gguf;
 const WeightStore = weights_mod.WeightStore;
@@ -125,26 +126,26 @@ pub const Vit = struct {
         const alloc = arena.allocator();
 
         const kdim = 3 * cfg.patch * cfg.patch;
-        const w0 = try loadVec(alloc, store, "v.patch_embd.weight", cfg.dim * kdim);
-        const w1 = try loadVec(alloc, store, "v.patch_embd.weight.1", cfg.dim * kdim);
+        const w0 = try loader.vector(alloc, store, "v.patch_embd.weight", cfg.dim * kdim);
+        const w1 = try loader.vector(alloc, store, "v.patch_embd.weight.1", cfg.dim * kdim);
         const patch_w = try alloc.alloc(f32, cfg.dim * kdim);
         for (patch_w, w0, w1) |*o, a, b| o.* = a + b;
 
         const blocks = try alloc.alloc(Block, cfg.n_blocks);
         for (blocks, 0..) |*blk, i| {
             blk.* = .{
-                .ln1_w = try loadBlkVec(alloc, store, i, "ln1.weight", cfg.dim),
-                .ln1_b = try loadBlkVec(alloc, store, i, "ln1.bias", cfg.dim),
-                .qkv = try loadBlkMatrix(store, i, "attn_qkv.weight", 3 * cfg.dim, cfg.dim),
-                .qkv_b = try loadBlkVec(alloc, store, i, "attn_qkv.bias", 3 * cfg.dim),
-                .out = try loadBlkMatrix(store, i, "attn_out.weight", cfg.dim, cfg.dim),
-                .out_b = try loadBlkVec(alloc, store, i, "attn_out.bias", cfg.dim),
-                .ln2_w = try loadBlkVec(alloc, store, i, "ln2.weight", cfg.dim),
-                .ln2_b = try loadBlkVec(alloc, store, i, "ln2.bias", cfg.dim),
-                .up = try loadBlkMatrix(store, i, "ffn_up.weight", cfg.ffn, cfg.dim),
-                .up_b = try loadBlkVec(alloc, store, i, "ffn_up.bias", cfg.ffn),
-                .down = try loadBlkMatrix(store, i, "ffn_down.weight", cfg.dim, cfg.ffn),
-                .down_b = try loadBlkVec(alloc, store, i, "ffn_down.bias", cfg.dim),
+                .ln1_w = try loader.indexedVector(alloc, store, "v.blk.", i, "ln1.weight", cfg.dim),
+                .ln1_b = try loader.indexedVector(alloc, store, "v.blk.", i, "ln1.bias", cfg.dim),
+                .qkv = try loader.indexedMatrix(store, "v.blk.", i, "attn_qkv.weight", 3 * cfg.dim, cfg.dim),
+                .qkv_b = try loader.indexedVector(alloc, store, "v.blk.", i, "attn_qkv.bias", 3 * cfg.dim),
+                .out = try loader.indexedMatrix(store, "v.blk.", i, "attn_out.weight", cfg.dim, cfg.dim),
+                .out_b = try loader.indexedVector(alloc, store, "v.blk.", i, "attn_out.bias", cfg.dim),
+                .ln2_w = try loader.indexedVector(alloc, store, "v.blk.", i, "ln2.weight", cfg.dim),
+                .ln2_b = try loader.indexedVector(alloc, store, "v.blk.", i, "ln2.bias", cfg.dim),
+                .up = try loader.indexedMatrix(store, "v.blk.", i, "ffn_up.weight", cfg.ffn, cfg.dim),
+                .up_b = try loader.indexedVector(alloc, store, "v.blk.", i, "ffn_up.bias", cfg.ffn),
+                .down = try loader.indexedMatrix(store, "v.blk.", i, "ffn_down.weight", cfg.dim, cfg.ffn),
+                .down_b = try loader.indexedVector(alloc, store, "v.blk.", i, "ffn_down.bias", cfg.dim),
             };
         }
 
@@ -152,12 +153,12 @@ pub const Vit = struct {
         // All arena allocations must happen BEFORE `.arena = arena` copies
         // the arena state into the result — later allocations would extend a
         // buffer list the snapshot doesn't know about and leak at deinit.
-        const patch_b = try loadVec(alloc, store, "v.patch_embd.bias", cfg.dim);
-        const pos_embd = try loadVec(alloc, store, "v.position_embd.weight", cfg.pos_grid * cfg.pos_grid * cfg.dim);
-        const post_ln_w = try loadVec(alloc, store, "v.post_ln.weight", cfg.dim);
-        const post_ln_b = try loadVec(alloc, store, "v.post_ln.bias", cfg.dim);
-        const mm0_b = try loadVec(alloc, store, "mm.0.bias", merged_dim);
-        const mm2_b = try loadVec(alloc, store, "mm.2.bias", cfg.proj_dim);
+        const patch_b = try loader.vector(alloc, store, "v.patch_embd.bias", cfg.dim);
+        const pos_embd = try loader.vector(alloc, store, "v.position_embd.weight", cfg.pos_grid * cfg.pos_grid * cfg.dim);
+        const post_ln_w = try loader.vector(alloc, store, "v.post_ln.weight", cfg.dim);
+        const post_ln_b = try loader.vector(alloc, store, "v.post_ln.bias", cfg.dim);
+        const mm0_b = try loader.vector(alloc, store, "mm.0.bias", merged_dim);
+        const mm2_b = try loader.vector(alloc, store, "mm.2.bias", cfg.proj_dim);
         return .{
             .arena = arena,
             .cfg = cfg,
@@ -167,9 +168,9 @@ pub const Vit = struct {
             .blocks = blocks,
             .post_ln_w = post_ln_w,
             .post_ln_b = post_ln_b,
-            .mm0 = try loadMatrix(store, "mm.0.weight", merged_dim, merged_dim),
+            .mm0 = try loader.matrix(store, "mm.0.weight", merged_dim, merged_dim),
             .mm0_b = mm0_b,
-            .mm2 = try loadMatrix(store, "mm.2.weight", cfg.proj_dim, merged_dim),
+            .mm2 = try loader.matrix(store, "mm.2.weight", cfg.proj_dim, merged_dim),
             .mm2_b = mm2_b,
         };
     }
@@ -580,29 +581,6 @@ const Scratch = struct {
         s.* = undefined;
     }
 };
-
-fn loadMatrix(store: WeightStore, name: []const u8, rows: usize, cols: usize) !Weight {
-    const view = store.get(name) orelse return error.MissingTensor;
-    const shape = view.info.shape.slice();
-    if (shape.len != 2 or shape[0] != rows or shape[1] != cols) return error.ShapeMismatch;
-    return Weight.init(view.bytes, view.info.dtype, rows, cols);
-}
-
-fn loadBlkMatrix(store: WeightStore, i: usize, comptime suffix: []const u8, rows: usize, cols: usize) !Weight {
-    var buf: [64]u8 = undefined;
-    return loadMatrix(store, try std.fmt.bufPrint(&buf, "v.blk.{d}." ++ suffix, .{i}), rows, cols);
-}
-
-fn loadVec(alloc: std.mem.Allocator, store: WeightStore, name: []const u8, len: usize) ![]f32 {
-    const view = store.get(name) orelse return error.MissingTensor;
-    if (view.info.elemCount() != len) return error.ShapeMismatch;
-    return view.toF32Alloc(alloc);
-}
-
-fn loadBlkVec(alloc: std.mem.Allocator, store: WeightStore, i: usize, comptime suffix: []const u8, len: usize) ![]f32 {
-    var buf: [64]u8 = undefined;
-    return loadVec(alloc, store, try std.fmt.bufPrint(&buf, "v.blk.{d}." ++ suffix, .{i}), len);
-}
 
 // --- tests -----------------------------------------------------------------
 

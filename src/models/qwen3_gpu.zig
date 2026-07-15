@@ -18,6 +18,8 @@ const gpu = @import("../gpu/context.zig");
 const safetensors = @import("../safetensors.zig");
 const ops = @import("../ops.zig");
 const spec = @import("../llm/spec.zig");
+const transformer = @import("transformer.zig");
+const transformer_gpu = @import("transformer_gpu.zig");
 
 const hidden = qwen3.hidden;
 const n_heads = qwen3.n_heads;
@@ -496,132 +498,186 @@ pub const VulkanLM = struct {
         }
         try ctx.tensorUpload(self.bufs.x, std.mem.sliceAsBytes(x));
 
-        const b = &self.bufs;
         try ctx.beginBatch();
         errdefer if (ctx.batching) ctx.abortBatch();
 
         for (self.lm.layers, 0..) |layer, l| {
-            // --- Attention ---
-            try self.normWide(b.x, b.normed, try nbuf(ctx, layer.input_norm), seq);
-            if (seq == 1) {
-                // Group the q/k/v GEMV halves so no barrier drains the GPU
-                // between independent dispatches.
-                ctx.independent(3);
-                try ctx.opGemvPartial(b.normed, b.gemv_partials[0], layer.q.bytes, layer.q.dtype == .f8_e4m3, q_dim, hidden, gemv_nchunk);
-                try ctx.opGemvPartial(b.normed, b.gemv_partials[1], layer.k.bytes, layer.k.dtype == .f8_e4m3, kv_dim, hidden, gemv_nchunk);
-                try ctx.opGemvPartial(b.normed, b.gemv_partials[2], layer.v.bytes, layer.v.dtype == .f8_e4m3, kv_dim, hidden, gemv_nchunk);
-                ctx.independent(3);
-                try ctx.opGemvCombine(b.q, 0, b.gemv_partials[0], q_dim, layer.q.scale, gemv_nchunk);
-                try ctx.opGemvCombine(b.k, 0, b.gemv_partials[1], kv_dim, layer.k.scale, gemv_nchunk);
-                try ctx.opGemvCombine(b.v, 0, b.gemv_partials[2], kv_dim, layer.v.scale, gemv_nchunk);
-            } else {
-                try self.gemm(b.q, b.normed, seq, layer.q, q_dim, hidden);
-                try self.gemm(b.k, b.normed, seq, layer.k, kv_dim, hidden);
-                try self.gemm(b.v, b.normed, seq, layer.v, kv_dim, hidden);
-            }
-            if (seq == 1) ctx.independent(2);
-            try rmsnorm(ctx, b.q, b.q, try nbuf(ctx, layer.q_norm), seq * n_heads, hd);
-            try rmsnorm(ctx, b.k, b.k, try nbuf(ctx, layer.k_norm), seq * kv_heads, hd);
-            if (seq == 1) ctx.independent(2);
-            try ctx.opElt(.rope_half, b.q, null, self.freqs_d, null, .{
-                .u0 = @intCast(seq * n_heads * half),
-                .u1 = half,
-                .u2 = self.sin_off,
-                .u3 = n_heads,
-                .u4 = @intCast(pos0),
-            }, seq * n_heads * half, 1, 1);
-            try ctx.opElt(.rope_half, b.k, null, self.freqs_d, null, .{
-                .u0 = @intCast(seq * kv_heads * half),
-                .u1 = half,
-                .u2 = self.sin_off,
-                .u3 = kv_heads,
-                .u4 = @intCast(pos0),
-            }, seq * kv_heads * half, 1, 1);
-            // Append K/V to the cache (in-batch device copy).
-            if (seq == 1) ctx.independent(2);
-            try ctx.opElt(.copy, b.k, self.k_cache[l], null, null, .{
-                .u0 = @intCast(seq * kv_dim),
-                .u2 = @intCast(pos0 * kv_dim),
-            }, seq * kv_dim, 1, 1);
-            try ctx.opElt(.copy, b.v, self.v_cache[l], null, null, .{
-                .u0 = @intCast(seq * kv_dim),
-                .u2 = @intCast(pos0 * kv_dim),
-            }, seq * kv_dim, 1, 1);
-
-            if (seq <= gemv_batch_max) {
-                // Batched flash-decoding split/merge against the cached
-                // prefix: query t sees pos0 + 1 + t keys (causal), so this
-                // covers decode (seq == 1), speculative verify, and
-                // follow-up prefill chunks at any pos0.
-                try ctx.opElt(.attn_dsplit, b.q, self.k_cache[l], self.v_cache[l], b.attn_scratch, .{
-                    .u0 = @intCast(pos0 + 1),
-                    .u1 = n_heads,
-                    .u2 = kv_heads,
-                    .u3 = hd,
-                    .u4 = nsplit,
-                    .u5 = @intCast(seq),
-                    .f0 = attn_scale,
-                }, seq * n_heads * nsplit, 1, 1);
-                try ctx.opElt(.attn_dmerge, b.attn_scratch, null, null, b.attn, .{
-                    .u0 = @intCast(seq * n_heads),
-                    .u1 = hd,
-                    .u2 = nsplit,
-                }, seq * n_heads * hd, 1, 1);
-            } else {
-                // Square causal attention (prefill starts from an empty cache).
-                std.debug.assert(pos0 == 0);
-                try ctx.opElt(.gather_kmajor, b.q, null, null, b.qt, .{
-                    .u0 = @intCast(seq * n_heads * hd),
-                    .u1 = n_heads,
-                    .u2 = hd,
-                    .u3 = @intCast(seq),
-                }, seq * n_heads * hd, 1, 1);
-                try ctx.opElt(.gather_kmajor, b.k, null, null, b.kt, .{
-                    .u0 = @intCast(seq * kv_heads * hd),
-                    .u1 = kv_heads,
-                    .u2 = hd,
-                    .u3 = @intCast(seq),
-                }, seq * kv_heads * hd, 1, 1);
-                const dc8 = std.math.divCeil(usize, seq, 8) catch unreachable;
-                try ctx.opElt(.attn_scores, b.qt, b.kt, null, b.s, .{
-                    .u0 = @intCast(seq),
-                    .u1 = n_heads,
-                    .u2 = kv_heads,
-                    .u3 = hd,
-                    .u4 = 0,
-                    .f0 = attn_scale,
-                }, dc8, dc8, n_heads);
-                try ctx.opElt(.attn_out, b.s, null, b.v, b.attn, .{
-                    .u0 = @intCast(seq),
-                    .u1 = n_heads,
-                    .u2 = kv_heads,
-                    .u3 = hd,
-                    .u4 = 0,
-                    .u5 = @intCast(seq),
-                    .f0 = @bitCast(@as(u32, @intCast(seq * seq))),
-                    .f1 = @bitCast(@as(u32, 1)), // causal
-                }, hd / 8, dc8, n_heads);
-            }
-            try self.gemm(b.t, b.attn, seq, layer.o, hidden, q_dim);
-            try ctx.opElt(.add, b.x, b.t, null, null, .{ .u0 = @intCast(seq * hidden) }, seq * hidden, 1, 1);
-
-            // --- MLP (SwiGLU) ---
-            try self.normWide(b.x, b.normed, try nbuf(ctx, layer.post_norm), seq);
-            if (seq == 1) {
-                ctx.independent(2);
-                try ctx.opGemvPartial(b.normed, b.gemv_partials[0], layer.gate.bytes, layer.gate.dtype == .f8_e4m3, intermediate, hidden, gemv_nchunk);
-                try ctx.opGemvPartial(b.normed, b.gemv_partials[1], layer.up.bytes, layer.up.dtype == .f8_e4m3, intermediate, hidden, gemv_nchunk);
-                ctx.independent(2);
-                try ctx.opGemvCombine(b.gate, 0, b.gemv_partials[0], intermediate, layer.gate.scale, gemv_nchunk);
-                try ctx.opGemvCombine(b.up, 0, b.gemv_partials[1], intermediate, layer.up.scale, gemv_nchunk);
-            } else {
-                try self.gemm(b.gate, b.normed, seq, layer.gate, intermediate, hidden);
-                try self.gemm(b.up, b.normed, seq, layer.up, intermediate, hidden);
-            }
-            try ctx.opElt(.silu_mul, b.gate, b.up, null, null, .{ .u0 = @intCast(seq * intermediate) }, seq * intermediate, 1, 1);
-            try self.gemm(b.t, b.gate, seq, layer.down, hidden, intermediate);
-            try ctx.opElt(.add, b.x, b.t, null, null, .{ .u0 = @intCast(seq * hidden) }, seq * hidden, 1, 1);
+            try transformer_gpu.decoderLayer(transformer.qwen3_spec, self, layer, l, seq, pos0);
         }
+    }
+
+    // --- transformer_gpu.decoderLayer stepper methods (faithful lifts of the
+    // former inline layer loop; each keeps its leading independent() hint so op
+    // and scheduling order are byte-for-byte preserved). ---
+
+    pub fn normInput(self: *VulkanLM, layer: anytype, seq: usize) !void {
+        try self.normWide(self.bufs.x, self.bufs.normed, try nbuf(self.ctx, layer.input_norm), seq);
+    }
+
+    pub fn projectQKV(self: *VulkanLM, l: usize, layer: anytype, seq: usize) !void {
+        _ = l; // qwen3: uniform geometry
+        const ctx = self.ctx;
+        const b = &self.bufs;
+        if (seq == 1) {
+            // Group the q/k/v GEMV halves so no barrier drains the GPU between
+            // independent dispatches.
+            ctx.independent(3);
+            try ctx.opGemvPartial(b.normed, b.gemv_partials[0], layer.q.bytes, layer.q.dtype == .f8_e4m3, q_dim, hidden, gemv_nchunk);
+            try ctx.opGemvPartial(b.normed, b.gemv_partials[1], layer.k.bytes, layer.k.dtype == .f8_e4m3, kv_dim, hidden, gemv_nchunk);
+            try ctx.opGemvPartial(b.normed, b.gemv_partials[2], layer.v.bytes, layer.v.dtype == .f8_e4m3, kv_dim, hidden, gemv_nchunk);
+            ctx.independent(3);
+            try ctx.opGemvCombine(b.q, 0, b.gemv_partials[0], q_dim, layer.q.scale, gemv_nchunk);
+            try ctx.opGemvCombine(b.k, 0, b.gemv_partials[1], kv_dim, layer.k.scale, gemv_nchunk);
+            try ctx.opGemvCombine(b.v, 0, b.gemv_partials[2], kv_dim, layer.v.scale, gemv_nchunk);
+        } else {
+            try self.gemm(b.q, b.normed, seq, layer.q, q_dim, hidden);
+            try self.gemm(b.k, b.normed, seq, layer.k, kv_dim, hidden);
+            try self.gemm(b.v, b.normed, seq, layer.v, kv_dim, hidden);
+        }
+    }
+
+    pub fn normQK(self: *VulkanLM, l: usize, layer: anytype, seq: usize) !void {
+        _ = l;
+        const ctx = self.ctx;
+        const b = &self.bufs;
+        if (seq == 1) ctx.independent(2);
+        try rmsnorm(ctx, b.q, b.q, try nbuf(ctx, layer.q_norm), seq * n_heads, hd);
+        try rmsnorm(ctx, b.k, b.k, try nbuf(ctx, layer.k_norm), seq * kv_heads, hd);
+    }
+
+    pub fn applyRope(self: *VulkanLM, l: usize, seq: usize, pos0: usize) !void {
+        _ = l; // qwen3: single rope table for all layers
+        const ctx = self.ctx;
+        const b = &self.bufs;
+        if (seq == 1) ctx.independent(2);
+        try ctx.opElt(.rope_half, b.q, null, self.freqs_d, null, .{
+            .u0 = @intCast(seq * n_heads * half),
+            .u1 = half,
+            .u2 = self.sin_off,
+            .u3 = n_heads,
+            .u4 = @intCast(pos0),
+        }, seq * n_heads * half, 1, 1);
+        try ctx.opElt(.rope_half, b.k, null, self.freqs_d, null, .{
+            .u0 = @intCast(seq * kv_heads * half),
+            .u1 = half,
+            .u2 = self.sin_off,
+            .u3 = kv_heads,
+            .u4 = @intCast(pos0),
+        }, seq * kv_heads * half, 1, 1);
+    }
+
+    pub fn appendKV(self: *VulkanLM, l: usize, seq: usize, pos0: usize) !void {
+        const ctx = self.ctx;
+        const b = &self.bufs;
+        // Append K/V to the cache (in-batch device copy).
+        if (seq == 1) ctx.independent(2);
+        try ctx.opElt(.copy, b.k, self.k_cache[l], null, null, .{
+            .u0 = @intCast(seq * kv_dim),
+            .u2 = @intCast(pos0 * kv_dim),
+        }, seq * kv_dim, 1, 1);
+        try ctx.opElt(.copy, b.v, self.v_cache[l], null, null, .{
+            .u0 = @intCast(seq * kv_dim),
+            .u2 = @intCast(pos0 * kv_dim),
+        }, seq * kv_dim, 1, 1);
+    }
+
+    pub fn attention(self: *VulkanLM, l: usize, seq: usize, pos0: usize) !void {
+        const ctx = self.ctx;
+        const b = &self.bufs;
+        if (seq <= gemv_batch_max) {
+            // Batched flash-decoding split/merge against the cached prefix:
+            // query t sees pos0 + 1 + t keys (causal) — covers decode (seq == 1),
+            // speculative verify, and follow-up prefill chunks at any pos0.
+            try ctx.opElt(.attn_dsplit, b.q, self.k_cache[l], self.v_cache[l], b.attn_scratch, .{
+                .u0 = @intCast(pos0 + 1),
+                .u1 = n_heads,
+                .u2 = kv_heads,
+                .u3 = hd,
+                .u4 = nsplit,
+                .u5 = @intCast(seq),
+                .f0 = attn_scale,
+            }, seq * n_heads * nsplit, 1, 1);
+            try ctx.opElt(.attn_dmerge, b.attn_scratch, null, null, b.attn, .{
+                .u0 = @intCast(seq * n_heads),
+                .u1 = hd,
+                .u2 = nsplit,
+            }, seq * n_heads * hd, 1, 1);
+        } else {
+            // Square causal attention (prefill starts from an empty cache).
+            std.debug.assert(pos0 == 0);
+            try ctx.opElt(.gather_kmajor, b.q, null, null, b.qt, .{
+                .u0 = @intCast(seq * n_heads * hd),
+                .u1 = n_heads,
+                .u2 = hd,
+                .u3 = @intCast(seq),
+            }, seq * n_heads * hd, 1, 1);
+            try ctx.opElt(.gather_kmajor, b.k, null, null, b.kt, .{
+                .u0 = @intCast(seq * kv_heads * hd),
+                .u1 = kv_heads,
+                .u2 = hd,
+                .u3 = @intCast(seq),
+            }, seq * kv_heads * hd, 1, 1);
+            const dc8 = std.math.divCeil(usize, seq, 8) catch unreachable;
+            try ctx.opElt(.attn_scores, b.qt, b.kt, null, b.s, .{
+                .u0 = @intCast(seq),
+                .u1 = n_heads,
+                .u2 = kv_heads,
+                .u3 = hd,
+                .u4 = 0,
+                .f0 = attn_scale,
+            }, dc8, dc8, n_heads);
+            try ctx.opElt(.attn_out, b.s, null, b.v, b.attn, .{
+                .u0 = @intCast(seq),
+                .u1 = n_heads,
+                .u2 = kv_heads,
+                .u3 = hd,
+                .u4 = 0,
+                .u5 = @intCast(seq),
+                .f0 = @bitCast(@as(u32, @intCast(seq * seq))),
+                .f1 = @bitCast(@as(u32, 1)), // causal
+            }, hd / 8, dc8, n_heads);
+        }
+    }
+
+    pub fn projectO(self: *VulkanLM, l: usize, layer: anytype, seq: usize) !void {
+        _ = l;
+        try self.gemm(self.bufs.t, self.bufs.attn, seq, layer.o, hidden, q_dim);
+    }
+
+    pub fn addResidual(self: *VulkanLM, seq: usize) !void {
+        try self.ctx.opElt(.add, self.bufs.x, self.bufs.t, null, null, .{ .u0 = @intCast(seq * hidden) }, seq * hidden, 1, 1);
+    }
+
+    pub fn normPreFfn(self: *VulkanLM, layer: anytype, seq: usize) !void {
+        try self.normWide(self.bufs.x, self.bufs.normed, try nbuf(self.ctx, layer.post_norm), seq);
+    }
+
+    pub fn projectGateUp(self: *VulkanLM, layer: anytype, seq: usize) !void {
+        const ctx = self.ctx;
+        const b = &self.bufs;
+        if (seq == 1) {
+            ctx.independent(2);
+            try ctx.opGemvPartial(b.normed, b.gemv_partials[0], layer.gate.bytes, layer.gate.dtype == .f8_e4m3, intermediate, hidden, gemv_nchunk);
+            try ctx.opGemvPartial(b.normed, b.gemv_partials[1], layer.up.bytes, layer.up.dtype == .f8_e4m3, intermediate, hidden, gemv_nchunk);
+            ctx.independent(2);
+            try ctx.opGemvCombine(b.gate, 0, b.gemv_partials[0], intermediate, layer.gate.scale, gemv_nchunk);
+            try ctx.opGemvCombine(b.up, 0, b.gemv_partials[1], intermediate, layer.up.scale, gemv_nchunk);
+        } else {
+            try self.gemm(b.gate, b.normed, seq, layer.gate, intermediate, hidden);
+            try self.gemm(b.up, b.normed, seq, layer.up, intermediate, hidden);
+        }
+    }
+
+    pub fn activate(self: *VulkanLM, comptime act: transformer.Activation, seq: usize) !void {
+        const which: gpu.Elt = switch (act) {
+            .silu_mul => .silu_mul,
+            .gelu_tanh_mul => .gelu_mul,
+        };
+        try self.ctx.opElt(which, self.bufs.gate, self.bufs.up, null, null, .{ .u0 = @intCast(seq * intermediate) }, seq * intermediate, 1, 1);
+    }
+
+    pub fn projectDown(self: *VulkanLM, layer: anytype, seq: usize) !void {
+        try self.gemm(self.bufs.t, self.bufs.gate, seq, layer.down, hidden, intermediate);
     }
 
     /// Dense linear over `m` rows, kernel picked by batch size: k-split GEMV

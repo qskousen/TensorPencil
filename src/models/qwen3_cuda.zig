@@ -20,6 +20,8 @@ const safetensors = @import("../safetensors.zig");
 const ops = @import("../ops.zig");
 const spec = @import("../llm/spec.zig");
 const kvmod = @import("../llm/kv_cache.zig");
+const transformer = @import("transformer.zig");
+const transformer_gpu = @import("transformer_gpu.zig");
 
 const Backend = cuda.Backend;
 const Buf = cuda.backend.DeviceBuffer;
@@ -632,6 +634,83 @@ pub const CudaLM = struct {
     /// upload, then the whole transformer inside an open batch. The caller
     /// finishes the batch (LM head variants differ) — on success the batch is
     /// still open, with the final hidden states in bufs.x.
+    // --- transformer_gpu.decoderLayer stepper methods (faithful lifts of the
+    // former layersForward inline body; taps + weight prefetch stay loop-level
+    // hooks around the decoderLayer call). ---
+
+    pub fn normInput(self: *CudaLM, layer: anytype, seq: usize) !void {
+        const c = self.cfg;
+        try self.be.qkNorm(self.bufs.x, self.bufs.normed, try nbuf(self.be, layer.input_norm), seq, c.hidden, eps);
+    }
+    pub fn projectQKV(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
+        _ = l; // qwen3: uniform geometry
+        const c = self.cfg;
+        const b = &self.bufs;
+        try self.linear(b.q, b.normed, layer.q, c.qDim(), c.hidden, seq);
+        try self.linear(b.k, b.normed, layer.k, c.kvDim(), c.hidden, seq);
+        try self.linear(b.v, b.normed, layer.v, c.kvDim(), c.hidden, seq);
+    }
+    pub fn normQK(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
+        _ = l;
+        const c = self.cfg;
+        const b = &self.bufs;
+        try self.be.qkNorm(b.q, b.q, try nbuf(self.be, layer.q_norm), seq * c.n_heads, hd, eps);
+        try self.be.qkNorm(b.k, b.k, try nbuf(self.be, layer.k_norm), seq * c.n_kv_heads, hd, eps);
+    }
+    pub fn applyRope(self: *CudaLM, l: usize, seq: usize, pos0: usize) !void {
+        _ = l; // qwen3: single rope table for all layers
+        const c = self.cfg;
+        const b = &self.bufs;
+        try self.be.ropeHalf(b.q, self.freqs_d, seq, c.n_heads, half, self.sin_off, pos0);
+        try self.be.ropeHalf(b.k, self.freqs_d, seq, c.n_kv_heads, half, self.sin_off, pos0);
+    }
+    pub fn appendKV(self: *CudaLM, l: usize, seq: usize, pos0: usize) !void {
+        const c = self.cfg;
+        const b = &self.bufs;
+        try self.be.tensorCopy(self.k_cache[l].buf, pos0 * c.kvDim() * 4, b.k, 0, seq * c.kvDim() * 4);
+        try self.be.tensorCopy(self.v_cache[l].buf, pos0 * c.kvDim() * 4, b.v, 0, seq * c.kvDim() * 4);
+    }
+    pub fn attention(self: *CudaLM, l: usize, seq: usize, pos0: usize) !void {
+        const c = self.cfg;
+        const b = &self.bufs;
+        if (seq <= gemv_batch_max) {
+            // Batched flash-decoding: the naive square kernel has too little
+            // parallelism for a handful of queries.
+            try self.be.opAttnDecode(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, pos0 + 1, seq, c.n_heads, c.n_kv_heads, hd, nsplit, attn_scale, 0);
+        } else {
+            try self.be.attn(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, seq, pos0 + seq, c.n_heads, c.n_kv_heads, hd, attn_scale, true);
+        }
+    }
+    pub fn projectO(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
+        _ = l;
+        const c = self.cfg;
+        try self.linear(self.bufs.t, self.bufs.attn, layer.o, c.hidden, c.qDim(), seq);
+    }
+    pub fn addResidual(self: *CudaLM, seq: usize) !void {
+        try self.be.opAdd(self.bufs.x, self.bufs.t, seq * self.cfg.hidden);
+    }
+    pub fn normPreFfn(self: *CudaLM, layer: anytype, seq: usize) !void {
+        const c = self.cfg;
+        try self.be.qkNorm(self.bufs.x, self.bufs.normed, try nbuf(self.be, layer.post_norm), seq, c.hidden, eps);
+    }
+    pub fn projectGateUp(self: *CudaLM, layer: anytype, seq: usize) !void {
+        const c = self.cfg;
+        const b = &self.bufs;
+        try self.linear(b.gate, b.normed, layer.gate, c.intermediate, c.hidden, seq);
+        try self.linear(b.up, b.normed, layer.up, c.intermediate, c.hidden, seq);
+    }
+    pub fn activate(self: *CudaLM, comptime act: transformer.Activation, seq: usize) !void {
+        const n = seq * self.cfg.intermediate;
+        switch (act) {
+            .silu_mul => try self.be.siluMul(self.bufs.gate, self.bufs.up, n),
+            .gelu_tanh_mul => try self.be.geluMul(self.bufs.gate, self.bufs.up, n),
+        }
+    }
+    pub fn projectDown(self: *CudaLM, layer: anytype, seq: usize) !void {
+        const c = self.cfg;
+        try self.linear(self.bufs.t, self.bufs.gate, layer.down, c.hidden, c.intermediate, seq);
+    }
+
     fn layersForward(self: *CudaLM, ids: []const u32) !void {
         const gpa = self.gpa;
         const be = self.be;
@@ -658,34 +737,7 @@ pub const CudaLM = struct {
                     if (l == tl) try be.opCopyOff(self.tap_d, (j * self.capacity + pos0) * c.hidden, b.x, 0, seq * c.hidden);
                 }
             }
-            // --- Attention ---
-            try be.qkNorm(b.x, b.normed, try nbuf(be, layer.input_norm), seq, c.hidden, eps);
-            try self.linear(b.q, b.normed, layer.q, c.qDim(), c.hidden, seq);
-            try self.linear(b.k, b.normed, layer.k, c.kvDim(), c.hidden, seq);
-            try self.linear(b.v, b.normed, layer.v, c.kvDim(), c.hidden, seq);
-            try be.qkNorm(b.q, b.q, try nbuf(be, layer.q_norm), seq * c.n_heads, hd, eps);
-            try be.qkNorm(b.k, b.k, try nbuf(be, layer.k_norm), seq * c.n_kv_heads, hd, eps);
-            try be.ropeHalf(b.q, self.freqs_d, seq, c.n_heads, half, self.sin_off, pos0);
-            try be.ropeHalf(b.k, self.freqs_d, seq, c.n_kv_heads, half, self.sin_off, pos0);
-            try be.tensorCopy(self.k_cache[l].buf, pos0 * c.kvDim() * 4, b.k, 0, seq * c.kvDim() * 4);
-            try be.tensorCopy(self.v_cache[l].buf, pos0 * c.kvDim() * 4, b.v, 0, seq * c.kvDim() * 4);
-            if (seq <= gemv_batch_max) {
-                // Batched flash-decoding: the naive square kernel has too
-                // little parallelism for a handful of queries.
-                try be.opAttnDecode(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, pos0 + 1, seq, c.n_heads, c.n_kv_heads, hd, nsplit, attn_scale, 0);
-            } else {
-                try be.attn(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, seq, pos0 + seq, c.n_heads, c.n_kv_heads, hd, attn_scale, true);
-            }
-            try self.linear(b.t, b.attn, layer.o, c.hidden, c.qDim(), seq);
-            try be.opAdd(b.x, b.t, seq * c.hidden);
-
-            // --- MLP (SwiGLU) ---
-            try be.qkNorm(b.x, b.normed, try nbuf(be, layer.post_norm), seq, c.hidden, eps);
-            try self.linear(b.gate, b.normed, layer.gate, c.intermediate, c.hidden, seq);
-            try self.linear(b.up, b.normed, layer.up, c.intermediate, c.hidden, seq);
-            try be.siluMul(b.gate, b.up, seq * c.intermediate);
-            try self.linear(b.t, b.gate, layer.down, c.hidden, c.intermediate, seq);
-            try be.opAdd(b.x, b.t, seq * c.hidden);
+            try transformer_gpu.decoderLayer(transformer.qwen3_spec, self, layer, l, seq, pos0);
         }
     }
 

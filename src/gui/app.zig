@@ -425,12 +425,14 @@ fn applyLiveSettings() void {
     if (g_loading.load(.acquire)) return;
     const s = g_session orelse return;
     s.updateSettings(&g_config);
-    if (!g_config.diffPathsEql(&g_config_baseline) and g_config.diffEnabled()) {
+    if (!g_config.diffReloadEql(&g_config_baseline) and g_config.diffEnabled()) {
         s.requestDiffPaths(
             g_config.diffusion_model.opt().?,
             g_config.vae.opt().?,
             g_config.text_encoder.opt().?,
             g_config.taesd.opt(),
+            toPipelineBackend(g_config.diff_backend),
+            toPipelineVae(g_config.vae_decode),
         );
     }
 }
@@ -549,6 +551,26 @@ fn finishLoad(err: ?anyerror) void {
     wakeupFrame();
 }
 
+/// Map the config's engine-decoupled backend enum onto `pipeline.Backend`.
+fn toPipelineBackend(b: config.Backend) tp.pipeline.Backend {
+    return switch (b) {
+        .cpu => .cpu,
+        .vulkan => .vulkan,
+        .zig_cuda => .zig_cuda,
+        .cuda => .cuda,
+    };
+}
+
+/// Map the config's decode-path enum onto `pipeline.VaeDecode`.
+fn toPipelineVae(v: config.VaeDecode) tp.pipeline.VaeDecode {
+    return switch (v) {
+        .auto => .auto,
+        .whole => .whole,
+        .gpu_tiled => .gpu_tiled,
+        .cpu_tiled => .cpu_tiled,
+    };
+}
+
 /// Build a session from the current settings, mapping unset optional models to
 /// disabled features (diffusion needs dit+vae+text-encoder; vision needs the
 /// tower). Paths are duped into `arena` so the session never aliases the live
@@ -566,7 +588,8 @@ fn buildSession(arena: std.mem.Allocator) !*chat.Session {
                 .steps = g_config.steps,
                 .width = g_config.width,
                 .height = g_config.height,
-                .backend = .zig_cuda,
+                .backend = toPipelineBackend(g_config.diff_backend),
+                .vae_decode = toPipelineVae(g_config.vae_decode),
                 .preview_enabled = g_config.preview != .none,
                 .taew_path = if (g_config.preview == .taesd)
                     (if (g_config.taesd.opt()) |t| try arena.dupe(u8, t) else null)
@@ -584,6 +607,7 @@ fn buildSession(arena: std.mem.Allocator) !*chat.Session {
         .model_path = try arena.dupe(u8, llm),
         .system_prompt = try arena.dupe(u8, system_prompt),
         .seed = @truncate(@as(u96, @bitCast(std.Io.Clock.real.now(g_io).nanoseconds))),
+        .backend = toPipelineBackend(g_config.llm_backend),
         .diff = diff,
         .mmproj_path = mmproj,
         .vram_limit_bytes = if (g_config.max_vram_gib > 0)

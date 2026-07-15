@@ -32,6 +32,8 @@ const gguf_mod = @import("../gguf.zig");
 const weights_mod = @import("../weights.zig");
 const qwen3 = @import("qwen3.zig");
 const ops = @import("../ops.zig");
+const loader = @import("loader.zig");
+const transformer = @import("transformer.zig");
 const kv_cache_mod = @import("../llm/kv_cache.zig");
 
 const Gguf = gguf_mod.Gguf;
@@ -226,35 +228,35 @@ pub const Model = struct {
         errdefer arena.deinit();
         const alloc = arena.allocator();
 
-        const embed = try loadMatrix(store, "embed_tokens.weight", cfg.vocab, cfg.hidden);
+        const embed = try loader.matrix(store, "embed_tokens.weight", cfg.vocab, cfg.hidden);
         const head = if (store.get("lm_head.weight")) |_|
-            try loadMatrix(store, "lm_head.weight", cfg.vocab, cfg.hidden)
+            try loader.matrix(store, "lm_head.weight", cfg.vocab, cfg.hidden)
         else
             embed;
-        const final_norm = try loadVec(alloc, store, "norm.weight", cfg.hidden);
-        const rope_freqs = try loadVec(alloc, store, "rope_freqs.weight", cfg.head_dim_global / 2);
+        const final_norm = try loader.vector(alloc, store, "norm.weight", cfg.hidden);
+        const rope_freqs = try loader.vector(alloc, store, "rope_freqs.weight", cfg.head_dim_global / 2);
 
         const layers = try alloc.alloc(Layer, cfg.n_layers);
         for (layers, 0..) |*layer, l| {
             const hd = cfg.headDim(l);
             layer.* = .{
-                .input_norm = try loadLayerVec(alloc, store, l, "input_layernorm.weight", cfg.hidden),
-                .q = try loadLayerMatrix(store, l, "self_attn.q_proj.weight", cfg.qDim(l), cfg.hidden),
-                .k = try loadLayerMatrix(store, l, "self_attn.k_proj.weight", cfg.kvDim(l), cfg.hidden),
-                .v = loadLayerMatrix(store, l, "self_attn.v_proj.weight", cfg.kvDim(l), cfg.hidden) catch |e| switch (e) {
+                .input_norm = try loader.indexedVector(alloc, store, "layers.", l, "input_layernorm.weight", cfg.hidden),
+                .q = try loader.indexedMatrix(store, "layers.", l, "self_attn.q_proj.weight", cfg.qDim(l), cfg.hidden),
+                .k = try loader.indexedMatrix(store, "layers.", l, "self_attn.k_proj.weight", cfg.kvDim(l), cfg.hidden),
+                .v = loader.indexedMatrix(store, "layers.", l, "self_attn.v_proj.weight", cfg.kvDim(l), cfg.hidden) catch |e| switch (e) {
                     error.MissingTensor => null, // global layers reuse K as V
                     else => return e,
                 },
-                .o = try loadLayerMatrix(store, l, "self_attn.o_proj.weight", cfg.hidden, cfg.qDim(l)),
-                .q_norm = try loadLayerVec(alloc, store, l, "self_attn.q_norm.weight", hd),
-                .k_norm = try loadLayerVec(alloc, store, l, "self_attn.k_norm.weight", hd),
-                .post_attn_norm = try loadLayerVec(alloc, store, l, "post_attention_layernorm.weight", cfg.hidden),
-                .pre_ffn_norm = try loadLayerVec(alloc, store, l, "pre_feedforward_layernorm.weight", cfg.hidden),
-                .post_ffn_norm = try loadLayerVec(alloc, store, l, "post_feedforward_layernorm.weight", cfg.hidden),
-                .gate = try loadLayerMatrix(store, l, "mlp.gate_proj.weight", cfg.intermediate, cfg.hidden),
-                .up = try loadLayerMatrix(store, l, "mlp.up_proj.weight", cfg.intermediate, cfg.hidden),
-                .down = try loadLayerMatrix(store, l, "mlp.down_proj.weight", cfg.hidden, cfg.intermediate),
-                .out_scale = (try loadLayerVec(alloc, store, l, "out_scale.weight", 1))[0],
+                .o = try loader.indexedMatrix(store, "layers.", l, "self_attn.o_proj.weight", cfg.hidden, cfg.qDim(l)),
+                .q_norm = try loader.indexedVector(alloc, store, "layers.", l, "self_attn.q_norm.weight", hd),
+                .k_norm = try loader.indexedVector(alloc, store, "layers.", l, "self_attn.k_norm.weight", hd),
+                .post_attn_norm = try loader.indexedVector(alloc, store, "layers.", l, "post_attention_layernorm.weight", cfg.hidden),
+                .pre_ffn_norm = try loader.indexedVector(alloc, store, "layers.", l, "pre_feedforward_layernorm.weight", cfg.hidden),
+                .post_ffn_norm = try loader.indexedVector(alloc, store, "layers.", l, "post_feedforward_layernorm.weight", cfg.hidden),
+                .gate = try loader.indexedMatrix(store, "layers.", l, "mlp.gate_proj.weight", cfg.intermediate, cfg.hidden),
+                .up = try loader.indexedMatrix(store, "layers.", l, "mlp.up_proj.weight", cfg.intermediate, cfg.hidden),
+                .down = try loader.indexedMatrix(store, "layers.", l, "mlp.down_proj.weight", cfg.hidden, cfg.intermediate),
+                .out_scale = (try loader.indexedVector(alloc, store, "layers.", l, "out_scale.weight", 1))[0],
             };
         }
 
@@ -364,65 +366,19 @@ pub fn layerForward(
     l: usize,
     s: *Scratch,
 ) !void {
-    const pos0 = cache.len;
     const global = cfg.isGlobal(l);
-    const hd = cfg.headDim(l);
-    const n_kv = cfg.nKv(l);
-    const q_dim = cfg.qDim(l);
-    const kv_dim = cfg.kvDim(l);
-    const freqs = if (global) freqs_global else freqs_local;
-
-    const q = s.q[0 .. seq * q_dim];
-    const k = s.k[0 .. seq * kv_dim];
-    const v = s.v[0 .. seq * kv_dim];
-    const attn_out = s.attn_out[0 .. seq * q_dim];
-
-    // --- Attention ---
-    ops.norm.rmsNorm(s.normed, x, layer.input_norm, cfg.rms_eps);
-    try ops.matmul.matmul(io, gpa, q, s.normed, seq, layer.q, null);
-    try ops.matmul.matmul(io, gpa, k, s.normed, seq, layer.k, null);
-    // V: its own projection, or (global layers, no v_proj) the RAW K projection
-    // output — copied before k_norm/rope mutate `k`.
-    if (layer.v) |vw| {
-        try ops.matmul.matmul(io, gpa, v, s.normed, seq, vw, null);
-    } else {
-        @memcpy(v, k);
-    }
-    ops.norm.rmsNorm(q, q, layer.q_norm, cfg.rms_eps); // per-head: rows of head_dim
-    ops.norm.rmsNorm(k, k, layer.k_norm, cfg.rms_eps);
-    ops.norm.rmsNormUnit(v, v, hd, cfg.rms_eps); // V: weightless RMS over head_dim
-    ops.rope.applyRotateHalfAt(q, freqs, pos0, seq, cfg.n_heads, hd);
-    ops.rope.applyRotateHalfAt(k, freqs, pos0, seq, n_kv, hd);
-
-    cache.write(l, k, v);
-    try ops.attention.attention(io, gpa, attn_out, q, cache.kView(l, seq), cache.vView(l, seq), .{
-        .seq_q = seq,
-        .seq_kv = pos0 + seq,
+    const dims: transformer.Dims = .{
+        .hidden = cfg.hidden,
         .n_heads = cfg.n_heads,
-        .n_kv_heads = n_kv,
-        .head_dim = hd,
-        .causal = true,
-        .scale = 1.0, // Gemma 4: no 1/sqrt(head_dim) (QK-norm folds it in)
-        .window = if (global) 0 else cfg.sliding_window,
-    });
-    // o_proj, then post-attention norm on the attn output BEFORE the residual.
-    try ops.matmul.matmul(io, gpa, s.tmp, attn_out, seq, layer.o, null);
-    ops.norm.rmsNorm(s.tmp, s.tmp, layer.post_attn_norm, cfg.rms_eps);
-    for (x, s.tmp) |*xi, ti| xi.* += ti;
-
-    // --- MLP (GeGLU) ---
-    ops.norm.rmsNorm(s.normed, x, layer.pre_ffn_norm, cfg.rms_eps);
-    try ops.matmul.matmul(io, gpa, s.gate, s.normed, seq, layer.gate, null);
-    try ops.matmul.matmul(io, gpa, s.up, s.normed, seq, layer.up, null);
-    ops.act.geluTanhMul(s.gate, s.up);
-    try ops.matmul.matmul(io, gpa, s.tmp, s.gate, seq, layer.down, null);
-    ops.norm.rmsNorm(s.tmp, s.tmp, layer.post_ffn_norm, cfg.rms_eps);
-    for (x, s.tmp) |*xi, ti| xi.* += ti;
-
-    // --- Per-layer output scale (whole residual stream) ---
-    if (layer.out_scale != 1.0) for (x) |*xi| {
-        xi.* *= layer.out_scale;
+        .n_kv = cfg.nKv(l),
+        .head_dim = cfg.headDim(l),
+        .q_dim = cfg.qDim(l),
+        .kv_dim = cfg.kvDim(l),
+        .intermediate = cfg.intermediate,
+        .sliding_window = if (global) 0 else cfg.sliding_window,
     };
+    const freqs = if (global) freqs_global else freqs_local;
+    try transformer.layerForward(transformer.gemma4_spec, .cached, io, gpa, layer, x, seq, dims, freqs, cfg.rms_eps, cache, l, cache.len, s);
 }
 
 /// Per-forward activation buffers, sized for the LARGEST per-layer widths so
@@ -466,29 +422,6 @@ pub const Scratch = struct {
         self.* = undefined;
     }
 };
-
-fn loadMatrix(store: WeightStore, name: []const u8, rows: usize, cols: usize) !Weight {
-    const view = store.get(name) orelse return error.MissingTensor;
-    const shape = view.info.shape.slice();
-    if (shape.len != 2 or shape[0] != rows or shape[1] != cols) return error.ShapeMismatch;
-    return Weight.init(view.bytes, view.info.dtype, rows, cols);
-}
-
-fn loadLayerMatrix(store: WeightStore, l: usize, comptime suffix: []const u8, rows: usize, cols: usize) !Weight {
-    var buf: [96]u8 = undefined;
-    return loadMatrix(store, try std.fmt.bufPrint(&buf, "layers.{d}." ++ suffix, .{l}), rows, cols);
-}
-
-fn loadVec(alloc: std.mem.Allocator, store: WeightStore, name: []const u8, len: usize) ![]f32 {
-    const view = store.get(name) orelse return error.MissingTensor;
-    if (view.info.elemCount() != len) return error.ShapeMismatch;
-    return view.toF32Alloc(alloc);
-}
-
-fn loadLayerVec(alloc: std.mem.Allocator, store: WeightStore, l: usize, comptime suffix: []const u8, len: usize) ![]f32 {
-    var buf: [96]u8 = undefined;
-    return loadVec(alloc, store, try std.fmt.bufPrint(&buf, "layers.{d}." ++ suffix, .{l}), len);
-}
 
 /// Read tokenizer.ggml.suppress_tokens ([INT32]) into an owned u32 slice.
 fn loadSuppressTokens(alloc: std.mem.Allocator, g: *const Gguf) ![]const u32 {

@@ -7,6 +7,7 @@ pub const sample = @import("llm/sample.zig");
 pub const engine = @import("llm/engine.zig");
 pub const spec = @import("llm/spec.zig");
 pub const kv_cache = @import("llm/kv_cache.zig");
+pub const session = @import("llm/session.zig");
 
 test {
     _ = chat;
@@ -15,4 +16,5 @@ test {
     _ = engine;
     _ = spec;
     _ = kv_cache;
+    _ = session;
 }

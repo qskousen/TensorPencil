@@ -83,29 +83,6 @@ const usage =
     \\
 ;
 
-/// `--vram-budget min`: hold only the in-flight weights. The budget is a soft
-/// ceiling (a single weight larger than it still uploads while physical VRAM
-/// has room), so this streams everything, embed/LM-head included.
-const min_vram_budget: u64 = 256 << 20;
-
-/// How far short of --vram-budget the pinned weight prefix stops. The gap is
-/// the streaming window: in-flight streamed weights live in it (it must
-/// comfortably exceed the largest streamed weight, the ~780 MiB embed/LM-head
-/// table, to keep the DMA pipeline deep) plus GEMM scratch. The budget is
-/// soft, so a transient overshoot degrades gracefully rather than failing.
-const pin_slack: u64 = 1 << 30;
-
-/// Weight budget to use when the user passes no --vram-budget (0). Defaults to
-/// the free VRAM at setup so a model that fits stays FULLY PINNED (resident)
-/// rather than streaming every weight from host each token — streaming a model
-/// that fits in VRAM is dramatically slower (measured 9B Q6_K on a 3090:
-/// 18 -> 66 tok/s, ~3.6x). A model larger than the free VRAM streams its tail,
-/// exactly as an explicit --vram-budget would. budget_override stays 0 (no hard
-/// weight cap), so the KV cache + activations grow into the VRAM left unpinned.
-fn defaultWeightBudget(be: *TensorPencil.gpu.cuda.Backend, user_budget: u64) u64 {
-    return if (user_budget != 0) user_budget else be.ctx.memGetInfo().free;
-}
-
 pub fn main(init: std.process.Init) !void {
     const arena: std.mem.Allocator = init.arena.allocator();
     const io = init.io;
@@ -176,7 +153,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--vram-budget")) {
             const val = try nextArg(args, &i);
             if (std.mem.eql(u8, val, "min")) {
-                vram_budget = min_vram_budget;
+                vram_budget = llm.session.min_vram_budget;
             } else {
                 const gib = try std.fmt.parseFloat(f64, val);
                 vram_budget = @intFromFloat(gib * (1 << 30));
@@ -306,6 +283,29 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidArgument;
     }
 
+    return runQwen3(arena, gpa, io, &st, backend, vram_budget, draft_path, eagle_path, max_context_arg, prompt, system, opts, profile, stdout);
+}
+
+/// One-shot / chat session for a Qwen3 model (the Krea 2 text-encoder stack /
+/// the tp-llm target): cpu / zig-cuda / cuda / vulkan, plus speculative decoding
+/// (n-gram --spec-k, a --draft-model, or an --eagle head with optional --tree).
+fn runQwen3(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    io: Io,
+    st: *ModelFile,
+    backend: BackendKind,
+    vram_budget: u64,
+    draft_path: ?[]const u8,
+    eagle_path: ?[]const u8,
+    max_context_arg: ?usize,
+    prompt: ?[]const u8,
+    system: ?[]const u8,
+    opts_in: llm.engine.Options,
+    profile: bool,
+    stdout: *Io.Writer,
+) !void {
+    var opts = opts_in;
     var lm = try qwen3.CausalLM.load(arena, st.store());
     defer lm.deinit();
     if (backend == .vulkan and lm.hasBlockQuantWeights()) {
@@ -313,11 +313,10 @@ pub fn main(init: std.process.Init) !void {
         try stdout.flush();
         return error.InvalidArgument;
     }
-    // Tokenizer: a GGUF checkpoint carries its own vocab (which may differ
-    // from the embedded Qwen3 one — e.g. Qwen3.6's 248k tokens); fall back
-    // to the embedded tokenizer when the file has none (ComfyUI-style
-    // conversions strip it).
-    var tok = switch (st) {
+    // Tokenizer: a GGUF checkpoint carries its own vocab (which may differ from
+    // the embedded Qwen3 one — e.g. Qwen3.6's 248k tokens); fall back to the
+    // embedded tokenizer when the file has none (ComfyUI-style conversions strip it).
+    var tok = switch (st.*) {
         .gguf => |*g| TensorPencil.tokenizer.Tokenizer.initFromGguf(arena, g) catch |err| switch (err) {
             error.MissingTokenizer => try TensorPencil.tokenizer.Tokenizer.init(arena),
             else => return err,
@@ -327,9 +326,9 @@ pub fn main(init: std.process.Init) !void {
     defer tok.deinit();
     llm.chat.applyTokenizer(&tok);
 
-    // Draft model for speculative decoding (same tokenizer family; its own
-    // KV cache and stepper). Implies spec decoding. The mapped checkpoint
-    // must outlive the session — weights are views into it.
+    // Draft model for speculative decoding (same tokenizer family; its own KV
+    // cache and stepper). Implies spec decoding. The mapped checkpoint must
+    // outlive the session — weights are views into it.
     var draft_st: ?ModelFile = null;
     defer if (draft_st) |*s| s.deinit();
     var draft_lm: ?qwen3.CausalLM = null;
@@ -389,13 +388,9 @@ pub fn main(init: std.process.Init) !void {
 
     // Vulkan reserves the whole KV window up front (no growable buffers), so
     // bring its device up now and auto-size the context to what VRAM holds
-    // before the banner and capacityPlan below read opts.max_context. CUDA
-    // instead defaults to the trained length and grows KV lazily. Pick the
-    // largest window whose KV reservation fits beside the resident weights
-    // (over-estimated by the whole mmapped file — the host-side embed is
-    // counted too — keeping the choice safely under budget), capped at the
-    // trained length. An explicit --max-context always wins. The context is
-    // held here and reused by the .vulkan arm below.
+    // before the banner and capacityPlan below read opts.max_context (an
+    // explicit --max-context always wins). CUDA defaults to the trained length
+    // and grows KV lazily. The context is reused by session.run's vulkan arm.
     var vk_ctx: ?*TensorPencil.gpu.Context = null;
     defer if (vk_ctx) |c| c.deinit();
     if (backend == .vulkan) {
@@ -405,8 +400,8 @@ pub fn main(init: std.process.Init) !void {
             const free = ctx.liveVram();
             const weight_est: u64 = if (st.mapping()) |m| m.len else 0;
             const per_tok = TensorPencil.models.qwen3_gpu.VulkanLM.kvWindowBytes(1);
-            const avail = free -| weight_est -| (pin_slack * 2); // activations + freqs + margin
-            const trained = @min(trainedContext(&st), auto_context_cap);
+            const avail = free -| weight_est -| (llm.session.pin_slack * 2); // activations + freqs + margin
+            const trained = @min(trainedContext(st), auto_context_cap);
             opts.max_context = std.math.clamp(avail / per_tok, 4096, trained);
         }
     }
@@ -419,124 +414,55 @@ pub fn main(init: std.process.Init) !void {
     try stdout.flush();
 
     // One-shot caps the window at the request; a chat session gets the whole
-    // --max-context window. Either way only a small initial slice of KV rows
-    // is committed up front — the cache grows in place as generation fills it
-    // (evicting weights into the streaming path under VRAM pressure).
-    // Speculative runs stay fixed-capacity: the tree batch region and EAGLE
-    // tap buffers stride by capacity, so it cannot move mid-session.
+    // --max-context window. Speculative runs stay fixed-capacity (the tree
+    // batch region and EAGLE tap buffers stride by capacity).
     const cap = try capacityPlan(opts, prompt, ids.items.len, opts.spec_k > 0 or opts.tree_nodes > 0 or draft_path != null or eagle_path != null);
     const prompt_len = if (prompt == null) @min(512, cap.max) else ids.items.len;
-    const t_init = Io.Clock.real.now(io).nanoseconds;
-    var t0: i96 = undefined; // set after backend/model setup: generation only
-    const n = switch (backend) {
-        .cpu => blk: {
-            if (vram_budget != 0) try stdout.writeAll("[--vram-budget ignored on the cpu backend]\n");
-            var model = try llm.engine.CpuModel.init(gpa, &lm, cap);
-            defer model.deinit();
-            if (draft_lm) |*dlm| {
-                var draft = try llm.engine.CpuModel.init(gpa, dlm, cap);
-                defer draft.deinit();
-                var drafter = try llm.spec.ModelDrafter(llm.engine.CpuModel).init(gpa, io, &draft);
-                defer drafter.deinit();
-                t0 = Io.Clock.real.now(io).nanoseconds;
-                break :blk try runSession(&model, &drafter, &tok, io, gpa, &ids, opts, stdout, prompt, null);
-            }
-            t0 = Io.Clock.real.now(io).nanoseconds;
-            break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt, null);
-        },
-        .@"zig-cuda", .cuda => blk: {
-            const cuda_be = TensorPencil.gpu.cuda.Backend;
-            const be = if (backend == .cuda) try cuda_be.initLibs(arena) else try cuda_be.init(arena);
-            defer be.deinit();
-            be.profile = profile;
-            const eff_budget = defaultWeightBudget(be, vram_budget);
-            be.budget_override = vram_budget; // --vram-budget: hard weight cap (0 = driver-managed)
-            be.pin_budget = eff_budget -| pin_slack; // default: pin the whole model if it fits, else the prefix
-            be.stream_window = @min(pin_slack, eff_budget); // in-flight streamed-weight cap / enqueue pacing
-            if (vram_budget != 0) {
-                // Page-lock the checkpoint mmaps so streamed weights DMA
-                // directly at full PCIe bandwidth, prefetched one layer
-                // ahead of compute (skipped when everything stays resident:
-                // registration pins host RAM for no benefit).
-                if (st.mapping()) |m| be.enableDirectStreaming(m);
-                if (draft_st) |ds| if (ds.mapping()) |m| be.enableDirectStreaming(m);
-                if (eagle_st) |es| if (es.mapping) |m| be.enableDirectStreaming(m);
-            }
-            var model = try qwen3_cuda.CudaLM.init(gpa, be, &lm, cap, prompt_len);
-            defer model.deinit();
-            var count: usize = undefined;
-            if (eagle_st) |*est| {
-                try model.enableTaps(TensorPencil.models.eagle3.default_tap_layers);
-                if (opts.tree_nodes > 0) try model.enableTree();
-                var head = try TensorPencil.models.eagle3.Eagle3Head.load(gpa, be, est, &lm, cap.max);
-                defer head.deinit();
-                var drafter = try TensorPencil.models.eagle3.Eagle3Drafter.init(gpa, &head, &model);
-                defer drafter.deinit();
-                t0 = Io.Clock.real.now(io).nanoseconds;
-                count = try runSession(&model, &drafter, &tok, io, gpa, &ids, opts, stdout, prompt, null);
-            } else if (draft_lm) |*dlm| {
-                var draft = try qwen3_cuda.CudaLM.init(gpa, be, dlm, cap, prompt_len);
-                defer draft.deinit();
-                // First claim on the pin budget goes to the draft: its weights
-                // are read once per drafted token, the target's only once per
-                // ~k accepted tokens, so pinned draft bytes save more PCIe.
-                if (vram_budget != 0) try draft.prewarmWeights();
-                var drafter = try llm.spec.ModelDrafter(qwen3_cuda.CudaLM).init(gpa, io, &draft);
-                defer drafter.deinit();
-                t0 = Io.Clock.real.now(io).nanoseconds;
-                count = try runSession(&model, &drafter, &tok, io, gpa, &ids, opts, stdout, prompt, null);
-            } else {
-                t0 = Io.Clock.real.now(io).nanoseconds;
-                count = try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt, null);
-            }
-            if (profile) {
-                try stdout.print("\n\nprofile (device, sync-per-op):\n", .{});
-                inline for (@typeInfo(cuda_be.ProfCat).@"enum".fields, 0..) |f, ci| {
-                    if (be.prof.n[ci] > 0)
-                        try stdout.print("  {s:<9} {d:>8.1} ms  ({d} launches)\n", .{ f.name, be.prof.ms[ci], be.prof.n[ci] });
-                }
-            }
-            break :blk count;
-        },
-        .vulkan => blk: {
-            const ctx = vk_ctx.?; // created + context-auto-sized above the banner
-            const Vk = TensorPencil.models.qwen3_gpu.VulkanLM;
-            // Default (no --vram-budget): pin what fits so a model that fits
-            // stays resident instead of streaming every weight each step. Unlike
-            // the CUDA path, Vulkan reserves the whole KV window up front and
-            // pinned weights are never evicted, so the default must leave that
-            // window's VRAM unpinned — subtract it here.
-            const kv_window = Vk.kvWindowBytes(cap.max);
-            const eff_budget = if (vram_budget != 0) vram_budget else ctx.liveVram() -| kv_window;
-            ctx.budget_override = vram_budget; // --vram-budget: hard weight cap (0 = driver-managed)
-            ctx.pin_budget = eff_budget -| pin_slack; // default: pin the whole model if it fits, else the prefix
-            var model = try Vk.init(gpa, ctx, &lm, cap.max, prompt_len);
-            defer model.deinit();
-            t0 = Io.Clock.real.now(io).nanoseconds;
-            break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt, null);
-        },
-    };
-    const t_end = Io.Clock.real.now(io).nanoseconds;
-    const setup_s = @as(f64, @floatFromInt(t0 - t_init)) / 1e9;
-    const elapsed_s = @as(f64, @floatFromInt(t_end - t0)) / 1e9;
 
-    // One-shot summary (generation time includes the prefill + first-use
-    // weight upload; setup is backend/model initialization). Chat sessions
-    // print per-turn stats instead — elapsed here would count typing time.
-    if (prompt != null) {
-        try stdout.print("\n\n[{d} tokens in {d:.1}s, {d:.2} tok/s; setup {d:.1}s]\n", .{
-            n, elapsed_s, @as(f64, @floatFromInt(n)) / elapsed_s, setup_s,
-        });
-    } else {
-        try stdout.print("[session over: {d} tokens generated; setup was {d:.1}s]\n", .{ n, setup_s });
-    }
+    const t_init = Io.Clock.real.now(io).nanoseconds;
+    // Dense CUDA bring-up (qwen3 has no CPU/GPU split): pin under the budget and
+    // page-lock the target/draft/eagle mmaps so a streamed tail DMAs at full PCIe.
+    const be_cuda = try llm.session.bringUpCuda(arena, backend, profile, vram_budget);
+    defer if (be_cuda) |b| b.deinit();
+    if (be_cuda) |b| if (vram_budget != 0) {
+        if (st.mapping()) |m| b.enableDirectStreaming(m);
+        if (draft_st) |ds| if (ds.mapping()) |m| b.enableDirectStreaming(m);
+        if (eagle_st) |es| if (es.mapping) |m| b.enableDirectStreaming(m);
+    };
+
+    const dev: llm.session.Devices = .{ .cu_be = be_cuda, .vk_ctx = vk_ctx };
+    const driver: Qwen3Driver = .{
+        .be_cuda = be_cuda,
+        .draft_lm = if (draft_lm) |*d| d else null,
+        .eagle_st = if (eagle_st) |*e| e else null,
+        .target_lm = &lm,
+        .cap = cap,
+        .prompt_len = prompt_len,
+        .vram_budget = vram_budget,
+        .tok = &tok,
+        .io = io,
+        .gpa = gpa,
+        .ids = &ids,
+        .opts = opts,
+        .stdout = stdout,
+        .prompt = prompt,
+    };
+    const res = try llm.session.run(Qwen3Spec, dev, backend, &lm, prompt_len, llm.session.no_prefill, driver, io, gpa, cap, vram_budget, stdout);
+    if (profile) if (be_cuda) |b| {
+        try stdout.print("\n\nprofile (device, sync-per-op):\n", .{});
+        try llm.session.printCudaProfile(stdout, b);
+    };
+
+    const setup_s = @as(f64, @floatFromInt(res.t0 - t_init)) / 1e9;
+    const elapsed_s = @as(f64, @floatFromInt(Io.Clock.real.now(io).nanoseconds - res.t0)) / 1e9;
+    try llm.session.printSummary(stdout, prompt != null, res.n, setup_s, elapsed_s);
     if (opts.spec_k > 0 or opts.tree_nodes > 0) {
         const pct = if (spec_stats.drafted > 0)
             100.0 * @as(f64, @floatFromInt(spec_stats.accepted)) / @as(f64, @floatFromInt(spec_stats.drafted))
         else
             0.0;
         try stdout.print("[spec: {d}/{d} drafts accepted ({d:.0}%), {d} verify forwards for {d} tokens]\n", .{
-            spec_stats.accepted, spec_stats.drafted, pct, spec_stats.forwards, n,
+            spec_stats.accepted, spec_stats.drafted, pct, spec_stats.forwards, res.n,
         });
     }
     try stdout.flush();
@@ -770,6 +696,174 @@ fn runSession(
     return total;
 }
 
+/// The generation `driver` for the non-speculative architectures (gemma3,
+/// gemma4, qwen35): drive one turn / the chat loop with no model drafter.
+/// `session.run` calls `drive` on the constructed stepper. (qwen3's driver,
+/// which selects a draft / EAGLE drafter, lives with the qwen3 path.)
+const SimpleDriver = struct {
+    tok: *const TensorPencil.tokenizer.Tokenizer,
+    io: Io,
+    gpa: std.mem.Allocator,
+    ids: *std.ArrayList(u32),
+    opts: llm.engine.Options,
+    stdout: *Io.Writer,
+    prompt: ?[]const u8,
+    img_chat: ?ImageChat,
+    pub fn drive(self: SimpleDriver, model: anytype) !llm.session.RunResult {
+        const t0 = Io.Clock.real.now(self.io).nanoseconds;
+        const n = try runSession(model, null, self.tok, self.io, self.gpa, self.ids, self.opts, self.stdout, self.prompt, self.img_chat);
+        return .{ .n = n, .t0 = t0 };
+    }
+};
+
+/// Vulkan KV-window size for the gemma3 weight budget (2 x n_layers x cap x
+/// kvDim x f32). gemma4 has no Vulkan backend, so its window fn is never called.
+fn gemma3KvWindow(lm: *const TensorPencil.models.gemma3.Model, cap: llm.engine.Capacity) u64 {
+    return 2 * @as(u64, lm.cfg.n_layers) * cap.max * lm.cfg.kvDim() * 4;
+}
+fn gemma4KvWindow(lm: *const TensorPencil.models.gemma4.Model, cap: llm.engine.Capacity) u64 {
+    _ = lm;
+    _ = cap;
+    return 0; // gemma4 Spec has Vulkan = void; never reached
+}
+fn qwen35KvWindow(lm: *const TensorPencil.models.qwen35.Model, cap: llm.engine.Capacity) u64 {
+    _ = lm;
+    _ = cap;
+    return 0; // qwen35 Vulkan pins what fits from full live VRAM (no KV reserve)
+}
+
+/// The generation `driver` for qwen35: like `SimpleDriver`, but first applies a
+/// hybrid CPU/GPU layer split (`--cpu-layers` / `--offload-grow`) to the built
+/// CUDA model and prints the split banner. The split is CUDA-only, so the setup
+/// is `@hasDecl`-guarded — it compiles away for the cpu / vulkan steppers (which
+/// the earlier feature gate has already restricted to no-split).
+const Qwen35Driver = struct {
+    cpu_split: ?TensorPencil.models.qwen35_cuda.CpuSplitPolicy,
+    dynamic_offload: bool,
+    vram_budget: u64,
+    n_layers: usize,
+    tok: *const TensorPencil.tokenizer.Tokenizer,
+    io: Io,
+    gpa: std.mem.Allocator,
+    ids: *std.ArrayList(u32),
+    opts: llm.engine.Options,
+    stdout: *Io.Writer,
+    prompt: ?[]const u8,
+    img_chat: ?ImageChat,
+    pub fn drive(self: Qwen35Driver, model: anytype) !llm.session.RunResult {
+        const M = @typeInfo(@TypeOf(model)).pointer.child;
+        if (comptime @hasDecl(M, "enableCpuSplit")) {
+            if (self.cpu_split != null or self.dynamic_offload) {
+                // Dynamic offload defaults to the attn policy (frees KV-growing
+                // layers first, recovering the most VRAM per migration).
+                const pol = self.cpu_split orelse .attn;
+                try model.enableCpuSplit(pol, self.vram_budget, self.dynamic_offload);
+                if (model.split) |sp| {
+                    const mode = if (sp.dynamic) "offload-grow" else "cpu-layers";
+                    try self.stdout.print("[--{s} {s}: {d}/{d} layers on CPU at start, {d} on GPU]\n", .{ mode, @tagName(sp.policy), sp.n_cpu, self.n_layers, self.n_layers - sp.n_cpu });
+                } else {
+                    try self.stdout.writeAll("[--cpu-layers: model fits under --vram-budget; no split needed]\n");
+                }
+                try self.stdout.flush();
+            }
+        }
+        // t0 after the (setup) cpu-split migration, so it counts as setup not generation.
+        const t0 = Io.Clock.real.now(self.io).nanoseconds;
+        const n = try runSession(model, null, self.tok, self.io, self.gpa, self.ids, self.opts, self.stdout, self.prompt, self.img_chat);
+        return .{ .n = n, .t0 = t0 };
+    }
+};
+
+/// qwen3's `Spec`: unlike the uniform archs, its CUDA/Vulkan steppers size
+/// fixed batch/tap buffers from the prompt length, so the builders thread
+/// `first_seq` through (and Vulkan takes `cap.max`, not the whole `Capacity`).
+const Qwen3Spec = struct {
+    pub const Model = qwen3.CausalLM;
+    pub const Cpu = llm.engine.CpuModel;
+    pub const Cuda = qwen3_cuda.CudaLM;
+    pub const Vulkan = TensorPencil.models.qwen3_gpu.VulkanLM;
+    pub fn kvWindow(lm: *const Model, cap: llm.engine.Capacity) u64 {
+        _ = lm;
+        return Vulkan.kvWindowBytes(cap.max);
+    }
+    pub fn buildCpu(gpa: std.mem.Allocator, lm: *const Model, cap: llm.engine.Capacity) !Cpu {
+        return Cpu.init(gpa, lm, cap);
+    }
+    pub fn buildCuda(gpa: std.mem.Allocator, be: *TensorPencil.gpu.cuda.Backend, lm: *const Model, cap: llm.engine.Capacity, first_seq: usize) !Cuda {
+        return Cuda.init(gpa, be, lm, cap, first_seq);
+    }
+    pub fn buildVulkan(gpa: std.mem.Allocator, ctx: *TensorPencil.gpu.Context, lm: *const Model, cap: llm.engine.Capacity, first_seq: usize) !Vulkan {
+        return Vulkan.init(gpa, ctx, lm, cap.max, first_seq);
+    }
+};
+
+/// The generation `driver` for qwen3: selects a speculative drafter and drives
+/// generation. EAGLE (a trained head over the target's tapped hidden states)
+/// and a CUDA draft model are CUDA-only; a CPU draft model runs on the CPU
+/// stepper; everything else (n-gram `--spec-k`, or vanilla) uses a null drafter
+/// (engine.generate handles n-gram internally). Branch selection is by exact
+/// stepper type, so the CUDA/CPU-only construction compiles away for the other
+/// backends (Vulkan falls through to the plain path).
+const Qwen3Driver = struct {
+    be_cuda: ?*TensorPencil.gpu.cuda.Backend,
+    draft_lm: ?*qwen3.CausalLM,
+    eagle_st: ?*TensorPencil.SafeTensors,
+    target_lm: *const qwen3.CausalLM,
+    cap: llm.engine.Capacity,
+    prompt_len: usize,
+    vram_budget: u64,
+    tok: *const TensorPencil.tokenizer.Tokenizer,
+    io: Io,
+    gpa: std.mem.Allocator,
+    ids: *std.ArrayList(u32),
+    opts: llm.engine.Options,
+    stdout: *Io.Writer,
+    prompt: ?[]const u8,
+
+    // Stamp t0 here (after any drafter/EAGLE construction in `drive`) so that
+    // setup work is not attributed to generation time.
+    fn gen(self: Qwen3Driver, model: anytype, drafter: anytype) !llm.session.RunResult {
+        const t0 = Io.Clock.real.now(self.io).nanoseconds;
+        const n = try runSession(model, drafter, self.tok, self.io, self.gpa, self.ids, self.opts, self.stdout, self.prompt, null);
+        return .{ .n = n, .t0 = t0 };
+    }
+
+    pub fn drive(self: Qwen3Driver, model: anytype) !llm.session.RunResult {
+        const M = @typeInfo(@TypeOf(model)).pointer.child;
+        if (comptime M == Qwen3Spec.Cuda) {
+            if (self.eagle_st) |est| {
+                try model.enableTaps(TensorPencil.models.eagle3.default_tap_layers);
+                if (self.opts.tree_nodes > 0) try model.enableTree();
+                var head = try TensorPencil.models.eagle3.Eagle3Head.load(self.gpa, self.be_cuda.?, est, self.target_lm, self.cap.max);
+                defer head.deinit();
+                var drafter = try TensorPencil.models.eagle3.Eagle3Drafter.init(self.gpa, &head, model);
+                defer drafter.deinit();
+                return self.gen(model, &drafter);
+            }
+            if (self.draft_lm) |dlm| {
+                var draft = try M.init(self.gpa, self.be_cuda.?, dlm, self.cap, self.prompt_len);
+                defer draft.deinit();
+                // First claim on the pin budget goes to the draft: its weights are
+                // read once per drafted token, the target's only once per ~k accepted
+                // tokens, so pinned draft bytes save more PCIe.
+                if (self.vram_budget != 0) try draft.prewarmWeights();
+                var drafter = try llm.spec.ModelDrafter(M).init(self.gpa, self.io, &draft);
+                defer drafter.deinit();
+                return self.gen(model, &drafter);
+            }
+        } else if (comptime M == Qwen3Spec.Cpu) {
+            if (self.draft_lm) |dlm| {
+                var draft = try M.init(self.gpa, dlm, self.cap);
+                defer draft.deinit();
+                var drafter = try llm.spec.ModelDrafter(M).init(self.gpa, self.io, &draft);
+                defer drafter.deinit();
+                return self.gen(model, &drafter);
+            }
+        }
+        return self.gen(model, null);
+    }
+};
+
 /// One turn's generation: engine.generate for null drafters (vanilla, or
 /// n-gram speculative when spec_k > 0), spec.generate for a model drafter.
 fn doGenerate(
@@ -841,7 +935,10 @@ fn runQwen35(
     const debug_cpu_vit = false;
 
     // CUDA backends create the device context up front so the ViT (image
-    // encode) can run on it before the LLM claims the VRAM.
+    // encode) can run on it before the LLM claims the VRAM. (bringUpCuda isn't
+    // used here: under a CPU/GPU split the weight budget is NOT applied — the
+    // split keeps its GPU layers fully resident and sizes itself after the
+    // model is built, in Qwen35Driver.)
     const cuda_be = TensorPencil.gpu.cuda.Backend;
     const be_cuda: ?*cuda_be = switch (backend) {
         .cuda => try cuda_be.initLibs(arena),
@@ -849,6 +946,18 @@ fn runQwen35(
         else => null,
     };
     defer if (be_cuda) |be| be.deinit();
+    if (be_cuda) |be| {
+        be.profile = profile;
+        if (cpu_split == null and !dynamic_offload) {
+            _ = llm.session.applyCuda(be, vram_budget);
+            // Page-lock the checkpoint mmap so a streamed tail DMAs at full PCIe
+            // bandwidth, prefetched one layer ahead (skipped when fully resident).
+            if (vram_budget != 0) if (g.mapping) |m| be.enableDirectStreaming(m);
+        }
+    }
+    // Vulkan context up front (the qwen35 LLM runs on it; there is no Vulkan ViT).
+    const vk_ctx: ?*TensorPencil.gpu.Context = if (backend == .vulkan) try TensorPencil.gpu.Context.init(arena) else null;
+    defer if (vk_ctx) |c| c.deinit();
 
     // The vision tower stays loaded for the whole session when --mmproj is
     // given: --image encodes up front (one-shot), and interactive turns can
@@ -980,99 +1089,57 @@ fn runQwen35(
         return;
     }
 
-    const t_init = Io.Clock.real.now(io).nanoseconds;
-    var t0: i96 = undefined;
-    const n = switch (backend) {
-        .cpu => blk: {
-            if (vram_budget != 0) try stdout.writeAll("[--vram-budget ignored on the cpu backend]\n");
-            var model = try qwen35.CpuModel.init(gpa, &lm, cap);
-            defer model.deinit();
-            // --profile on the cpu backend: wall-time breakdown of the forward
-            // pass (matmul now ggml; this surfaces the arch-specific ops).
-            if (profile) {
-                TensorPencil.prof.reset();
-                TensorPencil.prof.enabled = true;
-            }
-            defer if (profile) TensorPencil.prof.report(stdout) catch {};
-            t0 = Io.Clock.real.now(io).nanoseconds;
-            break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt, null);
-        },
-        .@"zig-cuda", .cuda => blk: {
-            const be = be_cuda.?;
-            be.profile = profile;
-            // Three ways to fit under --vram-budget, mutually exclusive: stream
-            // weights past the cap (default), move whole layers to the CPU
-            // (--cpu-layers, static), or migrate layers as the context grows
-            // (--offload-grow, dynamic). The two split modes keep GPU-resident
-            // weights fully resident (no streaming) and size themselves below.
-            if (cpu_split == null and !dynamic_offload) {
-                const eff_budget = defaultWeightBudget(be, vram_budget);
-                be.budget_override = vram_budget; // --vram-budget: hard weight cap (0 = driver-managed)
-                be.pin_budget = eff_budget -| pin_slack; // default: pin the whole model if it fits, else the prefix
-                be.stream_window = @min(pin_slack, eff_budget); // in-flight streamed-weight cap / enqueue pacing
-                // Page-lock the checkpoint mmap so streamed weights DMA directly at
-                // full PCIe bandwidth, prefetched one layer ahead (mirrors the dense
-                // path; skipped when everything stays resident or the file isn't mmap'd).
-                if (vram_budget != 0) if (g.mapping) |m| be.enableDirectStreaming(m);
-            }
-            defer if (profile) {
-                inline for (@typeInfo(cuda_be.ProfCat).@"enum".fields, 0..) |f, ci| {
-                    if (be.prof.n[ci] > 0)
-                        stdout.print("  {s:<9} {d:>8.1} ms  ({d} launches)\n", .{ f.name, be.prof.ms[ci], be.prof.n[ci] }) catch {};
-                }
-                stdout.flush() catch {};
-            };
-            var model = try TensorPencil.models.qwen35_cuda.CudaLM.init(gpa, be, &lm, cap);
-            defer model.deinit();
-            if (cpu_split != null or dynamic_offload) {
-                // Dynamic offload defaults to the attn policy (frees KV-growing
-                // layers first, recovering the most VRAM per migration).
-                const pol = cpu_split orelse .attn;
-                try model.enableCpuSplit(pol, vram_budget, dynamic_offload);
-                if (model.split) |sp| {
-                    const mode = if (sp.dynamic) "offload-grow" else "cpu-layers";
-                    try stdout.print("[--{s} {s}: {d}/{d} layers on CPU at start, {d} on GPU]\n", .{ mode, @tagName(sp.policy), sp.n_cpu, lm.cfg.n_layers, lm.cfg.n_layers - sp.n_cpu });
-                } else {
-                    try stdout.writeAll("[--cpu-layers: model fits under --vram-budget; no split needed]\n");
-                }
-                try stdout.flush();
-            }
-            if (img) |*e| {
-                // Mixed prefill: tokens, then the image embeddings (in place
-                // of the placeholder rows), then all but the last token —
-                // the engine's generate() prefills that one and samples.
-                const n_img = e.grid_w * e.grid_h;
-                try model.prefill(ids.items[0..n_pre]);
-                try model.prefillImage(e.embeds, e.grid_w, e.grid_h);
-                try model.prefill(ids.items[n_pre + n_img .. ids.items.len - 1]);
-            }
-            t0 = Io.Clock.real.now(io).nanoseconds;
-            break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt, img_chat);
-        },
-        .vulkan => blk: {
-            var ctx = try TensorPencil.gpu.Context.init(arena);
-            defer ctx.deinit();
-            // Pin what fits (block-quant weights stay resident); KV is fixed
-            // capacity up front (no growable buffers on Vulkan yet).
-            const eff = if (vram_budget != 0) vram_budget else ctx.liveVram();
-            ctx.budget_override = vram_budget;
-            ctx.pin_budget = eff -| pin_slack;
-            var model = try TensorPencil.models.qwen35_gpu.VulkanLM.init(gpa, ctx, &lm, cap);
-            defer model.deinit();
-            t0 = Io.Clock.real.now(io).nanoseconds;
-            break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt, null);
-        },
-    };
-    const t_end = Io.Clock.real.now(io).nanoseconds;
-    const setup_s = @as(f64, @floatFromInt(t0 - t_init)) / 1e9;
-    const elapsed_s = @as(f64, @floatFromInt(t_end - t0)) / 1e9;
-    if (prompt != null) {
-        try stdout.print("\n\n[{d} tokens in {d:.1}s, {d:.2} tok/s; setup {d:.1}s]\n", .{
-            n, elapsed_s, @as(f64, @floatFromInt(n)) / elapsed_s, setup_s,
-        });
-    } else {
-        try stdout.print("[session over: {d} tokens generated; setup was {d:.1}s]\n", .{ n, setup_s });
+    // --profile: wall-clock forward-pass breakdown on cpu, device op timings on
+    // the CUDA backends. Enable the cpu profiler before generation; reported
+    // after `run` (before the summary, matching the old per-arm ordering).
+    if (profile and backend == .cpu) {
+        TensorPencil.prof.reset();
+        TensorPencil.prof.enabled = true;
     }
+
+    const dev: llm.session.Devices = .{ .cu_be = be_cuda, .vk_ctx = vk_ctx };
+    const Spec = llm.session.UniformSpec(
+        qwen35.Model,
+        qwen35.CpuModel,
+        TensorPencil.models.qwen35_cuda.CudaLM,
+        TensorPencil.models.qwen35_gpu.VulkanLM,
+        qwen35KvWindow,
+    );
+    const n_img: usize = if (img) |*e| e.grid_w * e.grid_h else 0;
+    const prefiller: llm.session.ImagePrefiller(TensorPencil.models.vit35.Vit.Encoded) = .{
+        .img = if (img) |*e| e else null,
+        .n_pre = n_pre,
+        .n_img = n_img,
+        .ids = ids.items,
+    };
+    const driver: Qwen35Driver = .{
+        .cpu_split = cpu_split,
+        .dynamic_offload = dynamic_offload,
+        .vram_budget = vram_budget,
+        .n_layers = lm.cfg.n_layers,
+        .tok = &tok,
+        .io = io,
+        .gpa = gpa,
+        .ids = &ids,
+        .opts = opts,
+        .stdout = stdout,
+        .prompt = prompt,
+        .img_chat = img_chat,
+    };
+
+    const t_init = Io.Clock.real.now(io).nanoseconds;
+    const res = try llm.session.run(Spec, dev, backend, &lm, ids.items.len, prefiller, driver, io, gpa, cap, vram_budget, stdout);
+    if (profile) {
+        if (backend == .cpu) {
+            TensorPencil.prof.report(stdout) catch {};
+        } else if (be_cuda) |be| {
+            llm.session.printCudaProfile(stdout, be) catch {};
+            stdout.flush() catch {};
+        }
+    }
+    const setup_s = @as(f64, @floatFromInt(res.t0 - t_init)) / 1e9;
+    const elapsed_s = @as(f64, @floatFromInt(Io.Clock.real.now(io).nanoseconds - res.t0)) / 1e9;
+    try llm.session.printSummary(stdout, prompt != null, res.n, setup_s, elapsed_s);
     try stdout.flush();
 }
 
@@ -1114,22 +1181,11 @@ fn runGemma3(
     llm.chat.setFamily(.gemma);
 
     // CUDA backend created up front (so the ViT can encode before the LLM
-    // claims VRAM); null on cpu. Budget/pinning set here for the session.
-    const cuda_be = TensorPencil.gpu.cuda.Backend;
-    const be_cuda: ?*cuda_be = switch (backend) {
-        .cuda => try cuda_be.initLibs(arena),
-        .@"zig-cuda" => try cuda_be.init(arena),
-        else => null,
-    };
+    // claims VRAM); null on cpu. Bring-up pins weights under the budget; then
+    // page-lock the checkpoint mmap so a streamed tail DMAs at full bandwidth.
+    const be_cuda = try llm.session.bringUpCuda(arena, backend, profile, vram_budget);
     defer if (be_cuda) |b| b.deinit();
-    if (be_cuda) |b| {
-        b.profile = profile;
-        const eff_budget = defaultWeightBudget(b, vram_budget);
-        b.budget_override = vram_budget;
-        b.pin_budget = eff_budget -| pin_slack;
-        b.stream_window = @min(pin_slack, eff_budget);
-        if (vram_budget != 0) if (g.mapping) |m| b.enableDirectStreaming(m);
-    }
+    if (be_cuda) |b| if (vram_budget != 0) if (g.mapping) |m| b.enableDirectStreaming(m);
     // Vulkan context created up front too (shared by the ViT and the LLM).
     const vk_ctx: ?*TensorPencil.gpu.Context = if (backend == .vulkan) try TensorPencil.gpu.Context.init(arena) else null;
     defer if (vk_ctx) |c| c.deinit();
@@ -1216,64 +1272,29 @@ fn runGemma3(
     }
     defer if (profile) TensorPencil.prof.report(stdout) catch {};
 
-    const t_init = Io.Clock.real.now(io).nanoseconds;
-    var t0: i96 = undefined;
-    const n = switch (backend) {
-        .cpu => blk: {
-            if (vram_budget != 0) try stdout.writeAll("[--vram-budget ignored on the cpu backend]\n");
-            var model = try gemma3.CpuModel.init(gpa, &lm, cap);
-            defer model.deinit();
-            model.io = io; // image prefill runs before the first step
-            if (img) |*e| {
-                try model.prefill(ids.items[0..n_pre]);
-                try model.prefillImage(e.embeds, e.grid_w, e.grid_h);
-                try model.prefill(ids.items[n_pre + n_img .. ids.items.len - 1]);
-            }
-            t0 = Io.Clock.real.now(io).nanoseconds;
-            break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt, img_chat);
-        },
-        .@"zig-cuda", .cuda => blk: {
-            const be = be_cuda.?; // created up front (budget/pinning set there)
-            var model = try TensorPencil.models.gemma3_cuda.CudaLM.init(gpa, be, &lm, cap);
-            defer model.deinit();
-            if (img) |*e| {
-                try model.prefill(ids.items[0..n_pre]);
-                try model.prefillImage(e.embeds, e.grid_w, e.grid_h);
-                try model.prefill(ids.items[n_pre + n_img .. ids.items.len - 1]);
-            }
-            t0 = Io.Clock.real.now(io).nanoseconds;
-            break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt, img_chat);
-        },
-        .vulkan => blk: {
-            const ctx = vk_ctx.?; // created up front (shared with the ViT)
-            // Vulkan reserves the whole KV window up front and never evicts
-            // pinned weights, so leave that window's VRAM unpinned.
-            const kv_window = 2 * lm.cfg.n_layers * cap.max * lm.cfg.kvDim() * 4;
-            const eff = if (vram_budget != 0) vram_budget else ctx.liveVram() -| kv_window;
-            ctx.budget_override = vram_budget;
-            ctx.pin_budget = eff -| pin_slack;
-            var model = try TensorPencil.models.gemma3_gpu.VulkanLM.init(gpa, ctx, &lm, cap);
-            defer model.deinit();
-            if (img) |*e| {
-                try model.prefill(ids.items[0..n_pre]);
-                try model.prefillImage(e.embeds, e.grid_w, e.grid_h);
-                try model.prefill(ids.items[n_pre + n_img .. ids.items.len - 1]);
-            }
-            t0 = Io.Clock.real.now(io).nanoseconds;
-            break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt, null);
-        },
+    const dev: llm.session.Devices = .{ .cu_be = be_cuda, .vk_ctx = vk_ctx };
+    const Spec = llm.session.UniformSpec(
+        gemma3.Model,
+        gemma3.CpuModel,
+        TensorPencil.models.gemma3_cuda.CudaLM,
+        TensorPencil.models.gemma3_gpu.VulkanLM,
+        gemma3KvWindow,
+    );
+    const prefiller: llm.session.ImagePrefiller(TensorPencil.models.gemma_vit.Vit.Encoded) = .{
+        .img = if (img) |*e| e else null,
+        .n_pre = n_pre,
+        .n_img = n_img,
+        .ids = ids.items,
     };
-    const t_end = Io.Clock.real.now(io).nanoseconds;
+    // On Vulkan there is no CUDA backend, so img_chat is already null (interactive
+    // @image is CUDA-only) — the driver passes it uniformly.
+    const driver: SimpleDriver = .{ .tok = &tok, .io = io, .gpa = gpa, .ids = &ids, .opts = opts, .stdout = stdout, .prompt = prompt, .img_chat = img_chat };
 
-    const setup_s = @as(f64, @floatFromInt(t0 - t_init)) / 1e9;
-    const elapsed_s = @as(f64, @floatFromInt(t_end - t0)) / 1e9;
-    if (prompt != null) {
-        try stdout.print("\n\n[{d} tokens in {d:.1}s, {d:.2} tok/s; setup {d:.1}s]\n", .{
-            n, elapsed_s, @as(f64, @floatFromInt(n)) / elapsed_s, setup_s,
-        });
-    } else {
-        try stdout.print("[session over: {d} tokens generated; setup was {d:.1}s]\n", .{ n, setup_s });
-    }
+    const t_init = Io.Clock.real.now(io).nanoseconds;
+    const res = try llm.session.run(Spec, dev, backend, &lm, ids.items.len, prefiller, driver, io, gpa, cap, vram_budget, stdout);
+    const setup_s = @as(f64, @floatFromInt(res.t0 - t_init)) / 1e9;
+    const elapsed_s = @as(f64, @floatFromInt(Io.Clock.real.now(io).nanoseconds - res.t0)) / 1e9;
+    try llm.session.printSummary(stdout, prompt != null, res.n, setup_s, elapsed_s);
     try stdout.flush();
 }
 
@@ -1317,22 +1338,10 @@ fn runGemma4(
     llm.chat.setFamily(.gemma4);
 
     // CUDA backend created up front so the vision embedder can encode
-    // device-side (the LLM claims VRAM after). Null on cpu.
-    const cuda_be = TensorPencil.gpu.cuda.Backend;
-    const be_cuda: ?*cuda_be = switch (backend) {
-        .cuda => try cuda_be.initLibs(arena),
-        .@"zig-cuda" => try cuda_be.init(arena),
-        else => null,
-    };
+    // device-side (the LLM claims VRAM after). Null on cpu. A 0 budget pins the
+    // whole model resident (the 12B Q4_0 fits the 3090).
+    const be_cuda = try llm.session.bringUpCuda(arena, backend, profile, 0);
     defer if (be_cuda) |bb| bb.deinit();
-    if (be_cuda) |bb| {
-        // Pin the whole model resident (the 12B Q4_0 fits the 3090); without a
-        // pin budget cachedWeight pins nothing (see defaultWeightBudget).
-        bb.profile = profile;
-        const eff_budget = defaultWeightBudget(bb, 0);
-        bb.pin_budget = eff_budget -| pin_slack;
-        bb.stream_window = @min(pin_slack, eff_budget);
-    }
 
     // Vision embedder (--mmproj): the gemma4uv "unified" embedder (no ViT
     // blocks) runs device-side on the CUDA backends (host on cpu); --image
@@ -1404,47 +1413,31 @@ fn runGemma4(
     }
     defer if (profile) TensorPencil.prof.report(stdout) catch {};
 
-    const t_init = Io.Clock.real.now(io).nanoseconds;
     // CUDA backend + pinning were set up front (before the vision encode). No
-    // CPU-split / offload / streaming — the 12B fits.
-    var t0: i96 = undefined;
-    const n = switch (backend) {
-        .cpu => blk: {
-            var model = try gemma4.CpuModel.init(gpa, &lm, cap);
-            defer model.deinit();
-            model.io = io;
-            if (img) |*e| {
-                try model.prefill(ids.items[0..n_pre]);
-                try model.prefillImage(e.embeds, e.grid_w, e.grid_h);
-                try model.prefill(ids.items[n_pre + n_img .. ids.items.len - 1]);
-            }
-            t0 = Io.Clock.real.now(io).nanoseconds;
-            break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt, null);
-        },
-        .@"zig-cuda", .cuda => blk: {
-            var model = try TensorPencil.models.gemma4_cuda.CudaLM.init(gpa, be_cuda.?, &lm, cap);
-            defer model.deinit();
-            if (img) |*e| {
-                try model.prefill(ids.items[0..n_pre]);
-                try model.prefillImage(e.embeds, e.grid_w, e.grid_h);
-                try model.prefill(ids.items[n_pre + n_img .. ids.items.len - 1]);
-            }
-            t0 = Io.Clock.real.now(io).nanoseconds;
-            break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt, null);
-        },
-        .vulkan => unreachable, // rejected above
+    // CPU-split / offload / streaming — the 12B fits. gemma4 has no Vulkan
+    // backend (Spec.Vulkan = void); main() rejects --backend vulkan before here.
+    const dev: llm.session.Devices = .{ .cu_be = be_cuda };
+    const Spec = llm.session.UniformSpec(
+        gemma4.Model,
+        gemma4.CpuModel,
+        TensorPencil.models.gemma4_cuda.CudaLM,
+        void,
+        gemma4KvWindow,
+    );
+    const prefiller: llm.session.ImagePrefiller(TensorPencil.models.gemma4_vit.Vit.Encoded) = .{
+        .img = if (img) |*e| e else null,
+        .n_pre = n_pre,
+        .n_img = n_img,
+        .ids = ids.items,
     };
-    const t_end = Io.Clock.real.now(io).nanoseconds;
+    const driver: SimpleDriver = .{ .tok = &tok, .io = io, .gpa = gpa, .ids = &ids, .opts = opts, .stdout = stdout, .prompt = prompt, .img_chat = null };
 
-    const setup_s = @as(f64, @floatFromInt(t0 - t_init)) / 1e9;
-    const elapsed_s = @as(f64, @floatFromInt(t_end - t0)) / 1e9;
-    if (prompt != null) {
-        try stdout.print("\n\n[{d} tokens in {d:.1}s, {d:.2} tok/s; setup {d:.1}s]\n", .{
-            n, elapsed_s, @as(f64, @floatFromInt(n)) / elapsed_s, setup_s,
-        });
-    } else {
-        try stdout.print("[session over: {d} tokens generated; setup was {d:.1}s]\n", .{ n, setup_s });
-    }
+    const t_init = Io.Clock.real.now(io).nanoseconds;
+    // gemma4 ignores --vram-budget (it always pins the whole model), so pass 0.
+    const res = try llm.session.run(Spec, dev, backend, &lm, ids.items.len, prefiller, driver, io, gpa, cap, 0, stdout);
+    const setup_s = @as(f64, @floatFromInt(res.t0 - t_init)) / 1e9;
+    const elapsed_s = @as(f64, @floatFromInt(Io.Clock.real.now(io).nanoseconds - res.t0)) / 1e9;
+    try llm.session.printSummary(stdout, prompt != null, res.n, setup_s, elapsed_s);
     try stdout.flush();
 }
 
@@ -1479,7 +1472,7 @@ fn capacityPlan(opts: llm.engine.Options, prompt: ?[]const u8, n_prompt: usize, 
     return .{ .initial = @min(max, @max(n_prompt + 1, llm.kv_cache.initial_context)), .max = max };
 }
 
-const BackendKind = enum { cpu, @"zig-cuda", cuda, vulkan };
+const BackendKind = llm.session.BackendKind;
 
 /// A checkpoint opened from disk, container chosen by file extension
 /// (".gguf" or safetensors otherwise).

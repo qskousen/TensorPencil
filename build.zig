@@ -249,6 +249,7 @@ pub fn build(b: *std.Build) void {
     // dependency-free. Mirrors DiffKeep's proven dvui-0.5.0-dev wiring.
     const gui_step = b.step("gui", "Build tp-gui (desktop GUI)");
     const run_gui_step = b.step("run-gui", "Run tp-gui");
+    const gui_test_step = b.step("gui-test", "Run tp-gui config unit tests (not part of `test`)");
     if (b.lazyDependency("dvui", .{
         .target = target,
         .optimize = optimize,
@@ -290,6 +291,20 @@ pub fn build(b: *std.Build) void {
             run_gui_cmd.step.dependOn(&install_gui.step);
             if (b.args) |args| run_gui_cmd.addArgs(args);
             run_gui_step.dependOn(&run_gui_cmd.step);
+
+            // GUI config unit tests. Kept off the default `test` step (which
+            // stays free of GUI deps); `config.zig` only pulls std + known-folders.
+            const gui_config_tests = b.addTest(.{
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/gui/config.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "known-folders", .module = kf.module("known-folders") },
+                    },
+                }),
+            });
+            gui_test_step.dependOn(&b.addRunArtifact(gui_config_tests).step);
         }
     }
 

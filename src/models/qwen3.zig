@@ -24,6 +24,7 @@ const gguf_mod = @import("../gguf.zig");
 const weights_mod = @import("../weights.zig");
 const dtypes = @import("../dtype.zig");
 const ops = @import("../ops.zig");
+const transformer = @import("transformer.zig");
 const kv_cache_mod = @import("../llm/kv_cache.zig");
 
 const SafeTensors = safetensors.SafeTensors;
@@ -40,6 +41,31 @@ pub const n_layers = 36;
 pub const vocab_size = 151936;
 pub const rms_eps: f32 = 1e-6;
 pub const rope_theta: f64 = 5000000.0;
+
+/// Per-layer dims for the shared transformer body. qwen3 has uniform geometry
+/// and a compile-time `head_dim`, so these are constant across layers. The
+/// encoder uses module-const dims; `CausalLM` derives them from its runtime
+/// Config via `dimsFor` (n_layers/hidden/heads vary across Qwen3 checkpoints).
+const encoderDims: transformer.Dims = .{
+    .hidden = hidden,
+    .n_heads = n_heads,
+    .n_kv = n_kv_heads,
+    .head_dim = head_dim,
+    .q_dim = n_heads * head_dim,
+    .kv_dim = n_kv_heads * head_dim,
+    .intermediate = intermediate,
+};
+fn dimsFor(cfg: Config) transformer.Dims {
+    return .{
+        .hidden = cfg.hidden,
+        .n_heads = cfg.n_heads,
+        .n_kv = cfg.n_kv_heads,
+        .head_dim = head_dim,
+        .q_dim = cfg.qDim(),
+        .kv_dim = cfg.kvDim(),
+        .intermediate = cfg.intermediate,
+    };
+}
 
 /// Runtime model configuration for `CausalLM` — the extension point for
 /// other Qwen3-family checkpoints (LLM_PLAN.md M5 uses Qwen3-0.6B as the
@@ -228,6 +254,7 @@ pub const TextEncoder = struct {
         var scratch = try Scratch.init(gpa, seq, Config.vl_4b);
         defer scratch.deinit(gpa);
 
+        const dims = encoderDims;
         var tap_idx: usize = 0;
         for (0..n_layers) |l| {
             if (tap_idx < tap_layers.len and tap_layers[tap_idx] == l) {
@@ -237,7 +264,8 @@ pub const TextEncoder = struct {
                 tap_idx += 1;
             }
             if (l >= self.layers.len) break;
-            try layerForward(io, gpa, self.layers[l], x, seq, freqs, &scratch);
+            // Encoder: full-sequence, no persistent KV cache.
+            try transformer.layerForward(transformer.qwen3_spec, .fresh, io, gpa, self.layers[l], x, seq, dims, freqs, rms_eps, {}, 0, 0, &scratch);
         }
         std.debug.assert(tap_idx == tap_count);
         return out;
@@ -336,8 +364,10 @@ pub const CausalLM = struct {
         var scratch = try Scratch.init(gpa, seq, cfg);
         defer scratch.deinit(gpa);
 
+        const dims = dimsFor(cfg);
+        const pos0 = cache.len;
         for (self.layers, 0..) |layer, l| {
-            try layerForwardCached(io, gpa, cfg, layer, x, seq, freqs, cache, l, &scratch);
+            try transformer.layerForward(transformer.qwen3_spec, .cached, io, gpa, layer, x, seq, dims, freqs, rms_eps, cache, l, pos0, &scratch);
         }
         cache.commit(seq);
         if (out) |o| {
@@ -391,37 +421,9 @@ pub const CausalLM = struct {
         var s = try Scratch.init(gpa, n, cfg);
         defer s.deinit(gpa);
 
+        const dims = dimsFor(cfg);
         for (self.layers, 0..) |layer, l| {
-            const kvd = cfg.kvDim();
-            const lk = tree_k[l * n * kvd ..][0 .. n * kvd];
-            const lv = tree_v[l * n * kvd ..][0 .. n * kvd];
-
-            // Attention.
-            ops.norm.rmsNorm(s.normed, x, layer.input_norm, rms_eps);
-            try ops.matmul.matmul(io, gpa, s.q, s.normed, n, layer.q, null);
-            try ops.matmul.matmul(io, gpa, s.k, s.normed, n, layer.k, null);
-            try ops.matmul.matmul(io, gpa, s.v, s.normed, n, layer.v, null);
-            ops.norm.rmsNorm(s.q, s.q, layer.q_norm, rms_eps); // per-head: rows of head_dim
-            ops.norm.rmsNorm(s.k, s.k, layer.k_norm, rms_eps);
-            ops.rope.applyRotateHalfPos(s.q, freqs, positions, cfg.n_heads, head_dim);
-            ops.rope.applyRotateHalfPos(s.k, freqs, positions, cfg.n_kv_heads, head_dim);
-            @memcpy(lk, s.k[0 .. n * kvd]);
-            @memcpy(lv, s.v[0 .. n * kvd]);
-            try ops.attention.attentionTree(gpa, s.attn_out, s.q, cache.kView(l, 0), cache.vView(l, 0), lk, lv, parents, .{
-                .n_heads = cfg.n_heads,
-                .n_kv_heads = cfg.n_kv_heads,
-                .head_dim = head_dim,
-            });
-            try ops.matmul.matmul(io, gpa, s.tmp, s.attn_out, n, layer.o, null);
-            for (x, s.tmp) |*xi, ti| xi.* += ti;
-
-            // MLP.
-            ops.norm.rmsNorm(s.normed, x, layer.post_norm, rms_eps);
-            try ops.matmul.matmul(io, gpa, s.gate, s.normed, n, layer.gate, null);
-            try ops.matmul.matmul(io, gpa, s.up, s.normed, n, layer.up, null);
-            ops.act.siluMul(s.gate, s.up);
-            try ops.matmul.matmul(io, gpa, s.tmp, s.gate, n, layer.down, null);
-            for (x, s.tmp) |*xi, ti| xi.* += ti;
+            try transformer.layerForwardTree(transformer.qwen3_spec, io, gpa, layer, x, n, dims, freqs, positions, parents, cache, l, tree_k, tree_v, rms_eps, &s);
         }
         ops.norm.rmsNorm(out, x, self.final_norm, rms_eps);
     }
@@ -484,84 +486,6 @@ const Scratch = struct {
         self.* = undefined;
     }
 };
-
-/// One transformer layer over `x` [seq, hidden], residuals added in place.
-fn layerForward(io: std.Io, gpa: std.mem.Allocator, layer: Layer, x: []f32, seq: usize, freqs: ops.rope.Freqs, s: *Scratch) !void {
-    // Attention.
-    ops.norm.rmsNorm(s.normed, x, layer.input_norm, rms_eps);
-    try ops.matmul.matmul(io, gpa, s.q, s.normed, seq, layer.q, null);
-    try ops.matmul.matmul(io, gpa, s.k, s.normed, seq, layer.k, null);
-    try ops.matmul.matmul(io, gpa, s.v, s.normed, seq, layer.v, null);
-    ops.norm.rmsNorm(s.q, s.q, layer.q_norm, rms_eps); // per-head: rows of head_dim
-    ops.norm.rmsNorm(s.k, s.k, layer.k_norm, rms_eps);
-    ops.rope.applyRotateHalf(s.q, freqs, seq, n_heads, head_dim);
-    ops.rope.applyRotateHalf(s.k, freqs, seq, n_kv_heads, head_dim);
-    try ops.attention.attention(io, gpa, s.attn_out, s.q, s.k, s.v, .{
-        .seq_q = seq,
-        .seq_kv = seq,
-        .n_heads = n_heads,
-        .n_kv_heads = n_kv_heads,
-        .head_dim = head_dim,
-        .causal = true,
-    });
-    try ops.matmul.matmul(io, gpa, s.tmp, s.attn_out, seq, layer.o, null);
-    for (x, s.tmp) |*xi, ti| xi.* += ti;
-
-    // MLP.
-    ops.norm.rmsNorm(s.normed, x, layer.post_norm, rms_eps);
-    try ops.matmul.matmul(io, gpa, s.gate, s.normed, seq, layer.gate, null);
-    try ops.matmul.matmul(io, gpa, s.up, s.normed, seq, layer.up, null);
-    ops.act.siluMul(s.gate, s.up);
-    try ops.matmul.matmul(io, gpa, s.tmp, s.gate, seq, layer.down, null);
-    for (x, s.tmp) |*xi, ti| xi.* += ti;
-}
-
-/// layerForward against a KV cache: `x` holds only the `seq` NEW tokens (at
-/// absolute positions cache.len..), their K/V are appended to layer `l` of
-/// the cache, and attention runs over the whole cached prefix.
-fn layerForwardCached(
-    io: std.Io,
-    gpa: std.mem.Allocator,
-    cfg: Config,
-    layer: Layer,
-    x: []f32,
-    seq: usize,
-    freqs: ops.rope.Freqs,
-    cache: *KvCache,
-    l: usize,
-    s: *Scratch,
-) !void {
-    const pos0 = cache.len;
-
-    // Attention.
-    ops.norm.rmsNorm(s.normed, x, layer.input_norm, rms_eps);
-    try ops.matmul.matmul(io, gpa, s.q, s.normed, seq, layer.q, null);
-    try ops.matmul.matmul(io, gpa, s.k, s.normed, seq, layer.k, null);
-    try ops.matmul.matmul(io, gpa, s.v, s.normed, seq, layer.v, null);
-    ops.norm.rmsNorm(s.q, s.q, layer.q_norm, rms_eps); // per-head: rows of head_dim
-    ops.norm.rmsNorm(s.k, s.k, layer.k_norm, rms_eps);
-    ops.rope.applyRotateHalfAt(s.q, freqs, pos0, seq, cfg.n_heads, head_dim);
-    ops.rope.applyRotateHalfAt(s.k, freqs, pos0, seq, cfg.n_kv_heads, head_dim);
-    cache.write(l, s.k[0 .. seq * cfg.kvDim()], s.v[0 .. seq * cfg.kvDim()]);
-    try ops.attention.attention(io, gpa, s.attn_out, s.q, cache.kView(l, seq), cache.vView(l, seq), .{
-        .seq_q = seq,
-        .seq_kv = pos0 + seq,
-        .n_heads = cfg.n_heads,
-        .n_kv_heads = cfg.n_kv_heads,
-        .head_dim = head_dim,
-        .causal = true,
-    });
-    try ops.matmul.matmul(io, gpa, s.tmp, s.attn_out, seq, layer.o, null);
-    for (x, s.tmp) |*xi, ti| xi.* += ti;
-
-    // MLP.
-    ops.norm.rmsNorm(s.normed, x, layer.post_norm, rms_eps);
-    try ops.matmul.matmul(io, gpa, s.gate, s.normed, seq, layer.gate, null);
-    try ops.matmul.matmul(io, gpa, s.up, s.normed, seq, layer.up, null);
-    ops.act.siluMul(s.gate, s.up);
-    try ops.matmul.matmul(io, gpa, s.tmp, s.gate, seq, layer.down, null);
-    for (x, s.tmp) |*xi, ti| xi.* += ti;
-}
 
 fn loadLayers(alloc: std.mem.Allocator, st: *const SafeTensors, count: usize) ![]Layer {
     return loadLayersCfg(alloc, .{ .safetensors = st }, Config.vl_4b, count);

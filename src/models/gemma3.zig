@@ -28,6 +28,8 @@ const gguf_mod = @import("../gguf.zig");
 const weights_mod = @import("../weights.zig");
 const qwen3 = @import("qwen3.zig");
 const ops = @import("../ops.zig");
+const loader = @import("loader.zig");
+const transformer = @import("transformer.zig");
 const kv_cache_mod = @import("../llm/kv_cache.zig");
 
 const Gguf = gguf_mod.Gguf;
@@ -148,30 +150,30 @@ pub const Model = struct {
         errdefer arena.deinit();
         const alloc = arena.allocator();
 
-        const embed = try loadMatrix(store, "embed_tokens.weight", cfg.vocab, cfg.hidden);
+        const embed = try loader.matrix(store, "embed_tokens.weight", cfg.vocab, cfg.hidden);
         // Tied head, unless an explicit output.weight is present.
         const head = if (store.get("lm_head.weight")) |_|
-            try loadMatrix(store, "lm_head.weight", cfg.vocab, cfg.hidden)
+            try loader.matrix(store, "lm_head.weight", cfg.vocab, cfg.hidden)
         else
             embed;
-        const final_norm = try loadVec(alloc, store, "norm.weight", cfg.hidden);
+        const final_norm = try loader.vector(alloc, store, "norm.weight", cfg.hidden);
 
         const layers = try alloc.alloc(Layer, cfg.n_layers);
         for (layers, 0..) |*layer, l| {
             layer.* = .{
-                .input_norm = try loadLayerVec(alloc, store, l, "input_layernorm.weight", cfg.hidden),
-                .q = try loadLayerMatrix(store, l, "self_attn.q_proj.weight", cfg.qDim(), cfg.hidden),
-                .k = try loadLayerMatrix(store, l, "self_attn.k_proj.weight", cfg.kvDim(), cfg.hidden),
-                .v = try loadLayerMatrix(store, l, "self_attn.v_proj.weight", cfg.kvDim(), cfg.hidden),
-                .o = try loadLayerMatrix(store, l, "self_attn.o_proj.weight", cfg.hidden, cfg.qDim()),
-                .q_norm = try loadLayerVec(alloc, store, l, "self_attn.q_norm.weight", cfg.head_dim),
-                .k_norm = try loadLayerVec(alloc, store, l, "self_attn.k_norm.weight", cfg.head_dim),
-                .post_attn_norm = try loadLayerVec(alloc, store, l, "post_attention_layernorm.weight", cfg.hidden),
-                .pre_ffn_norm = try loadLayerVec(alloc, store, l, "pre_feedforward_layernorm.weight", cfg.hidden),
-                .post_ffn_norm = try loadLayerVec(alloc, store, l, "post_feedforward_layernorm.weight", cfg.hidden),
-                .gate = try loadLayerMatrix(store, l, "mlp.gate_proj.weight", cfg.intermediate, cfg.hidden),
-                .up = try loadLayerMatrix(store, l, "mlp.up_proj.weight", cfg.intermediate, cfg.hidden),
-                .down = try loadLayerMatrix(store, l, "mlp.down_proj.weight", cfg.hidden, cfg.intermediate),
+                .input_norm = try loader.indexedVector(alloc, store, "layers.", l, "input_layernorm.weight", cfg.hidden),
+                .q = try loader.indexedMatrix(store, "layers.", l, "self_attn.q_proj.weight", cfg.qDim(), cfg.hidden),
+                .k = try loader.indexedMatrix(store, "layers.", l, "self_attn.k_proj.weight", cfg.kvDim(), cfg.hidden),
+                .v = try loader.indexedMatrix(store, "layers.", l, "self_attn.v_proj.weight", cfg.kvDim(), cfg.hidden),
+                .o = try loader.indexedMatrix(store, "layers.", l, "self_attn.o_proj.weight", cfg.hidden, cfg.qDim()),
+                .q_norm = try loader.indexedVector(alloc, store, "layers.", l, "self_attn.q_norm.weight", cfg.head_dim),
+                .k_norm = try loader.indexedVector(alloc, store, "layers.", l, "self_attn.k_norm.weight", cfg.head_dim),
+                .post_attn_norm = try loader.indexedVector(alloc, store, "layers.", l, "post_attention_layernorm.weight", cfg.hidden),
+                .pre_ffn_norm = try loader.indexedVector(alloc, store, "layers.", l, "pre_feedforward_layernorm.weight", cfg.hidden),
+                .post_ffn_norm = try loader.indexedVector(alloc, store, "layers.", l, "post_feedforward_layernorm.weight", cfg.hidden),
+                .gate = try loader.indexedMatrix(store, "layers.", l, "mlp.gate_proj.weight", cfg.intermediate, cfg.hidden),
+                .up = try loader.indexedMatrix(store, "layers.", l, "mlp.up_proj.weight", cfg.intermediate, cfg.hidden),
+                .down = try loader.indexedMatrix(store, "layers.", l, "mlp.down_proj.weight", cfg.hidden, cfg.intermediate),
             };
         }
 
@@ -263,45 +265,20 @@ pub fn layerForward(
     l: usize,
     s: *Scratch,
 ) !void {
-    const pos0 = cache.len;
-    const hd = cfg.head_dim;
     const global = cfg.isGlobal(l);
-    const freqs = if (global) freqs_global else freqs_local;
-
-    // --- Attention ---
-    ops.norm.rmsNorm(s.normed, x, layer.input_norm, cfg.rms_eps);
-    try ops.matmul.matmul(io, gpa, s.q, s.normed, seq, layer.q, null);
-    try ops.matmul.matmul(io, gpa, s.k, s.normed, seq, layer.k, null);
-    try ops.matmul.matmul(io, gpa, s.v, s.normed, seq, layer.v, null);
-    ops.norm.rmsNorm(s.q, s.q, layer.q_norm, cfg.rms_eps); // per-head: rows of head_dim
-    ops.norm.rmsNorm(s.k, s.k, layer.k_norm, cfg.rms_eps);
-    ops.rope.applyRotateHalfAt(s.q, freqs, pos0, seq, cfg.n_heads, hd);
-    ops.rope.applyRotateHalfAt(s.k, freqs, pos0, seq, cfg.n_kv_heads, hd);
-
-    cache.write(l, s.k[0 .. seq * cfg.kvDim()], s.v[0 .. seq * cfg.kvDim()]);
-    try ops.attention.attention(io, gpa, s.attn_out, s.q, cache.kView(l, seq), cache.vView(l, seq), .{
-        .seq_q = seq,
-        .seq_kv = pos0 + seq,
+    const dims: transformer.Dims = .{
+        .hidden = cfg.hidden,
         .n_heads = cfg.n_heads,
-        .n_kv_heads = cfg.n_kv_heads,
-        .head_dim = hd,
-        .causal = true,
+        .n_kv = cfg.n_kv_heads,
+        .head_dim = cfg.head_dim,
+        .q_dim = cfg.qDim(),
+        .kv_dim = cfg.kvDim(),
+        .intermediate = cfg.intermediate,
         // Local layers use a sliding-window causal mask; global attend all.
-        .window = if (global) 0 else cfg.sliding_window,
-    });
-    // o_proj, then post-attention norm on the attn output BEFORE the residual.
-    try ops.matmul.matmul(io, gpa, s.tmp, s.attn_out, seq, layer.o, null);
-    ops.norm.rmsNorm(s.tmp, s.tmp, layer.post_attn_norm, cfg.rms_eps);
-    for (x, s.tmp) |*xi, ti| xi.* += ti;
-
-    // --- MLP (GeGLU) ---
-    ops.norm.rmsNorm(s.normed, x, layer.pre_ffn_norm, cfg.rms_eps);
-    try ops.matmul.matmul(io, gpa, s.gate, s.normed, seq, layer.gate, null);
-    try ops.matmul.matmul(io, gpa, s.up, s.normed, seq, layer.up, null);
-    ops.act.geluTanhMul(s.gate, s.up);
-    try ops.matmul.matmul(io, gpa, s.tmp, s.gate, seq, layer.down, null);
-    ops.norm.rmsNorm(s.tmp, s.tmp, layer.post_ffn_norm, cfg.rms_eps);
-    for (x, s.tmp) |*xi, ti| xi.* += ti;
+        .sliding_window = if (global) 0 else cfg.sliding_window,
+    };
+    const freqs = if (global) freqs_global else freqs_local;
+    try transformer.layerForward(transformer.gemma3_spec, .cached, io, gpa, layer, x, seq, dims, freqs, cfg.rms_eps, cache, l, cache.len, s);
 }
 
 /// Per-forward activation buffers, sized for `seq` tokens of `cfg`. Public so
@@ -363,29 +340,6 @@ pub const Scratch = struct {
         self.* = undefined;
     }
 };
-
-fn loadMatrix(store: WeightStore, name: []const u8, rows: usize, cols: usize) !Weight {
-    const view = store.get(name) orelse return error.MissingTensor;
-    const shape = view.info.shape.slice();
-    if (shape.len != 2 or shape[0] != rows or shape[1] != cols) return error.ShapeMismatch;
-    return Weight.init(view.bytes, view.info.dtype, rows, cols);
-}
-
-fn loadLayerMatrix(store: WeightStore, l: usize, comptime suffix: []const u8, rows: usize, cols: usize) !Weight {
-    var buf: [96]u8 = undefined;
-    return loadMatrix(store, try std.fmt.bufPrint(&buf, "layers.{d}." ++ suffix, .{l}), rows, cols);
-}
-
-fn loadVec(alloc: std.mem.Allocator, store: WeightStore, name: []const u8, len: usize) ![]f32 {
-    const view = store.get(name) orelse return error.MissingTensor;
-    if (view.info.elemCount() != len) return error.ShapeMismatch;
-    return view.toF32Alloc(alloc);
-}
-
-fn loadLayerVec(alloc: std.mem.Allocator, store: WeightStore, l: usize, comptime suffix: []const u8, len: usize) ![]f32 {
-    var buf: [96]u8 = undefined;
-    return loadVec(alloc, store, try std.fmt.bufPrint(&buf, "layers.{d}." ++ suffix, .{l}), len);
-}
 
 /// CPU stepper for the engine loop (mirrors engine.CpuModel). Speculative
 /// decoding is unsupported for now (no stepAll/truncate).

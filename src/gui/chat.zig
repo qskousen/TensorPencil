@@ -47,7 +47,14 @@ const Gguf = tp.Gguf;
 const RawImage = struct { rgb: []u8, width: usize, height: usize };
 
 /// A requested diffusion-model path set awaiting application (gpa-owned dupes).
-const PendingDiffPaths = struct { dit: []u8, vae: []u8, te: []u8, taew: ?[]u8 };
+const PendingDiffPaths = struct {
+    dit: []u8,
+    vae: []u8,
+    te: []u8,
+    taew: ?[]u8,
+    backend: pipeline.Backend,
+    vae_decode: pipeline.VaeDecode,
+};
 
 /// Round to a multiple of 16 (pipeline requirement) within sane bounds.
 fn clampDim(n: usize) usize {
@@ -198,6 +205,8 @@ pub const DiffConfig = struct {
     width: usize = 1024,
     height: usize = 1024,
     backend: pipeline.Backend = .zig_cuda,
+    /// VAE decode-path override (see pipeline.VaeDecode). Default adaptive.
+    vae_decode: pipeline.VaeDecode = .auto,
     /// 0 = auto (query live free VRAM); weights past the cap stream per step
     /// so diffusion coexists with the resident LLM.
     vram_budget: u64 = 0,
@@ -256,6 +265,9 @@ pub const Options = struct {
     max_new_tokens: usize = 2048,
     seed: u64 = 0,
     temperature: f32 = 0.7,
+    /// Compute backend for the chat LLM. Only the CUDA variants are supported
+    /// today; `.cpu`/`.vulkan` fail init with `error.UnsupportedLlmBackend`.
+    backend: pipeline.Backend = .zig_cuda,
     /// Image generation config; null disables the image tool.
     diff: ?DiffConfig = null,
     /// mmproj (vision tower) GGUF; enables dropping images to chat about them.
@@ -377,7 +389,15 @@ pub const Session = struct {
         errdefer self.tok.deinit();
         chat.applyTokenizer(&self.tok);
 
-        self.be = try cuda.Backend.init(arena);
+        // The chat LLM runs on CUDA only for now. Both CUDA variants work (the
+        // decode driver is identical — hand-PTX kernels either way; libs just
+        // adds cuBLASLt/cuDNN). Non-CUDA selections error cleanly (the loader
+        // surfaces it) rather than silently falling back.
+        self.be = switch (cfg.backend) {
+            .zig_cuda => try cuda.Backend.init(arena),
+            .cuda => try cuda.Backend.initLibs(arena),
+            .cpu, .vulkan => return error.UnsupportedLlmBackend,
+        };
         errdefer self.be.deinit();
 
         self.mmproj_gguf = null;
@@ -455,6 +475,7 @@ pub const Session = struct {
             .height = d.height,
             .steps = d.steps,
             .backend = d.backend,
+            .vae_decode = d.vae_decode,
             .vram_budget = d.vram_budget,
             .dit_path = d.dit_path,
             .vae_path = d.vae_path,
@@ -612,12 +633,22 @@ pub const Session = struct {
         }
     }
 
-    /// Request a diffusion-model swap (new dit/vae/text-encoder/taesd paths). The
-    /// swap is DEFERRED until the image queue is idle, so any in-flight or queued
-    /// image finishes on the current model; then `maybeApplyDiffPaths` applies it.
+    /// Request a diffusion-config swap (new dit/vae/text-encoder/taesd paths,
+    /// compute backend, and VAE decode path). The swap is DEFERRED until the
+    /// image queue is idle, so any in-flight or queued image finishes on the
+    /// current model; then `maybeApplyDiffPaths` applies it — including freeing
+    /// the resident pipeline so the next image rebuilds on the new backend.
     /// No-op if the image tool isn't enabled (that toggle needs a reload instead).
     /// Path args are borrowed (duped here).
-    pub fn requestDiffPaths(self: *Session, dit: []const u8, vae: []const u8, te: []const u8, taew: ?[]const u8) void {
+    pub fn requestDiffPaths(
+        self: *Session,
+        dit: []const u8,
+        vae: []const u8,
+        te: []const u8,
+        taew: ?[]const u8,
+        backend: pipeline.Backend,
+        vae_decode: pipeline.VaeDecode,
+    ) void {
         if (self.diff_opts == null) return;
         self.freePendingDiffPaths();
         const p: PendingDiffPaths = .{
@@ -625,6 +656,8 @@ pub const Session = struct {
             .vae = self.gpa.dupe(u8, vae) catch return,
             .te = self.gpa.dupe(u8, te) catch return,
             .taew = if (taew) |t| (self.gpa.dupe(u8, t) catch null) else null,
+            .backend = backend,
+            .vae_decode = vae_decode,
         };
         self.diff_paths_pending = p;
         self.maybeApplyDiffPaths();
@@ -653,6 +686,8 @@ pub const Session = struct {
         d.dit_path = a.dupe(u8, p.dit) catch return;
         d.vae_path = a.dupe(u8, p.vae) catch return;
         d.text_encoder_path = a.dupe(u8, p.te) catch return;
+        d.backend = p.backend;
+        d.vae_decode = p.vae_decode;
         self.taew_owned = if (p.taew) |t| (a.dupe(u8, t) catch null) else null;
         self.refreshPreview(); // taew_path follows the (possibly new) taew_owned
         self.freePendingDiffPaths();

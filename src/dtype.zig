@@ -65,56 +65,63 @@ pub const DType = enum {
         return null;
     }
 
+    /// Per-dtype size facts — the single source of truth the size accessors
+    /// below read from (one row per dtype in `info`, instead of the same set
+    /// of dtypes re-listed across six parallel switches). Adding a dtype is one
+    /// `info` arm.
+    pub const Info = struct {
+        /// Bytes per element for whole-byte scalar types; null for sub-byte
+        /// (`.i4`) and block-quantized types (use `storageBytes`).
+        byte_size: ?usize,
+        /// Bits per element; null for block-quantized types (fractional).
+        bit_size: ?usize,
+        /// Elements per quantization block (1 for non-block types).
+        block_elems: usize,
+        /// Bytes per quantization block; null for non-block types.
+        block_bytes: ?usize,
+    };
+
+    pub fn info(self: DType) Info {
+        return switch (self) {
+            .f8_e4m3, .u8, .i8, .bool => .{ .byte_size = 1, .bit_size = 8, .block_elems = 1, .block_bytes = null },
+            .f16, .bf16, .u16, .i16 => .{ .byte_size = 2, .bit_size = 16, .block_elems = 1, .block_bytes = null },
+            .f32, .u32, .i32 => .{ .byte_size = 4, .bit_size = 32, .block_elems = 1, .block_bytes = null },
+            .f64, .u64, .i64 => .{ .byte_size = 8, .bit_size = 64, .block_elems = 1, .block_bytes = null },
+            .i4 => .{ .byte_size = null, .bit_size = 4, .block_elems = 1, .block_bytes = null },
+            .q4_0 => .{ .byte_size = null, .bit_size = null, .block_elems = 32, .block_bytes = 18 },
+            .q8_0 => .{ .byte_size = null, .bit_size = null, .block_elems = 32, .block_bytes = 34 },
+            .q4_k => .{ .byte_size = null, .bit_size = null, .block_elems = 256, .block_bytes = 144 },
+            .q5_k => .{ .byte_size = null, .bit_size = null, .block_elems = 256, .block_bytes = 176 },
+            .q6_k => .{ .byte_size = null, .bit_size = null, .block_elems = 256, .block_bytes = 210 },
+        };
+    }
+
     /// Bytes per element. Undefined for sub-byte (`.i4`) and block-quantized
     /// types — those are unreachable here; use `storageBytes` for their
     /// packed on-disk length.
     pub fn byteSize(self: DType) usize {
-        return switch (self) {
-            .i4, .q4_0, .q8_0, .q4_k, .q5_k, .q6_k => unreachable,
-            .f8_e4m3, .u8, .i8, .bool => 1,
-            .f16, .bf16, .u16, .i16 => 2,
-            .f32, .u32, .i32 => 4,
-            .f64, .u64, .i64 => 8,
-        };
+        return self.info().byte_size orelse unreachable;
     }
 
     /// Bits per element (4 for `.i4`, else `byteSize * 8`). Undefined for
     /// block-quantized types (fractional).
     pub fn bitSize(self: DType) usize {
-        return switch (self) {
-            .i4 => 4,
-            .q4_0, .q8_0, .q4_k, .q5_k, .q6_k => unreachable,
-            else => self.byteSize() * 8,
-        };
+        return self.info().bit_size orelse unreachable;
     }
 
     /// True for the ggml block-quantized formats (GGUF weights).
     pub fn isBlockQuant(self: DType) bool {
-        return switch (self) {
-            .q4_0, .q8_0, .q4_k, .q5_k, .q6_k => true,
-            else => false,
-        };
+        return self.info().block_bytes != null;
     }
 
     /// Elements per quantization block (1 for scalar dtypes).
     pub fn blockElems(self: DType) usize {
-        return switch (self) {
-            .q4_0, .q8_0 => 32,
-            .q4_k, .q5_k, .q6_k => 256,
-            else => 1,
-        };
+        return self.info().block_elems;
     }
 
     /// Bytes per quantization block. Undefined for scalar dtypes.
     pub fn blockBytes(self: DType) usize {
-        return switch (self) {
-            .q4_0 => 18,
-            .q8_0 => 34,
-            .q4_k => 144,
-            .q5_k => 176,
-            .q6_k => 210,
-            else => unreachable,
-        };
+        return self.info().block_bytes orelse unreachable;
     }
 
     /// Packed storage size in bytes for `count` elements. Handles sub-byte
@@ -122,14 +129,14 @@ pub const DType = enum {
     /// types (`count` must be a multiple of the block size — ggml rows are
     /// whole blocks). For whole-byte types this is just `count * byteSize()`.
     pub fn storageBytes(self: DType, count: usize) usize {
-        return switch (self) {
-            .i4 => (count + 1) / 2,
-            .q4_0, .q8_0, .q4_k, .q5_k, .q6_k => blk: {
-                std.debug.assert(count % self.blockElems() == 0);
-                break :blk (count / self.blockElems()) * self.blockBytes();
-            },
-            else => count * self.byteSize(),
-        };
+        const inf = self.info();
+        if (inf.block_bytes) |bb| {
+            std.debug.assert(count % inf.block_elems == 0);
+            return (count / inf.block_elems) * bb;
+        }
+        // Scalar and sub-byte: pack `bit_size` bits per element, rounding up to
+        // whole bytes (a whole-byte type reduces to count * byte_size).
+        return (count * inf.bit_size.? + 7) / 8;
     }
 
     /// Decode the signed 4-bit value stored in nibble `idx` (0 = low, 1 = high)
@@ -230,6 +237,26 @@ test "dtype string round trip and sizes" {
     try std.testing.expectEqual(@as(usize, 1), DType.f8_e4m3.byteSize());
     try std.testing.expectEqual(@as(usize, 2), DType.bf16.byteSize());
     try std.testing.expectEqual(@as(usize, 8), DType.i64.byteSize());
+}
+
+test "block-quant descriptor: elems, block bytes, storage, isBlockQuant" {
+    // ggml block layouts (see the enum doc): q4_0/q8_0 are 32-elem blocks,
+    // q4_k/q5_k/q6_k are 256-elem. storageBytes = (count/elems) * block_bytes.
+    try std.testing.expect(DType.q4_k.isBlockQuant());
+    try std.testing.expect(!DType.f32.isBlockQuant());
+    try std.testing.expect(!DType.i4.isBlockQuant());
+
+    try std.testing.expectEqual(@as(usize, 32), DType.q8_0.blockElems());
+    try std.testing.expectEqual(@as(usize, 256), DType.q6_k.blockElems());
+    try std.testing.expectEqual(@as(usize, 34), DType.q8_0.blockBytes());
+    try std.testing.expectEqual(@as(usize, 210), DType.q6_k.blockBytes());
+
+    // One q6_k row of 256 elems = 210 bytes; two blocks of q4_0 = 36 bytes.
+    try std.testing.expectEqual(@as(usize, 210), DType.q6_k.storageBytes(256));
+    try std.testing.expectEqual(@as(usize, 36), DType.q4_0.storageBytes(64));
+    // Whole-byte scalar path still reduces to count * byteSize.
+    try std.testing.expectEqual(@as(usize, 12), DType.f32.storageBytes(3));
+    try std.testing.expectEqual(@as(usize, 6), DType.f16.storageBytes(3));
 }
 
 test "i4 packing and nibble decode" {

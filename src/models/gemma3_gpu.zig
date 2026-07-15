@@ -23,6 +23,8 @@ const gemma3 = @import("gemma3.zig");
 const gpu = @import("../gpu/context.zig");
 const ops = @import("../ops.zig");
 const kvmod = @import("../llm/kv_cache.zig");
+const transformer = @import("transformer.zig");
+const transformer_gpu = @import("transformer_gpu.zig");
 
 const Buf = gpu.DeviceBuffer;
 const Weight = ops.matmul.Weight;
@@ -211,46 +213,89 @@ pub const VulkanLM = struct {
         }
     }
 
-    fn decodeBody(self: *VulkanLM, want_logits: bool) !void {
-        const ctx = self.ctx;
+    // --- transformer_gpu.decoderLayer stepper methods (faithful lift of the
+    // former decodeBody inline loop; seq is 1 here — Vulkan gemma3 decodes one
+    // token at a time — but written in terms of `seq` for the contract). ---
+
+    pub fn normInput(self: *VulkanLM, layer: anytype, seq: usize) !void {
+        try self.rms(self.x, self.normed, layer.input_norm, seq, self.cfg.hidden);
+    }
+    pub fn projectQKV(self: *VulkanLM, l: usize, layer: anytype, seq: usize) !void {
+        _ = l; // gemma3: uniform geometry
+        _ = seq;
+        try self.gemvW(self.q, 0, self.normed, layer.q);
+        try self.gemvW(self.k, 0, self.normed, layer.k);
+        try self.gemvW(self.v, 0, self.normed, layer.v);
+    }
+    pub fn normQK(self: *VulkanLM, l: usize, layer: anytype, seq: usize) !void {
+        _ = l;
         const cfg = self.cfg;
-        const hd = cfg.head_dim;
-        const half = hd / 2;
+        try self.rms(self.q, self.q, layer.q_norm, seq * cfg.n_heads, cfg.head_dim);
+        try self.rms(self.k, self.k, layer.k_norm, seq * cfg.n_kv_heads, cfg.head_dim);
+    }
+    pub fn applyRope(self: *VulkanLM, l: usize, seq: usize, pos0: usize) !void {
+        _ = seq;
+        const cfg = self.cfg;
+        const half = cfg.head_dim / 2;
+        const freqs = if (cfg.isGlobal(l)) self.freqs_global else self.freqs_local;
+        try self.ctx.opRopeQwen35(self.q, freqs, cfg.n_heads, half, self.sin_off, cfg.head_dim, pos0);
+        try self.ctx.opRopeQwen35(self.k, freqs, cfg.n_kv_heads, half, self.sin_off, cfg.head_dim, pos0);
+    }
+    pub fn appendKV(self: *VulkanLM, l: usize, seq: usize, pos0: usize) !void {
+        _ = seq;
+        const kvdim = self.cfg.kvDim();
+        // In-batch device copy: dst[u2+i] = src[i].
+        try self.ctx.opElt(.copy, self.k, self.k_cache[l], null, null, .{ .u0 = @intCast(kvdim), .u2 = @intCast(pos0 * kvdim) }, kvdim, 1, 1);
+        try self.ctx.opElt(.copy, self.v, self.v_cache[l], null, null, .{ .u0 = @intCast(kvdim), .u2 = @intCast(pos0 * kvdim) }, kvdim, 1, 1);
+    }
+    pub fn attention(self: *VulkanLM, l: usize, seq: usize, pos0: usize) !void {
+        _ = seq;
+        const cfg = self.cfg;
+        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
+        const window: usize = if (cfg.isGlobal(l)) 0 else cfg.sliding_window;
+        try self.ctx.opAttnDecodeQ35(self.q, self.k_cache[l], self.v_cache[l], self.attn, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, pos0 + 1, scale, window);
+    }
+    pub fn projectO(self: *VulkanLM, l: usize, layer: anytype, seq: usize) !void {
+        _ = l;
+        _ = seq;
+        try self.gemvW(self.t, 0, self.attn, layer.o);
+    }
+    pub fn postAttnNorm(self: *VulkanLM, layer: anytype, seq: usize) !void {
+        try self.rms(self.t, self.t, layer.post_attn_norm, seq, self.cfg.hidden);
+    }
+    pub fn addResidual(self: *VulkanLM, seq: usize) !void {
+        try self.add(self.x, self.t, seq * self.cfg.hidden);
+    }
+    pub fn normPreFfn(self: *VulkanLM, layer: anytype, seq: usize) !void {
+        try self.rms(self.x, self.normed, layer.pre_ffn_norm, seq, self.cfg.hidden);
+    }
+    pub fn projectGateUp(self: *VulkanLM, layer: anytype, seq: usize) !void {
+        _ = seq;
+        try self.gemvW(self.gate, 0, self.normed, layer.gate);
+        try self.gemvW(self.up, 0, self.normed, layer.up);
+    }
+    pub fn activate(self: *VulkanLM, comptime act: transformer.Activation, seq: usize) !void {
+        const n = seq * self.cfg.intermediate;
+        const which: gpu.Elt = switch (act) {
+            .silu_mul => .silu_mul,
+            .gelu_tanh_mul => .gelu_mul,
+        };
+        try self.ctx.opElt(which, self.gate, self.up, null, null, .{ .u0 = @intCast(n) }, n, 1, 1);
+    }
+    pub fn projectDown(self: *VulkanLM, layer: anytype, seq: usize) !void {
+        _ = seq;
+        try self.gemvW(self.t, 0, self.gate, layer.down);
+    }
+    pub fn postFfnNorm(self: *VulkanLM, layer: anytype, seq: usize) !void {
+        try self.rms(self.t, self.t, layer.post_ffn_norm, seq, self.cfg.hidden);
+    }
+
+    fn decodeBody(self: *VulkanLM, want_logits: bool) !void {
+        const cfg = self.cfg;
         const pos = self.len;
-        const kvdim = cfg.kvDim();
-        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
 
         for (self.lm.layers, 0..) |*layer, l| {
-            const global = cfg.isGlobal(l);
-            const freqs = if (global) self.freqs_global else self.freqs_local;
-            const window: usize = if (global) 0 else cfg.sliding_window;
-
-            // --- Attention ---
-            try self.rms(self.x, self.normed, layer.input_norm, 1, cfg.hidden);
-            try self.gemvW(self.q, 0, self.normed, layer.q);
-            try self.gemvW(self.k, 0, self.normed, layer.k);
-            try self.gemvW(self.v, 0, self.normed, layer.v);
-            try self.rms(self.q, self.q, layer.q_norm, cfg.n_heads, hd);
-            try self.rms(self.k, self.k, layer.k_norm, cfg.n_kv_heads, hd);
-            try ctx.opRopeQwen35(self.q, freqs, cfg.n_heads, half, self.sin_off, hd, pos);
-            try ctx.opRopeQwen35(self.k, freqs, cfg.n_kv_heads, half, self.sin_off, hd, pos);
-            // KV append (in-batch device copy: dst[u2+i] = src[i]).
-            try ctx.opElt(.copy, self.k, self.k_cache[l], null, null, .{ .u0 = @intCast(kvdim), .u2 = @intCast(pos * kvdim) }, kvdim, 1, 1);
-            try ctx.opElt(.copy, self.v, self.v_cache[l], null, null, .{ .u0 = @intCast(kvdim), .u2 = @intCast(pos * kvdim) }, kvdim, 1, 1);
-            try ctx.opAttnDecodeQ35(self.q, self.k_cache[l], self.v_cache[l], self.attn, cfg.n_heads, cfg.n_kv_heads, hd, pos + 1, scale, window);
-            // o_proj, then post-attention norm on the attn output BEFORE the residual.
-            try self.gemvW(self.t, 0, self.attn, layer.o);
-            try self.rms(self.t, self.t, layer.post_attn_norm, 1, cfg.hidden);
-            try self.add(self.x, self.t, cfg.hidden);
-
-            // --- MLP (GeGLU) ---
-            try self.rms(self.x, self.normed, layer.pre_ffn_norm, 1, cfg.hidden);
-            try self.gemvW(self.gate, 0, self.normed, layer.gate);
-            try self.gemvW(self.up, 0, self.normed, layer.up);
-            try ctx.opElt(.gelu_mul, self.gate, self.up, null, null, .{ .u0 = @intCast(cfg.intermediate) }, cfg.intermediate, 1, 1);
-            try self.gemvW(self.t, 0, self.gate, layer.down);
-            try self.rms(self.t, self.t, layer.post_ffn_norm, 1, cfg.hidden);
-            try self.add(self.x, self.t, cfg.hidden);
+            try transformer_gpu.decoderLayer(transformer.gemma3_spec, self, layer, l, 1, pos);
         }
 
         if (want_logits) {

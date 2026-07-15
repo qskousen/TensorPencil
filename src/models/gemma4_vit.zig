@@ -29,6 +29,7 @@ const std = @import("std");
 const gguf_mod = @import("../gguf.zig");
 const weights_mod = @import("../weights.zig");
 const ops = @import("../ops.zig");
+const loader = @import("loader.zig");
 
 const Gguf = gguf_mod.Gguf;
 const WeightStore = weights_mod.WeightStore;
@@ -116,16 +117,16 @@ pub const Vit = struct {
         // Compute all loads into locals BEFORE building the struct: the arena
         // must be captured into the returned Vit only after every allocation,
         // or `.arena` snapshots a stale buffer list and the later allocs leak.
-        const patch_w = try loadMatrix(store, "v.patch_embd.weight", cfg.dim, cfg.kdim());
-        const patch_b = try loadVec(alloc, store, "v.patch_embd.bias", cfg.dim);
-        const pn1_w = try loadVec(alloc, store, "v.patch_norm.1.weight", cfg.kdim());
-        const pn1_b = try loadVec(alloc, store, "v.patch_norm.1.bias", cfg.kdim());
-        const pn2_w = try loadVec(alloc, store, "v.patch_norm.2.weight", cfg.dim);
-        const pn2_b = try loadVec(alloc, store, "v.patch_norm.2.bias", cfg.dim);
-        const pn3_w = try loadVec(alloc, store, "v.patch_norm.3.weight", cfg.dim);
-        const pn3_b = try loadVec(alloc, store, "v.patch_norm.3.bias", cfg.dim);
-        const pos_embd = try loadVec(alloc, store, "v.position_embd.weight", 2 * cfg.pos_size * cfg.dim);
-        const mm_proj = try loadMatrix(store, "mm.input_projection.weight", cfg.proj_dim, cfg.dim);
+        const patch_w = try loader.matrix(store, "v.patch_embd.weight", cfg.dim, cfg.kdim());
+        const patch_b = try loader.vector(alloc, store, "v.patch_embd.bias", cfg.dim);
+        const pn1_w = try loader.vector(alloc, store, "v.patch_norm.1.weight", cfg.kdim());
+        const pn1_b = try loader.vector(alloc, store, "v.patch_norm.1.bias", cfg.kdim());
+        const pn2_w = try loader.vector(alloc, store, "v.patch_norm.2.weight", cfg.dim);
+        const pn2_b = try loader.vector(alloc, store, "v.patch_norm.2.bias", cfg.dim);
+        const pn3_w = try loader.vector(alloc, store, "v.patch_norm.3.weight", cfg.dim);
+        const pn3_b = try loader.vector(alloc, store, "v.patch_norm.3.bias", cfg.dim);
+        const pos_embd = try loader.vector(alloc, store, "v.position_embd.weight", 2 * cfg.pos_size * cfg.dim);
+        const mm_proj = try loader.matrix(store, "mm.input_projection.weight", cfg.proj_dim, cfg.dim);
         return .{
             .arena = arena,
             .cfg = cfg,
@@ -348,19 +349,6 @@ fn preprocess(gpa: std.mem.Allocator, rgb: []const u8, sw: usize, sh: usize, tw:
         }
     }
     return out;
-}
-
-fn loadVec(alloc: std.mem.Allocator, store: WeightStore, name: []const u8, len: usize) ![]f32 {
-    const view = store.get(name) orelse return error.MissingTensor;
-    if (view.info.elemCount() != len) return error.ShapeMismatch;
-    return view.toF32Alloc(alloc);
-}
-
-fn loadMatrix(store: WeightStore, name: []const u8, rows: usize, cols: usize) !Weight {
-    const view = store.get(name) orelse return error.MissingTensor;
-    const shape = view.info.shape.slice();
-    if (shape.len != 2 or shape[0] != rows or shape[1] != cols) return error.ShapeMismatch;
-    return Weight.init(view.bytes, view.info.dtype, rows, cols);
 }
 
 // --- tests -----------------------------------------------------------------

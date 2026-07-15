@@ -27,6 +27,8 @@ const qwen3 = @import("qwen3.zig");
 const cuda = @import("../gpu/cuda.zig");
 const ops = @import("../ops.zig");
 const kvmod = @import("../llm/kv_cache.zig");
+const transformer = @import("transformer.zig");
+const transformer_gpu = @import("transformer_gpu.zig");
 
 const Backend = cuda.Backend;
 const Buf = cuda.backend.DeviceBuffer;
@@ -92,6 +94,10 @@ pub const CudaLM = struct {
         const alloc = arena.allocator();
 
         var self: CudaLM = undefined;
+        // `split` is always null for gemma4 (device-resident MVP, no CPU/GPU
+        // split); `self = undefined` bypasses the field's `= null` default, so
+        // set it explicitly — llmResidency reads it (GUI status bar).
+        self.split = null;
         self.lm = lm;
         self.be = be;
         self.gpa = gpa;
@@ -274,6 +280,103 @@ pub const CudaLM = struct {
     /// One batched forward over `n` pre-embedded rows at positions [len, len+n).
     /// When `logits` is set the last row's final-normed hidden feeds the LM head
     /// (then tanh softcap + suppress-token masking, host-side). Advances len.
+    // --- transformer_gpu.decoderLayer stepper methods (faithful lift of the
+    // former forwardRows loop). gemma4 has PER-LAYER geometry, so the
+    // geometry-sensitive ops take `l` and read cfg.headDim(l)/nKv(l)/qDim(l). ---
+
+    pub fn normInput(self: *CudaLM, layer: anytype, seq: usize) !void {
+        const cfg = self.cfg;
+        try self.be.qkNorm(self.bufs.x, self.bufs.normed, try nbuf(self.be, layer.input_norm), seq, cfg.hidden, cfg.rms_eps);
+    }
+    pub fn projectQKV(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
+        const cfg = self.cfg;
+        const b = &self.bufs;
+        const kv_dim = cfg.kvDim(l);
+        try self.linear(b.q, b.normed, layer.q, cfg.qDim(l), cfg.hidden, seq);
+        try self.linear(b.k, b.normed, layer.k, kv_dim, cfg.hidden, seq);
+        // V: its own projection, or (global layers) the RAW K projection copied
+        // BEFORE k_norm/rope mutate k.
+        if (layer.v) |vw| {
+            try self.linear(b.v, b.normed, vw, kv_dim, cfg.hidden, seq);
+        } else {
+            try self.be.tensorCopy(b.v, 0, b.k, 0, seq * kv_dim * 4);
+        }
+    }
+    pub fn normQK(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
+        const cfg = self.cfg;
+        const b = &self.bufs;
+        try self.be.qkNorm(b.q, b.q, try nbuf(self.be, layer.q_norm), seq * cfg.n_heads, cfg.headDim(l), cfg.rms_eps);
+        try self.be.qkNorm(b.k, b.k, try nbuf(self.be, layer.k_norm), seq * cfg.nKv(l), cfg.headDim(l), cfg.rms_eps);
+    }
+    pub fn normV(self: *CudaLM, l: usize, seq: usize) !void {
+        const cfg = self.cfg;
+        // Weightless RMS over head_dim (shared `ones` weight buffer).
+        try self.be.qkNorm(self.bufs.v, self.bufs.v, self.ones, seq * cfg.nKv(l), cfg.headDim(l), cfg.rms_eps);
+    }
+    pub fn applyRope(self: *CudaLM, l: usize, seq: usize, pos0: usize) !void {
+        const cfg = self.cfg;
+        const b = &self.bufs;
+        const global = cfg.isGlobal(l);
+        const freqs = if (global) self.freqs_global else self.freqs_local;
+        const sin_off = if (global) self.sin_off_global else self.sin_off_local;
+        const hd = cfg.headDim(l);
+        try self.be.ropeHalf(b.q, freqs, seq, cfg.n_heads, hd / 2, sin_off, pos0);
+        try self.be.ropeHalf(b.k, freqs, seq, cfg.nKv(l), hd / 2, sin_off, pos0);
+    }
+    pub fn appendKV(self: *CudaLM, l: usize, seq: usize, pos0: usize) !void {
+        const cfg = self.cfg;
+        const b = &self.bufs;
+        const kv_dim = cfg.kvDim(l);
+        try self.be.tensorCopy(self.k_cache[l].buf, pos0 * kv_dim * 4, b.k, 0, seq * kv_dim * 4);
+        try self.be.tensorCopy(self.v_cache[l].buf, pos0 * kv_dim * 4, b.v, 0, seq * kv_dim * 4);
+    }
+    pub fn attention(self: *CudaLM, l: usize, seq: usize, pos0: usize) !void {
+        const cfg = self.cfg;
+        const b = &self.bufs;
+        const ns: usize = if (seq == 1) nsplit else nsplit_prefill;
+        const window: usize = if (cfg.isGlobal(l)) 0 else cfg.sliding_window;
+        try self.be.opAttnDecode(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, pos0 + 1, seq, cfg.n_heads, cfg.nKv(l), cfg.headDim(l), ns, 1.0, window);
+    }
+    pub fn projectO(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
+        const cfg = self.cfg;
+        try self.linear(self.bufs.t, self.bufs.attn, layer.o, cfg.hidden, cfg.qDim(l), seq);
+    }
+    pub fn postAttnNorm(self: *CudaLM, layer: anytype, seq: usize) !void {
+        const cfg = self.cfg;
+        try self.be.qkNorm(self.bufs.t, self.bufs.t, try nbuf(self.be, layer.post_attn_norm), seq, cfg.hidden, cfg.rms_eps);
+    }
+    pub fn addResidual(self: *CudaLM, seq: usize) !void {
+        try self.be.opAdd(self.bufs.x, self.bufs.t, seq * self.cfg.hidden);
+    }
+    pub fn normPreFfn(self: *CudaLM, layer: anytype, seq: usize) !void {
+        const cfg = self.cfg;
+        try self.be.qkNorm(self.bufs.x, self.bufs.normed, try nbuf(self.be, layer.pre_ffn_norm), seq, cfg.hidden, cfg.rms_eps);
+    }
+    pub fn projectGateUp(self: *CudaLM, layer: anytype, seq: usize) !void {
+        const cfg = self.cfg;
+        const b = &self.bufs;
+        try self.linear(b.gate, b.normed, layer.gate, cfg.intermediate, cfg.hidden, seq);
+        try self.linear(b.up, b.normed, layer.up, cfg.intermediate, cfg.hidden, seq);
+    }
+    pub fn activate(self: *CudaLM, comptime act: transformer.Activation, seq: usize) !void {
+        const n = seq * self.cfg.intermediate;
+        switch (act) {
+            .silu_mul => try self.be.siluMul(self.bufs.gate, self.bufs.up, n),
+            .gelu_tanh_mul => try self.be.geluMul(self.bufs.gate, self.bufs.up, n),
+        }
+    }
+    pub fn projectDown(self: *CudaLM, layer: anytype, seq: usize) !void {
+        const cfg = self.cfg;
+        try self.linear(self.bufs.t, self.bufs.gate, layer.down, cfg.hidden, cfg.intermediate, seq);
+    }
+    pub fn postFfnNorm(self: *CudaLM, layer: anytype, seq: usize) !void {
+        const cfg = self.cfg;
+        try self.be.qkNorm(self.bufs.t, self.bufs.t, try nbuf(self.be, layer.post_ffn_norm), seq, cfg.hidden, cfg.rms_eps);
+    }
+    pub fn outScale(self: *CudaLM, layer: anytype, seq: usize) !void {
+        if (layer.out_scale != 1.0) try self.be.opScale(self.bufs.x, layer.out_scale, seq * self.cfg.hidden);
+    }
+
     fn forwardRows(self: *CudaLM, x_host: []const f32, logits: ?[]f32) !void {
         const be = self.be;
         const cfg = self.cfg;
@@ -289,55 +392,7 @@ pub const CudaLM = struct {
         errdefer if (be.batching()) be.abortBatch();
 
         for (self.lm.layers, 0..) |*layer, l| {
-            const global = cfg.isGlobal(l);
-            const hd = cfg.headDim(l);
-            const n_kv = cfg.nKv(l);
-            const q_dim = cfg.qDim(l);
-            const kv_dim = cfg.kvDim(l);
-            const freqs = if (global) self.freqs_global else self.freqs_local;
-            const sin_off = if (global) self.sin_off_global else self.sin_off_local;
-
-            // --- Attention ---
-            try be.qkNorm(b.x, b.normed, try nbuf(be, layer.input_norm), n, cfg.hidden, eps);
-            try self.linear(b.q, b.normed, layer.q, q_dim, cfg.hidden, n);
-            try self.linear(b.k, b.normed, layer.k, kv_dim, cfg.hidden, n);
-            // V: its own projection, or (global) the RAW K projection copied
-            // BEFORE k_norm/rope mutate k.
-            if (layer.v) |vw| {
-                try self.linear(b.v, b.normed, vw, kv_dim, cfg.hidden, n);
-            } else {
-                try be.tensorCopy(b.v, 0, b.k, 0, n * kv_dim * 4);
-            }
-            try be.qkNorm(b.q, b.q, try nbuf(be, layer.q_norm), n * cfg.n_heads, hd, eps);
-            try be.qkNorm(b.k, b.k, try nbuf(be, layer.k_norm), n * n_kv, hd, eps);
-            try be.qkNorm(b.v, b.v, self.ones, n * n_kv, hd, eps); // weightless V norm
-            try be.ropeHalf(b.q, freqs, n, cfg.n_heads, hd / 2, sin_off, pos0);
-            try be.ropeHalf(b.k, freqs, n, n_kv, hd / 2, sin_off, pos0);
-            try be.tensorCopy(self.k_cache[l].buf, pos0 * kv_dim * 4, b.k, 0, n * kv_dim * 4);
-            try be.tensorCopy(self.v_cache[l].buf, pos0 * kv_dim * 4, b.v, 0, n * kv_dim * 4);
-
-            // Flash-decode split: h512 (global, full causal) or h256 (local,
-            // sliding window). Both go through opAttnDecode.
-            const ns: usize = if (n == 1) nsplit else nsplit_prefill;
-            const window: usize = if (global) 0 else cfg.sliding_window;
-            try be.opAttnDecode(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, pos0 + 1, n, cfg.n_heads, n_kv, hd, ns, 1.0, window);
-
-            // o_proj, post-attention norm (on the attn output, before residual).
-            try self.linear(b.t, b.attn, layer.o, cfg.hidden, q_dim, n);
-            try be.qkNorm(b.t, b.t, try nbuf(be, layer.post_attn_norm), n, cfg.hidden, eps);
-            try be.opAdd(b.x, b.t, n * cfg.hidden);
-
-            // --- MLP (GeGLU) ---
-            try be.qkNorm(b.x, b.normed, try nbuf(be, layer.pre_ffn_norm), n, cfg.hidden, eps);
-            try self.linear(b.gate, b.normed, layer.gate, cfg.intermediate, cfg.hidden, n);
-            try self.linear(b.up, b.normed, layer.up, cfg.intermediate, cfg.hidden, n);
-            try be.geluMul(b.gate, b.up, n * cfg.intermediate);
-            try self.linear(b.t, b.gate, layer.down, cfg.hidden, cfg.intermediate, n);
-            try be.qkNorm(b.t, b.t, try nbuf(be, layer.post_ffn_norm), n, cfg.hidden, eps);
-            try be.opAdd(b.x, b.t, n * cfg.hidden);
-
-            // Per-layer output scale (whole residual stream).
-            if (layer.out_scale != 1.0) try be.opScale(b.x, layer.out_scale, n * cfg.hidden);
+            try transformer_gpu.decoderLayer(transformer.gemma4_spec, self, layer, l, n, pos0);
         }
 
         if (logits) |out| {
