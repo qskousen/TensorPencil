@@ -22,6 +22,21 @@ pub fn rmsNorm(out: []f32, x: []const f32, weight: []const f32, eps: f32) void {
     }
 }
 
+/// Row-wise RMSNorm with no learned weight: out = x / sqrt(mean(x^2) + eps),
+/// in rows of `dim`. `out` may alias `x`. Gemma 4 normalizes V this way (a
+/// weightless RMS over head_dim, unlike its weighted Q/K norms).
+pub fn rmsNormUnit(out: []f32, x: []const f32, dim: usize, eps: f32) void {
+    std.debug.assert(x.len == out.len);
+    std.debug.assert(dim != 0 and x.len % dim == 0);
+    var row: usize = 0;
+    while (row < x.len) : (row += dim) {
+        const xr = x[row..][0..dim];
+        const or_ = out[row..][0..dim];
+        const inv = invRms(xr, eps);
+        for (or_, xr) |*o, xv| o.* = xv * inv;
+    }
+}
+
 /// Classic LayerNorm with weight and bias, in rows of `weight.len`:
 /// out = (x - mean) / sqrt(var + eps) * weight + bias (the qwen3vl vision
 /// tower's ln1/ln2/post_ln). `out` may alias `x`.

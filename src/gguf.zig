@@ -42,6 +42,7 @@ fn dtypeFromGgml(id: u32) ?DType {
     return switch (id) {
         0 => .f32,
         1 => .f16,
+        2 => .q4_0,
         8 => .q8_0,
         12 => .q4_k,
         13 => .q5_k,
@@ -408,6 +409,27 @@ const gemma3_layer_suffix_map = [_][2][]const u8{
     .{ "ffn_down.weight", "mlp.down_proj.weight" },
 };
 
+/// Gemma 4 layer-tensor suffixes -> HF-style suffixes. Same "sandwich"-norm
+/// layout as Gemma 3, plus `layer_output_scale` (a per-layer scalar the whole
+/// layer output is multiplied by). Q/K/V and their per-head norms have
+/// layer-dependent dimensions (sliding-window vs global), but the names match.
+const gemma4_layer_suffix_map = [_][2][]const u8{
+    .{ "attn_norm.weight", "input_layernorm.weight" },
+    .{ "attn_q.weight", "self_attn.q_proj.weight" },
+    .{ "attn_k.weight", "self_attn.k_proj.weight" },
+    .{ "attn_v.weight", "self_attn.v_proj.weight" },
+    .{ "attn_output.weight", "self_attn.o_proj.weight" },
+    .{ "attn_q_norm.weight", "self_attn.q_norm.weight" },
+    .{ "attn_k_norm.weight", "self_attn.k_norm.weight" },
+    .{ "post_attention_norm.weight", "post_attention_layernorm.weight" },
+    .{ "ffn_norm.weight", "pre_feedforward_layernorm.weight" },
+    .{ "post_ffw_norm.weight", "post_feedforward_layernorm.weight" },
+    .{ "ffn_gate.weight", "mlp.gate_proj.weight" },
+    .{ "ffn_up.weight", "mlp.up_proj.weight" },
+    .{ "ffn_down.weight", "mlp.down_proj.weight" },
+    .{ "layer_output_scale.weight", "out_scale.weight" },
+};
+
 /// Translate a llama.cpp tensor name to the HF-style name the model loaders
 /// use (prefix-less, e.g. "layers.3.self_attn.q_proj.weight"). The per-layer
 /// suffix map is `arch`-dependent (gemma3 differs from the Qwen/llama
@@ -426,6 +448,8 @@ pub fn canonicalName(alloc: std.mem.Allocator, raw: []const u8, arch: []const u8
         _ = std.fmt.parseInt(u32, layer, 10) catch return raw;
         const map: []const [2][]const u8 = if (std.mem.eql(u8, arch, "gemma3"))
             &gemma3_layer_suffix_map
+        else if (std.mem.eql(u8, arch, "gemma4"))
+            &gemma4_layer_suffix_map
         else
             &layer_suffix_map;
         for (map) |entry| {

@@ -23,6 +23,7 @@ const DType = dtypes.DType;
 /// ggml type enum for a block-quant DType (null otherwise). Shared with matmul.
 pub fn ggmlType(dt: DType) ?ggml.c.enum_ggml_type {
     return switch (dt) {
+        .q4_0 => ggml.c.GGML_TYPE_Q4_0,
         .q8_0 => ggml.c.GGML_TYPE_Q8_0,
         .q4_k => ggml.c.GGML_TYPE_Q4_K,
         .q5_k => ggml.c.GGML_TYPE_Q5_K,

@@ -244,7 +244,7 @@ pub fn convertToF32(dt: DType, bytes: []const u8, out: []f32) ConvertError!void 
         // ggml block-quantized GGUF tensors (rows are whole blocks, which the
         // GGUF parser validated, so the length check above already enforced
         // block alignment).
-        .q8_0, .q4_k, .q5_k, .q6_k => quants.dequantSlice(dt, bytes, 0, out.len, out),
+        .q4_0, .q8_0, .q4_k, .q5_k, .q6_k => quants.dequantSlice(dt, bytes, 0, out.len, out),
         else => return error.UnsupportedDType,
     }
 }

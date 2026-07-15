@@ -524,6 +524,76 @@ would add ~10 pts acceptance on top.
   CUDA. Interactive @image on Vulkan is not wired (one-shot only). Validated:
   Vulkan caption byte-identical to the CUDA/CPU ViT ("A red fox sits alertly
   in a snowy forest, its ..."). gemma3 now runs on ALL backends incl. vision.
+- Gemma 4 (GGUF arch "gemma4") — **cpu + zig-cuda + cuda, text + vision DONE
+  (2026-07-14), text token-identical vs llama.cpp; vulkan + audio follow-ups**:
+  `models/gemma4.zig` (Config.detect + `Model` + `CpuModel`). Shares Gemma 3's
+  sandwich norms / sqrt(hidden) embed scale / QK-norm / GeGLU / tied head /
+  6-layer local:global split, but adds, per llama.cpp `src/models/gemma4.cpp`:
+  (1) PER-LAYER attention geometry — LOCAL layers head_dim 256 / 8 KV heads,
+  GLOBAL layers head_dim 512 / 1 KV head (MQA), so q/o/kv widths differ per
+  layer and the KV cache has a per-layer stride (`kv_cache.PerLayerKvCache`);
+  (2) attention score scale **1.0** (not 1/sqrt(hd) — folded into the QK norms;
+  `attention.Params.scale`); (3) V is RMS-normalized per head_dim with NO
+  learned weight (`norm.rmsNormUnit`), and GLOBAL layers have no v_proj so V
+  reuses the RAW K projection (before k_norm/rope); (4) proportional RoPE — the
+  GLOBAL layers divide the inverse frequency by `rope_freqs.weight` per dim
+  (`rope.rotateHalfFreqsFactored`), replacing Gemma 3's scalar 1/8; (5) a
+  per-layer scalar `out_scale` (layer_output_scale) multiplies the whole layer
+  output; (6) final logits tanh-softcapped at 30 and `suppress_tokens` forced
+  to -inf. The 12B QAT is **Q4_0** — added `.q4_0` to dtype/quants/gguf/matmul
+  (dequant rides ggml like the other block quants). **New tokenizer path**:
+  "SPM-style BPE" (`tokenizer.ggml.model == "gemma4"`) — `initGemma4FromGguf` +
+  `encodeGemma4`: SPM vocab (▁-escape, no dummy prefix, `<0xNN>` byte fallback,
+  verbatim CONTROL specials) but merges are RANK-ordered BPE rules over
+  newline-split words (llama.cpp LLAMA_VOCAB_TYPE_BPE + pre-type "gemma4"),
+  keyed `left\x00right`; a newline run that is itself a token is emitted whole.
+  Chat family `chat.setFamily(.gemma4)`: `<bos><|turn>{user|model}\n…<turn|>\n`
+  (turn markers 105/106, newline 107), no system role. Validated: gemma4
+  tokenization token-identical to llama-tokenize; greedy CPU generation
+  byte-identical to `llama-completion` ("The first 8 prime numbers are: 2, 3,
+  5, 7, 11, 13, 17, and 19.\n\nThree planets are: Mars, Jupiter, and Saturn.").
+  Dispatched in llm_main via `general.architecture == "gemma4"` (GPU / spec-
+  decode / cpu-split rejected). **VISION on CPU** (`models/gemma4_vit.zig`): the
+  mmproj `gemma4uv` "unified" embedder is NOT a SigLIP ViT (no transformer) —
+  smart-resize (effective 48px patch = 16·n_merge(3), tokens ∈ [40,280], each
+  dim snapped to a 48-multiple, aspect ~preserved, bilinear + PAD_CEIL onto a
+  black canvas), /255 normalize (mean 0/std 1), channel-planar im2col →
+  LayerNorm(patch_norm_1, over 6912, eps 1e-5) → patch-embed matmul (6912→3840)
+  + bias → LayerNorm(patch_norm_2) → add learned pos (two lookup tables, x by
+  column / y by row; `v.position_embd` [dim,1120,2]) → LayerNorm(patch_norm_3) →
+  weightless RMSNorm (eps 1e-6) → mm.input_projection (3840→3840). `num_patches`
+  tokens (NO pooling), injected UNSCALED between `<|image>` / `<image|>` markers.
+  `tp-llm --backend cpu --mmproj m.gguf --image x.png --prompt "..."` one-shot.
+  Validated by accurate image-specific captions (fox-in-snow; a dragon banner
+  where it even OCR'd the embedded "AURORA" text; "too blurry" on a noise
+  fixture) — exact token-match golden was blocked by llama-mtmd-cli crashing on
+  gemma4's jinja template, but the text LLM is already token-identical so the
+  embedder rides on that. Simplification: image tokens use the LLM's causal
+  attention (llama.cpp marks them non-causal / bidirectional) — same shortcut
+  Gemma 3's CPU path takes. **GPU** (`models/gemma4_cuda.zig`, cuda + zig-cuda,
+  device-resident MVP — no CPU-split/offload/streaming since the 12B fits):
+  per-layer K/V Growables (kvDim(l) stride); GLOBAL-layer attention uses the
+  generic naive `attn` op (arbitrary head_dim, full causal), LOCAL uses
+  opAttnDecode (h256 flash-split + window); V-norm via qkNorm with a shared
+  device ones buffer; out_scale via a new `opScale`/`f32_scale` kernel; the
+  GLOBAL RoPE freq_factors are baked into the device table; logit softcap +
+  suppress run host-side after the logits download. Two gotchas: Q4_0 had NO GPU
+  support (added a `dequant_q4_0_f16` PTX kernel + a q4_0 arm in opMatmulQuant;
+  q4_0 linears route through the dequant→f16 GEMM — the dp4a GEMV path has no
+  q4_0 kernel), and the naive `attn` kernel's `.local accl[512]` (128 f32) OOB'd
+  at head_dim 512 → bumped to accl[2048]. Text token-identical to CPU/llama.cpp
+  on both backends; vision caption identical to the CPU path. Vision still
+  encodes on CPU (the embedder is cheap); the LLM runs on GPU. **Decode ~44
+  tok/s** (token-identical, both backends; exceeds the gemma3 ~35 ref) — ~13x
+  over the initial dequant-GEMM path, via two kernels: (1) `attn_split_h512`
+  (flash-decode split for head_dim 512, adapted from attn_split_h256 — 16
+  dims/lane; wired through opAttnDecode, replacing the naive f32 `attn` whose
+  `.local accl` thrashed local memory), and (2) `gemv_q4_0_q8n` (dp4a int8-
+  activation GEMV reusing the q8_0_q8n grouped machinery; unpacks the 18-byte
+  q4_0 nibble block and applies the -8 offset as dot(w-8,a)=dp4a(nibble,a)-8·Σa).
+  A fused f32 `gemv_q4_0` is the non-dp4a fallback; prefill uses the dequant→f16
+  GEMM. REMAINING: a GPU vision embedder, the VULKAN backend, and the AUDIO
+  encoder (`gemma4ua`: mel frontend + encoder — TensorPencil has no audio path).
 - ~~GGUF import~~ — DONE (2026-07): `src/gguf.zig` (container, llama.cpp→HF
   name canonicalization, config from `qwen3.*` metadata), `src/quants.zig`
   (Q8_0/Q4_K/Q5_K/Q6_K dequant, bit-exact vs ggml-quants.c golden fixtures),

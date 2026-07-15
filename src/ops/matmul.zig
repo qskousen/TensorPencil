@@ -91,7 +91,7 @@ pub fn matmul(
     if (bias) |b| std.debug.assert(b.len == w.rows);
     switch (w.dtype) {
         .f8_e4m3, .bf16, .f16, .f32, .i8, .i4 => {},
-        .q8_0, .q4_k, .q5_k, .q6_k => {
+        .q4_0, .q8_0, .q4_k, .q5_k, .q6_k => {
             // ggml rows are whole blocks; block-aligned k-slicing depends on it.
             std.debug.assert(w.cols % w.dtype.blockElems() == 0);
         },
@@ -263,7 +263,7 @@ fn packedTask(
         inline .f8_e4m3, .bf16, .f16, .f32, .i8 => |dt| {
             packedTaskTyped(dt, y, x, m, w, bias, row_start, row_end, panel);
         },
-        inline .q8_0, .q4_k, .q5_k, .q6_k => |dt| {
+        inline .q4_0, .q8_0, .q4_k, .q5_k, .q6_k => |dt| {
             packedTaskBlock(dt, y, x, m, w, bias, row_start, row_end, panel);
         },
         else => unreachable, // validated in matmul()

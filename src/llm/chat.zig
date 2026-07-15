@@ -27,9 +27,10 @@ pub var pad: u32 = tokenizer_mod.pad_token;
 pub var newline: u32 = newline_id;
 
 /// Chat template family. `chatml` is Qwen's `<|im_start|>role\n…<|im_end|>`;
-/// `gemma` is Gemma 3's `<start_of_turn>role\n…<end_of_turn>\n` (roles user /
-/// model, no system role — its content prefixes the first user turn).
-pub const Family = enum { chatml, gemma };
+/// `gemma` is Gemma 3's `<start_of_turn>role\n…<end_of_turn>\n`; `gemma4` is
+/// Gemma 4's `<|turn>role\n…<turn|>\n` (roles user / model, no system role —
+/// system content prefixes the first user turn).
+pub const Family = enum { chatml, gemma, gemma4 };
 pub var family: Family = .chatml;
 /// Gemma: a user turn was opened by appendSystem (the system prefix) and the
 /// next appendUser continues it rather than starting a fresh turn.
@@ -63,6 +64,12 @@ pub fn appendSystem(tok: *const Tokenizer, gpa: std.mem.Allocator, text: []const
             try tok.encode(gpa, "\n\n", out);
             gemma_user_open = true;
         },
+        .gemma4 => {
+            try tok.encode(gpa, "<|turn>user\n", out);
+            try tok.encode(gpa, text, out);
+            try tok.encode(gpa, "\n\n", out);
+            gemma_user_open = true;
+        },
     }
 }
 
@@ -74,6 +81,12 @@ pub fn appendUser(tok: *const Tokenizer, gpa: std.mem.Allocator, text: []const u
             gemma_user_open = false;
             try tok.encode(gpa, text, out);
             try tok.encode(gpa, "<end_of_turn>\n", out);
+        },
+        .gemma4 => {
+            if (!gemma_user_open) try tok.encode(gpa, "<|turn>user\n", out);
+            gemma_user_open = false;
+            try tok.encode(gpa, text, out);
+            try tok.encode(gpa, "<turn|>\n", out);
         },
     }
 }
@@ -104,6 +117,15 @@ pub fn appendUserSegments(tok: *const Tokenizer, gpa: std.mem.Allocator, segment
                 },
             };
             try tok.encode(gpa, "<end_of_turn>\n", out);
+        },
+        .gemma4 => {
+            // Text-only for now (Gemma 4 vision is a separate follow-up).
+            try tok.encode(gpa, "<|turn>user\n", out);
+            for (segments) |seg| switch (seg) {
+                .text => |t| try tok.encode(gpa, t, out),
+                .image => return error.ImageUnsupported,
+            };
+            try tok.encode(gpa, "<turn|>\n", out);
         },
         .chatml => {
             const pad_id = tok.specialId("<|image_pad|>") orelse tok.pad;
@@ -142,6 +164,7 @@ pub fn openAssistant(tok: *const Tokenizer, gpa: std.mem.Allocator, out: *std.Ar
     try tok.encode(gpa, switch (family) {
         .chatml => "<|im_start|>assistant\n",
         .gemma => "<start_of_turn>model\n",
+        .gemma4 => "<|turn>model\n",
     }, out);
 }
 

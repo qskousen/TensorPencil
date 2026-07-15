@@ -34,6 +34,7 @@ pub const DType = enum {
     /// undefined; use `storageBytes` (whole blocks only). Never appears in
     /// safetensors headers; produced by the GGUF loader. Layouts and
     /// dequantization live in quants.zig.
+    q4_0, // 32 elems / 18 B: f16 d + 16 B nibbles; v = (nibble - 8) * d
     q8_0, // 32 elems / 34 B: f16 scale + 32 x i8
     q4_k, // 256 elems / 144 B: f16 d + f16 dmin + 12 B 6-bit scales/mins + 128 B nibbles
     q5_k, // 256 elems / 176 B: q4_k + 32 B high bits
@@ -69,7 +70,7 @@ pub const DType = enum {
     /// packed on-disk length.
     pub fn byteSize(self: DType) usize {
         return switch (self) {
-            .i4, .q8_0, .q4_k, .q5_k, .q6_k => unreachable,
+            .i4, .q4_0, .q8_0, .q4_k, .q5_k, .q6_k => unreachable,
             .f8_e4m3, .u8, .i8, .bool => 1,
             .f16, .bf16, .u16, .i16 => 2,
             .f32, .u32, .i32 => 4,
@@ -82,7 +83,7 @@ pub const DType = enum {
     pub fn bitSize(self: DType) usize {
         return switch (self) {
             .i4 => 4,
-            .q8_0, .q4_k, .q5_k, .q6_k => unreachable,
+            .q4_0, .q8_0, .q4_k, .q5_k, .q6_k => unreachable,
             else => self.byteSize() * 8,
         };
     }
@@ -90,7 +91,7 @@ pub const DType = enum {
     /// True for the ggml block-quantized formats (GGUF weights).
     pub fn isBlockQuant(self: DType) bool {
         return switch (self) {
-            .q8_0, .q4_k, .q5_k, .q6_k => true,
+            .q4_0, .q8_0, .q4_k, .q5_k, .q6_k => true,
             else => false,
         };
     }
@@ -98,7 +99,7 @@ pub const DType = enum {
     /// Elements per quantization block (1 for scalar dtypes).
     pub fn blockElems(self: DType) usize {
         return switch (self) {
-            .q8_0 => 32,
+            .q4_0, .q8_0 => 32,
             .q4_k, .q5_k, .q6_k => 256,
             else => 1,
         };
@@ -107,6 +108,7 @@ pub const DType = enum {
     /// Bytes per quantization block. Undefined for scalar dtypes.
     pub fn blockBytes(self: DType) usize {
         return switch (self) {
+            .q4_0 => 18,
             .q8_0 => 34,
             .q4_k => 144,
             .q5_k => 176,
@@ -122,7 +124,7 @@ pub const DType = enum {
     pub fn storageBytes(self: DType, count: usize) usize {
         return switch (self) {
             .i4 => (count + 1) / 2,
-            .q8_0, .q4_k, .q5_k, .q6_k => blk: {
+            .q4_0, .q8_0, .q4_k, .q5_k, .q6_k => blk: {
                 std.debug.assert(count % self.blockElems() == 0);
                 break :blk (count / self.blockElems()) * self.blockBytes();
             },

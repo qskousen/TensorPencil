@@ -114,6 +114,38 @@ pub fn rotateHalfFreqsScaled(gpa: std.mem.Allocator, seq: usize, head_dim: usize
     return .{ .cos = cos, .sin = sin, .half = half };
 }
 
+/// rotateHalfFreqsScaled with optional per-dimension frequency factors
+/// (llama.cpp `rope_freqs` / freq_factors — "proportional"/long-context RoPE):
+/// the effective angle divides the inverse frequency by `freq_factors[i]`,
+/// matching ggml's `theta/ff` in ggml_rope_cache_init. `freq_factors` must
+/// have head_dim/2 entries (or be null for the plain scaled table). Gemma 4's
+/// global layers pass the model's `rope_freqs.weight`; local layers pass null.
+pub fn rotateHalfFreqsFactored(
+    gpa: std.mem.Allocator,
+    seq: usize,
+    head_dim: usize,
+    theta: f64,
+    freq_scale: f64,
+    freq_factors: ?[]const f32,
+) !Freqs {
+    const half = head_dim / 2;
+    if (freq_factors) |ff| std.debug.assert(ff.len == half);
+    const cos = try gpa.alloc(f32, seq * half);
+    errdefer gpa.free(cos);
+    const sin = try gpa.alloc(f32, seq * half);
+    errdefer gpa.free(sin);
+    for (0..seq) |p| {
+        for (0..half) |i| {
+            const inv = 1.0 / std.math.pow(f64, theta, @as(f64, @floatFromInt(2 * i)) / @as(f64, @floatFromInt(head_dim)));
+            const ff: f64 = if (freq_factors) |f| f[i] else 1.0;
+            const angle = @as(f64, @floatFromInt(p)) * freq_scale * (inv / ff);
+            cos[p * half + i] = @floatCast(@cos(angle));
+            sin[p * half + i] = @floatCast(@sin(angle));
+        }
+    }
+    return .{ .cos = cos, .sin = sin, .half = half };
+}
+
 /// Apply rotate-half rotation in place: for i < half,
 /// (x[i], x[i+half]) -> (x[i] c_i - x[i+half] s_i, x[i+half] c_i + x[i] s_i).
 /// `x` is [seq, n_heads * head_dim] row-major.

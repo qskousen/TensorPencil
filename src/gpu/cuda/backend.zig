@@ -1317,6 +1317,7 @@ pub const Backend = struct {
         std.debug.assert(cols % dt.blockElems() == 0 and cols <= 32768);
         const w_db = try self.cachedWeight(w_bytes);
         const f = switch (dt) {
+            .q4_0 => try self.eltFn(elt.gemv_q4_0_ptx, "gemv_q4_0"),
             .q8_0 => try self.eltFn(elt.gemv_q8_0_ptx, "gemv_q8_0"),
             .q4_k => try self.eltFn(elt.gemv_q4_k_ptx, "gemv_q4_k"),
             .q5_k => try self.eltFn(elt.gemv_q5_k_ptx, "gemv_q5_k"),
@@ -1376,6 +1377,7 @@ pub const Backend = struct {
         std.debug.assert(self.q8_act.size >= n_total * cols / 32 * 4 + n_total * cols);
         const w_db = try self.cachedWeight(w_bytes);
         const f = switch (dt) {
+            .q4_0 => try self.eltFn(elt.gemv_q4_0_q8n_ptx, "gemv_q4_0_q8n"),
             .q8_0 => try self.eltFn(elt.gemv_q8_0_q8n_ptx, "gemv_q8_0_q8n"),
             .q4_k => try self.eltFn(elt.gemv_q4_k_q8n_ptx, "gemv_q4_k_q8n"),
             .q5_k => try self.eltFn(elt.gemv_q5_k_q8n_ptx, "gemv_q5_k_q8n"),
@@ -1400,6 +1402,7 @@ pub const Backend = struct {
         const w16 = if (dt == .f16) w_db else blk: {
             try self.ensureDeviceBuffer(&self.fp8_w16, rows * cols * 2);
             const f_deq = switch (dt) {
+                .q4_0 => try self.eltFn(elt.dequant_q4_0_f16_ptx, "dequant_q4_0_f16"),
                 .q8_0 => try self.eltFn(elt.dequant_q8_0_f16_ptx, "dequant_q8_0_f16"),
                 .q4_k => try self.eltFn(elt.dequant_q4_k_f16_ptx, "dequant_q4_k_f16"),
                 .q5_k => try self.eltFn(elt.dequant_q5_k_f16_ptx, "dequant_q5_k_f16"),
@@ -1468,11 +1471,13 @@ pub const Backend = struct {
     pub fn opAttnDecode(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, kv_len0: usize, seq_q: usize, n_heads: usize, kv_heads: usize, hd: usize, nsplit: usize, scale: f32, window: usize) Error!void {
         self.ptic();
         defer self.ptoc(.attn);
-        std.debug.assert((hd == 128 or hd == 256) and seq_q >= 1);
+        std.debug.assert((hd == 128 or hd == 256 or hd == 512) and seq_q >= 1);
         const f_split = if (hd == 128)
             try self.eltFn(elt.attn_split_ptx, "attn_split")
+        else if (hd == 256)
+            try self.eltFn(elt.attn_split_h256_ptx, "attn_split_h256")
         else
-            try self.eltFn(elt.attn_split_h256_ptx, "attn_split_h256");
+            try self.eltFn(elt.attn_split_h512_ptx, "attn_split_h512");
         try self.eltLaunch(f_split, q, k, v, scratch, .{ @intCast(kv_len0), @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intCast(nsplit), @intCast(seq_q) }, .{ scale, @floatFromInt(window) }, seq_q * n_heads * nsplit * 32);
         const f_merge = try self.eltFn(elt.attn_merge_ptx, "attn_merge");
         try self.eltLaunch(f_merge, scratch, out, null, null, .{ @intCast(seq_q * n_heads), @intCast(hd), @intCast(nsplit), 0, 0, 0 }, .{ 0, 0 }, seq_q * n_heads * hd);
@@ -2277,6 +2282,14 @@ pub const Backend = struct {
         defer self.ptoc(.elt);
         const f = try self.eltFn(elt.add_ptx, "add");
         try self.eltLaunch(f, a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+    }
+
+    /// In-place scalar multiply: a[i] *= scalar (Gemma 4 per-layer out_scale).
+    pub fn opScale(self: *Backend, a: DeviceBuffer, scalar: f32, total: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const f = try self.eltFn(elt.f32_scale_ptx, "f32_scale");
+        try self.eltLaunch(f, a, null, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ scalar, 0 }, total);
     }
 
     /// ReLU in place: a[i] = max(0, a[i]).

@@ -126,8 +126,11 @@ fn isMark(cp: u21) bool {
 pub const Pretok = enum { qwen2, qwen35 };
 
 /// Tokenizer algorithm. `bpe` is GPT-2 byte-level BPE (Qwen family);
-/// `spm` is SentencePiece (tokenizer.ggml.model == "llama"; Gemma, Llama).
-pub const Kind = enum { bpe, spm };
+/// `spm` is SentencePiece (tokenizer.ggml.model == "llama"; Gemma 3, Llama);
+/// `gemma4` is "SPM-style BPE" (tokenizer.ggml.model == "gemma4"): rank-based
+/// BPE merges over ▁-escaped raw UTF-8, newline-only pre-split, `<0xNN>` byte
+/// fallback — shares the SPM vocab layout but merges by rank, not score.
+pub const Kind = enum { bpe, spm, gemma4 };
 
 /// SentencePiece meta symbol ▁ (U+2581) standing in for a space.
 const spm_space = "\xe2\x96\x81";
@@ -162,6 +165,11 @@ pub const Tokenizer = struct {
     spm_text_id: std.StringHashMapUnmanaged(u32) = .empty,
     spm_byte_id: [256]u32 = @splat(0),
     spm_unk: u32 = 0,
+    /// Gemma 4 BPE merge ranks (kind == .gemma4): key is `left ++ '\x00' ++
+    /// right` (token texts contain no NUL), value is the merge rank (lower =
+    /// applied first). Lookups reuse `spm_text_id` (escaped-form text -> id)
+    /// and `spm_byte_id` (byte-fallback) exactly like the SPM path.
+    gemma4_ranks: std.StringHashMapUnmanaged(u32) = .empty,
     /// SentencePiece add_dummy_prefix: prepend ▁ at the start of a raw
     /// fragment following a special token. False for Gemma.
     add_space_prefix: bool = false,
@@ -225,6 +233,7 @@ pub const Tokenizer = struct {
     pub fn initFromGguf(gpa: std.mem.Allocator, g: *const gguf_mod.Gguf) !Tokenizer {
         const model = g.getStr("tokenizer.ggml.model") orelse return error.MissingTokenizer;
         if (std.mem.eql(u8, model, "llama")) return initSpmFromGguf(gpa, g);
+        if (std.mem.eql(u8, model, "gemma4")) return initGemma4FromGguf(gpa, g);
         if (!std.mem.eql(u8, model, "gpt2")) return error.UnsupportedTokenizer;
         var pretok: Pretok = .qwen2;
         if (g.getStr("tokenizer.ggml.pre")) |pre| {
@@ -376,6 +385,106 @@ pub const Tokenizer = struct {
         return t;
     }
 
+    /// Build from a GGUF's "gemma4" tokenizer (tokenizer.ggml.model ==
+    /// "gemma4"): SPM-style vocab (▁-escaped tokens, `<0xNN>` byte fallback,
+    /// CONTROL/USER_DEFINED specials) but merges are RANK-ordered BPE rules
+    /// (llama.cpp LLAMA_VOCAB_TYPE_BPE + pre-type "gemma4"). Encoding escapes
+    /// spaces to ▁ (no dummy prefix), splits on newline runs, then runs
+    /// rank-BPE with byte fallback — see `encodeGemma4`.
+    pub fn initGemma4FromGguf(gpa: std.mem.Allocator, g: *const gguf_mod.Gguf) !Tokenizer {
+        const tokens_arr = g.getArr("tokenizer.ggml.tokens") orelse return error.MissingTokenizer;
+        const types_arr = g.getArr("tokenizer.ggml.token_type") orelse return error.MissingTokenizer;
+        const merges_arr = g.getArr("tokenizer.ggml.merges") orelse return error.MissingTokenizer;
+
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        const alloc = arena.allocator();
+
+        const n_tokens = tokens_arr.len;
+        const id_to_bytes = try alloc.alloc([]const u8, n_tokens);
+        var text_id: std.StringHashMapUnmanaged(u32) = .empty;
+        try text_id.ensureTotalCapacity(alloc, @intCast(n_tokens));
+        var specials: std.ArrayList(Special) = .empty;
+
+        var types_it = types_arr.iterate();
+        var it = tokens_arr.iterate();
+        var id: u32 = 0;
+        while (it.next()) |v| : (id += 1) {
+            if (v != .str) return error.InvalidVocab;
+            const raw = try alloc.dupe(u8, v.str); // ▁-escaped stored form
+            const ttype: i64 = valueInt(types_it.next() orelse return error.InvalidVocab);
+            try text_id.put(alloc, raw, id); // escaped-form -> id (for merges/lookup)
+            switch (ttype) {
+                3, 4 => { // CONTROL / USER_DEFINED: literal text, verbatim-matched
+                    id_to_bytes[id] = raw;
+                    try specials.append(alloc, .{ .text = raw, .id = id });
+                },
+                6 => { // BYTE: "<0xNN>" -> the raw byte
+                    const b = parseByteToken(raw) orelse return error.InvalidVocab;
+                    id_to_bytes[id] = try alloc.dupe(u8, &[_]u8{b});
+                },
+                else => id_to_bytes[id] = try unescapeSpm(alloc, raw), // NORMAL / UNKNOWN
+            }
+        }
+
+        std.mem.sort(Special, specials.items, {}, struct {
+            fn lt(_: void, a: Special, b: Special) bool {
+                if (a.text.len != b.text.len) return a.text.len > b.text.len;
+                return a.id < b.id;
+            }
+        }.lt);
+
+        const unk: u32 = if (g.getUint("tokenizer.ggml.unknown_token_id")) |u| @intCast(u) else 0;
+        var byte_id: [256]u32 = undefined;
+        for (0..256) |b| {
+            var buf: [6]u8 = undefined;
+            const hex = std.fmt.bufPrint(&buf, "<0x{X:0>2}>", .{@as(u8, @intCast(b))}) catch unreachable;
+            byte_id[b] = text_id.get(hex) orelse text_id.get(&[_]u8{@intCast(b)}) orelse unk;
+        }
+
+        // Merge ranks: split each "left right" at the first space >= index 1
+        // (llama.cpp word.find(' ', 1)); key by `left ++ '\x00' ++ right`.
+        var ranks: std.StringHashMapUnmanaged(u32) = .empty;
+        try ranks.ensureTotalCapacity(alloc, @intCast(merges_arr.len));
+        var mit = merges_arr.iterate();
+        var rank: u32 = 0;
+        while (mit.next()) |mv| : (rank += 1) {
+            if (mv != .str) return error.InvalidMerges;
+            const word = mv.str;
+            if (word.len < 2) return error.InvalidMerges;
+            const pos = (std.mem.indexOfScalarPos(u8, word, 1, ' ')) orelse return error.InvalidMerges;
+            const left = word[0..pos];
+            const right = word[pos + 1 ..];
+            const key = try alloc.alloc(u8, left.len + 1 + right.len);
+            @memcpy(key[0..left.len], left);
+            key[left.len] = 0;
+            @memcpy(key[left.len + 1 ..], right);
+            // First occurrence wins the (lowest) rank, matching emplace.
+            const gop = try ranks.getOrPut(alloc, key);
+            if (!gop.found_existing) gop.value_ptr.* = rank;
+        }
+
+        var t: Tokenizer = .{
+            .arena = arena,
+            .id_to_bytes = id_to_bytes,
+            .byte_id = @splat(0), // unused for gemma4
+            .merges = .empty,
+            .specials = try specials.toOwnedSlice(alloc),
+            .kind = .gemma4,
+            .spm_text_id = text_id,
+            .spm_byte_id = byte_id,
+            .spm_unk = unk,
+            .gemma4_ranks = ranks,
+        };
+        const eos: ?u32 = if (g.getUint("tokenizer.ggml.eos_token_id")) |e| @intCast(e) else null;
+        // Gemma 4 turn markers: <|turn> (open) / <turn|> (close); the model
+        // stops on the closing marker or eos.
+        t.turn_end = findSpecial(t.specials, "<turn|>") orelse eos orelse return error.MissingTokenizer;
+        t.pad = if (g.getUint("tokenizer.ggml.padding_token_id")) |p| @intCast(p) else eos orelse t.turn_end;
+        t.newline = text_id.get("\n") orelse 0;
+        return t;
+    }
+
     /// Id of a special token by its literal text (e.g. "<|image_pad|>").
     pub fn specialId(self: *const Tokenizer, text: []const u8) ?u32 {
         return findSpecial(self.specials, text);
@@ -463,6 +572,7 @@ pub const Tokenizer = struct {
     /// Append the token ids of `text` to `out`.
     pub fn encode(self: *const Tokenizer, gpa: std.mem.Allocator, text: []const u8, out: *std.ArrayList(u32)) !void {
         if (self.kind == .spm) return self.encodeSpm(gpa, text, out);
+        if (self.kind == .gemma4) return self.encodeGemma4(gpa, text, out);
         var i: usize = 0;
         while (i < text.len) {
             // Earliest special-token occurrence from i.
@@ -749,6 +859,138 @@ pub const Tokenizer = struct {
         }
     }
 
+    // --- Gemma 4 ("SPM-style BPE") encode path ---------------------------
+
+    /// Gemma 4 encode: partition on specials (verbatim, longest-first), then
+    /// per raw fragment escape spaces to ▁ (no dummy prefix), split into
+    /// newline vs non-newline runs, and rank-BPE each run. Mirrors llama.cpp's
+    /// llm_tokenizer_bpe_session with pre-type GEMMA4.
+    fn encodeGemma4(self: *const Tokenizer, gpa: std.mem.Allocator, text: []const u8, out: *std.ArrayList(u32)) !void {
+        const Frag = union(enum) { raw: []const u8, tok: u32 };
+        var frags: std.ArrayList(Frag) = .empty;
+        defer frags.deinit(gpa);
+        var next: std.ArrayList(Frag) = .empty;
+        defer next.deinit(gpa);
+        try frags.append(gpa, .{ .raw = text });
+
+        for (self.specials) |sp| {
+            if (sp.text.len == 0) continue;
+            next.clearRetainingCapacity();
+            for (frags.items) |f| switch (f) {
+                .tok => try next.append(gpa, f),
+                .raw => |r| {
+                    var start: usize = 0;
+                    while (std.mem.indexOfPos(u8, r, start, sp.text)) |pos| {
+                        if (pos > start) try next.append(gpa, .{ .raw = r[start..pos] });
+                        try next.append(gpa, .{ .tok = sp.id });
+                        start = pos + sp.text.len;
+                    }
+                    if (start < r.len) try next.append(gpa, .{ .raw = r[start..] });
+                },
+            };
+            std.mem.swap(std.ArrayList(Frag), &frags, &next);
+        }
+
+        for (frags.items) |f| switch (f) {
+            .tok => |t| try out.append(gpa, t),
+            .raw => |r| try self.gemma4EncodeRaw(gpa, r, out),
+        };
+    }
+
+    /// Escape a raw fragment (spaces -> ▁, no dummy prefix), split into
+    /// maximal newline / non-newline runs, and rank-BPE each run.
+    fn gemma4EncodeRaw(self: *const Tokenizer, gpa: std.mem.Allocator, r: []const u8, out: *std.ArrayList(u32)) !void {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        for (r) |c| {
+            if (c == ' ') try buf.appendSlice(gpa, spm_space) else try buf.append(gpa, c);
+        }
+        const b = buf.items;
+        if (b.len == 0) return;
+        // Scratch for bigram keys: `left ++ '\x00' ++ right` never exceeds the
+        // word length + 1.
+        const scratch = try gpa.alloc(u8, b.len + 1);
+        defer gpa.free(scratch);
+        var i: usize = 0;
+        while (i < b.len) {
+            const is_nl = b[i] == '\n';
+            var j = i + 1;
+            while (j < b.len and (b[j] == '\n') == is_nl) j += 1;
+            try self.gemma4Word(gpa, b[i..j], is_nl, scratch, out);
+            i = j;
+        }
+    }
+
+    /// Rank-BPE one word (a newline or non-newline run) into ids, with
+    /// `<0xNN>` byte fallback. `all_newline` enables llama.cpp's gemma4 fix:
+    /// a newline run that is itself a token is emitted whole (never split).
+    fn gemma4Word(self: *const Tokenizer, gpa: std.mem.Allocator, word: []const u8, all_newline: bool, scratch: []u8, out: *std.ArrayList(u32)) !void {
+        if (all_newline) {
+            if (self.spm_text_id.get(word)) |wid| {
+                try out.append(gpa, wid);
+                return;
+            }
+        }
+
+        var syms: std.ArrayList(SpmSymbol) = .empty;
+        defer syms.deinit(gpa);
+        {
+            var offs: usize = 0;
+            var idx: i32 = 0;
+            while (offs < word.len) {
+                const len = std.unicode.utf8ByteSequenceLength(word[offs]) catch 1;
+                const n = @min(@as(usize, len), word.len - offs);
+                try syms.append(gpa, .{
+                    .text = word[offs .. offs + n],
+                    .prev = idx - 1,
+                    .next = if (offs + n == word.len) -1 else idx + 1,
+                });
+                offs += n;
+                idx += 1;
+            }
+        }
+        if (syms.items.len == 0) return;
+
+        var pq: Gemma4Queue = .empty;
+        defer pq.deinit(gpa);
+        for (1..syms.items.len) |i| try self.gemma4AddBigram(gpa, syms.items, &pq, @intCast(i - 1), @intCast(i), scratch);
+
+        while (pq.pop()) |bg| {
+            const l = &syms.items[@intCast(bg.left)];
+            const rr = &syms.items[@intCast(bg.right)];
+            if (l.text.len == 0 or rr.text.len == 0 or l.text.len + rr.text.len != bg.size) continue;
+            l.text = l.text.ptr[0 .. l.text.len + rr.text.len];
+            rr.text = rr.text[0..0];
+            l.next = rr.next;
+            if (rr.next >= 0) syms.items[@intCast(rr.next)].prev = bg.left;
+            try self.gemma4AddBigram(gpa, syms.items, &pq, l.prev, bg.left, scratch);
+            try self.gemma4AddBigram(gpa, syms.items, &pq, bg.left, l.next, scratch);
+        }
+
+        var i: i32 = 0;
+        while (i != -1) : (i = syms.items[@intCast(i)].next) {
+            const sym = syms.items[@intCast(i)];
+            if (sym.text.len == 0) continue;
+            if (self.spm_text_id.get(sym.text)) |wid| {
+                try out.append(gpa, wid);
+            } else {
+                for (sym.text) |bb| try out.append(gpa, self.spm_byte_id[bb]);
+            }
+        }
+    }
+
+    fn gemma4AddBigram(self: *const Tokenizer, gpa: std.mem.Allocator, syms: []const SpmSymbol, pq: *Gemma4Queue, left: i32, right: i32, scratch: []u8) !void {
+        if (left == -1 or right == -1) return;
+        const l = syms[@intCast(left)].text;
+        const rt = syms[@intCast(right)].text;
+        if (l.len == 0 or rt.len == 0) return;
+        @memcpy(scratch[0..l.len], l);
+        scratch[l.len] = 0;
+        @memcpy(scratch[l.len + 1 ..][0..rt.len], rt);
+        const rank = self.gemma4_ranks.get(scratch[0 .. l.len + 1 + rt.len]) orelse return;
+        try pq.push(gpa, .{ .left = left, .right = right, .rank = rank, .size = l.len + rt.len });
+    }
+
     /// Decode ids back to text (debugging / tests).
     pub fn decodeAlloc(self: *const Tokenizer, gpa: std.mem.Allocator, ids: []const u32) ![]u8 {
         var buf: std.ArrayList(u8) = .empty;
@@ -786,6 +1028,19 @@ fn spmBigramOrder(_: void, a: SpmBigram, b: SpmBigram) std.math.Order {
 }
 
 const SpmQueue = std.PriorityQueue(SpmBigram, void, spmBigramOrder);
+
+/// A candidate Gemma 4 rank-BPE merge of two adjacent symbols.
+const Gemma4Bigram = struct { left: i32, right: i32, rank: u32, size: usize };
+
+/// Lowest rank first; ties broken by smaller left index (llama.cpp
+/// llm_bigram_bpe::comparator). PriorityQueue pops the `.lt`-most element.
+fn gemma4BigramOrder(_: void, a: Gemma4Bigram, b: Gemma4Bigram) std.math.Order {
+    if (a.rank != b.rank) return if (a.rank < b.rank) .lt else .gt;
+    if (a.left != b.left) return if (a.left < b.left) .lt else .gt;
+    return .eq;
+}
+
+const Gemma4Queue = std.PriorityQueue(Gemma4Bigram, void, gemma4BigramOrder);
 
 // --- tests -----------------------------------------------------------------
 
@@ -935,6 +1190,46 @@ test "gemma3 gguf spm tokenizer matches llama-tokenize" {
     const round = try tok.decodeAlloc(gpa, ids.items);
     defer gpa.free(round);
     try std.testing.expectEqualStrings("<start_of_turn>user\nhi<end_of_turn>\n", round);
+}
+
+// Golden ids from llama.cpp's llama-tokenize --no-bos on the gemma4 12B GGUF
+// (tokenizer.ggml.model == "gemma4": SPM-style rank BPE); skipped when absent.
+test "gemma4 gguf tokenizer matches llama-tokenize" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "/home/qt/genai/lmstudio/models/gemma-4-12b-it-qat-q4_0.gguf";
+    std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
+
+    var g = try gguf_mod.Gguf.open(gpa, io, path);
+    defer g.deinit();
+    var tok = try Tokenizer.initFromGguf(gpa, &g);
+    defer tok.deinit();
+
+    try std.testing.expectEqual(Kind.gemma4, tok.kind);
+    try std.testing.expectEqual(@as(u32, 106), tok.turn_end); // <turn|>
+    try std.testing.expectEqual(@as(u32, 107), tok.newline); // "\n"
+    try std.testing.expectEqual(@as(usize, 262144), tok.id_to_bytes.len);
+
+    try expectEncode(&tok, "a photo of a cat", &.{ 236746, 4429, 529, 496, 5866 });
+    try expectEncode(&tok, "Hello, World! 123 café ☕ 你好", &.{ 9259, 236764, 4109, 236888, 236743, 236770, 236778, 236800, 33443, 236743, 244360, 43758, 237389 });
+    try expectEncode(&tok, "  leading and trailing  ", &.{ 138, 26016, 532, 45330, 138 });
+    try expectEncode(&tok, "The quick brown fox.", &.{ 818, 3823, 8864, 37423, 236761 });
+    try expectEncode(&tok, "don't we'll", &.{ 13246, 236789, 236745, 692, 236789, 859 });
+    try expectEncode(&tok, "a  b\n\nc\td ", &.{ 236746, 138, 236763, 108, 236755, 255968, 236753, 236743 });
+    try expectEncode(&tok, "café naïve", &.{ 123125, 236859, 120362 });
+    try expectEncode(&tok, "नमस्ते dost", &.{ 226767, 24873 });
+    try expectEncode(&tok, "x… —dash", &.{ 236781, 237064, 2192, 56057 });
+
+    // Turn markers matched verbatim (<|turn> = 105, <turn|> = 106, \n = 107).
+    try expectEncode(&tok, "<|turn>user\nhi there<turn|>\n", &.{ 105, 2364, 107, 2202, 993, 106, 107 });
+
+    // Decode round-trips (byte-concat of stored/unescaped forms).
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(gpa);
+    try tok.encode(gpa, "The quick brown fox.", &ids);
+    const round = try tok.decodeAlloc(gpa, ids.items);
+    defer gpa.free(round);
+    try std.testing.expectEqualStrings("The quick brown fox.", round);
 }
 
 test "decode round trips" {

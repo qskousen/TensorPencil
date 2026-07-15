@@ -120,6 +120,120 @@ pub const KvCache = struct {
     }
 };
 
+/// Like `KvCache` but each layer has its own `kv_dim`. Gemma 4 needs this:
+/// its sliding-window layers hold 8 KV heads × 256 = 2048, while its global
+/// layers hold 1 KV head × 512 = 512, so a single uniform stride would either
+/// waste half the cache or misalign the attention view. Same write/commit/view
+/// protocol as `KvCache`; the per-layer dims are borrowed at init (copied into
+/// the caller's allocator so they outlive the source config).
+pub const PerLayerKvCache = struct {
+    k: []f32,
+    v: []f32,
+    n_layers: usize,
+    capacity: usize,
+    /// Per-layer kv_dim (owned copy).
+    kv_dims: []usize,
+    /// Element base offset of each layer's block: `capacity * sum(kv_dims[<l])`.
+    /// `offsets[n_layers]` is the total element count per k/v buffer.
+    offsets: []usize,
+    len: usize = 0,
+
+    pub fn init(gpa: std.mem.Allocator, capacity: usize, kv_dims: []const usize) !PerLayerKvCache {
+        const n_layers = kv_dims.len;
+        const dims = try gpa.dupe(usize, kv_dims);
+        errdefer gpa.free(dims);
+        const offsets = try gpa.alloc(usize, n_layers + 1);
+        errdefer gpa.free(offsets);
+        var acc: usize = 0;
+        for (0..n_layers) |l| {
+            offsets[l] = acc * capacity;
+            acc += dims[l];
+        }
+        offsets[n_layers] = acc * capacity;
+        const total = offsets[n_layers];
+        const k = try gpa.alloc(f32, total);
+        errdefer gpa.free(k);
+        const v = try gpa.alloc(f32, total);
+        return .{ .k = k, .v = v, .n_layers = n_layers, .capacity = capacity, .kv_dims = dims, .offsets = offsets };
+    }
+
+    pub fn deinit(self: *PerLayerKvCache, gpa: std.mem.Allocator) void {
+        gpa.free(self.k);
+        gpa.free(self.v);
+        gpa.free(self.kv_dims);
+        gpa.free(self.offsets);
+        self.* = undefined;
+    }
+
+    pub fn remaining(self: *const PerLayerKvCache) usize {
+        return self.capacity - self.len;
+    }
+
+    /// Write `n` tokens' K/V for `layer` at the uncommitted rows [len, len+n).
+    pub fn write(self: *PerLayerKvCache, layer: usize, k_new: []const f32, v_new: []const f32) void {
+        const d = self.kv_dims[layer];
+        std.debug.assert(k_new.len == v_new.len and (d == 0 or k_new.len % d == 0));
+        std.debug.assert(self.len * d + k_new.len <= self.capacity * d);
+        const base = self.offsets[layer] + self.len * d;
+        @memcpy(self.k[base..][0..k_new.len], k_new);
+        @memcpy(self.v[base..][0..v_new.len], v_new);
+    }
+
+    pub fn kView(self: *const PerLayerKvCache, layer: usize, extra: usize) []const f32 {
+        return self.view(self.k, layer, extra);
+    }
+
+    pub fn vView(self: *const PerLayerKvCache, layer: usize, extra: usize) []const f32 {
+        return self.view(self.v, layer, extra);
+    }
+
+    fn view(self: *const PerLayerKvCache, buf: []const f32, layer: usize, extra: usize) []const f32 {
+        std.debug.assert(self.len + extra <= self.capacity);
+        const d = self.kv_dims[layer];
+        return buf[self.offsets[layer]..][0 .. (self.len + extra) * d];
+    }
+
+    pub fn commit(self: *PerLayerKvCache, n: usize) void {
+        std.debug.assert(self.len + n <= self.capacity);
+        self.len += n;
+    }
+
+    pub fn truncate(self: *PerLayerKvCache, new_len: usize) void {
+        std.debug.assert(new_len <= self.len);
+        self.len = new_len;
+    }
+
+    /// Grow to `new_capacity` rows per layer, re-striding into fresh buffers
+    /// (committed rows copied). No-op when already large enough.
+    pub fn grow(self: *PerLayerKvCache, gpa: std.mem.Allocator, new_capacity: usize) !void {
+        if (new_capacity <= self.capacity) return;
+        const new_offsets = try gpa.alloc(usize, self.n_layers + 1);
+        errdefer gpa.free(new_offsets);
+        var acc: usize = 0;
+        for (0..self.n_layers) |l| {
+            new_offsets[l] = acc * new_capacity;
+            acc += self.kv_dims[l];
+        }
+        new_offsets[self.n_layers] = acc * new_capacity;
+        const nk = try gpa.alloc(f32, new_offsets[self.n_layers]);
+        errdefer gpa.free(nk);
+        const nv = try gpa.alloc(f32, new_offsets[self.n_layers]);
+        errdefer gpa.free(nv);
+        for (0..self.n_layers) |l| {
+            const used = self.len * self.kv_dims[l];
+            @memcpy(nk[new_offsets[l]..][0..used], self.k[self.offsets[l]..][0..used]);
+            @memcpy(nv[new_offsets[l]..][0..used], self.v[self.offsets[l]..][0..used]);
+        }
+        gpa.free(self.k);
+        gpa.free(self.v);
+        gpa.free(self.offsets);
+        self.k = nk;
+        self.v = nv;
+        self.offsets = new_offsets;
+        self.capacity = new_capacity;
+    }
+};
+
 // --- tests -----------------------------------------------------------------
 
 test "write/commit/view round trip" {
@@ -171,6 +285,35 @@ test "grow preserves committed rows across the re-stride" {
     cache.write(0, &k2, &k2);
     cache.commit(1);
     try std.testing.expectEqualSlices(f32, &(k0 ++ k2), cache.kView(0, 0));
+}
+
+test "per-layer kv cache: variable dims, write/view/grow" {
+    const gpa = std.testing.allocator;
+    // Layer 0 dim 2, layer 1 dim 4 (mismatched, like gemma4 SWA vs global).
+    var cache = try PerLayerKvCache.init(gpa, 3, &.{ 2, 4 });
+    defer cache.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), cache.offsets[0]);
+    try std.testing.expectEqual(@as(usize, 6), cache.offsets[1]); // 3*2
+    try std.testing.expectEqual(@as(usize, 18), cache.offsets[2]); // 3*2 + 3*4
+
+    const k0 = [_]f32{ 1, 2, 3, 4 }; // two tokens, dim 2
+    const k1 = [_]f32{ 10, 11, 12, 13, 14, 15, 16, 17 }; // two tokens, dim 4
+    cache.write(0, &k0, &k0);
+    cache.write(1, &k1, &k1);
+    try std.testing.expectEqualSlices(f32, &k0, cache.kView(0, 2));
+    try std.testing.expectEqualSlices(f32, &k1, cache.kView(1, 2));
+    cache.commit(2);
+    try std.testing.expectEqual(@as(usize, 1), cache.remaining());
+
+    try cache.grow(gpa, 8);
+    try std.testing.expectEqual(@as(usize, 8), cache.capacity);
+    try std.testing.expectEqualSlices(f32, &k0, cache.kView(0, 0));
+    try std.testing.expectEqualSlices(f32, &k1, cache.vView(1, 0));
+    // New token lands after the preserved rows in each (differently strided) layer.
+    const n1 = [_]f32{ 100, 101, 102, 103 };
+    cache.write(1, &n1, &n1);
+    cache.commit(1);
+    try std.testing.expectEqualSlices(f32, &(k1 ++ n1), cache.kView(1, 0));
 }
 
 test "growTarget is geometric and clamped" {

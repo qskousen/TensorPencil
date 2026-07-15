@@ -275,6 +275,25 @@ pub fn main(init: std.process.Init) !void {
         return runGemma3(arena, gpa, io, &st.gguf, backend, vram_budget, image_path, mmproj_path, prompt, system, opts, profile, stdout);
     }
 
+    // Gemma 4 (per-layer local/global attention geometry, V-norm, out_scale,
+    // proportional RoPE): text-only CPU model for now (GPU + vision are
+    // follow-ups).
+    if (st == .gguf and st.gguf.getStr("general.architecture") != null and
+        std.mem.eql(u8, st.gguf.getStr("general.architecture").?, "gemma4"))
+    {
+        if (draft_path != null or eagle_path != null or opts.spec_k > 0 or opts.tree_nodes > 0) {
+            try stdout.writeAll("speculative decoding is not supported for gemma4 models yet\n");
+            try stdout.flush();
+            return error.InvalidArgument;
+        }
+        if (cpu_split != null or dynamic_offload) {
+            try stdout.writeAll("--cpu-layers / --offload-grow is only supported for qwen35 models\n");
+            try stdout.flush();
+            return error.InvalidArgument;
+        }
+        return runGemma4(arena, gpa, io, &st.gguf, backend, image_path, mmproj_path, prompt, system, opts, profile, stdout);
+    }
+
     if (cpu_split != null or dynamic_offload) {
         try stdout.writeAll("--cpu-layers / --offload-grow (hybrid CPU/GPU split) is only supported for qwen35 (Qwen3.5/3.6) models for now\n");
         try stdout.flush();
@@ -1243,6 +1262,172 @@ fn runGemma3(
             t0 = Io.Clock.real.now(io).nanoseconds;
             break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt, null);
         },
+    };
+    const t_end = Io.Clock.real.now(io).nanoseconds;
+
+    const setup_s = @as(f64, @floatFromInt(t0 - t_init)) / 1e9;
+    const elapsed_s = @as(f64, @floatFromInt(t_end - t0)) / 1e9;
+    if (prompt != null) {
+        try stdout.print("\n\n[{d} tokens in {d:.1}s, {d:.2} tok/s; setup {d:.1}s]\n", .{
+            n, elapsed_s, @as(f64, @floatFromInt(n)) / elapsed_s, setup_s,
+        });
+    } else {
+        try stdout.print("[session over: {d} tokens generated; setup was {d:.1}s]\n", .{ n, setup_s });
+    }
+    try stdout.flush();
+}
+
+fn runGemma4(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    io: Io,
+    g: *const TensorPencil.Gguf,
+    backend: BackendKind,
+    image_path: ?[]const u8,
+    mmproj_path: ?[]const u8,
+    prompt: ?[]const u8,
+    system: ?[]const u8,
+    opts: llm.engine.Options,
+    profile: bool,
+    stdout: *Io.Writer,
+) !void {
+    if (backend == .vulkan) {
+        try stdout.writeAll("gemma4 runs on cpu / zig-cuda / cuda (the vulkan backend is a follow-up)\n");
+        try stdout.flush();
+        return error.InvalidArgument;
+    }
+    if (image_path != null) {
+        if (mmproj_path == null) {
+            try stdout.writeAll("--image requires --mmproj <mmproj.gguf> (the vision embedder ships separately)\n");
+            try stdout.flush();
+            return error.InvalidArgument;
+        }
+        if (prompt == null) {
+            try stdout.writeAll("--image requires --prompt (one-shot; gemma4 interactive @image is not wired yet)\n");
+            try stdout.flush();
+            return error.InvalidArgument;
+        }
+    }
+    const gemma4 = TensorPencil.models.gemma4;
+    var lm = try gemma4.Model.load(arena, g);
+    defer lm.deinit();
+    var tok = try TensorPencil.tokenizer.Tokenizer.initFromGguf(arena, g);
+    defer tok.deinit();
+    llm.chat.applyTokenizer(&tok);
+    llm.chat.setFamily(.gemma4);
+
+    // Vision embedder (--mmproj): the gemma4uv "unified" embedder (no ViT
+    // blocks) runs on CPU; --image encodes up front (one-shot) and the
+    // projected embeddings are injected UNSCALED during prefill.
+    var mmg: ?TensorPencil.Gguf = null;
+    defer if (mmg) |*mg| mg.deinit();
+    var vit: ?TensorPencil.models.gemma4_vit.Vit = null;
+    defer if (vit) |*v| v.deinit();
+    if (mmproj_path) |mp| {
+        mmg = try TensorPencil.Gguf.open(arena, io, mp);
+        vit = try TensorPencil.models.gemma4_vit.Vit.load(arena, &mmg.?);
+    }
+    var img: ?TensorPencil.models.gemma4_vit.Vit.Encoded = null;
+    defer if (img) |*e| e.deinit(gpa);
+    if (image_path) |ip| {
+        const dec = try vips.loadRgb(gpa, ip);
+        defer gpa.free(dec.pixels);
+        const t_vit = Io.Clock.real.now(io).nanoseconds;
+        img = try vit.?.encode(io, gpa, dec.pixels, dec.width, dec.height);
+        const vit_s = @as(f64, @floatFromInt(Io.Clock.real.now(io).nanoseconds - t_vit)) / 1e9;
+        try stdout.print("[image {d}x{d} -> {d} tokens; vit {d:.1}s (cpu)]\n", .{ dec.width, dec.height, img.?.grid_w * img.?.grid_h, vit_s });
+        try stdout.flush();
+    }
+
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(gpa);
+    // Gemma 4 prompts begin with a single BOS.
+    if (tok.specialId("<bos>")) |bos| try ids.append(gpa, bos);
+    // Rows before the image block, and the block's token count — the one-shot
+    // prefill interleaves text / image / text around them.
+    var n_pre: usize = 0;
+    var n_img: usize = 0;
+    if (img) |*e| {
+        n_img = e.grid_w * e.grid_h;
+        try tok.encode(gpa, "<|turn>user\n", &ids);
+        try ids.append(gpa, tok.specialId("<|image>") orelse return error.MissingImageToken);
+        n_pre = ids.items.len;
+        // Placeholder rows (overwritten by prefillImage; keep ids aligned with
+        // cache rows). The id is immaterial to the forward.
+        try ids.appendNTimes(gpa, tok.pad, n_img);
+        try ids.append(gpa, tok.specialId("<image|>") orelse return error.MissingImageToken);
+        try tok.encode(gpa, prompt.?, &ids);
+        try tok.encode(gpa, "<turn|>\n", &ids);
+        try llm.chat.openAssistant(&tok, gpa, &ids);
+    } else {
+        if (system) |s| try llm.chat.appendSystem(&tok, gpa, s, &ids);
+        if (prompt) |p| {
+            try llm.chat.appendUser(&tok, gpa, p, &ids);
+            try llm.chat.openAssistant(&tok, gpa, &ids);
+        }
+    }
+
+    try stdout.print("[{s} backend, gemma4 {d}L, {d} prompt tokens, ctx window {d}, max {d} new/turn, temp {d:.2}, seed {d}]\n", .{
+        @tagName(backend), lm.cfg.n_layers, ids.items.len, opts.max_context, opts.max_new_tokens, opts.sampling.temperature, opts.seed,
+    });
+    if (prompt == null) {
+        try stdout.writeAll("[interactive chat: Enter sends, Shift- or Alt-Enter adds a line, /exit or Ctrl-D quits]\n");
+    }
+    try stdout.writeAll("\n");
+    try stdout.flush();
+
+    const cap = try capacityPlan(opts, prompt, ids.items.len, false);
+    if (profile) {
+        TensorPencil.prof.reset();
+        TensorPencil.prof.enabled = true;
+    }
+    defer if (profile) TensorPencil.prof.report(stdout) catch {};
+
+    const t_init = Io.Clock.real.now(io).nanoseconds;
+    // CUDA backends run the LLM device-resident (the vision embedder stays on
+    // CPU — it's cheap). No CPU-split / offload / streaming (the 12B fits).
+    const cuda_be = TensorPencil.gpu.cuda.Backend;
+    const be_cuda: ?*cuda_be = switch (backend) {
+        .cuda => try cuda_be.initLibs(arena),
+        .@"zig-cuda" => try cuda_be.init(arena),
+        else => null,
+    };
+    defer if (be_cuda) |bb| bb.deinit();
+    if (be_cuda) |bb| {
+        // Pin the whole model resident (the 12B Q4_0 fits the 3090). Without a
+        // pin budget, cachedWeight pins nothing and every weight streams from
+        // host each token — the ~3.6x decode killer (see defaultWeightBudget).
+        bb.profile = profile;
+        const eff_budget = defaultWeightBudget(bb, 0);
+        bb.pin_budget = eff_budget -| pin_slack;
+        bb.stream_window = @min(pin_slack, eff_budget);
+    }
+    var t0: i96 = undefined;
+    const n = switch (backend) {
+        .cpu => blk: {
+            var model = try gemma4.CpuModel.init(gpa, &lm, cap);
+            defer model.deinit();
+            model.io = io;
+            if (img) |*e| {
+                try model.prefill(ids.items[0..n_pre]);
+                try model.prefillImage(e.embeds, e.grid_w, e.grid_h);
+                try model.prefill(ids.items[n_pre + n_img .. ids.items.len - 1]);
+            }
+            t0 = Io.Clock.real.now(io).nanoseconds;
+            break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt, null);
+        },
+        .@"zig-cuda", .cuda => blk: {
+            var model = try TensorPencil.models.gemma4_cuda.CudaLM.init(gpa, be_cuda.?, &lm, cap);
+            defer model.deinit();
+            if (img) |*e| {
+                try model.prefill(ids.items[0..n_pre]);
+                try model.prefillImage(e.embeds, e.grid_w, e.grid_h);
+                try model.prefill(ids.items[n_pre + n_img .. ids.items.len - 1]);
+            }
+            t0 = Io.Clock.real.now(io).nanoseconds;
+            break :blk try runSession(&model, null, &tok, io, gpa, &ids, opts, stdout, prompt, null);
+        },
+        .vulkan => unreachable, // rejected above
     };
     const t_end = Io.Clock.real.now(io).nanoseconds;
 
