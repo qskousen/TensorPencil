@@ -582,8 +582,11 @@ would add ~10 pts acceptance on top.
   q4_0 linears route through the dequant→f16 GEMM — the dp4a GEMV path has no
   q4_0 kernel), and the naive `attn` kernel's `.local accl[512]` (128 f32) OOB'd
   at head_dim 512 → bumped to accl[2048]. Text token-identical to CPU/llama.cpp
-  on both backends; vision caption identical to the CPU path. Vision still
-  encodes on CPU (the embedder is cheap); the LLM runs on GPU. **Decode ~44
+  on both backends; vision caption identical to the CPU path. **Vision on GPU**
+  (`models/gemma4_vit_cuda.zig`): the shallow gemma4uv embedder runs device-side
+  (opLayerNorm ×3 → patch-embed opConvF16 → +pos opAdd → weightless rms → opMatmulBf16
+  projection), parity vs CPU min token cos 1.000000; wired into tp-llm and tp-gui.
+  **Decode ~44
   tok/s** (token-identical, both backends; exceeds the gemma3 ~35 ref) — ~13x
   over the initial dequant-GEMM path, via two kernels: (1) `attn_split_h512`
   (flash-decode split for head_dim 512, adapted from attn_split_h256 — 16
@@ -592,8 +595,8 @@ would add ~10 pts acceptance on top.
   activation GEMV reusing the q8_0_q8n grouped machinery; unpacks the 18-byte
   q4_0 nibble block and applies the -8 offset as dot(w-8,a)=dp4a(nibble,a)-8·Σa).
   A fused f32 `gemv_q4_0` is the non-dp4a fallback; prefill uses the dequant→f16
-  GEMM. REMAINING: a GPU vision embedder, the VULKAN backend, and the AUDIO
-  encoder (`gemma4ua`: mel frontend + encoder — TensorPencil has no audio path).
+  GEMM. REMAINING: the VULKAN backend and the AUDIO encoder (`gemma4ua`: mel
+  frontend + encoder — TensorPencil has no audio path).
 - ~~GGUF import~~ — DONE (2026-07): `src/gguf.zig` (container, llama.cpp→HF
   name canonicalization, config from `qwen3.*` metadata), `src/quants.zig`
   (Q8_0/Q4_K/Q5_K/Q6_K dequant, bit-exact vs ggml-quants.c golden fixtures),

@@ -1316,9 +1316,27 @@ fn runGemma4(
     llm.chat.applyTokenizer(&tok);
     llm.chat.setFamily(.gemma4);
 
+    // CUDA backend created up front so the vision embedder can encode
+    // device-side (the LLM claims VRAM after). Null on cpu.
+    const cuda_be = TensorPencil.gpu.cuda.Backend;
+    const be_cuda: ?*cuda_be = switch (backend) {
+        .cuda => try cuda_be.initLibs(arena),
+        .@"zig-cuda" => try cuda_be.init(arena),
+        else => null,
+    };
+    defer if (be_cuda) |bb| bb.deinit();
+    if (be_cuda) |bb| {
+        // Pin the whole model resident (the 12B Q4_0 fits the 3090); without a
+        // pin budget cachedWeight pins nothing (see defaultWeightBudget).
+        bb.profile = profile;
+        const eff_budget = defaultWeightBudget(bb, 0);
+        bb.pin_budget = eff_budget -| pin_slack;
+        bb.stream_window = @min(pin_slack, eff_budget);
+    }
+
     // Vision embedder (--mmproj): the gemma4uv "unified" embedder (no ViT
-    // blocks) runs on CPU; --image encodes up front (one-shot) and the
-    // projected embeddings are injected UNSCALED during prefill.
+    // blocks) runs device-side on the CUDA backends (host on cpu); --image
+    // encodes up front (one-shot) and the embeddings inject UNSCALED at prefill.
     var mmg: ?TensorPencil.Gguf = null;
     defer if (mmg) |*mg| mg.deinit();
     var vit: ?TensorPencil.models.gemma4_vit.Vit = null;
@@ -1333,9 +1351,12 @@ fn runGemma4(
         const dec = try vips.loadRgb(gpa, ip);
         defer gpa.free(dec.pixels);
         const t_vit = Io.Clock.real.now(io).nanoseconds;
-        img = try vit.?.encode(io, gpa, dec.pixels, dec.width, dec.height);
+        img = if (be_cuda) |bb|
+            try TensorPencil.models.gemma4_vit_cuda.encode(&vit.?, bb, io, gpa, dec.pixels, dec.width, dec.height)
+        else
+            try vit.?.encode(io, gpa, dec.pixels, dec.width, dec.height);
         const vit_s = @as(f64, @floatFromInt(Io.Clock.real.now(io).nanoseconds - t_vit)) / 1e9;
-        try stdout.print("[image {d}x{d} -> {d} tokens; vit {d:.1}s (cpu)]\n", .{ dec.width, dec.height, img.?.grid_w * img.?.grid_h, vit_s });
+        try stdout.print("[image {d}x{d} -> {d} tokens; vit {d:.1}s ({s})]\n", .{ dec.width, dec.height, img.?.grid_w * img.?.grid_h, vit_s, if (be_cuda == null) "cpu" else "gpu" });
         try stdout.flush();
     }
 
@@ -1384,24 +1405,8 @@ fn runGemma4(
     defer if (profile) TensorPencil.prof.report(stdout) catch {};
 
     const t_init = Io.Clock.real.now(io).nanoseconds;
-    // CUDA backends run the LLM device-resident (the vision embedder stays on
-    // CPU — it's cheap). No CPU-split / offload / streaming (the 12B fits).
-    const cuda_be = TensorPencil.gpu.cuda.Backend;
-    const be_cuda: ?*cuda_be = switch (backend) {
-        .cuda => try cuda_be.initLibs(arena),
-        .@"zig-cuda" => try cuda_be.init(arena),
-        else => null,
-    };
-    defer if (be_cuda) |bb| bb.deinit();
-    if (be_cuda) |bb| {
-        // Pin the whole model resident (the 12B Q4_0 fits the 3090). Without a
-        // pin budget, cachedWeight pins nothing and every weight streams from
-        // host each token — the ~3.6x decode killer (see defaultWeightBudget).
-        bb.profile = profile;
-        const eff_budget = defaultWeightBudget(bb, 0);
-        bb.pin_budget = eff_budget -| pin_slack;
-        bb.stream_window = @min(pin_slack, eff_budget);
-    }
+    // CUDA backend + pinning were set up front (before the vision encode). No
+    // CPU-split / offload / streaming — the 12B fits.
     var t0: i96 = undefined;
     const n = switch (backend) {
         .cpu => blk: {

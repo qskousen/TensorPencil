@@ -159,23 +159,36 @@ pub const Vit = struct {
         }
     };
 
-    /// Encode interleaved RGB pixels to LLM image-token embeddings.
-    pub fn encode(self: *const Vit, io: std.Io, gpa: std.mem.Allocator, rgb: []const u8, width: usize, height: usize) !Encoded {
+    /// Preprocessed patches: the im2col matrix [np][kdim] (row-major patch
+    /// order) plus the patch-grid dims. Shared by the CPU and CUDA encoders.
+    pub const Patches = struct {
+        data: []f32, // gpa-owned
+        n_cols: usize,
+        n_rows: usize,
+        pub fn np(self: Patches) usize {
+            return self.n_cols * self.n_rows;
+        }
+        pub fn deinit(self: *Patches, gpa: std.mem.Allocator) void {
+            gpa.free(self.data);
+            self.* = undefined;
+        }
+    };
+
+    /// Smart-resize + normalize + im2col: RGB pixels -> [np][kdim] patch matrix
+    /// (channel-planar 48x48 patches, row-major patch order).
+    pub fn patchMatrix(self: *const Vit, gpa: std.mem.Allocator, rgb: []const u8, width: usize, height: usize) !Patches {
         const cfg = self.cfg;
-        const dim = cfg.dim;
         const patch = cfg.patch;
         const kdim = cfg.kdim();
-
         const tgt = smartResize(width, height, patch, cfg.minPixels(), cfg.maxPixels());
         const n_cols = tgt.w / patch;
         const n_rows = tgt.h / patch;
         const np = n_cols * n_rows;
 
-        // Preprocess to planar CHW [0,1], then im2col into [np][kdim].
         const chw = try preprocess(gpa, rgb, width, height, tgt.w, tgt.h);
         defer gpa.free(chw);
         const patches = try gpa.alloc(f32, np * kdim);
-        defer gpa.free(patches);
+        errdefer gpa.free(patches);
         for (0..n_rows) |gy| {
             for (0..n_cols) |gx| {
                 const row = patches[(gy * n_cols + gx) * kdim ..][0..kdim];
@@ -187,34 +200,58 @@ pub const Vit = struct {
                 }
             }
         }
+        return .{ .data = patches, .n_cols = n_cols, .n_rows = n_rows };
+    }
+
+    /// The per-patch learned positional embedding as a dense [np][dim] buffer
+    /// (row p = table_x[col] + table_y[row]), for a single opAdd on device or
+    /// host. gpa-owned.
+    pub fn posEmbedRows(self: *const Vit, gpa: std.mem.Allocator, n_cols: usize, n_rows: usize) ![]f32 {
+        const cfg = self.cfg;
+        const dim = cfg.dim;
+        const np = n_cols * n_rows;
+        const tbl_x = self.pos_embd[0 .. cfg.pos_size * dim];
+        const tbl_y = self.pos_embd[cfg.pos_size * dim .. 2 * cfg.pos_size * dim];
+        const out = try gpa.alloc(f32, np * dim);
+        errdefer gpa.free(out);
+        for (0..np) |p| {
+            const ex = tbl_x[(p % n_cols) * dim ..][0..dim];
+            const ey = tbl_y[(p / n_cols) * dim ..][0..dim];
+            const dst = out[p * dim ..][0..dim];
+            for (dst, ex, ey) |*d, vx, vy| d.* = vx + vy;
+        }
+        return out;
+    }
+
+    /// Encode interleaved RGB pixels to LLM image-token embeddings (CPU).
+    pub fn encode(self: *const Vit, io: std.Io, gpa: std.mem.Allocator, rgb: []const u8, width: usize, height: usize) !Encoded {
+        const cfg = self.cfg;
+        const dim = cfg.dim;
+
+        var pm = try self.patchMatrix(gpa, rgb, width, height);
+        defer pm.deinit(gpa);
+        const np = pm.np();
+        const patches = pm.data;
 
         // patch_norm_1 (over kdim) -> patch-embed matmul -> patch_norm_2.
         ops.norm.layerNorm(patches, patches, self.patch_norm_1_w, self.patch_norm_1_b, cfg.eps_ln);
-        var x = try gpa.alloc(f32, np * dim);
+        const x = try gpa.alloc(f32, np * dim);
         defer gpa.free(x);
         try ops.matmul.matmul(io, gpa, x, patches, np, self.patch_w, self.patch_b);
         ops.norm.layerNorm(x, x, self.patch_norm_2_w, self.patch_norm_2_b, cfg.eps_ln);
 
-        // Add learned positional embeddings: table x by column, table y by row.
-        const tbl_x = self.pos_embd[0 .. cfg.pos_size * dim];
-        const tbl_y = self.pos_embd[cfg.pos_size * dim .. 2 * cfg.pos_size * dim];
-        for (0..np) |p| {
-            const gx = p % n_cols;
-            const gy = p / n_cols;
-            const dst = x[p * dim ..][0..dim];
-            const ex = tbl_x[gx * dim ..][0..dim];
-            const ey = tbl_y[gy * dim ..][0..dim];
-            for (dst, ex, ey) |*d, vx, vy| d.* += vx + vy;
-        }
-
-        // patch_norm_3 -> weightless RMSNorm -> projection.
+        // Add learned positional embeddings, then patch_norm_3.
+        const pos = try self.posEmbedRows(gpa, pm.n_cols, pm.n_rows);
+        defer gpa.free(pos);
+        for (x, pos) |*d, p| d.* += p;
         ops.norm.layerNorm(x, x, self.patch_norm_3_w, self.patch_norm_3_b, cfg.eps_ln);
-        ops.norm.rmsNormUnit(x, x, dim, cfg.eps_rms);
 
+        // weightless RMSNorm -> projection.
+        ops.norm.rmsNormUnit(x, x, dim, cfg.eps_rms);
         const embeds = try gpa.alloc(f32, np * cfg.proj_dim);
         errdefer gpa.free(embeds);
         try ops.matmul.matmul(io, gpa, embeds, x, np, self.mm_proj, null);
-        return .{ .embeds = embeds, .grid_w = n_cols, .grid_h = n_rows };
+        return .{ .embeds = embeds, .grid_w = pm.n_cols, .grid_h = pm.n_rows };
     }
 };
 

@@ -25,6 +25,7 @@ const gemma_vit_cuda = tp.models.gemma_vit_cuda;
 const gemma4 = tp.models.gemma4;
 const gemma4_cuda = tp.models.gemma4_cuda;
 const gemma4_vit = tp.models.gemma4_vit;
+const gemma4_vit_cuda = tp.models.gemma4_vit_cuda;
 
 /// The resident LLM + its vision tower, one variant per supported GGUF
 /// architecture. `model` retains a `*const lm`, so the bundle must live at a
@@ -50,7 +51,7 @@ const PendingDiffPaths = struct { dit: []u8, vae: []u8, te: []u8, taew: ?[]u8 };
 
 /// Round to a multiple of 16 (pipeline requirement) within sane bounds.
 fn clampDim(n: usize) usize {
-    const c = std.math.clamp(n, 256, 2048);
+    const c = std.math.clamp(n, 256, 4096);
     return c / 16 * 16;
 }
 
@@ -1075,10 +1076,9 @@ pub const Session = struct {
         }
     }
 
-    /// imageTurn for gemma4: the "unified" embedder runs on CPU (no ViT), so
-    /// each image encodes host-side (gemma4_vit.Vit.encode); the projected
-    /// embeddings then inject into the device LLM at their placeholder rows.
-    /// Otherwise identical to imageTurn.
+    /// imageTurn for gemma4: the "unified" embedder (no ViT transformer) runs
+    /// device-side via gemma4_vit_cuda; the projected embeddings then inject
+    /// into the LLM at their placeholder rows. Otherwise identical to imageTurn.
     fn imageTurnGemma4(self: *Session, a: anytype) !void {
         var encs: std.ArrayList(gemma4_vit.Vit.Encoded) = .empty;
         defer {
@@ -1088,7 +1088,7 @@ pub const Session = struct {
         var segs: std.ArrayList(chat.Segment) = .empty;
         defer segs.deinit(self.gpa);
         for (self.turn_images.items) |im| {
-            const enc = try a.vit.?.encode(self.io, self.gpa, im.rgb, im.width, im.height);
+            const enc = try gemma4_vit_cuda.encode(&a.vit.?, self.be, self.io, self.gpa, im.rgb, im.width, im.height);
             try encs.append(self.gpa, enc);
             try segs.append(self.gpa, .{ .image = .{ .grid_w = enc.grid_w, .grid_h = enc.grid_h } });
         }

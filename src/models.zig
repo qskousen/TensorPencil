@@ -11,6 +11,7 @@ pub const gemma3 = @import("models/gemma3.zig");
 pub const gemma4 = @import("models/gemma4.zig");
 pub const gemma4_cuda = @import("models/gemma4_cuda.zig");
 pub const gemma4_vit = @import("models/gemma4_vit.zig");
+pub const gemma4_vit_cuda = @import("models/gemma4_vit_cuda.zig");
 pub const gemma3_cuda = @import("models/gemma3_cuda.zig");
 pub const gemma3_gpu = @import("models/gemma3_gpu.zig");
 pub const gemma_vit = @import("models/gemma_vit.zig");
@@ -38,6 +39,7 @@ test {
     _ = gemma4;
     _ = gemma4_cuda;
     _ = gemma4_vit;
+    _ = gemma4_vit_cuda;
     _ = gemma3_cuda;
     _ = gemma3_gpu;
     _ = gemma_vit;
