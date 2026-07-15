@@ -23,3 +23,15 @@ int tp_load_image_rgb(
     int *width,
     int *height
 );
+
+/* As tp_load_image_rgb, but decodes an in-memory encoded image (e.g. PNG/JPEG
+   bytes pasted from the clipboard). `in`/`in_len` are only read during the
+   call; the caller may free them afterwards. */
+int tp_load_image_rgb_buffer(
+    const void *in,
+    size_t in_len,
+    void **buf,
+    size_t *len,
+    int *width,
+    int *height
+);

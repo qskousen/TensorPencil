@@ -53,3 +53,25 @@ pub fn loadRgb(gpa: std.mem.Allocator, path: []const u8) !Decoded {
         .height = @intCast(h),
     };
 }
+
+/// Decode an in-memory encoded image (any libvips-supported format — PNG,
+/// JPEG, ...) to packed RGB8, as `loadRgb` does for a file. Used for images
+/// pasted from the clipboard, where the format is sniffed from the bytes.
+pub fn loadRgbFromMemory(gpa: std.mem.Allocator, bytes: []const u8) !Decoded {
+    try ensureInit();
+    if (bytes.len == 0) return error.ImageDecodeFailed;
+
+    var buf: ?*anyopaque = null;
+    var len: usize = 0;
+    var w: c_int = 0;
+    var h: c_int = 0;
+    if (c.tp_load_image_rgb_buffer(bytes.ptr, bytes.len, &buf, &len, &w, &h) != 0)
+        return error.ImageDecodeFailed;
+    defer c.tp_vips_free(buf);
+
+    return .{
+        .pixels = try gpa.dupe(u8, @as([*]const u8, @ptrCast(buf.?))[0..len]),
+        .width = @intCast(w),
+        .height = @intCast(h),
+    };
+}

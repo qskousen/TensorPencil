@@ -287,6 +287,50 @@ fn handleDropFile(path: []const u8) void {
     s.attachImage(dec.pixels, dec.width, dec.height) catch |err| std.log.err("attach image: {t}", .{err});
 }
 
+/// Ctrl/Cmd+V with an image on the clipboard: decode the raw bytes (any
+/// libvips format) and attach it, exactly as a dropped file. Returns true
+/// when an image was found on the clipboard (whether or not decoding
+/// succeeded), so the caller can consume the event before the text entry
+/// treats it as a text paste. Returns false when the clipboard holds no
+/// image, letting normal text paste proceed.
+fn tryPasteClipboardImage() bool {
+    const SDL = SDLBackend.c;
+    const s = g_session orelse return false;
+    if (!s.visionEnabled()) return false;
+
+    var count: usize = 0;
+    const mimes = SDL.SDL_GetClipboardMimeTypes(&count);
+    if (mimes == null) return false;
+    defer SDL.SDL_free(@ptrCast(mimes));
+
+    var mime: [*c]const u8 = null;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const m = mimes[i];
+        if (m == null) continue;
+        if (std.mem.startsWith(u8, std.mem.span(m), "image/")) {
+            mime = m;
+            break;
+        }
+    }
+    if (mime == null) return false;
+
+    var size: usize = 0;
+    const data = SDL.SDL_GetClipboardData(mime, &size);
+    if (data == null or size == 0) return true;
+    defer SDL.SDL_free(data);
+
+    const bytes = @as([*]const u8, @ptrCast(data.?))[0..size];
+    const gpa = std.heap.smp_allocator;
+    const dec = vips.loadRgbFromMemory(gpa, bytes) catch |err| {
+        std.log.err("can't decode pasted image ({s}): {t}", .{ std.mem.span(mime), err });
+        return true;
+    };
+    defer gpa.free(dec.pixels);
+    s.attachImage(dec.pixels, dec.width, dec.height) catch |err| std.log.err("attach pasted image: {t}", .{err});
+    return true;
+}
+
 fn frame() void {
     var root = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both, .background = true });
     defer root.deinit();
@@ -900,6 +944,17 @@ fn renderInput(s: *chat.Session) void {
     // the multiline entry turns it into a newline; Shift+Enter falls through as
     // a newline. Disabled while generating so the box stays editable.
     if (!busy) {
+        // Paste (Ctrl/Cmd+V) an image from the clipboard: intercept before the
+        // text entry so an image on the clipboard attaches instead of a bogus
+        // text paste. Text-only clipboards fall through untouched. Handled
+        // regardless of focus so it works right after clicking into chat.
+        for (dvui.events()) |*e| {
+            if (e.handled or e.evt != .key) continue;
+            const k = e.evt.key;
+            if (k.code == .v and k.action == .down and (k.mod.control() or k.mod.command())) {
+                if (tryPasteClipboardImage()) e.handled = true;
+            }
+        }
         if (g_input_id) |id| {
             if (dvui.focusedWidgetId()) |fid| {
                 if (fid == id) {

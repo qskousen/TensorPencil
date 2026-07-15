@@ -254,9 +254,21 @@ test "gemma turn building matches whole-template tokenization" {
     defer g.deinit();
     var tok = try Tokenizer.initFromGguf(gpa, &g);
     defer tok.deinit();
+    // applyTokenizer + setFamily mutate process-global template state; capture
+    // and restore ALL of it (not just family) so later tests still see the
+    // chatml/Qwen defaults — otherwise gemma's stop/glue ids leak out.
+    const saved_turn_end = turn_end;
+    const saved_pad = pad;
+    const saved_newline = newline;
+    const saved_family = family;
     applyTokenizer(&tok);
     setFamily(.gemma);
-    defer setFamily(.chatml); // restore process-global for other tests
+    defer {
+        turn_end = saved_turn_end;
+        pad = saved_pad;
+        newline = saved_newline;
+        setFamily(saved_family);
+    }
 
     var ids: std.ArrayList(u32) = .empty;
     defer ids.deinit(gpa);
