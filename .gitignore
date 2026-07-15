@@ -4,3 +4,6 @@
 /zig-pkg/
 /scratch_out/
 /models/
+
+# Host-specific sframe-stripped CRT (see tools/patch-crt.sh)
+.zig-crt/

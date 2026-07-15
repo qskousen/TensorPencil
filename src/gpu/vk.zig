@@ -164,6 +164,11 @@ pub const StructureType = enum(i32) {
     physical_device_memory_properties_2 = 1000059006,
     memory_allocate_flags_info = 1000060000,
     physical_device_memory_budget_properties_ext = 1000237000,
+    physical_device_properties_2 = 1000059001,
+    physical_device_subgroup_properties = 1000094000,
+    physical_device_subgroup_size_control_properties = 1000225000,
+    pipeline_shader_stage_required_subgroup_size_create_info = 1000225001,
+    physical_device_subgroup_size_control_features = 1000225002,
     _,
 };
 
@@ -530,6 +535,46 @@ pub const PhysicalDeviceMemoryBudgetPropertiesEXT = extern struct {
 pub const ExtensionProperties = extern struct {
     extension_name: [MAX_EXTENSION_NAME_SIZE]u8,
     spec_version: u32,
+};
+
+// Subgroup-size control (VK_EXT_subgroup_size_control, core Vulkan 1.3): lets
+// a compute pipeline pin its subgroup size, so coopmat kernels that assume a
+// 32-lane subgroup run correctly on wave64 devices (AMD RADV).
+pub const PhysicalDeviceProperties2 = extern struct {
+    s_type: StructureType = .physical_device_properties_2,
+    p_next: ?*anyopaque = null,
+    properties: PhysicalDeviceProperties = undefined,
+};
+
+pub const PhysicalDeviceSubgroupProperties = extern struct {
+    s_type: StructureType = .physical_device_subgroup_properties,
+    p_next: ?*anyopaque = null,
+    subgroup_size: u32 = 0,
+    supported_stages: ShaderStageFlags = 0,
+    supported_operations: Flags = 0,
+    quad_operations_in_all_stages: Bool32 = FALSE,
+};
+
+pub const PhysicalDeviceSubgroupSizeControlProperties = extern struct {
+    s_type: StructureType = .physical_device_subgroup_size_control_properties,
+    p_next: ?*anyopaque = null,
+    min_subgroup_size: u32 = 0,
+    max_subgroup_size: u32 = 0,
+    max_compute_workgroup_subgroups: u32 = 0,
+    required_subgroup_size_stages: ShaderStageFlags = 0,
+};
+
+pub const PhysicalDeviceSubgroupSizeControlFeatures = extern struct {
+    s_type: StructureType = .physical_device_subgroup_size_control_features,
+    p_next: ?*anyopaque = null,
+    subgroup_size_control: Bool32 = FALSE,
+    compute_full_subgroups: Bool32 = FALSE,
+};
+
+pub const PipelineShaderStageRequiredSubgroupSizeCreateInfo = extern struct {
+    s_type: StructureType = .pipeline_shader_stage_required_subgroup_size_create_info,
+    p_next: ?*const anyopaque = null,
+    required_subgroup_size: u32,
 };
 
 pub const DeviceQueueCreateInfo = extern struct {
@@ -937,6 +982,7 @@ pub const PfnCreateInstance = *const fn (*const InstanceCreateInfo, ?*const Allo
 pub const PfnDestroyInstance = *const fn (Instance, ?*const AllocationCallbacks) callconv(.c) void;
 pub const PfnEnumeratePhysicalDevices = *const fn (Instance, *u32, ?[*]PhysicalDevice) callconv(.c) Result;
 pub const PfnGetPhysicalDeviceProperties = *const fn (PhysicalDevice, *PhysicalDeviceProperties) callconv(.c) void;
+pub const PfnGetPhysicalDeviceProperties2 = *const fn (PhysicalDevice, *PhysicalDeviceProperties2) callconv(.c) void;
 pub const PfnGetPhysicalDeviceQueueFamilyProperties = *const fn (PhysicalDevice, *u32, ?[*]QueueFamilyProperties) callconv(.c) void;
 pub const PfnGetPhysicalDeviceMemoryProperties = *const fn (PhysicalDevice, *PhysicalDeviceMemoryProperties) callconv(.c) void;
 pub const PfnGetPhysicalDeviceMemoryProperties2 = *const fn (PhysicalDevice, *PhysicalDeviceMemoryProperties2) callconv(.c) void;

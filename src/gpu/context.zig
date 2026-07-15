@@ -209,6 +209,36 @@ fn check(r: vk.Result) Error!void {
     }
 }
 
+/// Create a compute pipeline for a cooperative-matrix kernel, pinning the
+/// subgroup size when the device needs it. The coopmat SPIR-V assumes
+/// warp == subgroup == 32 lanes (every coop kernel declares `LocalSize 32,
+/// NWARPS, 1`). On a device whose native subgroup size isn't 32 — AMD RADV
+/// runs wave64 — the cooperative-matrix operands span the wrong lanes and the
+/// GEMM silently produces all zeros. `coop_sg` is 32 there (and the pipeline
+/// gets a RequiredSubgroupSize create-info via VK_EXT_subgroup_size_control,
+/// core 1.3); it is null on wave32 devices (e.g. NVIDIA), leaving the created
+/// pipeline byte-identical to the un-pinned path.
+fn createCoopPipe(
+    d: *const Dispatch,
+    device: vk.Device,
+    module: vk.ShaderModule,
+    layout: vk.PipelineLayout,
+    coop_sg: ?u32,
+    out: *vk.Pipeline,
+) Error!void {
+    var sgs: vk.PipelineShaderStageRequiredSubgroupSizeCreateInfo =
+        .{ .required_subgroup_size = coop_sg orelse 0 };
+    const info: vk.ComputePipelineCreateInfo = .{
+        .stage = .{
+            .module = module,
+            .p_name = "main",
+            .p_next = if (coop_sg != null) &sgs else null,
+        },
+        .layout = layout,
+    };
+    try check(d.CreateComputePipelines(device, .null_handle, 1, @ptrCast(&info), null, @ptrCast(out)));
+}
+
 /// Function table. Field names match the command names minus the `vk` prefix;
 /// loading resolves "vk" ++ field name through vkGetInstanceProcAddr.
 const Dispatch = struct {
@@ -320,6 +350,13 @@ pub const Context = struct {
     pinned_bytes: u64 = 0,
     device_name: [64]u8,
     device_name_len: usize,
+    /// Native subgroup (wave) size the device reported (0 = not queried).
+    subgroup_size: u32 = 0,
+    /// Subgroup size pinned on the coop pipelines (0 = none needed/applied).
+    coop_pinned_subgroup: u32 = 0,
+    /// Coop was advertised but disabled because the kernels' subgroup width
+    /// couldn't be pinned on this device (fell back to register/f32).
+    coop_disabled_by_subgroup: bool = false,
     /// f16*f16->f32 subgroup cooperative-matrix shape (0 = unsupported).
     coop_m: u32 = 0,
     coop_n: u32 = 0,
@@ -569,6 +606,69 @@ pub const Context = struct {
             });
         }
 
+        // The coop kernels are authored for a fixed subgroup width
+        // (coopmat.subgroup_lanes = 32; see there). We query the device's
+        // *native* subgroup size at runtime and adapt — nothing is hardcoded
+        // per GPU; the only constant is the kernels' own width, and every
+        // decision is driven by the queried native size and the device's
+        // advertised [min,max] pinnable range:
+        //   - native size already matches  -> coop runs as-is (NVIDIA wave32);
+        //   - native differs but the width is pinnable -> pin it via
+        //     VK_EXT_subgroup_size_control (AMD RADV wave64 -> pin 32);
+        //   - native differs and the width is NOT pinnable -> disable coop
+        //     (coop_m/coop_i8_m = 0) so the model falls back to the correct
+        //     register-tiled / f32 path instead of feeding coopmat the wrong
+        //     lanes (which returns zeros).
+        const want_lanes = coopmat.subgroup_lanes;
+        var coop_sg: ?u32 = null;
+        var native_subgroup: u32 = 0;
+        var coop_disabled_by_subgroup = false;
+        if (coop_m != 0 or coop_i8_m != 0) {
+            const getp2: ?vk.PfnGetPhysicalDeviceProperties2 =
+                if (gipa(instance, "vkGetPhysicalDeviceProperties2")) |p|
+                    @ptrCast(p)
+                else if (gipa(instance, "vkGetPhysicalDeviceProperties2KHR")) |p|
+                    @ptrCast(p)
+                else
+                    null;
+            if (getp2) |getp| {
+                var sg: vk.PhysicalDeviceSubgroupProperties = .{};
+                var sgc: vk.PhysicalDeviceSubgroupSizeControlProperties = .{ .p_next = &sg };
+                var props2: vk.PhysicalDeviceProperties2 = .{ .p_next = &sgc };
+                getp(phys, &props2);
+                native_subgroup = sg.subgroup_size;
+                if (sg.subgroup_size != want_lanes) {
+                    const pinnable = sgc.min_subgroup_size <= want_lanes and
+                        sgc.max_subgroup_size >= want_lanes and
+                        (sgc.required_subgroup_size_stages & vk.ShaderStage.compute) != 0;
+                    if (pinnable) {
+                        coop_sg = want_lanes;
+                    } else {
+                        // Can't make coopmat correct on this device; fall back.
+                        coop_m = 0;
+                        coop_n = 0;
+                        coop_k = 0;
+                        coop_i8_m = 0;
+                        coop_i8_n = 0;
+                        coop_i8_k = 0;
+                        coop_disabled_by_subgroup = true;
+                    }
+                }
+            }
+            if (dump_coop_configs) {
+                std.log.info("coopmat: native subgroup {d}, kernels want {d}; {s}", .{
+                    native_subgroup,
+                    want_lanes,
+                    if (coop_disabled_by_subgroup)
+                        "not pinnable -> coop disabled, register/f32 fallback"
+                    else if (coop_sg != null)
+                        "pinned to kernel width"
+                    else
+                        "native matches, no pin needed",
+                });
+            }
+        }
+
         // VK_EXT_memory_budget: proactive VRAM budgeting for weight
         // streaming (accounts for other processes; heap-size fallback
         // otherwise).
@@ -595,6 +695,12 @@ pub const Context = struct {
             var coop_features: vk.PhysicalDeviceCooperativeMatrixFeaturesKHR = .{
                 .cooperative_matrix = vk.TRUE,
             };
+            // Enable subgroup-size control so the coop pipelines can pin size 32
+            // (chained after coop_features, which is always present when
+            // coop_sg is set). Left disabled on wave32 devices.
+            var sgc_features: vk.PhysicalDeviceSubgroupSizeControlFeatures =
+                .{ .subgroup_size_control = vk.TRUE };
+            if (coop_sg != null) coop_features.p_next = &sgc_features;
             var features12: vk.PhysicalDeviceVulkan12Features = .{
                 .shader_int8 = vk.TRUE,
                 .storage_buffer_8bit_access = vk.TRUE,
@@ -837,18 +943,10 @@ pub const Context = struct {
         errdefer if (shader_coop_f16w != .null_handle) d.DestroyShaderModule(device, shader_coop_f16w, null);
         if (shader_coop != .null_handle) {
             inline for (.{ .{ shader_coop, &pipe_coop }, .{ shader_coop_f16w, &pipe_coop_f16w } }) |v| {
-                const info: vk.ComputePipelineCreateInfo = .{
-                    .stage = .{ .module = v[0], .p_name = "main" },
-                    .layout = pipeline_layout,
-                };
-                try check(d.CreateComputePipelines(device, .null_handle, 1, @ptrCast(&info), null, @ptrCast(v[1])));
+                try createCoopPipe(&d, device, v[0], pipeline_layout, coop_sg, v[1]);
             }
             if (shader_coop_c16 != .null_handle) {
-                const info: vk.ComputePipelineCreateInfo = .{
-                    .stage = .{ .module = shader_coop_c16, .p_name = "main" },
-                    .layout = pipeline_layout,
-                };
-                try check(d.CreateComputePipelines(device, .null_handle, 1, @ptrCast(&info), null, @ptrCast(&pipe_coop_c16)));
+                try createCoopPipe(&d, device, shader_coop_c16, pipeline_layout, coop_sg, &pipe_coop_c16);
             }
         }
         errdefer if (pipe_coop != .null_handle) d.DestroyPipeline(device, pipe_coop, null);
@@ -866,11 +964,7 @@ pub const Context = struct {
                 .code_size = code.len,
                 .p_code = @ptrCast(@alignCast(code.ptr)),
             }, null, &shader_coop_i8));
-            const info: vk.ComputePipelineCreateInfo = .{
-                .stage = .{ .module = shader_coop_i8, .p_name = "main" },
-                .layout = pipeline_layout,
-            };
-            try check(d.CreateComputePipelines(device, .null_handle, 1, @ptrCast(&info), null, @ptrCast(&pipe_coop_i8)));
+            try createCoopPipe(&d, device, shader_coop_i8, pipeline_layout, coop_sg, &pipe_coop_i8);
         }
         errdefer if (shader_coop_i8 != .null_handle) d.DestroyShaderModule(device, shader_coop_i8, null);
         errdefer if (pipe_coop_i8 != .null_handle) d.DestroyPipeline(device, pipe_coop_i8, null);
@@ -896,11 +990,7 @@ pub const Context = struct {
                     .code_size = code.len,
                     .p_code = @ptrCast(@alignCast(code.ptr)),
                 }, null, cfg[2]));
-                const info: vk.ComputePipelineCreateInfo = .{
-                    .stage = .{ .module = cfg[2].*, .p_name = "main" },
-                    .layout = pipeline_layout,
-                };
-                try check(d.CreateComputePipelines(device, .null_handle, 1, @ptrCast(&info), null, @ptrCast(cfg[3])));
+                try createCoopPipe(&d, device, cfg[2].*, pipeline_layout, coop_sg, cfg[3]);
             }
         }
         errdefer if (shader_coop_i8_fs16 != .null_handle) d.DestroyShaderModule(device, shader_coop_i8_fs16, null);
@@ -957,11 +1047,7 @@ pub const Context = struct {
         errdefer if (shader_scores_vae != .null_handle) d.DestroyShaderModule(device, shader_scores_vae, null);
         if (shader_scores != .null_handle) {
             inline for (.{ .{ shader_scores, &pipe_scores }, .{ shader_scores_vae, &pipe_scores_vae } }) |v| {
-                const info: vk.ComputePipelineCreateInfo = .{
-                    .stage = .{ .module = v[0], .p_name = "main" },
-                    .layout = pipeline_layout_e,
-                };
-                try check(d.CreateComputePipelines(device, .null_handle, 1, @ptrCast(&info), null, @ptrCast(v[1])));
+                try createCoopPipe(&d, device, v[0], pipeline_layout_e, coop_sg, v[1]);
             }
         }
         errdefer if (pipe_scores != .null_handle) d.DestroyPipeline(device, pipe_scores, null);
@@ -979,11 +1065,7 @@ pub const Context = struct {
         }
         errdefer if (shader_attn_out != .null_handle) d.DestroyShaderModule(device, shader_attn_out, null);
         if (shader_attn_out != .null_handle) {
-            const info: vk.ComputePipelineCreateInfo = .{
-                .stage = .{ .module = shader_attn_out, .p_name = "main" },
-                .layout = pipeline_layout_e,
-            };
-            try check(d.CreateComputePipelines(device, .null_handle, 1, @ptrCast(&info), null, @ptrCast(&pipe_attn_out)));
+            try createCoopPipe(&d, device, shader_attn_out, pipeline_layout_e, coop_sg, &pipe_attn_out);
         }
         errdefer if (pipe_attn_out != .null_handle) d.DestroyPipeline(device, pipe_attn_out, null);
 
@@ -1004,11 +1086,7 @@ pub const Context = struct {
                     .code_size = code.len,
                     .p_code = @ptrCast(@alignCast(code.ptr)),
                 }, null, v[1]));
-                const info: vk.ComputePipelineCreateInfo = .{
-                    .stage = .{ .module = v[1].*, .p_name = "main" },
-                    .layout = pipeline_layout_e,
-                };
-                try check(d.CreateComputePipelines(device, .null_handle, 1, @ptrCast(&info), null, @ptrCast(v[2])));
+                try createCoopPipe(&d, device, v[1].*, pipeline_layout_e, coop_sg, v[2]);
             }
         }
         errdefer if (shader_flash_md != .null_handle) d.DestroyShaderModule(device, shader_flash_md, null);
@@ -1141,6 +1219,9 @@ pub const Context = struct {
         const name_z = std.mem.sliceTo(&props.device_name, 0);
         self.device_name_len = @min(name_z.len, self.device_name.len);
         @memcpy(self.device_name[0..self.device_name_len], name_z[0..self.device_name_len]);
+        self.subgroup_size = native_subgroup;
+        self.coop_pinned_subgroup = coop_sg orelse 0;
+        self.coop_disabled_by_subgroup = coop_disabled_by_subgroup;
         return self;
     }
 
@@ -1222,6 +1303,26 @@ pub const Context = struct {
 
     pub fn deviceName(self: *const Context) []const u8 {
         return self.device_name[0..self.device_name_len];
+    }
+
+    /// Write a one-line summary of the cooperative-matrix (tensor-core) setup:
+    /// whether coop GEMMs are active, and how the device's subgroup width was
+    /// reconciled with the kernels'. Purely informational.
+    pub fn writeCoopStatus(self: *const Context, w: *std.Io.Writer) !void {
+        const coop_on = self.pipe_coop != .null_handle;
+        if (coop_on and self.coop_pinned_subgroup != 0) {
+            try w.print("coopmat: on (subgroup pinned to {d}, device native {d})\n", .{
+                self.coop_pinned_subgroup, self.subgroup_size,
+            });
+        } else if (coop_on) {
+            try w.print("coopmat: on (native subgroup {d})\n", .{self.subgroup_size});
+        } else if (self.coop_disabled_by_subgroup) {
+            try w.print("coopmat: off (device subgroup {d} not pinnable to {d}); register/f32 fallback\n", .{
+                self.subgroup_size, coopmat.subgroup_lanes,
+            });
+        } else {
+            try w.print("coopmat: off (not supported by device); register/f32 path\n", .{});
+        }
     }
 
     fn findMemoryType(self: *const Context, type_bits: u32, flags: u32) Error!u32 {
@@ -3140,8 +3241,13 @@ test "gpu matmul matches cpu reference" {
         // which is bounded by the row's absolute-product sum — this test's
         // random e4m3 bytes drive that into the thousands (measured
         // max_abs ~4 on sums bounded ~6700, i.e. a few f16 ulps), so the
-        // gate scales with that bound (4 ulps = 2^-9). The model-level
-        // gate stays the DiT parity fixture (0.169 with f16 accs).
+        // gate scales with that bound. The exact rounding depends on the
+        // hardware's MMA accumulation order: NVIDIA lands within ~4 ulps
+        // (2^-9), AMD RADV (wave32-pinned coopmat) a touch wider (~want_abs/
+        // 483), so the gate is want_abs/256 (~8 ulps) to cover both. This is
+        // still tight enough to catch the wrong-subgroup-size all-zero failure
+        // (100% off) and any gross regression. The model-level gate stays the
+        // DiT parity fixture (0.169 with f16 accs).
         for (0..cm) |t| {
             for (0..crows) |r| {
                 var want: f64 = 0;
@@ -3155,7 +3261,7 @@ test "gpu matmul matches cpu reference" {
                 }
                 const wantf: f32 = @floatCast(want);
                 const tol: f32 = if (coopmat.coop_acc_h16)
-                    @max(5e-3, @as(f32, @floatCast(want_abs)) / 512.0)
+                    @max(5e-3, @as(f32, @floatCast(want_abs)) / 256.0)
                 else
                     5e-3;
                 try std.testing.expectApproxEqAbs(wantf, y[t * crows + r], tol);

@@ -5,6 +5,32 @@ Update this file whenever a new 0.16.0 change is found or an existing workaround
 
 ---
 
+## Self-hosted linker chokes on glibc CRT `.sframe` (recent toolchains)
+
+On hosts with a recent glibc/binutils (e.g. Arch/CachyOS, gcc 16+), the C
+runtime startup objects `Scrt1.o`/`crt1.o` carry an SFrame unwind section
+(`.sframe` + `.rela.sframe`) that uses `R_X86_64_PC64` relocations. Zig 0.16's
+self-hosted ELF linker (the default for native Debug builds) cannot process
+that relocation type, so **every libc-linked build fails**:
+
+```
+fatal linker error: unhandled relocation type R_X86_64_PC64 at offset 0x1c
+    note: in .../crt1.o:.sframe
+```
+
+The exit-1 build even writes a corrupt binary ("exec format error"). Forcing
+`-flld` is not a fallback here — the bundled LLD segfaults on this system.
+
+`.sframe` is only stack-unwind metadata for the tiny `_start` stub, so stripping
+it is harmless. `tools/patch-crt.sh` builds `.zig-crt/` — a mirror of the system
+crt dir with those objects sframe-stripped (via `objcopy --remove-section`) — plus
+`.zig-crt/libc.txt`. `build.zig` auto-detects that file and sets `b.libc_file`
+(the global libc-file fallback for all compiles), so a plain `zig build` links
+cleanly. The dir is host-specific, `.gitignore`d, and a no-op on hosts with an
+older toolchain (e.g. the CUDA desktop). Re-run the script after a glibc upgrade.
+
+---
+
 ## ArrayList is now always unmanaged
 
 `std.ArrayList` no longer stores an allocator internally. The allocator is passed at every call site.

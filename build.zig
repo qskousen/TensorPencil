@@ -13,6 +13,20 @@ pub fn build(b: *std.Build) void {
     // means any target is allowed, and the default is native. Other options
     // for restricting supported target set are available.
     const target = b.standardTargetOptions(.{});
+
+    // Host toolchain workaround: recent glibc/binutils (e.g. Arch/CachyOS,
+    // gcc 16+) ship crt startup objects whose .sframe section uses
+    // R_X86_64_PC64 relocations the Zig 0.16 self-hosted ELF linker cannot
+    // process, breaking every libc-linked build. `tools/patch-crt.sh`
+    // generates a sframe-stripped crt dir + .zig-crt/libc.txt; if present,
+    // route all native compiles through it (via the global libc-file fallback
+    // in std.Build.Step.Compile). Absent on hosts with an older toolchain, so
+    // this is a no-op there. An explicit `--libc` on the CLI takes precedence.
+    if (b.libc_file == null) {
+        if (b.build_root.handle.access(b.graph.io, ".zig-crt/libc.txt", .{})) |_| {
+            b.libc_file = b.pathFromRoot(".zig-crt/libc.txt");
+        } else |_| {}
+    }
     // Standard optimization options allow the person running `zig build` to select
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.

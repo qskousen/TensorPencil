@@ -1286,6 +1286,17 @@ pub const coop_warps8 = true;
 pub const coop_acc_h16 = true;
 pub const coop_wgn: u32 = if (coop_warps8) 256 else 128;
 
+/// Lanes per subgroup that every coop kernel in this file is authored for:
+/// each shader declares `LocalSize (subgroup_lanes, NWARPS, 1)` so one warp
+/// (the X dimension) maps to exactly one subgroup, and the cooperative-matrix
+/// fragments are distributed across those lanes. The value is a property of
+/// how these kernels are written (a "warp" is 32 wide, the NVIDIA/PTX model),
+/// NOT of any particular GPU. A device whose native subgroup size differs
+/// (AMD RADV runs wave64) must have its coop pipelines pinned to this size via
+/// VK_EXT_subgroup_size_control, or the fragments span the wrong lanes and the
+/// GEMM returns zeros. Single source of truth for the pin in context.zig.
+pub const subgroup_lanes: u32 = 32;
+
 /// `b_f16 = false`: B is raw k-major e4m3 (the DiT weights), SWAR-decoded
 /// to f16 in the staging loop. `b_f16 = true`: B is pre-converted k-major
 /// f16 (the VAE conv weights, zero-padded to rows%128 / cols%64 on the

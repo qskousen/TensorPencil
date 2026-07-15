@@ -175,6 +175,7 @@ pub const Session = struct {
                 ctx.budget_override = opts.vram_budget;
                 ops.matmul.gpu = ctx;
                 try note(progress, "gpu: {s}\n", .{ctx.deviceName()});
+                if (progress) |w| try ctx.writeCoopStatus(w);
             } else |err| {
                 try note(progress, "gpu unavailable ({t}); using cpu\n", .{err});
             }
@@ -508,6 +509,10 @@ pub const Session = struct {
 /// One-shot text-to-image: load the models, generate a single image, free.
 /// Used by the CLI and tests; the GUI uses a persistent `Session` across a queue.
 pub fn generate(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*std.Io.Writer) !Image {
+    // Reject invalid dimensions/steps before loading any models (Session.init
+    // maps ~18 GiB of checkpoints); Session.generate re-checks per image.
+    if (opts.width % 16 != 0 or opts.height % 16 != 0) return error.SizeNotMultipleOf16;
+    if (opts.steps < 1) return error.NoSteps;
     var s = try Session.init(io, gpa, opts, progress);
     defer s.deinit();
     return s.generate(opts, progress);
