@@ -119,11 +119,13 @@ pub fn appendUserSegments(tok: *const Tokenizer, gpa: std.mem.Allocator, segment
             try tok.encode(gpa, "<end_of_turn>\n", out);
         },
         .gemma4 => {
-            // Text-only for now (Gemma 4 vision is a separate follow-up).
             try tok.encode(gpa, "<|turn>user\n", out);
             for (segments) |seg| switch (seg) {
                 .text => |t| try tok.encode(gpa, t, out),
-                .image => return error.ImageUnsupported,
+                .image => |im| {
+                    const row = try appendGemma4Image(tok, gpa, im.grid_w * im.grid_h, out);
+                    try image_rows.append(gpa, row);
+                },
             };
             try tok.encode(gpa, "<turn|>\n", out);
         },
@@ -155,6 +157,19 @@ pub fn appendGemmaImage(tok: *const Tokenizer, gpa: std.mem.Allocator, n_tokens:
     const first = out.items.len;
     try out.appendNTimes(gpa, soft, n_tokens);
     try tok.encode(gpa, "<end_of_image>", out);
+    return first;
+}
+
+/// Gemma 4 image block: `<|image>` + `n_tokens` placeholder rows (pad) +
+/// `<image|>`. Returns the first placeholder row so the caller can splice the
+/// embedder output in with prefillImage. Unlike Gemma 3 there is no dedicated
+/// soft token — the placeholder id is immaterial (those rows are overwritten by
+/// the projected image embeddings), so `pad` keeps `ids` aligned with cache rows.
+pub fn appendGemma4Image(tok: *const Tokenizer, gpa: std.mem.Allocator, n_tokens: usize, out: *std.ArrayList(u32)) !usize {
+    try tok.encode(gpa, "<|image>", out);
+    const first = out.items.len;
+    try out.appendNTimes(gpa, tok.pad, n_tokens);
+    try tok.encode(gpa, "<image|>", out);
     return first;
 }
 

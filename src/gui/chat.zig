@@ -22,6 +22,9 @@ const gemma3 = tp.models.gemma3;
 const gemma3_cuda = tp.models.gemma3_cuda;
 const gemma_vit = tp.models.gemma_vit;
 const gemma_vit_cuda = tp.models.gemma_vit_cuda;
+const gemma4 = tp.models.gemma4;
+const gemma4_cuda = tp.models.gemma4_cuda;
+const gemma4_vit = tp.models.gemma4_vit;
 
 /// The resident LLM + its vision tower, one variant per supported GGUF
 /// architecture. `model` retains a `*const lm`, so the bundle must live at a
@@ -30,6 +33,7 @@ const gemma_vit_cuda = tp.models.gemma_vit_cuda;
 const Arch = union(enum) {
     qwen35: struct { lm: qwen35.Model, model: qwen35_cuda.CudaLM, vit: ?vit35.Vit = null },
     gemma3: struct { lm: gemma3.Model, model: gemma3_cuda.CudaLM, vit: ?gemma_vit.Vit = null },
+    gemma4: struct { lm: gemma4.Model, model: gemma4_cuda.CudaLM, vit: ?gemma4_vit.Vit = null },
 };
 const cuda = tp.gpu.cuda;
 const engine = tp.llm.engine;
@@ -404,6 +408,16 @@ pub const Session = struct {
             if (self.mmproj_gguf) |*mg| a.vit = try gemma_vit.Vit.load(arena, mg);
             errdefer if (a.vit) |*v| v.deinit();
             a.model = try gemma3_cuda.CudaLM.init(gpa, self.be, &a.lm, cap);
+        } else if (std.mem.eql(u8, arch_str, "gemma4")) {
+            chat.setFamily(.gemma4);
+            self.arch = .{ .gemma4 = .{ .lm = try gemma4.Model.load(arena, &self.gguf), .model = undefined } };
+            const a = &self.arch.gemma4;
+            errdefer a.lm.deinit();
+            // gemma4's "unified" embedder has no ViT — it runs on CPU (cheap);
+            // encodes are scoped per image turn (imageTurn).
+            if (self.mmproj_gguf) |*mg| a.vit = try gemma4_vit.Vit.load(arena, mg);
+            errdefer if (a.vit) |*v| v.deinit();
+            a.model = try gemma4_cuda.CudaLM.init(gpa, self.be, &a.lm, cap);
         } else return error.UnsupportedArchitecture;
 
         self.opts = .{
@@ -481,7 +495,7 @@ pub const Session = struct {
         }
 
         // Gemma prompts begin with a single BOS ({{ bos_token }}); ChatML has none.
-        if (self.arch == .gemma3) {
+        if (self.arch == .gemma3 or self.arch == .gemma4) {
             if (self.tok.specialId("<bos>")) |bos| try self.ids.append(gpa, bos);
         }
 
@@ -856,6 +870,12 @@ pub const Session = struct {
         return switch (self.arch) {
             .qwen35 => |*a| @as(u64, a.model.cached()) * a.model.cfg.kvDim() * 8 * a.model.cfg.nAttnLayers(),
             .gemma3 => |*a| @as(u64, a.model.cached()) * a.model.cfg.kvDim() * 8 * a.model.cfg.n_layers,
+            // gemma4 KV dim varies per layer (SWA 2048 vs global 512), so sum it.
+            .gemma4 => |*a| blk: {
+                var kv: u64 = 0;
+                for (0..a.model.cfg.n_layers) |l| kv += a.model.cfg.kvDim(l);
+                break :blk @as(u64, a.model.cached()) * kv * 8;
+            },
         };
     }
 
@@ -1009,6 +1029,7 @@ pub const Session = struct {
             switch (self.arch) {
                 .qwen35 => |*a| try self.imageTurn(a, false),
                 .gemma3 => |*a| try self.imageTurn(a, true),
+                .gemma4 => |*a| try self.imageTurnGemma4(a),
             }
         } else {
             try chat.appendUser(&self.tok, self.gpa, self.turn_text, &self.ids);
@@ -1034,6 +1055,40 @@ pub const Session = struct {
                 try gemma_vit_cuda.encode(&a.vit.?, self.be, self.io, self.gpa, im.rgb, im.width, im.height)
             else
                 try vit35_cuda.encode(&a.vit.?, self.be, self.gpa, im.rgb, im.width, im.height);
+            try encs.append(self.gpa, enc);
+            try segs.append(self.gpa, .{ .image = .{ .grid_w = enc.grid_w, .grid_h = enc.grid_h } });
+        }
+        if (self.turn_text.len > 0) try segs.append(self.gpa, .{ .text = self.turn_text });
+
+        var image_rows: std.ArrayList(usize) = .empty;
+        defer image_rows.deinit(self.gpa);
+        try chat.appendUserSegments(&self.tok, self.gpa, segs.items, &self.ids, &image_rows);
+        try chat.openAssistant(&self.tok, self.gpa, &self.ids);
+
+        if (self.ids.items.len > a.model.cached() + a.model.remaining()) {
+            try a.model.ensureCapacity(self.ids.items.len);
+        }
+        for (image_rows.items, encs.items) |row, e| {
+            const before = self.ids.items[a.model.cached()..row];
+            if (before.len > 0) try a.model.prefill(before);
+            try a.model.prefillImage(e.embeds, e.grid_w, e.grid_h);
+        }
+    }
+
+    /// imageTurn for gemma4: the "unified" embedder runs on CPU (no ViT), so
+    /// each image encodes host-side (gemma4_vit.Vit.encode); the projected
+    /// embeddings then inject into the device LLM at their placeholder rows.
+    /// Otherwise identical to imageTurn.
+    fn imageTurnGemma4(self: *Session, a: anytype) !void {
+        var encs: std.ArrayList(gemma4_vit.Vit.Encoded) = .empty;
+        defer {
+            for (encs.items) |*e| e.deinit(self.gpa);
+            encs.deinit(self.gpa);
+        }
+        var segs: std.ArrayList(chat.Segment) = .empty;
+        defer segs.deinit(self.gpa);
+        for (self.turn_images.items) |im| {
+            const enc = try a.vit.?.encode(self.io, self.gpa, im.rgb, im.width, im.height);
             try encs.append(self.gpa, enc);
             try segs.append(self.gpa, .{ .image = .{ .grid_w = enc.grid_w, .grid_h = enc.grid_h } });
         }

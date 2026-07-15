@@ -71,6 +71,14 @@ pub const CudaLM = struct {
     k_cache: []Growable,
     v_cache: []Growable,
     io: std.Io = undefined,
+    /// Always null — this MVP is fully device-resident (no CPU/GPU split). The
+    /// field + the offload stubs below exist only so tp-gui's arch-generic
+    /// offload machinery (autoOffload / promoteLayers / split.n_cpu, etc.)
+    /// compiles and treats gemma4 as a permanently-resident model.
+    split: ?Split = null,
+
+    pub const CpuSplitPolicy = enum { tail, attn };
+    pub const Split = struct { n_cpu: usize = 0, budget: u64 = 0 };
 
     pub fn init(gpa: std.mem.Allocator, be: *Backend, lm: *const gemma4.Model, cap: kvmod.Capacity) !CudaLM {
         const cfg = lm.cfg;
@@ -160,6 +168,42 @@ pub const CudaLM = struct {
     }
     pub fn vocab(self: *const CudaLM) usize {
         return self.cfg.vocab;
+    }
+
+    // --- Offload interface (device-resident MVP: no-ops) ---------------------
+    // gemma4 always loads fully; these satisfy tp-gui's arch-generic residency
+    // calls without a CPU/GPU split. The 12B Q4_0 (~7 GB) fits the 3090; a model
+    // that didn't fit would need the real split machinery (gemma3_cuda), a
+    // follow-up.
+    pub fn autoOffload(self: *CudaLM, budget: u64) !bool {
+        _ = self;
+        _ = budget;
+        return false;
+    }
+    pub fn enableCpuSplit(self: *CudaLM, policy: CpuSplitPolicy, budget: u64, dynamic: bool) !void {
+        _ = self;
+        _ = policy;
+        _ = budget;
+        _ = dynamic;
+    }
+    pub fn offloadUntilFree(self: *CudaLM, needed_free: u64) !void {
+        _ = self;
+        _ = needed_free;
+    }
+    pub fn offloadToBudget(self: *CudaLM, target: u64) !void {
+        _ = self;
+        _ = target;
+    }
+    pub fn promoteLayers(self: *CudaLM, budget: u64) !usize {
+        _ = self;
+        _ = budget;
+        return 0;
+    }
+    /// New-chat: drop the context (KV rows are overwritten lazily on the next
+    /// prefill, like resetCache; nothing recurrent to zero).
+    pub fn resetResidency(self: *CudaLM, budget: u64) !void {
+        _ = budget;
+        self.len = 0;
     }
 
     pub fn ensureCapacity(self: *CudaLM, min_rows: usize) !void {
