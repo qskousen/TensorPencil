@@ -41,6 +41,7 @@ fn componentName(t: vk.ComponentTypeKHR) []const u8 {
         .uint16 => "u16",
         .uint32 => "u32",
         .uint64 => "u64",
+        .bfloat16 => "bf16",
         else => "?",
     };
 }
@@ -64,7 +65,7 @@ const Push = extern struct {
 };
 
 /// Eltwise/attention kernels and their workgroup shapes (kernels/eltwise.zig).
-pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, rope_qwen35, attn_decode_q35, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full };
+pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, rope_qwen35, attn_decode_q35, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad };
 const elt_entry_sizes = [_]EntrySize{
     .{ .name = "rmsnorm", .x = 64, .y = 1 },
     .{ .name = "rms_partial", .x = 256, .y = 1 },
@@ -133,6 +134,7 @@ const elt_entry_sizes = [_]EntrySize{
     .{ .name = "gelu", .x = 256, .y = 1 },
     .{ .name = "layernorm", .x = 64, .y = 1 },
     .{ .name = "attn_full", .x = 64, .y = 1 },
+    .{ .name = "f32_to_bf16_pad", .x = 256, .y = 1 },
 };
 
 /// Push block shared by all eltwise entries; meaning per entry (see kernels).
@@ -151,6 +153,7 @@ const TransposePush = extern struct {
     rows: u32,
     cols: u32,
     stride: u32,
+    k_pad: u32 = 0, // bf16_to_f16_coopw only
 };
 
 pub const Error = error{
@@ -399,6 +402,8 @@ pub const Context = struct {
     shader_tr: vk.ShaderModule,
     pipe_tr_f8: vk.Pipeline,
     pipe_tr_f32: vk.Pipeline,
+    pipe_tr_bf16w: vk.Pipeline, // bf16 weight -> f16 k-major coop layout (GPU convert, fallback)
+    pipe_tr_bf16raw: vk.Pipeline, // bf16 weight -> bf16 k-major coop layout (native, no convert)
     pipeline_layout_e: vk.PipelineLayout,
     shader_e: vk.ShaderModule,
     pipes_e: [elt_entry_sizes.len]vk.Pipeline,
@@ -411,6 +416,8 @@ pub const Context = struct {
     /// f16-weight coop GEMM (VAE convs; present iff pipe_coop is).
     shader_coop_f16w: vk.ShaderModule = .null_handle,
     pipe_coop_f16w: vk.Pipeline = .null_handle,
+    shader_coop_bf16w: vk.ShaderModule = .null_handle,
+    pipe_coop_bf16w: vk.Pipeline = .null_handle, // native bf16 A/B coop GEMM (null = use f16 fallback)
     /// int8 tensor-core GEMM s8*s8->s32 (present iff coop_i8_m != 0).
     shader_coop_i8: vk.ShaderModule = .null_handle,
     pipe_coop_i8: vk.Pipeline = .null_handle,
@@ -568,6 +575,9 @@ pub const Context = struct {
         var coop_i8_m: u32 = 0;
         var coop_i8_n: u32 = 0;
         var coop_i8_k: u32 = 0;
+        // Native bf16 A/B -> f32 config (SPV_KHR_bfloat16), same 16x16x16 tile as
+        // f16: lets the dense bf16 DiT compute in bf16 with no f16 round trip.
+        var coop_bf16 = false;
         if (gipa(instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR")) |pfn| {
             const get_props: vk.PfnGetPhysicalDeviceCooperativeMatrixPropertiesKHR = @ptrCast(pfn);
             var count: u32 = 0;
@@ -599,6 +609,11 @@ pub const Context = struct {
                                 coop_i8_m = cp.m_size;
                                 coop_i8_n = cp.n_size;
                                 coop_i8_k = cp.k_size;
+                            }
+                            if (cp.scope == .subgroup and cp.a_type == .bfloat16 and cp.b_type == .bfloat16 and
+                                cp.c_type == .float32 and cp.result_type == .float32 and cp.m_size == 16 and cp.n_size == 16 and cp.k_size == 16)
+                            {
+                                coop_bf16 = true;
                             }
                         }
                     }
@@ -706,6 +721,16 @@ pub const Context = struct {
             var sgc_features: vk.PhysicalDeviceSubgroupSizeControlFeatures =
                 .{ .subgroup_size_control = vk.TRUE };
             if (coop_sg != null) coop_features.p_next = &sgc_features;
+            // Native bf16 cooperative matrix: chain the bf16 feature after the
+            // subgroup-size one (or coop_features if no sg control) when the
+            // device advertised a bf16 coop config.
+            var bf16_features: vk.PhysicalDeviceShaderBfloat16FeaturesKHR = .{
+                .shader_bfloat16_type = vk.TRUE,
+                .shader_bfloat16_cooperative_matrix = vk.TRUE,
+            };
+            if (coop_bf16) {
+                if (coop_sg != null) sgc_features.p_next = &bf16_features else coop_features.p_next = &bf16_features;
+            }
             var features12: vk.PhysicalDeviceVulkan12Features = .{
                 .shader_int8 = vk.TRUE,
                 .storage_buffer_8bit_access = vk.TRUE,
@@ -723,7 +748,7 @@ pub const Context = struct {
                 .queue_count = 1,
                 .p_queue_priorities = @ptrCast(&priority),
             };
-            var exts: [2][*:0]const u8 = undefined;
+            var exts: [3][*:0]const u8 = undefined;
             var ext_n: u32 = 0;
             if (coop_m != 0) {
                 exts[ext_n] = "VK_KHR_cooperative_matrix";
@@ -731,6 +756,10 @@ pub const Context = struct {
             }
             if (has_memory_budget) {
                 exts[ext_n] = "VK_EXT_memory_budget";
+                ext_n += 1;
+            }
+            if (coop_bf16) {
+                exts[ext_n] = "VK_KHR_shader_bfloat16";
                 ext_n += 1;
             }
             try check(d.CreateDevice(phys, &.{
@@ -787,6 +816,8 @@ pub const Context = struct {
         try createKernelModule(gpa, &d, device, transpose_spv, &.{
             .{ .name = "transpose_f8", .x = tr_wg_x, .y = tr_wg_y },
             .{ .name = "transpose_f32", .x = tr_wg_x, .y = tr_wg_y },
+            .{ .name = "bf16_to_f16_coopw", .x = tr_wg_x, .y = tr_wg_y },
+            .{ .name = "bf16_coopw", .x = tr_wg_x, .y = tr_wg_y },
         }, &shader_tr);
         var shader_e: vk.ShaderModule = .null_handle;
         try createKernelModule(gpa, &d, device, eltwise_spv, &elt_entry_sizes, &shader_e);
@@ -872,11 +903,13 @@ pub const Context = struct {
             }, null, &pipeline_layout_tr));
         }
         errdefer d.DestroyPipelineLayout(device, pipeline_layout_tr, null);
-        var pipes_tr: [2]vk.Pipeline = .{ .null_handle, .null_handle };
+        var pipes_tr: [4]vk.Pipeline = @splat(.null_handle);
         {
-            const infos = [2]vk.ComputePipelineCreateInfo{
+            const infos = [4]vk.ComputePipelineCreateInfo{
                 .{ .stage = .{ .module = shader_tr, .p_name = "transpose_f8" }, .layout = pipeline_layout_tr },
                 .{ .stage = .{ .module = shader_tr, .p_name = "transpose_f32" }, .layout = pipeline_layout_tr },
+                .{ .stage = .{ .module = shader_tr, .p_name = "bf16_to_f16_coopw" }, .layout = pipeline_layout_tr },
+                .{ .stage = .{ .module = shader_tr, .p_name = "bf16_coopw" }, .layout = pipeline_layout_tr },
             };
             try check(d.CreateComputePipelines(device, .null_handle, infos.len, &infos, null, &pipes_tr));
         }
@@ -920,12 +953,14 @@ pub const Context = struct {
         var pipe_coop_c16: vk.Pipeline = .null_handle;
         var shader_coop_f16w: vk.ShaderModule = .null_handle;
         var pipe_coop_f16w: vk.Pipeline = .null_handle;
+        var shader_coop_bf16w: vk.ShaderModule = .null_handle;
+        var pipe_coop_bf16w: vk.Pipeline = .null_handle;
         if (coop_m == 16 and coop_n == 16 and coop_k == 16) {
             inline for (.{
                 .{ false, coopmat.coop_warps8, coopmat.coop_acc_h16, false, &shader_coop },
                 .{ true, false, false, false, &shader_coop_f16w },
             }) |v| {
-                const code = try coopmat.buildGemmShared(gpa, v[0], v[1], v[2], v[3]);
+                const code = try coopmat.buildGemmShared(gpa, v[0], v[1], v[2], v[3], false);
                 defer gpa.free(code);
                 try check(d.CreateShaderModule(device, &.{
                     .code_size = code.len,
@@ -935,23 +970,36 @@ pub const Context = struct {
             // f16 C store rides the fp8 pipe's toggles; it only exists (and
             // is only exact) with f16 accumulators.
             if (coopmat.coop_acc_h16) {
-                const code = try coopmat.buildGemmShared(gpa, false, coopmat.coop_warps8, true, true);
+                const code = try coopmat.buildGemmShared(gpa, false, coopmat.coop_warps8, true, true, false);
                 defer gpa.free(code);
                 try check(d.CreateShaderModule(device, &.{
                     .code_size = code.len,
                     .p_code = @ptrCast(@alignCast(code.ptr)),
                 }, null, &shader_coop_c16));
             }
+            // Native bf16 f16-weight-style GEMM (f16-weight path with bf16 A/B).
+            if (coop_bf16) {
+                const code = try coopmat.buildGemmShared(gpa, true, false, false, false, true);
+                defer gpa.free(code);
+                try check(d.CreateShaderModule(device, &.{
+                    .code_size = code.len,
+                    .p_code = @ptrCast(@alignCast(code.ptr)),
+                }, null, &shader_coop_bf16w));
+            }
         }
         errdefer if (shader_coop != .null_handle) d.DestroyShaderModule(device, shader_coop, null);
         errdefer if (shader_coop_c16 != .null_handle) d.DestroyShaderModule(device, shader_coop_c16, null);
         errdefer if (shader_coop_f16w != .null_handle) d.DestroyShaderModule(device, shader_coop_f16w, null);
+        errdefer if (shader_coop_bf16w != .null_handle) d.DestroyShaderModule(device, shader_coop_bf16w, null);
         if (shader_coop != .null_handle) {
             inline for (.{ .{ shader_coop, &pipe_coop }, .{ shader_coop_f16w, &pipe_coop_f16w } }) |v| {
                 try createCoopPipe(&d, device, v[0], pipeline_layout, coop_sg, v[1]);
             }
             if (shader_coop_c16 != .null_handle) {
                 try createCoopPipe(&d, device, shader_coop_c16, pipeline_layout, coop_sg, &pipe_coop_c16);
+            }
+            if (shader_coop_bf16w != .null_handle) {
+                try createCoopPipe(&d, device, shader_coop_bf16w, pipeline_layout, coop_sg, &pipe_coop_bf16w);
             }
         }
         errdefer if (pipe_coop != .null_handle) d.DestroyPipeline(device, pipe_coop, null);
@@ -1186,6 +1234,8 @@ pub const Context = struct {
             .shader_tr = shader_tr,
             .pipe_tr_f8 = pipes_tr[0],
             .pipe_tr_f32 = pipes_tr[1],
+            .pipe_tr_bf16w = pipes_tr[2],
+            .pipe_tr_bf16raw = pipes_tr[3],
             .pipeline_layout_e = pipeline_layout_e,
             .shader_e = shader_e,
             .pipes_e = pipes_e,
@@ -1207,6 +1257,8 @@ pub const Context = struct {
             .pipe_coop_c16 = pipe_coop_c16,
             .shader_coop_f16w = shader_coop_f16w,
             .pipe_coop_f16w = pipe_coop_f16w,
+            .shader_coop_bf16w = shader_coop_bf16w,
+            .pipe_coop_bf16w = pipe_coop_bf16w,
             .shader_scores = shader_scores,
             .pipe_scores = pipe_scores,
             .shader_scores_vae = shader_scores_vae,
@@ -1257,6 +1309,8 @@ pub const Context = struct {
         self.d.DestroyDescriptorPool(self.device, self.desc_pool, null);
         self.d.DestroyPipeline(self.device, self.pipe_f8, null);
         self.d.DestroyPipeline(self.device, self.pipe_f32, null);
+        self.d.DestroyPipeline(self.device, self.pipe_tr_bf16w, null);
+        self.d.DestroyPipeline(self.device, self.pipe_tr_bf16raw, null);
         self.d.DestroyPipeline(self.device, self.pipe_tr_f8, null);
         self.d.DestroyPipeline(self.device, self.pipe_tr_f32, null);
         for (self.pipes_e) |pp| self.d.DestroyPipeline(self.device, pp, null);
@@ -1278,6 +1332,8 @@ pub const Context = struct {
         if (self.shader_coop_c16 != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_coop_c16, null);
         if (self.pipe_coop_f16w != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_coop_f16w, null);
         if (self.shader_coop_f16w != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_coop_f16w, null);
+        if (self.pipe_coop_bf16w != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_coop_bf16w, null);
+        if (self.shader_coop_bf16w != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_coop_bf16w, null);
         if (self.pipe_scores != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_scores, null);
         if (self.shader_scores != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_scores, null);
         if (self.pipe_scores_vae != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_scores_vae, null);
@@ -2384,6 +2440,110 @@ pub const Context = struct {
         return db.buf;
     }
 
+    /// Like weightBufferF16From32, but the source is raw bf16 bytes (a dense
+    /// bf16 DiT checkpoint) and the bf16 -> f16 conversion + k-major transpose
+    /// runs ON THE GPU (bf16_to_f16_coopw): raw bf16 streams to the device once,
+    /// then one compute dispatch produces the [k_pad][n_pad] f16 layout the
+    /// f16-weight coop GEMM reads — no single-threaded CPU conversion loop (the
+    /// bottleneck when a >VRAM model re-streams weights every step). f16 keeps
+    /// more mantissa bits than bf16, so the round trip is near-lossless for the
+    /// < 1 weight range. Cached by host pointer, same residency accounting.
+    fn weightBufferF16FromBf16(self: *Context, w_bytes: []const u8, rows: usize, cols: usize, native: bool) Error!vk.Buffer {
+        const key = @intFromPtr(w_bytes.ptr);
+        self.use_counter += 1;
+        if (self.weights.getPtr(key)) |e| {
+            e.last_use = self.use_counter;
+            return e.db.buf;
+        }
+        std.debug.assert(w_bytes.len == rows * cols * 2);
+        // native: keep the weight bf16 (pipe_tr_bf16raw) for the bf16 coop GEMM;
+        // else convert to f16 (pipe_tr_bf16w) for the f16 fallback. Both emit a
+        // 16-bit k-major [k_pad][n_pad] buffer, so only the pipeline differs.
+        const tr_pipe = if (native) self.pipe_tr_bf16raw else self.pipe_tr_bf16w;
+
+        const n_pad = std.mem.alignForward(usize, rows, 128);
+        const k_pad = std.mem.alignForward(usize, cols, 64);
+        const total: u64 = @as(u64, k_pad) * n_pad * 2; // f16 out
+        self.reserveForWeights(total);
+        const db = try self.createBuffer(
+            total,
+            vk.BufferUsage.storage_buffer | vk.BufferUsage.transfer_dst,
+            vk.MemoryProperty.device_local,
+        );
+        errdefer {
+            self.d.DestroyBuffer(self.device, db.buf, null);
+            self.d.FreeMemory(self.device, db.mem, null);
+        }
+
+        // Raw bf16 -> device scratch (chunked through staging), then the
+        // convert+transpose dispatch builds the coop f16 layout device-side.
+        const cb = self.nowCmd();
+        const raw_size = std.mem.alignForward(u64, w_bytes.len, 4);
+        try self.ensureDeviceBuffer(&self.raw_dev, raw_size);
+        const chunk: u64 = 256 << 20;
+        const mapped = try self.ensureHostBuffer(&self.staging, @min(raw_size, chunk));
+        var off: u64 = 0;
+        while (off < w_bytes.len) {
+            const n: u64 = @min(chunk, w_bytes.len - off);
+            @memcpy(mapped[0..@intCast(n)], w_bytes[@intCast(off)..][0..@intCast(n)]);
+            try self.beginCmdBuf(cb);
+            const region: vk.BufferCopy = .{ .src_offset = 0, .dst_offset = off, .size = n };
+            self.d.CmdCopyBuffer(cb, self.staging.buf, self.raw_dev.buf, 1, @ptrCast(&region));
+            try self.submitAndWaitBuf(cb);
+            off += n;
+        }
+
+        {
+            const buf_infos = [2]vk.DescriptorBufferInfo{
+                .{ .buffer = self.raw_dev.buf },
+                .{ .buffer = db.buf },
+            };
+            var writes: [2]vk.WriteDescriptorSet = undefined;
+            for (&writes, 0..) |*wr, i| {
+                wr.* = .{
+                    .dst_set = self.desc_set_tr,
+                    .dst_binding = @intCast(i),
+                    .dst_array_element = 0,
+                    .descriptor_count = 1,
+                    .descriptor_type = .storage_buffer,
+                    .p_image_info = null,
+                    .p_buffer_info = @ptrCast(&buf_infos[i]),
+                    .p_texel_buffer_view = null,
+                };
+            }
+            self.d.UpdateDescriptorSets(self.device, writes.len, &writes, 0, null);
+
+            const push: TransposePush = .{
+                .rows = @intCast(rows),
+                .cols = @intCast(cols),
+                .stride = @intCast(n_pad),
+                .k_pad = @intCast(k_pad),
+            };
+            try self.beginCmdBuf(cb);
+            self.d.CmdBindPipeline(cb, .compute, tr_pipe);
+            self.d.CmdBindDescriptorSets(cb, .compute, self.pipeline_layout_tr, 0, 1, @ptrCast(&self.desc_set_tr), 0, null);
+            self.d.CmdPushConstants(cb, self.pipeline_layout_tr, vk.ShaderStage.compute, 0, @sizeOf(TransposePush), &push);
+            self.d.CmdDispatch(
+                cb,
+                @intCast(std.math.divCeil(usize, n_pad / 2, tr_wg_x) catch unreachable),
+                @intCast(std.math.divCeil(usize, k_pad, tr_wg_y) catch unreachable),
+                1,
+            );
+            const to_shader: vk.BufferMemoryBarrier = .{
+                .src_access_mask = vk.Access.shader_write,
+                .dst_access_mask = vk.Access.shader_read,
+                .buffer = db.buf,
+                .offset = 0,
+                .size = vk.WHOLE_SIZE,
+            };
+            self.d.CmdPipelineBarrier(cb, vk.PipelineStage.compute_shader, vk.PipelineStage.compute_shader, 0, 0, null, 1, @ptrCast(&to_shader), 0, null);
+            try self.submitAndWaitBuf(cb);
+        }
+
+        try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .pinned = self.pinNew(total) });
+        return db.buf;
+    }
+
     /// Tensor-core GEMM for f32 weights (the VAE convs): B converts once to
     /// zero-padded k-major f16 (cached), the f32 activations convert per
     /// call with the k tail padded (f32_to_h16_pad, since 9*ci is rarely a
@@ -2402,15 +2562,76 @@ pub const Context = struct {
         bias: []const f32,
     ) Error!void {
         std.debug.assert(self.pipe_coop_f16w != .null_handle);
+        const w_buf = try self.weightBufferF16From32(w, rows, cols);
+        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, bias, false);
+    }
+
+    /// Same f16-weight tensor-core GEMM as opMatmulCoopF16W, but the weight is a
+    /// raw bf16 tensor (a dense bf16 DiT block linear). bf16 -> f16 conversion
+    /// happens once at upload (weightBufferF16FromBf16, cached); everything else
+    /// — f16 activations, coop dispatch, bias-compact — is identical, so the
+    /// f32 output matches opMatmulCoop's contract and the bf16 DiT can reuse the
+    /// backend's f32-operand attention/mlp path unchanged.
+    pub fn opMatmulCoopF16Wb(
+        self: *Context,
+        y: DeviceBuffer,
+        y_off: usize,
+        x: DeviceBuffer,
+        m: usize,
+        w_bytes: []const u8,
+        rows: usize,
+        cols: usize,
+        bias: []const f32,
+    ) Error!void {
+        std.debug.assert(self.pipe_coop_f16w != .null_handle);
+        const w_buf = try self.weightBufferF16FromBf16(w_bytes, rows, cols, false);
+        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, bias, false);
+    }
+
+    /// Native bf16 twin of opMatmulCoopF16Wb: the raw bf16 weight is kept bf16
+    /// (k-major transpose only) and the activation converts f32 -> bf16, so the
+    /// bf16 tensor cores consume both operands directly — no f16 round trip.
+    /// Requires a bf16 cooperative-matrix config (pipe_coop_bf16w).
+    pub fn opMatmulCoopBf16(
+        self: *Context,
+        y: DeviceBuffer,
+        y_off: usize,
+        x: DeviceBuffer,
+        m: usize,
+        w_bytes: []const u8,
+        rows: usize,
+        cols: usize,
+        bias: []const f32,
+    ) Error!void {
+        std.debug.assert(self.pipe_coop_bf16w != .null_handle);
+        const w_buf = try self.weightBufferF16FromBf16(w_bytes, rows, cols, true);
+        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, bias, true);
+    }
+
+    /// Shared body of the f16/bf16-weight coop GEMM: the weight is already
+    /// uploaded as k-major padded 16-bit (`w_buf`); convert x to f16 (or bf16
+    /// when `bf16_ab`), run the coop dispatch into the padded scratch, then strip
+    /// the pad and add `bias` into `y`.
+    fn coopF16WDispatch(
+        self: *Context,
+        y: DeviceBuffer,
+        y_off: usize,
+        x: DeviceBuffer,
+        m: usize,
+        w_buf: vk.Buffer,
+        rows: usize,
+        cols: usize,
+        bias: []const f32,
+        bf16_ab: bool,
+    ) Error!void {
         const n_pad = std.mem.alignForward(usize, rows, 128);
         const k_pad = std.mem.alignForward(usize, cols, 64);
         const m_pad = std.mem.alignForward(usize, m, 128);
-        const w_buf = try self.weightBufferF16From32(w, rows, cols);
         try self.ensureDeviceBuffer(&self.x_h16, m_pad * k_pad * 2);
         try self.ensureDeviceBuffer(&self.y_pad, m_pad * n_pad * 4);
 
-        // x f32 [m][cols] -> f16 [m_pad][k_pad], zeros in both pads.
-        try self.opElt(.f32_to_h16_pad, x, null, null, self.x_h16, .{
+        // x f32 [m][cols] -> f16/bf16 [m_pad][k_pad], zeros in both pads.
+        try self.opElt(if (bf16_ab) .f32_to_bf16_pad else .f32_to_h16_pad, x, null, null, self.x_h16, .{
             .u0 = @intCast(m_pad * k_pad / 2),
             .u1 = @intCast(cols),
             .u2 = @intCast(k_pad),
@@ -2421,7 +2642,7 @@ pub const Context = struct {
         const push: [4]u32 = .{ @intCast(m_pad), @intCast(n_pad), @intCast(k_pad), @intCast(n_pad) };
         try self.opBegin();
         var set = self.bind4(.{ self.x_h16.buf, self.x_h16.buf, self.y_pad.buf, w_buf });
-        self.d.CmdBindPipeline(self.cmd, .compute, self.pipe_coop_f16w);
+        self.d.CmdBindPipeline(self.cmd, .compute, if (bf16_ab) self.pipe_coop_bf16w else self.pipe_coop_f16w);
         self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout, vk.ShaderStage.compute, 0, 16, &push);
         self.d.CmdDispatch(self.cmd, @intCast(n_pad / 128), @intCast(m_pad / 128), 1);

@@ -46,6 +46,7 @@ pub const HeuristicResult = extern struct {
 // ---- Enums we use (values from library_types.h / cublas_api.h / cublasLt.h) --
 // cudaDataType_t
 pub const R_16F: c_int = 2;
+pub const R_16BF: c_int = 14; // CUDA_R_16BF
 pub const R_32F: c_int = 0;
 pub const R_8I: c_int = 3;
 pub const R_32I: c_int = 10;

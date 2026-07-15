@@ -437,6 +437,17 @@ fn applyLiveSettings() void {
     }
 }
 
+/// Toolbar reasoning toggle: flip whether the model reasons before answering,
+/// persist it, and push it into the running session live (no reload — it only
+/// shapes the next prompt built). Keeps the baseline in sync so a later
+/// Settings → Cancel doesn't resurrect the old value.
+fn toggleReasoning() void {
+    g_config.reasoning = !g_config.reasoning;
+    g_config_baseline.reasoning = g_config.reasoning;
+    g_config.save(g_io, g_gpa, g_environ, g_config_path) catch |err| std.log.err("save settings failed: {t}", .{err});
+    applyLiveSettings();
+}
+
 /// Cancel button: discard unsaved edits by reloading the on-disk settings.
 fn cancelConfig() void {
     g_config = config.Config.load(g_io, g_gpa, g_environ, g_config_path);
@@ -615,6 +626,7 @@ fn buildSession(arena: std.mem.Allocator) !*chat.Session {
         else
             0,
         .vram_priority = g_config.vram_priority,
+        .reasoning = g_config.reasoning,
     });
     return s;
 }
@@ -696,13 +708,31 @@ fn renderMessage(s: *chat.Session, m: *const chat.Message, idx: usize) void {
     // because generation stopped (e.g. hit max tokens) reads "Thoughts".
     const live = s.busy() and idx + 1 == s.messages.items.len;
 
-    // Qwen3.5 reasoning: collapse <think>…</think> behind an expander. The
-    // label doubles as a "thinking" indicator while the block is still open.
+    // Reasoning: collapse the thought block behind an expander, default
+    // collapsed. The label doubles as a "thinking" indicator while the block is
+    // still open. An empty thought (e.g. a model that opened and closed the
+    // channel with nothing inside) shows no bubble at all — unless it's still
+    // actively streaming, where "Thinking…" is the right cue.
     if (p.think) |think| {
-        if (dvui.expander(@src(), if (p.thinking and live) "Thinking…" else "Thoughts", .{ .default_expanded = false }, .{})) {
-            var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal });
-            defer tl.deinit();
-            fonts.addRich(tl, think);
+        if (think.len > 0 or (p.thinking and live)) {
+            if (dvui.expander(@src(), if (p.thinking and live) "Thinking…" else "Thoughts", .{ .default_expanded = false }, .{})) {
+                // Set the reasoning apart from the answer: a dimmer text color on
+                // a slightly inset, accent-bordered block (a blockquote look), so
+                // it reads as the model's scratch work rather than the reply.
+                var tl = dvui.textLayout(@src(), .{}, .{
+                    .expand = .horizontal,
+                    .background = true,
+                    .color_fill = theme.fill.lerp(theme.text, 0.15),
+                    .color_text = theme.text.lerp(theme.fill, 0.40),
+                    .color_border = theme.focus,
+                    .border = .{ .x = 3, .y = 0, .w = 0, .h = 0 },
+                    .corner_radius = dvui.Rect.all(4),
+                    .margin = .{ .x = 2, .y = 4, .w = 2, .h = 4 },
+                    .padding = .{ .x = 9, .y = 6, .w = 9, .h = 6 },
+                });
+                defer tl.deinit();
+                fonts.addRich(tl, think);
+            }
         }
     }
 
@@ -876,7 +906,9 @@ fn genInfo(gi: *chat.GenImage) void {
             0;
         break :blk std.fmt.bufPrint(&buf, "{d}×{d}  ·  {d} steps  ·  seed {d}  ·  {d:.2} s/step  ·  {d:.1}s total", .{ w, h, gi.req_steps, gi.req_seed, sps, total_s }) catch "";
     } else std.fmt.bufPrint(&buf, "{d}×{d}  ·  {d} steps  ·  seed {d}", .{ w, h, gi.req_steps, gi.req_seed }) catch "";
-    dvui.label(@src(), "{s}", .{meta}, .{ .margin = .{ .y = 2 } });
+    // Rendered through a text layout (not a plain label) so the metadata —
+    // seed especially — is mouse-selectable.
+    fonts.richLabel(@src(), meta, .{ .margin = .{ .y = 2 } });
     if (dvui.expander(@src(), "Prompt", .{ .default_expanded = false }, .{})) {
         var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .padding = .{ .x = 6, .y = 2, .w = 6, .h = 4 } });
         defer tl.deinit();
@@ -886,17 +918,22 @@ fn genInfo(gi: *chat.GenImage) void {
 
 const Parsed = struct { think: ?[]const u8, answer: []const u8, thinking: bool };
 
-/// Split an assistant message into its <think>…</think> reasoning and the
-/// answer. `thinking` is true while the block is still open (no </think> yet).
+/// Split an assistant message into its reasoning block and the answer, using
+/// the active model family's thought markers (chat.reasoning() — e.g. Qwen's
+/// `<think>…</think>`, Gemma 4's `<|channel>thought…<channel|>`). The markers
+/// themselves are dropped. `thinking` is true while the block is still open (no
+/// close marker yet). Families that don't reason return everything as answer.
 fn parseThink(text: []const u8) Parsed {
     const ws = " \n\r\t";
+    const r = tp.llm.chat.reasoning() orelse
+        return .{ .think = null, .answer = text, .thinking = false };
     const t = std.mem.trimStart(u8, text, ws);
-    if (std.mem.startsWith(u8, t, "<think>")) {
-        const rest = t["<think>".len..];
-        if (std.mem.indexOf(u8, rest, "</think>")) |end| {
+    if (std.mem.startsWith(u8, t, r.open)) {
+        const rest = t[r.open.len..];
+        if (std.mem.indexOf(u8, rest, r.close)) |end| {
             return .{
                 .think = std.mem.trim(u8, rest[0..end], ws),
-                .answer = std.mem.trimStart(u8, rest[end + "</think>".len ..], ws),
+                .answer = std.mem.trimStart(u8, rest[end + r.close.len ..], ws),
                 .thinking = false,
             };
         }
@@ -961,6 +998,23 @@ fn renderInput(s: *chat.Session) void {
         .min_size_content = .{ .w = 22, .h = 22 },
         .margin = .{ .w = 6 },
     })) openSettings();
+
+    // Reasoning toggle (no brain icon in entypo — a lit bulb reads as
+    // "thinking"). Shown only for a loaded model whose family can reason
+    // (Gemma 3 etc. hide it). Highlighted when on; flips live and persists.
+    if (g_session != null and tp.llm.chat.supportsThinking()) {
+        const on = g_config.reasoning;
+        const th = dvui.themeGet();
+        if (dvui.buttonIcon(@src(), "reasoning", dvui.entypo.light_bulb, .{}, .{}, .{
+            .gravity_y = 0.5,
+            .min_size_content = .{ .w = 22, .h = 22 },
+            .margin = .{ .w = 6 },
+            .background = on,
+            .corner_radius = dvui.Rect.all(5),
+            .color_fill = if (on) th.fill.lerp(th.focus, 0.35) else null,
+            .color_text = if (on) th.focus else null,
+        })) toggleReasoning();
+    }
 
     var send = false;
 

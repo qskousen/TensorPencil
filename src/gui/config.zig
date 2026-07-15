@@ -206,6 +206,11 @@ pub const Config = struct {
     /// VAE decode-path override (see `VaeDecode`). Applied live like diff paths.
     vae_decode: VaeDecode = .auto,
     system_prompt: TextBuf(max_prompt) = TextBuf(max_prompt).lit(default_system_prompt),
+    /// Whether the chat model reasons (emits a "thought" block) before its
+    /// answer, for models that support it (see `chat.supportsThinking`). Applied
+    /// live — the GUI toolbar toggle flips this without a reload; the block is
+    /// rendered collapsed. No effect on non-reasoning models (e.g. Gemma 3).
+    reasoning: bool = true,
 
     /// The LLM side (model, vision tower, VRAM limit) matches. A change here
     /// needs a reload — but a transcript-preserving one: the chat is carried
@@ -310,6 +315,8 @@ pub const Config = struct {
             if (Backend.fromStr(val)) |b| self.diff_backend = b;
         } else if (std.mem.eql(u8, key, "vae_decode")) {
             if (VaeDecode.fromStr(val)) |v| self.vae_decode = v;
+        } else if (std.mem.eql(u8, key, "reasoning")) {
+            self.reasoning = std.mem.eql(u8, val, "true");
         }
     }
 
@@ -344,6 +351,7 @@ pub const Config = struct {
             \\llm_backend = {s}
             \\diff_backend = {s}
             \\vae_decode = {s}
+            \\reasoning = {}
             \\system_prompt = {s}
             \\
         , .{
@@ -354,7 +362,8 @@ pub const Config = struct {
             self.height,                  @tagName(self.preview),
             self.max_vram_gib,            @tagName(self.vram_priority),
             @tagName(self.llm_backend),   @tagName(self.diff_backend),
-            @tagName(self.vae_decode),    prompt_esc,
+            @tagName(self.vae_decode),    self.reasoning,
+            prompt_esc,
         });
         defer gpa.free(content);
 
@@ -402,6 +411,15 @@ test "Config.apply parses keys and tolerates junk" {
     try std.testing.expectEqual(@as(usize, 30), cfg.steps);
     try std.testing.expectEqual(Preview.latent2rgb, cfg.preview);
     try std.testing.expectEqual(@as(usize, 1024), cfg.width); // unchanged on junk
+}
+
+test "apply parses the reasoning flag (default on)" {
+    var cfg: Config = .{};
+    try std.testing.expect(cfg.reasoning); // on by default
+    cfg.apply("reasoning", "false");
+    try std.testing.expect(!cfg.reasoning);
+    cfg.apply("reasoning", "true");
+    try std.testing.expect(cfg.reasoning);
 }
 
 test "system prompt escapes/unescapes newlines round-trip" {

@@ -28,13 +28,47 @@ pub var newline: u32 = newline_id;
 
 /// Chat template family. `chatml` is Qwen's `<|im_start|>role\n…<|im_end|>`;
 /// `gemma` is Gemma 3's `<start_of_turn>role\n…<end_of_turn>\n`; `gemma4` is
-/// Gemma 4's `<|turn>role\n…<turn|>\n` (roles user / model, no system role —
-/// system content prefixes the first user turn).
+/// Gemma 4's `<|turn>role\n…<turn|>\n` (roles system / user / model, each its
+/// own turn; the system turn also carries the `<|think|>` reasoning cue).
 pub const Family = enum { chatml, gemma, gemma4 };
 pub var family: Family = .chatml;
 /// Gemma: a user turn was opened by appendSystem (the system prefix) and the
 /// next appendUser continues it rather than starting a fresh turn.
 var gemma_user_open: bool = false;
+
+/// Whether the model should emit a reasoning ("thought") block before its
+/// answer. Process-global like `family`; only reasoning-capable families honor
+/// it (see `reasoning`). When off, `openAssistant` primes an empty thought
+/// block so the model answers directly (each family's non-thinking template
+/// convention); when on, the turn is left unprimed and the model opens its own
+/// block (gemma4 is additionally cued by `<|think|>` in the system turn).
+pub var enable_thinking: bool = true;
+
+/// Turn reasoning on/off (process-global). Forward-looking: a new reasoning
+/// family just adds its markers to `reasoning` and its priming to
+/// `openAssistant`/`appendSystem`; this stays untouched.
+pub fn setThinking(on: bool) void {
+    enable_thinking = on;
+}
+
+/// Delimiters of a family's reasoning block as they appear in the *generated
+/// text* (decoded tokens): `open` starts the thought, `close` ends it. null =>
+/// the family has no reasoning channel and the thinking toggle is a no-op.
+pub const Reasoning = struct { open: []const u8, close: []const u8 };
+
+/// The active family's reasoning-block markers, or null if it can't reason.
+pub fn reasoning() ?Reasoning {
+    return switch (family) {
+        .chatml => .{ .open = "<think>", .close = "</think>" },
+        .gemma4 => .{ .open = "<|channel>thought", .close = "<channel|>" },
+        .gemma => null,
+    };
+}
+
+/// Whether the active family supports a reasoning block (drives the GUI toggle).
+pub fn supportsThinking() bool {
+    return reasoning() != null;
+}
 
 /// Select the chat template family (process-global, like the tokenizer).
 pub fn setFamily(f: Family) void {
@@ -65,10 +99,15 @@ pub fn appendSystem(tok: *const Tokenizer, gpa: std.mem.Allocator, text: []const
             gemma_user_open = true;
         },
         .gemma4 => {
-            try tok.encode(gpa, "<|turn>user\n", out);
+            // Gemma 4 has a dedicated system turn (unlike Gemma 3): a full
+            // <|turn>system\n … <turn|>\n block. In thinking mode the <|think|>
+            // reasoning cue is injected at the very top of it, before the
+            // system content — matching the reference template. The system turn
+            // stands alone, so the next appendUser opens a fresh user turn.
+            try tok.encode(gpa, "<|turn>system\n", out);
+            if (enable_thinking) try tok.encode(gpa, "<|think|>\n", out);
             try tok.encode(gpa, text, out);
-            try tok.encode(gpa, "\n\n", out);
-            gemma_user_open = true;
+            try tok.encode(gpa, "<turn|>\n", out);
         },
     }
 }
@@ -176,11 +215,23 @@ pub fn appendGemma4Image(tok: *const Tokenizer, gpa: std.mem.Allocator, n_tokens
 /// Start the assistant turn the model completes (ChatML: `<|im_start|>
 /// assistant\n`; Gemma: `<start_of_turn>model\n`).
 pub fn openAssistant(tok: *const Tokenizer, gpa: std.mem.Allocator, out: *std.ArrayList(u32)) !void {
-    try tok.encode(gpa, switch (family) {
-        .chatml => "<|im_start|>assistant\n",
-        .gemma => "<start_of_turn>model\n",
-        .gemma4 => "<|turn>model\n",
-    }, out);
+    switch (family) {
+        .chatml => {
+            try tok.encode(gpa, "<|im_start|>assistant\n", out);
+            // Non-thinking: prime an empty reasoning block (Qwen's
+            // <think>\n\n</think> convention) so the model answers directly.
+            // Thinking: unprimed — the model emits its own <think>…</think>.
+            if (!enable_thinking) try tok.encode(gpa, "<think>\n\n</think>\n\n", out);
+        },
+        .gemma => try tok.encode(gpa, "<start_of_turn>model\n", out),
+        .gemma4 => {
+            try tok.encode(gpa, "<|turn>model\n", out);
+            // Non-thinking: prime an empty thought channel so the model answers
+            // directly. Thinking: unprimed — the model opens its own
+            // <|channel>thought … <channel|> (cued by <|think|> in the system).
+            if (!enable_thinking) try tok.encode(gpa, "<|channel>thought\n<channel|>", out);
+        },
+    }
 }
 
 /// Close a generated assistant turn so another user turn can follow (the
@@ -276,6 +327,62 @@ test "turn building matches whole-template tokenization" {
         &ref,
     );
     try std.testing.expectEqualSlices(u32, ref.items, ids.items);
+}
+
+test "reasoning descriptor is family-scoped" {
+    const saved = family;
+    defer setFamily(saved);
+
+    setFamily(.chatml);
+    try std.testing.expect(supportsThinking());
+    try std.testing.expectEqualStrings("<think>", reasoning().?.open);
+    try std.testing.expectEqualStrings("</think>", reasoning().?.close);
+
+    setFamily(.gemma4);
+    try std.testing.expect(supportsThinking());
+    try std.testing.expectEqualStrings("<|channel>thought", reasoning().?.open);
+    try std.testing.expectEqualStrings("<channel|>", reasoning().?.close);
+
+    setFamily(.gemma);
+    try std.testing.expect(!supportsThinking());
+    try std.testing.expectEqual(@as(?Reasoning, null), reasoning());
+}
+
+// Thinking off must prepend an empty reasoning block to the assistant open (so
+// the model answers directly); thinking on must leave the open untouched (the
+// model emits its own block). Uses the embedded chatml tokenizer.
+test "openAssistant primes an empty reasoning block only when thinking is off" {
+    const gpa = std.testing.allocator;
+    var tok = try Tokenizer.init(gpa);
+    defer tok.deinit();
+
+    const saved_family = family;
+    const saved_thinking = enable_thinking;
+    defer {
+        setFamily(saved_family);
+        setThinking(saved_thinking);
+    }
+    setFamily(.chatml);
+
+    var open_ref: std.ArrayList(u32) = .empty;
+    defer open_ref.deinit(gpa);
+    try tok.encode(gpa, "<|im_start|>assistant\n", &open_ref);
+
+    // Thinking on: bare assistant open, model reasons on its own.
+    setThinking(true);
+    var on: std.ArrayList(u32) = .empty;
+    defer on.deinit(gpa);
+    try openAssistant(&tok, gpa, &on);
+    try std.testing.expectEqualSlices(u32, open_ref.items, on.items);
+
+    // Thinking off: same open plus a primed empty <think></think>, so it is a
+    // strict prefix-extension of the bare open.
+    setThinking(false);
+    var off: std.ArrayList(u32) = .empty;
+    defer off.deinit(gpa);
+    try openAssistant(&tok, gpa, &off);
+    try std.testing.expect(off.items.len > on.items.len);
+    try std.testing.expectEqualSlices(u32, on.items, off.items[0..on.items.len]);
 }
 
 // Gemma turn building (family = gemma) must match one-shot tokenization of

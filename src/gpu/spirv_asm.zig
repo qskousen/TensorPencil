@@ -201,6 +201,10 @@ const enum_tokens = std.StaticStringMap(u32).initComptime(.{
     .{ "VulkanMemoryModel", 5345 },
     .{ "VulkanMemoryModelDeviceScope", 5346 },
     .{ "CooperativeMatrixKHR", 6022 },
+    .{ "BFloat16TypeKHR", 5116 },
+    .{ "BFloat16CooperativeMatrixKHR", 5118 },
+    // FP encoding (OpTypeFloat 3rd operand, SPV_KHR_bfloat16)
+    .{ "BFloat16KHR", 0 },
     // Addressing model
     .{ "Logical", 0 },
     // Memory model

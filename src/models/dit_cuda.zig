@@ -45,16 +45,42 @@ fn offsetBuf(b: DeviceBuffer, off_bytes: usize) DeviceBuffer {
     return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off_bytes), .mem = .null_handle, .size = b.size - off_bytes };
 }
 
-/// Quantized-linear dispatch. A convrot checkpoint is homogeneous (every DiT
-/// linear is the same width), so `is_i4` picks the W4A4 prep/GEMM (m16n8k64.s4,
-/// activations quantized to s4) vs the W8A8 path at each call site.
-fn qPrep(be: *Backend, is_i4: bool, x: DeviceBuffer, m: usize, cols: usize) !void {
-    if (is_i4) return be.opI4Prep(x, m, cols);
-    return be.opI8Prep(x, m, cols, false);
+/// Zero bias for the block linears (they have none, but opMatmulBf16 always
+/// folds a bias in). A file-scope constant so every GEMM width shares one stable
+/// host pointer — cachedWeight then caches it once at the widest slice.
+const zero_bias: [mlp_dim]f32 = @splat(0);
+
+/// Weight class of the DiT block linears. A convrot checkpoint is int8/int4
+/// (per-row scale + prep-once shared-input quant GEMM); a dense checkpoint is
+/// bf16 (each linear a standalone f16 tensor-core GEMM). Uniform across blocks.
+const LinKind = enum { i8, i4, bf16 };
+
+/// Prep the shared linear input. int8/int4 rotate+quantize `x` in place (all the
+/// block's GEMMs then read that internal state); bf16 GEMMs consume the f32 `x`
+/// directly, so no prep is needed.
+fn linPrep(be: *Backend, kind: LinKind, x: DeviceBuffer, m: usize, cols: usize) !void {
+    switch (kind) {
+        .i4 => try be.opI4Prep(x, m, cols),
+        .i8 => try be.opI8Prep(x, m, cols, false),
+        .bf16 => {},
+    }
 }
-fn qGemm(be: *Backend, is_i4: bool, y: DeviceBuffer, w: anytype) !void {
-    if (is_i4) return be.opI4Gemm(y, w.bytes, w.row_scale.?, w.rows);
-    return be.opI8Gemm(y, w.bytes, w.row_scale.?, w.rows, false);
+
+/// One block linear y[m][rows] f32 = x[m][cols] @ Wᵀ. int8/int4 read the prepped
+/// activation state (`x` is ignored); bf16 runs the f32-in/f32-out f16
+/// tensor-core GEMM (opMatmulBf16, weight bf16→f16 at upload) with a zero bias.
+fn lin(be: *Backend, kind: LinKind, y: DeviceBuffer, x: DeviceBuffer, m: usize, w: anytype, bias: []const f32) !void {
+    switch (kind) {
+        .i4 => try be.opI4Gemm(y, w.bytes, w.row_scale.?, w.rows),
+        .i8 => try be.opI8Gemm(y, w.bytes, w.row_scale.?, w.rows, false),
+        // Ampere+ feeds raw bf16 straight to the tensor cores (no f16 convert, so
+        // a streamed weight is touched once); older cards fall back to the
+        // GPU-side bf16→f16 GEMM.
+        .bf16 => if (be.ctx.cc_major >= 8)
+            try be.opGemmBf16(y, x, m, w.bytes, w.rows, w.cols, bias[0..w.rows])
+        else
+            try be.opMatmulBf16(y, x, m, w.bytes, w.rows, w.cols, bias[0..w.rows]),
+    }
 }
 
 /// Use the tensor-core GQA attention path (hgemm+softmax_row) instead of the
@@ -403,17 +429,22 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
     try be.beginBatch();
     errdefer if (be.batching()) be.abortBatch();
 
-    // int4 (W4A4) vs int8 (W8A8) convrot: gate the quantized-linear path once.
-    // The hand-PTX CUDA DiT only handles convrot checkpoints (per-row scale +
-    // packed int weights); an fp8/bf16 DiT has no row_scale, so reject it with a
-    // clear error instead of unwrapping a null scale into an illegal GPU access.
+    // Weight class of the DiT block linears, gated once: int8/int4 convrot
+    // (per-row scale + packed int weights) or dense bf16. An fp8 DiT has no
+    // row_scale and no bf16 GEMM path here, so reject it with a clear error
+    // instead of unwrapping a null scale into an illegal GPU access.
     const wqt = model.blocks[0].attn.wq.dtype;
-    if (wqt != .i8 and wqt != .i4) return error.UnsupportedCheckpoint;
-    const is_i4 = wqt == .i4;
+    const kind: LinKind = switch (wqt) {
+        .i8 => .i8,
+        .i4 => .i4,
+        .bf16 => .bf16,
+        else => return error.UnsupportedCheckpoint,
+    };
+    const zeros: []const f32 = &zero_bias;
     // f16 activation chain (c16): only on the cuBLASLt/irescale int8 libs path.
     // Halves the mlp gate/up/silu/down-input DRAM traffic (the biggest eltwise
-    // category). Hand-PTX (igemm_pipe_fused writes f32) and int4 keep f32.
-    const mlp_f16 = (be.kernels == .libs) and !is_i4;
+    // category). Hand-PTX (igemm_pipe_fused writes f32), int4, and bf16 keep f32.
+    const mlp_f16 = (be.kernels == .libs) and kind == .i8;
 
     // patch embed: x[seq_txt..] = img_in @ first^T + bias
     const first_f8 = model.first.w.dtype == .f8_e4m3;
@@ -433,11 +464,11 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
         const mb = b * 6 * F;
         // --- attention ---
         try be.rmsMod(x_d, t1_d, mv_d, seq, F, mb + 0 * F, mb + 1 * F, eps);
-        try qPrep(be, is_i4, t1_d, seq, F);
-        try qGemm(be, is_i4, q_d, blk.attn.wq);
-        try qGemm(be, is_i4, k_d, blk.attn.wk);
-        try qGemm(be, is_i4, v_d, blk.attn.wv);
-        try qGemm(be, is_i4, g_d, blk.attn.gate);
+        try linPrep(be, kind, t1_d, seq, F);
+        try lin(be, kind, q_d, t1_d, seq, blk.attn.wq, zeros);
+        try lin(be, kind, k_d, t1_d, seq, blk.attn.wk, zeros);
+        try lin(be, kind, v_d, t1_d, seq, blk.attn.wv, zeros);
+        try lin(be, kind, g_d, t1_d, seq, blk.attn.gate, zeros);
         const qn = try normBuf(be, blk.attn.qnorm);
         const kn = try normBuf(be, blk.attn.knorm);
         try be.qkNorm(q_d, q_d, qn, seq * heads, hd, eps);
@@ -449,8 +480,8 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
         else
             try be.attn(q_d, k_d, v_d, attn_d, seq, seq, heads, kv_heads, hd, attn_scale, false);
         try be.sigmoidMul(attn_d, g_d, seq * F);
-        try qPrep(be, is_i4, attn_d, seq, blk.attn.wo.cols);
-        try qGemm(be, is_i4, t1_d, blk.attn.wo);
+        try linPrep(be, kind, attn_d, seq, blk.attn.wo.cols);
+        try lin(be, kind, t1_d, attn_d, seq, blk.attn.wo, zeros);
         try be.gatedAdd(x_d, t1_d, mv_d, seq * F, F, mb + 2 * F);
         // --- mlp (sequence-tiled: mg/mu are [tile][mlp_dim]; each row-chunk is
         // independent, so we walk seq in mlp_tile-row bands over offset x views) ---
@@ -459,7 +490,7 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
             const tile: usize = @min(mlp_tile, seq - c0);
             const xo = offsetBuf(x_d, c0 * F * 4);
             try be.rmsMod(xo, t1_d, mv_d, tile, F, mb + 3 * F, mb + 4 * F, eps);
-            try qPrep(be, is_i4, t1_d, tile, F);
+            try linPrep(be, kind, t1_d, tile, F);
             if (mlp_f16) {
                 // gate/up GEMMs emit f16 (irescale_h16); silu_mul_h16 reads/writes
                 // f16; the down prep reads f16 — halving the 16384-dim traffic.
@@ -468,12 +499,12 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
                 try be.siluMul16(mg_d, mu_d, tile * mlp_dim);
                 try be.opI8Prep(mg_d, tile, blk.mlp.down.cols, true);
             } else {
-                try qGemm(be, is_i4, mg_d, blk.mlp.gate);
-                try qGemm(be, is_i4, mu_d, blk.mlp.up);
+                try lin(be, kind, mg_d, t1_d, tile, blk.mlp.gate, zeros);
+                try lin(be, kind, mu_d, t1_d, tile, blk.mlp.up, zeros);
                 try be.siluMul(mg_d, mu_d, tile * mlp_dim);
-                try qPrep(be, is_i4, mg_d, tile, blk.mlp.down.cols);
+                try linPrep(be, kind, mg_d, tile, blk.mlp.down.cols);
             }
-            try qGemm(be, is_i4, t1_d, blk.mlp.down); // down → f32 t1_d for gatedAdd
+            try lin(be, kind, t1_d, mg_d, tile, blk.mlp.down, zeros); // down → f32 t1_d for gatedAdd
             try be.gatedAdd(xo, t1_d, mv_d, tile * F, F, mb + 5 * F);
         }
     }

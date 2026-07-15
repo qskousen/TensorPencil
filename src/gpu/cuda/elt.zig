@@ -3808,6 +3808,42 @@ pub const f32_to_f16_pad2d_ptx: [:0]const u8 =
     \\}
 ;
 
+/// f32_to_f16_pad2d but converting to bf16 (native bf16 tensor-core GEMM): the
+/// activation feeds the bf16 MMA alongside the raw-bf16 weight, so no f16 round
+/// trip. out[idx] with r=idx/cols_pad, c=idx%cols_pad = (r<rows and c<cols) ?
+/// bf16(src_f32[r*cols+c]) : 0. b0=src(f32), b1=out(bf16). u1=cols_pad, u2=rows,
+/// u3=cols.
+pub const f32_to_bf16_pad2d_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry f32_to_bf16_pad2d(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<4>;
+    \\  .reg .b32 %r<12>;
+    \\  .reg .f32 %f<2>;
+    \\  .reg .b16 %h<2>;
+    \\  .reg .b64 %rd<8>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1]; ld.param.u32 %r7,[u2]; ld.param.u32 %r8,[u3];
+    \\  ld.param.u64 %rd2,[p1]; cvta.to.global.u64 %rd2,%rd2;
+    \\  mul.wide.u32 %rd3,%r4,2; add.s64 %rd4,%rd2,%rd3;   // &out[idx] bf16
+    \\  div.u32 %r9,%r4,%r6; rem.u32 %r10,%r4,%r6;         // r, c
+    \\  mov.b16 %h0,0x0000;
+    \\  setp.ge.u32 %p2,%r9,%r7; @%p2 bra STORE;
+    \\  setp.ge.u32 %p3,%r10,%r8; @%p3 bra STORE;
+    \\  mad.lo.s32 %r11,%r9,%r8,%r10;                       // r*cols + c
+    \\  ld.param.u64 %rd1,[p0]; cvta.to.global.u64 %rd1,%rd1;
+    \\  mul.wide.u32 %rd5,%r11,4; add.s64 %rd6,%rd1,%rd5; ld.global.f32 %f1,[%rd6]; cvt.rn.bf16.f32 %h0,%f1;
+    \\STORE:
+    \\  st.global.b16 [%rd4],%h0;
+    \\END:
+    \\  ret;
+    \\}
+;
+
 /// f32_to_f16_pad2d's bf16-source twin (ViT GEMMs consume the mmproj's bf16
 /// weights straight from the mmap): out[idx] with r=idx/cols_pad,
 /// c=idx%cols_pad = (r<rows and c<cols) ? f16(f32(src_bf16[r*cols+c])) : 0.

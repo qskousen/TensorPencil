@@ -134,8 +134,8 @@ pub fn main(init: std.process.Init) !void {
             \\                         GEMMs to Vulkan; zig-cuda runs the whole
             \\                         pipeline on the pure-Zig hand-PTX CUDA
             \\                         backend; cuda runs it on NVIDIA's dlopen'd
-            \\                         cuBLASLt/cuDNN kernels (both need an int8
-            \\                         convrot --dit ckpt)
+            \\                         cuBLASLt/cuDNN kernels (both take an int8/
+            \\                         int4 convrot or dense bf16 --dit ckpt)
             \\      --vram-budget 0    GiB of device memory to use (0 = ask the
             \\                         driver); weights past it stream per step.
             \\                         "min" holds only the in-flight weights
@@ -149,7 +149,9 @@ pub fn main(init: std.process.Init) !void {
             \\                         instead of the f16 tensor-core path
             \\                         (slower, more exact) (on/off)
             \\      --dit <path>       diffusion checkpoint (fp8 / int8 / int4
-            \\                         convrot; auto-detected). Default: krea2 Fp8
+            \\                         convrot / dense bf16; auto-detected). The
+            \\                         "model.diffusion_model." key prefix is also
+            \\                         auto-detected. Default: krea2 Fp8
             \\      --vae <path>       VAE decoder checkpoint
             \\      --text-encoder <path>  text-encoder checkpoint (qwen3)
             \\      --mmap on          checkpoint loading: on = mmap (default),
@@ -1279,11 +1281,16 @@ fn cudaDitTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []con
     var model = try dit_mod.DiT.load(arena, &st);
     defer model.deinit();
     const wqt = model.blocks[0].attn.wq.dtype;
-    if (wqt != .i8 and wqt != .i4) {
-        try stdout.print("cuda-dit-test needs an int8 or int4 convrot checkpoint (wq.dtype={t})\n", .{wqt});
+    if (wqt != .i8 and wqt != .i4 and wqt != .bf16) {
+        try stdout.print("cuda-dit-test needs an int8/int4 convrot or bf16 checkpoint (wq.dtype={t})\n", .{wqt});
         return;
     }
-    const qtag: []const u8 = if (wqt == .i4) "int4" else "int8";
+    const qtag: []const u8 = switch (wqt) {
+        .i4 => "int4",
+        .i8 => "int8",
+        .bf16 => "bf16",
+        else => unreachable,
+    };
 
     const seq_txt: usize = 8;
     const sigma: f32 = 0.7;

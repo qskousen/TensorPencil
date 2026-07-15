@@ -19,7 +19,7 @@ const usage =
     \\              [--backend cpu|zig-cuda|cuda|vulkan]
     \\              [--system <text>] [--max-tokens <n>] [--max-context <n>]
     \\              [--temperature <t>] [--top-k <n>] [--top-p <p>]
-    \\              [--repeat-penalty <r>] [--seed <n>] [--greedy]
+    \\              [--repeat-penalty <r>] [--seed <n>] [--greedy] [--no-think]
     \\              [--spec-k <n>] [--draft-model <qwen3.safetensors>]
     \\              [--eagle <eagle3.safetensors>] [--tree <nodes>]
     \\              [--vram-budget <GiB>|min] [--cpu-layers tail|attn] [--offload-grow]
@@ -41,6 +41,10 @@ const usage =
     \\Sampling defaults follow Qwen3 non-thinking recommendations:
     \\temperature 0.7, top-k 20, top-p 0.8. --greedy = --temperature 0.
     \\Seed defaults to the clock; pass --seed for reproducible output.
+    \\Reasoning is on by default for models that support it (Qwen3.5, Gemma 4):
+    \\the model emits a thought block before its answer. --no-think disables it
+    \\(the turn is primed with an empty thought so the model answers directly);
+    \\--think forces it on. No effect on non-reasoning models (e.g. Gemma 3).
     \\--spec-k enables speculative decoding (prompt-lookup drafting, up to n
     \\tokens verified per forward; lossless — same output distribution).
     \\--draft-model drafts with a smaller model instead (e.g. Qwen3-0.6B;
@@ -142,6 +146,10 @@ pub fn main(init: std.process.Init) !void {
             opts.seed = try std.fmt.parseInt(u64, try nextArg(args, &i), 10);
         } else if (std.mem.eql(u8, a, "--greedy")) {
             opts.sampling.temperature = 0;
+        } else if (std.mem.eql(u8, a, "--think")) {
+            llm.chat.setThinking(true);
+        } else if (std.mem.eql(u8, a, "--no-think")) {
+            llm.chat.setThinking(false);
         } else if (std.mem.eql(u8, a, "--spec-k")) {
             opts.spec_k = try std.fmt.parseInt(usize, try nextArg(args, &i), 10);
         } else if (std.mem.eql(u8, a, "--tree")) {

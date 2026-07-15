@@ -1277,7 +1277,7 @@ pub const irescale_h16_ptx: [:0]const u8 =
 ///     from the per-row MD={max,1/sum} table (`softmax_md_f16`). This eliminates
 ///     the P materialization entirely (no P write in softmax, no P read here) —
 ///     the Vulkan-parity win. attnout implies batched; C is f32; p_scale is 1.
-pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout: bool) ![:0]u8 {
+pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout: bool, bf16: bool) ![:0]u8 {
     const BM = 128;
     const KSTEP = 32;
     const MT = 4;
@@ -1551,7 +1551,8 @@ pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
             nj = 0;
             while (nj < NT) : (nj += 1) {
                 const a = acc[(mi * NT + nj) * 4 ..][0..4];
-                try b.linef("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{{s},{s},{s},{s}}}, {{{s},{s},{s},{s}}}, {{{s},{s}}}, {{{s},{s},{s},{s}}};", .{
+                try b.linef("mma.sync.aligned.m16n8k16.row.col.f32.{s}.{s}.f32 {{{s},{s},{s},{s}}}, {{{s},{s},{s},{s}}}, {{{s},{s}}}, {{{s},{s},{s},{s}}};", .{
+                    if (bf16) "bf16" else "f16", if (bf16) "bf16" else "f16",
                     a[0],           a[1],           a[2],           a[3],
                     af[mi * 4 + 0], af[mi * 4 + 1], af[mi * 4 + 2], af[mi * 4 + 3],
                     bf[nj * 2 + 0], bf[nj * 2 + 1], a[0],           a[1],
@@ -2663,7 +2664,7 @@ fn f16val(u: u16) f32 {
 /// CPU references. Attention primitives on the hand-PTX backend.
 pub fn attnTest(ctx: *Context, io: anytype, stdout: anytype) !void {
     _ = io;
-    const hg_ptx = try buildHgemm(gpa, false, false, false);
+    const hg_ptx = try buildHgemm(gpa, false, false, false, false);
     defer gpa.free(hg_ptx);
     var hmod = try ctx.loadModule(hg_ptx);
     defer hmod.unload(ctx);
@@ -2674,7 +2675,7 @@ pub fn attnTest(ctx: *Context, io: anytype, stdout: anytype) !void {
     const f_sm = try smod.getFunction(ctx, "softmax_row");
 
     // f16-C batched hgemm (used for scores in the DiT attention path).
-    const hgc16_ptx = try buildHgemm(gpa, true, true, false);
+    const hgc16_ptx = try buildHgemm(gpa, true, true, false, false);
     defer gpa.free(hgc16_ptx);
     var hc16mod = try ctx.loadModule(hgc16_ptx);
     defer hc16mod.unload(ctx);

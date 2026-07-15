@@ -279,6 +279,10 @@ pub const Options = struct {
     vram_limit_bytes: u64 = 0,
     /// Who gets VRAM preference when chat + image generation compete.
     vram_priority: config.Priority = .chat,
+    /// Whether the model reasons (emits a thought block) before answering, for
+    /// families that support it. Flipped live by the toolbar toggle; no-op for
+    /// non-reasoning models. See `chat.setThinking`.
+    reasoning: bool = true,
 };
 
 pub const Session = struct {
@@ -408,6 +412,10 @@ pub const Session = struct {
             .initial = @min(cfg.max_context, 4096),
             .max = cfg.max_context,
         };
+
+        // Reasoning toggle (process-global like the family). No-op for models
+        // whose family can't reason; the toolbar toggle flips it live.
+        chat.setThinking(cfg.reasoning);
 
         // Architecture dispatch: each variant bundles {lm, model, vit}. The
         // model retains a `*const lm` into the union, which is stable (self is
@@ -610,6 +618,10 @@ pub const Session = struct {
     /// touched when no diffusion is in flight — the worker copies `diff_opts` at
     /// spawn, so skipping a rare concurrent update avoids a torn `taew_path`.
     pub fn updateSettings(self: *Session, cfg: *const config.Config) void {
+        // Reasoning is process-global (like the family) and only shapes the
+        // *next* prompt built, so flipping it mid-conversation is safe without a
+        // reload — the current turn already has its ids.
+        chat.setThinking(cfg.reasoning);
         // Priority takes effect at the next image-gen contention (imageVramEnter
         // reads it live); the LLM's budget doesn't depend on it (see llmBudget).
         self.vram_priority = cfg.vram_priority;

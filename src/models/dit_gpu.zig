@@ -50,6 +50,10 @@ const attn_scale: f32 = 1.0 / 11.313708498984761; // 1/sqrt(128)
 /// switch (kernels are unit-tested) for smaller-seq experiments or a future
 /// retiling.
 const use_flash = false;
+/// Full-width zero bias for the dense-bf16 block linears (they have none, but the
+/// f16-weight coop GEMM always folds a bias in). One stable file-scope pointer so
+/// every GEMM width shares a single cached buffer.
+const zero_bias: [dit.mlp_dim]f32 = @splat(0);
 /// Two-pass softmax / parallel rmsnorm chunk counts: 32 interleaved chunks
 /// per row so a warp covers a row with coalesced reads.
 const nchunks = 32;
@@ -398,9 +402,27 @@ pub fn forward(
         mark(io, &t_mark, &prof.matmul_ns);
 
     const sin_off: u32 = @intCast(seq * half);
+    // Zero bias for the block linears: the f16-weight coop GEMM used for dense
+    // bf16 weights always folds a bias in (bias_compact), and the DiT block
+    // GEMMs have none. Hand it the full-width zero bias (a stable file-scope
+    // pointer): opMatmulCoopF16Wb reads only `rows` of it, so one buffer serves
+    // every GEMM width — a per-width slice of a shared buffer would collide in
+    // the smallBuffer cache (same pointer, first-seen length).
+    const zeros: []const f32 = &zero_bias;
     const Gemm = struct {
-        fn go(c: *gpu.Context, use_coop: bool, y: gpu.DeviceBuffer, x: gpu.DeviceBuffer, m: usize, m_pad: usize, w_: anytype) !void {
-            if (use_coop) {
+        fn go(c: *gpu.Context, use_coop: bool, y: gpu.DeviceBuffer, x: gpu.DeviceBuffer, m: usize, m_pad: usize, w_: anytype, bias: []const f32) !void {
+            // Dense bf16 weights run through the f16-weight tensor-core GEMM
+            // (bf16 -> f16 at upload); its f32 output matches opMatmulCoop, so
+            // the surrounding f32-operand attention/mlp path is unchanged.
+            if (w_.dtype == .bf16) {
+                // Native bf16 tensor cores when the device has a bf16 coop
+                // config; else convert bf16->f16 on the GPU (both keep the
+                // conversion off the CPU under weight streaming).
+                if (c.pipe_coop_bf16w != .null_handle)
+                    try c.opMatmulCoopBf16(y, 0, x, m, w_.bytes, w_.rows, w_.cols, bias)
+                else
+                    try c.opMatmulCoopF16Wb(y, 0, x, m, w_.bytes, w_.rows, w_.cols, bias);
+            } else if (use_coop) {
                 try c.opMatmulCoop(y, x, m, m_pad, w_.bytes, w_.rows, w_.cols, w_.scale);
             } else {
                 try c.opMatmul(y, 0, x, 0, m, w_.bytes, true, w_.rows, w_.cols, w_.scale, null);
@@ -434,7 +456,11 @@ pub fn forward(
         // GEMMs (opI8Prep/opI8Gemm), producing f32 q/k/v/g — so it takes the
         // f32-output branches below (which still run tensor-core attention).
         const is_i8 = blk.attn.wq.dtype == .i8;
-        const qkv_shared = coop and !is_i8 and
+        // Dense bf16 weights take the f32-operand fallback branch (Gemm.go
+        // routes them to the f16-weight coop GEMM); they must be kept out of the
+        // fp8-coop shared/att16 fast paths, which assume 1-byte e4m3 weights.
+        const is_bf16 = blk.attn.wq.dtype == .bf16;
+        const qkv_shared = coop and !is_i8 and !is_bf16 and
             blk.attn.wq.scale == blk.attn.wk.scale and
             blk.attn.wq.scale == blk.attn.wv.scale and
             blk.attn.wq.scale == blk.attn.gate.scale;
@@ -498,13 +524,13 @@ pub fn forward(
                     mark(io, &t_mark, &prof.matmul_ns);
                 }
             } else {
-                try Gemm.go(ctx, coop, q_d, t1_d, seq, seq_pad, blk.attn.wq);
+                try Gemm.go(ctx, coop, q_d, t1_d, seq, seq_pad, blk.attn.wq, zeros);
                 mark(io, &t_mark, &prof.matmul_ns);
-                try Gemm.go(ctx, coop, k_d, t1_d, seq, seq_pad, blk.attn.wk);
+                try Gemm.go(ctx, coop, k_d, t1_d, seq, seq_pad, blk.attn.wk, zeros);
                 mark(io, &t_mark, &prof.matmul_ns);
-                try Gemm.go(ctx, coop, v_d, t1_d, seq, seq_pad, blk.attn.wv);
+                try Gemm.go(ctx, coop, v_d, t1_d, seq, seq_pad, blk.attn.wv, zeros);
                 mark(io, &t_mark, &prof.matmul_ns);
-                try Gemm.go(ctx, coop, g_d, t1_d, seq, seq_pad, blk.attn.gate);
+                try Gemm.go(ctx, coop, g_d, t1_d, seq, seq_pad, blk.attn.gate, zeros);
                 mark(io, &t_mark, &prof.matmul_ns);
             }
         }
@@ -732,7 +758,7 @@ pub fn forward(
             }
         }
         mark(io, &t_mark, &prof.attn_ns);
-        if (coop and !is_i8) {
+        if (coop and !is_i8 and !is_bf16) {
             if (att16) {
                 try ctx.opElt(.sigmoid_mul_g16, attn_d, g_d, null, h16_d, .{
                     .u0 = @intCast(seq_pad * F / 2),
@@ -756,7 +782,7 @@ pub fn forward(
                 mark(io, &t_mark, &prof.prep_ns);
                 try ctx.opI8Gemm(t1_d, blk.attn.wo.bytes, blk.attn.wo.row_scale.?, blk.attn.wo.rows, false);
             } else {
-                try Gemm.go(ctx, coop, t1_d, attn_d, seq, seq_pad, blk.attn.wo);
+                try Gemm.go(ctx, coop, t1_d, attn_d, seq, seq_pad, blk.attn.wo, zeros);
             }
         }
         mark(io, &t_mark, &prof.matmul_ns);
@@ -787,7 +813,7 @@ pub fn forward(
             .u2 = rms_ch,
             .f0 = 1e-5,
         }, seq, 1, 1);
-        const mlp_shared = coop and !is_i8 and blk.mlp.gate.scale == blk.mlp.up.scale;
+        const mlp_shared = coop and !is_i8 and !is_bf16 and blk.mlp.gate.scale == blk.mlp.up.scale;
         const mlp16 = mlp_shared and ctx.pipe_coop_c16 != .null_handle;
         if (mlp_shared) {
             try ctx.opElt(.rms_apply_mod_h16, x_d, h16_d, mv_d, rmsi_d, .{
@@ -820,13 +846,13 @@ pub fn forward(
                 try ctx.opI8Gemm(mu_d, blk.mlp.up.bytes, blk.mlp.up.row_scale.?, blk.mlp.up.rows, false);
                 mark(io, &t_mark, &prof.matmul_ns);
             } else {
-                try Gemm.go(ctx, coop, mg_d, t1_d, seq, seq_pad, blk.mlp.gate);
+                try Gemm.go(ctx, coop, mg_d, t1_d, seq, seq_pad, blk.mlp.gate, zeros);
                 mark(io, &t_mark, &prof.matmul_ns);
-                try Gemm.go(ctx, coop, mu_d, t1_d, seq, seq_pad, blk.mlp.up);
+                try Gemm.go(ctx, coop, mu_d, t1_d, seq, seq_pad, blk.mlp.up, zeros);
                 mark(io, &t_mark, &prof.matmul_ns);
             }
         }
-        if (coop and !is_i8) {
+        if (coop and !is_i8 and !is_bf16) {
             if (mlp16) {
                 try ctx.opElt(.silu_mul16, mg_d, mu_d, null, h16_d, .{
                     .u0 = @intCast(seq_pad * dit.mlp_dim / 2),
@@ -849,7 +875,7 @@ pub fn forward(
                 mark(io, &t_mark, &prof.prep_ns);
                 try ctx.opI8Gemm(t1_d, blk.mlp.down.bytes, blk.mlp.down.row_scale.?, blk.mlp.down.rows, false);
             } else {
-                try Gemm.go(ctx, coop, t1_d, mg_d, seq, seq_pad, blk.mlp.down);
+                try Gemm.go(ctx, coop, t1_d, mg_d, seq, seq_pad, blk.mlp.down, zeros);
             }
         }
         mark(io, &t_mark, &prof.matmul_ns);

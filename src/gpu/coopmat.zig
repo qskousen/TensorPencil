@@ -1310,7 +1310,14 @@ pub const subgroup_lanes: u32 = 32;
 /// `acc_h16` (f16 accumulators, converted to f32 at the C store) to fit
 /// 2 wgs/SM at <= 128 regs. acc_h16 changes accumulation NUMERICS — gate
 /// any keep on the DiT parity fixture.
-pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h16: bool, c_h16: bool) ![]align(4) u8 {
+pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h16: bool, c_h16: bool, bf16: bool) ![]align(4) u8 {
+    // bf16 mode: the A/B operands (activations + weights) are bfloat16 instead
+    // of IEEE f16 — same 16-bit storage, so the staging is a bitwise copy and
+    // only the type annotations change. Requires b_f16 (weight already 16-bit,
+    // no fp8 dequant) and f32 accumulate. ` E`/`v2E` name the A/B element type.
+    std.debug.assert(!bf16 or (b_f16 and !acc_h16 and !c_h16));
+    const E = if (bf16) "bf16" else "f16";
+    const v2E = if (bf16) "v2bf16" else "v2f16";
     // c_h16 stores C half-precision (binding 2 becomes an f16 array). Only
     // meaningful with f16 accumulators, where it is exact: the f32 store it
     // replaces was just a widening of the f16 accumulator values.
@@ -1357,9 +1364,14 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
     try em.line("OpCapability Float16", .{});
     try em.line("OpCapability VulkanMemoryModel", .{});
     try em.line("OpCapability CooperativeMatrixKHR", .{});
+    if (bf16) {
+        try em.line("OpCapability BFloat16TypeKHR", .{});
+        try em.line("OpCapability BFloat16CooperativeMatrixKHR", .{});
+    }
     try em.line("OpExtension \"SPV_KHR_cooperative_matrix\"", .{});
     try em.line("OpExtension \"SPV_KHR_vulkan_memory_model\"", .{});
     try em.line("OpExtension \"SPV_KHR_16bit_storage\"", .{});
+    if (bf16) try em.line("OpExtension \"SPV_KHR_bfloat16\"", .{});
     try em.line("OpMemoryModel Logical Vulkan", .{});
     try em.line("OpEntryPoint GLCompute %main \"main\" %gid %lid %vc %vb4 %va4 %vpush %vbsh", .{});
     try em.line("OpExecutionMode %main LocalSize 32 {d} 1", .{NWARPS});
@@ -1418,11 +1430,12 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
 
     // Workgroup slab (no layout decorations): B 2 x [32][WGN] f16 at 0,
     // A 2 x [128][32] f16 at A_BASE.
+    if (bf16) try em.line("%bf16 = OpTypeFloat 16 BFloat16KHR", .{});
     try em.line("%c_bsh_len = OpConstant %u32 {d}", .{A_BASE + 2 * A_SLAB});
-    try em.line("%t_bsh = OpTypeArray %f16 %c_bsh_len", .{});
+    try em.line("%t_bsh = OpTypeArray %{s} %c_bsh_len", .{E});
     try em.line("%ptr_wg_bsh = OpTypePointer Workgroup %t_bsh", .{});
     try em.line("%vbsh = OpVariable %ptr_wg_bsh Workgroup", .{});
-    try em.line("%ptr_wg_f16 = OpTypePointer Workgroup %f16", .{});
+    try em.line("%ptr_wg_f16 = OpTypePointer Workgroup %{s}", .{E});
 
     // Named u32 constant block (mirrors the original — note duplicate values
     // like c_u3 vs c_scope_sub are intentional and must be preserved).
@@ -1436,11 +1449,12 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
     }) |cv| try em.line("%{s} = OpConstant %u32 {d}", .{ cv[0], cv[1] });
 
     const c_acc_elem = if (acc_h16) "f16" else "f32";
-    try em.line("%mat_a = OpTypeCooperativeMatrixKHR %f16 %c_scope_sub %c_u16 %c_u16 %c_u0", .{});
-    try em.line("%mat_b = OpTypeCooperativeMatrixKHR %f16 %c_scope_sub %c_u16 %c_u16 %c_u1", .{});
+    try em.line("%mat_a = OpTypeCooperativeMatrixKHR %{s} %c_scope_sub %c_u16 %c_u16 %c_u0", .{E});
+    try em.line("%mat_b = OpTypeCooperativeMatrixKHR %{s} %c_scope_sub %c_u16 %c_u16 %c_u1", .{E});
     try em.line("%mat_c = OpTypeCooperativeMatrixKHR %{s} %c_scope_sub %c_u16 %c_u16 %c_u2", .{c_acc_elem});
     if (acc_h16 and !c_h16) try em.line("%mat_c32 = OpTypeCooperativeMatrixKHR %f32 %c_scope_sub %c_u16 %c_u16 %c_u2", .{});
     try em.line("%v2f16 = OpTypeVector %f16 2", .{});
+    if (bf16) try em.line("%v2bf16 = OpTypeVector %bf16 2", .{});
     try em.line("%c_f32_0 = OpConstant %f32 0", .{});
     if (acc_h16) try em.line("%c_f16_0 = OpConstant %f16 0", .{});
     try em.line("%c_h256 = OpConstant %f16 23552", .{}); // 0x5C00
@@ -1626,6 +1640,8 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
     const Stage = struct {
         em: *Emit,
         b_f16: bool,
+        e_type: []const u8, // A/B element: "f16" or "bf16"
+        v2_type: []const u8, // 2-vector of the above
         c_v2_256: []const u8,
         c_j: [4][]const u8,
         c_j8: [8][]const u8,
@@ -1685,10 +1701,10 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
                             const wv = e.id();
                             try e.line("%t{d} = OpCompositeExtract %u32 %t{d} {d}", .{ wv, quads[2 * i + qi], wi });
                             const hv2 = e.id();
-                            try e.line("%t{d} = OpBitcast %v2f16 %t{d}", .{ hv2, wv });
+                            try e.line("%t{d} = OpBitcast %{s} %t{d}", .{ hv2, st.v2_type, wv });
                             for (0..2) |j| {
                                 const hval = e.id();
-                                try e.line("%t{d} = OpCompositeExtract %f16 %t{d} {d}", .{ hval, hv2, j });
+                                try e.line("%t{d} = OpCompositeExtract %{s} %t{d} {d}", .{ hval, st.e_type, hv2, j });
                                 var eidx = qbase;
                                 if (wi * 2 + j > 0) {
                                     const ei = e.id();
@@ -1757,6 +1773,8 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
     const stage: Stage = .{
         .em = &em,
         .b_f16 = b_f16,
+        .e_type = E,
+        .v2_type = v2E,
         .c_v2_256 = "c_v2_256",
         .c_j = .{ "c_u0", "c_u1", "c_u2", "c_u3" },
         .c_j8 = .{ "c_u0", "c_u1", "c_u2", "c_u3", "c_u4", "c_u5", "c_u6", "c_u7" },
@@ -1769,6 +1787,8 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
     const AStage = struct {
         em: *Emit,
         aq: usize,
+        e_type: []const u8,
+        v2_type: []const u8,
         c_j: [8][]const u8,
         a_inv: [4]u32,
 
@@ -1795,10 +1815,10 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
                     const wv = e.id();
                     try e.line("%t{d} = OpCompositeExtract %u32 %t{d} {d}", .{ wv, quads[i], wi });
                     const hv2 = e.id();
-                    try e.line("%t{d} = OpBitcast %v2f16 %t{d}", .{ hv2, wv });
+                    try e.line("%t{d} = OpBitcast %{s} %t{d}", .{ hv2, st.v2_type, wv });
                     for (0..2) |j| {
                         const hval = e.id();
-                        try e.line("%t{d} = OpCompositeExtract %f16 %t{d} {d}", .{ hval, hv2, j });
+                        try e.line("%t{d} = OpCompositeExtract %{s} %t{d} {d}", .{ hval, st.e_type, hv2, j });
                         var eidx = sbase[i];
                         if (wi * 2 + j > 0) {
                             const ei = e.id();
@@ -1816,6 +1836,8 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
     const astage: AStage = .{
         .em = &em,
         .aq = AQ,
+        .e_type = E,
+        .v2_type = v2E,
         .c_j = .{ "c_u0", "c_u1", "c_u2", "c_u3", "c_u4", "c_u5", "c_u6", "c_u7" },
         .a_inv = a_inv_t,
     };

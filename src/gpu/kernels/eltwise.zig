@@ -1492,6 +1492,30 @@ export fn f32_to_h16_pad() callconv(.spirv_kernel) void {
     d.data[idx] = @bitCast(out);
 }
 
+// f32_to_bf16_pad: f32_to_h16_pad's bf16 twin for the native bf16 coop GEMM.
+// bf16 = round-to-nearest-even truncation of f32's top 16 bits (matches CUDA's
+// cvt.rn.bf16.f32). a = f32 source, d = packed bf16 pairs. u0 = out words,
+// u1 = src cols, u2 = dst cols, u3 = src rows, f0 = scale.
+export fn f32_to_bf16_pad() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const e0 = idx * 2;
+    const row = e0 / pc.u2;
+    const col = e0 % pc.u2; // u2 is even: e0+1 stays in the same row
+    var out: u32 = 0;
+    inline for (0..2) |j| {
+        const cc = col + j;
+        if (cc < pc.u1 and row < pc.u3) {
+            const bits: u32 = @bitCast(a.data[row * pc.u1 + cc] * pc.f0);
+            const rne: u32 = ((bits >> 16) & 1) +% 0x7FFF;
+            const bf: u16 = @truncate((bits +% rne) >> 16);
+            out |= @as(u32, bf) << @intCast(16 * j);
+        }
+    }
+    d.data[idx] = @bitCast(out);
+}
+
 // silu_mul_h16: fused SwiGLU gate + f16 conversion feeding the coop GEMM:
 // d[word] = pack(f16(silu(a)*b*scale)) — skips the f32 intermediate the
 // GEMM conversion would immediately re-read. Same push layout as

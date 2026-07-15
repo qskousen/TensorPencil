@@ -1086,6 +1086,7 @@ pub const ComponentTypeKHR = enum(i32) {
     uint16 = 8,
     uint32 = 9,
     uint64 = 10,
+    bfloat16 = 1000141000, // VK_COMPONENT_TYPE_BFLOAT16_KHR (SPV_KHR_bfloat16)
     _,
 };
 
@@ -1119,3 +1120,11 @@ pub const PhysicalDeviceCooperativeMatrixFeaturesKHR = extern struct {
 };
 
 pub const PfnGetPhysicalDeviceCooperativeMatrixPropertiesKHR = *const fn (PhysicalDevice, *u32, ?[*]CooperativeMatrixPropertiesKHR) callconv(.c) Result;
+
+pub const PhysicalDeviceShaderBfloat16FeaturesKHR = extern struct {
+    s_type: StructureType = @enumFromInt(1000141000), // VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR
+    p_next: ?*anyopaque = null,
+    shader_bfloat16_type: Bool32 = 0,
+    shader_bfloat16_dot_product: Bool32 = 0,
+    shader_bfloat16_cooperative_matrix: Bool32 = 0,
+};

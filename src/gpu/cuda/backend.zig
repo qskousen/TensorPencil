@@ -47,7 +47,7 @@ pub var bench_skip_rescale: bool = false;
 /// Numeric kind of a cuBLASLt matmul plan: int8 A/B → s32 D (32I compute) or
 /// f16 A/B → f32 D (32F compute, HMMA). Both are the TN case with the same
 /// layout mapping; only the data/compute/scale types differ.
-const LtKind = enum { i8, f16 };
+const LtKind = enum { i8, f16, bf16 };
 
 /// A cached cuBLASLt matmul plan for one (kind,n,m,k) shape: the operation
 /// descriptor, the three matrix layouts (no data pointer baked in), and the
@@ -335,6 +335,8 @@ pub const Backend = struct {
     mm_fn: cu.CUfunction = null,
     hgemm_mod: ?ctxmod.Module = null,
     hgemm_fn: cu.CUfunction = null,
+    hgemm_bf16_mod: ?ctxmod.Module = null, // native bf16 MMA (dense bf16 DiT)
+    hgemm_bf16_fn: cu.CUfunction = null,
     hgemm_b_mod: ?ctxmod.Module = null,
     hgemm_b_fn: cu.CUfunction = null,
     hgemm_bc16_mod: ?ctxmod.Module = null,
@@ -498,6 +500,7 @@ pub const Backend = struct {
         if (self.fused_mod) |m| m.unload(self.ctx);
         if (self.mm_mod) |m| m.unload(self.ctx);
         if (self.hgemm_mod) |m| m.unload(self.ctx);
+        if (self.hgemm_bf16_mod) |m| m.unload(self.ctx);
         if (self.hgemm_b_mod) |m| m.unload(self.ctx);
         if (self.hgemm_bc16_mod) |m| m.unload(self.ctx);
         if (self.hgemm_ao_mod) |m| m.unload(self.ctx);
@@ -1076,6 +1079,18 @@ pub const Backend = struct {
     fn cachedWeight(self: *Backend, bytes: []const u8) Error!DeviceBuffer {
         const key = @intFromPtr(bytes.ptr);
         self.use_counter += 1;
+        // A cached entry too small for `bytes` means the SAME host pointer was
+        // cached earlier as a shorter slice (e.g. a shared zero-bias buffer
+        // sliced to different GEMM widths). Returning it would read the tail out
+        // of bounds — drop it and re-upload at the larger size. Sync first: the
+        // stale buffer may still back queued reads.
+        if (self.weights.getPtr(key)) |e| if (e.db.size < bytes.len) {
+            _ = self.ctx.api.cuStreamSynchronize(self.ctx.stream);
+            const old = self.weights.fetchRemove(key).?;
+            var d = old.value.db;
+            if (old.value.pinned) self.pinned_bytes -|= d.size else self.streamed_bytes -|= d.size;
+            self.tensorDestroy(&d);
+        };
         if (self.weights.getPtr(key)) |e| {
             e.last_use = self.use_counter;
             e.awaiting_use = false; // consumed: the prefetch paid off, evictable again
@@ -1167,7 +1182,7 @@ pub const Backend = struct {
 
     fn hgemmFn(self: *Backend) Error!cu.CUfunction {
         if (self.hgemm_mod != null) return self.hgemm_fn;
-        const ptx = kernels.buildHgemm(self.gpa, false, false, false) catch return error.OutOfMemory;
+        const ptx = kernels.buildHgemm(self.gpa, false, false, false, false) catch return error.OutOfMemory;
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         self.hgemm_fn = mod.getFunction(self.ctx, "hgemm") catch return error.CudaError;
@@ -1175,9 +1190,22 @@ pub const Backend = struct {
         return self.hgemm_fn;
     }
 
+    /// Native bf16 tensor-core GEMM (dense bf16 DiT): same tiling as hgemmFn but
+    /// the MMA consumes bf16 A/B directly (f32 accumulate) — no f16 round trip.
+    /// Ampere+ (sm_80) only; callers must gate on cc_major >= 8.
+    fn hgemmBf16Fn(self: *Backend) Error!cu.CUfunction {
+        if (self.hgemm_bf16_mod != null) return self.hgemm_bf16_fn;
+        const ptx = kernels.buildHgemm(self.gpa, false, false, false, true) catch return error.OutOfMemory;
+        defer self.gpa.free(ptx);
+        var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
+        self.hgemm_bf16_fn = mod.getFunction(self.ctx, "hgemm") catch return error.CudaError;
+        self.hgemm_bf16_mod = mod;
+        return self.hgemm_bf16_fn;
+    }
+
     fn hgemmBatchedFn(self: *Backend) Error!cu.CUfunction {
         if (self.hgemm_b_mod != null) return self.hgemm_b_fn;
-        const ptx = kernels.buildHgemm(self.gpa, true, false, false) catch return error.OutOfMemory;
+        const ptx = kernels.buildHgemm(self.gpa, true, false, false, false) catch return error.OutOfMemory;
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         self.hgemm_b_fn = mod.getFunction(self.ctx, "hgemm_batched") catch return error.CudaError;
@@ -1188,7 +1216,7 @@ pub const Backend = struct {
     /// Batched hgemm with f16 C output (scores → softmax path).
     fn hgemmBatchedC16Fn(self: *Backend) Error!cu.CUfunction {
         if (self.hgemm_bc16_mod != null) return self.hgemm_bc16_fn;
-        const ptx = kernels.buildHgemm(self.gpa, true, true, false) catch return error.OutOfMemory;
+        const ptx = kernels.buildHgemm(self.gpa, true, true, false, false) catch return error.OutOfMemory;
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         self.hgemm_bc16_fn = mod.getFunction(self.ctx, "hgemm_batched_c16") catch return error.CudaError;
@@ -1200,7 +1228,7 @@ pub const Backend = struct {
     /// from S (f16) + the per-row MD table during A-staging (no P materialization).
     fn hgemmAttnOutFn(self: *Backend) Error!cu.CUfunction {
         if (self.hgemm_ao_mod != null) return self.hgemm_ao_fn;
-        const ptx = kernels.buildHgemm(self.gpa, true, false, true) catch return error.OutOfMemory;
+        const ptx = kernels.buildHgemm(self.gpa, true, false, true, false) catch return error.OutOfMemory;
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         self.hgemm_ao_fn = mod.getFunction(self.ctx, "hgemm_attnout") catch return error.CudaError;
@@ -1682,6 +1710,35 @@ pub const Backend = struct {
         try self.eltLaunch(f_bc, self.conv_c, b_db, dst, null, .{ @intCast(m * co), @intCast(co), @intCast(co_pad), @intCast(dst_off_elems), 0, 0 }, .{ 0, 0 }, m * co);
     }
 
+    /// Native bf16 GEMM: dst[m][co] f32 = src[m][k] f32 @ Wᵀ + bias, W bf16
+    /// [co][k]. The weight is fed to the bf16 tensor cores DIRECTLY from the
+    /// cached raw checkpoint bytes — no f16 conversion, so a streamed weight is
+    /// touched exactly once (DMA in, read by the MMA). Requires co%128==0 and
+    /// k%32==0 (true for every krea2 DiT block linear) so the raw [co][k] layout
+    /// is already the GEMM's B operand — no pad/transpose. Only the small
+    /// activation converts (f32→bf16) per call. Ampere+ only (bf16 MMA).
+    pub fn opGemmBf16(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: []const f32) Error!void {
+        self.ptic();
+        defer self.ptoc(.matmul);
+        std.debug.assert(w_bytes.len == co * k * 2 and bias.len == co);
+        std.debug.assert(co % 128 == 0 and k % 32 == 0); // raw weight IS the B operand
+        const m_pad = std.mem.alignForward(usize, m, 128);
+        const w_db = try self.cachedWeight(w_bytes); // raw bf16, resident, no convert
+        const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias));
+        try self.ensureDeviceBuffer(&self.conv_a16, m_pad * k * 2);
+        try self.ensureDeviceBuffer(&self.conv_c, m_pad * co * 4);
+        const f_apad = try self.eltFn(elt.f32_to_bf16_pad2d_ptx, "f32_to_bf16_pad2d");
+        try self.eltLaunch(f_apad, src, self.conv_a16, null, null, .{ @intCast(m_pad * k), @intCast(k), @intCast(m), @intCast(k), 0, 0 }, .{ 0, 0 }, m_pad * k);
+        if (self.kernels == .libs) {
+            try self.ltMatmulBf16(self.conv_c, w_db, self.conv_a16, co, m_pad, k);
+        } else {
+            const f_hg = try self.hgemmBf16Fn();
+            try self.launchHgemm(f_hg, self.conv_a16, w_db, self.conv_c, m_pad, co, k);
+        }
+        const f_bc = try self.eltFn(elt.bias_compact_ptx, "bias_compact");
+        try self.eltLaunch(f_bc, self.conv_c, b_db, dst, null, .{ @intCast(m * co), @intCast(co), @intCast(co), 0, 0, 0 }, .{ 0, 0 }, m * co);
+    }
+
     /// opConvF16's bf16-weight twin (ViT GEMMs over the mmproj's bf16
     /// tensors): dst[m][co] f32 = src[m][k] f32 @ Wᵀ + bias, W bf16 [co][k]
     /// straight from the GGUF mmap. Weight and activation convert to f16
@@ -1818,18 +1875,19 @@ pub const Backend = struct {
         const ab_type: c_int = switch (kind) {
             .i8 => cublaslt.R_8I,
             .f16 => cublaslt.R_16F,
+            .bf16 => cublaslt.R_16BF,
         };
         const d_type: c_int = switch (kind) {
             .i8 => cublaslt.R_32I,
-            .f16 => cublaslt.R_32F,
+            .f16, .bf16 => cublaslt.R_32F,
         };
         const compute: c_int = switch (kind) {
             .i8 => cublaslt.COMPUTE_32I,
-            .f16 => cublaslt.COMPUTE_32F,
+            .f16, .bf16 => cublaslt.COMPUTE_32F,
         };
         const scale: c_int = switch (kind) {
             .i8 => cublaslt.R_32I,
-            .f16 => cublaslt.R_32F,
+            .f16, .bf16 => cublaslt.R_32F,
         };
 
         const L = &self.libs.?;
@@ -1913,6 +1971,15 @@ pub const Backend = struct {
     /// used by the fp8 encoder GEMMs and the VAE convs.
     pub fn ltMatmulF16(self: *Backend, d: DeviceBuffer, w: DeviceBuffer, a: DeviceBuffer, n: usize, m: usize, k: usize) Error!void {
         const plan = try self.ltPlan(.f16, n, m, k);
+        var alpha: f32 = 1;
+        var beta: f32 = 0;
+        try self.ltRun(plan, d, w, a, @ptrCast(&alpha), @ptrCast(&beta));
+    }
+
+    /// bf16 twin of ltMatmulF16 (native bf16 GEMM, f32 accumulate): W and A are
+    /// raw bf16, D is f32.
+    pub fn ltMatmulBf16(self: *Backend, d: DeviceBuffer, w: DeviceBuffer, a: DeviceBuffer, n: usize, m: usize, k: usize) Error!void {
+        const plan = try self.ltPlan(.bf16, n, m, k);
         var alpha: f32 = 1;
         var beta: f32 = 0;
         try self.ltRun(plan, d, w, a, @ptrCast(&alpha), @ptrCast(&beta));

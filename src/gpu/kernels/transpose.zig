@@ -15,6 +15,7 @@ pub const Push = extern struct {
     rows: u32,
     cols: u32,
     stride: u32,
+    k_pad: u32, // bf16_to_f16_coopw only (the f8/f32 transposes ignore it)
 };
 
 extern var src: Words addrspace(.storage_buffer);
@@ -29,6 +30,7 @@ inline fn decorate() void {
         \\OpMemberDecorate %pt 0 Offset 0
         \\OpMemberDecorate %pt 1 Offset 4
         \\OpMemberDecorate %pt 2 Offset 8
+        \\OpMemberDecorate %pt 3 Offset 12
         \\OpDecorate %s DescriptorSet 0
         \\OpDecorate %s Binding 0
         \\OpDecorate %d DescriptorSet 0
@@ -68,4 +70,54 @@ export fn transpose_f32() callconv(.spirv_kernel) void {
     if (col >= pc.stride or k >= pc.cols) return;
     const v: u32 = if (col < pc.rows) src.w[col * pc.cols + k] else 0;
     dst.w[k * pc.stride + col] = v;
+}
+
+/// bf16 weight [rows][cols] -> f16 k-major [k_pad][stride] (the f16-weight coop
+/// GEMM layout: element (k, r) at k*stride + r, stride = n_pad = align(rows,128),
+/// k_pad = align(cols,64), both pads zeroed). Converts bf16->f16 on the GPU so
+/// the whole conversion + transpose runs at device bandwidth instead of a
+/// single CPU thread. One output u32 (two adjacent r as packed f16) per
+/// invocation. x = r-pair in [0, stride/2), y = k in [0, k_pad).
+export fn bf16_to_f16_coopw() callconv(.spirv_kernel) void {
+    decorate();
+    const rp = gpu.global_invocation_id[0];
+    const k = gpu.global_invocation_id[1];
+    if (rp * 2 >= pc.stride or k >= pc.k_pad) return;
+    var out: u32 = 0;
+    if (k < pc.cols) {
+        inline for (0..2) |j| {
+            const r = rp * 2 + j;
+            if (r < pc.rows) {
+                const idx = r * pc.cols + k; // bf16 element index
+                const bits: u32 = (src.w[idx >> 1] >> @intCast((idx & 1) * 16)) & 0xFFFF;
+                const f: f32 = @bitCast(bits << 16); // bf16 -> f32
+                const h: f16 = @floatCast(f);
+                out |= @as(u32, @as(u16, @bitCast(h))) << @intCast(16 * j);
+            }
+        }
+    }
+    dst.w[(k * pc.stride + rp * 2) >> 1] = out;
+}
+
+/// bf16 weight [rows][cols] -> bf16 k-major [k_pad][stride] (native bf16 coop
+/// GEMM). Same layout as bf16_to_f16_coopw but the 16-bit bits are copied
+/// VERBATIM (bf16 in, bf16 out) — no conversion, so the tensor cores consume
+/// the raw checkpoint values. Two adjacent r packed per output u32.
+export fn bf16_coopw() callconv(.spirv_kernel) void {
+    decorate();
+    const rp = gpu.global_invocation_id[0];
+    const k = gpu.global_invocation_id[1];
+    if (rp * 2 >= pc.stride or k >= pc.k_pad) return;
+    var out: u32 = 0;
+    if (k < pc.cols) {
+        inline for (0..2) |j| {
+            const r = rp * 2 + j;
+            if (r < pc.rows) {
+                const idx = r * pc.cols + k; // bf16 element index
+                const bits: u32 = (src.w[idx >> 1] >> @intCast((idx & 1) * 16)) & 0xFFFF;
+                out |= bits << @intCast(16 * j);
+            }
+        }
+    }
+    dst.w[(k * pc.stride + rp * 2) >> 1] = out;
 }
