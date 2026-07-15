@@ -3,6 +3,8 @@
 //! diagnostic-friendly (the Phase-1 experiment lives on top of this).
 
 const std = @import("std");
+const builtin = @import("builtin");
+const build_options = @import("build_options");
 const cu = @import("cu.zig");
 
 pub const Error = error{ CudaError, OutOfMemory, DeviceOutOfMemory };
@@ -71,6 +73,9 @@ pub const Context = struct {
     jit_log_len: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator) Error!Context {
+        // Integration tests are gated behind `-Dintegration`: fail init in test
+        // builds when it's off so the CUDA tests self-skip (they `catch SkipZigTest`).
+        if (builtin.is_test and !build_options.integration) return error.CudaError;
         _ = gpa;
         var self: Context = .{ .api = cu.Api.load() catch return error.CudaError };
         errdefer self.api.deinit();

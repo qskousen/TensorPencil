@@ -12,6 +12,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - If there is ambiguity in a request, don't guess or assume; ask for clarification.
 - When adding a new feature or fixing a bug, add unit / integration tests as appropriate.
 - Make sure all tests are still passing after working on something. If they aren't, fix it - even if the test was previously broken.
+- **Default to `zig build test` (fast, ~15s CPU unit suite). Do NOT run `zig build test -Dintegration` unless you truly need it** — it runs the GPU device tests and real-model inference tests and takes ~11 minutes. Reach for `-Dintegration` only when your change touches GPU kernels / device code or the real-model LLM/parity paths, and even then prefer narrowing with `-Dtest-filter "<substring>"`. See the Commands section for the full split.
 - Remember that the best code is often the simplest code. Tend towards simple solutions where possible, that will work for all the edge cases.
 - If the user asks for something that may cause issues, push back and get confirmation before doing it.
 - If you see existing code that may cause issues or is Band-Aid patch code, call it out and suggest a fix.
@@ -26,12 +27,15 @@ TensorPencil is a diffusion inference engine (text-to-image) plus an LLM inferen
 - `zig build` — build the executables (installs to `zig-out/bin/TensorPencil` and `zig-out/bin/tp-llm`)
 - `zig build run -- <args>` — build and run the diffusion CLI with arguments
 - `zig build run-llm -- <args>` — build and run `tp-llm`, the LLM inference CLI (see `LLM_PLAN.md`)
-- `zig build test` — run all tests (both the library module and executable module test binaries)
+- `zig build test` — run the **fast CPU unit suite** (~15s; both module test binaries). The slow integration tests are gated OFF by default (see below).
+- `zig build test -Dintegration` — run **everything**, including the GPU (CUDA/Vulkan) device tests and the real-model LLM/parity tests that load multi-GB checkpoints and run inference in Debug (~11 min). Needs a device and the `models/` checkpoints; individual tests still self-skip when their specific device/file is absent.
 - `zig build test --fuzz` — run fuzz tests (`std.testing.fuzz`)
 - `zig build -Doptimize=ReleaseFast` — optimized build (important for benchmarking inference; Debug is very slow for numeric code)
 
-To run a single test, filter at the compiler level since `zig build test` runs everything:
-- `zig test src/root.zig --test-filter "<test name substring>"`
+The `-Dintegration` gate lives in `src/test_gate.zig` (a `build_options.integration` flag): GPU `init` fails in test builds when it's off so device tests self-skip, and heavy real-model tests call `test_gate.requireModelFile`/`requireIntegration`. Gate a new slow test the same way; keep fast CPU unit tests ungated.
+
+To run a single test, filter with the build option (reuses the build cache):
+- `zig build test -Dtest-filter "<substring>"` (add `-Dintegration` for a gated test), or `zig test src/root.zig --test-filter "<substring>"` for a standalone compile.
 
 ## Architecture
 

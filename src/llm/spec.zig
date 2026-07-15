@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const qwen3 = @import("../models/qwen3.zig");
+const test_gate = @import("../test_gate.zig");
 const tokenizer_mod = @import("../tokenizer.zig");
 const engine = @import("engine.zig");
 const chat = @import("chat.zig");
@@ -993,7 +994,7 @@ test "spec matches vanilla greedy on the real model" {
     const io = std.testing.io;
     const safetensors = @import("../safetensors.zig");
     const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
-    std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
+    try test_gate.requireModelFile(io, te_path);
 
     var st = try safetensors.SafeTensors.open(gpa, io, te_path);
     defer st.deinit();
@@ -1040,7 +1041,7 @@ test "tree spec matches vanilla greedy on the real model" {
     const io = std.testing.io;
     const safetensors = @import("../safetensors.zig");
     const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
-    std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
+    try test_gate.requireModelFile(io, te_path);
 
     var st = try safetensors.SafeTensors.open(gpa, io, te_path);
     defer st.deinit();
@@ -1087,8 +1088,8 @@ test "model drafter matches vanilla greedy on the real models" {
     const safetensors = @import("../safetensors.zig");
     const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     const draft_path = "models/text_encoders/qwen_3_06b_base.safetensors";
-    std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
-    std.Io.Dir.cwd().access(io, draft_path, .{}) catch return error.SkipZigTest;
+    try test_gate.requireModelFile(io, te_path);
+    try test_gate.requireModelFile(io, draft_path);
 
     var st = try safetensors.SafeTensors.open(gpa, io, te_path);
     defer st.deinit();

@@ -112,6 +112,18 @@ pub fn build(b: *std.Build) void {
     }.f;
     linkGgml(mod, ggml_lib);
 
+    // `zig build test` runs only the fast CPU unit suite (~15 s). The slow
+    // integration tests — GPU (CUDA/Vulkan) device tests and the real-model LLM
+    // / parity tests that load multi-GB checkpoints and run inference in Debug —
+    // are gated behind `-Dintegration`. When it's off, GPU `init` fails in test
+    // builds (so GPU tests self-skip via their `catch SkipZigTest`) and the heavy
+    // model tests skip via `test_gate.requireIntegration`. Full suite:
+    // `zig build test -Dintegration` (needs a device + the models/ checkpoints).
+    const integration = b.option(bool, "integration", "Also run the slow GPU + real-model integration tests") orelse false;
+    const build_opts = b.addOptions();
+    build_opts.addOption(bool, "integration", integration);
+    mod.addImport("build_options", build_opts.createModule());
+
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
     // to the module defined above, it's sometimes preferable to split business

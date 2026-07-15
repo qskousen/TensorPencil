@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const qwen3 = @import("../models/qwen3.zig");
+const test_gate = @import("../test_gate.zig");
 const tokenizer_mod = @import("../tokenizer.zig");
 const ops = @import("../ops.zig");
 const chat = @import("chat.zig");
@@ -340,7 +341,7 @@ test "multi-turn generation continues the cache" {
     const io = std.testing.io;
     const safetensors = @import("../safetensors.zig");
     const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
-    std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
+    try test_gate.requireModelFile(io, te_path);
 
     var st = try safetensors.SafeTensors.open(gpa, io, te_path);
     defer st.deinit();
@@ -380,7 +381,7 @@ test "generation with a growing cache matches fixed capacity" {
     const io = std.testing.io;
     const safetensors = @import("../safetensors.zig");
     const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
-    std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
+    try test_gate.requireModelFile(io, te_path);
 
     var st = try safetensors.SafeTensors.open(gpa, io, te_path);
     defer st.deinit();
@@ -418,7 +419,7 @@ test "greedy generation produces valid tokens" {
     const io = std.testing.io;
     const safetensors = @import("../safetensors.zig");
     const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
-    std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
+    try test_gate.requireModelFile(io, te_path);
 
     var st = try safetensors.SafeTensors.open(gpa, io, te_path);
     defer st.deinit();

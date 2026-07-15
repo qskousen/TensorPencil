@@ -9,6 +9,8 @@
 //! whole forward pass is the planned next step.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const build_options = @import("build_options");
 pub const vk = @import("vk.zig");
 const spv = @import("spv.zig");
 const coopmat = @import("coopmat.zig");
@@ -491,6 +493,9 @@ pub const Context = struct {
     weights: std.AutoHashMapUnmanaged(usize, WeightEntry) = .empty,
 
     pub fn init(gpa: std.mem.Allocator) Error!*Context {
+        // Integration tests are gated behind `-Dintegration`: fail init in test
+        // builds when it's off so the Vulkan tests self-skip (they `catch SkipZigTest`).
+        if (builtin.is_test and !build_options.integration) return error.VulkanUnavailable;
         var lib = openVulkanLib() orelse return error.VulkanUnavailable;
         errdefer lib.close();
         const gipa = lib.lookup(vk.PfnGetInstanceProcAddr, "vkGetInstanceProcAddr") orelse

@@ -5,6 +5,7 @@ pub const taehv = @import("models/taehv.zig");
 pub const taehv_cuda = @import("models/taehv_cuda.zig");
 pub const vae_gpu = @import("models/vae_gpu.zig");
 pub const vae_cuda = @import("models/vae_cuda.zig");
+pub const vae_tiled = @import("models/vae_tiled.zig");
 pub const qwen3 = @import("models/qwen3.zig");
 pub const qwen35 = @import("models/qwen35.zig");
 pub const gemma3 = @import("models/gemma3.zig");
@@ -33,6 +34,7 @@ test {
     _ = wan_vae;
     _ = vae_gpu;
     _ = vae_cuda;
+    _ = vae_tiled;
     _ = qwen3;
     _ = qwen35;
     _ = gemma3;

@@ -2332,6 +2332,16 @@ pub const Backend = struct {
             defer self.ptoc(.attn);
             return self.opAttnCudnn(q, k, v, out, seq, n_heads, kv_heads, hd, scale);
         }
+        // A single head whose full scores plane (seq²·2 B) blows the scratch
+        // budget — the VAE mid-block attention over every latent position, tens
+        // of GB at high resolution. Tile the query dimension so the scores plane
+        // never materializes in full (the hand-PTX analogue of flash attention).
+        const mpad_full = std.mem.alignForward(usize, seq, 128);
+        if (n_heads == 1 and kv_heads == 1 and mpad_full * mpad_full * 2 > self.attn_scratch_budget) {
+            self.ptic();
+            defer self.ptoc(.attn);
+            return self.opAttnTCFlash(q, k, v, out, seq, hd, scale);
+        }
         if (self.attn_batched) {
             // sub-timed internally (attn_scores/softmax/pv + gather/scatter in .attn)
             try self.opAttnTCBatched(q, k, v, out, seq, n_heads, kv_heads, hd, scale);
@@ -2454,7 +2464,7 @@ pub const Backend = struct {
                 self.ptoc(.attn_softmax);
                 // O[gs][mpad][hd] f32 = (softmax S) @ Vtᵀ — P recomputed in-GEMM
                 self.ptic();
-                try self.launchAttnOut(f_pv, self.attn_s, self.attn_vth, self.attn_oh, self.attn_md, mpad, hd, gs, s_s, s_vt, s_o, seq32, mpad32);
+                try self.launchAttnOut(f_pv, self.attn_s, self.attn_vth, self.attn_oh, self.attn_md, mpad, hd, mpad, gs, s_s, s_vt, s_o, seq32, mpad32);
                 self.ptoc(.attn_pv);
             } else {
                 // P[gs·mpad][mpad] f16 = softmax(S) — flat over all gs heads' rows
@@ -2471,6 +2481,67 @@ pub const Backend = struct {
             try self.launch7(f_scb, .{ self.attn_oh.ptr(), out.ptr() }, .{ seq32, nh32, bh, hd32, mpad32, gs32 * seq32 * hd32, 0 }, gs * seq * hd);
             self.ptoc(.attn);
         }
+    }
+
+    /// Single-head attention with the QUERY dimension tiled (hand-PTX flash
+    /// attention). The full seq×seq scores plane never materializes: Q/K/V and O
+    /// stay resident ([mpad][hd], cheap), but scores are computed one query block
+    /// at a time (S[qb][mpad] f16 + an online-softmax {max, 1/sum} table), so the
+    /// scratch is bounded by `attn_scratch_budget` regardless of seq. Used for the
+    /// VAE mid-block attention over every latent position (seq² is tens of GB at
+    /// high resolution). Reuses the fused scores/softmax-md/attn-out kernels.
+    fn opAttnTCFlash(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, seq: usize, hd: usize, scale: f32) Error!void {
+        const mpad = std.mem.alignForward(usize, seq, 128);
+
+        // Resident single-head tiles + full O; only S/MD are query-tiled.
+        try self.ensureDeviceBuffer(&self.attn_qh, mpad * hd * 2);
+        try self.ensureDeviceBuffer(&self.attn_kh, mpad * hd * 2);
+        try self.ensureDeviceBuffer(&self.attn_vth, hd * mpad * 2);
+        try self.ensureDeviceBuffer(&self.attn_oh, mpad * hd * 4);
+
+        // Query block: the largest 128-multiple whose scores plane fits the
+        // budget (both mpad and qb are 128-multiples, so every block is full).
+        var qb: usize = (self.attn_scratch_budget / (mpad * 2)) & ~@as(usize, 127);
+        if (qb < 128) qb = 128;
+        if (qb > mpad) qb = mpad;
+        try self.ensureDeviceBuffer(&self.attn_s, qb * mpad * 2);
+        try self.ensureDeviceBuffer(&self.attn_md, qb * 8);
+
+        const f_scores = try self.hgemmBatchedC16Fn();
+        const f_pv = try self.hgemmAttnOutFn();
+        const f_sm = try self.eltFn(kernels.softmax_md_f16_ptx, "softmax_md_f16");
+        const f_gh = try self.eltFn(elt.gather_head_ptx, "gather_head");
+        const f_gvt = try self.eltFn(elt.gather_vt_ptx, "gather_vt");
+        const f_sc = try self.eltFn(elt.scatter_head_ptx, "scatter_head");
+
+        const mpad32: u32 = @intCast(mpad);
+        const seq32: u32 = @intCast(seq);
+        const hd32: u32 = @intCast(hd);
+        const s_qk: u32 = @intCast(mpad * hd);
+        const s_vt: u32 = @intCast(hd * mpad);
+        const s_o: u32 = @intCast(mpad * hd);
+        const s_s: u32 = @intCast(mpad * mpad); // per-head stride; unused at gs=1
+
+        // Gather the single head (n_heads = head = 0), padding rows seq..mpad.
+        try self.launch7(f_gh, .{ q.ptr(), self.attn_qh.ptr() }, .{ seq32, 1, 0, hd32, mpad32 * hd32, 0, 0 }, mpad * hd);
+        try self.launch7(f_gh, .{ k.ptr(), self.attn_kh.ptr() }, .{ seq32, 1, 0, hd32, mpad32 * hd32, 0, 0 }, mpad * hd);
+        try self.launch7(f_gvt, .{ v.ptr(), self.attn_vth.ptr() }, .{ seq32, 1, 0, hd32, mpad32, hd32 * mpad32, 0 }, hd * mpad);
+
+        var q0: usize = 0;
+        while (q0 < mpad) : (q0 += qb) {
+            const m = @min(qb, mpad - q0); // 128-multiple (mpad, qb both are)
+            const m32: u32 = @intCast(m);
+            const qblk = dbFromPtr(self.attn_qh.ptr() + @as(u64, q0) * hd * 2, m * hd * 2);
+            const oblk = dbFromPtr(self.attn_oh.ptr() + @as(u64, q0) * hd * 4, m * hd * 4);
+            // S[m][mpad] f16 = scale·(Qblk @ Kᵀ)  (scale prefolded in the C-store)
+            try self.launchHgemmB(f_scores, qblk, self.attn_kh, self.attn_s, m, mpad, hd, 1, s_qk, s_qk, s_s, scale);
+            // MD[m][2] f32 = {max, 1/sum} per row over valid cols 0..seq
+            try self.launchSoftmaxMd(f_sm, self.attn_s, self.attn_md, m, mpad, seq);
+            // O[m][hd] f32 = softmax(S) @ Vt  (k = mpad keys)
+            try self.launchAttnOut(f_pv, self.attn_s, self.attn_vth, oblk, self.attn_md, m, hd, mpad, 1, s_s, s_vt, s_o, seq32, m32);
+        }
+        // Scatter O rows 0..seq into out (n_heads = head = 0).
+        try self.launch7(f_sc, .{ self.attn_oh.ptr(), out.ptr() }, .{ seq32, 1, 0, hd32, seq32 * hd32, 0, 0 }, seq * hd);
     }
 
     /// Per-head attention reference (A/B against the batched path). Scratch reused
@@ -2561,12 +2632,12 @@ pub const Backend = struct {
     /// where P = exp(S-max)/sum is recomputed per element from S (f16, A operand,
     /// stride sa) + the MD table (per-row {max,1/sum}, per-head row stride mds=mpad)
     /// during A-staging. m=mpad, n=hd, k=mpad. p_scale is 1 (P is already normalized).
-    fn launchAttnOut(self: *Backend, f: cu.CUfunction, s: DeviceBuffer, vt: DeviceBuffer, o: DeviceBuffer, md: DeviceBuffer, m: usize, n: usize, gs: usize, sa: u32, sb: u32, sc: u32, seq: u32, mds: u32) Error!void {
+    fn launchAttnOut(self: *Backend, f: cu.CUfunction, s: DeviceBuffer, vt: DeviceBuffer, o: DeviceBuffer, md: DeviceBuffer, m: usize, n: usize, kk: usize, gs: usize, sa: u32, sb: u32, sc: u32, seq: u32, mds: u32) Error!void {
         var pa = s.ptr();
         var pb = vt.ptr();
         var pc = o.ptr();
         var pn: u32 = @intCast(n);
-        var pk: u32 = @intCast(m); // k = mpad = m
+        var pk: u32 = @intCast(kk); // keys (mpad); == m only for square (whole-seq) attention
         var psa = sa;
         var psb = sb;
         var psc = sc;
@@ -3484,6 +3555,80 @@ test "qwen35 attention ops match CPU reference" {
 
 fn offsetBufSizedTest(b: DeviceBuffer, off_bytes: usize, size: usize) DeviceBuffer {
     return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off_bytes), .mem = b.mem, .size = size };
+}
+
+// Query-tiled single-head attention (opAttnTCFlash, the VAE mid-block path) vs a
+// full CPU softmax reference. A tiny scratch budget forces several query blocks,
+// so the block-boundary handling is actually exercised.
+test "flash (query-tiled) attention matches CPU reference" {
+    const gpa = std.testing.allocator;
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+
+    const seq = 384; // 3 query blocks at qb=128
+    const hd = 128; // this kernel family tiles n=hd by 128 (VAE uses hd=384)
+    var prng = std.Random.DefaultPrng.init(4242);
+    const rand = prng.random();
+
+    const q = try gpa.alloc(f32, seq * hd);
+    const k = try gpa.alloc(f32, seq * hd);
+    const v = try gpa.alloc(f32, seq * hd);
+    defer gpa.free(q);
+    defer gpa.free(k);
+    defer gpa.free(v);
+    for (q) |*x| x.* = rand.floatNorm(f32);
+    for (k) |*x| x.* = rand.floatNorm(f32);
+    for (v) |*x| x.* = rand.floatNorm(f32);
+    const scale = 1.0 / @sqrt(@as(f32, hd));
+
+    // CPU reference: full (non-causal) single-head attention.
+    const ref = try gpa.alloc(f32, seq * hd);
+    defer gpa.free(ref);
+    const scores = try gpa.alloc(f32, seq);
+    defer gpa.free(scores);
+    for (0..seq) |i| {
+        var mx: f32 = -std.math.inf(f32);
+        for (0..seq) |j| {
+            var s: f32 = 0;
+            for (0..hd) |c| s += q[i * hd + c] * k[j * hd + c];
+            scores[j] = s * scale;
+            mx = @max(mx, scores[j]);
+        }
+        var den: f32 = 0;
+        for (scores) |*s| {
+            s.* = @exp(s.* - mx);
+            den += s.*;
+        }
+        for (0..hd) |c| {
+            var acc: f32 = 0;
+            for (0..seq) |j| acc += scores[j] * v[j * hd + c];
+            ref[i * hd + c] = acc / den;
+        }
+    }
+
+    const q_d = try be.tensorCreate(q.len * 4);
+    const k_d = try be.tensorCreate(k.len * 4);
+    const v_d = try be.tensorCreate(v.len * 4);
+    const out_d = try be.tensorCreate(q.len * 4);
+    defer {
+        inline for (.{ q_d, k_d, v_d, out_d }) |b| {
+            var bb = b;
+            be.tensorDestroy(&bb);
+        }
+    }
+    try be.tensorUpload(q_d, std.mem.sliceAsBytes(q));
+    try be.tensorUpload(k_d, std.mem.sliceAsBytes(k));
+    try be.tensorUpload(v_d, std.mem.sliceAsBytes(v));
+
+    const saved_budget = be.attn_scratch_budget;
+    be.attn_scratch_budget = 128 * (std.mem.alignForward(usize, seq, 128)) * 2; // force qb=128
+    defer be.attn_scratch_budget = saved_budget;
+    try be.opAttnTCFlash(q_d, k_d, v_d, out_d, seq, hd, scale);
+
+    const got = try gpa.alloc(f32, seq * hd);
+    defer gpa.free(got);
+    try be.tensorDownload(out_d, std.mem.sliceAsBytes(got));
+    for (ref, got) |e, a| try std.testing.expectApproxEqAbs(e, a, 2e-2);
 }
 
 // Gated on a CUDA device: batched flash-decode (seq_q >> 1) at hd=256

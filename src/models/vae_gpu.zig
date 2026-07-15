@@ -43,6 +43,9 @@ const Bufs = struct {
     s: DeviceBuffer = none,
     md: DeviceBuffer = none,
     pt: DeviceBuffer = none,
+    // Query-tiled (flash) attention scratch: a Q band + its P@V output band.
+    qh_band: DeviceBuffer = none,
+    o_band: DeviceBuffer = none,
 
     fn deinit(self: *Bufs, ctx: *Context) void {
         inline for (@typeInfo(Bufs).@"struct".fields) |f| {
@@ -253,36 +256,98 @@ fn attn(ctx: *Context, bufs: *Bufs, io: std.Io, gpa: std.mem.Allocator, h: usize
         .f0 = 1.0,
     }, seq_pad * c / 2, 1, 1);
 
-    // S = Q@K^T, stored f16 [seq_pad][seq_pad].
-    try ctx.ensureDeviceBuffer(&bufs.s, seq_pad * seq_pad * 2);
-    try ctx.opAttnScoresVae(bufs.s, bufs.qh, bufs.kh, .{
+    // The scores plane S is [seq_pad][seq_pad] f16 — O(seq²), tens of GB at
+    // high resolution. When it fits `flash_cap`, decode it whole; otherwise
+    // query-tile it (flash attention): S for a band of query rows at a time in
+    // a bounded [QB][seq_pad] buffer, streaming the P@V output back into the
+    // full attention buffer. Both paths use the SAME scores / two-pass softmax
+    // / P@V kernels — a band is just a smaller query grid.
+    const flash_cap: usize = 1 << 30; // 1 GiB scores plane before query-tiling
+    if (seq_pad * seq_pad * 2 <= flash_cap) {
+        try ctx.ensureDeviceBuffer(&bufs.s, seq_pad * seq_pad * 2);
+        try ctx.ensureDeviceBuffer(&bufs.pt, n * nchunks * 2 * 4);
+        try ctx.ensureDeviceBuffer(&bufs.md, seq_pad * 2 * 4);
+        // Scores over all seq_pad query tiles; softmax only the n valid rows
+        // (padding rows' P@V output is never read); P@V into bufs.u.
+        try attnScores(ctx, bufs.s, bufs.qh, bufs.kh, seq_pad, c, seq_pad);
+        try attnSoftmax(ctx, bufs.s, bufs.pt, bufs.md, n, n, seq_pad, nchunks);
+        try attnPV(ctx, bufs.s, bufs.vh, bufs.u, bufs.md, seq_pad, n, c, seq_pad);
+    } else {
+        // Largest 128-multiple band whose S fits the cap, capped at n so the
+        // softmax's rows==valid-cols coupling stays valid (band <= n).
+        const n_floor = (n / 128) * 128;
+        var qb: usize = (flash_cap / (seq_pad * 2)) & ~@as(usize, 127);
+        if (qb < 128) qb = 128;
+        if (qb > n_floor) qb = @max(128, n_floor);
+        try ctx.ensureDeviceBuffer(&bufs.s, qb * seq_pad * 2);
+        try ctx.ensureDeviceBuffer(&bufs.pt, qb * nchunks * 2 * 4);
+        try ctx.ensureDeviceBuffer(&bufs.md, qb * 2 * 4);
+        try ctx.ensureDeviceBuffer(&bufs.qh_band, qb * c * 2);
+        try ctx.ensureDeviceBuffer(&bufs.o_band, qb * c * 4);
+        var q0: usize = 0;
+        while (q0 < seq_pad) : (q0 += qb) {
+            const band = @min(qb, seq_pad - q0); // 128-multiple, <= qb <= n
+            const valid = @min(band, n -| q0); // valid query rows in this band
+            // Q band -> front of qh_band (f16 data copied as f32 words).
+            try ctx.opElt(.copy, bufs.qh, bufs.qh_band, null, null, .{
+                .u0 = @intCast(band * c / 2),
+                .u2 = 0,
+                .u3 = @intCast(q0 * c / 2),
+            }, band * c / 2, 1, 1);
+            try attnScores(ctx, bufs.s, bufs.qh_band, bufs.kh, seq_pad, c, band);
+            if (valid > 0) try attnSoftmax(ctx, bufs.s, bufs.pt, bufs.md, valid, n, seq_pad, nchunks);
+            try attnPV(ctx, bufs.s, bufs.vh, bufs.o_band, bufs.md, seq_pad, n, c, band);
+            // O band -> full attention buffer at row q0 (f32).
+            try ctx.opElt(.copy, bufs.o_band, bufs.u, null, null, .{
+                .u0 = @intCast(band * c),
+                .u2 = @intCast(q0 * c),
+                .u3 = 0,
+            }, band * c, 1, 1);
+        }
+    }
+
+    try ctx.opMatmul(bufs.v, 0, bufs.u, 0, n, std.mem.sliceAsBytes(ab.proj.w), false, c, c, 1.0, ab.proj.b);
+    try ctx.opElt(.add, bufs.x, bufs.v, null, null, .{ .u0 = @intCast(n * c) }, n * c, 1, 1);
+}
+
+/// S[grid_rows][seq_pad] f16 = scale·(Q @ Kᵀ). `qsrc` holds `grid_rows` query
+/// rows ([grid_rows][c] f16, scale prefolded); `kh` is the full k-major K.
+fn attnScores(ctx: *Context, s: DeviceBuffer, qsrc: DeviceBuffer, kh: DeviceBuffer, seq_pad: usize, c: usize, grid_rows: usize) !void {
+    try ctx.opAttnScoresVae(s, qsrc, kh, .{
         .u0 = @intCast(c),
         .u1 = @intCast(seq_pad),
         .u2 = 0,
         .u3 = 1,
         .u4 = @intCast(c * seq_pad),
         .u5 = @intCast(seq_pad * seq_pad),
-    }, seq_pad / 128, seq_pad / 128, 1);
+    }, seq_pad / 128, grid_rows / 128, 1);
+}
 
-    // Two-pass softmax -> per-row {max, 1/denom}.
-    try ctx.ensureDeviceBuffer(&bufs.pt, n * nchunks * 2 * 4);
-    try ctx.opElt(.softmax_partial, bufs.s, null, null, bufs.pt, .{
-        .u0 = @intCast(n * nchunks),
-        .u1 = nchunks,
+/// Two-pass softmax over the `n` valid key columns for `soft_rows` query rows of
+/// S ([soft_rows][seq_pad]) → per-row {max, 1/denom} in `md`. `soft_rows` must be
+/// <= n (the softmax kernel folds the row index and the valid-column count into
+/// one push field, so they must not diverge).
+fn attnSoftmax(ctx: *Context, s: DeviceBuffer, pt: DeviceBuffer, md: DeviceBuffer, soft_rows: usize, n: usize, seq_pad: usize, nchunks: usize) !void {
+    try ctx.opElt(.softmax_partial, s, null, null, pt, .{
+        .u0 = @intCast(soft_rows * nchunks),
+        .u1 = @intCast(nchunks),
         .u2 = @intCast(n),
         .u3 = @intCast(seq_pad),
         .u5 = 0,
-    }, n * nchunks, 1, 1);
-    try ctx.ensureDeviceBuffer(&bufs.md, seq_pad * 2 * 4);
-    try ctx.opElt(.softmax_combine, bufs.pt, null, null, bufs.md, .{
-        .u0 = @intCast(n),
-        .u1 = nchunks,
+    }, soft_rows * nchunks, 1, 1);
+    try ctx.opElt(.softmax_combine, pt, null, null, md, .{
+        .u0 = @intCast(soft_rows),
+        .u1 = @intCast(nchunks),
         .u2 = @intCast(n),
         .u3 = @intCast(seq_pad),
-    }, n, 1, 1);
+    }, soft_rows, 1, 1);
+}
 
-    // P@V into bufs.u (its q content was consumed by the f16 conversion).
-    try ctx.opAttnOut(bufs.s, bufs.vh, bufs.u, bufs.md, .{
+/// P@V: out[grid_rows][c] f32 = softmax(S) @ V, summing over the `n` valid keys.
+/// The 384-wide head is covered as three 128-column groups (grid.z=3) sharing
+/// the single S/MD plane.
+fn attnPV(ctx: *Context, s: DeviceBuffer, vh: DeviceBuffer, out: DeviceBuffer, md: DeviceBuffer, seq_pad: usize, n: usize, c: usize, grid_rows: usize) !void {
+    try ctx.opAttnOut(s, vh, out, md, .{
         .u0 = @intCast(seq_pad),
         .u1 = 0,
         .u2 = 0,
@@ -291,10 +356,7 @@ fn attn(ctx: *Context, bufs: *Bufs, io: std.Io, gpa: std.mem.Allocator, h: usize
         .u5 = @intCast(c),
         .f0 = @bitCast(@as(u32, @intCast(n))),
         .f1 = @bitCast(@as(u32, 0)),
-    }, seq_pad / 128, 3);
-
-    try ctx.opMatmul(bufs.v, 0, bufs.u, 0, n, std.mem.sliceAsBytes(ab.proj.w), false, c, c, 1.0, ab.proj.b);
-    try ctx.opElt(.add, bufs.x, bufs.v, null, null, .{ .u0 = @intCast(n * c) }, n * c, 1, 1);
+    }, grid_rows / 128, 3);
 }
 
 /// CPU fallback for the attention core (one qkv download + one upload).

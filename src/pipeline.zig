@@ -23,6 +23,7 @@ const taehv_mod = @import("models/taehv.zig");
 const taehv_cuda_mod = @import("models/taehv_cuda.zig");
 const vae_gpu = @import("models/vae_gpu.zig");
 const vae_cuda = @import("models/vae_cuda.zig");
+const vae_tiled = @import("models/vae_tiled.zig");
 
 /// Compute backend for the diffusion model (and, for Vulkan, the encoder + VAE):
 ///  - cpu:      everything on CPU.
@@ -129,6 +130,42 @@ const Cond = struct {
     data: []f32,
     seq: usize,
 };
+
+// --- Tiled VAE decode adapters (see models/vae_tiled.zig) ------------------
+// Each decodes a planar [16][th][tw] sub-latent to planar [3][8·th][8·tw]
+// pixels on its backend; `vae_tiled.decode` drives the tiling and feather-blends
+// the seams so decode VRAM stays bounded regardless of image size.
+
+const CudaTile = struct {
+    vae: *const wan_vae.Decoder,
+    be: *cuda.Backend,
+    fn call(self: CudaTile, gpa: std.mem.Allocator, io: std.Io, sub: []const f32, th: usize, tw: usize) anyerror![]f32 {
+        return vae_cuda.decode(self.vae, self.be, io, gpa, sub, th, tw);
+    }
+};
+
+const VkTile = struct {
+    vae: *const wan_vae.Decoder,
+    gc: *gpu_mod.Context,
+    fn call(self: VkTile, gpa: std.mem.Allocator, io: std.Io, sub: []const f32, th: usize, tw: usize) anyerror![]f32 {
+        return vae_gpu.decode(self.vae, self.gc, io, gpa, sub, th, tw);
+    }
+};
+
+const CpuTile = struct {
+    vae: *const wan_vae.Decoder,
+    fn call(self: CpuTile, gpa: std.mem.Allocator, io: std.Io, sub: []const f32, th: usize, tw: usize) anyerror![]f32 {
+        return self.vae.decode(io, gpa, sub, th, tw);
+    }
+};
+
+/// Bytes of the whole-image mid-block attention scores plane (seq = zh·zw, one
+/// head; `elem` = 2 for f16 GPU scores, 4 for f32 CPU). This term grows
+/// quadratically with image area and is what forces tiling on large images.
+fn attnPlaneBytes(zh: usize, zw: usize, elem: u64) u64 {
+    const seq: u64 = @as(u64, zh) * @as(u64, zw);
+    return seq * seq * elem;
+}
 
 /// A reusable text-to-image pipeline. `init` creates the backend and loads the
 /// text encoder, DiT, and VAE ONCE (their safetensors mappings stay open for the
@@ -455,48 +492,82 @@ pub const Session = struct {
         try note(progress, "decoding latent...\n", .{});
         const dec_start = std.Io.Clock.real.now(io);
         const vae = &self.vae;
+        // The whole-image decode is fastest and seamless, but its peak VRAM — in
+        // particular the O(seq²) mid-block attention scores plane — grows with
+        // image area and OOMs on large images. When it won't fit we decode in
+        // overlapping tiles (bounded footprint, feather-blended seams) on the GPU
+        // rather than crawling on the CPU; only if even a tile can't fit do we
+        // drop to a CPU tiled decode. See models/vae_tiled.zig.
+        const tp: vae_tiled.Params = .{};
         const planar = if (cu_be) |b| planar_blk: {
-            // Try the CUDA VAE decode; on OOM (large images), reclaim device VRAM
-            // held by another CUDA context (the GUI chat model) and retry, then
-            // fall back to a pure-CPU decode so a big image never simply fails.
+            // Whole-image decode first (fastest, seamless). The CUDA mid-block
+            // attention is bounded (hand-PTX flash on zig-cuda, cuDNN flash on
+            // libs), so this OOMs only when the conv activation buffers don't fit
+            // — then reclaim VRAM held by another CUDA context (the GUI chat
+            // model) and retry, and finally tile on the GPU.
             var attempt: usize = 0;
-            while (true) : (attempt += 1) {
+            while (attempt < 4) : (attempt += 1) {
                 if (vae_cuda.decode(vae, b, io, gpa, x, lat_h, lat_w)) |p| {
                     break :planar_blk p;
                 } else |err| switch (err) {
                     error.DeviceOutOfMemory, error.OutOfMemory => {
-                        const freed = attempt < 3 and opts.reclaim != null and
-                            opts.reclaim.?.call(opts.reclaim.?.ctx, 0);
+                        const freed = opts.reclaim != null and opts.reclaim.?.call(opts.reclaim.?.ctx, 0);
                         if (freed) {
                             b.bindThread(); // reclaim may have switched the current context
                             try note(progress, "vae decode: out of VRAM, reclaimed → retry\n", .{});
                             continue;
                         }
-                        try note(progress, "vae decode: out of VRAM → CPU decode\n", .{});
-                        const saved = ops.matmul.gpu;
-                        ops.matmul.gpu = null;
-                        defer ops.matmul.gpu = saved;
-                        break :planar_blk try vae.decode(io, gpa, x, lat_h, lat_w);
+                        break; // nothing more to reclaim → tile
                     },
                     else => return err,
                 }
             }
-        } else if (gpu_ctx) |gc|
-            vae_gpu.decode(vae, gc, io, gpa, x, lat_h, lat_w) catch |err| switch (err) {
-                // Not enough free VRAM for the decode activations. Fall back to a
-                // pure-CPU decode (buffers in system RAM), disabling GEMM offload
-                // for the duration so it can't bounce back into the same OOM.
-                error.DeviceOutOfMemory => blk: {
-                    try note(progress, "vae decode: out of VRAM, falling back to CPU decode\n", .{});
+            try note(progress, "vae decode: tiling on GPU ({d}² latent tiles)\n", .{tp.tile});
+            const ct = CudaTile{ .vae = vae, .be = b };
+            if (vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, ct, CudaTile.call)) |p| {
+                break :planar_blk p;
+            } else |err| switch (err) {
+                error.DeviceOutOfMemory, error.OutOfMemory => {
+                    try note(progress, "vae decode: GPU tiling out of VRAM → CPU tiled decode\n", .{});
                     const saved = ops.matmul.gpu;
                     ops.matmul.gpu = null;
                     defer ops.matmul.gpu = saved;
-                    break :blk try vae.decode(io, gpa, x, lat_h, lat_w);
+                    break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae }, CpuTile.call);
                 },
                 else => return err,
             }
-        else
-            try vae.decode(io, gpa, x, lat_h, lat_w);
+        } else if (gpu_ctx) |gc| planar_blk: {
+            // Whole-image decode first. The Vulkan mid-block attention is now
+            // query-tiled (flash), so this OOMs only when the conv activation
+            // buffers don't fit — then tile the whole decode on the GPU.
+            if (vae_gpu.decode(vae, gc, io, gpa, x, lat_h, lat_w)) |p| {
+                break :planar_blk p;
+            } else |err| switch (err) {
+                error.DeviceOutOfMemory => {},
+                else => return err,
+            }
+            try note(progress, "vae decode: tiling on GPU ({d}² latent tiles)\n", .{tp.tile});
+            const vt = VkTile{ .vae = vae, .gc = gc };
+            if (vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, vt, VkTile.call)) |p| {
+                break :planar_blk p;
+            } else |err| switch (err) {
+                error.DeviceOutOfMemory => {
+                    try note(progress, "vae decode: GPU tiling out of VRAM → CPU tiled decode\n", .{});
+                    const saved = ops.matmul.gpu;
+                    ops.matmul.gpu = null;
+                    defer ops.matmul.gpu = saved;
+                    break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae }, CpuTile.call);
+                },
+                else => return err,
+            }
+        } else planar_blk: {
+            // CPU-only: tile once the whole-image scores plane (f32) gets large,
+            // so a big image doesn't try to allocate tens of GB of host RAM.
+            if (attnPlaneBytes(lat_h, lat_w, 4) < (1 << 30))
+                break :planar_blk try vae.decode(io, gpa, x, lat_h, lat_w);
+            try note(progress, "vae decode: tiling on CPU\n", .{});
+            break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae }, CpuTile.call);
+        };
         defer gpa.free(planar);
         try note(progress, "decoded in {d:.1}s\n", .{@as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - dec_start.nanoseconds)) / 1e9});
 

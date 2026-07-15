@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const gguf_mod = @import("../gguf.zig");
+const test_gate = @import("../test_gate.zig");
 const weights_mod = @import("../weights.zig");
 const ops = @import("../ops.zig");
 
@@ -635,7 +636,7 @@ test "vit loads from real qwen3.6 mmproj" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const path = "/home/qt/genai/lmstudio/models/llmfan46/Qwen3.6-27B-uncensored-heretic-v2-GGUF/mmproj-Qwen3.6-27B-BF16.gguf";
-    std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
+    try test_gate.requireModelFile(io, path);
 
     var g = try Gguf.open(gpa, io, path);
     defer g.deinit();

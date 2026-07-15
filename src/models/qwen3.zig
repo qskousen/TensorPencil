@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const safetensors = @import("../safetensors.zig");
+const test_gate = @import("../test_gate.zig");
 const gguf_mod = @import("../gguf.zig");
 const weights_mod = @import("../weights.zig");
 const dtypes = @import("../dtype.zig");
@@ -664,7 +665,7 @@ test "krea2 conditioning matches comfyui" {
     const krea2_text = @import("krea2_text.zig");
     const tokenizer_mod = @import("../tokenizer.zig");
     const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
-    std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
+    try test_gate.requireModelFile(io, te_path);
     std.Io.Dir.cwd().access(io, "testdata/text_cond.bin", .{}) catch return error.SkipZigTest;
 
     var tok = try tokenizer_mod.Tokenizer.init(gpa);

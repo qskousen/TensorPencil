@@ -656,6 +656,16 @@ pub const Session = struct {
         self.taew_owned = if (p.taew) |t| (a.dupe(u8, t) catch null) else null;
         self.refreshPreview(); // taew_path follows the (possibly new) taew_owned
         self.freePendingDiffPaths();
+        // Free the resident (old-model) pipeline so the next image reloads with
+        // the new paths. Without this, a swap requested while the queue is idle
+        // repoints diff_opts but leaves the stale model loaded — the swap would
+        // never take effect (short of a new chat). Safe here: this branch only
+        // runs with no worker in flight (diff_busy false, nothing queued), so
+        // nothing is touching diff_session. deinit binds its own CUDA context.
+        if (self.diff_session.load(.acquire)) |s| {
+            s.deinit();
+            self.diff_session.store(null, .release);
+        }
         std.log.info("diffusion model switched", .{});
     }
 
@@ -1211,18 +1221,13 @@ pub const Session = struct {
         }
         const gi = self.nextPending() orelse {
             // Queue drained. KEEP the diffusion model loaded so a later (not
-            // back-to-back) gen reuses it instead of reloading — free it ONLY to
-            // apply a pending model swap (then it reloads with the new paths), or
-            // on new-chat / reload / teardown (reset/deinit). Under image priority,
-            // migrate LLM layers back into whatever room is left beside the still-
-            // resident image model (imageVramExit; no-op for chat/balanced).
-            if (self.diff_paths_pending != null) {
-                if (self.diff_session.load(.acquire)) |s| {
-                    s.deinit();
-                    self.diff_session.store(null, .release);
-                }
-                self.maybeApplyDiffPaths();
-            }
+            // back-to-back) gen reuses it instead of reloading — it's freed ONLY
+            // to apply a pending model swap (maybeApplyDiffPaths frees the stale
+            // session, so the next gen reloads with the new paths), or on new-chat
+            // / reload / teardown (reset/deinit). Under image priority, migrate
+            // LLM layers back into whatever room is left beside the still-resident
+            // image model (imageVramExit; no-op for chat/balanced).
+            self.maybeApplyDiffPaths();
             self.imageVramExit();
             return;
         };
