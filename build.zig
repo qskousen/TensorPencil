@@ -305,6 +305,18 @@ pub fn build(b: *std.Build) void {
                 }),
             });
             gui_test_step.dependOn(&b.addRunArtifact(gui_config_tests).step);
+
+            // Tool-call (`<image>…</image>`) parser unit tests. Pure std, no
+            // GUI/engine deps — kept off the default `test` step for the same
+            // reason as the config tests.
+            const gui_toolcall_tests = b.addTest(.{
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/gui/toolcall.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }),
+            });
+            gui_test_step.dependOn(&b.addRunArtifact(gui_toolcall_tests).step);
         }
     }
 

@@ -10,6 +10,7 @@ const dvui = @import("dvui");
 const SDLBackend = @import("backend");
 const tp = @import("TensorPencil");
 const chat = @import("chat.zig");
+const toolcall = @import("toolcall.zig");
 const fonts = @import("fonts.zig");
 const viewer = @import("viewer.zig");
 const config = @import("config.zig");
@@ -757,22 +758,28 @@ fn renderMessage(s: *chat.Session, m: *const chat.Message, idx: usize) void {
 }
 
 /// Add answer text to the layout with `<image>…</image>` tool-call tags hidden
-/// (the images render separately). A still-streaming, unterminated open tag
-/// hides everything from it onward.
+/// (the images render separately). Uses the same line-anchored matcher as the
+/// generation scanner (`chat.nextImageCall`), so a call that fires is exactly a
+/// call that's hidden — a casual inline mention of the tag stays visible text.
+/// A still-streaming, unterminated call hides everything from it onward.
 fn addAnswerText(tl: *dvui.TextLayoutWidget, text: []const u8) void {
-    const close = "</image>";
     var rest = text;
-    // Match the `<image` prefix (tags may carry attributes, e.g.
-    // `<image width=1024>`), mirroring the parser in chat.zig.
-    while (std.mem.indexOf(u8, rest, "<image")) |a| {
-        fonts.addRich(tl, rest[0..a]);
-        const after_open = rest[a + "<image".len ..];
-        const gt = std.mem.indexOfScalar(u8, after_open, '>') orelse return; // open tag still streaming: hide rest
-        const body = after_open[gt + 1 ..];
-        const b = std.mem.indexOf(u8, body, close) orelse return; // body still streaming: hide rest
-        rest = body[b + close.len ..];
+    while (true) {
+        switch (toolcall.nextImageCall(rest)) {
+            .none => {
+                fonts.addRich(tl, rest);
+                return;
+            },
+            .partial => |p| {
+                fonts.addRich(tl, p.text_before); // hide the still-streaming call
+                return;
+            },
+            .call => |c| {
+                fonts.addRich(tl, c.text_before);
+                rest = c.after;
+            },
+        }
     }
-    fonts.addRich(tl, rest);
 }
 
 /// Display size for an image: downscale so the longer side is `max`, never

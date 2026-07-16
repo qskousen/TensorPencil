@@ -13,6 +13,7 @@
 const std = @import("std");
 const tp = @import("TensorPencil");
 const config = @import("config.zig");
+const toolcall = @import("toolcall.zig");
 
 const qwen35 = tp.models.qwen35;
 const qwen35_cuda = tp.models.qwen35_cuda;
@@ -113,6 +114,7 @@ const image_tool_prompt =
     \\# Image generation tool
     \\You can generate images. When the user asks you to create, draw, generate, paint, or show an image, produce it by writing a tool call on its own line in EXACTLY this format:
     \\<image>a vivid, detailed description of the image</image>
+    \\Only a tool call written on its own line generates an image. You may mention the tag inline while explaining, and you may reason about it in your thoughts, without triggering anything — a generation happens ONLY when you commit to it by writing the tag on its own line in your reply.
     \\Write a rich prompt covering subject, setting, style, lighting, mood, and composition. The image is generated and shown to the user automatically. When the user asks for a change, emit a new, updated tool call.
     \\You may optionally set size/steps/seed as tag attributes when the user wants a specific aspect ratio, more detail, or a repeatable result:
     \\<image width=1024 height=1536 steps=12 seed=42>a tall portrait…</image>
@@ -1206,21 +1208,29 @@ pub const Session = struct {
     /// Extract `<image ...>PROMPT</image>` tool calls from a finished assistant
     /// message and queue a GenImage (status .pending) for each. Optional tag
     /// attributes (width/height/steps/seed) override the config defaults.
+    /// The active family's reasoning-block markers as `toolcall.Reasoning`
+    /// (null when the family can't reason), bridging `tp.llm.chat.reasoning()`
+    /// to the std-only tool-call module.
+    fn reasoningMarkers() ?toolcall.Reasoning {
+        const r = chat.reasoning() orelse return null;
+        return .{ .open = r.open, .close = r.close };
+    }
+
     fn scanImageCalls(self: *Session, msg: *Message) !void {
         const d = self.diff_opts.?;
-        const close = "</image>";
-        var rest = msg.text.items;
-        while (std.mem.indexOf(u8, rest, "<image")) |a| {
-            const after_open = rest[a + "<image".len ..];
-            const gt = std.mem.indexOfScalar(u8, after_open, '>') orelse break; // incomplete open tag
-            const attrs = after_open[0..gt];
-            const body = after_open[gt + 1 ..];
-            const b = std.mem.indexOf(u8, body, close) orelse break; // incomplete
-            const prompt = std.mem.trim(u8, body[0..b], " \n\r\t");
-            if (prompt.len > 0) {
+        // Scan only the answer, not the reasoning block, and only line-anchored
+        // tags — see toolcall.answerText/nextImageCall for why (spurious fires
+        // from the model merely *mentioning* the tag while thinking/explaining).
+        var rest = toolcall.answerText(msg.text.items, reasoningMarkers());
+        while (true) {
+            const c = switch (toolcall.nextImageCall(rest)) {
+                .none, .partial => break,
+                .call => |c| c,
+            };
+            if (c.prompt.len > 0) {
                 const gi = try self.gpa.create(GenImage);
                 gi.* = .{
-                    .prompt = try self.gpa.dupe(u8, prompt),
+                    .prompt = try self.gpa.dupe(u8, c.prompt),
                     .wake = self.wake,
                     .io = self.io,
                     .req_width = d.width,
@@ -1228,7 +1238,7 @@ pub const Session = struct {
                     .req_steps = d.steps,
                     .req_seed = 0,
                 };
-                parseGenAttrs(attrs, gi);
+                parseGenAttrs(c.attrs, gi);
                 // Assign a fresh, distinct seed now (unless the tag set one
                 // explicitly) so it's known and displayable immediately — even
                 // while the image is still queued. Advancing per image keeps
@@ -1239,7 +1249,7 @@ pub const Session = struct {
                 }
                 try msg.images.append(self.gpa, gi);
             }
-            rest = body[b + close.len ..];
+            rest = c.after;
         }
     }
 

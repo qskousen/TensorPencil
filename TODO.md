@@ -1,0 +1,13 @@
+- separate image generation mode with no llm
+- our taesd quality sucks way more than comfy, why?
+- add ability to save image to disk with parameters
+- add image copy to clipboard button
+- save window size and position in config on change (incl. image viewer, incl. maximized)
+- save thinking toggle if not already
+- toolbar cleanup: fixed width meters
+- backend switch in queue doesn't switch backend it seems like?
+- add a grid of capabilities and backends to readme (llm by model, llm quantization, diffusion by model and dtype, speculative decoding, etc.)
+- begin filling in holes in the above
+- add more sampling methods
+- tool call boxes inline, expandable to see the tool call
+- chat ui touchup because it's super ugly
