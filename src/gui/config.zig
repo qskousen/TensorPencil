@@ -32,27 +32,6 @@ pub const default_system_prompt = "You are a helpful assistant.";
 /// diffusion in the leftover VRAM; `image` evicts LLM layers to the CPU (only as
 /// many as needed) so the image model fits resident, then migrates them back
 /// once the image queue drains.
-pub const Priority = enum(u8) {
-    chat,
-    balanced,
-    image,
-
-    pub fn label(self: Priority) []const u8 {
-        return switch (self) {
-            .chat => "Chat (keep LLM resident)",
-            .balanced => "Balanced (share VRAM, no shuffling)",
-            .image => "Image generation",
-        };
-    }
-
-    fn fromStr(s: []const u8) ?Priority {
-        inline for (@typeInfo(Priority).@"enum".fields) |f| {
-            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
-        }
-        return null;
-    }
-};
-
 /// Live-preview method for image generation.
 pub const Preview = enum(u8) {
     none,
@@ -189,13 +168,13 @@ pub const Config = struct {
     width: usize = 1024,
     height: usize = 1024,
     preview: Preview = .taesd,
-    /// Max VRAM (GiB) the chat model may keep resident. 0 = auto (use the live
-    /// free VRAM at load). As the conversation grows past this, LLM layers
-    /// migrate to the CPU (see GUI_VRAM.md). Load-affecting: changing it reloads.
-    max_vram_gib: f32 = 0,
-    /// Who gets VRAM preference when chat and image generation compete. Default
-    /// `balanced` — keep as much of both resident as fits, no per-image shuffling.
-    vram_priority: Priority = .balanced,
+    /// VRAM meter policy as fractions of the whole card (the two draggable
+    /// handles; they replace the old max-VRAM cap + priority toggle). `vram_split`
+    /// is the LLM|diffusion contention boundary (the LLM's guaranteed share);
+    /// `vram_limit_frac` is the ceiling nothing allocates past. Applied LIVE (a
+    /// drag reshuffles residency on the fly) — never load-affecting.
+    vram_split: f32 = 0.60,
+    vram_limit_frac: f32 = 0.95,
     /// Compute backend for the chat LLM. Only the CUDA variants work today
     /// (non-CUDA errors cleanly at load). Changing it forces a reload.
     llm_backend: Backend = .zig_cuda,
@@ -218,7 +197,6 @@ pub const Config = struct {
     pub fn llmReloadEql(a: *const Config, b: *const Config) bool {
         return pathEql(&a.llm_model, &b.llm_model) and
             pathEql(&a.vision_tower, &b.vision_tower) and
-            a.max_vram_gib == b.max_vram_gib and
             a.llm_backend == b.llm_backend;
     }
 
@@ -305,10 +283,10 @@ pub const Config = struct {
             self.height = std.fmt.parseInt(usize, val, 10) catch self.height;
         } else if (std.mem.eql(u8, key, "preview")) {
             if (Preview.fromStr(val)) |p| self.preview = p;
-        } else if (std.mem.eql(u8, key, "max_vram_gib")) {
-            self.max_vram_gib = std.fmt.parseFloat(f32, val) catch self.max_vram_gib;
-        } else if (std.mem.eql(u8, key, "vram_priority")) {
-            if (Priority.fromStr(val)) |p| self.vram_priority = p;
+        } else if (std.mem.eql(u8, key, "vram_split")) {
+            self.vram_split = std.math.clamp(std.fmt.parseFloat(f32, val) catch self.vram_split, 0, 1);
+        } else if (std.mem.eql(u8, key, "vram_limit_frac")) {
+            self.vram_limit_frac = std.math.clamp(std.fmt.parseFloat(f32, val) catch self.vram_limit_frac, 0, 1);
         } else if (std.mem.eql(u8, key, "llm_backend")) {
             if (Backend.fromStr(val)) |b| self.llm_backend = b;
         } else if (std.mem.eql(u8, key, "diff_backend")) {
@@ -346,8 +324,8 @@ pub const Config = struct {
             \\width = {d}
             \\height = {d}
             \\preview = {s}
-            \\max_vram_gib = {d}
-            \\vram_priority = {s}
+            \\vram_split = {d}
+            \\vram_limit_frac = {d}
             \\llm_backend = {s}
             \\diff_backend = {s}
             \\vae_decode = {s}
@@ -360,7 +338,7 @@ pub const Config = struct {
             self.vae.slice(),             self.taesd.slice(),
             self.steps,                   self.width,
             self.height,                  @tagName(self.preview),
-            self.max_vram_gib,            @tagName(self.vram_priority),
+            self.vram_split,              self.vram_limit_frac,
             @tagName(self.llm_backend),   @tagName(self.diff_backend),
             @tagName(self.vae_decode),    self.reasoning,
             prompt_esc,
@@ -440,14 +418,16 @@ test "default system prompt is populated on a fresh Config" {
     try std.testing.expectEqualStrings(default_system_prompt, cfg.system_prompt.slice());
 }
 
-test "apply parses max_vram_gib and vram_priority" {
+test "apply parses vram meter fractions, clamps to [0,1], tolerates junk" {
     var cfg: Config = .{};
-    cfg.apply("max_vram_gib", "12.5");
-    cfg.apply("vram_priority", "image");
-    try std.testing.expectEqual(@as(f32, 12.5), cfg.max_vram_gib);
-    try std.testing.expectEqual(Priority.image, cfg.vram_priority);
-    cfg.apply("vram_priority", "bogus"); // unchanged on junk
-    try std.testing.expectEqual(Priority.image, cfg.vram_priority);
+    cfg.apply("vram_split", "0.5");
+    cfg.apply("vram_limit_frac", "0.8");
+    try std.testing.expectEqual(@as(f32, 0.5), cfg.vram_split);
+    try std.testing.expectEqual(@as(f32, 0.8), cfg.vram_limit_frac);
+    cfg.apply("vram_limit_frac", "1.7"); // clamped to 1
+    try std.testing.expectEqual(@as(f32, 1.0), cfg.vram_limit_frac);
+    cfg.apply("vram_split", "junk"); // unchanged on junk
+    try std.testing.expectEqual(@as(f32, 0.5), cfg.vram_split);
 }
 
 test "apply parses backends and vae_decode, tolerates junk" {
@@ -496,7 +476,7 @@ test "save/load round-trips the new backend + decode fields" {
     try std.testing.expectEqualStrings("/m.gguf", b.llm_model.opt().?);
 }
 
-test "llmReloadEql: LLM/vision/VRAM force reload; diff + live fields don't" {
+test "llmReloadEql: LLM/vision force reload; diff + live fields (incl. VRAM meter) don't" {
     var a: Config = .{};
     var b: Config = .{};
     a.llm_model.set("/m.gguf");
@@ -504,8 +484,11 @@ test "llmReloadEql: LLM/vision/VRAM force reload; diff + live fields don't" {
     try std.testing.expect(a.llmReloadEql(&b));
 
     // Live-only + diffusion-path changes: LLM side still equal (no LLM reload).
+    // The VRAM meter fractions apply live (offload/promote on the fly), so a
+    // change to them must NOT force a reload.
     b.steps = 40;
-    b.vram_priority = .image;
+    b.vram_split = 0.4;
+    b.vram_limit_frac = 0.8;
     b.vae.set("/vae.safetensors");
     b.diffusion_model.set("/dit.safetensors");
     try std.testing.expect(a.llmReloadEql(&b));
@@ -515,12 +498,6 @@ test "llmReloadEql: LLM/vision/VRAM force reload; diff + live fields don't" {
     b.vision_tower.set("/mmproj.gguf");
     try std.testing.expect(!a.llmReloadEql(&b));
     b.vision_tower.set("");
-    try std.testing.expect(a.llmReloadEql(&b));
-
-    // VRAM-limit change: LLM reload required.
-    b.max_vram_gib = 8;
-    try std.testing.expect(!a.llmReloadEql(&b));
-    b.max_vram_gib = 0;
     try std.testing.expect(a.llmReloadEql(&b));
 
     // LLM backend change: LLM reload required.

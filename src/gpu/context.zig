@@ -15,6 +15,8 @@ pub const vk = @import("vk.zig");
 const spv = @import("spv.zig");
 const coopmat = @import("coopmat.zig");
 const convrot = @import("../ops/convrot.zig");
+const mem_tag = @import("mem_tag.zig");
+pub const MemTag = mem_tag.MemTag;
 
 const matmul_f8_spv = @embedFile("matmul_f8_spv");
 const matmul_f32_spv = @embedFile("matmul_f32_spv");
@@ -309,6 +311,10 @@ pub const DeviceBuffer = struct {
     buf: vk.Buffer,
     mem: vk.DeviceMemory,
     size: u64,
+    /// Component attribution for the VRAM meter (set from the context's current
+    /// tag at createBuffer; read at freeDeviceBuffer). `.other` unless tagging is
+    /// active (diffusion backend only).
+    tag: MemTag = .other,
 };
 
 /// Cached device weight buffer + LRU stamp. Since the DiT walks its blocks
@@ -338,6 +344,12 @@ pub const Context = struct {
     device_heap: u32 = 0,
     /// Bytes we hold in buffers created through createBuffer.
     device_used: u64 = 0,
+    /// Per-component device-byte attribution (MEASURED, for the GUI VRAM meter);
+    /// only maintained when `track_tags` is set (diffusion backend). `mem_tag` is
+    /// applied to new device buffers; the pipeline sets it around each phase.
+    track_tags: bool = false,
+    mem_tag: MemTag = .other,
+    mem_tag_used: [MemTag.count]u64 = @splat(0),
     /// Monotonic stamp for the weight cache's LRU order.
     use_counter: u64 = 0,
     /// Test hook: when nonzero, caps the budget headroom calculation so
@@ -590,10 +602,9 @@ pub const Context = struct {
                         for (pb[0..count]) |cp| {
                             if (dump_coop_configs) {
                                 std.log.info("coopmat cfg: {d}x{d}x{d} A={s} B={s} C={s} R={s} scope={d} sat={d}", .{
-                                    cp.m_size,           cp.n_size,             cp.k_size,
-                                    componentName(cp.a_type), componentName(cp.b_type), componentName(cp.c_type),
-                                    componentName(cp.result_type), @intFromEnum(cp.scope),
-                                    @intFromBool(cp.saturating_accumulation == vk.TRUE),
+                                    cp.m_size,                     cp.n_size,                cp.k_size,
+                                    componentName(cp.a_type),      componentName(cp.b_type), componentName(cp.c_type),
+                                    componentName(cp.result_type), @intFromEnum(cp.scope),   @intFromBool(cp.saturating_accumulation == vk.TRUE),
                                 });
                             }
                             if (coop_m == 0 and cp.scope == .subgroup and cp.a_type == .float16 and cp.b_type == .float16 and
@@ -1398,8 +1409,11 @@ pub const Context = struct {
 
     fn createBuffer(self: *Context, size: u64, usage: u32, mem_flags: u32) Error!DeviceBuffer {
         while (true) {
-            if (self.createBufferRaw(size, usage, mem_flags)) |db| {
+            if (self.createBufferRaw(size, usage, mem_flags)) |db_raw| {
+                var db = db_raw;
+                db.tag = self.mem_tag;
                 self.device_used += size;
+                if (self.track_tags) self.mem_tag_used[@intFromEnum(self.mem_tag)] += size;
                 return db;
             } else |err| {
                 if (err != error.DeviceOutOfMemory) return err;
@@ -1434,6 +1448,30 @@ pub const Context = struct {
         self.d.DestroyBuffer(self.device, db.buf, null);
         self.d.FreeMemory(self.device, db.mem, null);
         self.device_used -|= db.size;
+        if (self.track_tags) self.mem_tag_used[@intFromEnum(db.tag)] -|= db.size;
+    }
+
+    /// Enable MEASURED per-component device-memory attribution (VRAM meter).
+    pub fn enableMemTags(self: *Context) void {
+        self.track_tags = true;
+    }
+
+    /// Free resident weights so the footprint fits `budget` (GUI VRAM limit
+    /// lowered while idle). Coarse: if over budget, drop the whole weight cache;
+    /// the next generation re-uploads what fits. Caller ensures no work is in
+    /// flight (DeviceWaitIdle inside evictWeights).
+    pub fn trimToBudget(self: *Context, budget: u64) void {
+        if (self.device_used <= budget) return;
+        self.evictWeights();
+    }
+    /// Set the tag applied to subsequent device allocations (pipeline brackets
+    /// each phase). Only meaningful when `track_tags` is on.
+    pub fn setMemTag(self: *Context, tag: MemTag) void {
+        self.mem_tag = tag;
+    }
+    /// Live device bytes attributed to `tag` (0 unless tagging is active).
+    pub fn memTagUsed(self: *const Context, tag: MemTag) u64 {
+        return self.mem_tag_used[@intFromEnum(tag)];
     }
 
     fn destroyHostBuffer(self: *Context, hb: *HostBuffer) void {

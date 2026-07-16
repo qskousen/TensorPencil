@@ -6,6 +6,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const cu = @import("cu.zig");
+const mem_tag = @import("../mem_tag.zig");
+pub const MemTag = mem_tag.MemTag;
 
 pub const Error = error{ CudaError, OutOfMemory, DeviceOutOfMemory };
 
@@ -16,6 +18,10 @@ const stage_slots = 4;
 pub const Buffer = struct {
     ptr: cu.CUdeviceptr = 0,
     bytes: usize = 0,
+    /// Component this allocation is attributed to (for the VRAM meter). Set from
+    /// the context's current tag at alloc; read back at free. `.other` unless
+    /// tagging is active (diffusion backend only).
+    tag: MemTag = .other,
 
     pub fn isNull(self: Buffer) bool {
         return self.ptr == 0;
@@ -63,6 +69,14 @@ pub const Context = struct {
     clock_khz: c_int = 0,
 
     device_used: usize = 0,
+
+    /// Per-component device-byte attribution (MEASURED, for the GUI VRAM meter).
+    /// Only maintained when `track_tags` is set (diffusion backend) so the LLM
+    /// allocator hot path is untouched. `mem_tag` is the tag applied to new
+    /// allocations; the pipeline sets it around each phase (encode/denoise/decode).
+    track_tags: bool = false,
+    mem_tag: MemTag = .other,
+    mem_tag_used: [MemTag.count]usize = @splat(0),
 
     /// Physical-chunk granularity for VMM growable buffers (bytes, typically
     /// 2 MB); 0 when the driver lacks the VMM entry points.
@@ -168,7 +182,7 @@ pub const Context = struct {
     pub fn registerHost(self: *Context, bytes: []const u8) bool {
         const rc = std.os.linux.mprotect(bytes.ptr, bytes.len, .{ .READ = true, .WRITE = true });
         if (std.posix.errno(rc) != .SUCCESS) return false;
-        const p: *anyopaque = @constCast(@ptrCast(bytes.ptr));
+        const p: *anyopaque = @ptrCast(@constCast(bytes.ptr));
         const r = self.api.cuMemHostRegister(p, bytes.len, 0);
         if (r != cu.CUDA_SUCCESS) std.debug.print("[registerHost failed: {s}]\n", .{self.api.errName(r)});
         return r == cu.CUDA_SUCCESS;
@@ -177,7 +191,7 @@ pub const Context = struct {
     /// Undo registerHost. Must run before the range is unmapped and after all
     /// DMAs from it have completed.
     pub fn unregisterHost(self: *Context, bytes: []const u8) void {
-        _ = self.api.cuMemHostUnregister(@constCast(@ptrCast(bytes.ptr)));
+        _ = self.api.cuMemHostUnregister(@ptrCast(@constCast(bytes.ptr)));
     }
 
     /// Async HtoD upload from page-locked (registered) host memory on the
@@ -271,15 +285,28 @@ pub const Context = struct {
         if (r == cu.CUDA_ERROR_OUT_OF_MEMORY) return error.DeviceOutOfMemory;
         try self.check(r, "cuMemAlloc");
         self.device_used += bytes;
-        return .{ .ptr = ptr, .bytes = bytes };
+        if (self.track_tags) self.mem_tag_used[@intFromEnum(self.mem_tag)] += bytes;
+        return .{ .ptr = ptr, .bytes = bytes, .tag = self.mem_tag };
     }
 
     pub fn free(self: *Context, buf: *Buffer) void {
         if (buf.ptr != 0) {
             _ = self.api.cuMemFree(buf.ptr);
             self.device_used -|= buf.bytes;
+            if (self.track_tags) self.mem_tag_used[@intFromEnum(buf.tag)] -|= buf.bytes;
         }
         buf.* = .{};
+    }
+
+    /// Set the tag applied to subsequent allocations (the pipeline brackets each
+    /// phase). Only meaningful when `track_tags` is on.
+    pub fn setMemTag(self: *Context, tag: MemTag) void {
+        self.mem_tag = tag;
+    }
+
+    /// Live device bytes attributed to `tag` (0 unless tagging is active).
+    pub fn memTagUsed(self: *const Context, tag: MemTag) u64 {
+        return self.mem_tag_used[@intFromEnum(tag)];
     }
 
     /// Live device free/total bytes (cuMemGetInfo) — sees OTHER processes'

@@ -9,11 +9,13 @@
 const std = @import("std");
 const dvui = @import("dvui");
 const chat = @import("chat.zig");
-const config = @import("config.zig");
+const diffuser = @import("diffuser.zig");
 const sysmon = @import("sysmon.zig");
+const meter = @import("meter.zig");
 
-/// Fixed bar height (logical px), reserved by the caller.
-pub const bar_height: f32 = 32;
+/// Fixed bar height (logical px), reserved by the caller. The VRAM meter row
+/// (top) plus the readout row (bottom).
+pub const bar_height: f32 = 52;
 
 /// Number of samples kept per sparkline.
 const hist_n = 48;
@@ -52,7 +54,9 @@ const sample_interval_us: i32 = 500_000;
 /// The most recent sample, rendered every frame regardless of when it was taken.
 const Sample = struct {
     cpu: f32 = 0,
+    cpu_mhz: f32 = 0,
     gpu_util: f32 = 0,
+    gpu_mhz: u32 = 0,
     vram_used: u64 = 0,
     vram_total: u64 = 0,
     have_gpu: bool = false,
@@ -65,7 +69,6 @@ const Sample = struct {
     diffusing: bool = false,
     diff_used: u64 = 0, // resident diffusion VRAM (the diffusion backend's device_used)
     limit: u64 = 0,
-    priority: config.Priority = .chat,
 };
 var cur: Sample = .{};
 
@@ -77,35 +80,34 @@ pub fn deinit() void {
 
 /// Take a fresh sample of every meter into `cur` and push the time-series rings.
 /// Called on the timer cadence, not per frame.
-fn sampleInto(s: ?*chat.Session) void {
+fn sampleInto(s: ?*chat.Session, diff_busy: bool, diff_used: u64) void {
     var n: Sample = .{};
     n.cpu = cpu_meter.sample();
+    n.cpu_mhz = sysmon.cpuFreqMhz();
     if (nvml) |*nv| if (nv.query()) |g| {
         n.gpu_util = @floatFromInt(g.util);
+        n.gpu_mhz = g.clock_mhz;
         n.vram_used = g.mem_used;
         n.vram_total = g.mem_total;
         n.have_gpu = true;
     };
+    // Diffusion state comes from the app-level engine (not the session).
+    n.diffusing = diff_busy;
+    n.diff_used = diff_used; // accurate resident diffusion VRAM (backend device_used)
     if (s) |sess| {
         n.has_session = true;
         n.llm_used = sess.be.deviceUsed();
         n.limit = sess.vram_limit; // the CONFIGURED cap, not the LLM's internal offload budget
-        n.priority = sess.vram_priority;
         n.ctx_tokens = sess.ctxTokens();
         n.ctx_kv = sess.ctxKvBytes();
         const res = sess.llmResidency();
         n.layers_gpu = res.gpu;
         n.layers_cpu = res.cpu;
-        n.diffusing = sess.diffusing();
         if (n.vram_total == 0) {
             const mi = sess.be.ctx.memGetInfo();
             n.vram_total = mi.total;
             n.vram_used = mi.total -| mi.free;
         }
-        // Accurate resident diffusion VRAM (the diffusion backend's own
-        // device_used), not an NVML-minus-LLM proxy that would also count the
-        // desktop's VRAM.
-        n.diff_used = sess.diffVramBytes();
     }
     const totf: f32 = if (n.vram_total > 0) @floatFromInt(n.vram_total) else 0;
     h_cpu.push(n.cpu);
@@ -115,8 +117,9 @@ fn sampleInto(s: ?*chat.Session) void {
 }
 
 /// Draw the bar. `s` is the live session (null before a model loads — the bar
-/// still shows CPU/GPU/total VRAM).
-pub fn render(s: ?*chat.Session) void {
+/// still shows CPU/GPU/total VRAM). `diff_busy`/`diff_used` come from the
+/// app-level diffusion engine.
+pub fn render(s: ?*chat.Session, diff_busy: bool, diff: diffuser.VramBreakdown, split: *f32, limit: *f32, llm_armed: bool, diff_armed: bool, acts: meter.Actions) void {
     if (!nvml_tried) {
         nvml = sysmon.Nvml.open();
         nvml_tried = true;
@@ -128,65 +131,84 @@ pub fn render(s: ?*chat.Session) void {
         .min_size_content = .{ .h = bar_height },
         .color_fill = theme.fill.lerp(theme.text, 0.06),
         .background = true,
-        .padding = .{ .x = 10, .y = 4, .w = 10 },
+        .padding = .{ .x = 8, .y = 3, .w = 8 },
     });
     defer bar.deinit();
 
-    // Time-based sampling: resample only when the timer fires, then reschedule
-    // (which also sets the main loop's wait so idle frames still tick).
+    // Time-based sampling (drives the meter's total/system baseline when no LLM
+    // session is loaded to read the card from). Resample on the timer.
     if (dvui.timerDoneOrNone(bar.data().id)) {
-        sampleInto(s);
+        sampleInto(s, diff_busy, diff.total());
         dvui.timer(bar.data().id, sample_interval_us);
     }
 
-    var buf: [128]u8 = undefined;
-
-    // Time-series meters (fixed-width labels so 2→3 digit changes don't shift).
+    var top: [24]u8 = undefined;
+    var bot: [24]u8 = undefined;
+    // Left: CPU/GPU/VRAM — util% on top, clock/size beneath (a 2-row stack that
+    // matches the meter's number columns), plus a trend sparkline.
     if (cur.have_gpu) {
-        meterLabel(0, 46, std.fmt.bufPrint(&buf, "GPU {d:.0}%", .{cur.gpu_util}) catch "GPU");
-        spark(1, &h_gpu, .{ .r = 120, .g = 200, .b = 120, .a = 235 });
+        metric(0, 72, &h_gpu, .{ .r = 120, .g = 200, .b = 120, .a = 235 }, std.fmt.bufPrint(&top, "GPU {d:.0}%", .{cur.gpu_util}) catch "GPU", std.fmt.bufPrint(&bot, "{d:.2} GHz", .{@as(f64, @floatFromInt(cur.gpu_mhz)) / 1000.0}) catch "");
     }
+    metric(6, 72, &h_cpu, .{ .r = 230, .g = 170, .b = 110, .a = 235 }, std.fmt.bufPrint(&top, "CPU {d:.0}%", .{cur.cpu}) catch "CPU", std.fmt.bufPrint(&bot, "{d:.2} GHz", .{cur.cpu_mhz / 1000.0}) catch "");
     if (cur.vram_total > 0) {
-        meterLabel(2, 104, std.fmt.bufPrint(&buf, "VRAM {d:.1}/{d:.0} GB", .{
-            @as(f64, @floatFromInt(cur.vram_used)) / gib, @as(f64, @floatFromInt(cur.vram_total)) / gib,
-        }) catch "VRAM");
-        spark(3, &h_vram, .{ .r = 110, .g = 160, .b = 230, .a = 235 });
+        metric(2, 88, &h_vram, .{ .r = 110, .g = 160, .b = 230, .a = 235 }, std.fmt.bufPrint(&top, "VRAM {d:.0}%", .{@as(f64, @floatFromInt(cur.vram_used)) / @as(f64, @floatFromInt(cur.vram_total)) * 100}) catch "VRAM", std.fmt.bufPrint(&bot, "{d:.1}/{d:.0} GB", .{ @as(f64, @floatFromInt(cur.vram_used)) / gib, @as(f64, @floatFromInt(cur.vram_total)) / gib }) catch "");
     }
-    meterLabel(6, 46, std.fmt.bufPrint(&buf, "CPU {d:.0}%", .{cur.cpu}) catch "CPU");
-    spark(7, &h_cpu, .{ .r = 230, .g = 170, .b = 110, .a = 235 });
+    sep(10);
 
-    // Session readouts (text; no sparkline — they change slowly / on generation).
-    if (cur.has_session) {
-        sep(10);
-        // LLM footprint + layer split (GPU/total; cpu = total − gpu).
-        meterLabel(11, 118, std.fmt.bufPrint(&buf, "LLM {d:.1}G · {d}/{d} gpu", .{
-            @as(f64, @floatFromInt(cur.llm_used)) / gib, cur.layers_gpu, cur.layers_gpu + cur.layers_cpu,
-        }) catch "LLM");
-        // Context length + its KV footprint.
-        var tb: [16]u8 = undefined;
-        meterLabel(12, 128, std.fmt.bufPrint(&buf, "ctx {s} tok · {d:.2}G KV", .{
-            fmtTokens(&tb, cur.ctx_tokens), @as(f64, @floatFromInt(cur.ctx_kv)) / gib,
-        }) catch "ctx");
-        // Diffusion residency (accurate: the diffusion backend's device_used),
-        // shown while the image model is loaded.
-        if (cur.diff_used > 0) {
-            meterLabel(13, 88, std.fmt.bufPrint(&buf, "diff {d:.1}G", .{@as(f64, @floatFromInt(cur.diff_used)) / gib}) catch "diff");
-        }
-    }
+    // The rest of the bar is the live VRAM meter (see meter.zig).
+    renderMeter(s, diff, split, limit, llm_armed, diff_armed, acts);
+}
 
-    // Limit + priority, pushed to the right.
-    {
-        var spb = dvui.box(@src(), .{}, .{ .expand = .horizontal });
-        spb.deinit();
+/// Build the meter model from live device accounting and draw it. Diffusion is
+/// a single segment (`dit`) for now — per-stage introspection (TE/latent/VAE)
+/// lands with the engine changes.
+fn renderMeter(s: ?*chat.Session, diff: diffuser.VramBreakdown, split: *f32, limit: *f32, llm_armed: bool, diff_armed: bool, acts: meter.Actions) void {
+    // Whole-card totals come from the SAME source as the left VRAM meter — the
+    // NVML sample — so the two always agree. (Reading the LLM context's own
+    // cuMemGetInfo here made the segments misbehave whenever a session was
+    // resident; NVML is the authoritative whole-device view.) Fall back to the
+    // context query, then a sane default, only when NVML is unavailable.
+    var total: u64 = cur.vram_total;
+    var used_all: u64 = cur.vram_used;
+    if (total == 0) {
+        if (s) |ss| {
+            const mi = ss.be.ctx.memGetInfo();
+            total = mi.total;
+            used_all = mi.total -| mi.free;
+        } else total = 24 << 30;
     }
-    if (cur.has_session) {
-        const pri = @tagName(cur.priority);
-        const txt = if (cur.limit > 0)
-            std.fmt.bufPrint(&buf, "limit {d:.1} GB · {s}", .{ @as(f64, @floatFromInt(cur.limit)) / gib, pri }) catch ""
-        else
-            std.fmt.bufPrint(&buf, "limit: auto · {s}", .{pri}) catch "";
-        dvui.label(@src(), "{s}", .{txt}, .{ .gravity_y = 0.5, .font = dvui.Font.theme(.body).withSize(12) });
-    }
+    const llm_used: u64 = if (s) |ss| ss.be.deviceUsed() else 0;
+    const ctx_b: u64 = if (s) |ss| ss.ctxKvBytes() else 0;
+    const diff_b = diff.total();
+    const system = used_all -| llm_used -| diff_b;
+    const tf: f32 = @floatFromInt(@max(total, 1));
+
+    var model: meter.Model = .{
+        .total = total,
+        .system = system,
+        .llm_w = llm_used -| ctx_b,
+        .llm_ctx = ctx_b,
+        // MEASURED per-component diffusion breakdown (see pipeline.vramBreakdown).
+        .te = diff.te,
+        .dit = diff.dit,
+        .latent = diff.latent,
+        .vae = diff.vae,
+        .split = split,
+        .limit = limit,
+        // Floors are soft UX guardrails, not hard reservations. The split can't
+        // be dragged left of the LLM's incompressible context (KV can't evict);
+        // diffusion keeps a small gap when loaded. Both are CAPPED well below the
+        // limit so a noisy byte-accounting reading can never invert the drag
+        // range and lock the handles (system VRAM is NOT counted here — it lives
+        // in the right-hand block against the ceiling, not the LLM's share).
+        .floor_llm = std.math.clamp(0.04 + @as(f32, @floatFromInt(ctx_b)) / tf, 0.04, 0.80),
+        .floor_diff = if (diff_b > 0) @as(f32, 0.04) else 0.01,
+        .llm_loaded = s != null,
+        .diff_loaded = diff_b > 0,
+        .llm_armed = llm_armed,
+        .diff_armed = diff_armed,
+    };
+    meter.render(&model, acts);
 }
 
 /// Format a token count compactly ("823", "3.2k", "128k").
@@ -195,16 +217,34 @@ fn fmtTokens(buf: []u8, n: usize) []const u8 {
     return std.fmt.bufPrint(buf, "{d}", .{n}) catch "?";
 }
 
-/// A fixed-width label for one meter (width reserved so digit-count changes
-/// don't reflow the row).
-fn meterLabel(id: usize, width: f32, text: []const u8) void {
+/// One left-hand metric: a 2-row text stack (top = util%, bottom = clock/size)
+/// beside its trend sparkline. `wtext` fixes the text column width (pick it wide
+/// enough for the max string) so digit-count changes never shift the bar.
+fn metric(id: usize, wtext: f32, ring: *const Ring, color: dvui.Color, top: []const u8, bottom: []const u8) void {
+    var box = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = id, .gravity_y = 0.5, .margin = .{ .w = 4 } });
+    defer box.deinit();
+    {
+        var txt = dvui.box(@src(), .{ .dir = .vertical }, .{
+            .gravity_y = 0.5,
+            .min_size_content = .{ .w = wtext },
+            .max_size_content = .width(wtext),
+        });
+        defer txt.deinit();
+        stackLine(0, top, false);
+        stackLine(1, bottom, true);
+    }
+    spark(id, ring, color);
+}
+
+fn stackLine(id: usize, text: []const u8, dim: bool) void {
+    const th = dvui.themeGet();
     dvui.label(@src(), "{s}", .{text}, .{
         .id_extra = id,
-        .gravity_y = 0.5,
         .gravity_x = 0.0,
-        .font = dvui.Font.theme(.body).withSize(12),
-        .min_size_content = .{ .w = width },
-        .margin = .{ .x = 2 },
+        .font = dvui.Font.theme(.body).withSize(9),
+        .padding = .{},
+        .margin = .{ .y = 1 },
+        .color_text = if (dim) th.fill.lerp(th.text, 0.45) else null,
     });
 }
 
@@ -217,7 +257,7 @@ fn sep(id: usize) void {
 fn spark(id: usize, ring: *const Ring, color: dvui.Color) void {
     var bx = dvui.box(@src(), .{}, .{
         .id_extra = id,
-        .min_size_content = .{ .w = 56, .h = 18 },
+        .min_size_content = .{ .w = 56, .h = 30 },
         .gravity_y = 0.5,
         .margin = .{ .x = 2, .w = 10 },
     });

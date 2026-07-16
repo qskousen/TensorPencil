@@ -68,6 +68,10 @@ pub const DeviceBuffer = struct {
     buf: Handle = .null_handle,
     mem: Handle = .null_handle,
     size: u64 = 0,
+    /// Component attribution for the VRAM meter (see mem_tag). Set from the
+    /// context's current tag at real allocation (tensorCreate); carried back to
+    /// the context at free (tensorDestroy). Non-owning views keep `.other`.
+    tag: ctxmod.MemTag = .other,
 
     pub fn ptr(self: DeviceBuffer) cu.CUdeviceptr {
         return @intFromEnum(self.buf);
@@ -656,7 +660,9 @@ pub const Backend = struct {
     pub fn tensorCreate(self: *Backend, size: u64) Error!DeviceBuffer {
         while (true) {
             if (self.ctx.alloc(@intCast(size))) |b| {
-                return dbFromPtr(b.ptr, size);
+                var db = dbFromPtr(b.ptr, size);
+                db.tag = b.tag; // carry the component tag for accurate free-time accounting
+                return db;
             } else |err| {
                 if (err != error.DeviceOutOfMemory) return error.CudaError;
                 // Reactive backstop: reclaim deferred-frees (blocking the oldest if
@@ -743,6 +749,28 @@ pub const Backend = struct {
     /// Total device bytes currently held (weights + KV + buffers).
     pub fn deviceUsed(self: *Backend) u64 {
         return self.ctx.device_used;
+    }
+
+    /// Enable MEASURED per-component device-memory attribution (VRAM meter). The
+    /// pipeline turns this on for the diffusion backend only; LLM decode leaves
+    /// it off so its allocator stays a plain counter.
+    pub fn enableMemTags(self: *Backend) void {
+        self.ctx.track_tags = true;
+    }
+
+    /// Free resident weights so the footprint fits `budget` (the GUI VRAM limit
+    /// lowered while idle). Coarse: if over budget, drop the whole weight cache —
+    /// the next generate() re-uploads what fits its (new) pin budget. Caller must
+    /// bind the context and ensure no worker is in flight.
+    pub fn trimToBudget(self: *Backend, budget: u64) void {
+        if (@as(u64, self.ctx.device_used) <= budget) return;
+        self.evictWeights();
+    }
+    pub fn setMemTag(self: *Backend, tag: ctxmod.MemTag) void {
+        self.ctx.setMemTag(tag);
+    }
+    pub fn memTagUsed(self: *Backend, tag: ctxmod.MemTag) u64 {
+        return self.ctx.memTagUsed(tag);
     }
 
     /// Free a specific weight's device copy — the dynamic offload scheduler
@@ -904,7 +932,7 @@ pub const Backend = struct {
 
     pub fn tensorDestroy(self: *Backend, db: *DeviceBuffer) void {
         if (db.buf != .null_handle) {
-            var b = ctxmod.Buffer{ .ptr = db.ptr(), .bytes = @intCast(db.size) };
+            var b = ctxmod.Buffer{ .ptr = db.ptr(), .bytes = @intCast(db.size), .tag = db.tag };
             self.ctx.free(&b);
         }
         db.* = .{};
@@ -1262,7 +1290,7 @@ pub const Backend = struct {
         var pyoff: u32 = @intCast(y_off / 4);
         var pxoff: u32 = @intCast(x_off / 4);
         var pg = [_]?*anyopaque{
-            @ptrCast(&py),    @ptrCast(&px),    @ptrCast(&pw),      @ptrCast(&bias_ptr),
+            @ptrCast(&py),    @ptrCast(&px),    @ptrCast(&pw),                @ptrCast(&bias_ptr),
             @ptrCast(&prows), @ptrCast(&pcols), @ptrCast(@constCast(&total)), @ptrCast(&pscale),
             @ptrCast(&pyoff), @ptrCast(&pxoff), @ptrCast(&hasbias),
         };
@@ -2688,8 +2716,8 @@ pub const Backend = struct {
         var psc = sc;
         var pscale = scale;
         var params = [_]?*anyopaque{
-            @ptrCast(&pa),  @ptrCast(&pb),  @ptrCast(&pc),  @ptrCast(&pn),
-            @ptrCast(&pk),  @ptrCast(&psa), @ptrCast(&psb), @ptrCast(&psc),
+            @ptrCast(&pa),     @ptrCast(&pb),  @ptrCast(&pc),  @ptrCast(&pn),
+            @ptrCast(&pk),     @ptrCast(&psa), @ptrCast(&psb), @ptrCast(&psc),
             @ptrCast(&pscale),
         };
         self.ctx.launch(f, .{ @intCast(n / 128), @intCast(m / 128), @intCast(gs) }, .{ 128, 1, 1 }, 0, &params) catch return error.CudaError;
@@ -2713,8 +2741,8 @@ pub const Backend = struct {
         var pseq = seq;
         var pmds = mds;
         var params = [_]?*anyopaque{
-            @ptrCast(&pa),    @ptrCast(&pb),  @ptrCast(&pc),  @ptrCast(&pn),
-            @ptrCast(&pk),    @ptrCast(&psa), @ptrCast(&psb), @ptrCast(&psc),
+            @ptrCast(&pa),     @ptrCast(&pb),  @ptrCast(&pc),   @ptrCast(&pn),
+            @ptrCast(&pk),     @ptrCast(&psa), @ptrCast(&psb),  @ptrCast(&psc),
             @ptrCast(&pscale), @ptrCast(&pmd), @ptrCast(&pseq), @ptrCast(&pmds),
         };
         self.ctx.launch(f, .{ @intCast(n / 128), @intCast(m / 128), @intCast(gs) }, .{ 128, 1, 1 }, 0, &params) catch return error.CudaError;
@@ -4241,4 +4269,3 @@ test "tree flash-decode attention matches CPU reference" {
     try be.tensorDownload(out_d, std.mem.sliceAsBytes(out));
     for (expected, out) |e, a| try std.testing.expectApproxEqAbs(e, a, 2e-4);
 }
-

@@ -5,6 +5,23 @@
 
 const std = @import("std");
 const gpu_mod = @import("gpu.zig");
+const mem_tag = @import("gpu/mem_tag.zig");
+pub const MemTag = mem_tag.MemTag;
+
+/// MEASURED per-component diffusion VRAM (bytes), for the GUI meter. `te`/`dit`/
+/// `vae` are each stage's device allocations (weights + that stage's scratch);
+/// `latent` is everything else (the latent buffer, workspace, init overhead).
+/// Sums to the diffusion backend's `deviceUsed()`.
+pub const VramBreakdown = struct {
+    te: u64 = 0,
+    dit: u64 = 0,
+    vae: u64 = 0,
+    latent: u64 = 0,
+
+    pub fn total(self: VramBreakdown) u64 {
+        return self.te + self.dit + self.vae + self.latent;
+    }
+};
 const ops = @import("ops.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const safetensors = @import("safetensors.zig");
@@ -254,6 +271,12 @@ pub const Session = struct {
         }
         errdefer if (self.cu_be) |b| b.deinit();
 
+        // MEASURED per-component VRAM attribution for the GUI meter: tag device
+        // allocations by pipeline phase (set in generate()). Diffusion-only — the
+        // LLM backend leaves this off, so its allocator hot path is untouched.
+        if (self.cu_be) |b| b.enableMemTags();
+        if (self.gpu_ctx) |c| c.enableMemTags();
+
         // Load all three models once; keep every mapping OPEN so weight pointers
         // stay valid across images. NO proactive evictWeights anywhere — the
         // encoder/DiT/VAE coexist under the default full-card budget, and a tight
@@ -288,7 +311,49 @@ pub const Session = struct {
     /// Device bytes this diffusion session's backend currently holds (weights +
     /// activations). 0 for non-CUDA backends. Read by the GUI status bar.
     pub fn deviceUsed(self: *const Session) u64 {
-        return if (self.cu_be) |b| b.deviceUsed() else 0;
+        if (self.cu_be) |b| return b.deviceUsed();
+        if (self.gpu_ctx) |c| return c.device_used;
+        return 0;
+    }
+
+    /// MEASURED per-component VRAM breakdown for the GUI meter. Reads the live
+    /// per-tag counters the allocator maintains (both CUDA and Vulkan backends).
+    /// `latent` absorbs the untagged remainder so the parts sum to `deviceUsed`.
+    pub fn vramBreakdown(self: *const Session) VramBreakdown {
+        const total = self.deviceUsed();
+        if (total == 0) return .{};
+        var te: u64 = 0;
+        var dit: u64 = 0;
+        var vae: u64 = 0;
+        if (self.cu_be) |b| {
+            te = b.memTagUsed(.te);
+            dit = b.memTagUsed(.dit);
+            vae = b.memTagUsed(.vae);
+        } else if (self.gpu_ctx) |c| {
+            te = c.memTagUsed(.te);
+            dit = c.memTagUsed(.dit);
+            vae = c.memTagUsed(.vae);
+        }
+        return .{ .te = te, .dit = dit, .vae = vae, .latent = total -| te -| dit -| vae };
+    }
+
+    /// Tag subsequent device allocations with the current pipeline phase (on
+    /// whichever backend is active). See generate().
+    fn setMemTag(self: *Session, tag: MemTag) void {
+        if (self.cu_be) |b| b.setMemTag(tag);
+        if (self.gpu_ctx) |c| c.setMemTag(tag);
+    }
+
+    /// Free resident weights to fit `budget` bytes (GUI VRAM limit lowered while
+    /// the queue is idle). The next generate() re-uploads what fits its budget.
+    /// Caller must ensure no diffusion worker is in flight.
+    pub fn trimToBudget(self: *Session, budget: u64) void {
+        if (self.cu_be) |b| {
+            b.bindThread();
+            b.trimToBudget(budget);
+        } else if (self.gpu_ctx) |c| {
+            c.trimToBudget(budget);
+        }
     }
 
     pub fn deinit(self: *Session) void {
@@ -343,7 +408,9 @@ pub const Session = struct {
         // across queued images while the encoder/VAE cycle in the leftover.
         if (cu_be) |b| b.pin_budget = 0;
 
-        // Stage 1: text encoding (reusing the resident encoder).
+        // Stage 1: text encoding (reusing the resident encoder). Tag its device
+        // allocations (encoder weights + encode scratch) as TE for the meter.
+        self.setMemTag(.te);
         const enc_start = std.Io.Clock.real.now(io);
         const cond_pos = try encodePrompt(io, gpa, gpu_ctx, cu_be, opts.encoder_f16, &self.tok, &self.enc, opts.prompt);
         defer gpa.free(cond_pos.data);
@@ -353,7 +420,7 @@ pub const Session = struct {
             null;
         defer if (cond_neg) |c| gpa.free(c.data);
         try note(progress, "encoded prompt ({d} tokens{s}) in {d:.1}s\n", .{
-            cond_pos.seq, if (use_cfg) " + negative" else "",
+            cond_pos.seq,                                                                                 if (use_cfg) " + negative" else "",
             @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - enc_start.nanoseconds)) / 1e9,
         });
 
@@ -366,12 +433,21 @@ pub const Session = struct {
         // encoder above stayed unpinned (pin_budget 0); the VAE (after the DiT
         // fills pin_budget) stays unpinned too.
         if (cu_be) |b| {
+            // Pin as much DiT as fits. `avail` is the shared budget (0 = all free
+            // VRAM). Reserve only the live activation scratch + a small margin —
+            // NOT the encoder (it's unpinned and evicts as the DiT pins), so a big
+            // reserve just leaves VRAM sitting empty.
             const avail = if (opts.vram_budget > 0) opts.vram_budget else b.ctx.memGetInfo().free;
-            const pin_reserve: u64 = 6 << 30; // encoder + activation headroom
+            const pin_reserve: u64 = b.attn_scratch_budget + (512 << 20);
             b.pin_budget = avail -| pin_reserve;
+            std.log.info("[diff-vram] budget={d}MB avail={d}MB reserve={d}MB pin={d}MB free={d}MB", .{
+                opts.vram_budget >> 20, avail >> 20, pin_reserve >> 20, b.pin_budget >> 20, b.ctx.memGetInfo().free >> 20,
+            });
         }
 
-        // Stage 2: flow-matching sampling (reusing the resident DiT).
+        // Stage 2: flow-matching sampling (reusing the resident DiT). Tag its
+        // device allocations (DiT weights + per-step scratch + latent) as DiT.
+        self.setMemTag(.dit);
         const x = try gpa.alloc(f32, lat_len);
         defer gpa.free(x);
         sampler.fillNoise(x, opts.seed);
@@ -490,6 +566,9 @@ pub const Session = struct {
 
         if (opts.cancel) |c| if (c.load(.acquire)) return error.Canceled;
 
+        // Stage 3: denormalize and decode (reusing the resident VAE). Tag its
+        // device allocations (VAE weights + decode scratch) as VAE.
+        self.setMemTag(.vae);
         // Stage 3: denormalize and decode (reusing the resident VAE). NO
         // evictWeights — the DiT stays resident for the next queued image; under
         // a tight budget the backend's LRU cache streams the overflow reactively.

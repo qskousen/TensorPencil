@@ -60,13 +60,29 @@ pub const CpuMeter = struct {
     }
 };
 
-/// A GPU snapshot: utilization percent + VRAM totals (bytes). `util` is the
-/// NVML "percent of time one or more kernels ran" over the last sample window.
+/// A GPU snapshot: utilization percent + VRAM totals (bytes) + graphics clock
+/// (MHz). `util` is the NVML "percent of time one or more kernels ran".
 pub const GpuStats = struct {
     util: u32,
     mem_used: u64,
     mem_total: u64,
+    clock_mhz: u32,
 };
+
+/// Current CPU frequency (MHz) from cpu0's cpufreq governor, 0 if unavailable
+/// (no cpufreq sysfs, e.g. some VMs). Raw syscall read, no allocation.
+pub fn cpuFreqMhz() f32 {
+    var buf: [32]u8 = undefined;
+    const fd = std.os.linux.open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", .{ .ACCMODE = .RDONLY }, 0);
+    if (std.posix.errno(fd) != .SUCCESS) return 0;
+    const ifd: i32 = @intCast(fd);
+    defer _ = std.os.linux.close(ifd);
+    const n = std.os.linux.read(ifd, &buf, buf.len);
+    if (std.posix.errno(n) != .SUCCESS or n == 0) return 0;
+    const s = std.mem.trim(u8, buf[0..@intCast(n)], " \t\r\n");
+    const khz = std.fmt.parseInt(u64, s, 10) catch return 0;
+    return @as(f32, @floatFromInt(khz)) / 1000.0; // kHz → MHz
+}
 
 // NVML C struct layouts (nvml.h). Only the fields we read.
 const NvmlUtilization = extern struct { gpu: c_uint, memory: c_uint };
@@ -81,6 +97,7 @@ pub const Nvml = struct {
     dev: NvmlDevice,
     getUtil: *const fn (NvmlDevice, *NvmlUtilization) callconv(.c) c_int,
     getMem: *const fn (NvmlDevice, *NvmlMemory) callconv(.c) c_int,
+    getClock: ?*const fn (NvmlDevice, c_uint, *c_uint) callconv(.c) c_int, // nvmlDeviceGetClockInfo (optional)
     shutdown: *const fn () callconv(.c) c_int,
 
     pub fn open() ?Nvml {
@@ -94,6 +111,7 @@ pub const Nvml = struct {
             lib.lookup(*const fn (c_uint, *NvmlDevice) callconv(.c) c_int, "nvmlDeviceGetHandleByIndex") orelse return null;
         const get_util = lib.lookup(*const fn (NvmlDevice, *NvmlUtilization) callconv(.c) c_int, "nvmlDeviceGetUtilizationRates") orelse return null;
         const get_mem = lib.lookup(*const fn (NvmlDevice, *NvmlMemory) callconv(.c) c_int, "nvmlDeviceGetMemoryInfo") orelse return null;
+        const get_clock = lib.lookup(*const fn (NvmlDevice, c_uint, *c_uint) callconv(.c) c_int, "nvmlDeviceGetClockInfo"); // optional
         const shutdown_fn = lib.lookup(*const fn () callconv(.c) c_int, "nvmlShutdown") orelse return null;
 
         if (init_fn() != 0) return null;
@@ -102,20 +120,23 @@ pub const Nvml = struct {
             _ = shutdown_fn();
             return null;
         }
-        return .{ .lib = lib, .dev = dev, .getUtil = get_util, .getMem = get_mem, .shutdown = shutdown_fn };
+        return .{ .lib = lib, .dev = dev, .getUtil = get_util, .getMem = get_mem, .getClock = get_clock, .shutdown = shutdown_fn };
     }
 
-    /// Current utilization + VRAM, or null if a query failed.
+    /// Current utilization + VRAM + graphics clock, or null if a query failed.
     pub fn query(self: *Nvml) ?GpuStats {
         var u: NvmlUtilization = undefined;
         var m: NvmlMemory = undefined;
         const uok = self.getUtil(self.dev, &u) == 0;
         const mok = self.getMem(self.dev, &m) == 0;
         if (!uok and !mok) return null;
+        var clock: c_uint = 0;
+        if (self.getClock) |gc| _ = gc(self.dev, 0, &clock); // 0 = NVML_CLOCK_GRAPHICS
         return .{
             .util = if (uok) u.gpu else 0,
             .mem_used = if (mok) @intCast(m.used) else 0,
             .mem_total = if (mok) @intCast(m.total) else 0,
+            .clock_mhz = @intCast(clock),
         };
     }
 

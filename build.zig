@@ -317,6 +317,22 @@ pub fn build(b: *std.Build) void {
                 }),
             });
             gui_test_step.dependOn(&b.addRunArtifact(gui_toolcall_tests).step);
+
+            // Diffusion-engine pure-helper tests (clampDim / parseGenAttrs /
+            // seed advance). Pulls in the TensorPencil module (for pipeline
+            // types) + known-folders (via config.zig), but stays CPU-only.
+            const gui_diffuser_tests = b.addTest(.{
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/gui/diffuser.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "TensorPencil", .module = mod },
+                        .{ .name = "known-folders", .module = kf.module("known-folders") },
+                    },
+                }),
+            });
+            gui_test_step.dependOn(&b.addRunArtifact(gui_diffuser_tests).step);
         }
     }
 

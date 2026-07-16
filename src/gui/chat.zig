@@ -14,6 +14,7 @@ const std = @import("std");
 const tp = @import("TensorPencil");
 const config = @import("config.zig");
 const toolcall = @import("toolcall.zig");
+const diffuser = @import("diffuser.zig");
 
 const qwen35 = tp.models.qwen35;
 const qwen35_cuda = tp.models.qwen35_cuda;
@@ -47,65 +48,12 @@ const Gguf = tp.Gguf;
 /// Raw decoded image (packed RGB) awaiting vision encoding.
 const RawImage = struct { rgb: []u8, width: usize, height: usize };
 
-/// A requested diffusion-model path set awaiting application (gpa-owned dupes).
-const PendingDiffPaths = struct {
-    dit: []u8,
-    vae: []u8,
-    te: []u8,
-    taew: ?[]u8,
-    backend: pipeline.Backend,
-    vae_decode: pipeline.VaeDecode,
-};
-
-/// Round to a multiple of 16 (pipeline requirement) within sane bounds.
-fn clampDim(n: usize) usize {
-    const c = std.math.clamp(n, 256, 4096);
-    return c / 16 * 16;
-}
-
-/// The LLM's dynamic-offload budget (bytes): the whole VRAM limit (or the live
-/// free VRAM when there's no limit). The LLM always loads fully into its budget
-/// when there's room — the priority split is NOT a hard reservation. Balanced's
-/// 75/25 only bites when the image model actually loads (contention), handled at
-/// image-gen time by `imageVramEnter` (offloadToBudget), not here.
-fn llmBudget(limit_bytes: u64, free_vram: u64) u64 {
-    return if (limit_bytes == 0) free_vram else limit_bytes;
-}
-
-/// Parse `key=value` tokens from an `<image ...>` tag into the GenImage.
-fn parseGenAttrs(attrs: []const u8, gi: *GenImage) void {
-    var it = std.mem.tokenizeAny(u8, attrs, " \t");
-    while (it.next()) |tok| {
-        const eq = std.mem.indexOfScalar(u8, tok, '=') orelse continue;
-        const key = tok[0..eq];
-        const val = std.mem.trim(u8, tok[eq + 1 ..], "\"'");
-        if (std.mem.eql(u8, key, "width")) {
-            if (std.fmt.parseInt(usize, val, 10)) |n| gi.req_width = clampDim(n) else |_| {}
-        } else if (std.mem.eql(u8, key, "height")) {
-            if (std.fmt.parseInt(usize, val, 10)) |n| gi.req_height = clampDim(n) else |_| {}
-        } else if (std.mem.eql(u8, key, "steps")) {
-            if (std.fmt.parseInt(usize, val, 10)) |n| gi.req_steps = std.math.clamp(n, 1, 100) else |_| {}
-        } else if (std.mem.eql(u8, key, "seed")) {
-            if (std.fmt.parseInt(u64, val, 10)) |n| gi.req_seed = n else |_| {}
-        }
-    }
-}
-
-/// Wall-clock now in nanoseconds (real-time ns fit comfortably in i64).
-fn nowNs(io: std.Io) i64 {
-    return @intCast(std.Io.Clock.real.now(io).nanoseconds);
-}
-
-fn rgbToRgba(gpa: std.mem.Allocator, rgb: []const u8, w: usize, h: usize) ![]u8 {
-    const rgba = try gpa.alloc(u8, w * h * 4);
-    for (0..w * h) |i| {
-        rgba[i * 4 + 0] = rgb[i * 3 + 0];
-        rgba[i * 4 + 1] = rgb[i * 3 + 1];
-        rgba[i * 4 + 2] = rgb[i * 3 + 2];
-        rgba[i * 4 + 3] = 255;
-    }
-    return rgba;
-}
+/// Diffusion helpers now live with the engine (see diffuser.zig). Aliased so
+/// this module and its consumers (app.zig, viewer.zig) keep their `chat.*`
+/// references working.
+const parseGenAttrs = diffuser.parseGenAttrs;
+const rgbToRgba = diffuser.rgbToRgba;
+const freeGenImage = diffuser.freeGenImage;
 
 /// Tool-only description of the `<image>…</image>` image tool. This is NOT a
 /// full system prompt — it carries no persona — and is appended to the user's
@@ -123,53 +71,9 @@ const image_tool_prompt =
 
 pub const Role = enum { user, assistant };
 
-pub const GenStatus = enum(u8) { pending, generating, done, failed, canceled };
-
-/// An image the assistant asked to generate (via a `<image>…</image>` tool
-/// call). Progress/status fields are atomics written by the diffusion worker
-/// and read by the UI thread; `rgba` is published before `status` flips to
-/// done (acquire/release), so a done image always has its pixels.
-pub const GenImage = struct {
-    prompt: []u8, // owned (gpa)
-    status: std.atomic.Value(u8) = .init(@intFromEnum(GenStatus.pending)),
-    step: std.atomic.Value(u32) = .init(0),
-    total: std.atomic.Value(u32) = .init(0),
-    rgba: ?[]u8 = null, // interleaved RGBA, [h][w][4]; gpa-owned
-    width: usize = 0,
-    height: usize = 0,
-    // Live preview (RGBA), allocated (generously) before the diffusion worker
-    // starts and overwritten in place each step — the pointer is stable for the
-    // whole generation (no fat-pointer race), byte tearing on a UI read is
-    // benign (rendered .always). Dimensions vary (latent2rgb ≈ latent res, taew
-    // ≈ 256px), published via atomics; 0 means "no preview yet".
-    preview: ?[]u8 = null,
-    preview_w: std.atomic.Value(u32) = .init(0),
-    preview_h: std.atomic.Value(u32) = .init(0),
-    /// Set by the UI's Cancel button. Polled by the diffusion pipeline between
-    /// steps (a generating image aborts) and by `nextPending` (a queued image is
-    /// dropped before it starts).
-    cancel: std.atomic.Value(bool) = .init(false),
-    wake: *const fn () void,
-    /// Clock source for the worker's timing timestamps (set at creation).
-    io: std.Io,
-    // Timing (ns, wall clock; written by the diffusion worker, read by the UI).
-    // start/done bracket the whole generation (incl. model load); first/last
-    // step bracket the sampling loop for an accurate s/step. 0 = not set yet.
-    start_ns: std.atomic.Value(i64) = .init(0),
-    first_step_ns: std.atomic.Value(i64) = .init(0),
-    last_step_ns: std.atomic.Value(i64) = .init(0),
-    done_ns: std.atomic.Value(i64) = .init(0),
-    // Requested generation params (from the tool call; defaults from config).
-    // Seed 0 means "assign a fresh one at dispatch".
-    req_width: usize = 1024,
-    req_height: usize = 1024,
-    req_steps: usize = 20,
-    req_seed: u64 = 0,
-
-    pub fn get(self: *const GenImage) GenStatus {
-        return @enumFromInt(self.status.load(.acquire));
-    }
-};
+/// Re-exported from the diffusion engine so consumers keep using `chat.*`.
+pub const GenStatus = diffuser.GenStatus;
+pub const GenImage = diffuser.GenImage;
 
 pub const Message = struct {
     role: Role,
@@ -184,41 +88,16 @@ pub const Message = struct {
 
     pub fn deinit(self: *Message, gpa: std.mem.Allocator) void {
         self.text.deinit(gpa);
-        for (self.images.items) |gi| freeGenImage(gpa, gi);
-        for (self.attachments.items) |gi| freeGenImage(gpa, gi);
+        // `images` are BORROWED (the app-level engine owns generated images and
+        // frees them); only free the ArrayList storage. `attachments` (user
+        // images) are owned here.
         self.images.deinit(gpa);
+        for (self.attachments.items) |gi| freeGenImage(gpa, gi);
         self.attachments.deinit(gpa);
     }
 };
 
-fn freeGenImage(gpa: std.mem.Allocator, gi: *GenImage) void {
-    gpa.free(gi.prompt);
-    if (gi.rgba) |r| gpa.free(r);
-    if (gi.preview) |p| gpa.free(p);
-    gpa.destroy(gi);
-}
-
-/// Diffusion configuration for the image tool (krea2 by default).
-pub const DiffConfig = struct {
-    dit_path: []const u8,
-    vae_path: []const u8,
-    text_encoder_path: []const u8,
-    steps: usize = 20,
-    width: usize = 1024,
-    height: usize = 1024,
-    backend: pipeline.Backend = .zig_cuda,
-    /// VAE decode-path override (see pipeline.VaeDecode). Default adaptive.
-    vae_decode: pipeline.VaeDecode = .auto,
-    /// 0 = auto (query live free VRAM); weights past the cap stream per step
-    /// so diffusion coexists with the resident LLM.
-    vram_budget: u64 = 0,
-    /// Optional taew2_1 approx-VAE for a sharper live preview (else latent2rgb).
-    taew_path: ?[]const u8 = null,
-    /// Show a live preview while sampling. When false, no per-step preview is
-    /// computed (the "None" preview method). When true, `taew_path` selects
-    /// TAESD vs. the built-in latent2rgb fallback.
-    preview_enabled: bool = true,
-};
+pub const DiffConfig = diffuser.DiffConfig;
 
 /// A `std.Io.Writer` sink that appends everything written to a session's
 /// `pending` queue under its mutex and wakes the UI. `iface` must be first so
@@ -260,7 +139,7 @@ const TokenSink = struct {
 pub const Options = struct {
     model_path: []const u8,
     /// Base system prompt sent at the start of every conversation. The image
-    /// tool description is appended to it when `diff` is set.
+    /// tool description is appended to it when `images_enabled` is set.
     system_prompt: []const u8 = "You are a helpful assistant.",
     /// KV window ceiling; growth commits rows lazily up to this.
     max_context: usize = 16384,
@@ -270,17 +149,20 @@ pub const Options = struct {
     /// Compute backend for the chat LLM. Only the CUDA variants are supported
     /// today; `.cpu`/`.vulkan` fail init with `error.UnsupportedLlmBackend`.
     backend: pipeline.Backend = .zig_cuda,
-    /// Image generation config; null disables the image tool.
-    diff: ?DiffConfig = null,
+    /// Whether the image tool is available (a diffusion model is configured, so
+    /// the app-level engine can render `<image>` calls). Gates the tool prompt.
+    images_enabled: bool = false,
     /// mmproj (vision tower) GGUF; enables dropping images to chat about them.
     /// Requires a CUDA backend (which this session always uses).
     mmproj_path: ?[]const u8 = null,
-    /// Max VRAM (bytes) the chat model may keep resident before layers migrate
-    /// to the CPU as context grows. 0 = auto (use the live free VRAM at load).
-    /// See GUI_VRAM.md.
-    vram_limit_bytes: u64 = 0,
-    /// Who gets VRAM preference when chat + image generation compete.
-    vram_priority: config.Priority = .chat,
+    /// VRAM meter policy, as fractions of the whole card (resolved to bytes
+    /// against the live card total at load). `vram_limit_frac` is the ceiling —
+    /// the LLM + image model never allocate past it. `vram_split` is the LLM's
+    /// guaranteed share under contention: with the image model resident the LLM
+    /// settles to this and diffusion gets the rest up to the ceiling; with
+    /// diffusion idle/unloaded the LLM borrows all the way up to the ceiling.
+    vram_split: f32 = 0.60,
+    vram_limit_frac: f32 = 0.95,
     /// Whether the model reasons (emits a thought block) before answering, for
     /// families that support it. Flipped live by the toolbar toggle; no-op for
     /// non-reasoning models. See `chat.setThinking`.
@@ -315,43 +197,25 @@ pub const Session = struct {
     gen_err: ?anyerror = null,
     sink_buf: [256]u8 = undefined,
 
-    // Image generation (null diff_opts = tool disabled). One diffusion runs at
-    // a time on its own thread + CUDA context, alongside the resident LLM.
-    diff_opts: ?pipeline.Options = null,
-    diff_seed: u64 = 0,
-    diff_busy: std.atomic.Value(bool) = .init(false),
-    diff_thread: ?std.Thread = null,
-    /// Persistent diffusion pipeline (loads the image model once and stays
-    /// resident across a queue of images, so the 2nd+ image skips the reload;
-    /// GUI_VRAM.md Phase 4). Created lazily by the first image's worker, reused
-    /// by later workers, freed when the queue drains (releasing its VRAM).
-    diff_session: std.atomic.Value(?*pipeline.Session) = .init(null),
-    /// The taew (approx-VAE) path duped at init, kept so `updateSettings` can
-    /// re-enable the TAESD preview live without re-duping (diff_opts.taew_path is
-    /// nulled when the preview method isn't TAESD). Null if none was configured.
-    taew_owned: ?[]const u8 = null,
-    /// Who wins VRAM when chat and image gen compete (see GUI_VRAM.md). Read by
-    /// the VRAM coordinator; updatable live from settings.
-    vram_priority: config.Priority = .chat,
-    /// The resolved LLM VRAM budget (bytes) — the configured limit, or the live
-    /// free VRAM when the config limit is 0 (auto). The offload scheduler keeps
-    /// LLM device usage under this.
+    // Whether the image tool is available (a diffusion model is configured).
+    // The diffusion engine itself is owned app-level (persistent across mode
+    // switches); this session only PRODUCES tool-call GenImages (scanImageCalls)
+    // into its transcript and backs the engine's VRAM coordinator (LLM layer
+    // eviction) + queue source (nextPending over the transcript). The flag gates
+    // the image-tool system prompt and the post-turn scan.
+    images_enabled: bool = false,
+    /// The LLM's dynamic-offload budget (bytes) — the ceiling it keeps device
+    /// usage under. Equals `vram_limit` (the meter's limit handle); the offload
+    /// scheduler migrates layers to the CPU once weights + KV would exceed it.
     vram_budget: u64 = 0,
-    /// The RAW configured VRAM limit (bytes; 0 = auto/no cap). Unlike
-    /// `vram_budget` this is NOT resolved to free VRAM, so it can gate whether a
-    /// cap applies. It's a SHARED ceiling: diffusion's resident-weight budget is
-    /// `vram_limit − (LLM resident)`, so LLM + image model together stay under it.
+    /// The VRAM ceiling (bytes) from the meter's limit handle: LLM + image model
+    /// together never allocate past it. Diffusion's resident-weight budget is
+    /// `vram_limit − (LLM resident)`, so the two share the space below it.
     vram_limit: u64 = 0,
-    /// Current live-preview method (derived from DiffConfig at init; updated by
-    /// settings). Kept so `refreshPreview` can set diff_opts.preview/taew_path
-    /// consistently after either a settings change or a diffusion-model swap.
-    preview_method: config.Preview = .taesd,
-    /// Backs the live diffusion path strings after a model swap (reset+re-dupe
-    /// per swap, so it doesn't grow). Initial paths point into the caller's arena.
-    diff_path_store: std.heap.ArenaAllocator = undefined,
-    /// A requested diffusion-model swap awaiting an idle image queue (in-flight +
-    /// queued images finish on the current model, then this applies). gpa-owned.
-    diff_paths_pending: ?PendingDiffPaths = null,
+    /// The LLM's guaranteed share (bytes) from the meter's split handle. Under
+    /// contention (image model resident) the LLM settles here, freeing the rest
+    /// (up to `vram_limit`) for diffusion to borrow.
+    vram_share: u64 = 0,
     /// True while LLM layers have been evicted to the CPU to make VRAM room for
     /// image generation (priority = image). Cleared once they've been promoted
     /// back (queue drained) or on a new chat.
@@ -471,37 +335,12 @@ pub const Session = struct {
         self.gen_err = null;
         self.opts.cancel = &self.cancel; // stable heap address for the worker
 
-        self.diff_busy = .init(false);
-        self.diff_thread = null;
-        self.diff_session = .init(null);
-        self.diff_seed = @truncate(cfg.seed +% 0x9E3779B97F4A7C15);
         self.attach_view = .empty;
         self.attach_rgb = .empty;
         self.turn_text = "";
         self.turn_images = .empty;
-        self.diff_opts = if (cfg.diff) |d| .{
-            .prompt = "",
-            .width = d.width,
-            .height = d.height,
-            .steps = d.steps,
-            .backend = d.backend,
-            .vae_decode = d.vae_decode,
-            .vram_budget = d.vram_budget,
-            .dit_path = d.dit_path,
-            .vae_path = d.vae_path,
-            .text_encoder_path = d.text_encoder_path,
-            .preview = d.preview_enabled, // live preview while sampling (config)
-            .taew_path = d.taew_path, // taew2_1 approx-VAE if available, else latent2rgb
-        } else null;
-        self.taew_owned = if (cfg.diff) |d| d.taew_path else null;
-        self.vram_priority = cfg.vram_priority;
-        self.preview_method = if (cfg.diff) |d| blk: {
-            if (!d.preview_enabled) break :blk config.Preview.none;
-            break :blk if (d.taew_path != null) config.Preview.taesd else config.Preview.latent2rgb;
-        } else config.Preview.none;
-        self.diff_path_store = std.heap.ArenaAllocator.init(gpa);
-        self.diff_paths_pending = null;
         self.image_evicted = false;
+        self.images_enabled = cfg.images_enabled;
 
         // Dynamic VRAM offload (GUI_VRAM.md): always arm the dynamic split (free
         // when the model fits — 0 layers on CPU, per-op decode ties the graph;
@@ -512,14 +351,17 @@ pub const Session = struct {
         // promotes every layer back to the GPU first (buildAndPrefillTurn) because
         // the host layer path uses scalar RoPE (wrong for image-grid M-RoPE).
         // budget = the configured limit, or the live free VRAM when 0 (auto).
-        self.vram_limit = cfg.vram_limit_bytes; // raw cap (0 = auto); shared with diffusion
         {
-            // The LLM loads fully into its budget (the whole limit, or free VRAM
-            // when unlimited) — the priority split is not a hard reservation. Under
-            // `balanced`, the LLM only gives up its share when the image model
-            // actually loads (imageVramEnter → offloadToBudget); until then it uses
-            // all the room it has.
-            self.vram_budget = llmBudget(cfg.vram_limit_bytes, self.be.ctx.memGetInfo().free);
+            // Resolve the meter fractions against THIS card's total VRAM. The
+            // ceiling (limit handle) is the LLM's offload budget: it loads fully
+            // up to the ceiling — the split is not a hard reservation, it only
+            // bites when the image model actually loads (imageVramEnter settles
+            // the LLM to its share then). With diffusion idle the LLM keeps
+            // everything up to the ceiling.
+            const total: f32 = @floatFromInt(self.be.ctx.memGetInfo().total);
+            self.vram_limit = @intFromFloat(cfg.vram_limit_frac * total);
+            self.vram_share = @intFromFloat(cfg.vram_split * total);
+            self.vram_budget = self.vram_limit;
             switch (self.arch) {
                 inline else => |*a| _ = a.model.autoOffload(self.vram_budget) catch |err|
                     std.log.warn("dynamic offload disabled ({t}); staying resident", .{err}),
@@ -534,7 +376,7 @@ pub const Session = struct {
         // System prompt: the configured base prompt, with the image-tool
         // description appended when the image tool is available. Prefilled on
         // the first turn (the uncached prefix of `ids`); never shown in the UI.
-        if (self.diff_opts != null) {
+        if (self.images_enabled) {
             const full = try std.fmt.allocPrint(self.gpa, "{s}\n\n{s}", .{ cfg.system_prompt, image_tool_prompt });
             defer self.gpa.free(full);
             try chat.appendSystem(&self.tok, self.gpa, full, &self.ids);
@@ -548,29 +390,12 @@ pub const Session = struct {
         return self;
     }
 
-    /// Start a fresh conversation, keeping the loaded model resident: drop all
-    /// messages/attachments, reset the KV cache, and restore `ids` to the init
-    /// prompt prefix. No-op while a turn is generating (the UI disables it then);
-    /// any in-flight or queued image generation is canceled first.
+    /// Start a fresh conversation (KV + transcript reset, LLM residency re-armed).
+    /// CONTRACT: the caller must first stop the app-level diffusion engine (join
+    /// its worker) so no diffusion thread is still touching a transcript GenImage
+    /// as this frees the messages — the session no longer owns that engine.
     pub fn reset(self: *Session) void {
         if (self.busy()) return;
-
-        // Stop and reap any diffusion so its worker can't touch the messages
-        // (and the GenImages it holds) as we free them below.
-        for (self.messages.items) |*m| {
-            for (m.images.items) |gi| gi.cancel.store(true, .release);
-        }
-        if (self.diff_thread) |t| {
-            t.join();
-            self.diff_thread = null;
-            self.diff_busy.store(false, .release);
-        }
-        // Free the resident diffusion model (binds its own CUDA context); the LLM
-        // context is re-bound below before resetResidency.
-        if (self.diff_session.load(.acquire)) |s| {
-            s.deinit();
-            self.diff_session.store(null, .release);
-        }
 
         for (self.messages.items) |*m| m.deinit(self.gpa);
         self.messages.clearRetainingCapacity();
@@ -605,7 +430,19 @@ pub const Session = struct {
     }
 
     pub fn imagesEnabled(self: *const Session) bool {
-        return self.diff_opts != null;
+        return self.images_enabled;
+    }
+
+    /// Diffusion's resident-weight budget when sharing the device with this LLM
+    /// (weights past it stream per step). Never leaves free VRAM empty:
+    ///  - auto (no configured cap): return 0 → the pipeline pins ALL free VRAM,
+    ///    filling the card beside the LLM (the LLM's share is protected by
+    ///    imageVramEnter settling it first, not by capping diffusion).
+    ///  - configured limit: cap at limit − LLM resident (the shared ceiling).
+    /// The app-level engine's VRAM coordinator calls this when an LLM is resident.
+    pub fn imageBudget(self: *Session) u64 {
+        if (self.vram_limit == 0) return 0;
+        return @max(256 << 20, self.vram_limit -| self.be.deviceUsed());
     }
 
     /// Ask the running generation to stop at the next token (no-op if idle).
@@ -613,183 +450,101 @@ pub const Session = struct {
         self.cancel.store(true, .release);
     }
 
+    /// Drop the transcript's BORROWED references to engine-owned generated
+    /// images (the pointers, not the images). The app calls this right before it
+    /// frees the diffusion engine (diffusion model cleared) so no message is
+    /// left pointing at freed memory. Text is untouched.
+    pub fn clearImageRefs(self: *Session) void {
+        for (self.messages.items) |*m| m.images.clearRetainingCapacity();
+    }
+
     /// Apply the non-load-affecting settings live (no reload, so the chat is
-    /// preserved): image-generation defaults, the preview method, and the VRAM
-    /// priority. Called on the UI thread when the user hits Apply and the model
-    /// set / VRAM limit are unchanged. The diffusion-facing fields are only
-    /// touched when no diffusion is in flight — the worker copies `diff_opts` at
-    /// spawn, so skipping a rare concurrent update avoids a torn `taew_path`.
+    /// preserved): currently just reasoning. The VRAM meter policy (split/limit)
+    /// is applied separately via `applyVramPolicy`; diffusion-facing settings go
+    /// to the app-level engine.
     pub fn updateSettings(self: *Session, cfg: *const config.Config) void {
+        _ = self;
         // Reasoning is process-global (like the family) and only shapes the
         // *next* prompt built, so flipping it mid-conversation is safe without a
         // reload — the current turn already has its ids.
         chat.setThinking(cfg.reasoning);
-        // Priority takes effect at the next image-gen contention (imageVramEnter
-        // reads it live); the LLM's budget doesn't depend on it (see llmBudget).
-        self.vram_priority = cfg.vram_priority;
-        if (self.diff_busy.load(.acquire)) return;
-        if (self.diff_opts) |*d| {
-            d.steps = cfg.steps;
-            d.width = cfg.width;
-            d.height = cfg.height;
-        }
-        self.preview_method = cfg.preview;
-        self.refreshPreview();
     }
 
-    /// Reconcile the live-preview fields of `diff_opts` with `preview_method` and
-    /// the current taew path. Called after a settings change or a diffusion-model
-    /// swap so the two derived fields stay consistent.
-    fn refreshPreview(self: *Session) void {
-        if (self.diff_opts) |*d| {
-            d.preview = self.preview_method != .none;
-            d.taew_path = if (self.preview_method == .taesd) self.taew_owned else null;
-        }
+    /// Apply the VRAM meter policy live (UI thread). `ceiling` (the limit handle)
+    /// is the hard cap the LLM never exceeds; `share` (the split handle) is its
+    /// guaranteed floor. With the image model resident (`diff_resident`) the LLM
+    /// settles to `share`, freeing the rest for diffusion to borrow; with
+    /// diffusion idle/unloaded the LLM borrows all the way up to `ceiling`.
+    /// Records the policy either way (so `imageBudget` is correct); the residency
+    /// reshuffle is skipped while the LLM is generating — migrations run on this
+    /// thread and must not race the worker's CUDA context — and reconciles at the
+    /// next idle apply / image-gen transition.
+    /// `available` is the system-adjusted budget for LLM + diffusion (the limit
+    /// handle minus system VRAM); `share` is the LLM's guaranteed floor.
+    /// Records the policy (so `imageBudget` is correct) and settles the LLM's
+    /// resident weights to fit. The reshuffle is skipped only while the LLM
+    /// ITSELF is generating (migrations would race its own decode worker) — it
+    /// runs even while DIFFUSION generates, since that's a separate context and
+    /// the caller serializes it with the diffusion worker's reclaim hook.
+    /// Offloading the LLM to CPU doesn't slow the running image (soft residency).
+    pub fn applyVramPolicy(self: *Session, available: u64, share: u64, diff_used: u64) void {
+        self.vram_limit = available;
+        self.vram_share = share;
+        self.vram_budget = available; // the LLM's absolute max (promote/reset ceiling)
+        if (available == 0 or self.busy()) return;
+        // SOFT split: keep only the room diffusion isn't holding, within the
+        // available budget. With diffusion unloaded (diff_used = 0) the LLM uses
+        // the whole budget; with it resident, the LLM offloads to fit around it.
+        // Floored so a tight budget offloads (nearly) everything rather than
+        // no-op'ing at 0. imageVramEnter settles to `share` at image start.
+        self.settleLlm(@max(available -| diff_used, 256 << 20));
     }
 
-    /// Request a diffusion-config swap (new dit/vae/text-encoder/taesd paths,
-    /// compute backend, and VAE decode path). The swap is DEFERRED until the
-    /// image queue is idle, so any in-flight or queued image finishes on the
-    /// current model; then `maybeApplyDiffPaths` applies it — including freeing
-    /// the resident pipeline so the next image rebuilds on the new backend.
-    /// No-op if the image tool isn't enabled (that toggle needs a reload instead).
-    /// Path args are borrowed (duped here).
-    pub fn requestDiffPaths(
-        self: *Session,
-        dit: []const u8,
-        vae: []const u8,
-        te: []const u8,
-        taew: ?[]const u8,
-        backend: pipeline.Backend,
-        vae_decode: pipeline.VaeDecode,
-    ) void {
-        if (self.diff_opts == null) return;
-        self.freePendingDiffPaths();
-        const p: PendingDiffPaths = .{
-            .dit = self.gpa.dupe(u8, dit) catch return,
-            .vae = self.gpa.dupe(u8, vae) catch return,
-            .te = self.gpa.dupe(u8, te) catch return,
-            .taew = if (taew) |t| (self.gpa.dupe(u8, t) catch null) else null,
-            .backend = backend,
-            .vae_decode = vae_decode,
-        };
-        self.diff_paths_pending = p;
-        self.maybeApplyDiffPaths();
-    }
-
-    fn freePendingDiffPaths(self: *Session) void {
-        if (self.diff_paths_pending) |p| {
-            self.gpa.free(p.dit);
-            self.gpa.free(p.vae);
-            self.gpa.free(p.te);
-            if (p.taew) |t| self.gpa.free(t);
-            self.diff_paths_pending = null;
-        }
-    }
-
-    /// Apply a pending diffusion-model swap once the image queue has drained.
-    /// Called from `requestDiffPaths` and each `pumpDiffusion`. Repoints the
-    /// diff_opts path slices at the resettable `diff_path_store` arena.
-    fn maybeApplyDiffPaths(self: *Session) void {
-        const p = self.diff_paths_pending orelse return;
-        if (self.diff_busy.load(.acquire)) return; // an image is generating
-        if (self.nextPending() != null) return; // more queued
-        var d = &(self.diff_opts orelse return);
-        _ = self.diff_path_store.reset(.retain_capacity);
-        const a = self.diff_path_store.allocator();
-        d.dit_path = a.dupe(u8, p.dit) catch return;
-        d.vae_path = a.dupe(u8, p.vae) catch return;
-        d.text_encoder_path = a.dupe(u8, p.te) catch return;
-        d.backend = p.backend;
-        d.vae_decode = p.vae_decode;
-        self.taew_owned = if (p.taew) |t| (a.dupe(u8, t) catch null) else null;
-        self.refreshPreview(); // taew_path follows the (possibly new) taew_owned
-        self.freePendingDiffPaths();
-        // Free the resident (old-model) pipeline so the next image reloads with
-        // the new paths. Without this, a swap requested while the queue is idle
-        // repoints diff_opts but leaves the stale model loaded — the swap would
-        // never take effect (short of a new chat). Safe here: this branch only
-        // runs with no worker in flight (diff_busy false, nothing queued), so
-        // nothing is touching diff_session. deinit binds its own CUDA context.
-        if (self.diff_session.load(.acquire)) |s| {
-            s.deinit();
-            self.diff_session.store(null, .release);
-        }
-        std.log.info("diffusion model switched", .{});
-    }
-
-    /// Estimate the image model's resident footprint (bytes) from its file
-    /// sizes — the target VRAM to free for it under image priority. 0 if unknown.
-    fn estimateImageBytes(self: *Session) u64 {
-        const d = self.diff_opts orelse return 0;
-        var total: u64 = 0;
-        for ([_][]const u8{ d.dit_path, d.vae_path, d.text_encoder_path }) |p| {
-            const st = std.Io.Dir.cwd().statFile(self.io, p, .{}) catch continue;
-            total += st.size;
-        }
-        return total;
-    }
-
-    /// Make VRAM room for the image model per the priority, as the image queue
-    /// starts (i.e. on CONTENTION — until an image loads, the LLM keeps all its
-    /// VRAM). No-op while the LLM is generating (migrations run on this UI thread
-    /// and must not race the worker's CUDA context) or when offload is disabled.
-    ///  - `image`: evict LLM layers only as needed to fit the image model
-    ///    resident, then promote them back when the queue drains (imageVramExit).
-    ///  - `balanced`: settle the LLM to 75% of the VRAM limit (ONCE — it stays
-    ///    there: no per-image shuffle, no promote-back), leaving ~25% for the
-    ///    image model, which streams the rest (diffusion tolerates that well).
-    ///    Only under a limit; unlimited/auto keeps both resident, no settling.
-    ///  - `chat`: nothing — the LLM keeps its VRAM, the image streams in the rest.
-    fn imageVramEnter(self: *Session) void {
-        if (self.vram_budget == 0 or self.busy()) return;
-        switch (self.vram_priority) {
-            .chat => {},
-            .image => {
-                const need = self.estimateImageBytes();
-                if (need == 0) return;
-                self.be.bindThread();
-                switch (self.arch) {
-                    inline else => |*a| {
-                        if (a.model.split == null)
-                            a.model.enableCpuSplit(.attn, self.vram_budget, true) catch return;
-                        a.model.offloadUntilFree(need) catch |err|
-                            std.log.warn("image-priority evict failed: {t}", .{err});
-                    },
-                }
-                self.image_evicted = true; // promote back when the queue drains
-            },
-            .balanced => {
-                if (self.vram_limit == 0) return; // no limit → both fit; no settling
-                const target = self.vram_limit / 4 * 3; // 75% LLM / 25% image
-                self.be.bindThread();
-                switch (self.arch) {
-                    inline else => |*a| {
-                        // Cap the LLM's ONGOING offload ceiling at 75% too, so as
-                        // chat continues (KV grows) it stays within its share while
-                        // the image model is kept resident — not just a one-time
-                        // settle. Restored to the full limit on new-chat (reset).
-                        if (a.model.split) |*sp| sp.budget = target;
-                        a.model.offloadToBudget(target) catch |err|
-                            std.log.warn("balanced settle failed: {t}", .{err});
-                    },
-                }
-                // No image_evicted flag: the LLM stays settled at ~75% (stable).
-            },
-        }
-    }
-
-    /// (image priority) Migrate LLM layers back onto the GPU after the image
-    /// queue drains, keeping the image model resident (promoteLayers stops before
-    /// overrunning the budget). No-op unless layers were evicted and the LLM is
-    /// idle (same CUDA-context constraint as imageVramEnter).
-    fn imageVramExit(self: *Session) void {
-        if (!self.image_evicted or self.busy()) return;
+    /// Settle the LLM's device residency to `target` bytes: shrink (offload
+    /// layers to the CPU) when over, grow (promote layers back) when under, and
+    /// set the ongoing offload ceiling so KV growth respects it. Caller ensures
+    /// the LLM is idle. Arms the split first if it somehow isn't.
+    fn settleLlm(self: *Session, target: u64) void {
+        if (target == 0) return;
         self.be.bindThread();
         switch (self.arch) {
-            inline else => |*a| _ = a.model.promoteLayers(self.vram_budget) catch |err|
-                std.log.warn("image-priority promote failed: {t}", .{err}),
+            inline else => |*a| {
+                if (a.model.split == null)
+                    _ = a.model.autoOffload(self.vram_budget) catch return;
+                if (a.model.split) |*sp| sp.budget = target; // ongoing ceiling as KV grows
+                if (self.be.deviceUsed() > target)
+                    a.model.offloadToBudget(target) catch |err|
+                        std.log.warn("vram settle (offload) failed: {t}", .{err})
+                else
+                    _ = a.model.promoteLayers(target) catch |err|
+                        std.log.warn("vram settle (promote) failed: {t}", .{err});
+            },
         }
+    }
+
+    /// Make VRAM room for the image model as the image queue starts (CONTENTION):
+    /// settle the LLM down to its guaranteed share so diffusion gets the rest up
+    /// to the ceiling. No-op while the LLM is generating (migrations run on this
+    /// UI thread and must not race the worker's CUDA context) or when there's no
+    /// budget. `imageVramExit` promotes the LLM back to the ceiling when the queue
+    /// drains. (The `image_bytes` estimate is unused now — the split, not the
+    /// image's footprint, decides how much the LLM gives up.)
+    pub fn imageVramEnter(self: *Session, image_bytes: u64) void {
+        _ = image_bytes;
+        if (self.vram_budget == 0 or self.vram_share == 0 or self.busy()) return;
+        self.settleLlm(self.vram_share);
+        self.image_evicted = true; // promote back to the ceiling when the queue drains
+    }
+
+    /// Migrate LLM layers back onto the GPU after the image queue drains, up to
+    /// the room diffusion isn't holding (`ceiling − diff_used`). The image model
+    /// usually stays RESIDENT after a queue drains (so the next image is fast),
+    /// so this borrows only the genuinely-free VRAM, not diffusion's weights —
+    /// promoting to the full ceiling here would overcommit. No-op unless the LLM
+    /// was settled down and is idle (same CUDA-context constraint as enter).
+    pub fn imageVramExit(self: *Session, diff_used: u64) void {
+        if (!self.image_evicted or self.busy()) return;
+        self.settleLlm(self.vram_limit -| diff_used);
         self.image_evicted = false;
     }
 
@@ -799,7 +554,7 @@ pub const Session = struct {
     /// DIFFUSION thread, so it binds the LLM context and is safe only when the LLM
     /// is idle (else it declines and the pipeline falls back to a CPU decode).
     /// `imageVramExit` promotes the layers back once the queue drains.
-    fn imageReclaim(self: *Session, needed: u64) bool {
+    pub fn imageReclaim(self: *Session, needed: u64) bool {
         _ = needed; // free as much as possible
         if (self.busy() or self.vram_budget == 0) return false;
         self.be.bindThread();
@@ -848,15 +603,9 @@ pub const Session = struct {
 
     pub fn deinit(self: *Session) void {
         if (self.worker) |t| t.join();
-        if (self.diff_thread) |t| t.join();
-        // Free the resident diffusion model first (binds/destroys its own CUDA
-        // context), then re-bind the LLM context so the LLM teardown below runs
-        // against the right one.
-        if (self.diff_session.load(.acquire)) |s| {
-            s.deinit();
-            self.diff_session.store(null, .release);
-            self.be.bindThread();
-        }
+        // The diffusion engine is owned app-level, not here — the app stops it
+        // (so no diffusion worker still touches a transcript GenImage) before
+        // tearing the session down.
         for (self.attach_view.items) |gi| freeGenImage(self.gpa, gi);
         self.attach_view.deinit(self.gpa);
         for (self.attach_rgb.items) |im| self.gpa.free(im.rgb);
@@ -876,8 +625,6 @@ pub const Session = struct {
         self.pending.deinit(self.gpa);
         self.ids.deinit(self.gpa);
         self.initial_ids.deinit(self.gpa);
-        self.freePendingDiffPaths();
-        self.diff_path_store.deinit();
         self.be.deinit();
         self.tok.deinit();
         switch (self.arch) {
@@ -901,19 +648,6 @@ pub const Session = struct {
 
     pub fn visionEnabled(self: *const Session) bool {
         return self.hasVit();
-    }
-
-    /// True while an image is generating (status-bar diffusion readout).
-    pub fn diffusing(self: *Session) bool {
-        return self.diff_busy.load(.acquire);
-    }
-
-    /// Device VRAM (bytes) the resident diffusion model actually holds — the
-    /// accurate figure from the diffusion backend, not an NVML-minus-LLM proxy
-    /// (which would also count the desktop's VRAM). 0 when no image model is
-    /// loaded. Read by the status bar.
-    pub fn diffVramBytes(self: *Session) u64 {
-        return if (self.diff_session.load(.acquire)) |s| s.deviceUsed() else 0;
     }
 
     /// Current context length in tokens (KV rows used).
@@ -995,16 +729,6 @@ pub const Session = struct {
             rgb[i * 3 + 2] = rgba[i * 4 + 2];
         }
         try self.attachImage(rgb, w, h);
-    }
-
-    /// Collect every finished image in the conversation (attachments then
-    /// generated, per message, in order) — the viewer navigates this list.
-    pub fn collectImages(self: *const Session, buf: *std.ArrayList(*GenImage)) !void {
-        buf.clearRetainingCapacity();
-        for (self.messages.items) |*m| {
-            for (m.attachments.items) |gi| if (gi.get() == .done) try buf.append(self.gpa, gi);
-            for (m.images.items) |gi| if (gi.get() == .done) try buf.append(self.gpa, gi);
-        }
     }
 
     /// Append a user turn and spawn the worker to stream the reply. No-op if a
@@ -1176,7 +900,8 @@ pub const Session = struct {
     }
 
     /// UI-thread, once per frame: move streamed bytes into the live assistant
-    /// message and reap a finished worker.
+    /// message and reap a finished worker. Tool-call scanning and diffusion
+    /// pumping are driven by the app (the engine is app-level).
     pub fn poll(self: *Session) void {
         self.mu.lockUncancelable(self.io);
         if (self.pending.items.len > 0 and self.messages.items.len > 0) {
@@ -1192,22 +917,20 @@ pub const Session = struct {
                 self.worker = null;
             }
         }
-
-        // Once the turn completes, scan it for <image> tool calls, then keep
-        // the diffusion queue moving.
-        if (self.imagesEnabled() and !self.busy() and self.messages.items.len > 0) {
-            const last = &self.messages.items[self.messages.items.len - 1];
-            if (last.role == .assistant and !last.images_scanned) {
-                last.images_scanned = true;
-                self.scanImageCalls(last) catch |err| std.log.err("scan image calls: {t}", .{err});
-            }
-        }
-        self.pumpDiffusion();
     }
 
-    /// Extract `<image ...>PROMPT</image>` tool calls from a finished assistant
-    /// message and queue a GenImage (status .pending) for each. Optional tag
-    /// attributes (width/height/steps/seed) override the config defaults.
+    /// Once a turn completes, scan the last assistant message (once) for
+    /// `<image>` tool calls and queue a GenImage for each into its transcript,
+    /// using the app-level engine's defaults + seed. Called by the app after
+    /// `poll` (chat mode). The app then pumps the engine.
+    pub fn scanNewImages(self: *Session, d: *diffuser.Diffuser) void {
+        if (!self.images_enabled or self.busy() or self.messages.items.len == 0) return;
+        const last = &self.messages.items[self.messages.items.len - 1];
+        if (last.role != .assistant or last.images_scanned) return;
+        last.images_scanned = true;
+        self.scanImageCalls(last, d) catch |err| std.log.err("scan image calls: {t}", .{err});
+    }
+
     /// The active family's reasoning-block markers as `toolcall.Reasoning`
     /// (null when the family can't reason), bridging `tp.llm.chat.reasoning()`
     /// to the std-only tool-call module.
@@ -1216,8 +939,10 @@ pub const Session = struct {
         return .{ .open = r.open, .close = r.close };
     }
 
-    fn scanImageCalls(self: *Session, msg: *Message) !void {
-        const d = self.diff_opts.?;
+    /// Extract `<image ...>PROMPT</image>` tool calls from a finished assistant
+    /// message and queue a GenImage (status .pending) for each. Optional tag
+    /// attributes (width/height/steps/seed) override the engine defaults.
+    fn scanImageCalls(self: *Session, msg: *Message, d: *diffuser.Diffuser) !void {
         // Scan only the answer, not the reasoning block, and only line-anchored
         // tags — see toolcall.answerText/nextImageCall for why (spurious fires
         // from the model merely *mentioning* the tag while thinking/explaining).
@@ -1233,9 +958,9 @@ pub const Session = struct {
                     .prompt = try self.gpa.dupe(u8, c.prompt),
                     .wake = self.wake,
                     .io = self.io,
-                    .req_width = d.width,
-                    .req_height = d.height,
-                    .req_steps = d.steps,
+                    .req_width = d.opts.width,
+                    .req_height = d.opts.height,
+                    .req_steps = d.opts.steps,
                     .req_seed = 0,
                 };
                 parseGenAttrs(c.attrs, gi);
@@ -1243,184 +968,13 @@ pub const Session = struct {
                 // explicitly) so it's known and displayable immediately — even
                 // while the image is still queued. Advancing per image keeps
                 // repeated generations varied.
-                if (gi.req_seed == 0) {
-                    self.diff_seed +%= 0x9E3779B97F4A7C15;
-                    gi.req_seed = self.diff_seed;
-                }
+                if (gi.req_seed == 0) gi.req_seed = d.nextSeed();
+                // The engine OWNS the image (unified queue + history); the
+                // message keeps a borrowed pointer for inline display.
+                try d.enqueue(gi);
                 try msg.images.append(self.gpa, gi);
             }
             rest = c.after;
         }
-    }
-
-    fn nextPending(self: *Session) ?*GenImage {
-        for (self.messages.items) |*m| {
-            for (m.images.items) |gi| {
-                if (gi.get() != .pending) continue;
-                // Canceled while still queued: drop it before it ever runs.
-                if (gi.cancel.load(.acquire)) {
-                    gi.status.store(@intFromEnum(GenStatus.canceled), .release);
-                    continue;
-                }
-                return gi;
-            }
-        }
-        return null;
-    }
-
-    /// Serialize image generation: reap a finished diffusion, then start the
-    /// next pending one (at most one at a time to bound VRAM).
-    fn pumpDiffusion(self: *Session) void {
-        if (self.diff_thread) |t| {
-            if (self.diff_busy.load(.acquire)) return; // still running
-            t.join();
-            self.diff_thread = null;
-        }
-        const gi = self.nextPending() orelse {
-            // Queue drained. KEEP the diffusion model loaded so a later (not
-            // back-to-back) gen reuses it instead of reloading — it's freed ONLY
-            // to apply a pending model swap (maybeApplyDiffPaths frees the stale
-            // session, so the next gen reloads with the new paths), or on new-chat
-            // / reload / teardown (reset/deinit). Under image priority, migrate
-            // LLM layers back into whatever room is left beside the still-resident
-            // image model (imageVramExit; no-op for chat/balanced).
-            self.maybeApplyDiffPaths();
-            self.imageVramExit();
-            return;
-        };
-        // Image priority: free VRAM for the image model before it loads (this
-        // must precede the diffusion worker, which auto-budgets from live free
-        // VRAM). No-op under chat priority or while the LLM is generating.
-        self.imageVramEnter();
-        // Seed was assigned when the tool call was scanned (see scanImageCalls),
-        // so it's already set here.
-        // Generous fixed preview buffer (holds any preview up to 512²; taew is
-        // ~256px, latent2rgb is latent-res). Dimensions published per step via
-        // the atomics; the pointer stays put for the whole generation.
-        gi.preview_w = .init(0);
-        gi.preview_h = .init(0);
-        if (self.gpa.alloc(u8, 512 * 512 * 4)) |pb| {
-            @memset(pb, 0);
-            gi.preview = pb;
-        } else |_| {
-            gi.preview = null;
-        }
-        gi.status.store(@intFromEnum(GenStatus.generating), .release);
-        self.diff_busy.store(true, .release);
-        self.diff_thread = std.Thread.spawn(.{}, diffWorker, .{ self, gi }) catch {
-            gi.status.store(@intFromEnum(GenStatus.failed), .release);
-            self.diff_busy.store(false, .release);
-            return;
-        };
-    }
-
-    /// pipeline `Reclaim.call` thunk (recovers the Session from the type-erased ctx).
-    fn reclaimThunk(ctx: *anyopaque, needed: u64) bool {
-        const self: *Session = @ptrCast(@alignCast(ctx));
-        return self.imageReclaim(needed);
-    }
-
-    fn diffWorker(self: *Session, gi: *GenImage) void {
-        var opts = self.diff_opts.?;
-        opts.prompt = gi.prompt;
-        opts.width = gi.req_width;
-        opts.height = gi.req_height;
-        opts.steps = gi.req_steps;
-        opts.seed = gi.req_seed;
-        opts.on_step = .{ .ctx = gi, .step = onDiffStep };
-        opts.cancel = &gi.cancel; // UI Cancel button aborts sampling
-        opts.reclaim = .{ .ctx = self, .call = reclaimThunk }; // free LLM VRAM on VAE OOM
-        // Share the configured VRAM limit with the LLM: cap diffusion's resident
-        // weights at (limit − what the LLM currently holds) so the two together
-        // stay under the cap; the rest of the image model streams. Under image
-        // priority the LLM was already evicted (imageVramEnter ran before this
-        // worker spawned), freeing more headroom. A small floor keeps the budget
-        // non-zero even when the LLM fills the limit — 0 would mean "auto / pin
-        // all free VRAM" (no cap), so the floor forces streaming instead. When no
-        // limit is configured, leave it 0 (auto, as before).
-        if (self.vram_limit > 0) {
-            opts.vram_budget = @max(256 << 20, self.vram_limit -| self.be.deviceUsed());
-        } else {
-            opts.vram_budget = 0;
-        }
-        gi.total.store(@intCast(opts.steps), .monotonic);
-        gi.start_ns.store(nowNs(self.io), .release);
-
-        // Load the diffusion model ONCE and keep it resident across the queue:
-        // create the session on the first image, reuse it for the rest (the 2nd+
-        // image skips the multi-second reload). `pumpDiffusion` frees it when the
-        // queue drains, returning its VRAM to the LLM. Reused across successive
-        // worker threads — `generate`/`deinit` bind the CUDA context internally.
-        var sess = self.diff_session.load(.acquire);
-        if (sess == null) {
-            sess = pipeline.Session.init(self.io, self.gpa, opts, null) catch |err| {
-                std.log.err("diffusion model load failed: {t}", .{err});
-                gi.status.store(@intFromEnum(GenStatus.failed), .release);
-                self.diff_busy.store(false, .release);
-                self.wake();
-                return;
-            };
-            self.diff_session.store(sess, .release);
-        }
-        var img = sess.?.generate(opts, null) catch |err| {
-            const st: GenStatus = if (err == error.Canceled) .canceled else blk: {
-                std.log.err("image generation failed: {t}", .{err});
-                break :blk .failed;
-            };
-            gi.status.store(@intFromEnum(st), .release);
-            self.diff_busy.store(false, .release);
-            self.wake();
-            return;
-        };
-        defer img.deinit(self.gpa);
-
-        // The pipeline returns packed RGB; dvui wants RGBA. Convert once.
-        const px = img.width * img.height;
-        const rgba = self.gpa.alloc(u8, px * 4) catch {
-            gi.status.store(@intFromEnum(GenStatus.failed), .release);
-            self.diff_busy.store(false, .release);
-            self.wake();
-            return;
-        };
-        for (0..px) |i| {
-            rgba[i * 4 + 0] = img.rgb[i * 3 + 0];
-            rgba[i * 4 + 1] = img.rgb[i * 3 + 1];
-            rgba[i * 4 + 2] = img.rgb[i * 3 + 2];
-            rgba[i * 4 + 3] = 255;
-        }
-        gi.done_ns.store(nowNs(self.io), .release);
-        gi.rgba = rgba;
-        gi.width = img.width;
-        gi.height = img.height;
-        gi.status.store(@intFromEnum(GenStatus.done), .release);
-        self.diff_busy.store(false, .release);
-        self.wake();
-    }
-
-    fn onDiffStep(ctx: *anyopaque, done: usize, total: usize, preview: ?pipeline.Preview) void {
-        const gi: *GenImage = @ptrCast(@alignCast(ctx));
-        // Timestamp the sampling loop: first callback (after step 1) anchors the
-        // s/step base; every callback updates the tail. Excludes model-load time.
-        const now = nowNs(gi.io);
-        if (gi.first_step_ns.load(.monotonic) == 0) gi.first_step_ns.store(now, .release);
-        gi.last_step_ns.store(now, .release);
-        gi.step.store(@intCast(done), .monotonic);
-        gi.total.store(@intCast(total), .monotonic);
-        if (preview) |pv| {
-            if (gi.preview) |dst| {
-                const np = pv.width * pv.height;
-                if (np * 4 <= dst.len) {
-                    for (0..np) |i| {
-                        dst[i * 4 + 0] = pv.rgb[i * 3 + 0];
-                        dst[i * 4 + 1] = pv.rgb[i * 3 + 1];
-                        dst[i * 4 + 2] = pv.rgb[i * 3 + 2];
-                        dst[i * 4 + 3] = 255;
-                    }
-                    gi.preview_w.store(@intCast(pv.width), .release);
-                    gi.preview_h.store(@intCast(pv.height), .release);
-                }
-            }
-        }
-        gi.wake();
     }
 };

@@ -5,16 +5,27 @@
 const std = @import("std");
 const dvui = @import("dvui");
 const SDLBackend = @import("backend");
-const chat = @import("chat.zig");
+const diffuser = @import("diffuser.zig");
 const fonts = @import("fonts.zig");
+
+pub const GenImage = diffuser.GenImage;
+
+/// Where the viewer's navigable image list comes from, decoupled from any
+/// particular driver: the chat transcript or the image studio's gallery both
+/// provide one. `collect` fills `buf` with the done images in display order.
+pub const ImageSource = struct {
+    ctx: *anyopaque,
+    gpa: std.mem.Allocator,
+    collect: *const fn (ctx: *anyopaque, buf: *std.ArrayList(*GenImage)) void,
+};
 
 pub const Viewer = struct {
     gpa: std.mem.Allocator,
     back: SDLBackend,
     win: dvui.Window,
     win_id: u32,
-    session: *chat.Session,
-    cur: *chat.GenImage,
+    src: ImageSource,
+    cur: *GenImage,
     open: bool = true,
     shown: bool = false,
     // Fonts/theme are per-window; install the broad-coverage font once so the
@@ -31,7 +42,7 @@ pub const Viewer = struct {
     /// the `SDLBackend` (via `back.backend()`), so the backend must live at a
     /// stable address — a by-value return would leave the window pointing at a
     /// dead copy.
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, session: *chat.Session, cur: *chat.GenImage) !*Viewer {
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, src: ImageSource, cur: *GenImage) !*Viewer {
         const self = try gpa.create(Viewer);
         errdefer gpa.destroy(self);
         self.gpa = gpa;
@@ -47,7 +58,7 @@ pub const Viewer = struct {
         errdefer self.back.deinit();
         self.win = try dvui.Window.init(@src(), gpa, self.back.backend(), .{ .id_extra = 1 });
         self.win_id = SDLBackend.c.SDL_GetWindowID(self.back.window);
-        self.session = session;
+        self.src = src;
         self.cur = cur;
         self.open = true;
         self.shown = false;
@@ -74,7 +85,7 @@ pub const Viewer = struct {
     }
 
     /// Point the viewer at a different image and reset the view.
-    pub fn setImage(self: *Viewer, gi: *chat.GenImage) void {
+    pub fn setImage(self: *Viewer, gi: *GenImage) void {
         self.cur = gi;
         self.resetView();
     }
@@ -86,9 +97,9 @@ pub const Viewer = struct {
     }
 
     fn nav(self: *Viewer, dir: i64) void {
-        var buf: std.ArrayList(*chat.GenImage) = .empty;
-        defer buf.deinit(self.session.gpa);
-        self.session.collectImages(&buf) catch return;
+        var buf: std.ArrayList(*GenImage) = .empty;
+        defer buf.deinit(self.src.gpa);
+        self.src.collect(self.src.ctx, &buf);
         if (buf.items.len == 0) return;
         var idx: usize = 0;
         for (buf.items, 0..) |gi, i| if (gi == self.cur) {
@@ -102,9 +113,9 @@ pub const Viewer = struct {
     }
 
     fn navTo(self: *Viewer, last: bool) void {
-        var buf: std.ArrayList(*chat.GenImage) = .empty;
-        defer buf.deinit(self.session.gpa);
-        self.session.collectImages(&buf) catch return;
+        var buf: std.ArrayList(*GenImage) = .empty;
+        defer buf.deinit(self.src.gpa);
+        self.src.collect(self.src.ctx, &buf);
         if (buf.items.len == 0) return;
         self.cur = buf.items[if (last) buf.items.len - 1 else 0];
         self.resetView();
@@ -123,9 +134,9 @@ pub const Viewer = struct {
         self.handleKeys();
 
         // Position/index label (which image, current zoom).
-        var buf: std.ArrayList(*chat.GenImage) = .empty;
-        defer buf.deinit(self.session.gpa);
-        self.session.collectImages(&buf) catch {};
+        var buf: std.ArrayList(*GenImage) = .empty;
+        defer buf.deinit(self.src.gpa);
+        self.src.collect(self.src.ctx, &buf);
         var idx: usize = 0;
         for (buf.items, 0..) |gi, i| if (gi == self.cur) {
             idx = i;
