@@ -2854,6 +2854,37 @@ pub const Context = struct {
         self.small_bufs.clearRetainingCapacity();
     }
 
+    /// Evict cached weights LRU-first — INCLUDING pinned ones (under VAE-decode
+    /// memory pressure the resident DiT pin must yield) — until at least `want`
+    /// bytes are freed or nothing more is evictable; return the bytes freed.
+    /// The "make just enough room, keep the rest resident" counterpart to the
+    /// full `evictWeights` nuke: used on a VAE-decode OOM so the untouched
+    /// weights stay cached instead of being dropped and re-uploaded. Dropped
+    /// weights re-upload from their mmap on next use.
+    pub fn evictToFree(self: *Context, want: u64) u64 {
+        if (want == 0) return 0;
+        if (self.batching) self.flushBatch() catch {};
+        _ = self.d.DeviceWaitIdle(self.device);
+        var freed: u64 = 0;
+        while (freed < want) {
+            var lru_key: usize = undefined;
+            var lru_use: u64 = std.math.maxInt(u64);
+            var it = self.weights.iterator();
+            while (it.next()) |e| {
+                if (e.value_ptr.last_use < lru_use) {
+                    lru_use = e.value_ptr.last_use;
+                    lru_key = e.key_ptr.*;
+                }
+            }
+            if (lru_use == std.math.maxInt(u64)) break; // cache empty
+            const e = self.weights.fetchRemove(lru_key).?;
+            if (e.value.pinned) self.pinned_bytes -|= e.value.db.size;
+            freed += e.value.db.size;
+            self.freeDeviceBuffer(e.value.db);
+        }
+        return freed;
+    }
+
     /// Free device memory available to us right now (live driver view;
     /// VK_EXT_memory_budget sees other processes). Used at setup to default
     /// the weight-pin budget so a model that fits stays fully resident.

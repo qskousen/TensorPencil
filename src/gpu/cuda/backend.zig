@@ -751,6 +751,19 @@ pub const Backend = struct {
         return self.ctx.device_used;
     }
 
+    /// Bytes held by UNPINNED cached weights — i.e. VRAM that will free itself
+    /// (evict + re-stream on next use) under allocation pressure. Added to the
+    /// live free VRAM this is the room actually reachable for pinning the next
+    /// model, even when another process holds part of the card.
+    pub fn evictableWeightBytes(self: *Backend) u64 {
+        return self.streamed_bytes;
+    }
+
+    /// Bytes held by PINNED cached weights (the resident model kept off the LRU).
+    pub fn pinnedWeightBytes(self: *Backend) u64 {
+        return self.pinned_bytes;
+    }
+
     /// Enable MEASURED per-component device-memory attribution (VRAM meter). The
     /// pipeline turns this on for the diffusion backend only; LLM decode leaves
     /// it off so its allocator stays a plain counter.
@@ -839,6 +852,75 @@ pub const Backend = struct {
         var d = db;
         self.tensorDestroy(&d);
         return true;
+    }
+
+    /// Evict cached weights LRU-first — INCLUDING pinned ones (under VAE-decode
+    /// memory pressure the resident DiT pin must yield) — until at least `want`
+    /// bytes are freed or nothing more is evictable, and return the bytes freed.
+    /// Unlike `evictOneWeight` (streaming backstop: defers frees, protects the
+    /// pin) this is the "make just enough room, keep the rest resident" path:
+    /// it frees SYNCHRONOUSLY (the caller is on a decode OOM path and needs the
+    /// VRAM available for an immediate retry) and stops the moment `want` is met,
+    /// so the untouched weights stay cached instead of a full `evictWeights`
+    /// nuke. Dropped weights re-stream from their mmap on next use. Protects the
+    /// MRU (the caller will reuse it immediately on retry) and any weight a
+    /// prefetch is mid-DMA into.
+    pub fn evictToFree(self: *Backend, want: u64) u64 {
+        if (want == 0) return 0;
+        // The buffers may still back queued reads / in-flight prefetch DMAs.
+        _ = self.ctx.api.cuStreamSynchronize(self.ctx.stream);
+        _ = self.ctx.api.cuStreamSynchronize(self.ctx.xfer_stream);
+        self.drainPending(); // realize any already-deferred frees first
+        const before_free = self.ctx.memGetInfo().free;
+        std.log.info("[evict] evictToFree want={d}MB: cache={d} entries pinned={d}MB streamed={d}MB free={d}MB", .{
+            want >> 20, self.weights.count(), self.pinned_bytes >> 20, self.streamed_bytes >> 20, before_free >> 20,
+        });
+        var freed: u64 = 0;
+        var n: usize = 0;
+        var skipped_protected: usize = 0;
+        while (freed < want) {
+            var mru_use: u64 = 0;
+            var it0 = self.weights.valueIterator();
+            while (it0.next()) |e| {
+                if (e.last_use > mru_use) mru_use = e.last_use;
+            }
+            const completed = self.pf_completed.load(.acquire);
+            var lru_key: usize = undefined;
+            var lru_use: u64 = std.math.maxInt(u64);
+            skipped_protected = 0;
+            var it = self.weights.iterator();
+            while (it.next()) |e| {
+                if (e.value_ptr.awaiting_use) {
+                    skipped_protected += 1;
+                    continue; // prefetched, not yet consumed
+                }
+                if (e.value_ptr.last_use == mru_use) {
+                    skipped_protected += 1;
+                    continue; // protect the MRU
+                }
+                if (e.value_ptr.pf_gen > completed) {
+                    skipped_protected += 1;
+                    continue; // in-flight prefetch
+                }
+                if (e.value_ptr.last_use < lru_use) {
+                    lru_use = e.value_ptr.last_use;
+                    lru_key = e.key_ptr.*;
+                }
+            }
+            if (lru_use == std.math.maxInt(u64)) break; // only protected entries left
+            self.evictions += 1;
+            const e = self.weights.fetchRemove(lru_key).?;
+            if (e.value.upload_ev) |ev| self.ctx.eventDestroy(ev);
+            if (e.value.pinned) self.pinned_bytes -|= e.value.db.size else self.streamed_bytes -|= e.value.db.size;
+            var db = e.value.db;
+            freed += db.size;
+            n += 1;
+            self.tensorDestroy(&db);
+        }
+        std.log.info("[evict] evictToFree freed={d}MB in {d} weights ({d} protected, cache now {d}, free={d}MB)", .{
+            freed >> 20, n, skipped_protected, self.weights.count(), self.ctx.memGetInfo().free >> 20,
+        });
+        return freed;
     }
 
     /// Get a device buffer for a weight upload. Exact-size reuse from the

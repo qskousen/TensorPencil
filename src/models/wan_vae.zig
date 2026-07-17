@@ -176,6 +176,36 @@ pub const Decoder = struct {
         self.* = undefined;
     }
 
+    /// Rough upper bound on the PEAK device VRAM (bytes) a whole-image GPU decode
+    /// of a [16][zh][zw] latent needs for its ACTIVATIONS: the three grow-and-keep
+    /// ping-pong buffers (x/t/u in vae_cuda / vae_gpu, each sized to the largest
+    /// activation `max(h·w·ch)`) plus the capped im2col patch band. Mirrors
+    /// decode()'s resolution/channel walk (res keeps resolution; up doubles h,w).
+    /// Deliberately approximate — it can't see the opaque cuBLASLt/cuDNN conv
+    /// workspace — so callers pre-free with a margin and keep a reactive fallback.
+    /// (For a tiled decode, call with the tile side to bound a single tile.)
+    pub fn estimatePeakBytes(self: *const Decoder, zh: usize, zw: usize) u64 {
+        var h = zh;
+        var w = zw;
+        var max_act: u64 = @as(u64, zh) * zw * self.conv_in.co; // latent res, 384ch
+        for (self.ups) |layer| switch (layer) {
+            .res => |rb| {
+                const e = @as(u64, h) * w * @max(rb.conv1.ci, rb.conv2.co);
+                if (e > max_act) max_act = e;
+            },
+            .up => |cv| {
+                h *= 2; // fused nearest-2x upsample: output lands at the doubled res
+                w *= 2;
+                const e = @as(u64, h) * w * cv.co;
+                if (e > max_act) max_act = e;
+            },
+        };
+        const head_in = @as(u64, h) * w * self.head_conv.ci; // full res, 96ch
+        if (head_in > max_act) max_act = head_in;
+        const patch_band: u64 = 256 << 20; // vae_cuda patch_band_bytes cap
+        return 3 * max_act * 4 + patch_band;
+    }
+
     /// Decode a VAE-space latent (planar [16][zh][zw], already denormalized)
     /// to planar [3][8*zh][8*zw] pixels in [-1, 1]. Caller frees the result.
     pub fn decode(self: *const Decoder, io: std.Io, gpa: std.mem.Allocator, z: []const f32, zh: usize, zw: usize) ![]f32 {

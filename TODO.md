@@ -1,6 +1,6 @@
-- save thinking toggle if not already
+- option to set taesd preview size: 1/6, 1/4, 1/2, 1
+- zig-cuda backend seems to have oom issues
 - backend switch in queue doesn't switch backend it seems like? is backend attached to images in the queue?
-- seems like flash attn isn't in the vae decode options?
 - add a grid of capabilities and backends to readme (llm by model, llm quantization, diffusion by model and dtype, speculative decoding, etc.)
 - begin filling in holes in the above
 - add more sampling methods

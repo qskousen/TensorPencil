@@ -507,6 +507,9 @@ pub const Session = struct {
     fn settleLlm(self: *Session, target: u64) void {
         if (target == 0) return;
         self.be.bindThread();
+        const before = self.be.deviceUsed();
+        const t0 = std.Io.Clock.real.now(self.io).nanoseconds;
+        const grow = before <= target;
         switch (self.arch) {
             inline else => |*a| {
                 if (a.model.split == null)
@@ -519,6 +522,14 @@ pub const Session = struct {
                     _ = a.model.promoteLayers(target) catch |err|
                         std.log.warn("vram settle (promote) failed: {t}", .{err});
             },
+        }
+        const after = self.be.deviceUsed();
+        const moved = if (grow) after -| before else before -| after;
+        if (moved > 0) {
+            const ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(self.io).nanoseconds - t0)) / 1e6;
+            std.log.info("[vram] LLM settle→{d}MB: {s} {d}MB {s} in {d:.0}ms (LLM now {d}MB device)", .{
+                target >> 20, if (grow) "promoted" else "offloaded", moved >> 20, if (grow) "→GPU" else "→CPU", ms, after >> 20,
+            });
         }
     }
 
@@ -550,24 +561,45 @@ pub const Session = struct {
 
     /// pipeline reclaim hook (GUI_VRAM.md Phase 5): free LLM VRAM for a large VAE
     /// decode by migrating chat layers to the CPU — done even under chat priority,
-    /// as the agreed last resort so a big image never just fails. Runs on the
-    /// DIFFUSION thread, so it binds the LLM context and is safe only when the LLM
-    /// is idle (else it declines and the pipeline falls back to a CPU decode).
-    /// `imageVramExit` promotes the layers back once the queue drains.
-    pub fn imageReclaim(self: *Session, needed: u64) bool {
-        _ = needed; // free as much as possible
-        if (self.busy() or self.vram_budget == 0) return false;
+    /// as the agreed last resort so a big image never just fails. Migrates JUST
+    /// ENOUGH to free ~`needed` bytes (the decode's remaining deficit), leaving
+    /// the rest of the LLM resident so it stays fast; `needed == 0` (or more than
+    /// the LLM holds) migrates everything it can. Returns the device bytes freed.
+    /// Runs on the DIFFUSION thread, so it binds the LLM context and is safe only
+    /// when the LLM is idle (else it declines — returns 0 — and the pipeline
+    /// falls back to tiling / CPU). `imageVramExit` promotes the layers back once
+    /// the queue drains.
+    pub fn imageReclaim(self: *Session, needed: u64) u64 {
+        if (self.busy()) {
+            std.log.info("[reclaim] declined: LLM is generating (can't migrate mid-decode)", .{});
+            return 0;
+        }
+        if (self.vram_budget == 0) {
+            std.log.info("[reclaim] declined: no VRAM budget (auto)", .{});
+            return 0;
+        }
         self.be.bindThread();
         const before = self.be.deviceUsed();
+        const t0 = std.Io.Clock.real.now(self.io).nanoseconds;
         switch (self.arch) {
             inline else => |*a| {
                 if (a.model.split == null)
-                    a.model.enableCpuSplit(.attn, self.vram_budget, true) catch return false;
-                a.model.offloadUntilFree(std.math.maxInt(u64)) catch {}; // migrate all it can
+                    a.model.enableCpuSplit(.attn, self.vram_budget, true) catch |err| {
+                        std.log.warn("[reclaim] enableCpuSplit failed: {t}", .{err});
+                        return 0;
+                    };
+                if (needed == 0 or needed >= before)
+                    a.model.offloadUntilFree(std.math.maxInt(u64)) catch {} // migrate all it can
+                else
+                    a.model.offloadToBudget(before - needed) catch {}; // just enough
             },
         }
-        const freed = self.be.deviceUsed() < before;
-        if (freed) self.image_evicted = true;
+        const freed = before -| self.be.deviceUsed();
+        const ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(self.io).nanoseconds - t0)) / 1e6;
+        std.log.info("[reclaim] needed={d}MB migrated LLM {d}MB→CPU in {d:.0}ms (LLM now {d}MB device)", .{
+            needed >> 20, freed >> 20, ms, self.be.deviceUsed() >> 20,
+        });
+        if (freed > 0) self.image_evicted = true;
         return freed;
     }
 

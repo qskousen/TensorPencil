@@ -28,6 +28,51 @@ const pipeline = tp.pipeline;
 /// for the status-bar meter.
 pub const VramBreakdown = pipeline.VramBreakdown;
 
+/// A `std.Io.Writer` that forwards the pipeline's progress lines to `std.log`,
+/// so GUI image generation is as observable in the terminal as the CLI is
+/// (load / encode / per-step / vae-decode-fallback notes). The CLI passes its
+/// stdout writer; the GUI has no stdout for the worker, so it routes here.
+/// Line-buffered: one `std.log.info` per '\n'; a line longer than the fixed
+/// accumulator is flushed in chunks. Progress notes are short, so `drain` is
+/// only ever hit on `flush` (one complete line at a time).
+const LogWriter = struct {
+    writer: std.Io.Writer,
+    line: [512]u8 = undefined,
+    len: usize = 0,
+
+    fn init(buffer: []u8) LogWriter {
+        return .{ .writer = .{ .vtable = &.{ .drain = drain }, .buffer = buffer } };
+    }
+
+    fn emitByte(self: *LogWriter, b: u8) void {
+        if (b == '\n' or self.len == self.line.len) {
+            if (self.len > 0) std.log.info("gen: {s}", .{self.line[0..self.len]});
+            self.len = 0;
+            if (b == '\n') return;
+        }
+        self.line[self.len] = b;
+        self.len += 1;
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *LogWriter = @alignCast(@fieldParentPtr("writer", w));
+        for (w.buffer[0..w.end]) |b| self.emitByte(b); // buffered bytes first
+        w.end = 0;
+        var written: usize = 0;
+        const slice = data[0 .. data.len - 1];
+        for (slice) |bytes| {
+            for (bytes) |b| self.emitByte(b);
+            written += bytes.len;
+        }
+        const pattern = data[data.len - 1];
+        for (0..splat) |_| {
+            for (pattern) |b| self.emitByte(b);
+        }
+        written += pattern.len * splat;
+        return written;
+    }
+};
+
 pub const GenStatus = enum(u8) { pending, generating, done, failed, canceled };
 
 /// An image awaiting or undergoing generation. Progress/status fields are
@@ -137,17 +182,18 @@ pub const VramCoordinator = struct {
     /// Resident-weight budget (bytes) for the next image; weights past it
     /// stream per step. 0 = auto / pin all free VRAM (the studio's answer).
     budget: *const fn (ctx: *anyopaque) u64,
-    /// VAE-OOM reclaim: free device memory held elsewhere (chat migrates LLM
-    /// layers to the CPU) and return true if anything was freed.
-    reclaim: *const fn (ctx: *anyopaque, needed: u64) bool,
+    /// VAE-OOM reclaim: free ~`needed` bytes of device memory held elsewhere
+    /// (chat migrates just enough LLM layers to the CPU) and return the bytes
+    /// actually freed.
+    reclaim: *const fn (ctx: *anyopaque, needed: u64) u64,
 
     fn noEnter(_: *anyopaque) void {}
     fn noExit(_: *anyopaque) void {}
     fn zeroBudget(_: *anyopaque) u64 {
         return 0;
     }
-    fn noReclaim(_: *anyopaque, _: u64) bool {
-        return false;
+    fn noReclaim(_: *anyopaque, _: u64) u64 {
+        return 0;
     }
 
     /// No-LLM coordinator: diffusion has the device to itself.
@@ -585,7 +631,7 @@ pub const Diffuser = struct {
     }
 
     /// pipeline `Reclaim.call` thunk (recovers the Diffuser from the ctx).
-    fn reclaimThunk(ctx: *anyopaque, needed: u64) bool {
+    fn reclaimThunk(ctx: *anyopaque, needed: u64) u64 {
         const self: *Diffuser = @ptrCast(@alignCast(ctx));
         return self.vram.reclaim(self.vram.ctx, needed);
     }
@@ -661,19 +707,27 @@ pub const Diffuser = struct {
         gi.total.store(@intCast(opts.steps), .monotonic);
         gi.start_ns.store(nowNs(self.io), .release);
 
+        // Mirror the CLI's progress notes to std.log (load / encode / per-step /
+        // vae-decode fallbacks) so terminal output is available for debugging.
+        var log_buf: [4096]u8 = undefined;
+        var lw = LogWriter.init(&log_buf);
+        const progress = &lw.writer;
+
         // Load the diffusion model ONCE and keep it resident across the queue.
         var sess = self.session.load(.acquire);
         if (sess == null) {
-            sess = pipeline.Session.init(self.io, self.gpa, opts, null) catch |err| {
+            const t_load = nowNs(self.io);
+            sess = pipeline.Session.init(self.io, self.gpa, opts, progress) catch |err| {
                 std.log.err("diffusion model load failed: {t}", .{err});
                 gi.status.store(@intFromEnum(GenStatus.failed), .release);
                 self.busy.store(false, .release);
                 self.wake();
                 return;
             };
+            std.log.info("[vram] diffusion model loaded in {d:.1}s", .{@as(f64, @floatFromInt(nowNs(self.io) - t_load)) / 1e9});
             self.session.store(sess, .release);
         }
-        var img = sess.?.generate(opts, null) catch |err| {
+        var img = sess.?.generate(opts, progress) catch |err| {
             const st: GenStatus = if (err == error.Canceled) .canceled else blk: {
                 std.log.err("image generation failed: {t}", .{err});
                 break :blk .failed;

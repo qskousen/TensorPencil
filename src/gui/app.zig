@@ -541,6 +541,7 @@ fn sdlEventWindowID(event: SDLBackend.c.SDL_Event) u32 {
 /// A file was dropped on the window: decode it (libvips → RGB) and attach it
 /// to the next message for the model to see.
 fn handleDropFile(path: []const u8) void {
+    if (g_loading.load(.acquire)) return; // session being rebuilt on the loader thread
     const s = g_session orelse return;
     if (!s.visionEnabled()) {
         std.log.warn("dropped {s} but vision is unavailable", .{path});
@@ -563,6 +564,7 @@ fn handleDropFile(path: []const u8) void {
 /// image, letting normal text paste proceed.
 fn tryPasteClipboardImage() bool {
     const SDL = SDLBackend.c;
+    if (g_loading.load(.acquire)) return false; // session being rebuilt on the loader thread
     const s = g_session orelse return false;
     if (!s.visionEnabled()) return false;
 
@@ -621,7 +623,9 @@ fn frame() void {
             defer area.deinit();
             image_view.render(&g_config, d, ready, .{ .to_chat = enterChatMode, .settings = openSettings });
         }
-        status_bar.render(g_session, diffBusy(), diffVram(), &g_split, &g_limit, g_llm_eject_armed, g_diff_eject_armed, meterActions());
+        // `ready` == !g_loading: only touch the session when no reload is tearing
+        // it down on the loader thread (same invariant as the chat view).
+        status_bar.render(if (ready) g_session else null, diffBusy(), diffVram(), &g_split, &g_limit, g_llm_eject_armed, g_diff_eject_armed, meterActions());
         return;
     }
 
@@ -630,6 +634,14 @@ fn frame() void {
     // assistant slot shows a small "Loading…" until the session is live (see
     // renderMessages). No spinner flashing in and out.
     const loading = g_loading.load(.acquire);
+    // While a (re)load is in flight the loader thread is tearing down / rebuilding
+    // g_session on its own thread, so the UI MUST NOT dereference the session
+    // pointer (the release/acquire hand-off only guarantees it valid when
+    // g_loading is false — see the g_session doc comment). Treat it as unavailable
+    // and fall back to the carried transcript; otherwise a backend switch that
+    // triggers a reload use-after-frees the session mid-frame. (This is why every
+    // session-consuming render below takes `s_ui`, not `g_session`.)
+    const s_ui: ?*chat.Session = if (loading) null else g_session;
 
     // Only show the "no model" notice when there's genuinely nothing configured
     // (not during a load, when g_session is transiently null).
@@ -638,7 +650,7 @@ fn frame() void {
         return;
     }
 
-    if (g_session) |s| {
+    if (s_ui) |s| {
         s.poll();
         if (g_diffuser) |*d| s.scanNewImages(d);
     }
@@ -650,9 +662,9 @@ fn frame() void {
     // height). max_size_content caps that.
     const list_h = @max(120, root.data().contentRect().h - g_input_h - status_bar.bar_height);
 
-    renderMessages(g_session, list_h, loading);
-    renderInput(g_session);
-    status_bar.render(g_session, diffBusy(), diffVram(), &g_split, &g_limit, g_llm_eject_armed, g_diff_eject_armed, meterActions());
+    renderMessages(s_ui, list_h, loading);
+    renderInput(s_ui);
+    status_bar.render(s_ui, diffBusy(), diffVram(), &g_split, &g_limit, g_llm_eject_armed, g_diff_eject_armed, meterActions());
 }
 
 fn diffBusy() bool {
@@ -743,12 +755,12 @@ fn vcBudget(_: *anyopaque) u64 {
     defer g_session_mu.unlock(g_io);
     return if (g_session) |s| s.imageBudget() else 0;
 }
-fn vcReclaim(_: *anyopaque, needed: u64) bool {
+fn vcReclaim(_: *anyopaque, needed: u64) u64 {
     // Worker thread; the reclaim hook binds the LLM context, so it must not race
     // an eject freeing that context. (LLM idle is checked inside imageReclaim.)
     g_session_mu.lockUncancelable(g_io);
     defer g_session_mu.unlock(g_io);
-    return if (g_session) |s| s.imageReclaim(needed) else false;
+    return if (g_session) |s| s.imageReclaim(needed) else 0;
 }
 fn appCoordinator() diffuser.VramCoordinator {
     return .{ .ctx = undefined, .enter = vcEnter, .exit = vcExit, .budget = vcBudget, .reclaim = vcReclaim };
@@ -980,7 +992,7 @@ fn loaderMain() void {
         g_carry = null;
     }
     const dt = @as(f64, @floatFromInt(std.Io.Clock.real.now(g_io).nanoseconds - t0)) / 1e9;
-    std.log.info("session ready in {d:.1}s", .{dt});
+    std.log.info("[vram] LLM session loaded/ready in {d:.1}s", .{dt});
     // Publish under the lock: the diffusion worker's coordinator hooks read
     // `g_session` and must see either null or a fully-built session, never a tear.
     g_session_mu.lockUncancelable(g_io);
@@ -1562,21 +1574,24 @@ fn renderInput(s: ?*chat.Session) void {
 fn submitChat(text: []const u8) void {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
     if (trimmed.len == 0) return;
-    if (g_session) |s| {
+    // Never touch the session while a (re)load is in flight — the loader thread is
+    // freeing/rebuilding it. Submit only when it's live; otherwise stash the text
+    // and the load-completion path (maybeStartReload) auto-submits it.
+    if (!g_loading.load(.acquire)) if (g_session) |s| {
         s.submit(trimmed) catch |err| std.log.err("submit failed: {t}", .{err});
         return;
-    }
-    if (g_loading.load(.acquire) or g_config.llm_model.opt() == null) return; // already loading / no model
+    };
+    if (g_config.llm_model.opt() == null) return; // no model to load
     if (g_pending_submit) |p| g_gpa.free(p);
     g_pending_submit = g_gpa.dupe(u8, trimmed) catch null;
-    g_reload_requested = true;
+    if (!g_loading.load(.acquire)) g_reload_requested = true; // else the in-flight load will pick it up
 }
 
 /// Start a fresh conversation, clearing the input box. Only the transcript is
 /// reset; generated images live in the engine's shared history and stay in the
 /// studio gallery (and the viewer keeps working). No-op if no session is loaded.
 fn newChat() void {
-    if (g_session) |s| s.reset();
+    if (!g_loading.load(.acquire)) if (g_session) |s| s.reset(); // session being rebuilt → g_carry clear below suffices
     // If the LLM is ejected, the transcript lives in g_carry — clear it too so
     // "new chat" starts fresh even while unloaded. (No-op when a session is
     // live, since g_carry is null then.)

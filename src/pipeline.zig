@@ -127,19 +127,23 @@ pub const Options = struct {
     /// decode. When it flips true, `generate` unwinds and returns
     /// `error.Canceled` (a caller-driven stop, not a failure).
     cancel: ?*std.atomic.Value(bool) = null,
-    /// Optional VRAM-reclaim hook. On a CUDA VAE-decode OOM (e.g. a very large
-    /// image), `generate` calls this to free device memory held by ANOTHER CUDA
-    /// context in the process (the GUI's resident chat model) and retries the
-    /// decode. Returns true if it freed anything. It may switch the calling
-    /// thread's current CUDA context, so the pipeline re-binds its own after.
-    /// (GUI_VRAM.md Phase 5; null everywhere else.)
+    /// Optional VRAM-reclaim hook. On a VAE-decode OOM (e.g. a very large image
+    /// while the GUI chat model is resident), `generate` calls this to migrate
+    /// device memory held by ANOTHER context in the process (the GUI's resident
+    /// chat LLM) to the host, freeing room for the decode. `needed` is roughly
+    /// how many more bytes the decode wants; the hook frees about that much
+    /// (just enough — the LLM layers left resident stay fast) and returns the
+    /// bytes actually freed. It may switch the calling thread's current CUDA
+    /// context, so the pipeline re-binds its own after. (GUI_VRAM.md Phase 5;
+    /// null everywhere else.)
     reclaim: ?Reclaim = null,
 };
 
-/// A device-VRAM reclaim callback (see `Options.reclaim`).
+/// A device-VRAM reclaim callback (see `Options.reclaim`); returns the number of
+/// device bytes it actually freed.
 pub const Reclaim = struct {
     ctx: *anyopaque,
-    call: *const fn (ctx: *anyopaque, needed: u64) bool,
+    call: *const fn (ctx: *anyopaque, needed: u64) u64,
 };
 
 pub const Image = struct {
@@ -194,6 +198,39 @@ const CpuTile = struct {
 fn attnPlaneBytes(zh: usize, zw: usize, elem: u64) u64 {
     const seq: u64 = @as(u64, zh) * @as(u64, zw);
     return seq * seq * elem;
+}
+
+/// VAE-decode OOM recovery: bytes to free on the first retry round. The decode's
+/// exact deficit is unknown, so we free this much, retry, and double each round
+/// (see `max_reclaim_rounds`) — small enough to keep resident weights we didn't
+/// need to drop, large enough that a multi-GB deficit converges in a few retries
+/// (each retry re-runs the decode, so we don't want hundreds of tiny steps).
+const reclaim_chunk: u64 = 1 << 30; // 1 GiB
+
+/// Cap on VAE-decode reclaim retries before giving up on the whole-image decode
+/// and dropping to tiling. With `reclaim_chunk` doubling each round this frees up
+/// to ~1 TiB, far past any card — it's a stall backstop, not a real bound.
+const max_reclaim_rounds: usize = 16;
+
+/// Whether a GPU VAE-decode error is one we recover from by freeing VRAM and/or
+/// stepping down the fallback ladder (whole-image → reclaim+retry → GPU tiling →
+/// CPU tiling), rather than failing the whole image. VRAM exhaustion surfaces as
+/// `DeviceOutOfMemory`, but the cuBLASLt / cuDNN libraries report an
+/// out-of-workspace as `CublasLtError` / `CudnnError`, and the hand-PTX path can
+/// surface a post-OOM stream fault as `CudaError` — all of which used to hit the
+/// `else => return err` arm and hard-fail the decode even though a CPU tiled
+/// decode would have succeeded. `error.Canceled` and any structural error still
+/// propagate (we never want to mask those behind a silent CPU fallback).
+fn recoverableDecodeErr(err: anyerror) bool {
+    return switch (err) {
+        error.DeviceOutOfMemory,
+        error.OutOfMemory,
+        error.CudaError,
+        error.CublasLtError,
+        error.CudnnError,
+        => true,
+        else => false,
+    };
 }
 
 /// A reusable text-to-image pipeline. `init` creates the backend and loads the
@@ -433,15 +470,21 @@ pub const Session = struct {
         // encoder above stayed unpinned (pin_budget 0); the VAE (after the DiT
         // fills pin_budget) stays unpinned too.
         if (cu_be) |b| {
-            // Pin as much DiT as fits. `avail` is the shared budget (0 = all free
-            // VRAM). Reserve only the live activation scratch + a small margin —
-            // NOT the encoder (it's unpinned and evicts as the DiT pins), so a big
-            // reserve just leaves VRAM sitting empty.
-            const avail = if (opts.vram_budget > 0) opts.vram_budget else b.ctx.memGetInfo().free;
+            // Pin as much DiT as fits. Two caps: the shared BUDGET (opts.vram_budget,
+            // 0 = no cap; = card limit − LLM resident in the GUI), and — critically
+            // — what is PHYSICALLY reachable right now. The budget is blind to other
+            // processes on the card (desktop, a running ComfyUI, …); if we pin to it
+            // we OOM the moment physical VRAM runs out, and pinned weights can't be
+            // evicted to recover. Physical room = live free VRAM + our own unpinned
+            // weights (the text encoder), which evict + re-stream as the DiT pins.
+            // Reserve the live activation scratch + a small margin on top.
+            const free_now = b.ctx.memGetInfo().free;
+            const room = free_now + b.evictableWeightBytes();
+            const budget = if (opts.vram_budget > 0) @min(opts.vram_budget, room) else room;
             const pin_reserve: u64 = b.attn_scratch_budget + (512 << 20);
-            b.pin_budget = avail -| pin_reserve;
-            std.log.info("[diff-vram] budget={d}MB avail={d}MB reserve={d}MB pin={d}MB free={d}MB", .{
-                opts.vram_budget >> 20, avail >> 20, pin_reserve >> 20, b.pin_budget >> 20, b.ctx.memGetInfo().free >> 20,
+            b.pin_budget = budget -| pin_reserve;
+            std.log.info("[diff-vram] budget={d}MB room={d}MB reserve={d}MB pin={d}MB free={d}MB", .{
+                opts.vram_budget >> 20, room >> 20, pin_reserve >> 20, b.pin_budget >> 20, free_now >> 20,
             });
         }
 
@@ -623,72 +666,155 @@ pub const Session = struct {
             defer ops.matmul.gpu = saved;
             break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae }, CpuTile.call);
         } else if (cu_be) |b| planar_blk: {
-            // Whole-image decode first (fastest, seamless). The CUDA mid-block
-            // attention is bounded (hand-PTX flash on zig-cuda, cuDNN flash on
-            // libs), so this OOMs only when the conv activation buffers don't fit
-            // — then reclaim VRAM held by another CUDA context (the GUI chat
-            // model) and retry, and finally tile on the GPU. (skip_whole jumps
-            // straight to tiling.)
+            // Attempt ladder — whole-image (fastest, seamless) → GPU tiling
+            // (bounded footprint) → CPU (guaranteed). Before EACH GPU retry free
+            // JUST ENOUGH VRAM and try again, keeping the rest resident so we
+            // reload as little as possible: drop LRU weights from THIS backend's
+            // own cache first (the DiT — dead for the rest of this image,
+            // re-streams next image), and only when that can't cover the deficit
+            // reach into the chat LLM's context. The freed amount escalates so a
+            // big deficit converges in a few retries. OOM can arrive as
+            // DeviceOutOfMemory OR as a cuBLASLt/cuDNN out-of-workspace error
+            // (see recoverableDecodeErr). (skip_whole jumps straight to tiling.)
+            try note(progress, "vae decode: mode={s} pinned={d}MB streamed={d}MB free={d}MB\n", .{
+                @tagName(opts.vae_decode), b.pinnedWeightBytes() >> 20, b.evictableWeightBytes() >> 20, b.ctx.memGetInfo().free >> 20,
+            });
+            var want: u64 = reclaim_chunk;
+            // Free ~`wnt` bytes across this backend's own cache (LRU incl. the
+            // now-dead DiT) then the chat LLM, log it, and report the total freed
+            // (0 ⇒ nothing left to free).
+            const freeSome = struct {
+                fn call(bk: *cuda.Backend, reclaim: ?Reclaim, w: ?*std.Io.Writer, cio: std.Io, wnt: u64) !u64 {
+                    const t0 = std.Io.Clock.real.now(cio).nanoseconds;
+                    bk.bindThread();
+                    const from_self = bk.evictToFree(wnt);
+                    var got = from_self;
+                    if (got < wnt) if (reclaim) |r| {
+                        got += r.call(r.ctx, wnt - got);
+                        bk.bindThread(); // reclaim may have switched the context
+                    };
+                    const ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(cio).nanoseconds - t0)) / 1e6;
+                    try note(w, "vae decode: freed {d}MB (own {d}MB + llm {d}MB) of {d}MB wanted in {d:.0}ms\n", .{
+                        got >> 20, from_self >> 20, (got - from_self) >> 20, wnt >> 20, ms,
+                    });
+                    return got;
+                }
+            }.call;
+            // PROACTIVE pre-free: estimate the first attempt's peak activation VRAM
+            // and free up front so we hit free ≥ 110% of it — avoids burning full
+            // failed decodes just to discover the deficit (the reactive loops below
+            // still catch any shortfall, since the estimate can't see the opaque
+            // cuBLASLt/cuDNN conv workspace). Tiled decode's first attempt is one
+            // tile, so estimate at the tile size when skip_whole.
+            {
+                const est = if (skip_whole) vae.estimatePeakBytes(tp.tile, tp.tile) else vae.estimatePeakBytes(lat_h, lat_w);
+                const target = est + est / 10; // 110%
+                const free_now = b.ctx.memGetInfo().free;
+                try note(progress, "vae decode: est peak {d}MB, want free ≥ {d}MB (have {d}MB)\n", .{ est >> 20, target >> 20, free_now >> 20 });
+                if (free_now < target) _ = try freeSome(b, opts.reclaim, progress, io, target - free_now);
+            }
+            // Phase 1: whole-image with incremental eviction.
             if (!skip_whole) {
-                var attempt: usize = 0;
-                while (attempt < 4) : (attempt += 1) {
+                var round: usize = 0;
+                while (round < max_reclaim_rounds) : (round += 1) {
                     if (vae_cuda.decode(vae, b, io, gpa, x, lat_h, lat_w)) |p| {
                         break :planar_blk p;
-                    } else |err| switch (err) {
-                        error.DeviceOutOfMemory, error.OutOfMemory => {
-                            const freed = opts.reclaim != null and opts.reclaim.?.call(opts.reclaim.?.ctx, 0);
-                            if (freed) {
-                                b.bindThread(); // reclaim may have switched the current context
-                                try note(progress, "vae decode: out of VRAM, reclaimed → retry\n", .{});
-                                continue;
-                            }
-                            break; // nothing more to reclaim → tile
-                        },
-                        else => return err,
-                    }
+                    } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: whole-image OOM ({t}) → freeing VRAM\n", .{err});
+                    if (try freeSome(b, opts.reclaim, progress, io, want) == 0) break; // nothing left → tile
+                    want *|= 2;
                 }
             }
-            try note(progress, "vae decode: tiling on GPU ({d}² latent tiles)\n", .{tp.tile});
-            const ct = CudaTile{ .vae = vae, .be = b };
-            if (vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, ct, CudaTile.call)) |p| {
-                break :planar_blk p;
-            } else |err| switch (err) {
-                error.DeviceOutOfMemory, error.OutOfMemory => {
-                    try note(progress, "vae decode: GPU tiling out of VRAM → CPU tiled decode\n", .{});
-                    const saved = ops.matmul.gpu;
-                    ops.matmul.gpu = null;
-                    defer ops.matmul.gpu = saved;
-                    break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae }, CpuTile.call);
-                },
-                else => return err,
+            // Phase 2: GPU tiling (bounded) with the same incremental eviction —
+            // after the DiT is evicted a tile easily fits, and it's far faster
+            // than the CPU floor below.
+            {
+                var round: usize = 0;
+                while (round < max_reclaim_rounds) : (round += 1) {
+                    try note(progress, "vae decode: tiling on GPU ({d}² latent tiles)\n", .{tp.tile});
+                    const ct = CudaTile{ .vae = vae, .be = b };
+                    if (vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, ct, CudaTile.call)) |p| {
+                        break :planar_blk p;
+                    } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: GPU tiling OOM ({t}) → freeing VRAM\n", .{err});
+                    if (try freeSome(b, opts.reclaim, progress, io, want) == 0) break; // nothing left → CPU
+                    want *|= 2;
+                }
             }
+            // Phase 3: CPU tiling — the guaranteed VRAM-can't-OOM floor (slow).
+            try note(progress, "vae decode: GPU out of VRAM → CPU tiled decode (slow)\n", .{});
+            const saved = ops.matmul.gpu;
+            ops.matmul.gpu = null;
+            defer ops.matmul.gpu = saved;
+            break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae }, CpuTile.call);
         } else if (gpu_ctx) |gc| planar_blk: {
             // Whole-image decode first. The Vulkan mid-block attention is now
             // query-tiled (flash), so this OOMs only when the conv activation
-            // buffers don't fit — then tile the whole decode on the GPU.
+            // buffers don't fit. On OOM free JUST ENOUGH VRAM and retry, keeping
+            // the rest resident: each round drops LRU weights from this context's
+            // own cache first (the DiT), and only when that can't cover it
+            // reaches into the chat LLM's context. The freed amount escalates so
+            // a large deficit converges fast. If nothing more can be freed, tile
+            // on the GPU; if even a tile won't fit, decode on the CPU.
             // (skip_whole jumps straight to tiling.)
-            if (!skip_whole) {
-                if (vae_gpu.decode(vae, gc, io, gpa, x, lat_h, lat_w)) |p| {
-                    break :planar_blk p;
-                } else |err| switch (err) {
-                    error.DeviceOutOfMemory => {},
-                    else => return err,
+            try note(progress, "vae decode: mode={s} free={d}MB\n", .{ @tagName(opts.vae_decode), gc.liveVram() >> 20 });
+            {
+                // Proactive pre-free to ~110% of the estimated first-attempt peak,
+                // so we don't burn a full failed decode just to find the deficit.
+                const est = if (skip_whole) vae.estimatePeakBytes(tp.tile, tp.tile) else vae.estimatePeakBytes(lat_h, lat_w);
+                const target = est + est / 10;
+                const free_now = gc.liveVram();
+                try note(progress, "vae decode: est peak {d}MB, want free >= {d}MB (have {d}MB)\n", .{ est >> 20, target >> 20, free_now >> 20 });
+                if (free_now < target) {
+                    _ = gc.evictToFree(target - free_now);
+                    if (opts.reclaim) |r| _ = r.call(r.ctx, target -| gc.liveVram());
                 }
             }
-            try note(progress, "vae decode: tiling on GPU ({d}² latent tiles)\n", .{tp.tile});
-            const vt = VkTile{ .vae = vae, .gc = gc };
-            if (vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, vt, VkTile.call)) |p| {
-                break :planar_blk p;
-            } else |err| switch (err) {
-                error.DeviceOutOfMemory => {
-                    try note(progress, "vae decode: GPU tiling out of VRAM → CPU tiled decode\n", .{});
-                    const saved = ops.matmul.gpu;
-                    ops.matmul.gpu = null;
-                    defer ops.matmul.gpu = saved;
-                    break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae }, CpuTile.call);
-                },
-                else => return err,
+            if (!skip_whole) {
+                var want: u64 = reclaim_chunk;
+                var round: usize = 0;
+                while (round < max_reclaim_rounds) : (round += 1) {
+                    if (vae_gpu.decode(vae, gc, io, gpa, x, lat_h, lat_w)) |p| {
+                        break :planar_blk p;
+                    } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: whole-image OOM ({t}) -> freeing VRAM\n", .{err});
+                    const t0 = std.Io.Clock.real.now(io).nanoseconds;
+                    const from_self = gc.evictToFree(want); // own resident weights first
+                    var got = from_self;
+                    if (got < want) if (opts.reclaim) |r| {
+                        got += r.call(r.ctx, want - got); // then the chat LLM
+                    };
+                    const ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0)) / 1e6;
+                    try note(progress, "vae decode: freed {d}MB (own {d}MB + llm {d}MB) of {d}MB wanted in {d:.0}ms\n", .{ got >> 20, from_self >> 20, (got - from_self) >> 20, want >> 20, ms });
+                    if (got == 0) break; // nothing left to free → tile
+                    want *|= 2; // escalate so a big deficit converges fast
+                }
             }
+            // Phase 2: GPU tiling (bounded) with the same incremental eviction.
+            {
+                var wt: u64 = reclaim_chunk;
+                var round: usize = 0;
+                while (round < max_reclaim_rounds) : (round += 1) {
+                    try note(progress, "vae decode: tiling on GPU ({d}^2 latent tiles)\n", .{tp.tile});
+                    const vt = VkTile{ .vae = vae, .gc = gc };
+                    if (vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, vt, VkTile.call)) |p| {
+                        break :planar_blk p;
+                    } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: GPU tiling OOM ({t}) -> freeing VRAM\n", .{err});
+                    const t0 = std.Io.Clock.real.now(io).nanoseconds;
+                    const from_self = gc.evictToFree(wt);
+                    var got = from_self;
+                    if (got < wt) if (opts.reclaim) |r| {
+                        got += r.call(r.ctx, wt - got);
+                    };
+                    const ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0)) / 1e6;
+                    try note(progress, "vae decode: freed {d}MB (own {d}MB + llm {d}MB) for tiling in {d:.0}ms\n", .{ got >> 20, from_self >> 20, (got - from_self) >> 20, ms });
+                    if (got == 0) break; // nothing left → CPU
+                    wt *|= 2;
+                }
+            }
+            // Phase 3: CPU tiling — the guaranteed VRAM-can't-OOM floor (slow).
+            try note(progress, "vae decode: GPU out of VRAM -> CPU tiled decode (slow)\n", .{});
+            const saved = ops.matmul.gpu;
+            ops.matmul.gpu = null;
+            defer ops.matmul.gpu = saved;
+            break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae }, CpuTile.call);
         } else planar_blk: {
             // CPU-only: tile once the whole-image scores plane (f32) gets large,
             // so a big image doesn't try to allocate tens of GB of host RAM.
@@ -783,4 +909,19 @@ test "options validation" {
     const io = std.testing.io;
     try std.testing.expectError(error.SizeNotMultipleOf16, generate(io, gpa, .{ .prompt = "x", .width = 100, .height = 96 }, null));
     try std.testing.expectError(error.NoSteps, generate(io, gpa, .{ .prompt = "x", .steps = 0 }, null));
+}
+
+test "recoverableDecodeErr classifies VAE-decode fallbacks" {
+    // Every way a GPU decode can run out of VRAM must trigger the reclaim +
+    // tiling ladder — including the cuBLASLt / cuDNN out-of-workspace errors and
+    // the hand-PTX post-OOM stream fault, which previously escaped it.
+    try std.testing.expect(recoverableDecodeErr(error.DeviceOutOfMemory));
+    try std.testing.expect(recoverableDecodeErr(error.OutOfMemory));
+    try std.testing.expect(recoverableDecodeErr(error.CudaError));
+    try std.testing.expect(recoverableDecodeErr(error.CublasLtError));
+    try std.testing.expect(recoverableDecodeErr(error.CudnnError));
+    // Cancellation and structural errors must propagate, never be masked by a
+    // silent CPU fallback.
+    try std.testing.expect(!recoverableDecodeErr(error.Canceled));
+    try std.testing.expect(!recoverableDecodeErr(error.SizeNotMultipleOf16));
 }
