@@ -109,6 +109,9 @@ pub const DiffConfig = struct {
     /// computed (the "None" preview method). When true, `taew_path` selects
     /// TAESD vs. the built-in latent2rgb fallback.
     preview_enabled: bool = true,
+    /// Directory finished images are written to (with AUTOMATIC1111 metadata).
+    /// Null (or empty) disables saving. Duped into the engine on init.
+    output_dir: ?[]const u8 = null,
 };
 
 /// A requested diffusion-model path set awaiting application (gpa-owned dupes).
@@ -207,6 +210,42 @@ pub fn nowNs(io: std.Io) i64 {
     return @intCast(std.Io.Clock.real.now(io).nanoseconds);
 }
 
+/// Build an AUTOMATIC1111-style `parameters` metadata string. Format:
+///
+///     <prompt>
+///     Negative prompt: <negative>            (omitted when empty)
+///     Steps: N, Sampler: Euler, Schedule type: Simple, CFG scale: C, Seed: S, Size: WxH, Model: <name>
+///
+/// `model_name` is the diffusion checkpoint's file stem. Caller frees.
+pub fn buildA1111Params(
+    gpa: std.mem.Allocator,
+    prompt: []const u8,
+    negative: []const u8,
+    steps: usize,
+    cfg: f32,
+    seed: u64,
+    width: usize,
+    height: usize,
+    model_name: []const u8,
+) ![]u8 {
+    const neg_line = if (negative.len > 0)
+        try std.fmt.allocPrint(gpa, "Negative prompt: {s}\n", .{negative})
+    else
+        try gpa.dupe(u8, "");
+    defer gpa.free(neg_line);
+    return std.fmt.allocPrint(
+        gpa,
+        "{s}\n{s}Steps: {d}, Sampler: Euler, Schedule type: Simple, CFG scale: {d:.1}, Seed: {d}, Size: {d}x{d}, Model: {s}",
+        .{ prompt, neg_line, steps, cfg, seed, width, height, model_name },
+    );
+}
+
+/// The file stem of a path (basename minus final extension) — the a1111 "Model".
+fn modelStem(path: []const u8) []const u8 {
+    const base = std.fs.path.basename(path);
+    return if (std.mem.lastIndexOfScalar(u8, base, '.')) |dot| base[0..dot] else base;
+}
+
 pub fn rgbToRgba(gpa: std.mem.Allocator, rgb: []const u8, w: usize, h: usize) ![]u8 {
     const rgba = try gpa.alloc(u8, w * h * 4);
     for (0..w * h) |i| {
@@ -245,6 +284,11 @@ pub const Diffuser = struct {
     path_store: std.heap.ArenaAllocator,
     /// A requested model swap awaiting an idle queue (gpa-owned).
     paths_pending: ?PendingDiffPaths = null,
+
+    /// Directory finished images are saved to (gpa-owned; null = saving off).
+    /// Updated live from settings via `setOutputDir` (UI thread, queue idle);
+    /// read by the worker after a generation completes.
+    output_dir: ?[]u8 = null,
 
     /// The single unified image queue + history: every generated image (chat
     /// tool-call and studio) lives here, in creation order. The engine OWNS
@@ -287,6 +331,10 @@ pub const Diffuser = struct {
             .taew_owned = cfg.taew_path,
             .path_store = std.heap.ArenaAllocator.init(gpa),
             .vram = vram,
+            .output_dir = if (cfg.output_dir) |o|
+                (if (o.len > 0) gpa.dupe(u8, o) catch null else null)
+            else
+                null,
         };
     }
 
@@ -361,6 +409,7 @@ pub const Diffuser = struct {
         if (self.thread) |t| t.join();
         self.freeSession();
         self.freePendingPaths();
+        if (self.output_dir) |o| self.gpa.free(o);
         self.path_store.deinit();
         // The engine owns every queued image (chat + studio); free them here.
         for (self.queue.items) |gi| freeGenImage(self.gpa, gi);
@@ -411,6 +460,20 @@ pub const Diffuser = struct {
         self.opts.steps = steps;
         self.opts.width = width;
         self.opts.height = height;
+    }
+
+    /// Update the directory finished images are saved to (from settings). Null
+    /// or empty disables saving. Only touched when idle (the worker reads it at
+    /// completion); a live change takes effect for the next generation.
+    pub fn setOutputDir(self: *Diffuser, dir: ?[]const u8) void {
+        if (self.busy.load(.acquire)) return;
+        const want: ?[]const u8 = if (dir) |d| (if (d.len > 0) d else null) else null;
+        // No change? (both null, or same string) leave the owned copy alone.
+        if (want == null and self.output_dir == null) return;
+        if (want != null and self.output_dir != null and
+            std.mem.eql(u8, want.?, self.output_dir.?)) return;
+        if (self.output_dir) |o| self.gpa.free(o);
+        self.output_dir = if (want) |w| self.gpa.dupe(u8, w) catch null else null;
     }
 
     /// Set the live-preview method and reconcile the derived `opts` fields.
@@ -527,6 +590,59 @@ pub const Diffuser = struct {
         return self.vram.reclaim(self.vram.ctx, needed);
     }
 
+    /// Write a finished image to `output_dir` as a PNG with AUTOMATIC1111
+    /// `parameters` metadata. Best-effort: any failure is logged, not fatal (the
+    /// image still shows in the UI). Runs on the worker thread. `rgb` is packed
+    /// [h][w][3]; `opts` is the worker's per-image options (paths, params).
+    fn saveImage(self: *Diffuser, gi: *GenImage, opts: *const pipeline.Options, rgb: []const u8, w: usize, h: usize) void {
+        const dir = self.output_dir orelse return; // saving disabled
+        const gpa = self.gpa;
+
+        const params = buildA1111Params(
+            gpa,
+            gi.prompt,
+            gi.req_negative,
+            gi.req_steps,
+            gi.req_cfg,
+            gi.req_seed,
+            w,
+            h,
+            modelStem(opts.dit_path),
+        ) catch |err| {
+            std.log.err("image save (metadata) failed: {t}", .{err});
+            return;
+        };
+        defer gpa.free(params);
+
+        var png: std.ArrayList(u8) = .empty;
+        defer png.deinit(gpa);
+        tp.image.encodePngRgbText(gpa, &png, rgb, w, h, &.{
+            .{ .keyword = "parameters", .text = params },
+        }) catch |err| {
+            std.log.err("image save (encode) failed: {t}", .{err});
+            return;
+        };
+
+        // Unique, roughly time-sortable filename: tp_<ns>_<seed>.png.
+        const name = std.fmt.allocPrint(gpa, "tp_{d}_{d}.png", .{ gi.start_ns.load(.acquire), gi.req_seed }) catch return;
+        defer gpa.free(name);
+        const path = std.fs.path.join(gpa, &.{ dir, name }) catch return;
+        defer gpa.free(path);
+
+        std.Io.Dir.cwd().createDirPath(self.io, dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => {
+                std.log.err("image save (mkdir {s}) failed: {t}", .{ dir, err });
+                return;
+            },
+        };
+        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = png.items }) catch |err| {
+            std.log.err("image save (write {s}) failed: {t}", .{ path, err });
+            return;
+        };
+        std.log.info("saved image to {s}", .{path});
+    }
+
     fn worker(self: *Diffuser, gi: *GenImage) void {
         var opts = self.opts;
         opts.prompt = gi.prompt;
@@ -568,6 +684,10 @@ pub const Diffuser = struct {
             return;
         };
         defer img.deinit(self.gpa);
+
+        // Persist the finished image (packed RGB) with a1111 metadata before the
+        // RGBA conversion. Best-effort — a save failure never fails the gen.
+        self.saveImage(gi, &opts, img.rgb, img.width, img.height);
 
         // The pipeline returns packed RGB; dvui wants RGBA. Convert once.
         const px = img.width * img.height;
@@ -642,6 +762,35 @@ test "parseGenAttrs overrides only provided fields" {
     try std.testing.expectEqual(@as(usize, 992), gi2.req_width); // 1000/16*16
     try std.testing.expectEqual(@as(usize, 1024), gi2.req_height); // default
     try std.testing.expectEqual(@as(usize, 20), gi2.req_steps); // default (bad ignored)
+}
+
+test "modelStem strips directory and extension" {
+    try std.testing.expectEqualStrings("krea2", modelStem("/models/diffusion/krea2.safetensors"));
+    try std.testing.expectEqualStrings("krea2", modelStem("krea2.safetensors"));
+    try std.testing.expectEqualStrings("model", modelStem("/a/b/model")); // no extension
+    try std.testing.expectEqualStrings("v1.0", modelStem("/m/v1.0.ckpt")); // last dot only
+}
+
+test "buildA1111Params formats prompt, settings, and optional negative" {
+    const gpa = std.testing.allocator;
+
+    const with_neg = try buildA1111Params(gpa, "a cat", "blurry", 20, 3.5, 42, 1024, 768, "krea2");
+    defer gpa.free(with_neg);
+    try std.testing.expectEqualStrings(
+        "a cat\n" ++
+            "Negative prompt: blurry\n" ++
+            "Steps: 20, Sampler: Euler, Schedule type: Simple, CFG scale: 3.5, Seed: 42, Size: 1024x768, Model: krea2",
+        with_neg,
+    );
+
+    // No negative → the "Negative prompt:" line is omitted entirely.
+    const no_neg = try buildA1111Params(gpa, "a dog", "", 8, 1.0, 7, 512, 512, "m");
+    defer gpa.free(no_neg);
+    try std.testing.expectEqualStrings(
+        "a dog\n" ++
+            "Steps: 8, Sampler: Euler, Schedule type: Simple, CFG scale: 1.0, Seed: 7, Size: 512x512, Model: m",
+        no_neg,
+    );
 }
 
 test "nextSeed advances deterministically and distinctly" {

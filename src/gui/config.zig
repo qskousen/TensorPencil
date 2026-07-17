@@ -164,6 +164,12 @@ pub const Config = struct {
     text_encoder: PathBuf = .{},
     vae: PathBuf = .{},
     taesd: PathBuf = .{},
+    /// Directory generated images are written to (chat + image studio). Empty
+    /// means "not resolved"; `load` fills it with `<Pictures>/TensorPencil`
+    /// (`~/Pictures/TensorPencil` on Linux) when unset, so the settings view
+    /// shows a concrete default the user can edit. Empty at save-time disables
+    /// saving.
+    output_dir: PathBuf = .{},
     steps: usize = 20,
     width: usize = 1024,
     height: usize = 1024,
@@ -247,6 +253,15 @@ pub const Config = struct {
         return try std.fs.path.join(gpa, &.{ dir, file_name });
     }
 
+    /// The default image-output directory: `<Pictures>/TensorPencil`
+    /// (`~/Pictures/TensorPencil` on Linux). Null if the platform has no known
+    /// pictures location. Caller frees.
+    fn defaultOutputDir(io: std.Io, gpa: std.mem.Allocator, environ: *const Environ) !?[]u8 {
+        const base = (try known_folders.getPath(io, gpa, environ, .pictures)) orelse return null;
+        defer gpa.free(base);
+        return try std.fs.path.join(gpa, &.{ base, "TensorPencil" });
+    }
+
     /// Load settings from disk. A missing file (or missing keys) yields
     /// defaults; a malformed line is skipped rather than failing the load.
     /// `path_override` bypasses the well-known location (used by `--config`).
@@ -264,6 +279,15 @@ pub const Config = struct {
             const val = std.mem.trim(u8, line[eq + 1 ..], " \t\r");
             cfg.apply(key, val);
         }
+        // Fill an unset output dir with the platform default so the settings
+        // view shows a concrete, editable path (best-effort; left empty if the
+        // platform has no known data location, which disables image saving).
+        if (cfg.output_dir.opt() == null) {
+            if (defaultOutputDir(io, gpa, environ) catch null) |dir| {
+                defer gpa.free(dir);
+                cfg.output_dir.set(dir);
+            }
+        }
         return cfg;
     }
 
@@ -274,6 +298,7 @@ pub const Config = struct {
         else if (std.mem.eql(u8, key, "text_encoder")) self.text_encoder.set(val) //
         else if (std.mem.eql(u8, key, "vae")) self.vae.set(val) //
         else if (std.mem.eql(u8, key, "taesd")) self.taesd.set(val) //
+        else if (std.mem.eql(u8, key, "output_dir")) self.output_dir.set(val) //
         else if (std.mem.eql(u8, key, "system_prompt")) self.system_prompt.setUnescaped(val) //
         else if (std.mem.eql(u8, key, "steps")) {
             self.steps = std.fmt.parseInt(usize, val, 10) catch self.steps;
@@ -320,6 +345,7 @@ pub const Config = struct {
             \\text_encoder = {s}
             \\vae = {s}
             \\taesd = {s}
+            \\output_dir = {s}
             \\steps = {d}
             \\width = {d}
             \\height = {d}
@@ -336,7 +362,8 @@ pub const Config = struct {
             self.llm_model.slice(),       self.vision_tower.slice(),
             self.diffusion_model.slice(), self.text_encoder.slice(),
             self.vae.slice(),             self.taesd.slice(),
-            self.steps,                   self.width,
+            self.output_dir.slice(),      self.steps,
+            self.width,
             self.height,                  @tagName(self.preview),
             self.vram_split,              self.vram_limit_frac,
             @tagName(self.llm_backend),   @tagName(self.diff_backend),
@@ -474,6 +501,28 @@ test "save/load round-trips the new backend + decode fields" {
     try std.testing.expectEqual(Backend.vulkan, b.diff_backend);
     try std.testing.expectEqual(VaeDecode.gpu_tiled, b.vae_decode);
     try std.testing.expectEqualStrings("/m.gguf", b.llm_model.opt().?);
+}
+
+test "output_dir round-trips and apply parses it" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const file = ".gui-config-outdir-test";
+    defer std.Io.Dir.cwd().deleteFile(io, file) catch {};
+
+    var environ: Environ = .init(gpa);
+    defer environ.deinit();
+
+    var a: Config = .{};
+    a.output_dir.set("/tmp/my images");
+    try a.save(io, gpa, &environ, file);
+
+    // With an explicit output_dir set, load leaves it as-is (no default fill).
+    const b = Config.load(io, gpa, &environ, file);
+    try std.testing.expectEqualStrings("/tmp/my images", b.output_dir.opt().?);
+
+    var c: Config = .{};
+    c.apply("output_dir", "/data/out");
+    try std.testing.expectEqualStrings("/data/out", c.output_dir.opt().?);
 }
 
 test "llmReloadEql: LLM/vision force reload; diff + live fields (incl. VRAM meter) don't" {

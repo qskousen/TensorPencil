@@ -16,8 +16,18 @@ const bpp = 3;
 /// Largest IDAT payload, matching PIL/ComfyUI's 64 KiB chunking.
 const idat_chunk = 65536;
 
+/// A PNG `tEXt` metadata entry (keyword + Latin-1 text). AUTOMATIC1111 stores
+/// generation parameters as a single such chunk with keyword "parameters".
+pub const TextChunk = struct { keyword: []const u8, text: []const u8 };
+
 /// Encode [h][w][3] u8 RGB pixels as a PNG into `out`.
 pub fn encodePngRgb(gpa: std.mem.Allocator, out: *std.ArrayList(u8), pixels: []const u8, width: usize, height: usize) !void {
+    return encodePngRgbText(gpa, out, pixels, width, height, &.{});
+}
+
+/// Like `encodePngRgb`, but also embeds `texts` as `tEXt` chunks (placed after
+/// IHDR, before the image data, per the PNG spec's ancillary-chunk ordering).
+pub fn encodePngRgbText(gpa: std.mem.Allocator, out: *std.ArrayList(u8), pixels: []const u8, width: usize, height: usize, texts: []const TextChunk) !void {
     std.debug.assert(pixels.len == width * height * 3);
 
     try out.appendSlice(gpa, &png_signature);
@@ -32,6 +42,16 @@ pub fn encodePngRgb(gpa: std.mem.Allocator, out: *std.ArrayList(u8), pixels: []c
     ihdr[11] = 0; // filter
     ihdr[12] = 0; // interlace
     try writeChunk(gpa, out, "IHDR", &ihdr);
+
+    // tEXt metadata: [keyword]\0[text], one chunk each.
+    for (texts) |t| {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try buf.appendSlice(gpa, t.keyword);
+        try buf.append(gpa, 0);
+        try buf.appendSlice(gpa, t.text);
+        try writeChunk(gpa, out, "tEXt", buf.items);
+    }
 
     // Adaptive-filter each scanline: filter byte + filtered row bytes.
     const stride = width * 3;
@@ -306,6 +326,42 @@ test "png structure is valid" {
     // zlib header advertises deflate + FLEVEL "fast" (level 4), like ComfyUI.
     try std.testing.expectEqual(@as(u8, 0x78), idat.items[0]);
     try std.testing.expectEqual(@as(u8, 0x5e), idat.items[1]);
+}
+
+test "tEXt metadata chunk is embedded after IHDR" {
+    const gpa = std.testing.allocator;
+    const pixels = [_]u8{ 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255 };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    const params = "a cat\nSteps: 20, Seed: 42";
+    try encodePngRgbText(gpa, &out, &pixels, 2, 2, &.{
+        .{ .keyword = "parameters", .text = params },
+    });
+
+    const bytes = out.items;
+    // Walk chunks, find the tEXt chunk, and confirm its order + payload.
+    var i: usize = 8;
+    var order: std.ArrayList([]const u8) = .empty;
+    defer order.deinit(gpa);
+    var text_payload: ?[]const u8 = null;
+    while (i < bytes.len) {
+        const len = std.mem.readInt(u32, bytes[i..][0..4], .big);
+        const chunk_type = bytes[i + 4 ..][0..4];
+        const data = bytes[i + 8 ..][0..len];
+        try order.append(gpa, chunk_type);
+        if (std.mem.eql(u8, chunk_type, "tEXt")) text_payload = data;
+        i += 12 + len;
+    }
+    // Expected chunk order: IHDR, tEXt, IDAT…, IEND.
+    try std.testing.expectEqualStrings("IHDR", order.items[0]);
+    try std.testing.expectEqualStrings("tEXt", order.items[1]);
+    try std.testing.expectEqualStrings("IDAT", order.items[2]);
+
+    // Payload is "parameters\0<params>".
+    const p = text_payload.?;
+    const nul = std.mem.indexOfScalar(u8, p, 0).?;
+    try std.testing.expectEqualStrings("parameters", p[0..nul]);
+    try std.testing.expectEqualStrings(params, p[nul + 1 ..]);
 }
 
 test "png round-trips through deflate and filtering" {

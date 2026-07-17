@@ -94,6 +94,10 @@ pub fn render(cfg: *config.Config, cb: Callbacks) void {
     pathRow(5, "TAESD preview", &cfg.taesd, "Safetensors", &safetensors_filters);
 
     section(21, "Image generation");
+    help(4, "Generated images (chat and the image studio) are saved here as PNGs " ++
+        "with AUTOMATIC1111-style metadata embedded. Defaults to a TensorPencil " ++
+        "folder in your Pictures directory; clear it to disable saving.");
+    dirRow(6, "Output folder", &cfg.output_dir);
     numRow(10, "Default steps", &steps_buf);
     numRow(11, "Default width", &width_buf);
     numRow(12, "Default height", &height_buf);
@@ -173,6 +177,32 @@ fn pathRow(id: usize, label: []const u8, pb: *config.PathBuf, desc: []const u8, 
 
     if (dvui.button(@src(), "Browse…", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 4 } })) {
         pickFile(pb, label, desc, filters);
+    }
+    if (dvui.button(@src(), "Clear", .{}, .{ .gravity_y = 0.5 })) {
+        pb.set("");
+    }
+}
+
+/// Like `pathRow`, but browses for a directory (native folder-select dialog).
+fn dirRow(id: usize, label: []const u8, pb: *config.PathBuf) void {
+    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = id, .expand = .horizontal, .padding = .{ .x = 4, .y = 3 } });
+    defer row.deinit();
+
+    dvui.label(@src(), "{s}", .{label}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
+
+    var te = dvui.textEntry(@src(), .{
+        .text = .{ .buffer = &pb.data },
+        .placeholder = "saving disabled",
+    }, .{ .expand = .horizontal, .gravity_y = 0.5 });
+    te.deinit();
+
+    if (dvui.button(@src(), "Browse…", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 4 } })) {
+        const arena = dvui.currentWindow().arena();
+        const chosen = dvui.dialogNativeFolderSelect(arena, .{
+            .title = label,
+            .path = pb.opt(),
+        }) catch null;
+        if (chosen) |p| pb.set(p);
     }
     if (dvui.button(@src(), "Clear", .{}, .{ .gravity_y = 0.5 })) {
         pb.set("");

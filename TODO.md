@@ -1,6 +1,3 @@
-- separate image generation mode with no llm
-- our taesd quality sucks way more than comfy, why?
-- add ability to save image to disk with parameters
 - add image copy to clipboard button
 - save window size and position in config on change (incl. image viewer, incl. maximized)
 - save thinking toggle if not already
