@@ -499,6 +499,17 @@ pub const Session = struct {
                 null;
             defer if (preview_scratch) |ps| gpa.free(ps);
 
+            // Scratch for the per-step denoised (x0) estimate that we preview.
+            // We decode the model's clean-image estimate `x - sigma*v`, not the
+            // raw noisy latent `x` — matching ComfyUI's preview (it decodes the
+            // `denoised` sample), so the preview reads as a blurry image that
+            // sharpens rather than noise that resolves only at the last steps.
+            const preview_x0: ?[]f32 = if (opts.preview and opts.on_step != null)
+                try gpa.alloc(f32, x.len)
+            else
+                null;
+            defer if (preview_x0) |p| gpa.free(p);
+
             // Optional taew2_1 (TAEHV) approx-VAE for a sharper preview.
             var taew_st: ?safetensors.SafeTensors = null;
             defer if (taew_st) |*s| s.deinit();
@@ -541,10 +552,19 @@ pub const Session = struct {
                     var pv: ?Preview = null;
                     var taew_rgb: ?[]u8 = null;
                     defer if (taew_rgb) |r| gpa.free(r);
+                    // Denoised (x0) estimate = x - sigma*v. `eulerStep` above set
+                    // x to x_{i+1} = x_i + (sigma_{i+1} - sigma_i)*v, so the clean
+                    // estimate in terms of the post-step latent is x - sigma_{i+1}*v
+                    // (collapses to x on the final step where sigma_{i+1}==0).
+                    const x0: []const f32 = if (preview_x0) |px0| blk: {
+                        const s_next = sigmas[i + 1];
+                        for (px0, x, v) |*o, xi, vi| o.* = xi - s_next * vi;
+                        break :blk px0;
+                    } else x;
                     if (taehv_dec) |*d| taew_blk: {
                         const th = lat_h / preview_ds;
                         const tw = lat_w / preview_ds;
-                        const small = downsampleLatent(gpa, x, lat_h, lat_w, preview_ds) catch break :taew_blk;
+                        const small = downsampleLatent(gpa, x0, lat_h, lat_w, preview_ds) catch break :taew_blk;
                         defer gpa.free(small);
                         const rgb = if (cu_be) |b|
                             (taehv_cuda_mod.decode(d, b, gpa, small, th, tw) catch break :taew_blk)
@@ -554,7 +574,7 @@ pub const Session = struct {
                         pv = .{ .rgb = rgb, .width = tw * taehv_mod.spatial_scale, .height = th * taehv_mod.spatial_scale };
                     }
                     if (pv == null) if (preview_scratch) |ps| {
-                        wan_vae.latentPreviewInto(ps, x, lat_h, lat_w);
+                        wan_vae.latentPreviewInto(ps, x0, lat_h, lat_w);
                         pv = .{ .rgb = ps, .width = lat_w, .height = lat_h };
                     };
                     p.step(p.ctx, i + 1, opts.steps, pv);
