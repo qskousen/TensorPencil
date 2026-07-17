@@ -6,6 +6,7 @@ const std = @import("std");
 const dvui = @import("dvui");
 const SDLBackend = @import("backend");
 const diffuser = @import("diffuser.zig");
+const clipboard = @import("clipboard.zig");
 const fonts = @import("fonts.zig");
 
 pub const GenImage = diffuser.GenImage;
@@ -152,6 +153,11 @@ pub const Viewer = struct {
             dvui.label(@src(), "image {d}/{d}   {d:.0}%   (← → navigate · scroll zoom · drag pan · 0 fit · 1 100% · Esc close)", .{
                 idx + 1, buf.items.len, self.zoom * 100,
             }, .{ .gravity_y = 0.5 });
+            {
+                var sp = dvui.box(@src(), .{}, .{ .expand = .horizontal });
+                sp.deinit();
+            }
+            if (dvui.button(@src(), "Copy", .{}, .{ .gravity_y = 0.5 })) clipboard.copyImage(self.cur);
         }
 
         self.renderImageArea();
@@ -162,6 +168,12 @@ pub const Viewer = struct {
             if (e.handled or e.evt != .key) continue;
             const ke = e.evt.key;
             if (ke.action != .down and ke.action != .repeat) continue;
+            // Ctrl/Cmd+C copies the current image to the clipboard as a PNG.
+            if (ke.code == .c and ke.action == .down and (ke.mod.control() or ke.mod.command())) {
+                e.handled = true;
+                clipboard.copyImage(self.cur);
+                continue;
+            }
             switch (ke.code) {
                 .left => {
                     e.handled = true;

@@ -17,6 +17,7 @@ const config = @import("config.zig");
 const config_view = @import("config_view.zig");
 const image_view = @import("image_view.zig");
 const diffuser = @import("diffuser.zig");
+const clipboard = @import("clipboard.zig");
 const meter = @import("meter.zig");
 const status_bar = @import("status_bar.zig");
 const vips = @import("vips");
@@ -1224,13 +1225,23 @@ fn renderGenImage(s: ?*chat.Session, gi: *chat.GenImage, gi_idx: usize) void {
 
                 genInfo(gi);
 
-                // Let the model see this image: attach it to the next message.
-                // Only when a live vision-capable session exists.
-                if (s) |ss| if (ss.visionEnabled()) {
-                    if (dvui.button(@src(), "Discuss this image", .{}, .{ .margin = .{ .y = 4 } })) {
-                        ss.attachRgba(rgba, gi.width, gi.height) catch |err| std.log.err("attach image: {t}", .{err});
-                    }
-                };
+                {
+                    var actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .margin = .{ .y = 4 } });
+                    defer actions.deinit();
+                    // Copy the image to the clipboard as a PNG.
+                    if (dvui.buttonIcon(@src(), "copy", dvui.entypo.clipboard, .{}, .{}, .{
+                        .min_size_content = .{ .w = 18, .h = 18 },
+                        .gravity_y = 0.5,
+                    })) clipboard.copyImage(gi);
+
+                    // Let the model see this image: attach it to the next
+                    // message. Only when a live vision-capable session exists.
+                    if (s) |ss| if (ss.visionEnabled()) {
+                        if (dvui.button(@src(), "Discuss this image", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 6 } })) {
+                            ss.attachRgba(rgba, gi.width, gi.height) catch |err| std.log.err("attach image: {t}", .{err});
+                        }
+                    };
+                }
             }
         },
         .failed => {

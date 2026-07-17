@@ -11,6 +11,7 @@ const std = @import("std");
 const dvui = @import("dvui");
 const config = @import("config.zig");
 const diffuser = @import("diffuser.zig");
+const clipboard = @import("clipboard.zig");
 const fonts = @import("fonts.zig");
 
 const GenImage = diffuser.GenImage;
@@ -306,8 +307,19 @@ fn renderCell(gi: *GenImage, idx: usize, cell: f32) void {
                 ib.deinit();
                 if (clicked) viewer_request = gi;
 
+                var meta_row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .{ .y = 2 } });
+                defer meta_row.deinit();
                 var mbuf: [64]u8 = undefined;
-                dvui.label(@src(), "{s}", .{std.fmt.bufPrint(&mbuf, "{d}×{d} · seed {d}", .{ gi.width, gi.height, gi.req_seed }) catch ""}, .{ .margin = .{ .y = 2 } });
+                dvui.label(@src(), "{s}", .{std.fmt.bufPrint(&mbuf, "{d}×{d} · seed {d}", .{ gi.width, gi.height, gi.req_seed }) catch ""}, .{ .gravity_y = 0.5 });
+                {
+                    var sp = dvui.box(@src(), .{}, .{ .expand = .horizontal });
+                    sp.deinit();
+                }
+                // Copy the image to the clipboard as a PNG.
+                if (dvui.buttonIcon(@src(), "copy", dvui.entypo.clipboard, .{}, .{}, .{
+                    .min_size_content = .{ .w = 16, .h = 16 },
+                    .gravity_y = 0.5,
+                })) clipboard.copyImage(gi);
             }
         },
         .failed => dvui.label(@src(), "⚠ failed", .{}, .{}),
