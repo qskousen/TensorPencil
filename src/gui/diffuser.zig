@@ -150,6 +150,9 @@ pub const DiffConfig = struct {
     vram_budget: u64 = 0,
     /// Optional taew2_1 approx-VAE for a sharper live preview (else latent2rgb).
     taew_path: ?[]const u8 = null,
+    /// Latent-resolution divisor for the TAESD preview (see pipeline.Options.
+    /// preview_ds). 0 = adaptive default.
+    preview_ds: usize = 0,
     /// Show a live preview while sampling. When false, no per-step preview is
     /// computed (the "None" preview method). When true, `taew_path` selects
     /// TAESD vs. the built-in latent2rgb fallback.
@@ -372,6 +375,7 @@ pub const Diffuser = struct {
                 .text_encoder_path = cfg.text_encoder_path,
                 .preview = cfg.preview_enabled,
                 .taew_path = cfg.taew_path,
+                .preview_ds = cfg.preview_ds,
             },
             .seed = 0,
             .taew_owned = cfg.taew_path,
@@ -529,6 +533,14 @@ pub const Diffuser = struct {
         self.refreshPreview();
     }
 
+    /// Set the TAESD preview resolution (latent-grid divisor; see
+    /// pipeline.Options.preview_ds). Applied live; ignored while a generation is
+    /// in flight (picked up on the next enqueue).
+    pub fn setPreviewSize(self: *Diffuser, preview_ds: usize) void {
+        if (self.busy.load(.acquire)) return;
+        self.opts.preview_ds = preview_ds;
+    }
+
     /// Reconcile the live-preview fields of `opts` with `preview_method` and the
     /// current taew path.
     fn refreshPreview(self: *Diffuser) void {
@@ -611,11 +623,14 @@ pub const Diffuser = struct {
         // Make VRAM room for the image model before it loads (the worker
         // auto-budgets from live free VRAM).
         self.vram.enter(self.vram.ctx);
-        // Generous fixed preview buffer (holds any preview up to 512²). The
+        // Preview buffer, sized to the final image resolution — the upper bound
+        // on any preview: a full-latent TAESD preview decodes at the image res
+        // (lat·spatial_scale), and latent2rgb is smaller (latent res). Sizing it
+        // to a fixed 512² silently dropped the larger TAESD sizes (½, full). The
         // pointer stays put for the whole generation; dims published via atomics.
         gi.preview_w = .init(0);
         gi.preview_h = .init(0);
-        if (self.gpa.alloc(u8, 512 * 512 * 4)) |pb| {
+        if (self.gpa.alloc(u8, gi.req_width * gi.req_height * 4)) |pb| {
             @memset(pb, 0);
             gi.preview = pb;
         } else |_| {

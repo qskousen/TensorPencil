@@ -54,6 +54,43 @@ pub const Preview = enum(u8) {
     }
 };
 
+/// Resolution of the live TAESD preview, as a fraction of the latent grid. A
+/// smaller fraction decodes faster (fewer pixels through the approx-VAE) but is
+/// blurrier; `full` decodes the whole latent for the sharpest preview. Maps to
+/// `pipeline.Options.preview_ds` (the latent-resolution divisor).
+pub const TaesdSize = enum(u8) {
+    sixth,
+    quarter,
+    half,
+    full,
+
+    pub fn label(self: TaesdSize) []const u8 {
+        return switch (self) {
+            .sixth => "1/6 latent (fastest)",
+            .quarter => "1/4 latent",
+            .half => "1/2 latent",
+            .full => "Full latent (sharpest)",
+        };
+    }
+
+    /// Latent-resolution divisor fed to the preview decode.
+    pub fn divisor(self: TaesdSize) usize {
+        return switch (self) {
+            .sixth => 6,
+            .quarter => 4,
+            .half => 2,
+            .full => 1,
+        };
+    }
+
+    fn fromStr(s: []const u8) ?TaesdSize {
+        inline for (@typeInfo(TaesdSize).@"enum".fields) |f| {
+            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        }
+        return null;
+    }
+};
+
 /// Compute backend. Mirrors `pipeline.Backend`; kept here so the config data
 /// model stays free of an engine dependency (app.zig maps it across). Diffusion
 /// supports all four; the chat LLM only supports the two CUDA variants today
@@ -178,6 +215,9 @@ pub const Config = struct {
     width: usize = 1024,
     height: usize = 1024,
     preview: Preview = .taesd,
+    /// Resolution of the live TAESD preview as a fraction of the latent grid.
+    /// Applied live (no reload) like the preview method itself.
+    taesd_size: TaesdSize = .quarter,
     /// VRAM meter policy as fractions of the whole card (the two draggable
     /// handles; they replace the old max-VRAM cap + priority toggle). `vram_split`
     /// is the LLM|diffusion contention boundary (the LLM's guaranteed share);
@@ -330,6 +370,8 @@ pub const Config = struct {
             self.height = std.fmt.parseInt(usize, val, 10) catch self.height;
         } else if (std.mem.eql(u8, key, "preview")) {
             if (Preview.fromStr(val)) |p| self.preview = p;
+        } else if (std.mem.eql(u8, key, "taesd_size")) {
+            if (TaesdSize.fromStr(val)) |t| self.taesd_size = t;
         } else if (std.mem.eql(u8, key, "vram_split")) {
             self.vram_split = std.math.clamp(std.fmt.parseFloat(f32, val) catch self.vram_split, 0, 1);
         } else if (std.mem.eql(u8, key, "vram_limit_frac")) {
@@ -392,6 +434,7 @@ pub const Config = struct {
             \\width = {d}
             \\height = {d}
             \\preview = {s}
+            \\taesd_size = {s}
             \\vram_split = {d}
             \\vram_limit_frac = {d}
             \\llm_backend = {s}
@@ -417,7 +460,8 @@ pub const Config = struct {
             self.output_dir.slice(),      self.steps,
             self.width,
             self.height,                  @tagName(self.preview),
-            self.vram_split,              self.vram_limit_frac,
+            @tagName(self.taesd_size),    self.vram_split,
+            self.vram_limit_frac,
             @tagName(self.llm_backend),   @tagName(self.diff_backend),
             @tagName(self.vae_decode),    self.reasoning,
             self.win_w,                   self.win_h,
@@ -473,6 +517,22 @@ test "Config.apply parses keys and tolerates junk" {
     try std.testing.expectEqual(@as(usize, 30), cfg.steps);
     try std.testing.expectEqual(Preview.latent2rgb, cfg.preview);
     try std.testing.expectEqual(@as(usize, 1024), cfg.width); // unchanged on junk
+}
+
+test "apply parses taesd_size and maps to a latent divisor" {
+    var cfg: Config = .{};
+    try std.testing.expectEqual(TaesdSize.quarter, cfg.taesd_size); // default
+    try std.testing.expectEqual(@as(usize, 4), cfg.taesd_size.divisor());
+
+    cfg.apply("taesd_size", "sixth");
+    try std.testing.expectEqual(TaesdSize.sixth, cfg.taesd_size);
+    try std.testing.expectEqual(@as(usize, 6), cfg.taesd_size.divisor());
+
+    cfg.apply("taesd_size", "full");
+    try std.testing.expectEqual(@as(usize, 1), cfg.taesd_size.divisor());
+
+    cfg.apply("taesd_size", "garbage"); // unchanged on junk
+    try std.testing.expectEqual(TaesdSize.full, cfg.taesd_size);
 }
 
 test "apply parses the reasoning flag (default on)" {

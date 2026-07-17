@@ -108,6 +108,12 @@ pub fn render(cfg: *config.Config, cb: Callbacks) void {
         dvui.label(@src(), "Live preview", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
         _ = dvui.dropdownEnum(@src(), config.Preview, .{ .choice = &cfg.preview }, .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 200 } });
     }
+    if (cfg.preview == .taesd) {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 4 } });
+        defer row.deinit();
+        dvui.label(@src(), "Preview size", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
+        taesdSizeDropdown(&cfg.taesd_size);
+    }
     {
         var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 4 } });
         defer row.deinit();
@@ -150,6 +156,25 @@ pub fn render(cfg: *config.Config, cb: Callbacks) void {
             .multiline = true,
         }, .{ .expand = .horizontal, .min_size_content = .{ .h = 90 }, .max_size_content = .height(220) });
         te.deinit();
+    }
+}
+
+/// Enum dropdown for the TAESD preview size. Unlike `dvui.dropdownEnum` (which
+/// shows raw tag names), this renders each option's human-readable `label()`
+/// (e.g. "1/6 latent") since the fractions can't be spelled as enum tags.
+fn taesdSizeDropdown(choice: *config.TaesdSize) void {
+    var dd: dvui.DropdownWidget = undefined;
+    dd.init(@src(), .{
+        .selected_index = @intFromEnum(choice.*),
+        .label = choice.label(),
+    }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 200 } });
+    defer dd.deinit();
+
+    if (dd.dropped()) {
+        inline for (@typeInfo(config.TaesdSize).@"enum".fields) |e| {
+            const opt: config.TaesdSize = @field(config.TaesdSize, e.name);
+            if (dd.addChoiceLabel(opt.label())) choice.* = opt;
+        }
     }
 }
 

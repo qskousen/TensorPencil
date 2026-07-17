@@ -123,6 +123,10 @@ pub const Options = struct {
     /// Optional taew2_1 approx-VAE (TAEHV) checkpoint for a higher-quality
     /// preview; falls back to latent2rgb when null or unloadable.
     taew_path: ?[]const u8 = null,
+    /// Latent-resolution divisor for the TAESD preview decode: the preview is
+    /// decoded at 1/`preview_ds` of the latent grid. 0 selects the adaptive
+    /// default (targets ~256px). Larger = faster but blurrier.
+    preview_ds: usize = 0,
     /// Optional cancel flag, polled between sampling steps and before the VAE
     /// decode. When it flips true, `generate` unwinds and returns
     /// `error.Canceled` (a caller-driven stop, not a failure).
@@ -558,7 +562,14 @@ pub const Session = struct {
             defer if (taew_st) |*s| s.deinit();
             var taehv_dec: ?taehv_mod.Decoder = null;
             defer if (taehv_dec) |*d| d.deinit();
-            const preview_ds: usize = @max(1, @max(lat_h, lat_w) / 32); // downsample so preview ≈ 256px
+            // Downsample factor for the preview decode. An explicit `opts.preview_ds`
+            // (from the GUI's TAESD-size setting) wins; 0 falls back to the adaptive
+            // default that targets a ~256px preview. Clamp to the latent grid so a
+            // large divisor on a small latent can't collapse to a 0-sized decode.
+            const preview_ds: usize = @min(
+                @max(1, @min(lat_h, lat_w)),
+                if (opts.preview_ds > 0) opts.preview_ds else @max(1, @max(lat_h, lat_w) / 32),
+            );
             if (opts.preview and opts.on_step != null) if (opts.taew_path) |tp| {
                 if (safetensors.SafeTensors.open(gpa, io, tp)) |tst| {
                     taew_st = tst;

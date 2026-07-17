@@ -783,6 +783,7 @@ fn dcfgFromConfig() diffuser.DiffConfig {
         .vae_decode = diffuser.toPipelineVae(g_config.vae_decode),
         .preview_enabled = g_config.preview != .none,
         .taew_path = if (g_config.preview == .taesd) g_config.taesd.opt() else null,
+        .preview_ds = g_config.taesd_size.divisor(),
         .output_dir = g_config.output_dir.opt(),
     };
 }
@@ -813,6 +814,7 @@ fn syncDiffuser() void {
     );
     d.setDefaults(g_config.steps, g_config.width, g_config.height);
     d.setPreview(g_config.preview);
+    d.setPreviewSize(g_config.taesd_size.divisor());
     d.setOutputDir(g_config.output_dir.opt());
 }
 
