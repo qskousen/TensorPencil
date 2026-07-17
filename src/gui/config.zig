@@ -157,6 +157,10 @@ pub fn TextBuf(comptime cap: usize) type {
 
 pub const PathBuf = TextBuf(max_path);
 
+/// Sentinel for an unsaved window position: SDL places the window itself (the
+/// WM's default / centered) instead of us restoring a stored coordinate.
+pub const pos_unset: i32 = std.math.minInt(i32);
+
 pub const Config = struct {
     llm_model: PathBuf = .{},
     vision_tower: PathBuf = .{},
@@ -196,6 +200,24 @@ pub const Config = struct {
     /// live — the GUI toolbar toggle flips this without a reload; the block is
     /// rendered collapsed. No effect on non-reasoning models (e.g. Gemma 3).
     reasoning: bool = true,
+
+    /// Persisted window geometry for the main window and the image viewer,
+    /// restored on the next launch. Size/position track the *restored* (non-
+    /// maximized) geometry — while a window is maximized these keep the last
+    /// unmaximized values so un-maximizing (and the next launch) lands sensibly.
+    /// `*_x`/`*_y` are `pos_unset` until a window has been moved. These are pure
+    /// view state: never load- or reload-affecting (not compared by any
+    /// `*ReloadEql`), and saved on change directly (see app.captureGeom).
+    win_w: usize = 1100,
+    win_h: usize = 820,
+    win_x: i32 = pos_unset,
+    win_y: i32 = pos_unset,
+    win_max: bool = false,
+    viewer_w: usize = 1000,
+    viewer_h: usize = 760,
+    viewer_x: i32 = pos_unset,
+    viewer_y: i32 = pos_unset,
+    viewer_max: bool = false,
 
     /// The LLM side (model, vision tower, VRAM limit) matches. A change here
     /// needs a reload — but a transcript-preserving one: the chat is carried
@@ -320,6 +342,26 @@ pub const Config = struct {
             if (VaeDecode.fromStr(val)) |v| self.vae_decode = v;
         } else if (std.mem.eql(u8, key, "reasoning")) {
             self.reasoning = std.mem.eql(u8, val, "true");
+        } else if (std.mem.eql(u8, key, "win_w")) {
+            self.win_w = std.fmt.parseInt(usize, val, 10) catch self.win_w;
+        } else if (std.mem.eql(u8, key, "win_h")) {
+            self.win_h = std.fmt.parseInt(usize, val, 10) catch self.win_h;
+        } else if (std.mem.eql(u8, key, "win_x")) {
+            self.win_x = std.fmt.parseInt(i32, val, 10) catch self.win_x;
+        } else if (std.mem.eql(u8, key, "win_y")) {
+            self.win_y = std.fmt.parseInt(i32, val, 10) catch self.win_y;
+        } else if (std.mem.eql(u8, key, "win_max")) {
+            self.win_max = std.mem.eql(u8, val, "true");
+        } else if (std.mem.eql(u8, key, "viewer_w")) {
+            self.viewer_w = std.fmt.parseInt(usize, val, 10) catch self.viewer_w;
+        } else if (std.mem.eql(u8, key, "viewer_h")) {
+            self.viewer_h = std.fmt.parseInt(usize, val, 10) catch self.viewer_h;
+        } else if (std.mem.eql(u8, key, "viewer_x")) {
+            self.viewer_x = std.fmt.parseInt(i32, val, 10) catch self.viewer_x;
+        } else if (std.mem.eql(u8, key, "viewer_y")) {
+            self.viewer_y = std.fmt.parseInt(i32, val, 10) catch self.viewer_y;
+        } else if (std.mem.eql(u8, key, "viewer_max")) {
+            self.viewer_max = std.mem.eql(u8, val, "true");
         }
     }
 
@@ -356,6 +398,16 @@ pub const Config = struct {
             \\diff_backend = {s}
             \\vae_decode = {s}
             \\reasoning = {}
+            \\win_w = {d}
+            \\win_h = {d}
+            \\win_x = {d}
+            \\win_y = {d}
+            \\win_max = {}
+            \\viewer_w = {d}
+            \\viewer_h = {d}
+            \\viewer_x = {d}
+            \\viewer_y = {d}
+            \\viewer_max = {}
             \\system_prompt = {s}
             \\
         , .{
@@ -368,6 +420,11 @@ pub const Config = struct {
             self.vram_split,              self.vram_limit_frac,
             @tagName(self.llm_backend),   @tagName(self.diff_backend),
             @tagName(self.vae_decode),    self.reasoning,
+            self.win_w,                   self.win_h,
+            self.win_x,                   self.win_y,
+            self.win_max,                 self.viewer_w,
+            self.viewer_h,                self.viewer_x,
+            self.viewer_y,                self.viewer_max,
             prompt_esc,
         });
         defer gpa.free(content);
@@ -501,6 +558,44 @@ test "save/load round-trips the new backend + decode fields" {
     try std.testing.expectEqual(Backend.vulkan, b.diff_backend);
     try std.testing.expectEqual(VaeDecode.gpu_tiled, b.vae_decode);
     try std.testing.expectEqualStrings("/m.gguf", b.llm_model.opt().?);
+}
+
+test "window geometry round-trips (size, position, maximized)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const file = ".gui-config-geom-test";
+    defer std.Io.Dir.cwd().deleteFile(io, file) catch {};
+
+    var environ: Environ = .init(gpa);
+    defer environ.deinit();
+
+    // Defaults: position unset, not maximized.
+    var a: Config = .{};
+    try std.testing.expectEqual(pos_unset, a.win_x);
+    try std.testing.expect(!a.win_max);
+
+    a.win_w = 1440;
+    a.win_h = 900;
+    a.win_x = -30; // negative coords are valid on multi-monitor setups
+    a.win_y = 12;
+    a.win_max = true;
+    a.viewer_w = 800;
+    a.viewer_h = 600;
+    a.viewer_x = 100;
+    a.viewer_y = 200;
+    try a.save(io, gpa, &environ, file);
+
+    const b = Config.load(io, gpa, &environ, file);
+    try std.testing.expectEqual(@as(usize, 1440), b.win_w);
+    try std.testing.expectEqual(@as(usize, 900), b.win_h);
+    try std.testing.expectEqual(@as(i32, -30), b.win_x);
+    try std.testing.expectEqual(@as(i32, 12), b.win_y);
+    try std.testing.expect(b.win_max);
+    try std.testing.expectEqual(@as(usize, 800), b.viewer_w);
+    try std.testing.expectEqual(@as(usize, 600), b.viewer_h);
+    try std.testing.expectEqual(@as(i32, 100), b.viewer_x);
+    try std.testing.expectEqual(@as(i32, 200), b.viewer_y);
+    try std.testing.expect(!b.viewer_max); // untouched → default
 }
 
 test "output_dir round-trips and apply parses it" {

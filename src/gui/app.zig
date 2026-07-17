@@ -118,6 +118,75 @@ fn applyMeterPolicy() void {
     };
 }
 
+/// Restore a persisted window geometry onto a freshly created SDL window. Size
+/// is applied first, then position (only when one was saved — otherwise SDL's
+/// default placement stands), then maximize last so it overrides the rect.
+fn applyWindowGeom(window: ?*SDLBackend.c.SDL_Window, w: usize, h: usize, x: i32, y: i32, maximized: bool) void {
+    _ = SDLBackend.c.SDL_SetWindowSize(window, @intCast(w), @intCast(h));
+    if (x != config.pos_unset and y != config.pos_unset)
+        _ = SDLBackend.c.SDL_SetWindowPosition(window, x, y);
+    if (maximized) _ = SDLBackend.c.SDL_MaximizeWindow(window);
+}
+
+/// Read a window's current geometry into the given config fields, returning
+/// whether anything changed. While the window is maximized (or minimized) the
+/// size/position are left alone — the stored values keep the last *restored*
+/// geometry so un-maximizing (and the next launch) lands on a sensible rect;
+/// only the maximized flag tracks the transition.
+fn captureGeom(window: ?*SDLBackend.c.SDL_Window, w: *usize, h: *usize, x: *i32, y: *i32, maximized: *bool) bool {
+    var changed = false;
+    const flags = SDLBackend.c.SDL_GetWindowFlags(window);
+    const now_max = (flags & SDLBackend.c.SDL_WINDOW_MAXIMIZED) != 0;
+    if (now_max != maximized.*) {
+        maximized.* = now_max;
+        changed = true;
+    }
+    if (now_max or (flags & SDLBackend.c.SDL_WINDOW_MINIMIZED) != 0) return changed;
+
+    var cw: c_int = 0;
+    var ch: c_int = 0;
+    _ = SDLBackend.c.SDL_GetWindowSize(window, &cw, &ch);
+    if (cw > 0 and ch > 0) {
+        const nw: usize = @intCast(cw);
+        const nh: usize = @intCast(ch);
+        if (nw != w.* or nh != h.*) {
+            w.* = nw;
+            h.* = nh;
+            changed = true;
+        }
+    }
+    var cx: c_int = 0;
+    var cy: c_int = 0;
+    _ = SDLBackend.c.SDL_GetWindowPosition(window, &cx, &cy);
+    const nx: i32 = @intCast(cx);
+    const ny: i32 = @intCast(cy);
+    if (nx != x.* or ny != y.*) {
+        x.* = nx;
+        y.* = ny;
+        changed = true;
+    }
+    return changed;
+}
+
+/// Persist window geometry that changed this frame. Geometry is pure view state,
+/// so we write the committed baseline (not the live `g_config`, which may hold
+/// mid-edit Settings text) with the current geometry overlaid — this keeps
+/// Settings → Cancel able to discard unsaved edits while a concurrent resize
+/// still sticks.
+fn saveGeometry() void {
+    g_config_baseline.win_w = g_config.win_w;
+    g_config_baseline.win_h = g_config.win_h;
+    g_config_baseline.win_x = g_config.win_x;
+    g_config_baseline.win_y = g_config.win_y;
+    g_config_baseline.win_max = g_config.win_max;
+    g_config_baseline.viewer_w = g_config.viewer_w;
+    g_config_baseline.viewer_h = g_config.viewer_h;
+    g_config_baseline.viewer_x = g_config.viewer_x;
+    g_config_baseline.viewer_y = g_config.viewer_y;
+    g_config_baseline.viewer_max = g_config.viewer_max;
+    g_config_baseline.save(g_io, g_gpa, g_environ, g_config_path) catch |err| std.log.err("save window geometry failed: {t}", .{err});
+}
+
 fn meterEjectLlm() void {
     g_llm_eject_armed = true; // fires (or fires now) via maybeProcessEjects
 }
@@ -278,13 +347,15 @@ pub fn run(init: std.process.Init) !void {
     var back = try SDLBackend.initWindow(.{
         .io = init.io,
         .allocator = gpa,
-        .size = .{ .w = 1100, .h = 820 },
+        .size = .{ .w = @floatFromInt(g_config.win_w), .h = @floatFromInt(g_config.win_h) },
         .min_size = .{ .w = 640, .h = 480 },
         .vsync = true,
         .title = "tp-gui",
         .environ_map = init.environ_map,
     });
     defer back.deinit();
+    // Restore the saved position / maximized state (size is already set above).
+    applyWindowGeom(back.window, g_config.win_w, g_config.win_h, g_config.win_x, g_config.win_y, g_config.win_max);
 
     var win = try dvui.Window.init(@src(), gpa, back.backend(), .{});
     defer win.deinit();
@@ -392,6 +463,9 @@ pub fn run(init: std.process.Init) !void {
                     std.log.err("open viewer failed: {t}", .{err});
                     break :vblk null;
                 };
+                // Restore the viewer window's saved geometry (created hidden, so
+                // this lands before it's first shown — no flash).
+                if (g_viewer) |v| applyWindowGeom(v.back.window, g_config.viewer_w, g_config.viewer_h, g_config.viewer_x, g_config.viewer_y, g_config.viewer_max);
             }
         }
 
@@ -424,6 +498,14 @@ pub fn run(init: std.process.Init) !void {
                 g_viewer = null;
             }
         }
+
+        // Persist any window move/resize/maximize that happened this frame. Both
+        // windows are checked; coalesced to at most one config write per frame.
+        var geom_changed = captureGeom(back.window, &g_config.win_w, &g_config.win_h, &g_config.win_x, &g_config.win_y, &g_config.win_max);
+        if (g_viewer) |v| {
+            if (captureGeom(v.back.window, &g_config.viewer_w, &g_config.viewer_h, &g_config.viewer_x, &g_config.viewer_y, &g_config.viewer_max)) geom_changed = true;
+        }
+        if (geom_changed) saveGeometry();
 
         const wait_micros = win.waitTime(end_micros);
         interrupted = try back.waitEventTimeout(wait_micros);

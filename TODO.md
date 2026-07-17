@@ -1,4 +1,3 @@
-- save window size and position in config on change (incl. image viewer, incl. maximized)
 - save thinking toggle if not already
 - backend switch in queue doesn't switch backend it seems like? is backend attached to images in the queue?
 - seems like flash attn isn't in the vae decode options?
