@@ -440,10 +440,33 @@ pub const CudaLM = struct {
 
     fn captureDecodeGraph(self: *CudaLM) !void {
         const be = self.be;
+        // The embed table is only touched device-side by the graph (per-op
+        // steps embed on host), so gather once outside capture first: its
+        // initial cachedWeight cuMemAlloc + upload are illegal on a capturing
+        // stream. Tied-head models never hit this (the warm LM-head GEMV
+        // already cached the table, head == embed); untied ones (8B+) failed
+        // capture every time without it. Mirrors qwen35_cuda.
+        try self.embedGather();
+        // That upload may itself have evicted LRU weights under VRAM
+        // pressure — the capture would then re-upload them mid-capture
+        // (cuMemAlloc again). Bail to per-op decode instead of starting a
+        // capture that must fail.
+        if (be.evictions != 0) return error.WeightsEvicted;
         try be.graphCaptureBegin();
         errdefer if (be.graphCaptureEnd()) |exec| be.graphDestroy(exec) else |_| {};
         try self.recordDecodeOps();
         self.graph_exec = try be.graphCaptureEnd();
+    }
+
+    /// Device-side embedding gather of g_state[0]'s row into bufs.x.
+    fn embedGather(self: *CudaLM) !void {
+        const c = self.cfg;
+        const x = offsetBufSized(self.bufs.x, 0, c.hidden * 4);
+        if (self.lm.embed.dtype == .bf16) {
+            try self.be.opEmbedGatherS(x, self.lm.embed.bytes, c.hidden);
+        } else {
+            try self.be.opEmbedGatherQuant(self.lm.embed.dtype, x, self.lm.embed.bytes, c.hidden);
+        }
     }
 
     /// The full single-token decode forward, recorded for graph capture:
@@ -455,11 +478,7 @@ pub const CudaLM = struct {
         const be = self.be;
         const c = self.cfg;
         const b = &self.bufs;
-        if (self.lm.embed.dtype == .bf16) {
-            try be.opEmbedGatherS(offsetBufSized(b.x, 0, c.hidden * 4), self.lm.embed.bytes, c.hidden);
-        } else {
-            try be.opEmbedGatherQuant(self.lm.embed.dtype, offsetBufSized(b.x, 0, c.hidden * 4), self.lm.embed.bytes, c.hidden);
-        }
+        try self.embedGather();
         for (self.lm.layers, 0..) |layer, l| {
             if (self.taps_on) {
                 for (self.tap_layers, 0..) |tl, j| {
