@@ -280,7 +280,7 @@ pub const VulkanLM = struct {
                         try ctx.opElt(.copy, self.v, self.v_cache[slot], null, null, .{ .u0 = @intCast(kvdim), .u2 = @intCast(pos * kvdim) }, kvdim, 1, 1);
                     }
                     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
-                    try ctx.opAttnDecodeQ35(self.q, self.k_cache[slot], self.v_cache[slot], self.attn, self.attn_scratch, cfg.n_heads, cfg.n_kv_heads, hd, pos + 1, scale, 0, 0, self.kv_dtype == .f16);
+                    try ctx.opAttnDecodeQ35(self.q, self.k_cache[slot], self.v_cache[slot], self.attn, self.attn_scratch, cfg.n_heads, cfg.n_kv_heads, hd, pos + 1, scale, 0, 0, 0, self.kv_dtype == .f16);
                     try ctx.opElt(.sigmoid_mul, self.attn, self.gate, null, null, .{ .u0 = @intCast(cfg.qDim()) }, cfg.qDim(), 1, 1);
                     try self.gemvW(self.t, 0, self.attn, al.o);
                     try self.add(self.x, self.t, cfg.hidden);

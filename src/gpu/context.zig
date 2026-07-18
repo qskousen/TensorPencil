@@ -182,6 +182,8 @@ pub const EltPush = extern struct {
     u5: u32 = 0,
     f0: f32 = 0,
     f1: f32 = 0,
+    // Appended after f0/f1 so existing kernels' field offsets are unchanged.
+    u6: u32 = 0,
 };
 
 const TransposePush = extern struct {
@@ -2104,8 +2106,10 @@ pub const Context = struct {
     /// `window` (> 0) restricts to the last `window` keys; `ring` (> 0) enables
     /// sliding-window ring addressing (KV storage row = pos%ring, gemma3 LOCAL
     /// layers). 0 = full causal / linear.
-    pub fn opAttnDecodeQ35(self: *Context, q: DeviceBuffer, k_cache: DeviceBuffer, v_cache: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, n_heads: usize, n_kv: usize, head_dim: usize, kv_len: usize, scale: f32, window: usize, ring: usize, kv_f16: bool) Error!void {
+    pub fn opAttnDecodeQ35(self: *Context, q: DeviceBuffer, k_cache: DeviceBuffer, v_cache: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, n_heads: usize, n_kv: usize, head_dim: usize, kv_len: usize, scale: f32, window: usize, ring: usize, kv_end: usize, kv_f16: bool) Error!void {
         const nsplit = attn_decode_nsplit;
+        // kv_end > kv_len marks a bidirectional image-block query (attends the
+        // whole block forward); 0 (or == kv_len) is the plain causal decode bound.
         try self.opElt(if (kv_f16) .attn_dsplit_gemma_f16 else .attn_dsplit_gemma, q, k_cache, v_cache, scratch, .{
             .u0 = @intCast(kv_len),
             .u1 = @intCast(n_heads),
@@ -2115,6 +2119,7 @@ pub const Context = struct {
             .u5 = @intCast(window),
             .f0 = scale,
             .f1 = @bitCast(@as(u32, @intCast(ring))),
+            .u6 = @intCast(kv_end),
         }, n_heads * nsplit, 1, 1);
         try self.opElt(.attn_dmerge, scratch, null, null, out, .{
             .u0 = @intCast(n_heads),
@@ -3978,6 +3983,92 @@ test "flash attention matches reference" {
             }
         }
     }
+}
+
+// Bidirectional image-block attention on Vulkan: opAttnDecodeQ35 is single
+// query, so an image block is prefilled token-by-token but each query gets
+// kv_end = block end (bidirectional forward) while the sliding window still
+// tracks its own position. This validates the u6=kv_end path of
+// attn_dsplit_gemma against a CPU reference for one such query.
+test "opAttnDecodeQ35 bidirectional kv_end matches cpu reference" {
+    const gpa = std.testing.allocator;
+    std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa) catch return error.SkipZigTest;
+    defer ctx.deinit();
+
+    const n_heads = 4;
+    const n_kv = 2;
+    const hd = 256; // gemma3 head_dim
+    const window = 24;
+    const kv_len = 61; // this query's causal position + 1 (query at abs pos 60)
+    const kv_end = 100; // block end: query attends forward to here (bidirectional)
+    const scale: f32 = 1.0 / @sqrt(@as(f32, hd));
+    var prng = std.Random.DefaultPrng.init(202);
+    const rand = prng.random();
+
+    const q = try gpa.alloc(f32, n_heads * hd);
+    defer gpa.free(q);
+    const k = try gpa.alloc(f32, kv_end * n_kv * hd);
+    defer gpa.free(k);
+    const v = try gpa.alloc(f32, kv_end * n_kv * hd);
+    defer gpa.free(v);
+    for (q) |*x| x.* = rand.floatNorm(f32) * 0.3;
+    for (k) |*x| x.* = rand.floatNorm(f32) * 0.3;
+    for (v) |*x| x.* = rand.floatNorm(f32);
+
+    // Reference: attend [kv_start, kv_end), kv_start windowed off kv_len.
+    const kv_start: usize = if (kv_len > window) kv_len - window else 0;
+    const ref = try gpa.alloc(f32, n_heads * hd);
+    defer gpa.free(ref);
+    const scores = try gpa.alloc(f32, kv_end);
+    defer gpa.free(scores);
+    for (0..n_heads) |h| {
+        const kvh = h / (n_heads / n_kv);
+        var mx: f32 = -std.math.inf(f32);
+        for (kv_start..kv_end) |j| {
+            var s: f32 = 0;
+            for (0..hd) |c| s += q[h * hd + c] * k[(j * n_kv + kvh) * hd + c];
+            scores[j] = s * scale;
+            mx = @max(mx, scores[j]);
+        }
+        var den: f32 = 0;
+        for (kv_start..kv_end) |j| {
+            scores[j] = @exp(scores[j] - mx);
+            den += scores[j];
+        }
+        for (0..hd) |c| {
+            var acc: f32 = 0;
+            for (kv_start..kv_end) |j| acc += scores[j] * v[(j * n_kv + kvh) * hd + c];
+            ref[h * hd + c] = acc / den;
+        }
+    }
+
+    var q_d = try ctx.tensorCreate(q.len * 4);
+    defer ctx.tensorDestroy(&q_d);
+    var k_d = try ctx.tensorCreate(k.len * 4);
+    defer ctx.tensorDestroy(&k_d);
+    var v_d = try ctx.tensorCreate(v.len * 4);
+    defer ctx.tensorDestroy(&v_d);
+    var o_d = try ctx.tensorCreate(q.len * 4);
+    defer ctx.tensorDestroy(&o_d);
+    var s_d = try ctx.tensorCreate(n_heads * Context.attn_decode_nsplit * (hd + 2) * 4);
+    defer ctx.tensorDestroy(&s_d);
+    try ctx.tensorUpload(q_d, std.mem.sliceAsBytes(q));
+    try ctx.tensorUpload(k_d, std.mem.sliceAsBytes(k));
+    try ctx.tensorUpload(v_d, std.mem.sliceAsBytes(v));
+
+    try ctx.beginBatch();
+    errdefer if (ctx.batching) ctx.abortBatch();
+    // ring=0 (linear KV); kv_end > kv_len marks the bidirectional block.
+    try ctx.opAttnDecodeQ35(q_d, k_d, v_d, o_d, s_d, n_heads, n_kv, hd, kv_len, scale, window, 0, kv_end, false);
+    try ctx.endBatch();
+
+    const got = try gpa.alloc(f32, q.len);
+    defer gpa.free(got);
+    try ctx.tensorDownload(o_d, std.mem.sliceAsBytes(got));
+    var worst: f32 = 0;
+    for (ref, got) |e, a| worst = @max(worst, @abs(e - a));
+    try std.testing.expect(worst <= 2e-3);
 }
 
 test "gpu argmax matches cpu argmax (incl. tie -> lowest index)" {

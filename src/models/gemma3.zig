@@ -43,6 +43,15 @@ const PerLayerKvCache = kv_cache_mod.PerLayerKvCache;
 /// batch (TODO lever 1). Also caps the activation scratch height.
 const prefill_chunk = 128;
 
+/// Gemma 3 vision is always a 16x16 = 256-token soft-image block. A
+/// bidirectional image block is prefilled in ONE pass, so it (not
+/// prefill_chunk) sets the largest single batch the LOCAL ring must hold.
+const max_image_tokens = 256;
+
+/// Largest single prefill batch: a text chunk (prefill_chunk) or a whole
+/// bidirectional image block (max_image_tokens), whichever is larger.
+const max_batch = @max(prefill_chunk, max_image_tokens);
+
 /// Kill-switch for the LOCAL-layer sliding-window ring cache (A/B validation).
 const enable_local_ring = true;
 
@@ -58,7 +67,7 @@ fn kvDims(cfg: Config, alloc: std.mem.Allocator) ![]usize {
 fn kvRings(cfg: Config, alloc: std.mem.Allocator) ![]usize {
     const rings = try alloc.alloc(usize, cfg.n_layers);
     for (rings, 0..) |*r, l| {
-        r.* = if (enable_local_ring and !cfg.isGlobal(l)) cfg.sliding_window + prefill_chunk else 0;
+        r.* = if (enable_local_ring and !cfg.isGlobal(l)) cfg.sliding_window + max_batch else 0;
     }
     return rings;
 }
@@ -235,7 +244,7 @@ pub const Model = struct {
         try qwen3.embedTokens(self.embed, ids, x);
         const scale = cfg.embedScale();
         for (x) |*v| v.* *= scale;
-        try self.forwardHidden(io, gpa, x, cache, freqs_global, freqs_local, out);
+        try self.forwardHidden(io, gpa, x, cache, freqs_global, freqs_local, out, false);
     }
 
     /// forwardCached over PRE-EMBEDDED input hidden states `x` ([seq*hidden],
@@ -251,24 +260,34 @@ pub const Model = struct {
         freqs_global: ops.rope.Freqs,
         freqs_local: ops.rope.Freqs,
         out: ?[]f32,
+        // Bidirectional: the whole `x` is one image-token block that must attend
+        // itself in full, so it is prefilled in a SINGLE un-chunked pass (a
+        // Gemma image block, <= max_image_tokens, always fits the local ring).
+        bidirectional: bool,
     ) !void {
         const cfg = self.cfg;
         const seq = x.len / cfg.hidden;
         std.debug.assert(seq > 0 and seq <= cache.remaining());
         std.debug.assert(cache.n_layers == cfg.n_layers);
+        // A bidirectional block cannot be split across chunks (a later chunk's
+        // KV is not committed when an earlier chunk runs), so it goes in one
+        // pass; the local ring is sized to hold `window + max_image_tokens`.
+        std.debug.assert(!bidirectional or seq <= max_image_tokens);
 
         // Prefill in prefill_chunk-sized batches so a LOCAL layer's ring never
         // holds more than `window + prefill_chunk` live positions at once
         // (chunked prefill is token-identical: attention is causal, so a later
-        // chunk only reads earlier chunks' committed KV).
-        var s = try Scratch.init(gpa, @min(seq, prefill_chunk), cfg);
+        // chunk only reads earlier chunks' committed KV). A bidirectional image
+        // block runs as one chunk of the whole `seq`.
+        const chunk = if (bidirectional) seq else prefill_chunk;
+        var s = try Scratch.init(gpa, @min(seq, chunk), cfg);
         defer s.deinit(gpa);
         var off: usize = 0;
         while (off < seq) {
-            const n = @min(prefill_chunk, seq - off);
+            const n = @min(chunk, seq - off);
             const xc = x[off * cfg.hidden ..][0 .. n * cfg.hidden];
             for (self.layers, 0..) |*layer, l| {
-                try layerForward(io, gpa, cfg, layer, xc, n, freqs_global, freqs_local, cache, l, &s);
+                try layerForward(io, gpa, cfg, layer, xc, n, freqs_global, freqs_local, cache, l, bidirectional, &s);
             }
             cache.commit(n);
             off += n;
@@ -300,6 +319,7 @@ pub fn layerForward(
     freqs_local: ops.rope.Freqs,
     cache: anytype,
     l: usize,
+    bidirectional: bool,
     s: *Scratch,
 ) !void {
     const global = cfg.isGlobal(l);
@@ -315,7 +335,7 @@ pub fn layerForward(
         .sliding_window = if (global) 0 else cfg.sliding_window,
     };
     const freqs = if (global) freqs_global else freqs_local;
-    try transformer.layerForward(transformer.gemma3_spec, .cached, io, gpa, layer, x, seq, dims, freqs, cfg.rms_eps, cache, l, cache.len, s);
+    try transformer.layerForward(transformer.gemma3_spec, .cached, io, gpa, layer, x, seq, dims, freqs, cfg.rms_eps, cache, l, cache.len, bidirectional, s);
 }
 
 /// Per-forward activation buffers, sized for `seq` tokens of `cfg`. Public so
@@ -459,7 +479,9 @@ pub const CpuModel = struct {
         _ = grid_h;
         const x = try self.gpa.dupe(f32, embeds);
         defer self.gpa.free(x);
-        try self.lm.forwardHidden(self.io, self.gpa, x, &self.cache, self.rope.get(0), self.rope.get(1), null);
+        // Image tokens attend bidirectionally within the block (llama.cpp marks
+        // the image span non-causal); one un-chunked pass, causal to the prefix.
+        try self.lm.forwardHidden(self.io, self.gpa, x, &self.cache, self.rope.get(0), self.rope.get(1), null, true);
     }
 };
 

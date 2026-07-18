@@ -36,8 +36,17 @@ pub const Activation = transformer.Activation;
 /// `l` is the layer index (into the KV cache), `seq` the rows this call
 /// forwards, `pos0` the absolute base position for rope / cache append.
 pub fn decoderLayer(comptime spec: LayerSpec, st: anytype, layer: anytype, l: usize, seq: usize, pos0: usize) !void {
-    // --- Attention ---
-    // The geometry-sensitive ops (q/k/v/o projections, q/k/v norms) take `l`
+    try decoderLayerQKV(spec, st, layer, l, seq, pos0);
+    try decoderLayerAttnMlp(spec, st, layer, l, seq, pos0);
+}
+
+/// First half of a decoder layer: project Q/K/V, norm/rope them, and commit K/V
+/// to the cache. Split out so the Vulkan bidirectional image prefill can run
+/// this for EVERY block token (committing all K/V) before any attention — the
+/// single-query kernel can't see forward within a batch otherwise. `st.q` holds
+/// the rope'd Q on return.
+pub fn decoderLayerQKV(comptime spec: LayerSpec, st: anytype, layer: anytype, l: usize, seq: usize, pos0: usize) !void {
+    // The geometry-sensitive ops (q/k/v projections, q/k/v norms) take `l`
     // because per-layer-geometry archs (gemma4) vary head_dim / KV width by
     // layer; uniform archs ignore it.
     try st.normInput(layer, seq);
@@ -46,6 +55,13 @@ pub fn decoderLayer(comptime spec: LayerSpec, st: anytype, layer: anytype, l: us
     if (comptime spec.v_norm_unit) try st.normV(l, seq);
     try st.applyRope(l, seq, pos0);
     try st.appendKV(l, seq, pos0);
+}
+
+/// Second half of a decoder layer: attention over the committed cache, output
+/// projection, residual, and the MLP block. Expects `decoderLayerQKV` to have
+/// run (K/V committed, `st.q` = rope'd Q).
+pub fn decoderLayerAttnMlp(comptime spec: LayerSpec, st: anytype, layer: anytype, l: usize, seq: usize, pos0: usize) !void {
+    // --- Attention ---
     try st.attention(l, seq, pos0);
     try st.projectO(l, layer, seq);
     if (comptime spec.sandwich_norms) try st.postAttnNorm(layer, seq);

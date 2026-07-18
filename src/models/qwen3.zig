@@ -265,7 +265,7 @@ pub const TextEncoder = struct {
             }
             if (l >= self.layers.len) break;
             // Encoder: full-sequence, no persistent KV cache.
-            try transformer.layerForward(transformer.qwen3_spec, .fresh, io, gpa, self.layers[l], x, seq, dims, freqs, rms_eps, {}, 0, 0, &scratch);
+            try transformer.layerForward(transformer.qwen3_spec, .fresh, io, gpa, self.layers[l], x, seq, dims, freqs, rms_eps, {}, 0, 0, false, &scratch);
         }
         std.debug.assert(tap_idx == tap_count);
         return out;
@@ -367,7 +367,7 @@ pub const CausalLM = struct {
         const dims = dimsFor(cfg);
         const pos0 = cache.len;
         for (self.layers, 0..) |layer, l| {
-            try transformer.layerForward(transformer.qwen3_spec, .cached, io, gpa, layer, x, seq, dims, freqs, rms_eps, cache, l, pos0, &scratch);
+            try transformer.layerForward(transformer.qwen3_spec, .cached, io, gpa, layer, x, seq, dims, freqs, rms_eps, cache, l, pos0, false, &scratch);
         }
         cache.commit(seq);
         if (out) |o| {

@@ -1,10 +1,11 @@
-- Vision: image tokens use causal attention instead of non-causal/bidirectional (quality shortcut, revisit). llama.cpp marks image-token spans non-causal so every image token attends to every other; our path runs them through the LLM's normal causal mask (each image token only sees earlier ones), which degrades caption/description quality. This is a deliberate temporary simplification taken to reuse the existing causal attention path. Marked in `src/models/gemma4_vit.zig:24-26` ("Simplification vs llama.cpp… revisit if caption quality needs it") and `LLM_PLAN.md:571-573`. Affects both Gemma 3 and Gemma 4 vision on the LLM side; the ViT/SigLIP tower itself is already correctly bidirectional (`src/models/gemma_vit.zig:251` `.causal = false`). FIX: give contiguous image-token spans bidirectional attention within the LLM's attention mask (a block-diagonal / prefix-unmasked region over the image tokens), across the CPU + CUDA (+ Vulkan) attention paths; validate caption quality/parity vs llama.cpp.
 - viewer: zooming seems to zoom to the bottom right corner or something instead of the mouse pointer
 - latent always shows as 0.0gb in gui and is not actually representative since it's "whatever is left over"
 - "talk about this image" button disappears when llm is unloaded (should be determined by model metadata like image and thinking capabilities)
 - zig-cuda backend seems to have oom issues
 - output text (user and agent) in markdown?
 - changing system prompt should wipe context and take effect on the next message
+- slide to regenerate last message
+- controls for sampling, temperature, top-k, top-p, repeat-penalty, etc.
 - begin filling in holes in the capabilities grid (BACKEND.md)
 - add more sampling methods
 - tool call boxes inline, expandable to see the tool call
@@ -16,3 +17,9 @@
   - fan out on-device sampling: qwen3 (all), qwen35_cuda, gemma3_cuda DONE (stepArgmax/stepSelect/maxSelect; greedy validated token-identical to CPU on 9B/12B). REMAINING: (a) gemma4_cuda needs a device finalizeLogits kernel (tanh softcap + suppress-token masking is applied host-side after download, so device logits aren't final — argmaxing them could pick a suppressed token); until then gemma4 stays on the CPU-sample download path. (b) Vulkan steppers qwen35_gpu/gemma3_gpu (single-row, no per-row-offset issue — straightforward mirror of qwen3_gpu, just lower priority since Vulkan LLM is correctness-first/slow).
   - Vulkan stepAllArgmax: needs a per-row offset in the argmax kernel (opElt binds whole buffers); skipped for now (lower priority — Vulkan qwen3 generation now works but is correctness-first/slow; the bf16-garbage bug is fixed, see top).
 - Vulkan block-quant GEMV is compute-bound (~13-18x slower than zig-cuda): gemma3-12B Q4_K_M decodes ~3 tok/s on vulkan vs ~54 on zig-cuda. Measured root cause: the vulkan block-quant GEMV kernels (gemv_q4_k_t / q5_k_t / q6_k_t in kernels/eltwise.zig) dequantize every weight to f32 and do scalar FMA → SM pegged at 100% while mem-BW sits at ~6% (compute-bound). zig-cuda uses int8 dp4a → memory-bound (~65% BW), i.e. at the physical floor. Ablation: removing the GEMV dequant compute drops vulkan SM util 100%→15%, so the GEMV is the whole remaining bottleneck (attention was fixed 2026-07-17 via attn_dsplit_gemma flash-split, 1→3 tok/s). FIX: rewrite the vulkan block-quant GEMV to use integer dot product (dp4a-equivalent) via VK_KHR_shader_integer_dot_product (OpUDot/OpSDot; the 3090 supports it) — dequant to int8 in-register + integer-dot accumulate so it becomes memory-bound like cuda. Realistic target ~20-40 tok/s. Real kernel project (new SPIR-V GEMV + int8-friendly weight repack + validation), NOT brief. Block-quant on vulkan is a gemma3/qwen35-only path (qwen3 rejects it and uses f8 coopmat), so there's no existing fast reference to copy. A half-measure (vectorize the current dequant, f16 math) might get ~2x but stays compute-bound.
+
+- are seeds random? does doing a new chat generate a new seed? seed per message?
+- context maxes out for some reason at 16k:
+  - info: [llm] 655 tok, 31.8 tok/s, ctx 16303/16384, vram 7266 MiB
+  - info: [llm] 62 tok, 30.2 tok/s, ctx 16384/16384, vram 7266 MiB
+  - error: generation failed: ContextFull

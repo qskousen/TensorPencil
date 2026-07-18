@@ -927,10 +927,11 @@ pub const CudaLM = struct {
                                 0,
                                 0,
                                 false,
+                                false,
                             );
                         }
                     } else {
-                        try be.opAttnDecode(b.q, self.k_cache[slot].buf, self.v_cache[slot].buf, b.attn, b.attn_scratch, self.len + 1, n, cfg.n_heads, cfg.n_kv_heads, hd, nsplit_prefill, scale, 0, 0, self.kv_dtype == .f16);
+                        try be.opAttnDecode(b.q, self.k_cache[slot].buf, self.v_cache[slot].buf, b.attn, b.attn_scratch, self.len + 1, n, cfg.n_heads, cfg.n_kv_heads, hd, nsplit_prefill, scale, 0, 0, false, self.kv_dtype == .f16);
                     }
                     try be.opMulSigmoid(b.attn, b.gate, n * cfg.qDim());
                     try self.gemm(b.t, b.attn, al.o, n);
@@ -1134,7 +1135,7 @@ pub const CudaLM = struct {
                     } else {
                         try self.storeKv(self.k_cache[slot].buf, self.len * cfg.kvDim(), b.k, 0, cfg.kvDim());
                         try self.storeKv(self.v_cache[slot].buf, self.len * cfg.kvDim(), b.v, 0, cfg.kvDim());
-                        try be.opAttnDecode(b.q, self.k_cache[slot].buf, self.v_cache[slot].buf, b.attn, b.attn_scratch, self.len + 1, 1, cfg.n_heads, cfg.n_kv_heads, hd, nsplit, scale, 0, 0, self.kv_dtype == .f16);
+                        try be.opAttnDecode(b.q, self.k_cache[slot].buf, self.v_cache[slot].buf, b.attn, b.attn_scratch, self.len + 1, 1, cfg.n_heads, cfg.n_kv_heads, hd, nsplit, scale, 0, 0, false, self.kv_dtype == .f16);
                     }
                     try be.opMulSigmoid(b.attn, b.gate, cfg.qDim());
                     try self.quantizeX(b.attn, cfg.qDim());

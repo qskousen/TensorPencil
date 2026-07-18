@@ -40,11 +40,22 @@ const prefill_chunk = 128;
 /// instead of opMatmulQuant's dequant-to-f16 GEMM (qwen3_cuda's crossover).
 const grouped_gemv_max = 40;
 
-/// Rows a LOCAL (sliding-window) layer's KV ring holds: window + one prefill
-/// chunk of slack (see gemma4_cuda for the aliasing rationale). LOCAL caches
-/// are fixed at this size and never grow (TODO lever 1).
+/// Gemma 3 vision is always a 16x16 = 256-token soft-image block. A
+/// bidirectional image block is prefilled in ONE batch so its tokens see each
+/// other, so it (not prefill_chunk) sets the largest single batch: the LOCAL
+/// ring slack and (rounded up) the activation-buffer height.
+const max_image_tokens = 256;
+/// Largest actual batch of rows fed in one forward (text chunk or image block).
+const max_batch = @max(prefill_chunk, max_image_tokens);
+/// Activation-buffer height. opMatmulQuant pads its output rows up to a
+/// multiple of 128, so GEMM-output buffers must reserve the padded height.
+const buf_rows = std.mem.alignForward(usize, max_batch, 128);
+
+/// Rows a LOCAL (sliding-window) layer's KV ring holds: window + one max-batch
+/// of slack (see gemma4_cuda for the aliasing rationale). LOCAL caches are
+/// fixed at this size and never grow (TODO lever 1).
 fn localRingRows(cfg: gemma3.Config) usize {
-    return cfg.sliding_window + prefill_chunk;
+    return cfg.sliding_window + max_batch;
 }
 
 /// Kill-switch for the LOCAL-layer sliding-window ring cache (A/B validation).
@@ -101,6 +112,10 @@ pub const CudaLM = struct {
     /// variant and the per-element stride of k_cache/v_cache.
     kv_dtype: kvmod.KvDtype,
     len: usize,
+    /// Set for the duration of a bidirectional image-block prefill: the
+    /// `attention` stepper (device + host-split) reads it and lets every query
+    /// in the batch attend the whole block forward (image spans are non-causal).
+    bidir_prefill: bool = false,
     /// Io for the host matmuls of a hybrid split's CPU-resident layers; set by
     /// `step`. Undefined until the first `step` — the offload host path only
     /// runs after generation starts (text-only sessions), same as qwen35_cuda.
@@ -535,13 +550,13 @@ pub const CudaLM = struct {
         // Offloaded-layer host shadow is always f32 (f16 disables the split).
         var cache = try kvmod.KvCache.init(gpa, n, self.capacity, cfg.kvDim(), .f32);
         errdefer cache.deinit(gpa);
-        var scratch = try gemma3.Scratch.init(gpa, prefill_chunk, cfg);
+        var scratch = try gemma3.Scratch.init(gpa, max_batch, cfg);
         errdefer scratch.deinit(gpa);
         var fg = try ops.rope.rotateHalfFreqsScaled(gpa, self.capacity, cfg.head_dim, cfg.rope_theta, cfg.rope_freq_scale);
         errdefer fg.deinit(gpa);
         var fl = try ops.rope.rotateHalfFreqsScaled(gpa, self.capacity, cfg.head_dim, cfg.rope_theta_local, 1.0);
         errdefer fl.deinit(gpa);
-        const hx = try gpa.alloc(f32, prefill_chunk * cfg.hidden);
+        const hx = try gpa.alloc(f32, max_batch * cfg.hidden);
         errdefer gpa.free(hx);
 
         self.split = .{
@@ -704,12 +719,12 @@ pub const CudaLM = struct {
         const cfg = self.cfg;
         const total = embeds.len / cfg.hidden;
         std.debug.assert(embeds.len == total * cfg.hidden);
-        var off: usize = 0;
-        while (off < total) {
-            const n: usize = @min(prefill_chunk, total - off);
-            try self.forwardRows(embeds[off * cfg.hidden ..][0 .. n * cfg.hidden], false, null);
-            off += n;
-        }
+        // A bidirectional image block must be one batch (a later chunk's KV is
+        // not committed when an earlier chunk runs); it fits in max_batch rows.
+        std.debug.assert(total <= max_batch);
+        self.bidir_prefill = true;
+        defer self.bidir_prefill = false;
+        try self.forwardRows(embeds, false, null);
     }
 
     /// Embed `ids` (gather + sqrt(hidden) scale, host-side) then forward the
@@ -768,7 +783,7 @@ pub const CudaLM = struct {
             return;
         }
         // LOCAL layer: write into the ring at row pos0%ring, splitting on wrap
-        // (seq <= prefill_chunk < ring, so at most one wrap).
+        // (seq <= max_batch < ring, so at most one wrap).
         const ring = localRingRows(cfg);
         const start = pos0 % ring;
         const first = @min(seq, ring - start);
@@ -787,7 +802,7 @@ pub const CudaLM = struct {
         const window: usize = if (cfg.isGlobal(l)) 0 else cfg.sliding_window;
         const ring: usize = if (usesRing(cfg, l)) localRingRows(cfg) else 0;
         const ns: usize = if (seq == 1) nsplit else nsplit_prefill;
-        try self.be.opAttnDecode(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, pos0 + 1, seq, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, ns, scale, window, ring, self.kv_dtype == .f16);
+        try self.be.opAttnDecode(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, pos0 + 1, seq, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, ns, scale, window, ring, self.bidir_prefill, self.kv_dtype == .f16);
     }
     pub fn projectO(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
         _ = l;
@@ -834,7 +849,7 @@ pub const CudaLM = struct {
         const n = x_host.len / cfg.hidden;
         const eps = cfg.rms_eps;
         const pos0 = self.len;
-        std.debug.assert(n >= 1 and n <= prefill_chunk and n <= self.remaining());
+        std.debug.assert(n >= 1 and n <= max_batch and n <= self.remaining());
 
         try be.tensorUpload(offsetBufSized(b.x, 0, n * cfg.hidden * 4), std.mem.sliceAsBytes(x_host));
 
@@ -855,7 +870,7 @@ pub const CudaLM = struct {
                         sp.on_host = true;
                     }
                     var sv = sp.scratch.viewSeq(n, cfg);
-                    try gemma3.layerForward(self.io, self.gpa, cfg, layer, sp.hx[0 .. n * cfg.hidden], n, sp.freqs_global, sp.freqs_local, &sp.cache, l, &sv);
+                    try gemma3.layerForward(self.io, self.gpa, cfg, layer, sp.hx[0 .. n * cfg.hidden], n, sp.freqs_global, sp.freqs_local, &sp.cache, l, self.bidir_prefill, &sv);
                     continue;
                 }
                 if (sp.on_host) {
@@ -952,8 +967,9 @@ const Bufs = struct {
     topk_i: Buf,
 
     fn init(be: *Backend, cfg: gemma3.Config) !Bufs {
-        const pc = prefill_chunk; // GEMM outputs are 128-row padded; pc == 128
-        comptime std.debug.assert(prefill_chunk == 128);
+        // Height for the largest single batch (text chunk or whole image block),
+        // rounded up to the GEMM's 128-row output padding.
+        const pc = buf_rows;
         const hd = cfg.head_dim;
         var self: Bufs = undefined;
         var created: usize = 0;

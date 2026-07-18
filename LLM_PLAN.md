@@ -568,9 +568,11 @@ would add ~10 pts acceptance on top.
   where it even OCR'd the embedded "AURORA" text; "too blurry" on a noise
   fixture) — exact token-match golden was blocked by llama-mtmd-cli crashing on
   gemma4's jinja template, but the text LLM is already token-identical so the
-  embedder rides on that. Simplification: image tokens use the LLM's causal
-  attention (llama.cpp marks them non-causal / bidirectional) — same shortcut
-  Gemma 3's CPU path takes. **GPU** (`models/gemma4_cuda.zig`, cuda + zig-cuda,
+  embedder rides on that. Image-token blocks attend BIDIRECTIONALLY in the LLM
+  (llama.cpp marks them non-causal): every image token sees the whole block,
+  causal only to the prefix — prefilled in one un-chunked `bidirectional` pass
+  on CPU + all GPU backends (Gemma 3 and Gemma 4). **GPU**
+  (`models/gemma4_cuda.zig`, cuda + zig-cuda,
   device-resident MVP — no CPU-split/offload/streaming since the 12B fits):
   per-layer K/V Growables (kvDim(l) stride); GLOBAL-layer attention uses the
   generic naive `attn` op (arbitrary head_dim, full causal), LOCAL uses

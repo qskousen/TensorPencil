@@ -26,6 +26,14 @@ pub const Params = struct {
     /// causal). When > 0 (and causal), query at absolute position p attends
     /// only keys in [p - window + 1, p]. Requires causal.
     window: usize = 0,
+    /// Bidirectional block (Gemma 3/4 image-token prefill): every query attends
+    /// FORWARD to the whole kv sequence (keys [.., seq_kv)) instead of stopping
+    /// at its own position, so a contiguous image block sees itself in full.
+    /// The causal-to-prefix and sliding-window LOWER bound still track each
+    /// query's OWN absolute position (a Gemma image block is smaller than the
+    /// window, so extending kv_end never clips a legitimate prefix key).
+    /// Requires causal (image prefill is always a causal-model prefill).
+    bidirectional: bool = false,
     /// Ring-buffer KV storage (gemma3/gemma4 LOCAL layers, TODO lever 1): 0 =
     /// linear (row = absolute position). When > 0, key/value for absolute
     /// position j lives at row `j % ring`, so k/v hold `ring` rows instead of
@@ -55,6 +63,7 @@ pub fn attention(
     std.debug.assert(out.len == q.len);
     std.debug.assert(p.n_heads % p.n_kv_heads == 0);
     if (p.causal) std.debug.assert(p.seq_q <= p.seq_kv);
+    if (p.bidirectional) std.debug.assert(p.causal);
     if (p.key_mask) |mask| std.debug.assert(mask.len == p.seq_kv);
 
     // Split each head's queries into chunks so even single-head attention
@@ -108,9 +117,13 @@ fn headTask(
 
     for (q_start..q_end) |i| {
         const qrow = q[i * q_stride + h * hd ..][0..hd];
-        const kv_end = if (p.causal) p.seq_kv - p.seq_q + i + 1 else p.seq_kv;
+        // Causal upper bound for THIS query's own position; the sliding-window
+        // lower bound tracks it too. A bidirectional block extends only the
+        // upper bound forward to the full sequence (keys added after the query).
+        const causal_end = if (p.causal) p.seq_kv - p.seq_q + i + 1 else p.seq_kv;
+        const kv_end = if (p.bidirectional) p.seq_kv else causal_end;
         // Sliding window: drop keys older than `window` positions back.
-        const kv_start = if (p.window != 0 and kv_end > p.window) kv_end - p.window else 0;
+        const kv_start = if (p.window != 0 and causal_end > p.window) causal_end - p.window else 0;
 
         var max_score = -std.math.inf(f32);
         for (kv_start..kv_end) |j| {
@@ -334,6 +347,70 @@ test "sliding-window attention" {
             }
         }
     }
+}
+
+test "bidirectional block attends the full sequence forward" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    // A whole-batch bidirectional block (image-token prefill, no prefix) makes
+    // every query attend every key forward AND back — identical to plain
+    // non-causal attention, even though `causal` is set.
+    {
+        var out: [24]f32 = undefined;
+        try attention(io, gpa, &out, &attn_q, &attn_k, &attn_v, .{
+            .seq_q = 3,
+            .seq_kv = 3,
+            .n_heads = 2,
+            .n_kv_heads = 1,
+            .head_dim = 4,
+            .causal = true,
+            .bidirectional = true,
+        });
+        for (attn_out, out) |e, a| try std.testing.expectApproxEqAbs(e, a, 3e-6);
+    }
+    // With a prefix (seq_q < seq_kv): the block queries (rows 1,2) still attend
+    // the whole kv sequence — the prefix key 0 AND the forward key 2 — so their
+    // outputs equal the corresponding full-attention rows. Confirms the forward
+    // extension is not clipped by the query's own causal position.
+    {
+        var out: [16]f32 = undefined;
+        try attention(io, gpa, &out, attn_q[8..], &attn_k, &attn_v, .{
+            .seq_q = 2,
+            .seq_kv = 3,
+            .n_heads = 2,
+            .n_kv_heads = 1,
+            .head_dim = 4,
+            .causal = true,
+            .bidirectional = true,
+        });
+        for (attn_out[8..], out) |e, a| try std.testing.expectApproxEqAbs(e, a, 3e-6);
+    }
+}
+
+test "bidirectional window bounds only the backward reach" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    // window=1 + bidirectional: query i attends [i, seq_kv). The last query
+    // (row 2) sees only key 2 (its own position; nothing forward), so its
+    // output is that key's V. Row 0 has no backward reach clipped, so the
+    // forward extension still lets it see the whole sequence (== full row 0).
+    var out: [24]f32 = undefined;
+    try attention(io, gpa, &out, &attn_q, &attn_k, &attn_v, .{
+        .seq_q = 3,
+        .seq_kv = 3,
+        .n_heads = 2,
+        .n_kv_heads = 1,
+        .head_dim = 4,
+        .causal = true,
+        .bidirectional = true,
+        .window = 1,
+    });
+    // Row 0 == full-attention row 0 (nothing behind it to window off).
+    for (0..8) |i| try std.testing.expectApproxEqAbs(attn_out[i], out[i], 3e-6);
+    // Row 2 collapses to key 2's V for both GQA heads (single-key softmax).
+    for (0..2) |h| for (0..4) |d| {
+        try std.testing.expectApproxEqAbs(attn_v[2 * 4 + d], out[2 * 8 + h * 4 + d], 3e-6);
+    };
 }
 
 test "cached decode attention matches the full causal rows" {

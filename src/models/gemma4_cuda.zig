@@ -41,13 +41,25 @@ const nsplit_prefill = 8;
 const prefill_chunk = 128;
 const grouped_gemv_max = 40;
 
+/// Gemma 4 vision emits up to 280 soft-image tokens (llama.cpp
+/// set_limit_image_tokens(40, 280)). A bidirectional image block is prefilled
+/// in ONE batch so its tokens see each other, so it (not prefill_chunk) sets
+/// the largest single batch: the LOCAL ring slack and (rounded up) the
+/// activation-buffer height.
+const max_image_tokens = 280;
+/// Largest actual batch of rows fed in one forward (text chunk or image block).
+const max_batch = @max(prefill_chunk, max_image_tokens);
+/// Activation-buffer height. opMatmulQuant pads its output rows up to a
+/// multiple of 128, so GEMM-output buffers must reserve the padded height.
+const buf_rows = std.mem.alignForward(usize, max_batch, 128);
+
 /// Rows a LOCAL (sliding-window) layer's KV ring holds. The window plus one
-/// prefill chunk of slack: within a single prefill batch the queries span
+/// max-batch of slack: within a single prefill batch the queries span
 /// `window + seq - 1` positions, so a ring smaller than this would alias a
 /// still-needed key against a freshly-written one. LOCAL caches are fixed at
 /// this size and never grow with the conversation (TODO lever 1).
 fn localRingRows(cfg: gemma4.Config) usize {
-    return cfg.sliding_window + prefill_chunk;
+    return cfg.sliding_window + max_batch;
 }
 
 /// Kill-switch for the LOCAL-layer sliding-window ring cache (TODO lever 1).
@@ -81,6 +93,10 @@ pub const CudaLM = struct {
     /// variant and the per-element byte stride of k_cache/v_cache.
     kv_dtype: kvmod.KvDtype,
     len: usize,
+    /// Set for the duration of a bidirectional image-block prefill: the
+    /// `attention` stepper reads it and lets every query in the batch attend
+    /// the whole block forward (llama.cpp marks image spans non-causal).
+    bidir_prefill: bool = false,
     /// sin-table offsets within each freqs buffer (= cap.max * half).
     sin_off_global: usize,
     sin_off_local: usize,
@@ -323,12 +339,12 @@ pub const CudaLM = struct {
         _ = grid_h;
         const cfg = self.cfg;
         const total = embeds.len / cfg.hidden;
-        var off: usize = 0;
-        while (off < total) {
-            const n: usize = @min(prefill_chunk, total - off);
-            try self.forwardRows(embeds[off * cfg.hidden ..][0 .. n * cfg.hidden], null);
-            off += n;
-        }
+        // A bidirectional image block must be one batch (a later chunk's KV is
+        // not committed when an earlier chunk runs); it fits in max_batch rows.
+        std.debug.assert(total <= max_batch);
+        self.bidir_prefill = true;
+        defer self.bidir_prefill = false;
+        try self.forwardRows(embeds, null);
     }
 
     fn embedChunk(self: *CudaLM, ids: []const u32, logits: ?[]f32) !void {
@@ -410,8 +426,8 @@ pub const CudaLM = struct {
             return;
         }
         // LOCAL layer: write into the ring at row pos0%ring, splitting the copy
-        // when it wraps the ring boundary (seq <= prefill_chunk < ring, so at
-        // most one wrap).
+        // when it wraps the ring boundary (seq <= max_batch < ring, so at most
+        // one wrap).
         const ring = localRingRows(cfg);
         const start = pos0 % ring;
         const first = @min(seq, ring - start);
@@ -429,7 +445,7 @@ pub const CudaLM = struct {
         const ns: usize = if (seq == 1) nsplit else nsplit_prefill;
         const window: usize = if (cfg.isGlobal(l)) 0 else cfg.sliding_window;
         const ring: usize = if (usesRing(cfg, l)) localRingRows(cfg) else 0;
-        try self.be.opAttnDecode(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, pos0 + 1, seq, cfg.n_heads, cfg.nKv(l), cfg.headDim(l), ns, 1.0, window, ring, self.kv_dtype == .f16);
+        try self.be.opAttnDecode(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, pos0 + 1, seq, cfg.n_heads, cfg.nKv(l), cfg.headDim(l), ns, 1.0, window, ring, self.bidir_prefill, self.kv_dtype == .f16);
     }
     pub fn projectO(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
         const cfg = self.cfg;
@@ -478,7 +494,7 @@ pub const CudaLM = struct {
         const n = x_host.len / cfg.hidden;
         const eps = cfg.rms_eps;
         const pos0 = self.len;
-        std.debug.assert(n >= 1 and n <= prefill_chunk and n <= self.remaining());
+        std.debug.assert(n >= 1 and n <= max_batch and n <= self.remaining());
 
         try be.tensorUpload(offsetBufSized(b.x, 0, n * cfg.hidden * 4), std.mem.sliceAsBytes(x_host));
 
@@ -566,8 +582,9 @@ const Bufs = struct {
     logits: Buf,
 
     fn init(be: *Backend, cfg: gemma4.Config) !Bufs {
-        const pc = prefill_chunk;
-        comptime std.debug.assert(prefill_chunk == 128);
+        // Height for the largest single batch (text chunk or whole image block),
+        // rounded up to the GEMM's 128-row output padding.
+        const pc = buf_rows;
         // The flash-split scratch row is (hd+4) f32; size it for the larger
         // (global) head_dim so both local and global attention fit.
         const hd_max = @max(cfg.head_dim_global, cfg.head_dim_local);

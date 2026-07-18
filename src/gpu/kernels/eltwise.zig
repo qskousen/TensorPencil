@@ -39,6 +39,9 @@ pub const Push = extern struct {
     u5: u32,
     f0: f32,
     f1: f32,
+    // Appended after f0/f1 so existing kernels' field offsets are unchanged
+    // (matches host EltPush). attn_dsplit_gemma uses it as the bidir kv_end.
+    u6: u32,
 };
 
 extern var a: FBuf addrspace(.storage_buffer);
@@ -1319,7 +1322,9 @@ export fn attn_dmerge() callconv(.spirv_kernel) void {
 //   attn_decode_q35 by `nsplit`.
 //   a = q [heads][hd], b = k_cache, c = v_cache, d = scratch.
 //   u0=kv_len (pos+1), u1=heads, u2=kv_heads, u3=hd(<=256), u4=nsplit,
-//   u5=window (0 = full causal), f0=scale, f1=ring (bitcast u32; 0 = linear).
+//   u5=window (0 = full causal), f0=scale, f1=ring (bitcast u32; 0 = linear),
+//   u6=kv_end (bidirectional image block upper bound; 0 = causal = kv_len). The
+//   window kv_start always tracks the query's OWN causal position (kv_len).
 export fn attn_dsplit_gemma() callconv(.spirv_kernel) void {
     decorate();
     const idx = gpu.global_invocation_id[0];
@@ -1332,14 +1337,17 @@ export fn attn_dsplit_gemma() callconv(.spirv_kernel) void {
     const window = pc.u5;
     const ring: u32 = @bitCast(pc.f1);
     const scale = pc.f0;
+    // Bidirectional image block extends the upper bound forward to the whole
+    // block (u6); default (0) keeps the causal bound. kv_start stays on kv_len.
+    const kv_end = if (pc.u6 != 0) pc.u6 else kv_len;
     const h = idx / nsplit;
     const i = idx % nsplit;
     const kvh = h / (heads / kv_heads);
     const kv_start: u32 = if (window != 0 and kv_len > window) kv_len - window else 0;
-    const span = kv_len - kv_start;
+    const span = kv_end - kv_start;
     const chunk = (span + nsplit - 1) / nsplit;
     const kv0 = kv_start + i * chunk;
-    const kv1 = @min(kv0 + chunk, kv_len);
+    const kv1 = @min(kv0 + chunk, kv_end);
     const qbase = h * hd;
     var acc: [256]f32 = @splat(0.0); // type-level max; loops bound by hd
     var m: f32 = -3.0e38;
@@ -1397,14 +1405,16 @@ export fn attn_dsplit_gemma_f16() callconv(.spirv_kernel) void {
     const window = pc.u5;
     const ring: u32 = @bitCast(pc.f1);
     const scale = pc.f0;
+    // Bidirectional image block (u6, 0 = causal); kv_start stays on kv_len.
+    const kv_end = if (pc.u6 != 0) pc.u6 else kv_len;
     const h = idx / nsplit;
     const i = idx % nsplit;
     const kvh = h / (heads / kv_heads);
     const kv_start: u32 = if (window != 0 and kv_len > window) kv_len - window else 0;
-    const span = kv_len - kv_start;
+    const span = kv_end - kv_start;
     const chunk = (span + nsplit - 1) / nsplit;
     const kv0 = kv_start + i * chunk;
-    const kv1 = @min(kv0 + chunk, kv_len);
+    const kv1 = @min(kv0 + chunk, kv_end);
     const qbase = h * hd;
     var acc: [256]f32 = @splat(0.0); // type-level max; loops bound by hd
     var m: f32 = -3.0e38;

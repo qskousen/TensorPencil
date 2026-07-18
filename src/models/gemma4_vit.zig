@@ -19,11 +19,10 @@
 //!   - mm.input_projection (3840 -> 3840) -> [n_patches, 3840] LLM embeddings.
 //!
 //! One image is `n_patches = (W/48)*(H/48)` tokens (variable, NO pooling); the
-//! LLM injects them UNSCALED between the `<|image>` / `<image|>` markers.
-//!
-//! Simplification vs llama.cpp: image tokens use the LLM's causal attention
-//! here (llama.cpp marks them non-causal / bidirectional). Same approximation
-//! Gemma 3's CPU path makes; revisit if caption quality needs it.
+//! LLM injects them UNSCALED between the `<|image>` / `<image|>` markers. The
+//! injected block attends BIDIRECTIONALLY in the LLM (every image token sees the
+//! whole block, causal only to the prefix), matching llama.cpp — see the
+//! `bidirectional` prefill path in gemma4.zig / gemma4_cuda.zig.
 
 const std = @import("std");
 const gguf_mod = @import("../gguf.zig");

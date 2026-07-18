@@ -141,6 +141,10 @@ pub fn layerForward(
     cache: anytype,
     l: usize,
     pos0: usize,
+    // Bidirectional block: this whole `seq` batch is one image-token block that
+    // attends itself in full (forward + backward), causal only to the prefix.
+    // Only meaningful for `.cached` prefill; ignored by `.fresh`.
+    bidirectional: bool,
     s: anytype,
 ) !void {
     const normed = s.normed[0 .. seq * dims.hidden];
@@ -165,6 +169,7 @@ pub fn layerForward(
             .causal = true,
             .scale = spec.attn_scale,
             .window = dims.sliding_window,
+            .bidirectional = bidirectional,
             // LOCAL ring layers store row = pos%ring; kView returns the ring block.
             .ring = cache.ringOf(l),
         });
@@ -356,7 +361,7 @@ fn freshVsCachedEquiv(comptime spec: LayerSpec, dims: Dims, n_layers: usize) !vo
     const x_fresh = try a.alloc(f32, seq * hidden);
     @memcpy(x_fresh, embeds);
     for (layers) |*ly| {
-        try layerForward(spec, .fresh, io, gpa, ly, x_fresh, seq, dims, freqs, 1e-6, {}, 0, 0, &scr);
+        try layerForward(spec, .fresh, io, gpa, ly, x_fresh, seq, dims, freqs, 1e-6, {}, 0, 0, false, &scr);
     }
 
     // Cached: feed tokens one at a time into a KV cache.
@@ -368,7 +373,7 @@ fn freshVsCachedEquiv(comptime spec: LayerSpec, dims: Dims, n_layers: usize) !vo
         @memcpy(xt, embeds[t * hidden ..][0..hidden]);
         const pos0 = cache.len;
         for (layers, 0..) |*ly, l| {
-            try layerForward(spec, .cached, io, gpa, ly, xt, 1, dims, freqs, 1e-6, &cache, l, pos0, &scr);
+            try layerForward(spec, .cached, io, gpa, ly, xt, 1, dims, freqs, 1e-6, &cache, l, pos0, false, &scr);
         }
         cache.commit(1);
         @memcpy(last, xt);

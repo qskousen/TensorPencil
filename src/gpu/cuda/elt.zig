@@ -1959,10 +1959,10 @@ pub const attn_split_h256_ptx: [:0]const u8 =
     \\.target sm_86
     \\.address_size 64
     \\.visible .entry attn_split_h256(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
-    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .u32 u6,.param .f32 f0,.param .f32 f1)
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .u32 u6,.param .u32 u7,.param .f32 f0,.param .f32 f1)
     \\{
-    \\  .reg .pred %p<6>;
-    \\  .reg .b32 %r<34>;
+    \\  .reg .pred %p<8>;
+    \\  .reg .b32 %r<40>;
     \\  .reg .f32 %f<64>;
     \\  .reg .b64 %rd<24>;
     \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x;
@@ -1983,20 +1983,28 @@ pub const attn_split_h256_ptx: [:0]const u8 =
     \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3; cvta.to.global.u64 %rd4,%rd4;
     \\  div.u32 %r31,%r27,%r7;                // query t
     \\  rem.u32 %r2,%r27,%r7;                 // warp within query
-    \\  add.u32 %r5,%r5,%r31;                 // this query's kv len (causal)
+    \\  add.u32 %r5,%r5,%r31;                 // this query's causal kv len (kv_len0+t)
+    \\  // kv_end (loop upper bound): causal by default; a bidirectional image
+    \\  // block (u7) extends it to the whole batch (kv_len0+seq_q-1) so every
+    \\  // query sees forward. The window kv_start below stays on the CAUSAL len.
+    \\  ld.param.u32 %r34,[u7];               // bidir (0/1)
+    \\  mov.u32 %r35,%r5;                      // kv_end = causal len
+    \\  setp.eq.u32 %p6,%r34,0; @%p6 bra NOBIDIR;
+    \\  add.u32 %r35,%r5,%r30; sub.u32 %r35,%r35,1; sub.u32 %r35,%r35,%r31; // kv_len0+seq_q-1
+    \\NOBIDIR:
     \\  div.u32 %r10,%r2,%r26;                // h
     \\  rem.u32 %r21,%r2,%r26;                // split i
-    \\  // Sliding window (f1, 0 = full causal): kv_start = max(0, kv_len - window).
+    \\  // Sliding window (f1, 0 = full causal): kv_start = max(0, causal_len - window).
     \\  ld.param.f32 %f30,[f1]; cvt.rzi.u32.f32 %r11,%f30;
     \\  mov.u32 %r16,0;                       // kv_start
     \\  setp.eq.u32 %p4,%r11,0; @%p4 bra NOWIN;
     \\  setp.le.u32 %p4,%r5,%r11; @%p4 bra NOWIN;
-    \\  sub.u32 %r16,%r5,%r11;                // kv_start = kv_len - window
+    \\  sub.u32 %r16,%r5,%r11;                // kv_start = causal_len - window
     \\NOWIN:
-    \\  sub.u32 %r22,%r5,%r16;                // span = kv_len - kv_start
+    \\  sub.u32 %r22,%r35,%r16;               // span = kv_end - kv_start
     \\  add.u32 %r22,%r22,%r26; sub.u32 %r22,%r22,1; div.u32 %r22,%r22,%r26; // chunk = ceil(span/nsplit)
     \\  mad.lo.s32 %r17,%r21,%r22,%r16;       // kv0 = kv_start + split_i*chunk
-    \\  add.u32 %r23,%r17,%r22; min.u32 %r23,%r23,%r5; // kv1
+    \\  add.u32 %r23,%r17,%r22; min.u32 %r23,%r23,%r35; // kv1
     \\  div.u32 %r12,%r6,%r8;                 // group
     \\  div.u32 %r13,%r10,%r12;               // kv head
     \\  // q fragment: q[(t*heads + h)*hd + lane*8 ..][8]
@@ -2073,10 +2081,10 @@ pub const attn_split_h512_ptx: [:0]const u8 =
     \\.target sm_86
     \\.address_size 64
     \\.visible .entry attn_split_h512(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
-    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .u32 u6,.param .f32 f0,.param .f32 f1)
     \\{
-    \\  .reg .pred %p<5>;
-    \\  .reg .b32 %r<32>;
+    \\  .reg .pred %p<7>;
+    \\  .reg .b32 %r<34>;
     \\  .reg .f32 %f<80>;
     \\  .reg .b64 %rd<24>;
     \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x;
@@ -2097,7 +2105,14 @@ pub const attn_split_h512_ptx: [:0]const u8 =
     \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3; cvta.to.global.u64 %rd4,%rd4;
     \\  div.u32 %r31,%r27,%r7;                // query t
     \\  rem.u32 %r2,%r27,%r7;
-    \\  add.u32 %r5,%r5,%r31;                 // this query's kv len (causal)
+    \\  add.u32 %r5,%r5,%r31;                 // this query's causal kv len (kv_len0+t)
+    \\  // kv_end: causal by default; bidirectional image block (u6) extends it to
+    \\  // kv_len0+seq_q-1 (global layers are window 0, so kv_start stays 0).
+    \\  ld.param.u32 %r32,[u6];               // bidir (0/1)
+    \\  mov.u32 %r33,%r5;                      // kv_end = causal len
+    \\  setp.eq.u32 %p5,%r32,0; @%p5 bra NOBIDIR;
+    \\  add.u32 %r33,%r5,%r30; sub.u32 %r33,%r33,1; sub.u32 %r33,%r33,%r31; // kv_len0+seq_q-1
+    \\NOBIDIR:
     \\  div.u32 %r10,%r2,%r26;               // h
     \\  rem.u32 %r21,%r2,%r26;               // split i
     \\  ld.param.f32 %f30,[f1]; cvt.rzi.u32.f32 %r11,%f30;
@@ -2106,10 +2121,10 @@ pub const attn_split_h512_ptx: [:0]const u8 =
     \\  setp.le.u32 %p4,%r5,%r11; @%p4 bra NOWIN;
     \\  sub.u32 %r16,%r5,%r11;
     \\NOWIN:
-    \\  sub.u32 %r22,%r5,%r16;
+    \\  sub.u32 %r22,%r33,%r16;               // span = kv_end - kv_start
     \\  add.u32 %r22,%r22,%r26; sub.u32 %r22,%r22,1; div.u32 %r22,%r22,%r26; // chunk = ceil(span/nsplit)
     \\  mad.lo.s32 %r17,%r21,%r22,%r16;       // kv0
-    \\  add.u32 %r23,%r17,%r22; min.u32 %r23,%r23,%r5; // kv1
+    \\  add.u32 %r23,%r17,%r22; min.u32 %r23,%r23,%r33; // kv1
     \\  div.u32 %r12,%r6,%r8;                 // group
     \\  div.u32 %r13,%r10,%r12;               // kv head
     \\  // q fragment: q[(t*heads + h)*hd + lane*16 ..][16]
@@ -2198,10 +2213,10 @@ pub const attn_split_h256_f16_ptx: [:0]const u8 =
     \\.target sm_86
     \\.address_size 64
     \\.visible .entry attn_split_h256_f16(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
-    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .u32 u6,.param .f32 f0,.param .f32 f1)
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .u32 u6,.param .u32 u7,.param .f32 f0,.param .f32 f1)
     \\{
-    \\  .reg .pred %p<6>;
-    \\  .reg .b32 %r<44>;
+    \\  .reg .pred %p<8>;
+    \\  .reg .b32 %r<46>;
     \\  .reg .f32 %f<64>;
     \\  .reg .b16 %hs<2>;
     \\  .reg .b64 %rd<24>;
@@ -2223,20 +2238,27 @@ pub const attn_split_h256_f16_ptx: [:0]const u8 =
     \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3; cvta.to.global.u64 %rd4,%rd4;
     \\  div.u32 %r31,%r27,%r7;                // query t
     \\  rem.u32 %r2,%r27,%r7;                 // warp within query
-    \\  add.u32 %r5,%r5,%r31;                 // this query's kv len (causal)
+    \\  add.u32 %r5,%r5,%r31;                 // this query's causal kv len (kv_len0+t)
+    \\  // kv_end: causal by default; bidirectional image block (u7) extends it
+    \\  // to the whole batch (kv_len0+seq_q-1). Window kv_start stays on causal.
+    \\  ld.param.u32 %r44,[u7];               // bidir (0/1)
+    \\  mov.u32 %r45,%r5;                      // kv_end = causal len
+    \\  setp.eq.u32 %p6,%r44,0; @%p6 bra NOBIDIR;
+    \\  add.u32 %r45,%r5,%r30; sub.u32 %r45,%r45,1; sub.u32 %r45,%r45,%r31; // kv_len0+seq_q-1
+    \\NOBIDIR:
     \\  div.u32 %r10,%r2,%r26;                // h
     \\  rem.u32 %r21,%r2,%r26;                // split i
-    \\  // Sliding window (f1, 0 = full causal): kv_start = max(0, kv_len - window).
+    \\  // Sliding window (f1, 0 = full causal): kv_start = max(0, causal_len - window).
     \\  ld.param.f32 %f30,[f1]; cvt.rzi.u32.f32 %r11,%f30;
     \\  mov.u32 %r16,0;                       // kv_start
     \\  setp.eq.u32 %p4,%r11,0; @%p4 bra NOWIN;
     \\  setp.le.u32 %p4,%r5,%r11; @%p4 bra NOWIN;
-    \\  sub.u32 %r16,%r5,%r11;                // kv_start = kv_len - window
+    \\  sub.u32 %r16,%r5,%r11;                // kv_start = causal_len - window
     \\NOWIN:
-    \\  sub.u32 %r22,%r5,%r16;                // span = kv_len - kv_start
+    \\  sub.u32 %r22,%r45,%r16;               // span = kv_end - kv_start
     \\  add.u32 %r22,%r22,%r26; sub.u32 %r22,%r22,1; div.u32 %r22,%r22,%r26; // chunk = ceil(span/nsplit)
     \\  mad.lo.s32 %r17,%r21,%r22,%r16;       // kv0 = kv_start + split_i*chunk
-    \\  add.u32 %r23,%r17,%r22; min.u32 %r23,%r23,%r5; // kv1
+    \\  add.u32 %r23,%r17,%r22; min.u32 %r23,%r23,%r45; // kv1
     \\  div.u32 %r12,%r6,%r8;                 // group
     \\  div.u32 %r13,%r10,%r12;               // kv head
     \\  // q fragment (f32): q[(t*heads + h)*hd + lane*8 ..][8]
@@ -2317,10 +2339,10 @@ pub const attn_split_h512_f16_ptx: [:0]const u8 =
     \\.target sm_86
     \\.address_size 64
     \\.visible .entry attn_split_h512_f16(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
-    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .u32 u6,.param .f32 f0,.param .f32 f1)
     \\{
-    \\  .reg .pred %p<5>;
-    \\  .reg .b32 %r<48>;
+    \\  .reg .pred %p<7>;
+    \\  .reg .b32 %r<50>;
     \\  .reg .f32 %f<80>;
     \\  .reg .b16 %hs<2>;
     \\  .reg .b64 %rd<24>;
@@ -2342,7 +2364,14 @@ pub const attn_split_h512_f16_ptx: [:0]const u8 =
     \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3; cvta.to.global.u64 %rd4,%rd4;
     \\  div.u32 %r31,%r27,%r7;                // query t
     \\  rem.u32 %r2,%r27,%r7;
-    \\  add.u32 %r5,%r5,%r31;                 // this query's kv len (causal)
+    \\  add.u32 %r5,%r5,%r31;                 // this query's causal kv len (kv_len0+t)
+    \\  // kv_end: causal by default; bidirectional image block (u6) extends it to
+    \\  // kv_len0+seq_q-1 (global layers are window 0, so kv_start stays 0).
+    \\  ld.param.u32 %r48,[u6];               // bidir (0/1)
+    \\  mov.u32 %r49,%r5;                      // kv_end = causal len
+    \\  setp.eq.u32 %p5,%r48,0; @%p5 bra NOBIDIR;
+    \\  add.u32 %r49,%r5,%r30; sub.u32 %r49,%r49,1; sub.u32 %r49,%r49,%r31; // kv_len0+seq_q-1
+    \\NOBIDIR:
     \\  div.u32 %r10,%r2,%r26;               // h
     \\  rem.u32 %r21,%r2,%r26;               // split i
     \\  ld.param.f32 %f30,[f1]; cvt.rzi.u32.f32 %r11,%f30;
@@ -2351,10 +2380,10 @@ pub const attn_split_h512_f16_ptx: [:0]const u8 =
     \\  setp.le.u32 %p4,%r5,%r11; @%p4 bra NOWIN;
     \\  sub.u32 %r16,%r5,%r11;
     \\NOWIN:
-    \\  sub.u32 %r22,%r5,%r16;
+    \\  sub.u32 %r22,%r49,%r16;               // span = kv_end - kv_start
     \\  add.u32 %r22,%r22,%r26; sub.u32 %r22,%r22,1; div.u32 %r22,%r22,%r26; // chunk = ceil(span/nsplit)
     \\  mad.lo.s32 %r17,%r21,%r22,%r16;       // kv0
-    \\  add.u32 %r23,%r17,%r22; min.u32 %r23,%r23,%r5; // kv1
+    \\  add.u32 %r23,%r17,%r22; min.u32 %r23,%r23,%r49; // kv1
     \\  div.u32 %r12,%r6,%r8;                 // group
     \\  div.u32 %r13,%r10,%r12;               // kv head
     \\  // q fragment (f32): q[(t*heads + h)*hd + lane*16 ..][16]

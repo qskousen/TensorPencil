@@ -125,6 +125,7 @@ Per-stage dispatch order everywhere is `if (cu_be)` → CUDA, `else if (gpu_ctx)
 | Attention prefill | `ops/attention.zig` | `attn_full` + coopmat | hgemm+softmax TC | **cuDNN SDPA** |
 | Attention decode (flash) | (same fn) | `attn_dsplit`/`attn_dmerge`, `attn_decode_q35` | `attn_split`/`_merge`/`_h256`/`_h512` | ↤ hand-PTX |
 | GQA / windowed (Gemma) local attn | ✅ | ✅ | ✅ | ✅ |
+| Bidirectional image-block attn (Gemma vision) | ✅ | ✅ (gemma3) | ✅ | ✅ |
 | KV cache | host slices | device + gather | `opKvAppendS` + gather/scatter | ↤ |
 | **Growable VMM KV context** (cuMemMap in-place) | ⚠️ host arrays | ❌ (reserves window up front) | ✅ | ✅ |
 | RoPE (half/partial/interleaved/dual/factored) | ✅ | ✅ (no vision/M-RoPE) | ✅ (+M-RoPE, vision) | ↤ |

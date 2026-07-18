@@ -1624,14 +1624,19 @@ pub const Backend = struct {
     /// `ring` (> 0) enables sliding-window ring addressing in the h256 kernel:
     /// KV storage row = pos % ring (gemma3/gemma4 LOCAL layers, whose caches hold
     /// only `ring` rows). 0 = linear addressing. Only hd==256 supports ring.
-    pub fn opAttnDecode(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, kv_len0: usize, seq_q: usize, n_heads: usize, kv_heads: usize, hd: usize, nsplit: usize, scale: f32, window: usize, ring: usize, kv_f16: bool) Error!void {
+    pub fn opAttnDecode(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, kv_len0: usize, seq_q: usize, n_heads: usize, kv_heads: usize, hd: usize, nsplit: usize, scale: f32, window: usize, ring: usize, bidir: bool, kv_f16: bool) Error!void {
         self.ptic();
         defer self.ptoc(.attn);
         std.debug.assert((hd == 128 or hd == 256 or hd == 512) and seq_q >= 1);
+        // Bidirectional image-block prefill (kv_end extended to the whole batch)
+        // is only wired into the h256/h512 gemma kernels; text decode never sets
+        // it, and the h128 (qwen) kernel is never a gemma image path.
+        std.debug.assert(!bidir or hd == 256 or hd == 512);
+        const bidir_u: u32 = @intFromBool(bidir);
         const total = seq_q * n_heads * nsplit * 32;
         if (hd == 256) {
-            // The h256 kernel carries an extra ring param (u6), so it needs a
-            // bespoke 13-param launch (eltLaunch only passes 6 u32 + 2 f32).
+            // The h256 kernel carries extra ring (u6) + bidir (u7) params, so it
+            // needs a bespoke 14-param launch (eltLaunch only passes 6 u32 + 2 f32).
             const f_split = try self.eltFn(
                 if (kv_f16) elt.attn_split_h256_f16_ptx else elt.attn_split_h256_ptx,
                 if (kv_f16) "attn_split_h256_f16" else "attn_split_h256",
@@ -1640,7 +1645,28 @@ pub const Backend = struct {
             var p1 = k.ptr();
             var p2 = v.ptr();
             var p3 = scratch.ptr();
-            var uu = [_]u32{ @intCast(kv_len0), @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intCast(nsplit), @intCast(seq_q), @intCast(ring) };
+            var uu = [_]u32{ @intCast(kv_len0), @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intCast(nsplit), @intCast(seq_q), @intCast(ring), bidir_u };
+            var ff = [_]f32{ scale, @floatFromInt(window) };
+            var params = [_]?*anyopaque{
+                @ptrCast(&p0),    @ptrCast(&p1),    @ptrCast(&p2),    @ptrCast(&p3),
+                @ptrCast(&uu[0]), @ptrCast(&uu[1]), @ptrCast(&uu[2]), @ptrCast(&uu[3]),
+                @ptrCast(&uu[4]), @ptrCast(&uu[5]), @ptrCast(&uu[6]), @ptrCast(&uu[7]),
+                @ptrCast(&ff[0]), @ptrCast(&ff[1]),
+            };
+            const grid: u32 = @intCast((total + 255) / 256);
+            self.ctx.launch(f_split, .{ grid, 1, 1 }, .{ 256, 1, 1 }, 0, &params) catch return error.CudaError;
+        } else if (hd == 512) {
+            // h512 (gemma4 GLOBAL) also takes bidir (u6); window is always 0, so
+            // it needs no ring param. Bespoke launch (7th u32 beyond eltLaunch).
+            const f_split = try self.eltFn(
+                if (kv_f16) elt.attn_split_h512_f16_ptx else elt.attn_split_h512_ptx,
+                if (kv_f16) "attn_split_h512_f16" else "attn_split_h512",
+            );
+            var p0 = q.ptr();
+            var p1 = k.ptr();
+            var p2 = v.ptr();
+            var p3 = scratch.ptr();
+            var uu = [_]u32{ @intCast(kv_len0), @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intCast(nsplit), @intCast(seq_q), bidir_u };
             var ff = [_]f32{ scale, @floatFromInt(window) };
             var params = [_]?*anyopaque{
                 @ptrCast(&p0),    @ptrCast(&p1),    @ptrCast(&p2),    @ptrCast(&p3),
@@ -1652,14 +1678,9 @@ pub const Backend = struct {
             self.ctx.launch(f_split, .{ grid, 1, 1 }, .{ 256, 1, 1 }, 0, &params) catch return error.CudaError;
         } else {
             std.debug.assert(ring == 0); // ring addressing is only implemented for hd==256
-            const f_split = if (hd == 128)
-                try self.eltFn(
-                    if (kv_f16) elt.attn_split_f16_ptx else elt.attn_split_ptx,
-                    if (kv_f16) "attn_split_f16" else "attn_split",
-                )
-            else try self.eltFn(
-                if (kv_f16) elt.attn_split_h512_f16_ptx else elt.attn_split_h512_ptx,
-                if (kv_f16) "attn_split_h512_f16" else "attn_split_h512",
+            const f_split = try self.eltFn(
+                if (kv_f16) elt.attn_split_f16_ptx else elt.attn_split_ptx,
+                if (kv_f16) "attn_split_f16" else "attn_split",
             );
             try self.eltLaunch(f_split, q, k, v, scratch, .{ @intCast(kv_len0), @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intCast(nsplit), @intCast(seq_q) }, .{ scale, @floatFromInt(window) }, total);
         }
@@ -3866,7 +3887,7 @@ test "qwen35 attention ops match CPU reference" {
     try be.tensorUpload(q_d, std.mem.sliceAsBytes(&q));
     try be.tensorUpload(k_d, std.mem.sliceAsBytes(&k));
     try be.tensorUpload(v_d, std.mem.sliceAsBytes(&v));
-    try be.opAttnDecode(q_d, k_d, v_d, out_d, scratch_d, kv_len, 1, heads, kv_heads, hd, 8, scale, 0, 0, false);
+    try be.opAttnDecode(q_d, k_d, v_d, out_d, scratch_d, kv_len, 1, heads, kv_heads, hd, 8, scale, 0, 0, false, false);
     var got: [heads * hd]f32 = undefined;
     try be.tensorDownload(out_d, std.mem.sliceAsBytes(&got));
     for (ref, got) |e, a| try std.testing.expectApproxEqAbs(e, a, 2e-3);
@@ -4120,7 +4141,7 @@ test "attn decode seq_q batch matches CPU reference" {
     try be.tensorUpload(q_d, std.mem.sliceAsBytes(q));
     try be.tensorUpload(k_d, std.mem.sliceAsBytes(k));
     try be.tensorUpload(v_d, std.mem.sliceAsBytes(v));
-    try be.opAttnDecode(q_d, k_d, v_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale, 0, 0, false);
+    try be.opAttnDecode(q_d, k_d, v_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale, 0, 0, false, false);
     const got = try gpa.alloc(f32, q.len);
     defer gpa.free(got);
     try be.tensorDownload(o_d, std.mem.sliceAsBytes(got));
@@ -4221,7 +4242,7 @@ test "attn decode with f16 KV cache matches the f32 reference" {
         try be.tensorUpload(q_d, std.mem.sliceAsBytes(q));
         try be.tensorUpload(k_d, std.mem.sliceAsBytes(k16));
         try be.tensorUpload(v_d, std.mem.sliceAsBytes(v16));
-        try be.opAttnDecode(q_d, k_d, v_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale, 0, 0, true);
+        try be.opAttnDecode(q_d, k_d, v_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale, 0, 0, false, true);
         const got = try gpa.alloc(f32, q.len);
         defer gpa.free(got);
         try be.tensorDownload(o_d, std.mem.sliceAsBytes(got));
@@ -4309,7 +4330,7 @@ test "attn decode sliding window matches CPU reference" {
     try be.tensorUpload(q_d, std.mem.sliceAsBytes(q));
     try be.tensorUpload(k_d, std.mem.sliceAsBytes(k));
     try be.tensorUpload(v_d, std.mem.sliceAsBytes(v));
-    try be.opAttnDecode(q_d, k_d, v_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale, window, 0, false);
+    try be.opAttnDecode(q_d, k_d, v_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale, window, 0, false, false);
     const got = try gpa.alloc(f32, q.len);
     defer gpa.free(got);
     try be.tensorDownload(o_d, std.mem.sliceAsBytes(got));
@@ -4341,11 +4362,105 @@ test "attn decode sliding window matches CPU reference" {
     }
     try be.tensorUpload(kr_d, std.mem.sliceAsBytes(k_ring));
     try be.tensorUpload(vr_d, std.mem.sliceAsBytes(v_ring));
-    try be.opAttnDecode(q_d, kr_d, vr_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale, window, ring, false);
+    try be.opAttnDecode(q_d, kr_d, vr_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale, window, ring, false, false);
     try be.tensorDownload(o_d, std.mem.sliceAsBytes(got));
     var worst_ring: f32 = 0;
     for (ref, got) |e, a| worst_ring = @max(worst_ring, @abs(e - a));
     try std.testing.expect(worst_ring <= 2e-3);
+}
+
+// Gated on a CUDA device: the bidirectional image-block path of the batched
+// attn_split kernels (bidir=1). Every query attends the WHOLE batch forward
+// (kv_end = kv_total) while the sliding-window lower bound still tracks each
+// query's own position — the mask Gemma image tokens use. Covers hd=256 (local,
+// window + ring) and hd=512 (global, window 0).
+test "attn decode bidirectional image block matches CPU reference" {
+    const gpa = std.testing.allocator;
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+
+    const heads = 4;
+    const kv_heads = 2;
+    const nsp = 8;
+    inline for (.{ 256, 512 }) |hd| {
+        // hd=256 mimics a Gemma LOCAL layer (windowed + ring); hd=512 a GLOBAL
+        // layer (window 0, no ring). The image block is the whole seq_q batch.
+        const window: usize = if (hd == 256) 24 else 0;
+        const seq_q = 40;
+        const kv_len0 = 60; // committed text prefix; the block starts here
+        const kv_total = kv_len0 + seq_q;
+        var prng = std.Random.DefaultPrng.init(101 + hd);
+        const rand = prng.random();
+
+        const q = try gpa.alloc(f32, seq_q * heads * hd);
+        defer gpa.free(q);
+        const k = try gpa.alloc(f32, kv_total * kv_heads * hd);
+        defer gpa.free(k);
+        const v = try gpa.alloc(f32, kv_total * kv_heads * hd);
+        defer gpa.free(v);
+        for (q) |*x| x.* = rand.floatNorm(f32) * 0.3;
+        for (k) |*x| x.* = rand.floatNorm(f32) * 0.3;
+        for (v) |*x| x.* = rand.floatNorm(f32);
+        const scale = 1.0 / @sqrt(@as(f32, hd));
+
+        // Bidirectional reference: query t attends [kv_start, kv_total) — the
+        // whole sequence FORWARD — with kv_start windowed off its OWN causal
+        // position (max(0, klen - window)), not the extended end.
+        const ref = try gpa.alloc(f32, seq_q * heads * hd);
+        defer gpa.free(ref);
+        const scores = try gpa.alloc(f32, kv_total);
+        defer gpa.free(scores);
+        for (0..seq_q) |t| {
+            const klen = kv_len0 + t + 1; // this query's causal position + 1
+            const kv_start = if (window != 0 and klen > window) klen - window else 0;
+            for (0..heads) |h| {
+                const kvh = h / (heads / kv_heads);
+                var mx: f32 = -std.math.inf(f32);
+                for (kv_start..kv_total) |j| {
+                    var sacc: f32 = 0;
+                    for (0..hd) |c| sacc += q[(t * heads + h) * hd + c] * k[(j * kv_heads + kvh) * hd + c];
+                    scores[j] = sacc * scale;
+                    mx = @max(mx, scores[j]);
+                }
+                var den: f32 = 0;
+                for (kv_start..kv_total) |j| {
+                    scores[j] = @exp(scores[j] - mx);
+                    den += scores[j];
+                }
+                for (0..hd) |c| {
+                    var acc: f32 = 0;
+                    for (kv_start..kv_total) |j| acc += scores[j] * v[(j * kv_heads + kvh) * hd + c];
+                    ref[(t * heads + h) * hd + c] = acc / den;
+                }
+            }
+        }
+
+        const q_d = try be.tensorCreate(q.len * 4);
+        const k_d = try be.tensorCreate(k.len * 4);
+        const v_d = try be.tensorCreate(v.len * 4);
+        const o_d = try be.tensorCreate(q.len * 4);
+        const s_d = try be.tensorCreate(seq_q * heads * nsp * (hd + 4) * 4);
+        defer {
+            inline for (.{ q_d, k_d, v_d, o_d, s_d }) |b| {
+                var bb = b;
+                be.tensorDestroy(&bb);
+            }
+        }
+        try be.tensorUpload(q_d, std.mem.sliceAsBytes(q));
+        try be.tensorUpload(k_d, std.mem.sliceAsBytes(k));
+        try be.tensorUpload(v_d, std.mem.sliceAsBytes(v));
+        // bidir=true, linear KV (ring=0): the image block is one un-chunked pass.
+        try be.opAttnDecode(q_d, k_d, v_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale, window, 0, true, false);
+        const got = try gpa.alloc(f32, q.len);
+        defer gpa.free(got);
+        try be.tensorDownload(o_d, std.mem.sliceAsBytes(got));
+        var worst: f32 = 0;
+        for (ref, got) |e, a| worst = @max(worst, @abs(e - a));
+        if (worst > 2e-3) {
+            std.debug.print("bidir hd={d}: worst abs err {d}\n", .{ hd, worst });
+            return error.TestExpectedApproxEqAbs;
+        }
+    }
 }
 
 // Gated on a CUDA device: rope_imrope_pos with DIFFERING (t, h, w)
