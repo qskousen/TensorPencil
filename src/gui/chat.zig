@@ -163,6 +163,10 @@ pub const Options = struct {
     /// only as the conversation fills.
     max_context: ?usize = null,
     max_new_tokens: usize = 2048,
+    /// BASE sampling seed for the session (the app passes the clock). Every
+    /// turn draws its own seed from a sample.SeedSeq over this at submit, so
+    /// a new chat / repeated prompt / regenerated reply never replays the
+    /// same RNG stream.
     seed: u64 = 0,
     /// Sampling controls (temperature/top-k/top-p/min-p/penalties). Snapshotted
     /// per turn: `updateSettings` stages changes, `submit` applies them, so a
@@ -231,6 +235,11 @@ pub const Session = struct {
     /// runs (`submit` refuses when busy). Keeps live settings edits from racing
     /// the worker's read of `opts`, and gives "takes effect next turn" exactly.
     pending_sampling: sample.Params = .{},
+    /// Per-turn sampling seeds, drawn at each turn boundary (`submit`, UI
+    /// thread — same discipline as `pending_sampling`). Deliberately NOT
+    /// reset by `reset`: a new chat must not replay the previous chat's
+    /// seeds, and a future "regenerate reply" just draws again.
+    seeds: sample.SeedSeq = .{ .state = 0 },
     messages: std.ArrayList(Message) = .empty,
 
     // Worker <-> UI marshalling.
@@ -387,6 +396,7 @@ pub const Session = struct {
             .sampling = cfg.sampling,
         };
         self.pending_sampling = cfg.sampling;
+        self.seeds = sample.SeedSeq.init(cfg.seed);
         // Let the decode loop enact arbiter-published VRAM targets on the worker
         // thread (`self` is heap-pinned, so the captured pointer stays valid).
         self.opts.residency_poll = .{ .ctx = self, .apply = residencyPollThunk };
@@ -829,9 +839,11 @@ pub const Session = struct {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0 and self.attach_view.items.len == 0) return;
 
-        // Turn boundary: adopt any sampling changes staged by updateSettings.
-        // Safe here (UI thread, no worker running yet).
+        // Turn boundary: adopt any sampling changes staged by updateSettings,
+        // and draw this turn's sampling seed so no two turns replay the same
+        // RNG stream. Safe here (UI thread, no worker running yet).
         self.opts.sampling = self.pending_sampling;
+        self.opts.seed = self.seeds.next();
 
         var um: Message = .{ .role = .user };
         if (trimmed.len > 0) try um.text.appendSlice(self.gpa, trimmed);

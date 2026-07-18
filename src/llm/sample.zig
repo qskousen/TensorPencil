@@ -97,6 +97,31 @@ pub const Dist = struct {
     }
 };
 
+/// Per-turn seed sequence for multi-turn sessions. A Sampler is constructed
+/// fresh for every generate call from `Options.seed`, so a session that reuses
+/// one seed replays the identical RNG stream each turn — a repeated prompt
+/// (new chat, or a regenerated reply) then reproduces the identical response.
+/// Chat drivers hold one SeedSeq per session and pull `next()` at every turn
+/// boundary instead: turns never share an RNG stream, while a fixed base seed
+/// still reproduces the whole session deterministically.
+pub const SeedSeq = struct {
+    state: u64,
+
+    pub fn init(base: u64) SeedSeq {
+        return .{ .state = base };
+    }
+
+    /// The next per-turn seed: splitmix64 over an advancing counter. The
+    /// finalizer is a bijection, so seeds within a session never collide.
+    pub fn next(self: *SeedSeq) u64 {
+        self.state +%= 0x9E3779B97F4A7C15;
+        var z = self.state;
+        z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+        z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+        return z ^ (z >> 31);
+    }
+};
+
 pub const Sampler = struct {
     params: Params,
     rng: std.Random.DefaultPrng,
@@ -645,4 +670,36 @@ test "sampling stays within the top-k set and is seed-deterministic" {
         try std.testing.expectEqual(ia, ib);
         try std.testing.expect(ia < 3);
     }
+}
+
+test "SeedSeq is deterministic per base and collision-free across turns" {
+    var a = SeedSeq.init(42);
+    var b = SeedSeq.init(42);
+    var seen: [64]u64 = undefined;
+    for (&seen) |*s| {
+        s.* = a.next();
+        try std.testing.expectEqual(s.*, b.next()); // same base -> same sequence
+    }
+    for (seen, 0..) |si, i| { // bijective finalizer: no repeats within a session
+        for (seen[i + 1 ..]) |sj| try std.testing.expect(si != sj);
+    }
+    // A different base yields a different first turn (new chat != old chat).
+    var c = SeedSeq.init(43);
+    try std.testing.expect(c.next() != seen[0]);
+}
+
+test "SeedSeq turns produce independent sampling streams" {
+    // Two turns of the same session must not replay the same tokens for the
+    // same logits (the "identical response on a repeated prompt" bug).
+    var seq = SeedSeq.init(7);
+    var s1 = Sampler.init(.{ .temperature = 1.0, .top_k = 0, .top_p = 1.0 }, seq.next());
+    var s2 = Sampler.init(.{ .temperature = 1.0, .top_k = 0, .top_p = 1.0 }, seq.next());
+    const logits_base = [_]f32{ 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0 };
+    var differs = false;
+    for (0..64) |_| {
+        var l1 = logits_base;
+        var l2 = logits_base;
+        if (s1.next(&l1, &.{}) != s2.next(&l2, &.{})) differs = true;
+    }
+    try std.testing.expect(differs); // p(false positive) = 8^-64
 }

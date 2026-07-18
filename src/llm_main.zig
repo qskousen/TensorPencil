@@ -51,7 +51,8 @@ const usage =
     \\token, --frequency-penalty subtracts per occurrence (defaults 0 =
     \\off; llama.cpp formulas). Any active penalty needs the full logits,
     \\so it takes the CPU-sampling path on GPU backends (slower per token).
-    \\Seed defaults to the clock; pass --seed for reproducible output.
+    \\Seed defaults to the clock; pass --seed to reproduce a session (it is
+    \\the base of a per-turn seed sequence, so turns stay independent).
     \\Reasoning is on by default for models that support it (Qwen3.5, Gemma 4):
     \\the model emits a thought block before its answer. --no-think disables it
     \\(the turn is primed with an empty thought so the model answers directly);
@@ -641,8 +642,16 @@ fn runSession(
     prompt: ?[]const u8,
     img_chat: ?ImageChat,
 ) !usize {
+    // opts.seed is the session's BASE seed (clock or --seed); every turn
+    // samples with a fresh seed drawn from this sequence so two turns (or a
+    // repeated prompt) never replay the same RNG stream, while a fixed
+    // --seed still reproduces the whole session.
+    var seeds = llm.sample.SeedSeq.init(opts.seed);
+    var turn_opts = opts;
+
     if (prompt != null) {
-        return doGenerate(model, drafter, tok, io, gpa, ids, opts, stdout);
+        turn_opts.seed = seeds.next();
+        return doGenerate(model, drafter, tok, io, gpa, ids, turn_opts, stdout);
     }
 
     const stdin_file: Io.File = .stdin();
@@ -686,7 +695,8 @@ fn runSession(
             try llm.chat.openAssistant(tok, gpa, ids);
         }
         const t0 = Io.Clock.real.now(io).nanoseconds;
-        const n = doGenerate(model, drafter, tok, io, gpa, ids, opts, stdout) catch |err| switch (err) {
+        turn_opts.seed = seeds.next();
+        const n = doGenerate(model, drafter, tok, io, gpa, ids, turn_opts, stdout) catch |err| switch (err) {
             error.ContextFull => {
                 try stdout.writeAll("\n[context window full]\n");
                 try stdout.flush();

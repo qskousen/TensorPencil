@@ -24,7 +24,11 @@ pub const Options = struct {
     /// committed up front (see capacityPlanFor / kv_cache.Capacity).
     max_context: usize = 4096,
     sampling: sample.Params = .{},
-    /// RNG seed for sampling (irrelevant when temperature = 0).
+    /// RNG seed for sampling THIS generate call (irrelevant when temperature
+    /// = 0). The sampler is constructed fresh per call, so a multi-turn
+    /// driver must supply a fresh seed each turn (see sample.SeedSeq) or
+    /// every turn replays the same RNG stream — a repeated prompt would then
+    /// reproduce the identical "random" response.
     seed: u64 = 0,
     /// Speculative decoding: max drafted tokens per verify forward
     /// (0 = off). Requires a backend stepper with stepAll + truncate.
