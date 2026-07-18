@@ -379,6 +379,14 @@ pub const Session = struct {
         return 0;
     }
 
+    /// Free VRAM (bytes) on the card, for the GUI's offload telemetry. 0 on
+    /// backends without a mem-info query (Vulkan) or no device. Reads the current
+    /// context, so the caller must be on a thread that bound this backend.
+    pub fn freeVram(self: *const Session) u64 {
+        if (self.cu_be) |b| return b.ctx.memGetInfo().free;
+        return 0;
+    }
+
     /// MEASURED per-component VRAM breakdown for the GUI meter. Reads the live
     /// per-tag counters the allocator maintains (both CUDA and Vulkan backends).
     /// `latent` absorbs the untagged remainder so the parts sum to `deviceUsed`.

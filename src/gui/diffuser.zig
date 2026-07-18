@@ -554,7 +554,13 @@ pub const Diffuser = struct {
     /// image re-uploads what fits its budget.
     pub fn trimToBudget(self: *Diffuser, budget: u64) void {
         if (self.busy.load(.acquire)) return;
-        if (self.session.load(.acquire)) |s| s.trimToBudget(budget);
+        const s = self.session.load(.acquire) orelse return;
+        const before = s.deviceUsed();
+        s.trimToBudget(budget);
+        const after = s.deviceUsed();
+        if (after != before) std.log.info("[vram] diffusion evict (limit {d} MiB): {d}→{d} MiB resident · {d} MiB free", .{
+            budget >> 20, before >> 20, after >> 20, s.freeVram() >> 20,
+        });
     }
 
     /// Incrementally free resident diffusion weights to fit `budget` bytes,
@@ -563,8 +569,13 @@ pub const Diffuser = struct {
     /// returns bytes freed.
     pub fn giveUpToBudget(self: *Diffuser, budget: u64) u64 {
         if (self.busy.load(.acquire)) return 0;
-        if (self.session.load(.acquire)) |s| return s.giveUpToBudget(budget);
-        return 0;
+        const s = self.session.load(.acquire) orelse return 0;
+        const before = s.deviceUsed();
+        const freed = s.giveUpToBudget(budget);
+        if (freed > 0) std.log.info("[vram] diffusion yield (target {d} MiB): freed {d} MiB ({d}→{d} MiB resident) · {d} MiB free", .{
+            budget >> 20, freed >> 20, before >> 20, s.deviceUsed() >> 20, s.freeVram() >> 20,
+        });
+        return freed;
     }
 
     /// Estimate the image model's resident footprint (bytes) from its file
@@ -850,7 +861,10 @@ pub const Diffuser = struct {
                 self.wake();
                 return;
             };
-            std.log.info("[vram] diffusion model loaded in {d:.1}s", .{@as(f64, @floatFromInt(nowNs(self.io) - t_load)) / 1e9});
+            std.log.info("[vram] diffusion model loaded in {d:.1}s: {d} MiB resident (budget {d} MiB) · {d} MiB free", .{
+                @as(f64, @floatFromInt(nowNs(self.io) - t_load)) / 1e9,
+                sess.?.deviceUsed() >> 20, opts.vram_budget >> 20, sess.?.freeVram() >> 20,
+            });
             self.session.store(sess, .release);
             // Record what's resident (gpa-owned; freed on the next reload / free).
             self.loaded = ModelConfig.dupe(

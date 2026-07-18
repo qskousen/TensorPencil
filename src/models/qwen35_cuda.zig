@@ -445,7 +445,7 @@ pub const CudaLM = struct {
         }
         sp.on_gpu[l] = false;
         sp.n_cpu += 1;
-        std.log.info("[offload] layer {d} ({s}) -> CPU at ctx {d} ({d}/{d} on CPU)", .{ l, if (cfg.isRecurrent(l)) "lin" else "attn", self.len, sp.n_cpu, cfg.n_layers });
+        std.log.debug("[offload] layer {d} ({s}) -> CPU at ctx {d} ({d}/{d} on CPU)", .{ l, if (cfg.isRecurrent(l)) "lin" else "attn", self.len, sp.n_cpu, cfg.n_layers });
     }
 
     /// Total device footprint of one layer's streamable weights (quantized
@@ -674,7 +674,7 @@ pub const CudaLM = struct {
         }
         sp.on_gpu[l] = true;
         sp.n_cpu -= 1;
-        std.log.info("[promote] layer {d} ({s}) -> GPU at ctx {d} ({d}/{d} on CPU)", .{ l, if (cfg.isRecurrent(l)) "lin" else "attn", self.len, sp.n_cpu, cfg.n_layers });
+        std.log.debug("[promote] layer {d} ({s}) -> GPU at ctx {d} ({d}/{d} on CPU)", .{ l, if (cfg.isRecurrent(l)) "lin" else "attn", self.len, sp.n_cpu, cfg.n_layers });
     }
 
     /// Migrate CPU layers back onto the GPU (LIFO by offload order), stopping

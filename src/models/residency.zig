@@ -25,6 +25,28 @@
 
 const std = @import("std");
 
+/// A point-in-time view of a stepper's CPU/GPU residency split + the card's free
+/// VRAM, for the GUI's offload telemetry (logged whenever residency changes).
+/// `n_cpu`/`n_layers` count the layers migrated to the host vs the total; the
+/// byte figures are the live device usage and free VRAM in MiB.
+pub const Snapshot = struct {
+    n_cpu: usize,
+    n_layers: usize,
+    device_mib: u64,
+    free_mib: u64,
+};
+
+/// Snapshot `st`'s residency. Must run on the thread that bound this model's
+/// CUDA context (memGetInfo/deviceUsed read the current context).
+pub fn snapshot(st: anytype) Snapshot {
+    return .{
+        .n_cpu = if (st.split) |sp| sp.n_cpu else 0,
+        .n_layers = st.cfg.n_layers,
+        .device_mib = st.be.deviceUsed() >> 20,
+        .free_mib = st.be.ctx.memGetInfo().free >> 20,
+    };
+}
+
 /// Migrate the next layer in the offload order to the host (dynamic mode).
 /// Returns false when nothing is left to migrate, or when f16 KV keeps the
 /// model fully resident (the host shadow cache is f32).

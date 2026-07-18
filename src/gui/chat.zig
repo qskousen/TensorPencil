@@ -536,8 +536,25 @@ pub const Session = struct {
         const self = fromCtx(ctx);
         self.be.bindThread();
         switch (self.arch) {
-            inline else => |*a| residency.settleTo(&a.model, target) catch |err|
-                std.log.warn("[vram] LLM settle→{d}MB failed: {t}", .{ target >> 20, err }),
+            inline else => |*a| {
+                // Snapshot residency around the settle so we can log exactly what
+                // moved (settleTo is idempotent — an already-satisfied target
+                // shifts nothing, so we stay quiet unless the split actually
+                // changed, mirroring the per-turn tok/s summary).
+                const before = residency.snapshot(&a.model);
+                residency.settleTo(&a.model, target) catch |err| {
+                    std.log.warn("[vram] LLM settle→{d}MB failed: {t}", .{ target >> 20, err });
+                    return;
+                };
+                const after = residency.snapshot(&a.model);
+                if (after.n_cpu != before.n_cpu) {
+                    const dir = if (after.n_cpu > before.n_cpu) "offload→CPU" else "promote→GPU";
+                    std.log.info("[vram] LLM {s} (target {d} MiB): {d}→{d}/{d} layers on host · device {d}→{d} MiB · {d} MiB free", .{
+                        dir, target >> 20, before.n_cpu, after.n_cpu, after.n_layers,
+                        before.device_mib, after.device_mib, after.free_mib,
+                    });
+                }
+            },
         }
     }
     fn fromCtx(ctx: *anyopaque) *Session {
@@ -837,9 +854,15 @@ pub const Session = struct {
                 // already shows diffusion "gen:" progress on (dvui.App.logFn).
                 const dt = @as(f64, @floatFromInt(std.Io.Clock.real.now(self.io).nanoseconds - t0)) / 1e9;
                 const st = session.Stats.of(&a.model);
+                // Residency snapshot too: layers migrated to the host grow with
+                // the KV cache mid-turn (the ensureCapacity path, not the arbiter),
+                // so folding it into the per-turn summary is how those gradual
+                // offloads surface (context bound on this worker thread).
+                const res = residency.snapshot(&a.model);
                 var vbuf: [32]u8 = undefined;
-                std.log.info("[llm] {d} tok, {d:.1} tok/s, ctx {d}/{d}{s}", .{
+                std.log.info("[llm] {d} tok, {d:.1} tok/s, ctx {d}/{d}{s}, {d}/{d} layers on host, {d} MiB free", .{
                     n, if (dt > 0) @as(f64, @floatFromInt(n)) / dt else 0, st.tokens, st.window, st.vramSuffix(&vbuf),
+                    res.n_cpu, res.n_layers, res.free_mib,
                 });
             },
         }

@@ -368,7 +368,7 @@ pub const CudaLM = struct {
         self.be.evictWeightBytes(layer.down.bytes);
         sp.on_gpu[l] = false;
         sp.n_cpu += 1;
-        std.log.info("[offload] layer {d} (attn) -> CPU at ctx {d} ({d}/{d} on CPU)", .{ l, self.len, sp.n_cpu, cfg.n_layers });
+        std.log.debug("[offload] layer {d} (attn) -> CPU at ctx {d} ({d}/{d} on CPU)", .{ l, self.len, sp.n_cpu, cfg.n_layers });
     }
 
     /// Migrate layers to the host until `@min(budget - deviceUsed, headroom)`
@@ -430,7 +430,7 @@ pub const CudaLM = struct {
         }
         sp.on_gpu[l] = true;
         sp.n_cpu -= 1;
-        std.log.info("[promote] layer {d} -> GPU at ctx {d} ({d}/{d} on CPU)", .{ l, self.len, sp.n_cpu, cfg.n_layers });
+        std.log.debug("[promote] layer {d} -> GPU at ctx {d} ({d}/{d} on CPU)", .{ l, self.len, sp.n_cpu, cfg.n_layers });
     }
 
     /// Migrate CPU layers back onto the GPU (LIFO by offload order), stopping
