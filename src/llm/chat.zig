@@ -56,18 +56,43 @@ pub fn setThinking(on: bool) void {
 /// the family has no reasoning channel and the thinking toggle is a no-op.
 pub const Reasoning = struct { open: []const u8, close: []const u8 };
 
-/// The active family's reasoning-block markers, or null if it can't reason.
-pub fn reasoning() ?Reasoning {
-    return switch (family) {
+/// A given family's reasoning-block markers, or null if it can't reason. The
+/// single source of truth; `reasoning`/`supportsThinking` read the active
+/// family, callers probing a not-yet-active family pass it explicitly.
+pub fn reasoningFor(f: Family) ?Reasoning {
+    return switch (f) {
         .chatml => .{ .open = "<think>", .close = "</think>" },
         .gemma4 => .{ .open = "<|channel>thought", .close = "<channel|>" },
         .gemma => null,
     };
 }
 
+/// The active family's reasoning-block markers, or null if it can't reason.
+pub fn reasoning() ?Reasoning {
+    return reasoningFor(family);
+}
+
+/// Whether a given family supports a reasoning block (pure — lets the GUI probe
+/// a configured-but-not-loaded model without disturbing the process-global
+/// `family`).
+pub fn familySupportsThinking(f: Family) bool {
+    return reasoningFor(f) != null;
+}
+
 /// Whether the active family supports a reasoning block (drives the GUI toggle).
 pub fn supportsThinking() bool {
-    return reasoning() != null;
+    return familySupportsThinking(family);
+}
+
+/// Map a GGUF `general.architecture` string to its chat template family, or
+/// null if it isn't a family we template here. Single source of truth for the
+/// arch→family mapping (used by the session loader and the GUI's pre-load
+/// capability probe).
+pub fn familyForArch(arch: []const u8) ?Family {
+    if (std.mem.eql(u8, arch, "qwen35")) return .chatml;
+    if (std.mem.eql(u8, arch, "gemma3")) return .gemma;
+    if (std.mem.eql(u8, arch, "gemma4")) return .gemma4;
+    return null;
 }
 
 /// Select the chat template family (process-global, like the tokenizer).
@@ -346,6 +371,26 @@ test "reasoning descriptor is family-scoped" {
     setFamily(.gemma);
     try std.testing.expect(!supportsThinking());
     try std.testing.expectEqual(@as(?Reasoning, null), reasoning());
+}
+
+test "arch→family mapping and family-scoped thinking probe (no global mutation)" {
+    // The GUI probes a configured-but-unloaded model's reasoning support via
+    // these pure helpers; they must not disturb the process-global `family`.
+    const saved = family;
+    defer setFamily(saved);
+    setFamily(.gemma); // a distinctive sentinel to prove the probe leaves it be
+
+    try std.testing.expectEqual(@as(?Family, .chatml), familyForArch("qwen35"));
+    try std.testing.expectEqual(@as(?Family, .gemma), familyForArch("gemma3"));
+    try std.testing.expectEqual(@as(?Family, .gemma4), familyForArch("gemma4"));
+    try std.testing.expectEqual(@as(?Family, null), familyForArch("llama"));
+    try std.testing.expectEqual(@as(?Family, null), familyForArch(""));
+
+    try std.testing.expect(familySupportsThinking(.chatml));
+    try std.testing.expect(familySupportsThinking(.gemma4));
+    try std.testing.expect(!familySupportsThinking(.gemma));
+
+    try std.testing.expectEqual(Family.gemma, family); // untouched by the probes
 }
 
 // Thinking off must prepend an empty reasoning block to the assistant open (so

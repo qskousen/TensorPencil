@@ -38,6 +38,22 @@ var g_reload_requested: bool = false;
 // the model lazy-loads, then this is auto-submitted (see maybeStartReload).
 var g_pending_submit: ?[]u8 = null;
 
+// Images dropped/pasted before the LLM has loaded (the lazy first message). Held
+// here with their decoded RGB (fed to `attachImage` once a session exists) plus
+// a display RGBA (for the pre-load thumbnail strip). `maybeStartReload` drains
+// them into the fresh session so the first message carries its attachments.
+const StagedImage = struct { rgb: []u8, rgba: []u8, width: usize, height: usize };
+var g_staged_images: std.ArrayList(StagedImage) = .empty;
+
+// Cached "does the configured LLM support a reasoning block?" answer, so the
+// thinking toggle can show before the model loads. Reading a GGUF header is
+// cheap but not per-frame cheap, so we memoize and re-probe only when the
+// configured model path changes (including a Settings model swap).
+var g_think_probe_path: [config.max_path]u8 = undefined;
+var g_think_probe_len: usize = 0;
+var g_think_probe_result: bool = false;
+var g_think_probe_valid: bool = false;
+
 // The diffusion engine — APP-LEVEL and persistent (survives chat↔image mode
 // switches, so the image model isn't reloaded each way). It owns the single
 // unified image queue/history shared by the chat tool-call path and the studio.
@@ -391,6 +407,8 @@ pub fn run(init: std.process.Init) !void {
         }
         freeCarry();
         if (g_pending_submit) |p| g_gpa.free(p);
+        clearStaged();
+        g_staged_images.deinit(g_gpa);
         image_view.deinit();
         status_bar.deinit();
     }
@@ -538,12 +556,92 @@ fn sdlEventWindowID(event: SDLBackend.c.SDL_Event) u32 {
     };
 }
 
+/// Can the next message carry an image? True when a vision tower is resident,
+/// or — before the lazy first-message load — when the configured model has one
+/// (an mmproj path is set alongside an LLM). Lets drop/paste work as the first
+/// message, staging into `g_staged_images` until the session comes up.
+fn visionAvailable() bool {
+    if (g_session) |s| return s.visionEnabled();
+    return g_config.vision_tower.opt() != null and g_config.llm_model.opt() != null;
+}
+
+/// Attach a decoded RGB image to the next message. Hands it to the live session,
+/// or (lazy first message) stages it and kicks a load. Callers decode the source
+/// and confirm `visionAvailable()` first.
+fn attachOrStage(rgb: []const u8, w: usize, h: usize) void {
+    if (g_session) |s| {
+        s.attachImage(rgb, w, h) catch |err| std.log.err("attach image: {t}", .{err});
+        return;
+    }
+    const rgb_own = g_gpa.dupe(u8, rgb) catch return;
+    const rgba = diffuser.rgbToRgba(g_gpa, rgb_own, w, h) catch {
+        g_gpa.free(rgb_own);
+        return;
+    };
+    g_staged_images.append(g_gpa, .{ .rgb = rgb_own, .rgba = rgba, .width = w, .height = h }) catch {
+        g_gpa.free(rgb_own);
+        g_gpa.free(rgba);
+        return;
+    };
+    // Kick the lazy load so the staged image (and any first message) lands in a
+    // session; maybeStartReload drains g_staged_images once it's live.
+    if (!g_loading.load(.acquire)) g_reload_requested = true;
+}
+
+/// Drop a not-yet-loaded staged attachment by index (pre-session mirror of
+/// `Session.removeAttachment`).
+fn removeStaged(idx: usize) void {
+    if (idx >= g_staged_images.items.len) return;
+    const st = g_staged_images.orderedRemove(idx);
+    g_gpa.free(st.rgb);
+    g_gpa.free(st.rgba);
+}
+
+/// Free all staged attachments (load failed, or "new chat" before load).
+fn clearStaged() void {
+    for (g_staged_images.items) |st| {
+        g_gpa.free(st.rgb);
+        g_gpa.free(st.rgba);
+    }
+    g_staged_images.clearRetainingCapacity();
+}
+
+/// Whether the *configured* LLM (by GGUF architecture) can reason, so the
+/// thinking toggle can show before the model loads. A live session's loaded
+/// family is authoritative (see `renderInput`); this covers the pre-load window
+/// and re-probes whenever the configured model path changes.
+fn configuredSupportsThinking() bool {
+    const path = g_config.llm_model.opt() orelse {
+        g_think_probe_valid = false;
+        g_think_probe_len = 0;
+        return false;
+    };
+    if (!(g_think_probe_valid and g_think_probe_len == path.len and
+        std.mem.eql(u8, g_think_probe_path[0..g_think_probe_len], path)))
+    {
+        g_think_probe_result = probeThinking(path);
+        @memcpy(g_think_probe_path[0..path.len], path);
+        g_think_probe_len = path.len;
+        g_think_probe_valid = true;
+    }
+    return g_think_probe_result;
+}
+
+/// Read the configured GGUF's architecture and map it to reasoning support.
+/// Any failure (missing/unreadable file, unknown arch) → false.
+fn probeThinking(path: []const u8) bool {
+    var gg = tp.Gguf.open(g_gpa, g_io, path) catch return false;
+    defer gg.deinit();
+    const arch = gg.getStr("general.architecture") orelse return false;
+    const fam = tp.llm.chat.familyForArch(arch) orelse return false;
+    return tp.llm.chat.familySupportsThinking(fam);
+}
+
 /// A file was dropped on the window: decode it (libvips → RGB) and attach it
 /// to the next message for the model to see.
 fn handleDropFile(path: []const u8) void {
     if (g_loading.load(.acquire)) return; // session being rebuilt on the loader thread
-    const s = g_session orelse return;
-    if (!s.visionEnabled()) {
+    if (!visionAvailable()) {
         std.log.warn("dropped {s} but vision is unavailable", .{path});
         return;
     }
@@ -553,7 +651,7 @@ fn handleDropFile(path: []const u8) void {
         return;
     };
     defer gpa.free(dec.pixels);
-    s.attachImage(dec.pixels, dec.width, dec.height) catch |err| std.log.err("attach image: {t}", .{err});
+    attachOrStage(dec.pixels, dec.width, dec.height);
 }
 
 /// Ctrl/Cmd+V with an image on the clipboard: decode the raw bytes (any
@@ -565,8 +663,7 @@ fn handleDropFile(path: []const u8) void {
 fn tryPasteClipboardImage() bool {
     const SDL = SDLBackend.c;
     if (g_loading.load(.acquire)) return false; // session being rebuilt on the loader thread
-    const s = g_session orelse return false;
-    if (!s.visionEnabled()) return false;
+    if (!visionAvailable()) return false;
 
     var count: usize = 0;
     const mimes = SDL.SDL_GetClipboardMimeTypes(&count);
@@ -597,7 +694,7 @@ fn tryPasteClipboardImage() bool {
         return true;
     };
     defer gpa.free(dec.pixels);
-    s.attachImage(dec.pixels, dec.width, dec.height) catch |err| std.log.err("attach pasted image: {t}", .{err});
+    attachOrStage(dec.pixels, dec.width, dec.height);
     return true;
 }
 
@@ -909,6 +1006,15 @@ fn maybeStartReload() void {
             // Load finished. Apply the current meter policy to the fresh session
             // (settles the LLM to its share if diffusion is already resident).
             if (g_session != null) applyMeterPolicy();
+            // Move any images staged before the lazy load into the fresh session
+            // (BEFORE the deferred submit, so the first message carries them). If
+            // the load failed (no session) or the model has no vision tower, drop
+            // them — attachImage no-ops without a tower.
+            if (g_session) |s| {
+                for (g_staged_images.items) |st|
+                    s.attachImage(st.rgb, st.width, st.height) catch |err| std.log.err("attach staged image: {t}", .{err});
+            }
+            clearStaged();
             // If the first message was stashed while the LLM lazy-loaded, submit
             // it now that the session is live.
             if (g_pending_submit) |text| {
@@ -1425,41 +1531,60 @@ fn parseThink(text: []const u8) Parsed {
     return .{ .think = null, .answer = text, .thinking = false };
 }
 
+/// One pending-attachment thumbnail (56px, RGBA) with a hover-only X. Returns
+/// true if its remove button was clicked this frame. Shared by the session and
+/// pre-load staging strips (`renderInput`).
+fn renderPendingThumb(pi: usize, rgba: []const u8, w: usize, h: usize) bool {
+    const sz = fitSize(w, h, 56);
+    var ov = dvui.overlay(@src(), .{ .id_extra = pi, .margin = .{ .w = 6 } });
+    defer ov.deinit();
+    _ = dvui.image(@src(), .{
+        .source = .{ .pixels = .{ .rgba = rgba, .width = @intCast(w), .height = @intCast(h) } },
+        .shrink = .ratio,
+    }, .{ .min_size_content = sz, .max_size_content = .size(sz), .corner_radius = dvui.Rect.all(4) });
+    // Non-consuming hover test (leaves the click for the X button).
+    const hovered = ov.data().rectScale().r.contains(dvui.currentWindow().mouse_pt);
+    if (hovered) {
+        if (dvui.buttonIcon(@src(), "remove", dvui.entypo.cross, .{}, .{}, .{
+            .gravity_x = 1.0,
+            .gravity_y = 0.0,
+            .min_size_content = .{ .w = 12, .h = 12 },
+            .padding = dvui.Rect.all(2),
+            .corner_radius = dvui.Rect.all(3),
+        })) return true;
+    }
+    return false;
+}
+
 fn renderInput(s: ?*chat.Session) void {
     var container = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal });
     defer container.deinit();
 
-    // Thumbnails of images attached (dropped) but not yet sent, each with a
-    // hover-only X to remove it before sending. (None before the LLM loads.)
-    const pending: []const *chat.GenImage = if (s) |ss| ss.pendingAttachments() else &.{};
-    if (pending.len > 0) {
+    // Thumbnails of images attached but not yet sent, each with a hover-only X
+    // to remove it before sending. Once the LLM is live these come from the
+    // session's pending attachments; before the lazy first-message load they
+    // come from the pre-session staging buffer (dropped/pasted first images).
+    const n_thumbs = if (s) |ss| ss.pendingAttachments().len else g_staged_images.items.len;
+    if (n_thumbs > 0) {
         var remove_idx: ?usize = null;
         {
             var strip = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 8, .y = 4, .w = 8 } });
             defer strip.deinit();
-            for (pending, 0..) |gi, pi| {
-                if (gi.rgba == null) continue;
-                const sz = fitSize(gi.width, gi.height, 56);
-                var ov = dvui.overlay(@src(), .{ .id_extra = pi, .margin = .{ .w = 6 } });
-                _ = dvui.image(@src(), .{
-                    .source = .{ .pixels = .{ .rgba = gi.rgba.?, .width = @intCast(gi.width), .height = @intCast(gi.height) } },
-                    .shrink = .ratio,
-                }, .{ .min_size_content = sz, .max_size_content = .size(sz), .corner_radius = dvui.Rect.all(4) });
-                // Non-consuming hover test (leaves the click for the X button).
-                const hovered = ov.data().rectScale().r.contains(dvui.currentWindow().mouse_pt);
-                if (hovered) {
-                    if (dvui.buttonIcon(@src(), "remove", dvui.entypo.cross, .{}, .{}, .{
-                        .gravity_x = 1.0,
-                        .gravity_y = 0.0,
-                        .min_size_content = .{ .w = 12, .h = 12 },
-                        .padding = dvui.Rect.all(2),
-                        .corner_radius = dvui.Rect.all(3),
-                    })) remove_idx = pi;
+            if (s) |ss| {
+                for (ss.pendingAttachments(), 0..) |gi, pi| {
+                    if (gi.rgba) |rgba| if (renderPendingThumb(pi, rgba, gi.width, gi.height)) {
+                        remove_idx = pi;
+                    };
                 }
-                ov.deinit();
+            } else {
+                for (g_staged_images.items, 0..) |st, pi| {
+                    if (renderPendingThumb(pi, st.rgba, st.width, st.height)) remove_idx = pi;
+                }
             }
         }
-        if (remove_idx) |ri| if (s) |ss| ss.removeAttachment(ri);
+        if (remove_idx) |ri| {
+            if (s) |ss| ss.removeAttachment(ri) else removeStaged(ri);
+        }
     }
 
     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = dvui.Rect.all(8) });
@@ -1491,9 +1616,13 @@ fn renderInput(s: ?*chat.Session) void {
     }) and !busy) enterImageMode();
 
     // Reasoning toggle (no brain icon in entypo — a lit bulb reads as
-    // "thinking"). Shown only for a loaded model whose family can reason
-    // (Gemma 3 etc. hide it). Highlighted when on; flips live and persists.
-    if (g_session != null and tp.llm.chat.supportsThinking()) {
+    // "thinking"). Shown for any model whose family can reason (Gemma 3 etc.
+    // hide it). A live session's loaded family is authoritative; before the
+    // lazy first-message load we probe the configured model's GGUF so the toggle
+    // is usable up front. Highlighted when on; flips live (or into config) and
+    // persists.
+    const can_reason = if (s != null) tp.llm.chat.supportsThinking() else configuredSupportsThinking();
+    if (can_reason) {
         const on = g_config.reasoning;
         const th = dvui.themeGet();
         if (dvui.buttonIcon(@src(), "reasoning", dvui.entypo.light_bulb, .{}, .{}, .{
@@ -1556,7 +1685,7 @@ fn renderInput(s: ?*chat.Session) void {
     g_input_id = te.data().id;
     // Reserve for next frame's layout: entry height + row padding, plus the
     // attachment strip when present.
-    g_input_h = te.data().rect.h + 24 + (if (pending.len > 0) @as(f32, 72) else 0);
+    g_input_h = te.data().rect.h + 24 + (if (n_thumbs > 0) @as(f32, 72) else 0);
     if (send) {
         const t = te.getText();
         n = @min(t.len, buf.len);
@@ -1614,6 +1743,7 @@ fn newChat() void {
     // "new chat" starts fresh even while unloaded. (No-op when a session is
     // live, since g_carry is null then.)
     freeCarry();
+    clearStaged(); // drop any images staged for a not-yet-loaded first message
     @memset(&g_input_buf, 0);
     g_follow_bottom = true;
 }

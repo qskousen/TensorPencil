@@ -291,12 +291,17 @@ pub const Session = struct {
         // whose family can't reason; the toolbar toggle flips it live.
         chat.setThinking(cfg.reasoning);
 
+        // Chat template family (process-global, keyed off the same architecture
+        // string as the model dispatch below). `familyForArch` is the single
+        // source of truth the GUI also uses to probe a configured-but-unloaded
+        // model, so keep the mapping there, not duplicated per branch.
+        chat.setFamily(chat.familyForArch(arch_str) orelse return error.UnsupportedArchitecture);
+
         // Architecture dispatch: each variant bundles {lm, model, vit}. The
         // model retains a `*const lm` into the union, which is stable (self is
         // heap-pinned and the tag is set once). Vision towers are scoped
         // per-encode and never stay resident under the LLM.
         if (std.mem.eql(u8, arch_str, "qwen35")) {
-            chat.setFamily(.chatml);
             self.arch = .{ .qwen35 = .{ .lm = try qwen35.Model.load(arena, &self.gguf), .model = undefined } };
             const a = &self.arch.qwen35;
             errdefer a.lm.deinit();
@@ -304,7 +309,6 @@ pub const Session = struct {
             errdefer if (a.vit) |*v| v.deinit();
             a.model = try qwen35_cuda.CudaLM.init(gpa, self.be, &a.lm, cap);
         } else if (std.mem.eql(u8, arch_str, "gemma3")) {
-            chat.setFamily(.gemma);
             self.arch = .{ .gemma3 = .{ .lm = try gemma3.Model.load(arena, &self.gguf), .model = undefined } };
             const a = &self.arch.gemma3;
             errdefer a.lm.deinit();
@@ -312,7 +316,6 @@ pub const Session = struct {
             errdefer if (a.vit) |*v| v.deinit();
             a.model = try gemma3_cuda.CudaLM.init(gpa, self.be, &a.lm, cap);
         } else if (std.mem.eql(u8, arch_str, "gemma4")) {
-            chat.setFamily(.gemma4);
             self.arch = .{ .gemma4 = .{ .lm = try gemma4.Model.load(arena, &self.gguf), .model = undefined } };
             const a = &self.arch.gemma4;
             errdefer a.lm.deinit();
