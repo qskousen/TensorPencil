@@ -224,6 +224,11 @@ pub const CudaLM = struct {
     pub fn capacityMax(self: *const CudaLM) usize {
         return self.max_capacity;
     }
+    /// Device VRAM (bytes) currently in use by this backend — for the
+    /// end-of-response telemetry (`session.statsOf`).
+    pub fn vramUsed(self: *const CudaLM) u64 {
+        return self.be.deviceUsed();
+    }
     pub fn resetCache(self: *CudaLM) !void {
         self.len = 0;
     }

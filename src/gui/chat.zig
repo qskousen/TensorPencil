@@ -40,8 +40,11 @@ const Arch = union(enum) {
 };
 const cuda = tp.gpu.cuda;
 const engine = tp.llm.engine;
+const session = tp.llm.session;
 const kv_cache = tp.llm.kv_cache;
 const chat = tp.llm.chat;
+const vram = tp.vram;
+const residency = tp.models.residency;
 const pipeline = tp.pipeline;
 const Tokenizer = tp.tokenizer.Tokenizer;
 const Gguf = tp.Gguf;
@@ -223,6 +226,11 @@ pub const Session = struct {
     /// image generation (priority = image). Cleared once they've been promoted
     /// back (queue drained) or on a new chat.
     image_evicted: bool = false,
+    /// Cross-thread residency intent published by the app's `vram.Arbiter`. The
+    /// worker enacts it at each token boundary (`engine.residency_poll`) on its
+    /// own context-bound thread; the arbiter enacts it directly while idle. The
+    /// single source of truth for this LLM's desired device-residency ceiling.
+    control: vram.ControlPoint = .{},
 
     // Vision (dropped/attached images the model can see). Loaded once; the
     // tower itself lives in `arch` (per-architecture type).
@@ -332,6 +340,9 @@ pub const Session = struct {
             .seed = cfg.seed,
             .sampling = .{ .temperature = cfg.temperature },
         };
+        // Let the decode loop enact arbiter-published VRAM targets on the worker
+        // thread (`self` is heap-pinned, so the captured pointer stays valid).
+        self.opts.residency_poll = .{ .ctx = self, .apply = residencyPollThunk };
 
         self.gpa = gpa;
         self.io = io;
@@ -460,18 +471,6 @@ pub const Session = struct {
         return self.images_enabled;
     }
 
-    /// Diffusion's resident-weight budget when sharing the device with this LLM
-    /// (weights past it stream per step). Never leaves free VRAM empty:
-    ///  - auto (no configured cap): return 0 → the pipeline pins ALL free VRAM,
-    ///    filling the card beside the LLM (the LLM's share is protected by
-    ///    imageVramEnter settling it first, not by capping diffusion).
-    ///  - configured limit: cap at limit − LLM resident (the shared ceiling).
-    /// The app-level engine's VRAM coordinator calls this when an LLM is resident.
-    pub fn imageBudget(self: *Session) u64 {
-        if (self.vram_limit == 0) return 0;
-        return @max(256 << 20, self.vram_limit -| self.be.deviceUsed());
-    }
-
     /// Ask the running generation to stop at the next token (no-op if idle).
     pub fn requestCancel(self: *Session) void {
         self.cancel.store(true, .release);
@@ -497,93 +496,43 @@ pub const Session = struct {
         chat.setThinking(cfg.reasoning);
     }
 
-    /// Apply the VRAM meter policy live (UI thread). `ceiling` (the limit handle)
-    /// is the hard cap the LLM never exceeds; `share` (the split handle) is its
-    /// guaranteed floor. With the image model resident (`diff_resident`) the LLM
-    /// settles to `share`, freeing the rest for diffusion to borrow; with
-    /// diffusion idle/unloaded the LLM borrows all the way up to `ceiling`.
-    /// Records the policy either way (so `imageBudget` is correct); the residency
-    /// reshuffle is skipped while the LLM is generating — migrations run on this
-    /// thread and must not race the worker's CUDA context — and reconciles at the
-    /// next idle apply / image-gen transition.
-    /// `available` is the system-adjusted budget for LLM + diffusion (the limit
-    /// handle minus system VRAM); `share` is the LLM's guaranteed floor.
-    /// Records the policy (so `imageBudget` is correct) and settles the LLM's
-    /// resident weights to fit. The reshuffle is skipped only while the LLM
-    /// ITSELF is generating (migrations would race its own decode worker) — it
-    /// runs even while DIFFUSION generates, since that's a separate context and
-    /// the caller serializes it with the diffusion worker's reclaim hook.
-    /// Offloading the LLM to CPU doesn't slow the running image (soft residency).
-    pub fn applyVramPolicy(self: *Session, available: u64, share: u64, diff_used: u64) void {
-        self.vram_limit = available;
-        self.vram_share = share;
-        self.vram_budget = available; // the LLM's absolute max (promote/reset ceiling)
-        if (available == 0 or self.busy()) return;
-        // SOFT split: keep only the room diffusion isn't holding, within the
-        // available budget. With diffusion unloaded (diff_used = 0) the LLM uses
-        // the whole budget; with it resident, the LLM offloads to fit around it.
-        // Floored so a tight budget offloads (nearly) everything rather than
-        // no-op'ing at 0. imageVramEnter settles to `share` at image start.
-        self.settleLlm(@max(available -| diff_used, 256 << 20));
+    // --- vram.Participant adapter --------------------------------------------
+    // Lets the app-level `vram.Arbiter` drive this LLM's device residency the
+    // same way it (will) drive diffusion. Read thunks are thread-safe (plain
+    // field/atomic reads). `applyBudget` mutates residency + binds the context,
+    // so it runs ONLY on the worker (via `pollAndApply` at a token boundary) or
+    // on the arbiter thread while the LLM is idle — never racing the worker.
+    fn vpUsage(ctx: *anyopaque) u64 {
+        return fromCtx(ctx).be.deviceUsed();
     }
-
-    /// Settle the LLM's device residency to `target` bytes: shrink (offload
-    /// layers to the CPU) when over, grow (promote layers back) when under, and
-    /// set the ongoing offload ceiling so KV growth respects it. Caller ensures
-    /// the LLM is idle. Arms the split first if it somehow isn't.
-    fn settleLlm(self: *Session, target: u64) void {
-        if (target == 0) return;
+    fn vpFloor(ctx: *anyopaque) u64 {
+        return fromCtx(ctx).ctxKvBytes(); // committed KV can't be evicted
+    }
+    fn vpBusy(ctx: *anyopaque) bool {
+        return fromCtx(ctx).busy();
+    }
+    fn vpApply(ctx: *anyopaque, target: u64) void {
+        const self = fromCtx(ctx);
         self.be.bindThread();
-        const before = self.be.deviceUsed();
-        const t0 = std.Io.Clock.real.now(self.io).nanoseconds;
-        const grow = before <= target;
         switch (self.arch) {
-            inline else => |*a| {
-                if (a.model.split == null)
-                    _ = a.model.autoOffload(self.vram_budget) catch return;
-                if (a.model.split) |*sp| sp.budget = target; // ongoing ceiling as KV grows
-                if (self.be.deviceUsed() > target)
-                    a.model.offloadToBudget(target) catch |err|
-                        std.log.warn("vram settle (offload) failed: {t}", .{err})
-                else
-                    _ = a.model.promoteLayers(target) catch |err|
-                        std.log.warn("vram settle (promote) failed: {t}", .{err});
-            },
-        }
-        const after = self.be.deviceUsed();
-        const moved = if (grow) after -| before else before -| after;
-        if (moved > 0) {
-            const ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(self.io).nanoseconds - t0)) / 1e6;
-            std.log.info("[vram] LLM settle→{d}MB: {s} {d}MB {s} in {d:.0}ms (LLM now {d}MB device)", .{
-                target >> 20, if (grow) "promoted" else "offloaded", moved >> 20, if (grow) "→GPU" else "→CPU", ms, after >> 20,
-            });
+            inline else => |*a| residency.settleTo(&a.model, target) catch |err|
+                std.log.warn("[vram] LLM settle→{d}MB failed: {t}", .{ target >> 20, err }),
         }
     }
+    fn fromCtx(ctx: *anyopaque) *Session {
+        return @ptrCast(@alignCast(ctx));
+    }
+    const vp_vtable: vram.Participant.VTable = .{ .usage = vpUsage, .floor = vpFloor, .busy = vpBusy, .applyBudget = vpApply };
 
-    /// Make VRAM room for the image model as the image queue starts (CONTENTION):
-    /// settle the LLM down to its guaranteed share so diffusion gets the rest up
-    /// to the ceiling. No-op while the LLM is generating (migrations run on this
-    /// UI thread and must not race the worker's CUDA context) or when there's no
-    /// budget. `imageVramExit` promotes the LLM back to the ceiling when the queue
-    /// drains. (The `image_bytes` estimate is unused now — the split, not the
-    /// image's footprint, decides how much the LLM gives up.)
-    pub fn imageVramEnter(self: *Session, image_bytes: u64) void {
-        _ = image_bytes;
-        if (self.vram_budget == 0 or self.vram_share == 0 or self.busy()) return;
-        self.settleLlm(self.vram_share);
-        self.image_evicted = true; // promote back to the ceiling when the queue drains
+    /// This LLM as a `vram.Participant` the app-level arbiter can drive.
+    pub fn participant(self: *Session) vram.Participant {
+        return .{ .ctx = self, .control = &self.control, .vtable = &vp_vtable };
     }
 
-    /// Migrate LLM layers back onto the GPU after the image queue drains, up to
-    /// the room diffusion isn't holding (`ceiling − diff_used`). The image model
-    /// usually stays RESIDENT after a queue drains (so the next image is fast),
-    /// so this borrows only the genuinely-free VRAM, not diffusion's weights —
-    /// promoting to the full ceiling here would overcommit. No-op unless the LLM
-    /// was settled down and is idle (same CUDA-context constraint as enter).
-    pub fn imageVramExit(self: *Session, diff_used: u64) void {
-        if (!self.image_evicted or self.busy()) return;
-        self.settleLlm(self.vram_limit -| diff_used);
-        self.image_evicted = false;
+    /// `engine.residency_poll` thunk: at each token boundary, enact any target
+    /// the arbiter published to `control` — on the worker's own bound thread.
+    fn residencyPollThunk(ctx: *anyopaque) void {
+        fromCtx(ctx).participant().pollAndApply();
     }
 
     /// pipeline reclaim hook (GUI_VRAM.md Phase 5): free LLM VRAM for a large VAE
@@ -594,8 +543,8 @@ pub const Session = struct {
     /// the LLM holds) migrates everything it can. Returns the device bytes freed.
     /// Runs on the DIFFUSION thread, so it binds the LLM context and is safe only
     /// when the LLM is idle (else it declines — returns 0 — and the pipeline
-    /// falls back to tiling / CPU). `imageVramExit` promotes the layers back once
-    /// the queue drains.
+    /// falls back to tiling / CPU). The `vram.Arbiter` promotes the layers back
+    /// (target = limit − diff_used) when the image queue drains (`vcExit`).
     pub fn imageReclaim(self: *Session, needed: u64) u64 {
         if (self.busy()) {
             std.log.info("[reclaim] declined: LLM is generating (can't migrate mid-decode)", .{});
@@ -854,12 +803,23 @@ pub const Session = struct {
             .iface = .{ .vtable = &TokenSink.vtable, .buffer = &self.sink_buf },
             .session = self,
         };
+        const t0 = std.Io.Clock.real.now(self.io).nanoseconds;
         switch (self.arch) {
             inline else => |*a| {
-                _ = engine.generate(&a.model, &self.tok, self.io, self.gpa, &self.ids, self.opts, &sink.iface) catch |err| {
+                const n = engine.generate(&a.model, &self.tok, self.io, self.gpa, &self.ids, self.opts, &sink.iface) catch |err| n: {
                     self.gen_err = err;
                     std.log.err("generation failed: {t}", .{err});
+                    break :n 0;
                 };
+                // End-of-response telemetry, mirroring the CLI's summary line —
+                // routed through std.log so it lands on the same channel the GUI
+                // already shows diffusion "gen:" progress on (dvui.App.logFn).
+                const dt = @as(f64, @floatFromInt(std.Io.Clock.real.now(self.io).nanoseconds - t0)) / 1e9;
+                const st = session.Stats.of(&a.model);
+                var vbuf: [32]u8 = undefined;
+                std.log.info("[llm] {d} tok, {d:.1} tok/s, ctx {d}/{d}{s}", .{
+                    n, if (dt > 0) @as(f64, @floatFromInt(n)) / dt else 0, st.tokens, st.window, st.vramSuffix(&vbuf),
+                });
             },
         }
         // Close the assistant turn so the next turn's context is well-formed.
@@ -918,20 +878,7 @@ pub const Session = struct {
             try segs.append(self.gpa, .{ .image = .{ .grid_w = enc.grid_w, .grid_h = enc.grid_h } });
         }
         if (self.turn_text.len > 0) try segs.append(self.gpa, .{ .text = self.turn_text });
-
-        var image_rows: std.ArrayList(usize) = .empty;
-        defer image_rows.deinit(self.gpa);
-        try chat.appendUserSegments(&self.tok, self.gpa, segs.items, &self.ids, &image_rows);
-        try chat.openAssistant(&self.tok, self.gpa, &self.ids);
-
-        if (self.ids.items.len > a.model.cached() + a.model.remaining()) {
-            try a.model.ensureCapacity(self.ids.items.len);
-        }
-        for (image_rows.items, encs.items) |row, e| {
-            const before = self.ids.items[a.model.cached()..row];
-            if (before.len > 0) try a.model.prefill(before);
-            try a.model.prefillImage(e.embeds, e.grid_w, e.grid_h);
-        }
+        try session.prefillImageTurn(&a.model, &self.tok, self.gpa, &self.ids, segs.items, encs.items);
     }
 
     /// imageTurn for gemma4: the "unified" embedder (no ViT transformer) runs
@@ -951,20 +898,7 @@ pub const Session = struct {
             try segs.append(self.gpa, .{ .image = .{ .grid_w = enc.grid_w, .grid_h = enc.grid_h } });
         }
         if (self.turn_text.len > 0) try segs.append(self.gpa, .{ .text = self.turn_text });
-
-        var image_rows: std.ArrayList(usize) = .empty;
-        defer image_rows.deinit(self.gpa);
-        try chat.appendUserSegments(&self.tok, self.gpa, segs.items, &self.ids, &image_rows);
-        try chat.openAssistant(&self.tok, self.gpa, &self.ids);
-
-        if (self.ids.items.len > a.model.cached() + a.model.remaining()) {
-            try a.model.ensureCapacity(self.ids.items.len);
-        }
-        for (image_rows.items, encs.items) |row, e| {
-            const before = self.ids.items[a.model.cached()..row];
-            if (before.len > 0) try a.model.prefill(before);
-            try a.model.prefillImage(e.embeds, e.grid_w, e.grid_h);
-        }
+        try session.prefillImageTurn(&a.model, &self.tok, self.gpa, &self.ids, segs.items, encs.items);
     }
 
     fn freeTurn(self: *Session) void {

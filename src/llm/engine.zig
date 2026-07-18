@@ -44,6 +44,21 @@ pub const Options = struct {
     /// KV-cache element storage type (f32 default; f16 halves the footprint,
     /// lossy). Copied onto the Capacity that reaches every model init.
     kv_dtype: kv_cache_mod.KvDtype = .f32,
+    /// Optional per-token residency hook. A cross-thread VRAM arbiter (the GUI,
+    /// when a diffusion model contends for VRAM) publishes a new device-residency
+    /// ceiling to this session's `vram.ControlPoint` from another thread; the
+    /// decode loop invokes this at each token boundary so the target is enacted
+    /// on the worker's OWN (context-bound) thread instead of raced from the
+    /// arbiter thread. null on the CLI / studio (no coordinator).
+    residency_poll: ?ResidencyPoll = null,
+};
+
+/// A `residency_poll`: `apply(ctx)` enacts any pending residency target on the
+/// calling (worker) thread. Typically `ctx` is a session and `apply` is a thunk
+/// over `vram.Participant.pollAndApply`.
+pub const ResidencyPoll = struct {
+    ctx: *anyopaque,
+    apply: *const fn (ctx: *anyopaque) void,
 };
 
 /// KV-cache capacity ceiling for a given prompt; errors when the prompt
@@ -76,7 +91,11 @@ fn ensureRoom(model: anytype, need: usize) !void {
         else => @TypeOf(model),
     };
     if (comptime !@hasDecl(M, "ensureCapacity")) return error.ContextFull;
+    const before = model.cached() + model.remaining(); // window before growth
     try model.ensureCapacity(model.cached() + need);
+    const after = model.cached() + model.remaining();
+    if (after != before)
+        std.log.info("[ctx] KV window grew {d} -> {d} rows ({d} tokens committed)", .{ before, after, model.cached() });
 }
 
 /// Extend `ids` in place until a stop token, the token budget, or a full
@@ -152,6 +171,8 @@ pub fn generate(
     try model.step(io, new, logits);
     var n: usize = 0;
     while (n < opts.max_new_tokens) {
+        if (opts.residency_poll) |rp| rp.apply(rp.ctx); // enact any arbiter-published VRAM target on this thread
+
         if (opts.cancel) |c| if (c.load(.acquire)) break;
         const next = sampler.next(logits, ids.items);
         if (chat.isStop(next)) break;
@@ -199,6 +220,8 @@ fn generateGreedyArgmax(
     var next = try model.stepArgmax(io, new);
     var n: usize = 0;
     while (n < opts.max_new_tokens) {
+        if (opts.residency_poll) |rp| rp.apply(rp.ctx); // enact any arbiter-published VRAM target on this thread
+
         if (opts.cancel) |c| if (c.load(.acquire)) break;
         if (chat.isStop(next)) break;
         try ids.append(gpa, next);
@@ -250,6 +273,8 @@ fn generateGpuSample(
     var count = try model.stepSelect(io, new, out_id, out_logit);
     var n: usize = 0;
     while (n < opts.max_new_tokens) {
+        if (opts.residency_poll) |rp| rp.apply(rp.ctx); // enact any arbiter-published VRAM target on this thread
+
         if (opts.cancel) |c| if (c.load(.acquire)) break;
         for (cands[0..count], out_id[0..count], out_logit[0..count]) |*c, id, lg| c.* = .{ .id = id, .logit = lg };
         const next = sampler.nextFromCandidates(cands[0..count]);
@@ -280,7 +305,7 @@ pub const CpuModel = struct {
     lm: *const qwen3.CausalLM,
     gpa: std.mem.Allocator,
     cache: KvCache,
-    freqs: ops.rope.Freqs,
+    rope: ops.rope.RopeTables(1),
     last_hidden: []f32,
     /// Growth ceiling (rows); the cache starts at cap.initial and grows here.
     max_capacity: usize,
@@ -294,10 +319,12 @@ pub const CpuModel = struct {
     pub fn init(gpa: std.mem.Allocator, lm: *const qwen3.CausalLM, cap: Capacity) !CpuModel {
         var cache = try KvCache.init(gpa, lm.cfg.n_layers, cap.initial, lm.cfg.kvDim(), cap.kv_dtype);
         errdefer cache.deinit(gpa);
-        var freqs = try ops.rope.rotateHalfFreqs(gpa, cap.initial, qwen3.head_dim, lm.cfg.rope_theta);
-        errdefer freqs.deinit(gpa);
+        var rope = try ops.rope.RopeTables(1).init(gpa, .{
+            .{ .head_dim = qwen3.head_dim, .theta = lm.cfg.rope_theta },
+        }, cap.initial);
+        errdefer rope.deinit(gpa);
         const last_hidden = try gpa.alloc(f32, lm.cfg.hidden);
-        return .{ .lm = lm, .gpa = gpa, .cache = cache, .freqs = freqs, .last_hidden = last_hidden, .max_capacity = cap.max };
+        return .{ .lm = lm, .gpa = gpa, .cache = cache, .rope = rope, .last_hidden = last_hidden, .max_capacity = cap.max };
     }
 
     pub fn capacityMax(self: *const CpuModel) usize {
@@ -307,18 +334,14 @@ pub const CpuModel = struct {
     /// Grow the cache (and the RoPE table) to hold at least `min_rows`.
     /// error.ContextFull past the window or when host memory runs out.
     pub fn ensureCapacity(self: *CpuModel, min_rows: usize) !void {
-        if (min_rows <= self.cache.capacity) return;
-        if (min_rows > self.max_capacity) return error.ContextFull;
-        const target = kv_cache_mod.growTarget(self.cache.capacity, min_rows, self.max_capacity);
+        const target = (try kv_cache_mod.growPlan(self.cache.capacity, self.max_capacity, min_rows)) orelse return;
         self.cache.grow(self.gpa, target) catch return error.ContextFull;
-        const freqs = ops.rope.rotateHalfFreqs(self.gpa, target, qwen3.head_dim, self.lm.cfg.rope_theta) catch return error.ContextFull;
-        self.freqs.deinit(self.gpa);
-        self.freqs = freqs;
+        self.rope.regrow(self.gpa, target) catch return error.ContextFull;
     }
 
     pub fn deinit(self: *CpuModel) void {
         self.cache.deinit(self.gpa);
-        self.freqs.deinit(self.gpa);
+        self.rope.deinit(self.gpa);
         self.gpa.free(self.last_hidden);
         if (self.tree_k) |t| self.gpa.free(t);
         if (self.tree_v) |t| self.gpa.free(t);
@@ -339,7 +362,7 @@ pub const CpuModel = struct {
     }
 
     pub fn step(self: *CpuModel, io: std.Io, ids_new: []const u32, logits: []f32) !void {
-        try self.lm.forwardCached(io, self.gpa, ids_new, &self.cache, self.freqs, self.last_hidden);
+        try self.lm.forwardCached(io, self.gpa, ids_new, &self.cache, self.rope.get(0), self.last_hidden);
         try ops.matmul.matmul(io, self.gpa, logits, self.last_hidden, 1, self.lm.lmHead(), null);
     }
 
@@ -350,7 +373,7 @@ pub const CpuModel = struct {
         std.debug.assert(logits.len == n * qwen3.vocab_size);
         const hid = try self.gpa.alloc(f32, n * self.lm.cfg.hidden);
         defer self.gpa.free(hid);
-        try self.lm.forwardCached(io, self.gpa, ids_new, &self.cache, self.freqs, hid);
+        try self.lm.forwardCached(io, self.gpa, ids_new, &self.cache, self.rope.get(0), hid);
         try ops.matmul.matmul(io, self.gpa, logits, hid, n, self.lm.lmHead(), null);
     }
 
@@ -372,7 +395,7 @@ pub const CpuModel = struct {
         }
         const hid = try self.gpa.alloc(f32, n * cfg.hidden);
         defer self.gpa.free(hid);
-        try self.lm.forwardTree(io, self.gpa, tokens, parents, &self.cache, self.freqs, self.tree_k.?, self.tree_v.?, hid);
+        try self.lm.forwardTree(io, self.gpa, tokens, parents, &self.cache, self.rope.get(0), self.tree_k.?, self.tree_v.?, hid);
         try ops.matmul.matmul(io, self.gpa, logits, hid, n, self.lm.lmHead(), null);
         self.tree_n = n;
     }

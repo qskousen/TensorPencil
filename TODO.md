@@ -1,3 +1,7 @@
+- Vision: image tokens use causal attention instead of non-causal/bidirectional (quality shortcut, revisit). llama.cpp marks image-token spans non-causal so every image token attends to every other; our path runs them through the LLM's normal causal mask (each image token only sees earlier ones), which degrades caption/description quality. This is a deliberate temporary simplification taken to reuse the existing causal attention path. Marked in `src/models/gemma4_vit.zig:24-26` ("Simplification vs llama.cpp… revisit if caption quality needs it") and `LLM_PLAN.md:571-573`. Affects both Gemma 3 and Gemma 4 vision on the LLM side; the ViT/SigLIP tower itself is already correctly bidirectional (`src/models/gemma_vit.zig:251` `.causal = false`). FIX: give contiguous image-token spans bidirectional attention within the LLM's attention mask (a block-diagonal / prefix-unmasked region over the image tokens), across the CPU + CUDA (+ Vulkan) attention paths; validate caption quality/parity vs llama.cpp.
+- viewer: zooming seems to zoom to the bottom right corner or something instead of the mouse pointer
+- latent always shows as 0.0gb in gui and is not actually representative since it's "whatever is left over"
+- "talk about this image" button disappears when llm is unloaded (should be determined by model metadata like image and thinking capabilities)
 - zig-cuda backend seems to have oom issues
 - output text (user and agent) in markdown?
 - changing system prompt should wipe context and take effect on the next message

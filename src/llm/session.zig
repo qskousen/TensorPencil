@@ -15,6 +15,8 @@ const std = @import("std");
 const cuda = @import("../gpu/cuda.zig");
 const gpu_context = @import("../gpu/context.zig");
 const kv_cache = @import("kv_cache.zig");
+const chat = @import("chat.zig");
+const tokenizer = @import("../tokenizer.zig");
 
 /// `--vram-budget min`: hold only the in-flight weights. The budget is a soft
 /// ceiling (a single weight larger than it still uploads while physical VRAM
@@ -75,13 +77,40 @@ pub fn applyVulkan(ctx: *gpu_context.Context, user_budget: u64, kv_window: u64) 
     return p;
 }
 
+/// End-of-response telemetry a stepper reports: committed context length, the
+/// growable window ceiling it can grow to, and device VRAM in use (null on the
+/// CPU backend, which has no device). Mirrors the diffusion side's per-image
+/// stats line. `model` is the `*Stepper` pointer the generation loop drives.
+pub const Stats = struct {
+    tokens: usize,
+    window: usize,
+    vram: ?u64,
+
+    pub fn of(model: anytype) Stats {
+        const M = @typeInfo(@TypeOf(model)).pointer.child;
+        const tokens = model.cached();
+        const window = if (comptime @hasDecl(M, "capacityMax")) model.capacityMax() else tokens + model.remaining();
+        const vram = if (comptime @hasDecl(M, "vramUsed")) model.vramUsed() else null;
+        return .{ .tokens = tokens, .window = window, .vram = vram };
+    }
+
+    /// " , vram 8123 MiB" (leading separator) or "" when there's no device —
+    /// so callers can splice it into a stats line uniformly.
+    pub fn vramSuffix(self: Stats, buf: []u8) []const u8 {
+        const mb = (self.vram orelse return "") >> 20;
+        return std.fmt.bufPrint(buf, ", vram {d} MiB", .{mb}) catch "";
+    }
+};
+
 /// The per-run timing summary. A one-shot (`--prompt`) run prints tokens +
-/// tok/s + setup; an interactive session prints just the token total + setup
-/// (elapsed would count the user's typing time between turns).
-pub fn printSummary(stdout: *std.Io.Writer, one_shot: bool, n: usize, setup_s: f64, elapsed_s: f64) !void {
+/// tok/s + context + VRAM + setup; an interactive session prints just the token
+/// total + setup (elapsed would count the user's typing time between turns, and
+/// each turn already reported its own stats line).
+pub fn printSummary(stdout: *std.Io.Writer, one_shot: bool, n: usize, setup_s: f64, elapsed_s: f64, stats: Stats) !void {
     if (one_shot) {
-        try stdout.print("\n\n[{d} tokens in {d:.1}s, {d:.2} tok/s; setup {d:.1}s]\n", .{
-            n, elapsed_s, @as(f64, @floatFromInt(n)) / elapsed_s, setup_s,
+        var vbuf: [32]u8 = undefined;
+        try stdout.print("\n\n[{d} tokens in {d:.1}s, {d:.2} tok/s; ctx {d}/{d}{s}; setup {d:.1}s]\n", .{
+            n, elapsed_s, @as(f64, @floatFromInt(n)) / elapsed_s, stats.tokens, stats.window, stats.vramSuffix(&vbuf), setup_s,
         });
     } else {
         try stdout.print("[session over: {d} tokens generated; setup was {d:.1}s]\n", .{ n, setup_s });
@@ -130,7 +159,7 @@ pub const Devices = struct {
 
 /// Result of a `run`: tokens generated and the timestamp generation began
 /// (`t0`), so the caller can split setup vs. generation time for the summary.
-pub const RunResult = struct { n: usize, t0: i96 };
+pub const RunResult = struct { n: usize, t0: i96, stats: Stats = .{ .tokens = 0, .window = 0, .vram = null } };
 
 /// Bring up the CUDA backend for a GPU session: `initLibs` (--backend cuda) or
 /// `init` (--backend zig-cuda), set profiling, and pin weights under the budget.
@@ -252,6 +281,46 @@ pub const no_prefill: struct {
         _ = model;
     }
 } = .{};
+
+/// Append an interleaved image+text user turn and prefill it — the shared core
+/// of the CLI's `imageTurn` and the GUI worker's `imageTurn`/`imageTurnGemma4`.
+/// Builds the family-aware segment layout, opens the assistant turn, grows the
+/// KV window to fit, then injects each encoded image's embeddings at its
+/// placeholder rows (text between/around images is prefilled as plain tokens).
+/// The engine's later `cached()`-based prefill handles the tail after the last
+/// image + `openAssistant`.
+///
+/// `model` is any stepper exposing cached/remaining/ensureCapacity/prefill/
+/// prefillImage; `segs` is the caller-built segment list (image placeholders +
+/// text, in display order); `encs` is a slice whose elements have `.embeds`/
+/// `.grid_w`/`.grid_h` (the arch ViT's `Encoded`) — one per image segment, in
+/// order. The image ENCODE (arch-specific ViT) stays with the caller; this owns
+/// only the backend-agnostic layout + interleave. Errors (e.g. ContextFull from
+/// ensureCapacity) propagate after `segs`/assistant tokens are already appended,
+/// so a caller that wants to bail cleanly should snapshot `ids.items.len` first
+/// and `shrinkRetainingCapacity` on error.
+pub fn prefillImageTurn(
+    model: anytype,
+    tok: *const tokenizer.Tokenizer,
+    gpa: std.mem.Allocator,
+    ids: *std.ArrayList(u32),
+    segs: []const chat.Segment,
+    encs: anytype,
+) !void {
+    var image_rows: std.ArrayList(usize) = .empty;
+    defer image_rows.deinit(gpa);
+    try chat.appendUserSegments(tok, gpa, segs, ids, &image_rows);
+    try chat.openAssistant(tok, gpa, ids);
+
+    if (ids.items.len > model.cached() + model.remaining()) {
+        try model.ensureCapacity(ids.items.len);
+    }
+    for (image_rows.items, encs) |row, e| {
+        const before = ids.items[model.cached()..row];
+        if (before.len > 0) try model.prefill(before);
+        try model.prefillImage(e.embeds, e.grid_w, e.grid_h);
+    }
+}
 
 /// A `prefiller` for a one-shot `--image` turn: prefill the tokens before the
 /// image block, then the image embeddings (in place of the placeholder rows),

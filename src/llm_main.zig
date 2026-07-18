@@ -471,7 +471,7 @@ fn runQwen3(
 
     const setup_s = @as(f64, @floatFromInt(res.t0 - t_init)) / 1e9;
     const elapsed_s = @as(f64, @floatFromInt(Io.Clock.real.now(io).nanoseconds - res.t0)) / 1e9;
-    try llm.session.printSummary(stdout, prompt != null, res.n, setup_s, elapsed_s);
+    try llm.session.printSummary(stdout, prompt != null, res.n, setup_s, elapsed_s, res.stats);
     if (opts.spec_k > 0 or opts.tree_nodes > 0) {
         const pct = if (spec_stats.drafted > 0)
             100.0 * @as(f64, @floatFromInt(spec_stats.accepted)) / @as(f64, @floatFromInt(spec_stats.drafted))
@@ -558,29 +558,18 @@ fn imageTurn(
             },
         };
 
+        // Append + interleave via the shared helper (same core the GUI worker
+        // uses). On a context-full growth failure, roll the turn's tokens back
+        // and bail gracefully instead of erroring the session.
         const ids_before = ids.items.len;
-        var image_rows: std.ArrayList(usize) = .empty;
-        defer image_rows.deinit(gpa);
-        try llm.chat.appendUserSegments(tok, gpa, segs.items, ids, &image_rows);
-        try llm.chat.openAssistant(tok, gpa, ids);
-        if (ids.items.len - model.cached() > model.remaining()) {
-            // Growable caches commit more rows first (image turns are the
-            // usual way a turn outgrows the committed slice).
-            if (comptime @hasDecl(M, "ensureCapacity")) model.ensureCapacity(ids.items.len) catch {};
-            if (ids.items.len - model.cached() > model.remaining()) {
+        llm.session.prefillImageTurn(model, tok, gpa, ids, segs.items, imgs.items) catch |err| {
+            if (err == error.ContextFull) {
                 try stdout.print("[turn needs {d} rows, only {d} left in context]\n", .{ ids.items.len - model.cached(), model.remaining() });
                 ids.shrinkRetainingCapacity(ids_before);
                 return false;
             }
-        }
-        // Interleave text prefill with the image embeddings, exactly like
-        // the one-shot --image path; the engine's generate() prefills the
-        // remaining tail from cached().
-        for (image_rows.items, imgs.items) |row, im| {
-            const pending = ids.items[model.cached()..row];
-            if (pending.len > 0) try model.prefill(pending);
-            try model.prefillImage(im.embeds, im.grid_w, im.grid_h);
-        }
+            return err;
+        };
         return true;
     }
 }
@@ -692,15 +681,13 @@ fn runSession(
 
         // The window a growable cache reports is its ceiling, not the
         // currently committed slice; the session is only over when the
-        // ceiling itself is reached.
-        const M = switch (@typeInfo(@TypeOf(model))) {
-            .pointer => |p| p.child,
-            else => @TypeOf(model),
-        };
-        const window = if (comptime @hasDecl(M, "capacityMax")) model.capacityMax() else model.cached() + model.remaining();
+        // ceiling itself is reached. `Stats.of` also carries device VRAM.
+        const st = llm.session.Stats.of(model);
+        const window = st.window;
         const dt = @as(f64, @floatFromInt(Io.Clock.real.now(io).nanoseconds - t0)) / 1e9;
-        try stdout.print("\n[{d} tok, {d:.1} tok/s, ctx {d}/{d}]\n", .{
-            n, @as(f64, @floatFromInt(n)) / dt, model.cached(), window,
+        var vbuf: [32]u8 = undefined;
+        try stdout.print("\n[{d} tok, {d:.1} tok/s, ctx {d}/{d}{s}]\n", .{
+            n, @as(f64, @floatFromInt(n)) / dt, st.tokens, window, st.vramSuffix(&vbuf),
         });
         try stdout.flush();
         if (model.cached() >= window) {
@@ -728,7 +715,7 @@ const SimpleDriver = struct {
     pub fn drive(self: SimpleDriver, model: anytype) !llm.session.RunResult {
         const t0 = Io.Clock.real.now(self.io).nanoseconds;
         const n = try runSession(model, null, self.tok, self.io, self.gpa, self.ids, self.opts, self.stdout, self.prompt, self.img_chat);
-        return .{ .n = n, .t0 = t0 };
+        return .{ .n = n, .t0 = t0, .stats = llm.session.Stats.of(model) };
     }
 };
 
@@ -786,7 +773,7 @@ const Qwen35Driver = struct {
         // t0 after the (setup) cpu-split migration, so it counts as setup not generation.
         const t0 = Io.Clock.real.now(self.io).nanoseconds;
         const n = try runSession(model, null, self.tok, self.io, self.gpa, self.ids, self.opts, self.stdout, self.prompt, self.img_chat);
-        return .{ .n = n, .t0 = t0 };
+        return .{ .n = n, .t0 = t0, .stats = llm.session.Stats.of(model) };
     }
 };
 
@@ -844,7 +831,7 @@ const Qwen3Driver = struct {
     fn gen(self: Qwen3Driver, model: anytype, drafter: anytype) !llm.session.RunResult {
         const t0 = Io.Clock.real.now(self.io).nanoseconds;
         const n = try runSession(model, drafter, self.tok, self.io, self.gpa, self.ids, self.opts, self.stdout, self.prompt, null);
-        return .{ .n = n, .t0 = t0 };
+        return .{ .n = n, .t0 = t0, .stats = llm.session.Stats.of(model) };
     }
 
     pub fn drive(self: Qwen3Driver, model: anytype) !llm.session.RunResult {
@@ -1158,7 +1145,7 @@ fn runQwen35(
     }
     const setup_s = @as(f64, @floatFromInt(res.t0 - t_init)) / 1e9;
     const elapsed_s = @as(f64, @floatFromInt(Io.Clock.real.now(io).nanoseconds - res.t0)) / 1e9;
-    try llm.session.printSummary(stdout, prompt != null, res.n, setup_s, elapsed_s);
+    try llm.session.printSummary(stdout, prompt != null, res.n, setup_s, elapsed_s, res.stats);
     try stdout.flush();
 }
 
@@ -1313,7 +1300,7 @@ fn runGemma3(
     const res = try llm.session.run(Spec, dev, backend, &lm, ids.items.len, prefiller, driver, io, gpa, cap, vram_budget, stdout);
     const setup_s = @as(f64, @floatFromInt(res.t0 - t_init)) / 1e9;
     const elapsed_s = @as(f64, @floatFromInt(Io.Clock.real.now(io).nanoseconds - res.t0)) / 1e9;
-    try llm.session.printSummary(stdout, prompt != null, res.n, setup_s, elapsed_s);
+    try llm.session.printSummary(stdout, prompt != null, res.n, setup_s, elapsed_s, res.stats);
     try stdout.flush();
 }
 
@@ -1456,7 +1443,7 @@ fn runGemma4(
     const res = try llm.session.run(Spec, dev, backend, &lm, ids.items.len, prefiller, driver, io, gpa, cap, 0, stdout);
     const setup_s = @as(f64, @floatFromInt(res.t0 - t_init)) / 1e9;
     const elapsed_s = @as(f64, @floatFromInt(Io.Clock.real.now(io).nanoseconds - res.t0)) / 1e9;
-    try llm.session.printSummary(stdout, prompt != null, res.n, setup_s, elapsed_s);
+    try llm.session.printSummary(stdout, prompt != null, res.n, setup_s, elapsed_s, res.stats);
     try stdout.flush();
 }
 

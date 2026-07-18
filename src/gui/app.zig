@@ -9,6 +9,7 @@ const std = @import("std");
 const dvui = @import("dvui");
 const SDLBackend = @import("backend");
 const tp = @import("TensorPencil");
+const vram = tp.vram;
 const chat = @import("chat.zig");
 const toolcall = @import("toolcall.zig");
 const fonts = @import("fonts.zig");
@@ -30,6 +31,10 @@ const vips = @import("vips");
 // the UI thread while `g_loading` is false (release/acquire hand-off from the
 // loader), so the pointer swap is race-free without a lock.
 var g_session: ?*chat.Session = null;
+/// The single owner of LLM↔diffusion VRAM arbitration. Its `llm` participant is
+/// (re)bound to `g_session` under `g_session_mu` on every load/unload. Driven by
+/// the coordinator hooks (`vcEnter`/`vcExit`) and the meter policy.
+var g_arbiter: vram.Arbiter = .{};
 var g_session_arena: ?*std.heap.ArenaAllocator = null; // load-once weights, freed on reload
 var g_loading: std.atomic.Value(bool) = .init(false);
 var g_loader: ?std.Thread = null;
@@ -121,16 +126,25 @@ fn applyMeterPolicy() void {
     const share: u64 = @min(@as(u64, @intFromFloat(g_split * tf)), available);
     const diff_busy = if (g_diffuser) |*d| d.busyNow() else false;
 
-    // LLM side: settle its resident weights to fit `available`. Guarded so it
-    // can't race the diffusion worker's reclaim hook (both bind the LLM context).
+    // LLM side: hand the resolved ceiling + share to the arbiter, which settles
+    // the LLM to fit (offloading weights to the CPU, or promoting them back).
+    // Guarded so a direct (idle) settle can't race the diffusion worker's reclaim
+    // hook — both touch the LLM context.
     g_session_mu.lockUncancelable(g_io);
-    s.applyVramPolicy(available, share, diff_res);
+    // Mirror the resolved policy onto the session for the status-bar display and
+    // the reset/reclaim ceiling (these fields outlive the arbiter's live state).
+    s.vram_limit = available;
+    s.vram_share = share;
+    s.vram_budget = available;
+    g_arbiter.diff_used = diff_res;
+    g_arbiter.setBudgets(available, share);
     g_session_mu.unlock(g_io);
 
-    // Diffusion side: trim resident weights to fit the room left after the LLM,
+    // Diffusion side: incrementally free resident weights to fit the room left
+    // after the LLM (keeping the rest resident so the next image reloads less),
     // but only when idle (soft residency — no mid-image streaming).
     if (!diff_busy) if (g_diffuser) |*d| {
-        d.trimToBudget(available -| s.be.deviceUsed());
+        _ = d.giveUpToBudget(available -| s.be.deviceUsed());
     };
 }
 
@@ -261,6 +275,7 @@ fn unloadLlm() void {
     g_carry = s.detachTranscript();
     s.deinit();
     g_session = null;
+    g_arbiter.llm = null; // participant points into the freed session
     g_session_mu.unlock(g_io);
     if (g_session_arena) |a| {
         a.deinit();
@@ -837,20 +852,33 @@ fn diffuserCollect(_: *anyopaque, buf: *std.ArrayList(*chat.GenImage)) void {
 // is one, else no-ops (diffusion has the device to itself). The engine owns its
 // queue directly now, so there is no source hook.
 fn vcEnter(_: *anyopaque) void {
-    if (g_session) |s| s.imageVramEnter(if (g_diffuser) |*d| d.estimateResidentBytes() else 0);
+    // Image queue started → the arbiter drives the LLM down to its share. Under
+    // the lock: an idle LLM is settled directly on this (UI) thread, which must
+    // not race the diffusion worker's reclaim hook (both touch the LLM context).
+    // A busy LLM is only published to its control point (an atomic) and yields at
+    // its next token — the fix for the old "no-op while generating" bug.
+    g_session_mu.lockUncancelable(g_io);
+    defer g_session_mu.unlock(g_io);
+    if (g_diffuser) |*d| g_arbiter.diff_used = d.vramBytes();
+    g_arbiter.setDiffusionActive(true);
 }
 fn vcExit(_: *anyopaque) void {
-    if (g_session) |s| s.imageVramExit(if (g_diffuser) |*d| d.vramBytes() else 0);
+    {
+        g_session_mu.lockUncancelable(g_io);
+        defer g_session_mu.unlock(g_io);
+        if (g_diffuser) |*d| g_arbiter.diff_used = d.vramBytes();
+        g_arbiter.setDiffusionActive(false); // LLM may reclaim up to limit − diff_used
+    }
     // Queue drained → idle. Re-honor the limit: trim the now-idle diffusion
     // model's resident weights if they push total usage past the ceiling.
     applyMeterPolicy();
 }
 fn vcBudget(_: *anyopaque) u64 {
     // Called on the diffusion WORKER thread — serialize with a concurrent LLM
-    // eject (unloadLlm) that may be freeing the session right now.
+    // eject (unloadLlm) that may be freeing the session right now. Pure read.
     g_session_mu.lockUncancelable(g_io);
     defer g_session_mu.unlock(g_io);
-    return if (g_session) |s| s.imageBudget() else 0;
+    return g_arbiter.diffusionBudget();
 }
 fn vcReclaim(_: *anyopaque, needed: u64) u64 {
     // Worker thread; the reclaim hook binds the LLM context, so it must not race
@@ -1067,6 +1095,7 @@ fn loaderMain() void {
         g_carry = s.detachTranscript();
         s.deinit();
         g_session = null;
+        g_arbiter.llm = null; // participant points into the freed session
         g_session_mu.unlock(g_io);
     }
     if (g_session_arena) |a| {
@@ -1110,6 +1139,7 @@ fn loaderMain() void {
     // `g_session` and must see either null or a fully-built session, never a tear.
     g_session_mu.lockUncancelable(g_io);
     g_session = s;
+    g_arbiter.llm = s.participant();
     g_session_mu.unlock(g_io);
     finishLoad(null);
 }

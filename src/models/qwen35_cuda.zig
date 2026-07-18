@@ -14,6 +14,7 @@ const qwen3 = @import("qwen3.zig");
 const cuda = @import("../gpu/cuda.zig");
 const ops = @import("../ops.zig");
 const kvmod = @import("../llm/kv_cache.zig");
+const residency = @import("residency.zig");
 
 const Backend = cuda.Backend;
 const Buf = cuda.backend.DeviceBuffer;
@@ -304,6 +305,11 @@ pub const CudaLM = struct {
     pub fn capacityMax(self: *const CudaLM) usize {
         return self.max_capacity;
     }
+    /// Device VRAM (bytes) currently in use by this backend — for the
+    /// end-of-response telemetry (`session.statsOf`).
+    pub fn vramUsed(self: *const CudaLM) u64 {
+        return self.be.deviceUsed();
+    }
 
     /// Commit more KV rows, in place: device pointers (and the captured
     /// decode graph — sin_off and the KV strides are capacity-independent)
@@ -312,9 +318,7 @@ pub const CudaLM = struct {
     /// in step(). error.ContextFull past the window or when even eviction
     /// can't free enough device memory.
     pub fn ensureCapacity(self: *CudaLM, min_rows: usize) !void {
-        if (min_rows <= self.capacity) return;
-        if (min_rows > self.max_capacity) return error.ContextFull;
-        const target = kvmod.growTarget(self.capacity, min_rows, self.max_capacity);
+        const target = (try kvmod.growPlan(self.capacity, self.max_capacity, min_rows)) orelse return;
         // Element stride MUST match how the buffers were created (esz), or an f16
         // cache (esz=2) requests f32-sized growth, overshoots its VA reservation,
         // and growableEnsure fails with DeviceOutOfMemory → ContextFull once the
@@ -332,7 +336,7 @@ pub const CudaLM = struct {
                 const need = self.liveAttnSlots() * 2 * add + (32 << 20); // + margin
                 const free = @min(sp.budget -| self.be.deviceUsed(), self.be.headroom());
                 if (free >= need) break;
-                if (!(try self.migrateNextLayer())) break; // nothing left; fall through
+                if (!(try residency.migrateNext(self))) break; // nothing left; fall through
             }
         };
 
@@ -353,7 +357,7 @@ pub const CudaLM = struct {
                 for ([2]*Growable{ &self.k_cache[s], &self.v_cache[s] }) |b| {
                     self.be.growableEnsure(b, bytes) catch |err| switch (err) {
                         error.DeviceOutOfMemory, error.OutOfMemory => {
-                            if (self.split != null and try self.migrateNextLayer()) continue :grow;
+                            if (self.split != null and try residency.migrateNext(self)) continue :grow;
                             return error.ContextFull;
                         },
                         else => return err,
@@ -386,21 +390,9 @@ pub const CudaLM = struct {
         return count;
     }
 
-    /// Migrate the next layer in the offload order to the host (dynamic mode).
-    /// Returns false when nothing is left to migrate.
-    fn migrateNextLayer(self: *CudaLM) !bool {
-        // f16 KV stays fully resident: the CPU-offload host shadow cache is f32.
-        if (self.kv_dtype == .f16) return false;
-        const sp = &self.split.?;
-        if (sp.next >= sp.order.len) return false;
-        const l = sp.order[sp.next];
-        sp.next += 1;
-        try self.migrateLayer(l);
-        return true;
-    }
-
-    /// Move layer `l`'s live state device->host and mark it CPU-resident.
-    fn migrateLayer(self: *CudaLM, l: usize) !void {
+    /// Move layer `l`'s live state device->host and mark it CPU-resident (a
+    /// `residency` hook).
+    pub fn migrateLayer(self: *CudaLM, l: usize) !void {
         const cfg = self.cfg;
         const sp = &self.split.?;
         if (!cfg.isRecurrent(l)) {
@@ -453,7 +445,7 @@ pub const CudaLM = struct {
         }
         sp.on_gpu[l] = false;
         sp.n_cpu += 1;
-        std.log.debug("[offload] layer {d} ({s}) -> CPU at ctx {d} ({d}/{d} on CPU)", .{ l, if (cfg.isRecurrent(l)) "lin" else "attn", self.len, sp.n_cpu, cfg.n_layers });
+        std.log.info("[offload] layer {d} ({s}) -> CPU at ctx {d} ({d}/{d} on CPU)", .{ l, if (cfg.isRecurrent(l)) "lin" else "attn", self.len, sp.n_cpu, cfg.n_layers });
     }
 
     /// Total device footprint of one layer's streamable weights (quantized
@@ -629,14 +621,7 @@ pub const CudaLM = struct {
     /// dynamic split. (ensureCapacity keeps its own loop, whose target shrinks per
     /// iteration as liveAttnSlots drops — a fixed target here can't express that.)
     pub fn offloadUntilFree(self: *CudaLM, needed_free: u64) !void {
-        if (self.split == null) return;
-        const sp = &self.split.?;
-        if (!sp.dynamic) return;
-        while (true) {
-            const free = @min(sp.budget -| self.be.deviceUsed(), self.be.headroom());
-            if (free >= needed_free) break;
-            if (!(try self.migrateNextLayer())) break; // nothing left
-        }
+        return residency.offloadUntilFree(self, needed_free);
     }
 
     /// Migrate layers to the host until the LLM's ACTUAL total device usage is at
@@ -647,12 +632,7 @@ pub const CudaLM = struct {
     /// weights are on the device. One-way + idempotent: once under `target` it's a
     /// no-op, so repeat calls (per image) don't re-shuffle.
     pub fn offloadToBudget(self: *CudaLM, target: u64) !void {
-        if (self.split == null or target == 0) return;
-        const sp = &self.split.?;
-        if (!sp.dynamic) return;
-        while (self.be.deviceUsed() > target) {
-            if (!(try self.migrateNextLayer())) break; // nothing left to migrate
-        }
+        return residency.offloadToBudget(self, target);
     }
 
     /// Bring layer `l` back onto the GPU, preserving its accumulated state
@@ -660,7 +640,15 @@ pub const CudaLM = struct {
     /// current capacity and upload the host rows [0,len); linear layers re-upload
     /// their conv/ssm state into the shared device buffers. Weights re-cache
     /// lazily on the next GPU forward.
-    fn promoteLayer(self: *CudaLM, l: usize) !void {
+    /// `residency.promoteBack` cost hook: VRAM a promote of layer `l` needs — its
+    /// streamable weights, the KV it re-commits at capacity (attention layers
+    /// only; recurrent layers hold fixed-size conv/ssm state, no KV), plus slack.
+    pub fn promoteCost(self: *CudaLM, l: usize) usize {
+        const kv_cost: usize = if (!self.cfg.isRecurrent(l)) 2 * self.capacity * self.cfg.kvDim() * 4 else 0;
+        return layerDeviceBytes(&self.lm.layers[l]) + kv_cost + (64 << 20);
+    }
+
+    pub fn promoteLayer(self: *CudaLM, l: usize) !void {
         const cfg = self.cfg;
         const sp = &self.split.?;
         if (!cfg.isRecurrent(l)) {
@@ -686,7 +674,7 @@ pub const CudaLM = struct {
         }
         sp.on_gpu[l] = true;
         sp.n_cpu -= 1;
-        std.log.debug("[promote] layer {d} ({s}) -> GPU at ctx {d} ({d}/{d} on CPU)", .{ l, if (cfg.isRecurrent(l)) "lin" else "attn", self.len, sp.n_cpu, cfg.n_layers });
+        std.log.info("[promote] layer {d} ({s}) -> GPU at ctx {d} ({d}/{d} on CPU)", .{ l, if (cfg.isRecurrent(l)) "lin" else "attn", self.len, sp.n_cpu, cfg.n_layers });
     }
 
     /// Migrate CPU layers back onto the GPU (LIFO by offload order), stopping
@@ -695,21 +683,7 @@ pub const CudaLM = struct {
     /// whatever else stays resident. Keeps the split armed. Returns the count
     /// promoted; 0 without a split.
     pub fn promoteLayers(self: *CudaLM, budget: u64) !usize {
-        if (self.split == null) return 0;
-        const sp = &self.split.?;
-        const kvd = self.cfg.kvDim();
-        var promoted: usize = 0;
-        while (sp.next > 0) {
-            const l = sp.order[sp.next - 1];
-            const kv_cost: usize = if (!self.cfg.isRecurrent(l)) 2 * self.capacity * kvd * 4 else 0;
-            const cost = layerDeviceBytes(&self.lm.layers[l]) + kv_cost + (64 << 20);
-            const free = @min(budget -| self.be.deviceUsed(), self.be.headroom());
-            if (free < cost) break;
-            try self.promoteLayer(l);
-            sp.next -= 1;
-            promoted += 1;
-        }
-        return promoted;
+        return residency.promoteBack(self, budget);
     }
 
     /// New-chat reset: drop the split (restoring the resident fast path + graph),

@@ -399,6 +399,12 @@ pub const VulkanLM = struct {
         return self.capacity - self.len;
     }
 
+    /// Device VRAM (bytes) this Vulkan context has allocated — the analog of the
+    /// CUDA backend's `deviceUsed()`, for the end-of-response telemetry.
+    pub fn vramUsed(self: *const VulkanLM) u64 {
+        return self.ctx.device_used;
+    }
+
     /// Forward `ids` at positions [len, len+ids.len), then write
     /// last-position vocab logits. A fresh-cache prompt chunks by max_rows
     /// through the square-attention GEMM path; follow-up (pos0 > 0) prefills

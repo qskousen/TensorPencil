@@ -1,6 +1,7 @@
 //! Model implementations (text encoder, DiT, VAE).
 
 pub const loader = @import("models/loader.zig");
+pub const residency = @import("models/residency.zig");
 pub const transformer = @import("models/transformer.zig");
 pub const transformer_gpu = @import("models/transformer_gpu.zig");
 pub const wan_vae = @import("models/wan_vae.zig");
@@ -36,6 +37,7 @@ pub const dit_cuda = @import("models/dit_cuda.zig");
 
 test {
     _ = loader;
+    _ = residency;
     _ = transformer;
     _ = transformer_gpu;
     _ = wan_vae;

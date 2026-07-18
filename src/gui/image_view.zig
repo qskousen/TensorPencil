@@ -32,7 +32,9 @@ var width_buf: [12]u8 = [_]u8{0} ** 12;
 var height_buf: [12]u8 = [_]u8{0} ** 12;
 var steps_buf: [8]u8 = [_]u8{0} ** 8;
 var cfg_buf: [8]u8 = [_]u8{0} ** 8;
-var count_buf: [4]u8 = [_]u8{0} ** 4;
+// Wide enough to type any u64 (20 digits + null): the queue count is
+// deliberately uncapped — see `generate`.
+var count_buf: [24]u8 = [_]u8{0} ** 24;
 var seed_buf: [24]u8 = [_]u8{0} ** 24;
 var random_seed: bool = true;
 
@@ -199,7 +201,9 @@ fn generate(cfg: *const config.Config, engine: *diffuser.Diffuser) void {
     const h = diffuser.clampDim(parseNum(&height_buf, cfg.height));
     const steps = std.math.clamp(parseNum(&steps_buf, cfg.steps), 1, 100);
     const cfg_scale = std.math.clamp(parseFloat(&cfg_buf, 1.0), 0.0, 30.0);
-    const count = std.math.clamp(parseNum(&count_buf, 1), 1, 16);
+    // Uncapped by design: queue as many as you ask for (min 1). Each is
+    // allocated up front, so a huge count is on you — that's the intent.
+    const count = @max(1, parseNum(&count_buf, 1));
     const base_seed: u64 = if (random_seed) 0 else std.fmt.parseInt(u64, std.mem.trim(u8, std.mem.sliceTo(&seed_buf, 0), " \t\r"), 10) catch 0;
 
     var i: usize = 0;

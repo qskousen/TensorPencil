@@ -419,6 +419,26 @@ pub const Session = struct {
         }
     }
 
+    /// Incrementally free resident weights down to `target` bytes (LRU), returning
+    /// the bytes freed. Unlike `trimToBudget` (all-or-nothing — `evictWeights`
+    /// drops the whole cache when over budget), this frees only the excess, so the
+    /// rest stays resident and the next image reloads less. This is diffusion's
+    /// live VRAM-yield lever — the analog of the LLM stepper's `offloadToBudget`
+    /// — so the cross-model `vram.Arbiter` can shrink an idle image model to make
+    /// room for a growing LLM. Caller ensures no diffusion worker is in flight;
+    /// no-op already under `target` or on a non-device backend.
+    pub fn giveUpToBudget(self: *Session, target: u64) u64 {
+        const used = self.deviceUsed();
+        if (used <= target) return 0;
+        const want = used - target;
+        if (self.cu_be) |b| {
+            b.bindThread();
+            return b.evictToFree(want);
+        }
+        if (self.gpu_ctx) |c| return c.evictToFree(want);
+        return 0;
+    }
+
     pub fn deinit(self: *Session) void {
         const gpa = self.gpa;
         // The session may be torn down from a different thread than it was used

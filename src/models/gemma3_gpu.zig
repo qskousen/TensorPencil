@@ -163,6 +163,11 @@ pub const VulkanLM = struct {
     pub fn vocab(self: *const VulkanLM) usize {
         return self.cfg.vocab;
     }
+    /// Device VRAM (bytes) this Vulkan context has allocated — the analog of the
+    /// CUDA backend's `deviceUsed()`, for the end-of-response telemetry.
+    pub fn vramUsed(self: *const VulkanLM) u64 {
+        return self.ctx.device_used;
+    }
     pub fn ensureCapacity(self: *VulkanLM, min_rows: usize) !void {
         if (min_rows > self.capacity) return error.ContextFull;
     }

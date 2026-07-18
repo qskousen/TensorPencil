@@ -473,8 +473,9 @@ pub const CpuModel = struct {
     lm: *const Model,
     gpa: std.mem.Allocator,
     cache: PerLayerKvCache,
-    freqs_global: ops.rope.Freqs,
-    freqs_local: ops.rope.Freqs,
+    /// Global-layer (index 0; theta 1e6 + proportional `rope_freqs` factors) and
+    /// local-layer (index 1; theta 1e4) RoPE tables, rebuilt together on growth.
+    rope: ops.rope.RopeTables(2),
     last_hidden: []f32,
     max_capacity: usize,
     io: std.Io = undefined,
@@ -487,16 +488,13 @@ pub const CpuModel = struct {
         defer gpa.free(rings);
         var cache = try PerLayerKvCache.init(gpa, cap.initial, dims, rings, cap.kv_dtype);
         errdefer cache.deinit(gpa);
-        var fg = try buildGlobalFreqs(gpa, cap.initial, cfg, lm.rope_freqs);
-        errdefer fg.deinit(gpa);
-        var fl = try ops.rope.rotateHalfFreqsFactored(gpa, cap.initial, cfg.head_dim_local, cfg.rope_theta_local, 1.0, null);
-        errdefer fl.deinit(gpa);
+        var rope = try ops.rope.RopeTables(2).init(gpa, .{
+            .{ .head_dim = cfg.head_dim_global, .theta = cfg.rope_theta, .freq_factors = lm.rope_freqs },
+            .{ .head_dim = cfg.head_dim_local, .theta = cfg.rope_theta_local },
+        }, cap.initial);
+        errdefer rope.deinit(gpa);
         const last_hidden = try gpa.alloc(f32, cfg.hidden);
-        return .{ .lm = lm, .gpa = gpa, .cache = cache, .freqs_global = fg, .freqs_local = fl, .last_hidden = last_hidden, .max_capacity = cap.max };
-    }
-
-    fn buildGlobalFreqs(gpa: std.mem.Allocator, seq: usize, cfg: Config, rope_freqs: []const f32) !ops.rope.Freqs {
-        return ops.rope.rotateHalfFreqsFactored(gpa, seq, cfg.head_dim_global, cfg.rope_theta, 1.0, rope_freqs);
+        return .{ .lm = lm, .gpa = gpa, .cache = cache, .rope = rope, .last_hidden = last_hidden, .max_capacity = cap.max };
     }
 
     pub fn capacityMax(self: *const CpuModel) usize {
@@ -504,23 +502,14 @@ pub const CpuModel = struct {
     }
 
     pub fn ensureCapacity(self: *CpuModel, min_rows: usize) !void {
-        if (min_rows <= self.cache.capacity) return;
-        if (min_rows > self.max_capacity) return error.ContextFull;
-        const cfg = self.lm.cfg;
-        const target = kv_cache_mod.growTarget(self.cache.capacity, min_rows, self.max_capacity);
+        const target = (try kv_cache_mod.growPlan(self.cache.capacity, self.max_capacity, min_rows)) orelse return;
         self.cache.grow(self.gpa, target) catch return error.ContextFull;
-        const fg = buildGlobalFreqs(self.gpa, target, cfg, self.lm.rope_freqs) catch return error.ContextFull;
-        self.freqs_global.deinit(self.gpa);
-        self.freqs_global = fg;
-        const fl = ops.rope.rotateHalfFreqsFactored(self.gpa, target, cfg.head_dim_local, cfg.rope_theta_local, 1.0, null) catch return error.ContextFull;
-        self.freqs_local.deinit(self.gpa);
-        self.freqs_local = fl;
+        self.rope.regrow(self.gpa, target) catch return error.ContextFull;
     }
 
     pub fn deinit(self: *CpuModel) void {
         self.cache.deinit(self.gpa);
-        self.freqs_global.deinit(self.gpa);
-        self.freqs_local.deinit(self.gpa);
+        self.rope.deinit(self.gpa);
         self.gpa.free(self.last_hidden);
         self.* = undefined;
     }
@@ -539,7 +528,7 @@ pub const CpuModel = struct {
 
     pub fn step(self: *CpuModel, io: std.Io, ids_new: []const u32, logits: []f32) !void {
         self.io = io;
-        try self.lm.forwardCached(io, self.gpa, ids_new, &self.cache, self.freqs_global, self.freqs_local, self.last_hidden);
+        try self.lm.forwardCached(io, self.gpa, ids_new, &self.cache, self.rope.get(0), self.rope.get(1), self.last_hidden);
         try ops.matmul.matmul(io, self.gpa, logits, self.last_hidden, 1, self.lm.head, null);
         self.lm.finalizeLogits(logits);
     }
@@ -547,7 +536,7 @@ pub const CpuModel = struct {
     /// Prefill text tokens (no logits) — for interleaving with prefillImage.
     /// Uses `self.io` (set by step, or by the caller before an image turn).
     pub fn prefill(self: *CpuModel, ids: []const u32) !void {
-        try self.lm.forwardCached(self.io, self.gpa, ids, &self.cache, self.freqs_global, self.freqs_local, null);
+        try self.lm.forwardCached(self.io, self.gpa, ids, &self.cache, self.rope.get(0), self.rope.get(1), null);
     }
 
     /// Prefill one image's projected embeddings ([grid_w*grid_h][hidden],
@@ -559,7 +548,7 @@ pub const CpuModel = struct {
         _ = grid_h;
         const x = try self.gpa.dupe(f32, embeds);
         defer self.gpa.free(x);
-        try self.lm.forwardHidden(self.io, self.gpa, x, &self.cache, self.freqs_global, self.freqs_local, null);
+        try self.lm.forwardHidden(self.io, self.gpa, x, &self.cache, self.rope.get(0), self.rope.get(1), null);
     }
 };
 

@@ -146,6 +146,74 @@ pub fn rotateHalfFreqsFactored(
     return .{ .cos = cos, .sin = sin, .half = half };
 }
 
+/// Build parameters for one rotate-half RoPE table. Every LLM stepper's freq
+/// table is captured by these four fields — the three `rotateHalfFreqs*`
+/// builders above all reduce to `rotateHalfFreqsFactored`. Capturing the spec
+/// (rather than a pre-built table) lets a growable context rebuild the table at
+/// a larger row count without the caller re-deriving theta/scale/factors.
+/// `freq_factors`, when set, must outlive the tables (it points into model
+/// weights, e.g. Gemma 4's `rope_freqs`).
+pub const RopeSpec = struct {
+    head_dim: usize,
+    theta: f64,
+    freq_scale: f64 = 1.0,
+    freq_factors: ?[]const f32 = null,
+
+    pub fn build(self: RopeSpec, gpa: std.mem.Allocator, rows: usize) !Freqs {
+        return rotateHalfFreqsFactored(gpa, rows, self.head_dim, self.theta, self.freq_scale, self.freq_factors);
+    }
+};
+
+/// A fixed set of `N` RoPE tables built from specs and rebuilt together when a
+/// growable context grows. `N` is 1 for single-RoPE archs (Qwen) and 2 for
+/// dual-RoPE archs (Gemma global + local). Owns the `Freqs`; `deinit` frees
+/// them. Single-sources the "rebuild every RoPE table at the new row count"
+/// dance that each CPU stepper's `ensureCapacity` open-coded.
+pub fn RopeTables(comptime N: usize) type {
+    return struct {
+        specs: [N]RopeSpec,
+        tables: [N]Freqs,
+
+        const Self = @This();
+
+        pub fn init(gpa: std.mem.Allocator, specs: [N]RopeSpec, rows: usize) !Self {
+            var tables: [N]Freqs = undefined;
+            var built: usize = 0;
+            errdefer for (tables[0..built]) |*t| t.deinit(gpa);
+            for (&tables, specs) |*t, s| {
+                t.* = try s.build(gpa, rows);
+                built += 1;
+            }
+            return .{ .specs = specs, .tables = tables };
+        }
+
+        pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
+            for (&self.tables) |*t| t.deinit(gpa);
+            self.* = undefined;
+        }
+
+        /// The `i`-th table (0 = first spec; for Gemma, 0 = global, 1 = local).
+        pub fn get(self: *const Self, i: usize) Freqs {
+            return self.tables[i];
+        }
+
+        /// Rebuild all tables at `rows` rows (context growth). Builds the fresh
+        /// tables first and only swaps in on full success, so a mid-build OOM
+        /// leaves the existing tables untouched.
+        pub fn regrow(self: *Self, gpa: std.mem.Allocator, rows: usize) !void {
+            var fresh: [N]Freqs = undefined;
+            var built: usize = 0;
+            errdefer for (fresh[0..built]) |*t| t.deinit(gpa);
+            for (&fresh, self.specs) |*t, s| {
+                t.* = try s.build(gpa, rows);
+                built += 1;
+            }
+            for (&self.tables) |*t| t.deinit(gpa);
+            self.tables = fresh;
+        }
+    };
+}
+
 /// Apply rotate-half rotation in place: for i < half,
 /// (x[i], x[i+half]) -> (x[i] c_i - x[i+half] s_i, x[i+half] c_i + x[i] s_i).
 /// `x` is [seq, n_heads * head_dim] row-major.
@@ -291,6 +359,34 @@ test "position zero is identity" {
     var x = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
     applyInterleaved(&x, freqs, 1, 1, 8);
     for ([_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 }, x) |e, a| try std.testing.expectEqual(e, a);
+}
+
+test "RopeTables matches direct builders and regrows" {
+    const gpa = std.testing.allocator;
+
+    // N=2 (Gemma-style global+local): tables equal the direct factored builds.
+    const factors = [_]f32{ 1.0, 2.0, 4.0, 8.0 }; // head_dim/2 = 4
+    var rt = try RopeTables(2).init(gpa, .{
+        .{ .head_dim = 8, .theta = 1e6, .freq_scale = 0.125, .freq_factors = &factors },
+        .{ .head_dim = 8, .theta = 1e4 },
+    }, 3);
+    defer rt.deinit(gpa);
+
+    var g = try rotateHalfFreqsFactored(gpa, 3, 8, 1e6, 0.125, &factors);
+    defer g.deinit(gpa);
+    var l = try rotateHalfFreqsScaled(gpa, 3, 8, 1e4, 1.0);
+    defer l.deinit(gpa);
+    try std.testing.expectEqualSlices(f32, g.cos, rt.get(0).cos);
+    try std.testing.expectEqualSlices(f32, g.sin, rt.get(0).sin);
+    try std.testing.expectEqualSlices(f32, l.cos, rt.get(1).cos);
+
+    // regrow to more rows: prefix (first 3 rows) is preserved bit-exactly, and
+    // the table now covers the larger row count.
+    try rt.regrow(gpa, 5);
+    var g5 = try rotateHalfFreqsFactored(gpa, 5, 8, 1e6, 0.125, &factors);
+    defer g5.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 5 * 4), rt.get(0).cos.len);
+    try std.testing.expectEqualSlices(f32, g5.cos, rt.get(0).cos);
 }
 
 // Rotate-half fixture: head_dim 8, theta 5e6, positions [0,1,2], same q as above.

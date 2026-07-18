@@ -69,6 +69,20 @@ pub fn growTarget(cur: usize, min: usize, max: usize) usize {
     return @min(max, @max(min, stepped));
 }
 
+/// The growth decision every stepper's `ensureCapacity` shares: from the
+/// current committed capacity `cur` and the hard ceiling `max`, decide whether
+/// `min_rows` needs a grow and, if so, to what capacity.
+///   - `null`  → `min_rows` already fits; the caller returns without growing.
+///   - `target`→ grow the cache (and RoPE tables) to this many rows.
+///   - `error.ContextFull` → `min_rows` exceeds `max`; unrecoverable.
+/// Single-sources the bounds-check + geometric `growTarget` that was copy-pasted
+/// (and independently bug-fixed) across every CPU and CUDA stepper.
+pub fn growPlan(cur: usize, max: usize, min_rows: usize) error{ContextFull}!?usize {
+    if (min_rows <= cur) return null;
+    if (min_rows > max) return error.ContextFull;
+    return growTarget(cur, min_rows, max);
+}
+
 /// f16 storage on the CPU packs two f16 into each f32 slot (like the GPU
 /// caches) so the backing array stays naturally f32-aligned and the f32 path is
 /// a zero-copy sub-slice. `slotsFor(elems)` is the packed f32-slot count.
@@ -629,6 +643,16 @@ test "growTarget is geometric and clamped" {
     try std.testing.expectEqual(@as(usize, 8192), growTarget(6000, 6001, 8192));
     try std.testing.expectEqual(@as(usize, 9000), growTarget(4096, 9000, 32768));
     try std.testing.expectEqual(@as(usize, 2048), growTarget(1024, 1025, 32768));
+}
+
+test "growPlan: fits / grows / overflows" {
+    // Already fits (min_rows <= cur): no grow.
+    try std.testing.expectEqual(@as(?usize, null), try growPlan(4096, 32768, 4096));
+    try std.testing.expectEqual(@as(?usize, null), try growPlan(4096, 32768, 100));
+    // Needs a grow: same target as growTarget.
+    try std.testing.expectEqual(@as(?usize, 6144), try growPlan(4096, 32768, 4097));
+    // Past the hard ceiling: unrecoverable.
+    try std.testing.expectError(error.ContextFull, growPlan(4096, 8192, 8193));
 }
 
 test "truncate rolls back and rows are rewritten" {

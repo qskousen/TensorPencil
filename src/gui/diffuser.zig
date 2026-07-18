@@ -557,6 +557,16 @@ pub const Diffuser = struct {
         if (self.session.load(.acquire)) |s| s.trimToBudget(budget);
     }
 
+    /// Incrementally free resident diffusion weights to fit `budget` bytes,
+    /// keeping the rest resident (unlike `trimToBudget`). Busy-gated (never
+    /// mid-image). The arbiter's live "diffusion yields to a growing LLM" lever;
+    /// returns bytes freed.
+    pub fn giveUpToBudget(self: *Diffuser, budget: u64) u64 {
+        if (self.busy.load(.acquire)) return 0;
+        if (self.session.load(.acquire)) |s| return s.giveUpToBudget(budget);
+        return 0;
+    }
+
     /// Estimate the image model's resident footprint (bytes) from its file
     /// sizes — the target VRAM to free for it under image priority. 0 if unknown.
     pub fn estimateResidentBytes(self: *Diffuser) u64 {

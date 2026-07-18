@@ -16,6 +16,7 @@ pub const image = @import("image.zig");
 pub const models = @import("models.zig");
 pub const sampler = @import("sampler.zig");
 pub const pipeline = @import("pipeline.zig");
+pub const vram = @import("vram.zig");
 pub const gpu = @import("gpu.zig");
 pub const llm = @import("llm.zig");
 pub const prof = @import("prof.zig");
@@ -42,6 +43,7 @@ test {
     _ = models;
     _ = sampler;
     _ = pipeline;
+    _ = vram;
     _ = gpu;
     _ = llm;
 }

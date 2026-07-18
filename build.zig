@@ -119,6 +119,12 @@ pub fn build(b: *std.Build) void {
     // builds (so GPU tests self-skip via their `catch SkipZigTest`) and the heavy
     // model tests skip via `test_gate.requireIntegration`. Full suite:
     // `zig build test -Dintegration` (needs a device + the models/ checkpoints).
+    // `-Dself-hosted` builds the executables with Zig's self-hosted x86_64
+    // codegen backend instead of LLVM (backend A/B benchmarking). `null` = Zig's
+    // default (LLVM in Release). SPIR-V kernels always stay self-hosted.
+    const self_hosted = b.option(bool, "self-hosted", "Build executables with the self-hosted backend (no LLVM)") orelse false;
+    const use_llvm: ?bool = if (self_hosted) false else null;
+
     const integration = b.option(bool, "integration", "Also run the slow GPU + real-model integration tests") orelse false;
     const build_opts = b.addOptions();
     build_opts.addOption(bool, "integration", integration);
@@ -142,6 +148,7 @@ pub fn build(b: *std.Build) void {
     // don't need and to put everything under a single module.
     const exe = b.addExecutable(.{
         .name = "TensorPencil",
+        .use_llvm = use_llvm,
         .root_module = b.createModule(.{
             // b.createModule defines a new module just like b.addModule but,
             // unlike b.addModule, it does not expose the module to consumers of
@@ -203,6 +210,7 @@ pub fn build(b: *std.Build) void {
     // the same TensorPencil library module.
     const llm_exe = b.addExecutable(.{
         .name = "tp-llm",
+        .use_llvm = use_llvm,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/llm_main.zig"),
             .link_libc = true,
@@ -258,6 +266,7 @@ pub fn build(b: *std.Build) void {
         if (b.lazyDependency("known_folders", .{})) |kf| {
             const gui_exe = b.addExecutable(.{
                 .name = "tp-gui",
+                .use_llvm = use_llvm,
                 .root_module = b.createModule(.{
                     .root_source_file = b.path("src/gui_main.zig"),
                     .link_libc = true,

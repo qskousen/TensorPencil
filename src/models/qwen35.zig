@@ -675,7 +675,7 @@ pub const CpuModel = struct {
     lm: *const Model,
     gpa: std.mem.Allocator,
     state: State,
-    freqs: ops.rope.Freqs,
+    rope: ops.rope.RopeTables(1),
     last_hidden: []f32,
     /// Growth ceiling (rows); the KV cache starts at cap.initial and grows here.
     max_capacity: usize,
@@ -683,10 +683,12 @@ pub const CpuModel = struct {
     pub fn init(gpa: std.mem.Allocator, lm: *const Model, cap: kv_cache_mod.Capacity) !CpuModel {
         var state = try State.init(gpa, lm.cfg, cap.initial, cap.kv_dtype);
         errdefer state.deinit(gpa);
-        var freqs = try ops.rope.rotateHalfFreqs(gpa, cap.initial, lm.cfg.rope_dim, lm.cfg.rope_theta);
-        errdefer freqs.deinit(gpa);
+        var rope = try ops.rope.RopeTables(1).init(gpa, .{
+            .{ .head_dim = lm.cfg.rope_dim, .theta = lm.cfg.rope_theta },
+        }, cap.initial);
+        errdefer rope.deinit(gpa);
         const last_hidden = try gpa.alloc(f32, lm.cfg.hidden);
-        return .{ .lm = lm, .gpa = gpa, .state = state, .freqs = freqs, .last_hidden = last_hidden, .max_capacity = cap.max };
+        return .{ .lm = lm, .gpa = gpa, .state = state, .rope = rope, .last_hidden = last_hidden, .max_capacity = cap.max };
     }
 
     pub fn capacityMax(self: *const CpuModel) usize {
@@ -697,19 +699,15 @@ pub const CpuModel = struct {
     /// `min_rows`; the recurrent conv/ssm states are position-independent
     /// and never grow. error.ContextFull past the window or on host OOM.
     pub fn ensureCapacity(self: *CpuModel, min_rows: usize) !void {
-        if (min_rows <= self.state.capacity) return;
-        if (min_rows > self.max_capacity) return error.ContextFull;
-        const target = kv_cache_mod.growTarget(self.state.capacity, min_rows, self.max_capacity);
+        const target = (try kv_cache_mod.growPlan(self.state.capacity, self.max_capacity, min_rows)) orelse return;
         self.state.kv.grow(self.gpa, target) catch return error.ContextFull;
         self.state.capacity = target;
-        const freqs = ops.rope.rotateHalfFreqs(self.gpa, target, self.lm.cfg.rope_dim, self.lm.cfg.rope_theta) catch return error.ContextFull;
-        self.freqs.deinit(self.gpa);
-        self.freqs = freqs;
+        self.rope.regrow(self.gpa, target) catch return error.ContextFull;
     }
 
     pub fn deinit(self: *CpuModel) void {
         self.state.deinit(self.gpa);
-        self.freqs.deinit(self.gpa);
+        self.rope.deinit(self.gpa);
         self.gpa.free(self.last_hidden);
         self.* = undefined;
     }
@@ -727,7 +725,7 @@ pub const CpuModel = struct {
     }
 
     pub fn step(self: *CpuModel, io: std.Io, ids_new: []const u32, logits: []f32) !void {
-        try self.lm.forwardCached(io, self.gpa, ids_new, &self.state, self.freqs, self.last_hidden);
+        try self.lm.forwardCached(io, self.gpa, ids_new, &self.state, self.rope.get(0), self.last_hidden);
         try ops.matmul.matmul(io, self.gpa, logits, self.last_hidden, 1, self.lm.head, null);
     }
 };
