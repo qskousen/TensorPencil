@@ -1634,12 +1634,16 @@ pub const Backend = struct {
         std.debug.assert(!bidir or hd == 256 or hd == 512);
         const bidir_u: u32 = @intFromBool(bidir);
         const total = seq_q * n_heads * nsplit * 32;
-        if (hd == 256) {
-            // The h256 kernel carries extra ring (u6) + bidir (u7) params, so it
-            // needs a bespoke 14-param launch (eltLaunch only passes 6 u32 + 2 f32).
-            const f_split = try self.eltFn(
+        if (hd == 256 or hd == 512) {
+            // h256 (local, ring) and h512 (gemma4 global, ring=0) share one
+            // generated kernel + param layout (u6=ring, u7=bidir), so both take
+            // the same bespoke 14-param launch (eltLaunch only passes 6 u32 + 2 f32).
+            const f_split = if (hd == 256) try self.eltFn(
                 if (kv_f16) elt.attn_split_h256_f16_ptx else elt.attn_split_h256_ptx,
                 if (kv_f16) "attn_split_h256_f16" else "attn_split_h256",
+            ) else try self.eltFn(
+                if (kv_f16) elt.attn_split_h512_f16_ptx else elt.attn_split_h512_ptx,
+                if (kv_f16) "attn_split_h512_f16" else "attn_split_h512",
             );
             var p0 = q.ptr();
             var p1 = k.ptr();
@@ -1652,27 +1656,6 @@ pub const Backend = struct {
                 @ptrCast(&uu[0]), @ptrCast(&uu[1]), @ptrCast(&uu[2]), @ptrCast(&uu[3]),
                 @ptrCast(&uu[4]), @ptrCast(&uu[5]), @ptrCast(&uu[6]), @ptrCast(&uu[7]),
                 @ptrCast(&ff[0]), @ptrCast(&ff[1]),
-            };
-            const grid: u32 = @intCast((total + 255) / 256);
-            self.ctx.launch(f_split, .{ grid, 1, 1 }, .{ 256, 1, 1 }, 0, &params) catch return error.CudaError;
-        } else if (hd == 512) {
-            // h512 (gemma4 GLOBAL) also takes bidir (u6); window is always 0, so
-            // it needs no ring param. Bespoke launch (7th u32 beyond eltLaunch).
-            const f_split = try self.eltFn(
-                if (kv_f16) elt.attn_split_h512_f16_ptx else elt.attn_split_h512_ptx,
-                if (kv_f16) "attn_split_h512_f16" else "attn_split_h512",
-            );
-            var p0 = q.ptr();
-            var p1 = k.ptr();
-            var p2 = v.ptr();
-            var p3 = scratch.ptr();
-            var uu = [_]u32{ @intCast(kv_len0), @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intCast(nsplit), @intCast(seq_q), bidir_u };
-            var ff = [_]f32{ scale, @floatFromInt(window) };
-            var params = [_]?*anyopaque{
-                @ptrCast(&p0),    @ptrCast(&p1),    @ptrCast(&p2),    @ptrCast(&p3),
-                @ptrCast(&uu[0]), @ptrCast(&uu[1]), @ptrCast(&uu[2]), @ptrCast(&uu[3]),
-                @ptrCast(&uu[4]), @ptrCast(&uu[5]), @ptrCast(&uu[6]), @ptrCast(&ff[0]),
-                @ptrCast(&ff[1]),
             };
             const grid: u32 = @intCast((total + 255) / 256);
             self.ctx.launch(f_split, .{ grid, 1, 1 }, .{ 256, 1, 1 }, 0, &params) catch return error.CudaError;

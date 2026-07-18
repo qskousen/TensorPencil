@@ -1945,533 +1945,183 @@ fn q4_0nInput(comptime i: u32) []const u8 {
     , .{ i, 40 + i, 40 + i });
 }
 
-/// attn_split for head_dim 256 (qwen35): identical flash-decoding split to
-/// attn_split, but each lane owns EIGHT dims (two v4 fragments) instead of
-/// four. Scratch layout stays [warp][(hd+4)] (m, d, pad2, acc[hd]), so
-/// attn_merge consumes it unchanged with u3=hd=256.
-/// b0=q, b1=k, b2=v, b3=scratch. u0=kv_len0, u1=heads, u2=kv_heads,
-/// u3=hd(=256), u4=nsplit, u5=seq_q, u6=ring. f0=scale, f1=window.
-/// u6 (ring) > 0 selects sliding-window ring addressing: the KV storage row is
-/// `pos % ring` instead of the absolute position (gemma3/gemma4 LOCAL layers,
-/// whose caches hold only `ring` rows). 0 = linear addressing (all other uses).
-pub const attn_split_h256_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
-    \\.visible .entry attn_split_h256(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
-    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .u32 u6,.param .u32 u7,.param .f32 f0,.param .f32 f1)
-    \\{
-    \\  .reg .pred %p<8>;
-    \\  .reg .b32 %r<40>;
-    \\  .reg .f32 %f<64>;
-    \\  .reg .b64 %rd<24>;
-    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x;
-    \\  mad.lo.s32 %r4,%r1,%r2,%r3;           // global thread
-    \\  shr.u32 %r27,%r4,5;                   // warp = idx/32
-    \\  and.b32 %r28,%r4,31;                  // lane
-    \\  ld.param.u32 %r5,[u0];                // kv_len0
-    \\  ld.param.u32 %r6,[u1];                // heads
-    \\  ld.param.u32 %r26,[u4];               // nsplit
-    \\  ld.param.u32 %r30,[u5];               // seq_q
-    \\  mul.lo.s32 %r7,%r6,%r26;              // heads*nsplit warps per query
-    \\  mul.lo.s32 %r31,%r7,%r30;
-    \\  setp.ge.u32 %p1,%r27,%r31; @%p1 bra END;
-    \\  ld.param.u32 %r8,[u2];                // kv_heads
-    \\  ld.param.u32 %r9,[u3];                // hd (=256)
-    \\  ld.param.f32 %f1,[f0];                // scale
-    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2]; ld.param.u64 %rd4,[p3];
-    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3; cvta.to.global.u64 %rd4,%rd4;
-    \\  div.u32 %r31,%r27,%r7;                // query t
-    \\  rem.u32 %r2,%r27,%r7;                 // warp within query
-    \\  add.u32 %r5,%r5,%r31;                 // this query's causal kv len (kv_len0+t)
-    \\  // kv_end (loop upper bound): causal by default; a bidirectional image
-    \\  // block (u7) extends it to the whole batch (kv_len0+seq_q-1) so every
-    \\  // query sees forward. The window kv_start below stays on the CAUSAL len.
-    \\  ld.param.u32 %r34,[u7];               // bidir (0/1)
-    \\  mov.u32 %r35,%r5;                      // kv_end = causal len
-    \\  setp.eq.u32 %p6,%r34,0; @%p6 bra NOBIDIR;
-    \\  add.u32 %r35,%r5,%r30; sub.u32 %r35,%r35,1; sub.u32 %r35,%r35,%r31; // kv_len0+seq_q-1
-    \\NOBIDIR:
-    \\  div.u32 %r10,%r2,%r26;                // h
-    \\  rem.u32 %r21,%r2,%r26;                // split i
-    \\  // Sliding window (f1, 0 = full causal): kv_start = max(0, causal_len - window).
-    \\  ld.param.f32 %f30,[f1]; cvt.rzi.u32.f32 %r11,%f30;
-    \\  mov.u32 %r16,0;                       // kv_start
-    \\  setp.eq.u32 %p4,%r11,0; @%p4 bra NOWIN;
-    \\  setp.le.u32 %p4,%r5,%r11; @%p4 bra NOWIN;
-    \\  sub.u32 %r16,%r5,%r11;                // kv_start = causal_len - window
-    \\NOWIN:
-    \\  sub.u32 %r22,%r35,%r16;               // span = kv_end - kv_start
-    \\  add.u32 %r22,%r22,%r26; sub.u32 %r22,%r22,1; div.u32 %r22,%r22,%r26; // chunk = ceil(span/nsplit)
-    \\  mad.lo.s32 %r17,%r21,%r22,%r16;       // kv0 = kv_start + split_i*chunk
-    \\  add.u32 %r23,%r17,%r22; min.u32 %r23,%r23,%r35; // kv1
-    \\  div.u32 %r12,%r6,%r8;                 // group
-    \\  div.u32 %r13,%r10,%r12;               // kv head
-    \\  // q fragment: q[(t*heads + h)*hd + lane*8 ..][8]
-    \\  mad.lo.s32 %r14,%r31,%r6,%r10; mul.lo.s32 %r14,%r14,%r9; shl.b32 %r15,%r28,3; add.u32 %r14,%r14,%r15;
-    \\  mul.wide.u32 %rd5,%r14,4; add.s64 %rd6,%rd1,%rd5;
-    \\  ld.global.v4.f32 {%f2,%f3,%f4,%f5},[%rd6];
-    \\  ld.global.v4.f32 {%f32,%f33,%f34,%f35},[%rd6+16];
-    \\  mov.f32 %f10,0fFF800000;              // m
-    \\  mov.f32 %f11,0f00000000;              // d
-    \\  mov.f32 %f20,0f00000000; mov.f32 %f21,0f00000000; mov.f32 %f22,0f00000000; mov.f32 %f23,0f00000000;
-    \\  mov.f32 %f40,0f00000000; mov.f32 %f41,0f00000000; mov.f32 %f42,0f00000000; mov.f32 %f43,0f00000000;
-    \\  ld.param.u32 %r32,[u6];              // ring (0 = linear KV addressing)
-    \\JLOOP:
-    \\  setp.ge.u32 %p2,%r17,%r23; @%p2 bra JD;
-    \\  // kv row fragment base: ((jr*kv_heads + kvh)*hd + lane*8), jr = ring ? j%ring : j
-    \\  mov.u32 %r33,%r17;
-    \\  setp.eq.u32 %p5,%r32,0; @%p5 bra ROW256;
-    \\  rem.u32 %r33,%r17,%r32;
-    \\ROW256:
-    \\  mad.lo.s32 %r18,%r33,%r8,%r13; mul.lo.s32 %r18,%r18,%r9; add.u32 %r18,%r18,%r15;
-    \\  mul.wide.u32 %rd9,%r18,4; add.s64 %rd10,%rd2,%rd9;
-    \\  ld.global.v4.f32 {%f24,%f25,%f26,%f27},[%rd10];
-    \\  ld.global.v4.f32 {%f36,%f37,%f38,%f39},[%rd10+16];
-    \\  mul.f32 %f6,%f2,%f24; fma.rn.f32 %f6,%f3,%f25,%f6; fma.rn.f32 %f6,%f4,%f26,%f6; fma.rn.f32 %f6,%f5,%f27,%f6;
-    \\  fma.rn.f32 %f6,%f32,%f36,%f6; fma.rn.f32 %f6,%f33,%f37,%f6; fma.rn.f32 %f6,%f34,%f38,%f6; fma.rn.f32 %f6,%f35,%f39,%f6;
-    \\  // butterfly all-reduce
-    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,16,0x1f,0xffffffff; mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
-    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,8,0x1f,0xffffffff;  mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
-    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,4,0x1f,0xffffffff;  mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
-    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,2,0x1f,0xffffffff;  mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
-    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,1,0x1f,0xffffffff;  mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
-    \\  mul.f32 %f6,%f6,%f1;                  // s
-    \\  max.f32 %f12,%f10,%f6;                // m2
-    \\  sub.f32 %f8,%f10,%f12; mul.f32 %f8,%f8,0f3FB8AA3B; ex2.approx.f32 %f8,%f8;  // corr
-    \\  sub.f32 %f9,%f6,%f12; mul.f32 %f9,%f9,0f3FB8AA3B; ex2.approx.f32 %f9,%f9;   // p
-    \\  mul.f32 %f11,%f11,%f8; add.f32 %f11,%f11,%f9;
-    \\  mov.f32 %f10,%f12;
-    \\  add.s64 %rd11,%rd3,%rd9;              // V fragment (same offsets)
-    \\  ld.global.v4.f32 {%f24,%f25,%f26,%f27},[%rd11];
-    \\  ld.global.v4.f32 {%f36,%f37,%f38,%f39},[%rd11+16];
-    \\  mul.f32 %f20,%f20,%f8; fma.rn.f32 %f20,%f9,%f24,%f20;
-    \\  mul.f32 %f21,%f21,%f8; fma.rn.f32 %f21,%f9,%f25,%f21;
-    \\  mul.f32 %f22,%f22,%f8; fma.rn.f32 %f22,%f9,%f26,%f22;
-    \\  mul.f32 %f23,%f23,%f8; fma.rn.f32 %f23,%f9,%f27,%f23;
-    \\  mul.f32 %f40,%f40,%f8; fma.rn.f32 %f40,%f9,%f36,%f40;
-    \\  mul.f32 %f41,%f41,%f8; fma.rn.f32 %f41,%f9,%f37,%f41;
-    \\  mul.f32 %f42,%f42,%f8; fma.rn.f32 %f42,%f9,%f38,%f42;
-    \\  mul.f32 %f43,%f43,%f8; fma.rn.f32 %f43,%f9,%f39,%f43;
-    \\  add.u32 %r17,%r17,1; bra JLOOP;
-    \\JD:
-    \\  // scratch row = warp*(hd+4): lane 0 stores m,d; every lane its acc8
-    \\  add.u32 %r24,%r9,4; mul.lo.s32 %r25,%r27,%r24;
-    \\  mul.wide.u32 %rd17,%r25,4; add.s64 %rd18,%rd4,%rd17;
-    \\  setp.ne.u32 %p3,%r28,0; @%p3 bra WRACC;
-    \\  st.global.f32 [%rd18],%f10; st.global.f32 [%rd18+4],%f11;
-    \\WRACC:
-    \\  shl.b32 %r29,%r28,5; add.u32 %r29,%r29,16;   // byte off = 16 + lane*32
-    \\  cvt.u64.u32 %rd19,%r29; add.s64 %rd20,%rd18,%rd19;
-    \\  st.global.v4.f32 [%rd20],{%f20,%f21,%f22,%f23};
-    \\  st.global.v4.f32 [%rd20+16],{%f40,%f41,%f42,%f43};
-    \\END:
-    \\  ret;
-    \\}
-;
+/// Comptime generator for the Gemma flash-decode "attn_split" kernels. The four
+/// former hand-written PTX blobs (h256/h512 x f32/f16 KV) differ only in three
+/// axes, all derived here from (`hd`, `is_f16`):
+///   - dims-per-lane = hd/32 (each of the 32 warp lanes owns this many head
+///     dims), which sets the unroll of the Q load, dot product, V accumulate,
+///     and scratch store;
+///   - KV load: f32 reads v4.f32 (4 dims each); f16 reads v4.u32 (8 packed
+///     halfs) and widens with cvt.f32.f16, at a *2 byte stride instead of *4;
+///   - ring addressing (u6) wraps the KV row (j%ring) for LOCAL sliding-window
+///     layers; GLOBAL layers pass ring=0 (linear) — same code, no branch cost.
+/// The masking is uniform: causal kv_len = kv_len0+t, a bidirectional image
+/// block (u7) extends the upper bound (kv_end) to kv_len0+seq_q-1 while the
+/// sliding window (f1) keeps kv_start on the query's own causal position.
+/// Register banks: %f1..%f9 scalars; Q dims [16..16+D); KV-temp [16+D..16+2D)
+/// (K then V); acc [16+2D..16+3D). Validated by `ptxas` + the on-device
+/// opAttnDecode tests (causal / window / f16 / bidirectional).
+fn genAttnSplit(comptime hd: u32, comptime is_f16: bool) [:0]const u8 {
+    @setEvalBranchQuota(200000);
+    const cp = std.fmt.comptimePrint;
+    const dims = hd / 32; // head dims per lane (8 for hd256, 16 for hd512)
+    const qshl = std.math.log2_int(u32, dims); // lane element offset shift
+    const sshl = qshl + 2; // lane byte offset for the scratch acc store
+    const QB = 16; // Q register base
+    const KB = 16 + dims; // KV-temp register base
+    const AB = 16 + 2 * dims; // accumulator register base
+    const name = cp("attn_split_h{d}{s}", .{ hd, if (is_f16) "_f16" else "" });
 
-/// attn_split for head_dim 512 (Gemma 4 GLOBAL layers): the h256 flash-decode
-/// split with each lane owning SIXTEEN dims (four v4 fragments) instead of
-/// eight. Scratch row stays [m, d, pad2, acc[hd]] = (hd+4) f32, so attn_merge
-/// consumes it unchanged with u3=hd=512. b0=q, b1=k, b2=v, b3=scratch.
-/// u0=kv_len0, u1=heads, u2=kv_heads, u3=hd(=512), u4=nsplit, u5=seq_q.
-/// f0=scale, f1=window (0 = full causal; Gemma 4 global is always 0).
-pub const attn_split_h512_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
-    \\.visible .entry attn_split_h512(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
-    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .u32 u6,.param .f32 f0,.param .f32 f1)
-    \\{
-    \\  .reg .pred %p<7>;
-    \\  .reg .b32 %r<34>;
-    \\  .reg .f32 %f<80>;
-    \\  .reg .b64 %rd<24>;
-    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x;
-    \\  mad.lo.s32 %r4,%r1,%r2,%r3;
-    \\  shr.u32 %r27,%r4,5;                   // warp
-    \\  and.b32 %r28,%r4,31;                  // lane
-    \\  ld.param.u32 %r5,[u0];                // kv_len0
-    \\  ld.param.u32 %r6,[u1];                // heads
-    \\  ld.param.u32 %r26,[u4];               // nsplit
-    \\  ld.param.u32 %r30,[u5];               // seq_q
-    \\  mul.lo.s32 %r7,%r6,%r26;
-    \\  mul.lo.s32 %r31,%r7,%r30;
-    \\  setp.ge.u32 %p1,%r27,%r31; @%p1 bra END;
-    \\  ld.param.u32 %r8,[u2];                // kv_heads
-    \\  ld.param.u32 %r9,[u3];                // hd (=512)
-    \\  ld.param.f32 %f1,[f0];                // scale
-    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2]; ld.param.u64 %rd4,[p3];
-    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3; cvta.to.global.u64 %rd4,%rd4;
-    \\  div.u32 %r31,%r27,%r7;                // query t
-    \\  rem.u32 %r2,%r27,%r7;
-    \\  add.u32 %r5,%r5,%r31;                 // this query's causal kv len (kv_len0+t)
-    \\  // kv_end: causal by default; bidirectional image block (u6) extends it to
-    \\  // kv_len0+seq_q-1 (global layers are window 0, so kv_start stays 0).
-    \\  ld.param.u32 %r32,[u6];               // bidir (0/1)
-    \\  mov.u32 %r33,%r5;                      // kv_end = causal len
-    \\  setp.eq.u32 %p5,%r32,0; @%p5 bra NOBIDIR;
-    \\  add.u32 %r33,%r5,%r30; sub.u32 %r33,%r33,1; sub.u32 %r33,%r33,%r31; // kv_len0+seq_q-1
-    \\NOBIDIR:
-    \\  div.u32 %r10,%r2,%r26;               // h
-    \\  rem.u32 %r21,%r2,%r26;               // split i
-    \\  ld.param.f32 %f30,[f1]; cvt.rzi.u32.f32 %r11,%f30;
-    \\  mov.u32 %r16,0;                       // kv_start
-    \\  setp.eq.u32 %p4,%r11,0; @%p4 bra NOWIN;
-    \\  setp.le.u32 %p4,%r5,%r11; @%p4 bra NOWIN;
-    \\  sub.u32 %r16,%r5,%r11;
-    \\NOWIN:
-    \\  sub.u32 %r22,%r33,%r16;               // span = kv_end - kv_start
-    \\  add.u32 %r22,%r22,%r26; sub.u32 %r22,%r22,1; div.u32 %r22,%r22,%r26; // chunk = ceil(span/nsplit)
-    \\  mad.lo.s32 %r17,%r21,%r22,%r16;       // kv0
-    \\  add.u32 %r23,%r17,%r22; min.u32 %r23,%r23,%r33; // kv1
-    \\  div.u32 %r12,%r6,%r8;                 // group
-    \\  div.u32 %r13,%r10,%r12;               // kv head
-    \\  // q fragment: q[(t*heads + h)*hd + lane*16 ..][16]
-    \\  mad.lo.s32 %r14,%r31,%r6,%r10; mul.lo.s32 %r14,%r14,%r9; shl.b32 %r15,%r28,4; add.u32 %r14,%r14,%r15;
-    \\  mul.wide.u32 %rd5,%r14,4; add.s64 %rd6,%rd1,%rd5;
-    \\  ld.global.v4.f32 {%f2,%f3,%f4,%f5},[%rd6];
-    \\  ld.global.v4.f32 {%f32,%f33,%f34,%f35},[%rd6+16];
-    \\  ld.global.v4.f32 {%f48,%f49,%f50,%f51},[%rd6+32];
-    \\  ld.global.v4.f32 {%f52,%f53,%f54,%f55},[%rd6+48];
-    \\  mov.f32 %f10,0fFF800000;              // m
-    \\  mov.f32 %f11,0f00000000;              // d
-    \\  mov.f32 %f20,0f00000000; mov.f32 %f21,0f00000000; mov.f32 %f22,0f00000000; mov.f32 %f23,0f00000000;
-    \\  mov.f32 %f40,0f00000000; mov.f32 %f41,0f00000000; mov.f32 %f42,0f00000000; mov.f32 %f43,0f00000000;
-    \\  mov.f32 %f64,0f00000000; mov.f32 %f65,0f00000000; mov.f32 %f66,0f00000000; mov.f32 %f67,0f00000000;
-    \\  mov.f32 %f68,0f00000000; mov.f32 %f69,0f00000000; mov.f32 %f70,0f00000000; mov.f32 %f71,0f00000000;
-    \\JLOOP:
-    \\  setp.ge.u32 %p2,%r17,%r23; @%p2 bra JD;
-    \\  mad.lo.s32 %r18,%r17,%r8,%r13; mul.lo.s32 %r18,%r18,%r9; add.u32 %r18,%r18,%r15;
-    \\  mul.wide.u32 %rd9,%r18,4; add.s64 %rd10,%rd2,%rd9;
-    \\  ld.global.v4.f32 {%f24,%f25,%f26,%f27},[%rd10];
-    \\  ld.global.v4.f32 {%f36,%f37,%f38,%f39},[%rd10+16];
-    \\  ld.global.v4.f32 {%f56,%f57,%f58,%f59},[%rd10+32];
-    \\  ld.global.v4.f32 {%f60,%f61,%f62,%f63},[%rd10+48];
-    \\  mul.f32 %f6,%f2,%f24; fma.rn.f32 %f6,%f3,%f25,%f6; fma.rn.f32 %f6,%f4,%f26,%f6; fma.rn.f32 %f6,%f5,%f27,%f6;
-    \\  fma.rn.f32 %f6,%f32,%f36,%f6; fma.rn.f32 %f6,%f33,%f37,%f6; fma.rn.f32 %f6,%f34,%f38,%f6; fma.rn.f32 %f6,%f35,%f39,%f6;
-    \\  fma.rn.f32 %f6,%f48,%f56,%f6; fma.rn.f32 %f6,%f49,%f57,%f6; fma.rn.f32 %f6,%f50,%f58,%f6; fma.rn.f32 %f6,%f51,%f59,%f6;
-    \\  fma.rn.f32 %f6,%f52,%f60,%f6; fma.rn.f32 %f6,%f53,%f61,%f6; fma.rn.f32 %f6,%f54,%f62,%f6; fma.rn.f32 %f6,%f55,%f63,%f6;
-    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,16,0x1f,0xffffffff; mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
-    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,8,0x1f,0xffffffff;  mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
-    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,4,0x1f,0xffffffff;  mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
-    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,2,0x1f,0xffffffff;  mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
-    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,1,0x1f,0xffffffff;  mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
-    \\  mul.f32 %f6,%f6,%f1;                  // s
-    \\  max.f32 %f12,%f10,%f6;                // m2
-    \\  sub.f32 %f8,%f10,%f12; mul.f32 %f8,%f8,0f3FB8AA3B; ex2.approx.f32 %f8,%f8;  // corr
-    \\  sub.f32 %f9,%f6,%f12; mul.f32 %f9,%f9,0f3FB8AA3B; ex2.approx.f32 %f9,%f9;   // p
-    \\  mul.f32 %f11,%f11,%f8; add.f32 %f11,%f11,%f9;
-    \\  mov.f32 %f10,%f12;
-    \\  add.s64 %rd11,%rd3,%rd9;              // V fragment
-    \\  ld.global.v4.f32 {%f24,%f25,%f26,%f27},[%rd11];
-    \\  ld.global.v4.f32 {%f36,%f37,%f38,%f39},[%rd11+16];
-    \\  ld.global.v4.f32 {%f56,%f57,%f58,%f59},[%rd11+32];
-    \\  ld.global.v4.f32 {%f60,%f61,%f62,%f63},[%rd11+48];
-    \\  mul.f32 %f20,%f20,%f8; fma.rn.f32 %f20,%f9,%f24,%f20;
-    \\  mul.f32 %f21,%f21,%f8; fma.rn.f32 %f21,%f9,%f25,%f21;
-    \\  mul.f32 %f22,%f22,%f8; fma.rn.f32 %f22,%f9,%f26,%f22;
-    \\  mul.f32 %f23,%f23,%f8; fma.rn.f32 %f23,%f9,%f27,%f23;
-    \\  mul.f32 %f40,%f40,%f8; fma.rn.f32 %f40,%f9,%f36,%f40;
-    \\  mul.f32 %f41,%f41,%f8; fma.rn.f32 %f41,%f9,%f37,%f41;
-    \\  mul.f32 %f42,%f42,%f8; fma.rn.f32 %f42,%f9,%f38,%f42;
-    \\  mul.f32 %f43,%f43,%f8; fma.rn.f32 %f43,%f9,%f39,%f43;
-    \\  mul.f32 %f64,%f64,%f8; fma.rn.f32 %f64,%f9,%f56,%f64;
-    \\  mul.f32 %f65,%f65,%f8; fma.rn.f32 %f65,%f9,%f57,%f65;
-    \\  mul.f32 %f66,%f66,%f8; fma.rn.f32 %f66,%f9,%f58,%f66;
-    \\  mul.f32 %f67,%f67,%f8; fma.rn.f32 %f67,%f9,%f59,%f67;
-    \\  mul.f32 %f68,%f68,%f8; fma.rn.f32 %f68,%f9,%f60,%f68;
-    \\  mul.f32 %f69,%f69,%f8; fma.rn.f32 %f69,%f9,%f61,%f69;
-    \\  mul.f32 %f70,%f70,%f8; fma.rn.f32 %f70,%f9,%f62,%f70;
-    \\  mul.f32 %f71,%f71,%f8; fma.rn.f32 %f71,%f9,%f63,%f71;
-    \\  add.u32 %r17,%r17,1; bra JLOOP;
-    \\JD:
-    \\  add.u32 %r24,%r9,4; mul.lo.s32 %r25,%r27,%r24;   // scratch row = warp*(hd+4)
-    \\  mul.wide.u32 %rd17,%r25,4; add.s64 %rd18,%rd4,%rd17;
-    \\  setp.ne.u32 %p3,%r28,0; @%p3 bra WRACC;
-    \\  st.global.f32 [%rd18],%f10; st.global.f32 [%rd18+4],%f11;
-    \\WRACC:
-    \\  shl.b32 %r29,%r28,6; add.u32 %r29,%r29,16;   // byte off = 16 + lane*64
-    \\  cvt.u64.u32 %rd19,%r29; add.s64 %rd20,%rd18,%rd19;
-    \\  st.global.v4.f32 [%rd20],{%f20,%f21,%f22,%f23};
-    \\  st.global.v4.f32 [%rd20+16],{%f40,%f41,%f42,%f43};
-    \\  st.global.v4.f32 [%rd20+32],{%f64,%f65,%f66,%f67};
-    \\  st.global.v4.f32 [%rd20+48],{%f68,%f69,%f70,%f71};
-    \\END:
-    \\  ret;
-    \\}
-;
+    comptime var s: []const u8 = ".version 8.0\n.target sm_86\n.address_size 64\n";
+    s = s ++ cp(".visible .entry {s}(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,\n", .{name});
+    s = s ++ "  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .u32 u6,.param .u32 u7,.param .f32 f0,.param .f32 f1)\n{\n";
+    s = s ++ "  .reg .pred %p<8>;\n  .reg .b32 %r<64>;\n  .reg .f32 %f<128>;\n";
+    if (is_f16) s = s ++ "  .reg .b16 %hs<2>;\n";
+    s = s ++ "  .reg .b64 %rd<32>;\n";
 
-/// f16-KV variant of `attn_split_h256`: the K/V cache holds f16 (half the VRAM),
-/// so each 8-dim K/V fragment is loaded as a v4.u32 (16 B = 8 halfs) and
-/// widened to f32 in-register (cvt.f32.f16) before the f32 dot/accumulate. Q,
-/// scratch, and output stay f32 — only the cache reads change, and the K/V byte
-/// stride is *2 instead of *4. Otherwise byte-identical to attn_split_h256
-/// (same flash-decode split, sliding window, and ring addressing). Lossy vs f32.
-pub const attn_split_h256_f16_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
-    \\.visible .entry attn_split_h256_f16(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
-    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .u32 u6,.param .u32 u7,.param .f32 f0,.param .f32 f1)
-    \\{
-    \\  .reg .pred %p<8>;
-    \\  .reg .b32 %r<46>;
-    \\  .reg .f32 %f<64>;
-    \\  .reg .b16 %hs<2>;
-    \\  .reg .b64 %rd<24>;
-    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x;
-    \\  mad.lo.s32 %r4,%r1,%r2,%r3;           // global thread
-    \\  shr.u32 %r27,%r4,5;                   // warp = idx/32
-    \\  and.b32 %r28,%r4,31;                  // lane
-    \\  ld.param.u32 %r5,[u0];                // kv_len0
-    \\  ld.param.u32 %r6,[u1];                // heads
-    \\  ld.param.u32 %r26,[u4];               // nsplit
-    \\  ld.param.u32 %r30,[u5];               // seq_q
-    \\  mul.lo.s32 %r7,%r6,%r26;              // heads*nsplit warps per query
-    \\  mul.lo.s32 %r31,%r7,%r30;
-    \\  setp.ge.u32 %p1,%r27,%r31; @%p1 bra END;
-    \\  ld.param.u32 %r8,[u2];                // kv_heads
-    \\  ld.param.u32 %r9,[u3];                // hd (=256)
-    \\  ld.param.f32 %f1,[f0];                // scale
-    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2]; ld.param.u64 %rd4,[p3];
-    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3; cvta.to.global.u64 %rd4,%rd4;
-    \\  div.u32 %r31,%r27,%r7;                // query t
-    \\  rem.u32 %r2,%r27,%r7;                 // warp within query
-    \\  add.u32 %r5,%r5,%r31;                 // this query's causal kv len (kv_len0+t)
-    \\  // kv_end: causal by default; bidirectional image block (u7) extends it
-    \\  // to the whole batch (kv_len0+seq_q-1). Window kv_start stays on causal.
-    \\  ld.param.u32 %r44,[u7];               // bidir (0/1)
-    \\  mov.u32 %r45,%r5;                      // kv_end = causal len
-    \\  setp.eq.u32 %p6,%r44,0; @%p6 bra NOBIDIR;
-    \\  add.u32 %r45,%r5,%r30; sub.u32 %r45,%r45,1; sub.u32 %r45,%r45,%r31; // kv_len0+seq_q-1
-    \\NOBIDIR:
-    \\  div.u32 %r10,%r2,%r26;                // h
-    \\  rem.u32 %r21,%r2,%r26;                // split i
-    \\  // Sliding window (f1, 0 = full causal): kv_start = max(0, causal_len - window).
-    \\  ld.param.f32 %f30,[f1]; cvt.rzi.u32.f32 %r11,%f30;
-    \\  mov.u32 %r16,0;                       // kv_start
-    \\  setp.eq.u32 %p4,%r11,0; @%p4 bra NOWIN;
-    \\  setp.le.u32 %p4,%r5,%r11; @%p4 bra NOWIN;
-    \\  sub.u32 %r16,%r5,%r11;                // kv_start = causal_len - window
-    \\NOWIN:
-    \\  sub.u32 %r22,%r45,%r16;               // span = kv_end - kv_start
-    \\  add.u32 %r22,%r22,%r26; sub.u32 %r22,%r22,1; div.u32 %r22,%r22,%r26; // chunk = ceil(span/nsplit)
-    \\  mad.lo.s32 %r17,%r21,%r22,%r16;       // kv0 = kv_start + split_i*chunk
-    \\  add.u32 %r23,%r17,%r22; min.u32 %r23,%r23,%r45; // kv1
-    \\  div.u32 %r12,%r6,%r8;                 // group
-    \\  div.u32 %r13,%r10,%r12;               // kv head
-    \\  // q fragment (f32): q[(t*heads + h)*hd + lane*8 ..][8]
-    \\  mad.lo.s32 %r14,%r31,%r6,%r10; mul.lo.s32 %r14,%r14,%r9; shl.b32 %r15,%r28,3; add.u32 %r14,%r14,%r15;
-    \\  mul.wide.u32 %rd5,%r14,4; add.s64 %rd6,%rd1,%rd5;
-    \\  ld.global.v4.f32 {%f2,%f3,%f4,%f5},[%rd6];
-    \\  ld.global.v4.f32 {%f32,%f33,%f34,%f35},[%rd6+16];
-    \\  mov.f32 %f10,0fFF800000;              // m
-    \\  mov.f32 %f11,0f00000000;              // d
-    \\  mov.f32 %f20,0f00000000; mov.f32 %f21,0f00000000; mov.f32 %f22,0f00000000; mov.f32 %f23,0f00000000;
-    \\  mov.f32 %f40,0f00000000; mov.f32 %f41,0f00000000; mov.f32 %f42,0f00000000; mov.f32 %f43,0f00000000;
-    \\  ld.param.u32 %r32,[u6];              // ring (0 = linear KV addressing)
-    \\JLOOP:
-    \\  setp.ge.u32 %p2,%r17,%r23; @%p2 bra JD;
-    \\  // kv row fragment base (elements): ((jr*kv_heads + kvh)*hd + lane*8), jr = ring ? j%ring : j
-    \\  mov.u32 %r33,%r17;
-    \\  setp.eq.u32 %p5,%r32,0; @%p5 bra ROW256;
-    \\  rem.u32 %r33,%r17,%r32;
-    \\ROW256:
-    \\  mad.lo.s32 %r18,%r33,%r8,%r13; mul.lo.s32 %r18,%r18,%r9; add.u32 %r18,%r18,%r15;
-    \\  mul.wide.u32 %rd9,%r18,2; add.s64 %rd10,%rd2,%rd9;   // f16 K row (*2 stride)
-    \\  ld.global.v4.u32 {%r40,%r41,%r42,%r43},[%rd10];      // 8 halfs
-    \\  mov.b32 {%hs0,%hs1},%r40; cvt.f32.f16 %f24,%hs0; cvt.f32.f16 %f25,%hs1;
-    \\  mov.b32 {%hs0,%hs1},%r41; cvt.f32.f16 %f26,%hs0; cvt.f32.f16 %f27,%hs1;
-    \\  mov.b32 {%hs0,%hs1},%r42; cvt.f32.f16 %f36,%hs0; cvt.f32.f16 %f37,%hs1;
-    \\  mov.b32 {%hs0,%hs1},%r43; cvt.f32.f16 %f38,%hs0; cvt.f32.f16 %f39,%hs1;
-    \\  mul.f32 %f6,%f2,%f24; fma.rn.f32 %f6,%f3,%f25,%f6; fma.rn.f32 %f6,%f4,%f26,%f6; fma.rn.f32 %f6,%f5,%f27,%f6;
-    \\  fma.rn.f32 %f6,%f32,%f36,%f6; fma.rn.f32 %f6,%f33,%f37,%f6; fma.rn.f32 %f6,%f34,%f38,%f6; fma.rn.f32 %f6,%f35,%f39,%f6;
-    \\  // butterfly all-reduce
-    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,16,0x1f,0xffffffff; mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
-    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,8,0x1f,0xffffffff;  mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
-    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,4,0x1f,0xffffffff;  mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
-    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,2,0x1f,0xffffffff;  mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
-    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,1,0x1f,0xffffffff;  mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
-    \\  mul.f32 %f6,%f6,%f1;                  // s
-    \\  max.f32 %f12,%f10,%f6;                // m2
-    \\  sub.f32 %f8,%f10,%f12; mul.f32 %f8,%f8,0f3FB8AA3B; ex2.approx.f32 %f8,%f8;  // corr
-    \\  sub.f32 %f9,%f6,%f12; mul.f32 %f9,%f9,0f3FB8AA3B; ex2.approx.f32 %f9,%f9;   // p
-    \\  mul.f32 %f11,%f11,%f8; add.f32 %f11,%f11,%f9;
-    \\  mov.f32 %f10,%f12;
-    \\  add.s64 %rd11,%rd3,%rd9;              // f16 V fragment (same offsets)
-    \\  ld.global.v4.u32 {%r40,%r41,%r42,%r43},[%rd11];
-    \\  mov.b32 {%hs0,%hs1},%r40; cvt.f32.f16 %f24,%hs0; cvt.f32.f16 %f25,%hs1;
-    \\  mov.b32 {%hs0,%hs1},%r41; cvt.f32.f16 %f26,%hs0; cvt.f32.f16 %f27,%hs1;
-    \\  mov.b32 {%hs0,%hs1},%r42; cvt.f32.f16 %f36,%hs0; cvt.f32.f16 %f37,%hs1;
-    \\  mov.b32 {%hs0,%hs1},%r43; cvt.f32.f16 %f38,%hs0; cvt.f32.f16 %f39,%hs1;
-    \\  mul.f32 %f20,%f20,%f8; fma.rn.f32 %f20,%f9,%f24,%f20;
-    \\  mul.f32 %f21,%f21,%f8; fma.rn.f32 %f21,%f9,%f25,%f21;
-    \\  mul.f32 %f22,%f22,%f8; fma.rn.f32 %f22,%f9,%f26,%f22;
-    \\  mul.f32 %f23,%f23,%f8; fma.rn.f32 %f23,%f9,%f27,%f23;
-    \\  mul.f32 %f40,%f40,%f8; fma.rn.f32 %f40,%f9,%f36,%f40;
-    \\  mul.f32 %f41,%f41,%f8; fma.rn.f32 %f41,%f9,%f37,%f41;
-    \\  mul.f32 %f42,%f42,%f8; fma.rn.f32 %f42,%f9,%f38,%f42;
-    \\  mul.f32 %f43,%f43,%f8; fma.rn.f32 %f43,%f9,%f39,%f43;
-    \\  add.u32 %r17,%r17,1; bra JLOOP;
-    \\JD:
-    \\  // scratch row = warp*(hd+4): lane 0 stores m,d; every lane its acc8 (f32)
-    \\  add.u32 %r24,%r9,4; mul.lo.s32 %r25,%r27,%r24;
-    \\  mul.wide.u32 %rd17,%r25,4; add.s64 %rd18,%rd4,%rd17;
-    \\  setp.ne.u32 %p3,%r28,0; @%p3 bra WRACC;
-    \\  st.global.f32 [%rd18],%f10; st.global.f32 [%rd18+4],%f11;
-    \\WRACC:
-    \\  shl.b32 %r29,%r28,5; add.u32 %r29,%r29,16;   // byte off = 16 + lane*32
-    \\  cvt.u64.u32 %rd19,%r29; add.s64 %rd20,%rd18,%rd19;
-    \\  st.global.v4.f32 [%rd20],{%f20,%f21,%f22,%f23};
-    \\  st.global.v4.f32 [%rd20+16],{%f40,%f41,%f42,%f43};
-    \\END:
-    \\  ret;
-    \\}
-;
+    // --- thread / warp / lane, params, per-query kv_len (causal) + kv_end ---
+    s = s ++
+        \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x;
+        \\  mad.lo.s32 %r4,%r1,%r2,%r3;
+        \\  shr.u32 %r27,%r4,5;                   // warp = idx/32
+        \\  and.b32 %r28,%r4,31;                  // lane
+        \\  ld.param.u32 %r5,[u0];                // kv_len0
+        \\  ld.param.u32 %r6,[u1];                // heads
+        \\  ld.param.u32 %r26,[u4];               // nsplit
+        \\  ld.param.u32 %r30,[u5];               // seq_q
+        \\  mul.lo.s32 %r7,%r6,%r26;              // heads*nsplit warps per query
+        \\  mul.lo.s32 %r31,%r7,%r30;
+        \\  setp.ge.u32 %p1,%r27,%r31; @%p1 bra END;
+        \\  ld.param.u32 %r8,[u2];                // kv_heads
+        \\  ld.param.u32 %r9,[u3];                // hd
+        \\  ld.param.f32 %f1,[f0];                // scale
+        \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2]; ld.param.u64 %rd4,[p3];
+        \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3; cvta.to.global.u64 %rd4,%rd4;
+        \\  div.u32 %r31,%r27,%r7;                // query t
+        \\  rem.u32 %r2,%r27,%r7;                 // warp within query
+        \\  add.u32 %r5,%r5,%r31;                 // causal kv len (kv_len0+t)
+        \\  ld.param.u32 %r34,[u7];               // bidir (0/1)
+        \\  mov.u32 %r35,%r5;                      // kv_end = causal len
+        \\  setp.eq.u32 %p6,%r34,0; @%p6 bra NOBIDIR;
+        \\  add.u32 %r35,%r5,%r30; sub.u32 %r35,%r35,1; sub.u32 %r35,%r35,%r31; // kv_len0+seq_q-1
+        \\NOBIDIR:
+        \\  div.u32 %r10,%r2,%r26;                // h
+        \\  rem.u32 %r21,%r2,%r26;                // split i
+        \\  ld.param.f32 %f9,[f1]; cvt.rzi.u32.f32 %r11,%f9;   // window (0 = full causal)
+        \\  mov.u32 %r16,0;                       // kv_start
+        \\  setp.eq.u32 %p4,%r11,0; @%p4 bra NOWIN;
+        \\  setp.le.u32 %p4,%r5,%r11; @%p4 bra NOWIN;
+        \\  sub.u32 %r16,%r5,%r11;                // kv_start = causal_len - window
+        \\NOWIN:
+        \\  sub.u32 %r22,%r35,%r16;               // span = kv_end - kv_start
+        \\  add.u32 %r22,%r22,%r26; sub.u32 %r22,%r22,1; div.u32 %r22,%r22,%r26; // chunk = ceil(span/nsplit)
+        \\  mad.lo.s32 %r17,%r21,%r22,%r16;       // kv0 = kv_start + split_i*chunk
+        \\  add.u32 %r23,%r17,%r22; min.u32 %r23,%r23,%r35; // kv1
+        \\  div.u32 %r12,%r6,%r8;                 // group
+        \\  div.u32 %r13,%r10,%r12;               // kv head
+        \\
+    ;
 
-/// f16-KV variant of `attn_split_h512` (Gemma 4 GLOBAL layers): each lane owns
-/// 16 dims, loaded as two v4.u32 (2*16 B = 16 halfs) and widened to f32. Q/
-/// scratch/output stay f32; K/V byte stride is *2. Otherwise identical to
-/// attn_split_h512. Lossy vs f32.
-pub const attn_split_h512_f16_ptx: [:0]const u8 =
-    \\.version 8.0
-    \\.target sm_86
-    \\.address_size 64
-    \\.visible .entry attn_split_h512_f16(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
-    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .u32 u6,.param .f32 f0,.param .f32 f1)
-    \\{
-    \\  .reg .pred %p<7>;
-    \\  .reg .b32 %r<50>;
-    \\  .reg .f32 %f<80>;
-    \\  .reg .b16 %hs<2>;
-    \\  .reg .b64 %rd<24>;
-    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x;
-    \\  mad.lo.s32 %r4,%r1,%r2,%r3;
-    \\  shr.u32 %r27,%r4,5;                   // warp
-    \\  and.b32 %r28,%r4,31;                  // lane
-    \\  ld.param.u32 %r5,[u0];                // kv_len0
-    \\  ld.param.u32 %r6,[u1];                // heads
-    \\  ld.param.u32 %r26,[u4];               // nsplit
-    \\  ld.param.u32 %r30,[u5];               // seq_q
-    \\  mul.lo.s32 %r7,%r6,%r26;
-    \\  mul.lo.s32 %r31,%r7,%r30;
-    \\  setp.ge.u32 %p1,%r27,%r31; @%p1 bra END;
-    \\  ld.param.u32 %r8,[u2];                // kv_heads
-    \\  ld.param.u32 %r9,[u3];                // hd (=512)
-    \\  ld.param.f32 %f1,[f0];                // scale
-    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2]; ld.param.u64 %rd4,[p3];
-    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3; cvta.to.global.u64 %rd4,%rd4;
-    \\  div.u32 %r31,%r27,%r7;                // query t
-    \\  rem.u32 %r2,%r27,%r7;
-    \\  add.u32 %r5,%r5,%r31;                 // this query's causal kv len (kv_len0+t)
-    \\  // kv_end: causal by default; bidirectional image block (u6) extends it to
-    \\  // kv_len0+seq_q-1 (global layers are window 0, so kv_start stays 0).
-    \\  ld.param.u32 %r48,[u6];               // bidir (0/1)
-    \\  mov.u32 %r49,%r5;                      // kv_end = causal len
-    \\  setp.eq.u32 %p5,%r48,0; @%p5 bra NOBIDIR;
-    \\  add.u32 %r49,%r5,%r30; sub.u32 %r49,%r49,1; sub.u32 %r49,%r49,%r31; // kv_len0+seq_q-1
-    \\NOBIDIR:
-    \\  div.u32 %r10,%r2,%r26;               // h
-    \\  rem.u32 %r21,%r2,%r26;               // split i
-    \\  ld.param.f32 %f30,[f1]; cvt.rzi.u32.f32 %r11,%f30;
-    \\  mov.u32 %r16,0;                       // kv_start
-    \\  setp.eq.u32 %p4,%r11,0; @%p4 bra NOWIN;
-    \\  setp.le.u32 %p4,%r5,%r11; @%p4 bra NOWIN;
-    \\  sub.u32 %r16,%r5,%r11;
-    \\NOWIN:
-    \\  sub.u32 %r22,%r49,%r16;               // span = kv_end - kv_start
-    \\  add.u32 %r22,%r22,%r26; sub.u32 %r22,%r22,1; div.u32 %r22,%r22,%r26; // chunk = ceil(span/nsplit)
-    \\  mad.lo.s32 %r17,%r21,%r22,%r16;       // kv0
-    \\  add.u32 %r23,%r17,%r22; min.u32 %r23,%r23,%r49; // kv1
-    \\  div.u32 %r12,%r6,%r8;                 // group
-    \\  div.u32 %r13,%r10,%r12;               // kv head
-    \\  // q fragment (f32): q[(t*heads + h)*hd + lane*16 ..][16]
-    \\  mad.lo.s32 %r14,%r31,%r6,%r10; mul.lo.s32 %r14,%r14,%r9; shl.b32 %r15,%r28,4; add.u32 %r14,%r14,%r15;
-    \\  mul.wide.u32 %rd5,%r14,4; add.s64 %rd6,%rd1,%rd5;
-    \\  ld.global.v4.f32 {%f2,%f3,%f4,%f5},[%rd6];
-    \\  ld.global.v4.f32 {%f32,%f33,%f34,%f35},[%rd6+16];
-    \\  ld.global.v4.f32 {%f48,%f49,%f50,%f51},[%rd6+32];
-    \\  ld.global.v4.f32 {%f52,%f53,%f54,%f55},[%rd6+48];
-    \\  mov.f32 %f10,0fFF800000;              // m
-    \\  mov.f32 %f11,0f00000000;              // d
-    \\  mov.f32 %f20,0f00000000; mov.f32 %f21,0f00000000; mov.f32 %f22,0f00000000; mov.f32 %f23,0f00000000;
-    \\  mov.f32 %f40,0f00000000; mov.f32 %f41,0f00000000; mov.f32 %f42,0f00000000; mov.f32 %f43,0f00000000;
-    \\  mov.f32 %f64,0f00000000; mov.f32 %f65,0f00000000; mov.f32 %f66,0f00000000; mov.f32 %f67,0f00000000;
-    \\  mov.f32 %f68,0f00000000; mov.f32 %f69,0f00000000; mov.f32 %f70,0f00000000; mov.f32 %f71,0f00000000;
-    \\JLOOP:
-    \\  setp.ge.u32 %p2,%r17,%r23; @%p2 bra JD;
-    \\  mad.lo.s32 %r18,%r17,%r8,%r13; mul.lo.s32 %r18,%r18,%r9; add.u32 %r18,%r18,%r15;
-    \\  mul.wide.u32 %rd9,%r18,2; add.s64 %rd10,%rd2,%rd9;   // f16 K row (*2 stride)
-    \\  ld.global.v4.u32 {%r40,%r41,%r42,%r43},[%rd10];      // dims 0..7
-    \\  ld.global.v4.u32 {%r44,%r45,%r46,%r47},[%rd10+16];   // dims 8..15
-    \\  mov.b32 {%hs0,%hs1},%r40; cvt.f32.f16 %f24,%hs0; cvt.f32.f16 %f25,%hs1;
-    \\  mov.b32 {%hs0,%hs1},%r41; cvt.f32.f16 %f26,%hs0; cvt.f32.f16 %f27,%hs1;
-    \\  mov.b32 {%hs0,%hs1},%r42; cvt.f32.f16 %f36,%hs0; cvt.f32.f16 %f37,%hs1;
-    \\  mov.b32 {%hs0,%hs1},%r43; cvt.f32.f16 %f38,%hs0; cvt.f32.f16 %f39,%hs1;
-    \\  mov.b32 {%hs0,%hs1},%r44; cvt.f32.f16 %f56,%hs0; cvt.f32.f16 %f57,%hs1;
-    \\  mov.b32 {%hs0,%hs1},%r45; cvt.f32.f16 %f58,%hs0; cvt.f32.f16 %f59,%hs1;
-    \\  mov.b32 {%hs0,%hs1},%r46; cvt.f32.f16 %f60,%hs0; cvt.f32.f16 %f61,%hs1;
-    \\  mov.b32 {%hs0,%hs1},%r47; cvt.f32.f16 %f62,%hs0; cvt.f32.f16 %f63,%hs1;
-    \\  mul.f32 %f6,%f2,%f24; fma.rn.f32 %f6,%f3,%f25,%f6; fma.rn.f32 %f6,%f4,%f26,%f6; fma.rn.f32 %f6,%f5,%f27,%f6;
-    \\  fma.rn.f32 %f6,%f32,%f36,%f6; fma.rn.f32 %f6,%f33,%f37,%f6; fma.rn.f32 %f6,%f34,%f38,%f6; fma.rn.f32 %f6,%f35,%f39,%f6;
-    \\  fma.rn.f32 %f6,%f48,%f56,%f6; fma.rn.f32 %f6,%f49,%f57,%f6; fma.rn.f32 %f6,%f50,%f58,%f6; fma.rn.f32 %f6,%f51,%f59,%f6;
-    \\  fma.rn.f32 %f6,%f52,%f60,%f6; fma.rn.f32 %f6,%f53,%f61,%f6; fma.rn.f32 %f6,%f54,%f62,%f6; fma.rn.f32 %f6,%f55,%f63,%f6;
-    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,16,0x1f,0xffffffff; mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
-    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,8,0x1f,0xffffffff;  mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
-    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,4,0x1f,0xffffffff;  mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
-    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,2,0x1f,0xffffffff;  mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
-    \\  mov.b32 %r19,%f6; shfl.sync.bfly.b32 %r20,%r19,1,0x1f,0xffffffff;  mov.b32 %f7,%r20; add.f32 %f6,%f6,%f7;
-    \\  mul.f32 %f6,%f6,%f1;                  // s
-    \\  max.f32 %f12,%f10,%f6;                // m2
-    \\  sub.f32 %f8,%f10,%f12; mul.f32 %f8,%f8,0f3FB8AA3B; ex2.approx.f32 %f8,%f8;  // corr
-    \\  sub.f32 %f9,%f6,%f12; mul.f32 %f9,%f9,0f3FB8AA3B; ex2.approx.f32 %f9,%f9;   // p
-    \\  mul.f32 %f11,%f11,%f8; add.f32 %f11,%f11,%f9;
-    \\  mov.f32 %f10,%f12;
-    \\  add.s64 %rd11,%rd3,%rd9;              // f16 V fragment
-    \\  ld.global.v4.u32 {%r40,%r41,%r42,%r43},[%rd11];
-    \\  ld.global.v4.u32 {%r44,%r45,%r46,%r47},[%rd11+16];
-    \\  mov.b32 {%hs0,%hs1},%r40; cvt.f32.f16 %f24,%hs0; cvt.f32.f16 %f25,%hs1;
-    \\  mov.b32 {%hs0,%hs1},%r41; cvt.f32.f16 %f26,%hs0; cvt.f32.f16 %f27,%hs1;
-    \\  mov.b32 {%hs0,%hs1},%r42; cvt.f32.f16 %f36,%hs0; cvt.f32.f16 %f37,%hs1;
-    \\  mov.b32 {%hs0,%hs1},%r43; cvt.f32.f16 %f38,%hs0; cvt.f32.f16 %f39,%hs1;
-    \\  mov.b32 {%hs0,%hs1},%r44; cvt.f32.f16 %f56,%hs0; cvt.f32.f16 %f57,%hs1;
-    \\  mov.b32 {%hs0,%hs1},%r45; cvt.f32.f16 %f58,%hs0; cvt.f32.f16 %f59,%hs1;
-    \\  mov.b32 {%hs0,%hs1},%r46; cvt.f32.f16 %f60,%hs0; cvt.f32.f16 %f61,%hs1;
-    \\  mov.b32 {%hs0,%hs1},%r47; cvt.f32.f16 %f62,%hs0; cvt.f32.f16 %f63,%hs1;
-    \\  mul.f32 %f20,%f20,%f8; fma.rn.f32 %f20,%f9,%f24,%f20;
-    \\  mul.f32 %f21,%f21,%f8; fma.rn.f32 %f21,%f9,%f25,%f21;
-    \\  mul.f32 %f22,%f22,%f8; fma.rn.f32 %f22,%f9,%f26,%f22;
-    \\  mul.f32 %f23,%f23,%f8; fma.rn.f32 %f23,%f9,%f27,%f23;
-    \\  mul.f32 %f40,%f40,%f8; fma.rn.f32 %f40,%f9,%f36,%f40;
-    \\  mul.f32 %f41,%f41,%f8; fma.rn.f32 %f41,%f9,%f37,%f41;
-    \\  mul.f32 %f42,%f42,%f8; fma.rn.f32 %f42,%f9,%f38,%f42;
-    \\  mul.f32 %f43,%f43,%f8; fma.rn.f32 %f43,%f9,%f39,%f43;
-    \\  mul.f32 %f64,%f64,%f8; fma.rn.f32 %f64,%f9,%f56,%f64;
-    \\  mul.f32 %f65,%f65,%f8; fma.rn.f32 %f65,%f9,%f57,%f65;
-    \\  mul.f32 %f66,%f66,%f8; fma.rn.f32 %f66,%f9,%f58,%f66;
-    \\  mul.f32 %f67,%f67,%f8; fma.rn.f32 %f67,%f9,%f59,%f67;
-    \\  mul.f32 %f68,%f68,%f8; fma.rn.f32 %f68,%f9,%f60,%f68;
-    \\  mul.f32 %f69,%f69,%f8; fma.rn.f32 %f69,%f9,%f61,%f69;
-    \\  mul.f32 %f70,%f70,%f8; fma.rn.f32 %f70,%f9,%f62,%f70;
-    \\  mul.f32 %f71,%f71,%f8; fma.rn.f32 %f71,%f9,%f63,%f71;
-    \\  add.u32 %r17,%r17,1; bra JLOOP;
-    \\JD:
-    \\  add.u32 %r24,%r9,4; mul.lo.s32 %r25,%r27,%r24;   // scratch row = warp*(hd+4)
-    \\  mul.wide.u32 %rd17,%r25,4; add.s64 %rd18,%rd4,%rd17;
-    \\  setp.ne.u32 %p3,%r28,0; @%p3 bra WRACC;
-    \\  st.global.f32 [%rd18],%f10; st.global.f32 [%rd18+4],%f11;
-    \\WRACC:
-    \\  shl.b32 %r29,%r28,6; add.u32 %r29,%r29,16;   // byte off = 16 + lane*64
-    \\  cvt.u64.u32 %rd19,%r29; add.s64 %rd20,%rd18,%rd19;
-    \\  st.global.v4.f32 [%rd20],{%f20,%f21,%f22,%f23};
-    \\  st.global.v4.f32 [%rd20+16],{%f40,%f41,%f42,%f43};
-    \\  st.global.v4.f32 [%rd20+32],{%f64,%f65,%f66,%f67};
-    \\  st.global.v4.f32 [%rd20+48],{%f68,%f69,%f70,%f71};
-    \\END:
-    \\  ret;
-    \\}
-;
+    // --- Q fragment load: (t*heads+h)*hd + lane*dims elements, dims f32 ---
+    s = s ++ cp("  mad.lo.s32 %r14,%r31,%r6,%r10; mul.lo.s32 %r14,%r14,%r9; shl.b32 %r15,%r28,{d}; add.u32 %r14,%r14,%r15;\n", .{qshl});
+    s = s ++ "  mul.wide.u32 %rd5,%r14,4; add.s64 %rd6,%rd1,%rd5;\n";
+    inline for (0..dims / 4) |L| {
+        s = s ++ cp("  ld.global.v4.f32 {{%f{d},%f{d},%f{d},%f{d}}},[%rd6+{d}];\n", .{ QB + L * 4, QB + L * 4 + 1, QB + L * 4 + 2, QB + L * 4 + 3, L * 16 });
+    }
+
+    // --- online-softmax accumulators: m=%f6, d=%f7, acc=[AB..AB+dims) ---
+    s = s ++ "  mov.f32 %f6,0fFF800000;              // m\n  mov.f32 %f7,0f00000000;              // d\n";
+    inline for (0..dims) |dd| s = s ++ cp("  mov.f32 %f{d},0f00000000;\n", .{AB + dd});
+    s = s ++ "  ld.param.u32 %r32,[u6];              // ring (0 = linear KV addressing)\n";
+
+    // --- KV loop ---
+    s = s ++
+        \\JLOOP:
+        \\  setp.ge.u32 %p2,%r17,%r23; @%p2 bra JD;
+        \\  mov.u32 %r33,%r17;
+        \\  setp.eq.u32 %p5,%r32,0; @%p5 bra ROWJ;
+        \\  rem.u32 %r33,%r17,%r32;               // ring wrap: j % ring
+        \\ROWJ:
+        \\  mad.lo.s32 %r18,%r33,%r8,%r13; mul.lo.s32 %r18,%r18,%r9; add.u32 %r18,%r18,%r15;
+        \\
+    ;
+    const kv_stride = if (is_f16) 2 else 4;
+    s = s ++ cp("  mul.wide.u32 %rd9,%r18,{d}; add.s64 %rd10,%rd2,%rd9;\n", .{kv_stride});
+    s = s ++ emitKVLoad(is_f16, dims, KB, "%rd10");
+
+    // --- dot(q, k) into %f2, then butterfly all-reduce across the 32 lanes ---
+    s = s ++ cp("  mul.f32 %f2,%f{d},%f{d};", .{ QB, KB });
+    inline for (1..dims) |dd| s = s ++ cp(" fma.rn.f32 %f2,%f{d},%f{d},%f2;", .{ QB + dd, KB + dd });
+    s = s ++ "\n";
+    inline for ([_]u32{ 16, 8, 4, 2, 1 }) |off| {
+        s = s ++ cp("  mov.b32 %r19,%f2; shfl.sync.bfly.b32 %r20,%r19,{d},0x1f,0xffffffff; mov.b32 %f3,%r20; add.f32 %f2,%f2,%f3;\n", .{off});
+    }
+
+    // --- online softmax update (m=%f6, d=%f7, m2=%f8, corr=%f4, p=%f5) ---
+    s = s ++
+        \\  mul.f32 %f2,%f2,%f1;                  // s = dot*scale
+        \\  max.f32 %f8,%f6,%f2;                  // m2
+        \\  sub.f32 %f4,%f6,%f8; mul.f32 %f4,%f4,0f3FB8AA3B; ex2.approx.f32 %f4,%f4;  // corr
+        \\  sub.f32 %f5,%f2,%f8; mul.f32 %f5,%f5,0f3FB8AA3B; ex2.approx.f32 %f5,%f5;  // p
+        \\  mul.f32 %f7,%f7,%f4; add.f32 %f7,%f7,%f5;   // d = d*corr + p
+        \\  mov.f32 %f6,%f8;                      // m = m2
+        \\
+    ;
+
+    // --- V load (same row offsets, base rd3) then acc = acc*corr + p*v ---
+    s = s ++ "  add.s64 %rd11,%rd3,%rd9;\n";
+    s = s ++ emitKVLoad(is_f16, dims, KB, "%rd11");
+    inline for (0..dims) |dd| {
+        s = s ++ cp("  mul.f32 %f{d},%f{d},%f4; fma.rn.f32 %f{d},%f5,%f{d},%f{d};\n", .{ AB + dd, AB + dd, AB + dd, KB + dd, AB + dd });
+    }
+    s = s ++ "  add.u32 %r17,%r17,1; bra JLOOP;\n";
+
+    // --- store partials: scratch row = warp*(hd+4); lane 0 writes m,d ---
+    s = s ++
+        \\JD:
+        \\  add.u32 %r24,%r9,4; mul.lo.s32 %r25,%r27,%r24;
+        \\  mul.wide.u32 %rd17,%r25,4; add.s64 %rd18,%rd4,%rd17;
+        \\  setp.ne.u32 %p3,%r28,0; @%p3 bra WRACC;
+        \\  st.global.f32 [%rd18],%f6; st.global.f32 [%rd18+4],%f7;   // m, d
+        \\WRACC:
+        \\
+    ;
+    s = s ++ cp("  shl.b32 %r29,%r28,{d}; add.u32 %r29,%r29,16;   // byte off = 16 + lane*dims*4\n", .{sshl});
+    s = s ++ "  cvt.u64.u32 %rd19,%r29; add.s64 %rd20,%rd18,%rd19;\n";
+    inline for (0..dims / 4) |L| {
+        s = s ++ cp("  st.global.v4.f32 [%rd20+{d}],{{%f{d},%f{d},%f{d},%f{d}}};\n", .{ L * 16, AB + L * 4, AB + L * 4 + 1, AB + L * 4 + 2, AB + L * 4 + 3 });
+    }
+    s = s ++ "END:\n  ret;\n}\n";
+
+    return (s ++ [_]u8{0})[0..s.len :0];
+}
+
+/// Emit the load of `dims` head-dim f32 values into registers [base..base+dims)
+/// from the global address in `addr`. f32 reads v4.f32 (4 dims/load); f16 reads
+/// v4.u32 (8 packed halfs/load) and widens each with cvt.f32.f16.
+fn emitKVLoad(comptime is_f16: bool, comptime dims: u32, comptime base: u32, comptime addr: []const u8) []const u8 {
+    const cp = std.fmt.comptimePrint;
+    comptime var s: []const u8 = "";
+    if (is_f16) {
+        inline for (0..dims / 8) |L| {
+            s = s ++ cp("  ld.global.v4.u32 {{%r40,%r41,%r42,%r43}},[{s}+{d}];\n", .{ addr, L * 16 });
+            inline for (0..4) |w| {
+                const d0 = base + L * 8 + w * 2;
+                s = s ++ cp("  mov.b32 {{%hs0,%hs1}},%r{d}; cvt.f32.f16 %f{d},%hs0; cvt.f32.f16 %f{d},%hs1;\n", .{ 40 + w, d0, d0 + 1 });
+            }
+        }
+    } else {
+        inline for (0..dims / 4) |L| {
+            s = s ++ cp("  ld.global.v4.f32 {{%f{d},%f{d},%f{d},%f{d}}},[{s}+{d}];\n", .{ base + L * 4, base + L * 4 + 1, base + L * 4 + 2, base + L * 4 + 3, addr, L * 16 });
+        }
+    }
+    return s;
+}
+
+pub const attn_split_h256_ptx = genAttnSplit(256, false);
+pub const attn_split_h512_ptx = genAttnSplit(512, false);
+pub const attn_split_h256_f16_ptx = genAttnSplit(256, true);
+pub const attn_split_h512_f16_ptx = genAttnSplit(512, true);
 
 /// Multi-input fp8 GEMV (speculative-decode verify / short prefills):
 /// y[i][row] = scale * dot(W[row], x_i) for n <= 4 input vectors. One block
