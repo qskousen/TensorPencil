@@ -140,22 +140,27 @@ pub fn generate(
     }
     // Greedy on a GPU backend that exposes stepArgmax: pick the token on-device
     // and download just the id, skipping the full ~vocab logit transfer + host
-    // argmax each step. Only when there's no repetition penalty (which would
-    // need the full logits) — the default greedy case.
+    // argmax each step.
     {
         const M = switch (@typeInfo(@TypeOf(model))) {
             .pointer => |p| p.child,
             else => @TypeOf(model),
         };
-        // No repetition penalty in the GPU paths yet — it needs the full logits;
-        // when it's on, fall through to the download + CPU-sample path.
-        if (opts.sampling.repeat_penalty == 1.0) {
-            if (opts.sampling.temperature <= 0) {
-                if (comptime @hasDecl(M, "stepArgmax"))
+        // Recent-window penalties (repetition/presence/frequency) modify the
+        // full logits. Steppers exposing the *Pen variants scatter them
+        // on-device (opPenalize) so the GPU sampling paths survive a penalty;
+        // anything else falls through to the download + CPU-sample path while
+        // one is active. min-p and top-p never need a fallback: they are
+        // prefix cuts inside the shared distFromSorted tail.
+        const pen_on = opts.sampling.penaltiesActive();
+        if (opts.sampling.temperature <= 0) {
+            if (comptime @hasDecl(M, "stepArgmax")) {
+                if (!pen_on or comptime @hasDecl(M, "stepArgmaxPen"))
                     return generateGreedyArgmax(model, tok, io, gpa, ids, opts, out);
-            } else if (comptime @hasDecl(M, "stepSelect")) {
-                return generateGpuSample(model, tok, io, gpa, ids, opts, out);
             }
+        } else if (comptime @hasDecl(M, "stepSelect")) {
+            if (!pen_on or comptime @hasDecl(M, "stepSelectPen"))
+                return generateGpuSample(model, tok, io, gpa, ids, opts, out);
         }
     }
 
@@ -200,10 +205,37 @@ pub fn generate(
     return n;
 }
 
+/// Dispatch to the model's penalized stepper variant when it has one (the
+/// penalties are scattered onto the device logits before the argmax); with an
+/// empty entry list the two variants are identical. generate()'s dispatch only
+/// routes active penalties to models exposing the Pen variants, so the plain
+/// fallback here never drops a penalty.
+fn stepArgmaxOf(model: anytype, io: std.Io, new: []const u32, pen: []const sample.PenaltyEntry, sp: sample.Params) !u32 {
+    const M = switch (@typeInfo(@TypeOf(model))) {
+        .pointer => |p| p.child,
+        else => @TypeOf(model),
+    };
+    if (comptime @hasDecl(M, "stepArgmaxPen")) return model.stepArgmaxPen(io, new, pen, sp);
+    std.debug.assert(pen.len == 0);
+    return model.stepArgmax(io, new);
+}
+
+/// stepSelect twin of `stepArgmaxOf`.
+fn stepSelectOf(model: anytype, io: std.Io, new: []const u32, pen: []const sample.PenaltyEntry, sp: sample.Params, out_id: []u32, out_logit: []f32) !usize {
+    const M = switch (@typeInfo(@TypeOf(model))) {
+        .pointer => |p| p.child,
+        else => @TypeOf(model),
+    };
+    if (comptime @hasDecl(M, "stepSelectPen")) return model.stepSelectPen(io, new, pen, sp, out_id, out_logit);
+    std.debug.assert(pen.len == 0);
+    return model.stepSelect(io, new, out_id, out_logit);
+}
+
 /// Greedy generation via on-device argmax (`model.stepArgmax`): no host logits
 /// buffer, no per-step vocab download — just the sampled id comes back. Emits
 /// identical tokens to the full-vocab greedy path (both are argmax, lowest
-/// index on ties).
+/// index on ties). Active penalties ride along as a per-token entry upload to
+/// the device penalize kernel (same window the CPU path scans: `ids` so far).
 fn generateGreedyArgmax(
     model: anytype,
     tok: *const Tokenizer,
@@ -214,10 +246,11 @@ fn generateGreedyArgmax(
     out: ?*std.Io.Writer,
 ) !usize {
     var stream: Utf8Stream = .{};
+    var pen_buf: [sample.max_penalty_window]sample.PenaltyEntry = undefined;
     const new = ids.items[model.cached()..];
     if (new.len == 0) return error.ContextFull;
     try ensureRoom(model, new.len);
-    var next = try model.stepArgmax(io, new);
+    var next = try stepArgmaxOf(model, io, new, sample.collectPenalties(ids.items, opts.sampling, &pen_buf), opts.sampling);
     var n: usize = 0;
     while (n < opts.max_new_tokens) {
         if (opts.residency_poll) |rp| rp.apply(rp.ctx); // enact any arbiter-published VRAM target on this thread
@@ -239,15 +272,18 @@ fn generateGreedyArgmax(
                 return err;
             };
         }
-        next = try model.stepArgmax(io, &.{next});
+        next = try stepArgmaxOf(model, io, &.{next}, sample.collectPenalties(ids.items, opts.sampling, &pen_buf), opts.sampling);
     }
     return n;
 }
 
 /// Stochastic generation via on-device top-k (`model.stepSelect`): the device
 /// selects the top-k candidates and returns just those (id,logit) pairs; the
-/// CPU Sampler runs the identical softmax/top-p/RNG tail over them (bit-identical
-/// to the full-vocab path for the same logits + seed). No per-step vocab download.
+/// CPU Sampler runs the identical softmax/min-p/top-p/RNG tail over them
+/// (bit-identical to the full-vocab path for the same logits + seed). No
+/// per-step vocab download. Active penalties are scattered onto the device
+/// logits BEFORE the top-k (stepSelectPen), so the candidates are the true
+/// post-penalty top set and the CPU tail never re-applies them.
 fn generateGpuSample(
     model: anytype,
     tok: *const Tokenizer,
@@ -267,10 +303,11 @@ fn generateGpuSample(
 
     var sampler = sample.Sampler.init(opts.sampling, opts.seed);
     var stream: Utf8Stream = .{};
+    var pen_buf: [sample.max_penalty_window]sample.PenaltyEntry = undefined;
     const new = ids.items[model.cached()..];
     if (new.len == 0) return error.ContextFull;
     try ensureRoom(model, new.len);
-    var count = try model.stepSelect(io, new, out_id, out_logit);
+    var count = try stepSelectOf(model, io, new, sample.collectPenalties(ids.items, opts.sampling, &pen_buf), opts.sampling, out_id, out_logit);
     var n: usize = 0;
     while (n < opts.max_new_tokens) {
         if (opts.residency_poll) |rp| rp.apply(rp.ctx); // enact any arbiter-published VRAM target on this thread
@@ -294,7 +331,7 @@ fn generateGpuSample(
                 return err;
             };
         }
-        count = try model.stepSelect(io, &.{next}, out_id, out_logit);
+        count = try stepSelectOf(model, io, &.{next}, sample.collectPenalties(ids.items, opts.sampling, &pen_buf), opts.sampling, out_id, out_logit);
     }
     return n;
 }

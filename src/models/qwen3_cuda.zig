@@ -20,6 +20,7 @@ const safetensors = @import("../safetensors.zig");
 const ops = @import("../ops.zig");
 const spec = @import("../llm/spec.zig");
 const kvmod = @import("../llm/kv_cache.zig");
+const sample = @import("../llm/sample.zig");
 const transformer = @import("transformer.zig");
 const transformer_gpu = @import("transformer_gpu.zig");
 
@@ -696,11 +697,18 @@ pub const CudaLM = struct {
     /// last position's logits on-device and return just that token id. Mirrors
     /// `step`'s graph/chunk dispatch. Matches sample.argmax (temperature 0).
     pub fn stepArgmax(self: *CudaLM, io: std.Io, ids: []const u32) !u32 {
+        return self.stepArgmaxPen(io, ids, &.{}, .{});
+    }
+
+    /// `stepArgmax` with sampling penalties scattered onto the device logits
+    /// first (opPenalize; see llm/sample.zig) — keeps penalized greedy decode
+    /// on the GPU path instead of the full-vocab download.
+    pub fn stepArgmaxPen(self: *CudaLM, io: std.Io, ids: []const u32, pen: []const sample.PenaltyEntry, sp: sample.Params) !u32 {
         if (self.be.evictions != 0) self.graph_ok = false;
         if (ids.len == 1 and self.graph_ok and !self.be.profile) {
             if (self.decode_warm) {
                 try self.stepDecodeGraph(io, ids[0], null);
-                return self.argmaxLogits();
+                return self.argmaxLogits(pen, sp);
             }
             self.decode_warm = true;
         }
@@ -710,12 +718,13 @@ pub const CudaLM = struct {
             try self.stepChunk(io, ids[off..][0..n], null);
             off += n;
         }
-        return self.argmaxLogits();
+        return self.argmaxLogits(pen, sp);
     }
 
-    fn argmaxLogits(self: *CudaLM) !u32 {
+    fn argmaxLogits(self: *CudaLM, pen: []const sample.PenaltyEntry, sp: sample.Params) !u32 {
         const be = self.be;
         const b = &self.bufs;
+        try be.opPenalize(offsetBufSized(b.logits, 0, qwen3.vocab_size * 4), pen, sp);
         try be.opArgmax(offsetBufSized(b.logits, 0, qwen3.vocab_size * 4), qwen3.vocab_size, b.argmax_out, &b.argmax_v, &b.argmax_i);
         var id_f: [1]f32 = undefined;
         try be.tensorDownload(b.argmax_out, std.mem.sliceAsBytes(&id_f));
@@ -732,6 +741,13 @@ pub const CudaLM = struct {
     /// just those (id,logit) pairs (a few KB vs the ~608 KB vocab). Returns the
     /// candidate count; the engine's Sampler finishes on the CPU over this set.
     pub fn stepSelect(self: *CudaLM, io: std.Io, ids: []const u32, out_id: []u32, out_logit: []f32) !usize {
+        return self.stepSelectPen(io, ids, &.{}, .{}, out_id, out_logit);
+    }
+
+    /// `stepSelect` with sampling penalties scattered onto the device logits
+    /// before the top-k (opPenalize) — the selected candidates are the true
+    /// post-penalty top set, so penalized stochastic decode stays on the GPU.
+    pub fn stepSelectPen(self: *CudaLM, io: std.Io, ids: []const u32, pen: []const sample.PenaltyEntry, sp: sample.Params, out_id: []u32, out_logit: []f32) !usize {
         if (self.be.evictions != 0) self.graph_ok = false;
         if (ids.len == 1 and self.graph_ok and !self.be.profile and self.decode_warm) {
             try self.stepDecodeGraph(io, ids[0], null);
@@ -746,6 +762,7 @@ pub const CudaLM = struct {
         }
         const be = self.be;
         const b = &self.bufs;
+        try be.opPenalize(offsetBufSized(b.logits, 0, qwen3.vocab_size * 4), pen, sp);
         const count = try be.opTopK(offsetBufSized(b.logits, 0, qwen3.vocab_size * 4), qwen3.vocab_size, &b.topk_v, &b.topk_i);
         std.debug.assert(count <= out_id.len and count <= out_logit.len);
         try be.tensorDownload(b.topk_v, std.mem.sliceAsBytes(out_logit[0..count]));

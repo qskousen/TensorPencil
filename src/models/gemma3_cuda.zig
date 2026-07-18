@@ -22,6 +22,7 @@ const qwen3 = @import("qwen3.zig");
 const cuda = @import("../gpu/cuda.zig");
 const ops = @import("../ops.zig");
 const kvmod = @import("../llm/kv_cache.zig");
+const sample = @import("../llm/sample.zig");
 const residency = @import("residency.zig");
 const transformer = @import("transformer.zig");
 const transformer_gpu = @import("transformer_gpu.zig");
@@ -670,9 +671,17 @@ pub const CudaLM = struct {
     /// Greedy decode: forward, then argmax the last logits on-device, returning
     /// just the id. Matches sample.argmax.
     pub fn stepArgmax(self: *CudaLM, io: std.Io, ids: []const u32) !u32 {
+        return self.stepArgmaxPen(io, ids, &.{}, .{});
+    }
+
+    /// `stepArgmax` with sampling penalties scattered onto the device logits
+    /// first (opPenalize; see llm/sample.zig) — keeps penalized greedy decode
+    /// on the GPU path instead of the full-vocab download.
+    pub fn stepArgmaxPen(self: *CudaLM, io: std.Io, ids: []const u32, pen: []const sample.PenaltyEntry, sp: sample.Params) !u32 {
         try self.forwardDecode(io, ids, null);
         const be = self.be;
         const b = &self.bufs;
+        try be.opPenalize(offsetBufSized(b.logits, 0, self.cfg.vocab * 4), pen, sp);
         try be.opArgmax(offsetBufSized(b.logits, 0, self.cfg.vocab * 4), self.cfg.vocab, b.argmax_out, &b.argmax_v, &b.argmax_i);
         var idf: [1]f32 = undefined;
         try be.tensorDownload(b.argmax_out, std.mem.sliceAsBytes(&idf));
@@ -688,9 +697,17 @@ pub const CudaLM = struct {
     /// Stochastic decode: forward, select the top-k on-device, download just
     /// those (id,logit) pairs. Returns the candidate count.
     pub fn stepSelect(self: *CudaLM, io: std.Io, ids: []const u32, out_id: []u32, out_logit: []f32) !usize {
+        return self.stepSelectPen(io, ids, &.{}, .{}, out_id, out_logit);
+    }
+
+    /// `stepSelect` with sampling penalties scattered onto the device logits
+    /// before the top-k (opPenalize) — the selected candidates are the true
+    /// post-penalty top set, so penalized stochastic decode stays on the GPU.
+    pub fn stepSelectPen(self: *CudaLM, io: std.Io, ids: []const u32, pen: []const sample.PenaltyEntry, sp: sample.Params, out_id: []u32, out_logit: []f32) !usize {
         try self.forwardDecode(io, ids, null);
         const be = self.be;
         const b = &self.bufs;
+        try be.opPenalize(offsetBufSized(b.logits, 0, self.cfg.vocab * 4), pen, sp);
         const count = try be.opTopK(offsetBufSized(b.logits, 0, self.cfg.vocab * 4), self.cfg.vocab, &b.topk_v, &b.topk_i);
         std.debug.assert(count <= out_id.len and count <= out_logit.len);
         try be.tensorDownload(b.topk_v, std.mem.sliceAsBytes(out_logit[0..count]));

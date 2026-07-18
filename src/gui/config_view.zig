@@ -24,6 +24,17 @@ var seeded: bool = false;
 var steps_buf: [16]u8 = [_]u8{0} ** 16;
 var width_buf: [16]u8 = [_]u8{0} ** 16;
 var height_buf: [16]u8 = [_]u8{0} ** 16;
+// LLM sampling controls (same text-buffer pattern; floats parse on commit).
+var temp_buf: [16]u8 = [_]u8{0} ** 16;
+var topk_buf: [16]u8 = [_]u8{0} ** 16;
+var topp_buf: [16]u8 = [_]u8{0} ** 16;
+var minp_buf: [16]u8 = [_]u8{0} ** 16;
+var rpen_buf: [16]u8 = [_]u8{0} ** 16;
+var rlast_buf: [16]u8 = [_]u8{0} ** 16;
+var ppen_buf: [16]u8 = [_]u8{0} ** 16;
+var fpen_buf: [16]u8 = [_]u8{0} ** 16;
+// Preset name entry (save/load/delete target in the sampling section).
+var preset_name_buf: [config.max_preset_name]u8 = [_]u8{0} ** config.max_preset_name;
 
 const gguf_filters = [_][]const u8{"*.gguf"};
 const safetensors_filters = [_][]const u8{"*.safetensors"};
@@ -37,12 +48,32 @@ fn seed(cfg: *const config.Config) void {
     _ = std.fmt.bufPrintZ(&steps_buf, "{d}", .{cfg.steps}) catch {};
     _ = std.fmt.bufPrintZ(&width_buf, "{d}", .{cfg.width}) catch {};
     _ = std.fmt.bufPrintZ(&height_buf, "{d}", .{cfg.height}) catch {};
+    seedSampling(cfg);
     seeded = true;
+}
+
+/// Reseed just the sampling buffers from the config — also used when a preset
+/// is loaded (the studio numeric buffers keep their in-progress edits).
+fn seedSampling(cfg: *const config.Config) void {
+    const s = &cfg.sampling;
+    _ = std.fmt.bufPrintZ(&temp_buf, "{d}", .{s.temperature}) catch {};
+    _ = std.fmt.bufPrintZ(&topk_buf, "{d}", .{s.top_k}) catch {};
+    _ = std.fmt.bufPrintZ(&topp_buf, "{d}", .{s.top_p}) catch {};
+    _ = std.fmt.bufPrintZ(&minp_buf, "{d}", .{s.min_p}) catch {};
+    _ = std.fmt.bufPrintZ(&rpen_buf, "{d}", .{s.repeat_penalty}) catch {};
+    _ = std.fmt.bufPrintZ(&rlast_buf, "{d}", .{s.repeat_last_n}) catch {};
+    _ = std.fmt.bufPrintZ(&ppen_buf, "{d}", .{s.presence_penalty}) catch {};
+    _ = std.fmt.bufPrintZ(&fpen_buf, "{d}", .{s.frequency_penalty}) catch {};
 }
 
 fn parseNum(buf: []const u8, fallback: usize) usize {
     const s = std.mem.trim(u8, std.mem.sliceTo(buf, 0), " \t\r");
     return std.fmt.parseInt(usize, s, 10) catch fallback;
+}
+
+fn parseFloatBuf(buf: []const u8, fallback: f32) f32 {
+    const s = std.mem.trim(u8, std.mem.sliceTo(buf, 0), " \t\r");
+    return std.fmt.parseFloat(f32, s) catch fallback;
 }
 
 /// Round to a multiple of 16 within the pipeline's supported range.
@@ -56,6 +87,23 @@ fn commitNumbers(cfg: *config.Config) void {
     cfg.steps = std.math.clamp(parseNum(&steps_buf, cfg.steps), 1, 100);
     cfg.width = clampDim(parseNum(&width_buf, cfg.width));
     cfg.height = clampDim(parseNum(&height_buf, cfg.height));
+    commitSampling(cfg);
+}
+
+/// Read the sampling edit buffers back into the config, clamped to sane ranges
+/// (the library additionally caps top_k at its candidate limit and the penalty
+/// window at max_penalty_window). Also called when saving a preset, so the
+/// preset stores what the controls will actually run with.
+fn commitSampling(cfg: *config.Config) void {
+    const s = &cfg.sampling;
+    s.temperature = std.math.clamp(parseFloatBuf(&temp_buf, s.temperature), 0, 5);
+    s.top_k = @min(parseNum(&topk_buf, s.top_k), 512);
+    s.top_p = std.math.clamp(parseFloatBuf(&topp_buf, s.top_p), 0, 1);
+    s.min_p = std.math.clamp(parseFloatBuf(&minp_buf, s.min_p), 0, 1);
+    s.repeat_penalty = std.math.clamp(parseFloatBuf(&rpen_buf, s.repeat_penalty), 0.1, 8);
+    s.repeat_last_n = @min(parseNum(&rlast_buf, s.repeat_last_n), 2048);
+    s.presence_penalty = std.math.clamp(parseFloatBuf(&ppen_buf, s.presence_penalty), -10, 10);
+    s.frequency_penalty = std.math.clamp(parseFloatBuf(&fpen_buf, s.frequency_penalty), -10, 10);
 }
 
 pub fn render(cfg: *config.Config, cb: Callbacks) void {
@@ -148,6 +196,23 @@ pub fn render(cfg: *config.Config, cb: Callbacks) void {
         _ = dvui.dropdownEnum(@src(), config.Backend, .{ .choice = &cfg.diff_backend }, .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 200 } });
     }
 
+    section(25, "LLM sampling");
+    help(5, "How the chat model picks each token. Changes apply on the NEXT reply " ++
+        "(no reload). Temperature 0 is greedy; top-k / top-p / min-p trim the " ++
+        "candidate pool. The penalties discourage tokens already in the recent " ++
+        "window (llama.cpp semantics; while any penalty is active, GPU backends " ++
+        "take a slower CPU-sampling path). Save the current values under a name " ++
+        "to reuse them; presets persist with the settings on Apply.");
+    presetRow(cfg);
+    numRow(40, "Temperature", &temp_buf);
+    numRow(41, "Top-k (0 = off)", &topk_buf);
+    numRow(42, "Top-p (1 = off)", &topp_buf);
+    numRow(43, "Min-p (0 = off)", &minp_buf);
+    numRow(44, "Repeat penalty (1 = off)", &rpen_buf);
+    numRow(45, "Penalty window (tokens)", &rlast_buf);
+    numRow(46, "Presence penalty (0 = off)", &ppen_buf);
+    numRow(47, "Frequency penalty (0 = off)", &fpen_buf);
+
     section(22, "VRAM & performance");
     help(2, "VRAM sharing between the chat model and image generation is controlled " ++
         "live from the meter in the status bar: drag the split handle to set each " ++
@@ -165,6 +230,49 @@ pub fn render(cfg: *config.Config, cb: Callbacks) void {
             .multiline = true,
         }, .{ .expand = .horizontal, .min_size_content = .{ .h = 90 }, .max_size_content = .height(220) });
         te.deinit();
+    }
+}
+
+/// The sampling-preset row: a dropdown that loads a saved preset into the
+/// controls, a name entry, and Save / Delete buttons operating on that name.
+/// Presets live in the Config (persisted on Apply, discarded on Cancel, like
+/// every other edit on this screen).
+fn presetRow(cfg: *config.Config) void {
+    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 3 } });
+    defer row.deinit();
+
+    dvui.label(@src(), "Preset", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
+
+    // Loading a preset copies its values into the controls (and its name into
+    // the entry, so Save/Delete target it); it still lands via Apply.
+    {
+        var dd: dvui.DropdownWidget = undefined;
+        dd.init(@src(), .{ .label = if (cfg.preset_count == 0) "none saved" else "Load…" }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 140 } });
+        defer dd.deinit();
+        if (dd.dropped()) {
+            for (cfg.presets[0..cfg.preset_count]) |*pr| {
+                if (dd.addChoiceLabel(pr.name.slice())) {
+                    cfg.sampling = pr.sampling;
+                    _ = std.fmt.bufPrintZ(&preset_name_buf, "{s}", .{pr.name.slice()}) catch {};
+                    seedSampling(cfg);
+                }
+            }
+        }
+    }
+
+    var te = dvui.textEntry(@src(), .{
+        .text = .{ .buffer = &preset_name_buf },
+        .placeholder = "preset name",
+    }, .{ .expand = .horizontal, .gravity_y = 0.5, .margin = .{ .x = 4 } });
+    te.deinit();
+
+    if (dvui.button(@src(), "Save", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 4 } })) {
+        commitSampling(cfg);
+        seedSampling(cfg); // reflect any clamping back into the controls
+        _ = cfg.upsertPreset(std.mem.sliceTo(&preset_name_buf, 0), cfg.sampling);
+    }
+    if (dvui.button(@src(), "Delete", .{}, .{ .gravity_y = 0.5 })) {
+        _ = cfg.removePresetNamed(std.mem.sliceTo(&preset_name_buf, 0));
     }
 }
 

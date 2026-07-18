@@ -1,5 +1,6 @@
 //! Logits -> token id: greedy argmax, or temperature + top-k + top-p
-//! (nucleus) sampling with an optional repetition penalty.
+//! (nucleus) + min-p sampling with optional repetition / presence /
+//! frequency penalties (llama.cpp semantics).
 //!
 //! Defaults follow Qwen3's non-thinking-mode recommendation
 //! (temperature 0.7, top_p 0.8, top_k 20). temperature == 0 is greedy.
@@ -14,11 +15,32 @@ pub const Params = struct {
     /// Nucleus: smallest prefix of the (sorted) distribution with cumulative
     /// probability >= top_p. 1.0 = no limit.
     top_p: f32 = 0.8,
+    /// Min-p: drop candidates whose probability is below min_p times the top
+    /// candidate's (0 = off). Thresholded in raw-logit space, independent of
+    /// temperature — matches llama.cpp's min_p sampler.
+    min_p: f32 = 0.0,
     /// llama.cpp-style repetition penalty over the recent window (1.0 = off):
     /// positive logits of recent ids are divided by this, negative multiplied.
+    /// Applied once per unique token regardless of its count in the window.
     repeat_penalty: f32 = 1.0,
-    /// How many trailing context tokens the repetition penalty looks at.
+    /// How many trailing context tokens the penalties look at
+    /// (capped at max_penalty_window; 0 disables all penalties).
     repeat_last_n: usize = 64,
+    /// Flat penalty subtracted from the logit of every token that appears in
+    /// the recent window (0 = off). Negative values boost repeats.
+    presence_penalty: f32 = 0.0,
+    /// Penalty subtracted per occurrence: logit -= count * frequency_penalty
+    /// (0 = off).
+    frequency_penalty: f32 = 0.0,
+
+    /// Whether any recent-window penalty is enabled. The GPU sampling paths
+    /// (on-device argmax / top-k) select candidates BEFORE penalties could be
+    /// applied, so the engine falls back to the full-logit-download CPU path
+    /// whenever this is true.
+    pub fn penaltiesActive(p: Params) bool {
+        return p.repeat_last_n != 0 and
+            (p.repeat_penalty != 1.0 or p.presence_penalty != 0 or p.frequency_penalty != 0);
+    }
 };
 
 /// Hard cap on sampling candidates when top_k = 0; softmax over the full
@@ -26,8 +48,8 @@ pub const Params = struct {
 /// noise) and this keeps the candidate buffer fixed-size.
 const max_candidates = 512;
 
-/// The fully processed next-token distribution (repetition penalty,
-/// temperature, top-k, top-p all applied): the exact distribution `next`
+/// The fully processed next-token distribution (penalties, temperature,
+/// top-k, top-p, min-p all applied): the exact distribution `next`
 /// draws from, exposed so speculative decoding can verify drafted tokens
 /// against it. Greedy (temperature 0) is a point mass on the argmax.
 pub const Dist = struct {
@@ -83,8 +105,8 @@ pub const Sampler = struct {
         return .{ .params = params, .rng = std.Random.DefaultPrng.init(seed) };
     }
 
-    /// Pick the next token. `logits` is modified in place (repetition
-    /// penalty); `recent` is the trailing context window for the penalty.
+    /// Pick the next token. `logits` is modified in place (penalties);
+    /// `recent` is the trailing context window for the penalties.
     pub fn next(self: *Sampler, logits: []f32, recent: []const u32) u32 {
         const d = self.dist(logits, recent);
         return d.sample(self.rng.random());
@@ -101,10 +123,10 @@ pub const Sampler = struct {
     }
 
     /// Build the processed next-token distribution. `logits` is modified in
-    /// place (repetition penalty); `recent` is the penalty's context window.
+    /// place (penalties); `recent` is the penalties' context window.
     pub fn dist(self: *Sampler, logits: []f32, recent: []const u32) Dist {
         const p = self.params;
-        applyRepetitionPenalty(logits, recent, p);
+        applyPenalties(logits, recent, p);
         if (p.temperature <= 0) {
             return distFromSorted(p, &.{.{ .id = argmax(logits), .logit = 0 }});
         }
@@ -116,12 +138,13 @@ pub const Sampler = struct {
         return distFromSorted(p, cands);
     }
 
-    /// GPU-sampling entry point: the device already applied the repetition
-    /// penalty and selected the top-k, downloading just these candidates
-    /// (a few KB vs the full ~608 KB vocab). We sort them descending — k is
-    /// tiny — and run the identical softmax / top-p / normalize / RNG tail as
-    /// the full-vocab path, so the emitted token is bit-identical to what the
-    /// CPU sampler would have produced from the same logits.
+    /// GPU-sampling entry point: the device selected the top-k, downloading
+    /// just these candidates (a few KB vs the full ~608 KB vocab); the engine
+    /// only routes here when no penalty is active (penalties need the full
+    /// logits). We sort them descending — k is tiny — and run the identical
+    /// softmax / min-p / top-p / normalize / RNG tail as the full-vocab path,
+    /// so the emitted token is bit-identical to what the CPU sampler would
+    /// have produced from the same logits.
     pub fn nextFromCandidates(self: *Sampler, cands: []Candidate) u32 {
         std.mem.sort(Candidate, cands, {}, candDesc);
         // Trim the (possibly larger, e.g. GPU per-lane) candidate pool to the
@@ -140,24 +163,98 @@ pub fn candidateCount(p: Params) usize {
     return @min(if (p.top_k == 0) max_candidates else p.top_k, max_candidates);
 }
 
-/// llama.cpp-style repetition penalty over the recent window, applied in place
-/// to the full logits (`p.repeat_penalty == 1.0` is a no-op). Extracted so the
-/// GPU path can mirror the exact formula in a device kernel before its top-k.
-pub fn applyRepetitionPenalty(logits: []f32, recent: []const u32, p: Params) void {
-    if (p.repeat_penalty == 1.0) return;
-    const n = @min(p.repeat_last_n, recent.len);
-    for (recent[recent.len - n ..]) |id| {
-        const l = &logits[id];
-        l.* = if (l.* > 0) l.* / p.repeat_penalty else l.* * p.repeat_penalty;
+/// Cap on how many trailing context tokens the penalties scan per step (bounds
+/// the fixed-size scratch below); `repeat_last_n` above this is clamped.
+pub const max_penalty_window = 2048;
+
+/// One unique token of the penalty window: its id and occurrence count.
+/// `count` is f32 (not integer) because it only ever feeds the frequency
+/// term's float math — and so the GPU penalize kernels can consume the
+/// entry buffer without an int→float convert.
+pub const PenaltyEntry = extern struct { id: u32, count: f32 };
+
+/// Collect the unique (id, count) pairs of the trailing penalty window,
+/// sorted by id. This is THE penalty list: the CPU path applies it below and
+/// the GPU paths upload it to their penalize kernel, so both penalize the
+/// exact same tokens with the same counts. Empty when penalties are off.
+pub fn collectPenalties(recent: []const u32, p: Params, out: *[max_penalty_window]PenaltyEntry) []PenaltyEntry {
+    if (!p.penaltiesActive()) return out[0..0];
+    const n: usize = @min(@min(p.repeat_last_n, recent.len), max_penalty_window);
+    // Sort a copy of the window so each unique id is one run (id + count).
+    var window: [max_penalty_window]u32 = undefined;
+    @memcpy(window[0..n], recent[recent.len - n ..]);
+    std.mem.sort(u32, window[0..n], {}, std.sort.asc(u32));
+    var m: usize = 0;
+    var i: usize = 0;
+    while (i < n) {
+        const id = window[i];
+        var end = i + 1;
+        while (end < n and window[end] == id) end += 1;
+        out[m] = .{ .id = id, .count = @floatFromInt(end - i) };
+        m += 1;
+        i = end;
+    }
+    return out[0..m];
+}
+
+/// The per-token penalty formula (mirrored bit-for-bit by the device penalize
+/// kernels): repetition divides a positive logit / multiplies a negative one —
+/// once per unique token — then presence/frequency subtract.
+pub fn penalizeLogit(l: f32, count: f32, p: Params) f32 {
+    const r = if (l > 0) l / p.repeat_penalty else l * p.repeat_penalty;
+    return r - (count * p.frequency_penalty + p.presence_penalty);
+}
+
+/// Wire scratch for the device penalize kernels: one (id, subtract) pair per
+/// entry. The subtract term `count * frequency_penalty + presence_penalty` is
+/// precomputed on the HOST with the exact two f32 ops penalizeLogit uses, so
+/// the kernels need only the repeat-penalty scalar and stay bit-faithful to
+/// the CPU formula.
+pub const PenaltyWire = [2 * max_penalty_window]u32;
+
+/// Pack entries for the CUDA penalize kernel: interleaved u32 words —
+/// the token id, then the f32 bits of the precomputed subtract term.
+pub fn packPenaltyWireU32(entries: []const PenaltyEntry, p: Params, out: *PenaltyWire) []const u32 {
+    for (entries, 0..) |e, i| {
+        out[2 * i] = e.id;
+        out[2 * i + 1] = @bitCast(e.count * p.frequency_penalty + p.presence_penalty);
+    }
+    return out[0 .. 2 * entries.len];
+}
+
+/// Pack entries for the Vulkan penalize kernel, whose storage buffers are
+/// f32-only: the token id stored AS f32 (exact below 2^24 — every vocab is)
+/// and the same precomputed subtract term.
+pub fn packPenaltyWireF32(entries: []const PenaltyEntry, p: Params, out: *[2 * max_penalty_window]f32) []const f32 {
+    for (entries, 0..) |e, i| {
+        out[2 * i] = @floatFromInt(e.id);
+        out[2 * i + 1] = e.count * p.frequency_penalty + p.presence_penalty;
+    }
+    return out[0 .. 2 * entries.len];
+}
+
+/// llama.cpp-style penalties over the recent window, applied in place to the
+/// full logits (a no-op when `p.penaltiesActive()` is false). Per unique token
+/// in the window (count = its occurrences):
+///   - repetition: positive logits divided by repeat_penalty, negative
+///     multiplied — applied ONCE, regardless of count;
+///   - presence/frequency: logit -= count * frequency_penalty + presence_penalty.
+/// Matches llama.cpp's llama_sampler_penalties formula exactly.
+pub fn applyPenalties(logits: []f32, recent: []const u32, p: Params) void {
+    var scratch: [max_penalty_window]PenaltyEntry = undefined;
+    for (collectPenalties(recent, p, &scratch)) |e| {
+        logits[e.id] = penalizeLogit(logits[e.id], e.count, p);
     }
 }
 
-/// The post-top-k tail: temperature softmax + nucleus (top-p) cut + normalize,
-/// over candidates already SORTED descending by logit. Shared by the full-vocab
-/// `dist` and the GPU candidate path so there is one source of truth for the
-/// stochastic math (and thus exact CPU/GPU parity). `temperature <= 0` collapses
-/// to a point mass on `cands[0]` (which must be the argmax). Repetition penalty
-/// is assumed already applied to the logits these candidates came from.
+/// The post-top-k tail: temperature softmax + nucleus (top-p) + min-p cuts +
+/// normalize, over candidates already SORTED descending by logit. Shared by the
+/// full-vocab `dist` and the GPU candidate path so there is one source of truth
+/// for the stochastic math (and thus exact CPU/GPU parity). `temperature <= 0`
+/// collapses to a point mass on `cands[0]` (which must be the argmax).
+/// Penalties are assumed already applied to the logits these candidates came
+/// from. Both cuts are prefix cuts computed on the full candidate set and then
+/// intersected — the same result as llama.cpp's top_p-then-min_p chain order.
 pub fn distFromSorted(p: Params, cands: []const Candidate) Dist {
     std.debug.assert(cands.len >= 1);
     var d: Dist = undefined;
@@ -187,6 +284,16 @@ pub fn distFromSorted(p: Params, cands: []const Candidate) Dist {
                 break;
             }
         }
+    }
+
+    // Min-p cut: drop candidates with probability below min_p times the top's.
+    // Thresholded in raw-logit space (temperature-independent, llama.cpp
+    // semantics); the top candidate always survives.
+    if (p.min_p > 0) {
+        const min_logit = cands[0].logit + @log(p.min_p);
+        var m: usize = 1;
+        while (m < keep and cands[m].logit >= min_logit) m += 1;
+        keep = m;
     }
 
     // Normalize the kept prefix.
@@ -328,6 +435,115 @@ test "repetition penalty suppresses a repeated token" {
     try std.testing.expectEqual(@as(u32, 1), s.next(&logits, &recent));
 }
 
+test "repetition penalty hits a repeated token once (llama.cpp semantics)" {
+    var s = Sampler.init(.{ .temperature = 0, .repeat_penalty = 2.0 }, 0);
+    // Token 0 appears TWICE in the window; the penalty still divides once
+    // (3/2 = 1.5 > 1.0), not per occurrence (3/4 = 0.75 < 1.0).
+    var logits = [_]f32{ 3.0, 1.0 };
+    const recent = [_]u32{ 0, 0 };
+    try std.testing.expectEqual(@as(u32, 0), s.next(&logits, &recent));
+}
+
+test "presence and frequency penalties scale with occurrence count" {
+    // Token 0 leads by 0.1 and appeared twice: frequency subtracts per
+    // occurrence (2 * 1.0), presence once (0.5) -> 2.0 - 2.5 = -0.5 < 1.9.
+    var s = Sampler.init(.{ .temperature = 0, .presence_penalty = 0.5, .frequency_penalty = 1.0 }, 0);
+    var logits = [_]f32{ 2.0, 1.9, 0.0 };
+    const recent = [_]u32{ 0, 0 };
+    try std.testing.expectEqual(@as(u32, 1), s.next(&logits, &recent));
+
+    // Presence alone is flat: one vs three occurrences penalize the same.
+    var p1 = [_]f32{ 2.0, 1.0 };
+    var p3 = [_]f32{ 2.0, 1.0 };
+    applyPenalties(&p1, &.{0}, .{ .presence_penalty = 0.7 });
+    applyPenalties(&p3, &.{ 0, 0, 0 }, .{ .presence_penalty = 0.7 });
+    try std.testing.expectEqual(p1[0], p3[0]);
+}
+
+test "repeat_last_n 0 disables all penalties" {
+    var logits = [_]f32{ 2.0, 1.0 };
+    applyPenalties(&logits, &.{ 0, 0 }, .{ .repeat_penalty = 2.0, .presence_penalty = 1.0, .repeat_last_n = 0 });
+    try std.testing.expectEqual(@as(f32, 2.0), logits[0]);
+}
+
+test "collectPenalties dedups the window into id-sorted (id, count) entries" {
+    const p: Params = .{ .repeat_penalty = 1.1 };
+    var scratch: [max_penalty_window]PenaltyEntry = undefined;
+    const recent = [_]u32{ 7, 3, 7, 7, 3, 9 };
+    const entries = collectPenalties(&recent, p, &scratch);
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+    try std.testing.expectEqual(PenaltyEntry{ .id = 3, .count = 2 }, entries[0]);
+    try std.testing.expectEqual(PenaltyEntry{ .id = 7, .count = 3 }, entries[1]);
+    try std.testing.expectEqual(PenaltyEntry{ .id = 9, .count = 1 }, entries[2]);
+
+    // Window trimming: only the trailing repeat_last_n tokens count.
+    const short = collectPenalties(&recent, .{ .repeat_penalty = 1.1, .repeat_last_n = 2 }, &scratch);
+    try std.testing.expectEqual(@as(usize, 2), short.len);
+    try std.testing.expectEqual(@as(u32, 3), short[0].id);
+    try std.testing.expectEqual(@as(u32, 9), short[1].id);
+
+    // Penalties off -> empty (the GPU paths key "upload nothing" off this).
+    try std.testing.expectEqual(@as(usize, 0), collectPenalties(&recent, .{}, &scratch).len);
+}
+
+// gemma4_cuda's device suppress mask reuses the penalize kernel with an
+// infinite presence penalty: rp=1 leaves the logit exactly unchanged (x/1),
+// and any finite value minus +inf is exactly -inf — this test pins that
+// contract so a formula change can't silently break the mask.
+test "infinite presence penalty is an exact -inf mask" {
+    const p: Params = .{ .repeat_penalty = 1.0, .presence_penalty = std.math.inf(f32) };
+    for ([_]f32{ 12.5, -3.25, 0.0, 3.4e38 }) |l| {
+        try std.testing.expectEqual(-std.math.inf(f32), penalizeLogit(l, 1, p));
+    }
+}
+
+test "penalty wire packing reproduces penalizeLogit exactly" {
+    const p: Params = .{ .repeat_penalty = 1.3, .presence_penalty = 0.4, .frequency_penalty = 0.17 };
+    const entries = [_]PenaltyEntry{ .{ .id = 5, .count = 1 }, .{ .id = 9, .count = 3 } };
+    var wu: PenaltyWire = undefined;
+    var wf: [2 * max_penalty_window]f32 = undefined;
+    const u = packPenaltyWireU32(&entries, p, &wu);
+    const f = packPenaltyWireF32(&entries, p, &wf);
+    try std.testing.expectEqual(@as(usize, 4), u.len);
+    for (entries, 0..) |e, i| {
+        try std.testing.expectEqual(e.id, u[2 * i]);
+        try std.testing.expectEqual(@as(f32, @floatFromInt(e.id)), f[2 * i]);
+        const sub: f32 = @bitCast(u[2 * i + 1]);
+        try std.testing.expectEqual(sub, f[2 * i + 1]);
+        // Applying (l -> l/rp or l*rp, then - sub) must equal penalizeLogit.
+        for ([_]f32{ 2.5, -1.75 }) |l| {
+            const r = if (l > 0) l / p.repeat_penalty else l * p.repeat_penalty;
+            try std.testing.expectEqual(penalizeLogit(l, e.count, p), r - sub);
+        }
+    }
+}
+
+test "min-p drops candidates far below the top" {
+    // Two near-equal leaders, one distant tail: min_p 0.5 keeps exactly the
+    // leaders (tail is e^-10 of the max), so the tail is never sampled and the
+    // dist reports it filtered out.
+    var s = Sampler.init(.{ .temperature = 1.0, .top_k = 0, .top_p = 1.0, .min_p = 0.5 }, 77);
+    var logits = [_]f32{ 10.0, 10.0, 0.0, -5.0 };
+    const d = s.dist(&logits, &.{});
+    try std.testing.expectEqual(@as(usize, 2), d.n);
+    try std.testing.expectEqual(@as(f32, 0), d.probOf(2));
+    for (0..32) |_| {
+        var l = [_]f32{ 10.0, 10.0, 0.0, -5.0 };
+        try std.testing.expect(s.next(&l, &.{}) < 2);
+    }
+}
+
+test "min-p threshold is temperature-independent (raw-logit space)" {
+    // ln(0.5) ~ -0.693: token 1 sits 0.5 under the max, so min_p = 0.5 keeps
+    // it at ANY temperature (the cut ignores temperature by design).
+    for ([_]f32{ 0.3, 1.0, 2.0 }) |t| {
+        var s = Sampler.init(.{ .temperature = t, .top_k = 0, .top_p = 1.0, .min_p = 0.5 }, 1);
+        var logits = [_]f32{ 3.0, 2.5, 1.0 };
+        const d = s.dist(&logits, &.{});
+        try std.testing.expectEqual(@as(usize, 2), d.n);
+    }
+}
+
 test "dist matches next() and normalizes" {
     var s = Sampler.init(.{ .temperature = 1.0, .top_k = 3, .top_p = 1.0 }, 5);
     var logits = [_]f32{ 2.0, 1.0, 0.0, -50.0 };
@@ -389,6 +605,8 @@ test "nextFromCandidates matches full-vocab next()" {
         .{ .temperature = 1.0, .top_k = 20, .top_p = 1.0 },
         .{ .temperature = 0.7, .top_k = 0, .top_p = 0.8 }, // top_k=0 → cap
         .{ .temperature = 1.3, .top_k = 5, .top_p = 0.95 },
+        .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .min_p = 0.1 },
+        .{ .temperature = 1.0, .top_k = 0, .top_p = 1.0, .min_p = 0.3 },
     };
     for (params_sets) |p| {
         for (0..16) |trial| {
@@ -403,7 +621,7 @@ test "nextFromCandidates matches full-vocab next()" {
 
             // GPU path: select the same top-k the device would, hand it over.
             var l_gpu = logits;
-            applyRepetitionPenalty(&l_gpu, &.{}, p);
+            applyPenalties(&l_gpu, &.{}, p);
             const k = if (p.temperature <= 0) 1 else candidateCount(p);
             var cand: [max_candidates]Candidate = undefined;
             const cands = topK(&l_gpu, cand[0..k]);

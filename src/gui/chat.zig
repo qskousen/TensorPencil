@@ -40,6 +40,7 @@ const Arch = union(enum) {
 };
 const cuda = tp.gpu.cuda;
 const engine = tp.llm.engine;
+const sample = tp.llm.sample;
 const session = tp.llm.session;
 const kv_cache = tp.llm.kv_cache;
 const chat = tp.llm.chat;
@@ -163,7 +164,10 @@ pub const Options = struct {
     max_context: ?usize = null,
     max_new_tokens: usize = 2048,
     seed: u64 = 0,
-    temperature: f32 = 0.7,
+    /// Sampling controls (temperature/top-k/top-p/min-p/penalties). Snapshotted
+    /// per turn: `updateSettings` stages changes, `submit` applies them, so a
+    /// mid-generation edit only affects the NEXT turn.
+    sampling: sample.Params = .{},
     /// Compute backend for the chat LLM. Only the CUDA variants are supported
     /// today; `.cpu`/`.vulkan` fail init with `error.UnsupportedLlmBackend`.
     backend: pipeline.Backend = .zig_cuda,
@@ -189,6 +193,22 @@ pub const Options = struct {
     kv_dtype: kv_cache.KvDtype = .f32,
 };
 
+/// Map the GUI's engine-free `config.Sampling` onto the library's
+/// `sample.Params`, field for field — explicit so the two can't drift silently.
+pub fn samplingParams(cfg: *const config.Config) sample.Params {
+    const s = &cfg.sampling;
+    return .{
+        .temperature = s.temperature,
+        .top_k = s.top_k,
+        .top_p = s.top_p,
+        .min_p = s.min_p,
+        .repeat_penalty = s.repeat_penalty,
+        .repeat_last_n = s.repeat_last_n,
+        .presence_penalty = s.presence_penalty,
+        .frequency_penalty = s.frequency_penalty,
+    };
+}
+
 pub const Session = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -206,6 +226,11 @@ pub const Session = struct {
     /// to this so a "new chat" reuses the exact same prompt as a fresh session.
     initial_ids: std.ArrayList(u32) = .empty,
     opts: engine.Options,
+    /// Sampling params staged by `updateSettings` (UI thread) and copied into
+    /// `opts.sampling` by `submit` — also UI-thread, and never while a worker
+    /// runs (`submit` refuses when busy). Keeps live settings edits from racing
+    /// the worker's read of `opts`, and gives "takes effect next turn" exactly.
+    pending_sampling: sample.Params = .{},
     messages: std.ArrayList(Message) = .empty,
 
     // Worker <-> UI marshalling.
@@ -359,8 +384,9 @@ pub const Session = struct {
             .max_new_tokens = cfg.max_new_tokens,
             .max_context = max_context,
             .seed = cfg.seed,
-            .sampling = .{ .temperature = cfg.temperature },
+            .sampling = cfg.sampling,
         };
+        self.pending_sampling = cfg.sampling;
         // Let the decode loop enact arbiter-published VRAM targets on the worker
         // thread (`self` is heap-pinned, so the captured pointer stays valid).
         self.opts.residency_poll = .{ .ctx = self, .apply = residencyPollThunk };
@@ -506,15 +532,18 @@ pub const Session = struct {
     }
 
     /// Apply the non-load-affecting settings live (no reload, so the chat is
-    /// preserved): currently just reasoning. The VRAM meter policy (split/limit)
-    /// is applied separately via `applyVramPolicy`; diffusion-facing settings go
-    /// to the app-level engine.
+    /// preserved): reasoning and the sampling controls. The VRAM meter policy
+    /// (split/limit) is applied separately via `applyVramPolicy`; diffusion-
+    /// facing settings go to the app-level engine.
     pub fn updateSettings(self: *Session, cfg: *const config.Config) void {
-        _ = self;
         // Reasoning is process-global (like the family) and only shapes the
         // *next* prompt built, so flipping it mid-conversation is safe without a
         // reload — the current turn already has its ids.
         chat.setThinking(cfg.reasoning);
+        // Sampling is staged, not applied: `submit` copies it into `opts` at the
+        // next turn boundary (a turn possibly generating right now keeps the
+        // params it started with — no racing the worker's read of `opts`).
+        self.pending_sampling = samplingParams(cfg);
     }
 
     // --- vram.Participant adapter --------------------------------------------
@@ -799,6 +828,10 @@ pub const Session = struct {
         if (self.busy()) return;
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0 and self.attach_view.items.len == 0) return;
+
+        // Turn boundary: adopt any sampling changes staged by updateSettings.
+        // Safe here (UI thread, no worker running yet).
+        self.opts.sampling = self.pending_sampling;
 
         var um: Message = .{ .role = .user };
         if (trimmed.len > 0) try um.text.appendSlice(self.gpa, trimmed);

@@ -200,6 +200,23 @@ export fn add_relu() callconv(.spirv_kernel) void {
     a.data[idx] = @max(0.0, a.data[idx] + b.data[idx]);
 }
 
+// penalize: sampling penalties (llm/sample.zig penalizeLogit), one thread per
+//   unique recent token: logits[id] = (l>0 ? l/rp : l*rp) - sub. a=logits (in
+//   place), b=wire — f32 pairs of (token id, stored as an exact f32 < 2^24,
+//   and the host-precomputed presence+frequency subtract term; see
+//   sample.packPenaltyWireF32). u0=entry count, f0=repeat penalty. Ids are
+//   unique so no two threads touch the same logit — no atomics.
+export fn penalize() callconv(.spirv_kernel) void {
+    decorate();
+    const e = gpu.global_invocation_id[0];
+    if (e >= pc.u0) return;
+    const id: u32 = @intFromFloat(b.data[e * 2]);
+    const sub = b.data[e * 2 + 1];
+    const l = a.data[id];
+    const r = if (l > 0) l / pc.f0 else l * pc.f0;
+    a.data[id] = r - sub;
+}
+
 // argmax_reduce: L lanes; lane i stride-scans logits[i], logits[i+L], ... and
 //   records its local max and the LOWEST index achieving it (ascending scan +
 //   strict `>` keeps the lowest). a=logits, c=out_val[L], d=out_idx[L] (index

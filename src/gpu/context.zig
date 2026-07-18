@@ -16,6 +16,7 @@ const spv = @import("spv.zig");
 const coopmat = @import("coopmat.zig");
 const convrot = @import("../ops/convrot.zig");
 const mem_tag = @import("mem_tag.zig");
+const sample = @import("../llm/sample.zig");
 pub const MemTag = mem_tag.MemTag;
 
 const matmul_f8_spv = @embedFile("matmul_f8_spv");
@@ -92,7 +93,7 @@ pub const topk_m = 8;
 pub const topk_lanes = 1024;
 
 /// Eltwise/attention kernels and their workgroup shapes (kernels/eltwise.zig).
-pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, rope_qwen35, attn_decode_q35, attn_dsplit_gemma, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, attn_dsplit_gemma_f16, kv_store_f16 };
+pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, rope_qwen35, attn_decode_q35, attn_dsplit_gemma, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, attn_dsplit_gemma_f16, kv_store_f16, penalize };
 const elt_entry_sizes = [_]EntrySize{
     .{ .name = "rmsnorm", .x = 64, .y = 1 },
     .{ .name = "rms_partial", .x = 256, .y = 1 },
@@ -170,6 +171,7 @@ const elt_entry_sizes = [_]EntrySize{
     .{ .name = "topk_reduce", .x = 256, .y = 1 },
     .{ .name = "attn_dsplit_gemma_f16", .x = 256, .y = 1 },
     .{ .name = "kv_store_f16", .x = 256, .y = 1 },
+    .{ .name = "penalize", .x = 256, .y = 1 },
 };
 
 /// Push block shared by all eltwise entries; meaning per entry (see kernels).
@@ -541,6 +543,8 @@ pub const Context = struct {
     i8_mpad: usize = 0,
     /// Tiny valid buffer bound to unused descriptor slots.
     dummy: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
+    /// Per-step penalty-entry wire for opPenalize (id + subtract f32 pairs).
+    pen_wire: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
     /// Small cached device uploads (biases, norm weights), keyed by host ptr.
     small_bufs: std.AutoHashMapUnmanaged(usize, DeviceBuffer) = .empty,
     /// Device-local transposed weight buffers, keyed by host weight pointer,
@@ -1346,7 +1350,7 @@ pub const Context = struct {
             }
             self.small_bufs.deinit(self.gpa);
         }
-        for ([_]*DeviceBuffer{ &self.x_dev, &self.y_dev, &self.raw_dev, &self.dummy, &self.x_h16, &self.y_pad, &self.i8_xr, &self.i8_scale, &self.i8_x, &self.i8_acc, &self.i8_acc1, &self.i8_acc2, &self.i8_acc3, &self.i8_hadamard, &self.i8_partials, &self.i8_scalecat }) |db| {
+        for ([_]*DeviceBuffer{ &self.x_dev, &self.y_dev, &self.raw_dev, &self.dummy, &self.pen_wire, &self.x_h16, &self.y_pad, &self.i8_xr, &self.i8_scale, &self.i8_x, &self.i8_acc, &self.i8_acc1, &self.i8_acc2, &self.i8_acc3, &self.i8_hadamard, &self.i8_partials, &self.i8_scalecat }) |db| {
             if (db.buf != .null_handle) {
                 self.freeDeviceBuffer(db.*);
             }
@@ -2960,6 +2964,23 @@ pub const Context = struct {
     /// the `topk_lanes * topk_m` candidates and does exact top-k on the CPU (a
     /// few KB vs the ~608 KB vocab). Caller owns out_val/out_idx (>= that many
     /// f32 each). Returns the candidate count written. No download here.
+    /// Apply the sampling penalties (llm/sample.zig penalizeLogit) to the
+    /// resident logits before an on-device argmax/top-k: uploads the tiny
+    /// (id, subtract) f32 wire and scatters one thread per unique recent
+    /// token. Same formula as the CPU applyPenalties (division is subject to
+    /// Vulkan's FP32 ULP tolerance). No-op on an empty entry list.
+    pub fn opPenalize(self: *Context, logits: DeviceBuffer, entries: []const sample.PenaltyEntry, sp: sample.Params) Error!void {
+        if (entries.len == 0) return;
+        var wire: [2 * sample.max_penalty_window]f32 = undefined;
+        const w = sample.packPenaltyWireF32(entries, sp, &wire);
+        try self.ensureDeviceBuffer(&self.pen_wire, w.len * 4);
+        try self.tensorUpload(self.pen_wire, std.mem.sliceAsBytes(w));
+        try self.opElt(.penalize, logits, self.pen_wire, null, null, .{
+            .u0 = @intCast(entries.len),
+            .f0 = sp.repeat_penalty,
+        }, entries.len, 1, 1);
+    }
+
     pub fn opTopK(self: *Context, logits: DeviceBuffer, vocab: usize, out_val: *DeviceBuffer, out_idx: *DeviceBuffer) Error!usize {
         const lanes: usize = @min(@as(usize, topk_lanes), vocab);
         const count = lanes * topk_m;
@@ -4076,7 +4097,6 @@ test "gpu argmax matches cpu argmax (incl. tie -> lowest index)" {
     std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
     var ctx = Context.init(gpa) catch return error.SkipZigTest;
     defer ctx.deinit();
-    const sample = @import("../llm/sample.zig");
 
     var prng = std.Random.DefaultPrng.init(0xA11CE);
     const rand = prng.random();
@@ -4115,7 +4135,6 @@ test "gpu argmax matches cpu argmax (incl. tie -> lowest index)" {
 
 test "gpu topk selects the true top-k set" {
     const gpa = std.testing.allocator;
-    const sample = @import("../llm/sample.zig");
     std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
     var ctx = Context.init(gpa) catch return error.SkipZigTest;
     defer ctx.deinit();
@@ -4160,6 +4179,60 @@ test "gpu topk selects the true top-k set" {
             for (refc, logits, 0..) |*c, v, i| c.* = .{ .id = @intCast(i), .logit = v };
             std.mem.sort(sample.Candidate, refc, {}, sample.candDesc);
             for (0..k) |r| try std.testing.expectEqual(refc[r].id, cands[r].id);
+        }
+    }
+}
+
+// The device penalize kernel mirrors the CPU applyPenalties formula. Vulkan
+// guarantees correctly-rounded f32 mul/sub but allows ~2.5 ULP on division
+// (the positive-logit repeat branch), so penalized elements compare with a
+// tight tolerance while untouched elements must be bit-identical.
+test "gpu penalize matches cpu applyPenalties" {
+    const gpa = std.testing.allocator;
+    std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa) catch return error.SkipZigTest;
+    defer ctx.deinit();
+
+    var prng = std.Random.DefaultPrng.init(0x9E4A17);
+    const rand = prng.random();
+    const p: sample.Params = .{ .repeat_penalty = 1.3, .presence_penalty = 0.4, .frequency_penalty = 0.17, .repeat_last_n = 64 };
+    const vocabs = [_]usize{ 128, 151936 };
+    for (vocabs) |vocab| {
+        const logits = try gpa.alloc(f32, vocab);
+        defer gpa.free(logits);
+        for (logits) |*v| v.* = rand.floatNorm(f32) * 5.0; // mixed signs: both penalty branches
+
+        // A recent window with repeats (counts > 1) and out-of-order ids.
+        var recent: [40]u32 = undefined;
+        for (&recent) |*t| t.* = rand.uintLessThan(u32, @intCast(vocab));
+        recent[7] = recent[3]; // guaranteed duplicates
+        recent[21] = recent[3];
+
+        const want = try gpa.dupe(f32, logits);
+        defer gpa.free(want);
+        sample.applyPenalties(want, &recent, p);
+
+        var lg = try ctx.tensorCreate(vocab * 4);
+        defer ctx.tensorDestroy(&lg);
+        try ctx.tensorUpload(lg, std.mem.sliceAsBytes(logits));
+        var scratch: [sample.max_penalty_window]sample.PenaltyEntry = undefined;
+        const entries = sample.collectPenalties(&recent, p, &scratch);
+        try ctx.opPenalize(lg, entries, p);
+
+        const penalized = try gpa.alloc(bool, vocab);
+        defer gpa.free(penalized);
+        @memset(penalized, false);
+        for (entries) |e| penalized[e.id] = true;
+
+        const got = try gpa.alloc(f32, vocab);
+        defer gpa.free(got);
+        try ctx.tensorDownload(lg, std.mem.sliceAsBytes(got));
+        for (want, got, penalized) |w, g, was_hit| {
+            if (was_hit) {
+                try std.testing.expect(@abs(g - w) <= @max(1e-5, 1e-6 * @abs(w)));
+            } else {
+                try std.testing.expectEqual(w, g); // untouched: bit-identical
+            }
         }
     }
 }

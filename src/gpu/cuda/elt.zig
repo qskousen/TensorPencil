@@ -4181,6 +4181,43 @@ pub const topk_reduce_ptx: [:0]const u8 =
     \\}
 ;
 
+/// Sampling penalties (llm/sample.zig penalizeLogit), one thread per unique
+/// recent token: logits[id] = (l>0 ? l/rp : l*rp) - sub, with the presence +
+/// frequency subtract term `sub` precomputed on the host (packPenaltyWireU32).
+/// b0=logits, b1=wire (interleaved u32 pairs: id, f32-bits sub). u0=entry
+/// count, f0=repeat penalty. Ids are unique, so no two threads touch the same
+/// logit; div.rn/mul.rn/sub.rn keep the math bit-identical to the CPU path.
+pub const penalize_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry penalize(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<3>;
+    \\  .reg .b32 %r<8>;
+    \\  .reg .f32 %f<7>;
+    \\  .reg .b64 %rd<8>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u64 %rd1,[p0]; cvta.to.global.u64 %rd1,%rd1;
+    \\  ld.param.u64 %rd2,[p1]; cvta.to.global.u64 %rd2,%rd2;
+    \\  mul.wide.u32 %rd3,%r4,8; add.s64 %rd4,%rd2,%rd3;
+    \\  ld.global.u32 %r6,[%rd4]; ld.global.f32 %f2,[%rd4+4];
+    \\  mul.wide.u32 %rd5,%r6,4; add.s64 %rd6,%rd1,%rd5;
+    \\  ld.global.f32 %f1,[%rd6];
+    \\  ld.param.f32 %f3,[f0];
+    \\  div.rn.f32 %f4,%f1,%f3;
+    \\  mul.rn.f32 %f5,%f1,%f3;
+    \\  setp.gt.f32 %p2,%f1,0f00000000;
+    \\  selp.f32 %f6,%f4,%f5,%p2;
+    \\  sub.rn.f32 %f6,%f6,%f2;
+    \\  st.global.f32 [%rd6],%f6;
+    \\END:
+    \\  ret;
+    \\}
+;
+
 /// a[idx] *= sigmoid(b[idx]), in place. b0=a, b1=b. u0=total.
 pub const sigmoid_mul_ptx: [:0]const u8 =
     \\.version 8.0

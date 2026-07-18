@@ -143,6 +143,40 @@ pub const VaeDecode = enum(u8) {
     }
 };
 
+/// LLM sampling controls, mirroring the library's `llm.sample.Params` field
+/// for field (kept engine-free here — `chat.samplingParams` maps it across).
+/// Applied LIVE: a change (or a loaded preset) takes effect on the next chat
+/// turn, never a reload.
+pub const Sampling = struct {
+    /// 0 = greedy; otherwise logits are divided by this.
+    temperature: f32 = 0.7,
+    /// Keep only the k highest logits (0 = no limit).
+    top_k: usize = 20,
+    /// Nucleus: smallest cumulative-probability prefix >= top_p (1 = off).
+    top_p: f32 = 0.8,
+    /// Drop candidates below min_p times the top candidate's probability (0 = off).
+    min_p: f32 = 0.0,
+    /// Divide a recently-seen token's positive logit by this (1 = off).
+    repeat_penalty: f32 = 1.0,
+    /// How many trailing context tokens the penalties look at (0 = off).
+    repeat_last_n: usize = 64,
+    /// Flat logit penalty for every token in the recent window (0 = off).
+    presence_penalty: f32 = 0.0,
+    /// Per-occurrence logit penalty (0 = off).
+    frequency_penalty: f32 = 0.0,
+};
+
+/// Named sampling presets, stored inline in the config file (one `preset = ...`
+/// line each, `name|temperature|top_k|top_p|min_p|repeat_penalty|repeat_last_n|
+/// presence|frequency`). Fixed-capacity so the Config stays a plain value type.
+pub const max_presets = 16;
+pub const max_preset_name = 48;
+
+pub const Preset = struct {
+    name: TextBuf(max_preset_name) = .{},
+    sampling: Sampling = .{},
+};
+
 /// A fixed-capacity, nul-terminated text buffer. `data` is handed directly to
 /// dvui's `textEntry` as its backing store, so the buffer is the single source
 /// of truth for the edited value (no separate edit state).
@@ -261,6 +295,14 @@ pub const Config = struct {
     /// footprint, lossy). Changing it rebuilds the KV context — the weights stay
     /// resident (see `ctxReloadEql`), not a full model reload.
     kv_dtype: KvDtype = .f32,
+    /// LLM sampling controls (see `Sampling`). Applied live: pushed into the
+    /// running session on Apply and picked up at the next turn — never load-
+    /// or context-affecting (not compared by any `*ReloadEql`).
+    sampling: Sampling = .{},
+    /// Saved sampling presets (`presets[0..preset_count]`). Pure data the
+    /// settings view loads/saves by name; persisted with everything else.
+    presets: [max_presets]Preset = [_]Preset{.{}} ** max_presets,
+    preset_count: usize = 0,
 
     /// Persisted window geometry for the main window and the image viewer,
     /// restored on the next launch. Size/position track the *restored* (non-
@@ -315,6 +357,44 @@ pub const Config = struct {
         return diffPathsEql(a, b) and
             a.diff_backend == b.diff_backend and
             a.vae_decode == b.vae_decode;
+    }
+
+    /// Find a saved preset by name (name is cleaned the same way `upsertPreset`
+    /// cleans it, so lookups match what was stored).
+    pub fn findPreset(self: *const Config, raw_name: []const u8) ?usize {
+        var buf: [max_preset_name]u8 = undefined;
+        const name = cleanPresetName(raw_name, &buf) orelse return null;
+        for (self.presets[0..self.preset_count], 0..) |*p, i| {
+            if (std.mem.eql(u8, p.name.slice(), name)) return i;
+        }
+        return null;
+    }
+
+    /// Save `s` under `raw_name` (whitespace-trimmed; the reserved '|' and
+    /// newlines are dropped), replacing an existing preset of the same name.
+    /// Returns false when the name is empty after cleaning or the table is full.
+    pub fn upsertPreset(self: *Config, raw_name: []const u8, s: Sampling) bool {
+        var buf: [max_preset_name]u8 = undefined;
+        const name = cleanPresetName(raw_name, &buf) orelse return false;
+        if (self.findPreset(name)) |i| {
+            self.presets[i].sampling = s;
+            return true;
+        }
+        if (self.preset_count >= max_presets) return false;
+        self.presets[self.preset_count] = .{ .sampling = s };
+        self.presets[self.preset_count].name.set(name);
+        self.preset_count += 1;
+        return true;
+    }
+
+    /// Remove the preset named `raw_name` (cleaned like `upsertPreset`).
+    /// Returns whether one was removed.
+    pub fn removePresetNamed(self: *Config, raw_name: []const u8) bool {
+        const i = self.findPreset(raw_name) orelse return false;
+        std.mem.copyForwards(Preset, self.presets[i .. self.preset_count - 1], self.presets[i + 1 .. self.preset_count]);
+        self.preset_count -= 1;
+        self.presets[self.preset_count] = .{};
+        return true;
     }
 
     /// Whether the image-generation tool is enabled: dit + text-encoder + VAE
@@ -416,6 +496,29 @@ pub const Config = struct {
             self.reasoning = std.mem.eql(u8, val, "true");
         } else if (std.mem.eql(u8, key, "kv_dtype")) {
             if (KvDtype.fromStr(val)) |d| self.kv_dtype = d;
+        } else if (std.mem.eql(u8, key, "temperature")) {
+            self.sampling.temperature = std.fmt.parseFloat(f32, val) catch self.sampling.temperature;
+        } else if (std.mem.eql(u8, key, "top_k")) {
+            self.sampling.top_k = std.fmt.parseInt(usize, val, 10) catch self.sampling.top_k;
+        } else if (std.mem.eql(u8, key, "top_p")) {
+            self.sampling.top_p = std.fmt.parseFloat(f32, val) catch self.sampling.top_p;
+        } else if (std.mem.eql(u8, key, "min_p")) {
+            self.sampling.min_p = std.fmt.parseFloat(f32, val) catch self.sampling.min_p;
+        } else if (std.mem.eql(u8, key, "repeat_penalty")) {
+            self.sampling.repeat_penalty = std.fmt.parseFloat(f32, val) catch self.sampling.repeat_penalty;
+        } else if (std.mem.eql(u8, key, "repeat_last_n")) {
+            self.sampling.repeat_last_n = std.fmt.parseInt(usize, val, 10) catch self.sampling.repeat_last_n;
+        } else if (std.mem.eql(u8, key, "presence_penalty")) {
+            self.sampling.presence_penalty = std.fmt.parseFloat(f32, val) catch self.sampling.presence_penalty;
+        } else if (std.mem.eql(u8, key, "frequency_penalty")) {
+            self.sampling.frequency_penalty = std.fmt.parseFloat(f32, val) catch self.sampling.frequency_penalty;
+        } else if (std.mem.eql(u8, key, "preset")) {
+            if (parsePreset(val)) |pr| {
+                if (self.preset_count < max_presets) {
+                    self.presets[self.preset_count] = pr;
+                    self.preset_count += 1;
+                }
+            }
         } else if (std.mem.eql(u8, key, "win_w")) {
             self.win_w = std.fmt.parseInt(usize, val, 10) catch self.win_w;
         } else if (std.mem.eql(u8, key, "win_h")) {
@@ -507,15 +610,86 @@ pub const Config = struct {
         });
         defer gpa.free(content);
 
+        // Sampling + presets are appended after the fixed template — sampling
+        // to stay under the 32-arg format limit, presets because they're
+        // variable-count (load order doesn't matter: every line is `key = value`).
+        var full: std.ArrayList(u8) = .empty;
+        defer full.deinit(gpa);
+        try full.appendSlice(gpa, content);
+        const sampling_lines = try std.fmt.allocPrint(gpa,
+            \\temperature = {d}
+            \\top_k = {d}
+            \\top_p = {d}
+            \\min_p = {d}
+            \\repeat_penalty = {d}
+            \\repeat_last_n = {d}
+            \\presence_penalty = {d}
+            \\frequency_penalty = {d}
+            \\
+        , .{
+            self.sampling.temperature,    self.sampling.top_k,
+            self.sampling.top_p,          self.sampling.min_p,
+            self.sampling.repeat_penalty, self.sampling.repeat_last_n,
+            self.sampling.presence_penalty,
+            self.sampling.frequency_penalty,
+        });
+        defer gpa.free(sampling_lines);
+        try full.appendSlice(gpa, sampling_lines);
+        for (self.presets[0..self.preset_count]) |*pr| {
+            const line = try std.fmt.allocPrint(gpa, "preset = {s}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}\n", .{
+                pr.name.slice(),            pr.sampling.temperature,
+                pr.sampling.top_k,          pr.sampling.top_p,
+                pr.sampling.min_p,          pr.sampling.repeat_penalty,
+                pr.sampling.repeat_last_n,  pr.sampling.presence_penalty,
+                pr.sampling.frequency_penalty,
+            });
+            defer gpa.free(line);
+            try full.appendSlice(gpa, line);
+        }
+
         if (std.fs.path.dirname(path)) |dir| {
             std.Io.Dir.cwd().createDirPath(io, dir) catch |err| switch (err) {
                 error.PathAlreadyExists => {},
                 else => return err,
             };
         }
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = content });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = full.items });
     }
 };
+
+/// Clean a preset name for storage/lookup: trim whitespace and drop the
+/// reserved '|' separator (and CR/LF). Returns a slice into `buf`, or null
+/// when nothing printable is left.
+fn cleanPresetName(raw: []const u8, buf: *[max_preset_name]u8) ?[]const u8 {
+    var n: usize = 0;
+    for (std.mem.trim(u8, raw, " \t\r\n")) |ch| {
+        if (ch == '|' or ch == '\n' or ch == '\r') continue;
+        if (n >= max_preset_name - 1) break; // TextBuf needs a trailing nul
+        buf[n] = ch;
+        n += 1;
+    }
+    return if (n == 0) null else buf[0..n];
+}
+
+/// Parse one `preset = name|t|k|p|minp|rp|rln|pp|fp` value. Null (line skipped)
+/// on any malformed field, so a hand-edited config can't half-apply a preset.
+fn parsePreset(val: []const u8) ?Preset {
+    var it = std.mem.splitScalar(u8, val, '|');
+    var buf: [max_preset_name]u8 = undefined;
+    const name = cleanPresetName(it.next() orelse return null, &buf) orelse return null;
+    var pr: Preset = .{};
+    pr.name.set(name);
+    const s = &pr.sampling;
+    inline for (.{ "temperature", "top_k", "top_p", "min_p", "repeat_penalty", "repeat_last_n", "presence_penalty", "frequency_penalty" }) |field| {
+        const raw = std.mem.trim(u8, it.next() orelse return null, " \t");
+        const F = @TypeOf(@field(s, field));
+        @field(s, field) = switch (@typeInfo(F)) {
+            .float => std.fmt.parseFloat(F, raw) catch return null,
+            else => std.fmt.parseInt(F, raw, 10) catch return null,
+        };
+    }
+    return pr;
+}
 
 /// Escape backslashes and newlines so a multi-line value survives on one
 /// `key = value` line (`\` → `\\`, newline → `\n`, CR dropped). Caller frees.
@@ -779,6 +953,128 @@ test "diffReloadEql: diff paths, backend, and decode all trigger a diff rebuild"
     b.vae_decode = .cpu_tiled;
     try std.testing.expect(!a.diffReloadEql(&b));
     try std.testing.expect(a.llmReloadEql(&b));
+}
+
+test "apply parses sampling keys and tolerates junk" {
+    var cfg: Config = .{};
+    // Defaults mirror llm.sample.Params.
+    try std.testing.expectEqual(@as(f32, 0.7), cfg.sampling.temperature);
+    try std.testing.expectEqual(@as(usize, 20), cfg.sampling.top_k);
+    try std.testing.expectEqual(@as(f32, 0.8), cfg.sampling.top_p);
+    try std.testing.expectEqual(@as(f32, 0.0), cfg.sampling.min_p);
+    try std.testing.expectEqual(@as(f32, 1.0), cfg.sampling.repeat_penalty);
+    try std.testing.expectEqual(@as(usize, 64), cfg.sampling.repeat_last_n);
+
+    cfg.apply("temperature", "1.2");
+    cfg.apply("top_k", "40");
+    cfg.apply("top_p", "0.95");
+    cfg.apply("min_p", "0.05");
+    cfg.apply("repeat_penalty", "1.1");
+    cfg.apply("repeat_last_n", "128");
+    cfg.apply("presence_penalty", "0.5");
+    cfg.apply("frequency_penalty", "-0.25");
+    try std.testing.expectEqual(@as(f32, 1.2), cfg.sampling.temperature);
+    try std.testing.expectEqual(@as(usize, 40), cfg.sampling.top_k);
+    try std.testing.expectEqual(@as(f32, 0.95), cfg.sampling.top_p);
+    try std.testing.expectEqual(@as(f32, 0.05), cfg.sampling.min_p);
+    try std.testing.expectEqual(@as(f32, 1.1), cfg.sampling.repeat_penalty);
+    try std.testing.expectEqual(@as(usize, 128), cfg.sampling.repeat_last_n);
+    try std.testing.expectEqual(@as(f32, 0.5), cfg.sampling.presence_penalty);
+    try std.testing.expectEqual(@as(f32, -0.25), cfg.sampling.frequency_penalty);
+
+    cfg.apply("temperature", "hot"); // unchanged on junk
+    try std.testing.expectEqual(@as(f32, 1.2), cfg.sampling.temperature);
+
+    // Sampling is a LIVE setting: neither a weight reload nor a KV rebuild.
+    const base: Config = .{};
+    try std.testing.expect(cfg.llmReloadEql(&base));
+    try std.testing.expect(cfg.ctxReloadEql(&base));
+}
+
+test "preset lines parse, tolerate junk, and cap at max_presets" {
+    var cfg: Config = .{};
+    cfg.apply("preset", "creative|1.2|40|0.95|0.05|1.1|128|0.5|0.25");
+    try std.testing.expectEqual(@as(usize, 1), cfg.preset_count);
+    try std.testing.expectEqualStrings("creative", cfg.presets[0].name.slice());
+    try std.testing.expectEqual(@as(f32, 1.2), cfg.presets[0].sampling.temperature);
+    try std.testing.expectEqual(@as(usize, 128), cfg.presets[0].sampling.repeat_last_n);
+    try std.testing.expectEqual(@as(f32, 0.25), cfg.presets[0].sampling.frequency_penalty);
+
+    // Whitespace around fields tolerated (hand-edited config).
+    cfg.apply("preset", " precise | 0 | 1 | 1 | 0 | 1 | 0 | 0 | 0 ");
+    try std.testing.expectEqual(@as(usize, 2), cfg.preset_count);
+    try std.testing.expectEqualStrings("precise", cfg.presets[1].name.slice());
+    try std.testing.expectEqual(@as(f32, 0), cfg.presets[1].sampling.temperature);
+
+    // Malformed lines are skipped whole (no half-applied preset).
+    cfg.apply("preset", "broken|1.0|notanumber|1|0|1|64|0|0");
+    cfg.apply("preset", "tooshort|1.0|20");
+    cfg.apply("preset", "|1.0|20|1|0|1|64|0|0"); // empty name
+    try std.testing.expectEqual(@as(usize, 2), cfg.preset_count);
+
+    // The table caps at max_presets; extra lines are dropped.
+    for (0..max_presets) |i| {
+        var name_buf: [max_preset_name]u8 = undefined;
+        const line = std.fmt.bufPrint(&name_buf, "p{d}|1|20|1|0|1|64|0|0", .{i}) catch unreachable;
+        cfg.apply("preset", line);
+    }
+    try std.testing.expectEqual(@as(usize, max_presets), cfg.preset_count);
+}
+
+test "upsertPreset adds, replaces by name, sanitizes; removePresetNamed removes" {
+    var cfg: Config = .{};
+    try std.testing.expect(cfg.upsertPreset("creative", .{ .temperature = 1.3 }));
+    try std.testing.expect(cfg.upsertPreset(" pipe|name \n", .{ .temperature = 0.2 }));
+    try std.testing.expectEqual(@as(usize, 2), cfg.preset_count);
+    try std.testing.expectEqualStrings("pipename", cfg.presets[1].name.slice());
+
+    // Same name replaces in place (no duplicate).
+    try std.testing.expect(cfg.upsertPreset("creative", .{ .temperature = 1.5 }));
+    try std.testing.expectEqual(@as(usize, 2), cfg.preset_count);
+    try std.testing.expectEqual(@as(f32, 1.5), cfg.presets[0].sampling.temperature);
+
+    // Empty / all-reserved names are rejected.
+    try std.testing.expect(!cfg.upsertPreset("  ", .{}));
+    try std.testing.expect(!cfg.upsertPreset("|||", .{}));
+
+    try std.testing.expect(cfg.findPreset("creative") != null);
+    try std.testing.expect(cfg.removePresetNamed("creative"));
+    try std.testing.expect(!cfg.removePresetNamed("creative")); // already gone
+    try std.testing.expectEqual(@as(usize, 1), cfg.preset_count);
+    try std.testing.expectEqualStrings("pipename", cfg.presets[0].name.slice());
+}
+
+test "sampling + presets save/load round-trip" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const file = ".gui-config-sampling-test";
+    defer std.Io.Dir.cwd().deleteFile(io, file) catch {};
+
+    var environ: Environ = .init(gpa);
+    defer environ.deinit();
+
+    var a: Config = .{};
+    a.sampling = .{
+        .temperature = 1.1,
+        .top_k = 0,
+        .top_p = 0.92,
+        .min_p = 0.07,
+        .repeat_penalty = 1.15,
+        .repeat_last_n = 256,
+        .presence_penalty = 0.4,
+        .frequency_penalty = -0.1,
+    };
+    try std.testing.expect(a.upsertPreset("creative", .{ .temperature = 1.4, .top_p = 0.98 }));
+    try std.testing.expect(a.upsertPreset("greedy", .{ .temperature = 0, .top_k = 1 }));
+    try a.save(io, gpa, &environ, file);
+
+    const b = Config.load(io, gpa, &environ, file);
+    try std.testing.expectEqual(a.sampling, b.sampling);
+    try std.testing.expectEqual(@as(usize, 2), b.preset_count);
+    try std.testing.expectEqualStrings("creative", b.presets[0].name.slice());
+    try std.testing.expectEqual(a.presets[0].sampling, b.presets[0].sampling);
+    try std.testing.expectEqualStrings("greedy", b.presets[1].name.slice());
+    try std.testing.expectEqual(a.presets[1].sampling, b.presets[1].sampling);
 }
 
 test "diffEnabled requires dit + text-encoder + vae" {

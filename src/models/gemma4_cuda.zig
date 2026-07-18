@@ -27,6 +27,7 @@ const qwen3 = @import("qwen3.zig");
 const cuda = @import("../gpu/cuda.zig");
 const ops = @import("../ops.zig");
 const kvmod = @import("../llm/kv_cache.zig");
+const sample = @import("../llm/sample.zig");
 const transformer = @import("transformer.zig");
 const transformer_gpu = @import("transformer_gpu.zig");
 
@@ -106,6 +107,10 @@ pub const CudaLM = struct {
     freqs_local: Buf,
     /// Device ones vector (len head_dim_global), for the weightless V RMS-norm.
     ones: Buf,
+    /// The suppress list as ready-made penalty entries: the device suppress
+    /// mask reuses the penalize scatter with an infinite presence penalty
+    /// (see suppressLogits). Arena-owned; empty when the model has none.
+    suppress_pen: []const sample.PenaltyEntry,
     bufs: Bufs,
     /// Per-layer K/V caches (variable stride = kvDim(l)).
     k_cache: []Growable,
@@ -163,6 +168,10 @@ pub const CudaLM = struct {
         self.k_cache = try alloc.alloc(Growable, cfg.n_layers);
         self.v_cache = try alloc.alloc(Growable, cfg.n_layers);
         try self.allocKvCaches();
+
+        const spen = try alloc.alloc(sample.PenaltyEntry, lm.suppress_tokens.len);
+        for (spen, lm.suppress_tokens) |*e, id| e.* = .{ .id = id, .count = 1 };
+        self.suppress_pen = spen;
 
         self.arena = arena;
         return self;
@@ -317,9 +326,105 @@ pub const CudaLM = struct {
         while (off < ids.len) {
             const n: usize = @min(prefill_chunk, ids.len - off);
             const last = (off + n == ids.len);
-            try self.embedChunk(ids[off..][0..n], if (last) logits else null);
+            try self.embedChunk(ids[off..][0..n], if (last) .{ .host = logits } else .none);
             off += n;
         }
+    }
+
+    /// Forward `ids`, leaving the last row's RAW logits resident in
+    /// bufs.logits for the on-device sampling ops.
+    fn forwardDeviceLogits(self: *CudaLM, io: std.Io, ids: []const u32) !void {
+        self.io = io;
+        std.debug.assert(ids.len >= 1 and ids.len <= self.remaining());
+        var off: usize = 0;
+        while (off < ids.len) {
+            const n: usize = @min(prefill_chunk, ids.len - off);
+            const last = (off + n == ids.len);
+            try self.embedChunk(ids[off..][0..n], if (last) .device else .none);
+            off += n;
+        }
+    }
+
+    /// Force the suppress_tokens to -inf on the DEVICE logits, mirroring
+    /// finalizeLogits's masking: reuses the penalize scatter with an infinite
+    /// presence penalty — repeat penalty 1.0 leaves the logit itself untouched
+    /// (x/1 is exact) and any finite logit minus +inf is exactly -inf.
+    fn suppressLogits(self: *CudaLM, lg: Buf) !void {
+        const sp: sample.Params = .{ .repeat_penalty = 1.0, .presence_penalty = std.math.inf(f32) };
+        var off: usize = 0;
+        while (off < self.suppress_pen.len) {
+            const n: usize = @min(sample.max_penalty_window, self.suppress_pen.len - off);
+            try self.be.opPenalize(lg, self.suppress_pen[off..][0..n], sp);
+            off += n;
+        }
+    }
+
+    /// Greedy decode without the vocab download. The tanh softcap is strictly
+    /// MONOTONIC, so the argmax over the raw (suppressed) device logits is the
+    /// argmax over the finalized logits — no device tanh needed. Matches
+    /// sample.argmax up to softcap rounding collapsing two distinct raw logits
+    /// onto one capped value (needs |logit| far beyond real model output).
+    pub fn stepArgmax(self: *CudaLM, io: std.Io, ids: []const u32) !u32 {
+        return self.stepArgmaxPen(io, ids, &.{}, .{});
+    }
+
+    /// `stepArgmax` with sampling penalties. Penalties are NOT monotonic over
+    /// the capped logits, so the winner comes from the finalized candidate set
+    /// (stepSelectPen's superset argument) instead of a raw device argmax.
+    pub fn stepArgmaxPen(self: *CudaLM, io: std.Io, ids: []const u32, pen: []const sample.PenaltyEntry, sp: sample.Params) !u32 {
+        if (pen.len != 0) {
+            const cap = self.maxSelect();
+            const out_id = try self.gpa.alloc(u32, cap);
+            defer self.gpa.free(out_id);
+            const out_logit = try self.gpa.alloc(f32, cap);
+            defer self.gpa.free(out_logit);
+            const count = try self.stepSelectPen(io, ids, pen, sp, out_id, out_logit);
+            var best: usize = 0; // highest logit, ties to the lowest id (sample.argmax)
+            for (1..count) |i| {
+                if (out_logit[i] > out_logit[best] or
+                    (out_logit[i] == out_logit[best] and out_id[i] < out_id[best])) best = i;
+            }
+            return out_id[best];
+        }
+        try self.forwardDeviceLogits(io, ids);
+        const be = self.be;
+        const b = &self.bufs;
+        const lg = offsetBufSized(b.logits, 0, self.cfg.vocab * 4);
+        try self.suppressLogits(lg);
+        try be.opArgmax(lg, self.cfg.vocab, b.argmax_out, &b.argmax_v, &b.argmax_i);
+        var idf: [1]f32 = undefined;
+        try be.tensorDownload(b.argmax_out, std.mem.sliceAsBytes(&idf));
+        return @intFromFloat(idf[0]);
+    }
+
+    /// Max candidates stepSelect can return (host buffer sizing for the engine).
+    pub fn maxSelect(self: *const CudaLM) usize {
+        _ = self;
+        return cuda.backend.topk_lanes * cuda.backend.topk_m;
+    }
+
+    /// Stochastic decode: on-device suppress + top-k over the RAW logits (the
+    /// monotonic softcap preserves the selection), then the candidates are
+    /// finalized on the host — exact softcap (bit-identical tanh), suppress
+    /// mask, penalties (gemma4.finalizeCandidates). Returns the candidate count.
+    pub fn stepSelect(self: *CudaLM, io: std.Io, ids: []const u32, out_id: []u32, out_logit: []f32) !usize {
+        return self.stepSelectPen(io, ids, &.{}, .{}, out_id, out_logit);
+    }
+
+    pub fn stepSelectPen(self: *CudaLM, io: std.Io, ids: []const u32, pen: []const sample.PenaltyEntry, sp: sample.Params, out_id: []u32, out_logit: []f32) !usize {
+        try self.forwardDeviceLogits(io, ids);
+        const be = self.be;
+        const b = &self.bufs;
+        const lg = offsetBufSized(b.logits, 0, self.cfg.vocab * 4);
+        try self.suppressLogits(lg);
+        const count = try be.opTopK(lg, self.cfg.vocab, &b.topk_v, &b.topk_i);
+        std.debug.assert(count <= out_id.len and count <= out_logit.len);
+        try be.tensorDownload(b.topk_v, std.mem.sliceAsBytes(out_logit[0..count]));
+        var idx_f: [cuda.backend.topk_lanes * cuda.backend.topk_m]f32 = undefined;
+        try be.tensorDownload(b.topk_i, std.mem.sliceAsBytes(idx_f[0..count]));
+        for (out_id[0..count], idx_f[0..count]) |*o, f| o.* = @intFromFloat(f);
+        self.lm.finalizeCandidates(out_id[0..count], out_logit[0..count], pen, sp);
+        return count;
     }
 
     /// Prefill text tokens (no logits) — for interleaving with prefillImage.
@@ -327,7 +432,7 @@ pub const CudaLM = struct {
         var off: usize = 0;
         while (off < ids.len) {
             const n: usize = @min(prefill_chunk, ids.len - off);
-            try self.embedChunk(ids[off..][0..n], null);
+            try self.embedChunk(ids[off..][0..n], .none);
             off += n;
         }
     }
@@ -344,10 +449,17 @@ pub const CudaLM = struct {
         std.debug.assert(total <= max_batch);
         self.bidir_prefill = true;
         defer self.bidir_prefill = false;
-        try self.forwardRows(embeds, null);
+        try self.forwardRows(embeds, .none);
     }
 
-    fn embedChunk(self: *CudaLM, ids: []const u32, logits: ?[]f32) !void {
+    /// Where a forward leaves the last row's logits: nowhere (prefill), a host
+    /// buffer (download + finalize — the CPU-sampling path), or resident on
+    /// the device in bufs.logits, RAW (no softcap/suppress) — for the GPU
+    /// sampling path, which suppresses on-device and finalizes the downloaded
+    /// candidates host-side (gemma4.finalizeCandidates).
+    const LogitsOut = union(enum) { none, host: []f32, device };
+
+    fn embedChunk(self: *CudaLM, ids: []const u32, out: LogitsOut) !void {
         const cfg = self.cfg;
         const n = ids.len;
         const x = try self.gpa.alloc(f32, n * cfg.hidden);
@@ -355,7 +467,7 @@ pub const CudaLM = struct {
         try qwen3.embedTokens(self.lm.embed, ids, x);
         const scale = cfg.embedScale();
         for (x) |*v| v.* *= scale;
-        try self.forwardRows(x, logits);
+        try self.forwardRows(x, out);
     }
 
     /// One batched forward over `n` pre-embedded rows at positions [len, len+n).
@@ -487,7 +599,7 @@ pub const CudaLM = struct {
         if (layer.out_scale != 1.0) try self.be.opScale(self.bufs.x, layer.out_scale, seq * self.cfg.hidden);
     }
 
-    fn forwardRows(self: *CudaLM, x_host: []const f32, logits: ?[]f32) !void {
+    fn forwardRows(self: *CudaLM, x_host: []const f32, out: LogitsOut) !void {
         const be = self.be;
         const cfg = self.cfg;
         const b = &self.bufs;
@@ -505,14 +617,20 @@ pub const CudaLM = struct {
             try transformer_gpu.decoderLayer(transformer.gemma4_spec, self, layer, l, n, pos0);
         }
 
-        if (logits) |out| {
+        if (out != .none) {
             const h = cfg.hidden;
             try be.qkNorm(offsetBufSized(b.x, (n - 1) * h * 4, h * 4), b.t, try nbuf(be, self.lm.final_norm), 1, h, eps);
             try self.lmHead(b.logits, b.t);
             try be.endBatch();
             self.len += n;
-            try be.tensorDownload(offsetBufSized(b.logits, 0, cfg.vocab * 4), std.mem.sliceAsBytes(out));
-            self.lm.finalizeLogits(out); // tanh softcap + suppress tokens
+            switch (out) {
+                .host => |dst| {
+                    try be.tensorDownload(offsetBufSized(b.logits, 0, cfg.vocab * 4), std.mem.sliceAsBytes(dst));
+                    self.lm.finalizeLogits(dst); // tanh softcap + suppress tokens
+                },
+                .device => {}, // RAW logits stay resident for the GPU sampling path
+                .none => unreachable,
+            }
         } else {
             try be.endBatch();
             self.len += n;
@@ -580,6 +698,11 @@ const Bufs = struct {
     t: Buf,
     attn_scratch: Buf,
     logits: Buf,
+    argmax_v: Buf,
+    argmax_i: Buf,
+    argmax_out: Buf,
+    topk_v: Buf,
+    topk_i: Buf,
 
     fn init(be: *Backend, cfg: gemma4.Config) !Bufs {
         // Height for the largest single batch (text chunk or whole image block),
@@ -605,6 +728,11 @@ const Bufs = struct {
             pc * cfg.hidden, // t
             @max(cfg.n_heads * nsplit, pc * cfg.n_heads * nsplit_prefill) * (hd_max + 4), // attn_scratch
             cfg.vocab, // logits
+            4096, // argmax_v (>= opArgmax lane count)
+            4096, // argmax_i
+            1, // argmax_out (1 id)
+            cuda.backend.topk_lanes * cuda.backend.topk_m, // topk_v
+            cuda.backend.topk_lanes * cuda.backend.topk_m, // topk_i
         };
         inline for (@typeInfo(Bufs).@"struct".fields, 0..) |f, i| {
             @field(self, f.name) = try be.tensorCreate(sizes[i] * 4);

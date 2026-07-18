@@ -1176,6 +1176,7 @@ fn buildSession(arena: std.mem.Allocator) !*chat.Session {
         .model_path = try arena.dupe(u8, llm),
         .system_prompt = try arena.dupe(u8, system_prompt),
         .seed = @truncate(@as(u96, @bitCast(std.Io.Clock.real.now(g_io).nanoseconds))),
+        .sampling = chat.samplingParams(&g_config),
         .backend = diffuser.toPipelineBackend(g_config.llm_backend),
         .images_enabled = hasDiffModel(&g_config),
         .mmproj_path = mmproj,

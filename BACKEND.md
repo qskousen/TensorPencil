@@ -134,9 +134,9 @@ Per-stage dispatch order everywhere is `if (cu_be)` → CUDA, `else if (gpu_ctx)
 | Prefill GEMM | `matmul.zig` microkernel | coopmat bf16/f16 + int8 s8→s32 | hand hgemm/igemm/i4gemm | **cuBLASLt** |
 | **GDN / gated DeltaNet** (qwen35) | ✅ | `gdn_gates`/`gdn_conv_step`/`gdn_delta_step` | `gdn_*` | ↤ |
 | Embedding gather | model | ⚠️ host-side | on-device `opEmbedGather*` | ↤ |
-| **Sampling** (argmax/temp/top-k/top-p) | ✅ `llm/sample.zig` | ↤ CPU (logits→host) | ↤ CPU | ↤ CPU |
+| **Sampling** (argmax/temp/top-k/top-p/min-p + repeat/presence/frequency penalties) | ✅ `llm/sample.zig` | ✅ on-device argmax/top-k select (qwen3) | ✅ on-device argmax/top-k select (qwen3/qwen35/gemma3/gemma4) | ↤ |
 
-**No GPU sampling kernel exists on any backend** — logits are always copied to host and sampled by `src/llm/sample.zig`.
+GPU sampling is a candidate select, not a full sampler: the device runs argmax (greedy) or a top-k reduce (`stepArgmax`/`stepSelect`) and downloads only the candidates; the CPU `llm/sample.zig` tail (temperature softmax, top-p, min-p, RNG) runs over them, bit-identical to full-vocab CPU sampling. The recent-window penalties (repeat/presence/frequency) also run on-device: the `penalize` kernel (PTX + SPIR-V, `opPenalize`) scatters the host-collected (unique id, subtract) entries onto the resident logits BEFORE the argmax/top-k (`stepArgmaxPen`/`stepSelectPen` on qwen3 all-GPU-backends, qwen35_cuda, gemma3_cuda, gemma4_cuda; bit-identical to CPU `applyPenalties` on CUDA via `div.rn`, ~2.5-ULP division tolerance on Vulkan; validated token-identical e2e vs the CPU-sampled spec-verify path). gemma4's logit finalization needs no device tanh: its softcap is strictly MONOTONIC, so the device selects over the RAW logits (after an on-device suppress mask — the penalize scatter with an infinite presence penalty), and only the downloaded candidates get the exact host softcap + penalties (`gemma4.finalizeCandidates`; validated token-identical to the old download path in all four sampling modes). Only the vulkan qwen35/gemma3 steppers (no stepSelect yet) still take the full logit download + CPU path.
 
 ### Speculative decoding (qwen3 only)
 

@@ -16,6 +16,7 @@ const elt = @import("elt.zig");
 const cublaslt = @import("cublaslt.zig");
 const cudnn = @import("cudnn.zig");
 const dtypes = @import("../../dtype.zig");
+const sample = @import("../../llm/sample.zig");
 
 const Context = ctxmod.Context;
 
@@ -271,6 +272,9 @@ pub const Backend = struct {
     fp8_a16: DeviceBuffer = .{},
     /// q8-quantized decode activation (opGemvQuantizeX / opGemvQuantQ8).
     q8_act: DeviceBuffer = .{},
+    /// Per-step penalty-entry wire for opPenalize (id + subtract pairs; tiny —
+    /// at most sample.max_penalty_window entries, uploaded each sampled token).
+    pen_wire: DeviceBuffer = .{},
 
     // Decode-graph state (see stateSetup): device address of g_state and the
     // graph-mode kernel entries sharing it.
@@ -530,6 +534,7 @@ pub const Backend = struct {
         self.tensorDestroy(&self.fp8_w16);
         self.tensorDestroy(&self.fp8_a16);
         self.tensorDestroy(&self.q8_act);
+        self.tensorDestroy(&self.pen_wire);
         self.tensorDestroy(&self.conv_w16);
         self.tensorDestroy(&self.conv_a16);
         self.tensorDestroy(&self.conv_c);
@@ -2553,6 +2558,23 @@ pub const Backend = struct {
     /// lanes each keep their `topk_m` highest (value,index). Caller downloads the
     /// returned count of (val,idx) pairs and does exact top-k on the CPU. Caller
     /// owns out_val/out_idx (>= count f32 each). Mirrors context.opTopK.
+    /// Apply the sampling penalties (llm/sample.zig penalizeLogit) to the
+    /// resident logits before an on-device argmax/top-k: uploads the tiny
+    /// (id, subtract) wire and scatters one thread per unique recent token.
+    /// Bit-identical to the CPU applyPenalties over the same logits. No-op on
+    /// an empty entry list.
+    pub fn opPenalize(self: *Backend, logits: DeviceBuffer, entries: []const sample.PenaltyEntry, sp: sample.Params) Error!void {
+        if (entries.len == 0) return;
+        self.ptic();
+        defer self.ptoc(.elt);
+        var wire: sample.PenaltyWire = undefined;
+        const w = sample.packPenaltyWireU32(entries, sp, &wire);
+        try self.ensureDeviceBuffer(&self.pen_wire, w.len * 4);
+        try self.tensorUpload(self.pen_wire, std.mem.sliceAsBytes(w));
+        const f = try self.eltFn(elt.penalize_ptx, "penalize");
+        try self.eltLaunch(f, logits, self.pen_wire, null, null, .{ @intCast(entries.len), 0, 0, 0, 0, 0 }, .{ sp.repeat_penalty, 0 }, entries.len);
+    }
+
     pub fn opTopK(self: *Backend, logits: DeviceBuffer, vocab: usize, out_val: *DeviceBuffer, out_idx: *DeviceBuffer) Error!usize {
         self.ptic();
         defer self.ptoc(.elt);
@@ -3092,7 +3114,6 @@ test "growable tensor grows in place" {
 // Gated on a CUDA device: the fused block-quant GEMVs against the CPU
 // quants.zig dequant + dot reference, all four formats.
 test "cuda argmax matches cpu argmax (incl. tie -> lowest index)" {
-    const sample = @import("../../llm/sample.zig");
     const gpa = std.testing.allocator;
     const be = Backend.init(gpa) catch return error.SkipZigTest;
     defer be.deinit();
@@ -3129,7 +3150,6 @@ test "cuda argmax matches cpu argmax (incl. tie -> lowest index)" {
 }
 
 test "cuda topk selects the true top-k set" {
-    const sample = @import("../../llm/sample.zig");
     const gpa = std.testing.allocator;
     const be = Backend.init(gpa) catch return error.SkipZigTest;
     defer be.deinit();
@@ -3172,6 +3192,61 @@ test "cuda topk selects the true top-k set" {
             const k = @min(k_want, vocab);
             for (0..k) |r| try std.testing.expectEqual(refc[r].id, cands[r].id);
         }
+    }
+}
+
+// The device penalize kernel must reproduce the CPU applyPenalties BIT-exactly
+// (div.rn/mul.rn/sub.rn are IEEE round-nearest, like Zig f32 math), so the GPU
+// sampling paths emit the same token the CPU path would for the same logits.
+test "cuda penalize matches cpu applyPenalties bit-exactly" {
+    const gpa = std.testing.allocator;
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+
+    var prng = std.Random.DefaultPrng.init(0x9E4A17);
+    const rand = prng.random();
+    const p: sample.Params = .{ .repeat_penalty = 1.3, .presence_penalty = 0.4, .frequency_penalty = 0.17, .repeat_last_n = 64 };
+    const vocabs = [_]usize{ 128, 151936 };
+    for (vocabs) |vocab| {
+        const logits = try gpa.alloc(f32, vocab);
+        defer gpa.free(logits);
+        for (logits) |*v| v.* = rand.floatNorm(f32) * 5.0; // mixed signs: both penalty branches
+
+        // A recent window with repeats (counts > 1) and out-of-order ids.
+        var recent: [40]u32 = undefined;
+        for (&recent) |*t| t.* = rand.uintLessThan(u32, @intCast(vocab));
+        recent[7] = recent[3]; // guaranteed duplicates
+        recent[21] = recent[3];
+
+        const want = try gpa.dupe(f32, logits);
+        defer gpa.free(want);
+        sample.applyPenalties(want, &recent, p);
+
+        var lg = try be.tensorCreate(vocab * 4);
+        defer be.tensorDestroy(&lg);
+        try be.tensorUpload(lg, std.mem.sliceAsBytes(logits));
+        var scratch: [sample.max_penalty_window]sample.PenaltyEntry = undefined;
+        try be.opPenalize(lg, sample.collectPenalties(&recent, p, &scratch), p);
+
+        const got = try gpa.alloc(f32, vocab);
+        defer gpa.free(got);
+        try be.tensorDownload(lg, std.mem.sliceAsBytes(got));
+        try std.testing.expectEqualSlices(f32, want, got);
+
+        // Composition sanity: argmax over the penalized device logits equals
+        // the CPU argmax over the CPU-penalized logits (the greedy path).
+        var out = try be.tensorCreate(4);
+        var sv: DeviceBuffer = .{};
+        var si: DeviceBuffer = .{};
+        defer {
+            be.tensorDestroy(&out);
+            be.tensorDestroy(&sv);
+            be.tensorDestroy(&si);
+        }
+        try be.opArgmax(lg, vocab, out, &sv, &si);
+        var got_f: [1]f32 = undefined;
+        try be.tensorDownload(out, std.mem.sliceAsBytes(&got_f));
+        try std.testing.expectEqual(sample.argmax(want), @as(u32, @intFromFloat(got_f[0])));
     }
 }
 

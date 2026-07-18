@@ -18,6 +18,7 @@ const gpu = @import("../gpu/context.zig");
 const safetensors = @import("../safetensors.zig");
 const ops = @import("../ops.zig");
 const spec = @import("../llm/spec.zig");
+const sample = @import("../llm/sample.zig");
 const transformer = @import("transformer.zig");
 const transformer_gpu = @import("transformer_gpu.zig");
 
@@ -501,6 +502,13 @@ pub const VulkanLM = struct {
     /// last position's logits on-device and return just that token id. Matches
     /// sample.argmax (temperature 0). The engine uses this for the greedy path.
     pub fn stepArgmax(self: *VulkanLM, io: std.Io, ids: []const u32) !u32 {
+        return self.stepArgmaxPen(io, ids, &.{}, .{});
+    }
+
+    /// `stepArgmax` with sampling penalties scattered onto the device logits
+    /// first (opPenalize; see llm/sample.zig) — keeps penalized greedy decode
+    /// on the GPU path instead of the full-vocab download.
+    pub fn stepArgmaxPen(self: *VulkanLM, io: std.Io, ids: []const u32, pen: []const sample.PenaltyEntry, sp: sample.Params) !u32 {
         var off: usize = 0;
         while (off < ids.len) {
             const n = if (self.len == 0)
@@ -512,6 +520,7 @@ pub const VulkanLM = struct {
         }
         const ctx = self.ctx;
         const b = &self.bufs;
+        try ctx.opPenalize(b.logits, pen, sp);
         try ctx.opArgmax(b.logits, qwen3.vocab_size, b.argmax_out, &b.argmax_v, &b.argmax_i);
         var id_f: [1]f32 = undefined;
         try ctx.tensorDownload(b.argmax_out, std.mem.sliceAsBytes(&id_f));
@@ -529,6 +538,13 @@ pub const VulkanLM = struct {
     /// vs the ~608 KB vocab). Returns the candidate count; the engine's Sampler
     /// finishes (softmax/top-p/RNG) on the CPU over this small set.
     pub fn stepSelect(self: *VulkanLM, io: std.Io, ids: []const u32, out_id: []u32, out_logit: []f32) !usize {
+        return self.stepSelectPen(io, ids, &.{}, .{}, out_id, out_logit);
+    }
+
+    /// `stepSelect` with sampling penalties scattered onto the device logits
+    /// before the top-k (opPenalize) — the selected candidates are the true
+    /// post-penalty top set, so penalized stochastic decode stays on the GPU.
+    pub fn stepSelectPen(self: *VulkanLM, io: std.Io, ids: []const u32, pen: []const sample.PenaltyEntry, sp: sample.Params, out_id: []u32, out_logit: []f32) !usize {
         var off: usize = 0;
         while (off < ids.len) {
             const n = if (self.len == 0)
@@ -540,6 +556,7 @@ pub const VulkanLM = struct {
         }
         const ctx = self.ctx;
         const b = &self.bufs;
+        try ctx.opPenalize(b.logits, pen, sp);
         const count = try ctx.opTopK(b.logits, qwen3.vocab_size, &b.topk_v, &b.topk_i);
         std.debug.assert(count <= out_id.len and count <= out_logit.len);
         try ctx.tensorDownload(b.topk_v, std.mem.sliceAsBytes(out_logit[0..count]));

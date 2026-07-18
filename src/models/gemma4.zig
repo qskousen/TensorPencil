@@ -35,6 +35,7 @@ const ops = @import("../ops.zig");
 const loader = @import("loader.zig");
 const transformer = @import("transformer.zig");
 const kv_cache_mod = @import("../llm/kv_cache.zig");
+const sample = @import("../llm/sample.zig");
 
 const Gguf = gguf_mod.Gguf;
 const WeightStore = weights_mod.WeightStore;
@@ -392,7 +393,53 @@ pub const Model = struct {
             if (id < logits.len) logits[id] = -std.math.inf(f32);
         }
     }
+
+    /// Finalize candidates a DEVICE top-k selected over the RAW (pre-softcap)
+    /// logits (gemma4_cuda.stepSelectPen): the exact host softcap (the same
+    /// tanh as finalizeLogits, so values are bit-identical to the CPU path),
+    /// the suppress mask, then the sampling penalties. This works because the
+    /// softcap is strictly monotonic — the raw-logit top-k IS the capped
+    /// top-k — and penalties only push seen tokens DOWN, so the post-penalty
+    /// top-k stays within the (much larger) downloaded candidate superset,
+    /// the same lane guarantee the plain top-k already relies on.
+    pub fn finalizeCandidates(self: *const Model, ids: []const u32, logits: []f32, pen: []const sample.PenaltyEntry, sp: sample.Params) void {
+        finalizeCandidatesRaw(self.cfg.final_logit_softcap, self.suppress_tokens, ids, logits, pen, sp);
+    }
 };
+
+/// `Model.finalizeCandidates` on explicit inputs (testable without a loaded
+/// model). Both id lists are sorted ascending: `suppress_sorted` by
+/// loadSuppressTokens, `pen` by sample.collectPenalties. Order matches the CPU
+/// path exactly: softcap, suppress to -inf, THEN penalties (penalizing -inf
+/// keeps it -inf, as applyPenalties over finalized logits does).
+pub fn finalizeCandidatesRaw(softcap: f32, suppress_sorted: []const u32, ids: []const u32, logits: []f32, pen: []const sample.PenaltyEntry, sp: sample.Params) void {
+    for (ids, logits) |id, *l| {
+        if (softcap != 0) l.* = softcap * std.math.tanh(l.* / softcap);
+        if (containsSorted(suppress_sorted, id)) l.* = -std.math.inf(f32);
+        if (penaltyCount(pen, id)) |count| l.* = sample.penalizeLogit(l.*, count, sp);
+    }
+}
+
+fn containsSorted(sorted: []const u32, id: u32) bool {
+    var lo: usize = 0;
+    var hi: usize = sorted.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (sorted[mid] < id) lo = mid + 1 else hi = mid;
+    }
+    return lo < sorted.len and sorted[lo] == id;
+}
+
+/// The occurrence count for `id` in the (id-sorted) penalty entries, if any.
+fn penaltyCount(pen: []const sample.PenaltyEntry, id: u32) ?f32 {
+    var lo: usize = 0;
+    var hi: usize = pen.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (pen[mid].id < id) lo = mid + 1 else hi = mid;
+    }
+    return if (lo < pen.len and pen[lo].id == id) pen[lo].count else null;
+}
 
 /// One Gemma 4 layer over `x` [seq, hidden], residuals added in place. `x`
 /// holds only the `seq` new tokens (at absolute positions cache.len..). The
@@ -468,7 +515,9 @@ pub const Scratch = struct {
     }
 };
 
-/// Read tokenizer.ggml.suppress_tokens ([INT32]) into an owned u32 slice.
+/// Read tokenizer.ggml.suppress_tokens ([INT32]) into an owned u32 slice,
+/// sorted ascending (finalizeCandidates binary-searches it; the masking loop
+/// in finalizeLogits is order-independent).
 fn loadSuppressTokens(alloc: std.mem.Allocator, g: *const Gguf) ![]const u32 {
     const arr = g.getArr("tokenizer.ggml.suppress_tokens") orelse return &.{};
     const out = try alloc.alloc(u32, arr.len);
@@ -481,6 +530,7 @@ fn loadSuppressTokens(alloc: std.mem.Allocator, g: *const Gguf) ![]const u32 {
             else => 0,
         };
     }
+    std.mem.sort(u32, out, {}, std.sort.asc(u32));
     return out;
 }
 
@@ -616,4 +666,40 @@ test "gemma4 loads from real gemma4-12b gguf" {
     try std.testing.expect(lm.suppress_tokens.len >= 1);
     try std.testing.expectEqual(@as(usize, 256), lm.layers[0].q_norm.len);
     try std.testing.expectEqual(@as(usize, 512), lm.layers[5].q_norm.len);
+}
+
+// The gemma4_cuda GPU sampling path selects top-k over RAW device logits and
+// finalizes only the downloaded candidates on the host. Every finalized
+// candidate value must be BIT-identical to the full-vocab CPU path
+// (finalizeLogits + sample.applyPenalties) — same tanh, same formula order.
+test "finalizeCandidatesRaw matches the full-vocab finalize + penalties path" {
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xF1A4);
+    const rand = prng.random();
+    const vocab = 4096;
+    const softcap: f32 = 30.0;
+    const suppress = [_]u32{ 5, 100, 2000 }; // sorted, incl. one also-penalized id
+    const sp: sample.Params = .{ .repeat_penalty = 1.3, .presence_penalty = 0.4, .frequency_penalty = 0.17 };
+    const recent = [_]u32{ 9, 40, 9, 2000, 7, 9 }; // repeats (count 3) + a suppressed id
+
+    const raw = try gpa.alloc(f32, vocab);
+    defer gpa.free(raw);
+    for (raw) |*v| v.* = rand.floatNorm(f32) * 8.0;
+
+    // Full-vocab CPU reference: finalizeLogits math, then applyPenalties.
+    const ref = try gpa.dupe(f32, raw);
+    defer gpa.free(ref);
+    for (ref) |*v| v.* = softcap * std.math.tanh(v.* / softcap);
+    for (suppress) |id| ref[id] = -std.math.inf(f32);
+    sample.applyPenalties(ref, &recent, sp);
+
+    // Candidate path over a full-vocab "superset" — every value bit-identical.
+    const ids = try gpa.alloc(u32, vocab);
+    defer gpa.free(ids);
+    for (ids, 0..) |*d, i| d.* = @intCast(i);
+    const got = try gpa.dupe(f32, raw);
+    defer gpa.free(got);
+    var scratch: [sample.max_penalty_window]sample.PenaltyEntry = undefined;
+    finalizeCandidatesRaw(softcap, &suppress, ids, got, sample.collectPenalties(&recent, sp, &scratch), sp);
+    try std.testing.expectEqualSlices(f32, ref, got);
 }

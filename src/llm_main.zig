@@ -19,8 +19,10 @@ const usage =
     \\              [--backend cpu|zig-cuda|cuda|vulkan]
     \\              [--system <text>] [--max-tokens <n>] [--max-context <n>]
     \\              [--kv-dtype f32|f16]
-    \\              [--temperature <t>] [--top-k <n>] [--top-p <p>]
-    \\              [--repeat-penalty <r>] [--seed <n>] [--greedy] [--no-think]
+    \\              [--temperature <t>] [--top-k <n>] [--top-p <p>] [--min-p <p>]
+    \\              [--repeat-penalty <r>] [--repeat-last-n <n>]
+    \\              [--presence-penalty <p>] [--frequency-penalty <p>]
+    \\              [--seed <n>] [--greedy] [--no-think]
     \\              [--spec-k <n>] [--draft-model <qwen3.safetensors>]
     \\              [--eagle <eagle3.safetensors>] [--tree <nodes>]
     \\              [--vram-budget <GiB>|min] [--cpu-layers tail|attn] [--offload-grow]
@@ -41,6 +43,14 @@ const usage =
     \\capped at the trained length.
     \\Sampling defaults follow Qwen3 non-thinking recommendations:
     \\temperature 0.7, top-k 20, top-p 0.8. --greedy = --temperature 0.
+    \\--min-p drops candidates below <p> times the top candidate's
+    \\probability (default 0 = off). The penalties scan the last
+    \\--repeat-last-n context tokens (default 64; 0 disables them):
+    \\--repeat-penalty divides a seen token's positive logit (default 1 =
+    \\off), --presence-penalty subtracts a flat amount from every seen
+    \\token, --frequency-penalty subtracts per occurrence (defaults 0 =
+    \\off; llama.cpp formulas). Any active penalty needs the full logits,
+    \\so it takes the CPU-sampling path on GPU backends (slower per token).
     \\Seed defaults to the clock; pass --seed for reproducible output.
     \\Reasoning is on by default for models that support it (Qwen3.5, Gemma 4):
     \\the model emits a thought block before its answer. --no-think disables it
@@ -148,8 +158,16 @@ pub fn main(init: std.process.Init) !void {
             opts.sampling.top_k = try std.fmt.parseInt(usize, try nextArg(args, &i), 10);
         } else if (std.mem.eql(u8, a, "--top-p")) {
             opts.sampling.top_p = try std.fmt.parseFloat(f32, try nextArg(args, &i));
+        } else if (std.mem.eql(u8, a, "--min-p")) {
+            opts.sampling.min_p = try std.fmt.parseFloat(f32, try nextArg(args, &i));
         } else if (std.mem.eql(u8, a, "--repeat-penalty")) {
             opts.sampling.repeat_penalty = try std.fmt.parseFloat(f32, try nextArg(args, &i));
+        } else if (std.mem.eql(u8, a, "--repeat-last-n")) {
+            opts.sampling.repeat_last_n = try std.fmt.parseInt(usize, try nextArg(args, &i), 10);
+        } else if (std.mem.eql(u8, a, "--presence-penalty")) {
+            opts.sampling.presence_penalty = try std.fmt.parseFloat(f32, try nextArg(args, &i));
+        } else if (std.mem.eql(u8, a, "--frequency-penalty")) {
+            opts.sampling.frequency_penalty = try std.fmt.parseFloat(f32, try nextArg(args, &i));
         } else if (std.mem.eql(u8, a, "--seed")) {
             opts.seed = try std.fmt.parseInt(u64, try nextArg(args, &i), 10);
         } else if (std.mem.eql(u8, a, "--greedy")) {
