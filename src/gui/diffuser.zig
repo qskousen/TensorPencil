@@ -75,6 +75,53 @@ const LogWriter = struct {
 
 pub const GenStatus = enum(u8) { pending, generating, done, failed, canceled };
 
+/// The model-defining config for one generation — exactly the fields that decide
+/// which `pipeline.Session` an image needs (paths + backend + VAE decode path).
+/// Captured onto each `GenImage` at `enqueue` so a mid-queue backend/model switch
+/// only affects images enqueued AFTER it: already-queued images finish on the
+/// config they were created with, and the worker reloads the pipeline at the seam
+/// where consecutive images disagree. Path strings are gpa-owned dupes (freed in
+/// `freeGenImage`); preview/steps/dims stay live (cosmetic / already per-image).
+pub const ModelConfig = struct {
+    dit_path: []const u8,
+    vae_path: []const u8,
+    text_encoder_path: []const u8,
+    backend: pipeline.Backend,
+    vae_decode: pipeline.VaeDecode,
+
+    /// Duplicate the path strings into gpa-owned storage.
+    fn dupe(
+        gpa: std.mem.Allocator,
+        dit: []const u8,
+        vae: []const u8,
+        te: []const u8,
+        backend: pipeline.Backend,
+        vae_decode: pipeline.VaeDecode,
+    ) !ModelConfig {
+        const d = try gpa.dupe(u8, dit);
+        errdefer gpa.free(d);
+        const v = try gpa.dupe(u8, vae);
+        errdefer gpa.free(v);
+        const t = try gpa.dupe(u8, te);
+        return .{ .dit_path = d, .vae_path = v, .text_encoder_path = t, .backend = backend, .vae_decode = vae_decode };
+    }
+
+    fn deinit(self: ModelConfig, gpa: std.mem.Allocator) void {
+        gpa.free(self.dit_path);
+        gpa.free(self.vae_path);
+        gpa.free(self.text_encoder_path);
+    }
+
+    /// Do these two configs need the same resident pipeline? (Paths + backend +
+    /// decode path — the fields `pipeline.Session.init` keys the session on.)
+    fn eql(a: ModelConfig, b: ModelConfig) bool {
+        return a.backend == b.backend and a.vae_decode == b.vae_decode and
+            std.mem.eql(u8, a.dit_path, b.dit_path) and
+            std.mem.eql(u8, a.vae_path, b.vae_path) and
+            std.mem.eql(u8, a.text_encoder_path, b.text_encoder_path);
+    }
+};
+
 /// An image awaiting or undergoing generation. Progress/status fields are
 /// atomics written by the diffusion worker and read by the UI thread; `rgba` is
 /// published before `status` flips to done (acquire/release), so a done image
@@ -120,6 +167,10 @@ pub const GenImage = struct {
     // them at these defaults — matching the pre-studio behavior).
     req_negative: []u8 = "", // owned (gpa) when non-empty; "" = none
     req_cfg: f32 = 1.0,
+    /// Model/backend snapshot, stamped by `enqueue` (gpa-owned paths). Null for
+    /// images that never went through the queue (e.g. user-attached inputs, tests);
+    /// the worker falls back to the engine's live config for those.
+    model: ?ModelConfig = null,
 
     pub fn get(self: *const GenImage) GenStatus {
         return @enumFromInt(self.status.load(.acquire));
@@ -131,6 +182,7 @@ pub fn freeGenImage(gpa: std.mem.Allocator, gi: *GenImage) void {
     if (gi.req_negative.len > 0) gpa.free(gi.req_negative);
     if (gi.rgba) |r| gpa.free(r);
     if (gi.preview) |p| gpa.free(p);
+    if (gi.model) |m| m.deinit(gpa);
     gpa.destroy(gi);
 }
 
@@ -160,16 +212,6 @@ pub const DiffConfig = struct {
     /// Directory finished images are written to (with AUTOMATIC1111 metadata).
     /// Null (or empty) disables saving. Duped into the engine on init.
     output_dir: ?[]const u8 = null,
-};
-
-/// A requested diffusion-model path set awaiting application (gpa-owned dupes).
-const PendingDiffPaths = struct {
-    dit: []u8,
-    vae: []u8,
-    te: []u8,
-    taew: ?[]u8,
-    backend: pipeline.Backend,
-    vae_decode: pipeline.VaeDecode,
 };
 
 /// Injected VRAM coordination. The chat session backs these with LLM layer
@@ -328,11 +370,18 @@ pub const Diffuser = struct {
     /// re-enable the TAESD preview without re-duping. Null if none configured.
     taew_owned: ?[]const u8 = null,
     preview_method: config.Preview = .taesd,
+    /// Live preview controls, shared with the running worker's sampling loop (via
+    /// `opts.preview_live`). `setPreview`/`setPreviewSize` write these so a method
+    /// or quality change shows on the next step — even mid-image. Address is stable
+    /// (the Diffuser outlives its worker; deinit joins the thread first).
+    live_preview: pipeline.LivePreview = .{},
     /// Backs the live path strings after a model swap (reset+re-dupe per swap).
     /// The initial paths point into the caller's arena.
     path_store: std.heap.ArenaAllocator,
-    /// A requested model swap awaiting an idle queue (gpa-owned).
-    paths_pending: ?PendingDiffPaths = null,
+    /// The model config the resident `session` is currently loaded for (gpa-owned
+    /// dupes; null when no session). The worker compares the next image's snapshot
+    /// against this to decide whether to reuse the pipeline or reload at the seam.
+    loaded: ?ModelConfig = null,
 
     /// Directory finished images are saved to (gpa-owned; null = saving off).
     /// Updated live from settings via `setOutputDir` (UI thread, queue idle);
@@ -390,7 +439,20 @@ pub const Diffuser = struct {
 
     /// Append a generation request to the unified queue (engine takes ownership
     /// of `gi`). The caller may keep a borrowed pointer for its own display.
+    ///
+    /// Stamps the CURRENT model config (paths / backend / VAE decode) onto the
+    /// image so a later backend/model switch only affects images enqueued after
+    /// this one — already-queued images finish on the config they were created
+    /// with (the worker reloads the pipeline at the seam where they disagree).
     pub fn enqueue(self: *Diffuser, gi: *GenImage) !void {
+        if (gi.model == null) gi.model = try ModelConfig.dupe(
+            self.gpa,
+            self.opts.dit_path,
+            self.opts.vae_path,
+            self.opts.text_encoder_path,
+            self.opts.backend,
+            self.opts.vae_decode,
+        );
         try self.queue.append(self.gpa, gi);
     }
 
@@ -453,12 +515,15 @@ pub const Diffuser = struct {
             s.deinit();
             self.session.store(null, .release);
         }
+        if (self.loaded) |l| {
+            l.deinit(self.gpa);
+            self.loaded = null;
+        }
     }
 
     pub fn deinit(self: *Diffuser) void {
         if (self.thread) |t| t.join();
         self.freeSession();
-        self.freePendingPaths();
         if (self.output_dir) |o| self.gpa.free(o);
         self.path_store.deinit();
         // The engine owns every queued image (chat + studio); free them here.
@@ -526,32 +591,40 @@ pub const Diffuser = struct {
         self.output_dir = if (want) |w| self.gpa.dupe(u8, w) catch null else null;
     }
 
-    /// Set the live-preview method and reconcile the derived `opts` fields.
+    /// Set the live-preview method. Takes effect on the NEXT sampling step, even
+    /// mid-image: the running worker reads `live_preview` each step, so there's no
+    /// busy-bail. `taehv` is preloaded up front (whenever a taew is configured) so
+    /// a mid-image switch to TAESD is instant.
     pub fn setPreview(self: *Diffuser, method: config.Preview) void {
-        if (self.busy.load(.acquire)) return;
         self.preview_method = method;
+        // config.Preview values match pipeline's method encoding (0=none,
+        // 1=latent2rgb, 2=taesd).
+        self.live_preview.method.store(@intFromEnum(method), .release);
         self.refreshPreview();
     }
 
     /// Set the TAESD preview resolution (latent-grid divisor; see
-    /// pipeline.Options.preview_ds). Applied live; ignored while a generation is
-    /// in flight (picked up on the next enqueue).
+    /// pipeline.Options.preview_ds). Applied live — mid-image on the next step.
     pub fn setPreviewSize(self: *Diffuser, preview_ds: usize) void {
-        if (self.busy.load(.acquire)) return;
         self.opts.preview_ds = preview_ds;
+        self.live_preview.ds.store(@intCast(preview_ds), .release);
     }
 
-    /// Reconcile the live-preview fields of `opts` with `preview_method` and the
-    /// current taew path.
+    /// Reconcile the STATIC preview fields of `opts` (fallback when no live
+    /// control) with `preview_method`. The worker always attaches `live_preview`
+    /// and passes `taew_owned` as the taew path, so these are just belt-and-braces.
     fn refreshPreview(self: *Diffuser) void {
         self.opts.preview = self.preview_method != .none;
         self.opts.taew_path = if (self.preview_method == .taesd) self.taew_owned else null;
     }
 
-    /// Request a model swap (new paths/backend/decode). DEFERRED until the queue
-    /// is idle so in-flight/queued images finish on the current model; then
-    /// `maybeApplyPaths` applies it (freeing the resident pipeline so the next
-    /// image reloads). Path args are borrowed (duped here).
+    /// Update the current model config (new paths/backend/decode) for FUTURE
+    /// enqueues. Takes effect immediately as the source `enqueue` snapshots onto
+    /// each image — already-queued images keep the config they were stamped with,
+    /// and the worker reloads the resident pipeline at the seam where consecutive
+    /// images disagree. When the queue is fully idle, the now-stale resident
+    /// pipeline is dropped here so a switch returns its VRAM promptly. Path args
+    /// are borrowed (re-duped into `path_store`).
     pub fn requestPaths(
         self: *Diffuser,
         dit: []const u8,
@@ -561,48 +634,38 @@ pub const Diffuser = struct {
         backend: pipeline.Backend,
         vae_decode: pipeline.VaeDecode,
     ) void {
-        self.freePendingPaths();
-        self.paths_pending = .{
-            .dit = self.gpa.dupe(u8, dit) catch return,
-            .vae = self.gpa.dupe(u8, vae) catch return,
-            .te = self.gpa.dupe(u8, te) catch return,
-            .taew = if (taew) |t| (self.gpa.dupe(u8, t) catch null) else null,
-            .backend = backend,
-            .vae_decode = vae_decode,
-        };
-        self.maybeApplyPaths();
-    }
-
-    fn freePendingPaths(self: *Diffuser) void {
-        if (self.paths_pending) |p| {
-            self.gpa.free(p.dit);
-            self.gpa.free(p.vae);
-            self.gpa.free(p.te);
-            if (p.taew) |t| self.gpa.free(t);
-            self.paths_pending = null;
-        }
-    }
-
-    /// Apply a pending model swap once the queue has drained. Called from
-    /// `requestPaths` and each `pump`. Repoints the path slices at `path_store`.
-    fn maybeApplyPaths(self: *Diffuser) void {
-        const p = self.paths_pending orelse return;
-        if (self.busy.load(.acquire)) return; // an image is generating
-        if (self.nextPending() != null) return; // more queued
         _ = self.path_store.reset(.retain_capacity);
         const a = self.path_store.allocator();
-        self.opts.dit_path = a.dupe(u8, p.dit) catch return;
-        self.opts.vae_path = a.dupe(u8, p.vae) catch return;
-        self.opts.text_encoder_path = a.dupe(u8, p.te) catch return;
-        self.opts.backend = p.backend;
-        self.opts.vae_decode = p.vae_decode;
-        self.taew_owned = if (p.taew) |t| (a.dupe(u8, t) catch null) else null;
+        self.opts.dit_path = a.dupe(u8, dit) catch return;
+        self.opts.vae_path = a.dupe(u8, vae) catch return;
+        self.opts.text_encoder_path = a.dupe(u8, te) catch return;
+        self.opts.backend = backend;
+        self.opts.vae_decode = vae_decode;
+        self.taew_owned = if (taew) |t| (a.dupe(u8, t) catch null) else null;
         self.refreshPreview(); // taew_path follows the (possibly new) taew_owned
-        self.freePendingPaths();
-        // Free the resident (old-model) pipeline so the next image reloads with
-        // the new paths. Safe here: no worker in flight and nothing queued.
-        self.freeSession();
-        std.log.info("diffusion model switched", .{});
+        self.dropStaleSession();
+    }
+
+    /// Free the resident pipeline when it's loaded for a config the current
+    /// defaults no longer match AND the queue is fully idle (no worker, nothing
+    /// pending) — so a model/backend switch made while idle returns the old VRAM
+    /// at once. A mid-queue switch is NOT dropped here: queued images still carry
+    /// (and need) their own snapshot, so the worker reloads lazily at the seam.
+    fn dropStaleSession(self: *Diffuser) void {
+        if (self.busy.load(.acquire)) return;
+        if (self.nextPending() != null) return;
+        const l = self.loaded orelse return; // nothing resident
+        const cur: ModelConfig = .{
+            .dit_path = self.opts.dit_path,
+            .vae_path = self.opts.vae_path,
+            .text_encoder_path = self.opts.text_encoder_path,
+            .backend = self.opts.backend,
+            .vae_decode = self.opts.vae_decode,
+        };
+        if (!ModelConfig.eql(l, cur)) {
+            self.freeSession();
+            std.log.info("diffusion model switched", .{});
+        }
     }
 
     /// UI-thread, once per frame: reap a finished diffusion, then start the next
@@ -614,12 +677,24 @@ pub const Diffuser = struct {
             self.thread = null;
         }
         const gi = self.nextPending() orelse {
-            // Queue drained. Keep the model resident so a later gen reuses it;
-            // apply a pending swap and let the coordinator undo any eviction.
-            self.maybeApplyPaths();
+            // Queue drained. Keep the model resident so a later gen reuses it —
+            // unless the config was switched mid-queue and it's now stale, in
+            // which case drop it here to return its VRAM. Let the coordinator
+            // undo any eviction.
+            self.dropStaleSession();
             self.vram.exit(self.vram.ctx);
             return;
         };
+        // Seam reconcile: if the resident pipeline is loaded for a different config
+        // than THIS image needs (a backend/model switch made after it was enqueued),
+        // free it now — on the UI thread, where no status-bar reader can race the
+        // free — so the worker reloads for gi's snapshot. Images without a snapshot
+        // (unqueued attachments) leave the resident session as-is.
+        if (gi.model) |m| {
+            if (self.loaded) |l| {
+                if (!ModelConfig.eql(l, m)) self.freeSession();
+            }
+        }
         // Make VRAM room for the image model before it loads (the worker
         // auto-budgets from live free VRAM).
         self.vram.enter(self.vram.ctx);
@@ -705,7 +780,23 @@ pub const Diffuser = struct {
     }
 
     fn worker(self: *Diffuser, gi: *GenImage) void {
+        // Start from the engine's live config (preview method / defaults / output)
+        // then override the model-defining fields from THIS image's snapshot — so a
+        // backend/model switch made after `gi` was enqueued doesn't retro-apply to
+        // it. Images that never went through the queue (no snapshot) use live opts.
         var opts = self.opts;
+        const want: ModelConfig = gi.model orelse .{
+            .dit_path = self.opts.dit_path,
+            .vae_path = self.opts.vae_path,
+            .text_encoder_path = self.opts.text_encoder_path,
+            .backend = self.opts.backend,
+            .vae_decode = self.opts.vae_decode,
+        };
+        opts.dit_path = want.dit_path;
+        opts.vae_path = want.vae_path;
+        opts.text_encoder_path = want.text_encoder_path;
+        opts.backend = want.backend;
+        opts.vae_decode = want.vae_decode;
         opts.prompt = gi.prompt;
         opts.negative = gi.req_negative;
         opts.cfg = gi.req_cfg;
@@ -714,6 +805,12 @@ pub const Diffuser = struct {
         opts.steps = gi.req_steps;
         opts.seed = gi.req_seed;
         opts.on_step = .{ .ctx = gi, .step = onStep };
+        // Live preview: the sampling loop reads method + resolution each step so a
+        // change made mid-image shows on the next one. Always pass the configured
+        // taew path (not just when TAESD is the current method) so the decoder is
+        // preloaded and a live switch to TAESD is instant.
+        opts.preview_live = &self.live_preview;
+        opts.taew_path = self.taew_owned;
         opts.cancel = &gi.cancel; // UI Cancel button aborts sampling
         opts.reclaim = .{ .ctx = self, .call = reclaimThunk }; // free LLM VRAM on VAE OOM
         // Resident-weight budget from the coordinator (chat: limit − LLM
@@ -728,7 +825,11 @@ pub const Diffuser = struct {
         var lw = LogWriter.init(&log_buf);
         const progress = &lw.writer;
 
-        // Load the diffusion model ONCE and keep it resident across the queue.
+        // Load the diffusion model when none is resident and keep it across the
+        // queue. A mid-queue backend/model switch is reconciled by `pump` on the UI
+        // thread BEFORE this worker spawns (it frees the stale session so `session`
+        // is null here) — freeing on the worker thread would race the status-bar
+        // readers, which sample `session` without gating on `busy`.
         var sess = self.session.load(.acquire);
         if (sess == null) {
             const t_load = nowNs(self.io);
@@ -741,6 +842,15 @@ pub const Diffuser = struct {
             };
             std.log.info("[vram] diffusion model loaded in {d:.1}s", .{@as(f64, @floatFromInt(nowNs(self.io) - t_load)) / 1e9});
             self.session.store(sess, .release);
+            // Record what's resident (gpa-owned; freed on the next reload / free).
+            self.loaded = ModelConfig.dupe(
+                self.gpa,
+                want.dit_path,
+                want.vae_path,
+                want.text_encoder_path,
+                want.backend,
+                want.vae_decode,
+            ) catch null;
         }
         var img = sess.?.generate(opts, progress) catch |err| {
             const st: GenStatus = if (err == error.Canceled) .canceled else blk: {

@@ -87,6 +87,22 @@ pub const VaeDecode = enum { auto, whole, gpu_tiled, cpu_tiled };
 /// resolution). Valid only for the duration of the `step` callback — copy it.
 pub const Preview = struct { rgb: []const u8, width: usize, height: usize };
 
+/// Live preview controls, read once per sampling step so a caller (the GUI) can
+/// change the preview METHOD or RESOLUTION mid-generation and see it on the very
+/// next completed step — no reload, no waiting for the image to finish. When
+/// `Options.preview_live` points at one of these, it OVERRIDES the static
+/// `preview`/`preview_ds` fields each step; the static fields are the fallback
+/// for callers that don't need live control (the CLI).
+pub const LivePreview = struct {
+    /// 0 = none, 1 = latent2rgb, 2 = taesd (approx-VAE). Matches the GUI's
+    /// `config.Preview` enum values. A `taesd` request falls back to latent2rgb
+    /// when no taew decoder loaded. Read/written with acquire/release.
+    method: std.atomic.Value(u8) = .init(0),
+    /// Latent-resolution divisor for the taesd decode (0 = adaptive default);
+    /// same meaning as `Options.preview_ds`. Applied only to the taesd path.
+    ds: std.atomic.Value(u32) = .init(0),
+};
+
 /// Per-step progress hook. `step(ctx, done, total, preview)` is called once
 /// after each sampling step, so a caller (e.g. a GUI) can show a live bar and
 /// (when `Options.preview` is set) a live latent2rgb preview.
@@ -128,6 +144,11 @@ pub const Options = struct {
     /// decoded at 1/`preview_ds` of the latent grid. 0 selects the adaptive
     /// default (targets ~256px). Larger = faster but blurrier.
     preview_ds: usize = 0,
+    /// Optional live preview controls (see `LivePreview`). When set, the preview
+    /// method + resolution are read from it each step (mid-generation switching);
+    /// `preview`/`preview_ds` above are the static fallback. The taew decoder is
+    /// still loaded up front (from `taew_path`) so switching TO taesd is instant.
+    preview_live: ?*const LivePreview = null,
     /// Optional cancel flag, polled between sampling steps and before the VAE
     /// decode. When it flips true, `generate` unwinds and returns
     /// `error.Canceled` (a caller-driven stop, not a failure).
@@ -540,8 +561,16 @@ pub const Session = struct {
                 cu_ws = try dit_cuda.Workspace.init(b, lat_h, lat_w, cu_seq_cap);
             }
 
+            // A preview can be produced this run when there's a step hook AND
+            // either the static preview is on OR a live control is attached (which
+            // can toggle it on mid-generation). When a live control is present we
+            // allocate the (small) scratch buffers and preload the taew decoder up
+            // front regardless of the CURRENT method, so a mid-run switch to any
+            // method takes effect on the next step with no reload.
+            const preview_active = opts.on_step != null and (opts.preview or opts.preview_live != null);
+
             // Scratch for the per-step latent2rgb preview (latent resolution RGB8).
-            const preview_scratch: ?[]u8 = if (opts.preview and opts.on_step != null)
+            const preview_scratch: ?[]u8 = if (preview_active)
                 try gpa.alloc(u8, lat_h * lat_w * 3)
             else
                 null;
@@ -552,31 +581,34 @@ pub const Session = struct {
             // raw noisy latent `x` — matching ComfyUI's preview (it decodes the
             // `denoised` sample), so the preview reads as a blurry image that
             // sharpens rather than noise that resolves only at the last steps.
-            const preview_x0: ?[]f32 = if (opts.preview and opts.on_step != null)
+            const preview_x0: ?[]f32 = if (preview_active)
                 try gpa.alloc(f32, x.len)
             else
                 null;
             defer if (preview_x0) |p| gpa.free(p);
 
-            // Optional taew2_1 (TAEHV) approx-VAE for a sharper preview.
+            // Clamp a latent-resolution divisor to the grid so a large divisor on
+            // a small latent can't collapse to a 0-sized decode. 0 → the adaptive
+            // default that targets a ~256px preview.
+            const clampDs = struct {
+                fn f(ds: usize, lh: usize, lw: usize) usize {
+                    return @min(@max(1, @min(lh, lw)), if (ds > 0) ds else @max(1, @max(lh, lw) / 32));
+                }
+            }.f;
+
+            // Optional taew2_1 (TAEHV) approx-VAE for a sharper preview. Loaded up
+            // front whenever a preview is active and a taew is configured — even if
+            // the current method isn't taesd — so a live switch to taesd is instant.
             var taew_st: ?safetensors.SafeTensors = null;
             defer if (taew_st) |*s| s.deinit();
             var taehv_dec: ?taehv_mod.Decoder = null;
             defer if (taehv_dec) |*d| d.deinit();
-            // Downsample factor for the preview decode. An explicit `opts.preview_ds`
-            // (from the GUI's TAESD-size setting) wins; 0 falls back to the adaptive
-            // default that targets a ~256px preview. Clamp to the latent grid so a
-            // large divisor on a small latent can't collapse to a 0-sized decode.
-            const preview_ds: usize = @min(
-                @max(1, @min(lat_h, lat_w)),
-                if (opts.preview_ds > 0) opts.preview_ds else @max(1, @max(lat_h, lat_w) / 32),
-            );
-            if (opts.preview and opts.on_step != null) if (opts.taew_path) |tp| {
+            if (preview_active) if (opts.taew_path) |tp| {
                 if (safetensors.SafeTensors.open(gpa, io, tp)) |tst| {
                     taew_st = tst;
                     if (taehv_mod.Decoder.load(gpa, &taew_st.?)) |d| {
                         taehv_dec = d;
-                        try note(progress, "preview: taew2_1 approx-VAE (1/{d} latent)\n", .{preview_ds});
+                        try note(progress, "preview: taew2_1 approx-VAE ready\n", .{});
                     } else |err| try note(progress, "taew2_1 load failed ({t}); latent2rgb preview\n", .{err});
                 } else |err| try note(progress, "taew2_1 open failed ({t}); latent2rgb preview\n", .{err});
             };
@@ -607,33 +639,51 @@ pub const Session = struct {
                     var pv: ?Preview = null;
                     var taew_rgb: ?[]u8 = null;
                     defer if (taew_rgb) |r| gpa.free(r);
-                    // Denoised (x0) estimate = x - sigma*v. `eulerStep` above set
-                    // x to x_{i+1} = x_i + (sigma_{i+1} - sigma_i)*v, so the clean
-                    // estimate in terms of the post-step latent is x - sigma_{i+1}*v
-                    // (collapses to x on the final step where sigma_{i+1}==0).
-                    const x0: []const f32 = if (preview_x0) |px0| blk: {
-                        const s_next = sigmas[i + 1];
-                        for (px0, x, v) |*o, xi, vi| o.* = xi - s_next * vi;
-                        break :blk px0;
-                    } else x;
-                    if (taehv_dec) |*d| taew_blk: {
-                        const th = lat_h / preview_ds;
-                        const tw = lat_w / preview_ds;
-                        const small = downsampleLatent(gpa, x0, lat_h, lat_w, preview_ds) catch break :taew_blk;
-                        defer gpa.free(small);
-                        const rgb = if (cu_be) |b|
-                            (taehv_cuda_mod.decode(d, b, gpa, small, th, tw) catch break :taew_blk)
-                        else if (gpu_ctx) |gc|
-                            (taehv_gpu_mod.decode(d, gc, gpa, small, th, tw) catch break :taew_blk)
-                        else
-                            (d.decode(io, gpa, small, th, tw) catch break :taew_blk);
-                        taew_rgb = rgb;
-                        pv = .{ .rgb = rgb, .width = tw * taehv_mod.spatial_scale, .height = th * taehv_mod.spatial_scale };
+
+                    // Effective preview method + resolution THIS step. A live
+                    // control (the GUI) overrides the static fields, so a method /
+                    // quality change made mid-generation shows on the next step. A
+                    // taesd request with no decoder loaded degrades to latent2rgb.
+                    var method: u8 = if (opts.preview_live) |lp|
+                        lp.method.load(.acquire)
+                    else if (opts.preview)
+                        (if (taehv_dec != null) @as(u8, 2) else 1)
+                    else
+                        0;
+                    if (method == 2 and taehv_dec == null) method = 1;
+
+                    if (method != 0) {
+                        // Denoised (x0) estimate = x - sigma*v. `eulerStep` above
+                        // set x to x_{i+1} = x_i + (sigma_{i+1} - sigma_i)*v, so the
+                        // clean estimate in terms of the post-step latent is
+                        // x - sigma_{i+1}*v (collapses to x on the final step where
+                        // sigma_{i+1}==0).
+                        const x0: []const f32 = if (preview_x0) |px0| blk: {
+                            const s_next = sigmas[i + 1];
+                            for (px0, x, v) |*o, xi, vi| o.* = xi - s_next * vi;
+                            break :blk px0;
+                        } else x;
+                        if (method == 2) if (taehv_dec) |*d| taew_blk: {
+                            const live_ds: usize = if (opts.preview_live) |lp| lp.ds.load(.acquire) else opts.preview_ds;
+                            const ds = clampDs(live_ds, lat_h, lat_w);
+                            const th = lat_h / ds;
+                            const tw = lat_w / ds;
+                            const small = downsampleLatent(gpa, x0, lat_h, lat_w, ds) catch break :taew_blk;
+                            defer gpa.free(small);
+                            const rgb = if (cu_be) |b|
+                                (taehv_cuda_mod.decode(d, b, gpa, small, th, tw) catch break :taew_blk)
+                            else if (gpu_ctx) |gc|
+                                (taehv_gpu_mod.decode(d, gc, gpa, small, th, tw) catch break :taew_blk)
+                            else
+                                (d.decode(io, gpa, small, th, tw) catch break :taew_blk);
+                            taew_rgb = rgb;
+                            pv = .{ .rgb = rgb, .width = tw * taehv_mod.spatial_scale, .height = th * taehv_mod.spatial_scale };
+                        };
+                        if (pv == null) if (preview_scratch) |ps| {
+                            wan_vae.latentPreviewInto(ps, x0, lat_h, lat_w);
+                            pv = .{ .rgb = ps, .width = lat_w, .height = lat_h };
+                        };
                     }
-                    if (pv == null) if (preview_scratch) |ps| {
-                        wan_vae.latentPreviewInto(ps, x0, lat_h, lat_w);
-                        pv = .{ .rgb = ps, .width = lat_w, .height = lat_h };
-                    };
                     p.step(p.ctx, i + 1, opts.steps, pv);
                 }
             }

@@ -1,5 +1,6 @@
 - zig-cuda backend seems to have oom issues
-- backend switch in queue doesn't switch backend it seems like? is backend attached to images in the queue?
+- output text (user and agent) in markdown?
+- changing system prompt should wipe context and take effect on the next message
 - begin filling in holes in the capabilities grid (BACKEND.md)
 - add more sampling methods
 - tool call boxes inline, expandable to see the tool call
