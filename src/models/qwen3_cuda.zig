@@ -415,7 +415,7 @@ pub const CudaLM = struct {
         if (self.graph_exec == null) {
             self.captureDecodeGraph() catch |err| {
                 // Leave graph mode permanently and decode this token normally.
-                std.debug.print("[decode graph capture failed ({t}); falling back to per-op launches]\n", .{err});
+                std.log.warn("decode graph capture failed ({t}); falling back to per-op launches", .{err});
                 self.graph_ok = false;
                 return self.stepChunk(io, &.{id}, logits);
             };

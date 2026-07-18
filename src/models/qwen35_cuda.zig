@@ -315,7 +315,11 @@ pub const CudaLM = struct {
         if (min_rows <= self.capacity) return;
         if (min_rows > self.max_capacity) return error.ContextFull;
         const target = kvmod.growTarget(self.capacity, min_rows, self.max_capacity);
-        const bytes = target * self.cfg.kvDim() * 4;
+        // Element stride MUST match how the buffers were created (esz), or an f16
+        // cache (esz=2) requests f32-sized growth, overshoots its VA reservation,
+        // and growableEnsure fails with DeviceOutOfMemory → ContextFull once the
+        // window grows past ~max_capacity/2.
+        const bytes = target * self.cfg.kvDim() * self.kv_dtype.elemBytes();
 
         // Dynamic offload: migrate layers GPU->CPU until there's headroom to
         // grow the device KV — instead of streaming weights (the cliff). Each
@@ -327,24 +331,36 @@ pub const CudaLM = struct {
             while (true) {
                 const need = self.liveAttnSlots() * 2 * add + (32 << 20); // + margin
                 const free = @min(sp.budget -| self.be.deviceUsed(), self.be.headroom());
-                std.debug.print("[dyn] target={d} used={d}MB budget={d}MB free={d}MB need={d}MB\n", .{ target, self.be.deviceUsed() >> 20, sp.budget >> 20, free >> 20, need >> 20 });
                 if (free >= need) break;
                 if (!(try self.migrateNextLayer())) break; // nothing left; fall through
             }
         };
 
-        // Grow device KV of the attention layers still on the GPU.
-        for (self.lm.layers, 0..) |*layer, l| {
-            if (self.cfg.isRecurrent(l)) continue;
-            _ = layer;
-            if (self.split) |*sp| if (!sp.on_gpu[l]) continue;
-            const s = l / self.cfg.full_attn_interval;
-            for ([2]*Growable{ &self.k_cache[s], &self.v_cache[s] }) |b| {
-                self.be.growableEnsure(b, bytes) catch |err| switch (err) {
-                    error.DeviceOutOfMemory, error.OutOfMemory => return error.ContextFull,
-                    else => return err,
-                };
+        // Grow device KV of the attention layers still on the GPU. Physical VRAM
+        // can be exhausted even when the proactive migration above thought there
+        // was room: a resident image model on another CUDA context may grab it
+        // between the headroom check and this commit. On a real OOM, offload one
+        // more layer to the CPU and retry the whole grow, so a full window only
+        // ever fails once nothing is left to migrate — never a premature
+        // ContextFull while layers can still move to host. growableEnsure is
+        // idempotent, so re-running the loop is cheap.
+        grow: while (true) {
+            for (self.lm.layers, 0..) |*layer, l| {
+                if (self.cfg.isRecurrent(l)) continue;
+                _ = layer;
+                if (self.split) |*sp| if (!sp.on_gpu[l]) continue;
+                const s = l / self.cfg.full_attn_interval;
+                for ([2]*Growable{ &self.k_cache[s], &self.v_cache[s] }) |b| {
+                    self.be.growableEnsure(b, bytes) catch |err| switch (err) {
+                        error.DeviceOutOfMemory, error.OutOfMemory => {
+                            if (self.split != null and try self.migrateNextLayer()) continue :grow;
+                            return error.ContextFull;
+                        },
+                        else => return err,
+                    };
+                }
             }
+            break;
         }
         // A hybrid split keeps host KV/RoPE for its CPU layers; grow them in
         // lockstep so host positions stay aligned with the device len.
@@ -437,7 +453,7 @@ pub const CudaLM = struct {
         }
         sp.on_gpu[l] = false;
         sp.n_cpu += 1;
-        std.debug.print("[offload] layer {d} ({s}) -> CPU at ctx {d} ({d}/{d} on CPU)\n", .{ l, if (cfg.isRecurrent(l)) "lin" else "attn", self.len, sp.n_cpu, cfg.n_layers });
+        std.log.debug("[offload] layer {d} ({s}) -> CPU at ctx {d} ({d}/{d} on CPU)", .{ l, if (cfg.isRecurrent(l)) "lin" else "attn", self.len, sp.n_cpu, cfg.n_layers });
     }
 
     /// Total device footprint of one layer's streamable weights (quantized
@@ -670,7 +686,7 @@ pub const CudaLM = struct {
         }
         sp.on_gpu[l] = true;
         sp.n_cpu -= 1;
-        std.debug.print("[promote] layer {d} ({s}) -> GPU at ctx {d} ({d}/{d} on CPU)\n", .{ l, if (cfg.isRecurrent(l)) "lin" else "attn", self.len, sp.n_cpu, cfg.n_layers });
+        std.log.debug("[promote] layer {d} ({s}) -> GPU at ctx {d} ({d}/{d} on CPU)", .{ l, if (cfg.isRecurrent(l)) "lin" else "attn", self.len, sp.n_cpu, cfg.n_layers });
     }
 
     /// Migrate CPU layers back onto the GPU (LIFO by offload order), stopping
@@ -1257,7 +1273,7 @@ pub const CudaLM = struct {
         try be.tensorUpload(self.pos3_d, std.mem.sliceAsBytes(&[3]u32{ p, p, p }));
         if (self.graph_exec == null) {
             self.captureDecodeGraph() catch |err| {
-                std.debug.print("[decode graph capture failed ({t}); falling back to per-op launches]\n", .{err});
+                std.log.warn("decode graph capture failed ({t}); falling back to per-op launches", .{err});
                 self.graph_ok = false;
                 return self.stepOne(id, true);
             };

@@ -273,7 +273,11 @@ pub const CudaLM = struct {
         const target = kvmod.growTarget(self.capacity, min_rows, self.max_capacity);
         for (0..self.cfg.n_layers) |l| {
             if (usesRing(self.cfg, l)) continue; // LOCAL ring layers are fixed-size
-            const bytes = target * self.cfg.kvDim(l) * 4;
+            // Element stride MUST match how the buffers were created (esz), or an
+            // f16 cache (esz=2) requests f32-sized growth, overshoots its VA
+            // reservation, and growableEnsure fails with DeviceOutOfMemory →
+            // ContextFull once the window grows past ~max_capacity/2.
+            const bytes = target * self.cfg.kvDim(l) * self.kv_dtype.elemBytes();
             for ([2]*Growable{ &self.k_cache[l], &self.v_cache[l] }) |b| {
                 self.be.growableEnsure(b, bytes) catch |err| switch (err) {
                     error.DeviceOutOfMemory, error.OutOfMemory => return error.ContextFull,

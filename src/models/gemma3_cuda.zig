@@ -361,7 +361,7 @@ pub const CudaLM = struct {
         self.be.evictWeightBytes(layer.down.bytes);
         sp.on_gpu[l] = false;
         sp.n_cpu += 1;
-        std.debug.print("[offload] layer {d} (attn) -> CPU at ctx {d} ({d}/{d} on CPU)\n", .{ l, self.len, sp.n_cpu, cfg.n_layers });
+        std.log.debug("[offload] layer {d} (attn) -> CPU at ctx {d} ({d}/{d} on CPU)", .{ l, self.len, sp.n_cpu, cfg.n_layers });
     }
 
     /// Migrate layers to the host until `@min(budget - deviceUsed, headroom)`
@@ -427,7 +427,7 @@ pub const CudaLM = struct {
         }
         sp.on_gpu[l] = true;
         sp.n_cpu -= 1;
-        std.debug.print("[promote] layer {d} -> GPU at ctx {d} ({d}/{d} on CPU)\n", .{ l, self.len, sp.n_cpu, cfg.n_layers });
+        std.log.debug("[promote] layer {d} -> GPU at ctx {d} ({d}/{d} on CPU)", .{ l, self.len, sp.n_cpu, cfg.n_layers });
     }
 
     /// Migrate CPU layers back onto the GPU (LIFO by offload order), stopping
@@ -596,7 +596,11 @@ pub const CudaLM = struct {
         if (min_rows <= self.capacity) return;
         if (min_rows > self.max_capacity) return error.ContextFull;
         const target = kvmod.growTarget(self.capacity, min_rows, self.max_capacity);
-        const bytes = target * self.cfg.kvDim() * 4;
+        // Element stride MUST match how the buffers were created (esz), or an f16
+        // cache (esz=2) requests f32-sized growth, overshoots its VA reservation,
+        // and growableEnsure fails with DeviceOutOfMemory → ContextFull once the
+        // window grows past ~max_capacity/2.
+        const bytes = target * self.cfg.kvDim() * self.kv_dtype.elemBytes();
 
         // Dynamic offload: migrate layers GPU->CPU until there's headroom to grow
         // the device KV, instead of streaming weights (the cliff). Each migrated
@@ -606,23 +610,34 @@ pub const CudaLM = struct {
             while (true) {
                 const need = self.liveSlots() * 2 * add + (32 << 20); // + margin
                 const free = @min(sp.budget -| self.be.deviceUsed(), self.be.headroom());
-                std.debug.print("[dyn] target={d} used={d}MB budget={d}MB free={d}MB need={d}MB\n", .{ target, self.be.deviceUsed() >> 20, sp.budget >> 20, free >> 20, need >> 20 });
                 if (free >= need) break;
                 if (!(try self.migrateNextLayer())) break; // nothing left; fall through
             }
         };
 
         // Grow device KV of the layers still on the GPU (LOCAL ring layers are
-        // fixed-size — never grow them).
-        for (0..self.cfg.n_layers) |l| {
-            if (usesRing(self.cfg, l)) continue;
-            if (self.split) |*sp| if (!sp.on_gpu[l]) continue;
-            for ([2]*Growable{ &self.k_cache[l], &self.v_cache[l] }) |b| {
-                self.be.growableEnsure(b, bytes) catch |err| switch (err) {
-                    error.DeviceOutOfMemory, error.OutOfMemory => return error.ContextFull,
-                    else => return err,
-                };
+        // fixed-size — never grow them). Physical VRAM can be exhausted even when
+        // the proactive migration above thought there was room: a resident image
+        // model on another CUDA context may grab it between the headroom check and
+        // this commit. On a real OOM, offload one more layer to the CPU and retry
+        // the whole grow, so a full window only ever fails once nothing is left to
+        // migrate — never a premature ContextFull while layers can still move to
+        // host. growableEnsure is idempotent, so re-running the loop is cheap.
+        grow: while (true) {
+            for (0..self.cfg.n_layers) |l| {
+                if (usesRing(self.cfg, l)) continue;
+                if (self.split) |*sp| if (!sp.on_gpu[l]) continue;
+                for ([2]*Growable{ &self.k_cache[l], &self.v_cache[l] }) |b| {
+                    self.be.growableEnsure(b, bytes) catch |err| switch (err) {
+                        error.DeviceOutOfMemory, error.OutOfMemory => {
+                            if (self.split != null and try self.migrateNextLayer()) continue :grow;
+                            return error.ContextFull;
+                        },
+                        else => return err,
+                    };
+                }
             }
+            break;
         }
         // A hybrid split keeps host KV/RoPE for its CPU layers; grow them in
         // lockstep so host positions stay aligned with the device len.
