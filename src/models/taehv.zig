@@ -73,9 +73,10 @@ pub const Decoder = struct {
             // TGrow 1x1 conv (decoder.<tg>.conv). Load full output channels,
             // then keep only the first `n` (the first-frame slice).
             const tg_name = try std.fmt.allocPrint(a, "decoder.{d}.conv", .{s.tg});
-            var tg = try wan_vae.loadConv(a, st, tg_name, s.n, s.tg_co, 1);
-            tg.co = s.n; // first-frame: first n of the (n or 2n) output channels
-            tg.b = tg.b[0..s.n]; // keep bias aligned with the sliced output
+            const tg_full = try wan_vae.loadConv(a, st, tg_name, s.n, s.tg_co, 1);
+            // first-frame: keep only the first n output channels (the second
+            // half of a stride-2 tgrow is the dropped second frame).
+            const tg = firstNOutput(tg_full, s.n);
             const sc_name = try std.fmt.allocPrint(a, "decoder.{d}", .{s.sc});
             stage.* = .{
                 .mb = mb,
@@ -160,7 +161,35 @@ fn firstHalfInput(a: std.mem.Allocator, cv: Conv2d) !Conv2d {
     return .{ .w = w, .b = cv.b, .co = cv.co, .ci = ci, .k = cv.k };
 }
 
+/// Keep only the first `n` output channels of a conv (w is [co][k][k][ci]
+/// row-major, so the first n rows are the leading n*k*k*ci floats). Used for
+/// the TGrow 1x1 conv whose second half of output channels is the dropped
+/// second frame. Slices w and b to keep the Weight (bytes == co*ci) invariant.
+fn firstNOutput(cv: Conv2d, n: usize) Conv2d {
+    std.debug.assert(n <= cv.co);
+    const per_out = cv.k * cv.k * cv.ci;
+    return .{ .w = cv.w[0 .. n * per_out], .b = cv.b[0..n], .co = n, .ci = cv.ci, .k = cv.k };
+}
+
 fn loadSub(a: std.mem.Allocator, st: *const SafeTensors, base: usize, sub: []const u8, ci: usize, co: usize, k: usize) !Conv2d {
     const name = try std.fmt.allocPrint(a, "decoder.{d}.{s}", .{ base, sub });
     return wan_vae.loadConv(a, st, name, ci, co, k);
+}
+
+test "firstNOutput keeps the Weight length invariant for the TGrow slice" {
+    const ops = @import("../ops.zig");
+    const Weight = ops.matmul.Weight;
+    // A 1x1 conv with 2n output channels (stride-2 tgrow), ci = n = 3.
+    const n = 3;
+    const w = [_]f32{0} ** (2 * n * n); // [2n][1][1][n]
+    const b = [_]f32{0} ** (2 * n);
+    const full: Conv2d = .{ .w = &w, .b = &b, .co = 2 * n, .ci = n, .k = 1 };
+
+    const sliced = firstNOutput(full, n);
+    try std.testing.expectEqual(@as(usize, n), sliced.co);
+    try std.testing.expectEqual(@as(usize, n * n), sliced.w.len);
+    try std.testing.expectEqual(@as(usize, n), sliced.b.len);
+    // The sliced weight must satisfy the matmul Weight invariant (bytes ==
+    // storageBytes(co*ci)); constructing it used to assert-crash previews.
+    _ = Weight.fromF32(sliced.w, sliced.co, sliced.ci);
 }

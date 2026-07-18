@@ -17,6 +17,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - If the user asks for something that may cause issues, push back and get confirmation before doing it.
 - If you see existing code that may cause issues or is Band-Aid patch code, call it out and suggest a fix.
 - This is a research project. There's no risk to trying big complicated work. We want to try unusual things. Be bold and adventerous.
+- However, we do want code to be structured, organized, and allow for generalization as much as possible without sacrificing performance.
+- After adding a new kernel feature like relo, supporting a new dtype like bf16 or qk_6 for a backend, or anything similar, check BACKEND.md and update it to reflect the current state.
 
 ## Project
 

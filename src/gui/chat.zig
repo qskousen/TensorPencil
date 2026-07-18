@@ -40,6 +40,7 @@ const Arch = union(enum) {
 };
 const cuda = tp.gpu.cuda;
 const engine = tp.llm.engine;
+const kv_cache = tp.llm.kv_cache;
 const chat = tp.llm.chat;
 const pipeline = tp.pipeline;
 const Tokenizer = tp.tokenizer.Tokenizer;
@@ -167,6 +168,8 @@ pub const Options = struct {
     /// families that support it. Flipped live by the toolbar toggle; no-op for
     /// non-reasoning models. See `chat.setThinking`.
     reasoning: bool = true,
+    /// KV-cache element storage type (f32 default; f16 halves the KV footprint).
+    kv_dtype: kv_cache.KvDtype = .f32,
 };
 
 pub const Session = struct {
@@ -273,10 +276,15 @@ pub const Session = struct {
         self.mmproj_gguf = null;
         if (cfg.mmproj_path) |mp| self.mmproj_gguf = try Gguf.open(arena, io, mp);
 
+        // f16 KV is supported per-arch (gemma4 first); the concrete model init
+        // (below) returns error.KvDtypeUnsupported for archs not yet wired, so
+        // the loader surfaces a clean error rather than corrupting the cache.
+
         // Interactive session: grow from a small floor toward the full window.
         const cap: engine.Capacity = .{
             .initial = @min(cfg.max_context, 4096),
             .max = cfg.max_context,
+            .kv_dtype = cfg.kv_dtype,
         };
 
         // Reasoning toggle (process-global like the family). No-op for models
@@ -426,6 +434,22 @@ pub const Session = struct {
         }
 
         self.gen_err = null;
+        self.wake();
+    }
+
+    /// Rebuild the KV cache at a new element dtype (the config f32<->f16 toggle),
+    /// keeping the model WEIGHTS resident — a "context reload", not a model
+    /// reload. Frees + re-creates the K/V buffers at `dtype` and resets the
+    /// committed length to 0; `ids` still hold the whole transcript, so the next
+    /// turn re-prefills it. Runs on the UI thread like `updateSettings`; the
+    /// caller must ensure no generation is in flight (returns error.Busy if so).
+    /// Errors (error.KvDtypeUnsupported) if the active arch can't do `dtype`.
+    pub fn rebuildContext(self: *Session, dtype: kv_cache.KvDtype) !void {
+        if (self.busy()) return error.Busy;
+        self.be.bindThread();
+        switch (self.arch) {
+            inline else => |*a| try a.model.reinitCache(dtype),
+        }
         self.wake();
     }
 
@@ -695,12 +719,28 @@ pub const Session = struct {
     pub fn ctxKvBytes(self: *Session) u64 {
         return switch (self.arch) {
             .qwen35 => |*a| @as(u64, a.model.cached()) * a.model.cfg.kvDim() * 8 * a.model.cfg.nAttnLayers(),
-            .gemma3 => |*a| @as(u64, a.model.cached()) * a.model.cfg.kvDim() * 8 * a.model.cfg.n_layers,
-            // gemma4 KV dim varies per layer (SWA 2048 vs global 512), so sum it.
+            // gemma3/gemma4 LOCAL (sliding-window) layers hold only a fixed ring
+            // (window + one prefill chunk), so their footprint plateaus instead
+            // of growing with the conversation (TODO lever 1); GLOBAL layers hold
+            // the full context. gemma4's KV dim also varies per layer.
+            .gemma3 => |*a| blk: {
+                const cfg = a.model.cfg;
+                const cached: u64 = a.model.cached();
+                const ring: u64 = if (cfg.sliding_window != 0) cfg.sliding_window + 128 else cached;
+                var rows: u64 = 0;
+                for (0..cfg.n_layers) |l| rows += if (cfg.isGlobal(l)) cached else @min(cached, ring);
+                break :blk rows * cfg.kvDim() * 8;
+            },
             .gemma4 => |*a| blk: {
+                const cfg = a.model.cfg;
+                const cached: u64 = a.model.cached();
+                const ring: u64 = if (cfg.sliding_window != 0) cfg.sliding_window + 128 else cached;
                 var kv: u64 = 0;
-                for (0..a.model.cfg.n_layers) |l| kv += a.model.cfg.kvDim(l);
-                break :blk @as(u64, a.model.cached()) * kv * 8;
+                for (0..cfg.n_layers) |l| {
+                    const layer_rows = if (cfg.isGlobal(l)) cached else @min(cached, ring);
+                    kv += layer_rows * cfg.kvDim(l);
+                }
+                break :blk kv * 8;
             },
         };
     }

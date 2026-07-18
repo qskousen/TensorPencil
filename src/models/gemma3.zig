@@ -36,6 +36,32 @@ const Gguf = gguf_mod.Gguf;
 const WeightStore = weights_mod.WeightStore;
 const Weight = ops.matmul.Weight;
 const KvCache = kv_cache_mod.KvCache;
+const PerLayerKvCache = kv_cache_mod.PerLayerKvCache;
+
+/// CPU prefill batch size — bounds per-forward `seq` so a LOCAL layer's KV ring
+/// (`sliding_window + prefill_chunk` rows) can't alias a still-needed key in one
+/// batch (TODO lever 1). Also caps the activation scratch height.
+const prefill_chunk = 128;
+
+/// Kill-switch for the LOCAL-layer sliding-window ring cache (A/B validation).
+const enable_local_ring = true;
+
+/// Uniform per-layer KV dims (gemma3 is uniform); caller owns the slice.
+fn kvDims(cfg: Config, alloc: std.mem.Allocator) ![]usize {
+    const dims = try alloc.alloc(usize, cfg.n_layers);
+    for (dims) |*d| d.* = cfg.kvDim();
+    return dims;
+}
+
+/// Per-layer KV ring rows: LOCAL (sliding-window) layers get a fixed ring;
+/// GLOBAL layers get 0 (full context). Caller owns the slice.
+fn kvRings(cfg: Config, alloc: std.mem.Allocator) ![]usize {
+    const rings = try alloc.alloc(usize, cfg.n_layers);
+    for (rings, 0..) |*r, l| {
+        r.* = if (enable_local_ring and !cfg.isGlobal(l)) cfg.sliding_window + prefill_chunk else 0;
+    }
+    return rings;
+}
 
 pub const Config = struct {
     n_layers: usize,
@@ -194,7 +220,7 @@ pub const Model = struct {
         io: std.Io,
         gpa: std.mem.Allocator,
         ids: []const u32,
-        cache: *KvCache,
+        cache: *PerLayerKvCache,
         freqs_global: ops.rope.Freqs,
         freqs_local: ops.rope.Freqs,
         out: ?[]f32,
@@ -202,7 +228,7 @@ pub const Model = struct {
         const cfg = self.cfg;
         const seq = ids.len;
         std.debug.assert(seq > 0 and seq <= cache.remaining());
-        std.debug.assert(cache.n_layers == cfg.n_layers and cache.kv_dim == cfg.kvDim());
+        std.debug.assert(cache.n_layers == cfg.n_layers);
 
         const x = try gpa.alloc(f32, seq * cfg.hidden);
         defer gpa.free(x);
@@ -221,7 +247,7 @@ pub const Model = struct {
         io: std.Io,
         gpa: std.mem.Allocator,
         x: []f32,
-        cache: *KvCache,
+        cache: *PerLayerKvCache,
         freqs_global: ops.rope.Freqs,
         freqs_local: ops.rope.Freqs,
         out: ?[]f32,
@@ -229,15 +255,24 @@ pub const Model = struct {
         const cfg = self.cfg;
         const seq = x.len / cfg.hidden;
         std.debug.assert(seq > 0 and seq <= cache.remaining());
-        std.debug.assert(cache.n_layers == cfg.n_layers and cache.kv_dim == cfg.kvDim());
+        std.debug.assert(cache.n_layers == cfg.n_layers);
 
-        var s = try Scratch.init(gpa, seq, cfg);
+        // Prefill in prefill_chunk-sized batches so a LOCAL layer's ring never
+        // holds more than `window + prefill_chunk` live positions at once
+        // (chunked prefill is token-identical: attention is causal, so a later
+        // chunk only reads earlier chunks' committed KV).
+        var s = try Scratch.init(gpa, @min(seq, prefill_chunk), cfg);
         defer s.deinit(gpa);
-
-        for (self.layers, 0..) |*layer, l| {
-            try layerForward(io, gpa, cfg, layer, x, seq, freqs_global, freqs_local, cache, l, &s);
+        var off: usize = 0;
+        while (off < seq) {
+            const n = @min(prefill_chunk, seq - off);
+            const xc = x[off * cfg.hidden ..][0 .. n * cfg.hidden];
+            for (self.layers, 0..) |*layer, l| {
+                try layerForward(io, gpa, cfg, layer, xc, n, freqs_global, freqs_local, cache, l, &s);
+            }
+            cache.commit(n);
+            off += n;
         }
-        cache.commit(seq);
 
         if (out) |o| {
             std.debug.assert(o.len % cfg.hidden == 0);
@@ -251,7 +286,9 @@ pub const Model = struct {
 /// One Gemma layer over `x` [seq, hidden], residuals added in place. `x`
 /// holds only the `seq` new tokens (at absolute positions cache.len..).
 /// Public so the CUDA hybrid CPU/GPU split (gemma3_cuda) can run host-resident
-/// layers through the exact same code path.
+/// layers through the exact same code path. `cache` is `anytype` so it accepts
+/// both the pure-CPU `PerLayerKvCache` (with LOCAL rings) and gemma3_cuda's
+/// uniform `KvCache` host shadow (ringOf → 0, so linear/full context).
 pub fn layerForward(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -261,7 +298,7 @@ pub fn layerForward(
     seq: usize,
     freqs_global: ops.rope.Freqs,
     freqs_local: ops.rope.Freqs,
-    cache: *KvCache,
+    cache: anytype,
     l: usize,
     s: *Scratch,
 ) !void {
@@ -346,7 +383,7 @@ pub const Scratch = struct {
 pub const CpuModel = struct {
     lm: *const Model,
     gpa: std.mem.Allocator,
-    cache: KvCache,
+    cache: PerLayerKvCache,
     freqs_global: ops.rope.Freqs,
     freqs_local: ops.rope.Freqs,
     last_hidden: []f32,
@@ -357,7 +394,11 @@ pub const CpuModel = struct {
 
     pub fn init(gpa: std.mem.Allocator, lm: *const Model, cap: kv_cache_mod.Capacity) !CpuModel {
         const cfg = lm.cfg;
-        var cache = try KvCache.init(gpa, cfg.n_layers, cap.initial, cfg.kvDim());
+        const dims = try kvDims(cfg, gpa);
+        defer gpa.free(dims);
+        const rings = try kvRings(cfg, gpa);
+        defer gpa.free(rings);
+        var cache = try PerLayerKvCache.init(gpa, cap.initial, dims, rings, cap.kv_dtype);
         errdefer cache.deinit(gpa);
         var fg = try ops.rope.rotateHalfFreqsScaled(gpa, cap.initial, cfg.head_dim, cfg.rope_theta, cfg.rope_freq_scale);
         errdefer fg.deinit(gpa);

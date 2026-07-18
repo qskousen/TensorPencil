@@ -21,6 +21,12 @@ const Context = ctxmod.Context;
 
 pub const Error = error{ CudaError, OutOfMemory, NoSuitableDevice, DeviceOutOfMemory };
 
+/// GPU top-k selection (opTopK): `topk_lanes` lanes each keep their `topk_m`
+/// highest candidates. `topk_m` MUST match elt.topk_reduce_ptx (and the Vulkan
+/// side). See context.opTopK for the rationale.
+pub const topk_m = 8;
+pub const topk_lanes = 1024;
+
 /// Which set of compute kernels the heavy op methods dispatch to.
 ///  - hand_ptx: the pure-Zig hand-emitted PTX kernels (`--backend zig-cuda`).
 ///  - libs:     NVIDIA's cuBLASLt / cuDNN, dlopen'd (`--backend cuda`, Phase 2).
@@ -80,6 +86,12 @@ pub const DeviceBuffer = struct {
 
 fn dbFromPtr(p: cu.CUdeviceptr, size: u64) DeviceBuffer {
     return .{ .buf = @enumFromInt(p), .mem = .null_handle, .size = size };
+}
+
+/// A non-owning view of `b` offset `off` bytes in (for a kernel launch that
+/// touches a sub-region). `mem` is cleared — views never free.
+fn dbOffset(b: DeviceBuffer, off: u64) DeviceBuffer {
+    return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off), .mem = .null_handle, .size = if (b.size > off) b.size - off else 0 };
 }
 
 /// Push constants for eltwise/attention kernels (matches the Vulkan EltPush).
@@ -265,9 +277,12 @@ pub const Backend = struct {
     state_ptr: cu.CUdeviceptr = 0,
     f_embed_gather_s: cu.CUfunction = null,
     f_kv_append_s: cu.CUfunction = null,
+    f_kv_append_s_f16: cu.CUfunction = null,
     f_rope_half_s: cu.CUfunction = null,
     f_attn_split_s: cu.CUfunction = null,
+    f_attn_split_s_f16: cu.CUfunction = null,
     f_attn_split_h256_s: cu.CUfunction = null,
+    f_attn_split_h256_s_f16: cu.CUfunction = null,
     f_embed_gather_q8_0: cu.CUfunction = null,
     f_embed_gather_q4_k: cu.CUfunction = null,
     f_embed_gather_q5_k: cu.CUfunction = null,
@@ -1606,19 +1621,65 @@ pub const Backend = struct {
     /// (p - window, p] — Gemma 3 local layers, and any future SWA arch. The
     /// bound is applied per query (kv_len0 + t), so it works for both a single
     /// decode row and a batched prefill.
-    pub fn opAttnDecode(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, kv_len0: usize, seq_q: usize, n_heads: usize, kv_heads: usize, hd: usize, nsplit: usize, scale: f32, window: usize) Error!void {
+    /// `ring` (> 0) enables sliding-window ring addressing in the h256 kernel:
+    /// KV storage row = pos % ring (gemma3/gemma4 LOCAL layers, whose caches hold
+    /// only `ring` rows). 0 = linear addressing. Only hd==256 supports ring.
+    pub fn opAttnDecode(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, kv_len0: usize, seq_q: usize, n_heads: usize, kv_heads: usize, hd: usize, nsplit: usize, scale: f32, window: usize, ring: usize, kv_f16: bool) Error!void {
         self.ptic();
         defer self.ptoc(.attn);
         std.debug.assert((hd == 128 or hd == 256 or hd == 512) and seq_q >= 1);
-        const f_split = if (hd == 128)
-            try self.eltFn(elt.attn_split_ptx, "attn_split")
-        else if (hd == 256)
-            try self.eltFn(elt.attn_split_h256_ptx, "attn_split_h256")
-        else
-            try self.eltFn(elt.attn_split_h512_ptx, "attn_split_h512");
-        try self.eltLaunch(f_split, q, k, v, scratch, .{ @intCast(kv_len0), @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intCast(nsplit), @intCast(seq_q) }, .{ scale, @floatFromInt(window) }, seq_q * n_heads * nsplit * 32);
+        const total = seq_q * n_heads * nsplit * 32;
+        if (hd == 256) {
+            // The h256 kernel carries an extra ring param (u6), so it needs a
+            // bespoke 13-param launch (eltLaunch only passes 6 u32 + 2 f32).
+            const f_split = try self.eltFn(
+                if (kv_f16) elt.attn_split_h256_f16_ptx else elt.attn_split_h256_ptx,
+                if (kv_f16) "attn_split_h256_f16" else "attn_split_h256",
+            );
+            var p0 = q.ptr();
+            var p1 = k.ptr();
+            var p2 = v.ptr();
+            var p3 = scratch.ptr();
+            var uu = [_]u32{ @intCast(kv_len0), @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intCast(nsplit), @intCast(seq_q), @intCast(ring) };
+            var ff = [_]f32{ scale, @floatFromInt(window) };
+            var params = [_]?*anyopaque{
+                @ptrCast(&p0),    @ptrCast(&p1),    @ptrCast(&p2),    @ptrCast(&p3),
+                @ptrCast(&uu[0]), @ptrCast(&uu[1]), @ptrCast(&uu[2]), @ptrCast(&uu[3]),
+                @ptrCast(&uu[4]), @ptrCast(&uu[5]), @ptrCast(&uu[6]), @ptrCast(&ff[0]),
+                @ptrCast(&ff[1]),
+            };
+            const grid: u32 = @intCast((total + 255) / 256);
+            self.ctx.launch(f_split, .{ grid, 1, 1 }, .{ 256, 1, 1 }, 0, &params) catch return error.CudaError;
+        } else {
+            std.debug.assert(ring == 0); // ring addressing is only implemented for hd==256
+            const f_split = if (hd == 128)
+                try self.eltFn(
+                    if (kv_f16) elt.attn_split_f16_ptx else elt.attn_split_ptx,
+                    if (kv_f16) "attn_split_f16" else "attn_split",
+                )
+            else try self.eltFn(
+                if (kv_f16) elt.attn_split_h512_f16_ptx else elt.attn_split_h512_ptx,
+                if (kv_f16) "attn_split_h512_f16" else "attn_split_h512",
+            );
+            try self.eltLaunch(f_split, q, k, v, scratch, .{ @intCast(kv_len0), @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intCast(nsplit), @intCast(seq_q) }, .{ scale, @floatFromInt(window) }, total);
+        }
         const f_merge = try self.eltFn(elt.attn_merge_ptx, "attn_merge");
         try self.eltLaunch(f_merge, scratch, out, null, null, .{ @intCast(seq_q * n_heads), @intCast(hd), @intCast(nsplit), 0, 0, 0 }, .{ 0, 0 }, seq_q * n_heads * hd);
+    }
+
+    /// Convert-copy `n` f32 elements from `src` (+`src_off` elements) into the
+    /// f16 KV cache at `dst` (+`dst_off` elements): the f16-cache analogue of
+    /// `tensorCopy`, converting f32 K/V projections to f16 on store. Offsets are
+    /// ELEMENT counts (f16 dst = *2 bytes, f32 src = *4 bytes).
+    pub fn opStoreKvF16(self: *Backend, dst: DeviceBuffer, dst_off: usize, src: DeviceBuffer, src_off: usize, n: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        // The shared f32_to_f16 kernel converts idx < u1 and zero-fills the
+        // rest; u0 is the thread-guard count. All n elements are valid here.
+        const f = try self.eltFn(elt.f32_to_f16_ptx, "f32_to_f16");
+        const srcb = dbOffset(src, src_off * 4);
+        const dstb = dbOffset(dst, dst_off * 2);
+        try self.eltLaunch(f, srcb, dstb, null, null, .{ @intCast(n), @intCast(n), 0, 0, 0, 0 }, .{ 0, 0 }, n);
     }
 
     /// Partial rotate-half RoPE: rotate the first 2*half dims of
@@ -2270,9 +2331,12 @@ pub const Backend = struct {
         std.debug.assert(sz == 8);
         self.f_embed_gather_s = mod.getFunction(self.ctx, "embed_gather_s") catch return error.CudaError;
         self.f_kv_append_s = mod.getFunction(self.ctx, "kv_append_s") catch return error.CudaError;
+        self.f_kv_append_s_f16 = mod.getFunction(self.ctx, "kv_append_s_f16") catch return error.CudaError;
         self.f_rope_half_s = mod.getFunction(self.ctx, "rope_half_s") catch return error.CudaError;
         self.f_attn_split_s = mod.getFunction(self.ctx, "attn_split_s") catch return error.CudaError;
+        self.f_attn_split_s_f16 = mod.getFunction(self.ctx, "attn_split_s_f16") catch return error.CudaError;
         self.f_attn_split_h256_s = mod.getFunction(self.ctx, "attn_split_h256_s") catch return error.CudaError;
+        self.f_attn_split_h256_s_f16 = mod.getFunction(self.ctx, "attn_split_h256_s_f16") catch return error.CudaError;
         self.f_embed_gather_q8_0 = mod.getFunction(self.ctx, "embed_gather_q8_0") catch return error.CudaError;
         self.f_embed_gather_q4_k = mod.getFunction(self.ctx, "embed_gather_q4_k") catch return error.CudaError;
         self.f_embed_gather_q5_k = mod.getFunction(self.ctx, "embed_gather_q5_k") catch return error.CudaError;
@@ -2336,8 +2400,9 @@ pub const Backend = struct {
 
     /// dst[base + pos0*stride + i] = src[i], pos0 from g_state (graph-safe
     /// KV appends and tap-row snapshots).
-    pub fn opKvAppendS(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, count: usize, stride: usize, base: usize) Error!void {
-        try self.eltLaunch(self.f_kv_append_s, src, dst, null, null, .{ @intCast(count), @intCast(stride), @intCast(base), 0, 0, 0 }, .{ 0, 0 }, count);
+    pub fn opKvAppendS(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, count: usize, stride: usize, base: usize, kv_f16: bool) Error!void {
+        const f = if (kv_f16) self.f_kv_append_s_f16 else self.f_kv_append_s;
+        try self.eltLaunch(f, src, dst, null, null, .{ @intCast(count), @intCast(stride), @intCast(base), 0, 0, 0 }, .{ 0, 0 }, count);
     }
 
     /// dst[dst_off + i] = src[src_off + i] as a kernel — usable inside
@@ -2352,9 +2417,12 @@ pub const Backend = struct {
         try self.eltLaunch(self.f_rope_half_s, qk, null, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), 0, 0 }, .{ 0, 0 }, total);
     }
 
-    pub fn opAttnDecodeSGraph(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, n_heads: usize, kv_heads: usize, hd: usize, nsplit: usize, scale: f32) Error!void {
+    pub fn opAttnDecodeSGraph(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, n_heads: usize, kv_heads: usize, hd: usize, nsplit: usize, scale: f32, kv_f16: bool) Error!void {
         std.debug.assert(hd == 128 or hd == 256);
-        const f_split = if (hd == 128) self.f_attn_split_s else self.f_attn_split_h256_s;
+        const f_split = if (hd == 128)
+            (if (kv_f16) self.f_attn_split_s_f16 else self.f_attn_split_s)
+        else
+            (if (kv_f16) self.f_attn_split_h256_s_f16 else self.f_attn_split_h256_s);
         try self.eltLaunch(f_split, q, k, v, scratch, .{ 0, @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intCast(nsplit), 1 }, .{ scale, 0 }, n_heads * nsplit * 32);
         const f_merge = try self.eltFn(elt.attn_merge_ptx, "attn_merge");
         try self.eltLaunch(f_merge, scratch, out, null, null, .{ @intCast(n_heads), @intCast(hd), @intCast(nsplit), 0, 0, 0 }, .{ 0, 0 }, n_heads * hd);
@@ -2475,6 +2543,48 @@ pub const Backend = struct {
         defer self.ptoc(.elt);
         const f = try self.eltFn(elt.relu_ptx, "relu");
         try self.eltLaunch(f, a, null, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+    }
+
+    /// Top-k candidate selection over `logits` (device [vocab] f32): `topk_lanes`
+    /// lanes each keep their `topk_m` highest (value,index). Caller downloads the
+    /// returned count of (val,idx) pairs and does exact top-k on the CPU. Caller
+    /// owns out_val/out_idx (>= count f32 each). Mirrors context.opTopK.
+    pub fn opTopK(self: *Backend, logits: DeviceBuffer, vocab: usize, out_val: *DeviceBuffer, out_idx: *DeviceBuffer) Error!usize {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const lanes: usize = @min(@as(usize, topk_lanes), vocab);
+        const count = lanes * topk_m;
+        try self.ensureDeviceBuffer(out_val, count * 4);
+        try self.ensureDeviceBuffer(out_idx, count * 4);
+        const f = try self.eltFn(elt.topk_reduce_ptx, "topk_reduce");
+        try self.eltLaunch(f, logits, out_val.*, out_idx.*, null, .{ @intCast(lanes), @intCast(vocab), 0, 0, 0, 0 }, .{ 0, 0 }, lanes);
+        return count;
+    }
+
+    /// Argmax over `logits` (device [vocab] f32) → token id written as an exact
+    /// f32 into out_id[0] (download 4 bytes, not the ~608 KB vocab). Two passes:
+    /// `lanes` stride-scanners find local maxima, then one thread reduces them,
+    /// tie-breaking to the lowest index (matches sample.argmax). Caller owns the
+    /// two working buffers (>= lanes f32 each).
+    pub fn opArgmax(
+        self: *Backend,
+        logits: DeviceBuffer,
+        vocab: usize,
+        out_id: DeviceBuffer,
+        scratch_v: *DeviceBuffer,
+        scratch_i: *DeviceBuffer,
+    ) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        // Explicit usize: `@min(4096, vocab)` narrows to a ~u13 type, so
+        // `lanes * 4` would overflow (#14039).
+        const lanes: usize = @min(@as(usize, 4096), vocab);
+        try self.ensureDeviceBuffer(scratch_v, lanes * 4);
+        try self.ensureDeviceBuffer(scratch_i, lanes * 4);
+        const fr = try self.eltFn(elt.argmax_reduce_ptx, "argmax_reduce");
+        try self.eltLaunch(fr, logits, scratch_v.*, scratch_i.*, null, .{ @intCast(lanes), @intCast(vocab), 0, 0, 0, 0 }, .{ 0, 0 }, lanes);
+        const ff = try self.eltFn(elt.argmax_final_ptx, "argmax_final");
+        try self.eltLaunch(ff, scratch_v.*, scratch_i.*, out_id, null, .{ @intCast(lanes), 0, 0, 0, 0, 0 }, .{ 0, 0 }, 1);
     }
 
     /// VAE per-position channel L2 norm (+ optional fused silu). x/out [n][c]
@@ -2977,6 +3087,90 @@ test "growable tensor grows in place" {
 
 // Gated on a CUDA device: the fused block-quant GEMVs against the CPU
 // quants.zig dequant + dot reference, all four formats.
+test "cuda argmax matches cpu argmax (incl. tie -> lowest index)" {
+    const sample = @import("../../llm/sample.zig");
+    const gpa = std.testing.allocator;
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+
+    var prng = std.Random.DefaultPrng.init(0xBEEF);
+    const rand = prng.random();
+    const vocabs = [_]usize{ 1, 7, 4096, 151936, 99991 };
+    for (vocabs) |vocab| {
+        const logits = try gpa.alloc(f32, vocab);
+        defer gpa.free(logits);
+        for (logits) |*v| v.* = rand.floatNorm(f32) * 5.0;
+        if (vocab > 10) {
+            logits[vocab / 3] = 1000.0;
+            logits[vocab / 3 + 5] = 1000.0; // exact tie → lowest index wins
+        }
+
+        var lg = try be.tensorCreate(vocab * 4);
+        var out = try be.tensorCreate(4);
+        var sv: DeviceBuffer = .{};
+        var si: DeviceBuffer = .{};
+        defer {
+            be.tensorDestroy(&lg);
+            be.tensorDestroy(&out);
+            be.tensorDestroy(&sv);
+            be.tensorDestroy(&si);
+        }
+        try be.tensorUpload(lg, std.mem.sliceAsBytes(logits));
+        try be.opArgmax(lg, vocab, out, &sv, &si);
+
+        var got_f: [1]f32 = undefined;
+        try be.tensorDownload(out, std.mem.sliceAsBytes(&got_f));
+        try std.testing.expectEqual(sample.argmax(logits), @as(u32, @intFromFloat(got_f[0])));
+    }
+}
+
+test "cuda topk selects the true top-k set" {
+    const sample = @import("../../llm/sample.zig");
+    const gpa = std.testing.allocator;
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+
+    var prng = std.Random.DefaultPrng.init(0x70FC);
+    const rand = prng.random();
+    const vocabs = [_]usize{ 5, 4096, 151936 };
+    for (vocabs) |vocab| {
+        const logits = try gpa.alloc(f32, vocab);
+        defer gpa.free(logits);
+        for (logits) |*v| v.* = rand.floatNorm(f32) * 6.0;
+
+        var lg = try be.tensorCreate(vocab * 4);
+        var ov: DeviceBuffer = .{};
+        var oi: DeviceBuffer = .{};
+        defer {
+            be.tensorDestroy(&lg);
+            be.tensorDestroy(&ov);
+            be.tensorDestroy(&oi);
+        }
+        try be.tensorUpload(lg, std.mem.sliceAsBytes(logits));
+        const count = try be.opTopK(lg, vocab, &ov, &oi);
+
+        const vals = try gpa.alloc(f32, count);
+        defer gpa.free(vals);
+        const idxs = try gpa.alloc(f32, count);
+        defer gpa.free(idxs);
+        try be.tensorDownload(ov, std.mem.sliceAsBytes(vals));
+        try be.tensorDownload(oi, std.mem.sliceAsBytes(idxs));
+
+        const cands = try gpa.alloc(sample.Candidate, count);
+        defer gpa.free(cands);
+        for (cands, vals, idxs) |*c, v, id| c.* = .{ .id = @intFromFloat(id), .logit = v };
+        std.mem.sort(sample.Candidate, cands, {}, sample.candDesc);
+        const refc = try gpa.alloc(sample.Candidate, vocab);
+        defer gpa.free(refc);
+        for (refc, logits, 0..) |*c, v, i| c.* = .{ .id = @intCast(i), .logit = v };
+        std.mem.sort(sample.Candidate, refc, {}, sample.candDesc);
+        for ([_]usize{ 1, 20, 512 }) |k_want| {
+            const k = @min(k_want, vocab);
+            for (0..k) |r| try std.testing.expectEqual(refc[r].id, cands[r].id);
+        }
+    }
+}
+
 test "gemv quant kernels match CPU reference" {
     const quants = @import("../../quants.zig");
     const gpa = std.testing.allocator;
@@ -3672,7 +3866,7 @@ test "qwen35 attention ops match CPU reference" {
     try be.tensorUpload(q_d, std.mem.sliceAsBytes(&q));
     try be.tensorUpload(k_d, std.mem.sliceAsBytes(&k));
     try be.tensorUpload(v_d, std.mem.sliceAsBytes(&v));
-    try be.opAttnDecode(q_d, k_d, v_d, out_d, scratch_d, kv_len, 1, heads, kv_heads, hd, 8, scale, 0);
+    try be.opAttnDecode(q_d, k_d, v_d, out_d, scratch_d, kv_len, 1, heads, kv_heads, hd, 8, scale, 0, 0, false);
     var got: [heads * hd]f32 = undefined;
     try be.tensorDownload(out_d, std.mem.sliceAsBytes(&got));
     for (ref, got) |e, a| try std.testing.expectApproxEqAbs(e, a, 2e-3);
@@ -3926,7 +4120,7 @@ test "attn decode seq_q batch matches CPU reference" {
     try be.tensorUpload(q_d, std.mem.sliceAsBytes(q));
     try be.tensorUpload(k_d, std.mem.sliceAsBytes(k));
     try be.tensorUpload(v_d, std.mem.sliceAsBytes(v));
-    try be.opAttnDecode(q_d, k_d, v_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale, 0);
+    try be.opAttnDecode(q_d, k_d, v_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale, 0, 0, false);
     const got = try gpa.alloc(f32, q.len);
     defer gpa.free(got);
     try be.tensorDownload(o_d, std.mem.sliceAsBytes(got));
@@ -3942,6 +4136,101 @@ test "attn decode seq_q batch matches CPU reference" {
     if (worst > 2e-3) {
         std.debug.print("worst {d} at elem {d} (t={d} h={d} c={d}): want {d} got {d}\n", .{ worst, worst_i, worst_i / (heads * hd), (worst_i / hd) % heads, worst_i % hd, ref[worst_i], got[worst_i] });
         return error.TestExpectedApproxEqAbs;
+    }
+}
+
+test "attn decode with f16 KV cache matches the f32 reference" {
+    // f16 KV: K/V stored as half precision (attn_split_h256_f16 /
+    // attn_split_h512_f16). Not bit-exact vs f32 — checked within an f16
+    // tolerance. Covers gemma4's two decode kernels (local hd=256, global 512).
+    const gpa = std.testing.allocator;
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+
+    const heads = 4;
+    const kv_heads = 2;
+    const nsp = 8;
+    inline for (.{ 256, 512 }) |hd| {
+        const seq_q = 40;
+        const kv_len0 = 7; // non-empty prefix
+        const kv_total = kv_len0 + seq_q;
+        var prng = std.Random.DefaultPrng.init(23 + hd);
+        const rand = prng.random();
+
+        const q = try gpa.alloc(f32, seq_q * heads * hd);
+        defer gpa.free(q);
+        const k = try gpa.alloc(f32, kv_total * kv_heads * hd);
+        defer gpa.free(k);
+        const v = try gpa.alloc(f32, kv_total * kv_heads * hd);
+        defer gpa.free(v);
+        for (q) |*x| x.* = rand.floatNorm(f32) * 0.3;
+        // Round K/V through f16 so the CPU reference sees the SAME values the
+        // kernel loads — isolating the test to the kernel math, not the f16
+        // rounding of the inputs.
+        for (k) |*x| x.* = @floatCast(@as(f16, @floatCast(rand.floatNorm(f32) * 0.3)));
+        for (v) |*x| x.* = @floatCast(@as(f16, @floatCast(rand.floatNorm(f32))));
+        const scale = 1.0 / @sqrt(@as(f32, hd));
+
+        const ref = try gpa.alloc(f32, seq_q * heads * hd);
+        defer gpa.free(ref);
+        const scores = try gpa.alloc(f32, kv_total);
+        defer gpa.free(scores);
+        for (0..seq_q) |t| {
+            const klen = kv_len0 + t + 1;
+            for (0..heads) |h| {
+                const kvh = h / (heads / kv_heads);
+                var mx: f32 = -std.math.inf(f32);
+                for (0..klen) |j| {
+                    var sacc: f32 = 0;
+                    for (0..hd) |c| sacc += q[(t * heads + h) * hd + c] * k[(j * kv_heads + kvh) * hd + c];
+                    scores[j] = sacc * scale;
+                    mx = @max(mx, scores[j]);
+                }
+                var den: f32 = 0;
+                for (scores[0..klen]) |*sc| {
+                    sc.* = @exp(sc.* - mx);
+                    den += sc.*;
+                }
+                for (0..hd) |c| {
+                    var acc: f32 = 0;
+                    for (0..klen) |j| acc += scores[j] * v[(j * kv_heads + kvh) * hd + c];
+                    ref[(t * heads + h) * hd + c] = acc / den;
+                }
+            }
+        }
+
+        // K/V uploaded as f16 (u16 bit patterns); q/out/scratch stay f32.
+        const k16 = try gpa.alloc(u16, k.len);
+        defer gpa.free(k16);
+        const v16 = try gpa.alloc(u16, v.len);
+        defer gpa.free(v16);
+        for (k, k16) |x, *o| o.* = @bitCast(@as(f16, @floatCast(x)));
+        for (v, v16) |x, *o| o.* = @bitCast(@as(f16, @floatCast(x)));
+
+        const q_d = try be.tensorCreate(q.len * 4);
+        const k_d = try be.tensorCreate(k.len * 2);
+        const v_d = try be.tensorCreate(v.len * 2);
+        const o_d = try be.tensorCreate(q.len * 4);
+        const s_d = try be.tensorCreate(seq_q * heads * nsp * (hd + 4) * 4);
+        defer {
+            inline for (.{ q_d, k_d, v_d, o_d, s_d }) |b| {
+                var bb = b;
+                be.tensorDestroy(&bb);
+            }
+        }
+        try be.tensorUpload(q_d, std.mem.sliceAsBytes(q));
+        try be.tensorUpload(k_d, std.mem.sliceAsBytes(k16));
+        try be.tensorUpload(v_d, std.mem.sliceAsBytes(v16));
+        try be.opAttnDecode(q_d, k_d, v_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale, 0, 0, true);
+        const got = try gpa.alloc(f32, q.len);
+        defer gpa.free(got);
+        try be.tensorDownload(o_d, std.mem.sliceAsBytes(got));
+        var worst: f32 = 0;
+        for (ref, got) |e, a| worst = @max(worst, @abs(e - a));
+        if (worst > 5e-3) {
+            std.debug.print("f16 KV hd={d}: worst abs err {d}\n", .{ hd, worst });
+            return error.TestExpectedApproxEqAbs;
+        }
     }
 }
 
@@ -4020,13 +4309,43 @@ test "attn decode sliding window matches CPU reference" {
     try be.tensorUpload(q_d, std.mem.sliceAsBytes(q));
     try be.tensorUpload(k_d, std.mem.sliceAsBytes(k));
     try be.tensorUpload(v_d, std.mem.sliceAsBytes(v));
-    try be.opAttnDecode(q_d, k_d, v_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale, window);
+    try be.opAttnDecode(q_d, k_d, v_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale, window, 0, false);
     const got = try gpa.alloc(f32, q.len);
     defer gpa.free(got);
     try be.tensorDownload(o_d, std.mem.sliceAsBytes(got));
     var worst: f32 = 0;
     for (ref, got) |e, a| worst = @max(worst, @abs(e - a));
     try std.testing.expect(worst <= 2e-3);
+
+    // Ring-buffer path: store key/value for absolute position j at row j%ring
+    // (gemma local layers). ring = window + seq_q guarantees no needed key is
+    // aliased across the seq_q queries, so the output must match the same ref.
+    const ring = window + seq_q;
+    const k_ring = try gpa.alloc(f32, ring * kv_heads * hd);
+    defer gpa.free(k_ring);
+    const v_ring = try gpa.alloc(f32, ring * kv_heads * hd);
+    defer gpa.free(v_ring);
+    for (0..kv_total) |j| {
+        const src = (j * kv_heads) * hd;
+        const dst = ((j % ring) * kv_heads) * hd;
+        @memcpy(k_ring[dst..][0 .. kv_heads * hd], k[src..][0 .. kv_heads * hd]);
+        @memcpy(v_ring[dst..][0 .. kv_heads * hd], v[src..][0 .. kv_heads * hd]);
+    }
+    const kr_d = try be.tensorCreate(k_ring.len * 4);
+    const vr_d = try be.tensorCreate(v_ring.len * 4);
+    defer {
+        inline for (.{ kr_d, vr_d }) |b| {
+            var bb = b;
+            be.tensorDestroy(&bb);
+        }
+    }
+    try be.tensorUpload(kr_d, std.mem.sliceAsBytes(k_ring));
+    try be.tensorUpload(vr_d, std.mem.sliceAsBytes(v_ring));
+    try be.opAttnDecode(q_d, kr_d, vr_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale, window, ring, false);
+    try be.tensorDownload(o_d, std.mem.sliceAsBytes(got));
+    var worst_ring: f32 = 0;
+    for (ref, got) |e, a| worst_ring = @max(worst_ring, @abs(e - a));
+    try std.testing.expect(worst_ring <= 2e-3);
 }
 
 // Gated on a CUDA device: rope_imrope_pos with DIFFERING (t, h, w)

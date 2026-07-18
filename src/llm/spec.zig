@@ -191,6 +191,14 @@ pub fn generate(
     // A tree-only drafter cannot serve chain mode (prunes the chain path,
     // which calls drafter.propose, at comptime).
     if (comptime !@hasDecl(D, "propose")) return error.TreeUnsupported;
+    // Greedy on a GPU stepper: verify by per-row on-device argmax, downloading
+    // just the ids instead of (k+1)*vocab logits. Acceptance is identical to
+    // the download path — the greedy dist is a point mass at the argmax.
+    // Repetition penalty needs the full logits, so it stays on the download path.
+    if (comptime @hasDecl(M, "stepAllArgmax")) {
+        if (opts.sampling.temperature == 0 and opts.sampling.repeat_penalty == 1.0)
+            return generateChainGreedy(model, drafter, tok, io, gpa, ids, opts, out);
+    }
     const vocab = qwen3.vocab_size;
     const k_max: usize = @min(opts.spec_k, max_draft);
     std.debug.assert(k_max > 0);
@@ -262,6 +270,81 @@ pub fn generate(
             // extra sample.
             const row = logits[m * vocab ..][0..vocab];
             pending = sampler.next(row, ids.items);
+        }
+    }
+    return n;
+}
+
+/// Greedy chain speculative decoding via on-device per-row argmax
+/// (`model.stepAllArgmax`): the verify forward returns just the target's argmax
+/// token per row (a few ids) instead of the (k+1)*vocab logit block. Acceptance
+/// is byte-identical to the download path: the greedy target distribution is a
+/// point mass at the argmax, so a draft is accepted iff it equals g[i], a
+/// rejection yields g[i], and full acceptance takes g[m] as the bonus token.
+fn generateChainGreedy(
+    model: anytype,
+    drafter: anytype,
+    tok: *const Tokenizer,
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    ids: *std.ArrayList(u32),
+    opts: engine.Options,
+    out: ?*std.Io.Writer,
+) !usize {
+    const k_max: usize = @min(opts.spec_k, max_draft);
+    std.debug.assert(k_max > 0);
+    var stream: engine.Utf8Stream = .{};
+
+    const new = ids.items[model.cached()..];
+    if (new.len == 0 or new.len > model.remaining()) return error.ContextFull;
+    var pending = try model.stepArgmax(io, new);
+
+    var n: usize = 0;
+    var g: [max_draft + 1]u32 = undefined;
+    while (true) {
+        if (chat.isStop(pending)) break;
+        try ids.append(gpa, pending);
+        n += 1;
+        try emit(tok, gpa, &stream, out, pending);
+        if (n == opts.max_new_tokens) break; // pending stays uncached, like vanilla
+        if (model.remaining() == 0) break;
+
+        var buf: [max_draft + 1]u32 = undefined;
+        const k_eff: usize = @min(k_max, @min(model.remaining() - 1, opts.max_new_tokens - n - 1));
+        const m = drafter.propose(ids.items, buf[1 .. 1 + k_eff]);
+        buf[0] = pending;
+        const draft = buf[1 .. 1 + m];
+        if (opts.spec_stats) |s| {
+            s.drafted += m;
+            s.forwards += 1;
+        }
+        // g[i] = the target's greedy token given the prefix through row i.
+        try model.stepAllArgmax(io, buf[0 .. 1 + m], g[0 .. 1 + m]);
+
+        var next_tok: ?u32 = null;
+        for (draft, 0..) |d, i| {
+            if (d != g[i]) {
+                next_tok = g[i]; // reject → resample = the point-mass argmax
+                break;
+            }
+            if (opts.spec_stats) |s| s.accepted += 1;
+            if (chat.isStop(d)) {
+                model.truncate(ids.items.len);
+                return n;
+            }
+            try ids.append(gpa, d);
+            n += 1;
+            try emit(tok, gpa, &stream, out, d);
+            if (n == opts.max_new_tokens) {
+                model.truncate(ids.items.len);
+                return n;
+            }
+        }
+        if (next_tok) |t| {
+            model.truncate(ids.items.len);
+            pending = t;
+        } else {
+            pending = g[m]; // all accepted → the row-m bonus token
         }
     }
     return n;

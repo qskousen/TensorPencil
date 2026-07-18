@@ -41,6 +41,9 @@ pub const Options = struct {
     /// reads true, generation stops and returns the tokens produced so far
     /// (a clean stop, not an error). Lets a UI interrupt a long reply.
     cancel: ?*std.atomic.Value(bool) = null,
+    /// KV-cache element storage type (f32 default; f16 halves the footprint,
+    /// lossy). Copied onto the Capacity that reaches every model init.
+    kv_dtype: kv_cache_mod.KvDtype = .f32,
 };
 
 /// KV-cache capacity ceiling for a given prompt; errors when the prompt
@@ -56,7 +59,11 @@ pub fn capacityFor(opts: Options, prompt_len: usize) !usize {
 /// growth support treat `.max` as the (old, fixed) capacity.
 pub fn capacityPlanFor(opts: Options, prompt_len: usize) !Capacity {
     const max = try capacityFor(opts, prompt_len);
-    return .{ .initial = @min(max, @max(prompt_len + 1, kv_cache_mod.initial_context)), .max = max };
+    return .{
+        .initial = @min(max, @max(prompt_len + 1, kv_cache_mod.initial_context)),
+        .max = max,
+        .kv_dtype = opts.kv_dtype,
+    };
 }
 
 /// Make room for `need` more rows, growing dynamic-capacity models (steppers
@@ -112,6 +119,27 @@ pub fn generate(
         var drafter: spec.NgramDrafter = .{};
         return spec.generate(model, &drafter, tok, io, gpa, ids, opts, out);
     }
+    // Greedy on a GPU backend that exposes stepArgmax: pick the token on-device
+    // and download just the id, skipping the full ~vocab logit transfer + host
+    // argmax each step. Only when there's no repetition penalty (which would
+    // need the full logits) — the default greedy case.
+    {
+        const M = switch (@typeInfo(@TypeOf(model))) {
+            .pointer => |p| p.child,
+            else => @TypeOf(model),
+        };
+        // No repetition penalty in the GPU paths yet — it needs the full logits;
+        // when it's on, fall through to the download + CPU-sample path.
+        if (opts.sampling.repeat_penalty == 1.0) {
+            if (opts.sampling.temperature <= 0) {
+                if (comptime @hasDecl(M, "stepArgmax"))
+                    return generateGreedyArgmax(model, tok, io, gpa, ids, opts, out);
+            } else if (comptime @hasDecl(M, "stepSelect")) {
+                return generateGpuSample(model, tok, io, gpa, ids, opts, out);
+            }
+        }
+    }
+
     const logits = try gpa.alloc(f32, model.vocab());
     defer gpa.free(logits);
 
@@ -151,6 +179,101 @@ pub fn generate(
     return n;
 }
 
+/// Greedy generation via on-device argmax (`model.stepArgmax`): no host logits
+/// buffer, no per-step vocab download — just the sampled id comes back. Emits
+/// identical tokens to the full-vocab greedy path (both are argmax, lowest
+/// index on ties).
+fn generateGreedyArgmax(
+    model: anytype,
+    tok: *const Tokenizer,
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    ids: *std.ArrayList(u32),
+    opts: Options,
+    out: ?*std.Io.Writer,
+) !usize {
+    var stream: Utf8Stream = .{};
+    const new = ids.items[model.cached()..];
+    if (new.len == 0) return error.ContextFull;
+    try ensureRoom(model, new.len);
+    var next = try model.stepArgmax(io, new);
+    var n: usize = 0;
+    while (n < opts.max_new_tokens) {
+        if (opts.cancel) |c| if (c.load(.acquire)) break;
+        if (chat.isStop(next)) break;
+        try ids.append(gpa, next);
+        n += 1;
+        if (out) |w| {
+            const bytes = try tok.decodeAlloc(gpa, &.{next});
+            defer gpa.free(bytes);
+            try stream.write(w, bytes);
+            try w.flush();
+        }
+        if (n == opts.max_new_tokens) break;
+        if (model.remaining() == 0) {
+            ensureRoom(model, 1) catch |err| {
+                if (err == error.ContextFull) break;
+                return err;
+            };
+        }
+        next = try model.stepArgmax(io, &.{next});
+    }
+    return n;
+}
+
+/// Stochastic generation via on-device top-k (`model.stepSelect`): the device
+/// selects the top-k candidates and returns just those (id,logit) pairs; the
+/// CPU Sampler runs the identical softmax/top-p/RNG tail over them (bit-identical
+/// to the full-vocab path for the same logits + seed). No per-step vocab download.
+fn generateGpuSample(
+    model: anytype,
+    tok: *const Tokenizer,
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    ids: *std.ArrayList(u32),
+    opts: Options,
+    out: ?*std.Io.Writer,
+) !usize {
+    const cap = model.maxSelect();
+    const out_id = try gpa.alloc(u32, cap);
+    defer gpa.free(out_id);
+    const out_logit = try gpa.alloc(f32, cap);
+    defer gpa.free(out_logit);
+    const cands = try gpa.alloc(sample.Candidate, cap);
+    defer gpa.free(cands);
+
+    var sampler = sample.Sampler.init(opts.sampling, opts.seed);
+    var stream: Utf8Stream = .{};
+    const new = ids.items[model.cached()..];
+    if (new.len == 0) return error.ContextFull;
+    try ensureRoom(model, new.len);
+    var count = try model.stepSelect(io, new, out_id, out_logit);
+    var n: usize = 0;
+    while (n < opts.max_new_tokens) {
+        if (opts.cancel) |c| if (c.load(.acquire)) break;
+        for (cands[0..count], out_id[0..count], out_logit[0..count]) |*c, id, lg| c.* = .{ .id = id, .logit = lg };
+        const next = sampler.nextFromCandidates(cands[0..count]);
+        if (chat.isStop(next)) break;
+        try ids.append(gpa, next);
+        n += 1;
+        if (out) |w| {
+            const bytes = try tok.decodeAlloc(gpa, &.{next});
+            defer gpa.free(bytes);
+            try stream.write(w, bytes);
+            try w.flush();
+        }
+        if (n == opts.max_new_tokens) break;
+        if (model.remaining() == 0) {
+            ensureRoom(model, 1) catch |err| {
+                if (err == error.ContextFull) break;
+                return err;
+            };
+        }
+        count = try model.stepSelect(io, &.{next}, out_id, out_logit);
+    }
+    return n;
+}
+
 /// CPU backend stepper: qwen3.CausalLM + host KvCache; the LM head is the
 /// tied bf16 embedding GEMV.
 pub const CpuModel = struct {
@@ -169,7 +292,7 @@ pub const CpuModel = struct {
     tree_n: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator, lm: *const qwen3.CausalLM, cap: Capacity) !CpuModel {
-        var cache = try KvCache.init(gpa, lm.cfg.n_layers, cap.initial, lm.cfg.kvDim());
+        var cache = try KvCache.init(gpa, lm.cfg.n_layers, cap.initial, lm.cfg.kvDim(), cap.kv_dtype);
         errdefer cache.deinit(gpa);
         var freqs = try ops.rope.rotateHalfFreqs(gpa, cap.initial, qwen3.head_dim, lm.cfg.rope_theta);
         errdefer freqs.deinit(gpa);

@@ -180,6 +180,107 @@ export fn add() callconv(.spirv_kernel) void {
     a.data[idx] += b.data[idx];
 }
 
+// relu: a = max(0, a), in place. a=in/out. u0=total.
+export fn relu() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    a.data[idx] = @max(0.0, a.data[idx]);
+}
+
+// add_relu: a = max(0, a + b), in place (fused MemBlock residual). a=x, b=delta.
+// u0=total.
+export fn add_relu() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    a.data[idx] = @max(0.0, a.data[idx] + b.data[idx]);
+}
+
+// argmax_reduce: L lanes; lane i stride-scans logits[i], logits[i+L], ... and
+//   records its local max and the LOWEST index achieving it (ascending scan +
+//   strict `>` keeps the lowest). a=logits, c=out_val[L], d=out_idx[L] (index
+//   as an exact f32 — vocab < 2^24). u0=L (lanes), u1=vocab. Pairs with
+//   argmax_final; no workgroup memory, no atomics.
+export fn argmax_reduce() callconv(.spirv_kernel) void {
+    decorate();
+    const lane = gpu.global_invocation_id[0];
+    if (lane >= pc.u0) return;
+    var best_i: u32 = lane;
+    var best_v: f32 = a.data[lane];
+    var i: u32 = lane + pc.u0;
+    while (i < pc.u1) : (i += pc.u0) {
+        const v = a.data[i];
+        if (v > best_v) {
+            best_v = v;
+            best_i = i;
+        }
+    }
+    c.data[lane] = best_v;
+    d.data[lane] = @floatFromInt(best_i);
+}
+
+// topk_reduce: L lanes each keep their M highest (value, index) over their
+//   stride-slice, via min-slot tracking (strict `>` keeps the lower index on
+//   ties). a=logits, c=out_val[L*M], d=out_idx[L*M] (index as exact f32).
+//   u0=L, u1=vocab. The host does exact top-k over the L*M candidates — this
+//   is a superset selection, exact unless a single lane holds >M of the global
+//   top-k (astronomically unlikely for k<=512 over 1024 lanes). No workgroup
+//   memory, no atomics.
+const topk_m = 8; // must match context.zig topk_m
+export fn topk_reduce() callconv(.spirv_kernel) void {
+    decorate();
+    const lane = gpu.global_invocation_id[0];
+    if (lane >= pc.u0) return;
+    const neg_max: f32 = -3.4028235e38;
+    var bv: [topk_m]f32 = @splat(neg_max);
+    var bi: [topk_m]u32 = @splat(0);
+    var i: u32 = lane;
+    while (i < pc.u1) : (i += pc.u0) {
+        const v = a.data[i];
+        // Slot with the smallest kept value.
+        var mj: u32 = 0;
+        var mv: f32 = bv[0];
+        var j: u32 = 1;
+        while (j < topk_m) : (j += 1) {
+            if (bv[j] < mv) {
+                mv = bv[j];
+                mj = j;
+            }
+        }
+        if (v > mv) {
+            bv[mj] = v;
+            bi[mj] = i;
+        }
+    }
+    const base = lane * topk_m;
+    var j: u32 = 0;
+    while (j < topk_m) : (j += 1) {
+        c.data[base + j] = bv[j];
+        d.data[base + j] = @floatFromInt(bi[j]);
+    }
+}
+
+// argmax_final: one thread reduces the L lane winners to the global argmax,
+//   tie-breaking to the lowest index (matches sample.argmax). a=vals[L],
+//   b=idx[L], d=out[1] (id as f32). u0=L.
+export fn argmax_final() callconv(.spirv_kernel) void {
+    decorate();
+    if (gpu.global_invocation_id[0] != 0) return;
+    var best_v: f32 = a.data[0];
+    var best_i: u32 = @intFromFloat(b.data[0]);
+    var i: u32 = 1;
+    while (i < pc.u0) : (i += 1) {
+        const v = a.data[i];
+        const idx: u32 = @intFromFloat(b.data[i]);
+        if (v > best_v or (v == best_v and idx < best_i)) {
+            best_v = v;
+            best_i = idx;
+        }
+    }
+    d.data[0] = @floatFromInt(best_i);
+}
+
 export fn silu_mul() callconv(.spirv_kernel) void {
     decorate();
     const idx = gpu.global_invocation_id[0];
@@ -342,7 +443,7 @@ export fn gemv_partial() callconv(.spirv_kernel) void {
     const col0 = (idx % groups) * 4;
     var sums: [4]f32 = @splat(0.0);
     var k: u32 = ch;
-    if (pc.u4 != 0) {
+    if (pc.u4 == 1) { // fp8: one aligned u32 = 4 columns
         while (k < pc.u1) : (k += pc.u2) {
             const word: u32 = @bitCast(a.data[(k * pc.u3 + col0) / 4]);
             const xv = b.data[k];
@@ -350,7 +451,18 @@ export fn gemv_partial() callconv(.spirv_kernel) void {
                 sums[j] += e4m3ToF32((word >> (8 * j)) & 0xFF) * xv;
             }
         }
-    } else {
+    } else if (pc.u4 == 2) { // bf16: one u32 = 2 columns (col0 even, stride even)
+        while (k < pc.u1) : (k += pc.u2) {
+            const e = k * pc.u3 + col0;
+            const w0: u32 = @bitCast(a.data[e >> 1]);
+            const w1: u32 = @bitCast(a.data[(e >> 1) + 1]);
+            const xv = b.data[k];
+            sums[0] += bf16ToF32(w0) * xv;
+            sums[1] += bf16ToF32(w0 >> 16) * xv;
+            sums[2] += bf16ToF32(w1) * xv;
+            sums[3] += bf16ToF32(w1 >> 16) * xv;
+        }
+    } else { // f32
         while (k < pc.u1) : (k += pc.u2) {
             const base = k * pc.u3 + col0;
             const xv = b.data[k];
@@ -960,7 +1072,8 @@ export fn rope_qwen35() callconv(.spirv_kernel) void {
 //   j*kvDim + kvh*hd), d = out [n_heads*hd]. u0 = n_heads, u1 = n_kv_heads,
 //   u2 = head_dim (<=256), u3 = kv_len, u4 = window (0 = full causal;
 //   sliding-window for Gemma 3 local layers — attend only the last `window`
-//   keys), f0 = scale.
+//   keys), u5 = ring (0 = linear; >0 => KV storage row is pos%ring, gemma3
+//   LOCAL ring cache), f0 = scale.
 export fn attn_decode_q35() callconv(.spirv_kernel) void {
     decorate();
     const h = gpu.global_invocation_id[0];
@@ -970,6 +1083,7 @@ export fn attn_decode_q35() callconv(.spirv_kernel) void {
     const hd = pc.u2;
     const kv_len = pc.u3;
     const window = pc.u4;
+    const ring = pc.u5;
     const scale = pc.f0;
     const kvh = h / (n_heads / n_kv);
     const qb = h * hd;
@@ -983,7 +1097,8 @@ export fn attn_decode_q35() callconv(.spirv_kernel) void {
     var denom: f32 = 0;
     var j: u32 = kv_start;
     while (j < kv_len) : (j += 1) {
-        const kb = j * kvdim + kvbase;
+        const row = if (ring != 0) j % ring else j;
+        const kb = row * kvdim + kvbase;
         var sc: f32 = 0;
         t = 0;
         while (t < hd) : (t += 1) sc += a.data[qb + t] * b.data[kb + t];
@@ -1025,7 +1140,7 @@ export fn gemv_partial4() callconv(.spirv_kernel) void {
     const col0 = (idx % groups) * 8;
     var sums: [4][8]f32 = @splat(@splat(0.0));
     var k: u32 = ch;
-    if (pc.u4 != 0) {
+    if (pc.u4 == 1) { // fp8: two aligned u32 = 8 columns
         while (k < cols) : (k += pc.u2) {
             const base = (k * pc.u3 + col0) / 4;
             const w0: u32 = @bitCast(a.data[base]);
@@ -1038,7 +1153,26 @@ export fn gemv_partial4() callconv(.spirv_kernel) void {
                 }
             }
         }
-    } else {
+    } else if (pc.u4 == 2) { // bf16: four u32 = 8 columns (col0, stride both even)
+        while (k < cols) : (k += pc.u2) {
+            const base = (k * pc.u3 + col0) >> 1;
+            const w0: u32 = @bitCast(a.data[base]);
+            const w1: u32 = @bitCast(a.data[base + 1]);
+            const w2: u32 = @bitCast(a.data[base + 2]);
+            const w3: u32 = @bitCast(a.data[base + 3]);
+            inline for (0..4) |i| {
+                const xv = b.data[x0 + i * cols + k];
+                sums[i][0] += bf16ToF32(w0) * xv;
+                sums[i][1] += bf16ToF32(w0 >> 16) * xv;
+                sums[i][2] += bf16ToF32(w1) * xv;
+                sums[i][3] += bf16ToF32(w1 >> 16) * xv;
+                sums[i][4] += bf16ToF32(w2) * xv;
+                sums[i][5] += bf16ToF32(w2 >> 16) * xv;
+                sums[i][6] += bf16ToF32(w3) * xv;
+                sums[i][7] += bf16ToF32(w3 >> 16) * xv;
+            }
+        }
+    } else { // f32
         while (k < cols) : (k += pc.u2) {
             const base = k * pc.u3 + col0;
             inline for (0..4) |i| {
@@ -1074,6 +1208,12 @@ export fn gemv_combine4() callconv(.spirv_kernel) void {
     var ch: u32 = 0;
     while (ch < pc.u1) : (ch += 1) sum += a.data[(ch * 4 + i) * rows + col];
     d.data[pc.u2 + i * pc.u3 + col] = sum * pc.f0;
+}
+
+// bf16 -> f32: bf16 IS the top 16 bits of an f32, so widening is a left shift
+// of the (low-16) bits into the high half. `bits` must be a 16-bit value.
+inline fn bf16ToF32(bits: u32) f32 {
+    return @bitCast((bits & 0xFFFF) << 16);
 }
 
 // e4m3 -> f32, branchless (same as common.zig's; duplicated so this module
@@ -1168,6 +1308,143 @@ export fn attn_dmerge() callconv(.spirv_kernel) void {
         o += a.data[base + i * stride + 2 + ch] * w;
     }
     d.data[idx] = o / dsum;
+}
+
+// attn_dsplit_gemma: flash-decoding split for ONE query (decode), hd<=256,
+//   with sliding-window + ring addressing (gemma3 LOCAL layers) and GQA. One
+//   thread per (head, kv chunk): online softmax over its chunk of the visible
+//   window, unnormalized partial (m, d, acc[hd]) to scratch at [idx*(hd+2)]
+//   ([h][i] order — attn_dmerge runs with heads' = heads). Pairs with
+//   attn_dmerge (hd-agnostic). Parallelizes the old one-thread-per-head
+//   attn_decode_q35 by `nsplit`.
+//   a = q [heads][hd], b = k_cache, c = v_cache, d = scratch.
+//   u0=kv_len (pos+1), u1=heads, u2=kv_heads, u3=hd(<=256), u4=nsplit,
+//   u5=window (0 = full causal), f0=scale, f1=ring (bitcast u32; 0 = linear).
+export fn attn_dsplit_gemma() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    const nsplit = pc.u4;
+    const heads = pc.u1;
+    if (idx >= heads * nsplit) return;
+    const hd = pc.u3;
+    const kv_len = pc.u0;
+    const kv_heads = pc.u2;
+    const window = pc.u5;
+    const ring: u32 = @bitCast(pc.f1);
+    const scale = pc.f0;
+    const h = idx / nsplit;
+    const i = idx % nsplit;
+    const kvh = h / (heads / kv_heads);
+    const kv_start: u32 = if (window != 0 and kv_len > window) kv_len - window else 0;
+    const span = kv_len - kv_start;
+    const chunk = (span + nsplit - 1) / nsplit;
+    const kv0 = kv_start + i * chunk;
+    const kv1 = @min(kv0 + chunk, kv_len);
+    const qbase = h * hd;
+    var acc: [256]f32 = @splat(0.0); // type-level max; loops bound by hd
+    var m: f32 = -3.0e38;
+    var dsum: f32 = 0;
+    var j = kv0;
+    while (j < kv1) : (j += 1) {
+        const row = if (ring != 0) j % ring else j;
+        const kbase = (row * kv_heads + kvh) * hd;
+        var s: f32 = 0;
+        var t: u32 = 0;
+        while (t < hd) : (t += 1) s += a.data[qbase + t] * b.data[kbase + t];
+        s *= scale;
+        const m2 = @max(m, s);
+        const corr = @exp(m - m2);
+        const p = @exp(s - m2);
+        dsum = dsum * corr + p;
+        m = m2;
+        var t2: u32 = 0;
+        while (t2 < hd) : (t2 += 1) acc[t2] = acc[t2] * corr + p * c.data[kbase + t2];
+    }
+    const base = idx * (hd + 2);
+    d.data[base] = m;
+    d.data[base + 1] = dsum;
+    var t: u32 = 0;
+    while (t < hd) : (t += 1) d.data[base + 2 + t] = acc[t];
+}
+
+// f16 K/V readers: the K (b) / V (c) caches hold f16, two per f32 slot. Element
+// e lives in slot e/2, low half if e even else high (little-endian). Mirrors
+// `wf16` (buffer a) for the K/V bindings — used by attn_dsplit_gemma_f16.
+inline fn kf16(e: u32) f32 {
+    const word: u32 = @bitCast(b.data[e / 2]);
+    const bits: u16 = if (e % 2 == 0) @truncate(word) else @truncate(word >> 16);
+    return @floatCast(@as(f16, @bitCast(bits)));
+}
+inline fn vf16(e: u32) f32 {
+    const word: u32 = @bitCast(c.data[e / 2]);
+    const bits: u16 = if (e % 2 == 0) @truncate(word) else @truncate(word >> 16);
+    return @floatCast(@as(f16, @bitCast(bits)));
+}
+
+// attn_dsplit_gemma_f16: f16-KV variant of attn_dsplit_gemma. Identical online
+// softmax + sliding-window + ring, but K/V are read from the f16-packed caches
+// (kf16/vf16) and widened to f32; Q (a) and scratch (d) stay f32. Params match
+// attn_dsplit_gemma exactly. Lossy vs f32.
+export fn attn_dsplit_gemma_f16() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    const nsplit = pc.u4;
+    const heads = pc.u1;
+    if (idx >= heads * nsplit) return;
+    const hd = pc.u3;
+    const kv_len = pc.u0;
+    const kv_heads = pc.u2;
+    const window = pc.u5;
+    const ring: u32 = @bitCast(pc.f1);
+    const scale = pc.f0;
+    const h = idx / nsplit;
+    const i = idx % nsplit;
+    const kvh = h / (heads / kv_heads);
+    const kv_start: u32 = if (window != 0 and kv_len > window) kv_len - window else 0;
+    const span = kv_len - kv_start;
+    const chunk = (span + nsplit - 1) / nsplit;
+    const kv0 = kv_start + i * chunk;
+    const kv1 = @min(kv0 + chunk, kv_len);
+    const qbase = h * hd;
+    var acc: [256]f32 = @splat(0.0); // type-level max; loops bound by hd
+    var m: f32 = -3.0e38;
+    var dsum: f32 = 0;
+    var j = kv0;
+    while (j < kv1) : (j += 1) {
+        const row = if (ring != 0) j % ring else j;
+        const kbase = (row * kv_heads + kvh) * hd;
+        var s: f32 = 0;
+        var t: u32 = 0;
+        while (t < hd) : (t += 1) s += a.data[qbase + t] * kf16(kbase + t);
+        s *= scale;
+        const m2 = @max(m, s);
+        const corr = @exp(m - m2);
+        const p = @exp(s - m2);
+        dsum = dsum * corr + p;
+        m = m2;
+        var t2: u32 = 0;
+        while (t2 < hd) : (t2 += 1) acc[t2] = acc[t2] * corr + p * vf16(kbase + t2);
+    }
+    const base = idx * (hd + 2);
+    d.data[base] = m;
+    d.data[base + 1] = dsum;
+    var t: u32 = 0;
+    while (t < hd) : (t += 1) d.data[base + 2 + t] = acc[t];
+}
+
+// kv_store_f16: convert-store f32 K/V into an f16-packed cache. One thread per
+// destination f32 slot = two f16 elements: reads a.data[u3 + 2*idx .. +1] (f32),
+// packs the two f16 into one u32 slot at b.data[u2 + idx]. u0 = slot count
+// (= f16 element count / 2). Whole KV rows are even, so this stays slot-aligned
+// and race-free (each slot written by exactly one thread).
+export fn kv_store_f16() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const lo: f16 = @floatCast(a.data[pc.u3 + 2 * idx]);
+    const hi: f16 = @floatCast(a.data[pc.u3 + 2 * idx + 1]);
+    const pk: u32 = @as(u32, @as(u16, @bitCast(lo))) | (@as(u32, @as(u16, @bitCast(hi))) << 16);
+    b.data[pc.u2 + idx] = @bitCast(pk);
 }
 
 // copy: b[u2 + idx] = a[u3 + idx]. Contiguous copy with destination and

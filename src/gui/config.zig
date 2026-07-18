@@ -109,6 +109,23 @@ pub const Backend = enum(u8) {
     }
 };
 
+/// KV-cache element storage type for the chat LLM. `f32` is the default and
+/// bit-exact; `f16` halves the KV footprint (VRAM), at a small precision cost
+/// (output is not identical to f32). Mirrors `kv_cache.KvDtype` in the library;
+/// mapped to it in `app.buildSession`. Changing it rebuilds the KV context
+/// (weights stay resident) — see `ctxReloadEql`.
+pub const KvDtype = enum(u8) {
+    f32,
+    f16,
+
+    fn fromStr(s: []const u8) ?KvDtype {
+        inline for (@typeInfo(KvDtype).@"enum".fields) |f| {
+            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        }
+        return null;
+    }
+};
+
 /// VAE decode-path override for image generation. `auto` is the adaptive chain
 /// (whole-image → GPU-tiled → CPU-tiled with OOM fallback); the others force the
 /// starting strategy but still degrade gracefully on OOM (see pipeline.zig).
@@ -240,6 +257,10 @@ pub const Config = struct {
     /// live — the GUI toolbar toggle flips this without a reload; the block is
     /// rendered collapsed. No effect on non-reasoning models (e.g. Gemma 3).
     reasoning: bool = true,
+    /// KV-cache element storage type (f32 default; f16 halves the KV VRAM
+    /// footprint, lossy). Changing it rebuilds the KV context — the weights stay
+    /// resident (see `ctxReloadEql`), not a full model reload.
+    kv_dtype: KvDtype = .f32,
 
     /// Persisted window geometry for the main window and the image viewer,
     /// restored on the next launch. Size/position track the *restored* (non-
@@ -266,6 +287,15 @@ pub const Config = struct {
         return pathEql(&a.llm_model, &b.llm_model) and
             pathEql(&a.vision_tower, &b.vision_tower) and
             a.llm_backend == b.llm_backend;
+    }
+
+    /// The LLM's KV-cache CONTEXT config matches. A change here (currently just
+    /// `kv_dtype`) needs a context rebuild — the KV cache is re-allocated at the
+    /// new dtype and the transcript re-prefilled — but the model WEIGHTS stay
+    /// resident (no full `llmReloadEql` reload). Kept separate from
+    /// `llmReloadEql` precisely so a dtype flip doesn't reload multi-GB weights.
+    pub fn ctxReloadEql(a: *const Config, b: *const Config) bool {
+        return a.kv_dtype == b.kv_dtype;
     }
 
     /// The diffusion model set (dit/text-encoder/vae/taesd) matches. A change
@@ -384,6 +414,8 @@ pub const Config = struct {
             if (VaeDecode.fromStr(val)) |v| self.vae_decode = v;
         } else if (std.mem.eql(u8, key, "reasoning")) {
             self.reasoning = std.mem.eql(u8, val, "true");
+        } else if (std.mem.eql(u8, key, "kv_dtype")) {
+            if (KvDtype.fromStr(val)) |d| self.kv_dtype = d;
         } else if (std.mem.eql(u8, key, "win_w")) {
             self.win_w = std.fmt.parseInt(usize, val, 10) catch self.win_w;
         } else if (std.mem.eql(u8, key, "win_h")) {
@@ -441,6 +473,7 @@ pub const Config = struct {
             \\diff_backend = {s}
             \\vae_decode = {s}
             \\reasoning = {}
+            \\kv_dtype = {s}
             \\win_w = {d}
             \\win_h = {d}
             \\win_x = {d}
@@ -464,6 +497,7 @@ pub const Config = struct {
             self.vram_limit_frac,
             @tagName(self.llm_backend),   @tagName(self.diff_backend),
             @tagName(self.vae_decode),    self.reasoning,
+            @tagName(self.kv_dtype),
             self.win_w,                   self.win_h,
             self.win_x,                   self.win_y,
             self.win_max,                 self.viewer_w,
@@ -542,6 +576,22 @@ test "apply parses the reasoning flag (default on)" {
     try std.testing.expect(!cfg.reasoning);
     cfg.apply("reasoning", "true");
     try std.testing.expect(cfg.reasoning);
+}
+
+test "apply parses kv_dtype (default f32) and ctxReloadEql tracks it" {
+    var cfg: Config = .{};
+    try std.testing.expectEqual(KvDtype.f32, cfg.kv_dtype); // default
+    cfg.apply("kv_dtype", "f16");
+    try std.testing.expectEqual(KvDtype.f16, cfg.kv_dtype);
+    cfg.apply("kv_dtype", "garbage"); // unchanged on junk
+    try std.testing.expectEqual(KvDtype.f16, cfg.kv_dtype);
+
+    // ctxReloadEql: false only when kv_dtype differs (weights stay resident).
+    const base: Config = .{};
+    try std.testing.expect(base.ctxReloadEql(&base));
+    try std.testing.expect(!cfg.ctxReloadEql(&base));
+    // A kv_dtype change must NOT trip llmReloadEql (that would reload weights).
+    try std.testing.expect(cfg.llmReloadEql(&base));
 }
 
 test "system prompt escapes/unescapes newlines round-trip" {

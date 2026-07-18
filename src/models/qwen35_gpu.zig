@@ -32,6 +32,8 @@ pub const VulkanLM = struct {
     arena: std.heap.ArenaAllocator,
     capacity: usize,
     len: usize,
+    /// KV-cache element storage type (f32 / f16).
+    kv_dtype: kvmod.KvDtype,
 
     // Per-token activation buffers.
     x: Buf,
@@ -42,6 +44,8 @@ pub const VulkanLM = struct {
     k: Buf,
     v: Buf,
     attn: Buf,
+    /// Flash-decode attention partials: n_heads * nsplit * (head_dim+2) f32.
+    attn_scratch: Buf,
     t: Buf,
     lin_qkv: Buf,
     lin_conv: Buf,
@@ -92,6 +96,7 @@ pub const VulkanLM = struct {
         self.gpa = gpa;
         self.capacity = cap.max;
         self.len = 0;
+        self.kv_dtype = cap.kv_dtype;
 
         // RoPE table for the rotated span, to max capacity up front.
         var freqs = try ops.rope.rotateHalfFreqs(gpa, cap.max, cfg.rope_dim, cfg.rope_theta);
@@ -114,6 +119,7 @@ pub const VulkanLM = struct {
         self.k = try ctx.tensorCreate(cfg.kvDim() * 4);
         self.v = try ctx.tensorCreate(cfg.kvDim() * 4);
         self.attn = try ctx.tensorCreate(cfg.qDim() * 4);
+        self.attn_scratch = try ctx.tensorCreate(cfg.n_heads * gpu.Context.attn_decode_nsplit * (cfg.head_dim + 2) * 4);
         self.t = try ctx.tensorCreate(cfg.hidden * 4);
         self.lin_qkv = try ctx.tensorCreate(cfg.convChannels() * 4);
         self.lin_conv = try ctx.tensorCreate(cfg.convChannels() * 4);
@@ -132,9 +138,10 @@ pub const VulkanLM = struct {
         const n_attn = cfg.nAttnLayers();
         self.k_cache = try alloc.alloc(Buf, n_attn);
         self.v_cache = try alloc.alloc(Buf, n_attn);
+        const esz = cap.kv_dtype.elemBytes();
         for (self.k_cache, self.v_cache) |*kb, *vb| {
-            kb.* = try ctx.tensorCreate(cap.max * cfg.kvDim() * 4);
-            vb.* = try ctx.tensorCreate(cap.max * cfg.kvDim() * 4);
+            kb.* = try ctx.tensorCreate(cap.max * cfg.kvDim() * esz);
+            vb.* = try ctx.tensorCreate(cap.max * cfg.kvDim() * esz);
         }
 
         const n_lin = cfg.n_layers - n_attn;
@@ -168,7 +175,7 @@ pub const VulkanLM = struct {
 
     pub fn deinit(self: *VulkanLM) void {
         const ctx = self.ctx;
-        inline for (.{ "x", "normed", "qg", "q", "gate", "k", "v", "attn", "t", "lin_qkv", "lin_conv", "lin_z", "lin_o", "ab", "gates", "mlp_gate", "mlp_up", "logits", "partials", "freqs_d" }) |f| {
+        inline for (.{ "x", "normed", "qg", "q", "gate", "k", "v", "attn", "attn_scratch", "t", "lin_qkv", "lin_conv", "lin_z", "lin_o", "ab", "gates", "mlp_gate", "mlp_up", "logits", "partials", "freqs_d" }) |f| {
             ctx.tensorDestroy(&@field(self, f));
         }
         for (self.k_cache) |*b| ctx.tensorDestroy(b);
@@ -260,10 +267,15 @@ pub const VulkanLM = struct {
                     // Append K/V to the cache with in-batch device copies
                     // (copy kernel: dst[u2+i] = src[u3+i]) — tensorCopy would
                     // flush the recording and drain the GPU every layer.
-                    try ctx.opElt(.copy, self.k, self.k_cache[slot], null, null, .{ .u0 = @intCast(kvdim), .u2 = @intCast(pos * kvdim) }, kvdim, 1, 1);
-                    try ctx.opElt(.copy, self.v, self.v_cache[slot], null, null, .{ .u0 = @intCast(kvdim), .u2 = @intCast(pos * kvdim) }, kvdim, 1, 1);
+                    if (self.kv_dtype == .f16) {
+                        try ctx.opStoreKvF16(self.k_cache[slot], pos * kvdim, self.k, 0, kvdim);
+                        try ctx.opStoreKvF16(self.v_cache[slot], pos * kvdim, self.v, 0, kvdim);
+                    } else {
+                        try ctx.opElt(.copy, self.k, self.k_cache[slot], null, null, .{ .u0 = @intCast(kvdim), .u2 = @intCast(pos * kvdim) }, kvdim, 1, 1);
+                        try ctx.opElt(.copy, self.v, self.v_cache[slot], null, null, .{ .u0 = @intCast(kvdim), .u2 = @intCast(pos * kvdim) }, kvdim, 1, 1);
+                    }
                     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
-                    try ctx.opAttnDecodeQ35(self.q, self.k_cache[slot], self.v_cache[slot], self.attn, cfg.n_heads, cfg.n_kv_heads, hd, pos + 1, scale, 0);
+                    try ctx.opAttnDecodeQ35(self.q, self.k_cache[slot], self.v_cache[slot], self.attn, self.attn_scratch, cfg.n_heads, cfg.n_kv_heads, hd, pos + 1, scale, 0, 0, self.kv_dtype == .f16);
                     try ctx.opElt(.sigmoid_mul, self.attn, self.gate, null, null, .{ .u0 = @intCast(cfg.qDim()) }, cfg.qDim(), 1, 1);
                     try self.gemvW(self.t, 0, self.attn, al.o);
                     try self.add(self.x, self.t, cfg.hidden);

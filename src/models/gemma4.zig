@@ -171,6 +171,24 @@ pub const Config = struct {
 /// Config.detect (Gemma 4 tops out at 60 layers for the 31B).
 const max_layers = 128;
 
+/// CPU prefill batch size. Bounds the per-forward `seq` so LOCAL layers' KV
+/// ring (`sliding_window + prefill_chunk` rows) can't alias a still-needed key
+/// within one batch (TODO lever 1). Also caps the activation scratch height.
+const prefill_chunk = 128;
+
+/// Kill-switch for the LOCAL-layer sliding-window ring cache (A/B validation).
+const enable_local_ring = true;
+
+/// Per-layer KV ring rows: LOCAL (sliding-window) layers get a fixed ring;
+/// GLOBAL layers get 0 (full context). Caller owns the slice.
+fn kvRings(cfg: Config, alloc: std.mem.Allocator) ![]usize {
+    const rings = try alloc.alloc(usize, cfg.n_layers);
+    for (rings, 0..) |*r, l| {
+        r.* = if (enable_local_ring and !cfg.isGlobal(l)) cfg.sliding_window + prefill_chunk else 0;
+    }
+    return rings;
+}
+
 /// Read a fixed-length uint/bool array KV into the caller's `out` buffer.
 fn readUintArray(g: *const Gguf, key: []const u8, out: []usize) ![]usize {
     const arr = g.getArr(key) orelse return error.UnknownModelConfig;
@@ -321,13 +339,22 @@ pub const Model = struct {
         const seq = x.len / cfg.hidden;
         std.debug.assert(seq > 0 and seq <= cache.remaining());
 
-        var s = try Scratch.init(gpa, seq, cfg);
+        // Prefill in prefill_chunk-sized batches so a LOCAL layer's ring never
+        // has to hold more than `window + prefill_chunk` live positions at once
+        // (chunked prefill is token-identical to a single pass — attention is
+        // causal, so a later chunk only reads earlier chunks' committed KV).
+        var s = try Scratch.init(gpa, @min(seq, prefill_chunk), cfg);
         defer s.deinit(gpa);
-
-        for (self.layers, 0..) |*layer, l| {
-            try layerForward(io, gpa, cfg, layer, x, seq, freqs_global, freqs_local, cache, l, &s);
+        var off: usize = 0;
+        while (off < seq) {
+            const n = @min(prefill_chunk, seq - off);
+            const xc = x[off * cfg.hidden ..][0 .. n * cfg.hidden];
+            for (self.layers, 0..) |*layer, l| {
+                try layerForward(io, gpa, cfg, layer, xc, n, freqs_global, freqs_local, cache, l, &s);
+            }
+            cache.commit(n);
+            off += n;
         }
-        cache.commit(seq);
 
         if (out) |o| {
             std.debug.assert(o.len % cfg.hidden == 0);
@@ -456,7 +483,9 @@ pub const CpuModel = struct {
         const cfg = lm.cfg;
         const dims = try cfg.kvDims(gpa);
         defer gpa.free(dims);
-        var cache = try PerLayerKvCache.init(gpa, cap.initial, dims);
+        const rings = try kvRings(cfg, gpa);
+        defer gpa.free(rings);
+        var cache = try PerLayerKvCache.init(gpa, cap.initial, dims, rings, cap.kv_dtype);
         errdefer cache.deinit(gpa);
         var fg = try buildGlobalFreqs(gpa, cap.initial, cfg, lm.rope_freqs);
         errdefer fg.deinit(gpa);

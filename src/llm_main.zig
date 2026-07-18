@@ -18,6 +18,7 @@ const usage =
     \\usage: tp-llm --model <qwen3.safetensors> --prompt <text>
     \\              [--backend cpu|zig-cuda|cuda|vulkan]
     \\              [--system <text>] [--max-tokens <n>] [--max-context <n>]
+    \\              [--kv-dtype f32|f16]
     \\              [--temperature <t>] [--top-k <n>] [--top-p <p>]
     \\              [--repeat-penalty <r>] [--seed <n>] [--greedy] [--no-think]
     \\              [--spec-k <n>] [--draft-model <qwen3.safetensors>]
@@ -134,6 +135,13 @@ pub fn main(init: std.process.Init) !void {
             opts.max_new_tokens = try std.fmt.parseInt(usize, try nextArg(args, &i), 10);
         } else if (std.mem.eql(u8, a, "--max-context")) {
             max_context_arg = try std.fmt.parseInt(usize, try nextArg(args, &i), 10);
+        } else if (std.mem.eql(u8, a, "--kv-dtype")) {
+            const name = try nextArg(args, &i);
+            opts.kv_dtype = llm.kv_cache.KvDtype.parse(name) orelse {
+                try stdout.print("unknown --kv-dtype: {s} (f32 | f16)\n", .{name});
+                try stdout.flush();
+                return error.InvalidArgument;
+            };
         } else if (std.mem.eql(u8, a, "--temperature")) {
             opts.sampling.temperature = try std.fmt.parseFloat(f32, try nextArg(args, &i));
         } else if (std.mem.eql(u8, a, "--top-k")) {
@@ -801,6 +809,9 @@ const Qwen3Spec = struct {
         return Cuda.init(gpa, be, lm, cap, first_seq);
     }
     pub fn buildVulkan(gpa: std.mem.Allocator, ctx: *TensorPencil.gpu.Context, lm: *const Model, cap: llm.engine.Capacity, first_seq: usize) !Vulkan {
+        // qwen3 Vulkan uses the hd128 attn_dsplit path (no f16 variant) and its
+        // generation is a known-broken path; f16 KV is gemma3/qwen35-only on Vulkan.
+        if (cap.kv_dtype != .f32) return error.KvDtypeUnsupported;
         return Vulkan.init(gpa, ctx, lm, cap.max, first_seq);
     }
 };
@@ -1476,8 +1487,12 @@ fn trainedContext(st: *const ModelFile) usize {
 /// toward it. `fixed` forces initial == max (speculative decoding).
 fn capacityPlan(opts: llm.engine.Options, prompt: ?[]const u8, n_prompt: usize, fixed: bool) !llm.engine.Capacity {
     const max = if (prompt == null) opts.max_context else try llm.engine.capacityFor(opts, n_prompt);
-    if (fixed) return .fixed(max);
-    return .{ .initial = @min(max, @max(n_prompt + 1, llm.kv_cache.initial_context)), .max = max };
+    if (fixed) return .{ .initial = max, .max = max, .kv_dtype = opts.kv_dtype };
+    return .{
+        .initial = @min(max, @max(n_prompt + 1, llm.kv_cache.initial_context)),
+        .max = max,
+        .kv_dtype = opts.kv_dtype,
+    };
 }
 
 const BackendKind = llm.session.BackendKind;

@@ -7,13 +7,47 @@
 
 const std = @import("std");
 
+/// Element storage type for the KV cache K/V data. `f32` is the default and is
+/// bit-exact (unchanged behavior); `f16` halves the footprint but is lossy —
+/// f16 output is NOT token-identical to f32. Structured as an enum so the ggml
+/// block-quant formats (q8_0, …) can be added as further arms later.
+pub const KvDtype = enum {
+    f32,
+    f16,
+
+    /// Bytes per stored K/V element.
+    pub fn elemBytes(self: KvDtype) usize {
+        return switch (self) {
+            .f32 => 4,
+            .f16 => 2,
+        };
+    }
+
+    /// Parse a CLI/config token ("f32" / "f16"); null if unrecognized.
+    pub fn parse(s: []const u8) ?KvDtype {
+        if (std.mem.eql(u8, s, "f32")) return .f32;
+        if (std.mem.eql(u8, s, "f16")) return .f16;
+        return null;
+    }
+
+    pub fn label(self: KvDtype) []const u8 {
+        return switch (self) {
+            .f32 => "f32",
+            .f16 => "f16",
+        };
+    }
+};
+
 /// Sizing plan for a session's KV cache: start with `initial` rows committed
 /// and grow on demand up to `max`. `initial == max` is a fixed-capacity cache
 /// (no growth) — required whenever the capacity is baked into device layouts
-/// (speculative tree batch regions, EAGLE tap strides).
+/// (speculative tree batch regions, EAGLE tap strides). `kv_dtype` selects the
+/// K/V element storage type (default f32) and is threaded into every model
+/// init so the device allocation and attention kernels agree on the width.
 pub const Capacity = struct {
     initial: usize,
     max: usize,
+    kv_dtype: KvDtype = .f32,
 
     pub fn fixed(n: usize) Capacity {
         return .{ .initial = n, .max = n };
@@ -35,25 +69,77 @@ pub fn growTarget(cur: usize, min: usize, max: usize) usize {
     return @min(max, @max(min, stepped));
 }
 
+/// f16 storage on the CPU packs two f16 into each f32 slot (like the GPU
+/// caches) so the backing array stays naturally f32-aligned and the f32 path is
+/// a zero-copy sub-slice. `slotsFor(elems)` is the packed f32-slot count.
+fn slotsFor(dt: KvDtype, elems: usize) usize {
+    return switch (dt) {
+        .f32 => elems,
+        .f16 => (elems + 1) / 2, // KV rows are even, so no partial-slot aliasing
+    };
+}
+
+/// Pack `src` (f32) into `buf` at logical f16-element `base` (even). Each f32
+/// slot holds elem 2k (low) and 2k+1 (high).
+fn packF16(buf: []f32, base: usize, src: []const f32) void {
+    var i: usize = 0;
+    while (i + 1 < src.len) : (i += 2) {
+        const lo: u16 = @bitCast(@as(f16, @floatCast(src[i])));
+        const hi: u16 = @bitCast(@as(f16, @floatCast(src[i + 1])));
+        buf[(base + i) / 2] = @bitCast(@as(u32, lo) | (@as(u32, hi) << 16));
+    }
+}
+
+/// Expand `count` packed f16 elements at logical element `base` of `buf` into
+/// `dst` (f32).
+fn unpackF16(dst: []f32, buf: []const f32, base: usize, count: usize) void {
+    var i: usize = 0;
+    while (i + 1 < count) : (i += 2) {
+        const word: u32 = @bitCast(buf[(base + i) / 2]);
+        dst[i] = @floatCast(@as(f16, @bitCast(@as(u16, @truncate(word)))));
+        dst[i + 1] = @floatCast(@as(f16, @bitCast(@as(u16, @truncate(word >> 16)))));
+    }
+}
+
 pub const KvCache = struct {
+    /// Backing storage (f32 slots). For f16, two elements are packed per slot,
+    /// so this is half the logical element count. Layer l's block starts at
+    /// `l * slotsFor(capacity*kv_dim)`.
     k: []f32,
     v: []f32,
+    /// f32 read scratch for the f16 path (one layer's rows expanded on view);
+    /// empty for f32 (zero-copy sub-slice instead). Two, since attention reads
+    /// K and V of the same layer at once.
+    k_scratch: []f32 = &.{},
+    v_scratch: []f32 = &.{},
     n_layers: usize,
     capacity: usize,
     kv_dim: usize,
+    kv_dtype: KvDtype = .f32,
     /// Committed token count (positions 0..len are valid in every layer).
     len: usize = 0,
 
-    pub fn init(gpa: std.mem.Allocator, n_layers: usize, capacity: usize, kv_dim: usize) !KvCache {
-        const k = try gpa.alloc(f32, n_layers * capacity * kv_dim);
+    pub fn init(gpa: std.mem.Allocator, n_layers: usize, capacity: usize, kv_dim: usize, kv_dtype: KvDtype) !KvCache {
+        const slots = slotsFor(kv_dtype, n_layers * capacity * kv_dim);
+        const k = try gpa.alloc(f32, slots);
         errdefer gpa.free(k);
-        const v = try gpa.alloc(f32, n_layers * capacity * kv_dim);
-        return .{ .k = k, .v = v, .n_layers = n_layers, .capacity = capacity, .kv_dim = kv_dim };
+        const v = try gpa.alloc(f32, slots);
+        errdefer gpa.free(v);
+        var ks: []f32 = &.{};
+        var vs: []f32 = &.{};
+        if (kv_dtype == .f16) {
+            ks = try gpa.alloc(f32, capacity * kv_dim);
+            errdefer gpa.free(ks);
+            vs = try gpa.alloc(f32, capacity * kv_dim);
+        }
+        return .{ .k = k, .v = v, .k_scratch = ks, .v_scratch = vs, .n_layers = n_layers, .capacity = capacity, .kv_dim = kv_dim, .kv_dtype = kv_dtype };
     }
 
     pub fn deinit(self: *KvCache, gpa: std.mem.Allocator) void {
         gpa.free(self.k);
         gpa.free(self.v);
+        if (self.k_scratch.len != 0) gpa.free(self.k_scratch);
+        if (self.v_scratch.len != 0) gpa.free(self.v_scratch);
         self.* = undefined;
     }
 
@@ -67,23 +153,34 @@ pub const KvCache = struct {
         std.debug.assert(k_new.len == v_new.len and k_new.len % self.kv_dim == 0);
         std.debug.assert(self.len * self.kv_dim + k_new.len <= self.capacity * self.kv_dim);
         const base = (layer * self.capacity + self.len) * self.kv_dim;
-        @memcpy(self.k[base..][0..k_new.len], k_new);
-        @memcpy(self.v[base..][0..v_new.len], v_new);
+        if (self.kv_dtype == .f16) {
+            packF16(self.k, base, k_new);
+            packF16(self.v, base, v_new);
+        } else {
+            @memcpy(self.k[base..][0..k_new.len], k_new);
+            @memcpy(self.v[base..][0..v_new.len], v_new);
+        }
     }
 
     /// K rows [0, len + extra) of `layer` — `extra` covers written-but-not-yet
-    /// committed tokens mid-forward.
-    pub fn kView(self: *const KvCache, layer: usize, extra: usize) []const f32 {
-        return self.view(self.k, layer, extra);
+    /// committed tokens mid-forward. For f16 this expands into `k_scratch`.
+    pub fn kView(self: *KvCache, layer: usize, extra: usize) []const f32 {
+        return self.view(self.k, self.k_scratch, layer, extra);
     }
 
-    pub fn vView(self: *const KvCache, layer: usize, extra: usize) []const f32 {
-        return self.view(self.v, layer, extra);
+    pub fn vView(self: *KvCache, layer: usize, extra: usize) []const f32 {
+        return self.view(self.v, self.v_scratch, layer, extra);
     }
 
-    fn view(self: *const KvCache, buf: []const f32, layer: usize, extra: usize) []const f32 {
+    fn view(self: *KvCache, buf: []f32, scratch: []f32, layer: usize, extra: usize) []const f32 {
         std.debug.assert(self.len + extra <= self.capacity);
-        return buf[layer * self.capacity * self.kv_dim ..][0 .. (self.len + extra) * self.kv_dim];
+        const rows_elems = (self.len + extra) * self.kv_dim;
+        const layer_base = layer * self.capacity * self.kv_dim;
+        if (self.kv_dtype == .f16) {
+            unpackF16(scratch[0..rows_elems], buf, layer_base, rows_elems);
+            return scratch[0..rows_elems];
+        }
+        return buf[layer_base..][0..rows_elems];
     }
 
     /// Advance `len` after all layers have written the same `n` tokens.
@@ -99,24 +196,45 @@ pub const KvCache = struct {
         self.len = new_len;
     }
 
+    /// Uniform cache has no sliding-window rings (all layers full context).
+    /// Present so `transformer.layerForward` can query any cache generically.
+    pub fn ringOf(self: *const KvCache, layer: usize) usize {
+        _ = self;
+        _ = layer;
+        return 0;
+    }
+
     /// Grow to `new_capacity` rows per layer. The per-layer blocks are
     /// re-strided into fresh arrays (committed rows copied, the rest left
     /// uninitialized, exactly like init). No-op when already large enough.
     pub fn grow(self: *KvCache, gpa: std.mem.Allocator, new_capacity: usize) !void {
         if (new_capacity <= self.capacity) return;
-        const nk = try gpa.alloc(f32, self.n_layers * new_capacity * self.kv_dim);
+        const dt = self.kv_dtype;
+        const nk = try gpa.alloc(f32, slotsFor(dt, self.n_layers * new_capacity * self.kv_dim));
         errdefer gpa.free(nk);
-        const nv = try gpa.alloc(f32, self.n_layers * new_capacity * self.kv_dim);
-        const used = self.len * self.kv_dim;
+        const nv = try gpa.alloc(f32, slotsFor(dt, self.n_layers * new_capacity * self.kv_dim));
+        errdefer gpa.free(nv);
+        const used_slots = slotsFor(dt, self.len * self.kv_dim);
         for (0..self.n_layers) |l| {
-            @memcpy(nk[l * new_capacity * self.kv_dim ..][0..used], self.k[l * self.capacity * self.kv_dim ..][0..used]);
-            @memcpy(nv[l * new_capacity * self.kv_dim ..][0..used], self.v[l * self.capacity * self.kv_dim ..][0..used]);
+            const src_base = slotsFor(dt, l * self.capacity * self.kv_dim);
+            const dst_base = slotsFor(dt, l * new_capacity * self.kv_dim);
+            @memcpy(nk[dst_base..][0..used_slots], self.k[src_base..][0..used_slots]);
+            @memcpy(nv[dst_base..][0..used_slots], self.v[src_base..][0..used_slots]);
         }
         gpa.free(self.k);
         gpa.free(self.v);
         self.k = nk;
         self.v = nv;
         self.capacity = new_capacity;
+        if (dt == .f16) {
+            const ks = try gpa.alloc(f32, new_capacity * self.kv_dim);
+            errdefer gpa.free(ks);
+            const vs = try gpa.alloc(f32, new_capacity * self.kv_dim);
+            gpa.free(self.k_scratch);
+            gpa.free(self.v_scratch);
+            self.k_scratch = ks;
+            self.v_scratch = vs;
+        }
     }
 };
 
@@ -127,41 +245,84 @@ pub const KvCache = struct {
 /// protocol as `KvCache`; the per-layer dims are borrowed at init (copied into
 /// the caller's allocator so they outlive the source config).
 pub const PerLayerKvCache = struct {
+    /// Backing storage: f32 slots. For f16, two logical elements pack per slot
+    /// (all layer offsets are even, so `offsets` stay LOGICAL element counts and
+    /// the packed slot for logical element E is E/2 — see slotsFor/packF16).
     k: []f32,
     v: []f32,
+    /// f32 read scratch (one layer's block) for the f16 path; empty for f32.
+    k_scratch: []f32 = &.{},
+    v_scratch: []f32 = &.{},
     n_layers: usize,
     capacity: usize,
     /// Per-layer kv_dim (owned copy).
     kv_dims: []usize,
-    /// Element base offset of each layer's block: `capacity * sum(kv_dims[<l])`.
-    /// `offsets[n_layers]` is the total element count per k/v buffer.
+    /// Per-layer ring size in rows (0 = full `capacity`, linear addressing).
+    /// LOCAL sliding-window layers use a fixed ring so their storage doesn't
+    /// grow with the conversation (TODO lever 1). Owned copy.
+    rings: []usize,
+    /// Logical-element base offset of each layer's block: `sum(layerRows(<l)*kv_dims)`.
+    /// `offsets[n_layers]` is the total logical element count per k/v buffer.
     offsets: []usize,
+    kv_dtype: KvDtype = .f32,
     len: usize = 0,
 
-    pub fn init(gpa: std.mem.Allocator, capacity: usize, kv_dims: []const usize) !PerLayerKvCache {
+    /// Ring size of layer `l` (0 = full/linear) — read by the attention op.
+    pub fn ringOf(self: *const PerLayerKvCache, l: usize) usize {
+        return self.rings[l];
+    }
+
+    /// Largest single-layer block (logical elements) — the f16 read scratch size.
+    fn maxBlock(capacity: usize, dims: []const usize, rings: []const usize) usize {
+        var m: usize = 0;
+        for (dims, 0..) |d, l| {
+            const rows = if (rings.len != 0 and rings[l] != 0) rings[l] else capacity;
+            m = @max(m, rows * d);
+        }
+        return m;
+    }
+
+    /// `rings` may be empty (no layer rings) or one entry per layer (0 = full).
+    pub fn init(gpa: std.mem.Allocator, capacity: usize, kv_dims: []const usize, rings: []const usize, kv_dtype: KvDtype) !PerLayerKvCache {
         const n_layers = kv_dims.len;
+        std.debug.assert(rings.len == 0 or rings.len == n_layers);
         const dims = try gpa.dupe(usize, kv_dims);
         errdefer gpa.free(dims);
+        const rg = try gpa.alloc(usize, n_layers);
+        errdefer gpa.free(rg);
+        if (rings.len == 0) @memset(rg, 0) else @memcpy(rg, rings);
         const offsets = try gpa.alloc(usize, n_layers + 1);
         errdefer gpa.free(offsets);
         var acc: usize = 0;
         for (0..n_layers) |l| {
-            offsets[l] = acc * capacity;
-            acc += dims[l];
+            offsets[l] = acc;
+            const rows = if (rg[l] != 0) rg[l] else capacity;
+            acc += rows * dims[l];
         }
-        offsets[n_layers] = acc * capacity;
-        const total = offsets[n_layers];
-        const k = try gpa.alloc(f32, total);
+        offsets[n_layers] = acc;
+        const k = try gpa.alloc(f32, slotsFor(kv_dtype, acc));
         errdefer gpa.free(k);
-        const v = try gpa.alloc(f32, total);
-        return .{ .k = k, .v = v, .n_layers = n_layers, .capacity = capacity, .kv_dims = dims, .offsets = offsets };
+        const v = try gpa.alloc(f32, slotsFor(kv_dtype, acc));
+        errdefer gpa.free(v);
+        var ks: []f32 = &.{};
+        var vs: []f32 = &.{};
+        if (kv_dtype == .f16) {
+            const mb = maxBlock(capacity, kv_dims, rings);
+            ks = try gpa.alloc(f32, mb);
+            errdefer gpa.free(ks);
+            vs = try gpa.alloc(f32, mb);
+        }
+        return .{ .k = k, .v = v, .k_scratch = ks, .v_scratch = vs, .n_layers = n_layers, .capacity = capacity, .kv_dims = dims, .rings = rg, .offsets = offsets, .kv_dtype = kv_dtype };
     }
 
     pub fn deinit(self: *PerLayerKvCache, gpa: std.mem.Allocator) void {
         gpa.free(self.k);
         gpa.free(self.v);
         gpa.free(self.kv_dims);
+        gpa.free(self.rings);
         gpa.free(self.offsets);
+        if (self.k_scratch.len != 0) gpa.free(self.k_scratch);
+        if (self.v_scratch.len != 0) gpa.free(self.v_scratch);
         self.* = undefined;
     }
 
@@ -169,28 +330,63 @@ pub const PerLayerKvCache = struct {
         return self.capacity - self.len;
     }
 
-    /// Write `n` tokens' K/V for `layer` at the uncommitted rows [len, len+n).
+    /// Copy/convert `src` (f32) into cache buffer `buf` at logical element
+    /// `base` (even). f32 memcpy; f16 packs 2/slot.
+    fn store(self: *const PerLayerKvCache, buf: []f32, base: usize, src: []const f32) void {
+        if (self.kv_dtype == .f16) packF16(buf, base, src) else @memcpy(buf[base..][0..src.len], src);
+    }
+
+    /// Write `n` tokens' K/V for `layer` at the uncommitted rows. Full layers
+    /// append at `len`; ring layers write at `len % ring`, splitting on wrap.
     pub fn write(self: *PerLayerKvCache, layer: usize, k_new: []const f32, v_new: []const f32) void {
         const d = self.kv_dims[layer];
         std.debug.assert(k_new.len == v_new.len and (d == 0 or k_new.len % d == 0));
-        std.debug.assert(self.len * d + k_new.len <= self.capacity * d);
-        const base = self.offsets[layer] + self.len * d;
-        @memcpy(self.k[base..][0..k_new.len], k_new);
-        @memcpy(self.v[base..][0..v_new.len], v_new);
+        const ring = self.rings[layer];
+        if (ring == 0) {
+            std.debug.assert(self.len * d + k_new.len <= self.capacity * d);
+            const base = self.offsets[layer] + self.len * d;
+            self.store(self.k, base, k_new);
+            self.store(self.v, base, v_new);
+            return;
+        }
+        const n = if (d == 0) 0 else k_new.len / d;
+        std.debug.assert(n <= ring); // a single forward must fit the ring
+        const start = self.len % ring;
+        const first = @min(n, ring - start);
+        const off = self.offsets[layer];
+        self.store(self.k, off + start * d, k_new[0 .. first * d]);
+        self.store(self.v, off + start * d, v_new[0 .. first * d]);
+        if (first < n) {
+            self.store(self.k, off, k_new[first * d ..]);
+            self.store(self.v, off, v_new[first * d ..]);
+        }
     }
 
-    pub fn kView(self: *const PerLayerKvCache, layer: usize, extra: usize) []const f32 {
-        return self.view(self.k, layer, extra);
+    pub fn kView(self: *PerLayerKvCache, layer: usize, extra: usize) []const f32 {
+        return self.view(self.k, self.k_scratch, layer, extra);
     }
 
-    pub fn vView(self: *const PerLayerKvCache, layer: usize, extra: usize) []const f32 {
-        return self.view(self.v, layer, extra);
+    pub fn vView(self: *PerLayerKvCache, layer: usize, extra: usize) []const f32 {
+        return self.view(self.v, self.v_scratch, layer, extra);
     }
 
-    fn view(self: *const PerLayerKvCache, buf: []const f32, layer: usize, extra: usize) []const f32 {
-        std.debug.assert(self.len + extra <= self.capacity);
+    /// Full layers return rows [0, len+extra); ring layers return the whole
+    /// ring block (the attention op indexes it by pos%ring, so it needs all
+    /// rows and the caller passes `.ring = ringOf(layer)`). f16 expands into
+    /// `scratch`.
+    fn view(self: *PerLayerKvCache, buf: []f32, scratch: []f32, layer: usize, extra: usize) []const f32 {
         const d = self.kv_dims[layer];
-        return buf[self.offsets[layer]..][0 .. (self.len + extra) * d];
+        const ring = self.rings[layer];
+        const count = if (ring != 0) ring * d else blk: {
+            std.debug.assert(self.len + extra <= self.capacity);
+            break :blk (self.len + extra) * d;
+        };
+        const base = self.offsets[layer];
+        if (self.kv_dtype == .f16) {
+            unpackF16(scratch[0..count], buf, base, count);
+            return scratch[0..count];
+        }
+        return buf[base..][0..count];
     }
 
     pub fn commit(self: *PerLayerKvCache, n: usize) void {
@@ -203,26 +399,31 @@ pub const PerLayerKvCache = struct {
         self.len = new_len;
     }
 
-    /// Grow to `new_capacity` rows per layer, re-striding into fresh buffers
-    /// (committed rows copied). No-op when already large enough.
+    /// Grow the FULL (non-ring) layers to `new_capacity`, re-striding into fresh
+    /// buffers. Ring layers keep their fixed size. No-op when large enough.
     pub fn grow(self: *PerLayerKvCache, gpa: std.mem.Allocator, new_capacity: usize) !void {
         if (new_capacity <= self.capacity) return;
+        const dt = self.kv_dtype;
         const new_offsets = try gpa.alloc(usize, self.n_layers + 1);
         errdefer gpa.free(new_offsets);
         var acc: usize = 0;
         for (0..self.n_layers) |l| {
-            new_offsets[l] = acc * new_capacity;
-            acc += self.kv_dims[l];
+            new_offsets[l] = acc;
+            const rows = if (self.rings[l] != 0) self.rings[l] else new_capacity;
+            acc += rows * self.kv_dims[l];
         }
-        new_offsets[self.n_layers] = acc * new_capacity;
-        const nk = try gpa.alloc(f32, new_offsets[self.n_layers]);
+        new_offsets[self.n_layers] = acc;
+        const nk = try gpa.alloc(f32, slotsFor(dt, acc));
         errdefer gpa.free(nk);
-        const nv = try gpa.alloc(f32, new_offsets[self.n_layers]);
+        const nv = try gpa.alloc(f32, slotsFor(dt, acc));
         errdefer gpa.free(nv);
         for (0..self.n_layers) |l| {
-            const used = self.len * self.kv_dims[l];
-            @memcpy(nk[new_offsets[l]..][0..used], self.k[self.offsets[l]..][0..used]);
-            @memcpy(nv[new_offsets[l]..][0..used], self.v[self.offsets[l]..][0..used]);
+            // Ring layers: copy the whole ring (any row may hold live data once
+            // len>ring). Full layers: copy the committed rows.
+            const copy_rows = if (self.rings[l] != 0) self.rings[l] else self.len;
+            const used = slotsFor(dt, copy_rows * self.kv_dims[l]);
+            @memcpy(nk[slotsFor(dt, new_offsets[l])..][0..used], self.k[slotsFor(dt, self.offsets[l])..][0..used]);
+            @memcpy(nv[slotsFor(dt, new_offsets[l])..][0..used], self.v[slotsFor(dt, self.offsets[l])..][0..used]);
         }
         gpa.free(self.k);
         gpa.free(self.v);
@@ -231,6 +432,16 @@ pub const PerLayerKvCache = struct {
         self.v = nv;
         self.offsets = new_offsets;
         self.capacity = new_capacity;
+        if (dt == .f16) {
+            const mb = maxBlock(new_capacity, self.kv_dims, self.rings);
+            const ks = try gpa.alloc(f32, mb);
+            errdefer gpa.free(ks);
+            const vs = try gpa.alloc(f32, mb);
+            gpa.free(self.k_scratch);
+            gpa.free(self.v_scratch);
+            self.k_scratch = ks;
+            self.v_scratch = vs;
+        }
     }
 };
 
@@ -238,7 +449,7 @@ pub const PerLayerKvCache = struct {
 
 test "write/commit/view round trip" {
     const gpa = std.testing.allocator;
-    var cache = try KvCache.init(gpa, 2, 4, 3);
+    var cache = try KvCache.init(gpa, 2, 4, 3, .f32);
     defer cache.deinit(gpa);
 
     // Two tokens across both layers, then commit.
@@ -262,9 +473,57 @@ test "write/commit/view round trip" {
     try std.testing.expectEqualSlices(f32, &(v0 ++ k2), cache.vView(0, 0));
 }
 
+test "KvCache f16 storage packs/expands (exact for f16-representable values)" {
+    const gpa = std.testing.allocator;
+    // dim 2, 4 rows, 2 layers, f16. Small integers are exact in f16, so the
+    // round trip is bit-exact and the layout (2 elems/f32 slot) is verifiable.
+    var cache = try KvCache.init(gpa, 2, 4, 2, .f16);
+    defer cache.deinit(gpa);
+    // Backing store is half the f32 element count (2 layers * 4 rows * 2 dim = 16
+    // elems -> 8 f32 slots per buffer).
+    try std.testing.expectEqual(@as(usize, 8), cache.k.len);
+
+    const k0 = [_]f32{ 1, 2, 3, 4 }; // 2 tokens
+    const v0 = [_]f32{ -1, -2, -3, -4 };
+    cache.write(0, &k0, &v0);
+    cache.write(1, &v0, &k0);
+    cache.commit(2);
+    try std.testing.expectEqualSlices(f32, &k0, cache.kView(0, 0));
+    try std.testing.expectEqualSlices(f32, &v0, cache.vView(0, 0));
+    try std.testing.expectEqualSlices(f32, &v0, cache.kView(1, 0));
+
+    // grow keeps the committed f16 rows.
+    try cache.grow(gpa, 8);
+    try std.testing.expectEqual(@as(usize, 8), cache.capacity);
+    try std.testing.expectEqualSlices(f32, &k0, cache.kView(0, 0));
+    try std.testing.expectEqualSlices(f32, &k0, cache.vView(1, 0));
+}
+
+test "PerLayerKvCache f16 ring: wrap write + whole-ring view" {
+    const gpa = std.testing.allocator;
+    // Layer 0 full (dim 2), layer 1 ring of 3 rows (dim 2), f16.
+    var cache = try PerLayerKvCache.init(gpa, 8, &.{ 2, 2 }, &.{ 0, 3 }, .f16);
+    defer cache.deinit(gpa);
+    // Write 5 tokens; the ring layer wraps at 3. Values exact in f16.
+    for (0..5) |t| {
+        const kf = [_]f32{ @floatFromInt(t * 2), @floatFromInt(t * 2 + 1) };
+        cache.write(0, &kf, &kf);
+        cache.write(1, &kf, &kf);
+        cache.commit(1);
+    }
+    // Full layer: rows 0..5 present in order.
+    try std.testing.expectEqualSlices(f32, &.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 }, cache.kView(0, 0));
+    // Ring (3 rows, dim 2): pos%3 -> row0=pos3, row1=pos4, row2=pos2.
+    const rv = cache.kView(1, 0);
+    try std.testing.expectEqual(@as(usize, 6), rv.len);
+    try std.testing.expectEqualSlices(f32, &.{ 6, 7 }, rv[0..2]); // pos 3
+    try std.testing.expectEqualSlices(f32, &.{ 8, 9 }, rv[2..4]); // pos 4
+    try std.testing.expectEqualSlices(f32, &.{ 4, 5 }, rv[4..6]); // pos 2
+}
+
 test "grow preserves committed rows across the re-stride" {
     const gpa = std.testing.allocator;
-    var cache = try KvCache.init(gpa, 2, 2, 3);
+    var cache = try KvCache.init(gpa, 2, 2, 3, .f32);
     defer cache.deinit(gpa);
 
     const k0 = [_]f32{ 1, 2, 3, 4, 5, 6 }; // two tokens
@@ -290,7 +549,7 @@ test "grow preserves committed rows across the re-stride" {
 test "per-layer kv cache: variable dims, write/view/grow" {
     const gpa = std.testing.allocator;
     // Layer 0 dim 2, layer 1 dim 4 (mismatched, like gemma4 SWA vs global).
-    var cache = try PerLayerKvCache.init(gpa, 3, &.{ 2, 4 });
+    var cache = try PerLayerKvCache.init(gpa, 3, &.{ 2, 4 }, &.{}, .f32);
     defer cache.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 0), cache.offsets[0]);
     try std.testing.expectEqual(@as(usize, 6), cache.offsets[1]); // 3*2
@@ -316,6 +575,55 @@ test "per-layer kv cache: variable dims, write/view/grow" {
     try std.testing.expectEqualSlices(f32, &(k1 ++ n1), cache.kView(1, 0));
 }
 
+test "per-layer ring: wrap write + whole-ring view + full-layer coexist" {
+    const gpa = std.testing.allocator;
+    // Layer 0: full (dim 1). Layer 1: ring of 3 rows (dim 1). Capacity 8.
+    var cache = try PerLayerKvCache.init(gpa, 8, &.{ 1, 1 }, &.{ 0, 3 }, .f32);
+    defer cache.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), cache.ringOf(0));
+    try std.testing.expectEqual(@as(usize, 3), cache.ringOf(1));
+    // Buffer holds layer0 (8 rows) + layer1 (3 rows) = 11 elems.
+    try std.testing.expectEqual(@as(usize, 0), cache.offsets[0]);
+    try std.testing.expectEqual(@as(usize, 8), cache.offsets[1]);
+    try std.testing.expectEqual(@as(usize, 11), cache.offsets[2]);
+
+    // Write 5 tokens one at a time to both layers; the ring layer wraps at 3.
+    for (0..5) |t| {
+        const kf = [_]f32{@floatFromInt(t)};
+        cache.write(0, &kf, &kf);
+        cache.write(1, &kf, &kf);
+        cache.commit(1);
+    }
+    // Full layer: rows 0..5 = 0,1,2,3,4.
+    try std.testing.expectEqualSlices(f32, &.{ 0, 1, 2, 3, 4 }, cache.kView(0, 0));
+    // Ring layer (3 rows): pos%3 -> row0=pos3, row1=pos4, row2=pos2 (last 3
+    // positions 2,3,4 survive, addressed by pos%3).
+    const rv = cache.kView(1, 0);
+    try std.testing.expectEqual(@as(usize, 3), rv.len);
+    try std.testing.expectEqual(@as(f32, 3), rv[0]); // pos 3 at row 0
+    try std.testing.expectEqual(@as(f32, 4), rv[1]); // pos 4 at row 1
+    try std.testing.expectEqual(@as(f32, 2), rv[2]); // pos 2 at row 2
+
+    // Grow keeps the ring intact and preserves the full layer's committed rows.
+    try cache.grow(gpa, 16);
+    try std.testing.expectEqual(@as(usize, 16), cache.offsets[1]); // full layer now 16 rows
+    try std.testing.expectEqualSlices(f32, &.{ 0, 1, 2, 3, 4 }, cache.kView(0, 0));
+    const rv2 = cache.kView(1, 0);
+    try std.testing.expectEqual(@as(f32, 3), rv2[0]);
+    try std.testing.expectEqual(@as(f32, 4), rv2[1]);
+    try std.testing.expectEqual(@as(f32, 2), rv2[2]);
+}
+
+test "KvDtype element size and parse" {
+    try std.testing.expectEqual(@as(usize, 4), KvDtype.f32.elemBytes());
+    try std.testing.expectEqual(@as(usize, 2), KvDtype.f16.elemBytes());
+    try std.testing.expectEqual(KvDtype.f32, KvDtype.parse("f32").?);
+    try std.testing.expectEqual(KvDtype.f16, KvDtype.parse("f16").?);
+    try std.testing.expectEqual(@as(?KvDtype, null), KvDtype.parse("bf16"));
+    // Default carrier dtype is f32 (unchanged behavior).
+    try std.testing.expectEqual(KvDtype.f32, (Capacity.fixed(8)).kv_dtype);
+}
+
 test "growTarget is geometric and clamped" {
     try std.testing.expectEqual(@as(usize, 6144), growTarget(4096, 4097, 32768));
     try std.testing.expectEqual(@as(usize, 8192), growTarget(6000, 6001, 8192));
@@ -325,7 +633,7 @@ test "growTarget is geometric and clamped" {
 
 test "truncate rolls back and rows are rewritten" {
     const gpa = std.testing.allocator;
-    var cache = try KvCache.init(gpa, 1, 4, 2);
+    var cache = try KvCache.init(gpa, 1, 4, 2, .f32);
     defer cache.deinit(gpa);
 
     const a = [_]f32{ 1, 2, 3, 4, 5, 6 }; // three tokens

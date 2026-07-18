@@ -38,6 +38,7 @@ const cuda = @import("gpu/cuda.zig");
 const wan_vae = @import("models/wan_vae.zig");
 const taehv_mod = @import("models/taehv.zig");
 const taehv_cuda_mod = @import("models/taehv_cuda.zig");
+const taehv_gpu_mod = @import("models/taehv_gpu.zig");
 const vae_gpu = @import("models/vae_gpu.zig");
 const vae_cuda = @import("models/vae_cuda.zig");
 const vae_tiled = @import("models/vae_tiled.zig");
@@ -622,6 +623,8 @@ pub const Session = struct {
                         defer gpa.free(small);
                         const rgb = if (cu_be) |b|
                             (taehv_cuda_mod.decode(d, b, gpa, small, th, tw) catch break :taew_blk)
+                        else if (gpu_ctx) |gc|
+                            (taehv_gpu_mod.decode(d, gc, gpa, small, th, tw) catch break :taew_blk)
                         else
                             (d.decode(io, gpa, small, th, tw) catch break :taew_blk);
                         taew_rgb = rgb;

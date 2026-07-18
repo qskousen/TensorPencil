@@ -188,9 +188,9 @@ pub const State = struct {
     len: usize = 0,
     capacity: usize,
 
-    pub fn init(gpa: std.mem.Allocator, cfg: Config, capacity: usize) !State {
+    pub fn init(gpa: std.mem.Allocator, cfg: Config, capacity: usize, kv_dtype: kv_cache_mod.KvDtype) !State {
         const n_lin = cfg.n_layers - cfg.nAttnLayers();
-        var kv = try KvCache.init(gpa, cfg.nAttnLayers(), capacity, cfg.kvDim());
+        var kv = try KvCache.init(gpa, cfg.nAttnLayers(), capacity, cfg.kvDim(), kv_dtype);
         errdefer kv.deinit(gpa);
         const conv = try gpa.alloc(f32, n_lin * cfg.convChannels() * (cfg.conv_kernel - 1));
         errdefer gpa.free(conv);
@@ -681,7 +681,7 @@ pub const CpuModel = struct {
     max_capacity: usize,
 
     pub fn init(gpa: std.mem.Allocator, lm: *const Model, cap: kv_cache_mod.Capacity) !CpuModel {
-        var state = try State.init(gpa, lm.cfg, cap.initial);
+        var state = try State.init(gpa, lm.cfg, cap.initial, cap.kv_dtype);
         errdefer state.deinit(gpa);
         var freqs = try ops.rope.rotateHalfFreqs(gpa, cap.initial, lm.cfg.rope_dim, lm.cfg.rope_theta);
         errdefer freqs.deinit(gpa);

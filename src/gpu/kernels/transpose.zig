@@ -62,6 +62,28 @@ export fn transpose_f8() callconv(.spirv_kernel) void {
     dst.w[(k * pc.stride + col_base) >> 2] = word;
 }
 
+/// bf16 weight [rows][cols] -> bf16 k-major [cols][stride] for the dense GEMV
+/// path: element (k, col) at k*stride + col (stride = align(rows, tn)), 2 bytes
+/// each, packed two columns per u32. Twin of `transpose_f8` (which packs four
+/// 1-byte columns). One output u32 (2 columns at one k) per invocation; x =
+/// column-pair in [0, stride/2), y = k in [0, cols).
+export fn transpose_bf16() callconv(.spirv_kernel) void {
+    decorate();
+    const col_base = gpu.global_invocation_id[0] * 2;
+    const k = gpu.global_invocation_id[1];
+    if (col_base >= pc.stride or k >= pc.cols) return;
+    var word: u32 = 0;
+    inline for (0..2) |j| {
+        const col = col_base + j;
+        if (col < pc.rows) {
+            const idx = col * pc.cols + k; // bf16 element index into src
+            const bits: u32 = (src.w[idx >> 1] >> @intCast((idx & 1) * 16)) & 0xFFFF;
+            word |= bits << @intCast(16 * j);
+        }
+    }
+    dst.w[(k * pc.stride + col_base) >> 1] = word;
+}
+
 /// One f32 element per invocation.
 export fn transpose_f32() callconv(.spirv_kernel) void {
     decorate();

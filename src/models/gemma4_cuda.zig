@@ -41,6 +41,25 @@ const nsplit_prefill = 8;
 const prefill_chunk = 128;
 const grouped_gemv_max = 40;
 
+/// Rows a LOCAL (sliding-window) layer's KV ring holds. The window plus one
+/// prefill chunk of slack: within a single prefill batch the queries span
+/// `window + seq - 1` positions, so a ring smaller than this would alias a
+/// still-needed key against a freshly-written one. LOCAL caches are fixed at
+/// this size and never grow with the conversation (TODO lever 1).
+fn localRingRows(cfg: gemma4.Config) usize {
+    return cfg.sliding_window + prefill_chunk;
+}
+
+/// Kill-switch for the LOCAL-layer sliding-window ring cache (TODO lever 1).
+/// When false, every layer reserves full context (pre-ring behaviour) — kept
+/// for A/B validation that ring output is token-identical.
+const enable_local_ring = true;
+
+/// This layer uses the sliding-window ring: a LOCAL layer, ring enabled.
+fn usesRing(cfg: gemma4.Config, l: usize) bool {
+    return enable_local_ring and !cfg.isGlobal(l);
+}
+
 fn nbuf(be: *Backend, weights: []const f32) !Buf {
     return .{ .buf = try be.smallBuffer(std.mem.sliceAsBytes(weights)), .mem = .null_handle, .size = 0 };
 }
@@ -58,6 +77,9 @@ pub const CudaLM = struct {
     capacity: usize,
     initial_capacity: usize,
     max_capacity: usize,
+    /// KV-cache element storage type (f32 / f16); selects the attention kernel
+    /// variant and the per-element byte stride of k_cache/v_cache.
+    kv_dtype: kvmod.KvDtype,
     len: usize,
     /// sin-table offsets within each freqs buffer (= cap.max * half).
     sin_off_global: usize,
@@ -105,6 +127,7 @@ pub const CudaLM = struct {
         self.capacity = cap.initial;
         self.initial_capacity = cap.initial;
         self.max_capacity = cap.max;
+        self.kv_dtype = cap.kv_dtype;
         self.len = 0;
         self.sin_off_global = cap.max * (cfg.head_dim_global / 2);
         self.sin_off_local = cap.max * (cfg.head_dim_local / 2);
@@ -123,14 +146,46 @@ pub const CudaLM = struct {
 
         self.k_cache = try alloc.alloc(Growable, cfg.n_layers);
         self.v_cache = try alloc.alloc(Growable, cfg.n_layers);
-        for (self.k_cache, self.v_cache, 0..) |*kb, *vb, l| {
-            const kvd = cfg.kvDim(l);
-            kb.* = try be.growableCreate(cap.initial * kvd * 4, cap.max * kvd * 4);
-            vb.* = try be.growableCreate(cap.initial * kvd * 4, cap.max * kvd * 4);
-        }
+        try self.allocKvCaches();
 
         self.arena = arena;
         return self;
+    }
+
+    /// (Re)create the per-layer K/V device buffers at `self.kv_dtype`, sized from
+    /// `self.initial_capacity`/`self.max_capacity`. The `k_cache`/`v_cache`
+    /// SLICES must already exist (arena-owned); this fills them with fresh
+    /// Growables. Used by `init` and `reinitCache` so the sizing stays in one
+    /// place. LOCAL layers are a fixed sliding-window ring (never grow).
+    fn allocKvCaches(self: *CudaLM) !void {
+        const cfg = self.cfg;
+        const be = self.be;
+        const esz = self.kv_dtype.elemBytes();
+        for (self.k_cache, self.v_cache, 0..) |*kb, *vb, l| {
+            const kvd = cfg.kvDim(l);
+            if (usesRing(cfg, l)) {
+                const bytes = localRingRows(cfg) * kvd * esz;
+                kb.* = try be.growableCreate(bytes, bytes);
+                vb.* = try be.growableCreate(bytes, bytes);
+            } else {
+                kb.* = try be.growableCreate(self.initial_capacity * kvd * esz, self.max_capacity * kvd * esz);
+                vb.* = try be.growableCreate(self.initial_capacity * kvd * esz, self.max_capacity * kvd * esz);
+            }
+        }
+    }
+
+    /// Rebuild the KV cache at a new element dtype (GUI f32<->f16 toggle),
+    /// keeping the model WEIGHTS resident: free the K/V buffers, re-create them
+    /// at `dtype`, and reset the committed length to 0 so the next forward
+    /// re-prefills the whole transcript. gemma4 decodes straight through
+    /// `opAttnDecode` (no captured graph to invalidate).
+    pub fn reinitCache(self: *CudaLM, dtype: kvmod.KvDtype) !void {
+        for (self.k_cache) |*b| self.be.growableDestroy(b);
+        for (self.v_cache) |*b| self.be.growableDestroy(b);
+        self.kv_dtype = dtype;
+        self.capacity = self.initial_capacity;
+        self.len = 0;
+        try self.allocKvCaches();
     }
 
     /// Build a device RoPE table (cos[rows*half] ++ sin[rows*half]) with an
@@ -217,6 +272,7 @@ pub const CudaLM = struct {
         if (min_rows > self.max_capacity) return error.ContextFull;
         const target = kvmod.growTarget(self.capacity, min_rows, self.max_capacity);
         for (0..self.cfg.n_layers) |l| {
+            if (usesRing(self.cfg, l)) continue; // LOCAL ring layers are fixed-size
             const bytes = target * self.cfg.kvDim(l) * 4;
             for ([2]*Growable{ &self.k_cache[l], &self.v_cache[l] }) |b| {
                 self.be.growableEnsure(b, bytes) catch |err| switch (err) {
@@ -323,19 +379,48 @@ pub const CudaLM = struct {
         try self.be.ropeHalf(b.q, freqs, seq, cfg.n_heads, hd / 2, sin_off, pos0);
         try self.be.ropeHalf(b.k, freqs, seq, cfg.nKv(l), hd / 2, sin_off, pos0);
     }
+    /// Store `n` K/V elements from `src` (+`src_off` elems) into cache buffer
+    /// `dst` at row-element offset `dst_off`. f32 caches copy raw; f16 caches
+    /// convert the f32 projection to f16 on store (opStoreKvF16). All offsets
+    /// and `n` are element counts (dtype-agnostic).
+    fn storeKv(self: *CudaLM, dst: Buf, dst_off: usize, src: Buf, src_off: usize, n: usize) !void {
+        if (self.kv_dtype == .f16) {
+            try self.be.opStoreKvF16(dst, dst_off, src, src_off, n);
+        } else {
+            try self.be.tensorCopy(dst, dst_off * 4, src, src_off * 4, n * 4);
+        }
+    }
+
     pub fn appendKV(self: *CudaLM, l: usize, seq: usize, pos0: usize) !void {
         const cfg = self.cfg;
         const b = &self.bufs;
         const kv_dim = cfg.kvDim(l);
-        try self.be.tensorCopy(self.k_cache[l].buf, pos0 * kv_dim * 4, b.k, 0, seq * kv_dim * 4);
-        try self.be.tensorCopy(self.v_cache[l].buf, pos0 * kv_dim * 4, b.v, 0, seq * kv_dim * 4);
+        if (!usesRing(cfg, l)) {
+            try self.storeKv(self.k_cache[l].buf, pos0 * kv_dim, b.k, 0, seq * kv_dim);
+            try self.storeKv(self.v_cache[l].buf, pos0 * kv_dim, b.v, 0, seq * kv_dim);
+            return;
+        }
+        // LOCAL layer: write into the ring at row pos0%ring, splitting the copy
+        // when it wraps the ring boundary (seq <= prefill_chunk < ring, so at
+        // most one wrap).
+        const ring = localRingRows(cfg);
+        const start = pos0 % ring;
+        const first = @min(seq, ring - start);
+        try self.storeKv(self.k_cache[l].buf, start * kv_dim, b.k, 0, first * kv_dim);
+        try self.storeKv(self.v_cache[l].buf, start * kv_dim, b.v, 0, first * kv_dim);
+        if (first < seq) {
+            const rest = seq - first;
+            try self.storeKv(self.k_cache[l].buf, 0, b.k, first * kv_dim, rest * kv_dim);
+            try self.storeKv(self.v_cache[l].buf, 0, b.v, first * kv_dim, rest * kv_dim);
+        }
     }
     pub fn attention(self: *CudaLM, l: usize, seq: usize, pos0: usize) !void {
         const cfg = self.cfg;
         const b = &self.bufs;
         const ns: usize = if (seq == 1) nsplit else nsplit_prefill;
         const window: usize = if (cfg.isGlobal(l)) 0 else cfg.sliding_window;
-        try self.be.opAttnDecode(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, pos0 + 1, seq, cfg.n_heads, cfg.nKv(l), cfg.headDim(l), ns, 1.0, window);
+        const ring: usize = if (usesRing(cfg, l)) localRingRows(cfg) else 0;
+        try self.be.opAttnDecode(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, pos0 + 1, seq, cfg.n_heads, cfg.nKv(l), cfg.headDim(l), ns, 1.0, window, ring, self.kv_dtype == .f16);
     }
     pub fn projectO(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
         const cfg = self.cfg;

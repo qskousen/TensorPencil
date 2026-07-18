@@ -39,6 +39,40 @@ const prefill_chunk = 128;
 /// instead of opMatmulQuant's dequant-to-f16 GEMM (qwen3_cuda's crossover).
 const grouped_gemv_max = 40;
 
+/// Rows a LOCAL (sliding-window) layer's KV ring holds: window + one prefill
+/// chunk of slack (see gemma4_cuda for the aliasing rationale). LOCAL caches
+/// are fixed at this size and never grow (TODO lever 1).
+fn localRingRows(cfg: gemma3.Config) usize {
+    return cfg.sliding_window + prefill_chunk;
+}
+
+/// Kill-switch for the LOCAL-layer sliding-window ring cache (A/B validation).
+const enable_local_ring = true;
+
+/// This layer uses the sliding-window ring: a LOCAL layer, ring enabled.
+fn usesRing(cfg: gemma3.Config, l: usize) bool {
+    return enable_local_ring and !cfg.isGlobal(l);
+}
+
+/// One contiguous copy between a ring buffer (row = pos%ring) and a linear
+/// host buffer (row = absolute pos). `abs` is the absolute position of the
+/// first row, `dev` the ring row it maps to, `n` the row count.
+const RingSeg = struct { abs: usize, dev: usize, n: usize };
+
+/// The (up to two) segments covering the live positions `[max(0,len-ring), len)`
+/// of a ring, split where the ring wraps. Used to translate a LOCAL layer's KV
+/// between its device ring and the linear host shadow on offload/promote.
+fn ringSegments(len: usize, ring: usize) [2]RingSeg {
+    const start = if (len > ring) len - ring else 0;
+    const total = len - start; // <= ring
+    const first_dev = start % ring;
+    const n1 = @min(total, ring - first_dev);
+    return .{
+        .{ .abs = start, .dev = first_dev, .n = n1 },
+        .{ .abs = start + n1, .dev = 0, .n = total - n1 },
+    };
+}
+
 fn nbuf(be: *Backend, weights: []const f32) !Buf {
     return .{ .buf = try be.smallBuffer(std.mem.sliceAsBytes(weights)), .mem = .null_handle, .size = 0 };
 }
@@ -62,6 +96,9 @@ pub const CudaLM = struct {
     /// The KV capacity a fresh session starts at; resetResidency shrinks back to
     /// it so a new chat frees the grown KV VRAM.
     initial_capacity: usize,
+    /// KV-cache element storage type (f32 / f16); selects the attention kernel
+    /// variant and the per-element stride of k_cache/v_cache.
+    kv_dtype: kvmod.KvDtype,
     len: usize,
     /// Io for the host matmuls of a hybrid split's CPU-resident layers; set by
     /// `step`. Undefined until the first `step` — the offload host path only
@@ -135,6 +172,7 @@ pub const CudaLM = struct {
         self.capacity = cap.initial;
         self.initial_capacity = cap.initial;
         self.max_capacity = cap.max;
+        self.kv_dtype = cap.kv_dtype;
         self.len = 0;
         self.split = null;
         self.sin_off = cap.max * (cfg.head_dim / 2);
@@ -148,10 +186,7 @@ pub const CudaLM = struct {
 
         self.k_cache = try alloc.alloc(Growable, cfg.n_layers);
         self.v_cache = try alloc.alloc(Growable, cfg.n_layers);
-        for (self.k_cache, self.v_cache) |*kb, *vb| {
-            kb.* = try be.growableCreate(cap.initial * cfg.kvDim() * 4, cap.max * cfg.kvDim() * 4);
-            vb.* = try be.growableCreate(cap.initial * cfg.kvDim() * 4, cap.max * cfg.kvDim() * 4);
-        }
+        try self.allocKvCaches();
 
         self.arena = arena;
         return self;
@@ -169,6 +204,49 @@ pub const CudaLM = struct {
         errdefer be.tensorDestroy(&buf);
         try be.tensorUpload(buf, std.mem.sliceAsBytes(fp));
         return buf;
+    }
+
+    /// (Re)create the per-layer K/V device buffers at `self.kv_dtype`, sized
+    /// from `self.initial_capacity`/`self.max_capacity` (LOCAL layers = fixed
+    /// sliding-window ring). The `k_cache`/`v_cache` slices must already exist.
+    fn allocKvCaches(self: *CudaLM) !void {
+        const cfg = self.cfg;
+        const be = self.be;
+        const esz = self.kv_dtype.elemBytes();
+        for (self.k_cache, self.v_cache, 0..) |*kb, *vb, l| {
+            if (usesRing(cfg, l)) {
+                const bytes = localRingRows(cfg) * cfg.kvDim() * esz;
+                kb.* = try be.growableCreate(bytes, bytes);
+                vb.* = try be.growableCreate(bytes, bytes);
+            } else {
+                kb.* = try be.growableCreate(self.initial_capacity * cfg.kvDim() * esz, self.max_capacity * cfg.kvDim() * esz);
+                vb.* = try be.growableCreate(self.initial_capacity * cfg.kvDim() * esz, self.max_capacity * cfg.kvDim() * esz);
+            }
+        }
+    }
+
+    /// Store `n` K/V elements from `src` (+`src_off` elems) into cache buffer
+    /// `dst` at element offset `dst_off`. f32 copies raw; f16 converts on store.
+    fn storeKv(self: *CudaLM, dst: Buf, dst_off: usize, src: Buf, src_off: usize, n: usize) !void {
+        if (self.kv_dtype == .f16) {
+            try self.be.opStoreKvF16(dst, dst_off, src, src_off, n);
+        } else {
+            try self.be.tensorCopy(dst, dst_off * 4, src, src_off * 4, n * 4);
+        }
+    }
+
+    /// Rebuild the KV cache at a new element dtype (GUI toggle), weights resident.
+    /// gemma3 decodes straight through `opAttnDecode` (no captured graph), so this
+    /// just frees + re-creates the K/V buffers and resets the length. f16 with an
+    /// active CPU-offload split is unsupported (the host shadow cache is f32).
+    pub fn reinitCache(self: *CudaLM, dtype: kvmod.KvDtype) !void {
+        if (dtype == .f16 and self.split != null) return error.KvDtypeUnsupported;
+        for (self.k_cache) |*b| self.be.growableDestroy(b);
+        for (self.v_cache) |*b| self.be.growableDestroy(b);
+        self.kv_dtype = dtype;
+        self.capacity = self.initial_capacity;
+        self.len = 0;
+        try self.allocKvCaches();
     }
 
     pub fn deinit(self: *CudaLM) void {
@@ -232,6 +310,9 @@ pub const CudaLM = struct {
     /// Migrate the next layer in the offload order to the host (dynamic mode).
     /// Returns false when nothing is left to migrate.
     fn migrateNextLayer(self: *CudaLM) !bool {
+        // f16 KV keeps the model fully resident: the CPU-offload host shadow
+        // cache is f32, so migrating an f16 device layer would mismatch.
+        if (self.kv_dtype == .f16) return false;
         const sp = &self.split.?;
         if (sp.next >= sp.order.len) return false;
         const l = sp.order[sp.next];
@@ -249,10 +330,22 @@ pub const CudaLM = struct {
         const kvd = cfg.kvDim();
         if (self.len > 0) {
             const cap = sp.cache.capacity;
-            const hk = sp.cache.k[l * cap * kvd ..][0 .. self.len * kvd];
-            const hv = sp.cache.v[l * cap * kvd ..][0 .. self.len * kvd];
-            try self.be.tensorDownload(offsetBufSized(self.k_cache[l].buf, 0, self.len * kvd * 4), std.mem.sliceAsBytes(hk));
-            try self.be.tensorDownload(offsetBufSized(self.v_cache[l].buf, 0, self.len * kvd * 4), std.mem.sliceAsBytes(hv));
+            if (usesRing(cfg, l)) {
+                // LOCAL ring -> linear host shadow: copy the live window,
+                // translating ring rows (pos%ring) to absolute host rows.
+                for (ringSegments(self.len, localRingRows(cfg))) |seg| {
+                    if (seg.n == 0) continue;
+                    const hk = sp.cache.k[l * cap * kvd + seg.abs * kvd ..][0 .. seg.n * kvd];
+                    const hv = sp.cache.v[l * cap * kvd + seg.abs * kvd ..][0 .. seg.n * kvd];
+                    try self.be.tensorDownload(offsetBufSized(self.k_cache[l].buf, seg.dev * kvd * 4, seg.n * kvd * 4), std.mem.sliceAsBytes(hk));
+                    try self.be.tensorDownload(offsetBufSized(self.v_cache[l].buf, seg.dev * kvd * 4, seg.n * kvd * 4), std.mem.sliceAsBytes(hv));
+                }
+            } else {
+                const hk = sp.cache.k[l * cap * kvd ..][0 .. self.len * kvd];
+                const hv = sp.cache.v[l * cap * kvd ..][0 .. self.len * kvd];
+                try self.be.tensorDownload(offsetBufSized(self.k_cache[l].buf, 0, self.len * kvd * 4), std.mem.sliceAsBytes(hk));
+                try self.be.tensorDownload(offsetBufSized(self.v_cache[l].buf, 0, self.len * kvd * 4), std.mem.sliceAsBytes(hv));
+            }
         }
         self.be.growableDestroy(&self.k_cache[l]);
         self.be.growableDestroy(&self.v_cache[l]);
@@ -306,14 +399,31 @@ pub const CudaLM = struct {
         const cfg = self.cfg;
         const sp = &self.split.?;
         const kvd = cfg.kvDim();
-        self.k_cache[l] = try self.be.growableCreate(self.capacity * kvd * 4, self.max_capacity * kvd * 4);
-        self.v_cache[l] = try self.be.growableCreate(self.capacity * kvd * 4, self.max_capacity * kvd * 4);
+        if (usesRing(cfg, l)) {
+            const bytes = localRingRows(cfg) * kvd * 4;
+            self.k_cache[l] = try self.be.growableCreate(bytes, bytes);
+            self.v_cache[l] = try self.be.growableCreate(bytes, bytes);
+        } else {
+            self.k_cache[l] = try self.be.growableCreate(self.capacity * kvd * 4, self.max_capacity * kvd * 4);
+            self.v_cache[l] = try self.be.growableCreate(self.capacity * kvd * 4, self.max_capacity * kvd * 4);
+        }
         if (self.len > 0) {
             const cap = sp.cache.capacity;
-            const hk = sp.cache.k[l * cap * kvd ..][0 .. self.len * kvd];
-            const hv = sp.cache.v[l * cap * kvd ..][0 .. self.len * kvd];
-            try self.be.tensorUpload(offsetBufSized(self.k_cache[l].buf, 0, self.len * kvd * 4), std.mem.sliceAsBytes(hk));
-            try self.be.tensorUpload(offsetBufSized(self.v_cache[l].buf, 0, self.len * kvd * 4), std.mem.sliceAsBytes(hv));
+            if (usesRing(cfg, l)) {
+                // Linear host shadow -> LOCAL ring: reverse of migrateLayer.
+                for (ringSegments(self.len, localRingRows(cfg))) |seg| {
+                    if (seg.n == 0) continue;
+                    const hk = sp.cache.k[l * cap * kvd + seg.abs * kvd ..][0 .. seg.n * kvd];
+                    const hv = sp.cache.v[l * cap * kvd + seg.abs * kvd ..][0 .. seg.n * kvd];
+                    try self.be.tensorUpload(offsetBufSized(self.k_cache[l].buf, seg.dev * kvd * 4, seg.n * kvd * 4), std.mem.sliceAsBytes(hk));
+                    try self.be.tensorUpload(offsetBufSized(self.v_cache[l].buf, seg.dev * kvd * 4, seg.n * kvd * 4), std.mem.sliceAsBytes(hv));
+                }
+            } else {
+                const hk = sp.cache.k[l * cap * kvd ..][0 .. self.len * kvd];
+                const hv = sp.cache.v[l * cap * kvd ..][0 .. self.len * kvd];
+                try self.be.tensorUpload(offsetBufSized(self.k_cache[l].buf, 0, self.len * kvd * 4), std.mem.sliceAsBytes(hk));
+                try self.be.tensorUpload(offsetBufSized(self.v_cache[l].buf, 0, self.len * kvd * 4), std.mem.sliceAsBytes(hv));
+            }
         }
         sp.on_gpu[l] = true;
         sp.n_cpu -= 1;
@@ -359,11 +469,17 @@ pub const CudaLM = struct {
             self.gpa.free(sp.order);
             self.split = null;
         }
-        for (self.k_cache, self.v_cache) |*kb, *vb| {
+        for (self.k_cache, self.v_cache, 0..) |*kb, *vb, l| {
             self.be.growableDestroy(kb);
             self.be.growableDestroy(vb);
-            kb.* = try self.be.growableCreate(self.initial_capacity * kvd * 4, self.max_capacity * kvd * 4);
-            vb.* = try self.be.growableCreate(self.initial_capacity * kvd * 4, self.max_capacity * kvd * 4);
+            if (usesRing(cfg, l)) {
+                const bytes = localRingRows(cfg) * kvd * 4;
+                kb.* = try self.be.growableCreate(bytes, bytes);
+                vb.* = try self.be.growableCreate(bytes, bytes);
+            } else {
+                kb.* = try self.be.growableCreate(self.initial_capacity * kvd * 4, self.max_capacity * kvd * 4);
+                vb.* = try self.be.growableCreate(self.initial_capacity * kvd * 4, self.max_capacity * kvd * 4);
+            }
         }
         self.capacity = self.initial_capacity;
         try self.resetCache();
@@ -377,6 +493,9 @@ pub const CudaLM = struct {
     /// fallback. See qwen35_cuda.autoOffload for the measured rationale.
     pub fn autoOffload(self: *CudaLM, budget: u64) !bool {
         if (budget == 0) return false;
+        // f16 KV stays fully resident (see migrateNextLayer); f16 halves the KV
+        // footprint, so the pressure that would trigger auto-offload is lower.
+        if (self.kv_dtype == .f16) return false;
         try self.enableCpuSplit(.attn, budget, true);
         return true;
     }
@@ -388,6 +507,8 @@ pub const CudaLM = struct {
     /// the per-op path (already the gemma3 default). No-op static split (all fit)
     /// leaves `self.split == null`. Mirrors qwen35_cuda.enableCpuSplit.
     pub fn enableCpuSplit(self: *CudaLM, policy: CpuSplitPolicy, budget: u64, dynamic: bool) !void {
+        // f16 KV + CPU offload is unsupported: the host shadow cache is f32.
+        if (self.kv_dtype == .f16) return error.KvDtypeUnsupported;
         const cfg = self.cfg;
         const n = cfg.n_layers;
         const gpa = self.gpa;
@@ -400,8 +521,11 @@ pub const CudaLM = struct {
             total_weight += per[l];
         }
 
-        // Device memory that must stay resident: KV at capacity + LM head + slack.
-        const kv_bytes = 2 * n * self.capacity * cfg.kvDim() * 4;
+        // Device memory that must stay resident: KV + LM head + slack. LOCAL ring
+        // layers hold only localRingRows, not the full capacity.
+        var kv_rows: usize = 0;
+        for (0..n) |l| kv_rows += if (usesRing(cfg, l)) localRingRows(cfg) else self.capacity;
+        const kv_bytes = 2 * kv_rows * cfg.kvDim() * 4;
         const reserve = if (dynamic)
             self.lm.head.bytes.len
         else
@@ -433,7 +557,8 @@ pub const CudaLM = struct {
 
         // Host state for the CPU-resident layers (sized to the current KV
         // capacity; grows with the device via ensureCapacity; len starts at 0).
-        var cache = try kvmod.KvCache.init(gpa, n, self.capacity, cfg.kvDim());
+        // Offloaded-layer host shadow is always f32 (f16 disables the split).
+        var cache = try kvmod.KvCache.init(gpa, n, self.capacity, cfg.kvDim(), .f32);
         errdefer cache.deinit(gpa);
         var scratch = try gemma3.Scratch.init(gpa, prefill_chunk, cfg);
         errdefer scratch.deinit(gpa);
@@ -487,8 +612,10 @@ pub const CudaLM = struct {
             }
         };
 
-        // Grow device KV of the layers still on the GPU.
+        // Grow device KV of the layers still on the GPU (LOCAL ring layers are
+        // fixed-size — never grow them).
         for (0..self.cfg.n_layers) |l| {
+            if (usesRing(self.cfg, l)) continue;
             if (self.split) |*sp| if (!sp.on_gpu[l]) continue;
             for ([2]*Growable{ &self.k_cache[l], &self.v_cache[l] }) |b| {
                 self.be.growableEnsure(b, bytes) catch |err| switch (err) {
@@ -519,13 +646,55 @@ pub const CudaLM = struct {
         self.io = io; // the CPU half of a hybrid split runs host matmuls through it
         std.debug.assert(ids.len >= 1 and ids.len <= self.remaining());
         std.debug.assert(logits.len == self.cfg.vocab);
+        try self.forwardDecode(io, ids, logits);
+    }
+
+    /// The decode/prefill forward in prefill_chunk batches; the final chunk runs
+    /// the LM head into bufs.logits, downloading to `dl` when non-null. Shared by
+    /// step (downloads), stepArgmax and stepSelect (sample on-device).
+    fn forwardDecode(self: *CudaLM, io: std.Io, ids: []const u32, dl: ?[]f32) !void {
+        self.io = io; // the CPU half of a hybrid split runs host matmuls through it
+        std.debug.assert(ids.len >= 1 and ids.len <= self.remaining());
         var off: usize = 0;
         while (off < ids.len) {
             const n: usize = @min(prefill_chunk, ids.len - off);
             const last = (off + n == ids.len);
-            try self.embedChunk(ids[off..][0..n], if (last) logits else null);
+            try self.embedChunk(ids[off..][0..n], last, if (last) dl else null);
             off += n;
         }
+    }
+
+    /// Greedy decode: forward, then argmax the last logits on-device, returning
+    /// just the id. Matches sample.argmax.
+    pub fn stepArgmax(self: *CudaLM, io: std.Io, ids: []const u32) !u32 {
+        try self.forwardDecode(io, ids, null);
+        const be = self.be;
+        const b = &self.bufs;
+        try be.opArgmax(offsetBufSized(b.logits, 0, self.cfg.vocab * 4), self.cfg.vocab, b.argmax_out, &b.argmax_v, &b.argmax_i);
+        var idf: [1]f32 = undefined;
+        try be.tensorDownload(b.argmax_out, std.mem.sliceAsBytes(&idf));
+        return @intFromFloat(idf[0]);
+    }
+
+    /// Max candidates stepSelect can return (host buffer sizing for the engine).
+    pub fn maxSelect(self: *const CudaLM) usize {
+        _ = self;
+        return cuda.backend.topk_lanes * cuda.backend.topk_m;
+    }
+
+    /// Stochastic decode: forward, select the top-k on-device, download just
+    /// those (id,logit) pairs. Returns the candidate count.
+    pub fn stepSelect(self: *CudaLM, io: std.Io, ids: []const u32, out_id: []u32, out_logit: []f32) !usize {
+        try self.forwardDecode(io, ids, null);
+        const be = self.be;
+        const b = &self.bufs;
+        const count = try be.opTopK(offsetBufSized(b.logits, 0, self.cfg.vocab * 4), self.cfg.vocab, &b.topk_v, &b.topk_i);
+        std.debug.assert(count <= out_id.len and count <= out_logit.len);
+        try be.tensorDownload(b.topk_v, std.mem.sliceAsBytes(out_logit[0..count]));
+        var idx_f: [cuda.backend.topk_lanes * cuda.backend.topk_m]f32 = undefined;
+        try be.tensorDownload(b.topk_i, std.mem.sliceAsBytes(idx_f[0..count]));
+        for (out_id[0..count], idx_f[0..count]) |*o, f| o.* = @intFromFloat(f);
+        return count;
     }
 
     /// Prefill text tokens (no logits) — for interleaving with prefillImage.
@@ -533,7 +702,7 @@ pub const CudaLM = struct {
         var off: usize = 0;
         while (off < ids.len) {
             const n: usize = @min(prefill_chunk, ids.len - off);
-            try self.embedChunk(ids[off..][0..n], null);
+            try self.embedChunk(ids[off..][0..n], false, null);
             off += n;
         }
     }
@@ -550,14 +719,14 @@ pub const CudaLM = struct {
         var off: usize = 0;
         while (off < total) {
             const n: usize = @min(prefill_chunk, total - off);
-            try self.forwardRows(embeds[off * cfg.hidden ..][0 .. n * cfg.hidden], null);
+            try self.forwardRows(embeds[off * cfg.hidden ..][0 .. n * cfg.hidden], false, null);
             off += n;
         }
     }
 
     /// Embed `ids` (gather + sqrt(hidden) scale, host-side) then forward the
     /// resulting rows.
-    fn embedChunk(self: *CudaLM, ids: []const u32, logits: ?[]f32) !void {
+    fn embedChunk(self: *CudaLM, ids: []const u32, want_head: bool, dl: ?[]f32) !void {
         const cfg = self.cfg;
         const n = ids.len;
         const x = try self.gpa.alloc(f32, n * cfg.hidden);
@@ -565,7 +734,7 @@ pub const CudaLM = struct {
         try qwen3.embedTokens(self.lm.embed, ids, x);
         const scale = cfg.embedScale();
         for (x) |*v| v.* *= scale;
-        try self.forwardRows(x, logits);
+        try self.forwardRows(x, want_head, dl);
     }
 
     /// One batched forward over `n` pre-embedded input rows `x_host`
@@ -604,16 +773,33 @@ pub const CudaLM = struct {
     pub fn appendKV(self: *CudaLM, l: usize, seq: usize, pos0: usize) !void {
         const cfg = self.cfg;
         const b = &self.bufs;
-        try self.be.tensorCopy(self.k_cache[l].buf, pos0 * cfg.kvDim() * 4, b.k, 0, seq * cfg.kvDim() * 4);
-        try self.be.tensorCopy(self.v_cache[l].buf, pos0 * cfg.kvDim() * 4, b.v, 0, seq * cfg.kvDim() * 4);
+        const kvd = cfg.kvDim();
+        if (!usesRing(cfg, l)) {
+            try self.storeKv(self.k_cache[l].buf, pos0 * kvd, b.k, 0, seq * kvd);
+            try self.storeKv(self.v_cache[l].buf, pos0 * kvd, b.v, 0, seq * kvd);
+            return;
+        }
+        // LOCAL layer: write into the ring at row pos0%ring, splitting on wrap
+        // (seq <= prefill_chunk < ring, so at most one wrap).
+        const ring = localRingRows(cfg);
+        const start = pos0 % ring;
+        const first = @min(seq, ring - start);
+        try self.storeKv(self.k_cache[l].buf, start * kvd, b.k, 0, first * kvd);
+        try self.storeKv(self.v_cache[l].buf, start * kvd, b.v, 0, first * kvd);
+        if (first < seq) {
+            const rest = seq - first;
+            try self.storeKv(self.k_cache[l].buf, 0, b.k, first * kvd, rest * kvd);
+            try self.storeKv(self.v_cache[l].buf, 0, b.v, first * kvd, rest * kvd);
+        }
     }
     pub fn attention(self: *CudaLM, l: usize, seq: usize, pos0: usize) !void {
         const cfg = self.cfg;
         const b = &self.bufs;
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
         const window: usize = if (cfg.isGlobal(l)) 0 else cfg.sliding_window;
+        const ring: usize = if (usesRing(cfg, l)) localRingRows(cfg) else 0;
         const ns: usize = if (seq == 1) nsplit else nsplit_prefill;
-        try self.be.opAttnDecode(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, pos0 + 1, seq, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, ns, scale, window);
+        try self.be.opAttnDecode(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, pos0 + 1, seq, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, ns, scale, window, ring, self.kv_dtype == .f16);
     }
     pub fn projectO(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
         _ = l;
@@ -653,7 +839,7 @@ pub const CudaLM = struct {
         try self.be.qkNorm(self.bufs.t, self.bufs.t, try nbuf(self.be, layer.post_ffn_norm), seq, cfg.hidden, cfg.rms_eps);
     }
 
-    fn forwardRows(self: *CudaLM, x_host: []const f32, logits: ?[]f32) !void {
+    fn forwardRows(self: *CudaLM, x_host: []const f32, want_head: bool, dl: ?[]f32) !void {
         const be = self.be;
         const cfg = self.cfg;
         const b = &self.bufs;
@@ -700,14 +886,15 @@ pub const CudaLM = struct {
             sp.on_host = false;
         };
 
-        if (logits) |out| {
+        if (want_head) {
             const h = cfg.hidden;
             try be.qkNorm(offsetBufSized(b.x, (n - 1) * h * 4, h * 4), b.t, try nbuf(be, self.lm.final_norm), 1, h, eps);
             try self.lmHead(b.logits, b.t);
             try be.endBatch();
             self.len += n;
             if (self.split) |*sp| sp.cache.commit(n); // keep host len == device len
-            try be.tensorDownload(offsetBufSized(b.logits, 0, cfg.vocab * 4), std.mem.sliceAsBytes(out));
+            // `dl` null leaves logits resident (stepArgmax/stepSelect sample them).
+            if (dl) |out| try be.tensorDownload(offsetBufSized(b.logits, 0, cfg.vocab * 4), std.mem.sliceAsBytes(out));
         } else {
             try be.endBatch();
             self.len += n;
@@ -770,6 +957,11 @@ const Bufs = struct {
     t: Buf,
     attn_scratch: Buf,
     logits: Buf,
+    argmax_v: Buf,
+    argmax_i: Buf,
+    argmax_out: Buf,
+    topk_v: Buf,
+    topk_i: Buf,
 
     fn init(be: *Backend, cfg: gemma3.Config) !Bufs {
         const pc = prefill_chunk; // GEMM outputs are 128-row padded; pc == 128
@@ -792,6 +984,11 @@ const Bufs = struct {
             pc * cfg.hidden, // t
             @max(cfg.n_heads * nsplit, pc * cfg.n_heads * nsplit_prefill) * (hd + 4), // attn_scratch
             cfg.vocab, // logits
+            4096, // argmax_v (>= opArgmax lane count)
+            4096, // argmax_i
+            1, // argmax_out (1 id)
+            cuda.backend.topk_lanes * cuda.backend.topk_m, // topk_v
+            cuda.backend.topk_lanes * cuda.backend.topk_m, // topk_i
         };
         inline for (@typeInfo(Bufs).@"struct".fields, 0..) |f, i| {
             @field(self, f.name) = try be.tensorCreate(sizes[i] * 4);
@@ -805,3 +1002,27 @@ const Bufs = struct {
         self.* = undefined;
     }
 };
+
+test "ringSegments covers the live window contiguously" {
+    // For each (len, ring), the segments must tile [max(0,len-ring), len)
+    // exactly, mapping each absolute position to ring row pos%ring, with no
+    // segment wrapping the ring boundary.
+    const cases = [_][2]usize{
+        .{ 5, 8 }, .{ 8, 8 }, .{ 9, 8 }, .{ 16, 8 }, .{ 17, 8 }, .{ 20, 8 },
+        .{ 1000, 1152 }, .{ 1152, 1152 }, .{ 1153, 1152 }, .{ 3000, 1152 },
+    };
+    for (cases) |c| {
+        const len = c[0];
+        const ring = c[1];
+        const start = if (len > ring) len - ring else 0;
+        var abs = start;
+        for (ringSegments(len, ring)) |s| {
+            if (s.n == 0) continue;
+            try std.testing.expectEqual(abs, s.abs); // contiguous, no gap
+            try std.testing.expectEqual(abs % ring, s.dev); // ring row of abs
+            try std.testing.expect(s.dev + s.n <= ring); // no wrap within a segment
+            abs += s.n;
+        }
+        try std.testing.expectEqual(len, abs); // covered exactly up to len
+    }
+}

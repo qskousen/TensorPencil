@@ -63,6 +63,9 @@ pub const CudaLM = struct {
     /// The KV capacity a fresh session starts at; resetResidency shrinks back to
     /// it so a new chat frees the grown KV VRAM.
     initial_capacity: usize,
+    /// KV-cache element storage type (f32 / f16); selects the attention/append
+    /// kernel variant and the per-element stride of k_cache/v_cache.
+    kv_dtype: kvmod.KvDtype,
     len: usize,
 
     bufs: Bufs,
@@ -161,6 +164,7 @@ pub const CudaLM = struct {
         self.capacity = cap.initial;
         self.initial_capacity = cap.initial;
         self.max_capacity = cap.max;
+        self.kv_dtype = cap.kv_dtype;
         self.len = 0;
         self.pos_next = 0;
         self.layer_dump = null;
@@ -193,11 +197,12 @@ pub const CudaLM = struct {
         self.bufs = try Bufs.init(be, cfg);
 
         const n_attn = cfg.nAttnLayers();
+        const esz = cap.kv_dtype.elemBytes();
         self.k_cache = try alloc.alloc(Growable, n_attn);
         self.v_cache = try alloc.alloc(Growable, n_attn);
         for (self.k_cache, self.v_cache) |*kb, *vb| {
-            kb.* = try be.growableCreate(cap.initial * cfg.kvDim() * 4, cap.max * cfg.kvDim() * 4);
-            vb.* = try be.growableCreate(cap.initial * cfg.kvDim() * 4, cap.max * cfg.kvDim() * 4);
+            kb.* = try be.growableCreate(cap.initial * cfg.kvDim() * esz, cap.max * cfg.kvDim() * esz);
+            vb.* = try be.growableCreate(cap.initial * cfg.kvDim() * esz, cap.max * cfg.kvDim() * esz);
         }
 
         const n_lin = cfg.n_layers - n_attn;
@@ -228,6 +233,41 @@ pub const CudaLM = struct {
         // any earlier would snapshot an empty arena and leak the chunks.
         self.arena = arena;
         return self;
+    }
+
+    /// Store `n` K/V elements from `src` (+`src_off` elems) into cache buffer
+    /// `dst` at element offset `dst_off`. f32 copies raw; f16 converts on store.
+    fn storeKv(self: *CudaLM, dst: Buf, dst_off: usize, src: Buf, src_off: usize, n: usize) !void {
+        if (self.kv_dtype == .f16) {
+            try self.be.opStoreKvF16(dst, dst_off, src, src_off, n);
+        } else {
+            try self.be.tensorCopy(dst, dst_off * 4, src, src_off * 4, n * 4);
+        }
+    }
+
+    /// Rebuild the KV cache at a new element dtype (GUI toggle), weights resident.
+    /// Drops the captured decode graph so it re-captures with the f16/f32 kernels,
+    /// frees + re-creates the per-attention-slot K/V buffers, resets the length.
+    /// f16 with an active CPU-offload split is unsupported (host shadow is f32).
+    pub fn reinitCache(self: *CudaLM, dtype: kvmod.KvDtype) !void {
+        if (dtype == .f16 and self.split != null) return error.KvDtypeUnsupported;
+        const be = self.be;
+        const cfg = self.cfg;
+        if (self.graph_exec != null) {
+            be.graphDestroy(self.graph_exec);
+            self.graph_exec = null;
+        }
+        self.decode_warm = false;
+        for (self.k_cache) |*b| be.growableDestroy(b);
+        for (self.v_cache) |*b| be.growableDestroy(b);
+        self.kv_dtype = dtype;
+        self.capacity = self.initial_capacity;
+        self.len = 0;
+        const esz = dtype.elemBytes();
+        for (self.k_cache, self.v_cache) |*kb, *vb| {
+            kb.* = try be.growableCreate(self.initial_capacity * cfg.kvDim() * esz, self.max_capacity * cfg.kvDim() * esz);
+            vb.* = try be.growableCreate(self.initial_capacity * cfg.kvDim() * esz, self.max_capacity * cfg.kvDim() * esz);
+        }
     }
 
     pub fn deinit(self: *CudaLM) void {
@@ -333,6 +373,8 @@ pub const CudaLM = struct {
     /// Migrate the next layer in the offload order to the host (dynamic mode).
     /// Returns false when nothing is left to migrate.
     fn migrateNextLayer(self: *CudaLM) !bool {
+        // f16 KV stays fully resident: the CPU-offload host shadow cache is f32.
+        if (self.kv_dtype == .f16) return false;
         const sp = &self.split.?;
         if (sp.next >= sp.order.len) return false;
         const l = sp.order[sp.next];
@@ -420,6 +462,8 @@ pub const CudaLM = struct {
     /// No-op split (all layers fit) leaves `self.split == null`. Forces the
     /// per-op decode path (a captured graph cannot record host compute).
     pub fn enableCpuSplit(self: *CudaLM, policy: CpuSplitPolicy, budget: u64, dynamic: bool) !void {
+        // f16 KV + CPU offload is unsupported: the host shadow cache is f32.
+        if (self.kv_dtype == .f16) return error.KvDtypeUnsupported;
         const cfg = self.cfg;
         const n = cfg.n_layers;
         const gpa = self.gpa;
@@ -497,7 +541,8 @@ pub const CudaLM = struct {
         // Host state for the CPU-resident layers (sized to the current KV
         // capacity; grows with the device via ensureCapacity). len starts at
         // 0 — enableCpuSplit runs before any tokens.
-        var state = try qwen35.State.init(gpa, cfg, self.capacity);
+        // Offloaded-layer host state is always f32 (f16 disables the split).
+        var state = try qwen35.State.init(gpa, cfg, self.capacity, .f32);
         errdefer state.deinit(gpa);
         var scratch = try qwen35.Scratch.init(gpa, prefill_chunk, cfg);
         errdefer scratch.deinit(gpa);
@@ -548,6 +593,9 @@ pub const CudaLM = struct {
     /// guard). Returns whether a split was armed.
     pub fn autoOffload(self: *CudaLM, budget: u64) !bool {
         if (budget == 0) return false; // no budget → fully resident, no offload path
+        // f16 KV stays fully resident (host shadow cache is f32); f16 already
+        // halves the KV footprint, lowering the pressure that would offload.
+        if (self.kv_dtype == .f16) return false;
         // Always arm the dynamic split. When the model fits its budget it places
         // ZERO layers on the CPU — measured free (per-op decode ties the captured
         // graph: 76.2 vs 77.2 tok/s on the 9B) — and migrates layers on demand as
@@ -695,10 +743,18 @@ pub const CudaLM = struct {
     /// of ~1700) once the first decode step has warmed weight residency;
     /// --profile and capture failures fall back to per-op launches.
     pub fn step(self: *CudaLM, io: std.Io, ids_new: []const u32, logits: []f32) !void {
+        std.debug.assert(logits.len == self.cfg.vocab);
+        try self.forwardDecode(io, ids_new);
+        try self.be.tensorDownload(offsetBufSized(self.bufs.logits, 0, self.cfg.vocab * 4), std.mem.sliceAsBytes(logits));
+    }
+
+    /// The decode forward, leaving the last position's logits resident in
+    /// bufs.logits (graph replay when warm, else prefill + one step). Shared by
+    /// step (downloads them), stepArgmax and stepSelect (sample on-device).
+    fn forwardDecode(self: *CudaLM, io: std.Io, ids_new: []const u32) !void {
         self.io = io; // the CPU half of a hybrid split runs host matmuls through it
         const be = self.be;
         std.debug.assert(ids_new.len >= 1 and ids_new.len <= self.remaining());
-        std.debug.assert(logits.len == self.cfg.vocab);
         // Any weight eviction (--vram-budget streaming, or live VRAM
         // pressure) means device weight pointers are not stable, and a
         // captured graph would replay against freed buffers.
@@ -710,7 +766,39 @@ pub const CudaLM = struct {
             try self.stepOne(ids_new[ids_new.len - 1], true);
             self.decode_warm = true;
         }
-        try be.tensorDownload(offsetBufSized(self.bufs.logits, 0, self.cfg.vocab * 4), std.mem.sliceAsBytes(logits));
+    }
+
+    /// Greedy decode: forward, then argmax the last logits on-device and return
+    /// just the id (download 4 B, not the vocab). Matches sample.argmax.
+    pub fn stepArgmax(self: *CudaLM, io: std.Io, ids_new: []const u32) !u32 {
+        try self.forwardDecode(io, ids_new);
+        const be = self.be;
+        const b = &self.bufs;
+        try be.opArgmax(offsetBufSized(b.logits, 0, self.cfg.vocab * 4), self.cfg.vocab, b.argmax_out, &b.argmax_v, &b.argmax_i);
+        var idf: [1]f32 = undefined;
+        try be.tensorDownload(b.argmax_out, std.mem.sliceAsBytes(&idf));
+        return @intFromFloat(idf[0]);
+    }
+
+    /// Max candidates stepSelect can return (host buffer sizing for the engine).
+    pub fn maxSelect(self: *const CudaLM) usize {
+        _ = self;
+        return cuda.backend.topk_lanes * cuda.backend.topk_m;
+    }
+
+    /// Stochastic decode: forward, select the top-k on-device, download just
+    /// those (id,logit) pairs. Returns the candidate count.
+    pub fn stepSelect(self: *CudaLM, io: std.Io, ids_new: []const u32, out_id: []u32, out_logit: []f32) !usize {
+        try self.forwardDecode(io, ids_new);
+        const be = self.be;
+        const b = &self.bufs;
+        const count = try be.opTopK(offsetBufSized(b.logits, 0, self.cfg.vocab * 4), self.cfg.vocab, &b.topk_v, &b.topk_i);
+        std.debug.assert(count <= out_id.len and count <= out_logit.len);
+        try be.tensorDownload(b.topk_v, std.mem.sliceAsBytes(out_logit[0..count]));
+        var idx_f: [cuda.backend.topk_lanes * cuda.backend.topk_m]f32 = undefined;
+        try be.tensorDownload(b.topk_i, std.mem.sliceAsBytes(idx_f[0..count]));
+        for (out_id[0..count], idx_f[0..count]) |*o, f| o.* = @intFromFloat(f);
+        return count;
     }
 
     /// Prefill tokens without reading logits, in batched chunks.
@@ -828,8 +916,8 @@ pub const CudaLM = struct {
                     try be.qkNorm(b.k, b.k, try nbuf(be, al.k_norm), n * cfg.n_kv_heads, hd, eps);
                     try be.opRopeImropePos(b.q, self.pos3s_d, self.freqs_d, n, cfg.n_heads, cfg.rope_dim / 2, self.sin_off, cfg.rope_sections, hd);
                     try be.opRopeImropePos(b.k, self.pos3s_d, self.freqs_d, n, cfg.n_kv_heads, cfg.rope_dim / 2, self.sin_off, cfg.rope_sections, hd);
-                    try be.tensorCopy(self.k_cache[slot].buf, self.len * cfg.kvDim() * 4, b.k, 0, n * cfg.kvDim() * 4);
-                    try be.tensorCopy(self.v_cache[slot].buf, self.len * cfg.kvDim() * 4, b.v, 0, n * cfg.kvDim() * 4);
+                    try self.storeKv(self.k_cache[slot].buf, self.len * cfg.kvDim(), b.k, 0, n * cfg.kvDim());
+                    try self.storeKv(self.v_cache[slot].buf, self.len * cfg.kvDim(), b.v, 0, n * cfg.kvDim());
                     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
                     if (debug_seq_attn) {
                         for (0..n) |t| {
@@ -847,10 +935,12 @@ pub const CudaLM = struct {
                                 nsplit,
                                 scale,
                                 0,
+                                0,
+                                false,
                             );
                         }
                     } else {
-                        try be.opAttnDecode(b.q, self.k_cache[slot].buf, self.v_cache[slot].buf, b.attn, b.attn_scratch, self.len + 1, n, cfg.n_heads, cfg.n_kv_heads, hd, nsplit_prefill, scale, 0);
+                        try be.opAttnDecode(b.q, self.k_cache[slot].buf, self.v_cache[slot].buf, b.attn, b.attn_scratch, self.len + 1, n, cfg.n_heads, cfg.n_kv_heads, hd, nsplit_prefill, scale, 0, 0, self.kv_dtype == .f16);
                     }
                     try be.opMulSigmoid(b.attn, b.gate, n * cfg.qDim());
                     try self.gemm(b.t, b.attn, al.o, n);
@@ -1047,13 +1137,14 @@ pub const CudaLM = struct {
                     try be.opRopeImrope(b.k, self.pos3_d, self.freqs_d, cfg.n_kv_heads, cfg.rope_dim / 2, self.sin_off, cfg.rope_sections, hd);
                     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
                     if (graph) {
-                        try be.opKvAppendS(self.k_cache[slot].buf, b.k, cfg.kvDim(), cfg.kvDim(), 0);
-                        try be.opKvAppendS(self.v_cache[slot].buf, b.v, cfg.kvDim(), cfg.kvDim(), 0);
-                        try be.opAttnDecodeSGraph(b.q, self.k_cache[slot].buf, self.v_cache[slot].buf, b.attn, b.attn_scratch, cfg.n_heads, cfg.n_kv_heads, hd, nsplit, scale);
+                        const kv_f16 = self.kv_dtype == .f16;
+                        try be.opKvAppendS(self.k_cache[slot].buf, b.k, cfg.kvDim(), cfg.kvDim(), 0, kv_f16);
+                        try be.opKvAppendS(self.v_cache[slot].buf, b.v, cfg.kvDim(), cfg.kvDim(), 0, kv_f16);
+                        try be.opAttnDecodeSGraph(b.q, self.k_cache[slot].buf, self.v_cache[slot].buf, b.attn, b.attn_scratch, cfg.n_heads, cfg.n_kv_heads, hd, nsplit, scale, kv_f16);
                     } else {
-                        try be.tensorCopy(self.k_cache[slot].buf, self.len * cfg.kvDim() * 4, b.k, 0, cfg.kvDim() * 4);
-                        try be.tensorCopy(self.v_cache[slot].buf, self.len * cfg.kvDim() * 4, b.v, 0, cfg.kvDim() * 4);
-                        try be.opAttnDecode(b.q, self.k_cache[slot].buf, self.v_cache[slot].buf, b.attn, b.attn_scratch, self.len + 1, 1, cfg.n_heads, cfg.n_kv_heads, hd, nsplit, scale, 0);
+                        try self.storeKv(self.k_cache[slot].buf, self.len * cfg.kvDim(), b.k, 0, cfg.kvDim());
+                        try self.storeKv(self.v_cache[slot].buf, self.len * cfg.kvDim(), b.v, 0, cfg.kvDim());
+                        try be.opAttnDecode(b.q, self.k_cache[slot].buf, self.v_cache[slot].buf, b.attn, b.attn_scratch, self.len + 1, 1, cfg.n_heads, cfg.n_kv_heads, hd, nsplit, scale, 0, 0, self.kv_dtype == .f16);
                     }
                     try be.opMulSigmoid(b.attn, b.gate, cfg.qDim());
                     try self.quantizeX(b.attn, cfg.qDim());
@@ -1282,6 +1373,11 @@ const Bufs = struct {
     mlp_gate: Buf,
     mlp_up: Buf,
     logits: Buf,
+    argmax_v: Buf,
+    argmax_i: Buf,
+    argmax_out: Buf,
+    topk_v: Buf,
+    topk_i: Buf,
 
     fn init(be: *Backend, cfg: qwen35.Config) !Bufs {
         var s: Bufs = undefined;
@@ -1310,6 +1406,11 @@ const Bufs = struct {
             pc * cfg.intermediate, // mlp_gate
             pc * cfg.intermediate, // mlp_up
             cfg.vocab, // logits
+            4096, // argmax_v (>= opArgmax lane count)
+            4096, // argmax_i
+            1, // argmax_out (1 id)
+            cuda.backend.topk_lanes * cuda.backend.topk_m, // topk_v
+            cuda.backend.topk_lanes * cuda.backend.topk_m, // topk_i
         };
         var done: usize = 0;
         errdefer {

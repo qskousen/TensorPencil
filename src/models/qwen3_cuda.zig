@@ -161,6 +161,9 @@ pub const CudaLM = struct {
     max_capacity: usize,
     /// Committed cache length (absolute position of the next token).
     len: usize = 0,
+    /// KV-cache element storage type (f32 / f16); selects the attention/append
+    /// kernel variant and the per-element stride of k_cache/v_cache.
+    kv_dtype: kvmod.KvDtype = .f32,
     /// Activation-buffer row budget: the prompt for prefill, 1 afterwards.
     max_rows: usize,
     sin_off: usize,
@@ -209,6 +212,7 @@ pub const CudaLM = struct {
         self.cfg = c;
         self.capacity = cap.initial;
         self.max_capacity = cap.max;
+        self.kv_dtype = cap.kv_dtype;
         self.len = 0;
         // Activation buffers always cover a speculative verify batch; padded
         // GEMM buffers are 128-row anyway, so the floor is nearly free.
@@ -235,16 +239,17 @@ pub const CudaLM = struct {
         errdefer be.tensorDestroy(&self.freqs_d);
         try be.tensorUpload(self.freqs_d, std.mem.sliceAsBytes(fp));
 
+        const esz = cap.kv_dtype.elemBytes();
         var created: usize = 0;
         errdefer for (self.k_cache[0..created]) |*b| be.growableDestroy(b);
         for (self.k_cache[0..c.n_layers]) |*b| {
-            b.* = try be.growableCreate(cap.initial * c.kvDim() * 4, cap.max * c.kvDim() * 4);
+            b.* = try be.growableCreate(cap.initial * c.kvDim() * esz, cap.max * c.kvDim() * esz);
             created += 1;
         }
         var vcreated: usize = 0;
         errdefer for (self.v_cache[0..vcreated]) |*b| be.growableDestroy(b);
         for (self.v_cache[0..c.n_layers]) |*b| {
-            b.* = try be.growableCreate(cap.initial * c.kvDim() * 4, cap.max * c.kvDim() * 4);
+            b.* = try be.growableCreate(cap.initial * c.kvDim() * esz, cap.max * c.kvDim() * esz);
             vcreated += 1;
         }
 
@@ -256,6 +261,9 @@ pub const CudaLM = struct {
     /// position (the EAGLE-3 drafter's fused-feature inputs). Call before
     /// any forward; costs 3 x capacity x hidden f32 of VRAM.
     pub fn enableTaps(self: *CudaLM, layers: [3]usize) !void {
+        // EAGLE taps + the tree-verify path use f32-only kernels (opAttnDecodeTree,
+        // f32 tap snapshots); f16 KV is greedy/chain-decode only for now.
+        if (self.kv_dtype == .f16) return error.KvDtypeUnsupported;
         std.debug.assert(!self.taps_on);
         for (layers) |l| std.debug.assert(l < self.cfg.n_layers);
         self.tap_d = try self.be.tensorCreate(3 * self.capacity * self.cfg.hidden * 4);
@@ -269,6 +277,7 @@ pub const CudaLM = struct {
     /// position), grows the activation buffers to cover a full tree batch,
     /// and allocates the tree buffers. Call before any forward.
     pub fn enableTree(self: *CudaLM) !void {
+        if (self.kv_dtype == .f16) return error.KvDtypeUnsupported; // tree kernels are f32-only
         const be = self.be;
         const c = self.cfg;
         std.debug.assert(self.tree == null and self.len == 0);
@@ -306,6 +315,28 @@ pub const CudaLM = struct {
         self.tree = tb;
     }
 
+    /// Rebuild the KV cache at a new element dtype (GUI toggle), weights resident.
+    /// Drops the captured decode graph so it re-captures with the f16/f32 kernels,
+    /// frees + re-creates the K/V buffers, and resets the length. Rejected while
+    /// EAGLE taps / tree-verify are active (those are f32-only).
+    pub fn reinitCache(self: *CudaLM, dtype: kvmod.KvDtype) !void {
+        if (dtype == .f16 and (self.taps_on or self.tree != null)) return error.KvDtypeUnsupported;
+        const be = self.be;
+        const c = self.cfg;
+        if (self.graph_exec != null) {
+            be.graphDestroy(self.graph_exec);
+            self.graph_exec = null;
+        }
+        self.decode_warm = false;
+        for (self.k_cache[0..c.n_layers]) |*b| be.growableDestroy(b);
+        for (self.v_cache[0..c.n_layers]) |*b| be.growableDestroy(b);
+        self.kv_dtype = dtype;
+        self.len = 0;
+        const esz = dtype.elemBytes();
+        for (self.k_cache[0..c.n_layers]) |*b| b.* = try be.growableCreate(self.capacity * c.kvDim() * esz, self.max_capacity * c.kvDim() * esz);
+        for (self.v_cache[0..c.n_layers]) |*b| b.* = try be.growableCreate(self.capacity * c.kvDim() * esz, self.max_capacity * c.kvDim() * esz);
+    }
+
     pub fn deinit(self: *CudaLM) void {
         if (self.tree) |*tb| tb.deinit(self.be);
         if (self.taps_on) self.be.tensorDestroy(&self.tap_d);
@@ -341,7 +372,7 @@ pub const CudaLM = struct {
         if (min_rows > self.max_capacity) return error.ContextFull;
         if (self.taps_on or self.tree != null) return error.ContextFull;
         const target = kvmod.growTarget(self.capacity, min_rows, self.max_capacity);
-        const bytes = target * self.cfg.kvDim() * 4;
+        const bytes = target * self.cfg.kvDim() * self.kv_dtype.elemBytes();
         for ([2][]Growable{ self.k_cache[0..self.cfg.n_layers], self.v_cache[0..self.cfg.n_layers] }) |caches| {
             for (caches) |*b| {
                 self.be.growableEnsure(b, bytes) catch |err| switch (err) {
@@ -377,7 +408,7 @@ pub const CudaLM = struct {
         }
     }
 
-    fn stepDecodeGraph(self: *CudaLM, io: std.Io, id: u32, logits: []f32) !void {
+    fn stepDecodeGraph(self: *CudaLM, io: std.Io, id: u32, logits: ?[]f32) !void {
         const be = self.be;
         std.debug.assert(self.remaining() >= 1);
         try be.setDecodeState(id, @intCast(self.len));
@@ -397,7 +428,8 @@ pub const CudaLM = struct {
         }
         try be.graphLaunch(self.graph_exec);
         self.len += 1;
-        try be.tensorDownload(offsetBufSized(self.bufs.logits, 0, qwen3.vocab_size * 4), std.mem.sliceAsBytes(logits[0..qwen3.vocab_size]));
+        // `null` leaves logits resident for the on-device argmax (stepArgmax).
+        if (logits) |l| try be.tensorDownload(offsetBufSized(self.bufs.logits, 0, qwen3.vocab_size * 4), std.mem.sliceAsBytes(l[0..qwen3.vocab_size]));
     }
 
     fn captureDecodeGraph(self: *CudaLM) !void {
@@ -425,7 +457,8 @@ pub const CudaLM = struct {
         for (self.lm.layers, 0..) |layer, l| {
             if (self.taps_on) {
                 for (self.tap_layers, 0..) |tl, j| {
-                    if (l == tl) try be.opKvAppendS(self.tap_d, b.x, c.hidden, c.hidden, j * self.capacity * c.hidden);
+                    // Taps are f32 hidden-state snapshots (EAGLE), never the KV cache.
+                    if (l == tl) try be.opKvAppendS(self.tap_d, b.x, c.hidden, c.hidden, j * self.capacity * c.hidden, false);
                 }
             }
             try be.qkNorm(b.x, b.normed, try nbuf(be, layer.input_norm), 1, c.hidden, eps);
@@ -436,9 +469,10 @@ pub const CudaLM = struct {
             try be.qkNorm(b.k, b.k, try nbuf(be, layer.k_norm), c.n_kv_heads, hd, eps);
             try be.opRopeHalfS(b.q, self.freqs_d, c.n_heads, half, self.sin_off);
             try be.opRopeHalfS(b.k, self.freqs_d, c.n_kv_heads, half, self.sin_off);
-            try be.opKvAppendS(self.k_cache[l].buf, b.k, c.kvDim(), c.kvDim(), 0);
-            try be.opKvAppendS(self.v_cache[l].buf, b.v, c.kvDim(), c.kvDim(), 0);
-            try be.opAttnDecodeSGraph(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, c.n_heads, c.n_kv_heads, hd, nsplit, attn_scale);
+            const kv_f16 = self.kv_dtype == .f16;
+            try be.opKvAppendS(self.k_cache[l].buf, b.k, c.kvDim(), c.kvDim(), 0, kv_f16);
+            try be.opKvAppendS(self.v_cache[l].buf, b.v, c.kvDim(), c.kvDim(), 0, kv_f16);
+            try be.opAttnDecodeSGraph(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, c.n_heads, c.n_kv_heads, hd, nsplit, attn_scale, kv_f16);
             try self.linear(b.t, b.attn, layer.o, c.hidden, c.qDim(), 1);
             try be.opAdd(b.x, b.t, c.hidden);
             try be.qkNorm(b.x, b.normed, try nbuf(be, layer.post_norm), 1, c.hidden, eps);
@@ -456,15 +490,22 @@ pub const CudaLM = struct {
     /// row-major) — the speculative-decode verify forward. The batch is
     /// engine-capped at spec.max_draft + 1, which max_rows always covers.
     pub fn stepAll(self: *CudaLM, io: std.Io, ids: []const u32, logits: []f32) !void {
+        _ = io;
+        std.debug.assert(logits.len == ids.len * qwen3.vocab_size);
+        try self.forwardAll(ids);
+        try self.be.tensorDownload(offsetBufSized(self.bufs.logits, 0, ids.len * qwen3.vocab_size * 4), std.mem.sliceAsBytes(logits));
+    }
+
+    /// Batched verify forward that leaves the per-row logits resident in
+    /// b.logits ([seq][vocab] on device) and advances the cache. Shared by
+    /// stepAll (downloads them) and stepAllArgmax (argmaxes them on-device).
+    fn forwardAll(self: *CudaLM, ids: []const u32) !void {
         const be = self.be;
         const seq = ids.len;
-        std.debug.assert(logits.len == seq * qwen3.vocab_size);
         std.debug.assert(seq > 0 and seq <= spec.max_draft + 1 and seq <= self.max_rows);
         const b = &self.bufs;
-
         try self.layersForward(ids);
         errdefer if (be.batching()) be.abortBatch();
-
         // Final norm on every new position, then the tied bf16 LM head in
         // 4-input groups (each group reads the vocab x hidden weight once).
         // b.t is 128-row padded, so gemv_bf16n's 4-row reads stay in bounds.
@@ -473,9 +514,24 @@ pub const CudaLM = struct {
         try self.lmHeadAll(b.logits, b.t, seq);
         try be.endBatch();
         self.len += seq;
+    }
 
-        try be.tensorDownload(offsetBufSized(b.logits, 0, seq * qwen3.vocab_size * 4), std.mem.sliceAsBytes(logits));
+    /// stepAll's greedy twin: the verify forward, then a per-row on-device
+    /// argmax into out_ids[0..seq] — downloading `seq` ids, not seq*vocab
+    /// (~608 KB/row). For greedy speculative decoding, where acceptance only
+    /// compares each draft to the target's argmax.
+    pub fn stepAllArgmax(self: *CudaLM, io: std.Io, ids: []const u32, out_ids: []u32) !void {
         _ = io;
+        std.debug.assert(out_ids.len >= ids.len);
+        try self.forwardAll(ids);
+        const be = self.be;
+        const b = &self.bufs;
+        for (0..ids.len) |r| {
+            try be.opArgmax(offsetBufSized(b.logits, r * qwen3.vocab_size * 4, qwen3.vocab_size * 4), qwen3.vocab_size, b.argmax_out, &b.argmax_v, &b.argmax_i);
+            var idf: [1]f32 = undefined;
+            try be.tensorDownload(b.argmax_out, std.mem.sliceAsBytes(&idf));
+            out_ids[r] = @intFromFloat(idf[0]);
+        }
     }
 
     /// Roll the KV cache back to `new_len` tokens (speculative-decode
@@ -610,7 +666,7 @@ pub const CudaLM = struct {
         self.len += path.len;
     }
 
-    fn stepChunk(self: *CudaLM, io: std.Io, ids: []const u32, logits: []f32) !void {
+    fn stepChunk(self: *CudaLM, io: std.Io, ids: []const u32, logits: ?[]f32) !void {
         const be = self.be;
         const seq = ids.len;
         const b = &self.bufs;
@@ -626,8 +682,72 @@ pub const CudaLM = struct {
         try be.endBatch();
         self.len += seq;
 
-        try be.tensorDownload(offsetBufSized(b.logits, 0, qwen3.vocab_size * 4), std.mem.sliceAsBytes(logits[0..qwen3.vocab_size]));
+        // `null` leaves logits resident for the on-device argmax (stepArgmax).
+        if (logits) |l| try be.tensorDownload(offsetBufSized(b.logits, 0, qwen3.vocab_size * 4), std.mem.sliceAsBytes(l[0..qwen3.vocab_size]));
         _ = io;
+    }
+
+    /// Greedy decode without the vocab download: forward `ids`, then argmax the
+    /// last position's logits on-device and return just that token id. Mirrors
+    /// `step`'s graph/chunk dispatch. Matches sample.argmax (temperature 0).
+    pub fn stepArgmax(self: *CudaLM, io: std.Io, ids: []const u32) !u32 {
+        if (self.be.evictions != 0) self.graph_ok = false;
+        if (ids.len == 1 and self.graph_ok and !self.be.profile) {
+            if (self.decode_warm) {
+                try self.stepDecodeGraph(io, ids[0], null);
+                return self.argmaxLogits();
+            }
+            self.decode_warm = true;
+        }
+        var off: usize = 0;
+        while (off < ids.len) {
+            const n = @min(self.max_rows, ids.len - off);
+            try self.stepChunk(io, ids[off..][0..n], null);
+            off += n;
+        }
+        return self.argmaxLogits();
+    }
+
+    fn argmaxLogits(self: *CudaLM) !u32 {
+        const be = self.be;
+        const b = &self.bufs;
+        try be.opArgmax(offsetBufSized(b.logits, 0, qwen3.vocab_size * 4), qwen3.vocab_size, b.argmax_out, &b.argmax_v, &b.argmax_i);
+        var id_f: [1]f32 = undefined;
+        try be.tensorDownload(b.argmax_out, std.mem.sliceAsBytes(&id_f));
+        return @intFromFloat(id_f[0]);
+    }
+
+    /// Max candidates stepSelect can return (host buffer sizing for the engine).
+    pub fn maxSelect(self: *const CudaLM) usize {
+        _ = self;
+        return cuda.backend.topk_lanes * cuda.backend.topk_m;
+    }
+
+    /// Stochastic decode: forward `ids`, select the top-k on-device, download
+    /// just those (id,logit) pairs (a few KB vs the ~608 KB vocab). Returns the
+    /// candidate count; the engine's Sampler finishes on the CPU over this set.
+    pub fn stepSelect(self: *CudaLM, io: std.Io, ids: []const u32, out_id: []u32, out_logit: []f32) !usize {
+        if (self.be.evictions != 0) self.graph_ok = false;
+        if (ids.len == 1 and self.graph_ok and !self.be.profile and self.decode_warm) {
+            try self.stepDecodeGraph(io, ids[0], null);
+        } else {
+            if (ids.len == 1 and self.graph_ok and !self.be.profile) self.decode_warm = true;
+            var off: usize = 0;
+            while (off < ids.len) {
+                const n = @min(self.max_rows, ids.len - off);
+                try self.stepChunk(io, ids[off..][0..n], null);
+                off += n;
+            }
+        }
+        const be = self.be;
+        const b = &self.bufs;
+        const count = try be.opTopK(offsetBufSized(b.logits, 0, qwen3.vocab_size * 4), qwen3.vocab_size, &b.topk_v, &b.topk_i);
+        std.debug.assert(count <= out_id.len and count <= out_logit.len);
+        try be.tensorDownload(b.topk_v, std.mem.sliceAsBytes(out_logit[0..count]));
+        var idx_f: [cuda.backend.topk_lanes * cuda.backend.topk_m]f32 = undefined;
+        try be.tensorDownload(b.topk_i, std.mem.sliceAsBytes(idx_f[0..count]));
+        for (out_id[0..count], idx_f[0..count]) |*o, f| o.* = @intFromFloat(f);
+        return count;
     }
 
     /// The layer stack over `ids` at positions [len, len+seq): embedding
@@ -664,19 +784,31 @@ pub const CudaLM = struct {
         try self.be.ropeHalf(b.q, self.freqs_d, seq, c.n_heads, half, self.sin_off, pos0);
         try self.be.ropeHalf(b.k, self.freqs_d, seq, c.n_kv_heads, half, self.sin_off, pos0);
     }
+    /// Store `n` K/V elements from `src` (+`src_off` elems) into cache buffer
+    /// `dst` at element offset `dst_off`. f32 copies raw; f16 converts on store.
+    fn storeKv(self: *CudaLM, dst: Buf, dst_off: usize, src: Buf, src_off: usize, n: usize) !void {
+        if (self.kv_dtype == .f16) {
+            try self.be.opStoreKvF16(dst, dst_off, src, src_off, n);
+        } else {
+            try self.be.tensorCopy(dst, dst_off * 4, src, src_off * 4, n * 4);
+        }
+    }
     pub fn appendKV(self: *CudaLM, l: usize, seq: usize, pos0: usize) !void {
         const c = self.cfg;
         const b = &self.bufs;
-        try self.be.tensorCopy(self.k_cache[l].buf, pos0 * c.kvDim() * 4, b.k, 0, seq * c.kvDim() * 4);
-        try self.be.tensorCopy(self.v_cache[l].buf, pos0 * c.kvDim() * 4, b.v, 0, seq * c.kvDim() * 4);
+        try self.storeKv(self.k_cache[l].buf, pos0 * c.kvDim(), b.k, 0, seq * c.kvDim());
+        try self.storeKv(self.v_cache[l].buf, pos0 * c.kvDim(), b.v, 0, seq * c.kvDim());
     }
     pub fn attention(self: *CudaLM, l: usize, seq: usize, pos0: usize) !void {
         const c = self.cfg;
         const b = &self.bufs;
-        if (seq <= gemv_batch_max) {
+        // f16 K/V is only read by the flash-split kernels (opAttnDecode); the
+        // square `be.attn` path is f32-only, so f16 routes all prefill through
+        // opAttnDecode (correct for any seq_q, just less parallel for big batches).
+        if (self.kv_dtype == .f16 or seq <= gemv_batch_max) {
             // Batched flash-decoding: the naive square kernel has too little
             // parallelism for a handful of queries.
-            try self.be.opAttnDecode(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, pos0 + 1, seq, c.n_heads, c.n_kv_heads, hd, nsplit, attn_scale, 0);
+            try self.be.opAttnDecode(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, pos0 + 1, seq, c.n_heads, c.n_kv_heads, hd, nsplit, attn_scale, 0, 0, self.kv_dtype == .f16);
         } else {
             try self.be.attn(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, seq, pos0 + seq, c.n_heads, c.n_kv_heads, hd, attn_scale, true);
         }
@@ -948,6 +1080,11 @@ const LmBufs = struct {
     t: Buf,
     attn_scratch: Buf,
     logits: Buf,
+    argmax_v: Buf,
+    argmax_i: Buf,
+    argmax_out: Buf,
+    topk_v: Buf,
+    topk_i: Buf,
 
     fn init(be: *Backend, rows: usize, c: qwen3.Config) !LmBufs {
         const rp = std.mem.alignForward(usize, rows, 128); // GEMM outputs are 128-row padded
@@ -969,6 +1106,11 @@ const LmBufs = struct {
             rp * c.hidden * 4, // t
             CudaLM.gemv_batch_max * c.n_heads * CudaLM.nsplit * (hd + 4) * 4, // attn_scratch (a row per verify query)
             (spec.max_draft + 1) * qwen3.vocab_size * 4, // logits (verify writes a row per position)
+            4096 * 4, // argmax_v (>= opArgmax lane count)
+            4096 * 4, // argmax_i
+            4, // argmax_out (1 id)
+            cuda.backend.topk_lanes * cuda.backend.topk_m * 4, // topk_v
+            cuda.backend.topk_lanes * cuda.backend.topk_m * 4, // topk_i
         };
         inline for (fields, sizes) |name, size| {
             @field(self, name) = try be.tensorCreate(size);
@@ -982,7 +1124,7 @@ const LmBufs = struct {
         self.* = undefined;
     }
 
-    const fields = [_][]const u8{ "x", "normed", "q", "k", "v", "attn", "gate", "up", "t", "attn_scratch", "logits" };
+    const fields = [_][]const u8{ "x", "normed", "q", "k", "v", "attn", "gate", "up", "t", "attn_scratch", "logits", "argmax_v", "argmax_i", "argmax_out", "topk_v", "topk_i" };
 };
 
 /// Tree-verify buffers (CudaLM.enableTree): node positions, the tree

@@ -190,6 +190,17 @@ pub fn encode(enc: *const qwen3.TextEncoder, ctx: *gpu.Context, io: std.Io, gpa:
     return out;
 }
 
+/// Map a weight's storage dtype to the dense-GEMV weight code. Only fp8 / bf16
+/// / f32 reach the Vulkan GEMV path (qwen3 rejects block-quant on vulkan); bf16
+/// is read natively (no widening) via the 2-byte transpose + GEMV bf16 branch.
+fn wcode(dt: @import("../dtype.zig").DType) gpu.WCode {
+    return switch (dt) {
+        .f8_e4m3 => .f8,
+        .bf16 => .bf16,
+        else => .f32,
+    };
+}
+
 fn gemm(ctx: *gpu.Context, coop: bool, y: Buf, x: Buf, m: usize, m_pad: usize, w: ops.matmul.Weight) !void {
     if (coop) {
         try ctx.opMatmulCoop(y, x, m, m_pad, w.bytes, w.rows, w.cols, w.scale);
@@ -427,7 +438,7 @@ pub const VulkanLM = struct {
             ctx.independent(vocab_chunks);
             for (0..vocab_chunks) |ci| {
                 const w = self.embed_f32[ci * chunk_rows * hidden ..][0 .. chunk_rows * hidden];
-                try ctx.opGemvPartial4(b.normed, g * 4 * hidden, b.gemv_partials[ci], std.mem.sliceAsBytes(w), false, chunk_rows, hidden, gemv_nchunk);
+                try ctx.opGemvPartial4(b.normed, g * 4 * hidden, b.gemv_partials[ci], std.mem.sliceAsBytes(w), .f32, chunk_rows, hidden, gemv_nchunk);
             }
             ctx.independent(vocab_chunks);
             for (0..vocab_chunks) |ci| {
@@ -447,7 +458,7 @@ pub const VulkanLM = struct {
         self.len = new_len;
     }
 
-    fn stepChunk(self: *VulkanLM, io: std.Io, ids: []const u32, logits: []f32) !void {
+    fn stepChunk(self: *VulkanLM, io: std.Io, ids: []const u32, logits: ?[]f32) !void {
         _ = io;
         const ctx = self.ctx;
         const seq = ids.len;
@@ -466,7 +477,7 @@ pub const VulkanLM = struct {
         ctx.independent(vocab_chunks);
         for (0..vocab_chunks) |ci| {
             const w = self.embed_f32[ci * chunk_rows * hidden ..][0 .. chunk_rows * hidden];
-            try ctx.opGemvPartial(b.normed, b.gemv_partials[ci], std.mem.sliceAsBytes(w), false, chunk_rows, hidden, gemv_nchunk);
+            try ctx.opGemvPartial(b.normed, b.gemv_partials[ci], std.mem.sliceAsBytes(w), .f32, chunk_rows, hidden, gemv_nchunk);
         }
         ctx.independent(vocab_chunks);
         for (0..vocab_chunks) |ci| {
@@ -475,7 +486,61 @@ pub const VulkanLM = struct {
         try ctx.endBatch();
         self.len += seq;
 
-        try ctx.tensorDownload(b.logits, std.mem.sliceAsBytes(logits[0..qwen3.vocab_size]));
+        // `null` leaves the last position's logits resident (stepArgmax runs the
+        // device argmax on them instead of paying the ~608 KB vocab download).
+        if (logits) |l| try ctx.tensorDownload(b.logits, std.mem.sliceAsBytes(l[0..qwen3.vocab_size]));
+    }
+
+    /// Greedy decode without the vocab download: forward `ids`, then argmax the
+    /// last position's logits on-device and return just that token id. Matches
+    /// sample.argmax (temperature 0). The engine uses this for the greedy path.
+    pub fn stepArgmax(self: *VulkanLM, io: std.Io, ids: []const u32) !u32 {
+        var off: usize = 0;
+        while (off < ids.len) {
+            const n = if (self.len == 0)
+                @min(self.max_rows, ids.len - off)
+            else
+                @min(gemv_batch_max, ids.len - off);
+            try self.stepChunk(io, ids[off..][0..n], null);
+            off += n;
+        }
+        const ctx = self.ctx;
+        const b = &self.bufs;
+        try ctx.opArgmax(b.logits, qwen3.vocab_size, b.argmax_out, &b.argmax_v, &b.argmax_i);
+        var id_f: [1]f32 = undefined;
+        try ctx.tensorDownload(b.argmax_out, std.mem.sliceAsBytes(&id_f));
+        return @intFromFloat(id_f[0]);
+    }
+
+    /// Max candidates stepSelect can return (host buffer sizing for the engine).
+    pub fn maxSelect(self: *const VulkanLM) usize {
+        _ = self;
+        return gpu.topk_lanes * gpu.topk_m;
+    }
+
+    /// Stochastic decode: forward `ids`, select the top-k candidates on-device,
+    /// and download just those (id,logit) pairs into out_id/out_logit (a few KB
+    /// vs the ~608 KB vocab). Returns the candidate count; the engine's Sampler
+    /// finishes (softmax/top-p/RNG) on the CPU over this small set.
+    pub fn stepSelect(self: *VulkanLM, io: std.Io, ids: []const u32, out_id: []u32, out_logit: []f32) !usize {
+        var off: usize = 0;
+        while (off < ids.len) {
+            const n = if (self.len == 0)
+                @min(self.max_rows, ids.len - off)
+            else
+                @min(gemv_batch_max, ids.len - off);
+            try self.stepChunk(io, ids[off..][0..n], null);
+            off += n;
+        }
+        const ctx = self.ctx;
+        const b = &self.bufs;
+        const count = try ctx.opTopK(b.logits, qwen3.vocab_size, &b.topk_v, &b.topk_i);
+        std.debug.assert(count <= out_id.len and count <= out_logit.len);
+        try ctx.tensorDownload(b.topk_v, std.mem.sliceAsBytes(out_logit[0..count]));
+        var idx_f: [gpu.topk_lanes * gpu.topk_m]f32 = undefined;
+        try ctx.tensorDownload(b.topk_i, std.mem.sliceAsBytes(idx_f[0..count]));
+        for (out_id[0..count], idx_f[0..count]) |*o, f| o.* = @intFromFloat(f);
+        return count;
     }
 
     /// The 36-layer stack over `ids` at positions [len, len+seq): embedding
@@ -522,9 +587,9 @@ pub const VulkanLM = struct {
             // Group the q/k/v GEMV halves so no barrier drains the GPU between
             // independent dispatches.
             ctx.independent(3);
-            try ctx.opGemvPartial(b.normed, b.gemv_partials[0], layer.q.bytes, layer.q.dtype == .f8_e4m3, q_dim, hidden, gemv_nchunk);
-            try ctx.opGemvPartial(b.normed, b.gemv_partials[1], layer.k.bytes, layer.k.dtype == .f8_e4m3, kv_dim, hidden, gemv_nchunk);
-            try ctx.opGemvPartial(b.normed, b.gemv_partials[2], layer.v.bytes, layer.v.dtype == .f8_e4m3, kv_dim, hidden, gemv_nchunk);
+            try ctx.opGemvPartial(b.normed, b.gemv_partials[0], layer.q.bytes, wcode(layer.q.dtype), q_dim, hidden, gemv_nchunk);
+            try ctx.opGemvPartial(b.normed, b.gemv_partials[1], layer.k.bytes, wcode(layer.k.dtype), kv_dim, hidden, gemv_nchunk);
+            try ctx.opGemvPartial(b.normed, b.gemv_partials[2], layer.v.bytes, wcode(layer.v.dtype), kv_dim, hidden, gemv_nchunk);
             ctx.independent(3);
             try ctx.opGemvCombine(b.q, 0, b.gemv_partials[0], q_dim, layer.q.scale, gemv_nchunk);
             try ctx.opGemvCombine(b.k, 0, b.gemv_partials[1], kv_dim, layer.k.scale, gemv_nchunk);
@@ -657,8 +722,8 @@ pub const VulkanLM = struct {
         const b = &self.bufs;
         if (seq == 1) {
             ctx.independent(2);
-            try ctx.opGemvPartial(b.normed, b.gemv_partials[0], layer.gate.bytes, layer.gate.dtype == .f8_e4m3, intermediate, hidden, gemv_nchunk);
-            try ctx.opGemvPartial(b.normed, b.gemv_partials[1], layer.up.bytes, layer.up.dtype == .f8_e4m3, intermediate, hidden, gemv_nchunk);
+            try ctx.opGemvPartial(b.normed, b.gemv_partials[0], layer.gate.bytes, wcode(layer.gate.dtype), intermediate, hidden, gemv_nchunk);
+            try ctx.opGemvPartial(b.normed, b.gemv_partials[1], layer.up.bytes, wcode(layer.up.dtype), intermediate, hidden, gemv_nchunk);
             ctx.independent(2);
             try ctx.opGemvCombine(b.gate, 0, b.gemv_partials[0], intermediate, layer.gate.scale, gemv_nchunk);
             try ctx.opGemvCombine(b.up, 0, b.gemv_partials[1], intermediate, layer.up.scale, gemv_nchunk);
@@ -683,20 +748,23 @@ pub const VulkanLM = struct {
     /// Dense linear over `m` rows, kernel picked by batch size: k-split GEMV
     /// (m = 1), grouped 4-input GEMVs (small batches — speculative verify
     /// and follow-up prefill chunks; bitwise equal to the m = 1 path), or
-    /// the tiled GEMM (large fresh prefills).
+    /// the tiled GEMM (large fresh prefills). bf16 weights have no tiled GEMM
+    /// (only fp8/f32), so bf16 always streams through the grouped GEMV — the
+    /// weight is read ceil(m/4)x, matching CUDA's bf16 opGemvBf16N.
     fn gemm(self: *VulkanLM, y: Buf, x: Buf, m: usize, w: ops.matmul.Weight, rows: usize, cols: usize) !void {
         const ctx = self.ctx;
+        const wc = wcode(w.dtype);
         if (m == 1) {
-            try ctx.opGemv(y, 0, x, self.bufs.gemv_partials[0], w.bytes, w.dtype == .f8_e4m3, rows, cols, w.scale, gemv_nchunk);
-        } else if (m <= gemv_batch_max) {
+            try ctx.opGemv(y, 0, x, self.bufs.gemv_partials[0], w.bytes, wc, rows, cols, w.scale, gemv_nchunk);
+        } else if (wc == .bf16 or m <= gemv_batch_max) {
             var g: usize = 0;
             while (g * 4 < m) : (g += 1) {
                 const n: usize = @min(4, m - g * 4);
-                try ctx.opGemvPartial4(x, g * 4 * cols, self.bufs.gemv_partials[0], w.bytes, w.dtype == .f8_e4m3, rows, cols, gemv_nchunk);
+                try ctx.opGemvPartial4(x, g * 4 * cols, self.bufs.gemv_partials[0], w.bytes, wc, rows, cols, gemv_nchunk);
                 try ctx.opGemvCombine4(y, g * 4 * rows, rows, self.bufs.gemv_partials[0], rows, w.scale, gemv_nchunk, n);
             }
         } else {
-            try ctx.opMatmul(y, 0, x, 0, m, w.bytes, w.dtype == .f8_e4m3, rows, cols, w.scale, null);
+            try ctx.opMatmul(y, 0, x, 0, m, w.bytes, wc == .f8, rows, cols, w.scale, null);
         }
     }
 
@@ -740,6 +808,13 @@ const LmBufs = struct {
     rms_inv: Buf,
     gemv_partials: [4]Buf,
     logits: Buf,
+    // GPU-argmax scratch (opArgmax): per-lane max value + index, and the 1-id out.
+    argmax_v: Buf,
+    argmax_i: Buf,
+    argmax_out: Buf,
+    // GPU top-k scratch (opTopK): per-lane top-M values + indices.
+    topk_v: Buf,
+    topk_i: Buf,
 
     fn init(ctx: *gpu.Context, rows: usize) !LmBufs {
         var self: LmBufs = undefined;
@@ -765,6 +840,11 @@ const LmBufs = struct {
             rows * VulkanLM.rms_chunks * 4, // rms_partials
             rows * 4, // rms_inv
             VulkanLM.gemv_batch_max * qwen3.vocab_size * 4, // logits (verify writes a row per position)
+            4096 * 4, // argmax_v (>= opArgmax lane count)
+            4096 * 4, // argmax_i
+            4, // argmax_out (1 id)
+            gpu.topk_lanes * gpu.topk_m * 4, // topk_v
+            gpu.topk_lanes * gpu.topk_m * 4, // topk_i
         };
         inline for (fields, sizes) |name, size| {
             @field(self, name) = try ctx.tensorCreate(size);
@@ -788,7 +868,7 @@ const LmBufs = struct {
         self.* = undefined;
     }
 
-    const fields = [_][]const u8{ "x", "normed", "q", "k", "v", "qt", "kt", "s", "attn", "gate", "up", "t", "attn_scratch", "rms_partials", "rms_inv", "logits" };
+    const fields = [_][]const u8{ "x", "normed", "q", "k", "v", "qt", "kt", "s", "attn", "gate", "up", "t", "attn_scratch", "rms_partials", "rms_inv", "logits", "argmax_v", "argmax_i", "argmax_out", "topk_v", "topk_i" };
 };
 
 // Parity against the CPU encode (same weights, same fixture prompt); gated on
@@ -883,4 +963,76 @@ test "vulkan spec decode matches vanilla greedy" {
         _ = try engine.generate(&model, &tok, io, gpa, &ids_spec, opts, null);
     }
     try std.testing.expectEqualSlices(u32, ids_vanilla.items, ids_spec.items);
+}
+
+// Regression for the bf16-generation bug: the Vulkan dense matmul / decode-GEMV
+// kernels used to handle only 1-byte (fp8) and 4-byte (f32) weights, so a bf16
+// checkpoint's 2-byte weights were read as f32 and generation produced garbage.
+// bf16 is now read natively (2-byte transpose `transpose_bf16` + a bf16 branch
+// in gemv_partial/gemv_partial4, weight code `WCode.bf16`). The pre-existing
+// spec test above uses the *fp8* encoder checkpoint and only compares
+// Vulkan-to-Vulkan, so it never exercised the bf16 path — hence a bf16 model AND
+// a comparison against the CPU reference here. Compares the prefill's next-token
+// argmax (the crisp signal: garbage diverged at token 1; bf16-GEMV-vs-CPU
+// reduction-order drift can diverge multi-token decode, so we don't chase full
+// token-identity on this correctness-first path).
+test "vulkan bf16 prefill argmax matches cpu" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const tokenizer_mod = @import("../tokenizer.zig");
+    const chat = @import("../llm/chat.zig");
+    const engine = @import("../llm/engine.zig");
+    const path = "models/text_encoders/qwen3_4b_instruct.safetensors";
+    std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
+
+    var ctx = gpu.Context.init(gpa) catch return error.SkipZigTest;
+    defer ctx.deinit();
+
+    var tok = try tokenizer_mod.Tokenizer.init(gpa);
+    defer tok.deinit();
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(gpa);
+    try chat.appendUser(&tok, gpa, "The capital of France is", &ids);
+    try chat.openAssistant(&tok, gpa, &ids);
+
+    const opts: engine.Options = .{ .max_new_tokens = 1, .sampling = .{ .temperature = 0 } };
+
+    const argmaxOf = struct {
+        fn f(logits: []const f32) usize {
+            var best: usize = 0;
+            for (logits, 0..) |v, i| if (v > logits[best]) {
+                best = i;
+            };
+            return best;
+        }
+    }.f;
+
+    const cpu_logits = try gpa.alloc(f32, qwen3.vocab_size);
+    defer gpa.free(cpu_logits);
+    const vk_logits = try gpa.alloc(f32, qwen3.vocab_size);
+    defer gpa.free(vk_logits);
+
+    // CPU reference: native bf16 forward.
+    {
+        var st = try safetensors.SafeTensors.open(gpa, io, path);
+        defer st.deinit();
+        var lm = try qwen3.CausalLM.load(gpa, .{ .safetensors = &st });
+        defer lm.deinit();
+        var model = try engine.CpuModel.init(gpa, &lm, try engine.capacityPlanFor(opts, ids.items.len));
+        defer model.deinit();
+        try model.step(io, ids.items, cpu_logits);
+    }
+    // Vulkan: native bf16 weights (the fix). Read as f32 before, this was garbage.
+    {
+        var st = try safetensors.SafeTensors.open(gpa, io, path);
+        defer st.deinit();
+        var lm = try qwen3.CausalLM.load(gpa, .{ .safetensors = &st });
+        defer lm.deinit();
+        var model = try VulkanLM.init(gpa, ctx, &lm, try engine.capacityFor(opts, ids.items.len), ids.items.len);
+        defer model.deinit();
+        try model.step(io, ids.items, vk_logits);
+    }
+
+    try std.testing.expectEqual(argmaxOf(cpu_logits), argmaxOf(vk_logits));
 }

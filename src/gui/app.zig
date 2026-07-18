@@ -861,11 +861,16 @@ fn applyConfig() void {
 
     const llm_reload = !g_config.llmReloadEql(&g_config_baseline) or
         (g_config.diffEnabled() != g_config_baseline.diffEnabled()); // tool prompt changes
+    // A KV-dtype change needs only a CONTEXT rebuild (weights stay resident),
+    // never the full weight reload above.
+    const ctx_reload = !g_config.ctxReloadEql(&g_config_baseline);
     if (g_session != null) {
         if (llm_reload) {
             g_reload_requested = true; // transcript-preserving (see loaderMain)
         } else if (!g_loading.load(.acquire)) {
             g_session.?.updateSettings(&g_config); // reasoning / VRAM priority, live
+            if (ctx_reload) g_session.?.rebuildContext(toKvDtype(g_config.kv_dtype)) catch |err|
+                std.log.err("kv-dtype context rebuild failed: {t}", .{err});
         }
     }
     // If no session is loaded yet (lazy), the new config is used at first chat.
@@ -1041,8 +1046,19 @@ fn buildSession(arena: std.mem.Allocator) !*chat.Session {
         .vram_split = g_config.vram_split,
         .vram_limit_frac = g_config.vram_limit_frac,
         .reasoning = g_config.reasoning,
+        .kv_dtype = toKvDtype(g_config.kv_dtype),
     });
     return s;
+}
+
+/// Map the GUI's local KV-dtype enum onto the library's `kv_cache.KvDtype`
+/// (config.zig stays free of a TensorPencil import). Same field names, explicit
+/// so adding a variant is a compile error until both sides agree.
+fn toKvDtype(d: config.KvDtype) tp.llm.kv_cache.KvDtype {
+    return switch (d) {
+        .f32 => .f32,
+        .f16 => .f16,
+    };
 }
 
 fn renderMessages(s: ?*chat.Session, list_h: f32, loading: bool) void {

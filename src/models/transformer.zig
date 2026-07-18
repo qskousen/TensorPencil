@@ -165,6 +165,8 @@ pub fn layerForward(
             .causal = true,
             .scale = spec.attn_scale,
             .window = dims.sliding_window,
+            // LOCAL ring layers store row = pos%ring; kView returns the ring block.
+            .ring = cache.ringOf(l),
         });
     } else {
         try ops.attention.attention(io, gpa, attn_out, qkv.q, qkv.k, qkv.v, .{
@@ -358,7 +360,7 @@ fn freshVsCachedEquiv(comptime spec: LayerSpec, dims: Dims, n_layers: usize) !vo
     }
 
     // Cached: feed tokens one at a time into a KV cache.
-    var cache = try kv_cache.KvCache.init(gpa, n_layers, seq + 2, kv_dim);
+    var cache = try kv_cache.KvCache.init(gpa, n_layers, seq + 2, kv_dim, .f32);
     defer cache.deinit(gpa);
     const xt = try a.alloc(f32, hidden);
     const last = try a.alloc(f32, hidden);

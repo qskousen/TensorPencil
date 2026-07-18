@@ -392,7 +392,7 @@ pub const CausalLM = struct {
         gpa: std.mem.Allocator,
         ids: []const u32,
         parents: []const u32,
-        cache: *const KvCache,
+        cache: *KvCache, // non-const: kView expands into the cache's f16 scratch
         freqs: ops.rope.Freqs,
         tree_k: []f32,
         tree_v: []f32,

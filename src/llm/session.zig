@@ -101,6 +101,26 @@ pub fn printCudaProfile(stdout: *std.Io.Writer, be: *const cuda.Backend) !void {
 /// `--backend` CLI values.
 pub const BackendKind = enum { cpu, @"zig-cuda", cuda, vulkan };
 
+/// Whether a backend has a working KV cache path for `dt`. f32 is always
+/// supported; f16 is enabled per-backend as its attention/append kernels land
+/// (CUDA = Phase 1, Vulkan = Phase 2, CPU = Phase 3). The CLI and GUI both
+/// gate on this so a mis-set dtype fails cleanly instead of corrupting.
+pub fn kvDtypeSupported(backend: BackendKind, dt: kv_cache.KvDtype) bool {
+    if (dt == .f32) return true;
+    return switch (backend) {
+        // CUDA: f16 attention/append kernels landed (Phase 1). Per-model init
+        // still rejects f16 for archs whose kernels aren't wired yet (only
+        // gemma4 so far) via error.KvDtypeUnsupported.
+        .cuda, .@"zig-cuda" => true,
+        // Vulkan: f16 on gemma3/qwen35 (hd256, attn_dsplit_gemma_f16). qwen3
+        // Vulkan rejects f16 in its builder (hd128 path, broken gen).
+        .vulkan => true,
+        // CPU: f16 packs 2/f32-slot in KvCache/PerLayerKvCache, expanded on read
+        // (Phase 3). All CPU archs (qwen3/qwen35/gemma3/gemma4) support it.
+        .cpu => true,
+    };
+}
+
 /// Device handles a `run` may need: `cu_be` for the CUDA arms, `vk_ctx` for the
 /// Vulkan arm; the CPU arm needs neither.
 pub const Devices = struct {
@@ -189,6 +209,10 @@ pub fn run(
     vram_budget: u64,
     stdout: *std.Io.Writer,
 ) !RunResult {
+    if (!kvDtypeSupported(backend, cap.kv_dtype)) {
+        try stdout.print("--kv-dtype {s} is not supported on the {s} backend yet\n", .{ cap.kv_dtype.label(), @tagName(backend) });
+        return error.KvDtypeUnsupported;
+    }
     switch (backend) {
         .cpu => {
             if (vram_budget != 0) try stdout.writeAll("[--vram-budget ignored on the cpu backend]\n");

@@ -26,6 +26,11 @@ pub const Params = struct {
     /// causal). When > 0 (and causal), query at absolute position p attends
     /// only keys in [p - window + 1, p]. Requires causal.
     window: usize = 0,
+    /// Ring-buffer KV storage (gemma3/gemma4 LOCAL layers, TODO lever 1): 0 =
+    /// linear (row = absolute position). When > 0, key/value for absolute
+    /// position j lives at row `j % ring`, so k/v hold `ring` rows instead of
+    /// `seq_kv`. Scores/positions stay absolute; only the K/V data row wraps.
+    ring: usize = 0,
 };
 
 pub const Error = error{OutOfMemory} || std.Io.Cancelable;
@@ -42,9 +47,11 @@ pub fn attention(
     p: Params,
 ) Error!void {
     const hd = p.head_dim;
+    // Ring layers store `ring` rows instead of the full seq_kv (row = pos%ring).
+    const kv_rows = if (p.ring != 0) p.ring else p.seq_kv;
     std.debug.assert(q.len == p.seq_q * p.n_heads * hd);
-    std.debug.assert(k.len == p.seq_kv * p.n_kv_heads * hd);
-    std.debug.assert(v.len == p.seq_kv * p.n_kv_heads * hd);
+    std.debug.assert(k.len == kv_rows * p.n_kv_heads * hd);
+    std.debug.assert(v.len == kv_rows * p.n_kv_heads * hd);
     std.debug.assert(out.len == q.len);
     std.debug.assert(p.n_heads % p.n_kv_heads == 0);
     if (p.causal) std.debug.assert(p.seq_q <= p.seq_kv);
@@ -111,7 +118,8 @@ fn headTask(
                 scores[j] = -std.math.inf(f32);
                 continue;
             };
-            const krow = k[j * kv_stride + h_kv * hd ..][0..hd];
+            const jr = if (p.ring != 0) j % p.ring else j;
+            const krow = k[jr * kv_stride + h_kv * hd ..][0..hd];
             const s = dot(qrow, krow) * scale;
             scores[j] = s;
             max_score = @max(max_score, s);
@@ -143,7 +151,8 @@ fn headTask(
         for (kv_start..kv_end) |j| {
             const weight = scores[j] * inv;
             if (weight == 0) continue;
-            const vrow = v[j * kv_stride + h_kv * hd ..][0..hd];
+            const jr = if (p.ring != 0) j % p.ring else j;
+            const vrow = v[jr * kv_stride + h_kv * hd ..][0..hd];
             for (orow, vrow) |*o, vv| o.* += weight * vv;
         }
     }

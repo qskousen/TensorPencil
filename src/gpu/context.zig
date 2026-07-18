@@ -57,6 +57,24 @@ const tr_wg_y = 4;
 const tile_m = 8;
 const tile_n = 8;
 
+/// Dense-GEMV weight storage dtype. The integer values are the `u4` dtype flag
+/// the gemv_partial / gemv_partial4 kernels branch on; `esize()` is the
+/// per-element byte count weightBuffer transposes with (and picks the matching
+/// transpose pipeline: 1→f8, 2→bf16, 4→f32).
+pub const WCode = enum(u32) {
+    f32 = 0,
+    f8 = 1,
+    bf16 = 2,
+
+    pub fn esize(self: WCode) u64 {
+        return switch (self) {
+            .f8 => 1,
+            .bf16 => 2,
+            .f32 => 4,
+        };
+    }
+};
+
 const Push = extern struct {
     m: u32,
     rows: u32,
@@ -66,8 +84,15 @@ const Push = extern struct {
     scale: f32,
 };
 
+/// GPU top-k selection (opTopK): `topk_lanes` lanes each keep their `topk_m`
+/// highest candidates, so the host does exact top-k over topk_lanes*topk_m
+/// downloaded pairs. `topk_m` MUST match kernels/eltwise.zig. Exact in practice
+/// for the sampler's k (<= 512): far more slots than any lane can plausibly own.
+pub const topk_m = 8;
+pub const topk_lanes = 1024;
+
 /// Eltwise/attention kernels and their workgroup shapes (kernels/eltwise.zig).
-pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, rope_qwen35, attn_decode_q35, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad };
+pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, rope_qwen35, attn_decode_q35, attn_dsplit_gemma, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, attn_dsplit_gemma_f16, kv_store_f16 };
 const elt_entry_sizes = [_]EntrySize{
     .{ .name = "rmsnorm", .x = 64, .y = 1 },
     .{ .name = "rms_partial", .x = 256, .y = 1 },
@@ -128,6 +153,7 @@ const elt_entry_sizes = [_]EntrySize{
     .{ .name = "gdn_delta_step", .x = 16, .y = 1 },
     .{ .name = "rope_qwen35", .x = 256, .y = 1 },
     .{ .name = "attn_decode_q35", .x = 16, .y = 1 },
+    .{ .name = "attn_dsplit_gemma", .x = 256, .y = 1 },
     .{ .name = "gemv_q6_k_t", .x = 256, .y = 1 },
     .{ .name = "gemv_q8_0_t", .x = 256, .y = 1 },
     .{ .name = "gemv_q4_k_t", .x = 256, .y = 1 },
@@ -137,6 +163,13 @@ const elt_entry_sizes = [_]EntrySize{
     .{ .name = "layernorm", .x = 64, .y = 1 },
     .{ .name = "attn_full", .x = 64, .y = 1 },
     .{ .name = "f32_to_bf16_pad", .x = 256, .y = 1 },
+    .{ .name = "relu", .x = 256, .y = 1 },
+    .{ .name = "add_relu", .x = 256, .y = 1 },
+    .{ .name = "argmax_reduce", .x = 256, .y = 1 },
+    .{ .name = "argmax_final", .x = 64, .y = 1 },
+    .{ .name = "topk_reduce", .x = 256, .y = 1 },
+    .{ .name = "attn_dsplit_gemma_f16", .x = 256, .y = 1 },
+    .{ .name = "kv_store_f16", .x = 256, .y = 1 },
 };
 
 /// Push block shared by all eltwise entries; meaning per entry (see kernels).
@@ -414,6 +447,7 @@ pub const Context = struct {
     shader_tr: vk.ShaderModule,
     pipe_tr_f8: vk.Pipeline,
     pipe_tr_f32: vk.Pipeline,
+    pipe_tr_bf16: vk.Pipeline, // bf16 weight -> bf16 k-major dense-GEMV layout (2 cols/u32)
     pipe_tr_bf16w: vk.Pipeline, // bf16 weight -> f16 k-major coop layout (GPU convert, fallback)
     pipe_tr_bf16raw: vk.Pipeline, // bf16 weight -> bf16 k-major coop layout (native, no convert)
     pipeline_layout_e: vk.PipelineLayout,
@@ -827,6 +861,7 @@ pub const Context = struct {
         try createKernelModule(gpa, &d, device, transpose_spv, &.{
             .{ .name = "transpose_f8", .x = tr_wg_x, .y = tr_wg_y },
             .{ .name = "transpose_f32", .x = tr_wg_x, .y = tr_wg_y },
+            .{ .name = "transpose_bf16", .x = tr_wg_x, .y = tr_wg_y },
             .{ .name = "bf16_to_f16_coopw", .x = tr_wg_x, .y = tr_wg_y },
             .{ .name = "bf16_coopw", .x = tr_wg_x, .y = tr_wg_y },
         }, &shader_tr);
@@ -914,11 +949,12 @@ pub const Context = struct {
             }, null, &pipeline_layout_tr));
         }
         errdefer d.DestroyPipelineLayout(device, pipeline_layout_tr, null);
-        var pipes_tr: [4]vk.Pipeline = @splat(.null_handle);
+        var pipes_tr: [5]vk.Pipeline = @splat(.null_handle);
         {
-            const infos = [4]vk.ComputePipelineCreateInfo{
+            const infos = [5]vk.ComputePipelineCreateInfo{
                 .{ .stage = .{ .module = shader_tr, .p_name = "transpose_f8" }, .layout = pipeline_layout_tr },
                 .{ .stage = .{ .module = shader_tr, .p_name = "transpose_f32" }, .layout = pipeline_layout_tr },
+                .{ .stage = .{ .module = shader_tr, .p_name = "transpose_bf16" }, .layout = pipeline_layout_tr },
                 .{ .stage = .{ .module = shader_tr, .p_name = "bf16_to_f16_coopw" }, .layout = pipeline_layout_tr },
                 .{ .stage = .{ .module = shader_tr, .p_name = "bf16_coopw" }, .layout = pipeline_layout_tr },
             };
@@ -1245,8 +1281,9 @@ pub const Context = struct {
             .shader_tr = shader_tr,
             .pipe_tr_f8 = pipes_tr[0],
             .pipe_tr_f32 = pipes_tr[1],
-            .pipe_tr_bf16w = pipes_tr[2],
-            .pipe_tr_bf16raw = pipes_tr[3],
+            .pipe_tr_bf16 = pipes_tr[2],
+            .pipe_tr_bf16w = pipes_tr[3],
+            .pipe_tr_bf16raw = pipes_tr[4],
             .pipeline_layout_e = pipeline_layout_e,
             .shader_e = shader_e,
             .pipes_e = pipes_e,
@@ -1320,6 +1357,7 @@ pub const Context = struct {
         self.d.DestroyDescriptorPool(self.device, self.desc_pool, null);
         self.d.DestroyPipeline(self.device, self.pipe_f8, null);
         self.d.DestroyPipeline(self.device, self.pipe_f32, null);
+        self.d.DestroyPipeline(self.device, self.pipe_tr_bf16, null);
         self.d.DestroyPipeline(self.device, self.pipe_tr_bf16w, null);
         self.d.DestroyPipeline(self.device, self.pipe_tr_bf16raw, null);
         self.d.DestroyPipeline(self.device, self.pipe_tr_f8, null);
@@ -1570,10 +1608,19 @@ pub const Context = struct {
                 .cols = @intCast(cols),
                 .stride = @intCast(stride),
             };
-            // f8: one u32 (4 cols) per invocation in x; f32: one element.
-            const x_items: u64 = if (esize == 1) stride / 4 else stride;
+            // f8: one u32 (4 cols) per invocation in x; bf16: 2 cols; f32: 1.
+            const x_items: u64 = switch (esize) {
+                1 => stride / 4,
+                2 => stride / 2,
+                else => stride,
+            };
+            const tr_pipe = switch (esize) {
+                1 => self.pipe_tr_f8,
+                2 => self.pipe_tr_bf16,
+                else => self.pipe_tr_f32,
+            };
             try self.beginCmdBuf(cb);
-            self.d.CmdBindPipeline(cb, .compute, if (esize == 1) self.pipe_tr_f8 else self.pipe_tr_f32);
+            self.d.CmdBindPipeline(cb, .compute, tr_pipe);
             self.d.CmdBindDescriptorSets(cb, .compute, self.pipeline_layout_tr, 0, 1, @ptrCast(&self.desc_set_tr), 0, null);
             self.d.CmdPushConstants(cb, self.pipeline_layout_tr, vk.ShaderStage.compute, 0, @sizeOf(TransposePush), &push);
             self.d.CmdDispatch(
@@ -1909,13 +1956,13 @@ pub const Context = struct {
         x: DeviceBuffer,
         partials: DeviceBuffer,
         w_bytes: []const u8,
-        dtype_f8: bool,
+        wcode: WCode,
         rows: usize,
         cols: usize,
         scale: f32,
         nchunk: usize,
     ) Error!void {
-        try self.opGemvPartial(x, partials, w_bytes, dtype_f8, rows, cols, nchunk);
+        try self.opGemvPartial(x, partials, w_bytes, wcode, rows, cols, nchunk);
         try self.opGemvCombine(y, y_off_elems, partials, rows, scale, nchunk);
     }
 
@@ -1927,20 +1974,20 @@ pub const Context = struct {
         x: DeviceBuffer,
         partials: DeviceBuffer,
         w_bytes: []const u8,
-        dtype_f8: bool,
+        wcode: WCode,
         rows: usize,
         cols: usize,
         nchunk: usize,
     ) Error!void {
         std.debug.assert(rows % 4 == 0);
-        const w_buf = try self.weightBuffer(w_bytes, if (dtype_f8) 1 else 4, rows, cols);
+        const w_buf = try self.weightBuffer(w_bytes, wcode.esize(), rows, cols);
         const w_db: DeviceBuffer = .{ .buf = w_buf, .mem = .null_handle, .size = 0 };
         try self.opElt(.gemv_partial, w_db, x, null, partials, .{
             .u0 = @intCast((rows / 4) * nchunk),
             .u1 = @intCast(cols),
             .u2 = @intCast(nchunk),
             .u3 = @intCast(std.mem.alignForward(usize, rows, tile_n)),
-            .u4 = @intFromBool(dtype_f8),
+            .u4 = @intFromEnum(wcode),
             .u5 = @intCast(rows),
         }, (rows / 4) * nchunk, 1, 1);
     }
@@ -2047,8 +2094,46 @@ pub const Context = struct {
     }
     /// Causal GQA attention for one decode query (online softmax, one thread
     /// per query head). k/v caches: position j at j*(n_kv*hd) + kvh*hd.
-    pub fn opAttnDecodeQ35(self: *Context, q: DeviceBuffer, k_cache: DeviceBuffer, v_cache: DeviceBuffer, out: DeviceBuffer, n_heads: usize, n_kv: usize, head_dim: usize, kv_len: usize, scale: f32, window: usize) Error!void {
-        try self.opElt(.attn_decode_q35, q, k_cache, v_cache, out, .{ .u0 = @intCast(n_heads), .u1 = @intCast(n_kv), .u2 = @intCast(head_dim), .u3 = @intCast(kv_len), .u4 = @intCast(window), .f0 = scale }, n_heads, 1, 1);
+    /// KV chunks per head in the flash-decoding split (attn_dsplit_gemma):
+    /// turns the old one-thread-per-head attention into heads*nsplit threads.
+    pub const attn_decode_nsplit = 64;
+
+    /// Causal GQA decode attention (one query), flash-split across nsplit kv
+    /// chunks then merged — parallelizes the naive one-thread-per-head kernel.
+    /// `scratch` holds n_heads*attn_decode_nsplit*(head_dim+2) f32 partials.
+    /// `window` (> 0) restricts to the last `window` keys; `ring` (> 0) enables
+    /// sliding-window ring addressing (KV storage row = pos%ring, gemma3 LOCAL
+    /// layers). 0 = full causal / linear.
+    pub fn opAttnDecodeQ35(self: *Context, q: DeviceBuffer, k_cache: DeviceBuffer, v_cache: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, n_heads: usize, n_kv: usize, head_dim: usize, kv_len: usize, scale: f32, window: usize, ring: usize, kv_f16: bool) Error!void {
+        const nsplit = attn_decode_nsplit;
+        try self.opElt(if (kv_f16) .attn_dsplit_gemma_f16 else .attn_dsplit_gemma, q, k_cache, v_cache, scratch, .{
+            .u0 = @intCast(kv_len),
+            .u1 = @intCast(n_heads),
+            .u2 = @intCast(n_kv),
+            .u3 = @intCast(head_dim),
+            .u4 = nsplit,
+            .u5 = @intCast(window),
+            .f0 = scale,
+            .f1 = @bitCast(@as(u32, @intCast(ring))),
+        }, n_heads * nsplit, 1, 1);
+        try self.opElt(.attn_dmerge, scratch, null, null, out, .{
+            .u0 = @intCast(n_heads),
+            .u1 = @intCast(head_dim),
+            .u2 = nsplit,
+        }, n_heads * head_dim, 1, 1);
+    }
+
+    /// Convert-store `n` f32 K/V elements from `src` (+`src_off` elems) into the
+    /// f16-packed cache `dst` at element offset `dst_off` (the f16-cache analogue
+    /// of `opElt(.copy, ...)`). `n`, `dst_off`, and `src_off` are element counts;
+    /// `n` and `dst_off` must be even (whole KV rows are) so each packed slot is
+    /// written by exactly one thread. See kv_store_f16 in eltwise.zig.
+    pub fn opStoreKvF16(self: *Context, dst: DeviceBuffer, dst_off: usize, src: DeviceBuffer, src_off: usize, n: usize) Error!void {
+        try self.opElt(.kv_store_f16, src, dst, null, null, .{
+            .u0 = @intCast(n / 2),
+            .u2 = @intCast(dst_off / 2),
+            .u3 = @intCast(src_off),
+        }, n / 2, 1, 1);
     }
 
     pub fn opGemvCombine(
@@ -2079,20 +2164,20 @@ pub const Context = struct {
         x_off_elems: usize,
         partials: DeviceBuffer,
         w_bytes: []const u8,
-        dtype_f8: bool,
+        wcode: WCode,
         rows: usize,
         cols: usize,
         nchunk: usize,
     ) Error!void {
         std.debug.assert(rows % 8 == 0);
-        const w_buf = try self.weightBuffer(w_bytes, if (dtype_f8) 1 else 4, rows, cols);
+        const w_buf = try self.weightBuffer(w_bytes, wcode.esize(), rows, cols);
         const w_db: DeviceBuffer = .{ .buf = w_buf, .mem = .null_handle, .size = 0 };
         try self.opElt(.gemv_partial4, w_db, x, null, partials, .{
             .u0 = @intCast((rows / 8) * nchunk),
             .u1 = @intCast(cols),
             .u2 = @intCast(nchunk),
             .u3 = @intCast(std.mem.alignForward(usize, rows, tile_n)),
-            .u4 = @intFromBool(dtype_f8),
+            .u4 = @intFromEnum(wcode),
             .u5 = @intCast(rows),
             .f1 = @bitCast(@as(u32, @intCast(x_off_elems))),
         }, (rows / 8) * nchunk, 1, 1);
@@ -2836,6 +2921,50 @@ pub const Context = struct {
             @intCast(@max(total_z, 1)),
         );
         try self.opEnd();
+    }
+
+    /// Argmax over `logits` (device [vocab] f32) → token id written as an exact
+    /// f32 into out_id[0] (download 4 bytes, not the ~608 KB vocab). Two passes:
+    /// `lanes` stride-scanners each find a local max, then one thread reduces
+    /// them, tie-breaking to the lowest index (matches sample.argmax). Caller
+    /// owns the two working buffers (>= lanes f32 each). No workgroup memory.
+    pub fn opArgmax(
+        self: *Context,
+        logits: DeviceBuffer,
+        vocab: usize,
+        out_id: DeviceBuffer,
+        scratch_v: *DeviceBuffer,
+        scratch_i: *DeviceBuffer,
+    ) Error!void {
+        // Explicit usize: `@min(4096, vocab)` would otherwise narrow to a type
+        // bounded by 4096 (~u13), so `lanes * 4` overflows (#14039).
+        const lanes: usize = @min(@as(usize, 4096), vocab);
+        try self.ensureDeviceBuffer(scratch_v, lanes * 4);
+        try self.ensureDeviceBuffer(scratch_i, lanes * 4);
+        try self.opElt(.argmax_reduce, logits, null, scratch_v.*, scratch_i.*, .{
+            .u0 = @intCast(lanes),
+            .u1 = @intCast(vocab),
+        }, lanes, 1, 1);
+        try self.opElt(.argmax_final, scratch_v.*, scratch_i.*, null, out_id, .{
+            .u0 = @intCast(lanes),
+        }, 1, 1, 1);
+    }
+
+    /// Top-k candidate selection over `logits` (device [vocab] f32). `topk_lanes`
+    /// lanes each keep their `topk_m` highest (value,index); the caller downloads
+    /// the `topk_lanes * topk_m` candidates and does exact top-k on the CPU (a
+    /// few KB vs the ~608 KB vocab). Caller owns out_val/out_idx (>= that many
+    /// f32 each). Returns the candidate count written. No download here.
+    pub fn opTopK(self: *Context, logits: DeviceBuffer, vocab: usize, out_val: *DeviceBuffer, out_idx: *DeviceBuffer) Error!usize {
+        const lanes: usize = @min(@as(usize, topk_lanes), vocab);
+        const count = lanes * topk_m;
+        try self.ensureDeviceBuffer(out_val, count * 4);
+        try self.ensureDeviceBuffer(out_idx, count * 4);
+        try self.opElt(.topk_reduce, logits, null, out_val.*, out_idx.*, .{
+            .u0 = @intCast(lanes),
+            .u1 = @intCast(vocab),
+        }, lanes, 1, 1);
+        return count;
     }
 
     /// Drop a cached weight buffer (e.g. when its model is unloaded).
@@ -3847,6 +3976,99 @@ test "flash attention matches reference" {
                 const got = o[(qi * n_heads + h) * hd + cc];
                 try std.testing.expectApproxEqAbs(@as(f32, @floatCast(want)), got, 1e-2);
             }
+        }
+    }
+}
+
+test "gpu argmax matches cpu argmax (incl. tie -> lowest index)" {
+    const gpa = std.testing.allocator;
+    std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa) catch return error.SkipZigTest;
+    defer ctx.deinit();
+    const sample = @import("../llm/sample.zig");
+
+    var prng = std.Random.DefaultPrng.init(0xA11CE);
+    const rand = prng.random();
+    // A spread of vocab sizes incl. non-multiples of the lane count and a tiny
+    // one; plus a forced exact tie to check the lowest-index tie-break.
+    const vocabs = [_]usize{ 1, 7, 4096, 151936, 99991 };
+    for (vocabs) |vocab| {
+        const logits = try gpa.alloc(f32, vocab);
+        defer gpa.free(logits);
+        for (logits) |*v| v.* = rand.floatNorm(f32) * 5.0;
+        if (vocab > 10) {
+            // Two exact-equal maxima: CPU + GPU must both pick the lower index.
+            logits[vocab / 3] = 1000.0;
+            logits[vocab / 3 + 5] = 1000.0;
+        }
+
+        var lg = try ctx.tensorCreate(vocab * 4);
+        var out = try ctx.tensorCreate(4);
+        var sv: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 };
+        var si: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 };
+        defer {
+            ctx.tensorDestroy(&lg);
+            ctx.tensorDestroy(&out);
+            ctx.tensorDestroy(&sv);
+            ctx.tensorDestroy(&si);
+        }
+        try ctx.tensorUpload(lg, std.mem.sliceAsBytes(logits));
+        try ctx.opArgmax(lg, vocab, out, &sv, &si);
+
+        var got_f: [1]f32 = undefined;
+        try ctx.tensorDownload(out, std.mem.sliceAsBytes(&got_f));
+        const got: u32 = @intFromFloat(got_f[0]);
+        try std.testing.expectEqual(sample.argmax(logits), got);
+    }
+}
+
+test "gpu topk selects the true top-k set" {
+    const gpa = std.testing.allocator;
+    const sample = @import("../llm/sample.zig");
+    std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa) catch return error.SkipZigTest;
+    defer ctx.deinit();
+
+    var prng = std.Random.DefaultPrng.init(0x70FF);
+    const rand = prng.random();
+    const vocabs = [_]usize{ 5, 4096, 151936 };
+    for (vocabs) |vocab| {
+        const logits = try gpa.alloc(f32, vocab);
+        defer gpa.free(logits);
+        for (logits) |*v| v.* = rand.floatNorm(f32) * 6.0;
+
+        var lg = try ctx.tensorCreate(vocab * 4);
+        var ov: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 };
+        var oi: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 };
+        defer {
+            ctx.tensorDestroy(&lg);
+            ctx.tensorDestroy(&ov);
+            ctx.tensorDestroy(&oi);
+        }
+        try ctx.tensorUpload(lg, std.mem.sliceAsBytes(logits));
+        const count = try ctx.opTopK(lg, vocab, &ov, &oi);
+
+        const vals = try gpa.alloc(f32, count);
+        defer gpa.free(vals);
+        const idxs = try gpa.alloc(f32, count);
+        defer gpa.free(idxs);
+        try ctx.tensorDownload(ov, std.mem.sliceAsBytes(vals));
+        try ctx.tensorDownload(oi, std.mem.sliceAsBytes(idxs));
+
+        // Build candidates and take exact top-k on the host, compare to the
+        // reference top-k over the full logits. k spans small and large.
+        for ([_]usize{ 1, 20, 512 }) |k_want| {
+            const k = @min(k_want, vocab);
+            const cands = try gpa.alloc(sample.Candidate, count);
+            defer gpa.free(cands);
+            for (cands, vals, idxs) |*c, v, id| c.* = .{ .id = @intFromFloat(id), .logit = v };
+            std.mem.sort(sample.Candidate, cands, {}, sample.candDesc);
+            // reference: sort a full candidate list
+            const refc = try gpa.alloc(sample.Candidate, vocab);
+            defer gpa.free(refc);
+            for (refc, logits, 0..) |*c, v, i| c.* = .{ .id = @intCast(i), .logit = v };
+            std.mem.sort(sample.Candidate, refc, {}, sample.candDesc);
+            for (0..k) |r| try std.testing.expectEqual(refc[r].id, cands[r].id);
         }
     }
 }

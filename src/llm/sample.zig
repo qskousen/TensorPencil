@@ -104,60 +104,110 @@ pub const Sampler = struct {
     /// place (repetition penalty); `recent` is the penalty's context window.
     pub fn dist(self: *Sampler, logits: []f32, recent: []const u32) Dist {
         const p = self.params;
-        if (p.repeat_penalty != 1.0) {
-            const n = @min(p.repeat_last_n, recent.len);
-            for (recent[recent.len - n ..]) |id| {
-                const l = &logits[id];
-                l.* = if (l.* > 0) l.* / p.repeat_penalty else l.* * p.repeat_penalty;
-            }
-        }
-        var d: Dist = undefined;
+        applyRepetitionPenalty(logits, recent, p);
         if (p.temperature <= 0) {
-            d.n = 1;
-            d.ids[0] = argmax(logits);
-            d.probs[0] = 1;
-            return d;
+            return distFromSorted(p, &.{.{ .id = argmax(logits), .logit = 0 }});
         }
-
-        // Top-k candidates (id, logit), highest first.
-        const k = @min(if (p.top_k == 0) max_candidates else p.top_k, max_candidates);
+        // Top-k candidates (id, logit), highest first — the only full-vocab
+        // step; everything downstream is on this <= max_candidates set.
+        const k = candidateCount(p);
         var cand: [max_candidates]Candidate = undefined;
         const cands = topK(logits, cand[0..k]);
+        return distFromSorted(p, cands);
+    }
 
-        // Softmax with temperature over the candidates.
-        var probs: [max_candidates]f32 = undefined;
-        var denom: f32 = 0;
-        for (cands, 0..) |c, i| {
-            probs[i] = @exp((c.logit - cands[0].logit) / p.temperature);
-            denom += probs[i];
-        }
-
-        // Nucleus cut: candidates are sorted, so walk until cumulative >= top_p.
-        var keep: usize = cands.len;
-        if (p.top_p < 1.0) {
-            var cum: f32 = 0;
-            for (probs[0..cands.len], 0..) |prob, i| {
-                cum += prob / denom;
-                if (cum >= p.top_p) {
-                    keep = i + 1;
-                    break;
-                }
-            }
-        }
-
-        // Normalize the kept prefix.
-        var kept_mass: f32 = 0;
-        for (probs[0..keep]) |prob| kept_mass += prob;
-        for (cands[0..keep], probs[0..keep], 0..) |c, prob, i| {
-            d.ids[i] = c.id;
-            d.probs[i] = prob / kept_mass;
-        }
-        d.n = keep;
-        return d;
+    /// GPU-sampling entry point: the device already applied the repetition
+    /// penalty and selected the top-k, downloading just these candidates
+    /// (a few KB vs the full ~608 KB vocab). We sort them descending — k is
+    /// tiny — and run the identical softmax / top-p / normalize / RNG tail as
+    /// the full-vocab path, so the emitted token is bit-identical to what the
+    /// CPU sampler would have produced from the same logits.
+    pub fn nextFromCandidates(self: *Sampler, cands: []Candidate) u32 {
+        std.mem.sort(Candidate, cands, {}, candDesc);
+        // Trim the (possibly larger, e.g. GPU per-lane) candidate pool to the
+        // top-k the params consider — matching the CPU path's topK(k) so the
+        // softmax runs over the same set.
+        const k = @min(candidateCount(self.params), cands.len);
+        const d = distFromSorted(self.params, cands[0..k]);
+        return d.sample(self.rng.random());
     }
 };
 
-const Candidate = struct { id: u32, logit: f32 };
+/// Number of top-k candidates the sampler considers for the given params
+/// (0 = "no limit" caps at max_candidates). The GPU top-k selects the same
+/// count so its candidate set matches the CPU path's.
+pub fn candidateCount(p: Params) usize {
+    return @min(if (p.top_k == 0) max_candidates else p.top_k, max_candidates);
+}
+
+/// llama.cpp-style repetition penalty over the recent window, applied in place
+/// to the full logits (`p.repeat_penalty == 1.0` is a no-op). Extracted so the
+/// GPU path can mirror the exact formula in a device kernel before its top-k.
+pub fn applyRepetitionPenalty(logits: []f32, recent: []const u32, p: Params) void {
+    if (p.repeat_penalty == 1.0) return;
+    const n = @min(p.repeat_last_n, recent.len);
+    for (recent[recent.len - n ..]) |id| {
+        const l = &logits[id];
+        l.* = if (l.* > 0) l.* / p.repeat_penalty else l.* * p.repeat_penalty;
+    }
+}
+
+/// The post-top-k tail: temperature softmax + nucleus (top-p) cut + normalize,
+/// over candidates already SORTED descending by logit. Shared by the full-vocab
+/// `dist` and the GPU candidate path so there is one source of truth for the
+/// stochastic math (and thus exact CPU/GPU parity). `temperature <= 0` collapses
+/// to a point mass on `cands[0]` (which must be the argmax). Repetition penalty
+/// is assumed already applied to the logits these candidates came from.
+pub fn distFromSorted(p: Params, cands: []const Candidate) Dist {
+    std.debug.assert(cands.len >= 1);
+    var d: Dist = undefined;
+    if (p.temperature <= 0) {
+        d.n = 1;
+        d.ids[0] = cands[0].id;
+        d.probs[0] = 1;
+        return d;
+    }
+
+    // Softmax with temperature over the candidates.
+    var probs: [max_candidates]f32 = undefined;
+    var denom: f32 = 0;
+    for (cands, 0..) |c, i| {
+        probs[i] = @exp((c.logit - cands[0].logit) / p.temperature);
+        denom += probs[i];
+    }
+
+    // Nucleus cut: candidates are sorted, so walk until cumulative >= top_p.
+    var keep: usize = cands.len;
+    if (p.top_p < 1.0) {
+        var cum: f32 = 0;
+        for (probs[0..cands.len], 0..) |prob, i| {
+            cum += prob / denom;
+            if (cum >= p.top_p) {
+                keep = i + 1;
+                break;
+            }
+        }
+    }
+
+    // Normalize the kept prefix.
+    var kept_mass: f32 = 0;
+    for (probs[0..keep]) |prob| kept_mass += prob;
+    for (cands[0..keep], probs[0..keep], 0..) |c, prob, i| {
+        d.ids[i] = c.id;
+        d.probs[i] = prob / kept_mass;
+    }
+    d.n = keep;
+    return d;
+}
+
+pub const Candidate = struct { id: u32, logit: f32 };
+
+/// Descending by logit, ties broken by ascending id (matches argmax's
+/// lowest-index-wins so a GPU-selected set sorts identically to topK's output).
+pub fn candDesc(_: void, a: Candidate, b: Candidate) bool {
+    if (a.logit != b.logit) return a.logit > b.logit;
+    return a.id < b.id;
+}
 
 /// Fill `out` with the highest-logit candidates, sorted descending.
 /// Selection over the full vocab via a min-heap keyed on the smallest kept
@@ -326,6 +376,42 @@ test "accept + sampleExcluding preserves the target distribution" {
         const fa = @as(f64, @floatFromInt(a)) / trials;
         const fb = @as(f64, @floatFromInt(b)) / trials;
         try std.testing.expectApproxEqAbs(fa, fb, 0.02); // ~4 sigma at n=20k
+    }
+}
+
+// The GPU path (device top-k → download candidates → nextFromCandidates) must
+// emit the SAME token as the CPU full-vocab next() for the same logits + seed.
+test "nextFromCandidates matches full-vocab next()" {
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const rand = prng.random();
+    const params_sets = [_]Params{
+        .{ .temperature = 0.0 }, // greedy
+        .{ .temperature = 1.0, .top_k = 20, .top_p = 1.0 },
+        .{ .temperature = 0.7, .top_k = 0, .top_p = 0.8 }, // top_k=0 → cap
+        .{ .temperature = 1.3, .top_k = 5, .top_p = 0.95 },
+    };
+    for (params_sets) |p| {
+        for (0..16) |trial| {
+            var logits: [4096]f32 = undefined;
+            for (&logits) |*l| l.* = rand.floatNorm(f32) * 4.0;
+            const seed: u64 = 100 + trial;
+
+            // CPU full-vocab path.
+            var cpu = Sampler.init(p, seed);
+            var l_cpu = logits;
+            const want = cpu.next(&l_cpu, &.{});
+
+            // GPU path: select the same top-k the device would, hand it over.
+            var l_gpu = logits;
+            applyRepetitionPenalty(&l_gpu, &.{}, p);
+            const k = if (p.temperature <= 0) 1 else candidateCount(p);
+            var cand: [max_candidates]Candidate = undefined;
+            const cands = topK(&l_gpu, cand[0..k]);
+            var gpu = Sampler.init(p, seed);
+            const got = gpu.nextFromCandidates(cands);
+
+            try std.testing.expectEqual(want, got);
+        }
     }
 }
 

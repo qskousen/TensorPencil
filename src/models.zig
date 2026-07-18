@@ -6,6 +6,7 @@ pub const transformer_gpu = @import("models/transformer_gpu.zig");
 pub const wan_vae = @import("models/wan_vae.zig");
 pub const taehv = @import("models/taehv.zig");
 pub const taehv_cuda = @import("models/taehv_cuda.zig");
+pub const taehv_gpu = @import("models/taehv_gpu.zig");
 pub const vae_gpu = @import("models/vae_gpu.zig");
 pub const vae_cuda = @import("models/vae_cuda.zig");
 pub const vae_tiled = @import("models/vae_tiled.zig");
@@ -38,6 +39,7 @@ test {
     _ = transformer;
     _ = transformer_gpu;
     _ = wan_vae;
+    _ = taehv_gpu;
     _ = vae_gpu;
     _ = vae_cuda;
     _ = vae_tiled;
