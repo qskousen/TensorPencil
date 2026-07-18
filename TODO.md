@@ -19,7 +19,3 @@
 - Vulkan block-quant GEMV is compute-bound (~13-18x slower than zig-cuda): gemma3-12B Q4_K_M decodes ~3 tok/s on vulkan vs ~54 on zig-cuda. Measured root cause: the vulkan block-quant GEMV kernels (gemv_q4_k_t / q5_k_t / q6_k_t in kernels/eltwise.zig) dequantize every weight to f32 and do scalar FMA → SM pegged at 100% while mem-BW sits at ~6% (compute-bound). zig-cuda uses int8 dp4a → memory-bound (~65% BW), i.e. at the physical floor. Ablation: removing the GEMV dequant compute drops vulkan SM util 100%→15%, so the GEMV is the whole remaining bottleneck (attention was fixed 2026-07-17 via attn_dsplit_gemma flash-split, 1→3 tok/s). FIX: rewrite the vulkan block-quant GEMV to use integer dot product (dp4a-equivalent) via VK_KHR_shader_integer_dot_product (OpUDot/OpSDot; the 3090 supports it) — dequant to int8 in-register + integer-dot accumulate so it becomes memory-bound like cuda. Realistic target ~20-40 tok/s. Real kernel project (new SPIR-V GEMV + int8-friendly weight repack + validation), NOT brief. Block-quant on vulkan is a gemma3/qwen35-only path (qwen3 rejects it and uses f8 coopmat), so there's no existing fast reference to copy. A half-measure (vectorize the current dequant, f16 math) might get ~2x but stays compute-bound.
 
 - are seeds random? does doing a new chat generate a new seed? seed per message?
-- context maxes out for some reason at 16k:
-  - info: [llm] 655 tok, 31.8 tok/s, ctx 16303/16384, vram 7266 MiB
-  - info: [llm] 62 tok, 30.2 tok/s, ctx 16384/16384, vram 7266 MiB
-  - error: generation failed: ContextFull

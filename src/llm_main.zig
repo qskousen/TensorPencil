@@ -1458,12 +1458,7 @@ const auto_context_cap: usize = 128 << 10;
 /// back to the native Qwen3 window.
 fn trainedContext(st: *const ModelFile) usize {
     switch (st.*) {
-        .gguf => |*g| {
-            const arch = g.getStr("general.architecture") orelse return 32768;
-            var buf: [64]u8 = undefined;
-            const key = std.fmt.bufPrint(&buf, "{s}.context_length", .{arch}) catch return 32768;
-            return @intCast(g.getUint(key) orelse 32768);
-        },
+        .gguf => |*g| return @intCast(g.contextLength() orelse 32768),
         .safetensors => return 32768,
     }
 }

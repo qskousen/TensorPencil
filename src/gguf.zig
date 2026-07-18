@@ -371,6 +371,16 @@ pub const Gguf = struct {
         const v = self.kv.get(key) orelse return null;
         return if (v == .arr) v.arr else null;
     }
+
+    /// The model's trained context length (`<arch>.context_length`), when the
+    /// container records both the architecture and the key. `null` lets the
+    /// caller pick a family default.
+    pub fn contextLength(self: *const Gguf) ?u64 {
+        const arch = self.getStr("general.architecture") orelse return null;
+        var buf: [64]u8 = undefined;
+        const key = std.fmt.bufPrint(&buf, "{s}.context_length", .{arch}) catch return null;
+        return self.getUint(key);
+    }
 };
 
 /// llama.cpp layer-tensor suffixes -> HF-style suffixes (Qwen3/llama family).

@@ -49,6 +49,16 @@ const pipeline = tp.pipeline;
 const Tokenizer = tp.tokenizer.Tokenizer;
 const Gguf = tp.Gguf;
 
+/// Upper bound on the auto-sized KV window when the caller passes no explicit
+/// `max_context` (mirrors the tp-llm CLI). A model can advertise a very large
+/// trained context; this keeps the ceiling sane while still far above the old
+/// fixed 16384. Growth is lazy, so this only bounds the maximum, not up-front
+/// VRAM.
+const auto_context_cap: usize = 128 << 10;
+
+/// Family fallback trained context when the GGUF omits `<arch>.context_length`.
+const default_trained_context: usize = 32768;
+
 /// Raw decoded image (packed RGB) awaiting vision encoding.
 const RawImage = struct { rgb: []u8, width: usize, height: usize };
 
@@ -145,8 +155,12 @@ pub const Options = struct {
     /// Base system prompt sent at the start of every conversation. The image
     /// tool description is appended to it when `images_enabled` is set.
     system_prompt: []const u8 = "You are a helpful assistant.",
-    /// KV window ceiling; growth commits rows lazily up to this.
-    max_context: usize = 16384,
+    /// KV window ceiling; growth commits rows lazily up to this. `null` (the
+    /// default) auto-sizes to the model's trained context length (capped at
+    /// `auto_context_cap`), so a session isn't silently clipped to a fixed
+    /// window — CUDA grows KV rows on demand, so a large ceiling costs VRAM
+    /// only as the conversation fills.
+    max_context: ?usize = null,
     max_new_tokens: usize = 2048,
     seed: u64 = 0,
     temperature: f32 = 0.7,
@@ -288,10 +302,17 @@ pub const Session = struct {
         // (below) returns error.KvDtypeUnsupported for archs not yet wired, so
         // the loader surfaces a clean error rather than corrupting the cache.
 
+        // Context ceiling: honor an explicit request, else auto-size to the
+        // model's trained context length (capped) so the window follows the
+        // model instead of a fixed 16384. CUDA grows KV lazily, so this bounds
+        // the max without paying the VRAM up front.
+        const max_context = cfg.max_context orelse
+            @min(@as(usize, @intCast(self.gguf.contextLength() orelse default_trained_context)), auto_context_cap);
+
         // Interactive session: grow from a small floor toward the full window.
         const cap: engine.Capacity = .{
-            .initial = @min(cfg.max_context, 4096),
-            .max = cfg.max_context,
+            .initial = @min(max_context, 4096),
+            .max = max_context,
             .kv_dtype = cfg.kv_dtype,
         };
 
@@ -336,7 +357,7 @@ pub const Session = struct {
 
         self.opts = .{
             .max_new_tokens = cfg.max_new_tokens,
-            .max_context = cfg.max_context,
+            .max_context = max_context,
             .seed = cfg.seed,
             .sampling = .{ .temperature = cfg.temperature },
         };
