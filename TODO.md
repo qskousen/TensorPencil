@@ -1,4 +1,3 @@
-- viewer: zooming seems to zoom to the bottom right corner or something instead of the mouse pointer
 - latent always shows as 0.0gb in gui and is not actually representative since it's "whatever is left over"
 - "talk about this image" button disappears when llm is unloaded (should be determined by model metadata like image and thinking capabilities)
 - zig-cuda backend seems to have oom issues

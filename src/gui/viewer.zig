@@ -8,6 +8,7 @@ const SDLBackend = @import("backend");
 const diffuser = @import("diffuser.zig");
 const clipboard = @import("clipboard.zig");
 const fonts = @import("fonts.zig");
+const viewmath = @import("viewmath.zig");
 
 pub const GenImage = diffuser.GenImage;
 
@@ -284,8 +285,8 @@ pub const Viewer = struct {
                     const cur_y = (me.p.y - cy) / (self.zoom * s);
                     const factor: f32 = if (dy > 0) 1.12 else (1.0 / 1.12);
                     const nz = std.math.clamp(self.zoom * factor, 0.05, 32.0);
-                    self.pan_x += cur_x * (self.zoom - nz);
-                    self.pan_y += cur_y * (self.zoom - nz);
+                    self.pan_x = viewmath.zoomAt(self.pan_x, cur_x, self.zoom, nz);
+                    self.pan_y = viewmath.zoomAt(self.pan_y, cur_y, self.zoom, nz);
                     self.zoom = nz;
                     self.zoom_mode = .custom;
                 },

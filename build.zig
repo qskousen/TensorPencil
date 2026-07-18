@@ -327,6 +327,17 @@ pub fn build(b: *std.Build) void {
             });
             gui_test_step.dependOn(&b.addRunArtifact(gui_toolcall_tests).step);
 
+            // Viewer zoom/pan math unit tests. Pure std — the dvui-facing
+            // viewer.zig stays out of the test build.
+            const gui_viewmath_tests = b.addTest(.{
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/gui/viewmath.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }),
+            });
+            gui_test_step.dependOn(&b.addRunArtifact(gui_viewmath_tests).step);
+
             // Diffusion-engine pure-helper tests (clampDim / parseGenAttrs /
             // seed advance). Pulls in the TensorPencil module (for pipeline
             // types) + known-folders (via config.zig), but stays CPU-only.

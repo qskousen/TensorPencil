@@ -353,3 +353,32 @@ Fix: annotate the result type at the `@min` — `const n: usize = @min(...)`.
 The result is then usize and all downstream arithmetic is full-width.
 Audit hint: any `@min(comptime_const, runtime)` (or `@max`) whose result
 feeds arithmetic or slice bounds needs the annotation.
+
+## Passing tests must be silent on stderr — else `zig build test` prints a spurious red "failed command:" line
+
+Any test that writes to stderr **while passing** (e.g. a `std.debug.print`
+diagnostic) makes the build runner emit output that looks exactly like a
+failure — a dim step subtree, the captured stderr, and a red
+`failed command: .../test --listen=-` line — even though the step
+succeeded and the summary says `N passed; 0 failed`. Don't burn time
+debugging it: check `zig build test --summary all`; if it says
+`test success`, nothing failed.
+
+Mechanism (Zig 0.16 cosmetic bug): `Step/Run.zig` sets
+`step.result_failed_command` before spawning every test binary and never
+clears it on the `zig_test` success path; `build_runner.zig`'s `makeStep`
+routes ANY step with non-empty `result_stderr` through
+`printErrorMessages` ("no matter the result"), which unconditionally
+appends the `failed command:` line when `result_failed_command` is set
+(default `verbose` error style).
+
+Rule: tests print diagnostics **only on failure**, via `errdefer`:
+
+```zig
+errdefer std.debug.print("parity: max_err={d:.6}\n", .{max_err}); // silent when green
+try std.testing.expect(max_err < 5e-3);
+```
+
+The print then lands inside the real failure report where it's useful.
+(`ZIG_BUILD_ERROR_STYLE=minimal` only hides the `failed command:` line,
+not the stderr dump — fix the test, not the env.)

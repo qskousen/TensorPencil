@@ -529,7 +529,9 @@ test "decode matches comfyui reference" {
         sum_err += err;
     }
     const mean_err = sum_err / @as(f64, @floatFromInt(out.len));
-    std.debug.print("vae parity: max_err={d:.6} mean_err={d:.6}\n", .{ max_err, mean_err });
+    // Diagnostic only on failure: stderr from a passing test makes the build
+    // runner print a spurious red "failed command:" line (see ZIG.md).
+    errdefer std.debug.print("vae parity: max_err={d:.6} mean_err={d:.6}\n", .{ max_err, mean_err });
     try std.testing.expect(max_err < 5e-3);
     try std.testing.expect(mean_err < 5e-4);
 }
@@ -544,6 +546,14 @@ fn stageErr(gpa: std.mem.Allocator, io: std.Io, name: []const u8, rows: []const 
         for (0..c) |ch| max_err = @max(max_err, @abs(rows[i * c + ch] - ref[ch * n + i]));
     }
     return max_err;
+}
+
+/// Asserts one stage of the parity walk, printing the stage error only when it
+/// exceeds tolerance (a passing test must be silent on stderr, see ZIG.md).
+fn checkStage(gpa: std.mem.Allocator, io: std.Io, name: []const u8, rows: []const f32, c: usize, n: usize) !void {
+    const err = try stageErr(gpa, io, name, rows, c, n);
+    errdefer std.debug.print("{s} err {d:.7}\n", .{ name, err });
+    try std.testing.expect(err < 5e-3);
 }
 
 // Stage-by-stage parity walk; only runs when the debug stage dumps from
@@ -566,15 +576,15 @@ test "decode stage parity" {
     var w: usize = 8;
 
     x = try dec.applyConv(io, gpa, x, h, w, dec.post_quant);
-    std.debug.print("postquant err {d:.7}\n", .{try stageErr(gpa, io, "postquant", x, 16, h * w)});
+    try checkStage(gpa, io, "postquant", x, 16, h * w);
     x = try dec.applyConv(io, gpa, x, h, w, dec.conv_in);
-    std.debug.print("convin err {d:.7}\n", .{try stageErr(gpa, io, "convin", x, 384, h * w)});
+    try checkStage(gpa, io, "convin", x, 384, h * w);
     x = try dec.applyRes(io, gpa, x, h, w, dec.mid_res1);
-    std.debug.print("mid0 err {d:.7}\n", .{try stageErr(gpa, io, "mid0", x, 384, h * w)});
+    try checkStage(gpa, io, "mid0", x, 384, h * w);
     x = try dec.applyAttn(io, gpa, x, h, w, dec.mid_attn);
-    std.debug.print("mid1 err {d:.7}\n", .{try stageErr(gpa, io, "mid1", x, 384, h * w)});
+    try checkStage(gpa, io, "mid1", x, 384, h * w);
     x = try dec.applyRes(io, gpa, x, h, w, dec.mid_res2);
-    std.debug.print("mid2 err {d:.7}\n", .{try stageErr(gpa, io, "mid2", x, 384, h * w)});
+    try checkStage(gpa, io, "mid2", x, 384, h * w);
 
     for (dec.ups, 0..) |layer, i| {
         var c: usize = undefined;
@@ -595,7 +605,7 @@ test "decode stage parity" {
         }
         var namebuf: [16]u8 = undefined;
         const name = try std.fmt.bufPrint(&namebuf, "up{d}", .{i});
-        std.debug.print("{s} err {d:.7}\n", .{ name, try stageErr(gpa, io, name, x, c, h * w) });
+        try checkStage(gpa, io, name, x, c, h * w);
     }
     gpa.free(x);
 }

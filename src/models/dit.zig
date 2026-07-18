@@ -801,7 +801,9 @@ test "int8 convrot matmul agrees with fp8 within quant noise" {
         den += @as(f64, ref) * ref;
     }
     const rel = @sqrt(num / den);
-    std.debug.print("int8-vs-fp8 wq GEMM relative RMSE: {d:.4}\n", .{rel});
+    // Diagnostic only on failure: stderr from a passing test makes the build
+    // runner print a spurious red "failed command:" line (see ZIG.md).
+    errdefer std.debug.print("int8-vs-fp8 wq GEMM relative RMSE: {d:.4}\n", .{rel});
     try std.testing.expect(rel < 0.05);
 }
 
@@ -883,7 +885,7 @@ test "int4 convrot matmul agrees with fp8 within quant noise" {
         den += @as(f64, ref) * ref;
     }
     const rel = @sqrt(num / den);
-    std.debug.print("int4-vs-fp8 wq GEMM relative RMSE: {d:.4}\n", .{rel});
+    errdefer std.debug.print("int4-vs-fp8 wq GEMM relative RMSE: {d:.4}\n", .{rel});
     // int4 (16 levels) is much coarser than int8; convrot keeps it usable but
     // the GEMM-level relative error is naturally several × higher. This is a
     // sanity bound (garbage from a wrong rotation/packing would land near ~1.0,
@@ -941,7 +943,7 @@ test "dit forward matches comfyui" {
         sum_err += @abs(e - a);
     }
     const mean_err = sum_err / @as(f64, @floatFromInt(out.len));
-    std.debug.print("dit parity: max_err={d:.5} mean_err={d:.6} max_val={d:.2}\n", .{ max_err, mean_err, max_val });
+    errdefer std.debug.print("dit parity: max_err={d:.5} mean_err={d:.6} max_val={d:.2}\n", .{ max_err, mean_err, max_val });
     try std.testing.expect(max_err < 0.01 * @max(1.0, max_val));
     try std.testing.expect(mean_err < 1e-3 * @as(f64, @max(1.0, max_val)));
 }

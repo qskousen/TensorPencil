@@ -7,6 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Never run `git add` or `git commit` unless directly requested.
 - Don't bring up "this code is uncommitted"; don't worry about commits or checkpoints or anything like that.
 - `zig build` produces no output on success; any output indicates a warning or error.
+- `zig build test` is likewise silent when everything passes. Tests must NOT print diagnostics on success — use `errdefer std.debug.print(...)` before the assert so values only print on failure. Any stderr from a *passing* test makes the runner print a misleading red `failed command:` line (see ZIG.md); if `zig build test --summary all` says `test success`, nothing failed — don't investigate that line.
 - **Read `ZIG.md` before doing any work.** It documents Zig 0.16.0 breaking changes relevant to this codebase. When you encounter and resolve a new 0.16.0 change, add it to `ZIG.md`.
 - We want the code to be clean, with clear seperation of concerns, modular, and testable.
 - If there is ambiguity in a request, don't guess or assume; ask for clarification.
