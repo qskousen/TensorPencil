@@ -1459,6 +1459,152 @@ export fn attn_dsplit_gemma_f16() callconv(.spirv_kernel) void {
     while (t < hd) : (t += 1) d.data[base + 2 + t] = acc[t];
 }
 
+// q8_0 K/V readers: the K (b) / V (c) caches hold ggml block_q8_0 (34 bytes per
+// 32 elements: f16 scale d at +0, 32 x i8 quants at +2), byte-packed into the
+// f32 words. Element e's block starts at byte (e/32)*34 (2-byte aligned; the
+// quant byte is arbitrary). Split into scale/quant readers so the attention
+// loop hoists the scale once per 32-aligned chunk. value = quant * scale.
+inline fn kq8s(e: u32) f32 {
+    const boff = (e / 32) * 34;
+    const w: u32 = @bitCast(b.data[boff / 4]);
+    const bits: u16 = if (boff % 4 == 0) @truncate(w) else @truncate(w >> 16);
+    return @floatCast(@as(f16, @bitCast(bits)));
+}
+inline fn kq8q(e: u32) f32 {
+    const qoff = (e / 32) * 34 + 2 + (e % 32);
+    const w: u32 = @bitCast(b.data[qoff / 4]);
+    const sh: u5 = @intCast(24 - (qoff % 4) * 8);
+    return @floatFromInt(@as(i32, @bitCast(w << sh)) >> 24);
+}
+inline fn vq8s(e: u32) f32 {
+    const boff = (e / 32) * 34;
+    const w: u32 = @bitCast(c.data[boff / 4]);
+    const bits: u16 = if (boff % 4 == 0) @truncate(w) else @truncate(w >> 16);
+    return @floatCast(@as(f16, @bitCast(bits)));
+}
+inline fn vq8q(e: u32) f32 {
+    const qoff = (e / 32) * 34 + 2 + (e % 32);
+    const w: u32 = @bitCast(c.data[qoff / 4]);
+    const sh: u5 = @intCast(24 - (qoff % 4) * 8);
+    return @floatFromInt(@as(i32, @bitCast(w << sh)) >> 24);
+}
+
+// attn_dsplit_gemma_q8: q8_0-KV variant of attn_dsplit_gemma. Identical online
+// softmax + sliding-window + ring, but K/V are read from the q8_0 block caches
+// (kq8*/vq8*) and widened to f32 — the row base is a block multiple (kv_dim is),
+// so 32-wide chunks hoist each block's scale once. Q (a) and scratch (d) stay
+// f32. Params match attn_dsplit_gemma exactly. Lossy vs f32.
+export fn attn_dsplit_gemma_q8() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    const nsplit = pc.u4;
+    const heads = pc.u1;
+    if (idx >= heads * nsplit) return;
+    const hd = pc.u3;
+    const kv_len = pc.u0;
+    const kv_heads = pc.u2;
+    const window = pc.u5;
+    const ring: u32 = @bitCast(pc.f1);
+    const scale = pc.f0;
+    // Bidirectional image block (u6, 0 = causal); kv_start stays on kv_len.
+    const kv_end = if (pc.u6 != 0) pc.u6 else kv_len;
+    const h = idx / nsplit;
+    const i = idx % nsplit;
+    const kvh = h / (heads / kv_heads);
+    const kv_start: u32 = if (window != 0 and kv_len > window) kv_len - window else 0;
+    const span = kv_end - kv_start;
+    const chunk = (span + nsplit - 1) / nsplit;
+    const kv0 = kv_start + i * chunk;
+    const kv1 = @min(kv0 + chunk, kv_end);
+    const qbase = h * hd;
+    var acc: [256]f32 = @splat(0.0); // type-level max; loops bound by hd
+    var m: f32 = -3.0e38;
+    var dsum: f32 = 0;
+    var j = kv0;
+    while (j < kv1) : (j += 1) {
+        const row = if (ring != 0) j % ring else j;
+        const kbase = (row * kv_heads + kvh) * hd;
+        var s: f32 = 0;
+        var t: u32 = 0;
+        while (t < hd) : (t += 32) {
+            const dk = kq8s(kbase + t);
+            var u: u32 = 0;
+            while (u < 32) : (u += 1) s += a.data[qbase + t + u] * (kq8q(kbase + t + u) * dk);
+        }
+        s *= scale;
+        const m2 = @max(m, s);
+        const corr = @exp(m - m2);
+        const p = @exp(s - m2);
+        dsum = dsum * corr + p;
+        m = m2;
+        var t2: u32 = 0;
+        while (t2 < hd) : (t2 += 32) {
+            const dv = vq8s(kbase + t2);
+            var u: u32 = 0;
+            while (u < 32) : (u += 1) acc[t2 + u] = acc[t2 + u] * corr + p * (vq8q(kbase + t2 + u) * dv);
+        }
+    }
+    const base = idx * (hd + 2);
+    d.data[base] = m;
+    d.data[base + 1] = dsum;
+    var t: u32 = 0;
+    while (t < hd) : (t += 1) d.data[base + 2 + t] = acc[t];
+}
+
+// kv_store_q8_0: quantize-store f32 K/V into a q8_0 block cache. One thread per
+// PAIR of 32-element blocks (68 bytes = 17 whole u32 words), because a single
+// 34-byte block ends mid-word and adjacent threads would race on the shared
+// word; kv_dim is a multiple of 64, so rows always hold whole pairs. Reads
+// a.data[u3 + idx*64 ..][64] (f32), writes 17 words at b word (u2/64)*17 +
+// idx*17. Per block: d = absmax/127 (f16), q = roundEven(x/d) — same
+// round-to-nearest-even as the host packQ80 and the CUDA cvt.rni kernels.
+// u0 = pair count, u2 = dst element offset (pair-aligned), u3 = src elem off.
+export fn kv_store_q8_0() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const src = pc.u3 + idx * 64;
+    // Byte staging as u32 (one byte value per slot): the SPIR-V path avoids
+    // 8-bit types everywhere (no Int8 capability), like the gemv_q8_0 readers.
+    var bytes: [68]u32 = undefined;
+    var blk: u32 = 0;
+    while (blk < 2) : (blk += 1) {
+        const s0 = src + blk * 32;
+        const o = blk * 34;
+        var amax: f32 = 0;
+        var i: u32 = 0;
+        while (i < 32) : (i += 1) amax = @max(amax, @abs(a.data[s0 + i]));
+        const dq = amax / 127.0;
+        const id: f32 = if (dq != 0) 1.0 / dq else 0.0;
+        const dbits: u32 = @as(u16, @bitCast(@as(f16, @floatCast(dq))));
+        bytes[o] = dbits & 0xff;
+        bytes[o + 1] = dbits >> 8;
+        i = 0;
+        while (i < 32) : (i += 1) {
+            // Round-to-nearest-even from exact primitives (floor and the
+            // fraction compare are exact for |v| <= 127.5): the 2^23 magic-add
+            // trick gets folded away by GPU shader compilers, leaving trunc.
+            const v = a.data[s0 + i] * id;
+            const fl = @floor(v);
+            const fr = v - fl;
+            var q: i32 = @intFromFloat(fl);
+            if (fr > 0.5) {
+                q += 1;
+            } else if (fr == 0.5) {
+                q += q & 1; // ties to even: bump odd down-rounded values up
+            }
+            bytes[o + 2 + i] = @as(u32, @bitCast(q)) & 0xff;
+        }
+    }
+    const dst_word = (pc.u2 / 64) * 17 + idx * 17;
+    var w: u32 = 0;
+    while (w < 17) : (w += 1) {
+        const p4 = w * 4;
+        const word = bytes[p4] | (bytes[p4 + 1] << 8) | (bytes[p4 + 2] << 16) | (bytes[p4 + 3] << 24);
+        b.data[dst_word + w] = @bitCast(word);
+    }
+}
+
 // kv_store_f16: convert-store f32 K/V into an f16-packed cache. One thread per
 // destination f32 slot = two f16 elements: reads a.data[u3 + 2*idx .. +1] (f32),
 // packs the two f16 into one u32 slot at b.data[u2 + idx]. u0 = slot count

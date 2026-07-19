@@ -976,7 +976,8 @@ fn freeDiffuser() void {
         // model-clear would leave dangling pointers behind.
         if (g_viewer) |v| v.open = false;
         if (g_session) |s| s.clearImageRefs();
-        if (g_carry) |*c| for (c.items) |*m| m.images.clearRetainingCapacity();
+        if (g_carry) |*c| for (c.items) |*m|
+            for (m.variants.items) |*v| v.images.clearRetainingCapacity();
         d.deinit();
         g_diffuser = null;
     }
@@ -1206,6 +1207,7 @@ fn buildSession(arena: std.mem.Allocator) !*chat.Session {
         .vram_limit_frac = g_config.vram_limit_frac,
         .reasoning = g_config.reasoning,
         .kv_dtype = toKvDtype(g_config.kv_dtype),
+        .regen_cache_mb = g_config.regen_cache_mb,
     });
     return s;
 }
@@ -1217,6 +1219,7 @@ fn toKvDtype(d: config.KvDtype) tp.llm.kv_cache.KvDtype {
     return switch (d) {
         .f32 => .f32,
         .f16 => .f16,
+        .q8_0 => .q8_0,
     };
 }
 
@@ -1324,7 +1327,10 @@ fn renderMessage(s: ?*chat.Session, m: *const chat.Message, idx: usize) void {
     // Images the user attached to this message.
     for (m.attachments.items, 0..) |gi, ai| renderGenImage(s, gi, ai);
 
-    const p = parseThink(m.text.items);
+    // Everything below shows the message's ACTIVE variant (the ‹/› nav on the
+    // last assistant response switches it; older takes stay stored).
+    const v = m.activeConst();
+    const p = parseThink(v.text.items);
     // Only the last assistant message is actively generating; "Thinking…" means
     // the block is still open AND generation is live. A think block left open
     // because generation stopped (e.g. hit max tokens) reads "Thoughts". With no
@@ -1374,7 +1380,7 @@ fn renderMessage(s: ?*chat.Session, m: *const chat.Message, idx: usize) void {
             })) dvui.clipboardTextSet(p.answer);
             hint.hover(@src(), &wd, "Copy the reply as markdown");
         }
-    } else if (m.role == .assistant and p.think == null and m.images.items.len == 0) {
+    } else if (m.role == .assistant and p.think == null and v.images.items.len == 0) {
         var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal });
         defer tl.deinit();
         if (live) {
@@ -1385,9 +1391,70 @@ fn renderMessage(s: ?*chat.Session, m: *const chat.Message, idx: usize) void {
         }
     }
 
-    // Generated images requested by this message, below its text. Offset the
+    // Generated images requested by this variant, below its text. Offset the
     // id base so it can't collide with attachment image ids in this bubble.
-    for (m.images.items, 0..) |gi, gi_idx| renderGenImage(s, gi, 100_000 + gi_idx);
+    for (v.images.items, 0..) |gi, gi_idx| renderGenImage(s, gi, 100_000 + gi_idx);
+
+    // ‹ n/m › navigation on the LAST assistant response (TODO #3): ‹ shows the
+    // previous take, › the next — or, on the newest take, regenerates a fresh
+    // one. Hidden while generating (Stop is the control then) and on a carried
+    // read-only transcript (no session to regenerate with). Images belonging
+    // to a non-active take keep generating in the engine's unified queue.
+    if (!is_user) if (s) |ss| {
+        const nmsg = ss.messages.items.len;
+        if (idx + 1 == nmsg and nmsg >= 2 and !ss.busy() and
+            ss.messages.items[nmsg - 2].role == .user)
+            renderVariantNav(ss, m);
+    };
+}
+
+/// The ‹ n/m › variant-navigation row (see renderMessage). Back is disabled
+/// (dimmed, inert) on the first take; next past the newest take regenerates.
+fn renderVariantNav(s: *chat.Session, m: *const chat.Message) void {
+    const theme = dvui.themeGet();
+    const n = m.variants.items.len;
+    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .margin = .{ .y = 2 } });
+    defer row.deinit();
+
+    const icon_opts: dvui.Options = .{
+        .min_size_content = .{ .w = 16, .h = 16 },
+        .padding = dvui.Rect.all(2),
+        .gravity_y = 0.5,
+    };
+    const can_back = m.cur > 0;
+    var bwd: dvui.WidgetData = undefined;
+    var opts = icon_opts;
+    opts.data_out = &bwd;
+    if (!can_back) opts.color_text = theme.text.lerp(theme.fill, 0.75);
+    if (dvui.buttonIcon(@src(), "prev-variant", dvui.entypo.chevron_small_left, .{}, .{}, opts) and can_back) {
+        switch (chat.navTarget(m.cur, n, .back)) {
+            .select => |i| s.selectVariant(i),
+            else => {},
+        }
+    }
+    if (can_back) hint.hover(@src(), &bwd, "Previous response");
+
+    if (n > 1) dvui.label(@src(), "{d}/{d}", .{ m.cur + 1, n }, .{
+        .gravity_y = 0.5,
+        .color_text = theme.text.lerp(theme.fill, 0.4),
+        .padding = .{ .x = 2, .w = 2 },
+    });
+
+    const at_newest = m.cur + 1 == n;
+    var nwd: dvui.WidgetData = undefined;
+    opts = icon_opts;
+    opts.data_out = &nwd;
+    if (dvui.buttonIcon(@src(), "next-variant", dvui.entypo.chevron_small_right, .{}, .{}, opts)) {
+        switch (chat.navTarget(m.cur, n, .next)) {
+            .select => |i| s.selectVariant(i),
+            .regenerate => s.regenerate() catch |err| std.log.err("regenerate failed: {t}", .{err}),
+            .none => {},
+        }
+    }
+    hint.hover(@src(), &nwd, if (at_newest)
+        "Generate a new response"
+    else
+        "Next response");
 }
 
 /// Render answer text as markdown with `<image>…</image>` tool-call tags

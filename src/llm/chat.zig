@@ -89,6 +89,7 @@ pub fn supportsThinking() bool {
 /// arch→family mapping (used by the session loader and the GUI's pre-load
 /// capability probe).
 pub fn familyForArch(arch: []const u8) ?Family {
+    if (std.mem.eql(u8, arch, "qwen3")) return .chatml;
     if (std.mem.eql(u8, arch, "qwen35")) return .chatml;
     if (std.mem.eql(u8, arch, "gemma3")) return .gemma;
     if (std.mem.eql(u8, arch, "gemma4")) return .gemma4;

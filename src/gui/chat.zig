@@ -1,6 +1,7 @@
-//! Chat session for tp-gui: owns the resident LLM (Qwen3.5 hybrid on the
-//! zig-cuda backend) and runs generation on a background thread, streaming
-//! decoded tokens back to the UI through a mutex-guarded queue.
+//! Chat session for tp-gui: owns the resident LLM (qwen3 / qwen35 / gemma3 /
+//! gemma4 on the CUDA backends — see `Arch`) and runs generation on a
+//! background thread, streaming decoded tokens back to the UI through a
+//! mutex-guarded queue.
 //!
 //! Threading contract:
 //!  - The UI thread calls `submit` (starts a turn) and `poll` (drains streamed
@@ -16,6 +17,8 @@ const config = @import("config.zig");
 const toolcall = @import("toolcall.zig");
 const diffuser = @import("diffuser.zig");
 
+const qwen3 = tp.models.qwen3;
+const qwen3_cuda = tp.models.qwen3_cuda;
 const qwen35 = tp.models.qwen35;
 const qwen35_cuda = tp.models.qwen35_cuda;
 const vit35 = tp.models.vit35;
@@ -34,9 +37,18 @@ const gemma4_vit_cuda = tp.models.gemma4_vit_cuda;
 /// stable address (it does — inside the heap-pinned Session) and its tag is
 /// never reassigned after init.
 const Arch = union(enum) {
+    qwen3: struct { lm: qwen3.CausalLM, model: qwen3_cuda.CudaLM, vit: ?NoVit = null },
     qwen35: struct { lm: qwen35.Model, model: qwen35_cuda.CudaLM, vit: ?vit35.Vit = null },
     gemma3: struct { lm: gemma3.Model, model: gemma3_cuda.CudaLM, vit: ?gemma_vit.Vit = null },
     gemma4: struct { lm: gemma4.Model, model: gemma4_cuda.CudaLM, vit: ?gemma4_vit.Vit = null },
+};
+
+/// Placeholder tower type for text-only architectures (plain qwen3): satisfies
+/// the duck-typed `vit` field the arch bundles share; always null.
+const NoVit = struct {
+    pub fn deinit(self: *NoVit) void {
+        _ = self;
+    }
 };
 const cuda = tp.gpu.cuda;
 const engine = tp.llm.engine;
@@ -90,27 +102,112 @@ pub const Role = enum { user, assistant };
 pub const GenStatus = diffuser.GenStatus;
 pub const GenImage = diffuser.GenImage;
 
-pub const Message = struct {
-    role: Role,
+/// One take of a message: its streamed text plus the images that take
+/// requested. Assistant messages accumulate variants as the user regenerates
+/// (the ‹/› buttons); user messages always have exactly one.
+pub const Variant = struct {
     /// UTF-8 text; grows as tokens stream in (assistant) or fixed (user).
     text: std.ArrayList(u8) = .empty,
-    /// Images requested by this (assistant) message, in emission order.
+    /// Images requested by this (assistant) variant, in emission order.
     images: std.ArrayList(*GenImage) = .empty,
-    /// Images the user attached to this (user) message (display only).
-    attachments: std.ArrayList(*GenImage) = .empty,
-    /// Set once the completed turn has been scanned for image tool calls.
+    /// Set once the completed variant has been scanned for image tool calls.
     images_scanned: bool = false,
 
-    pub fn deinit(self: *Message, gpa: std.mem.Allocator) void {
+    pub fn deinit(self: *Variant, gpa: std.mem.Allocator) void {
         self.text.deinit(gpa);
         // `images` are BORROWED (the app-level engine owns generated images and
-        // frees them); only free the ArrayList storage. `attachments` (user
-        // images) are owned here.
+        // frees them); only free the ArrayList storage.
         self.images.deinit(gpa);
+    }
+};
+
+pub const Message = struct {
+    role: Role,
+    /// The message's takes, oldest first — always at least one (init/adopt
+    /// guarantee it). `cur` selects the ACTIVE take: the one the UI displays
+    /// and the one the model context contains. Regeneration appends a variant;
+    /// ‹/› navigation moves `cur` (see `navTarget`).
+    variants: std.ArrayList(Variant) = .empty,
+    cur: usize = 0,
+    /// Images the user attached to this (user) message — displayed inline and
+    /// the re-encode source when the following response is regenerated.
+    attachments: std.ArrayList(*GenImage) = .empty,
+
+    pub fn init(gpa: std.mem.Allocator, role: Role) !Message {
+        var m: Message = .{ .role = role };
+        try m.variants.append(gpa, .{});
+        return m;
+    }
+
+    pub fn active(self: *Message) *Variant {
+        return &self.variants.items[self.cur];
+    }
+    pub fn activeConst(self: *const Message) *const Variant {
+        return &self.variants.items[self.cur];
+    }
+
+    pub fn deinit(self: *Message, gpa: std.mem.Allocator) void {
+        for (self.variants.items) |*v| v.deinit(gpa);
+        self.variants.deinit(gpa);
+        // `attachments` (user images) are owned here.
         for (self.attachments.items) |gi| freeGenImage(gpa, gi);
         self.attachments.deinit(gpa);
     }
 };
+
+/// A turn-boundary context checkpoint: the model's non-append-only state
+/// (`snap`, from the arch's `checkpoint()`) taken at `q` committed tokens,
+/// with `ids[0..ids_len)` being the boundary's prompt (everything prefilled
+/// except the last token, which `engine.generate` forwards). Restoring it
+/// rolls the whole context back to "user turn cached, nothing generated" —
+/// in O(snapshot) time, independent of context length.
+pub const Checkpoint = struct { q: usize, ids_len: usize, snap: []u8 };
+
+pub fn checkpointsBytes(list: []const Checkpoint) u64 {
+    var total: u64 = 0;
+    for (list) |cp| total += cp.snap.len;
+    return total;
+}
+
+/// Bytes → MiB for the `[ckpt]` log lines.
+fn mib(bytes: u64) f64 {
+    return @as(f64, @floatFromInt(bytes)) / (1 << 20);
+}
+
+/// Drop oldest-first until the snapshots fit `budget` — but ALWAYS keep the
+/// newest one, even when it alone exceeds the budget (or the budget is 0):
+/// the last turn must stay instantly regenerable; the budget only bounds how
+/// many OLDER boundaries are kept around.
+pub fn evictCheckpointsToBudget(gpa: std.mem.Allocator, list: *std.ArrayList(Checkpoint), budget: u64) void {
+    while (list.items.len > 1 and checkpointsBytes(list.items) > budget) {
+        gpa.free(list.orderedRemove(0).snap);
+    }
+}
+
+/// Invalidate checkpoints past a rollback point: positions > `q` no longer
+/// exist after a restore to `q`.
+pub fn dropCheckpointsAfter(gpa: std.mem.Allocator, list: *std.ArrayList(Checkpoint), q: usize) void {
+    while (list.items.len > 0 and list.items[list.items.len - 1].q > q) {
+        gpa.free(list.pop().?.snap);
+    }
+}
+
+pub fn clearCheckpoints(gpa: std.mem.Allocator, list: *std.ArrayList(Checkpoint)) void {
+    for (list.items) |cp| gpa.free(cp.snap);
+    list.clearRetainingCapacity();
+}
+
+/// What the ‹ (back) / › (next) buttons on the last assistant response do,
+/// carousel-style: back/next step through the existing variants; next pressed
+/// on the NEWEST variant means "regenerate a fresh one". Back on the first
+/// variant does nothing (the UI disables it). Pure, so it's unit-testable.
+pub const Nav = union(enum) { none, select: usize, regenerate };
+pub fn navTarget(cur: usize, n_variants: usize, dir: enum { back, next }) Nav {
+    return switch (dir) {
+        .back => if (cur == 0) .none else .{ .select = cur - 1 },
+        .next => if (cur + 1 < n_variants) .{ .select = cur + 1 } else .regenerate,
+    };
+}
 
 pub const DiffConfig = diffuser.DiffConfig;
 
@@ -195,6 +292,13 @@ pub const Options = struct {
     reasoning: bool = true,
     /// KV-cache element storage type (f32 default; f16 halves the KV footprint).
     kv_dtype: kv_cache.KvDtype = .f32,
+    /// Host-RAM budget (MB) for turn-boundary context checkpoints (the fast
+    /// regenerate/variant-switch path). Snapshot size is context-independent
+    /// but per-arch (qwen35: tens of MB), so this bounds how many turn
+    /// boundaries stay instantly rewindable. The newest turn's checkpoint is
+    /// ALWAYS kept, whatever the budget — only older boundaries (future
+    /// branch points) are evicted; a rollback past those re-prefills.
+    regen_cache_mb: usize = 2048,
 };
 
 /// Map the GUI's engine-free `config.Sampling` onto the library's
@@ -274,6 +378,38 @@ pub const Session = struct {
     /// image generation (priority = image). Cleared once they've been promoted
     /// back (queue drained) or on a new chat.
     image_evicted: bool = false,
+    /// Set when a regenerate / variant switch rebuilt `ids` for a transcript
+    /// the device context no longer matches. The next turn's worker clears the
+    /// context (KV + recurrent state) before prefilling, so the whole rebuilt
+    /// `ids` replays. UI-thread writes, worker-thread read — never concurrent
+    /// (both only happen while no worker runs / at worker start).
+    ctx_dirty: bool = false,
+    /// Turn-boundary checkpoints, oldest first (strictly increasing `q`).
+    /// Appended by the worker at each turn's boundary (takeCheckpoint), read
+    /// by the UI thread only while idle — the same non-overlap discipline as
+    /// `messages`. Emptied whenever cache CONTENT is rebuilt (reset, dtype
+    /// rebuild, full-reprefill fallback): a snapshot pairs with the exact KV
+    /// rows it was taken over.
+    checkpoints: std.ArrayList(Checkpoint) = .empty,
+    /// Byte budget for `checkpoints` (Options.regen_cache_mb). Staged like
+    /// sampling: updateSettings writes `pending_budget`, the next turn
+    /// boundary adopts it.
+    checkpoint_budget: u64 = 0,
+    pending_budget: u64 = 0,
+    /// `q` of the checkpoint covering the CURRENT last turn, or null when
+    /// that boundary has none (arch unsupported, snapshot failed) — then
+    /// regenerate/variant-switch take the full-reprefill fallback. Written by
+    /// the worker (takeCheckpoint) and the UI invalidation paths.
+    cur_turn_q: ?usize = null,
+    /// A fast rollback was requested: the next worker turn restores the
+    /// checkpoint at this position (on its own context-bound thread) before
+    /// anything else. Cleared together with `checkpoints` (invalidate), so it
+    /// can never name a freed snapshot.
+    pending_restore: ?usize = null,
+    /// Whether a new turn's payload (turn_text/turn_images) is staged for the
+    /// worker to build+prefill. False for a fast regenerate, which rolls back
+    /// to an already-prefilled boundary instead.
+    turn_staged: bool = false,
     /// Cross-thread residency intent published by the app's `vram.Arbiter`. The
     /// worker enacts it at each token boundary (`engine.residency_poll`) on its
     /// own context-bound thread; the arbiter enacts it directly while idle. The
@@ -364,7 +500,15 @@ pub const Session = struct {
         // model retains a `*const lm` into the union, which is stable (self is
         // heap-pinned and the tag is set once). Vision towers are scoped
         // per-encode and never stay resident under the LLM.
-        if (std.mem.eql(u8, arch_str, "qwen35")) {
+        if (std.mem.eql(u8, arch_str, "qwen3")) {
+            self.arch = .{ .qwen3 = .{ .lm = try qwen3.CausalLM.load(arena, .{ .gguf = &self.gguf }), .model = undefined } };
+            const a = &self.arch.qwen3;
+            errdefer a.lm.deinit();
+            // Plain qwen3 is text-only: no mmproj/vision tower exists for it.
+            if (self.mmproj_gguf != null)
+                std.log.warn("mmproj configured, but qwen3 is text-only — vision disabled", .{});
+            a.model = try qwen3_cuda.CudaLM.init(gpa, self.be, &a.lm, cap, @min(512, cap.max));
+        } else if (std.mem.eql(u8, arch_str, "qwen35")) {
             self.arch = .{ .qwen35 = .{ .lm = try qwen35.Model.load(arena, &self.gguf), .model = undefined } };
             const a = &self.arch.qwen35;
             errdefer a.lm.deinit();
@@ -388,6 +532,14 @@ pub const Session = struct {
             errdefer if (a.vit) |*v| v.deinit();
             a.model = try gemma4_cuda.CudaLM.init(gpa, self.be, &a.lm, cap);
         } else return error.UnsupportedArchitecture;
+
+        // A hybrid split's host matmuls need a valid Io BEFORE the first
+        // step(): an over-budget model has CPU layers from init, and the
+        // first turn's PREFILL (which takes no io) already runs them. Unseeded
+        // it fails closed (error.SplitIoUnset) instead of faulting.
+        switch (self.arch) {
+            inline else => |*a| a.model.io = io,
+        }
 
         self.opts = .{
             .max_new_tokens = cfg.max_new_tokens,
@@ -419,6 +571,13 @@ pub const Session = struct {
         self.turn_text = "";
         self.turn_images = .empty;
         self.image_evicted = false;
+        self.ctx_dirty = false;
+        self.checkpoints = .empty;
+        self.checkpoint_budget = @as(u64, cfg.regen_cache_mb) << 20;
+        self.pending_budget = self.checkpoint_budget;
+        self.cur_turn_q = null;
+        self.pending_restore = null;
+        self.turn_staged = false;
         self.images_enabled = cfg.images_enabled;
 
         // Dynamic VRAM offload (GUI_VRAM.md): always arm the dynamic split (free
@@ -503,9 +662,25 @@ pub const Session = struct {
             inline else => |*a| a.model.resetResidency(self.vram_budget) catch |err|
                 std.log.err("reset: residency reset failed: {t}", .{err}),
         }
+        self.ctx_dirty = false; // context and (restored) ids agree again
+        self.invalidateCheckpoints(); // they snapshot a context that no longer exists
 
         self.gen_err = null;
         self.wake();
+    }
+
+    /// Drop every turn checkpoint (and any rollback request naming one). Called
+    /// whenever the cache CONTENT is about to be rebuilt or destroyed — a
+    /// snapshot is only meaningful over the exact rows it was taken with.
+    fn invalidateCheckpoints(self: *Session) void {
+        if (self.checkpoints.items.len > 0) {
+            std.log.info("[ckpt] dropped {d} checkpoint(s) ({d:.1} MiB) — context invalidated", .{
+                self.checkpoints.items.len, mib(checkpointsBytes(self.checkpoints.items)),
+            });
+        }
+        clearCheckpoints(self.gpa, &self.checkpoints);
+        self.cur_turn_q = null;
+        self.pending_restore = null;
     }
 
     /// Rebuild the KV cache at a new element dtype (the config f32<->f16 toggle),
@@ -521,6 +696,7 @@ pub const Session = struct {
         switch (self.arch) {
             inline else => |*a| try a.model.reinitCache(dtype),
         }
+        self.invalidateCheckpoints(); // cache emptied; snapshots pair with old rows
         self.wake();
     }
 
@@ -538,7 +714,8 @@ pub const Session = struct {
     /// frees the diffusion engine (diffusion model cleared) so no message is
     /// left pointing at freed memory. Text is untouched.
     pub fn clearImageRefs(self: *Session) void {
-        for (self.messages.items) |*m| m.images.clearRetainingCapacity();
+        for (self.messages.items) |*m|
+            for (m.variants.items) |*v| v.images.clearRetainingCapacity();
     }
 
     /// Apply the non-load-affecting settings live (no reload, so the chat is
@@ -554,6 +731,8 @@ pub const Session = struct {
         // next turn boundary (a turn possibly generating right now keeps the
         // params it started with — no racing the worker's read of `opts`).
         self.pending_sampling = samplingParams(cfg);
+        // Checkpoint budget likewise (the worker reads it in takeCheckpoint).
+        self.pending_budget = @as(u64, cfg.regen_cache_mb) << 20;
     }
 
     // --- vram.Participant adapter --------------------------------------------
@@ -675,15 +854,31 @@ pub const Session = struct {
     /// past images). Takes ownership of `msgs`.
     pub fn adoptTranscript(self: *Session, msgs: std.ArrayList(Message)) !void {
         self.messages = msgs;
-        for (self.messages.items) |*m| switch (m.role) {
-            .user => try chat.appendUser(&self.tok, self.gpa, m.text.items, &self.ids),
+        try self.replayTranscript(self.messages.items);
+        self.wake();
+    }
+
+    /// Rebuild `ids` from scratch: the init prompt prefix + each message's
+    /// ACTIVE variant replayed through this model's tokenizer/chat template.
+    /// The device context is NOT touched — callers either run on a fresh
+    /// session (adopt: KV len 0, so the next prefill replays everything) or
+    /// set `ctx_dirty` so the next turn's worker clears it first. Past image
+    /// turns replay as their text only (embeddings are not re-encoded — the
+    /// model won't re-see those images), the same accepted limitation as a
+    /// model-swap adopt; the CURRENT turn's images are re-encoded for real on
+    /// a regenerate (see `regenerate`).
+    fn replayTranscript(self: *Session, msgs: []const Message) !void {
+        self.ids.clearRetainingCapacity();
+        try self.ids.appendSlice(self.gpa, self.initial_ids.items);
+        for (msgs) |*m| switch (m.role) {
+            .user => try chat.appendUser(&self.tok, self.gpa, m.activeConst().text.items, &self.ids),
             .assistant => {
                 try chat.openAssistant(&self.tok, self.gpa, &self.ids);
-                if (m.text.items.len > 0) try self.tok.encode(self.gpa, m.text.items, &self.ids);
+                const t = m.activeConst().text.items;
+                if (t.len > 0) try self.tok.encode(self.gpa, t, &self.ids);
                 try chat.closeAssistant(self.gpa, &self.ids);
             },
         };
-        self.wake();
     }
 
     pub fn deinit(self: *Session) void {
@@ -707,6 +902,8 @@ pub const Session = struct {
         if (self.mmproj_gguf) |*g| g.deinit();
         for (self.messages.items) |*m| m.deinit(self.gpa);
         self.messages.deinit(self.gpa);
+        clearCheckpoints(self.gpa, &self.checkpoints);
+        self.checkpoints.deinit(self.gpa);
         self.pending.deinit(self.gpa);
         self.ids.deinit(self.gpa);
         self.initial_ids.deinit(self.gpa);
@@ -743,11 +940,14 @@ pub const Session = struct {
     }
 
     /// Total KV-cache bytes for the current context (all attention layers,
-    /// logical footprint — K+V, f32) — what the context "costs" in memory
-    /// regardless of whether a given layer's KV lives on the GPU or the CPU.
+    /// logical footprint — K+V at the session's KV dtype) — what the context
+    /// "costs" in memory regardless of whether a given layer's KV lives on the
+    /// GPU or the CPU.
     pub fn ctxKvBytes(self: *Session) u64 {
         return switch (self.arch) {
-            .qwen35 => |*a| @as(u64, a.model.cached()) * a.model.cfg.kvDim() * 8 * a.model.cfg.nAttnLayers(),
+            // qwen3 is uniform full attention: every layer holds the whole context.
+            .qwen3 => |*a| 2 * @as(u64, a.model.cfg.n_layers) * a.model.kv_dtype.sizeBytes(a.model.cached() * a.model.cfg.kvDim()),
+            .qwen35 => |*a| 2 * @as(u64, a.model.cfg.nAttnLayers()) * a.model.kv_dtype.sizeBytes(a.model.cached() * a.model.cfg.kvDim()),
             // gemma3/gemma4 LOCAL (sliding-window) layers hold only a fixed ring
             // (window + one prefill chunk), so their footprint plateaus instead
             // of growing with the conversation (TODO lever 1); GLOBAL layers hold
@@ -758,7 +958,7 @@ pub const Session = struct {
                 const ring: u64 = if (cfg.sliding_window != 0) cfg.sliding_window + 128 else cached;
                 var rows: u64 = 0;
                 for (0..cfg.n_layers) |l| rows += if (cfg.isGlobal(l)) cached else @min(cached, ring);
-                break :blk rows * cfg.kvDim() * 8;
+                break :blk 2 * @as(u64, a.model.kv_dtype.sizeBytes(rows * cfg.kvDim()));
             },
             .gemma4 => |*a| blk: {
                 const cfg = a.model.cfg;
@@ -769,7 +969,7 @@ pub const Session = struct {
                     const layer_rows = if (cfg.isGlobal(l)) cached else @min(cached, ring);
                     kv += layer_rows * cfg.kvDim(l);
                 }
-                break :blk kv * 8;
+                break :blk 2 * @as(u64, a.model.kv_dtype.sizeBytes(kv));
             },
         };
     }
@@ -839,25 +1039,163 @@ pub const Session = struct {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0 and self.attach_view.items.len == 0) return;
 
-        // Turn boundary: adopt any sampling changes staged by updateSettings,
-        // and draw this turn's sampling seed so no two turns replay the same
-        // RNG stream. Safe here (UI thread, no worker running yet).
+        // Turn boundary: adopt any sampling/budget changes staged by
+        // updateSettings, and draw this turn's sampling seed so no two turns
+        // replay the same RNG stream. Safe here (UI thread, no worker yet).
         self.opts.sampling = self.pending_sampling;
+        self.checkpoint_budget = self.pending_budget;
         self.opts.seed = self.seeds.next();
 
-        var um: Message = .{ .role = .user };
-        if (trimmed.len > 0) try um.text.appendSlice(self.gpa, trimmed);
+        var um = try Message.init(self.gpa, .user);
+        if (trimmed.len > 0) try um.active().text.appendSlice(self.gpa, trimmed);
         try um.attachments.appendSlice(self.gpa, self.attach_view.items);
         self.attach_view.clearRetainingCapacity();
         try self.messages.append(self.gpa, um);
-        try self.messages.append(self.gpa, .{ .role = .assistant });
+        try self.messages.append(self.gpa, try Message.init(self.gpa, .assistant));
 
         // Stash the turn; the worker builds tokens after encoding any images
         // (encoding must run on the worker's CUDA thread).
         self.turn_text = if (trimmed.len > 0) try self.gpa.dupe(u8, trimmed) else "";
         try self.turn_images.appendSlice(self.gpa, self.attach_rgb.items);
         self.attach_rgb.clearRetainingCapacity();
+        self.turn_staged = true;
 
+        try self.spawnWorker();
+    }
+
+    /// The checkpoint covering the CURRENT last turn's boundary, when one
+    /// exists — the fast-rollback target for regenerate/variant switch.
+    fn turnCheckpoint(self: *Session) ?*const Checkpoint {
+        const tq = self.cur_turn_q orelse return null;
+        for (self.checkpoints.items) |*cp| {
+            if (cp.q == tq) return cp;
+        }
+        return null;
+    }
+
+    /// Regenerate the LAST assistant response as a NEW variant (the › button
+    /// on the newest variant). The displaced variant keeps its text AND its
+    /// images — an in-flight generation for it just keeps going in the
+    /// app-level engine's queue; nothing is canceled here. FAST path: roll
+    /// the context back to this turn's checkpoint (O(snapshot), keeps all
+    /// prior KV — image embeddings included). FALLBACK (no checkpoint: arch
+    /// unsupported, disabled, or a swap-adopted transcript): re-stage the turn
+    /// from the transcript and replay the whole context, re-encoding this
+    /// turn's attachments through the real vision path. No-op while busy.
+    pub fn regenerate(self: *Session) !void {
+        if (self.busy()) return;
+        const n = self.messages.items.len;
+        if (n < 2) return;
+        const target = &self.messages.items[n - 1];
+        const um = &self.messages.items[n - 2];
+        if (target.role != .assistant or um.role != .user) return;
+
+        // Turn boundary, exactly like submit: adopt staged sampling/budget
+        // changes and draw a fresh seed so the new variant never replays the
+        // previous variant's RNG stream (SeedSeq is deliberately not reset).
+        self.opts.sampling = self.pending_sampling;
+        self.checkpoint_budget = self.pending_budget;
+        self.opts.seed = self.seeds.next();
+
+        // The new (empty) variant becomes the active one and streams like a
+        // normal turn.
+        try target.variants.append(self.gpa, .{});
+        target.cur = target.variants.items.len - 1;
+
+        if (self.turnCheckpoint()) |cp| {
+            // ids[0..ids_len) are byte-identical to what the boundary saw
+            // (append-only within a turn; a variant switch re-derives the
+            // same tokens), so truncating is enough — the worker restores the
+            // snapshot on its own context-bound thread.
+            std.log.info("[ckpt] regenerate (take {d}): fast rollback to boundary @tok {d}", .{
+                target.variants.items.len, cp.q,
+            });
+            self.ids.shrinkRetainingCapacity(cp.ids_len);
+            self.pending_restore = cp.q;
+            self.turn_staged = false;
+        } else {
+            std.log.info("[ckpt] regenerate (take {d}): no checkpoint for this turn — full transcript replay", .{
+                target.variants.items.len,
+            });
+            // Rebuild `ids` up to BEFORE this turn's user message; the worker
+            // re-builds the user turn itself (buildAndPrefillTurn). The full
+            // replay rewrites cache contents, so surviving snapshots (none
+            // today, but branching-proof) would pair with stale rows.
+            self.invalidateCheckpoints();
+            try self.replayTranscript(self.messages.items[0 .. n - 2]);
+            self.ctx_dirty = true;
+
+            // Re-stage the turn payload from the transcript (what submit
+            // stashed): the user text plus raw RGB derived from the attachment
+            // display RGBA (a lossless round-trip of the attached pixels).
+            const text = um.activeConst().text.items;
+            self.turn_text = if (text.len > 0) try self.gpa.dupe(u8, text) else "";
+            for (um.attachments.items) |gi| {
+                const rgba = gi.rgba orelse continue;
+                const px = gi.width * gi.height;
+                const rgb = try self.gpa.alloc(u8, px * 3);
+                errdefer self.gpa.free(rgb);
+                for (0..px) |i| {
+                    rgb[i * 3 + 0] = rgba[i * 4 + 0];
+                    rgb[i * 3 + 1] = rgba[i * 4 + 1];
+                    rgb[i * 3 + 2] = rgba[i * 4 + 2];
+                }
+                try self.turn_images.append(self.gpa, .{ .rgb = rgb, .width = gi.width, .height = gi.height });
+            }
+            self.turn_staged = true;
+        }
+
+        // Drop any stale streamed bytes so nothing bleeds into the new variant
+        // (poll drains every frame while idle, so this is belt-and-suspenders).
+        self.mu.lockUncancelable(self.io);
+        self.pending.clearRetainingCapacity();
+        self.mu.unlock(self.io);
+
+        try self.spawnWorker();
+    }
+
+    /// Make variant `idx` of the LAST assistant message the active one (the
+    /// ‹/› navigation) and re-derive `ids` to match, so the next turn
+    /// continues from the DISPLAYED response. FAST path (checkpoint live):
+    /// swap just this turn's assistant text in `ids` and request a rollback
+    /// the next worker turn consumes — prior KV stays. FALLBACK: full
+    /// transcript replay through a cleared context. No-op while generating,
+    /// on a non-assistant tail, or for an out-of-range/unchanged index.
+    pub fn selectVariant(self: *Session, idx: usize) void {
+        if (self.busy()) return;
+        if (self.messages.items.len == 0) return;
+        const m = &self.messages.items[self.messages.items.len - 1];
+        if (m.role != .assistant or idx >= m.variants.items.len or idx == m.cur) return;
+        m.cur = idx;
+        fast: {
+            const cp = self.turnCheckpoint() orelse break :fast;
+            self.ids.shrinkRetainingCapacity(cp.ids_len);
+            const q = cp.q; // cp points into `checkpoints`; don't hold it across appends
+            const t = m.activeConst().text.items;
+            if (t.len > 0) self.tok.encode(self.gpa, t, &self.ids) catch break :fast;
+            chat.closeAssistant(self.gpa, &self.ids) catch break :fast;
+            self.pending_restore = q;
+            std.log.info("[ckpt] variant switch → take {d}/{d}: rollback to boundary @tok {d} queued for the next turn", .{
+                idx + 1, m.variants.items.len, q,
+            });
+            self.wake();
+            return;
+        }
+        // Fallback (no checkpoint, or the ids surgery failed mid-way): rebuild
+        // ids wholesale and replay through a cleared context next turn.
+        std.log.info("[ckpt] variant switch → take {d}/{d}: no checkpoint — full transcript replay next turn", .{
+            idx + 1, m.variants.items.len,
+        });
+        self.invalidateCheckpoints();
+        self.replayTranscript(self.messages.items) catch |err|
+            std.log.err("variant switch: transcript replay failed: {t}", .{err});
+        self.ctx_dirty = true;
+        self.wake();
+    }
+
+    /// Shared tail of submit/regenerate: arm the cancel flag and start the
+    /// generation worker for the already-staged turn.
+    fn spawnWorker(self: *Session) !void {
         self.gen_err = null;
         self.cancel.store(false, .release);
         self.generating.store(true, .release);
@@ -873,7 +1211,7 @@ pub const Session = struct {
         // device op (else cuMemcpyHtoD fails with INVALID_CONTEXT).
         self.be.bindThread();
 
-        self.buildAndPrefillTurn() catch |err| {
+        self.prepareTurn() catch |err| {
             self.gen_err = err;
             std.log.err("turn setup failed: {t}", .{err});
             self.freeTurn();
@@ -881,6 +1219,10 @@ pub const Session = struct {
             self.wake();
             return;
         };
+        // Snapshot this turn's boundary so it can be regenerated / switched
+        // in O(snapshot) later. Non-fatal: without one, a later rollback just
+        // takes the full-reprefill fallback.
+        self.takeCheckpoint();
 
         var sink: TokenSink = .{
             .iface = .{ .vtable = &TokenSink.vtable, .buffer = &self.sink_buf },
@@ -918,11 +1260,93 @@ pub const Session = struct {
         self.wake();
     }
 
-    /// Build this turn's tokens and prefill them. Text-only turns defer prefill
-    /// to `engine.generate`; image turns encode each image (the arch's vision
-    /// tower on CUDA), build the interleaved vision token layout, and inject
-    /// the embeddings at their pad rows — mirroring `llm_main.imageTurn`.
-    fn buildAndPrefillTurn(self: *Session) !void {
+    /// Bring the device context in line with `ids`, build any staged turn, and
+    /// prefill up to the turn boundary (everything but the last token, which
+    /// `engine.generate` forwards). All device work on the worker's thread.
+    fn prepareTurn(self: *Session) !void {
+        // Fast rollback (regenerate / variant switch over a live checkpoint):
+        // truncate + restore the boundary snapshot. The caller already
+        // arranged `ids`; the checkpoint cannot have been freed since (every
+        // invalidation also clears `pending_restore`), so a miss is a logic
+        // error — surface it rather than limp into a corrupt context.
+        if (self.pending_restore) |q| {
+            self.pending_restore = null;
+            const before_tok = self.ctxTokens();
+            var found = false;
+            var snap_bytes: usize = 0;
+            for (self.checkpoints.items) |*cp| {
+                if (cp.q != q) continue;
+                switch (self.arch) {
+                    // The @hasDecl gate only satisfies future archs without
+                    // checkpoint support at comptime — takeCheckpoint never
+                    // records a boundary for them, so this path can't be
+                    // reached at runtime (falls to CheckpointMissing if it is).
+                    inline else => |*a| if (comptime @hasDecl(@TypeOf(a.model), "restoreCheckpoint")) {
+                        try a.model.restoreCheckpoint(cp.snap, cp.q);
+                        snap_bytes = cp.snap.len;
+                        found = true;
+                    },
+                }
+                break;
+            }
+            if (!found) return error.CheckpointMissing;
+            // Positions past q no longer exist (branching-proof; today q is
+            // always the newest boundary, so this drops nothing).
+            const n_before = self.checkpoints.items.len;
+            dropCheckpointsAfter(self.gpa, &self.checkpoints, q);
+            const dropped = n_before - self.checkpoints.items.len;
+            std.log.info("[ckpt] rollback: ctx {d}→{d} tok ({d} discarded), restored {d:.1} MiB snapshot · {d} in cache{s}", .{
+                before_tok,                   q,
+                before_tok -| q,              mib(snap_bytes),
+                self.checkpoints.items.len,   if (dropped > 0) " (later boundaries dropped)" else "",
+            });
+        }
+        // A fallback regenerate / variant switch rebuilt `ids` for a
+        // transcript the device context no longer matches: clear the context
+        // (KV, recurrent state, ring positions — resetResidency is the one
+        // primitive that does this on every arch) so the prefill below
+        // replays the whole rebuilt transcript.
+        if (self.ctx_dirty) {
+            switch (self.arch) {
+                inline else => |*a| try a.model.resetResidency(self.vram_budget),
+            }
+            self.image_evicted = false; // offload re-armed from the baseline
+            self.ctx_dirty = false;
+            std.log.info("[ckpt] FULL REPLAY fallback: context cleared; this turn re-prefills the whole transcript (~{d} tok)", .{self.ids.items.len});
+        }
+        // Build the staged turn (image turns encode + inject inside) and
+        // prefill everything but the last prompt token, so generation always
+        // starts from a well-defined boundary — the position takeCheckpoint
+        // records. (After a fast rollback there is nothing left to prefill.)
+        // Timed as one unit so the "prefill done" line covers a turn's whole
+        // prompt processing, vision encode included.
+        const t0 = std.Io.Clock.real.now(self.io).nanoseconds;
+        const cached_before = self.ctxTokens();
+        if (self.turn_staged) try self.buildTurn();
+        switch (self.arch) {
+            inline else => |*a| {
+                const total = self.ids.items.len;
+                const cached = a.model.cached();
+                if (total >= 2 and cached + 1 < total) {
+                    if (total > cached + a.model.remaining()) try a.model.ensureCapacity(total);
+                    try a.model.prefill(self.ids.items[cached .. total - 1]);
+                }
+            },
+        }
+        const prefilled = self.ctxTokens() - cached_before;
+        if (prefilled > 0) {
+            const dt = @as(f64, @floatFromInt(std.Io.Clock.real.now(self.io).nanoseconds - t0)) / 1e9;
+            std.log.info("[llm] prefill done: {d} tok in {d:.2}s ({d:.0} tok/s) · ctx now {d} tok", .{
+                prefilled, dt, if (dt > 0) @as(f64, @floatFromInt(prefilled)) / dt else 0, self.ctxTokens(),
+            });
+        }
+    }
+
+    /// Build this turn's tokens. Text-only turns just append (prepareTurn
+    /// prefills); image turns encode each image (the arch's vision tower on
+    /// CUDA), build the interleaved vision token layout, and inject the
+    /// embeddings at their pad rows — mirroring `llm_main.imageTurn`.
+    fn buildTurn(self: *Session) !void {
         if (self.turn_images.items.len > 0 and self.hasVit()) {
             // Image tokens must run on the GPU: the offloaded-layer host path uses
             // scalar RoPE, wrong for image-grid M-RoPE positions (qwen35). Promote
@@ -935,6 +1359,7 @@ pub const Session = struct {
                     std.log.warn("promote for image turn failed: {t}", .{err}),
             }
             switch (self.arch) {
+                .qwen3 => unreachable, // text-only: hasVit() is always false here
                 .qwen35 => |*a| try self.imageTurn(a, false),
                 .gemma3 => |*a| try self.imageTurn(a, true),
                 .gemma4 => |*a| try self.imageTurnGemma4(a),
@@ -995,6 +1420,70 @@ pub const Session = struct {
         self.turn_text = "";
         for (self.turn_images.items) |im| self.gpa.free(im.rgb);
         self.turn_images.clearRetainingCapacity();
+        self.turn_staged = false;
+    }
+
+    /// Snapshot the current turn boundary (worker thread, right after
+    /// prepareTurn) so this turn can be rolled back in O(snapshot) instead of
+    /// a full re-prefill. All three GUI archs support checkpoints (qwen35:
+    /// recurrent conv/ssm state; gemma3/gemma4: the SWA rings) — the @hasDecl
+    /// gate future-proofs new archs. Skipped when this boundary already has
+    /// one (a fast regenerate lands on the same q). The NEWEST checkpoint is
+    /// always kept whatever the budget — the last turn must stay instantly
+    /// regenerable; the budget bounds how many OLDER boundaries survive as
+    /// future branch points. `cur_turn_q` records whether the CURRENT turn is
+    /// fast-rollback-capable.
+    fn takeCheckpoint(self: *Session) void {
+        switch (self.arch) {
+            inline else => |*a| {
+                if (comptime !@hasDecl(@TypeOf(a.model), "checkpoint")) {
+                    std.log.debug("[ckpt] arch has no checkpoint support; a regenerate will re-prefill", .{});
+                    self.cur_turn_q = null;
+                    return;
+                }
+                const q = a.model.cached();
+                if (self.findCheckpointQ(q)) {
+                    self.cur_turn_q = q; // fast regenerate re-landed on this boundary
+                    std.log.debug("[ckpt] boundary @tok {d} already checkpointed (regenerate)", .{q});
+                    return;
+                }
+                self.cur_turn_q = null;
+                const snap = self.gpa.alloc(u8, a.model.checkpointBytes()) catch return;
+                a.model.checkpoint(snap) catch |err| {
+                    std.log.warn("[ckpt] turn checkpoint failed ({t}); a rollback will re-prefill", .{err});
+                    self.gpa.free(snap);
+                    return;
+                };
+                self.checkpoints.append(self.gpa, .{ .q = q, .ids_len = self.ids.items.len, .snap = snap }) catch {
+                    self.gpa.free(snap);
+                    return;
+                };
+                // Eviction only ever drops OLDER boundaries (the newest — this
+                // one — is always kept, whatever the budget), so the current
+                // turn is now fast-rollback-capable unconditionally.
+                const n_before = self.checkpoints.items.len;
+                evictCheckpointsToBudget(self.gpa, &self.checkpoints, self.checkpoint_budget);
+                const evicted = n_before - self.checkpoints.items.len;
+                if (evicted > 0) {
+                    std.log.info("[ckpt] evicted {d} oldest checkpoint(s) to fit the {d} MiB budget", .{
+                        evicted, self.checkpoint_budget >> 20,
+                    });
+                }
+                self.cur_turn_q = q;
+                std.log.info("[ckpt] saved turn boundary @tok {d} ({d:.1} MiB) · {d} in cache, {d:.1}/{d} MiB used", .{
+                    q,                          mib(snap.len),
+                    self.checkpoints.items.len, mib(checkpointsBytes(self.checkpoints.items)),
+                    self.checkpoint_budget >> 20,
+                });
+            },
+        }
+    }
+
+    fn findCheckpointQ(self: *const Session, q: usize) bool {
+        for (self.checkpoints.items) |*cp| {
+            if (cp.q == q) return true;
+        }
+        return false;
     }
 
     /// UI-thread, once per frame: move streamed bytes into the live assistant
@@ -1004,7 +1493,7 @@ pub const Session = struct {
         self.mu.lockUncancelable(self.io);
         if (self.pending.items.len > 0 and self.messages.items.len > 0) {
             const last = &self.messages.items[self.messages.items.len - 1];
-            last.text.appendSlice(self.gpa, self.pending.items) catch {};
+            last.active().text.appendSlice(self.gpa, self.pending.items) catch {};
             self.pending.clearRetainingCapacity();
         }
         self.mu.unlock(self.io);
@@ -1017,16 +1506,18 @@ pub const Session = struct {
         }
     }
 
-    /// Once a turn completes, scan the last assistant message (once) for
-    /// `<image>` tool calls and queue a GenImage for each into its transcript,
-    /// using the app-level engine's defaults + seed. Called by the app after
-    /// `poll` (chat mode). The app then pumps the engine.
+    /// Once a turn completes, scan the last assistant message's ACTIVE variant
+    /// (once) for `<image>` tool calls and queue a GenImage for each into its
+    /// transcript, using the app-level engine's defaults + seed. Called by the
+    /// app after `poll` (chat mode). The app then pumps the engine.
     pub fn scanNewImages(self: *Session, d: *diffuser.Diffuser) void {
         if (!self.images_enabled or self.busy() or self.messages.items.len == 0) return;
         const last = &self.messages.items[self.messages.items.len - 1];
-        if (last.role != .assistant or last.images_scanned) return;
-        last.images_scanned = true;
-        self.scanImageCalls(last, d) catch |err| std.log.err("scan image calls: {t}", .{err});
+        if (last.role != .assistant) return;
+        const v = last.active();
+        if (v.images_scanned) return;
+        v.images_scanned = true;
+        self.scanImageCalls(v, d) catch |err| std.log.err("scan image calls: {t}", .{err});
     }
 
     /// The active family's reasoning-block markers as `toolcall.Reasoning`
@@ -1038,13 +1529,13 @@ pub const Session = struct {
     }
 
     /// Extract `<image ...>PROMPT</image>` tool calls from a finished assistant
-    /// message and queue a GenImage (status .pending) for each. Optional tag
+    /// variant and queue a GenImage (status .pending) for each. Optional tag
     /// attributes (width/height/steps/seed) override the engine defaults.
-    fn scanImageCalls(self: *Session, msg: *Message, d: *diffuser.Diffuser) !void {
+    fn scanImageCalls(self: *Session, v: *Variant, d: *diffuser.Diffuser) !void {
         // Scan only the answer, not the reasoning block, and only line-anchored
         // tags — see toolcall.answerText/nextImageCall for why (spurious fires
         // from the model merely *mentioning* the tag while thinking/explaining).
-        var rest = toolcall.answerText(msg.text.items, reasoningMarkers());
+        var rest = toolcall.answerText(v.text.items, reasoningMarkers());
         while (true) {
             const c = switch (toolcall.nextImageCall(rest)) {
                 .none, .partial => break,
@@ -1068,11 +1559,90 @@ pub const Session = struct {
                 // repeated generations varied.
                 if (gi.req_seed == 0) gi.req_seed = d.nextSeed();
                 // The engine OWNS the image (unified queue + history); the
-                // message keeps a borrowed pointer for inline display.
+                // variant keeps a borrowed pointer for inline display.
                 try d.enqueue(gi);
-                try msg.images.append(self.gpa, gi);
+                try v.images.append(self.gpa, gi);
             }
             rest = c.after;
         }
     }
 };
+
+// ── Tests (pure, CPU-only; run via `zig build gui-test`) ─────────────────────
+
+test "navTarget: carousel semantics for the back/next buttons" {
+    // Single variant: back does nothing (the UI disables it), next regenerates.
+    try std.testing.expectEqual(Nav.none, navTarget(0, 1, .back));
+    try std.testing.expectEqual(Nav.regenerate, navTarget(0, 1, .next));
+    // Middle of three: both directions navigate.
+    try std.testing.expectEqual(Nav{ .select = 0 }, navTarget(1, 3, .back));
+    try std.testing.expectEqual(Nav{ .select = 2 }, navTarget(1, 3, .next));
+    // Newest of three: back navigates, next regenerates (appends a fourth).
+    try std.testing.expectEqual(Nav{ .select = 1 }, navTarget(2, 3, .back));
+    try std.testing.expectEqual(Nav.regenerate, navTarget(2, 3, .next));
+}
+
+test "checkpoint budget: oldest evicted first; an oversize newest is dropped too" {
+    const gpa = std.testing.allocator;
+    var list: std.ArrayList(Checkpoint) = .empty;
+    defer {
+        clearCheckpoints(gpa, &list);
+        list.deinit(gpa);
+    }
+    for ([_]usize{ 10, 20, 30 }) |q| {
+        try list.append(gpa, .{ .q = q, .ids_len = q + 1, .snap = try gpa.alloc(u8, 100) });
+    }
+    try std.testing.expectEqual(@as(u64, 300), checkpointsBytes(list.items));
+
+    evictCheckpointsToBudget(gpa, &list, 300); // exactly at budget: keep all
+    try std.testing.expectEqual(@as(usize, 3), list.items.len);
+    evictCheckpointsToBudget(gpa, &list, 250); // oldest (q=10) goes
+    try std.testing.expectEqual(@as(usize, 2), list.items.len);
+    try std.testing.expectEqual(@as(usize, 20), list.items[0].q);
+    // Below a single snapshot (even 0): the NEWEST is always kept — the last
+    // turn must stay instantly regenerable; the budget bounds only the extras.
+    evictCheckpointsToBudget(gpa, &list, 50);
+    try std.testing.expectEqual(@as(usize, 1), list.items.len);
+    try std.testing.expectEqual(@as(usize, 30), list.items[0].q);
+    evictCheckpointsToBudget(gpa, &list, 0);
+    try std.testing.expectEqual(@as(usize, 1), list.items.len);
+}
+
+test "checkpoint rollback invalidates later boundaries only" {
+    const gpa = std.testing.allocator;
+    var list: std.ArrayList(Checkpoint) = .empty;
+    defer {
+        clearCheckpoints(gpa, &list);
+        list.deinit(gpa);
+    }
+    for ([_]usize{ 10, 20, 30 }) |q| {
+        try list.append(gpa, .{ .q = q, .ids_len = q + 1, .snap = try gpa.alloc(u8, 8) });
+    }
+    dropCheckpointsAfter(gpa, &list, 20); // restored to q=20: q=30 is gone
+    try std.testing.expectEqual(@as(usize, 2), list.items.len);
+    try std.testing.expectEqual(@as(usize, 20), list.items[list.items.len - 1].q);
+    dropCheckpointsAfter(gpa, &list, 20); // idempotent
+    try std.testing.expectEqual(@as(usize, 2), list.items.len);
+}
+
+test "Message variants: regenerate bookkeeping keeps older takes" {
+    const gpa = std.testing.allocator;
+    var m = try Message.init(gpa, .assistant);
+    defer m.deinit(gpa);
+    try m.active().text.appendSlice(gpa, "first take");
+    m.active().images_scanned = true;
+
+    // Regenerate: a new empty variant becomes active; the old take is intact
+    // (and would be rescanned for image calls only if it were active again).
+    try m.variants.append(gpa, .{});
+    m.cur = m.variants.items.len - 1;
+    try std.testing.expectEqual(@as(usize, 2), m.variants.items.len);
+    try std.testing.expectEqual(@as(usize, 0), m.active().text.items.len);
+    try std.testing.expect(!m.active().images_scanned);
+    try m.active().text.appendSlice(gpa, "second take");
+
+    // Navigate back to the first take; its state is untouched.
+    m.cur = 0;
+    try std.testing.expectEqualStrings("first take", m.active().text.items);
+    try std.testing.expect(m.active().images_scanned);
+}

@@ -393,6 +393,22 @@ pub fn build(b: *std.Build) void {
                 }),
             });
             gui_test_step.dependOn(&b.addRunArtifact(gui_diffuser_tests).step);
+
+            // Chat-session pure-helper tests (Message variants + the ‹/›
+            // regenerate-navigation semantics). Same deps as the diffuser
+            // tests (chat.zig imports it); CPU-only.
+            const gui_chat_tests = b.addTest(.{
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/gui/chat.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "TensorPencil", .module = mod },
+                        .{ .name = "known-folders", .module = kf.module("known-folders") },
+                    },
+                }),
+            });
+            gui_test_step.dependOn(&b.addRunArtifact(gui_chat_tests).step);
         }
     }
 

@@ -24,6 +24,7 @@ var seeded: bool = false;
 var steps_buf: [16]u8 = [_]u8{0} ** 16;
 var width_buf: [16]u8 = [_]u8{0} ** 16;
 var height_buf: [16]u8 = [_]u8{0} ** 16;
+var regen_buf: [16]u8 = [_]u8{0} ** 16;
 // LLM sampling controls (same text-buffer pattern; floats parse on commit).
 var temp_buf: [16]u8 = [_]u8{0} ** 16;
 var topk_buf: [16]u8 = [_]u8{0} ** 16;
@@ -48,6 +49,7 @@ fn seed(cfg: *const config.Config) void {
     _ = std.fmt.bufPrintZ(&steps_buf, "{d}", .{cfg.steps}) catch {};
     _ = std.fmt.bufPrintZ(&width_buf, "{d}", .{cfg.width}) catch {};
     _ = std.fmt.bufPrintZ(&height_buf, "{d}", .{cfg.height}) catch {};
+    _ = std.fmt.bufPrintZ(&regen_buf, "{d}", .{cfg.regen_cache_mb}) catch {};
     seedSampling(cfg);
     seeded = true;
 }
@@ -87,6 +89,8 @@ fn commitNumbers(cfg: *config.Config) void {
     cfg.steps = std.math.clamp(parseNum(&steps_buf, cfg.steps), 1, 100);
     cfg.width = clampDim(parseNum(&width_buf, cfg.width));
     cfg.height = clampDim(parseNum(&height_buf, cfg.height));
+    // Regen (checkpoint) cache: host RAM, capped at 64 GB to catch typos.
+    cfg.regen_cache_mb = @min(parseNum(&regen_buf, cfg.regen_cache_mb), 64 << 10);
     commitSampling(cfg);
 }
 
@@ -130,25 +134,25 @@ pub fn render(cfg: *config.Config, cb: Callbacks) void {
     var body = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .padding = dvui.Rect.all(6) });
     defer body.deinit();
 
-    section(20, "Models");
-    help(0, "The LLM is required. Diffusion (image generation) needs all three of " ++
+    section("Models");
+    help("The LLM is required. Diffusion (image generation) needs all three of " ++
         "diffusion model, text encoder, and VAE. Vision (chatting about images) " ++
         "needs the vision tower. Any unset feature is simply disabled.");
-    pathRow(0, "LLM model", &cfg.llm_model, "GGUF models", &gguf_filters);
-    pathRow(1, "Vision tower", &cfg.vision_tower, "GGUF mmproj", &gguf_filters);
-    pathRow(2, "Diffusion model", &cfg.diffusion_model, "Safetensors", &safetensors_filters);
-    pathRow(3, "Text encoder", &cfg.text_encoder, "Safetensors", &safetensors_filters);
-    pathRow(4, "VAE", &cfg.vae, "Safetensors", &safetensors_filters);
-    pathRow(5, "TAESD preview", &cfg.taesd, "Safetensors", &safetensors_filters);
+    pathRow("LLM model", &cfg.llm_model, "GGUF models", &gguf_filters);
+    pathRow("Vision tower", &cfg.vision_tower, "GGUF mmproj", &gguf_filters);
+    pathRow("Diffusion model", &cfg.diffusion_model, "Safetensors", &safetensors_filters);
+    pathRow("Text encoder", &cfg.text_encoder, "Safetensors", &safetensors_filters);
+    pathRow("VAE", &cfg.vae, "Safetensors", &safetensors_filters);
+    pathRow("TAESD preview", &cfg.taesd, "Safetensors", &safetensors_filters);
 
-    section(21, "Image generation");
-    help(4, "Generated images (chat and the image studio) are saved here as PNGs " ++
+    section("Image generation");
+    help("Generated images (chat and the image studio) are saved here as PNGs " ++
         "with AUTOMATIC1111-style metadata embedded. Defaults to a TensorPencil " ++
         "folder in your Pictures directory; clear it to disable saving.");
-    dirRow(6, "Output folder", &cfg.output_dir);
-    numRow(10, "Default steps", &steps_buf);
-    numRow(11, "Default width", &width_buf);
-    numRow(12, "Default height", &height_buf);
+    dirRow("Output folder", &cfg.output_dir);
+    numRow("Default steps", &steps_buf);
+    numRow("Default width", &width_buf);
+    numRow("Default height", &height_buf);
 
     {
         var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 4 } });
@@ -169,8 +173,8 @@ pub fn render(cfg: *config.Config, cb: Callbacks) void {
         _ = dvui.dropdownEnum(@src(), config.VaeDecode, .{ .choice = &cfg.vae_decode }, .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 200 } });
     }
 
-    section(23, "Backends");
-    help(3, "Compute backend for each engine. The two are independent — e.g. the " ++
+    section("Backends");
+    help("Compute backend for each engine. The two are independent — e.g. the " ++
         "LLM on CUDA while diffusion runs on Vulkan. The chat LLM currently " ++
         "supports the CUDA backends only (zig_cuda / cuda); picking cpu or vulkan " ++
         "for it fails to load. Diffusion supports all four.");
@@ -186,9 +190,10 @@ pub fn render(cfg: *config.Config, cb: Callbacks) void {
         dvui.label(@src(), "KV cache dtype", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
         _ = dvui.dropdownEnum(@src(), config.KvDtype, .{ .choice = &cfg.kv_dtype }, .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 200 } });
     }
-    help(24, "KV cache precision. f16 halves the KV-cache VRAM (longer chats fit), " ++
-        "at a small precision cost — output differs slightly from f32. Changing it " ++
-        "rebuilds the context; the model weights stay loaded.");
+    help("KV cache precision. f16 halves the KV-cache VRAM and q8_0 roughly " ++
+        "quarters it (longer chats fit), at a small precision cost — output " ++
+        "differs slightly from f32. Changing it rebuilds the context; the " ++
+        "model weights stay loaded.");
     {
         var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 4 } });
         defer row.deinit();
@@ -196,31 +201,37 @@ pub fn render(cfg: *config.Config, cb: Callbacks) void {
         _ = dvui.dropdownEnum(@src(), config.Backend, .{ .choice = &cfg.diff_backend }, .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 200 } });
     }
 
-    section(25, "LLM sampling");
-    help(5, "How the chat model picks each token. Changes apply on the NEXT reply " ++
+    section("LLM sampling");
+    help("How the chat model picks each token. Changes apply on the NEXT reply " ++
         "(no reload). Temperature 0 is greedy; top-k / top-p / min-p trim the " ++
         "candidate pool. The penalties discourage tokens already in the recent " ++
         "window (llama.cpp semantics; while any penalty is active, GPU backends " ++
         "take a slower CPU-sampling path). Save the current values under a name " ++
         "to reuse them; presets persist with the settings on Apply.");
     presetRow(cfg);
-    numRow(40, "Temperature", &temp_buf);
-    numRow(41, "Top-k (0 = off)", &topk_buf);
-    numRow(42, "Top-p (1 = off)", &topp_buf);
-    numRow(43, "Min-p (0 = off)", &minp_buf);
-    numRow(44, "Repeat penalty (1 = off)", &rpen_buf);
-    numRow(45, "Penalty window (tokens)", &rlast_buf);
-    numRow(46, "Presence penalty (0 = off)", &ppen_buf);
-    numRow(47, "Frequency penalty (0 = off)", &fpen_buf);
+    numRow("Temperature", &temp_buf);
+    numRow("Top-k (0 = off)", &topk_buf);
+    numRow("Top-p (1 = off)", &topp_buf);
+    numRow("Min-p (0 = off)", &minp_buf);
+    numRow("Repeat penalty (1 = off)", &rpen_buf);
+    numRow("Penalty window (tokens)", &rlast_buf);
+    numRow("Presence penalty (0 = off)", &ppen_buf);
+    numRow("Frequency penalty (0 = off)", &fpen_buf);
 
-    section(22, "VRAM & performance");
-    help(2, "VRAM sharing between the chat model and image generation is controlled " ++
+    section("VRAM & performance");
+    help("VRAM sharing between the chat model and image generation is controlled " ++
         "live from the meter in the status bar: drag the split handle to set each " ++
         "side's guaranteed share, and the limit handle to cap how much of the card " ++
         "is used at all. Both apply instantly — no reload — and persist here.");
+    numRow("Regen cache (MB)", &regen_buf);
+    help("Host RAM reserved for per-turn context checkpoints, which make " ++
+        "\"regenerate response\" and variant switching instant at any context " ++
+        "length. More MB keeps more past turns instantly rewindable; the newest " ++
+        "turn's checkpoint is always kept, whatever the budget. Applies on the " ++
+        "next reply.");
 
-    section(30, "System prompt");
-    help(1, "Sent to the model at the start of every conversation. When a diffusion " ++
+    section("System prompt");
+    help("Sent to the model at the start of every conversation. When a diffusion " ++
         "model is configured, the image-tool instructions are appended automatically.");
     {
         var row = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 3 } });
@@ -295,18 +306,29 @@ fn taesdSizeDropdown(choice: *config.TaesdSize) void {
     }
 }
 
-fn section(id: usize, title: []const u8) void {
-    dvui.label(@src(), "{s}", .{title}, .{ .id_extra = id, .font = .theme(.heading), .padding = .{ .x = 4, .y = 10, .h = 4 } });
+/// Widget id for a settings row, derived from its visible text. Every
+/// section/help/row helper shares a single `@src()` across all its calls, so
+/// `id_extra` is the only thing keeping them distinct — and the visible text
+/// (section title, row label, help body) is already a unique natural key.
+/// Hashing it beats hand-numbered ids (which collide silently on edit) and a
+/// per-frame counter (whose ids shift when a row is reordered or becomes
+/// conditional, detaching dvui's per-widget state).
+fn idFor(text: []const u8) usize {
+    return @truncate(std.hash.Wyhash.hash(0, text));
 }
 
-fn help(id: usize, text: []const u8) void {
-    var tl = dvui.textLayout(@src(), .{}, .{ .id_extra = id, .expand = .horizontal, .padding = .{ .x = 4, .h = 6 } });
+fn section(title: []const u8) void {
+    dvui.label(@src(), "{s}", .{title}, .{ .id_extra = idFor(title), .font = .theme(.heading), .padding = .{ .x = 4, .y = 10, .h = 4 } });
+}
+
+fn help(text: []const u8) void {
+    var tl = dvui.textLayout(@src(), .{}, .{ .id_extra = idFor(text), .expand = .horizontal, .padding = .{ .x = 4, .h = 6 } });
     defer tl.deinit();
     tl.addText(text, .{});
 }
 
-fn pathRow(id: usize, label: []const u8, pb: *config.PathBuf, desc: []const u8, filters: []const []const u8) void {
-    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = id, .expand = .horizontal, .padding = .{ .x = 4, .y = 3 } });
+fn pathRow(label: []const u8, pb: *config.PathBuf, desc: []const u8, filters: []const []const u8) void {
+    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = idFor(label), .expand = .horizontal, .padding = .{ .x = 4, .y = 3 } });
     defer row.deinit();
 
     dvui.label(@src(), "{s}", .{label}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
@@ -326,8 +348,8 @@ fn pathRow(id: usize, label: []const u8, pb: *config.PathBuf, desc: []const u8, 
 }
 
 /// Like `pathRow`, but browses for a directory (native folder-select dialog).
-fn dirRow(id: usize, label: []const u8, pb: *config.PathBuf) void {
-    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = id, .expand = .horizontal, .padding = .{ .x = 4, .y = 3 } });
+fn dirRow(label: []const u8, pb: *config.PathBuf) void {
+    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = idFor(label), .expand = .horizontal, .padding = .{ .x = 4, .y = 3 } });
     defer row.deinit();
 
     dvui.label(@src(), "{s}", .{label}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
@@ -351,8 +373,8 @@ fn dirRow(id: usize, label: []const u8, pb: *config.PathBuf) void {
     }
 }
 
-fn numRow(id: usize, label: []const u8, buf: []u8) void {
-    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = id, .expand = .horizontal, .padding = .{ .x = 4, .y = 3 } });
+fn numRow(label: []const u8, buf: []u8) void {
+    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = idFor(label), .expand = .horizontal, .padding = .{ .x = 4, .y = 3 } });
     defer row.deinit();
     dvui.label(@src(), "{s}", .{label}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
     // A single-line textEntry with no max_size_content is clamped to its

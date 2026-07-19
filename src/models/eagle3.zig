@@ -190,7 +190,7 @@ pub const Eagle3Head = struct {
         try be.ropeHalf(b.k, self.freqs_d, rows, kv_heads, half, (self.capacity + 1) * half, p0 + 1);
         try be.tensorCopy(self.k_cache, p0 * kv_dim * 4, b.k, 0, rows * kv_dim * 4);
         try be.tensorCopy(self.v_cache, p0 * kv_dim * 4, b.v, 0, rows * kv_dim * 4);
-        try be.opAttnDecode(b.q, self.k_cache, self.v_cache, b.attn, b.attn_scratch, p0 + 1, rows, n_heads, kv_heads, hd, nsplit, attn_scale, 0, 0, false, false);
+        try be.opAttnDecode(b.q, self.k_cache, self.v_cache, b.attn, b.attn_scratch, p0 + 1, rows, n_heads, kv_heads, hd, nsplit, attn_scale, 0, 0, false, .f32);
         try self.linear(b.t, b.attn, self.o, hidden, q_dim, rows);
         try be.opAdd(b.feat, b.t, rows * hidden);
 

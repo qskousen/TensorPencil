@@ -16,6 +16,16 @@ const gpu = @import("../gpu/context.zig");
 const ops = @import("../ops.zig");
 const kvmod = @import("../llm/kv_cache.zig");
 
+/// Map the session KV dtype onto the Vulkan op layer's kernel-format tag.
+fn kvFmt(dt: kvmod.KvDtype) gpu.KvFmt {
+    return switch (dt) {
+        .f32 => .f32,
+        .f16 => .f16,
+        .q8_0 => .q8_0,
+    };
+}
+
+
 const Buf = gpu.DeviceBuffer;
 const Weight = ops.matmul.Weight;
 
@@ -138,10 +148,10 @@ pub const VulkanLM = struct {
         const n_attn = cfg.nAttnLayers();
         self.k_cache = try alloc.alloc(Buf, n_attn);
         self.v_cache = try alloc.alloc(Buf, n_attn);
-        const esz = cap.kv_dtype.elemBytes();
+        const dt = cap.kv_dtype;
         for (self.k_cache, self.v_cache) |*kb, *vb| {
-            kb.* = try ctx.tensorCreate(cap.max * cfg.kvDim() * esz);
-            vb.* = try ctx.tensorCreate(cap.max * cfg.kvDim() * esz);
+            kb.* = try ctx.tensorCreate(dt.sizeBytes(cap.max * cfg.kvDim()));
+            vb.* = try ctx.tensorCreate(dt.sizeBytes(cap.max * cfg.kvDim()));
         }
 
         const n_lin = cfg.n_layers - n_attn;
@@ -272,15 +282,22 @@ pub const VulkanLM = struct {
                     // Append K/V to the cache with in-batch device copies
                     // (copy kernel: dst[u2+i] = src[u3+i]) — tensorCopy would
                     // flush the recording and drain the GPU every layer.
-                    if (self.kv_dtype == .f16) {
-                        try ctx.opStoreKvF16(self.k_cache[slot], pos * kvdim, self.k, 0, kvdim);
-                        try ctx.opStoreKvF16(self.v_cache[slot], pos * kvdim, self.v, 0, kvdim);
-                    } else {
-                        try ctx.opElt(.copy, self.k, self.k_cache[slot], null, null, .{ .u0 = @intCast(kvdim), .u2 = @intCast(pos * kvdim) }, kvdim, 1, 1);
-                        try ctx.opElt(.copy, self.v, self.v_cache[slot], null, null, .{ .u0 = @intCast(kvdim), .u2 = @intCast(pos * kvdim) }, kvdim, 1, 1);
+                    switch (self.kv_dtype) {
+                        .f16 => {
+                            try ctx.opStoreKvF16(self.k_cache[slot], pos * kvdim, self.k, 0, kvdim);
+                            try ctx.opStoreKvF16(self.v_cache[slot], pos * kvdim, self.v, 0, kvdim);
+                        },
+                        .q8_0 => {
+                            try ctx.opStoreKvQ8(self.k_cache[slot], pos * kvdim, self.k, 0, kvdim);
+                            try ctx.opStoreKvQ8(self.v_cache[slot], pos * kvdim, self.v, 0, kvdim);
+                        },
+                        .f32 => {
+                            try ctx.opElt(.copy, self.k, self.k_cache[slot], null, null, .{ .u0 = @intCast(kvdim), .u2 = @intCast(pos * kvdim) }, kvdim, 1, 1);
+                            try ctx.opElt(.copy, self.v, self.v_cache[slot], null, null, .{ .u0 = @intCast(kvdim), .u2 = @intCast(pos * kvdim) }, kvdim, 1, 1);
+                        },
                     }
                     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
-                    try ctx.opAttnDecodeQ35(self.q, self.k_cache[slot], self.v_cache[slot], self.attn, self.attn_scratch, cfg.n_heads, cfg.n_kv_heads, hd, pos + 1, scale, 0, 0, 0, self.kv_dtype == .f16);
+                    try ctx.opAttnDecodeQ35(self.q, self.k_cache[slot], self.v_cache[slot], self.attn, self.attn_scratch, cfg.n_heads, cfg.n_kv_heads, hd, pos + 1, scale, 0, 0, 0, kvFmt(self.kv_dtype));
                     try ctx.opElt(.sigmoid_mul, self.attn, self.gate, null, null, .{ .u0 = @intCast(cfg.qDim()) }, cfg.qDim(), 1, 1);
                     try self.gemvW(self.t, 0, self.attn, al.o);
                     try self.add(self.x, self.t, cfg.hidden);

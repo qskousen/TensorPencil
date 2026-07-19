@@ -12,8 +12,6 @@
 //!                               .dynamic: bool   .budget: u64
 //!                               .order: []usize  .next: usize
 //!   st.be                      the CUDA backend — `deviceUsed()` / `headroom()`
-//!   st.kv_dtype                `.f16` keeps the model fully resident (the host
-//!                              shadow cache is f32), so offload is disabled
 //!   st.migrateLayer(l) !void   move layer l device->host, freeing its VRAM
 //!   st.promoteLayer(l) !void   bring layer l host->device, restoring its state
 //!   st.promoteCost(l) usize    VRAM a promote of layer l needs (weights + the
@@ -48,10 +46,8 @@ pub fn snapshot(st: anytype) Snapshot {
 }
 
 /// Migrate the next layer in the offload order to the host (dynamic mode).
-/// Returns false when nothing is left to migrate, or when f16 KV keeps the
-/// model fully resident (the host shadow cache is f32).
+/// Returns false when nothing is left to migrate.
 pub fn migrateNext(st: anytype) !bool {
-    if (st.kv_dtype == .f16) return false;
     const sp = &st.split.?;
     if (sp.next >= sp.order.len) return false;
     const l = sp.order[sp.next];
@@ -95,7 +91,7 @@ pub fn offloadToBudget(st: anytype, target: u64) !void {
 /// isn't already, records `target` as the ceiling honored while KV grows, then
 /// migrates layers host-ward (currently over budget) or promotes them back
 /// (under budget). Idempotent: a satisfied target settles nothing. A no-op on
-/// f16 KV (`autoOffload` declines to arm) and on `target == 0`.
+/// `target == 0`.
 ///
 /// Backend residency mutation, so the caller MUST be on the thread that bound
 /// this model's CUDA context (the model's own worker at a safe boundary, or the

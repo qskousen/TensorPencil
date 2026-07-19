@@ -476,12 +476,13 @@ pub fn canonicalName(alloc: std.mem.Allocator, raw: []const u8, arch: []const u8
 
 // --- tests -----------------------------------------------------------------
 
-/// Minimal in-memory GGUF builder for tests.
-const TestBuilder = struct {
+/// Minimal in-memory GGUF builder for tests (also used by model config-detect
+/// tests in src/models/).
+pub const TestBuilder = struct {
     buf: std.ArrayList(u8) = .empty,
     gpa: std.mem.Allocator,
 
-    fn init(gpa: std.mem.Allocator, version: u32, n_tensors: u64, n_kv: u64) !TestBuilder {
+    pub fn init(gpa: std.mem.Allocator, version: u32, n_tensors: u64, n_kv: u64) !TestBuilder {
         var b = TestBuilder{ .gpa = gpa };
         try b.buf.appendSlice(gpa, "GGUF");
         try b.int(u32, version);
@@ -490,36 +491,36 @@ const TestBuilder = struct {
         return b;
     }
 
-    fn int(self: *TestBuilder, comptime T: type, v: T) !void {
+    pub fn int(self: *TestBuilder, comptime T: type, v: T) !void {
         var raw: [@sizeOf(T)]u8 = undefined;
         std.mem.writeInt(T, &raw, v, .little);
         try self.buf.appendSlice(self.gpa, &raw);
     }
 
-    fn str(self: *TestBuilder, s: []const u8) !void {
+    pub fn str(self: *TestBuilder, s: []const u8) !void {
         try self.int(u64, s.len);
         try self.buf.appendSlice(self.gpa, s);
     }
 
-    fn kvUint(self: *TestBuilder, key: []const u8, v: u32) !void {
+    pub fn kvUint(self: *TestBuilder, key: []const u8, v: u32) !void {
         try self.str(key);
         try self.int(u32, 4);
         try self.int(u32, v);
     }
 
-    fn kvF32(self: *TestBuilder, key: []const u8, v: f32) !void {
+    pub fn kvF32(self: *TestBuilder, key: []const u8, v: f32) !void {
         try self.str(key);
         try self.int(u32, 6);
         try self.int(u32, @bitCast(v));
     }
 
-    fn kvStr(self: *TestBuilder, key: []const u8, v: []const u8) !void {
+    pub fn kvStr(self: *TestBuilder, key: []const u8, v: []const u8) !void {
         try self.str(key);
         try self.int(u32, 8);
         try self.str(v);
     }
 
-    fn tensor(self: *TestBuilder, name: []const u8, ne: []const u64, type_id: u32, offset: u64) !void {
+    pub fn tensor(self: *TestBuilder, name: []const u8, ne: []const u64, type_id: u32, offset: u64) !void {
         try self.str(name);
         try self.int(u32, @intCast(ne.len));
         for (ne) |d| try self.int(u64, d);
@@ -528,14 +529,14 @@ const TestBuilder = struct {
     }
 
     /// Pad to the 32-byte data boundary and append the data section.
-    fn finish(self: *TestBuilder, data: []const u8) ![]u8 {
+    pub fn finish(self: *TestBuilder, data: []const u8) ![]u8 {
         const aligned = std.mem.alignForward(usize, self.buf.items.len, 32);
         try self.buf.appendNTimes(self.gpa, 0, aligned - self.buf.items.len);
         try self.buf.appendSlice(self.gpa, data);
         return self.buf.toOwnedSlice(self.gpa);
     }
 
-    fn deinit(self: *TestBuilder) void {
+    pub fn deinit(self: *TestBuilder) void {
         self.buf.deinit(self.gpa);
     }
 };

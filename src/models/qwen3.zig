@@ -55,7 +55,7 @@ const encoderDims: transformer.Dims = .{
     .kv_dim = n_kv_heads * head_dim,
     .intermediate = intermediate,
 };
-fn dimsFor(cfg: Config) transformer.Dims {
+pub fn dimsFor(cfg: Config) transformer.Dims {
     return .{
         .hidden = cfg.hidden,
         .n_heads = cfg.n_heads,
@@ -183,9 +183,10 @@ pub const Config = struct {
         return error.UnknownModelConfig;
     }
 
-    /// Largest n_layers across presets — backend steppers use fixed-size
-    /// per-layer arrays.
-    pub const max_layers = 36;
+    /// Upper bound on n_layers — backend steppers use fixed-size per-layer
+    /// arrays. Covers the presets (36) and GGUF checkpoints up to Qwen3-32B
+    /// (64 layers).
+    pub const max_layers = 64;
 };
 
 /// Tap k is the hidden state before layer k runs.
@@ -442,8 +443,9 @@ pub fn embedTokens(embed: Weight, ids: []const u32, x: []f32) !void {
     }
 }
 
-/// Per-forward activation buffers, sized for `seq` tokens of `cfg`.
-const Scratch = struct {
+/// Per-forward activation buffers, sized for `seq` tokens of `cfg`. Public so
+/// the CUDA hybrid split can allocate one for its host-resident layers.
+pub const Scratch = struct {
     normed: []f32,
     tmp: []f32,
     q: []f32,
@@ -453,7 +455,26 @@ const Scratch = struct {
     gate: []f32,
     up: []f32,
 
-    fn init(gpa: std.mem.Allocator, seq: usize, cfg: Config) !Scratch {
+    /// A borrowed view of the first `seq` rows of a larger scratch (no alloc).
+    /// The CUDA split sizes its scratch to a full chunk once, then views it
+    /// down to the actual chunk length each call — `layerForward`'s ops
+    /// require exact-length slices, so passing the oversized buffer would trip
+    /// a length assert (same fix as gemma3.Scratch.viewSeq). Never deinit a
+    /// view — it aliases the parent scratch's memory.
+    pub fn viewSeq(self: *const Scratch, seq: usize, cfg: Config) Scratch {
+        return .{
+            .normed = self.normed[0 .. seq * cfg.hidden],
+            .tmp = self.tmp[0 .. seq * cfg.hidden],
+            .q = self.q[0 .. seq * cfg.qDim()],
+            .k = self.k[0 .. seq * cfg.kvDim()],
+            .v = self.v[0 .. seq * cfg.kvDim()],
+            .attn_out = self.attn_out[0 .. seq * cfg.qDim()],
+            .gate = self.gate[0 .. seq * cfg.intermediate],
+            .up = self.up[0 .. seq * cfg.intermediate],
+        };
+    }
+
+    pub fn init(gpa: std.mem.Allocator, seq: usize, cfg: Config) !Scratch {
         var s: Scratch = undefined;
         s.normed = try gpa.alloc(f32, seq * cfg.hidden);
         errdefer gpa.free(s.normed);
@@ -474,7 +495,7 @@ const Scratch = struct {
         return s;
     }
 
-    fn deinit(self: *Scratch, gpa: std.mem.Allocator) void {
+    pub fn deinit(self: *Scratch, gpa: std.mem.Allocator) void {
         gpa.free(self.normed);
         gpa.free(self.tmp);
         gpa.free(self.q);
@@ -578,6 +599,55 @@ test "causal lm loads from real qwen3-4b gguf" {
     try std.testing.expect(lm.hasBlockQuantWeights());
     try std.testing.expectEqual(dtypes.DType.q4_k, lm.layers[0].q.dtype);
     try std.testing.expectEqual(@as(usize, 2560), lm.layers[0].input_norm.len);
+}
+
+// Config detection from synthetic GGUF metadata: a Qwen3-32B-shaped header
+// (64 layers — larger than any preset) builds the right Config, and a
+// block_count above max_layers is rejected.
+test "config detects 32b gguf metadata" {
+    const gpa = std.testing.allocator;
+
+    var b = try gguf_mod.TestBuilder.init(gpa, 3, 0, 9);
+    defer b.deinit();
+    try b.kvStr("general.architecture", "qwen3");
+    try b.kvUint("qwen3.block_count", 64);
+    try b.kvUint("qwen3.embedding_length", 5120);
+    try b.kvUint("qwen3.attention.head_count", 64);
+    try b.kvUint("qwen3.attention.head_count_kv", 8);
+    try b.kvUint("qwen3.attention.key_length", 128);
+    try b.kvUint("qwen3.attention.value_length", 128);
+    try b.kvUint("qwen3.feed_forward_length", 25600);
+    try b.kvF32("qwen3.rope.freq_base", 1e6);
+    const file = try b.finish(&.{});
+    defer gpa.free(file);
+
+    var g = try gguf_mod.Gguf.initFromSlice(gpa, file);
+    defer g.deinit();
+
+    const cfg = try Config.detect(.{ .gguf = &g });
+    try std.testing.expectEqual(@as(usize, 64), cfg.n_layers);
+    try std.testing.expectEqual(@as(usize, 5120), cfg.hidden);
+    try std.testing.expectEqual(@as(usize, 64), cfg.n_heads);
+    try std.testing.expectEqual(@as(usize, 8), cfg.n_kv_heads);
+    try std.testing.expectEqual(@as(usize, 25600), cfg.intermediate);
+    try std.testing.expectEqual(@as(f64, 1e6), cfg.rope_theta);
+    try std.testing.expectEqualStrings("", cfg.prefix);
+}
+
+test "config rejects block_count above max_layers" {
+    const gpa = std.testing.allocator;
+
+    var b = try gguf_mod.TestBuilder.init(gpa, 3, 0, 2);
+    defer b.deinit();
+    try b.kvStr("general.architecture", "qwen3");
+    try b.kvUint("qwen3.block_count", Config.max_layers + 1);
+    const file = try b.finish(&.{});
+    defer gpa.free(file);
+
+    var g = try gguf_mod.Gguf.initFromSlice(gpa, file);
+    defer g.deinit();
+
+    try std.testing.expectError(error.UnknownModelConfig, Config.detect(.{ .gguf = &g }));
 }
 
 // Parity against ComfyUI's Krea 2 conditioning (f32), post prefix-strip.

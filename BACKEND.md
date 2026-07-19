@@ -96,10 +96,10 @@ Per-stage dispatch order everywhere is `if (cu_be)` → CUDA, `else if (gpu_ctx)
 
 | Model | cpu | vulkan | zig-cuda | cuda | Files | Notes |
 |---|---|---|---|---|---|---|
-| **qwen3** (Qwen3 / Qwen3-VL) | ✅ | ✅¹ | ✅ | ✅ | `qwen3{,_gpu,_cuda}.zig` | only arch with spec decode; primary path fp8 safetensors |
+| **qwen3** (Qwen3 / Qwen3-VL) | ✅ | ✅¹ | ✅ | ✅ | `qwen3{,_gpu,_cuda}.zig` | only arch with spec decode; primary path fp8 safetensors; GGUF metadata config-detect up to 64 layers (Qwen3-32B); hybrid CPU split like qwen35 (32B: offload beats streaming ~1.7x at equal budget) |
 | **qwen35** (hybrid DeltaNet: GDN+attn) | ✅ | ✅ | ✅ | ✅ | `qwen35{,_gpu,_cuda}.zig` | GGUF block-quant on vulkan too; no spec (recurrent state) |
 | **gemma3** (sandwich norms, dual RoPE) | ✅ | ✅ | ✅ | ✅ | `gemma3{,_gpu,_cuda}.zig` | entirely GGUF block-quant |
-| **gemma4** (per-layer geom, factored RoPE) | ✅ | ❌² | ✅ | ✅ | `gemma4{,_cuda}.zig` | `--backend vulkan` rejected |
+| **gemma4** (per-layer geom, factored RoPE) | ✅ | ❌² | ✅ | ✅ | `gemma4{,_cuda}.zig` | `--backend vulkan` rejected; hybrid CPU split like gemma3 (GUI-driven; per-layer-KV host shadow keeps the device ring layout) |
 
 ¹ **qwen3 on vulkan rejects GGUF block-quant** (`llm_main.zig`): dense fp8/bf16/f32 only. bf16 weights are read **natively** (2-byte, `transpose_bf16`/`pipe_tr_bf16` + a bf16 branch in `gemv_partial`/`gemv_partial4`, weight code `context.WCode.bf16`), like CUDA's `gemv_bf16` — no widening, weights stay 8GB. bf16 has no tiled GEMM so prefill streams through grouped GEMV. Generation is coherent (4B ~32 tok/s) but not token-identical to CPU (GEMV reduction-order drift).
 ² No `gemma4_gpu.zig`; `Spec.Vulkan = void`.
@@ -135,8 +135,11 @@ Per-stage dispatch order everywhere is `if (cu_be)` → CUDA, `else if (gpu_ctx)
 | **GDN / gated DeltaNet** (qwen35) | ✅ | `gdn_gates`/`gdn_conv_step`/`gdn_delta_step` | `gdn_*` | ↤ |
 | Embedding gather | model | ⚠️ host-side | on-device `opEmbedGather*` | ↤ |
 | **Sampling** (argmax/temp/top-k/top-p/min-p + repeat/presence/frequency penalties) | ✅ `llm/sample.zig` | ✅ on-device argmax/top-k select (qwen3) | ✅ on-device argmax/top-k select (qwen3/qwen35/gemma3/gemma4) | ↤ |
+| **Turn-boundary checkpoint / rollback** (`checkpoint`/`restoreCheckpoint` — tp-gui regenerate) | ❌ | ❌ | ✅ qwen3/qwen35/gemma3/gemma4 | ↤ |
 
 GPU sampling is a candidate select, not a full sampler: the device runs argmax (greedy) or a top-k reduce (`stepArgmax`/`stepSelect`) and downloads only the candidates; the CPU `llm/sample.zig` tail (temperature softmax, top-p, min-p, RNG) runs over them, bit-identical to full-vocab CPU sampling. The recent-window penalties (repeat/presence/frequency) also run on-device: the `penalize` kernel (PTX + SPIR-V, `opPenalize`) scatters the host-collected (unique id, subtract) entries onto the resident logits BEFORE the argmax/top-k (`stepArgmaxPen`/`stepSelectPen` on qwen3 all-GPU-backends, qwen35_cuda, gemma3_cuda, gemma4_cuda; bit-identical to CPU `applyPenalties` on CUDA via `div.rn`, ~2.5-ULP division tolerance on Vulkan; validated token-identical e2e vs the CPU-sampled spec-verify path). gemma4's logit finalization needs no device tanh: its softcap is strictly MONOTONIC, so the device selects over the RAW logits (after an on-device suppress mask — the penalize scatter with an infinite presence penalty), and only the downloaded candidates get the exact host softcap + penalties (`gemma4.finalizeCandidates`; validated token-identical to the old download path in all four sampling modes). Only the vulkan qwen35/gemma3 steppers (no stepSelect yet) still take the full logit download + CPU path.
+
+Turn-boundary checkpoints back tp-gui's O(snapshot) "regenerate response" / variant-switch rollback: `checkpoint(out)` captures the non-append-only context state at a turn boundary and `restoreCheckpoint(snap, q)` truncates back to it — append-only attention KV is never copied. Per arch the snapshot is: **qwen3** nothing at all (uniform full attention is entirely append-only, so the snapshot is zero bytes and restore is a pure `truncate(q)`); **qwen35** the DeltaNet conv/ssm recurrent state + M-RoPE position (tens of MB); **gemma3/gemma4** the LOCAL layers' sliding-window KV rings (the response overwrites their oldest rows, so `len` rollback alone can't rewind past the ring slack; a few hundred MB, f16-aware on gemma4). Snapshot/restore are residency-aware (qwen35/gemma3/gemma4 read/write each layer's CURRENT owner — device buffer or CPU-split host shadow — so layers may migrate between snapshot and restore). Validated token-identical A/B on the real checkpoints (`-Dintegration '-Dtest-filter=checkpoint restore'`). Vulkan/CPU steppers don't expose the API (the GUI chat runs CUDA-only; its session falls back to a full transcript re-prefill for any arch without it).
 
 ### Speculative decoding (qwen3 only)
 
@@ -153,8 +156,12 @@ GPU sampling is a candidate select, not a full sampler: the device runs argmax (
 |---|---|---|---|---|---|
 | `--vram-budget` weight pinning | — | ✅ pin-prefix | ✅ | ✅ | all |
 | PCIe tail streaming (page-locked mmap) | ❌ | ❌ | ✅ | ✅ | qwen3/qwen35/gemma3 |
-| `--cpu-layers` static split | ❌ | ❌ | ✅ | ✅ | qwen35 only |
-| `--offload-grow` dynamic offload | ❌ | ❌ | ✅ | ✅ | qwen35 only |
+| `--cpu-layers` static split | ❌ | ❌ | ✅ | ✅ | qwen3/qwen35 |
+| `--offload-grow` dynamic offload | ❌ | ❌ | ✅ | ✅ | qwen3/qwen35 |
+
+The hybrid CPU/GPU split works with **every KV dtype** (`--kv-dtype f32|f16|q8_0`): the offloaded layers' host shadow (`llm/kv_cache.zig KvCache`, or `PerLayerKvCache` for gemma4's per-layer geometry) stores the same storage format as the device caches — packed-f16 slots or raw ggml `block_q8_0` bytes, byte-identical to the device layout — so migrate/promote (and the ring checkpoint copies — gemma3 translates ring↔linear, gemma4's shadow keeps the device ring layout so rings move wholesale) are raw, lossless copies (`kRowBytes`/`vRowBytes`). f16/q8_0 KV therefore keep their reduced footprint on both sides of the split AND the offload safety net at once. The GUI dtype toggle (`reinitCache`) also survives an armed split: the host shadow is rebuilt at the new dtype and host-resident layers keep no device KV. Applies to qwen3/qwen35/gemma3/gemma4 (the gemma models' split is GUI-driven — `autoOffload`/`settleTo`/`imageReclaim` — not exposed as CLI flags); qwen3's EAGLE-tap/tree paths remain f32-only.
+
+**q8_0 KV** (`--kv-dtype q8_0`, GUI dropdown): the ggml `block_q8_0` format — 34 bytes per 32 elements (f16 scale `d = absmax/127` + 32 × i8), ~3.8× smaller than f32. Rows are quantized once on write/append (CPU `packQ80`, CUDA `f32_to_q8_0`/`kv_append_s_q8`, Vulkan `kv_store_q8_0`) and dequantized inside the attention kernels (CUDA `attn_split_q8`/`attn_split_h256_q8`/`attn_split_h512_q8` + graph `_s_q8` twins, Vulkan `attn_dsplit_gemma_q8`, CPU dequant-on-view). Quantization rounds ties-to-EVEN on every engine (host 2^23 trick / CUDA `cvt.rni` / Vulkan floor+compare — deliberately diverging from ggml's `roundf` only on exact .5 ties) so host- and device-quantized bytes are **bit-identical**: a row quantized on either side of an offload split, checkpoint, or migrate/promote round trip produces the same cache bytes (see the `opStoreKvQ8 ... bit-identically` device test). Every model kv_dim is a multiple of 64, so rows never split blocks and the byte math stays 4-aligned. Backend coverage matches f16: all four backends; on Vulkan gemma3/qwen35 only (qwen3's hd128 Vulkan path stays f32); qwen3 spec-decode tree/EAGLE stay f32-only. Like f16, q8_0 is lossy — output is not token-identical to f32 — and a dtype toggle rebuilds the context.
 
 ---
 

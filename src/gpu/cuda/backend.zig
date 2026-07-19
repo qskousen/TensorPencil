@@ -22,6 +22,10 @@ const Context = ctxmod.Context;
 
 pub const Error = error{ CudaError, OutOfMemory, NoSuitableDevice, DeviceOutOfMemory };
 
+/// KV storage format of the flash-decode attention / KV store ops (mirrors
+/// llm.kv_cache.KvDtype; defined in elt.zig next to the kernels).
+pub const KvFmt = elt.KvFmt;
+
 /// GPU top-k selection (opTopK): `topk_lanes` lanes each keep their `topk_m`
 /// highest candidates. `topk_m` MUST match elt.topk_reduce_ptx (and the Vulkan
 /// side). See context.opTopK for the rationale.
@@ -282,11 +286,14 @@ pub const Backend = struct {
     f_embed_gather_s: cu.CUfunction = null,
     f_kv_append_s: cu.CUfunction = null,
     f_kv_append_s_f16: cu.CUfunction = null,
+    f_kv_append_s_q8: cu.CUfunction = null,
     f_rope_half_s: cu.CUfunction = null,
     f_attn_split_s: cu.CUfunction = null,
     f_attn_split_s_f16: cu.CUfunction = null,
+    f_attn_split_s_q8: cu.CUfunction = null,
     f_attn_split_h256_s: cu.CUfunction = null,
     f_attn_split_h256_s_f16: cu.CUfunction = null,
+    f_attn_split_h256_s_q8: cu.CUfunction = null,
     f_embed_gather_q8_0: cu.CUfunction = null,
     f_embed_gather_q4_k: cu.CUfunction = null,
     f_embed_gather_q5_k: cu.CUfunction = null,
@@ -1629,7 +1636,7 @@ pub const Backend = struct {
     /// `ring` (> 0) enables sliding-window ring addressing in the h256 kernel:
     /// KV storage row = pos % ring (gemma3/gemma4 LOCAL layers, whose caches hold
     /// only `ring` rows). 0 = linear addressing. Only hd==256 supports ring.
-    pub fn opAttnDecode(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, kv_len0: usize, seq_q: usize, n_heads: usize, kv_heads: usize, hd: usize, nsplit: usize, scale: f32, window: usize, ring: usize, bidir: bool, kv_f16: bool) Error!void {
+    pub fn opAttnDecode(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, kv_len0: usize, seq_q: usize, n_heads: usize, kv_heads: usize, hd: usize, nsplit: usize, scale: f32, window: usize, ring: usize, bidir: bool, kv_fmt: KvFmt) Error!void {
         self.ptic();
         defer self.ptoc(.attn);
         std.debug.assert((hd == 128 or hd == 256 or hd == 512) and seq_q >= 1);
@@ -1644,11 +1651,27 @@ pub const Backend = struct {
             // generated kernel + param layout (u6=ring, u7=bidir), so both take
             // the same bespoke 14-param launch (eltLaunch only passes 6 u32 + 2 f32).
             const f_split = if (hd == 256) try self.eltFn(
-                if (kv_f16) elt.attn_split_h256_f16_ptx else elt.attn_split_h256_ptx,
-                if (kv_f16) "attn_split_h256_f16" else "attn_split_h256",
+                switch (kv_fmt) {
+                    .f32 => elt.attn_split_h256_ptx,
+                    .f16 => elt.attn_split_h256_f16_ptx,
+                    .q8_0 => elt.attn_split_h256_q8_ptx,
+                },
+                switch (kv_fmt) {
+                    .f32 => "attn_split_h256",
+                    .f16 => "attn_split_h256_f16",
+                    .q8_0 => "attn_split_h256_q8",
+                },
             ) else try self.eltFn(
-                if (kv_f16) elt.attn_split_h512_f16_ptx else elt.attn_split_h512_ptx,
-                if (kv_f16) "attn_split_h512_f16" else "attn_split_h512",
+                switch (kv_fmt) {
+                    .f32 => elt.attn_split_h512_ptx,
+                    .f16 => elt.attn_split_h512_f16_ptx,
+                    .q8_0 => elt.attn_split_h512_q8_ptx,
+                },
+                switch (kv_fmt) {
+                    .f32 => "attn_split_h512",
+                    .f16 => "attn_split_h512_f16",
+                    .q8_0 => "attn_split_h512_q8",
+                },
             );
             var p0 = q.ptr();
             var p1 = k.ptr();
@@ -1667,8 +1690,16 @@ pub const Backend = struct {
         } else {
             std.debug.assert(ring == 0); // ring addressing is only implemented for hd==256
             const f_split = try self.eltFn(
-                if (kv_f16) elt.attn_split_f16_ptx else elt.attn_split_ptx,
-                if (kv_f16) "attn_split_f16" else "attn_split",
+                switch (kv_fmt) {
+                    .f32 => elt.attn_split_ptx,
+                    .f16 => elt.attn_split_f16_ptx,
+                    .q8_0 => elt.attn_split_q8_ptx,
+                },
+                switch (kv_fmt) {
+                    .f32 => "attn_split",
+                    .f16 => "attn_split_f16",
+                    .q8_0 => "attn_split_q8",
+                },
             );
             try self.eltLaunch(f_split, q, k, v, scratch, .{ @intCast(kv_len0), @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intCast(nsplit), @intCast(seq_q) }, .{ scale, @floatFromInt(window) }, total);
         }
@@ -1689,6 +1720,22 @@ pub const Backend = struct {
         const srcb = dbOffset(src, src_off * 4);
         const dstb = dbOffset(dst, dst_off * 2);
         try self.eltLaunch(f, srcb, dstb, null, null, .{ @intCast(n), @intCast(n), 0, 0, 0, 0 }, .{ 0, 0 }, n);
+    }
+
+    /// Quantize-copy `n` f32 elements (a whole number of 32-element blocks)
+    /// from `src` (+`src_off` elements) into the q8_0 KV cache at `dst`
+    /// (+`dst_off` elements, block-aligned): the q8_0 analogue of opStoreKvF16.
+    /// The kernel runs one thread per block and quantizes with the exact
+    /// rounding of the host packQ80 (see elt.f32_to_q8_0_ptx).
+    pub fn opStoreKvQ8(self: *Backend, dst: DeviceBuffer, dst_off: usize, src: DeviceBuffer, src_off: usize, n: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        std.debug.assert(n % 32 == 0 and dst_off % 32 == 0 and src_off % 32 == 0);
+        const f = try self.eltFn(elt.f32_to_q8_0_ptx, "f32_to_q8_0");
+        const srcb = dbOffset(src, src_off * 4);
+        const dstb = dbOffset(dst, (dst_off / 32) * 34);
+        const blocks = n / 32;
+        try self.eltLaunch(f, srcb, dstb, null, null, .{ @intCast(blocks), 0, 0, 0, 0, 0 }, .{ 0, 0 }, blocks);
     }
 
     /// Partial rotate-half RoPE: rotate the first 2*half dims of
@@ -2341,11 +2388,14 @@ pub const Backend = struct {
         self.f_embed_gather_s = mod.getFunction(self.ctx, "embed_gather_s") catch return error.CudaError;
         self.f_kv_append_s = mod.getFunction(self.ctx, "kv_append_s") catch return error.CudaError;
         self.f_kv_append_s_f16 = mod.getFunction(self.ctx, "kv_append_s_f16") catch return error.CudaError;
+        self.f_kv_append_s_q8 = mod.getFunction(self.ctx, "kv_append_s_q8") catch return error.CudaError;
         self.f_rope_half_s = mod.getFunction(self.ctx, "rope_half_s") catch return error.CudaError;
         self.f_attn_split_s = mod.getFunction(self.ctx, "attn_split_s") catch return error.CudaError;
         self.f_attn_split_s_f16 = mod.getFunction(self.ctx, "attn_split_s_f16") catch return error.CudaError;
+        self.f_attn_split_s_q8 = mod.getFunction(self.ctx, "attn_split_s_q8") catch return error.CudaError;
         self.f_attn_split_h256_s = mod.getFunction(self.ctx, "attn_split_h256_s") catch return error.CudaError;
         self.f_attn_split_h256_s_f16 = mod.getFunction(self.ctx, "attn_split_h256_s_f16") catch return error.CudaError;
+        self.f_attn_split_h256_s_q8 = mod.getFunction(self.ctx, "attn_split_h256_s_q8") catch return error.CudaError;
         self.f_embed_gather_q8_0 = mod.getFunction(self.ctx, "embed_gather_q8_0") catch return error.CudaError;
         self.f_embed_gather_q4_k = mod.getFunction(self.ctx, "embed_gather_q4_k") catch return error.CudaError;
         self.f_embed_gather_q5_k = mod.getFunction(self.ctx, "embed_gather_q5_k") catch return error.CudaError;
@@ -2408,9 +2458,16 @@ pub const Backend = struct {
     }
 
     /// dst[base + pos0*stride + i] = src[i], pos0 from g_state (graph-safe
-    /// KV appends and tap-row snapshots).
-    pub fn opKvAppendS(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, count: usize, stride: usize, base: usize, kv_f16: bool) Error!void {
-        const f = if (kv_f16) self.f_kv_append_s_f16 else self.f_kv_append_s;
+    /// KV appends and tap-row snapshots). q8_0 quantizes on append: one thread
+    /// per 32-element block (count/stride/base stay element counts).
+    pub fn opKvAppendS(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, count: usize, stride: usize, base: usize, kv_fmt: KvFmt) Error!void {
+        if (kv_fmt == .q8_0) {
+            std.debug.assert(count % 32 == 0 and stride % 32 == 0 and base % 32 == 0);
+            const blocks = count / 32;
+            try self.eltLaunch(self.f_kv_append_s_q8, src, dst, null, null, .{ @intCast(blocks), @intCast(stride), @intCast(base), 0, 0, 0 }, .{ 0, 0 }, blocks);
+            return;
+        }
+        const f = if (kv_fmt == .f16) self.f_kv_append_s_f16 else self.f_kv_append_s;
         try self.eltLaunch(f, src, dst, null, null, .{ @intCast(count), @intCast(stride), @intCast(base), 0, 0, 0 }, .{ 0, 0 }, count);
     }
 
@@ -2426,12 +2483,17 @@ pub const Backend = struct {
         try self.eltLaunch(self.f_rope_half_s, qk, null, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), 0, 0 }, .{ 0, 0 }, total);
     }
 
-    pub fn opAttnDecodeSGraph(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, n_heads: usize, kv_heads: usize, hd: usize, nsplit: usize, scale: f32, kv_f16: bool) Error!void {
+    pub fn opAttnDecodeSGraph(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, n_heads: usize, kv_heads: usize, hd: usize, nsplit: usize, scale: f32, kv_fmt: KvFmt) Error!void {
         std.debug.assert(hd == 128 or hd == 256);
-        const f_split = if (hd == 128)
-            (if (kv_f16) self.f_attn_split_s_f16 else self.f_attn_split_s)
-        else
-            (if (kv_f16) self.f_attn_split_h256_s_f16 else self.f_attn_split_h256_s);
+        const f_split = if (hd == 128) switch (kv_fmt) {
+            .f32 => self.f_attn_split_s,
+            .f16 => self.f_attn_split_s_f16,
+            .q8_0 => self.f_attn_split_s_q8,
+        } else switch (kv_fmt) {
+            .f32 => self.f_attn_split_h256_s,
+            .f16 => self.f_attn_split_h256_s_f16,
+            .q8_0 => self.f_attn_split_h256_s_q8,
+        };
         try self.eltLaunch(f_split, q, k, v, scratch, .{ 0, @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intCast(nsplit), 1 }, .{ scale, 0 }, n_heads * nsplit * 32);
         const f_merge = try self.eltFn(elt.attn_merge_ptx, "attn_merge");
         try self.eltLaunch(f_merge, scratch, out, null, null, .{ @intCast(n_heads), @intCast(hd), @intCast(nsplit), 0, 0, 0 }, .{ 0, 0 }, n_heads * hd);
@@ -3945,7 +4007,7 @@ test "qwen35 attention ops match CPU reference" {
     try be.tensorUpload(q_d, std.mem.sliceAsBytes(&q));
     try be.tensorUpload(k_d, std.mem.sliceAsBytes(&k));
     try be.tensorUpload(v_d, std.mem.sliceAsBytes(&v));
-    try be.opAttnDecode(q_d, k_d, v_d, out_d, scratch_d, kv_len, 1, heads, kv_heads, hd, 8, scale, 0, 0, false, false);
+    try be.opAttnDecode(q_d, k_d, v_d, out_d, scratch_d, kv_len, 1, heads, kv_heads, hd, 8, scale, 0, 0, false, .f32);
     var got: [heads * hd]f32 = undefined;
     try be.tensorDownload(out_d, std.mem.sliceAsBytes(&got));
     for (ref, got) |e, a| try std.testing.expectApproxEqAbs(e, a, 2e-3);
@@ -4199,7 +4261,7 @@ test "attn decode seq_q batch matches CPU reference" {
     try be.tensorUpload(q_d, std.mem.sliceAsBytes(q));
     try be.tensorUpload(k_d, std.mem.sliceAsBytes(k));
     try be.tensorUpload(v_d, std.mem.sliceAsBytes(v));
-    try be.opAttnDecode(q_d, k_d, v_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale, 0, 0, false, false);
+    try be.opAttnDecode(q_d, k_d, v_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale, 0, 0, false, .f32);
     const got = try gpa.alloc(f32, q.len);
     defer gpa.free(got);
     try be.tensorDownload(o_d, std.mem.sliceAsBytes(got));
@@ -4300,7 +4362,7 @@ test "attn decode with f16 KV cache matches the f32 reference" {
         try be.tensorUpload(q_d, std.mem.sliceAsBytes(q));
         try be.tensorUpload(k_d, std.mem.sliceAsBytes(k16));
         try be.tensorUpload(v_d, std.mem.sliceAsBytes(v16));
-        try be.opAttnDecode(q_d, k_d, v_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale, 0, 0, false, true);
+        try be.opAttnDecode(q_d, k_d, v_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale, 0, 0, false, .f16);
         const got = try gpa.alloc(f32, q.len);
         defer gpa.free(got);
         try be.tensorDownload(o_d, std.mem.sliceAsBytes(got));
@@ -4311,6 +4373,156 @@ test "attn decode with f16 KV cache matches the f32 reference" {
             return error.TestExpectedApproxEqAbs;
         }
     }
+}
+
+test "attn decode with q8_0 KV cache matches the f32 reference" {
+    // q8_0 KV: K/V stored as ggml 34-byte blocks (attn_split_q8 /
+    // attn_split_h256_q8 / attn_split_h512_q8). The host cache quantizes and
+    // the reference reads its dequantized view, so — like the f16 test — the
+    // comparison isolates the kernel math from the quantization loss.
+    // Covers all three head dims (qwen3 128, gemma local 256, gemma4 global 512).
+    const gpa = std.testing.allocator;
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+    const kvmod = @import("../../llm/kv_cache.zig");
+
+    const heads = 4;
+    const kv_heads = 2;
+    const nsp = 8;
+    inline for (.{ 128, 256, 512 }) |hd| {
+        const seq_q = 40;
+        const kv_len0 = 7; // non-empty prefix
+        const kv_total = kv_len0 + seq_q;
+        const kv_dim = kv_heads * hd;
+        var prng = std.Random.DefaultPrng.init(31 + hd);
+        const rand = prng.random();
+
+        const q = try gpa.alloc(f32, seq_q * heads * hd);
+        defer gpa.free(q);
+        const k_raw = try gpa.alloc(f32, kv_total * kv_dim);
+        defer gpa.free(k_raw);
+        const v_raw = try gpa.alloc(f32, kv_total * kv_dim);
+        defer gpa.free(v_raw);
+        for (q) |*x| x.* = rand.floatNorm(f32) * 0.3;
+        for (k_raw) |*x| x.* = rand.floatNorm(f32) * 0.3;
+        for (v_raw) |*x| x.* = rand.floatNorm(f32);
+        const scale = 1.0 / @sqrt(@as(f32, hd));
+
+        // Host q8_0 cache: quantizes on write; kView is the dequantized truth
+        // the kernel should reproduce, kRowBytes the device byte layout.
+        var cache = try kvmod.KvCache.init(gpa, 1, kv_total, kv_dim, .q8_0);
+        defer cache.deinit(gpa);
+        cache.write(0, k_raw, v_raw);
+        cache.commit(kv_total);
+        const k = cache.kView(0, 0);
+        const ref = try gpa.alloc(f32, seq_q * heads * hd);
+        defer gpa.free(ref);
+        const scores = try gpa.alloc(f32, kv_total);
+        defer gpa.free(scores);
+        for (0..seq_q) |t| {
+            const klen = kv_len0 + t + 1;
+            for (0..heads) |h| {
+                const kvh = h / (heads / kv_heads);
+                var mx: f32 = -std.math.inf(f32);
+                for (0..klen) |j| {
+                    var sacc: f32 = 0;
+                    for (0..hd) |c| sacc += q[(t * heads + h) * hd + c] * k[j * kv_dim + kvh * hd + c];
+                    scores[j] = sacc * scale;
+                    mx = @max(mx, scores[j]);
+                }
+                var den: f32 = 0;
+                for (scores[0..klen]) |*sc| {
+                    sc.* = @exp(sc.* - mx);
+                    den += sc.*;
+                }
+                const v = cache.vView(0, 0);
+                for (0..hd) |c| {
+                    var acc: f32 = 0;
+                    for (0..klen) |j| acc += scores[j] * v[j * kv_dim + kvh * hd + c];
+                    ref[(t * heads + h) * hd + c] = acc / den;
+                }
+            }
+        }
+
+        const kv_bytes = cache.kRowBytes(0, 0, kv_total);
+        const q_d = try be.tensorCreate(q.len * 4);
+        const k_d = try be.tensorCreate(kv_bytes.len);
+        const v_d = try be.tensorCreate(kv_bytes.len);
+        const o_d = try be.tensorCreate(q.len * 4);
+        const s_d = try be.tensorCreate(seq_q * heads * nsp * (hd + 4) * 4);
+        defer {
+            inline for (.{ q_d, k_d, v_d, o_d, s_d }) |b| {
+                var bb = b;
+                be.tensorDestroy(&bb);
+            }
+        }
+        try be.tensorUpload(q_d, std.mem.sliceAsBytes(q));
+        try be.tensorUpload(k_d, cache.kRowBytes(0, 0, kv_total));
+        try be.tensorUpload(v_d, cache.vRowBytes(0, 0, kv_total));
+        try be.opAttnDecode(q_d, k_d, v_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale, 0, 0, false, .q8_0);
+        const got = try gpa.alloc(f32, q.len);
+        defer gpa.free(got);
+        try be.tensorDownload(o_d, std.mem.sliceAsBytes(got));
+        var worst: f32 = 0;
+        for (ref, got) |e, a| worst = @max(worst, @abs(e - a));
+        if (worst > 5e-3) {
+            std.debug.print("q8_0 KV hd={d}: worst abs err {d}\n", .{ hd, worst });
+            return error.TestExpectedApproxEqAbs;
+        }
+    }
+}
+
+test "opStoreKvQ8 and kv_append_s_q8 quantize bit-identically to the host cache" {
+    // The store kernels use div.rn + cvt.rni (ties to even) to match the host
+    // packQ80 exactly: a row quantized on the device must equal the same row
+    // quantized by the host KvCache byte for byte (the offload-split /
+    // migrate-promote invariant).
+    const gpa = std.testing.allocator;
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+    const kvmod = @import("../../llm/kv_cache.zig");
+
+    const kv_dim = 256;
+    const rows = 9;
+    var prng = std.Random.DefaultPrng.init(99);
+    const rand = prng.random();
+    const src = try gpa.alloc(f32, rows * kv_dim);
+    defer gpa.free(src);
+    for (src) |*x| x.* = rand.floatNorm(f32) * 4.0;
+    // Include an all-zero block (d == 0 path) and a denormal-ish tiny block.
+    @memset(src[32..64], 0);
+    for (src[64..96]) |*x| x.* = rand.floatNorm(f32) * 1e-6;
+
+    var cache = try kvmod.KvCache.init(gpa, 1, rows, kv_dim, .q8_0);
+    defer cache.deinit(gpa);
+    cache.write(0, src, src);
+    cache.commit(rows);
+    const expect_bytes = cache.kRowBytes(0, 0, rows);
+
+    const src_d = try be.tensorCreate(src.len * 4);
+    const dst_d = try be.tensorCreate(expect_bytes.len);
+    defer {
+        inline for (.{ src_d, dst_d }) |b| {
+            var bb = b;
+            be.tensorDestroy(&bb);
+        }
+    }
+    try be.tensorUpload(src_d, std.mem.sliceAsBytes(src));
+
+    // Whole-chunk store (prefill path).
+    try be.opStoreKvQ8(dst_d, 0, src_d, 0, rows * kv_dim);
+    const got = try gpa.alloc(u8, expect_bytes.len);
+    defer gpa.free(got);
+    try be.tensorDownload(dst_d, got);
+    try std.testing.expectEqualSlices(u8, expect_bytes, got);
+
+    // Graph append (decode path): re-quantize row 5 in place via g_state pos0.
+    try be.tensorUpload(dst_d, got); // rewind not needed; row 5 overwritten below
+    try be.setDecodeState(0, 5);
+    const row_d = dbOffset(src_d, 5 * kv_dim * 4);
+    try be.opKvAppendS(dst_d, row_d, kv_dim, kv_dim, 0, .q8_0);
+    try be.tensorDownload(dst_d, got);
+    try std.testing.expectEqualSlices(u8, expect_bytes, got);
 }
 
 // Gated on a CUDA device: the sliding-window path of attn_split_h256
@@ -4388,7 +4600,7 @@ test "attn decode sliding window matches CPU reference" {
     try be.tensorUpload(q_d, std.mem.sliceAsBytes(q));
     try be.tensorUpload(k_d, std.mem.sliceAsBytes(k));
     try be.tensorUpload(v_d, std.mem.sliceAsBytes(v));
-    try be.opAttnDecode(q_d, k_d, v_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale, window, 0, false, false);
+    try be.opAttnDecode(q_d, k_d, v_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale, window, 0, false, .f32);
     const got = try gpa.alloc(f32, q.len);
     defer gpa.free(got);
     try be.tensorDownload(o_d, std.mem.sliceAsBytes(got));
@@ -4420,7 +4632,7 @@ test "attn decode sliding window matches CPU reference" {
     }
     try be.tensorUpload(kr_d, std.mem.sliceAsBytes(k_ring));
     try be.tensorUpload(vr_d, std.mem.sliceAsBytes(v_ring));
-    try be.opAttnDecode(q_d, kr_d, vr_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale, window, ring, false, false);
+    try be.opAttnDecode(q_d, kr_d, vr_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale, window, ring, false, .f32);
     try be.tensorDownload(o_d, std.mem.sliceAsBytes(got));
     var worst_ring: f32 = 0;
     for (ref, got) |e, a| worst_ring = @max(worst_ring, @abs(e - a));
@@ -4508,7 +4720,7 @@ test "attn decode bidirectional image block matches CPU reference" {
         try be.tensorUpload(k_d, std.mem.sliceAsBytes(k));
         try be.tensorUpload(v_d, std.mem.sliceAsBytes(v));
         // bidir=true, linear KV (ring=0): the image block is one un-chunked pass.
-        try be.opAttnDecode(q_d, k_d, v_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale, window, 0, true, false);
+        try be.opAttnDecode(q_d, k_d, v_d, o_d, s_d, kv_len0 + 1, seq_q, heads, kv_heads, hd, nsp, scale, window, 0, true, .f32);
         const got = try gpa.alloc(f32, q.len);
         defer gpa.free(got);
         try be.tensorDownload(o_d, std.mem.sliceAsBytes(got));

@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const cuda = @import("gpu/cuda.zig");
 
 /// Skip the calling test unless the integration suite is enabled.
 pub fn requireIntegration() error{SkipZigTest}!void {
@@ -22,3 +23,34 @@ pub fn requireModelFile(io: std.Io, path: []const u8) error{SkipZigTest}!void {
     if (!build_options.integration) return error.SkipZigTest;
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
 }
+
+/// Test helper: occupy device VRAM until only ~`target_free` bytes stay free,
+/// simulating another process / a resident image model for tests that assert
+/// VRAM-pressure behavior (split planning, eviction, reclaim). Allocates in
+/// 1 GiB chunks (one huge allocation can fail on a fragmented card) and stops
+/// early if the allocator refuses — the caller asserts on the RESULTING free
+/// figure, not on how much was ballooned. Release with `deinit`.
+pub const VramBalloon = struct {
+    be: *cuda.Backend,
+    gpa: std.mem.Allocator,
+    bufs: std.ArrayList(cuda.backend.DeviceBuffer) = .empty,
+
+    pub fn inflateToFree(gpa: std.mem.Allocator, be: *cuda.Backend, target_free: u64) !VramBalloon {
+        var self: VramBalloon = .{ .be = be, .gpa = gpa };
+        errdefer self.deinit();
+        while (true) {
+            const free = be.ctx.memGetInfo().free;
+            if (free <= target_free) break;
+            const chunk: u64 = @min(1 << 30, free - target_free);
+            if (chunk < (64 << 20)) break; // close enough; tiny allocs just churn
+            const b = be.tensorCreate(chunk) catch break; // fragmented: keep what we got
+            try self.bufs.append(gpa, b);
+        }
+        return self;
+    }
+
+    pub fn deinit(self: *VramBalloon) void {
+        for (self.bufs.items) |*b| self.be.tensorDestroy(b);
+        self.bufs.deinit(self.gpa);
+    }
+};

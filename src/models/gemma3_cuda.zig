@@ -29,6 +29,16 @@ const transformer_gpu = @import("transformer_gpu.zig");
 
 const Backend = cuda.Backend;
 const Buf = cuda.backend.DeviceBuffer;
+
+/// Map the session KV dtype onto the backend's kernel-format tag.
+fn kvFmt(dt: kvmod.KvDtype) cuda.backend.KvFmt {
+    return switch (dt) {
+        .f32 => .f32,
+        .f16 => .f16,
+        .q8_0 => .q8_0,
+    };
+}
+
 const Growable = Backend.GrowableTensor;
 
 /// KV chunks per head in the decode attention split; the smaller prefill
@@ -117,10 +127,12 @@ pub const CudaLM = struct {
     /// `attention` stepper (device + host-split) reads it and lets every query
     /// in the batch attend the whole block forward (image spans are non-causal).
     bidir_prefill: bool = false,
-    /// Io for the host matmuls of a hybrid split's CPU-resident layers; set by
-    /// `step`. Undefined until the first `step` — the offload host path only
-    /// runs after generation starts (text-only sessions), same as qwen35_cuda.
-    io: std.Io = undefined,
+    /// Io for the host matmuls of a hybrid split's CPU-resident layers; set
+    /// by the step entry points, or seeded by the session owner BEFORE the
+    /// first forward (tp-gui prefills before any step, and an over-budget
+    /// model has host layers from init). null fails the host path closed
+    /// (error.SplitIoUnset) instead of undefined-pointer UB.
+    io: ?std.Io = null,
     /// Hybrid CPU/GPU split: CPU-resident layers run host matmuls (dynamic
     /// offload migrates more to the host as the KV cache grows). null = fully
     /// device-resident. Forces the per-op path (already the gemma3 default).
@@ -192,6 +204,7 @@ pub const CudaLM = struct {
         self.kv_dtype = cap.kv_dtype;
         self.len = 0;
         self.split = null;
+        self.io = null; // field defaults do not apply to `undefined`-built structs
         self.sin_off = cap.max * (cfg.head_dim / 2);
 
         self.freqs_global = try uploadFreqs(be, gpa, cap.max, cfg.head_dim, cfg.rope_theta, cfg.rope_freq_scale);
@@ -226,44 +239,55 @@ pub const CudaLM = struct {
     /// (Re)create the per-layer K/V device buffers at `self.kv_dtype`, sized
     /// from `self.initial_capacity`/`self.max_capacity` (LOCAL layers = fixed
     /// sliding-window ring). The `k_cache`/`v_cache` slices must already exist.
+    /// Host-resident layers of an armed split are skipped — they keep no
+    /// device KV (their shadow lives in `split.cache`).
     fn allocKvCaches(self: *CudaLM) !void {
         const cfg = self.cfg;
         const be = self.be;
-        const esz = self.kv_dtype.elemBytes();
+        const dt = self.kv_dtype;
         for (self.k_cache, self.v_cache, 0..) |*kb, *vb, l| {
+            if (self.split) |*sp| if (!sp.on_gpu[l]) continue;
             if (usesRing(cfg, l)) {
-                const bytes = localRingRows(cfg) * cfg.kvDim() * esz;
+                const bytes = dt.sizeBytes(localRingRows(cfg) * cfg.kvDim());
                 kb.* = try be.growableCreate(bytes, bytes);
                 vb.* = try be.growableCreate(bytes, bytes);
             } else {
-                kb.* = try be.growableCreate(self.initial_capacity * cfg.kvDim() * esz, self.max_capacity * cfg.kvDim() * esz);
-                vb.* = try be.growableCreate(self.initial_capacity * cfg.kvDim() * esz, self.max_capacity * cfg.kvDim() * esz);
+                kb.* = try be.growableCreate(dt.sizeBytes(self.initial_capacity * cfg.kvDim()), dt.sizeBytes(self.max_capacity * cfg.kvDim()));
+                vb.* = try be.growableCreate(dt.sizeBytes(self.initial_capacity * cfg.kvDim()), dt.sizeBytes(self.max_capacity * cfg.kvDim()));
             }
         }
     }
 
     /// Store `n` K/V elements from `src` (+`src_off` elems) into cache buffer
-    /// `dst` at element offset `dst_off`. f32 copies raw; f16 converts on store.
+    /// `dst` at element offset `dst_off`. f32 copies raw; f16/q8_0 convert on
+    /// store.
     fn storeKv(self: *CudaLM, dst: Buf, dst_off: usize, src: Buf, src_off: usize, n: usize) !void {
-        if (self.kv_dtype == .f16) {
-            try self.be.opStoreKvF16(dst, dst_off, src, src_off, n);
-        } else {
-            try self.be.tensorCopy(dst, dst_off * 4, src, src_off * 4, n * 4);
+        switch (self.kv_dtype) {
+            .f16 => try self.be.opStoreKvF16(dst, dst_off, src, src_off, n),
+            .q8_0 => try self.be.opStoreKvQ8(dst, dst_off, src, src_off, n),
+            .f32 => try self.be.tensorCopy(dst, dst_off * 4, src, src_off * 4, n * 4),
         }
     }
 
     /// Rebuild the KV cache at a new element dtype (GUI toggle), weights resident.
     /// gemma3 decodes straight through `opAttnDecode` (no captured graph), so this
-    /// just frees + re-creates the K/V buffers and resets the length. f16 with an
-    /// active CPU-offload split is unsupported (the host shadow cache is f32).
+    /// just frees + re-creates the K/V buffers (and a split's host shadow, which
+    /// stores the same dtype as the device caches) and resets the length.
     pub fn reinitCache(self: *CudaLM, dtype: kvmod.KvDtype) !void {
-        if (dtype == .f16 and self.split != null) return error.KvDtypeUnsupported;
+        // Host-resident layers keep no device KV (growableDestroy is
+        // idempotent on their already-destroyed buffers; allocKvCaches skips
+        // them).
         for (self.k_cache) |*b| self.be.growableDestroy(b);
         for (self.v_cache) |*b| self.be.growableDestroy(b);
         self.kv_dtype = dtype;
         self.capacity = self.initial_capacity;
         self.len = 0;
         try self.allocKvCaches();
+        if (self.split) |*sp| {
+            const cache = try kvmod.KvCache.init(self.gpa, self.cfg.n_layers, self.capacity, self.cfg.kvDim(), dtype);
+            sp.cache.deinit(self.gpa);
+            sp.cache = cache;
+        }
     }
 
     pub fn deinit(self: *CudaLM) void {
@@ -306,6 +330,100 @@ pub const CudaLM = struct {
     pub fn resetCache(self: *CudaLM) !void {
         self.len = 0;
     }
+
+    /// Fixed byte size of a turn checkpoint (see `checkpoint`): every LOCAL
+    /// (sliding-window) layer's full KV ring. GLOBAL layers are append-only, so
+    /// truncation alone rolls them back — but a LOCAL ring OVERWRITES its
+    /// oldest rows as generation advances, so a rollback further than the ring
+    /// slack needs them restored. Context-independent (rings are fixed-size).
+    pub fn checkpointBytes(self: *const CudaLM) usize {
+        const cfg = self.cfg;
+        const ring_bytes = self.kv_dtype.sizeBytes(localRingRows(cfg) * cfg.kvDim());
+        var total: usize = 0;
+        for (0..cfg.n_layers) |l| {
+            if (usesRing(cfg, l)) total += 2 * ring_bytes;
+        }
+        return total;
+    }
+
+    /// Snapshot the non-append-only context state at the current position into
+    /// `out` (`checkpointBytes` long): each LOCAL layer's ring, in ring-row
+    /// format, read from whichever side currently owns the layer (a linear
+    /// host shadow is translated through the same ring mapping migrate/promote
+    /// use). Owner-agnostic, so layers may migrate between snapshot and
+    /// restore. Pair with `restoreCheckpoint(out, q)` where `q == cached()`.
+    pub fn checkpoint(self: *CudaLM, out: []u8) !void {
+        std.debug.assert(out.len == self.checkpointBytes());
+        try self.checkpointRings(.save, out);
+    }
+
+    /// Roll the context back to `q` committed tokens (a turn boundary) using a
+    /// snapshot taken there: GLOBAL layers just truncate (rows past `q` are
+    /// overwritten by the next write, on the device growables and the split's
+    /// linear host shadow alike); LOCAL rings are restored wholesale into each
+    /// layer's CURRENT owner, bringing back the rows the discarded response
+    /// overwrote.
+    pub fn restoreCheckpoint(self: *CudaLM, snap: []const u8, q: usize) !void {
+        std.debug.assert(snap.len == self.checkpointBytes());
+        std.debug.assert(q <= self.len);
+        // Truncate FIRST: the host-linear ring translation below maps the
+        // snapshot's live window, which is defined by q.
+        self.len = q;
+        if (self.split) |*sp| sp.cache.truncate(q);
+        try self.checkpointRings(.restore, snap);
+    }
+
+    const CheckpointDir = enum { save, restore };
+
+    /// Shared body of checkpoint/restoreCheckpoint: move every LOCAL layer's
+    /// ring between the snapshot buffer (ring-row format, K then V per layer)
+    /// and the layer's current owner. Device-resident rings copy wholesale;
+    /// a host-resident layer's linear shadow is translated per live segment
+    /// (`ringSegments(self.len, ring)` — the caller ensures `self.len` is the
+    /// snapshot's q in both directions).
+    fn checkpointRings(self: *CudaLM, comptime dir: CheckpointDir, buf: if (dir == .save) []u8 else []const u8) !void {
+        const cfg = self.cfg;
+        const kvd = cfg.kvDim();
+        const ring = localRingRows(cfg);
+        const dt = self.kv_dtype;
+        const ring_bytes = dt.sizeBytes(ring * kvd);
+        var off: usize = 0;
+        for (0..cfg.n_layers) |l| {
+            if (!usesRing(cfg, l)) continue;
+            const bk = buf[off..][0..ring_bytes];
+            const bv = buf[off + ring_bytes ..][0..ring_bytes];
+            const on_gpu = if (self.split) |*sp| sp.on_gpu[l] else true;
+            if (on_gpu) {
+                if (comptime dir == .save) {
+                    try self.be.tensorDownload(offsetBufSized(self.k_cache[l].buf, 0, ring_bytes), bk);
+                    try self.be.tensorDownload(offsetBufSized(self.v_cache[l].buf, 0, ring_bytes), bv);
+                } else {
+                    try self.be.tensorUpload(offsetBufSized(self.k_cache[l].buf, 0, ring_bytes), bk);
+                    try self.be.tensorUpload(offsetBufSized(self.v_cache[l].buf, 0, ring_bytes), bv);
+                }
+            } else {
+                // Host-resident: the linear shadow stores the same dtype as
+                // the device rings (kRowBytes is the device byte layout), so
+                // the snapshot's ring-row format is a raw copy either way.
+                const sp = &self.split.?;
+                for (ringSegments(self.len, ring)) |seg| {
+                    if (seg.n == 0) continue;
+                    const hk = sp.cache.kRowBytes(l, seg.abs, seg.n);
+                    const hv = sp.cache.vRowBytes(l, seg.abs, seg.n);
+                    const rk = bk[dt.sizeBytes(seg.dev * kvd)..][0..dt.sizeBytes(seg.n * kvd)];
+                    const rv = bv[dt.sizeBytes(seg.dev * kvd)..][0..dt.sizeBytes(seg.n * kvd)];
+                    if (comptime dir == .save) {
+                        @memcpy(rk, hk);
+                        @memcpy(rv, hv);
+                    } else {
+                        @memcpy(hk, rk);
+                        @memcpy(hv, rv);
+                    }
+                }
+            }
+            off += 2 * ring_bytes;
+        }
+    }
     pub fn vocab(self: *const CudaLM) usize {
         return self.cfg.vocab;
     }
@@ -336,23 +454,21 @@ pub const CudaLM = struct {
         const cfg = self.cfg;
         const sp = &self.split.?;
         const kvd = cfg.kvDim();
+        // The host shadow stores the same dtype as the device caches
+        // (kRowBytes is the device byte layout), so every copy is raw.
+        const dt = self.kv_dtype;
         if (self.len > 0) {
-            const cap = sp.cache.capacity;
             if (usesRing(cfg, l)) {
                 // LOCAL ring -> linear host shadow: copy the live window,
                 // translating ring rows (pos%ring) to absolute host rows.
                 for (ringSegments(self.len, localRingRows(cfg))) |seg| {
                     if (seg.n == 0) continue;
-                    const hk = sp.cache.k[l * cap * kvd + seg.abs * kvd ..][0 .. seg.n * kvd];
-                    const hv = sp.cache.v[l * cap * kvd + seg.abs * kvd ..][0 .. seg.n * kvd];
-                    try self.be.tensorDownload(offsetBufSized(self.k_cache[l].buf, seg.dev * kvd * 4, seg.n * kvd * 4), std.mem.sliceAsBytes(hk));
-                    try self.be.tensorDownload(offsetBufSized(self.v_cache[l].buf, seg.dev * kvd * 4, seg.n * kvd * 4), std.mem.sliceAsBytes(hv));
+                    try self.be.tensorDownload(offsetBufSized(self.k_cache[l].buf, dt.sizeBytes(seg.dev * kvd), dt.sizeBytes(seg.n * kvd)), sp.cache.kRowBytes(l, seg.abs, seg.n));
+                    try self.be.tensorDownload(offsetBufSized(self.v_cache[l].buf, dt.sizeBytes(seg.dev * kvd), dt.sizeBytes(seg.n * kvd)), sp.cache.vRowBytes(l, seg.abs, seg.n));
                 }
             } else {
-                const hk = sp.cache.k[l * cap * kvd ..][0 .. self.len * kvd];
-                const hv = sp.cache.v[l * cap * kvd ..][0 .. self.len * kvd];
-                try self.be.tensorDownload(offsetBufSized(self.k_cache[l].buf, 0, self.len * kvd * 4), std.mem.sliceAsBytes(hk));
-                try self.be.tensorDownload(offsetBufSized(self.v_cache[l].buf, 0, self.len * kvd * 4), std.mem.sliceAsBytes(hv));
+                try self.be.tensorDownload(offsetBufSized(self.k_cache[l].buf, 0, dt.sizeBytes(self.len * kvd)), sp.cache.kRowBytes(l, 0, self.len));
+                try self.be.tensorDownload(offsetBufSized(self.v_cache[l].buf, 0, dt.sizeBytes(self.len * kvd)), sp.cache.vRowBytes(l, 0, self.len));
             }
         }
         self.be.growableDestroy(&self.k_cache[l]);
@@ -392,7 +508,7 @@ pub const CudaLM = struct {
     /// streamable weights, the KV it re-commits at the current capacity (all
     /// gemma3 layers are attention), plus slack.
     pub fn promoteCost(self: *CudaLM, l: usize) usize {
-        const kv_at_cap = 2 * self.capacity * self.cfg.kvDim() * 4;
+        const kv_at_cap = 2 * self.kv_dtype.sizeBytes(self.capacity * self.cfg.kvDim());
         return layerDeviceBytes(&self.lm.layers[l]) + kv_at_cap + (64 << 20);
     }
 
@@ -403,30 +519,26 @@ pub const CudaLM = struct {
         const cfg = self.cfg;
         const sp = &self.split.?;
         const kvd = cfg.kvDim();
+        const dt = self.kv_dtype;
         if (usesRing(cfg, l)) {
-            const bytes = localRingRows(cfg) * kvd * 4;
+            const bytes = dt.sizeBytes(localRingRows(cfg) * kvd);
             self.k_cache[l] = try self.be.growableCreate(bytes, bytes);
             self.v_cache[l] = try self.be.growableCreate(bytes, bytes);
         } else {
-            self.k_cache[l] = try self.be.growableCreate(self.capacity * kvd * 4, self.max_capacity * kvd * 4);
-            self.v_cache[l] = try self.be.growableCreate(self.capacity * kvd * 4, self.max_capacity * kvd * 4);
+            self.k_cache[l] = try self.be.growableCreate(dt.sizeBytes(self.capacity * kvd), dt.sizeBytes(self.max_capacity * kvd));
+            self.v_cache[l] = try self.be.growableCreate(dt.sizeBytes(self.capacity * kvd), dt.sizeBytes(self.max_capacity * kvd));
         }
         if (self.len > 0) {
-            const cap = sp.cache.capacity;
             if (usesRing(cfg, l)) {
                 // Linear host shadow -> LOCAL ring: reverse of migrateLayer.
                 for (ringSegments(self.len, localRingRows(cfg))) |seg| {
                     if (seg.n == 0) continue;
-                    const hk = sp.cache.k[l * cap * kvd + seg.abs * kvd ..][0 .. seg.n * kvd];
-                    const hv = sp.cache.v[l * cap * kvd + seg.abs * kvd ..][0 .. seg.n * kvd];
-                    try self.be.tensorUpload(offsetBufSized(self.k_cache[l].buf, seg.dev * kvd * 4, seg.n * kvd * 4), std.mem.sliceAsBytes(hk));
-                    try self.be.tensorUpload(offsetBufSized(self.v_cache[l].buf, seg.dev * kvd * 4, seg.n * kvd * 4), std.mem.sliceAsBytes(hv));
+                    try self.be.tensorUpload(offsetBufSized(self.k_cache[l].buf, dt.sizeBytes(seg.dev * kvd), dt.sizeBytes(seg.n * kvd)), sp.cache.kRowBytes(l, seg.abs, seg.n));
+                    try self.be.tensorUpload(offsetBufSized(self.v_cache[l].buf, dt.sizeBytes(seg.dev * kvd), dt.sizeBytes(seg.n * kvd)), sp.cache.vRowBytes(l, seg.abs, seg.n));
                 }
             } else {
-                const hk = sp.cache.k[l * cap * kvd ..][0 .. self.len * kvd];
-                const hv = sp.cache.v[l * cap * kvd ..][0 .. self.len * kvd];
-                try self.be.tensorUpload(offsetBufSized(self.k_cache[l].buf, 0, self.len * kvd * 4), std.mem.sliceAsBytes(hk));
-                try self.be.tensorUpload(offsetBufSized(self.v_cache[l].buf, 0, self.len * kvd * 4), std.mem.sliceAsBytes(hv));
+                try self.be.tensorUpload(offsetBufSized(self.k_cache[l].buf, 0, dt.sizeBytes(self.len * kvd)), sp.cache.kRowBytes(l, 0, self.len));
+                try self.be.tensorUpload(offsetBufSized(self.v_cache[l].buf, 0, dt.sizeBytes(self.len * kvd)), sp.cache.vRowBytes(l, 0, self.len));
             }
         }
         sp.on_gpu[l] = true;
@@ -448,8 +560,6 @@ pub const CudaLM = struct {
     /// offload for the fresh small context. KV is discarded, so no host->device
     /// copy is needed (unlike promoteLayers).
     pub fn resetResidency(self: *CudaLM, budget: u64) !void {
-        const cfg = self.cfg;
-        const kvd = cfg.kvDim();
         if (self.split) |*sp| {
             sp.cache.deinit(self.gpa);
             sp.scratch.deinit(self.gpa);
@@ -460,19 +570,10 @@ pub const CudaLM = struct {
             self.gpa.free(sp.order);
             self.split = null;
         }
-        for (self.k_cache, self.v_cache, 0..) |*kb, *vb, l| {
-            self.be.growableDestroy(kb);
-            self.be.growableDestroy(vb);
-            if (usesRing(cfg, l)) {
-                const bytes = localRingRows(cfg) * kvd * 4;
-                kb.* = try self.be.growableCreate(bytes, bytes);
-                vb.* = try self.be.growableCreate(bytes, bytes);
-            } else {
-                kb.* = try self.be.growableCreate(self.initial_capacity * kvd * 4, self.max_capacity * kvd * 4);
-                vb.* = try self.be.growableCreate(self.initial_capacity * kvd * 4, self.max_capacity * kvd * 4);
-            }
-        }
+        for (self.k_cache) |*b| self.be.growableDestroy(b);
+        for (self.v_cache) |*b| self.be.growableDestroy(b);
         self.capacity = self.initial_capacity;
+        try self.allocKvCaches();
         try self.resetCache();
         _ = try self.autoOffload(budget);
     }
@@ -484,9 +585,6 @@ pub const CudaLM = struct {
     /// fallback. See qwen35_cuda.autoOffload for the measured rationale.
     pub fn autoOffload(self: *CudaLM, budget: u64) !bool {
         if (budget == 0) return false;
-        // f16 KV stays fully resident (see migrateNextLayer); f16 halves the KV
-        // footprint, so the pressure that would trigger auto-offload is lower.
-        if (self.kv_dtype == .f16) return false;
         try self.enableCpuSplit(.attn, budget, true);
         return true;
     }
@@ -498,8 +596,6 @@ pub const CudaLM = struct {
     /// the per-op path (already the gemma3 default). No-op static split (all fit)
     /// leaves `self.split == null`. Mirrors qwen35_cuda.enableCpuSplit.
     pub fn enableCpuSplit(self: *CudaLM, policy: CpuSplitPolicy, budget: u64, dynamic: bool) !void {
-        // f16 KV + CPU offload is unsupported: the host shadow cache is f32.
-        if (self.kv_dtype == .f16) return error.KvDtypeUnsupported;
         const cfg = self.cfg;
         const n = cfg.n_layers;
         const gpa = self.gpa;
@@ -516,12 +612,20 @@ pub const CudaLM = struct {
         // layers hold only localRingRows, not the full capacity.
         var kv_rows: usize = 0;
         for (0..n) |l| kv_rows += if (usesRing(cfg, l)) localRingRows(cfg) else self.capacity;
-        const kv_bytes = 2 * kv_rows * cfg.kvDim() * 4;
+        const kv_bytes = 2 * self.kv_dtype.sizeBytes(kv_rows * cfg.kvDim());
         const reserve = if (dynamic)
             self.lm.head.bytes.len
         else
             kv_bytes + self.lm.head.bytes.len + (512 << 20);
-        const gpu_weight_budget: usize = if (budget > reserve) budget - reserve else 0;
+        // The plan must respect the card's LIVE free VRAM, not just the
+        // abstract budget: other processes may hold a chunk of the card, and
+        // the already-committed KV/activation buffers count against it too. A
+        // plan the card can't satisfy places everything resident and then
+        // faults at the first prefill (weight uploads + lazy PTX JIT collide
+        // at zero free). headroom() already keeps a 10% margin.
+        const used = self.be.deviceUsed();
+        const avail = @min(budget, used + self.be.headroom()) -| used;
+        const gpu_weight_budget: usize = if (avail > reserve) @intCast(avail - reserve) else 0;
 
         // Eviction order: last layer leaves first (descending). gemma3 is
         // all-attention, so `.attn` and `.tail` coincide.
@@ -535,9 +639,7 @@ pub const CudaLM = struct {
         var gpu_weight = total_weight;
         var n_cpu: usize = 0;
         while (gpu_weight > gpu_weight_budget and n_cpu < n) {
-            const l = order[n_cpu];
-            on_gpu[l] = false;
-            gpu_weight -= per[l];
+            gpu_weight -= per[order[n_cpu]];
             n_cpu += 1;
         }
         if (n_cpu == 0 and !dynamic) {
@@ -547,10 +649,17 @@ pub const CudaLM = struct {
         }
 
         // Host state for the CPU-resident layers (sized to the current KV
-        // capacity; grows with the device via ensureCapacity; len starts at 0).
-        // Offloaded-layer host shadow is always f32 (f16 disables the split).
-        var cache = try kvmod.KvCache.init(gpa, n, self.capacity, cfg.kvDim(), .f32);
+        // capacity; grows with the device via ensureCapacity). The host shadow
+        // stores the SAME dtype as the device caches, so migrate/promote and
+        // the ring checkpoint translation are raw byte copies (kRowBytes).
+        var cache = try kvmod.KvCache.init(gpa, n, self.capacity, cfg.kvDim(), self.kv_dtype);
         errdefer cache.deinit(gpa);
+        // The host shadow tracks the SAME committed length as the device from
+        // the moment the split arms (per-step commits keep them in lockstep
+        // afterwards). Armed mid-conversation (imageReclaim), starting at 0
+        // would make host layers attend over nothing; migrateLayer copies each
+        // migrated layer's live rows so declaring them committed is correct.
+        cache.len = self.len;
         var scratch = try gemma3.Scratch.init(gpa, max_batch, cfg);
         errdefer scratch.deinit(gpa);
         var fg = try ops.rope.rotateHalfFreqsScaled(gpa, self.capacity, cfg.head_dim, cfg.rope_theta, cfg.rope_freq_scale);
@@ -562,7 +671,7 @@ pub const CudaLM = struct {
 
         self.split = .{
             .on_gpu = on_gpu,
-            .n_cpu = n_cpu,
+            .n_cpu = 0, // the placement loops below mark + count the host layers
             .policy = policy,
             .cache = cache,
             .scratch = scratch,
@@ -575,27 +684,38 @@ pub const CudaLM = struct {
             .budget = budget,
         };
 
-        // Free the device K/V of layers placed on the host up front (len is 0
-        // here, nothing to copy). Weights are reclaimed lazily by the cache.
-        for (order[0..n_cpu]) |l| {
-            self.be.growableDestroy(&self.k_cache[l]);
-            self.be.growableDestroy(&self.v_cache[l]);
+        // Place the statically-planned layers on the host. Before any tokens
+        // (autoOffload-at-init) there is nothing to copy — mark them and free
+        // the device K/V; weights are reclaimed lazily. Armed MID-conversation
+        // (imageReclaim), each layer's live rows must move to the host instead
+        // — migrateLayer does the copy AND the on_gpu/n_cpu bookkeeping, or
+        // the context would be destroyed with the device KV.
+        if (self.len == 0) {
+            const sp = &self.split.?;
+            for (order[0..n_cpu]) |l| {
+                sp.on_gpu[l] = false;
+                sp.n_cpu += 1;
+                self.be.growableDestroy(&self.k_cache[l]);
+                self.be.growableDestroy(&self.v_cache[l]);
+            }
+        } else {
+            for (order[0..n_cpu]) |l| try self.migrateLayer(l);
         }
     }
 
     pub fn ensureCapacity(self: *CudaLM, min_rows: usize) !void {
         const target = (try kvmod.growPlan(self.capacity, self.max_capacity, min_rows)) orelse return;
-        // Element stride MUST match how the buffers were created (esz), or an f16
-        // cache (esz=2) requests f32-sized growth, overshoots its VA reservation,
-        // and growableEnsure fails with DeviceOutOfMemory → ContextFull once the
-        // window grows past ~max_capacity/2.
-        const bytes = target * self.cfg.kvDim() * self.kv_dtype.elemBytes();
+        // Byte size MUST match how the buffers were created (kv_dtype block
+        // math), or an f16/q8_0 cache requests f32-sized growth, overshoots its
+        // VA reservation, and growableEnsure fails with DeviceOutOfMemory →
+        // ContextFull once the window grows past ~max_capacity/2.
+        const bytes = self.kv_dtype.sizeBytes(target * self.cfg.kvDim());
 
         // Dynamic offload: migrate layers GPU->CPU until there's headroom to grow
         // the device KV, instead of streaming weights (the cliff). Each migrated
         // layer frees its device KV + weight VRAM. Mirrors qwen35_cuda.
         if (self.split) |*sp| if (sp.dynamic) {
-            const add = (target - self.capacity) * self.cfg.kvDim() * 4;
+            const add = self.kv_dtype.sizeBytes((target - self.capacity) * self.cfg.kvDim());
             while (true) {
                 const need = self.liveSlots() * 2 * add + (32 << 20); // + margin
                 const free = @min(sp.budget -| self.be.deviceUsed(), self.be.headroom());
@@ -819,7 +939,7 @@ pub const CudaLM = struct {
         const window: usize = if (cfg.isGlobal(l)) 0 else cfg.sliding_window;
         const ring: usize = if (usesRing(cfg, l)) localRingRows(cfg) else 0;
         const ns: usize = if (seq == 1) nsplit else nsplit_prefill;
-        try self.be.opAttnDecode(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, pos0 + 1, seq, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, ns, scale, window, ring, self.bidir_prefill, self.kv_dtype == .f16);
+        try self.be.opAttnDecode(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, pos0 + 1, seq, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, ns, scale, window, ring, self.bidir_prefill, kvFmt(self.kv_dtype));
     }
     pub fn projectO(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
         _ = l;
@@ -886,8 +1006,9 @@ pub const CudaLM = struct {
                         try be.tensorDownload(offsetBufSized(b.x, 0, n * cfg.hidden * 4), std.mem.sliceAsBytes(sp.hx[0 .. n * cfg.hidden]));
                         sp.on_host = true;
                     }
+                    const host_io = self.io orelse return error.SplitIoUnset;
                     var sv = sp.scratch.viewSeq(n, cfg);
-                    try gemma3.layerForward(self.io, self.gpa, cfg, layer, sp.hx[0 .. n * cfg.hidden], n, sp.freqs_global, sp.freqs_local, &sp.cache, l, self.bidir_prefill, &sv);
+                    try gemma3.layerForward(host_io, self.gpa, cfg, layer, sp.hx[0 .. n * cfg.hidden], n, sp.freqs_global, sp.freqs_local, &sp.cache, l, self.bidir_prefill, &sv);
                     continue;
                 }
                 if (sp.on_host) {
@@ -1046,4 +1167,195 @@ test "ringSegments covers the live window contiguously" {
         }
         try std.testing.expectEqual(len, abs); // covered exactly up to len
     }
+}
+
+// Gated on -Dintegration + a CUDA device + the real 12B checkpoint: greedy
+// regeneration after `restoreCheckpoint` must be TOKEN-IDENTICAL. The geometry
+// deliberately exercises the SWA rings: the prompt exceeds the ring size (so
+// the rings have wrapped) and the generation exceeds the ring slack (so it
+// OVERWRITES live-window rows the rollback needs) — only the checkpoint's ring
+// snapshot can bring those rows back; a bare `len` rollback would replay over
+// destroyed keys. Also re-runs under a mid-conversation CPU split (host-linear
+// ring translation + owner-aware restore), asserting repeatability there and
+// bit-identity again after promoting back (hybrid CPU/GPU arithmetic isn't
+// guaranteed bit-identical to all-GPU, so the split leg can't compare to seq1
+// directly — mirrors the qwen35_cuda test).
+fn checkpointRestoreBody(kv_dtype: kvmod.KvDtype) !void {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const test_gate = @import("../test_gate.zig");
+    const Gguf = @import("../gguf.zig").Gguf;
+    const path = "/home/qt/genai/lmstudio/models/mradermacher/Gemma-3-Starshine-12B-Alt-GGUF/Gemma-3-Starshine-12B-Alt.Q4_K_M.gguf";
+    try test_gate.requireModelFile(io, path);
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+
+    var g = try Gguf.open(gpa, io, path);
+    defer g.deinit();
+    var lm = try gemma3.Model.load(gpa, &g);
+    defer lm.deinit();
+
+    const ring = localRingRows(lm.cfg);
+    const prompt_len = ring + 64; // rings wrapped: every new row overwrites
+    const n_gen = (ring - lm.cfg.sliding_window) + 64; // > slack: live rows destroyed
+    const total = prompt_len + n_gen + 8;
+    var model = try CudaLM.init(gpa, be, &lm, .{ .initial = total, .max = total, .kv_dtype = kv_dtype });
+    defer model.deinit();
+
+    const prompt = try gpa.alloc(u32, prompt_len);
+    defer gpa.free(prompt);
+    for (prompt, 0..) |*t, i| t.* = @intCast(1000 + (i * 37) % 50000);
+    try model.prefill(prompt[0 .. prompt.len - 1]);
+    const q = model.cached();
+    const snap = try gpa.alloc(u8, model.checkpointBytes());
+    defer gpa.free(snap);
+    try model.checkpoint(snap);
+
+    const seq1 = try gpa.alloc(u32, n_gen);
+    defer gpa.free(seq1);
+    var cur: u32 = prompt[prompt.len - 1];
+    for (seq1) |*t| {
+        cur = try model.stepArgmax(io, &.{cur});
+        t.* = cur;
+    }
+
+    try model.restoreCheckpoint(snap, q);
+    try std.testing.expectEqual(q, model.cached());
+    const seq2 = try gpa.alloc(u32, n_gen);
+    defer gpa.free(seq2);
+    cur = prompt[prompt.len - 1];
+    for (seq2) |*t| {
+        cur = try model.stepArgmax(io, &.{cur});
+        t.* = cur;
+    }
+    try std.testing.expectEqualSlices(u32, seq1, seq2);
+
+    // Mid-conversation split: migrate a slice of layers to the host, restore,
+    // and assert two restored continuations agree (repeatability).
+    try model.enableCpuSplit(.tail, std.math.maxInt(u64), true);
+    try model.offloadToBudget(be.deviceUsed() * 4 / 5);
+    try model.restoreCheckpoint(snap, q);
+    const seq3 = try gpa.alloc(u32, n_gen);
+    defer gpa.free(seq3);
+    cur = prompt[prompt.len - 1];
+    for (seq3) |*t| {
+        cur = try model.stepArgmax(io, &.{cur});
+        t.* = cur;
+    }
+    try model.restoreCheckpoint(snap, q);
+    const seq4 = try gpa.alloc(u32, n_gen);
+    defer gpa.free(seq4);
+    cur = prompt[prompt.len - 1];
+    for (seq4) |*t| {
+        cur = try model.stepArgmax(io, &.{cur});
+        t.* = cur;
+    }
+    try std.testing.expectEqualSlices(u32, seq3, seq4);
+
+    // Promote everything back and restore once more: the rings round-trip
+    // host→device, so an owner-misdirected restore would now surface as
+    // divergence from the all-GPU baseline.
+    _ = try model.promoteLayers(std.math.maxInt(u64));
+    try model.restoreCheckpoint(snap, q);
+    const seq5 = try gpa.alloc(u32, n_gen);
+    defer gpa.free(seq5);
+    cur = prompt[prompt.len - 1];
+    for (seq5) |*t| {
+        cur = try model.stepArgmax(io, &.{cur});
+        t.* = cur;
+    }
+    try std.testing.expectEqualSlices(u32, seq1, seq5);
+}
+
+test "checkpoint restore regenerates token-identical on the real model" {
+    try checkpointRestoreBody(.f32);
+}
+
+// Same workout on an f16 KV cache: the split's host shadow stores packed f16
+// (byte-identical to the device rings), so the mid-conversation migrate, the
+// owner-aware ring checkpoints, and the promote round trip must all stay
+// exact — token-identical within the f16 session.
+test "checkpoint restore regenerates token-identical on the real model (f16 kv)" {
+    try checkpointRestoreBody(.f16);
+}
+
+// And on a q8_0 KV cache: the shadow stores raw ggml blocks, the ring
+// checkpoints stay dtype-agnostic byte copies at the block-aware size.
+test "checkpoint restore regenerates token-identical on the real model (q8_0 kv)" {
+    try checkpointRestoreBody(.q8_0);
+}
+
+// The initial split plan must respect the card's LIVE free VRAM, not just the
+// abstract budget: with most of the card occupied (another process, a resident
+// image model), a generous budget must still plan layers onto the host —
+// planning them all resident faults at the first prefill instead (weight
+// uploads + lazy PTX JIT collide at zero free; surfaced in tp-gui as
+// "PTX JIT failed: CUDA_ERROR_ILLEGAL_ADDRESS").
+test "cpu split plan respects live free VRAM" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const test_gate = @import("../test_gate.zig");
+    const Gguf = @import("../gguf.zig").Gguf;
+    const path = "/home/qt/genai/lmstudio/models/mradermacher/Gemma-3-Starshine-12B-Alt-GGUF/Gemma-3-Starshine-12B-Alt.Q4_K_M.gguf";
+    try test_gate.requireModelFile(io, path);
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+
+    var g = try Gguf.open(gpa, io, path);
+    defer g.deinit();
+    var lm = try gemma3.Model.load(gpa, &g);
+    defer lm.deinit();
+    var model = try CudaLM.init(gpa, be, &lm, .{ .initial = 64, .max = 256 });
+    defer model.deinit();
+
+    // Leave ~3 GiB free: far less than the checkpoint's layer weights, so a
+    // live-aware plan MUST place some layers on the host.
+    var balloon = try test_gate.VramBalloon.inflateToFree(gpa, be, 3 << 30);
+    defer balloon.deinit();
+
+    try model.enableCpuSplit(.attn, 1 << 40, true); // budget far beyond the card
+    errdefer std.debug.print("n_cpu={d}, free={d} MiB\n", .{
+        if (model.split) |sp| sp.n_cpu else 0, be.ctx.memGetInfo().free >> 20,
+    });
+    try std.testing.expect(model.split != null);
+    try std.testing.expect(model.split.?.n_cpu > 0);
+}
+
+// A hybrid split's host layers can run BEFORE any step(): the tp-gui turn flow
+// prefills first, and an over-budget model has host layers from init. With the
+// stepper's `io` unseeded that used to be undefined-pointer UB (GP fault deep
+// in the host matmul's groupAsync); it must instead fail closed, and work once
+// the session owner seeds it (gui/chat.zig Session.init does).
+test "cpu split prefill before any step needs a seeded io" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const test_gate = @import("../test_gate.zig");
+    const Gguf = @import("../gguf.zig").Gguf;
+    const path = "/home/qt/genai/lmstudio/models/mradermacher/Gemma-3-Starshine-12B-Alt-GGUF/Gemma-3-Starshine-12B-Alt.Q4_K_M.gguf";
+    try test_gate.requireModelFile(io, path);
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+
+    var g = try Gguf.open(gpa, io, path);
+    defer g.deinit();
+    var lm = try gemma3.Model.load(gpa, &g);
+    defer lm.deinit();
+    var model = try CudaLM.init(gpa, be, &lm, .{ .initial = 128, .max = 256 });
+    defer model.deinit();
+
+    // A budget below the weight total statically places tail layers on the
+    // host right away (kept small so the Debug host prefill stays quick).
+    try model.enableCpuSplit(.tail, 6 << 30, true);
+    try std.testing.expect(model.split.?.n_cpu > 0);
+
+    var prompt: [24]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(1000 + (i * 37) % 50000);
+    try std.testing.expectError(error.SplitIoUnset, model.prefill(prompt[0 .. prompt.len - 1]));
+    try std.testing.expectEqual(@as(usize, 0), model.cached());
+
+    model.io = io; // the session owner's contract (tp-gui seeds this at init)
+    try model.prefill(prompt[0 .. prompt.len - 1]);
+    try std.testing.expectEqual(prompt.len - 1, model.cached());
+    const next = try model.stepArgmax(io, prompt[prompt.len - 1 ..]);
+    try std.testing.expect(next < lm.cfg.vocab);
 }

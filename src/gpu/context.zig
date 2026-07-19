@@ -93,7 +93,11 @@ pub const topk_m = 8;
 pub const topk_lanes = 1024;
 
 /// Eltwise/attention kernels and their workgroup shapes (kernels/eltwise.zig).
-pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, rope_qwen35, attn_decode_q35, attn_dsplit_gemma, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, attn_dsplit_gemma_f16, kv_store_f16, penalize };
+/// KV storage format of the LLM decode-attention / KV store ops (mirrors
+/// llm.kv_cache.KvDtype). q8_0 is the ggml 34-byte block (f16 scale + 32 i8).
+pub const KvFmt = enum { f32, f16, q8_0 };
+
+pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, rope_qwen35, attn_decode_q35, attn_dsplit_gemma, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, attn_dsplit_gemma_f16, kv_store_f16, penalize, attn_dsplit_gemma_q8, kv_store_q8_0 };
 const elt_entry_sizes = [_]EntrySize{
     .{ .name = "rmsnorm", .x = 64, .y = 1 },
     .{ .name = "rms_partial", .x = 256, .y = 1 },
@@ -172,6 +176,8 @@ const elt_entry_sizes = [_]EntrySize{
     .{ .name = "attn_dsplit_gemma_f16", .x = 256, .y = 1 },
     .{ .name = "kv_store_f16", .x = 256, .y = 1 },
     .{ .name = "penalize", .x = 256, .y = 1 },
+    .{ .name = "attn_dsplit_gemma_q8", .x = 256, .y = 1 },
+    .{ .name = "kv_store_q8_0", .x = 256, .y = 1 },
 };
 
 /// Push block shared by all eltwise entries; meaning per entry (see kernels).
@@ -2110,11 +2116,16 @@ pub const Context = struct {
     /// `window` (> 0) restricts to the last `window` keys; `ring` (> 0) enables
     /// sliding-window ring addressing (KV storage row = pos%ring, gemma3 LOCAL
     /// layers). 0 = full causal / linear.
-    pub fn opAttnDecodeQ35(self: *Context, q: DeviceBuffer, k_cache: DeviceBuffer, v_cache: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, n_heads: usize, n_kv: usize, head_dim: usize, kv_len: usize, scale: f32, window: usize, ring: usize, kv_end: usize, kv_f16: bool) Error!void {
+    pub fn opAttnDecodeQ35(self: *Context, q: DeviceBuffer, k_cache: DeviceBuffer, v_cache: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, n_heads: usize, n_kv: usize, head_dim: usize, kv_len: usize, scale: f32, window: usize, ring: usize, kv_end: usize, kv_fmt: KvFmt) Error!void {
         const nsplit = attn_decode_nsplit;
+        const entry: Elt = switch (kv_fmt) {
+            .f32 => .attn_dsplit_gemma,
+            .f16 => .attn_dsplit_gemma_f16,
+            .q8_0 => .attn_dsplit_gemma_q8,
+        };
         // kv_end > kv_len marks a bidirectional image-block query (attends the
         // whole block forward); 0 (or == kv_len) is the plain causal decode bound.
-        try self.opElt(if (kv_f16) .attn_dsplit_gemma_f16 else .attn_dsplit_gemma, q, k_cache, v_cache, scratch, .{
+        try self.opElt(entry, q, k_cache, v_cache, scratch, .{
             .u0 = @intCast(kv_len),
             .u1 = @intCast(n_heads),
             .u2 = @intCast(n_kv),
@@ -2143,6 +2154,20 @@ pub const Context = struct {
             .u2 = @intCast(dst_off / 2),
             .u3 = @intCast(src_off),
         }, n / 2, 1, 1);
+    }
+
+    /// Quantize-store `n` f32 K/V elements from `src` (+`src_off` elems) into
+    /// the q8_0 block cache `dst` at element offset `dst_off`: one thread per
+    /// PAIR of 32-element blocks (a lone 34-byte block ends mid-word — see
+    /// kv_store_q8_0 in eltwise.zig). `n` and `dst_off` must be multiples of
+    /// 64 (kv_dim always is).
+    pub fn opStoreKvQ8(self: *Context, dst: DeviceBuffer, dst_off: usize, src: DeviceBuffer, src_off: usize, n: usize) Error!void {
+        std.debug.assert(n % 64 == 0 and dst_off % 64 == 0);
+        try self.opElt(.kv_store_q8_0, src, dst, null, null, .{
+            .u0 = @intCast(n / 64),
+            .u2 = @intCast(dst_off),
+            .u3 = @intCast(src_off),
+        }, n / 64, 1, 1);
     }
 
     pub fn opGemvCombine(
@@ -4081,7 +4106,7 @@ test "opAttnDecodeQ35 bidirectional kv_end matches cpu reference" {
     try ctx.beginBatch();
     errdefer if (ctx.batching) ctx.abortBatch();
     // ring=0 (linear KV); kv_end > kv_len marks the bidirectional block.
-    try ctx.opAttnDecodeQ35(q_d, k_d, v_d, o_d, s_d, n_heads, n_kv, hd, kv_len, scale, window, 0, kv_end, false);
+    try ctx.opAttnDecodeQ35(q_d, k_d, v_d, o_d, s_d, n_heads, n_kv, hd, kv_len, scale, window, 0, kv_end, .f32);
     try ctx.endBatch();
 
     const got = try gpa.alloc(f32, q.len);
@@ -4090,6 +4115,124 @@ test "opAttnDecodeQ35 bidirectional kv_end matches cpu reference" {
     var worst: f32 = 0;
     for (ref, got) |e, a| worst = @max(worst, @abs(e - a));
     try std.testing.expect(worst <= 2e-3);
+}
+
+test "vulkan q8_0 KV: kv_store_q8_0 matches host packing, attention matches reference" {
+    const gpa = std.testing.allocator;
+    std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa) catch return error.SkipZigTest;
+    defer ctx.deinit();
+    const kvmod = @import("../llm/kv_cache.zig");
+
+    const n_heads = 4;
+    const n_kv = 2;
+    const hd = 256; // gemma3/qwen35 head_dim
+    const kv_dim = n_kv * hd;
+    const kv_len = 61;
+    const scale: f32 = 1.0 / @sqrt(@as(f32, hd));
+    var prng = std.Random.DefaultPrng.init(203);
+    const rand = prng.random();
+
+    const q = try gpa.alloc(f32, n_heads * hd);
+    defer gpa.free(q);
+    const k_raw = try gpa.alloc(f32, kv_len * kv_dim);
+    defer gpa.free(k_raw);
+    const v_raw = try gpa.alloc(f32, kv_len * kv_dim);
+    defer gpa.free(v_raw);
+    for (q) |*x| x.* = rand.floatNorm(f32) * 0.3;
+    for (k_raw) |*x| x.* = rand.floatNorm(f32) * 0.3;
+    for (v_raw) |*x| x.* = rand.floatNorm(f32);
+    @memset(k_raw[32..64], 0); // exercise the d == 0 block
+
+    // Host truth: quantized bytes (device layout) + dequantized views.
+    var cache = try kvmod.KvCache.init(gpa, 1, kv_len, kv_dim, .q8_0);
+    defer cache.deinit(gpa);
+    cache.write(0, k_raw, v_raw);
+    cache.commit(kv_len);
+    const expect_k = cache.kRowBytes(0, 0, kv_len);
+
+    var kf_d = try ctx.tensorCreate(k_raw.len * 4);
+    defer ctx.tensorDestroy(&kf_d);
+    var vf_d = try ctx.tensorCreate(v_raw.len * 4);
+    defer ctx.tensorDestroy(&vf_d);
+    var k_d = try ctx.tensorCreate(expect_k.len);
+    defer ctx.tensorDestroy(&k_d);
+    var v_d = try ctx.tensorCreate(expect_k.len);
+    defer ctx.tensorDestroy(&v_d);
+    try ctx.tensorUpload(kf_d, std.mem.sliceAsBytes(k_raw));
+    try ctx.tensorUpload(vf_d, std.mem.sliceAsBytes(v_raw));
+
+    // Device-side quantize-store (row at a time, like appendKV).
+    try ctx.beginBatch();
+    errdefer if (ctx.batching) ctx.abortBatch();
+    for (0..kv_len) |row| {
+        try ctx.opStoreKvQ8(k_d, row * kv_dim, kf_d, row * kv_dim, kv_dim);
+        try ctx.opStoreKvQ8(v_d, row * kv_dim, vf_d, row * kv_dim, kv_dim);
+    }
+    try ctx.endBatch();
+
+    // Device quantization must match the host packQ80 byte for byte (RNE on
+    // both sides; f32 add/mul are correctly rounded in Vulkan, and div-by-127
+    // rounds correctly on every desktop driver we target).
+    const got_bytes = try gpa.alloc(u8, expect_k.len);
+    defer gpa.free(got_bytes);
+    try ctx.tensorDownload(k_d, got_bytes);
+    {
+        var nbad: usize = 0;
+        for (expect_k, got_bytes, 0..) |e, g, i| {
+            if (e != g and nbad < 16) {
+                std.debug.print("byte {d} (block {d} off {d}): want {x:0>2} got {x:0>2}\n", .{ i, i / 34, i % 34, e, g });
+                nbad += 1;
+            }
+        }
+    }
+    try std.testing.expectEqualSlices(u8, expect_k, got_bytes);
+
+    // Attention over the q8_0 cache vs the host-dequantized reference.
+    const k = cache.kView(0, 0);
+    const v = cache.vView(0, 0);
+    const ref = try gpa.alloc(f32, n_heads * hd);
+    defer gpa.free(ref);
+    const scores = try gpa.alloc(f32, kv_len);
+    defer gpa.free(scores);
+    for (0..n_heads) |h| {
+        const kvh = h / (n_heads / n_kv);
+        var mx: f32 = -std.math.inf(f32);
+        for (0..kv_len) |j| {
+            var s: f32 = 0;
+            for (0..hd) |c| s += q[h * hd + c] * k[j * kv_dim + kvh * hd + c];
+            scores[j] = s * scale;
+            mx = @max(mx, scores[j]);
+        }
+        var den: f32 = 0;
+        for (0..kv_len) |j| {
+            scores[j] = @exp(scores[j] - mx);
+            den += scores[j];
+        }
+        for (0..hd) |c| {
+            var acc: f32 = 0;
+            for (0..kv_len) |j| acc += scores[j] * v[j * kv_dim + kvh * hd + c];
+            ref[h * hd + c] = acc / den;
+        }
+    }
+
+    var q_d = try ctx.tensorCreate(q.len * 4);
+    defer ctx.tensorDestroy(&q_d);
+    var o_d = try ctx.tensorCreate(q.len * 4);
+    defer ctx.tensorDestroy(&o_d);
+    var s_d = try ctx.tensorCreate(n_heads * Context.attn_decode_nsplit * (hd + 2) * 4);
+    defer ctx.tensorDestroy(&s_d);
+    try ctx.tensorUpload(q_d, std.mem.sliceAsBytes(q));
+    try ctx.beginBatch();
+    try ctx.opAttnDecodeQ35(q_d, k_d, v_d, o_d, s_d, n_heads, n_kv, hd, kv_len, scale, 0, 0, 0, .q8_0);
+    try ctx.endBatch();
+
+    const got = try gpa.alloc(f32, q.len);
+    defer gpa.free(got);
+    try ctx.tensorDownload(o_d, std.mem.sliceAsBytes(got));
+    var worst: f32 = 0;
+    for (ref, got) |e, a| worst = @max(worst, @abs(e - a));
+    try std.testing.expect(worst <= 5e-3);
 }
 
 test "gpu argmax matches cpu argmax (incl. tie -> lowest index)" {

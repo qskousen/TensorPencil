@@ -23,6 +23,16 @@ const gemma3 = @import("gemma3.zig");
 const gpu = @import("../gpu/context.zig");
 const ops = @import("../ops.zig");
 const kvmod = @import("../llm/kv_cache.zig");
+
+/// Map the session KV dtype onto the Vulkan op layer's kernel-format tag.
+fn kvFmt(dt: kvmod.KvDtype) gpu.KvFmt {
+    return switch (dt) {
+        .f32 => .f32,
+        .f16 => .f16,
+        .q8_0 => .q8_0,
+    };
+}
+
 const transformer = @import("transformer.zig");
 const transformer_gpu = @import("transformer_gpu.zig");
 
@@ -138,11 +148,11 @@ pub const VulkanLM = struct {
 
         self.k_cache = try alloc.alloc(Buf, cfg.n_layers);
         self.v_cache = try alloc.alloc(Buf, cfg.n_layers);
-        const esz = cap.kv_dtype.elemBytes();
+        const dt = cap.kv_dtype;
         for (self.k_cache, self.v_cache, 0..) |*kb, *vb, l| {
             const rows = if (usesRing(cfg, l)) localRingRows(cfg) else cap.max;
-            kb.* = try ctx.tensorCreate(rows * cfg.kvDim() * esz);
-            vb.* = try ctx.tensorCreate(rows * cfg.kvDim() * esz);
+            kb.* = try ctx.tensorCreate(dt.sizeBytes(rows * cfg.kvDim()));
+            vb.* = try ctx.tensorCreate(dt.sizeBytes(rows * cfg.kvDim()));
         }
 
         self.arena = arena;
@@ -336,12 +346,19 @@ pub const VulkanLM = struct {
         // In-batch device copy: dst[u2+i] = src[i]. LOCAL ring layers store at
         // row pos0%ring (single row per forward — no wrap to split).
         const row = if (usesRing(cfg, l)) pos0 % localRingRows(cfg) else pos0;
-        if (self.kv_dtype == .f16) {
-            try self.ctx.opStoreKvF16(self.k_cache[l], row * kvdim, self.k, 0, kvdim);
-            try self.ctx.opStoreKvF16(self.v_cache[l], row * kvdim, self.v, 0, kvdim);
-        } else {
-            try self.ctx.opElt(.copy, self.k, self.k_cache[l], null, null, .{ .u0 = @intCast(kvdim), .u2 = @intCast(row * kvdim) }, kvdim, 1, 1);
-            try self.ctx.opElt(.copy, self.v, self.v_cache[l], null, null, .{ .u0 = @intCast(kvdim), .u2 = @intCast(row * kvdim) }, kvdim, 1, 1);
+        switch (self.kv_dtype) {
+            .f16 => {
+                try self.ctx.opStoreKvF16(self.k_cache[l], row * kvdim, self.k, 0, kvdim);
+                try self.ctx.opStoreKvF16(self.v_cache[l], row * kvdim, self.v, 0, kvdim);
+            },
+            .q8_0 => {
+                try self.ctx.opStoreKvQ8(self.k_cache[l], row * kvdim, self.k, 0, kvdim);
+                try self.ctx.opStoreKvQ8(self.v_cache[l], row * kvdim, self.v, 0, kvdim);
+            },
+            .f32 => {
+                try self.ctx.opElt(.copy, self.k, self.k_cache[l], null, null, .{ .u0 = @intCast(kvdim), .u2 = @intCast(row * kvdim) }, kvdim, 1, 1);
+                try self.ctx.opElt(.copy, self.v, self.v_cache[l], null, null, .{ .u0 = @intCast(kvdim), .u2 = @intCast(row * kvdim) }, kvdim, 1, 1);
+            },
         }
     }
     pub fn attention(self: *VulkanLM, l: usize, seq: usize, pos0: usize) !void {
@@ -350,7 +367,7 @@ pub const VulkanLM = struct {
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
         const window: usize = if (cfg.isGlobal(l)) 0 else cfg.sliding_window;
         const ring: usize = if (usesRing(cfg, l)) localRingRows(cfg) else 0;
-        try self.ctx.opAttnDecodeQ35(self.q, self.k_cache[l], self.v_cache[l], self.attn, self.attn_scratch, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, pos0 + 1, scale, window, ring, self.bidir_end, self.kv_dtype == .f16);
+        try self.ctx.opAttnDecodeQ35(self.q, self.k_cache[l], self.v_cache[l], self.attn, self.attn_scratch, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, pos0 + 1, scale, window, ring, self.bidir_end, kvFmt(self.kv_dtype));
     }
     pub fn projectO(self: *VulkanLM, l: usize, layer: anytype, seq: usize) !void {
         _ = l;

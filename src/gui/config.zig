@@ -110,13 +110,15 @@ pub const Backend = enum(u8) {
 };
 
 /// KV-cache element storage type for the chat LLM. `f32` is the default and
-/// bit-exact; `f16` halves the KV footprint (VRAM), at a small precision cost
-/// (output is not identical to f32). Mirrors `kv_cache.KvDtype` in the library;
-/// mapped to it in `app.buildSession`. Changing it rebuilds the KV context
-/// (weights stay resident) — see `ctxReloadEql`.
+/// bit-exact; `f16` halves the KV footprint (VRAM) and `q8_0` (ggml 34-byte
+/// blocks) roughly quarters it, each at a small precision cost (output is not
+/// identical to f32). Mirrors `kv_cache.KvDtype` in the library; mapped to it
+/// in `app.buildSession`. Changing it rebuilds the KV context (weights stay
+/// resident) — see `ctxReloadEql`.
 pub const KvDtype = enum(u8) {
     f32,
     f16,
+    q8_0,
 
     fn fromStr(s: []const u8) ?KvDtype {
         inline for (@typeInfo(KvDtype).@"enum".fields) |f| {
@@ -295,6 +297,14 @@ pub const Config = struct {
     /// footprint, lossy). Changing it rebuilds the KV context — the weights stay
     /// resident (see `ctxReloadEql`), not a full model reload.
     kv_dtype: KvDtype = .f32,
+    /// Host-RAM budget (MB) for turn-boundary context checkpoints — the fast
+    /// "regenerate response / switch variant" rollback path. Bounds how many
+    /// turn boundaries stay instantly rewindable (snapshot size is per-arch,
+    /// context-independent). The newest turn's checkpoint is always kept
+    /// regardless of the budget, so the last response stays instantly
+    /// regenerable; the budget only bounds the older boundaries retained.
+    /// Applied live at the next turn — never load- or context-affecting.
+    regen_cache_mb: usize = 2048,
     /// LLM sampling controls (see `Sampling`). Applied live: pushed into the
     /// running session on Apply and picked up at the next turn — never load-
     /// or context-affecting (not compared by any `*ReloadEql`).
@@ -512,6 +522,8 @@ pub const Config = struct {
             self.sampling.presence_penalty = std.fmt.parseFloat(f32, val) catch self.sampling.presence_penalty;
         } else if (std.mem.eql(u8, key, "frequency_penalty")) {
             self.sampling.frequency_penalty = std.fmt.parseFloat(f32, val) catch self.sampling.frequency_penalty;
+        } else if (std.mem.eql(u8, key, "regen_cache_mb")) {
+            self.regen_cache_mb = std.fmt.parseInt(usize, val, 10) catch self.regen_cache_mb;
         } else if (std.mem.eql(u8, key, "preset")) {
             if (parsePreset(val)) |pr| {
                 if (self.preset_count < max_presets) {
@@ -635,6 +647,9 @@ pub const Config = struct {
         });
         defer gpa.free(sampling_lines);
         try full.appendSlice(gpa, sampling_lines);
+        const regen_line = try std.fmt.allocPrint(gpa, "regen_cache_mb = {d}\n", .{self.regen_cache_mb});
+        defer gpa.free(regen_line);
+        try full.appendSlice(gpa, regen_line);
         for (self.presets[0..self.preset_count]) |*pr| {
             const line = try std.fmt.allocPrint(gpa, "preset = {s}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}\n", .{
                 pr.name.slice(),            pr.sampling.temperature,
@@ -705,6 +720,14 @@ fn escapeAlloc(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
+/// Test-only: a per-PROCESS unique config filename. These tests are compiled
+/// into several gui test binaries (config.zig is imported by the diffuser and
+/// chat test roots too), which `zig build gui-test` runs in PARALLEL from the
+/// same cwd — a fixed filename races across binaries and flakes.
+fn testFile(buf: []u8, comptime tag: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, ".gui-config-{s}-test.{d}", .{ tag, std.posix.system.getpid() }) catch unreachable;
+}
+
 test "PathBuf opt/set round-trips and reports empty as null" {
     var p: PathBuf = .{};
     try std.testing.expect(p.opt() == null);
@@ -768,6 +791,33 @@ test "apply parses kv_dtype (default f32) and ctxReloadEql tracks it" {
     try std.testing.expect(cfg.llmReloadEql(&base));
 }
 
+test "regen_cache_mb: default, apply, junk tolerance, save/load, live-only" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var cfg: Config = .{};
+    try std.testing.expectEqual(@as(usize, 2048), cfg.regen_cache_mb); // default 2 GB
+    cfg.apply("regen_cache_mb", "512");
+    try std.testing.expectEqual(@as(usize, 512), cfg.regen_cache_mb);
+    cfg.apply("regen_cache_mb", "junk"); // unchanged on junk
+    try std.testing.expectEqual(@as(usize, 512), cfg.regen_cache_mb);
+
+    // Never load- or context-affecting: applied live at the next turn.
+    const base: Config = .{};
+    try std.testing.expect(cfg.llmReloadEql(&base));
+    try std.testing.expect(cfg.ctxReloadEql(&base));
+
+    // Round-trips through the config file (it lives in the appended section).
+    var fbuf: [64]u8 = undefined;
+    const file = testFile(&fbuf, "regen");
+    defer std.Io.Dir.cwd().deleteFile(io, file) catch {};
+    var environ: Environ = .init(gpa);
+    defer environ.deinit();
+    try cfg.save(io, gpa, &environ, file);
+    const back = Config.load(io, gpa, &environ, file);
+    try std.testing.expectEqual(@as(usize, 512), back.regen_cache_mb);
+}
+
 test "system prompt escapes/unescapes newlines round-trip" {
     const gpa = std.testing.allocator;
     var b: TextBuf(max_prompt) = .{};
@@ -824,7 +874,8 @@ test "save/load round-trips the new backend + decode fields" {
     const io = std.testing.io;
     // `path_override` is used verbatim and bypasses the known-folders lookup, so
     // a plain relative file in cwd exercises the real save/load template path.
-    const file = ".gui-config-roundtrip-test";
+    var fbuf: [64]u8 = undefined;
+    const file = testFile(&fbuf, "roundtrip");
     defer std.Io.Dir.cwd().deleteFile(io, file) catch {};
 
     var environ: Environ = .init(gpa); // unused with an override; just needs to exist
@@ -847,7 +898,8 @@ test "save/load round-trips the new backend + decode fields" {
 test "window geometry round-trips (size, position, maximized)" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const file = ".gui-config-geom-test";
+    var fbuf: [64]u8 = undefined;
+    const file = testFile(&fbuf, "geom");
     defer std.Io.Dir.cwd().deleteFile(io, file) catch {};
 
     var environ: Environ = .init(gpa);
@@ -885,7 +937,8 @@ test "window geometry round-trips (size, position, maximized)" {
 test "output_dir round-trips and apply parses it" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const file = ".gui-config-outdir-test";
+    var fbuf: [64]u8 = undefined;
+    const file = testFile(&fbuf, "outdir");
     defer std.Io.Dir.cwd().deleteFile(io, file) catch {};
 
     var environ: Environ = .init(gpa);
@@ -1047,7 +1100,8 @@ test "upsertPreset adds, replaces by name, sanitizes; removePresetNamed removes"
 test "sampling + presets save/load round-trip" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const file = ".gui-config-sampling-test";
+    var fbuf: [64]u8 = undefined;
+    const file = testFile(&fbuf, "sampling");
     defer std.Io.Dir.cwd().deleteFile(io, file) catch {};
 
     var environ: Environ = .init(gpa);

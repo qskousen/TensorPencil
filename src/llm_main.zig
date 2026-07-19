@@ -18,7 +18,7 @@ const usage =
     \\usage: tp-llm --model <qwen3.safetensors> --prompt <text>
     \\              [--backend cpu|zig-cuda|cuda|vulkan]
     \\              [--system <text>] [--max-tokens <n>] [--max-context <n>]
-    \\              [--kv-dtype f32|f16]
+    \\              [--kv-dtype f32|f16|q8_0]
     \\              [--temperature <t>] [--top-k <n>] [--top-p <p>] [--min-p <p>]
     \\              [--repeat-penalty <r>] [--repeat-last-n <n>]
     \\              [--presence-penalty <p>] [--frequency-penalty <p>]
@@ -83,7 +83,7 @@ const usage =
     \\0 (default) = pin as much of the model as the free VRAM holds, so a
     \\model that fits stays fully resident (streaming a model that fits is
     \\~3.6x slower); only a model larger than VRAM streams its tail.
-    \\--cpu-layers (qwen35 GGUF, zig-cuda/cuda, text-only) fits the model under
+    \\--cpu-layers (qwen3/qwen35 GGUF, zig-cuda/cuda, text-only) fits the model under
     \\--vram-budget a different way: instead of streaming weights, it runs whole
     \\layers on the CPU (their weights never touch the device). The layer count
     \\is derived from the budget; "tail" keeps a contiguous device prefix (the
@@ -149,7 +149,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--kv-dtype")) {
             const name = try nextArg(args, &i);
             opts.kv_dtype = llm.kv_cache.KvDtype.parse(name) orelse {
-                try stdout.print("unknown --kv-dtype: {s} (f32 | f16)\n", .{name});
+                try stdout.print("unknown --kv-dtype: {s} (f32 | f16 | q8_0)\n", .{name});
                 try stdout.flush();
                 return error.InvalidArgument;
             };
@@ -306,8 +306,13 @@ pub fn main(init: std.process.Init) !void {
         return runGemma4(arena, gpa, io, &st.gguf, backend, image_path, mmproj_path, prompt, system, opts, profile, stdout);
     }
 
-    if (cpu_split != null or dynamic_offload) {
-        try stdout.writeAll("--cpu-layers / --offload-grow (hybrid CPU/GPU split) is only supported for qwen35 (Qwen3.5/3.6) models for now\n");
+    if ((cpu_split != null or dynamic_offload) and backend != .@"zig-cuda" and backend != .cuda) {
+        try stdout.writeAll("--cpu-layers / --offload-grow (hybrid CPU/GPU split) needs a CUDA backend\n");
+        try stdout.flush();
+        return error.InvalidArgument;
+    }
+    if ((cpu_split != null or dynamic_offload) and (eagle_path != null or opts.tree_nodes > 0)) {
+        try stdout.writeAll("--cpu-layers / --offload-grow cannot combine with --eagle / --tree (device-only fixed-capacity layouts)\n");
         try stdout.flush();
         return error.InvalidArgument;
     }
@@ -318,7 +323,7 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidArgument;
     }
 
-    return runQwen3(arena, gpa, io, &st, backend, vram_budget, draft_path, eagle_path, max_context_arg, prompt, system, opts, profile, stdout);
+    return runQwen3(arena, gpa, io, &st, backend, vram_budget, cpu_split, dynamic_offload, draft_path, eagle_path, max_context_arg, prompt, system, opts, profile, stdout);
 }
 
 /// One-shot / chat session for a Qwen3 model (the Krea 2 text-encoder stack /
@@ -331,6 +336,8 @@ fn runQwen3(
     st: *ModelFile,
     backend: BackendKind,
     vram_budget: u64,
+    cpu_split: ?TensorPencil.models.qwen35_cuda.CpuSplitPolicy,
+    dynamic_offload: bool,
     draft_path: ?[]const u8,
     eagle_path: ?[]const u8,
     max_context_arg: ?usize,
@@ -455,10 +462,19 @@ fn runQwen3(
     const prompt_len = if (prompt == null) @min(512, cap.max) else ids.items.len;
 
     const t_init = Io.Clock.real.now(io).nanoseconds;
-    // Dense CUDA bring-up (qwen3 has no CPU/GPU split): pin under the budget and
-    // page-lock the target/draft/eagle mmaps so a streamed tail DMAs at full PCIe.
+    // Dense CUDA bring-up: pin under the budget and page-lock the
+    // target/draft/eagle mmaps so a streamed tail DMAs at full PCIe (the
+    // pinning plan is dropped below when a CPU split will manage residency).
     const be_cuda = try llm.session.bringUpCuda(arena, backend, profile, vram_budget);
     defer if (be_cuda) |b| b.deinit();
+    if (be_cuda) |b| if (cpu_split != null or dynamic_offload) {
+        // The hybrid split manages device residency by migrating whole layers;
+        // a weight-pinning plan would fight it (migrateLayer's evictWeightBytes
+        // does not refund pinned bytes). Mirror the qwen35 runner: no pinning.
+        b.budget_override = 0;
+        b.pin_budget = 0;
+        b.stream_window = 0;
+    };
     if (be_cuda) |b| if (vram_budget != 0) {
         if (st.mapping()) |m| b.enableDirectStreaming(m);
         if (draft_st) |ds| if (ds.mapping()) |m| b.enableDirectStreaming(m);
@@ -474,6 +490,8 @@ fn runQwen3(
         .cap = cap,
         .prompt_len = prompt_len,
         .vram_budget = vram_budget,
+        .cpu_split = cpu_split,
+        .dynamic_offload = dynamic_offload,
         .tok = &tok,
         .io = io,
         .gpa = gpa,
@@ -748,9 +766,10 @@ const SimpleDriver = struct {
 };
 
 /// Vulkan KV-window size for the gemma3 weight budget (2 x n_layers x cap x
-/// kvDim x f32). gemma4 has no Vulkan backend, so its window fn is never called.
+/// kvDim at the session KV dtype). gemma4 has no Vulkan backend, so its window
+/// fn is never called.
 fn gemma3KvWindow(lm: *const TensorPencil.models.gemma3.Model, cap: llm.engine.Capacity) u64 {
-    return 2 * @as(u64, lm.cfg.n_layers) * cap.max * lm.cfg.kvDim() * 4;
+    return 2 * @as(u64, lm.cfg.n_layers) * cap.kv_dtype.sizeBytes(cap.max * lm.cfg.kvDim());
 }
 fn gemma4KvWindow(lm: *const TensorPencil.models.gemma4.Model, cap: llm.engine.Capacity) u64 {
     _ = lm;
@@ -788,6 +807,7 @@ const Qwen35Driver = struct {
                 // Dynamic offload defaults to the attn policy (frees KV-growing
                 // layers first, recovering the most VRAM per migration).
                 const pol = self.cpu_split orelse .attn;
+                model.io = self.io; // host layers may prefill before the first step
                 try model.enableCpuSplit(pol, self.vram_budget, self.dynamic_offload);
                 if (model.split) |sp| {
                     const mode = if (sp.dynamic) "offload-grow" else "cpu-layers";
@@ -824,8 +844,9 @@ const Qwen3Spec = struct {
         return Cuda.init(gpa, be, lm, cap, first_seq);
     }
     pub fn buildVulkan(gpa: std.mem.Allocator, ctx: *TensorPencil.gpu.Context, lm: *const Model, cap: llm.engine.Capacity, first_seq: usize) !Vulkan {
-        // qwen3 Vulkan uses the hd128 attn_dsplit path (no f16 variant) and its
-        // generation is a known-broken path; f16 KV is gemma3/qwen35-only on Vulkan.
+        // qwen3 Vulkan uses the hd128 attn_dsplit path (no f16/q8_0 variant) and
+        // its generation is a known-broken path; f16/q8_0 KV is gemma3/qwen35-only
+        // on Vulkan.
         if (cap.kv_dtype != .f32) return error.KvDtypeUnsupported;
         return Vulkan.init(gpa, ctx, lm, cap.max, first_seq);
     }
@@ -846,6 +867,8 @@ const Qwen3Driver = struct {
     cap: llm.engine.Capacity,
     prompt_len: usize,
     vram_budget: u64,
+    cpu_split: ?TensorPencil.models.qwen35_cuda.CpuSplitPolicy,
+    dynamic_offload: bool,
     tok: *const TensorPencil.tokenizer.Tokenizer,
     io: Io,
     gpa: std.mem.Allocator,
@@ -865,6 +888,23 @@ const Qwen3Driver = struct {
     pub fn drive(self: Qwen3Driver, model: anytype) !llm.session.RunResult {
         const M = @typeInfo(@TypeOf(model)).pointer.child;
         if (comptime M == Qwen3Spec.Cuda) {
+            if (self.cpu_split != null or self.dynamic_offload) {
+                // Same CLI surface as the qwen35 runner (the global flag is
+                // typed on its policy enum; the variants are identical).
+                const pol: TensorPencil.models.qwen3_cuda.CpuSplitPolicy = switch (self.cpu_split orelse .attn) {
+                    .tail => .tail,
+                    .attn => .attn,
+                };
+                model.io = self.io; // host layers may prefill before the first step
+                try model.enableCpuSplit(pol, self.vram_budget, self.dynamic_offload);
+                if (model.split) |sp| {
+                    const mode = if (sp.dynamic) "offload-grow" else "cpu-layers";
+                    try self.stdout.print("[--{s} {s}: {d}/{d} layers on CPU at start, {d} on GPU]\n", .{ mode, @tagName(sp.policy), sp.n_cpu, model.cfg.n_layers, model.cfg.n_layers - sp.n_cpu });
+                } else {
+                    try self.stdout.writeAll("[--cpu-layers: model fits under --vram-budget; no split needed]\n");
+                }
+                try self.stdout.flush();
+            }
             if (self.eagle_st) |est| {
                 try model.enableTaps(TensorPencil.models.eagle3.default_tap_layers);
                 if (self.opts.tree_nodes > 0) try model.enableTree();

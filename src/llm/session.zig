@@ -137,15 +137,16 @@ pub const BackendKind = enum { cpu, @"zig-cuda", cuda, vulkan };
 pub fn kvDtypeSupported(backend: BackendKind, dt: kv_cache.KvDtype) bool {
     if (dt == .f32) return true;
     return switch (backend) {
-        // CUDA: f16 attention/append kernels landed (Phase 1). Per-model init
-        // still rejects f16 for archs whose kernels aren't wired yet (only
-        // gemma4 so far) via error.KvDtypeUnsupported.
+        // CUDA: f16 + q8_0 attention/append/store kernels are wired for every
+        // arch (qwen3 hd128, gemma/qwen35 hd256, gemma4 hd512, both graph and
+        // non-graph paths). qwen3's EAGLE-tap/tree speculative paths stay
+        // f32-only and reject other dtypes at enable time.
         .cuda, .@"zig-cuda" => true,
-        // Vulkan: f16 on gemma3/qwen35 (hd256, attn_dsplit_gemma_f16). qwen3
-        // Vulkan rejects f16 in its builder (hd128 path, broken gen).
+        // Vulkan: f16 + q8_0 on gemma3/qwen35 (hd256, attn_dsplit_gemma_f16/_q8).
+        // qwen3 Vulkan rejects non-f32 in its builder (hd128 path, broken gen).
         .vulkan => true,
-        // CPU: f16 packs 2/f32-slot in KvCache/PerLayerKvCache, expanded on read
-        // (Phase 3). All CPU archs (qwen3/qwen35/gemma3/gemma4) support it.
+        // CPU: f16 packs 2/f32-slot and q8_0 packs ggml 34-byte blocks in
+        // KvCache/PerLayerKvCache, expanded on read. All CPU archs support both.
         .cpu => true,
     };
 }
