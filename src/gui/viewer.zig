@@ -8,6 +8,7 @@ const SDLBackend = @import("backend");
 const diffuser = @import("diffuser.zig");
 const clipboard = @import("clipboard.zig");
 const fonts = @import("fonts.zig");
+const hint = @import("hint.zig");
 const viewmath = @import("viewmath.zig");
 
 pub const GenImage = diffuser.GenImage;
@@ -130,7 +131,7 @@ pub const Viewer = struct {
         // This window's own font DB/theme (dvui is per-window); install once so
         // the info bar renders arrows/dots instead of tofu.
         if (!self.fonts_ready) {
-            fonts.install() catch |err| std.log.err("viewer font install: {t}", .{err});
+            fonts.install();
             self.fonts_ready = true;
         }
         self.handleKeys();
@@ -158,7 +159,9 @@ pub const Viewer = struct {
                 var sp = dvui.box(@src(), .{}, .{ .expand = .horizontal });
                 sp.deinit();
             }
-            if (dvui.button(@src(), "Copy", .{}, .{ .gravity_y = 0.5 })) clipboard.copyImage(self.cur);
+            var wd: dvui.WidgetData = undefined;
+            if (dvui.button(@src(), "Copy", .{}, .{ .gravity_y = 0.5, .data_out = &wd })) clipboard.copyImage(self.cur);
+            hint.hover(@src(), &wd, "Copy image to clipboard");
         }
 
         self.renderImageArea();

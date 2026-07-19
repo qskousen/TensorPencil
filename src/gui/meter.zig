@@ -9,6 +9,7 @@
 //! drag, calling back so the app can persist + apply the new policy live.
 const std = @import("std");
 const dvui = @import("dvui");
+const hint = @import("hint.zig");
 
 const C = dvui.Color;
 // Segment colors (match the mockup). Fixed semantics.
@@ -76,7 +77,7 @@ pub fn render(m: *Model, a: Actions) void {
     // LLM numbers (left): weights + context, stacked.
     numCol(0, &.{ .{ .name = "weights", .c = col.llm_w, .v = m.llm_w }, .{ .name = "ctx", .c = col.llm_ctx, .v = m.llm_ctx } });
 
-    if (eject(0, m.llm_loaded, m.llm_armed)) a.on_eject_llm();
+    if (eject(0, m.llm_loaded, m.llm_armed, "Unload the LLM — frees its VRAM (reloads on the next message)")) a.on_eject_llm();
 
     {
         // The box's own background paints the "free" color (reliable); segments
@@ -98,7 +99,7 @@ pub fn render(m: *Model, a: Actions) void {
         handleDrag(m, a, wd, crs);
     }
 
-    if (eject(1, m.diff_loaded, m.diff_armed)) a.on_eject_diff();
+    if (eject(1, m.diff_loaded, m.diff_armed, "Unload the diffusion model — frees its VRAM (reloads on the next image)")) a.on_eject_diff();
 
     // Diffusion numbers (right): TE/DiT over latent/VAE, two mini-columns.
     numCol(1, &.{ .{ .name = "TE", .c = col.te, .v = m.te }, .{ .name = "lat", .c = col.latent, .v = m.latent } });
@@ -137,10 +138,11 @@ fn numCol(id: usize, items: []const Item) void {
     }
 }
 
-fn eject(id: usize, loaded: bool, armed: bool) bool {
+fn eject(id: usize, loaded: bool, armed: bool, hint_text: []const u8) bool {
     const th = dvui.themeGet();
     // ⏏ isn't in the bundled font; use the entypo eject glyph. Dimmed when the
     // model isn't loaded; accent-colored + bordered when armed (deferred unload).
+    var wd: dvui.WidgetData = undefined;
     const clicked = dvui.buttonIcon(@src(), "eject", dvui.entypo.circle_with_minus, .{}, .{}, .{
         .id_extra = id,
         .gravity_y = 0.5,
@@ -151,7 +153,9 @@ fn eject(id: usize, loaded: bool, armed: bool) bool {
         .color_text = if (armed) col.limit else if (loaded) null else th.fill.lerp(th.text, 0.28),
         .color_border = if (armed) col.limit else null,
         .border = if (armed) dvui.Rect.all(1) else .{},
+        .data_out = &wd,
     });
+    hint.hover(@src(), &wd, if (armed) "Unloading when idle…" else hint_text);
     return clicked and loaded;
 }
 

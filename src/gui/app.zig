@@ -13,6 +13,8 @@ const vram = tp.vram;
 const chat = @import("chat.zig");
 const toolcall = @import("toolcall.zig");
 const fonts = @import("fonts.zig");
+const hint = @import("hint.zig");
+const markdown_view = @import("markdown_view.zig");
 const viewer = @import("viewer.zig");
 const config = @import("config.zig");
 const config_view = @import("config_view.zig");
@@ -395,7 +397,7 @@ pub fn run(init: std.process.Init) !void {
     // themeSet need the current window) so CJK / symbols in LLM output render
     // instead of tofu boxes.
     try win.begin(win.frame_time_ns);
-    fonts.install() catch |err| std.log.err("font install failed: {t}", .{err});
+    fonts.install();
     _ = try win.end(.{});
 
     g_wakeup_event_type = SDLBackend.c.SDL_RegisterEvents(1);
@@ -1289,9 +1291,7 @@ fn pendingUserBubble(text: []const u8) void {
         .padding = dvui.Rect.all(10),
     });
     defer bubble.deinit();
-    var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal });
-    defer tl.deinit();
-    fonts.addRich(tl, text);
+    markdown_view.render(@src(), text, .{});
 }
 
 fn renderMessage(s: ?*chat.Session, m: *const chat.Message, idx: usize) void {
@@ -1342,7 +1342,7 @@ fn renderMessage(s: ?*chat.Session, m: *const chat.Message, idx: usize) void {
                 // Set the reasoning apart from the answer: a dimmer text color on
                 // a slightly inset, accent-bordered block (a blockquote look), so
                 // it reads as the model's scratch work rather than the reply.
-                var tl = dvui.textLayout(@src(), .{}, .{
+                markdown_view.render(@src(), think, .{ .prose = .{
                     .expand = .horizontal,
                     .background = true,
                     .color_fill = theme.fill.lerp(theme.text, 0.15),
@@ -1352,17 +1352,28 @@ fn renderMessage(s: ?*chat.Session, m: *const chat.Message, idx: usize) void {
                     .corner_radius = dvui.Rect.all(4),
                     .margin = .{ .x = 2, .y = 4, .w = 2, .h = 4 },
                     .padding = .{ .x = 9, .y = 6, .w = 9, .h = 6 },
-                });
-                defer tl.deinit();
-                fonts.addRich(tl, think);
+                } });
             }
         }
     }
 
     if (p.answer.len > 0) {
-        var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal });
-        defer tl.deinit();
-        addAnswerText(tl, p.answer);
+        renderAnswer(p.answer);
+        // Selection copies rendered text; this copies the raw markdown of
+        // the whole reply (assistant messages only — a user's own text is
+        // already in their hands).
+        if (!is_user) {
+            var wd: dvui.WidgetData = undefined;
+            if (dvui.buttonIcon(@src(), "copy markdown", dvui.entypo.clipboard, .{}, .{}, .{
+                .gravity_x = 1.0,
+                .min_size_content = .{ .h = 12 },
+                .color_text = theme.text.lerp(theme.fill, 0.5),
+                .padding = dvui.Rect.all(2),
+                .margin = .{ .y = 2 },
+                .data_out = &wd,
+            })) dvui.clipboardTextSet(p.answer);
+            hint.hover(@src(), &wd, "Copy the reply as markdown");
+        }
     } else if (m.role == .assistant and p.think == null and m.images.items.len == 0) {
         var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal });
         defer tl.deinit();
@@ -1379,29 +1390,44 @@ fn renderMessage(s: ?*chat.Session, m: *const chat.Message, idx: usize) void {
     for (m.images.items, 0..) |gi, gi_idx| renderGenImage(s, gi, 100_000 + gi_idx);
 }
 
-/// Add answer text to the layout with `<image>…</image>` tool-call tags hidden
-/// (the images render separately). Uses the same line-anchored matcher as the
-/// generation scanner (`chat.nextImageCall`), so a call that fires is exactly a
-/// call that's hidden — a casual inline mention of the tag stays visible text.
-/// A still-streaming, unterminated call hides everything from it onward.
-fn addAnswerText(tl: *dvui.TextLayoutWidget, text: []const u8) void {
-    var rest = text;
-    while (true) {
-        switch (toolcall.nextImageCall(rest)) {
-            .none => {
-                fonts.addRich(tl, rest);
-                return;
-            },
-            .partial => |p| {
-                fonts.addRich(tl, p.text_before); // hide the still-streaming call
-                return;
-            },
-            .call => |c| {
-                fonts.addRich(tl, c.text_before);
-                rest = c.after;
-            },
-        }
+/// Render answer text as markdown with `<image>…</image>` tool-call tags
+/// hidden (the images render separately). Uses the same line-anchored matcher
+/// as the generation scanner (`chat.nextImageCall`), so a call that fires is
+/// exactly a call that's hidden — a casual inline mention of the tag stays
+/// visible text. A still-streaming, unterminated call hides everything from
+/// it onward. Stripped text is assembled in the frame arena so the markdown
+/// parser sees one contiguous document (blocks may span a hidden call).
+fn renderAnswer(text: []const u8) void {
+    // Common case: no tool call anywhere — render the original slice.
+    var display = text;
+    switch (toolcall.nextImageCall(text)) {
+        .none => {},
+        .partial => |p| display = p.text_before,
+        .call => |first| {
+            var out: std.ArrayList(u8) = .empty;
+            const arena = dvui.currentWindow().arena();
+            out.appendSlice(arena, first.text_before) catch return;
+            var rest = first.after;
+            strip: while (true) {
+                switch (toolcall.nextImageCall(rest)) {
+                    .none => {
+                        out.appendSlice(arena, rest) catch return;
+                        break :strip;
+                    },
+                    .partial => |p| {
+                        out.appendSlice(arena, p.text_before) catch return;
+                        break :strip;
+                    },
+                    .call => |c| {
+                        out.appendSlice(arena, c.text_before) catch return;
+                        rest = c.after;
+                    },
+                }
+            }
+            display = out.items;
+        },
     }
+    markdown_view.render(@src(), display, .{});
 }
 
 /// Display size for an image: downscale so the longer side is `max`, never
@@ -1498,10 +1524,13 @@ fn renderGenImage(s: ?*chat.Session, gi: *chat.GenImage, gi_idx: usize) void {
                     var actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .margin = .{ .y = 4 } });
                     defer actions.deinit();
                     // Copy the image to the clipboard as a PNG.
+                    var cwd: dvui.WidgetData = undefined;
                     if (dvui.buttonIcon(@src(), "copy", dvui.entypo.clipboard, .{}, .{}, .{
                         .min_size_content = .{ .w = 18, .h = 18 },
                         .gravity_y = 0.5,
+                        .data_out = &cwd,
                     })) clipboard.copyImage(gi);
+                    hint.hover(@src(), &cwd, "Copy image to clipboard");
 
                     // Let the model see this image: attach it to the next
                     // message. Shown whenever the configured model can see
@@ -1647,18 +1676,23 @@ fn renderInput(s: ?*chat.Session) void {
 
     // New chat: drop the conversation and start fresh (model stays resident).
     // Disabled mid-turn so it can't race the generation worker.
+    var wd: dvui.WidgetData = undefined;
     if (dvui.buttonIcon(@src(), "new-chat", dvui.entypo.plus, .{}, .{}, .{
         .gravity_y = 0.5,
         .min_size_content = .{ .w = 22, .h = 22 },
         .margin = .{ .w = 6 },
+        .data_out = &wd,
     }) and !busy) newChat();
+    hint.hover(@src(), &wd, "New chat — clears the conversation (model stays loaded)");
 
     // Gear: switch to the settings view.
     if (dvui.buttonIcon(@src(), "settings", dvui.entypo.cog, .{}, .{}, .{
         .gravity_y = 0.5,
         .min_size_content = .{ .w = 22, .h = 22 },
         .margin = .{ .w = 6 },
+        .data_out = &wd,
     })) openSettings();
+    hint.hover(@src(), &wd, "Settings");
 
     // Image studio: leave chat (unloads the LLM) for direct text-to-image.
     // Disabled mid-turn so the unload can't race the generation worker.
@@ -1666,7 +1700,9 @@ fn renderInput(s: ?*chat.Session) void {
         .gravity_y = 0.5,
         .min_size_content = .{ .w = 22, .h = 22 },
         .margin = .{ .w = 6 },
+        .data_out = &wd,
     }) and !busy) enterImageMode();
+    hint.hover(@src(), &wd, "Image studio — text-to-image without chat (unloads the LLM)");
 
     // Reasoning toggle (no brain icon in entypo — a lit bulb reads as
     // "thinking"). Shown for any model whose family can reason (Gemma 3 etc.
@@ -1686,7 +1722,12 @@ fn renderInput(s: ?*chat.Session) void {
             .corner_radius = dvui.Rect.all(5),
             .color_fill = if (on) th.fill.lerp(th.focus, 0.35) else null,
             .color_text = if (on) th.focus else null,
+            .data_out = &wd,
         })) toggleReasoning();
+        hint.hover(@src(), &wd, if (on)
+            "Thinking is on — click to disable reasoning"
+        else
+            "Thinking is off — click to enable reasoning");
     }
 
     var send = false;

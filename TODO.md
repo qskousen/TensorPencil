@@ -1,5 +1,4 @@
 - zig-cuda backend seems to have oom issues
-- output text (user and agent) in markdown?
 - changing system prompt should wipe context and take effect on the next message
 - slide to regenerate last message
 - begin filling in holes in the capabilities grid (BACKEND.md)

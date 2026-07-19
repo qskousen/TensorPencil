@@ -301,6 +301,35 @@ pub fn build(b: *std.Build) void {
             if (b.args) |args| run_gui_cmd.addArgs(args);
             run_gui_step.dependOn(&run_gui_cmd.step);
 
+            // md-probe: renders a markdown torture document to a PNG through
+            // the real fonts + renderer (`zig build md-probe -- out.png`).
+            // The renderer's failure modes are visual, so this is the cheap
+            // way to eyeball changes without driving a chat session.
+            const md_probe_step = b.step("md-probe", "Render the markdown probe document to a PNG");
+            const md_probe_exe = b.addExecutable(.{
+                .name = "md-probe",
+                .use_llvm = use_llvm,
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/gui/md_probe.zig"),
+                    .link_libc = true,
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "dvui", .module = dvui_dep.module("dvui_sdl3") },
+                        .{ .name = "backend", .module = dvui_dep.module("sdl3") },
+                    },
+                }),
+            });
+            if (target.result.os.tag == .linux) {
+                md_probe_exe.root_module.linkSystemLibrary("X11", .{});
+                md_probe_exe.root_module.linkSystemLibrary("Xcursor", .{});
+                md_probe_exe.root_module.linkSystemLibrary("Xi", .{});
+                md_probe_exe.root_module.linkSystemLibrary("wayland-client", .{});
+            }
+            const run_md_probe = b.addRunArtifact(md_probe_exe);
+            if (b.args) |args| run_md_probe.addArgs(args);
+            md_probe_step.dependOn(&run_md_probe.step);
+
             // GUI config unit tests. Kept off the default `test` step (which
             // stays free of GUI deps); `config.zig` only pulls std + known-folders.
             const gui_config_tests = b.addTest(.{
@@ -326,6 +355,17 @@ pub fn build(b: *std.Build) void {
                 }),
             });
             gui_test_step.dependOn(&b.addRunArtifact(gui_toolcall_tests).step);
+
+            // Markdown parser unit tests. Pure std — the dvui-facing
+            // markdown_view.zig stays out of the test build.
+            const gui_markdown_tests = b.addTest(.{
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/gui/markdown.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }),
+            });
+            gui_test_step.dependOn(&b.addRunArtifact(gui_markdown_tests).step);
 
             // Viewer zoom/pan math unit tests. Pure std — the dvui-facing
             // viewer.zig stays out of the test build.

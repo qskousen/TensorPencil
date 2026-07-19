@@ -13,6 +13,7 @@ const config = @import("config.zig");
 const diffuser = @import("diffuser.zig");
 const clipboard = @import("clipboard.zig");
 const fonts = @import("fonts.zig");
+const hint = @import("hint.zig");
 
 const GenImage = diffuser.GenImage;
 
@@ -95,11 +96,14 @@ pub fn render(cfg: *const config.Config, d: ?*diffuser.Diffuser, ready: bool, cb
             sp.deinit();
         }
         if (dvui.button(@src(), "Chat", .{}, .{ .gravity_y = 0.5 })) cb.to_chat();
+        var wd: dvui.WidgetData = undefined;
         if (dvui.buttonIcon(@src(), "settings", dvui.entypo.cog, .{}, .{}, .{
             .gravity_y = 0.5,
             .min_size_content = .{ .w = 22, .h = 22 },
             .margin = .{ .x = 6 },
+            .data_out = &wd,
         })) cb.settings();
+        hint.hover(@src(), &wd, "Settings");
     }
 
     const engine = d orelse {
@@ -320,10 +324,13 @@ fn renderCell(gi: *GenImage, idx: usize, cell: f32) void {
                     sp.deinit();
                 }
                 // Copy the image to the clipboard as a PNG.
+                var wd: dvui.WidgetData = undefined;
                 if (dvui.buttonIcon(@src(), "copy", dvui.entypo.clipboard, .{}, .{}, .{
                     .min_size_content = .{ .w = 16, .h = 16 },
                     .gravity_y = 0.5,
+                    .data_out = &wd,
                 })) clipboard.copyImage(gi);
+                hint.hover(@src(), &wd, "Copy image to clipboard");
             }
         },
         .failed => dvui.label(@src(), "⚠ failed", .{}, .{}),
