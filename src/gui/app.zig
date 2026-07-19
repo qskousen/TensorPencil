@@ -573,10 +573,12 @@ fn sdlEventWindowID(event: SDLBackend.c.SDL_Event) u32 {
 
 /// Can the next message carry an image? True when a vision tower is resident,
 /// or — before the lazy first-message load — when the configured model has one
-/// (an mmproj path is set alongside an LLM). Lets drop/paste work as the first
-/// message, staging into `g_staged_images` until the session comes up.
+/// (an mmproj path is set alongside an LLM). Lets drop/paste and "Discuss this
+/// image" work as the first message, staging into `g_staged_images` until the
+/// session comes up. While a load is in flight the session is off-limits to the
+/// UI thread, so only the config answers.
 fn visionAvailable() bool {
-    if (g_session) |s| return s.visionEnabled();
+    if (!g_loading.load(.acquire)) if (g_session) |s| return s.visionEnabled();
     return g_config.vision_tower.opt() != null and g_config.llm_model.opt() != null;
 }
 
@@ -601,6 +603,24 @@ fn attachOrStage(rgb: []const u8, w: usize, h: usize) void {
     // Kick the lazy load so the staged image (and any first message) lands in a
     // session; maybeStartReload drains g_staged_images once it's live.
     if (!g_loading.load(.acquire)) g_reload_requested = true;
+}
+
+/// RGBA variant of `attachOrStage` for images that already live as display
+/// pixels (generated images). `s` is the UI-safe session (null while loading).
+fn attachOrStageRgba(s: ?*chat.Session, rgba: []const u8, w: usize, h: usize) void {
+    if (s) |ss| {
+        ss.attachRgba(rgba, w, h) catch |err| std.log.err("attach image: {t}", .{err});
+        return;
+    }
+    const px = w * h;
+    const rgb = g_gpa.alloc(u8, px * 3) catch return;
+    defer g_gpa.free(rgb);
+    for (0..px) |i| {
+        rgb[i * 3 + 0] = rgba[i * 4 + 0];
+        rgb[i * 3 + 1] = rgba[i * 4 + 1];
+        rgb[i * 3 + 2] = rgba[i * 4 + 2];
+    }
+    attachOrStage(rgb, w, h);
 }
 
 /// Drop a not-yet-loaded staged attachment by index (pre-session mirror of
@@ -1484,12 +1504,14 @@ fn renderGenImage(s: ?*chat.Session, gi: *chat.GenImage, gi_idx: usize) void {
                     })) clipboard.copyImage(gi);
 
                     // Let the model see this image: attach it to the next
-                    // message. Only when a live vision-capable session exists.
-                    if (s) |ss| if (ss.visionEnabled()) {
+                    // message. Shown whenever the configured model can see
+                    // images (not just while a session is resident); with the
+                    // LLM unloaded the image is staged and the lazy load kicks.
+                    if (visionAvailable()) {
                         if (dvui.button(@src(), "Discuss this image", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 6 } })) {
-                            ss.attachRgba(rgba, gi.width, gi.height) catch |err| std.log.err("attach image: {t}", .{err});
+                            attachOrStageRgba(s, rgba, gi.width, gi.height);
                         }
-                    };
+                    }
                 }
             }
         },

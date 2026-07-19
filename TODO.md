@@ -1,4 +1,3 @@
-- "talk about this image" button disappears when llm is unloaded (should be determined by model metadata like image and thinking capabilities)
 - zig-cuda backend seems to have oom issues
 - output text (user and agent) in markdown?
 - changing system prompt should wipe context and take effect on the next message
