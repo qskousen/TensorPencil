@@ -395,6 +395,12 @@ pub const Diffuser = struct {
     queue: std.ArrayList(*GenImage) = .empty,
 
     vram: VramCoordinator,
+    /// True between `vram.enter` (an image started) and the matching
+    /// `vram.exit` (queue drained), so `pump` fires the coordinator hooks on
+    /// queue EDGES only. `pump` runs every frame, and unconditionally calling
+    /// `exit` on every empty-queue frame made the arbiter rebalance (and
+    /// publish an LLM residency target) at frame rate for no reason.
+    vram_entered: bool = false,
 
     /// Build the engine from a `DiffConfig`. `wake` repaints the UI on progress;
     /// `vram` is the injected VRAM coordinator (LLM eviction, or `.none`). The
@@ -701,9 +707,12 @@ pub const Diffuser = struct {
             // Queue drained. Keep the model resident so a later gen reuses it —
             // unless the config was switched mid-queue and it's now stale, in
             // which case drop it here to return its VRAM. Let the coordinator
-            // undo any eviction.
+            // undo any eviction — once, on the drain EDGE (see `vram_entered`).
             self.dropStaleSession();
-            self.vram.exit(self.vram.ctx);
+            if (self.vram_entered) {
+                self.vram_entered = false;
+                self.vram.exit(self.vram.ctx);
+            }
             return;
         };
         // Seam reconcile: if the resident pipeline is loaded for a different config
@@ -718,6 +727,7 @@ pub const Diffuser = struct {
         }
         // Make VRAM room for the image model before it loads (the worker
         // auto-budgets from live free VRAM).
+        self.vram_entered = true;
         self.vram.enter(self.vram.ctx);
         // Preview buffer, sized to the final image resolution — the upper bound
         // on any preview: a full-latent TAESD preview decodes at the image res

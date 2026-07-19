@@ -114,9 +114,20 @@ fn meterCommit() void {
 fn applyMeterPolicy() void {
     const s = g_session orelse return;
     if (g_loading.load(.acquire)) return;
+    // cuMemGetInfo reads the CALLING thread's current CUDA context, and this
+    // runs on the UI thread — which starts with none bound (the LLM's context
+    // is created on the loader thread). Bind it first, or the query fails and
+    // returns zeros: that silent zero used to skip `setBudgets` entirely,
+    // leaving the arbiter uninitialized (the qwen3-32B first-message
+    // mass-offload bug). Binding here is the same thing the idle-settle path
+    // (`vpApply`) already does on this thread.
+    s.be.bindThread();
     const mi = s.be.ctx.memGetInfo();
     const total: u64 = mi.total;
-    if (total == 0) return;
+    if (total == 0) {
+        std.log.warn("[vram] meter policy skipped: VRAM query failed — arbiter budgets NOT updated", .{});
+        return;
+    }
     const free_b: u64 = mi.free;
     const used_all: u64 = total -| free_b;
     const llm_res: u64 = s.be.deviceUsed();
@@ -139,6 +150,9 @@ fn applyMeterPolicy() void {
     s.vram_share = share;
     s.vram_budget = available;
     g_arbiter.diff_used = diff_res;
+    std.log.info("[vram] meter policy: limit {d} MiB − system {d} → budget {d} MiB · LLM share {d} (LLM {d} + diff {d} resident, {d} free)", .{
+        limit_bytes >> 20, system >> 20, available >> 20, share >> 20, llm_res >> 20, diff_res >> 20, free_b >> 20,
+    });
     g_arbiter.setBudgets(available, share);
     g_session_mu.unlock(g_io);
 

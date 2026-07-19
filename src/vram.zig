@@ -115,8 +115,22 @@ pub const Participant = struct {
     /// and a worker that starts later); if no worker is running we also apply it
     /// now on the caller's thread, otherwise the worker applies it at its next
     /// safe boundary via `pollAndApply`.
+    ///
+    /// A `target` of 0 is IGNORED (nothing published or applied): 0 means the
+    /// arbiter has no real budget (uninitialized, or a fully-collapsed
+    /// measurement), and clamping it up to the floor would manufacture a real —
+    /// and typically unreachable — ceiling out of garbage, evicting the whole
+    /// model (the qwen3-32B first-message mass-offload bug). A coordinator that
+    /// wants a model to yield everything it can targets a small nonzero budget;
+    /// the floor clamp keeps that safe.
     pub fn settle(self: Participant, target: u64) void {
+        if (target == 0) {
+            std.log.debug("[vram] settle skipped: zero target (would clamp to floor {d} MiB)", .{self.floor() >> 20});
+            return;
+        }
         const clamped = @max(target, self.floor());
+        if (clamped != target)
+            std.log.debug("[vram] settle target {d} MiB below the committed-KV floor; raised to {d} MiB", .{ target >> 20, clamped >> 20 });
         self.control.requestBudget(clamped);
         if (!self.busy()) self.vtable.applyBudget(self.ctx, clamped);
     }
@@ -159,8 +173,17 @@ pub const Arbiter = struct {
     /// to its share (even mid-generation — the settle is published to its
     /// control point and applied at the next token). When diffusion is idle the
     /// LLM may use everything the image model isn't currently holding.
+    ///
+    /// With `limit == 0` the arbiter was never given budgets (`setBudgets`
+    /// hasn't run, or the VRAM query behind it failed) — there is no real
+    /// ceiling to drive toward, so driving anyway would publish garbage. Warn
+    /// and leave residency alone; the next successful `setBudgets` rebalances.
     pub fn rebalance(self: *Arbiter) void {
         if (self.llm) |llm| {
+            if (self.limit == 0) {
+                std.log.warn("[vram] rebalance skipped: budgets uninitialized (meter policy never resolved — VRAM query failed?)", .{});
+                return;
+            }
             const target = if (self.diff_active) self.llm_share else self.limit -| self.diff_used;
             llm.settle(target);
         }
@@ -277,6 +300,39 @@ test "Arbiter: diffusion active drives the LLM down to its share; idle frees it"
     // targets limit - diff_used instead of the whole limit.
     arb.setDiffusionUsage(5 << 30);
     try std.testing.expectEqual(@as(?u64, 17 << 30), m.applied);
+}
+
+test "Participant.settle: a zero target is ignored, not clamped up to the floor" {
+    // Regression: the qwen3-32B first-message mass-offload. A zero raw target
+    // (uninitialized arbiter) used to be clamped UP to the committed-KV floor
+    // (384 MiB mid-prefill) and published as a real ceiling — below the model's
+    // un-evictable minimum, so the worker evicted every layer chasing it.
+    std.testing.log_level = .err; // the skip logs on purpose; keep a passing run silent
+    var m: MockModel = .{ .used = 20 << 30, .floor_b = 384 << 20 };
+    m.participant().settle(0);
+    try std.testing.expectEqual(@as(?u64, null), m.applied);
+    try std.testing.expectEqual(@as(?u64, null), m.cp.budgetTarget());
+}
+
+test "Arbiter: uninitialized budgets (limit 0) never drive the LLM" {
+    // Regression companion: with `setBudgets` never called (meter policy
+    // early-returned on a failed VRAM query), the per-frame diffusion
+    // queue-drained edge used to rebalance with limit 0 and publish the
+    // floor-clamped garbage that `settle` now also rejects. The arbiter must
+    // leave residency alone until it has real budgets.
+    std.testing.log_level = .err; // the skipped rebalances warn on purpose
+    var m: MockModel = .{ .used = 20 << 30, .floor_b = 384 << 20 };
+    var arb: Arbiter = .{ .llm = m.participant() }; // limit/llm_share left 0
+    arb.setDiffusionActive(false); // the empty-queue drain edge
+    arb.setDiffusionActive(true);
+    arb.setDiffusionUsage(1 << 30);
+    try std.testing.expectEqual(@as(?u64, null), m.applied);
+    try std.testing.expectEqual(@as(?u64, null), m.cp.budgetTarget());
+
+    // First real setBudgets takes over and drives normally again.
+    arb.setDiffusionActive(false);
+    arb.setBudgets(22 << 30, 6 << 30);
+    try std.testing.expectEqual(@as(?u64, 21 << 30), m.applied); // limit − diff_used
 }
 
 test "Arbiter: a busy LLM still yields (via its control point, not a direct apply)" {

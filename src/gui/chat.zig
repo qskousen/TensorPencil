@@ -771,6 +771,14 @@ pub const Session = struct {
                         dir, target >> 20, before.n_cpu, after.n_cpu, after.n_layers,
                         before.device_mib, after.device_mib, after.free_mib,
                     });
+                    // An offload wave that STILL ends over target means the
+                    // ceiling is below the un-evictable minimum (KV + embeddings
+                    // + head + scratch) — every layer was migrated chasing it.
+                    // That target is garbage; say so instead of failing silently.
+                    if (after.n_cpu > before.n_cpu and after.device_mib > (target >> 20))
+                        std.log.warn("[vram] LLM residency target {d} MiB is unreachable: {d} MiB remain resident with {d}/{d} layers on host — suspect a bogus published budget", .{
+                            target >> 20, after.device_mib, after.n_cpu, after.n_layers,
+                        });
                 }
             },
         }
