@@ -389,23 +389,28 @@ pub const Session = struct {
 
     /// MEASURED per-component VRAM breakdown for the GUI meter. Reads the live
     /// per-tag counters the allocator maintains (both CUDA and Vulkan backends).
-    /// `latent` absorbs the untagged remainder so the parts sum to `deviceUsed`.
+    /// `latent` is the measured per-image working set (GPU session, activation
+    /// workspace, live-preview decode) plus the small untagged remainder (init
+    /// overhead, pools), so the parts always sum to `deviceUsed`.
     pub fn vramBreakdown(self: *const Session) VramBreakdown {
         const total = self.deviceUsed();
         if (total == 0) return .{};
-        var te: u64 = 0;
-        var dit: u64 = 0;
-        var vae: u64 = 0;
-        if (self.cu_be) |b| {
-            te = b.memTagUsed(.te);
-            dit = b.memTagUsed(.dit);
-            vae = b.memTagUsed(.vae);
+        var b: VramBreakdown = .{};
+        if (self.cu_be) |be| {
+            b = .{ .te = be.memTagUsed(.te), .dit = be.memTagUsed(.dit), .vae = be.memTagUsed(.vae), .latent = be.memTagUsed(.latent) };
         } else if (self.gpu_ctx) |c| {
-            te = c.memTagUsed(.te);
-            dit = c.memTagUsed(.dit);
-            vae = c.memTagUsed(.vae);
+            b = .{ .te = c.memTagUsed(.te), .dit = c.memTagUsed(.dit), .vae = c.memTagUsed(.vae), .latent = c.memTagUsed(.latent) };
         }
-        return .{ .te = te, .dit = dit, .vae = vae, .latent = total -| te -| dit -| vae };
+        return foldUntagged(b, total);
+    }
+
+    /// Fold the untagged remainder of `total` into `latent` so the breakdown's
+    /// parts sum to `total` (the meter's segments must account for every byte
+    /// of `deviceUsed`, or the difference would misrender as "system" VRAM).
+    fn foldUntagged(b: VramBreakdown, total: u64) VramBreakdown {
+        var out = b;
+        out.latent += total -| b.te -| b.dit -| b.vae -| b.latent;
+        return out;
     }
 
     /// Tag subsequent device allocations with the current pipeline phase (on
@@ -542,8 +547,10 @@ pub const Session = struct {
             });
         }
 
-        // Stage 2: flow-matching sampling (reusing the resident DiT). Tag its
-        // device allocations (DiT weights + per-step scratch + latent) as DiT.
+        // Stage 2: flow-matching sampling (reusing the resident DiT). DiT weights
+        // (streamed lazily during forward) + per-step attention scratch are tagged
+        // DiT; the per-image working set (GPU session, activation workspace,
+        // preview decode) is tagged `latent` below.
         self.setMemTag(.dit);
         const x = try gpa.alloc(f32, lat_len);
         defer gpa.free(x);
@@ -562,6 +569,10 @@ pub const Session = struct {
             // Per-image GPU session: text fusion, rope table, timestep vectors
             // computed + uploaded once per image (they depend on the prompt +
             // resolution). The DiT WEIGHTS stay cached in the backend across images.
+            // These per-image buffers (session + activation workspace) are the
+            // meter's "latent / working" segment — tag them so it's MEASURED, not
+            // a remainder.
+            self.setMemTag(.latent);
             var sess_pos: ?dit_gpu.Session = null;
             defer if (sess_pos) |*sp| sp.deinit(gpa, gpu_ctx.?);
             var sess_neg: ?dit_gpu.Session = null;
@@ -588,6 +599,9 @@ pub const Session = struct {
                 const cu_seq_cap = @max(cond_pos.seq, if (cond_neg) |c| c.seq else 0);
                 cu_ws = try dit_cuda.Workspace.init(b, lat_h, lat_w, cu_seq_cap);
             }
+            // Back to DiT for the sampling loop: lazily streamed DiT weights and
+            // per-step attention scratch belong to the DiT segment.
+            self.setMemTag(.dit);
 
             // A preview can be produced this run when there's a step hook AND
             // either the static preview is on OR a live control is attached (which
@@ -664,6 +678,10 @@ pub const Session = struct {
                 const ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - start.nanoseconds)) / 1e6;
                 try note(progress, "step {d}/{d}  sigma {d:.3} -> {d:.3}  ({d:.1}s)\n", .{ i + 1, opts.steps, sigmas[i], sigmas[i + 1], ms / 1000.0 });
                 if (opts.on_step) |p| {
+                    // Live-preview decode allocations (taew weights + scratch) are
+                    // working memory, not DiT.
+                    self.setMemTag(.latent);
+                    defer self.setMemTag(.dit);
                     var pv: ?Preview = null;
                     var taew_rgb: ?[]u8 = null;
                     defer if (taew_rgb) |r| gpa.free(r);
@@ -717,6 +735,14 @@ pub const Session = struct {
             }
             const sampling_s = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - sampling_start.nanoseconds)) / 1e9;
             try note(progress, "sampling {d} steps in {d:.1}s ({d:.2}s/step)\n", .{ opts.steps, sampling_s, sampling_s / @as(f64, @floatFromInt(opts.steps)) });
+            // Peak-of-sampling attribution (the per-image session/workspace is
+            // still alive here) — the same numbers the GUI meter shows.
+            if (self.cu_be != null or self.gpu_ctx != null) {
+                const bd = self.vramBreakdown();
+                std.log.info("[diff-vram] breakdown te={d}MB dit={d}MB latent={d}MB vae={d}MB (used={d}MB)", .{
+                    bd.te >> 20, bd.dit >> 20, bd.latent >> 20, bd.vae >> 20, bd.total() >> 20,
+                });
+            }
         }
 
         if (opts.cancel) |c| if (c.load(.acquire)) return error.Canceled;
@@ -1001,6 +1027,23 @@ test "options validation" {
     const io = std.testing.io;
     try std.testing.expectError(error.SizeNotMultipleOf16, generate(io, gpa, .{ .prompt = "x", .width = 100, .height = 96 }, null));
     try std.testing.expectError(error.NoSteps, generate(io, gpa, .{ .prompt = "x", .steps = 0 }, null));
+}
+
+test "vramBreakdown folds only the untagged remainder into latent" {
+    const gib_b: u64 = 1 << 30;
+    // Typical mid-generation state: all four tags populated plus a little
+    // untagged init overhead. The measured latent must be preserved and only
+    // the remainder added, so the parts sum to deviceUsed.
+    const b = Session.foldUntagged(
+        .{ .te = 5 * gib_b, .dit = 13 * gib_b, .vae = 1 * gib_b, .latent = 2 * gib_b },
+        21 * gib_b + (100 << 20),
+    );
+    try std.testing.expectEqual(2 * gib_b + (100 << 20), b.latent);
+    try std.testing.expectEqual(21 * gib_b + (100 << 20), b.total());
+    // Counters momentarily exceeding deviceUsed (benign cross-thread race) must
+    // saturate, not underflow.
+    const r = Session.foldUntagged(.{ .te = 2 * gib_b, .dit = 2 * gib_b, .vae = 0, .latent = 0 }, 3 * gib_b);
+    try std.testing.expectEqual(@as(u64, 0), r.latent);
 }
 
 test "recoverableDecodeErr classifies VAE-decode fallbacks" {

@@ -10,13 +10,14 @@
 //! touched on the allocating thread.
 
 /// Which pipeline component an allocation belongs to. `other` is the default
-/// (anything allocated outside a tagged phase — workspace, the latent buffer,
-/// init overhead); the meter folds it into the "latent / working" segment.
+/// (anything allocated outside a tagged phase — init overhead, pools); the
+/// meter folds it into the "latent / working" segment.
 pub const MemTag = enum(u8) {
     other = 0,
     te = 1, // text encoder (weights + encode scratch)
     dit = 2, // diffusion transformer (weights + denoise scratch)
     vae = 3, // VAE decoder (weights + decode scratch)
+    latent = 4, // per-image working set (latent workspace, GPU session, live-preview decode)
 
-    pub const count = 4;
+    pub const count = 5;
 };

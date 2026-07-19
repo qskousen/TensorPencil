@@ -159,9 +159,10 @@ pub fn render(s: ?*chat.Session, diff_busy: bool, diff: diffuser.VramBreakdown, 
     renderMeter(s, diff, split, limit, llm_armed, diff_armed, acts);
 }
 
-/// Build the meter model from live device accounting and draw it. Diffusion is
-/// a single segment (`dit`) for now — per-stage introspection (TE/latent/VAE)
-/// lands with the engine changes.
+/// Build the meter model from live device accounting and draw it. The diffusion
+/// segments (TE / DiT / latent / VAE) are MEASURED per-tag allocator counters
+/// (see pipeline.vramBreakdown); `latent` is the per-image working set (GPU
+/// session + activation workspace + preview decode), populated mid-generation.
 fn renderMeter(s: ?*chat.Session, diff: diffuser.VramBreakdown, split: *f32, limit: *f32, llm_armed: bool, diff_armed: bool, acts: meter.Actions) void {
     // Whole-card totals come from the SAME source as the left VRAM meter — the
     // NVML sample — so the two always agree. (Reading the LLM context's own
