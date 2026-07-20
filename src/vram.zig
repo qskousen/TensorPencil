@@ -214,7 +214,19 @@ pub const Arbiter = struct {
     /// for `limit - llm_share` even while the LLM is still coming down (the VAE
     /// reclaim ladder covers the transient); otherwise it gets whatever the LLM
     /// isn't currently holding. Floored so a tiny budget still streams, never 0.
+    ///
+    /// With `limit == 0` the arbiter has no budgets (`setBudgets` never ran —
+    /// there is no LLM session for the meter policy to resolve against, i.e.
+    /// pure image-studio mode). Return 0 = the pipeline's AUTO sentinel (pin
+    /// what fits live free VRAM), matching the pre-arbiter `vcBudget` behavior.
+    /// Returning the 256 MiB floor here instead pinned a sliver of the image
+    /// model and evicted/streamed the rest (the studio twin of the LLM
+    /// zero-budget mass-offload bug).
     pub fn diffusionBudget(self: *const Arbiter) u64 {
+        if (self.limit == 0) {
+            std.log.debug("[vram] diffusion budget: arbiter uninitialized (no LLM/meter policy) → auto (pin what fits)", .{});
+            return 0;
+        }
         const min_budget: u64 = 256 << 20;
         const llm_committed = if (self.diff_active)
             self.llm_share
@@ -343,6 +355,28 @@ test "Arbiter: a busy LLM still yields (via its control point, not a direct appl
     try std.testing.expectEqual(@as(?u64, null), m.applied);
     // …but the target is published, so the LLM worker yields at its next token.
     try std.testing.expectEqual(@as(?u64, 6 << 30), m.cp.budgetTarget());
+}
+
+test "Arbiter.diffusionBudget: uninitialized budgets mean auto (0), not the 256 MiB floor" {
+    // Regression: pure image-studio mode (no LLM session) never runs the meter
+    // policy, so `limit` stays 0. diffusionBudget used to return
+    // max(256 MiB, 0) — a hard 256 MiB pin budget that pinned a sliver of the
+    // image model and evicted the rest. 0 is the pipeline's AUTO sentinel.
+    std.testing.log_level = .err; // the auto fallback logs on purpose
+    var arb: Arbiter = .{};
+    try std.testing.expectEqual(@as(u64, 0), arb.diffusionBudget());
+
+    // Still auto with an LLM registered but budgets unresolved.
+    var m: MockModel = .{ .used = 20 << 30 };
+    arb.llm = m.participant();
+    try std.testing.expectEqual(@as(u64, 0), arb.diffusionBudget());
+
+    // Real budgets: back to limit − committed, floored at 256 MiB.
+    arb.limit = 22 << 30;
+    arb.llm_share = 6 << 30;
+    try std.testing.expectEqual(@as(u64, 2 << 30), arb.diffusionBudget()); // idle: limit − usage
+    m.used = 22 << 30;
+    try std.testing.expectEqual(@as(u64, 256 << 20), arb.diffusionBudget()); // floored
 }
 
 test "ControlPoint: budget intent round-trips and clears" {
