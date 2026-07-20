@@ -211,7 +211,7 @@ Notes:
 Coopmat SPIR-V builders in `src/gpu/coopmat.zig` (`buildGemmShared` f16/bf16, `buildGemmI8` int8; **no s4**).
 
 ### zig-cuda — hand-PTX (`src/gpu/cuda/kernels.zig` GEMM, `elt.zig` elementwise/attn)
-GEMM builders: `buildHgemm` (f16/bf16 mma m16n8k16) · `buildIgemmSmem`/`buildIgemmPipe` (int8 m16n8k32, int4 m16n8k64) · `buildPrep` (quant/rotate).
+GEMM builders: `buildHgemm` (f16/bf16 mma m16n8k16) · `buildIgemmSmem`/`buildIgemmPipe` (int8 m16n8k32, int4 m16n8k64) · `buildPrep` (quant/rotate). **All DiT GEMM formats** use warp-cooperative `ldmatrix.x4`/`.x2` frag loads + an XOR-swizzled (`off^=(row&7)<<4`) conflict-free shared layout (`use_ldmatrix` flag on `buildIgemmPipe` — int8/int4 — AND `buildHgemm` — f16/bf16 dense + attention; on at every runtime site; pure permutation → bit-exact, ~+1–3% on qkv/attn-proj shapes, flat on BW-bound MLP shapes).
 GEMV: `gemv_{fp8,bf16,f16,q8_0,q4_0,q4_k,q5_k,q6_k}` + `_q8`/grouped-N `_q8n` dp4a variants.
 Attn: `attn`, `attn_split`/`_merge`/`_h256`/`_h512`/`_tree`. GDN: `gdn_{conv_step,gates,delta_step}`.
 Plus `im2col`, dtype-pad converts, `dequant_*_f16`, rope/norm/act kernels.

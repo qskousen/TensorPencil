@@ -152,6 +152,8 @@ const PFN_cuStreamWaitEvent = *const fn (CUstream, CUevent, c_uint) callconv(.c)
 const PFN_cuEventQuery = *const fn (CUevent) callconv(.c) CUresult;
 const PFN_cuMemsetD8 = *const fn (CUdeviceptr, u8, usize) callconv(.c) CUresult;
 const PFN_cuMemsetD32 = *const fn (CUdeviceptr, c_uint, usize) callconv(.c) CUresult;
+const PFN_cuMemsetD8Async = *const fn (CUdeviceptr, u8, usize, CUstream) callconv(.c) CUresult;
+const PFN_cuMemsetD32Async = *const fn (CUdeviceptr, c_uint, usize, CUstream) callconv(.c) CUresult;
 const PFN_cuMemGetInfo = *const fn (*usize, *usize) callconv(.c) CUresult;
 const PFN_cuModuleLoadDataEx = *const fn (*CUmodule, *const anyopaque, c_uint, ?[*]c_int, ?[*]?*anyopaque) callconv(.c) CUresult;
 const PFN_cuModuleUnload = *const fn (CUmodule) callconv(.c) CUresult;
@@ -232,6 +234,8 @@ pub const Api = struct {
     cuEventQuery: PFN_cuEventQuery,
     cuMemsetD8: PFN_cuMemsetD8,
     cuMemsetD32: PFN_cuMemsetD32,
+    cuMemsetD8Async: PFN_cuMemsetD8Async,
+    cuMemsetD32Async: PFN_cuMemsetD32Async,
     cuMemGetInfo: PFN_cuMemGetInfo,
     cuModuleLoadDataEx: PFN_cuModuleLoadDataEx,
     cuModuleUnload: PFN_cuModuleUnload,
@@ -307,6 +311,8 @@ pub const Api = struct {
             .{ "cuEventQuery", "cuEventQuery" },
             .{ "cuMemsetD8", "cuMemsetD8_v2" },
             .{ "cuMemsetD32", "cuMemsetD32_v2" },
+            .{ "cuMemsetD8Async", "cuMemsetD8Async" },
+            .{ "cuMemsetD32Async", "cuMemsetD32Async" },
             .{ "cuMemGetInfo", "cuMemGetInfo_v2" },
             .{ "cuModuleLoadDataEx", "cuModuleLoadDataEx" },
             .{ "cuModuleUnload", "cuModuleUnload" },

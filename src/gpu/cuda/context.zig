@@ -404,6 +404,19 @@ pub const Context = struct {
         try self.check(self.api.cuMemsetD32(buf.ptr, value, count), "cuMemsetD32");
     }
 
+    /// Async memsets on the context (compute) stream. Unlike the legacy
+    /// null-stream variants above, these stay ordered within the single-stream
+    /// batch (no hidden full-stream sync) and, crucially, are legal inside a
+    /// CUDA-graph capture — a null-stream memset mid-capture aborts it with
+    /// STREAM_CAPTURE_IMPLICIT.
+    pub fn memsetD8Async(self: *Context, buf: Buffer, value: u8, bytes: usize) Error!void {
+        try self.check(self.api.cuMemsetD8Async(buf.ptr, value, bytes, self.stream), "cuMemsetD8Async");
+    }
+
+    pub fn memsetD32Async(self: *Context, buf: Buffer, value: u32, count: usize) Error!void {
+        try self.check(self.api.cuMemsetD32Async(buf.ptr, value, count, self.stream), "cuMemsetD32Async");
+    }
+
     // ---- Launch -------------------------------------------------------------
 
     /// Launch a kernel on the context stream. `params` is a slice of pointers to

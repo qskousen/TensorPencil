@@ -1301,7 +1301,7 @@ pub const Backend = struct {
 
     fn fusedFn(self: *Backend) Error!cu.CUfunction {
         if (self.fused_mod != null) return self.fused_fn;
-        const ptx = kernels.buildIgemmPipe(self.gpa, 64, true, 8) catch return error.OutOfMemory;
+        const ptx = kernels.buildIgemmPipe(self.gpa, 64, true, 8, true) catch return error.OutOfMemory;
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         self.fused_fn = mod.getFunction(self.ctx, "igemm_pipe_fused") catch return error.CudaError;
@@ -1319,7 +1319,7 @@ pub const Backend = struct {
 
     fn hgemmFn(self: *Backend) Error!cu.CUfunction {
         if (self.hgemm_mod != null) return self.hgemm_fn;
-        const ptx = kernels.buildHgemm(self.gpa, false, false, false, false) catch return error.OutOfMemory;
+        const ptx = kernels.buildHgemm(self.gpa, false, false, false, false, true) catch return error.OutOfMemory;
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         self.hgemm_fn = mod.getFunction(self.ctx, "hgemm") catch return error.CudaError;
@@ -1332,7 +1332,7 @@ pub const Backend = struct {
     /// Ampere+ (sm_80) only; callers must gate on cc_major >= 8.
     fn hgemmBf16Fn(self: *Backend) Error!cu.CUfunction {
         if (self.hgemm_bf16_mod != null) return self.hgemm_bf16_fn;
-        const ptx = kernels.buildHgemm(self.gpa, false, false, false, true) catch return error.OutOfMemory;
+        const ptx = kernels.buildHgemm(self.gpa, false, false, false, true, true) catch return error.OutOfMemory;
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         self.hgemm_bf16_fn = mod.getFunction(self.ctx, "hgemm") catch return error.CudaError;
@@ -1342,7 +1342,7 @@ pub const Backend = struct {
 
     fn hgemmBatchedFn(self: *Backend) Error!cu.CUfunction {
         if (self.hgemm_b_mod != null) return self.hgemm_b_fn;
-        const ptx = kernels.buildHgemm(self.gpa, true, false, false, false) catch return error.OutOfMemory;
+        const ptx = kernels.buildHgemm(self.gpa, true, false, false, false, true) catch return error.OutOfMemory;
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         self.hgemm_b_fn = mod.getFunction(self.ctx, "hgemm_batched") catch return error.CudaError;
@@ -1353,7 +1353,7 @@ pub const Backend = struct {
     /// Batched hgemm with f16 C output (scores → softmax path).
     fn hgemmBatchedC16Fn(self: *Backend) Error!cu.CUfunction {
         if (self.hgemm_bc16_mod != null) return self.hgemm_bc16_fn;
-        const ptx = kernels.buildHgemm(self.gpa, true, true, false, false) catch return error.OutOfMemory;
+        const ptx = kernels.buildHgemm(self.gpa, true, true, false, false, true) catch return error.OutOfMemory;
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         self.hgemm_bc16_fn = mod.getFunction(self.ctx, "hgemm_batched_c16") catch return error.CudaError;
@@ -1365,7 +1365,7 @@ pub const Backend = struct {
     /// from S (f16) + the per-row MD table during A-staging (no P materialization).
     fn hgemmAttnOutFn(self: *Backend) Error!cu.CUfunction {
         if (self.hgemm_ao_mod != null) return self.hgemm_ao_fn;
-        const ptx = kernels.buildHgemm(self.gpa, true, false, true, false) catch return error.OutOfMemory;
+        const ptx = kernels.buildHgemm(self.gpa, true, false, true, false, true) catch return error.OutOfMemory;
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         self.hgemm_ao_fn = mod.getFunction(self.ctx, "hgemm_attnout") catch return error.CudaError;
@@ -2261,12 +2261,13 @@ pub const Backend = struct {
         // The prep kernel (grid = {m,1,1}) fully overwrites rows 0..m-1 — every
         // column (cols % 1024 == 0, see buildPrep) plus i8_scale[row] — so only
         // the pad rows [m..mpad) need zeroing (GEMM pad rows -> 0 acc, scale 0).
-        // When m is already 128-aligned there is no pad, so skip the memset (and
-        // its NULL-stream sync bubble) entirely.
+        // When m is already 128-aligned there is no pad, so skip the memset
+        // entirely. Async on the compute stream: stays ordered within the batch
+        // (no null-stream sync bubble) and is legal inside a graph capture.
         if (mpad > m) {
             const pad = mpad - m;
-            self.ctx.memsetD8(.{ .ptr = self.i8_x.ptr() + @as(u64, @intCast(m * cols)), .bytes = @intCast(pad * cols) }, 0, pad * cols) catch return error.CudaError;
-            self.ctx.memsetD32(.{ .ptr = self.i8_scale.ptr() + @as(u64, @intCast(m * 4)), .bytes = @intCast(pad * 4) }, 0, pad) catch return error.CudaError;
+            self.ctx.memsetD8Async(.{ .ptr = self.i8_x.ptr() + @as(u64, @intCast(m * cols)), .bytes = @intCast(pad * cols) }, 0, pad * cols) catch return error.CudaError;
+            self.ctx.memsetD32Async(.{ .ptr = self.i8_scale.ptr() + @as(u64, @intCast(m * 4)), .bytes = @intCast(pad * 4) }, 0, pad) catch return error.CudaError;
         }
         const f = try self.prepFn(cols, in_f16);
         var px = x.ptr();
@@ -2316,7 +2317,7 @@ pub const Backend = struct {
 
     fn i4fusedFn(self: *Backend) Error!cu.CUfunction {
         if (self.i4_fused_mod != null) return self.i4_fused_fn;
-        const ptx = kernels.buildIgemmPipe(self.gpa, 64, true, 4) catch return error.OutOfMemory;
+        const ptx = kernels.buildIgemmPipe(self.gpa, 64, true, 4, true) catch return error.OutOfMemory;
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         self.i4_fused_fn = mod.getFunction(self.ctx, "i4gemm_pipe_fused") catch return error.CudaError;
@@ -2338,8 +2339,8 @@ pub const Backend = struct {
         try self.ensureDeviceBuffer(&self.i8_scale, mpad * 4);
         if (mpad > m) {
             const pad = mpad - m;
-            self.ctx.memsetD8(.{ .ptr = self.i8_x.ptr() + @as(u64, @intCast(m * qbytes)), .bytes = @intCast(pad * qbytes) }, 0, pad * qbytes) catch return error.CudaError;
-            self.ctx.memsetD32(.{ .ptr = self.i8_scale.ptr() + @as(u64, @intCast(m * 4)), .bytes = @intCast(pad * 4) }, 0, pad) catch return error.CudaError;
+            self.ctx.memsetD8Async(.{ .ptr = self.i8_x.ptr() + @as(u64, @intCast(m * qbytes)), .bytes = @intCast(pad * qbytes) }, 0, pad * qbytes) catch return error.CudaError;
+            self.ctx.memsetD32Async(.{ .ptr = self.i8_scale.ptr() + @as(u64, @intCast(m * 4)), .bytes = @intCast(pad * 4) }, 0, pad) catch return error.CudaError;
         }
         const f = try self.i4prepFn(cols);
         var px = x.ptr();

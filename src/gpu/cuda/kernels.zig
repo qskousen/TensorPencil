@@ -554,7 +554,7 @@ pub fn buildIgemmSmem(alloc: std.mem.Allocator) ![:0]u8 {
 /// K_STEP is a parameter: 64 -> 32 KB shared (no opt-in); 128 -> 64 KB (needs
 /// cuFuncSetAttribute opt-in, the >48 KB lever). Requires m%128==0, n%128==0,
 /// k%K_STEP==0. Entry `igemm_pipe`.
-pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool, bits: usize) ![:0]u8 {
+pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool, bits: usize, use_ldmatrix: bool) ![:0]u8 {
     std.debug.assert(bits == 8 or bits == 4);
     // s8: one m16n8k32 per 32-byte substep (32 k). s4: one m16n8k64 per 32-byte
     // substep (64 k). Staging/tile math is byte-based and identical; only the
@@ -661,17 +661,65 @@ pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool, bits: 
     // Fragment-load lane bases (relative to buffer): As lane / Bs lane.
     const r_asl0 = try b.reg(.b32);
     const r_bsl0 = try b.reg(.b32);
-    try b.linef("shl.b32 {s}, {s}, 6;", .{ r_tmp, r_wm });
-    try b.linef("add.u32 {s}, {s}, {s};", .{ r_tmp, r_tmp, r_gid });
-    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_asl0, r_tmp, kstep });
-    try b.linef("shl.b32 {s}, {s}, 2;", .{ r_tmp, r_tf });
-    try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl0, r_asl0, r_tmp });
-    try b.linef("shl.b32 {s}, {s}, 6;", .{ r_tmp, r_wn });
-    try b.linef("add.u32 {s}, {s}, {s};", .{ r_tmp, r_tmp, r_gid });
-    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_bsl0, r_tmp, kstep });
-    try b.linef("shl.b32 {s}, {s}, 2;", .{ r_tmp, r_tf });
-    try b.linef("add.u32 {s}, {s}, {s};", .{ r_bsl0, r_bsl0, r_tmp });
-    try b.linef("add.u32 {s}, {s}, {d};", .{ r_bsl0, r_bsl0, TILE });
+    // XOR-swizzle mask for the ldmatrix path (bits [4:6], keyed on row&7). Zero
+    // when swizzling is off. Applied identically to the cp.async store offset and
+    // the ldmatrix load offset -> pure permutation of shared, so bit-exact, but
+    // it makes the 8 rows of each 8x8 tile hit 8 distinct 16B banks (conflict-
+    // free) where the plain srow*kstep layout collides every 2 rows.
+    const r_lmask = try b.reg(.b32);
+    try b.linef("mov.u32 {s}, 0;", .{r_lmask});
+    if (!use_ldmatrix) {
+        try b.linef("shl.b32 {s}, {s}, 6;", .{ r_tmp, r_wm });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_tmp, r_tmp, r_gid });
+        try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_asl0, r_tmp, kstep });
+        try b.linef("shl.b32 {s}, {s}, 2;", .{ r_tmp, r_tf });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl0, r_asl0, r_tmp });
+        try b.linef("shl.b32 {s}, {s}, 6;", .{ r_tmp, r_wn });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_tmp, r_tmp, r_gid });
+        try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_bsl0, r_tmp, kstep });
+        try b.linef("shl.b32 {s}, {s}, 2;", .{ r_tmp, r_tf });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_bsl0, r_bsl0, r_tmp });
+        try b.linef("add.u32 {s}, {s}, {d};", .{ r_bsl0, r_bsl0, TILE });
+    } else {
+        // ldmatrix.x4 lane bases: each lane supplies the 16B-aligned start of one
+        // row of one 8x8 b16 tile. For the m16n8kK A fragment the 32 lanes map to
+        // 4 tiles: matrix = lane>>3, row_in_tile = lane&7.
+        //   A: row_within = (lane&7) + (matrix&1)*8 ; col_byte = (matrix&2)*8
+        //   B (col-major [n][k], ldmatrix.x2): row = lane&7 ; col_byte = (lane&8)<<1
+        const r_l8 = try b.reg(.b32);
+        const r_mtx = try b.reg(.b32);
+        const r_colb = try b.reg(.b32);
+        try b.linef("and.b32 {s}, {s}, 7;", .{ r_l8, r_lane });
+        try b.linef("shr.u32 {s}, {s}, 3;", .{ r_mtx, r_lane });
+        // A: row_within into r_tmp
+        try b.linef("and.b32 {s}, {s}, 1;", .{ r_asl0, r_mtx });
+        try b.linef("shl.b32 {s}, {s}, 3;", .{ r_asl0, r_asl0 });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl0, r_asl0, r_l8 }); // row_within
+        try b.linef("shl.b32 {s}, {s}, 6;", .{ r_tmp, r_wm }); // wm*64
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl0, r_asl0, r_tmp });
+        try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_asl0, r_asl0, kstep });
+        try b.linef("and.b32 {s}, {s}, 2;", .{ r_colb, r_mtx });
+        try b.linef("shl.b32 {s}, {s}, 3;", .{ r_colb, r_colb }); // (matrix&2)*8 -> 0 or 16
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl0, r_asl0, r_colb });
+        // B: row = lane&7 within the nj*8 block; col_byte = (lane&8)<<1
+        try b.linef("shl.b32 {s}, {s}, 6;", .{ r_tmp, r_wn }); // wn*64
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_tmp, r_tmp, r_l8 });
+        try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_bsl0, r_tmp, kstep });
+        try b.linef("and.b32 {s}, {s}, 8;", .{ r_colb, r_lane });
+        try b.linef("shl.b32 {s}, {s}, 1;", .{ r_colb, r_colb }); // 0 or 16
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_bsl0, r_bsl0, r_colb });
+        try b.linef("add.u32 {s}, {s}, {d};", .{ r_bsl0, r_bsl0, TILE });
+        // Read-side swizzle mask = (row&7)<<4. For every A/B ldmatrix load the
+        // fragment offset has (off>>6)&7 == lane&7 (proved: mi adds *1024, ks/col
+        // add <64, none carry into bit 6), so the mask is lane-constant.
+        try b.linef("shl.b32 {s}, {s}, 4;", .{ r_lmask, r_l8 });
+        // Write-side swizzle: XOR (srow&7)<<4 into the cp.async store offset. sw
+        // distributes over the +stage_stride (2048=bit11) chunk advance, so one
+        // XOR here swizzles all four staged chunks.
+        try b.linef("and.b32 {s}, {s}, 7;", .{ r_tmp, r_srow });
+        try b.linef("shl.b32 {s}, {s}, 4;", .{ r_tmp, r_tmp });
+        try b.linef("xor.b32 {s}, {s}, {s};", .{ r_stdst, r_stdst, r_tmp });
+    }
 
     for (acc) |r| try b.linef("mov.u32 {s}, 0;", .{r});
 
@@ -685,6 +733,7 @@ pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool, bits: 
     const r_dst = try b.reg(.b32);
     const r_asl = try b.reg(.b32);
     const r_bsl = try b.reg(.b32);
+    const r_lda = try b.reg(.b32); // swizzled ldmatrix address temp
     const r_bit = try b.reg(.b32);
     const p_more = try b.reg(.pred);
     const p_loop = try b.reg(.pred);
@@ -770,16 +819,35 @@ pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool, bits: 
         var mi: usize = 0;
         while (mi < MT) : (mi += 1) {
             const o = mi * 16 * kstep + ks * 32;
-            try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ af[mi * 4 + 0], r_asl, o });
-            try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ af[mi * 4 + 1], r_asl, o + 8 * kstep });
-            try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ af[mi * 4 + 2], r_asl, o + 16 });
-            try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ af[mi * 4 + 3], r_asl, o + 8 * kstep + 16 });
+            if (use_ldmatrix) {
+                // One warp-cooperative load pulls the whole 16x32 (s8) / 16x64 (s4)
+                // A fragment into the exact {a0,a1,a2,a3} MMA register layout.
+                // XOR-swizzle the address (r_lmask=0 when swizzle off).
+                try b.linef("add.u32 {s}, {s}, {d};", .{ r_lda, r_asl, o });
+                try b.linef("xor.b32 {s}, {s}, {s};", .{ r_lda, r_lda, r_lmask });
+                try b.linef("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{{s}, {s}, {s}, {s}}}, [{s}];", .{
+                    af[mi * 4 + 0], af[mi * 4 + 1], af[mi * 4 + 2], af[mi * 4 + 3], r_lda,
+                });
+            } else {
+                try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ af[mi * 4 + 0], r_asl, o });
+                try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ af[mi * 4 + 1], r_asl, o + 8 * kstep });
+                try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ af[mi * 4 + 2], r_asl, o + 16 });
+                try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ af[mi * 4 + 3], r_asl, o + 8 * kstep + 16 });
+            }
         }
         var nj: usize = 0;
         while (nj < NT) : (nj += 1) {
             const o = nj * 8 * kstep + ks * 32;
-            try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ bf[nj * 2 + 0], r_bsl, o });
-            try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ bf[nj * 2 + 1], r_bsl, o + 16 });
+            if (use_ldmatrix) {
+                try b.linef("add.u32 {s}, {s}, {d};", .{ r_lda, r_bsl, o });
+                try b.linef("xor.b32 {s}, {s}, {s};", .{ r_lda, r_lda, r_lmask });
+                try b.linef("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {{{s}, {s}}}, [{s}];", .{
+                    bf[nj * 2 + 0], bf[nj * 2 + 1], r_lda,
+                });
+            } else {
+                try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ bf[nj * 2 + 0], r_bsl, o });
+                try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ bf[nj * 2 + 1], r_bsl, o + 16 });
+            }
         }
         mi = 0;
         while (mi < MT) : (mi += 1) {
@@ -1277,7 +1345,7 @@ pub const irescale_h16_ptx: [:0]const u8 =
 ///     from the per-row MD={max,1/sum} table (`softmax_md_f16`). This eliminates
 ///     the P materialization entirely (no P write in softmax, no P read here) —
 ///     the Vulkan-parity win. attnout implies batched; C is f32; p_scale is 1.
-pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout: bool, bf16: bool) ![:0]u8 {
+pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout: bool, bf16: bool, use_ldmatrix: bool) ![:0]u8 {
     const BM = 128;
     const KSTEP = 32;
     const MT = 4;
@@ -1429,19 +1497,63 @@ pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
     const r_asl = try b.reg(.b32);
     const r_bsl = try b.reg(.b32);
     const r_tmp = try b.reg(.b32);
-    try b.linef("shl.b32 {s}, {s}, 6;", .{ r_tmp, r_wm });
-    try b.linef("add.u32 {s}, {s}, {s};", .{ r_tmp, r_tmp, r_gid });
-    try b.linef("mul.lo.u32 {s}, {s}, 64;", .{ r_asl, r_tmp }); // row*64 bytes
-    try b.linef("shl.b32 {s}, {s}, 2;", .{ r_tmp, r_tf }); // tf*4
-    try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl, r_asl, r_tmp });
-    try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl, r_asl, r_smem });
-    try b.linef("shl.b32 {s}, {s}, 6;", .{ r_tmp, r_wn });
-    try b.linef("add.u32 {s}, {s}, {s};", .{ r_tmp, r_tmp, r_gid });
-    try b.linef("mul.lo.u32 {s}, {s}, 64;", .{ r_bsl, r_tmp });
-    try b.linef("shl.b32 {s}, {s}, 2;", .{ r_tmp, r_tf });
-    try b.linef("add.u32 {s}, {s}, {s};", .{ r_bsl, r_bsl, r_tmp });
-    try b.linef("add.u32 {s}, {s}, {s};", .{ r_bsl, r_bsl, r_smem });
-    try b.linef("add.u32 {s}, {s}, {d};", .{ r_bsl, r_bsl, BS_BASE });
+    // XOR-swizzle mask for the ldmatrix path (bits [4:6], keyed on row&7); 0 when
+    // off. Same permutation as buildIgemmPipe (rows are 64B apart here too:
+    // KSTEP=32 f16 * 2B). Applied to the st.shared store offset and the ldmatrix
+    // read offset -> pure permutation of shared, bit-exact, conflict-free reads.
+    const r_lmask = try b.reg(.b32);
+    try b.linef("mov.u32 {s}, 0;", .{r_lmask});
+    if (!use_ldmatrix) {
+        try b.linef("shl.b32 {s}, {s}, 6;", .{ r_tmp, r_wm });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_tmp, r_tmp, r_gid });
+        try b.linef("mul.lo.u32 {s}, {s}, 64;", .{ r_asl, r_tmp }); // row*64 bytes
+        try b.linef("shl.b32 {s}, {s}, 2;", .{ r_tmp, r_tf }); // tf*4
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl, r_asl, r_tmp });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl, r_asl, r_smem });
+        try b.linef("shl.b32 {s}, {s}, 6;", .{ r_tmp, r_wn });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_tmp, r_tmp, r_gid });
+        try b.linef("mul.lo.u32 {s}, {s}, 64;", .{ r_bsl, r_tmp });
+        try b.linef("shl.b32 {s}, {s}, 2;", .{ r_tmp, r_tf });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_bsl, r_bsl, r_tmp });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_bsl, r_bsl, r_smem });
+        try b.linef("add.u32 {s}, {s}, {d};", .{ r_bsl, r_bsl, BS_BASE });
+    } else {
+        // ldmatrix.x4 (A) / .x2 (B) lane bases. matrix = lane>>3, row = lane&7.
+        //   A: row_within = (lane&7) + (matrix&1)*8 ; col_byte = (matrix&2)*8
+        //   B (col-major [n][k]): row = lane&7 ; col_byte = (lane&8)<<1
+        const r_l8 = try b.reg(.b32);
+        const r_mtx = try b.reg(.b32);
+        const r_colb = try b.reg(.b32);
+        try b.linef("and.b32 {s}, {s}, 7;", .{ r_l8, r_lane });
+        try b.linef("shr.u32 {s}, {s}, 3;", .{ r_mtx, r_lane });
+        // A row_within
+        try b.linef("and.b32 {s}, {s}, 1;", .{ r_asl, r_mtx });
+        try b.linef("shl.b32 {s}, {s}, 3;", .{ r_asl, r_asl });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl, r_asl, r_l8 });
+        try b.linef("shl.b32 {s}, {s}, 6;", .{ r_tmp, r_wm }); // wm*64 rows
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl, r_asl, r_tmp });
+        try b.linef("mul.lo.u32 {s}, {s}, 64;", .{ r_asl, r_asl }); // *64 bytes/row
+        try b.linef("and.b32 {s}, {s}, 2;", .{ r_colb, r_mtx });
+        try b.linef("shl.b32 {s}, {s}, 3;", .{ r_colb, r_colb }); // 0 or 16
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl, r_asl, r_colb });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl, r_asl, r_smem });
+        // B
+        try b.linef("shl.b32 {s}, {s}, 6;", .{ r_tmp, r_wn }); // wn*64 rows
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_tmp, r_tmp, r_l8 });
+        try b.linef("mul.lo.u32 {s}, {s}, 64;", .{ r_bsl, r_tmp });
+        try b.linef("and.b32 {s}, {s}, 8;", .{ r_colb, r_lane });
+        try b.linef("shl.b32 {s}, {s}, 1;", .{ r_colb, r_colb }); // 0 or 16
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_bsl, r_bsl, r_colb });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_bsl, r_bsl, r_smem });
+        try b.linef("add.u32 {s}, {s}, {d};", .{ r_bsl, r_bsl, BS_BASE });
+        // read mask = (lane&7)<<4
+        try b.linef("shl.b32 {s}, {s}, 4;", .{ r_lmask, r_l8 });
+        // write swizzle: XOR (rowq&7)<<4 into both shared store bases (rowq=t>>4=
+        // row&7 of the staged row; constant across the i*512 chunk advance).
+        try b.linef("shl.b32 {s}, {s}, 4;", .{ r_colb, r_rowq }); // rowq<<4 (rowq is 0..7)
+        try b.linef("xor.b32 {s}, {s}, {s};", .{ r_shA, r_shA, r_colb });
+        try b.linef("xor.b32 {s}, {s}, {s};", .{ r_shB, r_shB, r_colb });
+    }
 
     for (acc) |r| try b.linef("mov.f32 {s}, 0f00000000;", .{r});
 
@@ -1451,6 +1563,7 @@ pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
     const rd_k0 = try b.reg(.b64);
     const r_tA = try b.reg(.b32);
     const r_tB = try b.reg(.b32);
+    const r_lda = try b.reg(.b32); // swizzled ldmatrix address temp
     const p0 = try b.reg(.pred);
     // attnout: per-element exp-transform temporaries (declared once, reused).
     var r_j0: []const u8 = undefined;
@@ -1535,16 +1648,34 @@ pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
         var mi: usize = 0;
         while (mi < MT) : (mi += 1) {
             const o = mi * 1024 + ks * 32; // mi*16 rows*64B + ks*16 f16*2B
-            try b.linef("ld.shared.b32 {s}, [{s}+{d}];", .{ af[mi * 4 + 0], r_asl, o });
-            try b.linef("ld.shared.b32 {s}, [{s}+{d}];", .{ af[mi * 4 + 1], r_asl, o + 512 });
-            try b.linef("ld.shared.b32 {s}, [{s}+{d}];", .{ af[mi * 4 + 2], r_asl, o + 16 });
-            try b.linef("ld.shared.b32 {s}, [{s}+{d}];", .{ af[mi * 4 + 3], r_asl, o + 528 });
+            if (use_ldmatrix) {
+                // f16/bf16 are natively b16 -> ldmatrix.x4.b16 lands the exact
+                // {a0,a1,a2,a3} m16n8k16 fragment. XOR-swizzle the address.
+                try b.linef("add.u32 {s}, {s}, {d};", .{ r_lda, r_asl, o });
+                try b.linef("xor.b32 {s}, {s}, {s};", .{ r_lda, r_lda, r_lmask });
+                try b.linef("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{{s}, {s}, {s}, {s}}}, [{s}];", .{
+                    af[mi * 4 + 0], af[mi * 4 + 1], af[mi * 4 + 2], af[mi * 4 + 3], r_lda,
+                });
+            } else {
+                try b.linef("ld.shared.b32 {s}, [{s}+{d}];", .{ af[mi * 4 + 0], r_asl, o });
+                try b.linef("ld.shared.b32 {s}, [{s}+{d}];", .{ af[mi * 4 + 1], r_asl, o + 512 });
+                try b.linef("ld.shared.b32 {s}, [{s}+{d}];", .{ af[mi * 4 + 2], r_asl, o + 16 });
+                try b.linef("ld.shared.b32 {s}, [{s}+{d}];", .{ af[mi * 4 + 3], r_asl, o + 528 });
+            }
         }
         var nj: usize = 0;
         while (nj < NT) : (nj += 1) {
             const o = nj * 512 + ks * 32;
-            try b.linef("ld.shared.b32 {s}, [{s}+{d}];", .{ bf[nj * 2 + 0], r_bsl, o });
-            try b.linef("ld.shared.b32 {s}, [{s}+{d}];", .{ bf[nj * 2 + 1], r_bsl, o + 16 });
+            if (use_ldmatrix) {
+                try b.linef("add.u32 {s}, {s}, {d};", .{ r_lda, r_bsl, o });
+                try b.linef("xor.b32 {s}, {s}, {s};", .{ r_lda, r_lda, r_lmask });
+                try b.linef("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {{{s}, {s}}}, [{s}];", .{
+                    bf[nj * 2 + 0], bf[nj * 2 + 1], r_lda,
+                });
+            } else {
+                try b.linef("ld.shared.b32 {s}, [{s}+{d}];", .{ bf[nj * 2 + 0], r_bsl, o });
+                try b.linef("ld.shared.b32 {s}, [{s}+{d}];", .{ bf[nj * 2 + 1], r_bsl, o + 16 });
+            }
         }
         mi = 0;
         while (mi < MT) : (mi += 1) {
@@ -2034,7 +2165,7 @@ pub const softmax_md_f16_ptx: [:0]const u8 =
 const gpa = std.heap.page_allocator;
 
 /// Which GEMM kernel a case exercises.
-const Kernel = enum { v0, smem, pipe };
+const Kernel = enum { v0, smem, pipe, pipe_lm };
 
 /// int8 IMMA GEMM validation (exact integer match vs a CPU reference) + timing.
 pub fn i8GemmTest(ctx: *Context, io: anytype, stdout: anytype) !void {
@@ -2050,18 +2181,28 @@ pub fn i8GemmTest(ctx: *Context, io: anytype, stdout: anytype) !void {
     var mod1 = try ctx.loadModule(smem_ptx);
     defer mod1.unload(ctx);
     const f_smem = try mod1.getFunction(ctx, "igemm_smem");
-    const pipe_ptx = try buildIgemmPipe(gpa, 64, false, 8);
+    const pipe_ptx = try buildIgemmPipe(gpa, 64, false, 8, false);
     defer gpa.free(pipe_ptx);
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = "/tmp/claude-1000/-dump-projects-zig-TensorPencil/eccfce6f-7c1f-4c32-b182-cc9c60d44a58/scratchpad/igemm_pipe.gen.ptx", .data = pipe_ptx }) catch {};
     var mod2 = try ctx.loadModule(pipe_ptx);
     defer mod2.unload(ctx);
     const f_pipe = try mod2.getFunction(ctx, "igemm_pipe");
+    // ldmatrix fragment-load variant (warp-cooperative frag loads; must stay
+    // bit-exact vs the plain ld.shared path — same math, different load path).
+    const pipe_lm_ptx = try buildIgemmPipe(gpa, 64, false, 8, true);
+    defer gpa.free(pipe_lm_ptx);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = "/tmp/claude-1000/-dump-projects-zig-TensorPencil/eccfce6f-7c1f-4c32-b182-cc9c60d44a58/scratchpad/igemm_pipe_lm.gen.ptx", .data = pipe_lm_ptx }) catch {};
+    var mod_lm = try ctx.loadModule(pipe_lm_ptx);
+    defer mod_lm.unload(ctx);
+    const f_pipe_lm = try mod_lm.getFunction(ctx, "igemm_pipe");
     {
         var rs: c_int = 0;
         var rp: c_int = 0;
+        var rl: c_int = 0;
         _ = ctx.api.cuFuncGetAttribute(&rs, cu.CU_FUNC_ATTRIBUTE_NUM_REGS, f_smem);
         _ = ctx.api.cuFuncGetAttribute(&rp, cu.CU_FUNC_ATTRIBUTE_NUM_REGS, f_pipe);
-        try stdout.print("regs/thread: smem={d} pipe={d}\n", .{ rs, rp });
+        _ = ctx.api.cuFuncGetAttribute(&rl, cu.CU_FUNC_ATTRIBUTE_NUM_REGS, f_pipe_lm);
+        try stdout.print("regs/thread: smem={d} pipe={d} pipe_lm={d}\n", .{ rs, rp, rl });
     }
 
     const Case = struct { m: usize, n: usize, k: usize, check: bool, kern: Kernel };
@@ -2074,12 +2215,19 @@ pub fn i8GemmTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         .{ .m = 128, .n = 128, .k = 64, .check = true, .kern = .pipe },
         .{ .m = 256, .n = 384, .k = 320, .check = true, .kern = .pipe },
         .{ .m = 128, .n = 256, .k = 6144, .check = true, .kern = .pipe },
+        .{ .m = 128, .n = 128, .k = 64, .check = true, .kern = .pipe_lm },
+        .{ .m = 256, .n = 384, .k = 320, .check = true, .kern = .pipe_lm },
+        .{ .m = 128, .n = 256, .k = 6144, .check = true, .kern = .pipe_lm },
         .{ .m = 4224, .n = 6144, .k = 6144, .check = false, .kern = .smem },
         .{ .m = 4224, .n = 6144, .k = 6144, .check = false, .kern = .pipe },
+        .{ .m = 4224, .n = 6144, .k = 6144, .check = false, .kern = .pipe_lm },
         .{ .m = 7680, .n = 6144, .k = 6144, .check = false, .kern = .smem }, // DiT qkv @1120x1680
         .{ .m = 7680, .n = 6144, .k = 6144, .check = false, .kern = .pipe },
+        .{ .m = 7680, .n = 6144, .k = 6144, .check = false, .kern = .pipe_lm },
         .{ .m = 7680, .n = 16384, .k = 6144, .check = false, .kern = .pipe }, // mlp gate/up
+        .{ .m = 7680, .n = 16384, .k = 6144, .check = false, .kern = .pipe_lm },
         .{ .m = 7680, .n = 6144, .k = 16384, .check = false, .kern = .pipe }, // mlp.down
+        .{ .m = 7680, .n = 6144, .k = 16384, .check = false, .kern = .pipe_lm },
     };
     var prng = std.Random.DefaultPrng.init(7);
     const rand = prng.random();
@@ -2118,14 +2266,15 @@ pub fn i8GemmTest(ctx: *Context, io: anytype, stdout: anytype) !void {
             .v0 => f_v0,
             .smem => f_smem,
             .pipe => f_pipe,
+            .pipe_lm => f_pipe_lm,
         };
         const grid: [3]u32 = switch (c.kern) {
             .v0 => .{ @intCast(n / 8), @intCast(m / 16), 1 },
-            .smem, .pipe => .{ @intCast(n / 128), @intCast(m / 128), 1 },
+            .smem, .pipe, .pipe_lm => .{ @intCast(n / 128), @intCast(m / 128), 1 },
         };
         const block: [3]u32 = switch (c.kern) {
             .v0 => .{ 32, 1, 1 },
-            .smem, .pipe => .{ 128, 1, 1 },
+            .smem, .pipe, .pipe_lm => .{ 128, 1, 1 },
         };
         const tag = @tagName(c.kern);
 
@@ -2253,7 +2402,7 @@ pub fn i4LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
 
     // Performant fused s4 GEMM (rescale folded into the C-store), the path
     // dit_cuda's opI4Gemm uses. Requires m%128, rows%128, cols%128.
-    const pipe_ptx = try buildIgemmPipe(gpa, 64, true, 4);
+    const pipe_ptx = try buildIgemmPipe(gpa, 64, true, 4, true);
     defer gpa.free(pipe_ptx);
     var gmod = try ctx.loadModule(pipe_ptx);
     defer gmod.unload(ctx);
@@ -2387,7 +2536,7 @@ pub fn i4LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
 pub fn i8LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
     const convrot = @import("../../ops/convrot.zig");
 
-    const pipe_ptx = try buildIgemmPipe(gpa, 64, false, 8);
+    const pipe_ptx = try buildIgemmPipe(gpa, 64, false, 8, true);
     defer gpa.free(pipe_ptx);
     var gmod = try ctx.loadModule(pipe_ptx);
     defer gmod.unload(ctx);
@@ -2399,7 +2548,7 @@ pub fn i8LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
 
     // Stage-A fused GEMM: rescale folded into the C-store (no s32 acc buffer,
     // no separate rescale pass), output f32 y directly.
-    const fused_ptx = try buildIgemmPipe(gpa, 64, true, 8);
+    const fused_ptx = try buildIgemmPipe(gpa, 64, true, 8, true);
     defer gpa.free(fused_ptx);
     var fmod = try ctx.loadModule(fused_ptx);
     defer fmod.unload(ctx);
@@ -2664,7 +2813,7 @@ fn f16val(u: u16) f32 {
 /// CPU references. Attention primitives on the hand-PTX backend.
 pub fn attnTest(ctx: *Context, io: anytype, stdout: anytype) !void {
     _ = io;
-    const hg_ptx = try buildHgemm(gpa, false, false, false, false);
+    const hg_ptx = try buildHgemm(gpa, false, false, false, false, true);
     defer gpa.free(hg_ptx);
     var hmod = try ctx.loadModule(hg_ptx);
     defer hmod.unload(ctx);
@@ -2675,7 +2824,7 @@ pub fn attnTest(ctx: *Context, io: anytype, stdout: anytype) !void {
     const f_sm = try smod.getFunction(ctx, "softmax_row");
 
     // f16-C batched hgemm (used for scores in the DiT attention path).
-    const hgc16_ptx = try buildHgemm(gpa, true, true, false, false);
+    const hgc16_ptx = try buildHgemm(gpa, true, true, false, false, true);
     defer gpa.free(hgc16_ptx);
     var hc16mod = try ctx.loadModule(hgc16_ptx);
     defer hc16mod.unload(ctx);
