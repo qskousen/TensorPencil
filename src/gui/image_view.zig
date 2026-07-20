@@ -134,6 +134,8 @@ fn renderForm(cfg: *const config.Config, engine: *diffuser.Diffuser, ready: bool
             .text = .{ .buffer = &prompt_buf },
             .multiline = true,
             .placeholder = "Describe the image…",
+            .scroll_horizontal = false,
+            .break_lines = true,
         }, .{ .expand = .horizontal, .min_size_content = .{ .h = 60 }, .max_size_content = .height(160) });
         te.deinit();
     }
@@ -143,7 +145,10 @@ fn renderForm(cfg: *const config.Config, engine: *diffuser.Diffuser, ready: bool
     {
         var te = dvui.textEntry(@src(), .{
             .text = .{ .buffer = &negative_buf },
+            .multiline = true,
             .placeholder = "things to avoid (needs CFG > 1)",
+            .scroll_horizontal = false,
+            .break_lines = true,
         }, .{ .expand = .horizontal, .min_size_content = .{ .h = 24 } });
         te.deinit();
     }
