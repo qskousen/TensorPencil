@@ -177,6 +177,7 @@ fn renderForm(cfg: *const config.Config, engine: *diffuser.Diffuser, ready: bool
         defer row.deinit();
         const generating = engine.busyNow() or engine.hasPending();
         if (generating) {
+            if (dvui.button(@src(), "Generate", .{}, .{ .gravity_y = 0.5 })) generate(cfg, engine);
             if (dvui.button(@src(), "Stop", .{}, .{ .gravity_y = 0.5 })) engine.cancelAll();
         } else if (!ready) {
             dvui.label(@src(), "Loading model…", .{}, .{ .gravity_y = 0.5 });
