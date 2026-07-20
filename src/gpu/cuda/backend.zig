@@ -22,6 +22,13 @@ const Context = ctxmod.Context;
 
 pub const Error = error{ CudaError, OutOfMemory, NoSuitableDevice, DeviceOutOfMemory };
 
+/// io/allocator-free env-var presence check (std.posix.getenv / std.os.environ
+/// are gone in 0.16; we link libc, so call getenv directly).
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+fn envSet(name: [*:0]const u8) bool {
+    return getenv(name) != null;
+}
+
 /// KV storage format of the flash-decode attention / KV store ops (mirrors
 /// llm.kv_cache.KvDtype; defined in elt.zig next to the kernels).
 pub const KvFmt = elt.KvFmt;
@@ -356,6 +363,13 @@ pub const Backend = struct {
     // steps/blocks/weights of the same shape — the expensive heuristic query
     // runs once, and the timed matmul is a pure enqueue.
     lt_plans: std.AutoHashMapUnmanaged(u64, LtPlan) = .empty,
+    // Warmup attribution (TP_WARMUP_PROFILE): wall time in cuBLASLt heuristic
+    // queries and cuDNN SDPA plan builds (first-touch per shape).
+    lt_heur_ns: u64 = 0,
+    lt_heur_count: u32 = 0,
+    sdpa_ns: u64 = 0,
+    sdpa_count: u32 = 0,
+    wt_stall_ns: u64 = 0, // main-thread time spun waiting for weight prefetch
     // int4 (W4A4) variants: prep quantizes to s4 and the GEMM is m16n8k64.s4.
     i4_prep_mods: std.AutoHashMapUnmanaged(usize, cu.CUfunction) = .empty,
     i4_prep_owned: std.ArrayListUnmanaged(ctxmod.Module) = .empty,
@@ -477,6 +491,17 @@ pub const Backend = struct {
     }
 
     pub fn deinit(self: *Backend) void {
+        if (envSet("TP_WARMUP_PROFILE")) {
+            std.debug.print(
+                "[warmup] ptx-jit/load {d:.2}s ({d} mods) · cuBLASLt heuristic {d:.2}s ({d} shapes) · cuDNN sdpa {d:.2}s ({d} plans) · HtoD {d:.2}GB · weight-prefetch stall {d:.2}s\n",
+                .{
+                    @as(f64, @floatFromInt(self.ctx.jit_ns)) / 1e9,     self.ctx.jit_count,
+                    @as(f64, @floatFromInt(self.lt_heur_ns)) / 1e9,     self.lt_heur_count,
+                    @as(f64, @floatFromInt(self.sdpa_ns)) / 1e9,        self.sdpa_count,
+                    @as(f64, @floatFromInt(self.ctx.htod_bytes)) / 1e9, @as(f64, @floatFromInt(self.wt_stall_ns)) / 1e9,
+                },
+            );
+        }
         if (self.libs) |*L| {
             var sit = self.sdpa_plans.valueIterator();
             while (sit.next()) |p| p.deinit(&L.dnn);
@@ -1239,7 +1264,9 @@ pub const Backend = struct {
             // map isn't mutated during the wait (single main thread), so `e` stays
             // valid — but we already copied what we need.
             if (gen != 0) {
+                const stall_t0 = ctxmod.monoNs();
                 while (self.pf_completed.load(.acquire) < gen) std.Thread.yield() catch {};
+                self.wt_stall_ns += ctxmod.monoNs() -% stall_t0;
             }
             if (ev) |x| self.ctx.computeWaitEvent(x) catch {};
             return db;
@@ -2145,7 +2172,10 @@ pub const Backend = struct {
 
         var results: [1]cublaslt.HeuristicResult = .{.{}};
         var count: c_int = 0;
+        const heur_t0 = ctxmod.monoNs();
         try self.ltCheck(lt.cublasLtMatmulAlgoGetHeuristic(L.lt_handle, desc, adesc, bdesc, ddesc, ddesc, pref, 1, &results, &count), "AlgoGetHeuristic");
+        self.lt_heur_ns += ctxmod.monoNs() -% heur_t0;
+        self.lt_heur_count += 1;
         if (count < 1) {
             std.debug.print("cuBLASLt: no {s} algo for n={d} m={d} k={d}\n", .{ @tagName(kind), n, m, k });
             return error.CudaError;
@@ -2733,7 +2763,10 @@ pub const Backend = struct {
         const key: u64 = (@as(u64, seq) << 24) | (@as(u64, n_heads) << 16) | (@as(u64, kv_heads) << 8) | @as(u64, hd / 8);
         if (self.sdpa_plans.get(key)) |p| return p;
         const L = &self.libs.?;
+        const sdpa_t0 = ctxmod.monoNs();
         const p = cudnn.SdpaPlan.build(&L.dnn, L.dnn_handle, 1, n_heads, kv_heads, seq, hd) catch return error.CudaError;
+        self.sdpa_ns += ctxmod.monoNs() -% sdpa_t0;
+        self.sdpa_count += 1;
         self.sdpa_plans.put(self.gpa, key, p) catch return error.OutOfMemory;
         return p;
     }

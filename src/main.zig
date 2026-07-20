@@ -1233,9 +1233,15 @@ fn cudaStreamTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []
     const out_str = try arena.alloc(f32, x.len);
     const budget: u64 = @intFromFloat(budget_gib * (1 << 30));
 
-    // Resident (no budget): warm-up + timed.
+    // COLD-LOAD (the real "step 1" cost): first forward after evict, budget=0 so
+    // the whole model pins in — this is the ~12 GB host->VRAM upload. SYNC pageable
+    // path first.
     be.budget_override = 0;
+    be.evictWeights();
+    const cold_sync_a = std.Io.Clock.real.now(io);
     try dit_cuda.forward(&model, be, &sess, &ws, io, arena, out_res, x, sigma, null);
+    const t_cold_sync = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - cold_sync_a.nanoseconds)) / 1e6;
+    // Resident timed (weights now loaded): steady per-step.
     var t_res: f64 = std.math.inf(f64);
     for (0..3) |_| {
         const a = std.Io.Clock.real.now(io);
@@ -1257,6 +1263,28 @@ fn cudaStreamTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []
     }
     be.budget_override = 0;
 
+    // Async staging-ring COLD-LOAD: bounded 512 MB pinned ring (NOT registerHost —
+    // no whole-file page-lock), weights read from the page-cache-backed mmap and
+    // DMA'd off the main thread with block-N+1-ahead prefetch overlapping block-N
+    // compute. "Lean on the mmap": cold reads fault from disk, warm reads hit page
+    // cache (reclaimable, never stalls). Watch RAM externally: VmLck must stay tiny
+    // (~512 MB), RSS/page-cache growth is fine. budget=0 pins all (like a real gen).
+    const out_astr = try arena.alloc(f32, x.len);
+    be.enableAsyncStreaming();
+    be.evictWeights();
+    be.budget_override = 0;
+    const cold_a_a = std.Io.Clock.real.now(io);
+    try dit_cuda.forward(&model, be, &sess, &ws, io, arena, out_astr, x, sigma, null);
+    const t_cold_async = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - cold_a_a.nanoseconds)) / 1e6;
+    var t_astr: f64 = std.math.inf(f64);
+    for (0..3) |_| {
+        const a = std.Io.Clock.real.now(io);
+        try dit_cuda.forward(&model, be, &sess, &ws, io, arena, out_astr, x, sigma, null);
+        const b = std.Io.Clock.real.now(io);
+        t_astr = @min(t_astr, @as(f64, @floatFromInt(b.nanoseconds - a.nanoseconds)) / 1e6);
+    }
+    be.budget_override = 0;
+
     var maxdiff: f32 = 0;
     var ndiff: usize = 0;
     for (out_res, out_str) |a, b| {
@@ -1264,10 +1292,15 @@ fn cudaStreamTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []
         if (d != 0) ndiff += 1;
         maxdiff = @max(maxdiff, d);
     }
-    try stdout.print("resident {d:.3} s/step, streamed {d:.3} s/step ({d:.1}% slower)\n", .{ t_res / 1000.0, t_str / 1000.0, (t_str / t_res - 1.0) * 100.0 });
-    try stdout.print("streamed vs resident: {d} / {d} elems differ, max abs diff {d}\n", .{ ndiff, out_res.len, maxdiff });
+    var andiff: usize = 0;
+    for (out_res, out_astr) |a, b| if (a != b) {
+        andiff += 1;
+    };
+    try stdout.print("COLD-LOAD (12GB host->VRAM): sync-pageable {d:.3} s  vs  async-staging-ring {d:.3} s ({d:.1}% of sync)\n", .{ t_cold_sync / 1000.0, t_cold_async / 1000.0, t_cold_async / t_cold_sync * 100.0 });
+    try stdout.print("resident {d:.3} s/step, streamed(sync) {d:.3} s/step ({d:.1}% slower), streamed(async-ring) {d:.3} s/step ({d:.1}% slower)\n", .{ t_res / 1000.0, t_str / 1000.0, (t_str / t_res - 1.0) * 100.0, t_astr / 1000.0, (t_astr / t_res - 1.0) * 100.0 });
+    try stdout.print("streamed vs resident: sync {d} / async {d} / {d} elems differ, max abs diff {d}\n", .{ ndiff, andiff, out_res.len, maxdiff });
     try stdout.flush();
-    if (ndiff != 0) return error.StreamMismatch; // must be bit-identical
+    if (ndiff != 0 or andiff != 0) return error.StreamMismatch; // must be bit-identical
     try stdout.print("cuda weight streaming OK (bit-identical)\n", .{});
 }
 

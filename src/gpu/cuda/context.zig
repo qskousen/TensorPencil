@@ -11,6 +11,13 @@ pub const MemTag = mem_tag.MemTag;
 
 pub const Error = error{ CudaError, OutOfMemory, DeviceOutOfMemory };
 
+/// Monotonic wall-clock nanoseconds (io-free; std.time.Timer is gone in 0.16).
+pub fn monoNs() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
 /// Pinned staging-ring depth (slots in flight for async weight uploads).
 const stage_slots = 4;
 
@@ -64,6 +71,12 @@ pub const Context = struct {
     cc_major: c_int = 0,
     cc_minor: c_int = 0,
     sm_count: c_int = 0,
+    // Warmup attribution (TP_WARMUP_PROFILE): wall time spent in PTX module
+    // JIT/load, summed across the run (all but step 1 hit the module cache).
+    jit_ns: u64 = 0,
+    jit_count: u32 = 0,
+    // Total host->device bytes enqueued (weight residency attribution).
+    htod_bytes: u64 = 0,
     shared_optin_max: c_int = 0, // bytes of opt-in dynamic shared per block
     shared_per_sm: c_int = 0,
     clock_khz: c_int = 0,
@@ -167,6 +180,7 @@ pub const Context = struct {
         _ = self.api.cuEventSynchronize(self.staging_ev[i]); // slot free (prev DMA done)
         const slot: [*]u8 = @ptrCast(self.staging[i].?);
         @memcpy(slot[0..data.len], data);
+        self.htod_bytes += data.len;
         try self.check(self.api.cuMemcpyHtoDAsync(buf.ptr, slot, data.len, self.xfer_stream), "cuMemcpyHtoDAsync");
         _ = self.api.cuEventRecord(self.staging_ev[i], self.xfer_stream); // slot reusable after this
         try self.check(self.api.cuEventRecord(ev, self.xfer_stream), "cuEventRecord(xfer)");
@@ -199,6 +213,7 @@ pub const Context = struct {
     /// staging. Records `ev` (weight ready) for the compute stream to wait on.
     pub fn uploadDirect(self: *Context, buf: Buffer, data: []const u8, ev: cu.CUevent) Error!void {
         std.debug.assert(data.len <= buf.bytes);
+        self.htod_bytes += data.len;
         try self.check(self.api.cuMemcpyHtoDAsync(buf.ptr, @ptrCast(data.ptr), data.len, self.xfer_stream), "cuMemcpyHtoDAsync(direct)");
         try self.check(self.api.cuEventRecord(ev, self.xfer_stream), "cuEventRecord(direct)");
     }
@@ -252,7 +267,10 @@ pub const Context = struct {
             @ptrFromInt(86), // sm_86
         };
         var mod: cu.CUmodule = null;
+        const t0 = monoNs();
         const r = self.api.cuModuleLoadDataEx(&mod, ptx_text.ptr, opts.len, &opts, &vals);
+        self.jit_ns += monoNs() -% t0;
+        self.jit_count += 1;
         self.jit_log_len = @intFromPtr(vals[3]);
         if (r != cu.CUDA_SUCCESS) {
             std.debug.print(
@@ -386,6 +404,7 @@ pub const Context = struct {
 
     pub fn upload(self: *Context, buf: Buffer, data: []const u8) Error!void {
         std.debug.assert(data.len <= buf.bytes);
+        self.htod_bytes += data.len;
         try self.check(self.api.cuMemcpyHtoD(buf.ptr, data.ptr, data.len), "cuMemcpyHtoD");
     }
 

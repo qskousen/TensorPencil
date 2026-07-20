@@ -364,6 +364,18 @@ pub const Session = struct {
         errdefer self.vae_st.deinit();
         self.vae = try wan_vae.Decoder.load(gpa, &self.vae_st);
         const t2 = std.Io.Clock.real.now(io).nanoseconds;
+
+        // Async weight streaming via a BOUNDED pinned staging ring (4×128 MB =
+        // 512 MB), NOT registerHost — we deliberately do NOT page-lock the ~12 GB
+        // checkpoints (that filled RAM and stalled the box). Weights are read from
+        // the page-cache-backed mmap (cold→disk, warm→RAM, always reclaimable) and
+        // DMA'd off the main thread, so dit_cuda's block-N+1-ahead prefetch
+        // overlaps block-N compute instead of a synchronous pageable copy per
+        // weight on first touch. Bounded by the existing pin_budget/eviction, so a
+        // tight --vram-budget still streams within VRAM bounds. Isolated
+        // (cuda-stream-test, DiT-only): cold-load 10.1s→2.4s (cold disk) /
+        // 2.8s→2.2s (warm), bit-identical, MemAvailable dropped only ~2 GB.
+        if (self.cu_be) |b| b.enableAsyncStreaming();
         try note(progress, "models loaded (encoder {d:.1}s, dit+vae {d:.1}s)\n", .{
             @as(f64, @floatFromInt(t1 - t0)) / 1e9, @as(f64, @floatFromInt(t2 - t1)) / 1e9,
         });
