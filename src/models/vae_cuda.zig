@@ -13,7 +13,7 @@
 
 const std = @import("std");
 const wan_vae = @import("wan_vae.zig");
-const cuda = @import("../gpu/cuda.zig");
+const cuda = @import("tp_gpu").cuda;
 
 const Backend = cuda.Backend;
 const Buf = cuda.backend.DeviceBuffer;

@@ -9,7 +9,7 @@
 
 const std = @import("std");
 const dit = @import("dit.zig");
-const gpu = @import("../gpu/context.zig");
+const gpu = @import("tp_gpu").context;
 
 const DiT = dit.DiT;
 
@@ -953,7 +953,7 @@ fn normBuf(ctx: *gpu.Context, weights: []const f32) !gpu.DeviceBuffer {
 test "gpu-resident forward matches comfyui fixture" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const safetensors = @import("../safetensors.zig");
+    const safetensors = @import("tp_core").safetensors;
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
     const dit_path = "models/diffusion_model/krea2CenterSemiraw_v10Fp8.safetensors";
     std.Io.Dir.cwd().access(io, dit_path, .{}) catch return error.SkipZigTest;

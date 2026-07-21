@@ -15,15 +15,16 @@
 
 const std = @import("std");
 const qwen3 = @import("qwen3.zig");
-const cuda = @import("../gpu/cuda.zig");
-const safetensors = @import("../safetensors.zig");
-const ops = @import("../ops.zig");
+const cuda = @import("tp_gpu").cuda;
+const safetensors = @import("tp_core").safetensors;
+const ops = @import("tp_ops");
 const spec = @import("../llm/spec.zig");
-const kvmod = @import("../llm/kv_cache.zig");
-const sample = @import("../llm/sample.zig");
+const spec_limits = @import("tp_core").spec_limits;
+const kvmod = @import("tp_core").kv_cache;
+const sample = @import("tp_core").sample;
 const transformer = @import("transformer.zig");
 const transformer_gpu = @import("transformer_gpu.zig");
-const residency = @import("residency.zig");
+const residency = @import("tp_runtime").residency;
 
 const Backend = cuda.Backend;
 const Buf = cuda.backend.DeviceBuffer;
@@ -198,7 +199,7 @@ pub const CudaLM = struct {
     tap_d: Buf = .{},
     taps_on: bool = false,
     /// Tree-verify state (enableTree, LLM_PLAN.md M8): batch K/V rows live
-    /// at rows [capacity, capacity + spec.max_tree_nodes) of the (enlarged)
+    /// at rows [capacity, capacity + spec_limits.max_tree_nodes) of the (enlarged)
     /// per-layer caches; TreeBufs holds positions/meta/logits/tap rows.
     tree: ?TreeBufs = null,
     /// Node count of the last stepAllTree (commitTreePath bound).
@@ -280,7 +281,7 @@ pub const CudaLM = struct {
         self.len = 0;
         // Activation buffers always cover a speculative verify batch; padded
         // GEMM buffers are 128-row anyway, so the floor is nearly free.
-        self.max_rows = @max(@max(first_seq, 1), spec.max_draft + 1);
+        self.max_rows = @max(@max(first_seq, 1), spec_limits.max_draft + 1);
         // RoPE table (and its sin offset, baked into captured graphs as a
         // kernel param) cover max_capacity so KV growth never touches them.
         self.sin_off = cap.max * half;
@@ -337,7 +338,7 @@ pub const CudaLM = struct {
     }
 
     /// Enable the tree-verify path (spec.generateTree): rebuilds the K/V
-    /// caches with spec.max_tree_nodes extra rows (the batch region — tree
+    /// caches with spec_limits.max_tree_nodes extra rows (the batch region — tree
     /// nodes cannot append linearly, sibling branches collide at the same
     /// position), grows the activation buffers to cover a full tree batch,
     /// and allocates the tree buffers. Call before any forward.
@@ -351,7 +352,7 @@ pub const CudaLM = struct {
         // The batch region sits at rows [capacity, capacity + max_tree_nodes)
         // — capacity is baked into the layout, so tree sessions stay fixed.
         std.debug.assert(self.capacity == self.max_capacity);
-        const kv_bytes = (self.capacity + spec.max_tree_nodes) * c.kvDim() * 4;
+        const kv_bytes = (self.capacity + spec_limits.max_tree_nodes) * c.kvDim() * 4;
         var nk: [qwen3.Config.max_layers]Growable = undefined;
         var nv: [qwen3.Config.max_layers]Growable = undefined;
         var created: usize = 0;
@@ -368,11 +369,11 @@ pub const CudaLM = struct {
         }
         var tb = try TreeBufs.init(be, c);
         errdefer tb.deinit(be);
-        if (self.max_rows < spec.max_tree_nodes) {
-            const bufs = try LmBufs.init(be, spec.max_tree_nodes, c);
+        if (self.max_rows < spec_limits.max_tree_nodes) {
+            const bufs = try LmBufs.init(be, spec_limits.max_tree_nodes, c);
             self.bufs.deinit(be);
             self.bufs = bufs;
-            self.max_rows = spec.max_tree_nodes;
+            self.max_rows = spec_limits.max_tree_nodes;
         }
         for (self.k_cache[0..c.n_layers]) |*b| be.growableDestroy(b);
         for (self.v_cache[0..c.n_layers]) |*b| be.growableDestroy(b);
@@ -654,7 +655,7 @@ pub const CudaLM = struct {
 
     /// step, but with vocab logits for every new token ([ids.len, vocab]
     /// row-major) — the speculative-decode verify forward. The batch is
-    /// engine-capped at spec.max_draft + 1, which max_rows always covers.
+    /// engine-capped at spec_limits.max_draft + 1, which max_rows always covers.
     pub fn stepAll(self: *CudaLM, io: std.Io, ids: []const u32, logits: []f32) !void {
         self.io = io; // the CPU half of a hybrid split runs host matmuls through it
         std.debug.assert(logits.len == ids.len * qwen3.vocab_size);
@@ -668,7 +669,7 @@ pub const CudaLM = struct {
     fn forwardAll(self: *CudaLM, ids: []const u32) !void {
         const be = self.be;
         const seq = ids.len;
-        std.debug.assert(seq > 0 and seq <= spec.max_draft + 1 and seq <= self.max_rows);
+        std.debug.assert(seq > 0 and seq <= spec_limits.max_draft + 1 and seq <= self.max_rows);
         const b = &self.bufs;
         try self.layersForward(ids);
         errdefer if (be.batching()) be.abortBatch();
@@ -1018,7 +1019,7 @@ pub const CudaLM = struct {
         const gpa = self.gpa;
         const n = tokens.len;
         std.debug.assert(self.tree != null);
-        std.debug.assert(n >= 1 and n <= spec.max_tree_nodes and n <= self.max_rows);
+        std.debug.assert(n >= 1 and n <= spec_limits.max_tree_nodes and n <= self.max_rows);
         std.debug.assert(parents.len == n and logits.len == n * qwen3.vocab_size);
         const tb = &self.tree.?;
         const b = &self.bufs;
@@ -1026,8 +1027,8 @@ pub const CudaLM = struct {
         // Host: depth-based positions + the attention meta table (per-query
         // kv_len, then the ancestor NODE indices in depth order — the split
         // kernel adds the batch-region base itself).
-        var pos: [spec.max_tree_nodes]u32 = undefined;
-        var depth: [spec.max_tree_nodes]u32 = undefined;
+        var pos: [spec_limits.max_tree_nodes]u32 = undefined;
+        var depth: [spec_limits.max_tree_nodes]u32 = undefined;
         pos[0] = @intCast(self.len);
         depth[0] = 0;
         for (parents[1..], 1..) |p, i| {
@@ -1036,7 +1037,7 @@ pub const CudaLM = struct {
             pos[i] = pos[0] + depth[i];
             std.debug.assert(pos[i] < self.capacity);
         }
-        var meta: [spec.max_tree_nodes * (spec.max_tree_nodes + 1)]u32 = undefined;
+        var meta: [spec_limits.max_tree_nodes * (spec_limits.max_tree_nodes + 1)]u32 = undefined;
         for (0..n) |i| {
             meta[i * (n + 1)] = @intCast(self.len + depth[i] + 1);
             var j: u32 = @intCast(i);
@@ -1065,7 +1066,7 @@ pub const CudaLM = struct {
             self.prefetchLayer(l + 1); // == layers.len prefetches the LM head
             if (self.taps_on) {
                 for (self.tap_layers, 0..) |tl, j| {
-                    if (l == tl) try be.opCopyOff(tb.taps, j * spec.max_tree_nodes * c.hidden, b.x, 0, n * c.hidden);
+                    if (l == tl) try be.opCopyOff(tb.taps, j * spec_limits.max_tree_nodes * c.hidden, b.x, 0, n * c.hidden);
                 }
             }
             // --- Attention ---
@@ -1124,7 +1125,7 @@ pub const CudaLM = struct {
             const tb = &self.tree.?;
             for (0..3) |t| {
                 for (path, 0..) |idx, j| {
-                    try be.opCopyOff(self.tap_d, (t * self.capacity + self.len + j) * c.hidden, tb.taps, (t * spec.max_tree_nodes + idx) * c.hidden, c.hidden);
+                    try be.opCopyOff(self.tap_d, (t * self.capacity + self.len + j) * c.hidden, tb.taps, (t * spec_limits.max_tree_nodes + idx) * c.hidden, c.hidden);
                 }
             }
         }
@@ -1159,7 +1160,7 @@ pub const CudaLM = struct {
     }
 
     /// `stepArgmax` with sampling penalties scattered onto the device logits
-    /// first (opPenalize; see llm/sample.zig) — keeps penalized greedy decode
+    /// first (opPenalize; see sample.zig) — keeps penalized greedy decode
     /// on the GPU path instead of the full-vocab download.
     pub fn stepArgmaxPen(self: *CudaLM, io: std.Io, ids: []const u32, pen: []const sample.PenaltyEntry, sp: sample.Params) !u32 {
         self.io = io; // the CPU half of a hybrid split runs host matmuls through it
@@ -1500,7 +1501,7 @@ pub const CudaLM = struct {
         const be = self.be;
         if (w.dtype.isBlockQuant()) {
             // GGUF quants: fused GEMV for decode. For small batches (speculative
-            // verify — always <= spec.max_draft+1 = 17 — and short prefills), the
+            // verify — always <= spec_limits.max_draft+1 = 17 — and short prefills), the
             // grouped dp4a GEMV streams each weight ceil(seq/8)x: measured 5-20x
             // faster than the dequant-to-f16 GEMM below the crossover (qgemv-bench
             // on the 3090, ~n=40). Every block-quant (q4_k/q5_k/q6_k/q8_0) now has
@@ -1577,12 +1578,12 @@ pub const CudaLM = struct {
     /// instead of the GEMM + square-attention prefill path: covers every
     /// speculative verify batch, and ceil(seq/4) fused weight reads stay
     /// well below the GEMM's ~5x dequant-scratch traffic.
-    const gemv_batch_max = spec.max_draft + 1;
+    const gemv_batch_max = spec_limits.max_draft + 1;
 
     /// q5_k/q6_k batches at or below this take the grouped dp4a GEMV instead of
     /// opMatmulQuant's dequant-to-f16 GEMM. Measured crossover (qgemv-bench,
     /// 3090): ~48 rows q5_k, ~35 q6_k; 40 matches qwen35's grouped_prefill_max
-    /// and covers every speculative-verify batch (<= spec.max_draft + 1 = 17).
+    /// and covers every speculative-verify batch (<= spec_limits.max_draft + 1 = 17).
     const grouped_gemv_max = 40;
 
     /// KV chunks per head in the decode attention split pass (one warp each:
@@ -1638,7 +1639,7 @@ const LmBufs = struct {
             rp * c.intermediate * 4, // up
             rp * c.hidden * 4, // t
             @max(CudaLM.gemv_batch_max * CudaLM.nsplit, rows * CudaLM.nsplit_prefill) * c.n_heads * (hd + 4) * 4, // attn_scratch (verify batch at nsplit; f16 prefill chunks at nsplit_prefill)
-            (spec.max_draft + 1) * qwen3.vocab_size * 4, // logits (verify writes a row per position)
+            (spec_limits.max_draft + 1) * qwen3.vocab_size * 4, // logits (verify writes a row per position)
             4096 * 4, // argmax_v (>= opArgmax lane count)
             4096 * 4, // argmax_i
             4, // argmax_out (1 id)
@@ -1670,7 +1671,7 @@ const TreeBufs = struct {
     taps: Buf, // [3][max_tree_nodes][hidden] residual entering each tap layer
 
     fn init(be: *Backend, c: qwen3.Config) !TreeBufs {
-        const m = spec.max_tree_nodes;
+        const m = spec_limits.max_tree_nodes;
         var self: TreeBufs = undefined;
         var created: usize = 0;
         errdefer inline for (fields, 0..) |name, i| {
@@ -1708,7 +1709,7 @@ test "cuda tree spec matches vanilla greedy on the real model" {
     const io = std.testing.io;
     const engine = @import("../llm/engine.zig");
     const chat = @import("../llm/chat.zig");
-    const tokenizer_mod = @import("../tokenizer.zig");
+    const tokenizer_mod = @import("tp_core").tokenizer;
     const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
     std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
@@ -1760,7 +1761,7 @@ test "cuda weight streaming matches resident greedy on the real model" {
     const io = std.testing.io;
     const engine = @import("../llm/engine.zig");
     const chat = @import("../llm/chat.zig");
-    const tokenizer_mod = @import("../tokenizer.zig");
+    const tokenizer_mod = @import("tp_core").tokenizer;
     const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
     std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
@@ -1816,7 +1817,7 @@ fn cpuSplitGenerateBody(kv_dtype: kvmod.KvDtype) !void {
     const io = std.testing.io;
     const engine = @import("../llm/engine.zig");
     const chat = @import("../llm/chat.zig");
-    const tokenizer_mod = @import("../tokenizer.zig");
+    const tokenizer_mod = @import("tp_core").tokenizer;
     const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
     std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
@@ -1968,7 +1969,7 @@ test "cuda gui turn lifecycle: prefill, checkpoint rollback, residency reset" {
     const io = std.testing.io;
     const engine = @import("../llm/engine.zig");
     const chat = @import("../llm/chat.zig");
-    const tokenizer_mod = @import("../tokenizer.zig");
+    const tokenizer_mod = @import("tp_core").tokenizer;
     const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
     std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;

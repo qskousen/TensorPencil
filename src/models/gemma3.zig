@@ -24,13 +24,13 @@
 //! inside the GEMM; the Gguf mapping must outlive the model.
 
 const std = @import("std");
-const gguf_mod = @import("../gguf.zig");
-const weights_mod = @import("../weights.zig");
+const gguf_mod = @import("tp_core").gguf;
+const weights_mod = @import("tp_core").weights;
 const qwen3 = @import("qwen3.zig");
-const ops = @import("../ops.zig");
+const ops = @import("tp_ops");
 const loader = @import("loader.zig");
 const transformer = @import("transformer.zig");
-const kv_cache_mod = @import("../llm/kv_cache.zig");
+const kv_cache_mod = @import("tp_core").kv_cache;
 
 const Gguf = gguf_mod.Gguf;
 const WeightStore = weights_mod.WeightStore;

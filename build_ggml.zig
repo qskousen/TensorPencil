@@ -1,6 +1,10 @@
 const std = @import("std");
 
-const ggml_root = thisDir() ++ "/vendor/ggml";
+// Source paths are relative to the ggml package root. The package is supplied
+// as a fetched dependency (see build.zig.zon `.ggml`, formerly a git submodule
+// under vendor/ggml), so all files are resolved via `ggml_dep.path(...)` — this
+// keeps the build working for external consumers who obtain us through
+// `zig fetch` (git submodules are not fetched by the Zig package manager).
 
 // ── Compiler flag arrays ─────────────────────────────────────────────────────
 
@@ -50,64 +54,64 @@ const x86_ggml_defines = [_][]const u8{
 const x86_c_flags   = base_c_flags   ++ x86_isa_flags ++ x86_ggml_defines;
 const x86_cpp_flags = base_cpp_flags ++ x86_isa_flags ++ x86_ggml_defines;
 
-// ── Source file lists ────────────────────────────────────────────────────────
+// ── Source file lists (relative to the ggml package root) ────────────────────
 
 // Group 1 — ggml-base: pure logic, no SIMD
 const base_c_sources = [_][]const u8{
-    ggml_root ++ "/src/ggml.c",
-    ggml_root ++ "/src/ggml-alloc.c",
-    ggml_root ++ "/src/ggml-quants.c",
+    "src/ggml.c",
+    "src/ggml-alloc.c",
+    "src/ggml-quants.c",
 };
 const base_cpp_sources = [_][]const u8{
-    ggml_root ++ "/src/ggml.cpp",
-    ggml_root ++ "/src/ggml-backend.cpp",
+    "src/ggml.cpp",
+    "src/ggml-backend.cpp",
     // Added in recent ggml: the "meta" backend buffer (deferred/no-alloc tensor
     // contexts) referenced by ggml-backend.cpp / ggml-alloc.c.
-    ggml_root ++ "/src/ggml-backend-meta.cpp",
-    ggml_root ++ "/src/ggml-opt.cpp",
-    ggml_root ++ "/src/ggml-threading.cpp",
-    ggml_root ++ "/src/gguf.cpp",
+    "src/ggml-backend-meta.cpp",
+    "src/ggml-opt.cpp",
+    "src/ggml-threading.cpp",
+    "src/gguf.cpp",
 };
 
 // Group 2 — ggml-backend-reg: needs C++ exceptions, no SIMD
 // Intentionally separate so we never pass -fno-exceptions to it.
 const reg_cpp_sources = [_][]const u8{
-    ggml_root ++ "/src/ggml-backend-reg.cpp",
+    "src/ggml-backend-reg.cpp",
 };
 
 // Group 3 — ggml-cpu: shared CPU kernel files (get SIMD flags on x86)
 const cpu_c_sources = [_][]const u8{
-    ggml_root ++ "/src/ggml-cpu/ggml-cpu.c",
-    ggml_root ++ "/src/ggml-cpu/quants.c",
+    "src/ggml-cpu/ggml-cpu.c",
+    "src/ggml-cpu/quants.c",
 };
 const cpu_cpp_sources = [_][]const u8{
-    ggml_root ++ "/src/ggml-cpu/ggml-cpu.cpp",
-    ggml_root ++ "/src/ggml-cpu/repack.cpp",
-    ggml_root ++ "/src/ggml-cpu/hbm.cpp",
-    ggml_root ++ "/src/ggml-cpu/traits.cpp",
-    ggml_root ++ "/src/ggml-cpu/binary-ops.cpp",
-    ggml_root ++ "/src/ggml-cpu/unary-ops.cpp",
-    ggml_root ++ "/src/ggml-cpu/vec.cpp",
-    ggml_root ++ "/src/ggml-cpu/ops.cpp",
+    "src/ggml-cpu/ggml-cpu.cpp",
+    "src/ggml-cpu/repack.cpp",
+    "src/ggml-cpu/hbm.cpp",
+    "src/ggml-cpu/traits.cpp",
+    "src/ggml-cpu/binary-ops.cpp",
+    "src/ggml-cpu/unary-ops.cpp",
+    "src/ggml-cpu/vec.cpp",
+    "src/ggml-cpu/ops.cpp",
     // AMX files compile fine without AMX flags — they just won't activate.
     // Include them so the symbol table is complete on x86 builds.
-    ggml_root ++ "/src/ggml-cpu/amx/amx.cpp",
-    ggml_root ++ "/src/ggml-cpu/amx/mmq.cpp",
+    "src/ggml-cpu/amx/amx.cpp",
+    "src/ggml-cpu/amx/mmq.cpp",
 };
 
 // Group 3 — arch-specific CPU sources
 const cpu_x86_c_sources = [_][]const u8{
-    ggml_root ++ "/src/ggml-cpu/arch/x86/quants.c",
+    "src/ggml-cpu/arch/x86/quants.c",
 };
 const cpu_x86_cpp_sources = [_][]const u8{
-    ggml_root ++ "/src/ggml-cpu/arch/x86/repack.cpp",
+    "src/ggml-cpu/arch/x86/repack.cpp",
 };
 
 const cpu_arm_c_sources = [_][]const u8{
-    ggml_root ++ "/src/ggml-cpu/arch/arm/quants.c",
+    "src/ggml-cpu/arch/arm/quants.c",
 };
 const cpu_arm_cpp_sources = [_][]const u8{
-    ggml_root ++ "/src/ggml-cpu/arch/arm/repack.cpp",
+    "src/ggml-cpu/arch/arm/repack.cpp",
 };
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -118,17 +122,19 @@ pub fn link(
     exe: *std.Build.Step.Compile,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    ggml_dep: *std.Build.Dependency,
 ) void {
-    const lib = buildLib(b, target, optimize);
+    const lib = buildLib(b, target, optimize, ggml_dep);
     exe.root_module.linkLibrary(lib);
 }
 
-/// Build and return the static GGML library.
+/// Build and return the static GGML library from the fetched `ggml_dep`.
 /// Use this if you need to inspect or further configure the library step.
 pub fn buildLib(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    ggml_dep: *std.Build.Dependency,
 ) *std.Build.Step.Compile {
     const lib = b.addLibrary(.{
         .name = "ggml",
@@ -140,28 +146,28 @@ pub fn buildLib(
         }),
     });
 
-    addSources(b, lib, target);
+    addSources(lib, target, ggml_dep);
     return lib;
 }
 
 // ── Internal implementation ──────────────────────────────────────────────────
 
 fn addSources(
-    b: *std.Build,
     lib: *std.Build.Step.Compile,
     target: std.Build.ResolvedTarget,
+    ggml_dep: *std.Build.Dependency,
 ) void {
     const arch = target.result.cpu.arch;
     const os   = target.result.os.tag;
     const is_x86 = arch == .x86_64 or arch == .x86;
     const is_arm = arch == .aarch64;
 
-    // Include paths
-    lib.root_module.addIncludePath(b.path(ggml_root ++ "/include"));
-    lib.root_module.addIncludePath(b.path(ggml_root ++ "/src"));
-    lib.root_module.addIncludePath(b.path(ggml_root ++ "/src/ggml-cpu"));
+    // Include paths (into the fetched ggml package).
+    lib.root_module.addIncludePath(ggml_dep.path("include"));
+    lib.root_module.addIncludePath(ggml_dep.path("src"));
+    lib.root_module.addIncludePath(ggml_dep.path("src/ggml-cpu"));
 
-    // Platform macros — use defineCMacro rather than -D flags to avoid
+    // Platform macros — use addCMacro rather than -D flags to avoid
     // the "macro redefined" warning from Zig's built-in definitions.
     switch (os) {
         .linux   => lib.root_module.addCMacro("_GNU_SOURCE",            ""),
@@ -184,30 +190,32 @@ fn addSources(
     // All C++ files need libc++ (satisfies exception/RTTI runtime symbols,
     // including the SEH glue on Windows that was causing link errors).
 
+    const addC = struct {
+        fn f(l: *std.Build.Step.Compile, dep: *std.Build.Dependency, files: []const []const u8, flags: []const []const u8) void {
+            for (files) |sub| l.root_module.addCSourceFile(.{ .file = dep.path(sub), .flags = flags });
+        }
+    }.f;
+
     // ── Group 1: ggml-base (no SIMD) ────────────────────────────────────────
-    for (base_c_sources)   |f| lib.root_module.addCSourceFile(.{ .file = b.path(f), .flags = &base_c_flags });
-    for (base_cpp_sources) |f| lib.root_module.addCSourceFile(.{ .file = b.path(f), .flags = &base_cpp_flags });
+    addC(lib, ggml_dep, &base_c_sources,   &base_c_flags);
+    addC(lib, ggml_dep, &base_cpp_sources, &base_cpp_flags);
 
     // ── Group 2: backend registry (C++ exceptions required, no SIMD) ────────
-    for (reg_cpp_sources)  |f| lib.root_module.addCSourceFile(.{ .file = b.path(f), .flags = &base_cpp_flags });
+    addC(lib, ggml_dep, &reg_cpp_sources, &base_cpp_flags);
 
     // ── Group 3: CPU backend (SIMD flags on x86) ────────────────────────────
     const c_flags_cpu   = if (is_x86) &x86_c_flags   else &base_c_flags;
     const cpp_flags_cpu = if (is_x86) &x86_cpp_flags  else &base_cpp_flags;
 
-    for (cpu_c_sources)   |f| lib.root_module.addCSourceFile(.{ .file = b.path(f), .flags = c_flags_cpu });
-    for (cpu_cpp_sources) |f| lib.root_module.addCSourceFile(.{ .file = b.path(f), .flags = cpp_flags_cpu });
+    addC(lib, ggml_dep, &cpu_c_sources,   c_flags_cpu);
+    addC(lib, ggml_dep, &cpu_cpp_sources, cpp_flags_cpu);
 
     // Arch-specific sources
     if (is_x86) {
-        for (cpu_x86_c_sources)   |f| lib.root_module.addCSourceFile(.{ .file = b.path(f), .flags = &x86_c_flags });
-        for (cpu_x86_cpp_sources) |f| lib.root_module.addCSourceFile(.{ .file = b.path(f), .flags = &x86_cpp_flags });
+        addC(lib, ggml_dep, &cpu_x86_c_sources,   &x86_c_flags);
+        addC(lib, ggml_dep, &cpu_x86_cpp_sources, &x86_cpp_flags);
     } else if (is_arm) {
-        for (cpu_arm_c_sources)   |f| lib.root_module.addCSourceFile(.{ .file = b.path(f), .flags = &base_c_flags });
-        for (cpu_arm_cpp_sources) |f| lib.root_module.addCSourceFile(.{ .file = b.path(f), .flags = &base_cpp_flags });
+        addC(lib, ggml_dep, &cpu_arm_c_sources,   &base_c_flags);
+        addC(lib, ggml_dep, &cpu_arm_cpp_sources, &base_cpp_flags);
     }
-}
-
-fn thisDir() []const u8 {
-    return std.fs.path.dirname(@src().file) orelse ".";
 }

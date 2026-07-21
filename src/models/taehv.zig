@@ -9,7 +9,7 @@
 //! latent (no scaling for taew2_1); output is [0,1] → RGB8. Architecture read
 //! from ComfyUI comfy/taesd/taehv.py + the taew2_1 checkpoint keys.
 const std = @import("std");
-const safetensors = @import("../safetensors.zig");
+const safetensors = @import("tp_core").safetensors;
 const wan_vae = @import("wan_vae.zig");
 
 const SafeTensors = safetensors.SafeTensors;
@@ -177,7 +177,7 @@ fn loadSub(a: std.mem.Allocator, st: *const SafeTensors, base: usize, sub: []con
 }
 
 test "firstNOutput keeps the Weight length invariant for the TGrow slice" {
-    const ops = @import("../ops.zig");
+    const ops = @import("tp_ops");
     const Weight = ops.matmul.Weight;
     // A 1x1 conv with 2n output channels (stride-2 tgrow), ci = n = 3.
     const n = 3;

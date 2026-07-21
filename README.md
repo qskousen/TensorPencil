@@ -54,11 +54,7 @@ Plans for the future:
 
 Requires Zig 0.16.0 and `libvips`.
 
-The GGUF loading code uses ggml, as a submodule. Make sure you've checked out with submodules:
-
-```
-git submodule update --init --recursive
-```
+The GGUF loading code uses ggml, as a dependency. It will be fetched automatically on compile.
 
 Backends other than `cpu` require additional runtime libraries:
 

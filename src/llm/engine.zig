@@ -4,12 +4,12 @@
 const std = @import("std");
 const qwen3 = @import("../models/qwen3.zig");
 const test_gate = @import("../test_gate.zig");
-const tokenizer_mod = @import("../tokenizer.zig");
-const ops = @import("../ops.zig");
+const tokenizer_mod = @import("tp_core").tokenizer;
+const ops = @import("tp_ops");
 const chat = @import("chat.zig");
-const sample = @import("sample.zig");
+const sample = @import("tp_core").sample;
 const spec = @import("spec.zig");
-const kv_cache_mod = @import("kv_cache.zig");
+const kv_cache_mod = @import("tp_core").kv_cache;
 
 const Tokenizer = tokenizer_mod.Tokenizer;
 const KvCache = kv_cache_mod.KvCache;
@@ -526,7 +526,7 @@ test "utf8 prefix scanner" {
 test "multi-turn generation continues the cache" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const safetensors = @import("../safetensors.zig");
+    const safetensors = @import("tp_core").safetensors;
     const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     try test_gate.requireModelFile(io, te_path);
 
@@ -566,7 +566,7 @@ test "multi-turn generation continues the cache" {
 test "generation with a growing cache matches fixed capacity" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const safetensors = @import("../safetensors.zig");
+    const safetensors = @import("tp_core").safetensors;
     const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     try test_gate.requireModelFile(io, te_path);
 
@@ -604,7 +604,7 @@ test "generation with a growing cache matches fixed capacity" {
 test "greedy generation produces valid tokens" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const safetensors = @import("../safetensors.zig");
+    const safetensors = @import("tp_core").safetensors;
     const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     try test_gate.requireModelFile(io, te_path);
 

@@ -3,10 +3,10 @@
 
 pub const chat = @import("llm/chat.zig");
 pub const repl = @import("llm/repl.zig");
-pub const sample = @import("llm/sample.zig");
+pub const sample = @import("tp_core").sample;
 pub const engine = @import("llm/engine.zig");
 pub const spec = @import("llm/spec.zig");
-pub const kv_cache = @import("llm/kv_cache.zig");
+pub const kv_cache = @import("tp_core").kv_cache;
 pub const session = @import("llm/session.zig");
 
 test {

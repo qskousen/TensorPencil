@@ -221,8 +221,10 @@ Plus `im2col`, dtype-pad converts, `dequant_*_f16`, rope/norm/act kernels.
 **cuDNN** (`src/gpu/cuda/cudnn.zig`): fused SDPA-forward attention (prefill), legacy conv-forward (VAE).
 Everything else (decode GEMV, convrot prep, elementwise, RoPE, GDN) stays hand-PTX.
 
-### cpu — `src/ops/*.zig` + ggml (`vendor/ggml`, always-on)
+### cpu — `src/ops/*.zig` + ggml (fetched dep, optional `-Dggml`, default on)
 `matmul.zig` (dtype-aware microkernel; block-quant decode GEMV → ggml `vec_dot`) · `attention.zig`
 (+`attentionTree`) · `norm.zig` · `act.zig` (`silu`/`geluTanh`/`sigmoid` + `*Mul`) · `rope.zig` ·
 `convrot.zig` · `vmath.zig` (SIMD `expVec`). ggml owns CPU block-quant dequant + decode `vec_dot`;
 everything else (GGUF parse, f16/bf16/fp8 conversion, GEMM threading, convrot, tokenizer, sampling) is in-house Zig.
+With `-Dggml=false`, ggml is not fetched/linked and block-quant (q4_0/q8_0/q4_k/q5_k/q6_k) is unavailable
+(`matmul` → `error.QuantBackendUnavailable`); all other dtypes and backends are unaffected.

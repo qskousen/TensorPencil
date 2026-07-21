@@ -1,7 +1,7 @@
 //! Model implementations (text encoder, DiT, VAE).
 
 pub const loader = @import("models/loader.zig");
-pub const residency = @import("models/residency.zig");
+pub const residency = @import("tp_runtime").residency;
 pub const transformer = @import("models/transformer.zig");
 pub const transformer_gpu = @import("models/transformer_gpu.zig");
 pub const wan_vae = @import("models/wan_vae.zig");
@@ -68,4 +68,7 @@ test {
     _ = dit;
     _ = dit_gpu;
     _ = dit_cuda;
+    // Device test relocated out of the gpu backend (it needs both tp_gpu and a
+    // model CPU reference); lives here in the model tier.
+    _ = @import("models/vit35_gpu_test.zig");
 }

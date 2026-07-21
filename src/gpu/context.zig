@@ -14,9 +14,9 @@ const build_options = @import("build_options");
 pub const vk = @import("vk.zig");
 const spv = @import("spv.zig");
 const coopmat = @import("coopmat.zig");
-const convrot = @import("../ops/convrot.zig");
+const convrot = @import("tp_ops").convrot;
 const mem_tag = @import("mem_tag.zig");
-const sample = @import("../llm/sample.zig");
+const sample = @import("tp_core").sample;
 pub const MemTag = mem_tag.MemTag;
 
 const matmul_f8_spv = @embedFile("matmul_f8_spv");
@@ -2010,7 +2010,7 @@ pub const Context = struct {
     /// weight is uploaded raw (row-major blocks) via weightBufferRaw.
     pub fn opGemvQuant(
         self: *Context,
-        dt: @import("../dtype.zig").DType,
+        dt: @import("tp_core").dtype.DType,
         y: DeviceBuffer,
         y_off: usize,
         x: DeviceBuffer,
@@ -2045,7 +2045,7 @@ pub const Context = struct {
     /// Output is bit-close to opGemvQuant (only the reduction is chunked).
     pub fn opGemvQuantT(
         self: *Context,
-        dt: @import("../dtype.zig").DType,
+        dt: @import("tp_core").dtype.DType,
         y: DeviceBuffer,
         y_off: usize,
         x: DeviceBuffer,
@@ -2989,7 +2989,7 @@ pub const Context = struct {
     /// the `topk_lanes * topk_m` candidates and does exact top-k on the CPU (a
     /// few KB vs the ~608 KB vocab). Caller owns out_val/out_idx (>= that many
     /// f32 each). Returns the candidate count written. No download here.
-    /// Apply the sampling penalties (llm/sample.zig penalizeLogit) to the
+    /// Apply the sampling penalties (sample.zig penalizeLogit) to the
     /// resident logits before an on-device argmax/top-k: uploads the tiny
     /// (id, subtract) f32 wire and scatters one thread per unique recent
     /// token. Same formula as the CPU applyPenalties (division is subject to
@@ -3551,8 +3551,8 @@ test "gpu block-quant gemv matches cpu reference" {
     std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
     var ctx = Context.init(gpa) catch return error.SkipZigTest;
     defer ctx.deinit();
-    const dtypes = @import("../dtype.zig");
-    const quants = @import("../quants.zig");
+    const dtypes = @import("tp_core").dtype;
+    const quants = @import("tp_core").quants;
 
     const rows = 64;
     const cols = 512; // two 256-elem super-blocks: exercises the shared scale table
@@ -3684,7 +3684,7 @@ test "gpu matmul matches cpu reference" {
 
     // fp8 weights with scale, cooperative-matrix path (fused e4m3 decode).
     if (ctx.pipe_coop != .null_handle) {
-        const dtypes = @import("../dtype.zig");
+        const dtypes = @import("tp_core").dtype;
         const cm = 100;
         const m_pad = 128;
         const crows = 256;
@@ -3894,7 +3894,7 @@ test "gpu matmul matches cpu reference" {
 
     // fp8 weights with scale.
     {
-        const dtypes = @import("../dtype.zig");
+        const dtypes = @import("tp_core").dtype;
         const wbytes = try gpa.alloc(u8, rows * cols);
         defer gpa.free(wbytes);
         for (wbytes) |*b| b.* = rand.int(u8) & 0x7e;
@@ -4122,7 +4122,7 @@ test "vulkan q8_0 KV: kv_store_q8_0 matches host packing, attention matches refe
     std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
     var ctx = Context.init(gpa) catch return error.SkipZigTest;
     defer ctx.deinit();
-    const kvmod = @import("../llm/kv_cache.zig");
+    const kvmod = @import("tp_core").kv_cache;
 
     const n_heads = 4;
     const n_kv = 2;

@@ -18,14 +18,14 @@
 //! dequantized inside the GEMM; the safetensors mapping must outlive this.
 
 const std = @import("std");
-const safetensors = @import("../safetensors.zig");
+const safetensors = @import("tp_core").safetensors;
 const test_gate = @import("../test_gate.zig");
-const gguf_mod = @import("../gguf.zig");
-const weights_mod = @import("../weights.zig");
-const dtypes = @import("../dtype.zig");
-const ops = @import("../ops.zig");
+const gguf_mod = @import("tp_core").gguf;
+const weights_mod = @import("tp_core").weights;
+const dtypes = @import("tp_core").dtype;
+const ops = @import("tp_ops");
 const transformer = @import("transformer.zig");
-const kv_cache_mod = @import("../llm/kv_cache.zig");
+const kv_cache_mod = @import("tp_core").kv_cache;
 
 const SafeTensors = safetensors.SafeTensors;
 const WeightStore = weights_mod.WeightStore;
@@ -657,7 +657,7 @@ test "krea2 conditioning matches comfyui" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const krea2_text = @import("krea2_text.zig");
-    const tokenizer_mod = @import("../tokenizer.zig");
+    const tokenizer_mod = @import("tp_core").tokenizer;
     const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     try test_gate.requireModelFile(io, te_path);
     std.Io.Dir.cwd().access(io, "testdata/text_cond.bin", .{}) catch return error.SkipZigTest;

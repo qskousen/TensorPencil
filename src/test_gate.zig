@@ -9,7 +9,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const cuda = @import("gpu/cuda.zig");
+const cuda = @import("tp_gpu").cuda;
 
 /// Skip the calling test unless the integration suite is enabled.
 pub fn requireIntegration() error{SkipZigTest}!void {

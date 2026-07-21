@@ -14,7 +14,7 @@
 const std = @import("std");
 const wan_vae = @import("wan_vae.zig");
 const taehv = @import("taehv.zig");
-const gpu_context = @import("../gpu/context.zig");
+const gpu_context = @import("tp_gpu").context;
 
 const Context = gpu_context.Context;
 const DeviceBuffer = gpu_context.DeviceBuffer;

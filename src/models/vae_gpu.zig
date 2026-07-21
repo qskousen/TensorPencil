@@ -19,8 +19,8 @@
 
 const std = @import("std");
 const wan_vae = @import("wan_vae.zig");
-const ops = @import("../ops.zig");
-const gpu_context = @import("../gpu/context.zig");
+const ops = @import("tp_ops");
+const gpu_context = @import("tp_gpu").context;
 
 const Context = gpu_context.Context;
 const DeviceBuffer = gpu_context.DeviceBuffer;
@@ -516,7 +516,7 @@ test "gpu decode matches comfyui reference" {
         if (try file.readPositionalAll(io, bytes, 0) != bytes.len) return error.ShortRead;
     }
 
-    var st = try @import("../safetensors.zig").SafeTensors.open(gpa, io, vae_path);
+    var st = try @import("tp_core").safetensors.SafeTensors.open(gpa, io, vae_path);
     defer st.deinit();
     var dec = try wan_vae.Decoder.load(gpa, &st);
     defer dec.deinit();

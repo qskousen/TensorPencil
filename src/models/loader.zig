@@ -6,8 +6,8 @@
 //! shims over these, so call sites read naturally and only the logic is shared.
 
 const std = @import("std");
-const weights = @import("../weights.zig");
-const ops = @import("../ops.zig");
+const weights = @import("tp_core").weights;
+const ops = @import("tp_ops");
 
 const WeightStore = weights.WeightStore;
 const Weight = ops.matmul.Weight;
@@ -59,7 +59,7 @@ pub fn indexedVector(
 
 // --- tests -----------------------------------------------------------------
 
-const safetensors = @import("../safetensors.zig");
+const safetensors = @import("tp_core").safetensors;
 
 // A tiny in-memory safetensors: matrix "w" [2,2]={1,2,3,4} and vector
 // "layers.3.b" [2]={5,6}. The file buffer must outlive the SafeTensors (views

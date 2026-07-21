@@ -12,11 +12,11 @@
 //! delegated to the `driver`, so all model/eagle type references stay in the CLI.
 
 const std = @import("std");
-const cuda = @import("../gpu/cuda.zig");
-const gpu_context = @import("../gpu/context.zig");
-const kv_cache = @import("kv_cache.zig");
+const cuda = @import("tp_gpu").cuda;
+const gpu_context = @import("tp_gpu").context;
+const kv_cache = @import("tp_core").kv_cache;
 const chat = @import("chat.zig");
-const tokenizer = @import("../tokenizer.zig");
+const tokenizer = @import("tp_core").tokenizer;
 
 /// `--vram-budget min`: hold only the in-flight weights. The budget is a soft
 /// ceiling (a single weight larger than it still uploads while physical VRAM

@@ -15,23 +15,21 @@
 const std = @import("std");
 const qwen3 = @import("../models/qwen3.zig");
 const test_gate = @import("../test_gate.zig");
-const tokenizer_mod = @import("../tokenizer.zig");
+const tokenizer_mod = @import("tp_core").tokenizer;
 const engine = @import("engine.zig");
 const chat = @import("chat.zig");
-const sample = @import("sample.zig");
+const sample = @import("tp_core").sample;
+const spec_limits = @import("tp_core").spec_limits;
 
 const Tokenizer = tokenizer_mod.Tokenizer;
 
-/// Hard cap on drafted tokens per verify forward (draft buffers are
-/// stack-allocated; opts.spec_k is clamped to this).
-pub const max_draft = 16;
-
-/// Hard cap on tree-verify nodes (root + drafted branches, LLM_PLAN.md M8);
-/// opts.tree_nodes is clamped to this and backend tree buffers are sized for
-/// it. Note that verify batches beyond max_draft + 1 rows leave the grouped-
-/// GEMV regime on the GPU backends (correct and lossless, but the GEMM
-/// path's reduction order is no longer bitwise-identical to decode).
-pub const max_tree_nodes = 64;
+/// Speculative-decode size caps. Defined at the core level
+/// (`src/spec_limits.zig`) so model backends can size their K/V + verify
+/// buffers from them without importing this driver (which depends upward on the
+/// generation engine); re-exported here so `spec.max_draft` /
+/// `spec.max_tree_nodes` keep working.
+pub const max_draft = spec_limits.max_draft;
+pub const max_tree_nodes = spec_limits.max_tree_nodes;
 
 pub const Stats = struct {
     /// Tokens proposed by the drafter.
@@ -1075,7 +1073,7 @@ test "model drafter is byte-identical and re-syncs after rejections" {
 test "spec matches vanilla greedy on the real model" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const safetensors = @import("../safetensors.zig");
+    const safetensors = @import("tp_core").safetensors;
     const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     try test_gate.requireModelFile(io, te_path);
 
@@ -1122,7 +1120,7 @@ test "spec matches vanilla greedy on the real model" {
 test "tree spec matches vanilla greedy on the real model" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const safetensors = @import("../safetensors.zig");
+    const safetensors = @import("tp_core").safetensors;
     const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     try test_gate.requireModelFile(io, te_path);
 
@@ -1168,7 +1166,7 @@ test "tree spec matches vanilla greedy on the real model" {
 test "model drafter matches vanilla greedy on the real models" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const safetensors = @import("../safetensors.zig");
+    const safetensors = @import("tp_core").safetensors;
     const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     const draft_path = "models/text_encoders/qwen_3_06b_base.safetensors";
     try test_gate.requireModelFile(io, te_path);

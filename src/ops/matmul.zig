@@ -7,24 +7,50 @@
 //! `std.Io.Group` tasks; accumulation is f32 SIMD.
 
 const std = @import("std");
-const dtypes = @import("../dtype.zig");
-const quants = @import("../quants.zig");
+const dtypes = @import("tp_core").dtype;
+const quants = @import("tp_core").quants;
 const convrot_mod = @import("convrot.zig");
-const gpu_context = @import("../gpu/context.zig");
-const ggml = @import("ggml");
-const prof = @import("../prof.zig");
+const prof = @import("tp_core").prof;
+
+/// Whether ggml (the GGUF block-quant CPU backend) was linked (`-Dggml`).
+/// When false, block-quant weights return `error.QuantBackendUnavailable`.
+const have_ggml = quants.have_ggml;
 
 const DType = dtypes.DType;
 
-/// When set (pipeline --gpu), large f8/f32 GEMMs are dispatched to Vulkan.
-/// Single-threaded use only — the pipeline runs matmuls sequentially.
-pub var gpu: ?*gpu_context.Context = null;
+/// GPU GEMM dispatch, injected by the pipeline. Dependency injection keeps this
+/// CPU-ops layer from importing the GPU backend: the pipeline sets `gpu_dispatch`
+/// (pipeline --gpu) and large f8/f32 GEMMs are routed to the device via
+/// `call(ctx, ...)`. Single-threaded use only — the pipeline runs matmuls
+/// sequentially.
+pub const GpuDispatch = struct {
+    /// Opaque device backend (e.g. a `*gpu.Context`); passed back to `call`.
+    ctx: *anyopaque,
+    /// Runs y[m, rows] = x[m, cols] @ W^T (+bias) on the device. `dtype_f8`
+    /// selects the fp8-e4m3 weight path (else f32). Mirrors gpu `Context.matmul`;
+    /// `anyerror` erases the backend's error set so this layer stays agnostic.
+    call: *const fn (
+        ctx: *anyopaque,
+        y: []f32,
+        x: []const f32,
+        m: usize,
+        w_bytes: []const u8,
+        dtype_f8: bool,
+        rows: usize,
+        cols: usize,
+        scale: f32,
+        bias: ?[]const f32,
+    ) anyerror!void,
+};
+
+/// Injected by the pipeline; null = CPU only.
+pub var gpu_dispatch: ?GpuDispatch = null;
 
 /// Minimum FLOP count before the GPU path is worth the PCIe round trip.
 pub var gpu_min_flops: usize = 1 << 31;
 
 fn gpuEligible(m: usize, w: Weight) bool {
-    if (gpu == null) return false;
+    if (gpu_dispatch == null) return false;
     if (w.dtype != .f8_e4m3 and w.dtype != .f32) return false;
     return 2 * m * w.rows * w.cols >= gpu_min_flops;
 }
@@ -72,7 +98,7 @@ pub const Weight = struct {
     }
 };
 
-pub const Error = error{ UnsupportedDType, OutOfMemory } || std.Io.Cancelable;
+pub const Error = error{ UnsupportedDType, QuantBackendUnavailable, OutOfMemory } || std.Io.Cancelable;
 
 /// y[m, w.rows] = x[m, w.cols] @ w^T + bias.
 pub fn matmul(
@@ -92,8 +118,13 @@ pub fn matmul(
     switch (w.dtype) {
         .f8_e4m3, .bf16, .f16, .f32, .i8, .i4 => {},
         .q4_0, .q8_0, .q4_k, .q5_k, .q6_k => {
-            // ggml rows are whole blocks; block-aligned k-slicing depends on it.
-            std.debug.assert(w.cols % w.dtype.blockElems() == 0);
+            if (have_ggml) {
+                // ggml rows are whole blocks; block-aligned k-slicing depends on it.
+                std.debug.assert(w.cols % w.dtype.blockElems() == 0);
+            } else {
+                // Built with -Dggml=false: block-quant has no CPU backend.
+                return error.QuantBackendUnavailable;
+            }
         },
         else => return error.UnsupportedDType,
     }
@@ -102,12 +133,13 @@ pub fn matmul(
     if (m == 0 or w.rows == 0) return;
 
     if (gpuEligible(m, w)) {
-        if (gpu.?.matmul(y, x, m, w.bytes, w.dtype == .f8_e4m3, w.rows, w.cols, w.scale, bias)) |_| {
+        const gd = gpu_dispatch.?;
+        if (gd.call(gd.ctx, y, x, m, w.bytes, w.dtype == .f8_e4m3, w.rows, w.cols, w.scale, bias)) |_| {
             return;
         } else |err| {
             // Fall back to CPU once and stop routing.
             std.log.warn("gpu matmul failed ({t}); falling back to cpu", .{err});
-            gpu = null;
+            gpu_dispatch = null;
         }
     }
 
@@ -116,7 +148,13 @@ pub fn matmul(
     // Decode (small m) block-quant GEMV → ggml's AVX2 quant vec_dot, which is
     // memory-bound (~30x faster than our Zig dequant/int8 kernels). Non-block-
     // quant small-m falls through to the threaded runRange path below.
-    if (w.dtype.isBlockQuant()) return ggmlQuantGemv(io, w.dtype, y, x, m, w.bytes, w.rows, w.cols, bias);
+    if (w.dtype.isBlockQuant()) {
+        if (have_ggml) {
+            return ggml_gemv.quantGemv(io, w.dtype, y, x, m, w.bytes, w.rows, w.cols, bias);
+        } else {
+            return error.QuantBackendUnavailable;
+        }
+    }
 
     // Small problems are not worth the fork/join overhead.
     const flops = 2 * m * w.rows * w.cols;
@@ -184,67 +222,75 @@ fn matmulPacked(
     try group.await(io);
 }
 
-const GemvJob = struct {
-    vd: ggml.c.ggml_vec_dot_t,
-    y: []f32,
-    vy: []const u8,
-    w: []const u8,
-    m: usize,
-    rows: usize,
-    cols: usize,
-    row_bytes: usize,
-    vy_bytes: usize,
-    bias: ?[]const f32,
-};
+// Small-m block-quant GEMV via ggml's AVX2 vec_dot. Behind `have_ggml`: without
+// ggml, block-quant weights are rejected in matmul() (error.QuantBackendUnavailable)
+// long before reaching here, so this collapses to an empty struct and the
+// `@import("ggml")` is never analyzed.
+const ggml_gemv = if (have_ggml) struct {
+    const ggml = @import("ggml");
 
-/// Dot weight rows [r0, r1) against the (shared, pre-quantized) activation.
-fn ggmlGemvRows(j: GemvJob, r0: usize, r1: usize) void {
-    for (r0..r1) |r| {
-        const wrow = j.w.ptr + r * j.row_bytes;
-        for (0..j.m) |t| {
-            var s: f32 = 0;
-            j.vd.?(@intCast(j.cols), &s, 0, wrow, 0, j.vy.ptr + t * j.vy_bytes, 0, 1);
-            if (j.bias) |b| s += b[r];
-            j.y[t * j.rows + r] = s;
+    const GemvJob = struct {
+        vd: ggml.c.ggml_vec_dot_t,
+        y: []f32,
+        vy: []const u8,
+        w: []const u8,
+        m: usize,
+        rows: usize,
+        cols: usize,
+        row_bytes: usize,
+        vy_bytes: usize,
+        bias: ?[]const f32,
+    };
+
+    /// Dot weight rows [r0, r1) against the (shared, pre-quantized) activation.
+    fn gemvRows(j: GemvJob, r0: usize, r1: usize) void {
+        for (r0..r1) |r| {
+            const wrow = j.w.ptr + r * j.row_bytes;
+            for (0..j.m) |t| {
+                var s: f32 = 0;
+                j.vd.?(@intCast(j.cols), &s, 0, wrow, 0, j.vy.ptr + t * j.vy_bytes, 0, 1);
+                if (j.bias) |b| s += b[r];
+                j.y[t * j.rows + r] = s;
+            }
         }
     }
-}
 
-/// Decode-path (small m) block-quant GEMV via ggml's AVX2 vec_dot:
-/// y[m*rows] = W[rows*cols] (`dt`) · x[m*cols] + bias. Quantizes each activation
-/// column once to ggml's vec_dot_type (Q8_K for k-quants), then dots every weight
-/// row — threaded over row chunks: a single ggml vec_dot saturates one core, but
-/// the full model's weights exceed single-core memory bandwidth, so splitting
-/// rows across cores pulls more aggregate DRAM bandwidth.
-fn ggmlQuantGemv(io: std.Io, dt: DType, y: []f32, x: []const f32, m: usize, w_bytes: []const u8, rows: usize, cols: usize, bias: ?[]const f32) Error!void {
-    quants.ensureGgmlInit();
-    const gtype = quants.ggmlType(dt) orelse unreachable; // isBlockQuant gate covers all mapped types
-    const wt = ggml.c.ggml_get_type_traits_cpu(gtype);
-    const vdt = wt.*.vec_dot_type;
-    const from_float = ggml.c.ggml_get_type_traits_cpu(vdt).*.from_float.?;
+    /// Decode-path (small m) block-quant GEMV via ggml's AVX2 vec_dot:
+    /// y[m*rows] = W[rows*cols] (`dt`) · x[m*cols] + bias. Quantizes each activation
+    /// column once to ggml's vec_dot_type (Q8_K for k-quants), then dots every weight
+    /// row — threaded over row chunks: a single ggml vec_dot saturates one core, but
+    /// the full model's weights exceed single-core memory bandwidth, so splitting
+    /// rows across cores pulls more aggregate DRAM bandwidth.
+    pub fn quantGemv(io: std.Io, dt: DType, y: []f32, x: []const f32, m: usize, w_bytes: []const u8, rows: usize, cols: usize, bias: ?[]const f32) Error!void {
+        quants.ensureGgmlInit();
+        const gtype = quants.ggmlType(dt) orelse unreachable; // isBlockQuant gate covers all mapped types
+        const wt = ggml.c.ggml_get_type_traits_cpu(gtype);
+        const vdt = wt.*.vec_dot_type;
+        const from_float = ggml.c.ggml_get_type_traits_cpu(vdt).*.from_float.?;
 
-    const row_bytes: usize = @intCast(ggml.c.ggml_row_size(gtype, @intCast(cols)));
-    const vy_bytes: usize = @intCast(ggml.c.ggml_row_size(vdt, @intCast(cols)));
+        const row_bytes: usize = @intCast(ggml.c.ggml_row_size(gtype, @intCast(cols)));
+        const vy_bytes: usize = @intCast(ggml.c.ggml_row_size(vdt, @intCast(cols)));
 
-    const alloc = std.heap.c_allocator;
-    const vy = alloc.alloc(u8, m * vy_bytes) catch @panic("ggmlQuantGemv: OOM");
-    defer alloc.free(vy);
-    for (0..m) |t| from_float(x.ptr + t * cols, vy.ptr + t * vy_bytes, @intCast(cols));
+        const alloc = std.heap.c_allocator;
+        const vy = alloc.alloc(u8, m * vy_bytes) catch @panic("ggmlQuantGemv: OOM");
+        defer alloc.free(vy);
+        for (0..m) |t| from_float(x.ptr + t * cols, vy.ptr + t * vy_bytes, @intCast(cols));
 
-    const job = GemvJob{ .vd = wt.*.vec_dot, .y = y, .vy = vy, .w = w_bytes, .m = m, .rows = rows, .cols = cols, .row_bytes = row_bytes, .vy_bytes = vy_bytes, .bias = bias };
-    const n_threads = std.Thread.getCpuCount() catch 1;
-    const want: usize = if (n_threads == 1 or rows < 128) 1 else n_threads;
-    if (want == 1) return ggmlGemvRows(job, 0, rows);
+        const job = GemvJob{ .vd = wt.*.vec_dot, .y = y, .vy = vy, .w = w_bytes, .m = m, .rows = rows, .cols = cols, .row_bytes = row_bytes, .vy_bytes = vy_bytes, .bias = bias };
+        const n_threads = std.Thread.getCpuCount() catch 1;
+        const want: usize = if (n_threads == 1 or rows < 128) 1 else n_threads;
+        if (want == 1) return gemvRows(job, 0, rows);
 
-    const chunk = std.math.divCeil(usize, rows, want) catch unreachable;
-    var group: std.Io.Group = .init;
-    defer group.cancel(io);
-    var r: usize = 0;
-    while (r < rows) : (r += chunk) {
-        group.async(io, ggmlGemvRows, .{ job, r, @min(r + chunk, rows) });
+        const chunk = std.math.divCeil(usize, rows, want) catch unreachable;
+        var group: std.Io.Group = .init;
+        defer group.cancel(io);
+        var r: usize = 0;
+        while (r < rows) : (r += chunk) {
+            group.async(io, gemvRows, .{ job, r, @min(r + chunk, rows) });
+        }
+        try group.await(io);
     }
-    try group.await(io);
-}
+} else struct {};
 
 fn packedTask(
     y: []f32,
@@ -967,7 +1013,8 @@ test "matmul i4 convrot packed path" {
 /// scales, decoded to f32 by quants.zig for the naive reference — exercises
 /// the block dequant plumbing in both the small-m and packed paths.
 fn testBlockQuantAgainstNaive(m: usize, rows: usize, cols: usize, dt: DType, with_bias: bool) !void {
-    const quants_mod = @import("../quants.zig");
+    if (!have_ggml) return error.SkipZigTest; // block-quant needs the ggml backend
+    const quants_mod = @import("tp_core").quants;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var prng = std.Random.DefaultPrng.init(7);

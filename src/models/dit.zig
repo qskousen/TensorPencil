@@ -14,8 +14,8 @@
 //! safetensors mapping must outlive the model.
 
 const std = @import("std");
-const safetensors = @import("../safetensors.zig");
-const ops = @import("../ops.zig");
+const safetensors = @import("tp_core").safetensors;
+const ops = @import("tp_ops");
 
 const SafeTensors = safetensors.SafeTensors;
 const Weight = ops.matmul.Weight;

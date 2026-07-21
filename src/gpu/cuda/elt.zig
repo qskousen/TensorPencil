@@ -4337,7 +4337,7 @@ pub const topk_reduce_ptx: [:0]const u8 =
     \\}
 ;
 
-/// Sampling penalties (llm/sample.zig penalizeLogit), one thread per unique
+/// Sampling penalties (sample.zig penalizeLogit), one thread per unique
 /// recent token: logits[id] = (l>0 ? l/rp : l*rp) - sub, with the presence +
 /// frequency subtract term `sub` precomputed on the host (packPenaltyWireU32).
 /// b0=logits, b1=wire (interleaved u32 pairs: id, f32-bits sub). u0=entry

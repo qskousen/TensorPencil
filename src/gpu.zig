@@ -4,6 +4,7 @@
 pub const vk = @import("gpu/vk.zig");
 pub const spv = @import("gpu/spv.zig");
 pub const context = @import("gpu/context.zig");
+pub const mem_tag = @import("gpu/mem_tag.zig");
 pub const Context = context.Context;
 
 /// Experimental CUDA Driver-API backend (pure Zig: dlopen'd libcuda + hand-

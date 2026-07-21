@@ -17,10 +17,10 @@
 //! No deepstack (the Qwen3.6 mmproj flags none) and no window attention.
 
 const std = @import("std");
-const gguf_mod = @import("../gguf.zig");
+const gguf_mod = @import("tp_core").gguf;
 const test_gate = @import("../test_gate.zig");
-const weights_mod = @import("../weights.zig");
-const ops = @import("../ops.zig");
+const weights_mod = @import("tp_core").weights;
+const ops = @import("tp_ops");
 const loader = @import("loader.zig");
 
 const Gguf = gguf_mod.Gguf;

@@ -16,9 +16,9 @@
 //! (embeddings are NOT multiplied by sqrt(hidden)) at sequential positions.
 
 const std = @import("std");
-const gguf_mod = @import("../gguf.zig");
-const weights_mod = @import("../weights.zig");
-const ops = @import("../ops.zig");
+const gguf_mod = @import("tp_core").gguf;
+const weights_mod = @import("tp_core").weights;
+const ops = @import("tp_ops");
 const loader = @import("loader.zig");
 
 const Gguf = gguf_mod.Gguf;

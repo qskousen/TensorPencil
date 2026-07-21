@@ -4,7 +4,7 @@
 //! Pipeline: split out special tokens -> pretokenize (hand-rolled scanner for
 //! the fixed Qwen2 regex, using generated Unicode tables) -> byte-level BPE
 //! over vocab.json/merges.txt. The vocab and merges are embedded in the
-//! binary from src/assets/qwen_tokenizer/.
+//! binary from src/core/assets/qwen_tokenizer/.
 
 const std = @import("std");
 const tables = @import("unicode_tables.zig");

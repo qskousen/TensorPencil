@@ -14,11 +14,12 @@
 
 const std = @import("std");
 const qwen3 = @import("qwen3.zig");
-const gpu = @import("../gpu/context.zig");
-const safetensors = @import("../safetensors.zig");
-const ops = @import("../ops.zig");
+const gpu = @import("tp_gpu").context;
+const safetensors = @import("tp_core").safetensors;
+const ops = @import("tp_ops");
 const spec = @import("../llm/spec.zig");
-const sample = @import("../llm/sample.zig");
+const spec_limits = @import("tp_core").spec_limits;
+const sample = @import("tp_core").sample;
 const transformer = @import("transformer.zig");
 const transformer_gpu = @import("transformer_gpu.zig");
 
@@ -194,7 +195,7 @@ pub fn encode(enc: *const qwen3.TextEncoder, ctx: *gpu.Context, io: std.Io, gpa:
 /// Map a weight's storage dtype to the dense-GEMV weight code. Only fp8 / bf16
 /// / f32 reach the Vulkan GEMV path (qwen3 rejects block-quant on vulkan); bf16
 /// is read natively (no widening) via the 2-byte transpose + GEMV bf16 branch.
-fn wcode(dt: @import("../dtype.zig").DType) gpu.WCode {
+fn wcode(dt: @import("tp_core").dtype.DType) gpu.WCode {
     return switch (dt) {
         .f8_e4m3 => .f8,
         .bf16 => .bf16,
@@ -315,7 +316,7 @@ pub const VulkanLM = struct {
     /// batched flash-decoding): every speculative verify batch, and the
     /// chunk size for follow-up (pos0 > 0) prefills — which previously went
     /// token-by-token because the square attention kernel is pos0=0-only.
-    const gemv_batch_max = spec.max_draft + 1;
+    const gemv_batch_max = spec_limits.max_draft + 1;
     /// Interleaved chunks per row in the 3-pass rmsnorm.
     const rms_chunks = 64;
     /// Interleaved k chunks per output column in the decode GEMV.
@@ -424,7 +425,7 @@ pub const VulkanLM = struct {
 
     /// step, but with vocab logits for every new token ([ids.len, vocab]
     /// row-major) — the speculative-decode verify forward. The batch is
-    /// engine-capped at spec.max_draft + 1.
+    /// engine-capped at spec_limits.max_draft + 1.
     pub fn stepAll(self: *VulkanLM, io: std.Io, ids: []const u32, logits: []f32) !void {
         _ = io;
         const ctx = self.ctx;
@@ -506,7 +507,7 @@ pub const VulkanLM = struct {
     }
 
     /// `stepArgmax` with sampling penalties scattered onto the device logits
-    /// first (opPenalize; see llm/sample.zig) — keeps penalized greedy decode
+    /// first (opPenalize; see sample.zig) — keeps penalized greedy decode
     /// on the GPU path instead of the full-vocab download.
     pub fn stepArgmaxPen(self: *VulkanLM, io: std.Io, ids: []const u32, pen: []const sample.PenaltyEntry, sp: sample.Params) !u32 {
         var off: usize = 0;
@@ -901,7 +902,7 @@ test "gpu encode matches cpu encode" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const krea2_text = @import("krea2_text.zig");
-    const tokenizer_mod = @import("../tokenizer.zig");
+    const tokenizer_mod = @import("tp_core").tokenizer;
     const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
     std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
@@ -947,7 +948,7 @@ test "gpu encode matches cpu encode" {
 test "vulkan spec decode matches vanilla greedy" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const tokenizer_mod = @import("../tokenizer.zig");
+    const tokenizer_mod = @import("tp_core").tokenizer;
     const chat = @import("../llm/chat.zig");
     const engine = @import("../llm/engine.zig");
     const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
@@ -1002,7 +1003,7 @@ test "vulkan spec decode matches vanilla greedy" {
 test "vulkan bf16 prefill argmax matches cpu" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const tokenizer_mod = @import("../tokenizer.zig");
+    const tokenizer_mod = @import("tp_core").tokenizer;
     const chat = @import("../llm/chat.zig");
     const engine = @import("../llm/engine.zig");
     const path = "models/text_encoders/qwen3_4b_instruct.safetensors";

@@ -12,7 +12,7 @@
 //! matching transformers' behavior with special tokens left unescaped.
 
 const std = @import("std");
-const tokenizer_mod = @import("../tokenizer.zig");
+const tokenizer_mod = @import("tp_core").tokenizer;
 
 const Tokenizer = tokenizer_mod.Tokenizer;
 
@@ -437,7 +437,7 @@ test "openAssistant primes an empty reasoning block only when thinking is off" {
 test "gemma turn building matches whole-template tokenization" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const gguf_mod = @import("../gguf.zig");
+    const gguf_mod = @import("tp_core").gguf;
     const path = "/home/qt/genai/lmstudio/models/mradermacher/Gemma-3-Starshine-12B-Alt-GGUF/Gemma-3-Starshine-12B-Alt.Q4_K_M.gguf";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
 

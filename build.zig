@@ -84,33 +84,104 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .link_libc = true,
     });
-    // Reachable as @embedFile("matmul_f8_spv") etc. from within the module.
-    for (kernel_names, kernel_objs) |kname, obj| {
-        mod.addAnonymousImport(b.fmt("{s}_spv", .{kname}), .{ .root_source_file = obj.getEmittedBin() });
-    }
 
-    // ggml (llama.cpp tensor lib, vendor/ggml submodule) is a first-class
-    // dependency: its AVX2 CPU quant kernels are ~30x faster than our Zig ones,
-    // so the library uses them directly (@import("ggml")). Built once with the
-    // fast flags (build_ggml.zig) at ReleaseFast and linked into every artifact.
-    // `linkGgml` attaches the lib + libc++ to a Compile's root module; do this
-    // for anything that transitively uses the TensorPencil module.
-    const ggml_lib = ggml_build.buildLib(b, target, .ReleaseFast);
-    const ggml_mod = b.createModule(.{
-        .root_source_file = b.path("src/ggml.zig"),
+    // tp_core: the foundational primitive layer (src/core/), its own module so
+    // consumers can depend on it in isolation. The umbrella `mod` and every
+    // higher layer import it by name as "tp_core". ggml + build_options get
+    // wired into it below (quants needs both).
+    const core_mod = b.addModule("tp_core", .{
+        .root_source_file = b.path("src/core/core.zig"),
         .target = target,
-        .optimize = optimize,
         .link_libc = true,
     });
-    ggml_mod.addIncludePath(b.path("vendor/ggml/include"));
-    mod.addImport("ggml", ggml_mod);
-    const linkGgml = struct {
-        fn f(m: *std.Build.Module, lib: *std.Build.Step.Compile) void {
-            m.linkLibrary(lib);
-            m.link_libcpp = true;
+    mod.addImport("tp_core", core_mod);
+
+    // tp_ops: CPU numeric kernels (src/ops/), depends on tp_core. Its own module
+    // so consumers can pull the ops layer without the GPU/model layers. ggml is
+    // wired below (matmul's block-quant GEMV).
+    const ops_mod = b.addModule("tp_ops", .{
+        .root_source_file = b.path("src/ops.zig"),
+        .target = target,
+        .link_libc = true,
+    });
+    ops_mod.addImport("tp_core", core_mod);
+    mod.addImport("tp_ops", ops_mod);
+
+    // tp_gpu: GPU backends (Vulkan loader + Zig SPIR-V kernels, CUDA driver-API
+    // PTX; src/gpu/). Depends on tp_core + tp_ops. The SPIR-V kernel blobs are
+    // embedded here (reachable as @embedFile("matmul_f8_spv") from gpu/context).
+    // build_options is wired below.
+    const gpu_mod = b.addModule("tp_gpu", .{
+        .root_source_file = b.path("src/gpu.zig"),
+        .target = target,
+        .link_libc = true,
+    });
+    gpu_mod.addImport("tp_core", core_mod);
+    gpu_mod.addImport("tp_ops", ops_mod);
+    for (kernel_names, kernel_objs) |kname, obj| {
+        gpu_mod.addAnonymousImport(b.fmt("{s}_spv", .{kname}), .{ .root_source_file = obj.getEmittedBin() });
+    }
+    mod.addImport("tp_gpu", gpu_mod);
+
+    // tp_runtime: the offload/scheduling tier (VRAM arbiter + residency planner;
+    // src/runtime/). Pure std — no dependency on the other layers.
+    const runtime_mod = b.addModule("tp_runtime", .{
+        .root_source_file = b.path("src/runtime/runtime.zig"),
+        .target = target,
+        .link_libc = true,
+    });
+    mod.addImport("tp_runtime", runtime_mod);
+
+    // tp_models: the model tier — NN architectures (src/models/) plus the LLM
+    // generation machinery (src/llm/) that drives them, in one module because
+    // they are mutually recursive. Depends on all lower layers. build_options is
+    // wired below (its test_gate).
+    const models_mod = b.addModule("tp_models", .{
+        .root_source_file = b.path("src/tp_models.zig"),
+        .target = target,
+        .link_libc = true,
+    });
+    models_mod.addImport("tp_core", core_mod);
+    models_mod.addImport("tp_ops", ops_mod);
+    models_mod.addImport("tp_gpu", gpu_mod);
+    models_mod.addImport("tp_runtime", runtime_mod);
+    mod.addImport("tp_models", models_mod);
+
+    // ggml (llama.cpp tensor lib) is an OPTIONAL dependency (default on, gated
+    // by `-Dggml`): its AVX2 CPU quant kernels are ~30x faster than our Zig ones
+    // and back the GGUF block-quant (q4_k/q5_k/q6_k/q8_0) dequant + GEMV paths
+    // (@import("ggml")). Now fetched (was a git submodule under vendor/ggml) so
+    // external consumers get it via `zig fetch`, and lazy so `-Dggml=false`
+    // skips the fetch/compile entirely — the library's block-quant dtypes then
+    // return error.QuantBackendUnavailable (see src/quants.zig, ops/matmul.zig).
+    // The static lib + libc++ are linked into `mod`, so every artifact that
+    // transitively uses the TensorPencil module picks them up.
+    const have_ggml = b.option(bool, "ggml", "Link ggml for GGUF block-quant support (default true)") orelse true;
+    var ggml_mod: ?*std.Build.Module = null;
+    if (have_ggml) {
+        if (b.lazyDependency("ggml", .{})) |ggml_dep| {
+            const ggml_lib = ggml_build.buildLib(b, target, .ReleaseFast, ggml_dep);
+            const gm = b.createModule(.{
+                .root_source_file = b.path("src/ggml.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            });
+            gm.addIncludePath(ggml_dep.path("include"));
+            mod.addImport("ggml", gm);
+            mod.linkLibrary(ggml_lib);
+            mod.link_libcpp = true;
+            // quants lives in tp_core now, so wire ggml there too (matmul in the
+            // umbrella still needs its own `ggml` import above).
+            core_mod.addImport("ggml", gm);
+            core_mod.linkLibrary(ggml_lib);
+            core_mod.link_libcpp = true;
+            // matmul (tp_ops) also calls ggml directly; the static lib + libc++
+            // reach the final link via tp_core, but the module import is needed here.
+            ops_mod.addImport("ggml", gm);
+            ggml_mod = gm;
         }
-    }.f;
-    linkGgml(mod, ggml_lib);
+    }
 
     // `zig build test` runs only the fast CPU unit suite (~15 s). The slow
     // integration tests — GPU (CUDA/Vulkan) device tests and the real-model LLM
@@ -128,7 +199,16 @@ pub fn build(b: *std.Build) void {
     const integration = b.option(bool, "integration", "Also run the slow GPU + real-model integration tests") orelse false;
     const build_opts = b.addOptions();
     build_opts.addOption(bool, "integration", integration);
-    mod.addImport("build_options", build_opts.createModule());
+    // Tie the compile-time flag to whether ggml was actually wired: if the
+    // dependency is disabled (or unavailable), the library compiles its
+    // block-quant paths to a clean runtime error instead of a missing-module
+    // compile error.
+    build_opts.addOption(bool, "have_ggml", ggml_mod != null);
+    const opts_mod = build_opts.createModule();
+    mod.addImport("build_options", opts_mod);
+    core_mod.addImport("build_options", opts_mod);
+    gpu_mod.addImport("build_options", opts_mod);
+    models_mod.addImport("build_options", opts_mod);
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -412,10 +492,13 @@ pub fn build(b: *std.Build) void {
         }
     }
 
-    // ggml-bench: benchmark comparing TensorPencil's CPU quant kernels against
-    // ggml's. `zig build ggml-bench`. ggml links transitively via the
-    // TensorPencil module; the shared `ggml` import gives direct C access.
-    {
+    // ggml-bench / qgemv-bench: CPU-kernel + device GEMV benchmarks that need
+    // direct `ggml` C access, so they only exist when ggml is linked
+    // (`-Dggml`, default on). ggml links transitively via the TensorPencil
+    // module; the shared `ggml` import gives direct C access.
+    if (ggml_mod) |ggml_mod_v| {
+        // ggml-bench: benchmark comparing TensorPencil's CPU quant kernels
+        // against ggml's. `zig build ggml-bench`.
         const bench_step = b.step("ggml-bench", "Build+run the ggml vs TensorPencil CPU-kernel benchmark");
         const bench_exe = b.addExecutable(.{
             .name = "ggml-bench",
@@ -426,19 +509,18 @@ pub fn build(b: *std.Build) void {
                 .optimize = .ReleaseFast,
                 .imports = &.{
                     .{ .name = "TensorPencil", .module = mod },
-                    .{ .name = "ggml", .module = ggml_mod },
+                    .{ .name = "ggml", .module = ggml_mod_v },
                 },
             }),
         });
         const run_bench = b.addRunArtifact(bench_exe);
         if (b.args) |args| run_bench.addArgs(args);
         bench_step.dependOn(&run_bench.step);
-    }
 
-    // qgemv-bench: grouped-N dp4a quant GEMV vs dequant->f16 GEMM, on device.
-    // `zig build qgemv-bench`. Measures whether grouped-N is a real gain over
-    // the m>1 dequant-GEMM fallback for small (speculative-verify) batches.
-    {
+        // qgemv-bench: grouped-N dp4a quant GEMV vs dequant->f16 GEMM, on
+        // device. `zig build qgemv-bench`. Measures whether grouped-N is a real
+        // gain over the m>1 dequant-GEMM fallback for small (speculative-verify)
+        // batches.
         const qb_step = b.step("qgemv-bench", "Build+run the grouped-N GEMV vs dequant-GEMM device benchmark");
         const qb_exe = b.addExecutable(.{
             .name = "qgemv-bench",
@@ -449,7 +531,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = .ReleaseFast,
                 .imports = &.{
                     .{ .name = "TensorPencil", .module = mod },
-                    .{ .name = "ggml", .module = ggml_mod },
+                    .{ .name = "ggml", .module = ggml_mod_v },
                 },
             }),
         });
@@ -471,6 +553,38 @@ pub fn build(b: *std.Build) void {
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
+    // Each carved layer module is its own compilation, so its `test` blocks run
+    // from their own test binary. tp_core first.
+    const core_tests = b.addTest(.{
+        .root_module = core_mod,
+        .filters = test_filters,
+    });
+    const run_core_tests = b.addRunArtifact(core_tests);
+
+    const ops_tests = b.addTest(.{
+        .root_module = ops_mod,
+        .filters = test_filters,
+    });
+    const run_ops_tests = b.addRunArtifact(ops_tests);
+
+    const gpu_tests = b.addTest(.{
+        .root_module = gpu_mod,
+        .filters = test_filters,
+    });
+    const run_gpu_tests = b.addRunArtifact(gpu_tests);
+
+    const runtime_tests = b.addTest(.{
+        .root_module = runtime_mod,
+        .filters = test_filters,
+    });
+    const run_runtime_tests = b.addRunArtifact(runtime_tests);
+
+    const models_tests = b.addTest(.{
+        .root_module = models_mod,
+        .filters = test_filters,
+    });
+    const run_models_tests = b.addRunArtifact(models_tests);
+
     // Creates an executable that will run `test` blocks from the executable's
     // root module. Note that test executables only test one module at a time,
     // hence why we have to create two separate ones.
@@ -487,6 +601,11 @@ pub fn build(b: *std.Build) void {
     // make the two of them run in parallel.
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
+    test_step.dependOn(&run_core_tests.step);
+    test_step.dependOn(&run_ops_tests.step);
+    test_step.dependOn(&run_gpu_tests.step);
+    test_step.dependOn(&run_runtime_tests.step);
+    test_step.dependOn(&run_models_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.

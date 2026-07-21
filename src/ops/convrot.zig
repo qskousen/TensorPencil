@@ -146,7 +146,7 @@ test "rotation matches explicit matvec across multiple groups" {
 // `convrot_w4a4` dequant. `expected` = unpack(qweight) * scale[:,None] rotated
 // back into the original basis (`@ H^T`, and H is symmetric so `@ H`).
 test "convrot int4 dequant matches comfyui reference fixture" {
-    const dtypes = @import("../dtype.zig");
+    const dtypes = @import("tp_core").dtype;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 

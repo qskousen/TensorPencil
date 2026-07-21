@@ -16,7 +16,7 @@
 //! different computation.
 
 const std = @import("std");
-const ops = @import("../ops.zig");
+const ops = @import("tp_ops");
 
 pub const Activation = enum { silu_mul, gelu_tanh_mul };
 
@@ -259,7 +259,7 @@ pub fn layerForwardTree(
 // residual wiring, norm placement, and the activation on tiny synthetic weights
 // — no checkpoint, runs in `zig build test`.
 
-const kv_cache = @import("../llm/kv_cache.zig");
+const kv_cache = @import("tp_core").kv_cache;
 
 // Test layer carrying every field the specs touch (v: Weight, so it covers the
 // qwen3 + gemma3 shape; gemma4's ?Weight/out_scale variant is validated via

@@ -27,11 +27,11 @@
 const std = @import("std");
 const gemma4 = @import("gemma4.zig");
 const qwen3 = @import("qwen3.zig");
-const cuda = @import("../gpu/cuda.zig");
-const ops = @import("../ops.zig");
-const kvmod = @import("../llm/kv_cache.zig");
-const sample = @import("../llm/sample.zig");
-const residency = @import("residency.zig");
+const cuda = @import("tp_gpu").cuda;
+const ops = @import("tp_ops");
+const kvmod = @import("tp_core").kv_cache;
+const sample = @import("tp_core").sample;
+const residency = @import("tp_runtime").residency;
 const transformer = @import("transformer.zig");
 const transformer_gpu = @import("transformer_gpu.zig");
 
@@ -1225,7 +1225,7 @@ test "checkpoint restore regenerates token-identical on the real model" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const test_gate = @import("../test_gate.zig");
-    const Gguf = @import("../gguf.zig").Gguf;
+    const Gguf = @import("tp_core").gguf.Gguf;
     const path = "/home/qt/genai/lmstudio/models/gemma-4-12b-it-qat-q4_0.gguf";
     try test_gate.requireModelFile(io, path);
     const be = Backend.init(gpa) catch return error.SkipZigTest;
@@ -1405,7 +1405,7 @@ test "cpu split plan respects live free VRAM" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const test_gate = @import("../test_gate.zig");
-    const Gguf = @import("../gguf.zig").Gguf;
+    const Gguf = @import("tp_core").gguf.Gguf;
     const path = "/home/qt/genai/lmstudio/models/gemma-4-12b-it-qat-q4_0.gguf";
     try test_gate.requireModelFile(io, path);
     const be = Backend.init(gpa) catch return error.SkipZigTest;
@@ -1439,7 +1439,7 @@ test "cpu split prefill before any step needs a seeded io" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const test_gate = @import("../test_gate.zig");
-    const Gguf = @import("../gguf.zig").Gguf;
+    const Gguf = @import("tp_core").gguf.Gguf;
     const path = "/home/qt/genai/lmstudio/models/gemma-4-12b-it-qat-q4_0.gguf";
     try test_gate.requireModelFile(io, path);
     const be = Backend.init(gpa) catch return error.SkipZigTest;

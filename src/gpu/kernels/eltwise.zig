@@ -200,7 +200,7 @@ export fn add_relu() callconv(.spirv_kernel) void {
     a.data[idx] = @max(0.0, a.data[idx] + b.data[idx]);
 }
 
-// penalize: sampling penalties (llm/sample.zig penalizeLogit), one thread per
+// penalize: sampling penalties (sample.zig penalizeLogit), one thread per
 //   unique recent token: logits[id] = (l>0 ? l/rp : l*rp) - sub. a=logits (in
 //   place), b=wire — f32 pairs of (token id, stored as an exact f32 < 2^24,
 //   and the host-precomputed presence+frequency subtract term; see

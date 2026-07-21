@@ -7,7 +7,7 @@
 //! 3x3 conv (`up=true`) — valid because it commutes with the per-pixel TGrow
 //! 1x1 conv that sits between them.
 const std = @import("std");
-const cuda = @import("../gpu/cuda.zig");
+const cuda = @import("tp_gpu").cuda;
 const wan_vae = @import("wan_vae.zig");
 const taehv = @import("taehv.zig");
 

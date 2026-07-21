@@ -12,9 +12,9 @@
 
 const std = @import("std");
 const gemma_vit = @import("gemma_vit.zig");
-const gpu = @import("../gpu/context.zig");
-const ops = @import("../ops.zig");
-const safetensors = @import("../safetensors.zig");
+const gpu = @import("tp_gpu").context;
+const ops = @import("tp_ops");
+const safetensors = @import("tp_core").safetensors;
 
 const Vit = gemma_vit.Vit;
 const Buf = gpu.DeviceBuffer;

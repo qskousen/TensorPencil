@@ -10,8 +10,8 @@
 
 const std = @import("std");
 const dit = @import("dit.zig");
-const cuda = @import("../gpu/cuda.zig");
-const safetensors = @import("../safetensors.zig");
+const cuda = @import("tp_gpu").cuda;
+const safetensors = @import("tp_core").safetensors;
 
 const DiT = dit.DiT;
 const Backend = cuda.Backend;

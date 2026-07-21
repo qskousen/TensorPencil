@@ -2398,7 +2398,7 @@ pub fn i4GemmTest(ctx: *Context, io: anytype, stdout: anytype) !void {
 /// rel-vs-f32 = int4 accuracy (naturally coarser than int8).
 pub fn i4LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
     _ = io;
-    const convrot = @import("../../ops/convrot.zig");
+    const convrot = @import("tp_ops").convrot;
 
     // Performant fused s4 GEMM (rescale folded into the C-store), the path
     // dit_cuda's opI4Gemm uses. Requires m%128, rows%128, cols%128.
@@ -2534,7 +2534,7 @@ pub fn i4LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
 /// (rel-vs-cpu-sim = wiring exactness; rel-vs-f32 = int8 accuracy). Exercises
 /// >48 KB dynamic shared for cols=16384.
 pub fn i8LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
-    const convrot = @import("../../ops/convrot.zig");
+    const convrot = @import("tp_ops").convrot;
 
     const pipe_ptx = try buildIgemmPipe(gpa, 64, false, 8, true);
     defer gpa.free(pipe_ptx);

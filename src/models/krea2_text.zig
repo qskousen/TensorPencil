@@ -2,7 +2,7 @@
 //! (comfy/text_encoders/krea2.py).
 
 const std = @import("std");
-const tokenizer_mod = @import("../tokenizer.zig");
+const tokenizer_mod = @import("tp_core").tokenizer;
 
 const Tokenizer = tokenizer_mod.Tokenizer;
 

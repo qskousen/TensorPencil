@@ -18,12 +18,13 @@
 const std = @import("std");
 const qwen3 = @import("qwen3.zig");
 const qwen3_cuda = @import("qwen3_cuda.zig");
-const cuda = @import("../gpu/cuda.zig");
-const safetensors = @import("../safetensors.zig");
-const ops = @import("../ops.zig");
+const cuda = @import("tp_gpu").cuda;
+const safetensors = @import("tp_core").safetensors;
+const ops = @import("tp_ops");
 const spec = @import("../llm/spec.zig");
+const spec_limits = @import("tp_core").spec_limits;
 const chat = @import("../llm/chat.zig");
-const sample = @import("../llm/sample.zig");
+const sample = @import("tp_core").sample;
 
 const Backend = cuda.Backend;
 const Buf = cuda.backend.DeviceBuffer;
@@ -48,7 +49,7 @@ const nsplit = 32;
 
 /// Rows per head forward: covers a full verify round's grounding batch;
 /// longer (prefill) groundings chunk.
-const max_rows = spec.max_draft + 2;
+const max_rows = spec_limits.max_draft + 2;
 
 /// Tree drafting (LLM_PLAN.md M8): widest tree level the head forwards in
 /// one batch, and the beam-search shape — top candidates per node, each
@@ -145,9 +146,9 @@ pub const Eagle3Head = struct {
         // Rows [capacity, capacity + max_tree_nodes) are the tree batch
         // region: sibling branches collide at the same position, so tree
         // rollout K/V never appends linearly.
-        self.k_cache = try be.tensorCreate((capacity + spec.max_tree_nodes) * kv_dim * 4);
+        self.k_cache = try be.tensorCreate((capacity + spec_limits.max_tree_nodes) * kv_dim * 4);
         errdefer be.tensorDestroy(&self.k_cache);
-        self.v_cache = try be.tensorCreate((capacity + spec.max_tree_nodes) * kv_dim * 4);
+        self.v_cache = try be.tensorCreate((capacity + spec_limits.max_tree_nodes) * kv_dim * 4);
         errdefer be.tensorDestroy(&self.v_cache);
 
         self.b = try HeadBufs.init(be);
@@ -233,7 +234,7 @@ pub const Eagle3Head = struct {
         const b = &self.b;
         const p0 = self.len;
         std.debug.assert(rows >= 1 and rows <= tree_level_cap);
-        std.debug.assert(first_node >= 1 and first_node + rows <= spec.max_tree_nodes);
+        std.debug.assert(first_node >= 1 and first_node + rows <= spec_limits.max_tree_nodes);
         std.debug.assert(meta.len == rows * (rows + 1) and p0 + depth <= self.capacity);
 
         var pos: [tree_level_cap]u32 = undefined;
@@ -375,7 +376,7 @@ const HeadBufs = struct {
             max_rows * hidden * 4, // t
             max_rows * n_heads * nsplit * (hd + 4) * 4, // attn_scratch
             tree_level_cap * draft_vocab * 4, // logits (a row per tree-level node)
-            spec.max_tree_nodes * hidden * 4, // node_hidden
+            spec_limits.max_tree_nodes * hidden * 4, // node_hidden
             tree_level_cap * 4, // tree_pos
             (tree_level_cap * n_heads * nsplit * (hd + 4) + tree_level_cap * (tree_level_cap + 1)) * 4, // tree_scratch
         };
@@ -517,7 +518,7 @@ pub const Eagle3Drafter = struct {
         const head = self.head;
         const be = head.be;
         if (tokens.len == 0 or ids.len < 2 or max_depth == 0) return 0;
-        const budget = @min(tokens.len, spec.max_tree_nodes - 1);
+        const budget = @min(tokens.len, spec_limits.max_tree_nodes - 1);
         const rows_in_buf = try self.ground(ids);
         if (rows_in_buf == 0) return 0;
         if (head.len + max_depth > head.capacity) return 0;
@@ -528,8 +529,8 @@ pub const Eagle3Drafter = struct {
         try be.tensorDownload(offsetBufSized(head.b.logits, 0, draft_vocab * 4), std.mem.sliceAsBytes(self.logits[0..draft_vocab]));
 
         // Per-node bookkeeping (node 0 = root; slice index i is node i+1).
-        var node_parent: [spec.max_tree_nodes]u32 = undefined;
-        var cum_lp: [spec.max_tree_nodes]f32 = undefined;
+        var node_parent: [spec_limits.max_tree_nodes]u32 = undefined;
+        var cum_lp: [spec_limits.max_tree_nodes]f32 = undefined;
         var level: [tree_level_cap]u32 = undefined; // node ids of the current level
         var level_n: usize = 0;
         var m: usize = 0;
@@ -673,7 +674,7 @@ test "eagle drafter matches vanilla greedy on the real models" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const engine = @import("../llm/engine.zig");
-    const tokenizer_mod = @import("../tokenizer.zig");
+    const tokenizer_mod = @import("tp_core").tokenizer;
     const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     const head_path = "models/text_encoders/qwen3_4b_eagle3.safetensors";
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
@@ -727,7 +728,7 @@ test "eagle tree drafter matches vanilla greedy on the real models" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const engine = @import("../llm/engine.zig");
-    const tokenizer_mod = @import("../tokenizer.zig");
+    const tokenizer_mod = @import("tp_core").tokenizer;
     const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
     const head_path = "models/text_encoders/qwen3_4b_eagle3.safetensors";
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;

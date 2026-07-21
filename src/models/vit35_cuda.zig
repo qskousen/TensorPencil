@@ -21,8 +21,8 @@
 
 const std = @import("std");
 const vit35 = @import("vit35.zig");
-const cuda = @import("../gpu/cuda.zig");
-const ops = @import("../ops.zig");
+const cuda = @import("tp_gpu").cuda;
+const ops = @import("tp_ops");
 
 const Vit = vit35.Vit;
 const Backend = cuda.Backend;
@@ -184,7 +184,7 @@ test "cuda vit matches cpu encode" {
     const be = Backend.init(gpa) catch return error.SkipZigTest;
     defer be.deinit();
 
-    var g = try @import("../gguf.zig").Gguf.open(gpa, io, path);
+    var g = try @import("tp_core").gguf.Gguf.open(gpa, io, path);
     defer g.deinit();
     var vit = try Vit.load(gpa, &g);
     defer vit.deinit();

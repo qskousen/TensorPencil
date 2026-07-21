@@ -16,52 +16,92 @@
 
 const std = @import("std");
 const dtypes = @import("dtype.zig");
-const ggml = @import("ggml");
+const build_options = @import("build_options");
 
 const DType = dtypes.DType;
 
+/// Whether ggml (the GGUF block-quant CPU backend) was linked in this build.
+/// Gated by `-Dggml` (default on). When false, the block-quant dequant/GEMV
+/// paths are unavailable: `dequantSlice` panics and the matmul dispatch returns
+/// `error.QuantBackendUnavailable` (see ops/matmul.zig). All non-block-quant
+/// dtypes (f32/f16/bf16/fp8/int8/int4) are unaffected.
+pub const have_ggml = build_options.have_ggml;
+
+/// Returned by the block-quant matmul path when built with `-Dggml=false`.
+pub const QuantError = error{QuantBackendUnavailable};
+
+// All ggml-typed helpers live behind the build flag. When ggml is absent the
+// `@import("ggml")` is never analyzed (so the module need not be supplied to
+// the build), and these collapse to inert stubs.
+const gg = if (have_ggml) struct {
+    const ggml = @import("ggml");
+
+    /// ggml type enum for a block-quant DType (null otherwise).
+    pub fn blockType(dt: DType) ?ggml.c.enum_ggml_type {
+        return switch (dt) {
+            .q4_0 => ggml.c.GGML_TYPE_Q4_0,
+            .q8_0 => ggml.c.GGML_TYPE_Q8_0,
+            .q4_k => ggml.c.GGML_TYPE_Q4_K,
+            .q5_k => ggml.c.GGML_TYPE_Q5_K,
+            .q6_k => ggml.c.GGML_TYPE_Q6_K,
+            else => null,
+        };
+    }
+
+    var inited = false;
+    pub fn ensureInit() void {
+        if (!inited) {
+            ggml.c.ggml_cpu_init();
+            inited = true;
+        }
+    }
+
+    pub fn dequantSlice(dt: DType, row: []const u8, elem0: usize, n: usize, dst: []f32) void {
+        std.debug.assert(dst.len >= n);
+        const be = dt.blockElems();
+        std.debug.assert(elem0 % be == 0 and n % be == 0);
+        const gt = blockType(dt) orelse unreachable; // not a block-quantized dtype
+        const x = row.ptr + (elem0 / be) * dt.blockBytes();
+        ggml.c.ggml_get_type_traits(gt).*.to_float.?(x, dst.ptr, @intCast(n));
+    }
+} else struct {
+    // Never reached in a `-Dggml=false` build: every caller is gated on
+    // `have_ggml` and errors out before these run. Present only so the module
+    // compiles without the ggml import.
+    pub fn blockType(dt: DType) ?u32 {
+        _ = dt;
+        unreachable;
+    }
+    pub fn ensureInit() void {}
+    pub fn dequantSlice(dt: DType, row: []const u8, elem0: usize, n: usize, dst: []f32) void {
+        _ = .{ dt, row, elem0, n, dst };
+        @panic("quants.dequantSlice: TensorPencil built with -Dggml=false; " ++
+            "GGUF block-quant (q4_0/q8_0/q4_k/q5_k/q6_k) is unavailable");
+    }
+};
+
 /// ggml type enum for a block-quant DType (null otherwise). Shared with matmul.
-pub fn ggmlType(dt: DType) ?ggml.c.enum_ggml_type {
-    return switch (dt) {
-        .q4_0 => ggml.c.GGML_TYPE_Q4_0,
-        .q8_0 => ggml.c.GGML_TYPE_Q8_0,
-        .q4_k => ggml.c.GGML_TYPE_Q4_K,
-        .q5_k => ggml.c.GGML_TYPE_Q5_K,
-        .q6_k => ggml.c.GGML_TYPE_Q6_K,
-        else => null,
-    };
-}
+/// Only meaningful in a ggml build.
+pub const ggmlType = gg.blockType;
 
 /// Fill ggml's fp16 table / CPU dispatch once (the CPU vec_dot kernels return 0
 /// without it). Idempotent; the first block-quant matmul runs on the single
-/// main thread before any fan-out, so a plain flag is enough.
-var ggml_inited = false;
-pub fn ensureGgmlInit() void {
-    if (!ggml_inited) {
-        ggml.c.ggml_cpu_init();
-        ggml_inited = true;
-    }
-}
+/// main thread before any fan-out, so a plain flag is enough. No-op without ggml.
+pub const ensureGgmlInit = gg.ensureInit;
 
 /// Dequantize elements [elem0, elem0 + n) of a block-quantized `row` into `dst`
 /// via ggml's (auto-vectorized) `to_float` — ~4-12x faster than the scalar Zig
 /// decode it replaced. `elem0`/`n` must be block-aligned (ggml blocks never span
 /// rows; callers slice at block-aligned offsets). Bit-identical to the ggml
-/// reference our golden fixtures were generated from.
-pub fn dequantSlice(dt: DType, row: []const u8, elem0: usize, n: usize, dst: []f32) void {
-    std.debug.assert(dst.len >= n);
-    const be = dt.blockElems();
-    std.debug.assert(elem0 % be == 0 and n % be == 0);
-    const gt = ggmlType(dt) orelse unreachable; // not a block-quantized dtype
-    const x = row.ptr + (elem0 / be) * dt.blockBytes();
-    ggml.c.ggml_get_type_traits(gt).*.to_float.?(x, dst.ptr, @intCast(n));
-}
+/// reference our golden fixtures were generated from. Panics if built without ggml.
+pub const dequantSlice = gg.dequantSlice;
 
 // --- tests -----------------------------------------------------------------
 
 const fixtures = @import("quants_fixtures.zig");
 
 fn expectGolden(dt: DType, block: []const u8, expected_bits: []const u32) !void {
+    if (!have_ggml) return error.SkipZigTest; // dequant needs the ggml backend
     const n = dt.blockElems();
     var out: [256]f32 = undefined;
     dequantSlice(dt, block, 0, n, out[0..n]);
@@ -91,6 +131,7 @@ test "q6_k dequant matches ggml reference" {
 }
 
 test "dequantSlice block-aligned sub-ranges" {
+    if (!have_ggml) return error.SkipZigTest; // dequant needs the ggml backend
     // Dequanting a 2-block row in one call or block-by-block must agree.
     var row: [68]u8 = undefined;
     @memcpy(row[0..34], &fixtures.q8_0_block);

@@ -4,8 +4,8 @@
 //! bounding peak memory to roughly the DiT mapping (~13 GiB) plus activations.
 
 const std = @import("std");
-const gpu_mod = @import("gpu.zig");
-const mem_tag = @import("gpu/mem_tag.zig");
+const gpu_mod = @import("tp_gpu");
+const mem_tag = @import("tp_gpu").mem_tag;
 pub const MemTag = mem_tag.MemTag;
 
 /// MEASURED per-component diffusion VRAM (bytes), for the GUI meter. `te`/`dit`/
@@ -22,26 +22,45 @@ pub const VramBreakdown = struct {
         return self.te + self.dit + self.vae + self.latent;
     }
 };
-const ops = @import("ops.zig");
-const tokenizer_mod = @import("tokenizer.zig");
-const safetensors = @import("safetensors.zig");
-const sampler = @import("sampler.zig");
-const image = @import("image.zig");
-const qwen3 = @import("models/qwen3.zig");
-const qwen3_gpu = @import("models/qwen3_gpu.zig");
-const krea2_text = @import("models/krea2_text.zig");
-const dit_mod = @import("models/dit.zig");
-const dit_gpu = @import("models/dit_gpu.zig");
-const dit_cuda = @import("models/dit_cuda.zig");
-const qwen3_cuda = @import("models/qwen3_cuda.zig");
-const cuda = @import("gpu/cuda.zig");
-const wan_vae = @import("models/wan_vae.zig");
-const taehv_mod = @import("models/taehv.zig");
-const taehv_cuda_mod = @import("models/taehv_cuda.zig");
-const taehv_gpu_mod = @import("models/taehv_gpu.zig");
-const vae_gpu = @import("models/vae_gpu.zig");
-const vae_cuda = @import("models/vae_cuda.zig");
-const vae_tiled = @import("models/vae_tiled.zig");
+const ops = @import("tp_ops");
+
+/// Thunk wiring the Vulkan device GEMM into `ops.matmul`'s injected dispatch
+/// hook, so the ops layer never imports the GPU backend. Registered as
+/// `ops.matmul.gpu_dispatch.call` with the `*Context` handed back as `ctx`.
+fn gpuMatmulThunk(
+    ctx: *anyopaque,
+    y: []f32,
+    x: []const f32,
+    m: usize,
+    w_bytes: []const u8,
+    dtype_f8: bool,
+    rows: usize,
+    cols: usize,
+    scale: f32,
+    bias: ?[]const f32,
+) anyerror!void {
+    const c: *gpu_mod.Context = @ptrCast(@alignCast(ctx));
+    return c.matmul(y, x, m, w_bytes, dtype_f8, rows, cols, scale, bias);
+}
+const tokenizer_mod = @import("tp_core").tokenizer;
+const safetensors = @import("tp_core").safetensors;
+const sampler = @import("tp_core").sampler;
+const image = @import("tp_core").image;
+const qwen3 = @import("tp_models").models.qwen3;
+const qwen3_gpu = @import("tp_models").models.qwen3_gpu;
+const krea2_text = @import("tp_models").models.krea2_text;
+const dit_mod = @import("tp_models").models.dit;
+const dit_gpu = @import("tp_models").models.dit_gpu;
+const dit_cuda = @import("tp_models").models.dit_cuda;
+const qwen3_cuda = @import("tp_models").models.qwen3_cuda;
+const cuda = @import("tp_gpu").cuda;
+const wan_vae = @import("tp_models").models.wan_vae;
+const taehv_mod = @import("tp_models").models.taehv;
+const taehv_cuda_mod = @import("tp_models").models.taehv_cuda;
+const taehv_gpu_mod = @import("tp_models").models.taehv_gpu;
+const vae_gpu = @import("tp_models").models.vae_gpu;
+const vae_cuda = @import("tp_models").models.vae_cuda;
+const vae_tiled = @import("tp_models").models.vae_tiled;
 
 /// Compute backend for the diffusion model (and, for Vulkan, the encoder + VAE):
 ///  - cpu:      everything on CPU.
@@ -302,7 +321,7 @@ pub const Session = struct {
             if (gpu_mod.Context.init(gpa)) |ctx| {
                 self.gpu_ctx = ctx;
                 ctx.budget_override = opts.vram_budget;
-                ops.matmul.gpu = ctx;
+                ops.matmul.gpu_dispatch = .{ .ctx = ctx, .call = gpuMatmulThunk };
                 try note(progress, "gpu: {s}\n", .{ctx.deviceName()});
                 if (progress) |w| try ctx.writeCoopStatus(w);
             } else |err| {
@@ -310,7 +329,7 @@ pub const Session = struct {
             }
         }
         errdefer if (self.gpu_ctx) |ctx| {
-            ops.matmul.gpu = null;
+            ops.matmul.gpu_dispatch = null;
             ctx.deinit();
         };
 
@@ -479,7 +498,7 @@ pub const Session = struct {
         self.enc_st.deinit();
         self.tok.deinit();
         if (self.gpu_ctx) |ctx| {
-            ops.matmul.gpu = null;
+            ops.matmul.gpu_dispatch = null;
             ctx.deinit();
         }
         if (self.cu_be) |b| b.deinit();
@@ -791,9 +810,9 @@ pub const Session = struct {
         const skip_whole = opts.vae_decode == .gpu_tiled or opts.vae_decode == .cpu_tiled;
         const planar = if (force_cpu) planar_blk: {
             try note(progress, "vae decode: tiling on CPU (forced)\n", .{});
-            const saved = ops.matmul.gpu;
-            ops.matmul.gpu = null;
-            defer ops.matmul.gpu = saved;
+            const saved = ops.matmul.gpu_dispatch;
+            ops.matmul.gpu_dispatch = null;
+            defer ops.matmul.gpu_dispatch = saved;
             break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae }, CpuTile.call);
         } else if (cu_be) |b| planar_blk: {
             // Attempt ladder — whole-image (fastest, seamless) → GPU tiling
@@ -871,9 +890,9 @@ pub const Session = struct {
             }
             // Phase 3: CPU tiling — the guaranteed VRAM-can't-OOM floor (slow).
             try note(progress, "vae decode: GPU out of VRAM → CPU tiled decode (slow)\n", .{});
-            const saved = ops.matmul.gpu;
-            ops.matmul.gpu = null;
-            defer ops.matmul.gpu = saved;
+            const saved = ops.matmul.gpu_dispatch;
+            ops.matmul.gpu_dispatch = null;
+            defer ops.matmul.gpu_dispatch = saved;
             break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae }, CpuTile.call);
         } else if (gpu_ctx) |gc| planar_blk: {
             // Whole-image decode first. The Vulkan mid-block attention is now
@@ -941,9 +960,9 @@ pub const Session = struct {
             }
             // Phase 3: CPU tiling — the guaranteed VRAM-can't-OOM floor (slow).
             try note(progress, "vae decode: GPU out of VRAM -> CPU tiled decode (slow)\n", .{});
-            const saved = ops.matmul.gpu;
-            ops.matmul.gpu = null;
-            defer ops.matmul.gpu = saved;
+            const saved = ops.matmul.gpu_dispatch;
+            ops.matmul.gpu_dispatch = null;
+            defer ops.matmul.gpu_dispatch = saved;
             break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae }, CpuTile.call);
         } else planar_blk: {
             // CPU-only: tile once the whole-image scores plane (f32) gets large,

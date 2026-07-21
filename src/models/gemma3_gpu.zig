@@ -20,9 +20,9 @@
 const std = @import("std");
 const qwen3 = @import("qwen3.zig");
 const gemma3 = @import("gemma3.zig");
-const gpu = @import("../gpu/context.zig");
-const ops = @import("../ops.zig");
-const kvmod = @import("../llm/kv_cache.zig");
+const gpu = @import("tp_gpu").context;
+const ops = @import("tp_ops");
+const kvmod = @import("tp_core").kv_cache;
 
 /// Map the session KV dtype onto the Vulkan op layer's kernel-format tag.
 fn kvFmt(dt: kvmod.KvDtype) gpu.KvFmt {
