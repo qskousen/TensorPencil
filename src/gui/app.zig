@@ -1222,6 +1222,7 @@ fn buildSession(arena: std.mem.Allocator) !*chat.Session {
         .reasoning = g_config.reasoning,
         .kv_dtype = toKvDtype(g_config.kv_dtype),
         .regen_cache_mb = g_config.regen_cache_mb,
+        .vision_budget_tokens = g_config.vision_budget.tokens(),
     });
     return s;
 }

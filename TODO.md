@@ -1,8 +1,9 @@
-- zig-cuda backend seems to have oom issues
+- possible for cancelling/quitting to happen mid-step for image generation? particularly on cpu this is important- pause button
+- pause button
+- regenerate reply option disappears when model is unloaded
 - changing system prompt should wipe context and take effect on the next message
 - begin filling in holes in the capabilities grid (BACKEND.md)
 - add more sampling methods
-- possible for cancelling/quitting to happen mid-step for image generation? particularly on cpu this is important
 - multiple system prompts that can be saved and switched between
 - why is the config not json or something more structured?
 - tool call boxes inline, expandable to see the tool call

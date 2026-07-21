@@ -31,6 +31,8 @@ const gemma4 = tp.models.gemma4;
 const gemma4_cuda = tp.models.gemma4_cuda;
 const gemma4_vit = tp.models.gemma4_vit;
 const gemma4_vit_cuda = tp.models.gemma4_vit_cuda;
+const gemma4v_vit = tp.models.gemma4v_vit;
+const gemma4v_vit_cuda = tp.models.gemma4v_vit_cuda;
 
 /// The resident LLM + its vision tower, one variant per supported GGUF
 /// architecture. `model` retains a `*const lm`, so the bundle must live at a
@@ -40,7 +42,21 @@ const Arch = union(enum) {
     qwen3: struct { lm: qwen3.CausalLM, model: qwen3_cuda.CudaLM, vit: ?NoVit = null },
     qwen35: struct { lm: qwen35.Model, model: qwen35_cuda.CudaLM, vit: ?vit35.Vit = null },
     gemma3: struct { lm: gemma3.Model, model: gemma3_cuda.CudaLM, vit: ?gemma_vit.Vit = null },
-    gemma4: struct { lm: gemma4.Model, model: gemma4_cuda.CudaLM, vit: ?gemma4_vit.Vit = null },
+    gemma4: struct { lm: gemma4.Model, model: gemma4_cuda.CudaLM, vit: ?Gemma4Vit = null },
+};
+
+/// Either gemma4 vision tower, chosen by the mmproj's projector_type: the
+/// shallow "gemma4uv" unified embedder (12B; device-side on CUDA) or the full
+/// "gemma4v" SigLIP tower (31B; CPU forward). Both expose {embeds, grid_w,
+/// grid_h}, so one gemma4 bundle can carry whichever the mmproj provides.
+const Gemma4Vit = union(enum) {
+    uv: gemma4_vit.Vit,
+    v: gemma4v_vit.Vit,
+    pub fn deinit(self: *Gemma4Vit) void {
+        switch (self.*) {
+            inline else => |*t| t.deinit(),
+        }
+    }
 };
 
 /// Placeholder tower type for text-only architectures (plain qwen3): satisfies
@@ -292,6 +308,9 @@ pub const Options = struct {
     reasoning: bool = true,
     /// KV-cache element storage type (f32 default; f16 halves the KV footprint).
     kv_dtype: kv_cache.KvDtype = .f32,
+    /// gemma4v vision token budget (nMax); 0 = tower default (280). Applied live
+    /// per image encode; ignored by other archs.
+    vision_budget_tokens: usize = 0,
     /// Host-RAM budget (MB) for turn-boundary context checkpoints (the fast
     /// regenerate/variant-switch path). Snapshot size is context-independent
     /// but per-arch (qwen35: tens of MB), so this bounds how many turn
@@ -419,6 +438,9 @@ pub const Session = struct {
     // Vision (dropped/attached images the model can see). Loaded once; the
     // tower itself lives in `arch` (per-architecture type).
     mmproj_gguf: ?Gguf = null,
+    /// gemma4v vision token budget (nMax); 0 = tower default. Applied live per
+    /// image encode; updated by `updateSettings`.
+    vision_budget_tokens: usize = 0,
     // Images attached for the next message: `attach_view` are display copies
     // (RGBA, shown as a strip + moved into the sent message); `attach_rgb` are
     // the parallel raw RGB the worker encodes. On submit they move to the
@@ -464,8 +486,17 @@ pub const Session = struct {
             .cpu, .vulkan => return error.UnsupportedLlmBackend,
         };
         errdefer self.be.deinit();
+        // LLM weights pin resident on first touch and NEVER stream: without
+        // this, weights sit in the backend's evictable LRU cache, and once the
+        // working set is within ~a layer of the card, per-token allocations
+        // evict them in exactly the (cyclic) order decode re-reads them —
+        // ~the whole model re-uploads from the mmap EVERY token (the 31B
+        // 0.1 tok/s cliff). VRAM pressure is handled by the always-armed
+        // dynamic split + the vram Arbiter migrating whole layers instead.
+        self.be.pinAllWeights();
 
         self.mmproj_gguf = null;
+        self.vision_budget_tokens = cfg.vision_budget_tokens;
         if (cfg.mmproj_path) |mp| self.mmproj_gguf = try Gguf.open(arena, io, mp);
 
         // f16 KV is supported per-arch (gemma4 first); the concrete model init
@@ -526,9 +557,23 @@ pub const Session = struct {
             self.arch = .{ .gemma4 = .{ .lm = try gemma4.Model.load(arena, &self.gguf), .model = undefined } };
             const a = &self.arch.gemma4;
             errdefer a.lm.deinit();
-            // gemma4's "unified" embedder has no ViT — it runs on CPU (cheap);
-            // encodes are scoped per image turn (imageTurn).
-            if (self.mmproj_gguf) |*mg| a.vit = try gemma4_vit.Vit.load(arena, mg);
+            // Size the LLM's image-prefill scratch + LOCAL KV ring for the vision
+            // token budget (bidirectional image block prefills in one pass).
+            // Fixed at load, so vision_budget is a reload-triggering setting.
+            if (self.vision_budget_tokens != 0) a.lm.cfg.image_budget = self.vision_budget_tokens;
+            // Vision tower dispatched by projector_type: "gemma4v" -> full SigLIP
+            // tower (31B), else the shallow "gemma4uv" embedder (12B). Encodes are
+            // scoped per image turn.
+            if (self.mmproj_gguf) |*mg| {
+                const pt = mg.getStr("clip.vision.projector_type") orelse return error.UnknownModelConfig;
+                if (std.mem.eql(u8, pt, "gemma4v")) {
+                    var v = try gemma4v_vit.Vit.load(arena, mg);
+                    if (self.vision_budget_tokens != 0) v.cfg.max_tokens = self.vision_budget_tokens;
+                    a.vit = .{ .v = v };
+                } else {
+                    a.vit = .{ .uv = try gemma4_vit.Vit.load(arena, mg) };
+                }
+            }
             errdefer if (a.vit) |*v| v.deinit();
             a.model = try gemma4_cuda.CudaLM.init(gpa, self.be, &a.lm, cap);
         } else return error.UnsupportedArchitecture;
@@ -583,8 +628,9 @@ pub const Session = struct {
         // Dynamic VRAM offload (GUI_VRAM.md): always arm the dynamic split (free
         // when the model fits — 0 layers on CPU, per-op decode ties the graph;
         // measured 76 vs 77 tok/s on the 9B). Once context + weights outgrow the
-        // budget it migrates layers to the CPU, which is ~2.5x FASTER than the
-        // weight-streaming fallback on this box (18 vs 7 tok/s). Vision sessions
+        // budget it migrates layers to the CPU — the ONLY degradation path now
+        // (weights are pinned; the old streaming fallback, ~2.5x slower at best
+        // and a per-token full-model re-upload at worst, is gone). Vision sessions
         // arm it too: text turns run the fast offload path, and an IMAGE turn
         // promotes every layer back to the GPU first (buildAndPrefillTurn) because
         // the host layer path uses scalar RoPE (wrong for image-grid M-RoPE).
@@ -733,6 +779,8 @@ pub const Session = struct {
         self.pending_sampling = samplingParams(cfg);
         // Checkpoint budget likewise (the worker reads it in takeCheckpoint).
         self.pending_budget = @as(u64, cfg.regen_cache_mb) << 20;
+        // (vision_budget is reload-triggering, not live — it sizes the LLM's
+        // image-prefill buffers at load; see `reloadEql` / the gemma4 load path.)
     }
 
     // --- vram.Participant adapter --------------------------------------------
@@ -1403,19 +1451,33 @@ pub const Session = struct {
         try session.prefillImageTurn(&a.model, &self.tok, self.gpa, &self.ids, segs.items, encs.items);
     }
 
-    /// imageTurn for gemma4: the "unified" embedder (no ViT transformer) runs
-    /// device-side via gemma4_vit_cuda; the projected embeddings then inject
-    /// into the LLM at their placeholder rows. Otherwise identical to imageTurn.
+    /// imageTurn for gemma4: encode each image with the active tower — the
+    /// "gemma4uv" unified embedder runs device-side via gemma4_vit_cuda, the
+    /// "gemma4v" SigLIP tower on CPU — then inject the projected embeddings into
+    /// the LLM at their placeholder rows. Otherwise identical to imageTurn.
     fn imageTurnGemma4(self: *Session, a: anytype) !void {
-        var encs: std.ArrayList(gemma4_vit.Vit.Encoded) = .empty;
+        // Both towers' Encoded types are structurally identical; a local struct
+        // lets one list carry either (prefillImageTurn is duck-typed).
+        const Enc = struct { embeds: []f32, grid_w: usize, grid_h: usize };
+        var encs: std.ArrayList(Enc) = .empty;
         defer {
-            for (encs.items) |*e| e.deinit(self.gpa);
+            for (encs.items) |*e| self.gpa.free(e.embeds);
             encs.deinit(self.gpa);
         }
         var segs: std.ArrayList(chat.Segment) = .empty;
         defer segs.deinit(self.gpa);
         for (self.turn_images.items) |im| {
-            const enc = try gemma4_vit_cuda.encode(&a.vit.?, self.be, self.io, self.gpa, im.rgb, im.width, im.height);
+            const enc: Enc = switch (a.vit.?) {
+                .uv => |*uv| e: {
+                    const r = try gemma4_vit_cuda.encode(uv, self.be, self.io, self.gpa, im.rgb, im.width, im.height);
+                    break :e .{ .embeds = r.embeds, .grid_w = r.grid_w, .grid_h = r.grid_h };
+                },
+                .v => |*v| e: {
+                    // Budget was applied to v.cfg.max_tokens at load (reload-gated).
+                    const r = try gemma4v_vit_cuda.encode(v, self.be, self.io, self.gpa, im.rgb, im.width, im.height);
+                    break :e .{ .embeds = r.embeds, .grid_w = r.grid_w, .grid_h = r.grid_h };
+                },
+            };
             try encs.append(self.gpa, enc);
             try segs.append(self.gpa, .{ .image = .{ .grid_w = enc.grid_w, .grid_h = enc.grid_h } });
         }

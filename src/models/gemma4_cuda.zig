@@ -56,25 +56,21 @@ const nsplit_prefill = 8;
 const prefill_chunk = 128;
 const grouped_gemv_max = 40;
 
-/// Gemma 4 vision emits up to 280 soft-image tokens (llama.cpp
-/// set_limit_image_tokens(40, 280)). A bidirectional image block is prefilled
-/// in ONE batch so its tokens see each other, so it (not prefill_chunk) sets
-/// the largest single batch: the LOCAL ring slack and (rounded up) the
-/// activation-buffer height.
-const max_image_tokens = 280;
-/// Largest actual batch of rows fed in one forward (text chunk or image block).
-const max_batch = @max(prefill_chunk, max_image_tokens);
-/// Activation-buffer height. opMatmulQuant pads its output rows up to a
-/// multiple of 128, so GEMM-output buffers must reserve the padded height.
-const buf_rows = std.mem.alignForward(usize, max_batch, 128);
+// The largest single forward batch (a text chunk or a whole bidirectional
+// image block) is `cfg.maxBatch()` — runtime, sized from the vision token
+// budget (`cfg.image_budget`), so bigger budgets grow the buffers/ring without
+// inflating the default/text-only case. Activation-buffer height rounds it up
+// to a multiple of 128 (opMatmulQuant pads output rows to /128).
+fn bufRows(cfg: gemma4.Config) usize {
+    return std.mem.alignForward(usize, cfg.maxBatch(), 128);
+}
 
-/// Rows a LOCAL (sliding-window) layer's KV ring holds. The window plus one
-/// max-batch of slack: within a single prefill batch the queries span
-/// `window + seq - 1` positions, so a ring smaller than this would alias a
-/// still-needed key against a freshly-written one. LOCAL caches are fixed at
-/// this size and never grow with the conversation (TODO lever 1).
+/// Rows a LOCAL (sliding-window) layer's KV ring holds: the window plus one
+/// max-batch of slack, so within a single prefill batch (queries span
+/// `window + seq - 1` positions) the ring can't alias a still-needed key
+/// against a freshly-written one. Fixed for the session (never grows).
 fn localRingRows(cfg: gemma4.Config) usize {
-    return cfg.sliding_window + max_batch;
+    return cfg.sliding_window + cfg.maxBatch();
 }
 
 /// Kill-switch for the LOCAL-layer sliding-window ring cache (TODO lever 1).
@@ -568,6 +564,52 @@ pub const CudaLM = struct {
         return true;
     }
 
+    /// Arm a dynamic CPU split ON DEMAND with ALL layers still resident (nothing
+    /// migrated yet), so `residency.migrateNext` can then move layers host-ward
+    /// one at a time under VRAM pressure — even when no split was pre-armed (the
+    /// tp-llm case; the GUI arms via the vram Arbiter, the CLI never does).
+    /// Idempotent. Unlike `enableCpuSplit`, this does NOT run the budget planner
+    /// (which, called mid-life with weights already resident and near-zero
+    /// headroom, would offload almost everything at once); the retry loops
+    /// migrate exactly as many layers as the pressure needs.
+    fn ensureOffloadArmed(self: *CudaLM) !void {
+        if (self.split != null) return;
+        const cfg = self.cfg;
+        const n = cfg.n_layers;
+        const gpa = self.gpa;
+        const order = try gpa.alloc(usize, n); // last layer offloads first
+        errdefer gpa.free(order);
+        for (0..n) |i| order[i] = n - 1 - i;
+        const on_gpu = try gpa.alloc(bool, n);
+        errdefer gpa.free(on_gpu);
+        @memset(on_gpu, true);
+        var cache = try self.hostShadowCache(self.kv_dtype);
+        errdefer cache.deinit(gpa);
+        cache.len = self.len; // host shadow tracks committed length (migrateLayer copies live rows)
+        var scratch = try gemma4.Scratch.init(gpa, cfg.maxBatch(), cfg);
+        errdefer scratch.deinit(gpa);
+        var rope = try ops.rope.RopeTables(2).init(gpa, .{
+            .{ .head_dim = cfg.head_dim_global, .theta = cfg.rope_theta, .freq_factors = self.lm.rope_freqs },
+            .{ .head_dim = cfg.head_dim_local, .theta = cfg.rope_theta_local },
+        }, self.capacity);
+        errdefer rope.deinit(gpa);
+        const hx = try gpa.alloc(f32, cfg.maxBatch() * cfg.hidden);
+        errdefer gpa.free(hx);
+        self.split = .{
+            .on_gpu = on_gpu,
+            .n_cpu = 0,
+            .policy = .attn,
+            .cache = cache,
+            .scratch = scratch,
+            .rope = rope,
+            .hx = hx,
+            .dynamic = true,
+            .order = order,
+            .next = 0,
+            .budget = std.math.maxInt(u64),
+        };
+    }
+
     /// Place layers on the host until the device-resident weights fit under
     /// `budget` (bytes). `dynamic` packs the GPU now (head-only reserve) and
     /// migrates on demand as the KV grows; static reserves generously. No-op
@@ -640,14 +682,14 @@ pub const CudaLM = struct {
         // would make host layers attend over nothing; migrateLayer copies each
         // migrated layer's live rows so declaring them committed is correct.
         cache.len = self.len;
-        var scratch = try gemma4.Scratch.init(gpa, max_batch, cfg);
+        var scratch = try gemma4.Scratch.init(gpa, cfg.maxBatch(), cfg);
         errdefer scratch.deinit(gpa);
         var rope = try ops.rope.RopeTables(2).init(gpa, .{
             .{ .head_dim = cfg.head_dim_global, .theta = cfg.rope_theta, .freq_factors = self.lm.rope_freqs },
             .{ .head_dim = cfg.head_dim_local, .theta = cfg.rope_theta_local },
         }, self.capacity);
         errdefer rope.deinit(gpa);
-        const hx = try gpa.alloc(f32, max_batch * cfg.hidden);
+        const hx = try gpa.alloc(f32, cfg.maxBatch() * cfg.hidden);
         errdefer gpa.free(hx);
 
         self.split = .{
@@ -734,7 +776,11 @@ pub const CudaLM = struct {
                 for ([2]*Growable{ &self.k_cache[l], &self.v_cache[l] }) |b| {
                     self.be.growableEnsure(b, bytes) catch |err| switch (err) {
                         error.DeviceOutOfMemory, error.OutOfMemory => {
-                            if (self.split != null and try residency.migrateNext(self)) continue :grow;
+                            // Arm the split on demand (tp-llm never pre-arms one)
+                            // so KV growth can offload a layer and retry instead
+                            // of dead-ending at ContextFull.
+                            self.ensureOffloadArmed() catch return error.ContextFull;
+                            if (try residency.migrateNext(self)) continue :grow;
                             return error.ContextFull;
                         },
                         else => return err,
@@ -879,8 +925,8 @@ pub const CudaLM = struct {
         const cfg = self.cfg;
         const total = embeds.len / cfg.hidden;
         // A bidirectional image block must be one batch (a later chunk's KV is
-        // not committed when an earlier chunk runs); it fits in max_batch rows.
-        std.debug.assert(total <= max_batch);
+        // not committed when an earlier chunk runs); it fits in maxBatch rows.
+        std.debug.assert(total <= cfg.maxBatch());
         self.bidir_prefill = true;
         defer self.bidir_prefill = false;
         try self.forwardRows(embeds, .none);
@@ -1033,14 +1079,39 @@ pub const CudaLM = struct {
         if (layer.out_scale != 1.0) try self.be.opScale(self.bufs.x, layer.out_scale, seq * self.cfg.hidden);
     }
 
+    /// Forward a batch, offloading layers to the CPU and retrying if the device
+    /// OOMs — so VRAM pressure degrades to a hybrid split instead of failing.
+    /// Safe at this boundary: a failed `forwardRowsOnce` aborts its batch
+    /// (errdefer) and does NOT advance `self.len`, so migrating layers (which
+    /// copies only committed KV `[0,len)`) and re-running is idempotent. Each
+    /// OOM round moves a few layers to bound the retries; if nothing is left to
+    /// migrate, the request genuinely can't fit and the OOM propagates.
     fn forwardRows(self: *CudaLM, x_host: []const f32, out: LogitsOut) !void {
+        while (true) {
+            return self.forwardRowsOnce(x_host, out) catch |err| switch (err) {
+                error.DeviceOutOfMemory, error.OutOfMemory => {
+                    try self.ensureOffloadArmed();
+                    var moved: usize = 0;
+                    while (moved < 4) : (moved += 1) {
+                        if (!(try residency.migrateNext(self))) break;
+                    }
+                    if (moved == 0) return err; // nothing left on the GPU to move
+                    std.log.info("[vram] forward OOM at ctx {d}: offloaded {d} layer(s) to CPU, retrying", .{ self.len, moved });
+                    continue;
+                },
+                else => return err,
+            };
+        }
+    }
+
+    fn forwardRowsOnce(self: *CudaLM, x_host: []const f32, out: LogitsOut) !void {
         const be = self.be;
         const cfg = self.cfg;
         const b = &self.bufs;
         const n = x_host.len / cfg.hidden;
         const eps = cfg.rms_eps;
         const pos0 = self.len;
-        std.debug.assert(n >= 1 and n <= max_batch and n <= self.remaining());
+        std.debug.assert(n >= 1 and n <= cfg.maxBatch() and n <= self.remaining());
 
         try be.tensorUpload(offsetBufSized(b.x, 0, n * cfg.hidden * 4), std.mem.sliceAsBytes(x_host));
 
@@ -1172,7 +1243,7 @@ const Bufs = struct {
     fn init(be: *Backend, cfg: gemma4.Config) !Bufs {
         // Height for the largest single batch (text chunk or whole image block),
         // rounded up to the GEMM's 128-row output padding.
-        const pc = buf_rows;
+        const pc = bufRows(cfg);
         // The flash-split scratch row is (hd+4) f32; size it for the larger
         // (global) head_dim so both local and global attention fit.
         const hd_max = @max(cfg.head_dim_global, cfg.head_dim_local);

@@ -64,6 +64,20 @@ pub const Config = struct {
     swa_pattern: usize,
     /// tanh logit softcapping (0 = disabled).
     final_logit_softcap: f32,
+    /// Largest single bidirectional image block, in soft-image tokens — sizes the
+    /// prefill activation scratch and the LOCAL KV ring slack (a whole image
+    /// block is prefilled in ONE pass). Set from the gemma4v vision token budget
+    /// at load (`gemma4v_vit.Budget`); `detect` defaults it to `high` (280) so a
+    /// text-only or default session is unchanged. Bigger budgets grow these
+    /// buffers (more VRAM); must be fixed for a session (KV rings depend on it).
+    image_budget: usize = 280,
+
+    /// Largest single prefill batch: a text chunk (`prefill_chunk`) or a whole
+    /// bidirectional image block (`image_budget`), whichever is larger. Sizes the
+    /// activation scratch and the LOCAL ring slack.
+    pub fn maxBatch(self: Config) usize {
+        return @max(prefill_chunk, self.image_budget);
+    }
 
     /// Global (full-attention) layer? The rest are local sliding-window.
     pub fn isGlobal(self: Config, l: usize) bool {
@@ -177,15 +191,10 @@ const max_layers = 128;
 /// within one batch (TODO lever 1). Also caps the activation scratch height.
 const prefill_chunk = 128;
 
-/// Gemma 4 vision emits up to 280 soft-image tokens per image (llama.cpp
-/// set_limit_image_tokens(40, 280)). A bidirectional image block is prefilled
-/// in ONE pass, so it (not prefill_chunk) sets the largest single batch the
-/// LOCAL ring must hold.
-const max_image_tokens = 280;
-
-/// Largest single prefill batch: a text chunk (prefill_chunk) or a whole
-/// bidirectional image block (max_image_tokens), whichever is larger.
-const max_batch = @max(prefill_chunk, max_image_tokens);
+// The largest single prefill batch (a text chunk or a whole bidirectional image
+// block) is `Config.maxBatch()` — runtime, sized from the vision token budget
+// (`Config.image_budget`), so a bigger budget grows the scratch + LOCAL ring
+// without inflating the default/text-only case.
 
 /// Kill-switch for the LOCAL-layer sliding-window ring cache (A/B validation).
 const enable_local_ring = true;
@@ -195,7 +204,7 @@ const enable_local_ring = true;
 fn kvRings(cfg: Config, alloc: std.mem.Allocator) ![]usize {
     const rings = try alloc.alloc(usize, cfg.n_layers);
     for (rings, 0..) |*r, l| {
-        r.* = if (enable_local_ring and !cfg.isGlobal(l)) cfg.sliding_window + max_batch else 0;
+        r.* = if (enable_local_ring and !cfg.isGlobal(l)) cfg.sliding_window + cfg.maxBatch() else 0;
     }
     return rings;
 }
@@ -347,13 +356,13 @@ pub const Model = struct {
         out: ?[]f32,
         // Bidirectional: the whole `x` is one image-token block that must attend
         // itself in full, so it is prefilled in a SINGLE un-chunked pass (a
-        // Gemma image block, <= max_image_tokens, always fits the local ring).
+        // Gemma image block, <= image_budget, always fits the local ring).
         bidirectional: bool,
     ) !void {
         const cfg = self.cfg;
         const seq = x.len / cfg.hidden;
         std.debug.assert(seq > 0 and seq <= cache.remaining());
-        std.debug.assert(!bidirectional or seq <= max_image_tokens);
+        std.debug.assert(!bidirectional or seq <= cfg.image_budget);
 
         // Prefill in prefill_chunk-sized batches so a LOCAL layer's ring never
         // has to hold more than `window + prefill_chunk` live positions at once

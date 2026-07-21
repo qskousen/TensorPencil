@@ -3574,6 +3574,56 @@ pub const rope_vision_ptx: [:0]const u8 =
     \\}
 ;
 
+/// gemma4v vision 2-D RoPE (neox). Distinct from rope_vision (Qwen3-VL): here
+/// each head is split into two HALVES [0,2h) and [2h,4h) — span 0 rotates
+/// against grid col (pos2[t][0]=x), span 1 against row (pos2[t][1]=y) — with the
+/// neox pairing WITHIN each span: (off+i, off+h+i). Matches the CPU
+/// rope.applyRotateHalfPosSpan applied twice. b0=qk, b1=pos2(u32[rows*2]),
+/// b2=freqs(cos then sin at sin_off). u0=total(rows*n_heads*2*half), u1=half,
+/// u2=sin_off, u3=n_heads, u4=head_dim.
+pub const rope_vision_gemma4_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry rope_vision_gemma4(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<2>;
+    \\  .reg .b32 %r<28>;
+    \\  .reg .f32 %f<8>;
+    \\  .reg .b64 %rd<16>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1];               // half
+    \\  ld.param.u32 %r7,[u2];               // sin_off
+    \\  ld.param.u32 %r8,[u3];               // n_heads
+    \\  ld.param.u32 %r21,[u4];              // head_dim
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
+    \\  shl.b32 %r9,%r6,1;                    // pph = 2*half (pairs per head)
+    \\  rem.u32 %r10,%r4,%r9;                 // pair
+    \\  div.u32 %r11,%r4,%r9;                 // hp = row*n_heads + head
+    \\  div.u32 %r13,%r11,%r8;                // row (token)
+    \\  div.u32 %r14,%r10,%r6;                // span (0=x, 1=y)
+    \\  rem.u32 %r16,%r10,%r6;                // fi (freq index within span)
+    \\  shl.b32 %r17,%r13,1; add.u32 %r17,%r17,%r14;                        // pos2 index = row*2 + span
+    \\  mul.wide.u32 %rd4,%r17,4; add.s64 %rd5,%rd2,%rd4; ld.global.u32 %r18,[%rd5]; // pos
+    \\  mad.lo.s32 %r19,%r18,%r6,%r16;        // cos idx = pos*half + fi
+    \\  mul.wide.u32 %rd6,%r19,4; add.s64 %rd7,%rd3,%rd6; ld.global.f32 %f1,[%rd7]; // cos
+    \\  add.s32 %r20,%r19,%r7;
+    \\  mul.wide.u32 %rd8,%r20,4; add.s64 %rd9,%rd3,%rd8; ld.global.f32 %f2,[%rd9]; // sin
+    \\  mad.lo.s32 %r22,%r14,%r9,%r16;        // span*pph + fi
+    \\  mad.lo.s32 %r22,%r11,%r21,%r22;       // lo = hp*head_dim + span*pph + fi
+    \\  add.s32 %r23,%r22,%r6;                // hi = lo + half
+    \\  mul.wide.u32 %rd10,%r22,4; add.s64 %rd11,%rd1,%rd10; ld.global.f32 %f3,[%rd11];
+    \\  mul.wide.u32 %rd12,%r23,4; add.s64 %rd13,%rd1,%rd12; ld.global.f32 %f4,[%rd13];
+    \\  mul.f32 %f5,%f3,%f1; mul.f32 %f6,%f4,%f2; sub.f32 %f5,%f5,%f6; st.global.f32 [%rd11],%f5;  // lo*cos - hi*sin
+    \\  mul.f32 %f6,%f4,%f1; fma.rn.f32 %f6,%f3,%f2,%f6; st.global.f32 [%rd13],%f6;               // hi*cos + lo*sin
+    \\END:
+    \\  ret;
+    \\}
+;
+
 /// Deinterleave the qwen35 attention q projection: per 2*hd-wide head slot,
 /// q[h*hd+d] = qg[h*2*hd + d], gate[h*hd+d] = qg[h*2*hd + hd + d].
 /// b0=qg, b1=q, b2=gate. u0=total q elems (n_heads*hd), u1=hd.
@@ -4511,6 +4561,34 @@ pub const gelu_mul_ptx: [:0]const u8 =
     \\  neg.f32 %f4,%f3; mul.f32 %f4,%f4,0f3FB8AA3B; ex2.approx.f32 %f4,%f4; add.f32 %f4,%f4,0f3F800000; rcp.approx.f32 %f4,%f4;
     \\  mul.f32 %f1,%f1,%f4;                        // geluTanh(x) = x*sigmoid(w)
     \\  mul.f32 %f1,%f1,%f2; st.global.f32 [%rd4],%f1;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// a[idx] = gelu_quick(a[idx]) * b[idx], in place: gelu_quick(x)=x*sigmoid(1.702x)
+/// (ggml FFN_GELU_QUICK, gemma4v vision FFN gate). b0=a(gate), b1=b(up). u0=total.
+pub const gelu_quick_mul_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry gelu_quick_mul(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<2>;
+    \\  .reg .b32 %r<6>;
+    \\  .reg .f32 %f<6>;
+    \\  .reg .b64 %rd<8>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2;
+    \\  mul.wide.u32 %rd3,%r4,4; add.s64 %rd4,%rd1,%rd3; add.s64 %rd5,%rd2,%rd3;
+    \\  ld.global.f32 %f1,[%rd4]; ld.global.f32 %f2,[%rd5];  // gate, up
+    \\  mul.f32 %f3,%f1,0f3FD9DB23;                          // w = 1.702*gate
+    \\  neg.f32 %f4,%f3; mul.f32 %f4,%f4,0f3FB8AA3B; ex2.approx.f32 %f4,%f4; add.f32 %f4,%f4,0f3F800000; rcp.approx.f32 %f4,%f4; // sigmoid(w)
+    \\  mul.f32 %f1,%f1,%f4;                                 // gate*sigmoid(1.702*gate)
+    \\  mul.f32 %f1,%f1,%f2; st.global.f32 [%rd4],%f1;        // *up
     \\END:
     \\  ret;
     \\}

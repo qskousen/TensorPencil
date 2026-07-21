@@ -96,10 +96,10 @@ Per-stage dispatch order everywhere is `if (cu_be)` → CUDA, `else if (gpu_ctx)
 
 | Model | cpu | vulkan | zig-cuda | cuda | Files | Notes |
 |---|---|---|---|---|---|---|
-| **qwen3** (Qwen3 / Qwen3-VL) | ✅ | ✅¹ | ✅ | ✅ | `qwen3{,_gpu,_cuda}.zig` | only arch with spec decode; primary path fp8 safetensors; GGUF metadata config-detect up to 64 layers (Qwen3-32B); hybrid CPU split like qwen35 (32B: offload beats streaming ~1.7x at equal budget) |
+| **qwen3** (Qwen3 / Qwen3-VL) | ✅ | ✅¹ | ✅ | ✅ | `qwen3{,_gpu,_cuda}.zig` | only arch with spec decode; primary path fp8 safetensors; GGUF metadata config-detect up to 64 layers (Qwen3-32B); hybrid CPU split like qwen35 (32B: offload measured ~1.7x over the removed streaming path at equal budget) |
 | **qwen35** (hybrid DeltaNet: GDN+attn) | ✅ | ✅ | ✅ | ✅ | `qwen35{,_gpu,_cuda}.zig` | GGUF block-quant on vulkan too; no spec (recurrent state) |
 | **gemma3** (sandwich norms, dual RoPE) | ✅ | ✅ | ✅ | ✅ | `gemma3{,_gpu,_cuda}.zig` | entirely GGUF block-quant |
-| **gemma4** (per-layer geom, factored RoPE) | ✅ | ❌² | ✅ | ✅ | `gemma4{,_cuda}.zig` | `--backend vulkan` rejected; hybrid CPU split like gemma3 (GUI-driven; per-layer-KV host shadow keeps the device ring layout) |
+| **gemma4** (per-layer geom, factored RoPE) | ✅ | ❌² | ✅ | ✅ | `gemma4{,_cuda}.zig` | `--backend vulkan` rejected; hybrid CPU split like gemma3 (GUI-driven; per-layer-KV host shadow keeps the device ring layout). Config is fully metadata-driven: 12B (Q4_0, 48L) **and 31B** (mixed Q4_K/Q6_K + tied Q6_K head, 60L, hidden 5376, kv 16↔4) both load with no code change; vision via `gemma4uv`/`gemma4v` towers (see §5) |
 
 ¹ **qwen3 on vulkan rejects GGUF block-quant** (`llm_main.zig`): dense fp8/bf16/f32 only. bf16 weights are read **natively** (2-byte, `transpose_bf16`/`pipe_tr_bf16` + a bf16 branch in `gemv_partial`/`gemv_partial4`, weight code `context.WCode.bf16`), like CUDA's `gemv_bf16` — no widening, weights stay 8GB. bf16 has no tiled GEMM so prefill streams through grouped GEMV. Generation is coherent (4B ~32 tok/s) but not token-identical to CPU (GEMV reduction-order drift).
 ² No `gemma4_gpu.zig`; `Spec.Vulkan = void`.
@@ -112,9 +112,11 @@ Per-stage dispatch order everywhere is `if (cu_be)` → CUDA, `else if (gpu_ctx)
 |---|---|---|---|---|---|---|
 | **Qwen3-VL `vit35`** (SigLIP, 2-D RoPE) | ✅ | ❌ | ✅ | ✅ | `vit35{,_cuda}.zig` | bf16 blocks/proj, f32 patch |
 | **Gemma 3 `gemma_vit`** (SigLIP-So400m) | ✅ | ✅ | ✅ | ✅ | `gemma_vit{,_gpu,_cuda}.zig` | f16 blocks (vulkan: →f32 at load) |
-| **Gemma 4 `gemma4_vit`** (shallow embedder) | ✅ | ❌ | ✅ | ✅ | `gemma4_vit{,_cuda}.zig` | f32 patch, bf16 proj |
+| **Gemma 4 `gemma4_vit`** (shallow `gemma4uv` embedder, 12B) | ✅ | ❌ | ✅ | ✅ | `gemma4_vit{,_cuda}.zig` | f32 patch, bf16 proj |
+| **Gemma 4 `gemma4v_vit`** (full SigLIP tower, 31B) | ✅ | ❌ | ✅ | ✅ | `gemma4v_vit{,_cuda}.zig` | Q8_0/F16 blocks, f32 patch |
 
 - Only **gemma3** has a Vulkan ViT. Interactive `@image` chat mentions are **CUDA-only**; one-shot `--image` falls back to CPU (all towers) or Vulkan (gemma3 only).
+- ³ The **`gemma4v`** tower (31B `DarkIdol-Gemma-4-31B` mmproj: `projector_type "gemma4v"` — full 27-block SigLIP with per-head QK-RMSNorm, 2-D neox RoPE θ=100, weightless V-norm, `kq_scale=1.0`, GeGLU-quick FFN, RMS sandwich norms, 3×3 avg-pool merge, `std_bias`/`std_scale` affine, single `mm.input_projection`). CPU forward `gemma4v_vit.zig`; CUDA/zig-cuda device tower `gemma4v_vit_cuda.zig` runs the 27 blocks device-side (~1.0 s at 512² vs ~3.6 s CPU) and projects on host — reuses `opAttnTC`/`opHeadPad`/`qkNorm` + three gemma4v-specific ops (`opRopeVisionGemma4` 2-D neox rope, `geluQuickMul`, and qkNorm-as-RMS over `dim`). Vulkan not built (gemma4 has no Vulkan LLM). Preprocess follows **Google's `gemma4_vision_token_budget`**: aspect-preserving resize (NO crop, NO letterbox/pad) to a 48-aligned grid sized so post-merge tokens target a settable budget `nMax` — `f = sqrt(nMax·48²/(w·h))`, each dim floored to /48; `2·p/255 − 1` normalize. Budget is runtime-settable: CLI `--vision-budget low|medium|high|ultra|max|<tokens>` and tp-gui "Vision detail" dropdown (`config.VisionBudget`), presets 70/140/280/560/1120, default `high` (280). The budget also sizes the **LLM's** image-prefill scratch + LOCAL KV-ring slack (`gemma4.Config.image_budget` → `maxBatch()`/`bufRows()`/`localRingRows`), since a bidirectional image block prefills in ONE pass — so it's fixed at load (reload-gated in the GUI via `llmReloadEql`), and `high`/default stays lean (no regression). `ultra`/`max` (~540/~1080 tokens) roughly triple that scratch + ring; on a 24 GB card + 31B they need headroom (`--kv-dtype q8_0` and/or a smaller `--max-context`) or they OOM cleanly (no corruption). `TP_VIT_DUMP=<path.png>` writes the exact pixels the tower ingests. Dispatch by `clip.vision.projector_type` picks `gemma4v_vit` vs the shallow `gemma4uv` `gemma4_vit` (both CLI `runGemma4` and tp-gui). GPU parity vs the f32 CPU tower is looser than gemma3's (min-token cos ~0.96): the `kq_scale=1.0` peaked softmax makes the f16 tensor-core attention more divergent — semantically preserved (image-accurate captions match the CPU tower).
 
 ---
 
@@ -150,16 +152,28 @@ Turn-boundary checkpoints back tp-gui's O(snapshot) "regenerate response" / vari
 | EAGLE-3 head (`--eagle`) | ❌ | ❌ | ✅ | ✅ |
 | tree drafting (`--tree`) | ❌ (verify only) | ❌ | ✅ | ✅ |
 
-### Weight streaming / offload
+### Weight residency / offload
+
+**LLM weights NEVER stream.** Every LLM weight pins device-resident on first
+touch (`Backend.pinAllWeights` / Vulkan `pin_budget = maxInt`, set by
+`llm/session.zig` bring-up and the GUI session loader) and is immune to LRU
+eviction. A model that outgrows VRAM degrades by migrating **whole layers to
+the CPU** (the hybrid split below) — measured ~2.5x faster than the removed
+weight-streaming fallback, whose LRU-vs-cyclic-walk pathology re-uploaded ~the
+whole model per token the moment the budget fell short (the 31B 0.1 tok/s
+cliff). `--vram-budget` now only sizes the split planners; on Vulkan (no split)
+a model that doesn't fit fails with a clean error. Per-step weight streaming
+remains a **diffusion-only** mechanism (`pin_floor` + prefetch staging ring).
 
 | Feature | cpu | vulkan | zig-cuda | cuda | Models |
 |---|---|---|---|---|---|
-| `--vram-budget` weight pinning | — | ✅ pin-prefix | ✅ | ✅ | all |
-| PCIe tail streaming (page-locked mmap) | ❌ | ❌ | ✅ | ✅ | qwen3/qwen35/gemma3 |
+| pin-all weight residency | — | ✅ | ✅ | ✅ | all |
 | `--cpu-layers` static split | ❌ | ❌ | ✅ | ✅ | qwen3/qwen35 |
 | `--offload-grow` dynamic offload | ❌ | ❌ | ✅ | ✅ | qwen3/qwen35 |
 
 The hybrid CPU/GPU split works with **every KV dtype** (`--kv-dtype f32|f16|q8_0`): the offloaded layers' host shadow (`llm/kv_cache.zig KvCache`, or `PerLayerKvCache` for gemma4's per-layer geometry) stores the same storage format as the device caches — packed-f16 slots or raw ggml `block_q8_0` bytes, byte-identical to the device layout — so migrate/promote (and the ring checkpoint copies — gemma3 translates ring↔linear, gemma4's shadow keeps the device ring layout so rings move wholesale) are raw, lossless copies (`kRowBytes`/`vRowBytes`). f16/q8_0 KV therefore keep their reduced footprint on both sides of the split AND the offload safety net at once. The GUI dtype toggle (`reinitCache`) also survives an armed split: the host shadow is rebuilt at the new dtype and host-resident layers keep no device KV. Applies to qwen3/qwen35/gemma3/gemma4 (the gemma models' split is GUI-driven — `autoOffload`/`settleTo`/`imageReclaim` — not exposed as CLI flags); qwen3's EAGLE-tap/tree paths remain f32-only.
+
+**Automatic offload-on-OOM (gemma4, CLI + GUI):** `gemma4_cuda` never dead-ends on a device OOM while a layer can still move to the host. On `DeviceOutOfMemory` during a prefill forward (`forwardRows` retry wrapper) or KV growth (`ensureCapacity`), it arms a dynamic split **on demand** (`ensureOffloadArmed` — all layers resident, `n_cpu=0`, so `migrateNext` can then offload incrementally; it deliberately skips `enableCpuSplit`'s budget planner, which mid-life would offload almost everything at once), migrates a few layers to the CPU, and retries. Safe at the forward boundary: a failed forward aborts its batch and does NOT advance `self.len`, so migrating (which copies only committed KV `[0,len)`) and re-running is idempotent. This makes **tp-llm** (which never pre-arms a split, unlike the GUI's Arbiter) able to run/prefill a model or a large `--vision-budget` that doesn't fully fit — it degrades to a hybrid split (slower) instead of crashing. `session.zig` sets `model.io` before the CUDA prefill (not just decode) so the host layer path works. Only engages under real pressure — `high`/fitting workloads stay fully resident (`self.split == null`, zero overhead). Pattern is gemma4-only for now; drops into the other `*_cuda.zig` steppers via the shared `runtime/residency.zig` as a follow-up.
 
 **q8_0 KV** (`--kv-dtype q8_0`, GUI dropdown): the ggml `block_q8_0` format — 34 bytes per 32 elements (f16 scale `d = absmax/127` + 32 × i8), ~3.8× smaller than f32. Rows are quantized once on write/append (CPU `packQ80`, CUDA `f32_to_q8_0`/`kv_append_s_q8`, Vulkan `kv_store_q8_0`) and dequantized inside the attention kernels (CUDA `attn_split_q8`/`attn_split_h256_q8`/`attn_split_h512_q8` + graph `_s_q8` twins, Vulkan `attn_dsplit_gemma_q8`, CPU dequant-on-view). Quantization rounds ties-to-EVEN on every engine (host 2^23 trick / CUDA `cvt.rni` / Vulkan floor+compare — deliberately diverging from ggml's `roundf` only on exact .5 ties) so host- and device-quantized bytes are **bit-identical**: a row quantized on either side of an offload split, checkpoint, or migrate/promote round trip produces the same cache bytes (see the `opStoreKvQ8 ... bit-identically` device test). Every model kv_dim is a multiple of 64, so rows never split blocks and the byte math stays 4-aligned. Backend coverage matches f16: all four backends; on Vulkan gemma3/qwen35 only (qwen3's hd128 Vulkan path stays f32); qwen3 spec-decode tree/EAGLE stay f32-only. Like f16, q8_0 is lossy — output is not token-identical to f32 — and a dtype toggle rebuilds the context.
 
@@ -215,6 +229,7 @@ GEMM builders: `buildHgemm` (f16/bf16 mma m16n8k16) · `buildIgemmSmem`/`buildIg
 GEMV: `gemv_{fp8,bf16,f16,q8_0,q4_0,q4_k,q5_k,q6_k}` + `_q8`/grouped-N `_q8n` dp4a variants.
 Attn: `attn`, `attn_split`/`_merge`/`_h256`/`_h512`/`_tree`. GDN: `gdn_{conv_step,gates,delta_step}`.
 Plus `im2col`, dtype-pad converts, `dequant_*_f16`, rope/norm/act kernels.
+Vision: `rope_vision` (Qwen3-VL 2-D rope) · `rope_vision_gemma4` (gemma4v per-head-half x/y neox rope) · `gelu_quick_mul` (gemma4v GeGLU-quick FFN).
 
 ### cuda — vendor libs (`.libs` mode)
 **cuBLASLt** (`src/gpu/cuda/cublaslt.zig`): int8 `R_8I`/`COMPUTE_32I`, f16 `R_16F`, bf16 `R_16BF` (prefill GEMM only).

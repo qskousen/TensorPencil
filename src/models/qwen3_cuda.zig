@@ -10,8 +10,9 @@
 //! low hundreds of tokens), so the O(seq²) kernel is a sub-second one-time cost.
 //! The embedding gather (bf16→f32) and the rope table are CPU-side.
 //!
-//! fp8 weights stream through the Backend weight cache, so a small --vram-budget
-//! degrades to weight streaming here exactly as it does for the DiT.
+//! Weights upload once through the Backend weight cache and pin resident (LLM
+//! weights never stream); a model that outgrows VRAM degrades via the hybrid
+//! CPU/GPU layer split (--cpu-layers / --offload-grow).
 
 const std = @import("std");
 const qwen3 = @import("qwen3.zig");
@@ -453,11 +454,11 @@ pub const CudaLM = struct {
 
     /// Commit more KV rows, in place: device pointers (and the captured
     /// decode graph — sin_off and the KV strides are capacity-independent)
-    /// stay valid. Under VRAM pressure the commit evicts LRU weights into
-    /// the streaming path, which flips the graph off via the evictions guard
-    /// in step(). error.ContextFull past the window, when even eviction
-    /// can't free enough device memory, or when the tap/tree layouts (which
-    /// stride by capacity) pin the session to a fixed size.
+    /// stay valid. Under VRAM pressure a dynamic split migrates layers to
+    /// the CPU to make room (weights are pinned, never evicted into a
+    /// streaming path). error.ContextFull past the window, when even
+    /// migration can't free enough device memory, or when the tap/tree
+    /// layouts (which stride by capacity) pin the session to a fixed size.
     pub fn ensureCapacity(self: *CudaLM, min_rows: usize) !void {
         if (min_rows <= self.capacity) return;
         if (min_rows > self.max_capacity) return error.ContextFull;
@@ -519,9 +520,9 @@ pub const CudaLM = struct {
     /// --profile and capture failures fall back to per-op launches.
     pub fn step(self: *CudaLM, io: std.Io, ids: []const u32, logits: []f32) !void {
         self.io = io; // the CPU half of a hybrid split runs host matmuls through it
-        // Any weight eviction (--vram-budget streaming, or live VRAM pressure
-        // from another process) means device weight pointers are not stable,
-        // and a captured graph would replay against freed buffers.
+        // Any weight eviction (the GUI's reclaim paths under VRAM pressure)
+        // means device weight pointers are not stable, and a captured graph
+        // would replay against freed buffers.
         if (self.be.evictions != 0) self.graph_ok = false;
         if (ids.len == 1 and self.graphEligible()) {
             if (self.decode_warm) return self.stepDecodeGraph(ids[0], logits);
@@ -1061,9 +1062,7 @@ pub const CudaLM = struct {
 
         try be.beginBatch();
         errdefer if (be.batching()) be.abortBatch();
-        self.prefetchLayer(0);
         for (self.lm.layers, 0..) |layer, l| {
-            self.prefetchLayer(l + 1); // == layers.len prefetches the LM head
             if (self.taps_on) {
                 for (self.tap_layers, 0..) |tl, j| {
                     if (l == tl) try be.opCopyOff(tb.taps, j * spec_limits.max_tree_nodes * c.hidden, b.x, 0, n * c.hidden);
@@ -1144,7 +1143,6 @@ pub const CudaLM = struct {
         const h = self.cfg.hidden;
         try be.qkNorm(offsetBufSized(b.x, (seq - 1) * h * 4, h * 4), b.t, try nbuf(be, self.lm.final_norm), 1, h, eps);
         try self.lmHeadGemv(b.logits, b.t);
-        self.prefetchLayer(0); // next token's first layer DMAs behind the LM head
         try be.endBatch();
         self.advance(seq);
 
@@ -1357,9 +1355,7 @@ pub const CudaLM = struct {
         // Hybrid split: each chunk begins with the hidden on the device (bufs.x).
         if (self.split) |*sp| sp.on_host = false;
 
-        self.prefetchLayer(0);
         for (self.lm.layers, 0..) |layer, l| {
-            self.prefetchLayer(l + 1); // == layers.len prefetches the LM head
             if (self.taps_on) {
                 for (self.tap_layers, 0..) |tl, j| {
                     if (l == tl) try be.opCopyOff(self.tap_d, (j * self.capacity + pos0) * c.hidden, b.x, 0, seq * c.hidden);
@@ -1395,47 +1391,6 @@ pub const CudaLM = struct {
             try be.tensorUpload(offsetBufSized(b.x, 0, seq * c.hidden * 4), std.mem.sliceAsBytes(sp.hx[0 .. seq * c.hidden]));
             sp.on_host = false;
         };
-    }
-
-    /// Upload every linear weight and the LM head now, claiming pin residency
-    /// (first-touch, up to the backend's pin_budget) ahead of any model that
-    /// forwards later. Under --vram-budget the CLI calls this on the DRAFT
-    /// model before the target's first forward: the draft is read once per
-    /// drafted token, so pinning it buys more transfer savings per byte than
-    /// pinning the same bytes of the target (which verify reads only once per
-    /// ~k accepted tokens).
-    pub fn prewarmWeights(self: *CudaLM) !void {
-        const be = self.be;
-        for (self.lm.layers) |layer| {
-            inline for (.{ layer.q, layer.k, layer.v, layer.o, layer.gate, layer.up, layer.down }) |w| {
-                try be.warmWeight(w.bytes);
-            }
-        }
-        try be.warmWeight(self.lm.embed.bytes);
-        if (self.lm.head.bytes.ptr != self.lm.embed.bytes.ptr) try be.warmWeight(self.lm.head.bytes);
-    }
-
-    /// Queue layer `l`'s linear weights (or, past the last layer, the tied
-    /// bf16 LM head) for async prefetch — called one layer ahead so streamed
-    /// weights DMA from the page-locked mmap while the previous layer
-    /// computes (the dit_cuda.prefetchBlock analogue). No-op when direct
-    /// streaming is off; a cheap cache re-stamp when the weights are resident.
-    fn prefetchLayer(self: *CudaLM, l: usize) void {
-        const be = self.be;
-        if (!be.async_uploads) return;
-        if (l < self.lm.layers.len) {
-            // A CPU-resident layer's weights never touch the device — the
-            // host path reads them from the mapping; prefetching them would
-            // silently upload the whole "offloaded" tail anyway.
-            if (self.split) |*sp| if (!sp.on_gpu[l]) return;
-            const layer = self.lm.layers[l];
-            inline for (.{ layer.q, layer.k, layer.v, layer.o, layer.gate, layer.up, layer.down }) |w| {
-                be.prefetchWeight(w.bytes);
-            }
-        } else {
-            be.prefetchWeight(self.lm.embed.bytes);
-            if (self.lm.head.bytes.ptr != self.lm.embed.bytes.ptr) be.prefetchWeight(self.lm.head.bytes);
-        }
     }
 
     pub fn vocab(self: *const CudaLM) usize {
@@ -1752,60 +1707,6 @@ test "cuda tree spec matches vanilla greedy on the real model" {
     try std.testing.expectEqualSlices(u32, ids_vanilla.items, ids_tree.items);
 }
 
-// Gated on a CUDA device + the checkpoint: greedy decode under a --vram-budget
-// far below the checkpoint size (a first-touch prefix pinned resident, the
-// rest LRU-evicted and re-uploaded every token; the eviction guard keeps
-// decode off the captured graph) must equal resident greedy decode exactly.
-test "cuda weight streaming matches resident greedy on the real model" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    const engine = @import("../llm/engine.zig");
-    const chat = @import("../llm/chat.zig");
-    const tokenizer_mod = @import("tp_core").tokenizer;
-    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
-    std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
-    std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
-    // st before be: Backend.deinit unregisters the page-locked mmap, so the
-    // mapping must still exist when it runs (defers are LIFO).
-    var st = try safetensors.SafeTensors.open(gpa, io, te_path);
-    defer st.deinit();
-    const be = Backend.init(gpa) catch return error.SkipZigTest;
-    defer be.deinit();
-
-    var lm = try qwen3.CausalLM.load(gpa, .{ .safetensors = &st });
-    defer lm.deinit();
-    var tok = try tokenizer_mod.Tokenizer.init(gpa);
-    defer tok.deinit();
-
-    const opts: engine.Options = .{ .max_new_tokens = 4, .sampling = .{ .temperature = 0 } };
-    var ids_resident: std.ArrayList(u32) = .empty;
-    defer ids_resident.deinit(gpa);
-    try chat.appendUser(&tok, gpa, "Count: one two three one two", &ids_resident);
-    try chat.openAssistant(&tok, gpa, &ids_resident);
-    var ids_streamed: std.ArrayList(u32) = .empty;
-    defer ids_streamed.deinit(gpa);
-    try ids_streamed.appendSlice(gpa, ids_resident.items);
-
-    {
-        var model = try CudaLM.init(gpa, be, &lm, .fixed(try engine.capacityFor(opts, ids_resident.items.len)), ids_resident.items.len);
-        defer model.deinit();
-        _ = try engine.generate(&model, &tok, io, gpa, &ids_resident, opts, null);
-    }
-    be.evictWeights();
-    be.budget_override = 1 << 30; // ~1/4 of the fp8 checkpoint: forces streaming
-    be.pin_budget = 1 << 29; // first ~512 MiB of weights pinned, rest streams
-    if (st.mapping) |m| be.enableDirectStreaming(m); // prefetched direct-DMA path
-    {
-        var model = try CudaLM.init(gpa, be, &lm, .fixed(try engine.capacityFor(opts, ids_streamed.items.len)), ids_streamed.items.len);
-        defer model.deinit();
-        try model.prewarmWeights(); // the draft-pinning path: first claim on pin_budget
-        _ = try engine.generate(&model, &tok, io, gpa, &ids_streamed, opts, null);
-    }
-    try std.testing.expect(be.pinned_bytes > 0); // a prefix actually pinned
-    try std.testing.expect(be.evictions > 0); // and the remainder streamed
-    try std.testing.expectEqualSlices(u32, ids_resident.items, ids_streamed.items);
-}
-
 // Hybrid CPU/GPU split mechanics on the real model: a tight budget places
 // layers on the host, generation runs (host layers through the shared
 // transformer.layerForward), the host KV shadow stays in lockstep with the
@@ -1900,8 +1801,8 @@ test "cuda cpu split: host layers generate, rollback stays in sync, promote rest
 
 // f16 KV + CPU offload (TODO "f16 kv cache + cpu offload"): the host shadow
 // stores packed f16 — byte-identical to the device cache — so the hybrid
-// split arms on f16 configs too, instead of forcing a near-VRAM-size model
-// into the slow resident+streaming mode.
+// split arms on f16 configs too, instead of leaving a near-VRAM-size model
+// with no offload path.
 test "cuda cpu split with f16 kv: host layers generate, rollback stays in sync, promote restores" {
     try cpuSplitGenerateBody(.f16);
 }

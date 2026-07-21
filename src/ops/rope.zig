@@ -300,6 +300,42 @@ pub fn applyRotateHalfPos(x: []f32, freqs: Freqs, positions: []const usize, n_he
     }
 }
 
+/// Rotate-half RoPE over a contiguous sub-span [off, off+span) of each head,
+/// with an explicit absolute position per row. Pairs (off+i, off+span/2+i) for
+/// i in [0, span/2). `freqs` must be built with head_dim = span and cover
+/// max(positions)+1 rows. Used by the gemma4v vision tower's 2-D RoPE: each
+/// head's first half rotates against the x grid coordinate (span [0,hd/2),
+/// positions = patch column) and the second half against y (span [hd/2,hd),
+/// positions = patch row) — matching llama.cpp's per-half neox `ggml_rope_ext`.
+pub fn applyRotateHalfPosSpan(
+    x: []f32,
+    freqs: Freqs,
+    positions: []const usize,
+    n_heads: usize,
+    head_dim: usize,
+    off: usize,
+    span: usize,
+) void {
+    const half = span / 2;
+    std.debug.assert(freqs.half == half);
+    std.debug.assert(off + span <= head_dim);
+    std.debug.assert(x.len == positions.len * n_heads * head_dim);
+    for (positions, 0..) |pos, p| {
+        std.debug.assert((pos + 1) * half <= freqs.cos.len);
+        const cos = freqs.cos[pos * half ..][0..half];
+        const sin = freqs.sin[pos * half ..][0..half];
+        for (0..n_heads) |h| {
+            const base = (p * n_heads + h) * head_dim + off;
+            for (0..half) |i| {
+                const lo = x[base + i];
+                const hi = x[base + half + i];
+                x[base + i] = lo * cos[i] - hi * sin[i];
+                x[base + half + i] = hi * cos[i] + lo * sin[i];
+            }
+        }
+    }
+}
+
 /// FLUX sinusoidal timestep embedding: out = [cos(t' w_i) .. sin(t' w_i) ..]
 /// with t' = 1000 t, w_i = max_period^(-i/half). `out.len` must be even.
 pub fn timestepEmbedding(out: []f32, t: f32, max_period: f32) void {

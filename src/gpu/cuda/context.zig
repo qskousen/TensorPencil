@@ -186,38 +186,6 @@ pub const Context = struct {
         try self.check(self.api.cuEventRecord(ev, self.xfer_stream), "cuEventRecord(xfer)");
     }
 
-    /// Page-lock an existing host range (a checkpoint mmap) so uploads from it
-    /// can DMA directly, with no staging memcpy. READ_ONLY registration is
-    /// unsupported on discrete-GPU x86 (CUDA_ERROR_NOT_SUPPORTED), so the
-    /// MAP_PRIVATE mapping is first made writable — copy-on-write and never
-    /// actually written, so no extra RAM. Faults the whole range in and pins
-    /// that much host RAM. False if either step fails (caller stays on the
-    /// sync upload path).
-    pub fn registerHost(self: *Context, bytes: []const u8) bool {
-        const rc = std.os.linux.mprotect(bytes.ptr, bytes.len, .{ .READ = true, .WRITE = true });
-        if (std.posix.errno(rc) != .SUCCESS) return false;
-        const p: *anyopaque = @ptrCast(@constCast(bytes.ptr));
-        const r = self.api.cuMemHostRegister(p, bytes.len, 0);
-        if (r != cu.CUDA_SUCCESS) std.debug.print("[registerHost failed: {s}]\n", .{self.api.errName(r)});
-        return r == cu.CUDA_SUCCESS;
-    }
-
-    /// Undo registerHost. Must run before the range is unmapped and after all
-    /// DMAs from it have completed.
-    pub fn unregisterHost(self: *Context, bytes: []const u8) void {
-        _ = self.api.cuMemHostUnregister(@ptrCast(@constCast(bytes.ptr)));
-    }
-
-    /// Async HtoD upload from page-locked (registered) host memory on the
-    /// transfer stream: one full-bandwidth DMA straight from the mmap, no
-    /// staging. Records `ev` (weight ready) for the compute stream to wait on.
-    pub fn uploadDirect(self: *Context, buf: Buffer, data: []const u8, ev: cu.CUevent) Error!void {
-        std.debug.assert(data.len <= buf.bytes);
-        self.htod_bytes += data.len;
-        try self.check(self.api.cuMemcpyHtoDAsync(buf.ptr, @ptrCast(data.ptr), data.len, self.xfer_stream), "cuMemcpyHtoDAsync(direct)");
-        try self.check(self.api.cuEventRecord(ev, self.xfer_stream), "cuEventRecord(direct)");
-    }
-
     /// Make the compute stream wait for a transfer-stream event (the weight upload)
     /// before subsequent launches read the buffer.
     pub fn computeWaitEvent(self: *Context, ev: cu.CUevent) Error!void {

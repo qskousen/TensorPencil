@@ -197,6 +197,17 @@ pub fn render(cfg: *config.Config, cb: Callbacks) void {
     {
         var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 4 } });
         defer row.deinit();
+        dvui.label(@src(), "Vision detail (Gemma 4)", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
+        _ = dvui.dropdownEnum(@src(), config.VisionBudget, .{ .choice = &cfg.vision_budget }, .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 200 } });
+    }
+    help("Gemma 4 vision token budget: how many tokens (spatial detail) the " ++
+        "image tower spends per image. low=70 … high=280 (default) … max=1120. " ++
+        "Higher = sharper detail but much more VRAM (ultra/max may not fit " ++
+        "alongside a large model). Reloads the model (chat preserved). Ignored " ++
+        "by other models.");
+    {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 4 } });
+        defer row.deinit();
         dvui.label(@src(), "Diffusion backend", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
         _ = dvui.dropdownEnum(@src(), config.Backend, .{ .choice = &cfg.diff_backend }, .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 200 } });
     }

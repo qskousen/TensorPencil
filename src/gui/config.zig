@@ -128,6 +128,36 @@ pub const KvDtype = enum(u8) {
     }
 };
 
+/// Gemma-4 (gemma4v) vision token budget — Google's `gemma4_vision_token_budget`
+/// ladder. The image is resized (aspect-preserving, no crop/pad) so its
+/// post-merge token count targets this many; more tokens = more spatial detail
+/// and more compute. Ignored by non-gemma4v mmprojs.
+pub const VisionBudget = enum(u8) {
+    low,
+    medium,
+    high,
+    ultra,
+    max,
+
+    /// nMax token target; keep in sync with `models.gemma4v_vit.Budget`.
+    pub fn tokens(self: VisionBudget) usize {
+        return switch (self) {
+            .low => 70,
+            .medium => 140,
+            .high => 280,
+            .ultra => 560,
+            .max => 1120,
+        };
+    }
+
+    fn fromStr(s: []const u8) ?VisionBudget {
+        inline for (@typeInfo(VisionBudget).@"enum".fields) |f| {
+            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        }
+        return null;
+    }
+};
+
 /// VAE decode-path override for image generation. `auto` is the adaptive chain
 /// (whole-image → GPU-tiled → CPU-tiled with OOM fallback); the others force the
 /// starting strategy but still degrade gracefully on OOM (see pipeline.zig).
@@ -297,6 +327,9 @@ pub const Config = struct {
     /// footprint, lossy). Changing it rebuilds the KV context — the weights stay
     /// resident (see `ctxReloadEql`), not a full model reload.
     kv_dtype: KvDtype = .f32,
+    /// Gemma-4 (gemma4v) vision token budget. Applied live per image encode
+    /// (no reload); ignored by other archs / non-gemma4v mmprojs.
+    vision_budget: VisionBudget = .high,
     /// Host-RAM budget (MB) for turn-boundary context checkpoints — the fast
     /// "regenerate response / switch variant" rollback path. Bounds how many
     /// turn boundaries stay instantly rewindable (snapshot size is per-arch,
@@ -338,7 +371,10 @@ pub const Config = struct {
     pub fn llmReloadEql(a: *const Config, b: *const Config) bool {
         return pathEql(&a.llm_model, &b.llm_model) and
             pathEql(&a.vision_tower, &b.vision_tower) and
-            a.llm_backend == b.llm_backend;
+            a.llm_backend == b.llm_backend and
+            // The vision budget sizes the LLM's image-prefill buffers + KV ring
+            // at load, so a change needs a (transcript-preserving) reload.
+            a.vision_budget == b.vision_budget;
     }
 
     /// The LLM's KV-cache CONTEXT config matches. A change here (currently just
@@ -504,6 +540,8 @@ pub const Config = struct {
             if (VaeDecode.fromStr(val)) |v| self.vae_decode = v;
         } else if (std.mem.eql(u8, key, "reasoning")) {
             self.reasoning = std.mem.eql(u8, val, "true");
+        } else if (std.mem.eql(u8, key, "vision_budget")) {
+            if (VisionBudget.fromStr(val)) |b| self.vision_budget = b;
         } else if (std.mem.eql(u8, key, "kv_dtype")) {
             if (KvDtype.fromStr(val)) |d| self.kv_dtype = d;
         } else if (std.mem.eql(u8, key, "temperature")) {
@@ -589,6 +627,7 @@ pub const Config = struct {
             \\vae_decode = {s}
             \\reasoning = {}
             \\kv_dtype = {s}
+            \\vision_budget = {s}
             \\win_w = {d}
             \\win_h = {d}
             \\win_x = {d}
@@ -612,7 +651,7 @@ pub const Config = struct {
             self.vram_limit_frac,
             @tagName(self.llm_backend),   @tagName(self.diff_backend),
             @tagName(self.vae_decode),    self.reasoning,
-            @tagName(self.kv_dtype),
+            @tagName(self.kv_dtype),      @tagName(self.vision_budget),
             self.win_w,                   self.win_h,
             self.win_x,                   self.win_y,
             self.win_max,                 self.viewer_w,

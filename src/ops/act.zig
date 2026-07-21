@@ -88,6 +88,26 @@ pub fn geluTanhMul(gate: []f32, up: []const f32) void {
     while (i < gate.len) : (i += 1) gate[i] = geluTanhScalar(gate[i]) * up[i];
 }
 
+/// "Quick" GELU, matching ggml `ggml_gelu_quick` / torch `gelu(approximate)`
+/// via the sigmoid approximation: x * sigmoid(1.702 x). Used by the gemma4v
+/// vision tower's FFN (llama.cpp `FFN_GELU_QUICK`).
+pub inline fn geluQuickScalar(x: f32) f32 {
+    return x * sigmoidScalar(1.702 * x);
+}
+
+/// GeGLU-quick gating (gemma4v vision FFN): gate[i] = gelu_quick(gate[i]) * up[i].
+pub fn geluQuickMul(gate: []f32, up: []const f32) void {
+    std.debug.assert(gate.len == up.len);
+    const c: Vec = @splat(1.702);
+    var i: usize = 0;
+    while (i + vlen <= gate.len) : (i += vlen) {
+        const g: Vec = gate[i..][0..vlen].*;
+        const u: Vec = up[i..][0..vlen].*;
+        gate[i..][0..vlen].* = g * vmath.sigmoidVec(c * g) * u;
+    }
+    while (i < gate.len) : (i += 1) gate[i] = geluQuickScalar(gate[i]) * up[i];
+}
+
 /// Sigmoid gating (Krea 2 attention output): dst[i] *= sigmoid(gate[i]).
 pub fn sigmoidMul(dst: []f32, gate: []const f32) void {
     std.debug.assert(dst.len == gate.len);
@@ -136,4 +156,11 @@ test "fused gates" {
     sigmoidMul(&dst, &g2);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), dst[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 2.0 * 0.731058598), dst[1], 1e-6);
+
+    // gelu_quick(x) = x*sigmoid(1.702x); at x=1: 1*sigmoid(1.702)=0.845894...
+    var gq = [_]f32{ 1.0, 0.0 };
+    const up2 = [_]f32{ 3.0, 5.0 };
+    geluQuickMul(&gq, &up2);
+    try std.testing.expectApproxEqAbs(@as(f32, sigmoidScalar(1.702) * 3.0), gq[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), gq[1], 1e-6);
 }

@@ -221,11 +221,12 @@ pub const Backend = struct {
     evictions: u64 = 0,
     /// First-touch weight pinning: newly cached weights are pinned (immune to
     /// eviction) until their total reaches this cap; later weights stream.
-    /// For a fixed repeating walk (LLM decode) this turns the LRU cliff —
-    /// where any cap below full residency re-uploads EVERYTHING — into cost
-    /// proportional to the streamed fraction. 0 = off. Must stay off for the
-    /// diffusion pipeline: first-touch would pin the single-use text encoder
-    /// and stream the whole DiT.
+    /// 0 = off. Must stay off for the diffusion pipeline: first-touch would
+    /// pin the single-use text encoder and stream the whole DiT. LLM sessions
+    /// set maxInt via `pinAllWeights` — LLM weights are NEVER streamed (an LLM
+    /// that doesn't fit degrades via the CPU layer split, never per-token
+    /// PCIe re-uploads); a weight that physically can't pin is a hard
+    /// DeviceOutOfMemory the model's offload machinery handles.
     pin_budget: u64 = 0,
     /// Bytes currently claimed against pin_budget.
     pinned_bytes: u64 = 0,
@@ -250,13 +251,6 @@ pub const Backend = struct {
     /// re-uploads run on the transfer stream (overlapping compute) with a
     /// per-weight completion event the compute stream waits on.
     async_uploads: bool = false,
-    /// Host ranges page-locked via enableDirectStreaming (checkpoint mmaps).
-    /// Prefetches whose source lies inside one DMA straight from the mmap,
-    /// skipping the staging memcpy. Fixed slots + atomic count so the
-    /// prefetch thread can scan while the main thread registers another
-    /// model (slot written before the count is published).
-    registered: [4][]const u8 = undefined,
-    n_registered: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     /// evicted-but-not-yet-freed weight buffers (deferred free; async path only).
     free_pending: std.ArrayListUnmanaged(PendingFree) = .empty,
     /// Bytes held by free_pending. Counted as available by reserveForWeights:
@@ -271,14 +265,9 @@ pub const Backend = struct {
     /// here still count in ctx.device_used (they are still held).
     weight_pool: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(DeviceBuffer)) = .empty,
     /// Total bytes in streamed circulation (unpinned cache entries + deferred
-    /// frees + pool). weightBufAcquire paces the main thread against this:
-    /// past stream_window it blocks on the oldest deferred free (compute
-    /// progress) and recycles, instead of allocating more — bounding streamed
-    /// VRAM to the window and keeping steady state free of cuMemAlloc/Free.
+    /// frees + pool) — diffusion streaming accounting; always 0 under the LLM
+    /// pin-all mode.
     streamed_bytes: u64 = 0,
-    /// Cap for streamed_bytes; set alongside pin_budget by the CLI. 0 = no
-    /// pacing (weights fully resident or the sync path).
-    stream_window: u64 = 0,
 
     // ---- prefetch thread (block-ahead async weight streaming) ----
     // Lock-free single-producer (main) / single-consumer (thread) ring — Zig 0.16
@@ -545,12 +534,6 @@ pub const Backend = struct {
             self.pf_shutdown.store(true, .release);
             t.join(); // drains queued prefetches, then exits
         }
-        // Unregister page-locked checkpoint ranges after all transfer-stream
-        // DMAs from them are done (the caller munmaps after Backend.deinit).
-        if (self.n_registered.load(.monotonic) > 0) {
-            _ = self.ctx.api.cuStreamSynchronize(self.ctx.xfer_stream);
-            for (self.registered[0..self.n_registered.load(.monotonic)]) |r| self.ctx.unregisterHost(r);
-        }
         self.drainPending();
         self.free_pending.deinit(self.gpa);
         self.drainPool();
@@ -627,34 +610,16 @@ pub const Backend = struct {
         self.async_uploads = true;
     }
 
-    /// Enable direct async weight streaming from `bytes` (a checkpoint mmap):
-    /// page-lock the range and spawn the prefetch thread. Prefetched weights
-    /// then DMA straight from the mmap on the transfer stream at full PCIe
-    /// bandwidth. (The staging-ring path above measured SLOWER than sync
-    /// uploads for the DiT — its extra host memcpy caps throughput below the
-    /// driver's pageable copy. Direct DMA has no host copy.) Registration
-    /// faults the range in and pins that much host RAM; no-op on failure
-    /// (uploads stay synchronous). Call once per checkpoint, before decode.
-    pub fn enableDirectStreaming(self: *Backend, bytes: []const u8) void {
-        const n = self.n_registered.load(.monotonic);
-        if (n == self.registered.len) return;
-        if (!self.ctx.registerHost(bytes)) return;
-        self.registered[n] = bytes;
-        self.n_registered.store(n + 1, .release);
-        if (self.pf_thread == null) {
-            self.pf_thread = std.Thread.spawn(.{}, prefetchLoop, .{self}) catch null;
-        }
-        self.async_uploads = self.pf_thread != null;
-    }
-
-    /// Whether `bytes` lies inside a page-locked range (prefetch thread or main).
-    fn isRegistered(self: *Backend, bytes: []const u8) bool {
-        const a = @intFromPtr(bytes.ptr);
-        for (self.registered[0..self.n_registered.load(.acquire)]) |r| {
-            const r0 = @intFromPtr(r.ptr);
-            if (a >= r0 and a + bytes.len <= r0 + r.len) return true;
-        }
-        return false;
+    /// LLM weight residency: pin EVERY weight on first touch (immune to LRU
+    /// eviction), so decode never degrades to per-token PCIe re-streaming —
+    /// an LLM that outgrows VRAM offloads whole layers to the CPU instead
+    /// (measured ~2.5x faster than streaming, and streaming's LRU-vs-cyclic-
+    /// walk pathology re-uploads ~the whole model per token the moment the
+    /// budget falls short). A weight that physically can't allocate is a hard
+    /// DeviceOutOfMemory for the model's offload machinery to handle. Never
+    /// call on a diffusion backend (see pin_budget).
+    pub fn pinAllWeights(self: *Backend) void {
+        self.pin_budget = std.math.maxInt(u64);
     }
 
     /// Prefetch-thread body: drain the request ring, uploading each weight through
@@ -673,22 +638,10 @@ pub const Backend = struct {
             }
             const req = self.pf_ring[tail % pf_ring_sz];
             const cb = ctxmod.Buffer{ .ptr = req.db.ptr(), .bytes = @intCast(req.db.size) };
-            if (self.isRegistered(req.bytes)) {
-                self.ctx.uploadDirect(cb, req.bytes, req.ev) catch {};
-            } else {
-                self.ctx.uploadStaged(cb, req.bytes, req.ev) catch {};
-            }
+            self.ctx.uploadStaged(cb, req.bytes, req.ev) catch {};
             self.pf_tail.store(tail + 1, .release);
             self.pf_completed.store(req.gen, .release); // FIFO: gens complete in order
         }
-    }
-
-    /// Upload a weight through the cache immediately (pinned while pin_budget
-    /// has room). Lets a caller give specific weights first claim on the pin
-    /// budget before the main model's first forward — e.g. the spec-decode
-    /// draft model, whose weights are read once per drafted token.
-    pub fn warmWeight(self: *Backend, bytes: []const u8) Error!void {
-        _ = try self.cachedWeight(bytes);
     }
 
     /// Queue a weight upload for the prefetch thread (main thread). Allocates the
@@ -713,16 +666,25 @@ pub const Backend = struct {
         if (self.pin_floor != 0 and self.ctx.memGetInfo().free < bytes.len + self.pin_floor) return;
         self.reserveForWeights(bytes.len);
         const pin = self.pinNew(bytes.len);
-        const db = self.weightBufAcquire(bytes.len, pin) catch return; // best-effort; cachedWeight sync-falls-back on miss
+        const db = self.weightBufAcquire(bytes.len, pin) catch {
+            if (pin) self.pinned_bytes -|= bytes.len; // refund the unused claim
+            return; // best-effort; cachedWeight sync-falls-back on miss
+        };
         const ev = self.ctx.eventCreate() catch {
-            if (pin) self.streamed_bytes += db.size; // returning to circulation
+            if (pin) {
+                self.pinned_bytes -|= db.size; // refund: buffer returns to streamed circulation
+                self.streamed_bytes += db.size;
+            }
             self.poolPut(db);
             return;
         };
         const head = self.pf_head.load(.monotonic);
         if (head - self.pf_tail.load(.acquire) >= pf_ring_sz) { // ring full — drop (sync fallback later)
             self.ctx.eventDestroy(ev);
-            if (pin) self.streamed_bytes += db.size; // returning to circulation
+            if (pin) {
+                self.pinned_bytes -|= db.size; // refund: buffer returns to streamed circulation
+                self.streamed_bytes += db.size;
+            }
             self.poolPut(db);
             return;
         }
@@ -873,7 +835,8 @@ pub const Backend = struct {
 
     /// Free a specific weight's device copy — the dynamic offload scheduler
     /// migrates a layer to the host, so its weights won't be read on the device
-    /// again. No-op if not resident.
+    /// again. Refunds the pin claim (LLM weights are always pinned), so a
+    /// migrated-back layer can pin again. No-op if not resident.
     pub fn evictWeightBytes(self: *Backend, bytes: []const u8) void {
         const e = self.weights.fetchRemove(@intFromPtr(bytes.ptr)) orelse return;
         if (e.value.upload_ev) |ev| {
@@ -881,7 +844,7 @@ pub const Backend = struct {
             self.ctx.eventDestroy(ev);
         }
         _ = self.ctx.api.cuStreamSynchronize(self.ctx.stream);
-        self.streamed_bytes -|= e.value.db.size;
+        if (e.value.pinned) self.pinned_bytes -|= e.value.db.size else self.streamed_bytes -|= e.value.db.size;
         var d = e.value.db;
         self.tensorDestroy(&d);
     }
@@ -1083,28 +1046,13 @@ pub const Backend = struct {
     }
 
     /// Get a device buffer for a weight upload. Exact-size reuse from the
-    /// recycling pool first — streamed decode cycles the same handful of
-    /// sizes every token, and cuMemAlloc/cuMemFree under an active DMA queue
-    /// cost more than the transfers they serve. Past stream_window, block on
-    /// the oldest deferred free (i.e. wait for compute to consume the oldest
-    /// streamed weight) and recycle it: this paces the enqueue against
-    /// compute progress and bounds streamed VRAM to the window. Falls back
-    /// to a fresh allocation (soft window) when nothing is pending.
+    /// recycling pool first — streamed diffusion decode cycles the same
+    /// handful of sizes every step, and cuMemAlloc/cuMemFree under an active
+    /// DMA queue cost more than the transfers they serve.
     fn weightBufAcquire(self: *Backend, size: u64, pinned: bool) Error!DeviceBuffer {
         if (self.poolPop(size)) |db| {
             if (pinned) self.streamed_bytes -|= size; // leaves streamed circulation
             return db;
-        }
-        if (!pinned and self.stream_window != 0) {
-            while (self.streamed_bytes + size > self.stream_window) {
-                if (self.blockOldestRecycle()) {
-                    if (self.poolPop(size)) |db| return db;
-                    continue;
-                }
-                // Nothing pending: push a consumed weight into the deferred
-                // queue so the next iteration can wait on and recycle it.
-                if (!self.evictOneWeight()) break; // nothing reclaimable: soft overshoot
-            }
         }
         const db = try self.tensorCreate(size);
         if (!pinned) self.streamed_bytes += size;
@@ -1130,18 +1078,6 @@ pub const Backend = struct {
         self.streamed_bytes -|= db.size;
         var d = db;
         self.tensorDestroy(&d);
-    }
-
-    /// Wait for the oldest deferred free's event (compute progress) and move
-    /// its buffer to the recycling pool. False if nothing is pending.
-    fn blockOldestRecycle(self: *Backend) bool {
-        if (self.free_pending.items.len == 0) return false;
-        const pf = self.free_pending.orderedRemove(0);
-        _ = self.ctx.api.cuEventSynchronize(pf.ev);
-        self.ctx.eventDestroy(pf.ev);
-        self.pending_free_bytes -= pf.db.size;
-        self.poolPut(pf.db);
-        return true;
     }
 
     /// Free every pooled buffer for real (evictWeights / deinit).
@@ -1435,7 +1371,18 @@ pub const Backend = struct {
         // thread never touches it here (no race).
         self.reserveForWeights(bytes.len);
         const pin = self.pinNew(bytes.len);
+        // Refund the pin claim if the alloc/upload below fails: an OOM-retry
+        // loop (forward → offload → retry) otherwise re-claims the same weight
+        // every attempt and pinned_bytes runs away into phantom terabytes.
+        errdefer if (pin) {
+            self.pinned_bytes -|= bytes.len;
+        };
         const db = try self.weightBufAcquire(bytes.len, pin);
+        errdefer {
+            if (!pin) self.streamed_bytes -|= db.size;
+            var d = db;
+            self.tensorDestroy(&d);
+        }
         try self.tensorUpload(db, bytes);
         try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .pinned = pin, .scoped = self.weight_scope });
         return db;
@@ -1986,6 +1933,19 @@ pub const Backend = struct {
         defer self.ptoc(.elt);
         std.debug.assert(4 * half <= head_dim);
         const f = try self.eltFn(elt.rope_vision_ptx, "rope_vision");
+        const total = rows * n_heads * 2 * half;
+        try self.eltLaunch(f, qk, pos2, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), @intCast(head_dim), 0 }, .{ 0, 0 }, total);
+    }
+
+    /// gemma4v vision 2-D RoPE (neox, per-head-half x/y split). `half` is the
+    /// per-span rotation count (head_dim/4); `pos2` is u32[rows*2] (x, y grid
+    /// coords per token); `freqs` holds cos then sin at `sin_off`. See the
+    /// rope_vision_gemma4 PTX; matches CPU rope.applyRotateHalfPosSpan x2.
+    pub fn opRopeVisionGemma4(self: *Backend, qk: DeviceBuffer, pos2: DeviceBuffer, freqs: DeviceBuffer, rows: usize, n_heads: usize, half: usize, sin_off: usize, head_dim: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        std.debug.assert(4 * half <= head_dim);
+        const f = try self.eltFn(elt.rope_vision_gemma4_ptx, "rope_vision_gemma4");
         const total = rows * n_heads * 2 * half;
         try self.eltLaunch(f, qk, pos2, freqs, null, .{ @intCast(total), @intCast(half), @intCast(sin_off), @intCast(n_heads), @intCast(head_dim), 0 }, .{ 0, 0 }, total);
     }
@@ -3282,6 +3242,14 @@ pub const Backend = struct {
         self.ptic();
         defer self.ptoc(.elt);
         const f = try self.eltFn(elt.gelu_mul_ptx, "gelu_mul");
+        try self.eltLaunch(f, a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+    }
+
+    /// a = gelu_quick(a) * b, in place (gemma4v vision FFN: gelu_quick(gate)*up).
+    pub fn geluQuickMul(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, total: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const f = try self.eltFn(elt.gelu_quick_mul_ptx, "gelu_quick_mul");
         try self.eltLaunch(f, a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 

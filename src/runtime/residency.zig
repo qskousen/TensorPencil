@@ -107,6 +107,13 @@ pub fn settleTo(st: anytype, target: u64) !void {
         _ = try st.promoteLayers(target);
 }
 
+/// Free VRAM a promote must leave untouched, beyond the per-layer cost: the
+/// per-token activation/logits allocations plus KV-growth churn need live
+/// headroom, and a promote that lands the card at the physical edge starts a
+/// per-token OOM→offload→promote thrash cycle. Promoting late is harmless
+/// (a settle retries next pump); promoting into the edge is not.
+const promote_reserve: u64 = 256 << 20;
+
 /// Migrate CPU layers back onto the GPU (LIFO by offload order), stopping before
 /// the next would overflow `budget` — so the caller (VRAM coordinator, after
 /// image generation) reclaims LLM residency while leaving room for whatever else
@@ -116,12 +123,24 @@ pub fn promoteBack(st: anytype, budget: u64) !usize {
     if (st.split == null) return 0;
     const sp = &st.split.?;
     var promoted: usize = 0;
+    // A layer's WEIGHTS promote lazily (promoteLayer re-creates only its KV;
+    // the weights re-cache pinned on the next forward), so deviceUsed() does
+    // not yet include them. Carry that deferred cost across the loop —
+    // without it one settle promoted a dozen layers, the next forward's
+    // weight uploads OOM'd, the retry offloaded them all back, and the next
+    // settle promoted again: a full per-token PCIe thrash cycle.
+    var deferred: u64 = 0;
     while (sp.next > 0) {
         const l = sp.order[sp.next - 1];
         const cost = st.promoteCost(l);
-        const free = @min(budget -| st.be.deviceUsed(), st.be.headroom());
-        if (free < cost) break;
+        const used = st.be.deviceUsed() + deferred;
+        const free = @min(budget -| used, st.be.headroom() -| deferred);
+        if (free < cost + promote_reserve) break;
+        const before = st.be.deviceUsed();
         try st.promoteLayer(l);
+        // Whatever promoteLayer did NOT allocate now (its weight bytes, part
+        // of `cost`) arrives at the next forward; count it as spent already.
+        deferred += cost -| (st.be.deviceUsed() -| before);
         sp.next -= 1;
         promoted += 1;
     }
