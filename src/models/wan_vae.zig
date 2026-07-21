@@ -208,8 +208,21 @@ pub const Decoder = struct {
 
     /// Decode a VAE-space latent (planar [16][zh][zw], already denormalized)
     /// to planar [3][8*zh][8*zw] pixels in [-1, 1]. Caller frees the result.
-    pub fn decode(self: *const Decoder, io: std.Io, gpa: std.mem.Allocator, z: []const f32, zh: usize, zw: usize) ![]f32 {
+    pub fn decode(self: *const Decoder, io: std.Io, gpa: std.mem.Allocator, z: []const f32, zh: usize, zw: usize, cancel: ?*std.atomic.Value(bool)) ![]f32 {
         std.debug.assert(z.len == latent_channels * zh * zw);
+        // Arm fine-grained cancel inside the CPU matmul/attention kernels: a
+        // full-resolution conv (an im2col matmul) is seconds of CPU work.
+        const prev_tok = ops.cancel.token;
+        ops.cancel.token = cancel;
+        defer ops.cancel.token = prev_tok;
+        // Poll cancel between layers (the free-on-error is handled by each
+        // apply* freeing its input) so a stop lands mid-decode — a whole-image
+        // CPU decode can take minutes.
+        const canceled = struct {
+            fn f(c: ?*std.atomic.Value(bool)) bool {
+                return if (c) |p| p.load(.acquire) else false;
+            }
+        }.f;
 
         // planar -> channel-last
         var x = try planarToRows(gpa, z, latent_channels, zh * zw);
@@ -219,20 +232,30 @@ pub const Decoder = struct {
         x = try self.applyConv(io, gpa, x, h, w, self.post_quant);
         x = try self.applyConv(io, gpa, x, h, w, self.conv_in);
         x = try self.applyRes(io, gpa, x, h, w, self.mid_res1);
+        if (canceled(cancel)) {
+            gpa.free(x);
+            return error.Canceled;
+        }
         x = try self.applyAttn(io, gpa, x, h, w, self.mid_attn);
         x = try self.applyRes(io, gpa, x, h, w, self.mid_res2);
 
-        for (self.ups) |layer| switch (layer) {
-            .res => |rb| x = try self.applyRes(io, gpa, x, h, w, rb),
-            .up => |conv| {
-                const up = try nearest2x(gpa, x, h, w, conv.ci);
+        for (self.ups) |layer| {
+            if (canceled(cancel)) {
                 gpa.free(x);
-                x = up;
-                h *= 2;
-                w *= 2;
-                x = try self.applyConv(io, gpa, x, h, w, conv);
-            },
-        };
+                return error.Canceled;
+            }
+            switch (layer) {
+                .res => |rb| x = try self.applyRes(io, gpa, x, h, w, rb),
+                .up => |conv| {
+                    const up = try nearest2x(gpa, x, h, w, conv.ci);
+                    gpa.free(x);
+                    x = up;
+                    h *= 2;
+                    w *= 2;
+                    x = try self.applyConv(io, gpa, x, h, w, conv);
+                },
+            }
+        }
 
         // head: norm + silu + conv
         channelRmsNorm(x, self.head_norm);
@@ -243,9 +266,10 @@ pub const Decoder = struct {
         return rowsToPlanar(gpa, x, 3, h * w);
     }
 
-    /// conv2d that frees the input and returns a fresh output buffer.
+    /// conv2d that frees the input (on error too) and returns a fresh output.
     fn applyConv(self: *const Decoder, io: std.Io, gpa: std.mem.Allocator, x: []f32, h: usize, w: usize, conv: Conv2d) ![]f32 {
         _ = self;
+        errdefer gpa.free(x);
         const out = try gpa.alloc(f32, h * w * conv.co);
         errdefer gpa.free(out);
         try conv2d(io, gpa, out, x, h, w, conv);
@@ -255,6 +279,7 @@ pub const Decoder = struct {
 
     fn applyRes(self: *const Decoder, io: std.Io, gpa: std.mem.Allocator, x: []f32, h: usize, w: usize, rb: ResBlock) ![]f32 {
         _ = self;
+        errdefer gpa.free(x);
         const n = h * w;
         // t = silu(norm1(x))
         const t = try gpa.alloc(f32, n * rb.conv1.ci);
@@ -287,6 +312,7 @@ pub const Decoder = struct {
 
     fn applyAttn(self: *const Decoder, io: std.Io, gpa: std.mem.Allocator, x: []f32, h: usize, w: usize, ab: AttnBlock) ![]f32 {
         _ = self;
+        errdefer gpa.free(x);
         const n = h * w;
         const c = ab.qkv.ci;
         const t = try gpa.alloc(f32, n * c);
@@ -515,7 +541,7 @@ test "decode matches comfyui reference" {
     var dec = try Decoder.load(gpa, &st);
     defer dec.deinit();
 
-    const out = try dec.decode(io, gpa, z, 8, 8);
+    const out = try dec.decode(io, gpa, z, 8, 8, null);
     defer gpa.free(out);
 
     // Keep the raw output around for offline analysis of parity failures.
@@ -534,6 +560,10 @@ test "decode matches comfyui reference" {
     errdefer std.debug.print("vae parity: max_err={d:.6} mean_err={d:.6}\n", .{ max_err, mean_err });
     try std.testing.expect(max_err < 5e-3);
     try std.testing.expect(mean_err < 5e-4);
+
+    // A pre-set cancel flag aborts mid-decode (polled between layers).
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, dec.decode(io, gpa, z, 8, 8, &canceled));
 }
 
 fn stageErr(gpa: std.mem.Allocator, io: std.Io, name: []const u8, rows: []const f32, c: usize, n: usize) !f32 {

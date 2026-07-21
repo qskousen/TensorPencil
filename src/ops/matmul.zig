@@ -11,6 +11,7 @@ const dtypes = @import("tp_core").dtype;
 const quants = @import("tp_core").quants;
 const convrot_mod = @import("convrot.zig");
 const prof = @import("tp_core").prof;
+const cancel = @import("cancel.zig");
 
 /// Whether ggml (the GGUF block-quant CPU backend) was linked (`-Dggml`).
 /// When false, block-quant weights return `error.QuantBackendUnavailable`.
@@ -132,6 +133,11 @@ pub fn matmul(
         std.debug.assert(w.row_scale != null and w.row_scale.?.len == w.rows);
     if (m == 0 or w.rows == 0) return;
 
+    // Cooperative cancel (see ops/cancel.zig): captured once here on the
+    // calling thread, polled by the row-chunk tasks so a cancel lands
+    // mid-GEMM (a big DiT MLP GEMM is seconds of CPU work).
+    const tok = cancel.token;
+
     if (gpuEligible(m, w)) {
         const gd = gpu_dispatch.?;
         if (gd.call(gd.ctx, y, x, m, w.bytes, w.dtype == .f8_e4m3, w.rows, w.cols, w.scale, bias)) |_| {
@@ -143,7 +149,7 @@ pub fn matmul(
         }
     }
 
-    if (m >= small_m_max) return matmulPacked(io, gpa, y, x, m, w, bias);
+    if (m >= small_m_max) return matmulPacked(io, gpa, y, x, m, w, bias, tok);
 
     // Decode (small m) block-quant GEMV → ggml's AVX2 quant vec_dot, which is
     // memory-bound (~30x faster than our Zig dequant/int8 kernels). Non-block-
@@ -168,7 +174,8 @@ pub fn matmul(
     defer gpa.free(scratch);
 
     if (n_tasks == 1) {
-        runRange(y, x, m, w, bias, 0, w.rows, scratch);
+        runRange(y, x, m, w, bias, 0, w.rows, scratch, tok);
+        if (cancel.canceled(tok)) return error.Canceled;
         return;
     }
 
@@ -179,10 +186,11 @@ pub fn matmul(
     while (row < w.rows) : (row += chunk) {
         const row_end = @min(row + chunk, w.rows);
         const task_scratch = scratch[task * panel_rows * w.cols ..][0 .. panel_rows * w.cols];
-        group.async(io, runRange, .{ y, x, m, w, bias, row, row_end, task_scratch });
+        group.async(io, runRange, .{ y, x, m, w, bias, row, row_end, task_scratch, tok });
         task += 1;
     }
     try group.await(io);
+    if (cancel.canceled(tok)) return error.Canceled;
 }
 
 fn matmulPacked(
@@ -193,6 +201,7 @@ fn matmulPacked(
     m: usize,
     w: Weight,
     bias: ?[]const f32,
+    tok: cancel.Token,
 ) Error!void {
     const n_threads = std.Thread.getCpuCount() catch 1;
     const want_tasks: usize = if (n_threads == 1) 1 else 4 * n_threads;
@@ -206,7 +215,8 @@ fn matmulPacked(
     defer gpa.free(scratch);
 
     if (n_tasks == 1) {
-        packedTask(y, x, m, w, bias, 0, w.rows, scratch[0..stride]);
+        packedTask(y, x, m, w, bias, 0, w.rows, scratch[0..stride], tok);
+        if (cancel.canceled(tok)) return error.Canceled;
         return;
     }
 
@@ -216,10 +226,11 @@ fn matmulPacked(
     var row: usize = 0;
     while (row < w.rows) : (row += chunk) {
         const row_end = @min(row + chunk, w.rows);
-        group.async(io, packedTask, .{ y, x, m, w, bias, row, row_end, scratch[task * stride ..][0..stride] });
+        group.async(io, packedTask, .{ y, x, m, w, bias, row, row_end, scratch[task * stride ..][0..stride], tok });
         task += 1;
     }
     try group.await(io);
+    if (cancel.canceled(tok)) return error.Canceled;
 }
 
 // Small-m block-quant GEMV via ggml's AVX2 vec_dot. Behind `have_ggml`: without
@@ -240,11 +251,13 @@ const ggml_gemv = if (have_ggml) struct {
         row_bytes: usize,
         vy_bytes: usize,
         bias: ?[]const f32,
+        tok: cancel.Token,
     };
 
     /// Dot weight rows [r0, r1) against the (shared, pre-quantized) activation.
     fn gemvRows(j: GemvJob, r0: usize, r1: usize) void {
         for (r0..r1) |r| {
+            if (cancel.canceled(j.tok)) return; // quantGemv reports error.Canceled
             const wrow = j.w.ptr + r * j.row_bytes;
             for (0..j.m) |t| {
                 var s: f32 = 0;
@@ -276,10 +289,15 @@ const ggml_gemv = if (have_ggml) struct {
         defer alloc.free(vy);
         for (0..m) |t| from_float(x.ptr + t * cols, vy.ptr + t * vy_bytes, @intCast(cols));
 
-        const job = GemvJob{ .vd = wt.*.vec_dot, .y = y, .vy = vy, .w = w_bytes, .m = m, .rows = rows, .cols = cols, .row_bytes = row_bytes, .vy_bytes = vy_bytes, .bias = bias };
+        const tok = cancel.token;
+        const job = GemvJob{ .vd = wt.*.vec_dot, .y = y, .vy = vy, .w = w_bytes, .m = m, .rows = rows, .cols = cols, .row_bytes = row_bytes, .vy_bytes = vy_bytes, .bias = bias, .tok = tok };
         const n_threads = std.Thread.getCpuCount() catch 1;
         const want: usize = if (n_threads == 1 or rows < 128) 1 else n_threads;
-        if (want == 1) return gemvRows(job, 0, rows);
+        if (want == 1) {
+            gemvRows(job, 0, rows);
+            if (cancel.canceled(tok)) return error.Canceled;
+            return;
+        }
 
         const chunk = std.math.divCeil(usize, rows, want) catch unreachable;
         var group: std.Io.Group = .init;
@@ -289,6 +307,7 @@ const ggml_gemv = if (have_ggml) struct {
             group.async(io, gemvRows, .{ job, r, @min(r + chunk, rows) });
         }
         try group.await(io);
+        if (cancel.canceled(tok)) return error.Canceled;
     }
 } else struct {};
 
@@ -301,16 +320,17 @@ fn packedTask(
     row_start: usize,
     row_end: usize,
     panel: []f32,
+    tok: cancel.Token,
 ) void {
     // i4 is sub-byte packed (nibbles), so it can't ride the byteSize-based
     // typed path; it has its own kernel that unpacks two values per byte.
-    if (w.dtype == .i4) return packedTaskI4(y, x, m, w, bias, row_start, row_end, panel);
+    if (w.dtype == .i4) return packedTaskI4(y, x, m, w, bias, row_start, row_end, panel, tok);
     switch (w.dtype) {
         inline .f8_e4m3, .bf16, .f16, .f32, .i8 => |dt| {
-            packedTaskTyped(dt, y, x, m, w, bias, row_start, row_end, panel);
+            packedTaskTyped(dt, y, x, m, w, bias, row_start, row_end, panel, tok);
         },
         inline .q4_0, .q8_0, .q4_k, .q5_k, .q6_k => |dt| {
-            packedTaskBlock(dt, y, x, m, w, bias, row_start, row_end, panel);
+            packedTaskBlock(dt, y, x, m, w, bias, row_start, row_end, panel, tok);
         },
         else => unreachable, // validated in matmul()
     }
@@ -330,6 +350,7 @@ fn packedTaskBlock(
     row_start: usize,
     row_end: usize,
     panel: []f32,
+    tok: cancel.Token,
 ) void {
     comptime std.debug.assert(KC % 256 == 0);
     const cols = w.cols;
@@ -339,6 +360,7 @@ fn packedTaskBlock(
 
     var kc0: usize = 0;
     while (kc0 < cols) : (kc0 += KC) {
+        if (cancel.canceled(tok)) return; // matmul() reports error.Canceled
         const kl: usize = @min(KC, cols - kc0);
 
         for (0..n_nr) |nr| {
@@ -393,6 +415,7 @@ fn packedTaskTyped(
     row_start: usize,
     row_end: usize,
     panel: []f32,
+    tok: cancel.Token,
 ) void {
     const cols = w.cols;
     const rows = w.rows;
@@ -401,6 +424,7 @@ fn packedTaskTyped(
 
     var kc0: usize = 0;
     while (kc0 < cols) : (kc0 += KC) {
+        if (cancel.canceled(tok)) return; // matmul() reports error.Canceled
         // Note the explicit type: @min with a comptime bound would narrow to
         // u10 and make `kl * NR` overflow (see ZIG.md).
         const kl: usize = @min(KC, cols - kc0);
@@ -484,6 +508,7 @@ fn packedTaskI4(
     row_start: usize,
     row_end: usize,
     panel: []f32,
+    tok: cancel.Token,
 ) void {
     const cols = w.cols;
     const rows = w.rows;
@@ -491,6 +516,7 @@ fn packedTaskI4(
 
     var kc0: usize = 0;
     while (kc0 < cols) : (kc0 += KC) {
+        if (cancel.canceled(tok)) return; // matmul() reports error.Canceled
         const kl: usize = @min(KC, cols - kc0);
 
         for (0..n_nr) |nr| {
@@ -627,11 +653,12 @@ fn runRange(
     row_start: usize,
     row_end: usize,
     scratch: []f32,
+    tok: cancel.Token,
 ) void {
-    if (w.dtype == .i4) return runRangeI4(y, x, m, w, bias, row_start, row_end, scratch);
+    if (w.dtype == .i4) return runRangeI4(y, x, m, w, bias, row_start, row_end, scratch, tok);
     switch (w.dtype) {
         inline .f8_e4m3, .bf16, .f16, .f32, .i8 => |dt| {
-            runRangeTyped(dt, y, x, m, w, bias, row_start, row_end, scratch);
+            runRangeTyped(dt, y, x, m, w, bias, row_start, row_end, scratch, tok);
         },
         // Block-quant never reaches runRange: small-m goes to ggmlQuantGemv and
         // large-m to matmulPacked (see matmul()).
@@ -649,10 +676,12 @@ fn runRangeTyped(
     row_start: usize,
     row_end: usize,
     scratch: []f32,
+    tok: cancel.Token,
 ) void {
     const cols = w.cols;
     var r = row_start;
     while (r < row_end) : (r += panel_rows) {
+        if (cancel.canceled(tok)) return; // matmul() reports error.Canceled
         const nr = @min(panel_rows, row_end - r);
         for (0..nr) |j| {
             const src = w.bytes[(r + j) * cols * comptime dt.byteSize() ..][0 .. cols * comptime dt.byteSize()];
@@ -699,10 +728,12 @@ fn runRangeI4(
     row_start: usize,
     row_end: usize,
     scratch: []f32,
+    tok: cancel.Token,
 ) void {
     const cols = w.cols;
     var r = row_start;
     while (r < row_end) : (r += panel_rows) {
+        if (cancel.canceled(tok)) return; // matmul() reports error.Canceled
         const nr = @min(panel_rows, row_end - r);
         for (0..nr) |j| {
             const dst = scratch[j * cols ..][0..cols];
@@ -863,6 +894,35 @@ test "packed path fp8 with scale" {
 
 test "packed path single wide row block" {
     try testAgainstNaive(small_m_max, NR, KC * 2, .f32, false, 1.0);
+}
+
+test "matmul honors the threadlocal cancel token" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const rows = 64;
+    const cols = 64;
+    const m = small_m_max + 1;
+    const w_f32 = try gpa.alloc(f32, rows * cols);
+    defer gpa.free(w_f32);
+    @memset(w_f32, 0.5);
+    const x = try gpa.alloc(f32, m * cols);
+    defer gpa.free(x);
+    @memset(x, 1.0);
+    const y = try gpa.alloc(f32, m * rows);
+    defer gpa.free(y);
+    const w = Weight.fromF32(w_f32, rows, cols);
+
+    var flag = std.atomic.Value(bool).init(true);
+    cancel.token = &flag;
+    defer cancel.token = null;
+    // Both the packed (large-m) and small-m paths report the cancel.
+    try std.testing.expectError(error.Canceled, matmul(io, gpa, y, x, m, w, null));
+    try std.testing.expectError(error.Canceled, matmul(io, gpa, y[0..rows], x[0..cols], 1, w, null));
+
+    // Cleared flag: normal completion with a correct result.
+    flag.store(false, .release);
+    try matmul(io, gpa, y[0..rows], x[0..cols], 1, w, null);
+    try std.testing.expectApproxEqAbs(@as(f32, 32.0), y[0], 1e-4);
 }
 
 /// int8 ConvRot: quantized bytes + per-row scale, dequantized with the group

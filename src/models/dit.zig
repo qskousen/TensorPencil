@@ -175,11 +175,19 @@ pub const DiT = struct {
         sigma: f32,
         ctx: []const f32,
         seq_txt: usize,
+        cancel: ?*std.atomic.Value(bool),
     ) !void {
         std.debug.assert(lat_h % patch == 0 and lat_w % patch == 0);
         std.debug.assert(x_lat.len == channels * lat_h * lat_w);
         std.debug.assert(out.len == x_lat.len);
         std.debug.assert(ctx.len == seq_txt * txt_layers * txt_dim);
+
+        // Arm fine-grained cancel inside the CPU matmul/attention kernels for
+        // the whole forward: a single MLP GEMM is seconds of CPU work, so
+        // per-block polling alone leaves a multi-second cancel latency.
+        const prev_tok = ops.cancel.token;
+        ops.cancel.token = cancel;
+        defer ops.cancel.token = prev_tok;
         const h = lat_h / patch;
         const w = lat_w / patch;
         const n_img = h * w;
@@ -260,6 +268,9 @@ pub const DiT = struct {
         defer freqs.deinit(gpa);
 
         for (self.blocks) |*blk| {
+            // Poll cancel between blocks so a stop lands mid-step (a full CPU
+            // step can take 30+ seconds) rather than only at step boundaries.
+            if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
             try self.blockForward(io, gpa, blk, x, seq, tvec, freqs);
         }
 
@@ -932,7 +943,7 @@ test "dit forward matches comfyui" {
 
     const out = try gpa.alloc(f32, channels * 16 * 16);
     defer gpa.free(out);
-    try model.forward(io, gpa, out, x_lat, 16, 16, 0.875, ctx, seq_txt);
+    try model.forward(io, gpa, out, x_lat, 16, 16, 0.875, ctx, seq_txt, null);
 
     var max_err: f32 = 0;
     var max_val: f32 = 0;
@@ -946,4 +957,8 @@ test "dit forward matches comfyui" {
     errdefer std.debug.print("dit parity: max_err={d:.5} mean_err={d:.6} max_val={d:.2}\n", .{ max_err, mean_err, max_val });
     try std.testing.expect(max_err < 0.01 * @max(1.0, max_val));
     try std.testing.expect(mean_err < 1e-3 * @as(f64, @max(1.0, max_val)));
+
+    // A pre-set cancel flag aborts mid-step (polled between blocks).
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, model.forward(io, gpa, out, x_lat, 16, 16, 0.875, ctx, seq_txt, &canceled));
 }

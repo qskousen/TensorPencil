@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const vmath = @import("vmath.zig");
+const cancel = @import("cancel.zig");
 
 pub const Params = struct {
     seq_q: usize,
@@ -78,8 +79,13 @@ pub fn attention(
     const scratch = try gpa.alloc(f32, n_tasks * p.seq_kv);
     defer gpa.free(scratch);
 
+    // Cooperative cancel (see ops/cancel.zig): captured once on the calling
+    // thread, polled per query row inside the head tasks.
+    const tok = cancel.token;
+
     if (n_tasks == 1) {
-        headTask(out, q, k, v, p, 0, 0, p.seq_q, scratch);
+        headTask(out, q, k, v, p, 0, 0, p.seq_q, scratch, tok);
+        if (cancel.canceled(tok)) return error.Canceled;
         return;
     }
 
@@ -90,11 +96,12 @@ pub fn attention(
         var q_start: usize = 0;
         while (q_start < p.seq_q) : (q_start += q_chunk_len) {
             const q_end = @min(q_start + q_chunk_len, p.seq_q);
-            group.async(io, headTask, .{ out, q, k, v, p, h, q_start, q_end, scratch[task * p.seq_kv ..][0..p.seq_kv] });
+            group.async(io, headTask, .{ out, q, k, v, p, h, q_start, q_end, scratch[task * p.seq_kv ..][0..p.seq_kv], tok });
             task += 1;
         }
     }
     try group.await(io);
+    if (cancel.canceled(tok)) return error.Canceled;
 }
 
 fn headTask(
@@ -107,6 +114,7 @@ fn headTask(
     q_start: usize,
     q_end: usize,
     scores: []f32,
+    tok: cancel.Token,
 ) void {
     const hd = p.head_dim;
     const rep = p.n_heads / p.n_kv_heads;
@@ -116,6 +124,7 @@ fn headTask(
     const scale = p.scale orelse 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
 
     for (q_start..q_end) |i| {
+        if (cancel.canceled(tok)) return; // attention() reports error.Canceled
         const qrow = q[i * q_stride + h * hd ..][0..hd];
         // Causal upper bound for THIS query's own position; the sliding-window
         // lower bound tracks it too. A bidirectional block extends only the
@@ -302,6 +311,22 @@ test "gqa attention matches torch sdpa" {
         .head_dim = 4,
     });
     for (attn_out, out) |e, a| try std.testing.expectApproxEqAbs(e, a, 3e-6);
+}
+
+test "attention honors the threadlocal cancel token" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: [24]f32 = undefined;
+    var flag = std.atomic.Value(bool).init(true);
+    cancel.token = &flag;
+    defer cancel.token = null;
+    try std.testing.expectError(error.Canceled, attention(io, gpa, &out, &attn_q, &attn_k, &attn_v, .{
+        .seq_q = 3,
+        .seq_kv = 3,
+        .n_heads = 2,
+        .n_kv_heads = 1,
+        .head_dim = 4,
+    }));
 }
 
 test "causal attention matches torch sdpa" {

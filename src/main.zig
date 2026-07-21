@@ -945,7 +945,7 @@ fn cudaVaeTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, zh: usize) 
     var dec = try wan_vae.Decoder.load(arena, &st);
     defer dec.deinit();
 
-    const want = try dec.decode(io, arena, z, zh, zw);
+    const want = try dec.decode(io, arena, z, zh, zw, null);
 
     var be = cuda.Backend.init(arena) catch |err| {
         try stdout.print("cuda unavailable: {t}\n", .{err});
@@ -954,17 +954,17 @@ fn cudaVaeTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, zh: usize) 
     defer be.deinit();
     try stdout.print("== cuda-vae-test zh={d} ({d}x{d} px) ==\ncuda device: {s}\n", .{ zh, zh * 8, zw * 8, be.deviceName() });
 
-    const got0 = try vae_cuda.decode(&dec, be, io, arena, z, zh, zw);
+    const got0 = try vae_cuda.decode(&dec, be, io, arena, z, zh, zw, null);
     arena.free(got0);
     var best: f64 = std.math.inf(f64);
     for (0..3) |_| {
         const a = std.Io.Clock.real.now(io);
-        const g = try vae_cuda.decode(&dec, be, io, arena, z, zh, zw);
+        const g = try vae_cuda.decode(&dec, be, io, arena, z, zh, zw, null);
         const b = std.Io.Clock.real.now(io);
         arena.free(g);
         best = @min(best, @as(f64, @floatFromInt(b.nanoseconds - a.nanoseconds)) / 1e6);
     }
-    const got = try vae_cuda.decode(&dec, be, io, arena, z, zh, zw);
+    const got = try vae_cuda.decode(&dec, be, io, arena, z, zh, zw, null);
 
     var max_err: f32 = 0;
     var num: f64 = 0;
@@ -999,7 +999,7 @@ fn cudaEncodeTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
     var enc = try qwen3.TextEncoder.load(arena, &st);
     defer enc.deinit();
 
-    const want = try enc.encode(io, arena, ids.items);
+    const want = try enc.encode(io, arena, ids.items, null);
 
     var be = cuda.Backend.init(arena) catch |err| {
         try stdout.print("cuda unavailable: {t}\n", .{err});
@@ -1009,17 +1009,17 @@ fn cudaEncodeTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
     try stdout.print("== cuda-encode-test ({d} tokens) ==\ncuda device: {s}\n", .{ ids.items.len, be.deviceName() });
 
     // warm-up (JIT + weight upload), then timed.
-    const got0 = try qwen3_cuda.encode(&enc, be, io, arena, ids.items);
+    const got0 = try qwen3_cuda.encode(&enc, be, io, arena, ids.items, null);
     arena.free(got0);
     var best: f64 = std.math.inf(f64);
     for (0..3) |_| {
         const a = std.Io.Clock.real.now(io);
-        const g = try qwen3_cuda.encode(&enc, be, io, arena, ids.items);
+        const g = try qwen3_cuda.encode(&enc, be, io, arena, ids.items, null);
         const b = std.Io.Clock.real.now(io);
         arena.free(g);
         best = @min(best, @as(f64, @floatFromInt(b.nanoseconds - a.nanoseconds)) / 1e6);
     }
-    const got = try qwen3_cuda.encode(&enc, be, io, arena, ids.items);
+    const got = try qwen3_cuda.encode(&enc, be, io, arena, ids.items, null);
 
     var max_err: f32 = 0;
     var max_val: f32 = 0;
@@ -1340,7 +1340,7 @@ fn cudaDitTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []con
     const out_cpu = try arena.alloc(f32, x.len);
     if (check_cpu) {
         const t0 = std.Io.Clock.real.now(io);
-        try model.forward(io, arena, out_cpu, x, lat, lat, sigma, cond, seq_txt);
+        try model.forward(io, arena, out_cpu, x, lat, lat, sigma, cond, seq_txt, null);
         const t1 = std.Io.Clock.real.now(io);
         try stdout.print("cpu {s} forward: {d:.1} s\n", .{ qtag, @as(f64, @floatFromInt(t1.nanoseconds - t0.nanoseconds)) / 1e9 });
         try stdout.flush();
@@ -1579,7 +1579,7 @@ fn decodeLatent(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, z_path: []
     defer dec.deinit();
 
     const start = std.Io.Clock.real.now(io);
-    const planar = try dec.decode(io, arena, z, zh, zw);
+    const planar = try dec.decode(io, arena, z, zh, zw, null);
     const end = std.Io.Clock.real.now(io);
 
     const px = try TensorPencil.image.planarF32ToRgb8(arena, planar, zw * vae.spatial_scale, zh * vae.spatial_scale);

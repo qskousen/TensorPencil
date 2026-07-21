@@ -61,7 +61,7 @@ pub const CpuSplitPolicy = enum { tail, attn };
 
 /// Encode token ids to the Krea 2 conditioning stack, [seq][tap_count][hidden]
 /// (same token-major layout the CPU `encode` returns). Caller frees the result.
-pub fn encode(enc: *const qwen3.TextEncoder, be: *Backend, io: std.Io, gpa: std.mem.Allocator, ids: []const u32) ![]f32 {
+pub fn encode(enc: *const qwen3.TextEncoder, be: *Backend, io: std.Io, gpa: std.mem.Allocator, ids: []const u32, cancel: ?*std.atomic.Value(bool)) ![]f32 {
     _ = io;
     const seq = ids.len;
     std.debug.assert(seq > 0);
@@ -106,6 +106,9 @@ pub fn encode(enc: *const qwen3.TextEncoder, be: *Backend, io: std.Io, gpa: std.
 
     var tap_idx: usize = 0;
     for (0..n_layers) |l| {
+        // Poll cancel between layers so a stop lands mid-encode; the errdefer
+        // above aborts the in-flight batch.
+        if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
         if (tap_idx < qwen3.tap_layers.len and qwen3.tap_layers[tap_idx] == l) {
             // Snapshot the hidden state entering layer l into the tap-major output.
             try be.tensorCopy(out_d, tap_idx * seq * hidden * 4, x_d, 0, seq * hidden * 4);

@@ -168,9 +168,11 @@ pub const Options = struct {
     /// `preview`/`preview_ds` above are the static fallback. The taew decoder is
     /// still loaded up front (from `taew_path`) so switching TO taesd is instant.
     preview_live: ?*const LivePreview = null,
-    /// Optional cancel flag, polled between sampling steps and before the VAE
-    /// decode. When it flips true, `generate` unwinds and returns
-    /// `error.Canceled` (a caller-driven stop, not a failure).
+    /// Optional cancel flag, polled throughout generation — between encoder
+    /// layers, between DiT blocks (mid-step, on every backend), and between
+    /// VAE decode layers/tiles — so a stop lands within a fraction of a step
+    /// even on the CPU backend. When it flips true, `generate` unwinds and
+    /// returns `error.Canceled` (a caller-driven stop, not a failure).
     cancel: ?*std.atomic.Value(bool) = null,
     /// Optional VRAM-reclaim hook. On a VAE-decode OOM (e.g. a very large image
     /// while the GUI chat model is resident), `generate` calls this to migrate
@@ -217,23 +219,26 @@ const Cond = struct {
 const CudaTile = struct {
     vae: *const wan_vae.Decoder,
     be: *cuda.Backend,
+    cancel: ?*std.atomic.Value(bool) = null,
     fn call(self: CudaTile, gpa: std.mem.Allocator, io: std.Io, sub: []const f32, th: usize, tw: usize) anyerror![]f32 {
-        return vae_cuda.decode(self.vae, self.be, io, gpa, sub, th, tw);
+        return vae_cuda.decode(self.vae, self.be, io, gpa, sub, th, tw, self.cancel);
     }
 };
 
 const VkTile = struct {
     vae: *const wan_vae.Decoder,
     gc: *gpu_mod.Context,
+    cancel: ?*std.atomic.Value(bool) = null,
     fn call(self: VkTile, gpa: std.mem.Allocator, io: std.Io, sub: []const f32, th: usize, tw: usize) anyerror![]f32 {
-        return vae_gpu.decode(self.vae, self.gc, io, gpa, sub, th, tw);
+        return vae_gpu.decode(self.vae, self.gc, io, gpa, sub, th, tw, self.cancel);
     }
 };
 
 const CpuTile = struct {
     vae: *const wan_vae.Decoder,
+    cancel: ?*std.atomic.Value(bool) = null,
     fn call(self: CpuTile, gpa: std.mem.Allocator, io: std.Io, sub: []const f32, th: usize, tw: usize) anyerror![]f32 {
-        return self.vae.decode(io, gpa, sub, th, tw);
+        return self.vae.decode(io, gpa, sub, th, tw, self.cancel);
     }
 };
 
@@ -548,10 +553,10 @@ pub const Session = struct {
         // allocations (encoder weights + encode scratch) as TE for the meter.
         self.setMemTag(.te);
         const enc_start = std.Io.Clock.real.now(io);
-        const cond_pos = try encodePrompt(io, gpa, gpu_ctx, cu_be, opts.encoder_f16, &self.tok, &self.enc, opts.prompt);
+        const cond_pos = try encodePrompt(io, gpa, gpu_ctx, cu_be, opts.encoder_f16, &self.tok, &self.enc, opts.prompt, opts.cancel);
         defer gpa.free(cond_pos.data);
         const cond_neg: ?Cond = if (use_cfg)
-            try encodePrompt(io, gpa, gpu_ctx, cu_be, opts.encoder_f16, &self.tok, &self.enc, opts.negative)
+            try encodePrompt(io, gpa, gpu_ctx, cu_be, opts.encoder_f16, &self.tok, &self.enc, opts.negative, opts.cancel)
         else
             null;
         defer if (cond_neg) |c| gpa.free(c.data);
@@ -734,16 +739,16 @@ pub const Session = struct {
                 if (cu_be) |b| {
                     try dit_cuda.forward(dit, b, &cu_pos.?, &cu_ws.?, io, gpa, v, x, sigmas[i], opts.cancel);
                 } else if (gpu_ctx) |gc| {
-                    try dit_gpu.forward(dit, gc, &sess_pos.?, &ws.?, io, gpa, v, x, sigmas[i]);
+                    try dit_gpu.forward(dit, gc, &sess_pos.?, &ws.?, io, gpa, v, x, sigmas[i], opts.cancel);
                 } else {
-                    try dit.forward(io, gpa, v, x, lat_h, lat_w, sigmas[i], cond_pos.data, cond_pos.seq);
+                    try dit.forward(io, gpa, v, x, lat_h, lat_w, sigmas[i], cond_pos.data, cond_pos.seq, opts.cancel);
                 }
                 if (use_cfg) {
                     if (cu_be) |b| {
                         try dit_cuda.forward(dit, b, &cu_neg.?, &cu_ws.?, io, gpa, v_neg.?, x, sigmas[i], opts.cancel);
                     } else if (gpu_ctx) |gc| {
-                        try dit_gpu.forward(dit, gc, &sess_neg.?, &ws.?, io, gpa, v_neg.?, x, sigmas[i]);
-                    } else try dit.forward(io, gpa, v_neg.?, x, lat_h, lat_w, sigmas[i], cond_neg.?.data, cond_neg.?.seq);
+                        try dit_gpu.forward(dit, gc, &sess_neg.?, &ws.?, io, gpa, v_neg.?, x, sigmas[i], opts.cancel);
+                    } else try dit.forward(io, gpa, v_neg.?, x, lat_h, lat_w, sigmas[i], cond_neg.?.data, cond_neg.?.seq, opts.cancel);
                     sampler.applyCfg(v, v_neg.?, opts.cfg);
                 }
                 sampler.eulerStep(x, v, sigmas[i], sigmas[i + 1]);
@@ -854,7 +859,7 @@ pub const Session = struct {
             const saved = ops.matmul.gpu_dispatch;
             ops.matmul.gpu_dispatch = null;
             defer ops.matmul.gpu_dispatch = saved;
-            break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae }, CpuTile.call);
+            break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae, .cancel = opts.cancel }, CpuTile.call);
         } else if (cu_be) |b| planar_blk: {
             // Attempt ladder — whole-image (fastest, seamless) → GPU tiling
             // (bounded footprint) → CPU (guaranteed). Before EACH GPU retry free
@@ -907,7 +912,7 @@ pub const Session = struct {
             if (!skip_whole) {
                 var round: usize = 0;
                 while (round < max_reclaim_rounds) : (round += 1) {
-                    if (vae_cuda.decode(vae, b, io, gpa, x, lat_h, lat_w)) |p| {
+                    if (vae_cuda.decode(vae, b, io, gpa, x, lat_h, lat_w, opts.cancel)) |p| {
                         break :planar_blk p;
                     } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: whole-image OOM ({t}) → freeing VRAM\n", .{err});
                     if (try freeSome(b, opts.reclaim, progress, io, want) == 0) break; // nothing left → tile
@@ -921,7 +926,7 @@ pub const Session = struct {
                 var round: usize = 0;
                 while (round < max_reclaim_rounds) : (round += 1) {
                     try note(progress, "vae decode: tiling on GPU ({d}² latent tiles)\n", .{tp.tile});
-                    const ct = CudaTile{ .vae = vae, .be = b };
+                    const ct = CudaTile{ .vae = vae, .be = b, .cancel = opts.cancel };
                     if (vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, ct, CudaTile.call)) |p| {
                         break :planar_blk p;
                     } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: GPU tiling OOM ({t}) → freeing VRAM\n", .{err});
@@ -934,7 +939,7 @@ pub const Session = struct {
             const saved = ops.matmul.gpu_dispatch;
             ops.matmul.gpu_dispatch = null;
             defer ops.matmul.gpu_dispatch = saved;
-            break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae }, CpuTile.call);
+            break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae, .cancel = opts.cancel }, CpuTile.call);
         } else if (gpu_ctx) |gc| planar_blk: {
             // Whole-image decode first. The Vulkan mid-block attention is now
             // query-tiled (flash), so this OOMs only when the conv activation
@@ -962,7 +967,7 @@ pub const Session = struct {
                 var want: u64 = reclaim_chunk;
                 var round: usize = 0;
                 while (round < max_reclaim_rounds) : (round += 1) {
-                    if (vae_gpu.decode(vae, gc, io, gpa, x, lat_h, lat_w)) |p| {
+                    if (vae_gpu.decode(vae, gc, io, gpa, x, lat_h, lat_w, opts.cancel)) |p| {
                         break :planar_blk p;
                     } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: whole-image OOM ({t}) -> freeing VRAM\n", .{err});
                     const t0 = std.Io.Clock.real.now(io).nanoseconds;
@@ -983,7 +988,7 @@ pub const Session = struct {
                 var round: usize = 0;
                 while (round < max_reclaim_rounds) : (round += 1) {
                     try note(progress, "vae decode: tiling on GPU ({d}^2 latent tiles)\n", .{tp.tile});
-                    const vt = VkTile{ .vae = vae, .gc = gc };
+                    const vt = VkTile{ .vae = vae, .gc = gc, .cancel = opts.cancel };
                     if (vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, vt, VkTile.call)) |p| {
                         break :planar_blk p;
                     } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: GPU tiling OOM ({t}) -> freeing VRAM\n", .{err});
@@ -1004,15 +1009,15 @@ pub const Session = struct {
             const saved = ops.matmul.gpu_dispatch;
             ops.matmul.gpu_dispatch = null;
             defer ops.matmul.gpu_dispatch = saved;
-            break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae }, CpuTile.call);
+            break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae, .cancel = opts.cancel }, CpuTile.call);
         } else planar_blk: {
             // CPU-only: tile once the whole-image scores plane (f32) gets large,
             // so a big image doesn't try to allocate tens of GB of host RAM.
             // (skip_whole — e.g. gpu_tiled with no GPU — forces tiling.)
             if (!skip_whole and attnPlaneBytes(lat_h, lat_w, 4) < (1 << 30))
-                break :planar_blk try vae.decode(io, gpa, x, lat_h, lat_w);
+                break :planar_blk try vae.decode(io, gpa, x, lat_h, lat_w, opts.cancel);
             try note(progress, "vae decode: tiling on CPU\n", .{});
-            break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae }, CpuTile.call);
+            break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae, .cancel = opts.cancel }, CpuTile.call);
         };
         defer gpa.free(planar);
         try note(progress, "decoded in {d:.1}s\n", .{@as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - dec_start.nanoseconds)) / 1e9});
@@ -1035,26 +1040,29 @@ pub fn generate(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*s
     return s.generate(opts, progress);
 }
 
-fn encodePrompt(io: std.Io, gpa: std.mem.Allocator, gpu_ctx: ?*gpu_mod.Context, cu_be: ?*cuda.Backend, encoder_f16: bool, tok: *const tokenizer_mod.Tokenizer, enc: *const qwen3.TextEncoder, text: []const u8) !Cond {
+fn encodePrompt(io: std.Io, gpa: std.mem.Allocator, gpu_ctx: ?*gpu_mod.Context, cu_be: ?*cuda.Backend, encoder_f16: bool, tok: *const tokenizer_mod.Tokenizer, enc: *const qwen3.TextEncoder, text: []const u8, cancel: ?*std.atomic.Value(bool)) !Cond {
     var ids: std.ArrayList(u32) = .empty;
     defer ids.deinit(gpa);
     try krea2_text.buildIds(tok, gpa, text, &ids);
 
     // GPU-resident encode (batched, keeps the device saturated): the CUDA
     // backend when active, else Vulkan; the CPU forward is the fallback (and
-    // used on any GPU error).
+    // used on any GPU error — except a cancel, which must propagate, not
+    // silently restart the encode on the CPU).
     const full = if (cu_be) |b|
-        qwen3_cuda.encode(enc, b, io, gpa, ids.items) catch |err| blk: {
+        qwen3_cuda.encode(enc, b, io, gpa, ids.items, cancel) catch |err| blk: {
+            if (err == error.Canceled) return err;
             std.log.warn("cuda text encode failed ({t}); falling back to CPU (slow)", .{err});
-            break :blk try enc.encode(io, gpa, ids.items);
+            break :blk try enc.encode(io, gpa, ids.items, cancel);
         }
     else if (gpu_ctx) |gc|
-        qwen3_gpu.encode(enc, gc, io, gpa, ids.items, encoder_f16) catch |err| blk: {
+        qwen3_gpu.encode(enc, gc, io, gpa, ids.items, encoder_f16, cancel) catch |err| blk: {
+            if (err == error.Canceled) return err;
             std.log.warn("vulkan text encode failed ({t}); falling back to CPU (slow)", .{err});
-            break :blk try enc.encode(io, gpa, ids.items);
+            break :blk try enc.encode(io, gpa, ids.items, cancel);
         }
     else
-        try enc.encode(io, gpa, ids.items);
+        try enc.encode(io, gpa, ids.items, cancel);
     defer gpa.free(full);
 
     const offset = krea2_text.stripOffset(ids.items);

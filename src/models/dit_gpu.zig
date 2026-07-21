@@ -273,6 +273,7 @@ pub fn forward(
     out: []f32,
     x_lat: []const f32,
     sigma: f32,
+    cancel: ?*std.atomic.Value(bool),
 ) !void {
     const lat_h = sess.lat_h;
     const lat_w = sess.lat_w;
@@ -430,6 +431,9 @@ pub fn forward(
         }
     };
     for (model.blocks, 0..) |*blk, b| {
+        // Poll cancel between blocks so a stop lands mid-step rather than only
+        // at step boundaries. The `errdefer` above aborts the in-flight batch.
+        if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
         const mv_base: u32 = @intCast(b * 6 * F);
 
         // t1 = (1+pre_scale) * prenorm(x) + pre_shift — the norm weight is
@@ -993,7 +997,7 @@ test "gpu-resident forward matches comfyui fixture" {
     defer sess.deinit(gpa, ctx);
     var ws = try Workspace.init(ctx, 16, 16, seq_txt);
     defer ws.deinit(ctx);
-    try forward(&model, ctx, &sess, &ws, io, gpa, out, x_lat, 0.875);
+    try forward(&model, ctx, &sess, &ws, io, gpa, out, x_lat, 0.875, null);
 
     var max_err: f32 = 0;
     var max_val: f32 = 0;
@@ -1021,7 +1025,7 @@ test "gpu-resident forward matches comfyui fixture" {
         defer ws32.deinit(ctx);
         const out32 = try gpa.alloc(f32, dit.channels * 16 * 16);
         defer gpa.free(out32);
-        try forward(&model, ctx, &sess, &ws32, io, gpa, out32, x_lat, 0.875);
+        try forward(&model, ctx, &sess, &ws32, io, gpa, out32, x_lat, 0.875, null);
         var me: f32 = 0;
         for (expected, out32) |e, a| me = if (std.math.isNan(a)) std.math.inf(f32) else @max(me, @abs(e - a));
         std.debug.print("dit gpu parity (f32): max_err={d:.5} (f16 was {d:.5})\n", .{ me, max_err });
@@ -1037,6 +1041,12 @@ test "gpu-resident forward matches comfyui fixture" {
     defer ctx.budget_override = 0;
     const out2 = try gpa.alloc(f32, dit.channels * 16 * 16);
     defer gpa.free(out2);
-    try forward(&model, ctx, &sess, &ws, io, gpa, out2, x_lat, 0.875);
+    try forward(&model, ctx, &sess, &ws, io, gpa, out2, x_lat, 0.875, null);
     for (out, out2) |a, b| try std.testing.expectEqual(a, b);
+
+    // A pre-set cancel flag aborts mid-step (polled between blocks); the
+    // errdefer in forward aborts the in-flight batch so the context stays
+    // usable afterwards.
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, forward(&model, ctx, &sess, &ws, io, gpa, out2, x_lat, 0.875, &canceled));
 }

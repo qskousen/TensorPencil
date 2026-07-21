@@ -40,7 +40,7 @@ const Buf = gpu.DeviceBuffer;
 
 /// Encode token ids to the Krea 2 conditioning stack, [seq][tap_count][hidden]
 /// (same layout the CPU `encode` returns). Caller frees the result.
-pub fn encode(enc: *const qwen3.TextEncoder, ctx: *gpu.Context, io: std.Io, gpa: std.mem.Allocator, ids: []const u32, use_f16: bool) ![]f32 {
+pub fn encode(enc: *const qwen3.TextEncoder, ctx: *gpu.Context, io: std.Io, gpa: std.mem.Allocator, ids: []const u32, use_f16: bool, cancel: ?*std.atomic.Value(bool)) ![]f32 {
     _ = io;
     const seq = ids.len;
     std.debug.assert(seq > 0);
@@ -96,6 +96,9 @@ pub fn encode(enc: *const qwen3.TextEncoder, ctx: *gpu.Context, io: std.Io, gpa:
 
     var tap_idx: usize = 0;
     for (0..n_layers) |l| {
+        // Poll cancel between layers so a stop lands mid-encode; the errdefer
+        // above aborts the in-flight batch.
+        if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
         if (tap_idx < qwen3.tap_layers.len and qwen3.tap_layers[tap_idx] == l) {
             // Snapshot the hidden state entering layer l into the tap-major
             // output buffer (contiguous copy with a per-tap offset).
@@ -921,13 +924,13 @@ test "gpu encode matches cpu encode" {
     var enc = try qwen3.TextEncoder.load(gpa, &st);
     defer enc.deinit();
 
-    const want = try enc.encode(io, gpa, ids.items);
+    const want = try enc.encode(io, gpa, ids.items, null);
     defer gpa.free(want);
 
     // f32 path (default): near-bit-parity (reduction-order noise only).
     // f16 coop path: same rounding regime as the DiT's tensor-core GEMMs.
     inline for (.{ .{ false, 1e-3 }, .{ true, 1e-2 } }) |cfg| {
-        const got = try encode(&enc, ctx, io, gpa, ids.items, cfg[0]);
+        const got = try encode(&enc, ctx, io, gpa, ids.items, cfg[0], null);
         defer gpa.free(got);
         try std.testing.expectEqual(want.len, got.len);
         var max_err: f32 = 0;

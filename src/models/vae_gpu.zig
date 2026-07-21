@@ -56,7 +56,7 @@ const Bufs = struct {
 
 /// Decode a VAE-space latent (planar [16][zh][zw], already denormalized) to
 /// planar [3][8*zh][8*zw] pixels in [-1, 1]. Caller frees the result.
-pub fn decode(dec: *const wan_vae.Decoder, ctx: *Context, io: std.Io, gpa: std.mem.Allocator, z: []const f32, zh: usize, zw: usize) ![]f32 {
+pub fn decode(dec: *const wan_vae.Decoder, ctx: *Context, io: std.Io, gpa: std.mem.Allocator, z: []const f32, zh: usize, zw: usize, cancel: ?*std.atomic.Value(bool)) ![]f32 {
     std.debug.assert(z.len == wan_vae.latent_channels * zh * zw);
     var bufs: Bufs = .{};
     defer bufs.deinit(ctx);
@@ -98,15 +98,20 @@ pub fn decode(dec: *const wan_vae.Decoder, ctx: *Context, io: std.Io, gpa: std.m
 
     try res(ctx, &bufs, h, w, dec.mid_res2);
 
-    for (dec.ups) |layer| switch (layer) {
-        .res => |rb| try res(ctx, &bufs, h, w, rb),
-        .up => |cv| {
-            try conv(ctx, &bufs, &bufs.x, &bufs.t, h, w, cv, true);
-            std.mem.swap(DeviceBuffer, &bufs.x, &bufs.t);
-            h *= 2;
-            w *= 2;
-        },
-    };
+    for (dec.ups) |layer| {
+        // Poll cancel between layers so a stop lands mid-decode; the errdefer
+        // above flushes the in-flight batch on the way out.
+        if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
+        switch (layer) {
+            .res => |rb| try res(ctx, &bufs, h, w, rb),
+            .up => |cv| {
+                try conv(ctx, &bufs, &bufs.x, &bufs.t, h, w, cv, true);
+                std.mem.swap(DeviceBuffer, &bufs.x, &bufs.t);
+                h *= 2;
+                w *= 2;
+            },
+        }
+    }
 
     // head: norm + silu + conv
     const n = h * w;
@@ -521,7 +526,7 @@ test "gpu decode matches comfyui reference" {
     var dec = try wan_vae.Decoder.load(gpa, &st);
     defer dec.deinit();
 
-    const out = try decode(&dec, ctx, io, gpa, z, 8, 8);
+    const out = try decode(&dec, ctx, io, gpa, z, 8, 8, null);
     defer gpa.free(out);
 
     var max_err: f32 = 0;

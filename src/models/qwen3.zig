@@ -238,9 +238,14 @@ pub const TextEncoder = struct {
 
     /// Encode token ids to the Krea 2 conditioning stack, [seq][tap_count][hidden]
     /// row-major (token-major, matching the DiT's unpacked context layout).
-    pub fn encode(self: *const TextEncoder, io: std.Io, gpa: std.mem.Allocator, ids: []const u32) ![]f32 {
+    pub fn encode(self: *const TextEncoder, io: std.Io, gpa: std.mem.Allocator, ids: []const u32, cancel: ?*std.atomic.Value(bool)) ![]f32 {
         const seq = ids.len;
         std.debug.assert(seq > 0);
+        // Arm fine-grained cancel inside the CPU matmul/attention kernels so a
+        // stop lands mid-layer, not just between layers.
+        const prev_tok = ops.cancel.token;
+        ops.cancel.token = cancel;
+        defer ops.cancel.token = prev_tok;
 
         const out = try gpa.alloc(f32, seq * tap_count * hidden);
         errdefer gpa.free(out);
@@ -258,6 +263,9 @@ pub const TextEncoder = struct {
         const dims = encoderDims;
         var tap_idx: usize = 0;
         for (0..n_layers) |l| {
+            // Poll cancel between layers so a stop lands mid-encode (a full CPU
+            // encode is 36 layers of full-sequence attention).
+            if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
             if (tap_idx < tap_layers.len and tap_layers[tap_idx] == l) {
                 for (0..seq) |t| {
                     @memcpy(out[(t * tap_count + tap_idx) * hidden ..][0..hidden], x[t * hidden ..][0..hidden]);
@@ -684,7 +692,7 @@ test "krea2 conditioning matches comfyui" {
     var enc = try TextEncoder.load(gpa, &st);
     defer enc.deinit();
 
-    const cond = try enc.encode(io, gpa, ids.items);
+    const cond = try enc.encode(io, gpa, ids.items, null);
     defer gpa.free(cond);
 
     const offset = krea2_text.stripOffset(ids.items);
@@ -706,4 +714,8 @@ test "krea2 conditioning matches comfyui" {
     // Hidden states reach magnitudes of O(100); tolerances are relative to that.
     try std.testing.expect(max_err < 0.05);
     try std.testing.expect(mean_err < 5e-4 * @as(f64, max_val));
+
+    // A pre-set cancel flag aborts mid-encode (polled between layers).
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(error.Canceled, enc.encode(io, gpa, ids.items, &canceled));
 }

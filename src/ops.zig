@@ -7,6 +7,7 @@ pub const rope = @import("ops/rope.zig");
 pub const matmul = @import("ops/matmul.zig");
 pub const attention = @import("ops/attention.zig");
 pub const convrot = @import("ops/convrot.zig");
+pub const cancel = @import("ops/cancel.zig");
 
 test {
     _ = vmath;
@@ -16,4 +17,5 @@ test {
     _ = matmul;
     _ = attention;
     _ = convrot;
+    _ = cancel;
 }

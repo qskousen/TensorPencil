@@ -39,7 +39,7 @@ const Bufs = struct {
 
 /// Decode a VAE-space latent (planar [16][zh][zw], already denormalized) to
 /// planar [3][8*zh][8*zw] pixels in [-1, 1]. Caller frees the result.
-pub fn decode(dec: *const wan_vae.Decoder, be: *Backend, io: std.Io, gpa: std.mem.Allocator, z: []const f32, zh: usize, zw: usize) ![]f32 {
+pub fn decode(dec: *const wan_vae.Decoder, be: *Backend, io: std.Io, gpa: std.mem.Allocator, z: []const f32, zh: usize, zw: usize, cancel: ?*std.atomic.Value(bool)) ![]f32 {
     _ = io;
     std.debug.assert(z.len == wan_vae.latent_channels * zh * zw);
     var bufs: Bufs = .{};
@@ -74,15 +74,20 @@ pub fn decode(dec: *const wan_vae.Decoder, be: *Backend, io: std.Io, gpa: std.me
     be.freeAttnScratch();
     try be.beginBatch();
 
-    for (dec.ups) |layer| switch (layer) {
-        .res => |rb| try res(be, &bufs, h, w, rb),
-        .up => |cv| {
-            try conv(be, &bufs, &bufs.x, &bufs.t, h, w, cv, true);
-            std.mem.swap(Buf, &bufs.x, &bufs.t);
-            h *= 2;
-            w *= 2;
-        },
-    };
+    for (dec.ups) |layer| {
+        // Poll cancel between layers so a stop lands mid-decode; the errdefer
+        // above aborts the in-flight batch.
+        if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
+        switch (layer) {
+            .res => |rb| try res(be, &bufs, h, w, rb),
+            .up => |cv| {
+                try conv(be, &bufs, &bufs.x, &bufs.t, h, w, cv, true);
+                std.mem.swap(Buf, &bufs.x, &bufs.t);
+                h *= 2;
+                w *= 2;
+            },
+        }
+    }
 
     // head: norm + silu + conv
     const n = h * w;

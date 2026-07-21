@@ -53,6 +53,8 @@ Per-stage dispatch order everywhere is `if (cu_be)` → CUDA, `else if (gpu_ctx)
 | **TAEHV preview** (taew2_1) | ✅ | ✅ *(new)* | ✅ | ✅ | `taehv{,_gpu,_cuda}.zig` |
 | **latent2rgb preview** | ✅ | ✅ | ✅ | ✅ | `wan_vae.latentPreviewInto` (fallback when no `--taew`) |
 
+**Cancellation** (`Options.cancel`): polled between sampling steps everywhere, plus mid-stage on every backend — between DiT blocks, between text-encoder layers, and between VAE decode layers (and per tile in `vae_tiled`). On the **cpu** backend the threaded matmul/attention kernels additionally poll a threadlocal token (`src/ops/cancel.zig`, armed by `dit.forward` / `wan_vae.Decoder.decode` / `qwen3.TextEncoder.encode`) per row-panel / k-block / query row, so a cancel lands in milliseconds even when a single CPU GEMM takes seconds. `error.Canceled` is never swallowed: the VAE OOM-retry ladder and the GPU→CPU encode fallback both propagate it.
+
 ### DiT block weight-dtype support
 
 | DiT block dtype | cpu | vulkan | zig-cuda | cuda |
