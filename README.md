@@ -21,6 +21,11 @@ Backends supported so far:
 - Zig PTX (CUDA) - Zig hand-emitted PTX (`--backend zig-cuda`)
 - CUDA libraries - NVIDIA cuBLASLt + cuDNN (`--backend cuda`)
 
+Would like to eventually support:
+- Metal - Apple MLX (`--backend metal`) (I don't have a Mac)
+- ROCm libraries - AMD ROCm equivilant to cuBLASLt etc. if there is one (`--backend rocm`)
+- Intel libraries - Intel oneAPI equivilant to cuBLASLt etc. if there is one (`--backend intel`) (I don't have an Intel GPU)
+
 The backends all make images nearly pixel-identical to ComfyUI; here is a comparison image across the three GPU
 backends vs. a ComfyUI reference.
 
@@ -38,14 +43,14 @@ Not all backends support all model formats yet.
 | INT4 ConvRot |   ✅   |    ❌     |     ✅      |   ✅    |
 
 Speeds vary widely depending on the model format and backend used. This table is from an RTX
-3090 / Ryzen 7 9800X3D generating a 4 step 1024x1024 cfg 1 image with full VRAM availability,
-across the different formats and backends.
+3090 / Ryzen 7 9800X3D generating a 1024x1024 cfg 1 image with full VRAM availability,
+across the different formats and backends. Numbers are seconds per step.
 
 | Model format | `cpu` | `vulkan` | `zig-cuda` | `cuda` | ComfyUI w/CUDA |
 |:-------------|:-----:|:--------:|:----------:|:------:|:--------------:|
-| FP8          |  288  |   2.89   |     —      |   —    |      2.46      |
-| INT8 ConvRot |  289  |   2.39   |    1.94    |  1.28  |      1.14      |
-| INT4 ConvRot |  287  |    —     |    1.38    |  1.11  |       —        |
+| FP8          |  288  |   2.89   |     —      |   —    |      2.22      |
+| INT8 ConvRot |  289  |   2.39   |    1.90    |  1.24  |      1.04      |
+| INT4 ConvRot |  287  |    —     |    1.38    |  1.11  |      0.74      |
 
 Plans for the future:
 - Unclear, but I keep finding more things to add
@@ -63,7 +68,7 @@ Backends other than `cpu` require additional runtime libraries:
 - `--backend cuda` → `libcuda.so.1` + `libcublasLt.so` + `libcudnn.so.9` (NVIDIA's
   math libraries; install cuDNN 9 + the CUDA 12/13 toolkit runtime)
 
-You'll also need a driver for your GPU. On Ubuntu:
+You'll also need a Vulkan driver for your GPU for the Vulkan backend. On Ubuntu:
 
 ```
 sudo apt install libvulkan1
@@ -97,7 +102,7 @@ You can pass `min` as the budget size to load only 2 weights at a time, ~150MiB 
 
 ** Note that the VRAM budget is only for the weights, the scores and activations are still in VRAM.**
 The amount of VRAM used for the scores and activations depends on the size of the image; at ~1.8MP, it will 
-be roughly 3.1GiB; this also varies by backend.
+be roughly 3.1GiB; this also varies by backend and prompt.
 
 Measured on an RTX 3090 at 1120×1680, 4 steps, INT8 ConvRot, vulkan backend:
 
@@ -112,6 +117,8 @@ Measured on an RTX 3090 at 1120×1680, 4 steps, INT8 ConvRot, vulkan backend:
 | 2 GiB                       | 6.47   | 31.2 s |
 | 1 GiB                       | 6.53   | 31.3 s |
 | min (150MiB)                | 7.21   | 34.2 s |
+
+NOTE: this has changed quite a bit since I wrote this, the speed numbers need to be updated and the minimum size may be different.
 
 ### LLM
 

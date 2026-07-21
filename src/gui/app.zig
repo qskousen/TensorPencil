@@ -1851,6 +1851,8 @@ fn renderInput(s: ?*chat.Session) void {
         .text = .{ .buffer = &g_input_buf },
         .multiline = true,
         .placeholder = "Message…  (Enter to send · Shift+Enter for newline)",
+        .scroll_horizontal = false,
+        .break_lines = true,
     }, .{
         .expand = .horizontal,
         .gravity_y = 0.5,

@@ -490,6 +490,20 @@ pub const Session = struct {
         // CUDA's "current context" is per-thread, so bind before freeing device
         // memory / destroying the context.
         if (self.cu_be) |b| b.bindThread();
+        // Tear the compute backend down FIRST — before unmapping the checkpoint
+        // safetensors below. The CUDA backend's prefetch thread streams weights
+        // straight from those mmaps and DRAINS its queued requests as it joins
+        // (Backend.deinit's contract: "the caller munmaps after Backend.deinit").
+        // The old order unmapped first, so when a forward aborted mid-stream
+        // (e.g. an OOM under VRAM pressure left a block's prefetches queued) the
+        // still-draining thread read the freed DiT mapping → SIGSEGV during
+        // teardown. Stopping the thread first keeps the mappings valid until no
+        // one reads them.
+        if (self.gpu_ctx) |ctx| {
+            ops.matmul.gpu_dispatch = null;
+            ctx.deinit();
+        }
+        if (self.cu_be) |b| b.deinit();
         self.vae.deinit();
         self.vae_st.deinit();
         self.dit.deinit();
@@ -497,11 +511,6 @@ pub const Session = struct {
         self.enc.deinit();
         self.enc_st.deinit();
         self.tok.deinit();
-        if (self.gpu_ctx) |ctx| {
-            ops.matmul.gpu_dispatch = null;
-            ctx.deinit();
-        }
-        if (self.cu_be) |b| b.deinit();
         gpa.destroy(self);
     }
 
@@ -573,9 +582,41 @@ pub const Session = struct {
             const budget = if (opts.vram_budget > 0) @min(opts.vram_budget, room) else room;
             const pin_reserve: u64 = b.attn_scratch_budget + (512 << 20);
             b.pin_budget = budget -| pin_reserve;
+            // Same reserve as a LIVE floor for first-touch pinning: pinNew keeps
+            // this much VRAM free, so pinning never eats the room the (lazily
+            // allocated, per-block) attention scratch + activation workspace need.
+            // pin_budget above is blind to the working set not yet allocated at
+            // pin time; the floor is the physical backstop that makes streaming
+            // actually fit — the whole point of a tight budget.
+            b.pin_floor = pin_reserve;
             std.log.info("[diff-vram] budget={d}MB room={d}MB reserve={d}MB pin={d}MB free={d}MB", .{
                 opts.vram_budget >> 20, room >> 20, pin_reserve >> 20, b.pin_budget >> 20, free_now >> 20,
             });
+
+            // Proactively drop the transient text encoder when it can't stay
+            // resident alongside the DiT's working set. It's evictable but nothing
+            // forces it out until the DiT's own allocations reactively reclaim it
+            // — which happens DURING step 1, so step 1 pins little (streams around
+            // the resident encoder) and runs slow; only once it's cleared do later
+            // steps pin properly and speed up (the 11s→3s first-step cliff under a
+            // resident LLM). Evicting up front lets step 1 pin from the start. The
+            // encode (both CFG passes) is already done, so the encoder has no
+            // further use THIS image; on a big card where it all fits we keep it
+            // (the next queued image's encode reuses it). At this point — post
+            // encode, pre-DiT-Session.init — the weight cache holds ONLY the
+            // encoder, so evictWeights drops exactly it. Condition: the DiT weights
+            // + activation reserve don't fit in the live free VRAM with the encoder
+            // still resident (room already counts the encoder as reclaimable, so
+            // the test reduces to dit + reserve > free_now).
+            const dit_bytes = self.dit_st.payload.len;
+            if (dit_bytes + pin_reserve > free_now) {
+                // evictUnpinned (NOT evictWeights): keep a DiT pinned by a previous
+                // queued image, drop only the (unpinned) encoder + any stray stream.
+                const freed = b.evictUnpinned();
+                if (freed > 0) std.log.info("[diff-vram] dropped {d}MB of unpinned weights (text encoder) up front — won't fit alongside the DiT working set (dit={d}MB + reserve={d}MB > free={d}MB)", .{
+                    freed >> 20, dit_bytes >> 20, pin_reserve >> 20, free_now >> 20,
+                });
+            }
         }
 
         // Stage 2: flow-matching sampling (reusing the resident DiT). DiT weights

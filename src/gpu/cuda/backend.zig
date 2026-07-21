@@ -229,6 +229,23 @@ pub const Backend = struct {
     pin_budget: u64 = 0,
     /// Bytes currently claimed against pin_budget.
     pinned_bytes: u64 = 0,
+    /// Live-VRAM floor kept free by first-touch pinning (pinNew) and prefetch
+    /// (prefetchWeight). pin_budget is computed BEFORE the per-image working set
+    /// (activations + attention scratch, gigabytes at high resolution) is
+    /// allocated and is blind to other processes on the card, so it can
+    /// over-commit; pinned weights are then non-evictable on the streaming path
+    /// (evictOneWeight skips them), leaving no way to recover. Gating each pin on
+    /// live free VRAM staying above this floor makes pinning self-limit to
+    /// genuinely-free memory and stream the rest — the low-VRAM case just streams
+    /// more. 0 = disabled (only refuse a pin that physically won't fit): the LLM
+    /// decode path leaves it off (its residency is managed by pin_budget +
+    /// offload); the diffusion pipeline sets it to its activation-scratch reserve.
+    pin_floor: u64 = 0,
+    /// Last evictOneWeight skip-reason tally, for the tensorCreate OOM diagnostic
+    /// ([oom-dbg]). A failed eviction is now routine (the recycle pool, not the
+    /// cache, usually holds the reclaimable bytes), so the breakdown is recorded
+    /// here and only printed on a genuine unrecoverable OOM instead of per call.
+    evict_skip: struct { pin: u32 = 0, awaiting: u32 = 0, mru: u32 = 0, pf: u32 = 0, small: u32 = 0 } = .{},
     /// async weight uploads: set once a prefetch thread is running, so
     /// re-uploads run on the transfer stream (overlapping compute) with a
     /// per-weight completion event the compute stream waits on.
@@ -685,6 +702,15 @@ pub const Backend = struct {
             e.last_use = self.use_counter;
             return; // already resident or in flight
         }
+        // Bound prefetch-ahead by live VRAM (see pin_floor; off → no throttle,
+        // the LLM path). A prefetched weight is held `awaiting_use` (unevictable)
+        // until the compute consumes it, so prefetching under pressure piles up
+        // unreclaimable bytes and starves the current block's activation scratch
+        // — the exact OOM the [oom-dbg] "await=N" tally reports. When free VRAM is
+        // at the floor, skip the prefetch: cachedWeight sync-loads the weight on
+        // demand once the block's scratch has freed, and prefetch resumes as room
+        // opens.
+        if (self.pin_floor != 0 and self.ctx.memGetInfo().free < bytes.len + self.pin_floor) return;
         self.reserveForWeights(bytes.len);
         const pin = self.pinNew(bytes.len);
         const db = self.weightBufAcquire(bytes.len, pin) catch return; // best-effort; cachedWeight sync-falls-back on miss
@@ -723,6 +749,13 @@ pub const Backend = struct {
                 self.reclaimPending();
                 if (self.blockOldestPending()) continue;
                 if (self.evictOneWeight()) continue;
+                if (self.drainPoolForOom() > 0) continue; // sacrifice the recycle pool
+                if (self.evictNewestPrefetch()) continue; // last resort: drop the farthest-out prefetch
+                const es = self.evict_skip;
+                std.debug.print("[oom-dbg] tensorCreate size={d}MB free={d}MB pinned={d}MB streamed={d}MB cache={d} pending={d}MB | unevictable: pin={d} await={d} mru={d} pf={d} small={d}\n", .{
+                    size >> 20, self.ctx.memGetInfo().free >> 20, self.pinned_bytes >> 20, self.streamed_bytes >> 20, self.weights.count(), self.pending_free_bytes >> 20,
+                    es.pin,     es.awaiting,                     es.mru,                    es.pf,                      es.small,
+                });
                 return error.DeviceOutOfMemory;
             }
         }
@@ -864,19 +897,46 @@ pub const Backend = struct {
         }
         var lru_key: usize = undefined;
         var lru_use: u64 = std.math.maxInt(u64);
+        var sk_pin: usize = 0;
+        var sk_await: usize = 0;
+        var sk_mru: usize = 0;
+        var sk_pf: usize = 0;
+        var sk_small: usize = 0;
         var it = self.weights.iterator();
         while (it.next()) |e| {
-            if (e.value_ptr.pinned) continue; // pinned prefix never streams
-            if (e.value_ptr.awaiting_use) continue; // prefetched, not yet consumed
-            if (e.value_ptr.last_use == mru_use) continue; // protect the MRU
-            if (e.value_ptr.pf_gen > completed) continue; // protect in-flight prefetch
-            if (e.value_ptr.db.size <= evict_min_size) continue; // norms/scales: not worth a sync stall
+            if (e.value_ptr.pinned) {
+                sk_pin += 1;
+                continue;
+            } // pinned prefix never streams
+            if (e.value_ptr.awaiting_use) {
+                sk_await += 1;
+                continue;
+            } // prefetched, not yet consumed
+            if (e.value_ptr.last_use == mru_use) {
+                sk_mru += 1;
+                continue;
+            } // protect the MRU
+            if (e.value_ptr.pf_gen > completed) {
+                sk_pf += 1;
+                continue;
+            } // protect in-flight prefetch
+            if (e.value_ptr.db.size <= evict_min_size) {
+                sk_small += 1;
+                continue;
+            } // norms/scales: not worth a sync stall
             if (e.value_ptr.last_use < lru_use) {
                 lru_use = e.value_ptr.last_use;
                 lru_key = e.key_ptr.*;
             }
         }
-        if (lru_use == std.math.maxInt(u64)) return false; // only the MRU remains
+        if (lru_use == std.math.maxInt(u64)) {
+            // Record why nothing was evictable; [oom-dbg] prints it iff the whole
+            // reclaim ladder (incl. the pool drain) then fails. Not logged here:
+            // a failed eviction is normal under streaming (the pool holds the
+            // reclaimable bytes) and the caller usually recovers.
+            self.evict_skip = .{ .pin = @intCast(sk_pin), .awaiting = @intCast(sk_await), .mru = @intCast(sk_mru), .pf = @intCast(sk_pf), .small = @intCast(sk_small) };
+            return false; // only the MRU remains
+        }
         self.evictions += 1;
         const e = self.weights.fetchRemove(lru_key).?;
         if (e.value.upload_ev) |ev| {
@@ -903,6 +963,53 @@ pub const Backend = struct {
         self.streamed_bytes -|= db.size;
         var d = db;
         self.tensorDestroy(&d);
+        return true;
+    }
+
+    /// LAST-resort reclaim (below evictOneWeight + the pool drain in tensorCreate's
+    /// OOM ladder): free the prefetched-but-unconsumed weight FARTHEST from use.
+    /// Normally these `awaiting_use` buffers are protected — we prefetched them and
+    /// will consume them soon — but when another process grows its VRAM AFTER we
+    /// sized the prefetch (our free-memory estimate is now stale), reclaiming them
+    /// is the only way to avoid a hard OOM. Prefetch is FIFO (the DiT walks blocks
+    /// in order), so the HIGHEST gen is consumed last: evicting it is least
+    /// disruptive — it just re-streams synchronously much later, once nearer
+    /// weights have freed room. Returns false if no safe candidate exists.
+    ///
+    /// SAFETY: only `pf_gen <= pf_completed` weights are touchable. A weight with a
+    /// higher gen is either still queued in the ring or has the transfer stream
+    /// mid-write into its buffer — freeing it is the use-after-free the teardown
+    /// reorder fixed. Completed prefetches are ring-drained (pf_tail passed their
+    /// slot); we still wait on the upload event so the enqueued DMA finishes before
+    /// the free. Frees synchronously (a stall is fine on the about-to-OOM path).
+    fn evictNewestPrefetch(self: *Backend) bool {
+        const completed = self.pf_completed.load(.acquire);
+        var best_key: usize = undefined;
+        var best_gen: u64 = 0;
+        var found = false;
+        var it = self.weights.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.pinned) continue;
+            if (!e.value_ptr.awaiting_use) continue; // only prefetched-not-consumed
+            if (e.value_ptr.pf_gen > completed) continue; // DMA in flight / ring-owned — NEVER free
+            if (e.value_ptr.db.size <= evict_min_size) continue; // not worth the sync stall
+            if (!found or e.value_ptr.pf_gen > best_gen) { // farthest from use = highest gen
+                best_gen = e.value_ptr.pf_gen;
+                best_key = e.key_ptr.*;
+                found = true;
+            }
+        }
+        if (!found) return false;
+        self.evictions += 1; // invalidate any captured graph (matches evictOneWeight)
+        const e = self.weights.fetchRemove(best_key).?;
+        std.debug.print("[oom-dbg] evicting farthest prefetch gen={d} ({d}MB) — free-VRAM estimate went stale (external pressure?)\n", .{ best_gen, e.value.db.size >> 20 });
+        if (e.value.upload_ev) |ev| {
+            _ = self.ctx.api.cuEventSynchronize(ev); // the DMA into this buffer must finish before we free it
+            self.ctx.eventDestroy(ev);
+        }
+        self.streamed_bytes -|= e.value.db.size;
+        var db = e.value.db;
+        self.tensorDestroy(&db);
         return true;
     }
 
@@ -1048,6 +1155,28 @@ pub const Backend = struct {
             list.deinit(self.gpa);
         }
         self.weight_pool.clearRetainingCapacity();
+    }
+
+    /// Free recycled pool buffers for real to reclaim VRAM (tensorCreate OOM
+    /// backstop). The pool holds streamed-weight buffers by size to dodge
+    /// cuMemAlloc/Free churn in steady-state decode, but those bytes stay in
+    /// `streamed_bytes`/device_used and are invisible to evictOneWeight — so a
+    /// large NON-weight allocation (activation scratch) can OOM with gigabytes
+    /// sitting idle in the pool. Under that OOM the churn-avoidance trade must
+    /// yield: free the pool, adjusting streamed_bytes. Returns bytes freed.
+    fn drainPoolForOom(self: *Backend) u64 {
+        var freed: u64 = 0;
+        var it = self.weight_pool.valueIterator();
+        while (it.next()) |list| {
+            for (list.items) |db| {
+                var d = db;
+                self.streamed_bytes -|= d.size;
+                freed += d.size;
+                self.tensorDestroy(&d);
+            }
+            list.clearRetainingCapacity();
+        }
+        return freed;
     }
 
     /// Make room for a `need`-byte weight upload: reclaim ready deferred-frees, then
@@ -1216,6 +1345,36 @@ pub const Backend = struct {
         }
     }
 
+    /// Free all UNPINNED cached weights (keep the pinned prefix), returning bytes
+    /// freed. The diffusion pipeline calls this right after encode to drop the
+    /// transient text encoder before sampling: at that point the DiT hasn't been
+    /// touched this image, so the only unpinned entries are the encoder's — and a
+    /// DiT pinned by a PREVIOUS queued image (the GUI keeps it resident across the
+    /// queue) is pinned, so it survives. Reliable regardless of buffer-pool tag
+    /// reuse (keys on the `pinned` flag, set at cache time). Any stray leftover
+    /// streamed weight also goes, which is harmless (it re-streams on next use).
+    pub fn evictUnpinned(self: *Backend) u64 {
+        _ = self.ctx.api.cuStreamSynchronize(self.ctx.stream);
+        _ = self.ctx.api.cuStreamSynchronize(self.ctx.xfer_stream); // in-flight prefetch DMAs
+        self.drainPending();
+        var doomed: std.ArrayListUnmanaged(usize) = .empty;
+        defer doomed.deinit(self.gpa);
+        var it = self.weights.iterator();
+        while (it.next()) |e| {
+            if (!e.value_ptr.pinned) doomed.append(self.gpa, e.key_ptr.*) catch return 0;
+        }
+        var freed: u64 = 0;
+        for (doomed.items) |key| {
+            const e = self.weights.fetchRemove(key).?.value;
+            if (e.upload_ev) |ev| self.ctx.eventDestroy(ev);
+            self.streamed_bytes -|= e.db.size;
+            freed += e.db.size;
+            var db = e.db;
+            self.tensorDestroy(&db);
+        }
+        return freed;
+    }
+
     pub fn evictWeights(self: *Backend) void {
         _ = self.ctx.api.cuStreamSynchronize(self.ctx.stream);
         _ = self.ctx.api.cuStreamSynchronize(self.ctx.xfer_stream); // in-flight prefetch DMAs
@@ -1286,6 +1445,14 @@ pub const Backend = struct {
     /// order): true while the claims fit under pin_budget.
     fn pinNew(self: *Backend, size: u64) bool {
         if (self.pinned_bytes + size > self.pin_budget) return false;
+        // Physical guard (see pin_floor): only pin when live free VRAM stays
+        // above the floor afterwards, else stream this weight. Pinning eats
+        // memory the working set + ongoing streaming still need and can't be
+        // reclaimed by the streaming backstop, so pin_budget alone (blind to
+        // the not-yet-allocated working set and to other processes) is not a
+        // safe ceiling. Off (pin_floor 0, the LLM path) → pure pin_budget, no
+        // query. On (diffusion) the query is cheap and runs only on first touch.
+        if (self.pin_floor != 0 and self.ctx.memGetInfo().free < size + self.pin_floor) return false;
         self.pinned_bytes += size;
         return true;
     }
