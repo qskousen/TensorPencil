@@ -52,23 +52,28 @@ const zero_bias: [mlp_dim]f32 = @splat(0);
 
 /// Weight class of the DiT block linears. A convrot checkpoint is int8/int4
 /// (per-row scale + prep-once shared-input quant GEMM); a dense checkpoint is
-/// bf16 (each linear a standalone f16 tensor-core GEMM). Uniform across blocks.
-const LinKind = enum { i8, i4, bf16 };
+/// bf16 (each linear a standalone f16 tensor-core GEMM); an fp8-e4m3 checkpoint
+/// streams each linear through the dequant-to-f16 + hgemm path. Uniform across
+/// blocks.
+const LinKind = enum { i8, i4, bf16, fp8 };
 
 /// Prep the shared linear input. int8/int4 rotate+quantize `x` in place (all the
-/// block's GEMMs then read that internal state); bf16 GEMMs consume the f32 `x`
-/// directly, so no prep is needed.
+/// block's GEMMs then read that internal state); bf16/fp8 GEMMs consume the f32
+/// `x` directly, so no prep is needed.
 fn linPrep(be: *Backend, kind: LinKind, x: DeviceBuffer, m: usize, cols: usize) !void {
     switch (kind) {
         .i4 => try be.opI4Prep(x, m, cols),
         .i8 => try be.opI8Prep(x, m, cols, false),
-        .bf16 => {},
+        .bf16, .fp8 => {},
     }
 }
 
 /// One block linear y[m][rows] f32 = x[m][cols] @ Wᵀ. int8/int4 read the prepped
 /// activation state (`x` is ignored); bf16 runs the f32-in/f32-out f16
 /// tensor-core GEMM (opMatmulBf16, weight bf16→f16 at upload) with a zero bias.
+/// fp8 streams the weight, dequants it to an f16 scratch (per-tensor `w.scale`
+/// folded in) and runs the same validated hgemm. Block linears carry no bias, so
+/// `bias` is unused for the bf16/fp8 GEMMs (they all pass the shared zero_bias).
 fn lin(be: *Backend, kind: LinKind, y: DeviceBuffer, x: DeviceBuffer, m: usize, w: anytype, bias: []const f32) !void {
     switch (kind) {
         .i4 => try be.opI4Gemm(y, w.bytes, w.row_scale.?, w.rows),
@@ -80,6 +85,7 @@ fn lin(be: *Backend, kind: LinKind, y: DeviceBuffer, x: DeviceBuffer, m: usize, 
             try be.opGemmBf16(y, x, m, w.bytes, w.rows, w.cols, bias[0..w.rows])
         else
             try be.opMatmulBf16(y, x, m, w.bytes, w.rows, w.cols, bias[0..w.rows]),
+        .fp8 => try be.opMatmulFp8(y, x, m, w.bytes, w.scale, w.rows, w.cols),
     }
 }
 
@@ -430,14 +436,15 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
     errdefer if (be.batching()) be.abortBatch();
 
     // Weight class of the DiT block linears, gated once: int8/int4 convrot
-    // (per-row scale + packed int weights) or dense bf16. An fp8 DiT has no
-    // row_scale and no bf16 GEMM path here, so reject it with a clear error
-    // instead of unwrapping a null scale into an illegal GPU access.
+    // (per-row scale + packed int weights), dense bf16, or raw fp8-e4m3 (streamed
+    // + dequant-to-f16 hgemm). A block-quant / unknown dtype has no GEMM path
+    // here, so reject it with a clear error instead of a bad GPU access.
     const wqt = model.blocks[0].attn.wq.dtype;
     const kind: LinKind = switch (wqt) {
         .i8 => .i8,
         .i4 => .i4,
         .bf16 => .bf16,
+        .f8_e4m3 => .fp8,
         else => return error.UnsupportedCheckpoint,
     };
     const zeros: []const f32 = &zero_bias;

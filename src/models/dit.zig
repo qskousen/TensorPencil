@@ -94,6 +94,40 @@ pub const DiT = struct {
     last_mod: []const f32, // [2 * features]
     last_linear: LinearW, // 6144 -> 64
 
+    /// Materialize a projection weight to f32 for the GPU `opMatmul` fused-GEMM
+    /// path (`dit_cuda`/`dit_gpu`). Used for the two non-quantized linears fed to
+    /// it raw — the `first` patch embed and the `last.linear` output projection —
+    /// which need its bias + destination-offset support that the bulk-weight
+    /// GEMMs don't. That path only has an f32 pipeline (the CUDA fused kernel has
+    /// no fp8 variant, `backend.zig` `opMatmul`), so every dtype is normalized to
+    /// f32 here. These two weights are tiny ([F,64] / [64,F]) so the cost is
+    /// negligible, and it keeps first/last uniform across all checkpoint formats.
+    ///
+    /// - `f32`: consumed natively, so pass the mmap bytes through.
+    /// - `f8_e4m3`/`bf16`/`f16`: materialize to f32 once into `alloc` (the model
+    ///   arena, which outlives the model), folding any per-tensor scale. Without
+    ///   this the f32 pipeline reads the packed bytes as f32 and the image is
+    ///   pure noise (bf16: ComfyUI-native int8 checkpoints) or the run aborts on
+    ///   the fp8 assert (fp8 checkpoints on CUDA).
+    /// - anything else (i8/i4/block-quant): these projections are never
+    ///   quantized in any known checkpoint, and dequanting them here would be
+    ///   wrong (int needs the per-row scale + convrot; block-quant needs ggml).
+    ///   Refuse loudly rather than emit silent garbage.
+    fn opMatmulF32(alloc: std.mem.Allocator, w: Weight) !Weight {
+        switch (w.dtype) {
+            .f32 => return w,
+            .f8_e4m3, .bf16, .f16 => {
+                const out = try alloc.alloc(f32, w.rows * w.cols);
+                try safetensors.convertToF32(w.dtype, w.bytes, out);
+                if (w.scale != 1.0) for (out) |*v| {
+                    v.* *= w.scale;
+                };
+                return Weight.fromF32(out, w.rows, w.cols);
+            },
+            else => return error.UnsupportedCheckpoint,
+        }
+    }
+
     pub fn load(gpa: std.mem.Allocator, st: *const SafeTensors) !DiT {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
@@ -125,7 +159,16 @@ pub const DiT = struct {
             txt_refiner[i] = try l.loadTxtBlock("txtfusion.refiner_blocks.{d}", i);
         }
 
-        const first = try l.loadLinear("first", features, channels * patch * patch, true);
+        // The `first` patch-embed and `last.linear` output projection are the
+        // only non-quantized weights the GPU backends feed straight to the
+        // f32/fp8-only `opMatmul` (dit_cuda/dit_gpu); it has no bf16 pipeline and
+        // would reinterpret bf16 bytes as f32 -> pure noise. ComfyUI-native int8
+        // checkpoints store these two as BF16 (our own converter used F32), so
+        // materialize any non-f32/fp8 storage to f32 once at load. They are tiny
+        // ([F,64] / [64,F]) so the cost is negligible; fp8/f32 pass through, and
+        // the CPU matmul handles bf16 natively regardless.
+        var first = try l.loadLinear("first", features, channels * patch * patch, true);
+        first.w = try opMatmulF32(alloc, first.w);
         const tmlp0 = try l.loadLinear("tmlp.0", features, tdim, true);
         const tmlp2 = try l.loadLinear("tmlp.2", features, features, true);
         const tproj1 = try l.loadLinear("tproj.1", 6 * features, features, true);
@@ -135,7 +178,8 @@ pub const DiT = struct {
         const txtmlp3 = try l.loadLinear("txtmlp.3", features, features, true);
         const last_norm = try l.normScale("last.norm.scale", .{}, features);
         const last_mod = try l.vec("last.modulation.lin", .{}, 2 * features);
-        const last_linear = try l.loadLinear("last.linear", channels * patch * patch, features, true);
+        var last_linear = try l.loadLinear("last.linear", channels * patch * patch, features, true);
+        last_linear.w = try opMatmulF32(alloc, last_linear.w);
 
         return .{
             .arena = arena,
@@ -739,6 +783,48 @@ test "modulate and gatedAdd broadcast over rows" {
     try std.testing.expectEqualSlices(f32, &.{ 11.5, 20, 14.5, 20 }, &x);
     gatedAdd(&x, &.{ 1, 1, 2, 2 }, &.{ 2, 0.5 });
     try std.testing.expectEqualSlices(f32, &.{ 13.5, 20.5, 18.5, 21 }, &x);
+}
+
+test "opMatmulF32 passes f32/fp8 through and materializes bf16 to f32" {
+    const dtypes = @import("tp_core").dtype;
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // f32 passes through untouched (same bytes, so the GPU f32 pipeline is fed
+    // the original mmap; no needless copy).
+    const f32w = [_]f32{ 1.0, -2.0, 3.5, 0.25 };
+    const wf = try DiT.opMatmulF32(alloc, Weight.fromF32(&f32w, 2, 2));
+    try std.testing.expectEqual(@as(@TypeOf(wf.dtype), .f32), wf.dtype);
+    try std.testing.expectEqual(@intFromPtr(&f32w), @intFromPtr(wf.bytes.ptr));
+
+    // fp8 is materialized to f32 (the CUDA fused opMatmul has no fp8 pipeline);
+    // values match the e4m3 LUT exactly.
+    const dt = @import("tp_core").dtype;
+    const f8 = [_]u8{ 0x38, 0x40, 0x48, 0x50 }; // arbitrary e4m3 bytes
+    const w8 = try DiT.opMatmulF32(alloc, Weight.init(&f8, .f8_e4m3, 2, 2));
+    try std.testing.expectEqual(@as(@TypeOf(w8.dtype), .f32), w8.dtype);
+    const g8 = std.mem.bytesAsSlice(f32, w8.bytes);
+    for (f8, g8) |byte, g| try std.testing.expectEqual(dt.f8e4m3ToF32(byte), g);
+
+    // bf16 is materialized to f32 with the exact bf16-rounded values (this is
+    // the ComfyUI-native int8-checkpoint case that used to render as noise).
+    const vals = [_]f32{ 1.0, -2.5, 0.125, 42.0 };
+    var bf: [vals.len]u16 = undefined;
+    for (&bf, vals) |*b, v| b.* = dtypes.f32ToBf16(v);
+    const wb = try DiT.opMatmulF32(alloc, Weight.init(std.mem.sliceAsBytes(&bf), .bf16, 2, 2));
+    try std.testing.expectEqual(@as(@TypeOf(wb.dtype), .f32), wb.dtype);
+    const got = std.mem.bytesAsSlice(f32, wb.bytes);
+    for (vals, got) |want, g| {
+        try std.testing.expectEqual(dtypes.bf16ToF32(dtypes.f32ToBf16(want)), g);
+    }
+
+    // A quantized dtype for these projections is not a known checkpoint shape
+    // and can't be dequanted here (no scale/convrot/ggml), so it aborts loudly
+    // rather than silently mis-converting.
+    const q = [_]u8{ 0, 1, 2, 3 };
+    try std.testing.expectError(error.UnsupportedCheckpoint, DiT.opMatmulF32(alloc, Weight.init(&q, .i8, 2, 2)));
 }
 
 test "int8 convrot checkpoint loads with per-row scale + rotation metadata" {

@@ -47,7 +47,7 @@ Per-stage dispatch order everywhere is `if (cu_be)` → CUDA, `else if (gpu_ctx)
 | Stage | cpu | vulkan | zig-cuda | cuda | Files |
 |---|---|---|---|---|---|
 | **Text encoder** (Qwen3-VL-4B) | ✅ f32 | ✅ f32 (⚠️ f16 opt via `--encoder-f16`) | ✅ fp8→f16 TC | ✅ fp8→f16 TC | `krea2_text.zig`, `qwen3{,_gpu,_cuda}.zig` |
-| **DiT** (Krea 2, 28 blocks) | ✅ all dtypes | ✅ fp8 / int8 / bf16 | ✅ int8 / int4 / bf16 | ✅ int8 / int4 / bf16 | `dit{,_gpu,_cuda}.zig` |
+| **DiT** (Krea 2, 28 blocks) | ✅ all dtypes | ✅ fp8 / int8 / bf16 | ✅ fp8 / int8 / int4 / bf16 | ✅ fp8 / int8 / int4 / bf16 | `dit{,_gpu,_cuda}.zig` |
 | **VAE decode** (Wan 2.1) | ✅ | ✅ | ✅ | ✅ (+cuDNN conv avail.) | `wan_vae.zig`, `vae_{gpu,cuda}.zig` |
 | **VAE tiling** | CPU-tile | GPU-tile + CPU floor | GPU-tile + CPU floor | GPU-tile + CPU floor | `vae_tiled.zig` |
 | **TAEHV preview** (taew2_1) | ✅ | ✅ *(new)* | ✅ | ✅ | `taehv{,_gpu,_cuda}.zig` |
@@ -59,13 +59,13 @@ Per-stage dispatch order everywhere is `if (cu_be)` → CUDA, `else if (gpu_ctx)
 
 | DiT block dtype | cpu | vulkan | zig-cuda | cuda |
 |---|---|---|---|---|
-| **fp8-e4m3** *(default ckpt)* | ✅ | ✅ (fast coop) | ❌ blocks¹ | ❌ blocks¹ |
+| **fp8-e4m3** | ✅ | ✅ (fast coop) | ✅ stream+dequant¹ | ✅ stream+dequant¹ |
 | **int8-convrot** | ✅ | ✅ | ✅ | ✅ (+f16 MLP) |
 | **int4-convrot** | ✅ | ❌² | ✅ | ✅ |
 | **bf16 dense** | ✅ | ✅ native/f16 | ✅ native/f16 | ✅ cuBLASLt R_16BF |
 | **f32** | ✅ | ✅ (offload) | — | — |
 
-¹ The default checkpoint is fp8; **CUDA backends require an int8/int4/bf16 DiT checkpoint** (fp8 blocks → `error.UnsupportedCheckpoint`, `dit_cuda.zig:436`). First/last patch-embed projections still accept fp8.
+¹ fp8 block linears stream through `opMatmulFp8` (`backend.zig`): the fp8 weight is decoded to an f16 scratch (`dequant_fp8_f16`, per-tensor scale folded) and run through the validated `buildHgemm` (hand-PTX) or `ltMatmulF16` (cuBLASLt) — the same primitive the fp8 text encoder uses, `LinKind.fp8` in `dit_cuda.zig`. The dequant-to-f16 scratch is re-materialized per GEMM (no fp8 tensor-core GEMM yet), so fp8 on the CUDA backends is correctness-first and slower per step than the native int8 path. The **CUDA fused `opMatmul`** (bias + destination-offset, used only by `first`/`last.linear`) still has no fp8 variant, so those two tiny projections — like bf16 (ComfyUI-native int8 checkpoints) — are materialized to f32 once at load (`DiT.opMatmulF32`, `dit.zig`); otherwise the run either aborts on the fp8 assert or (bf16) reads the packed bytes as f32 → pure noise.
 ² No sint4 cooperative-matrix on Vulkan (see §7).
 
 ---

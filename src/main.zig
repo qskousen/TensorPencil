@@ -134,8 +134,8 @@ pub fn main(init: std.process.Init) !void {
             \\                         GEMMs to Vulkan; zig-cuda runs the whole
             \\                         pipeline on the pure-Zig hand-PTX CUDA
             \\                         backend; cuda runs it on NVIDIA's dlopen'd
-            \\                         cuBLASLt/cuDNN kernels (both take an int8/
-            \\                         int4 convrot or dense bf16 --dit ckpt)
+            \\                         cuBLASLt/cuDNN kernels (both take an fp8 /
+            \\                         int8|int4 convrot / dense bf16 --dit ckpt)
             \\      --vram-budget 0    GiB of device memory to use (0 = ask the
             \\                         driver); weights past it stream per step.
             \\                         "min" holds only the in-flight weights
