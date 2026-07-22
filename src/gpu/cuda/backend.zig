@@ -271,13 +271,19 @@ pub const Backend = struct {
 
     // ---- prefetch thread (block-ahead async weight streaming) ----
     // Lock-free single-producer (main) / single-consumer (thread) ring — Zig 0.16
-    // removed std.Thread.Mutex/Condition, so we use atomics + Thread.yield spins.
+    // removed std.Thread.Mutex/Condition, so we synchronize with atomics and,
+    // when the ring is empty, a raw Linux futex (the consumer blocks instead of
+    // spin-yielding; this backend is NVIDIA/Linux-only).
     pf_thread: ?std.Thread = null,
     pf_ring: [pf_ring_sz]PrefetchReq = undefined,
     pf_head: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // enqueue cursor (main writes)
     pf_tail: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // dequeue cursor (thread writes)
     pf_completed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // last gen whose DMA+event is queued
     pf_shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // Wake signal for the prefetch thread: bumped on every enqueue and on
+    // shutdown so the idle thread blocks (futex) instead of busy-spinning on an
+    // empty ring — a resident-but-idle CUDA session otherwise pinned a core.
+    pf_wake: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     pf_gen: u64 = 0, // last assigned generation (main-only)
 
     // fp8-e4m3 GEMM state (opMatmulFp8): the 256-entry e4m3->f32 LUT (uploaded
@@ -532,6 +538,7 @@ pub const Backend = struct {
         }
         if (self.pf_thread) |t| {
             self.pf_shutdown.store(true, .release);
+            self.pfWakeWorker(); // unpark it if it's blocked on an empty ring
             t.join(); // drains queued prefetches, then exits
         }
         self.drainPending();
@@ -622,6 +629,26 @@ pub const Backend = struct {
         self.pin_budget = std.math.maxInt(u64);
     }
 
+    /// Block the prefetch thread until `pf_wake` changes from `expect` (an
+    /// enqueue or shutdown bumps it). Raw Linux futex — std's Mutex/Condition are
+    /// gone in 0.16 and this backend only ever runs on Linux/NVIDIA.
+    fn pfWaitForWork(self: *Backend, expect: u32) void {
+        if (@import("builtin").os.tag == .linux) {
+            _ = std.os.linux.futex_4arg(&self.pf_wake.raw, .{ .cmd = .WAIT, .private = true }, expect, null);
+        } else {
+            std.Thread.yield() catch {};
+        }
+    }
+
+    /// Wake the prefetch thread if it's parked in `pfWaitForWork`. Callers bump
+    /// `pf_wake` (release) BEFORE calling this so a park racing the wake re-checks.
+    fn pfWakeWorker(self: *Backend) void {
+        _ = self.pf_wake.fetchAdd(1, .release);
+        if (@import("builtin").os.tag == .linux) {
+            _ = std.os.linux.futex_3arg(&self.pf_wake.raw, .{ .cmd = .WAKE, .private = true }, 1);
+        }
+    }
+
     /// Prefetch-thread body: drain the request ring, uploading each weight through
     /// the pinned staging ring on the transfer stream (blocks THIS thread on the
     /// mmap→pinned memcpy and slot reuse — never the main thread). Advances
@@ -633,7 +660,15 @@ pub const Backend = struct {
             const head = self.pf_head.load(.acquire); // publishes the ring slot
             if (tail == head) {
                 if (self.pf_shutdown.load(.acquire)) return; // drained + shutdown
-                std.Thread.yield() catch {};
+                // Ring empty: sleep until an enqueue (or shutdown) bumps pf_wake,
+                // instead of yield-spinning. Sample the wake signal, then re-check
+                // for work published in the meantime so no wakeup is lost — the
+                // producer stores head BEFORE bumping pf_wake, so if it raced in
+                // after our top-of-loop head load, either the re-check sees it or
+                // pf_wake has already moved past `w` and the wait returns at once.
+                const w = self.pf_wake.load(.acquire);
+                if (self.pf_head.load(.acquire) != head or self.pf_shutdown.load(.acquire)) continue;
+                self.pfWaitForWork(w);
                 continue;
             }
             const req = self.pf_ring[tail % pf_ring_sz];
@@ -692,6 +727,7 @@ pub const Backend = struct {
         const gen = self.pf_gen;
         self.pf_ring[head % pf_ring_sz] = .{ .bytes = bytes, .db = db, .ev = ev, .gen = gen };
         self.pf_head.store(head + 1, .release); // publish the slot to the thread
+        self.pfWakeWorker(); // unpark the prefetch thread if it was blocked on an empty ring
         self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .pinned = pin, .scoped = self.weight_scope, .awaiting_use = true, .upload_ev = ev, .pf_gen = gen }) catch {};
     }
 
