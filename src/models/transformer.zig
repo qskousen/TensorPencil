@@ -141,9 +141,10 @@ pub fn layerForward(
     cache: anytype,
     l: usize,
     pos0: usize,
-    // Bidirectional block: this whole `seq` batch is one image-token block that
-    // attends itself in full (forward + backward), causal only to the prefix.
-    // Only meaningful for `.cached` prefill; ignored by `.fresh`.
+    // Bidirectional attention. In `.cached` prefill: this whole `seq` batch is
+    // one image-token block that attends itself in full (forward + backward),
+    // causal only to the prefix. In `.fresh`: makes the full-sequence pass a
+    // non-causal encoder (EmbeddingGemma) instead of the default causal encoder.
     bidirectional: bool,
     s: anytype,
 ) !void {
@@ -174,13 +175,18 @@ pub fn layerForward(
             .ring = cache.ringOf(l),
         });
     } else {
+        // `.fresh` full-sequence encode. Causal by default (Qwen text encoder,
+        // an autoregressive LM used as an encoder); `bidirectional` flips it to
+        // a non-causal encoder (EmbeddingGemma / bidirectional embedding towers)
+        // where every position attends the whole sequence. No KV prefix exists
+        // here, so seq_kv == seq and causal=false is a plain full attention.
         try ops.attention.attention(io, gpa, attn_out, qkv.q, qkv.k, qkv.v, .{
             .seq_q = seq,
             .seq_kv = seq,
             .n_heads = dims.n_heads,
             .n_kv_heads = dims.n_kv,
             .head_dim = dims.head_dim,
-            .causal = true,
+            .causal = !bidirectional,
             .scale = spec.attn_scale,
             .window = dims.sliding_window,
         });

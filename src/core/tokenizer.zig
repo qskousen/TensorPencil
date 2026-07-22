@@ -130,7 +130,10 @@ pub const Pretok = enum { qwen2, qwen35 };
 /// `gemma4` is "SPM-style BPE" (tokenizer.ggml.model == "gemma4"): rank-based
 /// BPE merges over ▁-escaped raw UTF-8, newline-only pre-split, `<0xNN>` byte
 /// fallback — shares the SPM vocab layout but merges by rank, not score.
-pub const Kind = enum { bpe, spm, gemma4 };
+/// `unigram` is SentencePiece Unigram (XLM-RoBERTa / GTE; Snowflake Arctic
+/// Embed): whitespace pre-split, ▁-prefix per word, Viterbi over per-piece
+/// log-scores, whole-word `<unk>` fallback (no byte fallback).
+pub const Kind = enum { bpe, spm, gemma4, unigram };
 
 /// SentencePiece meta symbol ▁ (U+2581) standing in for a space.
 const spm_space = "\xe2\x96\x81";
@@ -173,6 +176,10 @@ pub const Tokenizer = struct {
     /// SentencePiece add_dummy_prefix: prepend ▁ at the start of a raw
     /// fragment following a special token. False for Gemma.
     add_space_prefix: bool = false,
+    /// Unigram (kind == .unigram): longest piece in bytes, bounding the Viterbi
+    /// back-scan. `spm_scores` holds per-id log-scores; `spm_text_id` holds the
+    /// ▁-escaped piece -> id map used for lattice lookups.
+    unigram_max_piece: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator) !Tokenizer {
         var arena = std.heap.ArenaAllocator.init(gpa);
@@ -485,6 +492,297 @@ pub const Tokenizer = struct {
         return t;
     }
 
+    /// Build a Gemma-style BPE tokenizer (kind == .gemma4) from a HuggingFace
+    /// `tokenizer.json` (model.type == "BPE"): metaspace ▁, `<0xNN>` byte
+    /// fallback, rank-ordered merges. Covers models sharing the SentencePiece
+    /// BPE layout regardless of vocab size — EmbeddingGemma (262144) and
+    /// SigLIP2's text tower (256000) both parse here. `json_bytes` is the raw
+    /// file contents; everything needed is copied into the tokenizer's arena,
+    /// so the buffer may be freed afterward.
+    ///
+    /// This reuses the exact `encodeGemma4` merge path used for GGUF gemma4
+    /// vocabs (validated bit-identical to llama.cpp / transformers): the vocab
+    /// pieces and merge halves are the ▁-escaped stored form, keyed the same
+    /// way. HF's normalizer (Replace " "→"▁") and pre_tokenizer (Split " ")
+    /// reduce to the ▁-escaping `gemma4EncodeRaw` already performs, so no
+    /// separate normalization step is needed. Added tokens are matched verbatim
+    /// as specials. Callers that need the model's post-processor frame
+    /// (`<bos>…<eos>` vs `…<eos>`) add it themselves — `encode` emits content
+    /// ids only.
+    pub fn initGemma4FromTokenizerJson(gpa: std.mem.Allocator, json_bytes: []const u8) !Tokenizer {
+        var scratch = std.heap.ArenaAllocator.init(gpa);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, sa, json_bytes, .{});
+        if (parsed != .object) return error.InvalidTokenizerJson;
+        const root = parsed.object;
+
+        const model_v = root.get("model") orelse return error.InvalidTokenizerJson;
+        if (model_v != .object) return error.InvalidTokenizerJson;
+        const model = model_v.object;
+        if (model.get("type")) |mt| {
+            if (mt == .string and !std.mem.eql(u8, mt.string, "BPE")) return error.UnsupportedTokenizer;
+        }
+        const vocab_v = model.get("vocab") orelse return error.InvalidTokenizerJson;
+        if (vocab_v != .object) return error.InvalidTokenizerJson;
+        const vocab = vocab_v.object;
+        const merges_v = model.get("merges") orelse return error.InvalidTokenizerJson;
+        if (merges_v != .array) return error.InvalidTokenizerJson;
+        const merges = merges_v.array.items;
+
+        // added_tokens (optional): control/user tokens matched verbatim.
+        var added: []const std.json.Value = &.{};
+        if (root.get("added_tokens")) |av| {
+            if (av == .array) added = av.array.items;
+        }
+
+        // Vocab size = max id + 1 over vocab entries and added tokens.
+        var n: usize = 0;
+        {
+            var vit = vocab.iterator();
+            while (vit.next()) |e| {
+                if (e.value_ptr.* != .integer) return error.InvalidVocab;
+                const id: usize = @intCast(e.value_ptr.integer);
+                if (id + 1 > n) n = id + 1;
+            }
+            for (added) |av| {
+                if (av != .object) continue;
+                const idv = av.object.get("id") orelse continue;
+                if (idv == .integer) {
+                    const id: usize = @intCast(idv.integer);
+                    if (id + 1 > n) n = id + 1;
+                }
+            }
+        }
+        if (n == 0) return error.InvalidVocab;
+
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+
+        const id_to_bytes = try a.alloc([]const u8, n);
+        for (id_to_bytes) |*e| e.* = ""; // ids with no vocab/added entry stay empty
+        var text_id: std.StringHashMapUnmanaged(u32) = .empty;
+        try text_id.ensureTotalCapacity(a, @intCast(n + added.len));
+
+        // Regular vocab: keys are ▁-escaped SentencePiece pieces (stored form).
+        {
+            var vit = vocab.iterator();
+            while (vit.next()) |e| {
+                const id: u32 = @intCast(e.value_ptr.integer);
+                const raw = try a.dupe(u8, e.key_ptr.*); // escaped form
+                try text_id.put(a, raw, id);
+                if (parseByteToken(raw)) |b| {
+                    id_to_bytes[id] = try a.dupe(u8, &[_]u8{b});
+                } else {
+                    id_to_bytes[id] = try unescapeSpm(a, raw);
+                }
+            }
+        }
+
+        // Added tokens: literal content (not ▁-escaped), matched verbatim.
+        var specials: std.ArrayList(Special) = .empty;
+        for (added) |av| {
+            if (av != .object) continue;
+            const o = av.object;
+            const idv = o.get("id") orelse continue;
+            const cv = o.get("content") orelse continue;
+            if (idv != .integer or cv != .string) continue;
+            const id: u32 = @intCast(idv.integer);
+            const content = try a.dupe(u8, cv.string);
+            id_to_bytes[id] = content;
+            try text_id.put(a, content, id);
+            try specials.append(a, .{ .text = content, .id = id });
+        }
+        // Longest-first so a special that is a prefix of another still matches.
+        std.mem.sort(Special, specials.items, {}, struct {
+            fn lt(_: void, x: Special, y: Special) bool {
+                if (x.text.len != y.text.len) return x.text.len > y.text.len;
+                return x.id < y.id;
+            }
+        }.lt);
+
+        const unk: u32 = blk: {
+            if (model.get("unk_token")) |uv| {
+                if (uv == .string) if (text_id.get(uv.string)) |uid| break :blk uid;
+            }
+            break :blk 0;
+        };
+
+        // Byte-fallback map: "<0xNN>" -> id (else raw single byte, else unk).
+        var byte_id: [256]u32 = undefined;
+        for (0..256) |b| {
+            var buf: [6]u8 = undefined;
+            const hex = std.fmt.bufPrint(&buf, "<0x{X:0>2}>", .{@as(u8, @intCast(b))}) catch unreachable;
+            byte_id[b] = text_id.get(hex) orelse text_id.get(&[_]u8{@intCast(b)}) orelse unk;
+        }
+
+        // Merge ranks: key `left ++ '\x00' ++ right`; first occurrence wins.
+        // HF 0.20+ stores merges as [left, right] pairs; older exports use a
+        // single "left right" string.
+        var ranks: std.StringHashMapUnmanaged(u32) = .empty;
+        try ranks.ensureTotalCapacity(a, @intCast(merges.len));
+        for (merges, 0..) |mv, rank| {
+            var left: []const u8 = undefined;
+            var right: []const u8 = undefined;
+            switch (mv) {
+                .array => |pair| {
+                    if (pair.items.len != 2 or pair.items[0] != .string or pair.items[1] != .string)
+                        return error.InvalidMerges;
+                    left = pair.items[0].string;
+                    right = pair.items[1].string;
+                },
+                .string => |s| {
+                    const pos = std.mem.indexOfScalar(u8, s, ' ') orelse return error.InvalidMerges;
+                    left = s[0..pos];
+                    right = s[pos + 1 ..];
+                },
+                else => return error.InvalidMerges,
+            }
+            const key = try a.alloc(u8, left.len + 1 + right.len);
+            @memcpy(key[0..left.len], left);
+            key[left.len] = 0;
+            @memcpy(key[left.len + 1 ..], right);
+            const gop = try ranks.getOrPut(a, key);
+            if (!gop.found_existing) gop.value_ptr.* = @intCast(rank);
+        }
+
+        var t: Tokenizer = .{
+            .arena = arena,
+            .id_to_bytes = id_to_bytes,
+            .byte_id = @splat(0), // unused for gemma4
+            .merges = .empty,
+            .specials = try specials.toOwnedSlice(a),
+            .kind = .gemma4,
+            .spm_text_id = text_id,
+            .spm_byte_id = byte_id,
+            .spm_unk = unk,
+            .gemma4_ranks = ranks,
+        };
+        // Best-effort template/stop ids; embedding callers add their own frame.
+        t.turn_end = findSpecial(t.specials, "<end_of_turn>") orelse
+            findSpecial(t.specials, "<eos>") orelse unk;
+        t.pad = findSpecial(t.specials, "<pad>") orelse t.turn_end;
+        t.newline = text_id.get("\n") orelse 0;
+        return t;
+    }
+
+    /// Build a SentencePiece **Unigram** tokenizer (kind == .unigram) from a
+    /// HuggingFace `tokenizer.json` (model.type == "Unigram"; XLM-RoBERTa / GTE,
+    /// e.g. Snowflake Arctic Embed). `model.vocab` is an array of `[piece,
+    /// score]` (id = index); `model.unk_id` is the fallback id. Pieces are the
+    /// ▁-escaped SentencePiece form.
+    ///
+    /// Matches the deployed DiffKeep `onnx_tokenizers.zig` behavior exactly: the
+    /// `Precompiled` (SentencePiece charsmap / NFKC) normalizer is **not**
+    /// applied — DiffKeep's index was built without it, so reproducing its
+    /// vectors means tokenizing the same way. `encode` emits content ids only
+    /// (whitespace-split → ▁-prefix → Viterbi); the embedding façade adds the
+    /// `<s> … </s>` frame.
+    pub fn initUnigramFromTokenizerJson(gpa: std.mem.Allocator, json_bytes: []const u8) !Tokenizer {
+        var scratch = std.heap.ArenaAllocator.init(gpa);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, sa, json_bytes, .{});
+        if (parsed != .object) return error.InvalidTokenizerJson;
+        const root = parsed.object;
+
+        const model_v = root.get("model") orelse return error.InvalidTokenizerJson;
+        if (model_v != .object) return error.InvalidTokenizerJson;
+        const model = model_v.object;
+        if (model.get("type")) |mt| {
+            if (mt == .string and !std.mem.eql(u8, mt.string, "Unigram")) return error.UnsupportedTokenizer;
+        }
+        const vocab_v = model.get("vocab") orelse return error.InvalidTokenizerJson;
+        if (vocab_v != .array) return error.InvalidTokenizerJson;
+        const vocab = vocab_v.array.items;
+        if (vocab.len == 0) return error.InvalidVocab;
+
+        var added: []const std.json.Value = &.{};
+        if (root.get("added_tokens")) |av| {
+            if (av == .array) added = av.array.items;
+        }
+        var n: usize = vocab.len;
+        for (added) |av| {
+            if (av != .object) continue;
+            if (av.object.get("id")) |idv| if (idv == .integer) {
+                const id: usize = @intCast(idv.integer);
+                if (id + 1 > n) n = id + 1;
+            };
+        }
+
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+
+        const id_to_bytes = try a.alloc([]const u8, n);
+        for (id_to_bytes) |*e| e.* = "";
+        const scores = try a.alloc(f32, n);
+        @memset(scores, 0);
+        var text_id: std.StringHashMapUnmanaged(u32) = .empty;
+        try text_id.ensureTotalCapacity(a, @intCast(n + added.len));
+
+        var max_piece: usize = 0;
+        for (vocab, 0..) |entry, id| {
+            if (entry != .array or entry.array.items.len != 2) return error.InvalidVocab;
+            const pv = entry.array.items;
+            if (pv[0] != .string) return error.InvalidVocab;
+            const raw = try a.dupe(u8, pv[0].string); // ▁-escaped piece
+            try text_id.put(a, raw, @intCast(id));
+            scores[id] = switch (pv[1]) {
+                .float => |f| @floatCast(f),
+                .integer => |iv| @floatFromInt(iv),
+                else => return error.InvalidVocab,
+            };
+            id_to_bytes[id] = try unescapeSpm(a, raw);
+            if (raw.len > max_piece) max_piece = raw.len;
+        }
+
+        var specials: std.ArrayList(Special) = .empty;
+        for (added) |av| {
+            if (av != .object) continue;
+            const o = av.object;
+            const idv = o.get("id") orelse continue;
+            const cv = o.get("content") orelse continue;
+            if (idv != .integer or cv != .string) continue;
+            const id: u32 = @intCast(idv.integer);
+            const content = try a.dupe(u8, cv.string);
+            id_to_bytes[id] = content;
+            try text_id.put(a, content, id);
+            try specials.append(a, .{ .text = content, .id = id });
+        }
+        std.mem.sort(Special, specials.items, {}, struct {
+            fn lt(_: void, x: Special, y: Special) bool {
+                if (x.text.len != y.text.len) return x.text.len > y.text.len;
+                return x.id < y.id;
+            }
+        }.lt);
+
+        const unk: u32 = if (model.get("unk_id")) |uv| (switch (uv) {
+            .integer => @intCast(uv.integer),
+            else => 3,
+        }) else 3;
+
+        var t: Tokenizer = .{
+            .arena = arena,
+            .id_to_bytes = id_to_bytes,
+            .byte_id = @splat(0), // unused for unigram
+            .merges = .empty,
+            .specials = try specials.toOwnedSlice(a),
+            .kind = .unigram,
+            .spm_scores = scores,
+            .spm_text_id = text_id,
+            .spm_unk = unk,
+            .unigram_max_piece = max_piece,
+        };
+        t.turn_end = findSpecial(t.specials, "</s>") orelse text_id.get("</s>") orelse unk;
+        t.pad = findSpecial(t.specials, "<pad>") orelse text_id.get("<pad>") orelse t.turn_end;
+        t.newline = text_id.get("\n") orelse 0;
+        return t;
+    }
+
     /// Id of a special token by its literal text (e.g. "<|image_pad|>").
     pub fn specialId(self: *const Tokenizer, text: []const u8) ?u32 {
         return findSpecial(self.specials, text);
@@ -573,6 +871,7 @@ pub const Tokenizer = struct {
     pub fn encode(self: *const Tokenizer, gpa: std.mem.Allocator, text: []const u8, out: *std.ArrayList(u32)) !void {
         if (self.kind == .spm) return self.encodeSpm(gpa, text, out);
         if (self.kind == .gemma4) return self.encodeGemma4(gpa, text, out);
+        if (self.kind == .unigram) return self.encodeUnigram(gpa, text, out);
         var i: usize = 0;
         while (i < text.len) {
             // Earliest special-token occurrence from i.
@@ -991,6 +1290,70 @@ pub const Tokenizer = struct {
         try pq.push(gpa, .{ .left = left, .right = right, .rank = rank, .size = l.len + rt.len });
     }
 
+    // --- Unigram (SentencePiece) encode path ----------------------------
+
+    /// Unigram encode: split on ASCII whitespace, prepend ▁ to each word, and
+    /// Viterbi-segment each word into ids. Mirrors DiffKeep's `onnx_tokenizers`
+    /// (no Precompiled/NFKC normalization). Content ids only — no `<s>`/`</s>`.
+    fn encodeUnigram(self: *const Tokenizer, gpa: std.mem.Allocator, text: []const u8, out: *std.ArrayList(u32)) !void {
+        var word: std.ArrayList(u8) = .empty;
+        defer word.deinit(gpa);
+        var it = std.mem.splitAny(u8, text, " \t\n\r");
+        while (it.next()) |w| {
+            if (w.len == 0) continue;
+            word.clearRetainingCapacity();
+            try word.appendSlice(gpa, spm_space);
+            try word.appendSlice(gpa, w);
+            try self.viterbiWord(gpa, word.items, out);
+        }
+    }
+
+    /// Viterbi over `word` (a ▁-prefixed word): maximize the summed piece
+    /// log-scores, emitting piece ids. If no full segmentation exists (an
+    /// unknown byte, no byte fallback), the whole word becomes one `<unk>`.
+    fn viterbiWord(self: *const Tokenizer, gpa: std.mem.Allocator, word: []const u8, out: *std.ArrayList(u32)) !void {
+        const n = word.len;
+        const neg_inf = -std.math.inf(f64);
+        const dp = try gpa.alloc(f64, n + 1);
+        defer gpa.free(dp);
+        const prev_start = try gpa.alloc(usize, n + 1);
+        defer gpa.free(prev_start);
+        const prev_id = try gpa.alloc(u32, n + 1);
+        defer gpa.free(prev_id);
+
+        @memset(dp, neg_inf);
+        dp[0] = 0;
+        for (1..n + 1) |i| {
+            const max_back = @min(i, self.unigram_max_piece);
+            var l: usize = 1;
+            while (l <= max_back) : (l += 1) {
+                const j = i - l;
+                if (dp[j] == neg_inf) continue;
+                if (self.spm_text_id.get(word[j..i])) |id| {
+                    const score = dp[j] + @as(f64, self.spm_scores[id]);
+                    if (score > dp[i]) {
+                        dp[i] = score;
+                        prev_start[i] = j;
+                        prev_id[i] = id;
+                    }
+                }
+            }
+        }
+
+        if (dp[n] == neg_inf) {
+            try out.append(gpa, self.spm_unk);
+            return;
+        }
+        // Backtrack, then append the pieces in forward order.
+        const start = out.items.len;
+        var pos = n;
+        while (pos > 0) {
+            try out.append(gpa, prev_id[pos]);
+            pos = prev_start[pos];
+        }
+        std.mem.reverse(u32, out.items[start..]);
+    }
+
     /// Decode ids back to text (debugging / tests).
     pub fn decodeAlloc(self: *const Tokenizer, gpa: std.mem.Allocator, ids: []const u32) ![]u8 {
         var buf: std.ArrayList(u8) = .empty;
@@ -1230,6 +1593,96 @@ test "gemma4 gguf tokenizer matches llama-tokenize" {
     const round = try tok.decodeAlloc(gpa, ids.items);
     defer gpa.free(round);
     try std.testing.expectEqualStrings("The quick brown fox.", round);
+}
+
+// tokenizer.json (HuggingFace) loader parity: build the gemma4 BPE path from
+// each model's tokenizer.json and require exact token-id match against golden
+// ids produced by HF `tokenizers` (testdata/embed_tokenizer_golden.json,
+// `ids_no_special` — encode emits content ids only). Covers EmbeddingGemma
+// (262144 vocab) and SigLIP2's text tower (256000 vocab). Skipped when the
+// DiffKeep model checkpoints are absent.
+test "gemma4 tokenizer.json matches HF tokenizers" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const golden_bytes = std.Io.Dir.cwd().readFileAlloc(io, "testdata/embed_tokenizer_golden.json", gpa, .limited(1024 * 1024)) catch return error.SkipZigTest;
+    defer gpa.free(golden_bytes);
+
+    var golden = try std.json.parseFromSlice(std.json.Value, gpa, golden_bytes, .{});
+    defer golden.deinit();
+    const groot = golden.value.object;
+
+    const Model = struct { name: []const u8, path: []const u8 };
+    const models = [_]Model{
+        .{ .name = "embeddinggemma", .path = "../DiffKeep/Models/embeddinggemma-300m/tokenizer.json" },
+        .{ .name = "siglip2_text", .path = "../DiffKeep/Models/ViT-B-16-SigLIP2-timm/tokenizer.json" },
+    };
+
+    var ran = false;
+    for (models) |m| {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, m.path, gpa, .limited(128 * 1024 * 1024)) catch continue;
+        defer gpa.free(bytes);
+        ran = true;
+
+        var tok = try Tokenizer.initGemma4FromTokenizerJson(gpa, bytes);
+        defer tok.deinit();
+
+        const cases = groot.get(m.name).?.object.get("cases").?.array.items;
+        var out: std.ArrayList(u32) = .empty;
+        defer out.deinit(gpa);
+        for (cases) |cv| {
+            const co = cv.object;
+            const text = co.get("text").?.string;
+            const want = co.get("ids_no_special").?.array.items;
+            out.clearRetainingCapacity();
+            try tok.encode(gpa, text, &out);
+            errdefer {
+                std.debug.print("MISMATCH [{s}] text=\"{s}\"\n  got : {any}\n  want:", .{ m.name, text, out.items });
+                for (want) |w| std.debug.print(" {d}", .{w.integer});
+                std.debug.print("\n", .{});
+            }
+            try std.testing.expectEqual(want.len, out.items.len);
+            for (want, out.items) |w, g| try std.testing.expectEqual(@as(u32, @intCast(w.integer)), g);
+        }
+    }
+    if (!ran) return error.SkipZigTest;
+}
+
+// Unigram tokenizer.json parity: build the Snowflake Arctic Embed Unigram
+// tokenizer and require exact token-id match vs HF `tokenizers` golden
+// (`ids_no_special`; encode emits content ids, no <s>/</s>). Skipped when the
+// DiffKeep model checkpoint is absent.
+test "unigram tokenizer.json matches HF tokenizers" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const golden_bytes = std.Io.Dir.cwd().readFileAlloc(io, "testdata/embed_tokenizer_golden.json", gpa, .limited(1024 * 1024)) catch return error.SkipZigTest;
+    defer gpa.free(golden_bytes);
+    var golden = try std.json.parseFromSlice(std.json.Value, gpa, golden_bytes, .{});
+    defer golden.deinit();
+
+    const path = "../DiffKeep/Models/snowflake-arctic-embed-m-v2.0/tokenizer.json";
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024 * 1024)) catch return error.SkipZigTest;
+    defer gpa.free(bytes);
+    var tok = try Tokenizer.initUnigramFromTokenizerJson(gpa, bytes);
+    defer tok.deinit();
+    try std.testing.expectEqual(Kind.unigram, tok.kind);
+
+    const cases = golden.value.object.get("snowflake").?.object.get("cases").?.array.items;
+    var out: std.ArrayList(u32) = .empty;
+    defer out.deinit(gpa);
+    for (cases) |cv| {
+        const co = cv.object;
+        const text = co.get("text").?.string;
+        const want = co.get("ids_no_special").?.array.items;
+        out.clearRetainingCapacity();
+        try tok.encode(gpa, text, &out);
+        errdefer {
+            std.debug.print("MISMATCH text=\"{s}\"\n  got :{any}\n  want:", .{ text, out.items });
+            for (want) |w| std.debug.print(" {d}", .{w.integer});
+            std.debug.print("\n", .{});
+        }
+        try std.testing.expectEqual(want.len, out.items.len);
+        for (want, out.items) |w, g| try std.testing.expectEqual(@as(u32, @intCast(w.integer)), g);
+    }
 }
 
 test "decode round trips" {

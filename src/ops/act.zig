@@ -88,6 +88,35 @@ pub fn geluTanhMul(gate: []f32, up: []const f32) void {
     while (i < gate.len) : (i += 1) gate[i] = geluTanhScalar(gate[i]) * up[i];
 }
 
+/// Error function (Abramowitz & Stegun 7.1.26; max abs error ~1.5e-7), for the
+/// exact (non-tanh) GELU used by GTE-style encoders (`hidden_act == "gelu"`).
+pub inline fn erfScalar(x: f32) f32 {
+    const a1: f32 = 0.254829592;
+    const a2: f32 = -0.284496736;
+    const a3: f32 = 1.421413741;
+    const a4: f32 = -1.453152027;
+    const a5: f32 = 1.061405429;
+    const p: f32 = 0.3275911;
+    const sign: f32 = if (x < 0) -1.0 else 1.0;
+    const ax = @abs(x);
+    const t = 1.0 / (1.0 + p * ax);
+    const y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * @exp(-ax * ax);
+    return sign * y;
+}
+
+/// Exact (erf) GELU, matching torch's default `nn.GELU()`:
+/// 0.5x(1 + erf(x/sqrt(2))).
+pub inline fn geluErfScalar(x: f32) f32 {
+    return 0.5 * x * (1.0 + erfScalar(x * 0.7071067811865476));
+}
+
+/// GeGLU gating with exact-erf GELU (GTE / Snowflake Arctic Embed FFN):
+/// gate[i] = gelu_erf(gate[i]) * up[i].
+pub fn geluErfMul(gate: []f32, up: []const f32) void {
+    std.debug.assert(gate.len == up.len);
+    for (gate, up) |*g, u| g.* = geluErfScalar(g.*) * u;
+}
+
 /// "Quick" GELU, matching ggml `ggml_gelu_quick` / torch `gelu(approximate)`
 /// via the sigmoid approximation: x * sigmoid(1.702 x). Used by the gemma4v
 /// vision tower's FFN (llama.cpp `FFN_GELU_QUICK`).

@@ -20,6 +20,7 @@ pub const ops = @import("tp_ops");
 pub const tokenizer = @import("tp_core").tokenizer;
 pub const image = @import("tp_core").image;
 pub const models = @import("tp_models").models;
+pub const embed = @import("embed.zig");
 pub const sampler = @import("tp_core").sampler;
 pub const pipeline = @import("pipeline.zig");
 pub const vram = @import("tp_runtime").vram;
@@ -49,6 +50,7 @@ test {
     _ = tokenizer;
     _ = image;
     _ = models;
+    _ = embed;
     _ = sampler;
     _ = pipeline;
     _ = vram;
