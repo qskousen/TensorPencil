@@ -399,7 +399,7 @@ pub const Session = struct {
         // tight --vram-budget still streams within VRAM bounds. Isolated
         // (cuda-stream-test, DiT-only): cold-load 10.1s→2.4s (cold disk) /
         // 2.8s→2.2s (warm), bit-identical, MemAvailable dropped only ~2 GB.
-        if (self.cu_be) |b| b.enableAsyncStreaming();
+        if (self.cu_be) |b| b.enableAsyncStreaming(io);
         try note(progress, "models loaded (encoder {d:.1}s, dit+vae {d:.1}s)\n", .{
             @as(f64, @floatFromInt(t1 - t0)) / 1e9, @as(f64, @floatFromInt(t2 - t1)) / 1e9,
         });

@@ -270,11 +270,11 @@ pub const Backend = struct {
     streamed_bytes: u64 = 0,
 
     // ---- prefetch thread (block-ahead async weight streaming) ----
-    // Lock-free single-producer (main) / single-consumer (thread) ring — Zig 0.16
-    // removed std.Thread.Mutex/Condition, so we synchronize with atomics and,
-    // when the ring is empty, a raw Linux futex (the consumer blocks instead of
-    // spin-yielding; this backend is NVIDIA/Linux-only).
+    // Lock-free single-producer (main) / single-consumer (thread) ring. when the ring is
+    // empty the consumer BLOCKS on `pf_wake` instead of spin-yielding (a
+    // yield-spin pinned a core whenever a session stayed resident but idle).
     pf_thread: ?std.Thread = null,
+    pf_io: std.Io = undefined, // set by enableAsyncStreaming before the thread spawns
     pf_ring: [pf_ring_sz]PrefetchReq = undefined,
     pf_head: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // enqueue cursor (main writes)
     pf_tail: std.atomic.Value(u64) = std.atomic.Value(u64).init(0), // dequeue cursor (thread writes)
@@ -611,8 +611,9 @@ pub const Backend = struct {
     /// memcpy + async DMA off the main thread, so the upload overlaps compute.
     /// No-op / falls back to synchronous uploads if pinning or the thread fails.
     /// 128 MiB slots cover the largest DiT weight (mlp ~101 MiB).
-    pub fn enableAsyncStreaming(self: *Backend) void {
+    pub fn enableAsyncStreaming(self: *Backend, io: std.Io) void {
         if (!self.ctx.initStaging(128 << 20)) return;
+        self.pf_io = io; // used by the thread to block/wake on the empty-ring futex
         self.pf_thread = std.Thread.spawn(.{}, prefetchLoop, .{self}) catch return;
         self.async_uploads = true;
     }
@@ -630,23 +631,17 @@ pub const Backend = struct {
     }
 
     /// Block the prefetch thread until `pf_wake` changes from `expect` (an
-    /// enqueue or shutdown bumps it). Raw Linux futex — std's Mutex/Condition are
-    /// gone in 0.16 and this backend only ever runs on Linux/NVIDIA.
+    /// enqueue or shutdown bumps it). Uses `std.Io`'s cross-platform futex; the
+    /// uncancelable variant is safe from this raw (non-Io-runtime) thread.
     fn pfWaitForWork(self: *Backend, expect: u32) void {
-        if (@import("builtin").os.tag == .linux) {
-            _ = std.os.linux.futex_4arg(&self.pf_wake.raw, .{ .cmd = .WAIT, .private = true }, expect, null);
-        } else {
-            std.Thread.yield() catch {};
-        }
+        self.pf_io.futexWaitUncancelable(u32, &self.pf_wake.raw, expect);
     }
 
-    /// Wake the prefetch thread if it's parked in `pfWaitForWork`. Callers bump
-    /// `pf_wake` (release) BEFORE calling this so a park racing the wake re-checks.
+    /// Wake the prefetch thread if it's parked in `pfWaitForWork`. Bumps `pf_wake`
+    /// (release) BEFORE the wake so a park racing it observes the new value.
     fn pfWakeWorker(self: *Backend) void {
         _ = self.pf_wake.fetchAdd(1, .release);
-        if (@import("builtin").os.tag == .linux) {
-            _ = std.os.linux.futex_3arg(&self.pf_wake.raw, .{ .cmd = .WAKE, .private = true }, 1);
-        }
+        self.pf_io.futexWake(u32, &self.pf_wake.raw, 1);
     }
 
     /// Prefetch-thread body: drain the request ring, uploading each weight through

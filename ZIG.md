@@ -5,6 +5,40 @@ Update this file whenever a new 0.16.0 change is found or an existing workaround
 
 ---
 
+## Namespaces move between Zig versions — search before assuming "removed"
+
+Zig is pre-1.0; the std namespace layout churns constantly. A decl that isn't
+where an older version (or your memory) put it has usually **moved**, not been
+deleted. Before concluding something is gone or writing a raw-syscall
+workaround, grep the std lib for it:
+
+```sh
+grep -rn "pub const Mutex\|pub fn futexWait" "$(zig env | grep std_dir ...)"  # or ~/.zvm/<ver>/lib/std
+```
+
+Recent moves seen here: the blocking primitives (`Mutex`, `Condition`,
+`Semaphore`) and the futex/sleep helpers all migrated from `std.Thread`/
+`std.time` onto **`std.Io`** (they now take an `io: std.Io` argument). See the
+individual entries below.
+
+## `std.Io` futex (cross-platform, replaces `std.Thread.Futex`)
+
+`std.Thread.Futex` is gone; use `std.Io`'s futex, which is cross-platform
+(Linux futex / Windows `WaitOnAddress` / darwin ulock / WASM). The
+`Uncancelable` variant is safe to call from a raw `std.Thread` (it doesn't touch
+the Io runtime's task/cancellation state), so you can park/wake a plain worker
+thread without a raw `linux.futex` syscall:
+
+```zig
+// consumer parks until the u32 changes from `expect`:
+io.futexWaitUncancelable(u32, &wake.raw, expect);   // wake: std.atomic.Value(u32)
+// producer bumps the value (release) THEN wakes:
+_ = wake.fetchAdd(1, .release);
+io.futexWake(u32, &wake.raw, 1);
+```
+
+---
+
 ## Self-hosted linker chokes on glibc CRT `.sframe` (recent toolchains)
 
 On hosts with a recent glibc/binutils (e.g. Arch/CachyOS, gcc 16+), the C

@@ -1270,7 +1270,7 @@ fn cudaStreamTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []
     // cache (reclaimable, never stalls). Watch RAM externally: VmLck must stay tiny
     // (~512 MB), RSS/page-cache growth is fine. budget=0 pins all (like a real gen).
     const out_astr = try arena.alloc(f32, x.len);
-    be.enableAsyncStreaming();
+    be.enableAsyncStreaming(io);
     be.evictWeights();
     be.budget_override = 0;
     const cold_a_a = std.Io.Clock.real.now(io);
