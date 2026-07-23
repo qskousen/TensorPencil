@@ -80,6 +80,19 @@ var g_limit: f32 = 0.95;
 // meter renders the armed state (accent border) so the deferral is visible.
 var g_llm_eject_armed: bool = false;
 var g_diff_eject_armed: bool = false;
+// LLM pause is mirrored app-level so it survives an unload (the gate itself lives
+// on the Session, which is destroyed on unload — unlike the diffuser's gate,
+// which lives on the persistent Diffuser). The button reads this; setPaused keeps
+// the session gate in sync while one is resident. (Tier 3.)
+var g_llm_paused: bool = false;
+// In-flight LLM state saved on an unload-while-paused: the raw `ids` (prompt +
+// partial open response) carried across the unload so a reload can reprefill +
+// continue that exact response. `g_carry` holds the display transcript alongside.
+const LlmSuspend = struct { ids: []u32, midturn: bool };
+var g_llm_suspend: ?LlmSuspend = null;
+// Set when a reload should CONTINUE a suspended mid-turn response (spawn a decode
+// worker after the fresh session adopts the carried `ids`). (Tier 3.)
+var g_pending_continue: bool = false;
 // Guards `g_session` teardown against the diffusion WORKER thread, which reads
 // the session in its VRAM-coordinator hooks (budget/reclaim). Held while a full
 // LLM eject frees the session so a concurrent worker can't touch freed memory.
@@ -243,19 +256,28 @@ fn meterActions() meter.Actions {
     return .{ .on_change = meterChanged, .on_commit = meterCommit, .on_eject_llm = meterEjectLlm, .on_eject_diff = meterEjectDiff, .on_toggle_pause_llm = toggleLlmPause, .on_toggle_pause_diff = toggleDiffPause };
 }
 
-/// The pause gate is the source of truth for each model's paused state (queried
-/// live for the button), so there's no separate UI flag to keep in sync. Only
-/// touch the session when it's safe to dereference (not mid-reload).
+/// Diffusion's gate lives on the persistent Diffuser, so it IS the source of
+/// truth (queried live, survives an unload). The LLM mirrors its state in
+/// `g_llm_paused` because the gate dies with the session on unload.
 fn llmPaused() bool {
-    if (g_loading.load(.acquire)) return false;
-    return if (g_session) |s| s.isPaused() else false;
+    return g_llm_paused;
 }
 fn diffPaused() bool {
     return if (g_diffuser) |*d| d.isPaused() else false;
 }
 fn toggleLlmPause() void {
-    if (g_loading.load(.acquire)) return;
-    if (g_session) |s| s.setPaused(!s.isPaused());
+    const now_paused = !g_llm_paused;
+    g_llm_paused = now_paused;
+    if (g_loading.load(.acquire)) return; // applied to the fresh gate on publish
+    if (g_session) |s| {
+        // Resident: drive the session gate (unpause also dispatches a turn that
+        // was queued while paused — see Session.setPaused).
+        s.setPaused(now_paused);
+    } else if (!now_paused and g_llm_suspend != null) {
+        // Unloaded + resuming with a suspended turn: reload, then continue it.
+        g_reload_requested = true;
+        wakeupFrame();
+    }
 }
 fn toggleDiffPause() void {
     if (g_diffuser) |*d| d.setPaused(!d.isPaused());
@@ -269,7 +291,19 @@ fn toggleDiffPause() void {
 fn maybeProcessEjects() void {
     if (g_diff_eject_armed) {
         if (g_diffuser) |*d| {
-            if (!d.busyNow() and !d.hasPending()) {
+            if (d.isPaused()) {
+                // Unload-while-paused (Tier 3): snapshot the in-flight image to
+                // host, then free the weights and KEEP the queue (incl. the
+                // suspended image), which resumes on unpause. Free even with
+                // pending images — they're parked by the pause gate anyway.
+                if (d.busyNow()) {
+                    d.requestSuspend(); // worker snapshots + exits; poll next frame
+                } else {
+                    d.reapAndFree();
+                    g_diff_eject_armed = false;
+                    applyMeterPolicy();
+                }
+            } else if (!d.busyNow() and !d.hasPending()) {
                 d.freeSession();
                 g_diff_eject_armed = false;
                 // Diffusion is gone: let the LLM borrow the freed VRAM back.
@@ -281,15 +315,45 @@ fn maybeProcessEjects() void {
         if (g_session == null or g_loading.load(.acquire)) {
             g_llm_eject_armed = false; // nothing loaded / a (re)load is in flight
         } else if (g_session) |s| {
-            // Fire as soon as the LLM itself is idle — do NOT wait on diffusion.
-            // The worker only touches the session through the coordinator hooks,
-            // which unloadLlm serializes with `g_session_mu`.
-            if (!s.busy()) {
+            if (g_llm_paused and s.busy()) {
+                // Unload-while-paused (Tier 3): the worker is parked mid-decode.
+                // Ask it to suspend (stop with the turn left OPEN); we finish the
+                // unload once it clears below.
+                s.requestSuspend();
+            } else if (!s.busy()) {
+                // Fire as soon as the LLM itself is idle — do NOT wait on
+                // diffusion. The worker only touches the session through the
+                // coordinator hooks, which unloadLlm serializes with g_session_mu.
+                // If we suspended a mid-turn response, carry its raw `ids` so the
+                // reload can reprefill + continue it.
+                if (g_llm_paused and s.suspended_midturn) saveLlmSuspend(s);
                 unloadLlm();
                 g_llm_eject_armed = false;
             }
         }
     }
+}
+
+/// Carry the suspended LLM's raw `ids` (prompt + partial open response) across an
+/// unload-while-paused so a reload can reprefill + continue it. `g_carry` holds
+/// the display transcript alongside. Drains pending bytes first so the displayed
+/// text matches the tokens. (Tier 3.)
+fn saveLlmSuspend(s: *chat.Session) void {
+    s.poll(); // drain streamed bytes into messages so display matches `ids`
+    const ids = g_gpa.dupe(u32, s.ids.items) catch |err| {
+        std.log.err("save suspend ids: {t}", .{err});
+        return;
+    };
+    if (g_llm_suspend) |old| g_gpa.free(old.ids); // one suspend at a time
+    g_llm_suspend = .{ .ids = ids, .midturn = s.suspended_midturn };
+}
+
+fn freeLlmSuspend() void {
+    if (g_llm_suspend) |sus| {
+        g_gpa.free(sus.ids);
+        g_llm_suspend = null;
+    }
+    g_pending_continue = false;
 }
 
 /// Fully unload the LLM (free its VRAM) while KEEPING the conversation: the
@@ -455,6 +519,7 @@ pub fn run(init: std.process.Init) !void {
             g_gpa.destroy(a);
         }
         freeCarry();
+        freeLlmSuspend();
         if (g_pending_submit) |p| g_gpa.free(p);
         clearStaged();
         g_staged_images.deinit(g_gpa);
@@ -1105,6 +1170,12 @@ fn maybeStartReload() void {
                 if (g_session) |s| s.submit(text) catch |err| std.log.err("deferred submit: {t}", .{err});
                 g_gpa.free(text);
             }
+            // Resume-continue a mid-turn response suspended by unload-while-paused
+            // (Tier 3): `ids` was restored verbatim; continue decoding it.
+            if (g_pending_continue) {
+                g_pending_continue = false;
+                if (g_session) |s| s.continueOpenTurn() catch |err| std.log.err("resume continue: {t}", .{err});
+            }
         }
     }
     if (!g_reload_requested or g_loading.load(.acquire) or g_loader != null) return;
@@ -1163,6 +1234,7 @@ fn loaderMain() void {
         // Nothing to load (LLM cleared): drop the carried transcript and leave
         // the notice showing.
         freeCarry();
+        freeLlmSuspend();
         g_loading.store(false, .release);
         wakeupFrame();
         return;
@@ -1179,15 +1251,29 @@ fn loaderMain() void {
         g_gpa.destroy(arena_obj);
         g_session_arena = null;
         freeCarry(); // no session to adopt the transcript
+        freeLlmSuspend();
         return finishLoad(err);
     };
     // Replay the carried transcript into the new model (KV empty; the next turn's
     // prefill replays it) so a model swap keeps the chat.
     if (g_carry) |m| {
         s.be.bindThread();
-        s.adoptTranscript(m) catch |err| std.log.err("adopt transcript failed: {t}", .{err});
+        if (g_llm_suspend) |sus| {
+            // Unload-while-paused resume (Tier 3): restore the exact `ids` (open
+            // turn) verbatim instead of replaying (which would close the turn),
+            // then continue decoding that response after publish.
+            s.adoptSuspended(m, sus.ids) catch |err| std.log.err("adopt suspended failed: {t}", .{err});
+            if (sus.midturn) g_pending_continue = true;
+            g_gpa.free(sus.ids);
+            g_llm_suspend = null;
+        } else {
+            s.adoptTranscript(m) catch |err| std.log.err("adopt transcript failed: {t}", .{err});
+        }
         g_carry = null;
     }
+    // A paused reload that is NOT a resume (e.g. a backend switch while paused)
+    // starts the fresh gate paused so the state matches the button.
+    if (g_llm_paused) s.pause.pause(g_io);
     const dt = @as(f64, @floatFromInt(std.Io.Clock.real.now(g_io).nanoseconds - t0)) / 1e9;
     std.log.info("[vram] LLM session loaded/ready in {d:.1}s", .{dt});
     // Publish under the lock: the diffusion worker's coordinator hooks read
@@ -1547,8 +1633,9 @@ fn renderGenImage(s: ?*chat.Session, gi: *chat.GenImage, gi_idx: usize) void {
     defer b.deinit();
 
     switch (gi.get()) {
-        .pending, .generating => {
-            const generating = gi.get() == .generating;
+        .pending, .generating, .suspended => {
+            const st_now = gi.get();
+            const generating = st_now == .generating;
             const done = gi.step.load(.monotonic);
             const total = gi.total.load(.monotonic);
             // Live preview (re-uploaded each frame as its bytes update).
@@ -1580,12 +1667,14 @@ fn renderGenImage(s: ?*chat.Session, gi: *chat.GenImage, gi_idx: usize) void {
 
             var buf: [112]u8 = undefined;
             var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal });
-            const status = if (!generating)
-                "🖼  Queued…"
-            else if (sps > 0)
-                std.fmt.bufPrint(&buf, "🖼  Generating…  step {d}/{d}  ·  {d:.2} s/step", .{ done, total, sps }) catch "Generating…"
-            else
-                std.fmt.bufPrint(&buf, "🖼  Generating…  step {d}/{d}", .{ done, total }) catch "Generating…";
+            const status = switch (st_now) {
+                .suspended => std.fmt.bufPrint(&buf, "⏸  Suspended at step {d}/{d} — resume to continue", .{ done, total }) catch "⏸ Suspended",
+                .pending => "🖼  Queued…",
+                else => if (sps > 0)
+                    std.fmt.bufPrint(&buf, "🖼  Generating…  step {d}/{d}  ·  {d:.2} s/step", .{ done, total, sps }) catch "Generating…"
+                else
+                    std.fmt.bufPrint(&buf, "🖼  Generating…  step {d}/{d}", .{ done, total }) catch "Generating…",
+            };
             fonts.addRich(tl, status);
             tl.deinit();
             const pct: f32 = if (total > 0) @as(f32, @floatFromInt(done)) / @as(f32, @floatFromInt(total)) else 0;
@@ -1945,6 +2034,11 @@ fn newChat() void {
     // "new chat" starts fresh even while unloaded. (No-op when a session is
     // live, since g_carry is null then.)
     freeCarry();
+    freeLlmSuspend(); // drop any suspended-turn carry; a new chat won't resume it
+    if (g_llm_paused) { // a fresh chat starts unpaused
+        g_llm_paused = false;
+        if (!g_loading.load(.acquire)) if (g_session) |s| s.setPaused(false);
+    }
     clearStaged(); // drop any images staged for a not-yet-loaded first message
     @memset(&g_input_buf, 0);
     g_follow_bottom = true;

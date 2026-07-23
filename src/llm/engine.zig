@@ -49,6 +49,11 @@ pub const Options = struct {
     /// as `cancel`). While paused the loop parks here — holding the KV cache and
     /// resident weights — until unpaused. See `ops/pause.zig`.
     pause: ?*ops.pause.Gate = null,
+    /// Set true (when non-null) if the loop stops because the pause gate returned
+    /// `.unload` — i.e. an unload-while-paused suspend, distinct from a cancel or
+    /// a natural stop. Lets the caller keep the assistant turn OPEN (no
+    /// closeAssistant) so a later reload can reprefill `ids` and continue. (Tier 3.)
+    suspended_out: ?*bool = null,
     /// KV-cache element storage type (f32 default; f16 halves the footprint,
     /// lossy). Copied onto the Capacity that reaches every model init.
     kv_dtype: kv_cache_mod.KvDtype = .f32,
@@ -187,10 +192,17 @@ pub fn generate(
         if (opts.residency_poll) |rp| rp.apply(rp.ctx); // enact any arbiter-published VRAM target on this thread
 
         if (opts.cancel) |c| if (c.load(.acquire)) break;
-        // Pause parks at the token boundary. `.canceled` (a stop delivered while
-        // parked) and `.unload` both just stop for Tier 1; Tier 3 will make
-        // `.unload` snapshot the KV cache and reprefill-resume instead.
-        if (opts.pause) |g| if (g.checkpoint(io, opts.cancel) != .proceed) break;
+        // Pause parks at the token boundary. `.canceled` stops like a cancel;
+        // `.unload` also stops but flags a suspend so the caller keeps the turn
+        // open and reprefill-resumes it on reload (Tier 3 unload-while-paused).
+        if (opts.pause) |g| switch (g.checkpoint(io, opts.cancel)) {
+            .proceed => {},
+            .canceled => break,
+            .unload => {
+                if (opts.suspended_out) |so| so.* = true;
+                break;
+            },
+        };
         const next = sampler.next(logits, ids.items);
         if (chat.isStop(next)) break;
         try ids.append(gpa, next);
@@ -268,10 +280,17 @@ fn generateGreedyArgmax(
         if (opts.residency_poll) |rp| rp.apply(rp.ctx); // enact any arbiter-published VRAM target on this thread
 
         if (opts.cancel) |c| if (c.load(.acquire)) break;
-        // Pause parks at the token boundary. `.canceled` (a stop delivered while
-        // parked) and `.unload` both just stop for Tier 1; Tier 3 will make
-        // `.unload` snapshot the KV cache and reprefill-resume instead.
-        if (opts.pause) |g| if (g.checkpoint(io, opts.cancel) != .proceed) break;
+        // Pause parks at the token boundary. `.canceled` stops like a cancel;
+        // `.unload` also stops but flags a suspend so the caller keeps the turn
+        // open and reprefill-resumes it on reload (Tier 3 unload-while-paused).
+        if (opts.pause) |g| switch (g.checkpoint(io, opts.cancel)) {
+            .proceed => {},
+            .canceled => break,
+            .unload => {
+                if (opts.suspended_out) |so| so.* = true;
+                break;
+            },
+        };
         if (chat.isStop(next)) break;
         try ids.append(gpa, next);
         n += 1;
@@ -329,10 +348,17 @@ fn generateGpuSample(
         if (opts.residency_poll) |rp| rp.apply(rp.ctx); // enact any arbiter-published VRAM target on this thread
 
         if (opts.cancel) |c| if (c.load(.acquire)) break;
-        // Pause parks at the token boundary. `.canceled` (a stop delivered while
-        // parked) and `.unload` both just stop for Tier 1; Tier 3 will make
-        // `.unload` snapshot the KV cache and reprefill-resume instead.
-        if (opts.pause) |g| if (g.checkpoint(io, opts.cancel) != .proceed) break;
+        // Pause parks at the token boundary. `.canceled` stops like a cancel;
+        // `.unload` also stops but flags a suspend so the caller keeps the turn
+        // open and reprefill-resumes it on reload (Tier 3 unload-while-paused).
+        if (opts.pause) |g| switch (g.checkpoint(io, opts.cancel)) {
+            .proceed => {},
+            .canceled => break,
+            .unload => {
+                if (opts.suspended_out) |so| so.* = true;
+                break;
+            },
+        };
         for (cands[0..count], out_id[0..count], out_logit[0..count]) |*c, id, lg| c.* = .{ .id = id, .logit = lg };
         const next = sampler.nextFromCandidates(cands[0..count]);
         if (chat.isStop(next)) break;

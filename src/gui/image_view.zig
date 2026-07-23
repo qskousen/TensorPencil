@@ -283,8 +283,9 @@ fn renderCell(gi: *GenImage, idx: usize, cell: f32) void {
     defer b.deinit();
 
     switch (gi.get()) {
-        .pending, .generating => {
-            const generating = gi.get() == .generating;
+        .pending, .generating, .suspended => {
+            const st_now = gi.get();
+            const generating = st_now == .generating;
             if (generating) dvui.refresh(null, @src(), null);
             const done = gi.step.load(.monotonic);
             const total = gi.total.load(.monotonic);
@@ -302,7 +303,11 @@ fn renderCell(gi: *GenImage, idx: usize, cell: f32) void {
             const pct: f32 = if (total > 0) @as(f32, @floatFromInt(done)) / @as(f32, @floatFromInt(total)) else 0;
             dvui.progress(@src(), .{ .percent = pct }, .{ .expand = .horizontal, .min_size_content = .{ .h = 6 }, .margin = .{ .y = 3 }, .corner_radius = dvui.Rect.all(3) });
             var buf: [48]u8 = undefined;
-            const status = if (!generating) "Queued…" else std.fmt.bufPrint(&buf, "step {d}/{d}", .{ done, total }) catch "…";
+            const status = switch (st_now) {
+                .suspended => std.fmt.bufPrint(&buf, "⏸ {d}/{d}", .{ done, total }) catch "⏸",
+                .pending => "Queued…",
+                else => std.fmt.bufPrint(&buf, "step {d}/{d}", .{ done, total }) catch "…",
+            };
             dvui.label(@src(), "{s}", .{status}, .{});
             if (dvui.button(@src(), "Cancel", .{}, .{ .margin = .{ .y = 2 } })) {
                 gi.cancel.store(true, .release);

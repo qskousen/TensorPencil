@@ -435,6 +435,11 @@ pub const Session = struct {
     /// worker to build+prefill. False for a fast regenerate, which rolls back
     /// to an already-prefilled boundary instead.
     turn_staged: bool = false,
+    /// Set by the worker when its decode stopped on an unload-while-paused
+    /// suspend (the pause gate returned `.unload`): the assistant turn is left
+    /// OPEN (no closeAssistant) so a reload can reprefill `ids` and continue.
+    /// Read by the app (after `busy()` clears) to carry the raw `ids`. (Tier 3.)
+    suspended_midturn: bool = false,
     /// Cross-thread residency intent published by the app's `vram.Arbiter`. The
     /// worker enacts it at each token boundary (`engine.residency_poll`) on its
     /// own context-bound thread; the arbiter enacts it directly while idle. The
@@ -785,6 +790,23 @@ pub const Session = struct {
         }
     }
 
+    /// Ask a paused, in-flight decode worker to suspend at its next token
+    /// boundary: it stops with the assistant turn left OPEN and sets
+    /// `suspended_midturn`. Async — poll `busy()`; when it clears, the raw `ids`
+    /// (prompt + partial response) can be carried across an unload and resumed
+    /// (reprefill + continue). No-op if not generating. (Tier 3.)
+    pub fn requestSuspend(self: *Session) void {
+        self.pause.requestUnload(self.io);
+    }
+
+    /// Resume a suspended mid-turn response after an unload+reload: `ids` already
+    /// holds the open turn (adoptSuspended set it), so spawn the decode worker —
+    /// prepareTurn reprefills all of `ids` (KV empty) and engine.generate
+    /// continues that same response. No new turn is staged. (Tier 3.)
+    pub fn continueOpenTurn(self: *Session) !void {
+        try self.spawnWorker();
+    }
+
     pub fn isPaused(self: *Session) bool {
         return self.pause.isPaused(self.io);
     }
@@ -945,6 +967,20 @@ pub const Session = struct {
     pub fn adoptTranscript(self: *Session, msgs: std.ArrayList(Message)) !void {
         self.messages = msgs;
         try self.replayTranscript(self.messages.items);
+        self.wake();
+    }
+
+    /// Adopt a transcript AND its exact `ids` token sequence carried from an
+    /// unload-while-paused suspend (Tier 3). Unlike `adoptTranscript`, this does
+    /// NOT replay/close the turns — it restores the raw `ids` verbatim (which may
+    /// end inside an OPEN assistant turn: prompt + partial response, no turn-end),
+    /// so a subsequent worker reprefills all of `ids` (KV is empty on this fresh
+    /// session) and continues decoding that same response. Takes ownership of
+    /// `msgs`; copies `ids` (caller frees its buffer).
+    pub fn adoptSuspended(self: *Session, msgs: std.ArrayList(Message), ids: []const u32) !void {
+        self.messages = msgs;
+        self.ids.clearRetainingCapacity();
+        try self.ids.appendSlice(self.gpa, ids);
         self.wake();
     }
 
@@ -1301,6 +1337,7 @@ pub const Session = struct {
             return;
         }
         self.gen_err = null;
+        self.suspended_midturn = false;
         self.cancel.store(false, .release);
         self.generating.store(true, .release);
         self.worker = std.Thread.spawn(.{}, workerMain, .{self}) catch |err| {
@@ -1333,9 +1370,13 @@ pub const Session = struct {
             .session = self,
         };
         const t0 = std.Io.Clock.real.now(self.io).nanoseconds;
+        // Detect an unload-while-paused suspend so we keep the turn OPEN below.
+        var suspended = false;
+        var run_opts = self.opts;
+        run_opts.suspended_out = &suspended;
         switch (self.arch) {
             inline else => |*a| {
-                const n = engine.generate(&a.model, &self.tok, self.io, self.gpa, &self.ids, self.opts, &sink.iface) catch |err| n: {
+                const n = engine.generate(&a.model, &self.tok, self.io, self.gpa, &self.ids, run_opts, &sink.iface) catch |err| n: {
                     self.gen_err = err;
                     std.log.err("generation failed: {t}", .{err});
                     break :n 0;
@@ -1356,6 +1397,17 @@ pub const Session = struct {
                     res.n_cpu, res.n_layers, res.free_mib,
                 });
             },
+        }
+        if (suspended) {
+            // Unload-while-paused: leave the assistant turn OPEN (no
+            // closeAssistant) so the app can carry the raw `ids` and a reload can
+            // reprefill + continue this exact response. freeTurn only drops the
+            // staged payload (already consumed by buildTurn), not the open turn.
+            self.suspended_midturn = true;
+            self.freeTurn();
+            self.generating.store(false, .release);
+            self.wake();
+            return;
         }
         // Close the assistant turn so the next turn's context is well-formed.
         chat.closeAssistant(self.gpa, &self.ids) catch {};

@@ -1,4 +1,5 @@
 - pause button
+- pause / cancel during prefill
 - i'm pretty sure the meter is reporting some vram under "system" for diffusion
 - can't switch to image studio while diffusing
 - regenerate reply option disappears when model is unloaded

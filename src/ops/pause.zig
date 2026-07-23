@@ -121,6 +121,15 @@ pub const Gate = struct {
         defer self.mu.unlock(io);
         return self.paused;
     }
+
+    /// Whether an unload has been requested (and not yet cleared by unpause).
+    /// A worker reads this after its loop returns to tell a suspend from a
+    /// normal completion.
+    pub fn wantsUnload(self: *Gate, io: Io) bool {
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
+        return self.want_unload;
+    }
 };
 
 test "gate: unpaused checkpoint proceeds without blocking" {

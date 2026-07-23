@@ -208,7 +208,9 @@ fn pauseBtn(id: usize, loaded: bool, paused: bool, hint_text: []const u8) bool {
         dvui.timer(wd.id, @intCast(@divFloor(to_flip, 1000) + 1));
     }
     hint.hover(@src(), &wd, if (paused) "Resume" else hint_text);
-    return clicked and loaded;
+    // Clickable while loaded OR paused: after an unload-while-paused the model is
+    // gone but still paused, and the button must stay live to resume it.
+    return clicked and (loaded or paused);
 }
 
 fn frac(m: *const Model, bytes: u64) f32 {

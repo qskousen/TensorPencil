@@ -130,6 +130,18 @@ pub const Progress = struct {
     step: *const fn (ctx: *anyopaque, done: usize, total: usize, preview: ?Preview) void,
 };
 
+/// A suspended generation's in-flight state: the sampler latent and the step it
+/// was captured at (the loop checkpoint runs at the TOP of a step, before that
+/// step's forward — so the latent is the input to `step`, and resuming re-runs
+/// step `step`). Small (one latent, ~1 MB at 1024²). See `Options.suspend_out` /
+/// `Options.resume_from`. (Tier 3 unload-while-paused.)
+pub const Snapshot = struct {
+    /// Host copy of the sampler latent (len == 16·(h/8)·(w/8)); gpa-owned.
+    latent: []f32,
+    /// Sampling step to resume at.
+    step: usize,
+};
+
 pub const Options = struct {
     prompt: []const u8,
     negative: []const u8 = "",
@@ -178,6 +190,17 @@ pub const Options = struct {
     /// as `cancel`). While paused the loop parks here — holding the in-flight
     /// latent and the resident DiT weights — until unpaused. See `ops/pause.zig`.
     pause: ?*ops.pause.Gate = null,
+    /// Resume a suspended generation: skip noise init, load this latent, and
+    /// start the sampling loop at `step` instead of 0. Conditioning + schedule
+    /// are recomputed deterministically, so the result is bit-identical to an
+    /// uninterrupted run. null = fresh generation. (Tier 3 unload-while-paused.)
+    resume_from: ?Snapshot = null,
+    /// On a paused unload (the pause gate returns `.unload`), `generate` writes a
+    /// host copy of the in-flight latent + current step here (allocated with the
+    /// session's gpa; the caller owns and frees it) and returns `error.Paused`,
+    /// so the caller can free the model and later resume via `resume_from`. When
+    /// null, a requested unload unwinds like a cancel (`error.Canceled`).
+    suspend_out: ?*?Snapshot = null,
     /// Optional VRAM-reclaim hook. On a VAE-decode OOM (e.g. a very large image
     /// while the GUI chat model is resident), `generate` calls this to migrate
     /// device memory held by ANOTHER context in the process (the GUI's resident
@@ -635,7 +658,13 @@ pub const Session = struct {
         self.setMemTag(.dit);
         const x = try gpa.alloc(f32, lat_len);
         defer gpa.free(x);
-        sampler.fillNoise(x, opts.seed);
+        // Resume: restore the suspended latent instead of drawing fresh noise
+        // (the schedule + conditioning above are recomputed identically). A
+        // length mismatch (shouldn't happen — resume reuses the same opts) falls
+        // back to a fresh draw rather than a bad copy.
+        if (opts.resume_from) |r| {
+            if (r.latent.len == x.len) @memcpy(x, r.latent) else sampler.fillNoise(x, opts.seed);
+        } else sampler.fillNoise(x, opts.seed);
 
         const sigmas = try sampler.simpleSchedule(gpa, opts.steps, opts.shift);
         defer gpa.free(sigmas);
@@ -737,15 +766,23 @@ pub const Session = struct {
             };
 
             const sampling_start = std.Io.Clock.real.now(io);
-            for (0..opts.steps) |i| {
+            const start_step = if (opts.resume_from) |r| @min(r.step, opts.steps) else 0;
+            for (start_step..opts.steps) |i| {
                 if (opts.cancel) |c| if (c.load(.acquire)) return error.Canceled;
                 if (opts.pause) |g| switch (g.checkpoint(io, opts.cancel)) {
                     .proceed => {},
                     .canceled => return error.Canceled,
-                    // Tier 3 (unload-while-paused) will snapshot `x` + step `i`
-                    // to host here and resume; until then a requested unload just
-                    // unwinds like a cancel. Tier 1 never sets want_unload.
-                    .unload => return error.Canceled,
+                    // Unload-while-paused: snapshot the in-flight latent + this
+                    // step to host so the caller can free the model and resume
+                    // bit-identically later (via resume_from). `x` here is the
+                    // input to step `i` (the checkpoint runs before the forward).
+                    .unload => {
+                        if (opts.suspend_out) |so| {
+                            so.* = .{ .latent = try gpa.dupe(f32, x), .step = i };
+                            return error.Paused;
+                        }
+                        return error.Canceled;
+                    },
                 };
                 const start = std.Io.Clock.real.now(io);
                 if (cu_be) |b| {

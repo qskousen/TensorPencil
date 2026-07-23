@@ -216,7 +216,14 @@ pub fn generate(
     while (true) {
         // Cooperative stop/pause at the token boundary (mirrors engine.zig).
         if (opts.cancel) |c| if (c.load(.acquire)) break;
-        if (opts.pause) |pg| if (pg.checkpoint(io, opts.cancel) != .proceed) break;
+        if (opts.pause) |pg| switch (pg.checkpoint(io, opts.cancel)) {
+            .proceed => {},
+            .canceled => break,
+            .unload => {
+                if (opts.suspended_out) |so| so.* = true;
+                break;
+            },
+        };
         if (chat.isStop(pending)) break;
         try ids.append(gpa, pending);
         n += 1;
@@ -305,7 +312,14 @@ fn generateChainGreedy(
     while (true) {
         // Cooperative stop/pause at the token boundary (mirrors engine.zig).
         if (opts.cancel) |c| if (c.load(.acquire)) break;
-        if (opts.pause) |pg| if (pg.checkpoint(io, opts.cancel) != .proceed) break;
+        if (opts.pause) |pg| switch (pg.checkpoint(io, opts.cancel)) {
+            .proceed => {},
+            .canceled => break,
+            .unload => {
+                if (opts.suspended_out) |so| so.* = true;
+                break;
+            },
+        };
         if (chat.isStop(pending)) break;
         try ids.append(gpa, pending);
         n += 1;
@@ -400,7 +414,14 @@ pub fn generateTree(
     while (true) {
         // Cooperative stop/pause at the token boundary (mirrors engine.zig).
         if (opts.cancel) |c| if (c.load(.acquire)) break;
-        if (opts.pause) |pg| if (pg.checkpoint(io, opts.cancel) != .proceed) break;
+        if (opts.pause) |pg| switch (pg.checkpoint(io, opts.cancel)) {
+            .proceed => {},
+            .canceled => break,
+            .unload => {
+                if (opts.suspended_out) |so| so.* = true;
+                break;
+            },
+        };
         if (chat.isStop(pending)) break;
         try ids.append(gpa, pending);
         n += 1;

@@ -74,7 +74,7 @@ const LogWriter = struct {
     }
 };
 
-pub const GenStatus = enum(u8) { pending, generating, done, failed, canceled };
+pub const GenStatus = enum(u8) { pending, generating, done, failed, canceled, suspended };
 
 /// The model-defining config for one generation — exactly the fields that decide
 /// which `pipeline.Session` an image needs (paths + backend + VAE decode path).
@@ -172,6 +172,11 @@ pub const GenImage = struct {
     /// images that never went through the queue (e.g. user-attached inputs, tests);
     /// the worker falls back to the engine's live config for those.
     model: ?ModelConfig = null,
+    /// In-flight sampler state saved when the image was suspended by an
+    /// unload-while-paused (status `.suspended`); gpa-owned. On the next dispatch
+    /// the worker passes it as `opts.resume_from` to continue bit-identically,
+    /// then frees it. See ops/pause.zig + pipeline.Snapshot. (Tier 3.)
+    resume_snapshot: ?pipeline.Snapshot = null,
 
     pub fn get(self: *const GenImage) GenStatus {
         return @enumFromInt(self.status.load(.acquire));
@@ -184,6 +189,7 @@ pub fn freeGenImage(gpa: std.mem.Allocator, gi: *GenImage) void {
     if (gi.rgba) |r| gpa.free(r);
     if (gi.preview) |p| gpa.free(p);
     if (gi.model) |m| m.deinit(gpa);
+    if (gi.resume_snapshot) |s| gpa.free(s.latent);
     gpa.destroy(gi);
 }
 
@@ -506,12 +512,19 @@ pub const Diffuser = struct {
         self.pause.wake(self.io);
     }
 
-    /// Next pending image to run, dropping ones canceled before they start.
+    /// Next image to run, dropping ones canceled before they start. Includes
+    /// `.suspended` images (unload-while-paused): the worker resumes them from
+    /// their saved latent (opts.resume_from).
     fn nextPending(self: *Diffuser) ?*GenImage {
         for (self.queue.items) |gi| {
-            if (gi.get() != .pending) continue;
+            const st = gi.get();
+            if (st != .pending and st != .suspended) continue;
             if (gi.cancel.load(.acquire)) {
                 gi.status.store(@intFromEnum(GenStatus.canceled), .release);
+                if (gi.resume_snapshot) |s| { // dropping a suspended image: free its latent
+                    self.gpa.free(s.latent);
+                    gi.resume_snapshot = null;
+                }
                 continue;
             }
             return gi;
@@ -540,6 +553,27 @@ pub const Diffuser = struct {
             self.thread = null;
             self.busy.store(false, .release);
         }
+    }
+
+    /// Ask a paused, in-flight worker to suspend: snapshot the in-flight latent
+    /// to host, mark the image `.suspended`, and exit. Async — poll `busyNow()`
+    /// for completion, then `reapAndFree()`. No-op if nothing is generating. Only
+    /// meaningful while paused (the worker must be parked at the step gate to see
+    /// the unload request). See ops/pause.zig. (Tier 3 unload-while-paused.)
+    pub fn requestSuspend(self: *Diffuser) void {
+        self.pause.requestUnload(self.io);
+    }
+
+    /// Reap a finished/suspended worker thread and free the resident weights,
+    /// KEEPING the queue (incl. any `.suspended` image, which resumes from its
+    /// saved latent on the next dispatch). For unload-while-paused: caller must
+    /// ensure the worker has stopped (`busyNow() == false`).
+    pub fn reapAndFree(self: *Diffuser) void {
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
+        }
+        self.freeSession();
     }
 
     /// Free the resident pipeline (returns its VRAM). Binds its own CUDA
@@ -770,6 +804,7 @@ pub const Diffuser = struct {
         // pointer stays put for the whole generation; dims published via atomics.
         gi.preview_w = .init(0);
         gi.preview_h = .init(0);
+        if (gi.preview) |old| self.gpa.free(old); // free a prior buffer (resumed image)
         if (self.gpa.alloc(u8, gi.req_width * gi.req_height * 4)) |pb| {
             @memset(pb, 0);
             gi.preview = pb;
@@ -878,6 +913,7 @@ pub const Diffuser = struct {
         opts.taew_path = self.taew_owned;
         opts.cancel = &gi.cancel; // UI Cancel button aborts sampling
         opts.pause = &self.pause; // UI Pause button parks sampling between steps
+        opts.resume_from = gi.resume_snapshot; // continue a suspended image (Tier 3)
         opts.reclaim = .{ .ctx = self, .call = reclaimThunk }; // free LLM VRAM on VAE OOM
         // Resident-weight budget from the coordinator (chat: limit − LLM
         // resident, floored; studio: 0 = auto / pin all free VRAM).
@@ -921,7 +957,21 @@ pub const Diffuser = struct {
                 want.vae_decode,
             ) catch null;
         }
+        // Unload-while-paused: generate writes the in-flight latent + step here
+        // and returns error.Paused. The worker stores it on the image (status
+        // .suspended) and exits; the UI frees the weights, and the next dispatch
+        // resumes bit-identically via opts.resume_from.
+        var suspend_snap: ?pipeline.Snapshot = null;
+        opts.suspend_out = &suspend_snap;
         var img = sess.?.generate(opts, progress) catch |err| {
+            if (err == error.Paused) {
+                if (gi.resume_snapshot) |old| self.gpa.free(old.latent); // replace any prior
+                gi.resume_snapshot = suspend_snap;
+                gi.status.store(@intFromEnum(GenStatus.suspended), .release);
+                self.busy.store(false, .release);
+                self.wake();
+                return;
+            }
             const st: GenStatus = if (err == error.Canceled) .canceled else blk: {
                 std.log.err("image generation failed: {t}", .{err});
                 break :blk .failed;
@@ -932,6 +982,11 @@ pub const Diffuser = struct {
             return;
         };
         defer img.deinit(self.gpa);
+        // Completed (resume, if any, is consumed): drop the saved latent.
+        if (gi.resume_snapshot) |s| {
+            self.gpa.free(s.latent);
+            gi.resume_snapshot = null;
+        }
 
         // Persist the finished image (packed RGB) with a1111 metadata before the
         // RGBA conversion. Best-effort — a save failure never fails the gen.
