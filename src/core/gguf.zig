@@ -47,6 +47,7 @@ fn dtypeFromGgml(id: u32) ?DType {
         12 => .q4_k,
         13 => .q5_k,
         14 => .q6_k,
+        20 => .iq4_nl, // GGML_TYPE_IQ4_NL (32-elem block, non-linear 4-bit LUT)
         16 => .i8, // GGML_TYPE_I8 (raw, no blocks)
         26 => .i32, // GGML_TYPE_I32
         30 => .bf16,

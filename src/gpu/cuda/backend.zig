@@ -311,6 +311,7 @@ pub const Backend = struct {
     // graph-mode kernel entries sharing it.
     state_ptr: cu.CUdeviceptr = 0,
     f_embed_gather_s: cu.CUfunction = null,
+    f_embed_gather_h: cu.CUfunction = null,
     f_kv_append_s: cu.CUfunction = null,
     f_kv_append_s_f16: cu.CUfunction = null,
     f_kv_append_s_q8: cu.CUfunction = null,
@@ -1667,13 +1668,14 @@ pub const Backend = struct {
             .q4_k => try self.eltFn(elt.gemv_q4_k_ptx, "gemv_q4_k"),
             .q5_k => try self.eltFn(elt.gemv_q5_k_ptx, "gemv_q5_k"),
             .q6_k => try self.eltFn(elt.gemv_q6_k_ptx, "gemv_q6_k"),
+            .iq4_nl => try self.eltFn(elt.gemv_iq4_nl_ptx, "gemv_iq4_nl"),
             else => unreachable,
         };
         // q5_k/q6_k run warp-per-row (8 rows per block); the kernel guards
         // `row < rows`, so a non-multiple-of-8 row count (e.g. Gemma 3's
         // 262145-token tied head) just leaves the last block's extra warps
         // idle — round the grid UP so every row is covered.
-        const warp_per_row = dt == .q5_k or dt == .q6_k;
+        const warp_per_row = dt == .q5_k or dt == .q6_k or dt == .iq4_nl;
         const grid = if (warp_per_row) (rows + 7) / 8 else rows;
         try self.rowLaunch(f, w_db, x, y, null, .{ @intCast(rows), @intCast(cols), 0, 0, 0, 0 }, .{ scale, 0 }, grid);
     }
@@ -1752,6 +1754,7 @@ pub const Backend = struct {
                 .q4_k => try self.eltFn(elt.dequant_q4_k_f16_ptx, "dequant_q4_k_f16"),
                 .q5_k => try self.eltFn(elt.dequant_q5_k_f16_ptx, "dequant_q5_k_f16"),
                 .q6_k => try self.eltFn(elt.dequant_q6_k_f16_ptx, "dequant_q6_k_f16"),
+                .iq4_nl => try self.eltFn(elt.dequant_iq4_nl_f16_ptx, "dequant_iq4_nl_f16"),
                 else => unreachable,
             };
             try self.eltLaunch(f_deq, w_db, self.fp8_w16, null, null, .{ @intCast(rows * cols), 0, 0, 0, 0, 0 }, .{ 0, 0 }, rows * cols);
@@ -2583,6 +2586,7 @@ pub const Backend = struct {
         self.ctx.check(self.ctx.api.cuModuleGetGlobal(&self.state_ptr, &sz, mod.mod, "g_state"), "cuModuleGetGlobal") catch return error.CudaError;
         std.debug.assert(sz == 8);
         self.f_embed_gather_s = mod.getFunction(self.ctx, "embed_gather_s") catch return error.CudaError;
+        self.f_embed_gather_h = mod.getFunction(self.ctx, "embed_gather_h") catch return error.CudaError;
         self.f_kv_append_s = mod.getFunction(self.ctx, "kv_append_s") catch return error.CudaError;
         self.f_kv_append_s_f16 = mod.getFunction(self.ctx, "kv_append_s_f16") catch return error.CudaError;
         self.f_kv_append_s_q8 = mod.getFunction(self.ctx, "kv_append_s_q8") catch return error.CudaError;
@@ -2637,6 +2641,13 @@ pub const Backend = struct {
         try self.stateSetup();
         const w_db = try self.cachedWeight(embed_bytes);
         try self.eltLaunch(self.f_embed_gather_s, w_db, x, null, null, .{ @intCast(h), 0, 0, 0, 0, 0 }, .{ 0, 0 }, h);
+    }
+
+    /// opEmbedGatherS for an f16 embedding table (Mistral/llama).
+    pub fn opEmbedGatherH(self: *Backend, x: DeviceBuffer, embed_bytes: []const u8, h: usize) Error!void {
+        try self.stateSetup();
+        const w_db = try self.cachedWeight(embed_bytes);
+        try self.eltLaunch(self.f_embed_gather_h, w_db, x, null, null, .{ @intCast(h), 0, 0, 0, 0, 0 }, .{ 0, 0 }, h);
     }
 
     /// opEmbedGatherS for a ggml block-quant embedding table: x[i] =

@@ -44,6 +44,7 @@ const gg = if (have_ggml) struct {
             .q4_k => ggml.c.GGML_TYPE_Q4_K,
             .q5_k => ggml.c.GGML_TYPE_Q5_K,
             .q6_k => ggml.c.GGML_TYPE_Q6_K,
+            .iq4_nl => ggml.c.GGML_TYPE_IQ4_NL,
             else => null,
         };
     }
@@ -76,7 +77,7 @@ const gg = if (have_ggml) struct {
     pub fn dequantSlice(dt: DType, row: []const u8, elem0: usize, n: usize, dst: []f32) void {
         _ = .{ dt, row, elem0, n, dst };
         @panic("quants.dequantSlice: TensorPencil built with -Dggml=false; " ++
-            "GGUF block-quant (q4_0/q8_0/q4_k/q5_k/q6_k) is unavailable");
+            "GGUF block-quant (q4_0/q8_0/q4_k/q5_k/q6_k/iq4_nl) is unavailable");
     }
 };
 
@@ -128,6 +129,25 @@ test "q5_k dequant matches ggml reference" {
 
 test "q6_k dequant matches ggml reference" {
     try expectGolden(.q6_k, &fixtures.q6_k_block, &fixtures.q6_k_expected_bits);
+}
+
+test "iq4_nl dequant matches the non-linear LUT" {
+    if (!have_ggml) return error.SkipZigTest; // dequant needs the ggml backend
+    // IQ4_NL: 32-elem block = f16 d + 16 nibble bytes; low nibble -> y[j],
+    // high nibble -> y[j+16], value = d * kvalues_iq4nl[nibble].
+    const kv = [16]f32{ -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
+    var block: [18]u8 = undefined;
+    std.mem.writeInt(u16, block[0..2], @bitCast(@as(f16, 2.0)), .little); // d = 2.0
+    block[2] = 0x21; // qs[0]: low nibble 1, high nibble 2
+    @memset(block[3..], 0); // qs[1..15] = 0 -> both nibbles index kv[0]
+    var out: [32]f32 = undefined;
+    dequantSlice(.iq4_nl, &block, 0, 32, &out);
+    try std.testing.expectEqual(2.0 * kv[1], out[0]); // low nibble of qs[0]
+    try std.testing.expectEqual(2.0 * kv[2], out[16]); // high nibble of qs[0]
+    for (1..16) |j| {
+        try std.testing.expectEqual(2.0 * kv[0], out[j]);
+        try std.testing.expectEqual(2.0 * kv[0], out[j + 16]);
+    }
 }
 
 test "dequantSlice block-aligned sub-ranges" {

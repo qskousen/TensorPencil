@@ -889,6 +889,74 @@ export fn gemv_q8_0_t() callconv(.spirv_kernel) void {
     d.data[ch * rows + row] = acc;
 }
 
+// IQ4_NL non-linear 4-bit codebook (ggml kvalues_iq4nl). Same block layout as
+// q4_0 (18 B/32 elems: f16 d + 16 nibble bytes) but v = d * kvalues[nibble].
+const kvalues_iq4nl = [16]i8{ -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
+
+// gemv_iq4_nl: y[row] = scale * dot(dequant(W[row]), x), one thread per row.
+//   Block j: low nibble of qs[i] -> element i, high nibble -> element i+16
+//   (ggml dequantize_row_iq4_nl order). a = W bytes, b = x, d = y.
+//   u0 = rows, u1 = cols, f0 = scale.
+export fn gemv_iq4_nl() callconv(.spirv_kernel) void {
+    decorate();
+    const row = gpu.global_invocation_id[0];
+    if (row >= pc.u0) return;
+    const nblk = pc.u1 / 32;
+    const row_base = row * nblk * 18;
+    var acc: f32 = 0;
+    var blk: u32 = 0;
+    while (blk < nblk) : (blk += 1) {
+        const bb = row_base + blk * 18;
+        const sc = wf16(bb);
+        var bsum: f32 = 0;
+        var i: u32 = 0;
+        while (i < 16) : (i += 1) {
+            const q = wbyte(bb + 2 + i);
+            const lo: f32 = @floatFromInt(kvalues_iq4nl[@intCast(q & 0xF)]);
+            const hi: f32 = @floatFromInt(kvalues_iq4nl[@intCast(q >> 4)]);
+            bsum += lo * b.data[blk * 32 + i];
+            bsum += hi * b.data[blk * 32 + 16 + i];
+        }
+        acc += sc * bsum;
+    }
+    d.data[pc.u2 + row] = acc * pc.f0;
+}
+
+// gemv_iq4_nl_t: transposed + block-split gemv_iq4_nl (matches gemv_q8_0_t).
+//   a = W (transposed), b = x, d = partials. u0=rows*nchunk u1=cols u2=nchunk u3=rows.
+export fn gemv_iq4_nl_t() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const rows = pc.u3;
+    const nchunk = pc.u2;
+    const ch = idx / rows;
+    const row = idx % rows;
+    const nblk = pc.u1 / 32;
+    const row_bytes = nblk * 18;
+    const gb = (row / GROUP) * (row_bytes * GROUP) + (row % GROUP);
+    const chunk = (nblk + nchunk - 1) / nchunk;
+    const start = ch * chunk;
+    const stop = @min(start + chunk, nblk);
+    var acc: f32 = 0;
+    var blk: u32 = start;
+    while (blk < stop) : (blk += 1) {
+        const bb = blk * 18;
+        const sc = tf16(gb, bb);
+        var bsum: f32 = 0;
+        var i: u32 = 0;
+        while (i < 16) : (i += 1) {
+            const q = tbyte(gb, bb + 2 + i);
+            const lo: f32 = @floatFromInt(kvalues_iq4nl[@intCast(q & 0xF)]);
+            const hi: f32 = @floatFromInt(kvalues_iq4nl[@intCast(q >> 4)]);
+            bsum += lo * b.data[blk * 32 + i];
+            bsum += hi * b.data[blk * 32 + 16 + i];
+        }
+        acc += sc * bsum;
+    }
+    d.data[ch * rows + row] = acc;
+}
+
 // gemv_q4_k_t: transposed + superblock-split gemv_q4_k. Same math as gemv_q4_k
 //   (v = d*sc*q - dmin*m) over the transposed layout. u0=rows*nchunk u1=cols
 //   u2=nchunk u3=rows.
@@ -988,6 +1056,207 @@ export fn gemv_q5_k_t() callconv(.spirv_kernel) void {
         }
     }
     d.data[ch * rows + row] = acc;
+}
+
+// --- block-quant dequant -> f32 row-major (prefill tensor-core GEMM path) ---
+// These read the SAME 32-row-group transposed weight the gemv_*_t kernels read
+// (so the resident decode weight is reused — no second copy) and write the
+// dequantized weight in natural [rows][cols] row-major order (element (row,col)
+// at row*cols + col; the value `col` would multiply in the GEMV). One thread
+// per (row, block/superblock); idx = unit*rows + row so a 32-lane warp reads
+// one coalesced row-group. u0 = rows*nunits, u1 = cols, u2 = rows, f0 = scale.
+// a = W (transposed), d = f32 row-major out. The per-format dequant math is
+// byte-identical to the matching gemv_*_t kernel; only the store differs.
+// `pack_h16_kmajor` then repacks the f32 output into the k-major padded f16
+// layout the coop GEMM consumes.
+
+export fn dequant_q8_0_f32() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const rows = pc.u2;
+    const cols = pc.u1;
+    const nblk = cols / 32;
+    const blk = idx / rows;
+    const row = idx % rows;
+    const row_bytes = nblk * 34;
+    const gb = (row / GROUP) * (row_bytes * GROUP) + (row % GROUP);
+    const bb = blk * 34;
+    const sc = tf16(gb, bb) * pc.f0;
+    const obase = row * cols + blk * 32;
+    var i: u32 = 0;
+    while (i < 32) : (i += 1) {
+        d.data[obase + i] = sc * @as(f32, @floatFromInt(ti8(gb, bb + 2 + i)));
+    }
+}
+
+export fn dequant_iq4_nl_f32() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const rows = pc.u2;
+    const cols = pc.u1;
+    const nblk = cols / 32;
+    const blk = idx / rows;
+    const row = idx % rows;
+    const row_bytes = nblk * 18;
+    const gb = (row / GROUP) * (row_bytes * GROUP) + (row % GROUP);
+    const bb = blk * 18;
+    const sc = tf16(gb, bb) * pc.f0;
+    const obase = row * cols + blk * 32;
+    var i: u32 = 0;
+    while (i < 16) : (i += 1) {
+        const q = tbyte(gb, bb + 2 + i);
+        d.data[obase + i] = sc * @as(f32, @floatFromInt(kvalues_iq4nl[@intCast(q & 0xF)]));
+        d.data[obase + 16 + i] = sc * @as(f32, @floatFromInt(kvalues_iq4nl[@intCast(q >> 4)]));
+    }
+}
+
+export fn dequant_q4_k_f32() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const rows = pc.u2;
+    const cols = pc.u1;
+    const nsb = cols / 256;
+    const sb = idx / rows;
+    const row = idx % rows;
+    const row_bytes = nsb * 144;
+    const gb = (row / GROUP) * (row_bytes * GROUP) + (row % GROUP);
+    const bb = sb * 144;
+    const sd = tf16(gb, bb);
+    const sdmin = tf16(gb, bb + 2);
+    const sbase = bb + 4;
+    const qbase = bb + 16;
+    const obase = row * cols + sb * 256;
+    var g: u32 = 0;
+    while (g < 4) : (g += 1) {
+        const s1 = scaleMinK4T(gb, sbase, 2 * g);
+        const s2 = scaleMinK4T(gb, sbase, 2 * g + 1);
+        const d1 = sd * @as(f32, @floatFromInt(s1.sc));
+        const m1 = sdmin * @as(f32, @floatFromInt(s1.m));
+        const d2 = sd * @as(f32, @floatFromInt(s2.sc));
+        const m2 = sdmin * @as(f32, @floatFromInt(s2.m));
+        const qg = qbase + g * 32;
+        const og = obase + g * 64;
+        var l: u32 = 0;
+        while (l < 32) : (l += 1) {
+            const q = tbyte(gb, qg + l);
+            d.data[og + l] = (d1 * @as(f32, @floatFromInt(q & 0xF)) - m1) * pc.f0;
+            d.data[og + 32 + l] = (d2 * @as(f32, @floatFromInt(q >> 4)) - m2) * pc.f0;
+        }
+    }
+}
+
+export fn dequant_q5_k_f32() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const rows = pc.u2;
+    const cols = pc.u1;
+    const nsb = cols / 256;
+    const sb = idx / rows;
+    const row = idx % rows;
+    const row_bytes = nsb * 176;
+    const gb = (row / GROUP) * (row_bytes * GROUP) + (row % GROUP);
+    const bb = sb * 176;
+    const sd = tf16(gb, bb);
+    const sdmin = tf16(gb, bb + 2);
+    const sbase = bb + 4;
+    const qhbase = bb + 16;
+    const qbase = bb + 48;
+    const obase = row * cols + sb * 256;
+    var g: u32 = 0;
+    while (g < 4) : (g += 1) {
+        const s1 = scaleMinK4T(gb, sbase, 2 * g);
+        const s2 = scaleMinK4T(gb, sbase, 2 * g + 1);
+        const d1 = sd * @as(f32, @floatFromInt(s1.sc));
+        const m1 = sdmin * @as(f32, @floatFromInt(s1.m));
+        const d2 = sd * @as(f32, @floatFromInt(s2.sc));
+        const m2 = sdmin * @as(f32, @floatFromInt(s2.m));
+        const qg = qbase + g * 32;
+        const og = obase + g * 64;
+        const mlo: u32 = @as(u32, 1) << @as(u5, @intCast(2 * g));
+        const mhi: u32 = @as(u32, 1) << @as(u5, @intCast(2 * g + 1));
+        var l: u32 = 0;
+        while (l < 32) : (l += 1) {
+            const q = tbyte(gb, qg + l);
+            const qh = tbyte(gb, qhbase + l);
+            const lo: u32 = (q & 0xF) + (if (qh & mlo != 0) @as(u32, 16) else 0);
+            const hi: u32 = (q >> 4) + (if (qh & mhi != 0) @as(u32, 16) else 0);
+            d.data[og + l] = (d1 * @as(f32, @floatFromInt(lo)) - m1) * pc.f0;
+            d.data[og + 32 + l] = (d2 * @as(f32, @floatFromInt(hi)) - m2) * pc.f0;
+        }
+    }
+}
+
+export fn dequant_q6_k_f32() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const rows = pc.u2;
+    const cols = pc.u1;
+    const nsb = cols / 256;
+    const sb = idx / rows;
+    const row = idx % rows;
+    const row_bytes = nsb * 210;
+    const gb = (row / GROUP) * (row_bytes * GROUP) + (row % GROUP);
+    const bb = sb * 210;
+    const sd = tf16(gb, bb + 208);
+    const obase = row * cols + sb * 256;
+    var half: u32 = 0;
+    while (half < 2) : (half += 1) {
+        const qlh = bb + half * 64;
+        const qhh = bb + 128 + half * 32;
+        const sch = bb + 192 + half * 8;
+        const og = obase + half * 128;
+        var l: u32 = 0;
+        while (l < 32) : (l += 1) {
+            const is = l / 16;
+            const ql_l = tbyte(gb, qlh + l);
+            const ql_h = tbyte(gb, qlh + l + 32);
+            const qh = tbyte(gb, qhh + l);
+            const q1 = @as(i32, @intCast((ql_l & 0xF) | (((qh >> 0) & 3) << 4))) - 32;
+            const q2 = @as(i32, @intCast((ql_h & 0xF) | (((qh >> 2) & 3) << 4))) - 32;
+            const q3 = @as(i32, @intCast((ql_l >> 4) | (((qh >> 4) & 3) << 4))) - 32;
+            const q4 = @as(i32, @intCast((ql_h >> 4) | (((qh >> 6) & 3) << 4))) - 32;
+            const sc1 = ti8(gb, sch + is + 0);
+            const sc2 = ti8(gb, sch + is + 2);
+            const sc3 = ti8(gb, sch + is + 4);
+            const sc4 = ti8(gb, sch + is + 6);
+            d.data[og + l] = sd * @as(f32, @floatFromInt(sc1 * q1)) * pc.f0;
+            d.data[og + l + 32] = sd * @as(f32, @floatFromInt(sc2 * q2)) * pc.f0;
+            d.data[og + l + 64] = sd * @as(f32, @floatFromInt(sc3 * q3)) * pc.f0;
+            d.data[og + l + 96] = sd * @as(f32, @floatFromInt(sc4 * q4)) * pc.f0;
+        }
+    }
+}
+
+// pack_h16_kmajor: f32 row-major [rows][cols] -> f16 k-major padded [k_pad][n_pad]
+//   (element (k,row) at k*n_pad + row), zeros in both pads — the layout the
+//   f16-weight coop GEMM (weightBufferF16From32) reads. One thread per OUTPUT
+//   WORD, holding two adjacent rows of the same column k (n_pad is even, so a
+//   word never straddles a column). a = f32 row-major, d = f16 words.
+//   u0 = k_pad*n_pad/2 (words), u1 = rows, u2 = cols, u3 = n_pad.
+export fn pack_h16_kmajor() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const rows = pc.u1;
+    const cols = pc.u2;
+    const n_pad = pc.u3;
+    const base = idx * 2;
+    const k = base / n_pad;
+    const row0 = base % n_pad;
+    var out: u32 = 0;
+    inline for (0..2) |j| {
+        const row = row0 + j;
+        if (k < cols and row < rows) {
+            const v: f16 = @floatCast(a.data[row * cols + k]);
+            out |= @as(u32, @as(u16, @bitCast(v))) << @intCast(16 * j);
+        }
+    }
+    d.data[idx] = @bitCast(out);
 }
 
 // --- qwen35 hybrid (gated DeltaNet) kernels -----------------------------

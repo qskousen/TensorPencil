@@ -109,7 +109,7 @@ pub const topk_lanes = 1024;
 /// llm.kv_cache.KvDtype). q8_0 is the ggml 34-byte block (f16 scale + 32 i8).
 pub const KvFmt = enum { f32, f16, q8_0 };
 
-pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, rope_qwen35, attn_decode_q35, attn_dsplit_gemma, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, attn_dsplit_gemma_f16, kv_store_f16, penalize, attn_dsplit_gemma_q8, kv_store_q8_0 };
+pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, rope_qwen35, attn_decode_q35, attn_dsplit_gemma, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, attn_dsplit_gemma_f16, kv_store_f16, penalize, attn_dsplit_gemma_q8, kv_store_q8_0, gemv_iq4_nl, gemv_iq4_nl_t, dequant_q8_0_f32, dequant_q4_k_f32, dequant_q5_k_f32, dequant_q6_k_f32, dequant_iq4_nl_f32, pack_h16_kmajor };
 const elt_entry_sizes = [_]EntrySize{
     .{ .name = "rmsnorm", .x = 64, .y = 1 },
     .{ .name = "rms_partial", .x = 256, .y = 1 },
@@ -190,6 +190,14 @@ const elt_entry_sizes = [_]EntrySize{
     .{ .name = "penalize", .x = 256, .y = 1 },
     .{ .name = "attn_dsplit_gemma_q8", .x = 256, .y = 1 },
     .{ .name = "kv_store_q8_0", .x = 256, .y = 1 },
+    .{ .name = "gemv_iq4_nl", .x = 256, .y = 1 },
+    .{ .name = "gemv_iq4_nl_t", .x = 256, .y = 1 },
+    .{ .name = "dequant_q8_0_f32", .x = 256, .y = 1 },
+    .{ .name = "dequant_q4_k_f32", .x = 256, .y = 1 },
+    .{ .name = "dequant_q5_k_f32", .x = 256, .y = 1 },
+    .{ .name = "dequant_q6_k_f32", .x = 256, .y = 1 },
+    .{ .name = "dequant_iq4_nl_f32", .x = 256, .y = 1 },
+    .{ .name = "pack_h16_kmajor", .x = 256, .y = 1 },
 };
 
 /// Push block shared by all eltwise entries; meaning per entry (see kernels).
@@ -472,6 +480,7 @@ pub const Context = struct {
     pipe_tr_bf16: vk.Pipeline, // bf16 weight -> bf16 k-major dense-GEMV layout (2 cols/u32)
     pipe_tr_bf16w: vk.Pipeline, // bf16 weight -> f16 k-major coop layout (GPU convert, fallback)
     pipe_tr_bf16raw: vk.Pipeline, // bf16 weight -> bf16 k-major coop layout (native, no convert)
+    pipe_tr_grp32: vk.Pipeline, // raw block-quant -> 32-row-group byte-transposed layout (device weightBufferRawT)
     pipeline_layout_e: vk.PipelineLayout,
     shader_e: vk.ShaderModule,
     pipes_e: [elt_entry_sizes.len]vk.Pipeline,
@@ -547,6 +556,10 @@ pub const Context = struct {
     y_pad: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
     /// Device-local scratch for raw (untransposed) weight uploads.
     raw_dev: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
+    /// Block-quant prefill GEMM scratch: one weight dequanted to f32 row-major,
+    /// then repacked to f16 k-major (both reused, barrier-ordered per weight).
+    deq_f32: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
+    deq_f16k: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
     /// int8-path scratch: rotated f32 activations, per-row act scale, packed
     /// int8 activations, s32 GEMM accumulator, and the resident Hadamard.
     i8_xr: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
@@ -897,6 +910,7 @@ pub const Context = struct {
             .{ .name = "transpose_bf16", .x = tr_wg_x, .y = tr_wg_y },
             .{ .name = "bf16_to_f16_coopw", .x = tr_wg_x, .y = tr_wg_y },
             .{ .name = "bf16_coopw", .x = tr_wg_x, .y = tr_wg_y },
+            .{ .name = "transpose_grp32", .x = 256, .y = 1 },
         }, &shader_tr);
         var shader_e: vk.ShaderModule = .null_handle;
         try createKernelModule(gpa, &d, device, eltwise_spv, &elt_entry_sizes, &shader_e);
@@ -982,14 +996,15 @@ pub const Context = struct {
             }, null, &pipeline_layout_tr));
         }
         errdefer d.DestroyPipelineLayout(device, pipeline_layout_tr, null);
-        var pipes_tr: [5]vk.Pipeline = @splat(.null_handle);
+        var pipes_tr: [6]vk.Pipeline = @splat(.null_handle);
         {
-            const infos = [5]vk.ComputePipelineCreateInfo{
+            const infos = [6]vk.ComputePipelineCreateInfo{
                 .{ .stage = .{ .module = shader_tr, .p_name = "transpose_f8" }, .layout = pipeline_layout_tr },
                 .{ .stage = .{ .module = shader_tr, .p_name = "transpose_f32" }, .layout = pipeline_layout_tr },
                 .{ .stage = .{ .module = shader_tr, .p_name = "transpose_bf16" }, .layout = pipeline_layout_tr },
                 .{ .stage = .{ .module = shader_tr, .p_name = "bf16_to_f16_coopw" }, .layout = pipeline_layout_tr },
                 .{ .stage = .{ .module = shader_tr, .p_name = "bf16_coopw" }, .layout = pipeline_layout_tr },
+                .{ .stage = .{ .module = shader_tr, .p_name = "transpose_grp32" }, .layout = pipeline_layout_tr },
             };
             try check(d.CreateComputePipelines(device, .null_handle, infos.len, &infos, null, &pipes_tr));
         }
@@ -1362,6 +1377,7 @@ pub const Context = struct {
             .pipe_tr_bf16 = pipes_tr[2],
             .pipe_tr_bf16w = pipes_tr[3],
             .pipe_tr_bf16raw = pipes_tr[4],
+            .pipe_tr_grp32 = pipes_tr[5],
             .pipeline_layout_e = pipeline_layout_e,
             .shader_e = shader_e,
             .pipes_e = pipes_e,
@@ -1428,7 +1444,7 @@ pub const Context = struct {
             }
             self.small_bufs.deinit(self.gpa);
         }
-        for ([_]*DeviceBuffer{ &self.x_dev, &self.y_dev, &self.raw_dev, &self.dummy, &self.pen_wire, &self.x_h16, &self.y_pad, &self.i8_xr, &self.i8_scale, &self.i8_x, &self.i8_acc, &self.i8_acc1, &self.i8_acc2, &self.i8_acc3, &self.i8_hadamard, &self.i8_partials, &self.i8_scalecat }) |db| {
+        for ([_]*DeviceBuffer{ &self.x_dev, &self.y_dev, &self.raw_dev, &self.deq_f32, &self.deq_f16k, &self.dummy, &self.pen_wire, &self.x_h16, &self.y_pad, &self.i8_xr, &self.i8_scale, &self.i8_x, &self.i8_acc, &self.i8_acc1, &self.i8_acc2, &self.i8_acc3, &self.i8_hadamard, &self.i8_partials, &self.i8_scalecat }) |db| {
             if (db.buf != .null_handle) {
                 self.freeDeviceBuffer(db.*);
             }
@@ -1444,6 +1460,7 @@ pub const Context = struct {
         self.d.DestroyPipeline(self.device, self.pipe_tr_bf16, null);
         self.d.DestroyPipeline(self.device, self.pipe_tr_bf16w, null);
         self.d.DestroyPipeline(self.device, self.pipe_tr_bf16raw, null);
+        self.d.DestroyPipeline(self.device, self.pipe_tr_grp32, null);
         self.d.DestroyPipeline(self.device, self.pipe_tr_f8, null);
         self.d.DestroyPipeline(self.device, self.pipe_tr_f32, null);
         for (self.pipes_e) |pp| self.d.DestroyPipeline(self.device, pp, null);
@@ -1775,9 +1792,12 @@ pub const Context = struct {
     /// weight into 32-row groups so the `*_t` GEMV kernels read coalesced:
     /// logical byte `j` of row `row` moves to grp_base + j*32 (grp_base =
     /// (row/32)*row_bytes*32 + row%32). The bytes are unchanged (bit-identical
-    /// dequant); only their order changes. Transpose is host-side and one-time
-    /// (cached by host pointer). Rows are padded up to a multiple of 32; the
-    /// pad slots are never read (out-of-range threads exit).
+    /// dequant); only their order changes. Cached by host pointer (one-time).
+    /// The transpose runs ON THE GPU (transpose_grp32): the raw weight streams
+    /// to a device scratch, then one compute pass writes the grouped layout —
+    /// replacing the single-thread ~8 GiB CPU byte-scatter (the cold-start
+    /// bottleneck). Rows are padded up to a multiple of 32; the pad slots are
+    /// zeroed by the kernel (out-of-range rows contribute 0) and never read.
     fn weightBufferRawT(self: *Context, bytes: []const u8, row_bytes: usize) Error!vk.Buffer {
         const key = @intFromPtr(bytes.ptr);
         self.use_counter += 1;
@@ -1802,31 +1822,66 @@ pub const Context = struct {
             self.d.FreeMemory(self.device, db.mem, null);
         }
 
-        // Host byte-transpose into a scratch, then upload verbatim.
-        const scratch = try self.gpa.alloc(u8, @intCast(total));
-        defer self.gpa.free(scratch);
-        if (packed_size != bytes.len) @memset(scratch, 0); // zero pad slots
-        var row: usize = 0;
-        while (row < rows) : (row += 1) {
-            const base = (row / G) * row_bytes * G + (row % G);
-            const src = bytes[row * row_bytes ..][0..row_bytes];
-            var j: usize = 0;
-            while (j < row_bytes) : (j += 1) scratch[base + j * G] = src[j];
-        }
-
+        // Raw row-major weight -> device scratch (chunked staging upload).
         const cb = self.nowCmd();
+        const raw_size = std.mem.alignForward(u64, bytes.len, 4);
+        try self.ensureDeviceBuffer(&self.raw_dev, raw_size);
         const chunk: u64 = 256 << 20;
-        const mapped = try self.ensureHostBuffer(&self.staging, @min(total, chunk));
+        const mapped = try self.ensureHostBuffer(&self.staging, @min(raw_size, chunk));
         var off: u64 = 0;
-        while (off < scratch.len) {
-            const n: u64 = @min(chunk, scratch.len - off);
-            @memcpy(mapped[0..@intCast(n)], scratch[@intCast(off)..][0..@intCast(n)]);
+        while (off < bytes.len) {
+            const n: u64 = @min(chunk, bytes.len - off);
+            @memcpy(mapped[0..@intCast(n)], bytes[@intCast(off)..][0..@intCast(n)]);
             try self.beginCmdBuf(cb);
             const region: vk.BufferCopy = .{ .src_offset = 0, .dst_offset = off, .size = n };
-            self.d.CmdCopyBuffer(cb, self.staging.buf, db.buf, 1, @ptrCast(&region));
+            self.d.CmdCopyBuffer(cb, self.staging.buf, self.raw_dev.buf, 1, @ptrCast(&region));
             try self.submitAndWaitBuf(cb);
             off += n;
         }
+
+        // GPU byte-transpose raw_dev -> db (one output u32 per invocation).
+        {
+            const buf_infos = [2]vk.DescriptorBufferInfo{
+                .{ .buffer = self.raw_dev.buf },
+                .{ .buffer = db.buf },
+            };
+            var writes: [2]vk.WriteDescriptorSet = undefined;
+            for (&writes, 0..) |*wr, i| {
+                wr.* = .{
+                    .dst_set = self.desc_set_tr,
+                    .dst_binding = @intCast(i),
+                    .dst_array_element = 0,
+                    .descriptor_count = 1,
+                    .descriptor_type = .storage_buffer,
+                    .p_image_info = null,
+                    .p_buffer_info = @ptrCast(&buf_infos[i]),
+                    .p_texel_buffer_view = null,
+                };
+            }
+            self.d.UpdateDescriptorSets(self.device, writes.len, &writes, 0, null);
+
+            const words: u32 = @intCast(total / 4);
+            const push: TransposePush = .{
+                .rows = @intCast(rows),
+                .cols = words, // dispatch/bound = output word count
+                .stride = @intCast(row_bytes),
+            };
+            try self.beginCmdBuf(cb);
+            self.d.CmdBindPipeline(cb, .compute, self.pipe_tr_grp32);
+            self.d.CmdBindDescriptorSets(cb, .compute, self.pipeline_layout_tr, 0, 1, @ptrCast(&self.desc_set_tr), 0, null);
+            self.d.CmdPushConstants(cb, self.pipeline_layout_tr, vk.ShaderStage.compute, 0, @sizeOf(TransposePush), &push);
+            self.d.CmdDispatch(cb, @intCast(std.math.divCeil(u64, words, 256) catch unreachable), 1, 1);
+            const to_shader: vk.BufferMemoryBarrier = .{
+                .src_access_mask = vk.Access.shader_write,
+                .dst_access_mask = vk.Access.shader_read,
+                .buffer = db.buf,
+                .offset = 0,
+                .size = vk.WHOLE_SIZE,
+            };
+            self.d.CmdPipelineBarrier(cb, vk.PipelineStage.compute_shader, vk.PipelineStage.compute_shader, 0, 0, null, 1, @ptrCast(&to_shader), 0, null);
+            try self.submitAndWaitBuf(cb);
+        }
+
         try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .pinned = self.pinNew(total) });
         return db.buf;
     }
@@ -2102,6 +2157,7 @@ pub const Context = struct {
             .q4_k => .gemv_q4_k,
             .q5_k => .gemv_q5_k,
             .q6_k => .gemv_q6_k,
+            .iq4_nl => .gemv_iq4_nl,
             else => return error.UnsupportedDType,
         };
         const w_buf = try self.weightBufferRaw(w_bytes);
@@ -2139,6 +2195,7 @@ pub const Context = struct {
             .q4_k => (cols / 256) * 144,
             .q5_k => (cols / 256) * 176,
             .q6_k => (cols / 256) * 210,
+            .iq4_nl => (cols / 32) * 18,
             else => return error.UnsupportedDType,
         };
         const entry: Elt = switch (dt) {
@@ -2146,9 +2203,10 @@ pub const Context = struct {
             .q4_k => .gemv_q4_k_t,
             .q5_k => .gemv_q5_k_t,
             .q6_k => .gemv_q6_k_t,
+            .iq4_nl => .gemv_iq4_nl_t,
             else => return error.UnsupportedDType,
         };
-        if (dt != .q8_0) std.debug.assert(cols % 256 == 0);
+        if (dt != .q8_0 and dt != .iq4_nl) std.debug.assert(cols % 256 == 0);
         const w_buf = try self.weightBufferRawT(w_bytes, row_bytes);
         const w_db: DeviceBuffer = .{ .buf = w_buf, .mem = .null_handle, .size = 0 };
         try self.opElt(entry, w_db, x, null, partials, .{
@@ -2893,6 +2951,81 @@ pub const Context = struct {
             .u2 = @intCast(n_pad),
             .u3 = @intCast(y_off),
         }, m * rows, 1, 1);
+    }
+
+    /// Whether the block-quant prefill tensor-core GEMM path is available on
+    /// this device (needs the f16-weight coopmat pipeline). When false, callers
+    /// fall back to the per-row dequant GEMV for prefill too.
+    pub fn hasQuantPrefillGemm(self: *const Context) bool {
+        return self.pipe_coop_f16w != .null_handle;
+    }
+
+    /// Bytes per weight row for a block-quant dtype at `cols` elements (the
+    /// row stride the 32-row-group transpose / dequant kernels assume).
+    fn quantRowBytes(dt: @import("tp_core").dtype.DType, cols: usize) usize {
+        return switch (dt) {
+            .q8_0 => (cols / 32) * 34,
+            .q4_k => (cols / 256) * 144,
+            .q5_k => (cols / 256) * 176,
+            .q6_k => (cols / 256) * 210,
+            .iq4_nl => (cols / 32) * 18,
+            else => unreachable,
+        };
+    }
+
+    /// Dequant a block-quant weight into the k-major padded f16 layout the coop
+    /// GEMM consumes, returning its device buffer (`self.deq_f16k`). Reads the
+    /// resident 32-row-group transposed weight (weightBufferRawT — the same
+    /// buffer the decode GEMV uses, so no second copy), dequants it to f32
+    /// row-major (`self.deq_f32`), then repacks to f16 k-major. Both scratches
+    /// are reused across a batched prefill; the per-op barriers order each
+    /// weight's dequant→pack→GEMM→(next weight) so the reuse is race-free.
+    fn quantWeightF16K(self: *Context, dt: @import("tp_core").dtype.DType, w_bytes: []const u8, rows: usize, cols: usize, scale: f32) Error!vk.Buffer {
+        std.debug.assert(cols % 32 == 0);
+        const row_bytes = quantRowBytes(dt, cols);
+        const w_t = try self.weightBufferRawT(w_bytes, row_bytes);
+        const w_db: DeviceBuffer = .{ .buf = w_t, .mem = .null_handle, .size = 0 };
+
+        try self.ensureDeviceBuffer(&self.deq_f32, rows * cols * 4);
+        const entry: Elt, const units: usize = switch (dt) {
+            .q8_0 => .{ .dequant_q8_0_f32, rows * (cols / 32) },
+            .q4_k => .{ .dequant_q4_k_f32, rows * (cols / 256) },
+            .q5_k => .{ .dequant_q5_k_f32, rows * (cols / 256) },
+            .q6_k => .{ .dequant_q6_k_f32, rows * (cols / 256) },
+            .iq4_nl => .{ .dequant_iq4_nl_f32, rows * (cols / 32) },
+            else => return error.UnsupportedDType,
+        };
+        try self.opElt(entry, w_db, null, null, self.deq_f32, .{
+            .u0 = @intCast(units),
+            .u1 = @intCast(cols),
+            .u2 = @intCast(rows),
+            .f0 = scale,
+        }, units, 1, 1);
+
+        const n_pad = std.mem.alignForward(usize, rows, 128);
+        const k_pad = std.mem.alignForward(usize, cols, 64);
+        const words = k_pad * n_pad / 2;
+        try self.ensureDeviceBuffer(&self.deq_f16k, k_pad * n_pad * 2);
+        try self.opElt(.pack_h16_kmajor, self.deq_f32, null, null, self.deq_f16k, .{
+            .u0 = @intCast(words),
+            .u1 = @intCast(rows),
+            .u2 = @intCast(cols),
+            .u3 = @intCast(n_pad),
+        }, words, 1, 1);
+        return self.deq_f16k.buf;
+    }
+
+    /// Block-quant tensor-core GEMM for prefill: `y[m][rows] = dequant(W) @ x`.
+    /// Dequants the weight to f16 k-major (quantWeightF16K) once per call, then
+    /// runs the shared f16-weight coop GEMM. The weight is re-dequanted every
+    /// call (the f16 form is 4x the block-quant size and won't all fit resident);
+    /// amortized across the whole prompt batch it's a rounding error next to the
+    /// per-token GEMV prefill it replaces. `bias` is added per output row (pass
+    /// zeros for the LLM projections, which carry no bias).
+    pub fn opMatmulCoopQuant(self: *Context, dt: @import("tp_core").dtype.DType, y: DeviceBuffer, y_off: usize, x: DeviceBuffer, m: usize, w_bytes: []const u8, rows: usize, cols: usize, scale: f32, bias: []const f32) Error!void {
+        std.debug.assert(self.pipe_coop_f16w != .null_handle);
+        const w_buf = try self.quantWeightF16K(dt, w_bytes, rows, cols, scale);
+        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, bias, false);
     }
 
     /// Attention-scores tensor-core GEMM (coopmat.buildGemmScores): grid is
@@ -3758,6 +3891,105 @@ test "gpu block-quant gemv matches cpu reference" {
                 std.debug.print("dtype {s} (transposed) row {d}: gpu {d} cpu {d}\n", .{ @tagName(dt), r, y[r], acc });
                 return e;
             };
+        }
+    }
+}
+
+// The block-quant prefill tensor-core GEMM (opMatmulCoopQuant): dequant each
+// weight to f16 k-major on-device, then the coop GEMM over a batch. Validates
+// all five dequant kernels + the pack kernel + the coop path against a CPU
+// dequant-matmul reference (f16-GEMM tolerance). iq4_nl is covered here (the
+// gemv test above skips it); the Nemo e2e run exercises iq4_nl/q8_0/q5_k.
+test "gpu block-quant prefill GEMM matches cpu reference" {
+    const gpa = std.testing.allocator;
+    std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa) catch return error.SkipZigTest;
+    defer ctx.deinit();
+    if (!ctx.hasQuantPrefillGemm()) return error.SkipZigTest; // no f16 coopmat on this device
+    const dtypes = @import("tp_core").dtype;
+    const quants = @import("tp_core").quants;
+
+    const m = 8; // prefill batch
+    const rows = 128; // output dim (n_pad multiple)
+    const cols = 512; // two 256-elem super-blocks
+    var prng = std.Random.DefaultPrng.init(91);
+    const rand = prng.random();
+
+    const x = try gpa.alloc(f32, m * cols);
+    defer gpa.free(x);
+    for (x) |*v| v.* = rand.floatNorm(f32) * 2.0 - 1.0;
+    var x_d = try ctx.tensorCreate(m * cols * 4);
+    var y_d = try ctx.tensorCreate(m * rows * 4);
+    defer {
+        ctx.tensorDestroy(&x_d);
+        ctx.tensorDestroy(&y_d);
+    }
+    try ctx.tensorUpload(x_d, std.mem.sliceAsBytes(x));
+
+    const bias = try gpa.alloc(f32, rows);
+    defer gpa.free(bias);
+    @memset(bias, 0);
+    const y = try gpa.alloc(f32, m * rows);
+    defer gpa.free(y);
+    const row_f32 = try gpa.alloc(f32, cols);
+    defer gpa.free(row_f32);
+
+    const dts = [_]dtypes.DType{ .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl };
+    const d16: u16 = 0x2A66; // ~0.05
+    const min16: u16 = 0x251F; // ~0.02
+
+    var ws: [dts.len][]u8 = undefined;
+    inline for (dts, 0..) |dt, i| {
+        ws[i] = try gpa.alloc(u8, dt.storageBytes(rows * cols));
+        rand.bytes(ws[i]);
+        const bb = dt.blockBytes();
+        var off: usize = 0;
+        while (off < ws[i].len) : (off += bb) {
+            switch (dt) {
+                .q8_0, .iq4_nl => std.mem.writeInt(u16, ws[i][off..][0..2], d16, .little),
+                .q4_k, .q5_k => {
+                    std.mem.writeInt(u16, ws[i][off..][0..2], d16, .little);
+                    std.mem.writeInt(u16, ws[i][off + 2 ..][0..2], min16, .little);
+                },
+                .q6_k => std.mem.writeInt(u16, ws[i][off + 208 ..][0..2], d16, .little),
+                else => unreachable,
+            }
+        }
+    }
+    defer for (ws) |w| gpa.free(w);
+
+    inline for (dts, 0..) |dt, i| {
+        try ctx.opMatmulCoopQuant(dt, y_d, 0, x_d, m, ws[i], rows, cols, 1.0, bias);
+        try ctx.tensorDownload(y_d, std.mem.sliceAsBytes(y));
+
+        const row_bytes = dt.storageBytes(cols);
+        for (0..rows) |r| {
+            quants.dequantSlice(dt, ws[i][r * row_bytes ..][0..row_bytes], 0, cols, row_f32);
+            for (0..m) |mi| {
+                // Reference rounds BOTH operands to f16 (as the GPU does: the
+                // pack kernel casts the dequanted weight to f16, f32_to_h16_pad
+                // casts x), so only the f32 accumulation ORDER differs — the
+                // dequant math is then checked tightly. (Comparing against a
+                // full-precision dot would fold in f16 input rounding, which on
+                // these ±6 synthetic weights with heavy cancellation is several
+                // % — a precision artifact, not a GEMM error.)
+                var acc: f64 = 0;
+                for (row_f32, x[mi * cols ..][0..cols]) |wv, xv| {
+                    const w16: f32 = @floatCast(@as(f16, @floatCast(wv)));
+                    const x16: f32 = @floatCast(@as(f16, @floatCast(xv)));
+                    acc += @as(f64, w16) * x16;
+                }
+                const want: f32 = @floatCast(acc);
+                const got = y[mi * rows + r];
+                // abs floor + a magnitude term (the GPU accumulates in f32 vs
+                // the reference's f64, and the synthetic scales push some rows
+                // to ~1e4, where f32 accumulation drifts proportionally).
+                const tol = 2e-2 + 2e-3 * @abs(want);
+                std.testing.expect(@abs(got - want) <= tol) catch |e| {
+                    std.debug.print("dtype {s} row {d} m {d}: gpu {d} cpu {d}\n", .{ @tagName(dt), r, mi, got, want });
+                    return e;
+                };
+            }
         }
     }
 }

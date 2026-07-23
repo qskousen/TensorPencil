@@ -119,11 +119,27 @@ fn isWs(cp: u21) bool {
 fn isMark(cp: u21) bool {
     return inRanges(&tables.mark_ranges, cp);
 }
+fn isLowercase(cp: u21) bool {
+    return inRanges(&tables.lowercase_ranges, cp); // \p{Ll}
+}
+fn isUppercase(cp: u21) bool {
+    return inRanges(&tables.uppercase_ranges, cp); // \p{Lu} ∪ \p{Lt}
+}
+/// tekken "upper" letter class [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}] = letters that
+/// aren't lowercase, plus marks.
+fn isTekHi(cp: u21) bool {
+    return isMark(cp) or (isLetter(cp) and !isLowercase(cp));
+}
+/// tekken "lower" letter class [\p{Ll}\p{Lm}\p{Lo}\p{M}] = letters that aren't
+/// upper/title-case, plus marks.
+fn isTekLo(cp: u21) bool {
+    return isMark(cp) or (isLetter(cp) and !isUppercase(cp));
+}
 
 /// Pretokenizer regex variant (tokenizer.ggml.pre). qwen35 differs from
 /// qwen2 in two places: letter runs are [\p{L}\p{M}]+ (combining marks join
 /// the run) and the punctuation class also excludes \p{M}.
-pub const Pretok = enum { qwen2, qwen35 };
+pub const Pretok = enum { qwen2, qwen35, tekken };
 
 /// Tokenizer algorithm. `bpe` is GPT-2 byte-level BPE (Qwen family);
 /// `spm` is SentencePiece (tokenizer.ggml.model == "llama"; Gemma 3, Llama);
@@ -159,6 +175,11 @@ pub const Tokenizer = struct {
     turn_end: u32 = im_end,
     pad: u32 = pad_token,
     newline: u32 = 198,
+    /// Beginning-of-sequence token to prepend once at the start of the prompt,
+    /// or null when the model doesn't use one. Set from a GGUF's
+    /// `tokenizer.ggml.add_bos_token` + `bos_token_id` (Mistral/llama want it;
+    /// Qwen3 does not). chat.zig prepends it via `appendBos`.
+    bos: ?u32 = null,
     pretok: Pretok = .qwen2,
     kind: Kind = .bpe,
     /// SentencePiece data (kind == .spm; empty for BPE): per-id merge score,
@@ -246,6 +267,8 @@ pub const Tokenizer = struct {
         if (g.getStr("tokenizer.ggml.pre")) |pre| {
             if (std.mem.eql(u8, pre, "qwen35")) {
                 pretok = .qwen35;
+            } else if (std.mem.eql(u8, pre, "tekken")) {
+                pretok = .tekken; // Mistral (Nemo etc.): case-split letter runs, single-digit
             } else if (!std.mem.eql(u8, pre, "qwen2")) {
                 std.log.warn("gguf pretokenizer '{s}' not implemented; using the qwen2 regex", .{pre});
             }
@@ -306,6 +329,10 @@ pub const Tokenizer = struct {
         const eos: ?u32 = if (g.getUint("tokenizer.ggml.eos_token_id")) |e| @intCast(e) else null;
         t.turn_end = findSpecial(t.specials, "<|im_end|>") orelse eos orelse return error.MissingTokenizer;
         t.pad = if (g.getUint("tokenizer.ggml.padding_token_id")) |p| @intCast(p) else eos orelse t.turn_end;
+        // Prepend BOS only when the model asks for it (Mistral/llama: true;
+        // Qwen3: absent/false).
+        if ((g.getBool("tokenizer.ggml.add_bos_token") orelse false))
+            t.bos = if (g.getUint("tokenizer.ggml.bos_token_id")) |b| @intCast(b) else null;
         return t;
     }
 
@@ -933,6 +960,7 @@ pub const Tokenizer = struct {
     /// The qwen35 variant widens letter runs to [\p{L}\p{M}]+ and excludes
     /// \p{M} from the punctuation class.
     fn pretokenEnd(pretok: Pretok, cps: []const u21, i: usize) usize {
+        if (pretok == .tekken) return pretokenEndTekken(cps, i);
         const n = cps.len;
         const c0 = cps[i];
 
@@ -999,6 +1027,78 @@ pub const Tokenizer = struct {
 
     fn asciiLower(cp: u21) u21 {
         return if (cp >= 'A' and cp <= 'Z') cp + 32 else cp;
+    }
+
+    /// End index (exclusive) of the tekken (Mistral) pretoken starting at `i`.
+    /// Hand-rolled match of the tekken regex alternation (tried in order):
+    ///   [^\r\n\p{L}\p{N}]?([\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+
+    ///     |[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*)
+    ///   | \p{N} |  ?[^\s\p{L}\p{N}]+[\r\n/]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+    /// Differs from qwen2: no contractions, letter runs split on case, digits
+    /// are single, and the punctuation tail allows '/' (not just \r\n).
+    fn pretokenEndTekken(cps: []const u21, i: usize) usize {
+        const n = cps.len;
+        const c0 = cps[i];
+
+        // 1: optional non-letter/number/CRLF prefix + a case-split letter run.
+        // The letter run is `U* L+ | U+ L*` (U/L = the tekken upper/lower
+        // classes); `caseRun` returns the end of exactly one such segment.
+        const isLM = struct {
+            fn f(cp: u21) bool {
+                return isLetter(cp) or isMark(cp);
+            }
+        }.f;
+        if (isLM(c0)) return caseRun(cps, i);
+        // prefix char: not CRLF, not letter, not number (space/punct qualify).
+        if (c0 != '\r' and c0 != '\n' and !isLetter(c0) and !isNumber(c0) and
+            i + 1 < n and isLM(cps[i + 1]))
+            return caseRun(cps, i + 1);
+
+        // 2: single number char.
+        if (isNumber(c0)) return i + 1;
+
+        // 3: optional space + punctuation run + trailing [\r\n/] run.
+        {
+            var j = i;
+            if (cps[j] == ' ') j += 1;
+            var k = j;
+            while (k < n and !isWs(cps[k]) and !isLetter(cps[k]) and !isNumber(cps[k])) k += 1;
+            if (k > j) {
+                while (k < n and (cps[k] == '\r' or cps[k] == '\n' or cps[k] == '/')) k += 1;
+                return k;
+            }
+        }
+
+        // 4-6: whitespace runs (identical to the qwen2 tail).
+        if (isWs(c0)) {
+            var e = i;
+            var last_rn: ?usize = null;
+            while (e < n and isWs(cps[e])) : (e += 1) {
+                if (cps[e] == '\r' or cps[e] == '\n') last_rn = e;
+            }
+            if (last_rn) |lr| return lr + 1; // \s*[\r\n]+
+            if (e == n) return e; // \s+(?!\S) at end of text
+            if (e - i >= 2) return e - 1; // \s+(?!\S) backs off one
+            return e; // \s+
+        }
+        return i + 1; // never loop forever
+    }
+
+    /// End (exclusive) of one tekken case-split letter segment starting at `s`
+    /// (`s` is a letter or mark). Consumes the maximal upper-class prefix, then
+    /// the following lower-class run — i.e. `U* L+`, falling back to `U+ L*`
+    /// when no lower-class char follows (an all-uppercase run). Ambiguous
+    /// letters (Lm/Lo/M) are in both classes and greedily join the upper prefix.
+    fn caseRun(cps: []const u21, s: usize) usize {
+        const n = cps.len;
+        var hi = s;
+        while (hi < n and isTekHi(cps[hi])) hi += 1; // greedy U*
+        // U* L+ : the char after the upper prefix (if any) is a pure-lowercase
+        // letter, so it opens the lower run; if instead the upper prefix ran to
+        // the segment boundary, this is the all-upper `U+ L*` case (lo == hi).
+        var lo = hi;
+        while (lo < n and isTekLo(cps[lo])) lo += 1;
+        return if (lo > hi) lo else hi;
     }
 
     /// Byte-level BPE of one pretoken; appends ids to `out`.
@@ -1510,6 +1610,33 @@ test "qwen3.6 gguf tokenizer matches llama-tokenize" {
     try expectEncode(&tok, "  leading and trailing  ", &.{ 220, 6187, 321, 26849, 256 });
     try expectEncode(&tok, "नमस्ते dost", &.{ 58069, 84237, 150104, 153348, 46704 });
     try expectEncode(&tok, "x… —dash", &.{ 87, 1873, 1892, 42080 });
+}
+
+// Golden ids from llama.cpp's `llama-tokenize --no-bos` on the same file
+// (gpt2 byte-level BPE, tokenizer.ggml.pre == "tekken"; Mistral-Nemo). Skipped
+// when absent. Exercises the tekken-specific pretokenizer: case-split letter
+// runs (iOS -> " i","OS"; camelCase -> "camel","Case"), single-digit numbers
+// (42.50 -> 4,2,.,5,0), no contractions ("don't" is not glued), and the '/'
+// punctuation tail ("/path").
+test "tekken gguf tokenizer matches llama-tokenize" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "/home/qt/genai/lmstudio/models/Impish_Bloodmoon_12B-ARM_HA_NL.gguf";
+    std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
+
+    var g = try gguf_mod.Gguf.open(gpa, io, path);
+    defer g.deinit();
+    var tok = try Tokenizer.initFromGguf(gpa, &g);
+    defer tok.deinit();
+
+    try std.testing.expectEqual(Pretok.tekken, tok.pretok);
+
+    try expectEncode(&tok, "Hello World! The iOS API costs $42.50, right? café_test/path", &.{
+        22177, 5325, 1033, 1531, 1623, 6964, 10523, 12889, 1659, 1052, 1050, 1046, 1053, 1048, 1044, 3169, 1063, 35858, 13683, 109366,
+    });
+    try expectEncode(&tok, "don't we'll I'M IT'S", &.{ 21797, 2405, 1729, 7534, 1362, 1039, 1077, 22784, 44161 });
+    try expectEncode(&tok, "camelCase HTTPRequest snake_case", &.{ 32587, 1299, 11139, 23733, 4967, 48726, 69982 });
+    try expectEncode(&tok, "  leading and trailing  ", &.{ 1032, 8924, 1321, 49875, 1256 });
 }
 
 // Golden ids from llama.cpp's llama-tokenize --no-bos on the same file

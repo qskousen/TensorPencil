@@ -260,14 +260,14 @@ pub const CudaLM = struct {
     };
 
     pub fn init(gpa: std.mem.Allocator, be: *Backend, lm: *const qwen3.CausalLM, cap: kvmod.Capacity, first_seq: usize) !CudaLM {
-        // Embedding/LM-head kernels exist for bf16 and the ggml block-quant
+        // Embedding/LM-head kernels exist for bf16, f16, and the ggml block-quant
         // formats (tied or untied head); anything else has no gather kernel.
         switch (lm.embed.dtype) {
-            .bf16, .q8_0, .q4_k, .q5_k, .q6_k => {},
+            .bf16, .f16, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl => {},
             else => return error.UnsupportedModelConfig,
         }
         switch (lm.head.dtype) {
-            .bf16, .q8_0, .q4_k, .q5_k, .q6_k => {},
+            .bf16, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl => {},
             else => return error.UnsupportedModelConfig,
         }
         const c = lm.cfg;
@@ -581,7 +581,7 @@ pub const CudaLM = struct {
         try be.graphLaunch(self.graph_exec);
         self.advance(1);
         // `null` leaves logits resident for the on-device argmax (stepArgmax).
-        if (logits) |l| try be.tensorDownload(offsetBufSized(self.bufs.logits, 0, qwen3.vocab_size * 4), std.mem.sliceAsBytes(l[0..qwen3.vocab_size]));
+        if (logits) |l| try be.tensorDownload(offsetBufSized(self.bufs.logits, 0, self.cfg.vocab * 4), std.mem.sliceAsBytes(l[0..self.cfg.vocab]));
     }
 
     fn captureDecodeGraph(self: *CudaLM) !void {
@@ -610,6 +610,8 @@ pub const CudaLM = struct {
         const x = offsetBufSized(self.bufs.x, 0, c.hidden * 4);
         if (self.lm.embed.dtype == .bf16) {
             try self.be.opEmbedGatherS(x, self.lm.embed.bytes, c.hidden);
+        } else if (self.lm.embed.dtype == .f16) {
+            try self.be.opEmbedGatherH(x, self.lm.embed.bytes, c.hidden);
         } else {
             try self.be.opEmbedGatherQuant(self.lm.embed.dtype, x, self.lm.embed.bytes, c.hidden);
         }
@@ -632,12 +634,14 @@ pub const CudaLM = struct {
                     if (l == tl) try be.opKvAppendS(self.tap_d, b.x, c.hidden, c.hidden, j * self.capacity * c.hidden, .f32);
                 }
             }
-            try be.qkNorm(b.x, b.normed, try nbuf(be, layer.input_norm), 1, c.hidden, eps);
+            try be.qkNorm(b.x, b.normed, try nbuf(be, layer.input_norm), 1, c.hidden, c.rms_eps);
             try self.linear(b.q, b.normed, layer.q, c.qDim(), c.hidden, 1);
             try self.linear(b.k, b.normed, layer.k, c.kvDim(), c.hidden, 1);
             try self.linear(b.v, b.normed, layer.v, c.kvDim(), c.hidden, 1);
-            try be.qkNorm(b.q, b.q, try nbuf(be, layer.q_norm), c.n_heads, hd, eps);
-            try be.qkNorm(b.k, b.k, try nbuf(be, layer.k_norm), c.n_kv_heads, hd, eps);
+            if (c.qk_norm) {
+                try be.qkNorm(b.q, b.q, try nbuf(be, layer.q_norm), c.n_heads, hd, c.rms_eps);
+                try be.qkNorm(b.k, b.k, try nbuf(be, layer.k_norm), c.n_kv_heads, hd, c.rms_eps);
+            }
             try be.opRopeHalfS(b.q, self.freqs_d, c.n_heads, half, self.sin_off);
             try be.opRopeHalfS(b.k, self.freqs_d, c.n_kv_heads, half, self.sin_off);
             const fmt = kvFmt(self.kv_dtype);
@@ -646,14 +650,14 @@ pub const CudaLM = struct {
             try be.opAttnDecodeSGraph(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, c.n_heads, c.n_kv_heads, hd, nsplit, attn_scale, fmt);
             try self.linear(b.t, b.attn, layer.o, c.hidden, c.qDim(), 1);
             try be.opAdd(b.x, b.t, c.hidden);
-            try be.qkNorm(b.x, b.normed, try nbuf(be, layer.post_norm), 1, c.hidden, eps);
+            try be.qkNorm(b.x, b.normed, try nbuf(be, layer.post_norm), 1, c.hidden, c.rms_eps);
             try self.linear(b.gate, b.normed, layer.gate, c.intermediate, c.hidden, 1);
             try self.linear(b.up, b.normed, layer.up, c.intermediate, c.hidden, 1);
             try be.siluMul(b.gate, b.up, c.intermediate);
             try self.linear(b.t, b.gate, layer.down, c.hidden, c.intermediate, 1);
             try be.opAdd(b.x, b.t, c.hidden);
         }
-        try be.qkNorm(offsetBufSized(b.x, 0, c.hidden * 4), b.t, try nbuf(be, self.lm.final_norm), 1, c.hidden, eps);
+        try be.qkNorm(offsetBufSized(b.x, 0, c.hidden * 4), b.t, try nbuf(be, self.lm.final_norm), 1, c.hidden, c.rms_eps);
         try self.lmHeadGemv(b.logits, b.t);
     }
 
@@ -662,9 +666,9 @@ pub const CudaLM = struct {
     /// engine-capped at spec_limits.max_draft + 1, which max_rows always covers.
     pub fn stepAll(self: *CudaLM, io: std.Io, ids: []const u32, logits: []f32) !void {
         self.io = io; // the CPU half of a hybrid split runs host matmuls through it
-        std.debug.assert(logits.len == ids.len * qwen3.vocab_size);
+        std.debug.assert(logits.len == ids.len * self.cfg.vocab);
         try self.forwardAll(ids);
-        try self.be.tensorDownload(offsetBufSized(self.bufs.logits, 0, ids.len * qwen3.vocab_size * 4), std.mem.sliceAsBytes(logits));
+        try self.be.tensorDownload(offsetBufSized(self.bufs.logits, 0, ids.len * self.cfg.vocab * 4), std.mem.sliceAsBytes(logits));
     }
 
     /// Batched verify forward that leaves the per-row logits resident in
@@ -681,7 +685,7 @@ pub const CudaLM = struct {
         // 4-input groups (each group reads the vocab x hidden weight once).
         // b.t is 128-row padded, so gemv_bf16n's 4-row reads stay in bounds.
         const h = self.cfg.hidden;
-        try be.qkNorm(b.x, b.t, try nbuf(be, self.lm.final_norm), seq, h, eps);
+        try be.qkNorm(b.x, b.t, try nbuf(be, self.lm.final_norm), seq, h, self.cfg.rms_eps);
         try self.lmHeadAll(b.logits, b.t, seq);
         try be.endBatch();
         self.advance(seq);
@@ -698,7 +702,7 @@ pub const CudaLM = struct {
         const be = self.be;
         const b = &self.bufs;
         for (0..ids.len) |r| {
-            try be.opArgmax(offsetBufSized(b.logits, r * qwen3.vocab_size * 4, qwen3.vocab_size * 4), qwen3.vocab_size, b.argmax_out, &b.argmax_v, &b.argmax_i);
+            try be.opArgmax(offsetBufSized(b.logits, r * self.cfg.vocab * 4, self.cfg.vocab * 4), self.cfg.vocab, b.argmax_out, &b.argmax_v, &b.argmax_i);
             var idf: [1]f32 = undefined;
             try be.tensorDownload(b.argmax_out, std.mem.sliceAsBytes(&idf));
             out_ids[r] = @intFromFloat(idf[0]);
@@ -1024,7 +1028,7 @@ pub const CudaLM = struct {
         const n = tokens.len;
         std.debug.assert(self.tree != null);
         std.debug.assert(n >= 1 and n <= spec_limits.max_tree_nodes and n <= self.max_rows);
-        std.debug.assert(parents.len == n and logits.len == n * qwen3.vocab_size);
+        std.debug.assert(parents.len == n and logits.len == n * self.cfg.vocab);
         const tb = &self.tree.?;
         const b = &self.bufs;
 
@@ -1072,12 +1076,14 @@ pub const CudaLM = struct {
                 }
             }
             // --- Attention ---
-            try be.qkNorm(b.x, b.normed, try nbuf(be, layer.input_norm), n, c.hidden, eps);
+            try be.qkNorm(b.x, b.normed, try nbuf(be, layer.input_norm), n, c.hidden, c.rms_eps);
             try self.linear(b.q, b.normed, layer.q, c.qDim(), c.hidden, n);
             try self.linear(b.k, b.normed, layer.k, c.kvDim(), c.hidden, n);
             try self.linear(b.v, b.normed, layer.v, c.kvDim(), c.hidden, n);
-            try be.qkNorm(b.q, b.q, try nbuf(be, layer.q_norm), n * c.n_heads, hd, eps);
-            try be.qkNorm(b.k, b.k, try nbuf(be, layer.k_norm), n * c.n_kv_heads, hd, eps);
+            if (c.qk_norm) {
+                try be.qkNorm(b.q, b.q, try nbuf(be, layer.q_norm), n * c.n_heads, hd, c.rms_eps);
+                try be.qkNorm(b.k, b.k, try nbuf(be, layer.k_norm), n * c.n_kv_heads, hd, c.rms_eps);
+            }
             try be.opRopeHalfPos(b.q, tb.pos, self.freqs_d, n, c.n_heads, half, self.sin_off);
             try be.opRopeHalfPos(b.k, tb.pos, self.freqs_d, n, c.n_kv_heads, half, self.sin_off);
             try be.tensorCopy(self.k_cache[l].buf, self.capacity * c.kvDim() * 4, b.k, 0, n * c.kvDim() * 4);
@@ -1087,7 +1093,7 @@ pub const CudaLM = struct {
             try be.opAdd(b.x, b.t, n * c.hidden);
 
             // --- MLP (SwiGLU) ---
-            try be.qkNorm(b.x, b.normed, try nbuf(be, layer.post_norm), n, c.hidden, eps);
+            try be.qkNorm(b.x, b.normed, try nbuf(be, layer.post_norm), n, c.hidden, c.rms_eps);
             try self.linear(b.gate, b.normed, layer.gate, c.intermediate, c.hidden, n);
             try self.linear(b.up, b.normed, layer.up, c.intermediate, c.hidden, n);
             try be.siluMul(b.gate, b.up, n * c.intermediate);
@@ -1098,12 +1104,12 @@ pub const CudaLM = struct {
         // Final norm on every node, then the tied bf16 LM head in 4-input
         // groups (b.t is 128-row padded, so the 4-row reads stay in bounds).
         const h = c.hidden;
-        try be.qkNorm(b.x, b.t, try nbuf(be, self.lm.final_norm), n, h, eps);
+        try be.qkNorm(b.x, b.t, try nbuf(be, self.lm.final_norm), n, h, c.rms_eps);
         try self.lmHeadAll(tb.logits, b.t, n);
         try be.endBatch();
         self.tree_n = n;
 
-        try be.tensorDownload(offsetBufSized(tb.logits, 0, n * qwen3.vocab_size * 4), std.mem.sliceAsBytes(logits));
+        try be.tensorDownload(offsetBufSized(tb.logits, 0, n * self.cfg.vocab * 4), std.mem.sliceAsBytes(logits));
     }
 
     /// Copy the accepted root path's K/V rows (and tap rows, when the
@@ -1144,13 +1150,13 @@ pub const CudaLM = struct {
 
         // Final norm on the last position + tied bf16 LM head, on device.
         const h = self.cfg.hidden;
-        try be.qkNorm(offsetBufSized(b.x, (seq - 1) * h * 4, h * 4), b.t, try nbuf(be, self.lm.final_norm), 1, h, eps);
+        try be.qkNorm(offsetBufSized(b.x, (seq - 1) * h * 4, h * 4), b.t, try nbuf(be, self.lm.final_norm), 1, h, self.cfg.rms_eps);
         try self.lmHeadGemv(b.logits, b.t);
         try be.endBatch();
         self.advance(seq);
 
         // `null` leaves logits resident for the on-device argmax (stepArgmax).
-        if (logits) |l| try be.tensorDownload(offsetBufSized(b.logits, 0, qwen3.vocab_size * 4), std.mem.sliceAsBytes(l[0..qwen3.vocab_size]));
+        if (logits) |l| try be.tensorDownload(offsetBufSized(b.logits, 0, self.cfg.vocab * 4), std.mem.sliceAsBytes(l[0..self.cfg.vocab]));
     }
 
     /// Greedy decode without the vocab download: forward `ids`, then argmax the
@@ -1185,8 +1191,8 @@ pub const CudaLM = struct {
     fn argmaxLogits(self: *CudaLM, pen: []const sample.PenaltyEntry, sp: sample.Params) !u32 {
         const be = self.be;
         const b = &self.bufs;
-        try be.opPenalize(offsetBufSized(b.logits, 0, qwen3.vocab_size * 4), pen, sp);
-        try be.opArgmax(offsetBufSized(b.logits, 0, qwen3.vocab_size * 4), qwen3.vocab_size, b.argmax_out, &b.argmax_v, &b.argmax_i);
+        try be.opPenalize(offsetBufSized(b.logits, 0, self.cfg.vocab * 4), pen, sp);
+        try be.opArgmax(offsetBufSized(b.logits, 0, self.cfg.vocab * 4), self.cfg.vocab, b.argmax_out, &b.argmax_v, &b.argmax_i);
         var id_f: [1]f32 = undefined;
         try be.tensorDownload(b.argmax_out, std.mem.sliceAsBytes(&id_f));
         return @intFromFloat(id_f[0]);
@@ -1224,8 +1230,8 @@ pub const CudaLM = struct {
         }
         const be = self.be;
         const b = &self.bufs;
-        try be.opPenalize(offsetBufSized(b.logits, 0, qwen3.vocab_size * 4), pen, sp);
-        const count = try be.opTopK(offsetBufSized(b.logits, 0, qwen3.vocab_size * 4), qwen3.vocab_size, &b.topk_v, &b.topk_i);
+        try be.opPenalize(offsetBufSized(b.logits, 0, self.cfg.vocab * 4), pen, sp);
+        const count = try be.opTopK(offsetBufSized(b.logits, 0, self.cfg.vocab * 4), self.cfg.vocab, &b.topk_v, &b.topk_i);
         std.debug.assert(count <= out_id.len and count <= out_logit.len);
         try be.tensorDownload(b.topk_v, std.mem.sliceAsBytes(out_logit[0..count]));
         var idx_f: [cuda.backend.topk_lanes * cuda.backend.topk_m]f32 = undefined;
@@ -1244,7 +1250,7 @@ pub const CudaLM = struct {
 
     pub fn normInput(self: *CudaLM, layer: anytype, seq: usize) !void {
         const c = self.cfg;
-        try self.be.qkNorm(self.bufs.x, self.bufs.normed, try nbuf(self.be, layer.input_norm), seq, c.hidden, eps);
+        try self.be.qkNorm(self.bufs.x, self.bufs.normed, try nbuf(self.be, layer.input_norm), seq, c.hidden, c.rms_eps);
     }
     pub fn projectQKV(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
         _ = l; // qwen3: uniform geometry
@@ -1257,9 +1263,10 @@ pub const CudaLM = struct {
     pub fn normQK(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {
         _ = l;
         const c = self.cfg;
+        if (!c.qk_norm) return; // llama/Mistral: no per-head QK-norm
         const b = &self.bufs;
-        try self.be.qkNorm(b.q, b.q, try nbuf(self.be, layer.q_norm), seq * c.n_heads, hd, eps);
-        try self.be.qkNorm(b.k, b.k, try nbuf(self.be, layer.k_norm), seq * c.n_kv_heads, hd, eps);
+        try self.be.qkNorm(b.q, b.q, try nbuf(self.be, layer.q_norm), seq * c.n_heads, hd, c.rms_eps);
+        try self.be.qkNorm(b.k, b.k, try nbuf(self.be, layer.k_norm), seq * c.n_kv_heads, hd, c.rms_eps);
     }
     pub fn applyRope(self: *CudaLM, l: usize, seq: usize, pos0: usize) !void {
         _ = l; // qwen3: single rope table for all layers
@@ -1317,7 +1324,7 @@ pub const CudaLM = struct {
     }
     pub fn normPreFfn(self: *CudaLM, layer: anytype, seq: usize) !void {
         const c = self.cfg;
-        try self.be.qkNorm(self.bufs.x, self.bufs.normed, try nbuf(self.be, layer.post_norm), seq, c.hidden, eps);
+        try self.be.qkNorm(self.bufs.x, self.bufs.normed, try nbuf(self.be, layer.post_norm), seq, c.hidden, c.rms_eps);
     }
     pub fn projectGateUp(self: *CudaLM, layer: anytype, seq: usize) !void {
         const c = self.cfg;
@@ -1376,7 +1383,11 @@ pub const CudaLM = struct {
                     }
                     const host_io = self.io orelse return error.SplitIoUnset;
                     var sv = sp.scratch.viewSeq(seq, c);
-                    try transformer.layerForward(transformer.qwen3_spec, .cached, host_io, gpa, layer, sp.hx[0 .. seq * c.hidden], seq, qwen3.dimsFor(c), sp.freqs, eps, &sp.cache, l, pos0, false, &sv);
+                    if (c.qk_norm) {
+                        try transformer.layerForward(transformer.qwen3_spec, .cached, host_io, gpa, layer, sp.hx[0 .. seq * c.hidden], seq, qwen3.dimsFor(c), sp.freqs, c.rms_eps, &sp.cache, l, pos0, false, &sv);
+                    } else {
+                        try transformer.layerForward(transformer.llama_spec, .cached, host_io, gpa, layer, sp.hx[0 .. seq * c.hidden], seq, qwen3.dimsFor(c), sp.freqs, c.rms_eps, &sp.cache, l, pos0, false, &sv);
+                    }
                     continue;
                 }
                 if (sp.on_host) {
@@ -1397,17 +1408,16 @@ pub const CudaLM = struct {
     }
 
     pub fn vocab(self: *const CudaLM) usize {
-        _ = self;
-        return qwen3.vocab_size;
+        return self.cfg.vocab;
     }
 
     /// LM head over one normed hidden row: y[vocab] = head @ x.
     fn lmHeadGemv(self: *CudaLM, y: Buf, x: Buf) !void {
         const head = self.lm.head;
         if (head.dtype.isBlockQuant()) {
-            try self.be.opGemvQuant(head.dtype, y, x, head.bytes, 1.0, qwen3.vocab_size, self.cfg.hidden);
+            try self.be.opGemvQuant(head.dtype, y, x, head.bytes, 1.0, self.cfg.vocab, self.cfg.hidden);
         } else {
-            try self.be.opGemvBf16(y, x, head.bytes, 1.0, qwen3.vocab_size, self.cfg.hidden);
+            try self.be.opGemvBf16(y, x, head.bytes, 1.0, self.cfg.vocab, self.cfg.hidden);
         }
     }
 
@@ -1418,15 +1428,16 @@ pub const CudaLM = struct {
         const be = self.be;
         const h = self.cfg.hidden;
         const head = self.lm.head;
+        const nvocab = self.cfg.vocab;
         if (head.dtype.isBlockQuant()) {
             for (0..seq) |i| {
                 try be.opGemvQuant(
                     head.dtype,
-                    offsetBufSized(y, i * qwen3.vocab_size * 4, qwen3.vocab_size * 4),
+                    offsetBufSized(y, i * nvocab * 4, nvocab * 4),
                     offsetBufSized(x, i * h * 4, h * 4),
                     head.bytes,
                     1.0,
-                    qwen3.vocab_size,
+                    nvocab,
                     h,
                 );
             }
@@ -1436,11 +1447,11 @@ pub const CudaLM = struct {
         while (off < seq) : (off += 4) {
             const n: usize = @min(4, seq - off); // annotated: @min would narrow to u3
             try be.opGemvBf16N(
-                offsetBufSized(y, off * qwen3.vocab_size * 4, n * qwen3.vocab_size * 4),
+                offsetBufSized(y, off * nvocab * 4, n * nvocab * 4),
                 offsetBufSized(x, off * h * 4, 4 * h * 4),
                 head.bytes,
                 1.0,
-                qwen3.vocab_size,
+                nvocab,
                 h,
                 n,
             );
@@ -1457,6 +1468,25 @@ pub const CudaLM = struct {
     /// tiny, so a dedicated GEMM path isn't worth it.
     fn linear(self: *CudaLM, y: Buf, x: Buf, w: ops.matmul.Weight, rows_out: usize, cols: usize, seq: usize) !void {
         const be = self.be;
+        if (w.dtype == .iq4_nl) {
+            // Decode (seq==1): fused f32 GEMV (full-precision activation). Prefill
+            // (seq>1): dequant the weight to f16 once and run the tensor-core GEMM
+            // (opMatmulQuant; all layer projections are rows%128==0). The untied
+            // vocab-row head never routes here — it goes through lmHead*.
+            //
+            // A dp4a mmvq variant (gemv_iq4_nl_q8n) was tried to close the ~6.4x
+            // decode gap to llama.cpp but measured IDENTICAL (~9.6s matmul/150 tok):
+            // both kernels stall at ~105 GB/s (11% of the 3090's peak) on the
+            // poorly-coalesced 18-byte IQ4_NL blocks, so the bottleneck is memory
+            // access / occupancy, not compute. Closing it needs an ncu-guided GEMV
+            // redesign, not a compute-kernel swap — see the memory note.
+            if (seq == 1) {
+                try be.opGemvQuant(w.dtype, y, x, w.bytes, w.scale, rows_out, cols);
+            } else {
+                try be.opMatmulQuant(w.dtype, y, x, seq, w.bytes, rows_out, cols);
+            }
+            return;
+        }
         if (w.dtype.isBlockQuant()) {
             // GGUF quants: fused GEMV for decode. For small batches (speculative
             // verify — always <= spec_limits.max_draft+1 = 17 — and short prefills), the

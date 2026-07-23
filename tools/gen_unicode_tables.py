@@ -1,6 +1,8 @@
 """Generate src/unicode_tables.zig: codepoint ranges for the character classes
-used by the Qwen2 pretokenizer regex (\\p{L}, \\p{N}, \\s), extracted from the
-`regex` module so they match transformers' slow tokenizer exactly.
+used by the Qwen2 pretokenizer regex (\\p{L}, \\p{N}, \\s) and the tekken /
+Mistral pretokenizer's case-split letter classes (\\p{Ll}, \\p{Lu}\\p{Lt}),
+extracted from the `regex` module so they match transformers' slow tokenizer
+exactly.
 
 Run with ComfyUI's venv python:
   ~/genai/comfyui/venv/bin/python tools/gen_unicode_tables.py > src/unicode_tables.zig
@@ -38,3 +40,8 @@ emit("letter_ranges", ranges_for(r"\p{L}"))
 emit("number_ranges", ranges_for(r"\p{N}"))
 emit("whitespace_ranges", ranges_for(r"\s"))
 emit("mark_ranges", ranges_for(r"\p{M}"))
+# tekken letter classes: lowercase \p{Ll} and upper/title [\p{Lu}\p{Lt}]. The
+# tekken "upper" class is M ∪ (L\Ll) and "lower" is M ∪ (L\(Lu∪Lt)), so the
+# tokenizer derives both from letter_ranges/mark_ranges minus these two.
+emit("lowercase_ranges", ranges_for(r"\p{Ll}"))
+emit("uppercase_ranges", ranges_for(r"[\p{Lu}\p{Lt}]"))

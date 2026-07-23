@@ -22,6 +22,7 @@ pub const newline_id: u32 = 198;
 /// Vocab-dependent template/stop ids. Defaults match the embedded Qwen3
 /// tokenizer; a GGUF-embedded tokenizer overrides them via applyTokenizer
 /// (process-global, like the tokenizer itself in tp-llm).
+pub var bos_token: ?u32 = null;
 pub var turn_end: u32 = tokenizer_mod.im_end;
 pub var pad: u32 = tokenizer_mod.pad_token;
 pub var newline: u32 = newline_id;
@@ -91,6 +92,9 @@ pub fn supportsThinking() bool {
 pub fn familyForArch(arch: []const u8) ?Family {
     if (std.mem.eql(u8, arch, "qwen3")) return .chatml;
     if (std.mem.eql(u8, arch, "qwen35")) return .chatml;
+    // Mistral-Nemo & the plain llama family ship a ChatML chat_template
+    // (<|im_start|>…<|im_end|>) and reuse the qwen3 stack (see qwen3.zig).
+    if (std.mem.eql(u8, arch, "llama")) return .chatml;
     if (std.mem.eql(u8, arch, "gemma3")) return .gemma;
     if (std.mem.eql(u8, arch, "gemma4")) return .gemma4;
     return null;
@@ -107,6 +111,15 @@ pub fn applyTokenizer(tok: *const Tokenizer) void {
     turn_end = tok.turn_end;
     pad = tok.pad;
     newline = tok.newline;
+    bos_token = tok.bos;
+}
+
+/// Prepend the model's BOS token when it wants one AND `out` is at the very
+/// start of the stream (Mistral/llama: `add_bos_token`; Qwen3/gemma: no-op).
+/// Called at the top of the first turn so BOS lands exactly once, before the
+/// first `<|im_start|>`.
+fn appendBosIfStart(gpa: std.mem.Allocator, out: *std.ArrayList(u32)) !void {
+    if (out.items.len == 0) if (bos_token) |b| try out.append(gpa, b);
 }
 
 pub fn isStop(id: u32) bool {
@@ -114,6 +127,7 @@ pub fn isStop(id: u32) bool {
 }
 
 pub fn appendSystem(tok: *const Tokenizer, gpa: std.mem.Allocator, text: []const u8, out: *std.ArrayList(u32)) !void {
+    try appendBosIfStart(gpa, out);
     switch (family) {
         .chatml => try appendTurn(tok, gpa, "system", text, out),
         .gemma => {
@@ -139,6 +153,7 @@ pub fn appendSystem(tok: *const Tokenizer, gpa: std.mem.Allocator, text: []const
 }
 
 pub fn appendUser(tok: *const Tokenizer, gpa: std.mem.Allocator, text: []const u8, out: *std.ArrayList(u32)) !void {
+    try appendBosIfStart(gpa, out);
     switch (family) {
         .chatml => try appendTurn(tok, gpa, "user", text, out),
         .gemma => {
@@ -171,6 +186,7 @@ pub const Segment = union(enum) {
 /// row index is appended to image_rows so the caller can interleave
 /// prefill() with prefillImage().
 pub fn appendUserSegments(tok: *const Tokenizer, gpa: std.mem.Allocator, segments: []const Segment, out: *std.ArrayList(u32), image_rows: *std.ArrayList(usize)) !void {
+    try appendBosIfStart(gpa, out);
     switch (family) {
         .gemma => {
             try tok.encode(gpa, "<start_of_turn>user\n", out);
@@ -384,7 +400,7 @@ test "arch→family mapping and family-scoped thinking probe (no global mutation
     try std.testing.expectEqual(@as(?Family, .chatml), familyForArch("qwen35"));
     try std.testing.expectEqual(@as(?Family, .gemma), familyForArch("gemma3"));
     try std.testing.expectEqual(@as(?Family, .gemma4), familyForArch("gemma4"));
-    try std.testing.expectEqual(@as(?Family, null), familyForArch("llama"));
+    try std.testing.expectEqual(@as(?Family, .chatml), familyForArch("llama"));
     try std.testing.expectEqual(@as(?Family, null), familyForArch(""));
 
     try std.testing.expect(familySupportsThinking(.chatml));

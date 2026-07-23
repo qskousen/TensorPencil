@@ -791,6 +791,77 @@ pub const gemv_q4_0_ptx: [:0]const u8 =
     \\}
 ;
 
+/// ggml IQ4_NL GEMV, warp-per-row (8 rows per 256-thread block; warp-shuffle
+/// reduction, no shared mem / bar.sync — same structure as gemv_q5_k/q6_k).
+/// Same block layout as q4_0 (f16 d + 16 nibble bytes, 32 elems) but the nibble
+/// maps through the non-linear codebook kvalues_iq4nl (a 16-entry .const LUT)
+/// instead of the affine (nibble - 8). Launch grid = ceil(rows/8).
+/// b0=W, b1=x, b2=y. u0=rows, u1=cols, f0=scale.
+pub const gemv_iq4_nl_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry gemv_iq4_nl(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<4>;
+    \\  .reg .b16 %h<2>;
+    \\  .reg .b32 %r<24>;
+    \\  .reg .f32 %f<16>;
+    \\  .reg .b64 %rd<22>;
+    \\  .shared .align 4 .b8 kvsh[16];         // kvalues_iq4nl LUT (shared: divergent
+    \\                                         // lookups parallelize, unlike const mem)
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r3,%tid.x;
+    \\  setp.ne.u32 %p1,%r3,0; @%p1 bra INITD; // thread 0 fills the shared LUT
+    \\  mov.u32 %r9,kvsh;
+    \\  mov.u32 %r10,0xBFAD9881; st.shared.u32 [%r9],%r10;      // kv0..3
+    \\  mov.u32 %r10,0xF6EADDCF; st.shared.u32 [%r9+4],%r10;    // kv4..7
+    \\  mov.u32 %r10,0x26190D01; st.shared.u32 [%r9+8],%r10;    // kv8..11
+    \\  mov.u32 %r10,0x71594535; st.shared.u32 [%r9+12],%r10;   // kv12..15
+    \\INITD:
+    \\  bar.sync 0;                            // all threads (before the bounds bail)
+    \\  shr.u32 %r5,%r3,5;                     // warp
+    \\  and.b32 %r6,%r3,31;                    // lane
+    \\  shl.b32 %r20,%r1,3; add.u32 %r7,%r20,%r5;          // row = ctaid*8 + warp
+    \\  ld.param.u32 %r2,[u0]; setp.ge.u32 %p1,%r7,%r2; @%p1 bra END;
+    \\  ld.param.u32 %r4,[u1];                 // cols
+    \\  ld.param.f32 %f1,[f0];                 // scale
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
+    \\  shr.u32 %r18,%r4,5; mul.lo.u32 %r19,%r18,18;       // row bytes = cols/32*18
+    \\  mul.wide.u32 %rd7,%r7,%r19; add.s64 %rd8,%rd1,%rd7; // W row base
+    \\  mov.f32 %f3,0f00000000;                // acc
+    \\  shr.u32 %r21,%r4,1;                    // nbytes = cols/2
+    \\  mov.u32 %r12,kvsh;                     // shared LUT base
+    \\  mov.u32 %r8,%r6;                       // g = lane
+    \\LOOP:
+    \\  setp.ge.u32 %p2,%r8,%r21; @%p2 bra RED;
+    \\  shr.u32 %r9,%r8,4;                     // block b = g/16
+    \\  mul.lo.u32 %r10,%r9,18; cvt.u64.u32 %rd9,%r10; add.s64 %rd10,%rd8,%rd9;  // &block
+    \\  ld.global.b16 %h0,[%rd10]; cvt.f32.f16 %f6,%h0;    // d
+    \\  and.b32 %r11,%r8,15;                   // jj
+    \\  cvt.u64.u32 %rd11,%r11; add.s64 %rd12,%rd10,%rd11; ld.global.u8 %r13,[%rd12+2];  // qs byte
+    \\  and.b32 %r14,%r13,15; add.u32 %r22,%r14,%r12; ld.shared.s8 %r14,[%r22]; cvt.rn.f32.s32 %f7,%r14; mul.f32 %f7,%f7,%f6;  // kv[lo]*d
+    \\  shr.u32 %r15,%r13,4; add.u32 %r22,%r15,%r12; ld.shared.s8 %r15,[%r22]; cvt.rn.f32.s32 %f8,%r15; mul.f32 %f8,%f8,%f6;   // kv[hi]*d
+    \\  shl.b32 %r16,%r9,5; add.u32 %r16,%r16,%r11;        // elo = b*32 + jj
+    \\  mul.wide.u32 %rd13,%r16,4; add.s64 %rd14,%rd2,%rd13; ld.global.f32 %f4,[%rd14];  // act_lo
+    \\  add.u32 %r17,%r16,16; mul.wide.u32 %rd15,%r17,4; add.s64 %rd16,%rd2,%rd15; ld.global.f32 %f5,[%rd16];  // act_hi
+    \\  fma.rn.f32 %f3,%f7,%f4,%f3; fma.rn.f32 %f3,%f8,%f5,%f3;
+    \\  add.u32 %r8,%r8,32; bra LOOP;
+    \\RED:
+    \\  mov.b32 %r22,%f3; shfl.sync.bfly.b32 %r23,%r22,16,0x1f,0xffffffff; mov.b32 %f9,%r23; add.f32 %f3,%f3,%f9;
+    \\  mov.b32 %r22,%f3; shfl.sync.bfly.b32 %r23,%r22,8,0x1f,0xffffffff;  mov.b32 %f9,%r23; add.f32 %f3,%f3,%f9;
+    \\  mov.b32 %r22,%f3; shfl.sync.bfly.b32 %r23,%r22,4,0x1f,0xffffffff;  mov.b32 %f9,%r23; add.f32 %f3,%f3,%f9;
+    \\  mov.b32 %r22,%f3; shfl.sync.bfly.b32 %r23,%r22,2,0x1f,0xffffffff;  mov.b32 %f9,%r23; add.f32 %f3,%f3,%f9;
+    \\  mov.b32 %r22,%f3; shfl.sync.bfly.b32 %r23,%r22,1,0x1f,0xffffffff;  mov.b32 %f9,%r23; add.f32 %f3,%f3,%f9;
+    \\  setp.ne.u32 %p3,%r6,0; @%p3 bra END;
+    \\  mul.f32 %f3,%f3,%f1;
+    \\  mul.wide.u32 %rd17,%r7,4; add.s64 %rd18,%rd3,%rd17; st.global.f32 [%rd18],%f3;
+    \\END:
+    \\  ret;
+    \\}
+;
+
 /// ggml q4_k GEMV: y[row] = scale * dot(W[row], x), W q4_k [rows][cols/256
 /// super-blocks of 144 B: f16 d, f16 dmin, 12 B 6-bit sub-block scales/mins,
 /// 128 B nibbles]. Phase 1 decodes every sub-block's (d*sc, dmin*m) pair
@@ -5067,6 +5138,44 @@ pub const dequant_q4_0_f16_ptx: [:0]const u8 =
     \\}
 ;
 
+/// IQ4_NL -> f16 dequant (prefill GEMM path): same block layout as q4_0, but
+/// the nibble maps through the non-linear kvalues_iq4nl LUT rather than the
+/// affine (q - 8). One thread per output element. b0=W(iq4_nl), b1=out(f16),
+/// u0=count.
+pub const dequant_iq4_nl_f16_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.const .align 1 .b8 kv_iq4nl[16] = {129,152,173,191,207,221,234,246,1,13,25,38,53,69,89,113};
+    \\.visible .entry dequant_iq4_nl_f16(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<3>;
+    \\  .reg .b32 %r<16>;
+    \\  .reg .f32 %f<4>;
+    \\  .reg .b16 %h<3>;
+    \\  .reg .b64 %rd<14>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2;
+    \\  shr.u32 %r6,%r4,5; mul.wide.u32 %rd4,%r6,18; add.s64 %rd5,%rd1,%rd4;   // &block
+    \\  ld.global.b16 %h0,[%rd5]; cvt.f32.f16 %f1,%h0;                         // d
+    \\  and.b32 %r7,%r4,31;                                                    // j
+    \\  setp.lt.u32 %p2,%r7,16;                                                // low nibble?
+    \\  sub.u32 %r9,%r7,16; selp.b32 %r8,%r7,%r9,%p2;                          // qs byte index
+    \\  cvt.u64.u32 %rd6,%r8; add.s64 %rd7,%rd5,%rd6;
+    \\  ld.global.u8 %r10,[%rd7+2];                                            // qs byte
+    \\  shr.u32 %r11,%r10,4; and.b32 %r12,%r10,15; selp.b32 %r13,%r12,%r11,%p2; // nibble
+    \\  mov.u64 %rd12,kv_iq4nl; cvt.u64.u32 %rd13,%r13; add.s64 %rd13,%rd12,%rd13; ld.const.s8 %r14,[%rd13]; cvt.rn.f32.s32 %f2,%r14;  // kv[nibble]
+    \\  mul.f32 %f3,%f2,%f1;
+    \\  cvt.rn.f16.f32 %h1,%f3;
+    \\  mul.wide.u32 %rd8,%r4,2; add.s64 %rd9,%rd2,%rd8; st.global.b16 [%rd9],%h1;
+    \\END:
+    \\  ret;
+    \\}
+;
+
 /// Dequantize ggml q4_k weights to f16: element e -> super-block e>>8 (144 B),
 /// sub-block scale/min via get_scale_min_k4, nibble from byte
 /// (j>>6)*32 + (j&31); out = f16(d*sc*q - dmin*m). cols % 256 == 0.
@@ -5426,6 +5535,28 @@ pub const decode_state_ptx: [:0]const u8 =
     \\  shl.b32 %r9,%r8,16; mov.b32 %f1,%r9;  // bf16 -> f32
     \\  mul.wide.u32 %rd5,%r4,4; add.s64 %rd6,%rd2,%rd5; st.global.f32 [%rd6],%f1;
     \\END:
+    \\  ret;
+    \\}
+    \\
+    \\// x[i] = f32(embed_f16[g_state[0]*hidden + i]); b0=embed(f16), b1=x, u0=hidden
+    \\.visible .entry embed_gather_h(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<2>;
+    \\  .reg .b16 %h<2>;
+    \\  .reg .b32 %r<12>;
+    \\  .reg .f32 %f<4>;
+    \\  .reg .b64 %rd<10>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra ENDH;
+    \\  ld.global.u32 %r6,[g_state];          // token id
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2;
+    \\  mad.lo.s32 %r7,%r6,%r5,%r4;           // elem = token*hidden + i
+    \\  mul.wide.u32 %rd3,%r7,2; add.s64 %rd4,%rd1,%rd3; ld.global.b16 %h0,[%rd4];
+    \\  cvt.f32.f16 %f1,%h0;                  // f16 -> f32
+    \\  mul.wide.u32 %rd5,%r4,4; add.s64 %rd6,%rd2,%rd5; st.global.f32 [%rd6],%f1;
+    \\ENDH:
     \\  ret;
     \\}
     \\

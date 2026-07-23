@@ -84,6 +84,39 @@ export fn transpose_bf16() callconv(.spirv_kernel) void {
     dst.w[(k * pc.stride + col_base) >> 1] = word;
 }
 
+/// Raw block-quant weight [rows][row_bytes] -> the 32-row-group byte-transposed
+/// layout the *_t GEMV / dequant kernels read: logical byte j of row `row` lands
+/// at (row/32)*row_bytes*32 + row%32 + j*32. A pure byte permutation (dequant-
+/// neutral), replacing weightBufferRawT's single-thread ~8 GiB CPU scatter with
+/// one device-bandwidth pass. One OUTPUT u32 per invocation, holding four
+/// CONSECUTIVE rows' byte j: a word's first dst byte starts at row%32 that is a
+/// multiple of 4 and j is constant across the 4 bytes, so they are exactly rows
+/// {base..base+3} at column j. Pad rows (>= `rows`) and the 4-byte tail contribute
+/// zero. rows = real rows, stride = row_bytes, cols = total output words (bound).
+export fn transpose_grp32() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.cols) return;
+    const row_bytes = pc.stride;
+    const group_bytes = row_bytes * 32;
+    const p0 = idx * 4; // first dst byte of this word
+    const group = p0 / group_bytes;
+    const local = p0 % group_bytes;
+    const j = local / 32; // logical byte within the row
+    const r0 = local % 32; // first row-in-group (multiple of 4)
+    const base_row = group * 32 + r0;
+    var out: u32 = 0;
+    inline for (0..4) |t| {
+        const row = base_row + t;
+        if (row < pc.rows) {
+            const q = row * row_bytes + j; // src byte index (row-major)
+            const byte = (src.w[q >> 2] >> @intCast((q & 3) * 8)) & 0xFF;
+            out |= byte << @intCast(8 * t);
+        }
+    }
+    dst.w[idx] = out;
+}
+
 /// One f32 element per invocation.
 export fn transpose_f32() callconv(.spirv_kernel) void {
     decorate();

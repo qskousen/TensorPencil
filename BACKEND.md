@@ -36,7 +36,7 @@ Legend: ✅ full · ⚠️ works but slow / limited · ❌ unsupported · — no
 | **LLM vision (ViT/mmproj)** | ✅ | ⚠️ gemma3 only | ✅ | ✅ | see §5 |
 | **GPU init failure** | — | → CPU fallback | → CPU fallback | → CPU fallback | logs + degrades, never hard-fails |
 
-¹ vulkan LLM excludes **gemma4** entirely and **rejects GGUF block-quant weights for qwen3** (see §4–§5).
+¹ vulkan LLM excludes **gemma4** entirely; qwen3 (incl. the llama/Mistral arch) runs GGUF block-quant weights on vulkan now — only a block-quant token *embedding* is rejected (no Vulkan gather kernel; see §4–§5).
 
 ---
 
@@ -98,12 +98,12 @@ Per-stage dispatch order everywhere is `if (cu_be)` → CUDA, `else if (gpu_ctx)
 
 | Model | cpu | vulkan | zig-cuda | cuda | Files | Notes |
 |---|---|---|---|---|---|---|
-| **qwen3** (Qwen3 / Qwen3-VL) | ✅ | ✅¹ | ✅ | ✅ | `qwen3{,_gpu,_cuda}.zig` | only arch with spec decode; primary path fp8 safetensors; GGUF metadata config-detect up to 64 layers (Qwen3-32B); hybrid CPU split like qwen35 (32B: offload measured ~1.7x over the removed streaming path at equal budget) |
+| **qwen3** (Qwen3 / Qwen3-VL / llama-arch Mistral-Nemo) | ✅ | ✅¹ | ✅ | ✅ | `qwen3{,_gpu,_cuda}.zig` | only arch with spec decode; primary path fp8 safetensors; GGUF metadata config-detect up to 64 layers (Qwen3-32B); the generalized `llama`/Mistral arch (un-permuted q/k, optional QK-norm, untied head, runtime vocab/eps) shares this stepper; hybrid CPU split like qwen35 (32B: offload measured ~1.7x over the removed streaming path at equal budget) |
 | **qwen35** (hybrid DeltaNet: GDN+attn) | ✅ | ✅ | ✅ | ✅ | `qwen35{,_gpu,_cuda}.zig` | GGUF block-quant on vulkan too; no spec (recurrent state) |
 | **gemma3** (sandwich norms, dual RoPE) | ✅ | ✅ | ✅ | ✅ | `gemma3{,_gpu,_cuda}.zig` | entirely GGUF block-quant |
 | **gemma4** (per-layer geom, factored RoPE) | ✅ | ❌² | ✅ | ✅ | `gemma4{,_cuda}.zig` | `--backend vulkan` rejected; hybrid CPU split like gemma3 (GUI-driven; per-layer-KV host shadow keeps the device ring layout). Config is fully metadata-driven: 12B (Q4_0, 48L) **and 31B** (mixed Q4_K/Q6_K + tied Q6_K head, 60L, hidden 5376, kv 16↔4) both load with no code change; vision via `gemma4uv`/`gemma4v` towers (see §5) |
 
-¹ **qwen3 on vulkan rejects GGUF block-quant** (`llm_main.zig`): dense fp8/bf16/f32 only. bf16 weights are read **natively** (2-byte, `transpose_bf16`/`pipe_tr_bf16` + a bf16 branch in `gemv_partial`/`gemv_partial4`, weight code `context.WCode.bf16`), like CUDA's `gemv_bf16` — no widening, weights stay 8GB. bf16 has no tiled GEMM so prefill streams through grouped GEMV. Generation is coherent (4B ~32 tok/s) but not token-identical to CPU (GEMV reduction-order drift).
+¹ **qwen3 on vulkan** (`qwen3_gpu.zig VulkanLM`, config-driven) runs both regimes. **Dense** (fp8/bf16/f32, tied head — the Qwen3-VL text encoders): batched square-attention prefill + spec decode; bf16 weights read **natively** (2-byte, `transpose_bf16`/`pipe_tr_bf16` + a bf16 branch in `gemv_partial`/`gemv_partial4`, weight code `context.WCode.bf16`), like CUDA's `gemv_bf16` — no widening, weights stay 8GB; bf16 has no tiled GEMM so prefill streams through grouped GEMV. Generation is coherent (4B ~32 tok/s) but not token-identical to CPU (GEMV reduction-order drift). **GGUF block-quant** (q8_0/q4_k/q5_k/q6_k/iq4_nl layers + untied block-quant head — the `llama`/Mistral arch, e.g. Mistral-Nemo IQ4_NL): **decode** is the per-row fused-dequant GEMV (`gemvW` → `opGemvQuantT`); **prefill of the fresh prompt** runs the tensor-core GEMM — `opMatmulCoopQuant` dequants each weight to f16 k-major on the GPU (`dequant_{fmt}_f32` reading the resident 32-row-group transposed weight → `pack_h16_kmajor`), reusing the existing f16-weight coopmat GEMM (`coopF16WDispatch`), so the whole prompt prefills in one batched pass instead of a forward per token (**~350× faster prefill on a 3090: a 411-token prompt went 39 s → ~0.1 s of marginal prefill**; measured token-identical output). The f16 weight is re-dequanted each prefill into one reused scratch (the f16 form is 4× the block-quant size and won't all fit resident); decode and short follow-up turns stay on the exact GEMV. Falls back to per-token GEMV when the device lacks the f16 coopmat pipeline. QK-norm is skipped (`cfg.qk_norm=false`); the F16 embedding is host-gathered to f32 like the dense path. Validated token-identical to CPU/llama.cpp on the constrained sequence prompt. **Only a block-quant token embedding is still rejected** (`llm_main.zig`) — there is no Vulkan block-quant gather kernel, so it needs an f16/bf16 embed table.
 ² No `gemma4_gpu.zig`; `Spec.Vulkan = void`.
 
 ---
@@ -183,7 +183,7 @@ The hybrid CPU/GPU split works with **every KV dtype** (`--kv-dtype f32|f16|q8_0
 
 ## 7. Data-format support matrix
 
-DType enum: `src/dtype.zig:11` — `f8_e4m3, f16, bf16, f32, i8, i4, q4_0, q8_0, q4_k, q5_k, q6_k`.
+DType enum: `src/dtype.zig:11` — `f8_e4m3, f16, bf16, f32, i8, i4, q4_0, q8_0, q4_k, q5_k, q6_k, iq4_nl`.
 (`i8`/`i4` are the ComfyUI "convrot" formats for the **image/DiT** path; GGUF `q*` are the **LLM** path.)
 
 | Format | cpu | vulkan | zig-cuda | cuda | How it computes |
@@ -199,6 +199,7 @@ DType enum: `src/dtype.zig:11` — `f8_e4m3, f16, bf16, f32, i8, i4, q4_0, q8_0,
 | **GGUF q4_k** | ✅ ggml | ✅ `gemv_q4_k`/`_t` (scalar) | ✅ `gemv_q4_k(_q8n)` | ⤷ dequant→f16 | — |
 | **GGUF q5_k** | ✅ ggml | ✅ `gemv_q5_k`/`_t` (scalar) | ✅ `gemv_q5_k(_q8/_q8n)` | ⤷ dequant→f16 | — |
 | **GGUF q6_k** | ✅ ggml | ✅ `gemv_q6_k`/`_t` (scalar) | ✅ `gemv_q6_k(_q8/_q8n)` | ⤷ dequant→f16 | — |
+| **GGUF iq4_nl** | ✅ ggml | ✅ `gemv_iq4_nl`/`_t` (scalar, module-const LUT) | ✅ `gemv_iq4_nl` (shared-mem LUT), `dequant_iq4_nl_f16` | ⤷ dequant→f16 | 32 elems / 18 B; non-linear `kvalues_iq4nl` LUT |
 
 Notes:
 - **int4 / W4A4 is CUDA-hand-PTX-only** (`s4 m16n8k64` tensor cores). CPU has a correctness path; Vulkan and cuBLASLt cannot do sint4.

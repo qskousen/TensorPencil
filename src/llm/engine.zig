@@ -440,8 +440,7 @@ pub const CpuModel = struct {
     }
 
     pub fn vocab(self: *const CpuModel) usize {
-        _ = self;
-        return qwen3.vocab_size;
+        return self.lm.cfg.vocab;
     }
 
     pub fn step(self: *CpuModel, io: std.Io, ids_new: []const u32, logits: []f32) !void {
@@ -453,7 +452,7 @@ pub const CpuModel = struct {
     /// row-major) — the speculative-decode verify forward.
     pub fn stepAll(self: *CpuModel, io: std.Io, ids_new: []const u32, logits: []f32) !void {
         const n = ids_new.len;
-        std.debug.assert(logits.len == n * qwen3.vocab_size);
+        std.debug.assert(logits.len == n * self.lm.cfg.vocab);
         const hid = try self.gpa.alloc(f32, n * self.lm.cfg.hidden);
         defer self.gpa.free(hid);
         try self.lm.forwardCached(io, self.gpa, ids_new, &self.cache, self.rope.get(0), hid);
@@ -471,7 +470,7 @@ pub const CpuModel = struct {
         const cfg = self.lm.cfg;
         const n = tokens.len;
         std.debug.assert(n >= 1 and n <= spec.max_tree_nodes);
-        std.debug.assert(logits.len == n * qwen3.vocab_size);
+        std.debug.assert(logits.len == n * self.lm.cfg.vocab);
         if (self.tree_k == null) {
             self.tree_k = try self.gpa.alloc(f32, cfg.n_layers * spec.max_tree_nodes * cfg.kvDim());
             self.tree_v = try self.gpa.alloc(f32, cfg.n_layers * spec.max_tree_nodes * cfg.kvDim());

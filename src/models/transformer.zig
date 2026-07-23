@@ -40,9 +40,16 @@ pub const LayerSpec = struct {
     /// Attention score scale; null = 1/sqrt(head_dim). Gemma4 folds the scale
     /// into its QK norms and passes 1.0.
     attn_scale: ?f32 = null,
+    /// Per-head QK RMS-norm before RoPE (qwen3/gemma). false for the plain
+    /// llama/Mistral family, which has no q_norm/k_norm tensors — those layer
+    /// fields go unread, so the arch's Layer struct may leave them empty.
+    qk_norm: bool = true,
 };
 
 pub const qwen3_spec: LayerSpec = .{ .activation = .silu_mul };
+/// llama/Mistral: SwiGLU, no QK-norm. (RoPE is made rotate-half-compatible by
+/// un-permuting q/k weights at load — see qwen3.loadLayersCfg.)
+pub const llama_spec: LayerSpec = .{ .activation = .silu_mul, .qk_norm = false };
 pub const gemma3_spec: LayerSpec = .{ .activation = .gelu_tanh_mul, .sandwich_norms = true };
 pub const gemma4_spec: LayerSpec = .{
     .activation = .gelu_tanh_mul,
@@ -116,8 +123,10 @@ fn qkvProject(comptime spec: LayerSpec, io: std.Io, gpa: std.mem.Allocator, laye
     } else {
         try ops.matmul.matmul(io, gpa, v, normed, seq, layer.v, null);
     }
-    ops.norm.rmsNorm(q, q, layer.q_norm, eps); // per-head: rows of head_dim
-    ops.norm.rmsNorm(k, k, layer.k_norm, eps);
+    if (comptime spec.qk_norm) {
+        ops.norm.rmsNorm(q, q, layer.q_norm, eps); // per-head: rows of head_dim
+        ops.norm.rmsNorm(k, k, layer.k_norm, eps);
+    }
     if (comptime spec.v_norm_unit) ops.norm.rmsNormUnit(v, v, dims.head_dim, eps);
     return .{ .q = q, .k = k, .v = v };
 }

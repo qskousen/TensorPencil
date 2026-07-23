@@ -39,6 +39,7 @@ pub const DType = enum {
     q4_k, // 256 elems / 144 B: f16 d + f16 dmin + 12 B 6-bit scales/mins + 128 B nibbles
     q5_k, // 256 elems / 176 B: q4_k + 32 B high bits
     q6_k, // 256 elems / 210 B: 128 B low nibbles + 64 B high 2-bits + 16 x i8 scales + f16 d
+    iq4_nl, // 32 elems / 18 B: f16 d + 16 B nibbles; v = d * kvalues_iq4nl[nibble] (non-linear LUT)
 
     const name_table = .{
         .{ "F8_E4M3", DType.f8_e4m3 },
@@ -93,6 +94,7 @@ pub const DType = enum {
             .q4_k => .{ .byte_size = null, .bit_size = null, .block_elems = 256, .block_bytes = 144 },
             .q5_k => .{ .byte_size = null, .bit_size = null, .block_elems = 256, .block_bytes = 176 },
             .q6_k => .{ .byte_size = null, .bit_size = null, .block_elems = 256, .block_bytes = 210 },
+            .iq4_nl => .{ .byte_size = null, .bit_size = null, .block_elems = 32, .block_bytes = 18 },
         };
     }
 

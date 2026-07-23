@@ -1,5 +1,7 @@
-- pause button
+- there is something subtly wrong with gemma 4, the thinking doesn't seem to work consistently and after a few turns it starts to break
 - pause / cancel during prefill
+- can't pause right after starting when nothing is loaded
+- keep preview image after resuming?
 - i'm pretty sure the meter is reporting some vram under "system" for diffusion
 - can't switch to image studio while diffusing
 - regenerate reply option disappears when model is unloaded

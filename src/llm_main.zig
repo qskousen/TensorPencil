@@ -359,8 +359,12 @@ fn runQwen3(
     var opts = opts_in;
     var lm = try qwen3.CausalLM.load(arena, st.store());
     defer lm.deinit();
-    if (backend == .vulkan and lm.hasBlockQuantWeights()) {
-        try stdout.writeAll("GGUF block-quantized weights (Q8_0/Q4_K/Q5_K/Q6_K) run on cpu / zig-cuda / cuda only for now\n");
+    // Vulkan runs block-quant layer weights + an untied block-quant head
+    // (per-row fused-dequant GEMV, VulkanLM.gemvW), but the token embedding is
+    // host-gathered into an f32 copy — there is no Vulkan block-quant gather
+    // kernel, so a block-quant embedding still needs cpu / zig-cuda / cuda.
+    if (backend == .vulkan and lm.embed.dtype.isBlockQuant()) {
+        try stdout.writeAll("A GGUF checkpoint with a block-quantized token embedding runs on cpu / zig-cuda / cuda only (Vulkan needs an f16/bf16 embed table)\n");
         try stdout.flush();
         return error.InvalidArgument;
     }
@@ -450,7 +454,7 @@ fn runQwen3(
         if (max_context_arg == null) {
             const free = ctx.liveVram();
             const weight_est: u64 = if (st.mapping()) |m| m.len else 0;
-            const per_tok = TensorPencil.models.qwen3_gpu.VulkanLM.kvWindowBytes(1);
+            const per_tok = TensorPencil.models.qwen3_gpu.VulkanLM.kvWindowBytes(lm.cfg, 1);
             const avail = free -| weight_est -| (2 << 30); // activations + freqs + margin
             const trained = @min(trainedContext(st), auto_context_cap);
             opts.max_context = std.math.clamp(avail / per_tok, 4096, trained);

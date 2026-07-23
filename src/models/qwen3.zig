@@ -69,9 +69,11 @@ pub fn dimsFor(cfg: Config) transformer.Dims {
 
 /// Runtime model configuration for `CausalLM` — the extension point for
 /// other Qwen3-family checkpoints (LLM_PLAN.md M5 uses Qwen3-0.6B as the
-/// speculative-decoding draft model). All checkpoints share head_dim 128
-/// (the flash-decoding kernels require it), rms_eps 1e-6, a tied bf16 LM
-/// head, and the 151936-token vocab; everything else varies.
+/// speculative-decoding draft model) AND the plain llama/Mistral family
+/// (which is structurally identical once q/k are un-permuted at load — see
+/// `qk_norm`/`permute_qk`). All checkpoints share head_dim 128 (the
+/// flash-decoding kernels require it) and rms_eps 1e-6; everything else
+/// (incl. vocab size and whether QK-norm is present) varies.
 pub const Config = struct {
     n_layers: usize,
     hidden: usize,
@@ -81,6 +83,19 @@ pub const Config = struct {
     rope_theta: f64,
     /// Tensor-name prefix up to "layers.N." / "embed_tokens." / "norm.".
     prefix: []const u8,
+    /// LM-head / embedding row count (default: the embedded-Qwen3 vocab).
+    /// llama/Mistral checkpoints carry their own (e.g. Mistral-Nemo 131074).
+    vocab: usize = vocab_size,
+    /// Per-head QK RMS-norm before RoPE (qwen3). false for llama/Mistral.
+    qk_norm: bool = true,
+    /// Un-permute q/k weight rows at load so the stored ggml "NORM"
+    /// (interleaved) RoPE layout matches our rotate-half RoPE. Only the
+    /// llama/Mistral family (LLAMA_ROPE_TYPE_NORM) needs it; qwen3 is NEOX
+    /// (rotate-half) and stores q/k unpermuted.
+    permute_qk: bool = false,
+    /// RMSNorm epsilon (qwen3 = 1e-6; Mistral-Nemo = 1e-5). Read from
+    /// `<arch>.attention.layer_norm_rms_epsilon` for GGUF checkpoints.
+    rms_eps: f32 = rms_eps,
 
     pub fn qDim(self: Config) usize {
         return self.n_heads * head_dim;
@@ -141,26 +156,43 @@ pub const Config = struct {
     }
 
     fn detectGguf(g: *const gguf_mod.Gguf) !Config {
-        if (g.getStr("general.architecture")) |arch| {
-            if (!std.mem.eql(u8, arch, "qwen3")) return error.UnknownModelConfig;
-        }
-        // Full llama.cpp metadata: build the config from the qwen3.* keys.
-        if (g.getUint("qwen3.block_count")) |block_count| {
+        const arch = g.getStr("general.architecture") orelse "qwen3";
+        // The plain llama/Mistral family (Mistral-Nemo etc.) reuses this whole
+        // stack: it is qwen3 minus per-head QK-norm, plus a checkpoint-carried
+        // vocab and NORM-rope q/k (un-permuted at load). All its hyperparameters
+        // live under the `llama.*` metadata prefix.
+        const is_llama = std.mem.eql(u8, arch, "llama");
+        if (!is_llama and !std.mem.eql(u8, arch, "qwen3")) return error.UnknownModelConfig;
+        const p = if (is_llama) "llama" else "qwen3";
+
+        // Full llama.cpp metadata: build the config from the <arch>.* keys.
+        var kbuf: [64]u8 = undefined;
+        const key = struct {
+            fn f(buf: []u8, pfx: []const u8, suffix: []const u8) []const u8 {
+                return std.fmt.bufPrint(buf, "{s}.{s}", .{ pfx, suffix }) catch unreachable;
+            }
+        }.f;
+        if (g.getUint(key(&kbuf, p, "block_count"))) |block_count| {
             if (block_count == 0 or block_count > max_layers) return error.UnknownModelConfig;
             // head_dim is a kernel invariant, not configurable.
-            if ((g.getUint("qwen3.attention.key_length") orelse head_dim) != head_dim or
-                (g.getUint("qwen3.attention.value_length") orelse head_dim) != head_dim)
+            if ((g.getUint(key(&kbuf, p, "attention.key_length")) orelse head_dim) != head_dim or
+                (g.getUint(key(&kbuf, p, "attention.value_length")) orelse head_dim) != head_dim)
                 return error.UnknownModelConfig;
             return .{
                 .n_layers = @intCast(block_count),
-                .hidden = @intCast(g.getUint("qwen3.embedding_length") orelse return error.UnknownModelConfig),
-                .n_heads = @intCast(g.getUint("qwen3.attention.head_count") orelse return error.UnknownModelConfig),
-                .n_kv_heads = @intCast(g.getUint("qwen3.attention.head_count_kv") orelse return error.UnknownModelConfig),
-                .intermediate = @intCast(g.getUint("qwen3.feed_forward_length") orelse return error.UnknownModelConfig),
-                .rope_theta = g.getFloat("qwen3.rope.freq_base") orelse 1e6,
+                .hidden = @intCast(g.getUint(key(&kbuf, p, "embedding_length")) orelse return error.UnknownModelConfig),
+                .n_heads = @intCast(g.getUint(key(&kbuf, p, "attention.head_count")) orelse return error.UnknownModelConfig),
+                .n_kv_heads = @intCast(g.getUint(key(&kbuf, p, "attention.head_count_kv")) orelse return error.UnknownModelConfig),
+                .intermediate = @intCast(g.getUint(key(&kbuf, p, "feed_forward_length")) orelse return error.UnknownModelConfig),
+                .rope_theta = g.getFloat(key(&kbuf, p, "rope.freq_base")) orelse 1e6,
                 .prefix = "",
+                .vocab = @intCast(g.getUint(key(&kbuf, p, "vocab_size")) orelse vocab_size),
+                .qk_norm = !is_llama,
+                .permute_qk = is_llama,
+                .rms_eps = if (g.getFloat(key(&kbuf, p, "attention.layer_norm_rms_epsilon"))) |e| @floatCast(e) else rms_eps,
             };
         }
+        if (is_llama) return error.UnknownModelConfig; // llama needs full metadata
         // Hyperparameter-less GGUF (ComfyUI-style conversion, bare HF names,
         // at most an architecture tag): match a plain-Qwen3 preset by
         // embedding shape. rope_theta is unrecoverable, so a VL-derived
@@ -306,16 +338,16 @@ pub const CausalLM = struct {
         var buf: [96]u8 = undefined;
         const embed_view = try store.require(try std.fmt.bufPrint(&buf, "{s}embed_tokens.weight", .{cfg.prefix}));
         const eshape = embed_view.info.shape.slice();
-        if (eshape.len != 2 or eshape[0] != vocab_size or eshape[1] != cfg.hidden)
+        if (eshape.len != 2 or eshape[0] != cfg.vocab or eshape[1] != cfg.hidden)
             return error.ShapeMismatch;
-        const embed = Weight.init(embed_view.bytes, embed_view.info.dtype, vocab_size, cfg.hidden);
+        const embed = Weight.init(embed_view.bytes, embed_view.info.dtype, cfg.vocab, cfg.hidden);
 
         var head = embed;
         if (store.get(try std.fmt.bufPrint(&buf, "{s}lm_head.weight", .{cfg.prefix}))) |hv| {
             const hshape = hv.info.shape.slice();
-            if (hshape.len != 2 or hshape[0] != vocab_size or hshape[1] != cfg.hidden)
+            if (hshape.len != 2 or hshape[0] != cfg.vocab or hshape[1] != cfg.hidden)
                 return error.ShapeMismatch;
-            head = Weight.init(hv.bytes, hv.info.dtype, vocab_size, cfg.hidden);
+            head = Weight.init(hv.bytes, hv.info.dtype, cfg.vocab, cfg.hidden);
         }
 
         const layers = try loadLayersCfg(alloc, store, cfg, cfg.n_layers);
@@ -376,14 +408,18 @@ pub const CausalLM = struct {
         const dims = dimsFor(cfg);
         const pos0 = cache.len;
         for (self.layers, 0..) |layer, l| {
-            try transformer.layerForward(transformer.qwen3_spec, .cached, io, gpa, layer, x, seq, dims, freqs, rms_eps, cache, l, pos0, false, &scratch);
+            if (cfg.qk_norm) {
+                try transformer.layerForward(transformer.qwen3_spec, .cached, io, gpa, layer, x, seq, dims, freqs, cfg.rms_eps, cache, l, pos0, false, &scratch);
+            } else {
+                try transformer.layerForward(transformer.llama_spec, .cached, io, gpa, layer, x, seq, dims, freqs, cfg.rms_eps, cache, l, pos0, false, &scratch);
+            }
         }
         cache.commit(seq);
         if (out) |o| {
             std.debug.assert(o.len % cfg.hidden == 0);
             const n = o.len / cfg.hidden;
             std.debug.assert(n >= 1 and n <= seq);
-            ops.norm.rmsNorm(o, x[(seq - n) * cfg.hidden ..][0 .. n * cfg.hidden], self.final_norm, rms_eps);
+            ops.norm.rmsNorm(o, x[(seq - n) * cfg.hidden ..][0 .. n * cfg.hidden], self.final_norm, cfg.rms_eps);
         }
     }
 
@@ -432,9 +468,13 @@ pub const CausalLM = struct {
 
         const dims = dimsFor(cfg);
         for (self.layers, 0..) |layer, l| {
-            try transformer.layerForwardTree(transformer.qwen3_spec, io, gpa, layer, x, n, dims, freqs, positions, parents, cache, l, tree_k, tree_v, rms_eps, &s);
+            if (cfg.qk_norm) {
+                try transformer.layerForwardTree(transformer.qwen3_spec, io, gpa, layer, x, n, dims, freqs, positions, parents, cache, l, tree_k, tree_v, cfg.rms_eps, &s);
+            } else {
+                try transformer.layerForwardTree(transformer.llama_spec, io, gpa, layer, x, n, dims, freqs, positions, parents, cache, l, tree_k, tree_v, cfg.rms_eps, &s);
+            }
         }
-        ops.norm.rmsNorm(out, x, self.final_norm, rms_eps);
+        ops.norm.rmsNorm(out, x, self.final_norm, cfg.rms_eps);
     }
 };
 
@@ -525,12 +565,14 @@ fn loadLayersCfg(alloc: std.mem.Allocator, store: WeightStore, cfg: Config, coun
     for (layers, 0..) |*layer, i| {
         layer.* = .{
             .input_norm = try loadNorm(alloc, store, cfg, i, "input_layernorm.weight", cfg.hidden),
-            .q = try loadWeight(store, cfg, i, "self_attn.q_proj.weight", cfg.qDim(), cfg.hidden),
-            .k = try loadWeight(store, cfg, i, "self_attn.k_proj.weight", cfg.kvDim(), cfg.hidden),
+            .q = try loadQK(alloc, store, cfg, i, "self_attn.q_proj.weight", cfg.n_heads),
+            .k = try loadQK(alloc, store, cfg, i, "self_attn.k_proj.weight", cfg.n_kv_heads),
             .v = try loadWeight(store, cfg, i, "self_attn.v_proj.weight", cfg.kvDim(), cfg.hidden),
             .o = try loadWeight(store, cfg, i, "self_attn.o_proj.weight", cfg.hidden, cfg.qDim()),
-            .q_norm = try loadNorm(alloc, store, cfg, i, "self_attn.q_norm.weight", head_dim),
-            .k_norm = try loadNorm(alloc, store, cfg, i, "self_attn.k_norm.weight", head_dim),
+            // llama/Mistral has no per-head QK-norm; leave the slices empty
+            // (the llama LayerSpec never reads them — see transformer.qkvProject).
+            .q_norm = if (cfg.qk_norm) try loadNorm(alloc, store, cfg, i, "self_attn.q_norm.weight", head_dim) else &.{},
+            .k_norm = if (cfg.qk_norm) try loadNorm(alloc, store, cfg, i, "self_attn.k_norm.weight", head_dim) else &.{},
             .post_norm = try loadNorm(alloc, store, cfg, i, "post_attention_layernorm.weight", cfg.hidden),
             .gate = try loadWeight(store, cfg, i, "mlp.gate_proj.weight", cfg.intermediate, cfg.hidden),
             .up = try loadWeight(store, cfg, i, "mlp.up_proj.weight", cfg.intermediate, cfg.hidden),
@@ -538,6 +580,30 @@ fn loadLayersCfg(alloc: std.mem.Allocator, store: WeightStore, cfg: Config, coun
         };
     }
     return layers;
+}
+
+/// Load a Q or K projection, un-permuting its output rows when `cfg.permute_qk`
+/// (llama/Mistral) so the stored ggml "NORM" (interleaved) RoPE layout matches
+/// our rotate-half RoPE. llama.cpp's converter permutes each head's head_dim
+/// rows as `permuted[2*i+g] = hf[g*(hd/2)+i]`; we invert that. Rows are whole
+/// block-quant rows, so the un-permute is a byte-level row shuffle into `alloc`.
+fn loadQK(alloc: std.mem.Allocator, store: WeightStore, cfg: Config, layer: usize, comptime suffix: []const u8, n_head_rows: usize) !Weight {
+    var w = try loadWeight(store, cfg, layer, suffix, n_head_rows * head_dim, cfg.hidden);
+    if (!cfg.permute_qk) return w;
+    const rb = w.dtype.storageBytes(cfg.hidden); // bytes per output row
+    const dst = try alloc.alloc(u8, n_head_rows * head_dim * rb);
+    const half = head_dim / 2;
+    for (0..n_head_rows) |h| {
+        for (0..head_dim) |d| {
+            const g = d / half; // 0 = first half, 1 = second half
+            const idx = d % half;
+            const src_row = h * head_dim + (2 * idx + g);
+            const dst_row = h * head_dim + d;
+            @memcpy(dst[dst_row * rb ..][0..rb], w.bytes[src_row * rb ..][0..rb]);
+        }
+    }
+    w.bytes = dst;
+    return w;
 }
 
 fn loadNorm(alloc: std.mem.Allocator, store: WeightStore, cfg: Config, layer: usize, comptime suffix: []const u8, len: usize) ![]f32 {
@@ -640,6 +706,49 @@ test "config detects 32b gguf metadata" {
     try std.testing.expectEqual(@as(usize, 25600), cfg.intermediate);
     try std.testing.expectEqual(@as(f64, 1e6), cfg.rope_theta);
     try std.testing.expectEqualStrings("", cfg.prefix);
+    // qwen3 defaults: QK-norm on, no q/k permute, embedded-vocab default.
+    try std.testing.expect(cfg.qk_norm);
+    try std.testing.expect(!cfg.permute_qk);
+    try std.testing.expectEqual(vocab_size, cfg.vocab);
+    try std.testing.expectEqual(@as(f32, 1e-6), cfg.rms_eps);
+}
+
+// The plain llama/Mistral family (Mistral-Nemo shape: 40 layers, hidden 5120,
+// GQA 32/8, head_dim 128, vocab 131074) reuses this stack with QK-norm OFF,
+// q/k un-permuted at load, its own vocab, and eps 1e-5.
+test "config detects llama (mistral-nemo) gguf metadata" {
+    const gpa = std.testing.allocator;
+
+    var b = try gguf_mod.TestBuilder.init(gpa, 3, 0, 11);
+    defer b.deinit();
+    try b.kvStr("general.architecture", "llama");
+    try b.kvUint("llama.block_count", 40);
+    try b.kvUint("llama.embedding_length", 5120);
+    try b.kvUint("llama.attention.head_count", 32);
+    try b.kvUint("llama.attention.head_count_kv", 8);
+    try b.kvUint("llama.attention.key_length", 128);
+    try b.kvUint("llama.attention.value_length", 128);
+    try b.kvUint("llama.feed_forward_length", 14336);
+    try b.kvUint("llama.vocab_size", 131074);
+    try b.kvF32("llama.rope.freq_base", 1e6);
+    try b.kvF32("llama.attention.layer_norm_rms_epsilon", 1e-5);
+    const file = try b.finish(&.{});
+    defer gpa.free(file);
+
+    var g = try gguf_mod.Gguf.initFromSlice(gpa, file);
+    defer g.deinit();
+
+    const cfg = try Config.detect(.{ .gguf = &g });
+    try std.testing.expectEqual(@as(usize, 40), cfg.n_layers);
+    try std.testing.expectEqual(@as(usize, 5120), cfg.hidden);
+    try std.testing.expectEqual(@as(usize, 32), cfg.n_heads);
+    try std.testing.expectEqual(@as(usize, 8), cfg.n_kv_heads);
+    try std.testing.expectEqual(@as(usize, 14336), cfg.intermediate);
+    try std.testing.expectEqual(@as(usize, 131074), cfg.vocab);
+    try std.testing.expectEqual(@as(usize, 4096), cfg.qDim()); // 32*128 != hidden 5120
+    try std.testing.expect(!cfg.qk_norm);
+    try std.testing.expect(cfg.permute_qk);
+    try std.testing.expectEqual(@as(f32, 1e-5), cfg.rms_eps);
 }
 
 test "config rejects block_count above max_layers" {
