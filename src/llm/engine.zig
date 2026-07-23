@@ -45,6 +45,10 @@ pub const Options = struct {
     /// reads true, generation stops and returns the tokens produced so far
     /// (a clean stop, not an error). Lets a UI interrupt a long reply.
     cancel: ?*std.atomic.Value(bool) = null,
+    /// Optional pause gate, consulted before each decode step (the same boundary
+    /// as `cancel`). While paused the loop parks here — holding the KV cache and
+    /// resident weights — until unpaused. See `ops/pause.zig`.
+    pause: ?*ops.pause.Gate = null,
     /// KV-cache element storage type (f32 default; f16 halves the footprint,
     /// lossy). Copied onto the Capacity that reaches every model init.
     kv_dtype: kv_cache_mod.KvDtype = .f32,
@@ -183,6 +187,10 @@ pub fn generate(
         if (opts.residency_poll) |rp| rp.apply(rp.ctx); // enact any arbiter-published VRAM target on this thread
 
         if (opts.cancel) |c| if (c.load(.acquire)) break;
+        // Pause parks at the token boundary. `.canceled` (a stop delivered while
+        // parked) and `.unload` both just stop for Tier 1; Tier 3 will make
+        // `.unload` snapshot the KV cache and reprefill-resume instead.
+        if (opts.pause) |g| if (g.checkpoint(io, opts.cancel) != .proceed) break;
         const next = sampler.next(logits, ids.items);
         if (chat.isStop(next)) break;
         try ids.append(gpa, next);
@@ -260,6 +268,10 @@ fn generateGreedyArgmax(
         if (opts.residency_poll) |rp| rp.apply(rp.ctx); // enact any arbiter-published VRAM target on this thread
 
         if (opts.cancel) |c| if (c.load(.acquire)) break;
+        // Pause parks at the token boundary. `.canceled` (a stop delivered while
+        // parked) and `.unload` both just stop for Tier 1; Tier 3 will make
+        // `.unload` snapshot the KV cache and reprefill-resume instead.
+        if (opts.pause) |g| if (g.checkpoint(io, opts.cancel) != .proceed) break;
         if (chat.isStop(next)) break;
         try ids.append(gpa, next);
         n += 1;
@@ -317,6 +329,10 @@ fn generateGpuSample(
         if (opts.residency_poll) |rp| rp.apply(rp.ctx); // enact any arbiter-published VRAM target on this thread
 
         if (opts.cancel) |c| if (c.load(.acquire)) break;
+        // Pause parks at the token boundary. `.canceled` (a stop delivered while
+        // parked) and `.unload` both just stop for Tier 1; Tier 3 will make
+        // `.unload` snapshot the KV cache and reprefill-resume instead.
+        if (opts.pause) |g| if (g.checkpoint(io, opts.cancel) != .proceed) break;
         for (cands[0..count], out_id[0..count], out_logit[0..count]) |*c, id, lg| c.* = .{ .id = id, .logit = lg };
         const next = sampler.nextFromCandidates(cands[0..count]);
         if (chat.isStop(next)) break;

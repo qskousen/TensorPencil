@@ -174,6 +174,10 @@ pub const Options = struct {
     /// even on the CPU backend. When it flips true, `generate` unwinds and
     /// returns `error.Canceled` (a caller-driven stop, not a failure).
     cancel: ?*std.atomic.Value(bool) = null,
+    /// Optional pause gate, consulted between sampling steps (the same boundary
+    /// as `cancel`). While paused the loop parks here — holding the in-flight
+    /// latent and the resident DiT weights — until unpaused. See `ops/pause.zig`.
+    pause: ?*ops.pause.Gate = null,
     /// Optional VRAM-reclaim hook. On a VAE-decode OOM (e.g. a very large image
     /// while the GUI chat model is resident), `generate` calls this to migrate
     /// device memory held by ANOTHER context in the process (the GUI's resident
@@ -735,6 +739,14 @@ pub const Session = struct {
             const sampling_start = std.Io.Clock.real.now(io);
             for (0..opts.steps) |i| {
                 if (opts.cancel) |c| if (c.load(.acquire)) return error.Canceled;
+                if (opts.pause) |g| switch (g.checkpoint(io, opts.cancel)) {
+                    .proceed => {},
+                    .canceled => return error.Canceled,
+                    // Tier 3 (unload-while-paused) will snapshot `x` + step `i`
+                    // to host here and resume; until then a requested unload just
+                    // unwinds like a cancel. Tier 1 never sets want_unload.
+                    .unload => return error.Canceled,
+                };
                 const start = std.Io.Clock.real.now(io);
                 if (cu_be) |b| {
                     try dit_cuda.forward(dit, b, &cu_pos.?, &cu_ws.?, io, gpa, v, x, sigmas[i], opts.cancel);

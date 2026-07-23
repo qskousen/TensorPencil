@@ -119,7 +119,7 @@ fn sampleInto(s: ?*chat.Session, diff_busy: bool, diff_used: u64) void {
 /// Draw the bar. `s` is the live session (null before a model loads — the bar
 /// still shows CPU/GPU/total VRAM). `diff_busy`/`diff_used` come from the
 /// app-level diffusion engine.
-pub fn render(s: ?*chat.Session, diff_busy: bool, diff: diffuser.VramBreakdown, split: *f32, limit: *f32, llm_armed: bool, diff_armed: bool, acts: meter.Actions) void {
+pub fn render(s: ?*chat.Session, diff_busy: bool, diff: diffuser.VramBreakdown, split: *f32, limit: *f32, llm_armed: bool, diff_armed: bool, llm_paused: bool, diff_paused: bool, acts: meter.Actions) void {
     if (!nvml_tried) {
         nvml = sysmon.Nvml.open();
         nvml_tried = true;
@@ -156,14 +156,14 @@ pub fn render(s: ?*chat.Session, diff_busy: bool, diff: diffuser.VramBreakdown, 
     sep(10);
 
     // The rest of the bar is the live VRAM meter (see meter.zig).
-    renderMeter(s, diff, split, limit, llm_armed, diff_armed, acts);
+    renderMeter(s, diff, split, limit, llm_armed, diff_armed, llm_paused, diff_paused, acts);
 }
 
 /// Build the meter model from live device accounting and draw it. The diffusion
 /// segments (TE / DiT / latent / VAE) are MEASURED per-tag allocator counters
 /// (see pipeline.vramBreakdown); `latent` is the per-image working set (GPU
 /// session + activation workspace + preview decode), populated mid-generation.
-fn renderMeter(s: ?*chat.Session, diff: diffuser.VramBreakdown, split: *f32, limit: *f32, llm_armed: bool, diff_armed: bool, acts: meter.Actions) void {
+fn renderMeter(s: ?*chat.Session, diff: diffuser.VramBreakdown, split: *f32, limit: *f32, llm_armed: bool, diff_armed: bool, llm_paused: bool, diff_paused: bool, acts: meter.Actions) void {
     // Whole-card totals come from the SAME source as the left VRAM meter — the
     // NVML sample — so the two always agree. (Reading the LLM context's own
     // cuMemGetInfo here made the segments misbehave whenever a session was
@@ -208,6 +208,8 @@ fn renderMeter(s: ?*chat.Session, diff: diffuser.VramBreakdown, split: *f32, lim
         .diff_loaded = diff_b > 0,
         .llm_armed = llm_armed,
         .diff_armed = diff_armed,
+        .llm_paused = llm_paused,
+        .diff_paused = diff_paused,
     };
     meter.render(&model, acts);
 }

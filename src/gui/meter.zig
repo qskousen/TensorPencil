@@ -47,6 +47,11 @@ pub const Model = struct {
     diff_loaded: bool,
     llm_armed: bool,
     diff_armed: bool,
+    /// Whether each worker's pause gate is currently engaged (parks at the next
+    /// boundary, holding in-flight state + VRAM). Drives the blinking pause
+    /// button next to each unload button. See ops/pause.zig.
+    llm_paused: bool,
+    diff_paused: bool,
 };
 
 pub const Actions = struct {
@@ -59,6 +64,11 @@ pub const Actions = struct {
     on_commit: *const fn () void,
     on_eject_llm: *const fn () void,
     on_eject_diff: *const fn () void,
+    /// Toggle each worker's pause independently — parks/releases the LLM decode
+    /// worker or the diffusion sampling worker at its next boundary (holding
+    /// in-flight state + VRAM). See ops/pause.zig.
+    on_toggle_pause_llm: *const fn () void,
+    on_toggle_pause_diff: *const fn () void,
 };
 
 const height: f32 = 30;
@@ -77,6 +87,7 @@ pub fn render(m: *Model, a: Actions) void {
     // LLM numbers (left): weights + context, stacked.
     numCol(0, &.{ .{ .name = "weights", .c = col.llm_w, .v = m.llm_w }, .{ .name = "ctx", .c = col.llm_ctx, .v = m.llm_ctx } });
 
+    if (pauseBtn(0, m.llm_loaded, m.llm_paused, "Pause the LLM — parks generation, keeps it resident")) a.on_toggle_pause_llm();
     if (eject(0, m.llm_loaded, m.llm_armed, "Unload the LLM — frees its VRAM (reloads on the next message)")) a.on_eject_llm();
 
     {
@@ -99,6 +110,7 @@ pub fn render(m: *Model, a: Actions) void {
         handleDrag(m, a, wd, crs);
     }
 
+    if (pauseBtn(1, m.diff_loaded, m.diff_paused, "Pause diffusion — parks generation, keeps it resident")) a.on_toggle_pause_diff();
     if (eject(1, m.diff_loaded, m.diff_armed, "Unload the diffusion model — frees its VRAM (reloads on the next image)")) a.on_eject_diff();
 
     // Diffusion numbers (right): TE/DiT over latent/VAE, two mini-columns.
@@ -156,6 +168,46 @@ fn eject(id: usize, loaded: bool, armed: bool, hint_text: []const u8) bool {
         .data_out = &wd,
     });
     hint.hover(@src(), &wd, if (armed) "Unloading when idle…" else hint_text);
+    return clicked and loaded;
+}
+
+/// Pause/resume toggle for one model, styled to match the eject button. While
+/// paused the glyph BLINKS orange (a ~1.25 Hz square wave) so the parked state
+/// is unmissable, and flips to ▶ (resume). Dimmed + inert when the model isn't
+/// loaded. Returns true when clicked (and loaded).
+fn pauseBtn(id: usize, loaded: bool, paused: bool, hint_text: []const u8) bool {
+    const th = dvui.themeGet();
+
+    // Square-wave blink phase off the frame clock: 400 ms lit, 400 ms dim.
+    const half_ns: i128 = 400_000_000;
+    const now = dvui.frameTimeNS();
+    const phase = @mod(now, 2 * half_ns);
+    const lit = phase < half_ns;
+
+    const color_text: ?C = if (paused)
+        (if (lit) col.limit else col.limit.lerp(th.fill, 0.72))
+    else if (loaded) null else th.fill.lerp(th.text, 0.28);
+
+    var wd: dvui.WidgetData = undefined;
+    const clicked = dvui.buttonIcon(@src(), "pause", if (paused) dvui.entypo.controller_play else dvui.entypo.controller_pause, .{}, .{}, .{
+        .id_extra = id,
+        .gravity_y = 0.5,
+        .min_size_content = .{ .w = 18, .h = 20 },
+        .margin = .{ .x = 3, .w = 3 },
+        .padding = dvui.Rect.all(3),
+        .corner_radius = dvui.Rect.all(5),
+        .color_text = color_text,
+        .color_border = if (paused) col.limit else null,
+        .border = if (paused) dvui.Rect.all(1) else .{},
+        .data_out = &wd,
+    });
+    // Keep the blink alive while paused: schedule the next repaint at the coming
+    // phase flip (the UI wakes ~2.5×/s, not every frame).
+    if (paused) {
+        const to_flip: i128 = if (lit) half_ns - phase else 2 * half_ns - phase;
+        dvui.timer(wd.id, @intCast(@divFloor(to_flip, 1000) + 1));
+    }
+    hint.hover(@src(), &wd, if (paused) "Resume" else hint_text);
     return clicked and loaded;
 }
 

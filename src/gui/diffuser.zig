@@ -23,6 +23,7 @@ const tp = @import("TensorPencil");
 const config = @import("config.zig");
 
 const pipeline = tp.pipeline;
+const pause_gate = tp.ops.pause;
 
 /// MEASURED per-component diffusion VRAM (bytes), re-exported from the pipeline
 /// for the status-bar meter.
@@ -363,6 +364,11 @@ pub const Diffuser = struct {
     seed: u64,
     busy: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
+    /// Pause gate for the sampling worker (see ops/pause.zig), driven by the
+    /// diffusion pause button (independent of the LLM's). Stable-addressed (the
+    /// Diffuser outlives its worker; deinit joins the thread first), so the
+    /// per-image `opts.pause` can point at it.
+    pause: pause_gate.Gate = .{},
     /// Persistent pipeline (loads the image model once, stays resident across a
     /// queue; freed when the queue drains, on a model swap, or on teardown).
     session: std.atomic.Value(?*pipeline.Session) = .init(null),
@@ -476,6 +482,28 @@ pub const Diffuser = struct {
     /// Cancel every queued/in-flight image (teardown / clear).
     pub fn cancelAll(self: *Diffuser) void {
         for (self.queue.items) |gi| gi.cancel.store(true, .release);
+        // A worker parked at the pause gate would never observe the per-image
+        // cancel; wake it (without unpausing — the pause button stays in sync)
+        // so its checkpoint re-reads `gi.cancel` and returns `.canceled`.
+        self.pause.wake(self.io);
+    }
+
+    /// Park the sampling worker at the next step boundary (holding the in-flight
+    /// latent + resident weights), or release it. UI-thread; driven by the
+    /// diffusion pause button.
+    pub fn setPaused(self: *Diffuser, paused: bool) void {
+        if (paused) self.pause.pause(self.io) else self.pause.unpause(self.io);
+    }
+
+    pub fn isPaused(self: *Diffuser) bool {
+        return self.pause.isPaused(self.io);
+    }
+
+    /// Wake a worker parked at the pause gate so it re-checks its per-image
+    /// cancel flag — used by the single-image Cancel button while paused (no-op
+    /// when nothing is parked, and never changes the pause state).
+    pub fn wakePaused(self: *Diffuser) void {
+        self.pause.wake(self.io);
     }
 
     /// Next pending image to run, dropping ones canceled before they start.
@@ -703,6 +731,12 @@ pub const Diffuser = struct {
             t.join();
             self.thread = null;
         }
+        // While paused, don't START (or load for) new work — leave it queued
+        // until resumed. A generation already in flight is parked at the step
+        // gate (Tier 1) and never reaches here (busy → returned above); this
+        // gates the NEXT image so a paused engine neither loads nor begins one.
+        if (self.pause.isPaused(self.io)) return;
+
         const gi = self.nextPending() orelse {
             // Queue drained. Keep the model resident so a later gen reuses it —
             // unless the config was switched mid-queue and it's now stale, in
@@ -843,6 +877,7 @@ pub const Diffuser = struct {
         opts.preview_live = &self.live_preview;
         opts.taew_path = self.taew_owned;
         opts.cancel = &gi.cancel; // UI Cancel button aborts sampling
+        opts.pause = &self.pause; // UI Pause button parks sampling between steps
         opts.reclaim = .{ .ctx = self, .call = reclaimThunk }; // free LLM VRAM on VAE OOM
         // Resident-weight budget from the coordinator (chat: limit − LLM
         // resident, floored; studio: 0 = auto / pin all free VRAM).

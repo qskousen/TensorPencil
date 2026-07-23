@@ -214,6 +214,9 @@ pub fn generate(
     var n: usize = 0;
     var pending = sampler.next(logits[0..vocab], ids.items);
     while (true) {
+        // Cooperative stop/pause at the token boundary (mirrors engine.zig).
+        if (opts.cancel) |c| if (c.load(.acquire)) break;
+        if (opts.pause) |pg| if (pg.checkpoint(io, opts.cancel) != .proceed) break;
         if (chat.isStop(pending)) break;
         try ids.append(gpa, pending);
         n += 1;
@@ -300,6 +303,9 @@ fn generateChainGreedy(
     var n: usize = 0;
     var g: [max_draft + 1]u32 = undefined;
     while (true) {
+        // Cooperative stop/pause at the token boundary (mirrors engine.zig).
+        if (opts.cancel) |c| if (c.load(.acquire)) break;
+        if (opts.pause) |pg| if (pg.checkpoint(io, opts.cancel) != .proceed) break;
         if (chat.isStop(pending)) break;
         try ids.append(gpa, pending);
         n += 1;
@@ -392,6 +398,9 @@ pub fn generateTree(
     var node_tokens: [max_tree_nodes]u32 = undefined;
     var node_parents: [max_tree_nodes]u32 = undefined;
     while (true) {
+        // Cooperative stop/pause at the token boundary (mirrors engine.zig).
+        if (opts.cancel) |c| if (c.load(.acquire)) break;
+        if (opts.pause) |pg| if (pg.checkpoint(io, opts.cancel) != .proceed) break;
         if (chat.isStop(pending)) break;
         try ids.append(gpa, pending);
         n += 1;

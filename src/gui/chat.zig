@@ -68,6 +68,7 @@ const NoVit = struct {
 };
 const cuda = tp.gpu.cuda;
 const engine = tp.llm.engine;
+const pause_gate = tp.ops.pause;
 const sample = tp.llm.sample;
 const session = tp.llm.session;
 const kv_cache = tp.llm.kv_cache;
@@ -371,6 +372,10 @@ pub const Session = struct {
     pending: std.ArrayList(u8) = .empty,
     generating: std.atomic.Value(bool) = .init(false),
     cancel: std.atomic.Value(bool) = .init(false),
+    /// Pause gate for the decode worker (see ops/pause.zig), driven by the LLM's
+    /// own pause button (independent of diffusion's). Heap-pinned with the
+    /// session, so `opts.pause` can point at it for the worker's lifetime.
+    pause: pause_gate.Gate = .{},
     worker: ?std.Thread = null,
     gen_err: ?anyerror = null,
     sink_buf: [256]u8 = undefined,
@@ -611,6 +616,8 @@ pub const Session = struct {
         self.worker = null;
         self.gen_err = null;
         self.opts.cancel = &self.cancel; // stable heap address for the worker
+        self.pause = .{};
+        self.opts.pause = &self.pause; // stable heap address for the worker
 
         self.attach_view = .empty;
         self.attach_rgb = .empty;
@@ -754,6 +761,32 @@ pub const Session = struct {
     /// Ask the running generation to stop at the next token (no-op if idle).
     pub fn requestCancel(self: *Session) void {
         self.cancel.store(true, .release);
+        // A worker parked at the pause gate would never observe the cancel; wake
+        // it (without unpausing — the pause button stays in sync) so its
+        // checkpoint re-reads `cancel` and returns `.canceled`.
+        self.pause.wake(self.io);
+    }
+
+    /// Park the decode worker at the next token boundary (holding KV + weights),
+    /// or release it. UI-thread; driven by the LLM's own pause button. On resume,
+    /// dispatch any turn that was queued while paused (staged by `submit` but
+    /// never spawned — see the `turn_staged && !busy() && worker == null` state).
+    pub fn setPaused(self: *Session, paused: bool) void {
+        if (paused) {
+            self.pause.pause(self.io);
+            return;
+        }
+        self.pause.unpause(self.io);
+        if (self.turn_staged and !self.busy() and self.worker == null) {
+            self.spawnWorker() catch |err| {
+                self.gen_err = err;
+                std.log.err("resume dispatch failed: {t}", .{err});
+            };
+        }
+    }
+
+    pub fn isPaused(self: *Session) bool {
+        return self.pause.isPaused(self.io);
     }
 
     /// Drop the transcript's BORROWED references to engine-owned generated
@@ -1090,9 +1123,12 @@ pub const Session = struct {
     }
 
     /// Append a user turn and spawn the worker to stream the reply. No-op if a
-    /// turn is already generating or there is nothing to send.
+    /// turn is already generating or there is nothing to send. Also refused while
+    /// a turn is staged but not yet running (queued while paused — Tier 2): the
+    /// LLM runs one turn at a time, so a second submit would clobber the staged
+    /// turn's data. The queued turn must run (on resume) or be canceled first.
     pub fn submit(self: *Session, text: []const u8) !void {
-        if (self.busy()) return;
+        if (self.busy() or self.turn_staged) return;
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0 and self.attach_view.items.len == 0) return;
 
@@ -1117,6 +1153,8 @@ pub const Session = struct {
         self.attach_rgb.clearRetainingCapacity();
         self.turn_staged = true;
 
+        // spawnWorker defers if paused: the turn stays queued (shown in the
+        // transcript with a pending assistant slot) and runs on resume (Tier 2).
         try self.spawnWorker();
     }
 
@@ -1253,6 +1291,15 @@ pub const Session = struct {
     /// Shared tail of submit/regenerate: arm the cancel flag and start the
     /// generation worker for the already-staged turn.
     fn spawnWorker(self: *Session) !void {
+        // Paused: leave the turn staged (the caller has already appended it) and
+        // don't run — no prefill, no decode — until resumed. `setPaused(false)`
+        // dispatches it then. This is the single gate covering every dispatch
+        // site (submit, regenerate). The resume path calls spawnWorker only after
+        // unpausing, so it isn't blocked here.
+        if (self.pause.isPaused(self.io)) {
+            self.wake(); // repaint so the queued turn shows
+            return;
+        }
         self.gen_err = null;
         self.cancel.store(false, .release);
         self.generating.store(true, .release);

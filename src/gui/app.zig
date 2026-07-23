@@ -240,7 +240,25 @@ fn meterEjectDiff() void {
     g_diff_eject_armed = true;
 }
 fn meterActions() meter.Actions {
-    return .{ .on_change = meterChanged, .on_commit = meterCommit, .on_eject_llm = meterEjectLlm, .on_eject_diff = meterEjectDiff };
+    return .{ .on_change = meterChanged, .on_commit = meterCommit, .on_eject_llm = meterEjectLlm, .on_eject_diff = meterEjectDiff, .on_toggle_pause_llm = toggleLlmPause, .on_toggle_pause_diff = toggleDiffPause };
+}
+
+/// The pause gate is the source of truth for each model's paused state (queried
+/// live for the button), so there's no separate UI flag to keep in sync. Only
+/// touch the session when it's safe to dereference (not mid-reload).
+fn llmPaused() bool {
+    if (g_loading.load(.acquire)) return false;
+    return if (g_session) |s| s.isPaused() else false;
+}
+fn diffPaused() bool {
+    return if (g_diffuser) |*d| d.isPaused() else false;
+}
+fn toggleLlmPause() void {
+    if (g_loading.load(.acquire)) return;
+    if (g_session) |s| s.setPaused(!s.isPaused());
+}
+fn toggleDiffPause() void {
+    if (g_diffuser) |*d| d.setPaused(!d.isPaused());
 }
 
 /// Main-loop hook: carry out any armed eject once ITS OWN model is idle. Each
@@ -773,7 +791,7 @@ fn frame() void {
         }
         // `ready` == !g_loading: only touch the session when no reload is tearing
         // it down on the loader thread (same invariant as the chat view).
-        status_bar.render(if (ready) g_session else null, diffBusy(), diffVram(), &g_split, &g_limit, g_llm_eject_armed, g_diff_eject_armed, meterActions());
+        status_bar.render(if (ready) g_session else null, diffBusy(), diffVram(), &g_split, &g_limit, g_llm_eject_armed, g_diff_eject_armed, llmPaused(), diffPaused(), meterActions());
         return;
     }
 
@@ -812,7 +830,7 @@ fn frame() void {
 
     renderMessages(s_ui, list_h, loading);
     renderInput(s_ui);
-    status_bar.render(s_ui, diffBusy(), diffVram(), &g_split, &g_limit, g_llm_eject_armed, g_diff_eject_armed, meterActions());
+    status_bar.render(s_ui, diffBusy(), diffVram(), &g_split, &g_limit, g_llm_eject_armed, g_diff_eject_armed, llmPaused(), diffPaused(), meterActions());
 }
 
 fn diffBusy() bool {
@@ -1403,6 +1421,9 @@ fn renderMessage(s: ?*chat.Session, m: *const chat.Message, idx: usize) void {
         } else if (if (s) |ss| ss.gen_err else null) |err| {
             var msg: [128]u8 = undefined;
             fonts.addRich(tl, std.fmt.bufPrint(&msg, "⚠ generation error: {t}", .{err}) catch "⚠ generation error");
+        } else if (idx + 1 == (if (s) |ss| ss.messages.items.len else 0) and (if (s) |ss| ss.isPaused() else false)) {
+            // A turn queued while the LLM is paused — it runs on resume (Tier 2).
+            tl.addText("⏸ queued — resume to generate", .{ .color_text = theme.text.lerp(theme.fill, 0.4) });
         }
     }
 
@@ -1583,6 +1604,9 @@ fn renderGenImage(s: ?*chat.Session, gi: *chat.GenImage, gi_idx: usize) void {
             if (dvui.button(@src(), "Cancel", .{}, .{ .margin = .{ .y = 4 } })) {
                 gi.cancel.store(true, .release);
                 gi.wake();
+                // If we're paused, the worker is parked at the gate — wake it so
+                // it re-checks this image's cancel flag now, not on resume.
+                if (g_diffuser) |*d| d.wakePaused();
             }
         },
         .done => {
