@@ -208,6 +208,66 @@ pub fn dedupeDecorations(gpa: std.mem.Allocator, spv: []const u8) Error![]align(
     return bytes;
 }
 
+// SPIR-V capability numbers the Zig backend won't declare for raw inline-asm
+// ops, injected here per-module.
+pub const cap_dot_product: u32 = 6019; // DotProduct (OpSDot)
+pub const cap_dot_product_input_4x8_packed: u32 = 6018; // DotProductInput4x8BitPacked
+pub const cap_group_nonuniform: u32 = 61; // GroupNonUniform (subgroup ops base)
+pub const cap_group_nonuniform_arithmetic: u32 = 63; // GroupNonUniformArithmetic (Reduce)
+pub const cap_group_nonuniform_shuffle: u32 = 65; // GroupNonUniformShuffle (butterfly)
+pub const cap_storage_buffer_16bit: u32 = 4433; // StorageBuffer16BitAccess (native u16 loads)
+
+/// Inject `caps` (OpCapability) + optional `ext` (OpExtension) into a module so
+/// it can use ops the Zig backend emits via inline asm but never declares
+/// (OpSDot, OpGroupNonUniform*, …). New capability words lead the capability
+/// block; the extension follows it — the order SPIR-V requires (all
+/// capabilities, then extensions, then the rest). Applied per-module so the
+/// shared kernels stay valid on devices lacking the capability.
+pub fn withCapabilities(gpa: std.mem.Allocator, spv: []const u8, caps: []const u32, ext: ?[]const u8) Error![]align(4) u8 {
+    if (spv.len % 4 != 0 or spv.len < 20) return error.InvalidSpirv;
+    const n_words = spv.len / 4;
+    const in_words: []align(1) const u32 = std.mem.bytesAsSlice(u32, spv);
+    if (in_words[0] != magic) return error.InvalidSpirv;
+
+    var out: std.ArrayList(u32) = .empty;
+    defer out.deinit(gpa);
+    try out.ensureTotalCapacity(gpa, n_words + 2 * caps.len + 8);
+    for (in_words[0..5]) |w| try out.append(gpa, w);
+
+    // Leading OpCapability instructions (2 words each).
+    for (caps) |cap| {
+        try out.append(gpa, (2 << 16) | @as(u32, op_capability));
+        try out.append(gpa, cap);
+    }
+
+    // Optional OpExtension, inserted once the capability block ends.
+    var ext_words: [16]u32 = @splat(0);
+    var ext_n: u32 = 0;
+    if (ext) |e| {
+        std.debug.assert(e.len < ext_words.len * 4);
+        @memcpy(std.mem.sliceAsBytes(ext_words[0..])[0..e.len], e);
+        ext_n = @intCast((e.len + 4) / 4); // + null terminator, rounded up to words
+    }
+    var i: usize = 5;
+    var inserted_ext = ext == null;
+    while (i < n_words) {
+        const first = in_words[i];
+        const opcode: u16 = @truncate(first & 0xFFFF);
+        const wc: usize = first >> 16;
+        if (wc == 0 or i + wc > n_words) return error.InvalidSpirv;
+        if (!inserted_ext and opcode != op_capability) {
+            try out.append(gpa, ((ext_n + 1) << 16) | @as(u32, op_extension));
+            for (ext_words[0..ext_n]) |w| try out.append(gpa, w);
+            inserted_ext = true;
+        }
+        for (in_words[i .. i + wc]) |w| try out.append(gpa, w);
+        i += wc;
+    }
+    const bytes = try gpa.alignedAlloc(u8, .of(u32), out.items.len * 4);
+    @memcpy(bytes, std.mem.sliceAsBytes(out.items));
+    return bytes;
+}
+
 test "patches local size after entry point" {
     const gpa = std.testing.allocator;
     // Minimal synthetic module: header + OpEntryPoint(GLCompute, id 7, "k").

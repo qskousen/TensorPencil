@@ -38,6 +38,7 @@ const transformer_gpu = @import("transformer_gpu.zig");
 
 const Buf = gpu.DeviceBuffer;
 const Weight = ops.matmul.Weight;
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
 fn nbuf(ctx: *gpu.Context, w: []const f32) !Buf {
     return .{ .buf = try ctx.smallBuffer(std.mem.sliceAsBytes(w)), .mem = .null_handle, .size = 0 };
@@ -76,6 +77,9 @@ pub const VulkanLM = struct {
     /// KV-cache element storage type (f32 / f16); selects the attention kernel
     /// variant and halves the per-element cache stride.
     kv_dtype: kvmod.KvDtype,
+    /// Fold decode attention (dsplit+dmerge → one subgroup-reduce pass,
+    /// opAttnDecodeSg) — f32 KV only; opt-in via TP_VK_SG_ATTN.
+    use_sg_attn: bool = false,
     /// Set (to the block end position) only while an image block is prefilling:
     /// `attention` passes it as the bidirectional kv_end so each image query
     /// attends the WHOLE block forward. 0 = plain causal decode/prefill.
@@ -125,6 +129,7 @@ pub const VulkanLM = struct {
         self.capacity = cap.max;
         self.len = 0;
         self.kv_dtype = cap.kv_dtype;
+        self.use_sg_attn = cap.kv_dtype == .f32 and ctx.hasAttnDecodeSg() and getenv("TP_VK_SG_ATTN") != null;
         self.sin_off = cap.max * (cfg.head_dim / 2);
 
         self.freqs_global = try uploadFreqs(ctx, gpa, cap.max, cfg.head_dim, cfg.rope_theta, cfg.rope_freq_scale);
@@ -367,6 +372,10 @@ pub const VulkanLM = struct {
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
         const window: usize = if (cfg.isGlobal(l)) 0 else cfg.sliding_window;
         const ring: usize = if (usesRing(cfg, l)) localRingRows(cfg) else 0;
+        if (self.use_sg_attn) {
+            try self.ctx.opAttnDecodeSg(self.q, self.k_cache[l], self.v_cache[l], self.attn, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, pos0 + 1, scale, window, ring, self.bidir_end);
+            return;
+        }
         try self.ctx.opAttnDecodeQ35(self.q, self.k_cache[l], self.v_cache[l], self.attn, self.attn_scratch, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim, pos0 + 1, scale, window, ring, self.bidir_end, kvFmt(self.kv_dtype));
     }
     pub fn projectO(self: *VulkanLM, l: usize, layer: anytype, seq: usize) !void {

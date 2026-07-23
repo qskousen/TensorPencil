@@ -502,6 +502,7 @@ pub fn run(init: std.process.Init) !void {
     // (see submitChat). Build the app-level diffusion engine now if a model is
     // configured (its pipeline still loads lazily on the first image).
     image_view.setEnv(g_gpa, g_io, wakeupFrame);
+    config_view.setEnv(back.window, wakeupFrame);
     syncDiffuser();
 
     // Tear down at exit. Stop the diffusion engine FIRST (join its worker) so no

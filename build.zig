@@ -48,7 +48,7 @@ pub fn build(b: *std.Build) void {
     // into the library as raw module bytes.
     // One object per kernel: the 0.16 SPIR-V backend only supports workgroup
     // storage in a single entry point per module.
-    const kernel_names = [_][]const u8{ "matmul_f8", "matmul_f32", "transpose", "eltwise", "attn_batched" };
+    const kernel_names = [_][]const u8{ "matmul_f8", "matmul_f32", "transpose", "eltwise", "attn_batched", "dp4a", "subgroup" };
     var kernel_objs: [kernel_names.len]*std.Build.Step.Compile = undefined;
     for (kernel_names, 0..) |kname, i| {
         kernel_objs[i] = b.addObject(.{

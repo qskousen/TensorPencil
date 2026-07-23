@@ -271,7 +271,25 @@ asm volatile (
 - Known open issue: even validator-clean workgroup-memory kernels hang the
   NVIDIA 580 driver (VK_ERROR_DEVICE_LOST at dispatch, even at workgroup
   size 1x1), while RADV and llvmpipe execute them correctly. Non-workgroup
-  kernels run fine on NVIDIA. Tracked in PLAN.md M9.
+  kernels run fine on NVIDIA. Tracked in PLAN.md M9. **This is specific to
+  Zig-BACKEND-EMITTED workgroup memory** — hand-authored SPIR-V using workgroup
+  memory (`coopmat.zig buildGemmShared`) runs fine on the same driver, so the
+  fault is in the Zig codegen's workgroup-memory output, not the driver or
+  workgroup storage itself.
+- Escape hatch — **subgroup ops instead of workgroup memory** (VERIFIED on
+  580.173.02): subgroup-scope ops (`OpGroupNonUniformFAdd`, `…Shuffle*`, coop
+  matrix) use no workgroup storage class, so they sidestep the hang. Emit them
+  from Zig via inline asm exactly like `OpSDot` — e.g.
+  `%r = OpGroupNonUniformFAdd %f32t %scope Reduce %val` with `[scope] "" (@as(u32,3))`
+  (Subgroup scope materializes as a constant id); inject the `GroupNonUniform`
+  (61) + `GroupNonUniformArithmetic` (63) capabilities via `spv.withCapabilities`.
+  This is the path to a CUDA-style warp-cooperative GEMV (row-major weights,
+  coalesced, no `_t` transpose) without shared memory. Confirmed by the
+  `"subgroup reduce runs on device"` test (one 32-lane subgroup sums 32 ones →
+  32.0; a hang would surface as DEVICE_LOST, not a wrong value).
+- Note: the Zig SPIR-V backend **segfaults compiling a single-kernel module**
+  that uses a subgroup/dp4a inline-asm op; the same kernel compiles fine in a
+  multi-kernel module. Park such probes alongside other kernels (e.g. `dp4a.zig`).
 
 ## `@min`/`@max` with a comptime bound narrows the result type
 

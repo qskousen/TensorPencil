@@ -169,6 +169,8 @@ pub const StructureType = enum(i32) {
     physical_device_subgroup_size_control_properties = 1000225000,
     pipeline_shader_stage_required_subgroup_size_create_info = 1000225001,
     physical_device_subgroup_size_control_features = 1000225002,
+    physical_device_shader_integer_dot_product_features = 1000280000,
+    physical_device_16bit_storage_features = 1000083000,
     _,
 };
 
@@ -569,6 +571,21 @@ pub const PhysicalDeviceSubgroupSizeControlFeatures = extern struct {
     p_next: ?*anyopaque = null,
     subgroup_size_control: Bool32 = FALSE,
     compute_full_subgroups: Bool32 = FALSE,
+};
+
+pub const PhysicalDeviceShaderIntegerDotProductFeatures = extern struct {
+    s_type: StructureType = .physical_device_shader_integer_dot_product_features,
+    p_next: ?*anyopaque = null,
+    shader_integer_dot_product: Bool32 = FALSE,
+};
+
+pub const PhysicalDevice16BitStorageFeatures = extern struct {
+    s_type: StructureType = .physical_device_16bit_storage_features,
+    p_next: ?*anyopaque = null,
+    storage_buffer_16bit_access: Bool32 = FALSE,
+    uniform_and_storage_buffer_16bit_access: Bool32 = FALSE,
+    storage_push_constant_16: Bool32 = FALSE,
+    storage_input_output_16: Bool32 = FALSE,
 };
 
 pub const PipelineShaderStageRequiredSubgroupSizeCreateInfo = extern struct {
@@ -983,6 +1000,7 @@ pub const PfnDestroyInstance = *const fn (Instance, ?*const AllocationCallbacks)
 pub const PfnEnumeratePhysicalDevices = *const fn (Instance, *u32, ?[*]PhysicalDevice) callconv(.c) Result;
 pub const PfnGetPhysicalDeviceProperties = *const fn (PhysicalDevice, *PhysicalDeviceProperties) callconv(.c) void;
 pub const PfnGetPhysicalDeviceProperties2 = *const fn (PhysicalDevice, *PhysicalDeviceProperties2) callconv(.c) void;
+pub const PfnGetPhysicalDeviceFeatures2 = *const fn (PhysicalDevice, *PhysicalDeviceFeatures2) callconv(.c) void;
 pub const PfnGetPhysicalDeviceQueueFamilyProperties = *const fn (PhysicalDevice, *u32, ?[*]QueueFamilyProperties) callconv(.c) void;
 pub const PfnGetPhysicalDeviceMemoryProperties = *const fn (PhysicalDevice, *PhysicalDeviceMemoryProperties) callconv(.c) void;
 pub const PfnGetPhysicalDeviceMemoryProperties2 = *const fn (PhysicalDevice, *PhysicalDeviceMemoryProperties2) callconv(.c) void;

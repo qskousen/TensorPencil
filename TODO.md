@@ -3,7 +3,7 @@
 - can't pause right after starting when nothing is loaded
 - keep preview image after resuming?
 - i'm pretty sure the meter is reporting some vram under "system" for diffusion
-- can't switch to image studio while diffusing
+- can't switch to image studio while llm'ing
 - regenerate reply option disappears when model is unloaded
 - when not diffusing and llm is running, llm doesn't offload any diffusion weights but diffusion offloads llm weights
 - split is not respected

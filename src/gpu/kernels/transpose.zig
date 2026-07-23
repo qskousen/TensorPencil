@@ -117,6 +117,80 @@ export fn transpose_grp32() callconv(.spirv_kernel) void {
     dst.w[idx] = out;
 }
 
+// --- block-quant -> int8-interleaved repack (dp4a decode layout) ------------
+// Raw row-major q8_0 / iq4_nl weight -> the layout dp4a.zig reads: per 32-row
+// group, per block b, 8 quad-u32 (4 packed int8 each) for 32 rows + 32 f32
+// row-scales (block region = 288 u32). The iq4_nl codebook is pre-applied, so
+// both formats produce uniform int8 + f32-scale blocks. One thread per
+// (row, block); idx = block*rows + row so consecutive threads write consecutive
+// rows of a quad (coalesced). rows = real rows (last group's pad rows are never
+// written or read), cols = elements/row, stride = source row_bytes.
+
+const kvalues_iq4nl = [16]i8{ -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
+const REPACK_BLOCK_U32 = 288; // 256 quad-u32 + 32 f32 scales
+
+inline fn srcByte(q: u32) u32 {
+    return (src.w[q >> 2] >> @intCast((q & 3) * 8)) & 0xFF;
+}
+inline fn srcF16(q: u32) f32 { // q is 2-byte aligned within a u32 word
+    const bits: u16 = @intCast(srcByte(q) | (srcByte(q + 1) << 8));
+    return @floatCast(@as(f16, @bitCast(bits)));
+}
+
+export fn repack_q8_0() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    const rows = pc.rows;
+    const cols = pc.cols;
+    const row_bytes = pc.stride;
+    const nblk = cols / 32;
+    if (idx >= rows * nblk) return;
+    const b = idx / rows;
+    const row = idx % rows;
+    const gi = row / 32;
+    const r = row % 32;
+    const sbase = row * row_bytes + b * 34; // f16 d + 32 i8
+    const gbase = gi * (nblk * REPACK_BLOCK_U32) + b * REPACK_BLOCK_U32;
+    var qg: u32 = 0;
+    while (qg < 8) : (qg += 1) {
+        var quad: u32 = 0;
+        var t: u32 = 0;
+        while (t < 4) : (t += 1) quad |= srcByte(sbase + 2 + qg * 4 + t) << @intCast(8 * t);
+        dst.w[gbase + qg * 32 + r] = quad;
+    }
+    dst.w[gbase + 256 + r] = @bitCast(srcF16(sbase));
+}
+
+export fn repack_iq4_nl() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    const rows = pc.rows;
+    const cols = pc.cols;
+    const row_bytes = pc.stride;
+    const nblk = cols / 32;
+    if (idx >= rows * nblk) return;
+    const b = idx / rows;
+    const row = idx % rows;
+    const gi = row / 32;
+    const r = row % 32;
+    const sbase = row * row_bytes + b * 18; // f16 d + 16 nibble bytes
+    const gbase = gi * (nblk * REPACK_BLOCK_U32) + b * REPACK_BLOCK_U32;
+    var qg: u32 = 0;
+    while (qg < 8) : (qg += 1) {
+        var quad: u32 = 0;
+        var t: u32 = 0;
+        while (t < 4) : (t += 1) {
+            const col = qg * 4 + t; // 0..31, natural column order
+            const nb = srcByte(sbase + 2 + (col & 15)); // qs byte for this column
+            const nibble = if (col < 16) (nb & 0xF) else (nb >> 4);
+            const kv: u32 = @bitCast(@as(i32, kvalues_iq4nl[@intCast(nibble)]));
+            quad |= (kv & 0xFF) << @intCast(8 * t);
+        }
+        dst.w[gbase + qg * 32 + r] = quad;
+    }
+    dst.w[gbase + 256 + r] = @bitCast(srcF16(sbase));
+}
+
 /// One f32 element per invocation.
 export fn transpose_f32() callconv(.spirv_kernel) void {
     decorate();

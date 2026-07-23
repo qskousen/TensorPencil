@@ -9,6 +9,48 @@
 const std = @import("std");
 const dvui = @import("dvui");
 const config = @import("config.zig");
+const SDLBackend = @import("backend");
+
+// SDL owns file picking: SDL_ShowOpen*Dialog parents the native dialog to the
+// main window (so it appears ON TOP, not behind it) — unlike tinyfiledialogs,
+// which spawns an unparented helper process. The dialogs are ASYNC: the callback
+// fires on the main thread during SDL event pumping and writes the chosen path
+// straight into the target PathBuf, then wakes a frame to show it.
+var g_window: ?*SDLBackend.c.SDL_Window = null;
+var g_wakeup: ?*const fn () void = null;
+// One dialog at a time: the SDL pickers are async (unlike the old blocking
+// tinyfiledialogs call), so without this a second Browse click would stack a
+// second dialog. Cleared in the callback.
+var g_dialog_open: bool = false;
+
+/// Wire the SDL window + frame-wakeup (called once from app init). Until set,
+/// the pickers no-op (the user can still type a path).
+pub fn setEnv(window: ?*SDLBackend.c.SDL_Window, wakeup: *const fn () void) void {
+    g_window = window;
+    g_wakeup = wakeup;
+}
+
+// Static filter sets — SDL keeps the pointer across the async call, so these
+// MUST outlive the dialog (module-level const, never a stack local).
+const gguf_sdl = [_]SDLBackend.c.SDL_DialogFileFilter{
+    .{ .name = "GGUF models", .pattern = "gguf" },
+    .{ .name = "All files", .pattern = "*" },
+};
+const safetensors_sdl = [_]SDLBackend.c.SDL_DialogFileFilter{
+    .{ .name = "Safetensors", .pattern = "safetensors" },
+    .{ .name = "All files", .pattern = "*" },
+};
+
+/// SDL open-file / folder callback: `userdata` is the target *PathBuf. Writes
+/// the first chosen path and wakes a frame. Cancel (files[0]==null) leaves it.
+fn dialogCallback(userdata: ?*anyopaque, filelist: [*c]const [*c]const u8, _: c_int) callconv(.c) void {
+    g_dialog_open = false;
+    const pb: *config.PathBuf = @ptrCast(@alignCast(userdata orelse return));
+    const files = filelist orelse return; // dialog error
+    if (files[0] == null) return; // cancelled
+    pb.set(std.mem.span(files[0]));
+    if (g_wakeup) |w| w();
+}
 
 /// App-supplied actions for the two footer buttons.
 pub const Callbacks = struct {
@@ -37,8 +79,6 @@ var fpen_buf: [16]u8 = [_]u8{0} ** 16;
 // Preset name entry (save/load/delete target in the sampling section).
 var preset_name_buf: [config.max_preset_name]u8 = [_]u8{0} ** config.max_preset_name;
 
-const gguf_filters = [_][]const u8{"*.gguf"};
-const safetensors_filters = [_][]const u8{"*.safetensors"};
 
 /// Call when the view is (re)entered so numeric buffers reseed from the config.
 pub fn open() void {
@@ -138,12 +178,12 @@ pub fn render(cfg: *config.Config, cb: Callbacks) void {
     help("The LLM is required. Diffusion (image generation) needs all three of " ++
         "diffusion model, text encoder, and VAE. Vision (chatting about images) " ++
         "needs the vision tower. Any unset feature is simply disabled.");
-    pathRow("LLM model", &cfg.llm_model, "GGUF models", &gguf_filters);
-    pathRow("Vision tower", &cfg.vision_tower, "GGUF mmproj", &gguf_filters);
-    pathRow("Diffusion model", &cfg.diffusion_model, "Safetensors", &safetensors_filters);
-    pathRow("Text encoder", &cfg.text_encoder, "Safetensors", &safetensors_filters);
-    pathRow("VAE", &cfg.vae, "Safetensors", &safetensors_filters);
-    pathRow("TAESD preview", &cfg.taesd, "Safetensors", &safetensors_filters);
+    pathRow("LLM model", &cfg.llm_model, &gguf_sdl);
+    pathRow("Vision tower", &cfg.vision_tower, &gguf_sdl);
+    pathRow("Diffusion model", &cfg.diffusion_model, &safetensors_sdl);
+    pathRow("Text encoder", &cfg.text_encoder, &safetensors_sdl);
+    pathRow("VAE", &cfg.vae, &safetensors_sdl);
+    pathRow("TAESD preview", &cfg.taesd, &safetensors_sdl);
 
     section("Image generation");
     help("Generated images (chat and the image studio) are saved here as PNGs " ++
@@ -338,7 +378,7 @@ fn help(text: []const u8) void {
     tl.addText(text, .{});
 }
 
-fn pathRow(label: []const u8, pb: *config.PathBuf, desc: []const u8, filters: []const []const u8) void {
+fn pathRow(label: []const u8, pb: *config.PathBuf, filters: []const SDLBackend.c.SDL_DialogFileFilter) void {
     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = idFor(label), .expand = .horizontal, .padding = .{ .x = 4, .y = 3 } });
     defer row.deinit();
 
@@ -350,8 +390,17 @@ fn pathRow(label: []const u8, pb: *config.PathBuf, desc: []const u8, filters: []
     }, .{ .expand = .horizontal, .gravity_y = 0.5 });
     te.deinit();
 
-    if (dvui.button(@src(), "Browse…", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 4 } })) {
-        pickFile(pb, label, desc, filters);
+    if (dvui.button(@src(), "Browse…", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 4 } }) and !g_dialog_open) {
+        g_dialog_open = true;
+        SDLBackend.c.SDL_ShowOpenFileDialog(
+            dialogCallback,
+            @ptrCast(pb),
+            g_window,
+            filters.ptr,
+            @intCast(filters.len),
+            null, // default location (null = last used / cwd)
+            false, // single selection
+        );
     }
     if (dvui.button(@src(), "Clear", .{}, .{ .gravity_y = 0.5 })) {
         pb.set("");
@@ -371,13 +420,15 @@ fn dirRow(label: []const u8, pb: *config.PathBuf) void {
     }, .{ .expand = .horizontal, .gravity_y = 0.5 });
     te.deinit();
 
-    if (dvui.button(@src(), "Browse…", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 4 } })) {
-        const arena = dvui.currentWindow().arena();
-        const chosen = dvui.dialogNativeFolderSelect(arena, .{
-            .title = label,
-            .path = pb.opt(),
-        }) catch null;
-        if (chosen) |p| pb.set(p);
+    if (dvui.button(@src(), "Browse…", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 4 } }) and !g_dialog_open) {
+        g_dialog_open = true;
+        SDLBackend.c.SDL_ShowOpenFolderDialog(
+            dialogCallback,
+            @ptrCast(pb),
+            g_window,
+            null, // default location
+            false, // single selection
+        );
     }
     if (dvui.button(@src(), "Clear", .{}, .{ .gravity_y = 0.5 })) {
         pb.set("");
@@ -395,16 +446,3 @@ fn numRow(label: []const u8, buf: []u8) void {
     te.deinit();
 }
 
-/// Open a blocking native file picker (tinyfiledialogs) and store the choice.
-/// If the native dialog is unavailable it returns null and the field is left
-/// as-is — the user can still type/paste a path into the text entry.
-fn pickFile(pb: *config.PathBuf, title: []const u8, desc: []const u8, filters: []const []const u8) void {
-    const arena = dvui.currentWindow().arena();
-    const chosen = dvui.dialogNativeFileOpen(arena, .{
-        .title = title,
-        .path = pb.opt(),
-        .filters = filters,
-        .filter_description = desc,
-    }) catch null;
-    if (chosen) |p| pb.set(p);
-}

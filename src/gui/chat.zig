@@ -542,13 +542,15 @@ pub const Session = struct {
         // model retains a `*const lm` into the union, which is stable (self is
         // heap-pinned and the tag is set once). Vision towers are scoped
         // per-encode and never stay resident under the LLM.
-        if (std.mem.eql(u8, arch_str, "qwen3")) {
+        if (std.mem.eql(u8, arch_str, "qwen3") or std.mem.eql(u8, arch_str, "llama")) {
+            // The plain llama/Mistral family reuses the qwen3 stack (qwen3.zig
+            // un-permutes q/k at load, skips QK-norm); qwen3_cuda runs both.
             self.arch = .{ .qwen3 = .{ .lm = try qwen3.CausalLM.load(arena, .{ .gguf = &self.gguf }), .model = undefined } };
             const a = &self.arch.qwen3;
             errdefer a.lm.deinit();
-            // Plain qwen3 is text-only: no mmproj/vision tower exists for it.
+            // qwen3 / llama here are text-only: no mmproj/vision tower.
             if (self.mmproj_gguf != null)
-                std.log.warn("mmproj configured, but qwen3 is text-only — vision disabled", .{});
+                std.log.warn("mmproj configured, but this text-only model has no vision — disabled", .{});
             a.model = try qwen3_cuda.CudaLM.init(gpa, self.be, &a.lm, cap, @min(512, cap.max));
         } else if (std.mem.eql(u8, arch_str, "qwen35")) {
             self.arch = .{ .qwen35 = .{ .lm = try qwen35.Model.load(arena, &self.gguf), .model = undefined } };
@@ -587,7 +589,10 @@ pub const Session = struct {
             }
             errdefer if (a.vit) |*v| v.deinit();
             a.model = try gemma4_cuda.CudaLM.init(gpa, self.be, &a.lm, cap);
-        } else return error.UnsupportedArchitecture;
+        } else unreachable; // familyForArch above is the single arch gate: any
+        // arch reaching here already passed it, and this dispatch covers the
+        // same set (adding an arch means adding it to both — a lockstep invariant,
+        // not a runtime case). A mismatch is a dev bug, caught loudly in Debug.
 
         // A hybrid split's host matmuls need a valid Io BEFORE the first
         // step(): an over-budget model has CPU layers from init, and the
