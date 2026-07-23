@@ -23,6 +23,18 @@ const matmul_f8_spv = @embedFile("matmul_f8_spv");
 const matmul_f32_spv = @embedFile("matmul_f32_spv");
 const transpose_spv = @embedFile("transpose_spv");
 const eltwise_spv = @embedFile("eltwise_spv");
+const attn_batched_spv = @embedFile("attn_batched_spv");
+
+/// Push constants for the standalone `attn_batched` kernel (matches the Push
+/// struct in kernels/attn_batched.zig: u0=total, u1=n_heads, u2=n_kv, u3=hd,
+/// f0=scale). Distinct layout from EltPush (f0 at offset 16, not 24).
+const AttnBatchedPush = extern struct {
+    u0: u32 = 0,
+    u1: u32 = 0,
+    u2: u32 = 0,
+    u3: u32 = 0,
+    f0: f32 = 0,
+};
 
 /// Probe hook: when true, `Context.init` logs every cooperative-matrix config
 /// the device advertises (component types + M/N/K + scope). Used by
@@ -463,6 +475,15 @@ pub const Context = struct {
     pipeline_layout_e: vk.PipelineLayout,
     shader_e: vk.ShaderModule,
     pipes_e: [elt_entry_sizes.len]vk.Pipeline,
+    // Standalone block-diagonal batched-attention kernel (its own module +
+    // 5-buffer set: a=q,b=k,c=v,d=out,e=bounds). Separate from the eltwise
+    // module, which is at the SPIR-V backend's per-module entry-point limit.
+    shader_ab: vk.ShaderModule,
+    dsl_ab: vk.DescriptorSetLayout,
+    pipeline_layout_ab: vk.PipelineLayout,
+    pipe_ab: vk.Pipeline,
+    pool_ab: vk.DescriptorPool,
+    desc_set_ab: vk.DescriptorSet,
     shader_coop: vk.ShaderModule = .null_handle,
     pipe_coop: vk.Pipeline = .null_handle,
     /// fp8 coop GEMM with an f16 C store (exact under f16 accumulators;
@@ -1004,6 +1025,51 @@ pub const Context = struct {
         }
         errdefer for (pipes_e) |pp| d.DestroyPipeline(device, pp, null);
 
+        // Standalone batched-attention kernel: own shader module, 5-buffer set
+        // (a=q,b=k,c=v,d=out,e=bounds), and one persistent descriptor set (the
+        // 5 buffers are stable within a forward, so no ring is needed).
+        var shader_ab: vk.ShaderModule = .null_handle;
+        try createKernelModule(gpa, &d, device, attn_batched_spv, &.{.{ .name = "attn_batched", .x = 64, .y = 1 }}, &shader_ab);
+        errdefer d.DestroyShaderModule(device, shader_ab, null);
+        var dsl_ab: vk.DescriptorSetLayout = .null_handle;
+        {
+            var bindings: [5]vk.DescriptorSetLayoutBinding = undefined;
+            for (&bindings, 0..) |*bd, i| bd.* = .{
+                .binding = @intCast(i),
+                .descriptor_type = .storage_buffer,
+                .descriptor_count = 1,
+                .stage_flags = vk.ShaderStage.compute,
+                .p_immutable_samplers = null,
+            };
+            try check(d.CreateDescriptorSetLayout(device, &.{ .binding_count = bindings.len, .p_bindings = &bindings }, null, &dsl_ab));
+        }
+        errdefer d.DestroyDescriptorSetLayout(device, dsl_ab, null);
+        var pipeline_layout_ab: vk.PipelineLayout = .null_handle;
+        {
+            const push_range: vk.PushConstantRange = .{ .stage_flags = vk.ShaderStage.compute, .offset = 0, .size = @sizeOf(AttnBatchedPush) };
+            try check(d.CreatePipelineLayout(device, &.{
+                .set_layout_count = 1,
+                .p_set_layouts = @ptrCast(&dsl_ab),
+                .push_constant_range_count = 1,
+                .p_push_constant_ranges = @ptrCast(&push_range),
+            }, null, &pipeline_layout_ab));
+        }
+        errdefer d.DestroyPipelineLayout(device, pipeline_layout_ab, null);
+        var pipe_ab: vk.Pipeline = .null_handle;
+        {
+            const info = [1]vk.ComputePipelineCreateInfo{.{ .stage = .{ .module = shader_ab, .p_name = "attn_batched" }, .layout = pipeline_layout_ab }};
+            try check(d.CreateComputePipelines(device, .null_handle, 1, &info, null, @ptrCast(&pipe_ab)));
+        }
+        errdefer d.DestroyPipeline(device, pipe_ab, null);
+        var pool_ab: vk.DescriptorPool = .null_handle;
+        {
+            const pool_size: vk.DescriptorPoolSize = .{ .type = .storage_buffer, .descriptor_count = 5 };
+            try check(d.CreateDescriptorPool(device, &.{ .max_sets = 1, .pool_size_count = 1, .p_pool_sizes = @ptrCast(&pool_size) }, null, &pool_ab));
+        }
+        errdefer d.DestroyDescriptorPool(device, pool_ab, null);
+        var desc_set_ab: vk.DescriptorSet = .null_handle;
+        try check(d.AllocateDescriptorSets(device, &.{ .descriptor_pool = pool_ab, .descriptor_set_count = 1, .p_set_layouts = @ptrCast(&dsl_ab) }, @ptrCast(&desc_set_ab)));
+
         // Cooperative-matrix GEMM pipeline (hand-assembled SPIR-V), when the
         // device supports 16x16x16 f16->f32 subgroup matrices.
         var shader_coop: vk.ShaderModule = .null_handle;
@@ -1299,6 +1365,12 @@ pub const Context = struct {
             .pipeline_layout_e = pipeline_layout_e,
             .shader_e = shader_e,
             .pipes_e = pipes_e,
+            .shader_ab = shader_ab,
+            .dsl_ab = dsl_ab,
+            .pipeline_layout_ab = pipeline_layout_ab,
+            .pipe_ab = pipe_ab,
+            .pool_ab = pool_ab,
+            .desc_set_ab = desc_set_ab,
             .shader_coop = shader_coop,
             .pipe_coop = pipe_coop,
             .shader_coop_i8 = shader_coop_i8,
@@ -1412,6 +1484,11 @@ pub const Context = struct {
         self.d.DestroyShaderModule(self.device, self.shader_f32, null);
         self.d.DestroyShaderModule(self.device, self.shader_tr, null);
         self.d.DestroyShaderModule(self.device, self.shader_e, null);
+        self.d.DestroyPipeline(self.device, self.pipe_ab, null);
+        self.d.DestroyPipelineLayout(self.device, self.pipeline_layout_ab, null);
+        self.d.DestroyShaderModule(self.device, self.shader_ab, null);
+        self.d.DestroyDescriptorPool(self.device, self.pool_ab, null);
+        self.d.DestroyDescriptorSetLayout(self.device, self.dsl_ab, null);
         self.d.DestroyDescriptorSetLayout(self.device, self.dsl, null);
         self.d.DestroyDescriptorSetLayout(self.device, self.dsl_tr, null);
         self.d.DestroyFence(self.device, self.fence, null);
@@ -2954,6 +3031,47 @@ pub const Context = struct {
             @intCast(std.math.divCeil(usize, @max(total_y, 1), es.y) catch unreachable),
             @intCast(@max(total_z, 1)),
         );
+        try self.opEnd();
+    }
+
+    /// Bind the 5 buffers (q,k,v,out,bounds) for `attnBatchedDispatch`. Call
+    /// ONCE before `beginBatch` — the buffers are stable across a forward's
+    /// layers, so one persistent descriptor set (no ring) suffices, and updating
+    /// it before the batch avoids touching a set referenced by recorded commands.
+    /// `bounds` is a device u32[2*total]: bounds[q]=item-start, bounds[total+q]=
+    /// item-end (exclusive) for query row q.
+    pub fn attnBatchedBind(self: *Context, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, bounds: DeviceBuffer) void {
+        const bufs = [5]vk.Buffer{ q.buf, k.buf, v.buf, out.buf, bounds.buf };
+        var bi: [5]vk.DescriptorBufferInfo = undefined;
+        var wr: [5]vk.WriteDescriptorSet = undefined;
+        for (&bi, &wr, bufs, 0..) |*b_, *w_, buf, i| {
+            b_.* = .{ .buffer = buf, .offset = 0 };
+            w_.* = .{
+                .dst_set = self.desc_set_ab,
+                .dst_binding = @intCast(i),
+                .dst_array_element = 0,
+                .descriptor_count = 1,
+                .descriptor_type = .storage_buffer,
+                .p_image_info = null,
+                .p_buffer_info = @ptrCast(b_),
+                .p_texel_buffer_view = null,
+            };
+        }
+        self.d.UpdateDescriptorSets(self.device, wr.len, &wr, 0, null);
+    }
+
+    /// Block-diagonal batched non-causal attention over the buffers last bound by
+    /// `attnBatchedBind`: one launch over all total*n_heads (query,head) threads,
+    /// each query attending only its own item's key range (from the bounds
+    /// buffer). B× the parallelism of a per-item attention loop — the lever that
+    /// fills the GPU for short-sequence encoders.
+    pub fn attnBatchedDispatch(self: *Context, total: usize, n_heads: usize, kv_heads: usize, hd: usize, scale: f32) Error!void {
+        try self.opBegin();
+        self.d.CmdBindPipeline(self.cmd, .compute, self.pipe_ab);
+        self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout_ab, 0, 1, @ptrCast(&self.desc_set_ab), 0, null);
+        const push: AttnBatchedPush = .{ .u0 = @intCast(total), .u1 = @intCast(n_heads), .u2 = @intCast(kv_heads), .u3 = @intCast(hd), .f0 = scale };
+        self.d.CmdPushConstants(self.cmd, self.pipeline_layout_ab, vk.ShaderStage.compute, 0, @sizeOf(AttnBatchedPush), &push);
+        self.d.CmdDispatch(self.cmd, @intCast((total * n_heads + 63) / 64), 1, 1);
         try self.opEnd();
     }
 

@@ -206,6 +206,67 @@ pub fn layerForward(
     }
 }
 
+/// Batched `.fresh` encoder layer: B independent sequences packed contiguously
+/// into `x` [total_rows, hidden] (ragged — item i occupies rows
+/// [row_off[i], row_off[i+1])). Every projection / norm / activation runs once
+/// over all `total` rows (via the shared `qkvProject`/`mlpBlock`), so the batch
+/// amortizes fork/join and weight reuse; only RoPE and attention are per-item
+/// (each sequence attends only itself). Produces the identical result to calling
+/// `layerForward(.fresh)` on each item. Encoder-only (no KV cache); reuses the
+/// caller's per-layer `freqs`/`dims` exactly as `layerForward` does.
+pub fn layerForwardBatchedFresh(
+    comptime spec: LayerSpec,
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    layer: anytype,
+    x: []f32,
+    row_off: []const usize, // len B+1, cumulative row offsets; row_off[B] == total
+    dims: Dims,
+    freqs: ops.rope.Freqs,
+    eps: f32,
+    bidirectional: bool,
+    s: anytype,
+) !void {
+    const b = row_off.len - 1;
+    const total = row_off[b];
+    const normed = s.normed[0 .. total * dims.hidden];
+    const attn_out = s.attn_out[0 .. total * dims.q_dim];
+    const tmp = s.tmp[0 .. total * dims.hidden];
+
+    // --- Attention (projections + norms batched over all rows) ---
+    ops.norm.rmsNorm(normed, x, layer.input_norm, eps);
+    const qkv = try qkvProject(spec, io, gpa, layer, normed, total, dims, eps, s);
+    for (0..b) |i| {
+        const L = row_off[i + 1] - row_off[i];
+        const qs = row_off[i] * dims.q_dim;
+        const ks = row_off[i] * dims.kv_dim;
+        ops.rope.applyRotateHalfAt(qkv.q[qs..][0 .. L * dims.q_dim], freqs, 0, L, dims.n_heads, dims.head_dim);
+        ops.rope.applyRotateHalfAt(qkv.k[ks..][0 .. L * dims.kv_dim], freqs, 0, L, dims.n_kv, dims.head_dim);
+        try ops.attention.attention(io, gpa, attn_out[qs..][0 .. L * dims.q_dim], qkv.q[qs..][0 .. L * dims.q_dim], qkv.k[ks..][0 .. L * dims.kv_dim], qkv.v[ks..][0 .. L * dims.kv_dim], .{
+            .seq_q = L,
+            .seq_kv = L,
+            .n_heads = dims.n_heads,
+            .n_kv_heads = dims.n_kv,
+            .head_dim = dims.head_dim,
+            .causal = !bidirectional,
+            .scale = spec.attn_scale,
+            .window = dims.sliding_window,
+        });
+    }
+    try ops.matmul.matmul(io, gpa, tmp, attn_out, total, layer.o, null);
+    if (comptime spec.sandwich_norms) ops.norm.rmsNorm(tmp, tmp, layer.post_attn_norm, eps);
+    for (x, tmp) |*xi, ti| xi.* += ti;
+
+    // --- MLP (batched over all rows) ---
+    try mlpBlock(spec, io, gpa, layer, x, total, dims, eps, s);
+
+    if (comptime spec.out_scale) {
+        if (layer.out_scale != 1.0) for (x) |*xi| {
+            xi.* *= layer.out_scale;
+        };
+    }
+}
+
 /// Tree-verify decoder layer (speculative tree drafting): `n` tree nodes at the
 /// per-node absolute `positions`, attending the committed cache prefix plus each
 /// node's ancestor chain (`parents`), WITHOUT committing to the cache. This

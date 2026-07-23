@@ -106,6 +106,7 @@ const image_tool_prompt =
     \\You can generate images. When the user asks you to create, draw, generate, paint, or show an image, produce it by writing a tool call on its own line in EXACTLY this format:
     \\<image>a vivid, detailed description of the image</image>
     \\Only a tool call written on its own line generates an image. You may mention the tag inline while explaining, and you may reason about it in your thoughts, without triggering anything — a generation happens ONLY when you commit to it by writing the tag on its own line in your reply.
+    \\You may call the tool multiple times in a single response if the user requests multiple images, there is no limit.
     \\Write a rich prompt covering subject, setting, style, lighting, mood, and composition. The image is generated and shown to the user automatically. When the user asks for a change, emit a new, updated tool call.
     \\You may optionally set size/steps/seed as tag attributes when the user wants a specific aspect ratio, more detail, or a repeatable result:
     \\<image width=1024 height=1536 steps=12 seed=42>a tall portrait…</image>

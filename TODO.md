@@ -1,7 +1,9 @@
-- possible for cancelling/quitting to happen mid-step for image generation? particularly on cpu this is important- pause button
 - pause button
+- i'm pretty sure the meter is reporting some vram under "system" for diffusion
+- can't switch to image studio while diffusing
 - regenerate reply option disappears when model is unloaded
 - when not diffusing and llm is running, llm doesn't offload any diffusion weights but diffusion offloads llm weights
+- split is not respected
 - changing system prompt should wipe context and take effect on the next message
 - begin filling in holes in the capabilities grid (BACKEND.md)
 - add more sampling methods

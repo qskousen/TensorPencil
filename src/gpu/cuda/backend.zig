@@ -94,6 +94,14 @@ pub const DeviceBuffer = struct {
     pub fn ptr(self: DeviceBuffer) cu.CUdeviceptr {
         return @intFromEnum(self.buf);
     }
+
+    /// A non-owning view offset `off_elems` f32 elements into this buffer, for a
+    /// kernel launch that touches a sub-region (e.g. one item of a batched
+    /// activation). `mem` is cleared — views never free.
+    pub fn viewF32(self: DeviceBuffer, off_elems: usize) DeviceBuffer {
+        const off: u64 = off_elems * @sizeOf(f32);
+        return .{ .buf = @enumFromInt(@intFromEnum(self.buf) + off), .mem = .null_handle, .size = if (self.size > off) self.size - off else 0 };
+    }
 };
 
 fn dbFromPtr(p: cu.CUdeviceptr, size: u64) DeviceBuffer {
@@ -2769,6 +2777,33 @@ pub const Backend = struct {
         std.debug.assert(seq_q <= seq_kv);
         const f = try self.eltFn(elt.attn_ptx, "attn");
         try self.eltLaunch(f, q, k, v, out, .{ @intCast(seq_q), @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intFromBool(causal), @intCast(seq_kv) }, .{ scale, 0 }, seq_q * n_heads);
+    }
+
+    /// Block-diagonal BATCHED non-causal attention over B ragged items packed
+    /// into one [total, heads*hd] (q/out) / [total, kv*hd] (k/v) activation.
+    /// `bounds` is a device u32[2*total]: bounds[q]=item-start row,
+    /// bounds[total+q]=item-end (exclusive) for each query row q — so query q
+    /// attends only its own item's keys. One launch over all total*heads
+    /// (query,head) threads (vs a per-item loop of B tiny launches) → the
+    /// parallelism short-sequence encoder attention needs to fill the GPU.
+    pub fn opAttnBatched(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, bounds: DeviceBuffer, total: usize, n_heads: usize, kv_heads: usize, hd: usize, scale: f32) Error!void {
+        self.ptic();
+        defer self.ptoc(.attn);
+        const f = try self.eltFn(elt.attn_batched_ptx, "attn_batched");
+        var p0 = q.ptr();
+        var p1 = k.ptr();
+        var p2 = v.ptr();
+        var p3 = out.ptr();
+        var p4 = bounds.ptr();
+        var uu = [6]u32{ @intCast(total), @intCast(n_heads), @intCast(kv_heads), @intCast(hd), 0, 0 };
+        var ff = [2]f32{ scale, 0 };
+        var params = [_]?*anyopaque{
+            @ptrCast(&p0),    @ptrCast(&p1),    @ptrCast(&p2),    @ptrCast(&p3),   @ptrCast(&p4),
+            @ptrCast(&uu[0]), @ptrCast(&uu[1]), @ptrCast(&uu[2]), @ptrCast(&uu[3]),
+            @ptrCast(&uu[4]), @ptrCast(&uu[5]), @ptrCast(&ff[0]), @ptrCast(&ff[1]),
+        };
+        const grid: u32 = @intCast((total * n_heads + 255) / 256);
+        self.ctx.launch(f, .{ grid, 1, 1 }, .{ 256, 1, 1 }, 0, &params) catch return error.CudaError;
     }
 
     /// rotate-half RoPE in place. total = rows*n_heads*half. `pos0` offsets

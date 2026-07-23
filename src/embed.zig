@@ -93,73 +93,103 @@ pub const TextEncoder = struct {
     }
 
     /// Batch variant: one vector per input text (DiffKeep batches ~8 at index
-    /// time). Returns a slice of caller-owned vectors (and owns the outer slice).
+    /// time). Runs a single fused forward over the whole batch on the selected
+    /// backend (CPU / Vulkan / CUDA) — the passed slice IS the "configurable
+    /// amount". Returns caller-owned vectors + slice.
     pub fn embedTextBatch(self: *const TextEncoder, gpa: std.mem.Allocator, texts: []const []const u8, opts: Options) ![][]f32 {
         const vecs = try gpa.alloc([]f32, texts.len);
-        var done: usize = 0;
-        errdefer {
-            for (vecs[0..done]) |v| gpa.free(v);
-            gpa.free(vecs);
+        errdefer gpa.free(vecs);
+        for (vecs) |*v| v.* = &.{};
+        errdefer for (vecs) |v| if (v.len != 0) gpa.free(v);
+        for (vecs) |*v| v.* = try gpa.alloc(f32, dim);
+
+        // B=1 has no cross-item amortization — take the single path (avoids the
+        // batched forward's per-item offset bookkeeping for the query case).
+        if (texts.len == 1) {
+            try self.embedTextInto(gpa, texts[0], opts, vecs[0]);
+            return vecs;
         }
-        for (texts, 0..) |t, i| {
-            vecs[i] = try self.embedText(gpa, t, opts);
-            done = i + 1;
+
+        // Frame every text into its own id list (arena-scoped), then run one
+        // fused forward over the whole batch on the selected backend.
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const framed = try a.alloc([]const u32, texts.len);
+        for (texts, framed) |t, *f| f.* = try self.frameText(a, t, opts);
+
+        switch (self.impl) {
+            .arctic_embed_m_v2 => |*m| switch (self.backend) {
+                .cpu => try m.embedBatch(self.io, gpa, framed, vecs),
+                .vulkan => |ctx| try models.embed_snowflake_gpu.ModelGpu.init(m).embedBatch(ctx, self.io, gpa, framed, vecs),
+                .cuda => |be| try models.embed_snowflake_cuda.ModelCuda.init(m).embedBatch(be, self.io, gpa, framed, vecs),
+            },
+            .embeddinggemma => |*m| switch (self.backend) {
+                .cpu => try m.embedBatch(self.io, gpa, framed, vecs),
+                .vulkan => |ctx| try models.embed_gemma_gpu.ModelGpu.init(m).embedBatch(ctx, self.io, gpa, framed, vecs),
+                .cuda => |be| try models.embed_gemma_cuda.ModelCuda.init(m).embedBatch(be, self.io, gpa, framed, vecs),
+            },
+            .siglip2_text => |*m| switch (self.backend) {
+                .cpu => try m.embedBatch(self.io, gpa, framed, vecs),
+                .vulkan => |ctx| try models.embed_siglip_gpu.TextModelGpu.init(m).embedBatch(ctx, self.io, gpa, framed, vecs),
+                .cuda => |be| try models.embed_siglip_cuda.TextModelCuda.init(m).embedBatch(be, self.io, gpa, framed, vecs),
+            },
         }
         return vecs;
     }
 
+    /// Role prefix → tokenize → model frame, returning the framed id list
+    /// (allocated with `a`). Shared by the single and batched paths.
+    fn frameText(self: *const TextEncoder, a: std.mem.Allocator, text: []const u8, opts: Options) ![]const u32 {
+        const kind: TextModelKind = self.impl;
+        const prefix = rolePrefix(kind, opts.role);
+        const prefixed = if (prefix.len == 0) text else try std.fmt.allocPrint(a, "{s}{s}", .{ prefix, text });
+
+        var content: std.ArrayList(u32) = .empty;
+        try self.tok.encode(a, prefixed, &content);
+
+        var framed: std.ArrayList(u32) = .empty;
+        switch (kind) {
+            .arctic_embed_m_v2 => {
+                try framed.append(a, 0); // <s>
+                try framed.appendSlice(a, content.items);
+                try framed.append(a, 2); // </s>
+            },
+            .embeddinggemma => {
+                try framed.append(a, 2); // <bos>
+                try framed.appendSlice(a, content.items);
+                try framed.append(a, 1); // <eos>
+            },
+            .siglip2_text => {
+                // SigLIP: [content…(≤60), <eos>=1]; the model pads to 64.
+                const n = @min(content.items.len, 60);
+                try framed.appendSlice(a, content.items[0..n]);
+                try framed.append(a, 1); // <eos>
+            },
+        }
+        return framed.items;
+    }
+
     fn embedTextInto(self: *const TextEncoder, gpa: std.mem.Allocator, text: []const u8, opts: Options, out: []f32) !void {
         std.debug.assert(out.len == dim);
-        const kind: TextModelKind = self.impl;
-
-        // 1. role prefix (applied before tokenization).
-        const prefix = rolePrefix(kind, opts.role);
-        const prefixed = if (prefix.len == 0)
-            text
-        else
-            try std.fmt.allocPrint(gpa, "{s}{s}", .{ prefix, text });
-        defer if (prefix.len != 0) gpa.free(prefixed);
-
-        // 2. tokenize to content ids.
-        var content: std.ArrayList(u32) = .empty;
-        defer content.deinit(gpa);
-        try self.tok.encode(gpa, prefixed, &content);
-
-        // 3. frame + 4. forward on the selected backend, per model.
-        var framed: std.ArrayList(u32) = .empty;
-        defer framed.deinit(gpa);
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const framed = try self.frameText(arena.allocator(), text, opts);
         switch (self.impl) {
-            .arctic_embed_m_v2 => |*m| {
-                try framed.append(gpa, 0); // <s>
-                try framed.appendSlice(gpa, content.items);
-                try framed.append(gpa, 2); // </s>
-                switch (self.backend) {
-                    .cpu => try m.embed(self.io, gpa, framed.items, out),
-                    .vulkan => |ctx| try models.embed_snowflake_gpu.ModelGpu.init(m).embed(ctx, self.io, gpa, framed.items, out),
-                    .cuda => |be| try models.embed_snowflake_cuda.ModelCuda.init(m).embed(be, self.io, gpa, framed.items, out),
-                }
+            .arctic_embed_m_v2 => |*m| switch (self.backend) {
+                .cpu => try m.embed(self.io, gpa, framed, out),
+                .vulkan => |ctx| try models.embed_snowflake_gpu.ModelGpu.init(m).embed(ctx, self.io, gpa, framed, out),
+                .cuda => |be| try models.embed_snowflake_cuda.ModelCuda.init(m).embed(be, self.io, gpa, framed, out),
             },
-            .embeddinggemma => |*m| {
-                try framed.append(gpa, 2); // <bos>
-                try framed.appendSlice(gpa, content.items);
-                try framed.append(gpa, 1); // <eos>
-                switch (self.backend) {
-                    .cpu => try m.embed(self.io, gpa, framed.items, out),
-                    .vulkan => |ctx| try models.embed_gemma_gpu.ModelGpu.init(m).embed(ctx, self.io, gpa, framed.items, out),
-                    .cuda => |be| try models.embed_gemma_cuda.ModelCuda.init(m).embed(be, self.io, gpa, framed.items, out),
-                }
+            .embeddinggemma => |*m| switch (self.backend) {
+                .cpu => try m.embed(self.io, gpa, framed, out),
+                .vulkan => |ctx| try models.embed_gemma_gpu.ModelGpu.init(m).embed(ctx, self.io, gpa, framed, out),
+                .cuda => |be| try models.embed_gemma_cuda.ModelCuda.init(m).embed(be, self.io, gpa, framed, out),
             },
-            .siglip2_text => |*m| {
-                // SigLIP: [content…(≤60), <eos>=1]; the model pads to 64.
-                const max_content = 60;
-                const n = @min(content.items.len, max_content);
-                try framed.appendSlice(gpa, content.items[0..n]);
-                try framed.append(gpa, 1); // <eos>
-                switch (self.backend) {
-                    .cpu => try m.embed(self.io, gpa, framed.items, out),
-                    .vulkan => |ctx| try models.embed_siglip_gpu.TextModelGpu.init(m).embed(ctx, self.io, gpa, framed.items, out),
-                    .cuda => |be| try models.embed_siglip_cuda.TextModelCuda.init(m).embed(be, self.io, gpa, framed.items, out),
-                }
+            .siglip2_text => |*m| switch (self.backend) {
+                .cpu => try m.embed(self.io, gpa, framed, out),
+                .vulkan => |ctx| try models.embed_siglip_gpu.TextModelGpu.init(m).embed(ctx, self.io, gpa, framed, out),
+                .cuda => |be| try models.embed_siglip_cuda.TextModelCuda.init(m).embed(be, self.io, gpa, framed, out),
             },
         }
     }
@@ -187,26 +217,37 @@ pub const ImageEncoder = struct {
     pub fn embedImage(self: *const ImageEncoder, gpa: std.mem.Allocator, rgb_chw: []const f32) ![]f32 {
         const out = try gpa.alloc(f32, dim);
         errdefer gpa.free(out);
+        try self.embedImageInto(gpa, rgb_chw, out);
+        return out;
+    }
+
+    /// Batch variant (DiffKeep indexes ~8 images at a time). Runs a single fused
+    /// ViT forward over all images on the selected backend. Caller-owned.
+    pub fn embedImageBatch(self: *const ImageEncoder, gpa: std.mem.Allocator, images: []const []const f32) ![][]f32 {
+        const vecs = try gpa.alloc([]f32, images.len);
+        errdefer gpa.free(vecs);
+        for (vecs) |*v| v.* = &.{};
+        errdefer for (vecs) |v| if (v.len != 0) gpa.free(v);
+        for (vecs) |*v| v.* = try gpa.alloc(f32, dim);
+
+        if (images.len == 1) {
+            try self.embedImageInto(gpa, images[0], vecs[0]);
+            return vecs;
+        }
+        switch (self.backend) {
+            .cpu => try self.model.embedBatch(self.io, gpa, images, vecs),
+            .vulkan => |ctx| try models.embed_siglip_gpu.VisualModelGpu.init(&self.model).embedBatch(ctx, self.io, gpa, images, vecs),
+            .cuda => |be| try models.embed_siglip_cuda.VisualModelCuda.init(&self.model).embedBatch(be, self.io, gpa, images, vecs),
+        }
+        return vecs;
+    }
+
+    fn embedImageInto(self: *const ImageEncoder, gpa: std.mem.Allocator, rgb_chw: []const f32, out: []f32) !void {
         switch (self.backend) {
             .cpu => try self.model.embed(self.io, gpa, rgb_chw, out),
             .vulkan => |ctx| try models.embed_siglip_gpu.VisualModelGpu.init(&self.model).embed(ctx, self.io, gpa, rgb_chw, out),
             .cuda => |be| try models.embed_siglip_cuda.VisualModelCuda.init(&self.model).embed(be, self.io, gpa, rgb_chw, out),
         }
-        return out;
-    }
-
-    pub fn embedImageBatch(self: *const ImageEncoder, gpa: std.mem.Allocator, images: []const []const f32) ![][]f32 {
-        const vecs = try gpa.alloc([]f32, images.len);
-        var done: usize = 0;
-        errdefer {
-            for (vecs[0..done]) |v| gpa.free(v);
-            gpa.free(vecs);
-        }
-        for (images, 0..) |img, i| {
-            vecs[i] = try self.embedImage(gpa, img);
-            done = i + 1;
-        }
-        return vecs;
     }
 };
 

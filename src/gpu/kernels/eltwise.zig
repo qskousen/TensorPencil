@@ -81,6 +81,7 @@ inline fn decorate() void {
     );
 }
 
+
 export fn rmsnorm() callconv(.spirv_kernel) void {
     decorate();
     const row = gpu.global_invocation_id[0];
@@ -378,9 +379,14 @@ export fn attn_full() callconv(.spirv_kernel) void {
     const scale = pc.f0;
     const head = idx % n_heads;
     const kvh = head / (n_heads / n_kv);
-    const qb = idx * hd;
+    // u4/u5 = element base offsets into the q/out and k/v buffers (batched
+    // ragged packing — one item's sub-region; 0 for the single-item path). q
+    // and k/v may have different per-position strides (GQA), hence two offsets.
+    const qoff = pc.u4;
+    const kvoff = pc.u5;
+    const qb = qoff + idx * hd;
     const kvdim = n_kv * hd;
-    const kvbase = kvh * hd;
+    const kvbase = kvoff + kvh * hd;
     var acc: [256]f32 = undefined;
     var t: u32 = 0;
     while (t < hd) : (t += 1) acc[t] = 0;
@@ -389,6 +395,56 @@ export fn attn_full() callconv(.spirv_kernel) void {
     var j: u32 = 0;
     while (j < seq) : (j += 1) {
         const kb = j * kvdim + kvbase;
+        var sc: f32 = 0;
+        t = 0;
+        while (t < hd) : (t += 1) sc += a.data[qb + t] * b.data[kb + t];
+        sc *= scale;
+        const newmax = @max(mx, sc);
+        const corr = @exp(mx - newmax);
+        const p = @exp(sc - newmax);
+        denom = denom * corr + p;
+        t = 0;
+        while (t < hd) : (t += 1) acc[t] = acc[t] * corr + p * c.data[kb + t];
+        mx = newmax;
+    }
+    const inv = 1.0 / denom;
+    t = 0;
+    while (t < hd) : (t += 1) d.data[qb + t] = acc[t] * inv;
+}
+
+// Block-diagonal BATCHED non-causal attention over B UNIFORM-length items
+// packed into one [total, n_heads*hd] (q/out) / [total, n_kv*hd] (k/v)
+// activation. Each item is `s_rows` rows; query at global row q attends only
+// keys [item*s_rows, item*s_rows + s_rows) where item = q/s_rows — so one
+// launch over all total*n_heads (query,head) threads gives B× the parallelism
+// of the per-item loop (what fills the GPU for short encoder sequences). No
+// per-item bounds buffer needed since lengths are uniform. u0=total, u1=n_heads,
+// u2=n_kv, u3=hd, u4=s_rows, f0=scale. a=q, b=k, c=v, d=out.
+export fn attn_full_batched() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    const total = pc.u0;
+    const n_heads = pc.u1;
+    if (idx >= total * n_heads) return;
+    const n_kv = pc.u2;
+    const hd = pc.u3;
+    const s_rows = pc.u4;
+    const scale = pc.f0;
+    const q_global = idx / n_heads;
+    const head = idx % n_heads;
+    const kvh = head / (n_heads / n_kv);
+    const kv_start = (q_global / s_rows) * s_rows;
+    const kv_end = kv_start + s_rows;
+    const qb = idx * hd;
+    const kvdim = n_kv * hd;
+    var acc: [256]f32 = undefined;
+    var t: u32 = 0;
+    while (t < hd) : (t += 1) acc[t] = 0;
+    var mx: f32 = -3.4e38;
+    var denom: f32 = 0;
+    var j: u32 = kv_start;
+    while (j < kv_end) : (j += 1) {
+        const kb = j * kvdim + kvh * hd;
         var sc: f32 = 0;
         t = 0;
         while (t < hd) : (t += 1) sc += a.data[qb + t] * b.data[kb + t];
@@ -438,7 +494,10 @@ export fn rope_half() callconv(.spirv_kernel) void {
     const row = idx / half; // pos*n_heads + head
     const cos_v = c.data[pos * half + i];
     const sin_v = c.data[pc.u2 + pos * half + i];
-    const base = row * (2 * half);
+    // u5 = element base offset into `a` (batched ragged packing — one item's
+    // sub-region; 0 for the single-item path). The freqs table (c) stays
+    // absolute: each item's positions start at 0.
+    const base = pc.u5 + row * (2 * half);
     const lo = a.data[base + i];
     const hi = a.data[base + half + i];
     a.data[base + i] = lo * cos_v - hi * sin_v;

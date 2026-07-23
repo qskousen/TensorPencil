@@ -220,6 +220,69 @@ pub const Model = struct {
         ops.norm.rmsNorm(out, x, self.final_norm, cfg.rms_eps);
     }
 
+    /// Batched encode: `ids_list[i]` (framed `<bos> … <eos>`) → `outs[i]`
+    /// [embed_dim]. All sequences are packed contiguously into one
+    /// [total_rows, hidden] activation (ragged — no padding), so the whole
+    /// Gemma-3 body runs through `transformer.layerForwardBatchedFresh`: every
+    /// projection / norm / GeGLU batches over `sum(seq_i)` rows and only RoPE +
+    /// attention loop per item. The head (mean-pool + 2 Dense + normalize) is
+    /// then applied per item. Bit-identical to per-item `embed`.
+    pub fn embedBatch(self: *const Model, io: std.Io, gpa: std.mem.Allocator, ids_list: []const []const u32, outs: [][]f32) !void {
+        const cfg = self.cfg;
+        const b = ids_list.len;
+        std.debug.assert(outs.len == b and b > 0);
+
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        const row_off = try a.alloc(usize, b + 1);
+        row_off[0] = 0;
+        var max_seq: usize = 0;
+        for (ids_list, 0..) |ids, i| {
+            std.debug.assert(ids.len > 0 and ids.len <= cfg.sliding_window);
+            row_off[i + 1] = row_off[i] + ids.len;
+            max_seq = @max(max_seq, ids.len);
+        }
+        const total = row_off[b];
+
+        const x = try a.alloc(f32, total * cfg.hidden);
+        for (ids_list, 0..) |ids, i| try qwen3.embedTokens(self.embed_w, ids, x[row_off[i] * cfg.hidden ..][0 .. ids.len * cfg.hidden]);
+        const scale = cfg.embedScale();
+        for (x) |*v| v.* *= scale;
+
+        var fg = try ops.rope.rotateHalfFreqs(gpa, max_seq, cfg.head_dim, cfg.rope_theta);
+        defer fg.deinit(gpa);
+        var fl = try ops.rope.rotateHalfFreqs(gpa, max_seq, cfg.head_dim, cfg.rope_theta_local);
+        defer fl.deinit(gpa);
+
+        var s = try gemma3.Scratch.init(gpa, total, cfg);
+        defer s.deinit(gpa);
+
+        for (self.layers, 0..) |*layer, l| {
+            const dims: transformer.Dims = .{
+                .hidden = cfg.hidden,
+                .n_heads = cfg.n_heads,
+                .n_kv = cfg.n_kv_heads,
+                .head_dim = cfg.head_dim,
+                .q_dim = cfg.qDim(),
+                .kv_dim = cfg.kvDim(),
+                .intermediate = cfg.intermediate,
+                .sliding_window = 0, // full bidirectional (valid for seq <= window)
+            };
+            const freqs = if (cfg.isGlobal(l)) fg else fl;
+            try transformer.layerForwardBatchedFresh(transformer.gemma3_spec, io, gpa, layer, x, row_off, dims, freqs, cfg.rms_eps, true, &s);
+        }
+
+        // final norm (per row) → per-item head.
+        const lhs = try a.alloc(f32, total * cfg.hidden);
+        ops.norm.rmsNorm(lhs, x, self.final_norm, cfg.rms_eps);
+        for (0..b) |i| {
+            std.debug.assert(outs[i].len == embed_dim);
+            try self.head(io, gpa, lhs[row_off[i] * cfg.hidden ..][0 .. (row_off[i + 1] - row_off[i]) * cfg.hidden], outs[i]);
+        }
+    }
+
     /// Encode `ids` (already framed `<bos> … <eos>`) into `out` [embed_dim], an
     /// L2-normalized 768-d embedding: bidirectional body → mean-pool over all
     /// tokens → Dense 768→3072 → Dense 3072→768 → normalize.
@@ -324,4 +387,33 @@ test "embeddinggemma matches ONNX reference" {
     }
     errdefer std.debug.print("worst cosine {d}\n", .{worst});
     try std.testing.expect(worst >= 0.999);
+}
+
+test "embeddinggemma embedBatch matches per-item" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "../DiffKeep/Models/embeddinggemma-300m";
+    std.Io.Dir.cwd().access(io, dir, .{}) catch return error.SkipZigTest;
+
+    var model = try Model.open(gpa, io, dir);
+    defer model.deinit();
+
+    // ragged batch: framed <bos>=2 … <eos>=1, different lengths.
+    const item0 = [_]u32{ 2, 1000, 2049, 1 };
+    const item1 = [_]u32{ 2, 500, 600, 700, 800, 1 };
+    const item2 = [_]u32{ 2, 42, 1 };
+    const ids_list = [_][]const u32{ &item0, &item1, &item2 };
+
+    var single: [3][embed_dim]f32 = undefined;
+    for (ids_list, 0..) |ids, i| try model.embed(io, gpa, ids, &single[i]);
+    var batched: [3][embed_dim]f32 = undefined;
+    var outs: [3][]f32 = .{ &batched[0], &batched[1], &batched[2] };
+    try model.embedBatch(io, gpa, &ids_list, &outs);
+
+    for (0..3) |i| {
+        var maxad: f32 = 0;
+        for (single[i], batched[i]) |sv, bv| maxad = @max(maxad, @abs(sv - bv));
+        errdefer std.debug.print("gemma item {d}: max abs diff {d}\n", .{ i, maxad });
+        try std.testing.expect(maxad < 1e-4);
+    }
 }

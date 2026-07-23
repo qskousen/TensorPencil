@@ -29,6 +29,17 @@ const Weight = ops.matmul.Weight;
 
 pub const embed_dim: usize = 768;
 
+/// In-place L2 normalization (shared by the per-item and batched paths).
+fn l2normalize(v: []f32) void {
+    var ss: f32 = 0;
+    for (v) |x| ss += x * x;
+    const norm = @sqrt(ss);
+    if (norm > 0) {
+        const inv = 1.0 / norm;
+        for (v) |*x| x.* *= inv;
+    }
+}
+
 pub const TextConfig = struct {
     context_length: usize = 64,
     vocab: usize = 256000,
@@ -189,13 +200,87 @@ pub const TextModel = struct {
         ops.norm.layerNorm(x, x, self.ln_final_w, self.ln_final_b, cfg.ln_eps);
         const pooled = x[(n - 1) * w ..][0..w];
         try ops.matmul.matmul(io, gpa, out, pooled, 1, self.text_proj, self.text_proj_bias);
+        l2normalize(out);
+    }
 
-        var ss: f32 = 0;
-        for (out) |val| ss += val * val;
-        const norm = @sqrt(ss);
-        if (norm > 0) {
-            const inv = 1.0 / norm;
-            for (out) |*val| val.* *= inv;
+    /// Batched text encode: `ids_list[i]` → `outs[i]` [embed_dim]. Every item is
+    /// truncated/padded to the fixed 64-token window, so the batch is a uniform
+    /// [B*context_length, width] activation — all GEMMs / LayerNorms / GeGLU run
+    /// once over `B*64` rows; only attention (per item) and the final pool loop
+    /// over the batch. Bit-identical to per-item `embed`.
+    pub fn embedBatch(self: *const TextModel, io: std.Io, gpa: std.mem.Allocator, ids_list: []const []const u32, outs: [][]f32) !void {
+        const cfg = self.cfg;
+        const n = cfg.context_length;
+        const w = cfg.width;
+        const inter = 4 * w;
+        const b = ids_list.len;
+        std.debug.assert(outs.len == b and b > 0);
+        const total = b * n;
+
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        // Padded token windows (one per item), token + positional embedding.
+        const padded = try a.alloc(u32, total);
+        for (ids_list, 0..) |ids, i| {
+            for (padded[i * n ..][0..n], 0..) |*p, t| p.* = if (t < ids.len) ids[t] else cfg.pad_id;
+        }
+        const x = try a.alloc(f32, total * w);
+        try qwen3.embedTokens(self.token_emb, padded, x);
+        for (0..b) |i| {
+            for (x[i * n * w ..][0 .. n * w], self.pos_emb) |*xi, pe| xi.* += pe;
+        }
+
+        const normed = try a.alloc(f32, total * w);
+        const qkv = try a.alloc(f32, total * 3 * w);
+        const q = try a.alloc(f32, total * w);
+        const k = try a.alloc(f32, total * w);
+        const v = try a.alloc(f32, total * w);
+        const attn = try a.alloc(f32, total * w);
+        const proj = try a.alloc(f32, total * w);
+        const fc = try a.alloc(f32, total * inter);
+
+        for (self.layers) |*layer| {
+            ops.norm.layerNorm(normed, x, layer.ln1_w, layer.ln1_b, cfg.ln_eps);
+            try ops.matmul.matmul(io, gpa, qkv, normed, total, layer.in_proj, layer.in_proj_bias);
+            for (0..total) |t| {
+                const src = qkv[t * 3 * w ..];
+                @memcpy(q[t * w ..][0..w], src[0..w]);
+                @memcpy(k[t * w ..][0..w], src[w .. 2 * w]);
+                @memcpy(v[t * w ..][0..w], src[2 * w .. 3 * w]);
+            }
+            for (0..b) |i| {
+                const s0 = i * n * w;
+                try ops.attention.attention(io, gpa, attn[s0..][0 .. n * w], q[s0..][0 .. n * w], k[s0..][0 .. n * w], v[s0..][0 .. n * w], .{
+                    .seq_q = n,
+                    .seq_kv = n,
+                    .n_heads = cfg.n_heads,
+                    .n_kv_heads = cfg.n_heads,
+                    .head_dim = cfg.head_dim,
+                    .causal = false,
+                });
+            }
+            try ops.matmul.matmul(io, gpa, proj, attn, total, layer.out_proj, layer.out_proj_bias);
+            for (x, proj) |*xi, pi| xi.* += pi;
+
+            ops.norm.layerNorm(normed, x, layer.ln2_w, layer.ln2_b, cfg.ln_eps);
+            try ops.matmul.matmul(io, gpa, fc, normed, total, layer.c_fc, layer.c_fc_bias);
+            ops.act.geluTanh(fc);
+            try ops.matmul.matmul(io, gpa, proj, fc, total, layer.c_proj, layer.c_proj_bias);
+            for (x, proj) |*xi, pi| xi.* += pi;
+        }
+        ops.norm.layerNorm(x, x, self.ln_final_w, self.ln_final_b, cfg.ln_eps);
+
+        // Gather each item's last-token row, batch the projection, normalize.
+        const pooled = try a.alloc(f32, b * w);
+        for (0..b) |i| @memcpy(pooled[i * w ..][0..w], x[(i * n + n - 1) * w ..][0..w]);
+        const projd = try a.alloc(f32, b * w);
+        try ops.matmul.matmul(io, gpa, projd, pooled, b, self.text_proj, self.text_proj_bias);
+        for (0..b) |i| {
+            std.debug.assert(outs[i].len == embed_dim);
+            @memcpy(outs[i], projd[i * w ..][0..w]);
+            l2normalize(outs[i]);
         }
     }
 };
@@ -468,12 +553,134 @@ pub const VisualModel = struct {
         for (p, hm) |*pi, mi| pi.* += mi;
 
         @memcpy(out, p);
-        var ss: f32 = 0;
-        for (out) |val| ss += val * val;
-        const norm = @sqrt(ss);
-        if (norm > 0) {
-            const inv = 1.0 / norm;
-            for (out) |*val| val.* *= inv;
+        l2normalize(out);
+    }
+
+    /// Batched image encode: `imgs[i]` (CHW [3*224*224]) → `outs[i]` [embed_dim].
+    /// The per-image patch count is fixed (196), so the batch is a uniform
+    /// [B*nPatches, width] activation — every ViT GEMM / LayerNorm / GeGLU runs
+    /// once over `B*196` rows; only the self-attention (per image) and the MAP
+    /// pool head loop over the batch. Bit-identical to per-item `embed`.
+    pub fn embedBatch(self: *const VisualModel, io: std.Io, gpa: std.mem.Allocator, imgs: []const []const f32, outs: [][]f32) !void {
+        const cfg = self.cfg;
+        const w = cfg.width;
+        const np = cfg.nPatches();
+        const b = imgs.len;
+        std.debug.assert(outs.len == b and b > 0);
+        const total = b * np;
+
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        // Patchify + patch-embed (matmul) + positional, per image.
+        const x = try a.alloc(f32, total * w);
+        for (imgs, 0..) |img, i| {
+            std.debug.assert(img.len == 3 * cfg.image_size * cfg.image_size);
+            const patch_in = try self.patchify(a, img);
+            try ops.matmul.matmul(io, gpa, x[i * np * w ..][0 .. np * w], patch_in, np, self.patch_w, self.patch_b);
+            for (x[i * np * w ..][0 .. np * w], self.pos_emb) |*xi, pe| xi.* += pe;
+        }
+
+        const normed = try a.alloc(f32, total * w);
+        const qkv = try a.alloc(f32, total * 3 * w);
+        const q = try a.alloc(f32, total * w);
+        const k = try a.alloc(f32, total * w);
+        const v = try a.alloc(f32, total * w);
+        const attn = try a.alloc(f32, total * w);
+        const proj = try a.alloc(f32, total * w);
+        const fc = try a.alloc(f32, total * cfg.mlp_dim);
+        for (self.blocks) |*bl| {
+            ops.norm.layerNorm(normed, x, bl.norm1_w, bl.norm1_b, cfg.ln_eps);
+            try ops.matmul.matmul(io, gpa, qkv, normed, total, bl.qkv, bl.qkv_b);
+            for (0..total) |t| {
+                const src = qkv[t * 3 * w ..];
+                @memcpy(q[t * w ..][0..w], src[0..w]);
+                @memcpy(k[t * w ..][0..w], src[w .. 2 * w]);
+                @memcpy(v[t * w ..][0..w], src[2 * w .. 3 * w]);
+            }
+            for (0..b) |i| {
+                const s0 = i * np * w;
+                try ops.attention.attention(io, gpa, attn[s0..][0 .. np * w], q[s0..][0 .. np * w], k[s0..][0 .. np * w], v[s0..][0 .. np * w], .{
+                    .seq_q = np,
+                    .seq_kv = np,
+                    .n_heads = cfg.n_heads,
+                    .n_kv_heads = cfg.n_heads,
+                    .head_dim = cfg.head_dim,
+                    .causal = false,
+                });
+            }
+            try ops.matmul.matmul(io, gpa, proj, attn, total, bl.attn_proj, bl.attn_proj_b);
+            for (x, proj) |*xi, pi| xi.* += pi;
+
+            ops.norm.layerNorm(normed, x, bl.norm2_w, bl.norm2_b, cfg.ln_eps);
+            try ops.matmul.matmul(io, gpa, fc, normed, total, bl.fc1, bl.fc1_b);
+            ops.act.geluTanh(fc);
+            try ops.matmul.matmul(io, gpa, proj, fc, total, bl.fc2, bl.fc2_b);
+            for (x, proj) |*xi, pi| xi.* += pi;
+        }
+        ops.norm.layerNorm(x, x, self.norm_w, self.norm_b, cfg.ln_eps);
+
+        try self.mapHeadBatch(io, gpa, x, outs);
+    }
+
+    /// Batched MAP attention-pool head over `x_normed` [B*nPatches*width]. The
+    /// latent query is image-independent (computed once); the KV projection and
+    /// the residual MLP batch over B rows, and only the cross-attention loops per
+    /// image. Bit-identical to `mapHead` per item.
+    pub fn mapHeadBatch(self: *const VisualModel, io: std.Io, gpa: std.mem.Allocator, x_normed: []const f32, outs: [][]f32) !void {
+        const cfg = self.cfg;
+        const w = cfg.width;
+        const b = outs.len;
+        const np = x_normed.len / w / b;
+
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        // Latent query (same for every image).
+        const q1 = try a.alloc(f32, w);
+        try ops.matmul.matmul(io, gpa, q1, self.latent, 1, self.q_w, self.q_b);
+
+        // KV projection over the whole batch, then split per row.
+        const kv = try a.alloc(f32, b * np * 2 * w);
+        try ops.matmul.matmul(io, gpa, kv, x_normed, b * np, self.kv_w, self.kv_b);
+
+        const pooled = try a.alloc(f32, b * w);
+        const kk = try a.alloc(f32, np * w);
+        const vv = try a.alloc(f32, np * w);
+        for (0..b) |i| {
+            for (0..np) |t| {
+                const s = (i * np + t) * 2 * w;
+                @memcpy(kk[t * w ..][0..w], kv[s..][0..w]);
+                @memcpy(vv[t * w ..][0..w], kv[s + w ..][0..w]);
+            }
+            try ops.attention.attention(io, gpa, pooled[i * w ..][0..w], q1, kk, vv, .{
+                .seq_q = 1,
+                .seq_kv = np,
+                .n_heads = cfg.n_heads,
+                .n_kv_heads = cfg.n_heads,
+                .head_dim = cfg.head_dim,
+                .causal = false,
+            });
+        }
+
+        // proj → residual pre-norm MLP, batched over B rows.
+        const p = try a.alloc(f32, b * w);
+        try ops.matmul.matmul(io, gpa, p, pooled, b, self.proj_w, self.proj_b);
+        const hn = try a.alloc(f32, b * w);
+        ops.norm.layerNorm(hn, p, self.head_norm_w, self.head_norm_b, cfg.ln_eps);
+        const hf = try a.alloc(f32, b * cfg.mlp_dim);
+        try ops.matmul.matmul(io, gpa, hf, hn, b, self.head_fc1, self.head_fc1_b);
+        ops.act.geluTanh(hf);
+        const hm = try a.alloc(f32, b * w);
+        try ops.matmul.matmul(io, gpa, hm, hf, b, self.head_fc2, self.head_fc2_b);
+        for (p, hm) |*pi, mi| pi.* += mi;
+
+        for (0..b) |i| {
+            std.debug.assert(outs[i].len == embed_dim);
+            @memcpy(outs[i], p[i * w ..][0..w]);
+            l2normalize(outs[i]);
         }
     }
 };
@@ -568,4 +775,63 @@ test "siglip2 visual tower matches ONNX reference" {
     const cos = cosine(out, &wbuf);
     errdefer std.debug.print("visual cosine {d}\n", .{cos});
     try std.testing.expect(cos >= 0.999);
+}
+
+test "siglip2 text embedBatch matches per-item" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "../DiffKeep/Models/ViT-B-16-SigLIP2-timm";
+    std.Io.Dir.cwd().access(io, dir, .{}) catch return error.SkipZigTest;
+
+    var model = try TextModel.open(gpa, io, dir);
+    defer model.deinit();
+
+    const item0 = [_]u32{ 100, 200, 300, 1 };
+    const item1 = [_]u32{ 55, 66, 77, 88, 99, 1 };
+    const item2 = [_]u32{ 42, 1 };
+    const ids_list = [_][]const u32{ &item0, &item1, &item2 };
+
+    var single: [3][embed_dim]f32 = undefined;
+    for (ids_list, 0..) |ids, i| try model.embed(io, gpa, ids, &single[i]);
+    var batched: [3][embed_dim]f32 = undefined;
+    var outs: [3][]f32 = .{ &batched[0], &batched[1], &batched[2] };
+    try model.embedBatch(io, gpa, &ids_list, &outs);
+
+    for (0..3) |i| {
+        var maxad: f32 = 0;
+        for (single[i], batched[i]) |sv, bv| maxad = @max(maxad, @abs(sv - bv));
+        errdefer std.debug.print("text item {d}: max abs diff {d}\n", .{ i, maxad });
+        try std.testing.expect(maxad < 1e-5);
+    }
+}
+
+test "siglip2 visual embedBatch matches per-item" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const dir = "../DiffKeep/Models/ViT-B-16-SigLIP2-timm";
+    std.Io.Dir.cwd().access(io, dir, .{}) catch return error.SkipZigTest;
+
+    var model = try VisualModel.open(gpa, io, dir);
+    defer model.deinit();
+
+    const n = 3 * 224 * 224;
+    var prng = std.Random.DefaultPrng.init(0x51A1);
+    const r = prng.random();
+    const imgs_data = try gpa.alloc(f32, 2 * n);
+    defer gpa.free(imgs_data);
+    for (imgs_data) |*e| e.* = (r.float(f32) - 0.5) * 2.0;
+    const imgs = [_][]const f32{ imgs_data[0..n], imgs_data[n..] };
+
+    var single: [2][embed_dim]f32 = undefined;
+    for (imgs, 0..) |img, i| try model.embed(io, gpa, img, &single[i]);
+    var batched: [2][embed_dim]f32 = undefined;
+    var outs: [2][]f32 = .{ &batched[0], &batched[1] };
+    try model.embedBatch(io, gpa, &imgs, &outs);
+
+    for (0..2) |i| {
+        var maxad: f32 = 0;
+        for (single[i], batched[i]) |sv, bv| maxad = @max(maxad, @abs(sv - bv));
+        errdefer std.debug.print("visual item {d}: max abs diff {d}\n", .{ i, maxad });
+        try std.testing.expect(maxad < 1e-4);
+    }
 }

@@ -48,7 +48,7 @@ pub fn build(b: *std.Build) void {
     // into the library as raw module bytes.
     // One object per kernel: the 0.16 SPIR-V backend only supports workgroup
     // storage in a single entry point per module.
-    const kernel_names = [_][]const u8{ "matmul_f8", "matmul_f32", "transpose", "eltwise" };
+    const kernel_names = [_][]const u8{ "matmul_f8", "matmul_f32", "transpose", "eltwise", "attn_batched" };
     var kernel_objs: [kernel_names.len]*std.Build.Step.Compile = undefined;
     for (kernel_names, 0..) |kname, i| {
         kernel_objs[i] = b.addObject(.{
@@ -490,6 +490,28 @@ pub fn build(b: *std.Build) void {
             });
             gui_test_step.dependOn(&b.addRunArtifact(gui_chat_tests).step);
         }
+    }
+
+    // embed-bench: throughput profiler for the tp.embed encoders (per-item vs
+    // batched forwards, DIFFKEEP.md M8). Only needs the TensorPencil module +
+    // a device for the GPU backends. `zig build embed-bench -- [opts]`.
+    {
+        const eb_step = b.step("embed-bench", "Build+run the tp.embed encoder throughput profiler");
+        const eb_exe = b.addExecutable(.{
+            .name = "embed-bench",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/embed_bench.zig"),
+                .link_libc = true,
+                .target = target,
+                .optimize = .ReleaseFast,
+                .imports = &.{
+                    .{ .name = "TensorPencil", .module = mod },
+                },
+            }),
+        });
+        const run_eb = b.addRunArtifact(eb_exe);
+        if (b.args) |args| run_eb.addArgs(args);
+        eb_step.dependOn(&run_eb.step);
     }
 
     // ggml-bench / qgemv-bench: CPU-kernel + device GEMV benchmarks that need

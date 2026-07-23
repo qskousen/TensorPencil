@@ -248,6 +248,95 @@ pub const attn_ptx: [:0]const u8 =
     \\}
 ;
 
+/// Block-diagonal BATCHED non-causal attention: q/k/v/out are one packed
+/// [total_rows, heads*hd] (q/out) / [total_rows, kv*hd] (k/v) activation for B
+/// ragged items concatenated. p4 = bounds (u32[2*total]): for query row q,
+/// bounds[q] = its item's first row, bounds[total+q] = one-past its item's last
+/// row — so each query attends ONLY its own item's keys. One launch over all
+/// total*heads (query,head) threads → B× the parallelism of the per-item loop,
+/// which is what fills the GPU for short-sequence encoders. u0=total, u1=heads,
+/// u2=kv_heads, u3=hd, f0=scale. Same online-softmax math as `attn`.
+pub const attn_batched_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry attn_batched(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,.param .u64 p4,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .local .align 4 .b8 accl[2048];
+    \\  .reg .pred %p<4>;
+    \\  .reg .b32 %r<32>;
+    \\  .reg .f32 %f<20>;
+    \\  .reg .b64 %rd<40>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x;
+    \\  mad.lo.s32 %r4,%r1,%r2,%r3;           // idx
+    \\  ld.param.u32 %r5,[u0];                // total
+    \\  ld.param.u32 %r6,[u1];                // heads
+    \\  mul.lo.s32 %r7,%r5,%r6;               // total*heads
+    \\  setp.ge.u32 %p1,%r4,%r7; @%p1 bra END;
+    \\  ld.param.u32 %r8,[u2];                // kv_heads
+    \\  ld.param.u32 %r9,[u3];                // hd
+    \\  ld.param.f32 %f1,[f0];                // scale
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2]; ld.param.u64 %rd4,[p3]; ld.param.u64 %rd20,[p4];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3; cvta.to.global.u64 %rd4,%rd4; cvta.to.global.u64 %rd20,%rd20;
+    \\  div.u32 %r10,%r4,%r6;                 // q = idx/heads (global row)
+    \\  rem.u32 %r11,%r4,%r6;                 // h = idx%heads
+    \\  div.u32 %r12,%r6,%r8;                 // group = heads/kv
+    \\  div.u32 %r13,%r11,%r12;               // kv = h/group
+    \\  mad.lo.s32 %r14,%r10,%r6,%r11; mul.lo.s32 %r14,%r14,%r9; // qbase=(q*heads+h)*hd
+    \\  mul.wide.u32 %rd5,%r14,4; add.s64 %rd6,%rd1,%rd5;  // Q row ptr
+    \\  mul.wide.u32 %rd21,%r10,4; add.s64 %rd22,%rd20,%rd21; ld.global.u32 %r24,[%rd22]; // start=bounds[q]
+    \\  add.u32 %r25,%r5,%r10; mul.wide.u32 %rd23,%r25,4; add.s64 %rd24,%rd20,%rd23; ld.global.u32 %r26,[%rd24]; // end=bounds[total+q]
+    \\  mov.u32 %r15,0;
+    \\ZINIT:
+    \\  setp.ge.u32 %p2,%r15,%r9; @%p2 bra ZD;
+    \\  mul.wide.u32 %rd7,%r15,4; mov.u32 %r16, accl; cvt.u64.u32 %rd8,%r16; add.s64 %rd8,%rd8,%rd7;
+    \\  mov.f32 %f2,0f00000000; st.local.f32 [%rd8],%f2;
+    \\  add.u32 %r15,%r15,1; bra ZINIT;
+    \\ZD:
+    \\  mov.f32 %f10,0fFF800000;              // m=-inf
+    \\  mov.f32 %f11,0f00000000;              // d=0
+    \\  mov.u32 %r17,%r24;                    // j = start
+    \\JLOOP:
+    \\  setp.ge.u32 %p2,%r17,%r26; @%p2 bra JD;   // j >= end
+    \\  mad.lo.s32 %r18,%r17,%r8,%r13; mul.lo.s32 %r18,%r18,%r9;
+    \\  mul.wide.u32 %rd9,%r18,4; add.s64 %rd10,%rd2,%rd9;  // K row
+    \\  add.s64 %rd11,%rd3,%rd9;                            // V row
+    \\  mov.f32 %f3,0f00000000; mov.u32 %r19,0; mov.b64 %rd12,%rd6; mov.b64 %rd13,%rd10;
+    \\DOT:
+    \\  setp.ge.u32 %p3,%r19,%r9; @%p3 bra DOTD;
+    \\  ld.global.f32 %f4,[%rd12]; ld.global.f32 %f5,[%rd13]; fma.rn.f32 %f3,%f4,%f5,%f3;
+    \\  add.s64 %rd12,%rd12,4; add.s64 %rd13,%rd13,4; add.u32 %r19,%r19,1; bra DOT;
+    \\DOTD:
+    \\  mul.f32 %f3,%f3,%f1;
+    \\  max.f32 %f12,%f10,%f3;
+    \\  sub.f32 %f6,%f10,%f12; mul.f32 %f6,%f6,0f3FB8AA3B; ex2.approx.f32 %f6,%f6;
+    \\  sub.f32 %f7,%f3,%f12; mul.f32 %f7,%f7,0f3FB8AA3B; ex2.approx.f32 %f7,%f7;
+    \\  mul.f32 %f11,%f11,%f6; add.f32 %f11,%f11,%f7;
+    \\  mov.f32 %f10,%f12;
+    \\  mov.u32 %r19,0; mov.b64 %rd14,%rd11;
+    \\ACC:
+    \\  setp.ge.u32 %p3,%r19,%r9; @%p3 bra ACCD;
+    \\  mul.wide.u32 %rd15,%r19,4; mov.u32 %r20, accl; cvt.u64.u32 %rd16,%r20; add.s64 %rd16,%rd16,%rd15;
+    \\  ld.local.f32 %f8,[%rd16]; ld.global.f32 %f9,[%rd14];
+    \\  mul.f32 %f8,%f8,%f6; fma.rn.f32 %f8,%f7,%f9,%f8; st.local.f32 [%rd16],%f8;
+    \\  add.s64 %rd14,%rd14,4; add.u32 %r19,%r19,1; bra ACC;
+    \\ACCD:
+    \\  add.u32 %r17,%r17,1; bra JLOOP;
+    \\JD:
+    \\  rcp.approx.f32 %f13,%f11;
+    \\  add.s64 %rd17,%rd4,%rd5;              // out row (same layout as Q)
+    \\  mov.u32 %r19,0;
+    \\WR:
+    \\  setp.ge.u32 %p3,%r19,%r9; @%p3 bra END;
+    \\  mul.wide.u32 %rd15,%r19,4; mov.u32 %r20, accl; cvt.u64.u32 %rd16,%r20; add.s64 %rd16,%rd16,%rd15;
+    \\  ld.local.f32 %f8,[%rd16]; mul.f32 %f8,%f8,%f13; add.s64 %rd18,%rd17,%rd15; st.global.f32 [%rd18],%f8;
+    \\  add.u32 %r19,%r19,1; bra WR;
+    \\END:
+    \\  ret;
+    \\}
+;
+
 /// qk_rmsnorm with one 256-thread block per row (shared-memory reduction) —
 /// the LLM decode path norms rows=1 x dim=2560, where the one-thread-per-row
 /// kernel serializes the whole row on a single lane. Same math/params:

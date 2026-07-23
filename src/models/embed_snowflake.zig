@@ -60,6 +60,17 @@ pub const config_m_v2: Config = .{
 
 pub const embed_dim: usize = 768;
 
+/// In-place L2 normalization (shared by `embed` / `embedBatch`).
+fn l2normalize(v: []f32) void {
+    var ss: f32 = 0;
+    for (v) |x| ss += x * x;
+    const norm = @sqrt(ss);
+    if (norm > 0) {
+        const inv = 1.0 / norm;
+        for (v) |*x| x.* *= inv;
+    }
+}
+
 const Layer = struct {
     qkv: Weight, // [3*hidden, hidden]
     qkv_bias: []const f32, // [3*hidden]
@@ -137,6 +148,107 @@ pub const Model = struct {
         self.* = undefined;
     }
 
+    /// Batched encode: `ids_list[i]` (already framed `<s> … </s>`) → `outs[i]`
+    /// [embed_dim]. All items are packed into one contiguous [total_rows, hidden]
+    /// activation (ragged — no padding), so every GEMM / LayerNorm / GeGLU runs
+    /// once over `sum(seq_i)` rows and amortizes fork/join + weight reuse across
+    /// the batch. RoPE and attention are the only per-item ops (each item attends
+    /// only itself), so they loop over the batch. Bit-identical to calling
+    /// `embed` per item (same math, just fused rows).
+    pub fn embedBatch(self: *const Model, io: std.Io, gpa: std.mem.Allocator, ids_list: []const []const u32, outs: [][]f32) !void {
+        const cfg = self.cfg;
+        const h = cfg.hidden;
+        const b = ids_list.len;
+        std.debug.assert(outs.len == b and b > 0);
+
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        // Per-item row offsets into the packed activation, and the batch's max
+        // sequence length (for the shared RoPE table).
+        const off = try a.alloc(usize, b + 1);
+        off[0] = 0;
+        var max_seq: usize = 0;
+        for (ids_list, 0..) |ids, i| {
+            std.debug.assert(ids.len > 0);
+            off[i + 1] = off[i] + ids.len;
+            max_seq = @max(max_seq, ids.len);
+        }
+        const total = off[b];
+
+        // Embeddings: word + token_type[0], then LayerNorm (per row).
+        const x = try a.alloc(f32, total * h);
+        for (ids_list, 0..) |ids, i| try qwen3.embedTokens(self.word_emb, ids, x[off[i] * h ..][0 .. ids.len * h]);
+        for (0..total) |t| {
+            for (x[t * h ..][0..h], self.token_type0) |*xi, tt| xi.* += tt;
+        }
+        ops.norm.layerNorm(x, x, self.emb_ln_w, self.emb_ln_b, cfg.ln_eps);
+
+        var freqs = try ops.rope.rotateHalfFreqs(gpa, max_seq, cfg.head_dim, cfg.rope_theta);
+        defer freqs.deinit(gpa);
+
+        const qkv = try a.alloc(f32, total * 3 * h);
+        const q = try a.alloc(f32, total * h);
+        const k = try a.alloc(f32, total * h);
+        const v = try a.alloc(f32, total * h);
+        const attn = try a.alloc(f32, total * h);
+        const proj = try a.alloc(f32, total * h);
+        const ug = try a.alloc(f32, total * 2 * cfg.intermediate);
+        const up = try a.alloc(f32, total * cfg.intermediate);
+        const gate = try a.alloc(f32, total * cfg.intermediate);
+        const mlp = try a.alloc(f32, total * h);
+
+        for (self.layers) |*layer| {
+            // Packed qkv over the whole batch, then split per row.
+            try ops.matmul.matmul(io, gpa, qkv, x, total, layer.qkv, layer.qkv_bias);
+            for (0..total) |t| {
+                const src = qkv[t * 3 * h ..];
+                @memcpy(q[t * h ..][0..h], src[0..h]);
+                @memcpy(k[t * h ..][0..h], src[h .. 2 * h]);
+                @memcpy(v[t * h ..][0..h], src[2 * h .. 3 * h]);
+            }
+            // RoPE + non-causal attention, per item (each attends only itself).
+            for (0..b) |i| {
+                const s0 = off[i] * h;
+                const L = ids_list[i].len;
+                ops.rope.applyRotateHalfAt(q[s0..][0 .. L * h], freqs, 0, L, cfg.n_heads, cfg.head_dim);
+                ops.rope.applyRotateHalfAt(k[s0..][0 .. L * h], freqs, 0, L, cfg.n_heads, cfg.head_dim);
+                try ops.attention.attention(io, gpa, attn[s0..][0 .. L * h], q[s0..][0 .. L * h], k[s0..][0 .. L * h], v[s0..][0 .. L * h], .{
+                    .seq_q = L,
+                    .seq_kv = L,
+                    .n_heads = cfg.n_heads,
+                    .n_kv_heads = cfg.n_heads,
+                    .head_dim = cfg.head_dim,
+                    .causal = false,
+                });
+            }
+            try ops.matmul.matmul(io, gpa, proj, attn, total, layer.o, layer.o_bias);
+            for (x, proj) |*xi, pi| xi.* += pi; // residual
+            ops.norm.layerNorm(x, x, layer.attn_ln_w, layer.attn_ln_b, cfg.ln_eps);
+
+            // GeGLU MLP over the whole batch.
+            try ops.matmul.matmul(io, gpa, ug, x, total, layer.up_gate, null);
+            for (0..total) |t| {
+                const src = ug[t * 2 * cfg.intermediate ..];
+                @memcpy(up[t * cfg.intermediate ..][0..cfg.intermediate], src[0..cfg.intermediate]);
+                @memcpy(gate[t * cfg.intermediate ..][0..cfg.intermediate], src[cfg.intermediate .. 2 * cfg.intermediate]);
+            }
+            ops.act.geluErfMul(gate, up);
+            try ops.matmul.matmul(io, gpa, mlp, gate, total, layer.down, layer.down_bias);
+            for (x, mlp) |*xi, mi| xi.* += mi; // residual
+            ops.norm.layerNorm(x, x, layer.mlp_ln_w, layer.mlp_ln_b, cfg.ln_eps);
+        }
+
+        // CLS pooling (each item's first row) + L2 normalize.
+        for (0..b) |i| {
+            const out = outs[i];
+            std.debug.assert(out.len == embed_dim);
+            @memcpy(out, x[off[i] * h ..][0..h]);
+            l2normalize(out);
+        }
+    }
+
     /// Encode `ids` (already framed `<s> … </s>`) into `out` [embed_dim], an
     /// L2-normalized CLS embedding.
     pub fn embed(self: *const Model, io: std.Io, gpa: std.mem.Allocator, ids: []const u32, out: []f32) !void {
@@ -209,13 +321,7 @@ pub const Model = struct {
 
         // CLS pooling (token 0) + L2 normalize.
         @memcpy(out, x[0..h]);
-        var ss: f32 = 0;
-        for (out) |val| ss += val * val;
-        const norm = @sqrt(ss);
-        if (norm > 0) {
-            const inv = 1.0 / norm;
-            for (out) |*val| val.* *= inv;
-        }
+        l2normalize(out);
     }
 };
 
@@ -275,4 +381,83 @@ test "snowflake arctic embed matches ONNX reference" {
     }
     errdefer std.debug.print("worst cosine {d}\n", .{worst});
     try std.testing.expect(worst >= 0.999);
+}
+
+// Batched forward must be bit-close to per-item (same math, fused rows). Uses
+// synthetic weights so it runs in the fast CPU suite (no checkpoint).
+test "snowflake embedBatch matches per-item" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // hidden must equal embed_dim (CLS pool copies the full hidden row); keep
+    // everything else small so the test stays in the fast CPU suite.
+    const cfg: Config = .{ .n_layers = 2, .hidden = embed_dim, .n_heads = 12, .head_dim = 64, .intermediate = 128, .vocab = 100, .ln_eps = 1e-12, .rope_theta = 160000.0 };
+    var prng = std.Random.DefaultPrng.init(0xABCD);
+    const r = prng.random();
+    const mat = struct {
+        fn f(al: std.mem.Allocator, rnd: std.Random, rows: usize, cols: usize) !Weight {
+            const d = try al.alloc(f32, rows * cols);
+            for (d) |*e| e.* = (rnd.float(f32) - 0.5) * 0.2;
+            return Weight.fromF32(d, rows, cols);
+        }
+    }.f;
+    const vecf = struct {
+        fn f(al: std.mem.Allocator, rnd: std.Random, n: usize, center: f32) ![]f32 {
+            const d = try al.alloc(f32, n);
+            for (d) |*e| e.* = center + (rnd.float(f32) - 0.5) * 0.1;
+            return d;
+        }
+    }.f;
+
+    const layers = try a.alloc(Layer, cfg.n_layers);
+    for (layers) |*ly| ly.* = .{
+        .qkv = try mat(a, r, 3 * cfg.hidden, cfg.hidden),
+        .qkv_bias = try vecf(a, r, 3 * cfg.hidden, 0),
+        .o = try mat(a, r, cfg.hidden, cfg.hidden),
+        .o_bias = try vecf(a, r, cfg.hidden, 0),
+        .attn_ln_w = try vecf(a, r, cfg.hidden, 1),
+        .attn_ln_b = try vecf(a, r, cfg.hidden, 0),
+        .up_gate = try mat(a, r, 2 * cfg.intermediate, cfg.hidden),
+        .down = try mat(a, r, cfg.hidden, cfg.intermediate),
+        .down_bias = try vecf(a, r, cfg.hidden, 0),
+        .mlp_ln_w = try vecf(a, r, cfg.hidden, 1),
+        .mlp_ln_b = try vecf(a, r, cfg.hidden, 0),
+    };
+    const word_data = try a.alloc(f32, cfg.vocab * cfg.hidden);
+    for (word_data) |*e| e.* = (r.float(f32) - 0.5) * 0.2;
+
+    var model: Model = .{
+        .arena = undefined,
+        .st = undefined,
+        .cfg = cfg,
+        .word_emb = Weight.fromF32(word_data, cfg.vocab, cfg.hidden),
+        .token_type0 = try vecf(a, r, cfg.hidden, 0),
+        .emb_ln_w = try vecf(a, r, cfg.hidden, 1),
+        .emb_ln_b = try vecf(a, r, cfg.hidden, 0),
+        .layers = layers,
+    };
+
+    // Ragged batch: three items of different lengths.
+    const item0 = [_]u32{ 0, 5, 9, 2 };
+    const item1 = [_]u32{ 0, 11, 3, 7, 42, 2 };
+    const item2 = [_]u32{ 0, 88, 2 };
+    const ids_list = [_][]const u32{ &item0, &item1, &item2 };
+
+    var single: [3][embed_dim]f32 = undefined;
+    for (ids_list, 0..) |ids, i| try model.embed(io, gpa, ids, &single[i]);
+
+    var batched: [3][embed_dim]f32 = undefined;
+    var outs: [3][]f32 = .{ &batched[0], &batched[1], &batched[2] };
+    try model.embedBatch(io, gpa, &ids_list, &outs);
+
+    for (0..3) |i| {
+        var maxad: f32 = 0;
+        for (single[i], batched[i]) |sv, bv| maxad = @max(maxad, @abs(sv - bv));
+        errdefer std.debug.print("item {d}: max abs diff {d}\n", .{ i, maxad });
+        try std.testing.expect(maxad < 1e-5);
+    }
 }
