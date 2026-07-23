@@ -93,6 +93,9 @@ var g_llm_suspend: ?LlmSuspend = null;
 // Set when a reload should CONTINUE a suspended mid-turn response (spawn a decode
 // worker after the fresh session adopts the carried `ids`). (Tier 3.)
 var g_pending_continue: bool = false;
+// Set when the user hits › (regenerate) while the LLM is unloaded: lazy-load,
+// then regenerate the last reply once the carried transcript is adopted.
+var g_pending_regenerate: bool = false;
 // Guards `g_session` teardown against the diffusion WORKER thread, which reads
 // the session in its VRAM-coordinator hooks (budget/reclaim). Held while a full
 // LLM eject frees the session so a concurrent worker can't touch freed memory.
@@ -1177,6 +1180,13 @@ fn maybeStartReload() void {
                 g_pending_continue = false;
                 if (g_session) |s| s.continueOpenTurn() catch |err| std.log.err("resume continue: {t}", .{err});
             }
+            // Regenerate requested while unloaded (the › button): the fresh
+            // session has adopted the carried transcript, so regenerate its last
+            // reply now.
+            if (g_pending_regenerate) {
+                g_pending_regenerate = false;
+                if (g_session) |s| s.regenerate() catch |err| std.log.err("deferred regenerate: {t}", .{err});
+            }
         }
     }
     if (!g_reload_requested or g_loading.load(.acquire) or g_loader != null) return;
@@ -1417,7 +1427,7 @@ fn pendingUserBubble(text: []const u8) void {
     markdown_view.render(@src(), text, .{});
 }
 
-fn renderMessage(s: ?*chat.Session, m: *const chat.Message, idx: usize) void {
+fn renderMessage(s: ?*chat.Session, m: *chat.Message, idx: usize) void {
     const is_user = m.role == .user;
     const theme = dvui.themeGet();
 
@@ -1520,20 +1530,30 @@ fn renderMessage(s: ?*chat.Session, m: *const chat.Message, idx: usize) void {
 
     // ‹ n/m › navigation on the LAST assistant response (TODO #3): ‹ shows the
     // previous take, › the next — or, on the newest take, regenerates a fresh
-    // one. Hidden while generating (Stop is the control then) and on a carried
-    // read-only transcript (no session to regenerate with). Images belonging
-    // to a non-active take keep generating in the engine's unified queue.
-    if (!is_user) if (s) |ss| {
-        const nmsg = ss.messages.items.len;
-        if (idx + 1 == nmsg and nmsg >= 2 and !ss.busy() and
-            ss.messages.items[nmsg - 2].role == .user)
-            renderVariantNav(ss, m);
-    };
+    // one. Hidden while generating (Stop is the control then). Shown even with
+    // NO live session (carried read-only transcript): ‹/› just switch the shown
+    // take, and › regenerate lazy-loads the LLM first (see renderVariantNav).
+    // Images belonging to a non-active take keep generating in the unified queue.
+    if (!is_user) {
+        const nmsg: usize, const prev_user: bool, const busy: bool = if (s) |ss| .{
+            ss.messages.items.len,
+            ss.messages.items.len >= 2 and ss.messages.items[ss.messages.items.len - 2].role == .user,
+            ss.busy(),
+        } else if (g_carry) |c| .{
+            c.items.len,
+            c.items.len >= 2 and c.items[c.items.len - 2].role == .user,
+            false,
+        } else .{ 0, false, false };
+        if (idx + 1 == nmsg and nmsg >= 2 and prev_user and !busy)
+            renderVariantNav(s, m);
+    }
 }
 
 /// The ‹ n/m › variant-navigation row (see renderMessage). Back is disabled
 /// (dimmed, inert) on the first take; next past the newest take regenerates.
-fn renderVariantNav(s: *chat.Session, m: *const chat.Message) void {
+/// `s` may be null (carried transcript, LLM unloaded): ‹/› switch the shown
+/// take by mutating `m.cur` directly, and › regenerate lazy-loads the LLM.
+fn renderVariantNav(s: ?*chat.Session, m: *chat.Message) void {
     const theme = dvui.themeGet();
     const n = m.variants.items.len;
     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .margin = .{ .y = 2 } });
@@ -1551,7 +1571,11 @@ fn renderVariantNav(s: *chat.Session, m: *const chat.Message) void {
     if (!can_back) opts.color_text = theme.text.lerp(theme.fill, 0.75);
     if (dvui.buttonIcon(@src(), "prev-variant", dvui.entypo.chevron_small_left, .{}, .{}, opts) and can_back) {
         switch (chat.navTarget(m.cur, n, .back)) {
-            .select => |i| s.selectVariant(i),
+            // Loaded: selectVariant re-syncs the KV for the next turn. Unloaded:
+            // just switch the shown take (a reload replays the active one).
+            .select => |i| if (s) |ss| ss.selectVariant(i) else {
+                m.cur = i;
+            },
             else => {},
         }
     }
@@ -1569,8 +1593,15 @@ fn renderVariantNav(s: *chat.Session, m: *const chat.Message) void {
     opts.data_out = &nwd;
     if (dvui.buttonIcon(@src(), "next-variant", dvui.entypo.chevron_small_right, .{}, .{}, opts)) {
         switch (chat.navTarget(m.cur, n, .next)) {
-            .select => |i| s.selectVariant(i),
-            .regenerate => s.regenerate() catch |err| std.log.err("regenerate failed: {t}", .{err}),
+            .select => |i| if (s) |ss| ss.selectVariant(i) else {
+                m.cur = i;
+            },
+            // Regenerate needs the LLM: run it now if loaded, else lazy-load and
+            // regenerate once the carried transcript is adopted (maybeStartReload).
+            .regenerate => if (s) |ss|
+                ss.regenerate() catch |err| std.log.err("regenerate failed: {t}", .{err})
+            else
+                requestRegenLoad(),
             .none => {},
         }
     }
@@ -2026,6 +2057,15 @@ fn submitChat(text: []const u8) void {
     if (!g_loading.load(.acquire)) g_reload_requested = true; // else the in-flight load will pick it up
 }
 
+/// The › (regenerate) button was hit while the LLM is unloaded: lazy-load it and
+/// regenerate the carried transcript's last reply once the fresh session adopts
+/// it (see maybeStartReload). No-op if no model is configured.
+fn requestRegenLoad() void {
+    if (g_config.llm_model.opt() == null) return; // no model to load
+    g_pending_regenerate = true;
+    if (!g_loading.load(.acquire)) g_reload_requested = true; // else the in-flight load picks it up
+}
+
 /// Start a fresh conversation, clearing the input box. Only the transcript is
 /// reset; generated images live in the engine's shared history and stay in the
 /// studio gallery (and the viewer keeps working). No-op if no session is loaded.
@@ -2036,6 +2076,7 @@ fn newChat() void {
     // live, since g_carry is null then.)
     freeCarry();
     freeLlmSuspend(); // drop any suspended-turn carry; a new chat won't resume it
+    g_pending_regenerate = false; // a fresh chat cancels a queued unloaded-regenerate
     if (g_llm_paused) { // a fresh chat starts unpaused
         g_llm_paused = false;
         if (!g_loading.load(.acquire)) if (g_session) |s| s.setPaused(false);
