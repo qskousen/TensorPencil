@@ -2003,7 +2003,16 @@ fn renderInput(s: ?*chat.Session) void {
         .expand = .horizontal,
         .gravity_y = 0.5,
         .min_size_content = .{ .h = 28 },
-        .max_size_content = .height(140),
+        // Bound BOTH dimensions of the reported min size. dvui's TextLayout
+        // accumulates its min width across every soft-wrapped line (it only
+        // resets on a literal '\n', not on a wrap), so a long wrapped message
+        // reports a min width proportional to the whole text. With `.expand`
+        // horizontal in this row, that ballooning min would overflow the row
+        // and shove the Send button off-screen. Capping max_size_content.w
+        // clamps the *reported* min (minSizeSetAndRefresh) while expand still
+        // stretches the entry to the real available width and break_lines wraps
+        // at that width — so no horizontal scroll and Send never collapses.
+        .max_size_content = .size(.{ .w = 160, .h = 140 }),
     });
     g_input_id = te.data().id;
     // Reserve for next frame's layout: entry height + row padding, plus the
