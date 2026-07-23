@@ -10,7 +10,7 @@
 - begin filling in holes in the capabilities grid (BACKEND.md)
 - add more sampling methods
 - multiple system prompts that can be saved and switched between
-- why is the config not json or something more structured?
+- a long entry in the llm prompt expands the input and collapses the send button. must keep line-break and no horizontal scroll
 - tool call boxes inline, expandable to see the tool call
 - chat ui touchup because it's super ugly
 - GPU sampling follow-ups (phases 1-4 landed: on-device argmax + top-k for qwen3 on all backends, chain-greedy spec verify):

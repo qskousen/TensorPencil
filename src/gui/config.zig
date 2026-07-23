@@ -1,14 +1,25 @@
 //! Persistent tp-gui settings: model paths and image-generation defaults.
 //!
-//! Stored as a tiny `key = value` text file under the platform config dir
+//! Stored as a JSON document under the platform config dir
 //! (`~/.config/tp-gui/config` on Linux), resolved via the `known-folders`
-//! package. Every setting has a sane default, so a missing or partial file
-//! reads back cleanly — the GUI degrades gracefully when a model is unset
-//! (see `PathBuf.opt`, which reports an empty path as "not configured").
+//! package. Serialization is derived directly from the `Config` struct by
+//! `std.json` — there is no per-field marshalling to keep in sync; add a field
+//! (with a default) and it round-trips automatically. Every setting has a sane
+//! default, so a missing or partial file reads back cleanly (unknown keys are
+//! ignored, missing keys fall back to the struct default) — the GUI degrades
+//! gracefully when a model is unset (see `PathBuf.opt`, which reports an empty
+//! path as "not configured").
+//!
+//! Legacy migration: older builds wrote a flat `key = value` text file. `load`
+//! tries JSON first and, if that fails, falls back to the old line parser
+//! (`apply`) and immediately rewrites the file as JSON — so an existing config
+//! upgrades in place on the first launch of a new build.
 //!
 //! Path fields double as dvui text-entry buffers: the fixed `PathBuf.data`
 //! array is what the config view binds to, so there is no separate edit state
-//! to keep in sync.
+//! to keep in sync. Fixed-buffer types (`TextBuf`, `PresetList`) carry their
+//! own `jsonStringify`/`jsonParse` so they (de)serialize as a plain string /
+//! variable-length array rather than a raw byte/element array.
 const std = @import("std");
 const known_folders = @import("known-folders");
 
@@ -209,6 +220,62 @@ pub const Preset = struct {
     sampling: Sampling = .{},
 };
 
+/// Saved named system prompts (`sys_prompts.slice()`). The *active* prompt is
+/// `Config.system_prompt`; these are just a library the user loads from /
+/// saves to (see the "System prompt" section of the settings view).
+pub const max_sys_prompts = 16;
+pub const max_sys_prompt_name = 48;
+
+pub const SysPrompt = struct {
+    name: TextBuf(max_sys_prompt_name) = .{},
+    text: TextBuf(max_prompt) = .{},
+};
+
+/// A fixed-capacity list (`items[0..count]`). Kept as a value type (no
+/// allocation) so `Config` stays a plain copyable value, but (de)serializes as
+/// a variable-length JSON array of the live entries — a raw `[cap]T` would
+/// emit/require exactly `cap` elements.
+pub fn FixedList(comptime T: type, comptime cap: usize) type {
+    return struct {
+        const Self = @This();
+        items: [cap]T = [_]T{.{}} ** cap,
+        count: usize = 0,
+
+        /// The live entries.
+        pub fn slice(self: *const Self) []const T {
+            return self.items[0..self.count];
+        }
+
+        pub fn jsonStringify(self: Self, jws: anytype) !void {
+            try jws.write(self.items[0..self.count]);
+        }
+
+        pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !Self {
+            var list: Self = .{};
+            if (.array_begin != try source.next()) return error.UnexpectedToken;
+            while (true) {
+                switch (try source.peekNextTokenType()) {
+                    .array_end => {
+                        _ = try source.next();
+                        break;
+                    },
+                    else => {},
+                }
+                // Parse every element for type-checking, but drop any past capacity.
+                const item = try std.json.innerParse(T, allocator, source, options);
+                if (list.count < cap) {
+                    list.items[list.count] = item;
+                    list.count += 1;
+                }
+            }
+            return list;
+        }
+    };
+}
+
+pub const PresetList = FixedList(Preset, max_presets);
+pub const SysPromptList = FixedList(SysPrompt, max_sys_prompts);
+
 /// A fixed-capacity, nul-terminated text buffer. `data` is handed directly to
 /// dvui's `textEntry` as its backing store, so the buffer is the single source
 /// of truth for the edited value (no separate edit state).
@@ -272,6 +339,22 @@ pub fn TextBuf(comptime cap: usize) type {
                 j += 1;
             }
         }
+
+        /// Serialize as a plain JSON string (the current text), not as a raw
+        /// array of `cap` bytes.
+        pub fn jsonStringify(self: Self, jws: anytype) !void {
+            try jws.write(self.slice());
+        }
+
+        /// Parse from a JSON string, copying (truncated to capacity) into the
+        /// fixed buffer — so the parsed `Config` owns no arena memory and stays
+        /// a plain value type.
+        pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !Self {
+            const s = try std.json.innerParse([]const u8, allocator, source, options);
+            var b: Self = .{};
+            b.set(s);
+            return b;
+        }
     };
 }
 
@@ -318,6 +401,10 @@ pub const Config = struct {
     /// VAE decode-path override (see `VaeDecode`). Applied live like diff paths.
     vae_decode: VaeDecode = .auto,
     system_prompt: TextBuf(max_prompt) = TextBuf(max_prompt).lit(default_system_prompt),
+    /// Saved named system prompts the user can load into `system_prompt` and
+    /// switch between (see the settings view). Pure data, like `presets`; the
+    /// *active* prompt is always `system_prompt` — this is just the library.
+    sys_prompts: SysPromptList = .{},
     /// Whether the chat model reasons (emits a "thought" block) before its
     /// answer, for models that support it (see `chat.supportsThinking`). Applied
     /// live — the GUI toolbar toggle flips this without a reload; the block is
@@ -342,10 +429,9 @@ pub const Config = struct {
     /// running session on Apply and picked up at the next turn — never load-
     /// or context-affecting (not compared by any `*ReloadEql`).
     sampling: Sampling = .{},
-    /// Saved sampling presets (`presets[0..preset_count]`). Pure data the
-    /// settings view loads/saves by name; persisted with everything else.
-    presets: [max_presets]Preset = [_]Preset{.{}} ** max_presets,
-    preset_count: usize = 0,
+    /// Saved sampling presets (`presets.slice()`). Pure data the settings view
+    /// loads/saves by name; persisted with everything else.
+    presets: PresetList = .{},
 
     /// Persisted window geometry for the main window and the image viewer,
     /// restored on the next launch. Size/position track the *restored* (non-
@@ -409,8 +495,8 @@ pub const Config = struct {
     /// cleans it, so lookups match what was stored).
     pub fn findPreset(self: *const Config, raw_name: []const u8) ?usize {
         var buf: [max_preset_name]u8 = undefined;
-        const name = cleanPresetName(raw_name, &buf) orelse return null;
-        for (self.presets[0..self.preset_count], 0..) |*p, i| {
+        const name = cleanName(raw_name, buf[0..]) orelse return null;
+        for (self.presets.slice(), 0..) |*p, i| {
             if (std.mem.eql(u8, p.name.slice(), name)) return i;
         }
         return null;
@@ -421,15 +507,15 @@ pub const Config = struct {
     /// Returns false when the name is empty after cleaning or the table is full.
     pub fn upsertPreset(self: *Config, raw_name: []const u8, s: Sampling) bool {
         var buf: [max_preset_name]u8 = undefined;
-        const name = cleanPresetName(raw_name, &buf) orelse return false;
+        const name = cleanName(raw_name, buf[0..]) orelse return false;
         if (self.findPreset(name)) |i| {
-            self.presets[i].sampling = s;
+            self.presets.items[i].sampling = s;
             return true;
         }
-        if (self.preset_count >= max_presets) return false;
-        self.presets[self.preset_count] = .{ .sampling = s };
-        self.presets[self.preset_count].name.set(name);
-        self.preset_count += 1;
+        if (self.presets.count >= max_presets) return false;
+        self.presets.items[self.presets.count] = .{ .sampling = s };
+        self.presets.items[self.presets.count].name.set(name);
+        self.presets.count += 1;
         return true;
     }
 
@@ -437,9 +523,47 @@ pub const Config = struct {
     /// Returns whether one was removed.
     pub fn removePresetNamed(self: *Config, raw_name: []const u8) bool {
         const i = self.findPreset(raw_name) orelse return false;
-        std.mem.copyForwards(Preset, self.presets[i .. self.preset_count - 1], self.presets[i + 1 .. self.preset_count]);
-        self.preset_count -= 1;
-        self.presets[self.preset_count] = .{};
+        std.mem.copyForwards(Preset, self.presets.items[i .. self.presets.count - 1], self.presets.items[i + 1 .. self.presets.count]);
+        self.presets.count -= 1;
+        self.presets.items[self.presets.count] = .{};
+        return true;
+    }
+
+    /// Find a saved system prompt by name (cleaned like `upsertSysPrompt`).
+    pub fn findSysPrompt(self: *const Config, raw_name: []const u8) ?usize {
+        var buf: [max_sys_prompt_name]u8 = undefined;
+        const name = cleanName(raw_name, buf[0..]) orelse return null;
+        for (self.sys_prompts.slice(), 0..) |*p, i| {
+            if (std.mem.eql(u8, p.name.slice(), name)) return i;
+        }
+        return null;
+    }
+
+    /// Save `text` under `raw_name` (whitespace-trimmed; newlines dropped from
+    /// the name), replacing an existing prompt of the same name. Returns false
+    /// when the name is empty after cleaning or the table is full.
+    pub fn upsertSysPrompt(self: *Config, raw_name: []const u8, text: []const u8) bool {
+        var buf: [max_sys_prompt_name]u8 = undefined;
+        const name = cleanName(raw_name, buf[0..]) orelse return false;
+        if (self.findSysPrompt(name)) |i| {
+            self.sys_prompts.items[i].text.set(text);
+            return true;
+        }
+        if (self.sys_prompts.count >= max_sys_prompts) return false;
+        const e = &self.sys_prompts.items[self.sys_prompts.count];
+        e.* = .{};
+        e.name.set(name);
+        e.text.set(text);
+        self.sys_prompts.count += 1;
+        return true;
+    }
+
+    /// Remove the system prompt named `raw_name`. Returns whether one was removed.
+    pub fn removeSysPromptNamed(self: *Config, raw_name: []const u8) bool {
+        const i = self.findSysPrompt(raw_name) orelse return false;
+        std.mem.copyForwards(SysPrompt, self.sys_prompts.items[i .. self.sys_prompts.count - 1], self.sys_prompts.items[i + 1 .. self.sys_prompts.count]);
+        self.sys_prompts.count -= 1;
+        self.sys_prompts.items[self.sys_prompts.count] = .{};
         return true;
     }
 
@@ -480,8 +604,22 @@ pub const Config = struct {
         return try std.fs.path.join(gpa, &.{ base, "TensorPencil" });
     }
 
+    /// Fill an unset output dir with the platform default so the settings view
+    /// shows a concrete, editable path (best-effort; left empty if the platform
+    /// has no known pictures location, which disables image saving).
+    fn fillOutputDir(self: *Config, io: std.Io, gpa: std.mem.Allocator, environ: *const Environ) void {
+        if (self.output_dir.opt() != null) return;
+        if (defaultOutputDir(io, gpa, environ) catch null) |dir| {
+            defer gpa.free(dir);
+            self.output_dir.set(dir);
+        }
+    }
+
     /// Load settings from disk. A missing file (or missing keys) yields
-    /// defaults; a malformed line is skipped rather than failing the load.
+    /// defaults. The on-disk format is JSON (unknown keys ignored, missing keys
+    /// default); a file that doesn't parse as JSON is treated as the legacy
+    /// `key = value` format — parsed line-by-line (malformed lines skipped) and
+    /// then rewritten as JSON in place, so old configs migrate on first load.
     /// `path_override` bypasses the well-known location (used by `--config`).
     pub fn load(io: std.Io, gpa: std.mem.Allocator, environ: *const Environ, path_override: ?[]const u8) Config {
         var cfg: Config = .{};
@@ -490,6 +628,17 @@ pub const Config = struct {
         const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024)) catch return cfg;
         defer gpa.free(bytes);
 
+        // JSON is the current format. `Config` is a plain value type (all
+        // fixed-capacity buffers, no slices/pointers into the parse arena), so
+        // we can copy the parsed value out and free the arena immediately.
+        if (std.json.parseFromSlice(Config, gpa, bytes, .{ .ignore_unknown_fields = true })) |parsed| {
+            defer parsed.deinit();
+            cfg = parsed.value;
+            cfg.fillOutputDir(io, gpa, environ);
+            return cfg;
+        } else |_| {}
+
+        // Legacy `key = value` fallback: parse, then rewrite as JSON in place.
         var lines = std.mem.tokenizeScalar(u8, bytes, '\n');
         while (lines.next()) |line| {
             const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
@@ -497,18 +646,17 @@ pub const Config = struct {
             const val = std.mem.trim(u8, line[eq + 1 ..], " \t\r");
             cfg.apply(key, val);
         }
-        // Fill an unset output dir with the platform default so the settings
-        // view shows a concrete, editable path (best-effort; left empty if the
-        // platform has no known data location, which disables image saving).
-        if (cfg.output_dir.opt() == null) {
-            if (defaultOutputDir(io, gpa, environ) catch null) |dir| {
-                defer gpa.free(dir);
-                cfg.output_dir.set(dir);
-            }
-        }
+        cfg.fillOutputDir(io, gpa, environ);
+        // Best-effort in-place upgrade to JSON; a failure just means we retry
+        // the migration on the next load (the settings still loaded fine).
+        cfg.save(io, gpa, environ, path_override) catch |err|
+            std.log.warn("config: migrate to JSON failed: {t}", .{err});
         return cfg;
     }
 
+    /// Legacy `key = value` line applier — used only to read pre-JSON config
+    /// files during migration (see `load`). New writes go through `save`'s JSON
+    /// path; this can be retired once no old configs remain in the wild.
     fn apply(self: *Config, key: []const u8, val: []const u8) void {
         if (std.mem.eql(u8, key, "llm_model")) self.llm_model.set(val) //
         else if (std.mem.eql(u8, key, "vision_tower")) self.vision_tower.set(val) //
@@ -564,9 +712,9 @@ pub const Config = struct {
             self.regen_cache_mb = std.fmt.parseInt(usize, val, 10) catch self.regen_cache_mb;
         } else if (std.mem.eql(u8, key, "preset")) {
             if (parsePreset(val)) |pr| {
-                if (self.preset_count < max_presets) {
-                    self.presets[self.preset_count] = pr;
-                    self.preset_count += 1;
+                if (self.presets.count < max_presets) {
+                    self.presets.items[self.presets.count] = pr;
+                    self.presets.count += 1;
                 }
             }
         } else if (std.mem.eql(u8, key, "win_w")) {
@@ -596,110 +744,16 @@ pub const Config = struct {
         return std.mem.eql(u8, a.slice(), b.slice());
     }
 
-    /// Serialize settings to disk (creating the parent dir if needed).
+    /// Serialize settings to disk as JSON (creating the parent dir if needed).
+    /// The document is derived straight from this struct by `std.json`, so it
+    /// stays in sync with the fields automatically — no per-field template.
     /// `path_override` bypasses the well-known location (used by `--config`).
     pub fn save(self: *const Config, io: std.Io, gpa: std.mem.Allocator, environ: *const Environ, path_override: ?[]const u8) !void {
         const path = (try filePath(io, gpa, environ, path_override)) orelse return error.NoConfigDir;
         defer gpa.free(path);
 
-        // The system prompt is multi-line; escape it onto one line so the
-        // simple key=value format holds.
-        const prompt_esc = try escapeAlloc(gpa, self.system_prompt.slice());
-        defer gpa.free(prompt_esc);
-
-        const content = try std.fmt.allocPrint(gpa,
-            \\llm_model = {s}
-            \\vision_tower = {s}
-            \\diffusion_model = {s}
-            \\text_encoder = {s}
-            \\vae = {s}
-            \\taesd = {s}
-            \\output_dir = {s}
-            \\steps = {d}
-            \\width = {d}
-            \\height = {d}
-            \\preview = {s}
-            \\taesd_size = {s}
-            \\vram_split = {d}
-            \\vram_limit_frac = {d}
-            \\llm_backend = {s}
-            \\diff_backend = {s}
-            \\vae_decode = {s}
-            \\reasoning = {}
-            \\kv_dtype = {s}
-            \\vision_budget = {s}
-            \\win_w = {d}
-            \\win_h = {d}
-            \\win_x = {d}
-            \\win_y = {d}
-            \\win_max = {}
-            \\viewer_w = {d}
-            \\viewer_h = {d}
-            \\viewer_x = {d}
-            \\viewer_y = {d}
-            \\viewer_max = {}
-            \\system_prompt = {s}
-            \\
-        , .{
-            self.llm_model.slice(),       self.vision_tower.slice(),
-            self.diffusion_model.slice(), self.text_encoder.slice(),
-            self.vae.slice(),             self.taesd.slice(),
-            self.output_dir.slice(),      self.steps,
-            self.width,
-            self.height,                  @tagName(self.preview),
-            @tagName(self.taesd_size),    self.vram_split,
-            self.vram_limit_frac,
-            @tagName(self.llm_backend),   @tagName(self.diff_backend),
-            @tagName(self.vae_decode),    self.reasoning,
-            @tagName(self.kv_dtype),      @tagName(self.vision_budget),
-            self.win_w,                   self.win_h,
-            self.win_x,                   self.win_y,
-            self.win_max,                 self.viewer_w,
-            self.viewer_h,                self.viewer_x,
-            self.viewer_y,                self.viewer_max,
-            prompt_esc,
-        });
-        defer gpa.free(content);
-
-        // Sampling + presets are appended after the fixed template — sampling
-        // to stay under the 32-arg format limit, presets because they're
-        // variable-count (load order doesn't matter: every line is `key = value`).
-        var full: std.ArrayList(u8) = .empty;
-        defer full.deinit(gpa);
-        try full.appendSlice(gpa, content);
-        const sampling_lines = try std.fmt.allocPrint(gpa,
-            \\temperature = {d}
-            \\top_k = {d}
-            \\top_p = {d}
-            \\min_p = {d}
-            \\repeat_penalty = {d}
-            \\repeat_last_n = {d}
-            \\presence_penalty = {d}
-            \\frequency_penalty = {d}
-            \\
-        , .{
-            self.sampling.temperature,    self.sampling.top_k,
-            self.sampling.top_p,          self.sampling.min_p,
-            self.sampling.repeat_penalty, self.sampling.repeat_last_n,
-            self.sampling.presence_penalty,
-            self.sampling.frequency_penalty,
-        });
-        defer gpa.free(sampling_lines);
-        try full.appendSlice(gpa, sampling_lines);
-        const regen_line = try std.fmt.allocPrint(gpa, "regen_cache_mb = {d}\n", .{self.regen_cache_mb});
-        defer gpa.free(regen_line);
-        try full.appendSlice(gpa, regen_line);
-        for (self.presets[0..self.preset_count]) |*pr| {
-            const line = try std.fmt.allocPrint(gpa, "preset = {s}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}\n", .{
-                pr.name.slice(),            pr.sampling.temperature,
-                pr.sampling.top_k,          pr.sampling.top_p,
-                pr.sampling.min_p,          pr.sampling.repeat_penalty,
-                pr.sampling.repeat_last_n,  pr.sampling.presence_penalty,
-                pr.sampling.frequency_penalty,
-            });
-            defer gpa.free(line);
-            try full.appendSlice(gpa, line);
-        }
+        const json = try std.json.Stringify.valueAlloc(gpa, self.*, .{ .whitespace = .indent_2 });
+        defer gpa.free(json);
 
         if (std.fs.path.dirname(path)) |dir| {
             std.Io.Dir.cwd().createDirPath(io, dir) catch |err| switch (err) {
@@ -707,18 +761,19 @@ pub const Config = struct {
                 else => return err,
             };
         }
-        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = full.items });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });
     }
 };
 
-/// Clean a preset name for storage/lookup: trim whitespace and drop the
-/// reserved '|' separator (and CR/LF). Returns a slice into `buf`, or null
-/// when nothing printable is left.
-fn cleanPresetName(raw: []const u8, buf: *[max_preset_name]u8) ?[]const u8 {
+/// Clean an entry name (preset or system prompt) for storage/lookup: trim
+/// whitespace and drop the reserved '|' separator (and CR/LF). Returns a slice
+/// into `buf`, or null when nothing printable is left. `buf` bounds the length
+/// (leaving room for the trailing nul a `TextBuf` needs).
+fn cleanName(raw: []const u8, buf: []u8) ?[]const u8 {
     var n: usize = 0;
     for (std.mem.trim(u8, raw, " \t\r\n")) |ch| {
         if (ch == '|' or ch == '\n' or ch == '\r') continue;
-        if (n >= max_preset_name - 1) break; // TextBuf needs a trailing nul
+        if (n >= buf.len - 1) break; // TextBuf needs a trailing nul
         buf[n] = ch;
         n += 1;
     }
@@ -730,7 +785,7 @@ fn cleanPresetName(raw: []const u8, buf: *[max_preset_name]u8) ?[]const u8 {
 fn parsePreset(val: []const u8) ?Preset {
     var it = std.mem.splitScalar(u8, val, '|');
     var buf: [max_preset_name]u8 = undefined;
-    const name = cleanPresetName(it.next() orelse return null, &buf) orelse return null;
+    const name = cleanName(it.next() orelse return null, buf[0..]) orelse return null;
     var pr: Preset = .{};
     pr.name.set(name);
     const s = &pr.sampling;
@@ -743,20 +798,6 @@ fn parsePreset(val: []const u8) ?Preset {
         };
     }
     return pr;
-}
-
-/// Escape backslashes and newlines so a multi-line value survives on one
-/// `key = value` line (`\` → `\\`, newline → `\n`, CR dropped). Caller frees.
-fn escapeAlloc(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    for (s) |ch| switch (ch) {
-        '\\' => try out.appendSlice(gpa, "\\\\"),
-        '\n' => try out.appendSlice(gpa, "\\n"),
-        '\r' => {},
-        else => try out.append(gpa, ch),
-    };
-    return out.toOwnedSlice(gpa);
 }
 
 /// Test-only: a per-PROCESS unique config filename. These tests are compiled
@@ -857,17 +898,64 @@ test "regen_cache_mb: default, apply, junk tolerance, save/load, live-only" {
     try std.testing.expectEqual(@as(usize, 512), back.regen_cache_mb);
 }
 
-test "system prompt escapes/unescapes newlines round-trip" {
+test "multi-line system prompt survives a JSON save/load round-trip" {
     const gpa = std.testing.allocator;
-    var b: TextBuf(max_prompt) = .{};
-    b.set("line one\nline two\\end");
-    const esc = try escapeAlloc(gpa, b.slice());
-    defer gpa.free(esc);
-    try std.testing.expectEqualStrings("line one\\nline two\\\\end", esc);
+    const io = std.testing.io;
+    var fbuf: [64]u8 = undefined;
+    const file = testFile(&fbuf, "prompt");
+    defer std.Io.Dir.cwd().deleteFile(io, file) catch {};
 
-    var back: TextBuf(max_prompt) = .{};
-    back.setUnescaped(esc);
-    try std.testing.expectEqualStrings("line one\nline two\\end", back.slice());
+    var environ: Environ = .init(gpa);
+    defer environ.deinit();
+
+    // Newlines, backslashes and quotes are all handled natively by JSON — no
+    // escaping helper needed the way the old key=value format required.
+    var a: Config = .{};
+    a.system_prompt.set("line one\nline two\\end \"quoted\"");
+    try a.save(io, gpa, &environ, file);
+
+    const b = Config.load(io, gpa, &environ, file);
+    try std.testing.expectEqualStrings("line one\nline two\\end \"quoted\"", b.system_prompt.slice());
+}
+
+test "load migrates a legacy key=value file to JSON in place" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var fbuf: [64]u8 = undefined;
+    const file = testFile(&fbuf, "legacy");
+    defer std.Io.Dir.cwd().deleteFile(io, file) catch {};
+
+    var environ: Environ = .init(gpa);
+    defer environ.deinit();
+
+    // Hand-write an old-format file (with an escaped multi-line prompt and a
+    // pipe-delimited preset) and confirm load parses it...
+    const legacy =
+        "llm_model = /m.gguf\n" ++
+        "steps = 30\n" ++
+        "llm_backend = cuda\n" ++
+        "temperature = 1.2\n" ++
+        "system_prompt = hello\\nworld\n" ++
+        "preset = creative|1.4|40|0.98|0|1|64|0|0\n";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = file, .data = legacy });
+
+    const a = Config.load(io, gpa, &environ, file);
+    try std.testing.expectEqualStrings("/m.gguf", a.llm_model.opt().?);
+    try std.testing.expectEqual(@as(usize, 30), a.steps);
+    try std.testing.expectEqual(Backend.cuda, a.llm_backend);
+    try std.testing.expectEqual(@as(f32, 1.2), a.sampling.temperature);
+    try std.testing.expectEqualStrings("hello\nworld", a.system_prompt.slice());
+    try std.testing.expectEqual(@as(usize, 1), a.presets.count);
+    try std.testing.expectEqualStrings("creative", a.presets.items[0].name.slice());
+
+    // ...and that the file on disk was rewritten as JSON (parses back cleanly
+    // via the JSON path, i.e. a second load doesn't hit the legacy fallback).
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, file, gpa, .limited(64 * 1024));
+    defer gpa.free(bytes);
+    try std.testing.expect(bytes.len > 0 and bytes[0] == '{');
+    const parsed = try std.json.parseFromSlice(Config, gpa, bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("/m.gguf", parsed.value.llm_model.opt().?);
 }
 
 test "default system prompt is populated on a fresh Config" {
@@ -1086,23 +1174,23 @@ test "apply parses sampling keys and tolerates junk" {
 test "preset lines parse, tolerate junk, and cap at max_presets" {
     var cfg: Config = .{};
     cfg.apply("preset", "creative|1.2|40|0.95|0.05|1.1|128|0.5|0.25");
-    try std.testing.expectEqual(@as(usize, 1), cfg.preset_count);
-    try std.testing.expectEqualStrings("creative", cfg.presets[0].name.slice());
-    try std.testing.expectEqual(@as(f32, 1.2), cfg.presets[0].sampling.temperature);
-    try std.testing.expectEqual(@as(usize, 128), cfg.presets[0].sampling.repeat_last_n);
-    try std.testing.expectEqual(@as(f32, 0.25), cfg.presets[0].sampling.frequency_penalty);
+    try std.testing.expectEqual(@as(usize, 1), cfg.presets.count);
+    try std.testing.expectEqualStrings("creative", cfg.presets.items[0].name.slice());
+    try std.testing.expectEqual(@as(f32, 1.2), cfg.presets.items[0].sampling.temperature);
+    try std.testing.expectEqual(@as(usize, 128), cfg.presets.items[0].sampling.repeat_last_n);
+    try std.testing.expectEqual(@as(f32, 0.25), cfg.presets.items[0].sampling.frequency_penalty);
 
     // Whitespace around fields tolerated (hand-edited config).
     cfg.apply("preset", " precise | 0 | 1 | 1 | 0 | 1 | 0 | 0 | 0 ");
-    try std.testing.expectEqual(@as(usize, 2), cfg.preset_count);
-    try std.testing.expectEqualStrings("precise", cfg.presets[1].name.slice());
-    try std.testing.expectEqual(@as(f32, 0), cfg.presets[1].sampling.temperature);
+    try std.testing.expectEqual(@as(usize, 2), cfg.presets.count);
+    try std.testing.expectEqualStrings("precise", cfg.presets.items[1].name.slice());
+    try std.testing.expectEqual(@as(f32, 0), cfg.presets.items[1].sampling.temperature);
 
     // Malformed lines are skipped whole (no half-applied preset).
     cfg.apply("preset", "broken|1.0|notanumber|1|0|1|64|0|0");
     cfg.apply("preset", "tooshort|1.0|20");
     cfg.apply("preset", "|1.0|20|1|0|1|64|0|0"); // empty name
-    try std.testing.expectEqual(@as(usize, 2), cfg.preset_count);
+    try std.testing.expectEqual(@as(usize, 2), cfg.presets.count);
 
     // The table caps at max_presets; extra lines are dropped.
     for (0..max_presets) |i| {
@@ -1110,20 +1198,20 @@ test "preset lines parse, tolerate junk, and cap at max_presets" {
         const line = std.fmt.bufPrint(&name_buf, "p{d}|1|20|1|0|1|64|0|0", .{i}) catch unreachable;
         cfg.apply("preset", line);
     }
-    try std.testing.expectEqual(@as(usize, max_presets), cfg.preset_count);
+    try std.testing.expectEqual(@as(usize, max_presets), cfg.presets.count);
 }
 
 test "upsertPreset adds, replaces by name, sanitizes; removePresetNamed removes" {
     var cfg: Config = .{};
     try std.testing.expect(cfg.upsertPreset("creative", .{ .temperature = 1.3 }));
     try std.testing.expect(cfg.upsertPreset(" pipe|name \n", .{ .temperature = 0.2 }));
-    try std.testing.expectEqual(@as(usize, 2), cfg.preset_count);
-    try std.testing.expectEqualStrings("pipename", cfg.presets[1].name.slice());
+    try std.testing.expectEqual(@as(usize, 2), cfg.presets.count);
+    try std.testing.expectEqualStrings("pipename", cfg.presets.items[1].name.slice());
 
     // Same name replaces in place (no duplicate).
     try std.testing.expect(cfg.upsertPreset("creative", .{ .temperature = 1.5 }));
-    try std.testing.expectEqual(@as(usize, 2), cfg.preset_count);
-    try std.testing.expectEqual(@as(f32, 1.5), cfg.presets[0].sampling.temperature);
+    try std.testing.expectEqual(@as(usize, 2), cfg.presets.count);
+    try std.testing.expectEqual(@as(f32, 1.5), cfg.presets.items[0].sampling.temperature);
 
     // Empty / all-reserved names are rejected.
     try std.testing.expect(!cfg.upsertPreset("  ", .{}));
@@ -1132,8 +1220,8 @@ test "upsertPreset adds, replaces by name, sanitizes; removePresetNamed removes"
     try std.testing.expect(cfg.findPreset("creative") != null);
     try std.testing.expect(cfg.removePresetNamed("creative"));
     try std.testing.expect(!cfg.removePresetNamed("creative")); // already gone
-    try std.testing.expectEqual(@as(usize, 1), cfg.preset_count);
-    try std.testing.expectEqualStrings("pipename", cfg.presets[0].name.slice());
+    try std.testing.expectEqual(@as(usize, 1), cfg.presets.count);
+    try std.testing.expectEqualStrings("pipename", cfg.presets.items[0].name.slice());
 }
 
 test "sampling + presets save/load round-trip" {
@@ -1163,11 +1251,11 @@ test "sampling + presets save/load round-trip" {
 
     const b = Config.load(io, gpa, &environ, file);
     try std.testing.expectEqual(a.sampling, b.sampling);
-    try std.testing.expectEqual(@as(usize, 2), b.preset_count);
-    try std.testing.expectEqualStrings("creative", b.presets[0].name.slice());
-    try std.testing.expectEqual(a.presets[0].sampling, b.presets[0].sampling);
-    try std.testing.expectEqualStrings("greedy", b.presets[1].name.slice());
-    try std.testing.expectEqual(a.presets[1].sampling, b.presets[1].sampling);
+    try std.testing.expectEqual(@as(usize, 2), b.presets.count);
+    try std.testing.expectEqualStrings("creative", b.presets.items[0].name.slice());
+    try std.testing.expectEqual(a.presets.items[0].sampling, b.presets.items[0].sampling);
+    try std.testing.expectEqualStrings("greedy", b.presets.items[1].name.slice());
+    try std.testing.expectEqual(a.presets.items[1].sampling, b.presets.items[1].sampling);
 }
 
 test "diffEnabled requires dit + text-encoder + vae" {
@@ -1178,4 +1266,67 @@ test "diffEnabled requires dit + text-encoder + vae" {
     try std.testing.expect(!c.diffEnabled()); // vae still missing
     c.vae.set("/vae.safetensors");
     try std.testing.expect(c.diffEnabled());
+}
+
+test "upsertSysPrompt adds, replaces by name, sanitizes; removeSysPromptNamed removes" {
+    var cfg: Config = .{};
+    try std.testing.expect(cfg.upsertSysPrompt("coder", "You write Zig.\nBe terse."));
+    try std.testing.expect(cfg.upsertSysPrompt(" pipe|name \n", "another"));
+    try std.testing.expectEqual(@as(usize, 2), cfg.sys_prompts.count);
+    try std.testing.expectEqualStrings("pipename", cfg.sys_prompts.items[1].name.slice());
+    // Multi-line text is stored verbatim (no escaping needed under JSON).
+    try std.testing.expectEqualStrings("You write Zig.\nBe terse.", cfg.sys_prompts.items[0].text.slice());
+
+    // Same name replaces the text in place (no duplicate).
+    try std.testing.expect(cfg.upsertSysPrompt("coder", "You write Rust."));
+    try std.testing.expectEqual(@as(usize, 2), cfg.sys_prompts.count);
+    try std.testing.expectEqualStrings("You write Rust.", cfg.sys_prompts.items[0].text.slice());
+
+    // Empty / all-reserved names rejected.
+    try std.testing.expect(!cfg.upsertSysPrompt("  ", "x"));
+    try std.testing.expect(!cfg.upsertSysPrompt("|||", "x"));
+
+    try std.testing.expect(cfg.findSysPrompt("coder") != null);
+    try std.testing.expect(cfg.removeSysPromptNamed("coder"));
+    try std.testing.expect(!cfg.removeSysPromptNamed("coder")); // already gone
+    try std.testing.expectEqual(@as(usize, 1), cfg.sys_prompts.count);
+    try std.testing.expectEqualStrings("pipename", cfg.sys_prompts.items[0].name.slice());
+}
+
+test "upsertSysPrompt caps at max_sys_prompts" {
+    var cfg: Config = .{};
+    for (0..max_sys_prompts + 3) |i| {
+        var name_buf: [16]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "p{d}", .{i}) catch unreachable;
+        // Returns false once the table is full.
+        const ok = cfg.upsertSysPrompt(name, "text");
+        try std.testing.expectEqual(i < max_sys_prompts, ok);
+    }
+    try std.testing.expectEqual(@as(usize, max_sys_prompts), cfg.sys_prompts.count);
+}
+
+test "sys_prompts save/load round-trip (JSON, multi-line text)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var fbuf: [64]u8 = undefined;
+    const file = testFile(&fbuf, "sysprompt");
+    defer std.Io.Dir.cwd().deleteFile(io, file) catch {};
+
+    var environ: Environ = .init(gpa);
+    defer environ.deinit();
+
+    var a: Config = .{};
+    try std.testing.expect(a.upsertSysPrompt("coder", "You write Zig.\nBe terse."));
+    try std.testing.expect(a.upsertSysPrompt("pirate", "Arr, matey!"));
+    // Saved prompts are pure data — never load- or context-affecting.
+    const base: Config = .{};
+    try std.testing.expect(a.llmReloadEql(&base));
+    try std.testing.expect(a.ctxReloadEql(&base));
+    try a.save(io, gpa, &environ, file);
+
+    const b = Config.load(io, gpa, &environ, file);
+    try std.testing.expectEqual(@as(usize, 2), b.sys_prompts.count);
+    try std.testing.expectEqualStrings("coder", b.sys_prompts.items[0].name.slice());
+    try std.testing.expectEqualStrings("You write Zig.\nBe terse.", b.sys_prompts.items[0].text.slice());
+    try std.testing.expectEqualStrings("pirate", b.sys_prompts.items[1].name.slice());
 }

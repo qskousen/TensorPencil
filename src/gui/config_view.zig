@@ -78,6 +78,8 @@ var ppen_buf: [16]u8 = [_]u8{0} ** 16;
 var fpen_buf: [16]u8 = [_]u8{0} ** 16;
 // Preset name entry (save/load/delete target in the sampling section).
 var preset_name_buf: [config.max_preset_name]u8 = [_]u8{0} ** config.max_preset_name;
+// System-prompt name entry (save/load/delete target in the system-prompt section).
+var sys_prompt_name_buf: [config.max_sys_prompt_name]u8 = [_]u8{0} ** config.max_sys_prompt_name;
 
 
 /// Call when the view is (re)entered so numeric buffers reseed from the config.
@@ -283,7 +285,9 @@ pub fn render(cfg: *config.Config, cb: Callbacks) void {
 
     section("System prompt");
     help("Sent to the model at the start of every conversation. When a diffusion " ++
-        "model is configured, the image-tool instructions are appended automatically.");
+        "model is configured, the image-tool instructions are appended automatically. " ++
+        "Save named prompts and switch between them with the library row below.");
+    sysPromptRow(cfg);
     {
         var row = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 3 } });
         defer row.deinit();
@@ -292,6 +296,47 @@ pub fn render(cfg: *config.Config, cb: Callbacks) void {
             .multiline = true,
         }, .{ .expand = .horizontal, .min_size_content = .{ .h = 90 }, .max_size_content = .height(220) });
         te.deinit();
+    }
+}
+
+/// The system-prompt library row: a dropdown that loads a saved prompt into the
+/// active editor, a name entry, and Save / Delete buttons operating on that
+/// name. Mirrors `presetRow`. Saved prompts live in the Config (persisted on
+/// Apply, discarded on Cancel), and "switching" is loading a different one as
+/// the active `system_prompt` (which takes effect like any prompt edit).
+fn sysPromptRow(cfg: *config.Config) void {
+    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 3 } });
+    defer row.deinit();
+
+    dvui.label(@src(), "Saved", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
+
+    // Loading copies the saved text into the active editor (and its name into
+    // the entry, so Save/Delete target it); it lands via Apply like any edit.
+    {
+        var dd: dvui.DropdownWidget = undefined;
+        dd.init(@src(), .{ .label = if (cfg.sys_prompts.count == 0) "none saved" else "Load…" }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 140 } });
+        defer dd.deinit();
+        if (dd.dropped()) {
+            for (cfg.sys_prompts.slice()) |*sp| {
+                if (dd.addChoiceLabel(sp.name.slice())) {
+                    cfg.system_prompt.set(sp.text.slice());
+                    _ = std.fmt.bufPrintZ(&sys_prompt_name_buf, "{s}", .{sp.name.slice()}) catch {};
+                }
+            }
+        }
+    }
+
+    var te = dvui.textEntry(@src(), .{
+        .text = .{ .buffer = &sys_prompt_name_buf },
+        .placeholder = "prompt name",
+    }, .{ .expand = .horizontal, .gravity_y = 0.5, .margin = .{ .x = 4 } });
+    te.deinit();
+
+    if (dvui.button(@src(), "Save", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 4 } })) {
+        _ = cfg.upsertSysPrompt(std.mem.sliceTo(&sys_prompt_name_buf, 0), cfg.system_prompt.slice());
+    }
+    if (dvui.button(@src(), "Delete", .{}, .{ .gravity_y = 0.5 })) {
+        _ = cfg.removeSysPromptNamed(std.mem.sliceTo(&sys_prompt_name_buf, 0));
     }
 }
 
@@ -309,10 +354,10 @@ fn presetRow(cfg: *config.Config) void {
     // the entry, so Save/Delete target it); it still lands via Apply.
     {
         var dd: dvui.DropdownWidget = undefined;
-        dd.init(@src(), .{ .label = if (cfg.preset_count == 0) "none saved" else "Load…" }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 140 } });
+        dd.init(@src(), .{ .label = if (cfg.presets.count == 0) "none saved" else "Load…" }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 140 } });
         defer dd.deinit();
         if (dd.dropped()) {
-            for (cfg.presets[0..cfg.preset_count]) |*pr| {
+            for (cfg.presets.slice()) |*pr| {
                 if (dd.addChoiceLabel(pr.name.slice())) {
                     cfg.sampling = pr.sampling;
                     _ = std.fmt.bufPrintZ(&preset_name_buf, "{s}", .{pr.name.slice()}) catch {};
