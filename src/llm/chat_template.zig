@@ -139,6 +139,17 @@ pub const ChatTemplate = struct {
         return .{ .tmpl = try jinja.Template.parse(gpa, src) };
     }
 
+    /// Google's current upstream "canonical" Gemma 4 chat template (identical
+    /// across the 12B/31B releases). Used by the config override that replaces
+    /// a model's own embedded template — some finetunes (e.g. DarkIdol 31B)
+    /// ship an older/stripped variant; this renders exactly what Google's
+    /// `apply_chat_template` would. Byte-exact vs jinja2 (golden fixtures).
+    pub const gemma4_canonical_src = jinja.gemma4_canonical_template;
+
+    pub fn gemma4Canonical(gpa: std.mem.Allocator) !ChatTemplate {
+        return fromSource(gpa, gemma4_canonical_src);
+    }
+
     pub fn deinit(self: *ChatTemplate) void {
         self.tmpl.deinit();
     }
@@ -356,6 +367,39 @@ test "chat_template: real gemma4 GGUF strips prior thoughts from the token strea
     try std.testing.expect(std.mem.indexOf(u8, text, "Hello there!") != null);
 }
 
+// Regression: Gemma prompts REQUIRE a leading <bos>. The gemma4 tokenizer must
+// populate `tok.bos` (from tokenizer.ggml.bos_token_id) so the render-driven
+// path — which derives the template's `{{ bos_token }}` string from it — emits
+// the BOS. When it was left null, the render dropped BOS and the model
+// degenerated into a repeat loop (worst on larger models). Self-skips if absent.
+test "chat_template: gemma4 render emits a leading BOS (tok.bos populated)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "/home/qt/genai/lmstudio/models/gemma-4-12b-it-qat-q4_0.gguf";
+    std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
+
+    var g = try Gguf.open(gpa, io, path);
+    defer g.deinit();
+    var tok = try Tokenizer.initFromGguf(gpa, &g);
+    defer tok.deinit();
+    var ct = (try ChatTemplate.fromGguf(gpa, &g)) orelse return error.SkipZigTest;
+    defer ct.deinit();
+
+    // The tokenizer must know its BOS id (this was the bug: null for gemma4).
+    const bos_id = tok.bos orelse return error.TestUnexpectedResult;
+
+    // Derive the BOS string exactly like the render-driven path does, then
+    // confirm the rendered token stream actually starts with the BOS id.
+    const bos_str = try tok.decodeAlloc(gpa, &.{bos_id});
+    defer gpa.free(bos_str);
+    const msgs = [_]Message{.{ .role = .user, .content = "Hi" }};
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(gpa);
+    try ct.renderIds(&tok, gpa, .{ .messages = &msgs, .bos_token = bos_str, .enable_thinking = true }, &ids);
+    try std.testing.expect(ids.items.len > 0);
+    try std.testing.expectEqual(bos_id, ids.items[0]);
+}
+
 // Task #4: the multimodal render must expand the template's single image
 // placeholder into the model's real image block — `<|image>` + pad×N +
 // `<image|>` for gemma4 — with the recorded row pointing at the first pad, so
@@ -385,9 +429,11 @@ test "chat_template: gemma4 image placeholder expands to the real block at the r
     defer got.deinit(gpa);
     var rows: std.ArrayList(usize) = .empty;
     defer rows.deinit(gpa);
+    const bos_str = if (tok.bos) |b| (try tok.decodeAlloc(gpa, &.{b})) else "";
+    defer if (bos_str.len > 0) gpa.free(bos_str);
     try ct.renderIdsMM(&tok, gpa, .{
         .messages = &msgs,
-        .bos_token = if (tok.bos) |b| (try tok.decodeAlloc(gpa, &.{b})) else "",
+        .bos_token = bos_str,
         .enable_thinking = false,
         .add_generation_prompt = true,
     }, exp, &.{.{ .grid_w = gw, .grid_h = gh }}, &got, &rows);
@@ -433,9 +479,11 @@ test "chat_template: gemma3 image placeholder expands to the real block at the r
     defer got.deinit(gpa);
     var rows: std.ArrayList(usize) = .empty;
     defer rows.deinit(gpa);
+    const bos_str = if (tok.bos) |b| (try tok.decodeAlloc(gpa, &.{b})) else "";
+    defer if (bos_str.len > 0) gpa.free(bos_str);
     try ct.renderIdsMM(&tok, gpa, .{
         .messages = &msgs,
-        .bos_token = if (tok.bos) |b| (try tok.decodeAlloc(gpa, &.{b})) else "",
+        .bos_token = bos_str,
         .enable_thinking = false,
         .add_generation_prompt = true,
     }, exp, &.{.{ .grid_w = gw, .grid_h = gh }}, &got, &rows);

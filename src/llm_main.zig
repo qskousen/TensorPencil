@@ -26,7 +26,7 @@ const usage =
     \\              [--temperature <t>] [--top-k <n>] [--top-p <p>] [--min-p <p>]
     \\              [--repeat-penalty <r>] [--repeat-last-n <n>]
     \\              [--presence-penalty <p>] [--frequency-penalty <p>]
-    \\              [--seed <n>] [--greedy] [--no-think]
+    \\              [--seed <n>] [--greedy] [--no-think] [--canonical-template]
     \\              [--spec-k <n>] [--draft-model <qwen3.safetensors>]
     \\              [--eagle <eagle3.safetensors>] [--tree <nodes>]
     \\              [--vram-budget <GiB>] [--cpu-layers tail|attn] [--offload-grow]
@@ -94,6 +94,11 @@ const usage =
     \\has no effect without one of them (weight streaming has been removed).
     \\
 ;
+
+/// `--canonical-template`: for gemma4, render Google's upstream canonical chat
+/// template instead of the model's embedded one (some finetunes ship an older
+/// variant). Set in `main`'s arg loop, read by `runGemma4`.
+var g_canonical_gemma4: bool = false;
 
 pub fn main(init: std.process.Init) !void {
     const arena: std.mem.Allocator = init.arena.allocator();
@@ -184,6 +189,8 @@ pub fn main(init: std.process.Init) !void {
             llm.chat.setThinking(true);
         } else if (std.mem.eql(u8, a, "--no-think")) {
             llm.chat.setThinking(false);
+        } else if (std.mem.eql(u8, a, "--canonical-template")) {
+            g_canonical_gemma4 = true;
         } else if (std.mem.eql(u8, a, "--spec-k")) {
             opts.spec_k = try std.fmt.parseInt(usize, try nextArg(args, &i), 10);
         } else if (std.mem.eql(u8, a, "--tree")) {
@@ -679,7 +686,16 @@ const Boundary = struct { q: usize, snap: []u8 };
 /// arena). No-op-safe: a model without a template leaves `active` null and the
 /// hand glue runs. `bos` is the decoded BOS string the template emits.
 fn setupChatTemplate(arena: std.mem.Allocator, g: *const TensorPencil.Gguf, tok: *const TensorPencil.tokenizer.Tokenizer, system: ?[]const u8) void {
-    llm.chat_template.active = llm.chat_template.ChatTemplate.fromGguf(arena, g) catch null;
+    setupChatTemplateEx(arena, g, tok, system, null);
+}
+
+/// As `setupChatTemplate`, but `override_src` (when non-null) replaces the
+/// model's embedded template — used by the gemma4 canonical-template override.
+fn setupChatTemplateEx(arena: std.mem.Allocator, g: *const TensorPencil.Gguf, tok: *const TensorPencil.tokenizer.Tokenizer, system: ?[]const u8, override_src: ?[]const u8) void {
+    llm.chat_template.active = if (override_src) |src|
+        (llm.chat_template.ChatTemplate.fromSource(arena, src) catch null)
+    else
+        (llm.chat_template.ChatTemplate.fromGguf(arena, g) catch null);
     llm.chat_template.system_prompt = system;
     llm.chat_template.bos = if (tok.bos) |b| (tok.decodeAlloc(arena, &.{b}) catch "") else "";
 }
@@ -1755,7 +1771,7 @@ fn runGemma4(
     defer tok.deinit();
     llm.chat.applyTokenizer(&tok);
     llm.chat.setFamily(.gemma4);
-    setupChatTemplate(arena, g, &tok, system);
+    setupChatTemplateEx(arena, g, &tok, system, if (g_canonical_gemma4) llm.chat_template.ChatTemplate.gemma4_canonical_src else null);
 
     // CUDA backend created up front so the vision embedder can encode
     // device-side (the LLM claims VRAM after). Null on cpu. A 0 budget pins the

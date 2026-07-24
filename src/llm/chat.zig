@@ -26,6 +26,11 @@ pub var bos_token: ?u32 = null;
 pub var turn_end: u32 = tokenizer_mod.im_end;
 pub var pad: u32 = tokenizer_mod.pad_token;
 pub var newline: u32 = newline_id;
+/// Raw end-of-sequence id, when the vocab declares one distinct from `turn_end`
+/// (`tokenizer.ggml.eos_token_id`). Some finetunes end a turn on `<eos>` rather
+/// than the turn marker, so `isStop` accepts it too — otherwise generation runs
+/// past the model's own stop and degenerates. Null => no separate eos.
+pub var eos: ?u32 = null;
 
 /// Chat template family. `chatml` is Qwen's `<|im_start|>role\n…<|im_end|>`;
 /// `gemma` is Gemma 3's `<start_of_turn>role\n…<end_of_turn>\n`; `gemma4` is
@@ -112,6 +117,7 @@ pub fn applyTokenizer(tok: *const Tokenizer) void {
     pad = tok.pad;
     newline = tok.newline;
     bos_token = tok.bos;
+    eos = tok.eos;
 }
 
 /// Prepend the model's BOS token when it wants one AND `out` is at the very
@@ -123,7 +129,7 @@ fn appendBosIfStart(gpa: std.mem.Allocator, out: *std.ArrayList(u32)) !void {
 }
 
 pub fn isStop(id: u32) bool {
-    return id == turn_end or id == pad;
+    return id == turn_end or id == pad or (eos != null and id == eos.?);
 }
 
 pub fn appendSystem(tok: *const Tokenizer, gpa: std.mem.Allocator, text: []const u8, out: *std.ArrayList(u32)) !void {
@@ -467,6 +473,8 @@ test "gemma turn building matches whole-template tokenization" {
     const saved_turn_end = turn_end;
     const saved_pad = pad;
     const saved_newline = newline;
+    const saved_bos = bos_token;
+    const saved_eos = eos;
     const saved_family = family;
     applyTokenizer(&tok);
     setFamily(.gemma);
@@ -474,6 +482,8 @@ test "gemma turn building matches whole-template tokenization" {
         turn_end = saved_turn_end;
         pad = saved_pad;
         newline = saved_newline;
+        bos_token = saved_bos;
+        eos = saved_eos;
         setFamily(saved_family);
     }
 
@@ -594,4 +604,14 @@ test "stop tokens" {
     try std.testing.expect(isStop(tokenizer_mod.im_end));
     try std.testing.expect(isStop(tokenizer_mod.pad_token));
     try std.testing.expect(!isStop(newline_id));
+
+    // A raw <eos> distinct from the turn marker must also stop (some finetunes
+    // — e.g. gemma4 DarkIdol — end a turn on <eos>, not <turn|>; missing this
+    // ran generation past the model's own end into a degenerate repeat tail).
+    const saved_eos = eos;
+    defer eos = saved_eos;
+    eos = 12345;
+    try std.testing.expect(isStop(12345));
+    eos = null;
+    try std.testing.expect(!isStop(12345));
 }

@@ -1116,8 +1116,16 @@ fn applyConfig() void {
     // The diffusion engine is shared by both modes; reconcile it either way.
     syncDiffuser();
 
+    // A system-prompt edit applies live on a render-driven (template) session —
+    // updateSettings restages it and the next message re-renders (TODO #8). A
+    // hand-glue session bakes the system into the prompt prefix, so it needs a
+    // transcript-preserving reload instead.
+    const sys_changed = !std.mem.eql(u8, g_config.system_prompt.slice(), g_config_baseline.system_prompt.slice());
+    const sys_needs_reload = sys_changed and g_session != null and
+        !g_loading.load(.acquire) and !g_session.?.templateActive();
     const llm_reload = !g_config.llmReloadEql(&g_config_baseline) or
-        (g_config.diffEnabled() != g_config_baseline.diffEnabled()); // tool prompt changes
+        (g_config.diffEnabled() != g_config_baseline.diffEnabled()) or // tool prompt changes
+        sys_needs_reload;
     // A KV-dtype change needs only a CONTEXT rebuild (weights stay resident),
     // never the full weight reload above.
     const ctx_reload = !g_config.ctxReloadEql(&g_config_baseline);
@@ -1346,6 +1354,7 @@ fn buildSession(arena: std.mem.Allocator) !*chat.Session {
         .kv_dtype = toKvDtype(g_config.kv_dtype),
         .regen_cache_mb = g_config.regen_cache_mb,
         .vision_budget_tokens = g_config.vision_budget.tokens(),
+        .gemma4_canonical_template = g_config.gemma4_canonical_template,
     });
     return s;
 }

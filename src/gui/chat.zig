@@ -116,6 +116,16 @@ const image_tool_prompt =
     \\Defaults (square, balanced quality) are used when attributes are omitted. width/height are rounded to multiples of 16. Reuse a prior seed when asked to modify a previous generation, or change the seed when asked to generate variations.
 ;
 
+/// Compose the effective system prompt: the configured base, with the
+/// image-tool description appended when the image tool is available. Shared by
+/// session init and the live `updateSettings` restage so both build it the same
+/// way. Caller owns the returned slice.
+fn composeSystemText(gpa: std.mem.Allocator, images_enabled: bool, base: []const u8) ![]u8 {
+    if (images_enabled)
+        return std.fmt.allocPrint(gpa, "{s}\n\n{s}", .{ base, image_tool_prompt });
+    return gpa.dupe(u8, base);
+}
+
 pub const Role = enum { user, assistant };
 
 /// Re-exported from the diffusion engine so consumers keep using `chat.*`.
@@ -328,6 +338,13 @@ pub const Options = struct {
     /// ALWAYS kept, whatever the budget — only older boundaries (future
     /// branch points) are evicted; a rollback past those re-prefills.
     regen_cache_mb: usize = 2048,
+    /// Replace a Gemma 4 model's OWN embedded chat_template with Google's
+    /// current upstream "canonical" one (chat_template.gemma4Canonical). Some
+    /// finetunes ship an older/stripped template; this renders exactly what
+    /// Google's `apply_chat_template` would. Ignored for non-gemma4 models.
+    /// Load-time (which template the session parses); a toggle triggers a
+    /// transcript-preserving reload.
+    gemma4_canonical_template: bool = false,
 };
 
 /// Map the GUI's engine-free `config.Sampling` onto the library's
@@ -378,6 +395,15 @@ pub const Session = struct {
     /// runs (`submit` refuses when busy). Keeps live settings edits from racing
     /// the worker's read of `opts`, and gives "takes effect next turn" exactly.
     pending_sampling: sample.Params = .{},
+    /// A changed system prompt staged by `updateSettings` (UI thread), gpa-owned,
+    /// adopted into `system_text` by `submit`/`regenerate` at the next turn
+    /// boundary — same discipline as `pending_sampling` (the worker reads
+    /// `system_text` mid-turn in `buildRenderedTurn`, so it must not be swapped
+    /// under it). Only staged for render-driven (template) sessions, where the
+    /// re-rendered system turn + reconcile apply it on the next message; the
+    /// hand-glue path can't change it live (app.zig forces a reload there). Null
+    /// when nothing is pending.
+    pending_system_text: ?[]const u8 = null,
     /// Per-turn sampling seeds, drawn at each turn boundary (`submit`, UI
     /// thread — same discipline as `pending_sampling`). Deliberately NOT
     /// reset by `reset`: a new chat must not replay the previous chat's
@@ -708,19 +734,19 @@ pub const Session = struct {
         // System prompt: the configured base prompt, with the image-tool
         // description appended when the image tool is available. Prefilled on
         // the first turn (the uncached prefix of `ids`); never shown in the UI.
-        if (self.images_enabled) {
-            self.system_text = try std.fmt.allocPrint(gpa, "{s}\n\n{s}", .{ cfg.system_prompt, image_tool_prompt });
-        } else {
-            self.system_text = try gpa.dupe(u8, cfg.system_prompt);
-        }
+        self.system_text = try composeSystemText(gpa, self.images_enabled, cfg.system_prompt);
         try chat.appendSystem(&self.tok, self.gpa, self.system_text, &self.ids);
 
         // Render-driven templating: load the model's own chat_template. Drives
         // text AND vision turns (the render's image placeholders expand to the
         // real pad-row block, embeddings spliced in during prefill — see
         // `buildRenderedTurn`). A model without an embedded template keeps the
-        // hand glue.
-        self.template = chat_template.ChatTemplate.fromGguf(arena, &self.gguf) catch null;
+        // hand glue. The gemma4-canonical override swaps in Google's upstream
+        // template (for finetunes shipping an older/stripped one).
+        self.template = if (cfg.gemma4_canonical_template and self.arch == .gemma4)
+            (chat_template.ChatTemplate.gemma4Canonical(arena) catch null)
+        else
+            (chat_template.ChatTemplate.fromGguf(arena, &self.gguf) catch null);
         self.bos_str = if (self.tok.bos) |b| (self.tok.decodeAlloc(gpa, &.{b}) catch "") else "";
 
         // Snapshot the prompt prefix so `reset` can restore it verbatim.
@@ -862,6 +888,24 @@ pub const Session = struct {
             for (m.variants.items) |*v| v.images.clearRetainingCapacity();
     }
 
+    /// Whether this session renders prompts from the model's embedded
+    /// chat_template (vs the hand glue). A changed system prompt can be applied
+    /// live only in this mode; app.zig reloads otherwise.
+    pub fn templateActive(self: *const Session) bool {
+        return self.template != null;
+    }
+
+    /// Adopt a system-prompt change staged by `updateSettings`, at a turn
+    /// boundary (UI thread, no worker running — callers guard on `busy()`), so
+    /// the worker never reads `system_text` while it is swapped.
+    fn adoptPendingSystemText(self: *Session) void {
+        if (self.pending_system_text) |t| {
+            if (self.system_text.len > 0) self.gpa.free(self.system_text);
+            self.system_text = t;
+            self.pending_system_text = null;
+        }
+    }
+
     /// Apply the non-load-affecting settings live (no reload, so the chat is
     /// preserved): reasoning and the sampling controls. The VRAM meter policy
     /// (split/limit) is applied separately via `applyVramPolicy`; diffusion-
@@ -877,6 +921,26 @@ pub const Session = struct {
         self.pending_sampling = samplingParams(cfg);
         // Checkpoint budget likewise (the worker reads it in takeCheckpoint).
         self.pending_budget = @as(u64, cfg.regen_cache_mb) << 20;
+        // System prompt: for a render-driven (template) session, restage it so
+        // the next turn re-renders the new system turn and `reconcile` rewinds
+        // the KV to apply it — TODO #8, "changing system prompt takes effect on
+        // the next message". Staged (not applied) to avoid racing the worker's
+        // read of `system_text`; `submit`/`regenerate` adopt it at the boundary.
+        // Non-template sessions bake the system into `initial_ids` and can't do
+        // this live — app.zig forces a transcript-preserving reload for them.
+        if (self.template != null) {
+            const base = cfg.system_prompt.opt() orelse config.default_system_prompt;
+            const next = composeSystemText(self.gpa, self.images_enabled, base) catch return;
+            // Compare against the pending value if one is already staged, else
+            // the live one — so repeated settings-applies don't leak.
+            const current = self.pending_system_text orelse self.system_text;
+            if (std.mem.eql(u8, next, current)) {
+                self.gpa.free(next);
+            } else {
+                if (self.pending_system_text) |old| self.gpa.free(old);
+                self.pending_system_text = next;
+            }
+        }
         // (vision_budget is reload-triggering, not live — it sizes the LLM's
         // image-prefill buffers at load; see `reloadEql` / the gemma4 load path.)
     }
@@ -1069,6 +1133,7 @@ pub const Session = struct {
         }
         if (self.template) |*t| t.deinit();
         if (self.system_text.len > 0) self.gpa.free(self.system_text);
+        if (self.pending_system_text) |t| self.gpa.free(t);
         if (self.bos_str.len > 0) self.gpa.free(self.bos_str);
         if (self.mmproj_gguf) |*g| g.deinit();
         for (self.messages.items) |*m| m.deinit(self.gpa);
@@ -1218,6 +1283,7 @@ pub const Session = struct {
         // replay the same RNG stream. Safe here (UI thread, no worker yet).
         self.opts.sampling = self.pending_sampling;
         self.checkpoint_budget = self.pending_budget;
+        self.adoptPendingSystemText();
         self.opts.seed = self.seeds.next();
 
         var um = try Message.init(self.gpa, .user);
@@ -1271,6 +1337,7 @@ pub const Session = struct {
         // previous variant's RNG stream (SeedSeq is deliberately not reset).
         self.opts.sampling = self.pending_sampling;
         self.checkpoint_budget = self.pending_budget;
+        self.adoptPendingSystemText();
         self.opts.seed = self.seeds.next();
 
         // The new (empty) variant becomes the active one and streams like a

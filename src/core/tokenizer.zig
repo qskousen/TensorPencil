@@ -180,6 +180,12 @@ pub const Tokenizer = struct {
     /// `tokenizer.ggml.add_bos_token` + `bos_token_id` (Mistral/llama want it;
     /// Qwen3 does not). chat.zig prepends it via `appendBos`.
     bos: ?u32 = null,
+    /// End-of-sequence token (`tokenizer.ggml.eos_token_id`), when the vocab
+    /// declares one distinct from `turn_end`. A model can end a turn on EITHER
+    /// its turn marker OR raw `<eos>` (some finetunes emit eos), so chat.isStop
+    /// treats both as stops — else the engine runs past the model's own end and
+    /// degenerates. Null when unknown/absent.
+    eos: ?u32 = null,
     pretok: Pretok = .qwen2,
     kind: Kind = .bpe,
     /// SentencePiece data (kind == .spm; empty for BPE): per-id merge score,
@@ -328,6 +334,7 @@ pub const Tokenizer = struct {
         };
         const eos: ?u32 = if (g.getUint("tokenizer.ggml.eos_token_id")) |e| @intCast(e) else null;
         t.turn_end = findSpecial(t.specials, "<|im_end|>") orelse eos orelse return error.MissingTokenizer;
+        t.eos = eos;
         t.pad = if (g.getUint("tokenizer.ggml.padding_token_id")) |p| @intCast(p) else eos orelse t.turn_end;
         // Prepend BOS only when the model asks for it (Mistral/llama: true;
         // Qwen3: absent/false).
@@ -414,8 +421,14 @@ pub const Tokenizer = struct {
         };
         const eos: ?u32 = if (g.getUint("tokenizer.ggml.eos_token_id")) |e| @intCast(e) else null;
         t.turn_end = findSpecial(t.specials, "<end_of_turn>") orelse eos orelse return error.MissingTokenizer;
+        t.eos = eos;
         t.pad = if (g.getUint("tokenizer.ggml.padding_token_id")) |p| @intCast(p) else eos orelse t.turn_end;
         t.newline = findSpecial(t.specials, "\n") orelse 0;
+        // BOS: Gemma requires a leading <bos>; the chat_template renders it via
+        // `{{ bos_token }}`, so this must be populated for the render-driven path
+        // (else no BOS is emitted and the model degenerates). Metadata-driven, so
+        // it stays null for SPM models that genuinely have no BOS.
+        t.bos = if (g.getUint("tokenizer.ggml.bos_token_id")) |b| @intCast(b) else findSpecial(t.specials, "<bos>");
         return t;
     }
 
@@ -514,8 +527,15 @@ pub const Tokenizer = struct {
         // Gemma 4 turn markers: <|turn> (open) / <turn|> (close); the model
         // stops on the closing marker or eos.
         t.turn_end = findSpecial(t.specials, "<turn|>") orelse eos orelse return error.MissingTokenizer;
+        t.eos = eos;
         t.pad = if (g.getUint("tokenizer.ggml.padding_token_id")) |p| @intCast(p) else eos orelse t.turn_end;
         t.newline = text_id.get("\n") orelse 0;
+        // BOS: Gemma prompts REQUIRE a leading <bos>. The chat_template renders
+        // it via `{{ bos_token }}`, so `bos` must be populated — otherwise the
+        // render-driven path emits no BOS and the model degenerates (badly on
+        // larger models). The hand glue adds it via specialId, but the template
+        // path relies on this field.
+        t.bos = if (g.getUint("tokenizer.ggml.bos_token_id")) |b| @intCast(b) else findSpecial(t.specials, "<bos>");
         return t;
     }
 

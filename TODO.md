@@ -5,7 +5,7 @@
 - can't switch to image studio while llm'ing
 - when not diffusing and llm is running, llm doesn't offload any diffusion weights but diffusion offloads llm weights
 - split is not respected
-- changing system prompt should wipe context and take effect on the next message
+- changing system prompt should take effect on the next message
 - begin filling in holes in the capabilities grid (BACKEND.md)
 - add more sampling methods
 - tool call boxes inline, expandable to see the tool call

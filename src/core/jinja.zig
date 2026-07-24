@@ -163,6 +163,11 @@ const Chunk = union(enum) {
 // Template
 // ---------------------------------------------------------------------------
 
+/// Google's current upstream "canonical" Gemma 4 chat template, embedded so
+/// the config override (chat_template.gemma4Canonical) can replace a model's
+/// own embedded template with it. Verified byte-exact vs jinja2 (fixtures).
+pub const gemma4_canonical_template: []const u8 = @embedFile("assets/jinja/gemma4_canonical.jinja");
+
 pub const Template = struct {
     arena: std.heap.ArenaAllocator,
     nodes: []Node,
@@ -924,8 +929,20 @@ const Parser = struct {
                 return self.mk(.{ .lit = .{ .float = v } });
             },
             .str => {
-                const v = self.toks[self.ti].str;
+                var v = self.toks[self.ti].str;
                 self.ti += 1;
+                // Python/Jinja2 adjacent string-literal concatenation: two (or
+                // more) string literals with nothing between them join into one
+                // (`"a" "b"` == `"ab"`), used e.g. for wrapped `raise_exception`
+                // messages in Google's canonical gemma4 template.
+                while (self.peekSym() == .str) {
+                    const nxt = self.toks[self.ti].str;
+                    self.ti += 1;
+                    const joined = try self.a.alloc(u8, v.len + nxt.len);
+                    @memcpy(joined[0..v.len], v);
+                    @memcpy(joined[v.len..], nxt);
+                    v = joined;
+                }
                 return self.mk(.{ .lit = .{ .str = v } });
             },
             .lparen => {
@@ -1799,11 +1816,40 @@ pub fn fromJson(a: std.mem.Allocator, jv: std.json.Value) Error!Value {
     };
 }
 
+test "jinja: adjacent string literals concatenate (Python/Jinja2)" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const g = try arena.allocator().create(Dict);
+    g.* = .{};
+    const empty: Value = .{ .dict = g };
+    const cases = [_]struct { src: []const u8, want: []const u8 }{
+        .{ .src = "{{ 'a' 'b' }}", .want = "ab" },
+        .{ .src = "{{ 'a' 'b' 'c' }}", .want = "abc" }, // 3+ join
+        .{ .src = "{{ (\"foo \"\n\"bar\") }}", .want = "foo bar" }, // wrapped, like raise_exception msgs
+        .{ .src = "{{ 'x' ~ 'y' }}", .want = "xy" }, // explicit ~ still works
+    };
+    for (cases) |c| {
+        var t = try Template.parse(gpa, c.src);
+        defer t.deinit();
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(gpa);
+        try t.render(gpa, empty, &out);
+        errdefer std.debug.print("src={s} got={s}\n", .{ c.src, out.items });
+        try std.testing.expectEqualStrings(c.want, out.items);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests: byte-exact against jinja2 goldens (assets/jinja/fixtures.json).
 // ---------------------------------------------------------------------------
 
 const fixtures_json = @embedFile("assets/jinja/fixtures.json");
+
+test "jinja: canonical gemma4 template parses (adjacent-string concat path)" {
+    var t = try Template.parse(std.testing.allocator, gemma4_canonical_template);
+    t.deinit();
+}
 
 test "jinja: golden fixtures render byte-exact vs jinja2" {
     const gpa = std.testing.allocator;

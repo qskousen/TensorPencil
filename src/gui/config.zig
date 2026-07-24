@@ -410,6 +410,12 @@ pub const Config = struct {
     /// live — the GUI toolbar toggle flips this without a reload; the block is
     /// rendered collapsed. No effect on non-reasoning models (e.g. Gemma 3).
     reasoning: bool = true,
+    /// Replace a Gemma 4 model's own embedded chat_template with Google's
+    /// current upstream "canonical" one. Some finetunes (e.g. DarkIdol 31B) ship
+    /// an older/stripped template; this renders exactly what Google's
+    /// `apply_chat_template` produces. No effect on non-gemma4 models. Load-time
+    /// (see `llmReloadEql`): a toggle triggers a transcript-preserving reload.
+    gemma4_canonical_template: bool = false,
     /// KV-cache element storage type (f32 default; f16 halves the KV VRAM
     /// footprint, lossy). Changing it rebuilds the KV context — the weights stay
     /// resident (see `ctxReloadEql`), not a full model reload.
@@ -460,7 +466,10 @@ pub const Config = struct {
             a.llm_backend == b.llm_backend and
             // The vision budget sizes the LLM's image-prefill buffers + KV ring
             // at load, so a change needs a (transcript-preserving) reload.
-            a.vision_budget == b.vision_budget;
+            a.vision_budget == b.vision_budget and
+            // Which chat_template the session parses is chosen at load, so a
+            // toggle reloads (transcript preserved; weights re-pinned).
+            a.gemma4_canonical_template == b.gemma4_canonical_template;
     }
 
     /// The LLM's KV-cache CONTEXT config matches. A change here (currently just
@@ -688,6 +697,8 @@ pub const Config = struct {
             if (VaeDecode.fromStr(val)) |v| self.vae_decode = v;
         } else if (std.mem.eql(u8, key, "reasoning")) {
             self.reasoning = std.mem.eql(u8, val, "true");
+        } else if (std.mem.eql(u8, key, "gemma4_canonical_template")) {
+            self.gemma4_canonical_template = std.mem.eql(u8, val, "true");
         } else if (std.mem.eql(u8, key, "vision_budget")) {
             if (VisionBudget.fromStr(val)) |b| self.vision_budget = b;
         } else if (std.mem.eql(u8, key, "kv_dtype")) {

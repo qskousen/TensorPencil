@@ -250,6 +250,16 @@ pub fn render(cfg: *config.Config, cb: Callbacks) void {
     {
         var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 4 } });
         defer row.deinit();
+        _ = dvui.checkbox(@src(), &cfg.gemma4_canonical_template, "Gemma 4 canonical chat template", .{ .gravity_y = 0.5 });
+    }
+    help("Use Google's current upstream Gemma 4 chat template instead of the " ++
+        "one embedded in the model file. Some finetunes ship an older or altered " ++
+        "template that can make multi-turn or reasoning chats misbehave; this " ++
+        "renders exactly what Google's reference does. Reloads the model (chat " ++
+        "preserved). Ignored by non-Gemma-4 models.");
+    {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 4 } });
+        defer row.deinit();
         dvui.label(@src(), "Diffusion backend", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
         _ = dvui.dropdownEnum(@src(), config.Backend, .{ .choice = &cfg.diff_backend }, .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 200 } });
     }
