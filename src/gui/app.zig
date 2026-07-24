@@ -1938,15 +1938,14 @@ fn renderInput(s: ?*chat.Session) void {
     })) openSettings();
     hint.hover(@src(), &wd, "Settings");
 
-    // Image studio: leave chat (unloads the LLM) for direct text-to-image.
-    // Disabled mid-turn so the unload can't race the generation worker.
+    // Image studio: leave chat for direct text-to-image.
     if (dvui.buttonIcon(@src(), "image-studio", dvui.entypo.image, .{}, .{}, .{
         .gravity_y = 0.5,
         .min_size_content = .{ .w = 22, .h = 22 },
         .margin = .{ .w = 6 },
         .data_out = &wd,
-    }) and !busy) enterImageMode();
-    hint.hover(@src(), &wd, "Image studio — text-to-image without chat (unloads the LLM)");
+    })) enterImageMode();
+    hint.hover(@src(), &wd, "Image studio — text-to-image without chat");
 
     // Reasoning toggle (no brain icon in entypo — a lit bulb reads as
     // "thinking"). Shown for any model whose family can reason (Gemma 3 etc.

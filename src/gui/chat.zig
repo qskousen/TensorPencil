@@ -389,6 +389,7 @@ pub const Session = struct {
     /// template emits, and whether reasoning is on — the render inputs.
     system_text: []const u8 = "",
     bos_str: []const u8 = "",
+    eos_str: []const u8 = "",
     opts: engine.Options,
     /// Sampling params staged by `updateSettings` (UI thread) and copied into
     /// `opts.sampling` by `submit` — also UI-thread, and never while a worker
@@ -696,6 +697,21 @@ pub const Session = struct {
         self.pending_budget = self.checkpoint_budget;
         self.cur_turn_q = null;
         self.pending_restore = null;
+        // MUST be nulled explicitly: the session is `gpa.create`d (undefined
+        // memory), so the field's `= null` default does NOT apply. Left
+        // undefined, `adoptPendingSystemText` reads it as a live pointer at the
+        // first turn, frees the real `system_text`, and swaps in garbage — the
+        // rendered prompt then concatenates a wild-length slice (OOM / integer
+        // overflow). Only surfaced once a template session actually renders the
+        // system prompt (e.g. Mistral `[INST]`); the first buggy turn happens to
+        // leave null behind, so a later session on the reused slot "works".
+        self.pending_system_text = null;
+        // Same `gpa.create` undefined-memory trap: these have `= default`
+        // declarations that do NOT apply, and both are read (control by the VRAM
+        // arbiter poll, suspended_midturn by the worker) before their first
+        // write in some orderings — initialize them to their intended defaults.
+        self.control = .{};
+        self.suspended_midturn = false;
         self.turn_staged = false;
         self.images_enabled = cfg.images_enabled;
 
@@ -748,6 +764,7 @@ pub const Session = struct {
         else
             (chat_template.ChatTemplate.fromGguf(arena, &self.gguf) catch null);
         self.bos_str = if (self.tok.bos) |b| (self.tok.decodeAlloc(gpa, &.{b}) catch "") else "";
+        self.eos_str = if (self.tok.eos) |e| (self.tok.decodeAlloc(gpa, &.{e}) catch "") else "";
 
         // Snapshot the prompt prefix so `reset` can restore it verbatim.
         self.initial_ids = .empty;
@@ -1135,6 +1152,7 @@ pub const Session = struct {
         if (self.system_text.len > 0) self.gpa.free(self.system_text);
         if (self.pending_system_text) |t| self.gpa.free(t);
         if (self.bos_str.len > 0) self.gpa.free(self.bos_str);
+        if (self.eos_str.len > 0) self.gpa.free(self.eos_str);
         if (self.mmproj_gguf) |*g| g.deinit();
         for (self.messages.items) |*m| m.deinit(self.gpa);
         self.messages.deinit(self.gpa);
@@ -1747,6 +1765,7 @@ pub const Session = struct {
         const ropts: chat_template.RenderOpts = .{
             .messages = msgs.items,
             .bos_token = self.bos_str,
+            .eos_token = self.eos_str,
             .enable_thinking = chat.enable_thinking,
             .add_generation_prompt = true,
         };

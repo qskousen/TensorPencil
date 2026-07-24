@@ -630,6 +630,35 @@ pub const Config = struct {
     /// `key = value` format — parsed line-by-line (malformed lines skipped) and
     /// then rewritten as JSON in place, so old configs migrate on first load.
     /// `path_override` bypasses the well-known location (used by `--config`).
+    /// Parse `bytes` as a JSON `Config` on a dedicated thread with a large stack,
+    /// returning the value by copy (the parsed `Config` owns no arena memory —
+    /// `TextBuf.jsonParse` copies strings into its fixed buffers — so the copy is
+    /// self-contained after `parsed.deinit()`). Returns null on any parse error
+    /// (caller falls back to the legacy key=value reader) or if the thread can't
+    /// be spawned. Keeps the huge std.json parse frames off the caller's stack;
+    /// see `load`.
+    fn parseJsonBigStack(gpa: std.mem.Allocator, bytes: []const u8) ?Config {
+        const Ctx = struct {
+            gpa: std.mem.Allocator,
+            bytes: []const u8,
+            out: ?Config = null,
+            fn run(c: *@This()) void {
+                const parsed = std.json.parseFromSlice(Config, c.gpa, c.bytes, .{ .ignore_unknown_fields = true }) catch return;
+                defer parsed.deinit();
+                c.out = parsed.value;
+            }
+        };
+        var ctx: Ctx = .{ .gpa = gpa, .bytes = bytes };
+        const t = std.Thread.spawn(.{ .stack_size = 16 << 20 }, Ctx.run, .{&ctx}) catch {
+            // Spawn failed (very unlikely): parse in-line as a best effort.
+            const parsed = std.json.parseFromSlice(Config, gpa, bytes, .{ .ignore_unknown_fields = true }) catch return null;
+            defer parsed.deinit();
+            return parsed.value;
+        };
+        t.join();
+        return ctx.out;
+    }
+
     pub fn load(io: std.Io, gpa: std.mem.Allocator, environ: *const Environ, path_override: ?[]const u8) Config {
         var cfg: Config = .{};
         const path = (filePath(io, gpa, environ, path_override) catch return cfg) orelse return cfg;
@@ -640,12 +669,18 @@ pub const Config = struct {
         // JSON is the current format. `Config` is a plain value type (all
         // fixed-capacity buffers, no slices/pointers into the parse arena), so
         // we can copy the parsed value out and free the arena immediately.
-        if (std.json.parseFromSlice(Config, gpa, bytes, .{ .ignore_unknown_fields = true })) |parsed| {
-            defer parsed.deinit();
-            cfg = parsed.value;
+        // `Config` is ~150 KB and std.json builds it plus its nested per-field
+        // temporaries on the stack; in a Debug build those frames, stacked on
+        // top of `app.run`'s own frames, can overflow the 8 MB main-thread stack
+        // (a nondeterministic SIGSEGV in a parse-frame prologue). Parse on a
+        // dedicated thread with a generous stack so the footprint never depends
+        // on the caller's remaining headroom (Release was fine; this hardens
+        // Debug and any future growth).
+        if (parseJsonBigStack(gpa, bytes)) |parsed_value| {
+            cfg = parsed_value;
             cfg.fillOutputDir(io, gpa, environ);
             return cfg;
-        } else |_| {}
+        }
 
         // Legacy `key = value` fallback: parse, then rewrite as JSON in place.
         var lines = std.mem.tokenizeScalar(u8, bytes, '\n');

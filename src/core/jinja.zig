@@ -224,6 +224,34 @@ fn isSpace(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\r' or c == '\n';
 }
 
+/// Find `close` in `src` at or after `from`, skipping over single/double quoted
+/// string literals (honoring backslash escapes) so a delimiter appearing inside
+/// a string is not mistaken for the tag terminator.
+fn findTagClose(src: []const u8, from: usize, close: []const u8) ?usize {
+    var k = from;
+    var quote: u8 = 0;
+    while (k < src.len) {
+        const c = src[k];
+        if (quote != 0) {
+            if (c == '\\' and k + 1 < src.len) {
+                k += 2;
+                continue;
+            }
+            if (c == quote) quote = 0;
+            k += 1;
+            continue;
+        }
+        if (c == '\'' or c == '"') {
+            quote = c;
+            k += 1;
+            continue;
+        }
+        if (k + close.len <= src.len and std.mem.eql(u8, src[k .. k + close.len], close)) return k;
+        k += 1;
+    }
+    return null;
+}
+
 fn scan(a: std.mem.Allocator, src: []const u8) Error![]Chunk {
     // Pass 1: raw split into text runs and tags, recording per-tag trim flags.
     const RawTag = struct { kind: TagKind, left_trim: bool, right_trim: bool, inner: []const u8, is_block: bool };
@@ -251,7 +279,14 @@ fn scan(a: std.mem.Allocator, src: []const u8) Error![]Chunk {
                 '%' => "%}",
                 else => "#}",
             };
-            const close_at = std.mem.indexOfPos(u8, src, j, close) orelse {
+            // For `{{ }}`/`{% %}` the close delimiter must be found OUTSIDE any
+            // quoted string, else a template that emits a literal `}}`/`%}` from
+            // a string (e.g. Mistral's `{{- "}}" }}`) is cut mid-string. Comments
+            // (`{# #}`) have no expression grammar, so a plain scan is fine.
+            const close_at = (if (marker == '#')
+                std.mem.indexOfPos(u8, src, j, close)
+            else
+                findTagClose(src, j, close)) orelse {
                 return Error.JinjaParse;
             };
             var inner_end = close_at;
@@ -1652,7 +1687,59 @@ const Interp = struct {
             try self.toJson(v, &buf, indent, 0);
             return self.strVal(buf.items);
         }
+        if (std.mem.eql(u8, name, "selectattr") or std.mem.eql(u8, name, "rejectattr")) {
+            // `seq | selectattr("attr")` keeps items whose attr is truthy;
+            // `seq | selectattr("attr", "test", *args)` keeps items where
+            // `test(item.attr, *args)` holds. `rejectattr` is the complement.
+            const reject = name[0] == 'r';
+            if (v != .list) return v;
+            const attr = if (args.len >= 1) try self.toStr(try self.eval(args[0])) else return self.rt("selectattr needs an attribute");
+            const l = try self.newList();
+            for (v.list.items.items) |it| {
+                const av = self.getAttr(it, attr);
+                const hit = if (args.len >= 2)
+                    try self.testValue(try self.toStr(try self.eval(args[1])), av, args[2..])
+                else
+                    av.truthy();
+                if (hit != reject) try l.items.append(self.a, it);
+            }
+            return .{ .list = l };
+        }
+        if (std.mem.eql(u8, name, "select") or std.mem.eql(u8, name, "reject")) {
+            const reject = name[0] == 'r';
+            if (v != .list) return v;
+            const l = try self.newList();
+            for (v.list.items.items) |it| {
+                const hit = if (args.len >= 1)
+                    try self.testValue(try self.toStr(try self.eval(args[0])), it, args[1..])
+                else
+                    it.truthy();
+                if (hit != reject) try l.items.append(self.a, it);
+            }
+            return .{ .list = l };
+        }
         return self.rt("unknown filter");
+    }
+
+    /// Apply a Jinja test to an already-evaluated value with unevaluated arg
+    /// exprs. Shared by `is <test>` and `selectattr`/`rejectattr`.
+    fn testValue(self: *Interp, name: []const u8, v: Value, args: []const *Expr) Error!bool {
+        if (std.mem.eql(u8, name, "equalto") or std.mem.eql(u8, name, "eq") or std.mem.eql(u8, name, "==") or std.mem.eql(u8, name, "sameas")) {
+            if (args.len < 1) return false;
+            return self.valueEql(v, try self.eval(args[0]));
+        }
+        if (std.mem.eql(u8, name, "ne") or std.mem.eql(u8, name, "!=")) {
+            if (args.len < 1) return true;
+            return !self.valueEql(v, try self.eval(args[0]));
+        }
+        if (std.mem.eql(u8, name, "defined")) return v != .undef;
+        if (std.mem.eql(u8, name, "undefined")) return v == .undef;
+        if (std.mem.eql(u8, name, "none")) return v == .none;
+        if (std.mem.eql(u8, name, "string")) return v == .str;
+        if (std.mem.eql(u8, name, "mapping")) return v == .dict;
+        if (std.mem.eql(u8, name, "number")) return v == .int or v == .float;
+        if (std.mem.eql(u8, name, "boolean")) return v == .boolean;
+        return self.rt2("unknown test in filter");
     }
 
     fn applyNamedFilter(self: *Interp, fname: []const u8, item: Value) Error!Value {

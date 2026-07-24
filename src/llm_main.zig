@@ -443,10 +443,16 @@ fn runQwen3(
     // line; the KV cache carries the whole conversation across turns).
     var ids: std.ArrayList(u32) = .empty;
     defer ids.deinit(gpa);
-    if (system) |s| try llm.chat.appendSystem(&tok, gpa, s, &ids);
+    // One-shot `--prompt` renders through the embedded template when present
+    // (correct `[INST]` for Mistral/llama; identical to a chat first turn).
+    // Interactive (prompt == null) with a template leaves `ids` empty here —
+    // `renderDrivenChat` re-renders the whole transcript and takes the system
+    // from `chat_template.system_prompt`; only the no-template hand-glue
+    // interactive fallback needs the system primed into `ids` up front.
     if (prompt) |p| {
-        try llm.chat.appendUser(&tok, gpa, p, &ids);
-        try llm.chat.openAssistant(&tok, gpa, &ids);
+        try appendOneShotPrompt(&tok, gpa, system, p, &ids);
+    } else if (llm.chat_template.active == null) {
+        if (system) |s| try llm.chat.appendSystem(&tok, gpa, s, &ids);
     }
 
     // Vulkan reserves the whole KV window up front (no growable buffers), so
@@ -698,6 +704,39 @@ fn setupChatTemplateEx(arena: std.mem.Allocator, g: *const TensorPencil.Gguf, to
         (llm.chat_template.ChatTemplate.fromGguf(arena, g) catch null);
     llm.chat_template.system_prompt = system;
     llm.chat_template.bos = if (tok.bos) |b| (tok.decodeAlloc(arena, &.{b}) catch "") else "";
+    llm.chat_template.eos = if (tok.eos) |e| (tok.decodeAlloc(arena, &.{e}) catch "") else "";
+}
+
+/// Build the initial `--prompt` one-shot token ids. When the model shipped an
+/// embedded chat_template, render `[system,] user` through it — the SAME source
+/// of truth the interactive `renderDrivenChat` uses — so a one-shot and a chat
+/// first turn are byte-identical (and Mistral/llama models get their real
+/// `[INST]` format instead of the ChatML hand glue). Falls back to the
+/// per-family hand glue when there is no template.
+fn appendOneShotPrompt(
+    tok: *const TensorPencil.tokenizer.Tokenizer,
+    gpa: std.mem.Allocator,
+    system: ?[]const u8,
+    prompt: []const u8,
+    ids: *std.ArrayList(u32),
+) !void {
+    if (llm.chat_template.active) |*ct| {
+        var msgs: std.ArrayList(llm.chat_template.Message) = .empty;
+        defer msgs.deinit(gpa);
+        if (system) |s| try msgs.append(gpa, .{ .role = .system, .content = s });
+        try msgs.append(gpa, .{ .role = .user, .content = prompt });
+        try ct.renderIds(tok, gpa, .{
+            .messages = msgs.items,
+            .bos_token = llm.chat_template.bos,
+            .eos_token = llm.chat_template.eos,
+            .enable_thinking = llm.chat.enable_thinking,
+            .add_generation_prompt = true,
+        }, ids);
+    } else {
+        if (system) |s| try llm.chat.appendSystem(tok, gpa, s, ids);
+        try llm.chat.appendUser(tok, gpa, prompt, ids);
+        try llm.chat.openAssistant(tok, gpa, ids);
+    }
 }
 
 fn childType(comptime T: type) type {
@@ -840,6 +879,7 @@ fn renderDrivenChat(
     const M = childType(@TypeOf(model));
     const ct = &llm.chat_template.active.?;
     const bos = llm.chat_template.bos;
+    const eos = llm.chat_template.eos;
     const img_ok = comptime @hasDecl(M, "prefillImage");
     const exp: ?llm.chat_template.ImageExpand = if (img_ok and img_chat != null) imageExpandFor(tok) else null;
 
@@ -949,6 +989,7 @@ fn renderDrivenChat(
         const ropts: llm.chat_template.RenderOpts = .{
             .messages = transcript.items,
             .bos_token = bos,
+            .eos_token = eos,
             .enable_thinking = llm.chat.enable_thinking,
             .add_generation_prompt = true,
         };

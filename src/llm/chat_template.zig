@@ -123,6 +123,9 @@ pub const RenderOpts = struct {
     enable_thinking: bool = true,
     /// The model's BOS string (templates emit `{{ bos_token }}`); "" for none.
     bos_token: []const u8 = "",
+    /// The model's EOS string (Mistral/llama templates emit `{{ eos_token }}`
+    /// to close each assistant turn); "" for none.
+    eos_token: []const u8 = "",
 };
 
 pub const ChatTemplate = struct {
@@ -212,6 +215,7 @@ pub const ChatTemplate = struct {
 // hand glue in `chat.zig`.
 pub var active: ?ChatTemplate = null;
 pub var bos: []const u8 = "";
+pub var eos: []const u8 = "";
 pub var system_prompt: ?[]const u8 = null;
 
 fn mapErr(e: jinja.Error) anyerror {
@@ -261,12 +265,108 @@ fn buildGlobals(a: std.mem.Allocator, opts: RenderOpts) !jinja.Value {
     try g.put(a, "add_generation_prompt", .{ .boolean = opts.add_generation_prompt });
     try g.put(a, "enable_thinking", .{ .boolean = opts.enable_thinking });
     try g.put(a, "bos_token", .{ .str = opts.bos_token });
+    try g.put(a, "eos_token", .{ .str = opts.eos_token });
     return .{ .dict = g };
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+// The Mistral v3 `[INST]` chat template (as shipped by Mistral-Small / its
+// finetunes, e.g. Pantheon-RP-Pure). Exercises the engine features these
+// templates need that simpler ChatML ones don't: a literal `}}` emitted from a
+// string (`{{- "}}" }}`, which requires the scanner to skip quoted strings when
+// finding the tag close), `messages[1:]` slicing, `selectattr(...,"equalto",...)`,
+// the `{{ eos_token }}` global, and the system prompt folded into the LAST user
+// turn. The expected string is byte-identical to jinja2's render of the real
+// GGUF template (verified against jinja2 3.1.6).
+const mistral_v3_src =
+    \\{%- if messages[0]["role"] == "system" %}
+    \\    {%- set system_message = messages[0]["content"] %}
+    \\    {%- set loop_messages = messages[1:] %}
+    \\{%- else %}
+    \\    {%- set loop_messages = messages %}
+    \\{%- endif %}
+    \\{%- if not tools is defined %}
+    \\    {%- set tools = none %}
+    \\{%- endif %}
+    \\{%- set user_messages = loop_messages | selectattr("role", "equalto", "user") | list %}
+    \\{{- bos_token }}
+    \\{%- for message in loop_messages %}
+    \\    {%- if message["role"] == "user" %}
+    \\        {%- if loop.last and system_message is defined %}
+    \\            {{- "[INST] " + system_message + "\n\n" + message["content"] + "[/INST]" }}
+    \\        {%- else %}
+    \\            {{- "[INST] " + message["content"] + "[/INST]" }}
+    \\        {%- endif %}
+    \\    {%- elif message["role"] == "assistant" %}
+    \\        {{- " " + message["content"]|trim + eos_token}}
+    \\    {%- else %}
+    \\        {{- "}}" }}
+    \\    {%- endif %}
+    \\{%- endfor %}
+;
+
+test "chat_template: Mistral v3 [INST] template renders byte-exact vs jinja2" {
+    const gpa = std.testing.allocator;
+    var ct = try ChatTemplate.fromSource(gpa, mistral_v3_src);
+    defer ct.deinit();
+
+    const msgs = [_]Message{
+        .{ .role = .system, .content = "You are Lyra." },
+        .{ .role = .user, .content = "Hello there." },
+        .{ .role = .assistant, .content = "Hi!" },
+        .{ .role = .user, .content = "How are you?" },
+    };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try ct.renderString(gpa, .{ .messages = &msgs, .bos_token = "<s>", .eos_token = "</s>" }, &out);
+
+    errdefer std.debug.print("rendered: {s}\n", .{out.items});
+    // System is folded into the LAST user turn; assistant turn closed by eos.
+    try std.testing.expectEqualStrings(
+        "<s>[INST] Hello there.[/INST] Hi!</s>[INST] You are Lyra.\n\nHow are you?[/INST]",
+        out.items,
+    );
+}
+
+test "jinja: scanner finds tag close outside quoted strings (literal }} in a string)" {
+    const gpa = std.testing.allocator;
+    // The `}}` inside the string must NOT be taken as the `{{ }}` terminator.
+    var ct = try ChatTemplate.fromSource(gpa, "{{- \"a}}b%}c\" }}X");
+    defer ct.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try ct.renderString(gpa, .{ .messages = &.{} }, &out);
+    try std.testing.expectEqualStrings("a}}b%}cX", out.items);
+}
+
+// Real GGUF: parse + render the Mistral-Small finetune's actual embedded
+// template. Proves the shipping template loads (no JinjaParse → no silent
+// ChatML fallback) and produces the `[INST]` format. Self-skips when absent;
+// mmaps header+tokenizer only (no weights), so it stays in the fast suite.
+test "chat_template: real Mistral-Small GGUF renders [INST] (no fallback)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "/home/qt/genai/lmstudio/models/Pantheon-RP-Pure-1.6.2-22b-Small.i1-Q5_K_M.gguf";
+    std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
+
+    var g = try Gguf.open(gpa, io, path);
+    defer g.deinit();
+    var ct = (try ChatTemplate.fromGguf(gpa, &g)) orelse return error.TestUnexpectedResult;
+    defer ct.deinit();
+
+    const msgs = [_]Message{
+        .{ .role = .system, .content = "You are Lyra." },
+        .{ .role = .user, .content = "Hi" },
+    };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try ct.renderString(gpa, .{ .messages = &msgs, .bos_token = "<s>", .eos_token = "</s>" }, &out);
+    errdefer std.debug.print("rendered: {s}\n", .{out.items});
+    try std.testing.expectEqualStrings("<s>[INST] You are Lyra.\n\nHi[/INST]", out.items);
+}
 
 // A tiny ChatML template mirroring the llama/qwen shape, so the render→tokenize
 // path is testable with the embedded default (Qwen ChatML) tokenizer — no GGUF.
