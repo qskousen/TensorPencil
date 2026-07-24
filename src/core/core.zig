@@ -18,6 +18,7 @@ pub const gguf = @import("gguf.zig");
 pub const weights = @import("weights.zig");
 pub const torch_rng = @import("torch_rng.zig");
 pub const tokenizer = @import("tokenizer.zig");
+pub const jinja = @import("jinja.zig");
 pub const unicode_tables = @import("unicode_tables.zig");
 pub const image = @import("image.zig");
 pub const kv_cache = @import("kv_cache.zig");
@@ -36,6 +37,7 @@ test {
     _ = weights;
     _ = torch_rng;
     _ = tokenizer;
+    _ = jinja;
     _ = unicode_tables;
     _ = image;
     _ = kv_cache;

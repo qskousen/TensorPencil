@@ -373,6 +373,16 @@ pub const Gguf = struct {
         return if (v == .arr) v.arr else null;
     }
 
+    /// True if this GGUF is a CLIP/vision projector — an `mmproj-*.gguf` vision
+    /// tower (`general.architecture == "clip"`) rather than an LLM. Lets a
+    /// vision-tower slot reject a wrong pick (e.g. a second LLM file) with a
+    /// clear error instead of dying deep in the tower loader with a cryptic
+    /// config error.
+    pub fn isVisionProjector(self: *const Gguf) bool {
+        const arch = self.getStr("general.architecture") orelse return false;
+        return std.mem.eql(u8, arch, "clip");
+    }
+
     /// The model's trained context length (`<arch>.context_length`), when the
     /// container records both the architecture and the key. `null` lets the
     /// caller pick a family default.
@@ -742,4 +752,25 @@ test "real qwen3-4b gguf headers" {
     const norm = try g.require("layers.0.input_layernorm.weight");
     try std.testing.expectEqual(DType.f32, norm.info.dtype);
     try std.testing.expectEqualSlices(usize, &.{2560}, norm.info.shape.slice());
+}
+
+// `isVisionProjector` must distinguish a CLIP mmproj (arch "clip") from an LLM
+// GGUF, so a vision-tower slot pointed at an LLM is rejected with a clear error
+// instead of a cryptic config failure. Header-only (no weights); self-skips
+// when the checkpoints are absent.
+test "isVisionProjector: mmproj yes, LLM no" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const mmproj = "/home/qt/genai/lmstudio/models/mmproj-gemma-4-12b-it-qat-q4_0.gguf";
+    const llm = "/home/qt/genai/lmstudio/models/gemma-4-12b-it-qat-q4_0.gguf";
+    std.Io.Dir.cwd().access(io, mmproj, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(io, llm, .{}) catch return error.SkipZigTest;
+
+    var mg = try Gguf.open(gpa, io, mmproj);
+    defer mg.deinit();
+    try std.testing.expect(mg.isVisionProjector());
+
+    var lg = try Gguf.open(gpa, io, llm);
+    defer lg.deinit();
+    try std.testing.expect(!lg.isVisionProjector()); // an LLM in the mmproj slot
 }

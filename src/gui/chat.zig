@@ -13,6 +13,7 @@
 //!    SDL wakeup so the event-driven render loop repaints promptly.
 const std = @import("std");
 const tp = @import("TensorPencil");
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 const config = @import("config.zig");
 const toolcall = @import("toolcall.zig");
 const diffuser = @import("diffuser.zig");
@@ -73,6 +74,7 @@ const sample = tp.llm.sample;
 const session = tp.llm.session;
 const kv_cache = tp.llm.kv_cache;
 const chat = tp.llm.chat;
+const chat_template = tp.llm.chat_template;
 const vram = tp.vram;
 const residency = tp.models.residency;
 const pipeline = tp.pipeline;
@@ -150,6 +152,11 @@ pub const Message = struct {
     /// Images the user attached to this (user) message — displayed inline and
     /// the re-encode source when the following response is regenerated.
     attachments: std.ArrayList(*GenImage) = .empty,
+    /// ViT token grids of this (user) message's images, parallel to
+    /// `attachments`, recorded when the turn is first built (render-driven
+    /// vision). Lets later turns reproduce the same image pad-row block so the
+    /// KV reconcile preserves past images instead of re-encoding them.
+    image_grids: std.ArrayList(chat_template.Grid) = .empty,
 
     pub fn init(gpa: std.mem.Allocator, role: Role) !Message {
         var m: Message = .{ .role = role };
@@ -170,6 +177,7 @@ pub const Message = struct {
         // `attachments` (user images) are owned here.
         for (self.attachments.items) |gi| freeGenImage(gpa, gi);
         self.attachments.deinit(gpa);
+        self.image_grids.deinit(gpa);
     }
 };
 
@@ -354,6 +362,16 @@ pub const Session = struct {
     /// image-tool description when diffusion is enabled). `reset` restores `ids`
     /// to this so a "new chat" reuses the exact same prompt as a fresh session.
     initial_ids: std.ArrayList(u32) = .empty,
+    /// Render-driven templating: the model's own embedded
+    /// `chat_template`. When present AND the session is text-only (no vision
+    /// tower), each turn's prompt is RENDERED from the transcript so prior-turn
+    /// thoughts are stripped (`strip_thinking`) instead of accumulating. Null =>
+    /// the model shipped no template, or a vision session — the hand glue runs.
+    template: ?chat_template.ChatTemplate = null,
+    /// The full system prompt (base + image-tool description), the BOS string the
+    /// template emits, and whether reasoning is on — the render inputs.
+    system_text: []const u8 = "",
+    bos_str: []const u8 = "",
     opts: engine.Options,
     /// Sampling params staged by `updateSettings` (UI thread) and copied into
     /// `opts.sampling` by `submit` — also UI-thread, and never while a worker
@@ -508,7 +526,19 @@ pub const Session = struct {
 
         self.mmproj_gguf = null;
         self.vision_budget_tokens = cfg.vision_budget_tokens;
-        if (cfg.mmproj_path) |mp| self.mmproj_gguf = try Gguf.open(arena, io, mp);
+        if (cfg.mmproj_path) |mp| {
+            var mg = try Gguf.open(arena, io, mp);
+            errdefer mg.deinit();
+            // The vision-tower slot must point at a CLIP/vision projector
+            // (mmproj-*.gguf), NOT an LLM. A wrong pick (e.g. a second model
+            // file) otherwise dies deep in the tower loader with a cryptic
+            // `UnknownModelConfig`; catch it here.
+            if (!mg.isVisionProjector()) {
+                std.log.err("vision tower (mmproj) '{s}' is not a CLIP vision projector — its architecture is '{s}'. Select an mmproj-*.gguf vision tower, not an LLM model (or clear the vision tower for a text-only model).", .{ mp, mg.getStr("general.architecture") orelse "?" });
+                return error.MmprojNotVisionTower;
+            }
+            self.mmproj_gguf = mg;
+        }
 
         // f16 KV is supported per-arch (gemma4 first); the concrete model init
         // (below) returns error.KvDtypeUnsupported for archs not yet wired, so
@@ -679,12 +709,19 @@ pub const Session = struct {
         // description appended when the image tool is available. Prefilled on
         // the first turn (the uncached prefix of `ids`); never shown in the UI.
         if (self.images_enabled) {
-            const full = try std.fmt.allocPrint(self.gpa, "{s}\n\n{s}", .{ cfg.system_prompt, image_tool_prompt });
-            defer self.gpa.free(full);
-            try chat.appendSystem(&self.tok, self.gpa, full, &self.ids);
+            self.system_text = try std.fmt.allocPrint(gpa, "{s}\n\n{s}", .{ cfg.system_prompt, image_tool_prompt });
         } else {
-            try chat.appendSystem(&self.tok, self.gpa, cfg.system_prompt, &self.ids);
+            self.system_text = try gpa.dupe(u8, cfg.system_prompt);
         }
+        try chat.appendSystem(&self.tok, self.gpa, self.system_text, &self.ids);
+
+        // Render-driven templating: load the model's own chat_template. Drives
+        // text AND vision turns (the render's image placeholders expand to the
+        // real pad-row block, embeddings spliced in during prefill — see
+        // `buildRenderedTurn`). A model without an embedded template keeps the
+        // hand glue.
+        self.template = chat_template.ChatTemplate.fromGguf(arena, &self.gguf) catch null;
+        self.bos_str = if (self.tok.bos) |b| (self.tok.decodeAlloc(gpa, &.{b}) catch "") else "";
 
         // Snapshot the prompt prefix so `reset` can restore it verbatim.
         self.initial_ids = .empty;
@@ -1030,6 +1067,9 @@ pub const Session = struct {
                 if (a.vit) |*v| v.deinit();
             },
         }
+        if (self.template) |*t| t.deinit();
+        if (self.system_text.len > 0) self.gpa.free(self.system_text);
+        if (self.bos_str.len > 0) self.gpa.free(self.bos_str);
         if (self.mmproj_gguf) |*g| g.deinit();
         for (self.messages.items) |*m| m.deinit(self.gpa);
         self.messages.deinit(self.gpa);
@@ -1238,6 +1278,18 @@ pub const Session = struct {
         try target.variants.append(self.gpa, .{});
         target.cur = target.variants.items.len - 1;
 
+        if (self.template != null) {
+            // Render-driven: the empty new variant drops from the render, so the
+            // next build re-renders the same prompt and reconcile rewinds to the
+            // turn boundary — the fast rollback and the replay fallback collapse
+            // into one path. Just stage the turn.
+            self.turn_staged = true;
+            self.mu.lockUncancelable(self.io);
+            self.pending.clearRetainingCapacity();
+            self.mu.unlock(self.io);
+            try self.spawnWorker();
+            return;
+        }
         if (self.turnCheckpoint()) |cp| {
             // ids[0..ids_len) are byte-identical to what the boundary saw
             // (append-only within a turn; a variant switch re-derives the
@@ -1303,6 +1355,12 @@ pub const Session = struct {
         const m = &self.messages.items[self.messages.items.len - 1];
         if (m.role != .assistant or idx >= m.variants.items.len or idx == m.cur) return;
         m.cur = idx;
+        // Render-driven: nothing to splice — the next turn re-renders the
+        // transcript with this variant active and reconcile rewinds to match.
+        if (self.template != null) {
+            self.wake();
+            return;
+        }
         fast: {
             const cp = self.turnCheckpoint() orelse break :fast;
             self.ids.shrinkRetainingCapacity(cp.ids_len);
@@ -1503,18 +1561,238 @@ pub const Session = struct {
         }
     }
 
+    /// Longest common prefix length of two id sequences.
+    fn lcpLen(a: []const u32, b: []const u32) usize {
+        const n = @min(a.len, b.len);
+        var i: usize = 0;
+        while (i < n and a[i] == b[i]) i += 1;
+        return i;
+    }
+
+    /// Render-driven turn (TODO #1): render the whole transcript through the
+    /// model's chat_template (stripping prior-turn thoughts), then reconcile the
+    /// committed KV with the render — rewind to the longest common prefix (which
+    /// for a stripped thought is the previous turn's boundary) and leave `ids` =
+    /// the rendered prompt for prepareTurn to prefill from `cached()`. Drops the
+    /// trailing in-flight assistant slot (add_generation_prompt opens it).
+    /// The active family's image-placeholder expansion (vocab-derived), or null
+    /// for a text-only arch. Mirrors the CLI's `imageExpandFor`.
+    fn imageExpand(self: *Session) ?chat_template.ImageExpand {
+        return switch (self.arch) {
+            .qwen3 => null,
+            .qwen35 => chat_template.ImageExpand.chatml(&self.tok),
+            .gemma3 => chat_template.ImageExpand.gemma3(&self.tok),
+            .gemma4 => chat_template.ImageExpand.gemma4(&self.tok),
+        };
+    }
+
+    /// One encoded image, arch-independent (embeds gpa-owned, freed by caller).
+    const EncImg = struct { embeds: []f32, grid_w: usize, grid_h: usize };
+
+    /// Encode this turn's raw images on the active vision tower (device-side),
+    /// appending {embeds,grid} to `out`. embeds are duped so a per-arch Encoded
+    /// can be released immediately.
+    fn encodeCurrentImages(self: *Session, out: *std.ArrayList(EncImg)) !void {
+        switch (self.arch) {
+            .qwen3 => {},
+            .qwen35 => |*a| for (self.turn_images.items) |im| {
+                var e = try vit35_cuda.encode(&a.vit.?, self.be, self.gpa, im.rgb, im.width, im.height);
+                defer e.deinit(self.gpa);
+                try out.append(self.gpa, .{ .embeds = try self.gpa.dupe(f32, e.embeds), .grid_w = e.grid_w, .grid_h = e.grid_h });
+            },
+            .gemma3 => |*a| for (self.turn_images.items) |im| {
+                var e = try gemma_vit_cuda.encode(&a.vit.?, self.be, self.io, self.gpa, im.rgb, im.width, im.height);
+                defer e.deinit(self.gpa);
+                try out.append(self.gpa, .{ .embeds = try self.gpa.dupe(f32, e.embeds), .grid_w = e.grid_w, .grid_h = e.grid_h });
+            },
+            .gemma4 => |*a| for (self.turn_images.items) |im| switch (a.vit.?) {
+                // gemma4 encoders return an owned embeds slice (no Encoded wrapper).
+                .uv => |*uv| {
+                    const r = try gemma4_vit_cuda.encode(uv, self.be, self.io, self.gpa, im.rgb, im.width, im.height);
+                    try out.append(self.gpa, .{ .embeds = r.embeds, .grid_w = r.grid_w, .grid_h = r.grid_h });
+                },
+                .v => |*v| {
+                    const r = try gemma4v_vit_cuda.encode(v, self.be, self.io, self.gpa, im.rgb, im.width, im.height);
+                    try out.append(self.gpa, .{ .embeds = r.embeds, .grid_w = r.grid_w, .grid_h = r.grid_h });
+                },
+            },
+        }
+    }
+
+    fn buildRenderedTurn(self: *Session) !void {
+        // Encode this turn's attached images (fresh submit only; a regenerate
+        // re-stages none — its image sits before the rollback boundary and is
+        // preserved in the KV). Image turns must run on the GPU (M-RoPE), so
+        // promote any CPU-offloaded layers back first.
+        var cur_embeds: std.ArrayList(EncImg) = .empty;
+        defer {
+            for (cur_embeds.items) |e| self.gpa.free(e.embeds);
+            cur_embeds.deinit(self.gpa);
+        }
+        const n = self.messages.items.len;
+        const completed = if (n > 0 and self.messages.items[n - 1].role == .assistant) n - 1 else n;
+        if (self.turn_images.items.len > 0 and self.hasVit()) {
+            switch (self.arch) {
+                inline else => |*a| _ = a.model.promoteLayers(std.math.maxInt(u64)) catch |err|
+                    std.log.warn("promote for image turn failed: {t}", .{err}),
+            }
+            try self.encodeCurrentImages(&cur_embeds);
+            // Record the grids on the current user message so later turns
+            // reproduce the same pad-row block (KV reconcile preserves it).
+            if (completed > 0) {
+                const cu = &self.messages.items[completed - 1];
+                if (cu.role == .user) {
+                    cu.image_grids.clearRetainingCapacity();
+                    for (cur_embeds.items) |e| try cu.image_grids.append(self.gpa, .{ .grid_w = e.grid_w, .grid_h = e.grid_h });
+                }
+            }
+        }
+
+        // Build the message list (a scratch arena owns the multimodal parts).
+        var scratch = std.heap.ArenaAllocator.init(self.gpa);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        var msgs: std.ArrayList(chat_template.Message) = .empty;
+        try msgs.append(sa, .{ .role = .system, .content = self.system_text });
+        var grids: std.ArrayList(chat_template.Grid) = .empty;
+        for (self.messages.items[0..completed]) |*m| {
+            if (m.role == .user and m.image_grids.items.len > 0) {
+                // Multimodal user turn: images first, then the text (matches the
+                // old glue's segment order).
+                var parts: std.ArrayList(chat_template.Part) = .empty;
+                for (m.image_grids.items) |gr| {
+                    try parts.append(sa, .{ .image = gr });
+                    try grids.append(sa, gr);
+                }
+                if (m.activeConst().text.items.len > 0)
+                    try parts.append(sa, .{ .text = m.activeConst().text.items });
+                try msgs.append(sa, .{ .role = .user, .parts = parts.items });
+            } else try msgs.append(sa, .{
+                .role = if (m.role == .user) .user else .assistant,
+                .content = m.activeConst().text.items,
+            });
+        }
+
+        var desired: std.ArrayList(u32) = .empty;
+        defer desired.deinit(self.gpa);
+        var image_rows: std.ArrayList(usize) = .empty;
+        defer image_rows.deinit(self.gpa);
+        const ropts: chat_template.RenderOpts = .{
+            .messages = msgs.items,
+            .bos_token = self.bos_str,
+            .enable_thinking = chat.enable_thinking,
+            .add_generation_prompt = true,
+        };
+        const exp = self.imageExpand();
+        if (exp != null and grids.items.len > 0)
+            try self.template.?.renderIdsMM(&self.tok, self.gpa, ropts, exp.?, grids.items, &desired, &image_rows)
+        else
+            try self.template.?.renderIds(&self.tok, self.gpa, ropts, &desired);
+
+        if (getenv("TP_DUMP_CTX") != null) {
+            const dbg = self.tok.decodeAlloc(self.gpa, desired.items) catch "";
+            defer if (dbg.len > 0) self.gpa.free(dbg);
+            std.log.info("[tmpl] rendered prompt ({d} tok):\n{s}\n[tmpl] end", .{ desired.items.len, dbg });
+        }
+        switch (self.arch) {
+            inline else => |*a| try self.reconcile(&a.model, desired.items),
+        }
+        self.ids.clearRetainingCapacity();
+        try self.ids.appendSlice(self.gpa, desired.items);
+
+        // With images this turn, do the injected prefill here (splice ViT embeds
+        // at the current turn's rows) so prepareTurn's plain prefill no-ops;
+        // text turns leave prefill to prepareTurn.
+        if (cur_embeds.items.len > 0) {
+            switch (self.arch) {
+                inline else => |*a| {
+                    // Only vision archs reach here (cur_embeds is empty for the
+                    // text-only qwen3, whose stepper has no prefillImage).
+                    if (comptime @hasDecl(@TypeOf(a.model), "prefillImage")) {
+                        const total = self.ids.items.len;
+                        if (total > a.model.cached() + a.model.remaining())
+                            try a.model.ensureCapacity(total);
+                        const to = total - 1;
+                        const cached = a.model.cached();
+                        if (to > cached) {
+                            const cur_rows = image_rows.items[image_rows.items.len - cur_embeds.items.len ..];
+                            try prefillTailGui(&a.model, self.ids.items, cached, to, cur_rows, cur_embeds.items);
+                        }
+                    } else unreachable;
+                },
+            }
+        }
+    }
+
+    /// Prefill `ids[from..to)`, splicing each current-turn image's embeds in at
+    /// its row via `prefillImage` (mirrors the CLI's `prefillTail`). Rows not in
+    /// `cur_rows` prefill as their plain pad tokens.
+    fn prefillTailGui(model: anytype, ids: []const u32, from: usize, to: usize, cur_rows: []const usize, cur_embeds: []const EncImg) !void {
+        var cur = from;
+        for (cur_rows, cur_embeds) |row, e| {
+            if (row < from or row >= to) continue;
+            if (row > cur) try model.prefill(ids[cur..row]);
+            try model.prefillImage(e.embeds, e.grid_w, e.grid_h);
+            cur = row + e.grid_w * e.grid_h;
+        }
+        if (to > cur) try model.prefill(ids[cur..to]);
+    }
+
+    /// Rewind the model's committed KV so it holds only the longest prefix it
+    /// shares with `desired`, so prepareTurn re-prefills exactly the tail that
+    /// changed (a stripped thought → just the prior answer + this turn). Uses
+    /// `truncate` (append-only attention) for an exact rewind, else the nearest
+    /// turn-boundary checkpoint ≤ d (SWA/recurrent), else a full reset.
+    fn reconcile(self: *Session, model: anytype, desired: []const u32) !void {
+        const M = @TypeOf(model.*);
+        const cached = model.cached();
+        // Compare against the COMMITTED prefix only (ids may hold uncommitted
+        // trailing tokens from a prior closeAssistant). Clamp to desired.len-1 so
+        // ≥1 prompt token stays uncommitted for generate to forward (the caller
+        // prefills all-but-last) — matters when `desired` is a prefix of what's
+        // committed (regenerate: same prompt, drop the old reply).
+        const lcp = lcpLen(self.ids.items[0..@min(cached, self.ids.items.len)], desired);
+        const d = @min(lcp, desired.len -| 1);
+        if (d == cached) return; // pure prefix-extension: nothing to rewind
+        if (comptime @hasDecl(M, "truncate")) {
+            model.truncate(d);
+            dropCheckpointsAfter(self.gpa, &self.checkpoints, d);
+            return;
+        }
+        var best_q: ?usize = null;
+        var best_snap: []const u8 = &.{};
+        for (self.checkpoints.items) |*cp| {
+            if (cp.q <= d and (best_q == null or cp.q > best_q.?)) {
+                best_q = cp.q;
+                best_snap = cp.snap;
+            }
+        }
+        if (best_q) |q| {
+            if (comptime @hasDecl(M, "restoreCheckpoint")) {
+                try model.restoreCheckpoint(best_snap, q);
+                dropCheckpointsAfter(self.gpa, &self.checkpoints, q);
+                return;
+            }
+        }
+        // No usable checkpoint: clear the context; prepareTurn reprefills whole.
+        try model.resetResidency(self.vram_budget);
+        self.invalidateCheckpoints();
+    }
+
     /// Build this turn's tokens. Text-only turns just append (prepareTurn
     /// prefills); image turns encode each image (the arch's vision tower on
     /// CUDA), build the interleaved vision token layout, and inject the
     /// embeddings at their pad rows — mirroring `llm_main.imageTurn`.
     fn buildTurn(self: *Session) !void {
-        if (self.turn_images.items.len > 0 and self.hasVit()) {
-            // Image tokens must run on the GPU: the offloaded-layer host path uses
-            // scalar RoPE, wrong for image-grid M-RoPE positions (qwen35). Promote
-            // every migrated layer back to the device first (KV-preserving); a huge
-            // budget means "bring back everything that physically fits". Runs on
-            // the worker's bound LLM context. As context grows afterward,
-            // ensureCapacity re-offloads.
+        if (self.template != null) {
+            // Render-driven path — handles text AND image turns (encodes this
+            // turn's images, expands the template's image placeholders to the
+            // real pad-row block, and splices embeds in during prefill).
+            try self.buildRenderedTurn();
+        } else if (self.turn_images.items.len > 0 and self.hasVit()) {
+            // Legacy hand-glue image path (no embedded template). Image tokens
+            // must run on the GPU (host path uses scalar RoPE, wrong for M-RoPE);
+            // promote CPU-offloaded layers back first.
             switch (self.arch) {
                 inline else => |*a| _ = a.model.promoteLayers(std.math.maxInt(u64)) catch |err|
                     std.log.warn("promote for image turn failed: {t}", .{err}),

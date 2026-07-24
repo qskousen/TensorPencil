@@ -380,6 +380,7 @@ fn runQwen3(
     };
     defer tok.deinit();
     llm.chat.applyTokenizer(&tok);
+    if (st.* == .gguf) setupChatTemplate(arena, &st.gguf, &tok, system);
 
     // Draft model for speculative decoding (same tokenizer family; its own KV
     // cache and stepper). Implies spec decoding. The mapped checkpoint must
@@ -528,6 +529,14 @@ fn runQwen3(
 const ImageChat = union(enum) {
     qwen35: struct { vit: *const TensorPencil.models.vit35.Vit, be: *TensorPencil.gpu.cuda.Backend },
     gemma3: struct { vit: *const TensorPencil.models.gemma_vit.Vit, be: *TensorPencil.gpu.cuda.Backend, io: Io },
+    // gemma4's two projector types: the shallow "uv" embedder or the full
+    // "gemma4v" SigLIP tower (exactly one is set). Both yield {embeds,grid}.
+    gemma4: struct {
+        uv: ?*const TensorPencil.models.gemma4_vit.Vit,
+        v: ?*const TensorPencil.models.gemma4v_vit.Vit,
+        be: *TensorPencil.gpu.cuda.Backend,
+        io: Io,
+    },
 };
 
 /// Build and prefill an interactive turn containing @image mentions:
@@ -587,6 +596,17 @@ fn imageTurn(
                         const e = try TensorPencil.models.gemma_vit_cuda.encode(g.vit, g.be, g.io, gpa, dec.pixels, dec.width, dec.height);
                         break :blk .{ .embeds = e.embeds, .grid_w = e.grid_w, .grid_h = e.grid_h };
                     },
+                    // gemma4 vision runs through the render-driven path
+                    // (encodeMention); this legacy glue loop only handles the
+                    // non-template archs, so the arm is here for exhaustiveness.
+                    .gemma4 => |g4| blk: {
+                        if (g4.uv) |uv| {
+                            const e = try TensorPencil.models.gemma4_vit_cuda.encode(uv, g4.be, g4.io, gpa, dec.pixels, dec.width, dec.height);
+                            break :blk .{ .embeds = e.embeds, .grid_w = e.grid_w, .grid_h = e.grid_h };
+                        }
+                        const e = try TensorPencil.models.gemma4v_vit_cuda.encode(g4.v.?, g4.be, g4.io, gpa, dec.pixels, dec.width, dec.height);
+                        break :blk .{ .embeds = e.embeds, .grid_w = e.grid_w, .grid_h = e.grid_h };
+                    },
                 };
                 try imgs.append(gpa, im);
                 try segs.append(gpa, .{ .image = .{ .grid_w = im.grid_w, .grid_h = im.grid_h } });
@@ -643,6 +663,339 @@ fn readEditorMessage(ed: *llm.repl.Editor, fd: std.posix.fd_t, stdin: *Io.Reader
     }
 }
 
+// --- render-driven multi-turn (jinja chat_template) -------------------------
+// The model's own embedded template is the single source of truth for the
+// prompt (strips prior-turn thoughts, handles the system/`<|think|>` cue, BOS,
+// etc.). We keep a transcript of {role, raw content} and, each turn, render the
+// FULL transcript to a token sequence, reconcile it with the committed KV
+// (rewind to the longest common prefix — which for a stripped thought lands
+// exactly on the previous turn's boundary), and generate. Text-only CUDA path
+// only (gated in runSession); image/spec/no-template sessions keep the glue.
+
+const Boundary = struct { q: usize, snap: []u8 };
+
+/// Load the model's embedded chat_template (if any) into the process globals so
+/// `renderDrivenChat` uses it; `arena` must outlive the session (weights/tok
+/// arena). No-op-safe: a model without a template leaves `active` null and the
+/// hand glue runs. `bos` is the decoded BOS string the template emits.
+fn setupChatTemplate(arena: std.mem.Allocator, g: *const TensorPencil.Gguf, tok: *const TensorPencil.tokenizer.Tokenizer, system: ?[]const u8) void {
+    llm.chat_template.active = llm.chat_template.ChatTemplate.fromGguf(arena, g) catch null;
+    llm.chat_template.system_prompt = system;
+    llm.chat_template.bos = if (tok.bos) |b| (tok.decodeAlloc(arena, &.{b}) catch "") else "";
+}
+
+fn childType(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .pointer => |p| p.child,
+        else => T,
+    };
+}
+
+/// Longest common prefix length of two id sequences.
+fn lcpLen(a: []const u32, b: []const u32) usize {
+    const n = @min(a.len, b.len);
+    var i: usize = 0;
+    while (i < n and a[i] == b[i]) i += 1;
+    return i;
+}
+
+/// Rewind the committed KV to `d` tokens, returning the length actually left
+/// committed (≤ d). `truncate` (append-only attention) rewinds to any d;
+/// otherwise a boundary checkpoint covering d is restored (SWA/recurrent);
+/// failing both, the context is reset to 0 and the caller reprefills whole.
+fn rewindTo(model: anytype, gpa: std.mem.Allocator, d: usize, boundary: *?Boundary) !usize {
+    const M = childType(@TypeOf(model));
+    if (model.cached() == d) return d;
+    if (comptime @hasDecl(M, "truncate")) {
+        model.truncate(d);
+        return d;
+    }
+    if (boundary.*) |b| {
+        if (b.q <= d and comptime @hasDecl(M, "restoreCheckpoint")) {
+            try model.restoreCheckpoint(b.snap, b.q);
+            return b.q;
+        }
+    }
+    try model.resetCache();
+    if (boundary.*) |b| {
+        gpa.free(b.snap);
+        boundary.* = null;
+    }
+    return 0;
+}
+
+/// Snapshot the current committed position as the turn boundary (so the NEXT
+/// turn can rewind here in O(answer) on SWA/recurrent archs). No-op / free for
+/// append-only archs (checkpointBytes == 0), which rewind via `truncate`.
+fn updateBoundary(model: anytype, gpa: std.mem.Allocator, boundary: *?Boundary) void {
+    const M = childType(@TypeOf(model));
+    if (comptime !@hasDecl(M, "checkpoint")) return;
+    if (boundary.*) |b| gpa.free(b.snap);
+    boundary.* = null;
+    const snap = gpa.alloc(u8, model.checkpointBytes()) catch return;
+    model.checkpoint(snap) catch {
+        gpa.free(snap);
+        return;
+    };
+    boundary.* = .{ .q = model.cached(), .snap = snap };
+}
+
+/// Interactive multi-turn chat driven by the embedded chat_template. Returns
+/// total tokens generated. Assumes `chat_template.active != null`.
+/// Guard `--mmproj`: the vision-tower slot must be a CLIP projector
+/// (mmproj-*.gguf), not an LLM. A wrong pick otherwise dies deep in the tower
+/// loader with a cryptic `UnknownModelConfig`; surface it clearly here.
+fn requireVisionTower(mmg: *const TensorPencil.Gguf, path: []const u8, stdout: *Io.Writer) !void {
+    if (mmg.isVisionProjector()) return;
+    try stdout.print("[--mmproj '{s}' is not a CLIP vision tower — its architecture is '{s}'. Pass an mmproj-*.gguf vision tower, not an LLM model.]\n", .{ path, mmg.getStr("general.architecture") orelse "?" });
+    try stdout.flush();
+    return error.MmprojNotVisionTower;
+}
+
+/// Arch-independent encoded image (embeds gpa-owned), matching `imageTurn`.
+const RenderImg = struct { embeds: []f32, grid_w: usize, grid_h: usize };
+
+/// Encode one @-mentioned image on the session's vision tower. Returns null
+/// (with a message) if the file can't be decoded.
+fn encodeMention(ic: ImageChat, gpa: std.mem.Allocator, path: []const u8, stdout: *Io.Writer) !?RenderImg {
+    const dec = vips.loadRgb(gpa, path) catch |err| {
+        try stdout.print("[can't load {s}: {t}]\n", .{ path, err });
+        return null;
+    };
+    defer gpa.free(dec.pixels);
+    const im: RenderImg = switch (ic) {
+        .qwen35 => |q| blk: {
+            const e = try TensorPencil.models.vit35_cuda.encode(q.vit, q.be, gpa, dec.pixels, dec.width, dec.height);
+            break :blk .{ .embeds = e.embeds, .grid_w = e.grid_w, .grid_h = e.grid_h };
+        },
+        .gemma3 => |g| blk: {
+            const e = try TensorPencil.models.gemma_vit_cuda.encode(g.vit, g.be, g.io, gpa, dec.pixels, dec.width, dec.height);
+            break :blk .{ .embeds = e.embeds, .grid_w = e.grid_w, .grid_h = e.grid_h };
+        },
+        .gemma4 => |g4| blk: {
+            if (g4.uv) |uv| {
+                const e = try TensorPencil.models.gemma4_vit_cuda.encode(uv, g4.be, g4.io, gpa, dec.pixels, dec.width, dec.height);
+                break :blk .{ .embeds = e.embeds, .grid_w = e.grid_w, .grid_h = e.grid_h };
+            }
+            const e = try TensorPencil.models.gemma4v_vit_cuda.encode(g4.v.?, g4.be, g4.io, gpa, dec.pixels, dec.width, dec.height);
+            break :blk .{ .embeds = e.embeds, .grid_w = e.grid_w, .grid_h = e.grid_h };
+        },
+    };
+    try stdout.print("[{s}: {d}x{d} -> {d} rows]\n", .{ path, dec.width, dec.height, im.grid_w * im.grid_h });
+    try stdout.flush();
+    return im;
+}
+
+/// The family's image-placeholder expansion, or null if the vocab lacks the
+/// markers (text-only). Keyed off the active chat family.
+fn imageExpandFor(tok: *const TensorPencil.tokenizer.Tokenizer) ?llm.chat_template.ImageExpand {
+    return switch (llm.chat.family) {
+        .chatml => llm.chat_template.ImageExpand.chatml(tok),
+        .gemma => llm.chat_template.ImageExpand.gemma3(tok),
+        .gemma4 => llm.chat_template.ImageExpand.gemma4(tok),
+    };
+}
+
+/// Prefill `ids[from..to)`, splicing each current-turn image's ViT embeddings
+/// in at its recorded row (via `prefillImage`) instead of the pad tokens. Rows
+/// not in `cur_rows` (past-turn images, only reachable after a full context
+/// reset) prefill as their plain pad tokens — degraded but safe.
+fn prefillTail(model: anytype, gpa: std.mem.Allocator, ids: []const u32, from: usize, to: usize, cur_rows: []const usize, cur_imgs: []const RenderImg) !void {
+    _ = gpa;
+    var cur = from;
+    for (cur_rows, cur_imgs) |row, im| {
+        if (row < from or row >= to) continue;
+        if (row > cur) try model.prefill(ids[cur..row]);
+        try model.prefillImage(im.embeds, im.grid_w, im.grid_h);
+        cur = row + im.grid_w * im.grid_h;
+    }
+    if (to > cur) try model.prefill(ids[cur..to]);
+}
+
+fn renderDrivenChat(
+    model: anytype,
+    tok: *const TensorPencil.tokenizer.Tokenizer,
+    io: Io,
+    gpa: std.mem.Allocator,
+    opts: llm.engine.Options,
+    stdout: *Io.Writer,
+    img_chat: ?ImageChat,
+) !usize {
+    const M = childType(@TypeOf(model));
+    const ct = &llm.chat_template.active.?;
+    const bos = llm.chat_template.bos;
+    const img_ok = comptime @hasDecl(M, "prefillImage");
+    const exp: ?llm.chat_template.ImageExpand = if (img_ok and img_chat != null) imageExpandFor(tok) else null;
+
+    var transcript: std.ArrayList(llm.chat_template.Message) = .empty;
+    defer {
+        for (transcript.items) |m| {
+            if (m.parts) |ps| {
+                for (ps) |p| if (p == .text) gpa.free(p.text);
+                gpa.free(ps);
+            } else if (m.content.len > 0) gpa.free(m.content);
+        }
+        transcript.deinit(gpa);
+    }
+    if (llm.chat_template.system_prompt) |s|
+        try transcript.append(gpa, .{ .role = .system, .content = try gpa.dupe(u8, s) });
+
+    var committed: std.ArrayList(u32) = .empty;
+    defer committed.deinit(gpa);
+    var desired: std.ArrayList(u32) = .empty;
+    defer desired.deinit(gpa);
+    var boundary: ?Boundary = null;
+    defer if (boundary) |b| gpa.free(b.snap);
+
+    const stdin_file: Io.File = .stdin();
+    var stdin_buffer: [64 * 1024]u8 = undefined;
+    var stdin_reader: Io.File.Reader = .initStreaming(stdin_file, io, &stdin_buffer);
+    const stdin = &stdin_reader.interface;
+    const tty = stdin_file.isTty(io) catch false;
+    var ed: llm.repl.Editor = .{};
+    defer ed.deinit(gpa);
+
+    var seeds = llm.sample.SeedSeq.init(opts.seed);
+    var turn_opts = opts;
+    var total: usize = 0;
+    while (true) {
+        try stdout.writeAll("\n> ");
+        try stdout.flush();
+        const msg = if (tty)
+            (try readEditorMessage(&ed, stdin_file.handle, stdin, gpa, stdout)) orelse break
+        else
+            (try stdin.takeDelimiter('\n')) orelse break;
+        const line = std.mem.trim(u8, msg, " \t\r\n");
+        if (line.len == 0) continue;
+        if (std.mem.eql(u8, line, "/exit")) break;
+
+        // @image mentions: encode this turn's images now (on the session ViT)
+        // and stage a multimodal user message; the ViT embeds are spliced in at
+        // the image rows during prefill below. Only enabled when the arch has a
+        // vision path + template image markers.
+        var cur_imgs: std.ArrayList(RenderImg) = .empty;
+        defer {
+            for (cur_imgs.items) |im| gpa.free(im.embeds);
+            cur_imgs.deinit(gpa);
+        }
+        var used_parts = false;
+        if (exp != null and std.mem.indexOfScalar(u8, line, '@') != null) {
+            var parts: std.ArrayList(llm.chat.Part) = .empty;
+            defer parts.deinit(gpa);
+            try llm.chat.parseImageMentions(gpa, line, &parts);
+            var has_image = false;
+            for (parts.items) |p| {
+                if (p == .image) has_image = true;
+            }
+            if (has_image) {
+                var mparts: std.ArrayList(llm.chat_template.Part) = .empty;
+                errdefer {
+                    for (mparts.items) |p| if (p == .text) gpa.free(p.text);
+                    mparts.deinit(gpa);
+                }
+                var ok = true;
+                for (parts.items) |p| switch (p) {
+                    .text => |t| try mparts.append(gpa, .{ .text = try gpa.dupe(u8, t) }),
+                    .image => |path| {
+                        const im = (try encodeMention(img_chat.?, gpa, path, stdout)) orelse {
+                            ok = false;
+                            break;
+                        };
+                        try cur_imgs.append(gpa, im);
+                        try mparts.append(gpa, .{ .image = .{ .grid_w = im.grid_w, .grid_h = im.grid_h } });
+                    },
+                };
+                if (!ok) {
+                    for (mparts.items) |p| if (p == .text) gpa.free(p.text);
+                    mparts.deinit(gpa);
+                    for (cur_imgs.items) |im| gpa.free(im.embeds);
+                    cur_imgs.clearRetainingCapacity();
+                    continue;
+                }
+                try transcript.append(gpa, .{ .role = .user, .parts = try mparts.toOwnedSlice(gpa) });
+                used_parts = true;
+            }
+        }
+        if (!used_parts)
+            try transcript.append(gpa, .{ .role = .user, .content = try gpa.dupe(u8, line) });
+
+        // Collect every image's grid (transcript order) for the placeholder
+        // expansion, and render + reconcile.
+        var grids: std.ArrayList(llm.chat_template.Grid) = .empty;
+        defer grids.deinit(gpa);
+        for (transcript.items) |m| if (m.parts) |ps| for (ps) |p| {
+            if (p == .image) try grids.append(gpa, .{ .grid_w = p.image.grid_w, .grid_h = p.image.grid_h });
+        };
+
+        desired.clearRetainingCapacity();
+        var image_rows: std.ArrayList(usize) = .empty;
+        defer image_rows.deinit(gpa);
+        const ropts: llm.chat_template.RenderOpts = .{
+            .messages = transcript.items,
+            .bos_token = bos,
+            .enable_thinking = llm.chat.enable_thinking,
+            .add_generation_prompt = true,
+        };
+        if (exp) |e|
+            try ct.renderIdsMM(tok, gpa, ropts, e, grids.items, &desired, &image_rows)
+        else
+            try ct.renderIds(tok, gpa, ropts, &desired);
+
+        if (getenv("TP_DUMP_CTX") != null) {
+            const dbg = try tok.decodeAlloc(gpa, desired.items);
+            defer gpa.free(dbg);
+            std.debug.print("\n===== RENDERED PROMPT ({d} tok) =====\n{s}\n===== END =====\n", .{ desired.items.len, dbg });
+        }
+        const d = lcpLen(committed.items, desired.items);
+        const kept = try rewindTo(model, gpa, d, &boundary);
+        if (desired.items.len > model.cached() + model.remaining())
+            try model.ensureCapacity(desired.items.len);
+        // Prefill everything up to the boundary (all but the last prompt token,
+        // which engine.generate forwards), splicing this turn's image embeds at
+        // their rows. `cur_imgs` pair with the LAST `cur_imgs.len` image rows
+        // (this turn's images; earlier rows are past turns, already in the KV).
+        const to = desired.items.len - 1;
+        if (to > kept) {
+            if (img_ok and cur_imgs.items.len > 0) {
+                const cur_rows = image_rows.items[image_rows.items.len - cur_imgs.items.len ..];
+                try prefillTail(model, gpa, desired.items, kept, to, cur_rows, cur_imgs.items);
+            } else {
+                try model.prefill(desired.items[kept..to]);
+            }
+        }
+        updateBoundary(model, gpa, &boundary);
+
+        const t0 = Io.Clock.real.now(io).nanoseconds;
+        turn_opts.seed = seeds.next();
+        const gen_start = desired.items.len;
+        const n = llm.engine.generate(model, tok, io, gpa, &desired, turn_opts, stdout) catch |err| switch (err) {
+            error.ContextFull => {
+                try stdout.writeAll("\n[context window full]\n");
+                try stdout.flush();
+                break;
+            },
+            else => return err,
+        };
+
+        committed.clearRetainingCapacity();
+        try committed.appendSlice(gpa, desired.items);
+        // Store the assistant reply RAW (thought included) — strip_thinking
+        // removes it from context on the next render.
+        const reply = try tok.decodeAlloc(gpa, desired.items[gen_start..]);
+        try transcript.append(gpa, .{ .role = .assistant, .content = reply });
+        total += n;
+
+        const st = llm.session.Stats.of(model);
+        const dt = @as(f64, @floatFromInt(Io.Clock.real.now(io).nanoseconds - t0)) / 1e9;
+        var vbuf: [32]u8 = undefined;
+        try stdout.print("\n[{d} tok, {d:.1} tok/s, ctx {d}/{d}{s}]\n", .{
+            n, if (dt > 0) @as(f64, @floatFromInt(n)) / dt else 0, st.tokens, st.window, st.vramSuffix(&vbuf),
+        });
+        try stdout.flush();
+    }
+    return total;
+}
+
 /// Drive one generation (--prompt) or an interactive chat loop (no
 /// --prompt): each message becomes a user turn, the assistant's reply
 /// streams back, and the turn is sealed so the KV cache carries the whole
@@ -670,6 +1023,20 @@ fn runSession(
     if (prompt != null) {
         turn_opts.seed = seeds.next();
         return doGenerate(model, drafter, tok, io, gpa, ids, turn_opts, stdout);
+    }
+
+    // Render-driven interactive chat when the model shipped a chat_template and
+    // the stepper exposes the KV primitives (no speculative drafter). Handles
+    // both text and @image turns; the hand glue below only runs for
+    // no-template / speculative sessions. Fixes prior-turn thought
+    // accumulation (TODO #1) — text and vision alike.
+    {
+        const M = childType(@TypeOf(model));
+        const drafter_null = @typeInfo(@TypeOf(drafter)) == .null;
+        if (comptime drafter_null and @hasDecl(M, "resetCache") and @hasDecl(M, "prefill") and @hasDecl(M, "ensureCapacity")) {
+            if (llm.chat_template.active != null)
+                return renderDrivenChat(model, tok, io, gpa, opts, stdout, img_chat);
+        }
     }
 
     const stdin_file: Io.File = .stdin();
@@ -957,6 +1324,7 @@ fn runQwen35(
     var tok = try TensorPencil.tokenizer.Tokenizer.initFromGguf(arena, g);
     defer tok.deinit();
     llm.chat.applyTokenizer(&tok);
+    setupChatTemplate(arena, g, &tok, system);
 
     // Hybrid CPU/GPU layer split (--cpu-layers / --offload-grow): CUDA-only,
     // needs a budget as the VRAM ceiling, and text-only (the CPU path uses
@@ -1013,6 +1381,7 @@ fn runQwen35(
     defer if (vit) |*v| v.deinit();
     if (mmproj_path) |mp| {
         mmg = try TensorPencil.Gguf.open(arena, io, mp);
+        try requireVisionTower(&mmg.?, mp, stdout);
         vit = try TensorPencil.models.vit35.Vit.load(arena, &mmg.?);
     }
     const img_chat: ?ImageChat = if (vit != null and be_cuda != null and !debug_cpu_vit)
@@ -1220,6 +1589,12 @@ fn runGemma3(
     defer tok.deinit();
     llm.chat.applyTokenizer(&tok);
     llm.chat.setFamily(.gemma);
+    // Render the model's OWN embedded chat_template (its image branch emits
+    // <start_of_image>, expanded by ImageExpand.gemma3). Mirrors gemma4/qwen35:
+    // interactive CUDA sessions go render-driven (strips prior-turn junk, no
+    // hand-glue drift); the cpu/vulkan steppers (no resetCache) and the one-shot
+    // --prompt/--image path keep the glue.
+    setupChatTemplate(arena, g, &tok, system);
 
     // CUDA backend created up front (so the ViT can encode before the LLM
     // claims VRAM); null on cpu. Every weight pins resident (never streamed).
@@ -1242,6 +1617,7 @@ fn runGemma3(
     defer if (vit_gpu) |*v| v.deinit();
     if (mmproj_path) |mp| {
         mmg = try TensorPencil.Gguf.open(arena, io, mp);
+        try requireVisionTower(&mmg.?, mp, stdout);
         vit = try TensorPencil.models.gemma_vit.Vit.load(arena, &mmg.?);
         if (vk_ctx != null) vit_gpu = try TensorPencil.models.gemma_vit_gpu.VitGpu.load(arena, &vit.?);
     }
@@ -1363,7 +1739,7 @@ fn runGemma4(
             return error.InvalidArgument;
         }
         if (prompt == null) {
-            try stdout.writeAll("--image requires --prompt (one-shot; gemma4 interactive @image is not wired yet)\n");
+            try stdout.writeAll("--image is one-shot (needs --prompt); for interactive gemma4 vision, drop the --image flag and use @path.png mentions in the chat instead\n");
             try stdout.flush();
             return error.InvalidArgument;
         }
@@ -1379,6 +1755,7 @@ fn runGemma4(
     defer tok.deinit();
     llm.chat.applyTokenizer(&tok);
     llm.chat.setFamily(.gemma4);
+    setupChatTemplate(arena, g, &tok, system);
 
     // CUDA backend created up front so the vision embedder can encode
     // device-side (the LLM claims VRAM after). Null on cpu. A 0 budget pins the
@@ -1405,6 +1782,7 @@ fn runGemma4(
     var proj_v = false;
     if (mmproj_path) |mp| {
         mmg = try TensorPencil.Gguf.open(arena, io, mp);
+        try requireVisionTower(&mmg.?, mp, stdout);
         const pt = mmg.?.getStr("clip.vision.projector_type") orelse return error.UnknownModelConfig;
         if (std.mem.eql(u8, pt, "gemma4v")) {
             proj_v = true;
@@ -1513,7 +1891,21 @@ fn runGemma4(
         .n_img = n_img,
         .ids = ids.items,
     };
-    const driver: SimpleDriver = .{ .tok = &tok, .io = io, .gpa = gpa, .ids = &ids, .opts = opts, .stdout = stdout, .prompt = prompt, .img_chat = null };
+    // Interactive @image (prompt == null): the render-driven loop encodes each
+    // mentioned image on the resident vision tower and splices the embeds in at
+    // the placeholder rows (one-shot --image uses the prefiller above instead).
+    const img_chat: ?ImageChat = if (prompt == null and be_cuda != null and (vit_uv != null or vit_v != null))
+        .{ .gemma4 = .{
+            .uv = if (vit_uv) |*u| u else null,
+            .v = if (vit_v) |*v| v else null,
+            .be = be_cuda.?,
+            .io = io,
+        } }
+    else
+        null;
+    if (prompt == null and img_chat != null)
+        try stdout.writeAll("[attach images with @path.jpg / @\"path with spaces.png\" (png/jpeg/webp/gif/tiff), anywhere in a message]\n");
+    const driver: SimpleDriver = .{ .tok = &tok, .io = io, .gpa = gpa, .ids = &ids, .opts = opts, .stdout = stdout, .prompt = prompt, .img_chat = img_chat };
 
     const t_init = Io.Clock.real.now(io).nanoseconds;
     // gemma4 ignores --vram-budget (it always pins the whole model), so pass 0.

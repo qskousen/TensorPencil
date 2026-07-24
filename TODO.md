@@ -1,4 +1,3 @@
-- there is something subtly wrong with gemma 4, the thinking doesn't seem to work consistently and after a few turns it starts to break
 - pause / cancel during prefill
 - can't pause right after starting when nothing is loaded
 - keep preview image after resuming?
@@ -9,8 +8,6 @@
 - changing system prompt should wipe context and take effect on the next message
 - begin filling in holes in the capabilities grid (BACKEND.md)
 - add more sampling methods
-- multiple system prompts that can be saved and switched between
-- a long entry in the llm prompt expands the input and collapses the send button. must keep line-break and no horizontal scroll
 - tool call boxes inline, expandable to see the tool call
 - chat ui touchup because it's super ugly
 - GPU sampling follow-ups (phases 1-4 landed: on-device argmax + top-k for qwen3 on all backends, chain-greedy spec verify):
@@ -26,4 +23,3 @@
     Validated bit-exact / within-f16-tol: `cuda-i8-test` (pipe_lm 0 mismatches; i8+i4 fused linear `rel vs cpu-sim 0.000000`), `cuda-attn-test` (hgemm `rel vs f16-cpu 0.00000`, batched-c16 + full attention pass), coherent end-to-end unicorn images on int8/int4/bf16. (fp8 DiT is a vulkan/cuda-libs path — `UnsupportedCheckpoint` on zig-cuda, unaffected.) MEASURED int8 (best-of-12, 3 runs, 3090 clocks noisy): +3% on 4224² (attn proj), +1% on 7680×6144×6144 (qkv), FLAT on the big MLP shapes (BW/epilogue-bound, not shared-load-bound). Modest net win, confirms the residual gap is "a stack of refinements," no single lever. Step 1 ALONE was a measured wash (it only enables step 2); toggle kept for A/B + disable. NEXT levers: STEP 3 (deeper pipeline) then STEP 4 (mainloop scheduling / epilogue coalescing), else take CUTLASS.
   - STEP 3 (notes, bigger) — deepen the pipeline 2→3-4 stages. Double-buffer hides exactly ONE slab's global→shared latency behind one slab's compute; int8 compute/slab is fast, so if load latency > slab-compute the tensor cores stall (this is plausibly most of the residual after 1+2). Each extra stage costs another full A+B shared buffer, trading against the 48/64/99KB budget and occupancy — so it's a per-shape tuning problem (cuBLASLt/CUTLASS autotune the stage count; we're hard-fixed at 2 via the `(i+1)&1` buffer toggle + BUFSZ). Would need: N-buffer ring (buffer base = `((i+k)%N)*BUFSZ`), N-1 prologue stages + `cp.async.commit_group` per stage, `cp.async.wait_group N-1` in the mainloop. At K_STEP=64 a 3rd stage is +32KB (fits ≤96KB dynamic on the 3090 via the existing cuFuncSetAttribute opt-in but hurts occupancy); measure occupancy vs latency-hiding. Only worth it after 1+2 land and we re-measure where the stall is (nsys `--cuda-graph-trace=node` won't apply; use the sync-per-op profiler category breakdown + isolated bench, NOT --profile wall which misleads for many-small-launch).
   - STEP 4 (notes, finer) — mainloop scheduling + epilogue write coalescing. (a) Interleave MMA issue with the async wait: currently we `wait_group` then do ALL fragment loads then ALL MMAs; CUTLASS overlaps the next-stage `cp.async` with the current MMAs and software-pipelines the ldmatrix→mma chain so ptxas can hide shared-load latency. (b) Fused-epilogue coalesced writes: check whether the fused-rescale C-store writes global in a scattered per-thread accumulator pattern; if so, bounce the C tile through shared and write coalesced u32 (the trick that tripled write rate on the Vulkan scores kernel). Both are diminishing returns vs 1-3; revisit only if still short of cuBLASLt after 1-3. If we're within ~1.1x of cuBLASLt after 1-3, stop and take CUTLASS for the last bit instead of hand-grinding these.
-- jinja?

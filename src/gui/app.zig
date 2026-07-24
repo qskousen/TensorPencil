@@ -878,9 +878,13 @@ fn frame() void {
     // session-consuming render below takes `s_ui`, not `g_session`.)
     const s_ui: ?*chat.Session = if (loading) null else g_session;
 
-    // Only show the "no model" notice when there's genuinely nothing configured
-    // (not during a load, when g_session is transiently null).
-    if (!loading and g_session == null and g_config.llm_model.opt() == null) {
+    // Show the "no model" notice when there's genuinely nothing configured, OR
+    // when the last load failed (e.g. a non-mmproj file in the vision-tower slot
+    // → error.MmprojNotVisionTower): the session load returns the error, so there
+    // is NO working session at all and renderNoModel surfaces `g_load_err`. Both
+    // are terminal null-session states; during a load `loading` is set so the
+    // transiently-null session never trips this.
+    if (!loading and g_session == null and (g_config.llm_model.opt() == null or g_load_err != null)) {
         renderNoModel();
         return;
     }
@@ -938,8 +942,12 @@ fn renderNoModel() void {
         var tl = dvui.textLayout(@src(), .{}, .{ .gravity_x = 0.5 });
         defer tl.deinit();
         if (g_load_err) |err| {
-            var msg: [256]u8 = undefined;
-            fonts.addRich(tl, std.fmt.bufPrint(&msg, "Failed to load the model: {t}\n\nChoose a different model in Settings.", .{err}) catch "Failed to load the model.");
+            var msg: [320]u8 = undefined;
+            const text = if (err == error.MmprojNotVisionTower)
+                "The vision-tower (mmproj) file isn't a vision projector — it looks like an LLM model, not an mmproj.\n\nIn Settings, set the vision tower to an mmproj-*.gguf file, or clear it for a text-only model."
+            else
+                (std.fmt.bufPrint(&msg, "Failed to load the model: {t}\n\nChoose a different model in Settings.", .{err}) catch "Failed to load the model.");
+            fonts.addRich(tl, text);
         } else {
             fonts.addRich(tl, "No LLM model is set.\n\nOpen Settings (or the ⚙ button) to choose a model file to get started.");
         }
