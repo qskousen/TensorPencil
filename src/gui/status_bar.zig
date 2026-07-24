@@ -12,6 +12,7 @@ const chat = @import("chat.zig");
 const diffuser = @import("diffuser.zig");
 const sysmon = @import("sysmon.zig");
 const meter = @import("meter.zig");
+const vram_split = @import("vram_split.zig");
 
 /// Fixed bar height (logical px), reserved by the caller. The VRAM meter row
 /// (top) plus the readout row (bottom).
@@ -48,10 +49,17 @@ var h_gpu: Ring = .{};
 const gib: f64 = 1 << 30;
 /// Sampling cadence (µs) — decoupled from the frame rate. A dvui timer fires on
 /// this interval, which also wakes the (event-driven) main loop when idle so the
-/// meters keep advancing even with no UI activity.
+/// meters keep advancing even with no UI activity. Faster while a worker is busy,
+/// since that's when the segments actually move.
 const sample_interval_us: i32 = 500_000;
+const sample_interval_busy_us: i32 = 200_000;
 
 /// The most recent sample, rendered every frame regardless of when it was taken.
+///
+/// EVERY VRAM number here is read in one pass in `sampleInto` — the whole-card
+/// total, our process's footprint, and each component. They must stay coherent:
+/// mixing a timer-sampled total with live per-frame component reads is what made
+/// "system" bounce during diffusion (see vram_split.zig).
 const Sample = struct {
     cpu: f32 = 0,
     cpu_mhz: f32 = 0,
@@ -59,6 +67,8 @@ const Sample = struct {
     gpu_mhz: u32 = 0,
     vram_used: u64 = 0,
     vram_total: u64 = 0,
+    /// Our process's whole card footprint (NVML per-process), 0 = unavailable.
+    vram_proc: u64 = 0,
     have_gpu: bool = false,
     has_session: bool = false,
     llm_used: u64 = 0,
@@ -67,10 +77,14 @@ const Sample = struct {
     layers_gpu: usize = 0,
     layers_cpu: usize = 0,
     diffusing: bool = false,
-    diff_used: u64 = 0, // resident diffusion VRAM (the diffusion backend's device_used)
+    /// Resident diffusion VRAM, per component (sums to the backend's device_used).
+    diff: diffuser.VramBreakdown = .{},
     limit: u64 = 0,
+    /// Smoothed residuals: ours-but-untracked, and other processes'.
+    parts: vram_split.Parts = .{},
 };
 var cur: Sample = .{};
+var split_smoother: vram_split.Smoother = .{};
 
 /// Release the NVML handle at process exit.
 pub fn deinit() void {
@@ -80,20 +94,24 @@ pub fn deinit() void {
 
 /// Take a fresh sample of every meter into `cur` and push the time-series rings.
 /// Called on the timer cadence, not per frame.
-fn sampleInto(s: ?*chat.Session, diff_busy: bool, diff_used: u64) void {
+fn sampleInto(s: ?*chat.Session, diff_busy: bool, diff: diffuser.VramBreakdown) void {
     var n: Sample = .{};
     n.cpu = cpu_meter.sample();
     n.cpu_mhz = sysmon.cpuFreqMhz();
-    if (nvml) |*nv| if (nv.query()) |g| {
-        n.gpu_util = @floatFromInt(g.util);
-        n.gpu_mhz = g.clock_mhz;
-        n.vram_used = g.mem_used;
-        n.vram_total = g.mem_total;
-        n.have_gpu = true;
-    };
+    if (nvml) |*nv| {
+        if (nv.query()) |g| {
+            n.gpu_util = @floatFromInt(g.util);
+            n.gpu_mhz = g.clock_mhz;
+            n.vram_used = g.mem_used;
+            n.vram_total = g.mem_total;
+            n.have_gpu = true;
+        }
+        // Same pass as the whole-card numbers above — the meter subtracts the two.
+        n.vram_proc = nv.selfUsed() orelse 0;
+    }
     // Diffusion state comes from the app-level engine (not the session).
     n.diffusing = diff_busy;
-    n.diff_used = diff_used; // accurate resident diffusion VRAM (backend device_used)
+    n.diff = diff; // MEASURED per-component resident diffusion VRAM
     if (s) |sess| {
         n.has_session = true;
         n.llm_used = sess.be.deviceUsed();
@@ -109,6 +127,14 @@ fn sampleInto(s: ?*chat.Session, diff_busy: bool, diff_used: u64) void {
             n.vram_used = mi.total -| mi.free;
         }
     }
+    // Split the card between us and the rest of the system, from this snapshot
+    // only (see vram_split.zig for why the residuals are derived this way).
+    if (n.vram_total > 0) n.parts = split_smoother.update(.{
+        .total = n.vram_total,
+        .device_used = n.vram_used,
+        .proc_used = n.vram_proc,
+        .ours = n.llm_used + n.diff.total(),
+    });
     const totf: f32 = if (n.vram_total > 0) @floatFromInt(n.vram_total) else 0;
     h_cpu.push(n.cpu);
     h_gpu.push(n.gpu_util);
@@ -135,11 +161,12 @@ pub fn render(s: ?*chat.Session, diff_busy: bool, diff: diffuser.VramBreakdown, 
     });
     defer bar.deinit();
 
-    // Time-based sampling (drives the meter's total/system baseline when no LLM
-    // session is loaded to read the card from). Resample on the timer.
+    // Time-based sampling: EVERY meter number (card total, our process
+    // footprint, per-component residency) is taken here, in one pass, and the
+    // meter renders that snapshot — never a mix of sampled and live reads.
     if (dvui.timerDoneOrNone(bar.data().id)) {
-        sampleInto(s, diff_busy, diff.total());
-        dvui.timer(bar.data().id, sample_interval_us);
+        sampleInto(s, diff_busy, diff);
+        dvui.timer(bar.data().id, if (diff_busy) sample_interval_busy_us else sample_interval_us);
     }
 
     var top: [24]u8 = undefined;
@@ -164,36 +191,32 @@ pub fn render(s: ?*chat.Session, diff_busy: bool, diff: diffuser.VramBreakdown, 
 /// (see pipeline.vramBreakdown); `latent` is the per-image working set (GPU
 /// session + activation workspace + preview decode), populated mid-generation.
 fn renderMeter(s: ?*chat.Session, diff: diffuser.VramBreakdown, split: *f32, limit: *f32, llm_armed: bool, diff_armed: bool, llm_paused: bool, diff_paused: bool, acts: meter.Actions) void {
-    // Whole-card totals come from the SAME source as the left VRAM meter — the
-    // NVML sample — so the two always agree. (Reading the LLM context's own
-    // cuMemGetInfo here made the segments misbehave whenever a session was
-    // resident; NVML is the authoritative whole-device view.) Fall back to the
-    // context query, then a sane default, only when NVML is unavailable.
+    // EVERY byte count below comes from `cur` — one snapshot (see Sample). The
+    // whole-card total is the same NVML reading the left VRAM meter shows, so the
+    // two always agree; with no NVML at all we fall back to the LLM context's
+    // cuMemGetInfo, then to a sane default.
     var total: u64 = cur.vram_total;
-    var used_all: u64 = cur.vram_used;
-    if (total == 0) {
-        if (s) |ss| {
-            const mi = ss.be.ctx.memGetInfo();
-            total = mi.total;
-            used_all = mi.total -| mi.free;
-        } else total = 24 << 30;
-    }
-    const llm_used: u64 = if (s) |ss| ss.be.deviceUsed() else 0;
-    const ctx_b: u64 = if (s) |ss| ss.ctxKvBytes() else 0;
-    const diff_b = diff.total();
-    const system = used_all -| llm_used -| diff_b;
+    if (total == 0) total = 24 << 30;
+    const ctx_b: u64 = cur.ctx_kv;
     const tf: f32 = @floatFromInt(@max(total, 1));
+    // The loaded/unloaded FLAGS (button dimming, drag floors) stay live: they're
+    // booleans, not residuals, so they can't reintroduce the bounce, and a
+    // half-second lag on an eject button would feel broken.
+    const diff_b = diff.total();
 
     var model: meter.Model = .{
         .total = total,
-        .system = system,
-        .llm_w = llm_used -| ctx_b,
+        // Ours but untracked (CUDA contexts + kernels, library internals, UI
+        // textures, a model still loading) vs genuinely other processes'.
+        .overhead = cur.parts.overhead,
+        .system = cur.parts.system,
+        .llm_w = cur.llm_used -| ctx_b,
         .llm_ctx = ctx_b,
         // MEASURED per-component diffusion breakdown (see pipeline.vramBreakdown).
-        .te = diff.te,
-        .dit = diff.dit,
-        .latent = diff.latent,
-        .vae = diff.vae,
+        .te = cur.diff.te,
+        .dit = cur.diff.dit,
+        .latent = cur.diff.latent,
+        .vae = cur.diff.vae,
         .split = split,
         .limit = limit,
         // Floors are soft UX guardrails, not hard reservations. The split can't

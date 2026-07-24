@@ -22,6 +22,9 @@ const col = struct {
     const dit = C{ .r = 224, .g = 138, .b = 60 };
     const latent = C{ .r = 216, .g = 82, .b = 74 };
     const vae = C{ .r = 154, .g = 109, .b = 208 };
+    /// Ours but untracked (contexts/kernels/UI textures) — a desaturated cousin
+    /// of `sys` so it reads as part of the right-hand block, yet distinct.
+    const ovh = C{ .r = 116, .g = 106, .b = 96 };
     const head = C{ .r = 128, .g = 138, .b = 156, .a = 46 };
     const split = C{ .r = 234, .g = 241, .b = 251 };
     const limit = C{ .r = 239, .g = 162, .b = 60 };
@@ -29,7 +32,13 @@ const col = struct {
 
 pub const Model = struct {
     total: u64,
+    /// VRAM held by OTHER processes (desktop, browsers, …) — never ours.
     system: u64,
+    /// OURS, but outside what the allocators track: the CUDA context(s) + JIT'd
+    /// modules, cuBLASLt/cuDNN internals, the SDL/GL window + image textures, and
+    /// anything a model has uploaded before its session is published. Used to be
+    /// lumped into `system`; see vram_split.zig.
+    overhead: u64,
     llm_w: u64,
     llm_ctx: u64,
     te: u64,
@@ -118,6 +127,9 @@ pub fn render(m: *Model, a: Actions) void {
     // Diffusion numbers (right): TE/DiT over latent/VAE, two mini-columns.
     numCol(1, &.{ .{ .name = "TE", .c = col.te, .v = m.te }, .{ .name = "lat", .c = col.latent, .v = m.latent } });
     numCol(2, &.{ .{ .name = "DiT", .c = col.dit, .v = m.dit }, .{ .name = "VAE", .c = col.vae, .v = m.vae } });
+    // The two blocks nobody could read before: our own untracked runtime
+    // (contexts/kernels/UI) over what OTHER processes hold.
+    numCol(3, &.{ .{ .name = "ovh", .c = col.ovh, .v = m.overhead }, .{ .name = "sys", .c = col.sys, .v = m.system } });
 }
 
 const Item = struct { name: []const u8, c: C, v: u64 };
@@ -238,11 +250,12 @@ fn drawBar(m: *Model, R: dvui.Rect.Physical, scale: f32) void {
     // on the left, THEN the free gap (bar background shows through), THEN
     // system/reserved at the far right. All segments sum to the card total.
     var used: u64 = 0;
-    inline for (.{ m.llm_w, m.llm_ctx, m.te, m.dit, m.latent, m.vae, m.system }) |b| used += b;
+    inline for (.{ m.llm_w, m.llm_ctx, m.te, m.dit, m.latent, m.vae, m.overhead, m.system }) |b| used += b;
     const free_b: u64 = m.total -| used;
 
     var x: f32 = 0;
-    // Our stuff: LLM (weights, context) then the diffusion stack, contiguous.
+    // Our stuff: LLM (weights, context), the diffusion stack, then our untracked
+    // runtime overhead — all contiguous, so the left block is exactly "ours".
     inline for (.{
         .{ m.llm_w, col.llm_w },
         .{ m.llm_ctx, col.llm_ctx },
@@ -250,6 +263,7 @@ fn drawBar(m: *Model, R: dvui.Rect.Physical, scale: f32) void {
         .{ m.dit, col.dit },
         .{ m.latent, col.latent },
         .{ m.vae, col.vae },
+        .{ m.overhead, col.ovh },
     }) |it| {
         const w = frac(m, it[0]);
         seg.at(R, x0, W, x, x + w, it[1]);

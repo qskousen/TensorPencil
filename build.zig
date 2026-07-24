@@ -458,6 +458,29 @@ pub fn build(b: *std.Build) void {
             });
             gui_test_step.dependOn(&b.addRunArtifact(gui_viewmath_tests).step);
 
+            // VRAM meter attribution math (ours-untracked vs other processes',
+            // and the smoothing that keeps our allocation churn out of the
+            // "system" block). Pure std.
+            const gui_vramsplit_tests = b.addTest(.{
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/gui/vram_split.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }),
+            });
+            gui_test_step.dependOn(&b.addRunArtifact(gui_vramsplit_tests).step);
+
+            // NVML/proc sampler helpers: the per-process VRAM struct ABI + list
+            // scan the meter depends on. Pure std (NVML itself is dlopen'd).
+            const gui_sysmon_tests = b.addTest(.{
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/gui/sysmon.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }),
+            });
+            gui_test_step.dependOn(&b.addRunArtifact(gui_sysmon_tests).step);
+
             // Diffusion-engine pure-helper tests (clampDim / parseGenAttrs /
             // seed advance). Pulls in the TensorPencil module (for pipeline
             // types) + known-folders (via config.zig), but stays CPU-only.
