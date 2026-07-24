@@ -802,14 +802,22 @@ pub const Diffuser = struct {
         // (lat·spatial_scale), and latent2rgb is smaller (latent res). Sizing it
         // to a fixed 512² silently dropped the larger TAESD sizes (½, full). The
         // pointer stays put for the whole generation; dims published via atomics.
-        gi.preview_w = .init(0);
-        gi.preview_h = .init(0);
-        if (gi.preview) |old| self.gpa.free(old); // free a prior buffer (resumed image)
-        if (self.gpa.alloc(u8, gi.req_width * gi.req_height * 4)) |pb| {
-            @memset(pb, 0);
-            gi.preview = pb;
-        } else |_| {
-            gi.preview = null;
+        //
+        // Resuming a suspended image (Tier 3 unload-while-paused): KEEP the last
+        // published preview + its dims so the parked frame stays on screen until
+        // the resumed worker's next onStep overwrites it, instead of blanking to
+        // black. The resolution is unchanged (same GenImage), so the existing
+        // buffer is still correctly sized.
+        if (gi.resume_snapshot == null or gi.preview == null) {
+            gi.preview_w = .init(0);
+            gi.preview_h = .init(0);
+            if (gi.preview) |old| self.gpa.free(old); // free a prior buffer (re-run of a finished image)
+            if (self.gpa.alloc(u8, gi.req_width * gi.req_height * 4)) |pb| {
+                @memset(pb, 0);
+                gi.preview = pb;
+            } else |_| {
+                gi.preview = null;
+            }
         }
         gi.status.store(@intFromEnum(GenStatus.generating), .release);
         self.busy.store(true, .release);

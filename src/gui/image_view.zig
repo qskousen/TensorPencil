@@ -308,7 +308,9 @@ fn renderCell(gi: *GenImage, idx: usize, cell: f32) void {
                 .pending => "Queued…",
                 else => std.fmt.bufPrint(&buf, "step {d}/{d}", .{ done, total }) catch "…",
             };
-            dvui.label(@src(), "{s}", .{status}, .{});
+            // richLabel so the ⏸ (suspended) routes to the emoji face — the prose
+            // font lacks media-control glyphs (see fonts.isEmoji).
+            fonts.richLabel(@src(), status, .{});
             if (dvui.button(@src(), "Cancel", .{}, .{ .margin = .{ .y = 2 } })) {
                 gi.cancel.store(true, .release);
                 gi.wake();

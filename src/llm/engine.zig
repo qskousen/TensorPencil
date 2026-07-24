@@ -74,6 +74,40 @@ pub const ResidencyPoll = struct {
     apply: *const fn (ctx: *anyopaque) void,
 };
 
+/// How many prompt tokens to prefill between pause/cancel checkpoints. Prefill
+/// was one un-interruptible `model.step` over the whole uncached prefix, so a
+/// long prompt couldn't be paused or canceled until the first token decoded.
+/// Chunking it lets the gate land mid-prefill. Incremental chunked stepping is
+/// token-identical (attention is causal → a later chunk only reads earlier
+/// chunks' committed KV; see gemma3.forwardCached), and the steppers already run
+/// the LM head per internal chunk, so per-chunk output here costs nothing beyond
+/// what `step` does anyway. 256 bounds cancel latency to a fraction of a second
+/// at any realistic prefill throughput.
+pub const prefill_gate_chunk: usize = 256;
+
+pub const StepAction = enum { proceed, stop };
+
+/// A pause/cancel/residency checkpoint shared by the decode loop and the chunked
+/// prefill. Poll it at clean boundaries — between decoded tokens and between
+/// prefill chunks. Returns `.stop` when generation should end: a cancel, a
+/// cancel delivered to a parked (paused) worker, or an unload-while-paused
+/// suspend — the last also sets `suspended_out` so the caller keeps the turn
+/// OPEN for a reprefill-resume on reload (Tier 3). `.proceed` otherwise (the
+/// fast path when neither paused nor canceled). A paused worker BLOCKS here.
+pub fn checkpoint(io: std.Io, opts: Options) StepAction {
+    if (opts.residency_poll) |rp| rp.apply(rp.ctx); // enact any arbiter-published VRAM target on this thread
+    if (opts.cancel) |c| if (c.load(.acquire)) return .stop;
+    if (opts.pause) |g| switch (g.checkpoint(io, opts.cancel)) {
+        .proceed => {},
+        .canceled => return .stop,
+        .unload => {
+            if (opts.suspended_out) |so| so.* = true;
+            return .stop;
+        },
+    };
+    return .proceed;
+}
+
 /// KV-cache capacity ceiling for a given prompt; errors when the prompt
 /// alone overflows the window.
 pub fn capacityFor(opts: Options, prompt_len: usize) !usize {
@@ -186,23 +220,20 @@ pub fn generate(
     const new = ids.items[model.cached()..];
     if (new.len == 0) return error.ContextFull;
     try ensureRoom(model, new.len);
-    try model.step(io, new, logits);
+    // Gate-checked chunked prefill (see prefill_gate_chunk): pause/cancel can now
+    // land mid-prefill. Only the final chunk's logits feed the first sample.
+    {
+        var off: usize = 0;
+        while (off < new.len) {
+            if (checkpoint(io, opts) == .stop) return 0;
+            const c = @min(prefill_gate_chunk, new.len - off);
+            try model.step(io, new[off..][0..c], logits);
+            off += c;
+        }
+    }
     var n: usize = 0;
     while (n < opts.max_new_tokens) {
-        if (opts.residency_poll) |rp| rp.apply(rp.ctx); // enact any arbiter-published VRAM target on this thread
-
-        if (opts.cancel) |c| if (c.load(.acquire)) break;
-        // Pause parks at the token boundary. `.canceled` stops like a cancel;
-        // `.unload` also stops but flags a suspend so the caller keeps the turn
-        // open and reprefill-resumes it on reload (Tier 3 unload-while-paused).
-        if (opts.pause) |g| switch (g.checkpoint(io, opts.cancel)) {
-            .proceed => {},
-            .canceled => break,
-            .unload => {
-                if (opts.suspended_out) |so| so.* = true;
-                break;
-            },
-        };
+        if (checkpoint(io, opts) == .stop) break;
         const next = sampler.next(logits, ids.items);
         if (chat.isStop(next)) break;
         try ids.append(gpa, next);
@@ -274,23 +305,22 @@ fn generateGreedyArgmax(
     const new = ids.items[model.cached()..];
     if (new.len == 0) return error.ContextFull;
     try ensureRoom(model, new.len);
-    var next = try stepArgmaxOf(model, io, new, sample.collectPenalties(ids.items, opts.sampling, &pen_buf), opts.sampling);
+    // Gate-checked chunked prefill; the final chunk yields the first token.
+    // Penalties are over the fixed prompt `ids`, so collect them once.
+    const pen = sample.collectPenalties(ids.items, opts.sampling, &pen_buf);
+    var next: u32 = undefined;
+    {
+        var off: usize = 0;
+        while (off < new.len) {
+            if (checkpoint(io, opts) == .stop) return 0;
+            const c = @min(prefill_gate_chunk, new.len - off);
+            next = try stepArgmaxOf(model, io, new[off..][0..c], pen, opts.sampling);
+            off += c;
+        }
+    }
     var n: usize = 0;
     while (n < opts.max_new_tokens) {
-        if (opts.residency_poll) |rp| rp.apply(rp.ctx); // enact any arbiter-published VRAM target on this thread
-
-        if (opts.cancel) |c| if (c.load(.acquire)) break;
-        // Pause parks at the token boundary. `.canceled` stops like a cancel;
-        // `.unload` also stops but flags a suspend so the caller keeps the turn
-        // open and reprefill-resumes it on reload (Tier 3 unload-while-paused).
-        if (opts.pause) |g| switch (g.checkpoint(io, opts.cancel)) {
-            .proceed => {},
-            .canceled => break,
-            .unload => {
-                if (opts.suspended_out) |so| so.* = true;
-                break;
-            },
-        };
+        if (checkpoint(io, opts) == .stop) break;
         if (chat.isStop(next)) break;
         try ids.append(gpa, next);
         n += 1;
@@ -342,23 +372,22 @@ fn generateGpuSample(
     const new = ids.items[model.cached()..];
     if (new.len == 0) return error.ContextFull;
     try ensureRoom(model, new.len);
-    var count = try stepSelectOf(model, io, new, sample.collectPenalties(ids.items, opts.sampling, &pen_buf), opts.sampling, out_id, out_logit);
+    // Gate-checked chunked prefill; the final chunk's candidates feed the first
+    // sample. Penalties are over the fixed prompt `ids`, so collect them once.
+    const pen = sample.collectPenalties(ids.items, opts.sampling, &pen_buf);
+    var count: usize = undefined;
+    {
+        var off: usize = 0;
+        while (off < new.len) {
+            if (checkpoint(io, opts) == .stop) return 0;
+            const c = @min(prefill_gate_chunk, new.len - off);
+            count = try stepSelectOf(model, io, new[off..][0..c], pen, opts.sampling, out_id, out_logit);
+            off += c;
+        }
+    }
     var n: usize = 0;
     while (n < opts.max_new_tokens) {
-        if (opts.residency_poll) |rp| rp.apply(rp.ctx); // enact any arbiter-published VRAM target on this thread
-
-        if (opts.cancel) |c| if (c.load(.acquire)) break;
-        // Pause parks at the token boundary. `.canceled` stops like a cancel;
-        // `.unload` also stops but flags a suspend so the caller keeps the turn
-        // open and reprefill-resumes it on reload (Tier 3 unload-while-paused).
-        if (opts.pause) |g| switch (g.checkpoint(io, opts.cancel)) {
-            .proceed => {},
-            .canceled => break,
-            .unload => {
-                if (opts.suspended_out) |so| so.* = true;
-                break;
-            },
-        };
+        if (checkpoint(io, opts) == .stop) break;
         for (cands[0..count], out_id[0..count], out_logit[0..count]) |*c, id, lg| c.* = .{ .id = id, .logit = lg };
         const next = sampler.nextFromCandidates(cands[0..count]);
         if (chat.isStop(next)) break;

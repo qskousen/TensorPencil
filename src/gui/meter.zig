@@ -87,8 +87,10 @@ pub fn render(m: *Model, a: Actions) void {
     // LLM numbers (left): weights + context, stacked.
     numCol(0, &.{ .{ .name = "weights", .c = col.llm_w, .v = m.llm_w }, .{ .name = "ctx", .c = col.llm_ctx, .v = m.llm_ctx } });
 
-    if (pauseBtn(0, m.llm_loaded, m.llm_paused, "Pause the LLM — parks generation, keeps it resident")) a.on_toggle_pause_llm();
+    // Unload on the OUTSIDE, pause next to the bar — so both pause buttons flank
+    // the meter (the diffusion side below is already pause-then-unload outward).
     if (eject(0, m.llm_loaded, m.llm_armed, "Unload the LLM — frees its VRAM (reloads on the next message)")) a.on_eject_llm();
+    if (pauseBtn(0, m.llm_paused, "Pause the LLM — holds generation (nothing loads until resumed)")) a.on_toggle_pause_llm();
 
     {
         // The box's own background paints the "free" color (reliable); segments
@@ -110,7 +112,7 @@ pub fn render(m: *Model, a: Actions) void {
         handleDrag(m, a, wd, crs);
     }
 
-    if (pauseBtn(1, m.diff_loaded, m.diff_paused, "Pause diffusion — parks generation, keeps it resident")) a.on_toggle_pause_diff();
+    if (pauseBtn(1, m.diff_paused, "Pause diffusion — holds generation (nothing loads until resumed)")) a.on_toggle_pause_diff();
     if (eject(1, m.diff_loaded, m.diff_armed, "Unload the diffusion model — frees its VRAM (reloads on the next image)")) a.on_eject_diff();
 
     // Diffusion numbers (right): TE/DiT over latent/VAE, two mini-columns.
@@ -173,9 +175,11 @@ fn eject(id: usize, loaded: bool, armed: bool, hint_text: []const u8) bool {
 
 /// Pause/resume toggle for one model, styled to match the eject button. While
 /// paused the glyph BLINKS orange (a ~1.25 Hz square wave) so the parked state
-/// is unmissable, and flips to ▶ (resume). Dimmed + inert when the model isn't
-/// loaded. Returns true when clicked (and loaded).
-fn pauseBtn(id: usize, loaded: bool, paused: bool, hint_text: []const u8) bool {
+/// is unmissable, and flips to ▶ (resume). ALWAYS clickable (never dimmed):
+/// pausing before anything is loaded pre-arms the gate so the next message /
+/// image is HELD — nothing loads at all — until resumed. See
+/// app.toggleLlmPause and Diffuser.pump (both defer loading while paused).
+fn pauseBtn(id: usize, paused: bool, hint_text: []const u8) bool {
     const th = dvui.themeGet();
 
     // Square-wave blink phase off the frame clock: 400 ms lit, 400 ms dim.
@@ -186,7 +190,8 @@ fn pauseBtn(id: usize, loaded: bool, paused: bool, hint_text: []const u8) bool {
 
     const color_text: ?C = if (paused)
         (if (lit) col.limit else col.limit.lerp(th.fill, 0.72))
-    else if (loaded) null else th.fill.lerp(th.text, 0.28);
+    else
+        null;
 
     var wd: dvui.WidgetData = undefined;
     const clicked = dvui.buttonIcon(@src(), "pause", if (paused) dvui.entypo.controller_play else dvui.entypo.controller_pause, .{}, .{}, .{
@@ -208,9 +213,7 @@ fn pauseBtn(id: usize, loaded: bool, paused: bool, hint_text: []const u8) bool {
         dvui.timer(wd.id, @intCast(@divFloor(to_flip, 1000) + 1));
     }
     hint.hover(@src(), &wd, if (paused) "Resume" else hint_text);
-    // Clickable while loaded OR paused: after an unload-while-paused the model is
-    // gone but still paused, and the button must stay live to resume it.
-    return clicked and (loaded or paused);
+    return clicked;
 }
 
 fn frac(m: *const Model, bytes: u64) f32 {

@@ -276,14 +276,26 @@ fn toggleLlmPause() void {
         // Resident: drive the session gate (unpause also dispatches a turn that
         // was queued while paused — see Session.setPaused).
         s.setPaused(now_paused);
-    } else if (!now_paused and g_llm_suspend != null) {
-        // Unloaded + resuming with a suspended turn: reload, then continue it.
-        g_reload_requested = true;
-        wakeupFrame();
+    } else if (!now_paused) {
+        // Resuming with nothing resident: fire any load we HELD while paused — a
+        // message / regenerate stashed by submitChat / requestRegenLoad (both set
+        // g_reload_requested), or a suspended turn to resume. Wake a frame so
+        // maybeStartReload runs now that the gate is lifted. Nothing pending ⇒
+        // nothing loads (a bare pause→resume on a cold engine is a no-op).
+        if (g_reload_requested or g_pending_submit != null or g_pending_regenerate or g_llm_suspend != null) {
+            g_reload_requested = true;
+            wakeupFrame();
+        }
     }
 }
 fn toggleDiffPause() void {
-    if (g_diffuser) |*d| d.setPaused(!d.isPaused());
+    if (g_diffuser) |*d| {
+        d.setPaused(!d.isPaused());
+        // Wake a frame so the next pump() runs at once: on resume it loads +
+        // starts any image queued while paused (pump defers all loads while
+        // paused, so nothing loaded until now). Harmless on pause.
+        wakeupFrame();
+    }
 }
 
 /// Main-loop hook: carry out any armed eject once ITS OWN model is idle. Each
@@ -932,6 +944,24 @@ fn loadingAssistantBubble() void {
     dvui.label(@src(), "Loading…", .{}, .{ .gravity_y = 0.5, .color_text = theme.text.lerp(theme.fill, 0.35) });
 }
 
+/// Assistant slot for a message sent while the LLM is paused with nothing
+/// resident: no spinner (nothing is loading), just a paused hint. The load +
+/// generation fire on resume — see toggleLlmPause → maybeStartReload.
+fn queuedAssistantBubble() void {
+    const theme = dvui.themeGet();
+    var bubble = dvui.box(@src(), .{ .dir = .horizontal }, .{
+        .margin = .{ .x = 8, .y = 3, .w = 96, .h = 3 },
+        .background = true,
+        .color_fill = theme.fill.lerp(theme.text, 0.08),
+        .corner_radius = dvui.Rect.all(10),
+        .padding = dvui.Rect.all(10),
+    });
+    defer bubble.deinit();
+    // richLabel (not dvui.label) so the ⏸ routes to the emoji face — the prose
+    // font (NotoSansCJK) has no media-control glyphs. See fonts.isEmoji.
+    fonts.richLabel(@src(), "⏸ queued — resume to generate", .{ .gravity_y = 0.5, .color_text = theme.text.lerp(theme.fill, 0.4) });
+}
+
 /// Chat view when no LLM is configured (or the last load failed): explain and
 /// offer a shortcut into settings.
 fn renderNoModel() void {
@@ -1206,6 +1236,11 @@ fn maybeStartReload() void {
         }
     }
     if (!g_reload_requested or g_loading.load(.acquire) or g_loader != null) return;
+    // Paused with nothing resident: HOLD the load. A message / regenerate / turn
+    // queued while paused keeps `g_reload_requested` set but loads NOTHING until
+    // the user resumes (toggleLlmPause kicks this the moment the gate lifts) —
+    // mirroring the diffusion side, where Diffuser.pump defers loads while paused.
+    if (g_llm_paused and g_session == null) return;
     // The LLM (re)loads CONCURRENTLY with diffusion — a running image keeps
     // generating on its own context while the LLM builds on a fresh one, so a
     // chat sent mid-image loads and responds right away instead of waiting for
@@ -1387,7 +1422,7 @@ fn renderMessages(s: ?*chat.Session, list_h: f32, loading: bool) void {
         // screen read-only and is never visually "reset" — only a "new chat"
         // click clears it. It reloads + replays on the next message.
         const msgs: []chat.Message = if (s) |ss| ss.messages.items else if (g_carry) |c| c.items else &.{};
-        if (msgs.len == 0 and !loading) {
+        if (msgs.len == 0 and !loading and g_pending_submit == null) {
             var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .padding = dvui.Rect.all(16) });
             defer tl.deinit();
             tl.addText(if (s == null)
@@ -1404,6 +1439,15 @@ fn renderMessages(s: ?*chat.Session, list_h: f32, loading: bool) void {
         if (loading) {
             if (g_pending_submit) |txt| pendingUserBubble(txt);
             loadingAssistantBubble();
+        } else if (g_llm_paused) {
+            // Paused with nothing resident: the just-sent message is HELD (no load
+            // at all) until resume. Show it + a paused hint rather than "Loading…"
+            // or the empty-state placeholder. (Session-resident pause is Tier 2,
+            // shown inline per-message above — g_pending_submit is null then.)
+            if (g_pending_submit) |txt| {
+                pendingUserBubble(txt);
+                queuedAssistantBubble();
+            }
         }
     }
 
@@ -1537,7 +1581,9 @@ fn renderMessage(s: ?*chat.Session, m: *chat.Message, idx: usize) void {
             fonts.addRich(tl, std.fmt.bufPrint(&msg, "⚠ generation error: {t}", .{err}) catch "⚠ generation error");
         } else if (idx + 1 == (if (s) |ss| ss.messages.items.len else 0) and (if (s) |ss| ss.isPaused() else false)) {
             // A turn queued while the LLM is paused — it runs on resume (Tier 2).
-            tl.addText("⏸ queued — resume to generate", .{ .color_text = theme.text.lerp(theme.fill, 0.4) });
+            // addStyled (not addText) routes the ⏸ to the emoji face (NotoSansCJK
+            // lacks media-control glyphs — see fonts.isEmoji).
+            fonts.addStyled(tl, "⏸ queued — resume to generate", .{}, .{ .color_text = theme.text.lerp(theme.fill, 0.4) });
         }
     }
 

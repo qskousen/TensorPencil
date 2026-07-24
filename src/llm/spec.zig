@@ -206,24 +206,25 @@ pub fn generate(
     var sampler = sample.Sampler.init(opts.sampling, opts.seed);
     var stream: engine.Utf8Stream = .{};
 
-    // Prefill the uncached suffix; only the last position's logits matter.
+    // Prefill the uncached suffix; only the last position's logits matter. Gate-
+    // checked chunks so a long prompt can be paused/canceled mid-prefill.
     const new = ids.items[model.cached()..];
     if (new.len == 0 or new.len > model.remaining()) return error.ContextFull;
-    try model.step(io, new, logits[0..vocab]);
+    {
+        var off: usize = 0;
+        while (off < new.len) {
+            if (engine.checkpoint(io, opts) == .stop) return 0;
+            const c = @min(engine.prefill_gate_chunk, new.len - off);
+            try model.step(io, new[off..][0..c], logits[0..vocab]);
+            off += c;
+        }
+    }
 
     var n: usize = 0;
     var pending = sampler.next(logits[0..vocab], ids.items);
     while (true) {
         // Cooperative stop/pause at the token boundary (mirrors engine.zig).
-        if (opts.cancel) |c| if (c.load(.acquire)) break;
-        if (opts.pause) |pg| switch (pg.checkpoint(io, opts.cancel)) {
-            .proceed => {},
-            .canceled => break,
-            .unload => {
-                if (opts.suspended_out) |so| so.* = true;
-                break;
-            },
-        };
+        if (engine.checkpoint(io, opts) == .stop) break;
         if (chat.isStop(pending)) break;
         try ids.append(gpa, pending);
         n += 1;
@@ -303,23 +304,26 @@ fn generateChainGreedy(
     std.debug.assert(k_max > 0);
     var stream: engine.Utf8Stream = .{};
 
+    // Gate-checked chunked prefill (see engine.prefill_gate_chunk); the final
+    // chunk's argmax is the first pending token.
     const new = ids.items[model.cached()..];
     if (new.len == 0 or new.len > model.remaining()) return error.ContextFull;
-    var pending = try model.stepArgmax(io, new);
+    var pending: u32 = undefined;
+    {
+        var off: usize = 0;
+        while (off < new.len) {
+            if (engine.checkpoint(io, opts) == .stop) return 0;
+            const c = @min(engine.prefill_gate_chunk, new.len - off);
+            pending = try model.stepArgmax(io, new[off..][0..c]);
+            off += c;
+        }
+    }
 
     var n: usize = 0;
     var g: [max_draft + 1]u32 = undefined;
     while (true) {
         // Cooperative stop/pause at the token boundary (mirrors engine.zig).
-        if (opts.cancel) |c| if (c.load(.acquire)) break;
-        if (opts.pause) |pg| switch (pg.checkpoint(io, opts.cancel)) {
-            .proceed => {},
-            .canceled => break,
-            .unload => {
-                if (opts.suspended_out) |so| so.* = true;
-                break;
-            },
-        };
+        if (engine.checkpoint(io, opts) == .stop) break;
         if (chat.isStop(pending)) break;
         try ids.append(gpa, pending);
         n += 1;
@@ -403,9 +407,19 @@ pub fn generateTree(
     var sampler = sample.Sampler.init(opts.sampling, opts.seed);
     var stream: engine.Utf8Stream = .{};
 
+    // Gate-checked chunked prefill (see engine.prefill_gate_chunk); only the
+    // final chunk's last-position logits feed the first sample.
     const new = ids.items[model.cached()..];
     if (new.len == 0 or new.len > model.remaining()) return error.ContextFull;
-    try model.step(io, new, logits[0..vocab]);
+    {
+        var off: usize = 0;
+        while (off < new.len) {
+            if (engine.checkpoint(io, opts) == .stop) return 0;
+            const c = @min(engine.prefill_gate_chunk, new.len - off);
+            try model.step(io, new[off..][0..c], logits[0..vocab]);
+            off += c;
+        }
+    }
 
     var n: usize = 0;
     var pending = sampler.next(logits[0..vocab], ids.items);
@@ -413,15 +427,7 @@ pub fn generateTree(
     var node_parents: [max_tree_nodes]u32 = undefined;
     while (true) {
         // Cooperative stop/pause at the token boundary (mirrors engine.zig).
-        if (opts.cancel) |c| if (c.load(.acquire)) break;
-        if (opts.pause) |pg| switch (pg.checkpoint(io, opts.cancel)) {
-            .proceed => {},
-            .canceled => break,
-            .unload => {
-                if (opts.suspended_out) |so| so.* = true;
-                break;
-            },
-        };
+        if (engine.checkpoint(io, opts) == .stop) break;
         if (chat.isStop(pending)) break;
         try ids.append(gpa, pending);
         n += 1;
@@ -761,6 +767,43 @@ test "spec greedy is byte-identical: budget lands mid-acceptance" {
     // fires inside the acceptance loop.
     try runSpecCase(.{ .rule = sumRule, .drafter_kind = .cheat, .max_new = 22 });
     try runSpecCase(.{ .rule = sumRule, .drafter_kind = .cheat, .max_new = 23 });
+}
+
+test "chunked prefill is byte-identical across the gate-chunk boundary" {
+    // A prompt LONGER than engine.prefill_gate_chunk forces the gate-checked
+    // prefill loop (added so pause/cancel can land mid-prefill) to run several
+    // chunks. Incremental chunked stepping must reconstruct the identical KV
+    // history — a dropped / duplicated / reordered token would change
+    // rule(hist) and diverge from vanilla greedy. sumRule folds the WHOLE
+    // history, so any such bug is caught.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const prompt_len = engine.prefill_gate_chunk * 2 + 37; // spans 3 chunks
+    const max_new = 24;
+
+    var prompt: std.ArrayList(u32) = .empty;
+    defer prompt.deinit(gpa);
+    for (0..prompt_len) |i| try prompt.append(gpa, @intCast(i % 90)); // never a stop token
+
+    var expected: std.ArrayList(u32) = .empty;
+    defer expected.deinit(gpa);
+    try ruleRollout(sumRule, gpa, prompt.items, max_new, &expected);
+
+    var model: ToyModel = .{ .gpa = gpa, .capacity = prompt_len + 128, .rule = sumRule };
+    defer model.deinit();
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(gpa);
+    try ids.appendSlice(gpa, prompt.items);
+
+    var drafter: TestDrafter = .{ .rule = sumRule, .wrong = false, .gpa = gpa };
+    defer drafter.deinit();
+    const opts: engine.Options = .{ .max_new_tokens = max_new, .sampling = .{ .temperature = 0 }, .spec_k = 4 };
+    const n = try generate(&model, &drafter, undefined, io, gpa, &ids, opts, null);
+
+    try std.testing.expectEqualSlices(u32, expected.items, ids.items);
+    try std.testing.expectEqual(expected.items.len - prompt_len, n);
+    // The multi-chunk prefill left the cache a consistent prefix of ids.
+    try std.testing.expectEqualSlices(u32, ids.items[0..model.cached()], model.hist.items);
 }
 
 test "spec fills the context window exactly like vanilla" {
