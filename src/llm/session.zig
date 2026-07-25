@@ -16,6 +16,7 @@ const cuda = @import("tp_gpu").cuda;
 const gpu_context = @import("tp_gpu").context;
 const kv_cache = @import("tp_core").kv_cache;
 const chat = @import("chat.zig");
+const engine = @import("engine.zig");
 const tokenizer = @import("tp_core").tokenizer;
 
 // LLM weights are NEVER streamed: every weight pins on first touch
@@ -51,15 +52,29 @@ pub const Stats = struct {
     }
 };
 
+/// Format a generate call's prefill/decode split as ", pp 512 @ 1068.0 tok/s,
+/// tg 600 @ 24.2 tok/s" (leading separator), or "" when the engine reported no
+/// split (the speculative path). Splitting matters: `elapsed / n` charges the
+/// prompt forward and every first-touch device cost to token generation, which
+/// on a short run reads far below the real decode rate.
+pub fn rateSuffix(t: engine.Timing, buf: []u8) []const u8 {
+    var w = std.Io.Writer.fixed(buf);
+    if (t.ppRate()) |pp| w.print(", pp {d} @ {d:.1} tok/s", .{ t.prefill_tokens, pp }) catch return "";
+    if (t.tgRate()) |tg| w.print(", tg {d} @ {d:.1} tok/s", .{ t.decode_tokens, tg }) catch return "";
+    return w.buffered();
+}
+
 /// The per-run timing summary. A one-shot (`--prompt`) run prints tokens +
-/// tok/s + context + VRAM + setup; an interactive session prints just the token
-/// total + setup (elapsed would count the user's typing time between turns, and
-/// each turn already reported its own stats line).
-pub fn printSummary(stdout: *std.Io.Writer, one_shot: bool, n: usize, setup_s: f64, elapsed_s: f64, stats: Stats) !void {
+/// the prefill/decode rate split + context + VRAM + setup; an interactive
+/// session prints just the token total + setup (elapsed would count the user's
+/// typing time between turns, and each turn already reported its own stats
+/// line). `timing` is the engine's split, summed over the run's turns.
+pub fn printSummary(stdout: *std.Io.Writer, one_shot: bool, n: usize, setup_s: f64, elapsed_s: f64, stats: Stats, timing: engine.Timing) !void {
     if (one_shot) {
         var vbuf: [32]u8 = undefined;
-        try stdout.print("\n\n[{d} tokens in {d:.1}s, {d:.2} tok/s; ctx {d}/{d}{s}; setup {d:.1}s]\n", .{
-            n, elapsed_s, @as(f64, @floatFromInt(n)) / elapsed_s, stats.tokens, stats.window, stats.vramSuffix(&vbuf), setup_s,
+        var rbuf: [96]u8 = undefined;
+        try stdout.print("\n\n[{d} tokens in {d:.1}s{s}; ctx {d}/{d}{s}; setup {d:.1}s]\n", .{
+            n, elapsed_s, rateSuffix(timing, &rbuf), stats.tokens, stats.window, stats.vramSuffix(&vbuf), setup_s,
         });
     } else {
         try stdout.print("[session over: {d} tokens generated; setup was {d:.1}s]\n", .{ n, setup_s });
@@ -109,7 +124,13 @@ pub const Devices = struct {
 
 /// Result of a `run`: tokens generated and the timestamp generation began
 /// (`t0`), so the caller can split setup vs. generation time for the summary.
-pub const RunResult = struct { n: usize, t0: i96, stats: Stats = .{ .tokens = 0, .window = 0, .vram = null } };
+pub const RunResult = struct {
+    n: usize,
+    t0: i96,
+    stats: Stats = .{ .tokens = 0, .window = 0, .vram = null },
+    /// The engine's prefill/decode split, summed over the run's turns.
+    timing: engine.Timing = .{},
+};
 
 /// Bring up the CUDA backend for a GPU session: `initLibs` (--backend cuda) or
 /// `init` (--backend zig-cuda), set profiling, and pin every weight resident

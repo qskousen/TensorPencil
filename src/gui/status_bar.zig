@@ -39,8 +39,8 @@ const Ring = struct {
 };
 
 var cpu_meter: sysmon.CpuMeter = .{};
-var nvml: ?sysmon.Nvml = null;
-var nvml_tried: bool = false;
+// NVML now lives in sysmon as a process-wide singleton: the VRAM budget reads the
+// same handle, so the meter and the policy can never disagree about the card.
 
 var h_vram: Ring = .{};
 var h_cpu: Ring = .{};
@@ -88,8 +88,7 @@ var split_smoother: vram_split.Smoother = .{};
 
 /// Release the NVML handle at process exit.
 pub fn deinit() void {
-    if (nvml) |*n| n.close();
-    nvml = null;
+    sysmon.nvmlClose();
 }
 
 /// Take a fresh sample of every meter into `cur` and push the time-series rings.
@@ -98,7 +97,7 @@ fn sampleInto(s: ?*chat.Session, diff_busy: bool, diff: diffuser.VramBreakdown) 
     var n: Sample = .{};
     n.cpu = cpu_meter.sample();
     n.cpu_mhz = sysmon.cpuFreqMhz();
-    if (nvml) |*nv| {
+    if (sysmon.nvml()) |nv| {
         if (nv.query()) |g| {
             n.gpu_util = @floatFromInt(g.util);
             n.gpu_mhz = g.clock_mhz;
@@ -146,10 +145,7 @@ fn sampleInto(s: ?*chat.Session, diff_busy: bool, diff: diffuser.VramBreakdown) 
 /// still shows CPU/GPU/total VRAM). `diff_busy`/`diff_used` come from the
 /// app-level diffusion engine.
 pub fn render(s: ?*chat.Session, diff_busy: bool, diff: diffuser.VramBreakdown, split: *f32, limit: *f32, llm_armed: bool, diff_armed: bool, llm_paused: bool, diff_paused: bool, acts: meter.Actions) void {
-    if (!nvml_tried) {
-        nvml = sysmon.Nvml.open();
-        nvml_tried = true;
-    }
+    _ = sysmon.nvml(); // opens on first use
 
     const theme = dvui.themeGet();
     var bar = dvui.box(@src(), .{ .dir = .horizontal }, .{

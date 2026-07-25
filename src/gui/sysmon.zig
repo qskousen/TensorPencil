@@ -125,6 +125,27 @@ fn scanProcs(comptime T: type, list: []const T, pid: u32) ListHit {
 /// Optional NVML handle for GPU utilization + VRAM. `open()` returns null when
 /// the NVML library or a required symbol is missing (no NVIDIA driver, or a
 /// headless/container run) — the status bar then shows the GPU meter as n/a.
+/// Process-wide lazy NVML handle. Shared rather than opened per consumer so the
+/// status bar and the VRAM budget read the SAME driver in the same pass — two
+/// handles could disagree, and the whole point of the per-process split is that
+/// its terms are coherent with each other.
+var g_nvml: ?Nvml = null;
+var g_nvml_tried: bool = false;
+
+pub fn nvml() ?*Nvml {
+    if (!g_nvml_tried) {
+        g_nvml = Nvml.open();
+        g_nvml_tried = true;
+    }
+    return if (g_nvml) |*n| n else null;
+}
+
+/// Release the shared handle at process exit.
+pub fn nvmlClose() void {
+    if (g_nvml) |*n| n.close();
+    g_nvml = null;
+}
+
 pub const Nvml = struct {
     lib: std.DynLib,
     dev: NvmlDevice,

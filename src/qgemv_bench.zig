@@ -29,10 +29,13 @@ const shapes = [_]Shape{
     .{ .rows = 4096, .cols = 4096, .name = "4096 x 4096   (attn o_proj)" },
     .{ .rows = 11008, .cols = 4096, .name = "11008 x 4096  (mlp gate/up)" },
     .{ .rows = 4096, .cols = 11008, .name = "4096 x 11008  (mlp down)" },
+    // gemma4 31B (hidden 5376, ffn 21504) — the prefill shapes that matter here.
+    .{ .rows = 21504, .cols = 5376, .name = "21504 x 5376  (g4 mlp gate/up)" },
+    .{ .rows = 5376, .cols = 21504, .name = "5376 x 21504  (g4 mlp down)" },
 };
 // n=1 is decode; 2-8 is a chain/tree verify batch; 16-64 spans into
 // prefill-chunk territory where the GEMM is expected to win.
-const batches = [_]usize{ 1, 2, 4, 8, 16, 32, 48, 64, 128 };
+const batches = [_]usize{ 1, 8, 32, 128, 256 };
 
 const Kind = struct { dt: tp.DType, g: c.enum_ggml_type, name: []const u8 };
 // All block-quants now have grouped dp4a kernels.
@@ -77,16 +80,16 @@ pub fn main(init: std.process.Init) !void {
         const rows = sh.rows;
         const cols = sh.cols;
         p("\n=== {s} ===\n", .{sh.name});
-        p("  {s:<5} {s:>4}  {s:>11} {s:>10} {s:>10}  {s:>8}  {s:>10}\n", .{ "dt", "n", "grouped ms", "quant ms", "gemm ms", "speedup", "gemv GB/s" });
+        p("  {s:<5} {s:>4} {s:>9} {s:>9}  {s:>8} {s:>8}  {s:>8} {s:>9}  {s:>8}\n", .{ "dt", "n", "dequant", "f16 gemm", "deq+gemm", "mmq v1", "pipe ms", "pipe rel", "pipe spd" });
 
         const wf = try gpa.alloc(f32, rows * cols);
+        defer gpa.free(wf);
         for (wf) |*v| v.* = rnd.floatNorm(f32) * 0.1;
 
         for (kinds) |k| {
             const row_b: usize = @intCast(c.ggml_row_size(k.g, @intCast(cols)));
             const q = try gpa.alloc(u8, rows * row_b);
             _ = c.ggml_quantize_chunk(k.g, wf.ptr, q.ptr, 0, @intCast(rows), @intCast(cols), null);
-            const w_bytes = rows * row_b;
 
             for (batches) |n| {
                 const x_d = try be.tensorCreate(n * cols * 4);
@@ -107,14 +110,68 @@ pub fn main(init: std.process.Init) !void {
                 const grouped_ms = be.prof.ms[@intFromEnum(Cat.matmul)] / iters;
                 const quant_ms = be.prof.ms[@intFromEnum(Cat.elt)] / iters;
 
+                // MMQ (q4_k only for now): correctness vs the dequant+GEMM path,
+                // then timing. Not bit-exact — the activations go through int8 —
+                // so compare with a relative-error bound over the whole output.
+                var mmq_ms: f64 = 0;
+                var mmq_rel: f64 = -1;
+                var pipe_ms: f64 = 0;
+                var pipe_rel: f64 = -1;
+                var den: f64 = 0;
+                if (Backend.mmqPipeSupported(k.dt, rows, cols)) {
+                    be.opMatmulQuant(k.dt, y_d, x_d, n, q, rows, cols) catch @panic("gemm");
+                    const ref = try gpa.alloc(f32, n * rows);
+                    defer gpa.free(ref);
+                    try be.tensorDownload(y_d, std.mem.sliceAsBytes(ref));
+                    if (Backend.mmqSupported(k.dt, rows, cols)) be.opMatmulQuantMmq(k.dt, y_d, x_d, n, q, rows, cols) catch @panic("mmq");
+                    const got = try gpa.alloc(f32, n * rows);
+                    defer gpa.free(got);
+                    try be.tensorDownload(y_d, std.mem.sliceAsBytes(got));
+                    var num: f64 = 0;
+                    den = 0;
+                    for (ref, got) |r, g| {
+                        num += @abs(@as(f64, r) - @as(f64, g));
+                        den += @abs(@as(f64, r));
+                    }
+                    mmq_rel = if (den > 0) num / den else 0;
+
+                    if (Backend.mmqSupported(k.dt, rows, cols)) {
+                        for (0..warmup) |_| be.opMatmulQuantMmq(k.dt, y_d, x_d, n, q, rows, cols) catch @panic("mmq");
+                        be.prof.reset();
+                        for (0..iters) |_| be.opMatmulQuantMmq(k.dt, y_d, x_d, n, q, rows, cols) catch @panic("mmq");
+                        mmq_ms = (be.prof.ms[@intFromEnum(Cat.matmul)] + be.prof.ms[@intFromEnum(Cat.elt)]) / iters;
+                    }
+
+                    // Pipe-tiled MMQ (128x128, MT=4/NT=8) — needs rows % 128 == 0.
+                    if (rows % Backend.mmq_pipe_tile == 0) {
+                        be.opMatmulQuantMmqPipe(k.dt, y_d, x_d, n, q, rows, cols) catch @panic("mmqpipe");
+                        const got2 = try gpa.alloc(f32, n * rows);
+                        defer gpa.free(got2);
+                        try be.tensorDownload(y_d, std.mem.sliceAsBytes(got2));
+                        var num2: f64 = 0;
+                        for (ref, got2) |r, g| num2 += @abs(@as(f64, r) - @as(f64, g));
+                        pipe_rel = if (den > 0) num2 / den else 0;
+
+                        for (0..warmup) |_| be.opMatmulQuantMmqPipe(k.dt, y_d, x_d, n, q, rows, cols) catch @panic("mmqpipe");
+                        be.prof.reset();
+                        for (0..iters) |_| be.opMatmulQuantMmqPipe(k.dt, y_d, x_d, n, q, rows, cols) catch @panic("mmqpipe");
+                        pipe_ms = (be.prof.ms[@intFromEnum(Cat.matmul)] + be.prof.ms[@intFromEnum(Cat.elt)]) / iters;
+                    }
+                }
+
                 be.prof.reset();
                 for (0..iters) |_| be.opMatmulQuant(k.dt, y_d, x_d, n, q, rows, cols) catch @panic("gemm");
-                const gemm_ms = be.prof.ms[@intFromEnum(Cat.matmul)] / iters;
+                // opMatmulQuant now charges the weight expansion to .dequant and
+                // the activation convert + tensor-core GEMM to .matmul, so the
+                // two halves of the m>1 fallback are separable.
+                const deq_ms = be.prof.ms[@intFromEnum(Cat.dequant)] / iters;
+                const mm_ms = be.prof.ms[@intFromEnum(Cat.matmul)] / iters;
+                const gemm_ms = deq_ms + mm_ms;
 
-                const passes = (n + 7) / 8;
-                const gbs = @as(f64, @floatFromInt(w_bytes * passes)) / (grouped_ms * 1e6);
-                const speedup = gemm_ms / grouped_ms;
-                p("  {s:<5} {d:>4}  {d:>11.4} {d:>10.4} {d:>10.4}  {d:>7.2}x  {d:>10.1}\n", .{ k.name, n, grouped_ms, quant_ms, gemm_ms, speedup, gbs });
+                _ = grouped_ms;
+                _ = quant_ms;
+                const pipe_spd = if (pipe_ms > 0) gemm_ms / pipe_ms else 0;
+                p("  {s:<5} {d:>4} {d:>9.4} {d:>9.4}  {d:>8.4} {d:>8.4}  {d:>8.4} {d:>9.5}  {d:>7.2}x  (v1 rel {d:.5})\n", .{ k.name, n, deq_ms, mm_ms, gemm_ms, mmq_ms, pipe_ms, pipe_rel, pipe_spd, mmq_rel });
 
                 var xd = x_d;
                 var yd = y_d;

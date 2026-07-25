@@ -24,6 +24,9 @@ pub const embed = @import("embed.zig");
 pub const sampler = @import("tp_core").sampler;
 pub const pipeline = @import("pipeline.zig");
 pub const vram = @import("tp_runtime").vram;
+/// CPU<->GPU layer-offload scheduling (shared by the CLI and the GUI, so the
+/// residency rules are defined once — see `vram.resolve`).
+pub const residency = @import("tp_runtime").residency;
 pub const gpu = @import("tp_gpu");
 pub const llm = @import("tp_models").llm;
 pub const prof = @import("tp_core").prof;

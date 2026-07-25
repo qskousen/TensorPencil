@@ -64,7 +64,54 @@ pub const Options = struct {
     /// on the worker's OWN (context-bound) thread instead of raced from the
     /// arbiter thread. null on the CLI / studio (no coordinator).
     residency_poll: ?ResidencyPoll = null,
+    /// When set, `generate` records its prefill-vs-decode wall-clock split here.
+    timing: ?*Timing = null,
 };
+
+/// Wall-clock split of one `generate` call. A caller that times the whole call
+/// and divides by the token count conflates prompt processing with token
+/// generation: `generate` prefills the uncached prompt prefix ITSELF, so that
+/// forward pass (plus any first-touch device work it triggers — kernel JIT,
+/// cuDNN/cuBLASLt plan construction, clock ramp) lands inside the measurement
+/// and drags the reported rate down, badly so on a short run. Keep the two
+/// apart to report llama.cpp-comparable `pp` (prompt) and `tg` (generation)
+/// throughputs.
+///
+/// `decode_tokens` counts the decode-loop forwards, which is one fewer than the
+/// tokens returned by `generate`: the last prefill chunk's logits produce the
+/// first token. Left all-zero by the speculative-decoding path, which has no
+/// one-forward-per-token loop to attribute.
+pub const Timing = struct {
+    prefill_tokens: usize = 0,
+    prefill_ns: u64 = 0,
+    decode_tokens: usize = 0,
+    decode_ns: u64 = 0,
+
+    /// Tokens/second over the prompt forward, or null if nothing was prefilled.
+    pub fn ppRate(self: Timing) ?f64 {
+        if (self.prefill_tokens == 0 or self.prefill_ns == 0) return null;
+        return @as(f64, @floatFromInt(self.prefill_tokens)) / (@as(f64, @floatFromInt(self.prefill_ns)) / 1e9);
+    }
+
+    /// Tokens/second over the decode loop, or null if it never ran.
+    pub fn tgRate(self: Timing) ?f64 {
+        if (self.decode_tokens == 0 or self.decode_ns == 0) return null;
+        return @as(f64, @floatFromInt(self.decode_tokens)) / (@as(f64, @floatFromInt(self.decode_ns)) / 1e9);
+    }
+
+    /// Accumulate another call's split (multi-turn sessions sum their turns).
+    pub fn add(self: *Timing, other: Timing) void {
+        self.prefill_tokens += other.prefill_tokens;
+        self.prefill_ns += other.prefill_ns;
+        self.decode_tokens += other.decode_tokens;
+        self.decode_ns += other.decode_ns;
+    }
+};
+
+/// Monotonic-ish wall clock in nanoseconds, for the Timing split.
+fn nowNs(io: std.Io) i96 {
+    return std.Io.Clock.real.now(io).nanoseconds;
+}
 
 /// A `residency_poll`: `apply(ctx)` enacts any pending residency target on the
 /// calling (worker) thread. Typically `ctx` is a session and `apply` is a thunk
@@ -222,6 +269,7 @@ pub fn generate(
     try ensureRoom(model, new.len);
     // Gate-checked chunked prefill (see prefill_gate_chunk): pause/cancel can now
     // land mid-prefill. Only the final chunk's logits feed the first sample.
+    const t_pre = nowNs(io);
     {
         var off: usize = 0;
         while (off < new.len) {
@@ -231,6 +279,16 @@ pub fn generate(
             off += c;
         }
     }
+    const t_dec = nowNs(io);
+    var steps: usize = 0;
+    defer if (opts.timing) |t| {
+        t.* = .{
+            .prefill_tokens = new.len,
+            .prefill_ns = @intCast(t_dec - t_pre),
+            .decode_tokens = steps,
+            .decode_ns = @intCast(nowNs(io) - t_dec),
+        };
+    };
     var n: usize = 0;
     while (n < opts.max_new_tokens) {
         if (checkpoint(io, opts) == .stop) break;
@@ -256,6 +314,7 @@ pub fn generate(
             };
         }
         try model.step(io, &.{next}, logits);
+        steps += 1;
     }
     return n;
 }
@@ -309,6 +368,7 @@ fn generateGreedyArgmax(
     // Penalties are over the fixed prompt `ids`, so collect them once.
     const pen = sample.collectPenalties(ids.items, opts.sampling, &pen_buf);
     var next: u32 = undefined;
+    const t_pre = nowNs(io);
     {
         var off: usize = 0;
         while (off < new.len) {
@@ -318,6 +378,16 @@ fn generateGreedyArgmax(
             off += c;
         }
     }
+    const t_dec = nowNs(io);
+    var steps: usize = 0;
+    defer if (opts.timing) |t| {
+        t.* = .{
+            .prefill_tokens = new.len,
+            .prefill_ns = @intCast(t_dec - t_pre),
+            .decode_tokens = steps,
+            .decode_ns = @intCast(nowNs(io) - t_dec),
+        };
+    };
     var n: usize = 0;
     while (n < opts.max_new_tokens) {
         if (checkpoint(io, opts) == .stop) break;
@@ -338,6 +408,7 @@ fn generateGreedyArgmax(
             };
         }
         next = try stepArgmaxOf(model, io, &.{next}, sample.collectPenalties(ids.items, opts.sampling, &pen_buf), opts.sampling);
+        steps += 1;
     }
     return n;
 }
@@ -376,6 +447,7 @@ fn generateGpuSample(
     // sample. Penalties are over the fixed prompt `ids`, so collect them once.
     const pen = sample.collectPenalties(ids.items, opts.sampling, &pen_buf);
     var count: usize = undefined;
+    const t_pre = nowNs(io);
     {
         var off: usize = 0;
         while (off < new.len) {
@@ -385,6 +457,16 @@ fn generateGpuSample(
             off += c;
         }
     }
+    const t_dec = nowNs(io);
+    var steps: usize = 0;
+    defer if (opts.timing) |t| {
+        t.* = .{
+            .prefill_tokens = new.len,
+            .prefill_ns = @intCast(t_dec - t_pre),
+            .decode_tokens = steps,
+            .decode_ns = @intCast(nowNs(io) - t_dec),
+        };
+    };
     var n: usize = 0;
     while (n < opts.max_new_tokens) {
         if (checkpoint(io, opts) == .stop) break;
@@ -407,6 +489,7 @@ fn generateGpuSample(
             };
         }
         count = try stepSelectOf(model, io, &.{next}, sample.collectPenalties(ids.items, opts.sampling, &pen_buf), opts.sampling, out_id, out_logit);
+        steps += 1;
     }
     return n;
 }

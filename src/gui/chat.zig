@@ -980,6 +980,20 @@ pub const Session = struct {
             inline else => |*a| residency.demand(&a.model),
         };
     }
+
+    /// Itemized predicted vs actual residency. Reported rather than merely
+    /// summed so a prediction that disagrees with reality is visible instead of
+    /// silently becoming a too-low residency ceiling.
+    pub fn residencyNeed(self: *Session) vram.Bytes {
+        return switch (self.arch) {
+            inline else => |*a| residency.need(&a.model),
+        };
+    }
+    pub fn residencyHave(self: *Session) vram.Bytes {
+        return switch (self.arch) {
+            inline else => |*a| residency.measured(&a.model),
+        };
+    }
     fn vpFloor(ctx: *anyopaque) u64 {
         return fromCtx(ctx).ctxKvBytes(); // committed KV can't be evicted
     }

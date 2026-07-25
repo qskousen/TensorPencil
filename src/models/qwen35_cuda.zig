@@ -686,11 +686,23 @@ pub const CudaLM = struct {
         return residency.offloadToBudget(self, target);
     }
 
-    /// Bring layer `l` back onto the GPU, preserving its accumulated state
-    /// (reverse of migrateLayer): attention layers re-create the device K/V at the
-    /// current capacity and upload the host rows [0,len); linear layers re-upload
-    /// their conv/ssm state into the shared device buffers. Weights re-cache
-    /// lazily on the next GPU forward.
+    /// `residency.demand` hook: this layer's weight bytes alone (no KV). Lets the
+    /// demand estimate separate "weights not uploaded yet" — which the backend's
+    /// pinned-bytes counter already accounts for globally — from the device KV a
+    /// promote has to re-create.
+    pub fn layerWeightBytes(self: *CudaLM, l: usize) usize {
+        return layerDeviceBytes(&self.lm.layers[l]);
+    }
+
+    /// `residency.demand` hook: device-resident weights that are not per-layer.
+    /// A tied head/embedding is ONE cached device buffer (the weight cache keys
+    /// on the byte slice), so count it once.
+    pub fn nonLayerDeviceBytes(self: *CudaLM) u64 {
+        const h = self.lm.head.bytes;
+        const e = self.lm.embed.bytes;
+        return h.len + if (e.ptr == h.ptr) 0 else e.len;
+    }
+
     /// `residency.promoteBack` cost hook: VRAM a promote of layer `l` needs — its
     /// streamable weights, the KV it re-commits at capacity (attention layers
     /// only; recurrent layers hold fixed-size conv/ssm state, no KV), plus slack.
@@ -699,6 +711,11 @@ pub const CudaLM = struct {
         return layerDeviceBytes(&self.lm.layers[l]) + kv_cost + residency.promote_slack;
     }
 
+    /// Bring layer `l` back onto the GPU, preserving its accumulated state
+    /// (reverse of migrateLayer): attention layers re-create the device K/V at the
+    /// current capacity and upload the host rows [0,len); linear layers re-upload
+    /// their conv/ssm state into the shared device buffers. Weights re-cache
+    /// lazily on the next GPU forward.
     pub fn promoteLayer(self: *CudaLM, l: usize) !void {
         const cfg = self.cfg;
         const sp = &self.split.?;

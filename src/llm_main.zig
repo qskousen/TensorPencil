@@ -13,6 +13,7 @@ const vips = @import("vips");
 const qwen3 = TensorPencil.models.qwen3;
 const qwen3_cuda = TensorPencil.models.qwen3_cuda;
 const llm = TensorPencil.llm;
+const residency = TensorPencil.residency;
 
 /// libc getenv (std.posix.getenv is gone in 0.16; we link libc). Used for the
 /// TP_VIT_DUMP debug hook.
@@ -522,7 +523,7 @@ fn runQwen3(
 
     const setup_s = @as(f64, @floatFromInt(res.t0 - t_init)) / 1e9;
     const elapsed_s = @as(f64, @floatFromInt(Io.Clock.real.now(io).nanoseconds - res.t0)) / 1e9;
-    try llm.session.printSummary(stdout, prompt != null, res.n, setup_s, elapsed_s, res.stats);
+    try llm.session.printSummary(stdout, prompt != null, res.n, setup_s, elapsed_s, res.stats, res.timing);
     if (opts.spec_k > 0 or opts.tree_nodes > 0) {
         const pct = if (spec_stats.drafted > 0)
             100.0 * @as(f64, @floatFromInt(spec_stats.accepted)) / @as(f64, @floatFromInt(spec_stats.drafted))
@@ -875,6 +876,8 @@ fn renderDrivenChat(
     opts: llm.engine.Options,
     stdout: *Io.Writer,
     img_chat: ?ImageChat,
+    /// Accumulates each turn's prefill/decode split (see engine.Timing).
+    timing: *llm.engine.Timing,
 ) !usize {
     const M = childType(@TypeOf(model));
     const ct = &llm.chat_template.active.?;
@@ -1024,6 +1027,8 @@ fn renderDrivenChat(
 
         const t0 = Io.Clock.real.now(io).nanoseconds;
         turn_opts.seed = seeds.next();
+        var turn_timing: llm.engine.Timing = .{};
+        turn_opts.timing = &turn_timing;
         const gen_start = desired.items.len;
         const n = llm.engine.generate(model, tok, io, gpa, &desired, turn_opts, stdout) catch |err| switch (err) {
             error.ContextFull => {
@@ -1034,6 +1039,7 @@ fn renderDrivenChat(
             else => return err,
         };
 
+        timing.add(turn_timing);
         committed.clearRetainingCapacity();
         try committed.appendSlice(gpa, desired.items);
         // Store the assistant reply RAW (thought included) — strip_thinking
@@ -1045,8 +1051,9 @@ fn renderDrivenChat(
         const st = llm.session.Stats.of(model);
         const dt = @as(f64, @floatFromInt(Io.Clock.real.now(io).nanoseconds - t0)) / 1e9;
         var vbuf: [32]u8 = undefined;
-        try stdout.print("\n[{d} tok, {d:.1} tok/s, ctx {d}/{d}{s}]\n", .{
-            n, if (dt > 0) @as(f64, @floatFromInt(n)) / dt else 0, st.tokens, st.window, st.vramSuffix(&vbuf),
+        var rbuf: [96]u8 = undefined;
+        try stdout.print("\n[{d} tok in {d:.1}s{s}, ctx {d}/{d}{s}]\n", .{
+            n, dt, llm.session.rateSuffix(turn_timing, &rbuf), st.tokens, st.window, st.vramSuffix(&vbuf),
         });
         try stdout.flush();
     }
@@ -1069,6 +1076,9 @@ fn runSession(
     stdout: *Io.Writer,
     prompt: ?[]const u8,
     img_chat: ?ImageChat,
+    /// Accumulates every turn's prefill/decode split (see engine.Timing), so
+    /// the summary can report pp/tg rates instead of one conflated tok/s.
+    timing: *llm.engine.Timing,
 ) !usize {
     // opts.seed is the session's BASE seed (clock or --seed); every turn
     // samples with a fresh seed drawn from this sequence so two turns (or a
@@ -1079,6 +1089,7 @@ fn runSession(
 
     if (prompt != null) {
         turn_opts.seed = seeds.next();
+        turn_opts.timing = timing;
         return doGenerate(model, drafter, tok, io, gpa, ids, turn_opts, stdout);
     }
 
@@ -1092,7 +1103,7 @@ fn runSession(
         const drafter_null = @typeInfo(@TypeOf(drafter)) == .null;
         if (comptime drafter_null and @hasDecl(M, "resetCache") and @hasDecl(M, "prefill") and @hasDecl(M, "ensureCapacity")) {
             if (llm.chat_template.active != null)
-                return renderDrivenChat(model, tok, io, gpa, opts, stdout, img_chat);
+                return renderDrivenChat(model, tok, io, gpa, opts, stdout, img_chat, timing);
         }
     }
 
@@ -1138,6 +1149,8 @@ fn runSession(
         }
         const t0 = Io.Clock.real.now(io).nanoseconds;
         turn_opts.seed = seeds.next();
+        var turn_timing: llm.engine.Timing = .{};
+        turn_opts.timing = &turn_timing;
         const n = doGenerate(model, drafter, tok, io, gpa, ids, turn_opts, stdout) catch |err| switch (err) {
             error.ContextFull => {
                 try stdout.writeAll("\n[context window full]\n");
@@ -1146,6 +1159,7 @@ fn runSession(
             },
             else => return err,
         };
+        timing.add(turn_timing);
         try llm.chat.closeAssistant(gpa, ids);
         total += n;
 
@@ -1156,8 +1170,9 @@ fn runSession(
         const window = st.window;
         const dt = @as(f64, @floatFromInt(Io.Clock.real.now(io).nanoseconds - t0)) / 1e9;
         var vbuf: [32]u8 = undefined;
-        try stdout.print("\n[{d} tok, {d:.1} tok/s, ctx {d}/{d}{s}]\n", .{
-            n, @as(f64, @floatFromInt(n)) / dt, st.tokens, window, st.vramSuffix(&vbuf),
+        var rbuf: [96]u8 = undefined;
+        try stdout.print("\n[{d} tok in {d:.1}s{s}, ctx {d}/{d}{s}]\n", .{
+            n, dt, llm.session.rateSuffix(turn_timing, &rbuf), st.tokens, window, st.vramSuffix(&vbuf),
         });
         try stdout.flush();
         if (model.cached() >= window) {
@@ -1184,8 +1199,9 @@ const SimpleDriver = struct {
     img_chat: ?ImageChat,
     pub fn drive(self: SimpleDriver, model: anytype) !llm.session.RunResult {
         const t0 = Io.Clock.real.now(self.io).nanoseconds;
-        const n = try runSession(model, null, self.tok, self.io, self.gpa, self.ids, self.opts, self.stdout, self.prompt, self.img_chat);
-        return .{ .n = n, .t0 = t0, .stats = llm.session.Stats.of(model) };
+        var timing: llm.engine.Timing = .{};
+        const n = try runSession(model, null, self.tok, self.io, self.gpa, self.ids, self.opts, self.stdout, self.prompt, self.img_chat, &timing);
+        return .{ .n = n, .t0 = t0, .stats = llm.session.Stats.of(model), .timing = timing };
     }
 };
 
@@ -1215,7 +1231,11 @@ const Qwen35Driver = struct {
                 // layers first, recovering the most VRAM per migration).
                 const pol = self.cpu_split orelse .attn;
                 model.io = self.io; // host layers may prefill before the first step
-                try model.enableCpuSplit(pol, self.vram_budget, self.dynamic_offload);
+                // Through the shared resolver, so --vram-budget means the same
+                // thing here as the GUI meter's limit handle and gets the same
+                // physical-reserve clamp (see residency.resolveBudget).
+                const budget = residency.resolveBudget(model, self.vram_budget);
+                try model.enableCpuSplit(pol, budget, self.dynamic_offload);
                 if (model.split) |sp| {
                     const mode = if (sp.dynamic) "offload-grow" else "cpu-layers";
                     try self.stdout.print("[--{s} {s}: {d}/{d} layers on CPU at start, {d} on GPU]\n", .{ mode, @tagName(sp.policy), sp.n_cpu, self.n_layers, self.n_layers - sp.n_cpu });
@@ -1227,8 +1247,9 @@ const Qwen35Driver = struct {
         }
         // t0 after the (setup) cpu-split migration, so it counts as setup not generation.
         const t0 = Io.Clock.real.now(self.io).nanoseconds;
-        const n = try runSession(model, null, self.tok, self.io, self.gpa, self.ids, self.opts, self.stdout, self.prompt, self.img_chat);
-        return .{ .n = n, .t0 = t0, .stats = llm.session.Stats.of(model) };
+        var timing: llm.engine.Timing = .{};
+        const n = try runSession(model, null, self.tok, self.io, self.gpa, self.ids, self.opts, self.stdout, self.prompt, self.img_chat, &timing);
+        return .{ .n = n, .t0 = t0, .stats = llm.session.Stats.of(model), .timing = timing };
     }
 };
 
@@ -1284,8 +1305,9 @@ const Qwen3Driver = struct {
     // setup work is not attributed to generation time.
     fn gen(self: Qwen3Driver, model: anytype, drafter: anytype) !llm.session.RunResult {
         const t0 = Io.Clock.real.now(self.io).nanoseconds;
-        const n = try runSession(model, drafter, self.tok, self.io, self.gpa, self.ids, self.opts, self.stdout, self.prompt, null);
-        return .{ .n = n, .t0 = t0, .stats = llm.session.Stats.of(model) };
+        var timing: llm.engine.Timing = .{};
+        const n = try runSession(model, drafter, self.tok, self.io, self.gpa, self.ids, self.opts, self.stdout, self.prompt, null, &timing);
+        return .{ .n = n, .t0 = t0, .stats = llm.session.Stats.of(model), .timing = timing };
     }
 
     pub fn drive(self: Qwen3Driver, model: anytype) !llm.session.RunResult {
@@ -1299,7 +1321,9 @@ const Qwen3Driver = struct {
                     .attn => .attn,
                 };
                 model.io = self.io; // host layers may prefill before the first step
-                try model.enableCpuSplit(pol, self.vram_budget, self.dynamic_offload);
+                // Shared resolver, same as the qwen35 runner above.
+                const budget = residency.resolveBudget(model, self.vram_budget);
+                try model.enableCpuSplit(pol, budget, self.dynamic_offload);
                 if (model.split) |sp| {
                     const mode = if (sp.dynamic) "offload-grow" else "cpu-layers";
                     try self.stdout.print("[--{s} {s}: {d}/{d} layers on CPU at start, {d} on GPU]\n", .{ mode, @tagName(sp.policy), sp.n_cpu, model.cfg.n_layers, model.cfg.n_layers - sp.n_cpu });
@@ -1607,7 +1631,7 @@ fn runQwen35(
     }
     const setup_s = @as(f64, @floatFromInt(res.t0 - t_init)) / 1e9;
     const elapsed_s = @as(f64, @floatFromInt(Io.Clock.real.now(io).nanoseconds - res.t0)) / 1e9;
-    try llm.session.printSummary(stdout, prompt != null, res.n, setup_s, elapsed_s, res.stats);
+    try llm.session.printSummary(stdout, prompt != null, res.n, setup_s, elapsed_s, res.stats, res.timing);
     try stdout.flush();
 }
 
@@ -1765,7 +1789,7 @@ fn runGemma3(
     const res = try llm.session.run(Spec, dev, backend, &lm, ids.items.len, prefiller, driver, io, gpa, cap, stdout);
     const setup_s = @as(f64, @floatFromInt(res.t0 - t_init)) / 1e9;
     const elapsed_s = @as(f64, @floatFromInt(Io.Clock.real.now(io).nanoseconds - res.t0)) / 1e9;
-    try llm.session.printSummary(stdout, prompt != null, res.n, setup_s, elapsed_s, res.stats);
+    try llm.session.printSummary(stdout, prompt != null, res.n, setup_s, elapsed_s, res.stats, res.timing);
     try stdout.flush();
 }
 
@@ -1967,9 +1991,15 @@ fn runGemma4(
     const t_init = Io.Clock.real.now(io).nanoseconds;
     // gemma4 ignores --vram-budget (it always pins the whole model), so pass 0.
     const res = try llm.session.run(Spec, dev, backend, &lm, ids.items.len, prefiller, driver, io, gpa, cap, stdout);
+    // On a CUDA backend the device breakdown is the useful one; the `defer`
+    // above only covers the CPU profiler (which stays empty on cuda/zig-cuda).
+    if (profile) if (be_cuda) |be| {
+        llm.session.printCudaProfile(stdout, be) catch {};
+        stdout.flush() catch {};
+    };
     const setup_s = @as(f64, @floatFromInt(res.t0 - t_init)) / 1e9;
     const elapsed_s = @as(f64, @floatFromInt(Io.Clock.real.now(io).nanoseconds - res.t0)) / 1e9;
-    try llm.session.printSummary(stdout, prompt != null, res.n, setup_s, elapsed_s, res.stats);
+    try llm.session.printSummary(stdout, prompt != null, res.n, setup_s, elapsed_s, res.stats, res.timing);
     try stdout.flush();
 }
 

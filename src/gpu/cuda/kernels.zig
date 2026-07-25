@@ -3177,3 +3177,1183 @@ pub const f32gemm_ptx: [:0]const u8 =
     \\    ret;
     \\}
 ;
+
+
+
+// ---------------------------------------------------------------------------
+// MMQ — q4_k weight x q8_1 activation on the s8 tensor cores, with the
+// dequantized weight NEVER materialized in global memory.
+//
+// The m>1 fallback (`opMatmulQuant`) expands the whole weight matrix to f16 in
+// global memory and then runs an f16 GEMM, so a prefill that steps the model in
+// chunks re-expands every weight once per chunk. Measured on gemma4 31B Q4_K_M:
+// that expansion alone is ~23% of prefill wall time, and the GEMM it feeds then
+// re-reads the result at 16 bits/elem instead of q4_k's 4.5.
+//
+// MMQ feeds `mma.m16n8k32.s8` straight from the packed nibbles. A k-quant's
+// scale changes every 32 elements, so the integer accumulator can only run for
+// ONE 32-elem sub-block before it must be folded into f32: the loop is one mma
+// per sub-block followed by a scaled accumulate (the same shape as llama.cpp's
+// mma mmq).
+//
+//   v = d*sc*q - dmin*m            (q4_k; sc/m per 32-elem sub-block)
+//   Σ_k v_k·a_k = d*sc*da*Σ(q·qa) - dmin*m*da*Σ(qa)
+//
+// The first term is the mma's s32 output; the second needs Σ(qa) per activation
+// block, which `quantize_q8_1` stores in its trailing `s` region.
+//
+// Tiling: one warp owns 16 rows x nt*8 tokens and holds nt*4 f32 accumulators.
+// The weight fragments are loaded once per k-step and reused across all nt
+// column tiles, so the weight is read once per row-tile per nt*8 tokens. nt*8
+// must be >= 128 to beat the f16 path's traffic: at nt=16 a 256-token chunk
+// reads the weight twice (~35 GB for this model) versus the f16 path's expand
+// + re-read (~122 GB).
+//
+// Only the ACTIVATION scales go through shared memory. Reading them straight
+// from global would cost 4 scalar loads per mma (they are indexed by both the
+// column and the sub-block, so nothing hoists); staged per super-block by the
+// whole block they cost 8 vector-ish loads per 8 mmas instead.
+//
+// Requires cols % 256 == 0 and rows % (16*warps) == 0. `n` is free — the column
+// tiles are predicated. Entry `mmq_q4_k`.
+// ---------------------------------------------------------------------------
+
+/// Emit the q4_k sub-block scale/min decode for a COMPILE-TIME sub-block index
+/// `is` (0..7), mirroring ggml's `get_scale_min_k4`. At comptime the reference
+/// implementation's data-dependent branch and variable shifts fold into
+/// immediates. `s1/s2/s3` hold header bytes 4..7, 8..11, 12..15; `t` is scratch.
+fn q4kScaleMin(
+    b: *ptx.Builder,
+    is: usize,
+    s1: []const u8,
+    s2: []const u8,
+    s3: []const u8,
+    sc: []const u8,
+    mn: []const u8,
+    t: []const u8,
+) !void {
+    if (is < 4) {
+        const sh = is * 8;
+        try b.linef("shr.u32 {s}, {s}, {d};", .{ sc, s1, sh });
+        try b.linef("and.b32 {s}, {s}, 63;", .{ sc, sc });
+        try b.linef("shr.u32 {s}, {s}, {d};", .{ mn, s2, sh });
+        try b.linef("and.b32 {s}, {s}, 63;", .{ mn, mn });
+    } else {
+        // sc = (scales[is+4] & 0xF) | ((scales[is-4] >> 6) << 4)
+        // mn = (scales[is+4] >>  4) | ((scales[is]   >> 6) << 4)
+        const sh = (is - 4) * 8;
+        try b.linef("shr.u32 {s}, {s}, {d};", .{ t, s3, sh });
+        try b.linef("and.b32 {s}, {s}, 15;", .{ sc, t });
+        try b.linef("shr.u32 {s}, {s}, 4;", .{ mn, t });
+        try b.linef("and.b32 {s}, {s}, 15;", .{ mn, mn });
+        try b.linef("shr.u32 {s}, {s}, {d};", .{ t, s1, sh });
+        try b.linef("shr.u32 {s}, {s}, 6;", .{ t, t });
+        try b.linef("and.b32 {s}, {s}, 3;", .{ t, t });
+        try b.linef("shl.b32 {s}, {s}, 4;", .{ t, t });
+        try b.linef("or.b32 {s}, {s}, {s};", .{ sc, sc, t });
+        try b.linef("shr.u32 {s}, {s}, {d};", .{ t, s2, sh });
+        try b.linef("shr.u32 {s}, {s}, 6;", .{ t, t });
+        try b.linef("and.b32 {s}, {s}, 3;", .{ t, t });
+        try b.linef("shl.b32 {s}, {s}, 4;", .{ t, t });
+        try b.linef("or.b32 {s}, {s}, {s};", .{ mn, mn, t });
+    }
+}
+
+/// q4_k MMQ (see the block comment above). `nt` = 8-token column tiles per warp,
+/// `warps` = warps per block (each owning its own 16 rows, all sharing columns).
+/// Grid: x = ceil(n/(nt*8)), y = rows/(16*warps), block = 32*warps threads.
+///   p_w      q4_k weight, row-major, row stride (cols/256)*144
+///   p_x      quantize_q8_1 output: f32 d[n*cols/32] | i8 qs[n*cols] | f32 s[n*cols/32]
+///   p_y      f32 [n][rows] (y[t*rows + r]) — the layout both existing paths write
+///   p_scale  multiplies the result
+pub fn buildMmqQ4K(alloc: std.mem.Allocator, nt: usize, warps: usize) ![:0]u8 {
+    std.debug.assert(nt >= 1 and warps >= 1);
+    const nthreads = 32 * warps;
+    const sd_bytes = nt * 8 * 8 * 4; // [nt*8 cols][8 sub-blocks] f32
+    const sh_bytes = 2 * sd_bytes; // sd then ss
+
+    var b = ptx.Builder.init(alloc);
+    defer b.deinit();
+
+    const acc = try b.regs(.f32, nt * 4);
+    const cfr = try b.regs(.b32, 4);
+    const afr = try b.regs(.b32, 4);
+    const bfr = try b.regs(.b32, 2);
+    const wq = try b.regs(.b32, 4); // wa0, wa16, wb0, wb16
+
+    const rd_w = try b.reg(.b64);
+    const rd_x = try b.reg(.b64);
+    const rd_y = try b.reg(.b64);
+    const r_rows = try b.reg(.b32);
+    const r_cols = try b.reg(.b32);
+    const r_n = try b.reg(.b32);
+    const f_scale = try b.reg(.f32);
+    try b.linef("ld.param.u64 {s}, [p_w];", .{rd_w});
+    try b.linef("ld.param.u64 {s}, [p_x];", .{rd_x});
+    try b.linef("ld.param.u64 {s}, [p_y];", .{rd_y});
+    try b.linef("ld.param.u32 {s}, [p_rows];", .{r_rows});
+    try b.linef("ld.param.u32 {s}, [p_cols];", .{r_cols});
+    try b.linef("ld.param.u32 {s}, [p_n];", .{r_n});
+    try b.linef("ld.param.f32 {s}, [p_scale];", .{f_scale});
+    try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_w, rd_w });
+    try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_x, rd_x });
+    try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_y, rd_y });
+
+    const r_t = try b.reg(.b32);
+    const r_lane = try b.reg(.b32);
+    const r_warp = try b.reg(.b32);
+    const r_gid = try b.reg(.b32);
+    const r_t4 = try b.reg(.b32);
+    const r_rowa = try b.reg(.b32);
+    const r_rowb = try b.reg(.b32);
+    const r_col0 = try b.reg(.b32);
+    const r_nsb = try b.reg(.b32);
+    const r_rb = try b.reg(.b32);
+    const r_bpt = try b.reg(.b32);
+    const r_smem = try b.reg(.b32);
+    const tm = try b.regs(.b32, 6);
+    const rdt = try b.regs(.b64, 4);
+
+    try b.linef("mov.u32 {s}, smem;", .{r_smem});
+    try b.linef("mov.u32 {s}, %tid.x;", .{r_t});
+    try b.linef("and.b32 {s}, {s}, 31;", .{ r_lane, r_t });
+    try b.linef("shr.u32 {s}, {s}, 5;", .{ r_warp, r_t });
+    try b.linef("shr.u32 {s}, {s}, 2;", .{ r_gid, r_lane });
+    try b.linef("and.b32 {s}, {s}, 3;", .{ r_t4, r_lane });
+    try b.linef("mov.u32 {s}, %ctaid.y;", .{tm[0]});
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ tm[0], tm[0], 16 * warps });
+    try b.linef("shl.b32 {s}, {s}, 4;", .{ tm[1], r_warp });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ tm[0], tm[0], tm[1] });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_rowa, tm[0], r_gid });
+    try b.linef("add.u32 {s}, {s}, 8;", .{ r_rowb, r_rowa });
+    try b.linef("mov.u32 {s}, %ctaid.x;", .{r_col0});
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_col0, r_col0, nt * 8 });
+    try b.linef("shr.u32 {s}, {s}, 8;", .{ r_nsb, r_cols });
+    try b.linef("mul.lo.u32 {s}, {s}, 144;", .{ r_rb, r_nsb });
+    try b.linef("shr.u32 {s}, {s}, 5;", .{ r_bpt, r_cols });
+
+    const rd_wa = try b.reg(.b64);
+    const rd_wb = try b.reg(.b64);
+    try b.linef("mul.wide.u32 {s}, {s}, {s};", .{ rd_wa, r_rowa, r_rb });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_wa, rd_w, rd_wa });
+    try b.linef("mul.wide.u32 {s}, {s}, {s};", .{ rd_wb, r_rowb, r_rb });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_wb, rd_w, rd_wb });
+
+    // qs region at n*bpt*4; s region a further n*cols on.
+    const rd_qs = try b.reg(.b64);
+    const rd_sm = try b.reg(.b64);
+    try b.linef("mul.lo.u32 {s}, {s}, {s};", .{ tm[0], r_n, r_bpt });
+    try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rd_qs, tm[0] });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_qs, rd_x, rd_qs });
+    try b.linef("mul.lo.u32 {s}, {s}, {s};", .{ tm[1], r_n, r_cols });
+    try b.linef("mul.wide.u32 {s}, {s}, 1;", .{ rdt[0], tm[1] });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_sm, rd_qs, rdt[0] });
+
+    for (acc) |a| try b.linef("mov.f32 {s}, 0f00000000;", .{a});
+
+    // ---- super-block loop -------------------------------------------------
+    const r_sb = try b.reg(.b32);
+    const pr = try b.regs(.pred, 4);
+    const lp = try b.newLabel("sb");
+    const lp_end = try b.newLabel("sbend");
+    try b.linef("mov.u32 {s}, 0;", .{r_sb});
+    try b.label(lp);
+    try b.linef("setp.ge.u32 {s}, {s}, {s};", .{ pr[0], r_sb, r_nsb });
+    try b.linef("@{s} bra {s};", .{ pr[0], lp_end });
+
+    // Stage this super-block's activation d/Σq for all nt*8 columns x 8 sub-blocks.
+    // bar.sync BEFORE the fill too: the previous iteration's readers must be done.
+    const r_fi = try b.reg(.b32);
+    const fdv = try b.regs(.f32, 2);
+    const lf = try b.newLabel("fill");
+    const lf_end = try b.newLabel("fillend");
+    const lf_oob = try b.newLabel("filloob");
+    try b.line("bar.sync 0;");
+    try b.linef("mov.u32 {s}, {s};", .{ r_fi, r_t });
+    try b.label(lf);
+    try b.linef("setp.ge.u32 {s}, {s}, {d};", .{ pr[1], r_fi, nt * 64 });
+    try b.linef("@{s} bra {s};", .{ pr[1], lf_end });
+    try b.linef("shr.u32 {s}, {s}, 3;", .{ tm[0], r_fi }); // column within tile-set
+    try b.linef("and.b32 {s}, {s}, 7;", .{ tm[1], r_fi }); // sub-block
+    try b.linef("add.u32 {s}, {s}, {s};", .{ tm[2], r_col0, tm[0] });
+    try b.linef("mov.f32 {s}, 0f00000000;", .{fdv[0]});
+    try b.linef("mov.f32 {s}, 0f00000000;", .{fdv[1]});
+    try b.linef("setp.ge.u32 {s}, {s}, {s};", .{ pr[2], tm[2], r_n });
+    try b.linef("@{s} bra {s};", .{ pr[2], lf_oob });
+    try b.linef("shl.b32 {s}, {s}, 3;", .{ tm[3], r_sb });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ tm[3], tm[3], tm[1] });
+    try b.linef("mad.lo.u32 {s}, {s}, {s}, {s};", .{ tm[4], tm[2], r_bpt, tm[3] });
+    try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rdt[1], tm[4] });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[2], rd_x, rdt[1] });
+    try b.linef("ld.global.f32 {s}, [{s}];", .{ fdv[0], rdt[2] });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[3], rd_sm, rdt[1] });
+    try b.linef("ld.global.f32 {s}, [{s}];", .{ fdv[1], rdt[3] });
+    try b.label(lf_oob);
+    try b.linef("shl.b32 {s}, {s}, 2;", .{ tm[5], r_fi });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ tm[5], tm[5], r_smem });
+    try b.linef("st.shared.f32 [{s}], {s};", .{ tm[5], fdv[0] });
+    try b.linef("st.shared.f32 [{s}+{d}], {s};", .{ tm[5], sd_bytes, fdv[1] });
+    try b.linef("add.u32 {s}, {s}, {d};", .{ r_fi, r_fi, nthreads });
+    try b.linef("bra {s};", .{lf});
+    try b.label(lf_end);
+    try b.line("bar.sync 0;");
+
+    // Super-block headers for the warp's two mma rows.
+    const ha = try b.regs(.b32, 4);
+    const hb = try b.regs(.b32, 4);
+    const rd_sba = try b.reg(.b64);
+    const rd_sbb = try b.reg(.b64);
+    try b.linef("mul.lo.u32 {s}, {s}, 144;", .{ tm[0], r_sb });
+    try b.linef("cvt.u64.u32 {s}, {s};", .{ rdt[0], tm[0] });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_sba, rd_wa, rdt[0] });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_sbb, rd_wb, rdt[0] });
+    try b.linef("ld.global.v4.u32 {{{s}, {s}, {s}, {s}}}, [{s}];", .{ ha[0], ha[1], ha[2], ha[3], rd_sba });
+    try b.linef("ld.global.v4.u32 {{{s}, {s}, {s}, {s}}}, [{s}];", .{ hb[0], hb[1], hb[2], hb[3], rd_sbb });
+    const fda = try b.reg(.f32);
+    const fmia = try b.reg(.f32);
+    const fdb = try b.reg(.f32);
+    const fmib = try b.reg(.f32);
+    const h16 = try b.regs(.b16, 4);
+    try b.linef("mov.b32 {{{s}, {s}}}, {s};", .{ h16[0], h16[1], ha[0] });
+    try b.linef("cvt.f32.f16 {s}, {s};", .{ fda, h16[0] });
+    try b.linef("cvt.f32.f16 {s}, {s};", .{ fmia, h16[1] });
+    try b.linef("mov.b32 {{{s}, {s}}}, {s};", .{ h16[2], h16[3], hb[0] });
+    try b.linef("cvt.f32.f16 {s}, {s};", .{ fdb, h16[2] });
+    try b.linef("cvt.f32.f16 {s}, {s};", .{ fmib, h16[3] });
+
+    // Byte offset of this lane's weight words inside a 64-elem group.
+    const r_qoff = try b.reg(.b32);
+    try b.linef("shl.b32 {s}, {s}, 2;", .{ r_qoff, r_t4 });
+
+    const sc = try b.reg(.b32);
+    const mn = try b.reg(.b32);
+    const sc2 = try b.reg(.b32);
+    const mn2 = try b.reg(.b32);
+    const ft = try b.regs(.f32, 8);
+    // Float scratch for the per-mma fold. These must be .f32 registers: the
+    // builder's .b32 class is for integer/bit values, and ptxas types operands.
+    const fx = try b.regs(.f32, 2);
+    const rd_b = try b.reg(.b64);
+    const r_kbase = try b.reg(.b32);
+
+    var is: usize = 0;
+    while (is < 8) : (is += 1) {
+        const grp = is / 2;
+        const half = is % 2;
+        try b.comment("sub-block {d} (group {d}, {s} nibble)", .{ is, grp, if (half == 0) "low" else "high" });
+        if (half == 0) {
+            // One pair of loads per row serves both halves of this 64-elem group.
+            try b.linef("add.u32 {s}, {s}, {d};", .{ tm[0], r_qoff, 16 + grp * 32 });
+            try b.linef("cvt.u64.u32 {s}, {s};", .{ rdt[0], tm[0] });
+            try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[1], rd_sba, rdt[0] });
+            try b.linef("ld.global.u32 {s}, [{s}];", .{ wq[0], rdt[1] });
+            try b.linef("ld.global.u32 {s}, [{s}+16];", .{ wq[1], rdt[1] });
+            try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[2], rd_sbb, rdt[0] });
+            try b.linef("ld.global.u32 {s}, [{s}];", .{ wq[2], rdt[2] });
+            try b.linef("ld.global.u32 {s}, [{s}+16];", .{ wq[3], rdt[2] });
+        }
+        // A fragment order is {row_a k, row_b k, row_a k+16, row_b k+16}.
+        const src = [_][]const u8{ wq[0], wq[2], wq[1], wq[3] };
+        for (afr, src) |dst, s| {
+            if (half == 0) {
+                try b.linef("and.b32 {s}, {s}, 0x0f0f0f0f;", .{ dst, s });
+            } else {
+                try b.linef("shr.u32 {s}, {s}, 4;", .{ dst, s });
+                try b.linef("and.b32 {s}, {s}, 0x0f0f0f0f;", .{ dst, dst });
+            }
+        }
+        try q4kScaleMin(&b, is, ha[1], ha[2], ha[3], sc, mn, tm[0]);
+        try q4kScaleMin(&b, is, hb[1], hb[2], hb[3], sc2, mn2, tm[0]);
+        // ft0 = d_a*sc_a, ft1 = dmin_a*m_a, ft2/ft3 the same for row_b.
+        try b.linef("cvt.rn.f32.u32 {s}, {s};", .{ ft[0], sc });
+        try b.linef("mul.f32 {s}, {s}, {s};", .{ ft[0], ft[0], fda });
+        try b.linef("cvt.rn.f32.u32 {s}, {s};", .{ ft[1], mn });
+        try b.linef("mul.f32 {s}, {s}, {s};", .{ ft[1], ft[1], fmia });
+        try b.linef("cvt.rn.f32.u32 {s}, {s};", .{ ft[2], sc2 });
+        try b.linef("mul.f32 {s}, {s}, {s};", .{ ft[2], ft[2], fdb });
+        try b.linef("cvt.rn.f32.u32 {s}, {s};", .{ ft[3], mn2 });
+        try b.linef("mul.f32 {s}, {s}, {s};", .{ ft[3], ft[3], fmib });
+        // k offset of this sub-block within the row: sb*256 + is*32 + t4*4
+        try b.linef("shl.b32 {s}, {s}, 8;", .{ r_kbase, r_sb });
+        try b.linef("add.u32 {s}, {s}, {d};", .{ r_kbase, r_kbase, is * 32 });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_kbase, r_kbase, r_qoff });
+
+        var j: usize = 0;
+        while (j < nt) : (j += 1) {
+            const lb_oob = try b.newLabel("bz");
+            const lb_st = try b.newLabel("bs");
+            // B fragment: this lane supplies column (col0 + j*8 + gid).
+            try b.linef("add.u32 {s}, {s}, {s};", .{ tm[1], r_col0, r_gid });
+            try b.linef("add.u32 {s}, {s}, {d};", .{ tm[1], tm[1], j * 8 });
+            try b.linef("mov.u32 {s}, 0;", .{bfr[0]});
+            try b.linef("mov.u32 {s}, 0;", .{bfr[1]});
+            try b.linef("setp.ge.u32 {s}, {s}, {s};", .{ pr[3], tm[1], r_n });
+            try b.linef("@{s} bra {s};", .{ pr[3], lb_oob });
+            try b.linef("mad.lo.u32 {s}, {s}, {s}, {s};", .{ tm[2], tm[1], r_cols, r_kbase });
+            try b.linef("cvt.u64.u32 {s}, {s};", .{ rdt[0], tm[2] });
+            try b.linef("add.s64 {s}, {s}, {s};", .{ rd_b, rd_qs, rdt[0] });
+            try b.linef("ld.global.u32 {s}, [{s}];", .{ bfr[0], rd_b });
+            try b.linef("ld.global.u32 {s}, [{s}+16];", .{ bfr[1], rd_b });
+            try b.label(lb_oob);
+            for (cfr) |c| try b.linef("mov.u32 {s}, 0;", .{c});
+            try b.linef("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {{{s},{s},{s},{s}}}, {{{s},{s},{s},{s}}}, {{{s},{s}}}, {{{s},{s},{s},{s}}};", .{
+                cfr[0], cfr[1], cfr[2], cfr[3],
+                afr[0], afr[1], afr[2], afr[3],
+                bfr[0], bfr[1],
+                cfr[0], cfr[1], cfr[2], cfr[3],
+            });
+            _ = lb_st;
+            // Activation d/Σq for this lane's two C columns, from shared.
+            // shared index = (j*8 + t4*2 + {0,1})*8 + is
+            try b.linef("shl.b32 {s}, {s}, 1;", .{ tm[3], r_t4 });
+            try b.linef("add.u32 {s}, {s}, {d};", .{ tm[3], tm[3], j * 8 });
+            try b.linef("shl.b32 {s}, {s}, 3;", .{ tm[3], tm[3] });
+            try b.linef("add.u32 {s}, {s}, {d};", .{ tm[3], tm[3], is });
+            try b.linef("shl.b32 {s}, {s}, 2;", .{ tm[3], tm[3] });
+            try b.linef("add.u32 {s}, {s}, {s};", .{ tm[3], tm[3], r_smem });
+            try b.linef("ld.shared.f32 {s}, [{s}];", .{ ft[4], tm[3] }); // da0
+            try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ ft[5], tm[3], sd_bytes }); // sa0
+            try b.linef("ld.shared.f32 {s}, [{s}+32];", .{ ft[6], tm[3] }); // da1
+            try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ ft[7], tm[3], sd_bytes + 32 }); // sa1
+            // acc += d*sc*da*c  -  dmin*m*da*Σq
+            const pairs = [_][3]usize{ .{ 0, 4, 5 }, .{ 1, 6, 7 }, .{ 2, 4, 5 }, .{ 3, 6, 7 } };
+            for (pairs, 0..) |pp, ci| {
+                const vscale = if (ci < 2) ft[0] else ft[2];
+                const mscale = if (ci < 2) ft[1] else ft[3];
+                const da = ft[pp[1]];
+                const sa = ft[pp[2]];
+                const a = acc[j * 4 + ci];
+                try b.linef("cvt.rn.f32.s32 {s}, {s};", .{ fx[0], cfr[ci] });
+                try b.linef("mul.f32 {s}, {s}, {s};", .{ fx[1], vscale, da });
+                try b.linef("fma.rn.f32 {s}, {s}, {s}, {s};", .{ a, fx[1], fx[0], a });
+                try b.linef("mul.f32 {s}, {s}, {s};", .{ fx[1], mscale, da });
+                try b.linef("mul.f32 {s}, {s}, {s};", .{ fx[1], fx[1], sa });
+                try b.linef("sub.f32 {s}, {s}, {s};", .{ a, a, fx[1] });
+                _ = pp[0];
+            }
+        }
+    }
+
+    try b.linef("add.u32 {s}, {s}, 1;", .{ r_sb, r_sb });
+    try b.linef("bra {s};", .{lp});
+    try b.label(lp_end);
+
+    // ---- epilogue: y[col*rows + row] --------------------------------------
+    var j2: usize = 0;
+    while (j2 < nt) : (j2 += 1) {
+        const l_skip0 = try b.newLabel("st0");
+        const l_skip1 = try b.newLabel("st1");
+        try b.linef("shl.b32 {s}, {s}, 1;", .{ tm[0], r_t4 });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ tm[0], tm[0], r_col0 });
+        try b.linef("add.u32 {s}, {s}, {d};", .{ tm[0], tm[0], j2 * 8 });
+        // column c
+        try b.linef("setp.ge.u32 {s}, {s}, {s};", .{ pr[0], tm[0], r_n });
+        try b.linef("@{s} bra {s};", .{ pr[0], l_skip0 });
+        try b.linef("mad.lo.u32 {s}, {s}, {s}, {s};", .{ tm[1], tm[0], r_rows, r_rowa });
+        try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rdt[0], tm[1] });
+        try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[0], rd_y, rdt[0] });
+        try b.linef("mul.f32 {s}, {s}, {s};", .{ ft[0], acc[j2 * 4 + 0], f_scale });
+        try b.linef("st.global.f32 [{s}], {s};", .{ rdt[0], ft[0] });
+        try b.linef("mad.lo.u32 {s}, {s}, {s}, {s};", .{ tm[1], tm[0], r_rows, r_rowb });
+        try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rdt[1], tm[1] });
+        try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[1], rd_y, rdt[1] });
+        try b.linef("mul.f32 {s}, {s}, {s};", .{ ft[1], acc[j2 * 4 + 2], f_scale });
+        try b.linef("st.global.f32 [{s}], {s};", .{ rdt[1], ft[1] });
+        try b.label(l_skip0);
+        // column c+1
+        try b.linef("add.u32 {s}, {s}, 1;", .{ tm[2], tm[0] });
+        try b.linef("setp.ge.u32 {s}, {s}, {s};", .{ pr[1], tm[2], r_n });
+        try b.linef("@{s} bra {s};", .{ pr[1], l_skip1 });
+        try b.linef("mad.lo.u32 {s}, {s}, {s}, {s};", .{ tm[1], tm[2], r_rows, r_rowa });
+        try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rdt[0], tm[1] });
+        try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[0], rd_y, rdt[0] });
+        try b.linef("mul.f32 {s}, {s}, {s};", .{ ft[0], acc[j2 * 4 + 1], f_scale });
+        try b.linef("st.global.f32 [{s}], {s};", .{ rdt[0], ft[0] });
+        try b.linef("mad.lo.u32 {s}, {s}, {s}, {s};", .{ tm[1], tm[2], r_rows, r_rowb });
+        try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rdt[1], tm[1] });
+        try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[1], rd_y, rdt[1] });
+        try b.linef("mul.f32 {s}, {s}, {s};", .{ ft[1], acc[j2 * 4 + 3], f_scale });
+        try b.linef("st.global.f32 [{s}], {s};", .{ rdt[1], ft[1] });
+        try b.label(l_skip1);
+    }
+
+    const shared_decl = try std.fmt.allocPrint(alloc, ".shared .align 16 .b8 smem[{d}];", .{sh_bytes});
+    defer alloc.free(shared_decl);
+    return b.build(
+        "mmq_q4_k",
+        "    .param .u64 p_w,\n    .param .u64 p_x,\n    .param .u64 p_y,\n    .param .u32 p_rows,\n    .param .u32 p_cols,\n    .param .u32 p_n,\n    .param .f32 p_scale",
+        shared_decl,
+    );
+}
+
+/// q4_k MMQ on the igemm-pipe tiling — the v1 `buildMmqQ4K` above is correct but
+/// loses to cuBLASLt at prefill batch sizes because its warp owns only 16 rows,
+/// so every A+B fragment-load pair feeds exactly ONE mma. This version uses the
+/// proven 128x128 / 2x2-warp / MT=4 / NT=8 shape from `buildIgemmPipe`: 32 mmas
+/// per 24 fragment loads, with the weight tile decoded ONCE into shared memory
+/// and reused by all four warps.
+///
+/// The pipe already issues one `mma.m16n8k32` per 32-k substep, which is exactly
+/// a q4_k sub-block — so the per-sub-block scale fold drops straight in after
+/// each substep. The mma writes a scratch s32 quad (C operand held at zero) and
+/// the result is folded into f32 accumulators:
+///     acc += (d*sc)*da*c - (dmin*m)*da*sum(qa)
+/// Both scale pairs are staged into shared alongside the tiles, so the fold costs
+/// 48 shared f32 loads per 32 mmas instead of 4 per mma.
+///
+/// Differences from `buildIgemmPipe`, and why:
+///   - A staging decodes q4_k nibbles instead of `cp.async`-copying raw s8. One
+///     thread per row: 32 qs bytes in, 64 int8 out, plus the row's two sub-block
+///     scale pairs. cp.async can't be used for A because the bytes are
+///     transformed on the way in.
+///   - Single-buffered. Without cp.async on A there is no async copy to overlap,
+///     so double buffering would mean holding the next slab in registers on top
+///     of 128 f32 accumulators. Fixing the arithmetic intensity is the dominant
+///     term; pipelining is the next lever, not this one.
+///   - No ldmatrix/swizzle (plain `ld.shared.u32` fragment loads, the pipe's
+///     `use_ldmatrix=false` path). kstep is 64 here, so the pipe's (row&7)<<4
+///     swizzle would XOR bit 6 and cross into the next row; a correct mask would
+///     be (row&3)<<4. Left off until the tiling change is measured.
+///
+/// Requires cols % 256 == 0, rows % 128 == 0, and `n` padded to a multiple of 128
+/// with the padding zero-filled (see `opMatmulQuantMmq`). Entry `mmq_pipe_q4_k`.
+pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
+    const BM = 128;
+    const BN = 128;
+    const kstep = 64;
+    const KS = kstep / 32; // 32-k substeps == q4_k sub-blocks per slab
+    const MT = 4;
+    const NT = 8;
+    const ATILE = BM * kstep;
+    const BTILE = BN * kstep;
+    const ASC = BM * KS * 2 * 4; // (d*sc, dmin*m) f32 pair per row per substep
+    const BSC = BN * KS * 2 * 4; // (da, sum qa) f32 pair per col per substep
+    const B_OFF = ATILE;
+    const ASC_OFF = ATILE + BTILE;
+    const BSC_OFF = ASC_OFF + ASC;
+    const SH = BSC_OFF + BSC;
+
+    var b = ptx.Builder.init(alloc);
+    defer b.deinit();
+
+    const acc = try b.regs(.f32, MT * NT * 4);
+    const af = try b.regs(.b32, MT * 4);
+    const bf = try b.regs(.b32, NT * 2);
+    const ct = try b.regs(.b32, 4); // mma destination (C operand is the zero quad)
+    const zq = try b.regs(.b32, 4); // permanently zero
+    const rsc = try b.regs(.f32, MT * 4); // per-mi: (dsc,dm) for rows gid and gid+8
+    const csc = try b.regs(.f32, 4); // per-nj: (da,sa) for cols tf*2 and tf*2+1
+
+    const rd_w = try b.reg(.b64);
+    const rd_x = try b.reg(.b64);
+    const rd_y = try b.reg(.b64);
+    const r_rows = try b.reg(.b32);
+    const r_cols = try b.reg(.b32);
+    const r_n = try b.reg(.b32);
+    const f_scale = try b.reg(.f32);
+    try b.linef("ld.param.u64 {s}, [p_w];", .{rd_w});
+    try b.linef("ld.param.u64 {s}, [p_x];", .{rd_x});
+    try b.linef("ld.param.u64 {s}, [p_y];", .{rd_y});
+    try b.linef("ld.param.u32 {s}, [p_rows];", .{r_rows});
+    try b.linef("ld.param.u32 {s}, [p_cols];", .{r_cols});
+    try b.linef("ld.param.u32 {s}, [p_n];", .{r_n});
+    try b.linef("ld.param.f32 {s}, [p_scale];", .{f_scale});
+    try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_w, rd_w });
+    try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_x, rd_x });
+    try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_y, rd_y });
+
+    const r_t = try b.reg(.b32);
+    const r_lane = try b.reg(.b32);
+    const r_warp = try b.reg(.b32);
+    const r_wm = try b.reg(.b32);
+    const r_wn = try b.reg(.b32);
+    const r_gid = try b.reg(.b32);
+    const r_tf = try b.reg(.b32);
+    const r_row0 = try b.reg(.b32);
+    const r_col0 = try b.reg(.b32);
+    const r_smem = try b.reg(.b32);
+    const r_nsb = try b.reg(.b32);
+    const r_rb = try b.reg(.b32);
+    const r_bpt = try b.reg(.b32);
+    const tm = try b.regs(.b32, 8);
+    const rdt = try b.regs(.b64, 4);
+
+    try b.linef("mov.u32 {s}, smem;", .{r_smem});
+    try b.linef("mov.u32 {s}, %tid.x;", .{r_t});
+    try b.linef("and.b32 {s}, {s}, 31;", .{ r_lane, r_t });
+    try b.linef("shr.u32 {s}, {s}, 5;", .{ r_warp, r_t });
+    try b.linef("and.b32 {s}, {s}, 1;", .{ r_wm, r_warp });
+    try b.linef("shr.u32 {s}, {s}, 1;", .{ r_wn, r_warp });
+    try b.linef("shr.u32 {s}, {s}, 2;", .{ r_gid, r_lane });
+    try b.linef("and.b32 {s}, {s}, 3;", .{ r_tf, r_lane });
+    try b.linef("mov.u32 {s}, %ctaid.y;", .{r_row0});
+    try b.linef("shl.b32 {s}, {s}, 7;", .{ r_row0, r_row0 });
+    try b.linef("mov.u32 {s}, %ctaid.x;", .{r_col0});
+    try b.linef("shl.b32 {s}, {s}, 7;", .{ r_col0, r_col0 });
+    try b.linef("shr.u32 {s}, {s}, 8;", .{ r_nsb, r_cols });
+    try b.linef("mul.lo.u32 {s}, {s}, 144;", .{ r_rb, r_nsb });
+    try b.linef("shr.u32 {s}, {s}, 5;", .{ r_bpt, r_cols });
+
+    // Activation regions: qs at n*bpt*4, sums a further n*cols on.
+    const rd_qs = try b.reg(.b64);
+    const rd_sm = try b.reg(.b64);
+    try b.linef("mul.lo.u32 {s}, {s}, {s};", .{ tm[0], r_n, r_bpt });
+    try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rd_qs, tm[0] });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_qs, rd_x, rd_qs });
+    try b.linef("mul.lo.u32 {s}, {s}, {s};", .{ tm[1], r_n, r_cols });
+    try b.linef("mul.wide.u32 {s}, {s}, 1;", .{ rdt[0], tm[1] });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_sm, rd_qs, rdt[0] });
+
+    // Staging identities: one thread per A row and per B column (BM=BN=128=nthreads).
+    const rd_wrow = try b.reg(.b64); // W + (row0+tid)*row_bytes
+    const rd_bcol = try b.reg(.b64); // qs + (col0+tid)*cols
+    const r_gcol = try b.reg(.b32); // col0 + tid (for the activation scale gather)
+    try b.linef("add.u32 {s}, {s}, {s};", .{ tm[0], r_row0, r_t });
+    try b.linef("mul.wide.u32 {s}, {s}, {s};", .{ rd_wrow, tm[0], r_rb });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_wrow, rd_w, rd_wrow });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_gcol, r_col0, r_t });
+    try b.linef("mul.wide.u32 {s}, {s}, {s};", .{ rd_bcol, r_gcol, r_cols });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_bcol, rd_qs, rd_bcol });
+
+    // Shared destinations for this thread's staged row/column.
+    const r_adst = try b.reg(.b32);
+    const r_bdst = try b.reg(.b32);
+    const r_ascd = try b.reg(.b32);
+    const r_bscd = try b.reg(.b32);
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_adst, r_t, kstep });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_adst, r_adst, r_smem });
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_bdst, r_t, kstep });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_bdst, r_bdst, r_smem });
+    try b.linef("add.u32 {s}, {s}, {d};", .{ r_bdst, r_bdst, B_OFF });
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_ascd, r_t, KS * 8 });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_ascd, r_ascd, r_smem });
+    try b.linef("add.u32 {s}, {s}, {d};", .{ r_ascd, r_ascd, ASC_OFF });
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_bscd, r_t, KS * 8 });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_bscd, r_bscd, r_smem });
+    try b.linef("add.u32 {s}, {s}, {d};", .{ r_bscd, r_bscd, BSC_OFF });
+
+    // Fragment-load bases (pipe's use_ldmatrix=false layout).
+    const r_asl = try b.reg(.b32);
+    const r_bsl = try b.reg(.b32);
+    try b.linef("shl.b32 {s}, {s}, 6;", .{ tm[0], r_wm });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ tm[0], tm[0], r_gid });
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_asl, tm[0], kstep });
+    try b.linef("shl.b32 {s}, {s}, 2;", .{ tm[1], r_tf });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl, r_asl, tm[1] });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl, r_asl, r_smem });
+    try b.linef("shl.b32 {s}, {s}, 6;", .{ tm[0], r_wn });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ tm[0], tm[0], r_gid });
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_bsl, tm[0], kstep });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_bsl, r_bsl, tm[1] });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_bsl, r_bsl, r_smem });
+    try b.linef("add.u32 {s}, {s}, {d};", .{ r_bsl, r_bsl, B_OFF });
+
+    // Scale-read bases: row (wm*64 + mi*16 + gid) and col (wn*64 + nj*8 + tf*2).
+    const r_ascr = try b.reg(.b32);
+    const r_bscr = try b.reg(.b32);
+    try b.linef("shl.b32 {s}, {s}, 6;", .{ tm[0], r_wm });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ tm[0], tm[0], r_gid });
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_ascr, tm[0], KS * 8 });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_ascr, r_ascr, r_smem });
+    try b.linef("add.u32 {s}, {s}, {d};", .{ r_ascr, r_ascr, ASC_OFF });
+    try b.linef("shl.b32 {s}, {s}, 6;", .{ tm[0], r_wn });
+    try b.linef("shl.b32 {s}, {s}, 1;", .{ tm[1], r_tf });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ tm[0], tm[0], tm[1] });
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_bscr, tm[0], KS * 8 });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_bscr, r_bscr, r_smem });
+    try b.linef("add.u32 {s}, {s}, {d};", .{ r_bscr, r_bscr, BSC_OFF });
+
+    for (acc) |r| try b.linef("mov.f32 {s}, 0f00000000;", .{r});
+    for (zq) |r| try b.linef("mov.u32 {s}, 0;", .{r});
+
+    // ---- slab loop --------------------------------------------------------
+    const r_i = try b.reg(.b32);
+    const r_nslab = try b.reg(.b32);
+    const pr = try b.regs(.pred, 3);
+    const lp = try b.newLabel("slab");
+    const hi_lbl = try b.newLabel("schi");
+    const sd_lbl = try b.newLabel("scdone");
+    try b.linef("shr.u32 {s}, {s}, 6;", .{ r_nslab, r_cols }); // cols/kstep
+    try b.linef("mov.u32 {s}, 0;", .{r_i});
+    try b.label(lp);
+
+    // -- stage A: decode this thread's row of q4_k nibbles into shared -------
+    const hh = try b.regs(.b32, 4);
+    const qw = try b.regs(.b32, 8);
+    const nib = try b.regs(.b32, 8);
+    try b.linef("shr.u32 {s}, {s}, 2;", .{ tm[0], r_i }); // sb = i/4
+    try b.linef("and.b32 {s}, {s}, 3;", .{ tm[1], r_i }); // grp = i&3
+    try b.linef("mul.lo.u32 {s}, {s}, 144;", .{ tm[2], tm[0] });
+    try b.linef("cvt.u64.u32 {s}, {s};", .{ rdt[0], tm[2] });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[1], rd_wrow, rdt[0] });
+    try b.linef("ld.global.v4.u32 {{{s}, {s}, {s}, {s}}}, [{s}];", .{ hh[0], hh[1], hh[2], hh[3], rdt[1] });
+    try b.linef("shl.b32 {s}, {s}, 5;", .{ tm[3], tm[1] }); // grp*32
+    try b.linef("add.u32 {s}, {s}, 16;", .{ tm[3], tm[3] });
+    try b.linef("cvt.u64.u32 {s}, {s};", .{ rdt[0], tm[3] });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[2], rdt[1], rdt[0] });
+    try b.linef("ld.global.v4.u32 {{{s}, {s}, {s}, {s}}}, [{s}];", .{ qw[0], qw[1], qw[2], qw[3], rdt[2] });
+    try b.linef("ld.global.v4.u32 {{{s}, {s}, {s}, {s}}}, [{s}+16];", .{ qw[4], qw[5], qw[6], qw[7], rdt[2] });
+    for (0..8) |j| try b.linef("and.b32 {s}, {s}, 0x0f0f0f0f;", .{ nib[j], qw[j] });
+    try b.linef("st.shared.v4.u32 [{s}], {{{s}, {s}, {s}, {s}}};", .{ r_adst, nib[0], nib[1], nib[2], nib[3] });
+    try b.linef("st.shared.v4.u32 [{s}+16], {{{s}, {s}, {s}, {s}}};", .{ r_adst, nib[4], nib[5], nib[6], nib[7] });
+    for (0..8) |j| {
+        try b.linef("shr.u32 {s}, {s}, 4;", .{ nib[j], qw[j] });
+        try b.linef("and.b32 {s}, {s}, 0x0f0f0f0f;", .{ nib[j], nib[j] });
+    }
+    try b.linef("st.shared.v4.u32 [{s}+32], {{{s}, {s}, {s}, {s}}};", .{ r_adst, nib[0], nib[1], nib[2], nib[3] });
+    try b.linef("st.shared.v4.u32 [{s}+48], {{{s}, {s}, {s}, {s}}};", .{ r_adst, nib[4], nib[5], nib[6], nib[7] });
+
+    // -- stage A scales: (d*sc, dmin*m) for sub-blocks grp*2 and grp*2+1 -----
+    // Runtime `is` here (grp comes from the slab index), so this is ggml's
+    // get_scale_min_k4 branch rather than the comptime form used elsewhere.
+    const sc0 = try b.reg(.b32);
+    const mn0 = try b.reg(.b32);
+    const sc1 = try b.reg(.b32);
+    const mn1 = try b.reg(.b32);
+    const h16 = try b.regs(.b16, 2);
+    const fd = try b.reg(.f32);
+    const fdm = try b.reg(.f32);
+    const fs = try b.regs(.f32, 4);
+    try b.linef("shl.b32 {s}, {s}, 1;", .{ tm[4], tm[1] }); // is0 = grp*2
+    try b.linef("shl.b32 {s}, {s}, 3;", .{ tm[5], tm[4] }); // is0*8
+    try b.linef("setp.ge.u32 {s}, {s}, 4;", .{ pr[0], tm[4] });
+    try b.linef("@{s} bra {s};", .{ pr[0], hi_lbl });
+    try b.linef("shr.u32 {s}, {s}, {s};", .{ sc0, hh[1], tm[5] });
+    try b.linef("and.b32 {s}, {s}, 63;", .{ sc0, sc0 });
+    try b.linef("shr.u32 {s}, {s}, {s};", .{ mn0, hh[2], tm[5] });
+    try b.linef("and.b32 {s}, {s}, 63;", .{ mn0, mn0 });
+    try b.linef("add.u32 {s}, {s}, 8;", .{ tm[6], tm[5] });
+    try b.linef("shr.u32 {s}, {s}, {s};", .{ sc1, hh[1], tm[6] });
+    try b.linef("and.b32 {s}, {s}, 63;", .{ sc1, sc1 });
+    try b.linef("shr.u32 {s}, {s}, {s};", .{ mn1, hh[2], tm[6] });
+    try b.linef("and.b32 {s}, {s}, 63;", .{ mn1, mn1 });
+    try b.linef("bra {s};", .{sd_lbl});
+    try b.label(hi_lbl);
+    try b.linef("add.u32 {s}, {s}, -32;", .{ tm[6], tm[5] }); // (is0-4)*8
+    inline for (.{ 0, 1 }) |half| {
+        const sc = if (half == 0) sc0 else sc1;
+        const mn = if (half == 0) mn0 else mn1;
+        if (half == 1) try b.linef("add.u32 {s}, {s}, 8;", .{ tm[6], tm[6] });
+        try b.linef("shr.u32 {s}, {s}, {s};", .{ tm[7], hh[3], tm[6] });
+        try b.linef("and.b32 {s}, {s}, 15;", .{ sc, tm[7] });
+        try b.linef("shr.u32 {s}, {s}, 4;", .{ mn, tm[7] });
+        try b.linef("and.b32 {s}, {s}, 15;", .{ mn, mn });
+        try b.linef("shr.u32 {s}, {s}, {s};", .{ tm[7], hh[1], tm[6] });
+        try b.linef("shr.u32 {s}, {s}, 6;", .{ tm[7], tm[7] });
+        try b.linef("and.b32 {s}, {s}, 3;", .{ tm[7], tm[7] });
+        try b.linef("shl.b32 {s}, {s}, 4;", .{ tm[7], tm[7] });
+        try b.linef("or.b32 {s}, {s}, {s};", .{ sc, sc, tm[7] });
+        try b.linef("shr.u32 {s}, {s}, {s};", .{ tm[7], hh[2], tm[6] });
+        try b.linef("shr.u32 {s}, {s}, 6;", .{ tm[7], tm[7] });
+        try b.linef("and.b32 {s}, {s}, 3;", .{ tm[7], tm[7] });
+        try b.linef("shl.b32 {s}, {s}, 4;", .{ tm[7], tm[7] });
+        try b.linef("or.b32 {s}, {s}, {s};", .{ mn, mn, tm[7] });
+    }
+    try b.label(sd_lbl);
+    try b.linef("mov.b32 {{{s}, {s}}}, {s};", .{ h16[0], h16[1], hh[0] });
+    try b.linef("cvt.f32.f16 {s}, {s};", .{ fd, h16[0] });
+    try b.linef("cvt.f32.f16 {s}, {s};", .{ fdm, h16[1] });
+    try b.linef("cvt.rn.f32.u32 {s}, {s};", .{ fs[0], sc0 });
+    try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[0], fs[0], fd });
+    try b.linef("cvt.rn.f32.u32 {s}, {s};", .{ fs[1], mn0 });
+    try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[1], fs[1], fdm });
+    try b.linef("cvt.rn.f32.u32 {s}, {s};", .{ fs[2], sc1 });
+    try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[2], fs[2], fd });
+    try b.linef("cvt.rn.f32.u32 {s}, {s};", .{ fs[3], mn1 });
+    try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[3], fs[3], fdm });
+    try b.linef("st.shared.v4.f32 [{s}], {{{s}, {s}, {s}, {s}}};", .{ r_ascd, fs[0], fs[1], fs[2], fs[3] });
+
+    // -- stage B: activation int8 (already in the right layout) + its scales --
+    try b.linef("shl.b32 {s}, {s}, 6;", .{ tm[0], r_i }); // i*kstep
+    try b.linef("cvt.u64.u32 {s}, {s};", .{ rdt[0], tm[0] });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[1], rd_bcol, rdt[0] });
+    try b.linef("ld.global.v4.u32 {{{s}, {s}, {s}, {s}}}, [{s}];", .{ qw[0], qw[1], qw[2], qw[3], rdt[1] });
+    try b.linef("ld.global.v4.u32 {{{s}, {s}, {s}, {s}}}, [{s}+16];", .{ qw[4], qw[5], qw[6], qw[7], rdt[1] });
+    try b.linef("st.shared.v4.u32 [{s}], {{{s}, {s}, {s}, {s}}};", .{ r_bdst, qw[0], qw[1], qw[2], qw[3] });
+    try b.linef("st.shared.v4.u32 [{s}+16], {{{s}, {s}, {s}, {s}}};", .{ r_bdst, qw[4], qw[5], qw[6], qw[7] });
+    try b.linef("ld.global.v4.u32 {{{s}, {s}, {s}, {s}}}, [{s}+32];", .{ qw[0], qw[1], qw[2], qw[3], rdt[1] });
+    try b.linef("ld.global.v4.u32 {{{s}, {s}, {s}, {s}}}, [{s}+48];", .{ qw[4], qw[5], qw[6], qw[7], rdt[1] });
+    try b.linef("st.shared.v4.u32 [{s}+32], {{{s}, {s}, {s}, {s}}};", .{ r_bdst, qw[0], qw[1], qw[2], qw[3] });
+    try b.linef("st.shared.v4.u32 [{s}+48], {{{s}, {s}, {s}, {s}}};", .{ r_bdst, qw[4], qw[5], qw[6], qw[7] });
+    // blk = i*KS + ks; d and sum live in separate regions, both indexed col*bpt+blk.
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ tm[0], r_i, KS });
+    try b.linef("mad.lo.u32 {s}, {s}, {s}, {s};", .{ tm[1], r_gcol, r_bpt, tm[0] });
+    try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rdt[0], tm[1] });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[1], rd_x, rdt[0] });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[2], rd_sm, rdt[0] });
+    try b.linef("ld.global.f32 {s}, [{s}];", .{ fs[0], rdt[1] });
+    try b.linef("ld.global.f32 {s}, [{s}];", .{ fs[1], rdt[2] });
+    try b.linef("ld.global.f32 {s}, [{s}+4];", .{ fs[2], rdt[1] });
+    try b.linef("ld.global.f32 {s}, [{s}+4];", .{ fs[3], rdt[2] });
+    try b.linef("st.shared.v4.f32 [{s}], {{{s}, {s}, {s}, {s}}};", .{ r_bscd, fs[0], fs[1], fs[2], fs[3] });
+
+    try b.line("bar.sync 0;");
+
+    // ---- compute: KS substeps of MT x NT mmas, folding scales each substep --
+    var ks: usize = 0;
+    while (ks < KS) : (ks += 1) {
+        var mi: usize = 0;
+        while (mi < MT) : (mi += 1) {
+            const o = mi * 16 * kstep + ks * 32;
+            try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ af[mi * 4 + 0], r_asl, o });
+            try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ af[mi * 4 + 1], r_asl, o + 8 * kstep });
+            try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ af[mi * 4 + 2], r_asl, o + 16 });
+            try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ af[mi * 4 + 3], r_asl, o + 8 * kstep + 16 });
+            // Row scale pairs for this mi: rows (mi*16+gid) and (mi*16+gid+8).
+            const so = mi * 16 * KS * 8 + ks * 8;
+            try b.linef("ld.shared.v2.f32 {{{s}, {s}}}, [{s}+{d}];", .{ rsc[mi * 4 + 0], rsc[mi * 4 + 1], r_ascr, so });
+            try b.linef("ld.shared.v2.f32 {{{s}, {s}}}, [{s}+{d}];", .{ rsc[mi * 4 + 2], rsc[mi * 4 + 3], r_ascr, so + 8 * KS * 8 });
+        }
+        var nj: usize = 0;
+        while (nj < NT) : (nj += 1) {
+            const o = nj * 8 * kstep + ks * 32;
+            try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ bf[nj * 2 + 0], r_bsl, o });
+            try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ bf[nj * 2 + 1], r_bsl, o + 16 });
+        }
+        nj = 0;
+        while (nj < NT) : (nj += 1) {
+            // Column scale pairs for this nj: cols (nj*8+tf*2) and +1.
+            const co = nj * 8 * KS * 8 + ks * 8;
+            try b.linef("ld.shared.v2.f32 {{{s}, {s}}}, [{s}+{d}];", .{ csc[0], csc[1], r_bscr, co });
+            try b.linef("ld.shared.v2.f32 {{{s}, {s}}}, [{s}+{d}];", .{ csc[2], csc[3], r_bscr, co + KS * 8 });
+            mi = 0;
+            while (mi < MT) : (mi += 1) {
+                try b.linef("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {{{s},{s},{s},{s}}}, {{{s},{s},{s},{s}}}, {{{s},{s}}}, {{{s},{s},{s},{s}}};", .{
+                    ct[0],          ct[1],          ct[2],          ct[3],
+                    af[mi * 4 + 0], af[mi * 4 + 1], af[mi * 4 + 2], af[mi * 4 + 3],
+                    bf[nj * 2 + 0], bf[nj * 2 + 1],
+                    zq[0],          zq[1],          zq[2],          zq[3],
+                });
+                // c0=(row gid,col tf*2) c1=(gid,tf*2+1) c2=(gid+8,tf*2) c3=(gid+8,+1)
+                const a = acc[(mi * NT + nj) * 4 ..][0..4];
+                const rows2 = [_]usize{ 0, 0, 2, 2 }; // index into rsc for row a/b
+                const cols2 = [_]usize{ 0, 2, 0, 2 }; // index into csc for col 0/1
+                for (0..4) |ci| {
+                    const dsc = rsc[mi * 4 + rows2[ci]];
+                    const dm = rsc[mi * 4 + rows2[ci] + 1];
+                    const da = csc[cols2[ci]];
+                    const sa = csc[cols2[ci] + 1];
+                    try b.linef("cvt.rn.f32.s32 {s}, {s};", .{ fs[0], ct[ci] });
+                    try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[1], dsc, da });
+                    try b.linef("fma.rn.f32 {s}, {s}, {s}, {s};", .{ a[ci], fs[1], fs[0], a[ci] });
+                    try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[1], dm, da });
+                    try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[1], fs[1], sa });
+                    try b.linef("sub.f32 {s}, {s}, {s};", .{ a[ci], a[ci], fs[1] });
+                }
+            }
+        }
+    }
+    try b.line("bar.sync 0;");
+    try b.linef("add.u32 {s}, {s}, 1;", .{ r_i, r_i });
+    try b.linef("setp.lt.u32 {s}, {s}, {s};", .{ pr[1], r_i, r_nslab });
+    try b.linef("@{s} bra {s};", .{ pr[1], lp });
+
+    // ---- store: y[col*rows + row] -----------------------------------------
+    const r_crow = try b.reg(.b32);
+    const r_ccol = try b.reg(.b32);
+    try b.linef("shl.b32 {s}, {s}, 6;", .{ r_crow, r_wm });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_crow, r_crow, r_row0 });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_crow, r_crow, r_gid });
+    try b.linef("shl.b32 {s}, {s}, 6;", .{ r_ccol, r_wn });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_ccol, r_ccol, r_col0 });
+    try b.linef("shl.b32 {s}, {s}, 1;", .{ tm[0], r_tf });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_ccol, r_ccol, tm[0] });
+    var mi2: usize = 0;
+    while (mi2 < MT) : (mi2 += 1) {
+        var nj2: usize = 0;
+        while (nj2 < NT) : (nj2 += 1) {
+            const a = acc[(mi2 * NT + nj2) * 4 ..][0..4];
+            const rowoff = [_]usize{ 0, 0, 8, 8 };
+            const coloff = [_]usize{ 0, 1, 0, 1 };
+            for (0..4) |ci| {
+                try b.linef("add.u32 {s}, {s}, {d};", .{ tm[1], r_crow, mi2 * 16 + rowoff[ci] });
+                try b.linef("add.u32 {s}, {s}, {d};", .{ tm[2], r_ccol, nj2 * 8 + coloff[ci] });
+                try b.linef("mad.lo.u32 {s}, {s}, {s}, {s};", .{ tm[3], tm[2], r_rows, tm[1] });
+                try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rdt[0], tm[3] });
+                try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[0], rd_y, rdt[0] });
+                try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[0], a[ci], f_scale });
+                try b.linef("st.global.f32 [{s}], {s};", .{ rdt[0], fs[0] });
+            }
+        }
+    }
+
+    const shared_decl = try std.fmt.allocPrint(alloc, ".shared .align 16 .b8 smem[{d}];", .{SH});
+    defer alloc.free(shared_decl);
+    return b.build(
+        "mmq_pipe_q4_k",
+        "    .param .u64 p_w,\n    .param .u64 p_x,\n    .param .u64 p_y,\n    .param .u32 p_rows,\n    .param .u32 p_cols,\n    .param .u32 p_n,\n    .param .f32 p_scale",
+        shared_decl,
+    );
+}
+
+/// q6_k MMQ, the pipe-tiled twin of `buildMmqPipeQ4K`. Same 128x128 / 2x2-warp /
+/// MT=4 / NT=8 shape and the same "decode the weight tile once into shared"
+/// idea; three things differ, all forced by the format:
+///
+///   1. q6_k's scale changes every 16 elements, not 32, so the mma is
+///      `m16n8k16` (one per sub-block) instead of `m16n8k32`. Same MACs per k,
+///      twice the instructions — but no wasted lanes, which zero-padding a
+///      k32 mma to cover one 16-element scale would cost.
+///   2. `v = d*sc*(q-32)` has NO min term, so there is no sum(qa) to carry and
+///      the fold is just `acc += d*sc*da*c`. The -32 is folded into the staged
+///      weight instead (SWAR byte subtract, see below), which keeps the mma
+///      operand a plain s8 in [-32,31].
+///   3. The 210-byte block is only 2-BYTE aligned (210 = 2 mod 4, and the row
+///      stride nsb*210 inherits that), so the weight bytes come in as u16 pairs
+///      assembled into u32 — the same dance `gemv_q6_k_q8n` does. q4_k's 144-byte
+///      block is 16-aligned and could use v4.u32.
+///
+/// Element mapping, checked against ggml's `dequantize_row_q6_K`: for slab
+/// `i_local` (0..3) of a super-block, with h = i_local>>1 and parity = i_local&1,
+/// element e (0..63) of the slab reads ql[h*64 + e] (low nibble when parity==0,
+/// high when 1), qh[h*32 + (e&31)] shifted right by 4*parity + 2*(e>>5), and uses
+/// scale index i_local*4 + s for substep s = e>>4. The natural element order lines
+/// up with the activation layout, so no k-permutation is needed.
+///
+/// Requires cols % 256 == 0 and rows % 128 == 0; `n` padded to 128 by the caller.
+/// Entry `mmq_pipe_q6_k`.
+pub fn buildMmqPipeQ6K(alloc: std.mem.Allocator) ![:0]u8 {
+    const BM = 128;
+    const BN = 128;
+    const kstep = 64;
+    const KS = kstep / 16; // 16-k substeps == q6_k sub-blocks per slab
+    const MT = 4;
+    const NT = 8;
+    const ATILE = BM * kstep;
+    const BTILE = BN * kstep;
+    const ASC = BM * KS * 4; // d*sc f32 per row per substep
+    const BSC = BN * KS * 4; // da f32 per col per substep
+    const B_OFF = ATILE;
+    const ASC_OFF = ATILE + BTILE;
+    const BSC_OFF = ASC_OFF + ASC;
+    const SH = BSC_OFF + BSC;
+
+    var b = ptx.Builder.init(alloc);
+    defer b.deinit();
+
+    const acc = try b.regs(.f32, MT * NT * 4);
+    const af = try b.regs(.b32, MT * 2);
+    const bfr = try b.regs(.b32, NT);
+    const ct = try b.regs(.b32, 4);
+    const zq = try b.regs(.b32, 4);
+    const rsc = try b.regs(.f32, MT * 2);
+    const csc = try b.regs(.f32, 2);
+
+    const rd_w = try b.reg(.b64);
+    const rd_x = try b.reg(.b64);
+    const rd_y = try b.reg(.b64);
+    const r_rows = try b.reg(.b32);
+    const r_cols = try b.reg(.b32);
+    const r_n = try b.reg(.b32);
+    const f_scale = try b.reg(.f32);
+    try b.linef("ld.param.u64 {s}, [p_w];", .{rd_w});
+    try b.linef("ld.param.u64 {s}, [p_x];", .{rd_x});
+    try b.linef("ld.param.u64 {s}, [p_y];", .{rd_y});
+    try b.linef("ld.param.u32 {s}, [p_rows];", .{r_rows});
+    try b.linef("ld.param.u32 {s}, [p_cols];", .{r_cols});
+    try b.linef("ld.param.u32 {s}, [p_n];", .{r_n});
+    try b.linef("ld.param.f32 {s}, [p_scale];", .{f_scale});
+    try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_w, rd_w });
+    try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_x, rd_x });
+    try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_y, rd_y });
+
+    const r_t = try b.reg(.b32);
+    const r_lane = try b.reg(.b32);
+    const r_warp = try b.reg(.b32);
+    const r_wm = try b.reg(.b32);
+    const r_wn = try b.reg(.b32);
+    const r_gid = try b.reg(.b32);
+    const r_tf = try b.reg(.b32);
+    const r_row0 = try b.reg(.b32);
+    const r_col0 = try b.reg(.b32);
+    const r_smem = try b.reg(.b32);
+    const r_nsb = try b.reg(.b32);
+    const r_rb = try b.reg(.b32);
+    const r_bpt = try b.reg(.b32);
+    const tm = try b.regs(.b32, 8);
+    const rdt = try b.regs(.b64, 4);
+
+    try b.linef("mov.u32 {s}, smem;", .{r_smem});
+    try b.linef("mov.u32 {s}, %tid.x;", .{r_t});
+    try b.linef("and.b32 {s}, {s}, 31;", .{ r_lane, r_t });
+    try b.linef("shr.u32 {s}, {s}, 5;", .{ r_warp, r_t });
+    try b.linef("and.b32 {s}, {s}, 1;", .{ r_wm, r_warp });
+    try b.linef("shr.u32 {s}, {s}, 1;", .{ r_wn, r_warp });
+    try b.linef("shr.u32 {s}, {s}, 2;", .{ r_gid, r_lane });
+    try b.linef("and.b32 {s}, {s}, 3;", .{ r_tf, r_lane });
+    try b.linef("mov.u32 {s}, %ctaid.y;", .{r_row0});
+    try b.linef("shl.b32 {s}, {s}, 7;", .{ r_row0, r_row0 });
+    try b.linef("mov.u32 {s}, %ctaid.x;", .{r_col0});
+    try b.linef("shl.b32 {s}, {s}, 7;", .{ r_col0, r_col0 });
+    try b.linef("shr.u32 {s}, {s}, 8;", .{ r_nsb, r_cols });
+    try b.linef("mul.lo.u32 {s}, {s}, 210;", .{ r_rb, r_nsb });
+    try b.linef("shr.u32 {s}, {s}, 5;", .{ r_bpt, r_cols });
+
+    const rd_qs = try b.reg(.b64);
+    try b.linef("mul.lo.u32 {s}, {s}, {s};", .{ tm[0], r_n, r_bpt });
+    try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rd_qs, tm[0] });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_qs, rd_x, rd_qs });
+
+    const rd_wrow = try b.reg(.b64);
+    const rd_bcol = try b.reg(.b64);
+    const r_gcol = try b.reg(.b32);
+    try b.linef("add.u32 {s}, {s}, {s};", .{ tm[0], r_row0, r_t });
+    try b.linef("mul.wide.u32 {s}, {s}, {s};", .{ rd_wrow, tm[0], r_rb });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_wrow, rd_w, rd_wrow });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_gcol, r_col0, r_t });
+    try b.linef("mul.wide.u32 {s}, {s}, {s};", .{ rd_bcol, r_gcol, r_cols });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_bcol, rd_qs, rd_bcol });
+
+    const r_adst = try b.reg(.b32);
+    const r_bdst = try b.reg(.b32);
+    const r_ascd = try b.reg(.b32);
+    const r_bscd = try b.reg(.b32);
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_adst, r_t, kstep });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_adst, r_adst, r_smem });
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_bdst, r_t, kstep });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_bdst, r_bdst, r_smem });
+    try b.linef("add.u32 {s}, {s}, {d};", .{ r_bdst, r_bdst, B_OFF });
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_ascd, r_t, KS * 4 });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_ascd, r_ascd, r_smem });
+    try b.linef("add.u32 {s}, {s}, {d};", .{ r_ascd, r_ascd, ASC_OFF });
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_bscd, r_t, KS * 4 });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_bscd, r_bscd, r_smem });
+    try b.linef("add.u32 {s}, {s}, {d};", .{ r_bscd, r_bscd, BSC_OFF });
+
+    const r_asl = try b.reg(.b32);
+    const r_bsl = try b.reg(.b32);
+    try b.linef("shl.b32 {s}, {s}, 6;", .{ tm[0], r_wm });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ tm[0], tm[0], r_gid });
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_asl, tm[0], kstep });
+    try b.linef("shl.b32 {s}, {s}, 2;", .{ tm[1], r_tf });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl, r_asl, tm[1] });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl, r_asl, r_smem });
+    try b.linef("shl.b32 {s}, {s}, 6;", .{ tm[0], r_wn });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ tm[0], tm[0], r_gid });
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_bsl, tm[0], kstep });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_bsl, r_bsl, tm[1] });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_bsl, r_bsl, r_smem });
+    try b.linef("add.u32 {s}, {s}, {d};", .{ r_bsl, r_bsl, B_OFF });
+
+    const r_ascr = try b.reg(.b32);
+    const r_bscr = try b.reg(.b32);
+    try b.linef("shl.b32 {s}, {s}, 6;", .{ tm[0], r_wm });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ tm[0], tm[0], r_gid });
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_ascr, tm[0], KS * 4 });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_ascr, r_ascr, r_smem });
+    try b.linef("add.u32 {s}, {s}, {d};", .{ r_ascr, r_ascr, ASC_OFF });
+    try b.linef("shl.b32 {s}, {s}, 6;", .{ tm[0], r_wn });
+    try b.linef("shl.b32 {s}, {s}, 1;", .{ tm[1], r_tf });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ tm[0], tm[0], tm[1] });
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_bscr, tm[0], KS * 4 });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_bscr, r_bscr, r_smem });
+    try b.linef("add.u32 {s}, {s}, {d};", .{ r_bscr, r_bscr, BSC_OFF });
+
+    for (acc) |r| try b.linef("mov.f32 {s}, 0f00000000;", .{r});
+    for (zq) |r| try b.linef("mov.u32 {s}, 0;", .{r});
+
+    const r_i = try b.reg(.b32);
+    const r_nslab = try b.reg(.b32);
+    const pr = try b.regs(.pred, 2);
+    const lp = try b.newLabel("slab6");
+    try b.linef("shr.u32 {s}, {s}, 6;", .{ r_nslab, r_cols });
+    try b.linef("mov.u32 {s}, 0;", .{r_i});
+    try b.label(lp);
+
+    // -- stage A: decode this thread's row of q6_k into shared ---------------
+    const rs = try b.regs(.b16, 2);
+    const qh = try b.regs(.b32, 8); // qh groups g=0..7, reused by g=8..15
+    const gw = try b.regs(.b32, 4); // one v4 store's worth of decoded bytes
+    const r_par = try b.reg(.b32);
+    const r_sh4 = try b.reg(.b32);
+    const rd_ql = try b.reg(.b64);
+    const rd_qh = try b.reg(.b64);
+    try b.linef("shr.u32 {s}, {s}, 2;", .{ tm[0], r_i }); // sb
+    try b.linef("and.b32 {s}, {s}, 3;", .{ tm[1], r_i }); // i_local
+    try b.linef("mul.lo.u32 {s}, {s}, 210;", .{ tm[2], tm[0] });
+    try b.linef("cvt.u64.u32 {s}, {s};", .{ rdt[0], tm[2] });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[1], rd_wrow, rdt[0] }); // super-block base
+    try b.linef("shr.u32 {s}, {s}, 1;", .{ tm[3], tm[1] }); // h
+    try b.linef("and.b32 {s}, {s}, 1;", .{ r_par, tm[1] }); // parity
+    try b.linef("shl.b32 {s}, {s}, 2;", .{ r_sh4, r_par }); // 4*parity
+    try b.linef("shl.b32 {s}, {s}, 6;", .{ tm[4], tm[3] }); // h*64
+    try b.linef("cvt.u64.u32 {s}, {s};", .{ rdt[0], tm[4] });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_ql, rdt[1], rdt[0] });
+    try b.linef("shl.b32 {s}, {s}, 5;", .{ tm[4], tm[3] }); // h*32
+    try b.linef("add.u32 {s}, {s}, 128;", .{ tm[4], tm[4] });
+    try b.linef("cvt.u64.u32 {s}, {s};", .{ rdt[0], tm[4] });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_qh, rdt[1], rdt[0] });
+    // Round both pointers down to 4 bytes and recombine with a funnel shift of
+    // (addr & 3) * 8, which is 0 or 16 (the base is always even).
+    const r_shb = try b.reg(.b32);
+    const rd_qla = try b.reg(.b64);
+    const rd_qha = try b.reg(.b64);
+    const wcar = try b.reg(.b32);
+    const wnew = try b.regs(.b32, 4);
+    try b.linef("cvt.u32.u64 {s}, {s};", .{ tm[5], rd_ql });
+    try b.linef("and.b32 {s}, {s}, 3;", .{ tm[5], tm[5] });
+    try b.linef("shl.b32 {s}, {s}, 3;", .{ r_shb, tm[5] });
+    try b.linef("and.b64 {s}, {s}, -4;", .{ rd_qla, rd_ql });
+    try b.linef("and.b64 {s}, {s}, -4;", .{ rd_qha, rd_qh });
+    // qh groups (8 u32 = 32 bytes): 9 aligned loads feed 8 funnels.
+    try b.linef("ld.global.u32 {s}, [{s}];", .{ wcar, rd_qha });
+    for (0..8) |g| {
+        try b.linef("ld.global.u32 {s}, [{s}+{d}];", .{ wnew[0], rd_qha, g * 4 + 4 });
+        try b.linef("shf.r.clamp.b32 {s}, {s}, {s}, {s};", .{ qh[g], wcar, wnew[0], r_shb });
+        try b.linef("mov.b32 {s}, {s};", .{ wcar, wnew[0] });
+    }
+    // 16 groups of 4 elements; 4 groups per v4.u32 shared store.
+    for (0..4) |gg| {
+        for (0..4) |k| {
+            const g = gg * 4 + k;
+            if (g == 0) try b.linef("ld.global.u32 {s}, [{s}];", .{ wcar, rd_qla });
+            try b.linef("ld.global.u32 {s}, [{s}+{d}];", .{ wnew[k], rd_qla, g * 4 + 4 });
+            try b.linef("shf.r.clamp.b32 {s}, {s}, {s}, {s};", .{ gw[k], wcar, wnew[k], r_shb });
+            try b.linef("mov.b32 {s}, {s};", .{ wcar, wnew[k] });
+            // low nibble when parity==0, high when 1 -> one runtime shift
+            try b.linef("shr.u32 {s}, {s}, {s};", .{ gw[k], gw[k], r_sh4 });
+            try b.linef("and.b32 {s}, {s}, 0x0f0f0f0f;", .{ gw[k], gw[k] });
+            // qh bits: shift = 4*parity + 2*(e>>5); e>>5 is 0 for g<8, 1 for g>=8
+            try b.linef("add.u32 {s}, {s}, {d};", .{ tm[5], r_sh4, if (g >= 8) @as(usize, 2) else 0 });
+            try b.linef("shr.u32 {s}, {s}, {s};", .{ tm[6], qh[g & 7], tm[5] });
+            try b.linef("and.b32 {s}, {s}, 0x03030303;", .{ tm[6], tm[6] });
+            try b.linef("shl.b32 {s}, {s}, 4;", .{ tm[6], tm[6] });
+            try b.linef("or.b32 {s}, {s}, {s};", .{ gw[k], gw[k], tm[6] });
+            // byte-wise -32. Each byte is in [0,63] so bit7 is clear; setting it
+            // first stops the borrow crossing into the next byte, and the final
+            // XOR removes it again. (v|0x80)-0x20 never borrows, and
+            // ((b+96)^128) == (b-32) mod 256 for b in [0,63].
+            try b.linef("or.b32 {s}, {s}, 0x80808080;", .{ gw[k], gw[k] });
+            try b.linef("sub.u32 {s}, {s}, 0x20202020;", .{ gw[k], gw[k] });
+            try b.linef("xor.b32 {s}, {s}, 0x80808080;", .{ gw[k], gw[k] });
+        }
+        try b.linef("st.shared.v4.u32 [{s}+{d}], {{{s}, {s}, {s}, {s}}};", .{ r_adst, gg * 16, gw[0], gw[1], gw[2], gw[3] });
+    }
+    // -- stage A scales: d * (signed int8) sc[i_local*4 + s] -----------------
+    const fd6 = try b.reg(.f32);
+    const fsv = try b.regs(.f32, 4);
+    try b.linef("ld.global.u16 {s}, [{s}+208];", .{ rs[0], rdt[1] });
+    try b.linef("cvt.f32.f16 {s}, {s};", .{ fd6, rs[0] });
+    try b.linef("shl.b32 {s}, {s}, 2;", .{ tm[5], tm[1] }); // i_local*4
+    try b.linef("add.u32 {s}, {s}, 192;", .{ tm[5], tm[5] });
+    try b.linef("cvt.u64.u32 {s}, {s};", .{ rdt[0], tm[5] });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[2], rdt[1], rdt[0] });
+    try b.linef("cvt.u32.u64 {s}, {s};", .{ tm[7], rdt[2] });
+    try b.linef("and.b32 {s}, {s}, 3;", .{ tm[7], tm[7] });
+    try b.linef("shl.b32 {s}, {s}, 3;", .{ tm[7], tm[7] });
+    try b.linef("and.b64 {s}, {s}, -4;", .{ rdt[3], rdt[2] });
+    try b.linef("ld.global.u32 {s}, [{s}];", .{ tm[6], rdt[3] });
+    try b.linef("ld.global.u32 {s}, [{s}+4];", .{ wcar, rdt[3] });
+    try b.linef("shf.r.clamp.b32 {s}, {s}, {s}, {s};", .{ tm[6], tm[6], wcar, tm[7] });
+    for (0..4) |s| {
+        try b.linef("shl.b32 {s}, {s}, {d};", .{ tm[7], tm[6], 24 - 8 * s });
+        try b.linef("shr.s32 {s}, {s}, 24;", .{ tm[7], tm[7] }); // sign-extend
+        try b.linef("cvt.rn.f32.s32 {s}, {s};", .{ fsv[s], tm[7] });
+        try b.linef("mul.f32 {s}, {s}, {s};", .{ fsv[s], fsv[s], fd6 });
+    }
+    try b.linef("st.shared.v4.f32 [{s}], {{{s}, {s}, {s}, {s}}};", .{ r_ascd, fsv[0], fsv[1], fsv[2], fsv[3] });
+
+    // -- stage B: activations (16-byte aligned) + their per-32-block scale ----
+    try b.linef("shl.b32 {s}, {s}, 6;", .{ tm[0], r_i });
+    try b.linef("cvt.u64.u32 {s}, {s};", .{ rdt[0], tm[0] });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[1], rd_bcol, rdt[0] });
+    for (0..4) |q| {
+        try b.linef("ld.global.v4.u32 {{{s}, {s}, {s}, {s}}}, [{s}+{d}];", .{ qh[0], qh[1], qh[2], qh[3], rdt[1], q * 16 });
+        try b.linef("st.shared.v4.u32 [{s}+{d}], {{{s}, {s}, {s}, {s}}};", .{ r_bdst, q * 16, qh[0], qh[1], qh[2], qh[3] });
+    }
+    // Substeps 0,1 fall in activation block i*2 and 2,3 in i*2+1 (q8_1 blocks are
+    // 32 elements, q6_k sub-blocks 16), so each da is used by two substeps.
+    try b.linef("shl.b32 {s}, {s}, 1;", .{ tm[0], r_i });
+    try b.linef("mad.lo.u32 {s}, {s}, {s}, {s};", .{ tm[1], r_gcol, r_bpt, tm[0] });
+    try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rdt[0], tm[1] });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[2], rd_x, rdt[0] });
+    try b.linef("ld.global.f32 {s}, [{s}];", .{ fsv[0], rdt[2] });
+    try b.linef("ld.global.f32 {s}, [{s}+4];", .{ fsv[2], rdt[2] });
+    try b.linef("mov.f32 {s}, {s};", .{ fsv[1], fsv[0] });
+    try b.linef("mov.f32 {s}, {s};", .{ fsv[3], fsv[2] });
+    try b.linef("st.shared.v4.f32 [{s}], {{{s}, {s}, {s}, {s}}};", .{ r_bscd, fsv[0], fsv[1], fsv[2], fsv[3] });
+
+    try b.line("bar.sync 0;");
+
+    // ---- compute -----------------------------------------------------------
+    var s: usize = 0;
+    while (s < KS) : (s += 1) {
+        var mi: usize = 0;
+        while (mi < MT) : (mi += 1) {
+            const o = mi * 16 * kstep + s * 16;
+            try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ af[mi * 2 + 0], r_asl, o });
+            try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ af[mi * 2 + 1], r_asl, o + 8 * kstep });
+            const so = mi * 16 * KS * 4 + s * 4;
+            try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ rsc[mi * 2 + 0], r_ascr, so });
+            try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ rsc[mi * 2 + 1], r_ascr, so + 8 * KS * 4 });
+        }
+        var nj: usize = 0;
+        while (nj < NT) : (nj += 1) {
+            try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ bfr[nj], r_bsl, nj * 8 * kstep + s * 16 });
+        }
+        nj = 0;
+        while (nj < NT) : (nj += 1) {
+            const co = nj * 8 * KS * 4 + s * 4;
+            try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ csc[0], r_bscr, co });
+            try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ csc[1], r_bscr, co + KS * 4 });
+            mi = 0;
+            while (mi < MT) : (mi += 1) {
+                try b.linef("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {{{s},{s},{s},{s}}}, {{{s},{s}}}, {{{s}}}, {{{s},{s},{s},{s}}};", .{
+                    ct[0],          ct[1],          ct[2], ct[3],
+                    af[mi * 2 + 0], af[mi * 2 + 1],
+                    bfr[nj],
+                    zq[0],          zq[1],          zq[2], zq[3],
+                });
+                const a = acc[(mi * NT + nj) * 4 ..][0..4];
+                const rows2 = [_]usize{ 0, 0, 1, 1 };
+                const cols2 = [_]usize{ 0, 1, 0, 1 };
+                for (0..4) |ci| {
+                    try b.linef("cvt.rn.f32.s32 {s}, {s};", .{ fsv[0], ct[ci] });
+                    try b.linef("mul.f32 {s}, {s}, {s};", .{ fsv[1], rsc[mi * 2 + rows2[ci]], csc[cols2[ci]] });
+                    try b.linef("fma.rn.f32 {s}, {s}, {s}, {s};", .{ a[ci], fsv[1], fsv[0], a[ci] });
+                }
+            }
+        }
+    }
+    try b.line("bar.sync 0;");
+    try b.linef("add.u32 {s}, {s}, 1;", .{ r_i, r_i });
+    try b.linef("setp.lt.u32 {s}, {s}, {s};", .{ pr[0], r_i, r_nslab });
+    try b.linef("@{s} bra {s};", .{ pr[0], lp });
+
+    // ---- store -------------------------------------------------------------
+    const r_crow = try b.reg(.b32);
+    const r_ccol = try b.reg(.b32);
+    try b.linef("shl.b32 {s}, {s}, 6;", .{ r_crow, r_wm });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_crow, r_crow, r_row0 });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_crow, r_crow, r_gid });
+    try b.linef("shl.b32 {s}, {s}, 6;", .{ r_ccol, r_wn });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_ccol, r_ccol, r_col0 });
+    try b.linef("shl.b32 {s}, {s}, 1;", .{ tm[0], r_tf });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_ccol, r_ccol, tm[0] });
+    var mi2: usize = 0;
+    while (mi2 < MT) : (mi2 += 1) {
+        var nj2: usize = 0;
+        while (nj2 < NT) : (nj2 += 1) {
+            const a = acc[(mi2 * NT + nj2) * 4 ..][0..4];
+            const rowoff = [_]usize{ 0, 0, 8, 8 };
+            const coloff = [_]usize{ 0, 1, 0, 1 };
+            for (0..4) |ci| {
+                try b.linef("add.u32 {s}, {s}, {d};", .{ tm[1], r_crow, mi2 * 16 + rowoff[ci] });
+                try b.linef("add.u32 {s}, {s}, {d};", .{ tm[2], r_ccol, nj2 * 8 + coloff[ci] });
+                try b.linef("mad.lo.u32 {s}, {s}, {s}, {s};", .{ tm[3], tm[2], r_rows, tm[1] });
+                try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rdt[0], tm[3] });
+                try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[0], rd_y, rdt[0] });
+                try b.linef("mul.f32 {s}, {s}, {s};", .{ fsv[0], a[ci], f_scale });
+                try b.linef("st.global.f32 [{s}], {s};", .{ rdt[0], fsv[0] });
+            }
+        }
+    }
+
+    const shared_decl = try std.fmt.allocPrint(alloc, ".shared .align 16 .b8 smem[{d}];", .{SH});
+    defer alloc.free(shared_decl);
+    return b.build(
+        "mmq_pipe_q6_k",
+        "    .param .u64 p_w,\n    .param .u64 p_x,\n    .param .u64 p_y,\n    .param .u32 p_rows,\n    .param .u32 p_cols,\n    .param .u32 p_n,\n    .param .f32 p_scale",
+        shared_decl,
+    );
+}

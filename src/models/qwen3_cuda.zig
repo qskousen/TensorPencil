@@ -861,6 +861,23 @@ pub const CudaLM = struct {
         return residency.offloadToBudget(self, target);
     }
 
+    /// `residency.demand` hook: this layer's weight bytes alone (no KV). Lets the
+    /// demand estimate separate "weights not uploaded yet" — which the backend's
+    /// pinned-bytes counter already accounts for globally — from the device KV a
+    /// promote has to re-create.
+    pub fn layerWeightBytes(self: *CudaLM, l: usize) usize {
+        return layerDeviceBytes(&self.lm.layers[l]);
+    }
+
+    /// `residency.demand` hook: device-resident weights that are not per-layer.
+    /// A tied head/embedding is ONE cached device buffer (the weight cache keys
+    /// on the byte slice), so count it once.
+    pub fn nonLayerDeviceBytes(self: *CudaLM) u64 {
+        const h = self.lm.head.bytes;
+        const e = self.lm.embed.bytes;
+        return h.len + if (e.ptr == h.ptr) 0 else e.len;
+    }
+
     /// `residency.promoteBack` cost hook: VRAM a promote of layer `l` needs —
     /// its streamable weights, the KV it re-commits at the current capacity,
     /// plus slack.

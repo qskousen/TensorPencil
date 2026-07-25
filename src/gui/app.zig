@@ -23,6 +23,7 @@ const diffuser = @import("diffuser.zig");
 const clipboard = @import("clipboard.zig");
 const meter = @import("meter.zig");
 const status_bar = @import("status_bar.zig");
+const sysmon = @import("sysmon.zig");
 const vips = @import("vips");
 
 // dvui frames are argless, so app state is process-global (the dvui idiom).
@@ -161,14 +162,44 @@ fn applyMeterPolicy() void {
         std.log.warn("[vram] meter policy skipped: VRAM query failed — arbiter budgets NOT updated", .{});
         return;
     }
-    const free_b: u64 = mi.free;
-    const used_all: u64 = total -| free_b;
+    // ONE coherent pass over the card, then one rule (see `vram.resolve`).
+    //
+    // This replaced `budget = limit - system`, where `system` was the residual
+    // `device_used - our_tracked`. That put an unreliable number alone on the
+    // right-hand side: it is sampled here, right after a load, when our own CUDA
+    // context / JIT'd modules / library workspaces do not exist yet — so it read
+    // ~1.1 GiB low, the budget came out that much too generous, the LLM promoted
+    // every layer to fill it, and the next batched allocation OOM'd and offloaded
+    // them straight back. `resolve` frames the handle as a RESERVE instead, where
+    // an under-read can only fall back to what the user asked for.
+    const tf: f32 = @floatFromInt(total);
     const llm_res: u64 = s.be.deviceUsed();
     const diff_res: u64 = if (g_diffuser) |*d| d.vramBytes() else 0;
-    const system = used_all -| llm_res -| diff_res;
-    const tf: f32 = @floatFromInt(total);
-    const limit_bytes: u64 = @intFromFloat(g_limit * tf);
-    const available: u64 = limit_bytes -| system; // budget for LLM + diffusion
+    var card: vram.Card = .{
+        .total = total,
+        .foreign = null, // no NVML: degrade to the residual (conservative)
+        .ours_tracked = llm_res + diff_res,
+        .device_used = total -| mi.free,
+    };
+    if (sysmon.nvml()) |nv| {
+        if (nv.selfUsed()) |proc| {
+            // Same pass as `mi` above. `foreign` is then OTHER PROCESSES ONLY, and
+            // our unattributed bytes land in `ours_total` where they belong.
+            card.foreign = card.device_used -| proc;
+            card.ours_total = proc;
+        }
+    }
+    // High-water the untracked term: it is ~0 on a cold model and grows as modules
+    // and workspaces are JIT'd/allocated. Letting it fall back would re-inflate the
+    // budget mid-session and restart the promote -> OOM -> offload cycle. It is
+    // deliberately NOT reset per model load — the CUDA context and compiled modules
+    // behind most of it outlive any one session.
+    const res = vram.resolve(.{ .fraction = g_limit }, card, g_untracked_high_water);
+    g_untracked_high_water = res.untracked;
+
+    const available: u64 = res.tracked; // cap on LLM + diffusion TRACKED bytes
+    // The split handle stays a fraction of the CARD (that is what the meter draws),
+    // clamped into what is actually ours to give away.
     const share: u64 = @min(@as(u64, @intFromFloat(g_split * tf)), available);
 
     // Guarded so a direct (idle) settle can't race the diffusion worker's reclaim
@@ -176,14 +207,17 @@ fn applyMeterPolicy() void {
     // the engine's own `res_mu` internally.
     g_session_mu.lockUncancelable(g_io);
     defer g_session_mu.unlock(g_io);
-    // Mirror the resolved policy onto the session for the status-bar display and
-    // the reset/reclaim ceiling (these fields outlive the arbiter's live state).
     s.vram_limit = available;
     s.vram_share = share;
     s.vram_budget = available;
-    std.log.info("[vram] meter policy: limit {d} MiB − system {d} → budget {d} MiB · LLM share {d} (LLM {d} + diff {d} resident, {d} free)", .{
-        limit_bytes >> 20, system >> 20, available >> 20, share >> 20, llm_res >> 20, diff_res >> 20, free_b >> 20,
+    var rbuf: [200]u8 = undefined;
+    std.log.info("[vram] card {d} MiB · limit {d} · {s}{s}", .{
+        total >> 20,
+        @as(u64, @intFromFloat(g_limit * tf)) >> 20,
+        res.render(&rbuf),
+        if (card.foreign == null) " (no NVML: foreign is a residual)" else "",
     });
+    vram.logResidency("LLM", s.residencyNeed(), s.residencyHave());
     g_arbiter.setBudgets(available, share);
 }
 
@@ -555,6 +589,7 @@ pub fn run(init: std.process.Init) !void {
     main_loop: while (true) {
         maybeProcessEjects();
         maybeStartReload();
+        maybeRefreshMeterPolicy();
         // Pump the app-level diffusion engine every frame (both modes; even under
         // Settings) so an in-flight generation finishes — it drains its own
         // unified queue. Gated on !loading so no diffusion worker touches the
@@ -1043,8 +1078,27 @@ fn vcExit(_: *anyopaque) void {
         defer g_session_mu.unlock(g_io);
         g_arbiter.diff_active = false;
     }
+    persistDiffPeak();
     applyMeterPolicy();
 }
+
+/// Persist the diffusion pipeline's measured peak residency when it grows. Called
+/// on the queue-drain edge (once per batch, not per frame) so the NEXT session's
+/// first image plans against a measurement instead of the file-size bootstrap.
+fn persistDiffPeak() void {
+    const d = if (g_diffuser) |*x| x else return;
+    const peak = d.peakResident();
+    if (peak <= g_config.diff_peak_resident) return;
+    const model = g_config.diffusion_model.opt() orelse return;
+    g_config.diff_peak_resident = peak;
+    g_config.diff_peak_key = config.modelKey(model);
+    g_config_baseline.diff_peak_resident = peak;
+    g_config_baseline.diff_peak_key = g_config.diff_peak_key;
+    g_config.save(g_io, g_gpa, g_environ, g_config_path) catch |err|
+        std.log.warn("[vram] could not persist measured diffusion peak: {t}", .{err});
+    std.log.info("[vram] measured diffusion peak {d} MiB (persisted; supersedes the checkpoint-size estimate)", .{peak >> 20});
+}
+
 fn vcBudget(_: *anyopaque) u64 {
     // Called on the diffusion WORKER thread — serialize with a concurrent LLM
     // eject (unloadLlm) that may be freeing the session right now. Pure read.
@@ -1115,6 +1169,16 @@ fn syncDiffuser() void {
     if (g_diffuser == null) {
         g_diffuser = diffuser.Diffuser.init(g_gpa, g_io, wakeupFrame, dcfgFromConfig(), appCoordinator());
         g_diffuser.?.seedBase(@truncate(@as(u96, @bitCast(std.Io.Clock.real.now(g_io).nanoseconds))));
+        // Carry the previously MEASURED peak residency across sessions, so the
+        // first image of a run sizes the LLM's eviction by what this pipeline
+        // actually costs instead of by what its checkpoints weigh. Keyed on the
+        // DiT path: a different model invalidates the figure.
+        if (g_config.diff_peak_resident != 0) {
+            if (g_config.diffusion_model.opt()) |m| {
+                if (config.modelKey(m) == g_config.diff_peak_key)
+                    g_diffuser.?.seedPeakResident(g_config.diff_peak_resident);
+            }
+        }
         // Register the image model as an arbiter participant so a growing LLM can
         // reclaim its idle residency (the direction that never worked). The
         // participant borrows the engine; `freeDiffuser` drops it before teardown.
@@ -1237,6 +1301,46 @@ fn cancelConfig() void {
     g_config = config.Config.load(g_io, g_gpa, g_environ, g_config_path);
     g_config_baseline = g_config;
     g_view = g_return_view;
+}
+
+/// Tracks the LLM's busy edge for `maybeRefreshMeterPolicy`.
+var g_llm_was_busy: bool = false;
+
+/// High-water mark of OUR unattributed card footprint (CUDA context, JIT'd
+/// modules, library workspaces, UI textures). See `applyMeterPolicy`.
+var g_untracked_high_water: u64 = 0;
+
+/// Main-loop hook: re-resolve the meter policy when the LLM finishes a turn.
+///
+/// The arbiter's residency targets come from `residency.demand`, and for an
+/// LLM-only session the plan behind them was computed exactly once — at load,
+/// when the model is COLD. Its RoPE tables, activation/logits scratch and dequant
+/// buffers are not allocated until the first forward, so `demand`'s cold bound
+/// cannot see them and reports less than full residency costs. That
+/// under-estimate then sticks as the ceiling for the whole session: the LLM
+/// offloads layers to obey a target below its real footprint while GiBs of the
+/// card sit unused (measured on gemma4-31B: target 19796 MiB against a 21527 MiB
+/// budget — 6/60 layers pushed to the host with 2 GiB idle).
+///
+/// Re-planning at a turn boundary keeps residency tracking a budget that moves:
+/// `system` steps once as our untracked CUDA/library footprint materializes, and
+/// the KV grows all session.
+///
+/// BOTH edges matter, because `Arbiter.plan` gates the split handle on who is
+/// actually working:
+///   idle -> busy   the LLM starts a turn, so the split now binds and it reclaims
+///                  the layers an image model borrowed while it was idle.
+///   busy -> idle   the turn ended, so a working diffuser may take what it needs.
+/// Edge-triggered, so an idle UI re-plans nothing; cheap when it does fire (one
+/// memGetInfo plus a plan).
+fn maybeRefreshMeterPolicy() void {
+    const s = g_session orelse {
+        g_llm_was_busy = false;
+        return;
+    };
+    const busy = s.busy();
+    defer g_llm_was_busy = busy;
+    if (g_llm_was_busy != busy) applyMeterPolicy();
 }
 
 /// Main-loop hook: reap a finished loader, and start a pending (re)load when

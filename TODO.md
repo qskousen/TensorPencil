@@ -1,7 +1,11 @@
 - begin filling in holes in the capabilities grid (BACKEND.md)
 - add more sampling methods
 - tool call boxes inline, expandable to see the tool call
+- collapsible image row in llm chat
+- move image generation details to a pane to the right of the image instead of underneath. clean up and make it more attractive
+- small footer to show prefill/s and tok/s on each message (smaller font, grayed out)
 - chat ui touchup because it's super ugly
+- make integration tests shorter?
 - GPU sampling follow-ups (phases 1-4 landed: on-device argmax + top-k for qwen3 on all backends, chain-greedy spec verify):
   - spec-decode TREE-greedy verify on GPU: generateTree still downloads (1+m)*vocab (up to ~38MB for a 64-node tree). Add CudaLM.stepAllTreeArgmax (tree forward + per-row opArgmax) and have the greedy walk use g[cur] instead of sampler.dist(row).ids[0] (gated on !penaltiesActive(), or reuse opPenalize per row). Needs an EAGLE draft head to validate e2e.
   - spec-decode STOCHASTIC-chain verify on GPU: reuse opTopK per row + rebuild the Dist on the CPU (accept/sampleExcluding), so temp>0 --spec-k stops downloading (k+1)*vocab.

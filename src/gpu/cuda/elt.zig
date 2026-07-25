@@ -1218,11 +1218,19 @@ pub const gemv_q6_k_ptx: [:0]const u8 =
 ;
 
 /// Quantize a decode activation vector to q8 blocks for the dp4a GEMV path,
-/// SoA so the GEMVs use vector loads: f32 d[nblk] then i8 qs[cols], with
-/// d = amax/127 per 32-elem block, q = rni(x*127/amax) (llama.cpp
-/// quantize_q8_1 semantics; no stored sum — the GEMVs recover per-quad sums
-/// with dp4a against 0x01010101). Warp per block: lane loads one elem,
-/// butterfly-max for amax. b0=x f32[cols], b1=xq out. u0=nblk (cols/32).
+/// SoA so the GEMVs use vector loads: f32 d[nblk], i8 qs[cols], f32 s[nblk],
+/// with d = amax/127 per 32-elem block, q = rni(x*127/amax) (llama.cpp
+/// quantize_q8_1 semantics) and s = Σq over the block.
+///
+/// The dp4a GEMVs recover per-quad sums themselves (dp4a against 0x01010101)
+/// and only read d/qs, so the trailing `s` region is inert for them. It exists
+/// for the MMQ tensor-core path, whose k-quant min term (`-dmin*m*Σq`) is
+/// folded per 32-elem sub-block AFTER the mma — there the sum can't come out
+/// of the integer dot, and recomputing it per weight tile would repeat work
+/// that is identical across every weight matrix in a layer.
+///
+/// Warp per block: lane loads one elem, butterfly-max for amax, butterfly-add
+/// for Σq. b0=x f32[cols], b1=xq out. u0=nblk (cols/32).
 pub const quantize_q8_1_ptx: [:0]const u8 =
     \\.version 8.0
     \\.target sm_86
@@ -1231,9 +1239,9 @@ pub const quantize_q8_1_ptx: [:0]const u8 =
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
     \\  .reg .pred %p<4>;
-    \\  .reg .b32 %r<24>;
-    \\  .reg .f32 %f<12>;
-    \\  .reg .b64 %rd<12>;
+    \\  .reg .b32 %r<32>;
+    \\  .reg .f32 %f<16>;
+    \\  .reg .b64 %rd<16>;
     \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%tid.x;
     \\  shr.u32 %r3,%r2,5;                     // warp
     \\  and.b32 %r4,%r2,31;                    // lane
@@ -1259,10 +1267,23 @@ pub const quantize_q8_1_ptx: [:0]const u8 =
     \\  shl.b32 %r11,%r6,2; add.u32 %r12,%r11,%r7;         // nblk*4 + elem
     \\  cvt.u64.u32 %rd5,%r12; add.s64 %rd6,%rd2,%rd5;
     \\  st.global.s8 [%rd6],%r10;
+    \\  // sum(q) over the 32-elem block (all lanes must reach the shuffles, so
+    \\  // this sits before the lane-0 guard; blk >= nblk above is warp-uniform).
+    \\  mov.u32 %r13,%r10;
+    \\  shfl.sync.bfly.b32 %r14,%r13,16,0x1f,0xffffffff; add.s32 %r13,%r13,%r14;
+    \\  shfl.sync.bfly.b32 %r14,%r13,8,0x1f,0xffffffff;  add.s32 %r13,%r13,%r14;
+    \\  shfl.sync.bfly.b32 %r14,%r13,4,0x1f,0xffffffff;  add.s32 %r13,%r13,%r14;
+    \\  shfl.sync.bfly.b32 %r14,%r13,2,0x1f,0xffffffff;  add.s32 %r13,%r13,%r14;
+    \\  shfl.sync.bfly.b32 %r14,%r13,1,0x1f,0xffffffff;  add.s32 %r13,%r13,%r14;
     \\  setp.ne.u32 %p3,%r4,0; @%p3 bra END;
     \\  div.rn.f32 %f7,%f2,%f4;                // d = amax/127
     \\  mul.wide.u32 %rd7,%r5,4; add.s64 %rd8,%rd2,%rd7;
     \\  st.global.f32 [%rd8],%f7;
+    \\  // s[blk] at nblk*4 + cols(=nblk*32) + blk*4 = nblk*36 + blk*4
+    \\  cvt.rn.f32.s32 %f8,%r13;
+    \\  mul.lo.u32 %r15,%r6,36; shl.b32 %r16,%r5,2; add.u32 %r15,%r15,%r16;
+    \\  cvt.u64.u32 %rd9,%r15; add.s64 %rd10,%rd2,%rd9;
+    \\  st.global.f32 [%rd10],%f8;
     \\END:
     \\  ret;
     \\}

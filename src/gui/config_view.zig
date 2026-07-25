@@ -304,6 +304,8 @@ pub fn render(cfg: *config.Config, cb: Callbacks) void {
         var te = dvui.textEntry(@src(), .{
             .text = .{ .buffer = &cfg.system_prompt.data },
             .multiline = true,
+            .scroll_horizontal = false,
+            .break_lines = true,
         }, .{ .expand = .horizontal, .min_size_content = .{ .h = 90 }, .max_size_content = .height(220) });
         te.deinit();
     }

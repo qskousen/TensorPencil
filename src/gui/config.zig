@@ -368,6 +368,17 @@ pub const Config = struct {
     llm_model: PathBuf = .{},
     vision_tower: PathBuf = .{},
     diffusion_model: PathBuf = .{},
+    /// MEASURED peak resident VRAM of the diffusion pipeline (bytes), plus the DiT
+    /// path it was measured against. Persisted so the FIRST image of a session
+    /// sizes the LLM's eviction by what the pipeline actually costs rather than by
+    /// what its checkpoints weigh — the file-size bootstrap is only for a model
+    /// that has never run here. Ignored when the key no longer matches.
+    diff_peak_resident: u64 = 0,
+    /// Hash of the DiT path the figure was measured against, NOT the path itself:
+    /// `Config` is already ~150 KB by value and `std.json`'s recursive parse
+    /// overflows the stack as it grows (hence `parseJsonBigStack`), so another
+    /// 4 KB `PathBuf` for what is only an equality check is not worth it.
+    diff_peak_key: u64 = 0,
     text_encoder: PathBuf = .{},
     vae: PathBuf = .{},
     taesd: PathBuf = .{},
@@ -649,7 +660,14 @@ pub const Config = struct {
             }
         };
         var ctx: Ctx = .{ .gpa = gpa, .bytes = bytes };
-        const t = std.Thread.spawn(.{ .stack_size = 16 << 20 }, Ctx.run, .{&ctx}) catch {
+        // 64 MB, not 16: `std.json`'s recursive `innerParse` builds a frame per
+        // struct field and `Config` is ~150 KB BY VALUE, so the stack this needs
+        // scales with the FIELD COUNT — adding two scalar fields was enough to
+        // blow a 16 MB stack and segfault every save/load test. A thread stack is
+        // reserved address space, so the headroom costs nothing until touched;
+        // sizing it tight here just means the next field added crashes config
+        // loading, which is a nasty way to find out.
+        const t = std.Thread.spawn(.{ .stack_size = 64 << 20 }, Ctx.run, .{&ctx}) catch {
             // Spawn failed (very unlikely): parse in-line as a best effort.
             const parsed = std.json.parseFromSlice(Config, gpa, bytes, .{ .ignore_unknown_fields = true }) catch return null;
             defer parsed.deinit();
@@ -810,6 +828,12 @@ pub const Config = struct {
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json });
     }
 };
+
+/// Key a measured-residency figure to the model it was measured on, so a changed
+/// checkpoint invalidates it. Hash rather than path — see `diff_peak_key`.
+pub fn modelKey(path: []const u8) u64 {
+    return std.hash.Wyhash.hash(0, path);
+}
 
 /// Clean an entry name (preset or system prompt) for storage/lookup: trim
 /// whitespace and drop the reserved '|' separator (and CR/LF). Returns a slice

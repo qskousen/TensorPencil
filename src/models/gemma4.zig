@@ -189,7 +189,12 @@ const max_layers = 128;
 /// CPU prefill batch size. Bounds the per-forward `seq` so LOCAL layers' KV
 /// ring (`sliding_window + prefill_chunk` rows) can't alias a still-needed key
 /// within one batch (TODO lever 1). Also caps the activation scratch height.
-const prefill_chunk = 128;
+// Rows per prefill batch. 256, not 128: the m>1 linear path expands the whole
+// weight matrix to f16 per call, so the expansion cost is amortized over the
+// chunk. Measured on gemma4 31B Q4_K_M / 3090 over a 3394-token prompt:
+// 128 -> 208 tok/s, 256 -> 265, 512 -> 267. 256 captures nearly all of it
+// without the larger activation buffers and KV ring 512 would pin.
+const prefill_chunk = 256;
 
 // The largest single prefill batch (a text chunk or a whole bidirectional image
 // block) is `Config.maxBatch()` — runtime, sized from the vision token budget

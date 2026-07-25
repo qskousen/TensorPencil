@@ -19,6 +19,226 @@
 
 const std = @import("std");
 
+/// How much of the card this process may commit, and why.
+///
+/// ## The rule
+///
+///   requested = total - limit          what the user asked to keep free
+///   reserve   = max(requested, foreign)  what actually stays out of our hands
+///   ours      = total - reserve          cap on our WHOLE footprint
+///   tracked   = ours - untracked         cap on what our allocators count
+///
+/// ## Why `reserve` is a max and not a subtraction
+///
+/// This used to be `budget = limit - system`, where `system` was the residual
+/// `device_used - our_tracked`. That is self-consistent (it enforces
+/// `card_used <= limit`) but it puts an unreliable measurement alone on the
+/// right-hand side: any under-reading of `system` inflates the budget directly,
+/// we promote layers to fill it, and the first big allocation then OOMs. And it
+/// IS under-read — the policy resolves right after a load, when our own CUDA
+/// context, JIT'd modules and library workspaces do not exist yet.
+///
+/// Framing the user's handle as a RESERVE removes that failure mode: the reserve
+/// is the larger of what the user asked for and what other processes hold, so an
+/// under-measured `foreign` cannot inflate anything — it just falls back to the
+/// user's own figure. The unreliable term stops being load-bearing.
+///
+/// Consequence worth knowing: once `foreign` exceeds the requested reserve, the
+/// limit handle no longer binds (every setting collapses to `total - foreign`).
+/// That is intended — the user asked to keep N bytes free, and other processes
+/// are already keeping more than N out of our reach.
+///
+/// ## Why the cap is on our WHOLE footprint
+///
+/// Physical usage is `tracked + our untracked + foreign`. Capping only `tracked`
+/// leaves the untracked part — measured at ~1.1 GiB on a 3090 with one LLM
+/// resident — with nowhere to live, so the card overcommits by exactly that much
+/// and the next batched allocation fails. `untracked` is therefore subtracted
+/// explicitly, and the caller passes a HIGH-WATER value so a cold reading of ~0
+/// cannot re-inflate the budget mid-session.
+pub const Reserve = struct {
+    /// Card bytes that must stay out of our hands.
+    bytes: u64,
+    /// What the user asked to keep free (`total - limit`).
+    requested: u64,
+    /// What other processes actually hold.
+    foreign: u64,
+    /// Cap on our whole footprint (tracked + untracked).
+    ours: u64,
+    /// Cap on what our allocators count — what the arbiter budgets.
+    tracked: u64,
+    /// Our untracked overhead, as folded into the cap.
+    untracked: u64,
+
+    /// "card 24101 · want 361 free, others hold 2064 -> reserve 2064 · ours <= 22037
+    ///  (untracked 1104) -> tracked <= 20933 MiB"
+    pub fn render(self: Reserve, buf: []u8) []const u8 {
+        var w = std.Io.Writer.fixed(buf);
+        w.print("want {d} free, others hold {d} -> reserve {d} · ours <= {d} (untracked {d}) -> tracked <= {d} MiB", .{
+            self.requested >> 20, self.foreign >> 20,    self.bytes >> 20,
+            self.ours >> 20,      self.untracked >> 20,  self.tracked >> 20,
+        }) catch return "?";
+        return w.buffered();
+    }
+};
+
+/// The user's ceiling. The CLI passes an absolute figure (`--vram-budget`), the
+/// GUI a fraction of the card (the meter's limit handle); both resolve HERE so
+/// the two frontends cannot drift apart on what "limit" means.
+pub const Limit = union(enum) {
+    /// No user ceiling: the reserve is whatever other processes hold.
+    none,
+    /// Whole-card ceiling in bytes.
+    card_bytes: u64,
+    /// Whole-card ceiling as a fraction of the card — the GUI meter's handle.
+    fraction: f32,
+    /// A cap on OUR OWN tracked residency rather than on total card usage. This
+    /// is what `tp-llm --vram-budget <GiB>` has always meant ("cap device memory
+    /// for the split planner"), and it is kept as a distinct variant rather than
+    /// converted so the CLI flag's documented meaning does not silently change.
+    /// The physical reserve still applies on top: a cap larger than the card can
+    /// safely hold is clamped down, which the CLI previously had no way to do.
+    ours_bytes: u64,
+
+    /// The whole-card ceiling this limit implies (the card itself when the limit
+    /// only constrains our own share).
+    fn cardCeiling(self: Limit, total: u64) u64 {
+        return switch (self) {
+            .none, .ours_bytes => total,
+            .card_bytes => |b| @min(b, total),
+            .fraction => |f| @min(@as(u64, @intFromFloat(f * @as(f64, @floatFromInt(total)))), total),
+        };
+    }
+};
+
+/// One coherent measurement of the card. Every field MUST come from the same
+/// sampling pass — mixing a stale total with live component reads is what made
+/// the old status-bar residual bounce at frame rate.
+pub const Card = struct {
+    total: u64,
+    /// Bytes charged to OTHER processes. Pass `null` when the driver exposes no
+    /// per-process data; the resolver then degrades to treating everything that
+    /// is not our tracked bytes as foreign, which is the old behaviour and is
+    /// conservative in the right direction.
+    foreign: ?u64,
+    /// Our whole footprint on the card (per-process reading). Ignored when
+    /// `foreign` is null.
+    ours_total: u64 = 0,
+    /// What our allocators count.
+    ours_tracked: u64 = 0,
+    /// Whole-card bytes in use, all processes. Only needed for the degraded path.
+    device_used: u64 = 0,
+};
+
+/// Apply the rule above. `untracked_floor` is the caller's high-water mark for
+/// our own unattributed VRAM; pass 0 the first time and feed back
+/// `Reserve.untracked` thereafter so a cold reading cannot re-inflate the cap.
+pub fn resolve(limit: Limit, card: Card, untracked_floor: u64) Reserve {
+    const requested = card.total -| limit.cardCeiling(card.total);
+    const foreign = card.foreign orelse (card.device_used -| card.ours_tracked);
+    const untracked = @max(
+        if (card.foreign != null) card.ours_total -| card.ours_tracked else 0,
+        untracked_floor,
+    );
+    const reserve = @max(requested, foreign);
+    const ours = card.total -| reserve;
+    // A `.ours_bytes` limit caps our tracked share on top of the physical reserve;
+    // whichever binds first wins.
+    var tracked = ours -| untracked;
+    if (limit == .ours_bytes) tracked = @min(tracked, limit.ours_bytes);
+    return .{
+        .bytes = reserve,
+        .requested = requested,
+        .foreign = foreign,
+        .ours = ours,
+        .tracked = tracked,
+        .untracked = untracked,
+    };
+}
+
+/// An itemized device-residency figure in bytes. Both the PREDICTION (what a
+/// model says it will need) and the MEASUREMENT (what it actually holds) use this
+/// same shape, so the two can be printed side by side and differenced.
+///
+/// Itemized rather than a single number on purpose. Every residency bug in this
+/// subsystem has been ONE TERM SILENTLY MISSING from a scalar estimate — the LM
+/// head, the embeddings, the RoPE tables, the dequant staging — and a scalar
+/// offers nothing to check against reality, so each was found only by noticing
+/// layers stranded on the host. With line items, a wrong estimate is visible the
+/// first time a model loads (see `logResidency`).
+pub const Bytes = struct {
+    /// Model parameters, whether or not they have been uploaded yet.
+    weights: u64 = 0,
+    /// KV cache / recurrent state at the current capacity.
+    kv: u64 = 0,
+    /// Everything sized from the batch or context rather than the parameter
+    /// count: activations, logits, RoPE tables, dequant staging.
+    scratch: u64 = 0,
+    /// Ours but unattributed — what the process holds on the card that our
+    /// allocators never counted: the CUDA context and JIT'd modules, cuBLASLt /
+    /// cuDNN workspaces, UI textures. Only ever MEASURED (it has no predictable
+    /// size), and only when the driver exposes per-process data.
+    untracked: u64 = 0,
+
+    pub fn total(self: Bytes) u64 {
+        return self.weights + self.kv + self.scratch + self.untracked;
+    }
+
+    pub fn plus(self: Bytes, o: Bytes) Bytes {
+        return .{
+            .weights = self.weights + o.weights,
+            .kv = self.kv + o.kv,
+            .scratch = self.scratch + o.scratch,
+            .untracked = self.untracked + o.untracked,
+        };
+    }
+
+    /// "weights 17025 + kv 1234 + scratch 370 = 18629 MiB" (untracked shown only
+    /// when nonzero, i.e. on a measurement). Writes into `buf`; returns the slice.
+    pub fn render(self: Bytes, buf: []u8) []const u8 {
+        var w = std.Io.Writer.fixed(buf);
+        w.print("weights {d} + kv {d} + scratch {d}", .{ self.weights >> 20, self.kv >> 20, self.scratch >> 20 }) catch return "?";
+        if (self.untracked != 0) w.print(" + untracked {d}", .{self.untracked >> 20}) catch return "?";
+        w.print(" = {d} MiB", .{self.total() >> 20}) catch return "?";
+        return w.buffered();
+    }
+};
+
+/// Log a participant's predicted need against what it actually holds, itemized,
+/// with the difference spelled out. The whole point is that a prediction which
+/// disagrees with reality is loud rather than silent: the arbiter turns `need`
+/// into a residency ceiling, so a term missing from the prediction becomes a cap
+/// below what the model actually costs, and the model then offloads layers to
+/// obey it while the card sits half empty.
+///
+/// `have.untracked` is not in `need` by design (it cannot be predicted), so it is
+/// reported separately rather than folded into the delta.
+pub fn logResidency(who: []const u8, need_b: Bytes, have: Bytes) void {
+    var nb: [160]u8 = undefined;
+    var hb: [160]u8 = undefined;
+    std.log.info("[vram] {s} predicted: {s}", .{ who, need_b.render(&nb) });
+    // A prediction of FULL residency is only checkable against a model that IS
+    // fully resident. Two legitimate reasons it might not be: weights upload
+    // lazily on the first forward (cold), or layers have been offloaded to the
+    // host (squeezed). Comparing in either state would cry wolf, so report how
+    // much is resident and skip the verdict.
+    if (have.weights < need_b.weights) {
+        std.log.info("[vram] {s} actual:    {s}  ({d}/{d} MiB of weights resident — not fully loaded, no verdict)", .{
+            who, have.render(&hb), have.weights >> 20, need_b.weights >> 20,
+        });
+        return;
+    }
+    const delta: i64 = @as(i64, @intCast(have.total())) - @as(i64, @intCast(need_b.total()));
+    std.log.info("[vram] {s} actual:    {s}  (vs predicted: {c}{d} MiB{s})", .{
+        who,                                  have.render(&hb),
+        @as(u8, if (delta < 0) '-' else '+'), @abs(delta) >> 20,
+        // Loud on purpose: the arbiter turns `need` into a residency ceiling, so a
+        // prediction below reality caps the model under its own footprint and
+        // strands layers on the host. One layer is the scale that matters.
+        if (@abs(delta) > (256 << 20)) " <-- PREDICTION IS WRONG" else "",
+    });
+}
+
 /// A cooperative control point between a model's compute WORKER thread and an
 /// external COORDINATOR (the app-level `VramArbiter`; later also a pause UI).
 /// One per participant, embedded in the model's session. The coordinator
@@ -165,8 +385,30 @@ pub const Side = enum { llm, diffusion };
 
 /// A coherent residency target for BOTH models, computed in one pass.
 pub const Plan = struct {
+    /// Residency CEILING published to the LLM — how much it MAY hold.
     llm: u64,
     diffusion: u64,
+    /// What the LLM actually NEEDS, as opposed to what it is allowed. These differ
+    /// only in the uncontended case, where the ceiling is deliberately the whole
+    /// unclaimed budget while the need stays the model's own demand. Diffusion's
+    /// allowance is computed against the NEED (`diffusionBudget`): the room the LLM
+    /// does not need is claimable, whereas the room it is merely permitted to grow
+    /// into is a soft cap it yields the moment an image queue starts.
+    llm_need: u64,
+    /// Which arm of `plan` produced this. Logged, because "why is my model
+    /// offloaded" is almost always "a different arm fired than you assumed".
+    arm: Arm = .uncontended,
+
+    pub const Arm = enum {
+        /// Both fit; nobody gets a growth-blocking ceiling.
+        uncontended,
+        /// Over budget with BOTH models working — the split handle decides.
+        split,
+        /// Over budget, only diffusion working — the idle LLM yields the deficit.
+        diffusion_only,
+        /// Over budget, diffusion idle — its cache yields to the LLM.
+        llm_only,
+    };
 };
 
 /// The single owner of "how much VRAM each model may hold." Replaces the ad-hoc
@@ -236,20 +478,78 @@ pub const Arbiter = struct {
         // estimate behind `demand` reads checkpoint file sizes, which can fail; a
         // demand of 0 there would read as "no contention" and leave the LLM holding
         // the entire card for the image model to load into.
-        const d_dem = blk: {
-            const raw = if (self.diffusion) |p| p.demand() else 0;
-            break :blk if (self.diff_active) @max(raw, self.limit -| self.llm_share) else raw;
-        };
+        // An IDLE image model demands only what it is actually holding. Its
+        // `demand` is an estimate from CHECKPOINT FILE SIZES, which is right when
+        // a queue is about to load the pipeline and badly wrong otherwise: a
+        // merely-configured diffuser reported ~17 GiB it did not hold, every plan
+        // read as contended, and arm (4) then computed `d = limit - l_dem` and
+        // `l = limit - d`, pinning the LLM's ceiling to EXACTLY its own demand.
+        // With no headroom above demand the first transient prefill allocation
+        // (measured: a 1.1 GiB dequant buffer) had nowhere to go and OOM'd, which
+        // offloaded layers, which is the eviction churn this whole path exists to
+        // prevent. When a queue does start, `setDiffusionActive` re-plans and the
+        // estimate (plus the entitlement below) takes over.
+        const d_raw = if (self.diffusion) |p| (if (self.diff_active) p.demand() else p.usage()) else 0;
+        const d_dem: u64 = if (self.diff_active) @max(d_raw, self.limit -| self.llm_share) else d_raw;
+        // What diffusion actually WANTS, as opposed to what an active queue is
+        // entitled to. The entitlement above deliberately inflates to the LLM's
+        // complement so a queue that hasn't loaded yet still reads as contention;
+        // but where we hand diffusion only its need (arm 3), inflating it would
+        // evict far more of the LLM than the image model will ever use. Fall back
+        // to the entitlement when the estimate is genuinely unavailable.
+        const d_want: u64 = if (d_raw != 0) d_raw else d_dem;
 
-        var out: Plan = if (l_dem + d_dem <= self.limit)
-            .{ .llm = l_dem, .diffusion = d_dem } // (1) uncontended
-        else if (self.diff_active) blk: { // (2) diffusion has work
+        const l_busy = if (self.llm) |p| p.busy() else false;
+
+        // ONE rule, four cases. The invariant every arm keeps: the two ceilings
+        // SUM TO AT MOST `limit`, so the cap holds even with both models running.
+        //
+        // "Active" means WORKING RIGHT NOW, not merely loaded. Between messages a
+        // chat session is fair game: the image model may take what it needs and the
+        // LLM gives it up, because promote/migrate is fast and in practice only the
+        // deficit moves. That is a deliberate product call — the split is a
+        // contention rule, not a standing reservation, so an idle model never holds
+        // VRAM that a working one could use.
+        var out: Plan = if (l_dem + d_dem <= self.limit) blk: {
+            // (1) Uncontended — both fit. Neither gets a growth-blocking ceiling:
+            // the LLM may use everything diffusion does not need.
+            //
+            // Emphatically NOT `l_dem`. `Participant.demand` is `max(demand,
+            // usage)`, so handing back the demand pins the ceiling to what the
+            // model already holds, and the first byte of KV growth then trips
+            // `settleTo`'s `deviceUsed() > target` and offloads a layer. Measured
+            // on a 12B with nothing else resident: budget 21395 MiB, target 8224,
+            // usage 8227 — one layer pushed to the host with 13.3 GiB free.
+            //
+            // The slack goes to the LLM rather than being split: it is the side
+            // that grows continuously (KV) and the side where yielding costs an
+            // interactive stall. Diffusion is offered its demand, which is all it
+            // can use, and `diffusionBudget` still reports the room the LLM does
+            // not NEED, so an image model can still load into it.
+            break :blk .{ .llm = self.limit -| d_dem, .diffusion = d_dem, .llm_need = l_dem, .arm = .uncontended };
+        } else if (self.diff_active and l_busy) blk: {
+            // (2) BOTH working and over budget — the only case the split decides.
             const l = clamp(self.llm_share, l_flr, l_dem);
-            break :blk .{ .llm = l, .diffusion = clamp(self.limit -| l, d_flr, d_dem) };
-        } else blk: { // (3) diffusion is idle cache
+            break :blk .{ .llm = l, .diffusion = clamp(self.limit -| l, d_flr, d_dem), .llm_need = l, .arm = .split };
+        } else if (self.diff_active) blk: {
+            // (3) Only diffusion is working. It takes what it NEEDS (the `d_want`
+            // clamp) rather than everything it is allowed, so the idle LLM yields
+            // just the deficit instead of being evicted wholesale — that is what
+            // keeps the bouncing small. `l_flr` (committed KV) is never taken.
+            const d = clamp(self.limit -| l_flr, d_flr, d_want);
+            break :blk .{ .llm = @max(self.limit -| d, l_flr), .diffusion = d, .llm_need = @min(l_dem, self.limit -| d), .arm = .diffusion_only };
+        } else blk: {
+            // (4) Diffusion idle: its residency is pure cache, so the LLM takes
+            // what it needs and diffusion gives the rest back (down to its floor,
+            // which is 0 unless an image is mid-flight).
             const d = clamp(self.limit -| l_dem, d_flr, d_dem);
-            break :blk .{ .llm = clamp(self.limit -| d, l_flr, l_dem), .diffusion = d };
+            break :blk .{ .llm = @max(self.limit -| d, l_flr), .diffusion = d, .llm_need = @min(l_dem, self.limit -| d), .arm = .llm_only };
         };
+        // A CEILING is not a grant: never clamp it down to demand. Demand is an
+        // estimate of steady-state residency and carries no allowance for the
+        // transient buffers a forward pass allocates, so a ceiling pinned at demand
+        // guarantees the next spike OOMs. `llm_need` above still reports the real
+        // need, which is what diffusion's allowance is computed against.
         // "Hold nothing" is a legitimate target for DIFFUSION — its residency is
         // pure cache — but 0 is also the sentinel the enactment paths read as "no
         // target, do nothing". Ask for 1 byte instead; the incremental evict then
@@ -283,6 +583,19 @@ pub const Arbiter = struct {
                 std.log.warn("[vram] rebalance skipped: budgets uninitialized (meter policy never resolved — VRAM query failed?)", .{});
             return;
         };
+        {
+            // Log the INPUTS and the arm, not just the outcome: every residency
+            // surprise so far has been "a different arm fired than you assumed",
+            // and the arm is a function of numbers you otherwise cannot see.
+            const lu = if (self.llm) |q| q.usage() else 0;
+            const du = if (self.diffusion) |q| q.usage() else 0;
+            std.log.info("[vram] plan {t}: limit {d} · llm need {d} (holds {d}) -> ceiling {d} · diff need {d} (holds {d}) -> ceiling {d}{s}", .{
+                p.arm,        self.limit >> 20,
+                p.llm_need >> 20, lu >> 20, p.llm >> 20,
+                (self.limit -| p.llm_need) >> 20, du >> 20, p.diffusion >> 20,
+                if (self.diff_active) " · image queue ACTIVE" else "",
+            });
+        }
         const llm_shrinks = if (self.llm) |q| p.llm < q.usage() else false;
         if (llm_shrinks) {
             if (self.llm) |q| q.settle(p.llm);
@@ -370,12 +683,92 @@ pub const Arbiter = struct {
             return 0;
         };
         const min_budget: u64 = 256 << 20;
-        return @max(min_budget, self.limit -| p.llm);
+        // Against the LLM's NEED, not its ceiling: uncontended, the ceiling is the
+        // whole unclaimed budget (so the LLM can grow into free VRAM instead of
+        // offloading), but the room it does not NEED is exactly what an image model
+        // may still claim. Using the ceiling here would offer diffusion the floor
+        // and it could never load.
+        return @max(min_budget, self.limit -| p.llm_need);
     }
 };
 
 fn clamp(v: u64, lo: u64, hi: u64) u64 {
     return @min(@max(v, lo), @max(lo, hi));
+}
+
+/// Compare byte figures at MiB granularity: a `fraction` limit goes through f32,
+/// so byte-exact expectations are meaningless (0.985 of a 24101 MiB card lands
+/// half a MiB either side depending on rounding).
+fn expectMiB(expected: u64, actual: u64) !void {
+    const a = actual >> 20;
+    if (a != expected and a != expected -| 1 and a != expected + 1) {
+        std.debug.print("expected ~{d} MiB, found {d} MiB\n", .{ expected, a });
+        return error.TestExpectedEqual;
+    }
+}
+
+test "vram.resolve: the reserve is a max, so an under-read of foreign cannot inflate the cap" {
+    const total: u64 = 24101 << 20;
+    // The measured case: 2064 MiB of desktop, 1104 MiB of our own untracked VRAM.
+    const r = resolve(.{ .fraction = 0.985 }, .{
+        .total = total,
+        .foreign = 2064 << 20,
+        .ours_total = 21637 << 20,
+        .ours_tracked = 20533 << 20,
+    }, 0);
+    try expectMiB(361, r.requested); // 1.5% of the card
+    try expectMiB(2064, r.bytes); // foreign wins the max
+    try expectMiB(1104, r.untracked);
+    try expectMiB(22037, r.ours);
+    try expectMiB(20933, r.tracked);
+    // The whole point: ours + reserve never exceeds the card.
+    try std.testing.expect(r.ours + r.bytes <= total);
+    try std.testing.expect(r.tracked + r.untracked + r.bytes <= total);
+}
+
+test "vram.resolve: the user's reserve wins when other processes are small" {
+    const total: u64 = 24101 << 20;
+    const r = resolve(.{ .fraction = 0.75 }, .{
+        .total = total,
+        .foreign = 200 << 20,
+        .ours_total = 1000 << 20,
+        .ours_tracked = 1000 << 20,
+    }, 0);
+    try expectMiB(6025, r.requested);
+    try expectMiB(6025, r.bytes); // requested wins
+    try std.testing.expectEqual(@as(u64, 0), r.untracked);
+    try std.testing.expect(r.ours + r.bytes <= total);
+}
+
+test "vram.resolve: the untracked high-water floor cannot be re-inflated by a cold read" {
+    const total: u64 = 24101 << 20;
+    // Cold: our process has barely allocated, so the live untracked read is ~0.
+    // Without the floor this hands back a cap 1.1 GiB too generous, we promote
+    // layers to fill it, and the first batched allocation OOMs.
+    const cold = resolve(.{ .fraction = 0.985 }, .{
+        .total = total,
+        .foreign = 2064 << 20,
+        .ours_total = 3299 << 20,
+        .ours_tracked = 3299 << 20,
+    }, 1104 << 20);
+    try expectMiB(1104, cold.untracked);
+    try expectMiB(20933, cold.tracked);
+}
+
+test "vram.resolve: no NVML degrades to the residual, and never overcommits" {
+    const total: u64 = 24101 << 20;
+    // foreign == null: everything that is not our tracked bytes counts as foreign,
+    // which folds our own untracked into the reserve. Conservative, and exactly
+    // the pre-NVML behaviour.
+    const r = resolve(.{ .fraction = 0.985 }, .{
+        .total = total,
+        .foreign = null,
+        .ours_tracked = 20533 << 20,
+        .device_used = 23701 << 20,
+    }, 0);
+    try expectMiB(3168, r.foreign);
+    try std.testing.expectEqual(@as(u64, 0), r.untracked);
+    try std.testing.expect(r.tracked + r.bytes <= total);
 }
 
 // --- tests -----------------------------------------------------------------
@@ -542,14 +935,95 @@ test "Arbiter: mid-image diffusion is never shrunk (its floor is its working set
     };
     arb.rebalance();
     try std.testing.expectEqual(@as(u64, 9 << 30), diff.used); // held at its floor
-    try std.testing.expectEqual(@as(?u64, 6 << 30), llm.applied); // down to its share
+
+    // The LLM here is IDLE, so the split does not bind: diffusion is given what it
+    // needs (9) and the LLM keeps the remainder (22 - 9 = 13) rather than being
+    // squeezed to its 6 GiB share for memory the image model will not use.
+    try std.testing.expectEqual(@as(?u64, 13 << 30), llm.applied);
+
+    // Once the LLM is working too, both want the card and the split decides. A
+    // BUSY participant is not applied directly — the target is published and its
+    // worker enacts it at the next token boundary (see the busy-yield test).
+    llm.is_busy = true;
+    arb.rebalance();
+    try std.testing.expectEqual(@as(?u64, 6 << 30), llm.cp.budgetTarget());
+    try std.testing.expectEqual(@as(u64, 9 << 30), diff.used); // still never shrunk
+}
+
+test "Arbiter.plan: an IDLE llm yields the deficit to a working diffuser" {
+    // Deliberate policy: the split is a contention rule, not a standing
+    // reservation. Between messages the image model may take what it needs and the
+    // LLM gives it up — promote/migrate is fast and only the deficit moves.
+    var llm: MockModel = .{ .used = 18 << 30, .want = 18 << 30, .floor_b = 2 << 30 }; // not busy
+    var diff: MockModel = .{ .used = 0, .want = 9 << 30 };
+    var arb: Arbiter = .{
+        .llm = llm.participant(),
+        .diffusion = diff.participant(),
+        .limit = 22 << 30,
+        .llm_share = 6 << 30,
+        .diff_active = true,
+    };
+    const p = arb.plan().?;
+    // Diffusion gets what it NEEDS (9), not the whole card and not `limit - share`.
+    try std.testing.expectEqual(@as(u64, 9 << 30), p.diffusion);
+    // The idle LLM yields exactly the deficit: 22 - 9 = 13, well above its 2 GiB
+    // floor. It is NOT crushed to the floor, and NOT held at its 6 GiB share.
+    try std.testing.expectEqual(@as(u64, 13 << 30), p.llm);
+    try std.testing.expect(p.llm + p.diffusion <= arb.limit);
+
+    // The moment the LLM starts a turn, the split takes over and it reclaims.
+    llm.is_busy = true;
+    try std.testing.expectEqual(@as(u64, 6 << 30), arb.plan().?.llm);
+}
+
+test "Arbiter.plan: uncontended, the LLM may grow into free VRAM" {
+    // The regression this rule exists for: a ceiling equal to the LLM's demand is
+    // a ceiling equal to what it already holds (`Participant.demand` maxes with
+    // usage), so the next KV byte trips `settleTo` and offloads a layer into an
+    // otherwise-empty card. Measured on a 12B: budget 21395 MiB, target 8224,
+    // usage 8227, 13.3 GiB free, 1/48 layers pushed to the host.
+    var llm: MockModel = .{ .used = 8 << 30, .want = 8 << 30, .floor_b = 1 << 30 };
+    var arb: Arbiter = .{ .llm = llm.participant(), .limit = 21 << 30, .llm_share = 6 << 30 };
+    const p = arb.plan().?;
+    try std.testing.expectEqual(@as(u64, 21 << 30), p.llm); // room to grow, not 8
+    try std.testing.expectEqual(@as(u64, 8 << 30), p.llm_need); // but need is unchanged
+    // Diffusion is still offered everything the LLM does not NEED, so an image
+    // model can load even though the LLM's ceiling is the whole limit.
+    try std.testing.expectEqual(@as(u64, 13 << 30), arb.diffusionBudget());
+}
+
+test "Arbiter.plan: ceilings never sum past the limit" {
+    // The hard guarantee behind the meter's limit handle: whatever the arm, the
+    // two models may not be told they can collectively exceed it.
+    var llm: MockModel = .{ .used = 4 << 30, .want = 18 << 30, .floor_b = 1 << 30 };
+    var diff: MockModel = .{ .used = 0, .want = 9 << 30 };
+    var arb: Arbiter = .{
+        .llm = llm.participant(),
+        .diffusion = diff.participant(),
+        .limit = 22 << 30,
+        .llm_share = 6 << 30,
+    };
+    for ([_]bool{ false, true }) |active| {
+        arb.diff_active = active;
+        for ([_]u64{ 4 << 30, 18 << 30, 30 << 30 }) |want| {
+            llm.want = want;
+            const p = arb.plan().?;
+            // `plan` floors diffusion at 1 BYTE — the "hold nothing" sentinel, so
+            // the enactment path can tell it apart from "no target". That is a
+            // marker, not an allocation, so it does not count against the cap.
+            const d: u64 = if (p.diffusion <= 1) 0 else p.diffusion;
+            try std.testing.expect(p.llm + d <= arb.limit);
+        }
+    }
 }
 
 test "Arbiter.plan: the split handle bounds diffusion when both models are active" {
     // TODO #2 "split is not respected": under real contention the meter's split
     // handle is what divides the card. The LLM is guaranteed `llm_share` and
     // diffusion gets the rest — not "whatever the LLM happens to hold".
-    var llm: MockModel = .{ .used = 20 << 30, .want = 20 << 30, .floor_b = 2 << 30 };
+    // BOTH must be working for the split to apply — an idle LLM instead yields the
+    // deficit to a working diffuser (see the arm-3 test below).
+    var llm: MockModel = .{ .used = 20 << 30, .want = 20 << 30, .floor_b = 2 << 30, .is_busy = true };
     var diff: MockModel = .{ .used = 0, .want = 12 << 30 };
     var arb: Arbiter = .{
         .llm = llm.participant(),
@@ -711,7 +1185,11 @@ test "Arbiter: uninitialized budgets (limit 0) never drive the LLM" {
     // First real setBudgets takes over and drives normally again.
     arb.setDiffusionActive(false);
     arb.setBudgets(22 << 30, 6 << 30);
-    try std.testing.expectEqual(@as(?u64, 21 << 30), m.applied); // its demand, ≤ limit
+    // Uncontended, so the ceiling is the whole limit (nothing else claims any of
+    // it) rather than the LLM's demand — a ceiling equal to demand is a ceiling
+    // equal to current usage, which blocks KV growth and offloads layers into
+    // free VRAM. `plan` arm (1).
+    try std.testing.expectEqual(@as(?u64, 22 << 30), m.applied);
 }
 
 test "Arbiter: a busy LLM still yields (via its control point, not a direct apply)" {

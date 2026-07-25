@@ -435,6 +435,9 @@ pub const Diffuser = struct {
     /// both participants have the same shape (and a future step-boundary poll is a
     /// fill-in, not a re-architecture).
     control: tp.vram.ControlPoint = .{},
+    /// High-water of MEASURED resident bytes, across generations. Supersedes the
+    /// checkpoint-file estimate in `vpDemand` as soon as one image has run.
+    peak_resident: std.atomic.Value(u64) = .init(0),
 
     /// Build the engine from a `DiffConfig`. `wake` repaints the UI on progress;
     /// `vram` is the injected VRAM coordinator (LLM eviction, or `.none`). The
@@ -638,13 +641,32 @@ pub const Diffuser = struct {
     /// Device VRAM (bytes) the resident diffusion model actually holds; 0 when
     /// none is loaded.
     pub fn vramBytes(self: *Diffuser) u64 {
-        return if (self.session.load(.acquire)) |s| s.deviceUsed() else 0;
+        const v = if (self.session.load(.acquire)) |s| s.deviceUsed() else 0;
+        // High-water it HERE rather than in the arbiter's `usage` hook: the arbiter
+        // only samples on plan events, and there is no plan event between "pipeline
+        // loaded" and "queue drained", so it would record the pre-load 0 and miss
+        // the peak entirely. The status bar samples this every 500 ms throughout a
+        // generation, which is what actually catches it.
+        self.notePeak(v);
+        return v;
     }
 
     /// MEASURED per-component VRAM breakdown (TE / DiT / VAE / latent) for the
     /// status-bar meter; all zero when no pipeline is resident.
     pub fn vramBreakdown(self: *Diffuser) VramBreakdown {
-        return if (self.session.load(.acquire)) |s| s.vramBreakdown() else .{};
+        const b: VramBreakdown = if (self.session.load(.acquire)) |s| s.vramBreakdown() else .{};
+        // Same high-water as `vramBytes`, because THIS is the accessor the status
+        // bar polls every 500 ms — and that poll is the only thing sampling us
+        // mid-generation, i.e. the only thing that ever sees the peak. Recording it
+        // only in `vramBytes` left the figure at its pre-load 0.
+        self.notePeak(b.total());
+        return b;
+    }
+
+    /// High-water the measured resident footprint. Called from every residency
+    /// accessor so the peak is caught wherever it happens to be observed.
+    fn notePeak(self: *Diffuser, v: u64) void {
+        if (v > self.peak_resident.load(.monotonic)) self.peak_resident.store(v, .monotonic);
     }
 
     /// Free resident diffusion weights to fit `budget` bytes — the GUI VRAM
@@ -694,16 +716,27 @@ pub const Diffuser = struct {
     // to a no-op. See the `vram.Arbiter` doc comment.
 
     fn vpUsage(ctx: *anyopaque) u64 {
-        return fromCtx(ctx).vramBytes();
+        return fromCtx(ctx).vramBytes(); // high-waters `peak_resident` internally
     }
-    /// Footprint if nothing contended. Estimated from the checkpoint file sizes
-    /// (see `estimateResidentBytes`) so it is nonzero even before the pipeline
-    /// loads — otherwise a not-yet-resident image model would read as "wants
-    /// nothing" and the LLM would plan to keep the whole card. `Participant.demand`
-    /// maxes this with live usage, so an under-estimate can never shrink below
-    /// what is actually resident.
+    /// Footprint if nothing contended.
+    ///
+    /// MEASURED once an image has run: the high-water of `vramBytes()`. The
+    /// checkpoint-file-size estimate below is only a bootstrap for the very first
+    /// image, and it is a poor one — it counts bytes that never become resident
+    /// (the pipeline drops the text encoder when the DiT working set won't fit
+    /// alongside it). Measured on krea2: files 18961 MiB vs 13052 MiB actually
+    /// resident, and since the arbiter turns this number into the LLM's eviction
+    /// target, those 6 GiB of phantom demand pushed ~20 extra layers to the host
+    /// for memory the image model never used.
+    ///
+    /// Still nonzero before the first load, deliberately: a diffuser that read as
+    /// "wants nothing" would let the LLM plan to keep the whole card and then have
+    /// nowhere to load into. `Participant.demand` maxes this with live usage, so an
+    /// under-estimate can never shrink below what is actually resident.
     fn vpDemand(ctx: *anyopaque) u64 {
-        return fromCtx(ctx).estimateResidentBytes();
+        const self = fromCtx(ctx);
+        const peak = self.peak_resident.load(.monotonic);
+        return if (peak != 0) peak else self.estimateResidentBytes();
     }
     /// Nothing is un-evictable while idle: resident weights are pure cache that
     /// the next image re-uploads. Mid-image the whole working set is the floor —
@@ -737,15 +770,41 @@ pub const Diffuser = struct {
         return .{ .ctx = self, .control = &self.control, .vtable = &vp_vtable };
     }
 
-    /// Estimate the image model's resident footprint (bytes) from its file
-    /// sizes — the target VRAM to free for it under image priority. 0 if unknown.
+    /// Bootstrap estimate of the pipeline's PEAK resident footprint, for a model
+    /// no image has run on yet. Superseded by `peak_resident` the moment one has.
+    ///
+    /// Deliberately EXCLUDES the text encoder. It is the largest checkpoint on
+    /// disk here (4999 MiB) but is transient by construction — it encodes the
+    /// prompt once and its weights are then droppable, so at the actual peak it
+    /// holds 52 MiB. Counting it made the estimate 18961 MiB against a measured
+    /// 13055, and since the arbiter turns this into the LLM's eviction target
+    /// those 5.9 GiB of phantom demand evicted every layer on the first image.
+    /// DiT + VAE gives 13961 — within ~900 MiB of the truth.
+    ///
+    /// Erring LOW is the right direction: an under-estimate means the LLM keeps
+    /// more and the pipeline reclaims reactively (`vcReclaim` / the OOM ladder),
+    /// whereas an over-estimate is an eviction that was never needed.
     pub fn estimateResidentBytes(self: *Diffuser) u64 {
         var total: u64 = 0;
-        for ([_][]const u8{ self.opts.dit_path, self.opts.vae_path, self.opts.text_encoder_path }) |p| {
+        for ([_][]const u8{ self.opts.dit_path, self.opts.vae_path }) |p| {
             const st = std.Io.Dir.cwd().statFile(self.io, p, .{}) catch continue;
             total += st.size;
         }
         return total;
+    }
+
+    /// Seed the measured high-water from a previous session (see
+    /// `Config.diff_peak_resident`). Ignored if a bigger figure is already known.
+    pub fn seedPeakResident(self: *Diffuser, bytes: u64) void {
+        if (bytes > self.peak_resident.load(.monotonic)) self.peak_resident.store(bytes, .monotonic);
+    }
+
+    /// The measured peak, for persisting. 0 when no image has run yet. Samples
+    /// once more on the way out so a caller at the drain edge still records
+    /// something even if nothing polled us during the generation.
+    pub fn peakResident(self: *Diffuser) u64 {
+        self.notePeak(self.vramBytes());
+        return self.peak_resident.load(.monotonic);
     }
 
     /// Update the default generation params (from settings). Only touched when

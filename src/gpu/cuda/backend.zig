@@ -246,6 +246,8 @@ pub const Backend = struct {
     pin_budget: u64 = 0,
     /// Bytes currently claimed against pin_budget.
     pinned_bytes: u64 = 0,
+    /// Largest single `tensorCreate` request seen (see `largestAllocation`).
+    max_alloc_bytes: u64 = 0,
     /// Live-VRAM floor kept free by first-touch pinning (pinNew) and prefetch
     /// (prefetchWeight). pin_budget is computed BEFORE the per-image working set
     /// (activations + attention scratch, gigabytes at high resolution) is
@@ -426,6 +428,12 @@ pub const Backend = struct {
     mm_fn: cu.CUfunction = null,
     hgemm_mod: ?ctxmod.Module = null,
     hgemm_fn: cu.CUfunction = null,
+    mmq_q4k_mod: ?ctxmod.Module = null,
+    mmq_q4k_fn: cu.CUfunction = null,
+    mmq_pipe_mod: ?ctxmod.Module = null,
+    mmq_pipe_fn: cu.CUfunction = null,
+    mmq_pipe6_mod: ?ctxmod.Module = null,
+    mmq_pipe6_fn: cu.CUfunction = null,
     hgemm_bf16_mod: ?ctxmod.Module = null, // native bf16 MMA (dense bf16 DiT)
     hgemm_bf16_fn: cu.CUfunction = null,
     hgemm_b_mod: ?ctxmod.Module = null,
@@ -456,10 +464,16 @@ pub const Backend = struct {
     prof: Prof = .{},
     ptimer: ?ctxmod.Context.Timer = null,
 
-    pub const ProfCat = enum { matmul, prep, attn, elt, attn_scores, attn_softmax, attn_pv };
+    /// `dequant` is the block-quant weight -> f16 expansion `opMatmulQuant` does
+    /// before its tensor-core GEMM. It used to be charged to `matmul`, which hid
+    /// the fact that a batched prefill re-expands the WHOLE weight matrix on every
+    /// call — keep it separate so that cost stays visible.
+    pub const ProfCat = enum { matmul, dequant, prep, attn, elt, attn_scores, attn_softmax, attn_pv };
     pub const Prof = struct {
-        ms: [7]f64 = .{ 0, 0, 0, 0, 0, 0, 0 },
-        n: [7]u32 = .{ 0, 0, 0, 0, 0, 0, 0 },
+        /// Sized from ProfCat so adding a category can't desync the arrays.
+        const ncat = @typeInfo(ProfCat).@"enum".fields.len;
+        ms: [ncat]f64 = @splat(0),
+        n: [ncat]u32 = @splat(0),
         pub fn reset(self: *Prof) void {
             self.* = .{};
         }
@@ -597,6 +611,9 @@ pub const Backend = struct {
         if (self.fused_mod) |m| m.unload(self.ctx);
         if (self.mm_mod) |m| m.unload(self.ctx);
         if (self.hgemm_mod) |m| m.unload(self.ctx);
+        if (self.mmq_q4k_mod) |m| m.unload(self.ctx);
+        if (self.mmq_pipe_mod) |m| m.unload(self.ctx);
+        if (self.mmq_pipe6_mod) |m| m.unload(self.ctx);
         if (self.hgemm_bf16_mod) |m| m.unload(self.ctx);
         if (self.hgemm_b_mod) |m| m.unload(self.ctx);
         if (self.hgemm_bc16_mod) |m| m.unload(self.ctx);
@@ -764,6 +781,14 @@ pub const Backend = struct {
     // ---- buffers ------------------------------------------------------------
 
     pub fn tensorCreate(self: *Backend, size: u64) Error!DeviceBuffer {
+        // High-water the largest single allocation this model has ever asked for.
+        // The residency planner needs it: a promote loop that fills to the ceiling
+        // and leaves only a fixed margin will OOM the moment a forward pass wants a
+        // transient buffer bigger than that margin, and "how big does this model's
+        // biggest buffer get" is not something worth predicting when the allocator
+        // can just report it. Recorded on REQUEST, not on success, so an allocation
+        // that OOM'd still teaches the planner how much room to leave next time.
+        if (size > self.max_alloc_bytes) self.max_alloc_bytes = size;
         while (true) {
             if (self.ctx.alloc(@intCast(size))) |b| {
                 var db = dbFromPtr(b.ptr, size);
@@ -897,6 +922,22 @@ pub const Backend = struct {
     /// Bytes held by PINNED cached weights (the resident model kept off the LRU).
     pub fn pinnedWeightBytes(self: *Backend) u64 {
         return self.pinned_bytes;
+    }
+
+    /// The largest single device allocation this backend has been asked for. The
+    /// residency planner keeps at least this much free so a promote cannot leave
+    /// the card too full for the next forward's transient buffers. Self-tuning: it
+    /// starts at 0 and learns the real figure on the first prefill.
+    pub fn largestAllocation(self: *Backend) u64 {
+        return self.max_alloc_bytes;
+    }
+
+    /// Bytes currently held by the dequant staging buffers `opMatmulQuant` sizes
+    /// to the widest weight it has been asked to expand. Zero until the first
+    /// BATCHED forward — which is exactly why `residency.demand` has to predict
+    /// them for a cold model and net off this figure once they exist.
+    pub fn dequantScratchBytes(self: *Backend) u64 {
+        return self.fp8_w16.size + self.fp8_a16.size;
     }
 
     /// Enable MEASURED per-component device-memory attribution (VRAM meter). The
@@ -1738,9 +1779,32 @@ pub const Backend = struct {
         defer self.ptoc(.elt);
         std.debug.assert(cols % 32 == 0);
         const nblk = cols / 32;
-        try self.ensureDeviceBuffer(&self.q8_act, nblk * 4 + cols);
+        // d[nblk] f32 | qs[cols] i8 | s[nblk] f32 (Σq per block, MMQ's min term).
+        try self.ensureDeviceBuffer(&self.q8_act, nblk * 8 + cols);
         const f = try self.eltFn(elt.quantize_q8_1_ptx, "quantize_q8_1");
         try self.rowLaunch(f, x, self.q8_act, null, null, .{ @intCast(nblk), 0, 0, 0, 0, 0 }, .{ 0, 0 }, (nblk + 7) / 8);
+    }
+
+    /// `opGemvQuantizeX` into a layout sized for `pad` elements while only
+    /// quantizing the first `real` — the region offsets (qs at nblk*4, sums at
+    /// nblk*4 + cols) are a function of the TOKEN COUNT, so a tiled consumer that
+    /// reads whole 128-token tiles past the real count needs the bigger layout,
+    /// not just a zeroed tail on the small one. The whole buffer is zeroed first
+    /// so the padded tokens contribute nothing (zero scale, zero quants, zero sum).
+    pub fn opGemvQuantizeXPadded(self: *Backend, x: DeviceBuffer, real: usize, pad: usize) Error!void {
+        std.debug.assert(real % 32 == 0 and pad % 32 == 0 and pad >= real);
+        if (pad == real) return self.opGemvQuantizeX(x, real);
+        self.ptic();
+        defer self.ptoc(.elt);
+        const nblk_real = real / 32;
+        const nblk_pad = pad / 32;
+        const bytes = nblk_pad * 8 + pad;
+        try self.ensureDeviceBuffer(&self.q8_act, bytes);
+        self.ctx.memsetD8Async(.{ .ptr = self.q8_act.ptr(), .bytes = @intCast(bytes) }, 0, bytes) catch return error.CudaError;
+        const f = try self.eltFn(elt.quantize_q8_1_ptx, "quantize_q8_1");
+        // u0 = nblk_pad sets the LAYOUT; the grid only covers the real blocks, so
+        // the kernel's `blk >= u0` guard never fires and nothing past `real` runs.
+        try self.rowLaunch(f, x, self.q8_act, null, null, .{ @intCast(nblk_pad), 0, 0, 0, 0, 0 }, .{ 0, 0 }, (nblk_real + 7) / 8);
     }
 
     /// dp4a block-quant GEMV for m=1 decode against the q8 activation
@@ -1786,12 +1850,135 @@ pub const Backend = struct {
     /// ggml block-quant GEMM (prefill): the opMatmulFp8 shape — dequant the
     /// weight to the shared f16 scratch, convert/pad the activations, run the
     /// f16 tensor-core GEMM. rows,cols must be multiples of 128,32.
-    pub fn opMatmulQuant(self: *Backend, dt: dtypes.DType, y: DeviceBuffer, x: DeviceBuffer, m: usize, w_bytes: []const u8, rows: usize, cols: usize) Error!void {
+    /// Column tiles per warp / warps per block for the MMQ kernel. nt*8 = 128
+    /// tokens per weight pass: below that MMQ re-reads the weight often enough
+    /// to lose its traffic advantage over the dequant+f16-GEMM fallback.
+    const mmq_nt = 16;
+    const mmq_warps = 4;
+    /// Tokens covered by one MMQ block (grid.x granularity).
+    pub const mmq_tile_n = mmq_nt * 8;
+    /// Rows covered by one MMQ block (grid.y granularity); `rows` must divide it.
+    pub const mmq_tile_rows = 16 * mmq_warps;
+
+    fn mmqQ4kFn(self: *Backend) Error!cu.CUfunction {
+        if (self.mmq_q4k_mod != null) return self.mmq_q4k_fn;
+        const ptx = kernels.buildMmqQ4K(self.gpa, mmq_nt, mmq_warps) catch return error.OutOfMemory;
+        defer self.gpa.free(ptx);
+        var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
+        self.mmq_q4k_fn = mod.getFunction(self.ctx, "mmq_q4_k") catch return error.CudaError;
+        self.mmq_q4k_mod = mod;
+        return self.mmq_q4k_fn;
+    }
+
+    fn mmqPipeFn(self: *Backend) Error!cu.CUfunction {
+        if (self.mmq_pipe_mod != null) return self.mmq_pipe_fn;
+        const ptx = kernels.buildMmqPipeQ4K(self.gpa) catch return error.OutOfMemory;
+        defer self.gpa.free(ptx);
+        var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
+        self.mmq_pipe_fn = mod.getFunction(self.ctx, "mmq_pipe_q4_k") catch return error.CudaError;
+        self.mmq_pipe_mod = mod;
+        return self.mmq_pipe_fn;
+    }
+
+    fn mmqPipe6Fn(self: *Backend) Error!cu.CUfunction {
+        if (self.mmq_pipe6_mod != null) return self.mmq_pipe6_fn;
+        const ptx = kernels.buildMmqPipeQ6K(self.gpa) catch return error.OutOfMemory;
+        defer self.gpa.free(ptx);
+        var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
+        self.mmq_pipe6_fn = mod.getFunction(self.ctx, "mmq_pipe_q6_k") catch return error.CudaError;
+        self.mmq_pipe6_mod = mod;
+        return self.mmq_pipe6_fn;
+    }
+
+    /// Rows/tokens per block for the pipe MMQ; `n` is padded up to the token tile.
+    pub const mmq_pipe_tile = 128;
+
+    /// Whether `opMatmulQuantMmqPipe` has a kernel for this shape/dtype. Having a
+    /// kernel is not the same as it being the fastest choice — q6_k's is correct
+    /// but loses to dequant+f16 on real shapes (see `buildMmqPipeQ6K`), so the
+    /// decision of what to actually call belongs to the caller.
+    pub fn mmqPipeSupported(dt: dtypes.DType, rows: usize, cols: usize) bool {
+        return (dt == .q4_k or dt == .q6_k) and cols % 256 == 0 and rows % mmq_pipe_tile == 0;
+    }
+
+    /// Whether MMQ is a WIN for this dtype, i.e. what a model should route on.
+    /// Measured on a 3090 at n=256: q4_k 1.6-2.0x vs dequant+f16; q6_k 0.87-0.98x.
+    pub fn mmqPipeFaster(dt: dtypes.DType, rows: usize, cols: usize) bool {
+        return dt == .q4_k and mmqPipeSupported(dt, rows, cols);
+    }
+
+    /// Pipe-tiled MMQ (128x128 tile, 2x2 warps, MT=4/NT=8). Same contract as
+    /// `opMatmulQuantMmq` but requires rows % 128 == 0; `n` is padded internally.
+    pub fn opMatmulQuantMmqPipe(self: *Backend, dt: dtypes.DType, y: DeviceBuffer, x: DeviceBuffer, m: usize, w_bytes: []const u8, rows: usize, cols: usize) Error!void {
+        std.debug.assert(mmqPipeSupported(dt, rows, cols));
+        const npad = std.mem.alignForward(usize, m, mmq_pipe_tile);
+        // The kernel reads whole 128-token tiles, so the activation must be laid
+        // out for npad tokens even though only m are real.
+        try self.opGemvQuantizeXPadded(x, m * cols, npad * cols);
         self.ptic();
         defer self.ptoc(.matmul);
         const w_db = try self.cachedWeight(w_bytes);
+        const f = if (dt == .q6_k) try self.mmqPipe6Fn() else try self.mmqPipeFn();
+        var pw = w_db.ptr();
+        var px = self.q8_act.ptr();
+        var py = y.ptr();
+        var prows: u32 = @intCast(rows);
+        var pcols: u32 = @intCast(cols);
+        var pn: u32 = @intCast(npad);
+        var pscale: f32 = 1.0;
+        var params = [_]?*anyopaque{
+            @ptrCast(&pw),    @ptrCast(&px),    @ptrCast(&py),
+            @ptrCast(&prows), @ptrCast(&pcols), @ptrCast(&pn), @ptrCast(&pscale),
+        };
+        self.ctx.launch(f, .{ @intCast(npad / mmq_pipe_tile), @intCast(rows / mmq_pipe_tile), 1 }, .{ 128, 1, 1 }, 0, &params) catch return error.CudaError;
+    }
+
+    /// Whether `opMatmulQuantMmq` has a kernel for this shape/dtype. The caller
+    /// falls back to `opMatmulQuant` when false.
+    pub fn mmqSupported(dt: dtypes.DType, rows: usize, cols: usize) bool {
+        return dt == .q4_k and cols % 256 == 0 and rows % mmq_tile_rows == 0;
+    }
+
+    /// MMQ: y[m][rows] f32 = W(q4_k)[rows][cols] @ x[m][cols], computed on the s8
+    /// tensor cores straight from the packed nibbles — no f16 weight expansion in
+    /// global memory (see the MMQ block comment in kernels.zig). `x` is f32 and is
+    /// quantized to q8_1 here; that quantize is per-activation, so a caller doing
+    /// several weights against the same x can hoist it (this op re-quantizes).
+    ///
+    /// NOT bit-identical to `opMatmulQuant`: the activations go through int8, so
+    /// results differ within q8_1's quantization error (the same tradeoff the
+    /// decode-path dp4a GEMVs already make).
+    pub fn opMatmulQuantMmq(self: *Backend, dt: dtypes.DType, y: DeviceBuffer, x: DeviceBuffer, m: usize, w_bytes: []const u8, rows: usize, cols: usize) Error!void {
+        std.debug.assert(mmqSupported(dt, rows, cols));
+        try self.opGemvQuantizeX(x, m * cols);
+        self.ptic();
+        defer self.ptoc(.matmul);
+        const w_db = try self.cachedWeight(w_bytes);
+        const f = try self.mmqQ4kFn();
+        var pw = w_db.ptr();
+        var px = self.q8_act.ptr();
+        var py = y.ptr();
+        var prows: u32 = @intCast(rows);
+        var pcols: u32 = @intCast(cols);
+        var pn: u32 = @intCast(m);
+        var pscale: f32 = 1.0;
+        var params = [_]?*anyopaque{
+            @ptrCast(&pw),    @ptrCast(&px),    @ptrCast(&py),
+            @ptrCast(&prows), @ptrCast(&pcols), @ptrCast(&pn), @ptrCast(&pscale),
+        };
+        const gx: u32 = @intCast((m + mmq_tile_n - 1) / mmq_tile_n);
+        const gy: u32 = @intCast(rows / mmq_tile_rows);
+        self.ctx.launch(f, .{ gx, gy, 1 }, .{ 32 * mmq_warps, 1, 1 }, 0, &params) catch return error.CudaError;
+    }
+
+    pub fn opMatmulQuant(self: *Backend, dt: dtypes.DType, y: DeviceBuffer, x: DeviceBuffer, m: usize, w_bytes: []const u8, rows: usize, cols: usize) Error!void {
+        const w_db = try self.cachedWeight(w_bytes);
         const mpad = std.mem.alignForward(usize, m, 128);
         try self.ensureDeviceBuffer(&self.fp8_a16, mpad * cols * 2);
+        // Two timed phases (the profiler's single timer can't nest): the weight
+        // dequant, then the activation convert + GEMM. Only `--profile` inserts
+        // the extra sync between them.
+        self.ptic();
         // Weight as f16 [rows][cols]: block-quant weights dequant into scratch;
         // an f16 weight (some GGUF quants keep small matrices at f16, e.g.
         // Unsloth ssm_out) is already in that layout and is used directly.
@@ -1809,6 +1996,9 @@ pub const Backend = struct {
             try self.eltLaunch(f_deq, w_db, self.fp8_w16, null, null, .{ @intCast(rows * cols), 0, 0, 0, 0, 0 }, .{ 0, 0 }, rows * cols);
             break :blk self.fp8_w16;
         };
+        self.ptoc(.dequant);
+        self.ptic();
+        defer self.ptoc(.matmul);
         const f_cvt = try self.eltFn(elt.f32_to_f16_ptx, "f32_to_f16");
         try self.eltLaunch(f_cvt, x, self.fp8_a16, null, null, .{ @intCast(mpad * cols), @intCast(m * cols), 0, 0, 0, 0 }, .{ 0, 0 }, mpad * cols);
         if (self.kernels == .libs) {

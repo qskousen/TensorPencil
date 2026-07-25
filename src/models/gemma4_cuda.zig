@@ -53,7 +53,12 @@ const Growable = Backend.GrowableTensor;
 const nsplit = 32;
 const nsplit_prefill = 8;
 /// Rows per batched-prefill chunk (also the activation-buffer height).
-const prefill_chunk = 128;
+// Rows per prefill batch. 256, not 128: the m>1 linear path expands the whole
+// weight matrix to f16 per call, so the expansion cost is amortized over the
+// chunk. Measured on gemma4 31B Q4_K_M / 3090 over a 3394-token prompt:
+// 128 -> 208 tok/s, 256 -> 265, 512 -> 267. 256 captures nearly all of it
+// without the larger activation buffers and KV ring 512 would pin.
+const prefill_chunk = 256;
 const grouped_gemv_max = 40;
 
 // The largest single forward batch (a text chunk or a whole bidirectional
@@ -493,6 +498,23 @@ pub const CudaLM = struct {
     /// loads). Live `deviceUsed()`, one-way + idempotent. See qwen35_cuda.
     pub fn offloadToBudget(self: *CudaLM, target: u64) !void {
         return residency.offloadToBudget(self, target);
+    }
+
+    /// `residency.demand` hook: this layer's weight bytes alone (no KV). Lets the
+    /// demand estimate separate "weights not uploaded yet" — which the backend's
+    /// pinned-bytes counter already accounts for globally — from the device KV a
+    /// promote has to re-create.
+    pub fn layerWeightBytes(self: *CudaLM, l: usize) usize {
+        return layerDeviceBytes(&self.lm.layers[l]);
+    }
+
+    /// `residency.demand` hook: device-resident weights that are not per-layer.
+    /// A tied head/embedding is ONE cached device buffer (the weight cache keys
+    /// on the byte slice), so count it once.
+    pub fn nonLayerDeviceBytes(self: *CudaLM) u64 {
+        const h = self.lm.head.bytes;
+        const e = self.lm.embed.bytes;
+        return h.len + if (e.ptr == h.ptr) 0 else e.len;
     }
 
     /// `residency.promoteBack` cost hook: VRAM a promote of layer `l` needs — its
@@ -1209,6 +1231,16 @@ pub const CudaLM = struct {
                     try be.opGemvQuantQ8N(w.dtype, y, w.bytes, w.scale, rows_out, cols, 1, 0, 1);
                 }
             }
+        } else if (cuda.backend.Backend.mmqPipeFaster(w.dtype, rows_out, cols)) {
+            // Batched prefill: MMQ on the s8 tensor cores straight from the
+            // packed nibbles. Beats dequant-to-f16 + cuBLASLt ~1.6-2.2x on these
+            // shapes because the f16 expansion never happens and the GEMM reads
+            // 4.5 bits/weight instead of 16. Costs q8_1 activation error (~0.5%
+            // relative), the same tradeoff the decode GEMVs already make.
+            // q4_k only: a q6_k MMQ kernel exists and is correct, but measures
+            // 0.87-0.98x there (6.56 bits/weight and a 2-byte-aligned 210-byte
+            // block that defeats vector loads), so q6_k keeps the f16 path.
+            try be.opMatmulQuantMmqPipe(w.dtype, y, x, seq, w.bytes, rows_out, cols);
         } else if (seq <= grouped_gemv_max and dp4a_ok) {
             try be.opGemvQuantizeX(x, seq * cols);
             var off: usize = 0;
