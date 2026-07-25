@@ -102,6 +102,19 @@ var g_pending_regenerate: bool = false;
 // The UI-thread hooks (enter/exit) never overlap the eject (same thread), so
 // only the worker-thread hooks + the teardown take it.
 var g_session_mu: std.Io.Mutex = std.Io.Mutex.init;
+// The MIRROR of g_session_mu: guards `g_diffuser` / `g_arbiter.diffusion` against
+// the LLM WORKER thread, which now reaches the image model through
+// `llmForeignReclaim` when an allocation can't be satisfied from its own context.
+// `syncDiffuser`/`freeDiffuser` (UI thread) publish and retract the participant
+// under it, so the worker never dereferences a freed engine.
+//
+// Lock order note: each worker thread takes exactly ONE of these two — the
+// diffusion worker takes g_session_mu to reach the LLM, the LLM worker takes
+// g_diff_mu to reach diffusion — and neither ever asks for the other, so the pair
+// cannot cycle. The UI thread is the only place both are ever held, and never
+// nested. `Diffuser.res_mu` sits below both and is only ever tryLock'd from a
+// foreign thread, so it cannot participate in a cycle either.
+var g_diff_mu: std.Io.Mutex = std.Io.Mutex.init;
 
 /// on_change: fired every drag-motion frame. The meter already mutated
 /// g_split/g_limit in place; motion repaints on its own, so this is a no-op (we
@@ -119,14 +132,18 @@ fn meterCommit() void {
     applyMeterPolicy();
 }
 
-/// Apply the meter policy (soft residency): the limit is a WHOLE-CARD ceiling,
-/// so our budget for LLM + diffusion is `limit − system` (system = OS/desktop +
-/// CUDA-context overhead we don't control). The LLM offloads weights to CPU to
-/// fit (cheap; doesn't slow a running image, so it runs even during diffusion
-/// generation, serialized with the worker's reclaim hook). Diffusion's resident
-/// weights are trimmed to fit ONLY while idle — mid-image eviction would force
-/// per-step streaming, which soft residency avoids; the next image re-budgets at
-/// its start via imageBudget. No-op with no session or mid-load.
+/// Resolve the meter handles against the live card and hand the result to the
+/// arbiter, which drives BOTH models (soft residency): the limit is a WHOLE-CARD
+/// ceiling, so our budget for LLM + diffusion is `limit − system` (system =
+/// OS/desktop + CUDA-context overhead we don't control), and the split handle is
+/// the LLM's guaranteed share under contention.
+///
+/// This used to also carry the diffusion half of the policy by hand — settle the
+/// LLM, then offer diffusion `available − (the LLM's just-shrunk usage)`. That
+/// second target algebraically cancelled to diffusion's own residency, so the
+/// image model never yielded a byte to the LLM (TODO #1). Both targets now come
+/// from one `Arbiter.plan`, which is also what makes the split handle mean
+/// something. No-op with no session or mid-load.
 fn applyMeterPolicy() void {
     const s = g_session orelse return;
     if (g_loading.load(.acquire)) return;
@@ -153,31 +170,21 @@ fn applyMeterPolicy() void {
     const limit_bytes: u64 = @intFromFloat(g_limit * tf);
     const available: u64 = limit_bytes -| system; // budget for LLM + diffusion
     const share: u64 = @min(@as(u64, @intFromFloat(g_split * tf)), available);
-    const diff_busy = if (g_diffuser) |*d| d.busyNow() else false;
 
-    // LLM side: hand the resolved ceiling + share to the arbiter, which settles
-    // the LLM to fit (offloading weights to the CPU, or promoting them back).
     // Guarded so a direct (idle) settle can't race the diffusion worker's reclaim
-    // hook — both touch the LLM context.
+    // hook — both touch the LLM context. The diffusion half of the rebalance takes
+    // the engine's own `res_mu` internally.
     g_session_mu.lockUncancelable(g_io);
+    defer g_session_mu.unlock(g_io);
     // Mirror the resolved policy onto the session for the status-bar display and
     // the reset/reclaim ceiling (these fields outlive the arbiter's live state).
     s.vram_limit = available;
     s.vram_share = share;
     s.vram_budget = available;
-    g_arbiter.diff_used = diff_res;
     std.log.info("[vram] meter policy: limit {d} MiB − system {d} → budget {d} MiB · LLM share {d} (LLM {d} + diff {d} resident, {d} free)", .{
         limit_bytes >> 20, system >> 20, available >> 20, share >> 20, llm_res >> 20, diff_res >> 20, free_b >> 20,
     });
     g_arbiter.setBudgets(available, share);
-    g_session_mu.unlock(g_io);
-
-    // Diffusion side: incrementally free resident weights to fit the room left
-    // after the LLM (keeping the rest resident so the next image reloads less),
-    // but only when idle (soft residency — no mid-image streaming).
-    if (!diff_busy) if (g_diffuser) |*d| {
-        _ = d.giveUpToBudget(available -| s.be.deviceUsed());
-    };
 }
 
 /// Restore a persisted window geometry onto a freshly created SDL window. Size
@@ -1020,18 +1027,22 @@ fn vcEnter(_: *anyopaque) void {
     // its next token — the fix for the old "no-op while generating" bug.
     g_session_mu.lockUncancelable(g_io);
     defer g_session_mu.unlock(g_io);
-    if (g_diffuser) |*d| g_arbiter.diff_used = d.vramBytes();
     g_arbiter.setDiffusionActive(true);
 }
 fn vcExit(_: *anyopaque) void {
+    // Queue drained → idle. The image model's residency becomes opportunistic
+    // cache, so the LLM gets priority over it again — one rebalance now settles
+    // BOTH sides (this used to be a `setDiffusionActive` plus a separate
+    // hand-written diffusion trim, whose two passes disagreed).
+    //
+    // The flag is set directly rather than via `setDiffusionActive` so the ceiling
+    // re-resolve below is what triggers the single rebalance; flipping it first
+    // would rebalance twice, the first time against a stale `system` reading.
     {
         g_session_mu.lockUncancelable(g_io);
         defer g_session_mu.unlock(g_io);
-        if (g_diffuser) |*d| g_arbiter.diff_used = d.vramBytes();
-        g_arbiter.setDiffusionActive(false); // LLM may reclaim up to limit − diff_used
+        g_arbiter.diff_active = false;
     }
-    // Queue drained → idle. Re-honor the limit: trim the now-idle diffusion
-    // model's resident weights if they push total usage past the ceiling.
     applyMeterPolicy();
 }
 fn vcBudget(_: *anyopaque) u64 {
@@ -1050,6 +1061,24 @@ fn vcReclaim(_: *anyopaque, needed: u64) u64 {
 }
 fn appCoordinator() diffuser.VramCoordinator {
     return .{ .ctx = undefined, .enter = vcEnter, .exit = vcExit, .budget = vcBudget, .reclaim = vcReclaim };
+}
+
+// ── The reverse direction: LLM reclaims from diffusion ────────────────────────
+// `vcReclaim` above has always let a diffusion worker migrate LLM layers to the
+// host mid-image. This is its mirror, and it was simply missing: an LLM
+// allocation that didn't fit under a resident-but-idle image model had no way to
+// reach that model's bytes (separate device contexts, and LLM weights are all
+// pinned so its own eviction ladder reclaims nothing), so the turn died with
+// DeviceOutOfMemory — the "llm sometimes ooms when diffusion is loaded" report.
+//
+// Runs on the LLM WORKER thread, as the last rung of `cuda.Backend`'s OOM ladder.
+// It does NOT take `g_session_mu`: the LLM session cannot be freed underneath its
+// own worker (every teardown path joins the worker first), and taking it here
+// would invert the lock order the diffusion worker uses.
+fn llmForeignReclaim(_: *anyopaque, needed: u64) u64 {
+    g_diff_mu.lockUncancelable(g_io);
+    defer g_diff_mu.unlock(g_io);
+    return g_arbiter.requestRoom(.llm, needed);
 }
 
 /// Whether a diffusion model is fully configured (all three pieces).
@@ -1086,6 +1115,13 @@ fn syncDiffuser() void {
     if (g_diffuser == null) {
         g_diffuser = diffuser.Diffuser.init(g_gpa, g_io, wakeupFrame, dcfgFromConfig(), appCoordinator());
         g_diffuser.?.seedBase(@truncate(@as(u96, @bitCast(std.Io.Clock.real.now(g_io).nanoseconds))));
+        // Register the image model as an arbiter participant so a growing LLM can
+        // reclaim its idle residency (the direction that never worked). The
+        // participant borrows the engine; `freeDiffuser` drops it before teardown.
+        // `g_diff_mu` because the LLM's worker thread reads it (foreignReclaim).
+        g_diff_mu.lockUncancelable(g_io);
+        g_arbiter.diffusion = g_diffuser.?.participant();
+        g_diff_mu.unlock(g_io);
     }
     var d = &g_diffuser.?;
     // requestPaths re-dupes the paths into the engine's owned store (nothing
@@ -1109,6 +1145,16 @@ fn syncDiffuser() void {
 /// join, then free it (frees the whole image history it owns).
 fn freeDiffuser() void {
     if (g_diffuser) |*d| {
+        // Drop the arbiter's participant FIRST: it borrows the engine we are about
+        // to free, and the LLM's worker thread can be reading it right now through
+        // `llmForeignReclaim`. Mirrors `g_arbiter.llm = null` on the LLM side.
+        // `diff_active` goes with it — we tear down without pumping, so the
+        // queue-drain edge that normally clears it never fires, and a stale `true`
+        // would keep the LLM pinned to its share with nothing left to use the rest.
+        g_diff_mu.lockUncancelable(g_io);
+        g_arbiter.diffusion = null;
+        g_arbiter.diff_active = false;
+        g_diff_mu.unlock(g_io);
         d.cancelAll();
         // Drop every BORROWED reference to the images d.deinit is about to free:
         // the chat transcript (live + carried) and the open viewer. Otherwise a
@@ -1391,6 +1437,13 @@ fn buildSession(arena: std.mem.Allocator) !*chat.Session {
         .vision_budget_tokens = g_config.vision_budget.tokens(),
         .gemma4_canonical_template = g_config.gemma4_canonical_template,
     });
+    // Let this LLM's OOM ladder reach the image model's device context as its last
+    // rung (see llmForeignReclaim). Installed on the session's own backend — the
+    // same instance the stepper allocates through (`be` is a pointer) — as soon as
+    // it exists, so it also covers device work done before the session is
+    // published. It dies with the session, so it can never outlive the arbiter
+    // entry `loaderMain` adds.
+    s.be.foreign_reclaim = .{ .ctx = undefined, .call = llmForeignReclaim };
     return s;
 }
 

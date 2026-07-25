@@ -509,7 +509,7 @@ pub const CudaLM = struct {
     /// gemma3 layers are attention), plus slack.
     pub fn promoteCost(self: *CudaLM, l: usize) usize {
         const kv_at_cap = 2 * self.kv_dtype.sizeBytes(self.capacity * self.cfg.kvDim());
-        return layerDeviceBytes(&self.lm.layers[l]) + kv_at_cap + (64 << 20);
+        return layerDeviceBytes(&self.lm.layers[l]) + kv_at_cap + residency.promote_slack;
     }
 
     /// Bring layer `l` back onto the GPU, preserving its accumulated K/V: re-create

@@ -413,6 +413,28 @@ pub const Diffuser = struct {
     /// `exit` on every empty-queue frame made the arbiter rebalance (and
     /// publish an LLM residency target) at frame rate for no reason.
     vram_entered: bool = false,
+    /// Guards this engine's device RESIDENCY against a foreign thread.
+    ///
+    /// `trimToBudget`/`giveUpToBudget` bind this engine's device context and free
+    /// its weights, and since diffusion became a `tp.vram.Participant` the arbiter
+    /// can invoke them from the LLM's worker thread (a starving LLM reclaiming
+    /// from an idle image model). That would otherwise race the UI thread's
+    /// `pump`, which frees the session at a model seam and flips `busy` + spawns
+    /// the worker — the `busy` check alone is a TOCTOU, since the flag is set on
+    /// a different thread than the one evicting.
+    ///
+    /// Held across pump's free/spawn decision and across each yield. Foreign
+    /// callers use `tryLock` and DECLINE rather than block, so no lock-ordering
+    /// cycle with the LLM-side `g_session_mu` is possible even if a future
+    /// reclaim path nests the two.
+    res_mu: std.Io.Mutex = std.Io.Mutex.init,
+    /// Cross-thread residency intent published by the app's `vram.Arbiter` (the
+    /// `tp.vram.Participant` half of `res_mu`'s story). Unlike the LLM, this engine
+    /// has no per-step poll of it: mid-image eviction is exactly what soft
+    /// residency avoids, so a published target is enacted only while idle. Kept so
+    /// both participants have the same shape (and a future step-boundary poll is a
+    /// fill-in, not a re-architecture).
+    control: tp.vram.ControlPoint = .{},
 
     /// Build the engine from a `DiffConfig`. `wake` repaints the UI on progress;
     /// `vram` is the injected VRAM coordinator (LLM eviction, or `.none`). The
@@ -578,7 +600,16 @@ pub const Diffuser = struct {
 
     /// Free the resident pipeline (returns its VRAM). Binds its own CUDA
     /// context. Caller must ensure no worker is in flight.
+    ///
+    /// Takes `res_mu` because this is the coarsest residency mutation there is:
+    /// the arbiter can be inside `giveUpToBudget` on the LLM's worker thread,
+    /// evicting from the very session we are about to destroy. Guarding the
+    /// primitive rather than its five call sites means a new caller can't
+    /// reintroduce the race. Blocking + uncancelable (the caller owns the
+    /// decision); the foreign side tryLocks and declines.
     pub fn freeSession(self: *Diffuser) void {
+        self.res_mu.lockUncancelable(self.io);
+        defer self.res_mu.unlock(self.io);
         if (self.session.load(.acquire)) |s| {
             s.deinit();
             self.session.store(null, .release);
@@ -621,6 +652,8 @@ pub const Diffuser = struct {
     /// which would force per-step streaming). No-op while generating; the next
     /// image re-uploads what fits its budget.
     pub fn trimToBudget(self: *Diffuser, budget: u64) void {
+        if (!self.res_mu.tryLock()) return; // pump is deciding / another yield in flight
+        defer self.res_mu.unlock(self.io);
         if (self.busy.load(.acquire)) return;
         const s = self.session.load(.acquire) orelse return;
         const before = s.deviceUsed();
@@ -635,7 +668,13 @@ pub const Diffuser = struct {
     /// keeping the rest resident (unlike `trimToBudget`). Busy-gated (never
     /// mid-image). The arbiter's live "diffusion yields to a growing LLM" lever;
     /// returns bytes freed.
+    ///
+    /// Binds this engine's device context, so it may only run when no worker owns
+    /// it — `res_mu` + the `busy` check together give that guarantee against both
+    /// the UI thread's `pump` and the LLM worker's reclaim (see `res_mu`).
     pub fn giveUpToBudget(self: *Diffuser, budget: u64) u64 {
+        if (!self.res_mu.tryLock()) return 0;
+        defer self.res_mu.unlock(self.io);
         if (self.busy.load(.acquire)) return 0;
         const s = self.session.load(.acquire) orelse return 0;
         const before = s.deviceUsed();
@@ -644,6 +683,58 @@ pub const Diffuser = struct {
             budget >> 20, freed >> 20, before >> 20, s.deviceUsed() >> 20, s.freeVram() >> 20,
         });
         return freed;
+    }
+
+    // --- tp.vram.Participant adapter --------------------------------------------
+    // Makes the image model a first-class arbiter participant alongside the LLM,
+    // so `vram.Arbiter.plan` can drive BOTH from one coherent plan. Before this,
+    // diffusion was only a budget CONSUMER (it read `diffusionBudget()` at spawn)
+    // and the reverse direction — an idle image model giving VRAM back to a
+    // growing LLM — was left to a separate app-level call that always cancelled
+    // to a no-op. See the `vram.Arbiter` doc comment.
+
+    fn vpUsage(ctx: *anyopaque) u64 {
+        return fromCtx(ctx).vramBytes();
+    }
+    /// Footprint if nothing contended. Estimated from the checkpoint file sizes
+    /// (see `estimateResidentBytes`) so it is nonzero even before the pipeline
+    /// loads — otherwise a not-yet-resident image model would read as "wants
+    /// nothing" and the LLM would plan to keep the whole card. `Participant.demand`
+    /// maxes this with live usage, so an under-estimate can never shrink below
+    /// what is actually resident.
+    fn vpDemand(ctx: *anyopaque) u64 {
+        return fromCtx(ctx).estimateResidentBytes();
+    }
+    /// Nothing is un-evictable while idle: resident weights are pure cache that
+    /// the next image re-uploads. Mid-image the whole working set is the floor —
+    /// evicting under a running sampler would force per-step streaming, which soft
+    /// residency exists to avoid.
+    fn vpFloor(ctx: *anyopaque) u64 {
+        const self = fromCtx(ctx);
+        return if (self.busyNow()) self.vramBytes() else 0;
+    }
+    fn vpBusy(ctx: *anyopaque) bool {
+        return fromCtx(ctx).busyNow();
+    }
+    fn vpApply(ctx: *anyopaque, target: u64) void {
+        _ = fromCtx(ctx).giveUpToBudget(target);
+    }
+    fn fromCtx(ctx: *anyopaque) *Diffuser {
+        return @ptrCast(@alignCast(ctx));
+    }
+    const vp_vtable: tp.vram.Participant.VTable = .{
+        .usage = vpUsage,
+        .demand = vpDemand,
+        .floor = vpFloor,
+        .busy = vpBusy,
+        .applyBudget = vpApply,
+    };
+
+    /// This image model as a `tp.vram.Participant` the app-level arbiter can drive.
+    /// The returned value borrows `self`, so the app must drop it (null out
+    /// `Arbiter.diffusion`) before tearing the engine down.
+    pub fn participant(self: *Diffuser) tp.vram.Participant {
+        return .{ .ctx = self, .control = &self.control, .vtable = &vp_vtable };
     }
 
     /// Estimate the image model's resident footprint (bytes) from its file
@@ -787,14 +878,19 @@ pub const Diffuser = struct {
         // than THIS image needs (a backend/model switch made after it was enqueued),
         // free it now — on the UI thread, where no status-bar reader can race the
         // free — so the worker reloads for gi's snapshot. Images without a snapshot
-        // (unqueued attachments) leave the resident session as-is.
+        // (unqueued attachments) leave the resident session as-is. (`freeSession`
+        // takes `res_mu` itself, so a concurrent foreign yield can't interleave.)
         if (gi.model) |m| {
             if (self.loaded) |l| {
                 if (!ModelConfig.eql(l, m)) self.freeSession();
             }
         }
         // Make VRAM room for the image model before it loads (the worker
-        // auto-budgets from live free VRAM).
+        // auto-budgets from live free VRAM). Deliberately OUTSIDE `res_mu`: this
+        // calls out to the app's VRAM coordinator, which rebalances the arbiter and
+        // so re-enters this engine's own participant hooks. (Nothing is lost by a
+        // yield landing in this window — we hold no session state across it, and
+        // the target the arbiter has for us here is a GROW, which is a no-op.)
         self.vram_entered = true;
         self.vram.enter(self.vram.ctx);
         // Preview buffer, sized to the final image resolution — the upper bound
@@ -819,6 +915,13 @@ pub const Diffuser = struct {
                 gi.preview = null;
             }
         }
+        // Hand this engine's device context to the worker under `res_mu`, so the
+        // `busy` flag and the spawn are one atomic step. Without it a foreign yield
+        // that had already passed its `busy == false` check would evict weights out
+        // from under a sampler that has just started (the flag alone is a TOCTOU —
+        // it is set on this thread, not the evicting one).
+        self.res_mu.lockUncancelable(self.io);
+        defer self.res_mu.unlock(self.io);
         gi.status.store(@intFromEnum(GenStatus.generating), .release);
         self.busy.store(true, .release);
         self.thread = std.Thread.spawn(.{}, worker, .{ self, gi }) catch {

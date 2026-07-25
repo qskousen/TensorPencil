@@ -34,6 +34,66 @@ pub const Snapshot = struct {
     free_mib: u64,
 };
 
+/// Scheduling margin each stepper's `promoteCost` adds on top of a layer's real
+/// device bytes, so a promote that *just* fits doesn't land the card at the
+/// physical edge. Single-sourced here because `demand` has to subtract it back
+/// out: it wants a FOOTPRINT, not a promote cost.
+/// Untyped so it coerces into both the steppers' `usize` promote costs and the
+/// `u64` byte budgets here.
+pub const promote_slack = 64 << 20;
+
+/// Device bytes `st` would hold with every layer back on the GPU — its full
+/// resident footprint, i.e. `vram.Participant.demand`. Equal to `deviceUsed()`
+/// when nothing is offloaded.
+///
+/// Needed because `deviceUsed()` alone cannot say whether the LLM is small or
+/// merely squeezed, and the cross-model arbiter has to tell those apart to know
+/// how much an idle image model should give back (see `vram.Arbiter.plan`).
+///
+/// Estimated as the MAX of two lower bounds, because neither alone covers every
+/// point in a session's life:
+///
+///   - `deviceUsed() + what the host-resident layers would cost to promote` —
+///     right once the model is warm (`deviceUsed` then already includes the LM
+///     head, embeddings and per-token scratch), whether or not anything is
+///     offloaded.
+///   - `every layer's weights + its KV at capacity` — right when the model is
+///     COLD. Device weights upload lazily on the first forward, so just after a
+///     load `deviceUsed` is only KV + scratch and the first bound reports a
+///     multi-GB model as wanting a few hundred MiB. That understatement is what
+///     let an idle image model keep the whole card until the first prefill
+///     OOM'd; the reactive `Arbiter.requestRoom` path recovers from that, but
+///     the point of a demand figure is not to need it.
+///
+/// Both are built from `promoteCost`, so no new per-stepper hook is required.
+/// Neither counts the head/scratch when cold, so this can still under-report
+/// slightly on a freshly loaded model — it is an estimate, and every consumer
+/// treats it as one.
+///
+/// Callable from ANY thread, unlike `snapshot`: this reads the backend's own byte
+/// counter and per-layer weight sizes only — no `memGetInfo`, so no bound context
+/// is required. That does mean it can observe `sp.next` mid-migration (the arbiter
+/// reads it from the diffusion worker while the LLM worker offloads), so the count
+/// is snapshotted and clamped: a stale read only skews the estimate, it can never
+/// index out of `order`. `order`'s CONTENTS are fixed for the life of the split —
+/// only the boundary moves — so every element is a valid layer index.
+pub fn demand(st: anytype) u64 {
+    const used = st.be.deviceUsed();
+    // Cold bound: every layer resident, at the current KV capacity.
+    var all_layers: u64 = 0;
+    for (0..st.cfg.n_layers) |l| all_layers += @as(u64, st.promoteCost(l)) -| promote_slack;
+
+    // Warm bound: what is resident now, plus promoting back everything on the host.
+    var warm = used;
+    if (st.split) |*sp| {
+        // `order[0..next]` are exactly the host-resident layers (migrateNext hands
+        // out order[next] then bumps it; promoteBack takes order[next-1]).
+        const n_host = @min(sp.next, sp.order.len);
+        for (sp.order[0..n_host]) |l| warm += @as(u64, st.promoteCost(l)) -| promote_slack;
+    }
+    return @max(warm, all_layers);
+}
+
 /// Snapshot `st`'s residency. Must run on the thread that bound this model's
 /// CUDA context (memGetInfo/deviceUsed read the current context).
 pub fn snapshot(st: anytype) Snapshot {

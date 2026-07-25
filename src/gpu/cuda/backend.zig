@@ -22,6 +22,14 @@ const Context = ctxmod.Context;
 
 pub const Error = error{ CudaError, OutOfMemory, NoSuitableDevice, DeviceOutOfMemory };
 
+/// Coordinator hook for freeing VRAM held by a DIFFERENT device context on the
+/// same card (see `Backend.foreign_reclaim`). Returns the bytes actually freed;
+/// 0 means "nothing available", which ends the ladder.
+pub const ForeignReclaim = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, needed: u64) u64,
+};
+
 /// io/allocator-free env-var presence check (std.posix.getenv / std.os.environ
 /// are gone in 0.16; we link libc, so call getenv directly).
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
@@ -250,6 +258,24 @@ pub const Backend = struct {
     /// decode path leaves it off (its residency is managed by pin_budget +
     /// offload); the diffusion pipeline sets it to its activation-scratch reserve.
     pin_floor: u64 = 0,
+    /// CROSS-CONTEXT reclaim: the last rung of both OOM ladders. When this
+    /// backend's own cache has nothing left to give, ask an external coordinator
+    /// to free `needed` bytes held by ANOTHER device context on the same card,
+    /// then retry the allocation. Null (the default, and the whole CLI) leaves
+    /// both ladders ending exactly where they always did.
+    ///
+    /// Why it can't be done locally: the GUI runs the LLM and the image model in
+    /// SEPARATE contexts, so `evictOneWeight` and the recycle pool below can only
+    /// ever reach this model's own bytes — and an LLM pins all of its weights, so
+    /// for the LLM those rungs reclaim nothing at all. Without this hook a
+    /// resident-but-idle image model was an immovable reservation, and any LLM
+    /// allocation that didn't fit under it (prefill activations, a promoted
+    /// layer's weight upload) failed the turn outright with DeviceOutOfMemory
+    /// while gigabytes sat evictable in the other context.
+    ///
+    /// The callee frees memory in the peer's context, which leaves THAT context
+    /// current on this thread — `foreignReclaim` re-binds ours before retrying.
+    foreign_reclaim: ?ForeignReclaim = null,
     /// Last evictOneWeight skip-reason tally, for the tensorCreate OOM diagnostic
     /// ([oom-dbg]). A failed eviction is now routine (the recycle pool, not the
     /// cache, usually holds the reclaimable bytes), so the breakdown is recorded
@@ -753,6 +779,7 @@ pub const Backend = struct {
                 if (self.evictOneWeight()) continue;
                 if (self.drainPoolForOom() > 0) continue; // sacrifice the recycle pool
                 if (self.evictNewestPrefetch()) continue; // last resort: drop the farthest-out prefetch
+                if (self.foreignReclaim(size)) continue; // finally: another context on this card
                 const es = self.evict_skip;
                 std.debug.print("[oom-dbg] tensorCreate size={d}MB free={d}MB pinned={d}MB streamed={d}MB cache={d} pending={d}MB | unevictable: pin={d} await={d} mru={d} pf={d} small={d}\n", .{
                     size >> 20, self.ctx.memGetInfo().free >> 20, self.pinned_bytes >> 20, self.streamed_bytes >> 20, self.weights.count(), self.pending_free_bytes >> 20,
@@ -761,6 +788,27 @@ pub const Backend = struct {
                 return error.DeviceOutOfMemory;
             }
         }
+    }
+
+    /// Final OOM-ladder rung: ask the coordinator to free `needed` bytes held by
+    /// another device context on this card (see `foreign_reclaim`). Returns true
+    /// when something was freed, i.e. the caller should retry.
+    ///
+    /// Terminates: the peer's residency strictly decreases on each success and it
+    /// reports 0 once it has nothing evictable left, so a retry loop guarded on
+    /// this cannot spin.
+    fn foreignReclaim(self: *Backend, needed: u64) bool {
+        const fr = self.foreign_reclaim orelse return false;
+        const got = fr.call(fr.ctx, needed);
+        // The peer's context was made current on this thread to free its memory.
+        // Restore ours before the caller retries, or the retry allocates into (or
+        // outright fails against) the wrong context.
+        self.bindThread();
+        if (got == 0) return false;
+        std.log.info("[vram] cross-context reclaim: needed {d} MiB, another context freed {d} MiB ({d} MiB now free)", .{
+            needed >> 20, got >> 20, self.ctx.memGetInfo().free >> 20,
+        });
+        return true;
     }
 
     /// Synchronously drain all deferred-frees (teardown / evictWeights).
@@ -1221,6 +1269,7 @@ pub const Backend = struct {
                 self.reclaimPending();
                 if (self.blockOldestPending()) continue;
                 if (self.evictOneWeight()) continue;
+                if (self.foreignReclaim(delta)) continue; // another context on this card
                 return error.DeviceOutOfMemory;
             };
             gt.handles.appendAssumeCapacity(h);

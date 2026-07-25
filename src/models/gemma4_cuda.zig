@@ -502,7 +502,7 @@ pub const CudaLM = struct {
         const cfg = self.cfg;
         const rows = if (usesRing(cfg, l)) localRingRows(cfg) else self.capacity;
         const kv = 2 * self.kv_dtype.sizeBytes(rows * cfg.kvDim(l));
-        return layerDeviceBytes(&self.lm.layers[l]) + kv + (64 << 20);
+        return layerDeviceBytes(&self.lm.layers[l]) + kv + residency.promote_slack;
     }
 
     /// Bring layer `l` back onto the GPU, preserving its accumulated K/V:

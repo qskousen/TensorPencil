@@ -696,7 +696,7 @@ pub const CudaLM = struct {
     /// only; recurrent layers hold fixed-size conv/ssm state, no KV), plus slack.
     pub fn promoteCost(self: *CudaLM, l: usize) usize {
         const kv_cost: usize = if (!self.cfg.isRecurrent(l)) 2 * self.kv_dtype.sizeBytes(self.capacity * self.cfg.kvDim()) else 0;
-        return layerDeviceBytes(&self.lm.layers[l]) + kv_cost + (64 << 20);
+        return layerDeviceBytes(&self.lm.layers[l]) + kv_cost + residency.promote_slack;
     }
 
     pub fn promoteLayer(self: *CudaLM, l: usize) !void {

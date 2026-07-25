@@ -971,6 +971,15 @@ pub const Session = struct {
     fn vpUsage(ctx: *anyopaque) u64 {
         return fromCtx(ctx).be.deviceUsed();
     }
+    /// Footprint with every offloaded layer promoted back — what the LLM would
+    /// hold if nothing contended. Lets the arbiter tell "this LLM is small" from
+    /// "this LLM is squeezed", so an idle image model yields only the deficit.
+    fn vpDemand(ctx: *anyopaque) u64 {
+        const self = fromCtx(ctx);
+        return switch (self.arch) {
+            inline else => |*a| residency.demand(&a.model),
+        };
+    }
     fn vpFloor(ctx: *anyopaque) u64 {
         return fromCtx(ctx).ctxKvBytes(); // committed KV can't be evicted
     }
@@ -1013,7 +1022,13 @@ pub const Session = struct {
     fn fromCtx(ctx: *anyopaque) *Session {
         return @ptrCast(@alignCast(ctx));
     }
-    const vp_vtable: vram.Participant.VTable = .{ .usage = vpUsage, .floor = vpFloor, .busy = vpBusy, .applyBudget = vpApply };
+    const vp_vtable: vram.Participant.VTable = .{
+        .usage = vpUsage,
+        .demand = vpDemand,
+        .floor = vpFloor,
+        .busy = vpBusy,
+        .applyBudget = vpApply,
+    };
 
     /// This LLM as a `vram.Participant` the app-level arbiter can drive.
     pub fn participant(self: *Session) vram.Participant {
@@ -1035,7 +1050,7 @@ pub const Session = struct {
     /// Runs on the DIFFUSION thread, so it binds the LLM context and is safe only
     /// when the LLM is idle (else it declines — returns 0 — and the pipeline
     /// falls back to tiling / CPU). The `vram.Arbiter` promotes the layers back
-    /// (target = limit − diff_used) when the image queue drains (`vcExit`).
+    /// back when the image queue drains (`vcExit` → the arbiter's rebalance).
     pub fn imageReclaim(self: *Session, needed: u64) u64 {
         if (self.busy()) {
             std.log.info("[reclaim] declined: LLM is generating (can't migrate mid-decode)", .{});

@@ -1,6 +1,3 @@
-- when not diffusing and llm is running, llm doesn't offload any diffusion weights but diffusion offloads llm weights. llm also sometimes ooms (llama) when diffusion is loaded; should auto offload to cpu
-- split is not respected
-- changing system prompt should take effect on the next message
 - begin filling in holes in the capabilities grid (BACKEND.md)
 - add more sampling methods
 - tool call boxes inline, expandable to see the tool call
