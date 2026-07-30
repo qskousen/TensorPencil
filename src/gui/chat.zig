@@ -1666,7 +1666,7 @@ pub const Session = struct {
                 }
             },
         }
-        const prefilled = self.ctxTokens() - cached_before;
+        const prefilled = self.ctxTokens() -| cached_before;
         if (prefilled > 0) {
             const dt = @as(f64, @floatFromInt(std.Io.Clock.real.now(self.io).nanoseconds - t0)) / 1e9;
             std.log.info("[llm] prefill done: {d} tok in {d:.2}s ({d:.0} tok/s) · ctx now {d} tok", .{
