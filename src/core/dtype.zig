@@ -231,6 +231,119 @@ pub fn bf16ToF32Row(src: []const u8, dst: []f32, scale: f32) void {
     while (i < dst.len) : (i += 1) dst[i] = bf16ToF32(std.mem.readInt(u16, src[i * 2 ..][0..2], .little)) * scale;
 }
 
+/// Round-to-nearest-even f32 -> f16 bits. `@floatCast` lowers to the hardware
+/// convert (vcvtps2ph under F16C), which is the same RNE rounding ggml's
+/// `GGML_COMPUTE_FP32_TO_FP16` uses, so the bits match ggml's.
+pub inline fn f32ToF16(v: f32) u16 {
+    return @bitCast(@as(f16, @floatCast(v)));
+}
+
+/// Vectorized f32 -> f16 row: `src.len` values into `dst.len == src.len * 2`
+/// little-endian u16s. The inverse of `f16ToF32Row`; bit-identical to ggml's
+/// `ggml_fp32_to_fp16_row` (both round to nearest even).
+pub fn f32ToF16Row(src: []const f32, dst: []u8) void {
+    std.debug.assert(dst.len == src.len * 2);
+    const V = 8;
+    var i: usize = 0;
+    while (i + V <= src.len) : (i += V) {
+        const f: @Vector(V, f32) = src[i..][0..V].*;
+        const h: @Vector(V, f16) = @floatCast(f);
+        dst[i * 2 ..][0 .. V * 2].* = @bitCast(h);
+    }
+    while (i < src.len) : (i += 1) std.mem.writeInt(u16, dst[i * 2 ..][0..2], f32ToF16(src[i]), .little);
+}
+
+/// Vectorized f32 -> bf16 row: `src.len` values into `dst.len == src.len * 2`
+/// little-endian u16s. The inverse of `bf16ToF32Row`, round-to-nearest-even with
+/// ggml's NaN handling — bit-identical to `ggml_compute_fp32_to_bf16` and to the
+/// scalar `f32ToBf16` above.
+///
+/// Note this matches ggml's *scalar* path. `ggml_fp32_to_bf16_row` has an
+/// `__AVX512BF16__` fast path that flushes subnormals to zero and therefore does
+/// NOT agree with its own scalar reference; builds that undefine that macro (as
+/// ours do) take the scalar path.
+pub fn f32ToBf16Row(src: []const f32, dst: []u8) void {
+    std.debug.assert(dst.len == src.len * 2);
+    const V = 8;
+    const one: @Vector(V, u32) = @splat(1);
+    const half: @Vector(V, u32) = @splat(0x7fff);
+    const qnan: @Vector(V, u32) = @splat(0x0040);
+    const abs_mask: @Vector(V, u32) = @splat(0x7fffffff);
+    const inf_bits: @Vector(V, u32) = @splat(0x7f800000);
+    const shift: @Vector(V, u5) = @splat(16);
+    var i: usize = 0;
+    while (i + V <= src.len) : (i += V) {
+        const f: @Vector(V, f32) = src[i..][0..V].*;
+        const bits: @Vector(V, u32) = @bitCast(f);
+        const hi = bits >> shift;
+        // RNE: add 0x7fff + lsb(hi), then truncate. The add is wrapping because a
+        // NaN lane can carry out of u32 (0xffffffff + 0x8000); every such lane is
+        // replaced by the NaN result below, so the wrapped value is never used.
+        const rounded = (bits +% (half + (hi & one))) >> shift;
+        const is_nan = (bits & abs_mask) > inf_bits;
+        const out: @Vector(V, u16) = @truncate(@select(u32, is_nan, hi | qnan, rounded));
+        dst[i * 2 ..][0 .. V * 2].* = @bitCast(out);
+    }
+    while (i < src.len) : (i += 1) std.mem.writeInt(u16, dst[i * 2 ..][0..2], f32ToBf16(src[i]), .little);
+}
+
+/// Values that stress both narrowing converters: exact, tie-to-even, overflow,
+/// subnormal, zero-sign, inf and NaN. Length 19 is deliberately not a multiple
+/// of the vector width, so the scalar tail runs too.
+const narrowing_test_values = [_]f32{
+    0.0,                            -0.0,
+    1.0,                            -1.0,
+    0.5,                            65504.0, // max f16
+    65536.0, // overflows f16 -> inf
+    1e-8, // subnormal/zero in f16
+    3.14159265,                     -2.718281828,
+    @bitCast(@as(u32, 0x3f808000)), // bf16 tie -> rounds down (even)
+    @bitCast(@as(u32, 0x3f818000)), // bf16 tie -> rounds up (even)
+    @bitCast(@as(u32, 0x3f808001)), // just above a bf16 tie -> up
+    std.math.inf(f32),              -std.math.inf(f32),
+    std.math.nan(f32),              1.0e30,
+    -1.0e-30,                       123456.789,
+};
+
+test "f32ToF16Row matches the scalar convert, including the tail" {
+    const src = &narrowing_test_values;
+    var dst: [src.len * 2]u8 = undefined;
+    f32ToF16Row(src, &dst);
+    for (src, 0..) |v, i| {
+        const got = std.mem.readInt(u16, dst[i * 2 ..][0..2], .little);
+        errdefer std.debug.print("f16 idx {d}: v={d} want {x:0>4} got {x:0>4}\n", .{ i, v, f32ToF16(v), got });
+        try std.testing.expectEqual(f32ToF16(v), got);
+    }
+}
+
+test "f32ToBf16Row matches the scalar convert, including the tail" {
+    const src = &narrowing_test_values;
+    var dst: [src.len * 2]u8 = undefined;
+    f32ToBf16Row(src, &dst);
+    for (src, 0..) |v, i| {
+        const got = std.mem.readInt(u16, dst[i * 2 ..][0..2], .little);
+        errdefer std.debug.print("bf16 idx {d}: v={d} want {x:0>4} got {x:0>4}\n", .{ i, v, f32ToBf16(v), got });
+        try std.testing.expectEqual(f32ToBf16(v), got);
+    }
+}
+
+test "narrowing row converters round-trip through the widening ones" {
+    // bf16 keeps the f32 high half, so every bf16-representable value survives
+    // f32 -> bf16 -> f32 exactly. Same for f16-representable values.
+    const src = [_]f32{ 0.0, 1.0, -1.0, 0.5, -0.25, 2.0, 256.0, -1024.0, 3.5, 0.125, -7.0, 64.0, 0.75, -0.5, 16.0, 1.5, -3.0 };
+    var packed_bf: [src.len * 2]u8 = undefined;
+    var packed_f16: [src.len * 2]u8 = undefined;
+    f32ToBf16Row(&src, &packed_bf);
+    f32ToF16Row(&src, &packed_f16);
+
+    var back_bf: [src.len]f32 = undefined;
+    var back_f16: [src.len]f32 = undefined;
+    bf16ToF32Row(&packed_bf, &back_bf, 1.0);
+    f16ToF32Row(&packed_f16, &back_f16, 1.0);
+    try std.testing.expectEqualSlices(f32, &src, &back_bf);
+    try std.testing.expectEqualSlices(f32, &src, &back_f16);
+}
+
 test "dtype string round trip and sizes" {
     try std.testing.expectEqual(DType.f8_e4m3, DType.fromString("F8_E4M3").?);
     try std.testing.expectEqual(DType.bf16, DType.fromString("BF16").?);

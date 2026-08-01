@@ -19,8 +19,12 @@ the engine — all as intra-module references.
 ## Public surface
 
 `tp_models.models.<arch>` (e.g. `models.qwen3.CausalLM`, `models.dit`,
-`models.wan_vae`) and `tp_models.llm.<part>` (e.g. `llm.engine.generate`,
-`llm.chat`, `llm.spec`).
+`models.wan_vae`, `models.lpips`) and `tp_models.llm.<part>` (e.g.
+`llm.engine.generate`, `llm.chat`, `llm.spec`).
+
+Every loader takes a `tp_core.weights.WeightStore`, so a model reads from
+safetensors or GGUF without caring which — including `dit.DiT.load` (see the
+`comfy.gguf.orig_shape` note in the repo CLAUDE.md).
 
 ## Dependencies
 

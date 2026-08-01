@@ -7,6 +7,7 @@ pub const rope = @import("ops/rope.zig");
 pub const matmul = @import("ops/matmul.zig");
 pub const attention = @import("ops/attention.zig");
 pub const convrot = @import("ops/convrot.zig");
+pub const conv = @import("ops/conv.zig");
 pub const cancel = @import("ops/cancel.zig");
 pub const pause = @import("ops/pause.zig");
 
@@ -18,6 +19,7 @@ test {
     _ = matmul;
     _ = attention;
     _ = convrot;
+    _ = conv;
     _ = cancel;
     _ = pause;
 }

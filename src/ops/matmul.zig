@@ -47,6 +47,61 @@ pub const GpuDispatch = struct {
 /// Injected by the pipeline; null = CPU only.
 pub var gpu_dispatch: ?GpuDispatch = null;
 
+/// Observer called with the INPUT of every GEMM, before it runs. The point is
+/// per-layer attribution: `w.tag` names the weight, so a caller can accumulate
+/// statistics of the activations each layer actually sees (quantization
+/// calibration), time or count GEMMs per layer (profiling), or dump intermediates
+/// (debugging) without any of that living in the kernels.
+///
+/// `x` is `[m, w.cols]` row-major and is only valid for the duration of the call —
+/// copy anything you keep. The hook must not mutate it.
+pub const Probe = struct {
+    ctx: *anyopaque,
+    input: *const fn (ctx: *anyopaque, w: Weight, x: []const f32, m: usize) void,
+};
+
+/// Installed by a caller; null = no observation, zero cost. Single-threaded use
+/// only, exactly like `gpu_dispatch` above: it is read once per `matmul` on the
+/// calling thread, so callers that run matmuls concurrently must synchronize the
+/// hook themselves.
+///
+/// Note this sees only GEMMs that go THROUGH this function: the CPU path, plus
+/// whatever the GPU dispatch above forwards. Backends with their own GEMM bypass it
+/// and carry their own probe points — **both DiT backends now do**:
+///
+/// - `dit_cuda`: `lin` (all 224 block linears), `txtGemm` (the txtfusion tower and
+///   both txtmlp linears), and the two patch-embed GEMMs.
+/// - `dit_gpu`: `Gemm.go` plus the two patch-embed GEMMs; a non-null `probe` also
+///   forces the f32 GEMM path there, because the cooperative-matrix fp8 fast path
+///   bypasses `Gemm.go` entirely and would feed f16 activations.
+///
+/// Each stages the activation to host memory and calls this same hook, so the
+/// statistics come out of one implementation whichever backend ran the model.
+/// **int8/int4 checkpoints are skipped on both**: their activation is rotated and
+/// quantized in place before the GEMM, so there is no f32 activation left to
+/// observe.
+pub var probe: ?Probe = null;
+
+/// Force block-quantized GEMMs down the exact-activation path at every `m`.
+///
+/// The CPU has two block-quant implementations that differ in *numerics*, not
+/// just speed (see `small_m_max`). At large `m` the weights are dequantized into
+/// a packed panel and multiplied in f32, so only the weights are quantized. At
+/// small `m` the work is memory-bound instead of compute-bound, and ggml's
+/// `vec_dot` GEMV wins by a wide margin — but it reaches that speed by also
+/// quantizing the activations to the weight type's `vec_dot_type` (Q8_K for
+/// k-quants), which introduces activation quantization error the packed path
+/// does not have.
+///
+/// That trade is the right default for inference. Set this when the *quantity
+/// being computed* matters more than throughput: measuring weight-format loss in
+/// isolation, comparing a small-`m` result against a large-`m` one, or chasing a
+/// numerical discrepancy across backends. Non-block dtypes are unaffected.
+///
+/// Single-threaded, like `probe` and `gpu_dispatch`: set it around the calls you
+/// care about and restore it afterwards.
+pub var exact_activations: bool = false;
+
 /// Minimum FLOP count before the GPU path is worth the PCIe round trip.
 pub var gpu_min_flops: usize = 1 << 31;
 
@@ -69,7 +124,16 @@ const Vec = @Vector(vlen, f32);
 const MR = 6;
 const NR = 2 * vlen;
 const KC = 512; // k-block: one packed subpanel slice is KC*NR*4 = 128 KiB max
-const small_m_max = 16;
+
+/// Token count at which the CPU path switches to the packed outer-product path.
+///
+/// Public because it changes the *semantics* of a block-quant GEMM, not just its
+/// speed: at or above this, block-quant weights are dequantized and multiplied in
+/// f32, so only the weights are quantized. Below it, they take ggml's int8
+/// `vec_dot` GEMV, which quantizes the **activations** too — a W8A8-shaped
+/// computation. A caller measuring weight-format loss in isolation has to know
+/// which side of this line it is on, so it has to be able to read the line.
+pub const small_m_max = 16;
 
 /// A weight matrix view over raw checkpoint bytes.
 pub const Weight = struct {
@@ -87,6 +151,12 @@ pub const Weight = struct {
     /// un-rotated at dequant time; `cols` must be a multiple of this. i4 packs
     /// two values per byte so `cols` is also even. See ops/convrot.zig.
     convrot: u32 = 0,
+    /// Checkpoint tensor name, when the loader knows it (e.g.
+    /// "blocks.12.attn.wq.weight"). Purely informational to the kernels — it is
+    /// what lets a caller attribute a GEMM to a layer: the `probe` hook below,
+    /// profiling breakdowns, and error messages. Owned by whoever built the
+    /// Weight (model loaders allocate it in the model arena).
+    tag: ?[]const u8 = null,
 
     pub fn init(bytes: []const u8, dtype: DType, rows: usize, cols: usize) Weight {
         std.debug.assert(bytes.len == dtype.storageBytes(rows * cols));
@@ -133,6 +203,10 @@ pub fn matmul(
         std.debug.assert(w.row_scale != null and w.row_scale.?.len == w.rows);
     if (m == 0 or w.rows == 0) return;
 
+    // Activation observer (see `probe`): after validation, before any dispatch, so
+    // it sees the same `x` every backend path would.
+    if (probe) |p| p.input(p.ctx, w, x, m);
+
     // Cooperative cancel (see ops/cancel.zig): captured once here on the
     // calling thread, polled by the row-chunk tasks so a cancel lands
     // mid-GEMM (a big DiT MLP GEMM is seconds of CPU work).
@@ -149,7 +223,12 @@ pub fn matmul(
         }
     }
 
-    if (m >= small_m_max) return matmulPacked(io, gpa, y, x, m, w, bias, tok);
+    // `exact_activations` routes block-quant to the packed path even in the
+    // small-m regime, trading the GEMV's speed for f32 activations. The packed
+    // path handles any m >= 1 (its MR tiling clamps on the tail), so this is a
+    // performance choice, not a correctness one.
+    if (m >= small_m_max or (exact_activations and w.dtype.isBlockQuant()))
+        return matmulPacked(io, gpa, y, x, m, w, bias, tok);
 
     // Decode (small m) block-quant GEMV → ggml's AVX2 quant vec_dot, which is
     // memory-bound (~30x faster than our Zig dequant/int8 kernels). Non-block-
@@ -862,6 +941,56 @@ test "matmul f32 small" {
     try testAgainstNaive(3, 5, 7, .f32, true, 1.0);
 }
 
+test "probe observes each GEMM's input, attributed by weight tag" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    const Recorder = struct {
+        const Call = struct { tag: ?[]const u8, m: usize, cols: usize, x0: f32, xn: f32 };
+        calls: [4]Call = undefined,
+        n: usize = 0,
+
+        fn onInput(ctx: *anyopaque, w: Weight, x: []const f32, m: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            // The hook sees the real input buffer, so record enough to prove it is
+            // the right one (not just that something fired).
+            self.calls[self.n] = .{ .tag = w.tag, .m = m, .cols = w.cols, .x0 = x[0], .xn = x[x.len - 1] };
+            self.n += 1;
+        }
+    };
+
+    // 2x3 weight, 2 tokens of 3 features.
+    const wdata = [_]f32{ 1, 0, 0, 0, 1, 0 };
+    const x = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    var y: [4]f32 = undefined;
+
+    var w = Weight.fromF32(&wdata, 2, 3);
+    w.tag = "blocks.0.attn.wq.weight";
+
+    var rec: Recorder = .{};
+    probe = .{ .ctx = &rec, .input = Recorder.onInput };
+    defer probe = null; // a leaked probe would silently observe every later test
+
+    try matmul(io, gpa, &y, &x, 2, w, null);
+    // An untagged weight still fires — the consumer decides what to do with null.
+    const untagged = Weight.fromF32(&wdata, 2, 3);
+    try matmul(io, gpa, &y, &x, 2, untagged, null);
+    // A zero-row GEMM does no work, so there is nothing to observe.
+    try matmul(io, gpa, y[0..0], x[0..0], 0, w, null);
+
+    try std.testing.expectEqual(@as(usize, 2), rec.n);
+    try std.testing.expectEqualStrings("blocks.0.attn.wq.weight", rec.calls[0].tag.?);
+    try std.testing.expectEqual(@as(?[]const u8, null), rec.calls[1].tag);
+    for (rec.calls[0..2]) |c| {
+        try std.testing.expectEqual(@as(usize, 2), c.m);
+        try std.testing.expectEqual(@as(usize, 3), c.cols);
+        try std.testing.expectEqual(@as(f32, 1), c.x0);
+        try std.testing.expectEqual(@as(f32, 6), c.xn);
+    }
+    // The GEMM itself is unaffected by observation: y = x @ w^T picks features 0,1.
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 4, 5 }, &y);
+}
+
 test "matmul f32 vector tail and single token" {
     try testAgainstNaive(1, 9, vlen * 2 + 3, .f32, false, 1.0);
 }
@@ -1176,6 +1305,89 @@ test "matmul block quants packed path" {
     try testBlockQuantAgainstNaive(37, NR + 5, KC + 256, .q4_k, false);
     try testBlockQuantAgainstNaive(19, 33, 512, .q5_k, true);
     try testBlockQuantAgainstNaive(small_m_max, NR, KC + 256, .q6_k, false);
+}
+
+test "exact_activations removes the small-m path's activation quantization" {
+    if (!have_ggml) return error.SkipZigTest;
+    const quants_mod = @import("tp_core").quants;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // m well below small_m_max, so the default dispatch is the vec_dot GEMV.
+    const m = 4;
+    const rows = 8;
+    const cols = 256;
+    const dt: DType = .q4_k;
+
+    var prng = std.Random.DefaultPrng.init(11);
+    const rand = prng.random();
+
+    const x = try gpa.alloc(f32, m * cols);
+    defer gpa.free(x);
+    for (x) |*v| v.* = rand.floatNorm(f32);
+
+    const row_bytes = dt.storageBytes(cols);
+    const wbytes = try gpa.alloc(u8, rows * row_bytes);
+    defer gpa.free(wbytes);
+    rand.bytes(wbytes);
+    var off: usize = 0;
+    while (off < wbytes.len) : (off += dt.blockBytes()) {
+        std.mem.writeInt(u16, wbytes[off..][0..2], 0x2A66, .little); // d   = 0.05
+        std.mem.writeInt(u16, wbytes[off + 2 ..][0..2], 0x251F, .little); // min = 0.02
+    }
+
+    // Reference: the same quantized weights decoded to f32, multiplied exactly.
+    const w_f32 = try gpa.alloc(f32, rows * cols);
+    defer gpa.free(w_f32);
+    for (0..rows) |r| {
+        quants_mod.dequantSlice(dt, wbytes[r * row_bytes ..][0..row_bytes], 0, cols, w_f32[r * cols ..][0..cols]);
+    }
+    const y_ref = try gpa.alloc(f32, m * rows);
+    defer gpa.free(y_ref);
+    naiveMatmul(y_ref, x, m, w_f32, rows, cols, null);
+
+    const w = Weight.init(wbytes, dt, rows, cols);
+    const y_gemv = try gpa.alloc(f32, m * rows);
+    defer gpa.free(y_gemv);
+    const y_exact = try gpa.alloc(f32, m * rows);
+    defer gpa.free(y_exact);
+
+    const prev = exact_activations;
+    defer exact_activations = prev;
+
+    exact_activations = false;
+    try matmul(io, gpa, y_gemv, x, m, w, null);
+    exact_activations = true;
+    try matmul(io, gpa, y_exact, x, m, w, null);
+
+    const relL2 = struct {
+        fn f(ref: []const f32, got: []const f32) f64 {
+            var num: f64 = 0;
+            var den: f64 = 0;
+            for (ref, got) |e, a| {
+                den += @as(f64, e) * e;
+                num += @as(f64, a - e) * (a - e);
+            }
+            return @sqrt(num / (den + 1e-12));
+        }
+    }.f;
+
+    const err_exact = relL2(y_ref, y_exact);
+    const err_gemv = relL2(y_ref, y_gemv);
+
+    // With the flag the activations stay f32, so the only difference from the
+    // reference is float summation order.
+    std.testing.expect(err_exact < 1e-6) catch |err| {
+        std.debug.print("exact_activations path rel-L2 {e:.3}, expected < 1e-6\n", .{err_exact});
+        return err;
+    };
+    // Without it, quantizing x to Q8_K costs real accuracy. Asserting the gap
+    // (rather than an absolute bound on err_gemv) is what makes this a test of
+    // the flag's effect and not of ggml's tolerances.
+    std.testing.expect(err_gemv > err_exact * 100) catch |err| {
+        std.debug.print("gemv rel-L2 {e:.3} vs exact {e:.3}: activation quantization is not visible\n", .{ err_gemv, err_exact });
+        return err;
+    };
 }
 
 test "matmul rejects unsupported dtype" {

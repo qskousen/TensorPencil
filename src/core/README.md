@@ -15,12 +15,12 @@ Root: `core.zig`.
 | `safetensors` | `SafeTensors` reader (`.open` / `.openIn`) |
 | `gguf` | `Gguf` reader |
 | `quants` | block-quant dequant (`dequantSlice`, ggml-backed); `have_ggml` |
-| `weights` | `WeightStore` over a checkpoint |
+| `weights` | `WeightStore` over a checkpoint, plus `Overlay` (a base store with tensors substituted from memory) |
 | `tokenizer` | `Tokenizer` (embedded qwen vocab under `assets/`) |
 | `kv_cache` | `KvCache` / `PerLayerKvCache` autoregressive caches |
 | `sample` | logits→token: argmax, top-k/top-p/min-p, penalties |
 | `sampler` | diffusion scheduler; `torch_rng` Torch-compatible RNG |
-| `image` | image load/save |
+| `image` | PNG encode/decode incl. `tEXt` metadata; comparison metrics (`psnr`, `mse`, `ssim`, `detailEnergy`) |
 | `spec_limits` | speculative-decode size caps; `prof` profiling |
 
 ## Dependencies

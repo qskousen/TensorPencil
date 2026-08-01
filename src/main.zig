@@ -1048,7 +1048,7 @@ fn cudaTxtFusionTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path:
     };
     var st = try TensorPencil.SafeTensors.open(arena, io, path);
     defer st.deinit();
-    var model = try dit.DiT.load(arena, &st);
+    var model = try dit.DiT.load(arena, .{ .safetensors = &st });
     defer model.deinit();
 
     // Deterministic conditioning [seq_txt, 12, txt_dim] (encoder-output-scale ~O(1)).
@@ -1201,7 +1201,7 @@ fn cudaStreamTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []
 
     var st = try TensorPencil.SafeTensors.open(arena, io, path);
     defer st.deinit();
-    var model = try dit_mod.DiT.load(arena, &st);
+    var model = try dit_mod.DiT.load(arena, .{ .safetensors = &st });
     defer model.deinit();
     if (model.blocks[0].attn.wq.dtype != .i8) {
         try stdout.print("cuda-stream-test needs the int8 convrot checkpoint\n", .{});
@@ -1311,7 +1311,7 @@ fn cudaDitTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []con
 
     var st = try TensorPencil.SafeTensors.open(arena, io, path);
     defer st.deinit();
-    var model = try dit_mod.DiT.load(arena, &st);
+    var model = try dit_mod.DiT.load(arena, .{ .safetensors = &st });
     defer model.deinit();
     const wqt = model.blocks[0].attn.wq.dtype;
     if (wqt != .i8 and wqt != .i4 and wqt != .bf16) {

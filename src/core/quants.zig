@@ -97,9 +97,422 @@ pub const ensureGgmlInit = gg.ensureInit;
 /// reference our golden fixtures were generated from. Panics if built without ggml.
 pub const dequantSlice = gg.dequantSlice;
 
+// ---------------------------------------------------------------------------
+// Raw ggml type bridge
+//
+// `DType` above covers the formats TensorPencil can *compute* with. A tool that
+// inspects or rewrites arbitrary GGUF files (a converter, a quantizer) has to
+// handle every type ggml knows — including ones we have no kernel for and don't
+// want to model in `DType`. `raw` is that escape hatch: the same ggml quantize /
+// dequantize / layout entry points, keyed on the numeric `enum ggml_type` id
+// straight out of a GGUF header, with the unchecked C surface (out-of-range ids,
+// null trait function pointers, unaligned lengths) turned into Zig errors.
+//
+// Prefer `DType` when the type is one we compute with; reach for `raw` when the
+// type is data passing through.
+// ---------------------------------------------------------------------------
+
+pub const RawError = error{
+    /// Not a valid `enum ggml_type` value in the linked ggml.
+    UnknownGgmlType,
+    /// ggml knows this type but has no kernel for the requested direction
+    /// (e.g. one it can read but not produce).
+    UnsupportedGgmlType,
+    /// Element count is not a whole number of blocks for this type.
+    NotBlockAligned,
+    /// A source or destination buffer is the wrong size for the request.
+    BufferSizeMismatch,
+    /// A type that cannot be quantized without an importance matrix was asked
+    /// for without one.
+    ImatrixRequired,
+} || QuantError;
+
+pub const raw = if (have_ggml) struct {
+    const ggml = @import("ggml");
+
+    fn checked(id: u32) RawError!ggml.c.enum_ggml_type {
+        if (id >= typeCount()) return error.UnknownGgmlType;
+        return @intCast(id);
+    }
+
+    /// Number of `enum ggml_type` values in the linked ggml; valid ids are
+    /// `0..typeCount() - 1`. This grows with ggml versions — a GGUF written by a
+    /// newer llama.cpp can carry ids this build does not know.
+    pub fn typeCount() u32 {
+        return @intCast(ggml.c.GGML_TYPE_COUNT);
+    }
+
+    /// ggml's own name for the type ("q4_K", "f16", …).
+    pub fn name(id: u32) RawError![]const u8 {
+        return std.mem.span(ggml.c.ggml_type_name(try checked(id)));
+    }
+
+    /// Elements per block (1 for non-block types).
+    pub fn blockElems(id: u32) RawError!usize {
+        return @intCast(ggml.c.ggml_blck_size(try checked(id)));
+    }
+
+    /// Bytes per block (for non-block types, bytes per element).
+    pub fn blockBytes(id: u32) RawError!usize {
+        return ggml.c.ggml_type_size(try checked(id));
+    }
+
+    /// Bytes needed to store `elems` elements of this type.
+    pub fn rowBytes(id: u32, elems: usize) RawError!usize {
+        const t = try checked(id);
+        const be: usize = @intCast(ggml.c.ggml_blck_size(t));
+        if (elems % be != 0) return error.NotBlockAligned;
+        return ggml.c.ggml_row_size(t, @intCast(elems));
+    }
+
+    pub fn isQuantized(id: u32) RawError!bool {
+        return ggml.c.ggml_is_quantized(try checked(id));
+    }
+
+    /// True for the types (the IQ family) that cannot be produced without an
+    /// importance matrix.
+    pub fn requiresImatrix(id: u32) RawError!bool {
+        return ggml.c.ggml_quantize_requires_imatrix(try checked(id));
+    }
+
+    /// Pre-build this type's quantization tables. Optional — `quantizeChunk` does
+    /// it internally — but worth calling once up front when many threads will
+    /// quantize concurrently, so the table build is off the hot path. ggml
+    /// documents init/free as thread-safe.
+    pub fn ensureQuantizeInit(id: u32) RawError!void {
+        ggml.c.ggml_quantize_init(try checked(id));
+    }
+
+    /// Release the memory held by `ensureQuantizeInit` / `quantizeChunk` (the IQ
+    /// lookup tables). Optional; call at process end to keep leak checkers quiet.
+    pub fn quantizeFree() void {
+        ggml.c.ggml_quantize_free();
+    }
+
+    /// Quantize `src` (`nrows * n_per_row` f32 values, row-major) into `dst` as
+    /// type `id`, returning the number of bytes written.
+    ///
+    /// `imatrix`, when given, is the per-column importance weighting that the
+    /// k-quant and IQ scale searches minimize against — one weight per column, so
+    /// `n_per_row` of them, shared by every row in the call. This is the
+    /// activation-aware hook: pass per-channel activation energy and ggml picks
+    /// block scales that minimize weighted error instead of plain squared error.
+    ///
+    /// Unlike ggml's `ggml_quantize_chunk` there is no `start` offset — slice
+    /// `src`/`dst` instead. Safe to call from many threads on disjoint slices.
+    pub fn quantizeChunk(
+        id: u32,
+        src: []const f32,
+        dst: []u8,
+        nrows: usize,
+        n_per_row: usize,
+        imatrix: ?[]const f32,
+    ) RawError!usize {
+        const t = try checked(id);
+        if (src.len != nrows * n_per_row) return error.BufferSizeMismatch;
+        const row_bytes = try rowBytes(id, n_per_row);
+        if (dst.len < nrows * row_bytes) return error.BufferSizeMismatch;
+        if (imatrix) |im| {
+            if (im.len != n_per_row) return error.BufferSizeMismatch;
+        } else if (ggml.c.ggml_quantize_requires_imatrix(t)) {
+            return error.ImatrixRequired;
+        }
+        // ggml asserts internally on a type it cannot produce; check the trait
+        // first so that surfaces as an error instead of aborting the process.
+        if (ggml.c.ggml_get_type_traits(t).*.from_float_ref == null)
+            return error.UnsupportedGgmlType;
+
+        return ggml.c.ggml_quantize_chunk(
+            t,
+            src.ptr,
+            dst.ptr,
+            0,
+            @intCast(nrows),
+            @intCast(n_per_row),
+            if (imatrix) |im| im.ptr else null,
+        );
+    }
+
+    /// Dequantize `elems` elements of type `id` from `src` into `dst`. `elems`
+    /// must be a whole number of blocks. Same ggml `to_float` kernel — and so the
+    /// same bytes — as `dequantSlice`, but reachable for any ggml type.
+    pub fn dequantRow(id: u32, src: []const u8, elems: usize, dst: []f32) RawError!void {
+        const t = try checked(id);
+        if (src.len < try rowBytes(id, elems)) return error.BufferSizeMismatch;
+        if (dst.len < elems) return error.BufferSizeMismatch;
+        const to_float = ggml.c.ggml_get_type_traits(t).*.to_float orelse
+            return error.UnsupportedGgmlType;
+        ensureGgmlInit(); // to_float reads ggml's fp16 table
+        to_float(src.ptr, dst.ptr, @intCast(elems));
+    }
+} else struct {
+    // Built with -Dggml=false: no ggml to bridge to. Every entry point reports
+    // the missing backend rather than panicking, so a consumer can degrade.
+    pub fn typeCount() u32 {
+        return 0;
+    }
+    pub fn name(id: u32) RawError![]const u8 {
+        _ = id;
+        return error.QuantBackendUnavailable;
+    }
+    pub fn blockElems(id: u32) RawError!usize {
+        _ = id;
+        return error.QuantBackendUnavailable;
+    }
+    pub fn blockBytes(id: u32) RawError!usize {
+        _ = id;
+        return error.QuantBackendUnavailable;
+    }
+    pub fn rowBytes(id: u32, elems: usize) RawError!usize {
+        _ = .{ id, elems };
+        return error.QuantBackendUnavailable;
+    }
+    pub fn isQuantized(id: u32) RawError!bool {
+        _ = id;
+        return error.QuantBackendUnavailable;
+    }
+    pub fn requiresImatrix(id: u32) RawError!bool {
+        _ = id;
+        return error.QuantBackendUnavailable;
+    }
+    pub fn ensureQuantizeInit(id: u32) RawError!void {
+        _ = id;
+        return error.QuantBackendUnavailable;
+    }
+    pub fn quantizeFree() void {}
+    pub fn quantizeChunk(id: u32, src: []const f32, dst: []u8, nrows: usize, n_per_row: usize, imatrix: ?[]const f32) RawError!usize {
+        _ = .{ id, src, dst, nrows, n_per_row, imatrix };
+        return error.QuantBackendUnavailable;
+    }
+    pub fn dequantRow(id: u32, src: []const u8, elems: usize, dst: []f32) RawError!void {
+        _ = .{ id, src, elems, dst };
+        return error.QuantBackendUnavailable;
+    }
+};
+
+/// Quantize f32 `src` into `dst` as `dt` — the typed convenience over
+/// `raw.quantizeChunk` for the block-quant dtypes TP models. See there for the
+/// `imatrix` contract and the threading rules.
+pub fn quantizeChunk(
+    dt: DType,
+    src: []const f32,
+    dst: []u8,
+    nrows: usize,
+    n_per_row: usize,
+    imatrix: ?[]const f32,
+) RawError!usize {
+    if (!have_ggml) return error.QuantBackendUnavailable;
+    const gt = ggmlType(dt) orelse return error.UnsupportedGgmlType;
+    return raw.quantizeChunk(@intCast(gt), src, dst, nrows, n_per_row, imatrix);
+}
+
 // --- tests -----------------------------------------------------------------
 
 const fixtures = @import("quants_fixtures.zig");
+
+/// ggml type ids, as they appear in a GGUF header. Stable (append-only) across
+/// ggml versions; the tests below assert each id still names what we expect
+/// before using it, so an upstream renumbering fails loudly instead of silently
+/// testing the wrong format.
+const id_q4_0: u32 = 2;
+const id_q5_0: u32 = 6;
+const id_q8_0: u32 = 8;
+const id_q2_k: u32 = 10;
+const id_q3_k: u32 = 11;
+const id_q4_k: u32 = 12;
+const id_q5_k: u32 = 13;
+const id_q6_k: u32 = 14;
+
+/// Deterministic pseudo-Gaussian test weights: a fixed seed so every assertion
+/// below is reproducible, at a realistic trained-weight scale.
+fn fillTestWeights(dst: []f32, seed: u64) void {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rng = prng.random();
+    for (dst) |*v| v.* = rng.floatNorm(f32) * 0.02;
+}
+
+test "raw type metadata agrees with DType for the shared block types" {
+    if (!have_ggml) return error.SkipZigTest;
+    const pairs = [_]struct { id: u32, dt: DType }{
+        .{ .id = id_q4_0, .dt = .q4_0 },
+        .{ .id = id_q8_0, .dt = .q8_0 },
+        .{ .id = id_q4_k, .dt = .q4_k },
+        .{ .id = id_q5_k, .dt = .q5_k },
+        .{ .id = id_q6_k, .dt = .q6_k },
+    };
+    for (pairs) |p| {
+        errdefer std.debug.print("mismatch for ggml id {d} / {t}\n", .{ p.id, p.dt });
+        try std.testing.expectEqual(p.dt.blockElems(), try raw.blockElems(p.id));
+        try std.testing.expectEqual(p.dt.blockBytes(), try raw.blockBytes(p.id));
+        const n = p.dt.blockElems() * 4;
+        try std.testing.expectEqual(p.dt.storageBytes(n), try raw.rowBytes(p.id, n));
+        try std.testing.expect(try raw.isQuantized(p.id));
+        // ggmlType(dt) and the literal id must be the same number.
+        try std.testing.expectEqual(p.id, @as(u32, @intCast(ggmlType(p.dt).?)));
+    }
+    // Non-quantized types are single-element "blocks".
+    try std.testing.expectEqual(@as(usize, 1), try raw.blockElems(0)); // f32
+    try std.testing.expectEqual(@as(usize, 4), try raw.blockBytes(0));
+    try std.testing.expect(!try raw.isQuantized(0));
+}
+
+test "raw rejects unknown ids, unaligned lengths and missing imatrix" {
+    if (!have_ggml) return error.SkipZigTest;
+    const bogus = raw.typeCount(); // one past the last valid id
+    try std.testing.expectError(error.UnknownGgmlType, raw.name(bogus));
+    try std.testing.expectError(error.UnknownGgmlType, raw.blockElems(bogus));
+    try std.testing.expectError(error.UnknownGgmlType, raw.rowBytes(bogus, 256));
+
+    // q4_k is a 256-element super-block, so 128 elements is not a whole block.
+    try std.testing.expectError(error.NotBlockAligned, raw.rowBytes(id_q4_k, 128));
+
+    var src: [256]f32 = undefined;
+    fillTestWeights(&src, 1);
+    var dst: [512]u8 = undefined;
+    // Wrong src length for the declared shape.
+    try std.testing.expectError(error.BufferSizeMismatch, raw.quantizeChunk(id_q4_k, src[0..128], &dst, 1, 256, null));
+    // Undersized dst.
+    try std.testing.expectError(error.BufferSizeMismatch, raw.quantizeChunk(id_q4_k, &src, dst[0..16], 1, 256, null));
+    // imatrix must be one weight per column.
+    var short_im: [8]f32 = @splat(1.0);
+    try std.testing.expectError(error.BufferSizeMismatch, raw.quantizeChunk(id_q4_k, &src, &dst, 1, 256, &short_im));
+}
+
+test "raw quantize/dequantize round-trips every block type ggufy emits" {
+    if (!have_ggml) return error.SkipZigTest;
+    const n = 256; // one q-super-block, eight 32-element blocks
+    var src: [n]f32 = undefined;
+    fillTestWeights(&src, 0xC0FFEE);
+
+    // (id, expected ggml name, SNR floor in dB). Floors are well under measured
+    // values — they catch a broken path, not a rounding change.
+    const cases = [_]struct { id: u32, name: []const u8, snr_floor: f64 }{
+        .{ .id = id_q8_0, .name = "q8_0", .snr_floor = 30 },
+        .{ .id = id_q6_k, .name = "q6_K", .snr_floor = 25 },
+        .{ .id = id_q5_k, .name = "q5_K", .snr_floor = 20 },
+        .{ .id = id_q4_k, .name = "q4_K", .snr_floor = 15 },
+        .{ .id = id_q3_k, .name = "q3_K", .snr_floor = 10 },
+        .{ .id = id_q2_k, .name = "q2_K", .snr_floor = 5 },
+        .{ .id = id_q5_0, .name = "q5_0", .snr_floor = 18 },
+        .{ .id = id_q4_0, .name = "q4_0", .snr_floor = 12 },
+    };
+    for (cases) |c| {
+        // Fail loudly if upstream ever renumbers, rather than testing the wrong type.
+        try std.testing.expectEqualStrings(c.name, try raw.name(c.id));
+
+        const row_bytes = try raw.rowBytes(c.id, n);
+        var enc: [512]u8 = undefined;
+        try std.testing.expect(row_bytes <= enc.len);
+        const written = try raw.quantizeChunk(c.id, &src, enc[0..row_bytes], 1, n, null);
+        try std.testing.expectEqual(row_bytes, written);
+
+        var back: [n]f32 = undefined;
+        try raw.dequantRow(c.id, enc[0..row_bytes], n, &back);
+
+        var sig: f64 = 0;
+        var err: f64 = 0;
+        for (src, back) |a, b| {
+            sig += @as(f64, a) * a;
+            const d = @as(f64, a) - b;
+            err += d * d;
+            try std.testing.expect(std.math.isFinite(b));
+        }
+        const snr = 10.0 * std.math.log10(sig / err);
+        errdefer std.debug.print("{s}: {d} B/row, snr {d:.2} dB (floor {d})\n", .{ c.name, row_bytes, snr, c.snr_floor });
+        try std.testing.expect(snr > c.snr_floor);
+    }
+}
+
+test "raw quantize is deterministic and matches the typed wrapper" {
+    if (!have_ggml) return error.SkipZigTest;
+    const n = 256;
+    var src: [n]f32 = undefined;
+    fillTestWeights(&src, 42);
+
+    var a: [144]u8 = undefined; // q4_k row size for 256 elements
+    var b: [144]u8 = undefined;
+    var c: [144]u8 = undefined;
+    _ = try raw.quantizeChunk(id_q4_k, &src, &a, 1, n, null);
+    _ = try raw.quantizeChunk(id_q4_k, &src, &b, 1, n, null);
+    _ = try quantizeChunk(.q4_k, &src, &c, 1, n, null);
+    try std.testing.expectEqualSlices(u8, &a, &b); // same input -> same bytes
+    try std.testing.expectEqualSlices(u8, &a, &c); // typed wrapper is the same call
+}
+
+test "raw dequantRow agrees with the fixture-validated dequantSlice" {
+    if (!have_ggml) return error.SkipZigTest;
+    // Ties the new entry point to the golden path: same bytes in, same floats out.
+    var via_slice: [32]f32 = undefined;
+    var via_raw: [32]f32 = undefined;
+    dequantSlice(.q8_0, &fixtures.q8_0_block, 0, 32, &via_slice);
+    try raw.dequantRow(id_q8_0, &fixtures.q8_0_block, 32, &via_raw);
+    try std.testing.expectEqualSlices(f32, &via_slice, &via_raw);
+}
+
+test "the imatrix steers the q4_k scale search toward the weighted columns" {
+    if (!have_ggml) return error.SkipZigTest;
+    // The activation-aware hook has to actually reach ggml's scale search —
+    // otherwise every "activation-aware" number downstream is a placebo.
+    //
+    // Two properties, checked separately:
+    //  1. Passing an imatrix changes the output bytes at all (it is plumbed).
+    //  2. WHICH columns it favours changes the fit. Asserted by comparing two
+    //     imatrices against each other rather than against the unweighted encode:
+    //     ggml takes a different algorithm branch when quant_weights is non-null
+    //     (make_qkx3_quants vs make_qkx2_quants), so weighted-vs-unweighted mixes
+    //     the weighting effect with an algorithm change. A-vs-B holds the
+    //     algorithm fixed and varies only the weights.
+    //
+    // The weights must also vary WITHIN a 32-element sub-block: q4_k picks one
+    // scale per sub-block, and scaling every weight in a sub-block by a constant
+    // leaves that scale's optimum unchanged (a constant factor drops out of the
+    // argmin). Hence the even/odd interleave, not a first-half/second-half split.
+    const n = 256;
+    var src: [n]f32 = undefined;
+    fillTestWeights(&src, 7);
+
+    var im_even: [n]f32 = undefined;
+    var im_odd: [n]f32 = undefined;
+    for (0..n) |i| {
+        const hot = i % 2 == 0;
+        im_even[i] = if (hot) 1000.0 else 0.001;
+        im_odd[i] = if (hot) 0.001 else 1000.0;
+    }
+
+    var plain: [144]u8 = undefined; // q4_k row size for 256 elements
+    var enc_even: [144]u8 = undefined;
+    var enc_odd: [144]u8 = undefined;
+    _ = try raw.quantizeChunk(id_q4_k, &src, &plain, 1, n, null);
+    _ = try raw.quantizeChunk(id_q4_k, &src, &enc_even, 1, n, &im_even);
+    _ = try raw.quantizeChunk(id_q4_k, &src, &enc_odd, 1, n, &im_odd);
+
+    // (1) plumbed at all.
+    try std.testing.expect(!std.mem.eql(u8, &plain, &enc_even));
+    // Weighting opposite column sets cannot produce the same encoding.
+    try std.testing.expect(!std.mem.eql(u8, &enc_even, &enc_odd));
+
+    var deq_even: [n]f32 = undefined;
+    var deq_odd: [n]f32 = undefined;
+    try raw.dequantRow(id_q4_k, &enc_even, n, &deq_even);
+    try raw.dequantRow(id_q4_k, &enc_odd, n, &deq_odd);
+
+    // Squared error on the even columns and on the odd columns, under each imatrix.
+    var err: [2][2]f64 = @splat(@splat(0));
+    for (0..n) |i| {
+        const parity: usize = i % 2;
+        const de = @as(f64, src[i]) - deq_even[i];
+        const do_ = @as(f64, src[i]) - deq_odd[i];
+        err[0][parity] += de * de;
+        err[1][parity] += do_ * do_;
+    }
+    errdefer std.debug.print(
+        "err[imatrix][columns]: even-weighted {e:.4}/{e:.4}, odd-weighted {e:.4}/{e:.4} (even/odd cols)\n",
+        .{ err[0][0], err[0][1], err[1][0], err[1][1] },
+    );
+    // (2) each imatrix fits its own favoured columns better than the other one does.
+    try std.testing.expect(err[0][0] < err[1][0]); // even columns: even-weighted wins
+    try std.testing.expect(err[1][1] < err[0][1]); // odd columns: odd-weighted wins
+}
 
 fn expectGolden(dt: DType, block: []const u8, expected_bits: []const u32) !void {
     if (!have_ggml) return error.SkipZigTest; // dequant needs the ggml backend

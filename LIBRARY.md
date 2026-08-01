@@ -10,7 +10,7 @@ kernels, the GPU backends, the offload logic, or the whole thing:
 
 | Module | Layer | Depends on |
 |---|---|---|
-| `tp_core` | dtypes, tensors, checkpoint parsing (safetensors/GGUF), quant dequant, tokenizer, K/V cache, sampler | — (pure Zig) |
+| `tp_core` | dtypes, tensors, checkpoint parsing (safetensors/GGUF), quant **quantize + dequant**, tokenizer, K/V cache, sampler | — (pure Zig) |
 | `tp_ops` | CPU numeric kernels: `matmul` (GEMM), `attention`, `rope`, `norm`, `act`, `convrot` | `tp_core` |
 | `tp_gpu` | GPU backends: Vulkan + embedded SPIR-V kernels, CUDA driver-API PTX | `tp_core`, `tp_ops` |
 | `tp_runtime` | offload/scheduling: the VRAM arbiter + CPU/GPU residency planner | — (pure Zig) |
@@ -85,6 +85,34 @@ Query it at runtime via `TensorPencil.quants.have_ggml`.
 A pure-Zig fallback for block-quant (so quantized models work without ggml, just
 slower) is not implemented; it would be a separate piece of work.
 
+## Quantization (`quants`)
+
+`quants` is not dequant-only — it is the ggml **format** layer, in both directions,
+so a consumer that writes checkpoints (e.g. a converter) does not need its own ggml:
+
+- `quants.dequantSlice(dt, row, elem0, n, dst)` — block-aligned dequant for a
+  `DType` (golden-fixture validated against llama.cpp's reference decoders).
+- `quants.quantizeChunk(dt, src, dst, nrows, n_per_row, imatrix)` — f32 → block
+  quant for a `DType`.
+- `quants.raw.*` — the same operations plus layout/metadata queries keyed on the
+  **numeric `enum ggml_type` id** rather than `DType`. `DType` covers the formats TP
+  can *compute* with; `raw` reaches every type ggml knows, including ones we have no
+  kernel for and deliberately do not model. That is what a tool inspecting or
+  rewriting arbitrary GGUF files needs: `raw.name`, `blockElems`, `blockBytes`,
+  `rowBytes`, `isQuantized`, `requiresImatrix`, `ensureQuantizeInit`,
+  `quantizeChunk`, `dequantRow`. Out-of-range ids, missing kernels and unaligned
+  lengths come back as errors rather than C-level undefined behaviour.
+
+The `imatrix` argument is ggml's per-column importance weighting (one weight per
+column, shared across the rows in a call): the k-quant and IQ scale searches
+minimize *weighted* error against it instead of plain squared error. Pass
+per-channel activation statistics there for activation-aware quantization.
+
+Note both directions are only as reproducible as the ggml build: the `q6_k`, `q5_k`
+and `q2_k` scale searches are sensitive to floating-point contraction, so their
+output bytes differ between optimization levels. TP always builds ggml at
+`ReleaseFast` regardless of the consumer's `-Doptimize`, which keeps this stable.
+
 ## What's reachable
 
 Everything public is re-exported from the module root (`src/root.zig`). The
@@ -93,14 +121,14 @@ main namespaces, low to high:
 | Namespace | What |
 |---|---|
 | `dtype`, `tensor` | dtypes, tensor/shape primitives |
-| `safetensors`, `gguf`, `quants`, `weights` | checkpoint parsing + weight stores |
-| `ops` | CPU numeric kernels: `matmul`, `attention`, `rope`, `norm`, `act`, `convrot`, `vmath` |
+| `safetensors`, `gguf`, `quants`, `weights` | checkpoint parsing + weight stores (`WeightStore` unifies the two; the DiT and every LLM load through it, and `weights.Overlay` substitutes individual tensors from memory) |
+| `ops` | CPU numeric kernels: `matmul`, `attention`, `rope`, `norm`, `act`, `convrot`, `conv`, `vmath` |
 | `gpu` | backends: `gpu.vk` (Vulkan + SPIR-V), `gpu.cuda` (Driver-API PTX), `gpu.Context` |
 | `vram` | the VRAM arbiter / budgeting |
-| `models` | architectures (qwen3/3.5, gemma3/4, DiT, VAE, ViT towers, …) + `models.residency` (CPU/GPU offload) |
-| `tokenizer`, `sampler`, `image` | tokenization, sampling, image I/O |
+| `models` | architectures (qwen3/3.5, gemma3/4, DiT, VAE, ViT towers, `lpips`, …) + `models.residency` (CPU/GPU offload) |
+| `tokenizer`, `sampler`, `image` | tokenization, sampling, image I/O + comparison metrics (`psnr`, `ssim`, `detailEnergy`) |
 | `llm` | LLM orchestration: chat templating, generation `engine`, `kv_cache`, speculative decode |
-| `pipeline` | the end-to-end diffusion pipeline |
+| `pipeline` | the end-to-end diffusion pipeline, and the composable stages it is built from (`Session.encode` / `schedule` / `Session.denoiser` + `predict` / `Session.decode`), plus `Session.replaceDit` to swap the diffusion weights of a live session |
 
 ## Minimal example
 

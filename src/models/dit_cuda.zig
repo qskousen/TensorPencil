@@ -12,6 +12,7 @@ const std = @import("std");
 const dit = @import("dit.zig");
 const cuda = @import("tp_gpu").cuda;
 const safetensors = @import("tp_core").safetensors;
+const ops = @import("tp_ops");
 
 const DiT = dit.DiT;
 const Backend = cuda.Backend;
@@ -75,6 +76,7 @@ fn linPrep(be: *Backend, kind: LinKind, x: DeviceBuffer, m: usize, cols: usize) 
 /// folded in) and runs the same validated hgemm. Block linears carry no bias, so
 /// `bias` is unused for the bf16/fp8 GEMMs (they all pass the shared zero_bias).
 fn lin(be: *Backend, kind: LinKind, y: DeviceBuffer, x: DeviceBuffer, m: usize, w: anytype, bias: []const f32) !void {
+    try probeLinInput(be, kind, x, m, w);
     switch (kind) {
         .i4 => try be.opI4Gemm(y, w.bytes, w.row_scale.?, w.rows),
         .i8 => try be.opI8Gemm(y, w.bytes, w.row_scale.?, w.rows, false),
@@ -87,6 +89,46 @@ fn lin(be: *Backend, kind: LinKind, y: DeviceBuffer, x: DeviceBuffer, m: usize, 
             try be.opMatmulBf16(y, x, m, w.bytes, w.rows, w.cols, bias[0..w.rows]),
         .fp8 => try be.opMatmulFp8(y, x, m, w.bytes, w.scale, w.rows, w.cols),
     }
+}
+
+/// Feed `ops.matmul.probe` this GEMM's input, so an activation capture works when
+/// the DiT runs on CUDA.
+///
+/// The hook exists here because **this backend never goes through `ops.matmul`** —
+/// it owns its upload and GEMM — so the CPU probe call site sees nothing at all on a
+/// GPU run. `lin` is the single choke point for all 224 block linears (the same role
+/// `Loader.mat` plays for tagging), so one call covers every one of them.
+///
+/// ⚠️ **int8/int4 are skipped, not captured.** `linPrep` has already rotated and
+/// quantized `x` in place by the time a GEMM runs, so the buffer no longer holds the
+/// f32 activation — recording it would be a W4A4-shaped number filed as a weight-only
+/// one (ACTIVATION_AWARE hygiene rule 4). The capture driver refuses those
+/// checkpoints outright rather than relying on this returning quietly.
+///
+/// The activation is **downloaded and handed to the same host accumulator a CPU
+/// capture uses**, rather than reduced on device. That is deliberate for a first
+/// version: the statistics then come out of identical f64 code, so a GPU-captured
+/// cache differs from a CPU one only by the DiT's own GEMM arithmetic — which is the
+/// open question, not a confound in it. It costs one `cuStreamSynchronize` plus
+/// `m × cols × 4 B` over PCIe per linear; if that ever dominates a capture, the
+/// reduction moves onto the device and this shrinks to a small download.
+fn probeInput(be: *Backend, x: DeviceBuffer, m: usize, w: anytype) !void {
+    const p = ops.matmul.probe orelse return;
+    if (m == 0 or w.cols == 0) return;
+    const host = be.gpa.alloc(f32, m * w.cols) catch return error.OutOfMemory;
+    defer be.gpa.free(host);
+    // `x` must already be a view at the activation's own base (see `offsetBuf`):
+    // `tensorDownload` copies from the buffer's start.
+    try be.tensorDownload(x, std.mem.sliceAsBytes(host));
+    p.input(p.ctx, w, host, m);
+}
+
+/// `probeInput` for the block linears, which are the only GEMMs here whose input
+/// may already have been consumed in place.
+fn probeLinInput(be: *Backend, kind: LinKind, x: DeviceBuffer, m: usize, w: anytype) !void {
+    if (ops.matmul.probe == null) return;
+    if (kind == .i8 or kind == .i4) return; // see the note above
+    try probeInput(be, x, m, w);
 }
 
 /// Use the tensor-core GQA attention path (hgemm+softmax_row) instead of the
@@ -150,6 +192,11 @@ const TxtScratch = struct {
 /// blocks downstream run in, so text-fusion precision is not the bottleneck.
 /// `bias` is a real bias, or a zeros slice (≥ out long) for the no-bias linears.
 fn txtGemm(be: *Backend, arena: std.mem.Allocator, y: DeviceBuffer, x: DeviceBuffer, m: usize, w: anytype, out: usize, in: usize, bias: []const f32) !void {
+    // The second probe choke point: every txtfusion linear and both txtmlp linears
+    // come through here, and a capture that recorded only the 224 block linears
+    // would be missing 34 of the model's 263 measurable layers — a cache that looks
+    // complete and is not.
+    try probeInput(be, x, m, w);
     try be.opConvF16(y, 0, x, m, try txtF32(arena, w), out, in, bias);
 }
 
@@ -440,12 +487,13 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
     // + dequant-to-f16 hgemm). A block-quant / unknown dtype has no GEMM path
     // here, so reject it with a clear error instead of a bad GPU access.
     const wqt = model.blocks[0].attn.wq.dtype;
+    if (!dit.gpuLinKindSupported(wqt)) return error.UnsupportedCheckpoint;
     const kind: LinKind = switch (wqt) {
         .i8 => .i8,
         .i4 => .i4,
         .bf16 => .bf16,
         .f8_e4m3 => .fp8,
-        else => return error.UnsupportedCheckpoint,
+        else => unreachable, // gated above
     };
     const zeros: []const f32 = &zero_bias;
     // f16 activation chain (c16): only on the cuBLASLt/irescale int8 libs path.
@@ -455,6 +503,7 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
 
     // patch embed: x[seq_txt..] = img_in @ first^T + bias
     const first_f8 = model.first.w.dtype == .f8_e4m3;
+    try probeInput(be, imgin_d, n_img, model.first.w);
     try be.opMatmul(x_d, seq_txt * F * 4, imgin_d, 0, n_img, model.first.w.bytes, first_f8, F, channels * patch * patch, model.first.w.scale, model.first.b);
 
     // Prefetch block 0's weights before the loop; each iteration prefetches the
@@ -519,6 +568,9 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
     // --- final layer ---
     try be.rmsMod(x_d, t1_d, fin_d, seq, F, 0, F, eps);
     const last_f8 = model.last_linear.w.dtype == .f8_e4m3;
+    // Note the offset view: this GEMM reads the image rows only, so the probe must
+    // see the same rows the GEMM does and not the text prefix.
+    try probeInput(be, offsetBuf(t1_d, seq_txt * F * 4), n_img, model.last_linear.w);
     try be.opMatmul(imgin_d, 0, t1_d, seq_txt * F * 4, n_img, model.last_linear.w.bytes, last_f8, channels * patch * patch, F, model.last_linear.w.scale, model.last_linear.b);
     try be.endBatch();
 

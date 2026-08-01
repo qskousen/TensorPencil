@@ -463,3 +463,397 @@ test "planar conversion clamps and scales" {
     defer gpa.free(px);
     try std.testing.expectEqualSlices(u8, &.{ 0, 128, 0, 255, 255, 191 }, px);
 }
+
+// ---------------------------------------------------------------------------
+// tEXt metadata, reading
+// ---------------------------------------------------------------------------
+
+/// Read every `tEXt` chunk out of a PNG — the counterpart to
+/// `encodePngRgbText`. AUTOMATIC1111, ComfyUI and this project all record
+/// generation parameters this way, so a consumer comparing generated images can
+/// recover the seed, sampler and model that produced each one instead of being
+/// told them out of band.
+///
+/// `zTXt`/`iTXt` (compressed and UTF-8 variants) are deliberately not handled:
+/// nothing here writes them, and silently returning fewer chunks than a file
+/// contains would be worse than a caller knowing only `tEXt` is covered.
+/// Keywords and text point into `data`; the slice itself is owned by the caller.
+pub fn readTextChunks(gpa: std.mem.Allocator, data: []const u8) ![]TextChunk {
+    if (data.len < 8 or !std.mem.eql(u8, data[0..8], &png_signature)) return error.InvalidPng;
+
+    var out: std.ArrayList(TextChunk) = .empty;
+    errdefer out.deinit(gpa);
+
+    var pos: usize = 8;
+    while (pos + 8 <= data.len) {
+        const len = std.mem.readInt(u32, data[pos..][0..4], .big);
+        const kind = data[pos + 4 ..][0..4];
+        const body_start = pos + 8;
+        // +4 for the trailing CRC.
+        const next = std.math.add(usize, body_start, @as(usize, len) + 4) catch return error.InvalidPng;
+        if (next > data.len) return error.InvalidPng;
+
+        if (std.mem.eql(u8, kind, "tEXt")) {
+            const body = data[body_start .. body_start + len];
+            // keyword \0 text — a chunk without the separator is malformed.
+            const nul = std.mem.indexOfScalar(u8, body, 0) orelse return error.InvalidPng;
+            try out.append(gpa, .{ .keyword = body[0..nul], .text = body[nul + 1 ..] });
+        } else if (std.mem.eql(u8, kind, "IEND")) {
+            break;
+        }
+        pos = next;
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// The text of the first `tEXt` chunk with this keyword, or null.
+pub fn findTextChunk(chunks: []const TextChunk, keyword: []const u8) ?[]const u8 {
+    for (chunks) |c| if (std.mem.eql(u8, c.keyword, keyword)) return c.text;
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// Comparison metrics
+// ---------------------------------------------------------------------------
+
+/// Mean squared error between two equally sized 8-bit images, in [0, 65025].
+pub fn mse(a: []const u8, b: []const u8) !f64 {
+    if (a.len != b.len) return error.SizeMismatch;
+    if (a.len == 0) return error.EmptyImage;
+    var acc: f64 = 0;
+    for (a, b) |x, y| {
+        const d = @as(f64, @floatFromInt(@as(i32, x) - @as(i32, y)));
+        acc += d * d;
+    }
+    return acc / @as(f64, @floatFromInt(a.len));
+}
+
+/// Peak signal-to-noise ratio in dB against an 8-bit peak of 255.
+///
+/// Unambiguous as metrics go — unlike SSIM (`ssim` below), whose conventions had
+/// to be pinned against scikit-image before it could be trusted. Identical
+/// images return infinity rather than a large sentinel; a caller reporting a
+/// table should special-case it rather than print `inf` and let a reader wonder.
+pub fn psnr(a: []const u8, b: []const u8) !f64 {
+    const m = try mse(a, b);
+    if (m == 0) return std.math.inf(f64);
+    return 10.0 * std.math.log10(255.0 * 255.0 / m);
+}
+
+/// RMS of the horizontal and vertical first differences of luma — a crude
+/// measure of how much fine detail an image carries at all.
+///
+/// **Not a standard metric, and not a similarity metric.** It exists because
+/// PSNR between two generated images is confounded when their composition
+/// drifts: a quantization that keeps the subject but loses texture and one that
+/// draws a different picture both score badly, and the two failures call for
+/// different responses. This number is per-image, so comparing a candidate's
+/// against the reference's says whether detail survived independently of whether
+/// the image matched.
+pub fn detailEnergy(pixels: []const u8, width: usize, height: usize) !f64 {
+    if (width == 0 or height == 0) return error.EmptyImage;
+    if (pixels.len != width * height * 3) return error.SizeMismatch;
+
+    var acc: f64 = 0;
+    var n: usize = 0;
+    for (0..height) |y| {
+        for (0..width) |x| {
+            const i = (y * width + x) * 3;
+            const l = luma(pixels[i], pixels[i + 1], pixels[i + 2]);
+            if (x + 1 < width) {
+                const r = luma(pixels[i + 3], pixels[i + 4], pixels[i + 5]);
+                acc += (l - r) * (l - r);
+                n += 1;
+            }
+            if (y + 1 < height) {
+                const j = i + width * 3;
+                const d = luma(pixels[j], pixels[j + 1], pixels[j + 2]);
+                acc += (l - d) * (l - d);
+                n += 1;
+            }
+        }
+    }
+    return if (n == 0) 0 else @sqrt(acc / @as(f64, @floatFromInt(n)));
+}
+
+/// Which window SSIM averages over. The two are different metrics that both go
+/// by "SSIM", so the choice is explicit rather than defaulted silently.
+pub const SsimWindow = enum {
+    /// 7x7 uniform, sample covariance (`N/(N-1)`). scikit-image's default, and
+    /// what most reported "SSIM" numbers are.
+    uniform7,
+    /// 11x11 gaussian, sigma 1.5, population covariance. What Wang et al. (2004)
+    /// specify, and what `skimage` gives with
+    /// `gaussian_weights=True, sigma=1.5, use_sample_covariance=False`.
+    gaussian11,
+
+    pub fn size(self: SsimWindow) usize {
+        return switch (self) {
+            .uniform7 => 7,
+            .gaussian11 => 11,
+        };
+    }
+};
+
+/// Mean structural similarity between two equally sized 8-bit RGB images, in
+/// [-1, 1]; 1 for identical input.
+///
+/// Computed per channel over `window`, then averaged over the three channels —
+/// scikit-image's `channel_axis=-1` convention, not luma. Only fully-interior
+/// windows contribute (the reference crops the border by the window radius),
+/// which is also why no boundary-extension mode appears here: cropped-away
+/// pixels are the only ones a mode would have affected.
+///
+/// Validated against `skimage.metrics.structural_similarity` on the fixtures in
+/// `assets/image_metric_fixtures.json`, both windows. `error.ImageTooSmall` when
+/// either side is shorter than the window.
+pub fn ssim(a: []const u8, b: []const u8, width: usize, height: usize, window: SsimWindow) !f64 {
+    if (a.len != b.len) return error.SizeMismatch;
+    if (a.len != width * height * 3) return error.SizeMismatch;
+    const win = window.size();
+    if (width < win or height < win) return error.ImageTooSmall;
+
+    // Separable weights, normalized so they sum to 1 in each axis; the 2D window
+    // is their outer product, so a 2D sum decomposes into two 1D passes.
+    var w1: [11]f64 = undefined;
+    const weights = w1[0..win];
+    switch (window) {
+        .uniform7 => for (weights) |*v| {
+            v.* = 1.0 / @as(f64, @floatFromInt(win));
+        },
+        .gaussian11 => {
+            const sigma = 1.5;
+            const radius = @as(f64, @floatFromInt(win / 2));
+            var sum: f64 = 0;
+            for (weights, 0..) |*v, i| {
+                const d = @as(f64, @floatFromInt(i)) - radius;
+                v.* = @exp(-(d * d) / (2 * sigma * sigma));
+                sum += v.*;
+            }
+            for (weights) |*v| v.* /= sum;
+        },
+    }
+    // Sample covariance divides by N-1 over the N window taps; the gaussian
+    // convention here is the population form, so 1.
+    const cov_norm: f64 = switch (window) {
+        .uniform7 => blk: {
+            const np = @as(f64, @floatFromInt(win * win));
+            break :blk np / (np - 1);
+        },
+        .gaussian11 => 1,
+    };
+
+    const data_range: f64 = 255;
+    const c1 = (0.01 * data_range) * (0.01 * data_range);
+    const c2 = (0.03 * data_range) * (0.03 * data_range);
+
+    const inner_h = height - win + 1;
+    const inner_w = width - win + 1;
+    var acc: f64 = 0;
+    for (0..3) |ch| {
+        for (0..inner_h) |y0| {
+            for (0..inner_w) |x0| {
+                var ux: f64 = 0;
+                var uy: f64 = 0;
+                var uxx: f64 = 0;
+                var uyy: f64 = 0;
+                var uxy: f64 = 0;
+                for (0..win) |dy| {
+                    for (0..win) |dx| {
+                        const wgt = weights[dy] * weights[dx];
+                        const i = ((y0 + dy) * width + x0 + dx) * 3 + ch;
+                        const x: f64 = @floatFromInt(a[i]);
+                        const y: f64 = @floatFromInt(b[i]);
+                        ux += wgt * x;
+                        uy += wgt * y;
+                        uxx += wgt * x * x;
+                        uyy += wgt * y * y;
+                        uxy += wgt * x * y;
+                    }
+                }
+                const vx = cov_norm * (uxx - ux * ux);
+                const vy = cov_norm * (uyy - uy * uy);
+                const vxy = cov_norm * (uxy - ux * uy);
+                const num = (2 * ux * uy + c1) * (2 * vxy + c2);
+                const den = (ux * ux + uy * uy + c1) * (vx + vy + c2);
+                acc += num / den;
+            }
+        }
+    }
+    return acc / @as(f64, @floatFromInt(3 * inner_h * inner_w));
+}
+
+/// Rec. 601 luma, the convention PSNR-on-luma implementations use.
+fn luma(r: u8, g: u8, b: u8) f64 {
+    return 0.299 * @as(f64, @floatFromInt(r)) +
+        0.587 * @as(f64, @floatFromInt(g)) +
+        0.114 * @as(f64, @floatFromInt(b));
+}
+
+test "tEXt chunks read back exactly what the encoder wrote" {
+    // The encoder and the reader are counterparts, so round-tripping them is the
+    // check that matters: a reader validated only against hand-built bytes could
+    // drift from what we actually emit.
+    const gpa = std.testing.allocator;
+    const width = 4;
+    const height = 3;
+    var pixels: [width * height * 3]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(11);
+    prng.random().bytes(&pixels);
+
+    const texts = [_]TextChunk{
+        .{ .keyword = "parameters", .text = "a prompt\nSteps: 16, Seed: 80085, Model: anim-int4-calib" },
+        .{ .keyword = "Software", .text = "ggufy" },
+    };
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try encodePngRgbText(gpa, &out, &pixels, width, height, &texts);
+
+    const got = try readTextChunks(gpa, out.items);
+    defer gpa.free(got);
+    try std.testing.expectEqual(@as(usize, 2), got.len);
+    for (got, texts) |g, want| {
+        try std.testing.expectEqualStrings(want.keyword, g.keyword);
+        try std.testing.expectEqualStrings(want.text, g.text);
+    }
+
+    try std.testing.expectEqualStrings(texts[0].text, findTextChunk(got, "parameters").?);
+    try std.testing.expect(findTextChunk(got, "absent") == null);
+
+    // A PNG with no text chunks yields an empty slice, not an error.
+    var bare: std.ArrayList(u8) = .empty;
+    defer bare.deinit(gpa);
+    try encodePngRgb(gpa, &bare, &pixels, width, height);
+    const none = try readTextChunks(gpa, bare.items);
+    defer gpa.free(none);
+    try std.testing.expectEqual(@as(usize, 0), none.len);
+
+    try std.testing.expectError(error.InvalidPng, readTextChunks(gpa, "not a png at all"));
+}
+
+test "psnr matches its definition on known inputs" {
+    const gpa = std.testing.allocator;
+    _ = gpa;
+    // Identical images: infinite, not a large sentinel a caller might print raw.
+    const a = [_]u8{ 10, 20, 30, 40 };
+    try std.testing.expect(std.math.isInf(try psnr(&a, &a)));
+    try std.testing.expectEqual(@as(f64, 0), try mse(&a, &a));
+
+    // A uniform error of 1 per sample gives MSE 1 and PSNR 20*log10(255).
+    const b = [_]u8{ 11, 21, 31, 41 };
+    try std.testing.expectApproxEqAbs(@as(f64, 1), try mse(&a, &b), 1e-12);
+    try std.testing.expectApproxEqAbs(20.0 * std.math.log10(255.0), try psnr(&a, &b), 1e-9);
+
+    // Maximum possible error: 0 dB, the floor of the scale.
+    const lo = [_]u8{ 0, 0 };
+    const hi = [_]u8{ 255, 255 };
+    try std.testing.expectApproxEqAbs(@as(f64, 0), try psnr(&lo, &hi), 1e-9);
+
+    try std.testing.expectError(error.SizeMismatch, psnr(&a, &lo));
+    try std.testing.expectError(error.EmptyImage, psnr(&.{}, &.{}));
+}
+
+test "detail energy separates a flat image from a textured one" {
+    // The property it exists for: it must respond to fine detail, not to overall
+    // brightness or contrast between two images.
+    const gpa = std.testing.allocator;
+    _ = gpa;
+    const w = 8;
+    const h = 8;
+    var flat: [w * h * 3]u8 = undefined;
+    @memset(&flat, 128);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), try detailEnergy(&flat, w, h), 1e-12);
+
+    // A one-pixel checkerboard is maximum detail at this resolution.
+    var checker: [w * h * 3]u8 = undefined;
+    for (0..h) |y| for (0..w) |x| {
+        const v: u8 = if ((x + y) % 2 == 0) 0 else 255;
+        const i = (y * w + x) * 3;
+        checker[i] = v;
+        checker[i + 1] = v;
+        checker[i + 2] = v;
+    };
+    const detailed = try detailEnergy(&checker, w, h);
+    try std.testing.expect(detailed > 250.0);
+
+    // A smooth ramp carries some detail, but far less than the checkerboard.
+    var ramp: [w * h * 3]u8 = undefined;
+    for (0..h) |y| for (0..w) |x| {
+        const v: u8 = @intCast(x * 30);
+        const i = (y * w + x) * 3;
+        ramp[i] = v;
+        ramp[i + 1] = v;
+        ramp[i + 2] = v;
+    };
+    const mid = try detailEnergy(&ramp, w, h);
+    try std.testing.expect(mid > 0 and mid < detailed / 5.0);
+
+    try std.testing.expectError(error.SizeMismatch, detailEnergy(&flat, w, h + 1));
+}
+
+const metric_fixtures_json = @embedFile("assets/image_metric_fixtures.json");
+
+test "mse, psnr and ssim match numpy and scikit-image on the reference pairs" {
+    const gpa = std.testing.allocator;
+
+    const Pair = struct {
+        name: []const u8,
+        width: usize,
+        height: usize,
+        a: []const u8,
+        b: []const u8,
+        mse: f64,
+        /// null means +inf: identical inputs. JSON has no infinity.
+        psnr: ?f64,
+        ssim: f64,
+        ssim_gaussian: f64,
+    };
+    var parsed = try std.json.parseFromSlice(
+        struct { pairs: []const Pair },
+        gpa,
+        metric_fixtures_json,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.pairs.len >= 5);
+
+    for (parsed.value.pairs) |p| {
+        try std.testing.expectEqual(p.width * p.height * 3, p.a.len);
+
+        try std.testing.expectApproxEqAbs(p.mse, try mse(p.a, p.b), 1e-9);
+        const got_psnr = try psnr(p.a, p.b);
+        if (p.psnr) |want| {
+            try std.testing.expectApproxEqAbs(want, got_psnr, 1e-9);
+        } else {
+            try std.testing.expect(std.math.isInf(got_psnr));
+        }
+
+        // 1e-9 rather than a loose tolerance: both sides accumulate in f64 over
+        // the same window, so anything larger would mean a convention mismatch
+        // (window, covariance normalization, data range) rather than rounding.
+        inline for (.{ .{ SsimWindow.uniform7, "ssim" }, .{ SsimWindow.gaussian11, "ssim_gaussian" } }) |case| {
+            const want = @field(p, case[1]);
+            const got = try ssim(p.a, p.b, p.width, p.height, case[0]);
+            std.testing.expectApproxEqAbs(want, got, 1e-9) catch |e| {
+                std.debug.print("{s} {s}: skimage {d} got {d}\n", .{ p.name, case[1], want, got });
+                return e;
+            };
+        }
+    }
+}
+
+test "ssim of an image against itself is exactly 1, and rejects a too-small image" {
+    const gpa = std.testing.allocator;
+    const w = 12;
+    const h = 12;
+    const px = try gpa.alloc(u8, w * h * 3);
+    defer gpa.free(px);
+    var prng = std.Random.DefaultPrng.init(3);
+    prng.random().bytes(px);
+
+    try std.testing.expectApproxEqAbs(1.0, try ssim(px, px, w, h, .uniform7), 1e-12);
+    try std.testing.expectApproxEqAbs(1.0, try ssim(px, px, w, h, .gaussian11), 1e-12);
+    // 11x11 window does not fit in a 10-row image.
+    try std.testing.expectError(error.ImageTooSmall, ssim(px[0 .. 10 * w * 3], px[0 .. 10 * w * 3], w, 10, .gaussian11));
+}

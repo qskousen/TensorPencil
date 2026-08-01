@@ -48,7 +48,7 @@ fn dtypeFromGgml(id: u32) ?DType {
         13 => .q5_k,
         14 => .q6_k,
         20 => .iq4_nl, // GGML_TYPE_IQ4_NL (32-elem block, non-linear 4-bit LUT)
-        16 => .i8, // GGML_TYPE_I8 (raw, no blocks)
+        24 => .i8, // GGML_TYPE_I8 (raw, no blocks) — NOT 16, which is IQ2_XXS
         26 => .i32, // GGML_TYPE_I32
         30 => .bf16,
         else => null,
@@ -252,10 +252,37 @@ pub const Gguf = struct {
             // Blocks must tile the contiguous dim exactly (ggml guarantees it).
             if (ne[0] % dt.blockElems() != 0) return error.InvalidShape;
             if (offset % alignment != 0) return error.InvalidOffsets;
+
+            // ComfyUI-GGUF's shape fix, undone. Its converters (and ggufy's) reshape
+            // a tensor whose contiguous dim is not a multiple of 256 to
+            // `(n/256, 256)` so ggml's block quants can tile it, recording the true
+            // shape in `comfy.gguf.orig_shape.<name>`. Without restoring it here a
+            // consumer sees the storage shape — krea2's patch embed arrives as
+            // [1536, 256] instead of [6144, 64] — and every shape check downstream
+            // fails on a file that is perfectly well formed.
+            var shape: tensors.Shape = .{ .dims = dims, .rank = n_dims };
+            if (origShape(&kv, alloc, raw_name)) |orig| {
+                // Only for unquantized tensors: a block-quantized tensor's on-disk
+                // layout follows its STORED row length, so re-labelling the rows
+                // would move every block boundary. ComfyUI only ever applies the fix
+                // to tensors it then leaves unquantized (the criterion that triggers
+                // it — a contiguous dim not divisible by 256 — is the same one that
+                // makes k-quantization impossible), so this is belt-and-braces.
+                if (dt.blockElems() != 1) {
+                    std.log.warn("gguf: ignoring orig_shape for block-quantized '{s}' ({t})", .{ raw_name, dt });
+                } else if (orig.count() != shape.count()) {
+                    std.log.warn("gguf: ignoring orig_shape for '{s}': {d} elements, stored has {d}", .{
+                        raw_name, orig.count(), shape.count(),
+                    });
+                } else {
+                    shape = orig;
+                }
+            }
+
             ri.* = .{
                 .name = try canonicalName(alloc, raw_name, arch),
                 .dt = dt,
-                .shape = .{ .dims = dims, .rank = n_dims },
+                .shape = shape,
                 .offset = @intCast(offset),
             };
         }
@@ -457,6 +484,33 @@ const gemma4_layer_suffix_map = [_][2][]const u8{
 /// family — see gemma3_layer_suffix_map). Names that don't match the
 /// convention (including ComfyUI-style GGUFs that already carry HF names)
 /// pass through unchanged.
+/// The logical shape ComfyUI-GGUF records for a tensor it reshaped to fit ggml's
+/// block quants: `comfy.gguf.orig_shape.<raw name>`, an array of dimensions in
+/// row-major (torch) order — already the order this reader uses, so no reversal.
+/// Null when absent or malformed.
+fn origShape(kv: *const std.StringArrayHashMapUnmanaged(Value), alloc: std.mem.Allocator, raw_name: []const u8) ?tensors.Shape {
+    const key = std.fmt.allocPrint(alloc, "comfy.gguf.orig_shape.{s}", .{raw_name}) catch return null;
+    const v = kv.get(key) orelse return null;
+    const arr = switch (v) {
+        .arr => |a| a,
+        else => return null,
+    };
+    if (arr.len == 0 or arr.len > tensors.max_rank) return null;
+    var dims: [tensors.max_rank]usize = @splat(0);
+    var it = arr.iterate();
+    var i: usize = 0;
+    while (it.next()) |item| : (i += 1) {
+        const n: i128 = switch (item) {
+            .uint => |u| @intCast(u),
+            .int => |x| x,
+            else => return null,
+        };
+        if (n <= 0 or n > std.math.maxInt(usize)) return null;
+        dims[i] = @intCast(n);
+    }
+    return .{ .dims = dims, .rank = arr.len };
+}
+
 pub fn canonicalName(alloc: std.mem.Allocator, raw: []const u8, arch: []const u8) ![]const u8 {
     if (std.mem.eql(u8, raw, "token_embd.weight")) return "embed_tokens.weight";
     if (std.mem.eql(u8, raw, "output_norm.weight")) return "norm.weight";

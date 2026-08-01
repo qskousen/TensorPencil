@@ -18,6 +18,7 @@ Root: `../ops.zig`.
 | `act` | `silu` / `geluTanh` / `sigmoid` + fused `*Mul` |
 | `rope` | rotary position embedding |
 | `convrot` | ConvRot (group-wise Hadamard) un-rotation |
+| `conv` | general channel-last 2D conv (any kernel/stride/padding) + max-pool, as banded `im2col` + GEMM |
 | `vmath` | SIMD helpers (`expVec`, …) |
 
 ## Dependencies

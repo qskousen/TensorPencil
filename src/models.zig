@@ -33,6 +33,7 @@ pub const qwen35_gpu = @import("models/qwen35_gpu.zig");
 pub const qwen3_cuda = @import("models/qwen3_cuda.zig");
 pub const eagle3 = @import("models/eagle3.zig");
 pub const krea2_text = @import("models/krea2_text.zig");
+pub const lpips = @import("models/lpips.zig");
 pub const embed_gemma = @import("models/embed_gemma.zig");
 pub const embed_gemma_gpu = @import("models/embed_gemma_gpu.zig");
 pub const embed_gemma_cuda = @import("models/embed_gemma_cuda.zig");
@@ -78,6 +79,7 @@ test {
     _ = qwen3_cuda;
     _ = eagle3;
     _ = krea2_text;
+    _ = lpips;
     _ = embed_gemma;
     _ = embed_gemma_gpu;
     _ = embed_gemma_cuda;

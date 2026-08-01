@@ -10,6 +10,7 @@
 const std = @import("std");
 const dit = @import("dit.zig");
 const gpu = @import("tp_gpu").context;
+const ops = @import("tp_ops");
 
 const DiT = dit.DiT;
 
@@ -275,6 +276,15 @@ pub fn forward(
     sigma: f32,
     cancel: ?*std.atomic.Value(bool),
 ) !void {
+    // Weight class of the DiT block linears, gated once — the same check
+    // `dit_cuda.forward` makes, and for the same reason. The branches below
+    // recognize int8/int4 convrot and dense bf16 and treat *everything else* as
+    // raw fp8-e4m3, so a ggml block quant (a GGUF checkpoint) would be read as
+    // fp8 bytes and render a blank image with no error at all. Measured: that is
+    // exactly what happened once `pipeline` learned to open a GGUF — the path
+    // became reachable, so it needs the refusal.
+    if (!dit.gpuLinKindSupported(model.blocks[0].attn.wq.dtype)) return error.UnsupportedCheckpoint;
+
     const lat_h = sess.lat_h;
     const lat_w = sess.lat_w;
     const seq_txt = sess.seq_txt;
@@ -286,7 +296,16 @@ pub fn forward(
     // tiles); buffers that receive GEMM output are sized for seq_pad (pad
     // rows stay zero).
     const seq_pad = std.mem.alignForward(usize, seq, 128);
-    const coop = !force_f32 and ctx.pipe_coop != .null_handle;
+    // ⚠️ **An activation capture forces the f32 GEMM path** (plan item 9), for
+    // coverage first and fidelity second. The cooperative-matrix fast path for fp8
+    // weights converts the modulated norm to **f16** and calls `opMatmulCoopH16`
+    // directly, bypassing `Gemm.go` — the one place a probe can see a block linear's
+    // input. Measured: a Vulkan capture recorded 39 of the model's 263 layers, every
+    // one of them from another path, and the cache looked perfectly well-formed.
+    // Second, what that path would hand the probe is the f16 activation, not the f32
+    // quantity the CPU reference records. Capture is not the throughput case.
+    const probing = ops.matmul.probe != null;
+    const coop = !force_f32 and !probing and ctx.pipe_coop != .null_handle;
     var prof: Prof = .{};
     var t_mark = std.Io.Clock.real.now(io);
     const mark = struct {
@@ -399,6 +418,7 @@ pub fn forward(
     if (batched) try ctx.beginBatch();
     errdefer if (ctx.batching) ctx.abortBatch();
     // first: image patches -> x rows after the text tokens.
+    try probeInput(ctx, imgin_d, n_img, model.first.w);
     try ctx.opMatmul(x_d, seq_txt * F * 4, imgin_d, 0, n_img, model.first.w.bytes, model.first.w.dtype == .f8_e4m3, F, dit.channels * dit.patch * dit.patch, model.first.w.scale, model.first.b);
         mark(io, &t_mark, &prof.matmul_ns);
 
@@ -412,6 +432,11 @@ pub fn forward(
     const zeros: []const f32 = &zero_bias;
     const Gemm = struct {
         fn go(c: *gpu.Context, use_coop: bool, y: gpu.DeviceBuffer, x: gpu.DeviceBuffer, m: usize, m_pad: usize, w_: anytype, bias: []const f32) !void {
+            // Activation capture (plan item 9): this backend owns its upload and
+            // GEMM, so the `ops.matmul` probe call site never sees these. One hook
+            // here covers all 224 block linears; the txtfusion tower and the
+            // timestep MLPs run on the CPU path under Vulkan and are captured there.
+            try probeInput(c, x, m, w_);
             // Dense bf16 weights run through the f16-weight tensor-core GEMM
             // (bf16 -> f16 at upload); its f32 output matches opMatmulCoop, so
             // the surrounding f32-operand attention/mlp path is unchanged.
@@ -921,6 +946,8 @@ pub fn forward(
     }, seq * F, 1, 1);
     mark(io, &t_mark, &prof.elt_ns);
     // imgin_d's input role is long done; it is exactly n_img x 64.
+    // The offset is part of the measurement: this GEMM reads the image rows only.
+    try probeInputAt(ctx, t1_d, seq_txt * F * 4, n_img, model.last_linear.w);
     try ctx.opMatmul(imgin_d, 0, t1_d, seq_txt * F * 4, n_img, model.last_linear.w.bytes, model.last_linear.w.dtype == .f8_e4m3, dit.channels * dit.patch * dit.patch, F, model.last_linear.w.scale, model.last_linear.b);
     mark(io, &t_mark, &prof.matmul_ns);
 
@@ -944,6 +971,28 @@ pub fn forward(
             .{ ms(prof.matmul_ns), ms(prof.attn_ns + prof.scores_ns + prof.smax_ns + prof.aout_ns), ms(prof.scores_ns), ms(prof.smax_ns), ms(prof.aout_ns), ms(prof.elt_ns), ms(prof.prep_ns), ms(prof.xfer_ns), ms(prof.cpu_ns) },
         );
     }
+}
+
+/// Feed `ops.matmul.probe` a GEMM input that lives on the device, for an activation
+/// capture running on Vulkan. See `dit_cuda.probeInput` for why this is a download
+/// into the CPU accumulator rather than an on-device reduction.
+///
+/// ⚠️ **int8/int4 weights are skipped.** Their activation has already been rotated
+/// and quantized in place, so the buffer holds a W4A4-shaped value and recording it
+/// as a weight-only statistic would be a category error (ACTIVATION_AWARE hygiene
+/// rule 4). `ggufy calibrate` refuses those checkpoints on a GPU backend outright.
+fn probeInput(ctx: *gpu.Context, x: gpu.DeviceBuffer, m: usize, w: anytype) !void {
+    return probeInputAt(ctx, x, 0, m, w);
+}
+
+fn probeInputAt(ctx: *gpu.Context, x: gpu.DeviceBuffer, off_bytes: u64, m: usize, w: anytype) !void {
+    const p = ops.matmul.probe orelse return;
+    if (w.dtype == .i8 or w.dtype == .i4) return;
+    if (m == 0 or w.cols == 0) return;
+    const host = try ctx.gpa.alloc(f32, m * w.cols);
+    defer ctx.gpa.free(host);
+    try ctx.tensorDownloadAt(x, off_bytes, std.mem.sliceAsBytes(host));
+    p.input(p.ctx, w, host, m);
 }
 
 fn normBuf(ctx: *gpu.Context, weights: []const f32) !gpu.DeviceBuffer {
@@ -988,7 +1037,7 @@ test "gpu-resident forward matches comfyui fixture" {
 
     var st = try safetensors.SafeTensors.open(gpa, io, dit_path);
     defer st.deinit();
-    var model = try DiT.load(gpa, &st);
+    var model = try DiT.load(gpa, .{ .safetensors = &st });
     defer model.deinit();
 
     const out = try gpa.alloc(f32, dit.channels * 16 * 16);

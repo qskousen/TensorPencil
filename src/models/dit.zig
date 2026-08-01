@@ -7,18 +7,24 @@
 //! QK-norm and sigmoid-gated output, SwiGLU MLPs, and 3-axis interleaved RoPE
 //! (theta 1000, dims 32/48/48; text tokens sit at position (0,0,0)).
 //!
-//! All checkpoint tensors are raw fp8-e4m3 (no scales); large weights stay
-//! fp8 and dequantize inside the GEMM, small vectors (norm scales, biases,
-//! modulation) are dequantized to f32 at load. Norms use the `(1 + scale)`
-//! convention with eps 1e-5, folded into the weight at load time. The
-//! safetensors mapping must outlive the model.
+//! Loads from any `WeightStore` — safetensors *or* GGUF — so a checkpoint's
+//! container is not part of this file's business. Large weights keep their
+//! checkpoint dtype (fp8-e4m3, int8/int4 convrot with per-row scales, or the ggml
+//! block quants from a GGUF) and dequantize inside the GEMM; small vectors (norm
+//! scales, biases, modulation) are dequantized to f32 at load. Norms use the
+//! `(1 + scale)` convention with eps 1e-5, folded into the weight at load time.
+//! **The store's mapping must outlive the model** — the `Weight`s are views into
+//! it.
 
 const std = @import("std");
 const safetensors = @import("tp_core").safetensors;
+const weights_mod = @import("tp_core").weights;
 const ops = @import("tp_ops");
 
 const SafeTensors = safetensors.SafeTensors;
+const WeightStore = weights_mod.WeightStore;
 const Weight = ops.matmul.Weight;
+const DType = @import("tp_core").dtype.DType;
 
 pub const features = 6144;
 pub const tdim = 256;
@@ -122,24 +128,26 @@ pub const DiT = struct {
                 if (w.scale != 1.0) for (out) |*v| {
                     v.* *= w.scale;
                 };
-                return Weight.fromF32(out, w.rows, w.cols);
+                var out_w = Weight.fromF32(out, w.rows, w.cols);
+                out_w.tag = w.tag; // materializing to f32 must not lose the layer name
+                return out_w;
             },
             else => return error.UnsupportedCheckpoint,
         }
     }
 
-    pub fn load(gpa: std.mem.Allocator, st: *const SafeTensors) !DiT {
+    pub fn load(gpa: std.mem.Allocator, store: WeightStore) !DiT {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const alloc = arena.allocator();
 
         // The fp8 checkpoint uses bare tensor names (`blocks.0…`); the int8
         // convrot checkpoint nests them under `model.diffusion_model.`.
-        const pfx: []const u8 = if (st.get("model.diffusion_model.blocks.0.mod.lin") != null)
+        const pfx: []const u8 = if (store.get("model.diffusion_model.blocks.0.mod.lin") != null)
             "model.diffusion_model."
         else
             "";
-        const l = Loader{ .st = st, .alloc = alloc, .pfx = pfx };
+        const l = Loader{ .store = store, .alloc = alloc, .pfx = pfx };
 
         const blocks = try alloc.alloc(Block, n_blocks);
         for (blocks, 0..) |*blk, i| {
@@ -667,13 +675,24 @@ fn linear(io: std.Io, gpa: std.mem.Allocator, out: []f32, x: []const f32, m: usi
     try ops.matmul.matmul(io, gpa, out, x, m, lw.w, lw.b);
 }
 
+/// Whether the GPU DiT forwards (`dit_gpu`, `dit_cuda`) have a GEMM path for block
+/// linears of this dtype. They branch on int8/int4 convrot and dense bf16 and treat
+/// anything else as raw fp8-e4m3, so an unrecognized dtype is not a slow path — it
+/// is silently wrong output. Both gate on this before dispatching.
+pub fn gpuLinKindSupported(dt: DType) bool {
+    return switch (dt) {
+        .i8, .i4, .bf16, .f8_e4m3 => true,
+        else => false,
+    };
+}
+
 // --- weight loading --------------------------------------------------------
 
 /// Resolves checkpoint tensor names (optionally under a runtime prefix) and
 /// builds `Weight`s, transparently attaching per-row scale + ConvRot metadata
 /// for int8/int4-quantized (`I8`/`I4`) tensors.
 const Loader = struct {
-    st: *const SafeTensors,
+    store: WeightStore,
     alloc: std.mem.Allocator,
     pfx: []const u8, // "" (fp8) or "model.diffusion_model." (int8/int4)
 
@@ -688,7 +707,7 @@ const Loader = struct {
     fn mat(l: Loader, comptime fmt: []const u8, args: anytype, rows: usize, cols: usize) !Weight {
         var buf: [160]u8 = undefined;
         const nm = try l.name(&buf, fmt, args, "");
-        const view = l.st.get(nm) orelse return error.MissingTensor;
+        const view = l.store.get(nm) orelse return error.MissingTensor;
         const shape = view.info.shape.slice();
 
         // int4 convrot weights are nibble-packed (two values per byte), so the
@@ -704,15 +723,27 @@ const Loader = struct {
         const wdt = if (is_i4) @as(@TypeOf(dt), .i4) else dt;
         const stored_cols = if (is_i4) cols / 2 else cols;
         if (is_i4 and cols % 2 != 0) return error.ShapeMismatch;
-        if (shape.len != 2 or shape[0] != rows or shape[1] != stored_cols) return error.ShapeMismatch;
+        if (shape.len != 2 or shape[0] != rows or shape[1] != stored_cols) {
+            // Say which tensor and what was expected: a bare ShapeMismatch over 230
+            // weights is not actionable, and the usual cause is a container whose
+            // dim order differs (GGUF stores them reversed and the reader flips
+            // them back).
+            std.log.err("dit: {s} has shape {any} ({t}), expected [{d}, {d}]", .{ nm, shape, dt, rows, stored_cols });
+            return error.ShapeMismatch;
+        }
 
         var w = Weight.init(view.bytes, wdt, rows, cols);
+        // Carry the checkpoint name on the Weight so a GEMM can be attributed to a
+        // layer downstream (ops.matmul.probe, profiling, error messages). Duped into
+        // the model arena because `nm` lives in a stack buffer; ~230 short strings
+        // per model.
+        w.tag = try l.alloc.dupe(u8, nm);
         if (wdt == .i8 or wdt == .i4) {
             // int8/int4 "convrot": per-output-row `weight_scale` and a size-256
             // group rotation folded out at dequant time.
             var sbuf: [168]u8 = undefined;
             const sname = try l.name(&sbuf, fmt, args, "_scale");
-            const sv = l.st.get(sname) orelse return error.MissingTensor;
+            const sv = l.store.get(sname) orelse return error.MissingTensor;
             if (sv.info.elemCount() != rows) return error.ShapeMismatch;
             if (cols % ops.convrot.group_size != 0) return error.ShapeMismatch;
             w.row_scale = try sv.toF32Alloc(l.alloc);
@@ -724,7 +755,7 @@ const Loader = struct {
     fn vec(l: Loader, comptime fmt: []const u8, args: anytype, len: usize) ![]f32 {
         var buf: [160]u8 = undefined;
         const nm = try l.name(&buf, fmt, args, "");
-        const view = l.st.get(nm) orelse return error.MissingTensor;
+        const view = l.store.get(nm) orelse return error.MissingTensor;
         if (view.info.elemCount() != len) return error.ShapeMismatch;
         return view.toF32Alloc(l.alloc);
     }
@@ -835,7 +866,7 @@ test "int8 convrot checkpoint loads with per-row scale + rotation metadata" {
 
     var st = try SafeTensors.open(gpa, io, path);
     defer st.deinit();
-    var model = try DiT.load(gpa, &st);
+    var model = try DiT.load(gpa, .{ .safetensors = &st });
     defer model.deinit();
 
     // The 8 per-block linears are int8 convrot; scales/rotation must be wired.
@@ -852,6 +883,122 @@ test "int8 convrot checkpoint loads with per-row scale + rotation metadata" {
     try std.testing.expect(model.first.w.row_scale == null);
 }
 
+test "every loaded weight carries its checkpoint tensor name as a tag" {
+    // The tag is what makes `ops.matmul.probe` able to attribute a GEMM to a layer
+    // (per-layer activation statistics, profiling). A weight that silently loses its
+    // name would just vanish from any such report, so assert the names are exact —
+    // not merely present.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "models/diffusion_model/krea2CenterSemiraw_v10Fp8.safetensors";
+    std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
+
+    var st = try SafeTensors.open(gpa, io, path);
+    defer st.deinit();
+    var model = try DiT.load(gpa, .{ .safetensors = &st });
+    defer model.deinit();
+
+    // Block 0's eight linears, with the names this checkpoint uses (bare `blocks.N.`;
+    // the int8/int4 checkpoints nest under `model.diffusion_model.`, which the loader
+    // prefixes — so this also pins that the tag is the RESOLVED name, not the format).
+    const b0 = model.blocks[0];
+    const expected = [_]struct { w: Weight, name: []const u8 }{
+        .{ .w = b0.attn.wq, .name = "blocks.0.attn.wq.weight" },
+        .{ .w = b0.attn.wk, .name = "blocks.0.attn.wk.weight" },
+        .{ .w = b0.attn.wv, .name = "blocks.0.attn.wv.weight" },
+        .{ .w = b0.attn.wo, .name = "blocks.0.attn.wo.weight" },
+        .{ .w = b0.attn.gate, .name = "blocks.0.attn.gate.weight" },
+        .{ .w = b0.mlp.gate, .name = "blocks.0.mlp.gate.weight" },
+        .{ .w = b0.mlp.up, .name = "blocks.0.mlp.up.weight" },
+        .{ .w = b0.mlp.down, .name = "blocks.0.mlp.down.weight" },
+    };
+    for (expected) |e| {
+        errdefer std.debug.print("tag mismatch: want {s}, got {?s}\n", .{ e.name, e.w.tag });
+        try std.testing.expectEqualStrings(e.name, e.w.tag orelse return error.MissingTag);
+    }
+
+    // Distinct per block, or per-layer attribution would collapse layers together.
+    try std.testing.expectEqualStrings("blocks.27.mlp.down.weight", model.blocks[27].mlp.down.tag.?);
+
+    // The two projections that get materialized to f32 at load (`first`, `last.linear`,
+    // see opMatmulF32) must keep their tags through that copy.
+    try std.testing.expectEqualStrings("first.weight", model.first.w.tag orelse return error.MissingTag);
+    try std.testing.expectEqualStrings("last.linear.weight", model.last_linear.w.tag orelse return error.MissingTag);
+
+    // And every remaining matmul weight is tagged, so nothing is unattributable.
+    for ([_]Weight{ model.tmlp0.w, model.tmlp2.w, model.tproj1.w, model.txtmlp1.w, model.txtmlp3.w, model.txt_projector }) |w| {
+        try std.testing.expect(w.tag != null);
+    }
+    for (model.txt_layerwise, model.txt_refiner) |lw, rf| {
+        try std.testing.expect(lw.attn.wq.tag != null and lw.mlp.down.tag != null);
+        try std.testing.expect(rf.attn.wq.tag != null and rf.mlp.down.tag != null);
+    }
+}
+
+test "a DiT loads through an overlay with exactly one weight substituted" {
+    // The composition the per-layer attribution arm rests on: a base checkpoint
+    // plus one tensor from memory. Two things have to hold — the patched weight is
+    // the caller's buffer at the caller's dtype, and *nothing else moves*. The
+    // second is the one that would quietly ruin an attribution measurement, so it
+    // is asserted pointer-by-pointer against an unpatched load of the same file.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "models/diffusion_model/krea2CenterSemiraw_v10Fp8.safetensors";
+    std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
+
+    var st = try SafeTensors.open(gpa, io, path);
+    defer st.deinit();
+    const base: WeightStore = .{ .safetensors = &st };
+
+    var plain = try DiT.load(gpa, base);
+    defer plain.deinit();
+
+    // `first.weight` is [6144, 64] — the smallest matmul weight in the model, so
+    // the substitute buffer is 1.5 MB rather than 150.
+    const n = plain.first.w.rows * plain.first.w.cols;
+    const sub = try gpa.alloc(f32, n);
+    defer gpa.free(sub);
+    for (sub, 0..) |*v, i| v.* = @floatFromInt(i % 7);
+
+    var ov: weights_mod.Overlay = .{ .base = base };
+    defer ov.deinit(gpa);
+    try ov.put(gpa, "first.weight", .f32, std.mem.sliceAsBytes(sub));
+
+    var patched = try DiT.load(gpa, ov.store());
+    defer patched.deinit();
+
+    try std.testing.expectEqual(DType.f32, patched.first.w.dtype);
+    try std.testing.expectEqual(std.mem.sliceAsBytes(sub).ptr, patched.first.w.bytes.ptr);
+    try std.testing.expectEqual(plain.first.w.rows, patched.first.w.rows);
+    try std.testing.expectEqual(plain.first.w.cols, patched.first.w.cols);
+    try std.testing.expectEqualStrings("first.weight", patched.first.w.tag.?);
+
+    // Every other matmul weight is the same view into the same mapping.
+    for (plain.blocks, patched.blocks) |a, b| {
+        for ([_]Weight{ a.attn.wq, a.attn.wk, a.attn.wv, a.attn.wo, a.attn.gate, a.mlp.gate, a.mlp.up, a.mlp.down }, //
+            [_]Weight{ b.attn.wq, b.attn.wk, b.attn.wv, b.attn.wo, b.attn.gate, b.mlp.gate, b.mlp.up, b.mlp.down }) |wa, wb|
+        {
+            try std.testing.expectEqual(wa.bytes.ptr, wb.bytes.ptr);
+            try std.testing.expectEqual(wa.dtype, wb.dtype);
+        }
+    }
+    try std.testing.expectEqual(plain.tproj1.w.bytes.ptr, patched.tproj1.w.bytes.ptr);
+    // `last.linear` is the other weight materialized to f32 at load, so it lands at
+    // a fresh arena address per load and can only be compared by value.
+    try std.testing.expectEqualSlices(u8, plain.last_linear.w.bytes, patched.last_linear.w.bytes);
+
+    // And dropping the patch restores the base tensor exactly. Compared by value,
+    // not by pointer: `first`/`last.linear` are materialized to f32 into the model
+    // arena at load (opMatmulF32), so a second load legitimately lands at a
+    // different address — which is also why the patched load above compares equal
+    // to the patch buffer (an f32 patch passes through untouched).
+    try std.testing.expect(ov.remove("first.weight"));
+    var restored = try DiT.load(gpa, ov.store());
+    defer restored.deinit();
+    try std.testing.expectEqual(plain.first.w.dtype, restored.first.w.dtype);
+    try std.testing.expectEqualSlices(u8, plain.first.w.bytes, restored.first.w.bytes);
+}
+
 // The int8 convrot weights should reconstruct the same linear map as the fp8
 // weights (both quantize the same base checkpoint), so a GEMM through each must
 // agree to within quantization noise. This validates the whole int8 path —
@@ -866,11 +1013,11 @@ test "int8 convrot matmul agrees with fp8 within quant noise" {
 
     var st_i8 = try SafeTensors.open(gpa, io, i8_path);
     defer st_i8.deinit();
-    var m_i8 = try DiT.load(gpa, &st_i8);
+    var m_i8 = try DiT.load(gpa, .{ .safetensors = &st_i8 });
     defer m_i8.deinit();
     var st_fp8 = try SafeTensors.open(gpa, io, fp8_path);
     defer st_fp8.deinit();
-    var m_fp8 = try DiT.load(gpa, &st_fp8);
+    var m_fp8 = try DiT.load(gpa, .{ .safetensors = &st_fp8 });
     defer m_fp8.deinit();
 
     const w_i8 = m_i8.blocks[0].attn.wq;
@@ -916,7 +1063,7 @@ test "int4 convrot checkpoint loads with per-row scale + rotation metadata" {
 
     var st = try SafeTensors.open(gpa, io, path);
     defer st.deinit();
-    var model = try DiT.load(gpa, &st);
+    var model = try DiT.load(gpa, .{ .safetensors = &st });
     defer model.deinit();
 
     // The per-block linears are int4 convrot: stored I8 (nibble-packed, two
@@ -950,11 +1097,11 @@ test "int4 convrot matmul agrees with fp8 within quant noise" {
 
     var st_i4 = try SafeTensors.open(gpa, io, i4_path);
     defer st_i4.deinit();
-    var m_i4 = try DiT.load(gpa, &st_i4);
+    var m_i4 = try DiT.load(gpa, .{ .safetensors = &st_i4 });
     defer m_i4.deinit();
     var st_fp8 = try SafeTensors.open(gpa, io, fp8_path);
     defer st_fp8.deinit();
-    var m_fp8 = try DiT.load(gpa, &st_fp8);
+    var m_fp8 = try DiT.load(gpa, .{ .safetensors = &st_fp8 });
     defer m_fp8.deinit();
 
     const w_i4 = m_i4.blocks[0].attn.wq;
@@ -1024,7 +1171,7 @@ test "dit forward matches comfyui" {
 
     var st = try SafeTensors.open(gpa, io, dit_path);
     defer st.deinit();
-    var model = try DiT.load(gpa, &st);
+    var model = try DiT.load(gpa, .{ .safetensors = &st });
     defer model.deinit();
 
     const out = try gpa.alloc(f32, channels * 16 * 16);
@@ -1047,4 +1194,71 @@ test "dit forward matches comfyui" {
     // A pre-set cancel flag aborts mid-step (polled between blocks).
     var canceled = std.atomic.Value(bool).init(true);
     try std.testing.expectError(error.Canceled, model.forward(io, gpa, out, x_lat, 16, 16, 0.875, ctx, seq_txt, &canceled));
+}
+
+test "a GGUF checkpoint loads, with its block-quant dtypes intact" {
+    // The GGUF half of ggufy's output (the ggml block quants) could not be loaded
+    // at all before `load` took a `WeightStore` — which meant the whole k-quant
+    // path had level-1 evidence and nothing else. This is the receipt that it is
+    // reachable: same bare tensor names as the safetensors checkpoints, dims
+    // un-reversed by the GGUF reader into [rows, cols], and per-layer mixed types
+    // from ggufy's sensitivity routing preserved as-is for the GEMM to dequantize.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const gguf = @import("tp_core").gguf;
+    const path = "models/diffusion_model/anim-q4k-calib.gguf";
+    std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
+
+    var g = try gguf.Gguf.open(gpa, io, path);
+    defer g.deinit();
+    var model = try DiT.load(gpa, .{ .gguf = &g });
+    defer model.deinit();
+
+    try std.testing.expectEqual(@as(usize, n_blocks), model.blocks.len);
+
+    // Every per-block linear must be a ggml block quant with no convrot metadata:
+    // the k-quants carry their scales inside the block, so a row_scale here would
+    // mean the int8/int4 path had misfired on a GGUF tensor.
+    var quantized: usize = 0;
+    for (model.blocks) |blk| {
+        for ([_]Weight{ blk.attn.wq, blk.attn.wk, blk.attn.wv, blk.attn.wo, blk.mlp.gate, blk.mlp.up, blk.mlp.down }) |w| {
+            try std.testing.expect(w.row_scale == null);
+            try std.testing.expectEqual(@as(u32, 0), w.convrot);
+            switch (w.dtype) {
+                .q4_0, .q4_k, .q5_k, .q6_k, .q8_0, .iq4_nl, .f16, .bf16, .f32 => {},
+                else => {
+                    std.debug.print("unexpected GGUF dtype {t} for {s}\n", .{ w.dtype, w.tag orelse "?" });
+                    return error.UnexpectedDtype;
+                },
+            }
+            if (w.dtype != .f32 and w.dtype != .f16 and w.dtype != .bf16) quantized += 1;
+        }
+    }
+    // Mixed precision is the point of the sensitivity routing: most linears are
+    // quantized, and the file is useless as a measurement target if none are.
+    try std.testing.expect(quantized > n_blocks * 5);
+}
+
+test "the GPU DiT paths refuse a block-quant checkpoint instead of misreading it" {
+    // Both GPU forwards recognize int8/int4/bf16 and treat everything else as raw
+    // fp8 bytes. A GGUF checkpoint is neither, and before `pipeline` could open a
+    // GGUF the case was unreachable — so the day it became reachable, Vulkan
+    // rendered a blank white image with no error, while CUDA (which already had the
+    // gate) refused. This pins both to refusing.
+    //
+    // Checks the *gate*, not a device: it asserts the dtype classification both
+    // forwards do, so it runs on the fast suite with no GPU and no checkpoint.
+    const supported = [_]DType{ .i8, .i4, .bf16, .f8_e4m3 };
+    const block_quants = [_]DType{ .q4_0, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl };
+
+    for (supported) |dt| try std.testing.expect(gpuLinKindSupported(dt));
+    for (block_quants) |dt| {
+        std.testing.expect(!gpuLinKindSupported(dt)) catch |e| {
+            std.debug.print("block quant {t} would be misread as fp8 by a GPU DiT forward\n", .{dt});
+            return e;
+        };
+    }
+    // f32 block linears are not a thing a checkpoint ships, and the GPU paths have
+    // no branch for them either.
+    try std.testing.expect(!gpuLinKindSupported(.f32));
 }

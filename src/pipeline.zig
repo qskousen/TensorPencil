@@ -44,6 +44,8 @@ fn gpuMatmulThunk(
 }
 const tokenizer_mod = @import("tp_core").tokenizer;
 const safetensors = @import("tp_core").safetensors;
+const gguf_mod = @import("tp_core").gguf;
+const weights_mod = @import("tp_core").weights;
 const sampler = @import("tp_core").sampler;
 const image = @import("tp_core").image;
 const qwen3 = @import("tp_models").models.qwen3;
@@ -232,11 +234,43 @@ pub const Image = struct {
     }
 };
 
-/// Stripped conditioning: [seq][12][2560] plus its length.
-const Cond = struct {
+/// Stripped conditioning: [seq][12][2560] plus its length. Produced by
+/// `Session.encode`, consumed by `Session.denoiser` / `Session.predict`; the
+/// caller owns `data`.
+pub const Cond = struct {
     data: []f32,
     seq: usize,
+
+    pub fn deinit(self: *Cond, gpa: std.mem.Allocator) void {
+        gpa.free(self.data);
+        self.* = undefined;
+    }
 };
+
+/// Per-call knobs for `Session.encode`. Defaults match `Options`, so
+/// `encode(gpa, prompt, .{})` is what `generate` does.
+pub const EncodeOptions = struct {
+    /// Run the GPU text encoder's GEMMs on tensor cores (f16). See
+    /// `Options.encoder_f16`.
+    encoder_f16: bool = false,
+    cancel: ?*std.atomic.Value(bool) = null,
+};
+
+/// Per-call knobs for `Session.decode`, mirroring the `Options` fields the VAE
+/// stage reads.
+pub const DecodeOptions = struct {
+    vae_decode: VaeDecode = .auto,
+    cancel: ?*std.atomic.Value(bool) = null,
+    reclaim: ?Reclaim = null,
+};
+
+/// The flow-matching sigma schedule for `steps` steps (length `steps + 1`,
+/// ending at 0). Re-exported here so a caller driving its own sampling loop over
+/// `Session.predict` gets the same schedule `generate` uses without reaching into
+/// `sampler`. Caller frees.
+pub fn schedule(gpa: std.mem.Allocator, steps: usize, shift: f32) ![]f32 {
+    return sampler.simpleSchedule(gpa, steps, shift);
+}
 
 // --- Tiled VAE decode adapters (see models/vae_tiled.zig) ------------------
 // Each decodes a planar [16][th][tw] sub-latent to planar [3][8·th][8·tw]
@@ -310,6 +344,150 @@ fn recoverableDecodeErr(err: anyerror) bool {
     };
 }
 
+/// One image's denoiser: everything a DiT forward needs that is built **once per
+/// image** rather than once per step — the text fusion, rope table and timestep
+/// vectors uploaded to the device, the activation workspace, and (when CFG is on)
+/// the second conditioning's session plus a scratch velocity.
+///
+/// This exists because `predict` cannot be a free function on the GPU backends
+/// without rebuilding all of that per step, which would be both slow and a
+/// behaviour change. A caller running a normal sampling loop makes one of these
+/// and calls `predict` per step, exactly as `generate` does; a caller that wants a
+/// single forward (level-2 style: one latent, one sigma, one conditioning) can use
+/// `Session.predict`, which wraps init/predict/deinit.
+///
+/// Borrows its conditionings — they must outlive the `Denoiser`. Bound to one
+/// resolution. `sigmas` is a cache, not a constraint: the Vulkan session
+/// precomputes a timestep vector per entry, and `predict` at a sigma that is not
+/// in the list recomputes one on the fly (correct, just slower) — so pass the
+/// schedule you intend to sample with, and an off-schedule probe still works.
+pub const Denoiser = struct {
+    sess: *Session,
+    lat_h: usize,
+    lat_w: usize,
+    /// 1.0 = no classifier-free guidance (single forward per step).
+    cfg: f32,
+    cond_pos: Cond,
+    cond_neg: ?Cond,
+    /// Velocity scratch for the negative pass; allocated only under CFG.
+    v_neg: ?[]f32 = null,
+
+    vk_pos: ?dit_gpu.Session = null,
+    vk_neg: ?dit_gpu.Session = null,
+    vk_ws: ?dit_gpu.Workspace = null,
+    cu_pos: ?dit_cuda.Session = null,
+    cu_neg: ?dit_cuda.Session = null,
+    cu_ws: ?dit_cuda.Workspace = null,
+
+    pub fn deinit(self: *Denoiser, gpa: std.mem.Allocator) void {
+        if (self.v_neg) |b| gpa.free(b);
+        if (self.vk_pos) |*s| s.deinit(gpa, self.sess.gpu_ctx.?);
+        if (self.vk_neg) |*s| s.deinit(gpa, self.sess.gpu_ctx.?);
+        if (self.vk_ws) |*w| w.deinit(self.sess.gpu_ctx.?);
+        if (self.cu_pos) |*s| s.deinit(self.sess.cu_be.?);
+        if (self.cu_neg) |*s| s.deinit(self.sess.cu_be.?);
+        if (self.cu_ws) |*w| w.deinit(self.sess.cu_be.?);
+        self.* = undefined;
+    }
+
+    /// One denoiser forward at `sigma`: `v_out = model(latent, sigma, cond)`, with
+    /// classifier-free guidance folded in when `cfg != 1`. `v_out` and `latent`
+    /// are both `16·lat_h·lat_w` long.
+    pub fn predict(
+        self: *Denoiser,
+        gpa: std.mem.Allocator,
+        v_out: []f32,
+        latent: []const f32,
+        sigma: f32,
+        cancel: ?*std.atomic.Value(bool),
+    ) !void {
+        const s = self.sess;
+        const io = s.io;
+        const dit = &s.dit;
+        std.debug.assert(v_out.len == wan_vae.latent_channels * self.lat_h * self.lat_w);
+        std.debug.assert(latent.len == v_out.len);
+
+        if (s.cu_be) |b| {
+            try dit_cuda.forward(dit, b, &self.cu_pos.?, &self.cu_ws.?, io, gpa, v_out, latent, sigma, cancel);
+        } else if (s.gpu_ctx) |gc| {
+            try dit_gpu.forward(dit, gc, &self.vk_pos.?, &self.vk_ws.?, io, gpa, v_out, latent, sigma, cancel);
+        } else {
+            try dit.forward(io, gpa, v_out, latent, self.lat_h, self.lat_w, sigma, self.cond_pos.data, self.cond_pos.seq, cancel);
+        }
+        if (self.cfg == 1.0) return;
+
+        const v_neg = self.v_neg.?;
+        if (s.cu_be) |b| {
+            try dit_cuda.forward(dit, b, &self.cu_neg.?, &self.cu_ws.?, io, gpa, v_neg, latent, sigma, cancel);
+        } else if (s.gpu_ctx) |gc| {
+            try dit_gpu.forward(dit, gc, &self.vk_neg.?, &self.vk_ws.?, io, gpa, v_neg, latent, sigma, cancel);
+        } else {
+            try dit.forward(io, gpa, v_neg, latent, self.lat_h, self.lat_w, sigma, self.cond_neg.?.data, self.cond_neg.?.seq, cancel);
+        }
+        sampler.applyCfg(v_out, v_neg, self.cfg);
+    }
+};
+
+/// The DiT's checkpoint container, which may be either format.
+///
+/// ggufy emits both — int4/int8 cluster formats as safetensors, the ggml block
+/// quants as GGUF — and until this existed only the safetensors half could be
+/// loaded, so the GGUF half of the quantization work could not be run or measured
+/// at all. `dit.DiT.load` takes a `WeightStore`, so the only thing missing was
+/// opening the file.
+pub const DitContainer = union(enum) {
+    safetensors: safetensors.SafeTensors,
+    gguf: gguf_mod.Gguf,
+
+    /// Open by **content**, not extension: a leading `GGUF` magic picks the GGUF
+    /// reader, anything else the safetensors one. Sniffing rather than trusting the
+    /// name because the failure mode of guessing wrong is a baffling error from the
+    /// other parser — handing a GGUF to the safetensors reader reports
+    /// `InvalidHeader`, which says nothing about what actually happened.
+    pub fn open(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !DitContainer {
+        return openIn(gpa, io, std.Io.Dir.cwd(), path);
+    }
+
+    pub fn openIn(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) !DitContainer {
+        var magic: [4]u8 = undefined;
+        {
+            const f = try dir.openFile(io, path, .{ .mode = .read_only });
+            defer f.close(io);
+            const n = try f.readPositionalAll(io, &magic, 0);
+            if (n < magic.len) return error.CheckpointTooSmall;
+        }
+        if (std.mem.eql(u8, &magic, "GGUF")) {
+            return .{ .gguf = try gguf_mod.Gguf.openIn(gpa, io, dir, path) };
+        }
+        return .{ .safetensors = try safetensors.SafeTensors.openIn(gpa, io, dir, path) };
+    }
+
+    pub fn deinit(self: *DitContainer) void {
+        switch (self.*) {
+            .safetensors => |*st| st.deinit(),
+            .gguf => |*g| g.deinit(),
+        }
+    }
+
+    /// A store view. Takes a pointer because the containers hold interior
+    /// pointers into their own mappings; the `Session` keeps this at a stable
+    /// address for exactly that reason.
+    pub fn store(self: *const DitContainer) weights_mod.WeightStore {
+        return switch (self.*) {
+            .safetensors => |*st| .{ .safetensors = st },
+            .gguf => |*g| .{ .gguf = g },
+        };
+    }
+
+    /// Tensor-data bytes — what the VRAM pinning policy sizes itself against.
+    pub fn payloadLen(self: *const DitContainer) usize {
+        return switch (self.*) {
+            .safetensors => |*st| st.payload.len,
+            .gguf => |*g| g.payload.len,
+        };
+    }
+};
+
 /// A reusable text-to-image pipeline. `init` creates the backend and loads the
 /// text encoder, DiT, and VAE ONCE (their safetensors mappings stay open for the
 /// session lifetime), so `generate` can produce many images without reloading —
@@ -323,13 +501,14 @@ pub const Session = struct {
     backend: Backend,
     gpu_ctx: ?*gpu_mod.Context,
     cu_be: ?*cuda.Backend,
-    // Models + their (kept-open) safetensors mappings. Held at stable addresses
+    // Models + their (kept-open) checkpoint mappings. Held at stable addresses
     // inside this heap-allocated struct so the models' pointers into the mmaps
-    // stay valid for the whole session.
+    // stay valid for the whole session. The DiT's container may be safetensors or
+    // GGUF (`DitContainer`); the encoder and VAE are safetensors-only.
     tok: tokenizer_mod.Tokenizer,
     enc_st: safetensors.SafeTensors,
     enc: qwen3.TextEncoder,
-    dit_st: safetensors.SafeTensors,
+    dit_st: DitContainer,
     dit: dit_mod.DiT,
     vae_st: safetensors.SafeTensors,
     vae: wan_vae.Decoder,
@@ -406,9 +585,9 @@ pub const Session = struct {
 
         try note(progress, "loading diffusion model...\n", .{});
         const t1 = std.Io.Clock.real.now(io).nanoseconds;
-        self.dit_st = try safetensors.SafeTensors.open(gpa, io, opts.dit_path);
+        self.dit_st = try DitContainer.open(gpa, io, opts.dit_path);
         errdefer self.dit_st.deinit();
-        self.dit = try dit_mod.DiT.load(gpa, &self.dit_st);
+        self.dit = try dit_mod.DiT.load(gpa, self.dit_st.store());
         errdefer self.dit.deinit();
 
         self.vae_st = try safetensors.SafeTensors.open(gpa, io, opts.vae_path);
@@ -432,6 +611,39 @@ pub const Session = struct {
         });
 
         return self;
+    }
+
+    /// Swap the DiT for one loaded from `store`, keeping the tokenizer, text
+    /// encoder, VAE and backend exactly as they are.
+    ///
+    /// For sweeps that vary only the diffusion weights — the level-2 per-tensor
+    /// attribution arm this was added for substitutes ONE tensor via
+    /// `weights.Overlay` and re-measures, once per layer. Reloading a whole
+    /// `Session` per point would re-load the text encoder and VAE (tens of seconds
+    /// each) and, worse, re-encode the conditioning, which puts a difference in the
+    /// *inputs* of a measurement whose entire claim is that the inputs are
+    /// identical.
+    ///
+    /// `store` may be an overlay over `self.dit_st.store()`: this call does not
+    /// touch `dit_st`, so the base container stays open and mapped. The caller owns
+    /// `store` and everything it points at, and both must outlive the DiT.
+    ///
+    /// The new DiT is loaded *before* the old one is freed, so a failed load leaves
+    /// the session intact and usable.
+    pub fn replaceDit(self: *Session, store: weights_mod.WeightStore) !void {
+        const fresh = try dit_mod.DiT.load(self.gpa, store);
+        // Device weight caches are keyed by HOST POINTER, so they must be dropped
+        // here: the old DiT's arena is about to be freed, and a later allocation
+        // reusing one of those addresses for a different tensor would score a stale
+        // cache hit and compute with the wrong weights. Cheap next to a reload, and
+        // the next forward re-uploads whatever fits its budget.
+        if (self.cu_be) |b| {
+            b.bindThread();
+            b.evictWeights();
+        }
+        if (self.gpu_ctx) |c| c.evictWeights();
+        self.dit.deinit();
+        self.dit = fresh;
     }
 
     /// Device bytes this diffusion session's backend currently holds (weights +
@@ -549,6 +761,311 @@ pub const Session = struct {
     /// Generate one image, reusing the loaded models. Rebuilds only the
     /// per-image state: conditioning, the DiT session/workspace (depend on the
     /// prompt AND resolution), the noise latent, and the schedule.
+    /// Stage 1 — text → conditioning, on the resident encoder. Caller frees the
+    /// returned `Cond`. Device allocations are tagged `.te` for the VRAM meter.
+    pub fn encode(self: *Session, gpa: std.mem.Allocator, text: []const u8, o: EncodeOptions) !Cond {
+        self.setMemTag(.te);
+        return encodePrompt(self.io, gpa, self.gpu_ctx, self.cu_be, o.encoder_f16, &self.tok, &self.enc, text, o.cancel);
+    }
+
+    /// Stage 2 — build the per-image denoiser (see `Denoiser`). `cond_neg` and a
+    /// `cfg` other than 1.0 go together: pass both for classifier-free guidance,
+    /// neither for a single forward per step. `sigmas` is the whole schedule (the
+    /// Vulkan backend precomputes a timestep vector per entry).
+    pub fn denoiser(
+        self: *Session,
+        gpa: std.mem.Allocator,
+        cond_pos: Cond,
+        cond_neg: ?Cond,
+        cfg: f32,
+        lat_h: usize,
+        lat_w: usize,
+        sigmas: []const f32,
+    ) !Denoiser {
+        const use_cfg = cfg != 1.0;
+        if (use_cfg and cond_neg == null) return error.CfgNeedsNegativeCond;
+
+        var d: Denoiser = .{
+            .sess = self,
+            .lat_h = lat_h,
+            .lat_w = lat_w,
+            .cfg = cfg,
+            .cond_pos = cond_pos,
+            .cond_neg = cond_neg,
+        };
+        errdefer d.deinit(gpa);
+
+        if (use_cfg) d.v_neg = try gpa.alloc(f32, wan_vae.latent_channels * lat_h * lat_w);
+
+        // The per-image device buffers (session + activation workspace) are the
+        // meter's "latent / working" segment — tagged so it is MEASURED rather
+        // than left as a remainder. Restored to `.dit` on the way out, since what
+        // follows is the sampling loop's lazily streamed weights and attention
+        // scratch.
+        self.setMemTag(.latent);
+        defer self.setMemTag(.dit);
+
+        // One workspace, shared by both conditioning passes, sized to the longer
+        // of the two sequences.
+        const seq_cap = @max(cond_pos.seq, if (cond_neg) |c| c.seq else 0);
+        if (self.cu_be) |b| {
+            d.cu_pos = try dit_cuda.Session.init(gpa, self.io, b, &self.dit, lat_h, lat_w, cond_pos.data, cond_pos.seq);
+            if (use_cfg) d.cu_neg = try dit_cuda.Session.init(gpa, self.io, b, &self.dit, lat_h, lat_w, cond_neg.?.data, cond_neg.?.seq);
+            d.cu_ws = try dit_cuda.Workspace.init(b, lat_h, lat_w, seq_cap);
+        } else if (self.gpu_ctx) |gc| {
+            d.vk_pos = try dit_gpu.Session.init(gpa, self.io, gc, &self.dit, lat_h, lat_w, cond_pos.data, cond_pos.seq, sigmas);
+            if (use_cfg) d.vk_neg = try dit_gpu.Session.init(gpa, self.io, gc, &self.dit, lat_h, lat_w, cond_neg.?.data, cond_neg.?.seq, sigmas);
+            d.vk_ws = try dit_gpu.Workspace.init(gc, lat_h, lat_w, seq_cap);
+        }
+        return d;
+    }
+
+    /// One denoiser forward, self-contained: `v_out = model(latent, sigma, cond)`.
+    ///
+    /// This is level 2's primitive (plan §7) — a fixed latent, sigma and
+    /// conditioning through the model once, with no sampler and therefore no
+    /// trajectory to drift. It builds and tears down a `Denoiser` per call, which
+    /// is free on CPU and wasteful on a GPU backend; for many forwards at one
+    /// resolution, hold a `Denoiser` and call its `predict` instead.
+    pub fn predict(
+        self: *Session,
+        gpa: std.mem.Allocator,
+        v_out: []f32,
+        latent: []const f32,
+        lat_h: usize,
+        lat_w: usize,
+        sigma: f32,
+        cond: Cond,
+    ) !void {
+        var d = try self.denoiser(gpa, cond, null, 1.0, lat_h, lat_w, &.{ sigma, 0 });
+        defer d.deinit(gpa);
+        try d.predict(gpa, v_out, latent, sigma, null);
+    }
+
+    /// Stage 3 — latent → pixels on the resident VAE: denormalize, then decode
+    /// through the adaptive whole-image → GPU-tiled → CPU-tiled ladder (see
+    /// `VaeDecode`), then interleave to RGB8. `latent` is `[16][lat_h][lat_w]`
+    /// planar and is NOT modified. The image comes back at `lat_w*8 x lat_h*8`.
+    pub fn decode(
+        self: *Session,
+        latent: []const f32,
+        lat_h: usize,
+        lat_w: usize,
+        o: DecodeOptions,
+        progress: ?*std.Io.Writer,
+    ) !Image {
+        const gpa = self.gpa;
+        const io = self.io;
+        if (latent.len != wan_vae.latent_channels * lat_h * lat_w) return error.LatentSizeMismatch;
+
+        // Device allocations here (VAE weights + decode scratch) are tagged VAE.
+        // NO evictWeights — the DiT stays resident for the next queued image;
+        // under a tight budget the backend's LRU cache streams the overflow
+        // reactively.
+        self.setMemTag(.vae);
+
+        // Denormalize onto a copy rather than in place: `generate` is done with
+        // its latent by now, but a caller driving the stages itself may not be,
+        // and silently rescaling their buffer would be a trap. ~2 MB at 1120x1680.
+        const x = try gpa.dupe(f32, latent);
+        defer gpa.free(x);
+        {
+            const plane = lat_h * lat_w;
+            for (0..wan_vae.latent_channels) |c| {
+                for (x[c * plane ..][0..plane]) |*val| {
+                    val.* = val.* * wan_vae.latents_std[c] + wan_vae.latents_mean[c];
+                }
+            }
+        }
+        try note(progress, "decoding latent...\n", .{});
+        const dec_start = std.Io.Clock.real.now(io);
+        const vae = &self.vae;
+        // The whole-image decode is fastest and seamless, but its peak VRAM — in
+        // particular the O(seq²) mid-block attention scores plane — grows with
+        // image area and OOMs on large images. When it won't fit we decode in
+        // overlapping tiles (bounded footprint, feather-blended seams) on the GPU
+        // rather than crawling on the CPU; only if even a tile can't fit do we
+        // drop to a CPU tiled decode. See models/vae_tiled.zig.
+        const tp: vae_tiled.Params = .{};
+        // Decode-path override (o.vae_decode). `force_cpu` short-circuits every
+        // backend to CPU tiling; `skip_whole` starts at GPU tiling (no whole-image
+        // attempt). `auto`/`whole` leave both false — whole-image is already the
+        // first attempt, so the two behave identically.
+        const force_cpu = o.vae_decode == .cpu_tiled;
+        const skip_whole = o.vae_decode == .gpu_tiled or o.vae_decode == .cpu_tiled;
+        const planar = if (force_cpu) planar_blk: {
+            try note(progress, "vae decode: tiling on CPU (forced)\n", .{});
+            const saved = ops.matmul.gpu_dispatch;
+            ops.matmul.gpu_dispatch = null;
+            defer ops.matmul.gpu_dispatch = saved;
+            break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae, .cancel = o.cancel }, CpuTile.call);
+        } else if (self.cu_be) |b| planar_blk: {
+            // Attempt ladder — whole-image (fastest, seamless) → GPU tiling
+            // (bounded footprint) → CPU (guaranteed). Before EACH GPU retry free
+            // JUST ENOUGH VRAM and try again, keeping the rest resident so we
+            // reload as little as possible: drop LRU weights from THIS backend's
+            // own cache first (the DiT — dead for the rest of this image,
+            // re-streams next image), and only when that can't cover the deficit
+            // reach into the chat LLM's context. The freed amount escalates so a
+            // big deficit converges in a few retries. OOM can arrive as
+            // DeviceOutOfMemory OR as a cuBLASLt/cuDNN out-of-workspace error
+            // (see recoverableDecodeErr). (skip_whole jumps straight to tiling.)
+            try note(progress, "vae decode: mode={s} pinned={d}MB streamed={d}MB free={d}MB\n", .{
+                @tagName(o.vae_decode), b.pinnedWeightBytes() >> 20, b.evictableWeightBytes() >> 20, b.ctx.memGetInfo().free >> 20,
+            });
+            var want: u64 = reclaim_chunk;
+            // Free ~`wnt` bytes across this backend's own cache (LRU incl. the
+            // now-dead DiT) then the chat LLM, log it, and report the total freed
+            // (0 ⇒ nothing left to free).
+            const freeSome = struct {
+                fn call(bk: *cuda.Backend, reclaim: ?Reclaim, w: ?*std.Io.Writer, cio: std.Io, wnt: u64) !u64 {
+                    const t0 = std.Io.Clock.real.now(cio).nanoseconds;
+                    bk.bindThread();
+                    const from_self = bk.evictToFree(wnt);
+                    var got = from_self;
+                    if (got < wnt) if (reclaim) |r| {
+                        got += r.call(r.ctx, wnt - got);
+                        bk.bindThread(); // reclaim may have switched the context
+                    };
+                    const ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(cio).nanoseconds - t0)) / 1e6;
+                    try note(w, "vae decode: freed {d}MB (own {d}MB + llm {d}MB) of {d}MB wanted in {d:.0}ms\n", .{
+                        got >> 20, from_self >> 20, (got - from_self) >> 20, wnt >> 20, ms,
+                    });
+                    return got;
+                }
+            }.call;
+            // PROACTIVE pre-free: estimate the first attempt's peak activation VRAM
+            // and free up front so we hit free ≥ 110% of it — avoids burning full
+            // failed decodes just to discover the deficit (the reactive loops below
+            // still catch any shortfall, since the estimate can't see the opaque
+            // cuBLASLt/cuDNN conv workspace). Tiled decode's first attempt is one
+            // tile, so estimate at the tile size when skip_whole.
+            {
+                const est = if (skip_whole) vae.estimatePeakBytes(tp.tile, tp.tile) else vae.estimatePeakBytes(lat_h, lat_w);
+                const target = est + est / 10; // 110%
+                const free_now = b.ctx.memGetInfo().free;
+                try note(progress, "vae decode: est peak {d}MB, want free ≥ {d}MB (have {d}MB)\n", .{ est >> 20, target >> 20, free_now >> 20 });
+                if (free_now < target) _ = try freeSome(b, o.reclaim, progress, io, target - free_now);
+            }
+            // Phase 1: whole-image with incremental eviction.
+            if (!skip_whole) {
+                var round: usize = 0;
+                while (round < max_reclaim_rounds) : (round += 1) {
+                    if (vae_cuda.decode(vae, b, io, gpa, x, lat_h, lat_w, o.cancel)) |p| {
+                        break :planar_blk p;
+                    } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: whole-image OOM ({t}) → freeing VRAM\n", .{err});
+                    if (try freeSome(b, o.reclaim, progress, io, want) == 0) break; // nothing left → tile
+                    want *|= 2;
+                }
+            }
+            // Phase 2: GPU tiling (bounded) with the same incremental eviction —
+            // after the DiT is evicted a tile easily fits, and it's far faster
+            // than the CPU floor below.
+            {
+                var round: usize = 0;
+                while (round < max_reclaim_rounds) : (round += 1) {
+                    try note(progress, "vae decode: tiling on GPU ({d}² latent tiles)\n", .{tp.tile});
+                    const ct = CudaTile{ .vae = vae, .be = b, .cancel = o.cancel };
+                    if (vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, ct, CudaTile.call)) |p| {
+                        break :planar_blk p;
+                    } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: GPU tiling OOM ({t}) → freeing VRAM\n", .{err});
+                    if (try freeSome(b, o.reclaim, progress, io, want) == 0) break; // nothing left → CPU
+                    want *|= 2;
+                }
+            }
+            // Phase 3: CPU tiling — the guaranteed VRAM-can't-OOM floor (slow).
+            try note(progress, "vae decode: GPU out of VRAM → CPU tiled decode (slow)\n", .{});
+            const saved = ops.matmul.gpu_dispatch;
+            ops.matmul.gpu_dispatch = null;
+            defer ops.matmul.gpu_dispatch = saved;
+            break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae, .cancel = o.cancel }, CpuTile.call);
+        } else if (self.gpu_ctx) |gc| planar_blk: {
+            // Whole-image decode first. The Vulkan mid-block attention is now
+            // query-tiled (flash), so this OOMs only when the conv activation
+            // buffers don't fit. On OOM free JUST ENOUGH VRAM and retry, keeping
+            // the rest resident: each round drops LRU weights from this context's
+            // own cache first (the DiT), and only when that can't cover it
+            // reaches into the chat LLM's context. The freed amount escalates so
+            // a large deficit converges fast. If nothing more can be freed, tile
+            // on the GPU; if even a tile won't fit, decode on the CPU.
+            // (skip_whole jumps straight to tiling.)
+            try note(progress, "vae decode: mode={s} free={d}MB\n", .{ @tagName(o.vae_decode), gc.liveVram() >> 20 });
+            {
+                // Proactive pre-free to ~110% of the estimated first-attempt peak,
+                // so we don't burn a full failed decode just to find the deficit.
+                const est = if (skip_whole) vae.estimatePeakBytes(tp.tile, tp.tile) else vae.estimatePeakBytes(lat_h, lat_w);
+                const target = est + est / 10;
+                const free_now = gc.liveVram();
+                try note(progress, "vae decode: est peak {d}MB, want free >= {d}MB (have {d}MB)\n", .{ est >> 20, target >> 20, free_now >> 20 });
+                if (free_now < target) {
+                    _ = gc.evictToFree(target - free_now);
+                    if (o.reclaim) |r| _ = r.call(r.ctx, target -| gc.liveVram());
+                }
+            }
+            if (!skip_whole) {
+                var want: u64 = reclaim_chunk;
+                var round: usize = 0;
+                while (round < max_reclaim_rounds) : (round += 1) {
+                    if (vae_gpu.decode(vae, gc, io, gpa, x, lat_h, lat_w, o.cancel)) |p| {
+                        break :planar_blk p;
+                    } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: whole-image OOM ({t}) -> freeing VRAM\n", .{err});
+                    const t0 = std.Io.Clock.real.now(io).nanoseconds;
+                    const from_self = gc.evictToFree(want); // own resident weights first
+                    var got = from_self;
+                    if (got < want) if (o.reclaim) |r| {
+                        got += r.call(r.ctx, want - got); // then the chat LLM
+                    };
+                    const ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0)) / 1e6;
+                    try note(progress, "vae decode: freed {d}MB (own {d}MB + llm {d}MB) of {d}MB wanted in {d:.0}ms\n", .{ got >> 20, from_self >> 20, (got - from_self) >> 20, want >> 20, ms });
+                    if (got == 0) break; // nothing left to free → tile
+                    want *|= 2; // escalate so a big deficit converges fast
+                }
+            }
+            // Phase 2: GPU tiling (bounded) with the same incremental eviction.
+            {
+                var wt: u64 = reclaim_chunk;
+                var round: usize = 0;
+                while (round < max_reclaim_rounds) : (round += 1) {
+                    try note(progress, "vae decode: tiling on GPU ({d}^2 latent tiles)\n", .{tp.tile});
+                    const vt = VkTile{ .vae = vae, .gc = gc, .cancel = o.cancel };
+                    if (vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, vt, VkTile.call)) |p| {
+                        break :planar_blk p;
+                    } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: GPU tiling OOM ({t}) -> freeing VRAM\n", .{err});
+                    const t0 = std.Io.Clock.real.now(io).nanoseconds;
+                    const from_self = gc.evictToFree(wt);
+                    var got = from_self;
+                    if (got < wt) if (o.reclaim) |r| {
+                        got += r.call(r.ctx, wt - got);
+                    };
+                    const ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0)) / 1e6;
+                    try note(progress, "vae decode: freed {d}MB (own {d}MB + llm {d}MB) for tiling in {d:.0}ms\n", .{ got >> 20, from_self >> 20, (got - from_self) >> 20, ms });
+                    if (got == 0) break; // nothing left → CPU
+                    wt *|= 2;
+                }
+            }
+            // Phase 3: CPU tiling — the guaranteed VRAM-can't-OOM floor (slow).
+            try note(progress, "vae decode: GPU out of VRAM -> CPU tiled decode (slow)\n", .{});
+            const saved = ops.matmul.gpu_dispatch;
+            ops.matmul.gpu_dispatch = null;
+            defer ops.matmul.gpu_dispatch = saved;
+            break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae, .cancel = o.cancel }, CpuTile.call);
+        } else planar_blk: {
+            // CPU-only: tile once the whole-image scores plane (f32) gets large,
+            // so a big image doesn't try to allocate tens of GB of host RAM.
+            // (skip_whole — e.g. gpu_tiled with no GPU — forces tiling.)
+            if (!skip_whole and attnPlaneBytes(lat_h, lat_w, 4) < (1 << 30))
+                break :planar_blk try vae.decode(io, gpa, x, lat_h, lat_w, o.cancel);
+            try note(progress, "vae decode: tiling on CPU\n", .{});
+            break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae, .cancel = o.cancel }, CpuTile.call);
+        };
+        defer gpa.free(planar);
+        try note(progress, "decoded in {d:.1}s\n", .{@as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - dec_start.nanoseconds)) / 1e9});
+
+        const width = lat_w * 8;
+        const height = lat_h * 8;
+        return .{ .rgb = try image.planarF32ToRgb8(gpa, planar, width, height), .width = width, .height = height };
+    }
+
     pub fn generate(self: *Session, opts: Options, progress: ?*std.Io.Writer) !Image {
         const gpa = self.gpa;
         const io = self.io;
@@ -576,17 +1093,13 @@ pub const Session = struct {
         // across queued images while the encoder/VAE cycle in the leftover.
         if (cu_be) |b| b.pin_budget = 0;
 
-        // Stage 1: text encoding (reusing the resident encoder). Tag its device
-        // allocations (encoder weights + encode scratch) as TE for the meter.
-        self.setMemTag(.te);
+        // Stage 1: text encoding (reusing the resident encoder).
         const enc_start = std.Io.Clock.real.now(io);
-        const cond_pos = try encodePrompt(io, gpa, gpu_ctx, cu_be, opts.encoder_f16, &self.tok, &self.enc, opts.prompt, opts.cancel);
-        defer gpa.free(cond_pos.data);
-        const cond_neg: ?Cond = if (use_cfg)
-            try encodePrompt(io, gpa, gpu_ctx, cu_be, opts.encoder_f16, &self.tok, &self.enc, opts.negative, opts.cancel)
-        else
-            null;
-        defer if (cond_neg) |c| gpa.free(c.data);
+        const enc_opts: EncodeOptions = .{ .encoder_f16 = opts.encoder_f16, .cancel = opts.cancel };
+        var cond_pos = try self.encode(gpa, opts.prompt, enc_opts);
+        defer cond_pos.deinit(gpa);
+        var cond_neg: ?Cond = if (use_cfg) try self.encode(gpa, opts.negative, enc_opts) else null;
+        defer if (cond_neg) |*c| c.deinit(gpa);
         try note(progress, "encoded prompt ({d} tokens{s}) in {d:.1}s\n", .{
             cond_pos.seq,                                                                                 if (use_cfg) " + negative" else "",
             @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - enc_start.nanoseconds)) / 1e9,
@@ -640,7 +1153,7 @@ pub const Session = struct {
             // + activation reserve don't fit in the live free VRAM with the encoder
             // still resident (room already counts the encoder as reclaimable, so
             // the test reduces to dit + reserve > free_now).
-            const dit_bytes = self.dit_st.payload.len;
+            const dit_bytes = self.dit_st.payloadLen();
             if (dit_bytes + pin_reserve > free_now) {
                 // evictUnpinned (NOT evictWeights): keep a DiT pinned by a previous
                 // queued image, drop only the (unpinned) encoder + any stray stream.
@@ -666,52 +1179,19 @@ pub const Session = struct {
             if (r.latent.len == x.len) @memcpy(x, r.latent) else sampler.fillNoise(x, opts.seed);
         } else sampler.fillNoise(x, opts.seed);
 
-        const sigmas = try sampler.simpleSchedule(gpa, opts.steps, opts.shift);
+        const sigmas = try schedule(gpa, opts.steps, opts.shift);
         defer gpa.free(sigmas);
 
         {
-            const dit = &self.dit;
             const v = try gpa.alloc(f32, lat_len);
             defer gpa.free(v);
-            const v_neg = if (use_cfg) try gpa.alloc(f32, lat_len) else null;
-            defer if (v_neg) |b| gpa.free(b);
 
-            // Per-image GPU session: text fusion, rope table, timestep vectors
-            // computed + uploaded once per image (they depend on the prompt +
-            // resolution). The DiT WEIGHTS stay cached in the backend across images.
-            // These per-image buffers (session + activation workspace) are the
-            // meter's "latent / working" segment — tag them so it's MEASURED, not
-            // a remainder.
-            self.setMemTag(.latent);
-            var sess_pos: ?dit_gpu.Session = null;
-            defer if (sess_pos) |*sp| sp.deinit(gpa, gpu_ctx.?);
-            var sess_neg: ?dit_gpu.Session = null;
-            defer if (sess_neg) |*sn| sn.deinit(gpa, gpu_ctx.?);
-            var ws: ?dit_gpu.Workspace = null;
-            defer if (ws) |*w| w.deinit(gpu_ctx.?);
-            if (cu_be == null) if (gpu_ctx) |gc| {
-                sess_pos = try dit_gpu.Session.init(gpa, io, gc, dit, lat_h, lat_w, cond_pos.data, cond_pos.seq, sigmas);
-                if (use_cfg) {
-                    sess_neg = try dit_gpu.Session.init(gpa, io, gc, dit, lat_h, lat_w, cond_neg.?.data, cond_neg.?.seq, sigmas);
-                }
-                const seq_txt_cap = @max(cond_pos.seq, if (cond_neg) |c| c.seq else 0);
-                ws = try dit_gpu.Workspace.init(gc, lat_h, lat_w, seq_txt_cap);
-            };
-            var cu_pos: ?dit_cuda.Session = null;
-            defer if (cu_pos) |*s| s.deinit(cu_be.?);
-            var cu_neg: ?dit_cuda.Session = null;
-            defer if (cu_neg) |*s| s.deinit(cu_be.?);
-            var cu_ws: ?dit_cuda.Workspace = null;
-            defer if (cu_ws) |*w| w.deinit(cu_be.?);
-            if (cu_be) |b| {
-                cu_pos = try dit_cuda.Session.init(gpa, io, b, dit, lat_h, lat_w, cond_pos.data, cond_pos.seq);
-                if (use_cfg) cu_neg = try dit_cuda.Session.init(gpa, io, b, dit, lat_h, lat_w, cond_neg.?.data, cond_neg.?.seq);
-                const cu_seq_cap = @max(cond_pos.seq, if (cond_neg) |c| c.seq else 0);
-                cu_ws = try dit_cuda.Workspace.init(b, lat_h, lat_w, cu_seq_cap);
-            }
-            // Back to DiT for the sampling loop: lazily streamed DiT weights and
-            // per-step attention scratch belong to the DiT segment.
-            self.setMemTag(.dit);
+            // The per-image denoiser: text fusion, rope table, timestep vectors and
+            // activation workspace, built once here (they depend on the prompt +
+            // resolution) and reused every step. The DiT WEIGHTS stay cached in the
+            // backend across images, independently of this.
+            var den = try self.denoiser(gpa, cond_pos, cond_neg, opts.cfg, lat_h, lat_w, sigmas);
+            defer den.deinit(gpa);
 
             // A preview can be produced this run when there's a step hook AND
             // either the static preview is on OR a live control is attached (which
@@ -785,21 +1265,7 @@ pub const Session = struct {
                     },
                 };
                 const start = std.Io.Clock.real.now(io);
-                if (cu_be) |b| {
-                    try dit_cuda.forward(dit, b, &cu_pos.?, &cu_ws.?, io, gpa, v, x, sigmas[i], opts.cancel);
-                } else if (gpu_ctx) |gc| {
-                    try dit_gpu.forward(dit, gc, &sess_pos.?, &ws.?, io, gpa, v, x, sigmas[i], opts.cancel);
-                } else {
-                    try dit.forward(io, gpa, v, x, lat_h, lat_w, sigmas[i], cond_pos.data, cond_pos.seq, opts.cancel);
-                }
-                if (use_cfg) {
-                    if (cu_be) |b| {
-                        try dit_cuda.forward(dit, b, &cu_neg.?, &cu_ws.?, io, gpa, v_neg.?, x, sigmas[i], opts.cancel);
-                    } else if (gpu_ctx) |gc| {
-                        try dit_gpu.forward(dit, gc, &sess_neg.?, &ws.?, io, gpa, v_neg.?, x, sigmas[i], opts.cancel);
-                    } else try dit.forward(io, gpa, v_neg.?, x, lat_h, lat_w, sigmas[i], cond_neg.?.data, cond_neg.?.seq, opts.cancel);
-                    sampler.applyCfg(v, v_neg.?, opts.cfg);
-                }
+                try den.predict(gpa, v, x, sigmas[i], opts.cancel);
                 sampler.eulerStep(x, v, sigmas[i], sigmas[i + 1]);
                 const ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - start.nanoseconds)) / 1e6;
                 try note(progress, "step {d}/{d}  sigma {d:.3} -> {d:.3}  ({d:.1}s)\n", .{ i + 1, opts.steps, sigmas[i], sigmas[i + 1], ms / 1000.0 });
@@ -873,207 +1339,14 @@ pub const Session = struct {
 
         if (opts.cancel) |c| if (c.load(.acquire)) return error.Canceled;
 
-        // Stage 3: denormalize and decode (reusing the resident VAE). Tag its
-        // device allocations (VAE weights + decode scratch) as VAE.
-        self.setMemTag(.vae);
-        // Stage 3: denormalize and decode (reusing the resident VAE). NO
-        // evictWeights — the DiT stays resident for the next queued image; under
-        // a tight budget the backend's LRU cache streams the overflow reactively.
-        {
-            const plane = lat_h * lat_w;
-            for (0..wan_vae.latent_channels) |c| {
-                for (x[c * plane ..][0..plane]) |*val| {
-                    val.* = val.* * wan_vae.latents_std[c] + wan_vae.latents_mean[c];
-                }
-            }
-        }
-        try note(progress, "decoding latent...\n", .{});
-        const dec_start = std.Io.Clock.real.now(io);
-        const vae = &self.vae;
-        // The whole-image decode is fastest and seamless, but its peak VRAM — in
-        // particular the O(seq²) mid-block attention scores plane — grows with
-        // image area and OOMs on large images. When it won't fit we decode in
-        // overlapping tiles (bounded footprint, feather-blended seams) on the GPU
-        // rather than crawling on the CPU; only if even a tile can't fit do we
-        // drop to a CPU tiled decode. See models/vae_tiled.zig.
-        const tp: vae_tiled.Params = .{};
-        // Decode-path override (opts.vae_decode). `force_cpu` short-circuits every
-        // backend to CPU tiling; `skip_whole` starts at GPU tiling (no whole-image
-        // attempt). `auto`/`whole` leave both false — whole-image is already the
-        // first attempt, so the two behave identically.
-        const force_cpu = opts.vae_decode == .cpu_tiled;
-        const skip_whole = opts.vae_decode == .gpu_tiled or opts.vae_decode == .cpu_tiled;
-        const planar = if (force_cpu) planar_blk: {
-            try note(progress, "vae decode: tiling on CPU (forced)\n", .{});
-            const saved = ops.matmul.gpu_dispatch;
-            ops.matmul.gpu_dispatch = null;
-            defer ops.matmul.gpu_dispatch = saved;
-            break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae, .cancel = opts.cancel }, CpuTile.call);
-        } else if (cu_be) |b| planar_blk: {
-            // Attempt ladder — whole-image (fastest, seamless) → GPU tiling
-            // (bounded footprint) → CPU (guaranteed). Before EACH GPU retry free
-            // JUST ENOUGH VRAM and try again, keeping the rest resident so we
-            // reload as little as possible: drop LRU weights from THIS backend's
-            // own cache first (the DiT — dead for the rest of this image,
-            // re-streams next image), and only when that can't cover the deficit
-            // reach into the chat LLM's context. The freed amount escalates so a
-            // big deficit converges in a few retries. OOM can arrive as
-            // DeviceOutOfMemory OR as a cuBLASLt/cuDNN out-of-workspace error
-            // (see recoverableDecodeErr). (skip_whole jumps straight to tiling.)
-            try note(progress, "vae decode: mode={s} pinned={d}MB streamed={d}MB free={d}MB\n", .{
-                @tagName(opts.vae_decode), b.pinnedWeightBytes() >> 20, b.evictableWeightBytes() >> 20, b.ctx.memGetInfo().free >> 20,
-            });
-            var want: u64 = reclaim_chunk;
-            // Free ~`wnt` bytes across this backend's own cache (LRU incl. the
-            // now-dead DiT) then the chat LLM, log it, and report the total freed
-            // (0 ⇒ nothing left to free).
-            const freeSome = struct {
-                fn call(bk: *cuda.Backend, reclaim: ?Reclaim, w: ?*std.Io.Writer, cio: std.Io, wnt: u64) !u64 {
-                    const t0 = std.Io.Clock.real.now(cio).nanoseconds;
-                    bk.bindThread();
-                    const from_self = bk.evictToFree(wnt);
-                    var got = from_self;
-                    if (got < wnt) if (reclaim) |r| {
-                        got += r.call(r.ctx, wnt - got);
-                        bk.bindThread(); // reclaim may have switched the context
-                    };
-                    const ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(cio).nanoseconds - t0)) / 1e6;
-                    try note(w, "vae decode: freed {d}MB (own {d}MB + llm {d}MB) of {d}MB wanted in {d:.0}ms\n", .{
-                        got >> 20, from_self >> 20, (got - from_self) >> 20, wnt >> 20, ms,
-                    });
-                    return got;
-                }
-            }.call;
-            // PROACTIVE pre-free: estimate the first attempt's peak activation VRAM
-            // and free up front so we hit free ≥ 110% of it — avoids burning full
-            // failed decodes just to discover the deficit (the reactive loops below
-            // still catch any shortfall, since the estimate can't see the opaque
-            // cuBLASLt/cuDNN conv workspace). Tiled decode's first attempt is one
-            // tile, so estimate at the tile size when skip_whole.
-            {
-                const est = if (skip_whole) vae.estimatePeakBytes(tp.tile, tp.tile) else vae.estimatePeakBytes(lat_h, lat_w);
-                const target = est + est / 10; // 110%
-                const free_now = b.ctx.memGetInfo().free;
-                try note(progress, "vae decode: est peak {d}MB, want free ≥ {d}MB (have {d}MB)\n", .{ est >> 20, target >> 20, free_now >> 20 });
-                if (free_now < target) _ = try freeSome(b, opts.reclaim, progress, io, target - free_now);
-            }
-            // Phase 1: whole-image with incremental eviction.
-            if (!skip_whole) {
-                var round: usize = 0;
-                while (round < max_reclaim_rounds) : (round += 1) {
-                    if (vae_cuda.decode(vae, b, io, gpa, x, lat_h, lat_w, opts.cancel)) |p| {
-                        break :planar_blk p;
-                    } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: whole-image OOM ({t}) → freeing VRAM\n", .{err});
-                    if (try freeSome(b, opts.reclaim, progress, io, want) == 0) break; // nothing left → tile
-                    want *|= 2;
-                }
-            }
-            // Phase 2: GPU tiling (bounded) with the same incremental eviction —
-            // after the DiT is evicted a tile easily fits, and it's far faster
-            // than the CPU floor below.
-            {
-                var round: usize = 0;
-                while (round < max_reclaim_rounds) : (round += 1) {
-                    try note(progress, "vae decode: tiling on GPU ({d}² latent tiles)\n", .{tp.tile});
-                    const ct = CudaTile{ .vae = vae, .be = b, .cancel = opts.cancel };
-                    if (vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, ct, CudaTile.call)) |p| {
-                        break :planar_blk p;
-                    } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: GPU tiling OOM ({t}) → freeing VRAM\n", .{err});
-                    if (try freeSome(b, opts.reclaim, progress, io, want) == 0) break; // nothing left → CPU
-                    want *|= 2;
-                }
-            }
-            // Phase 3: CPU tiling — the guaranteed VRAM-can't-OOM floor (slow).
-            try note(progress, "vae decode: GPU out of VRAM → CPU tiled decode (slow)\n", .{});
-            const saved = ops.matmul.gpu_dispatch;
-            ops.matmul.gpu_dispatch = null;
-            defer ops.matmul.gpu_dispatch = saved;
-            break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae, .cancel = opts.cancel }, CpuTile.call);
-        } else if (gpu_ctx) |gc| planar_blk: {
-            // Whole-image decode first. The Vulkan mid-block attention is now
-            // query-tiled (flash), so this OOMs only when the conv activation
-            // buffers don't fit. On OOM free JUST ENOUGH VRAM and retry, keeping
-            // the rest resident: each round drops LRU weights from this context's
-            // own cache first (the DiT), and only when that can't cover it
-            // reaches into the chat LLM's context. The freed amount escalates so
-            // a large deficit converges fast. If nothing more can be freed, tile
-            // on the GPU; if even a tile won't fit, decode on the CPU.
-            // (skip_whole jumps straight to tiling.)
-            try note(progress, "vae decode: mode={s} free={d}MB\n", .{ @tagName(opts.vae_decode), gc.liveVram() >> 20 });
-            {
-                // Proactive pre-free to ~110% of the estimated first-attempt peak,
-                // so we don't burn a full failed decode just to find the deficit.
-                const est = if (skip_whole) vae.estimatePeakBytes(tp.tile, tp.tile) else vae.estimatePeakBytes(lat_h, lat_w);
-                const target = est + est / 10;
-                const free_now = gc.liveVram();
-                try note(progress, "vae decode: est peak {d}MB, want free >= {d}MB (have {d}MB)\n", .{ est >> 20, target >> 20, free_now >> 20 });
-                if (free_now < target) {
-                    _ = gc.evictToFree(target - free_now);
-                    if (opts.reclaim) |r| _ = r.call(r.ctx, target -| gc.liveVram());
-                }
-            }
-            if (!skip_whole) {
-                var want: u64 = reclaim_chunk;
-                var round: usize = 0;
-                while (round < max_reclaim_rounds) : (round += 1) {
-                    if (vae_gpu.decode(vae, gc, io, gpa, x, lat_h, lat_w, opts.cancel)) |p| {
-                        break :planar_blk p;
-                    } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: whole-image OOM ({t}) -> freeing VRAM\n", .{err});
-                    const t0 = std.Io.Clock.real.now(io).nanoseconds;
-                    const from_self = gc.evictToFree(want); // own resident weights first
-                    var got = from_self;
-                    if (got < want) if (opts.reclaim) |r| {
-                        got += r.call(r.ctx, want - got); // then the chat LLM
-                    };
-                    const ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0)) / 1e6;
-                    try note(progress, "vae decode: freed {d}MB (own {d}MB + llm {d}MB) of {d}MB wanted in {d:.0}ms\n", .{ got >> 20, from_self >> 20, (got - from_self) >> 20, want >> 20, ms });
-                    if (got == 0) break; // nothing left to free → tile
-                    want *|= 2; // escalate so a big deficit converges fast
-                }
-            }
-            // Phase 2: GPU tiling (bounded) with the same incremental eviction.
-            {
-                var wt: u64 = reclaim_chunk;
-                var round: usize = 0;
-                while (round < max_reclaim_rounds) : (round += 1) {
-                    try note(progress, "vae decode: tiling on GPU ({d}^2 latent tiles)\n", .{tp.tile});
-                    const vt = VkTile{ .vae = vae, .gc = gc, .cancel = opts.cancel };
-                    if (vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, vt, VkTile.call)) |p| {
-                        break :planar_blk p;
-                    } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: GPU tiling OOM ({t}) -> freeing VRAM\n", .{err});
-                    const t0 = std.Io.Clock.real.now(io).nanoseconds;
-                    const from_self = gc.evictToFree(wt);
-                    var got = from_self;
-                    if (got < wt) if (opts.reclaim) |r| {
-                        got += r.call(r.ctx, wt - got);
-                    };
-                    const ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0)) / 1e6;
-                    try note(progress, "vae decode: freed {d}MB (own {d}MB + llm {d}MB) for tiling in {d:.0}ms\n", .{ got >> 20, from_self >> 20, (got - from_self) >> 20, ms });
-                    if (got == 0) break; // nothing left → CPU
-                    wt *|= 2;
-                }
-            }
-            // Phase 3: CPU tiling — the guaranteed VRAM-can't-OOM floor (slow).
-            try note(progress, "vae decode: GPU out of VRAM -> CPU tiled decode (slow)\n", .{});
-            const saved = ops.matmul.gpu_dispatch;
-            ops.matmul.gpu_dispatch = null;
-            defer ops.matmul.gpu_dispatch = saved;
-            break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae, .cancel = opts.cancel }, CpuTile.call);
-        } else planar_blk: {
-            // CPU-only: tile once the whole-image scores plane (f32) gets large,
-            // so a big image doesn't try to allocate tens of GB of host RAM.
-            // (skip_whole — e.g. gpu_tiled with no GPU — forces tiling.)
-            if (!skip_whole and attnPlaneBytes(lat_h, lat_w, 4) < (1 << 30))
-                break :planar_blk try vae.decode(io, gpa, x, lat_h, lat_w, opts.cancel);
-            try note(progress, "vae decode: tiling on CPU\n", .{});
-            break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae, .cancel = opts.cancel }, CpuTile.call);
-        };
-        defer gpa.free(planar);
-        try note(progress, "decoded in {d:.1}s\n", .{@as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - dec_start.nanoseconds)) / 1e9});
-
-        const rgb = try image.planarF32ToRgb8(gpa, planar, opts.width, opts.height);
+        var img = try self.decode(x, lat_h, lat_w, .{
+            .vae_decode = opts.vae_decode,
+            .cancel = opts.cancel,
+            .reclaim = opts.reclaim,
+        }, progress);
+        errdefer img.deinit(gpa);
         try note(progress, "total time {d:.1}s\n", .{@as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - total_start.nanoseconds)) / 1e9});
-        return .{ .rgb = rgb, .width = opts.width, .height = opts.height };
+        return img;
     }
 };
 
@@ -1188,4 +1461,170 @@ test "recoverableDecodeErr classifies VAE-decode fallbacks" {
     // silent CPU fallback.
     try std.testing.expect(!recoverableDecodeErr(error.Canceled));
     try std.testing.expect(!recoverableDecodeErr(error.SizeNotMultipleOf16));
+}
+
+const test_gate = @import("tp_models").test_gate;
+
+/// The checkpoints the composed-stages test needs. Defaults, so a machine with
+/// the standard `models/` layout runs it and any other self-skips.
+const test_paths = struct {
+    const dit = "models/diffusion_model/krea2CenterSemiraw_v10Fp8.safetensors";
+    const te = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    const vae = "models/vae/krea2RealVae_v10.safetensors";
+};
+
+test "generate composed from the public stages is bit-identical to Session.generate" {
+    // The acceptance test for the stage split: `encode` / `schedule` / `denoiser`
+    // + `predict` / `decode` must be able to reproduce `generate` exactly, or they
+    // are not the same computation and a caller driving them (level 2, img2img, a
+    // custom sampler) is measuring something else.
+    //
+    // Small and CPU: 128² is 64 DiT tokens, and the CPU path is the one the
+    // measurement harnesses anchor on.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    inline for (.{ test_paths.dit, test_paths.te, test_paths.vae }) |p| try test_gate.requireModelFile(io, p);
+
+    const opts: Options = .{
+        .prompt = "a copper teapot on a windowsill",
+        .width = 128,
+        .height = 128,
+        .steps = 2,
+        .cfg = 1.0,
+        .seed = 4242,
+        .backend = .cpu,
+        .dit_path = test_paths.dit,
+        .text_encoder_path = test_paths.te,
+        .vae_path = test_paths.vae,
+    };
+    const lat_h = opts.height / 8;
+    const lat_w = opts.width / 8;
+    const lat_len = wan_vae.latent_channels * lat_h * lat_w;
+
+    var sess = try Session.init(io, gpa, opts, null);
+    defer sess.deinit();
+
+    var whole = try sess.generate(opts, null);
+    defer whole.deinit(gpa);
+
+    // The same image, driven stage by stage — this is the reference usage.
+    var cond = try sess.encode(gpa, opts.prompt, .{ .encoder_f16 = opts.encoder_f16 });
+    defer cond.deinit(gpa);
+
+    const sigmas = try schedule(gpa, opts.steps, opts.shift);
+    defer gpa.free(sigmas);
+    try std.testing.expectEqual(opts.steps + 1, sigmas.len);
+
+    const x = try gpa.alloc(f32, lat_len);
+    defer gpa.free(x);
+    sampler.fillNoise(x, opts.seed);
+
+    const v = try gpa.alloc(f32, lat_len);
+    defer gpa.free(v);
+
+    var den = try sess.denoiser(gpa, cond, null, opts.cfg, lat_h, lat_w, sigmas);
+    defer den.deinit(gpa);
+
+    // The one-shot `Session.predict` — level 2's primitive — must agree with the
+    // loop's own first forward. If it does not, every level-2 number describes a
+    // model nobody renders with.
+    const v_oneshot = try gpa.alloc(f32, lat_len);
+    defer gpa.free(v_oneshot);
+    try sess.predict(gpa, v_oneshot, x, lat_h, lat_w, sigmas[0], cond);
+
+    for (0..opts.steps) |i| {
+        try den.predict(gpa, v, x, sigmas[i], null);
+        if (i == 0) try std.testing.expectEqualSlices(f32, v, v_oneshot);
+        sampler.eulerStep(x, v, sigmas[i], sigmas[i + 1]);
+    }
+
+    var staged = try sess.decode(x, lat_h, lat_w, .{}, null);
+    defer staged.deinit(gpa);
+
+    try std.testing.expectEqual(whole.width, staged.width);
+    try std.testing.expectEqual(whole.height, staged.height);
+    try std.testing.expectEqualSlices(u8, whole.rgb, staged.rgb);
+}
+
+test "decode does not modify the caller's latent" {
+    // `generate` is finished with its latent when it decodes, so denormalizing in
+    // place was safe there; a caller holding the latent for a drift curve is not,
+    // and a silent rescale would corrupt every subsequent step.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    inline for (.{ test_paths.dit, test_paths.te, test_paths.vae }) |p| try test_gate.requireModelFile(io, p);
+
+    const opts: Options = .{
+        .prompt = "x",
+        .width = 128,
+        .height = 128,
+        .backend = .cpu,
+        .dit_path = test_paths.dit,
+        .text_encoder_path = test_paths.te,
+        .vae_path = test_paths.vae,
+    };
+    var sess = try Session.init(io, gpa, opts, null);
+    defer sess.deinit();
+
+    const lat_h = opts.height / 8;
+    const lat_w = opts.width / 8;
+    const x = try gpa.alloc(f32, wan_vae.latent_channels * lat_h * lat_w);
+    defer gpa.free(x);
+    sampler.fillNoise(x, 7);
+    const before = try gpa.dupe(f32, x);
+    defer gpa.free(before);
+
+    var img = try sess.decode(x, lat_h, lat_w, .{}, null);
+    defer img.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 128), img.width);
+    try std.testing.expectEqualSlices(f32, before, x);
+}
+
+test "a CFG denoiser needs a negative conditioning" {
+    // The two go together; accepting cfg != 1 with no negative cond would
+    // dereference null inside the sampling loop.
+    const gpa = std.testing.allocator;
+    var sess: Session = undefined;
+    sess.gpa = gpa;
+    sess.gpu_ctx = null;
+    sess.cu_be = null;
+    try std.testing.expectError(
+        error.CfgNeedsNegativeCond,
+        sess.denoiser(gpa, .{ .data = &.{}, .seq = 0 }, null, 2.5, 16, 16, &.{ 1.0, 0.0 }),
+    );
+}
+
+test "DitContainer picks the reader by magic, not by extension" {
+    // A misnamed checkpoint used to reach the wrong parser and report
+    // `InvalidHeader`, which says nothing about the real problem. Sniffing means the
+    // name is irrelevant; only the bytes decide.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A minimal valid safetensors, deliberately named `.gguf`.
+    const header =
+        \\{"w":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}
+    ;
+    var st_bytes: [8 + header.len + 8]u8 = undefined;
+    std.mem.writeInt(u64, st_bytes[0..8], header.len, .little);
+    @memcpy(st_bytes[8..][0..header.len], header);
+    const vals = [2]f32{ 1.5, -2.5 };
+    @memcpy(st_bytes[8 + header.len ..], std.mem.sliceAsBytes(&vals));
+    {
+        const f = try tmp.dir.createFile(io, "lying.gguf", .{ .truncate = true });
+        defer f.close(io);
+        var buf: [64]u8 = undefined;
+        var w = f.writer(io, &buf);
+        try w.interface.writeAll(&st_bytes);
+        try w.interface.flush();
+    }
+
+    var c = try DitContainer.openIn(gpa, io, tmp.dir, "lying.gguf");
+    defer c.deinit();
+    try std.testing.expect(c == .safetensors);
+    try std.testing.expectEqual(@as(usize, 1), c.store().count());
+    try std.testing.expectEqual(@as(usize, 8), c.payloadLen());
 }
