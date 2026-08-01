@@ -1170,7 +1170,7 @@ test "gpu encode matches cpu encode" {
 
     var st = try safetensors.SafeTensors.open(gpa, io, te_path);
     defer st.deinit();
-    var enc = try qwen3.TextEncoder.load(gpa, &st);
+    var enc = try qwen3.TextEncoder.load(gpa, .{ .safetensors = &st });
     defer enc.deinit();
 
     const want = try enc.encode(io, gpa, ids.items, null);

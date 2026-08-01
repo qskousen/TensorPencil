@@ -18,6 +18,9 @@ pub const gguf = @import("gguf.zig");
 pub const weights = @import("weights.zig");
 pub const torch_rng = @import("torch_rng.zig");
 pub const tokenizer = @import("tokenizer.zig");
+/// CLIP BPE — the SD family's prompt tokenizer (see that file for why it is not a
+/// variant of `tokenizer.zig`).
+pub const clip_tokenizer = @import("clip_tokenizer.zig");
 pub const jinja = @import("jinja.zig");
 pub const unicode_tables = @import("unicode_tables.zig");
 pub const image = @import("image.zig");
@@ -37,6 +40,7 @@ test {
     _ = weights;
     _ = torch_rng;
     _ = tokenizer;
+    _ = clip_tokenizer;
     _ = jinja;
     _ = unicode_tables;
     _ = image;

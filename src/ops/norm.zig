@@ -104,3 +104,136 @@ test "rmsnorm in place and odd dims" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0 / rms), x[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, -5.0 / rms), x[9], 1e-6);
 }
+
+/// GroupNorm over channel-last activations: `x` is `[n_positions][channels]`, and
+/// each group of `channels / groups` **adjacent channels** is normalized over its own
+/// mean and variance **across all positions**. `out` may alias `x`.
+///
+/// This is what every SD-family ResBlock and VAE block runs before its convolution,
+/// and it is the one normalization in this codebase whose statistics are **not**
+/// per-position. RMSNorm and LayerNorm reduce along the row a position owns;
+/// GroupNorm reduces over `h·w·(channels/groups)` values at once. Laying activations
+/// out channel-last therefore makes its access pattern strided, which is why this
+/// takes a whole activation rather than a row.
+///
+/// ⚠️ **Biased variance, matching `torch.nn.functional.group_norm`** — divide by `n`,
+/// never `n − 1`. With 32 groups over a 320-channel 8×8 activation that is 640 values
+/// per group, so the difference is ~0.08% of the variance: far too small to look like
+/// a bug and far too large to leave to chance in a 25-block network.
+pub fn groupNorm(
+    out: []f32,
+    x: []const f32,
+    channels: usize,
+    groups: usize,
+    weight: []const f32,
+    bias: []const f32,
+    eps: f32,
+) void {
+    std.debug.assert(out.len == x.len);
+    std.debug.assert(channels != 0 and groups != 0 and channels % groups == 0);
+    std.debug.assert(x.len % channels == 0);
+    std.debug.assert(weight.len == channels and bias.len == channels);
+
+    const positions = x.len / channels;
+    const per_group = channels / groups;
+
+    var g: usize = 0;
+    while (g < groups) : (g += 1) {
+        const c0 = g * per_group;
+        // Two passes over the group rather than a sum/sum-of-squares single pass: the
+        // shifted form loses catastrophically when the mean is large relative to the
+        // spread, which is exactly the regime a late VAE block sits in.
+        var sum: f64 = 0;
+        var p: usize = 0;
+        while (p < positions) : (p += 1) {
+            const row = x[p * channels ..][c0..][0..per_group];
+            for (row) |v| sum += v;
+        }
+        const n: f64 = @floatFromInt(positions * per_group);
+        const mean = sum / n;
+
+        var sq: f64 = 0;
+        p = 0;
+        while (p < positions) : (p += 1) {
+            const row = x[p * channels ..][c0..][0..per_group];
+            for (row) |v| {
+                const d = @as(f64, v) - mean;
+                sq += d * d;
+            }
+        }
+        const inv = 1.0 / @sqrt(sq / n + @as(f64, eps));
+
+        const meanf: f32 = @floatCast(mean);
+        const invf: f32 = @floatCast(inv);
+        p = 0;
+        while (p < positions) : (p += 1) {
+            const src = x[p * channels ..][c0..][0..per_group];
+            const dst = out[p * channels ..][c0..][0..per_group];
+            for (dst, src, weight[c0..][0..per_group], bias[c0..][0..per_group]) |*o, v, wv, bv| {
+                o.* = (v - meanf) * invf * wv + bv;
+            }
+        }
+    }
+}
+
+// --- SD-family fixture tests ------------------------------------------------
+
+const sd15_op_fixtures_json = @embedFile("assets/sd15_op_fixtures.json");
+
+const GroupNormCase = struct {
+    channels: usize,
+    height: usize,
+    width: usize,
+    groups: usize,
+    eps: f32,
+    /// `[h*w][channels]`, channel-last — our layout, not torch's.
+    input: []const f32,
+    weight: []const f32,
+    bias: []const f32,
+    expected: []const f32,
+};
+
+const Sd15OpFixtures = struct { group_norm: []const GroupNormCase };
+
+test "groupNorm matches torch.nn.functional.group_norm" {
+    const gpa = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        Sd15OpFixtures,
+        gpa,
+        sd15_op_fixtures_json,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+
+    for (parsed.value.group_norm) |c| {
+        const out = try gpa.alloc(f32, c.input.len);
+        defer gpa.free(out);
+        groupNorm(out, c.input, c.channels, c.groups, c.weight, c.bias, c.eps);
+        for (c.expected, out, 0..) |e, a, i| {
+            errdefer std.debug.print(
+                "group_norm c={d} h={d} w={d}: index {d} expected {d:.6} got {d:.6}\n",
+                .{ c.channels, c.height, c.width, i, e, a },
+            );
+            try std.testing.expectApproxEqAbs(e, a, 2e-5);
+        }
+    }
+}
+
+test "groupNorm normalizes each group independently and in place" {
+    // Two groups whose scales differ by 100x: if the statistics leaked across groups
+    // the small group would come out near zero instead of unit-variance. `out` aliases
+    // `x`, which every caller in the ResBlock path relies on.
+    var x = [_]f32{ 1, 2, 100, 200, 3, 4, 300, 400 }; // [4 positions][... ] see below
+    // 4 channels, 2 groups: channels 0,1 are group 0 (small), 2,3 are group 1 (large).
+    const w = [_]f32{ 1, 1, 1, 1 };
+    const b = [_]f32{ 0, 0, 0, 0 };
+    groupNorm(&x, &x, 4, 2, &w, &b, 0);
+
+    var g0: f64 = 0;
+    var g1: f64 = 0;
+    for ([_]usize{ 0, 1, 4, 5 }) |i| g0 += x[i] * x[i];
+    for ([_]usize{ 2, 3, 6, 7 }) |i| g1 += x[i] * x[i];
+    // Zero mean removed, unit variance imposed: sum of squares == count, per group.
+    try std.testing.expectApproxEqAbs(@as(f64, 4), g0, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f64, 4), g1, 1e-4);
+}

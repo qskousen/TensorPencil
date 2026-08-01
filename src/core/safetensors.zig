@@ -241,6 +241,15 @@ pub fn convertToF32(dt: DType, bytes: []const u8, out: []f32) ConvertError!void 
         },
         .bf16 => dtypes.bf16ToF32Row(bytes, out, 1.0),
         .f16 => dtypes.f16ToF32Row(bytes, out, 1.0),
+        // f64 appears in real checkpoints — an SD1.5 merge in the wild stores its
+        // CLIP text-encoder linears this way — and a converting *read* is the right
+        // handling: ComfyUI casts them at load too. Integer dtypes deliberately stay
+        // unsupported below, because silently turning token ids or `position_ids`
+        // into floats is never what a caller wants.
+        .f64 => for (out, 0..) |*v, i| {
+            const bits = std.mem.readInt(u64, bytes[i * 8 ..][0..8], .little);
+            v.* = @floatCast(@as(f64, @bitCast(bits)));
+        },
         // ggml block-quantized GGUF tensors (rows are whole blocks, which the
         // GGUF parser validated, so the length check above already enforced
         // block alignment).

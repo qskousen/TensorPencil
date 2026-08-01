@@ -171,6 +171,23 @@ pub const Weight = struct {
 
 pub const Error = error{ UnsupportedDType, QuantBackendUnavailable, OutOfMemory } || std.Io.Cancelable;
 
+/// Whether `matmul` can take a weight of this dtype at all — the same set its own
+/// validation switch accepts, exposed so a *loader* can decide up front instead of
+/// discovering it mid-forward.
+///
+/// A model loader that meets an unsupported dtype has one correct move: materialize
+/// the weight to f32 once, at load. Checkpoints in the wild do carry surprises (an
+/// SD1.5 merge with **f64** CLIP linears is the case that prompted this), and the
+/// alternative — a `UnsupportedDType` from inside the first forward — reports the
+/// problem at the point furthest from its cause.
+pub fn supportsDType(dt: DType) bool {
+    return switch (dt) {
+        .f8_e4m3, .bf16, .f16, .f32, .i8, .i4 => true,
+        .q4_0, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl => have_ggml,
+        else => false,
+    };
+}
+
 /// y[m, w.rows] = x[m, w.cols] @ w^T + bias.
 pub fn matmul(
     io: std.Io,

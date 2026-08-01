@@ -124,6 +124,26 @@ pub inline fn geluQuickScalar(x: f32) f32 {
     return x * sigmoidScalar(1.702 * x);
 }
 
+/// Plain (ungated) quick-GELU, in place — CLIP's text-encoder MLP, whose two
+/// linears are sequential rather than gated, so there is no `up` to multiply by.
+pub fn geluQuick(xs: []f32) void {
+    const c: Vec = @splat(1.702);
+    var i: usize = 0;
+    while (i + vlen <= xs.len) : (i += vlen) {
+        const x: Vec = xs[i..][0..vlen].*;
+        xs[i..][0..vlen].* = x * vmath.sigmoidVec(c * x);
+    }
+    while (i < xs.len) : (i += 1) xs[i] = geluQuickScalar(xs[i]);
+}
+
+/// Plain (ungated) exact-erf GELU, in place — CLIP-G's MLP (SDXL's second tower)
+/// uses the erf form where CLIP-L uses the sigmoid approximation above. They differ
+/// by ~1e-3 at the peak, which is small enough to look like rounding and large
+/// enough to move a 32-layer tower's output.
+pub fn geluErf(xs: []f32) void {
+    for (xs) |*x| x.* = geluErfScalar(x.*);
+}
+
 /// GeGLU-quick gating (gemma4v vision FFN): gate[i] = gelu_quick(gate[i]) * up[i].
 pub fn geluQuickMul(gate: []f32, up: []const f32) void {
     std.debug.assert(gate.len == up.len);

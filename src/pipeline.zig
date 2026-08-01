@@ -57,6 +57,10 @@ const dit_cuda = @import("tp_models").models.dit_cuda;
 const qwen3_cuda = @import("tp_models").models.qwen3_cuda;
 const cuda = @import("tp_gpu").cuda;
 const wan_vae = @import("tp_models").models.wan_vae;
+const clip_tok = @import("tp_core").clip_tokenizer;
+const clip_text = @import("tp_models").models.clip_text;
+const sd_unet = @import("tp_models").models.sd_unet;
+const sd_vae = @import("tp_models").models.sd_vae;
 const taehv_mod = @import("tp_models").models.taehv;
 const taehv_cuda_mod = @import("tp_models").models.taehv_cuda;
 const taehv_gpu_mod = @import("tp_models").models.taehv_gpu;
@@ -163,9 +167,22 @@ pub const Options = struct {
     /// Run the GPU text encoder's GEMMs on tensor cores (f16). ~0.4s faster
     /// encode but ~doubles its image-delta contribution; default f32.
     encoder_f16: bool = false,
+    /// Where the conditioner and decoder come from **when they are not in the primary
+    /// checkpoint**. These defaults are krea2's separate files, and they are a
+    /// *fallback*, not an override: `resolveComponent` prefers the primary checkpoint's
+    /// own copy over a defaulted path, and prefers an explicitly supplied path over
+    /// both (see `explicit_text_encoder` / `explicit_vae`).
+    ///
+    /// ⚠️ Treating a *defaulted* path as "the user specified this" broke a joined SD1.5
+    /// checkpoint: the resolver dutifully opened krea2's qwen3 encoder, looked for
+    /// CLIP's tensors in it and reported `ComponentNotInCheckpoint`.
     text_encoder_path: []const u8 = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors",
     dit_path: []const u8 = "models/diffusion_model/krea2CenterSemiraw_v10Fp8.safetensors",
     vae_path: []const u8 = "models/vae/krea2RealVae_v10.safetensors",
+    /// True when the caller actually asked for those paths. A CLI sets this when the
+    /// flag was present; a library caller that fills the field in means it.
+    explicit_text_encoder: bool = false,
+    explicit_vae: bool = false,
     /// Optional per-step progress hook (see `Progress`).
     on_step: ?Progress = null,
     /// Compute a latent2rgb preview each step and pass it to `on_step`.
@@ -378,9 +395,21 @@ pub const Denoiser = struct {
     cu_pos: ?dit_cuda.Session = null,
     cu_neg: ?dit_cuda.Session = null,
     cu_ws: ?dit_cuda.Workspace = null,
+    /// SD1.5's per-resolution UNet scratch, for the same reason the GPU sessions
+    /// above exist: sized once per image rather than once per step.
+    sd_ws: ?sd_unet.Workspace = null,
+    /// Input scratch for SD's `x / sqrt(sigma^2 + 1)` pre-scaling, which krea2 has
+    /// no analogue of. Channel-last, since it is what the UNet reads.
+    sd_scaled: ?[]f32 = null,
+    /// Channel-last scratch for the UNet's output, transposed back to the sampler's
+    /// planar layout by `channelLastToPlanar`.
+    sd_eps: ?[]f32 = null,
 
     pub fn deinit(self: *Denoiser, gpa: std.mem.Allocator) void {
         if (self.v_neg) |b| gpa.free(b);
+        if (self.sd_ws) |*w| w.deinit();
+        if (self.sd_scaled) |b| gpa.free(b);
+        if (self.sd_eps) |b| gpa.free(b);
         if (self.vk_pos) |*s| s.deinit(gpa, self.sess.gpu_ctx.?);
         if (self.vk_neg) |*s| s.deinit(gpa, self.sess.gpu_ctx.?);
         if (self.vk_ws) |*w| w.deinit(self.sess.gpu_ctx.?);
@@ -403,7 +432,8 @@ pub const Denoiser = struct {
     ) !void {
         const s = self.sess;
         const io = s.io;
-        const dit = &s.dit;
+        if (s.models == .sd15) return self.predictSd(gpa, v_out, latent, sigma, cancel);
+        const dit = &s.models.krea2.dit;
         std.debug.assert(v_out.len == wan_vae.latent_channels * self.lat_h * self.lat_w);
         std.debug.assert(latent.len == v_out.len);
 
@@ -424,6 +454,90 @@ pub const Denoiser = struct {
         } else {
             try dit.forward(io, gpa, v_neg, latent, self.lat_h, self.lat_w, sigma, self.cond_neg.?.data, self.cond_neg.?.seq, cancel);
         }
+        sampler.applyCfg(v_out, v_neg, self.cfg);
+    }
+
+    /// SD1.5's forward: pre-scale the latent, invert sigma back to the timestep the
+    /// UNet is conditioned on, run it, and mix the two branches under CFG.
+    ///
+    /// ⚠️ **Both of the first two steps are silent if omitted.** Feeding the raw
+    /// latent runs the model off its training distribution (softer, washed images,
+    /// no error), and conditioning on the wrong timestep runs the right model at the
+    /// wrong noise level. Neither shows up as anything but "the sampler seems bad".
+    fn predictSd(
+        self: *Denoiser,
+        gpa: std.mem.Allocator,
+        v_out: []f32,
+        latent: []const f32,
+        sigma: f32,
+        cancel: ?*std.atomic.Value(bool),
+    ) !void {
+        const s = self.sess;
+        const m = &s.models.sd15;
+        const cfg_unet = m.unet.cfg;
+        std.debug.assert(v_out.len == cfg_unet.channels * self.lat_h * self.lat_w);
+        std.debug.assert(latent.len == v_out.len);
+        _ = cancel; // the CPU UNet's cancel hook rides on ops.cancel, like the DiT's
+
+        // ⚠️ **LAYOUT.** The sampler's latent is **planar** `[c][h][w]` — krea2's DiT and
+        // both VAEs use that, and `generate`/`decode` are written to it — while
+        // `sd_unet.forward` works in **channel-last** `[h*w][c]`, the layout `ops.conv`
+        // and the GEMMs want. So this transposes on the way in and back on the way out.
+        //
+        // Getting this wrong is *rms-preserving*: every value survives, only its
+        // position changes, so the per-step magnitudes stay right to a fraction of a
+        // percent while the image becomes a periodic streak pattern. It cost a long
+        // bisection, and two things made it worse: the UNet parity tests transpose
+        // explicitly before calling `forward`, so they never exercised the pipeline's
+        // convention, and a dump-and-compare against the reference *interpreted the
+        // dumped buffer the same wrong way*, so both sides scrambled identically and
+        // agreed to 1e-5.
+        const scaled = self.sd_scaled.?;
+        const plane = self.lat_h * self.lat_w;
+        const ch = cfg_unet.channels;
+        for (0..plane) |px| {
+            for (0..ch) |c| {
+                scaled[px * ch + c] = latent[c * plane + px];
+            }
+        }
+        sampler.sdScaleInput(scaled, scaled, sigma);
+        const t = sampler.sdTimestepForSigma(m.sigma_ladder, sigma);
+
+        const ws = &self.sd_ws.?;
+        const cl = self.sd_eps.?; // channel-last scratch for the UNet's output
+        try sd_unet.forward(
+            &m.unet,
+            s.io,
+            gpa,
+            ws,
+            cl,
+            scaled,
+            self.lat_h,
+            self.lat_w,
+            t,
+            self.cond_pos.data,
+            self.cond_pos.seq,
+        );
+        channelLastToPlanar(v_out, cl, ch, plane);
+        if (self.cfg == 1.0) return;
+
+        const v_neg = self.v_neg.?;
+        try sd_unet.forward(
+            &m.unet,
+            s.io,
+            gpa,
+            ws,
+            cl,
+            scaled,
+            self.lat_h,
+            self.lat_w,
+            t,
+            self.cond_neg.?.data,
+            self.cond_neg.?.seq,
+        );
+        channelLastToPlanar(v_neg, cl, ch, plane);
+        // Mixing eps is equivalent to mixing denoised predictions at fixed x, the
+        // same argument that licenses krea2's velocity CFG.
         sampler.applyCfg(v_out, v_neg, self.cfg);
     }
 };
@@ -495,7 +609,233 @@ pub const DitContainer = union(enum) {
 /// VRAM budget allows. The GUI keeps one alive while its image queue is
 /// non-empty; the one-shot `generate` free function below wraps init+generate+
 /// deinit for the CLI / tests. NOT thread-safe: serialize `generate` calls.
+/// Open `path` only when the caller actually gave one: an empty path means "not
+/// specified", and the component is then expected in the primary checkpoint.
+fn openIfGiven(gpa: std.mem.Allocator, io: std.Io, path: []const u8, explicit: bool) !?safetensors.SafeTensors {
+    if (path.len == 0) return null;
+    if (explicit) return try safetensors.SafeTensors.open(gpa, io, path);
+    // A *defaulted* path may simply not exist (a box with only SD checkpoints has no
+    // krea2 VAE), and that is not an error as long as the primary checkpoint carries
+    // the component. An explicit path that cannot be opened still fails loudly.
+    return safetensors.SafeTensors.open(gpa, io, path) catch null;
+}
+
+fn storeOf(st: *?safetensors.SafeTensors) ?weights_mod.WeightStore {
+    if (st.*) |*s| return .{ .safetensors = s };
+    return null;
+}
+
+/// Channel-last `[h*w][c]` -> planar `[c][h][w]`, the sampler's layout. See the layout
+/// note in `Denoiser.predictSd`.
+fn channelLastToPlanar(dst: []f32, src: []const f32, ch: usize, plane: usize) void {
+    std.debug.assert(dst.len == ch * plane and src.len == dst.len);
+    for (0..plane) |px| {
+        for (0..ch) |c| dst[c * plane + px] = src[px * ch + c];
+    }
+}
+
+/// One of the three things a diffusion pipeline is made of. Each may live in the
+/// primary checkpoint or in a file of its own — **independently of the architecture**.
+pub const Component = enum { denoiser, conditioner, decoder };
+
+/// Where a component's weights were found: a store in which it sits **at the root**
+/// (wrapped in a `weights.Prefixed` view when it was nested), plus the file it came
+/// from, for the load log.
+const Resolved = struct {
+    store: weights_mod.WeightStore,
+    /// Non-null when a `Prefixed` view had to be created; owned by the Session and
+    /// freed in `deinit`.
+    view: ?*weights_mod.Prefixed = null,
+    from_primary: bool,
+};
+
+/// Prefix spellings a component is found under, and a tensor that proves it. Ordered
+/// most-specific first, so a bundled checkpoint's nested spelling wins over a bare one
+/// that could also match by accident.
+const ComponentSpec = struct { prefixes: []const []const u8, probe: []const u8 };
+
+fn componentSpec(fam: Family, comp: Component) ComponentSpec {
+    return switch (fam) {
+        .krea2 => switch (comp) {
+            .denoiser => .{ .prefixes = &.{ "model.diffusion_model.", "" }, .probe = "blocks.0.attn.wq.weight" },
+            .conditioner => .{ .prefixes = &.{ "text_encoders.", "" }, .probe = "model.language_model.embed_tokens.weight" },
+            .decoder => .{ .prefixes = &.{ "first_stage_model.", "vae.", "" }, .probe = "decoder.conv1.weight" },
+        },
+        .sd15 => switch (comp) {
+            .denoiser => .{ .prefixes = &.{ "model.diffusion_model.", "" }, .probe = "input_blocks.0.0.weight" },
+            .conditioner => .{
+                // LDM bundle, then a bare HF text-encoder export.
+                .prefixes = &.{ "cond_stage_model.transformer.text_model.", "text_model.", "" },
+                .probe = "final_layer_norm.weight",
+            },
+            .decoder => .{ .prefixes = &.{ "first_stage_model.", "" }, .probe = "decoder.conv_in.weight" },
+        },
+    };
+}
+
+/// Resolve where a component's weights are, with the precedence the CLI promises:
+///
+/// 1. **An explicitly given path wins.** If the user passed `--text-encoder` or
+///    `--vae`, that file is used even when the primary checkpoint also carries one —
+///    overriding a bundled component is the whole reason to pass the flag.
+/// 2. Otherwise the primary checkpoint must contain it.
+///
+/// Either way the component may sit under a prefix, and either way the loader is
+/// handed a store in which it sits at the root (see `weights.Prefixed`), so no loader
+/// needs to know which spelling it came from.
+fn resolveComponent(
+    gpa: std.mem.Allocator,
+    fam: Family,
+    comp: Component,
+    primary: weights_mod.WeightStore,
+    side: ?weights_mod.WeightStore,
+    side_is_explicit: bool,
+) !Resolved {
+    const spec = componentSpec(fam, comp);
+
+    // Order of preference: an explicitly requested file, then the primary checkpoint's
+    // own copy, then a defaulted side file. So `--vae x` overrides a bundled VAE, a
+    // bundled VAE beats the built-in default path, and nothing silently wins over an
+    // explicit request.
+    var candidates: [3]?weights_mod.WeightStore = .{ null, null, null };
+    var n: usize = 0;
+    if (side_is_explicit) {
+        if (side) |st| {
+            candidates[n] = st;
+            n += 1;
+        }
+    }
+    candidates[n] = primary;
+    n += 1;
+    if (!side_is_explicit) {
+        if (side) |st| {
+            candidates[n] = st;
+            n += 1;
+        }
+    }
+
+    for (candidates[0..n]) |maybe| {
+        const store = maybe.?;
+        for (spec.prefixes) |pfx| {
+            var buf: [256]u8 = undefined;
+            if (pfx.len + spec.probe.len > buf.len) continue;
+            @memcpy(buf[0..pfx.len], pfx);
+            @memcpy(buf[pfx.len..][0..spec.probe.len], spec.probe);
+            if (store.get(buf[0 .. pfx.len + spec.probe.len]) == null) continue;
+
+            if (pfx.len == 0) return .{ .store = store, .from_primary = false };
+            const view = try gpa.create(weights_mod.Prefixed);
+            errdefer gpa.destroy(view);
+            view.* = try weights_mod.Prefixed.init(gpa, store, pfx);
+            return .{ .store = view.store(), .view = view, .from_primary = false };
+        }
+    }
+    // Silent: a resolver that both returns a typed error and logs makes every caller's
+    // own diagnostic a duplicate, and makes a test of the error path noisy (this suite
+    // treats stderr from a passing test as a failure). `reportResolve` is the reporting
+    // wrapper the loading paths use.
+    return error.ComponentNotInCheckpoint;
+}
+
+/// `resolveComponent` plus the diagnostic. The load paths use this; tests of the
+/// resolution rules use the silent form.
+fn reportResolve(
+    gpa: std.mem.Allocator,
+    fam: Family,
+    comp: Component,
+    primary: weights_mod.WeightStore,
+    side: ?weights_mod.WeightStore,
+    side_is_explicit: bool,
+    side_path: []const u8,
+) !Resolved {
+    return resolveComponent(gpa, fam, comp, primary, side, side_is_explicit) catch |err| {
+        if (err == error.ComponentNotInCheckpoint) std.log.err(
+            "{t} not found: the checkpoint has no '{s}' under any known prefix, and '{s}' does not supply one either",
+            .{ comp, componentSpec(fam, comp).probe, side_path },
+        );
+        return err;
+    };
+}
+
+/// Which architecture a session is running.
+///
+/// The engine started as a krea2 pipeline and the stage API (`encode` → `denoiser` →
+/// `predict` → `decode`) turned out to be the right shape for both families, so the
+/// generalization is a tagged union *inside* `Session` rather than a second pipeline:
+/// callers — including ggufy's whole measurement ladder — are unchanged.
+///
+/// ⚠️ **The two families differ in what a "step" means**, and `sampler.zig` documents
+/// it: krea2 predicts a velocity on a continuous flow-matching schedule, SD predicts
+/// eps on a discrete ladder, is conditioned on a timestep *index*, and needs its input
+/// pre-scaled. What makes one API cover both is that the Euler step consumes the same
+/// quantity either way — for eps-prediction the trajectory derivative *is* eps.
+pub const Family = enum { krea2, sd15 };
+
+/// krea2: three separate checkpoints (encoder, DiT, VAE).
+pub const Krea2Models = struct {
+    tok: tokenizer_mod.Tokenizer,
+    /// Null when the conditioner came out of the primary checkpoint.
+    enc_st: ?safetensors.SafeTensors,
+    enc: qwen3.TextEncoder,
+    dit_st: DitContainer,
+    dit: dit_mod.DiT,
+    /// Null when the decoder came out of the primary checkpoint.
+    vae_st: ?safetensors.SafeTensors,
+    vae: wan_vae.Decoder,
+    /// Prefix views, when a component was nested inside its container.
+    enc_view: ?*weights_mod.Prefixed,
+    vae_view: ?*weights_mod.Prefixed,
+};
+
+/// SD1.5: one LDM single-file checkpoint normally holds all three models — but the
+/// denoiser may come from a *different* file than the conditioner and decoder, which
+/// is the case that matters here: ggufy writes a GGUF containing only the UNet (with
+/// the container prefix stripped), so a quantized SD1.5 arm is measured with CLIP and
+/// the VAE loaded from the original checkpoint. `aux_st` is null when both come from
+/// the denoiser's own file.
+pub const Sd15Models = struct {
+    tok: clip_tok.Tokenizer,
+    unet_st: DitContainer,
+    /// Null when that component came out of the primary checkpoint.
+    enc_st: ?safetensors.SafeTensors,
+    vae_st: ?safetensors.SafeTensors,
+    clip: clip_text.TextEncoder,
+    unet: sd_unet.UNet,
+    vae: sd_vae.Decoder,
+    clip_view: ?*weights_mod.Prefixed,
+    vae_view: ?*weights_mod.Prefixed,
+    /// The full per-training-step sigma ladder, for the sigma → timestep inverse a
+    /// teacher-forced (off-schedule) sigma needs. Built once.
+    sigma_ladder: []f32,
+};
+
+/// The loaded model set, tagged by family. A named type rather than an anonymous
+/// union in the field: an inline `union(Family)` there makes the compiler derive its
+/// name from the first field's type and then report a dependency loop.
+pub const Models = union(Family) {
+    krea2: Krea2Models,
+    sd15: Sd15Models,
+};
+
+/// Which family a denoiser checkpoint belongs to, from its tensor names alone.
+///
+/// Name-based, like ggufy's own `ImageArch` detection, because the alternative —
+/// asking the caller — puts a mistypeable flag in front of a measurement whose whole
+/// point is that the inputs are what they claim to be.
+pub fn detectFamily(store: weights_mod.WeightStore) !Family {
+    // SD's UNet stem, prefixed (a full single-file checkpoint) or bare (ggufy's
+    // model-only GGUF, which strips the container prefix).
+    if (store.get("model.diffusion_model.input_blocks.0.0.weight") != null) return .sd15;
+    if (store.get("input_blocks.0.0.weight") != null) return .sd15;
+    if (store.get("model.diffusion_model.blocks.0.attn.wq.weight") != null) return .krea2;
+    if (store.get("blocks.0.attn.wq.weight") != null) return .krea2;
+    return error.UnknownArchitecture;
+}
+
 pub const Session = struct {
+    models: Models,
+
+
     gpa: std.mem.Allocator,
     io: std.Io,
     backend: Backend,
@@ -512,6 +852,35 @@ pub const Session = struct {
     dit: dit_mod.DiT,
     vae_st: safetensors.SafeTensors,
     vae: wan_vae.Decoder,
+
+    /// The loaded family. Shorthand for `@as(Family, self.models)`.
+    pub fn family(self: *const Session) Family {
+        return self.models;
+    }
+
+    /// krea2's model set, asserting the family — every krea2-only path binds this
+    /// once at the top and its body is then unchanged from before the split.
+    fn k(self: *Session) *Krea2Models {
+        return &self.models.krea2;
+    }
+
+    /// The store the *denoiser* was loaded from: what a caller overlays to
+    /// substitute weights (ggufy's per-tensor attribution arm) without touching the
+    /// conditioner or the decoder.
+    pub fn denoiserStore(self: *const Session) weights_mod.WeightStore {
+        return switch (self.models) {
+            .krea2 => |*m| m.dit_st.store(),
+            .sd15 => |*m| m.unet_st.store(),
+        };
+    }
+
+    /// Payload bytes of the denoiser's container, for the VRAM meter.
+    fn denoiserPayloadLen(self: *const Session) usize {
+        return switch (self.models) {
+            .krea2 => |*m| m.dit_st.payloadLen(),
+            .sd15 => |*m| m.unet_st.payloadLen(),
+        };
+    }
 
     /// Create the backend and load all three models once. Heap-allocated (returns
     /// `*Session`) so the models can hold stable pointers into their mappings.
@@ -574,26 +943,112 @@ pub const Session = struct {
         // stay valid across images. NO proactive evictWeights anywhere — the
         // encoder/DiT/VAE coexist under the default full-card budget, and a tight
         // budget lets the backend's LRU cache stream the overflow reactively.
-        try note(progress, "loading text encoder...\n", .{});
-        const t0 = std.Io.Clock.real.now(io).nanoseconds;
-        self.tok = try tokenizer_mod.Tokenizer.init(gpa);
-        errdefer self.tok.deinit();
-        self.enc_st = try safetensors.SafeTensors.open(gpa, io, opts.text_encoder_path);
-        errdefer self.enc_st.deinit();
-        self.enc = try qwen3.TextEncoder.load(gpa, &self.enc_st);
-        errdefer self.enc.deinit();
-
+        // The denoiser's container decides the architecture, so it is opened first
+        // and its names are what `detectFamily` reads.
         try note(progress, "loading diffusion model...\n", .{});
-        const t1 = std.Io.Clock.real.now(io).nanoseconds;
-        self.dit_st = try DitContainer.open(gpa, io, opts.dit_path);
-        errdefer self.dit_st.deinit();
-        self.dit = try dit_mod.DiT.load(gpa, self.dit_st.store());
-        errdefer self.dit.deinit();
+        const t0 = std.Io.Clock.real.now(io).nanoseconds;
+        var den_st = try DitContainer.open(gpa, io, opts.dit_path);
+        errdefer den_st.deinit();
+        const fam = try detectFamily(den_st.store());
 
-        self.vae_st = try safetensors.SafeTensors.open(gpa, io, opts.vae_path);
-        errdefer self.vae_st.deinit();
-        self.vae = try wan_vae.Decoder.load(gpa, &self.vae_st);
-        const t2 = std.Io.Clock.real.now(io).nanoseconds;
+        var t1 = t0;
+        var t2 = t0;
+        switch (fam) {
+            .krea2 => {
+                var m: Krea2Models = .{
+                    .tok = undefined,
+                    .enc_st = null,
+                    .enc = undefined,
+                    .dit_st = den_st,
+                    .dit = undefined,
+                    .vae_st = null,
+                    .vae = undefined,
+                    .enc_view = null,
+                    .vae_view = null,
+                };
+                const den = try reportResolve(gpa, fam, .denoiser, m.dit_st.store(), null, false, opts.dit_path);
+                m.dit = try dit_mod.DiT.load(gpa, den.store);
+                errdefer m.dit.deinit();
+                // The DiT loader detects its own prefix, so the resolver's view is not
+                // needed past this point.
+                if (den.view) |v| {
+                    v.deinit(gpa);
+                    gpa.destroy(v);
+                }
+                t1 = std.Io.Clock.real.now(io).nanoseconds;
+
+                try note(progress, "loading text encoder...\n", .{});
+                m.tok = try tokenizer_mod.Tokenizer.init(gpa);
+                errdefer m.tok.deinit();
+
+                m.enc_st = try openIfGiven(gpa, io, opts.text_encoder_path, opts.explicit_text_encoder);
+                errdefer if (m.enc_st) |*st| st.deinit();
+                const enc_r = try reportResolve(gpa, fam, .conditioner, m.dit_st.store(), storeOf(&m.enc_st), opts.explicit_text_encoder, opts.text_encoder_path);
+                m.enc_view = enc_r.view;
+                m.enc = try qwen3.TextEncoder.load(gpa, enc_r.store);
+                errdefer m.enc.deinit();
+
+                m.vae_st = try openIfGiven(gpa, io, opts.vae_path, opts.explicit_vae);
+                errdefer if (m.vae_st) |*st| st.deinit();
+                const vae_r = try reportResolve(gpa, fam, .decoder, m.dit_st.store(), storeOf(&m.vae_st), opts.explicit_vae, opts.vae_path);
+                m.vae_view = vae_r.view;
+                m.vae = try wan_vae.Decoder.load(gpa, vae_r.store);
+                t2 = std.Io.Clock.real.now(io).nanoseconds;
+                self.models = .{ .krea2 = m };
+            },
+            .sd15 => {
+                // ⚠️ **CPU only.** There is no GPU kernel for this UNet (no conv, no
+                // GroupNorm on either device backend), and the failure mode of
+                // pretending otherwise is what the GGUF-on-Vulkan bug already cost:
+                // a blank image with no error. Refuse instead.
+                if (self.gpu_ctx != null or self.cu_be != null) {
+                    std.log.err("SD1.5 runs on the CPU backend only (no GPU kernels for its UNet)", .{});
+                    return error.UnsupportedBackend;
+                }
+
+                var m: Sd15Models = .{
+                    .tok = undefined,
+                    .unet_st = den_st,
+                    .enc_st = null,
+                    .vae_st = null,
+                    .clip = undefined,
+                    .unet = undefined,
+                    .vae = undefined,
+                    .clip_view = null,
+                    .vae_view = null,
+                    .sigma_ladder = &.{},
+                };
+                const den = try reportResolve(gpa, fam, .denoiser, m.unet_st.store(), null, false, opts.dit_path);
+                m.unet = try sd_unet.UNet.load(gpa, den.store, sd_unet.sd15, "");
+                errdefer m.unet.deinit();
+                if (den.view) |v| {
+                    v.deinit(gpa);
+                    gpa.destroy(v);
+                }
+                t1 = std.Io.Clock.real.now(io).nanoseconds;
+
+                try note(progress, "loading text encoder...\n", .{});
+                m.tok = try clip_tok.Tokenizer.init(gpa);
+                errdefer m.tok.deinit();
+
+                m.enc_st = try openIfGiven(gpa, io, opts.text_encoder_path, opts.explicit_text_encoder);
+                errdefer if (m.enc_st) |*st| st.deinit();
+                const clip_r = try reportResolve(gpa, fam, .conditioner, m.unet_st.store(), storeOf(&m.enc_st), opts.explicit_text_encoder, opts.text_encoder_path);
+                m.clip_view = clip_r.view;
+                m.clip = try clip_text.TextEncoder.load(gpa, clip_r.store, clip_text.clip_l, "");
+                errdefer m.clip.deinit();
+
+                m.vae_st = try openIfGiven(gpa, io, opts.vae_path, opts.explicit_vae);
+                errdefer if (m.vae_st) |*st| st.deinit();
+                const vae_r = try reportResolve(gpa, fam, .decoder, m.unet_st.store(), storeOf(&m.vae_st), opts.explicit_vae, opts.vae_path);
+                m.vae_view = vae_r.view;
+                m.vae = try sd_vae.Decoder.load(gpa, vae_r.store, sd_vae.sd15, "");
+                errdefer m.vae.deinit();
+                m.sigma_ladder = try sampler.sdSigmasFull(gpa);
+                t2 = std.Io.Clock.real.now(io).nanoseconds;
+                self.models = .{ .sd15 = m };
+            },
+        }
 
         // Async weight streaming via a BOUNDED pinned staging ring (4×128 MB =
         // 512 MB), NOT registerHost — we deliberately do NOT page-lock the ~12 GB
@@ -624,13 +1079,28 @@ pub const Session = struct {
     /// *inputs* of a measurement whose entire claim is that the inputs are
     /// identical.
     ///
-    /// `store` may be an overlay over `self.dit_st.store()`: this call does not
+    /// `store` may be an overlay over `denoiserStore()`: this call does not
     /// touch `dit_st`, so the base container stays open and mapped. The caller owns
     /// `store` and everything it points at, and both must outlive the DiT.
     ///
     /// The new DiT is loaded *before* the old one is freed, so a failed load leaves
     /// the session intact and usable.
-    pub fn replaceDit(self: *Session, store: weights_mod.WeightStore) !void {
+    pub fn replaceDenoiser(self: *Session, store: weights_mod.WeightStore) !void {
+        if (self.models == .sd15) {
+            const m = &self.models.sd15;
+            // The substituted store may be prefixed either way (an overlay over a
+            // full checkpoint keeps the container prefix; over a ggufy GGUF it does
+            // not), so it goes through the same resolver the initial load used.
+            const r = try resolveComponent(self.gpa, .sd15, .denoiser, store, null, false);
+            defer if (r.view) |v| {
+                v.deinit(self.gpa);
+                self.gpa.destroy(v);
+            };
+            const fresh = try sd_unet.UNet.load(self.gpa, r.store, m.unet.cfg, "");
+            m.unet.deinit();
+            m.unet = fresh;
+            return;
+        }
         const fresh = try dit_mod.DiT.load(self.gpa, store);
         // Device weight caches are keyed by HOST POINTER, so they must be dropped
         // here: the old DiT's arena is about to be freed, and a later allocation
@@ -642,8 +1112,9 @@ pub const Session = struct {
             b.evictWeights();
         }
         if (self.gpu_ctx) |c| c.evictWeights();
-        self.dit.deinit();
-        self.dit = fresh;
+        const m = self.k();
+        m.dit.deinit();
+        m.dit = fresh;
     }
 
     /// Device bytes this diffusion session's backend currently holds (weights +
@@ -748,24 +1219,76 @@ pub const Session = struct {
             ctx.deinit();
         }
         if (self.cu_be) |b| b.deinit();
-        self.vae.deinit();
-        self.vae_st.deinit();
-        self.dit.deinit();
-        self.dit_st.deinit();
-        self.enc.deinit();
-        self.enc_st.deinit();
-        self.tok.deinit();
+        switch (self.models) {
+            .krea2 => |*m| {
+                m.vae.deinit();
+                m.dit.deinit();
+                m.enc.deinit();
+                inline for (.{ &m.enc_view, &m.vae_view }) |slot| if (slot.*) |v| {
+                    v.deinit(gpa);
+                    gpa.destroy(v);
+                };
+                if (m.enc_st) |*st| st.deinit();
+                if (m.vae_st) |*st| st.deinit();
+                m.dit_st.deinit();
+                m.tok.deinit();
+            },
+            .sd15 => |*m| {
+                gpa.free(m.sigma_ladder);
+                m.vae.deinit();
+                m.clip.deinit();
+                m.unet.deinit();
+                inline for (.{ &m.clip_view, &m.vae_view }) |slot| if (slot.*) |v| {
+                    v.deinit(gpa);
+                    gpa.destroy(v);
+                };
+                if (m.enc_st) |*st| st.deinit();
+                if (m.vae_st) |*st| st.deinit();
+                m.unet_st.deinit();
+                m.tok.deinit();
+            },
+        }
         gpa.destroy(self);
     }
 
     /// Generate one image, reusing the loaded models. Rebuilds only the
     /// per-image state: conditioning, the DiT session/workspace (depend on the
     /// prompt AND resolution), the noise latent, and the schedule.
+    /// The sigma schedule this session's family samples with: `steps + 1` values,
+    /// descending, ending at 0. krea2 reads `shift`; SD1.5 ignores it (its ladder
+    /// comes from the training betas), which is why this is a method rather than the
+    /// free `pipeline.schedule` — a caller that cannot see the family cannot pick.
+    pub fn schedule(self: *const Session, gpa: std.mem.Allocator, steps: usize, shift: f32) ![]f32 {
+        return switch (self.models) {
+            .krea2 => sampler.simpleSchedule(gpa, steps, shift),
+            .sd15 => sampler.sdSchedule(gpa, steps),
+        };
+    }
+
+    /// Latent channel count for this family — 16 for krea2's Wan VAE, 4 for SD's
+    /// AutoencoderKL. A caller sizing its own latent needs this.
+    pub fn latentChannels(self: *const Session) usize {
+        return switch (self.models) {
+            .krea2 => wan_vae.latent_channels,
+            .sd15 => |*m| m.unet.cfg.channels,
+        };
+    }
+
     /// Stage 1 — text → conditioning, on the resident encoder. Caller frees the
     /// returned `Cond`. Device allocations are tagged `.te` for the VRAM meter.
     pub fn encode(self: *Session, gpa: std.mem.Allocator, text: []const u8, o: EncodeOptions) !Cond {
         self.setMemTag(.te);
-        return encodePrompt(self.io, gpa, self.gpu_ctx, self.cu_be, o.encoder_f16, &self.tok, &self.enc, text, o.cancel);
+        switch (self.models) {
+            .krea2 => |*m| return encodePrompt(self.io, gpa, self.gpu_ctx, self.cu_be, o.encoder_f16, &m.tok, &m.enc, text, o.cancel),
+            .sd15 => |*m| {
+                const ids = try m.tok.encode(gpa, text);
+                defer gpa.free(ids);
+                const hidden = try gpa.alloc(f32, ids.len * m.clip.cfg.hidden);
+                errdefer gpa.free(hidden);
+                try m.clip.forward(self.io, gpa, hidden, ids, null);
+                return .{ .data = hidden, .seq = ids.len };
+            },
+        }
     }
 
     /// Stage 2 — build the per-image denoiser (see `Denoiser`). `cond_neg` and a
@@ -795,6 +1318,18 @@ pub const Session = struct {
         };
         errdefer d.deinit(gpa);
 
+        // SD1.5 is CPU-only and has no device sessions to build; what it does need is
+        // the UNet workspace and the input-scaling scratch, both per resolution.
+        if (self.models == .sd15) {
+            const m = &self.models.sd15;
+            const n = m.unet.cfg.channels * lat_h * lat_w;
+            if (use_cfg) d.v_neg = try gpa.alloc(f32, n);
+            d.sd_scaled = try gpa.alloc(f32, n);
+            d.sd_eps = try gpa.alloc(f32, n);
+            d.sd_ws = try sd_unet.Workspace.init(gpa, &m.unet, lat_h, lat_w);
+            return d;
+        }
+
         if (use_cfg) d.v_neg = try gpa.alloc(f32, wan_vae.latent_channels * lat_h * lat_w);
 
         // The per-image device buffers (session + activation workspace) are the
@@ -808,13 +1343,14 @@ pub const Session = struct {
         // One workspace, shared by both conditioning passes, sized to the longer
         // of the two sequences.
         const seq_cap = @max(cond_pos.seq, if (cond_neg) |c| c.seq else 0);
+        const dit = &self.k().dit;
         if (self.cu_be) |b| {
-            d.cu_pos = try dit_cuda.Session.init(gpa, self.io, b, &self.dit, lat_h, lat_w, cond_pos.data, cond_pos.seq);
-            if (use_cfg) d.cu_neg = try dit_cuda.Session.init(gpa, self.io, b, &self.dit, lat_h, lat_w, cond_neg.?.data, cond_neg.?.seq);
+            d.cu_pos = try dit_cuda.Session.init(gpa, self.io, b, dit, lat_h, lat_w, cond_pos.data, cond_pos.seq);
+            if (use_cfg) d.cu_neg = try dit_cuda.Session.init(gpa, self.io, b, dit, lat_h, lat_w, cond_neg.?.data, cond_neg.?.seq);
             d.cu_ws = try dit_cuda.Workspace.init(b, lat_h, lat_w, seq_cap);
         } else if (self.gpu_ctx) |gc| {
-            d.vk_pos = try dit_gpu.Session.init(gpa, self.io, gc, &self.dit, lat_h, lat_w, cond_pos.data, cond_pos.seq, sigmas);
-            if (use_cfg) d.vk_neg = try dit_gpu.Session.init(gpa, self.io, gc, &self.dit, lat_h, lat_w, cond_neg.?.data, cond_neg.?.seq, sigmas);
+            d.vk_pos = try dit_gpu.Session.init(gpa, self.io, gc, dit, lat_h, lat_w, cond_pos.data, cond_pos.seq, sigmas);
+            if (use_cfg) d.vk_neg = try dit_gpu.Session.init(gpa, self.io, gc, dit, lat_h, lat_w, cond_neg.?.data, cond_neg.?.seq, sigmas);
             d.vk_ws = try dit_gpu.Workspace.init(gc, lat_h, lat_w, seq_cap);
         }
         return d;
@@ -856,6 +1392,42 @@ pub const Session = struct {
     ) !Image {
         const gpa = self.gpa;
         const io = self.io;
+
+        // SD1.5's decode is one straight pass: no tiling ladder, no VRAM reclaim, no
+        // per-channel latent statistics — its AutoencoderKL takes `z / scaling_factor`
+        // and that is the whole normalization. Handled first so none of the krea2
+        // machinery below has to be made conditional.
+        if (self.models == .sd15) {
+            const m = &self.models.sd15;
+            const ch = m.unet.cfg.channels;
+            if (latent.len != ch * lat_h * lat_w) return error.LatentSizeMismatch;
+            try note(progress, "decoding latent...\n", .{});
+            // Planar [c][h][w] in, channel-last [h*w][c] for the decoder.
+            const z = try gpa.alloc(f32, latent.len);
+            defer gpa.free(z);
+            const plane = lat_h * lat_w;
+            const inv = 1.0 / m.vae.cfg.scaling_factor;
+            for (0..plane) |px| {
+                for (0..ch) |c| z[px * ch + c] = latent[c * plane + px] * inv;
+            }
+            const rgb_rows = try m.vae.decode(io, gpa, z, lat_h, lat_w);
+            defer gpa.free(rgb_rows);
+            // Back to planar for the shared f32 -> RGB8 conversion.
+            const width = lat_w * 8;
+            const height = lat_h * 8;
+            const planar = try gpa.alloc(f32, rgb_rows.len);
+            defer gpa.free(planar);
+            const px_count = width * height;
+            for (0..px_count) |px| {
+                for (0..3) |c| planar[c * px_count + px] = rgb_rows[px * 3 + c];
+            }
+            return .{
+                .rgb = try image.planarF32ToRgb8(gpa, planar, width, height),
+                .width = width,
+                .height = height,
+            };
+        }
+
         if (latent.len != wan_vae.latent_channels * lat_h * lat_w) return error.LatentSizeMismatch;
 
         // Device allocations here (VAE weights + decode scratch) are tagged VAE.
@@ -879,7 +1451,7 @@ pub const Session = struct {
         }
         try note(progress, "decoding latent...\n", .{});
         const dec_start = std.Io.Clock.real.now(io);
-        const vae = &self.vae;
+        const vae = &self.k().vae;
         // The whole-image decode is fastest and seamless, but its peak VRAM — in
         // particular the O(seq²) mid-block attention scores plane — grows with
         // image area and OOMs on large images. When it won't fit we decode in
@@ -1073,7 +1645,12 @@ pub const Session = struct {
         if (opts.steps < 1) return error.NoSteps;
         const lat_h = opts.height / 8;
         const lat_w = opts.width / 8;
-        const lat_len = wan_vae.latent_channels * lat_h * lat_w;
+        // Family-dependent: 16 latent channels for krea2's Wan VAE, 4 for SD's
+        // AutoencoderKL. Hardcoding 16 here ran SD's 4-channel UNet correctly for
+        // four steps and then failed in `decode` with `LatentSizeMismatch` — the
+        // sampling loop only ever touches whole latents, so the mismatch surfaced as
+        // far from its cause as possible.
+        const lat_len = self.latentChannels() * lat_h * lat_w;
         const use_cfg = opts.cfg != 1.0;
         const total_start = std.Io.Clock.real.now(io);
 
@@ -1153,7 +1730,7 @@ pub const Session = struct {
             // + activation reserve don't fit in the live free VRAM with the encoder
             // still resident (room already counts the encoder as reclaimable, so
             // the test reduces to dit + reserve > free_now).
-            const dit_bytes = self.dit_st.payloadLen();
+            const dit_bytes = self.denoiserPayloadLen();
             if (dit_bytes + pin_reserve > free_now) {
                 // evictUnpinned (NOT evictWeights): keep a DiT pinned by a previous
                 // queued image, drop only the (unpinned) encoder + any stray stream.
@@ -1169,6 +1746,11 @@ pub const Session = struct {
         // DiT; the per-image working set (GPU session, activation workspace,
         // preview decode) is tagged `latent` below.
         self.setMemTag(.dit);
+        // The schedule comes first now: the initial latent is scaled by `sigmas[0]`,
+        // which is 1.0 for krea2 (a no-op, bit-identical) and ~14.6 for SD.
+        const sigmas = try self.schedule(gpa, opts.steps, opts.shift);
+        defer gpa.free(sigmas);
+
         const x = try gpa.alloc(f32, lat_len);
         defer gpa.free(x);
         // Resume: restore the suspended latent instead of drawing fresh noise
@@ -1176,11 +1758,14 @@ pub const Session = struct {
         // length mismatch (shouldn't happen — resume reuses the same opts) falls
         // back to a fresh draw rather than a bad copy.
         if (opts.resume_from) |r| {
-            if (r.latent.len == x.len) @memcpy(x, r.latent) else sampler.fillNoise(x, opts.seed);
-        } else sampler.fillNoise(x, opts.seed);
-
-        const sigmas = try schedule(gpa, opts.steps, opts.shift);
-        defer gpa.free(sigmas);
+            if (r.latent.len == x.len) @memcpy(x, r.latent) else {
+                sampler.fillNoise(x, opts.seed);
+                sampler.scaleInitialNoise(x, sigmas[0]);
+            }
+        } else {
+            sampler.fillNoise(x, opts.seed);
+            sampler.scaleInitialNoise(x, sigmas[0]);
+        }
 
         {
             const v = try gpa.alloc(f32, lat_len);
@@ -1627,4 +2212,194 @@ test "DitContainer picks the reader by magic, not by extension" {
     try std.testing.expect(c == .safetensors);
     try std.testing.expectEqual(@as(usize, 1), c.store().count());
     try std.testing.expectEqual(@as(usize, 8), c.payloadLen());
+}
+
+test "family detection reads the denoiser's own tensor names" {
+    // Name-based rather than flag-based on purpose: a mistyped `--arch` in front of a
+    // measurement is exactly the kind of input error the whole harness exists to rule
+    // out. Both spellings of each family must resolve — a full single-file checkpoint
+    // keeps the LDM container prefix, and ggufy's model-only GGUF strips it.
+    const gpa = std.testing.allocator;
+
+    const cases = [_]struct { name: []const u8, want: Family }{
+        .{ .name = "model.diffusion_model.input_blocks.0.0.weight", .want = .sd15 },
+        .{ .name = "input_blocks.0.0.weight", .want = .sd15 },
+        .{ .name = "model.diffusion_model.blocks.0.attn.wq.weight", .want = .krea2 },
+        .{ .name = "blocks.0.attn.wq.weight", .want = .krea2 },
+    };
+    for (cases) |c| {
+        var buf: [512]u8 = undefined;
+        const header = try std.fmt.bufPrint(&buf, "{{\"{s}\":{{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}}}}", .{c.name});
+        const file = try gpa.alloc(u8, 8 + header.len + 8);
+        defer gpa.free(file);
+        std.mem.writeInt(u64, file[0..8], header.len, .little);
+        @memcpy(file[8..][0..header.len], header);
+        @memset(file[8 + header.len ..], 0);
+
+        var st = try safetensors.SafeTensors.initFromSlice(gpa, file);
+        defer st.deinit();
+        try std.testing.expectEqual(c.want, try detectFamily(.{ .safetensors = &st }));
+        // And the component resolver finds the denoiser under whichever spelling the
+        // file used, handing back a store in which it sits at the root.
+        var r = try resolveComponent(gpa, c.want, .denoiser, .{ .safetensors = &st }, null, false);
+        defer if (r.view) |v| {
+            v.deinit(gpa);
+            gpa.destroy(v);
+        };
+        const probe = componentSpec(c.want, .denoiser).probe;
+        try std.testing.expect(r.store.get(probe) != null);
+    }
+
+    // A checkpoint of neither family is an error, not a default: silently treating an
+    // unknown architecture as krea2 would fail deep inside a weight load.
+    {
+        const header = "{\"nonsense.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}}";
+        var file: [8 + header.len + 8]u8 = undefined;
+        std.mem.writeInt(u64, file[0..8], header.len, .little);
+        @memcpy(file[8..][0..header.len], header);
+        @memset(file[8 + header.len ..], 0);
+        var st = try safetensors.SafeTensors.initFromSlice(gpa, &file);
+        defer st.deinit();
+        try std.testing.expectError(error.UnknownArchitecture, detectFamily(.{ .safetensors = &st }));
+    }
+}
+
+test "container style is orthogonal to family: bundled, split, and explicit override" {
+    // The rule this pins, which an earlier version got wrong by tying container style
+    // to the architecture: any family ships joined OR split, an explicitly requested
+    // file overrides a bundled component, and a *defaulted* path never does.
+    const gpa = std.testing.allocator;
+
+    const Builder = struct {
+        /// A one-tensor safetensors file under `name`.
+        fn file(buf: []u8, name: []const u8) ![]u8 {
+            var hdr: [512]u8 = undefined;
+            const header = try std.fmt.bufPrint(&hdr, "{{\"{s}\":{{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}}}}", .{name});
+            std.mem.writeInt(u64, buf[0..8], header.len, .little);
+            @memcpy(buf[8..][0..header.len], header);
+            @memset(buf[8 + header.len ..][0..8], 0);
+            return buf[0 .. 8 + header.len + 8];
+        }
+    };
+
+    // A "bundled" primary: the SD conditioner nested under the LDM prefix.
+    var b1: [640]u8 = undefined;
+    var bundled = try safetensors.SafeTensors.initFromSlice(gpa, try Builder.file(&b1, "cond_stage_model.transformer.text_model.final_layer_norm.weight"));
+    defer bundled.deinit();
+    // A separate conditioner file, bare HF spelling.
+    var b2: [640]u8 = undefined;
+    var side = try safetensors.SafeTensors.initFromSlice(gpa, try Builder.file(&b2, "text_model.final_layer_norm.weight"));
+    defer side.deinit();
+
+    const probe = componentSpec(.sd15, .conditioner).probe;
+
+    // 1. Bundled only: found inside the primary, through a prefix view.
+    {
+        var r = try resolveComponent(gpa, .sd15, .conditioner, .{ .safetensors = &bundled }, null, false);
+        defer if (r.view) |v| {
+            v.deinit(gpa);
+            gpa.destroy(v);
+        };
+        try std.testing.expect(r.view != null);
+        try std.testing.expect(r.store.get(probe) != null);
+        // The view's namespace is the stripped one, or a consumer enumerating it
+        // (the capture sanity gate) would miss on every name.
+        try std.testing.expectEqual(@as(usize, 1), r.store.names().len);
+        try std.testing.expectEqualStrings(probe, r.store.names()[0]);
+    }
+
+    // 2. Split: the primary has no conditioner, the side file does.
+    {
+        var unet: [640]u8 = undefined;
+        var primary = try safetensors.SafeTensors.initFromSlice(gpa, try Builder.file(&unet, "model.diffusion_model.input_blocks.0.0.weight"));
+        defer primary.deinit();
+        var r = try resolveComponent(gpa, .sd15, .conditioner, .{ .safetensors = &primary }, .{ .safetensors = &side }, false);
+        defer if (r.view) |v| {
+            v.deinit(gpa);
+            gpa.destroy(v);
+        };
+        try std.testing.expect(r.store.get(probe) != null);
+    }
+
+    // 3. Explicit override: the primary DOES carry one, and the flag still wins.
+    {
+        const r = try resolveComponent(gpa, .sd15, .conditioner, .{ .safetensors = &bundled }, .{ .safetensors = &side }, true);
+        defer if (r.view) |v| {
+            v.deinit(gpa);
+            gpa.destroy(v);
+        };
+        // Which prefix resolved is how we know WHERE it came from: the side file
+        // spells it `text_model.`, the bundle `cond_stage_model.transformer.text_model.`.
+        // (Both are candidate spellings, so "no view" would not have distinguished
+        // them — the first version of this test asserted that and was simply wrong.)
+        try std.testing.expectEqualStrings("text_model.", r.view.?.prefix);
+    }
+
+    // 4. A *defaulted* side file does NOT override a bundled component. (This is the
+    //    case that broke a joined SD checkpoint: the default krea2 encoder path was
+    //    treated as a request, so the resolver looked for CLIP inside qwen3.)
+    {
+        const r = try resolveComponent(gpa, .sd15, .conditioner, .{ .safetensors = &bundled }, .{ .safetensors = &side }, false);
+        defer if (r.view) |v| {
+            v.deinit(gpa);
+            gpa.destroy(v);
+        };
+        try std.testing.expectEqualStrings("cond_stage_model.transformer.text_model.", r.view.?.prefix);
+    }
+
+    // 5. Nowhere at all is an error, not a silent fallback.
+    {
+        var empty: [640]u8 = undefined;
+        var nothing = try safetensors.SafeTensors.initFromSlice(gpa, try Builder.file(&empty, "unrelated.weight"));
+        defer nothing.deinit();
+        try std.testing.expectError(
+            error.ComponentNotInCheckpoint,
+            resolveComponent(gpa, .sd15, .conditioner, .{ .safetensors = &nothing }, null, false),
+        );
+    }
+}
+
+test "the sampler's planar latent survives a round trip through the UNet's layout" {
+    // ⚠️ The bug this pins reached a rendered image. The sampler works in planar
+    // `[c][h][w]` (krea2's DiT and both VAEs do) while `sd_unet.forward` works in
+    // channel-last `[h*w][c]`, and feeding one to the other is **rms-preserving**:
+    // every value survives, only its position moves. Per-step magnitudes therefore
+    // matched the reference to a fraction of a percent while the image became a
+    // periodic streak pattern — and the UNet parity tests could not see it, because
+    // they transpose explicitly before calling `forward`.
+    const gpa = std.testing.allocator;
+    const ch = 4;
+    const h = 3;
+    const w = 5;
+    const plane = h * w;
+
+    const planar = try gpa.alloc(f32, ch * plane);
+    defer gpa.free(planar);
+    for (planar, 0..) |*v, i| v.* = @floatFromInt(i);
+
+    // Forward transposition, exactly as `predictSd` does it.
+    const cl = try gpa.alloc(f32, ch * plane);
+    defer gpa.free(cl);
+    for (0..plane) |px| {
+        for (0..ch) |c| cl[px * ch + c] = planar[c * plane + px];
+    }
+    // Channel-last means a position's channels are adjacent.
+    try std.testing.expectEqual(planar[0], cl[0]);
+    try std.testing.expectEqual(planar[plane], cl[1]);
+    try std.testing.expectEqual(planar[2 * plane], cl[2]);
+
+    const back = try gpa.alloc(f32, ch * plane);
+    defer gpa.free(back);
+    channelLastToPlanar(back, cl, ch, plane);
+    try std.testing.expectEqualSlices(f32, planar, back);
+
+    // And the property that makes the bug so quiet: the wrong layout has the SAME
+    // norm. Any test that only checks magnitudes passes on scrambled data.
+    var n_planar: f64 = 0;
+    var n_cl: f64 = 0;
+    for (planar, cl) |a, b| {
+        n_planar += a * a;
+        n_cl += b * b;
+    }
+    try std.testing.expectEqual(n_planar, n_cl);
 }

@@ -523,7 +523,7 @@ test "gpu decode matches comfyui reference" {
 
     var st = try @import("tp_core").safetensors.SafeTensors.open(gpa, io, vae_path);
     defer st.deinit();
-    var dec = try wan_vae.Decoder.load(gpa, &st);
+    var dec = try wan_vae.Decoder.load(gpa, .{ .safetensors = &st });
     defer dec.deinit();
 
     const out = try decode(&dec, ctx, io, gpa, z, 8, 8, null);

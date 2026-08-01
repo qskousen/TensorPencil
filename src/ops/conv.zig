@@ -33,6 +33,17 @@ pub const Conv2d = struct {
     k: usize,
     stride: usize = 1,
     pad: usize = 0,
+    /// Checkpoint tensor name, when the loader knows it — carried onto the `Weight`
+    /// this convolution's im2col GEMM is issued with.
+    ///
+    /// ⚠️ **Without it a convolutional model is invisible to `ops.matmul.probe`.** A
+    /// conv here *is* a GEMM, so the probe fires either way, but an untagged call
+    /// cannot be attributed to a layer — so an activation capture of a UNet would
+    /// record only its attention and feed-forward linears and silently omit the
+    /// convolutions holding most of its parameters. That is the same class of partial
+    /// coverage as the Vulkan capture that recorded 39 of 263 layers and looked
+    /// well-formed.
+    tag: ?[]const u8 = null,
 
     pub fn patchLen(self: Conv2d) usize {
         return self.k * self.k * self.ci;
@@ -107,11 +118,14 @@ pub fn conv2dBanded(
 
     // 1x1 stride-1 unpadded is a plain GEMM over positions — no patch buffer.
     if (conv.k == 1 and conv.stride == 1 and conv.pad == 0) {
-        return matmul.matmul(io, gpa, out, in, h * w, Weight.fromF32(conv.w, conv.co, conv.ci), conv.b);
+        var w1: Weight = Weight.fromF32(conv.w, conv.co, conv.ci);
+        w1.tag = conv.tag;
+        return matmul.matmul(io, gpa, out, in, h * w, w1, conv.b);
     }
 
     const patch_len = conv.patchLen();
-    const weight = Weight.fromF32(conv.w, conv.co, patch_len);
+    var weight: Weight = Weight.fromF32(conv.w, conv.co, patch_len);
+    weight.tag = conv.tag;
     const max_rows = @max(1, band_bytes / (ow * patch_len * 4));
     const buf = try gpa.alloc(f32, @min(oh, max_rows) * ow * patch_len);
     defer gpa.free(buf);

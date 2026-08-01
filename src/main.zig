@@ -942,7 +942,7 @@ fn cudaVaeTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, zh: usize) 
 
     var st = try TensorPencil.SafeTensors.open(arena, io, vae_path);
     defer st.deinit();
-    var dec = try wan_vae.Decoder.load(arena, &st);
+    var dec = try wan_vae.Decoder.load(arena, .{ .safetensors = &st });
     defer dec.deinit();
 
     const want = try dec.decode(io, arena, z, zh, zw, null);
@@ -996,7 +996,7 @@ fn cudaEncodeTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
 
     var st = try TensorPencil.SafeTensors.open(arena, io, te_path);
     defer st.deinit();
-    var enc = try qwen3.TextEncoder.load(arena, &st);
+    var enc = try qwen3.TextEncoder.load(arena, .{ .safetensors = &st });
     defer enc.deinit();
 
     const want = try enc.encode(io, arena, ids.items, null);
@@ -1470,8 +1470,10 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
             opts.dit_path = val;
         } else if (std.mem.eql(u8, flag, "--vae")) {
             opts.vae_path = val;
+            opts.explicit_vae = true;
         } else if (std.mem.eql(u8, flag, "--text-encoder")) {
             opts.text_encoder_path = val;
+            opts.explicit_text_encoder = true;
         } else if (std.mem.eql(u8, flag, "--mmap")) {
             // off => buffered read instead of mmap (ZFS-safe; see safetensors.zig).
             TensorPencil.safetensors.use_mmap = !(std.mem.eql(u8, val, "off") or std.mem.eql(u8, val, "0") or std.mem.eql(u8, val, "false"));
@@ -1575,7 +1577,7 @@ fn decodeLatent(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, z_path: []
 
     var st = try TensorPencil.SafeTensors.open(arena, io, "models/vae/krea2RealVae_v10.safetensors");
     defer st.deinit();
-    var dec = try vae.Decoder.load(arena, &st);
+    var dec = try vae.Decoder.load(arena, .{ .safetensors = &st });
     defer dec.deinit();
 
     const start = std.Io.Clock.real.now(io);

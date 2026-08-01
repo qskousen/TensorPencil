@@ -18,6 +18,7 @@ const safetensors = @import("tp_core").safetensors;
 const ops = @import("tp_ops");
 
 const SafeTensors = safetensors.SafeTensors;
+const weights_mod = @import("tp_core").weights;
 const Weight = ops.matmul.Weight;
 
 pub const latent_channels = 16;
@@ -112,7 +113,9 @@ pub const Decoder = struct {
     head_norm: []const f32,
     head_conv: Conv2d, // 96 -> 3
 
-    pub fn load(gpa: std.mem.Allocator, st: *const SafeTensors) !Decoder {
+    /// `store` may be a `weights.Prefixed` view of a bundled checkpoint — this loader
+    /// always sees the VAE at the root. See `weights.Prefixed`.
+    pub fn load(gpa: std.mem.Allocator, store: weights_mod.WeightStore) !Decoder {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const alloc = arena.allocator();
@@ -132,13 +135,13 @@ pub const Decoder = struct {
         for (stages) |stage| {
             var ci = stage.in;
             for (0..3) |_| {
-                ups[idx] = .{ .res = try loadRes(alloc, st, "decoder.upsamples", idx, ci, stage.out) };
+                ups[idx] = .{ .res = try loadRes(alloc, store, "decoder.upsamples", idx, ci, stage.out) };
                 ci = stage.out;
                 idx += 1;
             }
             if (stage.up) {
                 const name = try std.fmt.allocPrint(alloc, "decoder.upsamples.{d}.resample.1", .{idx});
-                ups[idx] = .{ .up = try loadConv(alloc, st, name, stage.out, stage.out / 2, 3) };
+                ups[idx] = .{ .up = try loadConv(alloc, store, name, stage.out, stage.out / 2, 3) };
                 idx += 1;
             }
         }
@@ -146,17 +149,17 @@ pub const Decoder = struct {
 
         // All arena allocations must happen before `arena` is copied into the
         // result — chunks allocated afterwards would be missed by deinit.
-        const post_quant = try loadConv(alloc, st, "conv2", 16, 16, 1);
-        const conv_in = try loadConv(alloc, st, "decoder.conv1", 16, 384, 3);
-        const mid_res1 = try loadRes(alloc, st, "decoder.middle", 0, 384, 384);
+        const post_quant = try loadConv(alloc, store, "conv2", 16, 16, 1);
+        const conv_in = try loadConv(alloc, store, "decoder.conv1", 16, 384, 3);
+        const mid_res1 = try loadRes(alloc, store, "decoder.middle", 0, 384, 384);
         const mid_attn: AttnBlock = .{
-            .norm = try loadGamma(alloc, st, "decoder.middle.1.norm.gamma", 384),
-            .qkv = try loadConv(alloc, st, "decoder.middle.1.to_qkv", 384, 1152, 1),
-            .proj = try loadConv(alloc, st, "decoder.middle.1.proj", 384, 384, 1),
+            .norm = try loadGamma(alloc, store, "decoder.middle.1.norm.gamma", 384),
+            .qkv = try loadConv(alloc, store, "decoder.middle.1.to_qkv", 384, 1152, 1),
+            .proj = try loadConv(alloc, store, "decoder.middle.1.proj", 384, 384, 1),
         };
-        const mid_res2 = try loadRes(alloc, st, "decoder.middle", 2, 384, 384);
-        const head_norm = try loadGamma(alloc, st, "decoder.head.0.gamma", 96);
-        const head_conv = try loadConv(alloc, st, "decoder.head.2", 96, 3, 3);
+        const mid_res2 = try loadRes(alloc, store, "decoder.middle", 2, 384, 384);
+        const head_norm = try loadGamma(alloc, store, "decoder.head.0.gamma", 96);
+        const head_conv = try loadConv(alloc, store, "decoder.head.2", 96, 3, 3);
 
         return .{
             .arena = arena,
@@ -443,7 +446,7 @@ pub fn rowsToPlanar(gpa: std.mem.Allocator, rows: []const f32, c: usize, n: usiz
 
 // --- weight loading --------------------------------------------------------
 
-fn loadGamma(alloc: std.mem.Allocator, st: *const SafeTensors, name: []const u8, c: usize) ![]f32 {
+fn loadGamma(alloc: std.mem.Allocator, st: weights_mod.WeightStore, name: []const u8, c: usize) ![]f32 {
     const view = st.get(name) orelse return error.MissingTensor;
     if (view.info.elemCount() != c) return error.ShapeMismatch;
     return view.toF32Alloc(alloc);
@@ -451,7 +454,7 @@ fn loadGamma(alloc: std.mem.Allocator, st: *const SafeTensors, name: []const u8,
 
 /// Load a conv weight (+bias), collapsing a causal temporal axis if present
 /// (last kt slice) and repacking to [co][kh][kw][ci].
-pub fn loadConv(alloc: std.mem.Allocator, st: *const SafeTensors, prefix: []const u8, ci: usize, co: usize, k: usize) !Conv2d {
+pub fn loadConv(alloc: std.mem.Allocator, st: weights_mod.WeightStore, prefix: []const u8, ci: usize, co: usize, k: usize) !Conv2d {
     const wname = try std.fmt.allocPrint(alloc, "{s}.weight", .{prefix});
     const bname = try std.fmt.allocPrint(alloc, "{s}.bias", .{prefix});
     const wview = st.get(wname) orelse return error.MissingTensor;
@@ -493,7 +496,7 @@ pub fn loadConv(alloc: std.mem.Allocator, st: *const SafeTensors, prefix: []cons
     return .{ .w = packed_w, .b = bias, .co = co, .ci = ci, .k = k };
 }
 
-fn loadRes(alloc: std.mem.Allocator, st: *const SafeTensors, base: []const u8, idx: usize, ci: usize, co: usize) !ResBlock {
+fn loadRes(alloc: std.mem.Allocator, st: weights_mod.WeightStore, base: []const u8, idx: usize, ci: usize, co: usize) !ResBlock {
     const p = try std.fmt.allocPrint(alloc, "{s}.{d}", .{ base, idx });
     const n1 = try std.fmt.allocPrint(alloc, "{s}.residual.0.gamma", .{p});
     const c1 = try std.fmt.allocPrint(alloc, "{s}.residual.2", .{p});
@@ -538,7 +541,7 @@ test "decode matches comfyui reference" {
 
     var st = try SafeTensors.open(gpa, io, vae_path);
     defer st.deinit();
-    var dec = try Decoder.load(gpa, &st);
+    var dec = try Decoder.load(gpa, .{ .safetensors = &st });
     defer dec.deinit();
 
     const out = try dec.decode(io, gpa, z, 8, 8, null);
@@ -598,7 +601,7 @@ test "decode stage parity" {
     defer gpa.free(z);
     var st = try SafeTensors.open(gpa, io, "models/vae/krea2RealVae_v10.safetensors");
     defer st.deinit();
-    var dec = try Decoder.load(gpa, &st);
+    var dec = try Decoder.load(gpa, .{ .safetensors = &st });
     defer dec.deinit();
 
     var x = try planarToRows(gpa, z, latent_channels, 64);

@@ -186,6 +186,178 @@ substitution moves *nothing else* — every other weight pointer-identical to an
 unpatched load. (`first`/`last.linear` are materialized to f32 at load, so those two
 compare by value.)
 
+## The SD family (SD1.5, then SDXL) — in progress
+
+Why it exists: ggufy's whole activation-aware quantization programme has measured **one**
+architecture (krea2), and its central finding — that per-tensor damage spans only 2.3x around the
+median, so precision routing cannot beat uniform allocation — is a statement about a stack of 28
+identical transformer blocks. A UNet is the most structurally different thing available (conv-dominated,
+four channel widths, multi-resolution), and SD1.5/SDXL are the two architectures whose hand-built
+`sensitivities/*.json` files ship today and have never been validated. SD1.5 is also 860M params, so its
+whole measurement ladder runs in minutes rather than krea2's hours.
+
+**Reference fixtures come from `tools/gen_sd15_fixtures.py`** — `transformers.CLIPTextModel`,
+`diffusers.UNet2DConditionModel`, `diffusers.AutoencoderKL` — in two tiers: pure-torch op references
+(`src/ops/assets/sd15_op_fixtures.json`, ungated) and real-checkpoint parity
+(`src/models/assets/sd15_ref.safetensors`, ~1.5 MB, `-Dintegration`, tied to one checkpoint by sha256).
+Full tensors where small, per-stage `(mean, l2, max)` triples where not, so a mismatch localizes to a
+block instead of failing at the end.
+
+| piece | state |
+|---|---|
+| `ops.norm.groupNorm` | ✅ matches `F.group_norm` |
+| `ops.act.geluQuick` / `geluErf` (ungated forms) | ✅ |
+| `models.clip_text` (CLIP-L + CLIP-G configs) | ✅ matches `CLIPTextModel` on a real checkpoint |
+| `models.sd_unet` (SD1.5 config; SDXL by config) | ✅ matches `UNet2DConditionModel`, rel L2 < 1e-3 |
+| `models.sd_vae` (AutoencoderKL decoder) | ✅ matches `AutoencoderKL.decode`, rel L2 < 2e-3 |
+| `sampler.sd*` (discrete-eps schedule) | ✅ matches `EulerDiscreteScheduler` (ladder, 4- and 10-step sigmas, timesteps) |
+
+⚠️ **The layout convention is the one that actually bit, and it is rms-preserving.** The sampler works in
+planar `[c][h][w]` (krea2's DiT and both VAEs do, and `generate`/`decode` are written to it) while
+`sd_unet.forward` works in channel-last `[h*w][c]`. Feeding one to the other moves every value's *position*
+and none of its magnitude, so per-step eps/x norms matched the reference to a fraction of a percent while
+the render became a periodic streak pattern. Two things hid it for a long bisection: the UNet parity tests
+**transpose explicitly** before calling `forward`, so they validated the UNet and not the pipeline's
+convention; and a dump-and-compare against diffusers **interpreted the dumped buffer the same wrong way**,
+so both sides scrambled identically and "agreed" to 1e-5. The tell was that magnitudes agreed while the
+image did not — that signature means a permutation, not an arithmetic error. `Denoiser.predictSd` owns the
+transposition now, and a fast test pins the round trip *and* the fact that the wrong layout has the same
+norm. **Verified end to end: 50.9 dB against a diffusers reference render** (512², 20 steps, CFG 7.5).
+
+⚠️ **A parity test is only as good as the reference's *configuration*, and this cost a visibly bad
+image.** The first schedule matched `EulerDiscreteScheduler` exactly — configured with
+`timestep_spacing="leading"` (the old PNDM discretization), which starts a 4-step run at index 751,
+**sigma 4.12 instead of 14.615**. So the sampler was told the latent was only moderately noisy while
+`scaleInitialNoise` had scaled it as pure noise: no global structure formed and the render came out as
+noise-textured mush. The implementation was a *correct* port of the wrong convention, and every test
+passed. `linspace` (999 → 0, `steps_offset = 0`) is what k-diffusion Euler uses for SD1.5 and what
+ComfyUI/A1111 sample with; `sampler.sdTrainIndex` owns that choice and documents it.
+| `core.clip_tokenizer` (CLIP BPE) | ✅ matches `CLIPTokenizer` on 10 adversarial cases |
+| `Session` family generalization | ✅ `pipeline.Family`, both families behind one stage API |
+
+### One `Session`, two families
+
+`Session.models` is a `union(Family)` over `Krea2Models` (three checkpoints) and `Sd15Models` (normally
+one), and the stage API is unchanged — `encode` → `denoiser` → `predict` → `decode` dispatch internally,
+so **every existing caller, including ggufy's whole measurement ladder, works on both families**. What
+made that possible is that the Euler step consumes the same quantity either way: krea2's velocity and
+SD's eps are both the trajectory derivative.
+
+New family-aware surface, because these are the things a caller genuinely cannot decide for itself:
+`Session.family()`, `.schedule(gpa, steps, shift)` (krea2 reads `shift`; SD's ladder comes from the
+training betas and ignores it), `.latentChannels()` (16 vs 4), `.denoiserStore()` and
+`.replaceDenoiser()` — the last two replacing `dit_st`/`replaceDit`, since "the denoiser's container" is
+now the family-neutral concept the per-tensor attribution arm needs.
+
+- **The family is detected from the denoiser's own tensor names** (`detectFamily`), never from a flag: a
+  mistyped `--arch` in front of a measurement is exactly the input error the harness exists to exclude.
+  Both spellings resolve — a full single-file checkpoint keeps the `model.diffusion_model.` prefix,
+  ggufy's model-only GGUF strips it — and an unknown architecture is an error rather than a default.
+### Container style is orthogonal to architecture
+
+⚠️ **Joined-vs-split is NOT a property of the family.** Any architecture ships either as one bundled
+checkpoint (denoiser + text encoder + VAE in a single file, each under its own prefix) or as separate
+files, and the same model is distributed both ways. An earlier version of this code tied the two together
+— krea2 always split, SD allowed to be joined — which is simply wrong.
+
+`resolveComponent` decides per component (`denoiser` / `conditioner` / `decoder`) with the precedence the
+CLI promises:
+
+1. **An explicitly given `--text-encoder` / `--vae` wins**, even when the primary checkpoint also carries
+   that component. Overriding a bundled component is the entire reason to pass the flag.
+2. Otherwise the primary checkpoint's own copy, under any of its known prefix spellings.
+3. Otherwise a *defaulted* side path (`Options`' krea2 files).
+4. Nowhere → `error.ComponentNotInCheckpoint`, rather than a confusing failure deep in a weight load.
+
+⚠️ **A defaulted path is not a request, and conflating the two broke a joined SD1.5 checkpoint**: the
+resolver dutifully opened krea2's qwen3 encoder (the `Options` default), looked for CLIP's tensors in it,
+and reported `ComponentNotInCheckpoint`. Hence `Options.explicit_text_encoder` / `explicit_vae`, which a
+CLI sets only when the flag was actually present — and hence a defaulted side path that does not exist on
+disk is not an error, while an explicit one that cannot be opened still fails loudly.
+
+⚠️ **`generate`'s latent length is `latentChannels()`, not 16.** Hardcoding krea2's count ran SD's
+4-channel UNet correctly for four steps and then failed in `decode` with `LatentSizeMismatch` — the
+sampling loop only ever handles whole latents, so the mismatch surfaced as far from its cause as possible.
+
+**`weights.Prefixed` is what makes that cost nothing per loader.** It is a fourth `WeightStore` arm — a
+base store plus a prefix — so a loader is always handed a store in which *its* component sits at the root,
+exactly as if it had come from a dedicated file. No loader takes a prefix parameter, no caller needs to
+know which spelling a file used, and it generalizes to every future architecture. (`qwen3.TextEncoder.load`
+and `wan_vae.Decoder.load` now take a `WeightStore` instead of a `*const SafeTensors` for this reason.)
+⚠️ Its `names()` returns the **stripped** names, built once at construction: a consumer that enumerates a
+prefixed view and then looks those names up — the activation-capture sanity gate does exactly that — would
+otherwise miss on every one.
+
+The concrete case this exists for: ggufy writes a GGUF holding **only** the UNet, so a *quantized* SD arm
+is measured with the UNet from the GGUF and CLIP + VAE from the original checkpoint, while an unquantized
+arm reads all three out of one file.
+- ⚠️ **SD1.5 is refused on any GPU backend** (`error.UnsupportedBackend`). There are no device kernels
+  for this UNet, and the failure mode of pretending otherwise is already on the record: when `pipeline`
+  learned to open a GGUF, Vulkan rendered a blank white image with no error.
+- ⚠️ **`sampler.scaleInitialNoise` is applied unconditionally and is a no-op for krea2.** Flow matching
+  starts at sigma = 1, so the multiply is by exactly 1.0 (bit-identical, and the function early-returns);
+  SD's ladder starts near **14.6**, and skipping it hands the UNet a latent 15× too small — it denoises
+  something that was never noisy and produces a washed image with no error anywhere.
+- ⚠️ **`ops.conv.Conv2d` now carries a `tag`.** A convolution here *is* an im2col GEMM, so
+  `ops.matmul.probe` always fired on it — but untagged, meaning an activation capture of a UNet would
+  have recorded only its attention and feed-forward linears and silently omitted the convolutions holding
+  most of its parameters. Same class of partial coverage as the Vulkan capture that recorded 39 of 263
+  layers and passed its own sanity gate. The im2col GEMM's columns are `ci·kh·kw`, which is exactly how
+  ggufy quantizes a rank-4 conv weight — so a per-column imatrix lines up without reinterpretation.
+- **A named `Models` union, not an inline one:** an anonymous `union(Family)` in the field makes the
+  compiler derive its name from the first field's type and then report a dependency loop.
+
+**The SD family's sampling differs from krea2's in three ways that all have to line up**
+(`sampler.zig`'s discrete-eps section): sigma comes from a discrete beta ladder rather than a formula, the
+model is conditioned on a **timestep index** so a chosen sigma must be inverted back to a (fractional)
+index, and the input is pre-scaled by `1/sqrt(sigma²+1)`. The *step* is the same Euler, because for
+eps-prediction the trajectory derivative **is** eps — which is what lets ggufy's teacher-forced level 2
+compare both families without knowing which it is looking at.
+
+⚠️ **Two module-boundary facts worth knowing before adding fixtures.** `tp_core` is rooted at
+`src/core/core.zig`, so it cannot `@embedFile` anything under `src/ops/` or `src/models/` — each module
+owns its own fixtures (hence `src/core/assets/clip_tokenizer/fixtures.json` separate from
+`src/ops/assets/sd15_op_fixtures.json`), and it cannot import `test_gate` either, so a `tp_core` fixture
+test self-skips by catching the open error instead.
+
+⚠️ **The VAE's GroupNorm epsilon is 1e-6, the UNet's is 1e-5**, and `decoder.up.N` is indexed from the
+**outermost** level while the forward runs `up.3 … up.0`. Reading the list forwards gives a decoder that
+runs and inverts the channel ramp.
+
+**The UNet is the first convolutional, multi-resolution model here.** Activations stay channel-last
+`[h*w][c]` (so a 1×1 convolution *is* a GEMM over pixels and `ops.conv` handles the 3×3s), the skip stack
+is LIFO and includes the stem's output (12 skips for 12 output blocks), and the `Workspace` sizes its
+ping-pong buffers for the widest stage once per resolution rather than per step. Two naming traps cost a
+cycle each: `ops.conv.conv2dBanded` takes an explicit band size (`conv2d` is the defaulted form), and a
+`res`/`spatial` helper that builds an already-prefixed base name and passes it back through the prefixing
+loader produces `model.diffusion_model.model.diffusion_model.…`, which surfaces as a *missing tensor*
+rather than as the naming bug it is.
+
+⚠️ **`timestepEmbedding` computes in f64 on purpose.** diffusers computes it in f32, and at `i = 0` the
+argument is the timestep itself (~1000), so a 1e-7 relative slip becomes ~1e-4 in `cos`. Being *more*
+accurate than the reference bounds the disagreement by the reference's own rounding instead of stacking
+two errors — hence a 2e-4 fixture tolerance rather than 1e-6.
+
+⚠️ **`GroupNorm`'s statistics are not per-position**, unlike every other norm here: it reduces over
+`h·w·(channels/groups)` values at once, and uses the **biased** variance (divide by `n`) to match torch.
+With 640 values per group the biased/unbiased difference is ~0.08% — too small to look like a bug.
+
+⚠️ **Three checkpoint-reality traps, all hit while landing CLIP-L**, and each cost a debugging cycle:
+
+- **An SD1.5 merge in the wild stores its CLIP linears as `f64`.** `convertToF32` now reads f64 (ComfyUI
+  casts them too), and `ops.matmul.supportsDType` lets a *loader* decide up front whether to materialize
+  a weight to f32 instead of discovering it from inside the first forward. Integer dtypes stay refused:
+  silently floating `position_ids` is never right.
+- **`.arena = arena` in a struct literal copies the arena's state before later fields allocate into it**,
+  so anything allocated by a *later* field initializer leaks — invisible except to the test allocator.
+  Build every field into a local first, then construct. (`dit.zig` already does; `clip_text` had to
+  learn.)
+- **`CLIPTokenizer(vocab_file=…, merges_file=…)` silently produces meaningless ids** — without the
+  directory's `tokenizer_config.json` / `special_tokens_map.json` there is no bos/eos/pad, so every word
+  becomes the unknown token. The hidden-state comparison *passed* on those ids, because both sides were
+  fed the same garbage; only the pooled-output lookup (no eos to find) caught it. Fixture content is part
+  of a fixture's correctness.
+
 ## Image metrics and LPIPS
 
 `tp.image` carries the comparison metrics (`mse`, `psnr`, `ssim`, `detailEnergy`) and

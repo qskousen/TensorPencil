@@ -249,16 +249,18 @@ pub const TextEncoder = struct {
     /// Layers 0..34 — the last tap fires before layer 35.
     layers: []Layer,
 
-    pub fn load(gpa: std.mem.Allocator, st: *const SafeTensors) !TextEncoder {
+    /// `store` may be a `weights.Prefixed` view of a bundled checkpoint — this loader
+    /// always sees its own component at the root. See `weights.Prefixed`.
+    pub fn load(gpa: std.mem.Allocator, store: weights_mod.WeightStore) !TextEncoder {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const alloc = arena.allocator();
 
-        const embed = try st.require("model.language_model.embed_tokens.weight");
+        const embed = try store.require("model.language_model.embed_tokens.weight");
         if (embed.info.dtype != .bf16 or embed.info.elemCount() != vocab_size * hidden)
             return error.ShapeMismatch;
 
-        const layers = try loadLayers(alloc, st, n_layers - 1);
+        const layers = try loadLayers(alloc, store, n_layers - 1);
 
         return .{ .arena = arena, .embed_bytes = embed.bytes, .layers = layers };
     }
@@ -556,8 +558,8 @@ pub const Scratch = struct {
     }
 };
 
-fn loadLayers(alloc: std.mem.Allocator, st: *const SafeTensors, count: usize) ![]Layer {
-    return loadLayersCfg(alloc, .{ .safetensors = st }, Config.vl_4b, count);
+fn loadLayers(alloc: std.mem.Allocator, store: WeightStore, count: usize) ![]Layer {
+    return loadLayersCfg(alloc, store, Config.vl_4b, count);
 }
 
 fn loadLayersCfg(alloc: std.mem.Allocator, store: WeightStore, cfg: Config, count: usize) ![]Layer {
@@ -798,7 +800,7 @@ test "krea2 conditioning matches comfyui" {
 
     var st = try SafeTensors.open(gpa, io, te_path);
     defer st.deinit();
-    var enc = try TextEncoder.load(gpa, &st);
+    var enc = try TextEncoder.load(gpa, .{ .safetensors = &st });
     defer enc.deinit();
 
     const cond = try enc.encode(io, gpa, ids.items, null);

@@ -46,7 +46,11 @@ pub const Decoder = struct {
         errdefer arena.deinit();
         const a = arena.allocator();
 
-        const conv_in = try wan_vae.loadConv(a, st, "decoder.1", 16, 256, 3);
+        // `wan_vae`'s loaders take a `WeightStore` now (so a component can be read
+        // through a prefix view of a bundled checkpoint); taehv's own container is a
+        // plain safetensors file, wrapped here once.
+        const store: @import("tp_core").weights.WeightStore = .{ .safetensors = st };
+        const conv_in = try wan_vae.loadConv(a, store, "decoder.1", 16, 256, 3);
         // (n, first mem-block index, tgrow index, tgrow output ch, stage-conv
         // index, stage-conv out).
         const specs = [3]struct { n: usize, mb0: usize, tg: usize, tg_co: usize, sc: usize, sc_co: usize }{
@@ -61,19 +65,19 @@ pub const Decoder = struct {
                 const base = s.mb0 + j;
                 // conv0: load full (ci=2n) then keep the first-half input
                 // channels (the x side of cat[x, past=0]).
-                var c0 = try loadSub(a, st, base, "conv.0", s.n * 2, s.n, 3);
+                var c0 = try loadSub(a, store, base, "conv.0", s.n * 2, s.n, 3);
                 c0 = try firstHalfInput(a, c0);
                 b.* = .{
                     .conv0 = c0,
-                    .conv2 = try loadSub(a, st, base, "conv.2", s.n, s.n, 3),
-                    .conv4 = try loadSub(a, st, base, "conv.4", s.n, s.n, 3),
+                    .conv2 = try loadSub(a, store, base, "conv.2", s.n, s.n, 3),
+                    .conv4 = try loadSub(a, store, base, "conv.4", s.n, s.n, 3),
                     .n = s.n,
                 };
             }
             // TGrow 1x1 conv (decoder.<tg>.conv). Load full output channels,
             // then keep only the first `n` (the first-frame slice).
             const tg_name = try std.fmt.allocPrint(a, "decoder.{d}.conv", .{s.tg});
-            const tg_full = try wan_vae.loadConv(a, st, tg_name, s.n, s.tg_co, 1);
+            const tg_full = try wan_vae.loadConv(a, store, tg_name, s.n, s.tg_co, 1);
             // first-frame: keep only the first n output channels (the second
             // half of a stride-2 tgrow is the dropped second frame).
             const tg = firstNOutput(tg_full, s.n);
@@ -81,12 +85,12 @@ pub const Decoder = struct {
             stage.* = .{
                 .mb = mb,
                 .tgrow = tg,
-                .sc = try wan_vae.loadConv(a, st, sc_name, s.n, s.sc_co, 3),
+                .sc = try wan_vae.loadConv(a, store, sc_name, s.n, s.sc_co, 3),
                 .n = s.n,
             };
         }
 
-        const head_conv = try wan_vae.loadConv(a, st, "decoder.22", 64, 3, 3);
+        const head_conv = try wan_vae.loadConv(a, store, "decoder.22", 64, 3, 3);
         return .{ .arena = arena, .conv_in = conv_in, .stages = stages, .head_conv = head_conv };
     }
 
@@ -171,7 +175,7 @@ fn firstNOutput(cv: Conv2d, n: usize) Conv2d {
     return .{ .w = cv.w[0 .. n * per_out], .b = cv.b[0..n], .co = n, .ci = cv.ci, .k = cv.k };
 }
 
-fn loadSub(a: std.mem.Allocator, st: *const SafeTensors, base: usize, sub: []const u8, ci: usize, co: usize, k: usize) !Conv2d {
+fn loadSub(a: std.mem.Allocator, st: @import("tp_core").weights.WeightStore, base: usize, sub: []const u8, ci: usize, co: usize, k: usize) !Conv2d {
     const name = try std.fmt.allocPrint(a, "decoder.{d}.{s}", .{ base, sub });
     return wan_vae.loadConv(a, st, name, ci, co, k);
 }

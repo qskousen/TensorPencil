@@ -18,12 +18,14 @@ pub const WeightStore = union(enum) {
     safetensors: *const safetensors.SafeTensors,
     gguf: *const gguf.Gguf,
     overlay: *const Overlay,
+    prefixed: *const Prefixed,
 
     pub fn get(self: WeightStore, name: []const u8) ?TensorView {
         return switch (self) {
             .safetensors => |st| st.get(name),
             .gguf => |g| g.get(name),
             .overlay => |o| o.get(name),
+            .prefixed => |pfx| pfx.get(name),
         };
     }
 
@@ -37,6 +39,7 @@ pub const WeightStore = union(enum) {
             .safetensors => |st| st.count(),
             .gguf => |g| g.count(),
             .overlay => |o| o.base.count(),
+            .prefixed => |pfx| pfx.stripped.len,
         };
     }
 
@@ -48,6 +51,10 @@ pub const WeightStore = union(enum) {
             // base already has (`Overlay.put` enforces it), so the namespace is
             // unchanged and this stays honest without allocating.
             .overlay => |o| o.base.names(),
+            // The *stripped* names, built once at construction: a consumer that
+            // enumerates a prefixed view and then looks the results up must get the
+            // same namespace back, or every lookup misses.
+            .prefixed => |pfx| pfx.stripped,
         };
     }
 
@@ -57,6 +64,9 @@ pub const WeightStore = union(enum) {
         return switch (self) {
             .safetensors => |st| st.mapping,
             .gguf => |g| g.mapping,
+            // A prefixed view relabels names only; every tensor's bytes are still the
+            // base's, at the same offsets, so direct GPU streaming stays valid.
+            .prefixed => |pfx| pfx.base.mapping(),
             // Deliberately null rather than the base's mapping. A patched tensor's
             // bytes are caller-owned and lie OUTSIDE the base mapping, so a
             // consumer that turns a view into a mapping-relative offset (which is
@@ -93,6 +103,57 @@ pub const WeightStore = union(enum) {
 /// differently-shaped tensor is a bug every time (a transposed buffer, the wrong
 /// layer), and the shape check catches it here rather than as a puzzling
 /// `ShapeMismatch` from a loader 200 weights later.
+/// A view of one component inside a larger container: `get("decoder.conv_in.weight")`
+/// resolves `prefix ++ "decoder.conv_in.weight"` in the base.
+///
+/// This is what makes **container style orthogonal to architecture**. Any model may
+/// ship as one bundled checkpoint (denoiser + text encoder + VAE in a single file,
+/// each under its own prefix) or as separate files, and the same model is distributed
+/// both ways. Without this, every loader would need its own prefix parameter and every
+/// caller would need to know which spelling a given file used; with it, a loader is
+/// handed a store in which its component sits at the root — exactly as if it had come
+/// from a dedicated file.
+///
+/// ⚠️ **`names()` returns the STRIPPED names**, built once here. A consumer that
+/// enumerates the view and then looks those names up (the activation-capture sanity
+/// gate does exactly that) would otherwise miss on every one of them.
+pub const Prefixed = struct {
+    base: WeightStore,
+    prefix: []const u8,
+    /// Names under `prefix`, with it removed. Owned by this struct.
+    stripped: []const []const u8,
+
+    /// Borrows `base` and `prefix`; both must outlive this view (and the models
+    /// loaded through it).
+    pub fn init(gpa: std.mem.Allocator, base: WeightStore, prefix: []const u8) !Prefixed {
+        var list: std.ArrayList([]const u8) = .empty;
+        errdefer list.deinit(gpa);
+        for (base.names()) |n| {
+            if (std.mem.startsWith(u8, n, prefix)) try list.append(gpa, n[prefix.len..]);
+        }
+        return .{ .base = base, .prefix = prefix, .stripped = try list.toOwnedSlice(gpa) };
+    }
+
+    pub fn deinit(self: *Prefixed, gpa: std.mem.Allocator) void {
+        gpa.free(self.stripped);
+        self.* = undefined;
+    }
+
+    pub fn get(self: *const Prefixed, name: []const u8) ?TensorView {
+        // Stack-composed rather than allocated: names are short and this is on the
+        // load path for every weight.
+        var buf: [512]u8 = undefined;
+        if (self.prefix.len + name.len > buf.len) return null;
+        @memcpy(buf[0..self.prefix.len], self.prefix);
+        @memcpy(buf[self.prefix.len..][0..name.len], name);
+        return self.base.get(buf[0 .. self.prefix.len + name.len]);
+    }
+
+    pub fn store(self: *const Prefixed) WeightStore {
+        return .{ .prefixed = self };
+    }
+};
+
 pub const Overlay = struct {
     base: WeightStore,
     patch: std.StringHashMapUnmanaged(TensorView) = .empty,
