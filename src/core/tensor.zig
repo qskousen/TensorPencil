@@ -43,6 +43,23 @@ pub const TensorInfo = struct {
     shape: Shape,
     start: usize,
     end: usize,
+    /// True when this is a block-quantized tensor whose blocks tile the **flat**
+    /// element sequence rather than each row of `shape`.
+    ///
+    /// It arises from the ComfyUI-GGUF shape fix: a tensor whose contiguous dim is
+    /// not a multiple of 256 is stored reshaped to `(n/256, 256)`, so its blocks tile
+    /// 256-element storage rows, while `comfy.gguf.orig_shape` records the logical
+    /// shape a consumer must present it as. Restoring that shape is correct for the
+    /// *values* — flat row-major order is preserved — but it invalidates the
+    /// row-aligned blocking `matmul.Weight.init` requires, because the logical row
+    /// length need not be a multiple of the block size (a `[1280, 320]` q4_k tensor
+    /// is the SD1.5 case).
+    ///
+    /// A consumer that can only take row-aligned blocks must therefore
+    /// **materialize** such a tensor (`TensorView.toF32Alloc`, which dequantizes the
+    /// flat sequence) rather than point a packed `Weight` at its bytes. The model
+    /// loaders do that. Defaults false, so nothing that does not set it is affected.
+    flat_blocks: bool = false,
 
     pub fn byteLen(self: TensorInfo) usize {
         return self.end - self.start;

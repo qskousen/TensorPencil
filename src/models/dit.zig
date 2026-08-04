@@ -732,6 +732,15 @@ const Loader = struct {
             return error.ShapeMismatch;
         }
 
+        // A shape-fixed block-quantized tensor (`TensorInfo.flat_blocks`) has its
+        // blocks tiling the flat element sequence rather than each logical row, which
+        // is not what `Weight.init` assumes. krea2 never hits this — its only
+        // shape-fixed tensor, `first.weight`, is `keys_hiprec` and so unquantized —
+        // but refusing loudly beats a silently wrong byte count in ReleaseFast.
+        if (view.info.flat_blocks) {
+            std.log.err("dit: {s} is {t} with flat block layout (shape-fixed); the DiT loader needs row-aligned blocks", .{ nm, dt });
+            return error.UnsupportedCheckpoint;
+        }
         var w = Weight.init(view.bytes, wdt, rows, cols);
         // Carry the checkpoint name on the Weight so a GEMM can be attributed to a
         // layer downstream (ops.matmul.probe, profiling, error messages). Duped into

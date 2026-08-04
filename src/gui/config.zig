@@ -102,6 +102,152 @@ pub const TaesdSize = enum(u8) {
     }
 };
 
+/// Sampler for image generation. Mirrors `sampler.Kind`; kept here (like `Backend`)
+/// so the config data model stays free of an engine dependency, with `diffuser.zig`
+/// mapping it across.
+///
+/// The two SDE variants are DPM-Solver++(2M) SDE, differing only in how the
+/// multistep correction is applied — ComfyUI ships both under these names and they
+/// give visibly different images. Both draw their noise from a seed-determined
+/// Brownian tree, so a seed reproduces ComfyUI's render rather than merely being
+/// repeatable here. `eta`/`s_noise` are left at ComfyUI's defaults (1.0); the CLI's
+/// `--sde-eta` / `--sde-s-noise` can override them.
+/// Which prompt dialect the prompt boxes are written in. Load-neutral: it changes how
+/// the next image's prompt is parsed, not what is loaded.
+///
+/// ⚠️ Switching this changes the image for the SAME prompt text — `(x:1.2)` multiplies
+/// under A1111 and replaces under ComfyUI, `[x]` de-emphasizes under one and is literal
+/// text under the other. See `core/prompt_a1111.zig`.
+pub const PromptSyntax = enum(u8) {
+    comfy,
+    a1111,
+
+    pub fn label(self: PromptSyntax) []const u8 {
+        return switch (self) {
+            .comfy => "ComfyUI (default)",
+            .a1111 => "AUTOMATIC1111",
+        };
+    }
+
+    fn fromStr(s: []const u8) ?PromptSyntax {
+        inline for (@typeInfo(PromptSyntax).@"enum".fields) |f| {
+            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        }
+        return null;
+    }
+};
+
+/// How an A1111 attention weight reaches the hidden states. Meaningless under the
+/// ComfyUI dialect, which has exactly one form.
+pub const Emphasis = enum(u8) {
+    original,
+    no_norm,
+    ignore,
+
+    pub fn label(self: Emphasis) []const u8 {
+        return switch (self) {
+            .original => "Original (restore chunk mean)",
+            .no_norm => "No norm (better for SDXL)",
+            .ignore => "Ignore (strip weights)",
+        };
+    }
+
+    fn fromStr(s: []const u8) ?Emphasis {
+        inline for (@typeInfo(Emphasis).@"enum".fields) |f| {
+            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        }
+        return null;
+    }
+};
+
+/// Whose **sampling** conventions to reproduce — a separate axis from `PromptSyntax`,
+/// which is about the prompt text. See `pipeline.Compat`.
+///
+/// ⚠️ Switching this changes the image for the same seed, and more drastically than any
+/// other setting here: A1111 draws its noise from NVIDIA's Philox rather than torch's CPU
+/// generator, so the seed does not merely shift the result — it starts somewhere else
+/// entirely. The two sampling-convention differences that ride along with it (initial
+/// noise scale, fractional vs trained timestep) are worth ~9 dB and ~25 dB.
+pub const Compat = enum(u8) {
+    comfy,
+    a1111,
+
+    pub fn label(self: Compat) []const u8 {
+        return switch (self) {
+            .comfy => "ComfyUI (default)",
+            .a1111 => "AUTOMATIC1111 (Philox noise)",
+        };
+    }
+
+    fn fromStr(s: []const u8) ?Compat {
+        inline for (@typeInfo(Compat).@"enum".fields) |f| {
+            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        }
+        return null;
+    }
+};
+
+pub const Sampler = enum(u8) {
+    euler,
+    dpmpp_2m_sde,
+    dpmpp_2m_sde_heun,
+
+    pub fn label(self: Sampler) []const u8 {
+        return switch (self) {
+            .euler => "Euler (default)",
+            .dpmpp_2m_sde => "DPM++ 2M SDE",
+            .dpmpp_2m_sde_heun => "DPM++ 2M SDE Heun",
+        };
+    }
+
+    fn fromStr(s: []const u8) ?Sampler {
+        inline for (@typeInfo(Sampler).@"enum".fields) |f| {
+            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        }
+        return null;
+    }
+};
+
+/// Where the sampling steps go. Mirrors `schedule.Scheduler` plus a `default` member
+/// the engine enum does not need: the default differs per architecture (`simple` for
+/// krea2, `normal` for the SD family), so "leave it to the model" is a real choice a
+/// user has to be able to express — and it is what every render used before this became
+/// selectable.
+pub const Scheduler = enum(u8) {
+    default,
+    normal,
+    karras,
+    exponential,
+    sgm_uniform,
+    simple,
+    ddim_uniform,
+    beta,
+    linear_quadratic,
+    kl_optimal,
+
+    pub fn label(self: Scheduler) []const u8 {
+        return switch (self) {
+            .default => "Model default",
+            .normal => "Normal",
+            .karras => "Karras",
+            .exponential => "Exponential",
+            .sgm_uniform => "SGM Uniform",
+            .simple => "Simple",
+            .ddim_uniform => "DDIM Uniform (step count may differ)",
+            .beta => "Beta (step count may differ)",
+            .linear_quadratic => "Linear Quadratic",
+            .kl_optimal => "KL Optimal",
+        };
+    }
+
+    fn fromStr(s: []const u8) ?Scheduler {
+        inline for (@typeInfo(Scheduler).@"enum".fields) |f| {
+            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        }
+        return null;
+    }
+};
+
 /// Compute backend. Mirrors `pipeline.Backend`; kept here so the config data
 /// model stays free of an engine dependency (app.zig maps it across). Diffusion
 /// supports all four; the chat LLM only supports the two CUDA variants today
@@ -367,6 +513,11 @@ pub const pos_unset: i32 = std.math.minInt(i32);
 pub const Config = struct {
     llm_model: PathBuf = .{},
     vision_tower: PathBuf = .{},
+    /// The PRIMARY diffusion checkpoint — the only path image generation actually
+    /// requires. It may be a bundled "checkpoint-style" file carrying the text
+    /// encoder and VAE too, or a denoiser-only file (a GGUF UNet, krea2's separate
+    /// DiT); `pipeline.resolveComponent` works out which, and `text_encoder` / `vae`
+    /// below fill in or override whatever it does not carry.
     diffusion_model: PathBuf = .{},
     /// MEASURED peak resident VRAM of the diffusion pipeline (bytes), plus the DiT
     /// path it was measured against. Persisted so the FIRST image of a session
@@ -379,7 +530,22 @@ pub const Config = struct {
     /// overflows the stack as it grows (hence `parseJsonBigStack`), so another
     /// 4 KB `PathBuf` for what is only an equality check is not worth it.
     diff_peak_key: u64 = 0,
+    /// OPTIONAL conditioner / decoder overrides. Empty means "whatever the primary
+    /// checkpoint carries"; a set path is an *explicit* request that wins even over
+    /// a bundled copy (the CLI's `--text-encoder` / `--vae` precedence, mapped onto
+    /// `pipeline.Options.explicit_text_encoder` / `explicit_vae` in `diffuser`).
+    ///
+    /// ⚠️ Empty must stay distinguishable from "a path we happened to default to":
+    /// treating a defaulted path as a request is what broke a joined SD1.5
+    /// checkpoint in the CLI (the resolver opened krea2's qwen3 encoder, looked for
+    /// CLIP's tensors in it, and reported `ComponentNotInCheckpoint`). The GUI never
+    /// pre-fills these, so non-empty always means the user typed or browsed to it.
     text_encoder: PathBuf = .{},
+    /// SDXL's SECOND text tower (OpenCLIP bigG), resolved independently of the
+    /// first — `text_encoder` overrides embedder 0, this one embedder 1. Ignored
+    /// by every single-tower architecture, so leaving it set while running SD1.5
+    /// or krea2 costs nothing.
+    text_encoder_2: PathBuf = .{},
     vae: PathBuf = .{},
     taesd: PathBuf = .{},
     /// Directory generated images are written to (chat + image studio). Empty
@@ -391,6 +557,17 @@ pub const Config = struct {
     steps: usize = 20,
     width: usize = 1024,
     height: usize = 1024,
+    /// Sampler for image generation. Load-neutral (it is per-render state, not part
+    /// of the session), so a change applies to the next image with no reload.
+    sampler: Sampler = .euler,
+    /// Where the steps go. Load-neutral like `sampler`.
+    scheduler: Scheduler = .default,
+    /// Prompt dialect, and (A1111 only) how its weights are applied. Load-neutral.
+    prompt_syntax: PromptSyntax = .comfy,
+    emphasis: Emphasis = .original,
+    /// Whose sampling conventions (RNG above all) to reproduce. Load-neutral, and
+    /// independent of `prompt_syntax`: reproducing an A1111 render needs both.
+    compat: Compat = .comfy,
     preview: Preview = .taesd,
     /// Resolution of the live TAESD preview as a fraction of the latent grid.
     /// Applied live (no reload) like the preview method itself.
@@ -498,6 +675,7 @@ pub const Config = struct {
     pub fn diffPathsEql(a: *const Config, b: *const Config) bool {
         return pathEql(&a.diffusion_model, &b.diffusion_model) and
             pathEql(&a.text_encoder, &b.text_encoder) and
+            pathEql(&a.text_encoder_2, &b.text_encoder_2) and
             pathEql(&a.vae, &b.vae) and
             pathEql(&a.taesd, &b.taesd);
     }
@@ -587,13 +765,18 @@ pub const Config = struct {
         return true;
     }
 
-    /// Whether the image-generation tool is enabled: dit + text-encoder + VAE
-    /// must all be set (matches app.buildSession). Toggling this needs a reload
-    /// (the system prompt gains/loses the image-tool instructions).
+    /// Whether the image-generation tool is enabled: the PRIMARY checkpoint is set
+    /// (matches `app.hasDiffModel`). Toggling this needs a reload (the system
+    /// prompt gains/loses the image-tool instructions).
+    ///
+    /// ⚠️ This deliberately does NOT require `text_encoder` / `vae`. Container style
+    /// is a property of the file, not of the architecture: a bundled checkpoint
+    /// carries all three components itself, and demanding two more paths made every
+    /// such model unconfigurable here. Whether the pieces are actually reachable is
+    /// `pipeline.resolveComponent`'s call, not a path count's —
+    /// `gui/model_spec.missing` is the GUI's advisory preview of that answer.
     pub fn diffEnabled(self: *const Config) bool {
-        return self.diffusion_model.opt() != null and
-            self.text_encoder.opt() != null and
-            self.vae.opt() != null;
+        return self.diffusion_model.opt() != null;
     }
 
     /// Resolve the config directory (`<config>/tp-gui`); caller frees. Null if
@@ -734,6 +917,16 @@ pub const Config = struct {
             self.width = std.fmt.parseInt(usize, val, 10) catch self.width;
         } else if (std.mem.eql(u8, key, "height")) {
             self.height = std.fmt.parseInt(usize, val, 10) catch self.height;
+        } else if (std.mem.eql(u8, key, "sampler")) {
+            if (Sampler.fromStr(val)) |s| self.sampler = s;
+        } else if (std.mem.eql(u8, key, "prompt_syntax")) {
+            if (PromptSyntax.fromStr(val)) |x| self.prompt_syntax = x;
+        } else if (std.mem.eql(u8, key, "emphasis")) {
+            if (Emphasis.fromStr(val)) |x| self.emphasis = x;
+        } else if (std.mem.eql(u8, key, "compat")) {
+            if (Compat.fromStr(val)) |x| self.compat = x;
+        } else if (std.mem.eql(u8, key, "scheduler")) {
+            if (Scheduler.fromStr(val)) |s| self.scheduler = s;
         } else if (std.mem.eql(u8, key, "preview")) {
             if (Preview.fromStr(val)) |p| self.preview = p;
         } else if (std.mem.eql(u8, key, "taesd_size")) {
@@ -898,6 +1091,34 @@ test "Config.apply parses keys and tolerates junk" {
     try std.testing.expectEqual(@as(usize, 30), cfg.steps);
     try std.testing.expectEqual(Preview.latent2rgb, cfg.preview);
     try std.testing.expectEqual(@as(usize, 1024), cfg.width); // unchanged on junk
+}
+
+test "apply parses the sampler and leaves it alone on junk" {
+    var cfg: Config = .{};
+    try std.testing.expectEqual(Sampler.euler, cfg.sampler); // default
+    cfg.apply("sampler", "dpmpp_2m_sde_heun");
+    try std.testing.expectEqual(Sampler.dpmpp_2m_sde_heun, cfg.sampler);
+    cfg.apply("sampler", "dpmpp_2m_sde");
+    try std.testing.expectEqual(Sampler.dpmpp_2m_sde, cfg.sampler);
+    // A stale/unknown name must not silently reset the sampler to Euler — that would
+    // change what a saved config renders.
+    cfg.apply("sampler", "dpmpp_3m_sde");
+    try std.testing.expectEqual(Sampler.dpmpp_2m_sde, cfg.sampler);
+}
+
+test "apply parses the scheduler, including the model-default sentinel" {
+    var cfg: Config = .{};
+    try std.testing.expectEqual(Scheduler.default, cfg.scheduler);
+    cfg.apply("scheduler", "karras");
+    try std.testing.expectEqual(Scheduler.karras, cfg.scheduler);
+    cfg.apply("scheduler", "kl_optimal");
+    try std.testing.expectEqual(Scheduler.kl_optimal, cfg.scheduler);
+    // `default` must survive a round trip — it is not a stand-in for `normal`, it means
+    // "whatever this architecture samples with", which differs per family.
+    cfg.apply("scheduler", "default");
+    try std.testing.expectEqual(Scheduler.default, cfg.scheduler);
+    cfg.apply("scheduler", "karras_exponential"); // unknown: unchanged
+    try std.testing.expectEqual(Scheduler.default, cfg.scheduler);
 }
 
 test "apply parses taesd_size and maps to a latent divisor" {
@@ -1328,14 +1549,19 @@ test "sampling + presets save/load round-trip" {
     try std.testing.expectEqual(a.presets.items[1].sampling, b.presets.items[1].sampling);
 }
 
-test "diffEnabled requires dit + text-encoder + vae" {
+test "diffEnabled needs only the primary checkpoint" {
     var c: Config = .{};
     try std.testing.expect(!c.diffEnabled());
-    c.diffusion_model.set("/dit.safetensors");
+    // A bundled checkpoint is the whole pipeline: one path is enough. (The old
+    // rule demanded three and made every joined checkpoint unconfigurable.)
+    c.diffusion_model.set("/sd15.safetensors");
+    try std.testing.expect(c.diffEnabled());
+    // The overrides are additive, never a precondition.
     c.text_encoder.set("/te.safetensors");
-    try std.testing.expect(!c.diffEnabled()); // vae still missing
     c.vae.set("/vae.safetensors");
     try std.testing.expect(c.diffEnabled());
+    c.diffusion_model.set("");
+    try std.testing.expect(!c.diffEnabled());
 }
 
 test "upsertSysPrompt adds, replaces by name, sanitizes; removeSysPromptNamed removes" {

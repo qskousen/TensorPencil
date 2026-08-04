@@ -243,6 +243,14 @@ const Layer = struct {
 };
 
 pub const TextEncoder = struct {
+    /// **This tower cannot apply per-token prompt weights**, and the reason is structural
+    /// rather than a missing feature: krea2 conditions on qwen3 tap states with no fixed
+    /// token window, no chunking, and no empty-prompt reference of matching shape to
+    /// interpolate against. See `clip_text.TextEncoder.supports_prompt_weights` for the
+    /// three properties an emphasis-capable encoder needs, and `pipeline`'s
+    /// `supportsPromptWeights` for what reads this.
+    pub const supports_prompt_weights = false;
+
     arena: std.heap.ArenaAllocator,
     /// bf16 [vocab, hidden] view into the mapped file.
     embed_bytes: []const u8,

@@ -31,7 +31,8 @@ Legend: ✅ full · ⚠️ works but slow / limited · ❌ unsupported · — no
 
 | Capability | cpu | vulkan | zig-cuda | cuda | Notes |
 |---|---|---|---|---|---|
-| **Diffusion txt2img** | ⚠️ ref | ✅ | ✅ | ✅ **primary** | cuda ≈ 1.42× ComfyUI gap; vulkan targets ~1.2× of cuda |
+| **Diffusion txt2img** (Krea 2) | ⚠️ ref | ✅ | ✅ | ✅ **primary** | cuda ≈ 1.42× ComfyUI gap; vulkan targets ~1.2× of cuda |
+| **Diffusion txt2img** (SD1.5 / SDXL) | ⚠️ ref | ✅ | ✅ | ✅ **primary** | see §2A |
 | **LLM text generation** | ⚠️ ref | ✅¹ | ✅ | ✅ **primary** | dispatched per-arch in `llm_main.zig` |
 | **LLM vision (ViT/mmproj)** | ✅ | ⚠️ gemma3 only | ✅ | ✅ | see §5 |
 | **GPU init failure** | — | → CPU fallback | → CPU fallback | → CPU fallback | logs + degrades, never hard-fails |
@@ -54,6 +55,126 @@ Per-stage dispatch order everywhere is `if (cu_be)` → CUDA, `else if (gpu_ctx)
 | **latent2rgb preview** | ✅ | ✅ | ✅ | ✅ | `wan_vae.latentPreviewInto` (fallback when no `--taew`) |
 
 **Cancellation** (`Options.cancel`): polled between sampling steps everywhere, plus mid-stage on every backend — between DiT blocks, between text-encoder layers, and between VAE decode layers (and per tile in `vae_tiled`). On the **cpu** backend the threaded matmul/attention kernels additionally poll a threadlocal token (`src/ops/cancel.zig`, armed by `dit.forward` / `wan_vae.Decoder.decode` / `qwen3.TextEncoder.encode`) per row-panel / k-block / query row, so a cancel lands in milliseconds even when a single CPU GEMM takes seconds. `error.Canceled` is never swallowed: the VAE OOM-retry ladder and the GPU→CPU encode fallback both propagate it.
+
+### 2A. The SD family (SD1.5 / SDXL)
+
+Every stage of the SD pipeline runs on every backend (`clip_text{,_gpu,_cuda}.zig`,
+`sd_unet{,_gpu,_cuda}.zig`, `sd_vae{,_gpu,_cuda}.zig`).
+
+| Stage | cpu | vulkan | zig-cuda | cuda | Files |
+|---|---|---|---|---|---|
+| **CLIP-L / CLIP-G** | ✅ ref | ✅ | ✅ | ✅ | `clip_text{,_gpu,_cuda}.zig` |
+| **UNet** (LDM `UNetModel`) | ✅ ref | ✅ | ✅ | ✅ | `sd_unet{,_gpu,_cuda}.zig` |
+| **VAE decode** (AutoencoderKL) | ✅ | ✅ | ✅ | ✅ | `sd_vae{,_gpu,_cuda}.zig` |
+
+⚠️ **The CLIP towers were CPU-only until 2026-08-03** ("they run once per render and cost
+0.0–0.9 s"), and that stopped being true when long-prompt chunking landed: a real booru-style
+prompt is two or three 77-token windows, positive and negative, across two SDXL towers, so the
+encode became **1.7 s** measured at 1024×1536 — more than a whole 512² sampling step. The batch
+axis on the device is the *chunk*, since a single 77-row window gives only 77·heads threads.
+
+Three kernels were added for it, all CLIP-specific:
+
+| kernel | why it is not an existing one |
+|---|---|
+| `attn_causal_batched` (vulkan) | CLIP's tower is a causal LM body used as an encoder; every other encoder here (SigLIP, Snowflake, the ViTs) is bidirectional. CUDA needed nothing — `Backend.attn` already takes a `causal` flag. |
+| `gelu_quick` (both) | CLIP-**L**'s FFN, `x·σ(1.702x)`. Only the *gated* form existed. |
+| `gelu_erf` (both) | CLIP-**G**'s FFN. Only the gated form (`geglu`) existed. |
+
+⚠️ **The two towers of one SDXL checkpoint use DIFFERENT activations**, and the three GELU forms
+here agree to ~1e-2 — close enough to look correct, far enough to shift style. `cfg.act` carries
+which; the parity tests compare value by value rather than in aggregate for exactly that reason.
+
+⚠️ **Precision differs between the two GPU arms, and it is not the caller's choice on CUDA.**
+Vulkan follows `qwen3_gpu`'s convention — f32 GEMMs by default, tensor-core f16 only under
+`--encoder-f16` — so it tracks the CPU forward to **1.1e-5** rel L2. CUDA has only a tensor-core
+entry point at these widths, so it runs f16 regardless and lands ~1e-3, the same regime
+`sd_unet_cuda` already runs the denoiser in. A `cuda` render and a `cpu` render of the same seed
+therefore differ slightly at the conditioning, which is worth knowing before attributing such a
+difference to something else.
+
+**Measured** (RTX 3090, ReleaseFast, 8 steps, CFG 7.5 so two UNet forwards per step;
+`s/step` includes the first step's one-time weight upload amortized over eight):
+
+| arm | cpu | vulkan | zig-cuda | cuda | cuda speedup |
+|---|---:|---:|---:|---:|---:|
+| SD1.5 512², s/step | 6.91 | 0.92 | 0.46 | **0.27** | 26× |
+| SD1.5 512², total | 60.5 | 7.9 | 4.1 | **2.4** | 25× |
+| SDXL 1024², s/step | 50.06 | 2.20 | 1.83 | **1.11** | 45× |
+| SDXL 1024², total | 430.2 | 20.0 | 16.4 | **10.6** | 41× |
+
+So **25–41× end to end on `cuda`**, and 7.5–21× on vulkan. All three GPU arms agree with the CPU
+reference at **31.4–31.8 dB PSNR / SSIM 0.968–0.971** over a paired render, holding
+97.5–97.7% of its gradient energy — f16 tensor-core differences amplified by eight
+sampling steps, not a different picture. The CPU path stays the reference; none of
+these are bit-identical to it.
+
+⚠️ **The SDXL VAE overflows f16, and every GPU arm now divides the residual stream before the
+cast** (fixed 2026-08-03). Measured with a per-stage probe at a 64² latent: the decoder's
+residual reaches **4.2e5** against f16's ceiling of **65504** — the last upsample convolution's
+f32 output is 1.26e5 and the next block's 1×1 shortcut reads it — so the activation cast
+produced `inf`, the following GroupNorm spread it to NaN through its mean, and **every SDXL
+render at 512² or larger came out a solid white image with no error anywhere** on `vulkan`,
+`zig-cuda` and `cuda` alike. SD1.5's VAE peaks near 7e3, two orders lower, which is why the
+family the code was written against never showed it; it is also why ComfyUI decodes the SDXL VAE
+in fp32 (or ships the "fp16-fix" weights) by default.
+
+The fix divides only the *residual-reading* convolutions (the 1×1 shortcut and the level
+upsamples) by **256**, a power of two, so the correction is exact — it shifts the exponent and
+f16 keeps all 11 mantissa bits — and free, because both halves ride in kernels that already
+touch every element (`f32_to_f16_pad2d`/`f32_to_h16_pad` and `bias_compact`, whose spare `f32`
+push-constant this now uses; **every caller must pass 1.0, not 0.0**). `opConvF16Scaled` /
+`opMatmulCoopF16WScaled` and `convIntoScaled` are the entry points; `residual_act_div` in both
+`sd_vae_cuda` and `sd_vae_gpu` carries the measurement. Verified: the SDXL VAE now matches the
+CPU decoder at **rel L2 ≤ 1.4e-3 at every size from 12×10 to 128×128 and at both z magnitudes**
+in `sd-cuda-test` (both arms), and a real 768² render decodes at **44.0 dB (cuda) / 44.1 dB
+(vulkan) against a CPU decode of the same latent**, 64.6 dB through the tiled path.
+
+**Both kernel sets are pinned against the CPU ops they reproduce**, by different mechanisms:
+the SPIR-V ones in `sd_unet_gpu`'s test block (`-Dintegration` + the `testdata/gpu-tests`
+marker), the PTX ones by `TensorPencil sd-cuda-test [<ckpt>] [libs]` — a CLI command, because
+the test binary brings up no CUDA context, matching `cuda-vae-test` / `cuda-dit-test`. Both
+cover GroupNorm (mean 0 and mean 400), the erf-GELU gate, cross-attention at unequal q/kv
+lengths, self-attention at all four SD head widths, the convolution at all three sampling
+modes, the channel concat, and the head pad/unpad round trip; the CUDA command adds
+`add_bias_rows`, the VAE mid-block's own attention shape (one 512-wide head, seq 384/4096/9216),
+and whole-stage UNet and VAE parity, and exits non-zero on failure. ⚠️ **The VAE parity check is
+a SIZE × MAGNITUDE sweep** (12×10 … 128×128, z at ×1 and ×7.7) and both axes earned their place:
+the old single 12×10 unit-gaussian check passed throughout the months the SDXL overflow above
+made every real 512²-and-larger render white. `sd-cuda-test` also detects the checkpoint's family,
+so an SDXL file exercises the VAE sweep (the two families' decoders are architecturally identical);
+the UNet check stays SD1.5-only. Run it in
+both arms: `libs` reports "runs at 40/64/80/160" against hand-PTX's "128/128/128/256", which is
+the padding difference above made visible.
+
+⚠️ **`zig-cuda` beats `cuda` nowhere here, but `cuda` beats it by less than the DiT's
+margin** — SD's GEMMs are small enough that cuBLASLt/cuDNN's per-call overhead eats
+into the win, most visibly at SD1.5's 512² sizes.
+
+**Attention head widths are what forced per-backend choices**, and they are the one
+place the three GPU arms do not share a shape. SD1.5 attends with head_dim 40/80/160
+(fixed 8 heads, so the width grows with the level) and SDXL with 64 (fixed width, so
+the head count grows):
+
+| backend | how it attends | cost |
+|---|---|---|
+| **cuda** | cuDNN fused SDPA at the true width | none |
+| **zig-cuda** | zero-padded to a multiple of 128 | `128/hd` on the attention |
+| **vulkan** | zero-padded to 128; hd 160 falls back to the scalar kernel | as above |
+
+The padding is exact (a zero dimension contributes nothing to a dot product, and V's
+zero columns give output columns that are dropped) — it only costs arithmetic. Both
+GPU limits are the same one: the P@V GEMM tiles the head dimension in 128-wide blocks
+(`coopmat.buildGemmAttnOut`, `launchHgemmB`'s `grid.x = n/128`), so a narrower head
+either launches a zero-sized grid or silently computes part of the head. Removing the
+padding means parameterizing those two builders by head width, not changing the model
+code. ⚠️ **hd 160 is affordable on Vulkan's scalar fallback only because the wide-head
+levels are also the small-`n` ones** — SD1.5's two innermost levels carry 256 and 64
+positions at 512².
+
+⚠️ **A CPU VAE decode was the whole pipeline once the UNet moved**: 32 of the 47
+seconds of a 1024² SDXL render. On the device it is ~1.2 s, and it agrees with the CPU
+decoder at **65.0 dB / SSIM 0.9999** decoding the same latent.
 
 ### DiT block weight-dtype support
 
@@ -219,19 +340,31 @@ Notes:
 `attn_decode_q35` · `gather_kmajor{,_h16,16}` · `f32_to_h16{,_pad}` · `f32_to_bf16_pad` · `copy` ·
 `deinterleave2` · `scale_concat` · `scale_i32` · `bias_compact` · `im2col` · `rotate` · `rotate_fwht` ·
 `rowmax_i8` · `rowscale_i8` · `quantize_i8` · `gemv_partial{,4}` · `gemv_combine{,4}` ·
+`gn_stats` · `gn_combine` · `gn_apply` · `silu` · `geglu` · `concat_ch` · `attn_cross` ·
+`head_pad_h16` · `head_unpad` · `im2col_sd` ·
+`attn_causal_batched` · `gelu_quick` · `gelu_erf` (CLIP text tower) ·
 `gemv_q8_0{,_t}` · `gemv_q4_k{,_t}` · `gemv_q5_k{,_t}` · `gemv_q6_k{,_t}` · `gdn_gates` ·
 `gdn_conv_step` · `gdn_delta_step`
 
 **Vulkan GEMM entry points** (`context.zig`): `opMatmul` (f32/fp8) · `opGemv{,Partial,Quant,QuantT}` ·
-`opMatmulCoop{,H16}` (fp8→f16) · `opMatmulCoopF16W{,b}` (f32/bf16→f16) · `opMatmulCoopBf16` (native bf16) ·
+`opMatmulCoop{,H16}` (fp8→f16) · `opMatmulCoopF16W{,b,h,Dev}` (f32/bf16/f16→f16; `Dev` takes a
+device-resident bias, for the SD UNet's per-forward folded ResBlock bias) · `opMatmulCoopBf16` (native bf16) ·
 `opMatmulCoopI8{,Fused}` / `opMatmulI8` / `opI8Gemm` (int8 s8→s32) · `opAttnScores{,Vae}` / `opFlash` / `opAttnOut`.
 Coopmat SPIR-V builders in `src/gpu/coopmat.zig` (`buildGemmShared` f16/bf16, `buildGemmI8` int8; **no s4**).
+Scores shaders are compiled per head width — 128 (DiT, head-padded SD UNet), 384 (Wan VAE
+mid-block) and 512 (SD VAE mid-block) — since `buildGemmScores` unrolls the k-depth:
+`opAttnScores` / `opAttnScoresVae` / `opAttnScoresSd`.
 
 ### zig-cuda — hand-PTX (`src/gpu/cuda/kernels.zig` GEMM, `elt.zig` elementwise/attn)
 GEMM builders: `buildHgemm` (f16/bf16 mma m16n8k16) · `buildIgemmSmem`/`buildIgemmPipe` (int8 m16n8k32, int4 m16n8k64) · `buildPrep` (quant/rotate). **All DiT GEMM formats** use warp-cooperative `ldmatrix.x4`/`.x2` frag loads + an XOR-swizzled (`off^=(row&7)<<4`) conflict-free shared layout (`use_ldmatrix` flag on `buildIgemmPipe` — int8/int4 — AND `buildHgemm` — f16/bf16 dense + attention; on at every runtime site; pure permutation → bit-exact, ~+1–3% on qkv/attn-proj shapes, flat on BW-bound MLP shapes).
 GEMV: `gemv_{fp8,bf16,f16,q8_0,q4_0,q4_k,q5_k,q6_k}` + `_q8`/grouped-N `_q8n` dp4a variants.
 Attn: `attn`, `attn_split`/`_merge`/`_h256`/`_h512`/`_tree`. GDN: `gdn_{conv_step,gates,delta_step}`.
 Plus `im2col`, dtype-pad converts, `dequant_*_f16`, rope/norm/act kernels.
+SD family: `gn_stats`/`gn_combine`/`gn_apply` (GroupNorm, Welford statistics) ·
+`geglu` (erf-GELU gate) · `concat_ch` · `attn_cross` (seq_kv ≠ seq_q) ·
+`im2col_sd` (stride 2 / fused 2× upsample) · `head_pad_h16`/`head_unpad` ·
+`add_bias_rows` · `gelu_quick`/`gelu_erf` (the CLIP towers' two FFN activations,
+ungated — `attn`'s existing `causal` flag covered the rest).
 Vision: `rope_vision` (Qwen3-VL 2-D rope) · `rope_vision_gemma4` (gemma4v per-head-half x/y neox rope) · `gelu_quick_mul` (gemma4v GeGLU-quick FFN).
 
 ### cuda — vendor libs (`.libs` mode)

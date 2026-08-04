@@ -231,7 +231,7 @@ pub const Gguf = struct {
 
         // Tensor table: canonicalize names, reverse dims, validate spans
         // against the data section.
-        const Raw = struct { name: []const u8, dt: DType, shape: tensors.Shape, offset: usize };
+        const Raw = struct { name: []const u8, dt: DType, shape: tensors.Shape, offset: usize, flat_blocks: bool };
         const raw_infos = try alloc.alloc(Raw, @intCast(n_tensors));
         for (raw_infos) |*ri| {
             const raw_name = try r.str();
@@ -261,20 +261,43 @@ pub const Gguf = struct {
             // [1536, 256] instead of [6144, 64] — and every shape check downstream
             // fails on a file that is perfectly well formed.
             var shape: tensors.Shape = .{ .dims = dims, .rank = n_dims };
+            var flat_blocks = false;
             if (origShape(&kv, alloc, raw_name)) |orig| {
-                // Only for unquantized tensors: a block-quantized tensor's on-disk
-                // layout follows its STORED row length, so re-labelling the rows
-                // would move every block boundary. ComfyUI only ever applies the fix
-                // to tensors it then leaves unquantized (the criterion that triggers
-                // it — a contiguous dim not divisible by 256 — is the same one that
-                // makes k-quantization impossible), so this is belt-and-braces.
-                if (dt.blockElems() != 1) {
-                    std.log.warn("gguf: ignoring orig_shape for block-quantized '{s}' ({t})", .{ raw_name, dt });
-                } else if (orig.count() != shape.count()) {
+                // ⚠️ **This used to refuse block-quantized tensors**, on the reasoning
+                // that "ComfyUI only ever applies the fix to tensors it then leaves
+                // unquantized, since the criterion that triggers it — a contiguous dim
+                // not divisible by 256 — is the same one that makes k-quantization
+                // impossible". That is true of ComfyUI's converter and **false of
+                // ggufy's**, which blocks over a tensor's *flat* element count rather
+                // than per row: it reshapes first and then happily k-quantizes the
+                // result. Measured on a ggufy SD1.5 q4_k file: **166 of 686 tensors,
+                // 72.7% of the parameters** — every convolution, whose contiguous dim
+                // is `kw` (1 or 3). So the refusal made TensorPencil unable to load any
+                // ggufy SD-family GGUF at all (`time_embed.0.weight has shape
+                // {1600, 256}, expected [1280, 320]`), i.e. the whole GGUF output path
+                // for the SD family was unmeasurable — the same gap that was closed for
+                // krea2 and missed here.
+                //
+                // Restoring the shape is correct for the values: the fix is a pure
+                // regrouping, so flat row-major order is preserved, and 256-wide
+                // storage rows hold exactly one block each — flat and per-row blocking
+                // coincide, with or without an imatrix. What it is *not* is compatible
+                // with row-aligned blocking, so `flat_blocks` tells the loaders to
+                // materialize instead of pointing a packed `Weight` at the bytes.
+                //
+                // ⚠️ **Named shortcut:** materializing costs the memory the
+                // quantization saved (SD1.5 q4_k: ~0.5 GB on disk, ~3.4 GB f32
+                // resident). The robust alternative is a block GEMM that understands
+                // flat blocking, on all four backends — a real kernel project, and not
+                // one to undertake incidentally. This path is functionally complete
+                // (correct values, every consumer works) and purely additive: these
+                // files previously hard-errored, so nothing that loads today changes.
+                if (orig.count() != shape.count()) {
                     std.log.warn("gguf: ignoring orig_shape for '{s}': {d} elements, stored has {d}", .{
                         raw_name, orig.count(), shape.count(),
                     });
                 } else {
+                    flat_blocks = dt.blockElems() != 1;
                     shape = orig;
                 }
             }
@@ -284,6 +307,7 @@ pub const Gguf = struct {
                 .dt = dt,
                 .shape = shape,
                 .offset = @intCast(offset),
+                .flat_blocks = flat_blocks,
             };
         }
 
@@ -306,6 +330,7 @@ pub const Gguf = struct {
                 .shape = ri.shape,
                 .start = ri.offset,
                 .end = ri.offset + nbytes,
+                .flat_blocks = ri.flat_blocks,
             };
         }
 
@@ -827,4 +852,77 @@ test "isVisionProjector: mmproj yes, LLM no" {
     var lg = try Gguf.open(gpa, io, llm);
     defer lg.deinit();
     try std.testing.expect(!lg.isVisionProjector()); // an LLM in the mmproj slot
+}
+
+test "shape-fixed block-quantized tensors restore their logical shape and flag flat blocks" {
+    // ⚠️ The regression this pins, measured 2026-08-02: the parser used to REFUSE to
+    // restore `comfy.gguf.orig_shape` for a block-quantized tensor, on the reasoning
+    // that the shape fix only ever lands on tensors the converter then leaves
+    // unquantized. True of ComfyUI's converter; false of ggufy's, which blocks over a
+    // tensor's flat element count and so reshapes *then* k-quantizes. Measured on a
+    // ggufy SD1.5 q4_k file: 166 of 686 tensors, 72.7% of the parameters — every
+    // convolution. The result was that TensorPencil could not load any ggufy SD-family
+    // GGUF at all, so that whole output path was unmeasurable above level 1.
+    const gpa = std.testing.allocator;
+
+    // One q4_k super-block is 256 elements in 144 bytes. Stored as [1, 256]; the
+    // logical shape is [2, 128] — 256 elements, but a row length that is NOT a
+    // multiple of 256, which is exactly the case `Weight.init` cannot take.
+    var payload: [144]u8 = @splat(0);
+    payload[0] = 0x11; // any non-zero content; the parser does not decode it
+
+    var b = try TestBuilder.init(gpa, 3, 1, 2);
+    defer b.deinit();
+    try b.kvStr("general.architecture", "sd1.5");
+    // comfy.gguf.orig_shape.<name> = [2, 128], an i32 array in row-major order.
+    try b.str("comfy.gguf.orig_shape.conv.weight");
+    try b.int(u32, 9);
+    try b.int(u32, 5);
+    try b.int(u64, 2);
+    try b.int(u32, 2);
+    try b.int(u32, 128);
+    // ggml ne [256, 1] = stored torch shape [1, 256]; type 12 = q4_k.
+    try b.tensor("conv.weight", &.{ 256, 1 }, 12, 0);
+    const file = try b.finish(&payload);
+    defer gpa.free(file);
+
+    var g = try Gguf.initFromSlice(gpa, file);
+    defer g.deinit();
+
+    const v = g.get("conv.weight").?;
+    // The logical shape is restored — a consumer must see [2, 128], not [1, 256].
+    try std.testing.expectEqualSlices(usize, &.{ 2, 128 }, v.info.shape.slice());
+    // ...and it is flagged, because 128 is not a whole number of q4_k blocks, so the
+    // bytes can only be read as one flat 256-element sequence.
+    try std.testing.expect(v.info.flat_blocks);
+    // The byte range still follows the element count, which the reshape preserves.
+    try std.testing.expectEqual(@as(usize, 144), v.bytes.len);
+}
+
+test "an unquantized shape fix does not claim flat blocks" {
+    // The krea2 case, and the reason `flat_blocks` is not simply "has orig_shape":
+    // an f32 tensor has no blocks at all, so nothing downstream needs to materialize
+    // it and the fast path must stay available.
+    const gpa = std.testing.allocator;
+
+    var payload: [24]u8 = @splat(0);
+    var b = try TestBuilder.init(gpa, 3, 1, 2);
+    defer b.deinit();
+    try b.kvStr("general.architecture", "sd1.5");
+    try b.str("comfy.gguf.orig_shape.embed.weight");
+    try b.int(u32, 9);
+    try b.int(u32, 5);
+    try b.int(u64, 2);
+    try b.int(u32, 3);
+    try b.int(u32, 2);
+    // ggml ne [2, 3] = stored [3, 2] f32; orig_shape says [3, 2] as well here, so the
+    // only thing under test is that the flag stays false.
+    try b.tensor("embed.weight", &.{ 2, 3 }, 0, 0);
+    const file = try b.finish(&payload);
+    defer gpa.free(file);
+
+    var g = try Gguf.initFromSlice(gpa, file);
+    defer g.deinit();
+    const v = g.get("embed.weight").?;
+    try std.testing.expect(!v.info.flat_blocks);
 }

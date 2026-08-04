@@ -462,6 +462,94 @@ export fn attn_full_batched() callconv(.spirv_kernel) void {
     while (t < hd) : (t += 1) d.data[qb + t] = acc[t] * inv;
 }
 
+// Block-diagonal batched CAUSAL attention — `attn_full_batched` with the key
+// range clipped to `[item_start, query]` instead of the whole item.
+//
+// This is CLIP's text tower: a causal LM body used as an encoder, so unlike every
+// other encoder here it must not see forward. ⚠️ A non-causal CLIP still encodes
+// every prompt and still renders every image — it is simply a different model — so
+// there is no failure to observe, which is why this gets its own kernel rather than
+// a flag on `attn_full_batched` that a caller could forget.
+//
+// The batch axis is the *prompt chunk*: a 77-token window gives only 77*heads
+// threads, which does not fill a GPU, and a long prompt has two or three chunks
+// that are independent by construction.
+//
+// u0=total rows, u1=n_heads, u2=n_kv, u3=hd, u4=s_rows (per-item length),
+// f0=scale. a=q, b=k, c=v, d=out.
+export fn attn_causal_batched() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    const total = pc.u0;
+    const n_heads = pc.u1;
+    if (idx >= total * n_heads) return;
+    const n_kv = pc.u2;
+    const hd = pc.u3;
+    const s_rows = pc.u4;
+    const scale = pc.f0;
+    const q_global = idx / n_heads;
+    const head = idx % n_heads;
+    const kvh = head / (n_heads / n_kv);
+    const kv_start = (q_global / s_rows) * s_rows;
+    // Inclusive of the query's own row, exclusive above it — the only difference
+    // from the non-causal form, and the whole point of the kernel.
+    const kv_end = q_global + 1;
+    const qb = idx * hd;
+    const kvdim = n_kv * hd;
+    var acc: [256]f32 = undefined;
+    var t: u32 = 0;
+    while (t < hd) : (t += 1) acc[t] = 0;
+    var mx: f32 = -3.4e38;
+    var denom: f32 = 0;
+    var j: u32 = kv_start;
+    while (j < kv_end) : (j += 1) {
+        const kb = j * kvdim + kvh * hd;
+        var sc: f32 = 0;
+        t = 0;
+        while (t < hd) : (t += 1) sc += a.data[qb + t] * b.data[kb + t];
+        sc *= scale;
+        const newmax = @max(mx, sc);
+        const corr = @exp(mx - newmax);
+        const p = @exp(sc - newmax);
+        denom = denom * corr + p;
+        t = 0;
+        while (t < hd) : (t += 1) acc[t] = acc[t] * corr + p * c.data[kb + t];
+        mx = newmax;
+    }
+    const inv = 1.0 / denom;
+    t = 0;
+    while (t < hd) : (t += 1) d.data[qb + t] = acc[t] * inv;
+}
+
+// quick-GELU, in place: a = x * sigmoid(1.702x). CLIP-L's (and SD1.5's whole text
+// tower's) activation. ⚠️ NOT interchangeable with the `gelu` above (tanh) or with
+// `gelu_erf` below: the three agree to ~1e-2 and disagree enough to shift style.
+// Matches `ops.act.geluQuick` term for term. a=in/out. u0=total.
+export fn gelu_quick() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const x = a.data[idx];
+    a.data[idx] = x / (1.0 + @exp(-1.702 * x));
+}
+
+// erf-GELU, in place: a = 0.5x(1 + erf(x/sqrt2)). CLIP-G's (SDXL's second tower's)
+// activation — the exact form `F.gelu` defaults to, with the same A&S 7.1.26 erf
+// the `geglu` kernel below uses, so the two cannot drift. a=in/out. u0=total.
+export fn gelu_erf() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const x = a.data[idx];
+    const t_in = x * 0.7071067811865476;
+    const ax = @abs(t_in);
+    const t = 1.0 / (1.0 + 0.3275911 * ax);
+    const poly = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
+    var er = 1.0 - poly * @exp(-ax * ax);
+    if (t_in < 0) er = -er;
+    a.data[idx] = 0.5 * x * (1.0 + er);
+}
+
 export fn rope_inter() callconv(.spirv_kernel) void {
     decorate();
     const idx = gpu.global_invocation_id[0];
@@ -1988,12 +2076,18 @@ export fn gather_kmajor() callconv(.spirv_kernel) void {
 // GEMM. d = packed f16 pairs [kv][hd][s_stride] <- a = f32 [seq][kv][hd];
 // positions >= seq write zero (column padding). x = dest word index.
 // u0 = out words, u1 = hd, u2 = s_stride (even), u3 = seq, u4 = n_kv_heads.
+// u5 (optional) is the SOURCE head_dim when it is NARROWER than the emitted
+// one: the SD UNet's heads are 40/64/80 wide and the tensor-core attention
+// pipelines are built for 128, so K is gathered into 128-row planes whose rows
+// u5..u1-1 are zero. A zero dimension contributes nothing to a dot product, so
+// the padding is exact rather than approximate. u5 = 0 means "same as u1".
 export fn gather_kmajor_h16() callconv(.spirv_kernel) void {
     decorate();
     const idx = gpu.global_invocation_id[0];
     if (idx >= pc.u0) return;
     const e0 = idx * 2;
     const hd = pc.u1;
+    const hd_src = if (pc.u5 == 0) hd else pc.u5;
     const sstride = pc.u2;
     const plane = hd * sstride;
     const h = e0 / plane;
@@ -2001,14 +2095,66 @@ export fn gather_kmajor_h16() callconv(.spirv_kernel) void {
     const k = rem / sstride;
     const s0 = rem % sstride;
     var out: u32 = 0;
-    inline for (0..2) |j| {
-        const s = s0 + j;
-        if (s < pc.u3) {
-            const v: f16 = @floatCast(a.data[(s * pc.u4 + h) * hd + k]);
-            out |= @as(u32, @as(u16, @bitCast(v))) << (16 * j);
+    if (k < hd_src) {
+        inline for (0..2) |j| {
+            const s = s0 + j;
+            if (s < pc.u3) {
+                const v: f16 = @floatCast(a.data[(s * pc.u4 + h) * hd_src + k]);
+                out |= @as(u32, @as(u16, @bitCast(v))) << (16 * j);
+            }
         }
     }
     d.data[idx] = @bitCast(out);
+}
+
+// head_pad_h16: tight f32 [seq][heads*hd_src] -> f16 [seq_pad][heads*hd_out]
+// with each head zero-extended to hd_out and rows past `seq` zeroed — the Q and
+// V operands of the tensor-core attention, whose pipelines are compiled for
+// head_dim 128 while the SD UNet's heads are 40 (SD1.5 level 0), 64 (SDXL) or
+// 80. `f32_to_h16` cannot do this: the padding is INTERLEAVED per head, not
+// appended to the row, so a flat copy would shift every head but the first.
+// a = f32 src, d = packed f16 pairs. u0 = out words, u1 = hd_src, u2 = hd_out
+// (even), u3 = seq, u4 = heads, f0 = scale (the softmax scale, prefolded in Q).
+export fn head_pad_h16() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const e0 = idx * 2;
+    const hd_out = pc.u2;
+    const row_out = pc.u4 * hd_out;
+    const row = e0 / row_out;
+    const rem = e0 % row_out;
+    const h = rem / hd_out;
+    const t0 = rem % hd_out; // hd_out is even, so e0+1 stays in this head
+    var out: u32 = 0;
+    if (row < pc.u3) {
+        inline for (0..2) |j| {
+            const t = t0 + j;
+            if (t < pc.u1) {
+                const v: f16 = @floatCast(a.data[(row * pc.u4 + h) * pc.u1 + t] * pc.f0);
+                out |= @as(u32, @as(u16, @bitCast(v))) << (16 * j);
+            }
+        }
+    }
+    d.data[idx] = @bitCast(out);
+}
+
+// head_unpad: the inverse for the f32 attention output — [seq_pad][heads*hd_out]
+// back to tight [seq][heads*hd_src], dropping each head's padding columns (whose
+// values come from V's zero columns and are therefore not merely unwanted but
+// meaningless). a = src, **b = dst** (an f32 a->b elementwise op, like `copy`
+// and `gn_apply`; the f16-emitting `head_pad_h16` above writes `d` instead).
+// u0 = seq*heads*hd_src, u1 = hd_src, u2 = hd_out, u4 = heads.
+export fn head_unpad() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const row_in = pc.u4 * pc.u1;
+    const row = idx / row_in;
+    const rem = idx % row_in;
+    const h = rem / pc.u1;
+    const t = rem % pc.u1;
+    b.data[idx] = a.data[row * pc.u4 * pc.u2 + h * pc.u2 + t];
 }
 
 export fn attn_scores() callconv(.spirv_kernel) void {
@@ -2666,6 +2812,196 @@ export fn vae_norm() callconv(.spirv_kernel) void {
     }
 }
 
+// --- SD-family (UNet / AutoencoderKL) kernels ------------------------------
+//
+// GroupNorm is the SD family's normalization, and it is the only norm here
+// whose statistics are NOT per-position: a group reduces over
+// positions * (channels/groups) values at once. With one image in the batch
+// that makes mean/inv per GROUP — 32 numbers for the whole activation — so
+// the three kernels below are (per-chunk statistics) -> (merge per group) ->
+// (apply per element).
+//
+// ⚠️ The statistic is Welford, not sum-and-sum-of-squares, for the reason the
+// CPU `ops.norm.groupNorm` spells out: the shifted form `E[x²] - E[x]²` loses
+// catastrophically once the mean is large relative to the spread, which is
+// exactly the regime a late VAE decoder block sits in. Welford per chunk plus
+// Chan's stable pairwise merge keeps that accuracy at ONE read of the
+// activation, where the CPU's literal two-pass form would cost two.
+//
+// gn_stats: one thread per (group, chunk). Walks the group's elements in the
+//   INTERLEAVED slice i = chunk, chunk+u2, ... (so consecutive threads read
+//   consecutive addresses) and writes {count, mean, M2} as three floats.
+//   a = x [n][c], d = stats [groups*u2][3].
+//   u0 = groups*chunks (total threads), u1 = channels, u2 = chunks per group,
+//   u3 = per_group (channels/groups), u4 = positions.
+export fn gn_stats() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const nch = pc.u2;
+    const per_group = pc.u3;
+    const g = idx / nch;
+    const chunk = idx % nch;
+    const total = pc.u4 * per_group; // elements in this group
+    const c0 = g * per_group;
+    var count: f32 = 0;
+    var mean: f32 = 0;
+    var m2: f32 = 0;
+    var i: u32 = chunk;
+    while (i < total) : (i += nch) {
+        // Element i of the group is channel c0 + i%per_group at position
+        // i/per_group — the group's channels are a contiguous run, so this is
+        // the tight channel-last address.
+        const v = a.data[(i / per_group) * pc.u1 + c0 + i % per_group];
+        count += 1;
+        const delta = v - mean;
+        mean += delta / count;
+        m2 += delta * (v - mean);
+    }
+    d.data[idx * 3] = count;
+    d.data[idx * 3 + 1] = mean;
+    d.data[idx * 3 + 2] = m2;
+}
+
+// gn_combine: one thread per group. Merges the chunk statistics with Chan's
+//   formula and writes mean[g] at d[g], inv[g] at d[groups + g].
+//   a = stats, d = out (2*groups floats). u0 = groups, u2 = chunks, f0 = eps.
+export fn gn_combine() callconv(.spirv_kernel) void {
+    decorate();
+    const g = gpu.global_invocation_id[0];
+    if (g >= pc.u0) return;
+    const nch = pc.u2;
+    var count: f32 = 0;
+    var mean: f32 = 0;
+    var m2: f32 = 0;
+    var k: u32 = 0;
+    while (k < nch) : (k += 1) {
+        const base = (g * nch + k) * 3;
+        const cb = a.data[base];
+        if (cb == 0) continue; // a chunk past the end of a small activation
+        const mb = a.data[base + 1];
+        const m2b = a.data[base + 2];
+        const n = count + cb;
+        const delta = mb - mean;
+        mean += delta * cb / n;
+        m2 += m2b + delta * delta * count * cb / n;
+        count = n;
+    }
+    d.data[g] = mean;
+    d.data[pc.u0 + g] = 1.0 / @sqrt(m2 / count + pc.f0);
+}
+
+// gn_apply: one thread per element. out = (x - mean[g])*inv[g]*w[ch] + b[ch],
+//   optionally followed by the silu that trails every GroupNorm in a ResBlock.
+//   a = x, b = out, c = weight ++ bias (bias at u4), d = mean ++ inv.
+//   u0 = n*channels, u1 = channels, u2 = per_group, u3 = groups,
+//   u4 = bias offset in c, u5 = 1 to apply silu.
+export fn gn_apply() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const ch = idx % pc.u1;
+    const g = ch / pc.u2;
+    var v = (a.data[idx] - d.data[g]) * d.data[pc.u3 + g] * c.data[ch] + c.data[pc.u4 + ch];
+    if (pc.u5 != 0) v = v / (1.0 + @exp(-v));
+    b.data[idx] = v;
+}
+
+// silu: plain in-place SiLU, x = x*sigmoid(x). a = x. u0 = total.
+// (`silu_mul` is the gated form; the UNet head and the time embedding need the
+// ungated one.)
+export fn silu() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const v = a.data[idx];
+    a.data[idx] = v / (1.0 + @exp(-v));
+}
+
+// geglu: the SpatialTransformer feed-forward's gate. `ff.net.0.proj` emits
+// [value | gate] per row in THAT order, and the gate takes the **erf** GELU
+// (`F.gelu`'s default), not the tanh approximation — swapping either is a
+// silent quality loss, so this matches `ops.act.geluErfScalar` term for term
+// (Abramowitz & Stegun 7.1.26).
+// a = src [n][2*inner], b = dst [n][inner]. u0 = n*inner, u1 = inner.
+export fn geglu() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const inner = pc.u1;
+    const row = idx / inner;
+    const col = idx % inner;
+    const base = row * 2 * inner;
+    const value = a.data[base + col];
+    const x = a.data[base + inner + col];
+    // erf(x/sqrt(2)) via A&S 7.1.26.
+    const t_in = x * 0.7071067811865476;
+    const ax = @abs(t_in);
+    const t = 1.0 / (1.0 + 0.3275911 * ax);
+    const poly = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
+    var erf = 1.0 - poly * @exp(-ax * ax);
+    if (t_in < 0) erf = -erf;
+    b.data[idx] = value * (0.5 * x * (1.0 + erf));
+}
+
+// concat_ch: channel-axis concatenation, one thread per SOURCE element —
+// the UNet's output side prepends each popped skip's channels to the current
+// activation before the ResBlock. dst[p][u3 + j] = src[p][j].
+// a = src [n][u1], b = dst [n][u2]. u0 = n*u1, u1 = src channels,
+// u2 = dst channels, u3 = destination channel offset.
+export fn concat_ch() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const j = idx % pc.u1;
+    b.data[(idx / pc.u1) * pc.u2 + pc.u3 + j] = a.data[idx];
+}
+
+// attn_cross: non-causal attention where the KEYS ARE A DIFFERENT LENGTH from
+// the queries — the UNet's cross-attention onto the 77-row text conditioning.
+// `attn_full` folds both into one `seq`, and padding K/V up to seq_q to reuse
+// it would build an n×n scores plane where an n×77 one is wanted (16M against
+// 315K entries at a 512² SD1.5 latent). One thread per (query, head); K/V are
+// small enough to stay hot in L2 across the whole launch.
+// a = q [seq_q][n_heads*hd], b = k, c = v (both [seq_kv][n_heads*hd]),
+// d = out [seq_q][n_heads*hd].
+// u0 = seq_q, u1 = n_heads, u2 = head_dim (<=256), u3 = seq_kv, f0 = scale.
+export fn attn_cross() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    const n_heads = pc.u1;
+    if (idx >= pc.u0 * n_heads) return;
+    const hd = pc.u2;
+    const seq_kv = pc.u3;
+    const scale = pc.f0;
+    const head = idx % n_heads;
+    const qb = idx * hd;
+    const dim = n_heads * hd;
+    var acc: [256]f32 = undefined;
+    var t: u32 = 0;
+    while (t < hd) : (t += 1) acc[t] = 0;
+    var mx: f32 = -3.4e38;
+    var denom: f32 = 0;
+    var j: u32 = 0;
+    while (j < seq_kv) : (j += 1) {
+        const kb = j * dim + head * hd;
+        var sc: f32 = 0;
+        t = 0;
+        while (t < hd) : (t += 1) sc += a.data[qb + t] * b.data[kb + t];
+        sc *= scale;
+        const newmax = @max(mx, sc);
+        const corr = @exp(mx - newmax);
+        const p = @exp(sc - newmax);
+        denom = denom * corr + p;
+        t = 0;
+        while (t < hd) : (t += 1) acc[t] = acc[t] * corr + p * c.data[kb + t];
+        mx = newmax;
+    }
+    const inv = 1.0 / denom;
+    t = 0;
+    while (t < hd) : (t += 1) d.data[qb + t] = acc[t] * inv;
+}
+
 // im2col: build the f32 patch matrix for a band of output positions of a
 // zero-padded 3x3 conv over tight channel-last activations, so the conv is
 // a plain GEMM (patches [bn][9*ci] @ W^T). With f0 != 0 the source is
@@ -2700,17 +3036,66 @@ export fn im2col() callconv(.spirv_kernel) void {
     d.data[idx] = v;
 }
 
+// im2col_sd: the SD family's 3x3 patch matrix. The VAE's `im2col` above covers
+// stride 1 and the fused nearest-2x upsample; the UNet additionally has
+// **stride-2** convolutions (LDM's `Downsample`), whose output width is
+// ceil(w/2) and therefore cannot be derived by shifting the source width — so
+// the output width is an explicit field here rather than inferred.
+// a = src [h*w][ci], d = patches [bn][9*ci].
+// u0 = bn*patch_len threads, u1 = patch_len (9*ci), u2 = ci, u3 = src w,
+// u4 = src h, u5 = first output position of the band, u6 = OUT w,
+// f0 = source sampling mode: 0 = stride 1, 1 = fused nearest-exact 2x upsample
+// (stride 1 over the doubled grid, never materialized), 2 = stride 2.
+export fn im2col_sd() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const plen = pc.u1;
+    const ci = pc.u2;
+    const sw = pc.u3;
+    const up: u5 = if (pc.f0 == 1) 1 else 0;
+    const stride: u32 = if (pc.f0 == 2) 2 else 1;
+    // The grid the taps are addressed in: the doubled one when upsampling.
+    const gw = sw << up;
+    const gh = pc.u4 << up;
+    const ow = pc.u6;
+    const col = idx % plen;
+    const p = pc.u5 + idx / plen;
+    const tap = col / ci;
+    const cc = col % ci;
+    // Tap coordinate (oy*stride + ky - 1, ox*stride + kx - 1), carried with a +1
+    // offset so the pad test stays unsigned: valid iff 1 <= coord+1 <= extent.
+    const yk = (p / ow) * stride + tap / 3;
+    const xk = (p % ow) * stride + tap % 3;
+    var v: f32 = 0;
+    if (yk >= 1 and yk <= gh and xk >= 1 and xk <= gw) {
+        const sy = (yk - 1) >> up;
+        const sx = (xk - 1) >> up;
+        v = a.data[(sy * sw + sx) * ci + cc];
+    }
+    d.data[idx] = v;
+}
+
 // bias_compact: after the column-padded coop GEMM, strip the padding and
-// add the conv bias in one pass: d[u3 + i] = a[(i/u1)*u2 + i%u1] + b[i%u1].
+// add the conv bias in one pass:
+// d[u3 + i] = f0*a[(i/u1)*u2 + i%u1] + b[u4 + i%u1].
 // One thread per real output element. a = padded GEMM out [*][u2],
 // b = bias [u1], d = tight dst. u0 = positions*u1, u1 = co, u2 = n_pad,
-// u3 = dst offset (elements).
+// u3 = dst offset (elements), u4 = bias offset (elements — the SD UNet packs
+// every ResBlock's per-forward bias into one buffer, so it needs to index into
+// the middle of it).
+//
+// ⚠️ f0 is the GEMM output scale and every caller MUST set it (1.0 for the plain
+// case). It pairs with `f32_to_h16_pad`'s own f0 to let a caller divide the
+// activation by a power of two before the f16 cast and undo it here — f16 tops out
+// at 65504 and an SDXL VAE decoder's residual stream reaches ~4e5, so without it
+// the cast alone yields `inf`. The bias is added AFTER the unscale, unscaled.
 export fn bias_compact() callconv(.spirv_kernel) void {
     decorate();
     const idx = gpu.global_invocation_id[0];
     if (idx >= pc.u0) return;
     const cc = idx % pc.u1;
-    d.data[pc.u3 + idx] = a.data[(idx / pc.u1) * pc.u2 + cc] + b.data[cc];
+    d.data[pc.u3 + idx] = a.data[(idx / pc.u1) * pc.u2 + cc] * pc.f0 + b.data[pc.u4 + cc];
 }
 
 const attn_chunk = 32;

@@ -43,6 +43,7 @@ fn gpuMatmulThunk(
     return c.matmul(y, x, m, w_bytes, dtype_f8, rows, cols, scale, bias);
 }
 const tokenizer_mod = @import("tp_core").tokenizer;
+const noise_mod = @import("tp_core").noise;
 const safetensors = @import("tp_core").safetensors;
 const gguf_mod = @import("tp_core").gguf;
 const weights_mod = @import("tp_core").weights;
@@ -58,9 +59,16 @@ const qwen3_cuda = @import("tp_models").models.qwen3_cuda;
 const cuda = @import("tp_gpu").cuda;
 const wan_vae = @import("tp_models").models.wan_vae;
 const clip_tok = @import("tp_core").clip_tokenizer;
+const prompt_a1111 = @import("tp_core").prompt_a1111;
 const clip_text = @import("tp_models").models.clip_text;
+const clip_text_gpu = @import("tp_models").models.clip_text_gpu;
+const clip_text_cuda = @import("tp_models").models.clip_text_cuda;
 const sd_unet = @import("tp_models").models.sd_unet;
+const sd_unet_gpu = @import("tp_models").models.sd_unet_gpu;
+const sd_unet_cuda = @import("tp_models").models.sd_unet_cuda;
 const sd_vae = @import("tp_models").models.sd_vae;
+const sd_vae_gpu = @import("tp_models").models.sd_vae_gpu;
+const sd_vae_cuda = @import("tp_models").models.sd_vae_cuda;
 const taehv_mod = @import("tp_models").models.taehv;
 const taehv_cuda_mod = @import("tp_models").models.taehv_cuda;
 const taehv_gpu_mod = @import("tp_models").models.taehv_gpu;
@@ -146,17 +154,63 @@ pub const Snapshot = struct {
     latent: []f32,
     /// Sampling step to resume at.
     step: usize,
+    /// **Multistep sampler state**, gpa-owned, null for a first-order sampler.
+    ///
+    /// ⚠️ A latent alone is not enough to resume a DPM++(2M) run bit-identically:
+    /// the step after the resume applies a second-order correction built from the
+    /// PREVIOUS step's denoised prediction. Dropping it is not a crash — the
+    /// resumed step silently degrades to first order and the image differs from an
+    /// uninterrupted render, which is exactly the promise `resume_from` makes.
+    sde_old_denoised: ?[]f32 = null,
+    /// The `h` of the step before the resume point, the other half of that state.
+    sde_h_last: f64 = 0,
+
+    pub fn deinit(self: *Snapshot, gpa: std.mem.Allocator) void {
+        gpa.free(self.latent);
+        if (self.sde_old_denoised) |o| gpa.free(o);
+        self.* = undefined;
+    }
 };
 
 pub const Options = struct {
     prompt: []const u8,
     negative: []const u8 = "",
+    /// Which prompt dialect `prompt`/`negative` are written in. See `PromptSyntax` —
+    /// the two are not interchangeable spellings of the same thing.
+    prompt_syntax: PromptSyntax = .comfy,
+    /// How an A1111 attention weight reaches the hidden states. Ignored under `.comfy`.
+    emphasis: Emphasis = .original,
+    /// Whose **sampling** conventions to follow. Orthogonal to `prompt_syntax`: the same
+    /// prompt text can be read either dialect's way under either ecosystem's sampler, and
+    /// reproducing an A1111 render needs both set. See `Compat`.
+    compat: Compat = .comfy,
+    /// Per-knob overrides of `compat`, for an A1111 user who changed one of the three
+    /// settings from its default (each is a checkbox there, so this is normal, not
+    /// exotic). null = whatever `compat` says.
+    rng: ?noise_mod.Source = null,
+    sgm_noise_multiplier: ?bool = null,
+    quantize_timestep: ?bool = null,
     width: usize = 1024,
     height: usize = 1024,
     steps: usize = 8,
     cfg: f32 = 1.0,
     seed: u64 = 0,
     shift: f32 = sampler.default_shift,
+    /// Which sampler drives the loop. `euler` is the default and the only
+    /// first-order one; see `sampler.Kind`.
+    sampler: sampler.Kind = .euler,
+    /// Which scheduler places the steps. null = the family's default (`simple` for
+    /// krea2, `normal` for the SD family), which is what every render used before
+    /// this became selectable. See `sampler.Scheduler`.
+    ///
+    /// ⚠️ `ddim_uniform` and `beta` can return a different number of steps than
+    /// `steps` asks for; `generate` reports and drives off the real count.
+    scheduler: ?sampler.Scheduler = null,
+    /// SDE noise level (`eta`) and noise multiplier (`s_noise`), ignored by `euler`.
+    /// ComfyUI's defaults; `sde_eta = 0` makes an SDE sampler deterministic and
+    /// equal to plain DPM++(2M).
+    sde_eta: f64 = 1.0,
+    sde_s_noise: f64 = 1.0,
     /// Compute backend for the sampling loop (and encoder/VAE where supported).
     backend: Backend = .cpu,
     /// VAE decode-path override (see `VaeDecode`). Default `auto` (adaptive).
@@ -179,9 +233,14 @@ pub const Options = struct {
     text_encoder_path: []const u8 = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors",
     dit_path: []const u8 = "models/diffusion_model/krea2CenterSemiraw_v10Fp8.safetensors",
     vae_path: []const u8 = "models/vae/krea2RealVae_v10.safetensors",
+    /// SDXL's **second** text encoder (OpenCLIP bigG), for the split-file case. Empty by
+    /// default rather than pointing anywhere: unlike krea2's components there is no
+    /// canonical standalone file for it, and a bundled SDXL checkpoint always carries it.
+    text_encoder_2_path: []const u8 = "",
     /// True when the caller actually asked for those paths. A CLI sets this when the
     /// flag was present; a library caller that fills the field in means it.
     explicit_text_encoder: bool = false,
+    explicit_text_encoder_2: bool = false,
     explicit_vae: bool = false,
     /// Optional per-step progress hook (see `Progress`).
     on_step: ?Progress = null,
@@ -230,6 +289,15 @@ pub const Options = struct {
     /// context, so the pipeline re-binds its own after. (GUI_VRAM.md Phase 5;
     /// null everywhere else.)
     reclaim: ?Reclaim = null,
+
+    /// `compat` with the per-knob overrides applied — the form the sampling code reads.
+    pub fn compatConfig(self: *const Options) CompatConfig {
+        var c: CompatConfig = .of(self.compat);
+        if (self.rng) |v| c.noise_src = v;
+        if (self.sgm_noise_multiplier) |v| c.sgm_noise_multiplier = v;
+        if (self.quantize_timestep) |v| c.quantize_timestep = v;
+        return c;
+    }
 };
 
 /// A device-VRAM reclaim callback (see `Options.reclaim`); returns the number of
@@ -257,9 +325,62 @@ pub const Image = struct {
 pub const Cond = struct {
     data: []f32,
     seq: usize,
+    /// SDXL's pooled CLIP-G vector (1280). Null for the families that do not use one.
+    ///
+    /// It rides on the conditioning rather than being folded into it because the vector
+    /// the UNet actually consumes (`y`) also carries the *image size*, which `encode` does
+    /// not know — so the pooled half is produced here and combined in `Session.denoiser`,
+    /// which does.
+    pooled: ?[]f32 = null,
+    /// Extra conditionings for a prompt whose text CHANGES DURING the render — A1111's
+    /// `[a:b:0.5]` and `[a|b]`. Null for every static prompt, which is every prompt in
+    /// the ComfyUI dialect.
+    ///
+    /// ⚠️ **Entry 0 is this `Cond` itself** (`data`/`seq`/`pooled`), so a caller that
+    /// ignores `sched` reads the step-0 conditioning and behaves exactly as before. That
+    /// is what keeps `Session.predict`, the composed-stages invariant and ggufy's whole
+    /// measurement ladder working unchanged.
+    sched: ?Schedule = null,
+
+    /// The step → conditioning map for a scheduled prompt.
+    pub const Schedule = struct {
+        /// Entries 1.., each a complete conditioning with its own `seq` and `pooled`.
+        /// Deduplicated by prompt text: `[a|b]` over 35 steps has 35 schedule *entries*
+        /// but only 2 distinct texts, and building 35 conditionings for 2 prompts would
+        /// cost 33 pointless tower forwards and 33 device sessions.
+        extra: []Cond,
+        /// Per-step index into `[this] ++ extra`, length = the render's step count.
+        at: []u8,
+
+        /// Which conditioning step `i` (0-based) uses. Steps past the end clamp to the
+        /// last, so a schedule built for fewer steps than the render still resolves.
+        pub fn indexAt(self: Schedule, i: usize) usize {
+            if (self.at.len == 0) return 0;
+            return self.at[@min(i, self.at.len - 1)];
+        }
+    };
+
+    /// Total distinct conditionings, including entry 0.
+    pub fn entryCount(self: *const Cond) usize {
+        return 1 + if (self.sched) |s| s.extra.len else 0;
+    }
+
+    /// Conditioning `i`, where 0 is this one.
+    pub fn entry(self: *const Cond, i: usize) *const Cond {
+        if (i == 0) return self;
+        return &self.sched.?.extra[i - 1];
+    }
 
     pub fn deinit(self: *Cond, gpa: std.mem.Allocator) void {
         gpa.free(self.data);
+        if (self.pooled) |p| gpa.free(p);
+        if (self.sched) |s| {
+            // The extras are plain Conds with no schedule of their own, so this recurses
+            // exactly one level.
+            for (s.extra) |*e| e.deinit(gpa);
+            gpa.free(s.extra);
+            gpa.free(s.at);
+        }
         self.* = undefined;
     }
 };
@@ -270,7 +391,92 @@ pub const EncodeOptions = struct {
     /// Run the GPU text encoder's GEMMs on tensor cores (f16). See
     /// `Options.encoder_f16`.
     encoder_f16: bool = false,
+    /// Which prompt dialect to parse. See `PromptSyntax`.
+    prompt_syntax: PromptSyntax = .comfy,
+    /// How an attention weight reaches the hidden states. Only read for `.a1111`.
+    emphasis: Emphasis = .original,
+    /// Steps the render will take — needed only by `.a1111`, whose `[a:b:when]` and
+    /// `[a|b]` resolve against the step count. Zero means "one entry", which is what a
+    /// caller that is not rendering a schedule wants.
+    steps: usize = 0,
     cancel: ?*std.atomic.Value(bool) = null,
+};
+
+/// Which prompt dialect to parse. The two are NOT variations on a theme: see
+/// `core/prompt_a1111.zig` for the five things that differ.
+pub const PromptSyntax = enum {
+    /// ComfyUI: `(x:w)` replaces the weight, `[x]` is literal text, `BREAK` is a word,
+    /// and weights interpolate away from the empty prompt's hidden states.
+    comfy,
+    /// AUTOMATIC1111: `(x:w)` multiplies, `[x]` de-emphasizes, `BREAK` splits a chunk, a
+    /// chunk boundary backtracks to the last comma, weights multiply the hidden states,
+    /// and `[a:b:when]` / `[a|b]` schedule the prompt across steps.
+    a1111,
+};
+
+/// How A1111 applies an attention weight to the hidden states
+/// (`modules/sd_emphasis.py`). Ignored under `.comfy`, which has exactly one form.
+pub const Emphasis = enum {
+    /// `EmphasisOriginal`: multiply, then one global rescale restoring the chunk mean.
+    original,
+    /// `EmphasisOriginalNoNorm`: multiply only. Upstream documents this as working
+    /// better for SDXL, and it is the form that leaves unweighted tokens untouched.
+    no_norm,
+    /// `EmphasisIgnore`: parse the syntax and strip it, but weight everything 1.0 —
+    /// useful for isolating how much of a difference the weighting itself makes.
+    ignore,
+};
+
+/// Which ecosystem's **sampling** conventions to reproduce — a separate axis from
+/// `PromptSyntax`, which is about the prompt *text*.
+///
+/// ⚠️ **Three independent conventions, each a documented A1111 option whose default
+/// disagrees with ComfyUI's behaviour**, and this engine hardwired ComfyUI's choice for
+/// all three. Reproducing an A1111 render needs all of them; getting one wrong is enough
+/// to make the image a different image:
+///
+/// | | A1111 default | ComfyUI (was unconditional here) | cost of the wrong one |
+/// |---|---|---|---|
+/// | `randn_source` | **`GPU`** — NVIDIA Philox | CPU MT19937 | an *unrelated* image |
+/// | `sgm_noise_multiplier` | **`False`** — `x·σ₀` | `x·sqrt(1+σ₀²)` | ~9 dB |
+/// | `enable_quantization` | **`False`** — fractional σ→t | nearest trained index | ~25 dB |
+///
+/// The first is categorically worse than the other two: they perturb a trajectory, it
+/// replaces the starting point. Upstream's own note on the option is "changes seeds
+/// drastically". The second and third are measured in `sampler.sdScaleInitialNoise` and
+/// `sampler.sdModelTimestep`, whose doc comments already name diffusers as the other side
+/// of the same disagreement — A1111 happens to sit on diffusers' side of both.
+pub const Compat = enum {
+    /// ComfyUI's conventions, which every render here used before this was selectable.
+    comfy,
+    /// AUTOMATIC1111's **defaults**. ⚠️ Not "A1111" in general: each of the three is a
+    /// user-visible setting there, so an A1111 user who changed one needs the matching
+    /// override below.
+    a1111,
+};
+
+/// `Compat` resolved into the three switches the sampling code reads, after any
+/// per-knob override. Built by `Options.compatConfig`.
+pub const CompatConfig = struct {
+    /// Which generator the initial latent — and every Brownian-tree node — draws from.
+    noise_src: noise_mod.Source = .torch_cpu,
+    /// `x·sqrt(1+σ₀²)` when true (ComfyUI / the official SGM implementation), a bare
+    /// `x·σ₀` when false (A1111's default).
+    sgm_noise_multiplier: bool = true,
+    /// Snap the UNet's timestep to the nearest *trained* index (ComfyUI) rather than
+    /// passing the fractional one (A1111's `enable_quantization = False`).
+    quantize_timestep: bool = true,
+
+    pub fn of(compat: Compat) CompatConfig {
+        return switch (compat) {
+            .comfy => .{},
+            .a1111 => .{
+                .noise_src = .nv_philox,
+                .sgm_noise_multiplier = false,
+                .quantize_timestep = false,
+            },
+        };
+    }
 };
 
 /// Per-call knobs for `Session.decode`, mirroring the `Options` fields the VAE
@@ -317,6 +523,131 @@ const CpuTile = struct {
     cancel: ?*std.atomic.Value(bool) = null,
     fn call(self: CpuTile, gpa: std.mem.Allocator, io: std.Io, sub: []const f32, th: usize, tw: usize) anyerror![]f32 {
         return self.vae.decode(io, gpa, sub, th, tw, self.cancel);
+    }
+};
+
+/// The SD family's three tile adapters. Same contract as the krea2 ones above —
+/// planar `[c][th][tw]` sub-latent in, planar `[3][8·th][8·tw]` pixels out — with
+/// the channel-last transposition the SD decoders want folded in on either side,
+/// so `vae_tiled` and `Session.decode` stay planar-only.
+///
+/// ⚠️ The transposition is the layout trap that produced a periodic streak
+/// pattern when the UNet landed (see CLAUDE.md): it moves every value's position
+/// and none of its magnitude, so getting it wrong is invisible to any norm check.
+/// It lives here, once, for exactly that reason.
+fn sdTile(
+    gpa: std.mem.Allocator,
+    sub: []const f32,
+    th: usize,
+    tw: usize,
+    ctx: anytype,
+    comptime inner: fn (@TypeOf(ctx), std.mem.Allocator, []const f32, usize, usize) anyerror![]f32,
+) anyerror![]f32 {
+    const c = sd_vae.latent_channels;
+    const n = th * tw;
+    std.debug.assert(sub.len == c * n);
+    const z = try gpa.alloc(f32, sub.len);
+    defer gpa.free(z);
+    for (0..n) |px| {
+        for (0..c) |ch| z[px * c + ch] = sub[ch * n + px];
+    }
+    const rows = try inner(ctx, gpa, z, th, tw); // channel-last [ph*pw][3]
+    defer gpa.free(rows);
+    const pn = n * sd_vae.spatial_scale * sd_vae.spatial_scale;
+    std.debug.assert(rows.len == pn * 3);
+    const planar = try gpa.alloc(f32, rows.len);
+    errdefer gpa.free(planar);
+    for (0..pn) |px| {
+        for (0..3) |ch| planar[ch * pn + px] = rows[px * 3 + ch];
+    }
+    return planar;
+}
+
+const SdCudaTile = struct {
+    vae: *const sd_vae.Decoder,
+    be: *cuda.Backend,
+    cancel: ?*std.atomic.Value(bool) = null,
+    fn inner(self: SdCudaTile, gpa: std.mem.Allocator, z: []const f32, th: usize, tw: usize) anyerror![]f32 {
+        return sd_vae_cuda.decode(self.vae, self.be, gpa, z, th, tw, self.cancel);
+    }
+    fn call(self: SdCudaTile, gpa: std.mem.Allocator, io: std.Io, sub: []const f32, th: usize, tw: usize) anyerror![]f32 {
+        _ = io;
+        return sdTile(gpa, sub, th, tw, self, inner);
+    }
+};
+
+const SdVkTile = struct {
+    vae: *const sd_vae.Decoder,
+    gc: *gpu_mod.Context,
+    cancel: ?*std.atomic.Value(bool) = null,
+    fn inner(self: SdVkTile, gpa: std.mem.Allocator, z: []const f32, th: usize, tw: usize) anyerror![]f32 {
+        return sd_vae_gpu.decode(self.vae, self.gc, gpa, z, th, tw, self.cancel);
+    }
+    fn call(self: SdVkTile, gpa: std.mem.Allocator, io: std.Io, sub: []const f32, th: usize, tw: usize) anyerror![]f32 {
+        _ = io;
+        return sdTile(gpa, sub, th, tw, self, inner);
+    }
+};
+
+const SdCpuTile = struct {
+    vae: *const sd_vae.Decoder,
+    io: std.Io,
+    cancel: ?*std.atomic.Value(bool) = null,
+    fn inner(self: SdCpuTile, gpa: std.mem.Allocator, z: []const f32, th: usize, tw: usize) anyerror![]f32 {
+        // The CPU decoder takes no cancel token (unlike wan_vae's), so a stop
+        // lands at the next tile boundary rather than mid-tile.
+        if (self.cancel) |c| if (c.load(.acquire)) return error.Canceled;
+        return self.vae.decode(self.io, gpa, z, th, tw);
+    }
+    fn call(self: SdCpuTile, gpa: std.mem.Allocator, io: std.Io, sub: []const f32, th: usize, tw: usize) anyerror![]f32 {
+        _ = io;
+        return sdTile(gpa, sub, th, tw, self, inner);
+    }
+};
+
+/// The family-specific half of the VAE-decode ladder (`Session.decodePlanar`):
+/// the per-backend tile context, the peak-VRAM estimate, and the tile geometry.
+/// A whole-image decode is just a single tile covering the whole latent, so these
+/// three contexts are all the ladder needs to be written once for both families.
+const KreaVae = struct {
+    vae: *const wan_vae.Decoder,
+    /// 128² latent tiles (~1 MP): caps the mid-block scores plane at 512 MiB.
+    const tiling: vae_tiled.Params = .{};
+    fn estimate(self: KreaVae, zh: usize, zw: usize) u64 {
+        return self.vae.estimatePeakBytes(zh, zw);
+    }
+    fn cudaCtx(self: KreaVae, be: *cuda.Backend, cancel: ?*std.atomic.Value(bool)) CudaTile {
+        return .{ .vae = self.vae, .be = be, .cancel = cancel };
+    }
+    fn vkCtx(self: KreaVae, gc: *gpu_mod.Context, cancel: ?*std.atomic.Value(bool)) VkTile {
+        return .{ .vae = self.vae, .gc = gc, .cancel = cancel };
+    }
+    fn cpuCtx(self: KreaVae, io: std.Io, cancel: ?*std.atomic.Value(bool)) CpuTile {
+        _ = io;
+        return .{ .vae = self.vae, .cancel = cancel };
+    }
+};
+
+const SdVae = struct {
+    vae: *const sd_vae.Decoder,
+    /// ⚠️ HALF krea2's tile, and that is the whole point of tiling here. The SD
+    /// decoder's widest activation is 256 channels at FULL image resolution, so a
+    /// 128² latent tile (1024² pixels) still needs 3 x 1 GiB — barely under a
+    /// 1024x1536 whole-image decode, i.e. a tiling that saves nothing. 64² latent
+    /// (512² pixels) costs 3 x 256 MiB and is also what ComfyUI's tiled SD decode
+    /// defaults to; overlap 8 keeps its 25% seam ratio.
+    const tiling: vae_tiled.Params = .{ .tile = 64, .overlap = 8 };
+    fn estimate(self: SdVae, zh: usize, zw: usize) u64 {
+        return self.vae.estimatePeakBytes(zh, zw);
+    }
+    fn cudaCtx(self: SdVae, be: *cuda.Backend, cancel: ?*std.atomic.Value(bool)) SdCudaTile {
+        return .{ .vae = self.vae, .be = be, .cancel = cancel };
+    }
+    fn vkCtx(self: SdVae, gc: *gpu_mod.Context, cancel: ?*std.atomic.Value(bool)) SdVkTile {
+        return .{ .vae = self.vae, .gc = gc, .cancel = cancel };
+    }
+    fn cpuCtx(self: SdVae, io: std.Io, cancel: ?*std.atomic.Value(bool)) SdCpuTile {
+        return .{ .vae = self.vae, .io = io, .cancel = cancel };
     }
 };
 
@@ -378,6 +709,18 @@ fn recoverableDecodeErr(err: anyerror) bool {
 /// precomputes a timestep vector per entry, and `predict` at a sigma that is not
 /// in the list recomputes one on the fly (correct, just slower) — so pass the
 /// schedule you intend to sample with, and an off-schedule probe still works.
+/// One conditioning entry's device state for the SD family, per branch.
+///
+/// `adm` is SDXL's `y` vector, built here rather than in `encode` because it carries the
+/// image SIZE — a property of this denoiser's resolution, not of the prompt. It is
+/// per-entry because it embeds that entry's pooled CLIP-G vector, which a scheduled
+/// prompt changes along with everything else.
+pub const SdBranch = struct {
+    cu: ?sd_unet_cuda.Session = null,
+    vk: ?sd_unet_gpu.Session = null,
+    adm: ?[]f32 = null,
+};
+
 pub const Denoiser = struct {
     sess: *Session,
     lat_h: usize,
@@ -398,6 +741,19 @@ pub const Denoiser = struct {
     /// SD1.5's per-resolution UNet scratch, for the same reason the GPU sessions
     /// above exist: sized once per image rather than once per step.
     sd_ws: ?sd_unet.Workspace = null,
+    /// The SD family's per-conditioning device state, one array element per distinct
+    /// scheduled prompt (`Cond.entryCount`). Length 1 for every static prompt.
+    ///
+    /// One session per (entry, branch) rather than one per branch: a session carries that
+    /// conditioning's context on the device plus its folded per-forward ResBlock biases,
+    /// so a prompt that changes mid-render needs a session per variant. They are built
+    /// eagerly in `denoiser` — deduplication at encode time keeps the count at the number
+    /// of distinct prompt *texts* (2 for an `[a|b]`), not the number of steps.
+    sd_pos: []SdBranch = &.{},
+    sd_neg: []SdBranch = &.{},
+    /// Shared across every entry and both branches, sized for the widest conditioning.
+    sd_vk_ws: ?sd_unet_gpu.Workspace = null,
+    sd_cu_ws: ?sd_unet_cuda.Workspace = null,
     /// Input scratch for SD's `x / sqrt(sigma^2 + 1)` pre-scaling, which krea2 has
     /// no analogue of. Channel-last, since it is what the UNet reads.
     sd_scaled: ?[]f32 = null,
@@ -408,6 +764,16 @@ pub const Denoiser = struct {
     pub fn deinit(self: *Denoiser, gpa: std.mem.Allocator) void {
         if (self.v_neg) |b| gpa.free(b);
         if (self.sd_ws) |*w| w.deinit();
+        for ([_][]SdBranch{ self.sd_pos, self.sd_neg }) |arr| {
+            for (arr) |*br| {
+                if (br.vk) |*x| x.deinit(self.sess.gpu_ctx.?);
+                if (br.cu) |*x| x.deinit(self.sess.cu_be.?);
+                if (br.adm) |b| gpa.free(b);
+            }
+            gpa.free(arr);
+        }
+        if (self.sd_vk_ws) |*w| w.deinit(self.sess.gpu_ctx.?);
+        if (self.sd_cu_ws) |*w| w.deinit(self.sess.cu_be.?);
         if (self.sd_scaled) |b| gpa.free(b);
         if (self.sd_eps) |b| gpa.free(b);
         if (self.vk_pos) |*s| s.deinit(gpa, self.sess.gpu_ctx.?);
@@ -419,9 +785,12 @@ pub const Denoiser = struct {
         self.* = undefined;
     }
 
-    /// One denoiser forward at `sigma`: `v_out = model(latent, sigma, cond)`, with
-    /// classifier-free guidance folded in when `cfg != 1`. `v_out` and `latent`
-    /// are both `16·lat_h·lat_w` long.
+    /// One denoiser forward at `sigma`, using the STEP-0 conditioning.
+    ///
+    /// Unchanged in signature and behaviour: for a static prompt — every prompt in the
+    /// ComfyUI dialect — there is only one conditioning, so this is the whole story. A
+    /// caller driving the stages itself (ggufy's measurement ladder, the composed-stages
+    /// invariant test) keeps working verbatim.
     pub fn predict(
         self: *Denoiser,
         gpa: std.mem.Allocator,
@@ -430,9 +799,29 @@ pub const Denoiser = struct {
         sigma: f32,
         cancel: ?*std.atomic.Value(bool),
     ) !void {
+        return self.predictAt(gpa, v_out, latent, sigma, 0, cancel);
+    }
+
+    /// One denoiser forward at `sigma` on the conditioning scheduled for `step` (0-based):
+    /// `v_out = model(latent, sigma, cond[step])`, with classifier-free guidance folded in
+    /// when `cfg != 1`. `v_out` and `latent` are both `channels·lat_h·lat_w` long.
+    ///
+    /// `step` selects among A1111's per-step prompt variants and is ignored for a static
+    /// prompt. It is the *sampling* step index, not a sigma — the schedule is defined over
+    /// step ordinals, so a teacher-forced off-schedule sigma still needs to say which step
+    /// it stands for.
+    pub fn predictAt(
+        self: *Denoiser,
+        gpa: std.mem.Allocator,
+        v_out: []f32,
+        latent: []const f32,
+        sigma: f32,
+        step: usize,
+        cancel: ?*std.atomic.Value(bool),
+    ) !void {
         const s = self.sess;
         const io = s.io;
-        if (s.models == .sd15) return self.predictSd(gpa, v_out, latent, sigma, cancel);
+        if (s.family().isSd()) return self.predictSd(gpa, v_out, latent, sigma, step, cancel);
         const dit = &s.models.krea2.dit;
         std.debug.assert(v_out.len == wan_vae.latent_channels * self.lat_h * self.lat_w);
         std.debug.assert(latent.len == v_out.len);
@@ -470,14 +859,14 @@ pub const Denoiser = struct {
         v_out: []f32,
         latent: []const f32,
         sigma: f32,
+        step: usize,
         cancel: ?*std.atomic.Value(bool),
     ) !void {
         const s = self.sess;
-        const m = &s.models.sd15;
+        const m = s.sd().?;
         const cfg_unet = m.unet.cfg;
         std.debug.assert(v_out.len == cfg_unet.channels * self.lat_h * self.lat_w);
         std.debug.assert(latent.len == v_out.len);
-        _ = cancel; // the CPU UNet's cancel hook rides on ops.cancel, like the DiT's
 
         // ⚠️ **LAYOUT.** The sampler's latent is **planar** `[c][h][w]` — krea2's DiT and
         // both VAEs use that, and `generate`/`decode` are written to it — while
@@ -501,46 +890,103 @@ pub const Denoiser = struct {
             }
         }
         sampler.sdScaleInput(scaled, scaled, sigma);
-        const t = sampler.sdTimestepForSigma(m.sigma_ladder, sigma);
+        // The nearest *trained* index, not the fractional one — see `sdModelTimestep`,
+        // where the measured cost of the fractional form is 25 dB of render agreement.
+        // A1111 is the one ecosystem that passes the fractional index by default
+        // (`enable_quantization = False`), so `--compat a1111` takes the other branch.
+        const t = if (self.sess.compat.quantize_timestep)
+            sampler.sdModelTimestep(m.sigma_ladder, sigma)
+        else
+            sampler.sdTimestepForSigma(m.sigma_ladder, sigma);
 
-        const ws = &self.sd_ws.?;
+        // Which scheduled prompt this step conditions on. Both branches are indexed
+        // independently: A1111 schedules the negative prompt too, and the two need not
+        // change at the same steps.
+        const e_pos = if (self.cond_pos.sched) |sc| sc.indexAt(step) else 0;
         const cl = self.sd_eps.?; // channel-last scratch for the UNet's output
-        try sd_unet.forward(
-            &m.unet,
-            s.io,
-            gpa,
-            ws,
-            cl,
-            scaled,
-            self.lat_h,
-            self.lat_w,
-            t,
-            self.cond_pos.data,
-            self.cond_pos.seq,
-        );
+        try self.unetForward(gpa, cl, scaled, t, .positive, e_pos, cancel);
         channelLastToPlanar(v_out, cl, ch, plane);
         if (self.cfg == 1.0) return;
 
         const v_neg = self.v_neg.?;
-        try sd_unet.forward(
-            &m.unet,
-            s.io,
-            gpa,
-            ws,
-            cl,
-            scaled,
-            self.lat_h,
-            self.lat_w,
-            t,
-            self.cond_neg.?.data,
-            self.cond_neg.?.seq,
-        );
+        const e_neg = if (self.cond_neg.?.sched) |sc| sc.indexAt(step) else 0;
+        try self.unetForward(gpa, cl, scaled, t, .negative, e_neg, cancel);
         channelLastToPlanar(v_neg, cl, ch, plane);
         // Mixing eps is equivalent to mixing denoised predictions at fixed x, the
         // same argument that licenses krea2's velocity CFG.
         sampler.applyCfg(v_out, v_neg, self.cfg);
     }
+
+    /// One SD UNet forward for one conditioning branch, dispatched by backend.
+    /// Both arms take and return channel-last `[h*w][c]`.
+    fn unetForward(
+        self: *Denoiser,
+        gpa: std.mem.Allocator,
+        eps: []f32,
+        scaled: []const f32,
+        t: f32,
+        branch: enum { positive, negative },
+        entry: usize,
+        cancel: ?*std.atomic.Value(bool),
+    ) !void {
+        const s = self.sess;
+        const m = s.sd().?;
+        const br = &(switch (branch) {
+            .positive => self.sd_pos,
+            .negative => self.sd_neg,
+        })[entry];
+        if (s.cu_be) |b| {
+            return sd_unet_cuda.forward(&m.unet, b, &br.cu.?, &self.sd_cu_ws.?, s.io, gpa, eps, scaled, self.lat_h, self.lat_w, t, cancel);
+        }
+        if (s.gpu_ctx) |gc| {
+            return sd_unet_gpu.forward(&m.unet, gc, &br.vk.?, &self.sd_vk_ws.?, s.io, gpa, eps, scaled, self.lat_h, self.lat_w, t, cancel);
+        }
+        // The CPU UNet's cancel hook rides on ops.cancel, like the DiT's.
+        const cond = (switch (branch) {
+            .positive => &self.cond_pos,
+            .negative => &self.cond_neg.?,
+        }).entry(entry);
+        return sd_unet.forward(&m.unet, s.io, gpa, &self.sd_ws.?, eps, scaled, self.lat_h, self.lat_w, t, cond.data, cond.seq, br.adm);
+    }
 };
+
+/// The distinct prompt texts a scheduled prompt passes through, plus the per-step index
+/// into them. `texts` lives in `arena`; `at` is allocated from `gpa` because it outlives
+/// the call as part of `Cond.Schedule`.
+///
+/// Split out from `encodeScheduled` so the deduplication is testable without a model —
+/// it is the part with the interesting behaviour, and the part whose absence would cost
+/// 33 tower forwards on a 35-step `[a|b]`.
+pub const SchedulePlan = struct { texts: []const []const u8, at: []u8 };
+
+pub fn planSchedule(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    text: []const u8,
+    steps: usize,
+) !SchedulePlan {
+    const entries = try prompt_a1111.schedule(arena, text, steps);
+    var uniq: std.ArrayList([]const u8) = .empty;
+    const at = try gpa.alloc(u8, steps);
+    errdefer gpa.free(at);
+    for (0..steps) |step| {
+        // The first entry whose (1-based, inclusive) `until` covers this step.
+        const et = for (entries) |e| {
+            if (step + 1 <= e.until) break e.text;
+        } else entries[entries.len - 1].text;
+        const idx = for (uniq.items, 0..) |u, i| {
+            if (std.mem.eql(u8, u, et)) break i;
+        } else blk: {
+            try uniq.append(arena, et);
+            break :blk uniq.items.len - 1;
+        };
+        // 255 distinct prompts in one render is not a thing anyone means to do; refusing
+        // beats silently truncating the index.
+        if (idx > std.math.maxInt(u8)) return error.TooManyPromptVariants;
+        at[step] = @intCast(idx);
+    }
+    return .{ .texts = uniq.items, .at = at };
+}
 
 /// The DiT's checkpoint container, which may be either format.
 ///
@@ -636,7 +1082,10 @@ fn channelLastToPlanar(dst: []f32, src: []const f32, ch: usize, plane: usize) vo
 
 /// One of the three things a diffusion pipeline is made of. Each may live in the
 /// primary checkpoint or in a file of its own — **independently of the architecture**.
-pub const Component = enum { denoiser, conditioner, decoder };
+/// `conditioner2` exists only for SDXL, which conditions on **two** text towers whose
+/// outputs are concatenated. Asking any other family for it is a programming error
+/// (`error.NoSuchComponent`), not a missing-weights condition.
+pub const Component = enum { denoiser, conditioner, conditioner2, decoder };
 
 /// Where a component's weights were found: a store in which it sits **at the root**
 /// (wrapped in a `weights.Prefixed` view when it was nested), plus the file it came
@@ -654,12 +1103,13 @@ const Resolved = struct {
 /// that could also match by accident.
 const ComponentSpec = struct { prefixes: []const []const u8, probe: []const u8 };
 
-fn componentSpec(fam: Family, comp: Component) ComponentSpec {
+fn componentSpec(fam: Family, comp: Component) error{NoSuchComponent}!ComponentSpec {
     return switch (fam) {
         .krea2 => switch (comp) {
             .denoiser => .{ .prefixes = &.{ "model.diffusion_model.", "" }, .probe = "blocks.0.attn.wq.weight" },
             .conditioner => .{ .prefixes = &.{ "text_encoders.", "" }, .probe = "model.language_model.embed_tokens.weight" },
             .decoder => .{ .prefixes = &.{ "first_stage_model.", "vae.", "" }, .probe = "decoder.conv1.weight" },
+            .conditioner2 => error.NoSuchComponent,
         },
         .sd15 => switch (comp) {
             .denoiser => .{ .prefixes = &.{ "model.diffusion_model.", "" }, .probe = "input_blocks.0.0.weight" },
@@ -667,6 +1117,22 @@ fn componentSpec(fam: Family, comp: Component) ComponentSpec {
                 // LDM bundle, then a bare HF text-encoder export.
                 .prefixes = &.{ "cond_stage_model.transformer.text_model.", "text_model.", "" },
                 .probe = "final_layer_norm.weight",
+            },
+            .decoder => .{ .prefixes = &.{ "first_stage_model.", "" }, .probe = "decoder.conv_in.weight" },
+            .conditioner2 => error.NoSuchComponent,
+        },
+        // SDXL bundles its two towers under `conditioner.embedders.{0,1}` — and the two
+        // are spelled differently *within one file*: embedder 0 is a `transformers`
+        // CLIPTextModel, embedder 1 an OpenCLIP tower. Hence the different probes.
+        .sdxl => switch (comp) {
+            .denoiser => .{ .prefixes = &.{ "model.diffusion_model.", "" }, .probe = "input_blocks.0.0.weight" },
+            .conditioner => .{
+                .prefixes = &.{ "conditioner.embedders.0.transformer.text_model.", "text_model.", "" },
+                .probe = "final_layer_norm.weight",
+            },
+            .conditioner2 => .{
+                .prefixes = &.{ "conditioner.embedders.1.model.", "" },
+                .probe = "ln_final.weight",
             },
             .decoder => .{ .prefixes = &.{ "first_stage_model.", "" }, .probe = "decoder.conv_in.weight" },
         },
@@ -691,7 +1157,7 @@ fn resolveComponent(
     side: ?weights_mod.WeightStore,
     side_is_explicit: bool,
 ) !Resolved {
-    const spec = componentSpec(fam, comp);
+    const spec = try componentSpec(fam, comp);
 
     // Order of preference: an explicitly requested file, then the primary checkpoint's
     // own copy, then a defaulted side file. So `--vae x` overrides a bundled VAE, a
@@ -751,7 +1217,7 @@ fn reportResolve(
     return resolveComponent(gpa, fam, comp, primary, side, side_is_explicit) catch |err| {
         if (err == error.ComponentNotInCheckpoint) std.log.err(
             "{t} not found: the checkpoint has no '{s}' under any known prefix, and '{s}' does not supply one either",
-            .{ comp, componentSpec(fam, comp).probe, side_path },
+            .{ comp, (try componentSpec(fam, comp)).probe, side_path },
         );
         return err;
     };
@@ -769,7 +1235,18 @@ fn reportResolve(
 /// eps on a discrete ladder, is conditioned on a timestep *index*, and needs its input
 /// pre-scaled. What makes one API cover both is that the Euler step consumes the same
 /// quantity either way — for eps-prediction the trajectory derivative *is* eps.
-pub const Family = enum { krea2, sd15 };
+pub const Family = enum {
+    krea2,
+    sd15,
+    sdxl,
+
+    /// Whether this family runs the `sd_unet` / `sd_vae` / CLIP stack, i.e. whether
+    /// `Session.sd()` returns a model set. SD1.5 and SDXL differ only in configuration
+    /// and in SDXL's second text tower, so nearly every stage is shared.
+    pub fn isSd(self: Family) bool {
+        return self == .sd15 or self == .sdxl;
+    }
+};
 
 /// krea2: three separate checkpoints (encoder, DiT, VAE).
 pub const Krea2Models = struct {
@@ -787,26 +1264,42 @@ pub const Krea2Models = struct {
     vae_view: ?*weights_mod.Prefixed,
 };
 
-/// SD1.5: one LDM single-file checkpoint normally holds all three models — but the
-/// denoiser may come from a *different* file than the conditioner and decoder, which
-/// is the case that matters here: ggufy writes a GGUF containing only the UNet (with
-/// the container prefix stripped), so a quantized SD1.5 arm is measured with CLIP and
-/// the VAE loaded from the original checkpoint. `aux_st` is null when both come from
-/// the denoiser's own file.
-pub const Sd15Models = struct {
+/// The SD family (SD1.5 and SDXL): one LDM single-file checkpoint normally holds every
+/// model — but the denoiser may come from a *different* file than the conditioner and
+/// decoder, which is the case that matters here: ggufy writes a GGUF containing only the
+/// UNet (with the container prefix stripped), so a quantized arm is measured with CLIP
+/// and the VAE loaded from the original checkpoint.
+///
+/// One struct for both architectures, because they differ only in `Config`s and in
+/// SDXL's second text tower — so `denoiser`, `predict`, `decode` and teardown are shared
+/// verbatim rather than duplicated per family.
+pub const SdModels = struct {
     tok: clip_tok.Tokenizer,
     unet_st: DitContainer,
     /// Null when that component came out of the primary checkpoint.
     enc_st: ?safetensors.SafeTensors,
+    enc2_st: ?safetensors.SafeTensors,
     vae_st: ?safetensors.SafeTensors,
     clip: clip_text.TextEncoder,
+    /// SDXL's OpenCLIP bigG tower. Null for SD1.5.
+    clip_g: ?clip_text.TextEncoder,
     unet: sd_unet.UNet,
     vae: sd_vae.Decoder,
     clip_view: ?*weights_mod.Prefixed,
+    clip_g_view: ?*weights_mod.Prefixed,
     vae_view: ?*weights_mod.Prefixed,
     /// The full per-training-step sigma ladder, for the sigma → timestep inverse a
     /// teacher-forced (off-schedule) sigma needs. Built once.
     sigma_ladder: []f32,
+    /// `z_empty` for each tower — the empty prompt's hidden rows at the same capture
+    /// layer the conditioning is taken from, which is the reference point attention
+    /// weighting interpolates away from (`clip_text.applyWeights`).
+    ///
+    /// Cached because it depends only on the tower, while `encode` is called at least
+    /// twice per image (positive and negative) and a render often reuses a prompt. Filled
+    /// lazily, so an unweighted prompt never pays for it at all.
+    empty_ref: ?[]f32 = null,
+    empty_ref_g: ?[]f32 = null,
 };
 
 /// The loaded model set, tagged by family. A named type rather than an anonymous
@@ -814,7 +1307,8 @@ pub const Sd15Models = struct {
 /// name from the first field's type and then report a dependency loop.
 pub const Models = union(Family) {
     krea2: Krea2Models,
-    sd15: Sd15Models,
+    sd15: SdModels,
+    sdxl: SdModels,
 };
 
 /// Which family a denoiser checkpoint belongs to, from its tensor names alone.
@@ -823,6 +1317,13 @@ pub const Models = union(Family) {
 /// asking the caller — puts a mistypeable flag in front of a measurement whose whole
 /// point is that the inputs are what they claim to be.
 pub fn detectFamily(store: weights_mod.WeightStore) !Family {
+    // ⚠️ **SDXL must be tested before SD1.5, and by a tensor SD1.5 does not have.** Both
+    // are LDM UNets with the same `input_blocks.0.0` stem, so the stem cannot tell them
+    // apart; `label_emb` (the micro-conditioning projection) exists only in SDXL. Reading
+    // the stem first would load every SDXL checkpoint as SD1.5, which fails at the fourth
+    // level's missing weights rather than saying what it actually is.
+    if (store.get("model.diffusion_model.label_emb.0.0.weight") != null) return .sdxl;
+    if (store.get("label_emb.0.0.weight") != null) return .sdxl;
     // SD's UNet stem, prefixed (a full single-file checkpoint) or bare (ggufy's
     // model-only GGUF, which strips the container prefix).
     if (store.get("model.diffusion_model.input_blocks.0.0.weight") != null) return .sd15;
@@ -832,8 +1333,45 @@ pub fn detectFamily(store: weights_mod.WeightStore) !Family {
     return error.UnknownArchitecture;
 }
 
+/// The `sd_unet` / `sd_vae` configuration pair a family runs.
+fn sdConfigs(fam: Family) struct { unet: sd_unet.Config, vae: sd_vae.Config, clip: clip_text.Config } {
+    return switch (fam) {
+        .sd15 => .{ .unet = sd_unet.sd15, .vae = sd_vae.sd15, .clip = clip_text.clip_l },
+        .sdxl => .{ .unet = sd_unet.sdxl, .vae = sd_vae.sdxl, .clip = clip_text.clip_l },
+        .krea2 => unreachable,
+    };
+}
+
+/// **Whether this family's text encoder can apply per-token prompt weights at all.**
+///
+/// ⚠️ **Derived from the ENCODER's own declaration, deliberately not from a list of
+/// architectures.** SD.Next's equivalent is a hardcoded allow-list matched against pipeline
+/// *class names* (`'StableDiffusion' in cls or 'StableCascade' in cls or 'Flux' in cls`), and
+/// the cost of that shape is visible in their own file: Chroma and HiDream sit **commented
+/// out** of it, and Flux2 needs a `'Flux2' not in cls` special case to avoid being caught by
+/// the `Flux` substring. A name-matched list has to be edited for every new pipeline and
+/// silently gives the wrong answer until someone does.
+///
+/// Here the answer comes from `TextEncoder.supports_prompt_weights` on the encoder actually
+/// loaded, which cannot disagree with the encoder's real capability and forces a *deliberate*
+/// answer from any new one — omitting the declaration is a compile error, not a default. The
+/// three properties that decide it are documented on `clip_text.TextEncoder`: a fixed token
+/// window, rows the denoiser cross-attends to 1:1, and an empty-prompt encode of the same
+/// shape to interpolate against.
+pub fn supportsPromptWeights(fam: Family) bool {
+    return switch (fam) {
+        .krea2 => qwen3.TextEncoder.supports_prompt_weights,
+        .sd15, .sdxl => clip_text.TextEncoder.supports_prompt_weights,
+    };
+}
+
 pub const Session = struct {
     models: Models,
+    /// Which ecosystem's sampling conventions this session's forwards follow. Set from
+    /// `Options` at `init` and refreshed at the top of `generate`, so a caller driving the
+    /// public stages itself (ggufy's ladder, the GUI's per-image config) gets the same
+    /// behaviour without threading it through four stage signatures.
+    compat: CompatConfig = .{},
 
 
     gpa: std.mem.Allocator,
@@ -864,13 +1402,23 @@ pub const Session = struct {
         return &self.models.krea2;
     }
 
+    /// The SD-family model set, or null for krea2. Both SD arms hold the same struct
+    /// type, so every shared stage binds this once and needs no further family test.
+    pub fn sd(self: *Session) ?*SdModels {
+        return switch (self.models) {
+            .krea2 => null,
+            .sd15 => |*m| m,
+            .sdxl => |*m| m,
+        };
+    }
+
     /// The store the *denoiser* was loaded from: what a caller overlays to
     /// substitute weights (ggufy's per-tensor attribution arm) without touching the
     /// conditioner or the decoder.
     pub fn denoiserStore(self: *const Session) weights_mod.WeightStore {
         return switch (self.models) {
             .krea2 => |*m| m.dit_st.store(),
-            .sd15 => |*m| m.unet_st.store(),
+            .sd15, .sdxl => |*m| m.unet_st.store(),
         };
     }
 
@@ -878,7 +1426,7 @@ pub const Session = struct {
     fn denoiserPayloadLen(self: *const Session) usize {
         return switch (self.models) {
             .krea2 => |*m| m.dit_st.payloadLen(),
-            .sd15 => |*m| m.unet_st.payloadLen(),
+            .sd15, .sdxl => |*m| m.unet_st.payloadLen(),
         };
     }
 
@@ -892,6 +1440,7 @@ pub const Session = struct {
         errdefer gpa.destroy(self);
         self.gpa = gpa;
         self.io = io;
+        self.compat = opts.compatConfig();
         self.backend = opts.backend;
         self.gpu_ctx = null;
         self.cu_be = null;
@@ -996,30 +1545,26 @@ pub const Session = struct {
                 t2 = std.Io.Clock.real.now(io).nanoseconds;
                 self.models = .{ .krea2 = m };
             },
-            .sd15 => {
-                // ⚠️ **CPU only.** There is no GPU kernel for this UNet (no conv, no
-                // GroupNorm on either device backend), and the failure mode of
-                // pretending otherwise is what the GGUF-on-Vulkan bug already cost:
-                // a blank image with no error. Refuse instead.
-                if (self.gpu_ctx != null or self.cu_be != null) {
-                    std.log.err("SD1.5 runs on the CPU backend only (no GPU kernels for its UNet)", .{});
-                    return error.UnsupportedBackend;
-                }
+            .sd15, .sdxl => {
+                const cfgs = sdConfigs(fam);
 
-                var m: Sd15Models = .{
+                var m: SdModels = .{
                     .tok = undefined,
                     .unet_st = den_st,
                     .enc_st = null,
+                    .enc2_st = null,
                     .vae_st = null,
                     .clip = undefined,
+                    .clip_g = null,
                     .unet = undefined,
                     .vae = undefined,
                     .clip_view = null,
+                    .clip_g_view = null,
                     .vae_view = null,
                     .sigma_ladder = &.{},
                 };
                 const den = try reportResolve(gpa, fam, .denoiser, m.unet_st.store(), null, false, opts.dit_path);
-                m.unet = try sd_unet.UNet.load(gpa, den.store, sd_unet.sd15, "");
+                m.unet = try sd_unet.UNet.load(gpa, den.store, cfgs.unet, "");
                 errdefer m.unet.deinit();
                 if (den.view) |v| {
                     v.deinit(gpa);
@@ -1035,18 +1580,41 @@ pub const Session = struct {
                 errdefer if (m.enc_st) |*st| st.deinit();
                 const clip_r = try reportResolve(gpa, fam, .conditioner, m.unet_st.store(), storeOf(&m.enc_st), opts.explicit_text_encoder, opts.text_encoder_path);
                 m.clip_view = clip_r.view;
-                m.clip = try clip_text.TextEncoder.load(gpa, clip_r.store, clip_text.clip_l, "");
+                m.clip = try clip_text.TextEncoder.load(gpa, clip_r.store, cfgs.clip, "");
                 errdefer m.clip.deinit();
+
+                // SDXL's second tower. It resolves independently — `--text-encoder`
+                // overrides the *first* one, and a checkpoint carrying only CLIP-L is a
+                // real (if unusual) split, so this gets its own resolution rather than
+                // assuming both towers live wherever the first was found.
+                //
+                // Both `errdefer`s sit at case scope, not inside the `if`: scoped to the
+                // block they would stop protecting these on any *later* failure (the VAE
+                // load below), which is a leak only the test allocator would ever see.
+                if (fam == .sdxl) m.enc2_st = try openIfGiven(gpa, io, opts.text_encoder_2_path, opts.explicit_text_encoder_2);
+                errdefer if (m.enc2_st) |*st| st.deinit();
+                if (fam == .sdxl) {
+                    const g_r = try reportResolve(gpa, fam, .conditioner2, m.unet_st.store(), storeOf(&m.enc2_st), opts.explicit_text_encoder_2, opts.text_encoder_2_path);
+                    m.clip_g_view = g_r.view;
+                    m.clip_g = try clip_text.TextEncoder.load(gpa, g_r.store, clip_text.clip_g, "");
+                }
+                errdefer if (m.clip_g) |*c| c.deinit();
 
                 m.vae_st = try openIfGiven(gpa, io, opts.vae_path, opts.explicit_vae);
                 errdefer if (m.vae_st) |*st| st.deinit();
                 const vae_r = try reportResolve(gpa, fam, .decoder, m.unet_st.store(), storeOf(&m.vae_st), opts.explicit_vae, opts.vae_path);
                 m.vae_view = vae_r.view;
-                m.vae = try sd_vae.Decoder.load(gpa, vae_r.store, sd_vae.sd15, "");
+                m.vae = try sd_vae.Decoder.load(gpa, vae_r.store, cfgs.vae, "");
                 errdefer m.vae.deinit();
+                // Both SD architectures were trained on the same beta ladder, so the
+                // sampler is shared verbatim.
                 m.sigma_ladder = try sampler.sdSigmasFull(gpa);
                 t2 = std.Io.Clock.real.now(io).nanoseconds;
-                self.models = .{ .sd15 = m };
+                self.models = switch (fam) {
+                    .sd15 => .{ .sd15 = m },
+                    .sdxl => .{ .sdxl = m },
+                    .krea2 => unreachable,
+                };
             },
         }
 
@@ -1086,12 +1654,28 @@ pub const Session = struct {
     /// The new DiT is loaded *before* the old one is freed, so a failed load leaves
     /// the session intact and usable.
     pub fn replaceDenoiser(self: *Session, store: weights_mod.WeightStore) !void {
-        if (self.models == .sd15) {
-            const m = &self.models.sd15;
+        // ⚠️ Device weight caches are keyed by HOST POINTER, so they must be dropped
+        // whatever the family: the outgoing denoiser's arena is about to be freed,
+        // and a later allocation reusing one of those addresses for a different
+        // tensor would score a stale cache hit and compute with the wrong weights.
+        // Cheap next to a reload, and the next forward re-uploads what fits.
+        //
+        // This used to sit after an early return for the SD family, which was
+        // harmless only while SD was CPU-only. Once it had GPU paths the omission
+        // made a per-tensor patch a **silent no-op** — the host UNet held the
+        // patched weight, the device served the cached original — reported as a
+        // velocity identical to the reference (cos 1.0) rather than as an error.
+        if (self.cu_be) |b| {
+            b.bindThread();
+            b.evictWeights();
+        }
+        if (self.gpu_ctx) |c| c.evictWeights();
+
+        if (self.sd()) |m| {
             // The substituted store may be prefixed either way (an overlay over a
             // full checkpoint keeps the container prefix; over a ggufy GGUF it does
             // not), so it goes through the same resolver the initial load used.
-            const r = try resolveComponent(self.gpa, .sd15, .denoiser, store, null, false);
+            const r = try resolveComponent(self.gpa, self.family(), .denoiser, store, null, false);
             defer if (r.view) |v| {
                 v.deinit(self.gpa);
                 self.gpa.destroy(v);
@@ -1102,19 +1686,30 @@ pub const Session = struct {
             return;
         }
         const fresh = try dit_mod.DiT.load(self.gpa, store);
-        // Device weight caches are keyed by HOST POINTER, so they must be dropped
-        // here: the old DiT's arena is about to be freed, and a later allocation
-        // reusing one of those addresses for a different tensor would score a stale
-        // cache hit and compute with the wrong weights. Cheap next to a reload, and
-        // the next forward re-uploads whatever fits its budget.
-        if (self.cu_be) |b| {
-            b.bindThread();
-            b.evictWeights();
-        }
-        if (self.gpu_ctx) |c| c.evictWeights();
         const m = self.k();
         m.dit.deinit();
         m.dit = fresh;
+    }
+
+    /// The prefix the denoiser's own weights sit under inside `denoiserStore()`,
+    /// or `""` when the container holds nothing else (ggufy's model-only GGUF, and
+    /// every krea2 DiT).
+    ///
+    /// A caller that enumerates `denoiserStore().names()` needs this: a bundled SD
+    /// checkpoint's container also holds the CLIP and VAE tensors, and patching one
+    /// of those through a *denoiser* overlay is a silent no-op that measures as
+    /// zero damage rather than as an error.
+    pub fn denoiserPrefix(self: *const Session) []const u8 {
+        const store = self.denoiserStore();
+        const spec = componentSpec(self.family(), .denoiser) catch return "";
+        for (spec.prefixes) |pfx| {
+            var buf: [256]u8 = undefined;
+            if (pfx.len + spec.probe.len > buf.len) continue;
+            @memcpy(buf[0..pfx.len], pfx);
+            @memcpy(buf[pfx.len..][0..spec.probe.len], spec.probe);
+            if (store.get(buf[0 .. pfx.len + spec.probe.len]) != null) return pfx;
+        }
+        return "";
     }
 
     /// Device bytes this diffusion session's backend currently holds (weights +
@@ -1233,16 +1828,20 @@ pub const Session = struct {
                 m.dit_st.deinit();
                 m.tok.deinit();
             },
-            .sd15 => |*m| {
+            .sd15, .sdxl => |*m| {
                 gpa.free(m.sigma_ladder);
+                if (m.empty_ref) |e| gpa.free(e);
+                if (m.empty_ref_g) |e| gpa.free(e);
                 m.vae.deinit();
                 m.clip.deinit();
+                if (m.clip_g) |*c| c.deinit();
                 m.unet.deinit();
-                inline for (.{ &m.clip_view, &m.vae_view }) |slot| if (slot.*) |v| {
+                inline for (.{ &m.clip_view, &m.clip_g_view, &m.vae_view }) |slot| if (slot.*) |v| {
                     v.deinit(gpa);
                     gpa.destroy(v);
                 };
                 if (m.enc_st) |*st| st.deinit();
+                if (m.enc2_st) |*st| st.deinit();
                 if (m.vae_st) |*st| st.deinit();
                 m.unet_st.deinit();
                 m.tok.deinit();
@@ -1254,14 +1853,76 @@ pub const Session = struct {
     /// Generate one image, reusing the loaded models. Rebuilds only the
     /// per-image state: conditioning, the DiT session/workspace (depend on the
     /// prompt AND resolution), the noise latent, and the schedule.
-    /// The sigma schedule this session's family samples with: `steps + 1` values,
-    /// descending, ending at 0. krea2 reads `shift`; SD1.5 ignores it (its ladder
-    /// comes from the training betas), which is why this is a method rather than the
-    /// free `pipeline.schedule` — a caller that cannot see the family cannot pick.
-    pub fn schedule(self: *const Session, gpa: std.mem.Allocator, steps: usize, shift: f32) ![]f32 {
+    /// This session's **sigma table** — `model_sampling.sigmas`, the thing a scheduler
+    /// reads. krea2's is the shift-parameterized flux formula; the SD family's is the
+    /// beta ladder it already caches, borrowed (so this allocates nothing, and the
+    /// slice lives as long as the session).
+    pub fn sigmaTable(self: *const Session, shift: f32) sampler.SigmaTable {
         return switch (self.models) {
-            .krea2 => sampler.simpleSchedule(gpa, steps, shift),
-            .sd15 => sampler.sdSchedule(gpa, steps),
+            .krea2 => .{ .flux = shift },
+            .sd15, .sdxl => |*m| .{ .discrete = m.sigma_ladder },
+        };
+    }
+
+    /// The sigma schedule this session's family samples with, descending and ending at
+    /// 0 — using each family's **default** scheduler, which is the behaviour that
+    /// predates schedulers being selectable (`simple` for krea2, `normal` for SD).
+    /// krea2 reads `shift`; SD1.5 ignores it (its ladder comes from the training betas),
+    /// which is why this is a method rather than the free `pipeline.schedule` — a caller
+    /// that cannot see the family cannot pick.
+    pub fn schedule(self: *const Session, gpa: std.mem.Allocator, steps: usize, shift: f32) ![]f32 {
+        return self.scheduleWith(gpa, steps, shift, null);
+    }
+
+    /// `schedule` with an explicit scheduler; null means the family default.
+    ///
+    /// ⚠️ **The result is not always `steps + 1` long.** `ddim_uniform` strides the sigma
+    /// table and `beta` de-duplicates repeated rungs, so 30 requested steps can come
+    /// back as 31 or fewer. Drive a sampling loop off `sigmas.len - 1` — `generate`
+    /// does, and hardcoding `opts.steps` instead would read one past the end.
+    pub fn scheduleWith(
+        self: *const Session,
+        gpa: std.mem.Allocator,
+        steps: usize,
+        shift: f32,
+        sched: ?sampler.Scheduler,
+    ) ![]f32 {
+        const table = self.sigmaTable(shift);
+        return sampler.schedule_mod.build(gpa, table, sched orelse .defaultFor(table), steps);
+    }
+
+    /// Scale a freshly drawn unit-normal latent to `sigmas[0]`, the way **this family**
+    /// starts a trajectory. A method for the same reason `schedule` is one: the two
+    /// parameterizations disagree and a caller that cannot see the family cannot pick.
+    ///
+    /// krea2 (flow matching) multiplies by `sigma0`, which is exactly 1.0 — a
+    /// bit-identical no-op. The SD family multiplies by `sqrt(1 + sigma0²)`; see
+    /// `sampler.sdScaleInitialNoise` for why that is not the same as `sigma0` and what
+    /// getting it wrong costs.
+    pub fn scaleInitialNoise(self: *const Session, x: []f32, sigma0: f32) void {
+        switch (self.models) {
+            .krea2 => sampler.scaleInitialNoise(x, sigma0),
+            // ⚠️ Under `--compat a1111` this is the BARE sigma: A1111's
+            // `sgm_noise_multiplier` defaults to False, and its own description of the
+            // option ("match initial noise to official SDXL implementation - only useful
+            // for reproducing images") is an admission that its default is the odd one
+            // out. Both forms render; they render different images.
+            .sd15, .sdxl => if (self.compat.sgm_noise_multiplier)
+                sampler.sdScaleInitialNoise(x, sigma0)
+            else
+                sampler.scaleInitialNoise(x, sigma0),
+        }
+    }
+
+    /// The half-logSNR parameterization this family's denoiser is trained in — what a
+    /// higher-order sampler needs and Euler does not. A method for the same reason
+    /// `schedule` is one, and the failure mode is worse: `flow` on an SD ladder is
+    /// NaN from the first step, `eps` on a krea2 schedule silently integrates the
+    /// wrong ODE. See `sampler.Parameterization`.
+    pub fn parameterization(self: *const Session) sampler.Parameterization {
+        return switch (self.models) {
+            .krea2 => .flow,
+            .sd15, .sdxl => .eps,
         };
     }
 
@@ -1270,25 +1931,337 @@ pub const Session = struct {
     pub fn latentChannels(self: *const Session) usize {
         return switch (self.models) {
             .krea2 => wan_vae.latent_channels,
-            .sd15 => |*m| m.unet.cfg.channels,
+            .sd15, .sdxl => |*m| m.unet.cfg.channels,
         };
+    }
+
+    /// Fill `rgb_out` (`[lat_h*lat_w][3]` RGB8) with the cheap linear latent2rgb
+    /// preview of a planar sampler latent, using THIS family's factors. Each family
+    /// has its own matrix over its own channel count (16 for krea2's Wan latent, 4 for
+    /// SD's, with different factors for SD1.5 and SDXL); the wrong one is either an
+    /// out-of-bounds read or a preview with plausible structure and wrong colours.
+    pub fn latentPreviewInto(self: *const Session, rgb_out: []u8, z: []const f32, lat_h: usize, lat_w: usize) void {
+        switch (self.models) {
+            .krea2 => wan_vae.latentPreviewInto(rgb_out, z, lat_h, lat_w),
+            .sd15 => sd_vae.latentPreviewInto(rgb_out, z, lat_h, lat_w, &sd_vae.latent_rgb_factors_sd15, sd_vae.latent_rgb_bias_sd15),
+            .sdxl => sd_vae.latentPreviewInto(rgb_out, z, lat_h, lat_w, &sd_vae.latent_rgb_factors_sdxl, sd_vae.latent_rgb_bias_sdxl),
+        }
     }
 
     /// Stage 1 — text → conditioning, on the resident encoder. Caller frees the
     /// returned `Cond`. Device allocations are tagged `.te` for the VRAM meter.
     pub fn encode(self: *Session, gpa: std.mem.Allocator, text: []const u8, o: EncodeOptions) !Cond {
         self.setMemTag(.te);
-        switch (self.models) {
-            .krea2 => |*m| return encodePrompt(self.io, gpa, self.gpu_ctx, self.cu_be, o.encoder_f16, &m.tok, &m.enc, text, o.cancel),
-            .sd15 => |*m| {
-                const ids = try m.tok.encode(gpa, text);
-                defer gpa.free(ids);
-                const hidden = try gpa.alloc(f32, ids.len * m.clip.cfg.hidden);
-                errdefer gpa.free(hidden);
-                try m.clip.forward(self.io, gpa, hidden, ids, null);
-                return .{ .data = hidden, .seq = ids.len };
-            },
+        // A1111's `[a:b:when]` / `[a|b]` make the prompt a function of the step, so the
+        // result is a schedule of conditionings rather than one. `steps == 0` means the
+        // caller is not rendering a schedule (a single measurement forward), so the
+        // step-0 prompt is all there is.
+        if (o.prompt_syntax == .a1111 and o.steps > 0) return self.encodeScheduled(gpa, text, o);
+        return self.encodeText(gpa, text, o);
+    }
+
+    /// Resolve A1111 scheduling, deduplicate the resulting prompts by text, and encode
+    /// each distinct one.
+    ///
+    /// ⚠️ **Deduplication is load-bearing, not an optimization.** `[a|b]` contributes an
+    /// entry for EVERY step (upstream's `collect_steps` does), so a 35-step render yields
+    /// 35 schedule entries over 2 distinct texts. Encoding per entry would mean 33
+    /// redundant tower forwards and 33 redundant device sessions.
+    fn encodeScheduled(self: *Session, gpa: std.mem.Allocator, text: []const u8, o: EncodeOptions) !Cond {
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const plan = try planSchedule(arena, gpa, text, o.steps);
+        const uniq = plan.texts;
+        const at = plan.at;
+        errdefer gpa.free(at);
+
+        var first = try self.encodeText(gpa, uniq[0], o);
+        errdefer first.deinit(gpa);
+        if (uniq.len == 1) {
+            // Scheduling syntax that resolved to one prompt (or none at all): no schedule.
+            gpa.free(at);
+            return first;
         }
+
+        const extra = try gpa.alloc(Cond, uniq.len - 1);
+        errdefer gpa.free(extra);
+        var built: usize = 0;
+        errdefer for (extra[0..built]) |*e| e.deinit(gpa);
+        for (uniq[1..], 0..) |t, i| {
+            extra[i] = try self.encodeText(gpa, t, o);
+            built += 1;
+        }
+        first.sched = .{ .extra = extra, .at = at };
+        return first;
+    }
+
+    /// One conditioning for one concrete prompt text — the whole of `encode` before
+    /// scheduling existed, plus the dialect switch in how the text is tokenized.
+    fn encodeText(self: *Session, gpa: std.mem.Allocator, text: []const u8, o: EncodeOptions) !Cond {
+        // Weights the loaded encoder cannot honour are WARNED about and the prompt encoded
+        // verbatim — not refused, and not silently dropped. Generic rather than a branch in
+        // the family switch below, because it is a property of the encoder (see
+        // `supportsPromptWeights`) and every future family gets it for free. Per-step
+        // scheduling is unaffected and works on all of them: `Cond.sched` is family-neutral
+        // and this function runs once per resolved text, so krea2 gains something the
+        // ComfyUI dialect cannot express, where `[…]` is literal text.
+        if (o.prompt_syntax == .a1111 and !supportsPromptWeights(self.family())) {
+            if (try weightsWouldBeDropped(gpa, text, o)) std.log.warn(
+                "prompt weights are not applied by this model's text encoder: it has no " ++
+                    "fixed token window to weight them in (emphasis is a CLIP-only feature " ++
+                    "here and in every other implementation). Encoding the prompt verbatim; " ++
+                    "--emphasis ignore strips the syntax instead.",
+                .{},
+            );
+        }
+        switch (self.models) {
+            .krea2 => |*m| {
+                return encodePrompt(self.io, gpa, self.gpu_ctx, self.cu_be, o.encoder_f16, &m.tok, &m.enc, text, o.cancel);
+            },
+            .sd15 => |*m| {
+                var p = try self.tokenizePrompt(gpa, &m.tok, text, clip_tok.eos_id, o);
+                defer p.deinit(gpa);
+                const hidden = try gpa.alloc(f32, p.seq() * m.clip.cfg.hidden);
+                errdefer gpa.free(hidden);
+                try self.runClip(gpa, &m.clip, hidden, &p, .{
+                    .mode = weightMode(o),
+                    .empty_cache = &m.empty_ref,
+                    .pad_id = clip_tok.eos_id,
+                }, o);
+                return .{ .data = hidden, .seq = p.seq() };
+            },
+            .sdxl => |*m| return self.encodeSdxl(gpa, m, o, text),
+        }
+    }
+
+    /// Tokenize one prompt text in the requested dialect. The A1111 path is two passes
+    /// (`parseAttention` then `encodeParts`); ComfyUI's is one.
+    fn tokenizePrompt(
+        self: *Session,
+        gpa: std.mem.Allocator,
+        tok: *const clip_tok.Tokenizer,
+        text: []const u8,
+        pad_id: u32,
+        o: EncodeOptions,
+    ) !clip_tok.Prompt {
+        _ = self;
+        if (o.prompt_syntax == .comfy) return tok.encodeWeighted(gpa, text, pad_id);
+
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const parts = try prompt_a1111.parseAttention(arena_state.allocator(), text);
+        if (o.emphasis == .ignore) {
+            // `EmphasisIgnore`: the syntax is still parsed and stripped — so `(a:1.5)`
+            // conditions on `a`, not on the punctuation — but every weight becomes 1.0.
+            for (parts) |*part| if (!part.isBreak()) {
+                part.weight = 1.0;
+            };
+        }
+        return tok.encodeParts(gpa, parts, pad_id);
+    }
+
+    /// Whether an A1111 prompt carries a weight that an emphasis-incapable encoder would
+    /// leave unapplied. Returns a fact rather than logging or erroring, so the caller decides
+    /// what to do with it — and so a test can assert it without printing to stderr on success
+    /// (any output from a passing test makes the runner print a misleading failure line).
+    ///
+    /// ⚠️ **This was `error.PromptSyntaxUnsupportedForFamily`, first blanket and then narrowed
+    /// to weighted prompts, and both were wrong.** The reasoning was the house rule that
+    /// silently dropping weights a caller asked for is this area's recurring failure — but
+    /// refusing is not the only alternative to silence, and it is not what the ecosystem does.
+    /// **Emphasis weighting is a CLIP-only feature everywhere it is implemented**, checked
+    /// against SD.Next (`dev`; A1111 itself never had to decide, having only ever had CLIP):
+    ///
+    /// - `processing_prompt.set_prompt` gates the emphasis parser behind an allow-list of
+    ///   `StableDiffusion*` / `StableCascade` / `Flux`; everything else — Qwen-Image, Wan,
+    ///   Lumina, Flux2, and krea2's shape — falls to `prompt_attention = 'fixed'`, i.e. the
+    ///   raw string reaches the pipeline unparsed. Chroma and HiDream sit *commented out* of
+    ///   that list: tried, then disabled.
+    /// - SD3 settles it, having both kinds of encoder at once: the CLIP towers go through the
+    ///   weighted provider while the T5 tower is `_get_t5_prompt_embeds(prompt=…)` on the raw
+    ///   string, the two then concatenated. Flux is *on* the allow-list and still encodes via
+    ///   `pipe.encode_prompt` unweighted ("clip is only used for the pooled embeds").
+    ///
+    /// So refusing made this engine stricter than any live tool, on a *persistent* setting: a
+    /// global choice made for an SDXL render became a hard error on every later krea2 render.
+    /// A warning satisfies the house rule (nothing is silent — SD.Next only `debug_log`s its
+    /// own fallback) without failing a render nobody else fails.
+    ///
+    /// The prompt is then encoded **verbatim rather than stripped**, deliberately: it keeps
+    /// `.comfy` and `.a1111` byte-identical on such a model, and `--emphasis ignore` is the
+    /// explicit way to ask for the syntax to be parsed away instead.
+    fn weightsWouldBeDropped(gpa: std.mem.Allocator, text: []const u8, o: EncodeOptions) !bool {
+        if (o.emphasis == .ignore) return false; // already asked for the weights to be dropped
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const parts = try prompt_a1111.parseAttention(arena_state.allocator(), text);
+        for (parts) |part| {
+            // A BREAK is a chunk boundary such a model has no concept of in EITHER dialect —
+            // under `.comfy` the word tokenizes literally too — so it is not worth a word.
+            if (part.isBreak()) continue;
+            if (part.weight != 1.0) return true;
+        }
+        return false;
+    }
+
+    /// The weighting form the encoders should apply for these options.
+    fn weightMode(o: EncodeOptions) clip_text.TextEncoder.WeightMode {
+        if (o.prompt_syntax == .comfy) return .comfy;
+        return switch (o.emphasis) {
+            // `ignore` already flattened every weight to 1.0, so the form no longer
+            // matters; the cheaper one is picked so no empty-prompt forward is run.
+            .no_norm, .ignore => .a1111_no_norm,
+            .original => .a1111_original,
+        };
+    }
+
+    /// Run one CLIP tower on the best available backend, falling back to the CPU only
+    /// for errors the CPU can actually recover from.
+    ///
+    /// ⚠️ **A device FAULT must NOT fall back, and getting this wrong hid a real bug
+    /// behind an error naming the wrong stage.** `CUDA_ERROR_ILLEGAL_ADDRESS` (and a
+    /// Vulkan device loss) is **sticky**: once a kernel faults, every later call in that
+    /// context fails too. The original policy — copied from krea2's `encodePrompt` —
+    /// caught *any* error, logged a warning, re-ran the encode on the CPU (which
+    /// succeeds, needing no device) and returned normally. The render then died at the
+    /// denoiser's first conditioning upload with
+    /// `cuMemcpyHtoD failed: CUDA_ERROR_ILLEGAL_ADDRESS`, three stages downstream of the
+    /// fault, with the actual error demoted to a warning nobody reads. Reported as
+    /// "fails after the TE step", which is exactly where it did *not* fail.
+    ///
+    /// So the fallback is now allow-listed rather than catch-all:
+    ///
+    /// - `UnsupportedDType` — this tower's weights have no GPU GEMM (a block-quantized
+    ///   text encoder). A real, expected condition; the CPU is the right answer.
+    /// - `OutOfMemory` — the device reclaim ladder came up short. The context is intact
+    ///   and the CPU path needs no VRAM, so recovering is both safe and useful.
+    /// - everything else, `CudaError` above all — **propagate**. A poisoned context
+    ///   cannot be recovered by running the next stage anyway, and the error that names
+    ///   the faulting stage is worth far more than a render that limps one stage further.
+    ///
+    /// ⚠️ **A cancel must propagate too**, or cancelling a render silently restarts the
+    /// encode on the CPU and takes longer than not cancelling.
+    ///
+    /// ⚠️ **The three arms are not numerically equal, and CUDA is the loosest.** Vulkan
+    /// computes the GEMMs in f32 by default (f16 only under `--encoder-f16`), so it
+    /// tracks the CPU forward the ComfyUI fixtures pin to ~1e-6; the CUDA arm has only a
+    /// tensor-core entry point at these widths and lands ~1e-3. That is the regime
+    /// `sd_unet_cuda` already runs the denoiser in, so it is consistent rather than
+    /// newly lossy — but it does mean a `cuda` render and a `cpu` render of the same seed
+    /// differ slightly, which is worth knowing before attributing such a difference to
+    /// something else.
+    fn runClip(
+        self: *Session,
+        gpa: std.mem.Allocator,
+        tower: *const clip_text.TextEncoder,
+        out: []f32,
+        p: *const clip_tok.Prompt,
+        r: clip_text.TextEncoder.PromptRun,
+        o: EncodeOptions,
+    ) !void {
+        if (o.cancel) |c| if (c.load(.monotonic)) return error.Canceled;
+        if (self.cu_be) |b| {
+            return clip_text_cuda.encodePrompt(tower, b, self.io, gpa, out, p, r) catch |err| {
+                if (!clipFallbackOk(err)) return err;
+                std.log.warn("cuda clip encode: {t}; falling back to CPU (slow)", .{err});
+                return tower.encodePrompt(self.io, gpa, out, p, r);
+            };
+        }
+        if (self.gpu_ctx) |gc| {
+            return clip_text_gpu.encodePrompt(tower, gc, self.io, gpa, out, p, r, o.encoder_f16) catch |err| {
+                if (!clipFallbackOk(err)) return err;
+                std.log.warn("vulkan clip encode: {t}; falling back to CPU (slow)", .{err});
+                return tower.encodePrompt(self.io, gpa, out, p, r);
+            };
+        }
+        return tower.encodePrompt(self.io, gpa, out, p, r);
+    }
+
+    /// Whether a GPU text-encode error is one the CPU path can recover from. See
+    /// `runClip` for why this is an allow-list and not `catch |_|`.
+    fn clipFallbackOk(err: anyerror) bool {
+        return switch (err) {
+            error.UnsupportedDType, error.OutOfMemory => true,
+            else => false,
+        };
+    }
+
+    /// SDXL's conditioning: both towers, concatenated along the feature axis, plus
+    /// CLIP-G's projected pooled row.
+    ///
+    /// Three conventions here are ecosystem choices rather than derivable facts, and each
+    /// produces a plausible image if got wrong (see `clip_tokenizer.encodePadded` and
+    /// `clip_text.Config.Naming`):
+    ///
+    /// 1. **The penultimate hidden state, with the final LayerNorm SKIPPED.** Both towers,
+    ///    not just one. Using the final state instead is the "clip skip 1 vs 2" difference
+    ///    and shifts style across the whole image.
+    /// 2. **CLIP-L is padded with EOS and CLIP-G with 0**, so the prompt is tokenized
+    ///    twice. The padded slots are conditioning too.
+    /// 3. **Pooled comes from CLIP-G only**, from its *final-LayerNormed* last hidden state
+    ///    at the first EOS, then through `text_projection` — a different tensor than
+    ///    either half of the concatenated context.
+    fn encodeSdxl(self: *Session, gpa: std.mem.Allocator, m: *SdModels, o: EncodeOptions, text: []const u8) !Cond {
+        const g = &m.clip_g.?;
+        const hl = m.clip.cfg.hidden;
+        const hg = g.cfg.hidden;
+        const clen = clip_tok.context_length;
+
+        // Tokenized twice: same ids, different padding (convention 2 above). The chunk
+        // split is length-driven and the two differ only in padding, so the counts always
+        // agree — `min` is ComfyUI's own defensive form, not a case that arises here.
+        var pl = try self.tokenizePrompt(gpa, &m.tok, text, clip_tok.eos_id, o);
+        defer pl.deinit(gpa);
+        var pg = try self.tokenizePrompt(gpa, &m.tok, text, 0, o);
+        defer pg.deinit(gpa);
+        const chunks = @min(pl.chunks, pg.chunks);
+        const seq = chunks * clen;
+
+        // `cap_*` take the penultimate state, which is what the UNet cross-attends to.
+        // `final_g` takes CLIP-G's chunk-0 final output, the *only* thing pooled reads.
+        const cap_l = try gpa.alloc(f32, pl.seq() * hl);
+        defer gpa.free(cap_l);
+        // `layers - 1` is "after encoder layer layers-2", i.e. the reference's
+        // `hidden_states[-2]` — one short of the last block, before the final norm.
+        try self.runClip(gpa, &m.clip, cap_l, &pl, .{
+            .mode = weightMode(o),
+            .empty_cache = &m.empty_ref,
+            .pad_id = clip_tok.eos_id,
+            .capture_layer = m.clip.cfg.layers - 1,
+        }, o);
+
+        const cap_g = try gpa.alloc(f32, pg.seq() * hg);
+        defer gpa.free(cap_g);
+        const final_g = try gpa.alloc(f32, clen * hg);
+        defer gpa.free(final_g);
+        try self.runClip(gpa, g, cap_g, &pg, .{
+            .mode = weightMode(o),
+            .empty_cache = &m.empty_ref_g,
+            .pad_id = 0,
+            .capture_layer = g.cfg.layers - 1,
+            .final_chunk0 = final_g,
+        }, o);
+
+        const data = try gpa.alloc(f32, seq * (hl + hg));
+        errdefer gpa.free(data);
+        for (0..seq) |p| {
+            @memcpy(data[p * (hl + hg) ..][0..hl], cap_l[p * hl ..][0..hl]);
+            @memcpy(data[p * (hl + hg) + hl ..][0..hg], cap_g[p * hg ..][0..hg]);
+        }
+
+        // ⚠️ Pooled comes from CHUNK 0 only, and is never weighted. It is one vector for
+        // the whole prompt, so there is nothing to concatenate; taking it from the last
+        // chunk instead would condition `y` on the quality tags alone.
+        const pooled = try gpa.alloc(f32, hg);
+        errdefer gpa.free(pooled);
+        var ids0: [clip_tok.context_length]u32 = undefined;
+        pg.idsInto(&ids0, 0);
+        const row = g.pooled(final_g, &ids0) orelse return error.NoEosInPrompt;
+        g.projectPooled(pooled, row);
+
+        return .{ .data = data, .seq = seq, .pooled = pooled };
     }
 
     /// Stage 2 — build the per-image denoiser (see `Denoiser`). `cond_neg` and a
@@ -1318,15 +2291,76 @@ pub const Session = struct {
         };
         errdefer d.deinit(gpa);
 
-        // SD1.5 is CPU-only and has no device sessions to build; what it does need is
-        // the UNet workspace and the input-scaling scratch, both per resolution.
-        if (self.models == .sd15) {
-            const m = &self.models.sd15;
+        // The SD family needs the input-scaling scratch and a UNet workspace, both
+        // per resolution — plus SDXL's `y`, which is per resolution too. On Vulkan
+        // the workspace is device-side and there is one session per conditioning
+        // branch; on the CPU it is the host `sd_unet.Workspace`.
+        if (self.sd()) |m| {
             const n = m.unet.cfg.channels * lat_h * lat_w;
             if (use_cfg) d.v_neg = try gpa.alloc(f32, n);
             d.sd_scaled = try gpa.alloc(f32, n);
             d.sd_eps = try gpa.alloc(f32, n);
-            d.sd_ws = try sd_unet.Workspace.init(gpa, &m.unet, lat_h, lat_w);
+            // ⚠️ **The cap is over EVERY scheduled entry, not just entry 0.** A prompt
+            // whose variants tokenize to different chunk counts (`[a:a very long tail
+            // that spills past 77 tokens:0.5]`) would otherwise size the shared
+            // workspace for the wrong one, and cross-attention writes `ctx_seq` rows
+            // into it.
+            var seq_cap_sd: usize = 0;
+            for (0..cond_pos.entryCount()) |i| seq_cap_sd = @max(seq_cap_sd, cond_pos.entry(i).seq);
+            if (cond_neg) |*cn| {
+                for (0..cn.entryCount()) |i| seq_cap_sd = @max(seq_cap_sd, cn.entry(i).seq);
+            }
+
+            // One branch per distinct conditioning. Built eagerly: dedup at encode time
+            // keeps this at the number of distinct prompt TEXTS, so an `[a|b]` over 35
+            // steps builds 2, not 35.
+            d.sd_pos = try gpa.alloc(SdBranch, cond_pos.entryCount());
+            @memset(d.sd_pos, .{});
+            d.sd_neg = try gpa.alloc(SdBranch, if (cond_neg) |*cn| cn.entryCount() else 0);
+            @memset(d.sd_neg, .{});
+
+            const mc = sd_unet.MicroCond.forSize(lat_h * 8, lat_w * 8);
+            {
+                self.setMemTag(.latent);
+                defer self.setMemTag(.dit);
+                for ([_]?*const Cond{ &cond_pos, if (cond_neg) |*cn| cn else null }, 0..) |maybe, side| {
+                    const c = maybe orelse continue;
+                    const arr = if (side == 0) d.sd_pos else d.sd_neg;
+                    for (arr, 0..) |*br, i| {
+                        const ce = c.entry(i);
+                        // ⚠️ `y` first: a session folds the label embedding into its
+                        // per-forward biases and therefore needs the micro-conditioning
+                        // already built.
+                        //
+                        // The micro-conditioning is `original == target == this image, no
+                        // crop` — what ComfyUI and diffusers both default to, and not a
+                        // free choice: SDXL learned to associate small declared originals
+                        // with low-quality training crops, so declaring anything smaller
+                        // than the render asks the model for a worse image.
+                        if (m.unet.cfg.adm_channels) |adm_len| {
+                            br.adm = try gpa.alloc(f32, adm_len);
+                            sd_unet.admVector(br.adm.?, ce.pooled orelse return error.MissingPooledCond, mc);
+                        }
+                        if (self.cu_be) |b| {
+                            br.cu = try sd_unet_cuda.Session.init(gpa, b, &m.unet, ce.data, ce.seq, br.adm);
+                        } else if (self.gpu_ctx) |gc| {
+                            br.vk = try sd_unet_gpu.Session.init(gpa, gc, &m.unet, ce.data, ce.seq, br.adm);
+                        }
+                    }
+                }
+            }
+
+            if (self.cu_be) |b| {
+                self.setMemTag(.latent);
+                defer self.setMemTag(.dit);
+                d.sd_cu_ws = try sd_unet_cuda.Workspace.init(gpa, b, &m.unet, lat_h, lat_w, seq_cap_sd);
+            } else if (self.gpu_ctx) |gc| {
+                self.setMemTag(.latent);
+                defer self.setMemTag(.dit);
+                d.sd_vk_ws = try sd_unet_gpu.Workspace.init(gpa, gc, &m.unet, lat_h, lat_w, seq_cap_sd);
+            } else {
+                d.sd_ws = try sd_unet.Workspace.init(gpa, &m.unet, lat_h, lat_w, seq_cap_sd);
+            }
             return d;
         }
 
@@ -1393,34 +2427,38 @@ pub const Session = struct {
         const gpa = self.gpa;
         const io = self.io;
 
-        // SD1.5's decode is one straight pass: no tiling ladder, no VRAM reclaim, no
-        // per-channel latent statistics — its AutoencoderKL takes `z / scaling_factor`
-        // and that is the whole normalization. Handled first so none of the krea2
-        // machinery below has to be made conditional.
-        if (self.models == .sd15) {
-            const m = &self.models.sd15;
+        // The SD family differs from krea2 only in its normalization — its
+        // AutoencoderKL takes `z / scaling_factor`, where Wan's is per-channel
+        // (mean, std) — and in which decoder the ladder below drives. Both arms
+        // end up in `decodePlanar`, so the whole-image → reclaim → GPU-tiled →
+        // CPU-tiled recovery is shared.
+        //
+        // ⚠️ It was NOT shared until 2026-08-03, and that hard-failed every render
+        // whose SD VAE decode did not fit: at 1024x1536 the decoder wants 3 x 1.5 GiB
+        // of activations, and with a resident LLM or another process on the card
+        // that surfaces either as `DeviceOutOfMemory` or — once the OOM ladder has
+        // freed memory an in-flight kernel still referenced — as a post-OOM stream
+        // fault reported at the next `cuMemcpyHtoD` (`CUDA_ERROR_ILLEGAL_ADDRESS`,
+        // i.e. `error.CudaError`). `recoverableDecodeErr` already names that exact
+        // case; the SD path just returned before ever reaching it.
+        if (self.sd()) |m| {
             const ch = m.unet.cfg.channels;
             if (latent.len != ch * lat_h * lat_w) return error.LatentSizeMismatch;
-            try note(progress, "decoding latent...\n", .{});
-            // Planar [c][h][w] in, channel-last [h*w][c] for the decoder.
-            const z = try gpa.alloc(f32, latent.len);
-            defer gpa.free(z);
-            const plane = lat_h * lat_w;
+            self.setMemTag(.vae);
+            // Denormalize onto a copy: `decode` must not modify the caller's latent
+            // (a caller holding it for a drift curve would otherwise have it
+            // silently rescaled — there is a test for it).
+            const x = try gpa.dupe(f32, latent);
+            defer gpa.free(x);
             const inv = 1.0 / m.vae.cfg.scaling_factor;
-            for (0..plane) |px| {
-                for (0..ch) |c| z[px * ch + c] = latent[c * plane + px] * inv;
-            }
-            const rgb_rows = try m.vae.decode(io, gpa, z, lat_h, lat_w);
-            defer gpa.free(rgb_rows);
-            // Back to planar for the shared f32 -> RGB8 conversion.
+            for (x) |*v| v.* *= inv;
+            try note(progress, "decoding latent...\n", .{});
+            const dec_start = std.Io.Clock.real.now(io);
+            const planar = try self.decodePlanar(SdVae{ .vae = &m.vae }, x, lat_h, lat_w, o, progress);
+            defer gpa.free(planar);
+            try note(progress, "decoded in {d:.1}s\n", .{@as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - dec_start.nanoseconds)) / 1e9});
             const width = lat_w * 8;
             const height = lat_h * 8;
-            const planar = try gpa.alloc(f32, rgb_rows.len);
-            defer gpa.free(planar);
-            const px_count = width * height;
-            for (0..px_count) |px| {
-                for (0..3) |c| planar[c * px_count + px] = rgb_rows[px * 3 + c];
-            }
             return .{
                 .rgb = try image.planarF32ToRgb8(gpa, planar, width, height),
                 .width = width,
@@ -1451,44 +2489,76 @@ pub const Session = struct {
         }
         try note(progress, "decoding latent...\n", .{});
         const dec_start = std.Io.Clock.real.now(io);
-        const vae = &self.k().vae;
+        const planar = try self.decodePlanar(KreaVae{ .vae = &self.k().vae }, x, lat_h, lat_w, o, progress);
+        defer gpa.free(planar);
+        try note(progress, "decoded in {d:.1}s\n", .{@as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - dec_start.nanoseconds)) / 1e9});
+
+        const width = lat_w * 8;
+        const height = lat_h * 8;
+        return .{ .rgb = try image.planarF32ToRgb8(gpa, planar, width, height), .width = width, .height = height };
+    }
+
+    /// Decode an already-denormalized planar `[c][lat_h][lat_w]` latent to planar
+    /// `[3][8·lat_h][8·lat_w]` pixels, through the adaptive ladder: whole-image
+    /// (fastest, seamless) → free VRAM and retry → GPU tiling (bounded footprint)
+    /// → CPU tiling (the floor that cannot OOM). `v` is the family's adapter
+    /// (`KreaVae` / `SdVae`), which supplies the per-backend tile context, the
+    /// peak-VRAM estimate and the tile geometry — a whole-image decode is just a
+    /// single tile covering the whole latent, so nothing else here is
+    /// family-specific. Caller frees the result.
+    fn decodePlanar(
+        self: *Session,
+        v: anytype,
+        x: []const f32,
+        lat_h: usize,
+        lat_w: usize,
+        o: DecodeOptions,
+        progress: ?*std.Io.Writer,
+    ) ![]f32 {
+        const gpa = self.gpa;
+        const io = self.io;
         // The whole-image decode is fastest and seamless, but its peak VRAM — in
         // particular the O(seq²) mid-block attention scores plane — grows with
         // image area and OOMs on large images. When it won't fit we decode in
         // overlapping tiles (bounded footprint, feather-blended seams) on the GPU
         // rather than crawling on the CPU; only if even a tile can't fit do we
         // drop to a CPU tiled decode. See models/vae_tiled.zig.
-        const tp: vae_tiled.Params = .{};
+        const tp = @TypeOf(v).tiling;
         // Decode-path override (o.vae_decode). `force_cpu` short-circuits every
         // backend to CPU tiling; `skip_whole` starts at GPU tiling (no whole-image
         // attempt). `auto`/`whole` leave both false — whole-image is already the
         // first attempt, so the two behave identically.
         const force_cpu = o.vae_decode == .cpu_tiled;
         const skip_whole = o.vae_decode == .gpu_tiled or o.vae_decode == .cpu_tiled;
-        const planar = if (force_cpu) planar_blk: {
+        if (force_cpu) {
             try note(progress, "vae decode: tiling on CPU (forced)\n", .{});
             const saved = ops.matmul.gpu_dispatch;
             ops.matmul.gpu_dispatch = null;
             defer ops.matmul.gpu_dispatch = saved;
-            break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae, .cancel = o.cancel }, CpuTile.call);
-        } else if (self.cu_be) |b| planar_blk: {
+            const ct = v.cpuCtx(io, o.cancel);
+            return vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, ct, @TypeOf(ct).call);
+        }
+        if (self.cu_be) |b| {
+            const wt = v.cudaCtx(b, o.cancel);
+            const Whole = @TypeOf(wt);
             // Attempt ladder — whole-image (fastest, seamless) → GPU tiling
             // (bounded footprint) → CPU (guaranteed). Before EACH GPU retry free
             // JUST ENOUGH VRAM and try again, keeping the rest resident so we
             // reload as little as possible: drop LRU weights from THIS backend's
-            // own cache first (the DiT — dead for the rest of this image,
+            // own cache first (the denoiser — dead for the rest of this image,
             // re-streams next image), and only when that can't cover the deficit
             // reach into the chat LLM's context. The freed amount escalates so a
             // big deficit converges in a few retries. OOM can arrive as
-            // DeviceOutOfMemory OR as a cuBLASLt/cuDNN out-of-workspace error
-            // (see recoverableDecodeErr). (skip_whole jumps straight to tiling.)
+            // DeviceOutOfMemory OR as a cuBLASLt / cuDNN out-of-workspace error OR
+            // as a post-OOM stream fault (see recoverableDecodeErr).
+            // (skip_whole jumps straight to tiling.)
             try note(progress, "vae decode: mode={s} pinned={d}MB streamed={d}MB free={d}MB\n", .{
                 @tagName(o.vae_decode), b.pinnedWeightBytes() >> 20, b.evictableWeightBytes() >> 20, b.ctx.memGetInfo().free >> 20,
             });
             var want: u64 = reclaim_chunk;
             // Free ~`wnt` bytes across this backend's own cache (LRU incl. the
-            // now-dead DiT) then the chat LLM, log it, and report the total freed
-            // (0 ⇒ nothing left to free).
+            // now-dead denoiser) then the chat LLM, log it, and report the total
+            // freed (0 ⇒ nothing left to free).
             const freeSome = struct {
                 fn call(bk: *cuda.Backend, reclaim: ?Reclaim, w: ?*std.Io.Writer, cio: std.Io, wnt: u64) !u64 {
                     const t0 = std.Io.Clock.real.now(cio).nanoseconds;
@@ -1513,7 +2583,7 @@ pub const Session = struct {
             // cuBLASLt/cuDNN conv workspace). Tiled decode's first attempt is one
             // tile, so estimate at the tile size when skip_whole.
             {
-                const est = if (skip_whole) vae.estimatePeakBytes(tp.tile, tp.tile) else vae.estimatePeakBytes(lat_h, lat_w);
+                const est = if (skip_whole) v.estimate(tp.tile, tp.tile) else v.estimate(lat_h, lat_w);
                 const target = est + est / 10; // 110%
                 const free_now = b.ctx.memGetInfo().free;
                 try note(progress, "vae decode: est peak {d}MB, want free ≥ {d}MB (have {d}MB)\n", .{ est >> 20, target >> 20, free_now >> 20 });
@@ -1523,23 +2593,22 @@ pub const Session = struct {
             if (!skip_whole) {
                 var round: usize = 0;
                 while (round < max_reclaim_rounds) : (round += 1) {
-                    if (vae_cuda.decode(vae, b, io, gpa, x, lat_h, lat_w, o.cancel)) |p| {
-                        break :planar_blk p;
+                    if (Whole.call(wt, gpa, io, x, lat_h, lat_w)) |p| {
+                        return p;
                     } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: whole-image OOM ({t}) → freeing VRAM\n", .{err});
                     if (try freeSome(b, o.reclaim, progress, io, want) == 0) break; // nothing left → tile
                     want *|= 2;
                 }
             }
             // Phase 2: GPU tiling (bounded) with the same incremental eviction —
-            // after the DiT is evicted a tile easily fits, and it's far faster
+            // after the denoiser is evicted a tile easily fits, and it's far faster
             // than the CPU floor below.
             {
                 var round: usize = 0;
                 while (round < max_reclaim_rounds) : (round += 1) {
                     try note(progress, "vae decode: tiling on GPU ({d}² latent tiles)\n", .{tp.tile});
-                    const ct = CudaTile{ .vae = vae, .be = b, .cancel = o.cancel };
-                    if (vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, ct, CudaTile.call)) |p| {
-                        break :planar_blk p;
+                    if (vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, wt, Whole.call)) |p| {
+                        return p;
                     } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: GPU tiling OOM ({t}) → freeing VRAM\n", .{err});
                     if (try freeSome(b, o.reclaim, progress, io, want) == 0) break; // nothing left → CPU
                     want *|= 2;
@@ -1550,13 +2619,17 @@ pub const Session = struct {
             const saved = ops.matmul.gpu_dispatch;
             ops.matmul.gpu_dispatch = null;
             defer ops.matmul.gpu_dispatch = saved;
-            break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae, .cancel = o.cancel }, CpuTile.call);
-        } else if (self.gpu_ctx) |gc| planar_blk: {
+            const ct = v.cpuCtx(io, o.cancel);
+            return vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, ct, @TypeOf(ct).call);
+        }
+        if (self.gpu_ctx) |gc| {
+            const wt = v.vkCtx(gc, o.cancel);
+            const Whole = @TypeOf(wt);
             // Whole-image decode first. The Vulkan mid-block attention is now
             // query-tiled (flash), so this OOMs only when the conv activation
             // buffers don't fit. On OOM free JUST ENOUGH VRAM and retry, keeping
             // the rest resident: each round drops LRU weights from this context's
-            // own cache first (the DiT), and only when that can't cover it
+            // own cache first (the denoiser), and only when that can't cover it
             // reaches into the chat LLM's context. The freed amount escalates so
             // a large deficit converges fast. If nothing more can be freed, tile
             // on the GPU; if even a tile won't fit, decode on the CPU.
@@ -1565,7 +2638,7 @@ pub const Session = struct {
             {
                 // Proactive pre-free to ~110% of the estimated first-attempt peak,
                 // so we don't burn a full failed decode just to find the deficit.
-                const est = if (skip_whole) vae.estimatePeakBytes(tp.tile, tp.tile) else vae.estimatePeakBytes(lat_h, lat_w);
+                const est = if (skip_whole) v.estimate(tp.tile, tp.tile) else v.estimate(lat_h, lat_w);
                 const target = est + est / 10;
                 const free_now = gc.liveVram();
                 try note(progress, "vae decode: est peak {d}MB, want free >= {d}MB (have {d}MB)\n", .{ est >> 20, target >> 20, free_now >> 20 });
@@ -1578,8 +2651,8 @@ pub const Session = struct {
                 var want: u64 = reclaim_chunk;
                 var round: usize = 0;
                 while (round < max_reclaim_rounds) : (round += 1) {
-                    if (vae_gpu.decode(vae, gc, io, gpa, x, lat_h, lat_w, o.cancel)) |p| {
-                        break :planar_blk p;
+                    if (Whole.call(wt, gpa, io, x, lat_h, lat_w)) |p| {
+                        return p;
                     } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: whole-image OOM ({t}) -> freeing VRAM\n", .{err});
                     const t0 = std.Io.Clock.real.now(io).nanoseconds;
                     const from_self = gc.evictToFree(want); // own resident weights first
@@ -1595,24 +2668,23 @@ pub const Session = struct {
             }
             // Phase 2: GPU tiling (bounded) with the same incremental eviction.
             {
-                var wt: u64 = reclaim_chunk;
+                var wnt: u64 = reclaim_chunk;
                 var round: usize = 0;
                 while (round < max_reclaim_rounds) : (round += 1) {
                     try note(progress, "vae decode: tiling on GPU ({d}^2 latent tiles)\n", .{tp.tile});
-                    const vt = VkTile{ .vae = vae, .gc = gc, .cancel = o.cancel };
-                    if (vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, vt, VkTile.call)) |p| {
-                        break :planar_blk p;
+                    if (vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, wt, Whole.call)) |p| {
+                        return p;
                     } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: GPU tiling OOM ({t}) -> freeing VRAM\n", .{err});
                     const t0 = std.Io.Clock.real.now(io).nanoseconds;
-                    const from_self = gc.evictToFree(wt);
+                    const from_self = gc.evictToFree(wnt);
                     var got = from_self;
-                    if (got < wt) if (o.reclaim) |r| {
-                        got += r.call(r.ctx, wt - got);
+                    if (got < wnt) if (o.reclaim) |r| {
+                        got += r.call(r.ctx, wnt - got);
                     };
                     const ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0)) / 1e6;
                     try note(progress, "vae decode: freed {d}MB (own {d}MB + llm {d}MB) for tiling in {d:.0}ms\n", .{ got >> 20, from_self >> 20, (got - from_self) >> 20, ms });
                     if (got == 0) break; // nothing left → CPU
-                    wt *|= 2;
+                    wnt *|= 2;
                 }
             }
             // Phase 3: CPU tiling — the guaranteed VRAM-can't-OOM floor (slow).
@@ -1620,22 +2692,17 @@ pub const Session = struct {
             const saved = ops.matmul.gpu_dispatch;
             ops.matmul.gpu_dispatch = null;
             defer ops.matmul.gpu_dispatch = saved;
-            break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae, .cancel = o.cancel }, CpuTile.call);
-        } else planar_blk: {
-            // CPU-only: tile once the whole-image scores plane (f32) gets large,
-            // so a big image doesn't try to allocate tens of GB of host RAM.
-            // (skip_whole — e.g. gpu_tiled with no GPU — forces tiling.)
-            if (!skip_whole and attnPlaneBytes(lat_h, lat_w, 4) < (1 << 30))
-                break :planar_blk try vae.decode(io, gpa, x, lat_h, lat_w, o.cancel);
-            try note(progress, "vae decode: tiling on CPU\n", .{});
-            break :planar_blk try vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, CpuTile{ .vae = vae, .cancel = o.cancel }, CpuTile.call);
-        };
-        defer gpa.free(planar);
-        try note(progress, "decoded in {d:.1}s\n", .{@as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - dec_start.nanoseconds)) / 1e9});
-
-        const width = lat_w * 8;
-        const height = lat_h * 8;
-        return .{ .rgb = try image.planarF32ToRgb8(gpa, planar, width, height), .width = width, .height = height };
+            const ct = v.cpuCtx(io, o.cancel);
+            return vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, ct, @TypeOf(ct).call);
+        }
+        // CPU-only: tile once the whole-image scores plane (f32) gets large,
+        // so a big image doesn't try to allocate tens of GB of host RAM.
+        // (skip_whole — e.g. gpu_tiled with no GPU — forces tiling.)
+        const ct = v.cpuCtx(io, o.cancel);
+        if (!skip_whole and attnPlaneBytes(lat_h, lat_w, 4) < (1 << 30))
+            return @TypeOf(ct).call(ct, gpa, io, x, lat_h, lat_w);
+        try note(progress, "vae decode: tiling on CPU\n", .{});
+        return vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, ct, @TypeOf(ct).call);
     }
 
     pub fn generate(self: *Session, opts: Options, progress: ?*std.Io.Writer) !Image {
@@ -1643,6 +2710,8 @@ pub const Session = struct {
         const io = self.io;
         if (opts.width % 16 != 0 or opts.height % 16 != 0) return error.SizeNotMultipleOf16;
         if (opts.steps < 1) return error.NoSteps;
+        // Per-render, not per-session: the GUI snapshots a config per queued image.
+        self.compat = opts.compatConfig();
         const lat_h = opts.height / 8;
         const lat_w = opts.width / 8;
         // Family-dependent: 16 latent channels for krea2's Wan VAE, 4 for SD's
@@ -1670,17 +2739,45 @@ pub const Session = struct {
         // across queued images while the encoder/VAE cycle in the leftover.
         if (cu_be) |b| b.pin_budget = 0;
 
+        // The sigma schedule is computed HERE, before the text encode, only because an
+        // A1111 prompt schedule is indexed by step and so needs the step count up front.
+        // ⚠️ That count is `sigmas.len - 1`, NOT `opts.steps`: `ddim_uniform` strides the
+        // sigma table and `beta` de-duplicates rungs, so either can return a different
+        // number than requested. Hoisting is safe — `scheduleWith` is pure and touches no
+        // RNG, so the noise draw below is unchanged and the render stays bit-identical.
+        const sigmas = try self.scheduleWith(gpa, opts.steps, opts.shift, opts.scheduler);
+        defer gpa.free(sigmas);
+        const nsteps = sigmas.len - 1;
+        if (nsteps != opts.steps) {
+            try note(progress, "scheduler {t} produced {d} steps for a request of {d}\n", .{
+                opts.scheduler orelse sampler.Scheduler.defaultFor(self.sigmaTable(opts.shift)), nsteps, opts.steps,
+            });
+        }
+
         // Stage 1: text encoding (reusing the resident encoder).
         const enc_start = std.Io.Clock.real.now(io);
-        const enc_opts: EncodeOptions = .{ .encoder_f16 = opts.encoder_f16, .cancel = opts.cancel };
+        const enc_opts: EncodeOptions = .{
+            .encoder_f16 = opts.encoder_f16,
+            .prompt_syntax = opts.prompt_syntax,
+            .emphasis = opts.emphasis,
+            .steps = nsteps,
+            .cancel = opts.cancel,
+        };
         var cond_pos = try self.encode(gpa, opts.prompt, enc_opts);
         defer cond_pos.deinit(gpa);
         var cond_neg: ?Cond = if (use_cfg) try self.encode(gpa, opts.negative, enc_opts) else null;
         defer if (cond_neg) |*c| c.deinit(gpa);
-        try note(progress, "encoded prompt ({d} tokens{s}) in {d:.1}s\n", .{
-            cond_pos.seq,                                                                                 if (use_cfg) " + negative" else "",
+        // The variant count is worth reporting: an A1111 `[a|b]` or `[a:b:0.5]` silently
+        // becomes several conditionings, and "1 variant" is the difference between a
+        // schedule that took effect and syntax that was read as plain text.
+        const n_variants = cond_pos.entryCount() + if (cond_neg) |*c| c.entryCount() - 1 else 0;
+        try note(progress, "encoded prompt ({d} tokens{s}{s}) in {d:.1}s\n", .{
+            cond_pos.seq,
+            if (use_cfg) " + negative" else "",
+            if (n_variants > 1) ", scheduled" else "",
             @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - enc_start.nanoseconds)) / 1e9,
         });
+        if (n_variants > 1) try note(progress, "prompt schedule: {d} distinct conditionings\n", .{n_variants});
 
         // Pin the DiT across images (GUI_VRAM.md Phase 4): first-touch pinning
         // during sampling keeps the (large) DiT weights resident so a queued
@@ -1746,10 +2843,9 @@ pub const Session = struct {
         // DiT; the per-image working set (GPU session, activation workspace,
         // preview decode) is tagged `latent` below.
         self.setMemTag(.dit);
-        // The schedule comes first now: the initial latent is scaled by `sigmas[0]`,
-        // which is 1.0 for krea2 (a no-op, bit-identical) and ~14.6 for SD.
-        const sigmas = try self.schedule(gpa, opts.steps, opts.shift);
-        defer gpa.free(sigmas);
+        // `sigmas`/`nsteps` were computed before the encode (see there); the initial
+        // latent is scaled by `sigmas[0]`, which is 1.0 for krea2 (a bit-identical no-op)
+        // and ~14.6 for SD.
 
         const x = try gpa.alloc(f32, lat_len);
         defer gpa.free(x);
@@ -1759,17 +2855,56 @@ pub const Session = struct {
         // back to a fresh draw rather than a bad copy.
         if (opts.resume_from) |r| {
             if (r.latent.len == x.len) @memcpy(x, r.latent) else {
-                sampler.fillNoise(x, opts.seed);
-                sampler.scaleInitialNoise(x, sigmas[0]);
+                sampler.fillNoiseFrom(x, opts.seed, self.compat.noise_src);
+                self.scaleInitialNoise(x, sigmas[0]);
             }
         } else {
-            sampler.fillNoise(x, opts.seed);
-            sampler.scaleInitialNoise(x, sigmas[0]);
+            sampler.fillNoiseFrom(x, opts.seed, self.compat.noise_src);
+            self.scaleInitialNoise(x, sigmas[0]);
         }
 
         {
             const v = try gpa.alloc(f32, lat_len);
             defer gpa.free(v);
+
+            // The higher-order sampler's per-render state (multistep history + the
+            // Brownian noise path). Built HERE, between the initial-noise scaling and
+            // the denoiser, because both orderings matter:
+            //
+            //  - **After** `scaleInitialNoise`: ComfyUI scales the starting latent by
+            //    the *unoffset* first sigma (its `noise_scaling` runs before the
+            //    sampler function, which offsets a clone), and `init` mutates
+            //    `sigmas[0]`.
+            //  - **Before** `self.denoiser(...)`: that precomputes a timestep vector
+            //    per schedule entry, so it has to see the offset value or step 0 falls
+            //    off its own cache.
+            var sde: ?sampler.SdeStepper = if (opts.sampler.isSde()) try .init(
+                gpa,
+                sigmas,
+                lat_len,
+                self.parameterization(),
+                .{
+                    .eta = opts.sde_eta,
+                    .s_noise = opts.sde_s_noise,
+                    .solver = if (opts.sampler == .dpmpp_2m_sde) .midpoint else .heun,
+                    // ComfyUI seeds the Brownian path from the render's own seed
+                    // (`extra_args["seed"]`), the same one that drew the latent.
+                    .seed = opts.seed,
+                    // ⚠️ And the same generator, which is the half that is easy to miss:
+                    // A1111's pinned k-diffusion builds the tree on the CUDA tensor's
+                    // device, so its per-node draws are Philox too. Wiring only the
+                    // initial latent would have made euler reproduce and left every SDE
+                    // render wrong, with nothing failing.
+                    .noise_src = self.compat.noise_src,
+                },
+                opts.shift,
+            ) else null;
+            defer if (sde) |*s| s.deinit();
+            // Restore the multistep history on a resume, or the first step after it is
+            // silently first-order (see `Snapshot.sde_old_denoised`).
+            if (sde) |*s| if (opts.resume_from) |r| if (r.sde_old_denoised) |old| {
+                if (old.len == lat_len) s.restore(old, r.sde_h_last);
+            };
 
             // The per-image denoiser: text fusion, rope table, timestep vectors and
             // activation workspace, built once here (they depend on the prompt +
@@ -1816,11 +2951,17 @@ pub const Session = struct {
             // Optional taew2_1 (TAEHV) approx-VAE for a sharper preview. Loaded up
             // front whenever a preview is active and a taew is configured — even if
             // the current method isn't taesd — so a live switch to taesd is instant.
+            //
+            // krea2 ONLY: TAEHV is a 16-channel Wan approx-VAE, so it cannot decode an
+            // SD latent at all — the SD family's equivalent is TAESD/TAESDXL, a
+            // different (4-channel, image) decoder that isn't implemented here. Leaving
+            // `taehv_dec` null makes the `method == 2` request degrade to latent2rgb
+            // through the existing path, which is the only correct preview for SD today.
             var taew_st: ?safetensors.SafeTensors = null;
             defer if (taew_st) |*s| s.deinit();
             var taehv_dec: ?taehv_mod.Decoder = null;
             defer if (taehv_dec) |*d| d.deinit();
-            if (preview_active) if (opts.taew_path) |tp| {
+            if (preview_active and self.family() == .krea2) if (opts.taew_path) |tp| {
                 if (safetensors.SafeTensors.open(gpa, io, tp)) |tst| {
                     taew_st = tst;
                     if (taehv_mod.Decoder.load(gpa, &taew_st.?)) |d| {
@@ -1831,8 +2972,8 @@ pub const Session = struct {
             };
 
             const sampling_start = std.Io.Clock.real.now(io);
-            const start_step = if (opts.resume_from) |r| @min(r.step, opts.steps) else 0;
-            for (start_step..opts.steps) |i| {
+            const start_step = if (opts.resume_from) |r| @min(r.step, nsteps) else 0;
+            for (start_step..nsteps) |i| {
                 if (opts.cancel) |c| if (c.load(.acquire)) return error.Canceled;
                 if (opts.pause) |g| switch (g.checkpoint(io, opts.cancel)) {
                     .proceed => {},
@@ -1843,17 +2984,27 @@ pub const Session = struct {
                     // input to step `i` (the checkpoint runs before the forward).
                     .unload => {
                         if (opts.suspend_out) |so| {
-                            so.* = .{ .latent = try gpa.dupe(f32, x), .step = i };
+                            so.* = .{
+                                .latent = try gpa.dupe(f32, x),
+                                .step = i,
+                                // A multistep sampler's history is part of the state a
+                                // bit-identical resume needs; null for euler.
+                                .sde_old_denoised = if (sde) |*s|
+                                    (if (s.have_old) try gpa.dupe(f32, s.old_denoised) else null)
+                                else
+                                    null,
+                                .sde_h_last = if (sde) |*s| s.h_last else 0,
+                            };
                             return error.Paused;
                         }
                         return error.Canceled;
                     },
                 };
                 const start = std.Io.Clock.real.now(io);
-                try den.predict(gpa, v, x, sigmas[i], opts.cancel);
-                sampler.eulerStep(x, v, sigmas[i], sigmas[i + 1]);
+                try den.predictAt(gpa, v, x, sigmas[i], i, opts.cancel);
+                if (sde) |*s| try s.step(x, v, i) else sampler.eulerStep(x, v, sigmas[i], sigmas[i + 1]);
                 const ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - start.nanoseconds)) / 1e6;
-                try note(progress, "step {d}/{d}  sigma {d:.3} -> {d:.3}  ({d:.1}s)\n", .{ i + 1, opts.steps, sigmas[i], sigmas[i + 1], ms / 1000.0 });
+                try note(progress, "step {d}/{d}  sigma {d:.3} -> {d:.3}  ({d:.1}s)\n", .{ i + 1, nsteps, sigmas[i], sigmas[i + 1], ms / 1000.0 });
                 if (opts.on_step) |p| {
                     // Live-preview decode allocations (taew weights + scratch) are
                     // working memory, not DiT.
@@ -1876,12 +3027,20 @@ pub const Session = struct {
                     if (method == 2 and taehv_dec == null) method = 1;
 
                     if (method != 0) {
-                        // Denoised (x0) estimate = x - sigma*v. `eulerStep` above
+                        // Denoised (x0) estimate = x_i - sigma_i*v. `eulerStep` above
                         // set x to x_{i+1} = x_i + (sigma_{i+1} - sigma_i)*v, so the
                         // clean estimate in terms of the post-step latent is
                         // x - sigma_{i+1}*v (collapses to x on the final step where
                         // sigma_{i+1}==0).
-                        const x0: []const f32 = if (preview_x0) |px0| blk: {
+                        //
+                        // That reconstruction is only valid for an Euler step. An SDE
+                        // stepper's latent is not `x_i + dt*v` (it has an exponential
+                        // drift term and injected noise), so reading the estimate back
+                        // out of it would preview a differently-scaled image that
+                        // *looks* plausible. It keeps the same quantity to hand.
+                        const x0: []const f32 = if (sde) |*s|
+                            s.denoised
+                        else if (preview_x0) |px0| blk: {
                             const s_next = sigmas[i + 1];
                             for (px0, x, v) |*o, xi, vi| o.* = xi - s_next * vi;
                             break :blk px0;
@@ -1891,7 +3050,7 @@ pub const Session = struct {
                             const ds = clampDs(live_ds, lat_h, lat_w);
                             const th = lat_h / ds;
                             const tw = lat_w / ds;
-                            const small = downsampleLatent(gpa, x0, lat_h, lat_w, ds) catch break :taew_blk;
+                            const small = downsampleLatent(gpa, x0, wan_vae.latent_channels, lat_h, lat_w, ds) catch break :taew_blk;
                             defer gpa.free(small);
                             const rgb = if (cu_be) |b|
                                 (taehv_cuda_mod.decode(d, b, gpa, small, th, tw) catch break :taew_blk)
@@ -1903,15 +3062,15 @@ pub const Session = struct {
                             pv = .{ .rgb = rgb, .width = tw * taehv_mod.spatial_scale, .height = th * taehv_mod.spatial_scale };
                         };
                         if (pv == null) if (preview_scratch) |ps| {
-                            wan_vae.latentPreviewInto(ps, x0, lat_h, lat_w);
+                            self.latentPreviewInto(ps, x0, lat_h, lat_w);
                             pv = .{ .rgb = ps, .width = lat_w, .height = lat_h };
                         };
                     }
-                    p.step(p.ctx, i + 1, opts.steps, pv);
+                    p.step(p.ctx, i + 1, nsteps, pv);
                 }
             }
             const sampling_s = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - sampling_start.nanoseconds)) / 1e9;
-            try note(progress, "sampling {d} steps in {d:.1}s ({d:.2}s/step)\n", .{ opts.steps, sampling_s, sampling_s / @as(f64, @floatFromInt(opts.steps)) });
+            try note(progress, "sampling {d} steps in {d:.1}s ({d:.2}s/step)\n", .{ nsteps, sampling_s, sampling_s / @as(f64, @floatFromInt(nsteps)) });
             // Peak-of-sampling attribution (the per-image session/workspace is
             // still alive here) — the same numbers the GUI meter shows.
             if (self.cu_be != null or self.gpu_ctx != null) {
@@ -1980,10 +3139,14 @@ fn encodePrompt(io: std.Io, gpa: std.mem.Allocator, gpu_ctx: ?*gpu_mod.Context, 
     return .{ .data = data, .seq = seq };
 }
 
-/// Box-average a planar [C][h][w] latent down by integer factor `f`
-/// (→ [C][h/f][w/f]) so the taew preview decode stays cheap.
-fn downsampleLatent(gpa: std.mem.Allocator, x: []const f32, h: usize, w: usize, f: usize) ![]f32 {
-    const c = wan_vae.latent_channels;
+/// Box-average a planar [c][h][w] latent down by integer factor `f`
+/// (→ [c][h/f][w/f]) so the taew preview decode stays cheap.
+///
+/// ⚠️ `c` is a parameter, not `wan_vae.latent_channels`: hardcoding krea2's 16 read
+/// four times past the end of an SD latent, which crashed the GUI's first previewed
+/// SD render (`index out of bounds: index 0, len 0`) rather than producing a bad
+/// preview.
+fn downsampleLatent(gpa: std.mem.Allocator, x: []const f32, c: usize, h: usize, w: usize, f: usize) ![]f32 {
     const th = h / f;
     const tw = w / f;
     const out = try gpa.alloc(f32, c * th * tw);
@@ -2009,6 +3172,61 @@ fn note(progress: ?*std.Io.Writer, comptime fmt: []const u8, args: anytype) !voi
     }
 }
 
+test "the live preview follows the family's own latent format" {
+    // Regression: the per-step preview was krea2-only — `downsampleLatent` hardcoded 16
+    // channels and the latent2rgb call went straight to `wan_vae` — so the first
+    // previewed SD render read four planes past the end of a 4-channel latent and
+    // panicked mid-generation (`index out of bounds: index 0, len 0`), for BOTH SD1.5
+    // and SDXL. Only the union's tag is read here, so an undefined payload is safe and
+    // this stays a fast CPU test.
+    const gpa = std.testing.allocator;
+    const lat_h = 4;
+    const lat_w = 6;
+    const rgb = try gpa.alloc(u8, lat_h * lat_w * 3);
+    defer gpa.free(rgb);
+
+    var sess: Session = undefined;
+    var prev: [3][]u8 = undefined;
+    inline for (.{ Family.krea2, Family.sd15, Family.sdxl }, 0..) |fam, fi| {
+        sess.models = switch (fam) {
+            .krea2 => .{ .krea2 = undefined },
+            .sd15 => .{ .sd15 = undefined },
+            .sdxl => .{ .sdxl = undefined },
+        };
+        const ch: usize = if (fam == .krea2) wan_vae.latent_channels else sd_vae.latent_channels;
+        // Exactly the family's channel count — a read one plane past the end is an
+        // out-of-bounds panic, which is what the bug was.
+        const z = try gpa.alloc(f32, ch * lat_h * lat_w);
+        defer gpa.free(z);
+        for (z, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 7)) * 0.1 - 0.3;
+        sess.latentPreviewInto(rgb, z, lat_h, lat_w);
+        prev[fi] = try gpa.dupe(u8, rgb);
+    }
+    defer for (prev) |p| gpa.free(p);
+    // Each family uses its OWN factors: sharing SD1.5's for SDXL is not a crash, just a
+    // preview with plausible structure and wrong colours.
+    try std.testing.expect(!std.mem.eql(u8, prev[1], prev[2]));
+}
+
+test "downsampleLatent box-averages every plane of a non-krea2 latent" {
+    const gpa = std.testing.allocator;
+    const c = sd_vae.latent_channels;
+    const h = 4;
+    const w = 4;
+    const x = try gpa.alloc(f32, c * h * w);
+    defer gpa.free(x);
+    // Plane `ch` is filled with its own index so a channel mixup shows up as a value.
+    for (0..c) |ch| for (x[ch * h * w ..][0 .. h * w]) |*v| {
+        v.* = @floatFromInt(ch);
+    };
+    const small = try downsampleLatent(gpa, x, c, h, w, 2);
+    defer gpa.free(small);
+    try std.testing.expectEqual(@as(usize, c * 2 * 2), small.len);
+    for (0..c) |ch| for (small[ch * 4 ..][0..4]) |v| {
+        try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(ch)), v, 1e-6);
+    };
+}
+
 test "options validation" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -2031,6 +3249,60 @@ test "vramBreakdown folds only the untagged remainder into latent" {
     // saturate, not underflow.
     const r = Session.foldUntagged(.{ .te = 2 * gib_b, .dit = 2 * gib_b, .vae = 0, .latent = 0 }, 3 * gib_b);
     try std.testing.expectEqual(@as(u64, 0), r.latent);
+}
+
+test "the SD tile adapter transposes both ways around a channel-last decoder" {
+    // `vae_tiled` and `Session.decode` speak planar `[c][h][w]`; the SD decoders
+    // speak channel-last `[h*w][c]`. `sdTile` is the single seam between them, and
+    // it is the seam because getting this wrong is **rms-preserving** — every value
+    // survives, only its position moves — which is how the layout bug that reached a
+    // rendered image stayed invisible to every magnitude check (see "the sampler's
+    // planar latent survives a round trip through the UNet's layout").
+    //
+    // The dummy decoder asserts the layout it is HANDED and emits a distinct known
+    // pattern, so the two transpositions are pinned independently: a test that only
+    // checked the round trip would pass with both of them wrong.
+    const gpa = std.testing.allocator;
+    const c_in = sd_vae.latent_channels;
+    const th = 2;
+    const tw = 3;
+    const n = th * tw;
+
+    const sub = try gpa.alloc(f32, c_in * n); // planar [c][th][tw]
+    defer gpa.free(sub);
+    for (0..c_in) |c| {
+        for (0..n) |p| sub[c * n + p] = @floatFromInt(c * 1000 + p);
+    }
+
+    const Dummy = struct {
+        fn inner(_: @This(), a: std.mem.Allocator, z: []const f32, ith: usize, itw: usize) anyerror![]f32 {
+            const nn = ith * itw;
+            // Handed channel-last: a position's channels are adjacent.
+            for (0..nn) |p| {
+                for (0..c_in) |c| {
+                    try std.testing.expectEqual(@as(f32, @floatFromInt(c * 1000 + p)), z[p * c_in + c]);
+                }
+            }
+            // Emit channel-last pixels, the shape a real SD decoder returns.
+            const pn = nn * sd_vae.spatial_scale * sd_vae.spatial_scale;
+            const out = try a.alloc(f32, pn * 3);
+            for (0..pn) |p| {
+                for (0..3) |c| out[p * 3 + c] = @floatFromInt(c * 100000 + p);
+            }
+            return out;
+        }
+    };
+
+    const planar = try sdTile(gpa, sub, th, tw, Dummy{}, Dummy.inner);
+    defer gpa.free(planar);
+
+    const pn = n * sd_vae.spatial_scale * sd_vae.spatial_scale;
+    try std.testing.expectEqual(pn * 3, planar.len);
+    for (0..3) |c| {
+        for (0..pn) |p| {
+            try std.testing.expectEqual(@as(f32, @floatFromInt(c * 100000 + p)), planar[c * pn + p]);
+        }
+    }
 }
 
 test "recoverableDecodeErr classifies VAE-decode fallbacks" {
@@ -2102,7 +3374,10 @@ test "generate composed from the public stages is bit-identical to Session.gener
 
     const x = try gpa.alloc(f32, lat_len);
     defer gpa.free(x);
-    sampler.fillNoise(x, opts.seed);
+    // Through `compatConfig` rather than the default-source form: this test's whole claim
+    // is that the stages reproduce `generate`, so it has to draw from whatever generator
+    // `generate` would have used.
+    sampler.fillNoiseFrom(x, opts.seed, opts.compatConfig().noise_src);
 
     const v = try gpa.alloc(f32, lat_len);
     defer gpa.free(v);
@@ -2221,15 +3496,29 @@ test "family detection reads the denoiser's own tensor names" {
     // keeps the LDM container prefix, and ggufy's model-only GGUF strips it.
     const gpa = std.testing.allocator;
 
-    const cases = [_]struct { name: []const u8, want: Family }{
-        .{ .name = "model.diffusion_model.input_blocks.0.0.weight", .want = .sd15 },
-        .{ .name = "input_blocks.0.0.weight", .want = .sd15 },
-        .{ .name = "model.diffusion_model.blocks.0.attn.wq.weight", .want = .krea2 },
-        .{ .name = "blocks.0.attn.wq.weight", .want = .krea2 },
+    // ⚠️ The SDXL cases carry the SD1.5 stem **as well**, because that is what a real
+    // SDXL checkpoint looks like: both are LDM UNets with the same `input_blocks.0.0`.
+    // So these two cases are the ones that pin the *order* of the checks — testing SDXL
+    // with `label_emb` alone would pass even if the stem were read first, and every SDXL
+    // checkpoint would then load as SD1.5 and fail on a missing fourth level.
+    const cases = [_]struct { names: []const []const u8, want: Family }{
+        .{ .names = &.{"model.diffusion_model.input_blocks.0.0.weight"}, .want = .sd15 },
+        .{ .names = &.{"input_blocks.0.0.weight"}, .want = .sd15 },
+        .{ .names = &.{ "model.diffusion_model.input_blocks.0.0.weight", "model.diffusion_model.label_emb.0.0.weight" }, .want = .sdxl },
+        .{ .names = &.{ "input_blocks.0.0.weight", "label_emb.0.0.weight" }, .want = .sdxl },
+        .{ .names = &.{"model.diffusion_model.blocks.0.attn.wq.weight"}, .want = .krea2 },
+        .{ .names = &.{"blocks.0.attn.wq.weight"}, .want = .krea2 },
     };
     for (cases) |c| {
         var buf: [512]u8 = undefined;
-        const header = try std.fmt.bufPrint(&buf, "{{\"{s}\":{{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}}}}", .{c.name});
+        var fbs = std.Io.Writer.fixed(&buf);
+        try fbs.writeByte('{');
+        for (c.names, 0..) |nm, i| {
+            if (i > 0) try fbs.writeByte(',');
+            try fbs.print("\"{s}\":{{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}}", .{nm});
+        }
+        try fbs.writeByte('}');
+        const header = fbs.buffered();
         const file = try gpa.alloc(u8, 8 + header.len + 8);
         defer gpa.free(file);
         std.mem.writeInt(u64, file[0..8], header.len, .little);
@@ -2246,7 +3535,7 @@ test "family detection reads the denoiser's own tensor names" {
             v.deinit(gpa);
             gpa.destroy(v);
         };
-        const probe = componentSpec(c.want, .denoiser).probe;
+        const probe = (try componentSpec(c.want, .denoiser)).probe;
         try std.testing.expect(r.store.get(probe) != null);
     }
 
@@ -2291,7 +3580,7 @@ test "container style is orthogonal to family: bundled, split, and explicit over
     var side = try safetensors.SafeTensors.initFromSlice(gpa, try Builder.file(&b2, "text_model.final_layer_norm.weight"));
     defer side.deinit();
 
-    const probe = componentSpec(.sd15, .conditioner).probe;
+    const probe = (try componentSpec(.sd15, .conditioner)).probe;
 
     // 1. Bundled only: found inside the primary, through a prefix view.
     {
@@ -2402,4 +3691,180 @@ test "the sampler's planar latent survives a round trip through the UNet's layou
         n_cl += b * b;
     }
     try std.testing.expectEqual(n_planar, n_cl);
+}
+
+test "a scheduled prompt deduplicates by text and indexes every step" {
+    // The dedup is the load-bearing part: `[a|b]` contributes a schedule entry per STEP
+    // (upstream's `collect_steps` does), so without it a 35-step render would encode 35
+    // conditionings for 2 prompts and build 35 device sessions per branch.
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    {
+        const plan = try planSchedule(arena.allocator(), gpa, "[a|b] cat", 35);
+        defer gpa.free(plan.at);
+        try std.testing.expectEqual(@as(usize, 2), plan.texts.len);
+        try std.testing.expectEqual(@as(usize, 35), plan.at.len);
+        // Alternating, 1-based: step 1 -> "a", step 2 -> "b", …
+        try std.testing.expectEqualStrings("a cat", plan.texts[0]);
+        try std.testing.expectEqualStrings("b cat", plan.texts[1]);
+        for (plan.at, 0..) |ix, step| try std.testing.expectEqual(@as(u8, @intCast(step % 2)), ix);
+    }
+    {
+        // Prompt editing: one boundary, so two texts and a step index that switches once.
+        const plan = try planSchedule(arena.allocator(), gpa, "a [cat:dog:0.5] b", 10);
+        defer gpa.free(plan.at);
+        try std.testing.expectEqual(@as(usize, 2), plan.texts.len);
+        try std.testing.expectEqualStrings("a cat b", plan.texts[0]);
+        try std.testing.expectEqualStrings("a dog b", plan.texts[1]);
+        for (plan.at[0..5]) |ix| try std.testing.expectEqual(@as(u8, 0), ix);
+        for (plan.at[5..]) |ix| try std.testing.expectEqual(@as(u8, 1), ix);
+    }
+    {
+        // No scheduling syntax: one text, every step on it. This is the path every
+        // ComfyUI-dialect prompt and most A1111 prompts take, so it must stay trivial.
+        const plan = try planSchedule(arena.allocator(), gpa, "1girl, (shiny skin:1.1)", 20);
+        defer gpa.free(plan.at);
+        try std.testing.expectEqual(@as(usize, 1), plan.texts.len);
+        for (plan.at) |ix| try std.testing.expectEqual(@as(u8, 0), ix);
+    }
+}
+
+test "Cond entry accessors treat the parent as entry 0" {
+    // The compatibility claim that keeps ggufy and the composed-stages invariant working:
+    // a Cond with no schedule has exactly one entry and it is itself.
+    const gpa = std.testing.allocator;
+    var plain: Cond = .{ .data = try gpa.alloc(f32, 4), .seq = 1 };
+    defer plain.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), plain.entryCount());
+    try std.testing.expectEqual(&plain, plain.entry(0));
+
+    const extra = try gpa.alloc(Cond, 1);
+    extra[0] = .{ .data = try gpa.alloc(f32, 4), .seq = 2 };
+    const at = try gpa.alloc(u8, 4);
+    @memcpy(at, &[_]u8{ 0, 1, 1, 0 });
+    var sched: Cond = .{ .data = try gpa.alloc(f32, 4), .seq = 1, .sched = .{ .extra = extra, .at = at } };
+    defer sched.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 2), sched.entryCount());
+    try std.testing.expectEqual(@as(usize, 2), sched.entry(1).seq);
+    try std.testing.expectEqual(@as(usize, 1), sched.sched.?.indexAt(2));
+    // Past the end clamps to the last step rather than reading out of bounds — a schedule
+    // built for fewer steps than the render still resolves.
+    try std.testing.expectEqual(@as(usize, 0), sched.sched.?.indexAt(99));
+}
+
+test "compat resolves A1111's three sampling defaults, and a per-knob override wins" {
+    // ⚠️ All THREE, which is the point of the aggregate: A1111 disagrees with ComfyUI on
+    // every one of them, and the render only reproduces if they all flip together. A
+    // future edit that added a fourth convention to `.a1111` while leaving one at
+    // ComfyUI's value is exactly what this catches.
+    const a: CompatConfig = .of(.a1111);
+    try std.testing.expectEqual(noise_mod.Source.nv_philox, a.noise_src);
+    try std.testing.expectEqual(false, a.sgm_noise_multiplier);
+    try std.testing.expectEqual(false, a.quantize_timestep);
+
+    const c: CompatConfig = .of(.comfy);
+    try std.testing.expectEqual(noise_mod.Source.torch_cpu, c.noise_src);
+    try std.testing.expectEqual(true, c.sgm_noise_multiplier);
+    try std.testing.expectEqual(true, c.quantize_timestep);
+
+    // The default stays ComfyUI's, since that is what every render here reproduced
+    // before this was selectable.
+    const dflt: Options = .{ .prompt = "x" };
+    try std.testing.expectEqual(c, dflt.compatConfig());
+
+    // An override beats the aggregate in both directions — an A1111 user who set
+    // `randn_source` to CPU, or a ComfyUI user probing just the RNG.
+    var o: Options = .{ .prompt = "x", .compat = .a1111, .rng = .torch_cpu };
+    var got = o.compatConfig();
+    try std.testing.expectEqual(noise_mod.Source.torch_cpu, got.noise_src);
+    try std.testing.expectEqual(false, got.sgm_noise_multiplier); // the others untouched
+
+    o = .{ .prompt = "x", .rng = .nv_philox, .quantize_timestep = false };
+    got = o.compatConfig();
+    try std.testing.expectEqual(noise_mod.Source.nv_philox, got.noise_src);
+    try std.testing.expectEqual(true, got.sgm_noise_multiplier);
+    try std.testing.expectEqual(false, got.quantize_timestep);
+}
+
+test "the timestep quantization switch is not a no-op on a real schedule" {
+    // The cheap half of `--compat a1111` to get wrong silently: both branches return a
+    // well-defined timestep and neither errors, so nothing but a render comparison
+    // notices. Pin that they actually differ, and that only one of them is integral.
+    const gpa = std.testing.allocator;
+    const ladder = try sampler.sdSigmasFull(gpa);
+    defer gpa.free(ladder);
+    const sigmas = try sampler.sdSchedule(gpa, 8);
+    defer gpa.free(sigmas);
+
+    var any_differ = false;
+    for (sigmas[0..8]) |sg| {
+        const q = sampler.sdModelTimestep(ladder, sg);
+        const f = sampler.sdTimestepForSigma(ladder, sg);
+        try std.testing.expectEqual(@round(q), q);
+        if (@abs(q - f) > 0.05) any_differ = true;
+    }
+    try std.testing.expect(any_differ);
+}
+
+test "prompt-weight support is read off the encoder, not a list of architectures" {
+    // ⚠️ The predicate must come from the ENCODER. SD.Next's equivalent is a substring match
+    // on pipeline class names, and its own file shows the failure mode: Chroma and HiDream
+    // commented out of the list, and a `'Flux2' not in cls` guard bolted on so the `Flux`
+    // substring does not swallow a different architecture. Ours cannot drift, and a new
+    // encoder that declares nothing fails to compile rather than defaulting.
+    try std.testing.expect(!supportsPromptWeights(.krea2));
+    try std.testing.expect(supportsPromptWeights(.sd15));
+    try std.testing.expect(supportsPromptWeights(.sdxl));
+    // Read through the encoder types, so this test fails if a declaration is flipped without
+    // the pipeline noticing.
+    try std.testing.expectEqual(clip_text.TextEncoder.supports_prompt_weights, supportsPromptWeights(.sdxl));
+    try std.testing.expectEqual(qwen3.TextEncoder.supports_prompt_weights, supportsPromptWeights(.krea2));
+}
+
+test "an unweightable prompt is reported as such, never refused" {
+    // History, because the behaviour reversed twice: a BLANKET
+    // `error.PromptSyntaxUnsupportedForFamily` (reported as "why does krea2 report
+    // PromptSyntaxUnsupportedForFamily?"), then a refusal narrowed to weighted prompts, now a
+    // warning. See `weightsWouldBeDropped` for what settled it. Returning a bool rather than
+    // logging is also what lets this test stay silent on success.
+    const gpa = std.testing.allocator;
+    const o: EncodeOptions = .{ .prompt_syntax = .a1111 };
+
+    for ([_][]const u8{
+        "a cat sitting on a mat",
+        "", // an empty negative goes through the same path
+        "a cat, BREAK, best quality", // a boundary krea2 has no concept of either way
+        "a cat \\(cute\\) on a mat", // escaped parens are literal text, weight 1.0
+    }) |text| {
+        errdefer std.debug.print("nothing should be dropped from: '{s}'\n", .{text});
+        try std.testing.expect(!try Session.weightsWouldBeDropped(gpa, text, o));
+    }
+
+    // Real weights: reported, so the caller can say so — and the render still proceeds.
+    for ([_][]const u8{
+        "a (cat:1.3) on a mat",
+        "a (cat) on a mat", // bare parens are 1.1 under this dialect
+        "a [cat] on a mat", // and brackets are 1/1.1 de-emphasis, not literal text
+    }) |text| {
+        errdefer std.debug.print("weights should have been noticed in: '{s}'\n", .{text});
+        try std.testing.expect(try Session.weightsWouldBeDropped(gpa, text, o));
+    }
+
+    // `.ignore` already asked for the weights to be dropped, so there is nothing to report.
+    try std.testing.expect(!try Session.weightsWouldBeDropped(gpa, "a (cat:1.3) on a mat", .{ .prompt_syntax = .a1111, .emphasis = .ignore }));
+
+    // ⚠️ Per-step scheduling checked THROUGH `planSchedule`, not on the raw text: the
+    // scheduling brackets are resolved before `encodeText` ever sees the prompt, so checking
+    // `[cat:dog:0.5]` directly would describe a string the pipeline never passes — and would
+    // read as de-emphasis, since a bare `[…]` is 1/1.1 once the schedule is stripped.
+    for ([_][]const u8{ "a [cat:dog:0.5] on a mat", "a [cat|dog] on a mat" }) |text| {
+        var arena_state = std.heap.ArenaAllocator.init(gpa);
+        defer arena_state.deinit();
+        const plan = try planSchedule(arena_state.allocator(), gpa, text, 4);
+        defer gpa.free(plan.at);
+        try std.testing.expectEqual(@as(usize, 2), plan.texts.len); // it really did schedule
+        for (plan.texts) |t| try std.testing.expect(!try Session.weightsWouldBeDropped(gpa, t, o));
+    }
 }

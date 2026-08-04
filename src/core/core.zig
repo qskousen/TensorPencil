@@ -17,15 +17,29 @@ pub const safetensors = @import("safetensors.zig");
 pub const gguf = @import("gguf.zig");
 pub const weights = @import("weights.zig");
 pub const torch_rng = @import("torch_rng.zig");
+/// NVIDIA's Philox — the generator A1111 draws its noise from, unlike ComfyUI's CPU one.
+pub const philox_rng = @import("philox_rng.zig");
+/// Which of the two the noise comes from; both consumers dispatch through here.
+pub const noise = @import("noise.zig");
+/// `numpy.random.SeedSequence`, for the Brownian-tree noise sampler below.
+pub const seed_seq = @import("seed_seq.zig");
+/// torchsde's Brownian tree — the noise source ComfyUI's SDE samplers draw from.
+pub const brownian = @import("brownian.zig");
 pub const tokenizer = @import("tokenizer.zig");
 /// CLIP BPE — the SD family's prompt tokenizer (see that file for why it is not a
 /// variant of `tokenizer.zig`).
 pub const clip_tokenizer = @import("clip_tokenizer.zig");
+/// AUTOMATIC1111 prompt dialect (emphasis + per-step scheduling), alongside
+/// `clip_tokenizer`'s ComfyUI one.
+pub const prompt_a1111 = @import("prompt_a1111.zig");
 pub const jinja = @import("jinja.zig");
 pub const unicode_tables = @import("unicode_tables.zig");
 pub const image = @import("image.zig");
 pub const kv_cache = @import("kv_cache.zig");
 pub const sample = @import("sample.zig");
+/// Diffusion sigma SCHEDULES (where the steps go) — all nine ComfyUI schedulers.
+pub const schedule = @import("schedule.zig");
+/// Diffusion SAMPLERS (how to step) — Euler and DPM++ 2M SDE.
 pub const sampler = @import("sampler.zig");
 pub const spec_limits = @import("spec_limits.zig");
 pub const prof = @import("prof.zig");
@@ -39,13 +53,19 @@ test {
     _ = gguf;
     _ = weights;
     _ = torch_rng;
+    _ = philox_rng;
+    _ = noise;
+    _ = seed_seq;
+    _ = brownian;
     _ = tokenizer;
     _ = clip_tokenizer;
+    _ = prompt_a1111;
     _ = jinja;
     _ = unicode_tables;
     _ = image;
     _ = kv_cache;
     _ = sample;
+    _ = schedule;
     _ = sampler;
     _ = spec_limits;
     _ = prof;

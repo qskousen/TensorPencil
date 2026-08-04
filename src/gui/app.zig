@@ -558,7 +558,7 @@ pub fn run(init: std.process.Init) !void {
     // (see submitChat). Build the app-level diffusion engine now if a model is
     // configured (its pipeline still loads lazily on the first image).
     image_view.setEnv(g_gpa, g_io, wakeupFrame);
-    config_view.setEnv(back.window, wakeupFrame);
+    config_view.setEnv(back.window, wakeupFrame, g_gpa, g_io);
     syncDiffuser();
 
     // Tear down at exit. Stop the diffusion engine FIRST (join its worker) so no
@@ -581,6 +581,7 @@ pub fn run(init: std.process.Init) !void {
         clearStaged();
         g_staged_images.deinit(g_gpa);
         image_view.deinit();
+        config_view.deinit();
         status_bar.deinit();
     }
     defer if (g_viewer) |v| v.deinit();
@@ -1135,21 +1136,51 @@ fn llmForeignReclaim(_: *anyopaque, needed: u64) u64 {
     return g_arbiter.requestRoom(.llm, needed);
 }
 
-/// Whether a diffusion model is fully configured (all three pieces).
+/// Whether a diffusion model is configured. ONE path — the primary checkpoint —
+/// is the requirement; the text encoder and VAE are overrides for whatever it
+/// does not carry itself (see `config.diffEnabled`, and `model_spec.missing` for
+/// the advisory "is this set actually complete" preview the settings screen
+/// shows). Whether the components resolve is the pipeline's call at load time.
 fn hasDiffModel(cfg: *const config.Config) bool {
-    return cfg.diffusion_model.opt() != null and cfg.vae.opt() != null and cfg.text_encoder.opt() != null;
+    return cfg.diffusion_model.opt() != null;
+}
+
+/// The model set the current config selects, as the engine's own type. One
+/// builder, used by both `dcfgFromConfig` (first build) and `syncDiffuser`
+/// (live swap), so the two cannot drift as components are added.
+///
+/// "" = not overridden; the pipeline resolves that component out of the primary
+/// checkpoint. Never substitute a default here — a defaulted path that reaches
+/// `Options` is indistinguishable from a user request, which is what broke a
+/// joined SD1.5 checkpoint in the CLI.
+fn modelConfigFromConfig() diffuser.ModelConfig {
+    return .{
+        .dit_path = g_config.diffusion_model.opt().?,
+        .vae_path = g_config.vae.slice(),
+        .text_encoder_path = g_config.text_encoder.slice(),
+        .text_encoder_2_path = g_config.text_encoder_2.slice(),
+        .backend = diffuser.toPipelineBackend(g_config.diff_backend),
+        .vae_decode = diffuser.toPipelineVae(g_config.vae_decode),
+    };
 }
 
 fn dcfgFromConfig() diffuser.DiffConfig {
+    const m = modelConfigFromConfig();
     return .{
-        .dit_path = g_config.diffusion_model.opt().?,
-        .vae_path = g_config.vae.opt().?,
-        .text_encoder_path = g_config.text_encoder.opt().?,
+        .dit_path = m.dit_path,
+        .vae_path = m.vae_path,
+        .text_encoder_path = m.text_encoder_path,
+        .text_encoder_2_path = m.text_encoder_2_path,
         .steps = g_config.steps,
         .width = g_config.width,
         .height = g_config.height,
-        .backend = diffuser.toPipelineBackend(g_config.diff_backend),
-        .vae_decode = diffuser.toPipelineVae(g_config.vae_decode),
+        .sampler = diffuser.toPipelineSampler(g_config.sampler),
+        .scheduler = diffuser.toPipelineScheduler(g_config.scheduler),
+        .prompt_syntax = diffuser.toPipelineSyntax(g_config.prompt_syntax),
+        .emphasis = diffuser.toPipelineEmphasis(g_config.emphasis),
+        .compat = diffuser.toPipelineCompat(g_config.compat),
+        .backend = m.backend,
+        .vae_decode = m.vae_decode,
         .preview_enabled = g_config.preview != .none,
         .taew_path = if (g_config.preview == .taesd) g_config.taesd.opt() else null,
         .preview_ds = g_config.taesd_size.divisor(),
@@ -1191,14 +1222,17 @@ fn syncDiffuser() void {
     // requestPaths re-dupes the paths into the engine's owned store (nothing
     // aliases the live config buffers) and applies/swaps once the queue is idle.
     d.requestPaths(
-        g_config.diffusion_model.opt().?,
-        g_config.vae.opt().?,
-        g_config.text_encoder.opt().?,
+        modelConfigFromConfig(),
         if (g_config.preview == .taesd) g_config.taesd.opt() else null,
-        diffuser.toPipelineBackend(g_config.diff_backend),
-        diffuser.toPipelineVae(g_config.vae_decode),
     );
     d.setDefaults(g_config.steps, g_config.width, g_config.height);
+    d.setSampler(diffuser.toPipelineSampler(g_config.sampler));
+    d.setScheduler(diffuser.toPipelineScheduler(g_config.scheduler));
+    d.setPromptSyntax(
+        diffuser.toPipelineSyntax(g_config.prompt_syntax),
+        diffuser.toPipelineEmphasis(g_config.emphasis),
+        diffuser.toPipelineCompat(g_config.compat),
+    );
     d.setPreview(g_config.preview);
     d.setPreviewSize(g_config.taesd_size.divisor());
     d.setOutputDir(g_config.output_dir.opt());

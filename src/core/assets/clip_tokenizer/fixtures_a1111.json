@@ -1,0 +1,10873 @@
+{
+ "_reference": {
+  "upstream": "https://raw.githubusercontent.com/AUTOMATIC1111/stable-diffusion-webui/master/modules/prompt_parser.py",
+  "sha256": "27b25c780002fbb087b8cdc464077c5ca3874e47e2632085796c8fd5c338133d",
+  "comma_padding_backtrack": 20,
+  "emphasis": "Original",
+  "note": "A1111 (AGPL-3.0) source is fetched at generation time, never vendored.",
+  "backtrack_exercised_by": [
+   "cat, cat, cat, cat, cat, cat, cat, cat, "
+  ]
+ },
+ "a1111_attention": [
+  {
+   "text": "normal text",
+   "parts": [
+    {
+     "text": "normal text",
+     "weight": 1.0
+    }
+   ]
+  },
+  {
+   "text": "an (important) word",
+   "parts": [
+    {
+     "text": "an ",
+     "weight": 1.0
+    },
+    {
+     "text": "important",
+     "weight": 1.1
+    },
+    {
+     "text": " word",
+     "weight": 1.0
+    }
+   ]
+  },
+  {
+   "text": "(unbalanced",
+   "parts": [
+    {
+     "text": "unbalanced",
+     "weight": 1.1
+    }
+   ]
+  },
+  {
+   "text": "\\(literal\\]",
+   "parts": [
+    {
+     "text": "(literal]",
+     "weight": 1.0
+    }
+   ]
+  },
+  {
+   "text": "(unnecessary)(parens)",
+   "parts": [
+    {
+     "text": "unnecessaryparens",
+     "weight": 1.1
+    }
+   ]
+  },
+  {
+   "text": "a (((house:1.3)) [on] a (hill:0.5), sun, (((sky))).",
+   "parts": [
+    {
+     "text": "a ",
+     "weight": 1.0
+    },
+    {
+     "text": "house",
+     "weight": 1.5730000000000004
+    },
+    {
+     "text": " ",
+     "weight": 1.1
+    },
+    {
+     "text": "on",
+     "weight": 1.0
+    },
+    {
+     "text": " a ",
+     "weight": 1.1
+    },
+    {
+     "text": "hill",
+     "weight": 0.55
+    },
+    {
+     "text": ", sun, ",
+     "weight": 1.1
+    },
+    {
+     "text": "sky",
+     "weight": 1.4641000000000006
+    },
+    {
+     "text": ".",
+     "weight": 1.1
+    }
+   ]
+  },
+  {
+   "text": "",
+   "parts": [
+    {
+     "text": "",
+     "weight": 1.0
+    }
+   ]
+  },
+  {
+   "text": "[de-emphasized]",
+   "parts": [
+    {
+     "text": "de-emphasized",
+     "weight": 0.9090909090909091
+    }
+   ]
+  },
+  {
+   "text": "[[double de-emphasis]]",
+   "parts": [
+    {
+     "text": "double de-emphasis",
+     "weight": 0.8264462809917354
+    }
+   ]
+  },
+  {
+   "text": "(a:1.5) and [b:0.8]",
+   "parts": [
+    {
+     "text": "a",
+     "weight": 1.5
+    },
+    {
+     "text": " and ",
+     "weight": 1.0
+    },
+    {
+     "text": "b:0.8",
+     "weight": 0.9090909090909091
+    }
+   ]
+  },
+  {
+   "text": "(a:-1) (b:+2) (c:.5)",
+   "parts": [
+    {
+     "text": "a",
+     "weight": -1.0
+    },
+    {
+     "text": " ",
+     "weight": 1.0
+    },
+    {
+     "text": "b",
+     "weight": 2.0
+    },
+    {
+     "text": " ",
+     "weight": 1.0
+    },
+    {
+     "text": "c",
+     "weight": 0.5
+    }
+   ]
+  },
+  {
+   "text": "(a : 1.5)",
+   "parts": [
+    {
+     "text": "a ",
+     "weight": 1.5
+    }
+   ]
+  },
+  {
+   "text": "nested ((a:2.0) b)",
+   "parts": [
+    {
+     "text": "nested ",
+     "weight": 1.0
+    },
+    {
+     "text": "a",
+     "weight": 2.2
+    },
+    {
+     "text": " b",
+     "weight": 1.1
+    }
+   ]
+  },
+  {
+   "text": "((a:1.2):1.5)",
+   "parts": [
+    {
+     "text": "a",
+     "weight": 1.7999999999999998
+    }
+   ]
+  },
+  {
+   "text": "(x (a:1.2) y:1.5)",
+   "parts": [
+    {
+     "text": "x ",
+     "weight": 1.5
+    },
+    {
+     "text": "a",
+     "weight": 1.7999999999999998
+    },
+    {
+     "text": " y",
+     "weight": 1.5
+    }
+   ]
+  },
+  {
+   "text": "((a:1.2))",
+   "parts": [
+    {
+     "text": "a",
+     "weight": 1.32
+    }
+   ]
+  },
+  {
+   "text": "(((a:2):0.5):3)",
+   "parts": [
+    {
+     "text": "a",
+     "weight": 3.0
+    }
+   ]
+  },
+  {
+   "text": "[(a:1.2):1.5]",
+   "parts": [
+    {
+     "text": "a",
+     "weight": 1.0909090909090908
+    },
+    {
+     "text": ":1.5",
+     "weight": 0.9090909090909091
+    }
+   ]
+  },
+  {
+   "text": "((a:1.2) (b:0.5):2)",
+   "parts": [
+    {
+     "text": "a",
+     "weight": 2.4
+    },
+    {
+     "text": " ",
+     "weight": 2.0
+    },
+    {
+     "text": "b",
+     "weight": 1.0
+    }
+   ]
+  },
+  {
+   "text": "a BREAK b",
+   "parts": [
+    {
+     "text": "a",
+     "weight": 1.0
+    },
+    {
+     "text": "BREAK",
+     "weight": -1.0
+    },
+    {
+     "text": "b",
+     "weight": 1.0
+    }
+   ]
+  },
+  {
+   "text": "a, BREAK, b",
+   "parts": [
+    {
+     "text": "a,",
+     "weight": 1.0
+    },
+    {
+     "text": "BREAK",
+     "weight": -1.0
+    },
+    {
+     "text": ", b",
+     "weight": 1.0
+    }
+   ]
+  },
+  {
+   "text": "BREAKfast is not a BREAK",
+   "parts": [
+    {
+     "text": "BREAKfast is not a",
+     "weight": 1.0
+    },
+    {
+     "text": "BREAK",
+     "weight": -1.0
+    },
+    {
+     "text": "",
+     "weight": 1.0
+    }
+   ]
+  },
+  {
+   "text": "\\\\ backslash",
+   "parts": [
+    {
+     "text": "\\ backslash",
+     "weight": 1.0
+    }
+   ]
+  },
+  {
+   "text": "(a:1.5",
+   "parts": [
+    {
+     "text": "a:1.5",
+     "weight": 1.1
+    }
+   ]
+  },
+  {
+   "text": "trailing ((",
+   "parts": [
+    {
+     "text": "trailing ",
+     "weight": 1.0
+    }
+   ]
+  },
+  {
+   "text": "]stray[",
+   "parts": [
+    {
+     "text": "]stray",
+     "weight": 1.0
+    }
+   ]
+  },
+  {
+   "text": "(a)(b)(c:2)",
+   "parts": [
+    {
+     "text": "ab",
+     "weight": 1.1
+    },
+    {
+     "text": "c",
+     "weight": 2.0
+    }
+   ]
+  },
+  {
+   "text": "1girl, (shiny skin:1.1), [blurry], (lens flare:0.75)",
+   "parts": [
+    {
+     "text": "1girl, ",
+     "weight": 1.0
+    },
+    {
+     "text": "shiny skin",
+     "weight": 1.1
+    },
+    {
+     "text": ", ",
+     "weight": 1.0
+    },
+    {
+     "text": "blurry",
+     "weight": 0.9090909090909091
+    },
+    {
+     "text": ", ",
+     "weight": 1.0
+    },
+    {
+     "text": "lens flare",
+     "weight": 0.75
+    }
+   ]
+  }
+ ],
+ "a1111_schedule": [
+  {
+   "text": "test",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "test"
+    }
+   ]
+  },
+  {
+   "text": "a [b:3]",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 3,
+     "text": "a "
+    },
+    {
+     "until": 10,
+     "text": "a b"
+    }
+   ]
+  },
+  {
+   "text": "a [b: 3]",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 3,
+     "text": "a "
+    },
+    {
+     "until": 10,
+     "text": "a b"
+    }
+   ]
+  },
+  {
+   "text": "a [[[b]]:2]",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 2,
+     "text": "a "
+    },
+    {
+     "until": 10,
+     "text": "a [[b]]"
+    }
+   ]
+  },
+  {
+   "text": "[(a:2):3]",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 3,
+     "text": ""
+    },
+    {
+     "until": 10,
+     "text": "(a:2)"
+    }
+   ]
+  },
+  {
+   "text": "a [b : c : 1] d",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 1,
+     "text": "a b  d"
+    },
+    {
+     "until": 10,
+     "text": "a  c  d"
+    }
+   ]
+  },
+  {
+   "text": "a[b:[c:d:2]:1]e",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 1,
+     "text": "abe"
+    },
+    {
+     "until": 2,
+     "text": "ace"
+    },
+    {
+     "until": 10,
+     "text": "ade"
+    }
+   ]
+  },
+  {
+   "text": "a [unbalanced",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "a [unbalanced"
+    }
+   ]
+  },
+  {
+   "text": "a [b:.5] c",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 5,
+     "text": "a  c"
+    },
+    {
+     "until": 10,
+     "text": "a b c"
+    }
+   ]
+  },
+  {
+   "text": "a [{b|d{:.5] c",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "a [{b|d{:.5] c"
+    }
+   ]
+  },
+  {
+   "text": "((a][:b:c [d:3]",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 3,
+     "text": "((a][:b:c "
+    },
+    {
+     "until": 10,
+     "text": "((a][:b:c d"
+    }
+   ]
+  },
+  {
+   "text": "[a|(b:1.1)]",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 1,
+     "text": "a"
+    },
+    {
+     "until": 2,
+     "text": "(b:1.1)"
+    },
+    {
+     "until": 3,
+     "text": "a"
+    },
+    {
+     "until": 4,
+     "text": "(b:1.1)"
+    },
+    {
+     "until": 5,
+     "text": "a"
+    },
+    {
+     "until": 6,
+     "text": "(b:1.1)"
+    },
+    {
+     "until": 7,
+     "text": "a"
+    },
+    {
+     "until": 8,
+     "text": "(b:1.1)"
+    },
+    {
+     "until": 9,
+     "text": "a"
+    },
+    {
+     "until": 10,
+     "text": "(b:1.1)"
+    }
+   ]
+  },
+  {
+   "text": "[fe|]male",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 1,
+     "text": "female"
+    },
+    {
+     "until": 2,
+     "text": "male"
+    },
+    {
+     "until": 3,
+     "text": "female"
+    },
+    {
+     "until": 4,
+     "text": "male"
+    },
+    {
+     "until": 5,
+     "text": "female"
+    },
+    {
+     "until": 6,
+     "text": "male"
+    },
+    {
+     "until": 7,
+     "text": "female"
+    },
+    {
+     "until": 8,
+     "text": "male"
+    },
+    {
+     "until": 9,
+     "text": "female"
+    },
+    {
+     "until": 10,
+     "text": "male"
+    }
+   ]
+  },
+  {
+   "text": "[fe|||]male",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 1,
+     "text": "female"
+    },
+    {
+     "until": 2,
+     "text": "male"
+    },
+    {
+     "until": 3,
+     "text": "male"
+    },
+    {
+     "until": 4,
+     "text": "male"
+    },
+    {
+     "until": 5,
+     "text": "female"
+    },
+    {
+     "until": 6,
+     "text": "male"
+    },
+    {
+     "until": 7,
+     "text": "male"
+    },
+    {
+     "until": 8,
+     "text": "male"
+    },
+    {
+     "until": 9,
+     "text": "female"
+    },
+    {
+     "until": 10,
+     "text": "male"
+    }
+   ]
+  },
+  {
+   "text": "fantasy landscape with a [mountain:lake:0.25] and [an oak:a christmas tree:0.75][ in foreground::0.6][: in background:0.25] [shoddy:masterful:0.5]",
+   "steps": 100,
+   "entries": [
+    {
+     "until": 25,
+     "text": "fantasy landscape with a mountain and an oak in foreground shoddy"
+    },
+    {
+     "until": 50,
+     "text": "fantasy landscape with a lake and an oak in foreground in background shoddy"
+    },
+    {
+     "until": 60,
+     "text": "fantasy landscape with a lake and an oak in foreground in background masterful"
+    },
+    {
+     "until": 75,
+     "text": "fantasy landscape with a lake and an oak in background masterful"
+    },
+    {
+     "until": 100,
+     "text": "fantasy landscape with a lake and a christmas tree in background masterful"
+    }
+   ]
+  },
+  {
+   "text": "[white|light blue] off-shoulder shirt",
+   "steps": 35,
+   "entries": [
+    {
+     "until": 1,
+     "text": "white off-shoulder shirt"
+    },
+    {
+     "until": 2,
+     "text": "light blue off-shoulder shirt"
+    },
+    {
+     "until": 3,
+     "text": "white off-shoulder shirt"
+    },
+    {
+     "until": 4,
+     "text": "light blue off-shoulder shirt"
+    },
+    {
+     "until": 5,
+     "text": "white off-shoulder shirt"
+    },
+    {
+     "until": 6,
+     "text": "light blue off-shoulder shirt"
+    },
+    {
+     "until": 7,
+     "text": "white off-shoulder shirt"
+    },
+    {
+     "until": 8,
+     "text": "light blue off-shoulder shirt"
+    },
+    {
+     "until": 9,
+     "text": "white off-shoulder shirt"
+    },
+    {
+     "until": 10,
+     "text": "light blue off-shoulder shirt"
+    },
+    {
+     "until": 11,
+     "text": "white off-shoulder shirt"
+    },
+    {
+     "until": 12,
+     "text": "light blue off-shoulder shirt"
+    },
+    {
+     "until": 13,
+     "text": "white off-shoulder shirt"
+    },
+    {
+     "until": 14,
+     "text": "light blue off-shoulder shirt"
+    },
+    {
+     "until": 15,
+     "text": "white off-shoulder shirt"
+    },
+    {
+     "until": 16,
+     "text": "light blue off-shoulder shirt"
+    },
+    {
+     "until": 17,
+     "text": "white off-shoulder shirt"
+    },
+    {
+     "until": 18,
+     "text": "light blue off-shoulder shirt"
+    },
+    {
+     "until": 19,
+     "text": "white off-shoulder shirt"
+    },
+    {
+     "until": 20,
+     "text": "light blue off-shoulder shirt"
+    },
+    {
+     "until": 21,
+     "text": "white off-shoulder shirt"
+    },
+    {
+     "until": 22,
+     "text": "light blue off-shoulder shirt"
+    },
+    {
+     "until": 23,
+     "text": "white off-shoulder shirt"
+    },
+    {
+     "until": 24,
+     "text": "light blue off-shoulder shirt"
+    },
+    {
+     "until": 25,
+     "text": "white off-shoulder shirt"
+    },
+    {
+     "until": 26,
+     "text": "light blue off-shoulder shirt"
+    },
+    {
+     "until": 27,
+     "text": "white off-shoulder shirt"
+    },
+    {
+     "until": 28,
+     "text": "light blue off-shoulder shirt"
+    },
+    {
+     "until": 29,
+     "text": "white off-shoulder shirt"
+    },
+    {
+     "until": 30,
+     "text": "light blue off-shoulder shirt"
+    },
+    {
+     "until": 31,
+     "text": "white off-shoulder shirt"
+    },
+    {
+     "until": 32,
+     "text": "light blue off-shoulder shirt"
+    },
+    {
+     "until": 33,
+     "text": "white off-shoulder shirt"
+    },
+    {
+     "until": 34,
+     "text": "light blue off-shoulder shirt"
+    },
+    {
+     "until": 35,
+     "text": "white off-shoulder shirt"
+    }
+   ]
+  },
+  {
+   "text": "[white|light blue] off-shoulder shirt",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 1,
+     "text": "white off-shoulder shirt"
+    },
+    {
+     "until": 2,
+     "text": "light blue off-shoulder shirt"
+    },
+    {
+     "until": 3,
+     "text": "white off-shoulder shirt"
+    },
+    {
+     "until": 4,
+     "text": "light blue off-shoulder shirt"
+    }
+   ]
+  },
+  {
+   "text": "a [cat:dog:0.5] on a mat",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 10,
+     "text": "a cat on a mat"
+    },
+    {
+     "until": 20,
+     "text": "a dog on a mat"
+    }
+   ]
+  },
+  {
+   "text": "a [cat:dog:10] on a mat",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 10,
+     "text": "a cat on a mat"
+    },
+    {
+     "until": 20,
+     "text": "a dog on a mat"
+    }
+   ]
+  },
+  {
+   "text": "a [cat::0.3] b",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 6,
+     "text": "a cat b"
+    },
+    {
+     "until": 20,
+     "text": "a  b"
+    }
+   ]
+  },
+  {
+   "text": "a [:cat:0.3] b",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 6,
+     "text": "a  b"
+    },
+    {
+     "until": 20,
+     "text": "a cat b"
+    }
+   ]
+  },
+  {
+   "text": "no scheduling here",
+   "steps": 35,
+   "entries": [
+    {
+     "until": 35,
+     "text": "no scheduling here"
+    }
+   ]
+  },
+  {
+   "text": "[a|b|c]",
+   "steps": 7,
+   "entries": [
+    {
+     "until": 1,
+     "text": "a"
+    },
+    {
+     "until": 2,
+     "text": "b"
+    },
+    {
+     "until": 3,
+     "text": "c"
+    },
+    {
+     "until": 4,
+     "text": "a"
+    },
+    {
+     "until": 5,
+     "text": "b"
+    },
+    {
+     "until": 6,
+     "text": "c"
+    },
+    {
+     "until": 7,
+     "text": "a"
+    }
+   ]
+  },
+  {
+   "text": "[a:b:0]",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "b"
+    }
+   ]
+  },
+  {
+   "text": "[a:b:1]",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 1,
+     "text": "a"
+    },
+    {
+     "until": 10,
+     "text": "b"
+    }
+   ]
+  },
+  {
+   "text": "[a:b:99]",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "a"
+    }
+   ]
+  },
+  {
+   "text": "nested [a|[b:c:0.5]]",
+   "steps": 8,
+   "entries": [
+    {
+     "until": 1,
+     "text": "nested a"
+    },
+    {
+     "until": 2,
+     "text": "nested b"
+    },
+    {
+     "until": 3,
+     "text": "nested a"
+    },
+    {
+     "until": 4,
+     "text": "nested b"
+    },
+    {
+     "until": 5,
+     "text": "nested a"
+    },
+    {
+     "until": 6,
+     "text": "nested c"
+    },
+    {
+     "until": 7,
+     "text": "nested a"
+    },
+    {
+     "until": 8,
+     "text": "nested c"
+    }
+   ]
+  },
+  {
+   "text": "",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": ""
+    }
+   ]
+  },
+  {
+   "text": "a|b",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "a|b"
+    }
+   ]
+  },
+  {
+   "text": "(a|b)",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "(a|b)"
+    }
+   ]
+  },
+  {
+   "text": "[(a|b)]",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "[(a|b)]"
+    }
+   ]
+  },
+  {
+   "text": "{a|b}",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "{a|b}"
+    }
+   ]
+  },
+  {
+   "text": "a [b|c] d|e",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "a [b|c] d|e"
+    }
+   ]
+  },
+  {
+   "text": "a \\| b",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "a \\| b"
+    }
+   ]
+  },
+  {
+   "text": "[a:[b|c]:0.5]",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 1,
+     "text": "a"
+    },
+    {
+     "until": 2,
+     "text": "a"
+    },
+    {
+     "until": 3,
+     "text": "a"
+    },
+    {
+     "until": 4,
+     "text": "a"
+    },
+    {
+     "until": 5,
+     "text": "a"
+    },
+    {
+     "until": 6,
+     "text": "c"
+    },
+    {
+     "until": 7,
+     "text": "b"
+    },
+    {
+     "until": 8,
+     "text": "c"
+    },
+    {
+     "until": 9,
+     "text": "b"
+    },
+    {
+     "until": 10,
+     "text": "c"
+    }
+   ]
+  },
+  {
+   "text": "a [b|c",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "a [b|c"
+    }
+   ]
+  },
+  {
+   "text": "[[a|b]]",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 1,
+     "text": "[a]"
+    },
+    {
+     "until": 2,
+     "text": "[b]"
+    },
+    {
+     "until": 3,
+     "text": "[a]"
+    },
+    {
+     "until": 4,
+     "text": "[b]"
+    }
+   ]
+  },
+  {
+   "text": "[a|b:0.5]",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "[a|b:0.5]"
+    }
+   ]
+  },
+  {
+   "text": "[a|b:c]",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "[a|b:c]"
+    }
+   ]
+  },
+  {
+   "text": "[a:1|b]",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "[a:1|b]"
+    }
+   ]
+  },
+  {
+   "text": "[a|b:]",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "[a|b:]"
+    }
+   ]
+  },
+  {
+   "text": "[a|b|c:2]",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "[a|b|c:2]"
+    }
+   ]
+  },
+  {
+   "text": "[a|(b:0.5)]",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 1,
+     "text": "a"
+    },
+    {
+     "until": 2,
+     "text": "(b:0.5)"
+    },
+    {
+     "until": 3,
+     "text": "a"
+    },
+    {
+     "until": 4,
+     "text": "(b:0.5)"
+    }
+   ]
+  },
+  {
+   "text": "\\( |",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "\\( |"
+    }
+   ]
+  },
+  {
+   "text": ":cat}BREAK(BREAK",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": ":cat}BREAK(BREAK"
+    }
+   ]
+  },
+  {
+   "text": ":2a",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": ":2a"
+    }
+   ]
+  },
+  {
+   "text": ".5:0.5",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": ".5:0.5"
+    }
+   ]
+  },
+  {
+   "text": ":2\\|(.5bb\\|x yBREAK",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": ":2\\|(.5bb\\|x yBREAK"
+    }
+   ]
+  },
+  {
+   "text": "{.5 a1girlcata",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "{.5 a1girlcata"
+    }
+   ]
+  },
+  {
+   "text": ":2\\|",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": ":2\\|"
+    }
+   ]
+  },
+  {
+   "text": "dog\\(.5",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "dog\\(.5"
+    }
+   ]
+  },
+  {
+   "text": "{, {:1girldog:1.3{{",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "{, {:1girldog:1.3{{"
+    }
+   ]
+  },
+  {
+   "text": "b",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "b"
+    }
+   ]
+  },
+  {
+   "text": "b",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "b"
+    }
+   ]
+  },
+  {
+   "text": "cat:0.5[\\():2)",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "cat:0.5[\\():2)"
+    }
+   ]
+  },
+  {
+   "text": "[\\([:b]",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "[\\([:b]"
+    }
+   ]
+  },
+  {
+   "text": ":1.3[adog.5",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": ":1.3[adog.5"
+    }
+   ]
+  },
+  {
+   "text": ":1.3).5|:1.3)dog, ",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": ":1.3).5|:1.3)dog, "
+    }
+   ]
+  },
+  {
+   "text": "ab",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "ab"
+    }
+   ]
+  },
+  {
+   "text": ":\\|}\\|x y:)(1girl",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": ":\\|}\\|x y:)(1girl"
+    }
+   ]
+  },
+  {
+   "text": "cat\\||, , :0.5\\(",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "cat\\||, , :0.5\\("
+    }
+   ]
+  },
+  {
+   "text": "[\\|aabb",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "[\\|aabb"
+    }
+   ]
+  },
+  {
+   "text": " :",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": " :"
+    }
+   ]
+  },
+  {
+   "text": "b(:0.5:2:0.5b:1.3:0.5cat",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "b(:0.5:2:0.5b:1.3:0.5cat"
+    }
+   ]
+  },
+  {
+   "text": " :0.5)x y, \\(:1.3b",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": " :0.5)x y, \\(:1.3b"
+    }
+   ]
+  },
+  {
+   "text": "(x y:1.3]a, ](",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "(x y:1.3]a, ]("
+    }
+   ]
+  },
+  {
+   "text": " x ydog\\(:[",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": " x ydog\\(:["
+    }
+   ]
+  },
+  {
+   "text": "dogBREAK]BREAK(, :0.5, ",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "dogBREAK]BREAK(, :0.5, "
+    }
+   ]
+  },
+  {
+   "text": "\\(1girl ([ ",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "\\(1girl ([ "
+    }
+   ]
+  },
+  {
+   "text": ".5:",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": ".5:"
+    }
+   ]
+  },
+  {
+   "text": ":0.5\\(aBREAK1girldog",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": ":0.5\\(aBREAK1girldog"
+    }
+   ]
+  },
+  {
+   "text": "\\( BREAK:2dog|:.5",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "\\( BREAK:2dog|:.5"
+    }
+   ]
+  },
+  {
+   "text": "[bx y\\|",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "[bx y\\|"
+    }
+   ]
+  },
+  {
+   "text": "(.5:2",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "(.5:2"
+    }
+   ]
+  },
+  {
+   "text": "cat1girl}.5",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "cat1girl}.5"
+    }
+   ]
+  },
+  {
+   "text": "\\|1girl(",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "\\|1girl("
+    }
+   ]
+  },
+  {
+   "text": "\\(",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "\\("
+    }
+   ]
+  },
+  {
+   "text": "]a",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "]a"
+    }
+   ]
+  },
+  {
+   "text": ":0.5a({x y",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": ":0.5a({x y"
+    }
+   ]
+  },
+  {
+   "text": "BREAK |]cat b} ",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "BREAK |]cat b} "
+    }
+   ]
+  },
+  {
+   "text": ":0.51girlx yb \\|)x y",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": ":0.51girlx yb \\|)x y"
+    }
+   ]
+  },
+  {
+   "text": "|]dog(|dog",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "|]dog(|dog"
+    }
+   ]
+  },
+  {
+   "text": "cat[1girl |",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "cat[1girl |"
+    }
+   ]
+  },
+  {
+   "text": ":1.3)a\\|x y",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": ":1.3)a\\|x y"
+    }
+   ]
+  },
+  {
+   "text": ".5doga\\|:, ",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": ".5doga\\|:, "
+    }
+   ]
+  },
+  {
+   "text": "dog.5 ]doga",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "dog.5 ]doga"
+    }
+   ]
+  },
+  {
+   "text": "\\(:2acatBREAKBREAK",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "\\(:2acatBREAKBREAK"
+    }
+   ]
+  },
+  {
+   "text": "|catdog.5dog",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "|catdog.5dog"
+    }
+   ]
+  },
+  {
+   "text": "1girl:1.3|a|}",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "1girl:1.3|a|}"
+    }
+   ]
+  },
+  {
+   "text": "[::2}(b:2[|",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "[::2}(b:2[|"
+    }
+   ]
+  },
+  {
+   "text": "1girl",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "1girl"
+    }
+   ]
+  },
+  {
+   "text": ")]b1girl",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": ")]b1girl"
+    }
+   ]
+  },
+  {
+   "text": "a, :2.5a |\\(",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "a, :2.5a |\\("
+    }
+   ]
+  },
+  {
+   "text": "b\\( .5)",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "b\\( .5)"
+    }
+   ]
+  },
+  {
+   "text": "\\|:21girl",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "\\|:21girl"
+    }
+   ]
+  },
+  {
+   "text": "( [",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "( ["
+    }
+   ]
+  },
+  {
+   "text": "\\| ",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "\\| "
+    }
+   ]
+  },
+  {
+   "text": "|",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "|"
+    }
+   ]
+  },
+  {
+   "text": "{|}:1.3\\([",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "{|}:1.3\\(["
+    }
+   ]
+  },
+  {
+   "text": ".5doga:1.3",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": ".5doga:1.3"
+    }
+   ]
+  },
+  {
+   "text": ".5[, ",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": ".5[, "
+    }
+   ]
+  },
+  {
+   "text": "\\(b",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "\\(b"
+    }
+   ]
+  },
+  {
+   "text": ":2BREAK), .5",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": ":2BREAK), .5"
+    }
+   ]
+  },
+  {
+   "text": "dogBREAK",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "dogBREAK"
+    }
+   ]
+  },
+  {
+   "text": ", .5\\|b1girl",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": ", .5\\|b1girl"
+    }
+   ]
+  },
+  {
+   "text": "}",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "}"
+    }
+   ]
+  },
+  {
+   "text": ":0.5] , ",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": ":0.5] , "
+    }
+   ]
+  },
+  {
+   "text": "   (:2b x y",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "   (:2b x y"
+    }
+   ]
+  },
+  {
+   "text": ":2[b\\(dogcat:0.5x y\\|",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": ":2[b\\(dogcat:0.5x y\\|"
+    }
+   ]
+  },
+  {
+   "text": ":(x ya",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": ":(x ya"
+    }
+   ]
+  },
+  {
+   "text": ":2catBREAK:1.3bdog: {",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": ":2catBREAK:1.3bdog: {"
+    }
+   ]
+  },
+  {
+   "text": ", x y}\\|a",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": ", x y}\\|a"
+    }
+   ]
+  },
+  {
+   "text": "BREAK|:1.3:",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "BREAK|:1.3:"
+    }
+   ]
+  },
+  {
+   "text": ", dog|BREAK1girlcat.5\\(]",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": ", dog|BREAK1girlcat.5\\(]"
+    }
+   ]
+  },
+  {
+   "text": "1girlx y:1.3{x yba",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "1girlx y:1.3{x yba"
+    }
+   ]
+  },
+  {
+   "text": "}b, |",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "}b, |"
+    }
+   ]
+  },
+  {
+   "text": ":2a}:1.3b|",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": ":2a}:1.3b|"
+    }
+   ]
+  },
+  {
+   "text": "[",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "["
+    }
+   ]
+  },
+  {
+   "text": "{b\\|\\|][|{",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "{b\\|\\|][|{"
+    }
+   ]
+  },
+  {
+   "text": ":0.5",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": ":0.5"
+    }
+   ]
+  },
+  {
+   "text": "BREAK::\\|",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "BREAK::\\|"
+    }
+   ]
+  },
+  {
+   "text": "dog.5dog",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "dog.5dog"
+    }
+   ]
+  },
+  {
+   "text": "(cat:x y|.5",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "(cat:x y|.5"
+    }
+   ]
+  },
+  {
+   "text": "cat:0.5, \\|",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "cat:0.5, \\|"
+    }
+   ]
+  },
+  {
+   "text": "[BREAK|\\(a[\\|\\|dog",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "[BREAK|\\(a[\\|\\|dog"
+    }
+   ]
+  },
+  {
+   "text": "}BREAK\\(:0.5)",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "}BREAK\\(:0.5)"
+    }
+   ]
+  },
+  {
+   "text": "{BREAK:0.5x y",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "{BREAK:0.5x y"
+    }
+   ]
+  },
+  {
+   "text": ":2\\|{",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": ":2\\|{"
+    }
+   ]
+  },
+  {
+   "text": "  (a(}",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "  (a(}"
+    }
+   ]
+  },
+  {
+   "text": "\\(:1.3a",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "\\(:1.3a"
+    }
+   ]
+  },
+  {
+   "text": "\\|:0.5dog",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "\\|:0.5dog"
+    }
+   ]
+  },
+  {
+   "text": ":",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": ":"
+    }
+   ]
+  },
+  {
+   "text": "cat:0.5b",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "cat:0.5b"
+    }
+   ]
+  },
+  {
+   "text": "(}\\(",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "(}\\("
+    }
+   ]
+  },
+  {
+   "text": "|BREAKcat.5 ",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "|BREAKcat.5 "
+    }
+   ]
+  },
+  {
+   "text": "|\\|BREAK",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "|\\|BREAK"
+    }
+   ]
+  },
+  {
+   "text": "b",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "b"
+    }
+   ]
+  },
+  {
+   "text": "{1girl",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "{1girl"
+    }
+   ]
+  },
+  {
+   "text": "cat:1.3[|",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "cat:1.3[|"
+    }
+   ]
+  },
+  {
+   "text": "\\|.5:1.3",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "\\|.5:1.3"
+    }
+   ]
+  },
+  {
+   "text": "{):1.3:0.5]",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "{):1.3:0.5]"
+    }
+   ]
+  },
+  {
+   "text": "BREAK}[:0.51girl] ",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "BREAK}[:0.51girl] "
+    }
+   ]
+  },
+  {
+   "text": "\\|(\\|}",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "\\|(\\|}"
+    }
+   ]
+  },
+  {
+   "text": ":1.3):cat1girlx y:0.5",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": ":1.3):cat1girlx y:0.5"
+    }
+   ]
+  },
+  {
+   "text": "1girl::1.3, )BREAK}\\|}",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "1girl::1.3, )BREAK}\\|}"
+    }
+   ]
+  },
+  {
+   "text": "(:dog",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "(:dog"
+    }
+   ]
+  },
+  {
+   "text": "]",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "]"
+    }
+   ]
+  },
+  {
+   "text": ".5:2dog[, :0.5",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": ".5:2dog[, :0.5"
+    }
+   ]
+  },
+  {
+   "text": "1girl1girla\\(BREAK\\(",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "1girl1girla\\(BREAK\\("
+    }
+   ]
+  },
+  {
+   "text": "(||",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "(||"
+    }
+   ]
+  },
+  {
+   "text": "\\( :1.3[dog}",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "\\( :1.3[dog}"
+    }
+   ]
+  },
+  {
+   "text": "\\|aBREAK,  [:0.5cat",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "\\|aBREAK,  [:0.5cat"
+    }
+   ]
+  },
+  {
+   "text": "a|{\\(:0.5{)b:0.5",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "a|{\\(:0.5{)b:0.5"
+    }
+   ]
+  },
+  {
+   "text": ":0.5, b|b}:2:{",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": ":0.5, b|b}:2:{"
+    }
+   ]
+  },
+  {
+   "text": "]a",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "]a"
+    }
+   ]
+  },
+  {
+   "text": "}1girl x y",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "}1girl x y"
+    }
+   ]
+  },
+  {
+   "text": "]:0.5:0.5:2)), ",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "]:0.5:0.5:2)), "
+    }
+   ]
+  },
+  {
+   "text": ".5\\|[.5",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": ".5\\|[.5"
+    }
+   ]
+  },
+  {
+   "text": "|]1girlb\\|dog",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "|]1girlb\\|dog"
+    }
+   ]
+  },
+  {
+   "text": ":2{.5, cat:1.3",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": ":2{.5, cat:1.3"
+    }
+   ]
+  },
+  {
+   "text": "dog",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "dog"
+    }
+   ]
+  },
+  {
+   "text": ":0.5:1.3",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": ":0.5:1.3"
+    }
+   ]
+  },
+  {
+   "text": "a[}}\\|(",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "a[}}\\|("
+    }
+   ]
+  },
+  {
+   "text": "1girl.5a\\(1girl:1.3[ .5",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "1girl.5a\\(1girl:1.3[ .5"
+    }
+   ]
+  },
+  {
+   "text": "::2",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "::2"
+    }
+   ]
+  },
+  {
+   "text": "catb:, {[",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "catb:, {["
+    }
+   ]
+  },
+  {
+   "text": ":x y[|]",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 1,
+     "text": ":x y"
+    },
+    {
+     "until": 2,
+     "text": ":x y"
+    },
+    {
+     "until": 3,
+     "text": ":x y"
+    },
+    {
+     "until": 4,
+     "text": ":x y"
+    },
+    {
+     "until": 5,
+     "text": ":x y"
+    },
+    {
+     "until": 6,
+     "text": ":x y"
+    },
+    {
+     "until": 7,
+     "text": ":x y"
+    },
+    {
+     "until": 8,
+     "text": ":x y"
+    },
+    {
+     "until": 9,
+     "text": ":x y"
+    },
+    {
+     "until": 10,
+     "text": ":x y"
+    },
+    {
+     "until": 11,
+     "text": ":x y"
+    },
+    {
+     "until": 12,
+     "text": ":x y"
+    },
+    {
+     "until": 13,
+     "text": ":x y"
+    },
+    {
+     "until": 14,
+     "text": ":x y"
+    },
+    {
+     "until": 15,
+     "text": ":x y"
+    },
+    {
+     "until": 16,
+     "text": ":x y"
+    },
+    {
+     "until": 17,
+     "text": ":x y"
+    },
+    {
+     "until": 18,
+     "text": ":x y"
+    },
+    {
+     "until": 19,
+     "text": ":x y"
+    },
+    {
+     "until": 20,
+     "text": ":x y"
+    }
+   ]
+  },
+  {
+   "text": ".5BREAK{cat(:, x y, ",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": ".5BREAK{cat(:, x y, "
+    }
+   ]
+  },
+  {
+   "text": "\\(dog:2.5(([)]",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "\\(dog:2.5(([)]"
+    }
+   ]
+  },
+  {
+   "text": "cat1girl[",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "cat1girl["
+    }
+   ]
+  },
+  {
+   "text": " cat\\|dog(1girl",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": " cat\\|dog(1girl"
+    }
+   ]
+  },
+  {
+   "text": ":0.5{:2",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": ":0.5{:2"
+    }
+   ]
+  },
+  {
+   "text": "a{:2",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "a{:2"
+    }
+   ]
+  },
+  {
+   "text": ":2 BREAK][",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": ":2 BREAK]["
+    }
+   ]
+  },
+  {
+   "text": "a[a(",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "a[a("
+    }
+   ]
+  },
+  {
+   "text": ":1.3",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": ":1.3"
+    }
+   ]
+  },
+  {
+   "text": ":1.3{",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": ":1.3{"
+    }
+   ]
+  },
+  {
+   "text": "[\\|{cat)x y:1.3",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "[\\|{cat)x y:1.3"
+    }
+   ]
+  },
+  {
+   "text": "cat:[)[:1.3()",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "cat:[)[:1.3()"
+    }
+   ]
+  },
+  {
+   "text": "BREAKa(BREAKdog:1.3a[",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "BREAKa(BREAKdog:1.3a["
+    }
+   ]
+  },
+  {
+   "text": "x y:0.5\\(cat)\\|, ",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "x y:0.5\\(cat)\\|, "
+    }
+   ]
+  },
+  {
+   "text": "a{]",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "a{]"
+    }
+   ]
+  },
+  {
+   "text": "dog:1.3",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "dog:1.3"
+    }
+   ]
+  },
+  {
+   "text": "x y}{:2",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "x y}{:2"
+    }
+   ]
+  },
+  {
+   "text": "1girl",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "1girl"
+    }
+   ]
+  },
+  {
+   "text": "a).5]a, :2(]",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "a).5]a, :2(]"
+    }
+   ]
+  },
+  {
+   "text": "x y",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "x y"
+    }
+   ]
+  },
+  {
+   "text": "]",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "]"
+    }
+   ]
+  },
+  {
+   "text": "(:({||.51girl:0.5",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "(:({||.51girl:0.5"
+    }
+   ]
+  },
+  {
+   "text": "{ :1.3, \\((",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "{ :1.3, \\(("
+    }
+   ]
+  },
+  {
+   "text": "1girldog",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "1girldog"
+    }
+   ]
+  },
+  {
+   "text": ":0.5dog.5b :2",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": ":0.5dog.5b :2"
+    }
+   ]
+  },
+  {
+   "text": "1girl}:2",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "1girl}:2"
+    }
+   ]
+  },
+  {
+   "text": ":1.3:2x y:0.5{, ",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": ":1.3:2x y:0.5{, "
+    }
+   ]
+  },
+  {
+   "text": " :0.5",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": " :0.5"
+    }
+   ]
+  },
+  {
+   "text": "(cat(ax y, 1girl",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "(cat(ax y, 1girl"
+    }
+   ]
+  },
+  {
+   "text": ":2\\| ",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": ":2\\| "
+    }
+   ]
+  },
+  {
+   "text": "{[.5 dog",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "{[.5 dog"
+    }
+   ]
+  },
+  {
+   "text": "1girl{{x y",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "1girl{{x y"
+    }
+   ]
+  },
+  {
+   "text": "]:2a{",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "]:2a{"
+    }
+   ]
+  },
+  {
+   "text": "x y]",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "x y]"
+    }
+   ]
+  },
+  {
+   "text": "){|:1.3)}x y",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "){|:1.3)}x y"
+    }
+   ]
+  },
+  {
+   "text": "\\(BREAKcat1girl\\(aa]dog",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "\\(BREAKcat1girl\\(aa]dog"
+    }
+   ]
+  },
+  {
+   "text": "}b{adogdog",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "}b{adogdog"
+    }
+   ]
+  },
+  {
+   "text": "a:dog\\(}:",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "a:dog\\(}:"
+    }
+   ]
+  },
+  {
+   "text": ".5)1girldogx y",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": ".5)1girldogx y"
+    }
+   ]
+  },
+  {
+   "text": "BREAK:2catb):1.3cat.5",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "BREAK:2catb):1.3cat.5"
+    }
+   ]
+  },
+  {
+   "text": "{\\(x y\\(b",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "{\\(x y\\(b"
+    }
+   ]
+  },
+  {
+   "text": ".5[|b:0.51girl",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": ".5[|b:0.51girl"
+    }
+   ]
+  },
+  {
+   "text": "\\|(:2, }b:(dog",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "\\|(:2, }b:(dog"
+    }
+   ]
+  },
+  {
+   "text": "BREAKdogx y",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "BREAKdogx y"
+    }
+   ]
+  },
+  {
+   "text": ":1.3}|dogx y",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": ":1.3}|dogx y"
+    }
+   ]
+  },
+  {
+   "text": "{[{]{1girl\\| ",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "{[{]{1girl\\| "
+    }
+   ]
+  },
+  {
+   "text": "[\\|.5(cat",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "[\\|.5(cat"
+    }
+   ]
+  },
+  {
+   "text": "a])b [b{cat",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "a])b [b{cat"
+    }
+   ]
+  },
+  {
+   "text": "cat][\\|b",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "cat][\\|b"
+    }
+   ]
+  },
+  {
+   "text": "|x ya1girlbcat",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "|x ya1girlbcat"
+    }
+   ]
+  },
+  {
+   "text": "dog",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "dog"
+    }
+   ]
+  },
+  {
+   "text": "BREAKcat",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "BREAKcat"
+    }
+   ]
+  },
+  {
+   "text": "\\| \\(x ya{}:0.5",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "\\| \\(x ya{}:0.5"
+    }
+   ]
+  },
+  {
+   "text": ":0.5, ",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": ":0.5, "
+    }
+   ]
+  },
+  {
+   "text": "()cat:2dog",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "()cat:2dog"
+    }
+   ]
+  },
+  {
+   "text": "\\(()x ycatb",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "\\(()x ycatb"
+    }
+   ]
+  },
+  {
+   "text": ", 1girl:1.3:1.3:1.3]cat",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": ", 1girl:1.3:1.3:1.3]cat"
+    }
+   ]
+  },
+  {
+   "text": ")1girl",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": ")1girl"
+    }
+   ]
+  },
+  {
+   "text": "b|.5:x yb",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "b|.5:x yb"
+    }
+   ]
+  },
+  {
+   "text": "1girl.5BREAK:1.3, :2",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "1girl.5BREAK:1.3, :2"
+    }
+   ]
+  },
+  {
+   "text": "{]bx y.5}x y",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "{]bx y.5}x y"
+    }
+   ]
+  },
+  {
+   "text": "} [",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "} ["
+    }
+   ]
+  },
+  {
+   "text": "\\(a",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "\\(a"
+    }
+   ]
+  },
+  {
+   "text": ", ",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": ", "
+    }
+   ]
+  },
+  {
+   "text": "|",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "|"
+    }
+   ]
+  },
+  {
+   "text": ":2x y])x y:1.3",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": ":2x y])x y:1.3"
+    }
+   ]
+  },
+  {
+   "text": "{ba:1.3\\|:2, .5",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "{ba:1.3\\|:2, .5"
+    }
+   ]
+  },
+  {
+   "text": "\\|a",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "\\|a"
+    }
+   ]
+  },
+  {
+   "text": "}x y|x y",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "}x y|x y"
+    }
+   ]
+  },
+  {
+   "text": "\\(\\(",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "\\(\\("
+    }
+   ]
+  },
+  {
+   "text": "}}dogx y",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "}}dogx y"
+    }
+   ]
+  },
+  {
+   "text": " BREAK:2\\(dog",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": " BREAK:2\\(dog"
+    }
+   ]
+  },
+  {
+   "text": "[a:0.5:2)]",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "[a:0.5:2)]"
+    }
+   ]
+  },
+  {
+   "text": "b(",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "b("
+    }
+   ]
+  },
+  {
+   "text": ":2dog:2x y}:0.5 :0.5BREAK",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": ":2dog:2x y}:0.5 :0.5BREAK"
+    }
+   ]
+  },
+  {
+   "text": "(:x y:1.3]",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "(:x y:1.3]"
+    }
+   ]
+  },
+  {
+   "text": ":1.3",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": ":1.3"
+    }
+   ]
+  },
+  {
+   "text": "} ",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "} "
+    }
+   ]
+  },
+  {
+   "text": ":\\|(",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": ":\\|("
+    }
+   ]
+  },
+  {
+   "text": "\\|BREAK.5cat]",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "\\|BREAK.5cat]"
+    }
+   ]
+  },
+  {
+   "text": "{{].5dog.5",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "{{].5dog.5"
+    }
+   ]
+  },
+  {
+   "text": ":2):0.5",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": ":2):0.5"
+    }
+   ]
+  },
+  {
+   "text": ":0.5\\(:1.3BREAKb1girl",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": ":0.5\\(:1.3BREAKb1girl"
+    }
+   ]
+  },
+  {
+   "text": "dogBREAK1girla|:2a",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "dogBREAK1girla|:2a"
+    }
+   ]
+  },
+  {
+   "text": "b\\|:1.3]::2",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "b\\|:1.3]::2"
+    }
+   ]
+  },
+  {
+   "text": "|",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "|"
+    }
+   ]
+  },
+  {
+   "text": "bcat 1girl}ba\\|",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "bcat 1girl}ba\\|"
+    }
+   ]
+  },
+  {
+   "text": ":1.3cat\\(cat, }",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": ":1.3cat\\(cat, }"
+    }
+   ]
+  },
+  {
+   "text": "}:2{b.51girlcatdog|",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "}:2{b.51girlcatdog|"
+    }
+   ]
+  },
+  {
+   "text": ", (:1.3",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": ", (:1.3"
+    }
+   ]
+  },
+  {
+   "text": ": :",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": ": :"
+    }
+   ]
+  },
+  {
+   "text": ".5",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": ".5"
+    }
+   ]
+  },
+  {
+   "text": ", )",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": ", )"
+    }
+   ]
+  },
+  {
+   "text": "[[ ",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "[[ "
+    }
+   ]
+  },
+  {
+   "text": " , 1girl:0.51girl, ",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": " , 1girl:0.51girl, "
+    }
+   ]
+  },
+  {
+   "text": ", .5|",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": ", .5|"
+    }
+   ]
+  },
+  {
+   "text": "1girldog}:2:2(:0.5:2\\(",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "1girldog}:2:2(:0.5:2\\("
+    }
+   ]
+  },
+  {
+   "text": "{x y]",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "{x y]"
+    }
+   ]
+  },
+  {
+   "text": "\\(BREAKBREAKb, []",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "\\(BREAKBREAKb, []"
+    }
+   ]
+  },
+  {
+   "text": "(dog\\(1girl",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "(dog\\(1girl"
+    }
+   ]
+  },
+  {
+   "text": "dog\\(:0.5}[}:0.5a, ",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "dog\\(:0.5}[}:0.5a, "
+    }
+   ]
+  },
+  {
+   "text": "|:",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "|:"
+    }
+   ]
+  },
+  {
+   "text": " ], ))|}|",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": " ], ))|}|"
+    }
+   ]
+  },
+  {
+   "text": ":0.5]:0.5}",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": ":0.5]:0.5}"
+    }
+   ]
+  },
+  {
+   "text": " ",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": " "
+    }
+   ]
+  },
+  {
+   "text": ":0.5\\(\\| }x y|:2}",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": ":0.5\\(\\| }x y|:2}"
+    }
+   ]
+  },
+  {
+   "text": "BREAK]dog:0.5[:2",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": "BREAK]dog:0.5[:2"
+    }
+   ]
+  },
+  {
+   "text": "dog[\\(",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "dog[\\("
+    }
+   ]
+  },
+  {
+   "text": "\\(|a",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "\\(|a"
+    }
+   ]
+  },
+  {
+   "text": "dog\\(]:2b[",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "dog\\(]:2b["
+    }
+   ]
+  },
+  {
+   "text": "[}1girldog[",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "[}1girldog["
+    }
+   ]
+  },
+  {
+   "text": "dog a",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "dog a"
+    }
+   ]
+  },
+  {
+   "text": "BREAK, ",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "BREAK, "
+    }
+   ]
+  },
+  {
+   "text": ":2x yx y{",
+   "steps": 10,
+   "entries": [
+    {
+     "until": 10,
+     "text": ":2x yx y{"
+    }
+   ]
+  },
+  {
+   "text": "cat|, ])1girl:",
+   "steps": 20,
+   "entries": [
+    {
+     "until": 20,
+     "text": "cat|, ])1girl:"
+    }
+   ]
+  },
+  {
+   "text": "]",
+   "steps": 4,
+   "entries": [
+    {
+     "until": 4,
+     "text": "]"
+    }
+   ]
+  }
+ ],
+ "a1111_chunks": [
+  {
+   "text": "a red cat",
+   "clip_l": [
+    {
+     "ids": [
+      49406,
+      320,
+      736,
+      2368,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   ],
+   "clip_g": [
+    {
+     "ids": [
+      49406,
+      320,
+      736,
+      2368,
+      49407,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   ]
+  },
+  {
+   "text": "",
+   "clip_l": [
+    {
+     "ids": [
+      49406,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   ],
+   "clip_g": [
+    {
+     "ids": [
+      49406,
+      49407,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   ]
+  },
+  {
+   "text": "a BREAK b",
+   "clip_l": [
+    {
+     "ids": [
+      49406,
+      320,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "ids": [
+      49406,
+      321,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   ],
+   "clip_g": [
+    {
+     "ids": [
+      49406,
+      320,
+      49407,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "ids": [
+      49406,
+      321,
+      49407,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   ]
+  },
+  {
+   "text": "(a:1.2) BREAK (b:0.8)",
+   "clip_l": [
+    {
+     "ids": [
+      49406,
+      320,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.2,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "ids": [
+      49406,
+      321,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407
+     ],
+     "mults": [
+      1.0,
+      0.8,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   ],
+   "clip_g": [
+    {
+     "ids": [
+      49406,
+      320,
+      49407,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "mults": [
+      1.0,
+      1.2,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "ids": [
+      49406,
+      321,
+      49407,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "mults": [
+      1.0,
+      0.8,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   ]
+  },
+  {
+   "text": "cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat",
+   "clip_l": [
+    {
+     "ids": [
+      49406,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "ids": [
+      49406,
+      267,
+      2368,
+      267,
+      2368,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   ],
+   "clip_g": [
+    {
+     "ids": [
+      49406,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "ids": [
+      49406,
+      267,
+      2368,
+      267,
+      2368,
+      49407,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   ]
+  },
+  {
+   "text": "cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat and a very long tail of words to push well past one chunk",
+   "clip_l": [
+    {
+     "ids": [
+      49406,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "ids": [
+      49406,
+      267,
+      2368,
+      267,
+      2368,
+      537,
+      320,
+      1070,
+      1538,
+      4132,
+      539,
+      2709,
+      531,
+      6831,
+      1123,
+      2729,
+      637,
+      30275,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   ],
+   "clip_g": [
+    {
+     "ids": [
+      49406,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "ids": [
+      49406,
+      267,
+      2368,
+      267,
+      2368,
+      537,
+      320,
+      1070,
+      1538,
+      4132,
+      539,
+      2709,
+      531,
+      6831,
+      1123,
+      2729,
+      637,
+      30275,
+      49407,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   ]
+  },
+  {
+   "text": "verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword verylongunbrokenword ",
+   "clip_l": [
+    {
+     "ids": [
+      49406,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "ids": [
+      49406,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "ids": [
+      49406,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "ids": [
+      49406,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   ],
+   "clip_g": [
+    {
+     "ids": [
+      49406,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "ids": [
+      49406,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "ids": [
+      49406,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "ids": [
+      49406,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      11698,
+      1235,
+      2748,
+      26126,
+      2653,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   ]
+  },
+  {
+   "text": "(emphasis:1.3) cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat",
+   "clip_l": [
+    {
+     "ids": [
+      49406,
+      29588,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.3,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "ids": [
+      49406,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   ],
+   "clip_g": [
+    {
+     "ids": [
+      49406,
+      29588,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.3,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "ids": [
+      49406,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      49407,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   ]
+  },
+  {
+   "text": "cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat cat cat cat cat cat cat cat cat cat cat cat ",
+   "clip_l": [
+    {
+     "ids": [
+      49406,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "ids": [
+      49406,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   ],
+   "clip_g": [
+    {
+     "ids": [
+      49406,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      49407,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "ids": [
+      49406,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      49407,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   ]
+  },
+  {
+   "text": "cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat, cat cat cat cat cat cat cat cat cat cat cat cat cat cat cat cat cat cat cat cat cat cat cat cat cat cat cat cat cat cat ",
+   "clip_l": [
+    {
+     "ids": [
+      49406,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "ids": [
+      49406,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   ],
+   "clip_g": [
+    {
+     "ids": [
+      49406,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      267,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "ids": [
+      49406,
+      2368,
+      2368,
+      2368,
+      2368,
+      2368,
+      49407,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   ]
+  },
+  {
+   "text": "1girl, original, general, blonde hair, long hair, ponytail, light blue eyes, (shiny skin:1.1), gentle smile, bare shoulders, collarbone, off-shoulder shirt, sheer sleeves, denim short shorts, holding straw hat, looking back, side angle, upper body, beach, ocean, summer, sunny day, (lens flare:0.75), breeze, BREAK, masterpiece, best quality, very aesthetic, high contrast, vibrant, highres, year 2024, newest,",
+   "clip_l": [
+    {
+     "ids": [
+      49406,
+      272,
+      1611,
+      267,
+      3117,
+      267,
+      3658,
+      267,
+      10711,
+      2225,
+      267,
+      1538,
+      2225,
+      267,
+      43265,
+      267,
+      1395,
+      1746,
+      3095,
+      267,
+      12190,
+      3575,
+      267,
+      13577,
+      3490,
+      267,
+      14318,
+      18738,
+      267,
+      39662,
+      6195,
+      267,
+      1007,
+      268,
+      8476,
+      2523,
+      267,
+      17577,
+      19691,
+      267,
+      13606,
+      3005,
+      9680,
+      267,
+      5050,
+      16438,
+      3801,
+      267,
+      1312,
+      893,
+      267,
+      1145,
+      6946,
+      267,
+      7067,
+      1774,
+      267,
+      2117,
+      267,
+      4918,
+      267,
+      1673,
+      267,
+      5438,
+      575,
+      267,
+      8666,
+      21185,
+      267,
+      13125,
+      267,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.1,
+      1.1,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      0.75,
+      0.75,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "ids": [
+      49406,
+      267,
+      12066,
+      267,
+      949,
+      3027,
+      267,
+      1070,
+      16179,
+      267,
+      1400,
+      18501,
+      267,
+      14270,
+      267,
+      1487,
+      934,
+      267,
+      935,
+      273,
+      271,
+      273,
+      275,
+      267,
+      4990,
+      267,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407,
+      49407
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   ],
+   "clip_g": [
+    {
+     "ids": [
+      49406,
+      272,
+      1611,
+      267,
+      3117,
+      267,
+      3658,
+      267,
+      10711,
+      2225,
+      267,
+      1538,
+      2225,
+      267,
+      43265,
+      267,
+      1395,
+      1746,
+      3095,
+      267,
+      12190,
+      3575,
+      267,
+      13577,
+      3490,
+      267,
+      14318,
+      18738,
+      267,
+      39662,
+      6195,
+      267,
+      1007,
+      268,
+      8476,
+      2523,
+      267,
+      17577,
+      19691,
+      267,
+      13606,
+      3005,
+      9680,
+      267,
+      5050,
+      16438,
+      3801,
+      267,
+      1312,
+      893,
+      267,
+      1145,
+      6946,
+      267,
+      7067,
+      1774,
+      267,
+      2117,
+      267,
+      4918,
+      267,
+      1673,
+      267,
+      5438,
+      575,
+      267,
+      8666,
+      21185,
+      267,
+      13125,
+      267,
+      49407,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.1,
+      1.1,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      0.75,
+      0.75,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "ids": [
+      49406,
+      267,
+      12066,
+      267,
+      949,
+      3027,
+      267,
+      1070,
+      16179,
+      267,
+      1400,
+      18501,
+      267,
+      14270,
+      267,
+      1487,
+      934,
+      267,
+      935,
+      273,
+      271,
+      273,
+      275,
+      267,
+      4990,
+      267,
+      49407,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "mults": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+     ]
+    }
+   ]
+  }
+ ]
+}

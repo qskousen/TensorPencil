@@ -9,6 +9,8 @@
 const std = @import("std");
 const dvui = @import("dvui");
 const config = @import("config.zig");
+const diffuser = @import("diffuser.zig");
+const model_spec = @import("model_spec.zig");
 const SDLBackend = @import("backend");
 
 // SDL owns file picking: SDL_ShowOpen*Dialog parents the native dialog to the
@@ -23,11 +25,41 @@ var g_wakeup: ?*const fn () void = null;
 // second dialog. Cleared in the callback.
 var g_dialog_open: bool = false;
 
+// Memoized checkpoint inspection for the three diffusion path rows (see
+// `model_spec.Cache` — a probe opens and parses a checkpoint header, far too
+// expensive for a per-frame render). Only live once `setEnv` has run.
+var g_spec_ready: bool = false;
+var g_primary_cache: model_spec.Cache = undefined;
+var g_te_cache: model_spec.Cache = undefined;
+var g_te2_cache: model_spec.Cache = undefined;
+var g_vae_cache: model_spec.Cache = undefined;
+
 /// Wire the SDL window + frame-wakeup (called once from app init). Until set,
-/// the pickers no-op (the user can still type a path).
-pub fn setEnv(window: ?*SDLBackend.c.SDL_Window, wakeup: *const fn () void) void {
+/// the pickers no-op (the user can still type a path) and the checkpoint
+/// inspection panel stays hidden.
+pub fn setEnv(
+    window: ?*SDLBackend.c.SDL_Window,
+    wakeup: *const fn () void,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+) void {
     g_window = window;
     g_wakeup = wakeup;
+    g_primary_cache = model_spec.Cache.init(gpa, io);
+    g_te_cache = model_spec.Cache.init(gpa, io);
+    g_te2_cache = model_spec.Cache.init(gpa, io);
+    g_vae_cache = model_spec.Cache.init(gpa, io);
+    g_spec_ready = true;
+}
+
+/// Release the inspection caches (app teardown).
+pub fn deinit() void {
+    if (!g_spec_ready) return;
+    g_primary_cache.deinit();
+    g_te_cache.deinit();
+    g_te2_cache.deinit();
+    g_vae_cache.deinit();
+    g_spec_ready = false;
 }
 
 // Static filter sets — SDL keeps the pointer across the async call, so these
@@ -38,6 +70,14 @@ const gguf_sdl = [_]SDLBackend.c.SDL_DialogFileFilter{
 };
 const safetensors_sdl = [_]SDLBackend.c.SDL_DialogFileFilter{
     .{ .name = "Safetensors", .pattern = "safetensors" },
+    .{ .name = "All files", .pattern = "*" },
+};
+/// The primary diffusion checkpoint may be either container — the pipeline opens
+/// it by MAGIC, not by extension, so the picker must not hide GGUFs.
+const checkpoint_sdl = [_]SDLBackend.c.SDL_DialogFileFilter{
+    .{ .name = "Checkpoints", .pattern = "safetensors;gguf" },
+    .{ .name = "Safetensors", .pattern = "safetensors" },
+    .{ .name = "GGUF", .pattern = "gguf" },
     .{ .name = "All files", .pattern = "*" },
 };
 
@@ -85,6 +125,15 @@ var sys_prompt_name_buf: [config.max_sys_prompt_name]u8 = [_]u8{0} ** config.max
 /// Call when the view is (re)entered so numeric buffers reseed from the config.
 pub fn open() void {
     seeded = false;
+    // Re-read the checkpoints on every visit to Settings. The memo keys on the
+    // path text, so it would otherwise never notice a file REPLACED under an
+    // unchanged path — a once-per-open probe is the cheap way to stay honest.
+    if (g_spec_ready) {
+        g_primary_cache.invalidate();
+        g_te_cache.invalidate();
+        g_te2_cache.invalidate();
+        g_vae_cache.invalidate();
+    }
 }
 
 fn seed(cfg: *const config.Config) void {
@@ -177,15 +226,23 @@ pub fn render(cfg: *config.Config, cb: Callbacks) void {
     defer body.deinit();
 
     section("Models");
-    help("The LLM is required. Diffusion (image generation) needs all three of " ++
-        "diffusion model, text encoder, and VAE. Vision (chatting about images) " ++
-        "needs the vision tower. Any unset feature is simply disabled.");
+    help("The LLM is required for chat. Image generation needs only the diffusion " ++
+        "model: many checkpoints bundle their own text encoder(s) and VAE, and the " ++
+        "encoder/VAE fields below are OVERRIDES — set one only to supply a piece " ++
+        "the checkpoint lacks, or to replace one it has. Vision (chatting about " ++
+        "images) needs the vision tower. Any unset feature is simply disabled.");
     pathRow("LLM model", &cfg.llm_model, &gguf_sdl);
     pathRow("Vision tower", &cfg.vision_tower, &gguf_sdl);
-    pathRow("Diffusion model", &cfg.diffusion_model, &safetensors_sdl);
+    pathRow("Diffusion model", &cfg.diffusion_model, &checkpoint_sdl);
     pathRow("Text encoder", &cfg.text_encoder, &safetensors_sdl);
+    // SDXL's second tower. Always shown rather than revealed only for a detected
+    // SDXL checkpoint: a row that appears and disappears as you edit the path
+    // above it moves everything below, and the panel already says when it is
+    // needed. Ignored by every single-tower architecture.
+    pathRow("Text encoder 2 (SDXL)", &cfg.text_encoder_2, &safetensors_sdl);
     pathRow("VAE", &cfg.vae, &safetensors_sdl);
     pathRow("TAESD preview", &cfg.taesd, &safetensors_sdl);
+    checkpointPanel(cfg);
 
     section("Image generation");
     help("Generated images (chat and the image studio) are saved here as PNGs " ++
@@ -196,6 +253,42 @@ pub fn render(cfg: *config.Config, cb: Callbacks) void {
     numRow("Default width", &width_buf);
     numRow("Default height", &height_buf);
 
+    {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 4 } });
+        defer row.deinit();
+        dvui.label(@src(), "Sampler", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
+        samplerDropdown(&cfg.sampler);
+    }
+    {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 4 } });
+        defer row.deinit();
+        dvui.label(@src(), "Scheduler", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
+        schedulerDropdown(&cfg.scheduler);
+    }
+    {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 4 } });
+        defer row.deinit();
+        dvui.label(@src(), "Prompt syntax", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
+        promptSyntaxDropdown(&cfg.prompt_syntax);
+    }
+    // Only meaningful under the A1111 dialect, so it is hidden otherwise rather than
+    // shown greyed: a visible control that does nothing invites the reading that the
+    // ComfyUI path has a weighting choice too, and it does not.
+    if (cfg.prompt_syntax == .a1111) {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 4 } });
+        defer row.deinit();
+        dvui.label(@src(), "Emphasis", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
+        emphasisDropdown(&cfg.emphasis);
+    }
+    // Deliberately NOT hidden behind `prompt_syntax == .a1111`: the two axes are
+    // independent, and a user reproducing an A1111 image needs to find this one even
+    // when their prompt has no emphasis syntax in it at all.
+    {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 4 } });
+        defer row.deinit();
+        dvui.label(@src(), "Sampling compat", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
+        compatDropdown(&cfg.compat);
+    }
     {
         var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 4 } });
         defer row.deinit();
@@ -398,6 +491,89 @@ fn presetRow(cfg: *config.Config) void {
 /// Enum dropdown for the TAESD preview size. Unlike `dvui.dropdownEnum` (which
 /// shows raw tag names), this renders each option's human-readable `label()`
 /// (e.g. "1/6 latent") since the fractions can't be spelled as enum tags.
+/// Hand-rolled rather than `dvui.dropdownEnum` for the same reason as
+/// `taesdSizeDropdown`: the enum's tag names (`dpmpp_2m_sde_heun`) are the CLI
+/// spelling, not something to show a user.
+fn promptSyntaxDropdown(choice: *config.PromptSyntax) void {
+    var dd: dvui.DropdownWidget = undefined;
+    dd.init(@src(), .{
+        .selected_index = @intFromEnum(choice.*),
+        .label = choice.label(),
+    }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 200 } });
+    defer dd.deinit();
+    if (dd.dropped()) {
+        inline for (@typeInfo(config.PromptSyntax).@"enum".fields) |e| {
+            const opt: config.PromptSyntax = @field(config.PromptSyntax, e.name);
+            if (dd.addChoiceLabel(opt.label())) choice.* = opt;
+        }
+    }
+}
+
+fn compatDropdown(choice: *config.Compat) void {
+    var dd: dvui.DropdownWidget = undefined;
+    dd.init(@src(), .{
+        .selected_index = @intFromEnum(choice.*),
+        .label = choice.label(),
+    }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 260 } });
+    defer dd.deinit();
+    if (dd.dropped()) {
+        inline for (@typeInfo(config.Compat).@"enum".fields) |e| {
+            const opt: config.Compat = @field(config.Compat, e.name);
+            if (dd.addChoiceLabel(opt.label())) choice.* = opt;
+        }
+    }
+}
+
+fn emphasisDropdown(choice: *config.Emphasis) void {
+    var dd: dvui.DropdownWidget = undefined;
+    dd.init(@src(), .{
+        .selected_index = @intFromEnum(choice.*),
+        .label = choice.label(),
+    }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 260 } });
+    defer dd.deinit();
+    if (dd.dropped()) {
+        inline for (@typeInfo(config.Emphasis).@"enum".fields) |e| {
+            const opt: config.Emphasis = @field(config.Emphasis, e.name);
+            if (dd.addChoiceLabel(opt.label())) choice.* = opt;
+        }
+    }
+}
+
+fn samplerDropdown(choice: *config.Sampler) void {
+    var dd: dvui.DropdownWidget = undefined;
+    dd.init(@src(), .{
+        .selected_index = @intFromEnum(choice.*),
+        .label = choice.label(),
+    }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 200 } });
+    defer dd.deinit();
+
+    if (dd.dropped()) {
+        inline for (@typeInfo(config.Sampler).@"enum".fields) |e| {
+            const opt: config.Sampler = @field(config.Sampler, e.name);
+            if (dd.addChoiceLabel(opt.label())) choice.* = opt;
+        }
+    }
+}
+
+/// Wider than the others: two entries carry a "(step count may differ)" warning,
+/// because `ddim_uniform` and `beta` genuinely return a different number of steps than
+/// the Default-steps box asks for.
+fn schedulerDropdown(choice: *config.Scheduler) void {
+    var dd: dvui.DropdownWidget = undefined;
+    dd.init(@src(), .{
+        .selected_index = @intFromEnum(choice.*),
+        .label = choice.label(),
+    }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 260 } });
+    defer dd.deinit();
+
+    if (dd.dropped()) {
+        inline for (@typeInfo(config.Scheduler).@"enum".fields) |e| {
+            const opt: config.Scheduler = @field(config.Scheduler, e.name);
+            if (dd.addChoiceLabel(opt.label())) choice.* = opt;
+        }
+    }
+}
+
 fn taesdSizeDropdown(choice: *config.TaesdSize) void {
     var dd: dvui.DropdownWidget = undefined;
     dd.init(@src(), .{
@@ -490,6 +666,157 @@ fn dirRow(label: []const u8, pb: *config.PathBuf) void {
     if (dvui.button(@src(), "Clear", .{}, .{ .gravity_y = 0.5 })) {
         pb.set("");
     }
+}
+
+// ── Checkpoint inspection panel ───────────────────────────────────────────────
+// What the configured diffusion files actually are, shown under the path rows so
+// the user finds out here rather than from a failed image. Purely informational:
+// it never blocks Apply and never edits the config — `pipeline.Session.init` is
+// the authority, and `model_spec` mirrors just enough of it to give a preview
+// (see that module's advisory warning).
+
+/// A `⚠ …` / `• …` status line. Colored by severity so the two problem kinds
+/// (something is missing, something will refuse to load) stand out from the
+/// several ordinary "this is what you have" lines.
+fn statusLine(text: []const u8, err: bool) void {
+    const theme = dvui.themeGet();
+    // `err.fill` is the theme's alarm color (what a dangerous button is painted
+    // with); `err.text` is the text drawn ON it, so it would be invisible here.
+    const color = if (err) (theme.err.fill orelse theme.text) else theme.text;
+    var tl = dvui.textLayout(@src(), .{}, .{
+        .id_extra = idFor(text),
+        .expand = .horizontal,
+        .padding = .{ .x = 12, .h = 2 },
+        .color_text = color,
+    });
+    defer tl.deinit();
+    tl.addText(text, .{});
+}
+
+/// Same, for a line that needs formatting. `buf` is the caller's scratch.
+fn statusFmt(buf: []u8, comptime fmt: []const u8, args: anytype, err: bool) void {
+    statusLine(std.fmt.bufPrint(buf, fmt, args) catch fmt, err);
+}
+
+fn checkpointPanel(cfg: *config.Config) void {
+    if (!g_spec_ready) return;
+    const path = cfg.diffusion_model.opt() orelse return;
+
+    var buf: [512]u8 = undefined;
+    const probe = g_primary_cache.primary(path);
+    const info = switch (probe) {
+        .unset => return,
+        .failed => |err| {
+            statusFmt(&buf, "⚠ could not read this checkpoint: {t}", .{err}, true);
+            if (err == error.UnknownArchitecture) statusLine(
+                "  Its tensor names match no architecture this build knows " ++
+                    "(supported: krea2 flow-matching DiT, SD1.5 and SDXL UNets).",
+                true,
+            );
+            return;
+        },
+        .ok => |i| i,
+    };
+
+    const t = model_spec.traits(info.family);
+    statusFmt(&buf, "• Architecture: {s}", .{t.label}, false);
+
+    // What the primary file carries, and what the overrides add. An override is
+    // reported even when the checkpoint has its own copy — that is the case where
+    // knowing which one wins actually matters.
+    const te_set = cfg.text_encoder.opt();
+    const te2_set = cfg.text_encoder_2.opt();
+    const vae_set = cfg.vae.opt();
+    if (info.isComplete()) {
+        statusLine("• This checkpoint bundles every piece it needs — no other files required.", false);
+    } else {
+        statusFmt(&buf, "• This checkpoint contains: denoiser{s}{s}{s}", .{
+            if (info.contents.conditioner) " + text encoder" else "",
+            if (t.dual_conditioner and info.contents.conditioner2) " + text encoder 2" else "",
+            if (info.contents.decoder) " + VAE" else "",
+        }, false);
+    }
+    if (te_set != null and info.contents.conditioner)
+        statusLine("• Text encoder override set: it replaces the one in the checkpoint.", false);
+    if (te2_set != null and t.dual_conditioner and info.contents.conditioner2)
+        statusLine("• Text encoder 2 override set: it replaces the one in the checkpoint.", false);
+    // A second-tower path set for an architecture that has no second tower is
+    // silently unused by the pipeline; say so rather than let it look effective.
+    if (te2_set != null and !t.dual_conditioner)
+        statusFmt(&buf, "• Text encoder 2 is ignored: {s} has a single text encoder.", .{t.label}, false);
+    if (vae_set != null and info.contents.decoder)
+        statusLine("• VAE override set: it replaces the one in the checkpoint.", false);
+
+    const miss = model_spec.missing(info, .{
+        .conditioner = te_set != null,
+        .conditioner2 = te2_set != null,
+        .decoder = vae_set != null,
+    });
+    if (miss.conditioner) statusLine("⚠ No text encoder: this checkpoint has none, and no override is set.", true);
+    if (miss.conditioner2) statusLine(
+        "⚠ No second text encoder: SDXL needs both CLIP towers, this checkpoint " ++
+            "carries only the first, and no override is set.",
+        true,
+    );
+    if (miss.decoder) statusLine("⚠ No VAE: this checkpoint has none, and no override is set.", true);
+
+    // An override that does not hold what it is being asked for. This is the trap
+    // that catches an upgrade in particular: switch the primary checkpoint to a
+    // bundled SD1.5 file and leave krea2's encoder path set, and the resolver
+    // (rightly) prefers the explicit file, opens krea2's qwen3 encoder, hunts for
+    // CLIP's tensors in it and reports `ComponentNotInCheckpoint` — an error that
+    // names neither the file nor the reason. Say it here instead.
+    //
+    // Reported, never enforced: silently ignoring a path the user set would be a
+    // worse failure than a loud one, and the probe names are only a mirror of the
+    // pipeline's (see model_spec's advisory note).
+    if (te_set) |p| switch (g_te_cache.side(p, info.family)) {
+        .failed => |err| statusFmt(&buf, "⚠ the text encoder override could not be read: {t}", .{err}, true),
+        .ok => |i| if (!i.contents.conditioner) statusFmt(
+            &buf,
+            "⚠ the text encoder override holds no {s} text encoder. Clear it, or the load will fail.",
+            .{t.label},
+            true,
+        ),
+        .unset => {},
+    };
+    if (te2_set) |p| if (t.dual_conditioner) switch (g_te2_cache.side(p, info.family)) {
+        .failed => |err| statusFmt(&buf, "⚠ the second text encoder override could not be read: {t}", .{err}, true),
+        .ok => |i| if (!i.contents.conditioner2) statusFmt(
+            &buf,
+            "⚠ the second text encoder override holds no {s} OpenCLIP tower. Clear it, or the load will fail.",
+            .{t.label},
+            true,
+        ),
+        .unset => {},
+    };
+    if (vae_set) |p| switch (g_vae_cache.side(p, info.family)) {
+        .failed => |err| statusFmt(&buf, "⚠ the VAE override could not be read: {t}", .{err}, true),
+        .ok => |i| if (!i.contents.decoder) statusFmt(
+            &buf,
+            "⚠ the VAE override holds no {s} decoder. Clear it, or the load will fail.",
+            .{t.label},
+            true,
+        ),
+        .unset => {},
+    };
+
+    // Backend compatibility. Every architecture runs on every backend today, so
+    // this normally says nothing — it stays because "which backends" is a
+    // per-family fact (it was cpu-only for the SD family until its device kernels
+    // landed) and the next architecture will arrive CPU-first.
+    const want = diffuser.toPipelineBackend(cfg.diff_backend);
+    if (!t.supports(want)) statusFmt(
+        &buf,
+        "⚠ {s} has no kernels for the {t} backend — pick another below, " ++
+            "or generation will fail to load.",
+        .{ t.label, cfg.diff_backend },
+        true,
+    );
+
+    statusFmt(&buf, "• Suggested defaults for this architecture: {d}x{d}, {d} steps, CFG {d:.1}.", .{
+        t.width, t.height, t.steps, t.cfg,
+    }, false);
 }
 
 fn numRow(label: []const u8, buf: []u8) void {

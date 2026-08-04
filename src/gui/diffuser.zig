@@ -85,32 +85,42 @@ pub const GenStatus = enum(u8) { pending, generating, done, failed, canceled, su
 /// `freeGenImage`); preview/steps/dims stay live (cosmetic / already per-image).
 pub const ModelConfig = struct {
     dit_path: []const u8,
+    /// Conditioner / decoder OVERRIDES. **Empty means "not configured"**, which is
+    /// how `pipeline.Options` spells it too (`openIfGiven` returns null for an empty
+    /// path, and the resolver then takes the component out of the primary
+    /// checkpoint). Non-empty is an *explicit* request that outranks a bundled copy
+    /// — see `applyPaths`, which is the single place that turns these into
+    /// `explicit_text_encoder` / `explicit_vae`.
     vae_path: []const u8,
     text_encoder_path: []const u8,
+    /// SDXL's second text tower (OpenCLIP bigG). Same empty-means-unset rule; the
+    /// pipeline resolves it independently of `text_encoder_path` and ignores it
+    /// entirely for a single-tower architecture.
+    text_encoder_2_path: []const u8,
     backend: pipeline.Backend,
     vae_decode: pipeline.VaeDecode,
 
-    /// Duplicate the path strings into gpa-owned storage.
-    fn dupe(
-        gpa: std.mem.Allocator,
-        dit: []const u8,
-        vae: []const u8,
-        te: []const u8,
-        backend: pipeline.Backend,
-        vae_decode: pipeline.VaeDecode,
-    ) !ModelConfig {
-        const d = try gpa.dupe(u8, dit);
-        errdefer gpa.free(d);
-        const v = try gpa.dupe(u8, vae);
-        errdefer gpa.free(v);
-        const t = try gpa.dupe(u8, te);
-        return .{ .dit_path = d, .vae_path = v, .text_encoder_path = t, .backend = backend, .vae_decode = vae_decode };
+    /// Duplicate the path strings into gpa-owned storage. Takes a borrowed
+    /// `ModelConfig` rather than a positional path list: with four paths, the
+    /// call sites were one transposition away from loading the VAE as a text
+    /// encoder, and the compiler could not have caught it.
+    fn dupe(gpa: std.mem.Allocator, src: ModelConfig) !ModelConfig {
+        var out = src;
+        // Allocate into a fixed-size array of the owned slices so a partial
+        // failure frees exactly what was taken.
+        const fields = [_]*[]const u8{ &out.dit_path, &out.vae_path, &out.text_encoder_path, &out.text_encoder_2_path };
+        const srcs = [_][]const u8{ src.dit_path, src.vae_path, src.text_encoder_path, src.text_encoder_2_path };
+        var done: usize = 0;
+        errdefer for (fields[0..done]) |f| gpa.free(f.*);
+        while (done < fields.len) : (done += 1) fields[done].* = try gpa.dupe(u8, srcs[done]);
+        return out;
     }
 
     fn deinit(self: ModelConfig, gpa: std.mem.Allocator) void {
         gpa.free(self.dit_path);
         gpa.free(self.vae_path);
         gpa.free(self.text_encoder_path);
+        gpa.free(self.text_encoder_2_path);
     }
 
     /// Do these two configs need the same resident pipeline? (Paths + backend +
@@ -119,7 +129,32 @@ pub const ModelConfig = struct {
         return a.backend == b.backend and a.vae_decode == b.vae_decode and
             std.mem.eql(u8, a.dit_path, b.dit_path) and
             std.mem.eql(u8, a.vae_path, b.vae_path) and
-            std.mem.eql(u8, a.text_encoder_path, b.text_encoder_path);
+            std.mem.eql(u8, a.text_encoder_path, b.text_encoder_path) and
+            std.mem.eql(u8, a.text_encoder_2_path, b.text_encoder_2_path);
+    }
+
+    /// Write this model set onto `opts` — **the only place** the GUI's paths become
+    /// pipeline options, so the explicit-override flags cannot be forgotten at one
+    /// of the several call sites that build an `Options`.
+    ///
+    /// ⚠️ A path is "explicit" exactly when it is non-empty, and that equivalence
+    /// only holds because the GUI never pre-fills the two override fields. The
+    /// distinction is not cosmetic: the CLI's `Options` ships *defaulted* krea2
+    /// side paths, and treating one of those as a request is what broke a joined
+    /// SD1.5 checkpoint — the resolver opened krea2's qwen3 encoder, hunted for
+    /// CLIP's tensors in it, and reported `ComponentNotInCheckpoint`. If a future
+    /// settings screen ever suggests a path, it must leave the buffer empty until
+    /// the user accepts it, or carry a separate "asked for" bit.
+    pub fn applyTo(self: ModelConfig, opts: *pipeline.Options) void {
+        opts.dit_path = self.dit_path;
+        opts.text_encoder_path = self.text_encoder_path;
+        opts.explicit_text_encoder = self.text_encoder_path.len > 0;
+        opts.text_encoder_2_path = self.text_encoder_2_path;
+        opts.explicit_text_encoder_2 = self.text_encoder_2_path.len > 0;
+        opts.vae_path = self.vae_path;
+        opts.explicit_vae = self.vae_path.len > 0;
+        opts.backend = self.backend;
+        opts.vae_decode = self.vae_decode;
     }
 };
 
@@ -189,18 +224,35 @@ pub fn freeGenImage(gpa: std.mem.Allocator, gi: *GenImage) void {
     if (gi.rgba) |r| gpa.free(r);
     if (gi.preview) |p| gpa.free(p);
     if (gi.model) |m| m.deinit(gpa);
-    if (gi.resume_snapshot) |s| gpa.free(s.latent);
+    if (gi.resume_snapshot) |*s| s.deinit(gpa);
     gpa.destroy(gi);
 }
 
-/// Diffusion configuration for a session (krea2 by default).
+/// Diffusion configuration for a session. The architecture is detected from the
+/// primary checkpoint (`pipeline.detectFamily`), never configured here.
 pub const DiffConfig = struct {
+    /// Primary checkpoint (safetensors or GGUF, sniffed by magic). The only
+    /// required path — it may carry the conditioner and decoder as well.
     dit_path: []const u8,
-    vae_path: []const u8,
-    text_encoder_path: []const u8,
+    /// Conditioner / decoder overrides; "" = take them from the primary
+    /// checkpoint. See `ModelConfig`'s note on what non-empty means.
+    vae_path: []const u8 = "",
+    text_encoder_path: []const u8 = "",
+    /// SDXL's second text tower; "" for every other architecture.
+    text_encoder_2_path: []const u8 = "",
     steps: usize = 20,
     width: usize = 1024,
     height: usize = 1024,
+    /// Sampler for the next image. Load-neutral (per-render state), so this is
+    /// reconciled live like the preview settings rather than forcing a rebuild.
+    sampler: tp.sampler.Kind = .euler,
+    /// Where the steps go; null = the architecture's own default. Load-neutral.
+    scheduler: ?tp.sampler.Scheduler = null,
+    /// Prompt dialect + (a1111 only) weighting form. Reconciled live like the sampler:
+    /// they are per-render parsing choices, not part of the loaded session.
+    prompt_syntax: pipeline.PromptSyntax = .comfy,
+    emphasis: pipeline.Emphasis = .original,
+    compat: pipeline.Compat = .comfy,
     backend: pipeline.Backend = .zig_cuda,
     /// VAE decode-path override (see pipeline.VaeDecode). Default adaptive.
     vae_decode: pipeline.VaeDecode = .auto,
@@ -278,6 +330,56 @@ pub fn toPipelineVae(v: config.VaeDecode) pipeline.VaeDecode {
     };
 }
 
+/// Map the config's sampler enum onto `sampler.Kind`.
+/// Config -> pipeline, for the two prompt-dialect knobs. Separate enums because the
+/// config's carry UI labels and a stable serialized spelling.
+pub fn toPipelineSyntax(s: config.PromptSyntax) pipeline.PromptSyntax {
+    return switch (s) {
+        .comfy => .comfy,
+        .a1111 => .a1111,
+    };
+}
+
+pub fn toPipelineCompat(c: config.Compat) pipeline.Compat {
+    return switch (c) {
+        .comfy => .comfy,
+        .a1111 => .a1111,
+    };
+}
+
+pub fn toPipelineEmphasis(e: config.Emphasis) pipeline.Emphasis {
+    return switch (e) {
+        .original => .original,
+        .no_norm => .no_norm,
+        .ignore => .ignore,
+    };
+}
+
+pub fn toPipelineSampler(s: config.Sampler) tp.sampler.Kind {
+    return switch (s) {
+        .euler => .euler,
+        .dpmpp_2m_sde => .dpmpp_2m_sde,
+        .dpmpp_2m_sde_heun => .dpmpp_2m_sde_heun,
+    };
+}
+
+/// Map the config's scheduler enum onto `?schedule.Scheduler`; `.default` -> null,
+/// meaning "the architecture's own", which `Session.scheduleWith` resolves per family.
+pub fn toPipelineScheduler(s: config.Scheduler) ?tp.sampler.Scheduler {
+    return switch (s) {
+        .default => null,
+        .normal => .normal,
+        .karras => .karras,
+        .exponential => .exponential,
+        .sgm_uniform => .sgm_uniform,
+        .simple => .simple,
+        .ddim_uniform => .ddim_uniform,
+        .beta => .beta,
+        .linear_quadratic => .linear_quadratic,
+        .kl_optimal => .kl_optimal,
+    };
+}
+
 /// Round to a multiple of 16 (pipeline requirement) within sane bounds.
 pub fn clampDim(n: usize) usize {
     const c = std.math.clamp(n, 256, 4096);
@@ -308,13 +410,46 @@ pub fn nowNs(io: std.Io) i64 {
     return @intCast(std.Io.Clock.real.now(io).nanoseconds);
 }
 
+/// The AUTOMATIC1111 name for the sigma schedule a family samples on.
+///
+/// ⚠️ **Not cosmetic — this field is what a reader re-renders with.** krea2 walks
+/// a continuous flow-matching schedule (ComfyUI calls it "Simple"); the SD family
+/// walks the discrete beta ladder linearly (A1111's default, "Normal", as opposed
+/// to "Karras"). Stamping every render "Simple" would tell anyone reproducing an
+/// SDXL image to use the wrong discretization. Null when the architecture is not
+/// known, and then the field is omitted rather than guessed.
+/// The scheduler a family samples with when the caller did not choose one. Mirrors
+/// `schedule.Scheduler.defaultFor`, which takes a sigma table rather than a family.
+fn defaultSchedulerFor(fam: pipeline.Family) tp.sampler.Scheduler {
+    return switch (fam) {
+        .krea2 => .simple,
+        .sd15, .sdxl => .normal,
+    };
+}
+
 /// Build an AUTOMATIC1111-style `parameters` metadata string. Format:
 ///
 ///     <prompt>
 ///     Negative prompt: <negative>            (omitted when empty)
-///     Steps: N, Sampler: Euler, Schedule type: Simple, CFG scale: C, Seed: S, Size: WxH, Model: <name>
+///     Steps: N, Sampler: Euler, Schedule type: S, CFG scale: C, Seed: S, Size: WxH, Model: <name>, Prompt syntax: X
 ///
-/// `model_name` is the diffusion checkpoint's file stem. Caller frees.
+/// `model_name` is the diffusion checkpoint's file stem; `fam` names the schedule
+/// (the "Schedule type" field is dropped when it is null). Caller frees.
+///
+/// ⚠️ **`Prompt syntax` is not decoration, and the block is wrong without it.** A reader
+/// (including ComfyUI's own metadata importer) re-renders from these fields, and the very
+/// same prompt text means a DIFFERENT image in the two dialects — `(x:1.2)` multiplies in
+/// one and replaces in the other, `[x]` is de-emphasis in one and literal text in the
+/// other. A1111's own format has no field for this because A1111 only ever has one
+/// dialect; here it has to be recorded, on the same reasoning that made `Sampler` and
+/// `Schedule type` stop being hardcoded. `Emphasis` rides along only when it can matter.
+///
+/// ⚠️ **`Compat` is the same argument again, and for a bigger effect.** It selects whose
+/// *sampling* conventions ran — including which RNG drew the noise, which decides whether
+/// a seed means the same starting latent at all. `RNG`/`SGM noise multiplier` appear only
+/// when they were overridden away from that compat's own defaults, so an ordinary ComfyUI
+/// render's block is byte-for-byte what it was before this existed. `RNG` keeps A1111's
+/// own spelling of the field and its values, since that is what a reader will recognize.
 pub fn buildA1111Params(
     gpa: std.mem.Allocator,
     prompt: []const u8,
@@ -325,16 +460,74 @@ pub fn buildA1111Params(
     width: usize,
     height: usize,
     model_name: []const u8,
+    fam: ?pipeline.Family,
+    samp: tp.sampler.Kind,
+    sched: ?tp.sampler.Scheduler,
+    syntax: pipeline.PromptSyntax,
+    emphasis: pipeline.Emphasis,
+    compat: pipeline.Compat,
+    /// The resolved form — compared against `compat`'s own defaults to decide which
+    /// overrides need recording.
+    cc: pipeline.CompatConfig,
 ) ![]u8 {
     const neg_line = if (negative.len > 0)
         try std.fmt.allocPrint(gpa, "Negative prompt: {s}\n", .{negative})
     else
         try gpa.dupe(u8, "");
     defer gpa.free(neg_line);
+    // ⚠️ The scheduler actually used, not a guess from the architecture. This field
+    // used to be derived from the family alone, which was only ever right because the
+    // scheduler was not selectable; a reader (including ComfyUI's own metadata
+    // importer) re-renders from it. An explicit choice wins; otherwise name the
+    // family's default, and drop the field entirely when even that is unknown.
+    const sched_line = if (sched) |sc|
+        try std.fmt.allocPrint(gpa, "Schedule type: {s}, ", .{sc.a1111Name()})
+    else if (fam) |f|
+        try std.fmt.allocPrint(gpa, "Schedule type: {s}, ", .{defaultSchedulerFor(f).a1111Name()})
+    else
+        try gpa.dupe(u8, "");
+    defer gpa.free(sched_line);
+    const syntax_name: []const u8 = switch (syntax) {
+        .comfy => "ComfyUI",
+        .a1111 => "A1111",
+    };
+    // Only under `.a1111` — under `.comfy` there is exactly one weighting form, so the
+    // field would imply a choice that does not exist.
+    const emph_line = if (syntax == .a1111)
+        try std.fmt.allocPrint(gpa, ", Emphasis: {s}", .{switch (emphasis) {
+            .original => "Original",
+            .no_norm => "No norm",
+            .ignore => "Ignore",
+        }})
+    else
+        try gpa.dupe(u8, "");
+    defer gpa.free(emph_line);
+
+    const compat_line = if (compat == .comfy)
+        try gpa.dupe(u8, "")
+    else
+        try gpa.dupe(u8, ", Compat: A1111");
+    defer gpa.free(compat_line);
+
+    // Only the knobs that were actually overridden, so the common block is unchanged.
+    const base: pipeline.CompatConfig = .of(compat);
+    var extra: std.ArrayList(u8) = .empty;
+    defer extra.deinit(gpa);
+    if (cc.noise_src != base.noise_src) try extra.print(gpa, ", RNG: {s}", .{switch (cc.noise_src) {
+        .torch_cpu => "CPU",
+        .nv_philox => "NV",
+    }});
+    if (cc.sgm_noise_multiplier != base.sgm_noise_multiplier) {
+        try extra.print(gpa, ", SGM noise multiplier: {s}", .{if (cc.sgm_noise_multiplier) "True" else "False"});
+    }
+    if (cc.quantize_timestep != base.quantize_timestep) {
+        try extra.print(gpa, ", Quantize timesteps: {s}", .{if (cc.quantize_timestep) "True" else "False"});
+    }
+
     return std.fmt.allocPrint(
         gpa,
-        "{s}\n{s}Steps: {d}, Sampler: Euler, Schedule type: Simple, CFG scale: {d:.1}, Seed: {d}, Size: {d}x{d}, Model: {s}",
-        .{ prompt, neg_line, steps, cfg, seed, width, height, model_name },
+        "{s}\n{s}Steps: {d}, Sampler: {s}, {s}CFG scale: {d:.1}, Seed: {d}, Size: {d}x{d}, Model: {s}, Prompt syntax: {s}{s}{s}{s}",
+        .{ prompt, neg_line, steps, samp.a1111Name(), sched_line, cfg, seed, width, height, model_name, syntax_name, emph_line, compat_line, extra.items },
     );
 }
 
@@ -439,6 +632,20 @@ pub const Diffuser = struct {
     /// checkpoint-file estimate in `vpDemand` as soon as one image has run.
     peak_resident: std.atomic.Value(u64) = .init(0),
 
+    /// Why the last model LOAD failed, so the UI can say what went wrong instead
+    /// of showing a bare "⚠ failed" per image. Stored as `@intFromError` (0 = no
+    /// failure) because the worker writes it and the UI thread reads it; an error
+    /// code is a plain integer, so this needs no lock and no owned string.
+    ///
+    /// This exists because the SD family made the most likely first-run mistake
+    /// invisible: an SD1.5 checkpoint on the GUI's default CUDA backend returns
+    /// `error.UnsupportedBackend` (there are no device kernels for its UNet), and
+    /// before this the only trace was a line in the terminal.
+    load_error: std.atomic.Value(u16) = .init(0),
+    /// Architecture of the resident pipeline, for the UI (`@intFromEnum` + 1;
+    /// 0 = nothing loaded). Detected by the pipeline from the checkpoint itself.
+    loaded_family: std.atomic.Value(u8) = .init(0),
+
     /// Build the engine from a `DiffConfig`. `wake` repaints the UI on progress;
     /// `vram` is the injected VRAM coordinator (LLM eviction, or `.none`). The
     /// path slices in `cfg` must outlive the diffuser until the first model swap
@@ -450,25 +657,38 @@ pub const Diffuser = struct {
         cfg: DiffConfig,
         vram: VramCoordinator,
     ) Diffuser {
+        var opts: pipeline.Options = .{
+            .prompt = "",
+            .width = cfg.width,
+            .height = cfg.height,
+            .steps = cfg.steps,
+            .sampler = cfg.sampler,
+            .scheduler = cfg.scheduler,
+            .vram_budget = cfg.vram_budget,
+            .prompt_syntax = cfg.prompt_syntax,
+            .emphasis = cfg.emphasis,
+            .compat = cfg.compat,
+            .preview = cfg.preview_enabled,
+            .taew_path = cfg.taew_path,
+            .preview_ds = cfg.preview_ds,
+        };
+        // Paths + backend + the explicit-override flags, in one place. Note this
+        // OVERWRITES `Options`' defaulted krea2 side paths with "" when nothing is
+        // configured, which is what makes a bundled checkpoint resolve out of its
+        // own file instead of against a stale default.
+        (ModelConfig{
+            .dit_path = cfg.dit_path,
+            .vae_path = cfg.vae_path,
+            .text_encoder_path = cfg.text_encoder_path,
+            .text_encoder_2_path = cfg.text_encoder_2_path,
+            .backend = cfg.backend,
+            .vae_decode = cfg.vae_decode,
+        }).applyTo(&opts);
         return .{
             .gpa = gpa,
             .io = io,
             .wake = wake,
-            .opts = .{
-                .prompt = "",
-                .width = cfg.width,
-                .height = cfg.height,
-                .steps = cfg.steps,
-                .backend = cfg.backend,
-                .vae_decode = cfg.vae_decode,
-                .vram_budget = cfg.vram_budget,
-                .dit_path = cfg.dit_path,
-                .vae_path = cfg.vae_path,
-                .text_encoder_path = cfg.text_encoder_path,
-                .preview = cfg.preview_enabled,
-                .taew_path = cfg.taew_path,
-                .preview_ds = cfg.preview_ds,
-            },
+            .opts = opts,
             .seed = 0,
             .taew_owned = cfg.taew_path,
             .path_store = std.heap.ArenaAllocator.init(gpa),
@@ -488,15 +708,29 @@ pub const Diffuser = struct {
     /// this one — already-queued images finish on the config they were created
     /// with (the worker reloads the pipeline at the seam where they disagree).
     pub fn enqueue(self: *Diffuser, gi: *GenImage) !void {
-        if (gi.model == null) gi.model = try ModelConfig.dupe(
-            self.gpa,
-            self.opts.dit_path,
-            self.opts.vae_path,
-            self.opts.text_encoder_path,
-            self.opts.backend,
-            self.opts.vae_decode,
-        );
+        if (gi.model == null) gi.model = try ModelConfig.dupe(self.gpa, self.liveConfig());
         try self.queue.append(self.gpa, gi);
+    }
+
+    /// The model set the engine would load right now, read back out of `opts`.
+    ///
+    /// `opts` is the single store for the live config (the worker copies it and
+    /// overlays a per-image snapshot), so every "what is currently selected?"
+    /// question has to reconstruct a `ModelConfig` from it. Doing that inline at
+    /// each of the four sites is how one of them silently misses a newly added
+    /// path — which is exactly what a fourth component invites.
+    ///
+    /// Borrowed: the slices point into `path_store` (or the init-time arena) and
+    /// live until the next `requestPaths`.
+    fn liveConfig(self: *const Diffuser) ModelConfig {
+        return .{
+            .dit_path = self.opts.dit_path,
+            .vae_path = self.opts.vae_path,
+            .text_encoder_path = self.opts.text_encoder_path,
+            .text_encoder_2_path = self.opts.text_encoder_2_path,
+            .backend = self.opts.backend,
+            .vae_decode = self.opts.vae_decode,
+        };
     }
 
     /// The unified image list (creation order) for rendering / viewer nav.
@@ -546,8 +780,8 @@ pub const Diffuser = struct {
             if (st != .pending and st != .suspended) continue;
             if (gi.cancel.load(.acquire)) {
                 gi.status.store(@intFromEnum(GenStatus.canceled), .release);
-                if (gi.resume_snapshot) |s| { // dropping a suspended image: free its latent
-                    self.gpa.free(s.latent);
+                if (gi.resume_snapshot) |*s| { // dropping a suspended image: free its state
+                    s.deinit(self.gpa);
                     gi.resume_snapshot = null;
                 }
                 continue;
@@ -621,6 +855,21 @@ pub const Diffuser = struct {
             l.deinit(self.gpa);
             self.loaded = null;
         }
+        self.loaded_family.store(0, .release);
+    }
+
+    /// Why the last model load failed, or null if the last one succeeded (or none
+    /// has been tried). Cleared by the next successful load — a stale error would
+    /// keep the studio warning about a model the user has since replaced.
+    pub fn loadError(self: *const Diffuser) ?anyerror {
+        const code = self.load_error.load(.acquire);
+        return if (code == 0) null else @errorFromInt(code);
+    }
+
+    /// Architecture of the resident pipeline; null when nothing is loaded.
+    pub fn loadedFamily(self: *const Diffuser) ?pipeline.Family {
+        const v = self.loaded_family.load(.acquire);
+        return if (v == 0) null else @enumFromInt(v - 1);
     }
 
     pub fn deinit(self: *Diffuser) void {
@@ -784,9 +1033,18 @@ pub const Diffuser = struct {
     /// Erring LOW is the right direction: an under-estimate means the LLM keeps
     /// more and the pipeline reclaims reactively (`vcReclaim` / the OOM ladder),
     /// whereas an over-estimate is an eviction that was never needed.
+    /// ⚠️ A BUNDLED checkpoint therefore over-counts by its text encoder, which the
+    /// separate-file case deliberately excludes: the file size is all we have, and
+    /// it cannot be broken down per component without parsing the header. Erring
+    /// high here is the wrong direction (it over-evicts the LLM on the first
+    /// image), but it self-corrects after one generation — `peak_resident`
+    /// supersedes this the moment a real measurement exists.
     pub fn estimateResidentBytes(self: *Diffuser) u64 {
         var total: u64 = 0;
+        // An unset override contributes nothing (its component is inside the
+        // primary checkpoint, already counted).
         for ([_][]const u8{ self.opts.dit_path, self.opts.vae_path }) |p| {
+            if (p.len == 0) continue;
             const st = std.Io.Dir.cwd().statFile(self.io, p, .{}) catch continue;
             total += st.size;
         }
@@ -814,6 +1072,34 @@ pub const Diffuser = struct {
         self.opts.steps = steps;
         self.opts.width = width;
         self.opts.height = height;
+    }
+
+    /// Update the sampler (from settings). Load-neutral — the sampler is per-render
+    /// state, not part of the session — so this needs no rebuild and applies to the
+    /// next image. Gated on idle like `setDefaults`: the worker reads `opts` at
+    /// dispatch, and switching mid-image would not take effect anyway.
+    pub fn setSampler(self: *Diffuser, kind: tp.sampler.Kind) void {
+        if (self.busy.load(.acquire)) return;
+        self.opts.sampler = kind;
+    }
+
+    /// Update the prompt dialect and its weighting form (from settings). Load-neutral
+    /// like the sampler: the next image parses its prompt the new way, with no reload.
+    pub fn setPromptSyntax(
+        self: *Diffuser,
+        syntax: pipeline.PromptSyntax,
+        emph: pipeline.Emphasis,
+        compat: pipeline.Compat,
+    ) void {
+        self.opts.prompt_syntax = syntax;
+        self.opts.emphasis = emph;
+        self.opts.compat = compat;
+    }
+
+    /// Update the scheduler (from settings). Load-neutral, same as `setSampler`.
+    pub fn setScheduler(self: *Diffuser, sched: ?tp.sampler.Scheduler) void {
+        if (self.busy.load(.acquire)) return;
+        self.opts.scheduler = sched;
     }
 
     /// Update the directory finished images are saved to (from settings). Null
@@ -862,24 +1148,28 @@ pub const Diffuser = struct {
     /// each image — already-queued images keep the config they were stamped with,
     /// and the worker reloads the resident pipeline at the seam where consecutive
     /// images disagree. When the queue is fully idle, the now-stale resident
-    /// pipeline is dropped here so a switch returns its VRAM promptly. Path args
-    /// are borrowed (re-duped into `path_store`).
-    pub fn requestPaths(
-        self: *Diffuser,
-        dit: []const u8,
-        vae: []const u8,
-        te: []const u8,
-        taew: ?[]const u8,
-        backend: pipeline.Backend,
-        vae_decode: pipeline.VaeDecode,
-    ) void {
+    /// pipeline is dropped here so a switch returns its VRAM promptly.
+    ///
+    /// `want`'s paths are borrowed (re-duped into `path_store`); any override may
+    /// be "" (that component comes from the primary checkpoint). Takes the whole
+    /// `ModelConfig` rather than one parameter per path: at four paths plus two
+    /// enums a positional list is one transposition away from loading the VAE as
+    /// a text encoder, with no type error to catch it.
+    pub fn requestPaths(self: *Diffuser, want: ModelConfig, taew: ?[]const u8) void {
         _ = self.path_store.reset(.retain_capacity);
         const a = self.path_store.allocator();
-        self.opts.dit_path = a.dupe(u8, dit) catch return;
-        self.opts.vae_path = a.dupe(u8, vae) catch return;
-        self.opts.text_encoder_path = a.dupe(u8, te) catch return;
-        self.opts.backend = backend;
-        self.opts.vae_decode = vae_decode;
+        const owned: ModelConfig = .{
+            .dit_path = a.dupe(u8, want.dit_path) catch return,
+            .vae_path = a.dupe(u8, want.vae_path) catch return,
+            .text_encoder_path = a.dupe(u8, want.text_encoder_path) catch return,
+            .text_encoder_2_path = a.dupe(u8, want.text_encoder_2_path) catch return,
+            .backend = want.backend,
+            .vae_decode = want.vae_decode,
+        };
+        owned.applyTo(&self.opts);
+        // The config just changed, so any previous load failure describes a model
+        // set that no longer exists — clear it rather than warn about the old one.
+        self.load_error.store(0, .release);
         self.taew_owned = if (taew) |t| (a.dupe(u8, t) catch null) else null;
         self.refreshPreview(); // taew_path follows the (possibly new) taew_owned
         self.dropStaleSession();
@@ -894,14 +1184,7 @@ pub const Diffuser = struct {
         if (self.busy.load(.acquire)) return;
         if (self.nextPending() != null) return;
         const l = self.loaded orelse return; // nothing resident
-        const cur: ModelConfig = .{
-            .dit_path = self.opts.dit_path,
-            .vae_path = self.opts.vae_path,
-            .text_encoder_path = self.opts.text_encoder_path,
-            .backend = self.opts.backend,
-            .vae_decode = self.opts.vae_decode,
-        };
-        if (!ModelConfig.eql(l, cur)) {
+        if (!ModelConfig.eql(l, self.liveConfig())) {
             self.freeSession();
             std.log.info("diffusion model switched", .{});
         }
@@ -1014,6 +1297,13 @@ pub const Diffuser = struct {
             w,
             h,
             modelStem(opts.dit_path),
+            self.loadedFamily(),
+            opts.sampler,
+            opts.scheduler,
+            opts.prompt_syntax,
+            opts.emphasis,
+            opts.compat,
+            opts.compatConfig(),
         ) catch |err| {
             std.log.err("image save (metadata) failed: {t}", .{err});
             return;
@@ -1055,18 +1345,8 @@ pub const Diffuser = struct {
         // backend/model switch made after `gi` was enqueued doesn't retro-apply to
         // it. Images that never went through the queue (no snapshot) use live opts.
         var opts = self.opts;
-        const want: ModelConfig = gi.model orelse .{
-            .dit_path = self.opts.dit_path,
-            .vae_path = self.opts.vae_path,
-            .text_encoder_path = self.opts.text_encoder_path,
-            .backend = self.opts.backend,
-            .vae_decode = self.opts.vae_decode,
-        };
-        opts.dit_path = want.dit_path;
-        opts.vae_path = want.vae_path;
-        opts.text_encoder_path = want.text_encoder_path;
-        opts.backend = want.backend;
-        opts.vae_decode = want.vae_decode;
+        const want: ModelConfig = gi.model orelse self.liveConfig();
+        want.applyTo(&opts);
         opts.prompt = gi.prompt;
         opts.negative = gi.req_negative;
         opts.cfg = gi.req_cfg;
@@ -1107,25 +1387,21 @@ pub const Diffuser = struct {
             const t_load = nowNs(self.io);
             sess = pipeline.Session.init(self.io, self.gpa, opts, progress) catch |err| {
                 std.log.err("diffusion model load failed: {t}", .{err});
+                self.load_error.store(@intFromError(err), .release);
                 gi.status.store(@intFromEnum(GenStatus.failed), .release);
                 self.busy.store(false, .release);
                 self.wake();
                 return;
             };
-            std.log.info("[vram] diffusion model loaded in {d:.1}s: {d} MiB resident (budget {d} MiB) · {d} MiB free", .{
-                @as(f64, @floatFromInt(nowNs(self.io) - t_load)) / 1e9,
+            self.load_error.store(0, .release);
+            self.loaded_family.store(@as(u8, @intFromEnum(sess.?.family())) + 1, .release);
+            std.log.info("[vram] diffusion model loaded in {d:.1}s ({t}): {d} MiB resident (budget {d} MiB) · {d} MiB free", .{
+                @as(f64, @floatFromInt(nowNs(self.io) - t_load)) / 1e9, sess.?.family(),
                 sess.?.deviceUsed() >> 20, opts.vram_budget >> 20, sess.?.freeVram() >> 20,
             });
             self.session.store(sess, .release);
             // Record what's resident (gpa-owned; freed on the next reload / free).
-            self.loaded = ModelConfig.dupe(
-                self.gpa,
-                want.dit_path,
-                want.vae_path,
-                want.text_encoder_path,
-                want.backend,
-                want.vae_decode,
-            ) catch null;
+            self.loaded = ModelConfig.dupe(self.gpa, want) catch null;
         }
         // Unload-while-paused: generate writes the in-flight latent + step here
         // and returns error.Paused. The worker stores it on the image (status
@@ -1135,7 +1411,7 @@ pub const Diffuser = struct {
         opts.suspend_out = &suspend_snap;
         var img = sess.?.generate(opts, progress) catch |err| {
             if (err == error.Paused) {
-                if (gi.resume_snapshot) |old| self.gpa.free(old.latent); // replace any prior
+                if (gi.resume_snapshot) |*old| old.deinit(self.gpa); // replace any prior
                 gi.resume_snapshot = suspend_snap;
                 gi.status.store(@intFromEnum(GenStatus.suspended), .release);
                 self.busy.store(false, .release);
@@ -1153,8 +1429,8 @@ pub const Diffuser = struct {
         };
         defer img.deinit(self.gpa);
         // Completed (resume, if any, is consumed): drop the saved latent.
-        if (gi.resume_snapshot) |s| {
-            self.gpa.free(s.latent);
+        if (gi.resume_snapshot) |*s| {
+            s.deinit(self.gpa);
             gi.resume_snapshot = null;
         }
 
@@ -1213,6 +1489,94 @@ pub const Diffuser = struct {
     }
 };
 
+test "applyTo: an unset override is empty and NOT explicit" {
+    // The bundled-checkpoint case: one path, nothing else. The empty side paths
+    // must overwrite `Options`' defaulted krea2 files, or the resolver would open
+    // one of those and hunt for the wrong architecture's tensors in it.
+    var opts: pipeline.Options = .{ .prompt = "" };
+    (ModelConfig{
+        .dit_path = "/sd15.safetensors",
+        .vae_path = "",
+        .text_encoder_path = "",
+        .text_encoder_2_path = "",
+        .backend = .cpu,
+        .vae_decode = .auto,
+    }).applyTo(&opts);
+
+    try std.testing.expectEqualStrings("/sd15.safetensors", opts.dit_path);
+    try std.testing.expectEqualStrings("", opts.vae_path);
+    try std.testing.expectEqualStrings("", opts.text_encoder_path);
+    try std.testing.expectEqualStrings("", opts.text_encoder_2_path);
+    try std.testing.expect(!opts.explicit_vae);
+    try std.testing.expect(!opts.explicit_text_encoder);
+    try std.testing.expect(!opts.explicit_text_encoder_2);
+    try std.testing.expectEqual(pipeline.Backend.cpu, opts.backend);
+}
+
+test "applyTo: a set override is explicit (it outranks a bundled copy)" {
+    var opts: pipeline.Options = .{ .prompt = "" };
+    (ModelConfig{
+        .dit_path = "/dit.safetensors",
+        .vae_path = "/vae.safetensors",
+        .text_encoder_path = "",
+        .text_encoder_2_path = "",
+        .backend = .zig_cuda,
+        .vae_decode = .cpu_tiled,
+    }).applyTo(&opts);
+
+    // Only the VAE was supplied: it wins over anything in the checkpoint, while
+    // the conditioner still resolves out of the checkpoint itself.
+    try std.testing.expect(opts.explicit_vae);
+    try std.testing.expect(!opts.explicit_text_encoder);
+    try std.testing.expectEqualStrings("/vae.safetensors", opts.vae_path);
+    try std.testing.expectEqual(pipeline.VaeDecode.cpu_tiled, opts.vae_decode);
+}
+
+test "loadError/loadedFamily round-trip through their atomic encodings" {
+    var d: Diffuser = undefined;
+    d.load_error = .init(0);
+    d.loaded_family = .init(0);
+    try std.testing.expectEqual(@as(?anyerror, null), d.loadError());
+    try std.testing.expectEqual(@as(?pipeline.Family, null), d.loadedFamily());
+
+    d.load_error.store(@intFromError(error.UnsupportedBackend), .release);
+    try std.testing.expectEqual(@as(?anyerror, error.UnsupportedBackend), d.loadError());
+
+    // 0 is reserved for "nothing loaded", so the tag is stored offset by one —
+    // without that, family 0 (krea2) would read back as "no model". Every family
+    // must survive the round trip, including any added later.
+    inline for (@typeInfo(pipeline.Family).@"enum".fields) |f| {
+        const fam: pipeline.Family = @enumFromInt(f.value);
+        d.loaded_family.store(@as(u8, @intFromEnum(fam)) + 1, .release);
+        try std.testing.expectEqual(@as(?pipeline.Family, fam), d.loadedFamily());
+    }
+}
+
+test "ModelConfig.dupe owns all four paths and eql sees each of them" {
+    const gpa = std.testing.allocator;
+    const src: ModelConfig = .{
+        .dit_path = "/sdxl.safetensors",
+        .vae_path = "/vae.safetensors",
+        .text_encoder_path = "/clip_l.safetensors",
+        .text_encoder_2_path = "/clip_g.safetensors",
+        .backend = .cuda,
+        .vae_decode = .auto,
+    };
+    const copy = try ModelConfig.dupe(gpa, src);
+    defer copy.deinit(gpa);
+
+    // Equal by value, distinct storage (the source may be a caller's arena that
+    // gets reset under a queued image).
+    try std.testing.expect(ModelConfig.eql(src, copy));
+    try std.testing.expect(src.text_encoder_2_path.ptr != copy.text_encoder_2_path.ptr);
+
+    // Each path participates in the reload decision. The second tower especially:
+    // if `eql` ignored it, switching CLIP-G would silently keep the old pipeline.
+    var other = src;
+    other.text_encoder_2_path = "/other_g.safetensors";
+    try std.testing.expect(!ModelConfig.eql(src, other));
+}
+
 test "clampDim rounds to multiple of 16 within bounds" {
     try std.testing.expectEqual(@as(usize, 1024), clampDim(1024));
     try std.testing.expectEqual(@as(usize, 1024), clampDim(1030)); // 1030/16*16
@@ -1247,22 +1611,130 @@ test "modelStem strips directory and extension" {
 test "buildA1111Params formats prompt, settings, and optional negative" {
     const gpa = std.testing.allocator;
 
-    const with_neg = try buildA1111Params(gpa, "a cat", "blurry", 20, 3.5, 42, 1024, 768, "krea2");
+    const with_neg = try buildA1111Params(gpa, "a cat", "blurry", 20, 3.5, 42, 1024, 768, "krea2", .krea2, .euler, null, .comfy, .original, .comfy, .{});
     defer gpa.free(with_neg);
     try std.testing.expectEqualStrings(
         "a cat\n" ++
             "Negative prompt: blurry\n" ++
-            "Steps: 20, Sampler: Euler, Schedule type: Simple, CFG scale: 3.5, Seed: 42, Size: 1024x768, Model: krea2",
+            "Steps: 20, Sampler: Euler, Schedule type: Simple, CFG scale: 3.5, Seed: 42, Size: 1024x768, Model: krea2, Prompt syntax: ComfyUI",
         with_neg,
     );
 
     // No negative → the "Negative prompt:" line is omitted entirely.
-    const no_neg = try buildA1111Params(gpa, "a dog", "", 8, 1.0, 7, 512, 512, "m");
+    const no_neg = try buildA1111Params(gpa, "a dog", "", 8, 1.0, 7, 512, 512, "m", .krea2, .euler, null, .comfy, .original, .comfy, .{});
     defer gpa.free(no_neg);
     try std.testing.expectEqualStrings(
         "a dog\n" ++
-            "Steps: 8, Sampler: Euler, Schedule type: Simple, CFG scale: 1.0, Seed: 7, Size: 512x512, Model: m",
+            "Steps: 8, Sampler: Euler, Schedule type: Simple, CFG scale: 1.0, Seed: 7, Size: 512x512, Model: m, Prompt syntax: ComfyUI",
         no_neg,
+    );
+}
+
+test "buildA1111Params records the sampler actually used" {
+    // The field used to be the literal "Euler". A saved PNG is the record a user (or
+    // ComfyUI's metadata importer) re-renders from, so a hardcoded name is a wrong
+    // answer that nothing else would catch — and the a1111 spelling is not the CLI's.
+    const gpa = std.testing.allocator;
+    for ([_]struct { k: tp.sampler.Kind, want: []const u8 }{
+        .{ .k = .euler, .want = "Sampler: Euler," },
+        .{ .k = .dpmpp_2m_sde, .want = "Sampler: DPM++ 2M SDE," },
+        .{ .k = .dpmpp_2m_sde_heun, .want = "Sampler: DPM++ 2M SDE Heun," },
+    }) |c| {
+        const s = try buildA1111Params(gpa, "p", "", 20, 7.5, 1, 512, 512, "m", .sdxl, c.k, null, .comfy, .original, .comfy, .{});
+        defer gpa.free(s);
+        errdefer std.debug.print("{s}\n", .{s});
+        try std.testing.expect(std.mem.indexOf(u8, s, c.want) != null);
+    }
+}
+
+test "buildA1111Params records the sampling compat, and overrides only when overridden" {
+    const gpa = std.testing.allocator;
+
+    // An ordinary ComfyUI render's block is byte-for-byte what it was before compat
+    // existed — no new fields, so nothing that parses these PNGs has to change.
+    const plain = try buildA1111Params(gpa, "p", "", 20, 7.5, 1, 512, 512, "m", .sdxl, .euler, null, .comfy, .original, .comfy, .of(.comfy));
+    defer gpa.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "Compat") == null);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "RNG") == null);
+
+    // A1111's defaults are named once, not spelled out three times.
+    const a = try buildA1111Params(gpa, "p", "", 20, 7.5, 1, 512, 512, "m", .sdxl, .euler, null, .comfy, .original, .a1111, .of(.a1111));
+    defer gpa.free(a);
+    errdefer std.debug.print("{s}\n", .{a});
+    try std.testing.expect(std.mem.indexOf(u8, a, "Compat: A1111") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a, "RNG") == null);
+
+    // ⚠️ An override has to be recorded or the block does not describe the render: with
+    // `RNG: CPU` this is a different starting latent from the line above, at the same
+    // seed. Same reasoning that stopped `Sampler` being hardcoded.
+    var cc: pipeline.CompatConfig = .of(.a1111);
+    cc.noise_src = .torch_cpu;
+    const ov = try buildA1111Params(gpa, "p", "", 20, 7.5, 1, 512, 512, "m", .sdxl, .euler, null, .comfy, .original, .a1111, cc);
+    defer gpa.free(ov);
+    errdefer std.debug.print("{s}\n", .{ov});
+    try std.testing.expect(std.mem.indexOf(u8, ov, "Compat: A1111") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ov, "RNG: CPU") != null);
+    // And the two knobs still at A1111's defaults stay out of it.
+    try std.testing.expect(std.mem.indexOf(u8, ov, "SGM") == null);
+
+    // The reverse: ComfyUI conventions with A1111's noise, which is the single-variable
+    // experiment someone chasing a mismatch would actually run.
+    var cn: pipeline.CompatConfig = .of(.comfy);
+    cn.noise_src = .nv_philox;
+    const nv = try buildA1111Params(gpa, "p", "", 20, 7.5, 1, 512, 512, "m", .sdxl, .euler, null, .comfy, .original, .comfy, cn);
+    defer gpa.free(nv);
+    try std.testing.expect(std.mem.indexOf(u8, nv, "RNG: NV") != null);
+    try std.testing.expect(std.mem.indexOf(u8, nv, "Compat") == null);
+}
+
+test "buildA1111Params records the prompt dialect, and the emphasis only when it applies" {
+    // The same prompt text renders a DIFFERENT image in the two dialects, so a block that
+    // does not say which one was used cannot be re-rendered from. `Emphasis` appears only
+    // under a1111, where it is a real choice.
+    const gpa = std.testing.allocator;
+    const a = try buildA1111Params(gpa, "(a:1.2) [b]", "", 20, 7.5, 1, 512, 512, "m", .sdxl, .euler, null, .a1111, .no_norm, .comfy, .{});
+    defer gpa.free(a);
+    try std.testing.expect(std.mem.indexOf(u8, a, "Prompt syntax: A1111") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a, "Emphasis: No norm") != null);
+
+    const c = try buildA1111Params(gpa, "(a:1.2)", "", 20, 7.5, 1, 512, 512, "m", .sdxl, .euler, null, .comfy, .original, .comfy, .{});
+    defer gpa.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "Prompt syntax: ComfyUI") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "Emphasis") == null);
+}
+
+test "buildA1111Params names the family's own schedule, and omits it when unknown" {
+    const gpa = std.testing.allocator;
+
+    // The SD family samples the discrete beta ladder linearly — A1111's "Normal",
+    // not krea2's flow-matching "Simple". A reader re-renders from this field.
+    for ([_]pipeline.Family{ .sd15, .sdxl }) |f| {
+        const s = try buildA1111Params(gpa, "p", "", 20, 7.5, 1, 512, 512, "m", f, .euler, null, .comfy, .original, .comfy, .{});
+        defer gpa.free(s);
+        try std.testing.expect(std.mem.indexOf(u8, s, "Schedule type: Normal,") != null);
+    }
+    const k = try buildA1111Params(gpa, "p", "", 8, 1.0, 1, 1024, 1024, "m", .krea2, .euler, null, .comfy, .original, .comfy, .{});
+    defer gpa.free(k);
+    try std.testing.expect(std.mem.indexOf(u8, k, "Schedule type: Simple,") != null);
+
+    // ⚠️ An EXPLICIT scheduler wins over the family default, and this is what the
+    // field is for: with schedulers selectable, deriving it from the architecture
+    // stamps a name the image was not rendered with.
+    const karras = try buildA1111Params(gpa, "p", "", 20, 7.5, 1, 512, 512, "m", .sd15, .euler, .karras, .comfy, .original, .comfy, .{});
+    defer gpa.free(karras);
+    try std.testing.expect(std.mem.indexOf(u8, karras, "Schedule type: Karras,") != null);
+    const kl = try buildA1111Params(gpa, "p", "", 20, 7.5, 1, 512, 512, "m", .krea2, .euler, .kl_optimal, .comfy, .original, .comfy, .{});
+    defer gpa.free(kl);
+    try std.testing.expect(std.mem.indexOf(u8, kl, "Schedule type: KL Optimal,") != null);
+
+    // Unknown architecture: drop the field rather than stamp a guess a reader
+    // would reproduce with. Everything around it stays well-formed.
+    const unknown = try buildA1111Params(gpa, "p", "", 8, 1.0, 1, 512, 512, "m", null, .euler, null, .comfy, .original, .comfy, .{});
+    defer gpa.free(unknown);
+    try std.testing.expect(std.mem.indexOf(u8, unknown, "Schedule type") == null);
+    try std.testing.expectEqualStrings(
+        "p\nSteps: 8, Sampler: Euler, CFG scale: 1.0, Seed: 1, Size: 512x512, Model: m, Prompt syntax: ComfyUI",
+        unknown,
     );
 }
 

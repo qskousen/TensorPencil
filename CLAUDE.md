@@ -83,6 +83,34 @@ var img = try sess.decode(x, lat_h, lat_w, .{}, null);  // latent -> RGB8
   copy), unlike the in-place version that lived inside `generate` — a caller
   holding the latent for a drift curve would otherwise have it silently rescaled.
   There is a test for it.
+- ⚠️ **Both families share ONE VAE-decode ladder (`Session.decodePlanar`), and the SD
+  family was outside it until 2026-08-03 — which hard-failed every render whose decode
+  did not fit.** The ladder is whole-image → free VRAM and retry → GPU-tiled → CPU-tiled,
+  and `recoverableDecodeErr` already named the exact symptom this produced ("the hand-PTX
+  path can surface a post-OOM stream fault as `CudaError`"); the SD arm just returned
+  before reaching any of it. Reported as
+  `cuMemcpyHtoD failed: CUDA_ERROR_ILLEGAL_ADDRESS` → `error: image generation failed:
+  CudaError`, because `upload` is a blocking legacy-stream copy and so the first call to
+  *observe* a kernel that already faulted. At 1024×1536 the SD decoder wants **3 × 1.5 GiB**
+  of activations, so any resident LLM or foreign process is enough.
+  - The family-specific half is a small adapter (`KreaVae` / `SdVae`) supplying the
+    per-backend tile context, the peak-VRAM estimate and the tile geometry. **A
+    whole-image decode is just a single tile covering the whole latent**, which is what
+    collapses the two arms into one ladder.
+  - ⚠️ **SD needs HALF krea2's tile (64² latent, not 128²), and a wrong tile size makes
+    tiling pointless rather than broken.** The SD decoder's widest activation is 256
+    channels at *full* image resolution, so a 128² latent tile is 3 × 1 GiB — barely under
+    a 1024×1536 whole-image decode. 64² is also what ComfyUI's tiled SD decode defaults to.
+  - `vae_tiled.decode` derives the latent channel count from `z.len / (zh·zw)` instead of
+    krea2's 16, and its fast test now runs both 16 and 4 channels.
+  - `sdTile` owns the planar ↔ channel-last transposition on both sides of the SD
+    decoders, so `vae_tiled` and `decode` stay planar-only. It is one function for the
+    reason the layout section below gives: the wrong transposition is rms-preserving, so
+    no magnitude check can see it. A fast test pins each direction separately.
+  - The SD arm also now `setMemTag(.vae)`s, so the GUI's VRAM meter stops attributing a
+    multi-GiB decode to the untracked "ovh" segment (it read `vae=0MB` before).
+  - `--vae-decode auto|whole|gpu_tiled|cpu_tiled` exposes the override on the CLI; it was
+    reachable only through the library and the GUI before.
 - ⚠️ **The invariant to protect: `generate` composed from the stages must be
   bit-identical to `Session.generate`.** The gated test
   `"generate composed from the public stages is bit-identical to Session.generate"`
@@ -112,10 +140,41 @@ Two conventions had to be honoured to make a real GGUF load:
   any tensor whose contiguous dim is not a multiple of 256 to `(n/256, 256)` so
   ggml's blocks tile it, recording the true shape in that KV. krea2's patch embed
   therefore arrives as `[1536, 256]` instead of `[6144, 64]`, and without the
-  restore every shape check downstream fails on a perfectly well-formed file. The
-  restore is skipped (with a warning) for block-quantized dtypes, whose on-disk
-  layout follows the *stored* row length — re-labelling those rows would move every
-  block boundary.
+  restore every shape check downstream fails on a perfectly well-formed file.
+  - ⚠️ **The restore used to be skipped for block-quantized dtypes, and that made
+    every ggufy SD-family GGUF unloadable (fixed 2026-08-02).** The reasoning was
+    that "the criterion that triggers the fix — a contiguous dim not divisible by
+    256 — is the same one that makes k-quantization impossible, so ComfyUI only ever
+    applies it to tensors it then leaves unquantized". True of ComfyUI's converter;
+    **false of ggufy's**, which blocks over a tensor's *flat* element count, so it
+    reshapes first and k-quantizes happily. Measured on a ggufy SD1.5 q4_k file:
+    **166 of 686 tensors, 72.7% of the parameters** — every convolution, whose
+    contiguous dim is `kw` (1 or 3). Symptom: `sd_unet: time_embed.0.weight has
+    shape { 1600, 256 }, expected [1280, 320]`. So the SD family's whole GGUF path
+    was unmeasurable — the same gap this section closed for krea2, still open here
+    because nothing had tried it.
+  - The shape is now restored for those too and the tensor flagged
+    `TensorInfo.flat_blocks`. The **values** are fine — the fix is a pure regrouping,
+    so flat row-major order is preserved, and 256-wide storage rows hold exactly one
+    block each, meaning flat and per-row blocking coincide with or without an
+    imatrix. The **layout** is not: a logical row of 320 is not a whole number of
+    q4_k blocks, so `matmul.Weight.init`'s row-aligned assumption fails. Consumers
+    needing row-aligned blocks therefore materialize (`sd_unet.mat` and `clip_text`
+    already had that branch; `dit.zig`'s `mat` refuses loudly, since krea2 cannot hit
+    it — its only shape-fixed tensor, `first.weight`, is `keys_hiprec` and so
+    unquantized).
+  - ⚠️ **Named cost: materializing gives back the memory quantization saved.** SD1.5
+    q4_k is ~0.5 GB on disk and ~3.4 GB f32 resident (a divergence arm runs ~10 GB
+    RSS). The robust alternative is a block GEMM that understands flat blocking on
+    all four backends — a real kernel project, deliberately not undertaken here. This
+    path is functionally complete and purely additive: these files previously
+    hard-errored, so nothing that loaded before changes behaviour.
+  - ⚠️ **Related structural limit, worth stating right here:** no GPU DiT runs
+    block-quantized weights at all (`dit.gpuLinKindSupported` is
+    `{i8, i4, bf16, f8_e4m3}`; `sd_unet_cuda`'s GEMM switch is `{f32, f16, bf16}`).
+    So a GGUF arm must be measured on `-b cpu`, and there is **no weight-only GPU
+    render path for any architecture** — k-quants are weight-only but CPU-only, while
+    int4/int8 ConvRot run on GPU and quantize the activation in place (W4A4).
 - GGUF stores dims reversed; `gguf.zig` already un-reverses them. ggufy writes bare
   diffusion tensor names (`blocks.0.attn.wq.weight`), which `canonicalName` passes
   through untouched — only `blk.*` and the three LLM specials are rewritten.
@@ -186,7 +245,7 @@ substitution moves *nothing else* — every other weight pointer-identical to an
 unpatched load. (`first`/`last.linear` are materialized to f32 at load, so those two
 compare by value.)
 
-## The SD family (SD1.5, then SDXL) — in progress
+## The SD family (SD1.5 and SDXL)
 
 Why it exists: ggufy's whole activation-aware quantization programme has measured **one**
 architecture (krea2), and its central finding — that per-tensor damage spans only 2.3x around the
@@ -207,10 +266,11 @@ block instead of failing at the end.
 |---|---|
 | `ops.norm.groupNorm` | ✅ matches `F.group_norm` |
 | `ops.act.geluQuick` / `geluErf` (ungated forms) | ✅ |
-| `models.clip_text` (CLIP-L + CLIP-G configs) | ✅ matches `CLIPTextModel` on a real checkpoint |
-| `models.sd_unet` (SD1.5 config; SDXL by config) | ✅ matches `UNet2DConditionModel`, rel L2 < 1e-3 |
+| `models.clip_text` (CLIP-L) | ✅ matches `CLIPTextModel` on a real checkpoint |
+| `models.sd_unet` (SD1.5 config) | ✅ matches `UNet2DConditionModel`, rel L2 < 1e-3 |
 | `models.sd_vae` (AutoencoderKL decoder) | ✅ matches `AutoencoderKL.decode`, rel L2 < 2e-3 |
 | `sampler.sd*` (discrete-eps schedule) | ✅ matches `EulerDiscreteScheduler` (ladder, 4- and 10-step sigmas, timesteps) |
+| **SDXL** — CLIP-L + CLIP-G, UNet, `y`, VAE | ✅ all match **ComfyUI**; see the SDXL section below |
 
 ⚠️ **The layout convention is the one that actually bit, and it is rms-preserving.** The sampler works in
 planar `[c][h][w]` (krea2's DiT and both VAEs do, and `generate`/`decode` are written to it) while
@@ -222,7 +282,9 @@ convention; and a dump-and-compare against diffusers **interpreted the dumped bu
 so both sides scrambled identically and "agreed" to 1e-5. The tell was that magnitudes agreed while the
 image did not — that signature means a permutation, not an arithmetic error. `Denoiser.predictSd` owns the
 transposition now, and a fast test pins the round trip *and* the fact that the wrong layout has the same
-norm. **Verified end to end: 50.9 dB against a diffusers reference render** (512², 20 steps, CFG 7.5).
+norm. **Verified end to end: 70.6 dB against a ComfyUI reference render** (512², 20 steps, CFG 7.5, same
+seed; max per-channel difference 2/255). That figure was 50.9 dB against a *diffusers* render until the two
+sampling conventions below were fixed — see "⚠️ Two conventions where ComfyUI and diffusers disagree".
 
 ⚠️ **A parity test is only as good as the reference's *configuration*, and this cost a visibly bad
 image.** The first schedule matched `EulerDiscreteScheduler` exactly — configured with
@@ -232,16 +294,72 @@ image.** The first schedule matched `EulerDiscreteScheduler` exactly — configu
 noise-textured mush. The implementation was a *correct* port of the wrong convention, and every test
 passed. `linspace` (999 → 0, `steps_offset = 0`) is what k-diffusion Euler uses for SD1.5 and what
 ComfyUI/A1111 sample with; `sampler.sdTrainIndex` owns that choice and documents it.
+
+⚠️ **Three conventions where ComfyUI and diffusers disagree, and the SD family follows ComfyUI.** The
+first two were found 2026-08-01 by rendering SDXL against a ComfyUI render of the same seed; the third on
+2026-08-03 while landing DPM++ 2M SDE. None produces an error, none changes the *composition*, and all
+three are worth many dB:
+
+| | diffusers | ComfyUI (**what we do**) | measured |
+|---|---|---|---|
+| initial noise scale | `max_sigma` (for `linspace`/`trailing` spacing) | `sqrt(1 + sigma_max²)` | SDXL 22.0 → **30.9 dB** |
+| UNet timestep | the fractional index | **nearest trained index** (`argmin` in log-sigma) | SDXL 30.9 → **56.1 dB** |
+| **schedule interpolation** | lerp **sigma** at a fractional index | lerp **log-sigma**, then `exp` | SD1.5 SDE 19.9 → **bit-exact schedule** |
+
+Cumulative for the first two: SDXL 22.0 → 56.1 dB (RMSE 0.4/255), SD1.5 50.9 (vs diffusers) → **70.6 dB**
+(vs ComfyUI, max diff 2/255). The second is the bigger one and the less obvious: the sinusoidal timestep
+embedding is continuous, so a fractional index is perfectly well-defined — it is just not what the ecosystem
+conditions on, and at 8 steps the schedule's indices sit ~0.3 off an integer in *every* step.
+`sampler.sdScaleInitialNoise` and `sampler.sdModelTimestep` own these, document the disagreement, and a fast
+test pins both so neither can revert to the diffusers form. `Session.scaleInitialNoise` dispatches the first
+by family (krea2's flow matching must keep multiplying by exactly 1.0).
+
+⚠️ **The third one is the interesting case, because it is a bug whose visibility depends on the sampler.**
+Both implementations read the same (bit-identical) 1000-rung beta ladder at the same `linspace(999, 0, steps)`
+indices; they differ only in the space the fractional index is interpolated in. `sampler.interpLadder` lerped
+sigma (diffusers' `EulerDiscreteScheduler`); ComfyUI's `ModelSamplingDiscrete.sigma` lerps `log_sigmas` and
+exponentiates. Worth up to **4.4e-5** mid-schedule, which is:
+
+- **invisible to the fixture**, which compares against *diffusers* at the 2e-4 the log/exp round trip forces;
+- **invisible to Euler** — 53.83 dB before the fix, 53.59 after, i.e. unchanged, because the residual there
+  is the UNet's own ~1e-4 and Euler's trajectory is smooth in sigma;
+- **fatal to any SDE sampler**, because `brownian.zig` quantises the sigma axis to 1e-6 and uses it as a
+  **tree key**. 4.4e-5 is 44 cells, so every step drew unrelated noise. Receipt: ComfyUI rendered against
+  itself with **one** sigma of twenty nudged across **one** cell is **28.9 dB**; nudged by 1 ulp *within* a
+  cell it is 69.4 dB. The quantity is chaotic in its last digits and smooth in its value.
+
+`sdSchedule`/`interpLadder`/`sdTrainIndex` now compute in **f32, matching the reference's rounding rather
+than bounding it** — the opposite of `timestepEmbedding`'s f64 policy, and deliberately so: a quantised key
+has to agree digit for digit, where a numeric quantity only has to agree closely. That includes reproducing
+`torch.linspace`'s f32 `step` and halfway split for the index, and the fact that `exp(log(x))` is not the
+identity in f32. Result: the 4- and 10-step schedules are **bit-exact** to ComfyUI, 19/21 and 29/31 sigmas
+land in the right `round6` cell at 20 and 30 steps (the residual is one ulp of torch's vs Zig's `expf`).
+`test "the SD schedule matches ComfyUI's `normal` scheduler, not diffusers'"` pins it at 2.4e-7 relative
+*and* asserts the cell-agreement fraction, since the tight bound alone does not describe what the SDE
+sampler consumes.
+
+**The generalizable lesson, and it is the fourth time this file has had to record a version of it:** matching
+a reference implementation exactly still leaves the *choice of reference* unvalidated. The schedule bug above
+was a correct port of the wrong `timestep_spacing`; the noise scale and timestep were correct ports of
+diffusers where the compatibility target is ComfyUI; the interpolation space was a correct port of diffusers
+that *no existing test or render could see* until a sampler came along that consumed the value differently.
+A render comparison against the actual target is what caught all four, and nothing in a fixture suite would
+have. **Corollary worth keeping:** "this tolerance is loose enough for the current consumer" is a claim with
+an expiry date.
 | `core.clip_tokenizer` (CLIP BPE) | ✅ matches `CLIPTokenizer` on 10 adversarial cases |
 | `Session` family generalization | ✅ `pipeline.Family`, both families behind one stage API |
 
-### One `Session`, two families
+### One `Session`, three families
 
-`Session.models` is a `union(Family)` over `Krea2Models` (three checkpoints) and `Sd15Models` (normally
-one), and the stage API is unchanged — `encode` → `denoiser` → `predict` → `decode` dispatch internally,
-so **every existing caller, including ggufy's whole measurement ladder, works on both families**. What
-made that possible is that the Euler step consumes the same quantity either way: krea2's velocity and
-SD's eps are both the trajectory derivative.
+`Session.models` is a `union(Family)` over `Krea2Models` (three checkpoints) and `SdModels` (normally
+one) — **the same struct for both `.sd15` and `.sdxl`**, since they differ only in `Config`s and in
+SDXL's second text tower, so `denoiser`, `predict`, `decode` and teardown are shared verbatim rather
+than duplicated. Bind `Session.sd()` once and no further family test is needed.
+
+The stage API is unchanged — `encode` → `denoiser` → `predict` → `decode` dispatch internally, so
+**every existing caller, including ggufy's whole measurement ladder, works on all three families**
+(ggufy needed *no* changes for SDXL). What made that possible is that the Euler step consumes the same
+quantity either way: krea2's velocity and SD's eps are both the trajectory derivative.
 
 New family-aware surface, because these are the things a caller genuinely cannot decide for itself:
 `Session.family()`, `.schedule(gpa, steps, shift)` (krea2 reads `shift`; SD's ladder comes from the
@@ -291,8 +409,10 @@ otherwise miss on every one.
 The concrete case this exists for: ggufy writes a GGUF holding **only** the UNet, so a *quantized* SD arm
 is measured with the UNet from the GGUF and CLIP + VAE from the original checkpoint, while an unquantized
 arm reads all three out of one file.
-- ⚠️ **SD1.5 is refused on any GPU backend** (`error.UnsupportedBackend`). There are no device kernels
-  for this UNet, and the failure mode of pretending otherwise is already on the record: when `pipeline`
+- **The SD family runs on every backend** as of 2026-08-01 (`sd_unet{_gpu,_cuda}.zig`,
+  `sd_vae{_gpu,_cuda}.zig`) — see "### The SD family on the GPU" below and BACKEND.md §2A.
+  It was refused on any GPU backend before that, and the refusal was the right default while
+  it lasted: the failure mode of pretending otherwise is on the record, since when `pipeline`
   learned to open a GGUF, Vulkan rendered a blank white image with no error.
 - ⚠️ **`sampler.scaleInitialNoise` is applied unconditionally and is a no-op for krea2.** Flow matching
   starts at sigma = 1, so the multiply is by exactly 1.0 (bit-identical, and the function early-returns);
@@ -306,6 +426,19 @@ arm reads all three out of one file.
   ggufy quantizes a rank-4 conv weight — so a per-column imatrix lines up without reinterpretation.
 - **A named `Models` union, not an inline one:** an anonymous `union(Family)` in the field makes the
   compiler derive its name from the first field's type and then report a dependency loop.
+- ⚠️ **The live per-step PREVIEW is a latent *format*, and it was krea2-only until 2026-08-03.** Both
+  halves of it hardcoded krea2's 16 channels — `downsampleLatent`'s channel loop and the
+  `wan_vae.latentPreviewInto` call — so the first previewed SD render in the GUI read four planes past the
+  end of a 4-channel latent and **panicked mid-generation** (`index out of bounds: index 0, len 0`), on
+  SD1.5 and SDXL alike. `Session.latentPreviewInto` dispatches by family now, alongside
+  `latentChannels()`/`scaleInitialNoise`, and `downsampleLatent` takes the channel count. Two things that
+  are not interchangeable even within the SD family: SD1.5 and SDXL have **different** latent2rgb
+  matrices, and SDXL carries a **bias** where SD1.5's is zero (from ComfyUI's `latent_formats`) — the
+  wrong one is not a crash, just a preview with plausible structure and wrong colours.
+  - The taesd-quality preview stays **krea2-only on purpose**: TAEHV (`taew2_1`) is a 16-channel Wan
+    approx-VAE and cannot decode an SD latent at all. The SD equivalents (TAESD / TAESDXL) are a
+    different, unimplemented decoder, so a taesd request from the GUI degrades to latent2rgb through the
+    existing `method == 2 and taehv_dec == null` path. Loading it anyway is what produced the panic.
 
 **The SD family's sampling differs from krea2's in three ways that all have to line up**
 (`sampler.zig`'s discrete-eps section): sigma comes from a discrete beta ladder rather than a formula, the
@@ -357,6 +490,737 @@ With 640 values per group the biased/unbiased difference is ~0.08% — too small
   becomes the unknown token. The hidden-state comparison *passed* on those ids, because both sides were
   fed the same garbage; only the pooled-output lookup (no eos to find) caught it. Fixture content is part
   of a fixture's correctness.
+
+### SDXL
+
+Same three files as SD1.5 (`sd_unet`, `sd_vae`, `clip_text`) plus a second text tower — no new model
+files, because the SD1.5 work left the right seams. What changed:
+
+| | SD1.5 | SDXL |
+|---|---|---|
+| levels | 4 (`{1,2,4,4}`) | 3 (`{1,2,4}`) |
+| attention | levels 0–2 | levels **1–2** (none at the outermost) |
+| transformer depth | 1 everywhere | `{_, 2, 10}` per level |
+| heads | `num_heads = 8` (head_dim grows) | `num_head_channels = 64` (**head count** grows) |
+| `proj_in`/`proj_out` | 1x1 conv `[c,c,1,1]` | `nn.Linear` `[c,c]` |
+| conditioning | CLIP-L, 768 | CLIP-L ++ CLIP-G, **2048** |
+| extra | — | `y` = pooled ++ 6x256 size sinusoids → `label_emb` → `+= emb` |
+| VAE | scale 0.18215 | scale **0.13025**, otherwise identical |
+| skips / output blocks | 12 | 9 |
+
+**Reference is `tools/gen_sdxl_fixtures.py`, and it drives ComfyUI, not diffusers** — a deliberate
+departure from the SD1.5 generator. ComfyUI is the compatibility target (renders here are verified
+pixel-identical to it), and more importantly it is what *settles SDXL's conventions*, none of which are
+derivable from the checkpoint. Hand-converting the state dict inside the generator would have made the
+fixture and the code under test share an assumption. Run it with ComfyUI's **`nvenv`**, not the
+ai-toolkit venv.
+
+⚠️ **Five conventions, each of which yields a plausible image when wrong.** This is the whole content
+of the SDXL work; the arithmetic was already there.
+
+1. **CLIP-G is stored in OpenCLIP naming with a fused `attn.in_proj_weight`** while CLIP-L, *in the same
+   file*, is a `transformers` CLIPTextModel. `clip_text.Config.Naming` carries which; the `[3h, h]` fused
+   matrix's three row blocks are q, k, v in that order, taken as zero-copy views.
+2. **Both towers condition on the PENULTIMATE hidden state with the final LayerNorm SKIPPED**
+   (`layer_idx = -2`, `layer_norm_hidden_state = False`). Using the final state is the "clip skip"
+   difference and shifts style everywhere.
+3. **CLIP-L pads with EOS, CLIP-G pads with 0** (`"!"`), so the prompt is tokenized **twice**
+   (`clip_tokenizer.encodePadded`). The pad slots are inside the 77-token window the UNet cross-attends
+   to and a causal tower gives them distinct hidden states, so this is conditioning, not filler.
+4. **Pooled comes from CLIP-G only**, from its *final-LayerNormed* last hidden state at the first EOS,
+   through `text_projection` — stored in `x @ T` orientation, i.e. the transpose of an `nn.Linear`
+   weight (`projectPooled` does the transpose explicitly; the reference implementations flip it at load).
+5. **`y` is pooled ++ six 256-wide sinusoids of (height, width, crop_h, crop_w, target_h, target_w)** —
+   h before w, LDM's order. Any permutation is a valid 2816-vector that SDXL absorbs as a differently
+   *composed* image. `sd_unet.admVector` + `MicroCond`, pinned by a fixture rather than reasoned about.
+   The micro-conditioning is built in `Session.denoiser`, not `encode`, because it carries the image
+   size; defaults are original == target == the render, no crop, which is what ComfyUI and diffusers
+   both use (ComfyUI derives them from the latent shape).
+
+⚠️ **`detectFamily` must test SDXL before SD1.5, and by `label_emb`.** Both are LDM UNets with the same
+`input_blocks.0.0` stem, so the stem cannot distinguish them; reading it first loads every SDXL
+checkpoint as SD1.5 and fails at the fourth level's missing weights instead of saying what it is. The
+detection test's SDXL cases deliberately carry **both** tensors, so they pin the *order* — a case with
+`label_emb` alone would pass either way.
+
+⚠️ **Two ComfyUI-as-a-library traps, both silent.** Worth knowing before writing another generator
+against it:
+
+- **`comfy.options.enable_args_parsing()` must be called before importing `comfy.cli_args`**, or argv is
+  parsed as `[]` and *every* flag silently defaults — the "CPU fp32" reference was running on the GPU
+  with xformers, whose only symptom was an unrelated-looking `NotImplementedError` deep in attention.
+  The generator asserts the flags took, precisely because there is otherwise no diagnostic.
+- **Forward hooks do not fire where you expect.** `text_model.embeddings` is bypassed (ComfyUI computes
+  token embeddings outside it so textual-inversion vectors can be spliced in, passing `embeds=`), and
+  `input_blocks[i]` is never *called* (the UNet hands each `TimestepEmbedSequential` to
+  `forward_timestep_embed`, which iterates the children and dispatches on their type). Capture the
+  encoder's *input* for the former and patch that function for the latter. Getting this wrong silently
+  produced a fixture with **zero** stage rows, not an error.
+
+**Verified end to end: 56.1 dB against a ComfyUI reference render** (512², 8 steps, CFG 7.5, same seed;
+RMSE 0.4/255, 0.02% of pixels off by more than 8/255) — after the two sampling conventions above, which
+this comparison is what found. 8.8 s/step on 8 CPU cores in ReleaseFast, against ComfyUI's 25 s/step at
+CPU fp32.
+
+**Measured, all 17 SDXL tests green** (`zig build test -Dintegration -Dtest-filter=SDXL`, 7 min):
+CLIP-L and CLIP-G both match ComfyUI at rel L2 < 3e-3 (including the fused-QKV split, checked at the
+embedding output and after layer 0 before 32 layers can smear a mistake), the concatenated 2048-wide
+context matches row by row *and* half by half (which pins the concatenation order), pooled matches, `y`
+matches `encode_adm` to 1e-6, the UNet matches at 16² and 64² at rel L2 < 1e-3 with no per-phase
+structure, and the VAE matches at both sizes.
+
+⚠️ **`Workspace.init` now takes `ctx_seq`**, and this was a latent bug, not a tidy-up. Cross-attention
+writes `ctx_seq` rows of keys/values into `k`/`v`, which at a small latent **exceeds** the position count
+(a 16² latent gives 64 positions at the innermost level against 77 context rows) — the old
+positions-only sizing was sufficient only by accident, via an allocation ~10x larger than needed. Sizing
+the attention scratch per *attending* level at its own resolution also drops a 1024² SDXL render's
+feed-forward buffer from 671 MB to 84 MB, which matters because SDXL's outermost level does not attend
+at all.
+
+`--text-encoder-2` overrides CLIP-G for a split-file checkpoint (a bundled one carries it, and
+`conditioner2` resolves independently of `conditioner` so `--text-encoder` overrides only the first tower).
+⚠️ **That split path is unexercised** — every SDXL checkpoint here is bundled, so it is built and reviewed
+but not measured; asking krea2 or SD1.5 for `conditioner2` is `error.NoSuchComponent`.
+
+### Long prompts: attention weights and 77-token chunking
+
+⚠️ **`clip_tokenizer.encode`/`encodePadded` truncate at ONE 77-token window, and until
+2026-08-03 that was the whole prompt path — so every real prompt rendered a different
+image than ComfyUI's.** This was reported as "same prompt, negative, seed, steps, cfg,
+sampler, scheduler — what gives?", with two visibly different SDXL renders. It is worth
+recording precisely because nothing failed: no error, no warning, and a composition
+close enough to the reference that it read as a numerics problem.
+
+Measured on the reported prompt (115 CLIP tokens): ComfyUI built **154** conditioning
+rows, this engine built **77** and silently dropped everything from `(lens flare:0.75)`
+through `newest` — which is to say the lens flare (visibly present in one render and
+absent in the other) and the entire `masterpiece, best quality, very aesthetic, high
+contrast, vibrant` block, hence one saturated image and one flat one.
+
+Two independent gaps, and the second makes the first bite earlier than the prompt's
+length suggests:
+
+1. **No chunking.** ComfyUI packs into as many whole 77-token windows as it takes and
+   concatenates along the sequence axis. `encodeWeighted` now does; `Cond.seq` was
+   already threaded through every backend, and both GPU UNets already sized
+   cross-attention `@max(n, ctx_seq)`, so nothing below the encoder needed changing.
+2. **No emphasis parser.** `(shiny skin:1.1)` tokenized *literally* — nine content
+   slots spent on punctuation that ComfyUI strips, at weight 1.0. About 25 of the 75
+   usable slots in that prompt were syntax.
+
+⚠️ **The weight is an interpolation away from the EMPTY PROMPT, not a multiply**, and
+not A1111's mean-renormalized form either:
+
+```
+z[j] = (z[j] - z_empty[j]) * w + z_empty[j]
+```
+
+`z_empty` is the same tower run on `[BOS] [EOS] pad…` at the same capture layer, indexed
+by the same position `j`. So `w = 0` means "whatever this slot says with no prompt at
+all" rather than a zero vector. All three candidate forms produce a plausible image; a
+plain multiply misses ComfyUI by **3.1e-2** where the correct form lands at **2.2e-6** —
+a factor of 14,000, which is why this gets a fixture rather than an argument.
+`clip_text.applyWeights` owns it, and the two GPU arms call that same function rather
+than reimplementing it.
+
+**Four conventions that are not derivable, all verified against ComfyUI's own code:**
+
+| | |
+|---|---|
+| `BREAK` | **not honoured** — it tokenizes as the literal word `break`. A1111 pads to the next chunk on it; ComfyUI has no such rule and the split is purely length-driven. |
+| bare `(a)` | multiplies the weight by 1.1, cumulatively (`((a))` = 1.21) |
+| explicit `(a:1.5)` | **replaces** it absolutely — `((a:1.5))` is 1.5, not 1.65. The inner value wins over every enclosing multiplier. |
+| short segments | a tokenized segment under `max_word_length` (8) is pushed **whole** into the next chunk rather than split across the boundary; a longer one is split. |
+
+Also: the weight product accumulates in **f64** and narrows once (Python's `1.1*1.1` is
+1.2100000000000002, not f32's 1.2100001); a chunk's EOS goes **immediately after its
+content**, with padding after it, never before; and `pooled` comes from **chunk 0 only**
+and is never weighted — taking it from the last chunk would condition SDXL's `y` on the
+quality tags alone.
+
+**Pinned in two tiers, because the ids can be right while the weighting is wrong:**
+
+- `tools/gen_clip_prompt_fixtures.py` → `fixtures_weighted.json` (ungated, `tp_core`):
+  31 adversarial prompts × 2 paddings against ComfyUI's own `SDTokenizer`, exact on ids
+  *and* weights. Verified to have teeth — setting `max_word_length` to 999 or dropping
+  the 1.1 multiplier each fails 6 cases.
+- `tools/gen_clip_cond_ref.py` → `clip_cond_ref.safetensors` (gated): ComfyUI's
+  `CLIPTextEncode` output on two real checkpoints. Agreement **1.2e-6–2.7e-5** rel L2
+  across 14 prompt × tower comparisons.
+
+**End to end, like-for-like against ComfyUI** (SDXL, 1024×1536, 35 steps, CFG 5,
+`dpmpp_2m_sde_heun` + `karras`, same seed): **12.85 dB → 35.56 dB** (SSIM 0.584 → 0.982),
+and **38.30 dB** with `euler` at the same settings — which is the isolation showing the
+residual is the SDE amplification the sampler section documents, not the conditioning.
+
+⚠️ **One trap in taking that measurement**: the reference PNG had been produced with
+`VAEDecodeTiled` (tile 512), and ComfyUI's own tiled decode differs from its whole-image
+decode by **28.25 dB**. Comparing against it caps any result near 28 dB and looks like a
+real defect in this engine. Re-render the reference with the decode you are actually
+comparing to.
+
+### Two prompt dialects: ComfyUI and AUTOMATIC1111
+
+`--prompt-syntax comfy|a1111` (`Options.prompt_syntax`, plus `--emphasis
+original|no_norm|ignore`). Landed 2026-08-03 after the chunking work above, because the
+same prompt text is **not the same prompt** in the two ecosystems — five things differ, and
+every one of them changes the image:
+
+| | ComfyUI (`clip_tokenizer.encodeWeighted`) | A1111 (`core/prompt_a1111.zig`) |
+|---|---|---|
+| `(x:w)` | **replaces** the weight | **MULTIPLIES** the enclosed range |
+| `[x]` | literal text | **1/1.1 de-emphasis** |
+| `BREAK` | the literal word `break` | **forces a chunk boundary** |
+| 75-token boundary | hard cut | **backtracks to the last comma** (<=20 back) |
+| application | `(z - z_empty)*w + z_empty`, per position | `z*w`, then **one global rescale** restoring `z.mean()` |
+
+⚠️ **Row 1 is the counter-intuitive one.** Because `:w` multiplies, `(((house:1.3))` is
+`1.3 x 1.1 x 1.1 = 1.573` — the two unclosed parens still apply, since A1111 flushes open
+brackets at end of input rather than discarding them. Row 5 is the other trap: A1111's
+rescale is a single scalar over the whole chunk, so **emphasising one tag moves every other
+token in that chunk**, including the ones at weight 1.0. `no_norm` skips it and is what
+upstream itself recommends for SDXL.
+
+**Plus per-step scheduling**, which no other prompt path here has: `[a:b:when]` swaps a
+span mid-render and `[a|b]` alternates it every step. ⚠️ **`when` is a fraction of `steps`
+only when the literal contains a `.`** — `[b:3]` is step 3, `[b:.5]` is halfway, so `[b:1]`
+and `[b:1.0]` are different schedules.
+
+**The reference is A1111's `modules/prompt_parser.py` EXECUTED, not re-derived.** It
+imports standalone (only `re` + `lark`), so `tools/gen_a1111_prompt_fixtures.py` runs its
+real Lark grammar. ⚠️ **A1111 is AGPL-3.0 — the generator fetches it at run time and it is
+never vendored**; the fixture records the upstream sha256.
+
+⚠️ **Upstream parses with Earley and this is recursive descent, so equivalence is
+MEASURED**: 283 schedule cases agree exactly (43 hand-picked, every upstream doctest
+included, plus a 240-case seeded random corpus over the stressing alphabet at 4/10/20
+steps). It rests on reproducing upstream's *failure* behaviour, since on any parse error it
+discards scheduling and renders verbatim. Two rules make real prompts fail, both in
+`unschedulable`:
+
+- **A bare `|` is legal ONLY directly inside a MATCHED `[...]`.** Top level, inside `(...)`,
+  or inside an unbalanced bracket all fail — so **NovelAI-style `{a|b}` prompts silently
+  lose all scheduling in A1111**, and reproducing that is the difference between matching
+  the reference and being "reasonable".
+- **An alternation option may not contain a top-level `:`** (`[a|b:0.5]` fails,
+  `[a|(b:0.5)]` parses — there the `:` is inside parens).
+
+⚠️ **One upstream doctest is STALE and fails upstream too** (`a [{b|d{:.5] c`, 1 of its
+24). Pin what the code does, not what the docstring says — `doctest.testmod` on the
+reference is how you find that out.
+
+⚠️ **Two fixture groups initially had NO TEETH**, found by deliberately breaking the
+implementation and seeing nothing fail. Both are now covered and the second is guarded:
+
+1. `:w` multiply-vs-replace is indistinguishable unless a case nests an explicit weight
+   *inside another* (`((a:1.2):1.5)` -> 1.8 vs 1.5): replace-then-multiply-later coincides
+   with multiply-then-multiply whenever the inner weight is applied first.
+2. `comma_padding_backtrack` **never fires on an alternating `word, word,` prompt** — the
+   boundary always lands ON the comma. It needs unpunctuated words carrying the boundary
+   past a comma. The generator now **asserts** at least one case distinguishes the setting
+   on from off and refuses to emit a corpus that does not.
+
+**How a step-dependent prompt reaches the model**, and what it deliberately does not
+disturb:
+
+- `Cond.sched` holds the extra conditionings plus a per-step index, while
+  `data`/`seq`/`pooled` **stay entry 0** — so every existing caller, including ggufy's
+  measurement ladder and the composed-stages invariant, is untouched. `Denoiser.predict`
+  keeps its signature and means entry 0; `predictAt(step)` is the scheduled form.
+- ⚠️ **Dedup by text is load-bearing, not an optimization.** `[a|b]` contributes a schedule
+  entry for EVERY step, so 35 steps is 35 entries over 2 distinct texts; encoding per entry
+  would mean 33 wasted tower forwards and 33 wasted device sessions.
+- ⚠️ **`seq` can differ between entries**, so the shared UNet workspace is sized over every
+  entry of both branches, not just entry 0 — cross-attention writes `ctx_seq` rows into it.
+- ⚠️ **The sigma schedule is now computed BEFORE the text encode**, because the prompt
+  schedule is indexed by step and the count is `sigmas.len - 1` (not `opts.steps` —
+  `ddim_uniform` and `beta` return a different number). The hoist is safe: `scheduleWith`
+  is pure and touches no RNG, and the gated bit-identical-stages test still passes.
+- ⚠️ **The PNG `parameters` block now records `Prompt syntax:` (and `Emphasis:` under
+  a1111).** A reader re-renders from that block and the same text means a different image
+  per dialect; A1111's own format has no such field because A1111 has only one dialect.
+  Same reasoning that stopped `Sampler` and `Schedule type` being hardcoded.
+- ⚠️ **Prompt weights that the loaded text encoder cannot apply are WARNED about and the
+  prompt encoded verbatim — not refused, and not silently dropped.** krea2 is the case:
+  qwen3 tap states have no fixed token window, so emphasis has nowhere to apply.
+  - **This was `error.PromptSyntaxUnsupportedForFamily` and it went through two wrong
+    versions before this one.** First blanket (reported as "why does krea2 report
+    `PromptSyntaxUnsupportedForFamily`?"), which failed even a *plain* prompt — the dialect
+    is a **persistent** setting, so a global choice made for an SDXL render broke every later
+    krea2 render, on prompts where the two dialects are byte-identical. Then narrowed to
+    weighted prompts, which was still stricter than any live tool.
+  - **What settled it: emphasis weighting is a CLIP-only feature in every implementation.**
+    Checked against **SD.Next** (`dev`) rather than A1111, which never had to decide, having
+    only ever had CLIP. `processing_prompt.set_prompt` gates its emphasis parser behind an
+    allow-list of `StableDiffusion*` / `StableCascade` / `Flux`; everything else —
+    Qwen-Image, Wan, Lumina, Flux2, krea2's shape — falls to `prompt_attention = 'fixed'` and
+    the raw string reaches the pipeline unparsed. **SD3 is the clincher**, having both kinds of
+    encoder at once: the CLIP towers go through the weighted provider while the T5 tower is
+    `_get_t5_prompt_embeds(prompt=…)` on the raw string, the two then concatenated. Flux is
+    *on* the allow-list and still encodes unweighted ("clip is only used for the pooled
+    embeds"). Chroma and HiDream sit **commented out** of the list: tried, then disabled.
+  - The warning is what keeps the house rule intact — nothing is silent here, where SD.Next
+    only `debug_log`s its own fallback. **Verbatim rather than stripped** is deliberate: it
+    keeps `.comfy` and `.a1111` byte-identical on such a model (verified: identical md5 on a
+    krea2 render), and `--emphasis ignore` is the explicit way to parse the syntax away.
+- ⚠️ **The capability is read off the ENCODER (`TextEncoder.supports_prompt_weights`), not
+  from a list of architectures**, and SD.Next is the argument for that too: its allow-list
+  matches **substrings of pipeline class names**, which needs a `'Flux2' not in cls` guard so
+  `Flux` does not swallow a different architecture, and needs editing for every new pipeline —
+  silently giving the wrong answer until someone does. `pipeline.supportsPromptWeights(fam)`
+  reads the declaration on the encoder actually loaded, so it cannot drift from the real
+  capability, and a newly added encoder must state its answer or **fail to compile**. The three
+  properties that decide it are documented on `clip_text.TextEncoder`: a fixed token window,
+  rows the denoiser cross-attends to 1:1, and an empty-prompt encode of matching shape to
+  interpolate against.
+- **Per-step scheduling works on every family**, including krea2, and is a genuine feature the
+  ComfyUI dialect cannot express (there `[…]` is literal text): `Cond.sched` is family-neutral
+  and `encodeText` runs once per resolved text. ⚠️ Which is why the weight check runs on the
+  **schedule-resolved** text — `[cat:dog:0.5]` reaches `encodeText` as `cat`/`dog`, and
+  checking the raw string would read a bare `[…]` as de-emphasis. The test goes through
+  `planSchedule` for that reason.
+
+### Reproducing an A1111 render: the RNG, and two more sampling conventions
+
+`--compat comfy|a1111` (`Options.compat`, plus `--rng cpu|nv`, `--sgm-noise-mult on|off`,
+`--quantize-t on|off` as per-knob overrides). Landed 2026-08-04, after the prompt-dialect
+work above, because **matching A1111's prompt syntax is not enough to reproduce an A1111
+image** — the same seed was still a different picture. Three more things differ, all of
+them *sampling* rather than text, and every one was hardwired here to ComfyUI's choice:
+
+| | A1111 default | ComfyUI (was unconditional here) | cost |
+|---|---|---|---|
+| `randn_source` | **`GPU`** — NVIDIA Philox | torch CPU MT19937 | **an unrelated image** |
+| `sgm_noise_multiplier` | **`False`** — `x·σ₀` | `x·sqrt(1+σ₀²)` | ~9 dB |
+| `enable_quantization` | **`False`** — fractional σ→t | nearest *trained* index | ~25 dB |
+
+⚠️ **The RNG is categorically worse than the other two, and it is the one nothing here
+could have caught.** The second and third perturb a trajectory; the first replaces the
+starting point with an unrelated draw. Upstream's own description of the option is "changes
+seeds drastically". The other two are already documented from the *other* direction — the
+`sdScaleInitialNoise` and `sdModelTimestep` doc comments name **diffusers** as the side
+that disagrees with ComfyUI, and A1111 happens to sit on diffusers' side of both. So this
+is the third ecosystem to land on the same two forks in the road, which is the argument for
+`Compat` being a named axis rather than three loose flags.
+
+**`core/philox_rng.zig`** is the port: Philox4x32-10 + Box-Muller, with
+`core/noise.zig` as the two-engine selector (`torch_cpu` | `nv_philox`) that both consumers
+dispatch through. Reference is A1111's own `modules/rng_philox.py` — a pure-numpy CPU
+imitation of CUDA's generator, which is what its third `randn_source` setting ("NV")
+selects — so the target is executable and **no GPU-side RNG work was needed**.
+`tools/gen_philox_fixtures.py` runs it (AGPL: fetched at generation time, never vendored,
+sha256 recorded) and the port is **bit-exact** on the block cipher and on every normal,
+including an FNV-1a hash over whole latent-sized draws.
+
+⚠️ **It must apply to the Brownian tree as well, and that half is invisible on the default
+sampler.** The k-diffusion commit A1111 pins (`ab527a9a`) constructs
+`torchsde.BrownianTree(t0, w0, t1, entropy=s)` on `w0 = zeros_like(x)[0]` — the latent's own
+**CUDA** tensor — with no `cpu` kwarg anywhere, where ComfyUI's fork forces the tree to the
+CPU. So under A1111 *every* SDE node is a Philox draw too. Wiring only the initial latent
+would have made `euler` reproduce perfectly while every SDE render stayed wrong, with
+nothing failing — the same shape as the Vulkan capture that recorded 39 of 263 layers and
+passed its own gate. `SdeStepper.Options.noise_src` → `brownian.NoiseSampler.src`.
+
+⚠️ **`rng_philox` is faithful to real CUDA only below a HARDWARE-DEPENDENT element count,
+and the numpy code's shape actively misleads about why.** ATen's kernel
+(`DistributionTemplates.h`) gives each thread one `curand_normal4` and spreads its four
+normals across a grid stride, so element `i` is *not* obviously thread `i`'s first normal.
+It is, because the launch is `grid.x = min(SM_count · (maxThreadsPerSM/256),
+ceil(numel/256))`: below the cap there is one thread per element and only `rand.x` is ever
+consumed — which is exactly `counter[2] = i`, sine only. ATen's own comment says so ("for
+common tensor sizes, we end up using rand.x from each thread"). On a 3090 the cap is
+**125,952 elements** — above a 1024×1536 latent's 98,304, below a 1536²'s 147,456. Past it
+the tail comes from the cosine partners and the noise genuinely differs. `Generator.threads`
+reproduces that regime and a test pins the equivalence below the cap / divergence above it;
+**nothing in the CLI sets it**, deliberately, because reproducing a *foreign* A1111 render
+would require knowing which GPU drew it. A1111's own "NV" setting has the identical limit.
+
+⚠️ **The arithmetic is numpy's f64, not curand's f32**, because `uint32 * float32` promotes
+to **float64** under NumPy's rules: `box_muller` runs in f64 with f32-rounded constants and
+narrows once, where curand's device path is f32 throughout and uses the `__sincosf`
+intrinsic. So this is bit-exact against `randn_source="NV"` and ~1e-6 relative against
+`"GPU"` — two orders below the 1.3e-4 model-level disagreement the render comparison already
+carries, and the f64 side is the one with an executable reference.
+
+**Also recorded in the PNG `parameters` block**, on the same reasoning that stopped
+`Sampler` and `Schedule type` being hardcoded: `Compat: A1111` when not ComfyUI, plus
+`RNG:`/`SGM noise multiplier:`/`Quantize timesteps:` **only when overridden away from that
+compat's own defaults** — so an ordinary ComfyUI render's block is byte-for-byte what it was
+before this existed. `RNG` keeps A1111's own field name and its `CPU`/`NV` spellings.
+
+**Verified end to end, with the control in the same run** (SD1.5 dreamshaper_8, 512²,
+8 steps, CFG 7.5, euler + `normal`, seed 12345, CPU fp32 both sides). A1111 is not installed
+here, so the reference is **ComfyUI with exactly those three conventions substituted** — real
+`rng_philox` noise, `Sampler.max_denoise` forced False (which is precisely what turns
+ComfyUI's `noise_scaling` into `noise · sigma`), and `model_sampling.timestep` returning
+k-diffusion's unquantized fractional index:
+
+| | vs its own reference | the two arms against each other |
+|---|---|---|
+| `--compat comfy` | **64.05 dB**, SSIM 0.9999 | |
+| `--compat a1111` | **66.42 dB**, SSIM 1.0000, max 5/255 | **8.55 dB**, SSIM 0.289 |
+
+Three things that table says. The a1111 arm lands *slightly better* than the control, so all
+three conventions are wired right rather than partially right. The 8.55 dB between the arms is
+**identical on both engines** (ComfyUI's own two arms differ by the same 8.55 dB / 0.289), which
+is the cross-check that the divergence is the conventions and not this implementation. And 8.55
+dB is what "an unrelated image" looks like numerically — for scale, the *prompt dialect*
+difference is 19.6 dB and the SDE-amplification residual is 19–28 dB.
+
+⚠️ **The reference is a simulation of the target, not the target** — it shares this reading of
+A1111's source, so it validates the wiring (through an independent UNet, VAE and sampler loop)
+and not the reading. What is independently pinned is the piece the reading could most easily
+have got wrong: the noise itself, bit-exact against upstream's own `rng_philox`.
+
+**Still owed, and it needs a device:** `rng_philox` == `torch.randn(device='cuda')` is argued
+from ATen's and curand's source above but **not measured** — the GPU was fully occupied when
+this landed. One `torch.randn((4,64,64), device='cuda')` against `Generator(seed).randn` settles
+it; expect agreement to ~1e-6, not bit-exact, for the f64-vs-f32 reason above.
+
+**Two things deliberately NOT done**, since both would be guesses: A1111's `subseed` /
+`seed_resize_from` / `eta_noise_seed_delta` (all no-ops at their defaults, which were
+checked), and the capped-thread regime above.
+
+### The SD family on the GPU
+
+Landed 2026-08-01: `sd_unet_gpu` / `sd_unet_cuda` and `sd_vae_gpu` / `sd_vae_cuda`, so SD1.5
+and SDXL run on **vulkan, zig-cuda and cuda** as well as the CPU. BACKEND.md §2A holds the
+support grid and the measured table (25-41x end to end on `cuda`); what follows is what
+a change here has to keep true.
+
+**Both stages map the way `vae_gpu` maps the Wan decoder** — activations stay tight
+channel-last `[h*w][c]` f32, a 3x3 convolution is a banded `im2col_sd` plus a GEMM, a 1x1
+convolution and an `nn.Linear` are that GEMM with no patch step. What a UNet adds over a VAE
+decoder is GroupNorm, a SpatialTransformer, and the LIFO skip stack; the SD VAE decoder then
+reuses the UNet's convolution and GroupNorm helpers rather than copying them (`convInto`,
+`groupNormInto`), so the two SD stages cannot drift apart.
+
+**The CLIP towers moved to the GPU on 2026-08-03** (`clip_text_gpu` / `clip_text_cuda`), and the
+reason they had stayed on the CPU stopped being true: "they run once per render and cost 0.0-0.9 s"
+described a single 77-token window, but a real prompt is two or three windows x positive and
+negative x two SDXL towers, which measured **1.7 s** at 1024x1536 - more than a whole 512^2
+sampling step. See "### Long prompts" above for why the chunking exists.
+
+- **The batch axis is the chunk**, since one 77-row window is only 77*heads threads. The
+  empty-prompt reference `z_empty` rides along as one more batch item, which is also exactly how
+  ComfyUI computes it - and it is cached per tower, so a second render pays nothing.
+- Three kernels were needed, all CLIP-specific and all listed in BACKEND.md 2A:
+  `attn_causal_batched` (vulkan only - `Backend.attn` already had a `causal` flag), plus ungated
+  `gelu_quick` and `gelu_erf` on both. ⚠️ **CLIP's tower is the only CAUSAL encoder here** - every
+  other one (SigLIP, Snowflake, the ViTs) is bidirectional, and a non-causal CLIP encodes every
+  prompt and renders every image, so there is nothing to observe if it is wrong. The Vulkan test
+  asserts the non-causal kernel *disagrees*, precisely so a swapped kernel cannot pass.
+- ⚠️ **The two towers of ONE checkpoint use different activations** (CLIP-L quick-GELU, CLIP-G
+  erf-GELU) and the three GELU forms here agree to ~1e-2 - close enough to look right, far enough
+  to shift style. Compared value by value, not in aggregate, for that reason.
+- ⚠️ **Precision is not symmetric between the arms.** Vulkan follows `qwen3_gpu`'s convention
+  (f32 by default, tensor-core f16 only under `--encoder-f16`) and holds **1.1e-5** rel L2 against
+  the CPU forward; CUDA has only a tensor-core entry point at these widths, so it runs f16
+  regardless and lands ~1e-3 - the regime `sd_unet_cuda` already runs the denoiser in. So a `cuda`
+  render and a `cpu` render of one seed differ slightly at the conditioning.
+- ⚠️ **`Session.runClip`'s CPU fallback is an ALLOW-LIST, and making it a catch-all hid a real bug
+  behind an error naming the wrong stage.** `CUDA_ERROR_ILLEGAL_ADDRESS` is **sticky**: once a
+  kernel faults, every later call in that context fails too. The first version caught *any* error,
+  logged a warning, re-ran the encode on the CPU (which succeeds — it needs no device) and returned
+  normally; the render then died at the denoiser's first conditioning upload with
+  `cuMemcpyHtoD failed: CUDA_ERROR_ILLEGAL_ADDRESS`, three stages past the fault, with the real
+  error demoted to a warning. It was reported as "fails after the TE step", which is precisely
+  where it did not fail. Fallback is now limited to `UnsupportedDType` (a block-quantized tower
+  genuinely has no GPU GEMM) and `OutOfMemory` (context intact, and the CPU needs no VRAM);
+  everything else, `CudaError` above all, propagates. **Generalizable: never recover from a device
+  fault by running the next stage — the context is already poisoned, and the error that names the
+  faulting stage is worth more than a render that limps one stage further.**
+
+⚠️ **GroupNorm's statistics are Welford, not sum-and-sum-of-squares, and that is load-bearing.**
+`ops.norm.groupNorm` warns that the shifted `E[x^2] - E[x]^2` form loses catastrophically once
+the mean is large relative to the spread — a late VAE decoder block. Measured on the device at
+mean 400 / sd 1: Welford tracks the f64 CPU reference to **6.7e-5 rel L2**, which is f32's
+representation of `x` itself cancelling down to a quantity of size 1, while the shifted form
+has to resolve 160001 - 160000 in f32 and lands ~1% out on the variance. Chan's pairwise merge
+over the per-chunk statistics keeps that accuracy at ONE read of the activation, where the
+CPU's literal two-pass form would cost two.
+
+⚠️ **Attention head width is the one thing the three GPU arms do not share** (BACKEND.md §2A
+has the table). SD's heads are 40/64/80/160 wide; both GPU limits trace to the P@V GEMM tiling
+its head dimension in 128-wide blocks (`coopmat.buildGemmAttnOut`, `launchHgemmB`'s
+`grid.x = n/128`), so `cuda` uses cuDNN at the true width while `zig-cuda` and `vulkan`
+zero-pad up to 128. The padding is exact — a zero dimension contributes nothing to a dot
+product and V's zero columns give output columns `head_unpad` drops — so it only costs
+arithmetic. The fix is to parameterize those two builders by head width, not to change the
+model code. A too-narrow head is not a silent wrong answer on either: Vulkan's grid rounds up
+and the padding covers it, CUDA's `grid.x = 0` is `CUDA_ERROR_INVALID_VALUE`.
+
+⚠️ **f16's 65504 ceiling is a real limit on real checkpoints, and it made every SDXL
+render at 512² or larger a solid white image** (fixed 2026-08-03). Probed per stage: the
+SDXL VAE decoder's *residual stream* reaches **4.2e5** — the last upsample conv's f32
+output is 1.26e5 and the next block's 1×1 shortcut reads it — so casting the activation
+to f16 gave `inf`, the following GroupNorm turned that into NaN **through its mean**, and
+100% of the output was non-finite, which `planarF32ToRgb8` clamps to white. No error
+anywhere. SD1.5's VAE peaks near 7e3, which is why the family this code was written
+against never showed it, and it is the same reason ComfyUI decodes the SDXL VAE in fp32
+(or ships the "fp16-fix" weights) by default.
+
+- The fix divides *only the residual-reading convolutions* (the 1×1 shortcut and the
+  level upsamples) by **256** before the cast and multiplies the f32 result back:
+  `opConvF16Scaled` / `opMatmulCoopF16WScaled`, `convIntoScaled`, and
+  `residual_act_div` in both `sd_vae_cuda` and `sd_vae_gpu`. A power of two makes it
+  **exact** (an exponent shift; f16 keeps all 11 mantissa bits) and it is free — both
+  halves fold into kernels that already read every element. ⚠️ Those two kernels'
+  spare `f32` param is now load-bearing: **every caller must pass 1.0, not 0.0.**
+- **Every other convolution here reads a GroupNorm output (peak 67 measured), so it is
+  left alone** — scaling it would only cost precision at the bottom of the range, since
+  the divisor's real cost is that true values below `256·6e-8 = 1.5e-5` underflow to
+  zero (1e-10 of a residual whose peak is 1e5).
+- ⚠️ **Three false leads, recorded so nobody re-walks them.** The failure looked
+  *intermittent* — the same size passing then failing — which read as a race or a
+  stale-device-memory bug; it was a fresh random `z` per iteration landing either side
+  of the threshold. It looked *magnitude-independent* (a ×7.7 latent passed where ×1
+  failed) for the same reason. And it was **not** the attention path: swapping the
+  cuDNN arm for hand-PTX changed nothing, because both cast through the same
+  conversion kernel. A per-stage non-finite probe found it in minutes after ~an hour
+  of hypotheses — for a "100% of the output is NaN" symptom, bisect the stages first.
+- **`sd-cuda-test`'s VAE check is now a size × magnitude sweep** for this reason
+  (12×10 … 128×128, z at ×1 and ×7.7), and its reporter names *which side* went
+  non-finite and each side's max |v| — a bare `rel L2 nan` does not distinguish "the
+  reference overflowed" from "the kernel did". It also detects the checkpoint's family,
+  so an SDXL file exercises the sweep. ⚠️ Its reference decode must NOT run on an arena
+  (the CPU decoder frees every intermediate, an arena defers all of it to scope exit,
+  and the sweep got OOM-killed at 128²).
+
+⚠️ **`ensureDeviceBuffer` inside a recording batch is a live hazard, and it cost a wrong
+decode.** The SD VAE's activation sizing has to mirror the loader's own width bookkeeping: the
+first resnet of a level reads the PREVIOUS level's (wider) input at the NEW (doubled)
+resolution — 512 channels over 1920 positions where the level's own output is 256 — so sizing
+off `block_out_channels` alone under-allocates by 2x. That surfaced not as an allocation
+failure but as a **rel L2 of 0.24** against the CPU decoder, because growing the buffer
+discarded the activation it held and freed memory that recorded-but-unsubmitted dispatches
+still referenced. Both SD files now allocate everything BEFORE `beginBatch` and assert
+capacity rather than grow.
+
+⚠️ **`Context.smallBuffer` caches by POINTER and never re-uploads**, so a per-forward vector
+written back into the same host array would silently keep the first forward's values. The
+Vulkan UNet folds each ResBlock's timestep-embedding projection into its convolution bias —
+exact, since a conv bias is already a per-channel constant over positions, and it saves a
+read-modify-write of the full activation per ResBlock — and that folded vector changes every
+forward, hence `opMatmulCoopF16WDev` and one packed device buffer. The CUDA arm adds the
+projection with `opAddBiasRows` instead, because its GEMM entry points take a host bias slice
+and reworking that plumbing is not worth ~2% of a ResBlock.
+
+⚠️ **`ctx.independent(n)` counts DISPATCHES, not calls, and a coop GEMM is three of them
+sharing `x_h16`/`y_pad`.** Marking three q/k/v GEMMs independent therefore both let them
+clobber each other's scratch AND dropped the barriers *inside* the first one. That was the
+first bug in the Vulkan UNet, and it rendered a blue streak pattern rather than erroring.
+
+⚠️ **`head_unpad` writes binding `b`; `head_pad_h16` writes `d`.** A kernel bound to the wrong
+slot writes nothing, which reads as "attention returned zeros" — rel L2 of exactly 1.0. Worth
+knowing as a signature, because it looks like a numerics failure and is not.
+
+**Every new SPIR-V kernel is pinned against the CPU op it reproduces** (`sd_unet_gpu`'s test
+block, needing `-Dintegration` AND the `testdata/gpu-tests` marker): GroupNorm in both the
+mean-0 and mean-400 regimes, the erf-GELU gate value by value, cross-attention at unequal q/kv
+lengths, self-attention at all four SD head widths, the convolution at stride 1 / stride 2 /
+fused 2x upsample, the channel concat, the head pad/unpad round trip, and a whole-decoder
+parity test for the VAE. That harness localized every bug above in seconds; the one bug found
+by looking at a render instead cost far more.
+
+**The CUDA kernels are checked by `TensorPencil sd-cuda-test [<ckpt>] [libs]`**, not by a unit
+test: the test binary brings up no CUDA context, so validation here is a CLI command, matching
+`cuda-vae-test` / `cuda-dit-test`. It checks each kernel against its CPU op on random data,
+then both whole stages against their CPU forwards, and **exits non-zero if any check fails** so
+it works as a gate. Run it in BOTH arms — `libs` takes the cuDNN attention path, and the output
+makes the difference visible: it reports "runs at 40/64/80/160" where the default hand-PTX arm
+reports "runs at 128/128/128/256".
+
+⚠️ **One tolerance legitimately differs between the two backends**: `geglu` holds 1e-6 on
+Vulkan and needs 2e-5 on CUDA, because every kernel in `cuda/elt.zig` computes exp as
+`ex2.approx(x*log2e)` — an approximate instruction, per that file's header — where SPIR-V's
+`@exp` is not. Measured 6.6e-6, two orders below the f16 GEMM error either side of it. Do not
+"fix" it by tightening the bound.
+
+## Samplers and schedulers
+
+Two independent axes, and as of 2026-08-03 both are selectable — before that there was
+one sampler (Euler, called inline) and one schedule per family. They live in two files
+on purpose, because the concerns are orthogonal (any sampler runs on any schedule, which
+is why ComfyUI presents them as two dropdowns):
+
+| file | owns | surface |
+|---|---|---|
+| `core/schedule.zig` | **where the steps go**: all nine ComfyUI schedulers + the two families' sigma tables | `--scheduler`, `Options.scheduler` |
+| `core/sampler.zig` | **how to step**: Euler and DPM++ 2M SDE (midpoint / Heun) | `--sampler`, `--sde-eta`, `--sde-s-noise`, `Options.sampler` |
+
+Both also appear as Settings dropdowns in the GUI, and both are recorded in the saved
+PNG's AUTOMATIC1111 `parameters` block. ⚠️ **Both of those metadata fields used to be
+hardcoded** — a literal `Sampler: Euler`, and a `Schedule type` derived from the
+architecture — which was only ever right because neither was selectable. A reader
+(including ComfyUI's own metadata importer) re-renders from that block, so a stale name
+there is a wrong answer nothing else would catch.
+
+### The schedulers
+
+`schedule.SigmaTable` is the family-neutral view of `model_sampling.sigmas` that a
+scheduler reads: `.flux` (krea2 — 10000 entries from the shift formula, computed on
+demand) or `.discrete` (the SD family's 1000-rung beta ladder, borrowed from
+`SdModels.sigma_ladder`). `Session.sigmaTable`/`scheduleWith` dispatch; `Scheduler.defaultFor`
+keeps the pre-existing behaviour when the caller does not choose — **`simple` for krea2,
+`normal` for SD**, which are genuinely different defaults, so `null` (the GUI's "Model
+default") is a real choice and not a synonym for `normal`.
+
+All nine are ported: `normal`, `karras`, `exponential`, `sgm_uniform`, `simple`,
+`ddim_uniform`, `beta`, `linear_quadratic`, `kl_optimal`.
+
+⚠️ **`ddim_uniform` and `beta` do not return `steps + 1` sigmas.** The first strides the
+table (30 requested → 31 delivered), the second de-duplicates quantiles that round to
+the same rung (so it can return *fewer*). `generate` therefore takes its step count from
+`sigmas.len - 1` and reports a mismatch; looping to `opts.steps` reads past the end of a
+shortened schedule. The GUI's per-step total comes from the progress callback, which
+carries the real count.
+
+⚠️ **`beta` needs a real numeric routine, not a formula.** `scipy.stats.beta.ppf` is the
+inverse regularized incomplete beta; `schedule.zig` has `betaInc` (Numerical Recipes'
+Lentz continued fraction) and `betaIncInv` (plain bisection — the CDF is monotone on
+[0,1], it converges for roots of any magnitude, and Newton would need guarding against
+the infinite density at both ends when `a < 1`, which 0.6 is). Pinned against scipy at
+1e-11, with a forward round-trip so a fixture typo cannot make both sides agree on a
+wrong answer. `numpy.rint` is round-half-to-**even**, which `@round` is not.
+
+⚠️ **Three torch behaviours had to be reverse-engineered**, none visible in the Python
+source, each worth ulps on hundreds of table entries — and per the SDE section below, an
+ulp in a schedule value is a *different noise draw*:
+
+1. **`scalar / tensor` in PyTorch is `reciprocal(tensor) * scalar`** — two roundings, not
+   one. `flux_time_shift` is exactly that shape; a single f32 division disagrees on
+   **3114 of 10000** flux entries, 165 crossing a `round6` cell.
+2. **`torch.linspace` for f32 is FMA-contracted.** ATen's kernel is
+   `scalar_start + step * i` in `float` with `step` **also** in f32 (not the double its
+   `accscalar_t` suggests), which `-ffp-contract=fast` fuses. Hence `@mulAdd`, plus
+   torch's halfway split so both endpoints land exactly.
+3. **The same formula has two precisions depending on how it is called.**
+   `ModelSamplingFlux.sigma(t)` on a *tensor* is f32; the same class's
+   `percent_to_sigma` takes a *Python float* and is f64. `sigmaAt` is the second path and
+   `offsetFirstSigma` needs it.
+
+**Verified:** both sigma tables are bit-exact to `model_sampling.sigmas` on **every**
+entry, checked by an FNV-1a hash over the raw f32 bits rather than by sampling indices —
+deliberately, since the reciprocal convention above moves only 1.65% of the flux table
+and a seven-index spot check would miss it. Then all **9 schedulers × 2 families × 4 step
+counts = 72** combinations against ComfyUI's own `calculate_sigmas` at 4e-7 relative
+(max observed 3.0e-7, the floor set by torch's vectorized `logf` inside `interpLadder`),
+plus the fraction landing in ComfyUI's own `round6` cell: **68 of 72 place every sigma
+in the right cell**, the other four miss exactly one. End to end at 512²/10 steps against
+ComfyUI renders: `karras` **45.2 dB**, `beta` **48.4 dB** — both *better* than `normal`'s
+36.4 dB baseline, because they are pure formula / pure table lookup where `normal` goes
+through the log-space interpolation.
+
+### The samplers
+
+`pipeline.Options.sampler` (`sampler.Kind`) selects `euler`, `dpmpp_2m_sde` or
+`dpmpp_2m_sde_heun`. The two SDE variants are one solver differing only in the multistep
+correction form; ComfyUI ships both under those names and they give visibly different
+images.
+
+**Euler needs no state; DPM++ 2M SDE needs three kinds**, which is the whole structural
+difference and where the plumbing lives:
+
+- **Multistep history.** The second-order correction reuses the *previous* step's
+  denoised prediction, so `SdeStepper` is stateful — and `pipeline.Snapshot` had to
+  grow `sde_old_denoised`/`sde_h_last`, or an unload-while-paused resume would silently
+  take one first-order step and stop being bit-identical (the thing `resume_from`
+  promises). `SdeStepper.restore` is that path, pinned by a fast test that splits a run
+  in half and demands the same bytes.
+- **Half-logSNR, per family.** `lambda = log(alpha/sigma)`, and the families compute it
+  *differently*: `flow` (krea2/`CONST`) is `log((1-sigma)/sigma)`, `eps` (SD) is
+  `-log(sigma)`. `Session.parameterization()` dispatches. ⚠️ Getting it backwards is not
+  symmetric: `flow` on an SD ladder takes the log of a negative number and NaNs the
+  whole render, while `eps` on a krea2 schedule is perfectly finite and just integrates
+  the wrong ODE.
+- ⚠️ **`offsetFirstSigma`, without which flow matching is all NaN.** krea2's schedule
+  starts at sigma **exactly 1**, where `log((1-sigma)/sigma)` is -inf. ComfyUI's
+  `offset_first_sigma_for_snr` nudges it to `percent_to_sigma(1e-4)` = 0.99996833.
+  Ordering is load-bearing at both ends: it must run **after** `scaleInitialNoise`
+  (ComfyUI scales the starting latent by the *unoffset* first sigma) and **before**
+  `Session.denoiser`, which caches a timestep vector per schedule entry.
+
+**The noise is the hard part, and it is a real port, not a `randn`.** ComfyUI's SDE
+samplers draw from `torchsde.BrownianTree` via `BrownianTreeNoiseSampler` — one Brownian
+path over the *sigma axis*, fixed by the seed alone, queried by interval. That is what
+makes the same seed hold its structure across step counts, and it is three pieces, all
+now in `tp_core`:
+
+| file | reproduces |
+|---|---|
+| `core/seed_seq.zig` | `numpy.random.SeedSequence` entropy-pool mixing + `generate_state` |
+| `core/brownian.zig` | the dyadic `BrownianInterval(halfway_tree=True, tol=1e-6)`, W-branch only |
+| `core/torch_rng.zig` | `torch.randn` per node (already existed) |
+
+⚠️ **Which generator that last row uses is selectable, and A1111 needs the other one.**
+`core/noise.zig` dispatches to `torch_rng.zig` or `philox_rng.zig`; the tree's `src` comes
+from `SdeStepper.Options.noise_src`, because A1111's pinned k-diffusion builds the tree on
+the CUDA tensor's own device where ComfyUI's fork forces it to the CPU. See "Reproducing an
+A1111 render" above — and note that a wrong choice here is invisible under `euler`.
+
+**This is also why `schedule.zig` computes in f32.** The tree's time axis is quantised to
+1e-6 while an f32 sigma near 10 has an ulp of 9.5e-7 — the same order — so a schedule
+value one ulp off can land in the neighbouring cell and that step draws unrelated noise.
+Measured: one sigma of twenty crossing one cell costs **28.9 dB** (ComfyUI against
+itself), staying inside it costs 0.6 dB. A quantised key has to agree digit for digit, so
+here — uniquely — being *more* accurate than the reference is just being different.
+
+- ⚠️ **`brownian.round6` is Python's `round(x, 6)`, and neither shortcut works.**
+  `@round(x*1e6)/1e6` double-rounds; Zig's own formatter rounds the *shortest
+  round-trip decimal* half-up, where CPython rounds the **exact** binary value
+  ties-to-even. So it is done exactly (integer mantissa arithmetic, then a
+  correctly-rounded parse). Ties are reachable in practice — an interval midpoint that
+  is an odd multiple of 1/128 has exactly 7 decimals ending in 5.
+- ⚠️ **The sort-sign negation is real.** `BatchedBrownianTree` multiplies by the product
+  of its construction-order and query-order signs; sampling runs *down* the sigma axis
+  while the tree was built over `[sigma_min, sigma_max]`, so every increment is
+  **negated**. Statistically invisible, bit-exactly essential.
+- ⚠️ **The "bounce up to the parent" branch in `_loc_inner` is load-bearing, not
+  defensive.** In halfway mode a split cuts at the node's *midpoint*, not at the
+  requested boundary, so the child the walk descends into is routinely too narrow for
+  the query; the reference bounces back to the parent, which by then has a midpoint and
+  takes the straddle path. Omitting it walks the right edge forever. (First bug here.)
+- ⚠️ **The tree span comes from the schedule BEFORE the first-sigma offset**, and Levy
+  area is never needed (`levy_area_approximation='none'`), so only the `W` branch of
+  `_increment_and_space_time_levy_area` is ported — with its f32 operation order
+  preserved, since a Python float times an f32 tensor is computed in f32.
+
+**Verified, bottom to top** — this stack is only as good as its weakest link, so each
+one is pinned separately:
+
+| layer | check |
+|---|---|
+| `SeedSequence` | **bit-exact** vs numpy 2.2.6 (pool *and* derived state, spawned and unspawned) |
+| Brownian tree | **bit-exact** vs `torchsde` through ComfyUI's own `BrownianTreeNoiseSampler`, incl. out-of-order and multi-node queries |
+| the solver | whole trajectories vs ComfyUI's **own** `sample_dpmpp_2m_sde{,_heun}` over a toy analytic denoiser, 6 arms (both families, heun + midpoint, eta 0/0.5/1), rel 1e-4 |
+| the schedule | vs ComfyUI's own `normal_scheduler` (see the SD section) |
+| **in a real render** | the per-step noise vectors are **identical element-for-element** to ComfyUI's on a 512² SD1.5 render, all 9 steps |
+
+`tools/gen_sampler_fixtures.py` generates the first, second and fourth by driving
+ComfyUI/torchsde directly. The toy denoiser is `(x + c) / (1 + sigma)` on purpose: pure
+f32 add/divide, no transcendental, so a trajectory mismatch is the solver's and not
+libm's.
+
+⚠️ **A pixel-level SDE match to ComfyUI is not attainable through this engine's UNet,
+and that is a property of the sampler, not a defect here.** Measured on SD1.5 512²/10
+steps against ComfyUI, and the two columns are the point:
+
+| | ComfyUI vs **itself**, model output shifted by a fixed rel 1.3e-4 | TP vs ComfyUI (real UNet, which differs by rel 1.3e-4 at step 0) |
+|---|---|---|
+| euler | 64.0 dB | 36.4 dB |
+| dpmpp_2m_sde_heun, eta=0 | 56.5 dB (−7.5) | 28.3 dB (−8.1) |
+| dpmpp_2m_sde_heun, eta=1 | 37.1 dB (−26.9) | 19.0 dB (−17.4) |
+
+The *deltas* agree: this sampler intrinsically amplifies any model-level disagreement
+far more than Euler does (ComfyUI loses 27 dB against itself from a 1.3e-4 shift at
+eta=1), and TP's penalty is inside that envelope. Two dead ends recorded so the next
+person does not re-walk them: the gap is **not** the schedule (fixed, and the 10-step
+schedule is bit-exact), **not** the noise (identical per step in a real render), and
+**not** a latent-layout permutation (per-element agreement at every step). The first
+amplification test used *independent* per-call noise and misleadingly showed no
+amplification at all (45.5 vs 46.7 dB) — a systematic fixed-direction shift is the
+faithful proxy for an implementation difference, and it is what produced the table.
 
 ## Image metrics and LPIPS
 

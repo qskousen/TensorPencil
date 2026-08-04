@@ -497,6 +497,21 @@ pub fn build(b: *std.Build) void {
             });
             gui_test_step.dependOn(&b.addRunArtifact(gui_diffuser_tests).step);
 
+            // Checkpoint-inspection tests (family traits, component presence,
+            // the probe memo). Pulls in the TensorPencil module for the
+            // pipeline's Family/DitContainer; no dvui, CPU-only.
+            const gui_modelspec_tests = b.addTest(.{
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/gui/model_spec.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "TensorPencil", .module = mod },
+                    },
+                }),
+            });
+            gui_test_step.dependOn(&b.addRunArtifact(gui_modelspec_tests).step);
+
             // Chat-session pure-helper tests (Message variants + the ‹/›
             // regenerate-navigation semantics). Same deps as the diffuser
             // tests (chat.zig imports it); CPU-only.

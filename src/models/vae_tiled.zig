@@ -19,7 +19,6 @@
 //! same tiling drives the CPU, CUDA and Vulkan decoders.
 
 const std = @import("std");
-const wan_vae = @import("wan_vae.zig");
 
 /// VAE spatial upscale factor (latent → pixels).
 const scale = 8;
@@ -34,12 +33,17 @@ pub const Params = struct {
     overlap: usize = 16,
 };
 
-/// Decode a denormalized planar [16][zh][zw] latent to planar [3][8·zh][8·zw]
+/// Decode a denormalized planar [c][zh][zw] latent to planar [3][8·zh][8·zw]
 /// pixels in [-1, 1] by decoding overlapping tiles and feather-blending them.
 ///
-/// `decodeTile(ctx, gpa, io, sub, th, tw)` decodes a planar [16][th][tw]
+/// `decodeTile(ctx, gpa, io, sub, th, tw)` decodes a planar [c][th][tw]
 /// sub-latent to planar [3][8·th][8·tw] pixels (it owns the result; this frees
 /// it). Caller frees the returned image.
+///
+/// The latent channel count is *derived* from `z.len / (zh·zw)` rather than
+/// taken from a model constant: the tiling is identical for krea2's 16-channel
+/// Wan latent and the SD family's 4-channel one, and hardcoding either is how a
+/// second family ends up unable to tile at all.
 pub fn decode(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -50,9 +54,11 @@ pub fn decode(
     ctx: anytype,
     comptime decodeTile: fn (@TypeOf(ctx), std.mem.Allocator, std.Io, []const f32, usize, usize) anyerror![]f32,
 ) ![]f32 {
-    const cin = wan_vae.latent_channels; // 16
     const cout = 3;
-    std.debug.assert(z.len == cin * zh * zw);
+    std.debug.assert(zh != 0 and zw != 0);
+    std.debug.assert(z.len % (zh * zw) == 0);
+    const cin = z.len / (zh * zw);
+    std.debug.assert(cin != 0);
 
     const tile = @max(@as(usize, 1), params.tile);
     const ov = if (params.overlap >= tile) tile / 4 else params.overlap;
@@ -176,38 +182,42 @@ test "tiled decode of a local op equals the whole decode" {
     const io = std.testing.io;
     const zh = 40;
     const zw = 56;
-    const cin = wan_vae.latent_channels;
 
-    const z = try gpa.alloc(f32, cin * zh * zw);
-    defer gpa.free(z);
-    // Smooth-ish deterministic latent so borders are non-trivial.
-    for (0..cin) |ch| {
-        for (0..zh) |y| {
-            for (0..zw) |x| {
-                const fy: f32 = @floatFromInt(y);
-                const fx: f32 = @floatFromInt(x);
-                const fc: f32 = @floatFromInt(ch);
-                z[(ch * zh + y) * zw + x] = @sin(fy * 0.2 + fc) * @cos(fx * 0.15) + fc * 0.01;
+    // Both latent widths in the engine: krea2's Wan latent (16) and the SD
+    // family's (4). The channel count is derived from `z.len`, so a regression
+    // that reintroduces a hardcoded 16 fails on the 4-channel arm.
+    for ([_]usize{ 16, 4 }) |cin| {
+        const z = try gpa.alloc(f32, cin * zh * zw);
+        defer gpa.free(z);
+        // Smooth-ish deterministic latent so borders are non-trivial.
+        for (0..cin) |ch| {
+            for (0..zh) |y| {
+                for (0..zw) |x| {
+                    const fy: f32 = @floatFromInt(y);
+                    const fx: f32 = @floatFromInt(x);
+                    const fc: f32 = @floatFromInt(ch);
+                    z[(ch * zh + y) * zw + x] = @sin(fy * 0.2 + fc) * @cos(fx * 0.15) + fc * 0.01;
+                }
             }
         }
-    }
 
-    const whole = try upsampleCh0({}, gpa, io, z, zh, zw);
-    defer gpa.free(whole);
+        const whole = try upsampleCh0({}, gpa, io, z, zh, zw);
+        defer gpa.free(whole);
 
-    // Several tile/overlap configs, including tile larger than the image.
-    const cfgs = [_]Params{
-        .{ .tile = 16, .overlap = 4 },
-        .{ .tile = 24, .overlap = 8 },
-        .{ .tile = 100, .overlap = 16 }, // > zh, single row of tiles
-    };
-    for (cfgs) |p| {
-        const tiled = try decode(gpa, io, z, zh, zw, p, {}, upsampleCh0);
-        defer gpa.free(tiled);
-        try testing.expectEqual(whole.len, tiled.len);
-        for (whole, tiled) |a, b| {
-            try testing.expect(!std.math.isNan(b));
-            try testing.expectApproxEqAbs(a, b, 1e-4);
+        // Several tile/overlap configs, including tile larger than the image.
+        const cfgs = [_]Params{
+            .{ .tile = 16, .overlap = 4 },
+            .{ .tile = 24, .overlap = 8 },
+            .{ .tile = 100, .overlap = 16 }, // > zh, single row of tiles
+        };
+        for (cfgs) |p| {
+            const tiled = try decode(gpa, io, z, zh, zw, p, {}, upsampleCh0);
+            defer gpa.free(tiled);
+            try testing.expectEqual(whole.len, tiled.len);
+            for (whole, tiled) |a, b| {
+                try testing.expect(!std.math.isNan(b));
+                try testing.expectApproxEqAbs(a, b, 1e-4);
+            }
         }
     }
 }

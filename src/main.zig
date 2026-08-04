@@ -68,6 +68,15 @@ pub fn main(init: std.process.Init) !void {
         try cudaFp8Test(arena, stdout);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-encode-test")) {
         try cudaEncodeTest(arena, io, stdout);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "sd-cuda-test")) {
+        // `libs` selects the cuBLASLt/cuDNN arm, which takes a DIFFERENT attention
+        // path (true head width, no padding) — so both are worth running.
+        var ckpt: []const u8 = "/home/qt/genai/comfyui/models/checkpoints/sd1.5/perfectdeliberate_v20.safetensors";
+        var libs = false;
+        for (args[2..]) |a| {
+            if (std.mem.eql(u8, a, "libs")) libs = true else ckpt = a;
+        }
+        try sdCudaTest(arena, io, stdout, ckpt, libs);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-vae-test")) {
         const zh: usize = if (args.len >= 3) (std.fmt.parseInt(usize, args[2], 10) catch 16) else 16;
         try cudaVaeTest(arena, io, stdout, zh);
@@ -123,12 +132,53 @@ pub fn main(init: std.process.Init) !void {
             \\usage:
             \\  TensorPencil generate --prompt "..." [options]
             \\      --negative ""      negative prompt (needs --cfg != 1)
+            \\      --prompt-syntax    prompt dialect: comfy | a1111. They are NOT
+            \\                         spellings of one language: under a1111
+            \\                         (x:1.2) MULTIPLIES rather than replaces the
+            \\                         weight, [x] de-emphasizes, BREAK forces a
+            \\                         chunk boundary, and [a:b:0.5] / [a|b]
+            \\                         schedule the prompt across steps
+            \\      --emphasis         how an a1111 weight reaches the hidden
+            \\                         states: original | no_norm | ignore
+            \\                         (ignored under comfy)
             \\      --width 1024       image width  (multiple of 16)
             \\      --height 1024      image height (multiple of 16)
             \\      --steps 8          sampling steps
             \\      --cfg 1.0          guidance scale (1.0 = no negative pass)
             \\      --seed 0           noise seed
             \\      --shift 1.15       flow-matching sigma shift
+            \\      --sampler euler    sampler: euler | dpmpp_2m_sde
+            \\                         | dpmpp_2m_sde_heun. The two SDE variants are
+            \\                         DPM-Solver++(2M) SDE with ComfyUI's midpoint
+            \\                         and heun corrections; both inject noise from a
+            \\                         seed-determined Brownian tree, so the same
+            \\                         --seed reproduces ComfyUI's render
+            \\      --sde-eta 1.0      SDE noise level (0 = deterministic DPM++(2M))
+            \\      --sde-s-noise 1.0  SDE noise multiplier
+            \\      --scheduler        where the steps go: normal | karras
+            \\                         | exponential | sgm_uniform | simple
+            \\                         | ddim_uniform | beta | linear_quadratic
+            \\                         | kl_optimal. Default is the architecture's
+            \\                         own (simple for krea2, normal for SD).
+            \\                         ddim_uniform and beta may return a step count
+            \\                         different from --steps
+            \\      --compat comfy     whose SAMPLING conventions to reproduce:
+            \\                         comfy | a1111. Orthogonal to
+            \\                         --prompt-syntax; reproducing an a1111 seed
+            \\                         needs both. a1111 sets all three of the
+            \\                         overrides below to ITS defaults, which
+            \\                         differ from ComfyUI on every one
+            \\      --rng cpu          noise generator: cpu (torch's CPU MT19937,
+            \\                         what ComfyUI uses) | nv (NVIDIA Philox,
+            \\                         what a1111 uses by default, since its
+            \\                         randn_source defaults to "GPU"). This one
+            \\                         changes the image entirely, not slightly
+            \\      --sgm-noise-mult   scale the initial latent by sqrt(1+s0^2)
+            \\                         (on, ComfyUI/SGM) or by a bare s0 (off,
+            \\                         a1111's default) (on/off)
+            \\      --quantize-t       condition the UNet on the nearest TRAINED
+            \\                         timestep (on, ComfyUI) or on the fractional
+            \\                         one (off, a1111's default) (on/off)
             \\      --backend cpu      compute backend: cpu | vulkan | zig-cuda
             \\                         | cuda. vulkan offloads encoder/DiT/VAE
             \\                         GEMMs to Vulkan; zig-cuda runs the whole
@@ -153,7 +203,10 @@ pub fn main(init: std.process.Init) !void {
             \\                         "model.diffusion_model." key prefix is also
             \\                         auto-detected. Default: krea2 Fp8
             \\      --vae <path>       VAE decoder checkpoint
-            \\      --text-encoder <path>  text-encoder checkpoint (qwen3)
+            \\      --text-encoder <path>  text-encoder checkpoint (qwen3 for krea2,
+            \\                         CLIP-L for the SD family)
+            \\      --text-encoder-2 <path>  SDXL's second text encoder (OpenCLIP
+            \\                         bigG), only for a split-file checkpoint
             \\      --mmap on          checkpoint loading: on = mmap (default),
             \\                         off = buffered read into RAM. Use off for
             \\                         checkpoints on ZFS (mmap can deadlock there
@@ -163,6 +216,10 @@ pub fn main(init: std.process.Init) !void {
             \\  TensorPencil inspect <file.safetensors>   list tensors in a checkpoint
             \\  TensorPencil bench-matmul                 time a DiT-sized fp8 GEMM
             \\  TensorPencil decode-latent <z.bin> <zh> <zw> <out.png>
+            \\  TensorPencil sd-cuda-test [<sd1.5 ckpt>] [libs]
+            \\      check the CUDA SD kernels against the CPU ops they reproduce
+            \\      ("libs" runs the cuBLASLt/cuDNN arm, whose attention path
+            \\      differs); exits non-zero if any check fails
             \\
         , .{});
     }
@@ -923,6 +980,667 @@ fn cudaFp8Test(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
 /// Validate the CUDA text encoder (qwen3_cuda) against the CPU encode on the
 /// same prompt: proves the fp8 GEMM + rope_half + causal attention + norm chain
 /// produce a like-for-like Krea 2 conditioning stack.
+/// Validate the CUDA SD-family kernels against the CPU ops they reproduce, and
+/// then both whole stages against their CPU forwards.
+///
+/// This exists because the hand-PTX kernels cannot have unit tests the way their
+/// SPIR-V twins do (`sd_unet_gpu`'s test block): the test binary brings up no
+/// CUDA context. Without it the CUDA path's only evidence is that a whole render
+/// lands within 0.3 dB of the Vulkan arm — real, but it localizes nothing.
+///
+/// Every check is against the CPU op, on random data, and the command exits with
+/// an error if any fails, so it is usable as a gate.
+fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []const u8, libs: bool) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    const ops = TensorPencil.ops;
+    const sd_unet = TensorPencil.models.sd_unet;
+    const sd_unet_cuda = TensorPencil.models.sd_unet_cuda;
+    const sd_vae = TensorPencil.models.sd_vae;
+    const sd_vae_cuda = TensorPencil.models.sd_vae_cuda;
+    const Buf = cuda.backend.DeviceBuffer;
+
+    var be = (if (libs) cuda.Backend.initLibs(arena) else cuda.Backend.init(arena)) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    try stdout.print("== sd-cuda-test ==\ncuda device: {s} (kernels: {t})\n\n", .{ be.deviceName(), be.kernels });
+
+    var prng = std.Random.DefaultPrng.init(4242);
+    const rnd = prng.random();
+    var failures: usize = 0;
+
+    // Report one check. `tol` is on relative L2 unless the check is exact.
+    const R = struct {
+        out: *Io.Writer,
+        fails: *usize,
+        fn check(self: @This(), name: []const u8, want: []const f32, got: []const f32, tol: f64) !void {
+            var num: f64 = 0;
+            var den: f64 = 0;
+            var max_err: f64 = 0;
+            var nan = false;
+            // Which SIDE went non-finite, and how big each side's values get. A bare
+            // `rel L2 nan` says a check failed but not whether the reference or the
+            // kernel produced it — and "the reference overflowed" is a completely
+            // different bug from "the kernel did".
+            var bad_want: usize = 0;
+            var bad_got: usize = 0;
+            var mag_want: f64 = 0;
+            var mag_got: f64 = 0;
+            for (want, got) |e, a| {
+                if (!std.math.isFinite(e)) bad_want += 1 else mag_want = @max(mag_want, @abs(@as(f64, e)));
+                if (!std.math.isFinite(a)) bad_got += 1 else mag_got = @max(mag_got, @abs(@as(f64, a)));
+                if (std.math.isNan(a)) nan = true;
+                const d = @as(f64, e) - @as(f64, a);
+                num += d * d;
+                den += @as(f64, e) * @as(f64, e);
+                max_err = @max(max_err, @abs(d));
+            }
+            const rel = if (den == 0) @sqrt(num) else @sqrt(num / den);
+            const ok = !nan and bad_want == 0 and bad_got == 0 and rel <= tol;
+            if (!ok) self.fails.* += 1;
+            try self.out.print("{s:<44} rel L2 {d:.7}  max {d:.6}  {s}\n", .{
+                name, rel, max_err, if (ok) "ok" else "FAIL",
+            });
+            if (bad_want != 0 or bad_got != 0) {
+                try self.out.print("{s:<44}   non-finite: want {d}/{d} (max |v| {d:.1}), got {d}/{d} (max |v| {d:.1})\n", .{
+                    "", bad_want, want.len, mag_want, bad_got, got.len, mag_got,
+                });
+            }
+            // Flush per check: the whole-stage sweep takes minutes and can be
+            // killed by the host OOM killer mid-run, and a buffered report loses
+            // every line it had already produced — i.e. exactly the diagnostic.
+            try self.out.flush();
+        }
+    };
+    const rep: R = .{ .out = stdout, .fails = &failures };
+
+    var a_d: Buf = .{};
+    var b_d: Buf = .{};
+    var c_d: Buf = .{};
+    var d_d: Buf = .{};
+    var e_d: Buf = .{};
+    defer inline for (.{ &a_d, &b_d, &c_d, &d_d, &e_d }) |x| be.tensorDestroy(x);
+
+    const up = struct {
+        fn go(bk: *cuda.Backend, buf: *Buf, host: []const f32) !void {
+            try bk.ensureDeviceBuffer(buf, host.len * 4);
+            try bk.tensorUpload(buf.*, std.mem.sliceAsBytes(host));
+        }
+    }.go;
+
+    // --- GroupNorm -----------------------------------------------------------
+    // Two regimes: mean 0 is what a UNet activation looks like; mean 400 is the
+    // one `ops.norm.groupNorm` warns about (a late VAE block), where the shifted
+    // sum-of-squares form dies and Welford does not. The looser bound there is
+    // f32's representation of `x` itself cancelling to a quantity of size 1.
+    {
+        const groups = 32;
+        const n = 130; // not a multiple of the 256 statistics chunks
+        const ch = 320;
+        const x = try arena.alloc(f32, n * ch);
+        const cat = try arena.alloc(f32, 2 * ch);
+        for (cat) |*v| v.* = rnd.floatNorm(f32);
+        const want = try arena.alloc(f32, n * ch);
+        const got = try arena.alloc(f32, n * ch);
+        try be.ensureDeviceBuffer(&d_d, groups * 256 * 3 * 4);
+        try be.ensureDeviceBuffer(&e_d, groups * 2 * 4);
+        try up(be, &c_d, cat);
+        for ([2]f32{ 0, 400 }) |mean| {
+            for (x) |*v| v.* = mean + rnd.floatNorm(f32);
+            try up(be, &a_d, x);
+            try be.ensureDeviceBuffer(&b_d, n * ch * 4);
+            for ([2]bool{ false, true }) |silu| {
+                try be.opGroupNorm(a_d, b_d, c_d, d_d, e_d, n, ch, groups, 256, 1e-5, silu);
+                try be.tensorDownload(b_d, std.mem.sliceAsBytes(got));
+                ops.norm.groupNorm(want, x, ch, groups, cat[0..ch], cat[ch..], 1e-5);
+                if (silu) ops.act.silu(want);
+                var name_buf: [64]u8 = undefined;
+                const name = try std.fmt.bufPrint(&name_buf, "group_norm mean={d:.0} silu={}", .{ mean, silu });
+                try rep.check(name, want, got, if (mean == 0) 2e-6 else 2e-4);
+            }
+        }
+    }
+
+    // --- GEGLU ---------------------------------------------------------------
+    // The halves are (value, gate) in that order and the gate takes the ERF gelu;
+    // swapping either is a silent quality loss, so this compares element by
+    // element rather than in aggregate.
+    {
+        const n = 37;
+        const inner = 96;
+        const src = try arena.alloc(f32, n * 2 * inner);
+        for (src) |*v| v.* = rnd.floatNorm(f32) * 3;
+        const want = try arena.alloc(f32, n * inner);
+        for (0..n) |p| {
+            const row = src[p * 2 * inner ..][0 .. 2 * inner];
+            for (0..inner) |j| want[p * inner + j] = row[j] * ops.act.geluErfScalar(row[inner + j]);
+        }
+        try up(be, &a_d, src);
+        try be.ensureDeviceBuffer(&b_d, n * inner * 4);
+        try be.opGeglu(a_d, b_d, n, inner);
+        const got = try arena.alloc(f32, n * inner);
+        try be.tensorDownload(b_d, std.mem.sliceAsBytes(got));
+        // 2e-5, not the 1e-6 the SPIR-V twin holds: every kernel in `cuda/elt.zig`
+        // computes exp as `ex2.approx(x*log2e)` (its header says so), which is an
+        // approximate instruction, where SPIR-V's `@exp` is not. Measured 6.6e-6 —
+        // two orders below the f16 GEMM error either side of it, so the two
+        // backends legitimately disagree here and neither is wrong.
+        try rep.check("geglu (erf gate, value-first halves)", want, got, 2e-5);
+    }
+
+    // --- cross-attention (seq_kv != seq_q) -----------------------------------
+    {
+        const n = 100;
+        const ctx_seq = 77; // the SD family's conditioning length
+        const heads = 8;
+        const hd = 40; // SD1.5's outermost level
+        const dim = heads * hd;
+        const q = try arena.alloc(f32, n * dim);
+        const k = try arena.alloc(f32, ctx_seq * dim);
+        const v = try arena.alloc(f32, ctx_seq * dim);
+        for (q) |*x| x.* = rnd.floatNorm(f32);
+        for (k) |*x| x.* = rnd.floatNorm(f32);
+        for (v) |*x| x.* = rnd.floatNorm(f32);
+        try up(be, &a_d, q);
+        try up(be, &b_d, k);
+        try up(be, &c_d, v);
+        try be.ensureDeviceBuffer(&d_d, n * dim * 4);
+        try be.opAttnCross(a_d, b_d, c_d, d_d, n, ctx_seq, heads, hd, 1.0 / @sqrt(@as(f32, hd)));
+        const got = try arena.alloc(f32, n * dim);
+        try be.tensorDownload(d_d, std.mem.sliceAsBytes(got));
+        const want = try arena.alloc(f32, n * dim);
+        try ops.attention.attention(io, arena, want, q, k, v, .{
+            .seq_q = n,
+            .seq_kv = ctx_seq,
+            .n_heads = heads,
+            .n_kv_heads = heads,
+            .head_dim = hd,
+        });
+        try rep.check("attn_cross (q=100, kv=77, hd=40)", want, got, 1e-5);
+    }
+
+    // --- channel concat ------------------------------------------------------
+    {
+        const n = 17;
+        const ch_a = 12;
+        const ch_b = 20;
+        const total = ch_a + ch_b;
+        const av = try arena.alloc(f32, n * ch_a);
+        const bv = try arena.alloc(f32, n * ch_b);
+        for (av, 0..) |*x, i| x.* = @floatFromInt(i);
+        for (bv, 0..) |*x, i| x.* = @floatFromInt(1000 + i);
+        try up(be, &a_d, av);
+        try up(be, &b_d, bv);
+        try be.ensureDeviceBuffer(&c_d, n * total * 4);
+        try be.opConcatCh(a_d, c_d, n, ch_a, total, 0);
+        try be.opConcatCh(b_d, c_d, n, ch_b, total, ch_a);
+        const got = try arena.alloc(f32, n * total);
+        try be.tensorDownload(c_d, std.mem.sliceAsBytes(got));
+        const want = try arena.alloc(f32, n * total);
+        for (0..n) |p| {
+            @memcpy(want[p * total ..][0..ch_a], av[p * ch_a ..][0..ch_a]);
+            @memcpy(want[p * total + ch_a ..][0..ch_b], bv[p * ch_b ..][0..ch_b]);
+        }
+        try rep.check("concat_ch (exact)", want, got, 0);
+    }
+
+    // --- broadcast bias add --------------------------------------------------
+    // How a ResBlock's timestep projection reaches the activation on this
+    // backend; the offset argument is what lets one packed buffer serve them all.
+    {
+        const n = 23;
+        const ch = 64;
+        const off = 64;
+        const x = try arena.alloc(f32, n * ch);
+        const bias = try arena.alloc(f32, off + ch);
+        for (x) |*v| v.* = rnd.floatNorm(f32);
+        for (bias) |*v| v.* = rnd.floatNorm(f32);
+        try up(be, &a_d, x);
+        try up(be, &b_d, bias);
+        try be.opAddBiasRows(a_d, b_d, n, ch, off);
+        const got = try arena.alloc(f32, n * ch);
+        try be.tensorDownload(a_d, std.mem.sliceAsBytes(got));
+        const want = try arena.alloc(f32, n * ch);
+        for (0..n) |p| for (0..ch) |cc| {
+            want[p * ch + cc] = x[p * ch + cc] + bias[off + cc];
+        };
+        try rep.check("add_bias_rows (offset into a packed buffer)", want, got, 1e-7);
+    }
+
+    // --- head pad / unpad round trip ----------------------------------------
+    // The layout contract the tensor-core attention sits between. f16 storage, so
+    // the bound is f16-scale; what matters is that no value moves.
+    {
+        const n = 300;
+        const heads = 8;
+        const hd = 40;
+        const hp = 128;
+        const dim = heads * hd;
+        const seq_pad = std.mem.alignForward(usize, n, 128);
+        const rows = seq_pad * heads * hp;
+        const src = try arena.alloc(f32, n * dim);
+        for (src) |*v| v.* = rnd.floatNorm(f32);
+        try up(be, &a_d, src);
+        try be.ensureDeviceBuffer(&b_d, rows * 2);
+        try be.opHeadPadH16(a_d, b_d, n, seq_pad, heads, hd, hp, 1.0);
+        const words = try arena.alloc(u32, rows / 2);
+        try be.tensorDownload(b_d, std.mem.sliceAsBytes(words));
+        const widened = try arena.alloc(f32, rows);
+        for (words, 0..) |wd, i| {
+            widened[i * 2] = @floatCast(@as(f16, @bitCast(@as(u16, @truncate(wd)))));
+            widened[i * 2 + 1] = @floatCast(@as(f16, @bitCast(@as(u16, @truncate(wd >> 16)))));
+        }
+        // Every padding lane must be a hard zero, or the scores GEMM picks up
+        // whatever the buffer held before.
+        var pad_nonzero: usize = 0;
+        for (0..seq_pad) |r| for (0..heads) |hh| for (hd..hp) |t| {
+            if (widened[r * heads * hp + hh * hp + t] != 0) pad_nonzero += 1;
+        };
+        if (pad_nonzero != 0) failures += 1;
+        try stdout.print("{s:<44} {d} non-zero lanes  {s}\n", .{
+            "head_pad_h16 padding lanes", pad_nonzero, if (pad_nonzero == 0) "ok" else "FAIL",
+        });
+        try up(be, &c_d, widened);
+        try be.ensureDeviceBuffer(&d_d, n * dim * 4);
+        try be.opHeadUnpad(c_d, d_d, n, heads, hd, hp);
+        const got = try arena.alloc(f32, n * dim);
+        try be.tensorDownload(d_d, std.mem.sliceAsBytes(got));
+        try rep.check("head_pad_h16 -> head_unpad round trip", src, got, 1e-3);
+    }
+
+    // --- self-attention at every SD head width -------------------------------
+    // 40/80/160 are SD1.5's three attending levels, 64 is SDXL's. Under cuDNN all
+    // four run at the true width; under hand-PTX the narrow ones pad to 128 and
+    // 160 pads to 256, so this is where `attnHd` gets exercised.
+    {
+        const n = 300;
+        const cases = [_]struct { hd: usize, heads: usize }{
+            .{ .hd = 40, .heads = 8 },
+            .{ .hd = 64, .heads = 10 },
+            .{ .hd = 80, .heads = 8 },
+            .{ .hd = 160, .heads = 8 },
+        };
+        for (cases) |cse| {
+            const dim = cse.heads * cse.hd;
+            const q = try arena.alloc(f32, n * dim);
+            const k = try arena.alloc(f32, n * dim);
+            const v = try arena.alloc(f32, n * dim);
+            for (q) |*x| x.* = rnd.floatNorm(f32);
+            for (k) |*x| x.* = rnd.floatNorm(f32);
+            for (v) |*x| x.* = rnd.floatNorm(f32);
+
+            var ws: sd_unet_cuda.Workspace = .{
+                .gpa = arena,
+                .skips = try arena.alloc(cuda.backend.DeviceBuffer, 0),
+                .skip_ch = try arena.alloc(usize, 0),
+            };
+            defer ws.deinit(be);
+            try up(be, &ws.q, q);
+            try up(be, &ws.k, k);
+            try up(be, &ws.v, v);
+            try be.ensureDeviceBuffer(&ws.ao, n * dim * 4);
+            const hp = sd_unet_cuda.attnHd(be, cse.hd);
+            if (hp != cse.hd) {
+                inline for (.{ "qp", "kp", "vp", "op" }) |f| {
+                    try be.ensureDeviceBuffer(&@field(ws, f), n * cse.heads * hp * 4);
+                }
+            }
+            try sd_unet_cuda.selfAttn(be, &ws, n, cse.heads, cse.hd, 1.0 / @sqrt(@as(f32, @floatFromInt(cse.hd))));
+            const got = try arena.alloc(f32, n * dim);
+            try be.tensorDownload(ws.ao, std.mem.sliceAsBytes(got));
+            const want = try arena.alloc(f32, n * dim);
+            try ops.attention.attention(io, arena, want, q, k, v, .{
+                .seq_q = n,
+                .seq_kv = n,
+                .n_heads = cse.heads,
+                .n_kv_heads = cse.heads,
+                .head_dim = cse.hd,
+            });
+            var name_buf: [64]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buf, "self attention hd={d} heads={d} (runs at {d})", .{ cse.hd, cse.heads, hp });
+            // f16 tensor cores on a seq-length reduction.
+            try rep.check(name, want, got, 5e-3);
+        }
+    }
+
+    // --- the VAE mid-block's attention shape ---------------------------------
+    // ONE head 512 wide over every latent position — nothing like the UNet's
+    // 40..160-wide multi-head cases above, and the shape that makes `opAttnTC`
+    // switch to its query-tiled (flash) path once the scores plane outgrows the
+    // scratch budget. That switch is between seq 384 and seq 4096, i.e. between a
+    // 24x16 latent and a 64² one, so the sizes here straddle it deliberately: the
+    // whole-decoder check below passed at 12x10 for months while every 512-square
+    // and larger SDXL decode came out as a solid white image.
+    //
+    // The magnitude arm matters for the same reason it does in the decoder sweep:
+    // an online-softmax kernel's numerics depend on the score range, so a unit
+    // gaussian is not a sufficient input.
+    {
+        const ch: usize = 512;
+        const seqs = [_]usize{ 384, 4096, 9216 };
+        const mags = [_]f32{ 1.0, 8.0 };
+        for (seqs) |n| {
+            for (mags) |mag| {
+                var it_arena = std.heap.ArenaAllocator.init(arena);
+                defer it_arena.deinit();
+                const a = it_arena.allocator();
+                const q = try a.alloc(f32, n * ch);
+                const k = try a.alloc(f32, n * ch);
+                const v = try a.alloc(f32, n * ch);
+                for (q) |*x| x.* = rnd.floatNorm(f32) * mag;
+                for (k) |*x| x.* = rnd.floatNorm(f32) * mag;
+                for (v) |*x| x.* = rnd.floatNorm(f32) * mag;
+                var bq: Buf = .{};
+                var bk: Buf = .{};
+                var bv: Buf = .{};
+                var bo: Buf = .{};
+                defer inline for (.{ &bq, &bk, &bv, &bo }) |b| be.tensorDestroy(b);
+                try up(be, &bq, q);
+                try up(be, &bk, k);
+                try up(be, &bv, v);
+                try be.ensureDeviceBuffer(&bo, n * ch * 4);
+                const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(ch)));
+                try be.opAttnTC(bq, bk, bv, bo, n, 1, 1, ch, scale);
+                const got = try a.alloc(f32, n * ch);
+                try be.tensorDownload(bo, std.mem.sliceAsBytes(got));
+                const want = try a.alloc(f32, n * ch);
+                try ops.attention.attention(io, a, want, q, k, v, .{
+                    .seq_q = n,
+                    .seq_kv = n,
+                    .n_heads = 1,
+                    .n_kv_heads = 1,
+                    .head_dim = ch,
+                });
+                var name_buf: [72]u8 = undefined;
+                const name = try std.fmt.bufPrint(&name_buf, "vae mid attention seq={d} hd=512 (x{d:.0})", .{ n, mag });
+                // The x8 arm is looser BY MEASUREMENT, not to make it pass: scores
+                // grow with |q|·|k|, so an f16 GEMM feeding a softmax lands at ~6e-3
+                // relative at every seq length tested (1.0 holds 6e-4). What this arm
+                // is for is catching `inf`/NaN, which is what the SDXL VAE actually
+                // hit — a rel-L2 bound would report that as `nan`, not as 0.006.
+                try rep.check(name, want, got, if (mag > 1.0) 1e-2 else 5e-3);
+            }
+        }
+    }
+
+    // --- convolution at all three sampling modes -----------------------------
+    // Odd extents so stride 2's ceil(h/2) output size and the pad edges both
+    // matter. The upsample case is compared against an explicitly doubled
+    // tensor, which is exactly the equivalence the fused gather claims.
+    {
+        const h: usize = 11;
+        const w: usize = 7;
+        const ci: usize = 32;
+        const co: usize = 128; // >= 96, so the tensor-core arm that ships
+        const torch_w = try arena.alloc(f32, co * ci * 9);
+        for (torch_w) |*x| x.* = rnd.floatNorm(f32) * 0.1;
+        const bias = try arena.alloc(f32, co);
+        for (bias) |*x| x.* = rnd.floatNorm(f32);
+        const packed_w = try ops.conv.packWeight(arena, torch_w, co, ci, 3);
+        const in = try arena.alloc(f32, h * w * ci);
+        for (in) |*x| x.* = rnd.floatNorm(f32);
+        try up(be, &a_d, in);
+        var patch: Buf = .{};
+        defer be.tensorDestroy(&patch);
+
+        for ([3]sd_unet_cuda.SampleMode{ .stride1, .stride2, .upsample2x }) |mode| {
+            const oh = switch (mode) {
+                .stride1 => h,
+                .stride2 => (h + 1) / 2,
+                .upsample2x => 2 * h,
+            };
+            const ow = switch (mode) {
+                .stride1 => w,
+                .stride2 => (w + 1) / 2,
+                .upsample2x => 2 * w,
+            };
+            const cv: TensorPencil.ops.conv.Conv2d = .{
+                .w = packed_w,
+                .b = bias,
+                .co = co,
+                .ci = ci,
+                .k = 3,
+                .stride = if (mode == .stride2) @as(usize, 2) else 1,
+                .pad = 1,
+            };
+            try be.ensureDeviceBuffer(&b_d, oh * ow * co * 4);
+            try sd_unet_cuda.convInto(be, &patch, &b_d, &a_d, h, w, cv, mode);
+            const got = try arena.alloc(f32, oh * ow * co);
+            try be.tensorDownload(b_d, std.mem.sliceAsBytes(got));
+            const want = try arena.alloc(f32, oh * ow * co);
+            if (mode == .upsample2x) {
+                const expanded = try arena.alloc(f32, oh * ow * ci);
+                for (0..oh) |y| for (0..ow) |xx| {
+                    @memcpy(expanded[(y * ow + xx) * ci ..][0..ci], in[((y / 2) * w + (xx / 2)) * ci ..][0..ci]);
+                };
+                try ops.conv.conv2d(io, arena, want, expanded, oh, ow, cv);
+            } else {
+                try ops.conv.conv2d(io, arena, want, in, h, w, cv);
+            }
+            var name_buf: [64]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buf, "conv 3x3 {t} (im2col_sd + f16 GEMM)", .{mode});
+            try rep.check(name, want, got, 2e-3);
+        }
+    }
+
+    // --- CLIP's two GELU forms -----------------------------------------------
+    // Checked value by value (max, not just rel L2): the three GELU forms in this
+    // codebase agree to ~1e-2, so an aggregate bound loose enough to pass f32 noise
+    // would also pass the wrong kernel. quick-GELU is CLIP-L's, erf-GELU is CLIP-G's,
+    // and swapping them is a style shift with no error anywhere.
+    {
+        const n = 4096;
+        const x = try arena.alloc(f32, n);
+        // Spread over the range a real FFN sees, tails included.
+        for (x, 0..) |*v, i| v.* = (@as(f32, @floatFromInt(i)) / @as(f32, n) - 0.5) * 24.0;
+        const want = try arena.alloc(f32, n);
+        const got = try arena.alloc(f32, n);
+        // `2e-5` rather than the Vulkan arm's 2e-6 because every exp in `cuda/elt.zig`
+        // is `ex2.approx` — an approximate instruction, per that file's header. Do not
+        // "fix" it by tightening the bound.
+        for ([_]struct { []const u8, bool }{ .{ "gelu_quick (CLIP-L)", true }, .{ "gelu_erf (CLIP-G)", false } }) |arm| {
+            const name, const is_quick = arm;
+            @memcpy(want, x);
+            if (is_quick) ops.act.geluQuick(want) else ops.act.geluErf(want);
+            try up(be, &a_d, x);
+            if (is_quick) try be.geluQuick(a_d, n) else try be.geluErf(a_d, n);
+            try be.tensorDownload(a_d, std.mem.sliceAsBytes(got));
+            try rep.check(name, want, got, 2e-5);
+        }
+    }
+
+    // --- whole stages against their CPU forwards -----------------------------
+    std.Io.Dir.cwd().access(io, ckpt, .{}) catch {
+        try stdout.print("\nskipping the whole-stage checks: no checkpoint at {s}\n", .{ckpt});
+        try summarize(stdout, failures);
+        return;
+    };
+    var st = try TensorPencil.SafeTensors.open(arena, io, ckpt);
+    defer st.deinit();
+    const store: TensorPencil.weights.WeightStore = .{ .safetensors = &st };
+    try stdout.print("\nwhole stages against the CPU forward ({s}):\n", .{ckpt});
+
+    // The UNet check is SD1.5-specific (config + a 768-wide context and no `y`);
+    // the VAE below is not — the two families' decoders are architecturally
+    // IDENTICAL and differ only in weights and in `scaling_factor`, which `decode`
+    // never sees — so an SDXL checkpoint still exercises the sweep, which is how
+    // that family's fp16 behaviour gets measured at all.
+    const family = TensorPencil.pipeline.detectFamily(store) catch .sd15;
+    try stdout.print("checkpoint family: {t}\n", .{family});
+
+    // --- the CLIP text tower, whole, on a weighted two-chunk prompt -----------
+    // Both towers when the checkpoint has both, since they differ in naming (fused
+    // q/k/v), depth, head count AND activation — the SDXL arm is the one that
+    // exercises the erf-GELU path and the captured-penultimate-layer path.
+    {
+        const clip_text = TensorPencil.models.clip_text;
+        const clip_text_cuda = TensorPencil.models.clip_text_cuda;
+        const clip_tok = TensorPencil.clip_tokenizer;
+        const Tower = struct { name: []const u8, cfg: clip_text.Config, prefix: []const u8, pad: u32, capture: ?usize };
+        const towers: []const Tower = switch (family) {
+            .sd15 => &.{.{
+                .name = "clip_l",
+                .cfg = clip_text.clip_l,
+                .prefix = "cond_stage_model.transformer.text_model.",
+                .pad = clip_tok.eos_id,
+                .capture = null,
+            }},
+            .sdxl => &.{
+                .{
+                    .name = "clip_l",
+                    .cfg = clip_text.clip_l,
+                    .prefix = "conditioner.embedders.0.transformer.text_model.",
+                    .pad = clip_tok.eos_id,
+                    .capture = clip_text.clip_l.layers - 1,
+                },
+                .{
+                    .name = "clip_g",
+                    .cfg = clip_text.clip_g,
+                    .prefix = "conditioner.embedders.1.model.",
+                    .pad = 0,
+                    .capture = clip_text.clip_g.layers - 1,
+                },
+            },
+            .krea2 => &.{},
+        };
+        for (towers) |tw| {
+            var enc = clip_text.TextEncoder.load(arena, store, tw.cfg, tw.prefix) catch |err| {
+                try stdout.print("{s:<44} load failed: {t}\n", .{ tw.name, err });
+                failures += 1;
+                continue;
+            };
+            defer enc.deinit();
+
+            // Two chunks with a mix of weighted and unweighted rows, so the chunk
+            // batching, the causal mask per chunk and `applyWeights` are all live.
+            const clen = clip_tok.context_length;
+            const tokens = try arena.alloc(clip_tok.Weighted, 2 * clen);
+            for (tokens, 0..) |*t, i| {
+                const slot = i % clen;
+                t.* = .{
+                    .id = if (slot == 0) clip_tok.bos_id else if (slot > 60) clip_tok.eos_id else rnd.intRangeLessThan(u32, 0, 49000),
+                    .weight = if (slot % 5 == 0) 1.0 else if (slot % 3 == 0) 1.15 else 0.8,
+                };
+            }
+            const p: clip_tok.Prompt = .{ .tokens = tokens, .chunks = 2 };
+
+            const want = try arena.alloc(f32, p.seq() * tw.cfg.hidden);
+            const got = try arena.alloc(f32, p.seq() * tw.cfg.hidden);
+            // Separate caches: each side must compute its own `z_empty`, or the device
+            // arm is handed the host's and that half goes unchecked.
+            var cache_cpu: ?[]f32 = null;
+            var cache_dev: ?[]f32 = null;
+            const run: clip_text.TextEncoder.PromptRun = .{
+                .empty_cache = &cache_cpu,
+                .pad_id = tw.pad,
+                .capture_layer = tw.capture,
+            };
+            try enc.encodePrompt(io, arena, want, &p, run);
+            var dev_run = run;
+            dev_run.empty_cache = &cache_dev;
+            try clip_text_cuda.encodePrompt(&enc, be, io, arena, got, &p, dev_run);
+
+            var name_buf: [80]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buf, "clip_text_cuda {s} (2 chunks, weighted)", .{tw.name});
+            // f16 tensor-core GEMMs against an f32 CPU forward over 12/32 layers —
+            // the same regime as the whole-UNet check below, and the per-kernel checks
+            // above are what pin the arithmetic.
+            try rep.check(name, want, got, 2e-2);
+        }
+    }
+    if (family == .sd15) {
+        var unet = try sd_unet.UNet.load(arena, store, sd_unet.sd15, "model.diffusion_model.");
+        defer unet.deinit();
+        const lat_h = 16;
+        const lat_w = 16;
+        const ctx_seq = 77;
+        const n = lat_h * lat_w;
+        const x = try arena.alloc(f32, n * 4);
+        const context = try arena.alloc(f32, ctx_seq * 768);
+        for (x) |*v| v.* = rnd.floatNorm(f32);
+        for (context) |*v| v.* = rnd.floatNorm(f32) * 0.5;
+        const t: f32 = 481;
+
+        var cpu_ws = try sd_unet.Workspace.init(arena, &unet, lat_h, lat_w, ctx_seq);
+        defer cpu_ws.deinit();
+        const want = try arena.alloc(f32, n * 4);
+        try sd_unet.forward(&unet, io, arena, &cpu_ws, want, x, lat_h, lat_w, t, context, ctx_seq, null);
+
+        var sess = try sd_unet_cuda.Session.init(arena, be, &unet, context, ctx_seq, null);
+        defer sess.deinit(be);
+        var ws = try sd_unet_cuda.Workspace.init(arena, be, &unet, lat_h, lat_w, ctx_seq);
+        defer ws.deinit(be);
+        const got = try arena.alloc(f32, n * 4);
+        try sd_unet_cuda.forward(&unet, be, &sess, &ws, io, arena, got, x, lat_h, lat_w, t, null);
+        // A whole UNet of f16 GEMMs; the per-kernel checks above are what pin the
+        // arithmetic, this pins the wiring.
+        try rep.check("sd_unet_cuda.forward (SD1.5, 16x16 latent)", want, got, 2e-2);
+    }
+
+    {
+        var dec = try sd_vae.Decoder.load(arena, store, if (family == .sdxl) sd_vae.sdxl else sd_vae.sd15, "first_stage_model.");
+        defer dec.deinit();
+        // ⚠️ A SWEEP, not one size, and that is the point: this check passed at
+        // 12x10 for months while a 96x96 latent (a 768-square render) decoded to a
+        // solid white image. Anything that reduces over positions — GroupNorm's
+        // chunked Welford statistics, the conv's banding, the attention tiling —
+        // can be correct on a small tile and wrong once the position count crosses
+        // a kernel's own blocking, so the sizes below deliberately straddle the
+        // render sizes people actually use (64 = 512², 96 = 768², 128 = 1024²) and
+        // the tiled-decode tile sizes (64) plus its ragged edge tiles.
+        const sizes = [_][2]usize{
+            .{ 12, 10 }, // tiny, not square, not powers of two
+            .{ 24, 16 }, // a tiled decode's ragged edge tile
+            .{ 64, 64 }, // 512² render / one whole tile of a tiled decode
+            .{ 96, 64 }, // non-square, both large
+            .{ 96, 96 }, // 768² render
+            .{ 128, 128 }, // 1024² render
+        };
+        // ⚠️ NOT `arena`: the CPU reference frees every intermediate it allocates,
+        // but an arena only returns memory at scope exit, so the sweep accumulates
+        // every buffer of every size and the OOM killer takes the process at 128²
+        // (~2 GB per activation there). A freeing allocator keeps the peak at the
+        // few live buffers the decoder actually holds.
+        const ref_gpa = std.heap.page_allocator;
+        // ⚠️ The MAGNITUDE arm is as load-bearing as the size arm. `decode` is
+        // handed `z / scaling_factor`, so a real latent arrives ~5.5x (SD1.5) to
+        // ~7.7x (SDXL) wider than the unit gaussian a fixture naturally uses — and
+        // a unit-gaussian check passed at every size while a REAL 768-square render
+        // decoded to a solid white image.
+        const mags = [_]f32{ 1.0, 1.0 / 0.13025 };
+        for (sizes) |s| {
+            for (mags) |mag| {
+                const lat_h = s[0];
+                const lat_w = s[1];
+                const z = try ref_gpa.alloc(f32, lat_h * lat_w * 4);
+                defer ref_gpa.free(z);
+                for (z) |*v| v.* = rnd.floatNorm(f32) * mag;
+                const want = try dec.decode(io, ref_gpa, z, lat_h, lat_w);
+                defer ref_gpa.free(want);
+                const got = try sd_vae_cuda.decode(&dec, be, ref_gpa, z, lat_h, lat_w, null);
+                defer ref_gpa.free(got);
+                var name_buf: [80]u8 = undefined;
+                const name = try std.fmt.bufPrint(&name_buf, "sd_vae_cuda.decode ({d}x{d} latent, z x{d:.1})", .{ lat_h, lat_w, mag });
+                try rep.check(name, want, got, 5e-3);
+            }
+        }
+    }
+
+    try summarize(stdout, failures);
+}
+
+fn summarize(stdout: *Io.Writer, failures: usize) !void {
+    if (failures == 0) {
+        try stdout.print("\nall checks ok\n", .{});
+        try stdout.flush();
+        return;
+    }
+    try stdout.print("\n{d} check(s) FAILED\n", .{failures});
+    try stdout.flush();
+    return error.ValidationFailed;
+}
+
 /// Validate the CUDA VAE decode (vae_cuda) against the CPU decode on a random
 /// latent: proves the im2col conv + vae_norm + tensor-core mid attention chain.
 fn cudaVaeTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, zh: usize) !void {
@@ -1446,9 +2164,77 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
             opts.shift = try std.fmt.parseFloat(f32, val);
         } else if (std.mem.eql(u8, flag, "--profile")) {
             TensorPencil.models.dit_gpu.profile = std.mem.eql(u8, val, "on") or std.mem.eql(u8, val, "1");
+        } else if (std.mem.eql(u8, flag, "--prompt-syntax")) {
+            if (std.mem.eql(u8, val, "comfy")) {
+                opts.prompt_syntax = .comfy;
+            } else if (std.mem.eql(u8, val, "a1111")) {
+                opts.prompt_syntax = .a1111;
+            } else {
+                try stdout.print("unknown prompt syntax '{s}' (expected: comfy, a1111)\n", .{val});
+                return error.InvalidArgs;
+            }
+        } else if (std.mem.eql(u8, flag, "--emphasis")) {
+            if (std.mem.eql(u8, val, "original")) {
+                opts.emphasis = .original;
+            } else if (std.mem.eql(u8, val, "no_norm")) {
+                opts.emphasis = .no_norm;
+            } else if (std.mem.eql(u8, val, "ignore")) {
+                opts.emphasis = .ignore;
+            } else {
+                try stdout.print("unknown emphasis '{s}' (expected: original, no_norm, ignore)\n", .{val});
+                return error.InvalidArgs;
+            }
+        } else if (std.mem.eql(u8, flag, "--compat")) {
+            if (std.mem.eql(u8, val, "comfy")) {
+                opts.compat = .comfy;
+            } else if (std.mem.eql(u8, val, "a1111")) {
+                opts.compat = .a1111;
+            } else {
+                try stdout.print("unknown compat '{s}' (expected: comfy, a1111)\n", .{val});
+                return error.InvalidArgs;
+            }
+        } else if (std.mem.eql(u8, flag, "--rng")) {
+            if (std.mem.eql(u8, val, "cpu")) {
+                opts.rng = .torch_cpu;
+            } else if (std.mem.eql(u8, val, "nv") or std.mem.eql(u8, val, "gpu")) {
+                // "gpu" is accepted because that is what A1111's own dropdown says; its
+                // "NV" setting is the same generator computed on the host.
+                opts.rng = .nv_philox;
+            } else {
+                try stdout.print("unknown rng '{s}' (expected: cpu, nv)\n", .{val});
+                return error.InvalidArgs;
+            }
+        } else if (std.mem.eql(u8, flag, "--sgm-noise-mult")) {
+            opts.sgm_noise_multiplier = std.mem.eql(u8, val, "on") or std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
+        } else if (std.mem.eql(u8, flag, "--quantize-t")) {
+            opts.quantize_timestep = std.mem.eql(u8, val, "on") or std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
+        } else if (std.mem.eql(u8, flag, "--sampler")) {
+            opts.sampler = TensorPencil.sampler.Kind.parse(val) orelse {
+                try stdout.print(
+                    "unknown sampler '{s}' (expected: euler, dpmpp_2m_sde, dpmpp_2m_sde_heun)\n",
+                    .{val},
+                );
+                return error.InvalidArgs;
+            };
+        } else if (std.mem.eql(u8, flag, "--sde-eta")) {
+            opts.sde_eta = try std.fmt.parseFloat(f64, val);
+        } else if (std.mem.eql(u8, flag, "--sde-s-noise")) {
+            opts.sde_s_noise = try std.fmt.parseFloat(f64, val);
+        } else if (std.mem.eql(u8, flag, "--scheduler")) {
+            opts.scheduler = TensorPencil.sampler.Scheduler.parse(val) orelse {
+                try stdout.print("unknown scheduler '{s}' (expected: normal, karras, " ++
+                    "exponential, sgm_uniform, simple, ddim_uniform, beta, " ++
+                    "linear_quadratic, kl_optimal)\n", .{val});
+                return error.InvalidArgs;
+            };
         } else if (std.mem.eql(u8, flag, "--backend")) {
             opts.backend = TensorPencil.pipeline.Backend.fromStr(val) orelse {
                 try stdout.print("unknown backend '{s}' (expected: cpu, vulkan, zig-cuda)\n", .{val});
+                return error.InvalidArgs;
+            };
+        } else if (std.mem.eql(u8, flag, "--vae-decode")) {
+            opts.vae_decode = std.meta.stringToEnum(TensorPencil.pipeline.VaeDecode, val) orelse {
+                try stdout.print("unknown vae decode mode '{s}' (expected: auto, whole, gpu_tiled, cpu_tiled)\n", .{val});
                 return error.InvalidArgs;
             };
         } else if (std.mem.eql(u8, flag, "--vram-budget")) {
@@ -1474,6 +2260,11 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
         } else if (std.mem.eql(u8, flag, "--text-encoder")) {
             opts.text_encoder_path = val;
             opts.explicit_text_encoder = true;
+        } else if (std.mem.eql(u8, flag, "--text-encoder-2")) {
+            // SDXL's second tower, for a split-file checkpoint. A bundled SDXL
+            // checkpoint carries it, so this is an override, not a requirement.
+            opts.text_encoder_2_path = val;
+            opts.explicit_text_encoder_2 = true;
         } else if (std.mem.eql(u8, flag, "--mmap")) {
             // off => buffered read instead of mmap (ZFS-safe; see safetensors.zig).
             TensorPencil.safetensors.use_mmap = !(std.mem.eql(u8, val, "off") or std.mem.eql(u8, val, "0") or std.mem.eql(u8, val, "false"));

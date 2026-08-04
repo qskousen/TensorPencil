@@ -31,6 +31,7 @@
 
 const std = @import("std");
 const tables = @import("unicode_tables.zig");
+const prompt_a1111 = @import("prompt_a1111.zig");
 
 const vocab_json = @embedFile("assets/clip_tokenizer/vocab.json");
 const merges_txt = @embedFile("assets/clip_tokenizer/merges.txt");
@@ -40,6 +41,11 @@ pub const eos_id: u32 = 49407;
 /// SD1.5 and SDXL both condition on exactly this many token slots; the positional
 /// embedding table is this long, so it is a property of the weights.
 pub const context_length: usize = 77;
+
+/// A tokenized *segment* at least this long is split across a chunk boundary rather
+/// than pushed whole into the next chunk (ComfyUI's `SDTokenizer.max_word_length`).
+/// Short segments are kept intact so a chunk boundary never lands mid-word.
+pub const max_word_length: usize = 8;
 
 /// Binary search over the generated Unicode ranges — the same shape
 /// `tokenizer.zig` uses (its copy is private, and duplicating fifteen lines beats
@@ -146,30 +152,229 @@ pub const Tokenizer = struct {
     /// Encode `text` into exactly `context_length` ids: `[BOS] … [EOS]`, padded with
     /// EOS. Truncation keeps BOS and forces the last slot to EOS. Caller frees.
     pub fn encode(self: *const Tokenizer, gpa: std.mem.Allocator, text: []const u8) ![]u32 {
+        return self.encodePadded(gpa, text, eos_id);
+    }
+
+    /// `encode`, with the padding id spelled out.
+    ///
+    /// ⚠️ **SDXL's two towers pad differently and both paddings are conditioning.**
+    /// CLIP-L pads with EOS (`encode`); CLIP-G pads with **0** (`"!"`), which is what
+    /// OpenCLIP trained with and what both ComfyUI and diffusers use. The padded slots
+    /// are part of the 77-token window the UNet cross-attends to — a causal tower gives
+    /// them different hidden states — so this is not cosmetic, and the two towers must be
+    /// tokenized twice rather than once and shared.
+    pub fn encodePadded(self: *const Tokenizer, gpa: std.mem.Allocator, text: []const u8, pad_id: u32) ![]u32 {
+        const ids = try self.contentIds(gpa, text);
+        defer gpa.free(ids);
+
         const out = try gpa.alloc(u32, context_length);
         errdefer gpa.free(out);
-        @memset(out, eos_id);
+        @memset(out, pad_id);
         out[0] = bos_id;
 
-        var n: usize = 1;
+        // One slot is reserved for the terminating EOS, so at most len - 2 content ids.
+        const n = @min(ids.len, context_length - 2);
+        @memcpy(out[1 .. 1 + n], ids[0..n]);
+        // The terminator is always EOS even when the padding is not — it is what
+        // `clip_text.pooled` looks for, and with pad 0 there is exactly one of them.
+        out[1 + n] = eos_id;
+        return out;
+    }
+
+    /// The bare content ids of `text` — no BOS, no EOS, no padding and no
+    /// truncation. This is `transformers`' `tokenizer(text)["input_ids"][1:-1]`,
+    /// which is the unit both `encodePadded` and `encodeWeighted` are built from.
+    /// Caller frees.
+    pub fn contentIds(self: *const Tokenizer, gpa: std.mem.Allocator, text: []const u8) ![]u32 {
+        var out: std.ArrayList(u32) = .empty;
+        errdefer out.deinit(gpa);
         var words = WordIterator{ .text = text };
         while (try words.next(gpa)) |word| {
             defer gpa.free(word);
-            // One slot is reserved for the terminating EOS, so stop at len - 1.
-            if (n >= context_length - 1) break;
             var pieces = try self.bpe(gpa, word);
             defer {
                 for (pieces.items) |p| gpa.free(p);
                 pieces.deinit(gpa);
             }
-            for (pieces.items) |piece| {
-                if (n >= context_length - 1) break;
-                out[n] = self.vocab.get(piece) orelse eos_id;
-                n += 1;
+            // An unknown piece cannot happen with a well-formed vocab; CLIP's unk
+            // token is `<|endoftext|>`, so falling back to it matches transformers.
+            for (pieces.items) |piece| try out.append(gpa, self.vocab.get(piece) orelse eos_id);
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
+    /// Chunk already-parsed A1111 weighted parts into whole `context_length` windows —
+    /// the `tokenize_line` half of A1111's prompt path, where `prompt_a1111.parseAttention`
+    /// is the other half.
+    ///
+    /// Two things differ from `encodeWeighted`'s ComfyUI chunker, and both are visible in
+    /// a long prompt:
+    ///
+    /// - ⚠️ **A `BREAK` part closes the current chunk immediately**, padding the rest. That
+    ///   is what `BREAK` is *for*, and ComfyUI ignores it entirely (tokenizing the literal
+    ///   word `break`).
+    /// - ⚠️ **A boundary backtracks to the last comma.** On reaching 75 content tokens with
+    ///   a comma no more than `comma_backtrack` tokens behind, everything after that comma
+    ///   is *relocated* into the next chunk, so a boundary does not land mid-phrase. Since
+    ///   each chunk is encoded independently by a causal tower, a phrase split across the
+    ///   seam is conditioning the model never sees whole.
+    ///
+    /// Note the reference sets `last_comma` to the index the comma is *about* to occupy,
+    /// before appending it, and resets it whenever a chunk closes — including on the
+    /// relocation path, where the relocated tokens land in a chunk with no known comma.
+    ///
+    /// `parts` come from `prompt_a1111.parseAttention`. Caller `deinit`s the result.
+    pub fn encodeParts(
+        self: *const Tokenizer,
+        gpa: std.mem.Allocator,
+        parts: []const prompt_a1111.Part,
+        pad_id: u32,
+    ) !Prompt {
+        var scratch = std.heap.ArenaAllocator.init(gpa);
+        defer scratch.deinit();
+        const arena = scratch.allocator();
+
+        // `,</w>` — the comma as its own token, which is what a boundary looks for.
+        const comma_id: ?u32 = self.vocab.get(",</w>");
+
+        var out: std.ArrayList(Weighted) = .empty;
+        errdefer out.deinit(gpa);
+        // The current chunk's CONTENT only; BOS/EOS are added when it closes.
+        var cur: std.ArrayList(Weighted) = .empty;
+        var last_comma: ?usize = null;
+
+        const Closer = struct {
+            fn go(g: std.mem.Allocator, o: *std.ArrayList(Weighted), c: *std.ArrayList(Weighted), lc: *?usize, pad: u32) !void {
+                try o.append(g, .{ .id = bos_id, .weight = 1.0 });
+                try o.appendSlice(g, c.items);
+                // EOS terminates the content; the rest is padding. Both carry weight 1.0,
+                // so a weighted prompt never scales its own delimiters.
+                try o.append(g, .{ .id = eos_id, .weight = 1.0 });
+                for (c.items.len..chunk_content) |_| try o.append(g, .{ .id = pad, .weight = 1.0 });
+                c.clearRetainingCapacity();
+                lc.* = null;
+            }
+        };
+
+        for (parts) |part| {
+            if (part.isBreak()) {
+                try Closer.go(gpa, &out, &cur, &last_comma, pad_id);
+                continue;
+            }
+            const ids = try self.contentIds(arena, part.text);
+            for (ids) |id| {
+                if (comma_id != null and id == comma_id.?) {
+                    last_comma = cur.items.len;
+                } else if (comma_backtrack != 0 and cur.items.len == chunk_content) {
+                    if (last_comma) |lc| if (cur.items.len - lc <= comma_backtrack) {
+                        const at = lc + 1;
+                        const reloc = try arena.dupe(Weighted, cur.items[at..]);
+                        cur.shrinkRetainingCapacity(at);
+                        try Closer.go(gpa, &out, &cur, &last_comma, pad_id);
+                        try cur.appendSlice(gpa, reloc);
+                    };
+                }
+                if (cur.items.len == chunk_content) try Closer.go(gpa, &out, &cur, &last_comma, pad_id);
+                try cur.append(gpa, .{ .id = id, .weight = part.weight });
             }
         }
-        out[n] = eos_id; // explicit terminator; the rest is already EOS padding
-        return out;
+        // A trailing partial chunk, and the empty-prompt case (which still needs one).
+        if (cur.items.len > 0 or out.items.len == 0) {
+            try Closer.go(gpa, &out, &cur, &last_comma, pad_id);
+        }
+        cur.deinit(gpa);
+
+        std.debug.assert(out.items.len % context_length == 0);
+        const tokens = try out.toOwnedSlice(gpa);
+        return .{ .tokens = tokens, .chunks = tokens.len / context_length };
+    }
+
+    /// Tokenize a prompt the way ComfyUI does: parse the `(text:weight)` emphasis
+    /// syntax, then pack the result into **as many whole `context_length` chunks as
+    /// it takes** rather than truncating at one.
+    ///
+    /// ⚠️ **This is what `encode`/`encodePadded` get wrong for any real prompt**, and
+    /// it is not a subtle difference. A booru-style prompt is routinely 100+ tokens;
+    /// truncating at 77 silently drops the tail (typically the entire quality-tag
+    /// block), and tokenizing `(shiny skin:1.1)` literally spends nine content slots
+    /// on punctuation that ComfyUI strips — so the truncation bites *earlier* than the
+    /// prompt's real length suggests. Measured on one real 115-token prompt: ComfyUI
+    /// built 154 conditioning rows, `encode` built 77 and lost `lens flare` through
+    /// `newest`. The render was a different image, at the same seed.
+    ///
+    /// The two conventions worth knowing, because neither is derivable:
+    ///
+    /// - **`BREAK` is not honoured.** A1111 pads to the next chunk on it; ComfyUI has
+    ///   no such rule, so it tokenizes as the literal word `break`. Verified against
+    ///   `comfy.sd1_clip.SDTokenizer` — the chunk split is purely length-driven.
+    /// - **A weight is absolute, not cumulative, once a `:` gives one.** `(a:1.5)`
+    ///   inside another paren group is 1.5, not 1.5 × 1.1. Bare nesting *is*
+    ///   cumulative (`((a))` is 1.21).
+    ///
+    /// `pad_id` is the trailing filler for a short final chunk — EOS for CLIP-L, 0 for
+    /// CLIP-G, exactly as in `encodePadded`. Caller `deinit`s the result.
+    pub fn encodeWeighted(self: *const Tokenizer, gpa: std.mem.Allocator, text: []const u8, pad_id: u32) !Prompt {
+        var scratch = std.heap.ArenaAllocator.init(gpa);
+        defer scratch.deinit();
+        const arena = scratch.allocator();
+
+        var segs: std.ArrayList(Segment) = .empty;
+        try tokenWeights(arena, &segs, try escapeImportant(arena, text), 1.0, 0);
+
+        // Each weighted *segment* is tokenized on its own — not each word — because
+        // that is the unit ComfyUI hands to the tokenizer, and BPE at a segment
+        // boundary is not always what it would be mid-string.
+        var groups: std.ArrayList(Group) = .empty;
+        for (segs.items) |s| {
+            const plain = try unescapeImportant(arena, s.text);
+            if (plain.len == 0) continue; // ComfyUI drops empty segments outright.
+            try groups.append(arena, .{ .ids = try self.contentIds(arena, plain), .weight = s.weight });
+        }
+
+        var out: std.ArrayList(Weighted) = .empty;
+        errdefer out.deinit(gpa);
+
+        // `len` tracks the current chunk's fill; a chunk always opens with BOS and
+        // always closes with EOS, so `context_length - 1` is the content ceiling.
+        try out.append(gpa, .{ .id = bos_id, .weight = 1.0 });
+        var len: usize = 1;
+        for (groups.items) |g| {
+            const is_large = g.ids.len >= max_word_length;
+            // The nesting product was accumulated in f64 to match Python; this is the
+            // single narrowing to the f32 the multiply is actually done in.
+            const w: f32 = @floatCast(g.weight);
+            var rest = g.ids;
+            while (rest.len > 0) {
+                if (rest.len + len <= context_length - 1) {
+                    for (rest) |id| try out.append(gpa, .{ .id = id, .weight = w });
+                    len += rest.len;
+                    break;
+                }
+                const room = context_length - len - 1;
+                if (is_large) {
+                    // Split it: a long segment is not a word, so a boundary inside it
+                    // costs nothing. ⚠️ EOS goes directly after the content it
+                    // terminates — padding follows it, never precedes it.
+                    for (rest[0..room]) |id| try out.append(gpa, .{ .id = id, .weight = w });
+                    rest = rest[room..];
+                    try out.append(gpa, .{ .id = eos_id, .weight = 1.0 });
+                } else {
+                    // Keep it whole: close this chunk early and retry in the next one.
+                    // `rest` is deliberately not advanced.
+                    try out.append(gpa, .{ .id = eos_id, .weight = 1.0 });
+                    for (0..room) |_| try out.append(gpa, .{ .id = pad_id, .weight = 1.0 });
+                }
+                try out.append(gpa, .{ .id = bos_id, .weight = 1.0 });
+                len = 1;
+            }
+        }
+        try out.append(gpa, .{ .id = eos_id, .weight = 1.0 });
+        len += 1;
+        while (len < context_length) : (len += 1) try out.append(gpa, .{ .id = pad_id, .weight = 1.0 });
+
+        std.debug.assert(out.items.len % context_length == 0);
+        const tokens = try out.toOwnedSlice(gpa);
+        return .{ .tokens = tokens, .chunks = tokens.len / context_length };
     }
 
     /// BPE over one byte-encoded word, returning its pieces in order. The pieces
@@ -227,6 +432,204 @@ pub const Tokenizer = struct {
         return out;
     }
 };
+
+/// One token id plus the attention weight the prompt's emphasis syntax gave it.
+pub const Weighted = struct { id: u32, weight: f32 };
+
+/// How far back a chunk boundary may move to land after a comma (A1111's
+/// `comma_padding_backtrack`, default 20). Zero disables it.
+pub const comma_backtrack: usize = 20;
+
+/// Content tokens per chunk — 75, with BOS and EOS making up `context_length`.
+pub const chunk_content: usize = context_length - 2;
+
+/// A prompt tokenized into whole `context_length` chunks. `tokens` is
+/// `[chunks][context_length]` row-major, so every chunk is a complete
+/// `[BOS] … [EOS] pad…` sequence the tower can be run on directly.
+pub const Prompt = struct {
+    tokens: []Weighted,
+    chunks: usize,
+
+    pub fn deinit(self: *Prompt, gpa: std.mem.Allocator) void {
+        gpa.free(self.tokens);
+        self.* = undefined;
+    }
+
+    /// Chunk `i`'s `context_length` weighted ids.
+    pub fn chunk(self: *const Prompt, i: usize) []const Weighted {
+        return self.tokens[i * context_length ..][0..context_length];
+    }
+
+    /// Chunk `i`'s ids alone, into a caller buffer of exactly `context_length`.
+    pub fn idsInto(self: *const Prompt, dst: []u32, i: usize) void {
+        std.debug.assert(dst.len == context_length);
+        for (self.chunk(i), dst) |t, *d| d.* = t.id;
+    }
+
+    /// Total conditioning rows this prompt produces — what `Cond.seq` becomes.
+    pub fn seq(self: *const Prompt) usize {
+        return self.chunks * context_length;
+    }
+
+    /// True when any token's weight is not exactly 1.0. This is ComfyUI's
+    /// `has_weights`, and it is what decides whether the empty-prompt reference
+    /// forward is needed at all (see `clip_text.applyWeights`) — so an unweighted
+    /// prompt costs exactly what it did before.
+    pub fn hasWeights(self: *const Prompt) bool {
+        for (self.tokens) |t| if (t.weight != 1.0) return true;
+        return false;
+    }
+};
+
+/// ComfyUI's `gen_empty_tokens`: the sequence whose hidden states are the reference
+/// point attention weighting interpolates away from — `[BOS] [EOS] pad…`, filled to
+/// `dst.len`.
+pub fn emptyIds(dst: []u32, pad_id: u32) void {
+    std.debug.assert(dst.len >= 2);
+    dst[0] = bos_id;
+    dst[1] = eos_id;
+    @memset(dst[2..], pad_id);
+}
+
+/// A run of prompt text sharing one weight, still pointing into the escaped input.
+const Segment = struct { text: []const u8, weight: f64 };
+/// That run, tokenized. ComfyUI calls this a "t_group".
+const Group = struct { ids: []const u32, weight: f64 };
+
+/// The deepest `(((…)))` nesting accepted. Python's own recursion limit stops the
+/// reference at ~1000 frames; a real prompt never exceeds two or three, so this is a
+/// stack guard against a pathological input rather than a semantic limit — and it is
+/// an error instead of a silent literal reading, since a prompt this malformed should
+/// be reported rather than rendered differently than it looks.
+const max_nesting: usize = 32;
+
+/// `\(` and `\)` mean literal parentheses, so they are hidden from the weight parser
+/// behind byte pairs that cannot occur in text. Both replacements are the same length
+/// as what they replace, which is why this can be one left-to-right pass where the
+/// reference does two `str.replace` sweeps.
+fn escapeImportant(arena: std.mem.Allocator, text: []const u8) ![]u8 {
+    const out = try arena.alloc(u8, text.len);
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == '\\' and i + 1 < text.len and (text[i + 1] == ')' or text[i + 1] == '(')) {
+            out[n] = 0;
+            out[n + 1] = if (text[i + 1] == ')') 1 else 2;
+            n += 2;
+            i += 2;
+        } else {
+            out[n] = text[i];
+            n += 1;
+            i += 1;
+        }
+    }
+    return out[0..n];
+}
+
+/// Undo `escapeImportant` on one segment, restoring the literal parentheses that the
+/// tokenizer should see as text.
+fn unescapeImportant(arena: std.mem.Allocator, text: []const u8) ![]u8 {
+    const out = try arena.alloc(u8, text.len);
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == 0 and i + 1 < text.len and (text[i + 1] == 1 or text[i + 1] == 2)) {
+            out[n] = if (text[i + 1] == 1) ')' else '(';
+            n += 1;
+            i += 2;
+        } else {
+            out[n] = text[i];
+            n += 1;
+            i += 1;
+        }
+    }
+    return out[0..n];
+}
+
+/// Split `string` at its **top-level** parenthesised groups, so each returned item is
+/// either one whole `(…)` group (outer parens included) or a run of text between
+/// them. Every item is a contiguous slice of the input, which is what lets the whole
+/// weight parse stay zero-copy.
+///
+/// Unbalanced input is not an error and must not be "fixed": `a)b` is one plain item
+/// and `(a` is one item that simply fails the `(`…`)` test in `tokenWeights` and is
+/// read as literal text. The reference lets the nesting counter go negative for
+/// exactly this reason, so this does too.
+fn parseParentheses(arena: std.mem.Allocator, out: *std.ArrayList([]const u8), string: []const u8) !void {
+    var start: usize = 0;
+    var nesting: isize = 0;
+    for (string, 0..) |c, i| {
+        if (c == '(') {
+            if (nesting == 0 and i > start) {
+                try out.append(arena, string[start..i]);
+                start = i;
+            }
+            nesting += 1;
+        } else if (c == ')') {
+            nesting -= 1;
+            if (nesting == 0) {
+                try out.append(arena, string[start .. i + 1]);
+                start = i + 1;
+            }
+        }
+    }
+    if (start < string.len) try out.append(arena, string[start..]);
+}
+
+/// Resolve the `(text)` / `(text:weight)` emphasis syntax into flat weighted segments.
+///
+/// ⚠️ **A bare paren multiplies by 1.1; an explicit `:w` REPLACES the weight outright.**
+/// So `((a))` is 1.21 but `((a:1.5))` is 1.5, not 1.65 — the inner absolute wins over
+/// every enclosing multiplier. The multiply happens first and the assignment overwrites
+/// it, which is the reference's order and the only way to get this right.
+///
+/// The product is accumulated in f64 and narrowed once at the end, because that is what
+/// Python does: `1.1 * 1.1` is 1.2100000000000002 in f64 and 1.2100001 in f32.
+fn tokenWeights(
+    arena: std.mem.Allocator,
+    out: *std.ArrayList(Segment),
+    string: []const u8,
+    current_weight: f64,
+    depth: usize,
+) error{ OutOfMemory, PromptNestingTooDeep }!void {
+    if (depth > max_nesting) return error.PromptNestingTooDeep;
+
+    var items: std.ArrayList([]const u8) = .empty;
+    try parseParentheses(arena, &items, string);
+
+    for (items.items) |item| {
+        if (!(item.len >= 2 and item[0] == '(' and item[item.len - 1] == ')')) {
+            try out.append(arena, .{ .text = item, .weight = current_weight });
+            continue;
+        }
+        var x = item[1 .. item.len - 1];
+        var weight = current_weight * 1.1;
+        if (std.mem.lastIndexOfScalar(u8, x, ':')) |at| {
+            // `at > 0`: a leading colon is text, not a weight separator.
+            if (at > 0) {
+                if (parsePyFloat(x[at + 1 ..])) |w| {
+                    weight = w;
+                    x = x[0..at];
+                }
+            }
+        }
+        try tokenWeights(arena, out, x, weight, depth + 1);
+    }
+}
+
+/// `float(s)` as Python accepts it: surrounding whitespace stripped, and nothing else.
+/// Null when Python would have raised, which the caller treats as "this colon was not
+/// a weight" and leaves the text alone.
+///
+/// Zig's `parseFloat` is the more permissive of the two — it also takes hex floats and
+/// `_` digit separators — so those are rejected explicitly rather than silently
+/// accepted, which would read `(a:0x1p4)` as a weight where ComfyUI reads it as text.
+fn parsePyFloat(s: []const u8) ?f64 {
+    const t = std.mem.trim(u8, s, " \t\n\r\x0b\x0c");
+    if (t.len == 0) return null;
+    for (t) |c| if (c == '_' or c == 'x' or c == 'X') return null;
+    return std.fmt.parseFloat(f64, t) catch null;
+}
 
 /// Splits text into CLIP's pretokens, byte-encoded and ready for BPE. Whitespace is
 /// skipped rather than emitted (see the module header), and matching is on the
@@ -375,6 +778,178 @@ test "CLIP tokenization matches transformers.CLIPTokenizer" {
     }
 }
 
+const SdxlCase = struct { text: []const u8, ids_l: []const u32, ids_g: []const u32 };
+const SdxlFixtures = struct { sdxl_tokenizer: []const SdxlCase };
+
+test "SDXL's two paddings match ComfyUI's own SDXL tokenizer" {
+    // The reference is ComfyUI (`comfy.sdxl_clip.SDXLTokenizer`) rather than
+    // transformers, because ComfyUI is the compatibility target and it is what settles
+    // the pad-0 convention for the CLIP-G tower. Same cases as the SD1.5 fixture above,
+    // deliberately: any difference between the two columns is the padding and nothing
+    // else, which is also what this test asserts below.
+    const gpa = testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        SdxlFixtures,
+        gpa,
+        @embedFile("assets/clip_tokenizer/fixtures_sdxl.json"),
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+
+    var tok = try Tokenizer.init(gpa);
+    defer tok.deinit();
+
+    for (parsed.value.sdxl_tokenizer) |c| {
+        const l = try tok.encodePadded(gpa, c.text, eos_id);
+        defer gpa.free(l);
+        const g = try tok.encodePadded(gpa, c.text, 0);
+        defer gpa.free(g);
+        for (c.ids_l, l, 0..) |e, a, i| {
+            errdefer std.debug.print("clip_l '{s}' slot {d}: expected {d} got {d}\n", .{ c.text, i, e, a });
+            try testing.expectEqual(e, a);
+        }
+        for (c.ids_g, g, 0..) |e, a, i| {
+            errdefer std.debug.print("clip_g '{s}' slot {d}: expected {d} got {d}\n", .{ c.text, i, e, a });
+            try testing.expectEqual(e, a);
+        }
+        // And the relation between them, which is the whole claim: identical up to and
+        // including the terminating EOS, then EOS against 0. A fixture that disagreed
+        // here would mean the two towers see different *content*, not different padding.
+        var term: usize = 0;
+        while (term < context_length and c.ids_g[term] != eos_id) term += 1;
+        for (c.ids_l[0 .. term + 1], c.ids_g[0 .. term + 1]) |a, b| try testing.expectEqual(a, b);
+        for (c.ids_l[term + 1 ..]) |id| try testing.expectEqual(eos_id, id);
+        for (c.ids_g[term + 1 ..]) |id| try testing.expectEqual(@as(u32, 0), id);
+    }
+}
+
+const ChunkRows = struct { ids: []const u32, weights: []const f32 };
+const PromptCase = struct { text: []const u8, clip_l: []const ChunkRows, clip_g: []const ChunkRows };
+const PromptFixtures = struct { clip_prompt: []const PromptCase };
+
+test "prompt weights and 77-token chunking match ComfyUI's own tokenizer" {
+    // 31 prompts x 2 paddings, from `tools/gen_clip_prompt_fixtures.py`. The cases are
+    // adversarial on purpose: the two real prompts that exposed the truncation bug, bare
+    // vs absolute nesting, escaped parens, unbalanced parens, an unparseable weight, and
+    // both sides of the keep-short-segments-whole rule at a chunk boundary.
+    const gpa = testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        PromptFixtures,
+        gpa,
+        @embedFile("assets/clip_tokenizer/fixtures_weighted.json"),
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+
+    var tok = try Tokenizer.init(gpa);
+    defer tok.deinit();
+
+    for (parsed.value.clip_prompt) |c| {
+        for ([_]struct { u32, []const ChunkRows }{
+            .{ eos_id, c.clip_l },
+            .{ 0, c.clip_g },
+        }) |arm| {
+            const pad, const want = arm;
+            var got = try tok.encodeWeighted(gpa, c.text, pad);
+            defer got.deinit(gpa);
+
+            errdefer std.debug.print(
+                "'{s}' pad {d}: expected {d} chunks, got {d}\n",
+                .{ c.text, pad, want.len, got.chunks },
+            );
+            try testing.expectEqual(want.len, got.chunks);
+
+            for (want, 0..) |wc, ci| {
+                const gc = got.chunk(ci);
+                for (wc.ids, wc.weights, gc, 0..) |wid, ww, g, j| {
+                    errdefer std.debug.print(
+                        "'{s}' pad {d} chunk {d} slot {d}: expected id {d} w {d}, got id {d} w {d}\n",
+                        .{ c.text, pad, ci, j, wid, ww, g.id, g.weight },
+                    );
+                    try testing.expectEqual(wid, g.id);
+                    // Exact: the weight is a product of literal 1.1s and a parsed
+                    // decimal, and both sides narrow f64 -> f32 at the same point.
+                    try testing.expectEqual(ww, g.weight);
+                }
+            }
+        }
+    }
+}
+
+test "a long prompt keeps every token instead of truncating at one chunk" {
+    // The regression this whole path exists for, stated as a property rather than a
+    // fixture: `encode` drops the tail of a 100+ token prompt, `encodeWeighted` does not.
+    const gpa = testing.allocator;
+    var tok = try Tokenizer.init(gpa);
+    defer tok.deinit();
+
+    var long: std.ArrayList(u8) = .empty;
+    defer long.deinit(gpa);
+    for (0..100) |_| try long.appendSlice(gpa, "cat ");
+    try long.appendSlice(gpa, "unicorn");
+
+    const truncated = try tok.encode(gpa, long.items);
+    defer gpa.free(truncated);
+    var p = try tok.encodeWeighted(gpa, long.items, eos_id);
+    defer p.deinit(gpa);
+
+    const unicorn = tok.vocab.get("unicorn</w>").?;
+    try testing.expect(std.mem.indexOfScalar(u32, truncated, unicorn) == null);
+    var found = false;
+    for (p.tokens) |t| if (t.id == unicorn) {
+        found = true;
+    };
+    try testing.expect(found);
+    // Two chunks, and every chunk is a complete BOS…EOS sequence — not one long run.
+    try testing.expectEqual(@as(usize, 2), p.chunks);
+    for (0..p.chunks) |c| {
+        try testing.expectEqual(bos_id, p.chunk(c)[0].id);
+        var has_eos = false;
+        for (p.chunk(c)) |t| if (t.id == eos_id) {
+            has_eos = true;
+        };
+        try testing.expect(has_eos);
+    }
+    try testing.expect(!p.hasWeights());
+}
+
+test "an unweighted prompt's first chunk is exactly what encodePadded produced" {
+    // The compatibility claim that keeps the fixtures above meaningful: chunking is
+    // additive. A prompt that fit in one window before must tokenize identically now,
+    // padding included, or every existing SD/SDXL parity fixture has silently moved.
+    const gpa = testing.allocator;
+    var tok = try Tokenizer.init(gpa);
+    defer tok.deinit();
+
+    for ([_][]const u8{ "a red cat", "", "one two three four five", "a photo of a dog on a beach" }) |text| {
+        for ([_]u32{ eos_id, 0 }) |pad| {
+            const want = try tok.encodePadded(gpa, text, pad);
+            defer gpa.free(want);
+            var p = try tok.encodeWeighted(gpa, text, pad);
+            defer p.deinit(gpa);
+            try testing.expectEqual(@as(usize, 1), p.chunks);
+            for (want, p.chunk(0), 0..) |w, g, i| {
+                errdefer std.debug.print("'{s}' pad {d} slot {d}: {d} vs {d}\n", .{ text, pad, i, w, g.id });
+                try testing.expectEqual(w, g.id);
+            }
+        }
+    }
+}
+
+test "a pathologically nested prompt is reported rather than silently mis-read" {
+    const gpa = testing.allocator;
+    var tok = try Tokenizer.init(gpa);
+    defer tok.deinit();
+
+    var deep: std.ArrayList(u8) = .empty;
+    defer deep.deinit(gpa);
+    for (0..64) |_| try deep.append(gpa, '(');
+    try deep.appendSlice(gpa, "cat");
+    for (0..64) |_| try deep.append(gpa, ')');
+
+    try testing.expectError(error.PromptNestingTooDeep, tok.encodeWeighted(gpa, deep.items, eos_id));
+}
+
 test "the encoding always terminates, even when the prompt overruns the window" {
     // Truncation must keep BOS and force EOS into the last slot: a prompt that runs
     // past 77 tokens otherwise ends mid-word, and `clip_text.pooled` (first EOS)
@@ -409,4 +984,84 @@ test "whitespace is dropped rather than attached to the next word" {
     const b = try tok.encode(gpa, "  a red cat  ");
     defer gpa.free(b);
     try testing.expectEqualSlices(u32, a, b);
+}
+
+const A1111ChunkRows = struct { ids: []const u32, mults: []const f32 };
+const A1111ChunkCase = struct { text: []const u8, clip_l: []const A1111ChunkRows, clip_g: []const A1111ChunkRows };
+const A1111ChunkFixtures = struct { a1111_chunks: []const A1111ChunkCase };
+
+test "A1111 chunking matches tokenize_line, BREAK and comma backtrack included" {
+    // The full A1111 front end end to end: `parseAttention` then `encodeParts`, against
+    // A1111's own `parse_prompt_attention` piped through its own `tokenize_line`. The
+    // cases straddle the 75-token boundary with and without a nearby comma, which is the
+    // only way to see the backtrack at all.
+    const gpa = testing.allocator;
+    var parsed = try std.json.parseFromSlice(
+        A1111ChunkFixtures,
+        gpa,
+        @embedFile("assets/clip_tokenizer/fixtures_a1111.json"),
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+
+    var tok = try Tokenizer.init(gpa);
+    defer tok.deinit();
+
+    for (parsed.value.a1111_chunks) |c| {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const parts = try prompt_a1111.parseAttention(arena.allocator(), c.text);
+
+        for ([_]struct { u32, []const A1111ChunkRows }{
+            .{ eos_id, c.clip_l },
+            .{ 0, c.clip_g },
+        }) |arm| {
+            const pad, const want = arm;
+            var got = try tok.encodeParts(gpa, parts, pad);
+            defer got.deinit(gpa);
+
+            errdefer std.debug.print(
+                "'{s}' pad {d}: expected {d} chunks, got {d}\n",
+                .{ c.text, pad, want.len, got.chunks },
+            );
+            try testing.expectEqual(want.len, got.chunks);
+            for (want, 0..) |wc, ci| {
+                for (wc.ids, wc.mults, got.chunk(ci), 0..) |wid, wm, g, j| {
+                    errdefer std.debug.print(
+                        "'{s}' pad {d} chunk {d} slot {d}: want id {d} w {d}, got id {d} w {d}\n",
+                        .{ c.text, pad, ci, j, wid, wm, g.id, g.weight },
+                    );
+                    try testing.expectEqual(wid, g.id);
+                    try testing.expectEqual(wm, g.weight);
+                }
+            }
+        }
+    }
+}
+
+test "BREAK closes a chunk in the A1111 dialect and is a word in ComfyUI's" {
+    // The two dialects side by side on the same prompt, which is the clearest statement
+    // of why `Options.prompt_syntax` is not cosmetic.
+    const gpa = testing.allocator;
+    var tok = try Tokenizer.init(gpa);
+    defer tok.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    const parts = try prompt_a1111.parseAttention(arena.allocator(), "a BREAK b");
+    var a1111 = try tok.encodeParts(gpa, parts, eos_id);
+    defer a1111.deinit(gpa);
+    var comfy = try tok.encodeWeighted(gpa, "a BREAK b", eos_id);
+    defer comfy.deinit(gpa);
+
+    // A1111 splits into two windows; ComfyUI keeps one and spells `break` as a token.
+    try testing.expectEqual(@as(usize, 2), a1111.chunks);
+    try testing.expectEqual(@as(usize, 1), comfy.chunks);
+    const break_id = tok.vocab.get("break</w>").?;
+    var comfy_has_break = false;
+    for (comfy.chunk(0)) |t| if (t.id == break_id) {
+        comfy_has_break = true;
+    };
+    try testing.expect(comfy_has_break);
+    for (a1111.chunk(0)) |t| try testing.expect(t.id != break_id);
 }

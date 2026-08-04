@@ -111,7 +111,7 @@ pub const topk_lanes = 1024;
 /// llm.kv_cache.KvDtype). q8_0 is the ggml 34-byte block (f16 scale + 32 i8).
 pub const KvFmt = enum { f32, f16, q8_0 };
 
-pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, rope_qwen35, attn_decode_q35, attn_dsplit_gemma, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, attn_dsplit_gemma_f16, kv_store_f16, penalize, attn_dsplit_gemma_q8, kv_store_q8_0, gemv_iq4_nl, gemv_iq4_nl_t, dequant_q8_0_f32, dequant_q4_k_f32, dequant_q5_k_f32, dequant_q6_k_f32, dequant_iq4_nl_f32, pack_h16_kmajor };
+pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, rope_qwen35, attn_decode_q35, attn_dsplit_gemma, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, attn_dsplit_gemma_f16, kv_store_f16, penalize, attn_dsplit_gemma_q8, kv_store_q8_0, gemv_iq4_nl, gemv_iq4_nl_t, dequant_q8_0_f32, dequant_q4_k_f32, dequant_q5_k_f32, dequant_q6_k_f32, dequant_iq4_nl_f32, pack_h16_kmajor, gn_stats, gn_combine, gn_apply, silu, geglu, concat_ch, attn_cross, head_pad_h16, head_unpad, im2col_sd, attn_causal_batched, gelu_quick, gelu_erf };
 const elt_entry_sizes = [_]EntrySize{
     .{ .name = "rmsnorm", .x = 64, .y = 1 },
     .{ .name = "rms_partial", .x = 256, .y = 1 },
@@ -200,6 +200,23 @@ const elt_entry_sizes = [_]EntrySize{
     .{ .name = "dequant_q6_k_f32", .x = 256, .y = 1 },
     .{ .name = "dequant_iq4_nl_f32", .x = 256, .y = 1 },
     .{ .name = "pack_h16_kmajor", .x = 256, .y = 1 },
+    .{ .name = "gn_stats", .x = 256, .y = 1 },
+    .{ .name = "gn_combine", .x = 32, .y = 1 },
+    .{ .name = "gn_apply", .x = 256, .y = 1 },
+    .{ .name = "silu", .x = 256, .y = 1 },
+    .{ .name = "geglu", .x = 256, .y = 1 },
+    .{ .name = "concat_ch", .x = 256, .y = 1 },
+    .{ .name = "attn_cross", .x = 64, .y = 1 },
+    .{ .name = "head_pad_h16", .x = 256, .y = 1 },
+    .{ .name = "head_unpad", .x = 256, .y = 1 },
+    .{ .name = "im2col_sd", .x = 256, .y = 1 },
+    // CLIP's text tower (`clip_text_gpu`): causal self-attention batched over prompt
+    // chunks, and the two GELU forms its two towers use. Appended rather than grouped
+    // with their non-causal siblings above because `Elt` is indexed by
+    // `@intFromEnum` into this table — inserting mid-list silently renames kernels.
+    .{ .name = "attn_causal_batched", .x = 64, .y = 1 },
+    .{ .name = "gelu_quick", .x = 256, .y = 1 },
+    .{ .name = "gelu_erf", .x = 256, .y = 1 },
 };
 
 /// Push block shared by all eltwise entries; meaning per entry (see kernels).
@@ -561,6 +578,11 @@ pub const Context = struct {
     pipe_scores: vk.Pipeline = .null_handle,
     shader_scores_vae: vk.ShaderModule = .null_handle,
     pipe_scores_vae: vk.Pipeline = .null_handle,
+    /// head_dim-512 variant, for the SD-family VAE's mid-block attention (one
+    /// head over all 512 channels). A separate module because `buildGemmScores`
+    /// unrolls the k-depth into the shader.
+    shader_scores_sd: vk.ShaderModule = .null_handle,
+    pipe_scores_sd: vk.Pipeline = .null_handle,
     shader_attn_out: vk.ShaderModule = .null_handle,
     pipe_attn_out: vk.Pipeline = .null_handle,
     shader_flash_md: vk.ShaderModule = .null_handle,
@@ -1416,8 +1438,10 @@ pub const Context = struct {
         var pipe_scores: vk.Pipeline = .null_handle;
         var shader_scores_vae: vk.ShaderModule = .null_handle;
         var pipe_scores_vae: vk.Pipeline = .null_handle;
+        var shader_scores_sd: vk.ShaderModule = .null_handle;
+        var pipe_scores_sd: vk.Pipeline = .null_handle;
         if (shader_coop != .null_handle) {
-            inline for (.{ .{ 128, &shader_scores }, .{ 384, &shader_scores_vae } }) |v| {
+            inline for (.{ .{ 128, &shader_scores }, .{ 384, &shader_scores_vae }, .{ 512, &shader_scores_sd } }) |v| {
                 const code = try coopmat.buildGemmScores(gpa, v[0], coopmat.scores_stage_k);
                 defer gpa.free(code);
                 try check(d.CreateShaderModule(device, &.{
@@ -1428,13 +1452,19 @@ pub const Context = struct {
         }
         errdefer if (shader_scores != .null_handle) d.DestroyShaderModule(device, shader_scores, null);
         errdefer if (shader_scores_vae != .null_handle) d.DestroyShaderModule(device, shader_scores_vae, null);
+        errdefer if (shader_scores_sd != .null_handle) d.DestroyShaderModule(device, shader_scores_sd, null);
         if (shader_scores != .null_handle) {
-            inline for (.{ .{ shader_scores, &pipe_scores }, .{ shader_scores_vae, &pipe_scores_vae } }) |v| {
+            inline for (.{
+                .{ shader_scores, &pipe_scores },
+                .{ shader_scores_vae, &pipe_scores_vae },
+                .{ shader_scores_sd, &pipe_scores_sd },
+            }) |v| {
                 try createCoopPipe(&d, device, v[0], pipeline_layout_e, coop_sg, v[1]);
             }
         }
         errdefer if (pipe_scores != .null_handle) d.DestroyPipeline(device, pipe_scores, null);
         errdefer if (pipe_scores_vae != .null_handle) d.DestroyPipeline(device, pipe_scores_vae, null);
+        errdefer if (pipe_scores_sd != .null_handle) d.DestroyPipeline(device, pipe_scores_sd, null);
 
         var shader_attn_out: vk.ShaderModule = .null_handle;
         var pipe_attn_out: vk.Pipeline = .null_handle;
@@ -1608,6 +1638,8 @@ pub const Context = struct {
             .pipe_scores = pipe_scores,
             .shader_scores_vae = shader_scores_vae,
             .pipe_scores_vae = pipe_scores_vae,
+            .shader_scores_sd = shader_scores_sd,
+            .pipe_scores_sd = pipe_scores_sd,
             .shader_attn_out = shader_attn_out,
             .pipe_attn_out = pipe_attn_out,
             .shader_flash_md = shader_flash_md,
@@ -1686,7 +1718,9 @@ pub const Context = struct {
         if (self.pipe_scores != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_scores, null);
         if (self.shader_scores != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_scores, null);
         if (self.pipe_scores_vae != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_scores_vae, null);
+        if (self.pipe_scores_sd != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_scores_sd, null);
         if (self.shader_scores_vae != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_scores_vae, null);
+        if (self.shader_scores_sd != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_scores_sd, null);
         if (self.pipe_attn_out != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_attn_out, null);
         if (self.shader_attn_out != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_attn_out, null);
         if (self.pipe_flash_md != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_flash_md, null);
@@ -2372,8 +2406,26 @@ pub const Context = struct {
         scale: f32,
         bias: ?[]const f32,
     ) Error!void {
+        const bias_buf = if (bias) |bv| try self.smallBuffer(std.mem.sliceAsBytes(bv)) else null;
+        return self.opMatmulB(y, y_off, x, x_off, m, w_bytes, dtype_f8, rows, cols, scale, bias_buf);
+    }
+
+    fn opMatmulB(
+        self: *Context,
+        y: DeviceBuffer,
+        y_off: u64,
+        x: DeviceBuffer,
+        x_off: u64,
+        m: usize,
+        w_bytes: []const u8,
+        dtype_f8: bool,
+        rows: usize,
+        cols: usize,
+        scale: f32,
+        bias: ?vk.Buffer,
+    ) Error!void {
         const w_buf = try self.weightBuffer(w_bytes, if (dtype_f8) 1 else 4, rows, cols);
-        const bias_buf = if (bias) |bv| try self.smallBuffer(std.mem.sliceAsBytes(bv)) else try self.dummyBuf();
+        const bias_buf = bias orelse try self.dummyBuf();
 
         const push: Push = .{
             .m = @intCast(m),
@@ -3193,9 +3245,59 @@ pub const Context = struct {
         cols: usize,
         bias: []const f32,
     ) Error!void {
+        return self.opMatmulCoopF16WScaled(y, y_off, x, m, w, rows, cols, bias, 1.0);
+    }
+
+    /// `opMatmulCoopF16W` with the activation divided by `act_div` before the f16
+    /// cast and the GEMM result multiplied back afterwards (the bias is added after
+    /// the unscale, so it is passed unscaled). `act_div = 1.0` is `opMatmulCoopF16W`.
+    ///
+    /// ⚠️ f16's 65504 ceiling is reachable on real checkpoints: an SDXL VAE
+    /// decoder's residual stream measures ~4.2e5, so the cast alone produced `inf`,
+    /// the next GroupNorm turned that into NaN through its mean, and every SDXL
+    /// render at 512² or larger came out solid white with no error. A power-of-two
+    /// divisor makes the correction exact (it shifts the exponent only, and f16
+    /// keeps all 11 mantissa bits) and free — both halves ride in kernels that
+    /// already touch every element. See `sd_vae_gpu`'s `residual_act_div`.
+    pub fn opMatmulCoopF16WScaled(
+        self: *Context,
+        y: DeviceBuffer,
+        y_off: usize,
+        x: DeviceBuffer,
+        m: usize,
+        w: []const f32,
+        rows: usize,
+        cols: usize,
+        bias: []const f32,
+        act_div: f32,
+    ) Error!void {
         std.debug.assert(self.pipe_coop_f16w != .null_handle);
         const w_buf = try self.weightBufferF16From32(w, rows, cols);
-        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, bias, false);
+        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, false, act_div);
+    }
+
+    /// `opMatmulCoopF16W` with a **device-resident** bias, for the SD UNet's
+    /// ResBlocks: their convolution bias has the timestep-embedding projection
+    /// folded into it, so it changes every forward and cannot go through the
+    /// pointer-keyed `smallBuffer` cache (see `coopF16WDispatch`). Folding rather
+    /// than adding is exact — the projection is a per-channel constant over
+    /// positions, which is what a conv bias already is — and it saves a full
+    /// read-modify-write pass over the activation per ResBlock.
+    pub fn opMatmulCoopF16WDev(
+        self: *Context,
+        y: DeviceBuffer,
+        y_off: usize,
+        x: DeviceBuffer,
+        m: usize,
+        w: []const f32,
+        rows: usize,
+        cols: usize,
+        bias: DeviceBuffer,
+        bias_off: usize,
+    ) Error!void {
+        std.debug.assert(self.pipe_coop_f16w != .null_handle);
+        const w_buf = try self.weightBufferF16From32(w, rows, cols);
+        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, bias.buf, bias_off, false, 1.0);
     }
 
     /// Same f16-weight tensor-core GEMM as opMatmulCoopF16W, but the weight is a
@@ -3217,7 +3319,33 @@ pub const Context = struct {
     ) Error!void {
         std.debug.assert(self.pipe_coop_f16w != .null_handle);
         const w_buf = try self.weightBufferF16FromBf16(w_bytes, rows, cols, false);
-        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, bias, false);
+        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, false, 1.0);
+    }
+
+    /// Same f16-weight tensor-core GEMM again, but the weight is a raw **f16**
+    /// tensor — the dtype most SD-family checkpoints ship their UNet linears in
+    /// (`sd_unet`'s loader keeps every weight in its checkpoint dtype so a
+    /// quantized UNet still runs and `ops.matmul.probe` can attribute the GEMM).
+    ///
+    /// It reuses the *bf16* transpose pipeline deliberately: `transpose.bf16_coopw`
+    /// copies the 16-bit lanes VERBATIM into the k-major coop layout, so it is a
+    /// pure permutation and carries f16 bits just as faithfully as bf16 ones. What
+    /// makes this the f16 arm rather than the bf16 one is the dispatch flag —
+    /// `bf16_ab = false` converts the activation to f16, so both operands are f16.
+    pub fn opMatmulCoopF16Wh(
+        self: *Context,
+        y: DeviceBuffer,
+        y_off: usize,
+        x: DeviceBuffer,
+        m: usize,
+        w_bytes: []const u8,
+        rows: usize,
+        cols: usize,
+        bias: []const f32,
+    ) Error!void {
+        std.debug.assert(self.pipe_coop_f16w != .null_handle);
+        const w_buf = try self.weightBufferF16FromBf16(w_bytes, rows, cols, true);
+        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, false, 1.0);
     }
 
     /// Native bf16 twin of opMatmulCoopF16Wb: the raw bf16 weight is kept bf16
@@ -3237,13 +3365,20 @@ pub const Context = struct {
     ) Error!void {
         std.debug.assert(self.pipe_coop_bf16w != .null_handle);
         const w_buf = try self.weightBufferF16FromBf16(w_bytes, rows, cols, true);
-        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, bias, true);
+        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, true, 1.0);
     }
 
     /// Shared body of the f16/bf16-weight coop GEMM: the weight is already
     /// uploaded as k-major padded 16-bit (`w_buf`); convert x to f16 (or bf16
     /// when `bf16_ab`), run the coop dispatch into the padded scratch, then strip
     /// the pad and add `bias` into `y`.
+    ///
+    /// `bias_buf` is a device buffer of `rows` f32 rather than a host slice,
+    /// because a caller may need a bias that CHANGES between calls: `smallBuffer`
+    /// caches by pointer and never re-uploads, so a per-forward vector written
+    /// back into the same host array would silently keep the first forward's
+    /// values. The SD UNet folds each ResBlock's time-embedding projection into
+    /// its convolution bias, which is exactly that case.
     fn coopF16WDispatch(
         self: *Context,
         y: DeviceBuffer,
@@ -3253,8 +3388,10 @@ pub const Context = struct {
         w_buf: vk.Buffer,
         rows: usize,
         cols: usize,
-        bias: []const f32,
+        bias_buf: vk.Buffer,
+        bias_off: usize,
         bf16_ab: bool,
+        act_div: f32,
     ) Error!void {
         const n_pad = std.mem.alignForward(usize, rows, 128);
         const k_pad = std.mem.alignForward(usize, cols, 64);
@@ -3262,13 +3399,15 @@ pub const Context = struct {
         try self.ensureDeviceBuffer(&self.x_h16, m_pad * k_pad * 2);
         try self.ensureDeviceBuffer(&self.y_pad, m_pad * n_pad * 4);
 
-        // x f32 [m][cols] -> f16/bf16 [m_pad][k_pad], zeros in both pads.
+        // x f32 [m][cols] -> f16/bf16 [m_pad][k_pad], zeros in both pads. The
+        // `act_div` division rides along here and is undone in `bias_compact`; see
+        // `opMatmulCoopF16WScaled`.
         try self.opElt(if (bf16_ab) .f32_to_bf16_pad else .f32_to_h16_pad, x, null, null, self.x_h16, .{
             .u0 = @intCast(m_pad * k_pad / 2),
             .u1 = @intCast(cols),
             .u2 = @intCast(k_pad),
             .u3 = @intCast(m),
-            .f0 = 1.0,
+            .f0 = 1.0 / act_div,
         }, m_pad * k_pad / 2, 1, 1);
 
         const push: [4]u32 = .{ @intCast(m_pad), @intCast(n_pad), @intCast(k_pad), @intCast(n_pad) };
@@ -3280,16 +3419,14 @@ pub const Context = struct {
         self.d.CmdDispatch(self.cmd, @intCast(n_pad / 128), @intCast(m_pad / 128), 1);
         try self.opEnd();
 
-        const bias_buf: DeviceBuffer = .{
-            .buf = try self.smallBuffer(std.mem.sliceAsBytes(bias)),
-            .mem = .null_handle,
-            .size = 0,
-        };
-        try self.opElt(.bias_compact, self.y_pad, bias_buf, null, y, .{
+        const bias_db: DeviceBuffer = .{ .buf = bias_buf, .mem = .null_handle, .size = 0 };
+        try self.opElt(.bias_compact, self.y_pad, bias_db, null, y, .{
             .u0 = @intCast(m * rows),
             .u1 = @intCast(rows),
             .u2 = @intCast(n_pad),
             .u3 = @intCast(y_off),
+            .u4 = @intCast(bias_off),
+            .f0 = act_div,
         }, m * rows, 1, 1);
     }
 
@@ -3377,7 +3514,7 @@ pub const Context = struct {
     pub fn opMatmulCoopQuant(self: *Context, dt: @import("tp_core").dtype.DType, y: DeviceBuffer, y_off: usize, x: DeviceBuffer, m: usize, w_bytes: []const u8, rows: usize, cols: usize, scale: f32, bias: []const f32, repacked: bool) Error!void {
         std.debug.assert(self.pipe_coop_f16w != .null_handle);
         const w_buf = try self.quantWeightF16K(dt, w_bytes, rows, cols, scale, repacked);
-        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, bias, false);
+        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, false, 1.0);
     }
 
     /// Whether the int8 dp4a decode GEMV is available (q8_0 / iq4_nl).
@@ -3634,7 +3771,21 @@ pub const Context = struct {
         return self.opAttnScoresPipe(self.pipe_scores, s, q16, k16, push, gx, gy, gz);
     }
 
-    /// head_dim-384 variant (VAE mid-block attention).
+    /// head_dim-512 variant (the SD-family VAE's mid-block attention).
+    pub fn opAttnScoresSd(
+        self: *Context,
+        s: DeviceBuffer,
+        q16: DeviceBuffer,
+        k16: DeviceBuffer,
+        push: EltPush,
+        gx: usize,
+        gy: usize,
+        gz: usize,
+    ) Error!void {
+        return self.opAttnScoresPipe(self.pipe_scores_sd, s, q16, k16, push, gx, gy, gz);
+    }
+
+    /// head_dim-384 variant (Wan VAE mid-block attention).
     pub fn opAttnScoresVae(
         self: *Context,
         s: DeviceBuffer,

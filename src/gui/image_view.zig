@@ -11,6 +11,7 @@ const std = @import("std");
 const dvui = @import("dvui");
 const config = @import("config.zig");
 const diffuser = @import("diffuser.zig");
+const model_spec = @import("model_spec.zig");
 const clipboard = @import("clipboard.zig");
 const fonts = @import("fonts.zig");
 const hint = @import("hint.zig");
@@ -25,8 +26,16 @@ var g_env_ready: bool = false;
 /// Set when a done image is clicked; app.zig opens/refocuses the viewer.
 pub var viewer_request: ?*GenImage = null;
 
+// Memoized inspection of the configured checkpoint, so the form can default to
+// the architecture's own parameters (see `seed`). Live only after `setEnv`.
+var g_spec: model_spec.Cache = undefined;
+var g_spec_ready: bool = false;
+
 // Form fields (numeric ones edited as text, like the settings view).
 var seeded: bool = false;
+/// The architecture the form was last seeded for. A change here means the user
+/// picked a different kind of model, and the CFG default is re-seeded.
+var seeded_family: ?model_spec.Family = null;
 var prompt_buf: [4096]u8 = [_]u8{0} ** 4096;
 var negative_buf: [1024]u8 = [_]u8{0} ** 1024;
 var width_buf: [12]u8 = [_]u8{0} ** 12;
@@ -45,6 +54,8 @@ pub fn setEnv(gpa: std.mem.Allocator, io: std.Io, wake: *const fn () void) void 
     g_gpa = gpa;
     g_io = io;
     g_wake = wake;
+    g_spec = model_spec.Cache.init(gpa, io);
+    g_spec_ready = true;
     g_env_ready = true;
 }
 
@@ -52,17 +63,51 @@ pub fn setEnv(gpa: std.mem.Allocator, io: std.Io, wake: *const fn () void) void 
 /// state at exit.
 pub fn deinit() void {
     seeded = false;
+    seeded_family = null;
     viewer_request = null;
+    if (g_spec_ready) {
+        g_spec.deinit();
+        g_spec_ready = false;
+    }
 }
 
-fn seed(cfg: *const config.Config) void {
+/// The architecture of the configured checkpoint, if it can be read. Memoized on
+/// the path, so this is one header parse per model change, not per frame.
+///
+/// A file REPLACED under an unchanged path keeps the old answer here (only the
+/// settings screen re-probes, on every open). That is deliberate: the worst
+/// consequence is a stale CFG *suggestion* in a form field the user can edit,
+/// which does not justify re-parsing a checkpoint header every frame.
+fn currentFamily(cfg: *const config.Config) ?model_spec.Family {
+    if (!g_spec_ready) return null;
+    const path = cfg.diffusion_model.opt() orelse return null;
+    const info = g_spec.primary(path).info() orelse return null;
+    return info.family;
+}
+
+fn seed(cfg: *const config.Config, fam: ?model_spec.Family) void {
+    // Width / height / steps belong to Settings — they are the user's explicit
+    // global defaults, so the form must not overwrite them with an
+    // architecture's suggestion.
     _ = std.fmt.bufPrintZ(&width_buf, "{d}", .{cfg.width}) catch {};
     _ = std.fmt.bufPrintZ(&height_buf, "{d}", .{cfg.height}) catch {};
     _ = std.fmt.bufPrintZ(&steps_buf, "{d}", .{cfg.steps}) catch {};
-    _ = std.fmt.bufPrintZ(&cfg_buf, "{d:.1}", .{@as(f32, 1.0)}) catch {};
+    // CFG has no Settings field: it was a hardcoded 1.0, which is krea2's value
+    // and *disables* classifier-free guidance. SD1.5 at 1.0 ignores the negative
+    // prompt entirely and produces a washed, prompt-adherent-in-name-only image,
+    // so the default has to follow the architecture.
+    const guidance = if (fam) |f| model_spec.traits(f).cfg else 1.0;
+    _ = std.fmt.bufPrintZ(&cfg_buf, "{d:.1}", .{guidance}) catch {};
     _ = std.fmt.bufPrintZ(&count_buf, "{d}", .{@as(usize, 1)}) catch {};
     _ = std.fmt.bufPrintZ(&seed_buf, "{d}", .{@as(u64, 0)}) catch {};
     seeded = true;
+    seeded_family = fam;
+}
+
+fn famEql(a: ?model_spec.Family, b: ?model_spec.Family) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return a.? == b.?;
 }
 
 fn parseNum(buf: []const u8, fallback: usize) usize {
@@ -84,7 +129,11 @@ pub const Callbacks = struct {
 /// model is configured → a notice is shown). `ready` is false while the LLM is
 /// still being torn down (Generate is disabled until the device is free).
 pub fn render(cfg: *const config.Config, d: ?*diffuser.Diffuser, ready: bool, cb: Callbacks) void {
-    if (!seeded) seed(cfg);
+    const fam = currentFamily(cfg);
+    // Re-seed when the user switches to a different ARCHITECTURE: the form's CFG
+    // default is architecture-specific and carrying krea2's over to SD1.5 (or
+    // back) is a visibly wrong image, not a preference.
+    if (!seeded or !famEql(fam, seeded_family)) seed(cfg, fam);
 
     // Header: title + Chat / Settings actions.
     {
@@ -111,7 +160,8 @@ pub fn render(cfg: *const config.Config, d: ?*diffuser.Diffuser, ready: bool, cb
         var col = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both, .gravity_x = 0.5, .gravity_y = 0.5, .padding = dvui.Rect.all(24) });
         defer col.deinit();
         var tl = dvui.textLayout(@src(), .{}, .{ .gravity_x = 0.5 });
-        fonts.addRich(tl, "No diffusion model is set.\n\nOpen Settings and choose a diffusion model, text encoder, and VAE to generate images here.");
+        fonts.addRich(tl, "No diffusion model is set.\n\nOpen Settings and choose a diffusion model to generate images here. " ++
+            "Most checkpoints bundle everything they need; the text encoder and VAE fields are only for supplying or replacing a piece.");
         tl.deinit();
         if (dvui.button(@src(), "Open Settings", .{}, .{ .gravity_x = 0.5, .margin = .{ .y = 12 } })) cb.settings();
         return;
@@ -122,8 +172,44 @@ pub fn render(cfg: *const config.Config, d: ?*diffuser.Diffuser, ready: bool, cb
     var body = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .padding = dvui.Rect.all(8) });
     defer body.deinit();
 
+    renderModelNotice(cfg, engine, fam);
     renderForm(cfg, engine, ready);
     renderGallery(engine);
+}
+
+/// Tell the user, BEFORE they hit Generate, when this model set cannot produce an
+/// image — and afterwards, why the last load failed.
+///
+/// A model set can now fail to load for reasons the studio has no other way to
+/// show: a missing component the checkpoint does not bundle, an override holding
+/// the wrong architecture's weights, or a backend without kernels for it. All of
+/// those used to surface as a bare "⚠ failed" on the image with the reason only
+/// in the terminal.
+fn renderModelNotice(cfg: *const config.Config, engine: *diffuser.Diffuser, fam: ?model_spec.Family) void {
+    var buf: [320]u8 = undefined;
+    const theme = dvui.themeGet();
+    const alarm = theme.err.fill orelse theme.text;
+
+    const text: []const u8 = blk: {
+        if (engine.loadError()) |err| break :blk std.fmt.bufPrint(
+            &buf,
+            "⚠ The diffusion model failed to load: {t}. Check the model paths and backend in Settings.",
+            .{err},
+        ) catch "⚠ The diffusion model failed to load.";
+        const f = fam orelse return; // unreadable/unknown: Settings says why
+        const t = model_spec.traits(f);
+        const want = diffuser.toPipelineBackend(cfg.diff_backend);
+        if (!t.supports(want)) break :blk std.fmt.bufPrint(
+            &buf,
+            "⚠ {s} has no kernels for the {t} backend. Generation will fail to load — change it in Settings.",
+            .{ t.label, cfg.diff_backend },
+        ) catch "⚠ This architecture has no kernels for the selected backend.";
+        return;
+    };
+
+    var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .padding = .{ .x = 2, .y = 4 }, .color_text = alarm });
+    defer tl.deinit();
+    tl.addText(text, .{});
 }
 
 fn renderForm(cfg: *const config.Config, engine: *diffuser.Diffuser, ready: bool) void {

@@ -67,10 +67,79 @@ pub const sd15: Config = .{
     .scaling_factor = 0.18215,
 };
 
-const GroupNormW = struct { w: []const f32, b: []const f32 };
+/// SDXL's VAE is **architecturally identical** to SD1.5's — same widths, same depth, same
+/// epsilon — and differs only in weights and in the latent scale it was trained against.
+/// That one number is not cosmetic: decoding an SDXL latent with 0.18215 hands the decoder
+/// values 1.4x too small and produces a washed, low-contrast image with no error anywhere.
+pub const sdxl: Config = .{
+    .z_channels = 4,
+    .base_channels = 128,
+    .block_out_channels = &.{ 128, 256, 512, 512 },
+    .layers_per_block = 3,
+    .norm_groups = 32,
+    .norm_eps = 1e-6,
+    .scaling_factor = 0.13025,
+};
+
+pub const latent_channels = 4;
+pub const spatial_scale = 8;
+
+/// Linear latent→RGB approximation for the live sampling preview, from ComfyUI's
+/// `latent_formats.SD15` / `.SDXL`. A per-pixel 4x3 matmul on the *scaled* latent
+/// (the same space the sampler works in, i.e. what `decode` divides by
+/// `scaling_factor`), so it needs no VAE and runs every step.
+///
+/// The two families' factors are genuinely different matrices and SDXL carries a
+/// bias where SD1.5's is zero; using one for the other gives a preview with plausible
+/// structure and wrong colours.
+pub const latent_rgb_factors_sd15 = [latent_channels][3]f32{
+    .{ 0.3512, 0.2297, 0.3227 },
+    .{ 0.3250, 0.4974, 0.2350 },
+    .{ -0.2829, 0.1762, 0.2721 },
+    .{ -0.2120, -0.2616, -0.7177 },
+};
+pub const latent_rgb_bias_sd15 = [3]f32{ 0, 0, 0 };
+
+pub const latent_rgb_factors_sdxl = [latent_channels][3]f32{
+    .{ 0.3651, 0.4232, 0.4341 },
+    .{ -0.2533, -0.0042, 0.1068 },
+    .{ 0.1076, 0.1111, -0.0362 },
+    .{ -0.3165, -0.2492, -0.2188 },
+};
+pub const latent_rgb_bias_sdxl = [3]f32{ 0.1084, -0.0175, -0.0011 };
+
+/// Fill `rgb_out` (`[zh*zw][3]` RGB8) with the latent2rgb preview of the planar
+/// `[4][zh*zw]` sampler latent `z`. Same `(v + 1) / 2` mapping ComfyUI's
+/// `Latent2RGBPreviewer` uses.
+pub fn latentPreviewInto(
+    rgb_out: []u8,
+    z: []const f32,
+    zh: usize,
+    zw: usize,
+    factors: *const [latent_channels][3]f32,
+    bias: [3]f32,
+) void {
+    const plane = zh * zw;
+    std.debug.assert(rgb_out.len >= plane * 3 and z.len >= latent_channels * plane);
+    for (0..plane) |p| {
+        var acc = bias;
+        inline for (0..latent_channels) |c| {
+            const v = z[c * plane + p];
+            acc[0] += v * factors[c][0];
+            acc[1] += v * factors[c][1];
+            acc[2] += v * factors[c][2];
+        }
+        inline for (0..3) |ch| {
+            const u = std.math.clamp((acc[ch] + 1.0) * 0.5, 0.0, 1.0) * 255.0;
+            rgb_out[p * 3 + ch] = @intFromFloat(u);
+        }
+    }
+}
+
+pub const GroupNormW = struct { w: []const f32, b: []const f32 };
 
 /// LDM's autoencoder `ResnetBlock` — no timestep embedding, unlike the UNet's.
-const Resnet = struct {
+pub const Resnet = struct {
     norm1: GroupNormW,
     conv1: Conv2d,
     norm2: GroupNormW,
@@ -81,7 +150,7 @@ const Resnet = struct {
     out_ch: usize,
 };
 
-const AttnBlock = struct {
+pub const AttnBlock = struct {
     norm: GroupNormW,
     q: Conv2d,
     k: Conv2d,
@@ -90,7 +159,7 @@ const AttnBlock = struct {
     channels: usize,
 };
 
-const Level = struct {
+pub const Level = struct {
     blocks: []Resnet,
     /// 3x3 convolution after a nearest-neighbour 2x; absent on the outermost level.
     upsample: ?Conv2d,
@@ -166,6 +235,41 @@ pub const Decoder = struct {
     pub fn deinit(self: *Decoder) void {
         self.arena.deinit();
         self.* = undefined;
+    }
+
+    /// Upper bound on the device activation bytes a whole-image decode of a
+    /// `zh x zw` latent needs, for the VAE-decode reclaim ladder to pre-free
+    /// against. Mirrors `sd_vae_cuda` / `sd_vae_gpu`'s own sizing exactly: three
+    /// f32 buffers (x / t / u) at the widest (positions x channels) product any
+    /// level reaches, plus the latent-resolution attention scratch.
+    ///
+    /// ⚠️ The width that matters is `max(level input, level output)`: the first
+    /// resnet of a level reads the PREVIOUS (wider) level's activation at the NEW
+    /// (doubled) resolution, so sizing off `block_out_channels` alone
+    /// under-estimates by 2x — the same trap that cost a wrong decode in
+    /// `sd_vae_gpu`.
+    pub fn estimatePeakBytes(self: *const Decoder, zh: usize, zw: usize) u64 {
+        const cfg = self.cfg;
+        var lh: u64 = zh;
+        var lw: u64 = zw;
+        var c: u64 = cfg.innermost();
+        var max_elems: u64 = 0;
+        for (0..cfg.levels()) |i| {
+            const level_idx = cfg.levels() - 1 - i;
+            const out_ch: u64 = cfg.block_out_channels[level_idx];
+            max_elems = @max(max_elems, lh * lw * @max(c, out_ch));
+            c = out_ch;
+            if (level_idx > 0) {
+                lh *= 2;
+                lw *= 2;
+            }
+        }
+        max_elems = @max(max_elems, lh * lw * @max(c, 3));
+        // q/k/v/out at latent resolution + the O(seq^2) mid-block scores plane
+        // (f16 on the GPU paths, which query-tile it, so this term is generous).
+        const seq: u64 = @as(u64, zh) * zw;
+        const attn = 4 * seq * cfg.innermost() * 4 + seq * seq * 2;
+        return 3 * max_elems * 4 + attn;
     }
 
     /// `z` is channel-last `[lat_h*lat_w][z_channels]`, already divided by
@@ -527,4 +631,110 @@ test "the VAE decoder still matches diffusers at the size images are rendered at
     // Looser than the 8x8 case's 2e-3: the reference is stored f16 here (~5e-4
     // relative on its own), which dominates the budget.
     try testing.expect(rel < 3e-3);
+}
+
+const sdxl_ref_path = "src/models/assets/sdxl_ref.safetensors";
+const sdxl_ckpt = "/home/qt/genai/comfyui/models/checkpoints/sdxl/blackMAGICXL_v145.safetensors";
+
+test "the SDXL VAE decoder matches ComfyUI's AutoencoderKL at both sizes" {
+    // The decoder is architecturally identical to SD1.5's, so this is really a test of
+    // two things the `sdxl` config asserts: that the same code path loads SDXL's weights
+    // (same names, same widths), and that nothing about the wider UNet leaked into the
+    // VAE. The scale factor is NOT exercised here — `decode` takes an already-divided
+    // latent, exactly as the reference does, which is what makes this the decoder's test
+    // and not the pipeline's.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    try test_gate.requireIntegration();
+    try test_gate.requireModelFile(io, sdxl_ckpt);
+    try test_gate.requireModelFile(io, sdxl_ref_path);
+
+    var ref = try safetensors.SafeTensors.open(gpa, io, sdxl_ref_path);
+    defer ref.deinit();
+    var ck = try safetensors.SafeTensors.open(gpa, io, sdxl_ckpt);
+    defer ck.deinit();
+
+    var dec = try Decoder.load(gpa, .{ .safetensors = &ck }, sdxl, "first_stage_model.");
+    defer dec.deinit();
+
+    // The 8x8 case leaves every convolution in one im2col band and the mid attention at
+    // 64 positions; 64x64 bands many ways and attends over 4096. The f16-stored reference
+    // for the big case contributes ~5e-4 of its own tolerance.
+    const cases = [_]struct { lat: usize, z: []const u8, img: []const u8, tol: f64 }{
+        .{ .lat = 8, .z = "vae.latent", .img = "vae.image", .tol = 2e-3 },
+        .{ .lat = 64, .z = "vae_big.latent", .img = "vae_big.image", .tol = 3e-3 },
+    };
+    for (cases) |c| {
+        const z_planar = try ref.get(c.z).?.toF32Alloc(gpa);
+        defer gpa.free(z_planar);
+        const want_planar = try ref.get(c.img).?.toF32Alloc(gpa);
+        defer gpa.free(want_planar);
+
+        const z = try gpa.alloc(f32, z_planar.len);
+        defer gpa.free(z);
+        for (0..c.lat * c.lat) |p| {
+            for (0..4) |ci| z[p * 4 + ci] = z_planar[ci * c.lat * c.lat + p];
+        }
+
+        const rgb = try dec.decode(io, gpa, z, c.lat, c.lat);
+        defer gpa.free(rgb);
+
+        const px = c.lat * 8 * c.lat * 8;
+        try testing.expectEqual(px * 3, rgb.len);
+        var l2_ref: f64 = 0;
+        var l2_err: f64 = 0;
+        for (0..px) |p| {
+            for (0..3) |ci| {
+                const e = want_planar[ci * px + p];
+                const a = rgb[p * 3 + ci];
+                l2_ref += @as(f64, e) * e;
+                l2_err += @as(f64, e - a) * (e - a);
+            }
+        }
+        const rel = @sqrt(l2_err / l2_ref);
+        errdefer std.debug.print("sdxl vae decode at {d}px: rel L2 {d:.6}\n", .{ c.lat * 8, rel });
+        try testing.expect(rel < c.tol);
+    }
+}
+
+test "the two SD VAE configs differ only in the latent scale" {
+    // The scale factor is the one number that is easy to carry over wrongly and produces
+    // no error — a washed, low-contrast image. Asserting the rest of the config is
+    // *identical* is what makes "only the scale differs" a checked claim rather than a
+    // comment.
+    try testing.expectEqual(sd15.z_channels, sdxl.z_channels);
+    try testing.expectEqual(sd15.base_channels, sdxl.base_channels);
+    try testing.expectEqualSlices(usize, sd15.block_out_channels, sdxl.block_out_channels);
+    try testing.expectEqual(sd15.layers_per_block, sdxl.layers_per_block);
+    try testing.expectEqual(sd15.norm_groups, sdxl.norm_groups);
+    try testing.expectEqual(sd15.norm_eps, sdxl.norm_eps);
+    try testing.expect(sd15.scaling_factor != sdxl.scaling_factor);
+    // The latent2rgb preview is the one place they must NOT be shared: two different
+    // matrices, and a bias on SDXL only.
+    try testing.expect(latent_rgb_factors_sd15[0][0] != latent_rgb_factors_sdxl[0][0]);
+    try testing.expect(latent_rgb_bias_sd15[0] == 0 and latent_rgb_bias_sdxl[0] != 0);
+}
+
+test "the SD latent2rgb preview matches ComfyUI's factors, bias and clamp" {
+    // Hand-computed from ComfyUI's latent_formats factors with its
+    // `((v + 1) / 2).clamp(0, 1) * 255` mapping, so this pins the constants AND the
+    // mapping rather than restating the implementation.
+    const plane = 2;
+    var rgb: [plane * 3]u8 = undefined;
+
+    // SD1.5, unit weight on channel 0 at pixel 0 → factors[0]; a large value at
+    // pixel 1 → clamped white on R.
+    var z15 = [_]f32{0} ** (latent_channels * plane);
+    z15[0] = 1;
+    z15[1] = 10;
+    latentPreviewInto(&rgb, &z15, 1, plane, &latent_rgb_factors_sd15, latent_rgb_bias_sd15);
+    try testing.expectEqualSlices(u8, &.{ 172, 156, 168 }, rgb[0..3]);
+    try testing.expectEqual(@as(u8, 255), rgb[3]);
+
+    // SDXL, an all-zero latent → the bias alone (SD1.5's would give a flat 127).
+    const z_xl = [_]f32{0} ** (latent_channels * plane);
+    latentPreviewInto(&rgb, &z_xl, 1, plane, &latent_rgb_factors_sdxl, latent_rgb_bias_sdxl);
+    try testing.expectEqualSlices(u8, &.{ 141, 125, 127 }, rgb[0..3]);
+    latentPreviewInto(&rgb, &z_xl, 1, plane, &latent_rgb_factors_sd15, latent_rgb_bias_sd15);
+    try testing.expectEqualSlices(u8, &.{ 127, 127, 127 }, rgb[0..3]);
 }
