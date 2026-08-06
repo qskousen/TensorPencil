@@ -2801,7 +2801,23 @@ pub const Session = struct {
             const room = free_now + evictable;
             const budget = if (opts.vram_budget > 0) @min(opts.vram_budget, room) else room;
             const pin_reserve: u64 = b.attn_scratch_budget + (512 << 20);
-            b.pin_budget = budget -| pin_reserve;
+            // ⚠️ `pin_budget` is a TOTAL cap (`pinNew` tests
+            // `pinned_bytes + size > pin_budget`), but `room` is what is ADDITIONALLY
+            // reachable — live free VRAM plus our own evictable weights — and so
+            // excludes whatever is already pinned. Adding the resident total back is
+            // what keeps the two in the same units.
+            //
+            // Without this, every image after the first stops pinning entirely: a
+            // queued image finds ~11.7 GB of DiT already pinned against a `room`-only
+            // budget of ~1 GB, so `pinned_bytes > pin_budget` on the very first test
+            // and the rest of the DiT streams on every step for the whole image.
+            // Image 1 is unaffected (nothing pinned yet, so total == increment).
+            //
+            // Safe to be generous here: `pin_floor` is the physical backstop and is
+            // still checked per pin, so a budget larger than live VRAM cannot
+            // over-commit — it only stops the cap from being the binding constraint
+            // when it should not be.
+            b.pin_budget = b.pinnedWeightBytes() + (budget -| pin_reserve);
             // Same reserve as a LIVE floor for first-touch pinning: pinNew keeps
             // this much VRAM free, so pinning never eats the room the (lazily
             // allocated, per-block) attention scratch + activation workspace need.
