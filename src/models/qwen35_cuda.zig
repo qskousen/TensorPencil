@@ -514,6 +514,45 @@ pub const CudaLM = struct {
         return n;
     }
 
+    /// Upload every device-resident weight NOW, so the one-time host->device copy
+    /// is not charged to the first forward. Mirrors `layerDeviceBytes` exactly —
+    /// the same tensors it counts are the ones warmed here, so the two cannot
+    /// drift. See `Backend.warmWeight` for why this exists.
+    ///
+    /// Skips layers the CPU split placed on the host (their weights never go to
+    /// the device) and is best-effort throughout: anything that will not fit still
+    /// works, it just pays the copy on first use as before.
+    pub fn warmWeights(self: *CudaLM) void {
+        const be = self.be;
+        be.warmWeight(self.lm.head.bytes);
+        if (self.lm.embed.bytes.ptr != self.lm.head.bytes.ptr) be.warmWeight(self.lm.embed.bytes);
+        for (self.lm.layers, 0..) |*layer, l| {
+            if (self.split) |*sp| if (!sp.on_gpu[l]) continue;
+            const mlp = switch (layer.*) {
+                .attn => |*a| &a.mlp,
+                .linear => |*ll| &ll.mlp,
+            };
+            be.warmWeight(mlp.gate.bytes);
+            be.warmWeight(mlp.up.bytes);
+            be.warmWeight(mlp.down.bytes);
+            switch (layer.*) {
+                .attn => |*a| {
+                    be.warmWeight(a.qg.bytes);
+                    be.warmWeight(a.k.bytes);
+                    be.warmWeight(a.v.bytes);
+                    be.warmWeight(a.o.bytes);
+                },
+                .linear => |*ll| {
+                    be.warmWeight(ll.qkv.bytes);
+                    be.warmWeight(ll.z.bytes);
+                    be.warmWeight(ll.alpha.bytes);
+                    be.warmWeight(ll.beta.bytes);
+                    be.warmWeight(ll.out.bytes);
+                },
+            }
+        }
+    }
+
     /// Place layers on the host until the device-resident weights fit under
     /// `budget` (bytes), by the given policy. Must be called right after
     /// `init` (before any tokens), on a CUDA backend with `budget != 0`.

@@ -233,6 +233,12 @@ pub fn run(
             // Prefill may arm a CPU split on VRAM pressure (auto-offload), whose
             // host layers need `io`; set it before prefill, not just at decode.
             if (@hasField(@TypeOf(model), "io")) model.io = io;
+            // ⚠️ Upload the weights BEFORE the first forward. `cachedWeight` is
+            // lazy, so without this the one-time host->device copy of every weight
+            // is charged to prefill — inflating `pp` and making it incomparable to
+            // llama.cpp, which offloads at load time and reports that separately.
+            // Opt-in per stepper; those without the decl keep the old behaviour.
+            if (@hasDecl(@TypeOf(model), "warmWeights")) model.warmWeights();
             try prefiller.prefill(&model);
             return driver.drive(&model);
         },

@@ -1394,6 +1394,25 @@ pub const Backend = struct {
         return (try self.cachedWeight(bytes)).buf;
     }
 
+    /// Force one weight resident NOW rather than on its first use.
+    ///
+    /// ⚠️ **This exists so weight upload stops being counted as prefill.**
+    /// `cachedWeight` uploads lazily, so without a warm-up pass the host->device
+    /// copy of every weight lands inside the FIRST forward — i.e. inside the `pp`
+    /// timer — which both inflates our prefill number and makes it incomparable to
+    /// llama.cpp, whose `prompt eval time` excludes upload because it offloads at
+    /// model-load time. Measured on Bonsai-27B: a warm 13-token one-shot prefill
+    /// took 743 ms, against 14 ms for the same prompt on a later turn of the SAME
+    /// process. That difference is almost entirely this copy.
+    ///
+    /// Best-effort by design: a weight that cannot be made resident (VRAM budget,
+    /// a layer the split placed on the host) is simply skipped, and the normal
+    /// on-demand path still handles it correctly at first use.
+    pub fn warmWeight(self: *Backend, bytes: []const u8) void {
+        if (bytes.len == 0) return;
+        _ = self.cachedWeight(bytes) catch return;
+    }
+
     /// Free the tensor-core attention scratch (the ~seq² scores plane dominates).
     /// The VAE calls this after its mid-block attention so the plane doesn't stay
     /// resident through the 8× upsampling. Syncs first (recorded ops may read it).

@@ -1681,6 +1681,33 @@ fn pendingUserBubble(text: []const u8) void {
     markdown_view.render(@src(), text, .{});
 }
 
+/// Spinner + "Processing…": the model is working on this turn but has produced
+/// no visible text yet. See `renderMessage` for why this is distinct from the
+/// session-load "Loading…" bubble.
+fn processingRow(theme: dvui.Theme) void {
+    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{});
+    defer row.deinit();
+    dvui.spinner(@src(), .{ .gravity_y = 0.5, .min_size_content = .{ .w = 12, .h = 12 }, .margin = .{ .w = 6 } });
+    dvui.label(@src(), "Processing…", .{}, .{ .gravity_y = 0.5, .color_text = theme.text.lerp(theme.fill, 0.35) });
+}
+
+/// The assistant bubble's body when there is nothing to show and nothing is
+/// running: a generation error, or a turn queued behind a paused LLM.
+/// (The live case is the "Processing…" spinner in `renderMessage`.)
+fn renderEmptyAssistant(s: ?*chat.Session, theme: dvui.Theme, idx: usize) void {
+    var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal });
+    defer tl.deinit();
+    if (if (s) |ss| ss.gen_err else null) |err| {
+        var msg: [128]u8 = undefined;
+        fonts.addRich(tl, std.fmt.bufPrint(&msg, "⚠ generation error: {t}", .{err}) catch "⚠ generation error");
+    } else if (idx + 1 == (if (s) |ss| ss.messages.items.len else 0) and (if (s) |ss| ss.isPaused() else false)) {
+        // A turn queued while the LLM is paused — it runs on resume (Tier 2).
+        // addStyled (not addText) routes the ⏸ to the emoji face (NotoSansCJK
+        // lacks media-control glyphs — see fonts.isEmoji).
+        fonts.addStyled(tl, "⏸ queued — resume to generate", .{}, .{ .color_text = theme.text.lerp(theme.fill, 0.4) });
+    }
+}
+
 fn renderMessage(s: ?*chat.Session, m: *chat.Message, idx: usize) void {
     const is_user = m.role == .user;
     const theme = dvui.themeGet();
@@ -1721,13 +1748,35 @@ fn renderMessage(s: ?*chat.Session, m: *chat.Message, idx: usize) void {
     // live session (carried transcript), nothing is generating.
     const live = if (s) |ss| ss.busy() and idx + 1 == ss.messages.items.len else false;
 
+    // The model is working but has not emitted a single token yet: prompt
+    // processing (prefill), plus the short gap before the first token.
+    //
+    // ⚠️ This is tested BEFORE the thought block, and that ordering is the whole
+    // point. When reasoning is on the chat template PRIMES `<think>` into the
+    // prompt, so `parseThink` reports a non-null (empty) thought and
+    // `p.thinking = true` from the very FIRST frame — before generation has
+    // produced anything. Checking the thought first therefore jumped straight
+    // from "Loading…" to "Thinking…" and displayed prompt processing as
+    // reasoning. Raw variant text being empty is the honest signal.
+    const nothing_yet = live and v.text.items.len == 0 and m.role == .assistant;
+
+    if (nothing_yet) {
+        // ⚠️ Deliberately a DIFFERENT word from the session-load "Loading…"
+        // bubble: they are different phases with different costs, and a user
+        // reads one unchanging spinner as one thing. "Loading…" is reading the
+        // checkpoint and uploading weights to VRAM (chat.zig warms those up front
+        // so they land in that phase, not this one); "Processing…" is per-turn
+        // work that scales with the prompt.
+        processingRow(theme);
+    }
+
     // Reasoning: collapse the thought block behind an expander, default
     // collapsed. The label doubles as a "thinking" indicator while the block is
     // still open. An empty thought (e.g. a model that opened and closed the
     // channel with nothing inside) shows no bubble at all — unless it's still
     // actively streaming, where "Thinking…" is the right cue.
     if (p.think) |think| {
-        if (think.len > 0 or (p.thinking and live)) {
+        if (!nothing_yet and (think.len > 0 or (p.thinking and live))) {
             if (dvui.expander(@src(), if (p.thinking and live) "Thinking…" else "Thoughts", .{ .default_expanded = false }, .{})) {
                 // Set the reasoning apart from the answer: a dimmer text color on
                 // a slightly inset, accent-bordered block (a blockquote look), so
@@ -1764,20 +1813,10 @@ fn renderMessage(s: ?*chat.Session, m: *chat.Message, idx: usize) void {
             })) dvui.clipboardTextSet(p.answer);
             hint.hover(@src(), &wd, "Copy the reply as markdown");
         }
-    } else if (m.role == .assistant and p.think == null and v.images.items.len == 0) {
-        var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal });
-        defer tl.deinit();
-        if (live) {
-            tl.addText("…", .{});
-        } else if (if (s) |ss| ss.gen_err else null) |err| {
-            var msg: [128]u8 = undefined;
-            fonts.addRich(tl, std.fmt.bufPrint(&msg, "⚠ generation error: {t}", .{err}) catch "⚠ generation error");
-        } else if (idx + 1 == (if (s) |ss| ss.messages.items.len else 0) and (if (s) |ss| ss.isPaused() else false)) {
-            // A turn queued while the LLM is paused — it runs on resume (Tier 2).
-            // addStyled (not addText) routes the ⏸ to the emoji face (NotoSansCJK
-            // lacks media-control glyphs — see fonts.isEmoji).
-            fonts.addStyled(tl, "⏸ queued — resume to generate", .{}, .{ .color_text = theme.text.lerp(theme.fill, 0.4) });
-        }
+    } else if (!nothing_yet and m.role == .assistant and p.think == null and v.images.items.len == 0) {
+        // Text exists but currently renders to nothing (e.g. a half-streamed
+        // marker); keep the working indicator rather than flashing an empty card.
+        if (live) processingRow(theme) else renderEmptyAssistant(s, theme, idx);
     }
 
     // Generated images requested by this variant, below its text. Offset the

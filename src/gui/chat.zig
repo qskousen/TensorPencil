@@ -482,6 +482,24 @@ pub const Session = struct {
     // the transcript on the UI thread. `progress` is the engine's own per-token
     // counters (atomic, no lock); the two below are `mu`-guarded.
     progress: engine.Progress = .{},
+
+    /// Token length of the template's generation-prompt suffix (the
+    /// `…<|im_start|>assistant\n[<think>\n]` it appends when
+    /// `add_generation_prompt` is set). Measured ONCE per session by rendering
+    /// the same messages both ways — it is a property of the template and
+    /// `enable_thinking`, not of the conversation, so it does not need
+    /// re-measuring per turn (which would add a third full render to `build`).
+    /// `gen_prompt_think` records which setting it was measured under so a
+    /// mid-session thinking toggle re-measures.
+    gen_prompt_tokens: ?usize = null,
+    gen_prompt_think: bool = false,
+    /// This turn's safe checkpoint boundary: the position just BEFORE the
+    /// generation prompt. See `prepareTurn` for why the snapshot has to land
+    /// there and not at `cached()`. Null = take the checkpoint the old way.
+    turn_ckpt_q: ?usize = null,
+    /// Set once a checkpoint has been taken for this turn, so the post-prepare
+    /// call does not snapshot a second time (150 MiB a piece on a hybrid).
+    turn_ckpt_done: bool = false,
     /// The in-flight turn's assistant-side stats: the prefill half plus the
     /// context base, published once the prompt is in; the generation half is
     /// overwritten with the authoritative numbers when the turn ends. While
@@ -728,6 +746,18 @@ pub const Session = struct {
         // arch reaching here already passed it, and this dispatch covers the
         // same set (adding an arch means adding it to both — a lockstep invariant,
         // not a runtime case). A mismatch is a dev bug, caught loudly in Debug.
+
+        // ⚠️ Upload the weights NOW, while the UI is still showing "Loading…".
+        // `Backend.cachedWeight` is lazy, so without this the one-time
+        // host->device copy of every weight happens inside the FIRST turn's
+        // prefill — which both charges it to "Processing…" and makes the first
+        // response feel far slower than later ones for no visible reason
+        // (measured ~600 ms on Bonsai-27B). `session.run` does the same for the
+        // CLI. Opt-in per stepper; an arch without the decl keeps the old
+        // behaviour rather than failing to compile.
+        switch (self.arch) {
+            inline else => |*a| if (@hasDecl(@TypeOf(a.model), "warmWeights")) a.model.warmWeights(),
+        }
 
         // A hybrid split's host matmuls need a valid Io BEFORE the first
         // step(): an over-budget model has CPU layers from init, and the
@@ -1660,8 +1690,10 @@ pub const Session = struct {
         };
         // Snapshot this turn's boundary so it can be regenerated / switched
         // in O(snapshot) later. Non-fatal: without one, a later rollback just
-        // takes the full-reprefill fallback.
-        self.takeCheckpoint();
+        // takes the full-reprefill fallback. Skipped when `prepareTurn` already
+        // snapshotted at the pre-generation-prompt boundary — a second one here
+        // would cost another 150 MiB and be the unusable-by-next-turn position.
+        if (!self.turn_ckpt_done) self.takeCheckpoint();
 
         var sink: TokenSink = .{
             .iface = .{ .vtable = &TokenSink.vtable, .buffer = &self.sink_buf },
@@ -1785,24 +1817,66 @@ pub const Session = struct {
         // Timed as one unit so the "prefill done" line covers a turn's whole
         // prompt processing, vision encode included.
         const t0 = std.Io.Clock.real.now(self.io).nanoseconds;
-        const cached_before = self.ctxTokens();
+        // Cleared per turn: only `buildRenderedTurn` sets it, so a turn that does
+        // not rebuild (fast rollback, hand-glue path) cannot inherit the previous
+        // turn's boundary and split its prefill at a stale position.
+        self.turn_ckpt_q = null;
         if (self.turn_staged) try self.buildTurn();
+        // Split the two halves: re-rendering the template and re-tokenizing the
+        // whole transcript is CPU work that grows with the CONVERSATION, while
+        // prefill scales with what is actually new. They look identical from the
+        // UI (both sit under "Processing…"), so a turn that feels slow with a
+        // short prompt is only diagnosable if they are timed apart.
+        const t_built = std.Io.Clock.real.now(self.io).nanoseconds;
+        // ⚠️ Counted from the model's cache across the prefill call, NOT as a
+        // delta of `ctxTokens()` around the whole of prepareTurn. `buildTurn`'s
+        // reconcile can REWIND (or clear) the context first, so the outer delta
+        // saturates to 0 on exactly the turns that did the most work — which is
+        // how a full 2090-token transcript replay logged as "prefill 0 tok".
+        var prefilled: usize = 0;
+        const total = self.ids.items.len;
+        // Stage 1 (checkpoint-rewind archs only): prefill up to the boundary
+        // BEFORE the generation prompt and snapshot there, so NEXT turn's
+        // `reconcile` finds a checkpoint at or before its divergence point
+        // instead of clearing the context. See `safeCheckpointQ`.
+        self.turn_ckpt_done = false;
+        if (self.turn_ckpt_q) |q| {
+            const c0 = self.ctxTokens();
+            if (q > c0 and q + 1 < total) {
+                switch (self.arch) {
+                    inline else => |*a| {
+                        if (total > a.model.cached() + a.model.remaining()) try a.model.ensureCapacity(total);
+                        try a.model.prefill(self.ids.items[c0..q]);
+                        prefilled += a.model.cached() -| c0;
+                    },
+                }
+                self.takeCheckpoint();
+                self.turn_ckpt_done = true;
+            }
+        }
+        // Stage 2: the rest, leaving the last token for `generate` to forward.
         switch (self.arch) {
             inline else => |*a| {
-                const total = self.ids.items.len;
                 const cached = a.model.cached();
                 if (total >= 2 and cached + 1 < total) {
                     if (total > cached + a.model.remaining()) try a.model.ensureCapacity(total);
                     try a.model.prefill(self.ids.items[cached .. total - 1]);
+                    prefilled += a.model.cached() -| cached;
                 }
             },
         }
-        const prefilled = self.ctxTokens() -| cached_before;
-        self.publishPromptStats(prefilled, @intCast(std.Io.Clock.real.now(self.io).nanoseconds - t0));
-        if (prefilled > 0) {
-            const dt = @as(f64, @floatFromInt(std.Io.Clock.real.now(self.io).nanoseconds - t0)) / 1e9;
-            std.log.info("[llm] prefill done: {d} tok in {d:.2}s ({d:.0} tok/s) · ctx now {d} tok", .{
-                prefilled, dt, if (dt > 0) @as(f64, @floatFromInt(prefilled)) / dt else 0, self.ctxTokens(),
+        const t_end = std.Io.Clock.real.now(self.io).nanoseconds;
+        self.publishPromptStats(prefilled, @intCast(t_end - t0));
+        const build_ms = @as(f64, @floatFromInt(t_built - t0)) / 1e6;
+        const pre_s = @as(f64, @floatFromInt(t_end - t_built)) / 1e9;
+        // ⚠️ Logged even when `prefilled == 0`. A cached-prefix turn still spends
+        // real time here (render + tokenize), and reporting nothing is what made
+        // that time look like an unexplained stall behind "Processing…".
+        if (prefilled > 0 or t_end - t0 > 2 * std.time.ns_per_ms) {
+            std.log.info("[llm] turn prep: build {d:.0} ms · prefill {d} tok in {d:.2}s ({d:.0} tok/s) · ctx now {d} tok", .{
+                build_ms, prefilled, pre_s,
+                if (pre_s > 0) @as(f64, @floatFromInt(prefilled)) / pre_s else 0,
+                self.ctxTokens(),
             });
         }
     }
@@ -2013,6 +2087,7 @@ pub const Session = struct {
         // AND per setting — hence measured from the render, never assumed. Only the
         // tail is scanned so an earlier turn quoting `</think>` cannot decide it.
         self.recordThoughtPrimed(desired.items);
+        self.turn_ckpt_q = self.safeCheckpointQ(ropts, desired.items.len);
         switch (self.arch) {
             inline else => |*a| try self.reconcile(&a.model, desired.items),
         }
@@ -2165,6 +2240,52 @@ pub const Session = struct {
         self.invalidateCheckpoints();
     }
 
+    /// Where this turn's checkpoint must be taken: the position just BEFORE the
+    /// template's generation prompt, or null to keep the old behaviour.
+    ///
+    /// ⚠️ **This exists because the obvious boundary — `cached()` after prefill —
+    /// is a few tokens TOO LATE, and that silently cost a full transcript replay
+    /// on every turn of a hybrid model.** Next turn re-renders the history with
+    /// this turn's reply in place of the generation prompt (and, with reasoning
+    /// on, with the thought stripped), so `reconcile`'s divergence point `d`
+    /// lands exactly where `…assistant\n<think>\n` began. A snapshot taken at
+    /// `cached()` sits PAST that, fails `cp.q <= d`, and drops `reconcile` all
+    /// the way through to `resetResidency` — measured on Bonsai-27B as 2090 and
+    /// then 2644 tokens re-prefilled on turns 2 and 3, 4.6 s and 5.7 s.
+    ///
+    /// Only for archs that cannot `truncate` (recurrent/SWA: qwen35, gemma3,
+    /// gemma4). ⚠️ **qwen3 and any other append-only-attention arch is left
+    /// completely alone** — `reconcile` rewinds those exactly with `truncate`,
+    /// needs no checkpoint to do it, and must not start paying for a split
+    /// prefill or an extra render to fix a problem it does not have.
+    ///
+    /// Getting the estimate wrong degrades gracefully in BOTH directions: too
+    /// small and the checkpoint is unusable (today's behaviour, a full replay),
+    /// too large and we simply re-prefill a few more tokens than necessary.
+    fn safeCheckpointQ(self: *Session, ropts: chat_template.RenderOpts, full_len: usize) ?usize {
+        const needs = switch (self.arch) {
+            inline else => |*a| !@hasDecl(@TypeOf(a.model), "truncate"),
+        };
+        if (!needs) return null;
+        if (self.gen_prompt_tokens == null or self.gen_prompt_think != ropts.enable_thinking) {
+            var hist: std.ArrayList(u32) = .empty;
+            defer hist.deinit(self.gpa);
+            var hopts = ropts;
+            hopts.add_generation_prompt = false;
+            self.template.?.renderIds(&self.tok, self.gpa, hopts, &hist) catch |err| {
+                std.log.warn("[ckpt] generation-prompt measure failed ({t}); turn boundaries stay at cached()", .{err});
+                return null;
+            };
+            if (hist.items.len >= full_len) return null; // no suffix to skip
+            self.gen_prompt_tokens = full_len - hist.items.len;
+            self.gen_prompt_think = ropts.enable_thinking;
+            std.log.info("[ckpt] template generation prompt is {d} tok; turn boundaries land before it", .{self.gen_prompt_tokens.?});
+        }
+        const g = self.gen_prompt_tokens.?;
+        if (g >= full_len) return null;
+        return full_len - g;
+    }
+
     /// Build this turn's tokens. Text-only turns just append (prepareTurn
     /// prefills); image turns encode each image (the arch's vision tower on
     /// CUDA), build the interleaved vision token layout, and inject the
@@ -2294,6 +2415,7 @@ pub const Session = struct {
                     return;
                 }
                 self.cur_turn_q = null;
+                const t_ck = std.Io.Clock.real.now(self.io).nanoseconds;
                 const snap = self.gpa.alloc(u8, a.model.checkpointBytes()) catch return;
                 a.model.checkpoint(snap) catch |err| {
                     std.log.warn("[ckpt] turn checkpoint failed ({t}); a rollback will re-prefill", .{err});
@@ -2316,8 +2438,15 @@ pub const Session = struct {
                     });
                 }
                 self.cur_turn_q = q;
-                std.log.info("[ckpt] saved turn boundary @tok {d} ({d:.1} MiB) · {d} in cache, {d:.1}/{d} MiB used", .{
+                // ⚠️ Timed: this is a device->host copy of the whole recurrent
+                // state (~157 MiB on Bonsai-27B — 48 DeltaNet layers x 3.1 MiB of
+                // ssm state) plus a host allocation of the same size, and it runs
+                // on EVERY turn between prefill and the first token. It is inside
+                // the "Processing…" window but is not prefill, so without this
+                // number it is invisible.
+                std.log.info("[ckpt] saved turn boundary @tok {d} ({d:.1} MiB in {d:.0} ms) · {d} in cache, {d:.1}/{d} MiB used", .{
                     q,                          mib(snap.len),
+                    @as(f64, @floatFromInt(std.Io.Clock.real.now(self.io).nanoseconds - t_ck)) / 1e6,
                     self.checkpoints.items.len, mib(checkpointsBytes(self.checkpoints.items)),
                     self.checkpoint_budget >> 20,
                 });

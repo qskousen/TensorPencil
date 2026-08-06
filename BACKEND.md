@@ -398,8 +398,25 @@ Notes:
 
   | | TP | llama.cpp | ratio |
   |---|---|---|---|
-  | prefill, dequant+f16 (before) | 463 / 472 / 486 | 1206 / 1140 | 0.40x |
-  | prefill, **MMQ** (after) | **768 / 817 / 770** | 1194 / 1287 / 1231 | **0.63x** |
+  | prefill, dequant+f16 | 463 / 472 / 486 | 1206 / 1140 | 0.40x |
+  | prefill, **MMQ** | 768 / 817 / 770 | 1194 / 1287 / 1231 | 0.63x |
+  | prefill, MMQ + **weight upload out of `pp`** | **922 / 943** | 1178 / 1165 | **0.80x** |
+  | same, at N=497 | 943 / 1025 | 1204 / 1052 | **~0.88x** |
+
+  ⚠️ **The last row is an ACCOUNTING FIX, not a speedup — no user-visible time changed.**
+  `Backend.cachedWeight` uploads lazily, so ~600 ms of host->device weight copy was landing inside
+  the FIRST forward, i.e. inside `pp`. llama.cpp offloads at model-load time and reports it as `load
+  time`, outside `prompt eval time`, so every prefill ratio above the last row was measured against a
+  competitor that excluded a cost we included. `CudaLM.warmWeights` (called from `session.run` before
+  `prefiller.prefill`) now uploads up front; the time simply moved to the `setup` figure, which went
+  0.0s -> 0.6s. Evidence it was exactly this: a warm 13-token one-shot prefill went **743 ms -> 166 ms**,
+  and three turns piped into one process had always shown 47 ms then 14 ms for the same prompt.
+  ⚠️ Prefill tok/s is now **flat in prompt length** (1031/954/956/888 at 497/977/1937/3857) where it
+  used to *rise* (520/690/752/822) — that rise was the fixed cost amortizing, and it is the signature
+  to look for if this regresses.
+  ⚠️ **Only qwen35 has `warmWeights` so far** — it is opt-in via `@hasDecl`, so qwen3/gemma3/gemma4
+  still charge the upload to their prefill and their prefill numbers are understated by the same
+  bug. Each needs ~30 lines mirroring its own `layerDeviceBytes`.
 
   Isolated A/B from ONE binary (`TP_NO_MMQ2`), alternating: **486 → 780 tok/s, +61%**, with decode
   unchanged (58–59 both arms) and output still correct — including a 1946-token multi-chunk prefill.
@@ -441,22 +458,38 @@ Notes:
   - ⚠️ **A single unpaired sweep was useless** — the baseline itself moved 773→806 between runs and
     `TP_SKIP=4` came out *below* baseline, i.e. removing work appeared to make it slower. Pair every
     skip run with an adjacent baseline.
-  - **Fixed vs marginal, solved from four prompt lengths** (497/977/1937/3857): `fixed = 372 ms`,
-    `marginal = 1.121 ms/token` → **steady-state 892 tok/s** (0.72x of llama.cpp, against 0.63x at
-    N=1937). ⚠️ So quoting prefill at one length understates us; the fixed term is **39% of a
-    497-token prefill** and only 15% at 1937. `CUDA_CACHE_DISABLE=1` costs a further 344 ms, so the
-    warm fixed term is module *loading*, not compilation — llama.cpp ships precompiled cubins and pays
-    neither.
+  - **The fixed term was mostly the lazy weight upload, now moved out of `pp` (see above).** What is
+    left of it is module load + PTX JIT + first-touch allocation; `CUDA_CACHE_DISABLE=1` costs +344 ms,
+    so JIT is a real per-process cost, and `eltFn` loads one module per distinct PTX string in the
+    shared `Backend`. Historical note on how badly this was mis-estimated before the cause was found:
+    Four methods disagree badly: a 4-point fit on the baseline gives ~372 ms, refitting per *chunk*
+    (cost is stepwise in `ceil(N/512)`, not linear in N) gives ~422 ms, a 3-point fit on the
+    `TP_SKIP=511` floor gives 584 ms, a warm 13-token one-shot measures 743 ms — and three turns piped
+    into ONE interactive process cost 47 ms then 14 ms, i.e. only ~32 ms of one-time cost. They cannot
+    all be right, so what the term is *made of* is still unknown. Candidates not yet separated: CUDA
+    module load, PTX JIT, first-touch device allocation, and the lazy host→device weight upload
+    (`cachedWeight` uploads on first use, so a one-shot run pays ~7 GB of PCIe *inside* the `pp`
+    timer — where llama.cpp uploads at load time, outside its `prompt eval time`).
+  - ⚠️ **That last point means the prefill ratios above may be unfair to us**, since our `pp` can
+    include a one-time weight upload that their `prompt eval time` excludes. Settle it before quoting
+    prefill parity again.
+  - The one solid cross-cutting figure: `CUDA_CACHE_DISABLE=1` costs **+344 ms**, so PTX JIT is a real
+    per-process cost whenever the CUDA cache misses — and `eltFn` loads one module per distinct PTX
+    string, in the shared `Backend`, so every CUDA model pays it.
   - ⚠️ **MMQ is NOT the remaining bottleneck, and this is the receipt that stops another round of
     kernel tuning.** The MLP's three GEMMs are 66.3 TFLOP of int8 work in 910 ms = **72.9 TOPS**,
     against llama.cpp's isolated `test-backend-ops` q2_0 MMQ at **79.56 TFLOPS** — **0.92x, in situ
     against their microbenchmark**, and microbenchmarks flatter (one L2-resident weight). Further MMQ
     work would have to beat their kernel, not catch it.
-  - **Next levers, in order:** (1) the 393 ms of per-token elementwise/norm/rope/KV — ~936 kernel
-    launches per token, which is where fusion pays; (2) the 372 ms fixed module load, which dominates
-    *short* prompts and is a build-time-cubin project; (3) GDN recurrence at 172 ms — but the chunked
-    DeltaNet that would shrink it **costs bit-identity** with the decode path and was ruled out for
-    q1_0 on exactly that ground.
+  - ⚠️ **"Fuse the elementwise layer" was the wrong target and the sub-budget killed it.** Splitting
+    the non-GEMM per-token work with four more bits: **norms 120 ms**, adds+gating 19, rope+deinterleave
+    12, KV store ~0 — **151 ms, ~6% total**, so perfect fusion of all of it wins ~3%. The "393 ms of
+    elementwise" that motivated it was mostly a bad fixed-cost estimate, not real per-token work.
+  - **Next levers, in order:** (1) characterize the fixed term — it is the largest non-GEMM item by
+    every estimate and nothing should be built on it until its composition is known; (2) norm fusion
+    at 120 ms / 4.7%, contained but small; (3) GDN recurrence at 172 ms — the chunked DeltaNet that
+    would shrink it **costs bit-identity** with the decode path and was ruled out for q1_0 on exactly
+    that ground. MMQ is done (0.92x of llama.cpp's kernel in situ).
 
   - **The dp4a GEMV is worth ~1.9x** (32.4 → ~58–63), the same step q1_0 took (37.2 → 75.8). Both kernels
     are generated from one `Q2Geom` template, so g64 and g128 cannot drift apart. This is the only change
