@@ -57,6 +57,8 @@ const dit_gpu = @import("tp_models").models.dit_gpu;
 const dit_cuda = @import("tp_models").models.dit_cuda;
 const qwen3_cuda = @import("tp_models").models.qwen3_cuda;
 const cuda = @import("tp_gpu").cuda;
+/// std.posix.getenv is gone in 0.16 and we link libc (see backend.zig).
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 const wan_vae = @import("tp_models").models.wan_vae;
 const clip_tok = @import("tp_core").clip_tokenizer;
 const prompt_a1111 = @import("tp_core").prompt_a1111;
@@ -995,9 +997,47 @@ pub fn planSchedule(
 /// loaded, so the GGUF half of the quantization work could not be run or measured
 /// at all. `dit.DiT.load` takes a `WeightStore`, so the only thing missing was
 /// opening the file.
+/// `Context.WeightReader` over a plain safetensors store — the encoder/VAE twin of
+/// `DitContainer.weightReader`. See `SafeTensors.readTo`.
+fn storeReader(opt: *?safetensors.SafeTensors) ?cuda.Context.WeightReader {
+    const st = if (opt.*) |*v| v else return null;
+    return .{
+        .ctx = st,
+        .read = struct {
+            fn read(ctx: *anyopaque, dst: []u8, src: []const u8) bool {
+                const s2: *const safetensors.SafeTensors = @ptrCast(@alignCast(ctx));
+                return s2.readTo(dst, src);
+            }
+        }.read,
+    };
+}
+
 pub const DitContainer = union(enum) {
     safetensors: safetensors.SafeTensors,
     gguf: gguf_mod.Gguf,
+
+    /// A `Context.WeightReader` over this container, or null when it cannot serve
+    /// one. Lets the CUDA staging path pull weight bytes with positional reads
+    /// instead of faulting the (multi-GB, read-once) checkpoint mapping — see
+    /// `SafeTensors.readTo` for why that matters under host memory pressure.
+    ///
+    /// GGUF returns null for now: same idea applies, but the DiT GGUF path is
+    /// CPU-only today (no GPU block-quant GEMM), so it never reaches this staging
+    /// ring and wiring it would be untestable here.
+    pub fn weightReader(self: *DitContainer) ?cuda.Context.WeightReader {
+        return switch (self.*) {
+            .safetensors => |*st| .{
+                .ctx = st,
+                .read = struct {
+                    fn read(ctx: *anyopaque, dst: []u8, src: []const u8) bool {
+                        const s2: *const safetensors.SafeTensors = @ptrCast(@alignCast(ctx));
+                        return s2.readTo(dst, src);
+                    }
+                }.read,
+            },
+            .gguf => null,
+        };
+    }
 
     /// Open by **content**, not extension: a leading `GGUF` magic picks the GGUF
     /// reader, anything else the safetensors one. Sniffing rather than trusting the
@@ -1628,7 +1668,24 @@ pub const Session = struct {
         // tight --vram-budget still streams within VRAM bounds. Isolated
         // (cuda-stream-test, DiT-only): cold-load 10.1s→2.4s (cold disk) /
         // 2.8s→2.2s (warm), bit-identical, MemAvailable dropped only ~2 GB.
-        if (self.cu_be) |b| b.enableAsyncStreaming(io);
+        if (self.cu_be) |b| {
+            b.enableAsyncStreaming(io);
+            // Feed the staging ring from the checkpoint FILE rather than its
+            // mapping. The DiT is the one that matters (~13 GB, read once per
+            // image before it is pinned); see DitContainer.weightReader.
+            // Every checkpoint this session opened: each reader answers only for
+            // its own mapping, so registering all of them just means whichever one
+            // a weight came from serves it. Gated by `safetensors.read_mode` inside
+            // `readTo`, so `--mmap mmap` turns the whole thing off.
+            switch (self.models) {
+                .krea2 => |*m| {
+                    if (m.dit_st.weightReader()) |wr| b.ctx.addWeightReader(wr);
+                    if (storeReader(&m.enc_st)) |wr| b.ctx.addWeightReader(wr);
+                    if (storeReader(&m.vae_st)) |wr| b.ctx.addWeightReader(wr);
+                },
+                else => {},
+            }
+        }
         try note(progress, "models loaded (encoder {d:.1}s, dit+vae {d:.1}s)\n", .{
             @as(f64, @floatFromInt(t1 - t0)) / 1e9, @as(f64, @floatFromInt(t2 - t1)) / 1e9,
         });

@@ -272,6 +272,23 @@ pub const Backend = enum(u8) {
 /// identical to f32). Mirrors `kv_cache.KvDtype` in the library; mapped to it
 /// in `app.buildSession`. Changing it rebuilds the KV context (weights stay
 /// resident) — see `ctxReloadEql`.
+/// How checkpoint bytes are read. Mirrors `core/safetensors.zig`'s `ReadMode`
+/// (this module is deliberately std-only, so the enum is duplicated rather than
+/// imported); `app` translates it to the global. Takes effect on the next model
+/// load — it governs loading, so nothing resident changes.
+pub const WeightRead = enum(u8) {
+    pread,
+    mmap,
+    buffered,
+
+    fn fromStr(s: []const u8) ?WeightRead {
+        inline for (@typeInfo(WeightRead).@"enum".fields) |f| {
+            if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
+        }
+        return null;
+    }
+};
+
 pub const KvDtype = enum(u8) {
     f32,
     f16,
@@ -608,6 +625,9 @@ pub const Config = struct {
     /// footprint, lossy). Changing it rebuilds the KV context — the weights stay
     /// resident (see `ctxReloadEql`), not a full model reload.
     kv_dtype: KvDtype = .f32,
+    /// How checkpoint bytes are read (see `WeightRead`). Applies to every loader
+    /// — LLM and diffusion alike — and to the next load, not the resident model.
+    weight_read: WeightRead = .pread,
     /// Gemma-4 (gemma4v) vision token budget. Applied live per image encode
     /// (no reload); ignored by other archs / non-gemma4v mmprojs.
     vision_budget: VisionBudget = .high,
@@ -958,6 +978,8 @@ pub const Config = struct {
             if (VisionBudget.fromStr(val)) |b| self.vision_budget = b;
         } else if (std.mem.eql(u8, key, "kv_dtype")) {
             if (KvDtype.fromStr(val)) |d| self.kv_dtype = d;
+        } else if (std.mem.eql(u8, key, "weight_read")) {
+            if (WeightRead.fromStr(val)) |w| self.weight_read = w;
         } else if (std.mem.eql(u8, key, "temperature")) {
             self.sampling.temperature = std.fmt.parseFloat(f32, val) catch self.sampling.temperature;
         } else if (std.mem.eql(u8, key, "top_k")) {
@@ -1155,6 +1177,23 @@ test "apply parses the reasoning flag (default on)" {
     try std.testing.expect(!cfg.reasoning);
     cfg.apply("reasoning", "true");
     try std.testing.expect(cfg.reasoning);
+}
+
+test "apply parses weight_read (default pread) and ignores junk" {
+    var cfg: Config = .{};
+    try std.testing.expectEqual(WeightRead.pread, cfg.weight_read);
+    cfg.apply("weight_read", "buffered");
+    try std.testing.expectEqual(WeightRead.buffered, cfg.weight_read);
+    cfg.apply("weight_read", "mmap");
+    try std.testing.expectEqual(WeightRead.mmap, cfg.weight_read);
+    cfg.apply("weight_read", "garbage"); // unchanged on junk
+    try std.testing.expectEqual(WeightRead.mmap, cfg.weight_read);
+    // It governs LOADING only: neither reload predicate may notice it, or a
+    // read-mode flip would needlessly reload multi-GB weights / rebuild the KV.
+    var other: Config = cfg;
+    other.weight_read = .pread;
+    try std.testing.expect(cfg.llmReloadEql(&other));
+    try std.testing.expect(cfg.ctxReloadEql(&other));
 }
 
 test "apply parses kv_dtype (default f32) and ctxReloadEql tracks it" {

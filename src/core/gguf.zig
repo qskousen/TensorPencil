@@ -212,11 +212,17 @@ fn readScalarValue(r: *Reader, t: u32) ParseError!Value {
 
 pub const Gguf = struct {
     /// Whole-file mapping; null when constructed from a caller-owned slice
-    /// or the buffered-read path (safetensors.use_mmap toggles both loaders).
+    /// or the buffered-read path (safetensors.read_mode toggles both loaders).
     mapping: ?[]align(std.heap.page_size_min) const u8,
     /// Owned buffer in the buffered-read path; freed with `gpa`.
     owned: ?[]u8 = null,
     gpa: std.mem.Allocator = undefined,
+    /// The mapped file, kept OPEN so `readTo` can fetch tensor bytes with
+    /// positional reads instead of faulting the mapping. Null for the
+    /// buffered-read and caller-slice paths. See `SafeTensors.readTo`.
+    file: ?std.Io.File = null,
+    /// The `Io` `file` was opened with; needed to read and to close it.
+    io: ?std.Io = null,
     /// Tensor data section (file bytes from the aligned data offset).
     payload: []const u8,
     /// Canonical tensor name -> info, in file order.
@@ -234,11 +240,14 @@ pub const Gguf = struct {
 
     pub fn openIn(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) !Gguf {
         const file = try dir.openFile(io, path, .{ .mode = .read_only });
-        defer file.close(io);
+        // Closed on every path EXCEPT a successful mmap, which keeps it for
+        // `readTo` (see SafeTensors.openIn — same one-flag arrangement).
+        var keep_file = false;
+        defer if (!keep_file) file.close(io);
         const len = try file.length(io);
         if (len < 24) return error.FileTooSmall;
 
-        if (!safetensors.use_mmap) {
+        if (!safetensors.useMmap()) {
             const buf = try gpa.alloc(u8, @intCast(len));
             errdefer gpa.free(buf);
             if (try file.readPositionalAll(io, buf, 0) != buf.len) return error.ShortRead;
@@ -259,6 +268,9 @@ pub const Gguf = struct {
         std.posix.madvise(@constCast(mapping.ptr), mapping.len, std.posix.MADV.WILLNEED) catch {};
         var g = try initFromSlice(gpa, mapping);
         g.mapping = mapping;
+        g.file = file;
+        g.io = io;
+        keep_file = true;
         return g;
     }
 
@@ -472,7 +484,26 @@ pub const Gguf = struct {
         if (self.owned) |b| self.gpa.free(b);
         self.arena.deinit();
         if (self.mapping) |m| std.posix.munmap(m);
+        if (self.file) |f| f.close(self.io.?);
         self.* = undefined;
+    }
+
+    /// Fill `dst` with the bytes `src` (a slice of this file's mapping) points at,
+    /// via a positional read. The GGUF twin of `SafeTensors.readTo` — see there for
+    /// why reading beats faulting on a cold multi-GB checkpoint. False when this
+    /// store has no open file or `src` is not inside the mapping; the caller then
+    /// uses `src` directly, which is the pre-existing behaviour.
+    pub fn readTo(self: *const Gguf, dst: []u8, src: []const u8) bool {
+        if (safetensors.read_mode != .pread) return false;
+        const f = self.file orelse return false;
+        const io = self.io orelse return false;
+        const m = self.mapping orelse return false;
+        if (dst.len != src.len) return false;
+        const base = @intFromPtr(m.ptr);
+        const at = @intFromPtr(src.ptr);
+        if (at < base or at + src.len > base + m.len) return false;
+        const n = f.readPositionalAll(io, dst, at - base) catch return false;
+        return n == dst.len;
     }
 
     pub fn count(self: *const Gguf) usize {

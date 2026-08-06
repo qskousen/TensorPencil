@@ -51,22 +51,64 @@ pub const TensorView = struct {
     }
 };
 
-/// When true (default), `SafeTensors.open` mmaps the checkpoint; when false it
-/// reads the whole file into an owned heap buffer via buffered I/O. mmap is the
-/// better default (zero-copy, lazy paging, OS page-cache warmth across runs),
-/// but its fault path deadlocks on ZFS under memory pressure — set this false
-/// (CLI `--mmap off`) for checkpoints on ZFS, or just keep them on ext4/NVMe.
-pub var use_mmap: bool = true;
+/// How checkpoint bytes reach the consumer. Applies to BOTH loaders (safetensors
+/// and GGUF) and to every front end (`--mmap` on the CLIs, a setting in the GUI).
+pub const ReadMode = enum {
+    /// **Default.** Map the file (headers and CPU access still use the mapping),
+    /// but fetch bulk weight bytes for GPU upload with positional reads. Large
+    /// explicit reads do not depend on the kernel's readahead heuristic, which is
+    /// what collapses a cold multi-GB checkpoint to page-granularity speed when
+    /// the host is short of free RAM.
+    pread,
+    /// Map the file and copy weight bytes straight out of the mapping — the
+    /// behaviour before `pread` became the default. Kept because the read path is
+    /// the sort of thing worth being able to A/B without a rebuild.
+    mmap,
+    /// Read the whole file into an owned heap buffer up front. No fault path at
+    /// all, which is the ZFS-safe option (mmap faulting can deadlock there under
+    /// memory pressure); costs the file's full size in RAM.
+    buffered,
+};
+
+pub var read_mode: ReadMode = .pread;
+
+/// Parse a `--mmap` value. `on` is accepted as a synonym for `mmap` and
+/// `off`/`0`/`false` for `buffered`, so the spellings that predate `pread`
+/// becoming the default keep working. Null = unrecognized.
+pub fn parseReadMode(s: []const u8) ?ReadMode {
+    if (std.mem.eql(u8, s, "pread")) return .pread;
+    if (std.mem.eql(u8, s, "mmap") or std.mem.eql(u8, s, "on")) return .mmap;
+    if (std.mem.eql(u8, s, "buffered") or std.mem.eql(u8, s, "off") or
+        std.mem.eql(u8, s, "0") or std.mem.eql(u8, s, "false")) return .buffered;
+    return null;
+}
+
+/// Whether the loaders memory-map at all (both `pread` and `mmap` modes do).
+pub fn useMmap() bool {
+    return read_mode != .buffered;
+}
 
 pub const SafeTensors = struct {
     /// Whole-file mapping; null when constructed from a caller-owned slice or
     /// the buffered-read path.
     mapping: ?[]align(std.heap.page_size_min) const u8,
-    /// Owned buffer backing `payload` in the buffered-read path (`use_mmap`
-    /// false); null for mmap and caller-owned slices. Freed with `gpa`.
+    /// Owned buffer backing `payload` in the buffered-read path
+    /// (`read_mode == .buffered`); null otherwise. Freed with `gpa`.
     owned: ?[]u8 = null,
     /// Allocator that owns `owned` (and backs `arena`). Only used for freeing.
     gpa: std.mem.Allocator = undefined,
+    /// The mapped file, kept OPEN so a consumer can read tensor bytes with
+    /// positional reads (`readTo`) instead of faulting the mapping.
+    ///
+    /// ⚠️ Exists because a cold 14 GB checkpoint faults in at ~4 KiB granularity
+    /// when the host is under memory pressure — `MADV_WILLNEED` is advisory and
+    /// the kernel will not schedule that much readahead with little free RAM.
+    /// Measured on this NVMe: 192 MB/s at 4 KiB reads against 3.2 GB/s at 1 MiB,
+    /// and a GUI first sampling step of 116 s against 9 s when readahead happened
+    /// to engage. Null for the buffered-read and caller-slice paths.
+    file: ?std.Io.File = null,
+    /// The `Io` `file` was opened with; needed to read and to close it.
+    io: ?std.Io = null,
     /// Data section (file bytes after the JSON header).
     payload: []const u8,
     /// Tensor name -> info, in header order. Names point into the header
@@ -82,11 +124,15 @@ pub const SafeTensors = struct {
 
     pub fn openIn(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) !SafeTensors {
         const file = try dir.openFile(io, path, .{ .mode = .read_only });
-        defer file.close(io);
+        // Closed on every path EXCEPT a successful mmap, which keeps it for
+        // `readTo`. One flag rather than a mix of defer/errdefer so there is
+        // exactly one close.
+        var keep_file = false;
+        defer if (!keep_file) file.close(io);
         const len = try file.length(io);
         if (len < 8) return error.FileTooSmall;
 
-        if (!use_mmap) {
+        if (!useMmap()) {
             // Buffered read into an owned heap buffer: no mmap fault path (ZFS-
             // safe), and the read is a single explicit up-front phase so weight
             // access during compute never touches disk. Fails with a clean OOM
@@ -117,6 +163,9 @@ pub const SafeTensors = struct {
         std.posix.madvise(@constCast(mapping.ptr), mapping.len, std.posix.MADV.WILLNEED) catch {};
         var st = try initFromSlice(gpa, mapping);
         st.mapping = mapping;
+        st.file = file;
+        st.io = io;
+        keep_file = true;
         return st;
     }
 
@@ -201,7 +250,45 @@ pub const SafeTensors = struct {
         if (self.owned) |b| self.gpa.free(b);
         self.arena.deinit();
         if (self.mapping) |m| std.posix.munmap(m);
+        if (self.file) |f| f.close(self.io.?);
         self.* = undefined;
+    }
+
+    /// Read `dst.len` bytes of this checkpoint into `dst`, where `dst` mirrors a
+    /// slice of the mapping — i.e. the caller passes the mapped `src` it would
+    /// otherwise have copied, and gets the same bytes via a positional read.
+    ///
+    /// ⚠️ **The point is to avoid faulting the mapping.** A read-once 14 GB
+    /// checkpoint faulted at page granularity runs ~192 MB/s on this NVMe against
+    /// 3.2 GB/s for large reads, and the kernel will not schedule the readahead
+    /// that would fix it when the host is short on free RAM. Positional reads are
+    /// large and explicit, so throughput does not depend on the kernel's readahead
+    /// heuristic firing.
+    ///
+    /// ⚠️ It does NOT avoid page-cache pollution — a buffered `pread` populates the
+    /// cache just as a fault does. Only O_DIRECT would, and that needs alignment
+    /// handling this does not do.
+    ///
+    /// Measured (cold cache, interleaved A/B from one binary, 13.5 GB DiT):
+    /// step 1 8.5/8.1 s vs 8.9/8.9 s for the mapping copy, prefetch stall
+    /// 7.9/7.6 s vs 8.4/8.3 s — a consistent but small ~6-9%. ⚠️ The large win this
+    /// was built for (a 116 s first step under host memory pressure) is UNPROVEN:
+    /// that state could not be reproduced on demand.
+    ///
+    /// Returns false when this store has no open file (buffered-read or
+    /// caller-slice path) or `src` is not inside the mapping — the caller then
+    /// keeps using `src` directly, which is the pre-existing behaviour.
+    pub fn readTo(self: *const SafeTensors, dst: []u8, src: []const u8) bool {
+        if (read_mode != .pread) return false;
+        const f = self.file orelse return false;
+        const io = self.io orelse return false;
+        const m = self.mapping orelse return false;
+        if (dst.len != src.len) return false;
+        const base = @intFromPtr(m.ptr);
+        const at = @intFromPtr(src.ptr);
+        if (at < base or at + src.len > base + m.len) return false;
+        const n = f.readPositionalAll(io, dst, at - base) catch return false;
+        return n == dst.len;
     }
 
     pub fn count(self: *const SafeTensors) usize {
@@ -395,7 +482,7 @@ test "open via mmap round trip" {
     try std.testing.expectEqualSlices(f32, &.{ 1.0, -2.0 }, vals);
 }
 
-test "open via buffered read round trip (use_mmap=false)" {
+test "open via buffered read round trip (read_mode = .buffered)" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -412,9 +499,9 @@ test "open via buffered read round trip (use_mmap=false)" {
     defer gpa.free(bytes);
     try tmp.dir.writeFile(io, .{ .sub_path = "t.safetensors", .data = bytes });
 
-    const prev = use_mmap;
-    use_mmap = false;
-    defer use_mmap = prev;
+    const prev = read_mode;
+    read_mode = .buffered;
+    defer read_mode = prev;
 
     var st = try SafeTensors.openIn(gpa, io, tmp.dir, "t.safetensors");
     defer st.deinit(); // must free the owned buffer, not munmap

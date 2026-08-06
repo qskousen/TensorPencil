@@ -59,6 +59,14 @@ pub const Context = struct {
     // Pinned staging ring: the checkpoint mmap can't be page-locked directly, so
     // weight uploads memcpy mmap→pinned slot→async DMA. Round-robin slots each
     // with a reuse event (slot free once its DMA signals).
+    /// Sources for weight bytes that bypass the mmap — see `WeightReader`. One
+    /// slot per open checkpoint (a diffusion session has DiT + encoder + VAE);
+    /// each reader answers only for its own file, so they are simply tried in turn.
+    weight_readers: [4]?WeightReader = @splat(null),
+    /// A single pinned chunk for `uploadWeight`, kept SEPARATE from the staging
+    /// ring on purpose: the ring belongs to the prefetch thread, and the
+    /// synchronous path can run on the main thread at the same time.
+    wr_chunk: ?*anyopaque = null,
     staging: [stage_slots]?*anyopaque = @splat(null),
     staging_ev: [stage_slots]cu.CUevent = @splat(null),
     staging_size: usize = 0,
@@ -138,6 +146,7 @@ pub const Context = struct {
     }
 
     pub fn deinit(self: *Context) void {
+        if (self.wr_chunk) |p| _ = self.api.cuMemFreeHost(p);
         for (0..self.n_staging) |i| {
             if (self.staging_ev[i] != null) _ = self.api.cuEventDestroy(self.staging_ev[i]);
             if (self.staging[i]) |p| _ = self.api.cuMemFreeHost(p);
@@ -147,6 +156,82 @@ pub const Context = struct {
         if (self.ctx != null) _ = self.api.cuCtxDestroy(self.ctx);
         self.api.deinit();
     }
+
+    /// Bytes per `uploadWeight` chunk. Bounded so an arbitrarily large weight
+    /// (a 300 MB LM head) costs a fixed pinned allocation, not its own size.
+    const wr_chunk_size: usize = 32 << 20;
+
+    /// Synchronous upload that sources the bytes through a registered
+    /// `WeightReader` when one owns them — read into a pinned chunk, DMA, repeat —
+    /// instead of letting `cuMemcpyHtoD` fault them out of the checkpoint mapping.
+    ///
+    /// This is the path the LLM takes (it has no prefetch thread, so it never
+    /// reaches `uploadStaged`). Falls back to a plain `upload` when no reader owns
+    /// the bytes or the pinned chunk cannot be allocated, so it is never fatal.
+    pub fn uploadWeight(self: *Context, buf: Buffer, data: []const u8) Error!void {
+        std.debug.assert(data.len <= buf.bytes);
+        var any = false;
+        for (self.weight_readers) |maybe| if (maybe != null) {
+            any = true;
+        };
+        if (!any) return self.upload(buf, data);
+        if (self.wr_chunk == null) {
+            var p: ?*anyopaque = null;
+            if (self.api.cuMemAllocHost(&p, wr_chunk_size) != cu.CUDA_SUCCESS) return self.upload(buf, data);
+            self.wr_chunk = p;
+        }
+        const chunk: [*]u8 = @ptrCast(self.wr_chunk.?);
+        var off: usize = 0;
+        while (off < data.len) {
+            const n = @min(wr_chunk_size, data.len - off);
+            // A reader that declines mid-weight (not its file) means the whole
+            // weight is not ours — finish it with the plain copy rather than
+            // interleaving two sources.
+            if (!self.readWeight(chunk[0..n], data[off..][0..n])) {
+                if (off == 0) return self.upload(buf, data);
+                @memcpy(chunk[0..n], data[off..][0..n]);
+            }
+            try self.check(self.api.cuMemcpyHtoD(buf.ptr + off, chunk, n), "cuMemcpyHtoD(weight)");
+            self.htod_bytes += n;
+            off += n;
+        }
+    }
+
+    /// Register a source of weight bytes. Ignored once the slots are full — the
+    /// fallback copy is always correct, so running out degrades speed, not results.
+    pub fn addWeightReader(self: *Context, wr: WeightReader) void {
+        for (&self.weight_readers) |*slot| if (slot.* == null) {
+            slot.* = wr;
+            return;
+        };
+    }
+
+    /// Fill `dst` from whichever registered reader owns `src`; false if none does.
+    fn readWeight(self: *Context, dst: []u8, src: []const u8) bool {
+        for (self.weight_readers) |maybe| if (maybe) |wr| {
+            if (wr.read(wr.ctx, dst, src)) return true;
+        };
+        return false;
+    }
+
+/// Lets `uploadStaged` fetch weight bytes with a positional file read instead of
+/// copying them out of the checkpoint mapping.
+///
+/// ⚠️ A read-once multi-GB checkpoint faulted through mmap runs at page-granularity
+/// speed (~192 MB/s here) whenever the host is short of free RAM, because
+/// `MADV_WILLNEED` is advisory and readahead gets throttled; large explicit reads
+/// do not depend on that heuristic firing. It is a callback rather than a file
+/// handle so this layer keeps knowing nothing about checkpoint formats.
+///
+/// Measured worth ~6-9% on a cold 13.5 GB DiT with ample free RAM; the big win it
+/// targets (memory-pressured first step) is unproven — see `SafeTensors.readTo`.
+///
+/// `read` returns false to mean "not mine / could not read" — the caller then
+/// falls back to the plain copy, so a missing or failing reader is never fatal.
+pub const WeightReader = struct {
+    ctx: *anyopaque,
+    read: *const fn (ctx: *anyopaque, dst: []u8, src: []const u8) bool,
+};
 
     /// Allocate the pinned staging ring (`stage_slots` × `slot_size` device-pinned
     /// host buffers). Enables async weight uploads. Returns false if unsupported.
@@ -179,7 +264,10 @@ pub const Context = struct {
         self.staging_next = (i + 1) % self.n_staging;
         _ = self.api.cuEventSynchronize(self.staging_ev[i]); // slot free (prev DMA done)
         const slot: [*]u8 = @ptrCast(self.staging[i].?);
-        @memcpy(slot[0..data.len], data);
+        // Prefer a positional read straight into the pinned slot; fall back to the
+        // copy when there is no reader, the bytes are not from its file, or the
+        // read fails. Same destination either way, so this cannot change results.
+        if (!self.readWeight(slot[0..data.len], data)) @memcpy(slot[0..data.len], data);
         self.htod_bytes += data.len;
         try self.check(self.api.cuMemcpyHtoDAsync(buf.ptr, slot, data.len, self.xfer_stream), "cuMemcpyHtoDAsync");
         _ = self.api.cuEventRecord(self.staging_ev[i], self.xfer_stream); // slot reusable after this

@@ -23,7 +23,7 @@ const usage =
     \\usage: tp-llm --model <qwen3.safetensors> --prompt <text>
     \\              [--backend cpu|zig-cuda|cuda|vulkan]
     \\              [--system <text>] [--max-tokens <n>] [--max-context <n>]
-    \\              [--kv-dtype f32|f16|q8_0]
+    \\              [--kv-dtype f32|f16|q8_0] [--mmap pread|mmap|buffered]
     \\              [--temperature <t>] [--top-k <n>] [--top-p <p>] [--min-p <p>]
     \\              [--repeat-penalty <r>] [--repeat-last-n <n>]
     \\              [--presence-penalty <p>] [--frequency-penalty <p>]
@@ -190,6 +190,15 @@ pub fn main(init: std.process.Init) !void {
             llm.chat.setThinking(true);
         } else if (std.mem.eql(u8, a, "--no-think")) {
             llm.chat.setThinking(false);
+        } else if (std.mem.eql(u8, a, "--mmap")) {
+            // How checkpoint bytes are read; see safetensors.ReadMode. Shared with
+            // the diffusion CLI and the GUI so one setting governs every loader.
+            const name = try nextArg(args, &i);
+            TensorPencil.safetensors.read_mode = TensorPencil.safetensors.parseReadMode(name) orelse {
+                try stdout.print("unknown --mmap: {s} (pread | mmap | buffered)\n", .{name});
+                try stdout.flush();
+                return error.InvalidArgument;
+            };
         } else if (std.mem.eql(u8, a, "--canonical-template")) {
             g_canonical_gemma4 = true;
         } else if (std.mem.eql(u8, a, "--spec-k")) {
@@ -495,6 +504,9 @@ fn runQwen3(
     // (evictWeightBytes refunds their pin claims).
     const be_cuda = try llm.session.bringUpCuda(arena, backend, profile);
     defer if (be_cuda) |b| b.deinit();
+    // Read weight bytes from the checkpoint FILE rather than faulting the
+    // mapping; no-op unless read_mode is .pread (see session.useFileReads).
+    if (st.* == .gguf) llm.session.useFileReads(be_cuda, &st.gguf);
 
     const dev: llm.session.Devices = .{ .cu_be = be_cuda, .vk_ctx = vk_ctx };
     const driver: Qwen3Driver = .{
@@ -1447,6 +1459,9 @@ fn runQwen35(
         be.profile = profile;
         be.pinAllWeights();
     }
+    // Read weight bytes from the checkpoint FILE rather than faulting the
+    // mapping; no-op unless read_mode is .pread (see session.useFileReads).
+    llm.session.useFileReads(be_cuda, g);
     // Vulkan context up front (the qwen35 LLM runs on it; there is no Vulkan ViT).
     const vk_ctx: ?*TensorPencil.gpu.Context = if (backend == .vulkan) try TensorPencil.gpu.Context.init(arena) else null;
     defer if (vk_ctx) |c| c.deinit();
@@ -1681,6 +1696,9 @@ fn runGemma3(
     // claims VRAM); null on cpu. Every weight pins resident (never streamed).
     const be_cuda = try llm.session.bringUpCuda(arena, backend, profile);
     defer if (be_cuda) |b| b.deinit();
+    // Read weight bytes from the checkpoint FILE rather than faulting the
+    // mapping; no-op unless read_mode is .pread (see session.useFileReads).
+    llm.session.useFileReads(be_cuda, g);
     // Vulkan context created up front too (shared by the ViT and the LLM).
     const vk_ctx: ?*TensorPencil.gpu.Context = if (backend == .vulkan) try TensorPencil.gpu.Context.init(arena) else null;
     defer if (vk_ctx) |c| c.deinit();
@@ -1843,6 +1861,9 @@ fn runGemma4(
     // whole model resident (the 12B Q4_0 fits the 3090).
     const be_cuda = try llm.session.bringUpCuda(arena, backend, profile);
     defer if (be_cuda) |bb| bb.deinit();
+    // Read weight bytes from the checkpoint FILE rather than faulting the
+    // mapping; no-op unless read_mode is .pread (see session.useFileReads).
+    llm.session.useFileReads(be_cuda, g);
 
     // Vision embedder (--mmproj), dispatched by clip.vision.projector_type:
     //   "gemma4uv" -> shallow "unified" embedder (12B; no ViT blocks), runs

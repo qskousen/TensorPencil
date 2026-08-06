@@ -207,11 +207,16 @@ pub fn main(init: std.process.Init) !void {
             \\                         CLIP-L for the SD family)
             \\      --text-encoder-2 <path>  SDXL's second text encoder (OpenCLIP
             \\                         bigG), only for a split-file checkpoint
-            \\      --mmap on          checkpoint loading: on = mmap (default),
-            \\                         off = buffered read into RAM. Use off for
-            \\                         checkpoints on ZFS (mmap can deadlock there
-            \\                         under memory pressure); on is fine on
-            \\                         ext4/xfs/NVMe and warms the OS cache.
+            \\      --mmap pread       how checkpoint bytes are read:
+            \\                         pread (default) = mapped, but weight bytes
+            \\                         fetched with positional reads — does not
+            \\                         depend on kernel readahead, which collapses
+            \\                         to page-granularity speed on a cold
+            \\                         multi-GB file when RAM is short;
+            \\                         mmap = read straight from the mapping;
+            \\                         buffered = read the whole file into RAM up
+            \\                         front. Use buffered on ZFS (mmap faulting
+            \\                         can deadlock there under memory pressure).
             \\      --out out.png      output file
             \\  TensorPencil inspect <file.safetensors>   list tensors in a checkpoint
             \\  TensorPencil bench-matmul                 time a DiT-sized fp8 GEMM
@@ -2266,8 +2271,11 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
             opts.text_encoder_2_path = val;
             opts.explicit_text_encoder_2 = true;
         } else if (std.mem.eql(u8, flag, "--mmap")) {
-            // off => buffered read instead of mmap (ZFS-safe; see safetensors.zig).
-            TensorPencil.safetensors.use_mmap = !(std.mem.eql(u8, val, "off") or std.mem.eql(u8, val, "0") or std.mem.eql(u8, val, "false"));
+            // pread (default) | mmap | buffered — see safetensors.ReadMode.
+            TensorPencil.safetensors.read_mode = TensorPencil.safetensors.parseReadMode(val) orelse {
+                std.log.err("--mmap: expected pread|mmap|buffered (got '{s}')", .{val});
+                return error.InvalidArgs;
+            };
         } else if (std.mem.eql(u8, flag, "--out")) {
             out_path = val;
         } else if (std.mem.eql(u8, flag, "--taew")) {

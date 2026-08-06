@@ -523,6 +523,7 @@ pub fn run(init: std.process.Init) !void {
 
     // Load persisted settings (all fields default to unset / disabled).
     g_config = config.Config.load(init.io, gpa, init.environ_map, g_config_path);
+    applyWeightRead(g_config.weight_read);
     if (model_override) |m| g_config.llm_model.set(m);
     g_config_baseline = g_config;
     // Seed the meter handles from the persisted fractions, clamped into the
@@ -1315,6 +1316,11 @@ fn applyConfig() void {
     }
     // If no session is loaded yet (lazy), the new config is used at first chat.
 
+    // Governs LOADING, so no reload is forced: the next model load picks it up.
+    // (Nothing resident changes, which is why it is absent from both
+    // `llmReloadEql` and `ctxReloadEql`.)
+    applyWeightRead(g_config.weight_read);
+
     g_config_baseline = g_config;
     g_view = g_return_view;
 }
@@ -1334,6 +1340,7 @@ fn toggleReasoning() void {
 /// return to wherever Settings was opened from (chat or the studio).
 fn cancelConfig() void {
     g_config = config.Config.load(g_io, g_gpa, g_environ, g_config_path);
+    applyWeightRead(g_config.weight_read);
     g_config_baseline = g_config;
     g_view = g_return_view;
 }
@@ -1590,6 +1597,17 @@ fn buildSession(arena: std.mem.Allocator) !*chat.Session {
 /// Map the GUI's local KV-dtype enum onto the library's `kv_cache.KvDtype`
 /// (config.zig stays free of a TensorPencil import). Same field names, explicit
 /// so adding a variant is a compile error until both sides agree.
+/// Push the checkpoint-read setting to the core global every loader consults.
+/// Called wherever the config is loaded or applied; it governs LOADING, so the
+/// effect lands on the next model load rather than on anything resident.
+fn applyWeightRead(w: config.WeightRead) void {
+    tp.safetensors.read_mode = switch (w) {
+        .pread => .pread,
+        .mmap => .mmap,
+        .buffered => .buffered,
+    };
+}
+
 fn toKvDtype(d: config.KvDtype) tp.llm.kv_cache.KvDtype {
     return switch (d) {
         .f32 => .f32,

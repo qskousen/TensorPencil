@@ -747,6 +747,12 @@ pub const Session = struct {
         // same set (adding an arch means adding it to both — a lockstep invariant,
         // not a runtime case). A mismatch is a dev bug, caught loudly in Debug.
 
+        // Read weight bytes from the checkpoint FILE rather than faulting the
+        // mapping (no-op unless read_mode is .pread). Registered BEFORE
+        // warmWeights below, which is what actually pulls them in.
+        session.useFileReads(self.be, &self.gguf);
+        if (self.mmproj_gguf) |*mg| session.useFileReads(self.be, mg);
+
         // ⚠️ Upload the weights NOW, while the UI is still showing "Loading…".
         // `Backend.cachedWeight` is lazy, so without this the one-time
         // host->device copy of every weight happens inside the FIRST turn's

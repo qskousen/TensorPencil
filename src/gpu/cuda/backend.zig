@@ -1563,7 +1563,12 @@ pub const Backend = struct {
             var d = db;
             self.tensorDestroy(&d);
         }
-        try self.tensorUpload(db, bytes);
+        // Weight-aware upload: reads through a registered `WeightReader` when one
+        // owns these bytes (see Context.uploadWeight), else a plain HtoD.
+        {
+            const cb = ctxmod.Buffer{ .ptr = db.ptr(), .bytes = @intCast(db.size) };
+            self.ctx.uploadWeight(cb, bytes) catch return error.CudaError;
+        }
         try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .pinned = pin, .scoped = self.weight_scope });
         return db;
     }

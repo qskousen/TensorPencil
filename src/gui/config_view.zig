@@ -340,6 +340,18 @@ pub fn render(cfg: *config.Config, cb: Callbacks) void {
     {
         var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 4 } });
         defer row.deinit();
+        dvui.label(@src(), "Checkpoint reads", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
+        _ = dvui.dropdownEnum(@src(), config.WeightRead, .{ .choice = &cfg.weight_read }, .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 200 } });
+    }
+    help("How model files are read. pread (default) maps the file but fetches " ++
+        "weight bytes with positional reads, so a cold multi-GB checkpoint does " ++
+        "not depend on kernel readahead — which stalls badly when RAM is short. " ++
+        "mmap reads straight from the mapping. buffered loads the whole file " ++
+        "into RAM up front: use it for checkpoints on ZFS, where mmap faulting " ++
+        "can deadlock. Applies to the next model load.");
+    {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 4 } });
+        defer row.deinit();
         dvui.label(@src(), "Vision detail (Gemma 4)", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
         _ = dvui.dropdownEnum(@src(), config.VisionBudget, .{ .choice = &cfg.vision_budget }, .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 200 } });
     }

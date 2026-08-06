@@ -15,6 +15,7 @@ const std = @import("std");
 const cuda = @import("tp_gpu").cuda;
 const gpu_context = @import("tp_gpu").context;
 const kv_cache = @import("tp_core").kv_cache;
+const gguf_mod = @import("tp_core").gguf;
 const chat = @import("chat.zig");
 const engine = @import("engine.zig");
 const tokenizer = @import("tp_core").tokenizer;
@@ -147,6 +148,29 @@ pub fn bringUpCuda(arena: std.mem.Allocator, backend: BackendKind, profile: bool
         b.pinAllWeights();
     }
     return be;
+}
+
+/// Point the CUDA weight cache at the checkpoint FILE, so a weight upload reads
+/// its bytes positionally instead of faulting them out of the mapping.
+///
+/// Register every GGUF the session opened (model + mmproj): each reader answers
+/// only for its own mapping. No-op without a CUDA backend, and `Gguf.readTo`
+/// itself no-ops unless `safetensors.read_mode == .pread`, so `--mmap mmap`
+/// disables it without any caller needing to know.
+///
+/// ⚠️ The `Gguf` must outlive the backend — it is borrowed, not copied. Every
+/// caller holds it for the whole session, which is why this takes a pointer.
+pub fn useFileReads(be: ?*cuda.Backend, g: *const gguf_mod.Gguf) void {
+    const b = be orelse return;
+    b.ctx.addWeightReader(.{
+        .ctx = @constCast(g),
+        .read = struct {
+            fn read(ctx: *anyopaque, dst: []u8, src: []const u8) bool {
+                const gg: *const gguf_mod.Gguf = @ptrCast(@alignCast(ctx));
+                return gg.readTo(dst, src);
+            }
+        }.read,
+    });
 }
 
 /// Per-architecture descriptor for `run`: the concrete stepper types plus the
