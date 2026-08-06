@@ -33,12 +33,20 @@ pub const ParseError = error{
     UnsupportedTensorType,
     InvalidShape,
     InvalidOffsets,
+    /// GGUF type id 42 (Q2_0) is claimed by two formats with different block
+    /// sizes and the file's geometry does not identify which. See
+    /// `detectQ2_0Variant` — guessing here is a silent wrong answer.
+    AmbiguousQ2_0Variant,
     DuplicateTensor,
     OutOfMemory,
 };
 
 /// ggml tensor type ids (ggml.h `enum ggml_type`) we can load.
-fn dtypeFromGgml(id: u32) ?DType {
+///
+/// `q2_0` supplies the resolution of the ambiguous id 42 — see
+/// `detectQ2_0Variant`. Passing the wrong one is a silent wrong answer, so there
+/// is no default; the only caller resolves it from file geometry first.
+fn dtypeFromGgml(id: u32, q2_0: DType) ?DType {
     return switch (id) {
         0 => .f32,
         1 => .f16,
@@ -48,11 +56,76 @@ fn dtypeFromGgml(id: u32) ?DType {
         13 => .q5_k,
         14 => .q6_k,
         20 => .iq4_nl, // GGML_TYPE_IQ4_NL (32-elem block, non-linear 4-bit LUT)
+        41 => .q1_0, // GGML_TYPE_Q1_0 (128-elem block, 1 sign bit per weight)
+        42 => q2_0, // GGML_TYPE_Q2_0 — AMBIGUOUS, resolved by the caller
         24 => .i8, // GGML_TYPE_I8 (raw, no blocks) — NOT 16, which is IQ2_XXS
         26 => .i32, // GGML_TYPE_I32
         30 => .bf16,
         else => null,
     };
+}
+
+/// One tensor-table row, reduced to what `detectQ2_0Variant` needs.
+const Span = struct { type_id: u32, elems: u64, offset: u64 };
+
+/// Resolve GGUF type id 42 — which two shipped formats claim — from the file's
+/// own geometry. Returns `.q2_0_g64` (upstream ggml, 64 elems / 18 B) or
+/// `.q2_0_g128` (the PrismML fork's `prism` branch, 128 elems / 34 B).
+///
+/// ⚠️ **This cannot be skipped or guessed.** The two are indistinguishable from
+/// the header: same type id, same `general.file_type`, same arithmetic. Only the
+/// on-disk row length differs, by 17/18. And the error is not symmetric — reading
+/// a g64 file as g128 computes *smaller* spans than reality, so the bounds check
+/// below passes and every tensor view is silently short and misaligned against
+/// the real block stream. That is a wrong answer with no diagnostic, which is why
+/// this runs before any dtype is assigned.
+///
+/// The discriminator is the gap to the next tensor in offset order: a candidate
+/// is accepted only if `alignForward(size) == gap` exactly. The two candidates
+/// differ by ~5.6% (80 B on a 1440 B row) against at most `alignment` (typically
+/// 32 B) of padding, so for any real weight matrix there is no ambiguity band —
+/// but a gap that fits *both* (tiny tensors) or *neither* (a non-contiguous
+/// writer) simply casts no vote rather than guessing. Disagreement between
+/// tensors, or no vote at all, is an error: this is exactly the situation where
+/// picking a default is worse than refusing.
+fn detectQ2_0Variant(alloc: std.mem.Allocator, spans: []const Span, alignment: usize, payload_len: u64) ParseError!DType {
+    const order = try alloc.alloc(u32, spans.len);
+    defer alloc.free(order);
+    for (order, 0..) |*o, i| o.* = @intCast(i);
+    std.mem.sort(u32, order, spans, struct {
+        fn lt(s: []const Span, a: u32, b: u32) bool {
+            return s[a].offset < s[b].offset;
+        }
+    }.lt);
+
+    var found: ?DType = null;
+    for (order, 0..) |idx, i| {
+        const s = spans[idx];
+        if (s.type_id != 42) continue;
+        // The span available to this tensor: up to the next tensor's offset, or
+        // the end of the data section for the last one.
+        const limit = if (i + 1 < order.len) spans[order[i + 1]].offset else payload_len;
+        if (limit <= s.offset) continue; // overlapping/duplicate offsets: no signal
+        const gap = limit - s.offset;
+
+        var vote: ?DType = null;
+        for ([_]DType{ .q2_0_g64, .q2_0_g128 }) |cand| {
+            const be: u64 = cand.blockElems();
+            if (s.elems % be != 0) continue;
+            const size = s.elems / be * cand.blockBytes();
+            if (std.mem.alignForward(u64, size, alignment) != gap) continue;
+            if (vote != null) {
+                vote = null; // both fit this gap — too small to discriminate
+                break;
+            }
+            vote = cand;
+        }
+        const v = vote orelse continue;
+        if (found) |f| {
+            if (f != v) return error.AmbiguousQ2_0Variant; // the file disagrees with itself
+        } else found = v;
+    }
+    return found orelse error.AmbiguousQ2_0Variant;
 }
 
 /// A parsed metadata value. Strings and array spans point into the mapped
@@ -229,6 +302,38 @@ pub const Gguf = struct {
             else => return error.InvalidHeader,
         };
 
+        // Pre-scan the tensor table for GGUF type id 42, whose block size is not
+        // determined by the header (see `detectQ2_0Variant`). This walks the table
+        // once to collect offsets and element counts, then rewinds; the mapping is
+        // already in memory, so the second pass is only string/int decoding. A
+        // resolution has to exist before any dtype is assigned, because the size of
+        // every 42 tensor depends on it.
+        const table_start = r.pos;
+        const q2_0_variant: DType = blk: {
+            const spans = try alloc.alloc(Span, @intCast(n_tensors));
+            defer alloc.free(spans);
+            var any_q2_0 = false;
+            for (spans) |*sp| {
+                _ = try r.str();
+                const nd = try r.int(u32);
+                if (nd > tensors.max_rank) return error.InvalidShape;
+                var elems: u64 = 1;
+                for (0..nd) |_| {
+                    const v = try r.int(u64);
+                    if (v == 0) return error.InvalidShape;
+                    elems = std.math.mul(u64, elems, v) catch return error.InvalidShape;
+                }
+                const tid = try r.int(u32);
+                sp.* = .{ .type_id = tid, .elems = elems, .offset = try r.int(u64) };
+                if (tid == 42) any_q2_0 = true;
+            }
+            const ds = std.mem.alignForward(usize, r.pos, alignment);
+            if (ds > r.data.len) return error.InvalidOffsets;
+            r.pos = table_start; // rewind for the real pass below
+            if (!any_q2_0) break :blk .q2_0_g128; // unused; no tensor references it
+            break :blk try detectQ2_0Variant(alloc, spans, alignment, r.data.len - ds);
+        };
+
         // Tensor table: canonicalize names, reverse dims, validate spans
         // against the data section.
         const Raw = struct { name: []const u8, dt: DType, shape: tensors.Shape, offset: usize, flat_blocks: bool };
@@ -248,7 +353,7 @@ pub const Gguf = struct {
                 if (v == 0 or v > std.math.maxInt(usize)) return error.InvalidShape;
                 dims[d] = @intCast(v);
             }
-            const dt = dtypeFromGgml(type_id) orelse return error.UnsupportedTensorType;
+            const dt = dtypeFromGgml(type_id, q2_0_variant) orelse return error.UnsupportedTensorType;
             // Blocks must tile the contiguous dim exactly (ggml guarantees it).
             if (ne[0] % dt.blockElems() != 0) return error.InvalidShape;
             if (offset % alignment != 0) return error.InvalidOffsets;
@@ -686,6 +791,62 @@ test "parse synthetic gguf" {
     try std.testing.expectEqual(@as(usize, 34), emb.bytes.len);
     try std.testing.expect(g.get("blk.0.attn_q.weight") == null);
     try std.testing.expectError(error.MissingTensor, g.require("missing"));
+}
+
+test "the q2_0 variant is detected from file geometry, not the type id" {
+    const gpa = std.testing.allocator;
+    // GGUF type 42 is claimed by two formats (see `detectQ2_0Variant`). Build the
+    // SAME header twice, differing only in how much data each tensor occupies,
+    // and require the parser to reach opposite conclusions. A 1024-element row is
+    // 288 B as g64 (16 blocks x 18) and 272 B as g128 (8 x 34) — and 272 rounds up
+    // to 288 under 32 B alignment, so the FIRST tensor's gap is deliberately
+    // ambiguous. Detection must therefore come from the second tensor, which is
+    // what pins that a too-small gap casts no vote instead of guessing.
+    for ([_]struct { row: usize, want: DType }{
+        .{ .row = 288, .want = .q2_0_g64 },
+        .{ .row = 272, .want = .q2_0_g128 },
+    }) |c| {
+        const n_rows = 8;
+        const stride = std.mem.alignForward(usize, c.row, 32);
+        const payload = try gpa.alloc(u8, stride + c.row * n_rows);
+        defer gpa.free(payload);
+        @memset(payload, 0x24);
+
+        var b = try TestBuilder.init(gpa, 3, 2, 1);
+        defer b.deinit();
+        try b.kvStr("general.architecture", "qwen3");
+        try b.tensor("blk.0.attn_q.weight", &.{1024}, 42, 0);
+        try b.tensor("blk.0.attn_k.weight", &.{ 1024, n_rows }, 42, stride);
+        const file = try b.finish(payload);
+        defer gpa.free(file);
+
+        var g = try Gguf.initFromSlice(gpa, file);
+        defer g.deinit();
+        const t = try g.require("layers.0.self_attn.k_proj.weight");
+        errdefer std.debug.print("row {d}: got {t}\n", .{ c.row, t.info.dtype });
+        try std.testing.expectEqual(c.want, t.info.dtype);
+        try std.testing.expectEqual(c.row * n_rows, t.bytes.len);
+    }
+}
+
+test "a q2_0 file whose geometry fits neither variant is refused, not guessed" {
+    const gpa = std.testing.allocator;
+    // Sizes that match no candidate must be an error. Guessing would hand the
+    // loader silently short, misaligned tensor views — the failure mode the
+    // detector exists to prevent, and one no bounds check downstream can see.
+    const payload = try gpa.alloc(u8, 4096);
+    defer gpa.free(payload);
+    @memset(payload, 0);
+
+    var b = try TestBuilder.init(gpa, 3, 2, 1);
+    defer b.deinit();
+    try b.kvStr("general.architecture", "qwen3");
+    try b.tensor("blk.0.attn_q.weight", &.{ 1024, 4 }, 42, 0);
+    try b.tensor("blk.0.attn_k.weight", &.{ 1024, 4 }, 42, 1500); // neither 4*288 nor 4*272
+    const file = try b.finish(payload);
+    defer gpa.free(file);
+
+    try std.testing.expectError(error.AmbiguousQ2_0Variant, Gguf.initFromSlice(gpa, file));
 }
 
 test "reject malformed gguf" {

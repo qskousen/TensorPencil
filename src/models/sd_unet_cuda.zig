@@ -555,6 +555,41 @@ fn groupNorm(
 }
 
 /// A GEMM against a checkpoint weight, routed by the dtype it was stored in.
+
+/// Feed `ops.matmul.probe` this GEMM's input, so an activation capture works when
+/// the SD UNet runs on CUDA.
+///
+/// ⚠️ **Without these call sites a CUDA capture of an SD model is silently almost
+/// empty, and it passes the cache's own sanity gate.** This backend owns its GEMM,
+/// so `ops.matmul`'s probe point never fires here; measured before the fix, a
+/// dreamshaper_8 capture recorded **23 of ~282 layers** — every one of them an
+/// `emb_layers` timestep projection, which are the only linears that fall back to
+/// `ops.matmul`. Attention, the feed-forwards and every convolution — i.e. the model —
+/// were invisible. That is the same failure the Vulkan DiT capture had (39 of 263).
+///
+/// Mirrors `dit_cuda.probeInput`: the activation is downloaded and handed to the same
+/// host accumulator a CPU capture uses, so a GPU-captured cache differs from a CPU one
+/// only by the backend's own GEMM arithmetic.
+fn probeInput(be: *Backend, x: Buf, m: usize, w: Weight) !void {
+    const p = ops.matmul.probe orelse return;
+    if (m == 0 or w.cols == 0) return;
+    const host = try be.gpa.alloc(f32, m * w.cols);
+    defer be.gpa.free(host);
+    try be.tensorDownload(x, std.mem.sliceAsBytes(host));
+    p.input(p.ctx, w, host, m);
+}
+
+/// The `Weight` a convolution's GEMM is equivalent to, matching `ops.conv` exactly:
+/// a 1x1 reads `ci` columns and a 3x3 reads the im2col patch (`9*ci`). Getting this
+/// wrong would not fail — it would file a cache whose column count disagrees with the
+/// checkpoint, which is what the validator catches, or worse, silently mis-shape the
+/// per-column statistics an imatrix is built from.
+fn convWeight(cv: Conv2d, cols: usize) Weight {
+    var w = Weight.fromF32(cv.w, cv.co, cols);
+    w.tag = cv.tag;
+    return w;
+}
+
 fn gemm(be: *Backend, sess: *Session, y: *Buf, x: *const Buf, m: usize, wt: Weight, bias: ?[]const f32) !void {
     const rows = wt.rows;
     const cols = wt.cols;
@@ -565,6 +600,10 @@ fn gemm(be: *Backend, sess: *Session, y: *Buf, x: *const Buf, m: usize, wt: Weig
     // answer for THIS bias and nothing else. The kernels read only `rows`
     // entries, so handing them a longer slice is free. (Backend.cachedWeight)
     const b = bias orelse sess.zeros;
+    // Before the dispatch: `x` still holds the f32 activation here (unlike the
+    // int8/int4 DiT paths, which consume it in place — the SD UNet has no such path,
+    // its GEMM switch is {f32, f16, bf16}).
+    try probeInput(be, x.*, m, wt);
     switch (wt.dtype) {
         .f32 => {
             if (rows >= coop_min_co) return be.opConvF16(y.*, 0, x.*, m, wt.bytes, rows, cols, b);
@@ -629,6 +668,7 @@ pub fn convIntoScaled(
     if (cv.k == 1) {
         std.debug.assert(mode == .stride1);
         const n = h * w;
+        try probeInput(be, src.*, n, convWeight(cv, cv.ci));
         if (coop) return be.opConvF16Scaled(dst.*, 0, src.*, n, std.mem.sliceAsBytes(cv.w), cv.co, cv.ci, cb, act_div);
         return be.opMatmul(dst.*, 0, src.*, 0, n, std.mem.sliceAsBytes(cv.w), false, cv.co, cv.ci, 1.0, cb);
     }
@@ -653,6 +693,9 @@ pub fn convIntoScaled(
     while (p0 < n_out) : (p0 += band) {
         const bn = @min(band, n_out - p0);
         try be.opIm2colSd(src.*, patch.*, bn, patch_len, cv.ci, w, h, p0, ow, @intFromEnum(mode));
+        // Per band, not per convolution: the accumulator sums over rows, so N banded
+        // calls contribute exactly the rows one unbanded call would.
+        try probeInput(be, patch.*, bn, convWeight(cv, patch_len));
         if (coop) {
             try be.opConvF16Scaled(dst.*, p0 * cv.co, patch.*, bn, std.mem.sliceAsBytes(cv.w), cv.co, patch_len, cb, act_div);
         } else {

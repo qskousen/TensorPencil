@@ -23,6 +23,7 @@ const diffuser = @import("diffuser.zig");
 const clipboard = @import("clipboard.zig");
 const meter = @import("meter.zig");
 const status_bar = @import("status_bar.zig");
+const turn_stats = @import("turn_stats.zig");
 const sysmon = @import("sysmon.zig");
 const vips = @import("vips");
 
@@ -1572,6 +1573,7 @@ fn buildSession(arena: std.mem.Allocator) !*chat.Session {
         .reasoning = g_config.reasoning,
         .kv_dtype = toKvDtype(g_config.kv_dtype),
         .regen_cache_mb = g_config.regen_cache_mb,
+        .max_new_tokens = g_config.max_new_tokens,
         .vision_budget_tokens = g_config.vision_budget.tokens(),
         .gemma4_canonical_template = g_config.gemma4_canonical_template,
     });
@@ -1712,7 +1714,7 @@ fn renderMessage(s: ?*chat.Session, m: *chat.Message, idx: usize) void {
     // Everything below shows the message's ACTIVE variant (the ‹/› nav on the
     // last assistant response switches it; older takes stay stored).
     const v = m.activeConst();
-    const p = parseThink(v.text.items);
+    const p = parseThink(v.text.items, v.thought_primed);
     // Only the last assistant message is actively generating; "Thinking…" means
     // the block is still open AND generation is live. A think block left open
     // because generation stopped (e.g. hit max tokens) reads "Thoughts". With no
@@ -1782,6 +1784,11 @@ fn renderMessage(s: ?*chat.Session, m: *chat.Message, idx: usize) void {
     // id base so it can't collide with attachment image ids in this bubble.
     for (v.images.items, 0..) |gi, gi_idx| renderGenImage(s, gi, 100_000 + gi_idx);
 
+    // The turn's measurement (see chat.TurnStats): what the prompt cost under a
+    // user message, the rates + this reply's size + the context standing under
+    // an assistant one. Updates every frame while the reply streams.
+    renderStatsFooter(v.stats, is_user);
+
     // ‹ n/m › navigation on the LAST assistant response (TODO #3): ‹ shows the
     // previous take, › the next — or, on the newest take, regenerates a fresh
     // one. Hidden while generating (Stop is the control then). Shown even with
@@ -1801,6 +1808,28 @@ fn renderMessage(s: ?*chat.Session, m: *chat.Message, idx: usize) void {
         if (idx + 1 == nmsg and nmsg >= 2 and prev_user and !busy)
             renderVariantNav(s, m);
     }
+}
+
+/// A message's stats line: dim, small, and right-aligned so it reads as a
+/// margin note on the bubble rather than as content. Draws nothing at all
+/// until there is something measured — a bubble that has only just appeared
+/// (or a transcript carried across a model swap) would otherwise show a row of
+/// zeros. The strings come from `turn_stats`, which is where they're tested.
+fn renderStatsFooter(st: chat.TurnStats, is_user: bool) void {
+    if (!(if (is_user) st.hasPrompt() else st.hasGen())) return;
+    var buf: [turn_stats.buf_len]u8 = undefined;
+    const text = if (is_user) turn_stats.formatUser(&buf, st) else turn_stats.formatAssistant(&buf, st);
+    if (text.len == 0) return;
+    const theme = dvui.themeGet();
+    dvui.label(@src(), "{s}", .{text}, .{
+        // Sized to its text (no expand) so `gravity_x` places it along the
+        // bubble's own outer edge: the user's leans right, the assistant's left.
+        .gravity_x = if (is_user) 1.0 else 0.0,
+        .font = dvui.Font.theme(.body).withSize(10),
+        .color_text = theme.text.lerp(theme.fill, 0.45),
+        .padding = .{},
+        .margin = .{ .y = 3 },
+    });
 }
 
 /// The ‹ n/m › variant-navigation row (see renderMessage). Back is disabled
@@ -2075,23 +2104,17 @@ const Parsed = struct { think: ?[]const u8, answer: []const u8, thinking: bool }
 /// `<think>…</think>`, Gemma 4's `<|channel>thought…<channel|>`). The markers
 /// themselves are dropped. `thinking` is true while the block is still open (no
 /// close marker yet). Families that don't reason return everything as answer.
-fn parseThink(text: []const u8) Parsed {
-    const ws = " \n\r\t";
-    const r = tp.llm.chat.reasoning() orelse
-        return .{ .think = null, .answer = text, .thinking = false };
-    const t = std.mem.trimStart(u8, text, ws);
-    if (std.mem.startsWith(u8, t, r.open)) {
-        const rest = t[r.open.len..];
-        if (std.mem.indexOf(u8, rest, r.close)) |end| {
-            return .{
-                .think = std.mem.trim(u8, rest[0..end], ws),
-                .answer = std.mem.trimStart(u8, rest[end + r.close.len ..], ws),
-                .thinking = false,
-            };
-        }
-        return .{ .think = std.mem.trimStart(u8, rest, ws), .answer = "", .thinking = true };
-    }
-    return .{ .think = null, .answer = text, .thinking = false };
+///
+/// `primed` says the prompt already opened the block, so the generated text
+/// starts INSIDE the thought and never emits an opening marker — the render-driven
+/// (template) path does exactly that. It is recorded per variant at generation
+/// time (`Variant.thought_primed`), because a session can render both ways over
+/// its lifetime. See `toolcall.splitThought`, which owns the rule so the display
+/// and the tool-call scanner cannot disagree about what is inside a thought.
+fn parseThink(text: []const u8, primed: bool) Parsed {
+    const r = tp.llm.chat.reasoning();
+    const s = toolcall.splitThought(text, if (r) |rr| .{ .open = rr.open, .close = rr.close } else null, primed);
+    return .{ .think = s.think, .answer = s.answer, .thinking = s.open };
 }
 
 /// One pending-attachment thumbnail (56px, RGBA) with a hover-only X. Returns

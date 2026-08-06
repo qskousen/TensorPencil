@@ -899,6 +899,32 @@ fn headsPerBatch(seq_pad: usize, heads: usize) usize {
 /// A GEMM against a checkpoint weight, routed by the dtype it was stored in.
 /// `bias` null means the weight carries none (attention q/k/v), which the
 /// bias-adding kernels still need a vector for — hence the session's zeros.
+
+/// Feed `ops.matmul.probe` this GEMM's input, so an activation capture works when
+/// the SD UNet runs on Vulkan. Mirrors `sd_unet_cuda.probeInput` and
+/// `dit_gpu.probeInput`; see the former for what a capture records without these.
+///
+/// No int8/int4 skip is needed here, unlike the DiT backends: this UNet's dtype
+/// switch is {f32, f16, bf16, q8_0, q4_k, q5_k, q6_k, iq4_nl}, every one of which
+/// leaves the *activation* in f32 and quantizes only the weight. Nothing rotates or
+/// consumes `x` in place, so the buffer always holds what a CPU capture would see.
+fn probeInput(ctx: *Context, x: DeviceBuffer, m: usize, w: Weight) !void {
+    const p = ops.matmul.probe orelse return;
+    if (m == 0 or w.cols == 0) return;
+    const host = try ctx.gpa.alloc(f32, m * w.cols);
+    defer ctx.gpa.free(host);
+    try ctx.tensorDownloadAt(x, 0, std.mem.sliceAsBytes(host));
+    p.input(p.ctx, w, host, m);
+}
+
+/// The `Weight` a convolution's GEMM is equivalent to — `ci` columns for a 1x1 and
+/// the im2col patch (`9*ci`) for a 3x3, matching `ops.conv` exactly.
+fn convWeight(cv: Conv2d, cols: usize) Weight {
+    var w = Weight.fromF32(cv.w, cv.co, cols);
+    w.tag = cv.tag;
+    return w;
+}
+
 fn gemm(
     ctx: *Context,
     sess: *Session,
@@ -918,6 +944,7 @@ fn gemm(
     // answer for THIS bias and nothing else. The kernels read only `rows`
     // entries, so handing them a longer slice is free. (Context.smallBuffer)
     const b = bias orelse sess.zeros;
+    try probeInput(ctx, x.*, m, wt);
     const coop = ctx.pipe_coop_f16w != .null_handle and rows >= coop_min_co;
     switch (wt.dtype) {
         .f32 => {
@@ -1022,6 +1049,7 @@ pub fn convIntoScaled(
     if (cv.k == 1) {
         std.debug.assert(mode == .stride1);
         const n = h * w;
+        try probeInput(ctx, src.*, n, convWeight(cv, cv.ci));
         if (bias_dev) |bd| {
             std.debug.assert(coop);
             return ctx.opMatmulCoopF16WDev(dst.*, 0, src.*, n, cv.w, cv.co, cv.ci, bd.buf, bd.off);
@@ -1060,6 +1088,8 @@ pub fn convIntoScaled(
             .u6 = @intCast(ow),
             .f0 = @floatFromInt(@intFromEnum(mode)),
         }, bn * patch_len, 1, 1);
+        // Per band; the accumulator sums over rows (see sd_unet_cuda).
+        try probeInput(ctx, patch.*, bn, convWeight(cv, patch_len));
         if (bias_dev) |bd| {
             std.debug.assert(coop);
             try ctx.opMatmulCoopF16WDev(dst.*, p0 * cv.co, patch.*, bn, cv.w, cv.co, patch_len, bd.buf, bd.off);

@@ -17,6 +17,7 @@ extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 const config = @import("config.zig");
 const toolcall = @import("toolcall.zig");
 const diffuser = @import("diffuser.zig");
+const turn_stats = @import("turn_stats.zig");
 
 const qwen3 = tp.models.qwen3;
 const qwen3_cuda = tp.models.qwen3_cuda;
@@ -132,6 +133,21 @@ pub const Role = enum { user, assistant };
 pub const GenStatus = diffuser.GenStatus;
 pub const GenImage = diffuser.GenImage;
 
+/// What a message's footer reports: how much of the turn was prompt, how much
+/// was generation, and where the context stood afterwards. ONE struct for both
+/// roles — a user message's variant carries the prompt half, an assistant
+/// variant the generation half — because it is the same question ("what did
+/// this turn cost") asked at two points in the same turn, and the two halves
+/// are measured by the same worker pass.
+///
+/// Published by the generation worker and folded into the transcript by `poll`
+/// on the UI thread, like `pending`: only the UI thread ever touches
+/// `messages`. While a reply streams, the generation fields come from
+/// `engine.Progress` and update every frame.
+///
+/// Defined in `turn_stats.zig` (pure std, unit-tested) with its formatting.
+pub const TurnStats = turn_stats.TurnStats;
+
 /// One take of a message: its streamed text plus the images that take
 /// requested. Assistant messages accumulate variants as the user regenerates
 /// (the ‹/› buttons); user messages always have exactly one.
@@ -142,6 +158,18 @@ pub const Variant = struct {
     images: std.ArrayList(*GenImage) = .empty,
     /// Set once the completed variant has been scanned for image tool calls.
     images_scanned: bool = false,
+    /// Whether the prompt this variant was generated from already had the
+    /// reasoning block OPEN (the render-driven template primes
+    /// `…assistant\n<think>\n`), so the text starts inside the thought and only
+    /// ever emits the CLOSE marker. Recorded per variant rather than per session
+    /// because a session can render both ways over its lifetime — thinking can be
+    /// toggled, and a vision turn falls back to the unprimed hand glue.
+    /// Consumed by `toolcall.splitThought`; see there for why it matters.
+    thought_primed: bool = false,
+    /// This take's measurement, shown in the message footer (see `TurnStats`).
+    /// Per VARIANT, not per message: each regenerate is its own turn, with its
+    /// own rates and its own context length.
+    stats: TurnStats = .{},
 
     pub fn deinit(self: *Variant, gpa: std.mem.Allocator) void {
         self.text.deinit(gpa);
@@ -295,6 +323,10 @@ pub const Options = struct {
     /// window — CUDA grows KV rows on demand, so a large ceiling costs VRAM
     /// only as the conversation fills.
     max_context: ?usize = null,
+    /// Per-reply token ceiling. **0 means no explicit cap** — generate until the
+    /// model stops or the context window fills (see `resolveMaxNew`). Applied
+    /// live: `updateSettings` stages it and the next turn boundary adopts it,
+    /// exactly like `sampling`.
     max_new_tokens: usize = 2048,
     /// BASE sampling seed for the session (the app passes the clock). Every
     /// turn draws its own seed from a sample.SeedSeq over this at submit, so
@@ -347,6 +379,20 @@ pub const Options = struct {
     gemma4_canonical_template: bool = false,
 };
 
+/// Resolve the configured per-reply token cap against the session's context
+/// ceiling. 0 means "no explicit cap": the reply runs until the model emits a
+/// stop token or the KV window fills, which `engine.generate` handles as a clean
+/// break (`ensureRoom` → `error.ContextFull` → stop), not an error.
+///
+/// ⚠️ `max_context` — not a huge sentinel — is what expresses that. The engine
+/// sizes a one-shot KV plan as `prompt_len + max_new_tokens`
+/// (`engine.capacityPlanFor`), so `maxInt(usize)` there is an integer overflow,
+/// and `max_context` is anyway the *exact* upper bound on how many tokens one
+/// turn can produce. The engine's loop bound stays a plain `usize` either way.
+fn resolveMaxNew(cfg_max_new: usize, max_context: usize) usize {
+    return if (cfg_max_new == 0) max_context else cfg_max_new;
+}
+
 /// Map the GUI's engine-free `config.Sampling` onto the library's
 /// `sample.Params`, field for field — explicit so the two can't drift silently.
 pub fn samplingParams(cfg: *const config.Config) sample.Params {
@@ -396,6 +442,12 @@ pub const Session = struct {
     /// runs (`submit` refuses when busy). Keeps live settings edits from racing
     /// the worker's read of `opts`, and gives "takes effect next turn" exactly.
     pending_sampling: sample.Params = .{},
+    /// Per-reply token cap staged by `updateSettings` and adopted into
+    /// `opts.max_new_tokens` at the next turn boundary — the same discipline as
+    /// `pending_sampling`, and for the same reason: the worker reads `opts`
+    /// throughout a turn, so a live edit must not land mid-generation. Already
+    /// resolved (0 → the context ceiling), so the boundary is a plain copy.
+    pending_max_new_tokens: usize = 0,
     /// A changed system prompt staged by `updateSettings` (UI thread), gpa-owned,
     /// adopted into `system_text` by `submit`/`regenerate` at the next turn
     /// boundary — same discipline as `pending_sampling` (the worker reads
@@ -424,6 +476,32 @@ pub const Session = struct {
     worker: ?std.Thread = null,
     gen_err: ?anyerror = null,
     sink_buf: [256]u8 = undefined,
+
+    // Per-turn telemetry for the message footers (see `TurnStats`). Same
+    // marshalling rule as `pending`: the worker publishes, `poll` folds it into
+    // the transcript on the UI thread. `progress` is the engine's own per-token
+    // counters (atomic, no lock); the two below are `mu`-guarded.
+    progress: engine.Progress = .{},
+    /// The in-flight turn's assistant-side stats: the prefill half plus the
+    /// context base, published once the prompt is in; the generation half is
+    /// overwritten with the authoritative numbers when the turn ends. While
+    /// `busy()`, `poll` composes the live half from `progress` instead.
+    turn_stats: TurnStats = .{},
+    /// The prompt half, published once per FRESH user turn (never by a
+    /// regenerate, which re-runs an already-measured prompt) and consumed by
+    /// `poll` into the user message.
+    user_stats: ?TurnStats = null,
+    /// `poll` keeps folding `turn_stats` into the last assistant variant while
+    /// this is set; it clears it after applying the final numbers of a finished
+    /// turn, so a later frame can't overwrite a variant the user navigated away
+    /// from.
+    stats_live: bool = false,
+    /// Whether this turn built a new user message (submit) rather than
+    /// re-running an existing one (regenerate) — see `user_stats`. UI thread.
+    fresh_user_turn: bool = false,
+    /// Prompt tokens the turn just built contributes (`TurnStats.prompt_tokens`),
+    /// handed from `buildTurn` to `publishPromptStats`. Worker thread only.
+    turn_prompt_tokens: usize = 0,
 
     // Whether the image tool is available (a diffusion model is configured).
     // The diffusion engine itself is owned app-level (persistent across mode
@@ -660,12 +738,16 @@ pub const Session = struct {
         }
 
         self.opts = .{
-            .max_new_tokens = cfg.max_new_tokens,
+            .max_new_tokens = resolveMaxNew(cfg.max_new_tokens, max_context),
             .max_context = max_context,
             .seed = cfg.seed,
             .sampling = cfg.sampling,
         };
         self.pending_sampling = cfg.sampling;
+        // MUST be set explicitly, like every field here: the session is
+        // `gpa.create`d, so the struct default never runs (see the
+        // `pending_system_text` note below).
+        self.pending_max_new_tokens = self.opts.max_new_tokens;
         self.seeds = sample.SeedSeq.init(cfg.seed);
         // Let the decode loop enact arbiter-published VRAM targets on the worker
         // thread (`self` is heap-pinned, so the captured pointer stays valid).
@@ -713,6 +795,14 @@ pub const Session = struct {
         self.control = .{};
         self.suspended_midturn = false;
         self.turn_staged = false;
+        // Same trap for the footer telemetry: read every frame by `poll`.
+        self.progress = .{};
+        self.turn_stats = .{};
+        self.user_stats = null;
+        self.stats_live = false;
+        self.fresh_user_turn = false;
+        self.turn_prompt_tokens = 0;
+        self.opts.progress = &self.progress; // stable heap address for the worker
         self.images_enabled = cfg.images_enabled;
 
         // Dynamic VRAM offload (GUI_VRAM.md): always arm the dynamic split (free
@@ -789,7 +879,12 @@ pub const Session = struct {
 
         self.mu.lockUncancelable(self.io);
         self.pending.clearRetainingCapacity();
+        // The transcript those footer numbers described is gone.
+        self.turn_stats = .{};
+        self.user_stats = null;
+        self.stats_live = false;
         self.mu.unlock(self.io);
+        self.progress.reset();
 
         self.ids.clearRetainingCapacity();
         self.ids.appendSlice(self.gpa, self.initial_ids.items) catch |err|
@@ -889,6 +984,11 @@ pub const Session = struct {
     /// prepareTurn reprefills all of `ids` (KV empty) and engine.generate
     /// continues that same response. No new turn is staged. (Tier 3.)
     pub fn continueOpenTurn(self: *Session) !void {
+        // Resuming an existing turn: its user message was measured before the
+        // unload, and this pass re-prefills the whole transcript — publishing
+        // that as the message's cost would overwrite the real figure with the
+        // reload's, and with no prompt size beside it (nothing is built here).
+        self.fresh_user_turn = false;
         try self.spawnWorker();
     }
 
@@ -936,6 +1036,10 @@ pub const Session = struct {
         // next turn boundary (a turn possibly generating right now keeps the
         // params it started with — no racing the worker's read of `opts`).
         self.pending_sampling = samplingParams(cfg);
+        // The per-reply token cap is staged the same way (the worker's decode
+        // loop reads `opts.max_new_tokens` for the whole turn). Resolved against
+        // the LIVE context ceiling, so "unlimited" tracks a context rebuild.
+        self.pending_max_new_tokens = resolveMaxNew(cfg.max_new_tokens, self.opts.max_context);
         // Checkpoint budget likewise (the worker reads it in takeCheckpoint).
         self.pending_budget = @as(u64, cfg.regen_cache_mb) << 20;
         // System prompt: for a render-driven (template) session, restage it so
@@ -1329,9 +1433,14 @@ pub const Session = struct {
         // updateSettings, and draw this turn's sampling seed so no two turns
         // replay the same RNG stream. Safe here (UI thread, no worker yet).
         self.opts.sampling = self.pending_sampling;
+        self.opts.max_new_tokens = self.pending_max_new_tokens;
         self.checkpoint_budget = self.pending_budget;
         self.adoptPendingSystemText();
         self.opts.seed = self.seeds.next();
+
+        // A new user message: this turn measures its prompt (a regenerate
+        // re-runs one that was already measured, and leaves its numbers alone).
+        self.fresh_user_turn = true;
 
         var um = try Message.init(self.gpa, .user);
         if (trimmed.len > 0) try um.active().text.appendSlice(self.gpa, trimmed);
@@ -1383,9 +1492,14 @@ pub const Session = struct {
         // changes and draw a fresh seed so the new variant never replays the
         // previous variant's RNG stream (SeedSeq is deliberately not reset).
         self.opts.sampling = self.pending_sampling;
+        self.opts.max_new_tokens = self.pending_max_new_tokens;
         self.checkpoint_budget = self.pending_budget;
         self.adoptPendingSystemText();
         self.opts.seed = self.seeds.next();
+
+        // The prompt is unchanged (and already measured on the user message);
+        // only the new take gets its own stats.
+        self.fresh_user_turn = false;
 
         // The new (empty) variant becomes the active one and streams like a
         // normal turn.
@@ -1515,6 +1629,13 @@ pub const Session = struct {
         }
         self.gen_err = null;
         self.suspended_midturn = false;
+        // Start this turn's footer telemetry from zero, so a live reply never
+        // shows the previous turn's totals before its own first token.
+        self.progress.reset();
+        self.mu.lockUncancelable(self.io);
+        self.turn_stats = .{};
+        self.stats_live = true;
+        self.mu.unlock(self.io);
         self.cancel.store(false, .release);
         self.generating.store(true, .release);
         self.worker = std.Thread.spawn(.{}, workerMain, .{self}) catch |err| {
@@ -1549,8 +1670,10 @@ pub const Session = struct {
         const t0 = std.Io.Clock.real.now(self.io).nanoseconds;
         // Detect an unload-while-paused suspend so we keep the turn OPEN below.
         var suspended = false;
+        var timing: engine.Timing = .{};
         var run_opts = self.opts;
         run_opts.suspended_out = &suspended;
+        run_opts.timing = &timing;
         switch (self.arch) {
             inline else => |*a| {
                 const n = engine.generate(&a.model, &self.tok, self.io, self.gpa, &self.ids, run_opts, &sink.iface) catch |err| n: {
@@ -1558,6 +1681,9 @@ pub const Session = struct {
                     std.log.err("generation failed: {t}", .{err});
                     break :n 0;
                 };
+                // The footer's authoritative numbers for this take, replacing the
+                // live `progress` counters `poll` has been showing.
+                self.publishGenStats(n, timing);
                 // End-of-response telemetry, mirroring the CLI's summary line —
                 // routed through std.log so it lands on the same channel the GUI
                 // already shows diffusion "gen:" progress on (dvui.App.logFn).
@@ -1569,8 +1695,13 @@ pub const Session = struct {
                 // offloads surface (context bound on this worker thread).
                 const res = residency.snapshot(&a.model);
                 var vbuf: [32]u8 = undefined;
+                // The DECODE rate, not tokens/elapsed: the latter charges this
+                // turn's forwarded prompt token and every first-touch device
+                // cost to generation, and now disagrees with the rate the
+                // message footer shows for the same turn.
+                const tg = timing.tgRate() orelse (if (dt > 0) @as(f64, @floatFromInt(n)) / dt else 0);
                 std.log.info("[llm] {d} tok, {d:.1} tok/s, ctx {d}/{d}{s}, {d}/{d} layers on host, {d} MiB free", .{
-                    n, if (dt > 0) @as(f64, @floatFromInt(n)) / dt else 0, st.tokens, st.window, st.vramSuffix(&vbuf),
+                    n, tg, st.tokens, st.window, st.vramSuffix(&vbuf),
                     res.n_cpu, res.n_layers, res.free_mib,
                 });
             },
@@ -1667,12 +1798,76 @@ pub const Session = struct {
             },
         }
         const prefilled = self.ctxTokens() -| cached_before;
+        self.publishPromptStats(prefilled, @intCast(std.Io.Clock.real.now(self.io).nanoseconds - t0));
         if (prefilled > 0) {
             const dt = @as(f64, @floatFromInt(std.Io.Clock.real.now(self.io).nanoseconds - t0)) / 1e9;
             std.log.info("[llm] prefill done: {d} tok in {d:.2}s ({d:.0} tok/s) · ctx now {d} tok", .{
                 prefilled, dt, if (dt > 0) @as(f64, @floatFromInt(prefilled)) / dt else 0, self.ctxTokens(),
             });
         }
+    }
+
+    /// The context window as the footer reports it: how many rows the KV cache
+    /// has COMMITTED (it starts at 4096 and grows lazily) and the session's
+    /// ceiling. Two different numbers, and the gap is the point — a chat sitting
+    /// at 3.9k/4k tokens is nowhere near its 128k limit, it is one token from
+    /// the next growth step.
+    fn ctxCaps(self: *Session) struct { cap: usize, max: usize } {
+        return switch (self.arch) {
+            inline else => |*a| .{
+                .cap = a.model.cached() + a.model.remaining(),
+                .max = if (comptime @hasDecl(@TypeOf(a.model), "capacityMax"))
+                    a.model.capacityMax()
+                else
+                    self.opts.max_context,
+            },
+        };
+    }
+
+    /// Publish the turn's prompt half for the message footers (worker thread,
+    /// end of `prepareTurn`). The assistant's copy carries the context BASE —
+    /// `poll` adds the tokens generated since — and its generation half is
+    /// overwritten with the authoritative numbers when the turn ends. The user
+    /// message's copy is published only for a fresh turn (see `user_stats`).
+    fn publishPromptStats(self: *Session, prefilled: usize, prefill_ns: u64) void {
+        const caps = self.ctxCaps();
+        const s: TurnStats = .{
+            .prompt_tokens = self.turn_prompt_tokens,
+            .prefill_tokens = prefilled,
+            .prefill_ns = prefill_ns,
+            .ctx_tokens = self.ctxTokens(),
+            .ctx_cap = caps.cap,
+            .ctx_max = caps.max,
+        };
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        self.turn_stats = s;
+        if (self.fresh_user_turn) self.user_stats = s;
+        self.turn_prompt_tokens = 0;
+        // Repaint now rather than at the first token: a long prompt's numbers
+        // are exactly what a user staring at a stalled-looking bubble wants.
+        self.wake();
+    }
+
+    /// Publish the turn's generation half once `generate` has returned (worker
+    /// thread): the authoritative token count and split, replacing whatever the
+    /// live `progress` counters last showed.
+    fn publishGenStats(self: *Session, n: usize, t: engine.Timing) void {
+        const caps = self.ctxCaps();
+        const ctx = self.ctxTokens();
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        self.turn_stats.gen_tokens = n;
+        self.turn_stats.decode_tokens = t.decode_tokens;
+        self.turn_stats.decode_ns = t.decode_ns;
+        // `t.prefill_*` is deliberately NOT folded in. `prepareTurn` prefills
+        // everything but the last prompt token, so what `generate` prefills is
+        // that ONE token — a decode-shaped forward, not prompt processing.
+        // Folding it in would report "prefill 33 tok/s" for a regenerate whose
+        // prompt was entirely cached, which describes nothing.
+        self.turn_stats.ctx_tokens = ctx;
+        self.turn_stats.ctx_cap = caps.cap;
+        self.turn_stats.ctx_max = caps.max;
     }
 
     /// Longest common prefix length of two id sequences.
@@ -1804,11 +1999,20 @@ pub const Session = struct {
         else
             try self.template.?.renderIds(&self.tok, self.gpa, ropts, &desired);
 
+        // What this turn's user message costs the prompt, for its footer.
+        self.turn_prompt_tokens = self.measureTurnPrompt(ropts, msgs.items, exp, grids.items, desired.items.len);
+
         if (getenv("TP_DUMP_CTX") != null) {
             const dbg = self.tok.decodeAlloc(self.gpa, desired.items) catch "";
             defer if (dbg.len > 0) self.gpa.free(dbg);
             std.log.info("[tmpl] rendered prompt ({d} tok):\n{s}\n[tmpl] end", .{ desired.items.len, dbg });
         }
+        // Does this render leave the reasoning block OPEN? A model's own template
+        // primes `…assistant\n<think>\n` when thinking is on (and the CLOSED
+        // `<think>\n\n</think>` when it is off), so the answer differs per template
+        // AND per setting — hence measured from the render, never assumed. Only the
+        // tail is scanned so an earlier turn quoting `</think>` cannot decide it.
+        self.recordThoughtPrimed(desired.items);
         switch (self.arch) {
             inline else => |*a| try self.reconcile(&a.model, desired.items),
         }
@@ -1837,6 +2041,73 @@ pub const Session = struct {
                 },
             }
         }
+    }
+
+    /// How many prompt tokens this turn's user message contributes: render the
+    /// same transcript with that message EMPTIED (no text, no image parts) and
+    /// diff against the full render's `full_len`. So it counts the message's own
+    /// content — its text and its image pad rows — but not the per-turn wrapper
+    /// the template pays for any message at all.
+    ///
+    /// A second render rather than arithmetic on the first, because the template
+    /// is opaque: it owns the image-placeholder expansion and any
+    /// content-dependent branch. Subtracting "the previous prompt's length"
+    /// instead would be wrong by the previous reply's thought, which this turn's
+    /// render strips.
+    ///
+    /// ⚠️ **Emptied, not removed**, and that is not a stylistic choice: a real
+    /// chat template can REFUSE to render a transcript with the last user turn
+    /// dropped. Qwen3.5's raises `No user query found in messages` — so on the
+    /// first turn, where removing it leaves only the system message, the obvious
+    /// version of this measurement fails on exactly the turn a user is most
+    /// likely to be looking at. Emptying keeps the message list legal on every
+    /// turn and keeps ONE definition for all of them.
+    ///
+    /// Cost is a render + tokenize with no forward pass — small next to the
+    /// prefill it labels — and it is skipped for a regenerate, whose prompt is
+    /// already measured. Returns 0 (the footer omits the figure) if anything
+    /// fails: a measurement must never be able to kill the turn it measures.
+    fn measureTurnPrompt(
+        self: *Session,
+        ropts: chat_template.RenderOpts,
+        msgs: []const chat_template.Message,
+        exp: ?chat_template.ImageExpand,
+        grids: []const chat_template.Grid,
+        full_len: usize,
+    ) usize {
+        if (!self.fresh_user_turn) return 0;
+        if (msgs.len < 2 or msgs[msgs.len - 1].role != .user) return 0;
+        // Grids are collected in message order, so this turn's are the tail —
+        // and they leave with the message they belong to.
+        const n = self.messages.items.len;
+        const cur = if (n >= 2 and self.messages.items[n - 2].role == .user)
+            self.messages.items[n - 2].image_grids.items.len
+        else
+            0;
+        if (cur > grids.len) return 0;
+        const base_grids = grids[0 .. grids.len - cur];
+
+        const stripped = self.gpa.dupe(chat_template.Message, msgs) catch return 0;
+        defer self.gpa.free(stripped);
+        stripped[stripped.len - 1] = .{ .role = .user, .content = "" };
+
+        var base: std.ArrayList(u32) = .empty;
+        defer base.deinit(self.gpa);
+        var rows: std.ArrayList(usize) = .empty;
+        defer rows.deinit(self.gpa);
+        var bopts = ropts;
+        bopts.messages = stripped;
+        if (exp != null and base_grids.len > 0)
+            self.template.?.renderIdsMM(&self.tok, self.gpa, bopts, exp.?, base_grids, &base, &rows) catch |err| {
+                std.log.warn("[stats] empty-turn render failed ({t}); this message's size is unavailable", .{err});
+                return 0;
+            }
+        else
+            self.template.?.renderIds(&self.tok, self.gpa, bopts, &base) catch |err| {
+                std.log.warn("[stats] empty-turn render failed ({t}); this message's size is unavailable", .{err});
+                return 0;
+            };
+        return full_len -| base.items.len;
     }
 
     /// Prefill `ids[from..to)`, splicing each current-turn image's embeds in at
@@ -1902,9 +2173,16 @@ pub const Session = struct {
         if (self.template != null) {
             // Render-driven path — handles text AND image turns (encodes this
             // turn's images, expands the template's image placeholders to the
-            // real pad-row block, and splices embeds in during prefill).
+            // real pad-row block, and splices embeds in during prefill). It
+            // measures its own prompt contribution (the render is wholesale).
             try self.buildRenderedTurn();
-        } else if (self.turn_images.items.len > 0 and self.hasVit()) {
+            return;
+        }
+        // Hand-glue paths APPEND this turn to `ids`, so the growth is exactly
+        // what the user message contributed (wrapper and image rows included).
+        const ids_before = self.ids.items.len;
+        defer self.turn_prompt_tokens = self.ids.items.len -| ids_before;
+        if (self.turn_images.items.len > 0 and self.hasVit()) {
             // Legacy hand-glue image path (no embedded template). Image tokens
             // must run on the GPU (host path uses scalar RoPE, wrong for M-RoPE);
             // promote CPU-offloaded layers back first.
@@ -2064,7 +2342,20 @@ pub const Session = struct {
             last.active().text.appendSlice(self.gpa, self.pending.items) catch {};
             self.pending.clearRetainingCapacity();
         }
+        // Take this frame's footer telemetry (see `TurnStats`). `busy` is read
+        // under the same lock as the publication it pairs with: the worker's
+        // final publish lands BEFORE it clears `generating`, so a frame that
+        // sees the turn finished also sees its authoritative numbers.
+        const live = self.stats_live;
+        const base = self.turn_stats;
+        const user = self.user_stats;
+        self.user_stats = null;
+        const generating = self.busy();
+        if (live and !generating) self.stats_live = false;
         self.mu.unlock(self.io);
+
+        if (user) |u| self.applyUserStats(u);
+        if (live) self.applyTurnStats(base, generating);
 
         if (self.worker) |t| {
             if (!self.busy()) {
@@ -2072,6 +2363,42 @@ pub const Session = struct {
                 self.worker = null;
             }
         }
+    }
+
+    /// Fold the prompt half into the user message this turn was built from —
+    /// the one before the in-flight assistant slot. UI thread (`poll`), which
+    /// is the only thread allowed to touch `messages`.
+    fn applyUserStats(self: *Session, s: TurnStats) void {
+        const n = self.messages.items.len;
+        if (n < 2) return;
+        const um = &self.messages.items[n - 2];
+        if (um.role != .user) return;
+        um.active().stats = s;
+    }
+
+    /// Fold the turn's stats into the streaming (or just-finished) assistant
+    /// variant. While `generating`, the generation half comes from the engine's
+    /// live counters instead of the published (still empty) one. UI thread.
+    fn applyTurnStats(self: *Session, base: TurnStats, generating: bool) void {
+        if (self.messages.items.len == 0) return;
+        const last = &self.messages.items[self.messages.items.len - 1];
+        if (last.role != .assistant) return;
+        var s = base;
+        if (generating) {
+            const p = self.progress.snapshot();
+            s.gen_tokens = p.emitted;
+            s.decode_tokens = p.timing.decode_tokens;
+            s.decode_ns = p.timing.decode_ns;
+            // `base.ctx_tokens` is the context at generation start (the last
+            // prompt token is still uncommitted — `generate` forwards it), so
+            // this trails the truth by one token until the final publish.
+            s.ctx_tokens = base.ctx_tokens + p.emitted;
+        }
+        // The committed capacity grows DURING a long reply (ensureCapacity), and
+        // the value published at prefill time is the one before that growth —
+        // clamp so the readout can never show more tokens than cap.
+        s.ctx_cap = @max(s.ctx_cap, s.ctx_tokens);
+        last.active().stats = s;
     }
 
     /// Once a turn completes, scan the last assistant message's ACTIVE variant
@@ -2096,6 +2423,23 @@ pub const Session = struct {
         return .{ .open = r.open, .close = r.close };
     }
 
+    /// Record on the in-flight assistant variant whether `prompt` ends inside an
+    /// open reasoning block, so the display and the tool-call scanner know the
+    /// generated text starts *inside* the thought (see `toolcall.splitThought`).
+    ///
+    /// Only the last few tokens are decoded: the generation prompt's block marker
+    /// sits at the very end, and scanning the whole transcript would let an earlier
+    /// turn that quoted `</think>` flip the answer.
+    fn recordThoughtPrimed(self: *Session, prompt: []const u32) void {
+        const n = self.messages.items.len;
+        if (n == 0 or self.messages.items[n - 1].role != .assistant) return;
+        const tail_n = @min(prompt.len, 16);
+        const tail = self.tok.decodeAlloc(self.gpa, prompt[prompt.len - tail_n ..]) catch return;
+        defer self.gpa.free(tail);
+        self.messages.items[n - 1].active().thought_primed =
+            toolcall.endsInsideThought(tail, reasoningMarkers());
+    }
+
     /// Extract `<image ...>PROMPT</image>` tool calls from a finished assistant
     /// variant and queue a GenImage (status .pending) for each. Optional tag
     /// attributes (width/height/steps/seed) override the engine defaults.
@@ -2103,7 +2447,7 @@ pub const Session = struct {
         // Scan only the answer, not the reasoning block, and only line-anchored
         // tags — see toolcall.answerText/nextImageCall for why (spurious fires
         // from the model merely *mentioning* the tag while thinking/explaining).
-        var rest = toolcall.answerText(v.text.items, reasoningMarkers());
+        var rest = toolcall.answerText(v.text.items, reasoningMarkers(), v.thought_primed);
         while (true) {
             const c = switch (toolcall.nextImageCall(rest)) {
                 .none, .partial => break,
@@ -2137,6 +2481,19 @@ pub const Session = struct {
 };
 
 // ── Tests (pure, CPU-only; run via `zig build gui-test`) ─────────────────────
+
+test "resolveMaxNew: 0 means the context ceiling, any other value passes through" {
+    // 0 = "no explicit cap" resolves to the context ceiling — the exact upper
+    // bound on one turn's output, and never a sentinel that could overflow
+    // engine.capacityPlanFor's `prompt_len + max_new_tokens`.
+    try std.testing.expectEqual(@as(usize, 32768), resolveMaxNew(0, 32768));
+    // A set cap is used verbatim, including one ABOVE the context (the engine
+    // stops on ContextFull first, so this must not be silently clamped here —
+    // clamping would make "unlimited" and "larger than context" differ).
+    try std.testing.expectEqual(@as(usize, 2048), resolveMaxNew(2048, 32768));
+    try std.testing.expectEqual(@as(usize, 99999), resolveMaxNew(99999, 4096));
+    try std.testing.expectEqual(@as(usize, 1), resolveMaxNew(1, 4096));
+}
 
 test "navTarget: carousel semantics for the back/next buttons" {
     // Single variant: back does nothing (the UI disables it), next regenerates.

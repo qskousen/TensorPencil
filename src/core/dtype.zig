@@ -40,6 +40,35 @@ pub const DType = enum {
     q5_k, // 256 elems / 176 B: q4_k + 32 B high bits
     q6_k, // 256 elems / 210 B: 128 B low nibbles + 64 B high 2-bits + 16 x i8 scales + f16 d
     iq4_nl, // 32 elems / 18 B: f16 d + 16 B nibbles; v = d * kvalues_iq4nl[nibble] (non-linear LUT)
+    /// 128 elems / 18 B: f16 d + 16 B of sign bits; v = bit ? d : -d. One bit per
+    /// weight (1.125 bpw including the scale) — the *sign* of the weight times the
+    /// block's mean absolute value. Note the two ways this differs from every other
+    /// block quant here: it cannot represent zero, and its 128-element block is
+    /// neither 32 nor 256, so anything that hardcoded those two sizes is wrong for it.
+    q1_0,
+    /// ⚠️ **GGUF type id 42 is AMBIGUOUS, which is why there are two arms here.**
+    /// Two shipped formats claim it with *identical* arithmetic
+    /// (`v = (code - 1) * d`, 2-bit codes packed LSB-first, 4 per byte, so the
+    /// set is {-1, 0, +1, +2} * d) and *different* block sizes:
+    ///
+    /// - `q2_0_g64`  — upstream ggml `GGML_TYPE_Q2_0`, `QK2_0 = 64`:  64 elems / 18 B
+    /// - `q2_0_g128` — PrismML llama.cpp fork (`prism` branch), `QK2_0 = 128`:
+    ///   128 elems / 34 B. Every published Bonsai / "Ternary" GGUF is this one;
+    ///   the model cards advertise it as "Q2_0 g128".
+    ///
+    /// **Nothing inside a GGUF distinguishes them** — not the type id, not the
+    /// file_type KV — only the on-disk row byte size does, and they differ by
+    /// just 17/18. `gguf.detectQ2_0Variant` resolves it from file geometry;
+    /// never assume one from the type id alone. Decoding with the wrong arm is
+    /// silent: it yields plausible-magnitude garbage, not an error.
+    ///
+    /// Note the ASYMMETRY in both: unlike q1_0 (and unlike ggml's *ternary*
+    /// tq1_0/tq2_0, which these share no layout with) the representable set is
+    /// not centred on zero — +2d is reachable and -2d is not.
+    q2_0_g64,
+    /// The 128-element variant of the above. 2.125 bpw including the scale.
+    /// Decoded natively rather than by ggml — see `quants.dequantQ2_0G128`.
+    q2_0_g128,
 
     const name_table = .{
         .{ "F8_E4M3", DType.f8_e4m3 },
@@ -95,6 +124,9 @@ pub const DType = enum {
             .q5_k => .{ .byte_size = null, .bit_size = null, .block_elems = 256, .block_bytes = 176 },
             .q6_k => .{ .byte_size = null, .bit_size = null, .block_elems = 256, .block_bytes = 210 },
             .iq4_nl => .{ .byte_size = null, .bit_size = null, .block_elems = 32, .block_bytes = 18 },
+            .q1_0 => .{ .byte_size = null, .bit_size = null, .block_elems = 128, .block_bytes = 18 },
+            .q2_0_g64 => .{ .byte_size = null, .bit_size = null, .block_elems = 64, .block_bytes = 18 },
+            .q2_0_g128 => .{ .byte_size = null, .bit_size = null, .block_elems = 128, .block_bytes = 34 },
         };
     }
 

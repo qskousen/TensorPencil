@@ -791,6 +791,714 @@ pub const gemv_q4_0_ptx: [:0]const u8 =
     \\}
 ;
 
+/// Per-bit body of `gemv_q1_0`: consume the LSB of the running quant register
+/// %r13, negate that element's activation when the bit is CLEAR, and accumulate.
+///
+/// The negate is PREDICATED rather than a selp of a precomputed `-x`, which
+/// halves the register pressure (no live negated copy per element) and lets the
+/// eight bodies share one accumulator chain. The activations arrive in %f4..%f11
+/// from two v4 loads, so `k` indexes those directly.
+fn q1BitStep(comptime k: u32) []const u8 {
+    return std.fmt.comptimePrint(
+        \\  and.b32 %r14,%r13,1; setp.eq.u32 %p2,%r14,0; @%p2 neg.f32 %f{d},%f{d};
+        \\  add.f32 %f12,%f12,%f{d}; shr.u32 %r13,%r13,1;
+        \\
+    , .{ 4 + k, 4 + k, 4 + k });
+}
+
+fn q1BitSteps() []const u8 {
+    comptime {
+        var s: []const u8 = "";
+        var k: u32 = 0;
+        while (k < 8) : (k += 1) s = s ++ q1BitStep(k);
+        return s;
+    }
+}
+
+/// ggml q1_0 GEMV, warp-per-row (8 rows per 256-thread block, warp-shuffle
+/// reduction, no shared memory / bar.sync — the gemv_iq4_nl/q5_k/q6_k shape):
+/// y[row] = scale * dot(W[row], x), W q1_0 [rows][cols/128 blocks of 18 B:
+/// f16 d + 16 bytes of sign bits].
+///
+/// Iterates the 16 qs BYTES per block, and one byte is EIGHT elements — bit b
+/// of byte g is element g*8 + b, value `bit ? d : -d`. So each weight byte is
+/// read once and drives eight elements' work, which is why the eight signed
+/// activations are summed FIRST and multiplied by `d` once: 8 adds + 1 fma
+/// instead of 8 fmas, at no accuracy cost worth naming because every element of
+/// a block shares one magnitude.
+///
+/// ⚠️ Warp-per-row is not a stylistic choice here, it is the difference between
+/// 28 and 55 tok/s on Bonsai-27B. The block-per-row form this started as spends
+/// 8 rounds of `bar.sync` reducing 256 partials per row while each thread has
+/// only `cols/8/256` = 2.5 bytes of weight to consume at cols=5120 — the
+/// reduction costs more than the dot product. q1_0 is the format most exposed to
+/// this, because one bit per weight means the least work per row of any quant.
+///
+/// ⚠️ The arithmetic intensity is also inverted relative to every other quant
+/// here: one byte of weight pulls 32 bytes of activation, so a row reads 8x LESS
+/// weight and the SAME activation as q8_0. It stays DRAM-bound overall only
+/// because x is shared by every row and lives in cache — a variant that re-read
+/// x from global per row would be activation-bound instead.
+///
+/// The 8 activations are contiguous from element g*8, so their byte offset is a
+/// multiple of 32 and two `ld.global.v4.f32` are legal (16-byte aligned).
+/// cols % 128 == 0. b0=W, b1=x, b2=y. u0=rows, u1=cols, f0=scale.
+pub const gemv_q1_0_ptx: [:0]const u8 = q1_0_head ++ q1BitSteps() ++ q1_0_tail;
+
+const q1_0_head =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry gemv_q1_0(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<4>;
+    \\  .reg .b16 %h<2>;
+    \\  .reg .b32 %r<24>;
+    \\  .reg .f32 %f<16>;
+    \\  .reg .b64 %rd<20>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r3,%tid.x;
+    \\  shr.u32 %r5,%r3,5;                     // warp
+    \\  and.b32 %r6,%r3,31;                    // lane
+    \\  shl.b32 %r20,%r1,3; add.u32 %r19,%r20,%r5;         // row = ctaid*8 + warp
+    \\  ld.param.u32 %r2,[u0]; setp.ge.u32 %p1,%r19,%r2; @%p1 bra END;
+    \\  ld.param.u32 %r4,[u1];                 // cols
+    \\  ld.param.f32 %f1,[f0];                 // scale
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
+    \\  shr.u32 %r21,%r4,7; mul.lo.u32 %r22,%r21,18;       // row bytes = cols/128*18
+    \\  mul.wide.u32 %rd7,%r19,%r22; add.s64 %rd8,%rd1,%rd7; // W row base
+    \\  mov.f32 %f3,0f00000000;                // acc
+    \\  shr.u32 %r7,%r4,3;                     // nbytes = cols/8
+    \\  mov.u32 %r8,%r6;                       // g = lane
+    \\LOOP:
+    \\  setp.ge.u32 %p2,%r8,%r7; @%p2 bra RED;
+    \\  shr.u32 %r9,%r8,4;                     // block b = g/16
+    \\  mul.lo.u32 %r10,%r9,18; cvt.u64.u32 %rd9,%r10; add.s64 %rd10,%rd8,%rd9;  // &block
+    \\  ld.global.b16 %h0,[%rd10]; cvt.f32.f16 %f2,%h0;    // d
+    \\  and.b32 %r11,%r8,15;                   // jj (qs byte within block)
+    \\  cvt.u64.u32 %rd11,%r11; add.s64 %rd12,%rd10,%rd11; ld.global.u8 %r13,[%rd12+2];
+    \\  shl.b32 %r12,%r8,3;                    // e0 = g*8
+    \\  mul.wide.u32 %rd13,%r12,4; add.s64 %rd14,%rd2,%rd13;
+    \\  ld.global.v4.f32 {%f4,%f5,%f6,%f7},[%rd14];
+    \\  ld.global.v4.f32 {%f8,%f9,%f10,%f11},[%rd14+16];
+    \\  mov.f32 %f12,0f00000000;               // sum of the 8 signed activations
+    \\
+;
+
+const q1_0_tail =
+    \\  fma.rn.f32 %f3,%f12,%f2,%f3;           // acc += d * sum
+    \\  add.u32 %r8,%r8,32; bra LOOP;
+    \\RED:
+    \\  mov.b32 %r22,%f3; shfl.sync.bfly.b32 %r23,%r22,16,0x1f,0xffffffff; mov.b32 %f13,%r23; add.f32 %f3,%f3,%f13;
+    \\  mov.b32 %r22,%f3; shfl.sync.bfly.b32 %r23,%r22,8,0x1f,0xffffffff;  mov.b32 %f13,%r23; add.f32 %f3,%f3,%f13;
+    \\  mov.b32 %r22,%f3; shfl.sync.bfly.b32 %r23,%r22,4,0x1f,0xffffffff;  mov.b32 %f13,%r23; add.f32 %f3,%f3,%f13;
+    \\  mov.b32 %r22,%f3; shfl.sync.bfly.b32 %r23,%r22,2,0x1f,0xffffffff;  mov.b32 %f13,%r23; add.f32 %f3,%f3,%f13;
+    \\  mov.b32 %r22,%f3; shfl.sync.bfly.b32 %r23,%r22,1,0x1f,0xffffffff;  mov.b32 %f13,%r23; add.f32 %f3,%f3,%f13;
+    \\  setp.ne.u32 %p3,%r6,0; @%p3 bra END;
+    \\  mul.f32 %f3,%f3,%f1;
+    \\  mul.wide.u32 %rd17,%r19,4; add.s64 %rd18,%rd3,%rd17; st.global.f32 [%rd18],%f3;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// The two q2_0 block geometries sharing GGUF type id 42 (see `DType.q2_0_g64`).
+/// Every q2_0 kernel below is generated from this, so the pair can never drift:
+/// the arithmetic is identical and only the stride from one scale to the next
+/// moves. `qk` elements per block, `2 + qk/4` bytes (f16 scale + 2 bits each).
+pub const Q2Geom = struct {
+    qk: u32,
+    /// Suffix on the PTX entry name, so both variants can be loaded at once.
+    tag: []const u8,
+
+    fn blockBytes(g: Q2Geom) u32 {
+        return 2 + g.qk / 4;
+    }
+    /// 32-element q8 activation chunks spanned by one weight block.
+    fn chunks(g: Q2Geom) u32 {
+        return g.qk / 32;
+    }
+};
+
+pub const q2_g64: Q2Geom = .{ .qk = 64, .tag = "g64" };
+pub const q2_g128: Q2Geom = .{ .qk = 128, .tag = "g128" };
+
+/// Per-code body of `gemv_q2_0_*`: consume the low 2 bits of the running quant
+/// register %r13 as a code in {0,1,2,3}, weight that element's activation by
+/// `code - 1` in {-1,0,1,2}, and accumulate.
+///
+/// Unlike q1_0's sign bit this cannot be a predicated negate, so it is an integer
+/// subtract, a convert and an fma. The multiplier is still an exact small integer,
+/// which is what lets the four products be summed BEFORE the single multiply by
+/// `d` below with no accuracy cost at all — every term is exact in f32.
+fn q2CodeStep(comptime k: u32) []const u8 {
+    return std.fmt.comptimePrint(
+        \\  and.b32 %r14,%r13,3; sub.s32 %r15,%r14,1; cvt.rn.f32.s32 %f13,%r15;
+        \\  fma.rn.f32 %f12,%f13,%f{d},%f12; shr.u32 %r13,%r13,2;
+        \\
+    , .{4 + k});
+}
+
+fn q2CodeSteps() []const u8 {
+    comptime {
+        var s: []const u8 = "";
+        var k: u32 = 0;
+        while (k < 4) : (k += 1) s = s ++ q2CodeStep(k);
+        return s;
+    }
+}
+
+/// q2_0 (g128) GEMV, warp-per-row (8 rows per 256-thread block, warp-shuffle
+/// reduction, no shared memory / bar.sync — the gemv_q1_0/iq4_nl/q5_k shape):
+/// y[row] = scale * dot(W[row], x), W q2_0_g128 [rows][cols/128 blocks of 34 B:
+/// f16 d + 32 bytes of 2-bit codes].
+///
+/// ⚠️ **g128 only** (see `DType.q2_0_g128`). GGUF type id 42 is also claimed by
+/// ggml's 64-element Q2_0, for which this 34-byte stride is wrong; that dtype is
+/// refused at load rather than routed here.
+///
+/// Iterates the 32 qs BYTES per block, and one byte is FOUR elements — code c of
+/// byte g is element g*4 + c, value `(code - 1) * d`. Each weight byte is read
+/// once and drives four elements, so the four weighted activations are summed
+/// first and multiplied by `d` once: 4 fmas + 1 fma instead of 4 fmas against
+/// pre-scaled weights. That is exact here rather than merely cheap, because the
+/// multipliers are the integers {-1, 0, 1, 2}.
+///
+/// The 4 activations are contiguous from element g*4, so their byte offset is a
+/// multiple of 16 and one `ld.global.v4.f32` is legal.
+///
+/// Warp-per-row for the reason `gemv_q1_0` documents at length: at 2 bits per
+/// weight there is so little work per row that a block-per-row shared-memory
+/// reduction costs more than the dot product it reduces. q2_0 has twice q1_0's
+/// weight traffic and the same activation traffic, so it sits slightly further
+/// from that cliff, but on the same side of it.
+///
+/// cols % 128 == 0. b0=W, b1=x, b2=y. u0=rows, u1=cols, f0=scale.
+pub fn gemvQ2_0Ptx(comptime g: Q2Geom) [:0]const u8 {
+    return q2_0_head(g) ++ q2CodeSteps() ++ q2_0_tail;
+}
+pub const gemv_q2_0_g64_ptx = gemvQ2_0Ptx(q2_g64);
+pub const gemv_q2_0_g128_ptx = gemvQ2_0Ptx(q2_g128);
+
+fn q2_0_head(comptime g: Q2Geom) []const u8 {
+    return std.fmt.comptimePrint(
+        \\.version 8.0
+        \\.target sm_86
+        \\.address_size 64
+        \\.visible .entry gemv_q2_0_{[tag]s}(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+        \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+        \\{{
+        \\  .reg .pred %p<4>;
+        \\  .reg .b16 %h<2>;
+        \\  .reg .b32 %r<24>;
+        \\  .reg .f32 %f<16>;
+        \\  .reg .b64 %rd<20>;
+        \\  mov.u32 %r1,%ctaid.x; mov.u32 %r3,%tid.x;
+        \\  shr.u32 %r5,%r3,5;                     // warp
+        \\  and.b32 %r6,%r3,31;                    // lane
+        \\  shl.b32 %r20,%r1,3; add.u32 %r19,%r20,%r5;         // row = ctaid*8 + warp
+        \\  ld.param.u32 %r2,[u0]; setp.ge.u32 %p1,%r19,%r2; @%p1 bra END;
+        \\  ld.param.u32 %r4,[u1];                 // cols
+        \\  ld.param.f32 %f1,[f0];                 // scale
+        \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
+        \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
+        \\  shr.u32 %r21,%r4,{[qk_log]d}; mul.lo.u32 %r22,%r21,{[bb]d};   // row bytes = cols/qk*bb
+        \\  mul.wide.u32 %rd7,%r19,%r22; add.s64 %rd8,%rd1,%rd7; // W row base
+        \\  mov.f32 %f3,0f00000000;                // acc
+        \\  shr.u32 %r7,%r4,2;                     // nbytes = cols/4
+        \\  mov.u32 %r8,%r6;                       // g = lane
+        \\LOOP:
+        \\  setp.ge.u32 %p2,%r8,%r7; @%p2 bra RED;
+        \\  shr.u32 %r9,%r8,{[bpb_log]d};          // block b = g/(qk/4)
+        \\  mul.lo.u32 %r10,%r9,{[bb]d}; cvt.u64.u32 %rd9,%r10; add.s64 %rd10,%rd8,%rd9;  // &block
+        \\  ld.global.b16 %h0,[%rd10]; cvt.f32.f16 %f2,%h0;    // d
+        \\  and.b32 %r11,%r8,{[bpb_mask]d};        // jj (qs byte within block)
+        \\  cvt.u64.u32 %rd11,%r11; add.s64 %rd12,%rd10,%rd11; ld.global.u8 %r13,[%rd12+2];
+        \\  shl.b32 %r12,%r8,2;                    // e0 = g*4
+        \\  mul.wide.u32 %rd13,%r12,4; add.s64 %rd14,%rd2,%rd13;
+        \\  ld.global.v4.f32 {{%f4,%f5,%f6,%f7}},[%rd14];
+        \\  mov.f32 %f12,0f00000000;               // sum of the 4 weighted activations
+        \\
+    , .{
+        .tag = g.tag,
+        .bb = g.blockBytes(),
+        .qk_log = std.math.log2_int(u32, g.qk),
+        .bpb_log = std.math.log2_int(u32, g.qk / 4), // qs bytes per block
+        .bpb_mask = g.qk / 4 - 1,
+    });
+}
+
+const q2_0_tail =
+    \\  fma.rn.f32 %f3,%f12,%f2,%f3;           // acc += d * sum
+    \\  add.u32 %r8,%r8,32; bra LOOP;
+    \\RED:
+    \\  mov.b32 %r22,%f3; shfl.sync.bfly.b32 %r23,%r22,16,0x1f,0xffffffff; mov.b32 %f13,%r23; add.f32 %f3,%f3,%f13;
+    \\  mov.b32 %r22,%f3; shfl.sync.bfly.b32 %r23,%r22,8,0x1f,0xffffffff;  mov.b32 %f13,%r23; add.f32 %f3,%f3,%f13;
+    \\  mov.b32 %r22,%f3; shfl.sync.bfly.b32 %r23,%r22,4,0x1f,0xffffffff;  mov.b32 %f13,%r23; add.f32 %f3,%f3,%f13;
+    \\  mov.b32 %r22,%f3; shfl.sync.bfly.b32 %r23,%r22,2,0x1f,0xffffffff;  mov.b32 %f13,%r23; add.f32 %f3,%f3,%f13;
+    \\  mov.b32 %r22,%f3; shfl.sync.bfly.b32 %r23,%r22,1,0x1f,0xffffffff;  mov.b32 %f13,%r23; add.f32 %f3,%f3,%f13;
+    \\  setp.ne.u32 %p3,%r6,0; @%p3 bra END;
+    \\  mul.f32 %f3,%f3,%f1;
+    \\  mul.wide.u32 %rd17,%r19,4; add.s64 %rd18,%rd3,%rd17; st.global.f32 [%rd18],%f3;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// One 8-element step of `gemv_q2_0_*_q8`: turn the u16 weight word %r{src} into
+/// two dp4a operands of four SIGNED symbols each, and dot them against the two
+/// matching q8 activation words.
+///
+/// The whole unpack is `prmt` used as a lookup table. %r56 holds the four symbols
+/// `{-1, 0, +1, +2}` as bytes (0x020100FF), and a `prmt` selector is four NIBBLES
+/// each naming a source byte — so if the selector's nibbles are the 2-bit codes,
+/// one `prmt` maps four codes straight to their symbols with no arithmetic:
+///
+///   sel_even = q       & 0x33333333   -> nibbles c0 c2 c4 c6
+///   sel_odd  = (q>>2)  & 0x33333333   -> nibbles c1 c3 c5 c7
+///   qe = prmt(LUT, LUT, sel_even)     -> symbol bytes of the even codes
+///   qo = prmt(LUT, LUT, sel_odd)      -> symbol bytes of the odd codes
+///   qx = prmt(qe, qo, 0x5140)         -> back to element order c0 c1 c2 c3
+///   qy = prmt(qe, qo, 0x7362)         ->                       c4 c5 c6 c7
+///
+/// ⚠️ **The `0x33333333` mask is load-bearing, not tidiness.** `prmt` reads bit 3
+/// of each selector nibble as SIGN-REPLICATE — it emits 0x00/0xFF from the source
+/// byte's msb instead of the byte. Without the mask a nibble carries the NEXT
+/// code in its high 2 bits, so any code >= 2 sets bit 3 and silently corrupts its
+/// neighbour's symbol whenever that neighbour is also >= 2 (constantly, in a
+/// ternary model). This is the same trap recorded for `gemv_q1_0_q8`, where the
+/// symptom was a model running at full speed emitting one token forever.
+///
+/// Symbols come out SIGNED, so this needs no `sum(xq)` correction term — which is
+/// what lets the kernel skip the `s` region entirely: 9 ops per 8 elements and one
+/// fewer global load per chunk than the unsigned-code form this replaced.
+/// `t` is the base of a 6-register scratch block, and `sumi` the accumulator, so
+/// two rows can be interleaved without false dependencies through shared temps.
+/// Constants live at %r55 (selector mask), %r56 (symbol LUT), %r57/%r58 (unshuffle).
+fn q2Dp4aWord(comptime src: u32, comptime act0: u32, comptime act1: u32, comptime sumi: u32, comptime t: u32) []const u8 {
+    return std.fmt.comptimePrint(
+        \\  and.b32 %r{[t0]d},%r{[src]d},%r55;                       // nibbles = even codes
+        \\  shr.u32 %r{[t1]d},%r{[src]d},2; and.b32 %r{[t1]d},%r{[t1]d},%r55;  // nibbles = odd codes
+        \\  prmt.b32 %r{[t2]d},%r56,%r56,%r{[t0]d};                  // even symbols
+        \\  prmt.b32 %r{[t3]d},%r56,%r56,%r{[t1]d};                  // odd symbols
+        \\  prmt.b32 %r{[t4]d},%r{[t2]d},%r{[t3]d},%r57;             // elements 0..3
+        \\  prmt.b32 %r{[t5]d},%r{[t2]d},%r{[t3]d},%r58;             // elements 4..7
+        \\  dp4a.s32.s32 %r{[s]d},%r{[t4]d},%r{[a0]d},%r{[s]d};
+        \\  dp4a.s32.s32 %r{[s]d},%r{[t5]d},%r{[a1]d},%r{[s]d};
+        \\
+    , .{
+        .src = src,
+        .a0 = act0,
+        .a1 = act1,
+        .s = sumi,
+        .t0 = t,
+        .t1 = t + 1,
+        .t2 = t + 2,
+        .t3 = t + 3,
+        .t4 = t + 4,
+        .t5 = t + 5,
+    });
+}
+
+/// Weight registers per row. Row A avoids %r15/%r16 (row-bytes, live above the
+/// loop); row B sits in the high block alongside its own temps.
+const q2_wregs_a = [4]u32{ 13, 14, 17, 18 };
+const q2_wregs_b = [4]u32{ 60, 61, 62, 63 };
+
+/// The four 8-element steps covering one 32-element q8 activation chunk for ONE
+/// row, against activation words %r20..%r27.
+fn q2Dp4aChunk() []const u8 {
+    comptime {
+        var s: []const u8 = "";
+        for (q2_wregs_a, 0..) |wr, w| s = s ++ q2Dp4aWord(wr, 20 + w * 2, 21 + w * 2, 51, 40);
+        return s;
+    }
+}
+
+/// Two rows against the SAME activation registers, interleaved word by word so
+/// the two dependency chains overlap. Separate temps and accumulators per row is
+/// what makes the interleave real rather than cosmetic.
+fn q2Dp4aChunkX2() []const u8 {
+    comptime {
+        var s: []const u8 = "";
+        for (0..4) |w| {
+            s = s ++ q2Dp4aWord(q2_wregs_a[w], 20 + w * 2, 21 + w * 2, 51, 40);
+            s = s ++ q2Dp4aWord(q2_wregs_b[w], 20 + w * 2, 21 + w * 2, 52, 64);
+        }
+        return s;
+    }
+}
+
+/// q2_0 GEMV against a `quantize_q8_1` activation (dp4a int8 dot) — the decode
+/// twin of `gemv_q1_0_q8`, and what makes q2_0 decode competitive: warp per row,
+/// 8 rows per 256-thread block, warp-shuffle reduction, no shared memory.
+///
+/// One lane handles one 32-element chunk per iteration: a whole q8 activation
+/// block, and 8 code bytes of a weight block (a HALF block at g64, a QUARTER at
+/// g128 — the only place the two geometries differ, and `Q2Geom` supplies it).
+/// Per chunk: four u16 weight loads (a q2_0 block is 18 or 34 bytes, so `qs` is
+/// only 2-byte aligned and a u32 load would be misaligned), eight u32 activation
+/// loads, 8 spreads and 8 `dp4a`.
+///
+/// ⚠️ NOT the same arithmetic as `gemv_q2_0_*`: the activation goes through int8
+/// here, so this is approximate where that kernel is f32-exact. Same tradeoff
+/// every other dp4a decode GEMV here already makes, and what llama.cpp computes.
+///
+/// b0=W(q2_0), b1=xq (SoA: f32 d[nblk] then i8 qs[cols]; the `s` region is not
+/// read), b2=y.
+/// u0=rows, u1=cols (% 256 == 0), u2=n tokens (grid.y), f0=scale.
+pub fn gemvQ2_0Q8Ptx(comptime g: Q2Geom) [:0]const u8 {
+    return q2_0_q8_head(g) ++ q2Dp4aChunk() ++ q2_0_q8_tail;
+}
+pub const gemv_q2_0_g64_q8_ptx = gemvQ2_0Q8Ptx(q2_g64);
+pub const gemv_q2_0_g128_q8_ptx = gemvQ2_0Q8Ptx(q2_g128);
+
+fn q2_0_q8_head(comptime g: Q2Geom) []const u8 {
+    return std.fmt.comptimePrint(
+        \\.version 8.0
+        \\.target sm_86
+        \\.address_size 64
+        \\.visible .entry gemv_q2_0_{[tag]s}_q8(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+        \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+        \\{{
+        \\  .reg .pred %p<4>;
+        \\  .reg .b16 %h<2>;
+        \\  .reg .b32 %r<60>;
+        \\  .reg .f32 %f<12>;
+        \\  .reg .b64 %rd<26>;
+        \\  mov.u32 %r1,%ctaid.x; mov.u32 %r3,%tid.x;
+        \\  shr.u32 %r5,%r3,5;                     // warp
+        \\  and.b32 %r6,%r3,31;                    // lane
+        \\  shl.b32 %r7,%r1,3; add.u32 %r7,%r7,%r5;            // row = ctaid*8 + warp
+        \\  ld.param.u32 %r2,[u0]; setp.ge.u32 %p1,%r7,%r2; @%p1 bra END;
+        \\  ld.param.u32 %r4,[u1];                 // cols
+        \\  ld.param.f32 %f1,[f0];                 // scale
+        \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
+        \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
+        \\  shr.u32 %r15,%r4,{[qk_log]d}; mul.lo.u32 %r16,%r15,{[bb]d};   // row bytes = cols/qk*bb
+        \\  mul.wide.u32 %rd7,%r7,%r16; add.s64 %rd8,%rd1,%rd7; // W row base
+        \\  // grid.y is the TOKEN; the q8 activation is one SoA block for all `n`
+        \\  // tokens: d[NBLK] | qs[n*cols], NBLK = n*cols/32 - the layout
+        \\  // gemv_q1_0_q8 reads. The trailing `s` region is not needed here.
+        \\  ld.param.u32 %r33,[u2];                // n (tokens)
+        \\  mov.u32 %r34,%ctaid.y;                 // t
+        \\  shr.u32 %r35,%r4,5;                    // q8 blocks per token = cols/32
+        \\  mul.lo.u32 %r44,%r33,%r35;             // NBLK
+        \\  shl.b32 %r36,%r44,2;                   // NBLK*4 (bytes of d)
+        \\  mad.lo.u32 %r36,%r34,%r4,%r36;                     // + t*cols
+        \\  cvt.u64.u32 %rd4,%r36; add.s64 %rd4,%rd2,%rd4;     // this token's qs
+        \\  mul.lo.u32 %r37,%r34,%r35; shl.b32 %r37,%r37,2;    // t*blocks*4
+        \\  cvt.u64.u32 %rd19,%r37; add.s64 %rd19,%rd2,%rd19;  // this token's d
+        \\  mov.f32 %f3,0f00000000;                // acc
+        \\  mov.u32 %r55,0x33333333;               // prmt selector mask (see q2Dp4aWord)
+        \\  mov.u32 %r56,0x020100FF;               // symbol LUT: code -> {{-1,0,1,2}}
+        \\  mov.u32 %r57,0x00005140;               // unshuffle: elements 0..3
+        \\  mov.u32 %r58,0x00007362;               // unshuffle: elements 4..7
+        \\  mov.u32 %r8,%r6;                       // chunk = lane
+        \\LOOP:
+        \\  setp.ge.u32 %p2,%r8,%r35; @%p2 bra RED;
+        \\  shr.u32 %r9,%r8,{[cpb_log]d};          // weight block b = chunk/(qk/32)
+        \\  and.b32 %r11,%r8,{[cpb_mask]d};        // chunk within block
+        \\  mul.lo.u32 %r10,%r9,{[bb]d}; cvt.u64.u32 %rd9,%r10; add.s64 %rd10,%rd8,%rd9;  // &block
+        \\  ld.global.b16 %h0,[%rd10]; cvt.f32.f16 %f2,%h0;    // d1
+        \\  shl.b32 %r12,%r11,3; cvt.u64.u32 %rd11,%r12; add.s64 %rd12,%rd10,%rd11;
+        \\  ld.global.u16 %r13,[%rd12+2]; ld.global.u16 %r14,[%rd12+4];
+        \\  ld.global.u16 %r17,[%rd12+6]; ld.global.u16 %r18,[%rd12+8];   // 32 codes
+        \\  mul.wide.u32 %rd13,%r8,4; add.s64 %rd14,%rd19,%rd13; ld.global.f32 %f4,[%rd14];  // d8
+        \\  shl.b32 %r19,%r8,5; cvt.u64.u32 %rd15,%r19; add.s64 %rd16,%rd4,%rd15;
+        \\  ld.global.v4.u32 {{%r20,%r21,%r22,%r23}},[%rd16];
+        \\  ld.global.v4.u32 {{%r24,%r25,%r26,%r27}},[%rd16+16];
+        \\  mov.u32 %r51,0;                        // sumi
+        \\
+    , .{
+        .tag = g.tag,
+        .bb = g.blockBytes(),
+        .qk_log = std.math.log2_int(u32, g.qk),
+        .cpb_log = std.math.log2_int(u32, g.chunks()),
+        .cpb_mask = g.chunks() - 1,
+    });
+}
+
+const q2_0_q8_tail =
+    \\  mul.f32 %f5,%f2,%f4;                   // d1 * d8
+    \\  cvt.rn.f32.s32 %f6,%r51;               // symbols are signed: no sum(xq) term
+    \\  fma.rn.f32 %f3,%f5,%f6,%f3;
+    \\  add.u32 %r8,%r8,32; bra LOOP;
+    \\RED:
+    \\  mov.b32 %r52,%f3; shfl.sync.bfly.b32 %r53,%r52,16,0x1f,0xffffffff; mov.b32 %f7,%r53; add.f32 %f3,%f3,%f7;
+    \\  mov.b32 %r52,%f3; shfl.sync.bfly.b32 %r53,%r52,8,0x1f,0xffffffff;  mov.b32 %f7,%r53; add.f32 %f3,%f3,%f7;
+    \\  mov.b32 %r52,%f3; shfl.sync.bfly.b32 %r53,%r52,4,0x1f,0xffffffff;  mov.b32 %f7,%r53; add.f32 %f3,%f3,%f7;
+    \\  mov.b32 %r52,%f3; shfl.sync.bfly.b32 %r53,%r52,2,0x1f,0xffffffff;  mov.b32 %f7,%r53; add.f32 %f3,%f3,%f7;
+    \\  mov.b32 %r52,%f3; shfl.sync.bfly.b32 %r53,%r52,1,0x1f,0xffffffff;  mov.b32 %f7,%r53; add.f32 %f3,%f3,%f7;
+    \\  setp.ne.u32 %p3,%r6,0; @%p3 bra END;
+    \\  mul.f32 %f3,%f3,%f1;
+    \\  mul.lo.u32 %r54,%r34,%r2; add.u32 %r54,%r54,%r7;   // t*rows + row
+    \\  mul.wide.u32 %rd17,%r54,4; add.s64 %rd18,%rd3,%rd17; st.global.f32 [%rd18],%f3;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// Two-row-per-warp variant of `gemv_q2_0_*_q8`: 16 rows per 256-thread block
+/// instead of 8, with both rows sharing ONE set of activation registers.
+///
+/// ⚠️ **Measured, and it is a trade, not a win** — see BACKEND.md. It halves the
+/// activation re-reads (the one-row kernel has every warp read the whole q8
+/// activation for its single row, so a GEMV's activation traffic is `rows * cols`
+/// bytes — several times the weight stream, all through L2), but it also halves
+/// the block count. `gemv_q2_0_*_q8` already reaches **100% occupancy** (38
+/// registers, 48 warps/SM), so there is no latency-hiding headroom to buy back,
+/// and on a narrow weight the halved grid stops filling the GPU: Bonsai's
+/// 5120-row weights drop from 640 blocks (1.3 waves over 82 SMs) to 320 (0.65) —
+/// less than one wave.
+///
+/// Selected by `TP_Q2_X2` so the two forms can be A/B'd from ONE binary; the
+/// default is off. Requires `rows % 16 == 0`.
+pub fn gemvQ2_0Q8X2Ptx(comptime g: Q2Geom) [:0]const u8 {
+    return q2_0_q8x2_head(g) ++ q2Dp4aChunkX2() ++ q2_0_q8x2_tail;
+}
+pub const gemv_q2_0_g64_q8x2_ptx = gemvQ2_0Q8X2Ptx(q2_g64);
+pub const gemv_q2_0_g128_q8x2_ptx = gemvQ2_0Q8X2Ptx(q2_g128);
+
+fn q2_0_q8x2_head(comptime g: Q2Geom) []const u8 {
+    return std.fmt.comptimePrint(
+        \\.version 8.0
+        \\.target sm_86
+        \\.address_size 64
+        \\.visible .entry gemv_q2_0_{[tag]s}_q8x2(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+        \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+        \\{{
+        \\  .reg .pred %p<4>;
+        \\  .reg .b16 %h<4>;
+        \\  .reg .b32 %r<80>;
+        \\  .reg .f32 %f<16>;
+        \\  .reg .b64 %rd<30>;
+        \\  mov.u32 %r1,%ctaid.x; mov.u32 %r3,%tid.x;
+        \\  shr.u32 %r5,%r3,5;                     // warp
+        \\  and.b32 %r6,%r3,31;                    // lane
+        \\  shl.b32 %r7,%r1,4; shl.b32 %r70,%r5,1; add.u32 %r7,%r7,%r70;  // row0 = ctaid*16 + warp*2
+        \\  ld.param.u32 %r2,[u0]; setp.ge.u32 %p1,%r7,%r2; @%p1 bra END;
+        \\  ld.param.u32 %r4,[u1];                 // cols
+        \\  ld.param.f32 %f1,[f0];                 // scale
+        \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
+        \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
+        \\  shr.u32 %r15,%r4,{[qk_log]d}; mul.lo.u32 %r16,%r15,{[bb]d};   // row bytes = cols/qk*bb
+        \\  mul.wide.u32 %rd7,%r7,%r16; add.s64 %rd8,%rd1,%rd7;  // row0 base
+        \\  cvt.u64.u32 %rd22,%r16; add.s64 %rd23,%rd8,%rd22;    // row1 base = row0 + row_bytes
+        \\  ld.param.u32 %r33,[u2];                // n (tokens)
+        \\  mov.u32 %r34,%ctaid.y;                 // t
+        \\  shr.u32 %r35,%r4,5;                    // q8 blocks per token = cols/32
+        \\  mul.lo.u32 %r44,%r33,%r35;             // NBLK
+        \\  shl.b32 %r36,%r44,2;                   // NBLK*4 (bytes of d)
+        \\  mad.lo.u32 %r36,%r34,%r4,%r36;                     // + t*cols
+        \\  cvt.u64.u32 %rd4,%r36; add.s64 %rd4,%rd2,%rd4;     // this token's qs
+        \\  mul.lo.u32 %r37,%r34,%r35; shl.b32 %r37,%r37,2;    // t*blocks*4
+        \\  cvt.u64.u32 %rd19,%r37; add.s64 %rd19,%rd2,%rd19;  // this token's d
+        \\  mov.f32 %f3,0f00000000;                // acc row0
+        \\  mov.f32 %f9,0f00000000;                // acc row1
+        \\  mov.u32 %r55,0x33333333;               // prmt selector mask (see q2Dp4aWord)
+        \\  mov.u32 %r56,0x020100FF;               // symbol LUT: code -> {{-1,0,1,2}}
+        \\  mov.u32 %r57,0x00005140;               // unshuffle: elements 0..3
+        \\  mov.u32 %r58,0x00007362;               // unshuffle: elements 4..7
+        \\  mov.u32 %r8,%r6;                       // chunk = lane
+        \\LOOP:
+        \\  setp.ge.u32 %p2,%r8,%r35; @%p2 bra RED;
+        \\  shr.u32 %r9,%r8,{[cpb_log]d};          // weight block b = chunk/(qk/32)
+        \\  and.b32 %r11,%r8,{[cpb_mask]d};        // chunk within block
+        \\  mul.lo.u32 %r10,%r9,{[bb]d}; cvt.u64.u32 %rd9,%r10;
+        \\  add.s64 %rd10,%rd8,%rd9; add.s64 %rd24,%rd23,%rd9;   // &block row0 / row1
+        \\  ld.global.b16 %h0,[%rd10]; cvt.f32.f16 %f2,%h0;      // d1 row0
+        \\  ld.global.b16 %h2,[%rd24]; cvt.f32.f16 %f10,%h2;     // d1 row1
+        \\  shl.b32 %r12,%r11,3; cvt.u64.u32 %rd11,%r12;
+        \\  add.s64 %rd12,%rd10,%rd11; add.s64 %rd25,%rd24,%rd11;
+        \\  ld.global.u16 %r13,[%rd12+2]; ld.global.u16 %r14,[%rd12+4];
+        \\  ld.global.u16 %r17,[%rd12+6]; ld.global.u16 %r18,[%rd12+8];   // 32 codes row0
+        \\  ld.global.u16 %r60,[%rd25+2]; ld.global.u16 %r61,[%rd25+4];
+        \\  ld.global.u16 %r62,[%rd25+6]; ld.global.u16 %r63,[%rd25+8];   // 32 codes row1
+        \\  mul.wide.u32 %rd13,%r8,4; add.s64 %rd14,%rd19,%rd13; ld.global.f32 %f4,[%rd14];  // d8
+        \\  shl.b32 %r19,%r8,5; cvt.u64.u32 %rd15,%r19; add.s64 %rd16,%rd4,%rd15;
+        \\  ld.global.v4.u32 {{%r20,%r21,%r22,%r23}},[%rd16];
+        \\  ld.global.v4.u32 {{%r24,%r25,%r26,%r27}},[%rd16+16];
+        \\  mov.u32 %r51,0; mov.u32 %r52,0;        // sumi row0 / row1
+        \\
+    , .{
+        .tag = g.tag,
+        .bb = g.blockBytes(),
+        .qk_log = std.math.log2_int(u32, g.qk),
+        .cpb_log = std.math.log2_int(u32, g.chunks()),
+        .cpb_mask = g.chunks() - 1,
+    });
+}
+
+const q2_0_q8x2_tail =
+    \\  mul.f32 %f5,%f2,%f4;                   // d1(row0) * d8
+    \\  cvt.rn.f32.s32 %f6,%r51; fma.rn.f32 %f3,%f5,%f6,%f3;
+    \\  mul.f32 %f11,%f10,%f4;                 // d1(row1) * d8
+    \\  cvt.rn.f32.s32 %f12,%r52; fma.rn.f32 %f9,%f11,%f12,%f9;
+    \\  add.u32 %r8,%r8,32; bra LOOP;
+    \\RED:
+    \\  mov.b32 %r71,%f3; shfl.sync.bfly.b32 %r72,%r71,16,0x1f,0xffffffff; mov.b32 %f7,%r72; add.f32 %f3,%f3,%f7;
+    \\  mov.b32 %r71,%f9; shfl.sync.bfly.b32 %r72,%r71,16,0x1f,0xffffffff; mov.b32 %f7,%r72; add.f32 %f9,%f9,%f7;
+    \\  mov.b32 %r71,%f3; shfl.sync.bfly.b32 %r72,%r71,8,0x1f,0xffffffff;  mov.b32 %f7,%r72; add.f32 %f3,%f3,%f7;
+    \\  mov.b32 %r71,%f9; shfl.sync.bfly.b32 %r72,%r71,8,0x1f,0xffffffff;  mov.b32 %f7,%r72; add.f32 %f9,%f9,%f7;
+    \\  mov.b32 %r71,%f3; shfl.sync.bfly.b32 %r72,%r71,4,0x1f,0xffffffff;  mov.b32 %f7,%r72; add.f32 %f3,%f3,%f7;
+    \\  mov.b32 %r71,%f9; shfl.sync.bfly.b32 %r72,%r71,4,0x1f,0xffffffff;  mov.b32 %f7,%r72; add.f32 %f9,%f9,%f7;
+    \\  mov.b32 %r71,%f3; shfl.sync.bfly.b32 %r72,%r71,2,0x1f,0xffffffff;  mov.b32 %f7,%r72; add.f32 %f3,%f3,%f7;
+    \\  mov.b32 %r71,%f9; shfl.sync.bfly.b32 %r72,%r71,2,0x1f,0xffffffff;  mov.b32 %f7,%r72; add.f32 %f9,%f9,%f7;
+    \\  mov.b32 %r71,%f3; shfl.sync.bfly.b32 %r72,%r71,1,0x1f,0xffffffff;  mov.b32 %f7,%r72; add.f32 %f3,%f3,%f7;
+    \\  mov.b32 %r71,%f9; shfl.sync.bfly.b32 %r72,%r71,1,0x1f,0xffffffff;  mov.b32 %f7,%r72; add.f32 %f9,%f9,%f7;
+    \\  setp.ne.u32 %p3,%r6,0; @%p3 bra END;
+    \\  mul.f32 %f3,%f3,%f1; mul.f32 %f9,%f9,%f1;
+    \\  mul.lo.u32 %r73,%r34,%r2; add.u32 %r73,%r73,%r7;   // t*rows + row0
+    \\  mul.wide.u32 %rd17,%r73,4; add.s64 %rd18,%rd3,%rd17;
+    \\  st.global.f32 [%rd18],%f3; st.global.f32 [%rd18+4],%f9;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// Unpack 16 q1_0 sign bits (the low u16 of %r{q}) into four u32 of four s8 ±1
+/// bytes, then dp4a them against activation words %r{u0}..%r{u0+3}, accumulating
+/// into %r51. Eight `prmt.b32` per 16 weights, no branches and no arithmetic.
+///
+/// `prmt` is used twice as a nibble-indexed byte LUT, which is what makes this
+/// cheap (the technique is PrismML's, from their llama.cpp fork's
+/// `unpack_q1_0_bytes`):
+///
+///   1. `prmt(0x11100100, ., q & 0x33333333)` — the four source bytes are
+///      {0x00,0x01,0x10,0x11}, so each 2 bits of `q` become one byte holding those
+///      bits as two NIBBLES. Run on `q` and `q >> 2` to spread all 16 bits.
+///      ⚠️ The mask is load-bearing: `prmt` reads bit 3 of each selector nibble as
+///      a SIGN-REPLICATE flag, not as part of the index, and every source byte
+///      here has its msb clear — so an unmasked nibble >= 8 silently yields 0x00
+///      and those two weights come out as -1,-1 regardless of their real signs.
+///      The symptom is a model that runs at full speed and emits one token
+///      forever, which is why the mask is verified by comparison against the CPU
+///      op rather than by reading the kernel.
+///   2. `prmt(0x01FF, ., n)` — source bytes {0xFF,0x01,0x00,0x00}, so each nibble
+///      (0 or 1) becomes 0xFF = -1 or 0x01 = +1 as s8.
+///
+/// The final two `prmt`s per half interleave the two spread streams back into
+/// ELEMENT order, so word k holds elements 4k..4k+3 — which is exactly the byte
+/// order dp4a needs against a q8 activation word covering the same elements.
+/// Getting that interleave wrong is not a crash, just a wrong dot product, so the
+/// order is pinned by `sd-cuda-test`-style comparison against the CPU op.
+fn q1Dp4aHalf(comptime q: u32, comptime act: u32) []const u8 {
+    return std.fmt.comptimePrint(
+        \\  and.b32 %r40,%r{d},0x33333333; prmt.b32 %r41,%r38,%r38,%r40;  // bits 0,1 4,5 8,9 12,13
+        \\  shr.u32 %r40,%r{d},2; and.b32 %r40,%r40,0x33333333;
+        \\  prmt.b32 %r42,%r38,%r38,%r40;                      // bits 2,3 6,7 10,11 14,15
+        \\  prmt.b32 %r43,%r39,%r39,%r41;                      // -> +-1 bytes (bits 0,1,4,5)
+        \\  prmt.b32 %r44,%r39,%r39,%r42;                      // (bits 2,3,6,7)
+        \\  shr.u32 %r40,%r41,16; prmt.b32 %r45,%r39,%r39,%r40; // (bits 8,9,12,13)
+        \\  shr.u32 %r40,%r42,16; prmt.b32 %r46,%r39,%r39,%r40; // (bits 10,11,14,15)
+        \\  mov.u32 %r40,0x5410; prmt.b32 %r47,%r43,%r44,%r40;  // elements 0..3
+        \\  prmt.b32 %r49,%r45,%r46,%r40;                      // elements 8..11
+        \\  mov.u32 %r40,0x7632; prmt.b32 %r48,%r43,%r44,%r40;  // elements 4..7
+        \\  prmt.b32 %r50,%r45,%r46,%r40;                      // elements 12..15
+        \\  dp4a.s32.s32 %r51,%r47,%r{d},%r51;
+        \\  dp4a.s32.s32 %r51,%r48,%r{d},%r51;
+        \\  dp4a.s32.s32 %r51,%r49,%r{d},%r51;
+        \\  dp4a.s32.s32 %r51,%r50,%r{d},%r51;
+        \\
+    , .{ q, q, act, act + 1, act + 2, act + 3 });
+}
+
+/// ggml q1_0 GEMV against a `quantize_q8_1` activation (dp4a int8 dot), the
+/// decode-path twin of `gemv_q5_k_q8`/`gemv_q6_k_q8`: warp per row, 8 rows per
+/// 256-thread block, warp-shuffle reduction.
+///
+/// One lane handles one 32-element chunk per iteration — a q8 activation block,
+/// and a quarter of a q1_0 weight block, so the weight's single `d` multiplies
+/// four chunks and each chunk brings its own `d8`. Per chunk: two u16 weight
+/// loads (q1_0's qs is only 2-byte aligned, since a block is 18 bytes), eight u32
+/// activation loads, 16 `prmt` and 8 `dp4a`.
+///
+/// ⚠️ NOT the same arithmetic as `gemv_q1_0`: the activation goes through int8
+/// here, so this is approximate where that kernel is f32-exact. Same tradeoff the
+/// other dp4a decode GEMVs already make, and it is what llama.cpp computes.
+///
+/// b0=W(q1_0), b1=xq (SoA: f32 d[cols/32] then i8 qs[cols]), b2=y.
+/// u0=rows, u1=cols (% 256 == 0), f0=scale.
+pub const gemv_q1_0_q8_ptx: [:0]const u8 =
+    q1_0_q8_head ++ q1Dp4aHalf(13, 20) ++ q1Dp4aHalf(14, 24) ++ q1_0_q8_tail;
+
+const q1_0_q8_head =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry gemv_q1_0_q8(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<4>;
+    \\  .reg .b16 %h<2>;
+    \\  .reg .b32 %r<56>;
+    \\  .reg .f32 %f<10>;
+    \\  .reg .b64 %rd<24>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r3,%tid.x;
+    \\  shr.u32 %r5,%r3,5;                     // warp
+    \\  and.b32 %r6,%r3,31;                    // lane
+    \\  shl.b32 %r7,%r1,3; add.u32 %r7,%r7,%r5;            // row = ctaid*8 + warp
+    \\  ld.param.u32 %r2,[u0]; setp.ge.u32 %p1,%r7,%r2; @%p1 bra END;
+    \\  ld.param.u32 %r4,[u1];                 // cols
+    \\  ld.param.f32 %f1,[f0];                 // scale
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
+    \\  shr.u32 %r15,%r4,7; mul.lo.u32 %r16,%r15,18;       // row bytes = cols/128*18
+    \\  mul.wide.u32 %rd7,%r7,%r16; add.s64 %rd8,%rd1,%rd7; // W row base
+    \\  // grid.y is the TOKEN. The q8 activation is one SoA block for all `n`
+    \\  // tokens: d[n*cols/32] then qs[n*cols], so this token's regions are
+    \\  // d + t*cols/32 and qs_base + t*cols. n=1 reduces to the single-token
+    \\  // layout exactly (d at xq, qs at xq + cols/8), so there is no second case.
+    \\  ld.param.u32 %r33,[u2];                // n (tokens)
+    \\  mov.u32 %r34,%ctaid.y;                 // t
+    \\  shr.u32 %r35,%r4,5;                    // q8 blocks per token = cols/32
+    \\  mul.lo.u32 %r36,%r33,%r35; shl.b32 %r36,%r36,2;    // n*cols/8 (bytes of d)
+    \\  mad.lo.u32 %r36,%r34,%r4,%r36;                     // + t*cols
+    \\  cvt.u64.u32 %rd4,%r36; add.s64 %rd4,%rd2,%rd4;     // this token's qs
+    \\  mul.lo.u32 %r37,%r34,%r35; shl.b32 %r37,%r37,2;
+    \\  cvt.u64.u32 %rd19,%r37; add.s64 %rd19,%rd2,%rd19;  // this token's d
+    \\  mov.f32 %f3,0f00000000;                // acc
+    \\  shr.u32 %r30,%r4,5;                    // nchunk = cols/32
+    \\  mov.u32 %r38,0x11100100;               // prmt LUT: 2 bits -> 2 nibbles
+    \\  mov.u32 %r39,0x000001FF;               // prmt LUT: nibble -> -1 / +1 as s8
+    \\  mov.u32 %r8,%r6;                       // chunk = lane
+    \\LOOP:
+    \\  setp.ge.u32 %p2,%r8,%r30; @%p2 bra RED;
+    \\  shr.u32 %r9,%r8,2;                     // weight block b = chunk/4
+    \\  and.b32 %r11,%r8,3;                    // chunk within block
+    \\  mul.lo.u32 %r10,%r9,18; cvt.u64.u32 %rd9,%r10; add.s64 %rd10,%rd8,%rd9;  // &block
+    \\  ld.global.b16 %h0,[%rd10]; cvt.f32.f16 %f2,%h0;    // d1
+    \\  shl.b32 %r12,%r11,2; cvt.u64.u32 %rd11,%r12; add.s64 %rd12,%rd10,%rd11;
+    \\  ld.global.u16 %r13,[%rd12+2]; ld.global.u16 %r14,[%rd12+4];  // 32 sign bits
+    \\  mul.wide.u32 %rd13,%r8,4; add.s64 %rd14,%rd19,%rd13; ld.global.f32 %f4,[%rd14];  // d8
+    \\  shl.b32 %r18,%r8,5; cvt.u64.u32 %rd15,%r18; add.s64 %rd16,%rd4,%rd15;
+    \\  ld.global.v4.u32 {%r20,%r21,%r22,%r23},[%rd16];
+    \\  ld.global.v4.u32 {%r24,%r25,%r26,%r27},[%rd16+16];
+    \\  mov.u32 %r51,0;                        // sumi
+    \\
+;
+
+const q1_0_q8_tail =
+    \\  mul.f32 %f5,%f2,%f4;                   // d1 * d8
+    \\  cvt.rn.f32.s32 %f6,%r51; fma.rn.f32 %f3,%f5,%f6,%f3;
+    \\  add.u32 %r8,%r8,32; bra LOOP;
+    \\RED:
+    \\  mov.b32 %r52,%f3; shfl.sync.bfly.b32 %r53,%r52,16,0x1f,0xffffffff; mov.b32 %f7,%r53; add.f32 %f3,%f3,%f7;
+    \\  mov.b32 %r52,%f3; shfl.sync.bfly.b32 %r53,%r52,8,0x1f,0xffffffff;  mov.b32 %f7,%r53; add.f32 %f3,%f3,%f7;
+    \\  mov.b32 %r52,%f3; shfl.sync.bfly.b32 %r53,%r52,4,0x1f,0xffffffff;  mov.b32 %f7,%r53; add.f32 %f3,%f3,%f7;
+    \\  mov.b32 %r52,%f3; shfl.sync.bfly.b32 %r53,%r52,2,0x1f,0xffffffff;  mov.b32 %f7,%r53; add.f32 %f3,%f3,%f7;
+    \\  mov.b32 %r52,%f3; shfl.sync.bfly.b32 %r53,%r52,1,0x1f,0xffffffff;  mov.b32 %f7,%r53; add.f32 %f3,%f3,%f7;
+    \\  setp.ne.u32 %p3,%r6,0; @%p3 bra END;
+    \\  mul.f32 %f3,%f3,%f1;
+    \\  mad.lo.u32 %r38,%r34,%r2,%r7;          // y[t*rows + row]
+    \\  mul.wide.u32 %rd17,%r38,4; add.s64 %rd18,%rd3,%rd17; st.global.f32 [%rd18],%f3;
+    \\END:
+    \\  ret;
+    \\}
+;
+
 /// ggml IQ4_NL GEMV, warp-per-row (8 rows per 256-thread block; warp-shuffle
 /// reduction, no shared mem / bar.sync — same structure as gemv_q5_k/q6_k).
 /// Same block layout as q4_0 (f16 d + 16 nibble bytes, 32 elems) but the nibble
@@ -3911,6 +4619,245 @@ pub const l2norm_rows_ptx: [:0]const u8 =
     \\}
 ;
 
+/// `l2norm_rows` over rows that arrive in GROUPS strided by `u3` elements,
+/// normalizing the first `u2` consecutive `dim`-wide rows of each group. qwen35's
+/// batched GDN needs it because each token's q/k slice is separated from the next
+/// token's by that token's v slice.
+///
+/// ⚠️ A SEPARATE kernel rather than a mode flag on `l2norm_rows`: the plain form is
+/// launched once per token per GDN layer on models that don't take the batched
+/// path (55k times in a 9B prefill), and folding a runtime branch into it measured
+/// ~4% slower there. Duplicating ~20 lines of reduction is the cheaper trade.
+/// b0=x. u0=rows(total), u1=dim, u2=rows_per_group, u3=group_stride(elements).
+pub const l2norm_rows_g_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry l2norm_rows_g(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<6>;
+    \\  .reg .b32 %r<20>;
+    \\  .reg .f32 %f<10>;
+    \\  .reg .b64 %rd<10>;
+    \\  .shared .align 4 .b8 red[1024];
+    \\  mov.u32 %r1,%ctaid.x;                  // row (across all groups)
+    \\  ld.param.u32 %r2,[u0]; setp.ge.u32 %p1,%r1,%r2; @%p1 bra END;
+    \\  mov.u32 %r3,%tid.x;
+    \\  ld.param.u32 %r4,[u1];                 // dim
+    \\  ld.param.f32 %f1,[f0];                 // eps
+    \\  ld.param.u64 %rd1,[p0]; cvta.to.global.u64 %rd1,%rd1;
+    \\  ld.param.u32 %r16,[u2];                // rows_per_group
+    \\  ld.param.u32 %r17,[u3];                // group stride, in elements
+    \\  div.u32 %r18,%r1,%r16;                 // group
+    \\  mul.lo.s32 %r19,%r18,%r16; sub.s32 %r19,%r1,%r19;  // row within group
+    \\  mad.lo.s32 %r5,%r18,%r17,%r3;          // group*stride + tid
+    \\  mad.lo.s32 %r5,%r19,%r4,%r5;           // + row_in_group*dim
+    \\  mul.wide.u32 %rd2,%r5,4; add.s64 %rd3,%rd1,%rd2;
+    \\  mov.f32 %f2,0f00000000;
+    \\  setp.ge.u32 %p2,%r3,%r4; @%p2 bra RED0;
+    \\  ld.global.f32 %f3,[%rd3]; mul.f32 %f2,%f3,%f3;
+    \\RED0:
+    \\  shl.b32 %r6,%r3,2; mov.u32 %r7,red; add.u32 %r8,%r7,%r6;
+    \\  st.shared.f32 [%r8],%f2; bar.sync 0;
+    \\  mov.u32 %r9,128;
+    \\RED:
+    \\  setp.eq.u32 %p3,%r9,0; @%p3 bra REDD;
+    \\  setp.ge.u32 %p4,%r3,%r9; @%p4 bra REDS;
+    \\  ld.shared.f32 %f4,[%r8]; shl.b32 %r10,%r9,2; add.u32 %r10,%r8,%r10;
+    \\  ld.shared.f32 %f5,[%r10]; add.f32 %f4,%f4,%f5; st.shared.f32 [%r8],%f4;
+    \\REDS:
+    \\  bar.sync 0; shr.u32 %r9,%r9,1; bra RED;
+    \\REDD:
+    \\  ld.shared.f32 %f6,[%r7];               // sum of squares
+    \\  sqrt.rn.f32 %f6,%f6; max.f32 %f6,%f6,%f1; rcp.rn.f32 %f6,%f6;
+    \\  setp.ge.u32 %p5,%r3,%r4; @%p5 bra END;
+    \\  ld.global.f32 %f7,[%rd3]; mul.f32 %f7,%f7,%f6; st.global.f32 [%rd3],%f7;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// Emit one tap of `gdn_conv_batch`: read the channel's value at token `t-3+k`
+/// — from `x` when that token is inside this chunk, else from the carried
+/// 3-column state — and accumulate `w[k] * v`.
+///
+/// The out-of-chunk branch is a `selp` on the ADDRESS, not a branch on the load,
+/// so the four taps stay straight-line. Computing the (negative, invalid) `x`
+/// address for a state tap is harmless because it is never dereferenced.
+fn gdnConvTap(comptime k: i32) []const u8 {
+    return std.fmt.comptimePrint(
+        \\  add.s32 %r11,%r8,{d};                  // j = t - 3 + k
+        \\  setp.lt.s32 %p2,%r11,0;                // before this chunk?
+        \\  mad.lo.s32 %r12,%r11,%r6,%r10; mul.wide.s32 %rd5,%r12,4; add.s64 %rd6,%rd2,%rd5;
+        \\  add.s32 %r13,%r11,3; mul.wide.s32 %rd7,%r13,4; add.s64 %rd8,%rd11,%rd7;
+        \\  selp.b64 %rd9,%rd8,%rd6,%p2;
+        \\  ld.global.f32 %f2,[%rd9]; ld.global.f32 %f3,[%rd12+{d}];
+        \\  fma.rn.f32 %f4,%f3,%f2,%f4;
+        \\
+    , .{ k - 3, k * 4 });
+}
+
+/// Batched qwen35 depthwise causal conv (kernel 4) + SiLU: every token of a
+/// prefill chunk at once, one thread per (token, channel).
+///
+/// ⚠️ This is a CONVOLUTION, not a recurrence — that is the whole point. The
+/// per-token `gdn_conv_step` below rolls a 3-column state forward and so had to
+/// run once per token inside batched prefill; but `out[t]` depends only on
+/// `x[t-3..t]`, so all tokens are independent given the state carried IN. Running
+/// it per token cost 7 launches per token per GDN layer, and that loop measured
+/// **46% of Bonsai-27B's prefill**. The state roll moves to
+/// `gdn_conv_state` (one launch per chunk) because doing it here would race:
+/// every token's threads read the same old state.
+///
+/// b0=conv_state [channels][3] (read-only), b1=x [n][channels],
+/// b2=conv_w [channels][4] (w[0] oldest), b3=out [n][channels].
+/// u0=n*channels, u1=channels, u2=n.
+/// ⚠️ Tap order is 3, 0, 1, 2 — NOT ascending — to reproduce `gdn_conv_step`'s
+/// summation order exactly (`w3*x`, then `w0*s0`, `w1*s1`, `w2*s2`). f32 addition
+/// is not associative, so ascending order would make batched prefill and
+/// single-token decode disagree in the last bits, and this model's output is
+/// validated token-identical against llama.cpp. (`fma(w,v,0)` for the first tap is
+/// bit-identical to the reference's `mul`, so only the ORDER matters.)
+pub const gdn_conv_batch_ptx: [:0]const u8 = gdn_conv_batch_head ++
+    gdnConvTap(3) ++ gdnConvTap(0) ++ gdnConvTap(1) ++ gdnConvTap(2) ++ gdn_conv_batch_tail;
+
+const gdn_conv_batch_head =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry gdn_conv_batch(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<4>;
+    \\  .reg .b32 %r<16>;
+    \\  .reg .f32 %f<10>;
+    \\  .reg .b64 %rd<16>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1];                 // channels
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2]; ld.param.u64 %rd4,[p3];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3; cvta.to.global.u64 %rd4,%rd4;
+    \\  div.u32 %r8,%r4,%r6;                   // t = i / channels
+    \\  mul.lo.s32 %r9,%r8,%r6; sub.s32 %r10,%r4,%r9;      // c = i % channels
+    \\  mul.lo.s32 %r14,%r10,3; mul.wide.u32 %rd13,%r14,4; add.s64 %rd11,%rd1,%rd13;  // &state[c][0]
+    \\  shl.b32 %r15,%r10,2; mul.wide.u32 %rd14,%r15,4; add.s64 %rd12,%rd3,%rd14;     // &w[c][0]
+    \\  mov.f32 %f4,0f00000000;
+    \\
+;
+
+const gdn_conv_batch_tail =
+    \\  neg.f32 %f5,%f4; mul.f32 %f5,%f5,0f3FB8AA3B; ex2.approx.f32 %f5,%f5;
+    \\  add.f32 %f5,%f5,0f3F800000; rcp.approx.f32 %f5,%f5; mul.f32 %f4,%f4,%f5;  // silu
+    \\  mul.wide.u32 %rd15,%r4,4; add.s64 %rd10,%rd4,%rd15; st.global.f32 [%rd10],%f4;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// Roll the qwen35 conv state forward over a whole chunk: after `gdn_conv_batch`,
+/// the carried 3 columns must become the chunk's LAST 3 token columns. One thread
+/// per channel, one launch per chunk.
+///
+/// ⚠️ All three old values are read BEFORE any is written — the update is in place
+/// and, for a chunk shorter than the 3-column window, a new column can come from
+/// the old state itself (n=2 gives {old[2], x[0], x[1]}).
+/// b0=conv_state [channels][3] (in/out), b1=x [n][channels]. u0=channels, u1=n.
+pub const gdn_conv_state_ptx: [:0]const u8 = gdn_conv_state_head ++
+    gdnConvStateCol(0) ++ gdnConvStateCol(1) ++ gdnConvStateCol(2) ++ gdn_conv_state_tail;
+
+const gdn_conv_state_head =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry gdn_conv_state(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<4>;
+    \\  .reg .b32 %r<16>;
+    \\  .reg .f32 %f<8>;
+    \\  .reg .b64 %rd<16>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r7,[u1];                 // n
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2;
+    \\  mul.lo.s32 %r8,%r4,3; mul.wide.u32 %rd3,%r8,4; add.s64 %rd4,%rd1,%rd3;   // &state[c][0]
+    \\  ld.global.f32 %f1,[%rd4]; ld.global.f32 %f2,[%rd4+4]; ld.global.f32 %f3,[%rd4+8]; // OLD, read first
+    \\  add.s32 %r9,%r7,-3;                    // j0 = n - 3
+    \\
+;
+
+/// Emit one output column `i` of `gdn_conv_state`: source token `j = n - 3 + i`,
+/// taken from `x` when in range, else the old state column `3 + j` (which is
+/// `n + i`, and is why the old values must already be in registers).
+fn gdnConvStateCol(comptime i: u32) []const u8 {
+    return std.fmt.comptimePrint(
+        \\  add.s32 %r10,%r9,{d};                  // j = n - 3 + i
+        \\  setp.lt.s32 %p2,%r10,0;
+        \\  mad.lo.s32 %r11,%r10,%r5,%r4; mul.wide.s32 %rd5,%r11,4; add.s64 %rd6,%rd2,%rd5;
+        \\  ld.global.f32 %f4,[%rd6];              // x[j][c] (garbage if j < 0, unused)
+        \\  add.s32 %r12,%r7,{d};                  // old column n + i
+        \\  setp.eq.u32 %p3,%r12,0; selp.f32 %f5,%f1,%f2,%p3;
+        \\  setp.eq.u32 %p3,%r12,1; selp.f32 %f5,%f2,%f5,%p3;
+        \\  setp.eq.u32 %p3,%r12,2; selp.f32 %f5,%f3,%f5,%p3;
+        \\  selp.f32 %f6,%f5,%f4,%p2;
+        \\  st.global.f32 [%rd4+{d}],%f6;
+        \\
+    , .{ i, i, i * 4 });
+}
+
+const gdn_conv_state_tail =
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// Batched twin of `gdn_gates`: the whole chunk's gates in one launch, one thread
+/// per (token, head). alpha/beta arrive as SEPARATE [n][heads] buffers (two
+/// batched GEMVs write them independently, unlike the decode path's single fused
+/// `[alpha|beta]` GEMV output); `out` is per token `[decay(heads) | beta(heads)]`,
+/// the layout `gdn_delta_step` already reads.
+/// b0=alpha [n][heads], b1=beta [n][heads], b2=a_dt [a|dt], b3=out [n][2*heads].
+/// u0=n*heads, u1=heads.
+pub const gdn_gates_batch_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry gdn_gates_batch(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<4>;
+    \\  .reg .b32 %r<16>;
+    \\  .reg .f32 %f<14>;
+    \\  .reg .b64 %rd<16>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1];                 // heads
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2]; ld.param.u64 %rd4,[p3];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3; cvta.to.global.u64 %rd4,%rd4;
+    \\  div.u32 %r7,%r4,%r6;                   // t
+    \\  mul.lo.s32 %r8,%r7,%r6; sub.s32 %r9,%r4,%r8;       // h
+    \\  mul.wide.u32 %rd5,%r4,4;
+    \\  add.s64 %rd6,%rd1,%rd5; ld.global.f32 %f1,[%rd6];  // alpha[t][h]
+    \\  add.s64 %rd7,%rd2,%rd5; ld.global.f32 %f2,[%rd7];  // beta[t][h]
+    \\  mul.wide.u32 %rd8,%r9,4; add.s64 %rd9,%rd3,%rd8; ld.global.f32 %f3,[%rd9];  // a[h]
+    \\  mul.wide.u32 %rd10,%r6,4; add.s64 %rd11,%rd9,%rd10; ld.global.f32 %f4,[%rd11]; // dt[h]
+    \\  add.f32 %f5,%f1,%f4;                                         // alpha + dt
+    \\  setp.gt.f32 %p2,%f5,0f41A00000; @%p2 bra SPBIG;
+    \\  mul.f32 %f6,%f5,0f3FB8AA3B; ex2.approx.f32 %f6,%f6; add.f32 %f6,%f6,0f3F800000;
+    \\  lg2.approx.f32 %f6,%f6; mul.f32 %f5,%f6,0f3F317218;          // softplus
+    \\SPBIG:
+    \\  mul.f32 %f7,%f3,%f5; mul.f32 %f7,%f7,0f3FB8AA3B; ex2.approx.f32 %f7,%f7;  // decay
+    \\  shl.b32 %r10,%r6,1; mad.lo.s32 %r11,%r7,%r10,%r9;            // t*2*heads + h
+    \\  mul.wide.u32 %rd12,%r11,4; add.s64 %rd13,%rd4,%rd12; st.global.f32 [%rd13],%f7;
+    \\  neg.f32 %f8,%f2; mul.f32 %f8,%f8,0f3FB8AA3B; ex2.approx.f32 %f8,%f8; add.f32 %f8,%f8,0f3F800000; rcp.approx.f32 %f8,%f8;
+    \\  add.s64 %rd14,%rd13,%rd10; st.global.f32 [%rd14],%f8;        // + heads
+    \\END:
+    \\  ret;
+    \\}
+;
+
 /// One step of the qwen35 depthwise causal conv (kernel 4) + SiLU: per
 /// channel, out = silu(w0*s0 + w1*s1 + w2*s2 + w3*x), then the 3-column
 /// state rolls forward (s = {s1, s2, x}). One thread per channel.
@@ -5242,6 +6189,100 @@ pub const dequant_q4_0_f16_ptx: [:0]const u8 =
     \\  ret;
     \\}
 ;
+
+/// q1_0 -> f16 dequant (prefill GEMM path): 128-element blocks of 18 B
+/// (f16 d + 16 bytes of sign bits, LSB-first), value `bit ? d : -d`. One thread
+/// per output element. b0=W(q1_0), b1=out(f16), u0=count.
+///
+/// f16 holds `d` exactly — it IS an f16 in the block — so unlike every other
+/// dequant here this conversion is lossless, and the f16 GEMM that follows sees
+/// the same values the CPU path computes with.
+pub const dequant_q1_0_f16_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry dequant_q1_0_f16(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<3>;
+    \\  .reg .b32 %r<16>;
+    \\  .reg .f32 %f<4>;
+    \\  .reg .b16 %h<3>;
+    \\  .reg .b64 %rd<12>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2;
+    \\  shr.u32 %r6,%r4,7; mul.wide.u32 %rd4,%r6,18; add.s64 %rd5,%rd1,%rd4;   // &block
+    \\  ld.global.b16 %h0,[%rd5]; cvt.f32.f16 %f1,%h0;                         // d
+    \\  and.b32 %r7,%r4,127;                                                   // j within block
+    \\  shr.u32 %r8,%r7,3;                                                     // qs byte index
+    \\  cvt.u64.u32 %rd6,%r8; add.s64 %rd7,%rd5,%rd6;
+    \\  ld.global.u8 %r10,[%rd7+2];                                            // qs byte
+    \\  and.b32 %r11,%r7,7; shr.u32 %r12,%r10,%r11; and.b32 %r13,%r12,1;       // the sign bit
+    \\  neg.f32 %f2,%f1;
+    \\  setp.eq.u32 %p2,%r13,0; selp.f32 %f3,%f2,%f1,%p2;                      // clear -> -d
+    \\  cvt.rn.f16.f32 %h1,%f3;
+    \\  mul.wide.u32 %rd8,%r4,2; add.s64 %rd9,%rd2,%rd8; st.global.b16 [%rd9],%h1;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// q2_0 (g128) -> f16 dequant (prefill GEMM path): 128-element blocks of 34 B
+/// (f16 d + 32 bytes of 2-bit codes, 4 per byte LSB-first), value
+/// `(code - 1) * d`. One thread per output element. b0=W(q2_0_g128),
+/// b1=out(f16), u0=count.
+///
+/// ⚠️ This is the **g128** variant of GGUF type 42 (see `DType.q2_0_g128`);
+/// ggml's own type 42 is g64 and this stride would be wrong for it. There is no
+/// g64 CUDA kernel — `qwen35_cuda` refuses that dtype at load rather than
+/// silently running this one.
+///
+/// Like q1_0's, the conversion is lossless in the scale (`d` IS an f16 in the
+/// block) and the code multiplier is an exact small integer, so the f16 GEMM that
+/// follows sees exactly the values the CPU path computes with.
+pub fn dequantQ2_0F16Ptx(comptime g: Q2Geom) [:0]const u8 {
+    return std.fmt.comptimePrint(
+        \\.version 8.0
+        \\.target sm_86
+        \\.address_size 64
+        \\.visible .entry dequant_q2_0_{[tag]s}_f16(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+        \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+        \\{{
+        \\  .reg .pred %p<3>;
+        \\  .reg .b32 %r<16>;
+        \\  .reg .f32 %f<4>;
+        \\  .reg .b16 %h<3>;
+        \\  .reg .b64 %rd<12>;
+        \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+        \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+        \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1];
+        \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2;
+        \\  shr.u32 %r6,%r4,{[qk_log]d}; mul.wide.u32 %rd4,%r6,{[bb]d}; add.s64 %rd5,%rd1,%rd4;  // &block
+        \\  ld.global.b16 %h0,[%rd5]; cvt.f32.f16 %f1,%h0;                         // d
+        \\  and.b32 %r7,%r4,{[qk_mask]d};                                          // j within block
+        \\  shr.u32 %r8,%r7,2;                                                     // qs byte index
+        \\  cvt.u64.u32 %rd6,%r8; add.s64 %rd7,%rd5,%rd6;
+        \\  ld.global.u8 %r10,[%rd7+2];                                            // qs byte
+        \\  and.b32 %r11,%r7,3; shl.b32 %r11,%r11,1;                               // bit offset = 2*(j&3)
+        \\  shr.u32 %r12,%r10,%r11; and.b32 %r13,%r12,3;                           // the 2-bit code
+        \\  sub.s32 %r14,%r13,1; cvt.rn.f32.s32 %f2,%r14;                          // code - 1
+        \\  mul.f32 %f3,%f2,%f1;
+        \\  cvt.rn.f16.f32 %h1,%f3;
+        \\  mul.wide.u32 %rd8,%r4,2; add.s64 %rd9,%rd2,%rd8; st.global.b16 [%rd9],%h1;
+        \\END:
+        \\  ret;
+        \\}}
+    , .{
+        .tag = g.tag,
+        .bb = g.blockBytes(),
+        .qk_log = std.math.log2_int(u32, g.qk),
+        .qk_mask = g.qk - 1,
+    });
+}
+pub const dequant_q2_0_g64_f16_ptx = dequantQ2_0F16Ptx(q2_g64);
+pub const dequant_q2_0_g128_f16_ptx = dequantQ2_0F16Ptx(q2_g128);
 
 /// IQ4_NL -> f16 dequant (prefill GEMM path): same block layout as q4_0, but
 /// the nibble maps through the non-linear kvalues_iq4nl LUT rather than the
@@ -7018,3 +8059,25 @@ pub const add_bias_rows_ptx: [:0]const u8 =
     \\  ret;
     \\}
 ;
+
+// ⚠️ **Every PTX string in this file must be pure ASCII**, comments included:
+// `ptxas` rejects the whole module with `Unexpected non-ASCII character
+// encountered on line N` and the model then dies at PTX-JIT time on a GPU box,
+// far from the edit. A stray Sigma or em-dash in a `//` comment is enough, and
+// this repo's prose style makes those easy to type — it happened twice while
+// landing `gemv_q2_0_*_q8`.
+//
+// This walks every `*_ptx` declaration, so the failure is caught by the fast CPU
+// suite instead of needing a device.
+test "every PTX kernel string is ASCII" {
+    @setEvalBranchQuota(200_000);
+    const self = @This();
+    inline for (@typeInfo(self).@"struct".decls) |d| {
+        if (comptime !std.mem.endsWith(u8, d.name, "_ptx")) continue;
+        const src = @field(self, d.name);
+        for (src, 0..) |c, i| {
+            errdefer std.debug.print("{s}: non-ASCII 0x{X} at byte {d}\n", .{ d.name, c, i });
+            try std.testing.expect(c < 0x80);
+        }
+    }
+}

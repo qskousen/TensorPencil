@@ -619,6 +619,15 @@ pub const Config = struct {
     /// regenerable; the budget only bounds the older boundaries retained.
     /// Applied live at the next turn — never load- or context-affecting.
     regen_cache_mb: usize = 2048,
+    /// Ceiling on how many tokens ONE reply may generate. **0 = no explicit cap**
+    /// (the reply runs until the model stops or the context window fills — a
+    /// clean stop, not an error). Applied live at the next reply — never load- or
+    /// context-affecting (not compared by any `*ReloadEql`).
+    ///
+    /// Deliberately NOT part of `Sampling`: that struct is what a preset stores,
+    /// in a fixed 8-field `name|t|k|p|…` line (`parsePreset`), so adding a ninth
+    /// would invalidate every preset already saved to disk.
+    max_new_tokens: usize = 2048,
     /// LLM sampling controls (see `Sampling`). Applied live: pushed into the
     /// running session on Apply and picked up at the next turn — never load-
     /// or context-affecting (not compared by any `*ReloadEql`).
@@ -967,6 +976,8 @@ pub const Config = struct {
             self.sampling.frequency_penalty = std.fmt.parseFloat(f32, val) catch self.sampling.frequency_penalty;
         } else if (std.mem.eql(u8, key, "regen_cache_mb")) {
             self.regen_cache_mb = std.fmt.parseInt(usize, val, 10) catch self.regen_cache_mb;
+        } else if (std.mem.eql(u8, key, "max_new_tokens")) {
+            self.max_new_tokens = std.fmt.parseInt(usize, val, 10) catch self.max_new_tokens;
         } else if (std.mem.eql(u8, key, "preset")) {
             if (parsePreset(val)) |pr| {
                 if (self.presets.count < max_presets) {
@@ -1187,6 +1198,36 @@ test "regen_cache_mb: default, apply, junk tolerance, save/load, live-only" {
     try cfg.save(io, gpa, &environ, file);
     const back = Config.load(io, gpa, &environ, file);
     try std.testing.expectEqual(@as(usize, 512), back.regen_cache_mb);
+}
+
+test "max_new_tokens: default, apply, junk tolerance, save/load, live-only" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var cfg: Config = .{};
+    try std.testing.expectEqual(@as(usize, 2048), cfg.max_new_tokens); // default
+    cfg.apply("max_new_tokens", "8192");
+    try std.testing.expectEqual(@as(usize, 8192), cfg.max_new_tokens);
+    cfg.apply("max_new_tokens", "junk"); // unchanged on junk
+    try std.testing.expectEqual(@as(usize, 8192), cfg.max_new_tokens);
+    cfg.apply("max_new_tokens", "0"); // 0 is a REAL value ("no explicit cap")
+    try std.testing.expectEqual(@as(usize, 0), cfg.max_new_tokens);
+
+    // Never load- or context-affecting: applied live at the next turn. This is
+    // what keeps a change from reloading multi-GB weights or rebuilding the KV.
+    const base: Config = .{};
+    try std.testing.expect(cfg.llmReloadEql(&base));
+    try std.testing.expect(cfg.ctxReloadEql(&base));
+
+    // Round-trips through the config file, including the 0 sentinel.
+    var fbuf: [64]u8 = undefined;
+    const file = testFile(&fbuf, "maxnew");
+    defer std.Io.Dir.cwd().deleteFile(io, file) catch {};
+    var environ: Environ = .init(gpa);
+    defer environ.deinit();
+    try cfg.save(io, gpa, &environ, file);
+    const back = Config.load(io, gpa, &environ, file);
+    try std.testing.expectEqual(@as(usize, 0), back.max_new_tokens);
 }
 
 test "multi-line system prompt survives a JSON save/load round-trip" {

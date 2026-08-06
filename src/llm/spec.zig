@@ -211,11 +211,17 @@ pub fn generate(
     const new = ids.items[model.cached()..];
     if (new.len == 0 or new.len > model.remaining()) return error.ContextFull;
     {
+        const batch = engine.prefillBatchOf(model);
+        const cs = engine.publishCancel(opts);
+        defer cs.end();
         var off: usize = 0;
         while (off < new.len) {
             if (engine.checkpoint(io, opts) == .stop) return 0;
-            const c = @min(engine.prefill_gate_chunk, new.len - off);
-            try model.step(io, new[off..][0..c], logits[0..vocab]);
+            const c = @min(batch, new.len - off);
+            model.step(io, new[off..][0..c], logits[0..vocab]) catch |err| {
+                if (engine.isCancelUnwind(err)) return 0;
+                return err;
+            };
             off += c;
         }
     }
@@ -304,17 +310,23 @@ fn generateChainGreedy(
     std.debug.assert(k_max > 0);
     var stream: engine.Utf8Stream = .{};
 
-    // Gate-checked chunked prefill (see engine.prefill_gate_chunk); the final
+    // Chunked prefill (batch via engine.prefillBatchOf); the final
     // chunk's argmax is the first pending token.
     const new = ids.items[model.cached()..];
     if (new.len == 0 or new.len > model.remaining()) return error.ContextFull;
     var pending: u32 = undefined;
     {
+        const batch = engine.prefillBatchOf(model);
+        const cs = engine.publishCancel(opts);
+        defer cs.end();
         var off: usize = 0;
         while (off < new.len) {
             if (engine.checkpoint(io, opts) == .stop) return 0;
-            const c = @min(engine.prefill_gate_chunk, new.len - off);
-            pending = try model.stepArgmax(io, new[off..][0..c]);
+            const c = @min(batch, new.len - off);
+            pending = model.stepArgmax(io, new[off..][0..c]) catch |err| {
+                if (engine.isCancelUnwind(err)) return 0;
+                return err;
+            };
             off += c;
         }
     }
@@ -407,16 +419,22 @@ pub fn generateTree(
     var sampler = sample.Sampler.init(opts.sampling, opts.seed);
     var stream: engine.Utf8Stream = .{};
 
-    // Gate-checked chunked prefill (see engine.prefill_gate_chunk); only the
+    // Chunked prefill (batch via engine.prefillBatchOf); only the
     // final chunk's last-position logits feed the first sample.
     const new = ids.items[model.cached()..];
     if (new.len == 0 or new.len > model.remaining()) return error.ContextFull;
     {
+        const batch = engine.prefillBatchOf(model);
+        const cs = engine.publishCancel(opts);
+        defer cs.end();
         var off: usize = 0;
         while (off < new.len) {
             if (engine.checkpoint(io, opts) == .stop) return 0;
-            const c = @min(engine.prefill_gate_chunk, new.len - off);
-            try model.step(io, new[off..][0..c], logits[0..vocab]);
+            const c = @min(batch, new.len - off);
+            model.step(io, new[off..][0..c], logits[0..vocab]) catch |err| {
+                if (engine.isCancelUnwind(err)) return 0;
+                return err;
+            };
             off += c;
         }
     }
@@ -770,15 +788,17 @@ test "spec greedy is byte-identical: budget lands mid-acceptance" {
 }
 
 test "chunked prefill is byte-identical across the gate-chunk boundary" {
-    // A prompt LONGER than engine.prefill_gate_chunk forces the gate-checked
-    // prefill loop (added so pause/cancel can land mid-prefill) to run several
-    // chunks. Incremental chunked stepping must reconstruct the identical KV
+    // A prompt LONGER than the batch ToyModel will actually be handed forces the
+    // chunked prefill loop (added so pause/cancel can land mid-prefill) to run several
+    // chunks. ⚠️ Derived from `prefillBatchOfType`, not from `prefill_gate_chunk`:
+    // the batch is now the stepper's choice, so a hardcoded constant here would let
+    // the test silently stop spanning chunks the day ToyModel declares one. Incremental chunked stepping must reconstruct the identical KV
     // history — a dropped / duplicated / reordered token would change
     // rule(hist) and diverge from vanilla greedy. sumRule folds the WHOLE
     // history, so any such bug is caught.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const prompt_len = engine.prefill_gate_chunk * 2 + 37; // spans 3 chunks
+    const prompt_len = engine.prefillBatchOfType(ToyModel) * 2 + 37; // spans 3 chunks
     const max_new = 24;
 
     var prompt: std.ArrayList(u32) = .empty;

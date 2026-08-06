@@ -447,6 +447,17 @@ pub fn build(b: *std.Build) void {
             });
             gui_test_step.dependOn(&b.addRunArtifact(gui_markdown_tests).step);
 
+            // Message-footer telemetry: rates + formatting. Pure std — the
+            // struct lives here rather than in chat.zig so it stays testable.
+            const gui_turn_stats_tests = b.addTest(.{
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/gui/turn_stats.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }),
+            });
+            gui_test_step.dependOn(&b.addRunArtifact(gui_turn_stats_tests).step);
+
             // Viewer zoom/pan math unit tests. Pure std — the dvui-facing
             // viewer.zig stays out of the test build.
             const gui_viewmath_tests = b.addTest(.{

@@ -37,6 +37,14 @@ fn envSet(name: [*:0]const u8) bool {
     return getenv(name) != null;
 }
 
+/// Opt-in for q2_0's two-row decode GEMV (`gemvQ2_0Q8X2Ptx`). Cached on first use
+/// so the choice cannot change between the kernel pick and the grid size.
+var q2_x2_cache: ?bool = null;
+fn q2X2() bool {
+    if (q2_x2_cache == null) q2_x2_cache = envSet("TP_Q2_X2");
+    return q2_x2_cache.?;
+}
+
 /// KV storage format of the flash-decode attention / KV store ops (mirrors
 /// llm.kv_cache.KvDtype; defined in elt.zig next to the kernels).
 pub const KvFmt = elt.KvFmt;
@@ -437,6 +445,22 @@ pub const Backend = struct {
     mmq_pipe_fn: cu.CUfunction = null,
     mmq_pipe6_mod: ?ctxmod.Module = null,
     mmq_pipe6_fn: cu.CUfunction = null,
+    mmq_pipe1_mod: ?ctxmod.Module = null,
+    mmq_pipe1_fn: cu.CUfunction = null,
+    /// One slot per q2_0 block geometry (see elt.Q2Geom); a checkpoint only ever
+    /// uses one, but the two entry points differ so they cannot share a module.
+    mmq_pipe2_mod: [2]?ctxmod.Module = .{ null, null },
+    mmq_pipe2_fn: [2]cu.CUfunction = .{ null, null },
+    /// `gdn_delta_chunk` bakes `d` in (the state walk is fully unrolled), so the
+    /// module is cached together with the `d` it was built for.
+    gdn_chunk_mod: ?ctxmod.Module = null,
+    gdn_chunk_fn: cu.CUfunction = null,
+    gdn_chunk_d: usize = 0,
+    /// `attn_split_g` unrolls the query-head group, so the module is cached with
+    /// the `group` it was built for.
+    attn_g_mod: ?ctxmod.Module = null,
+    attn_g_fn: cu.CUfunction = null,
+    attn_g_group: usize = 0,
     hgemm_bf16_mod: ?ctxmod.Module = null, // native bf16 MMA (dense bf16 DiT)
     hgemm_bf16_fn: cu.CUfunction = null,
     hgemm_b_mod: ?ctxmod.Module = null,
@@ -617,6 +641,10 @@ pub const Backend = struct {
         if (self.mmq_q4k_mod) |m| m.unload(self.ctx);
         if (self.mmq_pipe_mod) |m| m.unload(self.ctx);
         if (self.mmq_pipe6_mod) |m| m.unload(self.ctx);
+        if (self.mmq_pipe1_mod) |m| m.unload(self.ctx);
+        for (self.mmq_pipe2_mod) |mo| if (mo) |m| m.unload(self.ctx);
+        if (self.gdn_chunk_mod) |m| m.unload(self.ctx);
+        if (self.attn_g_mod) |m| m.unload(self.ctx);
         if (self.hgemm_bf16_mod) |m| m.unload(self.ctx);
         if (self.hgemm_b_mod) |m| m.unload(self.ctx);
         if (self.hgemm_bc16_mod) |m| m.unload(self.ctx);
@@ -1745,6 +1773,22 @@ pub const Backend = struct {
         try self.rowLaunch(f, w_db, x, y, self.fp8_lut, .{ @intCast(rows), @intCast(cols), @intCast(n), 0, 0, 0 }, .{ scale, 0 }, rows / 8);
     }
 
+    /// Whether this block-quant dtype has BOTH CUDA entry points a model needs:
+    /// `opGemvQuant`'s decode kernel and `opMatmulQuant`'s dequant-to-f16. Both
+    /// switch on dtype with `else => unreachable`, so a caller holding a weight in
+    /// a block format with no kernel must check here and refuse rather than
+    /// discover it as a panic mid-forward.
+    ///
+    /// ⚠️ `.q2_0_g64` is deliberately absent while `.q2_0_g128` is present: they
+    /// share a GGUF type id and differ in block stride, so there is no kernel that
+    /// serves both and running the wrong one is silent corruption, not a fault.
+    pub fn quantKernelSupported(dt: dtypes.DType) bool {
+        return switch (dt) {
+            .q4_0, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl, .q1_0, .q2_0_g64, .q2_0_g128 => true,
+            else => false,
+        };
+    }
+
     /// Fused ggml block-quant GEMV for m=1 decode: y[rows] f32 =
     /// scale * (W quant [rows][cols] @ x), inline dequant — each weight byte
     /// read exactly once (memory-bound optimal, like opGemvFp8). cols must be
@@ -1762,13 +1806,16 @@ pub const Backend = struct {
             .q5_k => try self.eltFn(elt.gemv_q5_k_ptx, "gemv_q5_k"),
             .q6_k => try self.eltFn(elt.gemv_q6_k_ptx, "gemv_q6_k"),
             .iq4_nl => try self.eltFn(elt.gemv_iq4_nl_ptx, "gemv_iq4_nl"),
+            .q1_0 => try self.eltFn(elt.gemv_q1_0_ptx, "gemv_q1_0"),
+            .q2_0_g64 => try self.eltFn(elt.gemv_q2_0_g64_ptx, "gemv_q2_0_g64"),
+            .q2_0_g128 => try self.eltFn(elt.gemv_q2_0_g128_ptx, "gemv_q2_0_g128"),
             else => unreachable,
         };
         // q5_k/q6_k run warp-per-row (8 rows per block); the kernel guards
         // `row < rows`, so a non-multiple-of-8 row count (e.g. Gemma 3's
         // 262145-token tied head) just leaves the last block's extra warps
         // idle — round the grid UP so every row is covered.
-        const warp_per_row = dt == .q5_k or dt == .q6_k or dt == .iq4_nl;
+        const warp_per_row = dt == .q5_k or dt == .q6_k or dt == .iq4_nl or dt == .q1_0 or dt == .q2_0_g64 or dt == .q2_0_g128;
         const grid = if (warp_per_row) (rows + 7) / 8 else rows;
         try self.rowLaunch(f, w_db, x, y, null, .{ @intCast(rows), @intCast(cols), 0, 0, 0, 0 }, .{ scale, 0 }, grid);
     }
@@ -1820,12 +1867,61 @@ pub const Backend = struct {
         std.debug.assert(cols % 256 == 0 and rows % 8 == 0);
         std.debug.assert(self.q8_act.size >= cols / 32 * 4 + cols);
         const w_db = try self.cachedWeight(w_bytes);
+        // `TP_Q2_X2` selects q2_0's two-row kernel (see gemvQ2_0Q8X2Ptx). Off by
+        // default and env-gated rather than compiled out, so the two forms can be
+        // A/B'd from ONE binary — which matters here because this box drifts
+        // several percent between sessions and only an interleaved comparison of
+        // the same build is trustworthy.
+        const x2 = q2X2() and rows % 16 == 0 and (dt == .q2_0_g64 or dt == .q2_0_g128);
         const f = switch (dt) {
             .q5_k => try self.eltFn(elt.gemv_q5_k_q8_ptx, "gemv_q5_k_q8"),
             .q6_k => try self.eltFn(elt.gemv_q6_k_q8_ptx, "gemv_q6_k_q8"),
+            // These kernels carry a token dimension (grid.y); n = 1 here.
+            .q1_0 => try self.eltFn(elt.gemv_q1_0_q8_ptx, "gemv_q1_0_q8"),
+            .q2_0_g64 => if (x2)
+                try self.eltFn(elt.gemv_q2_0_g64_q8x2_ptx, "gemv_q2_0_g64_q8x2")
+            else
+                try self.eltFn(elt.gemv_q2_0_g64_q8_ptx, "gemv_q2_0_g64_q8"),
+            .q2_0_g128 => if (x2)
+                try self.eltFn(elt.gemv_q2_0_g128_q8x2_ptx, "gemv_q2_0_g128_q8x2")
+            else
+                try self.eltFn(elt.gemv_q2_0_g128_q8_ptx, "gemv_q2_0_g128_q8"),
             else => unreachable,
         };
-        try self.rowLaunch(f, w_db, self.q8_act, y, null, .{ @intCast(rows), @intCast(cols), 0, 0, 0, 0 }, .{ scale, 0 }, rows / 8);
+        const nt: u32 = if (quantQ8BatchSupported(dt)) 1 else 0;
+        try self.rowLaunch(f, w_db, self.q8_act, y, null, .{ @intCast(rows), @intCast(cols), nt, 0, 0, 0 }, .{ scale, 0 }, if (x2) rows / 16 else rows / 8);
+    }
+
+    /// Whether `opGemvQuantQ8Batch` has a kernel for this dtype — i.e. whether its
+    /// dp4a GEMV carries the token dimension in grid.y.
+    pub fn quantQ8BatchSupported(dt: dtypes.DType) bool {
+        return dt == .q1_0 or dt == .q2_0_g64 or dt == .q2_0_g128;
+    }
+
+    /// Batched dp4a GEMV: `y[n][rows] = scale * (W @ x_t)` for all `n` tokens in
+    /// ONE launch (grid.y = token), against the q8 activation written by a single
+    /// `opGemvQuantizeX(x, n*cols)`.
+    ///
+    /// This exists for the SKINNY weights a GEMM cannot take: qwen35's GDN
+    /// `ssm_alpha`/`ssm_beta` are [48, hidden], and `launchHgemm` computes
+    /// `grid.x = rows/128`, so rows=48 would launch a zero-sized grid
+    /// (`CUDA_ERROR_INVALID_VALUE`). Prefill previously called the single-token
+    /// GEMV once per token for them, which measured a large part of the per-token
+    /// GDN loop's 46% share of prefill.
+    pub fn opGemvQuantQ8Batch(self: *Backend, dt: dtypes.DType, y: DeviceBuffer, w_bytes: []const u8, scale: f32, rows: usize, cols: usize, n: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.matmul);
+        std.debug.assert(quantQ8BatchSupported(dt));
+        std.debug.assert(cols % 256 == 0 and rows % 8 == 0 and n >= 1);
+        std.debug.assert(self.q8_act.size >= n * (cols / 32 * 4 + cols));
+        const w_db = try self.cachedWeight(w_bytes);
+        const f = switch (dt) {
+            .q1_0 => try self.eltFn(elt.gemv_q1_0_q8_ptx, "gemv_q1_0_q8"),
+            .q2_0_g64 => try self.eltFn(elt.gemv_q2_0_g64_q8_ptx, "gemv_q2_0_g64_q8"),
+            .q2_0_g128 => try self.eltFn(elt.gemv_q2_0_g128_q8_ptx, "gemv_q2_0_g128_q8"),
+            else => unreachable, // gated by quantQ8BatchSupported above
+        };
+        try self.rowLaunch2(f, w_db, self.q8_act, y, null, .{ @intCast(rows), @intCast(cols), @intCast(n), 0, 0, 0 }, .{ scale, 0 }, rows / 8, n);
     }
 
     /// Grouped dp4a GEMV for small-batch prefill: y[i][rows] f32 = scale *
@@ -1893,6 +1989,30 @@ pub const Backend = struct {
         return self.mmq_pipe6_fn;
     }
 
+    fn mmqPipe2Fn(self: *Backend, dt: dtypes.DType) Error!cu.CUfunction {
+        const g: elt.Q2Geom = if (dt == .q2_0_g64) elt.q2_g64 else elt.q2_g128;
+        const i: usize = if (dt == .q2_0_g64) 0 else 1;
+        if (self.mmq_pipe2_mod[i] != null) return self.mmq_pipe2_fn[i];
+        const ptx = kernels.buildMmqPipeQ2_0(self.gpa, g) catch return error.OutOfMemory;
+        defer self.gpa.free(ptx);
+        var name_buf: [32]u8 = undefined;
+        const name = std.fmt.bufPrintZ(&name_buf, "mmq_pipe_q2_0_{s}", .{g.tag}) catch unreachable;
+        var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
+        self.mmq_pipe2_fn[i] = mod.getFunction(self.ctx, name) catch return error.CudaError;
+        self.mmq_pipe2_mod[i] = mod;
+        return self.mmq_pipe2_fn[i];
+    }
+
+    fn mmqPipe1Fn(self: *Backend) Error!cu.CUfunction {
+        if (self.mmq_pipe1_mod != null) return self.mmq_pipe1_fn;
+        const ptx = kernels.buildMmqPipeQ1_0(self.gpa) catch return error.OutOfMemory;
+        defer self.gpa.free(ptx);
+        var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
+        self.mmq_pipe1_fn = mod.getFunction(self.ctx, "mmq_pipe_q1_0") catch return error.CudaError;
+        self.mmq_pipe1_mod = mod;
+        return self.mmq_pipe1_fn;
+    }
+
     /// Rows/tokens per block for the pipe MMQ; `n` is padded up to the token tile.
     pub const mmq_pipe_tile = 128;
 
@@ -1901,13 +2021,23 @@ pub const Backend = struct {
     /// but loses to dequant+f16 on real shapes (see `buildMmqPipeQ6K`), so the
     /// decision of what to actually call belongs to the caller.
     pub fn mmqPipeSupported(dt: dtypes.DType, rows: usize, cols: usize) bool {
-        return (dt == .q4_k or dt == .q6_k) and cols % 256 == 0 and rows % mmq_pipe_tile == 0;
+        return (dt == .q4_k or dt == .q6_k or dt == .q1_0 or dt == .q2_0_g64 or dt == .q2_0_g128) and
+            cols % 256 == 0 and rows % mmq_pipe_tile == 0;
     }
 
     /// Whether MMQ is a WIN for this dtype, i.e. what a model should route on.
     /// Measured on a 3090 at n=256: q4_k 1.6-2.0x vs dequant+f16; q6_k 0.87-0.98x.
+    ///
+    /// q1_0's margin is the largest of the three and for a structural reason: the
+    /// dequant+f16 fallback expands a 1.125-bpw weight to 16 bits, so it moves ~14x
+    /// the bytes MMQ reads, where for q4_k it is only ~3.5x.
     pub fn mmqPipeFaster(dt: dtypes.DType, rows: usize, cols: usize) bool {
-        return dt == .q4_k and mmqPipeSupported(dt, rows, cols);
+        if (!mmqPipeSupported(dt, rows, cols)) return false;
+        // q2_0 measured +61% prefill (486 -> 780 tok/s, Bonsai-27B, 1937-token
+        // prompt, interleaved same-binary A/B) with decode unchanged. `TP_NO_MMQ2`
+        // keeps the dequant+f16 path reachable for future A/B from one build.
+        if (dt == .q2_0_g64 or dt == .q2_0_g128) return !envSet("TP_NO_MMQ2");
+        return dt == .q4_k or dt == .q1_0;
     }
 
     /// Pipe-tiled MMQ (128x128 tile, 2x2 warps, MT=4/NT=8). Same contract as
@@ -1921,7 +2051,12 @@ pub const Backend = struct {
         self.ptic();
         defer self.ptoc(.matmul);
         const w_db = try self.cachedWeight(w_bytes);
-        const f = if (dt == .q6_k) try self.mmqPipe6Fn() else try self.mmqPipeFn();
+        const f = switch (dt) {
+            .q6_k => try self.mmqPipe6Fn(),
+            .q1_0 => try self.mmqPipe1Fn(),
+            .q2_0_g64, .q2_0_g128 => try self.mmqPipe2Fn(dt),
+            else => try self.mmqPipeFn(),
+        };
         var pw = w_db.ptr();
         var px = self.q8_act.ptr();
         var py = y.ptr();
@@ -1994,6 +2129,9 @@ pub const Backend = struct {
                 .q5_k => try self.eltFn(elt.dequant_q5_k_f16_ptx, "dequant_q5_k_f16"),
                 .q6_k => try self.eltFn(elt.dequant_q6_k_f16_ptx, "dequant_q6_k_f16"),
                 .iq4_nl => try self.eltFn(elt.dequant_iq4_nl_f16_ptx, "dequant_iq4_nl_f16"),
+                .q1_0 => try self.eltFn(elt.dequant_q1_0_f16_ptx, "dequant_q1_0_f16"),
+                .q2_0_g64 => try self.eltFn(elt.dequant_q2_0_g64_f16_ptx, "dequant_q2_0_g64_f16"),
+                .q2_0_g128 => try self.eltFn(elt.dequant_q2_0_g128_f16_ptx, "dequant_q2_0_g128_f16"),
                 else => unreachable,
             };
             try self.eltLaunch(f_deq, w_db, self.fp8_w16, null, null, .{ @intCast(rows * cols), 0, 0, 0, 0, 0 }, .{ 0, 0 }, rows * cols);
@@ -2071,7 +2209,15 @@ pub const Backend = struct {
         std.debug.assert(!bidir or hd == 256 or hd == 512);
         const bidir_u: u32 = @intFromBool(bidir);
         const total = seq_q * n_heads * nsplit * 32;
-        if (hd == 256 or hd == 512) {
+        if (attnSplitGroupOk(hd, kv_fmt, window, ring, bidir, seq_q, n_heads, kv_heads)) {
+            // Prefill: share the KV fragment across the query-head group, which cuts
+            // L2->SM traffic by `group`. That traffic, not arithmetic, is what bounds
+            // prefill attention — see `kernels.buildAttnSplitGroup`. Checked FIRST
+            // because the model this matters for (qwen3.5) has hd=256.
+            const group = n_heads / kv_heads;
+            const f_split = try self.attnGroupFn(hd, group, kv_fmt);
+            try self.eltLaunch(f_split, q, k, v, scratch, .{ @intCast(kv_len0), @intCast(n_heads), @intCast(kv_heads), @intCast(hd), @intCast(nsplit), @intCast(seq_q) }, .{ scale, 0 }, seq_q * kv_heads * nsplit * 32);
+        } else if (hd == 256 or hd == 512) {
             // h256 (local, ring) and h512 (gemma4 global, ring=0) share one
             // generated kernel + param layout (u6=ring, u7=bidir), so both take
             // the same bespoke 14-param launch (eltLaunch only passes 6 u32 + 2 f32).
@@ -2272,6 +2418,19 @@ pub const Backend = struct {
         try self.rowLaunch(f, x, null, null, null, .{ @intCast(rows), @intCast(dim), 0, 0, 0, 0 }, .{ eps, 0 }, rows);
     }
 
+    /// `opL2NormRows` over rows that come in GROUPS strided by `group_stride`
+    /// elements, normalizing `rows_per_group` consecutive `dim`-wide rows at the
+    /// start of each group. For qwen35's batched GDN this normalizes each token's
+    /// q/k slice, which is not contiguous across tokens because the v slice sits
+    /// between them. `rows` is the total across all groups.
+    pub fn opL2NormRowsGrouped(self: *Backend, x: DeviceBuffer, rows: usize, dim: usize, rows_per_group: usize, group_stride: usize, eps: f32) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        std.debug.assert(dim <= 256 and rows_per_group > 0 and rows % rows_per_group == 0);
+        const f = try self.eltFn(elt.l2norm_rows_g_ptx, "l2norm_rows_g");
+        try self.rowLaunch(f, x, null, null, null, .{ @intCast(rows), @intCast(dim), @intCast(rows_per_group), @intCast(group_stride), 0, 0 }, .{ eps, 0 }, rows);
+    }
+
     /// One qwen35 causal-conv step (kernel 4, SiLU) over all channels; the
     /// 3-column per-channel state rolls forward.
     pub fn opGdnConvStep(self: *Backend, conv_state: DeviceBuffer, x: DeviceBuffer, conv_w: DeviceBuffer, out: DeviceBuffer, channels: usize) Error!void {
@@ -2279,6 +2438,103 @@ pub const Backend = struct {
         defer self.ptoc(.elt);
         const f = try self.eltFn(elt.gdn_conv_step_ptx, "gdn_conv_step");
         try self.eltLaunch(f, conv_state, x, conv_w, out, .{ @intCast(channels), 0, 0, 0, 0, 0 }, .{ 0, 0 }, channels);
+    }
+
+    /// Batched causal conv + SiLU over a whole prefill chunk: `n` tokens in two
+    /// launches instead of `n` (see `elt.gdn_conv_batch_ptx` for why this is
+    /// legal — it is a convolution, so tokens are independent given the carried
+    /// state). The state roll is a separate launch because every token's threads
+    /// read the same incoming state.
+    pub fn opGdnConvBatch(self: *Backend, conv_state: DeviceBuffer, x: DeviceBuffer, conv_w: DeviceBuffer, out: DeviceBuffer, channels: usize, n: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const f = try self.eltFn(elt.gdn_conv_batch_ptx, "gdn_conv_batch");
+        try self.eltLaunch(f, conv_state, x, conv_w, out, .{ @intCast(n * channels), @intCast(channels), @intCast(n), 0, 0, 0 }, .{ 0, 0 }, n * channels);
+        const fs = try self.eltFn(elt.gdn_conv_state_ptx, "gdn_conv_state");
+        try self.eltLaunch(fs, conv_state, x, null, null, .{ @intCast(channels), @intCast(n), 0, 0, 0, 0 }, .{ 0, 0 }, channels);
+    }
+
+    /// Batched delta-net gates: `n` tokens in one launch. `alpha`/`beta` are
+    /// separate [n][heads] buffers (two batched GEMVs), `out` is per token
+    /// `[decay(heads) | beta(heads)]` — the layout `opGdnDeltaStep` reads.
+    pub fn opGdnGatesBatch(self: *Backend, alpha: DeviceBuffer, beta: DeviceBuffer, a_dt: DeviceBuffer, out: DeviceBuffer, heads: usize, n: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const f = try self.eltFn(elt.gdn_gates_batch_ptx, "gdn_gates_batch");
+        try self.eltLaunch(f, alpha, beta, a_dt, out, .{ @intCast(n * heads), @intCast(heads), 0, 0, 0, 0 }, .{ 0, 0 }, n * heads);
+    }
+
+    fn gdnChunkFn(self: *Backend, d: usize) Error!cu.CUfunction {
+        if (self.gdn_chunk_mod != null and self.gdn_chunk_d == d) return self.gdn_chunk_fn;
+        if (self.gdn_chunk_mod) |m| m.unload(self.ctx); // a different `d` is a different kernel
+        self.gdn_chunk_mod = null;
+        const ptx_src = kernels.buildGdnDeltaChunk(self.gpa, d) catch return error.OutOfMemory;
+        defer self.gpa.free(ptx_src);
+        var mod = self.ctx.loadModule(ptx_src) catch return error.CudaError;
+        self.gdn_chunk_fn = mod.getFunction(self.ctx, "gdn_delta_chunk") catch return error.CudaError;
+        self.gdn_chunk_mod = mod;
+        self.gdn_chunk_d = d;
+        return self.gdn_chunk_fn;
+    }
+
+    /// Whether the group-shared prefill attention kernel covers this call. Narrow
+    /// on purpose: it only implements hd=128 / f32 KV / full causal, and only pays
+    /// off when there are several queries AND several heads per kv head. Everything
+    /// else keeps the general `attn_split`, which is the honest default — the two
+    /// are bit-identical per head, so this predicate is a pure performance choice.
+    pub fn attnSplitGroupOk(hd: usize, kv_fmt: KvFmt, window: usize, ring: usize, bidir: bool, seq_q: usize, n_heads: usize, kv_heads: usize) bool {
+        _ = kv_fmt; // all three KV formats have a variant now
+        return (hd == 128 or hd == 256) and window == 0 and ring == 0 and !bidir and
+            seq_q > 1 and kv_heads > 0 and n_heads > kv_heads and n_heads % kv_heads == 0 and
+            n_heads / kv_heads <= 16;
+    }
+
+    fn attnGroupFn(self: *Backend, hd: usize, group: usize, kv_fmt: KvFmt) Error!cu.CUfunction {
+        const key = (hd * 32 + group) * 4 + @intFromEnum(kv_fmt);
+        if (self.attn_g_mod != null and self.attn_g_group == key) return self.attn_g_fn;
+        if (self.attn_g_mod) |m| m.unload(self.ctx); // a different group is a different kernel
+        self.attn_g_mod = null;
+        const ptx_src = kernels.buildAttnSplitGroup(self.gpa, hd, group, kv_fmt) catch return error.OutOfMemory;
+        defer self.gpa.free(ptx_src);
+        var mod = self.ctx.loadModule(ptx_src) catch return error.CudaError;
+        self.attn_g_fn = mod.getFunction(self.ctx, switch (kv_fmt) {
+            .f32 => "attn_split_g",
+            .f16 => "attn_split_g_f16",
+            .q8_0 => "attn_split_g_q8",
+        }) catch return error.CudaError;
+        self.attn_g_mod = mod;
+        self.attn_g_group = key;
+        return self.attn_g_fn;
+    }
+
+    /// Whole-chunk gated-delta-net recurrence with the state resident in registers
+    /// — one launch per layer per chunk instead of one per token, and the
+    /// `[heads][d][d]` state read/written once instead of `n` times. **Bit-identical
+    /// to `opGdnDeltaStep`**; see `kernels.buildGdnDeltaChunk` for why that matters
+    /// and what it constrains.
+    ///
+    /// `conv_out` is [n][channels] and `gates` [n][2*heads] — the batched layouts —
+    /// and `o` is [n][heads*d].
+    pub fn opGdnDeltaChunk(self: *Backend, state: DeviceBuffer, conv_out: DeviceBuffer, gates: DeviceBuffer, o: DeviceBuffer, heads: usize, d: usize, k_heads: usize, n: usize, channels: usize, scale: f32) Error!void {
+        self.ptic();
+        defer self.ptoc(.attn);
+        std.debug.assert(d % 32 == 0 and d <= 256 and n >= 1);
+        const f = try self.gdnChunkFn(d);
+        var ps = state.ptr();
+        var pcv = conv_out.ptr();
+        var pg = gates.ptr();
+        var po = o.ptr();
+        var pheads: u32 = @intCast(heads);
+        var pkh: u32 = @intCast(k_heads);
+        var pn: u32 = @intCast(n);
+        var pch: u32 = @intCast(channels);
+        var pscale = scale;
+        var params = [_]?*anyopaque{
+            @ptrCast(&ps),     @ptrCast(&pcv), @ptrCast(&pg), @ptrCast(&po),
+            @ptrCast(&pheads), @ptrCast(&pkh), @ptrCast(&pn), @ptrCast(&pch),
+            @ptrCast(&pscale),
+        };
+        self.ctx.launch(f, .{ @intCast(heads), 1, 1 }, .{ @intCast(d), 1, 1 }, 0, &params) catch return error.CudaError;
     }
 
     /// Per-head delta-net gates: decay = exp(a*softplus(alpha+dt)),
@@ -2344,6 +2600,23 @@ pub const Backend = struct {
             @ptrCast(&uu[4]), @ptrCast(&uu[5]), @ptrCast(&ff[0]), @ptrCast(&ff[1]),
         };
         self.ctx.launch(f, .{ @intCast(grid_rows), 1, 1 }, .{ 256, 1, 1 }, 0, &params) catch return error.CudaError;
+    }
+
+    /// `rowLaunch` with a second grid dimension — used by the batched decode
+    /// GEMVs, where grid.y is the TOKEN so one launch covers a whole chunk.
+    fn rowLaunch2(self: *Backend, f: cu.CUfunction, b0: ?DeviceBuffer, b1: ?DeviceBuffer, b2: ?DeviceBuffer, b3: ?DeviceBuffer, u: [6]u32, fp: [2]f32, grid_rows: usize, grid_y: usize) Error!void {
+        var p0: cu.CUdeviceptr = if (b0) |b| b.ptr() else 0;
+        var p1: cu.CUdeviceptr = if (b1) |b| b.ptr() else 0;
+        var p2: cu.CUdeviceptr = if (b2) |b| b.ptr() else 0;
+        var p3: cu.CUdeviceptr = if (b3) |b| b.ptr() else 0;
+        var uu = u;
+        var ff = fp;
+        var params = [_]?*anyopaque{
+            @ptrCast(&p0),    @ptrCast(&p1),    @ptrCast(&p2),    @ptrCast(&p3),
+            @ptrCast(&uu[0]), @ptrCast(&uu[1]), @ptrCast(&uu[2]), @ptrCast(&uu[3]),
+            @ptrCast(&uu[4]), @ptrCast(&uu[5]), @ptrCast(&ff[0]), @ptrCast(&ff[1]),
+        };
+        self.ctx.launch(f, .{ @intCast(grid_rows), @intCast(grid_y), 1 }, .{ 256, 1, 1 }, 0, &params) catch return error.CudaError;
     }
 
     /// f16 tensor-core conv/GEMM for the VAE: y[m][co] f32 = x[m][k] f32 @ Wᵀ + bias,

@@ -304,7 +304,7 @@ The hybrid CPU/GPU split works with **every KV dtype** (`--kv-dtype f32|f16|q8_0
 
 ## 7. Data-format support matrix
 
-DType enum: `src/dtype.zig:11` — `f8_e4m3, f16, bf16, f32, i8, i4, q4_0, q8_0, q4_k, q5_k, q6_k, iq4_nl`.
+DType enum: `src/dtype.zig:11` — `f8_e4m3, f16, bf16, f32, i8, i4, q4_0, q8_0, q4_k, q5_k, q6_k, iq4_nl, q1_0, q2_0_g64, q2_0_g128`.
 (`i8`/`i4` are the ComfyUI "convrot" formats for the **image/DiT** path; GGUF `q*` are the **LLM** path.)
 
 | Format | cpu | vulkan | zig-cuda | cuda | How it computes |
@@ -321,11 +321,327 @@ DType enum: `src/dtype.zig:11` — `f8_e4m3, f16, bf16, f32, i8, i4, q4_0, q8_0,
 | **GGUF q5_k** | ✅ ggml | ✅ `gemv_q5_k`/`_t` (scalar) | ✅ `gemv_q5_k(_q8/_q8n)` | ⤷ dequant→f16 | — |
 | **GGUF q6_k** | ✅ ggml | ✅ `gemv_q6_k`/`_t` (scalar) | ✅ `gemv_q6_k(_q8/_q8n)` | ⤷ dequant→f16 | — |
 | **GGUF iq4_nl** | ✅ ggml | ✅ `gemv_iq4_nl`/`_t` (scalar, module-const LUT) | ✅ `gemv_iq4_nl` (shared-mem LUT), `dequant_iq4_nl_f16` | ⤷ dequant→f16 | 32 elems / 18 B; non-linear `kvalues_iq4nl` LUT |
+| **GGUF q1_0** | ✅ ggml | ❌ (no GEMV kernel) | ✅ `gemv_q1_0` (f32), `gemv_q1_0_q8` (dp4a, default), `mmq_pipe_q1_0`, `dequant_q1_0_f16` | ⤷ dequant→f16 | 128 elems / 18 B; **1 sign bit per weight**, `v = bit ? d : -d`, `d = mean\|x\|` |
+| **GGUF q2_0 g128** | ✅ **native** `dotQ2_0G128` (fused, exact activations — NOT ggml) | ❌ (no GEMV kernel) | ✅ `gemv_q2_0_g128_q8` (dp4a, default), `gemv_q2_0_g128` (f32), `dequant_q2_0_g128_f16` | ⤷ dequant→f16 | 128 elems / 34 B; 2 bits/weight, `v = (code - 1) * d`, codes → {−1, 0, +1, +2} |
+| **GGUF q2_0 g64** | ✅ ggml | ❌ | ✅ `gemv_q2_0_g64_q8` (dp4a), `gemv_q2_0_g64` (f32), `dequant_q2_0_g64_f16` — ⚠️ **built, not measured** (no g64 file exists here) | ⤷ dequant→f16 | 64 elems / 18 B; same arithmetic, ggml's own `QK2_0` |
 
 Notes:
 - **int4 / W4A4 is CUDA-hand-PTX-only** (`s4 m16n8k64` tensor cores). CPU has a correctness path; Vulkan and cuBLASLt cannot do sint4.
 - **GGUF block-quant on GPU dequants on-the-fly inside the GEMV** — never expanded to VRAM. Vulkan's GEMV is **scalar f32 (no dp4a)** and lacks `q4_0`. The `cuda` (libs) arm dequants GGUF to f16 for prefill GEMM but uses the shared **hand-PTX** GEMV at decode (cuBLASLt/cuDNN never consume GGUF block-quant directly).
 - **convrot** (`src/ops/convrot.zig`): size-256 Hadamard rotation, applied at int8/int4 dequant. `cols` must be a multiple of 256 (i4 also even from nibble-packing).
+- **q1_0 is the first 128-element block** (every other quant here is 32 or 256), so anything that hardcoded those two sizes is wrong for it — `matmul.packedTaskBlock`'s k-slice assert is now per-dtype for that reason.
+- ⚠️ **GGUF type id 42 is claimed by TWO formats, and picking the wrong one is silent.** Both spell
+  themselves "Q2_0", both compute `v = (code - 1) * d` from 2-bit codes packed 4 per byte LSB-first, and
+  they differ **only in block size**: upstream ggml's `QK2_0 = 64` (18 B) against the PrismML llama.cpp
+  fork's `prism` branch at `QK2_0 = 128` (34 B). Every published Bonsai / "Ternary" GGUF is the latter,
+  advertised on the model card as "Q2_0 g128"; the fork's own `master` and `pr/q2_0-*` branches are g64,
+  so the fork is not a reliable tell either. Nothing *inside* a file distinguishes them — not the type id,
+  not `general.file_type` (41 = `LLAMA_FTYPE_MOSTLY_Q2_0` for both).
+  - **The only signal is the on-disk row length, and it differs by just 17/18.** On Bonsai's 5120-wide row
+    that is 1440 B (g64) vs 1360 B (g128). `gguf.detectQ2_0Variant` resolves it from the gap to the next
+    tensor in offset order, accepting a candidate only on `alignForward(size) == gap`; ~5.6% against ≤32 B
+    of padding leaves no ambiguity band for a real weight matrix, and a gap fitting both or neither casts
+    no vote rather than guessing. No vote at all, or two tensors disagreeing, is `AmbiguousQ2_0Variant`.
+  - ⚠️ **The failure is asymmetric, which is why detection is not optional.** Reading a **g64** file as
+    g128 computes *smaller* spans than reality, so `gguf.zig`'s bounds check (`offset + nbytes <=
+    payload.len`) **passes** and every tensor view is silently short and misaligned — plausible garbage,
+    no error. The reverse (g128 read as g64) overruns and does surface as `InvalidOffsets`, which is how
+    this was found. A `ne[0] % blockElems()` check does not save you: real hidden dims (5120, 4096, 14336)
+    are multiples of 128 as well as 64.
+  - **g128 is decoded natively, NOT by ggml** (`quants.dequantQ2_0G128`), even though our pinned ggml has
+    a `GGML_TYPE_Q2_0` — because that one is g64, and `QK2_0` is a compile-time `#define` baked into every
+    kernel, so there is no way to ask ggml for the other stride. `quants.ggmlType(.q2_0_g128)` returns
+    **null** as a hard interlock: it makes every ggml entry point (dequant, `vec_dot`, quantize)
+    unreachable for the dtype. Patching the vendored ggml's `QK2_0` was rejected — it would fork a
+    dependency and break g64 instead, trading one silent wrong answer for another.
+  - **Cost of that interlock, and its fix:** g128 loses ggml's AVX2 fused `vec_dot`, so it first fell back
+    to the packed dequant-to-f32 path — 4 B/element against 0.266 B stored, ~15x the memory traffic, which
+    measured **0.2 tok/s** decode on Bonsai-27B. `quants.dotQ2_0G128` + `matmul.native_gemv` are the native
+    replacement (same thread-over-row-chunks shape as `ggml_gemv`, no activation quantization):
+    **0.2 → 2.6 → 3.2 tok/s, 16x**, output byte-identical throughout. g64 keeps ggml and is unaffected.
+    - The 2.6 → 3.2 step is the instructive one. The first kernel used a `[256][4]f32` coefficient table
+      indexed per qs byte — the obvious form, and **three loads per 4 elements**. `--profile` put `matmul`
+      at **91.2%** of decode while sustaining only **17.8 GB/s** of weight traffic, far under this box's
+      DDR5 bandwidth: load-issue bound, not memory bound. Replacing the table with SIMD shift-extraction
+      (one integer load per 8 codes) gave +23% at **21.9 GB/s**, `matmul` still 90.3%.
+    - **vs llama.cpp: 0.76x**, measured matched — same prompt, same 299 generated tokens, `-t 8` on 8
+      cores (SMT off), two runs each: **TP 3.3, 3.3** against **llama.cpp 4.31, 4.36** (PrismML `prism`).
+      ⚠️ An earlier figure of "0.53–0.68x" in this file was **wrong**: it compared a 40-token TP run against
+      llama.cpp at `-t 12`, and short runs here are noisy enough to be meaningless — the same 39-token
+      llama.cpp workload measured **6.02 tok/s at `-t 12` and 4.06 at `-t 8`**, i.e. *faster* while
+      oversubscribed. Two 300-token runs per side is the smallest thing that settles it.
+    - The remaining 1.31x is llama.cpp's kernel design, not a missing micro-optimization. Its x86
+      `ggml_vec_dot_q2_0_q8_0` **quantizes the activation to q8_0** and dots in int8: `vpdpbusd` (VNNI —
+      present and enabled on this CPU) does 32 multiply-accumulates per instruction against our 8 f32
+      FMAs, and the activation stream is 4x smaller. It does not net 4x because it spends more shuffling
+      to widen 2-bit codes to bytes, needs a **second** `vpdpbusd` per chunk for the `-1` offset
+      (`dot(code,y) - dot(1,y)`, since codes are 0..3 but values are −1..2), and pays a horizontal sum per
+      32 elements.
+    - **Closing it means quantizing the activation, which this kernel deliberately does not do** — the
+      same accuracy trade `exact_activations` exists to name. At 0.76x on a fallback path, against an
+      exactness property the packed path shares, that has not been judged worth taking.
+- **q2_0 g128 measured on Bonsai-27B** (`Ternary-Bonsai-27B-Abliterated-LowDeg-Q2_0`, 7.2 GB at 2.125 bpw),
+  3090, `zig-cuda`, 7.2 GB VRAM. Reference is a **PrismML `prism`-branch llama.cpp built with CUDA**
+  (`-ngl 99`), same prompt and 299 generated tokens, two runs each:
+
+  | | TP | llama.cpp | ratio |
+  |---|---|---|---|
+  | decode, f32 GEMV (first cut) | 32.4 | 67.8 / 66.3 | 0.48x |
+  | decode, **dp4a** (session A) | 62.8 / 61.7 | 67.8 / 66.3 | 0.93x |
+  | decode, **dp4a** (session B, interleaved) | 57.7 / 57.7 / 58.6 | 61.9 / 63.3 / 64.2 | **0.92x** |
+
+  ⚠️ Compare down the *ratio* column, never across the tok/s columns between sessions — see the
+  measurement note below.
+
+  **PREFILL** (1937-token prompt, so the ~0.3 s of fixed PTX-JIT that swamps a 44-token prompt is only
+  ~7% here). `mmq_pipe_q2_0` closed most of the gap:
+
+  | | TP | llama.cpp | ratio |
+  |---|---|---|---|
+  | prefill, dequant+f16 (before) | 463 / 472 / 486 | 1206 / 1140 | 0.40x |
+  | prefill, **MMQ** (after) | **768 / 817 / 770** | 1194 / 1287 / 1231 | **0.63x** |
+
+  Isolated A/B from ONE binary (`TP_NO_MMQ2`), alternating: **486 → 780 tok/s, +61%**, with decode
+  unchanged (58–59 both arms) and output still correct — including a 1946-token multi-chunk prefill.
+
+  **Why the port was cheap, and this is the reusable part:** the q1_0 prefill campaign's 333 → 1097 was
+  five architecture-level wins (batched GDN ops, register-resident GDN recurrence, group-shared prefill
+  attention, per-arch prefill batch 512) plus two q1_0-kernel ones. **All the architecture-level work is
+  dtype-independent and was already active for q2_0** — verified: `prefill_batch = prefill_chunk = 512`
+  via `prefillBatchOf`, plus `opGdnDeltaChunk` / `gdn_conv_batch` / `buildAttnSplitGroup`, none of which
+  look at the weight dtype. So only the one dtype-specific piece was missing.
+  - `buildMmqPipeQ2_0` reuses `buildMmqPipeQ1_0`'s pipe wholesale because q2_0 shares **both** properties
+    that make q1_0 the simplest MMQ here: signed symbols out of the `prmt` table mean **no min term**, and
+    a 128/64-element block means **one scale per 64-k slab**. Only the addressing (16 code bytes per slab
+    not 8, stride 34/18, `SPB` slabs per block) and the unpack differ.
+  - ⚠️ **The one real risk was registers, and it had to be measured first.** `ptxas -arch=sm_86 -v` puts
+    `mmq_pipe_q1_0` at **255 registers with zero spill** — the hard ceiling. A naive port holding eight
+    live `u16` instead of four would have spilled. Packing each pair into a u32 *at load time*, into the
+    addressing temps that are already dead, keeps it at **255 registers / 0 spill / 44032 B smem —
+    identical to q1_0** — and a u32 of 16 codes is exactly what `emitQ2Unpack` wants anyway.
+  - ⚠️ `prmt` reads only the **low 16 bits** of its selector, so a u32 of 16 codes is unpacked in two
+    halves rather than masked in one go.
+  - ⚠️ g64's MMQ is generated from the same function but, like its GEMVs, is **built and never executed**
+    — no g64 file exists here.
+
+  **The prefill budget after MMQ** (`TP_SKIP` bitmask in `qwen35_cuda.stepBatch`, one component removed
+  per run, 1937-token prompt, each measurement PAIRED with an adjacent baseline so the box's drift
+  cancels). The parts sum to the 2443 ms baseline exactly — that closure is what makes it usable:
+
+  | component | ms | share |
+  |---|---|---|
+  | MLP (gate/up/down + silu) | 910 | 37% |
+  | **per-token OTHER** (norms / rope / KV store / elementwise) | **393** | **16%** |
+  | **fixed startup** (module load + PTX JIT) | **372** | **15%** |
+  | GDN qkv/z/out GEMMs | 307 | 13% |
+  | GDN recurrence + batched ops | 172 | 7% |
+  | attention op | 158 | 6.5% |
+  | attn qkv/o GEMMs | 131 | 5.4% |
+
+  - ⚠️ **A single unpaired sweep was useless** — the baseline itself moved 773→806 between runs and
+    `TP_SKIP=4` came out *below* baseline, i.e. removing work appeared to make it slower. Pair every
+    skip run with an adjacent baseline.
+  - **Fixed vs marginal, solved from four prompt lengths** (497/977/1937/3857): `fixed = 372 ms`,
+    `marginal = 1.121 ms/token` → **steady-state 892 tok/s** (0.72x of llama.cpp, against 0.63x at
+    N=1937). ⚠️ So quoting prefill at one length understates us; the fixed term is **39% of a
+    497-token prefill** and only 15% at 1937. `CUDA_CACHE_DISABLE=1` costs a further 344 ms, so the
+    warm fixed term is module *loading*, not compilation — llama.cpp ships precompiled cubins and pays
+    neither.
+  - ⚠️ **MMQ is NOT the remaining bottleneck, and this is the receipt that stops another round of
+    kernel tuning.** The MLP's three GEMMs are 66.3 TFLOP of int8 work in 910 ms = **72.9 TOPS**,
+    against llama.cpp's isolated `test-backend-ops` q2_0 MMQ at **79.56 TFLOPS** — **0.92x, in situ
+    against their microbenchmark**, and microbenchmarks flatter (one L2-resident weight). Further MMQ
+    work would have to beat their kernel, not catch it.
+  - **Next levers, in order:** (1) the 393 ms of per-token elementwise/norm/rope/KV — ~936 kernel
+    launches per token, which is where fusion pays; (2) the 372 ms fixed module load, which dominates
+    *short* prompts and is a build-time-cubin project; (3) GDN recurrence at 172 ms — but the chunked
+    DeltaNet that would shrink it **costs bit-identity** with the decode path and was ruled out for
+    q1_0 on exactly that ground.
+
+  - **The dp4a GEMV is worth ~1.9x** (32.4 → ~58–63), the same step q1_0 took (37.2 → 75.8). Both kernels
+    are generated from one `Q2Geom` template, so g64 and g128 cannot drift apart. This is the only change
+    here that is far outside the noise floor; everything below is inside it.
+  - ⚠️ **MEASUREMENT METHOD, and it invalidated three of this section's earlier conclusions.** This box
+    drifts several percent *between sessions*: the identical binary measured 62.8 tok/s in one session and
+    57.3–59.4 (5 runs, ±1.8% within-session) in the next, and **llama.cpp moved with it** — 67.8 → 63.1
+    over the same interval. Absolute tok/s across sessions is therefore meaningless; only an
+    **interleaved, same-session A/B** is. Clocks are not the story (they boost to 1950–1980 MHz of 2100
+    either way) and neither is short-run noise — the within-session spread is small. Whatever drifts,
+    drifts for both engines, so the RATIO is the stable quantity and it has held at **0.92–0.93**
+    throughout.
+    - Casualty 1: "the `prmt` symbol-LUT added ~2%" — inside the noise, unproven.
+    - Casualty 2: "two-row blocking is 4% slower" — **wrong**, it was compared against a stale baseline
+      from the previous session. Re-measured properly (same binary, `TP_Q2_X2`, alternating): 1-row
+      56.9 mean vs x2 57.7 mean, i.e. **a wash**. The kernel is kept behind `TP_Q2_X2`, default off.
+    - Casualty 3: "the residual is `quantizeX` redundancy" — **wrong**, `step` already hoists it (one
+      quantize serves qg/k/v, qkv/z/alpha/beta, gate/up). The ~256 per token that remain are all for
+      fresh data; fusing every one of them away bounds out near 2.5%.
+  - **Occupancy is already 100%, measured** (`ptxas -arch=sm_86 -v`: 38 registers, 256 threads/block →
+    8 warps/block × 6 blocks = 48 warps/SM, the Ampere maximum; full occupancy needs ≤42.6 registers).
+    So "more parallelism" is not available and not the lever — which is also why two-row blocking could
+    not win: it halves the block count with no occupancy headroom to reclaim, and on a 5120-row weight
+    that drops the grid from 640 blocks (1.3 waves over 82 SMs) to 320 (0.65), under one wave.
+  - **Where the residual ~8% actually lives is still OPEN, and the next step is a per-op comparison, not
+    another guess.** llama.cpp's isolated kernel on `m=4096, n=1, k=14336` is **26.72 us/run** =
+    15.6 MB / 26.72 us = **~584 GB/s, 62% of peak** (`test-backend-ops perf -o MUL_MAT -b CUDA0
+    -p type_a=q2_0`). Their *end-to-end* decode is only ~430 GB/s-equivalent, so a large part of the gap
+    for both engines is everything that is not the GEMV. `qgemv-bench` does not yet cover the m=1 decode
+    GEMV; adding it would give our directly comparable number against that 26.72 us and finally localize
+    the difference to the kernel or to the surrounding pipeline.
+  - One structural fact both engines share: a q2_0 block is 18/34 bytes, so `qs` is only 2-byte aligned
+    and both issue four `u16` loads per 32 elements (2 bytes per load instruction). The `+2` f16 scale
+    makes alignment alternate with the block index, so it cannot be specialized without warp divergence.
+  - **Correctness:** the 220-token content run is exactly right (30 integers, alphabet, countdown), and
+    against llama.cpp's CUDA output it is character-identical for ~40 tokens before flipping
+    `comma separated`/`comma-separated` and re-converging — the near-tie signature both engines' int8
+    activations produce, not a decode error. The f32 `gemv_q2_0_*` kernels remain as the exact path.
+- **q1_0 measured on Bonsai-27B** (a qwen35 hybrid, 3.8 GB at 1.125 bpw), 3090, `zig-cuda`, against llama.cpp with full offload. **Token-identical to both the CPU path and llama.cpp on 5 greedy prompts** (including a 1163-token multi-chunk prefill), and the decode number is *better* than llama.cpp's:
+
+  | | TP | llama.cpp | |
+  |---|---|---|---|
+  | decode | **~73 tok/s** | 58.3 | **1.25×** |
+  | prefill (1157 tok) | **~554 tok/s** | 1276 | 0.43× |
+
+  ⚠️ **Measure these warm and on an idle GPU.** The 3090 sits at ~1100 MHz of a 2100 MHz max when it has been idle, boosts to ~1935 MHz under sustained load, and a competing process moves these numbers ±8% — enough to invent a regression that is not there. Decode sampled 72–77 and the 9B q6_k prefill 470–521 across this work; a single short run cannot support a few-percent claim.
+
+  Decode came in three measured steps, and the first is the generalizable one: **block-per-row 28.0 → warp-per-row 37.2 → dp4a 75.8**. q1_0 is the format most punished by a block-per-row shared-memory reduction, because one bit per weight means the least work per row of any quant — the reduction costs more than the dot product.
+- **Prefill: 187 → 333 → 414 → 554 tok/s**, in that order (2.96× overall). `mmq_pipe_q1_0` (see `buildMmqPipeQ1_0`) plus `prefill_chunk` 128 → 256 gave the first step; isolated, since both changed at once: 187 (chunk 128, dequant) → 251 (chunk 256, dequant) → 288 (chunk 128, MMQ) → **333** (both), so the two contribute ~independently. 512 measures flat against 256, so 256 is the knee. Batching the GDN recurrence (next bullet) gave the second step, to **414**.
+- ⚠️ **CORRECTION to an earlier claim in this file: the remaining prefill gap was NOT MMQ kernel quality**, and the "next levers" recorded here (`cp.async`, `ldmatrix`, wider n-tile) were the wrong target. Measured with `zig build qgemv-bench` on the real shape (17408×5120, n=256): `mmq_pipe_q1_0` does **63.9 TOPS**, i.e. **22.5% of a 3090's ~284 dense int8 peak — the same efficiency band as llama.cpp's MMQ** (~24%). Its time is also *flat* from n=1 to n=128 (0.372 ms), the signature of latency, not throughput: at BM=128 with 128 threads the grid is only `rows/128` = 136 blocks and register pressure (128 f32 accumulators) caps occupancy near 2 blocks/SM. The FFN GEMMs account for only ~26% of prefill, so even doubling MMQ would buy ~13% end to end.
+- ⚠️ **What prefill actually spent its time on: the GDN recurrence ran PER TOKEN inside batched prefill** — 7 launches per token per linear layer (`quantizeX`, two `rows=48` GEMVs, gates, conv, L2-norm, delta step). On Bonsai that is 48 layers × 1157 tokens × 7 = **389k launches**, against 403k counted by the profiler. The isolation ladder, removing exactly that loop:
+
+  | per-token GDN loop | prefill |
+  |---|---|
+  | all 7 ops | 333 tok/s |
+  | minus quantizeX + 2 GEMVs + gates | 372 |
+  | only `opGdnDeltaStep` | 411 |
+  | loop removed entirely | 614 |
+
+  So the loop was **46% of prefill** and only `opGdnDeltaStep` is genuinely sequential. Six of the seven are now batched over the chunk (`opGdnConvBatch`, `opGdnGatesBatch`, `opGemvQuantQ8Batch`, `opL2NormRowsGrouped`) for **333 → 414 tok/s (+24%)**, and the seventh — the recurrence itself — became `opGdnDeltaChunk`, taking it to **554** (91% of the 614 ceiling), still token-identical to llama.cpp on 5 prompts including a 1163-token multi-chunk prefill.
+- **The recurrence did NOT need a chunked/parallel DeltaNet.** ⚠️ Worth reading before anyone reaches for one: `kernels.buildGdnDeltaChunk` keeps the state in **registers** across the whole chunk (one block per v-head, thread `j` owning column `j` of `[d][d]`), which is the *same recurrence in the same order* — so it is **bit-identical** to the per-token `gdn_delta_step`. That was the deciding property, not the speed:
+  - The per-token form streamed the state through global memory every token: `[heads][d][d]` f32 read **and** written, ~3.1 MB each way per layer per token, **~350 GB over a 1157-token prefill**. Its own doc comment already said it was "load-latency bound". Registers make that traffic vanish; only the staged k/q and the small per-token gates/v/o touch memory.
+  - **Decode can only ever run the per-token form** (n=1), so prefill and decode must agree exactly or a re-prefill (regenerate, variant rollback, suspend/resume) would diverge from the incremental path. A chunked DeltaNet — matmuls plus a 64×64 triangular solve, which is what llama.cpp's `build_delta_net_chunking` does via `ggml_solve_tri` — reassociates the recurrence and would **not** have this property, on top of making chunk size a numerical-stability knob (upstream drops to CS=16 for the KDA variant).
+  - **Verified by A/B on the same backend**, not by argument: batched vs per-token over a 1164-token prefill plus 250 greedy tokens produced **identical bytes** (and 310.8 → 579.4 tok/s on that prompt). Any bit of state divergence would almost certainly flip a token within 250.
+  - ⚠️ The `i` walk is **fully unrolled** because PTX cannot index a register file — that is what forces this kernel to be *generated* rather than written, and why `d` is baked in and the module is cached keyed by it (`Backend.gdn_chunk_d`). Cost is ~`d` live f32 registers per thread (128 for qwen3.5); it adds no parallelism (still `heads` blocks), so the ~614 ceiling stands.
+  - **The conv is a CONVOLUTION, not a recurrence** — `out[t]` depends only on `x[t-3..t]`, so given the state carried *in*, every token is independent. That is what makes it batchable; only the 3-column state roll is sequential, and it moves to a separate one-per-chunk launch because every token's threads read the same incoming state.
+  - ⚠️ **`gdn_conv_batch` sums its taps in order 3, 0, 1, 2**, not ascending, to reproduce `gdn_conv_step`'s order exactly. f32 addition is not associative and this model is validated token-identical, so ascending order would make batched prefill disagree with single-token decode in the last bits.
+  - ⚠️ **`ssm_alpha`/`ssm_beta` are [48, hidden], which no GEMM here can take**: `launchHgemm` computes `grid.x = rows/128`, so rows=48 is a zero-sized grid (`CUDA_ERROR_INVALID_VALUE`). Hence `opGemvQuantQ8Batch` — the dp4a GEMV with a token dimension on grid.y — rather than routing them through `gemm`.
+  - **What remains is NOT in the GDN path.** With the whole per-token loop removed the ceiling was 614 tok/s, and `opGdnDeltaChunk` reaches 554 — so ~90% of the GDN cost is gone and a chunked DeltaNet could buy at most ~11% more while giving up bit-identity.
+
+### Where the remaining ~2× of qwen35 prefill is (measured 2026-08-05)
+
+Isolated with a temporary `TP_SKIP` bitmask in `stepBatch` (one build, one component removed per run) at 1155 tokens. **The budget closes to 0 ms against the 1978 ms baseline**, which is what makes it trustworthy:
+
+| component | ms | share |
+|---|---|---|
+| MLP (gate/up/down + silu) | 803 | 41% |
+| GDN qkv/z/out GEMMs | 273 | 14% |
+| attention op | 217 | 11% |
+| GDN recurrence + batched ops | 118 | 6% |
+| attn qkv/o GEMMs | 113 | 6% |
+| residual | 454 | 23% |
+
+⚠️ **The residual is NOT per-token work — it is ~190 ms of FIXED startup** (PTX JIT of the eltwise/MMQ modules) that the reported `pp` rate includes. Solved from two prompt lengths (1155 and 2295 tokens): baseline is `187 ms + 1.578 ms/token`, so **steady-state prefill is 634 tok/s, not the 554–584 a short prompt reports**. Layer elementwise is only 13 ms and the host `embedTokens` is free (577.4 vs 578.2 tok/s with it removed) — both were candidate explanations and both are wrong. **Compare against llama-bench's warm, averaged number using the marginal rate, or a short-prompt `pp` will understate TP by ~10%.**
+
+Against llama.cpp's 1276 tok/s (0.784 ms/token), the gap splits in two:
+
+| | TP ms/token | llama.cpp | gap |
+|---|---|---|---|
+| matmul | 1.029 (65%) | 0.622 | **1.66×** |
+| non-matmul | 0.548 | 0.162 | **3.39×** |
+
+- ⚠️ **Our MMQ really was slower than llama.cpp's, and that was measured, not inferred.** `test-backend-ops perf -o MUL_MAT -p type_a=q1_0 -b CUDA0` reports **86.50 TFLOPS** at m=4096/n=512/k=14336; `qgemv-bench` on that *identical* shape gave our `mmq_pipe_q1_0` **65.0 TOPS** — **1.33×**. (The earlier claim in this file that the two were in the same band came from dividing llama.cpp's end-to-end rate by the compute bound, which silently assumed their prefill was all matmul. It is 79% matmul, not 100%. **Never infer a kernel's efficiency from an end-to-end rate when a per-op benchmark exists.**)
+
+#### Closing most of it: cp.async double-buffering (2026-08-05)
+
+Two probes decided the design, and the first one saved a lot of wasted work:
+
+| probe (wrong output, timing only) | ggml shape, n=512 |
+|---|---|
+| baseline | 65.0 TOPS |
+| scale fold cut 4× (fold 1 of 4 accumulator quads) | 71.5 (**+10% only**) |
+| A/B staging removed entirely | 80.4 (**+24%**) |
+
+So the **fold is not the limiter** — which killed a planned 128-element activation requantization that would have cut the fold 4× for ~10%, and would have changed prefill numerics for it. The limiter was **exposed global-load latency**: the single-buffered loop staged, `bar.sync`d, computed, `bar.sync`d, so nothing overlapped the ~500-cycle loads.
+
+Result, `rel` unchanged at 0.00534 throughout (and still token-identical to llama.cpp on 5 prompts):
+
+| shape, n | before | after |
+|---|---|---|
+| b27 mlp gate/up, n=256 | 63.9 | **72.6** |
+| b27 mlp down, n=256 | 56.5 | **80.8** |
+| ggml perf shape, n=512 | 65.0 | **76.2** (vs llama.cpp 86.50 → 1.14×, was 1.33×) |
+
+**End to end: steady-state prefill 634 → 698 tok/s.** Decode untouched (76.7; it never uses MMQ).
+
+Three things the implementation commits to:
+
+- ⚠️ **cp.async PAYS FOR ITSELF IN REGISTERS BEFORE HIDING ANY LATENCY.** The kernel sat at 254 of 255 registers, so there was no headroom for prefetch state at all — but moving B global→shared with `cp.async.ca.shared.global` deletes its 16 staging registers, which funds the ~10 the A prefetch needs. Final: 255 registers, 35.8 KB smem (two buffers), **no spills** (`ptxas -v`).
+- **A cannot use cp.async** — its bytes are transformed by the `prmt` decode — so A's raw u16s are prefetched into REGISTERS a slab ahead and decoded into shared after the compute that hides their latency.
+- ⚠️ **The slab loop is unrolled 2× so buffer parity is COMPILE-TIME**, keeping every shared offset an immediate (`buf * SH_HALF`) instead of spending a register and an add per access. `cols % 256 == 0` makes `cols/kstep` a multiple of 4, so nslab is always even. The prefetch index is **clamped** to the last slab rather than branched on — the extra fetch is garbage that is never consumed, and clamping keeps the address in bounds. One `bar.sync` per slab instead of two.
+- **A smaller free win found on the way:** B's staging issued load/store/load/store, so the second pair of global loads waited on the first pair's registers, serializing two latencies that should overlap. Issuing all four `ld.global.v4.u32` before any store was +3%.
+
+⚠️ **`prefill_chunk` still cannot be raised, and it was re-tested after the speedup.** The kernel is much better at n=512 (gate/up 72.6 → 88.9, down 80.8 → 92.2), so the balance should have shifted — but 256 and 512 measure **668.8 vs 668.7 tok/s** over three runs each. The attention masking cost (below) grows with chunk size and still cancels the matmul gain exactly; 512 also costs 162 MiB more scratch. **Attention is now the binding constraint on chunk size, so fixing it unlocks the kernel's large-n regime as well as its own 11%.**
+- ⚠️ **`qgemv-bench` OVERSTATES the kernel** because it hammers one 11 MB weight for 40 iterations, so the weight is L2-resident; the real model streams 3.6 GB of distinct weights per chunk. Use it for A/B between kernels, not as an absolute.
+- ⚠️ **`prefill_chunk` above 256 IS DEAD CODE, and that is why raising it never helped.** The engine slices prefill into `engine.prefill_gate_chunk = 256`-token pieces so the pause/cancel gate can land mid-prefill, so `qwen35_cuda.prefill` never receives more than 256 ids (255 in practice — the last prompt token is held back for the first decode step) and its internal chunk loop never iterates. Raising the constant changes only the activation buffer sizes.
+  - **How it was found:** the profile showed *identical launch counts* (9434 / 1216 / 19076) at chunk 256 and 512, which cannot happen if the batching changed. Logging the actual `n` gave `n=255` nine times in both configs. Two earlier hypotheses — masked attention work, then attention cost in general — were both wrong, and both were about the *wrong variable*.
+  - **Raising it alone is actively harmful** (−31% on the matmul bucket at 512): the same 255-token work with `mlp_gate`/`mlp_up` doubled to 35.7 MB each and `attn_scratch` to 102 MB, half-used, so it is pure locality loss for zero benefit. **⚠️ Change `engine.prefill_gate_chunk` and `prefill_chunk` together or not at all.**
+  - **Fixed by making the batch the STEPPER's choice** (`engine.prefillBatchOf`): a stepper that knows what its kernels want declares `prefill_batch`, everyone else keeps `prefill_gate_chunk` and today's behaviour. qwen35_cuda ties `prefill_batch = prefill_chunk` so the two cannot drift again. **Prefill 959 → 1097 tok/s steady-state (+14%).** Measured at 1024 as well: ~604 tok/s, i.e. the buffers outgrow useful locality, so 512 is the knee.
+  - ⚠️ **Pause and cancel are now polled at DIFFERENT granularities, deliberately.** `ops/pause.zig` states that parking mid-kernel would strand half-computed state and held locks, so **pause** still parks only at batch boundaries — a paused worker waits at most one forward, which is the accepted cost of a larger batch. **Cancel** discards its work by definition, so it is safe to unwind mid-forward where parking is not: `engine.publishCancel` publishes the engine's flag to `ops.cancel`'s threadlocal token (which the LLM path never set before), and `qwen35_cuda.stepBatch` polls it **between layers**, returning `error.Canceled`. The existing `errdefer` aborts the recording batch and `self.len` only advances after `endBatch`, so an unwind commits nothing and `cached()` stays truthful. Net: cancel got *finer* (≈one layer, was one 256-token batch) while the batch doubled.
+  - ⚠️ **There were FIVE copies of this prefill loop** — three in `engine.zig` (plain / argmax / select) and two in `spec.zig` — and the first fix only patched one, which is why the measurement did not move. That duplication is what let the original cap hide. All five now share `prefillBatchOf` / `publishCancel` / `isCancelUnwind`, and those three have unit tests (a stepper with and without the decl, token publish/restore, and that only `error.Canceled` counts as an unwind).
+  - `isCancelUnwind` matches by error NAME on purpose: only steppers that poll the token can produce `error.Canceled`, and an explicit `switch` arm fails to typecheck against the error sets of those that cannot.
+
+#### Prefill attention: share the KV fragment across the query-head group (2026-08-05)
+
+⚠️ **CORRECTION to a claim made twice above and acted on once: `attn_split` is ALREADY exactly causal.** Each `(query, head, split)` warp uses `kv_len = kv_len0 + t`, so no masked work is ever computed and discarded, and there is nothing for a "causal-aware" rewrite to skip. The waste is elsewhere: **each of the `group = heads/kv_heads` query heads re-reads the same KV head.** With 24 heads over 4 kv heads and 256 queries that is a 1536× re-read of K and V.
+
+The model matches the measurement, which is what makes it actionable: **6.29 GB of L2→SM traffic per attention call, 503 GB over a 1155-token prefill, ~252 ms at the 3090's ~2 TB/s L2** — against 217 ms measured for the whole `attn` bucket. Warp-instruction bound was ~27 ms, i.e. 9× of headroom to spend on arithmetic in exchange for traffic.
+
+`kernels.buildAttnSplitGroup` (entry `attn_split_g`) makes one warp own a `(query, **kv head**, split)` and loops the group's q heads inside, so K and V are read **once** for the group. Traffic drops by `group` (6× here); the instruction count per warp rises by ~`group` while the warp count falls by `group`, so total instructions are unchanged.
+
+| | 1155 tokens | 2295 tokens |
+|---|---|---|
+| before | 660 tok/s | 672 |
+| after | **716** | **810** |
+
+**Steady-state prefill 698 → 901 tok/s.** The gain grows with context because attention cost grows with `kv_len` while the matmuls do not.
+
+- ⚠️ **Bit-identical to `attn_split` per head** — same j order, same dot order, same butterfly, same `ex2.approx` softmax sequence — and **verified by A/B on the same backend**, not argued: group vs general over a 1164-token prefill + 250 greedy tokens produced **identical bytes**. This matters more here than anywhere else, because prefill attention writes the KV cache that decode then reads.
+- ⚠️ **I built it for hd=128 first and it did nothing, because qwen3.5's `key_length` is 256.** `opAttnDecode` branches `hd == 256 or hd == 512` *before* the hd=128 path, so the kernel was never reached. **Check `head_dim` from the checkpoint before choosing an attention variant** — the builder now takes `hd` and the dispatch is tested first.
+- Narrow by design (`Backend.attnSplitGroupOk`): hd ∈ {128, 256}, full causal (`window == 0`, `ring == 0`, no bidir), `seq_q > 1`, `heads > kv_heads`. Everything else keeps the general kernel — and since the two are bit-identical per head, that predicate is a pure performance choice, never a correctness one. The module is cached keyed by `(hd*32 + group)*4 + kv_fmt`, because both the group and the KV decode are unrolled into the kernel.
+- **All three KV formats have a variant** (`attn_split_g` / `_f16` / `_q8`). `kernels.emitKvFrag` mirrors `elt.emitKVLoad` instruction for instruction — same load widths, same sign-extend shifts, same multiply order — which is what keeps each variant bit-identical to the `attn_split*` it replaces. ⚠️ The q8_0 arm relies on a lane's fragment never straddling a 34-byte block: rows are block-aligned and the fragment is `dims`-aligned with `dims | 32`, so `elem % 32 == (lane*dims) % 32` and the quant offset `(lane*dims & 31) + 2` is loop-invariant.
+
+  | KV format | general | group-shared | |
+  |---|---|---|---|
+  | f32 | 687.9 tok/s | **753.0** | +9.5% |
+  | f16 | 731.2 | **750.2** | +2.6% |
+  | q8_0 | 731.2 | **749.2** | +2.5% |
+
+  **f16/q8 gain far less, and the baselines say why:** their KV elements are 2 and ~1.06 bytes instead of 4, so the general kernel's redundant re-reads already cost proportionally less (note their *baseline* is 43 tok/s ahead of f32's). The group kernel brings all three to ~750, i.e. attention stops being traffic-bound in every format. All three verified **bit-identical** by A/B on the same backend over a 1164-token prefill + 200 greedy tokens.
+- gemma3/gemma4 are unaffected: their local layers set `ring != 0` and their global layers are hd=512, so both fall outside the gate. Smoke-tested gemma4-12B after the dispatch change.
+
+#### The MMQ fragment loads had a 4-way bank conflict; padding fixed it (2026-08-05)
+
+⚠️ **This was found while scoping `ldmatrix`, and it turned out to be what `ldmatrix` would mostly have bought.** The A/B fragment load has lane `L` read row `base + L/4` at word `ks*8 + L%4`. With the row stride equal to `kstep` = 64 bytes = 16 words, the row term is `16*gid mod 32` ∈ {0,16}, so **the 32 lanes touch only 8 of the 32 banks — a 4-way conflict on every one of the 32 fragment loads per substep.**
+
+Padding the shared row stride to **80 bytes (20 words)** makes it conflict-free: the row term becomes `20*gid mod 32` = {0,20,8,28,16,4,24,12}, eight distinct multiples of 4, so adding `tf` 0..3 covers all 32 banks exactly once. Verified by enumeration, not assumed.
+
+Padding rather than an XOR swizzle, deliberately: at kstep=64 a row is only 16 words, so the pipe's usual `(row&7)<<4` swizzle crosses into the next row, and the `(row&3)<<4` mask that *does* fit still leaves 2-way conflicts because gid 4..7 alias gid 0..3. Costs 4 KB more shared (44 KB for two buffers, still under the 48 KB default limit).
+
+| shape, n | before pipeline | + cp.async | + padding | llama.cpp |
+|---|---|---|---|---|
+| b27 mlp gate/up, n=256 | 63.9 | 72.6 | **82.8** | |
+| b27 mlp down, n=256 | 56.5 | 80.8 | **84.9** | |
+| ggml perf shape, n=512 | 65.0 | 76.2 | **88.3** | 86.50 |
+
+**Our MMQ is now slightly ahead of llama.cpp's at the identical shape (88.3 vs 86.50).** `rel` is unchanged at 0.00534 — padding moves addresses, not arithmetic. **Prefill 901 → 959 tok/s.**
+
+⚠️ **`ldmatrix` itself was then NOT done, and here is the receipt rather than a shrug.** Its value was two things: fewer instructions, and conflict-free access. The second is now captured by the padding. The first is 20 of ~464 instructions per substep (32 fragment loads → 12), i.e. **4.3%** — and the fold probe above showed the instruction stream is not the limiter (cutting 384 of 464 instructions bought only 10%), so 4.3% is worth ~1%. Against that: on sm_86 `ldmatrix` is `.b16` only, which is an awkward fit for an int8 `m16n8k32` fragment and would require re-deriving the shared layout in a kernel that is currently validated bit-identical. **Wrong trade; not attempted.**
+
+**Status:** prefill **333 → 1097 tok/s** across this session (**3.29×**), now **0.86×** of llama.cpp's 1276 (from 0.26×), with the GEMM kernel itself slightly ahead of theirs. Decode 75.8 (1.30× theirs). **Status: prefill 333 → 1097 tok/s across this session (3.29×), now 0.86× of llama.cpp's 1276** (from 0.26×), with the GEMM kernel itself slightly ahead of theirs. Decode 75.8 (1.30×). The `prefill_chunk` question is answered in the bullet above — it was capped by `engine.prefill_gate_chunk` all along.
+- **q1_0's MMQ is the simplest of the three** and worth knowing why, because it is the one place the format helps: there is **no min term** (`v = ±d` is symmetric with no zero point, so the activation's per-block quant *sums* — a whole shared-memory region in q4_k — are not needed at all), and **the scale is constant across a 64-k slab**, so the row scale loads once per slab where q4_k reloads a pair per 32-k substep and q6_k per 16. Shared memory is 17.9 KB against q4_k's 20.5 KB.
+- ⚠️ **`prefill_chunk` and the GDN kernels are shared by every qwen35 model**, so both changes were checked against a non-q1_0 one: the 9B q6_k is 83.4 tok/s decode (was 82.2) and ~505 tok/s prefill across repeats (run-to-run band 493–521 — a single sample is not enough to call a few percent here). `Bufs` derives its padded row count from `prefill_chunk` via `pad_rows` instead of a second hardcoded 128, so the two cannot drift apart.
+  - ⚠️ **`l2norm_rows_g` is a SEPARATE kernel, not a mode flag on `l2norm_rows`**, and that is a measurement, not taste: the plain form is launched once per token per GDN layer on models that don't take the batched path (55k times in a 9B prefill), and folding a runtime branch into it cost ~4% there. Duplicating ~20 lines of reduction is the cheaper trade.
+- **The dp4a q1_0 GEMV unpacks sign bits with two `prmt.b32` used as nibble LUTs** (technique from PrismML's llama.cpp fork). ⚠️ The selector must be masked to `0x33333333`: `prmt` reads bit 3 of each nibble as a *sign-replicate* flag, and every source byte in the first LUT has its msb clear, so an unmasked nibble ≥ 8 yields 0x00 and silently forces two weights to −1. Symptom was a model at full speed emitting one token forever.
 
 ---
 

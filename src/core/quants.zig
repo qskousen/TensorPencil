@@ -13,6 +13,11 @@
 //! - q5_k (176 B / 256): q4_k layout + 32 B of per-element 5th bits
 //! - q6_k (210 B / 256): 128 B low nibbles, 64 B high 2-bit pairs,
 //!   16 x i8 sub-block scales (16 sub-blocks of 16), f16 d; v = d*sc*(q - 32)
+//! - q1_0 (18 B / 128): f16 d, 16 B of sign bits (LSB-first);  v = bit ? d : -d
+//! - q2_0_g64 (18 B / 64) and q2_0_g128 (34 B / 128): f16 d, then 2-bit codes
+//!   (LSB-first, 4 per byte); v = (code - 1) * d, so the set is {-1, 0, +1, +2}
+//!   * d — NOT centred on zero. Same arithmetic, two block sizes, one GGUF type
+//!   id; g64 is ggml's, g128 is decoded natively. See `dequantQ2_0G128`.
 
 const std = @import("std");
 const dtypes = @import("dtype.zig");
@@ -45,6 +50,14 @@ const gg = if (have_ggml) struct {
             .q5_k => ggml.c.GGML_TYPE_Q5_K,
             .q6_k => ggml.c.GGML_TYPE_Q6_K,
             .iq4_nl => ggml.c.GGML_TYPE_IQ4_NL,
+            .q1_0 => ggml.c.GGML_TYPE_Q1_0,
+            // ggml's GGML_TYPE_Q2_0 is the 64-element variant, so ONLY g64 maps
+            // here. `.q2_0_g128` is deliberately absent: its blocks are 128
+            // elements, so these kernels would walk the byte stream with the
+            // wrong stride and return plausible garbage rather than fail. A null
+            // here is what keeps every ggml entry point (dequant, vec_dot,
+            // quantize) unreachable for it. See `dequantQ2_0G128`.
+            .q2_0_g64 => ggml.c.GGML_TYPE_Q2_0,
             else => null,
         };
     }
@@ -77,7 +90,7 @@ const gg = if (have_ggml) struct {
     pub fn dequantSlice(dt: DType, row: []const u8, elem0: usize, n: usize, dst: []f32) void {
         _ = .{ dt, row, elem0, n, dst };
         @panic("quants.dequantSlice: TensorPencil built with -Dggml=false; " ++
-            "GGUF block-quant (q4_0/q8_0/q4_k/q5_k/q6_k/iq4_nl) is unavailable");
+            "GGUF block-quant (q4_0/q8_0/q4_k/q5_k/q6_k/iq4_nl/q1_0) is unavailable");
     }
 };
 
@@ -90,12 +103,131 @@ pub const ggmlType = gg.blockType;
 /// main thread before any fan-out, so a plain flag is enough. No-op without ggml.
 pub const ensureGgmlInit = gg.ensureInit;
 
+/// Whether this dtype's decode goes through ggml. False for non-block dtypes and
+/// for `.q2_0_g128`, which is decoded natively — so it needs neither `-Dggml` nor
+/// the `ensureGgmlInit` call, and must never reach a ggml entry point. Callers
+/// choosing between the ggml `vec_dot` GEMV and the packed path gate on this.
+pub fn usesGgml(dt: DType) bool {
+    return dt.isBlockQuant() and ggmlType(dt) != null;
+}
+
 /// Dequantize elements [elem0, elem0 + n) of a block-quantized `row` into `dst`
 /// via ggml's (auto-vectorized) `to_float` — ~4-12x faster than the scalar Zig
 /// decode it replaced. `elem0`/`n` must be block-aligned (ggml blocks never span
 /// rows; callers slice at block-aligned offsets). Bit-identical to the ggml
-/// reference our golden fixtures were generated from. Panics if built without ggml.
-pub const dequantSlice = gg.dequantSlice;
+/// reference our golden fixtures were generated from. Panics if built without
+/// ggml — except for `.q2_0_g128`, which never needs it.
+pub fn dequantSlice(dt: DType, row: []const u8, elem0: usize, n: usize, dst: []f32) void {
+    if (dt == .q2_0_g128) return dequantQ2_0G128(row, elem0, n, dst);
+    gg.dequantSlice(dt, row, elem0, n, dst);
+}
+
+/// SIMD width for the fused q2_0 dot. Capped at 16 because the code extraction
+/// packs `2 * q2_vl` shift amounts into one integer load, and 2*16 = 32 bits is
+/// the widest that fits a u32; every candidate width divides 128.
+const q2_vl: usize = @min(16, @max(4, std.simd.suggestVectorLength(f32) orelse 4));
+/// Bit offset of each lane's 2-bit code within the loaded word: 0, 2, 4, ...
+const q2_shifts: @Vector(q2_vl, u5) = blk: {
+    var s: [q2_vl]u5 = undefined;
+    for (&s, 0..) |*e, i| e.* = @intCast(2 * i);
+    break :blk s;
+};
+/// The integer holding one vector's worth of codes (u8 / u16 / u32). Read exactly
+/// this wide — a u32 load at every step would run past the 34-byte block on the
+/// last block of a row.
+const Q2Word = std.meta.Int(.unsigned, q2_vl * 2);
+
+/// Fused q2_0 g128 dot: `Σ (code - 1) * d * x`, reading each weight byte ONCE and
+/// never materializing the dequantized row.
+///
+/// This exists because the g128 arm has no ggml `vec_dot` (see `dequantQ2_0G128`),
+/// and the packed fallback it would otherwise take expands the weight to f32
+/// panels — 4 B per element against 0.266 B stored, ~15x the memory traffic, which
+/// on Bonsai-27B measured as 0.2 tok/s against 2.6 for the first version of this.
+///
+/// ⚠️ Unlike ggml's `vec_dot`, the activation is NOT quantized: this is exact in
+/// `x`, so the small-`m` and packed paths agree to summation order rather than to
+/// a 5% activation-quantization bound. It is in fact slightly MORE accurate than
+/// dequant-then-dot: `(code-1) * x` is exact in f32 (the multipliers are ±1, 0, 2),
+/// so scaling by `d` once per block rounds once where the reference rounds every
+/// `(code-1)*d*x` product. That exactness is also why the `- 1` stays in the inner
+/// loop rather than being hoisted as `Σ code*x - Σx` (which would be one vector op
+/// cheaper, and `Σx` is even row-invariant): `3 * x` is NOT exact, so hoisting
+/// would trade the property for a rounding.
+///
+/// ⚠️ **The codes are extracted with shifts, not a lookup table, and that is a
+/// measured choice.** A `[256][4]f32` coefficient table indexed per qs byte is the
+/// obvious form and was the first version; it costs THREE loads (byte, table row,
+/// activation) per 4 elements, and profiling put `matmul` at 91.2% of CPU decode
+/// while sustaining only 17.8 GB/s of weight traffic — nowhere near this box's
+/// DRAM bandwidth, i.e. load-issue bound, not memory bound. Extracting instead
+/// pulls one integer load per `q2_vl` codes and leaves the activation load as the
+/// only other memory op.
+pub fn dotQ2_0G128(row: []const u8, x: []const f32) f32 {
+    const be = 128;
+    const bb = 34;
+    std.debug.assert(x.len % be == 0);
+    const V = @Vector(q2_vl, f32);
+    const U = @Vector(q2_vl, u32);
+    const step = 4 * q2_vl; // four accumulator chains per pass
+    var acc: f32 = 0;
+    for (0..x.len / be) |bi| {
+        const b = row[bi * bb ..][0..bb];
+        const d: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, b[0..2], .little))));
+        const xb = x[bi * be ..][0..be];
+        var s: [4]V = @splat(@as(V, @splat(0)));
+        var e: usize = 0;
+        while (e < be) : (e += step) {
+            inline for (0..4) |u| {
+                const e0 = e + u * q2_vl;
+                // 4 codes per qs byte, so element e0 starts at qs byte e0/4.
+                const word = std.mem.readInt(Q2Word, b[2 + e0 / 4 ..][0..@sizeOf(Q2Word)], .little);
+                const codes = (@as(U, @splat(word)) >> q2_shifts) & @as(U, @splat(3));
+                const c: V = @floatFromInt(codes);
+                s[u] += (c - @as(V, @splat(1))) * @as(V, xb[e0..][0..q2_vl].*);
+            }
+        }
+        acc += d * @reduce(.Add, (s[0] + s[1]) + (s[2] + s[3]));
+    }
+    return acc;
+}
+
+/// Native q2_0 g128 decode: `v = (code - 1) * d` over 128-element / 34-byte blocks.
+///
+/// ⚠️ **This does NOT go through ggml, and that is the whole point.** GGUF type id
+/// 42 is claimed by two shipped formats with identical arithmetic and different
+/// block sizes: upstream ggml's `GGML_TYPE_Q2_0` uses `QK2_0 = 64` (18 B blocks,
+/// our `.q2_0_g64`, which *does* use ggml), while the PrismML llama.cpp fork's
+/// `prism` branch — which every published Bonsai / "Ternary" GGUF is quantized
+/// with, advertising itself as "Q2_0 g128" — uses `QK2_0 = 128` (34 B). Calling
+/// ggml's `to_float` for type 42 on a g128 file walks the byte stream with the
+/// wrong stride and returns plausible garbage rather than failing, so
+/// `ggmlType(.q2_0_g128)` is null and this is the only decoder for it.
+///
+/// The 4-entry LUT is bit-exact against the reference's `((int)q - 1) * d`: the
+/// three non-zero products are exact in f32 (`-1*d`, `1*d`, `2*d` are sign flips
+/// and an exponent bump), and `0 * d` is written as such so a negative `d` yields
+/// the reference's -0.0 rather than +0.0.
+fn dequantQ2_0G128(row: []const u8, elem0: usize, n: usize, dst: []f32) void {
+    const be = 128; // DType.q2_0_g128.blockElems()
+    const bb = 34; // DType.q2_0_g128.blockBytes()
+    std.debug.assert(dst.len >= n);
+    std.debug.assert(elem0 % be == 0 and n % be == 0);
+    var blk = elem0 / be;
+    var o: usize = 0;
+    while (o < n) : (o += be) {
+        const b = row[blk * bb ..][0..bb];
+        const d: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, b[0..2], .little))));
+        const lut = [4]f32{ -d, 0 * d, d, 2 * d };
+        for (b[2..], 0..) |byte, i| {
+            dst[o + i * 4 + 0] = lut[byte & 3];
+            dst[o + i * 4 + 1] = lut[(byte >> 2) & 3];
+            dst[o + i * 4 + 2] = lut[(byte >> 4) & 3];
+            dst[o + i * 4 + 3] = lut[byte >> 6];
+        }
+        blk += 1;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Raw ggml type bridge
@@ -563,6 +695,175 @@ test "iq4_nl dequant matches the non-linear LUT" {
     }
 }
 
+test "q1_0 dequant is sign-bit x block scale" {
+    if (!have_ggml) return error.SkipZigTest; // dequant needs the ggml backend
+    // Q1_0: 128-elem block = f16 d + 16 bytes of sign bits, LSB-first within each
+    // byte (bit j of byte j/8 is element j); set = +d, clear = -d. There is no
+    // zero, which is what makes it different in kind from every other block quant
+    // here — a cleared bit is -d, not 0.
+    var block: [18]u8 = undefined;
+    std.mem.writeInt(u16, block[0..2], @bitCast(@as(f16, 0.25)), .little);
+    @memset(block[2..], 0); // every element = -d
+    block[2] = 0b0000_1001; // elements 0 and 3 = +d
+    block[3] = 0b1000_0000; // element 15 = +d
+    block[17] = 0b0000_0010; // element 121 = +d
+
+    var out: [128]f32 = undefined;
+    dequantSlice(.q1_0, &block, 0, 128, &out);
+    for (out, 0..) |v, i| {
+        const positive = i == 0 or i == 3 or i == 15 or i == 121;
+        errdefer std.debug.print("q1_0 elem {d}: got {d}\n", .{ i, v });
+        try std.testing.expectEqual(@as(f32, if (positive) 0.25 else -0.25), v);
+    }
+}
+
+test "q1_0 round-trips through ggml as the sign of the input" {
+    if (!have_ggml) return error.SkipZigTest;
+    // Pins the format end to end through the *quantizer* too, so the bit order
+    // above is the one ggml actually writes and not just the one it reads. The
+    // reconstruction is exact in direction and uniform in magnitude
+    // (d = mean|x| over the block), which is the whole content of the format.
+    const id_q1_0: u32 = 41;
+    try std.testing.expectEqualStrings("q1_0", try raw.name(id_q1_0));
+    try std.testing.expectEqual(@as(usize, 128), try raw.blockElems(id_q1_0));
+    try std.testing.expectEqual(@as(usize, 18), try raw.blockBytes(id_q1_0));
+    try std.testing.expectEqual(id_q1_0, @as(u32, @intCast(ggmlType(.q1_0).?)));
+
+    const n = 256; // two blocks
+    var src: [n]f32 = undefined;
+    fillTestWeights(&src, 0xB05A1);
+
+    var enc: [36]u8 = undefined;
+    try std.testing.expectEqual(enc.len, try raw.rowBytes(id_q1_0, n));
+    _ = try raw.quantizeChunk(id_q1_0, &src, &enc, 1, n, null);
+    var back: [n]f32 = undefined;
+    try raw.dequantRow(id_q1_0, &enc, n, &back);
+
+    for (0..2) |b| {
+        var mean_abs: f64 = 0;
+        for (src[b * 128 ..][0..128]) |v| mean_abs += @abs(v);
+        mean_abs /= 128;
+        const d: f32 = @floatCast(@as(f16, @floatCast(mean_abs))); // stored as f16
+        for (src[b * 128 ..][0..128], back[b * 128 ..][0..128], 0..) |a, got, i| {
+            errdefer std.debug.print("block {d} elem {d}: src {d} got {d} d {d}\n", .{ b, i, a, got, d });
+            // `>= 0` is set, so +0.0 encodes as +d — matching the reference's
+            // comparison rather than a signbit test.
+            try std.testing.expectEqual(if (a >= 0) d else -d, got);
+        }
+    }
+    // Also reachable through the typed dtype path, with the same bytes.
+    var typed: [36]u8 = undefined;
+    _ = try quantizeChunk(.q1_0, &src, &typed, 1, n, null);
+    try std.testing.expectEqualSlices(u8, &enc, &typed);
+}
+
+test "q2_0 dequant is a 2-bit code offset by one, at both block sizes" {
+    // Q2_0: f16 d + 2-bit codes, 4 per byte, LSB-first (element j is bits
+    // [2*(j%4) .. +2) of byte j/4). v = (code - 1) * d, so the set is
+    // {-d, 0, +d, +2d}. ⚠️ NOT symmetric — +2d is representable and -2d is not,
+    // unlike ggml's ternary tq2_0, which this shares no layout with.
+    //
+    // Both arms of the ambiguous type id 42 are pinned here with the SAME code
+    // pattern in the first block, so the test states exactly what differs: the
+    // arithmetic is identical and only the block stride moves.
+    inline for (.{ DType.q2_0_g64, DType.q2_0_g128 }) |dt| {
+        if (dt == .q2_0_g64 and !have_ggml) continue; // g64 decodes via ggml
+        const be = comptime dt.blockElems();
+        const bb = comptime dt.blockBytes();
+        var block: [bb]u8 = undefined;
+        std.mem.writeInt(u16, block[0..2], @bitCast(@as(f16, 0.25)), .little);
+        @memset(block[2..], 0b0101_0101); // code 1 everywhere => 0.0
+        block[2] = 0b1110_0100; // elements 0..3 = codes 0,1,2,3
+        block[bb - 1] = 0b0000_0011; // last 4 elements = codes 3,0,0,0
+
+        var out: [be]f32 = undefined;
+        dequantSlice(dt, &block, 0, be, &out);
+        for (out, 0..) |v, i| {
+            const code: f32 = switch (i) {
+                0 => 0,
+                1 => 1,
+                2 => 2,
+                3 => 3,
+                be - 4 => 3,
+                be - 3, be - 2, be - 1 => 0,
+                else => 1,
+            };
+            errdefer std.debug.print("{t} elem {d}: got {d}\n", .{ dt, i, v });
+            try std.testing.expectEqual((code - 1) * 0.25, v);
+        }
+    }
+}
+
+test "the two q2_0 variants decode the same bytes differently" {
+    if (!have_ggml) return error.SkipZigTest; // g64 goes through ggml
+    // The whole reason `gguf.detectQ2_0Variant` exists: one byte stream is valid
+    // under both block sizes and means different things. 128 elements of codes is
+    // either ONE g128 block (34 B) or TWO g64 blocks (36 B) — so laid out as g64,
+    // byte 18 is a second scale, while g128 reads that same byte as 4 codes.
+    //
+    // Pinning the disagreement is what gives the detector's tests teeth: if these
+    // ever agreed, mis-detection would be harmless and the detector pointless.
+    var buf: [36]u8 = undefined;
+    @memset(&buf, 0b1110_0100); // codes 0,1,2,3 repeating
+    std.mem.writeInt(u16, buf[0..2], @bitCast(@as(f16, 0.5)), .little);
+    std.mem.writeInt(u16, buf[18..20], @bitCast(@as(f16, 0.25)), .little);
+
+    var as_g64: [128]f32 = undefined;
+    var as_g128: [128]f32 = undefined;
+    dequantSlice(.q2_0_g64, &buf, 0, 128, &as_g64);
+    dequantSlice(.q2_0_g128, buf[0..34], 0, 128, &as_g128);
+    try std.testing.expect(!std.mem.eql(f32, &as_g64, &as_g128));
+    // Concretely: g64's second block re-reads a scale at byte 18 (0.25), so its
+    // element 64 is a scaled code; g128 reads byte 18 as codes and its element
+    // 64 is (code-1) * 0.5. Both are "plausible" — that is the hazard.
+    try std.testing.expectEqual(@as(f32, -0.25), as_g64[64]);
+    try std.testing.expectEqual(@as(f32, -0.5), as_g128[64]);
+}
+
+test "q2_0_g64 round-trips through ggml as round(x / amax)" {
+    if (!have_ggml) return error.SkipZigTest;
+    // Pins the g64 arm end to end through ggml's own *quantizer*, so the bit
+    // order is the one ggml writes and not just the one it reads. There is no
+    // equivalent for g128: nothing here encodes it, and the reference encoder
+    // lives in a llama.cpp fork we do not build.
+    const id_q2_0: u32 = 42;
+    try std.testing.expectEqualStrings("q2_0", try raw.name(id_q2_0));
+    try std.testing.expectEqual(@as(usize, 64), try raw.blockElems(id_q2_0));
+    try std.testing.expectEqual(@as(usize, 18), try raw.blockBytes(id_q2_0));
+    try std.testing.expectEqual(id_q2_0, @as(u32, @intCast(ggmlType(.q2_0_g64).?)));
+    // ⚠️ And the g128 arm must NOT reach ggml, whose type 42 is the g64 layout.
+    try std.testing.expectEqual(@as(?@TypeOf(ggmlType(.q8_0).?), null), ggmlType(.q2_0_g128));
+
+    const n = 256; // four blocks
+    var src: [n]f32 = undefined;
+    fillTestWeights(&src, 0xB2050);
+
+    var enc: [72]u8 = undefined;
+    try std.testing.expectEqual(enc.len, try raw.rowBytes(id_q2_0, n));
+    _ = try raw.quantizeChunk(id_q2_0, &src, &enc, 1, n, null);
+    var back: [n]f32 = undefined;
+    try raw.dequantRow(id_q2_0, &enc, n, &back);
+
+    for (0..4) |b| {
+        // The scale is the block's max |x| (NOT its mean, which is q1_0's rule),
+        // so every |x/d| <= 1 and the reference's clamp to [0, 3] never fires:
+        // a *symmetric* quantizer only ever emits codes 0..2. The asymmetric +2d
+        // code is unreachable from this encoder and exists for the imatrix path.
+        var amax: f32 = 0;
+        for (src[b * 64 ..][0..64]) |v| amax = @max(amax, @abs(v));
+        const d: f32 = @floatCast(@as(f16, @floatCast(amax))); // stored as f16
+        const id: f32 = if (amax > 0) 1.0 / amax else 0.0; // reference divides by the f32 amax
+        for (src[b * 64 ..][0..64], back[b * 64 ..][0..64], 0..) |a, got, i| {
+            errdefer std.debug.print("block {d} elem {d}: src {d} got {d} d {d}\n", .{ b, i, a, got, d });
+            try std.testing.expectEqual(@round(a * id) * d, got);
+        }
+    }
+    // Also reachable through the typed dtype path, with the same bytes.
+    var typed: [72]u8 = undefined;
+    _ = try quantizeChunk(.q2_0_g64, &src, &typed, 1, n, null);
+    try std.testing.expectEqualSlices(u8, &enc, &typed);
+}
+
 test "dequantSlice block-aligned sub-ranges" {
     if (!have_ggml) return error.SkipZigTest; // dequant needs the ggml backend
     // Dequanting a 2-block row in one call or block-by-block must agree.
@@ -586,6 +887,17 @@ test "storage sizes match ggml block layouts" {
     try std.testing.expectEqual(@as(usize, 144), DType.q4_k.storageBytes(256));
     try std.testing.expectEqual(@as(usize, 176), DType.q5_k.storageBytes(256));
     try std.testing.expectEqual(@as(usize, 210), DType.q6_k.storageBytes(256));
+    // q1_0 is 18 B per *128* elements, so a 256-element row is two blocks.
+    try std.testing.expectEqual(@as(usize, 36), DType.q1_0.storageBytes(256));
+    // A Bonsai-27B hidden row: 5120 = 40 q1_0 blocks.
+    try std.testing.expectEqual(@as(usize, 720), DType.q1_0.storageBytes(5120));
+    // The two q2_0 variants differ by exactly 17/18 on any row — the only signal
+    // that tells them apart in a file (see gguf.detectQ2_0Variant). On Bonsai's
+    // 5120-wide row that is 1440 vs 1360 bytes.
+    try std.testing.expectEqual(@as(usize, 1440), DType.q2_0_g64.storageBytes(5120));
+    try std.testing.expectEqual(@as(usize, 1360), DType.q2_0_g128.storageBytes(5120));
+    try std.testing.expectEqual(@as(usize, 72), DType.q2_0_g64.storageBytes(256));
+    try std.testing.expectEqual(@as(usize, 68), DType.q2_0_g128.storageBytes(256));
     // A Qwen3-4B hidden row: 2560 = 10 super-blocks.
     try std.testing.expectEqual(@as(usize, 1440), DType.q4_k.storageBytes(2560));
     try std.testing.expect(DType.q4_k.isBlockQuant() and !DType.bf16.isBlockQuant());

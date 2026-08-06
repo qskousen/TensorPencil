@@ -9,6 +9,7 @@
 //! unsupported (recurrent state cannot roll back).
 
 const std = @import("std");
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 const qwen35 = @import("qwen35.zig");
 const qwen3 = @import("qwen3.zig");
 const cuda = @import("tp_gpu").cuda;
@@ -53,8 +54,21 @@ fn graphOkFor(dtype: anytype) bool {
 const nsplit = 32;
 /// Batched-prefill chunk (rows per stepBatch) and its attention split count
 /// (bounds the flash-decode scratch).
-const prefill_chunk = 128;
+///
+/// 256, not 128: the MMQ prefill kernel tiles 128 tokens x 128 rows per block, so
+/// a 128-token chunk launches only `rows/128` blocks — 136 for the widest FFN,
+/// under two waves on a 3090's 82 SMs, so a large part of each launch is tail. The
+/// same change was worth +46% on gemma4 before its MMQ landed. It costs activation
+/// scratch, which `Bufs.pad_rows` sizes from this constant rather than a second
+/// hardcoded 128.
+const prefill_chunk = 512;
 const nsplit_prefill = 8;
+
+/// Rows every per-chunk activation buffer is sized for: `opMatmulQuant` and the
+/// MMQ kernels always write `align(m, 128)` rows, so a chunk-sized buffer would
+/// let the pad rows overflow into the next one. Also the row stride the batched
+/// GDN uses to place `beta` after `alpha` in `Bufs.ab_n`.
+const pad_rows = std.mem.alignForward(usize, prefill_chunk, 128);
 
 /// Which layers a hybrid CPU/GPU split pushes to the host, once the count is
 /// fixed by the VRAM budget. `tail` keeps a contiguous device prefix (the
@@ -63,6 +77,12 @@ const nsplit_prefill = 8;
 pub const CpuSplitPolicy = enum { tail, attn };
 
 pub const CudaLM = struct {
+    /// The prefill batch this stepper wants the engine to hand it. Tied to
+    /// `prefill_chunk` so the two cannot drift: the engine's old hardcoded 256 capped
+    /// this silently, and the mismatch cost a measured 31% on the matmul bucket
+    /// (bigger buffers, same 255-token work). See `engine.generate`'s prefill loop.
+    pub const prefill_batch = prefill_chunk;
+
     lm: *const qwen35.Model,
     be: *Backend,
     gpa: std.mem.Allocator,
@@ -1053,7 +1073,14 @@ pub const CudaLM = struct {
         // Hybrid split: each chunk begins with n rows on the device (bufs.x).
         if (self.split) |*sp| sp.on_host = false;
 
+        // Cancel granularity: between LAYERS, not between batches. A 512-token
+        // forward is ~0.5 s, far too long to sit on a cancel; the `errdefer` above
+        // aborts the recording batch and `self.len` is only advanced after
+        // `endBatch`, so an unwind here commits nothing and leaves `cached()` truthful.
+        // Pause deliberately does NOT park here — see `ops/pause.zig` and the engine.
+        const ctok = ops.cancel.token;
         for (self.lm.layers, 0..) |*layer, l| {
+            if (ops.cancel.canceled(ctok)) return error.Canceled;
             if (self.split) |*sp| {
                 if (!sp.on_gpu[l]) {
                     if (!sp.on_host) {
@@ -1072,17 +1099,25 @@ pub const CudaLM = struct {
             switch (layer.*) {
                 .attn => |*al| {
                     const slot = l / cfg.full_attn_interval;
-                    try be.qkNorm(b.x, b.normed, try nbuf(be, al.input_norm), n, cfg.hidden, eps);
-                    try self.gemm(b.qg, b.normed, al.qg, n);
-                    try self.gemm(b.k, b.normed, al.k, n);
-                    try self.gemm(b.v, b.normed, al.v, n);
-                    try be.opDeinterleave2(b.qg, b.q, b.gate, n * cfg.qDim(), hd);
-                    try be.qkNorm(b.q, b.q, try nbuf(be, al.q_norm), n * cfg.n_heads, hd, eps);
-                    try be.qkNorm(b.k, b.k, try nbuf(be, al.k_norm), n * cfg.n_kv_heads, hd, eps);
-                    try be.opRopeImropePos(b.q, self.pos3s_d, self.freqs_d, n, cfg.n_heads, cfg.rope_dim / 2, self.sin_off, cfg.rope_sections, hd);
-                    try be.opRopeImropePos(b.k, self.pos3s_d, self.freqs_d, n, cfg.n_kv_heads, cfg.rope_dim / 2, self.sin_off, cfg.rope_sections, hd);
-                    try self.storeKv(self.k_cache[slot].buf, self.len * cfg.kvDim(), b.k, 0, n * cfg.kvDim());
-                    try self.storeKv(self.v_cache[slot].buf, self.len * cfg.kvDim(), b.v, 0, n * cfg.kvDim());
+                    if (skipMask() & 32 == 0) try be.qkNorm(b.x, b.normed, try nbuf(be, al.input_norm), n, cfg.hidden, eps);
+                    if (skipMask() & 16 == 0) {
+                        try self.gemm(b.qg, b.normed, al.qg, n);
+                        try self.gemm(b.k, b.normed, al.k, n);
+                        try self.gemm(b.v, b.normed, al.v, n);
+                    }
+                    if (skipMask() & 64 == 0) try be.opDeinterleave2(b.qg, b.q, b.gate, n * cfg.qDim(), hd);
+                    if (skipMask() & 32 == 0) {
+                        try be.qkNorm(b.q, b.q, try nbuf(be, al.q_norm), n * cfg.n_heads, hd, eps);
+                        try be.qkNorm(b.k, b.k, try nbuf(be, al.k_norm), n * cfg.n_kv_heads, hd, eps);
+                    }
+                    if (skipMask() & 64 == 0) {
+                        try be.opRopeImropePos(b.q, self.pos3s_d, self.freqs_d, n, cfg.n_heads, cfg.rope_dim / 2, self.sin_off, cfg.rope_sections, hd);
+                        try be.opRopeImropePos(b.k, self.pos3s_d, self.freqs_d, n, cfg.n_kv_heads, cfg.rope_dim / 2, self.sin_off, cfg.rope_sections, hd);
+                    }
+                    if (skipMask() & 128 == 0) {
+                        try self.storeKv(self.k_cache[slot].buf, self.len * cfg.kvDim(), b.k, 0, n * cfg.kvDim());
+                        try self.storeKv(self.v_cache[slot].buf, self.len * cfg.kvDim(), b.v, 0, n * cfg.kvDim());
+                    }
                     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
                     if (debug_seq_attn) {
                         for (0..n) |t| {
@@ -1106,28 +1141,68 @@ pub const CudaLM = struct {
                             );
                         }
                     } else {
-                        try be.opAttnDecode(b.q, self.k_cache[slot].buf, self.v_cache[slot].buf, b.attn, b.attn_scratch, self.len + 1, n, cfg.n_heads, cfg.n_kv_heads, hd, nsplit_prefill, scale, 0, 0, false, kvFmt(self.kv_dtype));
+                        if (skipMask() & 8 == 0)
+                            try be.opAttnDecode(b.q, self.k_cache[slot].buf, self.v_cache[slot].buf, b.attn, b.attn_scratch, self.len + 1, n, cfg.n_heads, cfg.n_kv_heads, hd, nsplit_prefill, scale, 0, 0, false, kvFmt(self.kv_dtype));
                     }
-                    try be.opMulSigmoid(b.attn, b.gate, n * cfg.qDim());
-                    try self.gemm(b.t, b.attn, al.o, n);
-                    try be.opAdd(b.x, b.t, n * cfg.hidden);
+                    if (skipMask() & 256 == 0) try be.opMulSigmoid(b.attn, b.gate, n * cfg.qDim());
+                    if (skipMask() & 16 == 0) try self.gemm(b.t, b.attn, al.o, n);
+                    if (skipMask() & 256 == 0) try be.opAdd(b.x, b.t, n * cfg.hidden);
                 },
                 .linear => |*ll| {
                     const lin_idx = l - l / cfg.full_attn_interval;
                     const channels = cfg.convChannels();
                     const d = cfg.lin_head_dim;
                     const heads = cfg.lin_v_heads;
-                    try be.qkNorm(b.x, b.normed, try nbuf(be, ll.input_norm), n, cfg.hidden, eps);
+                    if (skipMask() & 32 == 0) try be.qkNorm(b.x, b.normed, try nbuf(be, ll.input_norm), n, cfg.hidden, eps);
                     if (self.op_dump) |od| {
                         if (l == 0) try be.tensorDownload(offsetBufSized(b.normed, 0, n * cfg.hidden * 4), std.mem.sliceAsBytes(od[0 .. n * cfg.hidden]));
                     }
-                    try self.gemm(b.lin_qkv, b.normed, ll.qkv, n);
-                    try self.gemm(b.lin_z, b.normed, ll.z, n);
+                    if (skipMask() & 2 == 0) {
+                        try self.gemm(b.lin_qkv, b.normed, ll.qkv, n);
+                        try self.gemm(b.lin_z, b.normed, ll.z, n);
+                    }
                     const conv_off = lin_idx * channels * (cfg.conv_kernel - 1) * 4;
                     const conv_state = offsetBufSized(self.conv_state, conv_off, channels * (cfg.conv_kernel - 1) * 4);
                     const ssm_off = lin_idx * heads * d * d * 4;
                     const ssm = offsetBufSized(self.ssm_state, ssm_off, heads * d * d * 4);
-                    for (0..n) |t| {
+                    // Everything except the state recurrence is batched over the
+                    // chunk. ⚠️ Measured on Bonsai-27B: running all seven of these
+                    // per token cost **46% of prefill** (333 → 614 tok/s with the
+                    // loop removed entirely), and only `opGdnDeltaStep` is
+                    // genuinely sequential — the conv is a convolution, and the
+                    // gates / L2-norm / alpha / beta are per-token independent.
+                    // Batching the other six is worth 333 → 411 tok/s.
+                    const batched = skipMask() & 4 == 0 and n > 1 and Backend.quantQ8BatchSupported(ll.alpha.dtype) and
+                        ll.alpha.cols % 256 == 0 and heads % 8 == 0;
+                    if (batched) {
+                        try self.quantizeX(b.normed, n * cfg.hidden);
+                        const alpha_n = offsetBufSized(b.ab_n, 0, n * heads * 4);
+                        const beta_n = offsetBufSized(b.ab_n, pad_rows * heads * 4, n * heads * 4);
+                        try be.opGemvQuantQ8Batch(ll.alpha.dtype, alpha_n, ll.alpha.bytes, ll.alpha.scale, heads, ll.alpha.cols, n);
+                        try be.opGemvQuantQ8Batch(ll.beta.dtype, beta_n, ll.beta.bytes, ll.beta.scale, heads, ll.beta.cols, n);
+                        try be.opGdnGatesBatch(alpha_n, beta_n, try nbuf(be, self.a_dt[lin_idx]), b.gates, heads, n);
+                        try be.opGdnConvBatch(conv_state, b.lin_qkv, try nbuf(be, ll.conv_w), b.lin_conv, channels, n);
+                        // The q/k slice is NOT contiguous across tokens (the v part
+                        // sits between them), hence the grouped form.
+                        try be.opL2NormRowsGrouped(b.lin_conv, n * 2 * cfg.lin_k_heads, d, 2 * cfg.lin_k_heads, channels, eps);
+                        // The recurrence itself, state resident in registers for the
+                        // whole chunk — bit-identical to the per-token form below.
+                        try be.opGdnDeltaChunk(
+                            ssm,
+                            b.lin_conv,
+                            b.gates,
+                            b.lin_o,
+                            heads,
+                            d,
+                            cfg.lin_k_heads,
+                            n,
+                            channels,
+                            1.0 / @sqrt(@as(f32, @floatFromInt(d))),
+                        );
+                    }
+                    // Unbatched fallback: a dtype with no batched skinny GEMV, or
+                    // n == 1 (decode). Same math, one token per launch set.
+                    for (0..if (batched or skipMask() & 4 != 0) 0 else n) |t| {
                         const normed_t = offsetBufSized(b.normed, t * cfg.hidden * 4, cfg.hidden * 4);
                         try self.quantizeX(normed_t, cfg.hidden);
                         try self.gemv(offsetBufSized(b.ab, 0, heads * 4), normed_t, ll.alpha);
@@ -1152,22 +1227,24 @@ pub const CudaLM = struct {
                             1.0 / @sqrt(@as(f32, @floatFromInt(d))),
                         );
                     }
-                    try be.qkNorm(b.lin_o, b.lin_o, try nbuf(be, ll.ssm_norm), n * heads, d, eps);
-                    try be.siluMul(b.lin_z, b.lin_o, n * cfg.linVDim());
-                    try self.gemm(b.t, b.lin_z, ll.out, n);
-                    try be.opAdd(b.x, b.t, n * cfg.hidden);
+                    if (skipMask() & 32 == 0) try be.qkNorm(b.lin_o, b.lin_o, try nbuf(be, ll.ssm_norm), n * heads, d, eps);
+                    if (skipMask() & 256 == 0) try be.siluMul(b.lin_z, b.lin_o, n * cfg.linVDim());
+                    if (skipMask() & 2 == 0) try self.gemm(b.t, b.lin_z, ll.out, n);
+                    if (skipMask() & 256 == 0) try be.opAdd(b.x, b.t, n * cfg.hidden);
                 },
             }
             const mlp = switch (layer.*) {
                 .attn => |*al| &al.mlp,
                 .linear => |*ll| &ll.mlp,
             };
-            try be.qkNorm(b.x, b.normed, try nbuf(be, mlp.post_norm), n, cfg.hidden, eps);
-            try self.gemm(b.mlp_gate, b.normed, mlp.gate, n);
-            try self.gemm(b.mlp_up, b.normed, mlp.up, n);
-            try be.siluMul(b.mlp_gate, b.mlp_up, n * cfg.intermediate);
-            try self.gemm(b.t, b.mlp_gate, mlp.down, n);
-            try be.opAdd(b.x, b.t, n * cfg.hidden);
+            if (skipMask() & 1 == 0) {
+                try be.qkNorm(b.x, b.normed, try nbuf(be, mlp.post_norm), n, cfg.hidden, eps);
+                try self.gemm(b.mlp_gate, b.normed, mlp.gate, n);
+                try self.gemm(b.mlp_up, b.normed, mlp.up, n);
+                try be.siluMul(b.mlp_gate, b.mlp_up, n * cfg.intermediate);
+                try self.gemm(b.t, b.mlp_gate, mlp.down, n);
+                try be.opAdd(b.x, b.t, n * cfg.hidden);
+            }
             if (self.layer_dump) |dump| {
                 try be.tensorDownload(
                     offsetBufSized(b.x, (n - 1) * cfg.hidden * 4, cfg.hidden * 4),
@@ -1200,6 +1277,9 @@ pub const CudaLM = struct {
             try self.quantizeX(x, w.cols);
             return self.gemv(y, x, w);
         }
+        // Same gate as `gemv` — see the comment there.
+        if (w.dtype.isBlockQuant() and !Backend.quantKernelSupported(w.dtype))
+            return error.UnsupportedDType;
         if (debug_gemv_prefill) {
             for (0..n) |t| {
                 const x_t = offsetBufSized(x, t * w.cols * 4, w.cols * 4);
@@ -1218,8 +1298,40 @@ pub const CudaLM = struct {
             }
             return;
         }
+        // Batched prefill: MMQ on the s8 tensor cores straight from the packed
+        // weight, when the backend says it beats dequant-to-f16 for this dtype.
+        // The margin is widest for q1_0 — the f16 expansion it avoids is ~14x the
+        // bytes MMQ reads, against ~3.5x for q4_k.
+        if (Backend.mmqPipeFaster(w.dtype, w.rows, w.cols)) {
+            return self.be.opMatmulQuantMmqPipe(w.dtype, y, x, n, w.bytes, w.rows, w.cols);
+        }
         try self.be.opMatmulQuant(w.dtype, y, x, n, w.bytes, w.rows, w.cols);
     }
+
+    /// `TP_SKIP` — prefill BUDGET bitmask: each bit removes one component from
+    /// `stepBatch`, so a run measures the prefill cost of everything *except* it.
+    ///
+    /// The output is garbage by construction; this is a stopwatch, not a mode. Its
+    /// value is that the removed costs must **sum to the baseline**, which is what
+    /// makes the resulting budget trustworthy — a per-component `--profile` number
+    /// cannot be checked that way (and its timings are distorted by added syncs).
+    ///
+    ///   1 MLP (gate/up/down + silu)      8 attention op
+    ///   2 GDN qkv/z/out GEMMs           16 attn qkv/o GEMMs
+    ///   4 GDN recurrence + batched ops   32 norms (input/q/k/ssm; post_norm is in 1)
+    ///  64 rope + deinterleave           128 KV store
+    /// 256 residual adds + gating (mulSigmoid, GDN siluMul)
+    fn skipMask() u32 {
+        if (skip_cache) |v| return v;
+        const s = getenv("TP_SKIP") orelse return blk: { skip_cache = 0; break :blk 0; };
+        var v: u32 = 0;
+        for (std.mem.span(s)) |c| if (c >= '0' and c <= '9') {
+            v = v * 10 + (c - '0');
+        };
+        skip_cache = v;
+        return v;
+    }
+    var skip_cache: ?u32 = null;
 
     /// Debug escape hatches for bisecting the batched-prefill path.
     const debug_gemv_prefill = false;
@@ -1487,15 +1599,34 @@ pub const CudaLM = struct {
         self.q8_cols = cols;
     }
 
+    /// Whether this weight can take the dp4a decode GEMV, which needs both a
+    /// kernel for the dtype and `opGemvQuantQ8`'s tiling (256-column groups, rows
+    /// in warps of 8). Every weight in the checkpoints measured so far satisfies
+    /// the shape half, but it is checked rather than assumed: the alternative is
+    /// tripping an assert deep in a forward, and the f32 `opGemvQuant` fallback
+    /// below handles any block-quant shape.
+    fn dp4aGemvOk(w: ops.matmul.Weight) bool {
+        const dt_ok = w.dtype == .q5_k or w.dtype == .q6_k or w.dtype == .q1_0 or
+            w.dtype == .q2_0_g64 or w.dtype == .q2_0_g128;
+        return dt_ok and w.cols % 256 == 0 and w.rows % 8 == 0;
+    }
+
     /// Fused GEMV in the weight's storage dtype (all qwen35 GGUF linear
-    /// weights are block-quantized). q5_k/q6_k take the dp4a path against
+    /// weights are block-quantized). q5_k/q6_k/q1_0 take the dp4a path against
     /// the activation staged by quantizeX; other dtypes read x directly.
     fn gemv(self: *CudaLM, y: Buf, x: Buf, w: ops.matmul.Weight) !void {
         const be = self.be;
-        if (w.dtype == .q5_k or w.dtype == .q6_k) {
+        if (dp4aGemvOk(w)) {
             std.debug.assert(self.q8_for.buf == x.buf and self.q8_cols == w.cols);
             try be.opGemvQuantQ8(w.dtype, y, w.bytes, w.scale, w.rows, w.cols);
         } else if (w.dtype.isBlockQuant()) {
+            // ⚠️ Checked, not assumed: `opGemvQuant`/`opMatmulQuant` switch on
+            // dtype with `else => unreachable`, so a block quant with no CUDA
+            // kernel (q2_0_g64 today) would panic deep in a forward instead of
+            // reporting. The check lives here rather than at load because a mixed
+            // GGUF carries per-layer dtypes, so only the weights actually used
+            // give complete coverage.
+            if (!Backend.quantKernelSupported(w.dtype)) return error.UnsupportedDType;
             try be.opGemvQuant(w.dtype, y, x, w.bytes, w.scale, w.rows, w.cols);
         } else if (w.dtype == .bf16) {
             try be.opGemvBf16(y, x, w.bytes, w.scale, w.rows, w.cols);
@@ -1532,11 +1663,18 @@ const Bufs = struct {
     attn_scratch: Buf,
     t: Buf,
     lin_qkv: Buf,
+    /// Conv output. One token in the decode path; the whole chunk in batched
+    /// prefill (`opGdnConvBatch` writes all `n` at once).
     lin_conv: Buf,
     lin_z: Buf,
     lin_o: Buf,
     ab: Buf,
     gates: Buf,
+    /// Batched prefill's alpha/beta: `alpha[n][heads]` at offset 0, `beta[n][heads]`
+    /// at `pad_rows*heads`. Separate from `ab` because the decode path's single
+    /// fused GEMV writes `[alpha|beta]` contiguously per token, a layout the two
+    /// independent batched GEMVs cannot produce.
+    ab_n: Buf,
     mlp_gate: Buf,
     mlp_up: Buf,
     logits: Buf,
@@ -1548,11 +1686,7 @@ const Bufs = struct {
 
     fn init(be: *Backend, cfg: qwen35.Config) !Bufs {
         var s: Bufs = undefined;
-        // Activation buffers sized for the GEMM's 128-row-padded output
-        // (opMatmulQuant always writes align(m, 128) rows — a chunk-sized
-        // buffer would let the pad rows overflow into the next buffer).
-        const pc = 128;
-        comptime std.debug.assert(prefill_chunk <= pc);
+        const pc = pad_rows; // see the constant's doc comment
         const sizes = [_]usize{
             pc * cfg.hidden, // x
             pc * cfg.hidden, // normed
@@ -1565,11 +1699,12 @@ const Bufs = struct {
             @max(cfg.n_heads * nsplit, pc * cfg.n_heads * nsplit_prefill) * (cfg.head_dim + 4), // attn_scratch
             pc * cfg.hidden, // t
             pc * cfg.convChannels(), // lin_qkv
-            cfg.convChannels(), // lin_conv
+            pc * cfg.convChannels(), // lin_conv (batched prefill holds the chunk)
             pc * cfg.linVDim(), // lin_z
             pc * cfg.linVDim(), // lin_o
-            2 * cfg.lin_v_heads, // ab
-            2 * cfg.lin_v_heads, // gates
+            2 * cfg.lin_v_heads, // ab (decode: [alpha|beta] from one fused GEMV)
+            pc * 2 * cfg.lin_v_heads, // gates ([decay|beta] per token)
+            2 * pc * cfg.lin_v_heads, // ab_n (batched: alpha[n][h] then beta[n][h])
             pc * cfg.intermediate, // mlp_gate
             pc * cfg.intermediate, // mlp_up
             cfg.vocab, // logits

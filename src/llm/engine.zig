@@ -66,6 +66,11 @@ pub const Options = struct {
     residency_poll: ?ResidencyPoll = null,
     /// When set, `generate` records its prefill-vs-decode wall-clock split here.
     timing: ?*Timing = null,
+    /// When set, `generate` publishes the SAME split as it accrues — for a UI
+    /// that shows a turn's rates while it is still streaming. `timing` is the
+    /// final word (written once, on return); this is the running one, read by
+    /// another thread. See `Progress`.
+    progress: ?*Progress = null,
 };
 
 /// Wall-clock split of one `generate` call. A caller that times the whole call
@@ -108,6 +113,74 @@ pub const Timing = struct {
     }
 };
 
+/// A `Timing` published WHILE the call runs, plus the token count produced so
+/// far. `Timing` alone can only be read after `generate` returns, which is
+/// exactly when a UI no longer needs it: a chat client wants "24.3 tok/s, 512
+/// tokens" as the reply streams. The fields are atomic because the reader is a
+/// different thread (the GUI's UI thread) from the writer (its generation
+/// worker); they are published independently, so a reader can observe a
+/// token count one step ahead of the elapsed time it is divided by — a sub-frame
+/// skew on a live counter, not a correctness question.
+///
+/// `emitted` is the tokens appended to `ids` (what a UI shows as the reply's
+/// length); `decode_tokens` stays the decode-loop FORWARD count `Timing`
+/// documents, which is one fewer. Left untouched by the speculative-decoding
+/// path, for the reason `Timing` gives — so a UI on that path shows a reply's
+/// text without a rate rather than a wrong one.
+pub const Progress = struct {
+    prefill_tokens: std.atomic.Value(usize) = .init(0),
+    prefill_ns: std.atomic.Value(u64) = .init(0),
+    decode_tokens: std.atomic.Value(usize) = .init(0),
+    decode_ns: std.atomic.Value(u64) = .init(0),
+    emitted: std.atomic.Value(usize) = .init(0),
+
+    /// Zero every counter. A driver calls this at a turn boundary so a new
+    /// turn's live numbers never start from the previous turn's totals.
+    pub fn reset(self: *Progress) void {
+        self.publish(.{}, 0);
+    }
+
+    pub fn publish(self: *Progress, t: Timing, emitted: usize) void {
+        self.prefill_tokens.store(t.prefill_tokens, .monotonic);
+        self.prefill_ns.store(t.prefill_ns, .monotonic);
+        self.decode_tokens.store(t.decode_tokens, .monotonic);
+        self.decode_ns.store(t.decode_ns, .monotonic);
+        self.emitted.store(emitted, .monotonic);
+    }
+
+    /// The split as it stands, plus the tokens produced so far.
+    pub fn snapshot(self: *const Progress) struct { timing: Timing, emitted: usize } {
+        return .{
+            .timing = .{
+                .prefill_tokens = self.prefill_tokens.load(.monotonic),
+                .prefill_ns = self.prefill_ns.load(.monotonic),
+                .decode_tokens = self.decode_tokens.load(.monotonic),
+                .decode_ns = self.decode_ns.load(.monotonic),
+            },
+            .emitted = self.emitted.load(.monotonic),
+        };
+    }
+};
+
+/// Publish the running prefill split — called per prefill batch, so a long
+/// prompt's rate climbs into view instead of appearing only once it is done.
+fn progPrefill(opts: Options, io: std.Io, tokens: usize, t_pre: i96) void {
+    const p = opts.progress orelse return;
+    p.publish(.{ .prefill_tokens = tokens, .prefill_ns = @intCast(nowNs(io) - t_pre) }, 0);
+}
+
+/// Publish the running decode split — called per emitted token. `steps` is the
+/// forward count (one behind `emitted` by construction; see `Timing`).
+fn progDecode(opts: Options, io: std.Io, prefill_tokens: usize, prefill_ns: u64, steps: usize, emitted: usize, t_dec: i96) void {
+    const p = opts.progress orelse return;
+    p.publish(.{
+        .prefill_tokens = prefill_tokens,
+        .prefill_ns = prefill_ns,
+        .decode_tokens = steps,
+        .decode_ns = @intCast(nowNs(io) - t_dec),
+    }, emitted);
+}
+
 /// Monotonic-ish wall clock in nanoseconds, for the Timing split.
 fn nowNs(io: std.Io) i96 {
     return std.Io.Clock.real.now(io).nanoseconds;
@@ -131,6 +204,60 @@ pub const ResidencyPoll = struct {
 /// what `step` does anyway. 256 bounds cancel latency to a fraction of a second
 /// at any realistic prefill throughput.
 pub const prefill_gate_chunk: usize = 256;
+
+/// How many prompt tokens to hand a stepper per prefill forward.
+///
+/// ⚠️ **This is the STEPPER's choice, not the engine's.** Every prefill loop below
+/// used to force `prefill_gate_chunk` on every arch, which silently capped each
+/// model's own internal chunk: qwen3.5's `prefill_chunk` was set to 512 and never saw
+/// more than 255 ids, so the knob looked like it "preferred" 256 when it was simply
+/// disconnected — and raising it alone cost 31% on the matmul bucket (bigger buffers,
+/// same work). A stepper that knows what its kernels want declares `prefill_batch`
+/// (qwen35_cuda ties it to its own `prefill_chunk` so the two cannot drift); everyone
+/// else keeps the old constant and the old behaviour.
+pub fn prefillBatchOf(model: anytype) usize {
+    return prefillBatchOfType(switch (@typeInfo(@TypeOf(model))) {
+        .pointer => |p| p.child,
+        else => @TypeOf(model),
+    });
+}
+
+/// `prefillBatchOf` on the type alone — for tests that need to size a prompt to span
+/// several chunks of whatever batch the stepper under test will actually use.
+pub fn prefillBatchOfType(comptime M: type) usize {
+    return if (comptime @hasDecl(M, "prefill_batch")) M.prefill_batch else prefill_gate_chunk;
+}
+
+/// Publishes the engine's cancel flag to `ops.cancel`'s threadlocal token for the
+/// duration of prefill, so a stepper can poll it BETWEEN LAYERS and unwind
+/// immediately instead of waiting out a whole forward.
+///
+/// ⚠️ **Pause and cancel are deliberately polled at DIFFERENT granularities.** Pause
+/// parks only at batch boundaries (`checkpoint` in the loops below): `ops/pause.zig`
+/// is explicit that parking mid-kernel would strand half-computed state and held
+/// locks, so a paused worker waits at most one forward — the accepted cost of a
+/// larger batch. Cancel discards its work by definition, so unwinding mid-forward is
+/// safe where parking is not, and at a 512-token batch a boundary-only cancel would
+/// mean sitting on it for ~0.5 s. A stepper that ignores the token behaves as before.
+pub const CancelScope = struct {
+    prev: ops.cancel.Token,
+    pub fn end(self: CancelScope) void {
+        ops.cancel.token = self.prev;
+    }
+};
+pub fn publishCancel(opts: Options) CancelScope {
+    const prev = ops.cancel.token;
+    ops.cancel.token = opts.cancel;
+    return .{ .prev = prev };
+}
+
+/// Whether `err` is a stepper's mid-forward cancel unwind. Matched by NAME because
+/// only steppers that poll the token can produce `error.Canceled`, and an explicit
+/// `switch` arm would fail to typecheck against the error sets of those that cannot.
+/// Such an unwind commits nothing, so `model.cached()` still reflects whole batches.
+pub fn isCancelUnwind(err: anyerror) bool {
+    return std.mem.eql(u8, @errorName(err), "Canceled");
+}
 
 pub const StepAction = enum { proceed, stop };
 
@@ -267,16 +394,40 @@ pub fn generate(
     const new = ids.items[model.cached()..];
     if (new.len == 0) return error.ContextFull;
     try ensureRoom(model, new.len);
-    // Gate-checked chunked prefill (see prefill_gate_chunk): pause/cancel can now
-    // land mid-prefill. Only the final chunk's logits feed the first sample.
+    // Chunked prefill. Only the final chunk's logits feed the first sample.
+    //
+    // ⚠️ The batch size is the STEPPER's choice, not the engine's. This loop used to
+    // force `prefill_gate_chunk` on every arch, which silently capped each model's
+    // own `prefill_chunk` — qwen3.5's was set to 512 and never saw more than 255
+    // ids, so the knob looked like it "preferred" 256 when it was simply
+    // disconnected (see BACKEND.md). A stepper that knows what its kernels want
+    // declares `prefill_batch`; everyone else keeps the old constant.
+    //
+    // PAUSE and CANCEL are deliberately polled at DIFFERENT granularities:
+    //   - **pause** parks here, at batch boundaries only. `ops/pause.zig` is explicit
+    //     that parking mid-kernel would strand half-computed state and held locks, so
+    //     a paused worker waits at most one forward before parking. That is the
+    //     accepted cost of a larger batch.
+    //   - **cancel** is published to `ops.cancel`'s threadlocal token so the stepper
+    //     can poll it BETWEEN LAYERS and unwind immediately. Cancel discards its work
+    //     by definition, so unwinding mid-forward is safe where parking is not — and
+    //     at a 512-token batch a boundary-only cancel would mean waiting ~0.5 s.
+    // A stepper that never polls the token simply behaves as before.
     const t_pre = nowNs(io);
     {
+        const batch = prefillBatchOf(model);
+        const cs = publishCancel(opts);
+        defer cs.end();
         var off: usize = 0;
         while (off < new.len) {
             if (checkpoint(io, opts) == .stop) return 0;
-            const c = @min(prefill_gate_chunk, new.len - off);
-            try model.step(io, new[off..][0..c], logits);
+            const c = @min(batch, new.len - off);
+            model.step(io, new[off..][0..c], logits) catch |err| {
+                if (isCancelUnwind(err)) return 0;
+                return err;
+            };
             off += c;
+            progPrefill(opts, io, off, t_pre);
         }
     }
     const t_dec = nowNs(io);
@@ -296,6 +447,7 @@ pub fn generate(
         if (chat.isStop(next)) break;
         try ids.append(gpa, next);
         n += 1;
+        progDecode(opts, io, new.len, @intCast(t_dec - t_pre), steps, n, t_dec);
         if (out) |w| {
             const bytes = try tok.decodeAlloc(gpa, &.{next});
             defer gpa.free(bytes);
@@ -370,12 +522,19 @@ fn generateGreedyArgmax(
     var next: u32 = undefined;
     const t_pre = nowNs(io);
     {
+        const batch = prefillBatchOf(model);
+        const cs = publishCancel(opts);
+        defer cs.end();
         var off: usize = 0;
         while (off < new.len) {
             if (checkpoint(io, opts) == .stop) return 0;
-            const c = @min(prefill_gate_chunk, new.len - off);
-            next = try stepArgmaxOf(model, io, new[off..][0..c], pen, opts.sampling);
+            const c = @min(batch, new.len - off);
+            next = stepArgmaxOf(model, io, new[off..][0..c], pen, opts.sampling) catch |err| {
+                if (isCancelUnwind(err)) return 0;
+                return err;
+            };
             off += c;
+            progPrefill(opts, io, off, t_pre);
         }
     }
     const t_dec = nowNs(io);
@@ -394,6 +553,7 @@ fn generateGreedyArgmax(
         if (chat.isStop(next)) break;
         try ids.append(gpa, next);
         n += 1;
+        progDecode(opts, io, new.len, @intCast(t_dec - t_pre), steps, n, t_dec);
         if (out) |w| {
             const bytes = try tok.decodeAlloc(gpa, &.{next});
             defer gpa.free(bytes);
@@ -449,12 +609,19 @@ fn generateGpuSample(
     var count: usize = undefined;
     const t_pre = nowNs(io);
     {
+        const batch = prefillBatchOf(model);
+        const cs = publishCancel(opts);
+        defer cs.end();
         var off: usize = 0;
         while (off < new.len) {
             if (checkpoint(io, opts) == .stop) return 0;
-            const c = @min(prefill_gate_chunk, new.len - off);
-            count = try stepSelectOf(model, io, new[off..][0..c], pen, opts.sampling, out_id, out_logit);
+            const c = @min(batch, new.len - off);
+            count = stepSelectOf(model, io, new[off..][0..c], pen, opts.sampling, out_id, out_logit) catch |err| {
+                if (isCancelUnwind(err)) return 0;
+                return err;
+            };
             off += c;
+            progPrefill(opts, io, off, t_pre);
         }
     }
     const t_dec = nowNs(io);
@@ -475,6 +642,7 @@ fn generateGpuSample(
         if (chat.isStop(next)) break;
         try ids.append(gpa, next);
         n += 1;
+        progDecode(opts, io, new.len, @intCast(t_dec - t_pre), steps, n, t_dec);
         if (out) |w| {
             const bytes = try tok.decodeAlloc(gpa, &.{next});
             defer gpa.free(bytes);
@@ -713,6 +881,68 @@ test "multi-turn generation continues the cache" {
     try std.testing.expectEqual(ids.items.len - 1, model.cached());
 }
 
+test "Progress publishes what Timing finally reports" {
+    // The live counters a UI renders and the final split a log line prints must
+    // describe the same turn — otherwise a reply's footer changes the moment it
+    // stops streaming. Cheap to fold into a real generate; 4 tokens is enough to
+    // exercise the decode loop's publication (1 would leave decode_tokens 0).
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const safetensors = @import("tp_core").safetensors;
+    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    try test_gate.requireModelFile(io, te_path);
+
+    var st = try safetensors.SafeTensors.open(gpa, io, te_path);
+    defer st.deinit();
+    var lm = try qwen3.CausalLM.load(gpa, .{ .safetensors = &st });
+    defer lm.deinit();
+    var tok = try Tokenizer.init(gpa);
+    defer tok.deinit();
+
+    var model = try CpuModel.init(gpa, &lm, .fixed(128));
+    defer model.deinit();
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(gpa);
+    try chat.appendUser(&tok, gpa, "Say hi.", &ids);
+    try chat.openAssistant(&tok, gpa, &ids);
+    const prompt_len = ids.items.len;
+
+    var timing: Timing = .{};
+    var progress: Progress = .{};
+    const opts: Options = .{
+        .max_new_tokens = 4,
+        .sampling = .{ .temperature = 0 },
+        .timing = &timing,
+        .progress = &progress,
+    };
+    const n = try generate(&model, &tok, io, gpa, &ids, opts, null);
+    const live = progress.snapshot();
+    errdefer std.debug.print("n={d} live={any} timing={any}\n", .{ n, live, timing });
+    try std.testing.expectEqual(n, live.emitted);
+    try std.testing.expectEqual(timing.decode_tokens, live.timing.decode_tokens);
+    try std.testing.expectEqual(timing.prefill_tokens, live.timing.prefill_tokens);
+    // `generate` prefills the whole uncached prompt (here: all of it, cache
+    // empty) and the last chunk's logits yield the first token — hence one
+    // fewer decode forward than tokens returned.
+    try std.testing.expectEqual(prompt_len, live.timing.prefill_tokens);
+    try std.testing.expectEqual(n - 1, live.timing.decode_tokens);
+    try std.testing.expect(live.timing.decode_ns > 0);
+}
+
+test "Progress.reset clears a previous turn's counters" {
+    var p: Progress = .{};
+    p.publish(.{ .prefill_tokens = 7, .prefill_ns = 8, .decode_tokens = 9, .decode_ns = 10 }, 11);
+    const before = p.snapshot();
+    try std.testing.expectEqual(@as(usize, 11), before.emitted);
+    try std.testing.expectEqual(@as(usize, 9), before.timing.decode_tokens);
+    // Without this, a new turn's footer would open on the previous turn's
+    // totals until its own first token landed.
+    p.reset();
+    const after = p.snapshot();
+    try std.testing.expectEqual(@as(usize, 0), after.emitted);
+    try std.testing.expectEqual(Timing{}, after.timing);
+}
+
 // Dynamic-capacity growth is transparent: a cache that starts far too small
 // for the prompt (growing during prefill) must produce the same greedy token
 // as a full-size cache. Gated on the checkpoint; kept to 1 token.
@@ -781,4 +1011,53 @@ test "greedy generation produces valid tokens" {
     try std.testing.expectEqual(prompt_len + n, ids.items.len);
     try std.testing.expect(n > 0); // "Say hi." should not stop on token one
     for (ids.items[prompt_len..]) |id| try std.testing.expect(id < qwen3.vocab_size);
+}
+
+test "prefillBatchOf honours a stepper's declared batch, else the gate constant" {
+    // The bug this pins: every prefill loop used to hardcode `prefill_gate_chunk`,
+    // so a stepper's own `prefill_chunk` was silently capped and raising it only
+    // inflated buffers (measured -31% on the matmul bucket). Five call sites now
+    // share this, so it is worth a test rather than five careful readings.
+    const Declared = struct {
+        pub const prefill_batch: usize = 512;
+    };
+    const Plain = struct {};
+    var d: Declared = .{};
+    var p: Plain = .{};
+    try std.testing.expectEqual(@as(usize, 512), prefillBatchOf(&d));
+    try std.testing.expectEqual(prefill_gate_chunk, prefillBatchOf(&p));
+    // Taken by value as well as by pointer (the loops pass whatever they hold).
+    try std.testing.expectEqual(@as(usize, 512), prefillBatchOf(d));
+    try std.testing.expectEqual(prefill_gate_chunk, prefillBatchOf(p));
+}
+
+test "publishCancel exposes the engine's flag to ops.cancel and restores it" {
+    // Steppers poll `ops.cancel.token` BETWEEN LAYERS; the engine owns the flag, so
+    // the token must be published for exactly the prefill's duration and restored
+    // after — a leaked token would let one worker's cancel unwind another's forward.
+    var flag = std.atomic.Value(bool).init(false);
+    const outer = ops.cancel.token;
+    {
+        const cs = publishCancel(.{ .cancel = &flag });
+        defer cs.end();
+        try std.testing.expectEqual(@as(ops.cancel.Token, &flag), ops.cancel.token);
+        try std.testing.expect(!ops.cancel.canceled(ops.cancel.token));
+        flag.store(true, .release);
+        try std.testing.expect(ops.cancel.canceled(ops.cancel.token));
+    }
+    try std.testing.expectEqual(outer, ops.cancel.token);
+    // No flag wired (the CLI case): the token is null, so a stepper's poll is free.
+    {
+        const cs = publishCancel(.{});
+        defer cs.end();
+        try std.testing.expectEqual(@as(ops.cancel.Token, null), ops.cancel.token);
+        try std.testing.expect(!ops.cancel.canceled(ops.cancel.token));
+    }
+}
+
+test "isCancelUnwind recognizes only a cancel unwind" {
+    try std.testing.expect(isCancelUnwind(error.Canceled));
+    try std.testing.expect(!isCancelUnwind(error.OutOfMemory));
+    try std.testing.expect(!isCancelUnwind(error.CudaError));
+    try std.testing.expect(!isCancelUnwind(error.ContextFull));
 }

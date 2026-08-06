@@ -107,6 +107,10 @@ var steps_buf: [16]u8 = [_]u8{0} ** 16;
 var width_buf: [16]u8 = [_]u8{0} ** 16;
 var height_buf: [16]u8 = [_]u8{0} ** 16;
 var regen_buf: [16]u8 = [_]u8{0} ** 16;
+// Per-reply token cap. Sits in the sampling SECTION but is committed with the
+// other plain integers (commitNumbers), not with commitSampling: it is not part
+// of a preset — see config.Config.max_new_tokens.
+var maxnew_buf: [16]u8 = [_]u8{0} ** 16;
 // LLM sampling controls (same text-buffer pattern; floats parse on commit).
 var temp_buf: [16]u8 = [_]u8{0} ** 16;
 var topk_buf: [16]u8 = [_]u8{0} ** 16;
@@ -141,6 +145,7 @@ fn seed(cfg: *const config.Config) void {
     _ = std.fmt.bufPrintZ(&width_buf, "{d}", .{cfg.width}) catch {};
     _ = std.fmt.bufPrintZ(&height_buf, "{d}", .{cfg.height}) catch {};
     _ = std.fmt.bufPrintZ(&regen_buf, "{d}", .{cfg.regen_cache_mb}) catch {};
+    _ = std.fmt.bufPrintZ(&maxnew_buf, "{d}", .{cfg.max_new_tokens}) catch {};
     seedSampling(cfg);
     seeded = true;
 }
@@ -182,6 +187,9 @@ fn commitNumbers(cfg: *config.Config) void {
     cfg.height = clampDim(parseNum(&height_buf, cfg.height));
     // Regen (checkpoint) cache: host RAM, capped at 64 GB to catch typos.
     cfg.regen_cache_mb = @min(parseNum(&regen_buf, cfg.regen_cache_mb), 64 << 10);
+    // Max response: 0 keeps its "no explicit cap" meaning, so this only bounds
+    // typos at the top end — the real limit is the context window either way.
+    cfg.max_new_tokens = @min(parseNum(&maxnew_buf, cfg.max_new_tokens), 1 << 20);
     commitSampling(cfg);
 }
 
@@ -364,6 +372,10 @@ pub fn render(cfg: *config.Config, cb: Callbacks) void {
         "window (llama.cpp semantics; while any penalty is active, GPU backends " ++
         "take a slower CPU-sampling path). Save the current values under a name " ++
         "to reuse them; presets persist with the settings on Apply.");
+    numRow("Max response (0 = no limit)", &maxnew_buf);
+    help("Longest single reply, in tokens. 0 lets a reply run until the model " ++
+        "stops on its own or the context window fills. Not saved with presets " ++
+        "below. Applies on the next reply.");
     presetRow(cfg);
     numRow("Temperature", &temp_buf);
     numRow("Top-k (0 = off)", &topk_buf);

@@ -183,7 +183,9 @@ pub const Error = error{ UnsupportedDType, QuantBackendUnavailable, OutOfMemory 
 pub fn supportsDType(dt: DType) bool {
     return switch (dt) {
         .f8_e4m3, .bf16, .f16, .f32, .i8, .i4 => true,
-        .q4_0, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl => have_ggml,
+        .q4_0, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl, .q1_0, .q2_0_g64 => have_ggml,
+        // q2_0_g128 decodes natively (quants.dequantQ2_0G128), so it needs no ggml.
+        .q2_0_g128 => true,
         else => false,
     };
 }
@@ -205,7 +207,7 @@ pub fn matmul(
     if (bias) |b| std.debug.assert(b.len == w.rows);
     switch (w.dtype) {
         .f8_e4m3, .bf16, .f16, .f32, .i8, .i4 => {},
-        .q4_0, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl => {
+        .q4_0, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl, .q1_0, .q2_0_g64 => {
             if (have_ggml) {
                 // ggml rows are whole blocks; block-aligned k-slicing depends on it.
                 std.debug.assert(w.cols % w.dtype.blockElems() == 0);
@@ -214,6 +216,8 @@ pub fn matmul(
                 return error.QuantBackendUnavailable;
             }
         },
+        // Rows are whole blocks here too, but the decode is ours, not ggml's.
+        .q2_0_g128 => std.debug.assert(w.cols % w.dtype.blockElems() == 0),
         else => return error.UnsupportedDType,
     }
     if (w.dtype == .i8 or w.dtype == .i4)
@@ -250,13 +254,19 @@ pub fn matmul(
     // Decode (small m) block-quant GEMV → ggml's AVX2 quant vec_dot, which is
     // memory-bound (~30x faster than our Zig dequant/int8 kernels). Non-block-
     // quant small-m falls through to the threaded runRange path below.
-    if (w.dtype.isBlockQuant()) {
+    //
+    // ⚠️ Gated on `quants.usesGgml`, not `isBlockQuant`: q2_0_g128 has no ggml
+    // type (its blocks are 128 elements where ggml's type 42 is 64), so it takes
+    // the native fused GEMV instead of a call into ggml with the wrong stride.
+    if (w.dtype.isBlockQuant() and quants.usesGgml(w.dtype)) {
         if (have_ggml) {
             return ggml_gemv.quantGemv(io, w.dtype, y, x, m, w.bytes, w.rows, w.cols, bias);
         } else {
             return error.QuantBackendUnavailable;
         }
     }
+    if (w.dtype == .q2_0_g128) return native_gemv.q2Gemv(io, y, x, m, w.bytes, w.rows, w.cols, bias);
+    if (w.dtype.isBlockQuant()) return matmulPacked(io, gpa, y, x, m, w, bias, tok);
 
     // Small problems are not worth the fork/join overhead.
     const flops = 2 * m * w.rows * w.cols;
@@ -328,6 +338,69 @@ fn matmulPacked(
     try group.await(io);
     if (cancel.canceled(tok)) return error.Canceled;
 }
+
+// Small-m GEMV for block-quant dtypes ggml cannot serve — today only q2_0_g128,
+// whose 128-element blocks ggml's 64-element type 42 cannot address (see
+// quants.dequantQ2_0G128). Same shape as `ggml_gemv` below (thread over row
+// chunks, weight row read once) minus the activation quantization: the fused dot
+// takes f32 activations directly, so there is no `vy` scratch and no from_float.
+const native_gemv = struct {
+    const Job = struct {
+        y: []f32,
+        x: []const f32,
+        w: []const u8,
+        m: usize,
+        rows: usize,
+        cols: usize,
+        row_bytes: usize,
+        bias: ?[]const f32,
+        tok: cancel.Token,
+    };
+
+    fn gemvRows(j: Job, r0: usize, r1: usize) void {
+        for (r0..r1) |r| {
+            if (cancel.canceled(j.tok)) return; // q2Gemv reports error.Canceled
+            const wrow = j.w[r * j.row_bytes ..][0..j.row_bytes];
+            for (0..j.m) |t| {
+                var s = quants.dotQ2_0G128(wrow, j.x[t * j.cols ..][0..j.cols]);
+                if (j.bias) |b| s += b[r];
+                j.y[t * j.rows + r] = s;
+            }
+        }
+    }
+
+    /// y[m*rows] = W[rows*cols] (q2_0_g128) · x[m*cols] + bias.
+    ///
+    /// Threaded over row chunks for the reason `quantGemv` documents: one core
+    /// cannot pull the model's weight bandwidth, so rows are split across cores.
+    ///
+    /// ⚠️ At m > 1 the weight row is re-read per token, so weight traffic scales
+    /// with m. That is exactly what `ggml_gemv` does for every other quant (its
+    /// `vec_dot` is likewise called per token), so this is parity rather than a
+    /// new deficiency — and `small_m_max` hands anything from 16 tokens up to the
+    /// packed path, which amortizes the weight over the whole batch.
+    pub fn q2Gemv(io: std.Io, y: []f32, x: []const f32, m: usize, w_bytes: []const u8, rows: usize, cols: usize, bias: ?[]const f32) Error!void {
+        const row_bytes = DType.q2_0_g128.storageBytes(cols);
+        const tok = cancel.token;
+        const job = Job{ .y = y, .x = x, .w = w_bytes, .m = m, .rows = rows, .cols = cols, .row_bytes = row_bytes, .bias = bias, .tok = tok };
+        const n_threads = std.Thread.getCpuCount() catch 1;
+        const want: usize = if (n_threads == 1 or rows < 128) 1 else n_threads;
+        if (want == 1) {
+            gemvRows(job, 0, rows);
+            if (cancel.canceled(tok)) return error.Canceled;
+            return;
+        }
+        const chunk = std.math.divCeil(usize, rows, want) catch unreachable;
+        var group: std.Io.Group = .init;
+        defer group.cancel(io);
+        var r: usize = 0;
+        while (r < rows) : (r += chunk) {
+            group.async(io, gemvRows, .{ job, r, @min(r + chunk, rows) });
+        }
+        try group.await(io);
+        if (cancel.canceled(tok)) return error.Canceled;
+    }
+};
 
 // Small-m block-quant GEMV via ggml's AVX2 vec_dot. Behind `have_ggml`: without
 // ggml, block-quant weights are rejected in matmul() (error.QuantBackendUnavailable)
@@ -425,7 +498,7 @@ fn packedTask(
         inline .f8_e4m3, .bf16, .f16, .f32, .i8 => |dt| {
             packedTaskTyped(dt, y, x, m, w, bias, row_start, row_end, panel, tok);
         },
-        inline .q4_0, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl => |dt| {
+        inline .q4_0, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl, .q1_0, .q2_0_g64, .q2_0_g128 => |dt| {
             packedTaskBlock(dt, y, x, m, w, bias, row_start, row_end, panel, tok);
         },
         else => unreachable, // validated in matmul()
@@ -434,8 +507,10 @@ fn packedTask(
 
 /// Packed outer-product path for ggml block-quantized weights. Mirrors
 /// `packedTaskI4` (dequant a k-slice of each row into a temp, scatter
-/// k-major) with quants.zig doing the block decode. KC is a multiple of the
-/// 256-element super-block, so k-slices stay block-aligned.
+/// k-major) with quants.zig doing the block decode. KC is a multiple of every
+/// block size we carry (32, 64, 128, 256), so k-slices stay block-aligned — which
+/// `dequantSlice` asserts on, and which the comptime check below pins per dtype
+/// rather than against a single hardcoded super-block size.
 fn packedTaskBlock(
     comptime dt: DType,
     y: []f32,
@@ -448,7 +523,7 @@ fn packedTaskBlock(
     panel: []f32,
     tok: cancel.Token,
 ) void {
-    comptime std.debug.assert(KC % 256 == 0);
+    comptime std.debug.assert(KC % dt.blockElems() == 0);
     const cols = w.cols;
     const rows = w.rows;
     const row_bytes = dt.storageBytes(cols);
@@ -1248,7 +1323,11 @@ fn testBlockQuantAgainstNaive(m: usize, rows: usize, cols: usize, dt: DType, wit
     var off: usize = 0;
     while (off < wbytes.len) : (off += bb) {
         switch (dt) {
-            .q8_0 => std.mem.writeInt(u16, wbytes[off..][0..2], d16, .little),
+            // q1_0/q2_0's only scale field is `d` at offset 0; the remaining
+            // bytes are sign bits / 2-bit codes, so random ones need no pinning
+            // (every bit pattern is a valid quant and there is no per-sub-block
+            // scale to blow up).
+            .q8_0, .q1_0, .q2_0_g64, .q2_0_g128 => std.mem.writeInt(u16, wbytes[off..][0..2], d16, .little),
             .q4_k, .q5_k => {
                 std.mem.writeInt(u16, wbytes[off..][0..2], d16, .little);
                 std.mem.writeInt(u16, wbytes[off + 2 ..][0..2], min16, .little);
@@ -1281,11 +1360,15 @@ fn testBlockQuantAgainstNaive(m: usize, rows: usize, cols: usize, dt: DType, wit
     try matmul(io, gpa, y, x, m, w, bias);
     naiveMatmul(y_ref, x, m, w_f32, rows, cols, bias);
 
-    // Small-m block-quant now runs through ggml's vec_dot, which quantizes the
+    // Small-m block-quant runs through ggml's vec_dot, which quantizes the
     // activation to int8 (Q8_K / Q8_0) — approximate by design. Use a robust,
     // dtype-agnostic relative-L2 tolerance over the whole output (a per-row
     // metric blows up on near-zero dots; a per-256-block bound breaks for q8_0).
-    if (m < small_m_max) {
+    //
+    // ⚠️ Gated on `usesGgml`, not on `m` alone: a dtype with no ggml vec_dot
+    // (q2_0_g128) takes the exact packed path at every m, and holding it to the
+    // 5% activation-quantization bound would leave it with no teeth.
+    if (m < small_m_max and quants_mod.usesGgml(dt)) {
         var num: f64 = 0;
         var den: f64 = 0;
         for (y_ref, y) |e, a| {
@@ -1322,6 +1405,32 @@ test "matmul block quants packed path" {
     try testBlockQuantAgainstNaive(37, NR + 5, KC + 256, .q4_k, false);
     try testBlockQuantAgainstNaive(19, 33, 512, .q5_k, true);
     try testBlockQuantAgainstNaive(small_m_max, NR, KC + 256, .q6_k, false);
+}
+
+test "matmul q1_0 on both paths" {
+    // q1_0's 128-element block is the first block size here that is neither 32 nor
+    // 256, so the k-slicing is the thing under test as much as the arithmetic:
+    // `cols = KC + 128` gives a partial final slice that is still block-aligned.
+    try testBlockQuantAgainstNaive(1, 9, 128, .q1_0, false); // GEMV, one block/row
+    try testBlockQuantAgainstNaive(3, 12, 512, .q1_0, true); // GEMV, multi-block
+    try testBlockQuantAgainstNaive(37, NR + 5, KC + 128, .q1_0, false); // packed, partial slice
+    try testBlockQuantAgainstNaive(small_m_max, NR, 5120, .q1_0, true); // packed, Bonsai's hidden
+}
+
+test "matmul q2_0 on both paths, both block sizes" {
+    // Both variants of GGUF type 42. g64 is a fourth distinct block size (after
+    // 32, 256, 128), so as with q1_0 the k-slicing is under test as much as the
+    // arithmetic: `cols = KC + blk` gives a partial final slice that is still
+    // block-aligned. g128 additionally takes the PACKED path at every m (it has
+    // no ggml vec_dot), so its small-m cases exercise a different kernel than
+    // every other block quant's do — which is the point of running both here.
+    for ([_]DType{ .q2_0_g64, .q2_0_g128 }) |dt| {
+        const blk = dt.blockElems();
+        try testBlockQuantAgainstNaive(1, 9, blk, dt, false); // one block/row
+        try testBlockQuantAgainstNaive(3, 12, 512, dt, true); // multi-block
+        try testBlockQuantAgainstNaive(37, NR + 5, KC + blk, dt, false); // packed, partial slice
+        try testBlockQuantAgainstNaive(small_m_max, NR, 5120, dt, true); // packed, Bonsai's hidden
+    }
 }
 
 test "exact_activations removes the small-m path's activation quantization" {

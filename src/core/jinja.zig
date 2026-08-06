@@ -1660,6 +1660,24 @@ const Interp = struct {
             for (v.list.items.items) |it| try l.items.append(self.a, try self.applyNamedFilter(fname, it));
             return .{ .list = l };
         }
+        if (std.mem.eql(u8, name, "items")) {
+            // jinja2 3.1's `items`: a mapping's (key, value) pairs in insertion
+            // order — `dictsort` without the sort. Its leniency is specified, not
+            // incidental: undefined yields nothing, and a non-mapping is an ERROR
+            // rather than a pass-through, because `for k, v in <string>|items`
+            // would otherwise unpack characters and render silent nonsense. Tool
+            // calls reach this via `tool_call.arguments|items`.
+            if (v == .undef) return .{ .list = try self.newList() };
+            if (v != .dict) return self.rt("items expects a mapping");
+            const l = try self.newList();
+            for (v.dict.entries.items) |ent| {
+                const pair = try self.newList();
+                try pair.items.append(self.a, self.strVal(ent.key));
+                try pair.items.append(self.a, ent.val);
+                try l.items.append(self.a, .{ .list = pair });
+            }
+            return .{ .list = l };
+        }
         if (std.mem.eql(u8, name, "dictsort")) {
             if (v != .dict) return v;
             const entries = try self.a.dupe(Entry, v.dict.entries.items);
@@ -1812,7 +1830,7 @@ const Interp = struct {
             .list => |l| {
                 try out.append(self.a, '[');
                 for (l.items.items, 0..) |it, i| {
-                    if (i > 0) try out.append(self.a, ',');
+                    if (i > 0) try self.jsonItemSep(out, indent);
                     try self.jsonNL(out, indent, depth + 1);
                     try self.toJson(it, out, indent, depth + 1);
                 }
@@ -1822,11 +1840,10 @@ const Interp = struct {
             .dict => |d| {
                 try out.append(self.a, '{');
                 for (d.entries.items, 0..) |ent, i| {
-                    if (i > 0) try out.append(self.a, ',');
+                    if (i > 0) try self.jsonItemSep(out, indent);
                     try self.jsonNL(out, indent, depth + 1);
                     try self.jsonStr(ent.key, out);
-                    try out.append(self.a, ':');
-                    if (indent != null) try out.append(self.a, ' ');
+                    try out.appendSlice(self.a, ": "); // key separator, always spaced
                     try self.toJson(ent.val, out, indent, depth + 1);
                 }
                 if (d.entries.items.len > 0) try self.jsonNL(out, indent, depth);
@@ -1834,6 +1851,16 @@ const Interp = struct {
             },
             else => try out.appendSlice(self.a, "null"),
         }
+    }
+    /// Python's `json.dumps` separators, which `tojson` inherits: `", "` between
+    /// items when compact, plain `","` once an indent puts a newline after it.
+    /// ⚠️ This is not cosmetic. A chat template's `tools` block goes through
+    /// `tojson` into the system prompt, so a compact `{"a":1}` where the
+    /// ecosystem writes `{"a": 1}` is a DIFFERENT prompt — different tokens, for
+    /// every tool-calling render. llama.cpp's own jinja (`common/jinja/value.cpp`)
+    /// and transformers' `tojson` override agree on these two defaults.
+    fn jsonItemSep(self: *Interp, out: *std.ArrayList(u8), indent: ?usize) Error!void {
+        try out.appendSlice(self.a, if (indent == null) ", " else ",");
     }
     fn jsonNL(self: *Interp, out: *std.ArrayList(u8), indent: ?usize, depth: usize) Error!void {
         if (indent) |n| {

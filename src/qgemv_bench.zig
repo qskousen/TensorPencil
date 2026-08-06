@@ -26,25 +26,46 @@ const rnd = rnd_state.random();
 const Shape = struct { rows: usize, cols: usize, name: []const u8 };
 // rows multiple of 128 (hgemm), cols multiple of 256 (dp4a grouped GEMV).
 const shapes = [_]Shape{
-    .{ .rows = 4096, .cols = 4096, .name = "4096 x 4096   (attn o_proj)" },
-    .{ .rows = 11008, .cols = 4096, .name = "11008 x 4096  (mlp gate/up)" },
-    .{ .rows = 4096, .cols = 11008, .name = "4096 x 11008  (mlp down)" },
     // gemma4 31B (hidden 5376, ffn 21504) — the prefill shapes that matter here.
     .{ .rows = 21504, .cols = 5376, .name = "21504 x 5376  (g4 mlp gate/up)" },
     .{ .rows = 5376, .cols = 21504, .name = "5376 x 21504  (g4 mlp down)" },
+    // Bonsai-27B / qwen35 (hidden 5120, ffn 17408) — the q1_0 prefill shapes.
+    .{ .rows = 17408, .cols = 5120, .name = "17408 x 5120  (b27 mlp gate/up)" },
+    .{ .rows = 5120, .cols = 17408, .name = "5120 x 17408  (b27 mlp down)" },
+    // The shape ggml's own `test-backend-ops perf -o MUL_MAT` reports, so our MMQ
+    // can be compared to llama.cpp's number apples-to-apples instead of inferred
+    // from an end-to-end rate. Theirs: 86.50 TFLOPS at n=512 on a 3090.
+    .{ .rows = 4096, .cols = 14336, .name = "4096 x 14336  (ggml perf shape)" },
 };
 // n=1 is decode; 2-8 is a chain/tree verify batch; 16-64 spans into
 // prefill-chunk territory where the GEMM is expected to win.
-const batches = [_]usize{ 1, 8, 32, 128, 256 };
+const batches = [_]usize{ 1, 8, 32, 128, 256, 512 };
 
 const Kind = struct { dt: tp.DType, g: c.enum_ggml_type, name: []const u8 };
-// All block-quants now have grouped dp4a kernels.
+// Every block-quant here has a grouped dp4a kernel EXCEPT q1_0 (see `grouped`).
 const kinds = [_]Kind{
     .{ .dt = .q4_k, .g = c.GGML_TYPE_Q4_K, .name = "q4_k" },
     .{ .dt = .q5_k, .g = c.GGML_TYPE_Q5_K, .name = "q5_k" },
     .{ .dt = .q6_k, .g = c.GGML_TYPE_Q6_K, .name = "q6_k" },
     .{ .dt = .q8_0, .g = c.GGML_TYPE_Q8_0, .name = "q8_0" },
+    .{ .dt = .q1_0, .g = c.GGML_TYPE_Q1_0, .name = "q1_0" },
 };
+
+/// Whether `grouped` has a kernel for this dtype (`opGemvQuantQ8N`). q1_0 has no
+/// grouped GEMV — it went straight to MMQ for prefill — so the grouped column is
+/// skipped rather than panicking.
+fn hasGroupedKernel(dt: tp.DType) bool {
+    return dt != .q1_0;
+}
+
+/// Int8 tensor-core MACs for one GEMM, as TOPS given a millisecond timing —
+/// the distance from the 3090's ~284 dense TOPS is what says whether a kernel is
+/// worth more work or already near the machine.
+fn tops(rows: usize, cols: usize, n: usize, ms: f64) f64 {
+    if (ms <= 0) return 0;
+    const ops = 2.0 * @as(f64, @floatFromInt(rows)) * @as(f64, @floatFromInt(cols)) * @as(f64, @floatFromInt(n));
+    return ops / (ms * 1e-3) / 1e12;
+}
 
 /// DeviceBuffer sub-view (mirrors qwen*_cuda.zig's private offsetBufSized).
 fn offBuf(b: DeviceBuffer, off_bytes: usize, size: u64) DeviceBuffer {
@@ -80,7 +101,7 @@ pub fn main(init: std.process.Init) !void {
         const rows = sh.rows;
         const cols = sh.cols;
         p("\n=== {s} ===\n", .{sh.name});
-        p("  {s:<5} {s:>4} {s:>9} {s:>9}  {s:>8} {s:>8}  {s:>8} {s:>9}  {s:>8}\n", .{ "dt", "n", "dequant", "f16 gemm", "deq+gemm", "mmq v1", "pipe ms", "pipe rel", "pipe spd" });
+        p("  {s:<5} {s:>4} {s:>9} {s:>9}  {s:>8} {s:>8}  {s:>8} {s:>9}  {s:>8} {s:>6}\n", .{ "dt", "n", "dequant", "f16 gemm", "deq+gemm", "mmq v1", "pipe ms", "pipe rel", "pipe spd", "TOPS" });
 
         const wf = try gpa.alloc(f32, rows * cols);
         defer gpa.free(wf);
@@ -101,12 +122,13 @@ pub fn main(init: std.process.Init) !void {
                 try be.tensorUpload(x_d, std.mem.sliceAsBytes(xh));
 
                 for (0..warmup) |_| {
-                    grouped(be, k.dt, x_d, y_d, q, n, rows, cols);
+                    if (hasGroupedKernel(k.dt)) grouped(be, k.dt, x_d, y_d, q, n, rows, cols);
                     be.opMatmulQuant(k.dt, y_d, x_d, n, q, rows, cols) catch @panic("gemm");
                 }
 
                 be.prof.reset();
-                for (0..iters) |_| grouped(be, k.dt, x_d, y_d, q, n, rows, cols);
+                if (hasGroupedKernel(k.dt))
+                    for (0..iters) |_| grouped(be, k.dt, x_d, y_d, q, n, rows, cols);
                 const grouped_ms = be.prof.ms[@intFromEnum(Cat.matmul)] / iters;
                 const quant_ms = be.prof.ms[@intFromEnum(Cat.elt)] / iters;
 
@@ -171,7 +193,7 @@ pub fn main(init: std.process.Init) !void {
                 _ = grouped_ms;
                 _ = quant_ms;
                 const pipe_spd = if (pipe_ms > 0) gemm_ms / pipe_ms else 0;
-                p("  {s:<5} {d:>4} {d:>9.4} {d:>9.4}  {d:>8.4} {d:>8.4}  {d:>8.4} {d:>9.5}  {d:>7.2}x  (v1 rel {d:.5})\n", .{ k.name, n, deq_ms, mm_ms, gemm_ms, mmq_ms, pipe_ms, pipe_rel, pipe_spd, mmq_rel });
+                p("  {s:<5} {d:>4} {d:>9.4} {d:>9.4}  {d:>8.4} {d:>8.4}  {d:>8.4} {d:>9.5}  {d:>7.2}x  {d:>6.1}  (v1 rel {d:.5})\n", .{ k.name, n, deq_ms, mm_ms, gemm_ms, mmq_ms, pipe_ms, pipe_rel, pipe_spd, tops(rows, cols, n, pipe_ms), mmq_rel });
 
                 var xd = x_d;
                 var yd = y_d;
