@@ -872,6 +872,30 @@ pub const CudaLM = struct {
     /// `residency.demand` hook: device-resident weights that are not per-layer.
     /// A tied head/embedding is ONE cached device buffer (the weight cache keys
     /// on the byte slice), so count it once.
+    /// Upload every device-resident weight NOW, so the one-time host->device copy
+    /// is not charged to the first forward. Mirrors `layerDeviceBytes` exactly —
+    /// the same tensors it counts are the ones warmed here, so the two cannot
+    /// drift. See `Backend.warmWeight` for why this exists.
+    ///
+    /// Skips layers the CPU split placed on the host and is best-effort
+    /// throughout: anything that will not fit still works, it just pays the copy
+    /// on first use as before.
+    pub fn warmWeights(self: *CudaLM) void {
+        const be = self.be;
+        be.warmWeight(self.lm.head.bytes);
+        if (self.lm.embed.bytes.ptr != self.lm.head.bytes.ptr) be.warmWeight(self.lm.embed.bytes);
+        for (self.lm.layers, 0..) |*layer, l| {
+            if (self.split) |*sp| if (!sp.on_gpu[l]) continue;
+            be.warmWeight(layer.q.bytes);
+            be.warmWeight(layer.k.bytes);
+            be.warmWeight(layer.v.bytes);
+            be.warmWeight(layer.o.bytes);
+            be.warmWeight(layer.gate.bytes);
+            be.warmWeight(layer.up.bytes);
+            be.warmWeight(layer.down.bytes);
+        }
+    }
+
     pub fn nonLayerDeviceBytes(self: *CudaLM) u64 {
         const h = self.lm.head.bytes;
         const e = self.lm.embed.bytes;

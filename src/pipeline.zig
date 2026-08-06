@@ -2797,7 +2797,8 @@ pub const Session = struct {
             // weights (the text encoder), which evict + re-stream as the DiT pins.
             // Reserve the live activation scratch + a small margin on top.
             const free_now = b.ctx.memGetInfo().free;
-            const room = free_now + b.evictableWeightBytes();
+            const evictable = b.evictableWeightBytes();
+            const room = free_now + evictable;
             const budget = if (opts.vram_budget > 0) @min(opts.vram_budget, room) else room;
             const pin_reserve: u64 = b.attn_scratch_budget + (512 << 20);
             b.pin_budget = budget -| pin_reserve;
@@ -2808,8 +2809,14 @@ pub const Session = struct {
             // pin time; the floor is the physical backstop that makes streaming
             // actually fit — the whole point of a tight budget.
             b.pin_floor = pin_reserve;
-            std.log.info("[diff-vram] budget={d}MB room={d}MB reserve={d}MB pin={d}MB free={d}MB", .{
-                opts.vram_budget >> 20, room >> 20, pin_reserve >> 20, b.pin_budget >> 20, free_now >> 20,
+            // ⚠️ `req` is what the caller ASKED for; `eff` is what physical room
+            // allows and what actually governs. Printing only `req` next to a much
+            // smaller `pin` reads as a bug ("16 GB budget, pinning 689 MB?") when
+            // it is the `@min` above doing its job.
+            std.log.info("[diff-vram] budget req={d}MB room={d}MB -> eff={d}MB · reserve={d}MB pin={d}MB (free={d}MB + evictable={d}MB)", .{
+                opts.vram_budget >> 20, room >> 20, budget >> 20,
+                pin_reserve >> 20,      b.pin_budget >> 20,
+                free_now >> 20,         evictable >> 20,
             });
 
             // Proactively drop the transient text encoder when it can't stay
@@ -2821,19 +2828,42 @@ pub const Session = struct {
             // resident LLM). Evicting up front lets step 1 pin from the start. The
             // encode (both CFG passes) is already done, so the encoder has no
             // further use THIS image; on a big card where it all fits we keep it
-            // (the next queued image's encode reuses it). At this point — post
-            // encode, pre-DiT-Session.init — the weight cache holds ONLY the
-            // encoder, so evictWeights drops exactly it. Condition: the DiT weights
-            // + activation reserve don't fit in the live free VRAM with the encoder
-            // still resident (room already counts the encoder as reclaimable, so
-            // the test reduces to dit + reserve > free_now).
+            // (the next queued image's encode reuses it).
+            //
+            // ⚠️ **The test must discount the DiT already on the card, and getting
+            // that wrong made this fire on every queued image.** On the FIRST image
+            // the cache holds only the encoder, so "does dit + reserve fit in free?"
+            // is right. On a SUBSEQUENT image the previous DiT is still pinned
+            // (evictUnpinned below deliberately keeps it) — which is *why* free VRAM
+            // is low — so counting the whole DiT again double-counts it against a
+            // `free_now` that already excludes it. Observed: dit=13477 + reserve=2560
+            // > free=2628 "true" with the DiT wholly resident, evicting an encoder
+            // that fit perfectly well. Subtracting the resident part reduces the
+            // second image to `reserve > free`, which is the real question.
+            //
+            // Pinned bytes are the right proxy for "resident DiT": the encoder and
+            // the VAE are both left UNPINNED by design (see pin_budget above), so on
+            // this path anything pinned is DiT. Clamped to `dit_bytes` so a stray
+            // pin can never make the requirement negative.
             const dit_bytes = self.denoiserPayloadLen();
-            if (dit_bytes + pin_reserve > free_now) {
+            const dit_resident = @min(dit_bytes, b.pinnedWeightBytes());
+            const dit_to_place = dit_bytes - dit_resident;
+            if (dit_to_place + pin_reserve > free_now) {
                 // evictUnpinned (NOT evictWeights): keep a DiT pinned by a previous
                 // queued image, drop only the (unpinned) encoder + any stray stream.
                 const freed = b.evictUnpinned();
-                if (freed > 0) std.log.info("[diff-vram] dropped {d}MB of unpinned weights (text encoder) up front — won't fit alongside the DiT working set (dit={d}MB + reserve={d}MB > free={d}MB)", .{
-                    freed >> 20, dit_bytes >> 20, pin_reserve >> 20, free_now >> 20,
+                // ⚠️ Says "unpinned weights", not "text encoder": on a subsequent
+                // image the VAE is resident and unpinned too, so this drops that as
+                // well (harmless — the decode is after sampling, by which point the
+                // streaming DiT would have reclaimed it anyway). Naming only the
+                // encoder made the line describe less than it did.
+                //
+                // The inequality is the one actually tested. The old line printed
+                // the WHOLE DiT against free VRAM, which framed streaming-by-design
+                // as a fit failure and implied dropping ~600 MB could make 13 GB fit.
+                if (freed > 0) std.log.info("[diff-vram] dropped {d}MB of unpinned weights (encoder, + VAE if resident) so step 1 pins from the start — DiT still needs {d}MB of {d}MB ({d}MB already resident) + {d}MB reserve > {d}MB free", .{
+                    freed >> 20,      dit_to_place >> 20, dit_bytes >> 20,
+                    dit_resident >> 20, pin_reserve >> 20, free_now >> 20,
                 });
             }
         }
