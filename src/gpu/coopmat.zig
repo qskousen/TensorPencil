@@ -2460,11 +2460,19 @@ pub fn buildGemmScores(gpa: std.mem.Allocator, hd: u32, stage_k: bool) ![]align(
 /// Bindings: 0 = K (f16 per-head k-major [kv][128][s_stride], zero-padded
 /// cols), 1 = Q (f16 [seq_pad][heads*128], softmax scale prefolded, zero
 /// pad rows), 2 = OUT+MD (f32; out rows [seq_pad][heads*128] then MD
-/// [z][s_stride] x {m, 1/d} at u5), 3 = V (f16 [seq_pad][kv*128], zero pad
+/// [z][md_plane] x {m, 1/d} at u5), 3 = V (f16 [kv_pad][kv*128], zero pad
 /// rows; unused by pass 1). Push (EltPush words): u0 = q/out row stride
-/// (heads*128), u1 = s_stride == MD plane stride, u2 = head_off, u3 =
-/// heads-per-kv group, u4 = V row stride (kv*128), u5 = MD offset in f32
-/// elements, f0 = valid j count (u32 bits).
+/// (heads*128), u1 = s_stride (the KEY padded length: K's row stride and the
+/// j loop bound), u2 = head_off, u3 = heads-per-kv group, u4 = V row stride
+/// (kv*128), u5 = MD offset in f32 elements, f0 = valid j count (u32 bits),
+/// **f1 = MD plane stride, 0 meaning "= s_stride"**.
+///
+/// ⚠️ **q and kv lengths are INDEPENDENT** — grid.y covers query tiles while
+/// `s_stride`/`pseq` describe the keys — so this runs cross-attention
+/// (Anima's `seq x 512`) as well as square self-attention. The one thing that
+/// was not independent was the MD table, whose plane stride has to cover the
+/// *query* rows; hence f1. Every caller that predates it passes 0 and gets the
+/// old square behaviour exactly.
 fn buildFlashAttn(gpa: std.mem.Allocator, out_phase: bool, stage_k: bool) ![]align(4) u8 {
     const STAGE_Q = false;
     const Q_SH: u32 = if (STAGE_Q) 16384 else 0; // s_sh region base
@@ -2645,11 +2653,24 @@ fn buildFlashAttn(gpa: std.mem.Allocator, out_phase: bool, stage_k: bool) ![]ali
     const flat = em.id();
     try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ flat, lymul, lx });
 
-    const pnames = [_][]const u8{ "pqstride", "psstride", "pheadoff", "pgroup", "pvstride", "pmdoff", "pseq" };
-    for (0..7) |m| {
+    const pnames = [_][]const u8{ "pqstride", "psstride", "pheadoff", "pgroup", "pvstride", "pmdoff", "pseq", "pmdplane_raw" };
+    for (0..8) |m| {
         const pptr = em.id();
         try em.line("%t{d} = OpAccessChain %ptr_pc_u32 %vpush %c_u{d}", .{ pptr, m });
         try em.line("%{s} = OpLoad %u32 %t{d}", .{ pnames[m], pptr });
+    }
+    // MD plane stride. ⚠️ It is NOT `psstride` in general: this kernel runs
+    // RECTANGULAR q x kv (Anima's cross-attention is `seq x 512`), where `psstride`
+    // is the *key* padded length while the MD table needs one entry per *query*
+    // row. Word 7 carries it, and **0 means "same as psstride"** so every
+    // pre-existing caller — all of which pass f1 = 0 — is unchanged by
+    // construction. `buildGemmAttnOut` already had a `pmdplane`; this is its
+    // sibling catching up.
+    const mdplane = "pmdplane";
+    {
+        const isz = em.id();
+        try em.line("%t{d} = OpIEqual %bool %pmdplane_raw %c_u0", .{isz});
+        try em.line("%{s} = OpSelect %u32 %t{d} %psstride %pmdplane_raw", .{ mdplane, isz });
     }
 
     const head = em.id();
@@ -2709,7 +2730,7 @@ fn buildFlashAttn(gpa: std.mem.Allocator, out_phase: bool, stage_k: bool) ![]ali
     const mdrow = em.id();
     {
         const zr = em.id();
-        try em.line("%t{d} = OpIMul %u32 %t{d} %psstride", .{ zr, zidx });
+        try em.line("%t{d} = OpIMul %u32 %t{d} %pmdplane", .{ zr, zidx });
         const qr = em.id();
         try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ qr, zr, row0 });
         const qr2 = em.id();

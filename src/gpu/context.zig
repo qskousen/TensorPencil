@@ -15,6 +15,7 @@ pub const vk = @import("vk.zig");
 const spv = @import("spv.zig");
 const coopmat = @import("coopmat.zig");
 const convrot = @import("tp_ops").convrot;
+const ops = @import("tp_ops");
 const mem_tag = @import("mem_tag.zig");
 const sample = @import("tp_core").sample;
 pub const MemTag = mem_tag.MemTag;
@@ -110,6 +111,21 @@ pub const topk_lanes = 1024;
 /// KV storage format of the LLM decode-attention / KV store ops (mirrors
 /// llm.kv_cache.KvDtype). q8_0 is the ggml 34-byte block (f16 scale + 32 i8).
 pub const KvFmt = enum { f32, f16, q8_0 };
+
+/// Reduction widths with a FUSED int8 prep kernel. ⚠️ Every convrot `cols` a model's
+/// device GEMMs use should appear here or that prep silently takes the 3-pass fallback,
+/// which round-trips a full f32 copy of the activation through global memory. krea2 needs
+/// 6144 and 16384; Anima needs 2048 (`dim`) and 8192 (`mlp_dim`).
+pub const i8_prep_cols = [_]u32{ 2048, 6144, 8192, 16384 };
+
+/// Which pass of the two-pass flash attention (`coopmat.buildFlashAttn`). Named rather than
+/// inline so a caller can pass it through `@call`.
+pub const FlashPass = enum { md, out };
+
+fn i8PrepIndex(cols: usize) ?usize {
+    for (i8_prep_cols, 0..) |c, i| if (c == cols) return i;
+    return null;
+}
 
 pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, rope_qwen35, attn_decode_q35, attn_dsplit_gemma, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, attn_dsplit_gemma_f16, kv_store_f16, penalize, attn_dsplit_gemma_q8, kv_store_q8_0, gemv_iq4_nl, gemv_iq4_nl_t, dequant_q8_0_f32, dequant_q4_k_f32, dequant_q5_k_f32, dequant_q6_k_f32, dequant_iq4_nl_f32, pack_h16_kmajor, gn_stats, gn_combine, gn_apply, silu, geglu, concat_ch, attn_cross, head_pad_h16, head_unpad, im2col_sd, attn_causal_batched, gelu_quick, gelu_erf, gn_stats_h16, gn_apply_h16, add_h16, bias_compact_h16, im2col_sd_h16, h16_to_h16_pad };
 const elt_entry_sizes = [_]EntrySize{
@@ -534,9 +550,10 @@ pub const Context = struct {
     /// on the rare device that rejects the module.
     /// [0] subgroup_sum (capability probe), [1] rmsnorm_sg, [2] gemv_q8_0_sg,
     /// [3] gemv_q4_k_sg, [4] gemv_q5_k_sg, [5] gemv_q6_k_sg, [6] gemv_iq4_nl_sg,
-    /// [7] attn_decode_sg (folded flash-decode attention).
+    /// [7] attn_decode_sg (folded flash-decode attention),
+    /// [8] ln_mod_sg (fused weightless LayerNorm + AdaLN modulation).
     shader_sg: vk.ShaderModule = .null_handle,
-    pipe_sg: [8]vk.Pipeline = @splat(.null_handle),
+    pipe_sg: [9]vk.Pipeline = @splat(.null_handle),
     // Standalone block-diagonal batched-attention kernel (its own module +
     // 5-buffer set: a=q,b=k,c=v,d=out,e=bounds). Separate from the eltwise
     // module, which is at the SPIR-V backend's per-module entry-point limit.
@@ -576,10 +593,12 @@ pub const Context = struct {
     /// Stage B: fused int8 prep (rotate FWHT + rowmax + quantize) in one
     /// f16-shared-memory kernel. Two builds: cols=6144 (qkv/wo/mlp-gu) and
     /// cols=16384 (mlp.down). Replaces the 3-pass chain + its xr round-trip.
-    shader_i8_prep6144: vk.ShaderModule = .null_handle,
-    pipe_i8_prep6144: vk.Pipeline = .null_handle,
-    shader_i8_prep16384: vk.ShaderModule = .null_handle,
-    pipe_i8_prep16384: vk.Pipeline = .null_handle,
+    /// Fused int8 prep (rotate + rowmax + quantize in one kernel), one build per
+    /// reduction width — the FWHT is unrolled for a fixed `cols`. Indexed by
+    /// `i8_prep_cols`; `.null_handle` for a width with no build, which falls back to the
+    /// width-general 3-pass chain.
+    shader_i8_prep: [i8_prep_cols.len]vk.ShaderModule = @splat(.null_handle),
+    pipe_i8_prep: [i8_prep_cols.len]vk.Pipeline = @splat(.null_handle),
     /// Tensor-core attention GEMMs (present iff pipe_coop is).
     shader_scores: vk.ShaderModule = .null_handle,
     pipe_scores: vk.Pipeline = .null_handle,
@@ -1214,7 +1233,7 @@ pub const Context = struct {
         // leaves the subgroup pipelines null (callers fall back to the multi-pass
         // eltwise path), never failing device bring-up.
         var shader_sg: vk.ShaderModule = .null_handle;
-        var pipe_sg: [8]vk.Pipeline = @splat(vk.Pipeline.null_handle);
+        var pipe_sg: [9]vk.Pipeline = @splat(vk.Pipeline.null_handle);
         sg: {
             const sg_entries = [_]EntrySize{
                 .{ .name = "subgroup_sum", .x = 32, .y = 1 },
@@ -1230,13 +1249,16 @@ pub const Context = struct {
                 // attn_decode_sg: one subgroup (=1 wg) per head; big acc[] per
                 // lane, so keep 1 subgroup/wg (not 8) to limit register pressure.
                 .{ .name = "attn_decode_sg", .x = 32, .y = 1 },
+                // ln_mod_sg: one row per subgroup, 8 subgroups per workgroup —
+                // same reasoning as the gemv_*_sg entries above.
+                .{ .name = "ln_mod_sg", .x = 256, .y = 1 },
             };
             const caps = [_]u32{ spv.cap_group_nonuniform, spv.cap_group_nonuniform_arithmetic };
             createKernelModule(gpa, &d, device, subgroup_spv, &sg_entries, &caps, null, &shader_sg) catch |e| {
                 std.log.warn("subgroup module unavailable ({t}); norms use the multi-pass path", .{e});
                 break :sg;
             };
-            const infos = [8]vk.ComputePipelineCreateInfo{
+            const infos = [9]vk.ComputePipelineCreateInfo{
                 .{ .stage = .{ .module = shader_sg, .p_name = "subgroup_sum" }, .layout = pipeline_layout_e },
                 .{ .stage = .{ .module = shader_sg, .p_name = "rmsnorm_sg" }, .layout = pipeline_layout_e },
                 .{ .stage = .{ .module = shader_sg, .p_name = "gemv_q8_0_sg" }, .layout = pipeline_layout_e },
@@ -1245,6 +1267,7 @@ pub const Context = struct {
                 .{ .stage = .{ .module = shader_sg, .p_name = "gemv_q6_k_sg" }, .layout = pipeline_layout_e },
                 .{ .stage = .{ .module = shader_sg, .p_name = "gemv_iq4_nl_sg" }, .layout = pipeline_layout_e },
                 .{ .stage = .{ .module = shader_sg, .p_name = "attn_decode_sg" }, .layout = pipeline_layout_e },
+                .{ .stage = .{ .module = shader_sg, .p_name = "ln_mod_sg" }, .layout = pipeline_layout_e },
             };
             if (d.CreateComputePipelines(device, .null_handle, infos.len, &infos, null, &pipe_sg) != .success) {
                 std.log.warn("subgroup pipelines unavailable; norms use the multi-pass path", .{});
@@ -1414,29 +1437,25 @@ pub const Context = struct {
 
         // Stage B: fused int8 prep kernels (f16-shared FWHT; hand-assembled),
         // one per convrot cols (6144, 16384).
-        var shader_i8_prep6144: vk.ShaderModule = .null_handle;
-        var pipe_i8_prep6144: vk.Pipeline = .null_handle;
-        var shader_i8_prep16384: vk.ShaderModule = .null_handle;
-        var pipe_i8_prep16384: vk.Pipeline = .null_handle;
+        var shader_i8_prep: [i8_prep_cols.len]vk.ShaderModule = @splat(.null_handle);
+        var pipe_i8_prep: [i8_prep_cols.len]vk.Pipeline = @splat(.null_handle);
         if (coop_i8_m == 16 and coop_i8_n == 16 and coop_i8_k == 32 and coopmat.i8_shared) {
-            inline for (.{ .{ 6144, &shader_i8_prep6144, &pipe_i8_prep6144 }, .{ 16384, &shader_i8_prep16384, &pipe_i8_prep16384 } }) |cfg| {
-                const code = try coopmat.buildFusedPrepI8(gpa, cfg[0]);
+            for (i8_prep_cols, 0..) |cols, i| {
+                const code = try coopmat.buildFusedPrepI8(gpa, cols);
                 defer gpa.free(code);
                 try check(d.CreateShaderModule(device, &.{
                     .code_size = code.len,
                     .p_code = @ptrCast(@alignCast(code.ptr)),
-                }, null, cfg[1]));
+                }, null, &shader_i8_prep[i]));
                 const info: vk.ComputePipelineCreateInfo = .{
-                    .stage = .{ .module = cfg[1].*, .p_name = "main" },
+                    .stage = .{ .module = shader_i8_prep[i], .p_name = "main" },
                     .layout = pipeline_layout,
                 };
-                try check(d.CreateComputePipelines(device, .null_handle, 1, @ptrCast(&info), null, @ptrCast(cfg[2])));
+                try check(d.CreateComputePipelines(device, .null_handle, 1, @ptrCast(&info), null, @ptrCast(&pipe_i8_prep[i])));
             }
         }
-        errdefer if (shader_i8_prep6144 != .null_handle) d.DestroyShaderModule(device, shader_i8_prep6144, null);
-        errdefer if (pipe_i8_prep6144 != .null_handle) d.DestroyPipeline(device, pipe_i8_prep6144, null);
-        errdefer if (shader_i8_prep16384 != .null_handle) d.DestroyShaderModule(device, shader_i8_prep16384, null);
-        errdefer if (pipe_i8_prep16384 != .null_handle) d.DestroyPipeline(device, pipe_i8_prep16384, null);
+        errdefer for (shader_i8_prep) |sh| if (sh != .null_handle) d.DestroyShaderModule(device, sh, null);
+        errdefer for (pipe_i8_prep) |pp| if (pp != .null_handle) d.DestroyPipeline(device, pp, null);
 
         // Attention-scores GEMM on the same cooperative-matrix support; uses
         // the eltwise pipeline layout (same 4-buffer set, EltPush-sized push).
@@ -1631,10 +1650,8 @@ pub const Context = struct {
             .pipe_coop_i8_fs = pipe_coop_i8_fs,
             .shader_coop_i8_fs16 = shader_coop_i8_fs16,
             .pipe_coop_i8_fs16 = pipe_coop_i8_fs16,
-            .shader_i8_prep6144 = shader_i8_prep6144,
-            .pipe_i8_prep6144 = pipe_i8_prep6144,
-            .shader_i8_prep16384 = shader_i8_prep16384,
-            .pipe_i8_prep16384 = pipe_i8_prep16384,
+            .shader_i8_prep = shader_i8_prep,
+            .pipe_i8_prep = pipe_i8_prep,
             .shader_coop_c16 = shader_coop_c16,
             .pipe_coop_c16 = pipe_coop_c16,
             .shader_coop_f16w = shader_coop_f16w,
@@ -1712,10 +1729,8 @@ pub const Context = struct {
         if (self.shader_coop_i8_fs != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_coop_i8_fs, null);
         if (self.pipe_coop_i8_fs16 != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_coop_i8_fs16, null);
         if (self.shader_coop_i8_fs16 != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_coop_i8_fs16, null);
-        if (self.pipe_i8_prep6144 != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_i8_prep6144, null);
-        if (self.shader_i8_prep6144 != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_i8_prep6144, null);
-        if (self.pipe_i8_prep16384 != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_i8_prep16384, null);
-        if (self.shader_i8_prep16384 != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_i8_prep16384, null);
+        for (self.pipe_i8_prep) |pp| if (pp != .null_handle) self.d.DestroyPipeline(self.device, pp, null);
+        for (self.shader_i8_prep) |sh| if (sh != .null_handle) self.d.DestroyShaderModule(self.device, sh, null);
         if (self.pipe_coop_c16 != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_coop_c16, null);
         if (self.shader_coop_c16 != .null_handle) self.d.DestroyShaderModule(self.device, self.shader_coop_c16, null);
         if (self.pipe_coop_f16w != .null_handle) self.d.DestroyPipeline(self.device, self.pipe_coop_f16w, null);
@@ -2949,11 +2964,7 @@ pub const Context = struct {
         // Stage B: one fused kernel (rotate FWHT + rowmax + quantize in f16
         // shared) replaces the 3-pass chain + its xr round-trip. One build per
         // convrot cols (6144 for qkv/wo/mlp-gu, 16384 for mlp.down).
-        const prep_pipe: vk.Pipeline = switch (cols) {
-            6144 => self.pipe_i8_prep6144,
-            16384 => self.pipe_i8_prep16384,
-            else => .null_handle,
-        };
+        const prep_pipe: vk.Pipeline = if (i8PrepIndex(cols)) |i| self.pipe_i8_prep[i] else .null_handle;
         if (prep_pipe != .null_handle) {
             try self.opBegin();
             var set = self.bind4(.{ x.buf, self.i8_x.buf, self.i8_scale.buf, try self.dummyBuf() });
@@ -3613,6 +3624,57 @@ pub const Context = struct {
         try self.opEnd();
     }
 
+    /// Whether this reduction width has a FUSED int8 prep kernel, rather than falling back to
+    /// the 3-pass `rotate_fwht` -> `rowscale_i8` -> `quantize_i8` chain (which round-trips a
+    /// full f32 copy of the activation through global memory). Exposed so a bench can state
+    /// which path it measured instead of inferring it from the timing.
+    pub fn hasFusedI8Prep(self: *const Context, cols: usize) bool {
+        const i = i8PrepIndex(cols) orelse return false;
+        return self.pipe_i8_prep[i] != .null_handle;
+    }
+
+    /// Whether the fused LayerNorm + AdaLN modulation (ln_mod_sg) built.
+    pub fn hasLnModSg(self: *const Context) bool {
+        return self.pipe_sg[8] != .null_handle;
+    }
+
+    /// Fused **weightless** LayerNorm + AdaLN modulation over `[rows][dim]`:
+    /// `out = (x - mean) * inv * mod[premul_off + c] + mod[shift_off + c]`. One
+    /// subgroup per row, two deviation-based passes (see `ln_mod_sg`).
+    ///
+    /// ⚠️ `premul` must already carry the `(1 + scale)` fold — the same convention
+    /// `Backend.rmsMod` takes on the CUDA side, so one host-built table serves both
+    /// backends. Requires `hasLnModSg()`.
+    pub fn opLnModSg(
+        self: *Context,
+        x: DeviceBuffer,
+        out: DeviceBuffer,
+        mod: DeviceBuffer,
+        rows: usize,
+        dim: usize,
+        premul_off: usize,
+        shift_off: usize,
+        eps: f32,
+    ) Error!void {
+        std.debug.assert(self.pipe_sg[8] != .null_handle);
+        const dummy = try self.dummyBuf();
+        try self.opBegin();
+        var set = self.bind4(.{ x.buf, out.buf, mod.buf, dummy });
+        const push: EltPush = .{
+            .u0 = @intCast(rows),
+            .u1 = @intCast(dim),
+            .u2 = @intCast(premul_off),
+            .u3 = @intCast(shift_off),
+            .f0 = eps,
+        };
+        self.d.CmdBindPipeline(self.cmd, .compute, self.pipe_sg[8]);
+        self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout_e, 0, 1, @ptrCast(&set), 0, null);
+        self.d.CmdPushConstants(self.cmd, self.pipeline_layout_e, vk.ShaderStage.compute, 0, @sizeOf(EltPush), &push);
+        // 256-lane workgroups = 8 subgroups = 8 rows each.
+        self.d.CmdDispatch(self.cmd, @intCast((rows + 7) / 8), 1, 1);
+        try self.opEnd();
+    }
+
     /// Whether the cooperative block-quant decode GEMV (gemv_q*_sg) is available.
     pub fn hasSubgroupGemv(self: *const Context) bool {
         return self.pipe_sg[2] != .null_handle;
@@ -3863,7 +3925,7 @@ pub const Context = struct {
     /// (any valid buffer).
     pub fn opFlash(
         self: *Context,
-        which: enum { md, out },
+        which: FlashPass,
         q16: DeviceBuffer,
         k16: DeviceBuffer,
         v16: DeviceBuffer,
@@ -4898,6 +4960,94 @@ test "gpu subgroup rmsnorm matches cpu reference" {
     }
 }
 
+test "gpu fused LayerNorm+modulate matches ops.norm.layerNormUnit" {
+    const gpa = std.testing.allocator;
+    std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa) catch return error.SkipZigTest;
+    defer ctx.deinit();
+    if (!ctx.hasLnModSg()) return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(0x11e5);
+    const rand = prng.random();
+    const eps: f32 = 1e-6;
+    // Anima's own width, a strided tail, and — the case that matters — a row whose
+    // MEAN dwarfs its spread. That is where the shifted `E[x^2] - E[x]^2` variance
+    // catastrophically cancels in f32, and the reason this kernel is two-pass; a
+    // mean-0 test alone cannot tell the two forms apart.
+    const cases = [_]struct { rows: usize, dim: usize, bias: f32 }{
+        .{ .rows = 8, .dim = 2048, .bias = 0 },
+        .{ .rows = 3, .dim = 2053, .bias = 0 },
+        .{ .rows = 5, .dim = 2048, .bias = 400 },
+    };
+    for (cases) |cs| {
+        const rows = cs.rows;
+        const dim = cs.dim;
+        const x = try gpa.alloc(f32, rows * dim);
+        defer gpa.free(x);
+        // `mod` holds [premul][shift] back to back, at the two offsets pushed below.
+        const mod = try gpa.alloc(f32, 2 * dim);
+        defer gpa.free(mod);
+        for (x) |*v| v.* = rand.floatNorm(f32) * 1.5 + cs.bias;
+        for (mod[0..dim]) |*v| v.* = 1.0 + rand.floatNorm(f32) * 0.3; // 1 + scale
+        for (mod[dim..]) |*v| v.* = rand.floatNorm(f32) * 0.2; // shift
+
+        var x_d = try ctx.tensorCreate(rows * dim * 4);
+        defer ctx.tensorDestroy(&x_d);
+        var m_d = try ctx.tensorCreate(mod.len * 4);
+        defer ctx.tensorDestroy(&m_d);
+        var y_d = try ctx.tensorCreate(rows * dim * 4);
+        defer ctx.tensorDestroy(&y_d);
+        try ctx.tensorUpload(x_d, std.mem.sliceAsBytes(x));
+        try ctx.tensorUpload(m_d, std.mem.sliceAsBytes(mod));
+        try ctx.opLnModSg(x_d, y_d, m_d, rows, dim, 0, dim, eps);
+        const y = try gpa.alloc(f32, rows * dim);
+        defer gpa.free(y);
+        try ctx.tensorDownload(y_d, std.mem.sliceAsBytes(y));
+
+        // The f32 CPU path, for comparison only.
+        const cpu = try gpa.alloc(f32, rows * dim);
+        defer gpa.free(cpu);
+        ops.norm.layerNormUnit(cpu, x, dim, eps);
+
+        // ⚠️ **The reference is f64, and at `bias = 400` that is the whole point.**
+        // `layerNormUnit` sums 2048 values near 400 serially in f32, so its own mean
+        // carries ~5e-4 of error — larger than the GPU's, whose per-lane partials then
+        // tree-reduce. Comparing to it would fail the accurate implementation. So both
+        // are scored against f64 and the device is required to be **no worse than** the
+        // f32 host path: that is the claim that actually distinguishes this two-pass
+        // kernel from the shifted `E[x^2]-E[x]^2` form, which cancels catastrophically
+        // in exactly this regime and would lose by orders of magnitude.
+        var gpu_err: f64 = 0;
+        var cpu_err: f64 = 0;
+        var ref_sq: f64 = 0;
+        for (0..rows) |r| {
+            const xr = x[r * dim ..][0..dim];
+            var sum: f64 = 0;
+            for (xr) |v| sum += v;
+            const mean = sum / @as(f64, @floatFromInt(dim));
+            var vs: f64 = 0;
+            for (xr) |v| vs += (@as(f64, v) - mean) * (@as(f64, v) - mean);
+            const inv = 1.0 / @sqrt(vs / @as(f64, @floatFromInt(dim)) + eps);
+            for (0..dim) |i| {
+                const want = (@as(f64, xr[i]) - mean) * inv * mod[i] + mod[dim + i];
+                ref_sq += want * want;
+                const dg = @as(f64, y[r * dim + i]) - want;
+                gpu_err += dg * dg;
+                const dc = @as(f64, cpu[r * dim + i]) * mod[i] + mod[dim + i] - want;
+                cpu_err += dc * dc;
+            }
+        }
+        const g_rel = @sqrt(gpu_err / ref_sq);
+        const c_rel = @sqrt(cpu_err / ref_sq);
+        errdefer std.debug.print(
+            "rows {d} dim {d} bias {d}: gpu rel L2 {e:.3} vs f64, f32 host {e:.3}\n",
+            .{ rows, dim, cs.bias, g_rel, c_rel },
+        );
+        try std.testing.expect(g_rel < 1e-3);
+        try std.testing.expect(g_rel <= @max(c_rel, 1e-6) * 1.5);
+    }
+}
+
 test "gpu dp4a decode GEMV matches cpu reference" {
     const gpa = std.testing.allocator;
     std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
@@ -5299,6 +5449,13 @@ test "gpu matmul matches cpu reference" {
 
 // Flash attention (md + out passes) against a CPU reference computed in the
 // kernels' exact regime: f16 Q/K/V, f16-rounded scores, f32 softmax, f16 P.
+//
+// ⚠️ Runs SQUARE and RECTANGULAR. The rectangular arm is what Anima's
+// cross-attention needs (`seq x 512`), and it is the case that exercises the MD
+// plane stride (push f1): with q_pad > kv_pad the old kernel indexed the MD table
+// by the *key* padded length and every head past the first read another head's
+// {max, 1/sum}. The square arm passes f1 = 0 and so also pins that 0 still means
+// "= s_stride" for every pre-existing caller.
 test "flash attention matches reference" {
     const gpa = std.testing.allocator;
     std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
@@ -5306,107 +5463,120 @@ test "flash attention matches reference" {
     defer ctx.deinit();
     if (ctx.pipe_flash_md == .null_handle) return error.SkipZigTest;
 
-    const seq = 200;
-    const seq_pad = 256;
-    const n_heads = 4;
-    const n_kv = 2;
-    const hd = 128;
-    const scale: f32 = 0.25;
-    var prng = std.Random.DefaultPrng.init(77);
-    const rand = prng.random();
-
-    const q = try gpa.alloc(f32, seq * n_heads * hd);
-    defer gpa.free(q);
-    for (q) |*v| v.* = rand.floatNorm(f32);
-    const k = try gpa.alloc(f32, seq * n_kv * hd);
-    defer gpa.free(k);
-    for (k) |*v| v.* = rand.floatNorm(f32);
-    const vv = try gpa.alloc(f32, seq * n_kv * hd);
-    defer gpa.free(vv);
-    for (vv) |*v| v.* = rand.floatNorm(f32);
-
-    var q_d = try ctx.tensorCreate(seq * n_heads * hd * 4);
-    defer ctx.tensorDestroy(&q_d);
-    var q16_d = try ctx.tensorCreate(seq_pad * n_heads * hd * 2);
-    defer ctx.tensorDestroy(&q16_d);
-    var k_d = try ctx.tensorCreate(seq * n_kv * hd * 4);
-    defer ctx.tensorDestroy(&k_d);
-    var k16_d = try ctx.tensorCreate(n_kv * hd * seq_pad * 2);
-    defer ctx.tensorDestroy(&k16_d);
-    var v_d = try ctx.tensorCreate(seq * n_kv * hd * 4);
-    defer ctx.tensorDestroy(&v_d);
-    var v16_d = try ctx.tensorCreate(seq_pad * n_kv * hd * 2);
-    defer ctx.tensorDestroy(&v16_d);
-    const mdoff = seq_pad * n_heads * hd;
-    var o_d = try ctx.tensorCreate((mdoff + n_heads * seq_pad * 2) * 4);
-    defer ctx.tensorDestroy(&o_d);
-    try ctx.tensorUpload(q_d, std.mem.sliceAsBytes(q));
-    try ctx.tensorUpload(k_d, std.mem.sliceAsBytes(k));
-    try ctx.tensorUpload(v_d, std.mem.sliceAsBytes(vv));
-
-    try ctx.opElt(.f32_to_h16, q_d, null, null, q16_d, .{
-        .u0 = seq_pad * n_heads * hd / 2,
-        .u1 = seq * n_heads * hd,
-        .f0 = scale,
-    }, seq_pad * n_heads * hd / 2, 1, 1);
-    try ctx.opElt(.gather_kmajor_h16, k_d, null, null, k16_d, .{
-        .u0 = n_kv * hd * seq_pad / 2,
-        .u1 = hd,
-        .u2 = seq_pad,
-        .u3 = seq,
-        .u4 = n_kv,
-    }, n_kv * hd * seq_pad / 2, 1, 1);
-    try ctx.opElt(.f32_to_h16, v_d, null, null, v16_d, .{
-        .u0 = seq_pad * n_kv * hd / 2,
-        .u1 = seq * n_kv * hd,
-        .f0 = 1.0,
-    }, seq_pad * n_kv * hd / 2, 1, 1);
-
-    const push: EltPush = .{
-        .u0 = n_heads * hd,
-        .u1 = seq_pad,
-        .u2 = 0,
-        .u3 = n_heads / n_kv,
-        .u4 = n_kv * hd,
-        .u5 = mdoff,
-        .f0 = @bitCast(@as(u32, seq)),
+    const cases = [_]struct { q: usize, kv: usize }{
+        .{ .q = 200, .kv = 200 }, // square, f1 = 0
+        .{ .q = 300, .kv = 128 }, // q_pad 384 > kv_pad 128 — the MD-stride case
+        .{ .q = 130, .kv = 500 }, // and the other way round
     };
-    try ctx.opFlash(.md, q16_d, k16_d, v16_d, o_d, push, seq_pad / 128, n_heads);
-    try ctx.opFlash(.out, q16_d, k16_d, v16_d, o_d, push, seq_pad / 128, n_heads);
+    for (cases) |cs| {
+        const seq_q = cs.q;
+        const seq_kv = cs.kv;
+        const q_pad = std.mem.alignForward(usize, seq_q, 128);
+        const kv_pad = std.mem.alignForward(usize, seq_kv, 128);
+        const n_heads = 4;
+        const n_kv = 2;
+        const hd = 128;
+        const scale: f32 = 0.25;
+        var prng = std.Random.DefaultPrng.init(77);
+        const rand = prng.random();
 
-    const o = try gpa.alloc(f32, mdoff + n_heads * seq_pad * 2);
-    defer gpa.free(o);
-    try ctx.tensorDownload(o_d, std.mem.sliceAsBytes(o));
+        const q = try gpa.alloc(f32, seq_q * n_heads * hd);
+        defer gpa.free(q);
+        for (q) |*v| v.* = rand.floatNorm(f32);
+        const k = try gpa.alloc(f32, seq_kv * n_kv * hd);
+        defer gpa.free(k);
+        for (k) |*v| v.* = rand.floatNorm(f32);
+        const vv = try gpa.alloc(f32, seq_kv * n_kv * hd);
+        defer gpa.free(vv);
+        for (vv) |*v| v.* = rand.floatNorm(f32);
 
-    // Reference: f16 scores from f16 operands, exact softmax, f16 P/V.
-    const s_row = try gpa.alloc(f64, seq);
-    defer gpa.free(s_row);
-    for (0..n_heads) |h| {
-        const kvh = h / (n_heads / n_kv);
-        for (0..seq) |qi| {
-            var rmax: f64 = -std.math.inf(f64);
-            for (0..seq) |ji| {
-                var dot: f64 = 0;
-                for (0..hd) |kk| {
-                    const qa: f16 = @floatCast(q[(qi * n_heads + h) * hd + kk] * scale);
-                    const ka: f16 = @floatCast(k[(ji * n_kv + kvh) * hd + kk]);
-                    dot += @as(f64, @floatCast(qa)) * @as(f64, @floatCast(ka));
+        var q_d = try ctx.tensorCreate(seq_q * n_heads * hd * 4);
+        defer ctx.tensorDestroy(&q_d);
+        var q16_d = try ctx.tensorCreate(q_pad * n_heads * hd * 2);
+        defer ctx.tensorDestroy(&q16_d);
+        var k_d = try ctx.tensorCreate(seq_kv * n_kv * hd * 4);
+        defer ctx.tensorDestroy(&k_d);
+        var k16_d = try ctx.tensorCreate(n_kv * hd * kv_pad * 2);
+        defer ctx.tensorDestroy(&k16_d);
+        var v_d = try ctx.tensorCreate(seq_kv * n_kv * hd * 4);
+        defer ctx.tensorDestroy(&v_d);
+        var v16_d = try ctx.tensorCreate(kv_pad * n_kv * hd * 2);
+        defer ctx.tensorDestroy(&v16_d);
+        // MD needs one {max, 1/sum} pair per QUERY row per head.
+        const mdoff = q_pad * n_heads * hd;
+        var o_d = try ctx.tensorCreate((mdoff + n_heads * q_pad * 2) * 4);
+        defer ctx.tensorDestroy(&o_d);
+        try ctx.tensorUpload(q_d, std.mem.sliceAsBytes(q));
+        try ctx.tensorUpload(k_d, std.mem.sliceAsBytes(k));
+        try ctx.tensorUpload(v_d, std.mem.sliceAsBytes(vv));
+
+        try ctx.opElt(.f32_to_h16, q_d, null, null, q16_d, .{
+            .u0 = @intCast(q_pad * n_heads * hd / 2),
+            .u1 = @intCast(seq_q * n_heads * hd),
+            .f0 = scale,
+        }, q_pad * n_heads * hd / 2, 1, 1);
+        try ctx.opElt(.gather_kmajor_h16, k_d, null, null, k16_d, .{
+            .u0 = @intCast(n_kv * hd * kv_pad / 2),
+            .u1 = hd,
+            .u2 = @intCast(kv_pad),
+            .u3 = @intCast(seq_kv),
+            .u4 = n_kv,
+        }, n_kv * hd * kv_pad / 2, 1, 1);
+        try ctx.opElt(.f32_to_h16, v_d, null, null, v16_d, .{
+            .u0 = @intCast(kv_pad * n_kv * hd / 2),
+            .u1 = @intCast(seq_kv * n_kv * hd),
+            .f0 = 1.0,
+        }, kv_pad * n_kv * hd / 2, 1, 1);
+
+        const push: EltPush = .{
+            .u0 = n_heads * hd,
+            .u1 = @intCast(kv_pad),
+            .u2 = 0,
+            .u3 = n_heads / n_kv,
+            .u4 = n_kv * hd,
+            .u5 = @intCast(mdoff),
+            .f0 = @bitCast(@as(u32, @intCast(seq_kv))),
+            // 0 where it coincides with s_stride, so the square case pins the default.
+            .f1 = if (q_pad == kv_pad) 0 else @bitCast(@as(u32, @intCast(q_pad))),
+        };
+        try ctx.opFlash(.md, q16_d, k16_d, v16_d, o_d, push, q_pad / 128, n_heads);
+        try ctx.opFlash(.out, q16_d, k16_d, v16_d, o_d, push, q_pad / 128, n_heads);
+
+        const o = try gpa.alloc(f32, mdoff + n_heads * q_pad * 2);
+        defer gpa.free(o);
+        try ctx.tensorDownload(o_d, std.mem.sliceAsBytes(o));
+
+        // Reference: f16 scores from f16 operands, exact softmax, f16 P/V.
+        const s_row = try gpa.alloc(f64, seq_kv);
+        defer gpa.free(s_row);
+        for (0..n_heads) |h| {
+            const kvh = h / (n_heads / n_kv);
+            for (0..seq_q) |qi| {
+                var rmax: f64 = -std.math.inf(f64);
+                for (0..seq_kv) |ji| {
+                    var dot: f64 = 0;
+                    for (0..hd) |kk| {
+                        const qa: f16 = @floatCast(q[(qi * n_heads + h) * hd + kk] * scale);
+                        const ka: f16 = @floatCast(k[(ji * n_kv + kvh) * hd + kk]);
+                        dot += @as(f64, @floatCast(qa)) * @as(f64, @floatCast(ka));
+                    }
+                    const s16: f16 = @floatCast(dot);
+                    s_row[ji] = @floatCast(s16);
+                    rmax = @max(rmax, s_row[ji]);
                 }
-                const s16: f16 = @floatCast(dot);
-                s_row[ji] = @floatCast(s16);
-                rmax = @max(rmax, s_row[ji]);
-            }
-            var dsum: f64 = 0;
-            for (0..seq) |ji| dsum += @exp(s_row[ji] - rmax);
-            for (0..hd) |cc| {
-                var want: f64 = 0;
-                for (0..seq) |ji| {
-                    const pa: f16 = @floatCast(@exp(s_row[ji] - rmax) / dsum);
-                    const va: f16 = @floatCast(vv[(ji * n_kv + kvh) * hd + cc]);
-                    want += @as(f64, @floatCast(pa)) * @as(f64, @floatCast(va));
+                var dsum: f64 = 0;
+                for (0..seq_kv) |ji| dsum += @exp(s_row[ji] - rmax);
+                for (0..hd) |cc| {
+                    var want: f64 = 0;
+                    for (0..seq_kv) |ji| {
+                        const pa: f16 = @floatCast(@exp(s_row[ji] - rmax) / dsum);
+                        const va: f16 = @floatCast(vv[(ji * n_kv + kvh) * hd + cc]);
+                        want += @as(f64, @floatCast(pa)) * @as(f64, @floatCast(va));
+                    }
+                    const got = o[(qi * n_heads + h) * hd + cc];
+                    errdefer std.debug.print("q {d} kv {d} head {d} row {d} col {d}\n", .{ seq_q, seq_kv, h, qi, cc });
+                    try std.testing.expectApproxEqAbs(@as(f32, @floatCast(want)), got, 1e-2);
                 }
-                const got = o[(qi * n_heads + h) * hd + cc];
-                try std.testing.expectApproxEqAbs(@as(f32, @floatCast(want)), got, 1e-2);
             }
         }
     }

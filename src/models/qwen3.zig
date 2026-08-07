@@ -239,26 +239,41 @@ pub const tap_count = tap_layers.len;
 /// the identical 35 layers and differ only in how many states they keep.
 pub const zimage_taps = [_]usize{35};
 
+/// Anima conditions on the **final** hidden state with `model.norm` APPLIED
+/// (`sd1_clip` `layer = "last"`, and `Qwen3_06BConfig.final_norm = True`). In this
+/// file's convention — tap k is the state entering layer k — that is tap
+/// `n_layers`, one past the last layer, so unlike the other two variants every
+/// layer runs AND the final norm is evaluated. Derived from the preset rather than
+/// written as `28`, so the two cannot disagree.
+pub const anima_taps = [_]usize{Config.qwen3_0_6b.n_layers};
+
 /// Which conditioning stack a `TextEncoder` produces.
 ///
-/// The two are the same 36-layer, 2560-wide Qwen3-4B body; they differ in three
-/// things and nothing else: the checkpoint's tensor prefix (krea2 ships the VL
-/// checkpoint, so its language model is nested under `model.language_model.`), the
-/// RoPE theta (5e6 for the VL variant, 1e6 for plain Qwen3-4B), and the tap list.
+/// krea2 and Z-Image are the same 36-layer, 2560-wide Qwen3-4B body and differ only
+/// in the checkpoint's tensor prefix (krea2 ships the VL checkpoint, so its language
+/// model is nested under `model.language_model.`), the RoPE theta (5e6 vs 1e6) and
+/// the tap list. **Anima is a different body** — Qwen3-0.6B, 28 layers, 1024 wide —
+/// which is why the encoder is written against `cfg` rather than this file's
+/// module-level dims.
 ///
 /// ⚠️ The theta is the dangerous one — it is not recoverable from the weights, and
 /// the wrong value produces a perfectly finite encode whose long-range positions
-/// are simply wrong. Both live in `Config` presets so the choice is made once.
+/// are simply wrong. All three live in `Config` presets so the choice is made once.
 pub const Variant = enum {
     /// Krea 2: Qwen3-VL-4B, the 12-layer tap stack the DiT's `txtfusion` consumes.
     krea2,
     /// Z-Image: plain Qwen3-4B, one hidden state.
     zimage,
+    /// Anima: Qwen3-0.6B **base**, the final hidden state after `model.norm`. Its
+    /// states are the `llm_adapter`'s cross-attention source, not the denoiser's
+    /// context directly — see `models/anima.zig`.
+    anima,
 
     pub fn config(self: Variant) Config {
         return switch (self) {
             .krea2 => Config.vl_4b,
             .zimage => Config.qwen3_4b,
+            .anima => Config.qwen3_0_6b,
         };
     }
 
@@ -266,6 +281,20 @@ pub const Variant = enum {
         return switch (self) {
             .krea2 => &tap_layers,
             .zimage => &zimage_taps,
+            .anima => &anima_taps,
+        };
+    }
+
+    /// Whether `norm.weight` is loaded and applied to the last tap.
+    ///
+    /// ⚠️ This is NOT the same knob as `sd1_clip`'s `layer_norm_hidden_state`, which
+    /// only governs an *intermediate* output. krea2 and Z-Image tap before a layer
+    /// that still has to run, so the final norm is genuinely never evaluated for
+    /// them and is not even loaded; Anima taps past the end, where it always is.
+    pub fn appliesFinalNorm(self: Variant) bool {
+        return switch (self) {
+            .krea2, .zimage => false,
+            .anima => true,
         };
     }
 };
@@ -303,12 +332,16 @@ pub const TextEncoder = struct {
     /// Qwen3-4B-Q4_K_M). Every gather goes through `embedTokens`, which dispatches
     /// on it — three call sites used to hardcode `bf16` and a `* 2` row stride.
     embed: Weight,
-    /// Layers 0..34 — the last tap fires before layer 35.
+    /// Layers `0..taps[last]` — krea2/Z-Image tap before layer 35, so layer 35 is
+    /// never loaded; Anima taps past layer 27, so all 28 are.
     layers: []Layer,
     variant: Variant,
     cfg: Config,
     /// Hidden states to keep, in layer order. `encode` emits them token-major.
     taps: []const usize,
+    /// `norm.weight`, or null when this variant never reaches the final norm. See
+    /// `Variant.appliesFinalNorm`.
+    final_norm: ?[]const f32,
 
     pub fn tapCount(self: *const TextEncoder) usize {
         return self.taps.len;
@@ -356,10 +389,17 @@ pub const TextEncoder = struct {
         if (embed_view.info.elemCount() != cfg.vocab * cfg.hidden) return error.ShapeMismatch;
         const embed = Weight.init(embed_view.bytes, embed_view.info.dtype, cfg.vocab, cfg.hidden);
 
-        // One past the last tap: both variants tap at 35, so layer 35 and the final
-        // norm are never evaluated and are not loaded.
+        // Layers up to the last tap. krea2/Z-Image tap at 35, so layer 35 and the
+        // final norm are never evaluated and are not loaded; Anima taps at 28, which
+        // is every layer, and then the final norm.
         const taps = variant.taps();
+        if (taps[taps.len - 1] > cfg.n_layers) return error.UnsupportedModelConfig;
         const layers = try loadLayersCfg(alloc, store, cfg, taps[taps.len - 1]);
+
+        const final_norm: ?[]const f32 = if (variant.appliesFinalNorm())
+            try loadNormNamed(alloc, store, try std.fmt.bufPrint(&nbuf, "{s}norm.weight", .{cfg.prefix}), cfg.hidden)
+        else
+            null;
 
         return .{
             .arena = arena,
@@ -368,6 +408,7 @@ pub const TextEncoder = struct {
             .variant = variant,
             .cfg = cfg,
             .taps = taps,
+            .final_norm = final_norm,
         };
     }
 
@@ -390,10 +431,15 @@ pub const TextEncoder = struct {
         ops.cancel.token = cancel;
         defer ops.cancel.token = prev_tok;
 
-        const out = try gpa.alloc(f32, seq * n_taps * hidden);
+        // ⚠️ `self.cfg.hidden`, not this file's 2560: Anima's body is Qwen3-0.6B at
+        // 1024. Reading the module constant here allocated 2.5x the rows needed and
+        // strode the wrong distance through them.
+        const h = self.cfg.hidden;
+
+        const out = try gpa.alloc(f32, seq * n_taps * h);
         errdefer gpa.free(out);
 
-        const x = try gpa.alloc(f32, seq * hidden);
+        const x = try gpa.alloc(f32, seq * h);
         defer gpa.free(x);
         try embedTokens(self.embed, ids, x);
 
@@ -408,13 +454,28 @@ pub const TextEncoder = struct {
 
         const dims = dimsFor(self.cfg);
         var tap_idx: usize = 0;
-        for (0..n_layers) |l| {
+        // ⚠️ `n_layers + 1`, because a tap index may be one PAST the last layer:
+        // Anima's tap is `cfg.n_layers`. The `l >= self.layers.len` break below is
+        // what actually terminates the loop, so no variant runs a layer it should
+        // not — but a range of exactly `n_layers` would never fire that final tap,
+        // and the `tap_idx == n_taps` assert is what would catch it.
+        for (0..self.cfg.n_layers + 1) |l| {
             // Poll cancel between layers so a stop lands mid-encode (a full CPU
             // encode is 36 layers of full-sequence attention).
             if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
             if (tap_idx < n_taps and self.taps[tap_idx] == l) {
                 for (0..seq) |t| {
-                    @memcpy(out[(t * n_taps + tap_idx) * hidden ..][0..hidden], x[t * hidden ..][0..hidden]);
+                    const dst = out[(t * n_taps + tap_idx) * h ..][0..h];
+                    const src = x[t * h ..][0..h];
+                    // The final norm applies only to a tap past the last layer —
+                    // which is the only tap a variant that has one ever takes.
+                    if (self.final_norm) |w| {
+                        if (l == self.cfg.n_layers) {
+                            ops.norm.rmsNorm(dst, src, w, self.cfg.rms_eps);
+                            continue;
+                        }
+                    }
+                    @memcpy(dst, src);
                 }
                 tap_idx += 1;
             }
@@ -757,6 +818,34 @@ fn readF32File(gpa: std.mem.Allocator, io: std.Io, path: []const u8, n: usize) !
     const bytes = std.mem.sliceAsBytes(out);
     if (try file.readPositionalAll(io, bytes, 0) != bytes.len) return error.ShortRead;
     return out;
+}
+
+// The three conditioning variants differ in body, taps and whether the final norm
+// runs. This is a fast structural pin, not a numeric one — the numbers are checked
+// against ComfyUI by the krea2 test below and by the Anima fixtures — but it is what
+// catches a tap list that stops agreeing with the config it indexes, which produces
+// a finite encode of the wrong hidden state.
+test "each encoder variant's tap list is consistent with its own body" {
+    for ([_]Variant{ .krea2, .zimage, .anima }) |v| {
+        const cfg = v.config();
+        const taps = v.taps();
+        errdefer std.debug.print("variant {t}: n_layers={d} taps={any}\n", .{ v, cfg.n_layers, taps });
+        try std.testing.expect(taps.len > 0);
+        // A tap may be one PAST the last layer — that is exactly the case that
+        // carries the final norm — but never further, or `loadVariant` would be
+        // asked for a layer the checkpoint does not have.
+        try std.testing.expect(taps[taps.len - 1] <= cfg.n_layers);
+        for (taps[1..], taps[0 .. taps.len - 1]) |b, a| try std.testing.expect(b > a);
+        // ⚠️ The load-bearing invariant: the final norm is applied if and only if
+        // the last tap is past the last layer. krea2/Z-Image tap before a layer that
+        // still has to run, so their final norm is genuinely never evaluated; Anima
+        // taps past the end, where ComfyUI's `layer = "last"` always applies it.
+        try std.testing.expectEqual(taps[taps.len - 1] == cfg.n_layers, v.appliesFinalNorm());
+    }
+    // Anima's Qwen3-0.6B body, since the whole width generalization exists for it.
+    try std.testing.expectEqual(@as(usize, 28), Variant.anima.config().n_layers);
+    try std.testing.expectEqual(@as(usize, 1024), Variant.anima.config().hidden);
+    try std.testing.expectEqual(@as(usize, 28), Variant.anima.taps()[0]);
 }
 
 // Config detection + weight wiring against a real llama.cpp GGUF; skipped

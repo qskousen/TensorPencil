@@ -88,6 +88,12 @@ pub fn main(init: std.process.Init) !void {
                 ref = args[i];
             } else if (std.mem.eql(u8, args[i], "--krea2")) {
                 variant = .krea2;
+            } else if (std.mem.eql(u8, args[i], "--anima")) {
+                // ⚠️ The variant decides the CONFIG (0.6B: 28 layers, hidden 1024),
+                // so a 0.6B encoder under the default `.zimage` variant is a
+                // `ShapeMismatch` at load rather than a wrong answer. This flag is how
+                // Anima's encoder gets checked on every backend.
+                variant = .anima;
             } else path = args[i];
         }
         try teTest(arena, io, stdout, path, ref, variant);
@@ -104,6 +110,26 @@ pub fn main(init: std.process.Init) !void {
             } else ckpt = args[i];
         }
         try zimageCudaTest(arena, io, stdout, ckpt, vae, libs);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "anima-cuda-test")) {
+        var ckpt: []const u8 = "/home/qt/genai/comfyui/models/diffusion_models/anima/terraRising_20TerraRisingAnima.safetensors";
+        var libs = false;
+        for (args[2..]) |a| {
+            if (std.mem.eql(u8, a, "libs")) libs = true else ckpt = a;
+        }
+        try animaCudaTest(arena, io, stdout, ckpt, libs);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "vk-norm-bench")) {
+        try vkNormBench(arena, io, stdout);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "anima-vk-bench")) {
+        var seq: usize = 6534;
+        for (args[2..]) |a| seq = std.fmt.parseInt(usize, a, 10) catch seq;
+        try animaVkBench(arena, io, stdout, seq);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "anima-cuda-bench")) {
+        var seq: usize = 6534;
+        var libs = false;
+        for (args[2..]) |a| {
+            if (std.mem.eql(u8, a, "libs")) libs = true else seq = std.fmt.parseInt(usize, a, 10) catch seq;
+        }
+        try animaCudaBench(arena, io, stdout, seq, libs);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "zimage-cuda-bench")) {
         var seq: usize = 6848;
         var libs = false;
@@ -259,13 +285,29 @@ pub fn main(init: std.process.Init) !void {
             \\      check the CUDA SD kernels against the CPU ops they reproduce
             \\      ("libs" runs the cuBLASLt/cuDNN arm, whose attention path
             \\      differs); exits non-zero if any check fails
-            \\  TensorPencil te-test [<encoder>] [--ref <encoder>] [--krea2]
+            \\  TensorPencil te-test [<encoder>] [--ref <encoder>] [--krea2|--anima]
             \\      check a Qwen3 text encoder on every GPU backend against its
             \\      own CPU forward (kernel check), and optionally against a
             \\      second encoder (quantization check). Accepts .gguf
             \\  TensorPencil zimage-cuda-test [<zimage ckpt>] [libs]
             \\      check zimage_cuda's device forward against the CPU forward on
             \\      real weights, on both attention paths; non-zero if any fails
+            \\  TensorPencil anima-cuda-test [<anima ckpt>] [libs]
+            \\      check anima_cuda's new kernels (lnMod, rectangular TC
+            \\      attention) against the CPU ops they reproduce, then its whole
+            \\      device forward against anima.DiT.predict on real weights, on
+            \\      both attention paths; non-zero if any fails
+            \\  TensorPencil vk-norm-bench
+            \\      thread-per-row vs subgroup weighted RMSNorm at every shape the
+            \\      three Vulkan DiTs use, at the sizes they render at
+            \\  TensorPencil anima-vk-bench [<seq>]
+            \\      the Vulkan counterpart: bf16 vs int8 GEMMs at identical shapes,
+            \\      the int8 prep, attention and elementwise, each against a
+            \\      ceiling (TFLOP/s or GB/s)
+            \\  TensorPencil anima-cuda-bench [<seq>] [libs]
+            \\      time one Anima trunk step's device work at real shapes, split
+            \\      GEMM / attention / elementwise, each against a ceiling
+            \\      (TFLOP/s or GB/s) rather than a share of the total
             \\  TensorPencil zimage-cuda-bench [<seq>] [libs]
             \\      time one Z-Image step's worth of bf16 GEMMs, with and without
             \\      the f32<->bf16 conversion passes, to isolate where the time goes
@@ -1553,7 +1595,7 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
             },
             // This command is the SD-family kernel gate; other architectures have
             // their own text towers and are not exercised here.
-            .krea2, .zimage => &.{},
+            .krea2, .zimage, .anima => &.{},
         };
         for (towers) |tw| {
             var enc = clip_text.TextEncoder.load(arena, store, tw.cfg, tw.prefix) catch |err| {
@@ -1985,6 +2027,838 @@ fn timeBest(io: Io, n: usize, comptime go: anytype, be: anytype, args: anytype) 
 /// `seq` is the joint (caption ++ image) token count; 6848 is a 1056x1584 render.
 /// Weights are random and each shape is uploaded once — the working set is far
 /// past L2 either way, so reuse costs nothing in fidelity and 11.6 GB in VRAM.
+/// Time ONE Anima trunk step's device work at real shapes, with no checkpoint and no
+/// sampler, split GEMM / attention / elementwise — and give each part a CEILING to be
+/// judged against (achieved TFLOP/s for the arithmetic, achieved GB/s for the
+/// bandwidth-bound kernels).
+///
+/// The point is a receipt rather than an estimate, and the ceiling is the part that
+/// matters. A share-of-time table has no notion of what an op *should* have cost, which
+/// is exactly how Z-Image's two 37 GB/s norm kernels hid inside a 7% `elt` bucket on a
+/// 936 GB/s card while the profile pointed at a `matmul` bucket that was already at 92%
+/// of the roof. `bench_gemm_only` additionally splits `opGemmBf16`'s own f32<->bf16
+/// conversion passes out of the GEMM they wrap, since `ptic()` scopes the op, not the
+/// kernel.
+///
+/// `seq` is the image token count: 6534 is a 1056x1584 render, 1536 a 512x768 one.
+/// Weights are random and each shape is allocated once — the working set is far past L2
+/// either way, so the reuse costs nothing in fidelity and several GB in VRAM.
+fn animaCudaBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, seq: usize, libs: bool) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    const anima = TensorPencil.models.anima;
+    const cfg = anima.anima_2b;
+
+    var be = (if (libs) cuda.Backend.initLibs(arena) else cuda.Backend.init(arena)) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    try stdout.print("== anima-cuda-bench seq={d} ==\ncuda device: {s} (kernels: {t})\n", .{ seq, be.deviceName(), be.kernels });
+
+    const d = cfg.dim;
+    const heads = cfg.n_heads;
+    const hd = cfg.headDim();
+    const half = hd / 2;
+    const ctx_seq = cfg.adapter.min_rows;
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+    const iters = 10;
+
+    // Random bf16 weights for the three distinct GEMM shapes.
+    const wsq = try arena.alloc(u16, d * d); // [2048, 2048]
+    const wup = try arena.alloc(u16, cfg.mlp_dim * d); // [8192, 2048]
+    const wdn = try arena.alloc(u16, d * cfg.mlp_dim); // [2048, 8192]
+    var prng = std.Random.DefaultPrng.init(3);
+    const rnd = prng.random();
+    for ([_][]u16{ wsq, wup, wdn }) |w| for (w) |*v| {
+        v.* = @bitCast(@as(u16, @truncate(@as(u32, @bitCast(@as(f32, rnd.floatNorm(f32) * 0.02))) >> 16)));
+    };
+
+    var x_d = try be.tensorCreate(seq * d * 4);
+    defer be.tensorDestroy(&x_d);
+    var y_d = try be.tensorCreate(seq * d * 4);
+    defer be.tensorDestroy(&y_d);
+    var k_d = try be.tensorCreate(seq * d * 4);
+    defer be.tensorDestroy(&k_d);
+    var v_d = try be.tensorCreate(seq * d * 4);
+    defer be.tensorDestroy(&v_d);
+    var big_d = try be.tensorCreate(seq * cfg.mlp_dim * 4);
+    defer be.tensorDestroy(&big_d);
+    var mod_d = try be.tensorCreate(anima.modulationTableLen(cfg) * 4);
+    defer be.tensorDestroy(&mod_d);
+    var frq_d = try be.tensorCreate(2 * seq * half * 4);
+    defer be.tensorDestroy(&frq_d);
+    var ck_d = try be.tensorCreate(ctx_seq * d * 4);
+    defer be.tensorDestroy(&ck_d);
+    var cv_d = try be.tensorCreate(ctx_seq * d * 4);
+    defer be.tensorDestroy(&cv_d);
+    {
+        const fill = try arena.alloc(f32, seq * cfg.mlp_dim);
+        for (fill) |*t| t.* = rnd.floatNorm(f32);
+        try be.tensorUpload(big_d, std.mem.sliceAsBytes(fill));
+        try be.tensorUpload(x_d, std.mem.sliceAsBytes(fill[0 .. seq * d]));
+        try be.tensorUpload(k_d, std.mem.sliceAsBytes(fill[0 .. seq * d]));
+        try be.tensorUpload(v_d, std.mem.sliceAsBytes(fill[0 .. seq * d]));
+        // Modulation: the scale blocks are folded, so ~1.
+        const m = try arena.alloc(f32, anima.modulationTableLen(cfg));
+        for (m) |*t| t.* = 1.0 + rnd.floatNorm(f32) * 0.1;
+        try be.tensorUpload(mod_d, std.mem.sliceAsBytes(m));
+        const f = try arena.alloc(f32, 2 * seq * half);
+        for (f) |*t| t.* = rnd.floatNorm(f32) * 0.5;
+        try be.tensorUpload(frq_d, std.mem.sliceAsBytes(f));
+        try be.tensorUpload(ck_d, std.mem.sliceAsBytes(fill[0 .. ctx_seq * d]));
+        try be.tensorUpload(cv_d, std.mem.sliceAsBytes(fill[0 .. ctx_seq * d]));
+    }
+
+    const Timer = struct {
+        io: Io,
+        be: *cuda.Backend,
+        fn run(self: @This(), n: usize, comptime f: anytype, args: anytype) !f64 {
+            // One warm-up so PTX JIT and any plan build are outside the measurement.
+            try @call(.auto, f, args);
+            try self.be.ctx.synchronize();
+            const t0 = std.Io.Clock.real.now(self.io);
+            for (0..n) |_| try @call(.auto, f, args);
+            try self.be.ctx.synchronize();
+            const ns = std.Io.Clock.real.now(self.io).nanoseconds - t0.nanoseconds;
+            return @as(f64, @floatFromInt(ns)) / 1e6 / @as(f64, @floatFromInt(n));
+        }
+    };
+    const T = Timer{ .io = io, .be = be };
+
+    // --- GEMMs, with and without the conversion passes --------------------------
+    try stdout.print("\n-- GEMMs (per call; x{d} per block => the block total) --\n", .{1});
+    const Gemm = struct { name: []const u8, y: cuda.backend.DeviceBuffer, x: cuda.backend.DeviceBuffer, w: []const u16, co: usize, k: usize, per_block: usize, m: usize };
+    const gemms = [_]Gemm{
+        .{ .name = "q/k/v/out  2048<-2048", .y = y_d, .x = x_d, .w = wsq, .co = d, .k = d, .per_block = 6, .m = seq },
+        .{ .name = "mlp1       8192<-2048", .y = big_d, .x = x_d, .w = wup, .co = cfg.mlp_dim, .k = d, .per_block = 1, .m = seq },
+        .{ .name = "mlp2       2048<-8192", .y = y_d, .x = big_d, .w = wdn, .co = d, .k = cfg.mlp_dim, .per_block = 1, .m = seq },
+        // ⚠️ NOT part of the step: these are the cross-attention K/V projections, which
+        // `Session.init` hoists out of the step loop because they depend only on the
+        // context. Timed here so the hoist's worth is MEASURED rather than asserted —
+        // and it is small (see the roll-up), which a FLOP count off by 30x once claimed
+        // otherwise.
+        .{ .name = "cross k/v  2048<-1024 (hoisted)", .y = y_d, .x = x_d, .w = wsq, .co = d, .k = 1024, .per_block = 2, .m = ctx_seq },
+    };
+    var gemm_ms: f64 = 0;
+    var gemm_flop: f64 = 0;
+    var hoisted_ms: f64 = 0;
+    for (gemms) |g| {
+        const wb = std.mem.sliceAsBytes(g.w);
+        const flop = 2.0 * @as(f64, @floatFromInt(g.m * g.co * g.k));
+        cuda.backend.bench_gemm_only = false;
+        const full = try T.run(iters, cuda.Backend.opGemmBf16, .{ be, g.y, g.x, g.m, wb, g.co, g.k, @as(?[]const f32, null) });
+        cuda.backend.bench_gemm_only = true;
+        const only = try T.run(iters, cuda.Backend.opGemmBf16, .{ be, g.y, g.x, g.m, wb, g.co, g.k, @as(?[]const f32, null) });
+        cuda.backend.bench_gemm_only = false;
+        if (g.m == seq) {
+            gemm_ms += full * @as(f64, @floatFromInt(g.per_block));
+            gemm_flop += flop * @as(f64, @floatFromInt(g.per_block));
+        } else {
+            hoisted_ms += full * @as(f64, @floatFromInt(g.per_block));
+        }
+        try stdout.print("  {s}  x{d}  {d:7.2} ms  ({d:6.2} gemm + {d:5.2} convert)  {d:6.1} TFLOP/s pure\n", .{
+            g.name, g.per_block, full, only, full - only, flop / only / 1e9,
+        });
+    }
+
+    // --- attention --------------------------------------------------------------
+    try stdout.print("\n-- attention --\n", .{});
+    const self_flop = 4.0 * @as(f64, @floatFromInt(seq)) * @as(f64, @floatFromInt(seq)) * @as(f64, @floatFromInt(d));
+    const self_ms = try T.run(iters, cuda.Backend.opAttnTC, .{ be, x_d, k_d, v_d, y_d, seq, heads, heads, hd, scale });
+    try stdout.print("  self  {d:>5}q x {d:>5}kv  x1  {d:7.2} ms  {d:6.1} TFLOP/s\n", .{ seq, seq, self_ms, self_flop / self_ms / 1e9 });
+    const cross_flop = 4.0 * @as(f64, @floatFromInt(seq)) * @as(f64, @floatFromInt(ctx_seq)) * @as(f64, @floatFromInt(d));
+    const cross_ms = try T.run(iters, cuda.Backend.opAttnTCRect, .{ be, x_d, ck_d, cv_d, y_d, seq, ctx_seq, heads, heads, hd, scale });
+    try stdout.print("  cross {d:>5}q x {d:>5}kv  x1  {d:7.2} ms  {d:6.1} TFLOP/s\n", .{ seq, ctx_seq, cross_ms, cross_flop / cross_ms / 1e9 });
+
+    // --- elementwise, judged by achieved BANDWIDTH ------------------------------
+    // ⚠️ This is the column that makes a broken kernel legible: these do almost no
+    // arithmetic, so bytes-moved / seconds has a known ceiling (~936 GB/s on a 3090,
+    // ~700 achievable), and a kernel at a tenth of it is broken rather than merely
+    // small. Share-of-time cannot say that.
+    try stdout.print("\n-- elementwise (bytes moved / time; the 3090's roof is 936 GB/s) --\n", .{});
+    const fseq: f64 = @floatFromInt(seq);
+    const fd: f64 = @floatFromInt(d);
+    const Elt = struct { name: []const u8, ms: f64, bytes: f64, per_block: usize };
+    var elts: [5]Elt = undefined;
+    // lnMod: two read passes over x plus a read+write in the apply pass.
+    elts[0] = .{ .name = "lnMod", .ms = try T.run(iters, cuda.Backend.lnMod, .{ be, x_d, y_d, mod_d, seq, d, d, @as(usize, 0), cfg.norm_eps }), .bytes = fseq * fd * 4 * 4, .per_block = 3 };
+    elts[1] = .{ .name = "gatedAdd", .ms = try T.run(iters, cuda.Backend.gatedAdd, .{ be, x_d, y_d, mod_d, seq * d, d, @as(usize, 0) }), .bytes = fseq * fd * 4 * 3, .per_block = 3 };
+    var nrm_d = try be.tensorCreate(hd * 4);
+    defer be.tensorDestroy(&nrm_d);
+    elts[2] = .{ .name = "qkNorm", .ms = try T.run(iters, cuda.Backend.qkNorm, .{ be, x_d, x_d, nrm_d, seq * heads, hd, cfg.qk_eps }), .bytes = fseq * fd * 4 * 2, .per_block = 3 };
+    elts[3] = .{ .name = "ropeHalf", .ms = try T.run(iters, cuda.Backend.ropeHalf, .{ be, x_d, frq_d, seq, heads, half, seq * half, @as(usize, 0) }), .bytes = fseq * fd * 4 * 2, .per_block = 2 };
+    elts[4] = .{ .name = "geluErf (mlp width)", .ms = try T.run(iters, cuda.Backend.geluErf, .{ be, big_d, seq * cfg.mlp_dim }), .bytes = fseq * @as(f64, @floatFromInt(cfg.mlp_dim)) * 4 * 2, .per_block = 1 };
+    var elt_ms: f64 = 0;
+    for (elts) |e| {
+        elt_ms += e.ms * @as(f64, @floatFromInt(e.per_block));
+        try stdout.print("  {s:<20} x{d}  {d:7.2} ms  {d:6.0} GB/s\n", .{ e.name, e.per_block, e.ms, e.bytes / e.ms / 1e6 });
+    }
+
+    // --- the roll-up ------------------------------------------------------------
+    const nl: f64 = @floatFromInt(cfg.n_layers);
+    const block_ms = gemm_ms + self_ms + cross_ms + elt_ms;
+    const step_ms = block_ms * nl;
+    try stdout.print("\n-- one block, then one {d}-block step --\n", .{cfg.n_layers});
+    try stdout.print("  GEMM        {d:8.2} ms/block  {d:8.0} ms/step  ({d:4.1}%)  {d:5.1} TFLOP/s effective\n", .{ gemm_ms, gemm_ms * nl, 100 * gemm_ms / block_ms, gemm_flop / gemm_ms / 1e9 });
+    try stdout.print("  self attn   {d:8.2} ms/block  {d:8.0} ms/step  ({d:4.1}%)\n", .{ self_ms, self_ms * nl, 100 * self_ms / block_ms });
+    try stdout.print("  cross attn  {d:8.2} ms/block  {d:8.0} ms/step  ({d:4.1}%)\n", .{ cross_ms, cross_ms * nl, 100 * cross_ms / block_ms });
+    try stdout.print("  elementwise {d:8.2} ms/block  {d:8.0} ms/step  ({d:4.1}%)\n", .{ elt_ms, elt_ms * nl, 100 * elt_ms / block_ms });
+    try stdout.print("  TOTAL       {d:8.2} ms/block  {d:8.0} ms/step\n", .{ block_ms, step_ms });
+    try stdout.print("\n  hoisted out of the step loop (cross k/v, per IMAGE not per step):\n", .{});
+    try stdout.print("  {d:8.2} ms/block  {d:8.1} ms once  = {d:5.2}% of a step if it were NOT hoisted\n", .{
+        hoisted_ms, hoisted_ms * nl, 100 * hoisted_ms * nl / step_ms,
+    });
+}
+
+/// Sweep the weighted-RMSNorm shapes the three Vulkan DiTs actually use, timing the
+/// thread-per-row `Elt.rmsnorm` against the subgroup `rmsnorm_sg` at each.
+///
+/// ⚠️ Exists because the choice between them is **shape-dependent and the fast one is not
+/// always the subgroup one**: `rmsnorm` gives a thread a whole row, which is catastrophic
+/// for a narrow row (a warp's loads land `dim*4` bytes apart) but not obviously so for a
+/// wide one, where a single thread's own reads are at least sequential. Anima's 128-wide
+/// heads measured **45 GB/s against 511** at production size — and only **176 against 355**
+/// at a third of it, so a small-shape measurement understates the gap by 3x. Judge each
+/// geometry, and judge it at the size the model runs.
+fn vkNormBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
+    const gpu = TensorPencil.gpu.context;
+
+    const ctx = gpu.Context.init(arena) catch |err| {
+        try stdout.print("vulkan unavailable: {t}\n", .{err});
+        return;
+    };
+    defer ctx.deinit();
+    try stdout.print("== vk-norm-bench ==\nvulkan device: {s}\n", .{ctx.device_name[0..ctx.device_name_len]});
+    if (!ctx.hasSubgroupNorm()) {
+        try stdout.print("rmsnorm_sg unavailable on this device; nothing to compare\n", .{});
+        return;
+    }
+
+    // Real geometries, at the token counts these models are actually rendered at.
+    const Case = struct { who: []const u8, rows: usize, dim: usize, per_step: usize };
+    const cases = [_]Case{
+        .{ .who = "anima  Q/K      @1056x1584", .rows = 6534 * 16, .dim = 128, .per_step = 3 * 28 },
+        .{ .who = "anima  Q/K      @512x768  ", .rows = 1536 * 16, .dim = 128, .per_step = 3 * 28 },
+        .{ .who = "zimage Q/K      @1056x1584", .rows = 6848 * 30, .dim = 128, .per_step = 2 * 32 },
+        .{ .who = "zimage sandwich @1056x1584", .rows = 6848, .dim = 3840, .per_step = 4 * 32 },
+        // ⚠️ krea2's Q/K `Elt.rmsnorm` sits in an ELSE branch behind two fused
+        // alternatives (`qknorm_rope16`, `qknorm_rope_f32`). It is live for a **bf16 or fp8**
+        // checkpoint — `qkv_shared` requires `!is_bf16`, so those fall through — and NOT for
+        // an int8 one, which takes the fused f32 path. So this row is a real saving for the
+        // dense checkpoints only.
+        .{ .who = "krea2  Q/K bf16 @1120x1680", .rows = 7350 * 48, .dim = 128, .per_step = 2 * 28 },
+        // ⚠️ **Reference only — `per_step = 0`.** A 6144-wide row is krea2's block-norm
+        // shape, but `dit_gpu` routes those through the already-parallel
+        // `rms_partial`/`rms_combine`/`rms_apply_mod` chain, NOT `Elt.rmsnorm`. Timed here
+        // so nobody reads the wide-row numbers as an available krea2 win; there is none.
+        .{ .who = "  (ref) wide row, no such site", .rows = 8400, .dim = 6144, .per_step = 0 },
+    };
+
+    var max_elems: usize = 0;
+    var max_dim: usize = 0;
+    for (cases) |c| {
+        max_elems = @max(max_elems, c.rows * c.dim);
+        max_dim = @max(max_dim, c.dim);
+    }
+    var x_d = try ctx.tensorCreate(max_elems * 4);
+    defer ctx.tensorDestroy(&x_d);
+    var y_d = try ctx.tensorCreate(max_elems * 4);
+    defer ctx.tensorDestroy(&y_d);
+    var w_d = try ctx.tensorCreate(max_dim * 4);
+    defer ctx.tensorDestroy(&w_d);
+    {
+        var prng = std.Random.DefaultPrng.init(9);
+        const rnd = prng.random();
+        const fill = try arena.alloc(f32, max_elems);
+        for (fill) |*t| t.* = rnd.floatNorm(f32);
+        try ctx.tensorUpload(x_d, std.mem.sliceAsBytes(fill));
+        const w = try arena.alloc(f32, max_dim);
+        for (w) |*t| t.* = 1.0;
+        try ctx.tensorUpload(w_d, std.mem.sliceAsBytes(w));
+    }
+
+    // Warm on the op, then best-of-rounds: the 3090 idles its clocks and a cold short run
+    // reads ~2x slow (see anima-vk-bench).
+    const T = struct {
+        io: Io,
+        fn run(self: @This(), comptime f: anytype, args: anytype) !f64 {
+            const w0 = std.Io.Clock.real.now(self.io);
+            var n: usize = 0;
+            while (n < 200) : (n += 1) {
+                try @call(.auto, f, args);
+                const el = @as(f64, @floatFromInt(std.Io.Clock.real.now(self.io).nanoseconds - w0.nanoseconds)) / 1e6;
+                if (el >= 150) break;
+            }
+            var best: f64 = std.math.inf(f64);
+            for (0..5) |_| {
+                const t0 = std.Io.Clock.real.now(self.io);
+                for (0..8) |_| try @call(.auto, f, args);
+                const ns = std.Io.Clock.real.now(self.io).nanoseconds - t0.nanoseconds;
+                best = @min(best, @as(f64, @floatFromInt(ns)) / 1e6 / 8.0);
+            }
+            return best;
+        }
+    }{ .io = io };
+
+    try stdout.print("\n{s:<28} {s:>10} {s:>12} {s:>12} {s:>7}  {s}\n", .{
+        "shape", "rows x dim", "thread/row", "subgroup", "speedup", "per-step saving",
+    });
+    for (cases) |c| {
+        const bytes = @as(f64, @floatFromInt(c.rows * c.dim)) * 4 * 2; // read + write
+        const thr = try T.run(gpu.Context.opElt, .{ ctx, gpu.Elt.rmsnorm, x_d, @as(?gpu.DeviceBuffer, y_d), @as(?gpu.DeviceBuffer, w_d), @as(?gpu.DeviceBuffer, null), gpu.EltPush{
+            .u0 = @intCast(c.rows), .u1 = @intCast(c.dim), .f0 = 1e-6,
+        }, c.rows, @as(usize, 1), @as(usize, 1) });
+        const sub = try T.run(gpu.Context.opRmsNormSg, .{ ctx, x_d, y_d, w_d, c.rows, c.dim, @as(f32, 1e-6) });
+        try stdout.print("{s} {d:6}x{d:<4} {d:7.2} ms {d:4.0} GB/s {d:7.2} ms {d:4.0} GB/s {d:6.1}x  {d:6.0} -> {d:4.0} ms\n", .{
+            c.who,      c.rows,                    c.dim,
+            thr,        bytes / thr / 1e6,
+            sub,        bytes / sub / 1e6,
+            thr / sub,  thr * @as(f64, @floatFromInt(c.per_step)),
+            sub * @as(f64, @floatFromInt(c.per_step)),
+        });
+    }
+    try stdout.print("\n⚠️  `per-step saving` assumes every call site switches; it is the CEILING on\n", .{});
+    try stdout.print("    the change, not a prediction — a render also has to be re-measured.\n", .{});
+}
+
+/// Time ONE Anima trunk step's VULKAN device work at real shapes, split GEMM / int8 prep /
+/// attention / elementwise, each against a CEILING — the Vulkan counterpart of
+/// `anima-cuda-bench`, and the harness whose absence made "Vulkan's int8 speedup is 1.2x
+/// where CUDA's is 1.9x" an observation rather than a diagnosis.
+///
+/// ⚠️ Timing is sync-per-op and that is exact here, not an approximation: outside
+/// `beginBatch` every `opBegin`/`opEnd` pair ends in `submitAndWait`, which is the same
+/// methodology `dit_gpu`'s `--profile` uses. It does mean the numbers include per-submit
+/// overhead, which a batched render elides — so the roll-up is an upper bound on the step
+/// and the PER-OP ratios are the trustworthy part.
+///
+/// Prints bf16 and int8 side by side at identical shapes, because the question is not "how
+/// fast is the int8 GEMM" but "is it faster than the bf16 one it replaces, and by enough to
+/// pay for the prep".
+fn animaVkBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, seq: usize) !void {
+    const gpu = TensorPencil.gpu.context;
+    const anima = TensorPencil.models.anima;
+    const cfg = anima.anima_2b;
+
+    const ctx = gpu.Context.init(arena) catch |err| {
+        try stdout.print("vulkan unavailable: {t}\n", .{err});
+        return;
+    };
+    defer ctx.deinit();
+    try stdout.print("== anima-vk-bench seq={d} ==\nvulkan device: {s}\n", .{ seq, ctx.device_name[0..ctx.device_name_len] });
+    try stdout.print("  coop f16 {s} · coop bf16w {s} · coop i8 {s} · ln_mod_sg {s} · flash {s}\n", .{
+        if (ctx.pipe_coop_f16w != .null_handle) "yes" else "NO",
+        if (ctx.pipe_coop_bf16w != .null_handle) "yes" else "NO",
+        if (ctx.pipe_coop_i8 != .null_handle) "yes" else "NO",
+        if (ctx.hasLnModSg()) "yes" else "NO",
+        if (ctx.pipe_flash_md != .null_handle) "yes" else "NO",
+    });
+    // ⚠️ Stated, not inferred: a width with no fused prep silently takes the 3-pass chain.
+    for ([_]usize{ cfg.dim, cfg.mlp_dim }) |c| {
+        try stdout.print("  fused int8 prep @ cols {d}: {s}\n", .{ c, if (ctx.hasFusedI8Prep(c)) "yes" else "NO (3-pass fallback)" });
+    }
+
+    const d = cfg.dim;
+    const mlp = cfg.mlp_dim;
+    const heads = cfg.n_heads;
+    const hd = cfg.headDim();
+    const half = hd / 2;
+    const ctx_seq = cfg.adapter.min_rows;
+    const seq_pad = std.mem.alignForward(usize, seq, 128);
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+    const iters = 8;
+
+    var prng = std.Random.DefaultPrng.init(5);
+    const rnd = prng.random();
+
+    // Weights at the three device shapes, in both dtypes.
+    const Shape = struct { name: []const u8, rows: usize, cols: usize, per_block: usize };
+    const shapes = [_]Shape{
+        .{ .name = "q/k/v/out+cross 2048<-2048", .rows = d, .cols = d, .per_block = 6 },
+        .{ .name = "mlp1            8192<-2048", .rows = mlp, .cols = d, .per_block = 1 },
+        .{ .name = "mlp2            2048<-8192", .rows = d, .cols = mlp, .per_block = 1 },
+    };
+    var wbf: [shapes.len][]u16 = undefined;
+    var wi8: [shapes.len][]u8 = undefined;
+    var wsc: [shapes.len][]f32 = undefined;
+    for (shapes, 0..) |sh, i| {
+        wbf[i] = try arena.alloc(u16, sh.rows * sh.cols);
+        for (wbf[i]) |*v| v.* = @truncate(@as(u32, @bitCast(rnd.floatNorm(f32) * 0.02)) >> 16);
+        wi8[i] = try arena.alloc(u8, sh.rows * sh.cols);
+        for (wi8[i]) |*v| v.* = @bitCast(@as(i8, @intCast(rnd.intRangeAtMost(i8, -127, 127))));
+        wsc[i] = try arena.alloc(f32, sh.rows);
+        for (wsc[i]) |*v| v.* = 0.0005 + rnd.float(f32) * 0.002;
+    }
+
+    // Buffers, all padded so a quant GEMM's i8_mpad rows fit.
+    var x_d = try ctx.tensorCreate(seq_pad * mlp * 4);
+    defer ctx.tensorDestroy(&x_d);
+    var y_d = try ctx.tensorCreate(seq_pad * mlp * 4);
+    defer ctx.tensorDestroy(&y_d);
+    var k_d = try ctx.tensorCreate(seq_pad * d * 4);
+    defer ctx.tensorDestroy(&k_d);
+    var v_d = try ctx.tensorCreate(seq_pad * d * 4);
+    defer ctx.tensorDestroy(&v_d);
+    var mod_d = try ctx.tensorCreate(anima.modulationTableLen(cfg) * 4);
+    defer ctx.tensorDestroy(&mod_d);
+    var frq_d = try ctx.tensorCreate(2 * seq * half * 4);
+    defer ctx.tensorDestroy(&frq_d);
+    var nrm_d = try ctx.tensorCreate(hd * 4);
+    defer ctx.tensorDestroy(&nrm_d);
+    var q16 = try ctx.tensorCreate(seq_pad * d * 2);
+    defer ctx.tensorDestroy(&q16);
+    var k16 = try ctx.tensorCreate(d * seq_pad * 2);
+    defer ctx.tensorDestroy(&k16);
+    var v16 = try ctx.tensorCreate(seq_pad * d * 2);
+    defer ctx.tensorDestroy(&v16);
+    var o_d = try ctx.tensorCreate((seq_pad * d + heads * seq_pad * 2) * 4);
+    defer ctx.tensorDestroy(&o_d);
+    {
+        const fill = try arena.alloc(f32, seq_pad * mlp);
+        for (fill) |*t| t.* = rnd.floatNorm(f32);
+        try ctx.tensorUpload(x_d, std.mem.sliceAsBytes(fill));
+        try ctx.tensorUpload(k_d, std.mem.sliceAsBytes(fill[0 .. seq_pad * d]));
+        try ctx.tensorUpload(v_d, std.mem.sliceAsBytes(fill[0 .. seq_pad * d]));
+        const m = try arena.alloc(f32, anima.modulationTableLen(cfg));
+        for (m) |*t| t.* = 1.0 + rnd.floatNorm(f32) * 0.1;
+        try ctx.tensorUpload(mod_d, std.mem.sliceAsBytes(m));
+        const f = try arena.alloc(f32, 2 * seq * half);
+        for (f) |*t| t.* = rnd.floatNorm(f32) * 0.5;
+        try ctx.tensorUpload(frq_d, std.mem.sliceAsBytes(f));
+        const nw = try arena.alloc(f32, hd);
+        for (nw) |*t| t.* = 1.0;
+        try ctx.tensorUpload(nrm_d, std.mem.sliceAsBytes(nw));
+    }
+    const zeros = try arena.alloc(f32, mlp);
+    @memset(zeros, 0);
+
+    // ⚠️ **BEST-of-rounds after a timed warm-up, not a single mean — the 3090 idles its
+    // clocks and a cold short run reads 2x slow.** A first version of this harness used one
+    // 8-iteration mean and produced numbers that moved by 2.2x between runs (bf16 mlp1 read
+    // 2.29 ms then 5.06 ms; `gelu_erf` 672 then 342 GB/s), which is enough to invert a
+    // conclusion. The warm-up spins the clocks up on the op being measured, and the minimum
+    // over rounds is the estimate least polluted by interference — the same reason
+    // `gpu-perf-lab-notes` says never to trust a short run on this card.
+    const T = struct {
+        io: Io,
+        const warm_ms: f64 = 150;
+        const rounds: usize = 5;
+        fn run(self: @This(), n: usize, comptime f: anytype, args: anytype) !f64 {
+            const w0 = std.Io.Clock.real.now(self.io);
+            var warmed: usize = 0;
+            while (true) {
+                try @call(.auto, f, args);
+                warmed += 1;
+                const el = @as(f64, @floatFromInt(std.Io.Clock.real.now(self.io).nanoseconds - w0.nanoseconds)) / 1e6;
+                if (el >= warm_ms or warmed >= 200) break;
+            }
+            var best: f64 = std.math.inf(f64);
+            for (0..rounds) |_| {
+                const t0 = std.Io.Clock.real.now(self.io);
+                for (0..n) |_| try @call(.auto, f, args);
+                const ns = std.Io.Clock.real.now(self.io).nanoseconds - t0.nanoseconds;
+                best = @min(best, @as(f64, @floatFromInt(ns)) / 1e6 / @as(f64, @floatFromInt(n)));
+            }
+            return best;
+        }
+    }{ .io = io };
+
+    // --- the sync-per-op floor -------------------------------------------------
+    // ⚠️ Measure the per-submit cost before anything else, so every number below can be
+    // read against it. Outside a batch each op is its own submit+fence, and a render
+    // BATCHES — so an op whose time is close to this floor is being measured, not timed.
+    const floor = try T.run(64, gpu.Context.opElt, .{ ctx, gpu.Elt.copy, x_d, @as(?gpu.DeviceBuffer, y_d), @as(?gpu.DeviceBuffer, null), @as(?gpu.DeviceBuffer, null), gpu.EltPush{
+        .u0 = 256, .u2 = 0, .u3 = 0,
+    }, @as(usize, 256), @as(usize, 1), @as(usize, 1) });
+    try stdout.print("\n-- submit+fence floor (a 256-element copy): {d:.3} ms/op --\n", .{floor});
+    try stdout.print("   Subtract it to judge a kernel; a batched render pays it ~once per 512 dispatches.\n", .{});
+
+    // --- GEMMs: bf16 vs int8 at identical shapes -------------------------------
+    try stdout.print("\n-- GEMMs, bf16 vs int8 at the same shape (per call) --\n", .{});
+    var bf_ms: f64 = 0;
+    var i8_ms: f64 = 0;
+    var prep_ms: f64 = 0;
+    for (shapes, 0..) |sh, i| {
+        const flop = 2.0 * @as(f64, @floatFromInt(seq * sh.rows * sh.cols));
+        const bw = std.mem.sliceAsBytes(wbf[i]);
+        const bf = try T.run(iters, gpu.Context.opMatmulCoopBf16, .{ ctx, y_d, @as(usize, 0), x_d, seq, bw, sh.rows, sh.cols, @as([]const f32, zeros) });
+        // int8 needs a prep of the activation at this reduction width first.
+        const pr = try T.run(iters, gpu.Context.opI8Prep, .{ ctx, x_d, seq, sh.cols });
+        const q8 = try T.run(iters, gpu.Context.opI8Gemm, .{ ctx, y_d, @as([]const u8, wi8[i]), @as([]const f32, wsc[i]), sh.rows, false });
+        bf_ms += bf * @as(f64, @floatFromInt(sh.per_block));
+        i8_ms += q8 * @as(f64, @floatFromInt(sh.per_block));
+        // One prep per GROUP, not per GEMM: q/k/v/out/cross share cols=2048 (4 groups in a
+        // block: qkv, self-out, cross-q, cross-out) and mlp1/mlp2 have one each.
+        const groups: f64 = if (sh.cols == d and sh.rows == d) 4 else 1;
+        prep_ms += pr * groups;
+        // TFLOP/s is computed on the time NET of the submit floor, so a small GEMM is not
+        // credited with the harness's own overhead.
+        try stdout.print("  {s} x{d}  bf16 {d:7.2} ms ({d:5.1} TF/s net)  int8 {d:7.2} ms ({d:5.1} TF/s net)  {d:4.2}x   prep {d:6.2} ms\n", .{
+            sh.name,      sh.per_block,
+            bf,           flop / @max(bf - floor, 1e-6) / 1e9,
+            q8,           flop / @max(q8 - floor, 1e-6) / 1e9,
+            bf / q8,      pr,
+        });
+    }
+
+    // --- attention -------------------------------------------------------------
+    try stdout.print("\n-- attention (f16 operand prep + flash md/out) --\n", .{});
+    var attn_ms: f64 = 0;
+    inline for (.{ .{ "self ", true }, .{ "cross", false } }) |cs| {
+        const square = cs[1];
+        const kv_seq: usize = if (square) seq else ctx_seq;
+        const kv_pad = std.mem.alignForward(usize, kv_seq, 128);
+        const cvt = try T.run(iters, gpu.Context.opElt, .{ ctx, gpu.Elt.f32_to_h16, x_d, @as(?gpu.DeviceBuffer, null), @as(?gpu.DeviceBuffer, null), q16, gpu.EltPush{
+            .u0 = @intCast(seq_pad * d / 2),
+            .u1 = @intCast(seq * d),
+            .f0 = scale,
+        }, seq_pad * d / 2, @as(usize, 1), @as(usize, 1) });
+        const gth = try T.run(iters, gpu.Context.opElt, .{ ctx, gpu.Elt.gather_kmajor_h16, k_d, @as(?gpu.DeviceBuffer, null), @as(?gpu.DeviceBuffer, null), k16, gpu.EltPush{
+            .u0 = @intCast(d * kv_pad / 2),
+            .u1 = @intCast(hd),
+            .u2 = @intCast(kv_pad),
+            .u3 = @intCast(kv_seq),
+            .u4 = @intCast(heads),
+        }, d * kv_pad / 2, @as(usize, 1), @as(usize, 1) });
+        const push = gpu.EltPush{
+            .u0 = @intCast(heads * hd),
+            .u1 = @intCast(kv_pad),
+            .u3 = 1,
+            .u4 = @intCast(heads * hd),
+            .u5 = @intCast(seq_pad * d),
+            .f0 = @bitCast(@as(u32, @intCast(kv_seq))),
+            .f1 = @bitCast(@as(u32, @intCast(seq_pad))),
+        };
+        const md = try T.run(iters, gpu.Context.opFlash, .{ ctx, gpu.FlashPass.md, q16, k16, v16, o_d, push, seq_pad / 128, heads });
+        const out = try T.run(iters, gpu.Context.opFlash, .{ ctx, gpu.FlashPass.out, q16, k16, v16, o_d, push, seq_pad / 128, heads });
+        const flop = 4.0 * @as(f64, @floatFromInt(seq)) * @as(f64, @floatFromInt(kv_seq)) * @as(f64, @floatFromInt(d));
+        const tot = cvt + 2 * gth + md + out;
+        attn_ms += tot;
+        try stdout.print("  {s} {d:>5}q x {d:>5}kv  cvt {d:5.2} + gather {d:5.2} + md {d:6.2} + out {d:6.2} = {d:7.2} ms  {d:5.1} TFLOP/s\n", .{
+            cs[0], seq, kv_seq, cvt, gth, md, out, tot, flop / (md + out) / 1e9,
+        });
+    }
+
+    // --- elementwise, judged by achieved BANDWIDTH -----------------------------
+    try stdout.print("\n-- elementwise (bytes/time; the 3090's roof is 936 GB/s) --\n", .{});
+    const fseq: f64 = @floatFromInt(seq);
+    const fd: f64 = @floatFromInt(d);
+    var elt_ms: f64 = 0;
+    {
+        const ln = try T.run(iters, gpu.Context.opLnModSg, .{ ctx, x_d, y_d, mod_d, seq, d, @as(usize, d), @as(usize, 0), cfg.norm_eps });
+        const ga = try T.run(iters, gpu.Context.opElt, .{ ctx, gpu.Elt.gated_add, x_d, @as(?gpu.DeviceBuffer, y_d), @as(?gpu.DeviceBuffer, mod_d), @as(?gpu.DeviceBuffer, null), gpu.EltPush{
+            .u0 = @intCast(seq * d), .u1 = @intCast(d), .u2 = 0,
+        }, seq * d, @as(usize, 1), @as(usize, 1) });
+        const qn = try T.run(iters, gpu.Context.opElt, .{ ctx, gpu.Elt.rmsnorm, x_d, @as(?gpu.DeviceBuffer, x_d), @as(?gpu.DeviceBuffer, nrm_d), @as(?gpu.DeviceBuffer, null), gpu.EltPush{
+            .u0 = @intCast(seq * heads), .u1 = @intCast(hd), .f0 = cfg.qk_eps,
+        }, seq * heads, @as(usize, 1), @as(usize, 1) });
+        const rp = try T.run(iters, gpu.Context.opElt, .{ ctx, gpu.Elt.rope_half, x_d, @as(?gpu.DeviceBuffer, null), @as(?gpu.DeviceBuffer, frq_d), @as(?gpu.DeviceBuffer, null), gpu.EltPush{
+            .u0 = @intCast(seq * heads * half), .u1 = @intCast(half), .u2 = @intCast(seq * half), .u3 = @intCast(heads),
+        }, seq * heads * half, @as(usize, 1), @as(usize, 1) });
+        const gl = try T.run(iters, gpu.Context.opElt, .{ ctx, gpu.Elt.gelu_erf, x_d, @as(?gpu.DeviceBuffer, null), @as(?gpu.DeviceBuffer, null), @as(?gpu.DeviceBuffer, null), gpu.EltPush{
+            .u0 = @intCast(seq * mlp),
+        }, seq * mlp, @as(usize, 1), @as(usize, 1) });
+        // ⚠️ The subgroup RMSNorm exists on this backend and the qk-norm was not using it.
+        // Timed alongside the thread-per-row one so the choice is measured, not assumed:
+        // `rmsnorm`'s thread owns a whole 128-wide head, so a warp's 32 loads land 512 B
+        // apart and each is its own sector — the identical mistake `qk_rmsnorm_warp` fixed
+        // on CUDA, where it was worth 17x.
+        const qs = if (ctx.hasSubgroupNorm())
+            try T.run(iters, gpu.Context.opRmsNormSg, .{ ctx, x_d, x_d, nrm_d, seq * heads, hd, cfg.qk_eps })
+        else
+            0;
+        const rows = [_]struct { n: []const u8, ms: f64, bytes: f64, per: usize }{
+            .{ .n = "ln_mod_sg", .ms = ln, .bytes = fseq * fd * 4 * 4, .per = 3 },
+            .{ .n = "gated_add", .ms = ga, .bytes = fseq * fd * 4 * 3, .per = 3 },
+            .{ .n = "rmsnorm (qk) thread/row", .ms = qn, .bytes = fseq * fd * 4 * 2, .per = 3 },
+            .{ .n = "rmsnorm (qk) subgroup", .ms = qs, .bytes = fseq * fd * 4 * 2, .per = 0 },
+            .{ .n = "rope_half", .ms = rp, .bytes = fseq * fd * 4 * 2, .per = 2 },
+            .{ .n = "gelu_erf (mlp)", .ms = gl, .bytes = fseq * @as(f64, @floatFromInt(mlp)) * 4 * 2, .per = 1 },
+        };
+        for (rows) |r| {
+            if (r.ms == 0) continue;
+            elt_ms += r.ms * @as(f64, @floatFromInt(r.per));
+            try stdout.print("  {s:<24} x{d}  {d:7.2} ms  {d:6.0} GB/s\n", .{ r.n, r.per, r.ms, r.bytes / r.ms / 1e6 });
+        }
+    }
+
+    // --- roll-up ---------------------------------------------------------------
+    const nl: f64 = @floatFromInt(cfg.n_layers);
+    const bf_step = (bf_ms + attn_ms + elt_ms) * nl;
+    const i8_step = (i8_ms + prep_ms + attn_ms + elt_ms) * nl;
+    try stdout.print("\n-- one {d}-block step (sync-per-op, so an UPPER bound) --\n", .{cfg.n_layers});
+    try stdout.print("  bf16: gemm {d:6.0} + attn {d:6.0} + elt {d:5.0} = {d:6.0} ms\n", .{ bf_ms * nl, attn_ms * nl, elt_ms * nl, bf_step });
+    try stdout.print("  int8: gemm {d:6.0} + prep {d:5.0} + attn {d:6.0} + elt {d:5.0} = {d:6.0} ms\n", .{ i8_ms * nl, prep_ms * nl, attn_ms * nl, elt_ms * nl, i8_step });
+    try stdout.print("  => int8 is {d:4.2}x the bf16 step; the GEMMs alone are {d:4.2}x, and prep gives back {d:4.1}%%\n", .{
+        bf_step / i8_step, bf_ms / i8_ms, 100 * prep_ms / (i8_ms + prep_ms),
+    });
+}
+
+/// Validate `anima_cuda` against the CPU ops and the CPU forward. Two tiers on
+/// purpose: the KERNEL checks need no checkpoint and localize a mismatch to one op,
+/// and the whole-forward check on real weights is what catches a wiring mistake that
+/// every individual kernel survives. Exits non-zero if anything fails, so it works as
+/// a gate. (A CLI command rather than a unit test because the test binary brings up no
+/// CUDA context — matching `zimage-cuda-test` / `sd-cuda-test`.)
+fn animaCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []const u8, libs: bool) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    const anima = TensorPencil.models.anima;
+    const anima_cuda = TensorPencil.models.anima_cuda;
+    const ops = TensorPencil.ops;
+    const safetensors = TensorPencil.SafeTensors;
+
+    var be = (if (libs) cuda.Backend.initLibs(arena) else cuda.Backend.init(arena)) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    try stdout.print("== anima-cuda-test ==\ncuda device: {s} (kernels: {t})\n", .{ be.deviceName(), be.kernels });
+
+    var prng = std.Random.DefaultPrng.init(0xa71a);
+    const rnd = prng.random();
+    var failures: usize = 0;
+
+    // --- kernel: fused weightless LayerNorm + AdaLN modulation ------------------
+    // ⚠️ Includes a row whose MEAN dwarfs its spread, which is where the shifted
+    // `E[x^2]-E[x]^2` variance cancels catastrophically in f32. A mean-0 case alone
+    // cannot tell the two forms apart, and `ops.norm.groupNorm` records what that
+    // costs. The reference is f64 for the same reason: at mean 400 the f32 host path's
+    // own serial sum carries more error than the device's block reduction.
+    try stdout.print("\n-- kernels --\n", .{});
+    for ([_]f32{ 0, 400 }) |bias| {
+        const rows = 300;
+        const dim = anima.anima_2b.dim;
+        const x = try arena.alloc(f32, rows * dim);
+        for (x) |*v| v.* = rnd.floatNorm(f32) * 1.5 + bias;
+        const mod = try arena.alloc(f32, 2 * dim);
+        for (mod[0..dim]) |*v| v.* = 1.0 + rnd.floatNorm(f32) * 0.3; // 1 + scale, folded
+        for (mod[dim..]) |*v| v.* = rnd.floatNorm(f32) * 0.2;
+
+        var x_d = try be.tensorCreate(x.len * 4);
+        defer be.tensorDestroy(&x_d);
+        var m_d = try be.tensorCreate(mod.len * 4);
+        defer be.tensorDestroy(&m_d);
+        var y_d = try be.tensorCreate(x.len * 4);
+        defer be.tensorDestroy(&y_d);
+        try be.tensorUpload(x_d, std.mem.sliceAsBytes(x));
+        try be.tensorUpload(m_d, std.mem.sliceAsBytes(mod));
+        try be.lnMod(x_d, y_d, m_d, rows, dim, 0, dim, anima.anima_2b.norm_eps);
+        const got = try arena.alloc(f32, x.len);
+        try be.tensorDownload(y_d, std.mem.sliceAsBytes(got));
+
+        var num: f64 = 0;
+        var den: f64 = 0;
+        for (0..rows) |r| {
+            const xr = x[r * dim ..][0..dim];
+            var sum: f64 = 0;
+            for (xr) |v| sum += v;
+            const mean = sum / @as(f64, @floatFromInt(dim));
+            var vs: f64 = 0;
+            for (xr) |v| vs += (@as(f64, v) - mean) * (@as(f64, v) - mean);
+            const inv = 1.0 / @sqrt(vs / @as(f64, @floatFromInt(dim)) + anima.anima_2b.norm_eps);
+            for (0..dim) |i| {
+                const want = (@as(f64, xr[i]) - mean) * inv * mod[i] + mod[dim + i];
+                const d = @as(f64, got[r * dim + i]) - want;
+                num += d * d;
+                den += want * want;
+            }
+        }
+        const rel = @sqrt(num / den);
+        const ok = rel < 1e-4;
+        if (!ok) failures += 1;
+        try stdout.print("  lnMod (row mean {d:>3})       rel L2 {e:.4} vs f64  {s}\n", .{ bias, rel, if (ok) "ok" else "FAILED" });
+    }
+
+    // --- kernel: rectangular tensor-core attention ------------------------------
+    // ⚠️ This is the new capability the cross-attention path rests on, so it is
+    // checked at Anima's real shape (512-row context, 16 heads of 128) AND at a
+    // non-multiple-of-128 key length, which is what exercises the padded-key masking.
+    {
+        const heads = anima.anima_2b.n_heads;
+        const hd = anima.anima_2b.headDim();
+        const dim = heads * hd;
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+        const shapes = [_][2]usize{ .{ 300, 512 }, .{ 260, 200 }, .{ 128, 128 } };
+        for (shapes) |sh| {
+            const nq = sh[0];
+            const nkv = sh[1];
+            const q = try arena.alloc(f32, nq * dim);
+            const k = try arena.alloc(f32, nkv * dim);
+            const v = try arena.alloc(f32, nkv * dim);
+            for (q) |*t| t.* = rnd.floatNorm(f32);
+            for (k) |*t| t.* = rnd.floatNorm(f32);
+            for (v) |*t| t.* = rnd.floatNorm(f32);
+            const want = try arena.alloc(f32, nq * dim);
+            try ops.attention.attention(io, arena, want, q, k, v, .{
+                .seq_q = nq,
+                .seq_kv = nkv,
+                .n_heads = heads,
+                .n_kv_heads = heads,
+                .head_dim = hd,
+            });
+
+            var q_d = try be.tensorCreate(q.len * 4);
+            defer be.tensorDestroy(&q_d);
+            var k_d = try be.tensorCreate(k.len * 4);
+            defer be.tensorDestroy(&k_d);
+            var v_d = try be.tensorCreate(v.len * 4);
+            defer be.tensorDestroy(&v_d);
+            var o_d = try be.tensorCreate(q.len * 4);
+            defer be.tensorDestroy(&o_d);
+            try be.tensorUpload(q_d, std.mem.sliceAsBytes(q));
+            try be.tensorUpload(k_d, std.mem.sliceAsBytes(k));
+            try be.tensorUpload(v_d, std.mem.sliceAsBytes(v));
+            try be.opAttnTCRect(q_d, k_d, v_d, o_d, nq, nkv, heads, heads, hd, scale);
+            const got = try arena.alloc(f32, q.len);
+            try be.tensorDownload(o_d, std.mem.sliceAsBytes(got));
+
+            var num: f64 = 0;
+            var den: f64 = 0;
+            var bad: usize = 0;
+            for (want, got) |e, a| {
+                if (!std.math.isFinite(a)) bad += 1;
+                num += (@as(f64, e) - a) * (@as(f64, e) - a);
+                den += @as(f64, e) * e;
+            }
+            const rel = if (den == 0) 0 else @sqrt(num / den);
+            // f16 operands against the CPU's f32 accumulation — the regime every
+            // tensor-core attention here sits in.
+            const ok = bad == 0 and rel < 5e-3;
+            if (!ok) failures += 1;
+            try stdout.print("  opAttnTCRect {d:>4}q x {d:>4}kv  rel L2 {e:.4}  {s}{s}\n", .{
+                nq, nkv, rel, if (ok) "ok" else "FAILED", if (bad != 0) " (non-finite)" else "",
+            });
+        }
+    }
+
+    // --- the whole forward on real weights --------------------------------------
+    std.Io.Dir.cwd().access(io, ckpt, .{}) catch {
+        try stdout.print("\n(skipping the forward: {s} not found)\n", .{ckpt});
+        try summarize(stdout, failures);
+        return;
+    };
+    var ck = try safetensors.open(arena, io, ckpt);
+    defer ck.deinit();
+    try stdout.print("\n-- forward (real weights) --\n", .{});
+    // ⚠️ **Depth 1 AND depth 2, because that is the ATTRIBUTION on a mixed checkpoint.**
+    // A quantized Anima file leaves block 0 dense and quantizes block 1 onward, so depth 1
+    // measures the dense pipeline alone and depth 2 adds exactly one quantized block. Two
+    // numbers separate "the port is wrong" from "int8 changes the answer", which one number
+    // cannot. Truncating at all is because a full-depth CPU reference forward takes minutes
+    // and depth adds no new WIRING — which third of the modulation table each sublayer
+    // reads, whether RoPE applies, whether the cached cross K/V line up. The end-to-end
+    // render covers the loop bound.
+    for ([_]usize{ 1, 2 }) |depth| {
+        var cfg = anima.anima_2b;
+        cfg.n_layers = depth;
+        var model = try anima.DiT.load(arena, .{ .safetensors = &ck }, cfg);
+        defer model.deinit();
+        if (!anima_cuda.supported(&model)) {
+            try stdout.print("  checkpoint dtype unsupported on this backend\n", .{});
+            break;
+        }
+        // `unsupportedLin` with the no-convrot support set reports the first int8/int4
+        // linear, which is exactly "is this depth quantized, and as what".
+        const qdt: ?TensorPencil.dtype.DType = if (anima.unsupportedLin(&model, .{})) |q| q.dtype else null;
+        failures += try animaForwardCheck(arena, io, stdout, be, &model, depth, qdt, rnd);
+    }
+
+    try summarize(stdout, failures);
+}
+
+/// One depth's device-vs-CPU forward check, on both attention arms. Returns the failure
+/// count. `quant` widens the tolerance for the reason printed alongside it.
+fn animaForwardCheck(
+    arena: std.mem.Allocator,
+    io: Io,
+    stdout: *Io.Writer,
+    be: *TensorPencil.gpu.cuda.Backend,
+    model: *const TensorPencil.models.anima.DiT,
+    depth: usize,
+    qdt: ?TensorPencil.dtype.DType,
+    rnd: std.Random,
+) !usize {
+    const anima = TensorPencil.models.anima;
+    const anima_cuda = TensorPencil.models.anima_cuda;
+    const cfg = model.cfg;
+    const lat_h = 24;
+    const lat_w = 32;
+    const ctx_seq = cfg.adapter.min_rows; // 512, what a real prompt gives
+    const cond = try arena.alloc(f32, ctx_seq * cfg.context_dim);
+    for (cond) |*t| t.* = rnd.floatNorm(f32) * 0.5;
+    const x_lat = try arena.alloc(f32, cfg.channels * lat_h * lat_w);
+    for (x_lat) |*t| t.* = rnd.floatNorm(f32);
+    const sigma: f32 = 0.75;
+
+    const want = try arena.alloc(f32, x_lat.len);
+    {
+        const mod = try model.modulationTable(io, arena, sigma);
+        try model.predict(io, arena, want, x_lat, lat_h, lat_w, cond, ctx_seq, mod, null);
+    }
+
+    // ⚠️ **A quantized checkpoint is a DIFFERENT computation on the two sides, not just a
+    // different rounding of the same one.** The CPU `matmul` dequantizes the weight to f32
+    // and multiplies in f32 (W8A16, weight-only); `opI8Prep`/`opI8Gemm` additionally
+    // quantize the ACTIVATION to int8 (W8A8). So the residual here includes the activation
+    // quantization the reference never does, and the bound has to allow it. The dense
+    // arms' own figure (depth 1, printed above) is what says the pipeline is otherwise
+    // unchanged.
+    // ⚠️ The bound is looser at depth 1 than at depth 2, which looks backwards and is not:
+    // with one block the trunk barely transforms `x`, so the output magnitude the relative
+    // error is measured against is smaller. Measured on a dense checkpoint: **1.42e-3 at
+    // depth 1 against 8.0e-4 at depth 2**, and those depth-1 figures are IDENTICAL between
+    // a dense file and its quantized sibling (block 0 is bf16 in both) — which is the
+    // cross-check that quantization changed nothing it should not have.
+    // ⚠️ **int4's bound is ~16x int8's because it has 16 levels against 256, and that
+    // RATIO is the receipt.** Predicted 16x from the bit width, measured 18x
+    // (3.80e-2 against 2.09e-3) — a quantization-coarseness signature, not a wiring
+    // error, which would not scale with the level count. Both attention arms agree to
+    // three digits at both dtypes, so it is not attention either.
+    const tol: f64 = switch (qdt orelse .f32) {
+        .i4 => 6e-2,
+        .i8 => 6e-3,
+        else => if (depth == 1) 2.5e-3 else 1e-3,
+    };
+    var failures: usize = 0;
+    const saved = anima_cuda.force_naive_attn;
+    defer anima_cuda.force_naive_attn = saved;
+    for ([_]bool{ false, true }) |naive| {
+        anima_cuda.force_naive_attn = naive;
+        var sess = try anima_cuda.Session.init(arena, io, be, model, lat_h, lat_w, cond, ctx_seq, &.{ sigma, 0 });
+        defer sess.deinit(arena, be);
+        var ws = try anima_cuda.Workspace.init(be, model, lat_h, lat_w);
+        defer ws.deinit(be);
+        const got = try arena.alloc(f32, x_lat.len);
+        const t0 = std.Io.Clock.real.now(io);
+        try anima_cuda.forward(model, be, &sess, &ws, io, arena, got, x_lat, sigma, null);
+        const dt = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0.nanoseconds)) / 1e6;
+
+        var num: f64 = 0;
+        var den: f64 = 0;
+        var bad: usize = 0;
+        for (want, got) |e, a| {
+            if (!std.math.isFinite(a)) bad += 1;
+            num += (@as(f64, e) - a) * (@as(f64, e) - a);
+            den += @as(f64, e) * e;
+        }
+        const rel = if (den == 0) 0 else @sqrt(num / den);
+        const ok = bad == 0 and rel < tol;
+        if (!ok) failures += 1;
+        try stdout.print("  {d} block{s} {s:<7} ({s:<11}) {d:7.0} ms  rel L2 {e:.4}  {s}{s}\n", .{
+            depth,
+            if (depth == 1) " " else "s",
+            if (qdt) |d| @tagName(d) else "dense",
+            if (naive) "naive attn" else "tensor core",
+            dt,
+            rel,
+            if (ok) "ok" else "FAILED",
+            if (bad != 0) " (non-finite output)" else "",
+        });
+    }
+    _ = anima;
+    return failures;
+}
+
 fn zimageCudaBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, seq: usize, libs: bool) !void {
     const cuda = TensorPencil.gpu.cuda;
     const zimage = TensorPencil.models.zimage;

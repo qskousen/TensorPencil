@@ -640,18 +640,22 @@ pub fn forward(
         } else {
         // The q and k chains (norm -> rope -> convert/gather) touch disjoint
         // buffers stage by stage; each stage pair/triple runs barrier-free.
+        // ⚠️ **The SUBGROUP norm, because `Elt.rmsnorm` gives each THREAD a whole 128-wide
+        // head** — a warp's 32 loads land 512 B apart and each is its own sector. Measured
+        // at krea2's geometry at 1120x1680 (`vk-norm-bench`, 352800 x 128): **35 GB/s
+        // against 558**, 16x, worth ~600 ms/step across the two calls x 28 blocks.
+        //
+        // ⚠️ This `else` arm is reached by **bf16 and fp8** checkpoints only — `qkv_shared`
+        // requires `!is_bf16` so they fall through, while an int8 one takes the fused
+        // `qknorm_rope_f32` path above and never gets here. So this is a dense-checkpoint
+        // win; the int8 arm already avoided the separate norm.
+        //
+        // ⚠️ Not bit-identical: the row sum becomes a subgroup tree where it was serial (the
+        // more accurate of the two). `independent(2)` still applies — one dispatch either way.
         ctx.independent(2);
-        try ctx.opElt(.rmsnorm, q_d, q_d, try normBuf(ctx, blk.attn.qnorm), null, .{
-            .u0 = @intCast(seq * heads),
-            .u1 = hd,
-            .f0 = 1e-5,
-        }, seq * heads, 1, 1);
+        try rmsNormQk(ctx, q_d, blk.attn.qnorm, seq * heads, hd);
         mark(io, &t_mark, &prof.elt_ns);
-        try ctx.opElt(.rmsnorm, k_d, k_d, try normBuf(ctx, blk.attn.knorm), null, .{
-            .u0 = @intCast(seq * kv_heads),
-            .u1 = hd,
-            .f0 = 1e-5,
-        }, seq * kv_heads, 1, 1);
+        try rmsNormQk(ctx, k_d, blk.attn.knorm, seq * kv_heads, hd);
         mark(io, &t_mark, &prof.elt_ns);
         ctx.independent(2);
         try ctx.opElt(.rope_inter, q_d, null, freqs_d, null, .{
@@ -993,6 +997,18 @@ fn probeInputAt(ctx: *gpu.Context, x: gpu.DeviceBuffer, off_bytes: u64, m: usize
     defer ctx.gpa.free(host);
     try ctx.tensorDownloadAt(x, off_bytes, std.mem.sliceAsBytes(host));
     p.input(p.ctx, w, host, m);
+}
+
+/// Per-head weighted RMSNorm in place over `[rows][hd]`, preferring the subgroup kernel.
+/// See the call site for the measurement and for which checkpoints reach it.
+fn rmsNormQk(ctx: *gpu.Context, x: gpu.DeviceBuffer, weights: []const f32, rows: usize, width: usize) !void {
+    const w = try normBuf(ctx, weights);
+    if (ctx.hasSubgroupNorm()) return ctx.opRmsNormSg(x, x, w, rows, width, 1e-5);
+    try ctx.opElt(.rmsnorm, x, x, w, null, .{
+        .u0 = @intCast(rows),
+        .u1 = @intCast(width),
+        .f0 = 1e-5,
+    }, rows, 1, 1);
 }
 
 fn normBuf(ctx: *gpu.Context, weights: []const f32) !gpu.DeviceBuffer {

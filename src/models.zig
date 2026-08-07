@@ -63,6 +63,11 @@ pub const zimage = @import("models/zimage.zig");
 pub const zimage_text = @import("models/zimage_text.zig");
 pub const zimage_gpu = @import("models/zimage_gpu.zig");
 pub const zimage_cuda = @import("models/zimage_cuda.zig");
+/// Anima — a Cosmos-Predict2 `MiniTrainDIT` plus an `llm_adapter` that fuses a T5
+/// tokenization of the prompt with a Qwen3-0.6B encode of it.
+pub const anima = @import("models/anima.zig");
+pub const anima_gpu = @import("models/anima_gpu.zig");
+pub const anima_cuda = @import("models/anima_cuda.zig");
 
 test {
     _ = loader;
@@ -122,6 +127,9 @@ test {
     _ = zimage_text;
     _ = zimage_gpu;
     _ = zimage_cuda;
+    _ = anima;
+    _ = anima_gpu;
+    _ = anima_cuda;
     // Device test relocated out of the gpu backend (it needs both tp_gpu and a
     // model CPU reference); lives here in the model tier.
     _ = @import("models/vit35_gpu_test.zig");

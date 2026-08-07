@@ -134,12 +134,13 @@ pub const Traits = struct {
     label: []const u8,
     /// Backends the engine has kernels for.
     ///
-    /// Every family runs on all four today (`sd_unet{,_gpu,_cuda}` /
-    /// `sd_vae{,_gpu,_cuda}` landed the SD family's device paths; see BACKEND.md
-    /// §2A). The field stays because "which backends" is genuinely per-family —
-    /// it was `cpu` only for SD until those kernels existed, and the next
-    /// architecture starts life CPU-only too. Advisory: `Session.init` is what
-    /// actually refuses a backend it has no kernels for.
+    /// Every family now runs on all four. The field exists because each new
+    /// architecture starts life CPU-first and offering a device it has no kernels for
+    /// reads as a hang rather than as a fallback: SD was `cpu` only until
+    /// `sd_unet{,_gpu,_cuda}` landed, Z-Image until `zimage_gpu` did, and Anima until
+    /// `anima_{gpu,cuda}` did. Advisory — `Session.denoiser` is what actually decides,
+    /// and it warns by name when a checkpoint's dtype or a device leaves the trunk on
+    /// the host.
     backends: []const Backend,
     /// Whether this architecture has a SECOND text tower (SDXL's OpenCLIP bigG).
     /// Drives the extra path row and the readiness check; the pipeline resolves
@@ -181,6 +182,16 @@ pub fn traits(fam: Family) Traits {
             .height = 1024,
             .steps = 8,
             .cfg = 1.0,
+        },
+        // ComfyUI's own `image_anima_base_v1` template: 1024x1024, 30 steps, cfg 4,
+        // euler + `simple`.
+        .anima => .{
+            .label = "Anima (Cosmos MiniTrainDIT + LLM adapter)",
+            .backends = &all_backends,
+            .width = 1024,
+            .height = 1024,
+            .steps = 30,
+            .cfg = 4.0,
         },
         .sd15 => .{
             .label = "SD1.5 (UNet)",
@@ -358,16 +369,20 @@ test "traits: every family runs on the CPU, and the GPU list is per family" {
     // mechanism is unchanged: the GUI hides backends a family has no kernels for, so
     // a too-generous list here is an offered backend that then fails at render time.
     //
-    // Every family now has a forward on every backend again — Z-Image was the
-    // CPU-first one and its `zimage_gpu` / `zimage_cuda` arms have both landed. If a
-    // future architecture arrives CPU-first, narrow THIS test rather than widening a
-    // traits entry the kernels do not back.
+    // Every family now has all four arms. ⚠️ A CPU-first arrival gets NARROWED here
+    // rather than having its traits entry over-promise — that is what the note on
+    // `backends` prescribes, and the opposite of what makes the GUI offer a backend
+    // that then fails at render time. Anima was the last one and both its arms have
+    // since landed, so the set is empty; add to it, do not edit the loop.
+    const cpu_only = std.EnumSet(Family).initEmpty();
     inline for (@typeInfo(Family).@"enum".fields) |f| {
         const fam: Family = @enumFromInt(f.value);
         const t = traits(fam);
-        for ([_]Backend{ .cpu, .vulkan, .zig_cuda, .cuda }) |b| {
+        // Every family runs on the CPU, without exception — that is the floor.
+        try std.testing.expect(t.supports(.cpu));
+        for ([_]Backend{ .vulkan, .zig_cuda, .cuda }) |b| {
             errdefer std.debug.print("{t} supports({t}) = {}\n", .{ fam, b, t.supports(b) });
-            try std.testing.expect(t.supports(b));
+            try std.testing.expectEqual(!cpu_only.contains(fam), t.supports(b));
         }
     }
 }

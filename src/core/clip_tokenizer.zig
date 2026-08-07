@@ -32,6 +32,7 @@
 const std = @import("std");
 const tables = @import("unicode_tables.zig");
 const prompt_a1111 = @import("prompt_a1111.zig");
+const prompt_weights = @import("prompt_weights.zig");
 
 const vocab_json = @embedFile("assets/clip_tokenizer/vocab.json");
 const merges_txt = @embedFile("assets/clip_tokenizer/merges.txt");
@@ -318,15 +319,15 @@ pub const Tokenizer = struct {
         defer scratch.deinit();
         const arena = scratch.allocator();
 
-        var segs: std.ArrayList(Segment) = .empty;
-        try tokenWeights(arena, &segs, try escapeImportant(arena, text), 1.0, 0);
+        var segs: std.ArrayList(prompt_weights.Segment) = .empty;
+        try prompt_weights.segments(arena, &segs, text);
 
         // Each weighted *segment* is tokenized on its own — not each word — because
         // that is the unit ComfyUI hands to the tokenizer, and BPE at a segment
         // boundary is not always what it would be mid-string.
         var groups: std.ArrayList(Group) = .empty;
         for (segs.items) |s| {
-            const plain = try unescapeImportant(arena, s.text);
+            const plain = try prompt_weights.unescape(arena, s.text);
             if (plain.len == 0) continue; // ComfyUI drops empty segments outright.
             try groups.append(arena, .{ .ids = try self.contentIds(arena, plain), .weight = s.weight });
         }
@@ -492,144 +493,8 @@ pub fn emptyIds(dst: []u32, pad_id: u32) void {
 }
 
 /// A run of prompt text sharing one weight, still pointing into the escaped input.
-const Segment = struct { text: []const u8, weight: f64 };
 /// That run, tokenized. ComfyUI calls this a "t_group".
 const Group = struct { ids: []const u32, weight: f64 };
-
-/// The deepest `(((…)))` nesting accepted. Python's own recursion limit stops the
-/// reference at ~1000 frames; a real prompt never exceeds two or three, so this is a
-/// stack guard against a pathological input rather than a semantic limit — and it is
-/// an error instead of a silent literal reading, since a prompt this malformed should
-/// be reported rather than rendered differently than it looks.
-const max_nesting: usize = 32;
-
-/// `\(` and `\)` mean literal parentheses, so they are hidden from the weight parser
-/// behind byte pairs that cannot occur in text. Both replacements are the same length
-/// as what they replace, which is why this can be one left-to-right pass where the
-/// reference does two `str.replace` sweeps.
-fn escapeImportant(arena: std.mem.Allocator, text: []const u8) ![]u8 {
-    const out = try arena.alloc(u8, text.len);
-    var n: usize = 0;
-    var i: usize = 0;
-    while (i < text.len) {
-        if (text[i] == '\\' and i + 1 < text.len and (text[i + 1] == ')' or text[i + 1] == '(')) {
-            out[n] = 0;
-            out[n + 1] = if (text[i + 1] == ')') 1 else 2;
-            n += 2;
-            i += 2;
-        } else {
-            out[n] = text[i];
-            n += 1;
-            i += 1;
-        }
-    }
-    return out[0..n];
-}
-
-/// Undo `escapeImportant` on one segment, restoring the literal parentheses that the
-/// tokenizer should see as text.
-fn unescapeImportant(arena: std.mem.Allocator, text: []const u8) ![]u8 {
-    const out = try arena.alloc(u8, text.len);
-    var n: usize = 0;
-    var i: usize = 0;
-    while (i < text.len) {
-        if (text[i] == 0 and i + 1 < text.len and (text[i + 1] == 1 or text[i + 1] == 2)) {
-            out[n] = if (text[i + 1] == 1) ')' else '(';
-            n += 1;
-            i += 2;
-        } else {
-            out[n] = text[i];
-            n += 1;
-            i += 1;
-        }
-    }
-    return out[0..n];
-}
-
-/// Split `string` at its **top-level** parenthesised groups, so each returned item is
-/// either one whole `(…)` group (outer parens included) or a run of text between
-/// them. Every item is a contiguous slice of the input, which is what lets the whole
-/// weight parse stay zero-copy.
-///
-/// Unbalanced input is not an error and must not be "fixed": `a)b` is one plain item
-/// and `(a` is one item that simply fails the `(`…`)` test in `tokenWeights` and is
-/// read as literal text. The reference lets the nesting counter go negative for
-/// exactly this reason, so this does too.
-fn parseParentheses(arena: std.mem.Allocator, out: *std.ArrayList([]const u8), string: []const u8) !void {
-    var start: usize = 0;
-    var nesting: isize = 0;
-    for (string, 0..) |c, i| {
-        if (c == '(') {
-            if (nesting == 0 and i > start) {
-                try out.append(arena, string[start..i]);
-                start = i;
-            }
-            nesting += 1;
-        } else if (c == ')') {
-            nesting -= 1;
-            if (nesting == 0) {
-                try out.append(arena, string[start .. i + 1]);
-                start = i + 1;
-            }
-        }
-    }
-    if (start < string.len) try out.append(arena, string[start..]);
-}
-
-/// Resolve the `(text)` / `(text:weight)` emphasis syntax into flat weighted segments.
-///
-/// ⚠️ **A bare paren multiplies by 1.1; an explicit `:w` REPLACES the weight outright.**
-/// So `((a))` is 1.21 but `((a:1.5))` is 1.5, not 1.65 — the inner absolute wins over
-/// every enclosing multiplier. The multiply happens first and the assignment overwrites
-/// it, which is the reference's order and the only way to get this right.
-///
-/// The product is accumulated in f64 and narrowed once at the end, because that is what
-/// Python does: `1.1 * 1.1` is 1.2100000000000002 in f64 and 1.2100001 in f32.
-fn tokenWeights(
-    arena: std.mem.Allocator,
-    out: *std.ArrayList(Segment),
-    string: []const u8,
-    current_weight: f64,
-    depth: usize,
-) error{ OutOfMemory, PromptNestingTooDeep }!void {
-    if (depth > max_nesting) return error.PromptNestingTooDeep;
-
-    var items: std.ArrayList([]const u8) = .empty;
-    try parseParentheses(arena, &items, string);
-
-    for (items.items) |item| {
-        if (!(item.len >= 2 and item[0] == '(' and item[item.len - 1] == ')')) {
-            try out.append(arena, .{ .text = item, .weight = current_weight });
-            continue;
-        }
-        var x = item[1 .. item.len - 1];
-        var weight = current_weight * 1.1;
-        if (std.mem.lastIndexOfScalar(u8, x, ':')) |at| {
-            // `at > 0`: a leading colon is text, not a weight separator.
-            if (at > 0) {
-                if (parsePyFloat(x[at + 1 ..])) |w| {
-                    weight = w;
-                    x = x[0..at];
-                }
-            }
-        }
-        try tokenWeights(arena, out, x, weight, depth + 1);
-    }
-}
-
-/// `float(s)` as Python accepts it: surrounding whitespace stripped, and nothing else.
-/// Null when Python would have raised, which the caller treats as "this colon was not
-/// a weight" and leaves the text alone.
-///
-/// Zig's `parseFloat` is the more permissive of the two — it also takes hex floats and
-/// `_` digit separators — so those are rejected explicitly rather than silently
-/// accepted, which would read `(a:0x1p4)` as a weight where ComfyUI reads it as text.
-fn parsePyFloat(s: []const u8) ?f64 {
-    const t = std.mem.trim(u8, s, " \t\n\r\x0b\x0c");
-    if (t.len == 0) return null;
-    for (t) |c| if (c == '_' or c == 'x' or c == 'X') return null;
-    return std.fmt.parseFloat(f64, t) catch null;
-}
 
 /// Splits text into CLIP's pretokens, byte-encoded and ready for BPE. Whitespace is
 /// skipped rather than emitted (see the module header), and matching is on the

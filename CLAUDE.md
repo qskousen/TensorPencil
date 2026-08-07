@@ -206,6 +206,39 @@ arithmetic. Below 16 it takes ggml's `vec_dot` GEMV, which also quantizes the
 any real resolution is hundreds of tokens and never enters that regime. So a
 block-quant DiT measures format loss, not kernel loss.
 
+## A safetensors file must COVER its payload, and not checking cost a white image
+
+`safetensors.initFromSlice` now refuses a file whose tensor ranges do not account for
+every payload byte (`error.IncompleteMetadata`), with the two byte counts in the message.
+
+⚠️ **The reference implementation has always made this check and we did not, so a corrupt
+checkpoint rendered a solid white image instead of failing.** Reported as "tried to run
+with this model and got `reached unreachable code`" on
+`anima_baseV10-INT8_CONVROT-MIXED.safetensors`. Its header declares **2,324,776,986** bytes
+of tensors inside a **2,366,726,170**-byte payload — 41,949,184 unaccounted — and the
+actual data is displaced by ~41.94 MB from where the header says, so every tensor past the
+first ~28 read a neighbour's bytes. Python's `safetensors` refuses it outright
+("incomplete metadata, file not fully covered"); being more permissive bought only silent
+garbage.
+
+- **Every per-tensor check passed**: `end <= payload_len`, and
+  `end - start == storageBytes(shape)`. The corruption is only visible in the *aggregate*,
+  which is why per-entry validation is not enough.
+- ⚠️ **The drift is not even constant** (+41,944,320 then +41,944,576), so no
+  "reload at an offset" recovery is possible — the file is unusable, not merely shifted.
+- **Measured before enforcing: 326 of 327** `.safetensors` files in the user's collection
+  cover their payload exactly; the one that does not is that file. So this is a targeted
+  check, not a new class of rejection. Worth re-running that census before tightening any
+  other container invariant.
+- ⚠️ The header is also unpadded (`8 + header_len` is 6 mod 8), leaving every `F32`
+  tensor 2-byte misaligned. Harmless to our byte-wise conversions, fatal to any reader
+  that casts a mapped range to `[]const f32` — worth knowing before adding a zero-copy
+  fast path.
+
+**Generalizable:** a container check that the reference implementation performs and we skip
+is not a "permissive reader", it is a deferred crash. The failure surfaced five frames deep
+in `ops.matmul` on an assert about something else entirely.
+
 ## Weight overlays: substituting one tensor without rewriting a checkpoint
 
 `weights.Overlay` is a third `WeightStore` arm — a base store plus a
@@ -1566,6 +1599,544 @@ taking ~11.5 s for a 256px forward.
 A/B'd across the `qkNorm` change (0.14061 with the old kernel, 0.14098 with the new), so
 it is pre-existing and unrelated to any of the above. Unfixed, and worth someone's time:
 it means krea2's bf16 CUDA arm has no working validation today.
+
+## Anima: a fifth family, and the first Cosmos derivative
+
+⚠️ **Anima IS Cosmos-Predict2's DiT.** `comfy/ldm/anima/model.py` is 214 lines that
+subclass `MiniTrainDIT` from `comfy/ldm/cosmos/predict2.py` and bolt an `LLMAdapter`
+onto its front; `model_detection` picks `"anima"` over `"cosmos_predict2"` purely
+because `llm_adapter.blocks.0.cross_attn.q_proj.weight` exists. So everything in
+`models/anima.zig` that reads as "a video DiT used on one frame" is exactly that —
+`patch_temporal = 1`, `T = 1`, and a 3-axis RoPE whose temporal axis is all zeros.
+
+Landed 2026-08-07 on the CPU and, later the same day, on **all four backends** (see "###
+On the GPU" below). It cost less than the SD family did because most of it already existed;
+what was genuinely new is one tokenizer and one 2-part model.
+
+| piece | what it is | reuse |
+|---|---|---|
+| tokenizer A | Qwen2 BPE | `core/tokenizer.zig` + a new `encodeSegmented` |
+| tokenizer B | **SentencePiece Unigram** (T5, 32100) | **new**: `core/t5_tokenizer.zig` |
+| text encoder | Qwen3-**0.6B**, hidden 1024 | `qwen3.TextEncoder`, new `.anima` `Variant` |
+| VAE | Wan 2.1, 16-ch, `Wan21` latent format | `wan_vae.Decoder` **verbatim**, krea2's arm |
+| sigma table | `ModelSamplingDiscreteFlow`, shift 3.0 | `SigmaTable.discrete_flow` — **bit-identical to Z-Image's** |
+| denoiser + adapter | 28 blocks + 6 adapter blocks | new: `models/anima.zig` |
+
+⚠️ **The prompt is tokenized TWICE, by two unrelated tokenizers, and the adapter is
+where the two streams meet.** The `llm_adapter`'s *queries* come from its own
+`Embedding(32128, 1024)` indexed by **T5** ids; its *keys and values* are the
+Qwen3-0.6B encoder's final hidden states. Its output — `max(512, n_t)` rows, zero
+padded — is what the denoiser cross-attends to. So `Cond.data` here is the adapter's
+output, not the encoder's, and `Cond.seq` is 512 for any prompt under 512 T5 tokens.
+
+⚠️ **Emphasis weights live on the T5 branch ONLY, which makes Anima the first
+Qwen3-conditioned family where `supportsPromptWeights` is TRUE.**
+`AnimaTokenizer.tokenize_with_weights` forces every Qwen3 weight to 1.0 and keeps the
+T5 ones, which then multiply the adapter's output ROWS — a plain per-row multiply, not
+CLIP's `(z - z_empty)*w + z_empty` interpolation. krea2 and Z-Image are false for a
+structural reason (no fixed token window); Anima has one, indexed 1:1 by the T5
+tokenization.
+
+### The seven conventions that are silent wrong answers
+
+Enumerated in `models/anima.zig`'s header; the two worth repeating here:
+
+1. ⚠️ **The input and output patch feature orders are DIFFERENT.** `x_embedder` takes
+   `(c, ph, pw)` — channel **slowest**; `unpatchify` emits `(ph, pw, c)` — channel
+   **fastest**. They are not each other's inverse. Using one for both is a pure
+   permutation: every norm, every magnitude and every per-stage rel-L2 still matches,
+   and only the image is wrong. Third time this repo has met that class of bug (SD's
+   planar/channel-last, Z-Image's `(ph, pw, c)`), hence a test that pins each
+   direction separately and asserts the two disagree.
+2. ⚠️ **The timestep IS the sigma.** `sampling_settings` has `multiplier: 1.0`, so
+   `model_sampling.timestep(sigma)` is the sigma itself, in (0, 1]. Z-Image — whose
+   sigma table is **bit-identical** — feeds `(1 - sigma) * 1000`. Same table,
+   different argument; borrowing the wrong one is finite nonsense.
+
+Also: `concat_padding_mask` appends an all-zero **17th channel** before patchifying
+(which is why `x_embedder.proj.1.weight` is `[2048, 68]`); one AdaLN-LoRA vector is
+shared by all three sublayers and the final layer takes only its first `2*dim`;
+`adaln_modulation_*` is `Sequential(SiLU, Linear(d, 256), Linear(256, 3d))` with **no
+activation between the two linears**; RoPE applies to DiT self-attention only but to
+**both q and k** in the adapter's cross-attention; and the RoPE frequency vector is
+`[t(22) | h(21) | w(21)]` with h/w on an NTK-scaled theta `10000 * 4^(42/40)`.
+
+### The T5 tokenizer is a real piece of SentencePiece
+
+`core/t5_tokenizer.zig` — Unigram + Viterbi, with the `Precompiled` charsmap
+normalizer (SentencePiece's `nmt_nfkc`: a darts-clone double-array trie, embedded
+verbatim at 237 KB) plus `Strip(right)` and `Replace(/ {2,}/ -> U+2581)`, then
+`Metaspace`. It is not an approximation: the charsmap maps NBSP/ZWSP/**ZWJ**/
+ideographic space to a plain space, deletes 30 control characters, folds ligatures
+(`ﬁ`→`fi`), fullwidth Latin, superscripts and circled digits, expands `Ⅸ`→`IX` (one
+char to **two**), and composes `e`+U+0301 into `é`.
+
+⚠️ **It is NOT a variant of `tokenizer.zig`'s existing `.unigram` kind** (added for
+Snowflake Arctic Embed). That one splits on ASCII whitespace and prepends `▁` to
+*every* word, has **no normalizer at all**, and its lattice has no `<unk>` nodes — an
+unsegmentable word becomes one `<unk>` for the whole word where `tokenizers` inserts
+one per unsegmentable *character* at `min_score - 10` and then fuses runs. Its
+tie-break also prefers the shortest incoming piece where `tokenizers` prefers the
+longest. **Those last two look like latent bugs in the embedding tokenizer** — its own
+fixture passes, so its corpus evidently never exercises a partially-unknown word — but
+they were deliberately NOT changed, since altering them would move every embedding
+this repo has computed.
+
+⚠️ **Five ComfyUI conventions, each a silent wrong answer**, all pinned by
+`tools/gen_anima_prompt_fixtures.py` (50 cases, generated by *executing*
+`AnimaTokenizer`):
+
+- **Weighted segments are tokenized SEPARATELY** — one tokenizer call each. ⚠️ A split
+  at a SPACE is transparent (the segment's own `add_prefix_space` reproduces the `▁`
+  the space would have become), so **only a mid-word split reveals a wrong port**:
+  `cat(s:1.1)` is `▁cat ▁s`, never `▁cats`. The fixture's own teeth-check asserts at
+  least one case distinguishes them, and it caught the first version, where every case
+  happened to split on a space.
+- **`</s>` appears once, at the end**, while each *segment's* is dropped
+  (`input_ids[0:-1]`). `end_token` is 1 because `SDTokenizer.__init__` resolved it from
+  `tokenizer("")["input_ids"][0]`, not because anything configured it.
+- **The `▁` prefix is added iff the span starts at byte 0 of the call's input** —
+  Metaspace's `prepend_scheme = "first"` tests `offsets_original().0 == 0`, NOT "is
+  this the first split". So `prefix<extra_id_0>suffix` ends `… [s][uff][ix]`, with no
+  `▁`. Breaking exactly this rule is what the fixture catches first.
+- **An empty normalized span produces NOTHING**, not a bare `▁`. `" "`, `"   "` and
+  `"\x01"` all tokenize to just the trailing `</s>`.
+- **Unknown pieces FUSE** within a pre-token but not across one: the two Gothic letters
+  of `𐌰𐌱` are one `<unk>`; separated by a space they are two.
+
+⚠️ **The Qwen3 branch is ALSO per-segment**, and finding that out cost the first
+end-to-end comparison. `tokenizer.encodeSegmented` exists for it. Measured: the real
+positive prompt's whole-string and per-segment encodes diverge from **token 37**,
+because a segment ending in `", "` leaves the trailing space as its own token 220 where
+the whole-string encode merges it into the next word.
+
+`core/prompt_weights.zig` was extracted from `clip_tokenizer.zig` so the `(a:1.2)`
+parser has ONE implementation — two copies of "a bare paren multiplies by 1.1, an
+explicit `:w` replaces" is exactly the drift that makes one prompt path disagree with
+another.
+
+### Measured
+
+Component parity against ComfyUI, fp32 on both sides (`tools/gen_anima_fixtures.py`;
+the trunk truncated to 8 and 2 blocks so an *exact fp32* reference on real weights at
+real width fits in RAM, the adapter referenced in **full** because at 133 M parameters
+there was no reason not to). The table is in `models/anima.zig`'s header;
+`patchify + x_embedder` is **bit-identical**, everything else 1e-8…8e-6, and ⚠️ **the
+DiT's disagreement is FLAT in depth** — 2.2e-6 at 2 blocks, 1.9e-6 at 8 — so nothing is
+accumulating, which is what says the block form is right rather than merely close.
+(Z-Image's grows linearly and that was already good enough.)
+
+**End to end**, against ComfyUI **fp32** at 256²/4 steps/seed 42, same prompts, same
+sigmas: **78.44 dB / SSIM 1.0000 at cfg 1.0** and **67.31 dB / SSIM 0.9999 at cfg 4.0**,
+max difference **1/255** either way. That is the f32 reduction-order floor — there is no
+residual to explain.
+
+⚠️ **The 15 dB "disagreement" that was entirely the harness, and it is the same trap
+this file already records for Z-Image.** The first comparison read 15.3 dB with our
+render visibly washed out. Cause: `tools/render_anima_ref.py` applied Wan21's
+`process_out` (`z * latents_std + latents_mean`) itself, but
+`CFGGuider.sample` already ends with `self.inner_model.process_latent_out(samples)`
+(`comfy/samplers.py`) — so the reference denormalized **twice**. The composition
+survived intact — same subject, same pose, same colours in the same places — and only
+the tone shifted, which reads as a numerics problem in the engine. **The tell is the
+signature: structure matching while tone does not means the trajectory agreed and only
+the output mapping did not.** The Z-Image script's own comment says exactly this and I
+overrode it.
+
+**End to end at the REFERENCE RENDER's own settings** — 512x768, 30 steps, cfg 5.0,
+euler + `normal`, seed 80085, its 125-T5-token positive prompt (parenthesised emphasis
+included) and its negative. ⚠️ **Read the control row first:**
+
+| | PSNR | SSIM |
+|---|---|---|
+| **CONTROL** — ComfyUI bf16 vs ComfyUI fp32 | **25.16 dB** | 0.9448 |
+| **TensorPencil f32 vs ComfyUI fp32** | **44.39 dB** | **0.9990** |
+| TensorPencil f32 vs ComfyUI bf16 | 25.19 dB | 0.9451 |
+
+44.39 dB is **19 dB inside the reference's own precision envelope**, and the last row is
+statistically identical to the control — i.e. against a bf16 render this engine is
+indistinguishable from a second ComfyUI fp32 render.
+
+⚠️ **This model is PRECISION-DOMINATED at cfg 5, so read the control first.** At
+1056x1584 / 30 steps / cfg 5 / euler + `normal` / seed 80085, **ComfyUI disagrees with
+itself**:
+
+| | PSNR | SSIM |
+|---|---|---|
+| ComfyUI bf16 vs ComfyUI fp32 (one harness) | **23.04 dB** | 0.9020 |
+| the user's own bf16 render vs my bf16 harness | 25.04 dB | 0.9269 |
+| the user's own bf16 render vs my fp32 harness | 23.52 dB | 0.8925 |
+
+23–25 dB is therefore the **ceiling** for any comparison against that PNG, and it sits
+right on Z-Image's documented 24.49 dB bf16-vs-fp16 floor. (The two bf16 renders differ
+because the reference harness forces `--use-pytorch-cross-attention` where a normal
+ComfyUI server picks its own attention kernel.)
+
+### On the GPU
+
+**Every backend runs the whole pipeline** as of 2026-08-07 (`anima_gpu.zig` /
+`anima_cuda.zig`). At 512x768 / 30 steps / cfg 5 on a 3090, **`cuda` is 0.37 s/step
+against ComfyUI's 0.33 bf16** — 89% of it, and **118x** the CPU arm's 43.60. At
+1056x1584 it is 1.62 against ComfyUI's 1.31 (81%). BACKEND.md 2C has the full grid,
+the per-component bench and the parity table; what belongs here is what the port cost.
+
+| | 512x768 | 1056x1584 | vs ComfyUI fp32 (control 25.16 dB) |
+|---|---|---|---|
+| `cuda` | **0.37 s/step** | **1.62 s/step** | 33.36 dB |
+| `zig-cuda` | 0.42 | 2.32 | 35.32 dB |
+| `vulkan` | 0.59 | **3.11** | 28.95 dB |
+| `cpu` (f32) | 43.60 | 3-8 min | 44.39 dB |
+
+⚠️ **Read the control first.** All three device arms sit inside ComfyUI's own
+**25.16 dB** bf16-vs-fp32 envelope at these settings, and they agree with each other at
+28-36 dB — the same band, i.e. what separates them is precision, not a defect in one. At
+1056x1584 (control **23.04 dB**) they are **32.29 / 33.84 / 33.71 dB**, and `vulkan` —
+the lowest of the three above — is the *highest* there, which is what settles that the
+spread is chaotic rather than systematic.
+Unit-level, all three match `anima.DiT.predict` at **8.0e-4** rel L2 (Vulkan 8.02e-4,
+zig-cuda 8.10e-4, cuda 8.05e-4) — two independent implementations landing on the same
+figure, and **the attention choice is not what the residual is made of**: forcing the
+naive kernels moves it to 8.07e-4.
+
+**Two new kernels and one op generalization.** Everything else was already there.
+
+- ⚠️ **`ln_mod_sg` is a SUBGROUP kernel, and that is the point.** Fused weightless
+  LayerNorm + AdaLN modulation, one subgroup per row. A thread-per-row form at 6534 rows
+  x 2048 wide x 3 calls x 28 blocks is precisely the trap `qk_rmsnorm_warp` already paid
+  for (37 GB/s on a 936 GB/s card, a quarter of a Z-Image step). It computes the variance
+  in **two deviation-based passes**, matching `ops.norm.layerNormUnit` rather than the
+  shifted `E[x^2]-E[x]^2` form — `ops.norm.groupNorm` records why, and the device test
+  includes a row whose mean is 400 against a spread of 1.5 for exactly that reason.
+  ⚠️ At that mean the **f32 host reference is the less accurate side** (its serial sum of
+  2048 values near 400 carries ~5e-4), so both are scored against f64 and the device is
+  required to be no worse — a comparison against `layerNormUnit` directly *fails the
+  correct implementation*.
+- **`ln_mod_par`** is its CUDA twin, **derived from `ln_bias_par` by asserted
+  substitution** (`replaceOnce`, which `@compileError`s on an absent or non-unique
+  pattern) rather than copied, so the block reduction and the two-pass variance stay
+  literally shared.
+- ⚠️ **`coopmat.buildFlashAttn` gained an MD plane stride (push word 7), which is what
+  makes it RECTANGULAR.** `s_stride` was K's row stride, the j loop bound *and* the MD
+  plane stride at once; the MD table is indexed by *query* row, so once `q_pad` exceeded
+  `kv_pad` every head past the first read another head's `{max, 1/sum}`. **0 means
+  "= s_stride"**, so every pre-existing caller is unchanged by construction — and the
+  teeth check is exact: forcing f1 = 0 fails at row 128, the first row past `kv_pad`.
+  `buildGemmAttnOut` already had a `pmdplane`; this is its sibling catching up.
+- **`opAttnTCRect`** is `opAttnTCBatched` with the two sequence lengths pulled apart. The
+  launches were already parameterized by m/n/k with independent per-head strides, and
+  `launchAttnOut` already documented that its `k` "== m only for square attention".
+
+⚠️ **Rectangular tensor-core attention is a REQUIREMENT, not an optimization.**
+Cross-attention is `seq x 512` — **2.4% of a step's FLOPs**, 5.6% of its measured time —
+so the temptation is to leave it on the naive thread-per-(query, head) kernels. But each
+of those threads streams the whole 512-key context, which estimates to ~0.6 s/step at
+1056x1584, i.e. **a third of the whole step for 2.4% of the work**. The FLOP share is not
+what decides; the kernel's data reuse is.
+
+**Cross-attention's K and V are per-IMAGE constants, precomputed for every block at
+`Session.init`.** They are projections of the adapter's output, which no step changes, so
+28 blocks x 2 GEMMs of `[512, 2048] x [2048, 1024]` leave the step loop. Vulkan caches
+them directly in the **f16 attention-operand layout** (117 MB), which also removes the
+per-step conversion and the k-major gather; CUDA's entry points convert internally, so its
+cache is f32 (235 MB). The K norm is per-image too and is applied before caching. Same
+observation `zimage_gpu` makes about its `modulation=False` caption half. `DiT.crossKv` /
+`projectKv` exist so "what K and V are" has ONE implementation — two copies of "project,
+then norm K but not V" is exactly the drift no shape check would see.
+
+⚠️ **A 30x arithmetic error is recorded here rather than quietly fixed, because the shape
+of the mistake is the lesson.** This optimization was motivated by "~17% of the trunk's
+per-step GEMM FLOPs", which came from dividing a **28-block total** by a **per-block**
+figure. The true share is **0.56%** at 6534 tokens (4.29 GFLOP against a block's 767) and
+2.4% at 1536 — obvious in hindsight, since these two GEMMs run over the 512-row *context*
+where every other GEMM in the block runs over the *sequence*, and 512 is a twelfth of
+6534. **Measured** by `anima-cuda-bench`, which times the hoisted GEMMs explicitly and
+outside the step roll-up: 0.10 ms/block, i.e. the hoist is worth **0.38% of a step**. So it
+is a small win that costs 117-235 MB (doubled under CFG), kept because it also removes a
+per-step conversion, and **not** what makes this port fast. The general rule this violated:
+**a ratio between two numbers computed at different scopes is not a ratio.** Per this
+file's own standard the receipt should have come before the code, not after it.
+
+⚠️ **The cost of that cache is that a session is bound to ONE conditioning, so CFG needs
+two of them** — 235 MB of cross K/V on CUDA and 117 MB on Vulkan becomes twice that at
+cfg > 1. Measured VRAM at 1056x1584 / cfg 5: `te=840MB dit=3527MB latent=1051MB`, ~5.4 GB
+resident, so it is comfortable on a 24 GB card and would be the first thing to reconsider
+on a small one. It is the same shape of trade Z-Image's per-conditioning sessions already
+make.
+
+**Three bugs the port cost, and two are recorded elsewhere in this file in other forms:**
+
+- ⚠️ **The folded modulation table must NOT fold the FINAL layer's scale.** The device's
+  fused norm has no place for the `1 +`, so every *block* scale arrives pre-folded — but
+  both arms run the final layer on the HOST through `DiT.finalize`, whose `modulatedNorm`
+  adds its own 1. Folding it there too gave **rel L2 0.10** against the CPU forward:
+  finite, plausible in magnitude, and **identical on both attention paths**, which is
+  what said "shared wiring, not attention" and found it in one step. The rule is *fold
+  exactly what the fused device norm consumes*.
+- ⚠️ **`offsetBuf` is a CUDA idiom and does not port.** A Vulkan `DeviceBuffer.buf` is an
+  opaque HANDLE, not a device pointer, so `zimage_cuda`'s trick of adding a byte offset to
+  it produced an invalid handle and `error_device_lost` on the first cross-attention. The
+  tell was the *size*: a 24x32 latent is far too small for the watchdog to be plausible,
+  so a device loss there is a fault, not a timeout. Fixed with **one buffer per block**,
+  since a descriptor binds a whole buffer.
+- **`replaceOnce` needs `@setEvalBranchQuota`** for a PTX-sized haystack — `std.mem.indexOf`
+  runs Boyer-Moore at comptime.
+
+**Where the step goes, and why the answer is "nowhere unexpected"**
+(`anima-cuda-bench 6534 libs`, one forward): GEMM ~440 ms at 49 TFLOP/s effective and
+**49-54 pure**, self-attention 190-220 ms at 44 TFLOP/s, cross-attention 44 ms, elementwise
+78 ms at **410-830 GB/s** — total **750-790 ms** across runs. ⚠️ **The isolation that makes that a receipt
+is CFG**: 787 ms is ONE forward, a cfg-5 render does two, and the same size at `--cfg 1.0`
+measures **0.82 s/step** against the predicted 0.787. So 2 x 0.82 = 1.64 against the 1.62
+measured — nothing is hiding, and every component is healthy against its own ceiling.
+Closing the remaining ~19% would mean **bf16 activations end to end** plus better GEMM
+tiling at these widths; named, not attempted.
+
+⚠️ **The device arms serve conditioning entry 0 only.** A device session caches
+cross-attention's K/V for the conditioning it was built with, so an A1111 per-step prompt
+schedule (`[a:b:0.5]`, `[a|b]`) would need one session per variant. `predictAnima` detects
+a scheduled entry and falls back to the host forward rather than silently rendering the
+wrong prompt — the same reason krea2's and Z-Image's device paths read entry 0, made
+explicit here because Anima *does* support scheduling.
+
+### int8/int4 convrot: the CPU runs it, the GPU arms refuse it BY BLOCK
+
+`anima.zig`'s loader wires the convrot metadata (`<name>_weight_scale` per output row plus
+the 256-wide rotation), so an int8/int4 Anima checkpoint runs on the **CPU** — `ops.matmul`
+already had the dequant-and-rotate paths. The `comfy_quant` blob confirms the convention
+verbatim: `{"convrot": true, "convrot_groupsize": 256, "per_row": true, "format":
+"int8_tensorwise"}`.
+
+⚠️ **Omitting that wiring is a PANIC, not a slow path.** `ops.matmul.matmul` asserts
+`row_scale != null` for an integer weight, and the loader accepted the I8 tensor because
+`supportsDType(.i8)` is true — so it fired five frames deep, inside `crossKv`.
+
+⚠️ **`unsupportedGpuLin` scans EVERY block's linears, because checking one tensor of one
+block is wrong on a real checkpoint.** `anima_baseV10-INT8_CONVROT-MIXED` keeps **block 0
+entirely bf16** and quantizes blocks 1-27 (block 1: the 10 attention/MLP linears only;
+blocks 2-27: all 16, AdaLN included). A `supported()` that read
+`blocks[0].self_attn.q.dtype` therefore said "GPU ok", built a device session, and crashed
+on the first thing it did. **"Mixed" means mixed per block**, and per-block-uniform is the
+easy case rather than the general one. `zimage_cuda.supported` still reads one tensor —
+correct only because no mixed Z-Image checkpoint exists yet.
+
+The warning names the offending layer (`block 1's blocks.1.self_attn.q_proj.weight is
+i8 …`), because "unsupported dtype" is unactionable when the answer to "but my checkpoint
+is bf16" is "block 1 is not".
+
+**int8 and int4 convrot run on the DEVICE on all three GPU backends** as of 2026-08-07,
+with the kind resolved **per block**. Measured at 512x768 / 20 steps / cfg 4 on a 3090
+(`easonAnimaHOTStyle_animaV10`, its own bf16 as the reference):
+
+| | `cuda` s/step | DiT VRAM | vs its bf16 render | `vulkan` s/step | DiT VRAM |
+|---|---|---|---|---|---|
+| bf16 | 0.43 | 3230 MB | — | 0.57 | 3272 MB |
+| **int8** | **0.23** (1.9x) | **1781 MB** | **25.8 dB / SSIM 0.936** | **0.48** (1.2x) | **1779 MB** |
+| **int4** | **0.18** (2.4x) | **1025 MB** | 11.9 dB / SSIM 0.451 | **0.48** | **1779 MB** (= int8's) |
+
+int8 is free in the way that matters — same composition, same colours, same detail, at half
+the weights and nearly double the speed on `cuda`. int4 keeps the *composition* exactly and
+destroys the surface, which is what the user predicted and what quantization damage looks
+like; a broken kernel gives noise or a flat field, not the same pose with a grainy skin.
+
+⚠️ **`dit_cuda`'s `LinKind` is one value for the whole model ("uniform across blocks") and
+that is WRONG here.** A real mixed checkpoint is mixed by block:
+`easonAnimaHOTStyle_animaV10-INT8_CONVROT` leaves block 0 entirely dense, quantizes block
+1's ten attention/MLP linears, and quantizes all sixteen (AdaLN included) in blocks 2-27. So
+`anima.linKind` is per linear and `prepGroup` is per shared activation. The AdaLN pair and
+cross-attention's k/v are quantized too but are evaluated on the HOST, where `ops.matmul`
+handles convrot at any shape — which is what lets the device path require `rows % 128 == 0`
+(CUDA) / `% 64` (Vulkan) without special-casing their 256 and 6144.
+
+⚠️ **`opI8Prep` does NOT overwrite its input** on either backend — it writes int8 rows and
+per-row scales into the backend's own scratch — so a dense GEMM in the same group may still
+read the f32 activation afterwards. The only constraints are that the prep precedes the
+quantized GEMMs of its group and that one prep serves one reduction width. Anima's MLP is
+8192 wide where everything else is 2048, so `mlp2` gets its own prep.
+
+⚠️ **Vulkan has NO `sint4` cooperative matrix**, only `sint8`. `anima_gpu.Lins` therefore
+**widens every int4 weight to int8 once**, which is exact — a 4-bit value is representable
+in 8 bits and the per-row scale and rotation are untouched — and against CUDA's true W4A4 it
+is *more* accurate, since the activation stays int8. **Named cost: int4 costs int8's memory
+on Vulkan.** The fix that recovers it is a nibble-reading coop GEMM or an i4→i8 repack
+inside `weightBufferRepacked` (device-only widening); both are real kernel work, neither
+done.
+
+⚠️ **That widening must be per MODEL, and making it per session doubled the VRAM.** The
+device weight cache keys on the host POINTER, so one shadow per `anima_gpu.Session` uploaded
+a second full copy of every quantized weight for the CFG-negative branch — measured
+**`dit=3291MB` for int4 against int8's 1779 MB**, i.e. the widening looked twice as
+expensive as it is, and the unpack ran twice per image. `pipeline.Session` owns one `Lins`.
+
+⚠️ **Anima's reduction widths had to be added to `gpu.i8_prep_cols`.** The Vulkan fused prep
+kernel unrolls its FWHT for a fixed `cols` and only krea2's 6144/16384 existed; a missing
+width silently takes a 3-pass fallback that round-trips a full f32 copy of the activation
+through global memory. The table is now `{2048, 6144, 8192, 16384}` and looked up rather
+than switched on.
+
+### `anima-vk-bench`: int8 was never the problem
+
+**`TensorPencil anima-vk-bench [<seq>]`** is the Vulkan counterpart of `anima-cuda-bench`,
+and building it inverted the conclusion. Sync-per-op is exact here (outside `beginBatch`
+every op ends in `submitAndWait`), and the harness prints bf16 and int8 **at identical
+shapes** because the question was never "how fast is the int8 GEMM" but "is it faster than
+the bf16 one it replaces, and by enough to pay for the prep".
+
+At seq 6534, best-of-rounds, net of a measured 0.03 ms submit floor:
+
+| | bf16 | int8 | ratio |
+|---|---|---|---|
+| q/k/v/out+cross `2048<-2048` x6 | 1.49 ms, **37.6 TF/s** | 0.74 ms, **77.5 TF/s** | 2.02x |
+| mlp1 `8192<-2048` | 4.94 ms, 44.6 | 2.57 ms, 86.2 | 1.92x |
+| mlp2 `2048<-8192` | 5.03 ms, 43.8 | 2.62 ms, 84.7 | 1.92x |
+
+Per 28-block step: bf16 = gemm 529 + attn 699 + elt 266 = **1495 ms**; int8 = gemm 269 +
+prep 83 + attn 699 + elt 266 = **1318 ms**.
+
+⚠️ **So int8 is behaving exactly as it should and there is no int8 gap.** Its GEMMs are
+**1.9-2.0x** the bf16 ones and run at **77-86 TFLOP/s — faster than cuBLASLt's bf16 (49-54)
+on the same card.** The step only improves 1.13x because the GEMMs are ~35% of it while
+**attention is ~47% and does not shrink**, and the prep adds back 24% of what the GEMMs
+saved. That is arithmetic, not a defect — and it is the receipt that replaces the earlier
+"Vulkan's int8 speedup is only 1.2x, cause unknown".
+
+⚠️ **The qk-norm was 11.4x off, and the fix was a kernel already sitting in the file.**
+`Elt.rmsnorm` gives each THREAD a whole 128-wide head, so a warp's 32 loads land 512 B apart
+and every one is its own sector: **45 GB/s** at seq 6534 against `rmsnorm_sg`'s **511**. Three
+calls per block x 28 blocks is **198 ms/step -> 18 ms**, i.e. the whole `elt` bucket drops
+266 -> 86 ms. ⚠️ **Confirmed on a real render, which is what makes the bench trustworthy**:
+1056x1584 / 30 steps / cfg 5 went **3.57 -> 3.11 s/step**, against a predicted 0.36 s/step
+(180 ms x two forwards). Output quality is unchanged — **33.54 dB** against ComfyUI fp32
+where it was 33.71, both far inside that render's own 23.04 dB bf16-vs-fp32 control. This is the CUDA `qk_rmsnorm_warp` finding repeating verbatim on the other
+backend, which is the second time this file records it: **judge a bandwidth-bound kernel by
+achieved GB/s against the card's roof, never by its share of the step.** At seq 1536 the same
+kernel reads 176 GB/s and looks merely mediocre — the pathology only becomes obvious at
+production size, because more rows means more independent thread-strided streams.
+⚠️ **Not bit-identical**: the row sum becomes a subgroup tree where it was serial. It is the
+more accurate of the two, and `ln_mod_sg` next door already reduces that way.
+
+### The same fix across all three Vulkan DiTs
+
+**`TensorPencil vk-norm-bench`** sweeps every weighted-RMSNorm shape the three Vulkan DiTs
+use, at the sizes they render at, timing `Elt.rmsnorm` against `rmsnorm_sg`. It exists
+because **the right choice is shape-dependent AND size-dependent** — thread-per-row is
+catastrophic on a narrow row and merely bad on a wide one, and at a third of production size
+Anima's own case understated the gap by 3x (176 vs 355 GB/s at seq 1536; 29 vs 509 at 6534).
+
+| call site | rows x dim | thread/row | subgroup | | per-step estimate |
+|---|---|---|---|---|---|
+| anima Q/K @1056x1584 | 104544 x 128 | 29-37 GB/s | 462-509 | **12-18x** | 246 -> 19 ms |
+| zimage Q/K @1056x1584 | 205440 x 128 | 36 | 508 | **14.2x** | 376 -> 27 ms |
+| zimage sandwich (x4/block) | 6848 x 3840 | 108 | 315 | 2.9x | 250 -> 86 ms |
+| krea2 Q/K **bf16/fp8 only** | 352800 x 128 | 32 | 550 | **17.1x** | 630 -> 37 ms |
+
+All eight live sites now prefer the subgroup kernel (`zimage_gpu.rmsNorm`,
+`dit_gpu.rmsNormQk`, `anima_gpu.qkNorm`).
+
+**Confirmed by same-session A/B renders, which is the only number worth quoting:**
+
+| | before | after | |
+|---|---|---|---|
+| Anima, 1056x1584 / 30 steps / cfg 5 | 3.57 s/step | **3.11** | -13% |
+| Z-Image, 1056x1584 / 9 steps / cfg 1 | 4.44 s/step | **3.80** | -14% |
+
+⚠️ **The table's estimate is an ESTIMATE, not a ceiling, and Z-Image beat it** — 640 ms
+measured against 513 predicted. The row count in the sweep is approximate (Z-Image's joint
+sequence at that resolution is larger than the 6848 used), so read those figures as an order
+of magnitude for deciding *whether* to switch a site, and the A/B as the result. Quality is
+unaffected: Anima **33.54 dB** against ComfyUI fp32 (was 33.71) and Z-Image **38.27 dB**
+before-vs-after, both far inside their own precision floors (23.04 and 24.49 dB).
+
+⚠️ **Two scoping facts I had to check rather than assume, and one of them killed a row of my
+own bench.**
+
+1. **krea2's Q/K `Elt.rmsnorm` is an `else` branch behind two FUSED alternatives**
+   (`qknorm_rope16`, `qknorm_rope_f32`). `qkv_shared` requires `!is_bf16`, so **bf16 and fp8
+   checkpoints fall through and do benefit, while an int8 one takes the fused path and never
+   reaches it.** Quoting the 630 ms as a krea2 win generally would have been wrong.
+2. ⚠️ **krea2's `dim`-wide block norms do NOT go through `Elt.rmsnorm` at all** — `dit_gpu`
+   routes them through the already-parallel `rms_partial` -> `rms_combine` ->
+   `rms_apply_mod` chain. My first bench listed a 6144-wide krea2 row implying a 262 ms
+   saving; there is none. It is kept with `per_step = 0` and labelled
+   `(ref) wide row, no such site`, precisely so the wide-row numbers cannot be read as an
+   available win. **A bench row is a claim; an unlabelled shape is a claim about a call site
+   that may not exist.**
+
+**krea2 bf16 verified end to end** — the `else` arm renders its reference poster correctly on
+Vulkan (768², text legible, no artefacts). ⚠️ **That render's 22.9 s/step says nothing about
+the norm**: an 18.7 GB bf16 DiT on a 24 GB card is weight-streaming bound, so it is a
+correctness check, and krea2's speed benefit remains **kernel-measured only** (32 -> 550
+GB/s at its geometry). A clean krea2 speed A/B needs a card that holds the model resident.
+
+⚠️ **Not bit-identical anywhere**: the row sum becomes a subgroup tree where it was serial
+(the more accurate of the two, and `ln_mod_sg` already reduced that way). Z-Image's and
+krea2's gated forward tests pin tolerances, so those are the things to watch, not just the
+renders.
+
+⚠️ **Vulkan's real gap against CUDA is ATTENTION, not the GEMMs.** 699 ms/step at **16.0
+TFLOP/s** against `opAttnTC`'s **44.3** for the same work, and inside it the P@V (`out`) pass
+is **14.93 ms against `md`'s 7.00** — 2.1x, on the half that should be the cheaper one. That
+is where a 1056x1584 Vulkan render's 3.5 s/step sits, and it is orthogonal to quantization.
+
+⚠️ **First version of this harness was unusable and the reason is on the record**: one
+8-iteration mean, which moved **2.2x between runs** (bf16 mlp1 read 2.29 ms then 5.06;
+`gelu_erf` 672 then 342 GB/s) because the 3090 idles its clocks. It now warms for 150 ms on
+the op being measured and takes the **minimum over 5 rounds**. A short cold run on this card
+is not a measurement.
+
+⚠️ **Every activation buffer is 128-ROW PADDED, and it was not.** A quantized GEMM writes
+`i8_mpad` rows (the prep pads m up to 128 and the coop tile is 128x128), where the dense
+path writes exactly `m` — so the first int8 run died with
+`CUDA_ERROR_ILLEGAL_ADDRESS`. `compute-sanitizer --tool memcheck` named it in one run:
+`igemm_pipe_fused` writing 1 byte past a 1,572,864-byte (= 192 x 2048 x 4) allocation. **For
+an illegal-address fault, reach for the sanitizer before forming a hypothesis** — I had
+already spent a fix on a wrong one (`ensureDeviceBuffer` growing inside the batch, which
+that function already guards against by syncing the stream, and which I then reverted).
+
+**Validated by `TensorPencil anima-cuda-test [<ckpt>] [libs]`**, which checks the two new
+kernels against the CPU ops they reproduce and then the whole device forward against
+`anima.DiT.predict` on real weights, on both attention arms, exiting non-zero on failure;
+plus the gated `-Dtest-filter="Anima gpu"` for the Vulkan arm.
+
+### Container style, and what the resolver has to get right
+
+⚠️ **Anima BUNDLES its VAE and ships its encoder separately — the opposite split from
+Z-Image**, which is why `resolveComponent` deciding per component rather than per
+family keeps paying off. The bundled `first_stage_model.*` is **byte-for-byte**
+`qwen_image_vae.safetensors` (194 tensors, all shapes equal, verified), and
+shape-for-shape krea2's Wan 2.1 decoder — so `Session.decode` shares krea2's whole arm,
+including `latents_mean`/`latents_std`, and a test asserts the latent2rgb preview
+resolves to krea2's matrix and NOT Z-Image's (also 16-channel, so the wrong one is not
+even an out-of-bounds read).
+
+⚠️ **`defaultComponentPath(.anima, .decoder)` is deliberately EMPTY.** A defaulted path
+that does not exist is not an error — the resolver falls through to the checkpoint's own
+copy — but naming one would send it at a file that has nothing to do with this family,
+which is the failure a joined SD1.5 checkpoint already hit once.
+
+⚠️ **`detectFamily` probes the LLM ADAPTER, not the trunk**, and `anima_probe` is one
+constant shared with `componentSpec` so the two cannot disagree. Every trunk tensor name
+— `blocks.0.mlp.layer1.weight` included — is shared with stock Cosmos-Predict2, so a
+trunk probe would load a Cosmos checkpoint as Anima and fail on ~100 missing adapter
+weights. The detection test's Anima cases carry the Cosmos trunk tensor **as well**, so
+they pin that the adapter is what decides, and a negative case asserts a Cosmos trunk
+*without* an adapter is `UnknownArchitecture`.
+
+**Defaults**, from ComfyUI's own `image_anima_base_v1` template: 1024², **30 steps**,
+**cfg 4.0**, euler + **`simple`**, shift 3.0, with `qwen_3_06b_base.safetensors` as the
+encoder. (The reference render this was validated against used cfg 5 and `normal` —
+the user's own choice, not a default.)
+
+### What the width generalization cost
+
+⚠️ **`qwen3.TextEncoder.encode` and both GPU twins were hardcoded to the 2560-wide
+4B body** (`const hidden = qwen3.hidden`), so a 1024-wide Qwen3-0.6B ran with 2.5x
+strides — finite garbage, no error. All three now read `enc.cfg`. `Variant.anima` also
+needed a new tap KIND: krea2 and Z-Image tap *before* a layer that still has to run, so
+their final norm is genuinely never evaluated and is not even loaded, while Anima taps
+one past the last layer (`layer = "last"`, `final_norm = True`) and the norm always
+applies. A fast test asserts the invariant both ways — the final norm is loaded iff the
+last tap is `n_layers` — since a tap list that silently stops agreeing with its config
+is a finite encode of the wrong hidden state.
 
 ## Samplers and schedulers
 

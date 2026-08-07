@@ -3438,6 +3438,19 @@ pub const Backend = struct {
         self.ctx.launch(f, .{ @intCast(rows), 1, 1 }, .{ 256, 1, 1 }, 0, &params) catch return error.CudaError;
     }
 
+    /// out = (x - mean)*inv*mod[premul+c] + mod[shift+c], inv = 1/sqrt(var+eps).
+    /// Fused **weightless** LayerNorm + AdaLN modulation — `anima.modulatedNorm` —
+    /// one 256-thread block per row with a two-pass (deviation-based) variance.
+    ///
+    /// ⚠️ `premul` must already carry the `(1 + scale)` fold, as `rmsMod`'s does, so
+    /// one host-built table serves this and Vulkan's `opLnModSg`.
+    pub fn lnMod(self: *Backend, x: DeviceBuffer, out: DeviceBuffer, mod: DeviceBuffer, rows: usize, dim: usize, premul_off: usize, shift_off: usize, eps: f32) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const f = try self.eltFn(elt.ln_mod_par_ptx, "ln_mod_par");
+        try self.rowLaunch(f, x, out, mod, null, .{ @intCast(rows), @intCast(dim), @intCast(premul_off), @intCast(shift_off), 0, 0 }, .{ eps, 0 }, rows);
+    }
+
     /// per-head RMS norm * weight, one thread per row (rows = seq*n_heads).
     pub fn qkNorm(self: *Backend, x: DeviceBuffer, out: DeviceBuffer, weight: DeviceBuffer, rows: usize, hd: usize, eps: f32) Error!void {
         self.ptic();
@@ -3968,6 +3981,106 @@ pub const Backend = struct {
             // scatter O rows 0..seq into out[q][base+z][hd]
             self.ptic();
             try self.launch7(f_scb, .{ self.attn_oh.ptr(), out.ptr() }, .{ seq32, nh32, bh, hd32, mpad32, gs32 * seq32 * hd32, 0 }, gs * seq * hd);
+            self.ptoc(.attn);
+        }
+    }
+
+    /// **Rectangular** tensor-core attention: `seq_q` queries against `seq_kv` keys,
+    /// f32 in / f32 out, non-causal, GQA-aware. `opAttnTCBatched` with the two
+    /// sequence lengths pulled apart.
+    ///
+    /// This exists for **cross-attention** — Anima's denoiser attends `seq` image
+    /// tokens onto a fixed 512-row context — and it is a requirement rather than an
+    /// optimization: at 1056x1584 the naive `opAttnCross` (one thread per (query,
+    /// head), streaming K/V per thread) would spend an estimated ~0.6 s/step on what
+    /// is only ~8% of the step's FLOPs. Nothing about the pipeline was square to begin
+    /// with; `launchHgemmB` takes m/n/k with independent per-head strides and
+    /// `launchAttnOut` already documented that its `k` "== m only for square
+    /// (whole-seq) attention".
+    ///
+    /// ⚠️ Always the hand-PTX path, in **both** `kernels` modes. Under `--backend cuda`
+    /// self-attention still goes to cuDNN's fused SDPA (`opAttnTC`), whose `SdpaPlan`
+    /// is built for one sequence length; teaching it a rectangular shape is a real but
+    /// separate change, deliberately not made here. So a `cuda` render's cross-attention
+    /// and a `zig-cuda` render's are the same kernels.
+    pub fn opAttnTCRect(
+        self: *Backend,
+        q: DeviceBuffer,
+        k: DeviceBuffer,
+        v: DeviceBuffer,
+        out: DeviceBuffer,
+        seq_q: usize,
+        seq_kv: usize,
+        n_heads: usize,
+        kv_heads: usize,
+        hd: usize,
+        scale: f32,
+    ) Error!void {
+        const qpad = std.mem.alignForward(usize, seq_q, 128);
+        const kpad = std.mem.alignForward(usize, seq_kv, 128);
+        const group = n_heads / kv_heads;
+
+        // Scratch per head in the batch: Q/K tiles, Vᵀ, the S plane and the MD table.
+        // S dominates and is what caps the batch, exactly as in the square path.
+        const per_head = qpad * hd * 2 + kpad * hd * 2 + hd * kpad * 2 + qpad * kpad * 2 + qpad * 8 + qpad * hd * 4;
+        const cap = if (self.budget_override != 0)
+            @min(self.attn_scratch_budget, @max(64 << 20, self.budget_override / 4))
+        else
+            self.attn_scratch_budget;
+        var g = cap / per_head;
+        if (g < 1) g = 1;
+        if (g > n_heads) g = n_heads;
+
+        try self.ensureDeviceBuffer(&self.attn_qh, g * qpad * hd * 2);
+        try self.ensureDeviceBuffer(&self.attn_kh, g * kpad * hd * 2);
+        try self.ensureDeviceBuffer(&self.attn_vth, g * hd * kpad * 2);
+        try self.ensureDeviceBuffer(&self.attn_s, g * qpad * kpad * 2);
+        try self.ensureDeviceBuffer(&self.attn_md, g * qpad * 8);
+        try self.ensureDeviceBuffer(&self.attn_oh, g * qpad * hd * 4);
+
+        const f_scores = try self.hgemmBatchedC16Fn();
+        const f_pv = try self.hgemmAttnOutFn();
+        const f_sm = try self.eltFn(kernels.softmax_md_f16_ptx, "softmax_md_f16");
+        const f_ghb = try self.eltFn(elt.gather_head_b_ptx, "gather_head_b");
+        const f_gvtb = try self.eltFn(elt.gather_vt_b_ptx, "gather_vt_b");
+        const f_scb = try self.eltFn(elt.scatter_head_b_ptx, "scatter_head_b");
+
+        const s_q: u32 = @intCast(qpad * hd);
+        const s_k: u32 = @intCast(kpad * hd);
+        const s_vt: u32 = @intCast(hd * kpad);
+        const s_s: u32 = @intCast(qpad * kpad);
+        const s_o: u32 = @intCast(qpad * hd);
+        const hd32: u32 = @intCast(hd);
+        const nh32: u32 = @intCast(n_heads);
+        const kvh32: u32 = @intCast(kv_heads);
+        const qs32: u32 = @intCast(seq_q);
+        const ks32: u32 = @intCast(seq_kv);
+        const qp32: u32 = @intCast(qpad);
+        const kp32: u32 = @intCast(kpad);
+        const grp32: u32 = @intCast(group);
+
+        var base: usize = 0;
+        while (base < n_heads) : (base += g) {
+            const gs = @min(g, n_heads - base);
+            const gs32: u32 = @intCast(gs);
+            const bh: u32 = @intCast(base);
+            // ⚠️ Q/scatter carry the QUERY length and pad; K/Vᵀ the KEY length and pad.
+            self.ptic();
+            try self.launch7(f_ghb, .{ q.ptr(), self.attn_qh.ptr() }, .{ qs32, nh32, bh, 1, hd32, qp32, gs32 * qp32 * hd32 }, gs * qpad * hd);
+            try self.launch7(f_ghb, .{ k.ptr(), self.attn_kh.ptr() }, .{ ks32, kvh32, bh, grp32, hd32, kp32, gs32 * kp32 * hd32 }, gs * kpad * hd);
+            try self.launch7(f_gvtb, .{ v.ptr(), self.attn_vth.ptr() }, .{ ks32, kvh32, bh, grp32, hd32, kp32, gs32 * hd32 * kp32 }, gs * hd * kpad);
+            self.ptoc(.attn);
+            self.ptic();
+            try self.launchHgemmB(f_scores, self.attn_qh, self.attn_kh, self.attn_s, qpad, kpad, hd, gs, s_q, s_k, s_s, scale);
+            self.ptoc(.attn_scores);
+            self.ptic();
+            try self.launchSoftmaxMd(f_sm, self.attn_s, self.attn_md, gs * qpad, kpad, seq_kv);
+            self.ptoc(.attn_softmax);
+            self.ptic();
+            try self.launchAttnOut(f_pv, self.attn_s, self.attn_vth, self.attn_oh, self.attn_md, qpad, hd, kpad, gs, s_s, s_vt, s_o, ks32, qp32);
+            self.ptoc(.attn_pv);
+            self.ptic();
+            try self.launch7(f_scb, .{ self.attn_oh.ptr(), out.ptr() }, .{ qs32, nh32, bh, hd32, qp32, gs32 * qs32 * hd32, 0 }, gs * seq_q * hd);
             self.ptoc(.attn);
         }
     }

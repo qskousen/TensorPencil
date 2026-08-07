@@ -516,6 +516,53 @@ pub const ln_bias_par_ptx: [:0]const u8 =
     \\}
 ;
 
+/// `ln_bias_par` with its per-column weight and bias read out of ONE modulation
+/// buffer at two element offsets — Anima's `modulatedNorm`:
+///   out = (x - mean) * inv * mod[u2 + c] + mod[u3 + c]
+///
+/// ⚠️ `mod[u2..]` must already carry the `(1 + scale)` fold. That is the same
+/// convention `rms_mod_par` takes (its "premul" is `norm_weight * (1 + scale)`), so
+/// one host-built table feeds this and the Vulkan `ln_mod_sg` and the two backends
+/// cannot drift apart.
+///
+/// b0=x, b1=out, b2=mod, b3 unused. u0=rows, u1=dim, u2=premul elem offset,
+/// u3=shift elem offset, f0=eps. grid=(rows,1,1).
+///
+/// Derived from `ln_bias_par_ptx` by asserted substitution rather than copied: the
+/// two differ only in where the per-column pair comes from, and `replaceOnce`
+/// @compileErrors if a pattern is absent or not unique — so the reduction, the
+/// two-pass variance and the strided loop stay literally shared.
+pub const ln_mod_par_ptx: [:0]const u8 = blk: {
+    @setEvalBranchQuota(20000);
+    var t: []const u8 = ln_bias_par_ptx;
+    t = replaceOnce(t, ".visible .entry ln_bias_par(", ".visible .entry ln_mod_par(");
+    // Fold the two element offsets into base pointers once, before the loops. The
+    // `w`/`b` pointers become `mod + u2*4` and `mod + u3*4`; `rd4` (b3) goes unused.
+    t = replaceOnce(t,
+        \\  cvt.rn.f32.u32 %f8,%r4;                // dim as f32
+    ,
+        \\  ld.param.u32 %r16,[u2]; mul.wide.u32 %rd15,%r16,4;
+        \\  ld.param.u32 %r17,[u3]; mul.wide.u32 %rd16,%r17,4;
+        \\  add.s64 %rd4,%rd3,%rd16;               // shift base  = mod + u3*4
+        \\  add.s64 %rd3,%rd3,%rd15;               // premul base = mod + u2*4
+        \\  cvt.rn.f32.u32 %f8,%r4;                // dim as f32
+    );
+    // The apply loop needs no change: it already reads `rd3 + off` and `rd4 + off`.
+    // Widen the 64-bit register budget for the two new offsets.
+    t = replaceOnce(t, "  .reg .b64 %rd<20>;", "  .reg .b64 %rd<24>;");
+    break :blk t ++ "\x00";
+};
+
+/// Substitute exactly once, refusing an absent or non-unique pattern at compile
+/// time. Local to this file because `kernels.zig` imports it and must not be
+/// imported back (see that file's note on the cycle).
+fn replaceOnce(comptime src: []const u8, comptime from: []const u8, comptime to: []const u8) []const u8 {
+    const i = std.mem.indexOf(u8, src, from) orelse @compileError("replaceOnce: pattern absent: " ++ from);
+    if (std.mem.indexOf(u8, src[i + from.len ..], from) != null) @compileError("replaceOnce: pattern not unique: " ++ from);
+    return src[0..i] ++ to ++ src[i + from.len ..];
+}
+
+
 /// Fused fp8-e4m3 GEMV for KV-cached decode (m=1): y[row] = scale * dot(W[row], x),
 /// W fp8 [rows][cols] dequantized inline via the 256-entry LUT staged in shared.
 /// One 256-thread block per row (ctaid = row): thread t strides c = 8t, 8t+2048, ...

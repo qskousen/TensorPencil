@@ -9,6 +9,7 @@
 const std = @import("std");
 const tables = @import("unicode_tables.zig");
 const gguf_mod = @import("gguf.zig");
+const prompt_weights = @import("prompt_weights.zig");
 
 const vocab_json = @embedFile("assets/qwen_tokenizer/vocab.json");
 const merges_txt = @embedFile("assets/qwen_tokenizer/merges.txt");
@@ -912,6 +913,55 @@ pub const Tokenizer = struct {
 
     inline fn pairKey(left: u32, right: u32) u64 {
         return (@as(u64, left) << 32) | right;
+    }
+
+    /// Encode `text` the way ComfyUI's `sd1_clip.SDTokenizer` does: resolve the
+    /// `(a:1.2)` emphasis syntax into segments and make **one tokenizer call per
+    /// segment**, concatenating the results. Caller frees.
+    ///
+    /// ⚠️ This is not the same id stream as `encode` on the whole string, and the
+    /// difference is not confined to where the weights are. A segment boundary is a
+    /// tokenizer-call boundary, so byte-level BPE re-derives its pretokens on each
+    /// side of it: the positive prompt of Anima's reference render has a segment
+    /// ending in `", "`, whose trailing space becomes its own token 220 where the
+    /// whole-string encode merges it into the following word. Measured: the two
+    /// disagree from token 37 onward on that prompt.
+    ///
+    /// ⚠️ **The weights are DISCARDED**, deliberately. This exists for Anima's Qwen3
+    /// branch, and `AnimaTokenizer.tokenize_with_weights` forces every weight on that
+    /// branch to 1.0 — emphasis reaches Anima only through its T5 branch
+    /// (`t5_tokenizer.encodeWeighted`). A caller that needs weighted ids for a
+    /// BPE tower wants `clip_tokenizer.encodeWeighted`, which also does the 77-token
+    /// chunking this deliberately does not.
+    ///
+    /// `min_len` pads with `pad_id` (`SDTokenizer`'s `min_length`, 1 for the Qwen3
+    /// branch — so an empty prompt is one `<|endoftext|>` rather than no tokens).
+    /// There is no start token, no end token and no chunking: Anima's Qwen3
+    /// sub-tokenizer sets `has_start_token=False`, `has_end_token=False`,
+    /// `pad_to_max_length=False` and `max_length=99999999`.
+    pub fn encodeSegmented(
+        self: *const Tokenizer,
+        gpa: std.mem.Allocator,
+        text: []const u8,
+        min_len: usize,
+        pad_id: u32,
+    ) ![]u32 {
+        var scratch = std.heap.ArenaAllocator.init(gpa);
+        defer scratch.deinit();
+        const arena = scratch.allocator();
+
+        var segs: std.ArrayList(prompt_weights.Segment) = .empty;
+        try prompt_weights.segments(arena, &segs, text);
+
+        var out: std.ArrayList(u32) = .empty;
+        errdefer out.deinit(gpa);
+        for (segs.items) |s| {
+            const plain = try prompt_weights.unescape(arena, s.text);
+            if (plain.len == 0) continue; // ComfyUI drops empty segments outright.
+            try self.encode(gpa, plain, &out);
+        }
+        while (out.items.len < min_len) try out.append(gpa, pad_id);
+        return out.toOwnedSlice(gpa);
     }
 
     /// Append the token ids of `text` to `out`.

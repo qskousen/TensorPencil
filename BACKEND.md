@@ -45,7 +45,7 @@ Legend: ✅ full · ⚠️ works but slow / limited · ❌ unsupported · — no
 
 Per-stage dispatch order everywhere is `if (cu_be)` → CUDA, `else if (gpu_ctx)` → Vulkan, `else` → CPU.
 
-Four families: krea2 (below), the SD family (§2A), and Z-Image (§2B).
+Five families: krea2 (below), the SD family (§2A), Z-Image (§2B), and Anima (§2C).
 
 | Stage | cpu | vulkan | zig-cuda | cuda | Files |
 |---|---|---|---|---|---|
@@ -298,6 +298,222 @@ surface rather than chosen:
 - ⚠️ The Q/K norms take `finfo(f32).eps` (1.19e-7), **not** the blocks' 1e-5.
 - ⚠️ `ctx.independent(n)` counts **dispatches, not calls**, and a coop GEMM is three of
   them sharing scratch — do not mark the three qkv GEMMs independent.
+
+### 2C. Anima (Cosmos-Predict2 `MiniTrainDIT` + `llm_adapter`)
+
+Every stage runs on every backend as of 2026-08-07 (`anima_gpu.zig` / `anima_cuda.zig`
+for the 28-block trunk). The encoder is `qwen3{,_gpu,_cuda}` at Qwen3-0.6B width and the
+decoder is krea2's Wan 2.1 arm verbatim, both shared code. ⚠️ The **`llm_adapter` stays on
+the host on purpose** — it does not depend on the timestep at all, so it is computed once
+per *image* inside `encode`, and a device port would buy ~1/30th of a render.
+
+| Stage | cpu | vulkan | zig-cuda | cuda | Files |
+|---|---|---|---|---|---|
+| **T5 tokenizer** (SentencePiece Unigram) | ✅ | — | — | — | `core/t5_tokenizer.zig` |
+| **Text encoder** (Qwen3-**0.6B**, final state + `model.norm`) | ✅ f32 424 ms | ✅ 47 ms / 3.9e-3 | ✅ 98 ms / 3.7e-3 | ✅ 82 ms / 3.6e-3 | `qwen3{,_gpu,_cuda}.zig`, `Variant.anima` |
+| **`llm_adapter`** (6 blocks, 1024, T5-indexed) | ✅ | host | host | host | `anima.zig` (`Adapter`) — per-image, see above |
+| **DiT** (`MiniTrainDIT`, 28 blocks, 2048) | ✅ bf16 / f16 / f32 / fp8 / **int8+int4 convrot** | ✅ (not convrot) | ✅ (not convrot) | ✅ (not convrot) | `anima{,_gpu,_cuda}.zig` |
+| **VAE decode** (Wan 2.1, 16-ch) | ✅ | ✅ | ✅ | ✅ | `wan_vae.zig`, `vae_{gpu,cuda}.zig` |
+| **VAE tiling** | CPU-tile | GPU-tile + CPU floor | GPU-tile + CPU floor | GPU-tile + CPU floor | `vae_tiled.zig` |
+| **TAEHV preview** (taew2_1) | ✅ | ✅ | ✅ | ✅ | ⚠️ inferred from the shared Wan latent format, not measured on an Anima render |
+| **latent2rgb preview** | ✅ | ✅ | ✅ | ✅ | `wan_vae.latentPreviewInto` — krea2's Wan matrix, NOT Z-Image's Flux one |
+
+The encoder row is measured by **`TensorPencil te-test --anima <encoder>`** (72 tokens,
+each backend against its own CPU forward) — the `--anima` flag exists because the variant
+decides the config, so a 0.6B encoder under the default 4B variant is a `ShapeMismatch`
+at load rather than a wrong answer.
+
+**int8/int4 convrot runs on the DEVICE on all three GPU backends**, with the kind resolved
+**per block** (`anima.linKind` / `prepGroup`). Measured at 512x768 / 20 steps / cfg 4 on a
+3090, against the same model's own bf16 render:
+
+| | `cuda` s/step | DiT VRAM | quality vs bf16 | `vulkan` s/step | DiT VRAM |
+|---|---|---|---|---|---|
+| bf16 | 0.43 | 3230 MB | — | 0.57 | 3272 MB |
+| **int8** | **0.23** | **1781 MB** | **25.8 dB / SSIM 0.936** | **0.48** | **1779 MB** |
+| **int4** | **0.18** | **1025 MB** | 11.9 dB / SSIM 0.451 | **0.48** | **1779 MB** (= int8's) |
+
+Device-forward parity against `anima.DiT.predict` (`anima-cuda-test`, depth 1 = dense block
+0, depth 2 = one quantized block, both attention arms):
+
+| | depth 1 (dense) | depth 2 |
+|---|---|---|
+| bf16 checkpoint | 1.42e-3 | 8.0e-4 |
+| int8 checkpoint | **1.42e-3** (identical) | 2.09e-3 |
+| int4 checkpoint | **1.42e-3** (identical) | 3.80e-2 |
+
+⚠️ **Read those three depth-1 figures together: they are identical**, because block 0 is bf16
+in all three files — which is the cross-check that quantization changed nothing it should
+not have. And **int4's 3.80e-2 is 18x int8's 2.09e-3 against a predicted 16x** from 4 bits
+against 8: a coarseness signature, not a wiring error, which would not scale with the level
+count. ⚠️ The reference is W8A**16** (the CPU dequantizes the weight and multiplies in f32)
+while the device is W8A8, so the residual legitimately includes an activation quantization
+the host never does.
+
+⚠️ **It scans every block.** `-INT8_CONVROT` leaves block 0 entirely dense, quantizes block
+1's ten attention/MLP linears, and quantizes all sixteen in blocks 2-27, so a one-tensor
+check said "GPU ok" and then panicked. `dit_cuda`'s per-MODEL `LinKind` would be wrong for
+at least one block of that file.
+
+⚠️ **Vulkan has no `sint4` coopmat**, so `anima_gpu.Lins` widens int4 to int8 once per
+MODEL — exact (4 bits fit in 8; scale and rotation untouched) and in fact more accurate than
+CUDA's W4A4, but int4 then costs int8's memory there. Per model, not per session: the weight
+cache keys on the host pointer, so a per-session shadow uploaded a second copy for the
+CFG-negative branch (3291 MB against 1779). Anima's 2048/8192 reduction widths were added to
+`gpu.i8_prep_cols`; a missing width silently falls back to a 3-pass prep that round-trips a
+full f32 activation copy through global memory.
+
+**What the trunk port needed.** Two kernels and one op generalization; the rest of the
+vocabulary already existed in `zimage_{gpu,cuda}` and the SD UNet arms.
+
+| new | where | why |
+|---|---|---|
+| `ln_mod_sg` | `kernels/subgroup.zig` | fused **weightless** LayerNorm + AdaLN modulation, one subgroup per row. ⚠️ A subgroup kernel rather than thread-per-row because at 6534 rows x 2048 wide x 3 calls x 28 blocks that is the exact bandwidth trap `qk_rmsnorm_warp` already paid for. Two-pass deviation variance, matching `ops.norm.layerNormUnit` — not the shifted form, which cancels catastrophically at large row means |
+| `ln_mod_par` | `cuda/elt.zig` | the CUDA twin, **derived from `ln_bias_par` by asserted substitution** (`replaceOnce`) so the reduction and two-pass variance stay literally shared |
+| `pmdplane` (push word 7) | `coopmat.buildFlashAttn` | lets the flash kernel run **rectangular** q x kv. `s_stride` was K's row stride, the j loop bound *and* the MD plane stride at once; the MD table is indexed by QUERY row. **0 means "= s_stride"**, so every pre-existing caller is unchanged by construction |
+| `opAttnTCRect` | `cuda/backend.zig` | `opAttnTCBatched` with the two sequence lengths pulled apart. The launches were already parameterized by m/n/k with independent per-head strides |
+
+⚠️ **Rectangular tensor-core attention is a requirement, not an optimization.**
+Cross-attention is `seq x 512` — **2.4% of a step's FLOPs** and 5.6% of its measured
+time — but the naive thread-per-(query, head) kernels would spend an estimated ~0.6 s/step
+on it at 1056x1584, because each thread streams the whole 512-key context. A third of the
+step for 2.4% of the work: the FLOP share is not what decides, the data reuse is.
+
+⚠️ **Cross-attention's K and V are per-IMAGE constants and are precomputed for every
+block at `Session.init`.** They are projections of the adapter's output, which no step
+changes, so 28 blocks x 2 GEMMs of `[512, 2048] x [2048, 1024]` leave the step loop.
+Vulkan caches them directly in the **f16 attention-operand layout** (117 MB), which also
+removes the per-step conversion and k-major gather; CUDA's entry points convert
+internally, so its cache is f32 (235 MB) — doubled under CFG, since a session is bound to
+one conditioning.
+
+⚠️ **It is a SMALL win, and the estimate that motivated it was wrong by 30x.** An earlier
+note here claimed ~17% of the trunk's per-step GEMM FLOPs; that compared a 28-block total
+against a per-block figure. The true share is **0.56%** at 6534 tokens (4.29 GFLOP against
+a block's 767) and 2.4% at 1536 — these GEMMs run over the 512-row *context* where every
+other one runs over the *sequence*. `anima-cuda-bench` times them explicitly and outside
+the step roll-up: **0.10 ms/block, so the hoist is worth 0.38% of a step**. Kept because it
+also removes the per-step f16 conversion, but it is not what makes this port fast.
+
+⚠️ **One buffer PER BLOCK on Vulkan, not one buffer with a per-block offset.** A Vulkan
+`DeviceBuffer.buf` is an opaque HANDLE, so `zimage_cuda`'s `offsetBuf` trick — adding a
+byte offset to `.buf` — is meaningful only on CUDA. Doing it here gave an invalid handle
+and `error_device_lost` on the first cross-attention, at a latent far too small for the
+watchdog to be a plausible cause.
+
+⚠️ **Under `--backend cuda`, self-attention goes to cuDNN's fused SDPA but
+cross-attention takes the hand-PTX rectangular path**, because `SdpaPlan` is built for a
+single sequence length. Teaching it a rectangular shape is a real but separate change,
+deliberately not made; it is ~6% of the step.
+
+**Measured** — component parity against ComfyUI, fp32 both sides
+(`-Dintegration -Dtest-filter=Anima`; `tools/gen_anima_fixtures.py`):
+
+| stage | rel L2 |
+|---|---|
+| patchify + `x_embedder` | **exactly 0** (bit-identical) |
+| sinusoidal timestep / RoPE table | 1.8e-8 / 1.7e-8 |
+| block-0 modulation / final layer's | 4.6e-7 / 1.4e-6 |
+| `llm_adapter` (all 6 blocks), and + weights + 512-row pad | 3.2e-6 / 3.2e-6 |
+| whole DiT forward, **8 blocks** / **2 blocks** | 1.9e-6 / 2.2e-6 — **flat in depth** |
+| Qwen3-0.6B conditioning | 2.5e-6 … 7.8e-6 |
+| both tokenizations on real prompts | exact ids |
+
+**Device-forward parity** against `anima.DiT.predict` on the real checkpoint, 2 blocks at
+a 24x32 latent with a 512-row context (`anima-cuda-test`, and the gated
+`-Dtest-filter="Anima gpu"`):
+
+| arm | rel L2 vs the CPU forward |
+|---|---|
+| `vulkan` (flash attention) | **8.02e-4** |
+| `zig-cuda` (hand-PTX TC) | **8.10e-4** |
+| `cuda` (cuDNN SDPA) | **8.05e-4** |
+| either, with the naive attention forced | 8.07e-4 / 8.08e-4 |
+
+⚠️ Read those as one number, not four: bf16 GEMMs against the CPU's f32 accumulation put
+the floor there, and **the attention choice is not what the residual is made of** — the
+naive and tensor-core arms agree to the third digit. Two independent implementations
+(SPIR-V and PTX) landing on the same 8.0e-4 is the cross-check.
+
+**End to end** at 512x768 / 30 steps / cfg 5 / euler + `normal` / seed 80085, on the
+reference render's own prompts. ⚠️ **Read the control row first** — this model at cfg 5 is
+precision-dominated, so ComfyUI disagrees with itself by 25 dB purely from the denoiser's
+dtype, and every arm below sits inside that envelope:
+
+| | vs ComfyUI fp32 | SSIM |
+|---|---|---|
+| **CONTROL** — ComfyUI bf16 vs ComfyUI fp32 | **25.16 dB** | 0.9448 |
+| `cpu` (f32) | 44.39 dB | 0.9990 |
+| `zig-cuda` | **35.32 dB** | 0.9933 |
+| `cuda` | **33.36 dB** | 0.9900 |
+| `vulkan` | **28.95 dB** | 0.9830 |
+
+The three device arms agree with each other at 28-36 dB — the same band as their distance
+from the reference, i.e. what separates them is precision rather than a defect in one of
+them. At 1056x1584 all three land **32.29 / 33.84 / 33.71 dB** (`cuda` / `zig-cuda` /
+`vulkan`) against ComfyUI fp32 with the control at **23.04 dB** — and `vulkan`, the lowest
+of the three at 512x768, is the *highest* here, which is what says the 28.95 above was
+chaotic variation rather than a systematic arm difference. `cuda` against the user's own
+bf16 PNG is **23.80 dB**, which is that PNG's own ceiling.
+
+**Speed**, 30 steps / cfg 5 / euler + `normal` — so **two forwards per step**:
+
+| | 512x768 (1536 tok) | 1056x1584 (6534 tok) |
+|---|---|---|
+| ComfyUI bf16 GPU | 0.33 s/step | 1.31 s/step |
+| ComfyUI fp32 GPU | 0.95 s/step | 6.94 s/step |
+| **`cuda`** | **0.37 s/step** | **1.62 s/step** |
+| **`zig-cuda`** | **0.42 s/step** | **2.32 s/step** |
+| **`vulkan`** | **0.59 s/step** | **3.11 s/step** |
+| `cpu`, 8 cores | 43.60 s/step | ⚠️ not cleanly measured (3-8 min) |
+
+So `cuda` is **89%** of ComfyUI's bf16 speed at 512x768 and **81%** at 1056x1584, and
+**118x** the CPU arm at 512x768.
+
+⚠️ **`vulkan` degrades with sequence length faster than the CUDA arms, and
+`anima-vk-bench` now says why: ATTENTION.** At seq 6534 it is **699 ms of a 1318 ms step at
+16.0 TFLOP/s**, against `opAttnTC`'s 44.3 for the same work — and inside it the P@V (`out`)
+pass costs **14.93 ms against `md`'s 7.00**, 2.1x on the half that should be cheaper. The
+GEMMs are fine (bf16 37-45 TFLOP/s, int8 77-86). Fixing attention is the lever; it is
+orthogonal to quantization.
+
+⚠️ **The same `Elt.rmsnorm` -> `rmsnorm_sg` change landed in `zimage_gpu` (6 sites) and
+`dit_gpu` (2, bf16/fp8 only) as well**, measured by `vk-norm-bench` at each geometry and
+confirmed by same-session A/B renders: **Anima 3.57 -> 3.11 s/step**, **Z-Image 4.44 ->
+3.80**. Quality unaffected (Anima 33.54 dB vs ComfyUI fp32, Z-Image 38.27 dB before-vs-after,
+both inside their own precision floors).
+
+⚠️ **A `Elt.rmsnorm` -> `rmsnorm_sg` change to the Q/K norm was worth 3.57 -> 3.11 s/step**
+(11.4x on the kernel: **45 -> 511 GB/s** at seq 6534). `rmsnorm` gives each THREAD a whole
+128-wide head, so a warp's loads are 512 B apart and each is its own sector. ⚠️ At seq 1536
+the same kernel reads 176 GB/s and looks merely mediocre — **the pathology is only visible at
+production size**. The same call pattern is still in `zimage_gpu` (Q/K plus four `dim`-wide
+sandwich norms) and `dit_gpu`: a strong lead, but measured only for Anima here, and a
+reduction-order change would move their pinned parity tolerances.
+
+**Where the step goes** (`anima-cuda-bench 6534 libs`, one forward, per-component with a
+ceiling rather than a share of the total):
+
+| | ms/step | achieved |
+|---|---|---|
+| GEMM (8 per block) | 444 | 48.4 TFLOP/s effective, **49-54 pure** |
+| self-attention | 221 | 44.3 TFLOP/s |
+| cross-attention | 44 | 17.4 TFLOP/s |
+| elementwise (12 per block) | 78 | **665-828 GB/s** |
+| **total** | **787** | |
+
+⚠️ **That accounts for the whole step, and the check is the CFG isolation.** 787 ms is
+ONE forward; a cfg-5 render does two, and rendering the same size at `--cfg 1.0` measures
+**0.82 s/step** against the bench's 0.787 — the 33 ms being host patchify, the final
+layer and the modulation upload. So 2 x 0.82 = 1.64 s against the 1.62 s/step measured at
+cfg 5: nothing is hiding.
+
+⚠️ Every component is healthy against its own ceiling — the elementwise kernels are at
+665-828 GB/s on a 936 GB/s card, and the GEMMs at 49-54 TFLOP/s against a ~71 TFLOP/s
+bf16 peak. **The remaining ~19% against ComfyUI is not one broken thing**; closing it
+would mean bf16 activations end to end (halving the elementwise traffic and removing the
+f32<->bf16 staging, which the bench measures at 0.01-0.94 ms per GEMM) plus better GEMM
+tiling at these widths. Named, not attempted.
 
 ### 2A. The SD family (SD1.5 / SDXL)
 

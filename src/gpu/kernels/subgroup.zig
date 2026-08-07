@@ -411,3 +411,58 @@ export fn rmsnorm_sg() callconv(.spirv_kernel) void {
         b.data[base + i] = a.data[base + i] * inv * c.data[i];
     }
 }
+
+// ln_mod_sg: one subgroup per row, fused WEIGHTLESS LayerNorm + AdaLN modulation.
+//   y[row][i] = (x[row][i] - mean) * inv * premul[i] + shift[i]
+// with `inv = 1/sqrt(var + eps)` and `premul`/`shift` read out of ONE modulation
+// buffer at two element offsets. This is `anima.modulatedNorm` — the DiT's
+// `(1 + scale)` is folded into `premul` on the host, exactly as `rms_mod_par` on
+// the CUDA side takes a pre-folded scale, so both backends read the same table and
+// the two conventions cannot drift.
+//
+// ⚠️ **Two passes over the row, deviation-based — NOT the shifted
+// `E[x^2] - E[x]^2` form.** `ops.norm.layerNormUnit` is written that way and
+// `ops.norm.groupNorm` records why: once the mean is large relative to the spread
+// the shifted form has to resolve a catastrophic cancellation in f32. A DiT
+// residual stream is exactly a place where that can happen, and the second pass is
+// nearly free — an 8 KB row is L1-resident by then.
+//
+// ⚠️ **A thread-per-row version of this is a bandwidth trap, which is why this is
+// a subgroup kernel.** At 6534 rows x 2048 wide, one thread per row gives each
+// lane a whole row, so a warp's 32 loads land 8 KB apart and every one is its own
+// sector fetch. The same mistake cost a quarter of a Z-Image step on CUDA
+// (`qk_rmsnorm_warp`'s 37 GB/s on a 936 GB/s card); here it is 3 calls per block
+// across 28 blocks.
+//
+// Dispatch LocalSize x = 32, one workgroup per row. a = x, b = out, c = mod.
+// u0 = rows, u1 = dim, u2 = premul elem offset, u3 = shift elem offset, f0 = eps.
+export fn ln_mod_sg() callconv(.spirv_kernel) void {
+    decorate();
+    const gid = gpu.global_invocation_id[0];
+    const lane = gid % 32;
+    const row = gid / 32;
+    if (row >= pc.u0) return; // uniform across the subgroup (all 32 lanes share row)
+    const dim = pc.u1;
+    const base = row * dim;
+    const dimf: f32 = @floatFromInt(dim);
+
+    var psum: f32 = 0;
+    var i: u32 = lane;
+    while (i < dim) : (i += 32) psum += a.data[base + i];
+    const mean = subgroupReduceAdd(psum) / dimf;
+
+    var pvar: f32 = 0;
+    i = lane;
+    while (i < dim) : (i += 32) {
+        const dv = a.data[base + i] - mean;
+        pvar += dv * dv;
+    }
+    const inv = 1.0 / @sqrt(subgroupReduceAdd(pvar) / dimf + pc.f0);
+
+    const pre = pc.u2;
+    const sh = pc.u3;
+    i = lane;
+    while (i < dim) : (i += 32) {
+        b.data[base + i] = (a.data[base + i] - mean) * inv * c.data[pre + i] + c.data[sh + i];
+    }
+}

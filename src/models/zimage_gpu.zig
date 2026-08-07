@@ -466,11 +466,7 @@ fn blockForward(
     const total: u32 = @intCast(rows * dim);
 
     // --- attention: x += tanh(gate_msa) * norm2(attn(modulate(norm1(x), scale_msa)))
-    try ctx.opElt(.rmsnorm, x, ws.nrm_d, try normBuf(ctx, blk.attn_norm1), null, .{
-        .u0 = @intCast(rows),
-        .u1 = @intCast(dim),
-        .f0 = cfg.norm_eps,
-    }, rows, 1, 1);
+    try rmsNorm(ctx, x, ws.nrm_d, blk.attn_norm1, rows, dim, cfg.norm_eps);
     // ⚠️ `u3` points at the table's trailing ZERO block: Z-Image's modulation has no
     // shift, and this is how the shared `modulate` kernel expresses that.
     try ctx.opElt(.modulate, ws.nrm_d, null, ws.mv_d, null, .{
@@ -491,16 +487,8 @@ fn blockForward(
     // ⚠️ The Q/K norms take `finfo(f32).eps`, NOT the blocks' 1e-5 — see
     // `zimage.Config.qk_eps`. Same kernel, different push constant.
     ctx.independent(2);
-    try ctx.opElt(.rmsnorm, ws.q_d, ws.q_d, try normBuf(ctx, blk.attn.qnorm), null, .{
-        .u0 = @intCast(rows * heads),
-        .u1 = @intCast(hd),
-        .f0 = cfg.qk_eps,
-    }, rows * heads, 1, 1);
-    try ctx.opElt(.rmsnorm, ws.k_d, ws.k_d, try normBuf(ctx, blk.attn.knorm), null, .{
-        .u0 = @intCast(rows * kv_heads),
-        .u1 = @intCast(hd),
-        .f0 = cfg.qk_eps,
-    }, rows * kv_heads, 1, 1);
+    try rmsNorm(ctx, ws.q_d, ws.q_d, blk.attn.qnorm, rows * heads, hd, cfg.qk_eps);
+    try rmsNorm(ctx, ws.k_d, ws.k_d, blk.attn.knorm, rows * kv_heads, hd, cfg.qk_eps);
     ctx.independent(2);
     try ctx.opElt(.rope_inter, ws.q_d, null, freqs, null, .{
         .u0 = @intCast(rows * heads * half),
@@ -519,11 +507,7 @@ fn blockForward(
     try gemm(ctx, ws.dlt_d, ws.attn_d, rows, blk.attn.out);
     // The sandwich norm: a SECOND RMSNorm, on the sublayer's output, inside the
     // residual. krea2 has no equivalent.
-    try ctx.opElt(.rmsnorm, ws.dlt_d, ws.dlt_d, try normBuf(ctx, blk.attn_norm2), null, .{
-        .u0 = @intCast(rows),
-        .u1 = @intCast(dim),
-        .f0 = cfg.norm_eps,
-    }, rows, 1, 1);
+    try rmsNorm(ctx, ws.dlt_d, ws.dlt_d, blk.attn_norm2, rows, dim, cfg.norm_eps);
     // The gate was `tanh`'d on the host, inside the table.
     try ctx.opElt(.gated_add, x, ws.dlt_d, ws.mv_d, null, .{
         .u0 = total,
@@ -532,11 +516,7 @@ fn blockForward(
     }, rows * dim, 1, 1);
 
     // --- feed-forward ----------------------------------------------------------
-    try ctx.opElt(.rmsnorm, x, ws.nrm_d, try normBuf(ctx, blk.ffn_norm1), null, .{
-        .u0 = @intCast(rows),
-        .u1 = @intCast(dim),
-        .f0 = cfg.norm_eps,
-    }, rows, 1, 1);
+    try rmsNorm(ctx, x, ws.nrm_d, blk.ffn_norm1, rows, dim, cfg.norm_eps);
     try ctx.opElt(.modulate, ws.nrm_d, null, ws.mv_d, null, .{
         .u0 = total,
         .u1 = @intCast(dim),
@@ -549,11 +529,7 @@ fn blockForward(
         .u0 = @intCast(rows * cfg.mlp_dim),
     }, rows * cfg.mlp_dim, 1, 1);
     try gemm(ctx, ws.dlt_d, ws.mg_d, rows, blk.ffn.w2);
-    try ctx.opElt(.rmsnorm, ws.dlt_d, ws.dlt_d, try normBuf(ctx, blk.ffn_norm2), null, .{
-        .u0 = @intCast(rows),
-        .u1 = @intCast(dim),
-        .f0 = cfg.norm_eps,
-    }, rows, 1, 1);
+    try rmsNorm(ctx, ws.dlt_d, ws.dlt_d, blk.ffn_norm2, rows, dim, cfg.norm_eps);
     try ctx.opElt(.gated_add, x, ws.dlt_d, ws.mv_d, null, .{
         .u0 = total,
         .u1 = @intCast(dim),
@@ -703,6 +679,30 @@ fn gemm(ctx: *gpu.Context, y: Buf, x: Buf, m: usize, w: Weight) !void {
 
 /// Widest zero bias any Z-Image GEMM needs. `mlp_dim` is the largest output width.
 const zero_bias: [zimage.z_image.mlp_dim]f32 = @splat(0);
+
+/// Weighted RMSNorm over `[rows][dim]`, `x -> out` (may alias).
+///
+/// ⚠️ **The SUBGROUP kernel wherever it exists.** `Elt.rmsnorm` gives each THREAD a whole
+/// row, so a warp's 32 loads land `dim * 4` bytes apart and each is its own sector fetch.
+/// Measured at Z-Image's own geometries at 1056x1584 (`vk-norm-bench`):
+///
+/// | | thread/row | subgroup | |
+/// |---|---|---|---|
+/// | Q/K, 205440 x 128 | **37 GB/s** | **555 GB/s** | 15.2x |
+/// | sandwich, 6848 x 3840 | 114 GB/s | 345 GB/s | 3.0x |
+///
+/// ⚠️ **Not bit-identical**: the row sum becomes a subgroup tree where it was serial. It is
+/// the more accurate of the two, and `ln_mod_sg` next door already reduces that way — but it
+/// does move the parity figures, so the gated forward test's bound is the thing to watch.
+fn rmsNorm(ctx: *gpu.Context, x: Buf, out: Buf, weights: []const f32, rows: usize, dim: usize, eps: f32) !void {
+    const w = try normBuf(ctx, weights);
+    if (ctx.hasSubgroupNorm()) return ctx.opRmsNormSg(x, out, w, rows, dim, eps);
+    try ctx.opElt(.rmsnorm, x, out, w, null, .{
+        .u0 = @intCast(rows),
+        .u1 = @intCast(dim),
+        .f0 = eps,
+    }, rows, 1, 1);
+}
 
 fn normBuf(ctx: *gpu.Context, weights: []const f32) !Buf {
     // smallBuffer caches by pointer; wrap the raw handle for opElt.

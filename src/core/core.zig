@@ -29,6 +29,12 @@ pub const tokenizer = @import("tokenizer.zig");
 /// CLIP BPE — the SD family's prompt tokenizer (see that file for why it is not a
 /// variant of `tokenizer.zig`).
 pub const clip_tokenizer = @import("clip_tokenizer.zig");
+/// ComfyUI's `(a:1.2)` emphasis parser, shared by every tokenizer that consumes it
+/// (`clip_tokenizer` for the SD family, `t5_tokenizer` for Anima).
+pub const prompt_weights = @import("prompt_weights.zig");
+/// T5 SentencePiece-Unigram — Anima's SECOND prompt tokenizer, whose ids index the
+/// `llm_adapter`'s own embedding (there is no T5 model here).
+pub const t5_tokenizer = @import("t5_tokenizer.zig");
 /// AUTOMATIC1111 prompt dialect (emphasis + per-step scheduling), alongside
 /// `clip_tokenizer`'s ComfyUI one.
 pub const prompt_a1111 = @import("prompt_a1111.zig");
@@ -59,6 +65,8 @@ test {
     _ = brownian;
     _ = tokenizer;
     _ = clip_tokenizer;
+    _ = prompt_weights;
+    _ = t5_tokenizer;
     _ = prompt_a1111;
     _ = jinja;
     _ = unicode_tables;

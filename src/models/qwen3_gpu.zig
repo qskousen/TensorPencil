@@ -23,16 +23,13 @@ const sample = @import("tp_core").sample;
 const transformer = @import("transformer.zig");
 const transformer_gpu = @import("transformer_gpu.zig");
 
-const hidden = qwen3.hidden;
-const n_heads = qwen3.n_heads;
-const kv_heads = qwen3.n_kv_heads;
+// ⚠️ Only `head_dim` is a family-wide constant here. Every other dimension is read
+// off `enc.cfg` inside `encode`, because Anima's encoder is Qwen3-**0.6B** (28
+// layers, 1024 wide, SwiGLU 3072) where krea2's and Z-Image's are 4B. These used to
+// be module constants; a 0.6B encoder ran with 2560-wide strides and produced
+// garbage with no error.
 const hd = qwen3.head_dim;
 const half = hd / 2;
-const q_dim = n_heads * hd;
-const kv_dim = kv_heads * hd;
-const intermediate = qwen3.intermediate;
-const n_layers = qwen3.n_layers;
-const eps = qwen3.rms_eps;
 const attn_scale: f32 = 1.0 / @sqrt(@as(f32, hd));
 
 const Buf = gpu.DeviceBuffer;
@@ -52,6 +49,13 @@ pub fn encode(enc: *const qwen3.TextEncoder, ctx: *gpu.Context, io: std.Io, gpa:
     std.debug.assert(seq > 0);
     const tap_count = enc.tapCount();
     if (!supportsWeights(ctx, enc)) return error.UnsupportedDType;
+
+    const c = enc.cfg;
+    const hidden = c.hidden;
+    const n_heads = c.n_heads;
+    const kv_heads = c.n_kv_heads;
+    const intermediate = c.intermediate;
+    const eps = c.rms_eps;
 
     // CPU: embedding gather and the rotate-half rope table. ⚠️ Through
     // `embedTokens`, which dispatches on the embedding's own dtype — this used to
@@ -77,7 +81,7 @@ pub fn encode(enc: *const qwen3.TextEncoder, ctx: *gpu.Context, io: std.Io, gpa:
     const seq_pad = std.mem.alignForward(usize, seq, 128);
 
     // Device buffers for this (single) forward.
-    var bufs = try Bufs.init(ctx, seq, seq_pad, tap_count);
+    var bufs = try Bufs.init(ctx, c, seq, seq_pad, tap_count);
     defer bufs.deinit(ctx);
     var freqs_d = try ctx.tensorCreate(fp.len * 4);
     defer ctx.tensorDestroy(&freqs_d);
@@ -102,14 +106,29 @@ pub fn encode(enc: *const qwen3.TextEncoder, ctx: *gpu.Context, io: std.Io, gpa:
     errdefer if (ctx.batching) ctx.abortBatch();
 
     var tap_idx: usize = 0;
-    for (0..n_layers) |l| {
+    // `n_layers + 1`: a tap index may be one PAST the last layer (Anima's is), and
+    // the `l >= enc.layers.len` break is what terminates the loop. See the CPU
+    // `encode` for why the range and the break are separate concerns.
+    for (0..c.n_layers + 1) |l| {
         // Poll cancel between layers so a stop lands mid-encode; the errdefer
         // above aborts the in-flight batch.
-        if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
+        if (cancel) |cc| if (cc.load(.acquire)) return error.Canceled;
         if (tap_idx < tap_count and enc.taps[tap_idx] == l) {
             // Snapshot the hidden state entering layer l into the tap-major
             // output buffer (contiguous copy with a per-tap offset).
-            try ctx.opElt(.copy, x_d, out_d, null, null, .{
+            //
+            // ⚠️ A tap past the last layer carries the final norm. `.rmsnorm` has no
+            // destination-offset push slot, so it lands in the `normed` scratch and
+            // the existing offset copy moves it — two ops, no new kernel, and the
+            // f32 arm's reduction matches the CPU's.
+            var src = x_d;
+            if (enc.final_norm) |w| {
+                if (l == c.n_layers) {
+                    try rmsnorm(ctx, x_d, nd, try nbuf(ctx, w), seq, hidden, eps);
+                    src = nd;
+                }
+            }
+            try ctx.opElt(.copy, src, out_d, null, null, .{
                 .u0 = @intCast(seq * hidden),
                 .u2 = @intCast(tap_idx * seq * hidden),
             }, seq * hidden, 1, 1);
@@ -119,51 +138,51 @@ pub fn encode(enc: *const qwen3.TextEncoder, ctx: *gpu.Context, io: std.Io, gpa:
         const layer = enc.layers[l];
 
         // --- Attention ---
-        try rmsnorm(ctx, x_d, nd, try nbuf(ctx, layer.input_norm), seq, hidden);
+        try rmsnorm(ctx, x_d, nd, try nbuf(ctx, layer.input_norm), seq, hidden, eps);
         try gemm(ctx, coop, q_d, nd, seq, seq_pad, layer.q);
         try gemm(ctx, coop, k_d, nd, seq, seq_pad, layer.k);
         try gemm(ctx, coop, v_d, nd, seq, seq_pad, layer.v);
         // Per-head QK-norm (rows of head_dim), then rotate-half rope.
-        try rmsnorm(ctx, q_d, q_d, try nbuf(ctx, layer.q_norm), seq * n_heads, hd);
-        try rmsnorm(ctx, k_d, k_d, try nbuf(ctx, layer.k_norm), seq * kv_heads, hd);
+        try rmsnorm(ctx, q_d, q_d, try nbuf(ctx, layer.q_norm), seq * n_heads, hd, eps);
+        try rmsnorm(ctx, k_d, k_d, try nbuf(ctx, layer.k_norm), seq * kv_heads, hd, eps);
         try ctx.opElt(.rope_half, q_d, null, freqs_d, null, .{
             .u0 = @intCast(seq * n_heads * half),
             .u1 = half,
             .u2 = sin_off,
-            .u3 = n_heads,
+            .u3 = @intCast(n_heads),
         }, seq * n_heads * half, 1, 1);
         try ctx.opElt(.rope_half, k_d, null, freqs_d, null, .{
             .u0 = @intCast(seq * kv_heads * half),
             .u1 = half,
             .u2 = sin_off,
-            .u3 = kv_heads,
+            .u3 = @intCast(kv_heads),
         }, seq * kv_heads * half, 1, 1);
         // Causal attention: gather k-major, raw scores, fused-softmax P@V.
         try ctx.opElt(.gather_kmajor, q_d, null, null, qt_d, .{
             .u0 = @intCast(seq * n_heads * hd),
-            .u1 = n_heads,
+            .u1 = @intCast(n_heads),
             .u2 = hd,
             .u3 = @intCast(seq),
         }, seq * n_heads * hd, 1, 1);
         try ctx.opElt(.gather_kmajor, k_d, null, null, kt_d, .{
             .u0 = @intCast(seq * kv_heads * hd),
-            .u1 = kv_heads,
+            .u1 = @intCast(kv_heads),
             .u2 = hd,
             .u3 = @intCast(seq),
         }, seq * kv_heads * hd, 1, 1);
         const dc8 = std.math.divCeil(usize, seq, 8) catch unreachable;
         try ctx.opElt(.attn_scores, qt_d, kt_d, null, s_d, .{
             .u0 = @intCast(seq),
-            .u1 = n_heads,
-            .u2 = kv_heads,
+            .u1 = @intCast(n_heads),
+            .u2 = @intCast(kv_heads),
             .u3 = hd,
             .u4 = 0,
             .f0 = attn_scale,
         }, dc8, dc8, n_heads);
         try ctx.opElt(.attn_out, s_d, null, v_d, attn_d, .{
             .u0 = @intCast(seq),
-            .u1 = n_heads,
-            .u2 = kv_heads,
+            .u1 = @intCast(n_heads),
+            .u2 = @intCast(kv_heads),
             .u3 = hd,
             .u4 = 0,
             .u5 = @intCast(seq),
@@ -174,7 +193,7 @@ pub fn encode(enc: *const qwen3.TextEncoder, ctx: *gpu.Context, io: std.Io, gpa:
         try ctx.opElt(.add, x_d, t_d, null, null, .{ .u0 = @intCast(seq * hidden) }, seq * hidden, 1, 1);
 
         // --- MLP (SwiGLU) ---
-        try rmsnorm(ctx, x_d, nd, try nbuf(ctx, layer.post_norm), seq, hidden);
+        try rmsnorm(ctx, x_d, nd, try nbuf(ctx, layer.post_norm), seq, hidden, eps);
         try gemm(ctx, coop, g_d, nd, seq, seq_pad, layer.gate);
         try gemm(ctx, coop, u_d, nd, seq, seq_pad, layer.up);
         try ctx.opElt(.silu_mul, g_d, u_d, null, null, .{ .u0 = @intCast(seq * intermediate) }, seq * intermediate, 1, 1);
@@ -270,7 +289,7 @@ fn gemm(ctx: *gpu.Context, coop: bool, y: Buf, x: Buf, m: usize, m_pad: usize, w
     }
 }
 
-fn rmsnorm(ctx: *gpu.Context, in: Buf, out: Buf, weight: Buf, rows: usize, dim: usize) !void {
+fn rmsnorm(ctx: *gpu.Context, in: Buf, out: Buf, weight: Buf, rows: usize, dim: usize, eps: f32) !void {
     try ctx.opElt(.rmsnorm, in, out, weight, null, .{
         .u0 = @intCast(rows),
         .u1 = @intCast(dim),
@@ -299,7 +318,7 @@ const Bufs = struct {
     t: Buf,
     out: Buf,
 
-    fn init(ctx: *gpu.Context, seq: usize, seq_pad: usize, tap_count: usize) !Bufs {
+    fn init(ctx: *gpu.Context, c: qwen3.Config, seq: usize, seq_pad: usize, tap_count: usize) !Bufs {
         var self: Bufs = undefined;
         var created: usize = 0;
         errdefer inline for (fields, 0..) |name, i| {
@@ -308,19 +327,19 @@ const Bufs = struct {
         // GEMM outputs (q/k/v/attn/gate/up/t) are 128-row padded for the coop
         // path (pad rows written zero); the rest are indexed by real seq.
         const sizes = [fields.len]usize{
-            seq * hidden * 4, // x
-            seq * hidden * 4, // normed
-            seq_pad * q_dim * 4, // q
-            seq_pad * kv_dim * 4, // k
-            seq_pad * kv_dim * 4, // v
-            seq * q_dim * 4, // qt (k-major)
-            seq * kv_dim * 4, // kt (k-major)
-            n_heads * seq * seq * 4, // s (all heads batched)
-            seq_pad * q_dim * 4, // attn
-            seq_pad * intermediate * 4, // gate
-            seq_pad * intermediate * 4, // up
-            seq_pad * hidden * 4, // t
-            tap_count * seq * hidden * 4, // out (tap-major)
+            seq * c.hidden * 4, // x
+            seq * c.hidden * 4, // normed
+            seq_pad * c.qDim() * 4, // q
+            seq_pad * c.kvDim() * 4, // k
+            seq_pad * c.kvDim() * 4, // v
+            seq * c.qDim() * 4, // qt (k-major)
+            seq * c.kvDim() * 4, // kt (k-major)
+            c.n_heads * seq * seq * 4, // s (all heads batched)
+            seq_pad * c.qDim() * 4, // attn
+            seq_pad * c.intermediate * 4, // gate
+            seq_pad * c.intermediate * 4, // up
+            seq_pad * c.hidden * 4, // t
+            tap_count * seq * c.hidden * 4, // out (tap-major)
         };
         inline for (fields, sizes) |name, size| {
             @field(self, name) = try ctx.tensorCreate(size);

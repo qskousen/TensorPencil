@@ -24,6 +24,9 @@ pub const ParseError = error{
     InvalidShape,
     InvalidOffsets,
     DuplicateTensor,
+    /// The declared tensor ranges do not cover the whole payload — a truncated or
+    /// mis-assembled file. See the check in `initFromSlice`.
+    IncompleteMetadata,
     OutOfMemory,
 };
 
@@ -189,6 +192,9 @@ pub const SafeTensors = struct {
 
         var index: std.StringArrayHashMapUnmanaged(TensorInfo) = .empty;
         var metadata: ?std.json.ObjectMap = null;
+        // High-water mark of the declared tensor ranges, checked against the payload
+        // length below.
+        var covered: usize = 0;
 
         var it = root.object.iterator();
         while (it.next()) |entry| {
@@ -201,6 +207,29 @@ pub const SafeTensors = struct {
             const slot = try index.getOrPut(alloc, name);
             if (slot.found_existing) return error.DuplicateTensor;
             slot.value_ptr.* = info;
+            covered = @max(covered, info.end);
+        }
+
+        // ⚠️ **The tensor table must COVER the payload, and not checking that let a
+        // corrupt checkpoint render a solid white image instead of failing.**
+        // `anima_baseV10-INT8_CONVROT-MIXED.safetensors` declares 2,324,776,986 bytes of
+        // tensors in a 2,366,726,170-byte payload — 41,949,184 bytes short — and its
+        // actual data is displaced by ~41.94 MB from where the header says, so every
+        // tensor past the first ~28 read someone else's bytes. Per-tensor bounds
+        // (`end <= payload_len`, `end - start == storageBytes`) all passed.
+        //
+        // The reference implementation makes exactly this check and refuses the same file
+        // with "incomplete metadata, file not fully covered"; being more permissive than
+        // it buys nothing but silent garbage. A tensor table that does not describe the
+        // whole payload is not a file we can reason about.
+        if (covered != payload.len) {
+            std.log.err(
+                "safetensors: the tensor table covers {d} of {d} payload bytes ({d} unaccounted). " ++
+                    "The file is truncated or its header does not match its data; the reference " ++
+                    "implementation refuses it too. Re-download or re-export the checkpoint.",
+                .{ covered, payload.len, payload.len -| covered },
+            );
+            return error.IncompleteMetadata;
         }
 
         return .{

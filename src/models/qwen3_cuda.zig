@@ -41,16 +41,13 @@ fn kvFmt(dt: kvmod.KvDtype) cuda.backend.KvFmt {
 }
 
 
-const hidden = qwen3.hidden; // 2560
-const n_heads = qwen3.n_heads; // 32
-const kv_heads = qwen3.n_kv_heads; // 8
+// ⚠️ Only `head_dim` is a family-wide constant. Every other dimension in `encode`
+// is read off `enc.cfg`, because Anima's encoder is Qwen3-**0.6B** (28 layers, 1024
+// wide, SwiGLU 3072) where krea2's and Z-Image's are 4B. These were module
+// constants; a 0.6B encoder then ran with 2560-wide strides — finite garbage, no
+// error. `CudaLM` below was already config-driven.
 const hd = qwen3.head_dim; // 128
 const half = hd / 2; // 64
-const q_dim = n_heads * hd; // 4096
-const kv_dim = kv_heads * hd; // 1024
-const intermediate = qwen3.intermediate; // 9728
-const n_layers = qwen3.n_layers; // 36
-const eps = qwen3.rms_eps;
 const attn_scale: f32 = 1.0 / @sqrt(@as(f32, hd));
 
 /// Which layers a hybrid CPU/GPU split pushes to the host. qwen3 is uniform
@@ -112,6 +109,15 @@ pub fn encode(enc: *const qwen3.TextEncoder, be: *Backend, io: std.Io, gpa: std.
     const tap_count = enc.tapCount();
     if (!supportsWeights(enc)) return error.UnsupportedDType;
 
+    const c = enc.cfg;
+    const hidden = c.hidden;
+    const n_heads = c.n_heads;
+    const kv_heads = c.n_kv_heads;
+    const q_dim = c.qDim();
+    const kv_dim = c.kvDim();
+    const intermediate = c.intermediate;
+    const eps = c.rms_eps;
+
     // CPU: embedding gather and the rotate-half rope table. ⚠️ Through
     // `embedTokens`, which dispatches on the embedding's own dtype — this used to
     // hardcode bf16 and a `* 2` row stride, which a GGUF encoder (q6_k embedding)
@@ -127,7 +133,7 @@ pub fn encode(enc: *const qwen3.TextEncoder, be: *Backend, io: std.Io, gpa: std.
     @memcpy(fp[seq * half ..], freqs.sin);
     const sin_off = seq * half;
 
-    var bufs = try Bufs.init(be, seq, seq_pad, tap_count);
+    var bufs = try Bufs.init(be, c, seq, seq_pad, tap_count);
     defer bufs.deinit(be);
     var freqs_d = try be.tensorCreate(fp.len * 4);
     defer be.tensorDestroy(&freqs_d);
@@ -149,13 +155,25 @@ pub fn encode(enc: *const qwen3.TextEncoder, be: *Backend, io: std.Io, gpa: std.
     errdefer if (be.batching()) be.abortBatch();
 
     var tap_idx: usize = 0;
-    for (0..n_layers) |l| {
+    // `n_layers + 1`: a tap index may be one PAST the last layer (Anima's is), and
+    // the `l >= enc.layers.len` break is what terminates the loop.
+    for (0..c.n_layers + 1) |l| {
         // Poll cancel between layers so a stop lands mid-encode; the errdefer
         // above aborts the in-flight batch.
-        if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
+        if (cancel) |cc| if (cc.load(.acquire)) return error.Canceled;
         if (tap_idx < tap_count and enc.taps[tap_idx] == l) {
             // Snapshot the hidden state entering layer l into the tap-major output.
-            try be.tensorCopy(out_d, tap_idx * seq * hidden * 4, x_d, 0, seq * hidden * 4);
+            // ⚠️ A tap past the last layer carries the final norm; it lands in the
+            // `normed` scratch first, since `tensorCopy` is what applies the per-tap
+            // offset. Same two-op shape as the Vulkan arm.
+            var src = x_d;
+            if (enc.final_norm) |w| {
+                if (l == c.n_layers) {
+                    try be.qkNorm(x_d, nd, try nbuf(be, w), seq, hidden, eps);
+                    src = nd;
+                }
+            }
+            try be.tensorCopy(out_d, tap_idx * seq * hidden * 4, src, 0, seq * hidden * 4);
             tap_idx += 1;
         }
         if (l >= enc.layers.len) break;
@@ -2085,7 +2103,7 @@ const Bufs = struct {
     t: Buf,
     out: Buf, // tap-major [tap][seq][hidden]
 
-    fn init(be: *Backend, seq: usize, seq_pad: usize, tap_count: usize) !Bufs {
+    fn init(be: *Backend, c: qwen3.Config, seq: usize, seq_pad: usize, tap_count: usize) !Bufs {
         var self: Bufs = undefined;
         var created: usize = 0;
         errdefer inline for (fields, 0..) |name, i| {
@@ -2094,16 +2112,16 @@ const Bufs = struct {
         // GEMM outputs (q/k/v/gate/up/t) are 128-row padded (pad rows are zero);
         // x/normed/attn are indexed by real seq.
         const sizes = [fields.len]usize{
-            seq * hidden * 4, // x
-            seq * hidden * 4, // normed
-            seq_pad * q_dim * 4, // q
-            seq_pad * kv_dim * 4, // k
-            seq_pad * kv_dim * 4, // v
-            seq * q_dim * 4, // attn
-            seq_pad * intermediate * 4, // gate
-            seq_pad * intermediate * 4, // up
-            seq_pad * hidden * 4, // t
-            tap_count * seq * hidden * 4, // out
+            seq * c.hidden * 4, // x
+            seq * c.hidden * 4, // normed
+            seq_pad * c.qDim() * 4, // q
+            seq_pad * c.kvDim() * 4, // k
+            seq_pad * c.kvDim() * 4, // v
+            seq * c.qDim() * 4, // attn
+            seq_pad * c.intermediate * 4, // gate
+            seq_pad * c.intermediate * 4, // up
+            seq_pad * c.hidden * 4, // t
+            tap_count * seq * c.hidden * 4, // out
         };
         inline for (fields, sizes) |name, size| {
             @field(self, name) = try be.tensorCreate(size);
