@@ -32,7 +32,6 @@ const q_dim = n_heads * hd;
 const kv_dim = kv_heads * hd;
 const intermediate = qwen3.intermediate;
 const n_layers = qwen3.n_layers;
-const tap_count = qwen3.tap_count;
 const eps = qwen3.rms_eps;
 const attn_scale: f32 = 1.0 / @sqrt(@as(f32, hd));
 
@@ -40,23 +39,29 @@ const Buf = gpu.DeviceBuffer;
 
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 
-/// Encode token ids to the Krea 2 conditioning stack, [seq][tap_count][hidden]
-/// (same layout the CPU `encode` returns). Caller frees the result.
+/// Encode token ids to the encoder variant's conditioning stack,
+/// `[seq][enc.tapCount()][hidden]` (same layout the CPU `encode` returns). Caller
+/// frees the result.
+///
+/// ⚠️ The tap list and the RoPE theta come off `enc`, never from this file's
+/// constants: krea2 keeps 12 hidden states at theta 5e6, Z-Image keeps one at theta
+/// 1e6, and both would run to completion with the other's values.
 pub fn encode(enc: *const qwen3.TextEncoder, ctx: *gpu.Context, io: std.Io, gpa: std.mem.Allocator, ids: []const u32, use_f16: bool, cancel: ?*std.atomic.Value(bool)) ![]f32 {
     _ = io;
     const seq = ids.len;
     std.debug.assert(seq > 0);
+    const tap_count = enc.tapCount();
+    if (!supportsWeights(ctx, enc)) return error.UnsupportedDType;
 
-    // CPU: embedding gather (bf16 -> f32) and the rotate-half rope table.
+    // CPU: embedding gather and the rotate-half rope table. ⚠️ Through
+    // `embedTokens`, which dispatches on the embedding's own dtype — this used to
+    // hardcode bf16 and a `* 2` row stride, which a GGUF encoder (q6_k embedding)
+    // would have read as garbage.
     const x = try gpa.alloc(f32, seq * hidden);
     defer gpa.free(x);
-    for (ids, 0..) |id, t| {
-        if (id >= qwen3.vocab_size) return error.TokenIdOutOfRange;
-        const row = enc.embed_bytes[@as(usize, id) * hidden * 2 ..][0 .. hidden * 2];
-        try safetensors.convertToF32(.bf16, row, x[t * hidden ..][0..hidden]);
-    }
+    try qwen3.embedTokens(enc.embed, ids, x);
 
-    var freqs = try ops.rope.rotateHalfFreqs(gpa, seq, hd, qwen3.rope_theta);
+    var freqs = try ops.rope.rotateHalfFreqs(gpa, seq, hd, enc.cfg.rope_theta);
     defer freqs.deinit(gpa);
     const fp = try gpa.alloc(f32, 2 * seq * half);
     defer gpa.free(fp);
@@ -72,7 +77,7 @@ pub fn encode(enc: *const qwen3.TextEncoder, ctx: *gpu.Context, io: std.Io, gpa:
     const seq_pad = std.mem.alignForward(usize, seq, 128);
 
     // Device buffers for this (single) forward.
-    var bufs = try Bufs.init(ctx, seq, seq_pad);
+    var bufs = try Bufs.init(ctx, seq, seq_pad, tap_count);
     defer bufs.deinit(ctx);
     var freqs_d = try ctx.tensorCreate(fp.len * 4);
     defer ctx.tensorDestroy(&freqs_d);
@@ -101,7 +106,7 @@ pub fn encode(enc: *const qwen3.TextEncoder, ctx: *gpu.Context, io: std.Io, gpa:
         // Poll cancel between layers so a stop lands mid-encode; the errdefer
         // above aborts the in-flight batch.
         if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
-        if (tap_idx < qwen3.tap_layers.len and qwen3.tap_layers[tap_idx] == l) {
+        if (tap_idx < tap_count and enc.taps[tap_idx] == l) {
             // Snapshot the hidden state entering layer l into the tap-major
             // output buffer (contiguous copy with a per-tap offset).
             try ctx.opElt(.copy, x_d, out_d, null, null, .{
@@ -208,11 +213,60 @@ fn wcode(dt: @import("tp_core").dtype.DType) gpu.WCode {
     };
 }
 
+/// Widest zero bias any encoder GEMM needs: the f16-weight coop GEMM always folds a
+/// bias in and these linears have none. One full-width buffer for every width —
+/// `smallBuffer` caches by host POINTER, so a per-width slice would hand a later,
+/// wider GEMM whichever length was uploaded first.
+const zero_bias: [qwen3.intermediate]f32 = @splat(0);
+
+/// Whether this context can run the encoder's weights at all.
+///
+/// ⚠️ **This exists because assuming it cost a blank white image.** krea2's encoder
+/// checkpoint is fp8 and Z-Image's `qwen_3_4b.safetensors` is **bf16**; before the
+/// bf16 arm below, `gemm` fell through to `opMatmul` with `dtype_f8 = false`, which
+/// reads the bf16 bytes as f32 — every GEMM garbage, the conditioning non-finite, and
+/// the render pure white with no error anywhere. The `wcode` helper further down this
+/// file does read bf16 natively, but that is the LM's GEMV path, not this one; the two
+/// are easy to conflate and one comment does not cover the other.
+pub fn supportsWeights(ctx: *gpu.Context, enc: *const qwen3.TextEncoder) bool {
+    if (enc.layers.len == 0) return false;
+    return switch (enc.layers[0].q.dtype) {
+        .f8_e4m3, .f32 => true,
+        .bf16, .f16 => ctx.pipe_coop_bf16w != .null_handle or ctx.pipe_coop_f16w != .null_handle,
+        // A GGUF encoder. `hasQuantPrefillGemm` IS the f16-weight coop pipeline the
+        // dequant path feeds, so ask it rather than restating the condition.
+        else => |dt| dt.isBlockQuant() and ctx.hasQuantPrefillGemm(),
+    };
+}
+
 fn gemm(ctx: *gpu.Context, coop: bool, y: Buf, x: Buf, m: usize, m_pad: usize, w: ops.matmul.Weight) !void {
-    if (coop) {
-        try ctx.opMatmulCoop(y, x, m, m_pad, w.bytes, w.rows, w.cols, w.scale);
-    } else {
-        try ctx.opMatmul(y, 0, x, 0, m, w.bytes, w.dtype == .f8_e4m3, w.rows, w.cols, w.scale, null);
+    const zeros: []const f32 = &zero_bias;
+    std.debug.assert(w.rows <= zeros.len);
+    if (w.dtype.isBlockQuant()) {
+        // GGUF text encoder (`--text-encoder foo.gguf`): dequant the weight to f16
+        // k-major once, then the same coop GEMM every other arm below uses. This is
+        // the LLM prefill path (`opMatmulCoopQuant`), which suits an encoder exactly
+        // — one call over the whole prompt, so the per-call re-dequant amortizes.
+        //
+        // ⚠️ NOT `wcode` below: that maps every non-f8/bf16 dtype to `.f32`, so a
+        // block quant reaching it would be read as f32 — the same silent-garbage
+        // shape as the bf16 bug this file's `supportsWeights` comment describes.
+        return ctx.opMatmulCoopQuant(w.dtype, y, 0, x, m, w.bytes, w.rows, w.cols, w.scale, zeros[0..w.rows], false);
+    }
+    switch (w.dtype) {
+        // Dense bf16/f16 weights go through the f16-weight tensor-core GEMM, the same
+        // route `dit_gpu` and `zimage_gpu` take for their dense blocks. Native bf16
+        // tensor cores where the device has that config, else bf16 -> f16 at upload.
+        .bf16 => if (ctx.pipe_coop_bf16w != .null_handle)
+            try ctx.opMatmulCoopBf16(y, 0, x, m, w.bytes, w.rows, w.cols, zeros)
+        else
+            try ctx.opMatmulCoopF16Wb(y, 0, x, m, w.bytes, w.rows, w.cols, zeros),
+        .f16 => try ctx.opMatmulCoopF16Wh(y, 0, x, m, w.bytes, w.rows, w.cols, zeros),
+        else => if (coop) {
+            try ctx.opMatmulCoop(y, x, m, m_pad, w.bytes, w.rows, w.cols, w.scale);
+        } else {
+            try ctx.opMatmul(y, 0, x, 0, m, w.bytes, w.dtype == .f8_e4m3, w.rows, w.cols, w.scale, null);
+        },
     }
 }
 
@@ -245,7 +299,7 @@ const Bufs = struct {
     t: Buf,
     out: Buf,
 
-    fn init(ctx: *gpu.Context, seq: usize, seq_pad: usize) !Bufs {
+    fn init(ctx: *gpu.Context, seq: usize, seq_pad: usize, tap_count: usize) !Bufs {
         var self: Bufs = undefined;
         var created: usize = 0;
         errdefer inline for (fields, 0..) |name, i| {

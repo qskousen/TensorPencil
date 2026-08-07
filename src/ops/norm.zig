@@ -59,6 +59,30 @@ pub fn layerNorm(out: []f32, x: []const f32, weight: []const f32, bias: []const 
     }
 }
 
+/// LayerNorm with **no learned weight or bias** (`elementwise_affine=False`):
+/// out = (x - mean) / sqrt(var + eps), in rows of `dim`. `out` may alias `x`.
+///
+/// Z-Image's `final_layer.norm_final` is this: the affine part is supplied
+/// separately by the AdaLN modulation that follows, so the norm itself carries no
+/// parameters. Uses the **biased** variance (divide by `n`), like `torch.nn.LayerNorm`.
+pub fn layerNormUnit(out: []f32, x: []const f32, dim: usize, eps: f32) void {
+    std.debug.assert(x.len == out.len);
+    std.debug.assert(dim != 0 and x.len % dim == 0);
+    const dim_f: f32 = @floatFromInt(dim);
+    var row: usize = 0;
+    while (row < x.len) : (row += dim) {
+        const xr = x[row..][0..dim];
+        const or_ = out[row..][0..dim];
+        var sum: f32 = 0;
+        for (xr) |v| sum += v;
+        const mean = sum / dim_f;
+        var var_sum: f32 = 0;
+        for (xr) |v| var_sum += (v - mean) * (v - mean);
+        const inv = 1.0 / @sqrt(var_sum / dim_f + eps);
+        for (or_, xr) |*o, xv| o.* = (xv - mean) * inv;
+    }
+}
+
 /// 1 / sqrt(mean(x^2) + eps), with vectorized partial sums.
 pub fn invRms(x: []const f32, eps: f32) f32 {
     const vlen = comptime std.simd.suggestVectorLength(f32) orelse 8;

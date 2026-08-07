@@ -50,7 +50,6 @@ const q_dim = n_heads * hd; // 4096
 const kv_dim = kv_heads * hd; // 1024
 const intermediate = qwen3.intermediate; // 9728
 const n_layers = qwen3.n_layers; // 36
-const tap_count = qwen3.tap_count;
 const eps = qwen3.rms_eps;
 const attn_scale: f32 = 1.0 / @sqrt(@as(f32, hd));
 
@@ -59,23 +58,68 @@ const attn_scale: f32 = 1.0 / @sqrt(@as(f32, hd));
 /// migrates first); kept for interface parity with qwen35_cuda.
 pub const CpuSplitPolicy = enum { tail, attn };
 
-/// Encode token ids to the Krea 2 conditioning stack, [seq][tap_count][hidden]
-/// (same token-major layout the CPU `encode` returns). Caller frees the result.
+/// Encode token ids to the encoder variant's conditioning stack,
+/// `[seq][enc.tapCount()][hidden]` (same token-major layout the CPU `encode`
+/// returns). Caller frees the result.
+///
+/// ⚠️ The tap list and the RoPE theta come off `enc`, never from this file's
+/// constants: krea2 keeps 12 hidden states at theta 5e6, Z-Image keeps one at theta
+/// 1e6, and both would run to completion with the other's values.
+///
+/// ⚠️ **Weight dtype is DISPATCHED per GEMM (`wgemm`), not assumed.** This used to
+/// call `opMatmulFp8` unconditionally, which is right for krea2's fp8 encoder and
+/// reads a bf16 one as fp8 bytes — so `supportsWeights` gated bf16 out and every
+/// Z-Image render silently encoded its prompt on the CPU instead. Callers still
+/// gate on `supportsWeights`, but it now answers for the dtypes `wgemm` handles.
+/// One encoder GEMM, dispatched by weight dtype — the same routing `zimage_cuda.gemm`
+/// and `dit_cuda.lin` use. `y[m][co] = x[m][k] @ Wᵀ`, no bias anywhere in Qwen3.
+///
+/// ⚠️ Every Qwen3 encoder width satisfies `opGemmBf16`'s `co%128==0 and k%32==0`
+/// (4B: q 4096, kv 1024, o 2560, mlp 9728, over hidden 2560 / 9728), so the raw
+/// checkpoint bytes ARE the B operand and a bf16 weight is never converted. The
+/// `opMatmulBf16` arm is the general fallback for a checkpoint whose widths differ
+/// or a pre-Ampere card.
+fn wgemm(be: *Backend, y: Buf, x: Buf, m: usize, w: ops.matmul.Weight, co: usize, k: usize) !void {
+    if (w.dtype.isBlockQuant()) {
+        // GGUF text encoder (`--text-encoder foo.gguf`). `opMatmulQuant` expands the
+        // weight to f16 once and runs the same tensor-core GEMM the other arms use.
+        //
+        // ⚠️ **Deliberately NOT the MMQ path**, which `mmqPipeFaster` would select
+        // for every q4_k matrix here and which the LLM prefill does take. MMQ
+        // quantizes the ACTIVATION to q8_1 (~0.5% relative), and this is a
+        // conditioning tensor: it is computed once per render and then steers every
+        // sampling step, so trading accuracy for a fraction of a second — once — is
+        // the wrong side of that trade. The LLM makes it because there the same GEMM
+        // runs per chunk, per token, forever.
+        return be.opMatmulQuant(w.dtype, y, x, m, w.bytes, co, k);
+    }
+    switch (w.dtype) {
+        .f8_e4m3 => try be.opMatmulFp8(y, x, m, w.bytes, w.scale, co, k),
+        .bf16 => if (be.ctx.cc_major >= 8 and co % 128 == 0 and k % 32 == 0)
+            try be.opGemmBf16(y, x, m, w.bytes, co, k, null)
+        else
+            try be.opMatmulBf16(y, x, m, w.bytes, co, k, null),
+        .f16 => try be.opMatmulF16(y, x, m, w.bytes, co, k, null),
+        else => return error.UnsupportedDType,
+    }
+}
+
 pub fn encode(enc: *const qwen3.TextEncoder, be: *Backend, io: std.Io, gpa: std.mem.Allocator, ids: []const u32, cancel: ?*std.atomic.Value(bool)) ![]f32 {
     _ = io;
     const seq = ids.len;
     std.debug.assert(seq > 0);
     const seq_pad = std.mem.alignForward(usize, seq, 128);
+    const tap_count = enc.tapCount();
+    if (!supportsWeights(enc)) return error.UnsupportedDType;
 
-    // CPU: embedding gather (bf16 -> f32) and the rotate-half rope table.
+    // CPU: embedding gather and the rotate-half rope table. ⚠️ Through
+    // `embedTokens`, which dispatches on the embedding's own dtype — this used to
+    // hardcode bf16 and a `* 2` row stride, which a GGUF encoder (q6_k embedding)
+    // would have read as garbage.
     const x = try gpa.alloc(f32, seq * hidden);
     defer gpa.free(x);
-    for (ids, 0..) |id, t| {
-        if (id >= qwen3.vocab_size) return error.TokenIdOutOfRange;
-        const row = enc.embed_bytes[@as(usize, id) * hidden * 2 ..][0 .. hidden * 2];
-        try safetensors.convertToF32(.bf16, row, x[t * hidden ..][0..hidden]);
-    }
-    var freqs = try ops.rope.rotateHalfFreqs(gpa, seq, hd, qwen3.rope_theta);
+    try qwen3.embedTokens(enc.embed, ids, x);
+    var freqs = try ops.rope.rotateHalfFreqs(gpa, seq, hd, enc.cfg.rope_theta);
     defer freqs.deinit(gpa);
     const fp = try gpa.alloc(f32, 2 * seq * half);
     defer gpa.free(fp);
@@ -83,7 +127,7 @@ pub fn encode(enc: *const qwen3.TextEncoder, be: *Backend, io: std.Io, gpa: std.
     @memcpy(fp[seq * half ..], freqs.sin);
     const sin_off = seq * half;
 
-    var bufs = try Bufs.init(be, seq, seq_pad);
+    var bufs = try Bufs.init(be, seq, seq_pad, tap_count);
     defer bufs.deinit(be);
     var freqs_d = try be.tensorCreate(fp.len * 4);
     defer be.tensorDestroy(&freqs_d);
@@ -109,7 +153,7 @@ pub fn encode(enc: *const qwen3.TextEncoder, be: *Backend, io: std.Io, gpa: std.
         // Poll cancel between layers so a stop lands mid-encode; the errdefer
         // above aborts the in-flight batch.
         if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
-        if (tap_idx < qwen3.tap_layers.len and qwen3.tap_layers[tap_idx] == l) {
+        if (tap_idx < tap_count and enc.taps[tap_idx] == l) {
             // Snapshot the hidden state entering layer l into the tap-major output.
             try be.tensorCopy(out_d, tap_idx * seq * hidden * 4, x_d, 0, seq * hidden * 4);
             tap_idx += 1;
@@ -119,23 +163,23 @@ pub fn encode(enc: *const qwen3.TextEncoder, be: *Backend, io: std.Io, gpa: std.
 
         // --- Attention ---
         try be.qkNorm(x_d, nd, try nbuf(be, layer.input_norm), seq, hidden, eps);
-        try be.opMatmulFp8(q_d, nd, seq, layer.q.bytes, layer.q.scale, q_dim, hidden);
-        try be.opMatmulFp8(k_d, nd, seq, layer.k.bytes, layer.k.scale, kv_dim, hidden);
-        try be.opMatmulFp8(v_d, nd, seq, layer.v.bytes, layer.v.scale, kv_dim, hidden);
+        try wgemm(be, q_d, nd, seq, layer.q, q_dim, hidden);
+        try wgemm(be, k_d, nd, seq, layer.k, kv_dim, hidden);
+        try wgemm(be, v_d, nd, seq, layer.v, kv_dim, hidden);
         try be.qkNorm(q_d, q_d, try nbuf(be, layer.q_norm), seq * n_heads, hd, eps);
         try be.qkNorm(k_d, k_d, try nbuf(be, layer.k_norm), seq * kv_heads, hd, eps);
         try be.ropeHalf(q_d, freqs_d, seq, n_heads, half, sin_off, 0);
         try be.ropeHalf(k_d, freqs_d, seq, kv_heads, half, sin_off, 0);
         try be.attn(q_d, k_d, v_d, attn_d, seq, seq, n_heads, kv_heads, hd, attn_scale, true);
-        try be.opMatmulFp8(t_d, attn_d, seq, layer.o.bytes, layer.o.scale, hidden, q_dim);
+        try wgemm(be, t_d, attn_d, seq, layer.o, hidden, q_dim);
         try be.opAdd(x_d, t_d, seq * hidden);
 
         // --- MLP (SwiGLU) ---
         try be.qkNorm(x_d, nd, try nbuf(be, layer.post_norm), seq, hidden, eps);
-        try be.opMatmulFp8(g_d, nd, seq, layer.gate.bytes, layer.gate.scale, intermediate, hidden);
-        try be.opMatmulFp8(u_d, nd, seq, layer.up.bytes, layer.up.scale, intermediate, hidden);
+        try wgemm(be, g_d, nd, seq, layer.gate, intermediate, hidden);
+        try wgemm(be, u_d, nd, seq, layer.up, intermediate, hidden);
         try be.siluMul(g_d, u_d, seq * intermediate);
-        try be.opMatmulFp8(t_d, g_d, seq, layer.down.bytes, layer.down.scale, hidden, intermediate);
+        try wgemm(be, t_d, g_d, seq, layer.down, hidden, intermediate);
         try be.opAdd(x_d, t_d, seq * hidden);
     }
     std.debug.assert(tap_idx == tap_count);
@@ -154,6 +198,24 @@ pub fn encode(enc: *const qwen3.TextEncoder, be: *Backend, io: std.Io, gpa: std.
         }
     }
     return out;
+}
+
+/// Whether this backend's `encode` has a GEMM path for the encoder's weights.
+/// It calls `opMatmulFp8` unconditionally, so anything else would be read as fp8
+/// bytes and produce noise rather than an error. Exposed so the pipeline can fall
+/// back to the CPU encode instead of finding out from the image.
+pub fn supportsWeights(enc: *const qwen3.TextEncoder) bool {
+    if (enc.layers.len == 0) return false;
+    return switch (enc.layers[0].q.dtype) {
+        .f8_e4m3 => true,
+        // Native bf16 tensor cores are Ampere+; older cards take the f16 route,
+        // which `wgemm` falls back to, so both are supported either way.
+        .bf16, .f16 => true,
+        // ⚠️ Asked of the DTYPE, not of a hardcoded list, because a GGUF encoder's
+        // matrices are not all one dtype: Qwen3-4B-Q4_K_M ships q4_k projections
+        // with q6_k on some, and `wgemm` dispatches per matrix.
+        else => |dt| dt.isBlockQuant(),
+    };
 }
 
 /// Wrap a CPU f32 norm-weight slice as a (pointer-cached) small device buffer.
@@ -2023,7 +2085,7 @@ const Bufs = struct {
     t: Buf,
     out: Buf, // tap-major [tap][seq][hidden]
 
-    fn init(be: *Backend, seq: usize, seq_pad: usize) !Bufs {
+    fn init(be: *Backend, seq: usize, seq_pad: usize, tap_count: usize) !Bufs {
         var self: Bufs = undefined;
         var created: usize = 0;
         errdefer inline for (fields, 0..) |name, i| {

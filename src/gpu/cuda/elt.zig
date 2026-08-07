@@ -72,40 +72,75 @@ pub const rms_mod_par_ptx: [:0]const u8 =
     \\}
 ;
 
-/// per-head RMS norm, one thread per row. b0=x, b1=out, b2=weight[dim].
-/// out[row*dim+c] = x*inv*weight[c], inv=1/sqrt(mean(x^2)+f0). u0=rows,u1=dim(hd),f0=eps.
-pub const qk_rmsnorm_ptx: [:0]const u8 =
+/// per-head RMS norm with one WARP per row: lane `l` walks the row at stride 32,
+/// so a warp's 32 loads are one contiguous 128-byte line. Reduction is a butterfly
+/// shuffle — no shared memory, no `bar.sync` — and any `dim` works (the loop is
+/// guarded, not unrolled). b0=x, b1=out, b2=weight[dim]. u0=rows, u1=dim, f0=eps.
+///
+/// ⚠️ **This replaced a one-thread-per-row kernel that was a bandwidth trap at
+/// every shape a DiT uses**, and nothing had ever measured it because a norm
+/// "obviously" costs nothing next to a GEMM. That form gave each lane a whole
+/// row, so a warp's 32 loads were 32 sector fetches 4·dim apart. Measured on a
+/// 3090 at Z-Image's own shapes (32 blocks, seq 6944): the per-head q/k norms ran
+/// at **37.5 GB/s** and the two sandwich norms at **47.1 GB/s**, against 500-750
+/// GB/s for every other elementwise kernel in the same block and ~936 GB/s of
+/// card. Together they were **654 ms of a 2556 ms step** — more than a quarter of
+/// it. Coalescing them cost 17x and 10x respectively (654 ms -> 49 ms).
+///
+/// ⚠️ The row sum is a TREE where the old kernel accumulated serially, so this is
+/// NOT bit-identical to it — it is the more accurate of the two (shallower
+/// dependency chain), and `rms_mod_par` next door already reduced this way. A
+/// Z-Image render moved 29.42 -> 29.38 dB against ComfyUI (SSIM 0.9586 ->
+/// 0.9592), i.e. inside that model's own precision noise.
+///
+/// ⚠️ `rows < 512` still takes `qk_rmsnorm_par` (a whole block per row): the LLM
+/// decode path norms 1 x 2560, where 8 rows per block would leave 82 SMs idle.
+pub const qk_rmsnorm_warp_ptx: [:0]const u8 =
     \\.version 8.0
     \\.target sm_86
     \\.address_size 64
-    \\.visible .entry qk_rmsnorm(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\.visible .entry qk_rmsnorm_warp(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
-    \\  .reg .pred %p<3>;
-    \\  .reg .b32 %r<12>;
-    \\  .reg .f32 %f<8>;
-    \\  .reg .b64 %rd<12>;
+    \\  .reg .pred %p<4>;
+    \\  .reg .b32 %r<24>;
+    \\  .reg .f32 %f<12>;
+    \\  .reg .b64 %rd<16>;
     \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x;
     \\  mad.lo.s32 %r4,%r1,%r2,%r3;
-    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
-    \\  ld.param.u32 %r6,[u1]; ld.param.f32 %f1,[f0];
+    \\  shr.u32 %r5,%r4,5;                     // row = global thread / 32
+    \\  and.b32 %r6,%r3,31;                    // lane
+    \\  ld.param.u32 %r7,[u0]; setp.ge.u32 %p1,%r5,%r7; @%p1 bra END;
+    \\  ld.param.u32 %r8,[u1];                 // dim
+    \\  ld.param.f32 %f1,[f0];                 // eps
     \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
     \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
-    \\  mul.lo.s32 %r7,%r4,%r6; mul.wide.u32 %rd4,%r7,4;
-    \\  add.s64 %rd5,%rd1,%rd4; add.s64 %rd6,%rd2,%rd4;
-    \\  mov.f32 %f2,0f00000000; mov.u32 %r8,0; mov.b64 %rd7,%rd5;
+    \\  mul.lo.s32 %r9,%r5,%r8; mul.wide.u32 %rd4,%r9,4;
+    \\  add.s64 %rd5,%rd1,%rd4;                // x row
+    \\  add.s64 %rd6,%rd2,%rd4;                // out row
+    \\  mov.f32 %f2,0f00000000; mov.u32 %r10,%r6;
     \\SS:
-    \\  setp.ge.u32 %p2,%r8,%r6; @%p2 bra SSD;
-    \\  ld.global.f32 %f3,[%rd7]; fma.rn.f32 %f2,%f3,%f3,%f2;
-    \\  add.s64 %rd7,%rd7,4; add.u32 %r8,%r8,1; bra SS;
+    \\  setp.ge.u32 %p2,%r10,%r8; @%p2 bra SSD;
+    \\  mul.wide.u32 %rd7,%r10,4; add.s64 %rd8,%rd5,%rd7;
+    \\  ld.global.f32 %f3,[%rd8]; fma.rn.f32 %f2,%f3,%f3,%f2;
+    \\  add.u32 %r10,%r10,32; bra SS;
     \\SSD:
-    \\  cvt.rn.f32.u32 %f4,%r6; div.rn.f32 %f2,%f2,%f4; add.f32 %f2,%f2,%f1; rsqrt.approx.f32 %f5,%f2;
-    \\  mov.u32 %r8,0; mov.b64 %rd8,%rd3;
+    \\  mov.b32 %r11,%f2;
+    \\  shfl.sync.bfly.b32 %r12,%r11,16,0x1f,0xffffffff; mov.b32 %f4,%r12; add.f32 %f2,%f2,%f4; mov.b32 %r11,%f2;
+    \\  shfl.sync.bfly.b32 %r12,%r11,8,0x1f,0xffffffff;  mov.b32 %f4,%r12; add.f32 %f2,%f2,%f4; mov.b32 %r11,%f2;
+    \\  shfl.sync.bfly.b32 %r12,%r11,4,0x1f,0xffffffff;  mov.b32 %f4,%r12; add.f32 %f2,%f2,%f4; mov.b32 %r11,%f2;
+    \\  shfl.sync.bfly.b32 %r12,%r11,2,0x1f,0xffffffff;  mov.b32 %f4,%r12; add.f32 %f2,%f2,%f4; mov.b32 %r11,%f2;
+    \\  shfl.sync.bfly.b32 %r12,%r11,1,0x1f,0xffffffff;  mov.b32 %f4,%r12; add.f32 %f2,%f2,%f4;
+    \\  cvt.rn.f32.u32 %f5,%r8; div.rn.f32 %f2,%f2,%f5; add.f32 %f2,%f2,%f1;
+    \\  rsqrt.approx.f32 %f6,%f2;              // inv
+    \\  mov.u32 %r10,%r6;
     \\AP:
-    \\  setp.ge.u32 %p2,%r8,%r6; @%p2 bra END;
-    \\  ld.global.f32 %f6,[%rd5]; ld.global.f32 %f7,[%rd8];
-    \\  mul.f32 %f6,%f6,%f5; mul.f32 %f6,%f6,%f7; st.global.f32 [%rd6],%f6;
-    \\  add.s64 %rd5,%rd5,4; add.s64 %rd6,%rd6,4; add.s64 %rd8,%rd8,4; add.u32 %r8,%r8,1; bra AP;
+    \\  setp.ge.u32 %p2,%r10,%r8; @%p2 bra END;
+    \\  mul.wide.u32 %rd7,%r10,4; add.s64 %rd8,%rd5,%rd7; ld.global.f32 %f3,[%rd8];
+    \\  add.s64 %rd9,%rd3,%rd7; ld.global.f32 %f7,[%rd9];
+    \\  mul.f32 %f3,%f3,%f6; mul.f32 %f3,%f3,%f7;
+    \\  add.s64 %rd10,%rd6,%rd7; st.global.f32 [%rd10],%f3;
+    \\  add.u32 %r10,%r10,32; bra AP;
     \\END:
     \\  ret;
     \\}
@@ -6485,6 +6520,209 @@ pub const dequant_q6_k_f16_ptx: [:0]const u8 =
 /// b0=in(f32), b1=out(f16). u0=total(padded elems), u1=real elems. One thread/elem.
 /// f16 -> f32 flat elementwise convert (p0 f16 in, p1 f32 out, u0 = count). Used
 /// to bring the cuDNN fused-SDPA O (f16) back to the DiT's f32 attention buffer.
+// --- f16 ACTIVATION STORAGE -------------------------------------------------
+//
+// ⚠️ These five are storage-format twins of the kernels above, NOT new maths: each
+// reads and/or writes the big VAE activation buffers as f16 while computing in f32
+// exactly as before. They exist because a 16-channel VAE decoding 1056x1584 needs
+// 256 channels at FULL image resolution — 428M floats, 1.71 GB — in each of two
+// buffers, and f32 storage made a whole-image decode cost 4.3 GB.
+//
+// ⚠️ **Range, not precision, is what gates their use.** The activations these hold
+// peak around 489 for the Flux/Z-Image VAE and ~7e3 for SD1.5, both far inside
+// f16's 65504 — but SDXL's VAE **residual stream reaches 4.2e5**, which is why
+// `sd_vae.Config.act_f16` is off there. See `sd_vae_cuda.decode`.
+
+/// `gn_stats` reading an f16 activation. ⚠️ Welford stays in f32 — see
+/// `ops.norm.groupNorm`: the shifted `E[x²]-E[x]²` form loses catastrophically once
+/// the mean is large relative to the spread, which a late VAE block is.
+/// Diff from `gn_stats`: one load, `*4` -> `*2` + `cvt`.
+pub const gn_stats_h16_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry gn_stats_h16(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<4>;
+    \\  .reg .b16 %rs<4>;
+    \\  .reg .b32 %r<20>;
+    \\  .reg .f32 %f<12>;
+    \\  .reg .b64 %rd<10>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1]; ld.param.u32 %r7,[u2]; ld.param.u32 %r8,[u3]; ld.param.u32 %r9,[u4];
+    \\  ld.param.u64 %rd1,[p0]; cvta.to.global.u64 %rd1,%rd1;
+    \\  div.u32 %r10,%r4,%r7; rem.u32 %r11,%r4,%r7;        // g, chunk
+    \\  mul.lo.s32 %r12,%r9,%r8;                            // total = positions*per_group
+    \\  mul.lo.s32 %r13,%r10,%r8;                           // c0 = g*per_group
+    \\  mov.f32 %f1,0f00000000;                             // count
+    \\  mov.f32 %f2,0f00000000;                             // mean
+    \\  mov.f32 %f3,0f00000000;                             // m2
+    \\  mov.u32 %r14,%r11;                                  // i = chunk
+    \\LOOP:
+    \\  setp.ge.u32 %p2,%r14,%r12; @%p2 bra DONE;
+    \\  div.u32 %r15,%r14,%r8; rem.u32 %r16,%r14,%r8;       // p, j
+    \\  mad.lo.s32 %r17,%r15,%r6,%r13; add.u32 %r17,%r17,%r16;   // p*ch + c0 + j
+    \\  mul.wide.u32 %rd2,%r17,2; add.s64 %rd3,%rd1,%rd2; ld.global.b16 %rs1,[%rd3]; cvt.f32.f16 %f4,%rs1;
+    \\  add.f32 %f1,%f1,0f3F800000;                         // count += 1
+    \\  sub.f32 %f5,%f4,%f2;                                // delta = v - mean
+    \\  div.rn.f32 %f6,%f5,%f1; add.f32 %f2,%f2,%f6;        // mean += delta/count
+    \\  sub.f32 %f7,%f4,%f2; fma.rn.f32 %f3,%f5,%f7,%f3;    // m2 += delta*(v-mean)
+    \\  add.u32 %r14,%r14,%r7; bra LOOP;
+    \\DONE:
+    \\  ld.param.u64 %rd4,[p3]; cvta.to.global.u64 %rd4,%rd4;
+    \\  mul.lo.s32 %r18,%r4,3; mul.wide.u32 %rd5,%r18,4; add.s64 %rd6,%rd4,%rd5;
+    \\  st.global.f32 [%rd6],%f1; st.global.f32 [%rd6+4],%f2; st.global.f32 [%rd6+8],%f3;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// `gn_apply` reading AND writing f16. Weight, bias and the group statistics stay
+/// f32 — they are per-channel, not per-position, so they cost nothing. Diff from
+/// `gn_apply`: `%rd13` is now a *2 offset (x and out are both f16), one `cvt` in
+/// on the load and one out before the store.
+pub const gn_apply_h16_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry gn_apply_h16(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<4>;
+    \\  .reg .b16 %rs<4>;
+    \\  .reg .b32 %r<16>;
+    \\  .reg .f32 %f<12>;
+    \\  .reg .b64 %rd<16>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1]; ld.param.u32 %r7,[u2]; ld.param.u32 %r8,[u3]; ld.param.u32 %r9,[u4]; ld.param.u32 %r10,[u5];
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2]; ld.param.u64 %rd4,[p3];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3; cvta.to.global.u64 %rd4,%rd4;
+    \\  rem.u32 %r11,%r4,%r6; div.u32 %r12,%r11,%r7;        // cc, g
+    \\  mul.wide.u32 %rd5,%r12,4; add.s64 %rd6,%rd4,%rd5; ld.global.f32 %f1,[%rd6];   // mean
+    \\  add.u32 %r13,%r12,%r8; mul.wide.u32 %rd7,%r13,4; add.s64 %rd8,%rd4,%rd7; ld.global.f32 %f2,[%rd8]; // inv
+    \\  mul.wide.u32 %rd9,%r11,4; add.s64 %rd10,%rd3,%rd9; ld.global.f32 %f3,[%rd10]; // weight
+    \\  add.u32 %r14,%r11,%r9; mul.wide.u32 %rd11,%r14,4; add.s64 %rd12,%rd3,%rd11; ld.global.f32 %f4,[%rd12]; // bias
+    \\  mul.wide.u32 %rd13,%r4,2; add.s64 %rd14,%rd1,%rd13; ld.global.b16 %rs1,[%rd14]; cvt.f32.f16 %f5,%rs1;
+    \\  sub.f32 %f5,%f5,%f1; mul.f32 %f5,%f5,%f2; fma.rn.f32 %f5,%f5,%f3,%f4;
+    \\  setp.eq.u32 %p2,%r10,0; @%p2 bra STORE;
+    \\  neg.f32 %f6,%f5; mul.f32 %f6,%f6,0f3FB8AA3B; ex2.approx.f32 %f6,%f6; add.f32 %f6,%f6,0f3F800000;
+    \\  rcp.approx.f32 %f6,%f6; mul.f32 %f5,%f5,%f6;
+    \\STORE:
+    \\  add.s64 %rd15,%rd2,%rd13; cvt.rn.f16.f32 %rs2,%f5; st.global.b16 [%rd15],%rs2;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// `add` over two f16 activations, summed in f32.
+pub const add_h16_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry add_h16(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<2>;
+    \\  .reg .b16 %rs<4>;
+    \\  .reg .b32 %r<8>;
+    \\  .reg .f32 %f<4>;
+    \\  .reg .b64 %rd<8>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2;
+    \\  mul.wide.u32 %rd3,%r4,2; add.s64 %rd4,%rd1,%rd3; add.s64 %rd5,%rd2,%rd3;
+    \\  ld.global.b16 %rs1,[%rd4]; ld.global.b16 %rs2,[%rd5];
+    \\  cvt.f32.f16 %f1,%rs1; cvt.f32.f16 %f2,%rs2; add.f32 %f1,%f1,%f2;
+    \\  cvt.rn.f16.f32 %rs1,%f1; st.global.b16 [%rd4],%rs1;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// `bias_compact` writing f16: the GEMM accumulator `C` stays f32, only `dst`
+/// narrows, so the bias add and the `act_div` unscale still happen in f32.
+pub const bias_compact_h16_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry bias_compact_h16(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<2>;
+    \\  .reg .b16 %rs<4>;
+    \\  .reg .b32 %r<12>;
+    \\  .reg .f32 %f<4>;
+    \\  .reg .b64 %rd<10>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1]; ld.param.u32 %r7,[u2]; ld.param.u32 %r8,[u3];
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
+    \\  div.u32 %r9,%r4,%r6; rem.u32 %r10,%r4,%r6;          // r, c
+    \\  mad.lo.s32 %r11,%r9,%r7,%r10;                        // r*co_pad + c
+    \\  mul.wide.u32 %rd4,%r11,4; add.s64 %rd5,%rd1,%rd4; ld.global.f32 %f1,[%rd5];  // C
+    \\  ld.param.f32 %f3,[f0]; mul.f32 %f1,%f1,%f3;          // undo the activation prescale
+    \\  mul.wide.u32 %rd6,%r10,4; add.s64 %rd7,%rd2,%rd6; ld.global.f32 %f2,[%rd7];  // bias[c]
+    \\  add.f32 %f1,%f1,%f2;
+    \\  add.s32 %r11,%r8,%r4;                                // dst_off + i
+    \\  mul.wide.u32 %rd8,%r11,2; add.s64 %rd9,%rd3,%rd8; cvt.rn.f16.f32 %rs1,%f1; st.global.b16 [%rd9],%rs1;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// `im2col_sd` reading an f16 source. ⚠️ The patch it writes stays **f32** — it is
+/// banded (a few MB, `convBand`) so it is not where the memory goes, and leaving it
+/// f32 means the GEMM's own `f32_to_f16_pad2d` and the zero-padding logic are
+/// untouched. Only the gather narrows.
+pub const im2col_sd_h16_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry im2col_sd_h16(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<6>;
+    \\  .reg .b16 %rs<4>;
+    \\  .reg .b32 %r<28>;
+    \\  .reg .f32 %f<4>;
+    \\  .reg .b64 %rd<8>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1]; ld.param.u32 %r7,[u2]; ld.param.u32 %r8,[u3]; ld.param.u32 %r9,[u4]; ld.param.u32 %r10,[u5];
+    \\  ld.param.f32 %f1,[f0]; ld.param.b32 %r24,[f1];      // mode, out width (raw bits)
+    \\  setp.eq.f32 %p2,%f1,0f3F800000; selp.b32 %r11,1,0,%p2;      // up = (mode == 1)
+    \\  setp.eq.f32 %p2,%f1,0f40000000; selp.b32 %r25,2,1,%p2;      // stride = (mode == 2) ? 2 : 1
+    \\  shl.b32 %r12,%r8,%r11; shl.b32 %r13,%r9,%r11;       // gw, gh (the doubled grid when upsampling)
+    \\  rem.u32 %r14,%r4,%r6; div.u32 %r15,%r4,%r6;         // col, band-row
+    \\  add.u32 %r16,%r10,%r15;                              // p
+    \\  div.u32 %r17,%r14,%r7; rem.u32 %r18,%r14,%r7;       // tap, cc
+    \\  div.u32 %r19,%r16,%r24; rem.u32 %r20,%r16,%r24;     // oy, ox
+    \\  mul.lo.s32 %r19,%r19,%r25; mul.lo.s32 %r20,%r20,%r25;
+    \\  div.u32 %r21,%r17,3; rem.u32 %r22,%r17,3;           // ky, kx
+    \\  add.u32 %r19,%r19,%r21; add.u32 %r20,%r20,%r22;     // yk, xk (coordinate + 1)
+    \\  mov.f32 %f2,0f00000000;
+    \\  setp.lt.u32 %p3,%r19,1; @%p3 bra STORE;
+    \\  setp.gt.u32 %p3,%r19,%r13; @%p3 bra STORE;
+    \\  setp.lt.u32 %p3,%r20,1; @%p3 bra STORE;
+    \\  setp.gt.u32 %p3,%r20,%r12; @%p3 bra STORE;
+    \\  sub.u32 %r19,%r19,1; shr.u32 %r19,%r19,%r11;        // sy
+    \\  sub.u32 %r20,%r20,1; shr.u32 %r20,%r20,%r11;        // sx
+    \\  mad.lo.s32 %r23,%r19,%r8,%r20; mad.lo.s32 %r23,%r23,%r7,%r18;
+    \\  ld.param.u64 %rd1,[p0]; cvta.to.global.u64 %rd1,%rd1;
+    \\  mul.wide.u32 %rd2,%r23,2; add.s64 %rd3,%rd1,%rd2; ld.global.b16 %rs1,[%rd3]; cvt.f32.f16 %f2,%rs1;
+    \\STORE:
+    \\  ld.param.u64 %rd4,[p1]; cvta.to.global.u64 %rd4,%rd4;
+    \\  mul.wide.u32 %rd5,%r4,4; add.s64 %rd6,%rd4,%rd5; st.global.f32 [%rd6],%f2;
+    \\END:
+    \\  ret;
+    \\}
+;
+
 pub const f16_to_f32_ptx: [:0]const u8 =
     \\.version 8.0
     \\.target sm_86

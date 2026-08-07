@@ -93,51 +93,24 @@ const Spec = struct {
     probe: []const u8,
 };
 
-fn spec(fam: Family, comp: Component) ?Spec {
-    return switch (fam) {
-        .krea2 => switch (comp) {
-            .denoiser => .{ .prefixes = &.{ "model.diffusion_model.", "" }, .probe = "blocks.0.attn.wq.weight" },
-            .conditioner => .{ .prefixes = &.{ "text_encoders.", "" }, .probe = "model.language_model.embed_tokens.weight" },
-            .decoder => .{ .prefixes = &.{ "first_stage_model.", "vae.", "" }, .probe = "decoder.conv1.weight" },
-            .conditioner2 => null, // single-conditioner architecture
-        },
-        .sd15 => switch (comp) {
-            .denoiser => .{ .prefixes = &.{ "model.diffusion_model.", "" }, .probe = "input_blocks.0.0.weight" },
-            .conditioner => .{
-                .prefixes = &.{ "cond_stage_model.transformer.text_model.", "text_model.", "" },
-                .probe = "final_layer_norm.weight",
-            },
-            .decoder => .{ .prefixes = &.{ "first_stage_model.", "" }, .probe = "decoder.conv_in.weight" },
-            .conditioner2 => null,
-        },
-        // ⚠️ SDXL's two towers are spelled DIFFERENTLY inside one file: embedder 0 is a
-        // `transformers` CLIPTextModel and embedder 1 an OpenCLIP tower, hence the
-        // unrelated probe names. Probing embedder 1 with embedder 0's `text_model.`
-        // spelling finds nothing and would report a bundled checkpoint as incomplete.
-        .sdxl => switch (comp) {
-            .denoiser => .{ .prefixes = &.{ "model.diffusion_model.", "" }, .probe = "input_blocks.0.0.weight" },
-            .conditioner => .{
-                .prefixes = &.{ "conditioner.embedders.0.transformer.text_model.", "text_model.", "" },
-                .probe = "final_layer_norm.weight",
-            },
-            .conditioner2 => .{
-                .prefixes = &.{ "conditioner.embedders.1.model.", "" },
-                .probe = "ln_final.weight",
-            },
-            .decoder => .{ .prefixes = &.{ "first_stage_model.", "" }, .probe = "decoder.conv_in.weight" },
-        },
-    };
-}
-
 /// Does `store` carry `comp` under any prefix spelling `fam` is distributed with?
+/// ⚠️ **The prefix/probe table lives in `pipeline`, not here.** This file used to
+/// carry its own copy — same rules, written twice — and they drifted the moment the
+/// pipeline learned that a component's tensor names differ by CONTAINER. A GGUF text
+/// encoder is `embed_tokens.weight` where safetensors is `model.embed_tokens.weight`,
+/// so `pipeline.resolveComponent` loaded it happily while this copy, still probing
+/// one spelling, reported the file as carrying no conditioner — the GUI refusing a
+/// file the engine could open. One table, one answer.
 pub fn storeHas(store: tp.weights.WeightStore, fam: Family, comp: Component) bool {
-    const s = spec(fam, comp) orelse return false;
+    const s = pipeline.componentSpec(fam, comp) catch return false;
     for (s.prefixes) |pfx| {
-        var buf: [256]u8 = undefined;
-        if (pfx.len + s.probe.len > buf.len) continue;
-        @memcpy(buf[0..pfx.len], pfx);
-        @memcpy(buf[pfx.len..][0..s.probe.len], s.probe);
-        if (store.get(buf[0 .. pfx.len + s.probe.len]) != null) return true;
+        for (s.probes) |probe| {
+            var buf: [256]u8 = undefined;
+            if (pfx.len + probe.len > buf.len) continue;
+            @memcpy(buf[0..pfx.len], pfx);
+            @memcpy(buf[pfx.len..][0..probe.len], probe);
+            if (store.get(buf[0 .. pfx.len + probe.len]) != null) return true;
+        }
     }
     return false;
 }
@@ -192,6 +165,17 @@ pub fn traits(fam: Family) Traits {
     return switch (fam) {
         .krea2 => .{
             .label = "krea2 (flow-matching DiT)",
+            .backends = &all_backends,
+            .width = 1024,
+            .height = 1024,
+            .steps = 8,
+            .cfg = 1.0,
+        },
+        // The official Z-Image Turbo defaults: 1024², 8 steps, cfg 1 (no negative
+        // branch), from ComfyUI's own template for it.
+        //
+        .zimage => .{
+            .label = "Z-Image (NextDiT)",
             .backends = &all_backends,
             .width = 1024,
             .height = 1024,
@@ -348,7 +332,7 @@ pub const Cache = struct {
 fn read(gpa: std.mem.Allocator, io: std.Io, path: []const u8, fam: ?Family) Probe {
     // Opens by MAGIC, so a GGUF denoiser works here exactly as it does in the
     // pipeline — the GUI never has to care which container a file uses.
-    var c = pipeline.DitContainer.open(gpa, io, path) catch |err| return .{ .failed = err };
+    var c = pipeline.Container.open(gpa, io, path) catch |err| return .{ .failed = err };
     defer c.deinit();
     const store = c.store();
     const family = fam orelse (pipeline.detectFamily(store) catch |err| return .{ .failed = err });
@@ -368,14 +352,23 @@ pub fn inspectSide(gpa: std.mem.Allocator, io: std.Io, path: []const u8, fam: Fa
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-test "traits: every family runs on every backend" {
-    // The SD family's device kernels (sd_unet_gpu/_cuda, sd_vae_gpu/_cuda) landed,
-    // so the CPU-only restriction is gone. If a future architecture arrives
-    // CPU-first, THIS is the test that should be narrowed — the mechanism stays.
+test "traits: every family runs on the CPU, and the GPU list is per family" {
+    // ⚠️ Narrowed when Z-Image landed, which is exactly what the previous version of
+    // this test said should happen if an architecture ever arrived CPU-first. The
+    // mechanism is unchanged: the GUI hides backends a family has no kernels for, so
+    // a too-generous list here is an offered backend that then fails at render time.
+    //
+    // Every family now has a forward on every backend again — Z-Image was the
+    // CPU-first one and its `zimage_gpu` / `zimage_cuda` arms have both landed. If a
+    // future architecture arrives CPU-first, narrow THIS test rather than widening a
+    // traits entry the kernels do not back.
     inline for (@typeInfo(Family).@"enum".fields) |f| {
-        const t = traits(@enumFromInt(f.value));
-        for ([_]Backend{ .cpu, .vulkan, .zig_cuda, .cuda }) |b|
+        const fam: Family = @enumFromInt(f.value);
+        const t = traits(fam);
+        for ([_]Backend{ .cpu, .vulkan, .zig_cuda, .cuda }) |b| {
+            errdefer std.debug.print("{t} supports({t}) = {}\n", .{ fam, b, t.supports(b) });
             try std.testing.expect(t.supports(b));
+        }
     }
 }
 
@@ -472,17 +465,40 @@ test "missing: SDXL's second tower counts, and only for SDXL" {
 }
 
 test "spec: only SDXL probes a second tower, with its own spelling" {
-    try std.testing.expect(spec(.sdxl, .conditioner2) != null);
-    try std.testing.expect(spec(.sd15, .conditioner2) == null);
-    try std.testing.expect(spec(.krea2, .conditioner2) == null);
+    // Reads `pipeline`'s table directly — this file no longer keeps a copy, and the
+    // point of the test is that the GUI's readiness view and the pipeline's resolver
+    // cannot disagree about what a checkpoint contains.
+    _ = try pipeline.componentSpec(.sdxl, .conditioner2);
+    try std.testing.expectError(error.NoSuchComponent, pipeline.componentSpec(.sd15, .conditioner2));
+    try std.testing.expectError(error.NoSuchComponent, pipeline.componentSpec(.krea2, .conditioner2));
     // ⚠️ The two SDXL towers are spelled differently inside one file; reusing
     // embedder 0's probe for embedder 1 would find nothing and report a bundled
     // checkpoint as incomplete.
     try std.testing.expect(!std.mem.eql(
         u8,
-        spec(.sdxl, .conditioner).?.probe,
-        spec(.sdxl, .conditioner2).?.probe,
+        (try pipeline.componentSpec(.sdxl, .conditioner)).probes[0],
+        (try pipeline.componentSpec(.sdxl, .conditioner2)).probes[0],
     ));
+}
+
+test "the GUI sees a GGUF text encoder as carrying a conditioner" {
+    // ⚠️ The regression this file's `storeHas` comment describes: the GUI kept its own
+    // probe table with ONE spelling per component, so a `.gguf` encoder — whose tensors
+    // are `embed_tokens.weight`, not `model.embed_tokens.weight` — scanned as empty and
+    // the settings panel refused a file the engine loads fine.
+    const gpa = std.testing.allocator;
+    var b = try tp.gguf.TestBuilder.init(gpa, 3, 1, 1);
+    defer b.deinit();
+    try b.kvStr("general.architecture", "qwen3");
+    // llama.cpp's spelling, which `canonicalName` maps to a BARE `embed_tokens.weight`
+    // — no `model.` to restore. That is the whole bug in one tensor name.
+    try b.tensor("token_embd.weight", &.{ 4, 2 }, 0, 0);
+    const file = try b.finish(&([_]u8{0} ** 32));
+    defer gpa.free(file);
+    var g = try tp.gguf.Gguf.initFromSlice(gpa, file);
+    defer g.deinit();
+    try std.testing.expect(storeHas(.{ .gguf = &g }, .zimage, .conditioner));
+    try std.testing.expect(storeHas(.{ .gguf = &g }, .krea2, .conditioner));
 }
 
 test "Contents.has covers every component" {

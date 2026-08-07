@@ -72,8 +72,12 @@ const safetensors_sdl = [_]SDLBackend.c.SDL_DialogFileFilter{
     .{ .name = "Safetensors", .pattern = "safetensors" },
     .{ .name = "All files", .pattern = "*" },
 };
-/// The primary diffusion checkpoint may be either container — the pipeline opens
-/// it by MAGIC, not by extension, so the picker must not hide GGUFs.
+/// Any component that can arrive as its own file — the primary checkpoint, and the
+/// text encoders. `pipeline.Container` opens all of them by MAGIC, not by extension,
+/// so the picker must not hide GGUFs. ⚠️ A default filter that omits a format the
+/// engine supports reads as "unsupported": the encoder rows used to offer
+/// `safetensors` only, and a perfectly loadable `qwen_3_4b-q8_0.gguf` simply did not
+/// appear in the dialog.
 const checkpoint_sdl = [_]SDLBackend.c.SDL_DialogFileFilter{
     .{ .name = "Checkpoints", .pattern = "safetensors;gguf" },
     .{ .name = "Safetensors", .pattern = "safetensors" },
@@ -242,12 +246,12 @@ pub fn render(cfg: *config.Config, cb: Callbacks) void {
     pathRow("LLM model", &cfg.llm_model, &gguf_sdl);
     pathRow("Vision tower", &cfg.vision_tower, &gguf_sdl);
     pathRow("Diffusion model", &cfg.diffusion_model, &checkpoint_sdl);
-    pathRow("Text encoder", &cfg.text_encoder, &safetensors_sdl);
+    pathRow("Text encoder", &cfg.text_encoder, &checkpoint_sdl);
     // SDXL's second tower. Always shown rather than revealed only for a detected
     // SDXL checkpoint: a row that appears and disappears as you edit the path
     // above it moves everything below, and the panel already says when it is
     // needed. Ignored by every single-tower architecture.
-    pathRow("Text encoder 2 (SDXL)", &cfg.text_encoder_2, &safetensors_sdl);
+    pathRow("Text encoder 2 (SDXL)", &cfg.text_encoder_2, &checkpoint_sdl);
     pathRow("VAE", &cfg.vae, &safetensors_sdl);
     pathRow("TAESD preview", &cfg.taesd, &safetensors_sdl);
     checkpointPanel(cfg);

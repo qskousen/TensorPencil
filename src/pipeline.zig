@@ -53,6 +53,10 @@ const qwen3 = @import("tp_models").models.qwen3;
 const qwen3_gpu = @import("tp_models").models.qwen3_gpu;
 const krea2_text = @import("tp_models").models.krea2_text;
 const dit_mod = @import("tp_models").models.dit;
+const zimage = @import("tp_models").models.zimage;
+const zimage_text = @import("tp_models").models.zimage_text;
+const zimage_gpu = @import("tp_models").models.zimage_gpu;
+const zimage_cuda = @import("tp_models").models.zimage_cuda;
 const dit_gpu = @import("tp_models").models.dit_gpu;
 const dit_cuda = @import("tp_models").models.dit_cuda;
 const qwen3_cuda = @import("tp_models").models.qwen3_cuda;
@@ -197,7 +201,15 @@ pub const Options = struct {
     steps: usize = 8,
     cfg: f32 = 1.0,
     seed: u64 = 0,
+    /// Sigma-schedule shift. ⚠️ **Its default is family-dependent**, so leaving
+    /// `explicit_shift` false is not the same as passing this value: krea2 wants
+    /// 1.15, Z-Image 3.0, and the SD family ignores it entirely (its ladder comes
+    /// from the training betas). `Session.resolvedShift` picks.
     shift: f32 = sampler.default_shift,
+    /// True when the caller actually asked for `shift`. Same reasoning as
+    /// `explicit_text_encoder`: a *defaulted* value is not a request, and treating
+    /// one as such would silently render Z-Image on krea2's shift.
+    explicit_shift: bool = false,
     /// Which sampler drives the loop. `euler` is the default and the only
     /// first-order one; see `sampler.Kind`.
     sampler: sampler.Kind = .euler,
@@ -545,9 +557,15 @@ fn sdTile(
     ctx: anytype,
     comptime inner: fn (@TypeOf(ctx), std.mem.Allocator, []const f32, usize, usize) anyerror![]f32,
 ) anyerror![]f32 {
-    const c = sd_vae.latent_channels;
     const n = th * tw;
-    std.debug.assert(sub.len == c * n);
+    // ⚠️ **DERIVED, not `sd_vae.latent_channels`.** That constant is 4, and the same
+    // decoder body also runs Z-Image's 16-channel Flux latent. Hardcoding it
+    // transposed only the first quarter of the latent and left the rest reading
+    // whatever followed — which rendered as a band of colour noise across the top of
+    // an otherwise flat grey image, with the assert below compiled out in ReleaseFast.
+    // `vae_tiled.decode` already derives its channel count the same way.
+    std.debug.assert(n != 0 and sub.len % n == 0);
+    const c = sub.len / n;
     const z = try gpa.alloc(f32, sub.len);
     defer gpa.free(z);
     for (0..n) |px| {
@@ -615,7 +633,8 @@ const KreaVae = struct {
     vae: *const wan_vae.Decoder,
     /// 128² latent tiles (~1 MP): caps the mid-block scores plane at 512 MiB.
     const tiling: vae_tiled.Params = .{};
-    fn estimate(self: KreaVae, zh: usize, zw: usize) u64 {
+    fn estimate(self: KreaVae, zh: usize, zw: usize, scores_resident: bool) u64 {
+        _ = scores_resident; // wan_vae's estimator has no scores-plane term
         return self.vae.estimatePeakBytes(zh, zw);
     }
     fn cudaCtx(self: KreaVae, be: *cuda.Backend, cancel: ?*std.atomic.Value(bool)) CudaTile {
@@ -639,8 +658,12 @@ const SdVae = struct {
     /// (512² pixels) costs 3 x 256 MiB and is also what ComfyUI's tiled SD decode
     /// defaults to; overlap 8 keeps its 25% seam ratio.
     const tiling: vae_tiled.Params = .{ .tile = 64, .overlap = 8 };
-    fn estimate(self: SdVae, zh: usize, zw: usize) u64 {
-        return self.vae.estimatePeakBytes(zh, zw);
+    /// `scores_resident` doubles as "this is the Vulkan arm": it is the only
+    /// backend that materializes the scores plane, and also the only one that has
+    /// not been taught f16 activation storage. Kept as one flag rather than two so
+    /// they cannot be set inconsistently.
+    fn estimate(self: SdVae, zh: usize, zw: usize, scores_resident: bool) u64 {
+        return self.vae.estimatePeakBytes(zh, zw, scores_resident, self.vae.cfg.act_f16 and !scores_resident);
     }
     fn cudaCtx(self: SdVae, be: *cuda.Backend, cancel: ?*std.atomic.Value(bool)) SdCudaTile {
         return .{ .vae = self.vae, .be = be, .cancel = cancel };
@@ -682,6 +705,17 @@ const max_reclaim_rounds: usize = 16;
 /// `else => return err` arm and hard-fail the decode even though a CPU tiled
 /// decode would have succeeded. `error.Canceled` and any structural error still
 /// propagate (we never want to mask those behind a silent CPU fallback).
+/// Why the ladder is stepping down, for the progress log. ⚠️ Not cosmetic: every
+/// rung used to say "OOM", which is a wrong diagnosis for a decode that came back
+/// non-finite and would send the next reader hunting for a memory problem that is
+/// not there.
+fn decodeStepReason(err: anyerror) []const u8 {
+    return switch (err) {
+        error.GpuDecodeNonFinite => "produced non-finite values",
+        else => "ran out of VRAM",
+    };
+}
+
 fn recoverableDecodeErr(err: anyerror) bool {
     return switch (err) {
         error.DeviceOutOfMemory,
@@ -689,6 +723,10 @@ fn recoverableDecodeErr(err: anyerror) bool {
         error.CudaError,
         error.CublasLtError,
         error.CudnnError,
+        // A device decode whose output came back non-finite (`sd_vae_gpu` checks and
+        // reports rather than returning a buffer `planarF32ToRgb8` would clamp to
+        // white). The CPU tier of the ladder is exact, so this must reach it.
+        error.GpuDecodeNonFinite,
         => true,
         else => false,
     };
@@ -763,6 +801,29 @@ pub const Denoiser = struct {
     /// planar layout by `channelLastToPlanar`.
     sd_eps: ?[]f32 = null,
 
+    /// Z-Image's caption half — `cap_embedder` + pad + both `context_refiner`
+    /// blocks — one per branch.
+    ///
+    /// ⚠️ Cached because it is genuinely constant across steps, and that is a
+    /// property of the architecture rather than an optimization guess: the
+    /// `context_refiner` blocks are built with `modulation=False`, so the text half
+    /// never sees the timestep. Recomputing it per step would add two full attention
+    /// blocks over the caption to every step for an identical result.
+    zi_cap_pos: ?[]f32 = null,
+    zi_cap_neg: ?[]f32 = null,
+    /// Padded caption length, i.e. how many rows of the joint sequence the text half
+    /// occupies. The image half starts here.
+    zi_cap_padded: usize = 0,
+    /// Z-Image's Vulkan state, when the device can run its GEMMs. Null means the
+    /// trunk runs on the CPU — which is also the case on every CUDA backend, which
+    /// has no Z-Image forward at all yet.
+    zi_vk: ?zimage_gpu.Session = null,
+    zi_vk_neg: ?zimage_gpu.Session = null,
+    zi_vk_ws: ?zimage_gpu.Workspace = null,
+    zi_cu: ?zimage_cuda.Session = null,
+    zi_cu_neg: ?zimage_cuda.Session = null,
+    zi_cu_ws: ?zimage_cuda.Workspace = null,
+
     pub fn deinit(self: *Denoiser, gpa: std.mem.Allocator) void {
         if (self.v_neg) |b| gpa.free(b);
         if (self.sd_ws) |*w| w.deinit();
@@ -778,6 +839,14 @@ pub const Denoiser = struct {
         if (self.sd_cu_ws) |*w| w.deinit(self.sess.cu_be.?);
         if (self.sd_scaled) |b| gpa.free(b);
         if (self.sd_eps) |b| gpa.free(b);
+        if (self.zi_cap_pos) |b| gpa.free(b);
+        if (self.zi_cap_neg) |b| gpa.free(b);
+        if (self.zi_vk) |*x| x.deinit(gpa, self.sess.gpu_ctx.?);
+        if (self.zi_vk_neg) |*x| x.deinit(gpa, self.sess.gpu_ctx.?);
+        if (self.zi_vk_ws) |*w| w.deinit(self.sess.gpu_ctx.?);
+        if (self.zi_cu) |*x| x.deinit(gpa, self.sess.cu_be.?);
+        if (self.zi_cu_neg) |*x| x.deinit(gpa, self.sess.cu_be.?);
+        if (self.zi_cu_ws) |*w| w.deinit(self.sess.cu_be.?);
         if (self.vk_pos) |*s| s.deinit(gpa, self.sess.gpu_ctx.?);
         if (self.vk_neg) |*s| s.deinit(gpa, self.sess.gpu_ctx.?);
         if (self.vk_ws) |*w| w.deinit(self.sess.gpu_ctx.?);
@@ -824,6 +893,7 @@ pub const Denoiser = struct {
         const s = self.sess;
         const io = s.io;
         if (s.family().isSd()) return self.predictSd(gpa, v_out, latent, sigma, step, cancel);
+        if (s.family() == .zimage) return self.predictZImage(gpa, v_out, latent, sigma, cancel);
         const dit = &s.models.krea2.dit;
         std.debug.assert(v_out.len == wan_vae.latent_channels * self.lat_h * self.lat_w);
         std.debug.assert(latent.len == v_out.len);
@@ -845,6 +915,55 @@ pub const Denoiser = struct {
         } else {
             try dit.forward(io, gpa, v_neg, latent, self.lat_h, self.lat_w, sigma, self.cond_neg.?.data, self.cond_neg.?.seq, cancel);
         }
+        sampler.applyCfg(v_out, v_neg, self.cfg);
+    }
+
+    /// Z-Image's forward: the timestep vector, then the image half and the joint
+    /// trunk on top of the cached caption half.
+    ///
+    /// No input pre-scaling and no timestep inversion — it is flow matching, like
+    /// krea2, so the sampler's sigma reaches the model directly (`NextDiT` turns it
+    /// into `1 - sigma` itself). The output is the trajectory derivative, which is
+    /// what makes CFG mixing valid here for the same reason it is for krea2.
+    fn predictZImage(
+        self: *Denoiser,
+        gpa: std.mem.Allocator,
+        v_out: []f32,
+        latent: []const f32,
+        sigma: f32,
+        cancel: ?*std.atomic.Value(bool),
+    ) !void {
+        const s = self.sess;
+        const dit = &s.models.zimage.dit;
+        std.debug.assert(v_out.len == zimage.latent_channels * self.lat_h * self.lat_w);
+        std.debug.assert(latent.len == v_out.len);
+
+        if (self.zi_cu) |*cu| {
+            const b = s.cu_be.?;
+            try zimage_cuda.forward(dit, b, cu, &self.zi_cu_ws.?, s.io, gpa, v_out, latent, sigma, cancel);
+            if (self.cfg == 1.0) return;
+            const v_neg = self.v_neg.?;
+            try zimage_cuda.forward(dit, b, &self.zi_cu_neg.?, &self.zi_cu_ws.?, s.io, gpa, v_neg, latent, sigma, cancel);
+            sampler.applyCfg(v_out, v_neg, self.cfg);
+            return;
+        }
+        if (self.zi_vk) |*vk| {
+            const gc = s.gpu_ctx.?;
+            try zimage_gpu.forward(dit, gc, vk, &self.zi_vk_ws.?, s.io, gpa, v_out, latent, sigma, cancel);
+            if (self.cfg == 1.0) return;
+            const v_neg = self.v_neg.?;
+            try zimage_gpu.forward(dit, gc, &self.zi_vk_neg.?, &self.zi_vk_ws.?, s.io, gpa, v_neg, latent, sigma, cancel);
+            sampler.applyCfg(v_out, v_neg, self.cfg);
+            return;
+        }
+
+        const adaln = try dit.adalnInput(s.io, gpa, sigma);
+        defer gpa.free(adaln);
+        try dit.predict(s.io, gpa, v_out, latent, self.lat_h, self.lat_w, self.zi_cap_pos.?, self.zi_cap_padded, adaln, cancel);
+        if (self.cfg == 1.0) return;
+
+        const v_neg = self.v_neg.?;
+        try dit.predict(s.io, gpa, v_neg, latent, self.lat_h, self.lat_w, self.zi_cap_neg.?, self.zi_cap_padded, adaln, cancel);
         sampler.applyCfg(v_out, v_neg, self.cfg);
     }
 
@@ -990,29 +1109,23 @@ pub fn planSchedule(
     return .{ .texts = uniq.items, .at = at };
 }
 
-/// The DiT's checkpoint container, which may be either format.
+/// A checkpoint container, which may be either format — used for every component
+/// that can arrive as its own file (denoiser, text encoder, VAE).
 ///
 /// ggufy emits both — int4/int8 cluster formats as safetensors, the ggml block
 /// quants as GGUF — and until this existed only the safetensors half could be
 /// loaded, so the GGUF half of the quantization work could not be run or measured
 /// at all. `dit.DiT.load` takes a `WeightStore`, so the only thing missing was
 /// opening the file.
-/// `Context.WeightReader` over a plain safetensors store — the encoder/VAE twin of
-/// `DitContainer.weightReader`. See `SafeTensors.readTo`.
-fn storeReader(opt: *?safetensors.SafeTensors) ?cuda.Context.WeightReader {
-    const st = if (opt.*) |*v| v else return null;
-    return .{
-        .ctx = st,
-        .read = struct {
-            fn read(ctx: *anyopaque, dst: []u8, src: []const u8) bool {
-                const s2: *const safetensors.SafeTensors = @ptrCast(@alignCast(ctx));
-                return s2.readTo(dst, src);
-            }
-        }.read,
-    };
+/// `Context.WeightReader` over an optional side-file container — the encoder/VAE
+/// twin of `Container.weightReader`, which it now simply delegates to. See
+/// `SafeTensors.readTo`.
+fn storeReader(opt: *?Container) ?cuda.Context.WeightReader {
+    const c = if (opt.*) |*v| v else return null;
+    return c.weightReader();
 }
 
-pub const DitContainer = union(enum) {
+pub const Container = union(enum) {
     safetensors: safetensors.SafeTensors,
     gguf: gguf_mod.Gguf,
 
@@ -1024,7 +1137,7 @@ pub const DitContainer = union(enum) {
     /// GGUF returns null for now: same idea applies, but the DiT GGUF path is
     /// CPU-only today (no GPU block-quant GEMM), so it never reaches this staging
     /// ring and wiring it would be untestable here.
-    pub fn weightReader(self: *DitContainer) ?cuda.Context.WeightReader {
+    pub fn weightReader(self: *Container) ?cuda.Context.WeightReader {
         return switch (self.*) {
             .safetensors => |*st| .{
                 .ctx = st,
@@ -1044,11 +1157,11 @@ pub const DitContainer = union(enum) {
     /// name because the failure mode of guessing wrong is a baffling error from the
     /// other parser — handing a GGUF to the safetensors reader reports
     /// `InvalidHeader`, which says nothing about what actually happened.
-    pub fn open(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !DitContainer {
+    pub fn open(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !Container {
         return openIn(gpa, io, std.Io.Dir.cwd(), path);
     }
 
-    pub fn openIn(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) !DitContainer {
+    pub fn openIn(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) !Container {
         var magic: [4]u8 = undefined;
         {
             const f = try dir.openFile(io, path, .{ .mode = .read_only });
@@ -1062,7 +1175,7 @@ pub const DitContainer = union(enum) {
         return .{ .safetensors = try safetensors.SafeTensors.openIn(gpa, io, dir, path) };
     }
 
-    pub fn deinit(self: *DitContainer) void {
+    pub fn deinit(self: *Container) void {
         switch (self.*) {
             .safetensors => |*st| st.deinit(),
             .gguf => |*g| g.deinit(),
@@ -1072,7 +1185,7 @@ pub const DitContainer = union(enum) {
     /// A store view. Takes a pointer because the containers hold interior
     /// pointers into their own mappings; the `Session` keeps this at a stable
     /// address for exactly that reason.
-    pub fn store(self: *const DitContainer) weights_mod.WeightStore {
+    pub fn store(self: *const Container) weights_mod.WeightStore {
         return switch (self.*) {
             .safetensors => |*st| .{ .safetensors = st },
             .gguf => |*g| .{ .gguf = g },
@@ -1080,7 +1193,7 @@ pub const DitContainer = union(enum) {
     }
 
     /// Tensor-data bytes — what the VRAM pinning policy sizes itself against.
-    pub fn payloadLen(self: *const DitContainer) usize {
+    pub fn payloadLen(self: *const Container) usize {
         return switch (self.*) {
             .safetensors => |*st| st.payload.len,
             .gguf => |*g| g.payload.len,
@@ -1097,17 +1210,22 @@ pub const DitContainer = union(enum) {
 /// deinit for the CLI / tests. NOT thread-safe: serialize `generate` calls.
 /// Open `path` only when the caller actually gave one: an empty path means "not
 /// specified", and the component is then expected in the primary checkpoint.
-fn openIfGiven(gpa: std.mem.Allocator, io: std.Io, path: []const u8, explicit: bool) !?safetensors.SafeTensors {
+/// Open a side-file component if one was given. ⚠️ Goes through `Container`, so a
+/// side file is opened by **magic** and may be a GGUF — a `.gguf` text encoder used
+/// to die with `InvalidHeader` from the safetensors parser, an error that says
+/// nothing about what happened (the same trap `Container.open` exists to avoid for
+/// the denoiser).
+fn openIfGiven(gpa: std.mem.Allocator, io: std.Io, path: []const u8, explicit: bool) !?Container {
     if (path.len == 0) return null;
-    if (explicit) return try safetensors.SafeTensors.open(gpa, io, path);
+    if (explicit) return try Container.open(gpa, io, path);
     // A *defaulted* path may simply not exist (a box with only SD checkpoints has no
     // krea2 VAE), and that is not an error as long as the primary checkpoint carries
     // the component. An explicit path that cannot be opened still fails loudly.
-    return safetensors.SafeTensors.open(gpa, io, path) catch null;
+    return Container.open(gpa, io, path) catch null;
 }
 
-fn storeOf(st: *?safetensors.SafeTensors) ?weights_mod.WeightStore {
-    if (st.*) |*s| return .{ .safetensors = s };
+fn storeOf(st: *?Container) ?weights_mod.WeightStore {
+    if (st.*) |*s| return s.store();
     return null;
 }
 
@@ -1138,43 +1256,64 @@ const Resolved = struct {
     from_primary: bool,
 };
 
-/// Prefix spellings a component is found under, and a tensor that proves it. Ordered
-/// most-specific first, so a bundled checkpoint's nested spelling wins over a bare one
-/// that could also match by accident.
-const ComponentSpec = struct { prefixes: []const []const u8, probe: []const u8 };
+/// Prefix spellings a component is found under, and tensors that prove it. Both lists
+/// are ordered most-specific first, so a bundled checkpoint's nested spelling wins over
+/// a bare one that could also match by accident.
+///
+/// ⚠️ `probes` is a LIST because a component's own tensor names are not the same in
+/// every container. A GGUF text encoder is `embed_tokens.weight` where safetensors is
+/// `model.embed_tokens.weight` — `canonicalName` strips llama.cpp's `blk.N.` spelling
+/// but there is no `model.` to restore, and with one probe a `.gguf` encoder resolved
+/// to nothing and reported `ComponentNotInCheckpoint`.
+pub const ComponentSpec = struct { prefixes: []const []const u8, probes: []const []const u8 };
 
-fn componentSpec(fam: Family, comp: Component) error{NoSuchComponent}!ComponentSpec {
+pub fn componentSpec(fam: Family, comp: Component) error{NoSuchComponent}!ComponentSpec {
     return switch (fam) {
         .krea2 => switch (comp) {
-            .denoiser => .{ .prefixes = &.{ "model.diffusion_model.", "" }, .probe = "blocks.0.attn.wq.weight" },
-            .conditioner => .{ .prefixes = &.{ "text_encoders.", "" }, .probe = "model.language_model.embed_tokens.weight" },
-            .decoder => .{ .prefixes = &.{ "first_stage_model.", "vae.", "" }, .probe = "decoder.conv1.weight" },
+            .denoiser => .{ .prefixes = &.{ "model.diffusion_model.", "" }, .probes = &.{"blocks.0.attn.wq.weight"} },
+            .conditioner => .{ .prefixes = &.{ "text_encoders.", "" }, .probes = &.{ "model.language_model.embed_tokens.weight", "embed_tokens.weight" } },
+            .decoder => .{ .prefixes = &.{ "first_stage_model.", "vae.", "" }, .probes = &.{"decoder.conv1.weight"} },
             .conditioner2 => error.NoSuchComponent,
         },
         .sd15 => switch (comp) {
-            .denoiser => .{ .prefixes = &.{ "model.diffusion_model.", "" }, .probe = "input_blocks.0.0.weight" },
+            .denoiser => .{ .prefixes = &.{ "model.diffusion_model.", "" }, .probes = &.{"input_blocks.0.0.weight"} },
             .conditioner => .{
                 // LDM bundle, then a bare HF text-encoder export.
                 .prefixes = &.{ "cond_stage_model.transformer.text_model.", "text_model.", "" },
-                .probe = "final_layer_norm.weight",
+                .probes = &.{"final_layer_norm.weight"},
             },
-            .decoder => .{ .prefixes = &.{ "first_stage_model.", "" }, .probe = "decoder.conv_in.weight" },
+            .decoder => .{ .prefixes = &.{ "first_stage_model.", "" }, .probes = &.{"decoder.conv_in.weight"} },
+            .conditioner2 => error.NoSuchComponent,
+        },
+        // Z-Image ships as three separate files in the official layout, but the
+        // resolver is the same: each component is looked for in the primary
+        // checkpoint first and in a side file second.
+        //
+        // ⚠️ The conditioner probe is `model.embed_tokens.weight`, NOT krea2's
+        // `model.language_model.embed_tokens.weight`: krea2 uses the Qwen3-**VL**
+        // checkpoint, whose language model is nested a level deeper. Feeding either
+        // encoder to the other family resolves to nothing and reports it, which is
+        // the point of probing rather than assuming.
+        .zimage => switch (comp) {
+            .denoiser => .{ .prefixes = &.{ "model.diffusion_model.", "" }, .probes = &.{"cap_embedder.1.weight"} },
+            .conditioner => .{ .prefixes = &.{ "text_encoders.", "" }, .probes = &.{ "model.embed_tokens.weight", "embed_tokens.weight" } },
+            .decoder => .{ .prefixes = &.{ "first_stage_model.", "vae.", "" }, .probes = &.{"decoder.conv_in.weight"} },
             .conditioner2 => error.NoSuchComponent,
         },
         // SDXL bundles its two towers under `conditioner.embedders.{0,1}` — and the two
         // are spelled differently *within one file*: embedder 0 is a `transformers`
         // CLIPTextModel, embedder 1 an OpenCLIP tower. Hence the different probes.
         .sdxl => switch (comp) {
-            .denoiser => .{ .prefixes = &.{ "model.diffusion_model.", "" }, .probe = "input_blocks.0.0.weight" },
+            .denoiser => .{ .prefixes = &.{ "model.diffusion_model.", "" }, .probes = &.{"input_blocks.0.0.weight"} },
             .conditioner => .{
                 .prefixes = &.{ "conditioner.embedders.0.transformer.text_model.", "text_model.", "" },
-                .probe = "final_layer_norm.weight",
+                .probes = &.{"final_layer_norm.weight"},
             },
             .conditioner2 => .{
                 .prefixes = &.{ "conditioner.embedders.1.model.", "" },
-                .probe = "ln_final.weight",
+                .probes = &.{"ln_final.weight"},
             },
-            .decoder => .{ .prefixes = &.{ "first_stage_model.", "" }, .probe = "decoder.conv_in.weight" },
+            .decoder => .{ .prefixes = &.{ "first_stage_model.", "" }, .probes = &.{"decoder.conv_in.weight"} },
         },
     };
 }
@@ -1224,10 +1363,17 @@ fn resolveComponent(
         const store = maybe.?;
         for (spec.prefixes) |pfx| {
             var buf: [256]u8 = undefined;
-            if (pfx.len + spec.probe.len > buf.len) continue;
-            @memcpy(buf[0..pfx.len], pfx);
-            @memcpy(buf[pfx.len..][0..spec.probe.len], spec.probe);
-            if (store.get(buf[0 .. pfx.len + spec.probe.len]) == null) continue;
+            var hit = false;
+            for (spec.probes) |probe| {
+                if (pfx.len + probe.len > buf.len) continue;
+                @memcpy(buf[0..pfx.len], pfx);
+                @memcpy(buf[pfx.len..][0..probe.len], probe);
+                if (store.get(buf[0 .. pfx.len + probe.len]) != null) {
+                    hit = true;
+                    break;
+                }
+            }
+            if (!hit) continue;
 
             if (pfx.len == 0) return .{ .store = store, .from_primary = false };
             const view = try gpa.create(weights_mod.Prefixed);
@@ -1257,7 +1403,7 @@ fn reportResolve(
     return resolveComponent(gpa, fam, comp, primary, side, side_is_explicit) catch |err| {
         if (err == error.ComponentNotInCheckpoint) std.log.err(
             "{t} not found: the checkpoint has no '{s}' under any known prefix, and '{s}' does not supply one either",
-            .{ comp, (try componentSpec(fam, comp)).probe, side_path },
+            .{ comp, (try componentSpec(fam, comp)).probes[0], side_path },
         );
         return err;
     };
@@ -1279,6 +1425,11 @@ pub const Family = enum {
     krea2,
     sd15,
     sdxl,
+    /// Z-Image (`NextDiT`), the architecture "zit" checkpoints use. Flow matching
+    /// like krea2, and it shares krea2's Qwen3-4B text encoder body — but a
+    /// different tap, a different RoPE theta, a 16-channel `AutoencoderKL` rather
+    /// than the Wan VAE, and its own 1000-rung sigma table. See `models/zimage.zig`.
+    zimage,
 
     /// Whether this family runs the `sd_unet` / `sd_vae` / CLIP stack, i.e. whether
     /// `Session.sd()` returns a model set. SD1.5 and SDXL differ only in configuration
@@ -1292,12 +1443,12 @@ pub const Family = enum {
 pub const Krea2Models = struct {
     tok: tokenizer_mod.Tokenizer,
     /// Null when the conditioner came out of the primary checkpoint.
-    enc_st: ?safetensors.SafeTensors,
+    enc_st: ?Container,
     enc: qwen3.TextEncoder,
-    dit_st: DitContainer,
+    dit_st: Container,
     dit: dit_mod.DiT,
     /// Null when the decoder came out of the primary checkpoint.
-    vae_st: ?safetensors.SafeTensors,
+    vae_st: ?Container,
     vae: wan_vae.Decoder,
     /// Prefix views, when a component was nested inside its container.
     enc_view: ?*weights_mod.Prefixed,
@@ -1315,11 +1466,11 @@ pub const Krea2Models = struct {
 /// verbatim rather than duplicated per family.
 pub const SdModels = struct {
     tok: clip_tok.Tokenizer,
-    unet_st: DitContainer,
+    unet_st: Container,
     /// Null when that component came out of the primary checkpoint.
-    enc_st: ?safetensors.SafeTensors,
-    enc2_st: ?safetensors.SafeTensors,
-    vae_st: ?safetensors.SafeTensors,
+    enc_st: ?Container,
+    enc2_st: ?Container,
+    vae_st: ?Container,
     clip: clip_text.TextEncoder,
     /// SDXL's OpenCLIP bigG tower. Null for SD1.5.
     clip_g: ?clip_text.TextEncoder,
@@ -1342,6 +1493,23 @@ pub const SdModels = struct {
     empty_ref_g: ?[]f32 = null,
 };
 
+/// Z-Image: a denoiser-only checkpoint plus Qwen3-4B and the 16-channel Flux VAE,
+/// each normally in a file of its own — the shape the official ComfyUI template
+/// distributes it in. Structurally krea2's set with two of the three models swapped.
+pub const ZImageModels = struct {
+    tok: tokenizer_mod.Tokenizer,
+    /// Null when that component came out of the primary checkpoint.
+    enc_st: ?Container,
+    enc: qwen3.TextEncoder,
+    dit_st: Container,
+    dit: zimage.DiT,
+    vae_st: ?Container,
+    vae: sd_vae.Decoder,
+    /// Prefix views, when a component was nested inside its container.
+    enc_view: ?*weights_mod.Prefixed,
+    vae_view: ?*weights_mod.Prefixed,
+};
+
 /// The loaded model set, tagged by family. A named type rather than an anonymous
 /// union in the field: an inline `union(Family)` there makes the compiler derive its
 /// name from the first field's type and then report a dependency loop.
@@ -1349,6 +1517,7 @@ pub const Models = union(Family) {
     krea2: Krea2Models,
     sd15: SdModels,
     sdxl: SdModels,
+    zimage: ZImageModels,
 };
 
 /// Which family a denoiser checkpoint belongs to, from its tensor names alone.
@@ -1370,6 +1539,18 @@ pub fn detectFamily(store: weights_mod.WeightStore) !Family {
     if (store.get("input_blocks.0.0.weight") != null) return .sd15;
     if (store.get("model.diffusion_model.blocks.0.attn.wq.weight") != null) return .krea2;
     if (store.get("blocks.0.attn.wq.weight") != null) return .krea2;
+    // Z-Image. ⚠️ Both tensors, which is ComfyUI's own test
+    // (`model_detection.py`): `cap_embedder.1.weight` alone is shared with stock
+    // Lumina 2 and with OmniGen2, and the `noise_refiner` qk-norm is what says this
+    // is the NextDiT shape rather than one of those. The width (3840) is then what
+    // distinguishes Z-Image from Lumina 2, and `zimage.DiT.load` checks it.
+    for ([_][]const u8{ "model.diffusion_model.", "" }) |pfx| {
+        var b1: [96]u8 = undefined;
+        var b2: [96]u8 = undefined;
+        const cap = std.fmt.bufPrint(&b1, "{s}cap_embedder.1.weight", .{pfx}) catch continue;
+        const ref = std.fmt.bufPrint(&b2, "{s}noise_refiner.0.attention.k_norm.weight", .{pfx}) catch continue;
+        if (store.get(cap) != null and store.get(ref) != null) return .zimage;
+    }
     return error.UnknownArchitecture;
 }
 
@@ -1378,7 +1559,7 @@ fn sdConfigs(fam: Family) struct { unet: sd_unet.Config, vae: sd_vae.Config, cli
     return switch (fam) {
         .sd15 => .{ .unet = sd_unet.sd15, .vae = sd_vae.sd15, .clip = clip_text.clip_l },
         .sdxl => .{ .unet = sd_unet.sdxl, .vae = sd_vae.sdxl, .clip = clip_text.clip_l },
-        .krea2 => unreachable,
+        .krea2, .zimage => unreachable,
     };
 }
 
@@ -1398,9 +1579,44 @@ fn sdConfigs(fam: Family) struct { unet: sd_unet.Config, vae: sd_vae.Config, cli
 /// three properties that decide it are documented on `clip_text.TextEncoder`: a fixed token
 /// window, rows the denoiser cross-attends to 1:1, and an empty-prompt encode of the same
 /// shape to interpolate against.
+/// Where a family's side components live when the caller did not name one.
+///
+/// ⚠️ `Options`' own `text_encoder_path` / `vae_path` defaults are **krea2's**, and
+/// they predate there being more than one family. Handing them to another
+/// architecture is exactly the failure the `explicit_*` flags exist to prevent — the
+/// resolver would open krea2's Qwen3-**VL** encoder, look for Z-Image's
+/// `model.embed_tokens.weight` in it and report `ComponentNotInCheckpoint`. So a
+/// defaulted path is chosen per family here, and only an *explicit* one overrides it.
+///
+/// Both Z-Image paths are what the official ComfyUI template names.
+pub fn defaultComponentPath(fam: Family, comp: Component) []const u8 {
+    return switch (fam) {
+        .zimage => switch (comp) {
+            .conditioner => "models/text_encoders/qwen_3_4b.safetensors",
+            .decoder => "models/vae/ae.safetensors",
+            else => "",
+        },
+        else => "",
+    };
+}
+
+/// The sigma-schedule shift a family was trained with, for a caller that did not ask
+/// for one. The SD arm's value is unused — its ladder comes from the betas — and is
+/// returned only so this is total.
+pub fn defaultShift(fam: Family) f32 {
+    return switch (fam) {
+        .krea2 => sampler.default_shift,
+        .zimage => sampler.schedule_mod.z_image_shift,
+        .sd15, .sdxl => sampler.default_shift,
+    };
+}
+
 pub fn supportsPromptWeights(fam: Family) bool {
     return switch (fam) {
-        .krea2 => qwen3.TextEncoder.supports_prompt_weights,
+        // Z-Image conditions on a Qwen3 hidden state exactly as krea2 does, so it
+        // inherits the same answer from the same encoder type — and for the same
+        // structural reason, not by analogy.
+        .krea2, .zimage => qwen3.TextEncoder.supports_prompt_weights,
         .sd15, .sdxl => clip_text.TextEncoder.supports_prompt_weights,
     };
 }
@@ -1422,11 +1638,11 @@ pub const Session = struct {
     // Models + their (kept-open) checkpoint mappings. Held at stable addresses
     // inside this heap-allocated struct so the models' pointers into the mmaps
     // stay valid for the whole session. The DiT's container may be safetensors or
-    // GGUF (`DitContainer`); the encoder and VAE are safetensors-only.
+    // GGUF (`Container`); the encoder and VAE are safetensors-only.
     tok: tokenizer_mod.Tokenizer,
     enc_st: safetensors.SafeTensors,
     enc: qwen3.TextEncoder,
-    dit_st: DitContainer,
+    dit_st: Container,
     dit: dit_mod.DiT,
     vae_st: safetensors.SafeTensors,
     vae: wan_vae.Decoder,
@@ -1442,11 +1658,16 @@ pub const Session = struct {
         return &self.models.krea2;
     }
 
+    /// Z-Image's model set, asserting the family.
+    fn zi(self: *Session) *ZImageModels {
+        return &self.models.zimage;
+    }
+
     /// The SD-family model set, or null for krea2. Both SD arms hold the same struct
     /// type, so every shared stage binds this once and needs no further family test.
     pub fn sd(self: *Session) ?*SdModels {
         return switch (self.models) {
-            .krea2 => null,
+            .krea2, .zimage => null,
             .sd15 => |*m| m,
             .sdxl => |*m| m,
         };
@@ -1458,6 +1679,7 @@ pub const Session = struct {
     pub fn denoiserStore(self: *const Session) weights_mod.WeightStore {
         return switch (self.models) {
             .krea2 => |*m| m.dit_st.store(),
+            .zimage => |*m| m.dit_st.store(),
             .sd15, .sdxl => |*m| m.unet_st.store(),
         };
     }
@@ -1466,6 +1688,7 @@ pub const Session = struct {
     fn denoiserPayloadLen(self: *const Session) usize {
         return switch (self.models) {
             .krea2 => |*m| m.dit_st.payloadLen(),
+            .zimage => |*m| m.dit_st.payloadLen(),
             .sd15, .sdxl => |*m| m.unet_st.payloadLen(),
         };
     }
@@ -1536,7 +1759,7 @@ pub const Session = struct {
         // and its names are what `detectFamily` reads.
         try note(progress, "loading diffusion model...\n", .{});
         const t0 = std.Io.Clock.real.now(io).nanoseconds;
-        var den_st = try DitContainer.open(gpa, io, opts.dit_path);
+        var den_st = try Container.open(gpa, io, opts.dit_path);
         errdefer den_st.deinit();
         const fam = try detectFamily(den_st.store());
 
@@ -1584,6 +1807,52 @@ pub const Session = struct {
                 m.vae = try wan_vae.Decoder.load(gpa, vae_r.store);
                 t2 = std.Io.Clock.real.now(io).nanoseconds;
                 self.models = .{ .krea2 = m };
+            },
+            .zimage => {
+                var m: ZImageModels = .{
+                    .tok = undefined,
+                    .enc_st = null,
+                    .enc = undefined,
+                    .dit_st = den_st,
+                    .dit = undefined,
+                    .vae_st = null,
+                    .vae = undefined,
+                    .enc_view = null,
+                    .vae_view = null,
+                };
+                const den = try reportResolve(gpa, fam, .denoiser, m.dit_st.store(), null, false, opts.dit_path);
+                m.dit = try zimage.DiT.load(gpa, den.store, zimage.z_image);
+                errdefer m.dit.deinit();
+                // The DiT loader detects its own prefix, so the resolver's view is
+                // not needed past this point.
+                if (den.view) |v| {
+                    v.deinit(gpa);
+                    gpa.destroy(v);
+                }
+                t1 = std.Io.Clock.real.now(io).nanoseconds;
+
+                try note(progress, "loading text encoder...\n", .{});
+                // The same Qwen2 BPE vocabulary krea2 uses — Z-Image's ComfyUI
+                // tokenizer is `Qwen2Tokenizer` over the qwen2.5 vocab.
+                m.tok = try tokenizer_mod.Tokenizer.init(gpa);
+                errdefer m.tok.deinit();
+
+                const te_path = if (opts.explicit_text_encoder) opts.text_encoder_path else defaultComponentPath(fam, .conditioner);
+                m.enc_st = try openIfGiven(gpa, io, te_path, opts.explicit_text_encoder);
+                errdefer if (m.enc_st) |*st| st.deinit();
+                const enc_r = try reportResolve(gpa, fam, .conditioner, m.dit_st.store(), storeOf(&m.enc_st), opts.explicit_text_encoder, te_path);
+                m.enc_view = enc_r.view;
+                m.enc = try qwen3.TextEncoder.loadVariant(gpa, enc_r.store, .zimage);
+                errdefer m.enc.deinit();
+
+                const vae_path = if (opts.explicit_vae) opts.vae_path else defaultComponentPath(fam, .decoder);
+                m.vae_st = try openIfGiven(gpa, io, vae_path, opts.explicit_vae);
+                errdefer if (m.vae_st) |*st| st.deinit();
+                const vae_r = try reportResolve(gpa, fam, .decoder, m.dit_st.store(), storeOf(&m.vae_st), opts.explicit_vae, vae_path);
+                m.vae_view = vae_r.view;
+                m.vae = try sd_vae.Decoder.load(gpa, vae_r.store, sd_vae.flux, "");
+                t2 = std.Io.Clock.real.now(io).nanoseconds;
+                self.models = .{ .zimage = m };
             },
             .sd15, .sdxl => {
                 const cfgs = sdConfigs(fam);
@@ -1653,7 +1922,7 @@ pub const Session = struct {
                 self.models = switch (fam) {
                     .sd15 => .{ .sd15 = m },
                     .sdxl => .{ .sdxl = m },
-                    .krea2 => unreachable,
+                    .krea2, .zimage => unreachable,
                 };
             },
         }
@@ -1672,13 +1941,18 @@ pub const Session = struct {
             b.enableAsyncStreaming(io);
             // Feed the staging ring from the checkpoint FILE rather than its
             // mapping. The DiT is the one that matters (~13 GB, read once per
-            // image before it is pinned); see DitContainer.weightReader.
+            // image before it is pinned); see Container.weightReader.
             // Every checkpoint this session opened: each reader answers only for
             // its own mapping, so registering all of them just means whichever one
             // a weight came from serves it. Gated by `safetensors.read_mode` inside
             // `readTo`, so `--mmap mmap` turns the whole thing off.
             switch (self.models) {
                 .krea2 => |*m| {
+                    if (m.dit_st.weightReader()) |wr| b.ctx.addWeightReader(wr);
+                    if (storeReader(&m.enc_st)) |wr| b.ctx.addWeightReader(wr);
+                    if (storeReader(&m.vae_st)) |wr| b.ctx.addWeightReader(wr);
+                },
+                .zimage => |*m| {
                     if (m.dit_st.weightReader()) |wr| b.ctx.addWeightReader(wr);
                     if (storeReader(&m.enc_st)) |wr| b.ctx.addWeightReader(wr);
                     if (storeReader(&m.vae_st)) |wr| b.ctx.addWeightReader(wr);
@@ -1740,6 +2014,13 @@ pub const Session = struct {
             const fresh = try sd_unet.UNet.load(self.gpa, r.store, m.unet.cfg, "");
             m.unet.deinit();
             m.unet = fresh;
+            return;
+        }
+        if (self.family() == .zimage) {
+            const fresh = try zimage.DiT.load(self.gpa, store, zimage.z_image);
+            const m = self.zi();
+            m.dit.deinit();
+            m.dit = fresh;
             return;
         }
         const fresh = try dit_mod.DiT.load(self.gpa, store);
@@ -1885,6 +2166,19 @@ pub const Session = struct {
                 m.dit_st.deinit();
                 m.tok.deinit();
             },
+            .zimage => |*m| {
+                m.vae.deinit();
+                m.dit.deinit();
+                m.enc.deinit();
+                inline for (.{ &m.enc_view, &m.vae_view }) |slot| if (slot.*) |v| {
+                    v.deinit(gpa);
+                    gpa.destroy(v);
+                };
+                if (m.enc_st) |*st| st.deinit();
+                if (m.vae_st) |*st| st.deinit();
+                m.dit_st.deinit();
+                m.tok.deinit();
+            },
             .sd15, .sdxl => |*m| {
                 gpa.free(m.sigma_ladder);
                 if (m.empty_ref) |e| gpa.free(e);
@@ -1917,6 +2211,10 @@ pub const Session = struct {
     pub fn sigmaTable(self: *const Session, shift: f32) sampler.SigmaTable {
         return switch (self.models) {
             .krea2 => .{ .flux = shift },
+            // ⚠️ A DIFFERENT flow table, not `.flux` with a converted shift: 1000
+            // rungs against 10000, and the same formula rounded differently. See
+            // `schedule.discreteFlowSigma`.
+            .zimage => .{ .discrete_flow = shift },
             .sd15, .sdxl => |*m| .{ .discrete = m.sigma_ladder },
         };
     }
@@ -1948,6 +2246,19 @@ pub const Session = struct {
         return sampler.schedule_mod.build(gpa, table, sched orelse .defaultFor(table), steps);
     }
 
+    /// The shift this session's sigma table should use, honouring an explicit
+    /// request and otherwise taking the family's own trained value.
+    ///
+    /// ⚠️ Z-Image's is **3.0** (`supported_models.py::ZImage.sampling_settings`, and
+    /// the official ComfyUI template sets it again explicitly through a
+    /// `ModelSamplingAuraFlow` node). Rendering it on krea2's 1.15 is not an error —
+    /// it is a valid schedule that puts the steps in the wrong places, which at 8
+    /// steps is the difference between a finished image and a smeared one.
+    pub fn resolvedShift(self: *const Session, opts: Options) f32 {
+        if (opts.explicit_shift) return opts.shift;
+        return defaultShift(self.family());
+    }
+
     /// Scale a freshly drawn unit-normal latent to `sigmas[0]`, the way **this family**
     /// starts a trajectory. A method for the same reason `schedule` is one: the two
     /// parameterizations disagree and a caller that cannot see the family cannot pick.
@@ -1958,7 +2269,10 @@ pub const Session = struct {
     /// getting it wrong costs.
     pub fn scaleInitialNoise(self: *const Session, x: []f32, sigma0: f32) void {
         switch (self.models) {
-            .krea2 => sampler.scaleInitialNoise(x, sigma0),
+            // Both flow-matching families: a multiply by `sigma0`, which for both of
+            // them is exactly 1.0 at the top of the schedule (Z-Image's
+            // `time_snr_shift(3, 1)` is 3/3), so it is a bit-identical no-op.
+            .krea2, .zimage => sampler.scaleInitialNoise(x, sigma0),
             // ⚠️ Under `--compat a1111` this is the BARE sigma: A1111's
             // `sgm_noise_multiplier` defaults to False, and its own description of the
             // option ("match initial noise to official SDXL implementation - only useful
@@ -1978,7 +2292,7 @@ pub const Session = struct {
     /// wrong ODE. See `sampler.Parameterization`.
     pub fn parameterization(self: *const Session) sampler.Parameterization {
         return switch (self.models) {
-            .krea2 => .flow,
+            .krea2, .zimage => .flow,
             .sd15, .sdxl => .eps,
         };
     }
@@ -1988,6 +2302,7 @@ pub const Session = struct {
     pub fn latentChannels(self: *const Session) usize {
         return switch (self.models) {
             .krea2 => wan_vae.latent_channels,
+            .zimage => zimage.latent_channels,
             .sd15, .sdxl => |*m| m.unet.cfg.channels,
         };
     }
@@ -2000,6 +2315,9 @@ pub const Session = struct {
     pub fn latentPreviewInto(self: *const Session, rgb_out: []u8, z: []const f32, lat_h: usize, lat_w: usize) void {
         switch (self.models) {
             .krea2 => wan_vae.latentPreviewInto(rgb_out, z, lat_h, lat_w),
+            // Also 16 channels, but the Flux matrix and a non-zero bias — a
+            // different picture from krea2's Wan matrix, not a shared one.
+            .zimage => zimage.latentPreviewInto(rgb_out, z, lat_h, lat_w),
             .sd15 => sd_vae.latentPreviewInto(rgb_out, z, lat_h, lat_w, &sd_vae.latent_rgb_factors_sd15, sd_vae.latent_rgb_bias_sd15),
             .sdxl => sd_vae.latentPreviewInto(rgb_out, z, lat_h, lat_w, &sd_vae.latent_rgb_factors_sdxl, sd_vae.latent_rgb_bias_sdxl),
         }
@@ -2090,7 +2408,42 @@ pub const Session = struct {
                 return .{ .data = hidden, .seq = p.seq() };
             },
             .sdxl => |*m| return self.encodeSdxl(gpa, m, o, text),
+            .zimage => |*m| {
+                var ids: std.ArrayList(u32) = .empty;
+                defer ids.deinit(gpa);
+                try zimage_text.buildIds(&m.tok, gpa, text, &ids);
+                // ⚠️ No prefix strip, unlike krea2: Z-Image conditions on the WHOLE
+                // token sequence, chat markers included. See `zimage_text`.
+                const data = try self.runQwen3(gpa, &m.enc, ids.items, o);
+                return .{ .data = data, .seq = ids.items.len };
+            },
         }
+    }
+
+    /// One Qwen3 encode, dispatched by backend with the CPU forward as the fallback.
+    /// Shared by krea2's `encodePrompt` and Z-Image's arm above — the difference
+    /// between the two families is the tap list and the template, both of which are
+    /// already decided by the time this runs.
+    fn runQwen3(self: *Session, gpa: std.mem.Allocator, enc: *const qwen3.TextEncoder, ids: []const u32, o: EncodeOptions) ![]f32 {
+        if (self.cu_be) |b| {
+            // ⚠️ Only when the CUDA arm can actually run these weights: its encode
+            // GEMM is `opMatmulFp8` unconditionally, and Z-Image's Qwen3-4B ships
+            // bf16, which it would read as fp8 bytes and turn into noise.
+            if (qwen3_cuda.supportsWeights(enc)) {
+                return qwen3_cuda.encode(enc, b, self.io, gpa, ids, o.cancel) catch |err| {
+                    if (err == error.Canceled) return err;
+                    std.log.warn("cuda text encode failed ({t}); falling back to CPU (slow)", .{err});
+                    return enc.encode(self.io, gpa, ids, o.cancel);
+                };
+            }
+        } else if (self.gpu_ctx) |gc| {
+            return qwen3_gpu.encode(enc, gc, self.io, gpa, ids, o.encoder_f16, o.cancel) catch |err| {
+                if (err == error.Canceled) return err;
+                std.log.warn("vulkan text encode failed ({t}); falling back to CPU (slow)", .{err});
+                return enc.encode(self.io, gpa, ids, o.cancel);
+            };
+        }
+        return enc.encode(self.io, gpa, ids, o.cancel);
     }
 
     /// Tokenize one prompt text in the requested dialect. The A1111 path is two passes
@@ -2421,6 +2774,54 @@ pub const Session = struct {
             return d;
         }
 
+        if (self.family() == .zimage) {
+            const m = self.zi();
+            if (use_cfg) d.v_neg = try gpa.alloc(f32, zimage.latent_channels * lat_h * lat_w);
+            // ⚠️ Both branches must pad to the SAME caption length, or the image
+            // half's RoPE positions (which start at `cap_padded + 1`) would differ
+            // between the two CFG passes and the guidance would mix two different
+            // geometries. The pad multiple makes that automatic only when the two
+            // prompts land in the same bucket, so it is asserted rather than assumed.
+            d.zi_cap_pos = try m.dit.capTokens(self.io, gpa, cond_pos.data, cond_pos.seq);
+            d.zi_cap_padded = zimage.z_image.padded(cond_pos.seq);
+            if (cond_neg) |cn| {
+                if (zimage.z_image.padded(cn.seq) != d.zi_cap_padded) return error.CondLengthMismatch;
+                d.zi_cap_neg = try m.dit.capTokens(self.io, gpa, cn.data, cn.seq);
+            }
+
+            // ⚠️ **Vulkan only** — there is no CUDA Z-Image forward yet, and that case
+            // says so rather than being quietly 100x slow: a silent CPU trunk under
+            // `--backend cuda` reads as a hang, not as a fallback.
+            if (self.gpu_ctx) |gc| {
+                if (zimage_gpu.supported(gc, &m.dit)) {
+                    self.setMemTag(.latent);
+                    defer self.setMemTag(.dit);
+                    d.zi_vk = try zimage_gpu.Session.init(gpa, self.io, gc, &m.dit, lat_h, lat_w, d.zi_cap_pos.?, d.zi_cap_padded, sigmas);
+                    if (d.zi_cap_neg) |cn| {
+                        d.zi_vk_neg = try zimage_gpu.Session.init(gpa, self.io, gc, &m.dit, lat_h, lat_w, cn, d.zi_cap_padded, sigmas);
+                    }
+                    d.zi_vk_ws = try zimage_gpu.Workspace.init(gc, &m.dit, lat_h, lat_w, d.zi_cap_padded);
+                } else {
+                    std.log.warn("Z-Image: this device has no tensor-core pipeline for the DiT's " ++
+                        "weights; the trunk runs on the CPU. Expect CPU sampling speed.", .{});
+                }
+            } else if (self.cu_be) |b| {
+                if (zimage_cuda.supported(&m.dit)) {
+                    self.setMemTag(.latent);
+                    defer self.setMemTag(.dit);
+                    d.zi_cu = try zimage_cuda.Session.init(gpa, self.io, b, &m.dit, lat_h, lat_w, d.zi_cap_pos.?, d.zi_cap_padded, sigmas);
+                    if (d.zi_cap_neg) |cn| {
+                        d.zi_cu_neg = try zimage_cuda.Session.init(gpa, self.io, b, &m.dit, lat_h, lat_w, cn, d.zi_cap_padded, sigmas);
+                    }
+                    d.zi_cu_ws = try zimage_cuda.Workspace.init(b, &m.dit, lat_h, lat_w, d.zi_cap_padded);
+                } else {
+                    std.log.warn("Z-Image: this checkpoint's weight dtype has no CUDA GEMM path; " ++
+                        "the trunk runs on the CPU. Expect CPU sampling speed.", .{});
+                }
+            }
+            return d;
+        }
+
         if (use_cfg) d.v_neg = try gpa.alloc(f32, wan_vae.latent_channels * lat_h * lat_w);
 
         // The per-image device buffers (session + activation workspace) are the
@@ -2509,6 +2910,32 @@ pub const Session = struct {
             defer gpa.free(x);
             const inv = 1.0 / m.vae.cfg.scaling_factor;
             for (x) |*v| v.* *= inv;
+            try note(progress, "decoding latent...\n", .{});
+            const dec_start = std.Io.Clock.real.now(io);
+            const planar = try self.decodePlanar(SdVae{ .vae = &m.vae }, x, lat_h, lat_w, o, progress);
+            defer gpa.free(planar);
+            try note(progress, "decoded in {d:.1}s\n", .{@as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - dec_start.nanoseconds)) / 1e9});
+            const width = lat_w * 8;
+            const height = lat_h * 8;
+            return .{
+                .rgb = try image.planarF32ToRgb8(gpa, planar, width, height),
+                .width = width,
+                .height = height,
+            };
+        }
+
+        if (self.family() == .zimage) {
+            const m = self.zi();
+            if (latent.len != zimage.latent_channels * lat_h * lat_w) return error.LatentSizeMismatch;
+            self.setMemTag(.vae);
+            // Denormalize onto a copy (`decode` must not modify the caller's latent).
+            // ⚠️ `latent_formats.Flux.process_out` is `z / scale + SHIFT` — the shift
+            // term has no SD analogue, and dropping it decodes a latent offset by
+            // 0.116, which is a plausible image with a colour cast rather than an error.
+            const x = try gpa.dupe(f32, latent);
+            defer gpa.free(x);
+            const inv = 1.0 / m.vae.cfg.scaling_factor;
+            for (x) |*v| v.* = v.* * inv + m.vae.cfg.shift_factor;
             try note(progress, "decoding latent...\n", .{});
             const dec_start = std.Io.Clock.real.now(io);
             const planar = try self.decodePlanar(SdVae{ .vae = &m.vae }, x, lat_h, lat_w, o, progress);
@@ -2640,7 +3067,9 @@ pub const Session = struct {
             // cuBLASLt/cuDNN conv workspace). Tiled decode's first attempt is one
             // tile, so estimate at the tile size when skip_whole.
             {
-                const est = if (skip_whole) v.estimate(tp.tile, tp.tile) else v.estimate(lat_h, lat_w);
+                // CUDA never materializes the mid-block scores plane — cuDNN's
+                // fused SDPA under `.libs`, `be.attn`'s online softmax otherwise.
+                const est = if (skip_whole) v.estimate(tp.tile, tp.tile, false) else v.estimate(lat_h, lat_w, false);
                 const target = est + est / 10; // 110%
                 const free_now = b.ctx.memGetInfo().free;
                 try note(progress, "vae decode: est peak {d}MB, want free ≥ {d}MB (have {d}MB)\n", .{ est >> 20, target >> 20, free_now >> 20 });
@@ -2666,7 +3095,7 @@ pub const Session = struct {
                     try note(progress, "vae decode: tiling on GPU ({d}² latent tiles)\n", .{tp.tile});
                     if (vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, wt, Whole.call)) |p| {
                         return p;
-                    } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: GPU tiling OOM ({t}) → freeing VRAM\n", .{err});
+                    } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: GPU tiling {s} ({t}) → freeing VRAM\n", .{ decodeStepReason(err), err });
                     if (try freeSome(b, o.reclaim, progress, io, want) == 0) break; // nothing left → CPU
                     want *|= 2;
                 }
@@ -2695,7 +3124,8 @@ pub const Session = struct {
             {
                 // Proactive pre-free to ~110% of the estimated first-attempt peak,
                 // so we don't burn a full failed decode just to find the deficit.
-                const est = if (skip_whole) v.estimate(tp.tile, tp.tile) else v.estimate(lat_h, lat_w);
+                // Vulkan DOES materialize it, in f32 (see `sd_vae_gpu.attn`).
+                const est = if (skip_whole) v.estimate(tp.tile, tp.tile, true) else v.estimate(lat_h, lat_w, true);
                 const target = est + est / 10;
                 const free_now = gc.liveVram();
                 try note(progress, "vae decode: est peak {d}MB, want free >= {d}MB (have {d}MB)\n", .{ est >> 20, target >> 20, free_now >> 20 });
@@ -2731,7 +3161,7 @@ pub const Session = struct {
                     try note(progress, "vae decode: tiling on GPU ({d}^2 latent tiles)\n", .{tp.tile});
                     if (vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, wt, Whole.call)) |p| {
                         return p;
-                    } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: GPU tiling OOM ({t}) -> freeing VRAM\n", .{err});
+                    } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: GPU tiling {s} ({t}) -> CPU tier\n", .{ decodeStepReason(err), err });
                     const t0 = std.Io.Clock.real.now(io).nanoseconds;
                     const from_self = gc.evictToFree(wnt);
                     var got = from_self;
@@ -2745,7 +3175,7 @@ pub const Session = struct {
                 }
             }
             // Phase 3: CPU tiling — the guaranteed VRAM-can't-OOM floor (slow).
-            try note(progress, "vae decode: GPU out of VRAM -> CPU tiled decode (slow)\n", .{});
+            try note(progress, "vae decode: falling back to the CPU tier (exact, slow)\n", .{});
             const saved = ops.matmul.gpu_dispatch;
             ops.matmul.gpu_dispatch = null;
             defer ops.matmul.gpu_dispatch = saved;
@@ -2802,12 +3232,13 @@ pub const Session = struct {
         // sigma table and `beta` de-duplicates rungs, so either can return a different
         // number than requested. Hoisting is safe — `scheduleWith` is pure and touches no
         // RNG, so the noise draw below is unchanged and the render stays bit-identical.
-        const sigmas = try self.scheduleWith(gpa, opts.steps, opts.shift, opts.scheduler);
+        const shift = self.resolvedShift(opts);
+        const sigmas = try self.scheduleWith(gpa, opts.steps, shift, opts.scheduler);
         defer gpa.free(sigmas);
         const nsteps = sigmas.len - 1;
         if (nsteps != opts.steps) {
             try note(progress, "scheduler {t} produced {d} steps for a request of {d}\n", .{
-                opts.scheduler orelse sampler.Scheduler.defaultFor(self.sigmaTable(opts.shift)), nsteps, opts.steps,
+                opts.scheduler orelse sampler.Scheduler.defaultFor(self.sigmaTable(shift)), nsteps, opts.steps,
             });
         }
 
@@ -3000,7 +3431,7 @@ pub const Session = struct {
                     // render wrong, with nothing failing.
                     .noise_src = self.compat.noise_src,
                 },
-                opts.shift,
+                shift,
             ) else null;
             defer if (sde) |*s| s.deinit();
             // Restore the multistep history on a resume, or the first step after it is
@@ -3289,14 +3720,19 @@ test "the live preview follows the family's own latent format" {
     defer gpa.free(rgb);
 
     var sess: Session = undefined;
-    var prev: [3][]u8 = undefined;
-    inline for (.{ Family.krea2, Family.sd15, Family.sdxl }, 0..) |fam, fi| {
+    var prev: [4][]u8 = undefined;
+    inline for (.{ Family.krea2, Family.sd15, Family.sdxl, Family.zimage }, 0..) |fam, fi| {
         sess.models = switch (fam) {
             .krea2 => .{ .krea2 = undefined },
             .sd15 => .{ .sd15 = undefined },
             .sdxl => .{ .sdxl = undefined },
+            .zimage => .{ .zimage = undefined },
         };
-        const ch: usize = if (fam == .krea2) wan_vae.latent_channels else sd_vae.latent_channels;
+        const ch: usize = switch (fam) {
+            .krea2 => wan_vae.latent_channels,
+            .zimage => zimage.latent_channels,
+            .sd15, .sdxl => sd_vae.latent_channels,
+        };
         // Exactly the family's channel count — a read one plane past the end is an
         // out-of-bounds panic, which is what the bug was.
         const z = try gpa.alloc(f32, ch * lat_h * lat_w);
@@ -3307,8 +3743,11 @@ test "the live preview follows the family's own latent format" {
     }
     defer for (prev) |p| gpa.free(p);
     // Each family uses its OWN factors: sharing SD1.5's for SDXL is not a crash, just a
-    // preview with plausible structure and wrong colours.
+    // preview with plausible structure and wrong colours. krea2 and Z-Image are the
+    // pair that matters most here — both are 16-channel, so the wrong matrix is not
+    // even an out-of-bounds read, just quietly wrong colours.
     try std.testing.expect(!std.mem.eql(u8, prev[1], prev[2]));
+    try std.testing.expect(!std.mem.eql(u8, prev[0], prev[3]));
 }
 
 test "downsampleLatent box-averages every plane of a non-krea2 latent" {
@@ -3354,7 +3793,7 @@ test "vramBreakdown folds only the untagged remainder into latent" {
     try std.testing.expectEqual(@as(u64, 0), r.latent);
 }
 
-test "the SD tile adapter transposes both ways around a channel-last decoder" {
+test "the SD tile adapter transposes both ways at every latent width" {
     // `vae_tiled` and `Session.decode` speak planar `[c][h][w]`; the SD decoders
     // speak channel-last `[h*w][c]`. `sdTile` is the single seam between them, and
     // it is the seam because getting this wrong is **rms-preserving** — every value
@@ -3362,48 +3801,57 @@ test "the SD tile adapter transposes both ways around a channel-last decoder" {
     // rendered image stayed invisible to every magnitude check (see "the sampler's
     // planar latent survives a round trip through the UNet's layout").
     //
+    // ⚠️ **Run at 4 AND 16 channels.** The same decoder body serves SD's 4-channel
+    // latent and Z-Image's 16-channel Flux latent, and `sdTile` used to take the
+    // count from `sd_vae.latent_channels` — so it transposed the first quarter of a
+    // Z-Image latent and read past it for the rest. A 4-channel-only test could not
+    // see that (it was the hardcoded value), and the render it produced was a band of
+    // colour noise over flat grey rather than an error.
+    //
     // The dummy decoder asserts the layout it is HANDED and emits a distinct known
     // pattern, so the two transpositions are pinned independently: a test that only
     // checked the round trip would pass with both of them wrong.
     const gpa = std.testing.allocator;
-    const c_in = sd_vae.latent_channels;
     const th = 2;
     const tw = 3;
     const n = th * tw;
 
-    const sub = try gpa.alloc(f32, c_in * n); // planar [c][th][tw]
-    defer gpa.free(sub);
-    for (0..c_in) |c| {
-        for (0..n) |p| sub[c * n + p] = @floatFromInt(c * 1000 + p);
-    }
-
-    const Dummy = struct {
-        fn inner(_: @This(), a: std.mem.Allocator, z: []const f32, ith: usize, itw: usize) anyerror![]f32 {
-            const nn = ith * itw;
-            // Handed channel-last: a position's channels are adjacent.
-            for (0..nn) |p| {
-                for (0..c_in) |c| {
-                    try std.testing.expectEqual(@as(f32, @floatFromInt(c * 1000 + p)), z[p * c_in + c]);
-                }
-            }
-            // Emit channel-last pixels, the shape a real SD decoder returns.
-            const pn = nn * sd_vae.spatial_scale * sd_vae.spatial_scale;
-            const out = try a.alloc(f32, pn * 3);
-            for (0..pn) |p| {
-                for (0..3) |c| out[p * 3 + c] = @floatFromInt(c * 100000 + p);
-            }
-            return out;
+    inline for (.{ sd_vae.latent_channels, zimage.latent_channels }) |c_in| {
+        const sub = try gpa.alloc(f32, c_in * n); // planar [c][th][tw]
+        defer gpa.free(sub);
+        for (0..c_in) |c| {
+            for (0..n) |p| sub[c * n + p] = @floatFromInt(c * 1000 + p);
         }
-    };
 
-    const planar = try sdTile(gpa, sub, th, tw, Dummy{}, Dummy.inner);
-    defer gpa.free(planar);
+        const Dummy = struct {
+            fn inner(_: @This(), a: std.mem.Allocator, z: []const f32, ith: usize, itw: usize) anyerror![]f32 {
+                const nn = ith * itw;
+                // Handed channel-last: a position's channels are adjacent.
+                try std.testing.expectEqual(nn * c_in, z.len);
+                for (0..nn) |p| {
+                    for (0..c_in) |c| {
+                        try std.testing.expectEqual(@as(f32, @floatFromInt(c * 1000 + p)), z[p * c_in + c]);
+                    }
+                }
+                // Emit channel-last pixels, the shape a real SD decoder returns.
+                const pn = nn * sd_vae.spatial_scale * sd_vae.spatial_scale;
+                const out = try a.alloc(f32, pn * 3);
+                for (0..pn) |p| {
+                    for (0..3) |c| out[p * 3 + c] = @floatFromInt(c * 100000 + p);
+                }
+                return out;
+            }
+        };
 
-    const pn = n * sd_vae.spatial_scale * sd_vae.spatial_scale;
-    try std.testing.expectEqual(pn * 3, planar.len);
-    for (0..3) |c| {
-        for (0..pn) |p| {
-            try std.testing.expectEqual(@as(f32, @floatFromInt(c * 100000 + p)), planar[c * pn + p]);
+        const planar = try sdTile(gpa, sub, th, tw, Dummy{}, Dummy.inner);
+        defer gpa.free(planar);
+
+        const pn = n * sd_vae.spatial_scale * sd_vae.spatial_scale;
+        try std.testing.expectEqual(pn * 3, planar.len);
+        for (0..3) |c| {
+            for (0..pn) |p| {
+                try std.testing.expectEqual(@as(f32, @floatFromInt(c * 100000 + p)), planar[c * pn + p]);
+            }
         }
     }
 }
@@ -3417,6 +3865,9 @@ test "recoverableDecodeErr classifies VAE-decode fallbacks" {
     try std.testing.expect(recoverableDecodeErr(error.CudaError));
     try std.testing.expect(recoverableDecodeErr(error.CublasLtError));
     try std.testing.expect(recoverableDecodeErr(error.CudnnError));
+    // A device decode that came back non-finite: the CPU tier is exact, so the ladder
+    // must reach it rather than hand back a white image.
+    try std.testing.expect(recoverableDecodeErr(error.GpuDecodeNonFinite));
     // Cancellation and structural errors must propagate, never be masked by a
     // silent CPU fallback.
     try std.testing.expect(!recoverableDecodeErr(error.Canceled));
@@ -3557,7 +4008,7 @@ test "a CFG denoiser needs a negative conditioning" {
     );
 }
 
-test "DitContainer picks the reader by magic, not by extension" {
+test "Container picks the reader by magic, not by extension" {
     // A misnamed checkpoint used to reach the wrong parser and report
     // `InvalidHeader`, which says nothing about the real problem. Sniffing means the
     // name is irrelevant; only the bytes decide.
@@ -3585,7 +4036,7 @@ test "DitContainer picks the reader by magic, not by extension" {
         try w.interface.flush();
     }
 
-    var c = try DitContainer.openIn(gpa, io, tmp.dir, "lying.gguf");
+    var c = try Container.openIn(gpa, io, tmp.dir, "lying.gguf");
     defer c.deinit();
     try std.testing.expect(c == .safetensors);
     try std.testing.expectEqual(@as(usize, 1), c.store().count());
@@ -3611,6 +4062,13 @@ test "family detection reads the denoiser's own tensor names" {
         .{ .names = &.{ "input_blocks.0.0.weight", "label_emb.0.0.weight" }, .want = .sdxl },
         .{ .names = &.{"model.diffusion_model.blocks.0.attn.wq.weight"}, .want = .krea2 },
         .{ .names = &.{"blocks.0.attn.wq.weight"}, .want = .krea2 },
+        // ⚠️ Z-Image needs BOTH tensors, which is ComfyUI's own test:
+        // `cap_embedder.1.weight` alone is shared with stock Lumina 2 and OmniGen2,
+        // and the `noise_refiner` qk-norm is what says this is the NextDiT shape.
+        // These cases therefore also pin that a `cap_embedder` on its own is NOT
+        // enough (the negative case below).
+        .{ .names = &.{ "model.diffusion_model.cap_embedder.1.weight", "model.diffusion_model.noise_refiner.0.attention.k_norm.weight" }, .want = .zimage },
+        .{ .names = &.{ "cap_embedder.1.weight", "noise_refiner.0.attention.k_norm.weight" }, .want = .zimage },
     };
     for (cases) |c| {
         var buf: [512]u8 = undefined;
@@ -3638,7 +4096,7 @@ test "family detection reads the denoiser's own tensor names" {
             v.deinit(gpa);
             gpa.destroy(v);
         };
-        const probe = (try componentSpec(c.want, .denoiser)).probe;
+        const probe = (try componentSpec(c.want, .denoiser)).probes[0];
         try std.testing.expect(r.store.get(probe) != null);
     }
 
@@ -3654,6 +4112,50 @@ test "family detection reads the denoiser's own tensor names" {
         defer st.deinit();
         try std.testing.expectError(error.UnknownArchitecture, detectFamily(.{ .safetensors = &st }));
     }
+
+    // ⚠️ `cap_embedder.1.weight` on its OWN is not Z-Image: stock Lumina 2 and
+    // OmniGen2 have it too. This case is what gives the two-tensor probe teeth —
+    // without it, a single-tensor test would pass either way.
+    {
+        const header = "{\"cap_embedder.1.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}}";
+        var file: [8 + header.len + 8]u8 = undefined;
+        std.mem.writeInt(u64, file[0..8], header.len, .little);
+        @memcpy(file[8..][0..header.len], header);
+        @memset(file[8 + header.len ..], 0);
+        var st = try safetensors.SafeTensors.initFromSlice(gpa, &file);
+        defer st.deinit();
+        try std.testing.expectError(error.UnknownArchitecture, detectFamily(.{ .safetensors = &st }));
+    }
+}
+
+test "each family's schedule shift and defaulted component paths are its own" {
+    // ⚠️ Three constants that produce a plausible image when wrong, so none of them
+    // can be left to a shared default:
+    //
+    //  - the SHIFT. Z-Image trained on 3.0 and krea2 on 1.15, and `Options.shift`
+    //    defaults to krea2's. At 8 steps the wrong one is the difference between a
+    //    finished image and a smeared one — a valid schedule with the steps in the
+    //    wrong places, not an error.
+    //  - the two DEFAULTED component paths. `Options`' are krea2's files, and
+    //    handing krea2's Qwen3-**VL** encoder to Z-Image resolves to nothing (its
+    //    language model is nested a level deeper), which reports
+    //    `ComponentNotInCheckpoint` — the exact failure a joined SD1.5 checkpoint hit.
+    try std.testing.expectEqual(sampler.default_shift, defaultShift(.krea2));
+    try std.testing.expectEqual(@as(f32, 3.0), defaultShift(.zimage));
+    try std.testing.expect(defaultShift(.krea2) != defaultShift(.zimage));
+
+    // Only an EXPLICIT request overrides the family's own value.
+    var sess: Session = undefined;
+    sess.models = .{ .zimage = undefined };
+    try std.testing.expectEqual(@as(f32, 3.0), sess.resolvedShift(.{ .prompt = "" }));
+    try std.testing.expectEqual(@as(f32, 1.7), sess.resolvedShift(.{ .prompt = "", .shift = 1.7, .explicit_shift = true }));
+    sess.models = .{ .krea2 = undefined };
+    try std.testing.expectEqual(sampler.default_shift, sess.resolvedShift(.{ .prompt = "" }));
+
+    // Z-Image names its own side files; every other family keeps using `Options`'.
+    try std.testing.expect(defaultComponentPath(.zimage, .conditioner).len > 0);
+    try std.testing.expect(defaultComponentPath(.zimage, .decoder).len > 0);
+    try std.testing.expectEqual(@as(usize, 0), defaultComponentPath(.krea2, .conditioner).len);
 }
 
 test "container style is orthogonal to family: bundled, split, and explicit override" {
@@ -3683,7 +4185,7 @@ test "container style is orthogonal to family: bundled, split, and explicit over
     var side = try safetensors.SafeTensors.initFromSlice(gpa, try Builder.file(&b2, "text_model.final_layer_norm.weight"));
     defer side.deinit();
 
-    const probe = (try componentSpec(.sd15, .conditioner)).probe;
+    const probe = (try componentSpec(.sd15, .conditioner)).probes[0];
 
     // 1. Bundled only: found inside the primary, through a prefix view.
     {

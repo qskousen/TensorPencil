@@ -72,6 +72,11 @@ pub const Context = struct {
     staging_size: usize = 0,
     staging_next: usize = 0,
     n_staging: usize = 0,
+    /// Parallel filler for the staging slots. Inline rather than heap-allocated
+    /// because the workers hold `&self.fill`: `initStaging` runs on the
+    /// already-heap-resident Context, where `init` returns by value and is copied.
+    fill: FillPool = .{ .ctx = undefined },
+    fill_ready: bool = false,
 
     // Device attributes (queried once at init).
     name_buf: [256]u8 = undefined,
@@ -85,6 +90,12 @@ pub const Context = struct {
     jit_count: u32 = 0,
     // Total host->device bytes enqueued (weight residency attribution).
     htod_bytes: u64 = 0,
+    /// Prefetch-thread accounting, split so a slow upload can be blamed on the
+    /// right half: `stage_read_ns` is the host fill of the pinned slot (pread or
+    /// memcpy from the mapping), `stage_wait_ns` the block waiting for a slot's
+    /// previous DMA to drain — i.e. the PCIe side pushing back.
+    stage_read_ns: u64 = 0,
+    stage_wait_ns: u64 = 0,
     shared_optin_max: c_int = 0, // bytes of opt-in dynamic shared per block
     shared_per_sm: c_int = 0,
     clock_khz: c_int = 0,
@@ -146,6 +157,7 @@ pub const Context = struct {
     }
 
     pub fn deinit(self: *Context) void {
+        if (self.fill_ready) self.fill.deinit();
         if (self.wr_chunk) |p| _ = self.api.cuMemFreeHost(p);
         for (0..self.n_staging) |i| {
             if (self.staging_ev[i] != null) _ = self.api.cuEventDestroy(self.staging_ev[i]);
@@ -233,9 +245,128 @@ pub const WeightReader = struct {
     read: *const fn (ctx: *anyopaque, dst: []u8, src: []const u8) bool,
 };
 
+/// Fans the host-side fill of one pinned staging slot out over several threads.
+///
+/// ⚠️ **The fill, not the DMA, is what makes a multi-GB weight upload slow, and
+/// nothing in the code said so until it was split out.** Measured on a 3090 with
+/// an 11.57 GB Z-Image DiT: `fill 4.88s, slot-wait 0.04s` — i.e. PCIe was idle
+/// 99% of the time and one thread reading the checkpoint at **2.37 GB/s** was the
+/// whole warm-up. The same file reads at 4.3 GB/s cold and 26 GB/s page-cached
+/// under `dd`, so a single reader is leaving most of both on the table: cold it is
+/// short on queue depth, warm it is one core doing a 12 GB copy.
+///
+/// Positional reads are independent by construction (no shared file offset), and
+/// the fallback `@memcpy` splits just as freely — so a range split is safe with no
+/// ordering between workers. Chunks are claimed rather than pre-assigned so a
+/// worker that lands on cold pages cannot hold up the batch.
+const FillPool = struct {
+    /// Total fillers including the caller, which works alongside them rather than
+    /// blocking — so this is threads spawned + 1.
+    const workers = 4;
+    /// Claim granularity. Small enough that a straggler costs little, large enough
+    /// that a claim's mutex round trip is noise against the read it guards.
+    const chunk_bytes = 8 << 20;
+
+    ctx: *Context,
+    /// `std.Io`'s portable primitives rather than raw futex/pthread — this file
+    /// is the one place a macOS/Windows port would otherwise have to rewrite.
+    io: std.Io = undefined,
+    mu: std.Io.Mutex = .init,
+    have_work: std.Io.Condition = .init,
+    batch_done: std.Io.Condition = .init,
+    threads: [workers - 1]?std.Thread = @splat(null),
+    /// Bumped once per batch; a worker waits for it to change.
+    gen: u64 = 0,
+    shutdown: bool = false,
+    dst: []u8 = &.{},
+    src: []const u8 = &.{},
+    next: usize = 0,
+    /// Chunks claimed but not yet finished. The batch is over at 0 with `next`
+    /// past the end — counting claims (not completions) is what lets the producer
+    /// join without knowing how the work was divided.
+    busy: usize = 0,
+
+    fn spawn(self: *FillPool, io: std.Io) void {
+        self.io = io;
+        for (&self.threads) |*t| t.* = std.Thread.spawn(.{}, loop, .{self}) catch null;
+    }
+
+    fn loop(self: *FillPool) void {
+        const io = self.io;
+        self.mu.lockUncancelable(io);
+        var seen = self.gen;
+        while (true) {
+            while (self.gen == seen and !self.shutdown) self.have_work.waitUncancelable(io, &self.mu);
+            if (self.shutdown) {
+                self.mu.unlock(io);
+                return;
+            }
+            seen = self.gen;
+            self.mu.unlock(io);
+            self.drain();
+            self.mu.lockUncancelable(io);
+        }
+    }
+
+    /// Claim and fill chunks until none are left. Called by the workers AND by the
+    /// producer, which is what keeps `workers` accurate at small sizes: a 29 MB
+    /// weight is 4 chunks, and the producer taking one of them beats it idling.
+    fn drain(self: *FillPool) void {
+        const io = self.io;
+        while (true) {
+            self.mu.lockUncancelable(io);
+            const off = self.next;
+            if (off >= self.dst.len) {
+                self.mu.unlock(io);
+                return;
+            }
+            const n = @min(chunk_bytes, self.dst.len - off);
+            self.next = off + n;
+            self.busy += 1;
+            const d = self.dst[off..][0..n];
+            const s = self.src[off..][0..n];
+            self.mu.unlock(io);
+
+            if (!self.ctx.readWeight(d, s)) @memcpy(d, s);
+
+            self.mu.lockUncancelable(io);
+            self.busy -= 1;
+            if (self.busy == 0 and self.next >= self.dst.len) self.batch_done.signal(io);
+            self.mu.unlock(io);
+        }
+    }
+
+    /// Fill `dst` from `src` across the pool, returning once every byte is in.
+    fn run(self: *FillPool, dst: []u8, src: []const u8) void {
+        const io = self.io;
+        self.mu.lockUncancelable(io);
+        self.dst = dst;
+        self.src = src;
+        self.next = 0;
+        self.gen +%= 1;
+        self.have_work.broadcast(io);
+        self.mu.unlock(io);
+
+        self.drain(); // the producer is a worker too
+
+        self.mu.lockUncancelable(io);
+        while (self.busy != 0) self.batch_done.waitUncancelable(io, &self.mu);
+        self.mu.unlock(io);
+    }
+
+    fn deinit(self: *FillPool) void {
+        const io = self.io;
+        self.mu.lockUncancelable(io);
+        self.shutdown = true;
+        self.have_work.broadcast(io);
+        self.mu.unlock(io);
+        for (self.threads) |t| if (t) |th| th.join();
+    }
+};
+
     /// Allocate the pinned staging ring (`stage_slots` × `slot_size` device-pinned
     /// host buffers). Enables async weight uploads. Returns false if unsupported.
-    pub fn initStaging(self: *Context, slot_size: usize) bool {
+    pub fn initStaging(self: *Context, slot_size: usize, io: std.Io) bool {
         if (self.n_staging > 0) return true;
         var i: usize = 0;
         while (i < stage_slots) : (i += 1) {
@@ -248,6 +379,11 @@ pub const WeightReader = struct {
             self.n_staging = i + 1;
         }
         self.staging_size = slot_size;
+        if (self.n_staging > 0 and !self.fill_ready) {
+            self.fill.ctx = self;
+            self.fill.spawn(io);
+            self.fill_ready = true;
+        }
         return self.n_staging > 0;
     }
 
@@ -262,12 +398,20 @@ pub const WeightReader = struct {
         if (self.n_staging == 0 or data.len > self.staging_size) return self.upload(buf, data);
         const i = self.staging_next;
         self.staging_next = (i + 1) % self.n_staging;
+        const t_wait = monoNs();
         _ = self.api.cuEventSynchronize(self.staging_ev[i]); // slot free (prev DMA done)
+        const t_read = monoNs();
+        self.stage_wait_ns +%= t_read -% t_wait;
         const slot: [*]u8 = @ptrCast(self.staging[i].?);
         // Prefer a positional read straight into the pinned slot; fall back to the
         // copy when there is no reader, the bytes are not from its file, or the
         // read fails. Same destination either way, so this cannot change results.
-        if (!self.readWeight(slot[0..data.len], data)) @memcpy(slot[0..data.len], data);
+        if (self.fill_ready) {
+            self.fill.run(slot[0..data.len], data);
+        } else if (!self.readWeight(slot[0..data.len], data)) {
+            @memcpy(slot[0..data.len], data);
+        }
+        self.stage_read_ns +%= monoNs() -% t_read;
         self.htod_bytes += data.len;
         try self.check(self.api.cuMemcpyHtoDAsync(buf.ptr, slot, data.len, self.xfer_stream), "cuMemcpyHtoDAsync");
         _ = self.api.cuEventRecord(self.staging_ev[i], self.xfer_stream); // slot reusable after this

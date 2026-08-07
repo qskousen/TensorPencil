@@ -120,20 +120,7 @@ pub const DiT = struct {
     ///   wrong (int needs the per-row scale + convrot; block-quant needs ggml).
     ///   Refuse loudly rather than emit silent garbage.
     fn opMatmulF32(alloc: std.mem.Allocator, w: Weight) !Weight {
-        switch (w.dtype) {
-            .f32 => return w,
-            .f8_e4m3, .bf16, .f16 => {
-                const out = try alloc.alloc(f32, w.rows * w.cols);
-                try safetensors.convertToF32(w.dtype, w.bytes, out);
-                if (w.scale != 1.0) for (out) |*v| {
-                    v.* *= w.scale;
-                };
-                var out_w = Weight.fromF32(out, w.rows, w.cols);
-                out_w.tag = w.tag; // materializing to f32 must not lose the layer name
-                return out_w;
-            },
-            else => return error.UnsupportedCheckpoint,
-        }
+        return ops.matmul.materializeF32(alloc, w);
     }
 
     pub fn load(gpa: std.mem.Allocator, store: WeightStore) !DiT {

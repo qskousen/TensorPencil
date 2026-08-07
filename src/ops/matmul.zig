@@ -190,6 +190,41 @@ pub fn supportsDType(dt: DType) bool {
     };
 }
 
+/// Materialize a weight to f32 once, into `alloc`, folding any per-tensor scale.
+///
+/// The GPU backends' fused `opMatmul` (the one with bias + destination-offset
+/// support, used for a model's small in/out projections) has an **f32 pipeline
+/// only** — handed bf16 bytes it reinterprets them as f32 and the render is pure
+/// noise, and handed fp8 it trips an assert. So a loader normalizes those few
+/// projections here rather than discovering the problem inside the first forward.
+///
+/// - `f32` passes through untouched, so the device is fed the original mmap.
+/// - `f8_e4m3` / `bf16` / `f16` are converted (fp8 too: the CUDA fused kernel has
+///   no fp8 variant).
+/// - Anything else — int8/int4 convrot, ggml block quants — refuses loudly.
+///   Dequantizing those needs metadata this function does not have (a per-row
+///   scale and group rotation, or a ggml block layout), so converting them here
+///   would emit silent garbage rather than an error.
+///
+/// The `tag` survives the copy: materializing must not make a weight
+/// unattributable to its checkpoint tensor (`Weight.tag`).
+pub fn materializeF32(alloc: std.mem.Allocator, w: Weight) !Weight {
+    switch (w.dtype) {
+        .f32 => return w,
+        .f8_e4m3, .bf16, .f16 => {
+            const out = try alloc.alloc(f32, w.rows * w.cols);
+            try @import("tp_core").safetensors.convertToF32(w.dtype, w.bytes, out);
+            if (w.scale != 1.0) for (out) |*v| {
+                v.* *= w.scale;
+            };
+            var out_w = Weight.fromF32(out, w.rows, w.cols);
+            out_w.tag = w.tag;
+            return out_w;
+        },
+        else => return error.UnsupportedCheckpoint,
+    }
+}
+
 /// y[m, w.rows] = x[m, w.cols] @ w^T + bias.
 pub fn matmul(
     io: std.Io,

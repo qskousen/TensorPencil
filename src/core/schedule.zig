@@ -54,6 +54,15 @@ const std = @import("std");
 pub const default_shift: f32 = 1.15;
 /// `ModelSamplingFlux.set_parameters(timesteps=10000)`.
 pub const flux_table_len: usize = 10000;
+/// `ModelSamplingDiscreteFlow.set_parameters(timesteps=1000)` — Lumina 2 / Z-Image.
+/// ⚠️ A TENTH of the flux table, which is why the two cannot share a variant even
+/// though their sigma formulas are algebraically the same function: every scheduler
+/// that indexes the table (`normal`, `sgm_uniform`, `ddim_uniform`, `beta`) reads a
+/// different number of rungs.
+pub const discrete_flow_table_len: usize = 1000;
+/// Z-Image's own `sampling_settings["shift"]` (`supported_models.py::ZImage`), which
+/// the official ComfyUI template also sets explicitly via `ModelSamplingAuraFlow`.
+pub const z_image_shift: f32 = 3.0;
 
 /// SD1.5 / SDXL training betas ("scaled_linear"): 1000 steps between these bounds,
 /// squared. Both numbers are part of the checkpoint's identity, not tunables.
@@ -92,6 +101,28 @@ pub fn fluxSigma(shift: f32, t: f32) f32 {
 pub fn fluxTableAt(shift: f32, i: usize) f32 {
     const t: f32 = @as(f32, @floatFromInt(i + 1)) / @as(f32, @floatFromInt(flux_table_len));
     return fluxSigma(shift, t);
+}
+
+/// `time_snr_shift(alpha, t)` — `ModelSamplingDiscreteFlow.sigma`, on an f32 tensor.
+///
+/// Algebraically identical to `fluxSigma` with `alpha = exp(mu)`, and deliberately
+/// NOT written that way: torch evaluates this one as `(alpha*t) / (1 + (alpha-1)*t)`
+/// — a single tensor/tensor division — where the flux form is `scalar / tensor`,
+/// which lowers to `reciprocal * scalar` and rounds twice. Schedule values are
+/// quantised to 1e-6 and used as Brownian-tree keys, so a one-ulp difference is a
+/// different noise draw (see the module doc).
+pub fn discreteFlowSigma(shift: f32, t: f32) f32 {
+    if (shift == 1.0) return t;
+    return (shift * t) / (1.0 + (shift - 1.0) * t);
+}
+
+/// Entry `i` of `ModelSamplingDiscreteFlow.sigmas`, ascending. The multiplier is 1.0
+/// for Z-Image, so `set_parameters`' `* multiplier` and `sigma`'s `/ multiplier`
+/// cancel exactly and `t` is just `(i + 1) / 1000` in f32, as `arange(1, 1001) / 1000`
+/// produces it.
+pub fn discreteFlowTableAt(shift: f32, i: usize) f32 {
+    const t: f32 = @as(f32, @floatFromInt(i + 1)) / @as(f32, @floatFromInt(discrete_flow_table_len));
+    return discreteFlowSigma(shift, t);
 }
 
 /// The full per-training-step SD sigma ladder, ascending. Caller frees.
@@ -158,11 +189,16 @@ pub const SigmaTable = union(enum) {
     flux: f32,
     /// SD1.5 / SDXL: the ascending 1000-rung beta ladder, borrowed.
     discrete: []const f32,
+    /// Lumina 2 / Z-Image (`ModelSamplingDiscreteFlow`), parameterized by its shift.
+    /// Flow matching like `.flux`, but a 1000-rung table under a differently-rounded
+    /// form of the same formula — see `discreteFlowSigma`.
+    discrete_flow: f32,
 
     pub fn len(self: SigmaTable) usize {
         return switch (self) {
             .flux => flux_table_len,
             .discrete => |l| l.len,
+            .discrete_flow => discrete_flow_table_len,
         };
     }
 
@@ -171,6 +207,7 @@ pub const SigmaTable = union(enum) {
         return switch (self) {
             .flux => |shift| fluxTableAt(shift, i),
             .discrete => |l| l[i],
+            .discrete_flow => |shift| discreteFlowTableAt(shift, i),
         };
     }
 
@@ -191,7 +228,10 @@ pub const SigmaTable = union(enum) {
     /// in log-sigma.
     pub fn timestep(self: SigmaTable, sigma: f32) f32 {
         return switch (self) {
-            .flux => sigma,
+            // Both flow tables index by the sigma itself. For `.discrete_flow` that
+            // is `sigma * multiplier` with Z-Image's multiplier of 1.0 — an identity
+            // only because of that value, not a property of the class.
+            .flux, .discrete_flow => sigma,
             .discrete => |l| blk: {
                 const log_sigma: f32 = @log(sigma);
                 var best: usize = 0;
@@ -213,6 +253,7 @@ pub const SigmaTable = union(enum) {
         return switch (self) {
             .flux => |shift| fluxSigma(shift, t),
             .discrete => |l| interpLadder(l, t),
+            .discrete_flow => |shift| discreteFlowSigma(shift, t),
         };
     }
 };
@@ -260,7 +301,9 @@ pub const Scheduler = enum {
     /// `simple` for flow-matching checkpoints, `normal` for the SD family.
     pub fn defaultFor(table: SigmaTable) Scheduler {
         return switch (table) {
-            .flux => .simple,
+            // `simple` for both flow-matching tables: it is what ComfyUI's own
+            // Z-Image Turbo template selects, alongside 8 steps and cfg 1.
+            .flux, .discrete_flow => .simple,
             .discrete => .normal,
         };
     }
@@ -599,6 +642,18 @@ fn f32At(v: std.json.Value) f32 {
     };
 }
 
+/// A u64 out of the fixture. ⚠️ `std.json` parks an integer that does not fit `i64`
+/// in `number_string`, and the Z-Image table's FNV-1a hash is exactly such a value —
+/// reading `.integer` unconditionally panics on it while passing for the other two
+/// tables, which is how this stayed latent until a third table was added.
+fn u64At(v: std.json.Value) !u64 {
+    return switch (v) {
+        .integer => |n| @bitCast(n),
+        .number_string => |str| std.fmt.parseInt(u64, str, 10),
+        else => error.BadFixture,
+    };
+}
+
 test "both sigma tables are bit-exact to model_sampling.sigmas, every entry" {
     // ⚠️ Checked by a hash over EVERY entry's raw f32 bits, not by sampling indices,
     // and that is the point: the `scalar / tensor` reciprocal convention (see the
@@ -620,6 +675,8 @@ test "both sigma tables are bit-exact to model_sampling.sigmas, every entry" {
         const t = entry.value_ptr.object;
         const table: SigmaTable = if (std.mem.eql(u8, entry.key_ptr.*, "flux"))
             .{ .flux = default_shift }
+        else if (std.mem.eql(u8, entry.key_ptr.*, "zimage"))
+            .{ .discrete_flow = z_image_shift }
         else
             .{ .discrete = ladder };
         errdefer std.debug.print("table {s}\n", .{entry.key_ptr.*});
@@ -641,10 +698,10 @@ test "both sigma tables are bit-exact to model_sampling.sigmas, every entry" {
                 h = (h ^ byte) *% 0x100000001b3;
             }
         }
-        try std.testing.expectEqual(@as(u64, @bitCast(t.get("bits_fnv1a").?.integer)), h);
+        try std.testing.expectEqual(try u64At(t.get("bits_fnv1a").?), h);
         seen += 1;
     }
-    try std.testing.expectEqual(@as(usize, 2), seen);
+    try std.testing.expectEqual(@as(usize, 3), seen);
 }
 
 test "every scheduler matches ComfyUI's calculate_sigmas, on both sigma tables" {
@@ -676,6 +733,8 @@ test "every scheduler matches ComfyUI's calculate_sigmas, on both sigma tables" 
         const steps = try std.fmt.parseInt(usize, parts.next().?, 10);
         const table: SigmaTable = if (std.mem.eql(u8, fam, "flux"))
             .{ .flux = default_shift }
+        else if (std.mem.eql(u8, fam, "zimage"))
+            .{ .discrete_flow = z_image_shift }
         else
             .{ .discrete = ladder };
         const sched = Scheduler.parse(name).?;
@@ -712,9 +771,9 @@ test "every scheduler matches ComfyUI's calculate_sigmas, on both sigma tables" 
         try std.testing.expect(want.len - same_cell <= 1 + want.len / 8);
         checked += 1;
     }
-    // 9 schedulers x 2 tables x 4 step counts; a silently-empty fixture would
+    // 9 schedulers x 3 tables x 4 step counts; a silently-empty fixture would
     // otherwise make this test pass by doing nothing.
-    try std.testing.expectEqual(@as(usize, 72), checked);
+    try std.testing.expectEqual(@as(usize, 108), checked);
 }
 
 test "the inverse incomplete beta matches scipy" {

@@ -144,6 +144,24 @@ def const_sampling(shift=1.15):
     return m
 
 
+def zimage_sampling(shift=3.0):
+    """Z-Image / Lumina 2: `ModelSamplingDiscreteFlow` + `CONST`, with the
+    `sampling_settings` `supported_models.py::ZImage` declares (shift 3.0,
+    multiplier 1.0) — which the official ComfyUI template also sets explicitly via a
+    `ModelSamplingAuraFlow` node.
+
+    ⚠️ Its table is **1000** rungs where `ModelSamplingFlux`'s is 10000, and its sigma
+    formula is the same function written as a single tensor division rather than
+    `scalar / tensor`. Both differences are invisible to Euler and decisive for an SDE
+    sampler, whose Brownian tree keys on the sigma quantised to 1e-6.
+    """
+    class MS(ms.ModelSamplingDiscreteFlow, ms.CONST):
+        pass
+    m = MS()
+    m.set_parameters(shift=shift, multiplier=1.0)
+    return m
+
+
 def eps_sampling():
     """SD1.5 / SDXL: `ModelSamplingDiscrete` + `EPS`."""
     class MS(ms.ModelSamplingDiscrete, ms.EPS):
@@ -170,7 +188,7 @@ SCHEDULERS = ["normal", "karras", "exponential", "sgm_uniform", "simple",
 SCHED_STEPS = [4, 10, 20, 30]
 
 
-def scheduler_fixture(const_ms, eps_ms):
+def scheduler_fixture(const_ms, eps_ms, zimg_ms):
     """ComfyUI's `calculate_sigmas` for every scheduler x both families x several step
     counts, called through ComfyUI's own dispatcher (which owns the `use_ms` split
     between `f(model_sampling, steps)` and `f(n, sigma_min, sigma_max)`).
@@ -181,7 +199,7 @@ def scheduler_fixture(const_ms, eps_ms):
     its step count from the schedule.
     """
     out = {}
-    for fam, ms in (("flux", const_ms), ("sd", eps_ms)):
+    for fam, ms in (("flux", const_ms), ("sd", eps_ms), ("zimage", zimg_ms)):
         for name in SCHEDULERS:
             for steps in SCHED_STEPS:
                 sig = comfy.samplers.calculate_sigmas(ms, name, steps)
@@ -189,7 +207,7 @@ def scheduler_fixture(const_ms, eps_ms):
     return out
 
 
-def table_fixture(const_ms, eps_ms):
+def table_fixture(const_ms, eps_ms, zimg_ms):
     """The two `model_sampling.sigmas` tables' own endpoints and a few interior entries.
 
     ⚠️ These are computed by torch in **f32** (`ModelSamplingFlux.set_parameters` builds
@@ -199,7 +217,7 @@ def table_fixture(const_ms, eps_ms):
     re-learned on the flux table.
     """
     out = {}
-    for fam, ms in (("flux", const_ms), ("sd", eps_ms)):
+    for fam, ms in (("flux", const_ms), ("sd", eps_ms), ("zimage", zimg_ms)):
         s = ms.sigmas
         idx = [0, 1, 2, len(s) // 3, len(s) // 2, len(s) - 2, len(s) - 1]
         # ⚠️ A hash over EVERY entry's raw f32 bits, because sampling a handful of
@@ -232,6 +250,7 @@ def betaincinv_fixture():
 def main():
     const_ms = const_sampling()
     eps_ms = eps_sampling()
+    zimg_ms = zimage_sampling()
 
     # ⚠️ ComfyUI's OWN `normal` scheduler, not a reimplementation of it. This is the
     # fixture that catches the interpolation space: `ModelSamplingDiscrete.sigma`
@@ -264,8 +283,8 @@ def main():
                  "k_diffusion.sampling and torchsde. Do not hand-edit.",
         brownian=brownian_fixture(),
         sd_schedules=schedules,
-        sigma_tables=table_fixture(const_ms, eps_ms),
-        schedulers=scheduler_fixture(const_ms, eps_ms),
+        sigma_tables=table_fixture(const_ms, eps_ms, zimg_ms),
+        schedulers=scheduler_fixture(const_ms, eps_ms, zimg_ms),
         betaincinv=betaincinv_fixture(),
         trajectories=trajectories,
     )
@@ -276,7 +295,7 @@ def main():
     for t in trajectories:
         print(f"  {t['name']:22s} family={t['family']:5s} eta={t['eta']} "
               f"|x_out| max={max(abs(v) for v in t['x_out']):.4f}")
-    for fam in ("flux", "sd"):
+    for fam in ("flux", "sd", "zimage"):
         for name in SCHEDULERS:
             got = doc["schedulers"][f"{fam}|{name}|20"]
             print(f"  {fam:4s} {name:17s} 20 steps -> {len(got):3d} sigmas  "

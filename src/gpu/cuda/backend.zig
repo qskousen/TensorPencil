@@ -78,6 +78,13 @@ const lt_workspace_bytes: usize = 32 << 20;
 /// measure its batched cost — the ceiling on what fusing dequant could save.
 pub var bench_skip_rescale: bool = false;
 
+/// DIAGNOSTIC ONLY: in `opGemmBf16`, skip the f32→bf16 activation pad and the
+/// `bias_compact` output pass, leaving only the GEMM itself (produces garbage
+/// output). The isolation measurement behind any "the GEMM is/isn't the
+/// bottleneck" claim: `zimage-cuda-bench` times the op with this off and on, so
+/// the difference IS the two streaming passes' cost rather than an estimate.
+pub var bench_gemm_only: bool = false;
+
 /// Numeric kind of a cuBLASLt matmul plan: int8 A/B → s32 D (32I compute) or
 /// f16 A/B → f32 D (32F compute, HMMA). Both are the TN case with the same
 /// layout mapping; only the data/compute/scale types differ.
@@ -488,6 +495,7 @@ pub const Backend = struct {
 
     // per-category profiler (sync-per-op device timing; the plan's methodology).
     profile: bool = false,
+    zero_bias_host: []f32 = &.{},
     prof: Prof = .{},
     ptimer: ?ctxmod.Context.Timer = null,
 
@@ -505,6 +513,21 @@ pub const Backend = struct {
             self.* = .{};
         }
     };
+
+    /// Host-side zeros for a `null` bias on a path that still needs one (the
+    /// hand-PTX arm's `bias_compact` does the m-pad compaction as well as the
+    /// add, so it runs either way). Grown, never shrunk, and handed out WHOLE —
+    /// the device weight cache keys on the host pointer and sizes from the first
+    /// call, so a narrow slice cached first would leave every wider call reading
+    /// past the end.
+    pub fn zeroBias(self: *Backend, co: usize) Error![]const f32 {
+        if (self.zero_bias_host.len < co) {
+            self.gpa.free(self.zero_bias_host);
+            self.zero_bias_host = self.gpa.alloc(f32, co) catch return error.OutOfMemory;
+            @memset(self.zero_bias_host, 0);
+        }
+        return self.zero_bias_host;
+    }
 
     /// Begin timing the next op (no-op unless `profile`). Pairs with `ptoc`.
     fn ptic(self: *Backend) void {
@@ -579,14 +602,18 @@ pub const Backend = struct {
     }
 
     pub fn deinit(self: *Backend) void {
+        self.gpa.free(self.zero_bias_host);
         if (envSet("TP_WARMUP_PROFILE")) {
             std.debug.print(
-                "[warmup] ptx-jit/load {d:.2}s ({d} mods) · cuBLASLt heuristic {d:.2}s ({d} shapes) · cuDNN sdpa {d:.2}s ({d} plans) · HtoD {d:.2}GB · weight-prefetch stall {d:.2}s\n",
+                "[warmup] ptx-jit/load {d:.2}s ({d} mods) · cuBLASLt heuristic {d:.2}s ({d} shapes) · cuDNN sdpa {d:.2}s ({d} plans) · HtoD {d:.2}GB (fill {d:.2}s, slot-wait {d:.2}s) · weight-prefetch stall {d:.2}s\n",
                 .{
                     @as(f64, @floatFromInt(self.ctx.jit_ns)) / 1e9,     self.ctx.jit_count,
                     @as(f64, @floatFromInt(self.lt_heur_ns)) / 1e9,     self.lt_heur_count,
                     @as(f64, @floatFromInt(self.sdpa_ns)) / 1e9,        self.sdpa_count,
-                    @as(f64, @floatFromInt(self.ctx.htod_bytes)) / 1e9, @as(f64, @floatFromInt(self.wt_stall_ns)) / 1e9,
+                    @as(f64, @floatFromInt(self.ctx.htod_bytes)) / 1e9,
+                    @as(f64, @floatFromInt(self.ctx.stage_read_ns)) / 1e9,
+                    @as(f64, @floatFromInt(self.ctx.stage_wait_ns)) / 1e9,
+                    @as(f64, @floatFromInt(self.wt_stall_ns)) / 1e9,
                 },
             );
         }
@@ -695,7 +722,7 @@ pub const Backend = struct {
     /// No-op / falls back to synchronous uploads if pinning or the thread fails.
     /// 128 MiB slots cover the largest DiT weight (mlp ~101 MiB).
     pub fn enableAsyncStreaming(self: *Backend, io: std.Io) void {
-        if (!self.ctx.initStaging(128 << 20)) return;
+        if (!self.ctx.initStaging(128 << 20, io)) return;
         self.pf_io = io; // used by the thread to block/wake on the empty-ring futex
         self.pf_thread = std.Thread.spawn(.{}, prefetchLoop, .{self}) catch return;
         self.async_uploads = true;
@@ -2674,6 +2701,14 @@ pub const Backend = struct {
     ///
     /// The bias is NOT scaled: `bias_compact` adds it after undoing the scale.
     pub fn opConvF16Scaled(self: *Backend, dst: DeviceBuffer, dst_off_elems: usize, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: []const f32, act_div: f32) Error!void {
+        return self.opConvF16Prec(dst, dst_off_elems, src, m, w_bytes, co, k, bias, act_div, false, false);
+    }
+
+    /// `opConvF16Scaled` with f16 activation STORAGE on either side. The GEMM is
+    /// unchanged — it already ran f16 operands with an f32 accumulator; these flags
+    /// only say how `src` and `dst` are laid out in memory, which is where a VAE
+    /// decode's gigabytes actually live.
+    pub fn opConvF16Prec(self: *Backend, dst: DeviceBuffer, dst_off_elems: usize, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: []const f32, act_div: f32, src_f16: bool, dst_f16: bool) Error!void {
         self.ptic();
         defer self.ptoc(.matmul);
         const co_pad = std.mem.alignForward(usize, co, 128);
@@ -2688,14 +2723,26 @@ pub const Backend = struct {
         // The WEIGHT is never scaled — conv weights are O(1) and it is the
         // activation that overflows.
         try self.eltLaunch(f_pad, w_db, self.conv_w16, null, null, .{ @intCast(co_pad * k_pad), @intCast(k_pad), @intCast(co), @intCast(k), 0, 0 }, .{ 1.0, 0 }, co_pad * k_pad);
-        try self.eltLaunch(f_pad, src, self.conv_a16, null, null, .{ @intCast(m_pad * k_pad), @intCast(k_pad), @intCast(m), @intCast(k), 0, 0 }, .{ 1.0 / act_div, 0 }, m_pad * k_pad);
+        // An f16 source is already in the GEMM's format: `f16_pad2d` only pads.
+        // ⚠️ It takes no scale, so an f16 source cannot carry `act_div` — asserted
+        // rather than silently ignored, since that is a wrong image, not an error.
+        if (src_f16) {
+            std.debug.assert(act_div == 1.0);
+            const f_h = try self.eltFn(elt.f16_pad2d_ptx, "f16_pad2d");
+            try self.eltLaunch(f_h, src, self.conv_a16, null, null, .{ @intCast(m_pad * k_pad), @intCast(k_pad), @intCast(m), @intCast(k), 0, 0 }, .{ 0, 0 }, m_pad * k_pad);
+        } else {
+            try self.eltLaunch(f_pad, src, self.conv_a16, null, null, .{ @intCast(m_pad * k_pad), @intCast(k_pad), @intCast(m), @intCast(k), 0, 0 }, .{ 1.0 / act_div, 0 }, m_pad * k_pad);
+        }
         if (self.kernels == .libs) {
             try self.ltMatmulF16(self.conv_c, self.conv_w16, self.conv_a16, co_pad, m_pad, k_pad);
         } else {
             const f_hg = try self.hgemmFn();
             try self.launchHgemm(f_hg, self.conv_a16, self.conv_w16, self.conv_c, m_pad, co_pad, k_pad);
         }
-        const f_bc = try self.eltFn(elt.bias_compact_ptx, "bias_compact");
+        const f_bc = if (dst_f16)
+            try self.eltFn(elt.bias_compact_h16_ptx, "bias_compact_h16")
+        else
+            try self.eltFn(elt.bias_compact_ptx, "bias_compact");
         try self.eltLaunch(f_bc, self.conv_c, b_db, dst, null, .{ @intCast(m * co), @intCast(co), @intCast(co_pad), @intCast(dst_off_elems), 0, 0 }, .{ act_div, 0 }, m * co);
     }
 
@@ -2706,9 +2753,30 @@ pub const Backend = struct {
     /// k%32==0 (true for every krea2 DiT block linear) so the raw [co][k] layout
     /// is already the GEMM's B operand — no pad/transpose. Only the small
     /// activation converts (f32→bf16) per call. Ampere+ only (bf16 MMA).
-    pub fn opGemmBf16(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: []const f32) Error!void {
+    ///
+    /// ⚠️ `bias` is OPTIONAL, and passing `null` is not just tidier — under
+    /// `.libs` it removes a whole streaming pass. With no bias to add and
+    /// cuBLASLt free of the hand-PTX kernel's `m % 128` tiling rule, the GEMM can
+    /// write its f32 result straight into `dst`: no `m` padding, no `conv_c`
+    /// staging buffer, and no `bias_compact` re-read of the entire output. That
+    /// pass moves `m·co` f32 in and out again for what is otherwise a copy —
+    /// measured at 70 GB per Z-Image step. Callers with a real bias (`dit_cuda`)
+    /// keep the staged path unchanged.
+    pub fn opGemmBf16(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: ?[]const f32) Error!void {
         self.ptic();
         defer self.ptoc(.matmul);
+        if (bias == null and self.kernels == .libs) {
+            std.debug.assert(w_bytes.len == co * k * 2);
+            std.debug.assert(co % 128 == 0 and k % 32 == 0);
+            const w_direct = try self.cachedWeight(w_bytes);
+            try self.ensureDeviceBuffer(&self.conv_a16, m * k * 2);
+            if (!bench_gemm_only) {
+                const f_a = try self.eltFn(elt.f32_to_bf16_pad2d_ptx, "f32_to_bf16_pad2d");
+                try self.eltLaunch(f_a, src, self.conv_a16, null, null, .{ @intCast(m * k), @intCast(k), @intCast(m), @intCast(k), 0, 0 }, .{ 0, 0 }, m * k);
+            }
+            try self.ltMatmulBf16(dst, w_direct, self.conv_a16, co, m, k);
+            return;
+        }
         // ⚠️ `bias.len >= co`, not `== co`. `sd_unet_cuda.gemm` deliberately passes its
         // WHOLE `sess.zeros` array for a null bias (see the comment there: a bias is
         // cached by pointer and sized from the first call's length, so a narrow layer
@@ -2719,21 +2787,25 @@ pub const Backend = struct {
         // run — the published SD CUDA timings were taken on an F32 checkpoint, which
         // routes to `opMatmul`/`opConvF16` instead. Debug-only, since asserts vanish in
         // ReleaseFast, so it was a build-mode-dependent crash rather than a wrong number.
-        std.debug.assert(w_bytes.len == co * k * 2 and bias.len >= co);
+        const bias_s = bias orelse try self.zeroBias(co);
+        std.debug.assert(w_bytes.len == co * k * 2 and bias_s.len >= co);
         std.debug.assert(co % 128 == 0 and k % 32 == 0); // raw weight IS the B operand
         const m_pad = std.mem.alignForward(usize, m, 128);
         const w_db = try self.cachedWeight(w_bytes); // raw bf16, resident, no convert
-        const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias));
+        const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias_s));
         try self.ensureDeviceBuffer(&self.conv_a16, m_pad * k * 2);
         try self.ensureDeviceBuffer(&self.conv_c, m_pad * co * 4);
-        const f_apad = try self.eltFn(elt.f32_to_bf16_pad2d_ptx, "f32_to_bf16_pad2d");
-        try self.eltLaunch(f_apad, src, self.conv_a16, null, null, .{ @intCast(m_pad * k), @intCast(k), @intCast(m), @intCast(k), 0, 0 }, .{ 0, 0 }, m_pad * k);
+        if (!bench_gemm_only) {
+            const f_apad = try self.eltFn(elt.f32_to_bf16_pad2d_ptx, "f32_to_bf16_pad2d");
+            try self.eltLaunch(f_apad, src, self.conv_a16, null, null, .{ @intCast(m_pad * k), @intCast(k), @intCast(m), @intCast(k), 0, 0 }, .{ 0, 0 }, m_pad * k);
+        }
         if (self.kernels == .libs) {
             try self.ltMatmulBf16(self.conv_c, w_db, self.conv_a16, co, m_pad, k);
         } else {
             const f_hg = try self.hgemmBf16Fn();
             try self.launchHgemm(f_hg, self.conv_a16, w_db, self.conv_c, m_pad, co, k);
         }
+        if (bench_gemm_only) return;
         const f_bc = try self.eltFn(elt.bias_compact_ptx, "bias_compact");
         try self.eltLaunch(f_bc, self.conv_c, b_db, dst, null, .{ @intCast(m * co), @intCast(co), @intCast(co), 0, 0, 0 }, .{ 1.0, 0 }, m * co);
     }
@@ -2744,7 +2816,7 @@ pub const Backend = struct {
     /// zero-padded to the coop tile (co→128-mult, k→32-mult, m→128), then
     /// bias_compact strips the pad + adds bias into the tight dst. Handles
     /// any co/k (e.g. the ViT's ffn 4304).
-    pub fn opMatmulBf16(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: []const f32) Error!void {
+    pub fn opMatmulBf16(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: ?[]const f32) Error!void {
         self.ptic();
         defer self.ptoc(.matmul);
         // ⚠️ `bias.len >= co`, not `== co`. `sd_unet_cuda.gemm` deliberately passes its
@@ -2757,12 +2829,13 @@ pub const Backend = struct {
         // run — the published SD CUDA timings were taken on an F32 checkpoint, which
         // routes to `opMatmul`/`opConvF16` instead. Debug-only, since asserts vanish in
         // ReleaseFast, so it was a build-mode-dependent crash rather than a wrong number.
-        std.debug.assert(w_bytes.len == co * k * 2 and bias.len >= co);
+        const bias_s = bias orelse try self.zeroBias(co);
+        std.debug.assert(w_bytes.len == co * k * 2 and bias_s.len >= co);
         const co_pad = std.mem.alignForward(usize, co, 128);
         const k_pad = std.mem.alignForward(usize, k, 32);
         const m_pad = std.mem.alignForward(usize, m, 128);
         const w_db = try self.cachedWeight(w_bytes);
-        const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias));
+        const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias_s));
         try self.ensureDeviceBuffer(&self.conv_w16, co_pad * k_pad * 2);
         try self.ensureDeviceBuffer(&self.conv_a16, m_pad * k_pad * 2);
         try self.ensureDeviceBuffer(&self.conv_c, m_pad * co_pad * 4);
@@ -2783,7 +2856,7 @@ pub const Backend = struct {
     /// Like `opMatmulBf16` but for an f16 weight (some GGUF mmproj towers ship
     /// f16, e.g. Qwen3.5-9B's). Identical except the weight is padded with a
     /// straight f16 copy instead of a bf16→f16 convert.
-    pub fn opMatmulF16(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: []const f32) Error!void {
+    pub fn opMatmulF16(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: ?[]const f32) Error!void {
         self.ptic();
         defer self.ptoc(.matmul);
         // ⚠️ `bias.len >= co`, not `== co`. `sd_unet_cuda.gemm` deliberately passes its
@@ -2796,12 +2869,13 @@ pub const Backend = struct {
         // run — the published SD CUDA timings were taken on an F32 checkpoint, which
         // routes to `opMatmul`/`opConvF16` instead. Debug-only, since asserts vanish in
         // ReleaseFast, so it was a build-mode-dependent crash rather than a wrong number.
-        std.debug.assert(w_bytes.len == co * k * 2 and bias.len >= co);
+        const bias_s = bias orelse try self.zeroBias(co);
+        std.debug.assert(w_bytes.len == co * k * 2 and bias_s.len >= co);
         const co_pad = std.mem.alignForward(usize, co, 128);
         const k_pad = std.mem.alignForward(usize, k, 32);
         const m_pad = std.mem.alignForward(usize, m, 128);
         const w_db = try self.cachedWeight(w_bytes);
-        const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias));
+        const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias_s));
         try self.ensureDeviceBuffer(&self.conv_w16, co_pad * k_pad * 2);
         try self.ensureDeviceBuffer(&self.conv_a16, m_pad * k_pad * 2);
         try self.ensureDeviceBuffer(&self.conv_c, m_pad * co_pad * 4);
@@ -3361,8 +3435,13 @@ pub const Backend = struct {
             try self.rowLaunch(f, x, out, weight, null, .{ @intCast(rows), @intCast(hd), 0, 0, 0, 0 }, .{ eps, 0 }, rows);
             return;
         }
-        const f = try self.eltFn(elt.qk_rmsnorm_ptx, "qk_rmsnorm");
-        try self.eltLaunch(f, x, out, weight, null, .{ @intCast(rows), @intCast(hd), 0, 0, 0, 0 }, .{ eps, 0 }, rows);
+        // Many rows: a WARP each, so the 32 lanes of a load cover one contiguous
+        // line. The one-thread-per-row kernel this replaced was reading a whole
+        // row per lane — see `qk_rmsnorm_warp_ptx` for the measurement, but the
+        // short version is 37-47 GB/s on a 936 GB/s card, and a quarter of a
+        // Z-Image step. 256 threads = 8 rows per block.
+        const f = try self.eltFn(elt.qk_rmsnorm_warp_ptx, "qk_rmsnorm_warp");
+        try self.rowLaunch(f, x, out, weight, null, .{ @intCast(rows), @intCast(hd), 0, 0, 0, 0 }, .{ eps, 0 }, (rows + 7) / 8);
     }
 
     /// interleaved RoPE in place. total = rows*n_heads*half.
@@ -3424,6 +3503,14 @@ pub const Backend = struct {
     }
 
     /// a += b, in place (plain residual add). total = element count.
+    /// `a += b` over two **f16** activations, summed in f32. See `elt.add_h16_ptx`.
+    pub fn opAddH16(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, total: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const f = try self.eltFn(elt.add_h16_ptx, "add_h16");
+        try self.eltLaunch(f, a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+    }
+
     pub fn opAdd(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, total: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
@@ -3536,11 +3623,17 @@ pub const Backend = struct {
         chunks: usize,
         eps: f32,
         silu: bool,
+        /// `x` and `out` are f16 rather than f32. Statistics, weight and bias stay
+        /// f32 either way — they are per-channel, not per-position.
+        act_f16: bool,
     ) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
         const per_group = ch / groups;
-        const f_st = try self.eltFn(elt.gn_stats_ptx, "gn_stats");
+        const f_st = if (act_f16)
+            try self.eltFn(elt.gn_stats_h16_ptx, "gn_stats_h16")
+        else
+            try self.eltFn(elt.gn_stats_ptx, "gn_stats");
         try self.eltLaunch(f_st, x, null, null, gstat, .{
             @intCast(groups * chunks), @intCast(ch), @intCast(chunks), @intCast(per_group), @intCast(n), 0,
         }, .{ 0, 0 }, groups * chunks);
@@ -3548,7 +3641,10 @@ pub const Backend = struct {
         try self.eltLaunch(f_cb, gstat, null, null, gmi, .{
             @intCast(groups), 0, @intCast(chunks), 0, 0, 0,
         }, .{ eps, 0 }, groups);
-        const f_ap = try self.eltFn(elt.gn_apply_ptx, "gn_apply");
+        const f_ap = if (act_f16)
+            try self.eltFn(elt.gn_apply_h16_ptx, "gn_apply_h16")
+        else
+            try self.eltFn(elt.gn_apply_ptx, "gn_apply");
         try self.eltLaunch(f_ap, x, out, cat, gmi, .{
             @intCast(n * ch), @intCast(ch), @intCast(per_group), @intCast(groups), @intCast(ch), @intFromBool(silu),
         }, .{ 0, 0 }, n * ch);
@@ -3622,10 +3718,15 @@ pub const Backend = struct {
         p0: usize,
         out_w: usize,
         mode: u2,
+        /// The SOURCE activation is f16; the patch written is f32 either way.
+        src_f16: bool,
     ) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
-        const f = try self.eltFn(elt.im2col_sd_ptx, "im2col_sd");
+        const f = if (src_f16)
+            try self.eltFn(elt.im2col_sd_h16_ptx, "im2col_sd_h16")
+        else
+            try self.eltFn(elt.im2col_sd_ptx, "im2col_sd");
         const total = bn * patch_len;
         // The output width rides in f1's raw bits: this kernel signature has six
         // u32 slots and the band already needs all of them.

@@ -2165,7 +2165,15 @@ export fn attn_scores() callconv(.spirv_kernel) void {
     const kv_head = head / (pc.u1 / pc.u2);
     const j0 = gpu.global_invocation_id[0] * amm_tile;
     const q0 = gpu.global_invocation_id[1] * amm_tile;
-    if (j0 >= seq or q0 >= seq) return;
+    // Query banding (u6 != 0): compute rows [u5, u5+u6) of the scores plane into a
+    // band-local buffer of `u6` rows. u6 == 0 is the whole plane, exactly as before —
+    // every pre-existing caller passes 0 for both, so their behaviour is unchanged
+    // by construction. Exists because the VAE mid-block attends over EVERY latent
+    // position: at a 132x198 latent that is seq = 26,136 and a full f32 plane is
+    // 2.73 GB, which dwarfs the decode it belongs to.
+    const qb = if (pc.u6 == 0) seq else pc.u6;
+    const qoff = pc.u5;
+    if (j0 >= seq or q0 >= qb) return;
 
     // Inputs are per-head k-major (gather_kmajor): row k of head h starts at
     // (h*hd + k) * seq. All tile loads are contiguous runs of amm_tile.
@@ -2178,7 +2186,7 @@ export fn attn_scores() callconv(.spirv_kernel) void {
         var qv: [amm_tile]f32 = undefined;
         var kv: [amm_tile]f32 = undefined;
         inline for (0..amm_tile) |i| {
-            qv[i] = a.data[qrow0 + k * seq + q0 + i];
+            qv[i] = a.data[qrow0 + k * seq + qoff + q0 + i];
             kv[i] = b.data[krow0 + k * seq + j0 + i];
         }
         inline for (0..amm_tile) |i| {
@@ -2191,11 +2199,13 @@ export fn attn_scores() callconv(.spirv_kernel) void {
     const z = gpu.global_invocation_id[2];
     inline for (0..amm_tile) |i| {
         const q = q0 + i;
-        if (q < seq) {
+        // Band-local: `q` indexes the band, `qoff + q` the real query. The row
+        // stride stays `seq` (a whole key row) and only the PLANE shrinks to `qb`.
+        if (q < qb and qoff + q < seq) {
             inline for (0..amm_tile) |jj| {
                 const j = j0 + jj;
                 if (j < seq) {
-                    d.data[(z * seq + q) * seq + j] = acc[i][jj] * pc.f0;
+                    d.data[(z * qb + q) * seq + j] = acc[i][jj] * pc.f0;
                 }
             }
         }
@@ -2296,7 +2306,12 @@ export fn attn_out() callconv(.spirv_kernel) void {
     const kv_head = head / (pc.u1 / pc.u2);
     const c0 = gpu.global_invocation_id[0] * amm_tile;
     const q0 = gpu.global_invocation_id[1] * amm_tile;
-    if (c0 >= hd or q0 >= seq) return;
+    // ⚠️ `u6` carries the query-band offset **plus one**, so that 0 keeps meaning
+    // "not banded" — the kernel has exactly one free push slot and needs to
+    // distinguish "band starting at row 0" from "no banding". See `attn_scores`.
+    const banded = pc.u6 != 0;
+    const qoff = if (banded) pc.u6 - 1 else 0;
+    if (c0 >= hd or (!banded and q0 >= seq) or qoff + q0 >= seq) return;
 
     // Scores layout: row stride u5, per-head plane stride in f0 (u32 bits) —
     // the tensor-core scores path pads both to multiples of 128.
@@ -2307,7 +2322,10 @@ export fn attn_out() callconv(.spirv_kernel) void {
     const splane: u32 = @bitCast(pc.f0);
     var pb: [amm_tile]u32 = undefined;
     inline for (0..amm_tile) |i| {
-        pb[i] = z * splane + @min(q0 + i, s_max) * sstr;
+        // Banded: rows are band-local and the caller sizes the band buffer to a whole
+        // multiple of the tile, so `q0 + i` is always in range and needs no clamp.
+        const row: u32 = if (banded) q0 + @as(u32, @intCast(i)) else @min(q0 + @as(u32, @intCast(i)), s_max);
+        pb[i] = z * splane + row * sstr;
     }
     const vb = kv_head * hd + c0;
     // f1 != 0 => causal: row q attends only to keys j <= q (encoder path;
@@ -2326,7 +2344,7 @@ export fn attn_out() callconv(.spirv_kernel) void {
             vv[u] = c.data[j * kv_stride + vb + u];
         }
         inline for (0..amm_tile) |i| {
-            if (causal == 0 or j <= q0 + i) {
+            if (causal == 0 or j <= qoff + q0 + i) {
                 const s = a.data[pb[i] + j];
                 const m_new = @max(m[i], s);
                 const corr = @exp(m[i] - m_new);
@@ -2342,7 +2360,8 @@ export fn attn_out() callconv(.spirv_kernel) void {
 
     const q_stride = pc.u1 * hd;
     inline for (0..amm_tile) |i| {
-        const q = q0 + i;
+        // Banded: the OUTPUT row is the real query, `qoff + q0 + i`.
+        const q = qoff + q0 + i;
         if (q < seq) {
             const inv = 1.0 / denom[i];
             inline for (0..amm_tile) |u| {

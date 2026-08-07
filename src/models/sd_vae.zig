@@ -33,9 +33,37 @@ const WeightStore = weights_mod.WeightStore;
 const Weight = ops.matmul.Weight;
 const Conv2d = ops.conv.Conv2d;
 
-/// SD1.5 and SDXL share this decoder shape; only the weights differ.
+/// Which spelling a checkpoint uses for the *same* `AutoencoderKL` graph.
+///
+/// ⚠️ These are two naming schemes over identical arithmetic, and the up-block
+/// index runs in **opposite directions**: LDM numbers levels from the outermost
+/// (execution runs `up.3 … up.0`) while diffusers stores them already reversed
+/// (execution runs `up_blocks.0 … up_blocks.3`). Reading one as the other loads a
+/// decoder that runs and inverts the channel ramp.
+///
+/// ⚠️ **Detected from the store, never configured** (`Decoder.detectNaming`), because
+/// it is a property of the FILE and not of the architecture: the very same 16-channel
+/// Z-Image VAE ships both ways — the official `ae.safetensors` the ComfyUI template
+/// points at is LDM-named, while `z-image-turbo.vae.safetensors` is diffusers-named.
+/// A config field here would be a flag that can disagree with the bytes.
+pub const Naming = enum {
+    /// LDM / `first_stage_model` (SD1.5, SDXL): `decoder.mid.block_1`,
+    /// `decoder.up.3.block.0`, `nin_shortcut`, `decoder.norm_out`, and a middle
+    /// attention stored as four **1x1 convolutions** (`q`/`k`/`v`/`proj_out`).
+    ldm,
+    /// diffusers `AutoencoderKL` (the Flux / Z-Image VAE exports):
+    /// `decoder.mid_block.resnets.0`, `decoder.up_blocks.0.resnets.0`,
+    /// `conv_shortcut`, `decoder.conv_norm_out`, and a middle attention stored as
+    /// **`nn.Linear`** (`to_q`/`to_k`/`to_v`/`to_out.0`) with `group_norm` for its
+    /// norm. A `[c, c]` Linear and a `[c, c, 1, 1]` convolution hold the same bytes
+    /// in the same order, so only the shape check has to accommodate both.
+    diffusers,
+};
+
+/// SD1.5, SDXL and the 16-channel Flux/Z-Image VAE share this decoder shape; only
+/// the widths, the latent channel count, the naming and the latent scaling differ.
 pub const Config = struct {
-    /// Latent channels (4).
+    /// Latent channels: 4 for SD, 16 for Flux/Z-Image.
     z_channels: usize,
     /// Base width; `block_out_channels` below are multiples of it.
     base_channels: usize,
@@ -47,6 +75,25 @@ pub const Config = struct {
     norm_eps: f32,
     /// What `decode` assumes the caller already divided the latent by.
     scaling_factor: f32,
+    /// What `decode` assumes the caller already ADDED, after the divide
+    /// (`latent_formats.Flux.process_out` is `latent / scale + shift`). Zero for
+    /// SD, whose latent format has no shift term.
+    shift_factor: f32 = 0,
+    /// Store the decoder's running activations as **f16** rather than f32, halving
+    /// the two widest buffers — at 1056x1584 those hold 256 channels at full image
+    /// resolution (428M elements each), so this is most of a whole-image decode's
+    /// VRAM. The arithmetic is unchanged: every GEMM already ran f16 operands with
+    /// an f32 accumulator, and the norms still reduce in f32.
+    ///
+    /// ⚠️ **RANGE decides this, not precision, and the answer differs per
+    /// architecture.** These buffers carry the residual stream, whose measured peak
+    /// is ~489 for the Flux/Z-Image VAE and ~7e3 for SD1.5 — both far inside f16's
+    /// 65504 — but **4.2e5 for SDXL's**, which is why `sd_vae_cuda.residual_act_div`
+    /// exists at all. An f16 buffer cannot hold a value the divisor was invented to
+    /// sneak through a cast, so the two are alternatives and this stays off for
+    /// SDXL. It is a per-config constant rather than a probe because a decode
+    /// cannot discover its own peak before allocating.
+    act_f16: bool = false,
 
     pub fn levels(self: Config) usize {
         return self.block_out_channels.len;
@@ -65,6 +112,7 @@ pub const sd15: Config = .{
     .norm_groups = 32,
     .norm_eps = 1e-6,
     .scaling_factor = 0.18215,
+    .act_f16 = true,
 };
 
 /// SDXL's VAE is **architecturally identical** to SD1.5's — same widths, same depth, same
@@ -79,6 +127,22 @@ pub const sdxl: Config = .{
     .norm_groups = 32,
     .norm_eps = 1e-6,
     .scaling_factor = 0.13025,
+};
+
+/// The 16-channel `AutoencoderKL` the Flux lineage uses, which Z-Image inherits
+/// through `Lumina2` (`latent_formats.Flux`). Architecturally the SD decoder with
+/// four times the latent width; the naming and the absence of `post_quant_conv` are
+/// discovered from the file rather than stated here.
+pub const flux: Config = .{
+    .z_channels = 16,
+    .base_channels = 128,
+    .block_out_channels = &.{ 128, 256, 512, 512 },
+    .layers_per_block = 3,
+    .norm_groups = 32,
+    .norm_eps = 1e-6,
+    .scaling_factor = 0.3611,
+    .shift_factor = 0.1159,
+    .act_f16 = true,
 };
 
 pub const latent_channels = 4;
@@ -165,10 +229,48 @@ pub const Level = struct {
     upsample: ?Conv2d,
 };
 
+/// The two activation widths a decode needs, in f32 elements.
+///
+/// ⚠️ **They are NOT the same number, and treating them as one over-allocated a
+/// third of every decode.** `x` (the running activation) and `t` (a norm's output)
+/// both reach the widest tensor in the ladder — for a 16-channel VAE at 1056x1584
+/// that is 256 channels at FULL image resolution, 428M floats — but `u` only ever
+/// receives a convolution's OUTPUT, so it peaks one level narrower (128 channels at
+/// full resolution, 214M). Sizing all three at `wide` cost **856 MB** per decode,
+/// and made `estimatePeakBytes` demand room the decode never used.
+pub const ActWidths = struct { wide: u64, out: u64 };
+
+pub fn activationElems(cfg: Config, zh: usize, zw: usize) ActWidths {
+    var lh: u64 = zh;
+    var lw: u64 = zw;
+    var c: u64 = cfg.innermost();
+    var wide: u64 = 0;
+    var out: u64 = 0;
+    for (0..cfg.levels()) |i| {
+        const level_idx = cfg.levels() - 1 - i;
+        const out_ch: u64 = cfg.block_out_channels[level_idx];
+        wide = @max(wide, lh * lw * @max(c, out_ch));
+        out = @max(out, lh * lw * out_ch);
+        c = out_ch;
+        if (level_idx > 0) {
+            lh *= 2;
+            lw *= 2;
+        }
+    }
+    wide = @max(wide, lh * lw * @max(c, 3));
+    out = @max(out, lh * lw * 3); // conv_out writes 3 channels at full resolution
+    return .{ .wide = wide, .out = out };
+}
+
 pub const Decoder = struct {
     arena: std.heap.ArenaAllocator,
     cfg: Config,
-    post_quant: Conv2d,
+    /// The spelling this checkpoint turned out to use. See `Naming`.
+    naming: Naming,
+    /// ⚠️ Null for the Flux-lineage VAE, which has no `post_quant_conv` at all —
+    /// BFL dropped both `quant_conv` and `post_quant_conv`, so requiring it would
+    /// fail the load of every Flux/Z-Image VAE in existence.
+    post_quant: ?Conv2d,
     conv_in: Conv2d,
     mid1: Resnet,
     mid_attn: AttnBlock,
@@ -178,49 +280,90 @@ pub const Decoder = struct {
     norm_out: GroupNormW,
     conv_out: Conv2d,
 
+    /// Which naming scheme this store uses, from a tensor only one of them has.
+    ///
+    /// ⚠️ Probed on the **middle block**, deliberately: `decoder.conv_in` and
+    /// `decoder.conv_out` are spelled identically in both schemes, so the obvious
+    /// entry points cannot tell them apart. `decoder.mid_block.resnets.0` exists
+    /// only in diffusers exports.
+    ///
+    /// Defaulting to LDM on an unrecognized store is safe — the very next lookup is
+    /// `decoder.mid.block_1.norm1.weight`, which reports the missing tensor by name.
+    pub fn detectNaming(store: WeightStore, prefix: []const u8) Naming {
+        var buf: [200]u8 = undefined;
+        const nm = std.fmt.bufPrint(&buf, "{s}decoder.mid_block.resnets.0.norm1.weight", .{prefix}) catch return .ldm;
+        return if (store.get(nm) != null) .diffusers else .ldm;
+    }
+
     /// `prefix` is where the autoencoder sits: `first_stage_model.` in an LDM
     /// single-file checkpoint, `""` for a bare diffusers-style VAE export.
     pub fn load(gpa: std.mem.Allocator, store: WeightStore, cfg: Config, prefix: []const u8) !Decoder {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const alloc = arena.allocator();
-        const l: Loader = .{ .store = store, .alloc = alloc, .pfx = prefix, .cfg = cfg };
+        const naming = detectNaming(store, prefix);
+        const l: Loader = .{ .store = store, .alloc = alloc, .pfx = prefix, .cfg = cfg, .naming = naming };
 
         const inner = cfg.innermost();
-        const post_quant = try l.conv("post_quant_conv", .{}, cfg.z_channels, cfg.z_channels, 1, 1, 0);
+        const ldm = naming == .ldm;
+        const post_quant = if (l.has("post_quant_conv.weight"))
+            try l.conv("post_quant_conv", .{}, cfg.z_channels, cfg.z_channels, 1, 1, 0)
+        else
+            null;
         const conv_in = try l.conv("decoder.conv_in", .{}, inner, cfg.z_channels, 3, 1, 1);
-        const mid1 = try l.resnet("decoder.mid.block_1", .{}, inner, inner);
-        const mid_attn = try l.attn("decoder.mid.attn_1", .{}, inner);
-        const mid2 = try l.resnet("decoder.mid.block_2", .{}, inner, inner);
+        const mid1 = if (ldm)
+            try l.resnet("decoder.mid.block_1", .{}, inner, inner)
+        else
+            try l.resnet("decoder.mid_block.resnets.0", .{}, inner, inner);
+        const mid_attn = if (ldm)
+            try l.attn("decoder.mid.attn_1", .{}, inner)
+        else
+            try l.attn("decoder.mid_block.attentions.0", .{}, inner);
+        const mid2 = if (ldm)
+            try l.resnet("decoder.mid.block_2", .{}, inner, inner)
+        else
+            try l.resnet("decoder.mid_block.resnets.1", .{}, inner, inner);
 
-        // Execution order: the highest `up` index first. `ch` tracks the width coming
-        // in, which changes at the first resnet of a level whenever the level is
-        // narrower than the one before it.
+        // Execution order: innermost level first. ⚠️ LDM numbers that level
+        // `levels-1` and diffusers numbers it `0` — the same walk under two indices.
+        // `ch` tracks the width coming in, which changes at the first resnet of a
+        // level whenever the level is narrower than the one before it.
         const levels = try alloc.alloc(Level, cfg.levels());
         var ch = inner;
         for (0..cfg.levels()) |i| {
-            const level_idx = cfg.levels() - 1 - i; // 3, 2, 1, 0
-            const out_ch = cfg.block_out_channels[level_idx];
+            const ldm_idx = cfg.levels() - 1 - i; // 3, 2, 1, 0
+            const idx = if (ldm) ldm_idx else i;
+            const out_ch = cfg.block_out_channels[ldm_idx];
             const blocks = try alloc.alloc(Resnet, cfg.layers_per_block);
             for (blocks, 0..) |*b, j| {
-                b.* = try l.resnet("decoder.up.{d}.block.{d}", .{ level_idx, j }, ch, out_ch);
+                b.* = if (ldm)
+                    try l.resnet("decoder.up.{d}.block.{d}", .{ idx, j }, ch, out_ch)
+                else
+                    try l.resnet("decoder.up_blocks.{d}.resnets.{d}", .{ idx, j }, ch, out_ch);
                 ch = out_ch;
             }
+            // The last level executed (the outermost) has no upsample in either
+            // scheme; it is `up.0` for LDM and `up_blocks.levels-1` for diffusers.
+            const has_up = i + 1 < cfg.levels();
             levels[i] = .{
                 .blocks = blocks,
-                .upsample = if (level_idx > 0)
-                    try l.conv("decoder.up.{d}.upsample.conv", .{level_idx}, ch, ch, 3, 1, 1)
+                .upsample = if (!has_up) null else if (ldm)
+                    try l.conv("decoder.up.{d}.upsample.conv", .{idx}, ch, ch, 3, 1, 1)
                 else
-                    null,
+                    try l.conv("decoder.up_blocks.{d}.upsamplers.0.conv", .{idx}, ch, ch, 3, 1, 1),
             };
         }
 
-        const norm_out = try l.groupNorm("decoder.norm_out", .{}, ch);
+        const norm_out = if (ldm)
+            try l.groupNorm("decoder.norm_out", .{}, ch)
+        else
+            try l.groupNorm("decoder.conv_norm_out", .{}, ch);
         const conv_out = try l.conv("decoder.conv_out", .{}, 3, ch, 3, 1, 1);
 
         return .{
             .arena = arena,
             .cfg = cfg,
+            .naming = naming,
             .post_quant = post_quant,
             .conv_in = conv_in,
             .mid1 = mid1,
@@ -248,28 +391,40 @@ pub const Decoder = struct {
     /// (doubled) resolution, so sizing off `block_out_channels` alone
     /// under-estimates by 2x — the same trap that cost a wrong decode in
     /// `sd_vae_gpu`.
-    pub fn estimatePeakBytes(self: *const Decoder, zh: usize, zw: usize) u64 {
-        const cfg = self.cfg;
-        var lh: u64 = zh;
-        var lw: u64 = zw;
-        var c: u64 = cfg.innermost();
-        var max_elems: u64 = 0;
-        for (0..cfg.levels()) |i| {
-            const level_idx = cfg.levels() - 1 - i;
-            const out_ch: u64 = cfg.block_out_channels[level_idx];
-            max_elems = @max(max_elems, lh * lw * @max(c, out_ch));
-            c = out_ch;
-            if (level_idx > 0) {
-                lh *= 2;
-                lw *= 2;
-            }
-        }
-        max_elems = @max(max_elems, lh * lw * @max(c, 3));
+    /// `scores_resident` says whether the caller's mid-block attention materializes
+    /// the O(seq²) scores plane. ⚠️ It is a PARAMETER because the two GPU backends
+    /// genuinely differ, and guessing either way costs something real: `sd_vae_gpu`
+    /// materializes an f32 plane, while both CUDA arms stream (cuDNN's fused SDPA
+    /// under `.libs`, `be.attn`'s online softmax otherwise) and allocate nothing.
+    /// At a 132x198 latent that term is **2.73 GB** — charging it on CUDA made the
+    /// ladder evict 2.4 GB of resident DiT weights before a decode that never needed
+    /// the room, and then re-stream them for the next image.
+    /// `act_f16` is the CALLER's storage format, not `cfg.act_f16`: only the CUDA
+    /// decoder implements it, and reporting the narrow figure to a backend that
+    /// still stores f32 would send the ladder into a whole-image decode that cannot
+    /// fit — an OOM discovered the expensive way, which is exactly what this
+    /// estimate exists to avoid.
+    pub fn estimatePeakBytes(self: *const Decoder, zh: usize, zw: usize, scores_resident: bool, act_f16: bool) u64 {
+        const w = activationElems(self.cfg, zh, zw);
+        const max_elems = w.wide;
         // q/k/v/out at latent resolution + the O(seq^2) mid-block scores plane
         // (f16 on the GPU paths, which query-tile it, so this term is generous).
         const seq: u64 = @as(u64, zh) * zw;
-        const attn = 4 * seq * cfg.innermost() * 4 + seq * seq * 2;
-        return 3 * max_elems * 4 + attn;
+        // ⚠️ 4 bytes for the scores plane, not 2: `sd_vae_gpu` materializes it in f32
+        // (the Flux VAE's logits overflow f16 — see that file's `attn`). Under-reporting
+        // it here is what would make the ladder attempt a whole-image decode that cannot
+        // fit and discover it as an allocation failure.
+        // ⚠️ `scores_resident` is the Vulkan arm, which materializes ONE QUERY BAND
+        // of the plane (`sd_vae_gpu.scoresBand`), not the whole `seq²`. Both GPU
+        // arms also keep a k-major f32 copy of Q and K.
+        const band: u64 = @min(seq, (64 << 20) / @max(seq, 1));
+        const attn = 4 * seq * self.cfg.innermost() * 4 +
+            if (scores_resident) 2 * seq * self.cfg.innermost() * 4 + band * seq * 4 else 0;
+        // ⚠️ The activation buffers narrow with `act_f16`; the attention scratch does
+        // not (q/k/v/out stay f32 — they are at latent resolution, and both GPU
+        // attention paths take f32 buffers).
+        const abytes: u64 = if (act_f16) 2 else 4;
+        return (2 * max_elems + w.out) * abytes + attn;
     }
 
     /// `z` is channel-last `[lat_h*lat_w][z_channels]`, already divided by
@@ -288,7 +443,11 @@ pub const Decoder = struct {
 
         const pq = try gpa.alloc(f32, z.len);
         defer gpa.free(pq);
-        try ops.conv.conv2d(io, gpa, pq, z, lat_h, lat_w, self.post_quant);
+        if (self.post_quant) |c| {
+            try ops.conv.conv2d(io, gpa, pq, z, lat_h, lat_w, c);
+        } else {
+            @memcpy(pq, z);
+        }
 
         var h = lat_h;
         var w = lat_w;
@@ -433,6 +592,15 @@ const Loader = struct {
     pfx: []const u8,
     cfg: Config,
 
+    naming: Naming,
+
+    /// Whether a tensor (named relative to the store prefix) is present.
+    fn has(l: Loader, rel: []const u8) bool {
+        var buf: [200]u8 = undefined;
+        const nm = std.fmt.bufPrint(&buf, "{s}{s}", .{ l.pfx, rel }) catch return false;
+        return l.store.get(nm) != null;
+    }
+
     fn view(l: Loader, nm: []const u8) !safetensors.TensorView {
         return l.store.get(nm) orelse {
             std.log.err("sd_vae: missing {s}", .{nm});
@@ -471,7 +639,12 @@ const Loader = struct {
         const nm = try l.name(&buf, fmt, args, ".weight");
         const v = try l.view(nm);
         const shape = v.info.shape.slice();
-        if (shape.len != 4 or shape[0] != co or shape[1] != ci or shape[2] != k or shape[3] != k) {
+        // A 1x1 convolution and an `nn.Linear` of the same widths are byte-identical
+        // row-major, and diffusers stores the VAE's middle attention as the latter,
+        // so `[co, ci]` is accepted wherever `[co, ci, 1, 1]` is.
+        const ok = (shape.len == 4 and shape[0] == co and shape[1] == ci and shape[2] == k and shape[3] == k) or
+            (k == 1 and shape.len == 2 and shape[0] == co and shape[1] == ci);
+        if (!ok) {
             std.log.err("sd_vae: {s} has shape {any}, expected [{d}, {d}, {d}, {d}]", .{ nm, shape, co, ci, k, k });
             return error.ShapeMismatch;
         }
@@ -502,7 +675,10 @@ const Loader = struct {
             .conv1 = try l.conv("{s}.conv1", .{base}, out_ch, in_ch, 3, 1, 1),
             .norm2 = try l.groupNorm("{s}.norm2", .{base}, out_ch),
             .conv2 = try l.conv("{s}.conv2", .{base}, out_ch, out_ch, 3, 1, 1),
-            .nin = if (in_ch != out_ch) try l.conv("{s}.nin_shortcut", .{base}, out_ch, in_ch, 1, 1, 0) else null,
+            .nin = if (in_ch == out_ch) null else if (l.naming == .ldm)
+                try l.conv("{s}.nin_shortcut", .{base}, out_ch, in_ch, 1, 1, 0)
+            else
+                try l.conv("{s}.conv_shortcut", .{base}, out_ch, in_ch, 1, 1, 0),
             .in_ch = in_ch,
             .out_ch = out_ch,
         };
@@ -511,6 +687,16 @@ const Loader = struct {
     fn attn(l: Loader, comptime fmt: []const u8, args: anytype, ch: usize) !AttnBlock {
         var buf: [200]u8 = undefined;
         const base = try std.fmt.bufPrint(&buf, fmt, args);
+        // diffusers stores these four as `nn.Linear` rather than 1x1 convolutions.
+        // Same bytes, same order; `conv` accepts the 2-D shape when k == 1.
+        if (l.naming == .diffusers) return .{
+            .norm = try l.groupNorm("{s}.group_norm", .{base}, ch),
+            .q = try l.conv("{s}.to_q", .{base}, ch, ch, 1, 1, 0),
+            .k = try l.conv("{s}.to_k", .{base}, ch, ch, 1, 1, 0),
+            .v = try l.conv("{s}.to_v", .{base}, ch, ch, 1, 1, 0),
+            .proj = try l.conv("{s}.to_out.0", .{base}, ch, ch, 1, 1, 0),
+            .channels = ch,
+        };
         return .{
             .norm = try l.groupNorm("{s}.norm", .{base}, ch),
             .q = try l.conv("{s}.q", .{base}, ch, ch, 1, 1, 0),
@@ -737,4 +923,123 @@ test "the SD latent2rgb preview matches ComfyUI's factors, bias and clamp" {
     try testing.expectEqualSlices(u8, &.{ 141, 125, 127 }, rgb[0..3]);
     latentPreviewInto(&rgb, &z_xl, 1, plane, &latent_rgb_factors_sd15, latent_rgb_bias_sd15);
     try testing.expectEqualSlices(u8, &.{ 127, 127, 127 }, rgb[0..3]);
+}
+
+const zimage_ref_path = "src/models/assets/zimage_ref.safetensors";
+const zimage_vae_ckpt = "/home/qt/genai/comfyui/models/vae/z-image-turbo.vae.safetensors";
+
+test "the 16-channel Flux/Z-Image VAE decoder matches ComfyUI's AutoencoderKL" {
+    // Same decoder graph as SD's, so what this actually exercises is the three
+    // things the `flux` config changes, each of which fails differently:
+    //   - **diffusers naming**, whose up-block index runs the OPPOSITE way. Reading
+    //     it as LDM would invert the channel ramp, which fails as a shape mismatch
+    //     at the first level rather than as a bad image — but only because the
+    //     widths happen to differ; a symmetric ramp would decode silently wrong.
+    //   - **no `post_quant_conv`**, which under the old loader was a hard
+    //     MissingTensor on every Flux-lineage VAE in existence.
+    //   - **16 latent channels**, which changes only `conv_in`'s input width.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    try test_gate.requireIntegration();
+    try test_gate.requireModelFile(io, zimage_vae_ckpt);
+    try test_gate.requireModelFile(io, zimage_ref_path);
+
+    var ref = try safetensors.SafeTensors.open(gpa, io, zimage_ref_path);
+    defer ref.deinit();
+    var ck = try safetensors.SafeTensors.open(gpa, io, zimage_vae_ckpt);
+    defer ck.deinit();
+
+    var dec = try Decoder.load(gpa, .{ .safetensors = &ck }, flux, "");
+    defer dec.deinit();
+    try testing.expect(dec.post_quant == null);
+
+    // 8x8 keeps every convolution in one im2col band; 32x32 bands many ways and
+    // attends over 1024 positions.
+    for ([_]usize{ 0, 1 }) |ci| {
+        var kb: [32]u8 = undefined;
+        const z_planar = try (try ref.require(try std.fmt.bufPrint(&kb, "vae.{d}.z", .{ci}))).toF32Alloc(gpa);
+        defer gpa.free(z_planar);
+        const want_planar = try (try ref.require(try std.fmt.bufPrint(&kb, "vae.{d}.rgb", .{ci}))).toF32Alloc(gpa);
+        defer gpa.free(want_planar);
+
+        const zc = flux.z_channels;
+        const lat = std.math.sqrt(z_planar.len / zc);
+        const z = try gpa.alloc(f32, z_planar.len);
+        defer gpa.free(z);
+        for (0..lat * lat) |p| {
+            for (0..zc) |c| z[p * zc + c] = z_planar[c * lat * lat + p];
+        }
+
+        const rgb = try dec.decode(io, gpa, z, lat, lat);
+        defer gpa.free(rgb);
+
+        const px = lat * 8 * lat * 8;
+        try testing.expectEqual(px * 3, rgb.len);
+        var l2_ref: f64 = 0;
+        var l2_err: f64 = 0;
+        for (0..px) |p| {
+            for (0..3) |c| {
+                const e = want_planar[c * px + p];
+                const a = rgb[p * 3 + c];
+                l2_ref += @as(f64, e) * e;
+                l2_err += @as(f64, e - a) * (e - a);
+            }
+        }
+        const rel = @sqrt(l2_err / l2_ref);
+        errdefer std.debug.print("flux vae decode at {d}px: rel L2 {d:.6}\n", .{ lat * 8, rel });
+        // Measured 2e-6 at 64px against an f32 reference — the decode is exact up to
+        // reduction order, so this bound is deliberately far tighter than the SD
+        // cases above (whose references are stored f16).
+        try testing.expect(rel < 1e-4);
+    }
+}
+
+test "the Flux VAE config differs from SD's only in the latent width and scaling" {
+    // The decoder body is shared, so an accidental edit to one config silently
+    // changes the other family's decode. Pin what is shared and what is not.
+    try testing.expectEqualSlices(usize, sd15.block_out_channels, flux.block_out_channels);
+    try testing.expectEqual(sd15.layers_per_block, flux.layers_per_block);
+    try testing.expectEqual(sd15.norm_groups, flux.norm_groups);
+    try testing.expectEqual(sd15.norm_eps, flux.norm_eps);
+
+    try testing.expectEqual(@as(usize, 4), sd15.z_channels);
+    try testing.expectEqual(@as(usize, 16), flux.z_channels);
+    // SD's latent format has no shift term; Flux's does, and dropping it decodes a
+    // latent offset by 0.116 — a plausible image with a colour cast.
+    try testing.expectEqual(@as(f32, 0), sd15.shift_factor);
+    try testing.expect(flux.shift_factor != 0);
+}
+
+test "VAE naming is detected from the store, and the same VAE ships both ways" {
+    // ⚠️ The claim this exists to check is not "detection works" but that BOTH
+    // spellings are real: the official `ae.safetensors` the ComfyUI Z-Image template
+    // points at is LDM-named while `z-image-turbo.vae.safetensors` is
+    // diffusers-named, and they are the same 244-tensor 16-channel decoder. A config
+    // field for the naming would be right for one of them and wrong for the other.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    try test_gate.requireIntegration();
+
+    const cases = [_]struct { path: []const u8, want: Naming }{
+        .{ .path = "/home/qt/genai/comfyui/models/vae/ae.safetensors", .want = .ldm },
+        .{ .path = zimage_vae_ckpt, .want = .diffusers },
+    };
+    var seen: usize = 0;
+    for (cases) |c| {
+        test_gate.requireModelFile(io, c.path) catch continue;
+        var st = try safetensors.SafeTensors.open(gpa, io, c.path);
+        defer st.deinit();
+        const store: WeightStore = .{ .safetensors = &st };
+        errdefer std.debug.print("{s}: detected {t}, expected {t}\n", .{ c.path, Decoder.detectNaming(store, ""), c.want });
+        try testing.expectEqual(c.want, Decoder.detectNaming(store, ""));
+
+        // And both load into the same decoder shape through that detection.
+        var dec = try Decoder.load(gpa, store, flux, "");
+        defer dec.deinit();
+        try testing.expectEqual(c.want, dec.naming);
+        try testing.expect(dec.post_quant == null);
+        try testing.expectEqual(@as(usize, 4), dec.levels.len);
+        seen += 1;
+    }
+    if (seen == 0) return error.SkipZigTest;
 }

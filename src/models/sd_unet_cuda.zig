@@ -551,7 +551,7 @@ fn groupNorm(
     silu: bool,
 ) !void {
     const cat = try sess.normBuf(be, nw);
-    try be.opGroupNorm(src.*, dst.*, cat, ws.gstat, ws.gmi, n, ch, cfg.norm_groups, gn_chunks, cfg.norm_eps, silu);
+    try be.opGroupNorm(src.*, dst.*, cat, ws.gstat, ws.gmi, n, ch, cfg.norm_groups, gn_chunks, cfg.norm_eps, silu, false);
 }
 
 /// A GEMM against a checkpoint weight, routed by the dtype it was stored in.
@@ -663,13 +663,53 @@ pub fn convIntoScaled(
     mode: SampleMode,
     act_div: f32,
 ) !void {
+    return convIntoPrec(be, patch, dst, src, h, w, cv, mode, act_div, false, false);
+}
+
+/// `convIntoScaled` with f16 activation STORAGE selectable on either side. The GEMM
+/// is unchanged — it already ran f16 operands with an f32 accumulator; `src_f16` /
+/// `dst_f16` only say how the big activation buffers are laid out in memory, which
+/// is where a VAE decode's gigabytes live.
+///
+/// ⚠️ For a 3x3 the **patch stays f32** (it is banded, a few MB), so `src_f16` is
+/// consumed by the im2col gather and the GEMM's own source is f32 either way.
+///
+/// ⚠️ `src_f16` and `act_div != 1` are MUTUALLY EXCLUSIVE, and that is a property of
+/// the problem rather than a limitation: `act_div` exists because a value too large
+/// for f16 has to be scaled down before the cast, and an f16 *buffer* could not have
+/// held that value in the first place. `sd_vae.Config.act_f16` is off exactly where
+/// `act_div` is load-bearing (SDXL).
+pub fn convIntoPrec(
+    be: *Backend,
+    patch: *Buf,
+    dst: *Buf,
+    src: *const Buf,
+    h: usize,
+    w: usize,
+    cv: Conv2d,
+    mode: SampleMode,
+    act_div: f32,
+    src_f16: bool,
+    dst_f16: bool,
+) !void {
+    std.debug.assert(!(src_f16 and act_div != 1.0));
     const cb = cv.b orelse return error.MissingConvBias;
-    const coop = cv.co >= coop_min_co;
+    // ⚠️ f16 storage FORCES the cooperative path, because the f32 GEMM arm has no
+    // f16 form. `coop_min_co` is a performance threshold, not a correctness one
+    // (padding `co` to the tile costs more than the tensor cores return below it),
+    // so widening it here is free of consequence — and not widening it was a real
+    // bug: SD1.5's `post_quant_conv` is 4->4, fell to the f32 arm, and wrote f32
+    // into an f16 buffer. Every pixel non-finite, caught by `sd-cuda-test`'s sweep.
+    const coop = cv.co >= coop_min_co or src_f16 or dst_f16;
     if (cv.k == 1) {
         std.debug.assert(mode == .stride1);
         const n = h * w;
-        try probeInput(be, src.*, n, convWeight(cv, cv.ci));
-        if (coop) return be.opConvF16Scaled(dst.*, 0, src.*, n, std.mem.sliceAsBytes(cv.w), cv.co, cv.ci, cb, act_div);
+        // ⚠️ The activation-capture probe reads f32; an f16 buffer would be filed as
+        // noise, so it is skipped rather than lied to (capture and f16 storage are
+        // not used together — one is a measurement run, the other a render).
+        if (!src_f16) try probeInput(be, src.*, n, convWeight(cv, cv.ci));
+        if (coop) return be.opConvF16Prec(dst.*, 0, src.*, n, std.mem.sliceAsBytes(cv.w), cv.co, cv.ci, cb, act_div, src_f16, dst_f16);
+        std.debug.assert(!src_f16 and !dst_f16); // unreachable: `coop` covers those
         return be.opMatmul(dst.*, 0, src.*, 0, n, std.mem.sliceAsBytes(cv.w), false, cv.co, cv.ci, 1.0, cb);
     }
     std.debug.assert(cv.k == 3);
@@ -692,13 +732,15 @@ pub fn convIntoScaled(
     var p0: usize = 0;
     while (p0 < n_out) : (p0 += band) {
         const bn = @min(band, n_out - p0);
-        try be.opIm2colSd(src.*, patch.*, bn, patch_len, cv.ci, w, h, p0, ow, @intFromEnum(mode));
+        try be.opIm2colSd(src.*, patch.*, bn, patch_len, cv.ci, w, h, p0, ow, @intFromEnum(mode), src_f16);
         // Per band, not per convolution: the accumulator sums over rows, so N banded
         // calls contribute exactly the rows one unbanded call would.
         try probeInput(be, patch.*, bn, convWeight(cv, patch_len));
         if (coop) {
-            try be.opConvF16Scaled(dst.*, p0 * cv.co, patch.*, bn, std.mem.sliceAsBytes(cv.w), cv.co, patch_len, cb, act_div);
+            // The patch is f32 whatever `src_f16` said, so only `dst_f16` applies here.
+            try be.opConvF16Prec(dst.*, p0 * cv.co, patch.*, bn, std.mem.sliceAsBytes(cv.w), cv.co, patch_len, cb, act_div, false, dst_f16);
         } else {
+            std.debug.assert(!dst_f16);
             try be.opMatmul(dst.*, p0 * cv.co * 4, patch.*, 0, bn, std.mem.sliceAsBytes(cv.w), false, cv.co, patch_len, 1.0, cb);
         }
     }

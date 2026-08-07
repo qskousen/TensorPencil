@@ -77,6 +77,40 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, a, "libs")) libs = true else ckpt = a;
         }
         try sdCudaTest(arena, io, stdout, ckpt, libs);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "te-test")) {
+        var path: []const u8 = "/home/qt/genai/comfyui/models/text_encoders/Qwen3-4B-Q4_K_M.gguf";
+        var ref: []const u8 = "";
+        var variant: TensorPencil.models.qwen3.Variant = .zimage;
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "--ref") and i + 1 < args.len) {
+                i += 1;
+                ref = args[i];
+            } else if (std.mem.eql(u8, args[i], "--krea2")) {
+                variant = .krea2;
+            } else path = args[i];
+        }
+        try teTest(arena, io, stdout, path, ref, variant);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "zimage-cuda-test")) {
+        var ckpt: []const u8 = "/home/qt/genai/comfyui/models/checkpoints/zit/unstableRevolution_V2Fp16.safetensors";
+        var vae: []const u8 = "/home/qt/genai/comfyui/models/vae/z-image-turbo.vae.safetensors";
+        var libs = false;
+        var i: usize = 2;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "libs")) libs = true //
+            else if (std.mem.eql(u8, args[i], "--vae") and i + 1 < args.len) {
+                i += 1;
+                vae = args[i];
+            } else ckpt = args[i];
+        }
+        try zimageCudaTest(arena, io, stdout, ckpt, vae, libs);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "zimage-cuda-bench")) {
+        var seq: usize = 6848;
+        var libs = false;
+        for (args[2..]) |a| {
+            if (std.mem.eql(u8, a, "libs")) libs = true else seq = std.fmt.parseInt(usize, a, 10) catch seq;
+        }
+        try zimageCudaBench(arena, io, stdout, seq, libs);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "cuda-vae-test")) {
         const zh: usize = if (args.len >= 3) (std.fmt.parseInt(usize, args[2], 10) catch 16) else 16;
         try cudaVaeTest(arena, io, stdout, zh);
@@ -225,6 +259,16 @@ pub fn main(init: std.process.Init) !void {
             \\      check the CUDA SD kernels against the CPU ops they reproduce
             \\      ("libs" runs the cuBLASLt/cuDNN arm, whose attention path
             \\      differs); exits non-zero if any check fails
+            \\  TensorPencil te-test [<encoder>] [--ref <encoder>] [--krea2]
+            \\      check a Qwen3 text encoder on every GPU backend against its
+            \\      own CPU forward (kernel check), and optionally against a
+            \\      second encoder (quantization check). Accepts .gguf
+            \\  TensorPencil zimage-cuda-test [<zimage ckpt>] [libs]
+            \\      check zimage_cuda's device forward against the CPU forward on
+            \\      real weights, on both attention paths; non-zero if any fails
+            \\  TensorPencil zimage-cuda-bench [<seq>] [libs]
+            \\      time one Z-Image step's worth of bf16 GEMMs, with and without
+            \\      the f32<->bf16 conversion passes, to isolate where the time goes
             \\
         , .{});
     }
@@ -1096,7 +1140,7 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
             try up(be, &a_d, x);
             try be.ensureDeviceBuffer(&b_d, n * ch * 4);
             for ([2]bool{ false, true }) |silu| {
-                try be.opGroupNorm(a_d, b_d, c_d, d_d, e_d, n, ch, groups, 256, 1e-5, silu);
+                try be.opGroupNorm(a_d, b_d, c_d, d_d, e_d, n, ch, groups, 256, 1e-5, silu, false);
                 try be.tensorDownload(b_d, std.mem.sliceAsBytes(got));
                 ops.norm.groupNorm(want, x, ch, groups, cat[0..ch], cat[ch..], 1e-5);
                 if (silu) ops.act.silu(want);
@@ -1507,7 +1551,9 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
                     .capture = clip_text.clip_g.layers - 1,
                 },
             },
-            .krea2 => &.{},
+            // This command is the SD-family kernel gate; other architectures have
+            // their own text towers and are not exercised here.
+            .krea2, .zimage => &.{},
         };
         for (towers) |tw| {
             var enc = clip_text.TextEncoder.load(arena, store, tw.cfg, tw.prefix) catch |err| {
@@ -1644,6 +1690,547 @@ fn summarize(stdout: *Io.Writer, failures: usize) !void {
     try stdout.print("\n{d} check(s) FAILED\n", .{failures});
     try stdout.flush();
     return error.ValidationFailed;
+}
+
+/// Check a Qwen3 text encoder end to end: every GPU backend against the CPU
+/// forward of the SAME file, and optionally a second encoder against the first
+/// (which is how a quantized GGUF is compared to its bf16 original).
+///
+/// A CLI command rather than a test for the usual reason — the test binary brings
+/// up no CUDA/Vulkan context — and because an 8 GB encoder is not a unit test.
+///
+/// ⚠️ The two questions it separates are genuinely different and were being
+/// conflated by looking at renders: "does this backend compute what the CPU
+/// computes" (a kernel question, expect ~1e-3) and "does this quantization change
+/// the conditioning" (a format question, expect much more). A render comparison
+/// answers neither on its own.
+fn teTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []const u8, ref_path: []const u8, variant: TensorPencil.models.qwen3.Variant) !void {
+    const qwen3 = TensorPencil.models.qwen3;
+    const qwen3_cuda = TensorPencil.models.qwen3_cuda;
+    const qwen3_gpu = TensorPencil.models.qwen3_gpu;
+    const zimage_text = TensorPencil.models.zimage_text;
+    const cuda = TensorPencil.gpu.cuda;
+    const tokenizer = TensorPencil.tokenizer;
+
+    std.Io.Dir.cwd().access(io, path, .{}) catch {
+        try stdout.print("te-test needs an encoder ({s})\n", .{path});
+        return;
+    };
+    // A prompt long enough that the GEMMs are real (m in the hundreds), since a
+    // 5-token encode exercises a different regime from any actual render.
+    const text = "A sophisticated, high-end vector and layered graphic art piece on a pure " ++
+        "white background, an ethereal angelic figure crouched in profile, translucent " ++
+        "wings of layered blue floral petals, soft teals and pale pinks, clean precise " ++
+        "vector lines, two dark navy hummingbird silhouettes, restricted harmonious palette.";
+
+    var tok = try tokenizer.Tokenizer.init(arena);
+    defer tok.deinit();
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(arena);
+    try zimage_text.buildIds(&tok, arena, text, &ids);
+
+    var ct = try TensorPencil.pipeline.Container.open(arena, io, path);
+    defer ct.deinit();
+    var enc = try qwen3.TextEncoder.loadVariant(arena, ct.store(), variant);
+    defer enc.deinit();
+    try stdout.print("== te-test ==\nencoder : {s}\n          {d} layers, hidden {d}, rope_theta {d:.0}, q dtype {t}, {d} tokens\n", .{
+        path, enc.cfg.n_layers, enc.cfg.hidden, enc.cfg.rope_theta, enc.layers[0].q.dtype, ids.items.len,
+    });
+
+    var t0 = std.Io.Clock.real.now(io);
+    const want = try enc.encode(io, arena, ids.items, null);
+    var ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0.nanoseconds)) / 1e6;
+    try stdout.print("\ncpu       {d:8.0} ms   (reference)\n", .{ms});
+
+    var failures: usize = 0;
+    const R = struct {
+        fn rel(a: []const f32, b: []const f32) f64 {
+            var num: f64 = 0;
+            var den: f64 = 0;
+            for (a, b) |e, g| {
+                num += (@as(f64, e) - g) * (@as(f64, e) - g);
+                den += @as(f64, e) * e;
+            }
+            return if (den == 0) 0 else @sqrt(num / den);
+        }
+        fn finite(a: []const f32) bool {
+            for (a) |v| if (!std.math.isFinite(v)) return false;
+            return true;
+        }
+    };
+
+    // Each CUDA arm, then Vulkan. A backend that is absent simply reports so.
+    inline for (.{ true, false }) |libs| {
+        if (cuda.Backend.initLibs(arena)) |_| {} else |_| {}
+        const be = (if (libs) cuda.Backend.initLibs(arena) else cuda.Backend.init(arena)) catch null;
+        if (be) |b| {
+            defer b.deinit();
+            const name = if (libs) "cuda" else "zig-cuda";
+            if (!qwen3_cuda.supportsWeights(&enc)) {
+                try stdout.print("{s:<9} REFUSED (supportsWeights false — would fall back to CPU)\n", .{name});
+                failures += 1;
+            } else {
+                _ = try qwen3_cuda.encode(&enc, b, io, arena, ids.items, null); // warm
+                t0 = std.Io.Clock.real.now(io);
+                const got = try qwen3_cuda.encode(&enc, b, io, arena, ids.items, null);
+                ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0.nanoseconds)) / 1e6;
+                const r = R.rel(want, got);
+                const ok = R.finite(got) and r < 5e-3;
+                if (!ok) failures += 1;
+                try stdout.print("{s:<9} {d:8.0} ms   rel L2 {e:.4}  {s}\n", .{ name, ms, r, if (ok) "ok" else "FAILED" });
+            }
+        } else {
+            try stdout.print("{s:<9} unavailable\n", .{if (libs) "cuda" else "zig-cuda"});
+        }
+    }
+    if (TensorPencil.gpu.Context.init(arena)) |gc| {
+        defer gc.deinit();
+        if (!qwen3_gpu.supportsWeights(gc, &enc)) {
+            try stdout.print("{s:<9} REFUSED (supportsWeights false — would fall back to CPU)\n", .{"vulkan"});
+            failures += 1;
+        } else {
+            _ = try qwen3_gpu.encode(&enc, gc, io, arena, ids.items, false, null);
+            t0 = std.Io.Clock.real.now(io);
+            const got = try qwen3_gpu.encode(&enc, gc, io, arena, ids.items, false, null);
+            ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0.nanoseconds)) / 1e6;
+            const r = R.rel(want, got);
+            const ok = R.finite(got) and r < 5e-3;
+            if (!ok) failures += 1;
+            try stdout.print("{s:<9} {d:8.0} ms   rel L2 {e:.4}  {s}\n", .{ "vulkan", ms, r, if (ok) "ok" else "FAILED" });
+        }
+    } else |err| try stdout.print("{s:<9} unavailable ({t})\n", .{ "vulkan", err });
+
+    // The format question, kept separate from the kernel question above.
+    if (ref_path.len != 0) {
+        var rt = try TensorPencil.pipeline.Container.open(arena, io, ref_path);
+        defer rt.deinit();
+        var ref = try qwen3.TextEncoder.loadVariant(arena, rt.store(), variant);
+        defer ref.deinit();
+        const rwant = try ref.encode(io, arena, ids.items, null);
+        try stdout.print("\nvs {s}\n  ({t} weights)  rel L2 {e:.4}  — the QUANTIZATION delta, not a kernel error\n", .{
+            ref_path, ref.layers[0].q.dtype, R.rel(rwant, want),
+        });
+    }
+    try summarize(stdout, failures);
+}
+
+/// Check `zimage_cuda`'s device forward against `zimage.DiT.predict` on real
+/// checkpoint weights — the CUDA twin of `zimage_gpu`'s gated Vulkan test, and a
+/// CLI command for the reason `sd-cuda-test` and `cuda-dit-test` are: the test
+/// binary brings up no CUDA context, so a `test` block here would only ever skip.
+///
+/// Truncated to a few trunk layers so it loads in seconds. The loop bound is not
+/// what a kernel port gets wrong; the block's shape is. Exits non-zero on failure
+/// so it works as a gate.
+fn zimageCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []const u8, vae_path: []const u8, libs: bool) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    const zimage = TensorPencil.models.zimage;
+    const zimage_cuda = TensorPencil.models.zimage_cuda;
+    const safetensors = TensorPencil.SafeTensors;
+
+    std.Io.Dir.cwd().access(io, ckpt, .{}) catch {
+        try stdout.print("zimage-cuda-test needs a Z-Image checkpoint ({s})\n", .{ckpt});
+        return;
+    };
+    var ck = try safetensors.open(arena, io, ckpt);
+    defer ck.deinit();
+    var cfg = zimage.z_image;
+    cfg.n_layers = 2;
+    var model = try zimage.DiT.load(arena, .{ .safetensors = &ck }, cfg);
+    defer model.deinit();
+
+    var be = (if (libs) cuda.Backend.initLibs(arena) else cuda.Backend.init(arena)) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    try stdout.print("== zimage-cuda-test ==\ncuda device: {s} (kernels: {t})\n", .{ be.deviceName(), be.kernels });
+    if (!zimage_cuda.supported(&model)) {
+        try stdout.print("checkpoint dtype unsupported on this backend\n", .{});
+        return;
+    }
+
+    const lat = 16; // 8x8 = 64 image tokens, exactly two pad buckets
+    const seq_txt = 20;
+    var prng = std.Random.DefaultPrng.init(11);
+    const rnd = prng.random();
+    const ctxv = try arena.alloc(f32, seq_txt * cfg.cap_dim);
+    for (ctxv) |*v| v.* = rnd.floatNorm(f32);
+    const x_lat = try arena.alloc(f32, cfg.channels * lat * lat);
+    for (x_lat) |*v| v.* = rnd.floatNorm(f32);
+
+    const sigma: f32 = 0.75;
+    const cap = try model.capTokens(io, arena, ctxv, seq_txt);
+    const cap_padded = cfg.padded(seq_txt);
+
+    const want = try arena.alloc(f32, x_lat.len);
+    {
+        const adaln = try model.adalnInput(io, arena, sigma);
+        try model.predict(io, arena, want, x_lat, lat, lat, cap, cap_padded, adaln, null);
+    }
+
+    var failures: usize = 0;
+    // ⚠️ BOTH attention paths. `opAttnTC` is what runs; the naive one is the
+    // fallback and the reference the fast path was validated against. Checking
+    // only the fast one leaves the fallback free to rot — and checking only the
+    // slow one is what let the watchdog problem reach a render on Vulkan.
+    const saved = zimage_cuda.force_naive_attn;
+    defer zimage_cuda.force_naive_attn = saved;
+    for ([_]bool{ false, true }) |naive| {
+        zimage_cuda.force_naive_attn = naive;
+        var sess = try zimage_cuda.Session.init(arena, io, be, &model, lat, lat, cap, cap_padded, &.{ sigma, 0 });
+        defer sess.deinit(arena, be);
+        var ws = try zimage_cuda.Workspace.init(be, &model, lat, lat, cap_padded);
+        defer ws.deinit(be);
+        const got = try arena.alloc(f32, x_lat.len);
+        try zimage_cuda.forward(&model, be, &sess, &ws, io, arena, got, x_lat, sigma, null);
+
+        var num: f64 = 0;
+        var den: f64 = 0;
+        var nonfinite: usize = 0;
+        for (want, got) |e, a| {
+            if (!std.math.isFinite(a)) nonfinite += 1;
+            num += (@as(f64, e) - a) * (@as(f64, e) - a);
+            den += @as(f64, e) * e;
+        }
+        const rel = if (den == 0) 0 else @sqrt(num / den);
+        // The GEMMs run tensor cores against the CPU's f32 accumulation — the same
+        // regime `sd_unet_cuda` sits in, and `zimage_gpu` measures 2.2e-4 there.
+        const ok = nonfinite == 0 and rel < 1e-3;
+        if (!ok) failures += 1;
+        try stdout.print("forward vs CPU ({s:<11})  rel L2 {e:.4}  {s}{s}\n", .{
+            if (naive) "naive attn" else "opAttnTC", rel,
+            if (ok) "ok" else "FAILED",
+            if (nonfinite != 0) " (non-finite output)" else "",
+        });
+    }
+    // --- the VAE decode ---------------------------------------------------------
+    // ⚠️ Checked at a SMALL and a LARGE latent, because the mid-block attention takes
+    // a different path at each and the small one is where the f16-logit overflow that
+    // once rendered solid white actually shows. A single size is how that bug hid.
+    if (vae_path.len != 0) {
+        std.Io.Dir.cwd().access(io, vae_path, .{}) catch {
+            try stdout.print("\n(skipping the VAE: {s} not found)\n", .{vae_path});
+            try summarize(stdout, failures);
+            return;
+        };
+        var vt = try safetensors.open(arena, io, vae_path);
+        defer vt.deinit();
+        const store: TensorPencil.weights.WeightStore = .{ .safetensors = &vt };
+        const vcfg = TensorPencil.models.sd_vae.flux;
+        var vdec = try TensorPencil.models.sd_vae.Decoder.load(arena, store, vcfg, "");
+        defer vdec.deinit();
+        try stdout.print("\n-- VAE decode ({d}-channel latent) --\n", .{vcfg.z_channels});
+
+        const sizes = [_][2]usize{ .{ 12, 10 }, .{ 40, 32 } };
+        const saved_vae = TensorPencil.models.sd_vae_cuda.force_naive_attn;
+        defer TensorPencil.models.sd_vae_cuda.force_naive_attn = saved_vae;
+        for (sizes) |sz| {
+            const zh = sz[0];
+            const zw = sz[1];
+            const z = try arena.alloc(f32, vcfg.z_channels * zh * zw);
+            for (z) |*v| v.* = rnd.floatNorm(f32);
+            const ref = try vdec.decode(io, arena, z, zh, zw);
+            for ([_]bool{ false, true }) |naive| {
+                TensorPencil.models.sd_vae_cuda.force_naive_attn = naive;
+                const t0 = std.Io.Clock.real.now(io);
+                const got = try TensorPencil.models.sd_vae_cuda.decode(&vdec, be, arena, z, zh, zw, null);
+                const dt = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0.nanoseconds)) / 1e6;
+                var num: f64 = 0;
+                var den: f64 = 0;
+                var bad: usize = 0;
+                for (ref, got) |e, a| {
+                    if (!std.math.isFinite(a)) bad += 1;
+                    num += (@as(f64, e) - a) * (@as(f64, e) - a);
+                    den += @as(f64, e) * e;
+                }
+                const rel = if (den == 0) 0 else @sqrt(num / den);
+                const ok = bad == 0 and rel < 5e-3;
+                if (!ok) failures += 1;
+                try stdout.print("  {d}x{d} {s:<12} {d:7.0} ms  rel L2 {e:.4}  {s}{s}\n", .{
+                    zh, zw, if (naive) "be.attn" else "opAttnTC", dt, rel,
+                    if (ok) "ok" else "FAILED",
+                    if (bad != 0) " (non-finite)" else "",
+                });
+            }
+        }
+    }
+    try summarize(stdout, failures);
+}
+
+/// Best-of-`n` wall time in ms for one device-work closure, warming once first
+/// (PTX JIT, cuBLASLt heuristics and cuDNN plans are all first-call costs).
+fn timeBest(io: Io, n: usize, comptime go: anytype, be: anytype, args: anytype) !f64 {
+    try go(be, args);
+    var best: f64 = std.math.inf(f64);
+    for (0..n) |_| {
+        const a = std.Io.Clock.real.now(io);
+        try go(be, args);
+        const b = std.Io.Clock.real.now(io);
+        best = @min(best, @as(f64, @floatFromInt(b.nanoseconds - a.nanoseconds)) / 1e6);
+    }
+    return best;
+}
+
+/// Time ONE Z-Image trunk step's worth of bf16 GEMMs in isolation, with and
+/// without the two streaming passes `opGemmBf16` wraps around every call (the
+/// f32→bf16 activation pad, and `bias_compact` on the f32 output).
+///
+/// The point is a receipt rather than an estimate. A whole-render profile puts
+/// ~88% of a step under `.matmul`, but that bucket spans the op, not the GEMM —
+/// `opGemmBf16` is `ptic()`-scoped, so the conversion passes are counted inside
+/// it. Without this split, "cuBLASLt is as fast as it gets" and "we spend a
+/// third of the step converting operands" are indistinguishable.
+///
+/// `seq` is the joint (caption ++ image) token count; 6848 is a 1056x1584 render.
+/// Weights are random and each shape is uploaded once — the working set is far
+/// past L2 either way, so reuse costs nothing in fidelity and 11.6 GB in VRAM.
+fn zimageCudaBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, seq: usize, libs: bool) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    const zimage = TensorPencil.models.zimage;
+    const Buf = cuda.backend.DeviceBuffer;
+    const cfg = zimage.z_image;
+
+    var be = (if (libs) cuda.Backend.initLibs(arena) else cuda.Backend.init(arena)) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+
+    // The seven GEMMs of one block, in forward order: q, k, v, attn-out, w1, w3, w2.
+    const Shape = struct { co: usize, k: usize, name: []const u8 };
+    const shapes = [_]Shape{
+        .{ .co = cfg.qDim(), .k = cfg.dim, .name = "wq" },
+        .{ .co = cfg.kvDim(), .k = cfg.dim, .name = "wk" },
+        .{ .co = cfg.kvDim(), .k = cfg.dim, .name = "wv" },
+        .{ .co = cfg.dim, .k = cfg.dim, .name = "out" },
+        .{ .co = cfg.mlp_dim, .k = cfg.dim, .name = "w1" },
+        .{ .co = cfg.mlp_dim, .k = cfg.dim, .name = "w3" },
+        .{ .co = cfg.dim, .k = cfg.mlp_dim, .name = "w2" },
+    };
+    // 30 trunk layers + the 2 noise refiners, which are the same block shape.
+    const blocks = cfg.n_layers + cfg.n_refiner_layers;
+
+    try stdout.print("== zimage-cuda-bench seq={d} ==\ncuda device: {s} (kernels: {t})\n", .{ seq, be.deviceName(), be.kernels });
+    try stdout.print("{d} blocks x {d} GEMMs = {d} calls/step\n\n", .{ blocks, shapes.len, blocks * shapes.len });
+
+    var max_k: usize = 0;
+    var max_co: usize = 0;
+    for (shapes) |s| {
+        max_k = @max(max_k, s.k);
+        max_co = @max(max_co, s.co);
+    }
+    const m_pad = std.mem.alignForward(usize, seq, 128);
+
+    var x: Buf = .{};
+    var y: Buf = .{};
+    try be.ensureDeviceBuffer(&x, m_pad * max_k * 4);
+    try be.ensureDeviceBuffer(&y, m_pad * max_co * 4);
+    {
+        const host = try arena.alloc(f32, seq * max_k);
+        defer arena.free(host);
+        var prng = std.Random.DefaultPrng.init(99);
+        for (host) |*v| v.* = prng.random().floatNorm(f32) * 0.02;
+        try be.tensorUpload(x, std.mem.sliceAsBytes(host));
+    }
+    // One host-side bf16 weight per distinct (co,k); `cachedWeight` keys by host
+    // pointer, so a shared buffer would also share the device copy — which is what
+    // we want, since the real weights are read from VRAM either way.
+    var wbytes: [shapes.len][]u8 = undefined;
+    var seen: [shapes.len]?usize = @splat(null);
+    for (shapes, 0..) |s, i| {
+        for (shapes[0..i], 0..) |t, j| {
+            if (t.co == s.co and t.k == s.k) {
+                seen[i] = j;
+                break;
+            }
+        }
+        if (seen[i]) |j| {
+            wbytes[i] = wbytes[j];
+            continue;
+        }
+        const raw = try arena.alloc(u16, s.co * s.k);
+        var prng = std.Random.DefaultPrng.init(7 + i);
+        // bf16 = the top 16 bits of an f32, so build it that way rather than
+        // by hand: a denormal or a NaN pattern here would time differently.
+        for (raw) |*v| v.* = @truncate(@as(u32, @bitCast(prng.random().floatNorm(f32) * 0.02)) >> 16);
+        wbytes[i] = std.mem.sliceAsBytes(raw);
+    }
+
+    const zeros = try arena.alloc(f32, max_co);
+    @memset(zeros, 0);
+
+    // One step of GEMMs, timed as a whole: individual calls are 0.5-13 ms, so a
+    // per-call clock would mostly measure the sync.
+    const Run = struct {
+        fn go(b: *cuda.Backend, sh: []const Shape, wb: [][]u8, nb: usize, m: usize, xb: Buf, yb: Buf, z: []const f32) !void {
+            try b.beginBatch();
+            for (0..nb) |_| {
+                // `null` bias, exactly as `zimage_cuda.gemm` passes it.
+                _ = z;
+                for (sh, 0..) |s, i| try b.opGemmBf16(yb, xb, m, wb[i], s.co, s.k, null);
+            }
+            try b.endBatch();
+        }
+    };
+
+    var t_full: f64 = std.math.inf(f64);
+    var t_gemm: f64 = std.math.inf(f64);
+    inline for (.{ false, true }) |gemm_only| {
+        cuda.backend.bench_gemm_only = gemm_only;
+        try Run.go(be, &shapes, &wbytes, 2, seq, x, y, zeros); // warm: JIT + plans
+        for (0..3) |_| {
+            const a = std.Io.Clock.real.now(io);
+            try Run.go(be, &shapes, &wbytes, blocks, seq, x, y, zeros);
+            const c = std.Io.Clock.real.now(io);
+            const ms = @as(f64, @floatFromInt(c.nanoseconds - a.nanoseconds)) / 1e6;
+            if (gemm_only) t_gemm = @min(t_gemm, ms) else t_full = @min(t_full, ms);
+        }
+    }
+    cuda.backend.bench_gemm_only = false;
+
+    // FLOPs are counted at the PADDED m: that arithmetic is really performed, and
+    // charging only the useful rows would report a rate the hardware never hit.
+    var flop: f64 = 0;
+    for (shapes) |s| flop += 2.0 * @as(f64, @floatFromInt(m_pad * s.co * s.k));
+    flop *= @floatFromInt(blocks);
+
+    const conv = t_full - t_gemm;
+    try stdout.print("full opGemmBf16 : {d:.1} ms   ({d:.1} TFLOP/s effective)\n", .{ t_full, flop / (t_full / 1e3) / 1e12 });
+    try stdout.print("GEMM only       : {d:.1} ms   ({d:.1} TFLOP/s)\n", .{ t_gemm, flop / (t_gemm / 1e3) / 1e12 });
+    try stdout.print("conversion pass : {d:.1} ms   ({d:.1}% of the op)\n", .{ conv, 100.0 * conv / t_full });
+    try stdout.print("\narithmetic: {d:.1} TFLOP/step at m_pad={d} (m={d}, {d:.1}% pad waste)\n", .{
+        flop / 1e12, m_pad, seq,
+        100.0 * @as(f64, @floatFromInt(m_pad - seq)) / @as(f64, @floatFromInt(m_pad)),
+    });
+
+    // --- the rest of the block, so the three parts can be added up -------------
+    // Everything a block does apart from its GEMMs, at the same shapes and in the
+    // same order. Without these the GEMM figure above is only half an answer: it
+    // says how fast the GEMMs are, not what fraction of the step they are.
+    const heads = cfg.n_heads;
+    const hd = cfg.head_dim;
+    var q: Buf = .{};
+    var kk: Buf = .{};
+    var v: Buf = .{};
+    var ao: Buf = .{};
+    var mg: Buf = .{};
+    var mu: Buf = .{};
+    var mv: Buf = .{};
+    var nrm: Buf = .{};
+    var frq: Buf = .{};
+    var nw: Buf = .{};
+    try be.ensureDeviceBuffer(&q, seq * cfg.qDim() * 4);
+    try be.ensureDeviceBuffer(&kk, seq * cfg.kvDim() * 4);
+    try be.ensureDeviceBuffer(&v, seq * cfg.kvDim() * 4);
+    try be.ensureDeviceBuffer(&ao, seq * cfg.qDim() * 4);
+    try be.ensureDeviceBuffer(&mg, seq * cfg.mlp_dim * 4);
+    try be.ensureDeviceBuffer(&mu, seq * cfg.mlp_dim * 4);
+    try be.ensureDeviceBuffer(&nrm, seq * cfg.dim * 4);
+    try be.ensureDeviceBuffer(&mv, blocks * 4 * cfg.dim * 4);
+    try be.ensureDeviceBuffer(&frq, seq * hd * 4);
+    try be.ensureDeviceBuffer(&nw, cfg.mlp_dim * 4);
+
+    const t_attn = try timeBest(io, 3, struct {
+        fn go(b: *cuda.Backend, a: anytype) !void {
+            try b.beginBatch();
+            for (0..a.nb) |_| try b.opAttnTC(a.q, a.k, a.v, a.o, a.seq, a.h, a.h, a.hd, 0.088388);
+            try b.endBatch();
+        }
+    }.go, be, .{ .q = q, .k = kk, .v = v, .o = ao, .seq = seq, .h = heads, .hd = hd, .nb = blocks });
+
+    // ⚠️ Timed per op FAMILY, not as one lump. "elementwise is 30% of the step"
+    // is not actionable — these are pure-bandwidth kernels, so the question is
+    // which of them is far from the 936 GB/s the card can do, and a single total
+    // averages the answer away.
+    const ea = .{
+        .x = y, .nrm = nrm, .mv = mv, .q = q, .k = kk, .nw = nw, .frq = frq,
+        .mg = mg, .mu = mu, .seq = seq, .dim = cfg.dim, .mlp = cfg.mlp_dim,
+        .h = heads, .hd = hd, .zoff = blocks * 4 * cfg.dim - cfg.dim, .nb = blocks,
+    };
+    const E = struct {
+        // ⚠️ Each is the exact call `zimage_cuda.blockForward` makes, per block.
+        fn rmsmod(b: *cuda.Backend, a: anytype) !void {
+            try b.beginBatch();
+            for (0..a.nb) |_| {
+                try b.rmsMod(a.x, a.nrm, a.mv, a.seq, a.dim, 0, a.zoff, 1e-5);
+                try b.rmsMod(a.x, a.nrm, a.mv, a.seq, a.dim, 2 * a.dim, a.zoff, 1e-5);
+            }
+            try b.endBatch();
+        }
+        /// The per-HEAD q/k norms: many narrow (hd=128) rows.
+        fn qk(b: *cuda.Backend, a: anytype) !void {
+            try b.beginBatch();
+            for (0..a.nb) |_| {
+                try b.qkNorm(a.q, a.q, a.nw, a.seq * a.h, a.hd, 1e-7);
+                try b.qkNorm(a.k, a.k, a.nw, a.seq * a.h, a.hd, 1e-7);
+            }
+            try b.endBatch();
+        }
+        /// The two sandwich norms, through the SAME entry point but at full model
+        /// width: few rows, each 3840 wide. A different regime entirely.
+        fn sandwich(b: *cuda.Backend, a: anytype) !void {
+            try b.beginBatch();
+            for (0..a.nb) |_| {
+                try b.qkNorm(a.nrm, a.nrm, a.nw, a.seq, a.dim, 1e-5);
+                try b.qkNorm(a.nrm, a.nrm, a.nw, a.seq, a.dim, 1e-5);
+            }
+            try b.endBatch();
+        }
+        fn ropes(b: *cuda.Backend, a: anytype) !void {
+            try b.beginBatch();
+            for (0..a.nb) |_| {
+                try b.rope(a.q, a.frq, a.seq, a.h, a.hd / 2, a.seq * a.hd / 2);
+                try b.rope(a.k, a.frq, a.seq, a.h, a.hd / 2, a.seq * a.hd / 2);
+            }
+            try b.endBatch();
+        }
+        fn gated(b: *cuda.Backend, a: anytype) !void {
+            try b.beginBatch();
+            for (0..a.nb) |_| {
+                try b.gatedAdd(a.x, a.nrm, a.mv, a.seq * a.dim, a.dim, a.dim);
+                try b.gatedAdd(a.x, a.nrm, a.mv, a.seq * a.dim, a.dim, 3 * a.dim);
+            }
+            try b.endBatch();
+        }
+        fn silu(b: *cuda.Backend, a: anytype) !void {
+            try b.beginBatch();
+            for (0..a.nb) |_| try b.siluMul(a.mg, a.mu, a.seq * a.mlp);
+            try b.endBatch();
+        }
+    };
+    const sd: f64 = @floatFromInt(seq * cfg.dim);
+    const parts = [_]struct { name: []const u8, t: f64, gb: f64 }{
+        .{ .name = "rmsMod x2", .t = try timeBest(io, 3, E.rmsmod, be, ea), .gb = 2 * sd * 8 },
+        .{ .name = "qkNorm q,k (hd=128)", .t = try timeBest(io, 3, E.qk, be, ea), .gb = 2 * sd * 8 },
+        .{ .name = "qkNorm sandwich (w=3840)", .t = try timeBest(io, 3, E.sandwich, be, ea), .gb = 2 * sd * 8 },
+        .{ .name = "rope q,k", .t = try timeBest(io, 3, E.ropes, be, ea), .gb = 2 * sd * 8 },
+        .{ .name = "gatedAdd x2", .t = try timeBest(io, 3, E.gated, be, ea), .gb = 2 * sd * 12 },
+        .{ .name = "siluMul", .t = try timeBest(io, 3, E.silu, be, ea), .gb = @as(f64, @floatFromInt(seq * cfg.mlp_dim)) * 12 },
+    };
+    var t_elt: f64 = 0;
+    for (parts) |p| t_elt += p.t;
+
+    const total = t_full + t_attn + t_elt;
+    // Attention is 4·seq²·hd per head (QK then PV), both at full width — Z-Image
+    // has no causal mask, so nothing is skipped.
+    const aflop = 4.0 * @as(f64, @floatFromInt(seq)) * @as(f64, @floatFromInt(seq)) *
+        @as(f64, @floatFromInt(hd * heads * blocks));
+    try stdout.print("\n-- one step's device work, by part --\n", .{});
+    try stdout.print("GEMMs (with conv) : {d:7.1} ms  {d:5.1}%\n", .{ t_full, 100 * t_full / total });
+    try stdout.print("attention         : {d:7.1} ms  {d:5.1}%   ({d:.1} TFLOP/step, {d:.1} TFLOP/s)\n", .{ t_attn, 100 * t_attn / total, aflop / 1e12, aflop / (t_attn / 1e3) / 1e12 });
+    try stdout.print("elementwise       : {d:7.1} ms  {d:5.1}%\n", .{ t_elt, 100 * t_elt / total });
+    try stdout.print("                    {d:7.1} ms total device work\n", .{total});
+    // ⚠️ The achieved bandwidth is the number that says whether a kernel is
+    // *finished* or merely *working*: these move a known number of bytes and do
+    // almost no arithmetic, so anything far under the card's ~936 GB/s is a
+    // kernel problem, not a workload.
+    try stdout.print("\n-- elementwise, per op (x{d} blocks) --\n", .{blocks});
+    for (parts) |p| {
+        const gb = p.gb * @as(f64, @floatFromInt(blocks)) / 1e9;
+        try stdout.print("{s:<26} {d:6.1} ms   {d:6.1} GB/s\n", .{ p.name, p.t, gb / (p.t / 1e3) });
+    }
+    try stdout.flush();
 }
 
 /// Validate the CUDA VAE decode (vae_cuda) against the CPU decode on a random
@@ -2167,6 +2754,7 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
             opts.seed = try std.fmt.parseInt(u64, val, 10);
         } else if (std.mem.eql(u8, flag, "--shift")) {
             opts.shift = try std.fmt.parseFloat(f32, val);
+            opts.explicit_shift = true;
         } else if (std.mem.eql(u8, flag, "--profile")) {
             TensorPencil.models.dit_gpu.profile = std.mem.eql(u8, val, "on") or std.mem.eql(u8, val, "1");
         } else if (std.mem.eql(u8, flag, "--prompt-syntax")) {

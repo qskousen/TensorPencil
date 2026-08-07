@@ -45,6 +45,8 @@ Legend: ✅ full · ⚠️ works but slow / limited · ❌ unsupported · — no
 
 Per-stage dispatch order everywhere is `if (cu_be)` → CUDA, `else if (gpu_ctx)` → Vulkan, `else` → CPU.
 
+Four families: krea2 (below), the SD family (§2A), and Z-Image (§2B).
+
 | Stage | cpu | vulkan | zig-cuda | cuda | Files |
 |---|---|---|---|---|---|
 | **Text encoder** (Qwen3-VL-4B) | ✅ f32 | ✅ f32 (⚠️ f16 opt via `--encoder-f16`) | ✅ fp8→f16 TC | ✅ fp8→f16 TC | `krea2_text.zig`, `qwen3{,_gpu,_cuda}.zig` |
@@ -55,6 +57,247 @@ Per-stage dispatch order everywhere is `if (cu_be)` → CUDA, `else if (gpu_ctx)
 | **latent2rgb preview** | ✅ | ✅ | ✅ | ✅ | `wan_vae.latentPreviewInto` (fallback when no `--taew`) |
 
 **Cancellation** (`Options.cancel`): polled between sampling steps everywhere, plus mid-stage on every backend — between DiT blocks, between text-encoder layers, and between VAE decode layers (and per tile in `vae_tiled`). On the **cpu** backend the threaded matmul/attention kernels additionally poll a threadlocal token (`src/ops/cancel.zig`, armed by `dit.forward` / `wan_vae.Decoder.decode` / `qwen3.TextEncoder.encode`) per row-panel / k-block / query row, so a cancel lands in milliseconds even when a single CPU GEMM takes seconds. `error.Canceled` is never swallowed: the VAE OOM-retry ladder and the GPU→CPU encode fallback both propagate it.
+
+### 2B. Z-Image ("zit" / `NextDiT`)
+
+| Stage | cpu | vulkan | zig-cuda | cuda | Files |
+|---|---|---|---|---|---|
+| **Text encoder** (Qwen3-4B, penultimate) | ✅ f32 | ✅ bf16 TC | ⚠️ CPU (fp8-only arm) | ⚠️ CPU (fp8-only arm) | `zimage_text.zig`, `qwen3{,_gpu,_cuda}.zig` |
+| **DiT** (`NextDiT`, 30 blocks + 2+2 refiners) | ✅ bf16 / f16 / f32 / fp8 / GGUF | ✅ bf16 / f16 / f32 / fp8 | ❌ CPU | ❌ CPU | `zimage{,_gpu}.zig` |
+| **VAE decode** (`AutoencoderKL`, 16-ch) | ✅ | ⚠️ falls back to CPU | ⚠️ untested | ⚠️ untested | `sd_vae{,_gpu,_cuda}.zig` (`sd_vae.flux`) |
+| **latent2rgb preview** | ✅ | ✅ | ✅ | ✅ | `zimage.latentPreviewInto` (Flux factors + bias) |
+
+**Measured** (`-Dintegration -Dtest-filter="Z-Image gpu"`, needs `testdata/gpu-tests`):
+`attn_full` at Z-Image's 30 x 128 head geometry matches `ops.attention` at **4.9e-7**
+rel L2; the whole Vulkan forward matches `zimage.DiT.predict` on real checkpoint
+weights at **2.1e-4** — the f16 tensor-core regime `sd_unet_cuda` already sits in.
+Verified end to end: a Vulkan render is visually identical to the CPU one.
+
+**Measured, full pipeline, 1056x1584 / 9 steps / cfg 1 / euler+beta** (RTX 3090):
+
+| backend | s/step | decode | total | vs a real ComfyUI render |
+|---|---|---|---|---|
+| `cuda` | **2.94** | 11.9 s | **41.3 s** | **29.42 dB** / SSIM 0.959 |
+| `vulkan` | 4.55 | 2.1 s | 50.5 s | 28.96 dB / SSIM 0.960 |
+
+The two arms agree with each other at **34.20 dB / SSIM 0.986**, and both sit inside
+ComfyUI's own **24.49 dB** bf16-vs-fp16 envelope — take that control before reading
+either figure, because Z-Image Turbo at 9 steps is precision-dominated.
+
+#### Text encoders: dtype x backend (measured 2026-08-06, 3090, 72-token prompt)
+
+`--text-encoder` accepts **safetensors or GGUF**, opened by magic. Encode wall time,
+and rel L2 against that same file's CPU forward (`TensorPencil te-test`):
+
+| encoder weights | cpu | cuda | zig-cuda | vulkan |
+|---|---|---|---|---|
+| q4_k (`Qwen3-4B-Q4_K_M.gguf`, llama.cpp-style) | 1354 ms | **144 ms** / 1.3e-4 | 221 ms / 1.3e-4 | 947 ms / 1.3e-4 |
+| q8_0 (`qwen_3_4b-q8_0.gguf`, ComfyUI-style) | 919 ms | 151 ms / 1.4e-4 | 210 ms / 1.5e-4 | 1010 ms / 1.5e-4 |
+| bf16 (`qwen_3_4b.safetensors`) | 793 ms | 136 ms / 3.7e-3 | 187 ms / 3.7e-3 | 127 ms / 3.7e-3 |
+| fp8-e4m3 (krea2 Qwen3-VL) | 1628 ms | 161 ms / 1.3e-4 | 207 ms / 1.4e-4 | 384 ms / 1.4e-6 |
+
+Routing: fp8 -> `opMatmulFp8`; bf16 -> `opGemmBf16` (Ampere+, native bf16 tensor
+cores, every encoder width satisfies `co%128==0 and k%32==0`) or `opMatmulBf16`;
+block quants -> `opMatmulQuant` (CUDA) / `opMatmulCoopQuant` (Vulkan), i.e. the LLM's
+own prefill paths, which suit an encoder exactly — one call over the whole prompt, so
+the per-call weight dequant amortizes.
+
+⚠️ **Block quants do NOT take the MMQ path** even where `mmqPipeFaster` says yes.
+MMQ quantizes the activation to q8_1 (~0.5% rel); a conditioning tensor is computed
+once per render and then steers every sampling step, so that trade sits the wrong way
+round here. The LLM takes it because there the same GEMM runs per token, forever.
+
+⚠️ **Vulkan's `wcode` maps every non-f8/bf16 dtype to `.f32`.** A block quant reaching
+`qwen3_gpu.gemm`'s fallback would be read as f32 — the same silent-garbage shape as the
+bf16 bug that file's `supportsWeights` comment records. The block-quant arm is checked
+*before* `wcode`, and `supportsWeights` gates on `hasQuantPrefillGemm`.
+
+**Why it is worth having, and which one to pick** (Z-Image, 1056x1584, seed 80085):
+
+| encoder | file | live VRAM | vs ComfyUI | vs the bf16-encoder render | conditioning rel L2 |
+|---|---|---|---|---|---|
+| bf16 | 8.04 GB | 6738 MB | 29.4 dB | - | - |
+| **q8_0** | 4.27 GB | **3634 MB** | **30.0 dB** | **30.8 dB** | 6.4e-3 |
+| q4_k | 2.50 GB | 2065 MB | 21.8 dB | 22.2 dB | 3.4e-2 |
+
+⚠️ **These are not the same trade and only a render shows it.** q8_0 lands INSIDE this
+model's own 24.49 dB bf16-vs-fp16 floor — indistinguishable from bf16 at half the size.
+q4_k is 8 dB below it: a different, equally valid image of the same prompt, not a
+cheaper route to the same one. Recommend q8_0.
+
+#### Where Z-Image's CUDA time goes (measured 2026-08-06, 3090, 1056x1584 / 9 steps)
+
+| | s/step (avg, incl. warm-up) | steady state | step 1 |
+|---|---|---|---|
+| **ComfyUI** (bf16, torch + cuBLAS) | **1.836** | - | - |
+| TensorPencil `cuda`, at first measurement | 3.17 | 2.6 | 8.0 s |
+| + one-block-ahead `prefetchWeight` | 3.04 | 2.6 | 6.6 s |
+| + coalesced `qk_rmsnorm_warp` | 2.39 | 2.0 | 5.6 s |
+| + null-bias GEMM writing straight to `dst` | 2.27 | 1.9 | 5.1 s |
+| + **parallel staging fill** | **2.00** | **1.8** | 3.4 s |
+
+**91.8% of ComfyUI**, from 58%. Renders are unchanged in kind: 29.38 dB / SSIM 0.9592
+against a real ComfyUI render of the same workflow, where the starting point was 29.42
+/ 0.9586 — and ComfyUI's own bf16-vs-fp16 floor on this model is **24.49 dB**, so read
+that control first.
+
+⚠️ **The baseline is MEASURED under identical settings, not taken from a round
+number.** `tools/render_zimage_ref.py` times `comfy.sample.sample` itself; "about 2
+s/step" is really 1.836, which moved the target from "4% away" to "24% away".
+
+##### The isolation, and why the first profile pointed at the wrong thing
+
+`TensorPencil zimage-cuda-bench [<seq>] [libs]` replays exactly one step's device work
+at Z-Image's own shapes, with no checkpoint and no sampler, split three ways. ⚠️ **It
+exists because the whole-render profile was actively misleading**: it attributed 88% of
+the step to `matmul`, but `opGemmBf16` is `ptic()`-scoped, so the two f32<->bf16
+streaming passes wrapped around every GEMM were being counted *as* GEMM time — and the
+norms hid inside a 7% `elt` bucket that looked too small to matter.
+
+| | before | after | |
+|---|---|---|---|
+| GEMMs (224, with conversion) | 1393 ms | **1280 ms** | 65.2 TFLOP/s pure GEMM = ~92% of the card's bf16 roof |
+| attention (32 x cuDNN SDPA) | 424 ms | 416 ms | 23.7 TFLOP/step at 57 TFLOP/s |
+| elementwise | **765 ms** | **156 ms** | |
+| total device work | 2556 ms | **1852 ms** | vs 1.8 s steady in a real render |
+
+⚠️ **The GEMMs were never the problem, and a fourth of the step was two norm calls.**
+Per-op bandwidth is what says so — these kernels do almost no arithmetic, so anything
+far under ~936 GB/s is a kernel defect, not a workload:
+
+| op (x32 blocks) | before | after |
+|---|---|---|
+| `qkNorm` q,k (hd=128) | 364 ms @ **37.5 GB/s** | 20 ms @ 698 GB/s |
+| `qkNorm` sandwich (w=3840) | 290 ms @ **47.1 GB/s** | 29 ms @ 468 GB/s |
+| `rmsMod` x2 | 27 ms @ 498 GB/s | unchanged |
+| `rope` q,k / `gatedAdd` x2 / `siluMul` | 20 / 28 / 36 ms @ 684-749 GB/s | unchanged |
+
+Every other kernel in the same block was already at 500-750 GB/s, which is what makes
+the two outliers legible. Cause: `qk_rmsnorm` gave each **thread** a whole row, so a
+warp's 32 loads were 32 sector fetches `4*dim` apart. `qk_rmsnorm_warp` gives each
+**warp** a row (butterfly-shuffle reduction, no shared memory) - 17x and 10x. ⚠️ The
+row sum becomes a tree where it was serial, so this is not bit-identical; it is the
+more accurate of the two, and `rms_mod_par` next door already reduced this way.
+`rows < 512` still takes the block-per-row kernel (LLM decode norms 1 x 2560).
+
+##### Three more, each with its own receipt
+
+- **A null bias skips a whole output pass.** `opGemmBf16(..., bias: ?[]const f32)`:
+  with nothing to add and cuBLASLt free of the hand-PTX `m % 128` tiling rule, the
+  GEMM writes f32 straight into `dst` - no `m` padding, no `conv_c` staging, no
+  `bias_compact` re-read of `m*co` floats. Conversion overhead 143 -> 56 ms.
+  ⚠️ Callers with a real bias (`dit_cuda`) keep the staged path untouched.
+- ⚠️ **Weight upload is HOST-fill bound, not PCIe bound, and nothing said so until it
+  was split out.** `TP_WARMUP_PROFILE` now reports the two halves separately: at
+  11.57 GB it read `fill 4.88s, slot-wait 0.04s` - PCIe idle 99% of the time while one
+  thread filled the pinned slots at **2.37 GB/s**, against 4.3 GB/s cold and 26 GB/s
+  page-cached for the same file under `dd`. `Context.FillPool` fans the fill over 4
+  threads (positional reads need no ordering): fill 4.88 -> 2.28 s, step 1 5.1 -> 2.6 s,
+  and the render is **bit-identical** (PSNR ∞), as pure plumbing must be.
+- **One-block-ahead `prefetchWeight`**, which `dit_cuda` had and `zimage_cuda` did not.
+
+##### What is NOT the lever, so nobody re-walks it
+
+- **cuBLASLt is at ~92% of the bf16 roof** at these shapes (65.2 TFLOP/s pure GEMM on a
+  ~71 TFLOP/s card). Measured with `bench_gemm_only`, which removes exactly the
+  conversion passes and nothing else.
+- ⚠️ **`COMPUTE_32F` is not the problem.** Torch uses it too, so reduced-precision
+  accumulate is not where ComfyUI's speed comes from; switching to `COMPUTE_16F` would
+  change the numerics for a win the reference does not take.
+- **M padding is 1.4%** at this size, and now zero on the null-bias path.
+- Still untried, and now worth less than it looked: fusing the three qkv GEMMs into one
+  `[11520, 3840]` (blocked on a de-interleave kernel - `qkNorm`/`rope`/`attn` all
+  assume contiguous `[rows][heads*hd]`).
+
+##### Validation
+
+`TensorPencil zimage-cuda-test [<ckpt>] [libs]` checks `zimage_cuda.forward` against
+`zimage.DiT.predict` on real weights (2 trunk layers), on **both** attention paths, and
+exits non-zero on failure - the check this file's convention demanded and that
+`zimage_cuda` had never had. Measured: `libs` 2.23e-4 / 2.14e-4, `hand_ptx` 2.37e-4 /
+2.14e-4 rel L2, matching Vulkan's 2.19e-4 / 2.15e-4.
+
+⚠️ **Found, NOT caused, while doing this: `cuda-dit-test` on a bf16 krea2 checkpoint
+fails** at rel L2 0.141 and runs a 256px forward at ~11.5 s/step. A/B'd across the
+`qkNorm` change (0.14061 old kernel vs 0.14098 new), so it is pre-existing and
+independent of everything above. Unfixed.
+
+⚠️ **The CUDA decode is 5x slower than Vulkan's** (11.9 s vs 2.1 s) and that is the
+attention, not the convolutions: `sd_vae_cuda` uses `be.attn`'s f32 online softmax,
+which is one thread per query — fine at a 64² tile, poor at a whole-image 132x198
+latent (26136 single-head queries). Vulkan's f32 scores plane parallelizes better.
+The fix is a *tiled* f32 online softmax or forcing the decode ladder to tile here;
+neither is done.
+
+⚠️ **`zimage_cuda` has no unit test.** Per this file's own convention the CUDA kernels
+are checked by a CLI command (`sd-cuda-test`) because the test binary brings up no CUDA
+context — a `zimage-cuda-test` is owed. What it *is* checked by today: the render
+comparisons above, plus the isolation that localized its one bug (forcing the trunk to
+CPU showed the fault was in the VAE, not the trunk).
+
+⚠️ **The CUDA text-encoder arm is fp8-only** (`qwen3_cuda.encode` calls `opMatmulFp8`
+unconditionally) and Z-Image's `qwen_3_4b.safetensors` is **bf16**, which it would read
+as fp8 bytes and turn into noise. It gates on `qwen3_cuda.supportsWeights` and falls
+back to the CPU encode. Widening it to bf16 is the cheapest real win available here.
+
+⚠️ **The Vulkan text encoder had the same bug and it cost a blank white render**
+(fixed 2026-08-06). `qwen3_gpu.gemm` handled fp8 only; a bf16 weight fell through to
+`opMatmul` with `dtype_f8 = false`, i.e. the **f32** pipeline reading bf16 bytes. Every
+GEMM was garbage, the conditioning non-finite, and the image solid white with no error.
+⚠️ The trap worth remembering: this file's `wcode` helper *does* read bf16 natively —
+but that is the **LM's GEMV** path, not the encoder's GEMM, and one comment does not
+cover the other. `qwen3_gpu.supportsWeights` now gates it and `zimage_text` has a
+GPU-vs-CPU parity test.
+
+⚠️ **`sd_vae_gpu`'s mid-block scores plane is f32, not the f16 the tensor-core path
+would give, and that is forced by measurement.** The Flux/Z-Image VAE's attention
+**logits reach 9.95e6** on a 12x10 latent where SD1.5's reach **8.3** — 152x past
+f16's 65504 ceiling, and even without overflow f16's quantum up there is ~8000, which
+destroys a softmax whose differences are O(1). It rendered solid white with no error.
+⚠️ Everything upstream is finite and in fact *smaller* than SD's (489 vs 929 at the
+last level), so nothing but the logits themselves shows it — and the 4-channel-only
+test could not, because 4 was also the hardcoded channel count. The plane costs one
+f32 O(seq²) buffer on one attention at latent resolution; `estimatePeakBytes` reports
+it at 4 bytes so the ladder tiles when a whole-image plane will not fit. Measured
+after: SD1.5 **1.1e-3** and the Flux VAE both match the CPU decoder.
+
+⚠️ **`attn_out` runs its OWN online softmax.** There is no softmax pass between it and
+`attn_scores`; adding one exponentiates twice — finite, plausible, and wrong by rel L2
+0.26. `dit_gpu`'s f32 branch omits it for the same reason, and that absence reads as a
+missing step until you read the kernel.
+
+**How `zimage_cuda` differs from `zimage_gpu`** — two things, both forced by the op
+surface rather than chosen:
+
+- ⚠️ **The modulation table is the FOLDED one** (`zimage.modulationTableFolded`).
+  CUDA has no standalone `modulate` — only `rmsMod` (`out = x*inv*premul[col] +
+  shift[col]`) — so the pre-norm weight must arrive already multiplied into the scale
+  (`premul = norm_w * (1 + scale)`, exact since both are per-column multiplies).
+  Vulkan takes the *unfused* table because it has a separate `modulate`. Both come out
+  of one AdaLN evaluation so they cannot drift, and each backend is compared against
+  the same CPU forward.
+- **Attention is `opAttnTC`** (cuDNN's fused SDPA under `--backend cuda`, hand-PTX
+  otherwise). The naive `be.attn` is the fallback behind `force_naive_attn`.
+- **No new kernel was needed on either backend.** The block maps onto the existing
+  vocabulary — the main way this port differs from the SD family's, where GroupNorm,
+  the SpatialTransformer and the LIFO skip stack were all new.
+- **`tanh` the gates on the host**, inside that same table — one `dim`-wide vector per
+  block per step, so it costs nothing and saves a kernel.
+- **The fused `qkv` splits into three zero-copy ROW VIEWS**, so it is three GEMMs
+  writing straight into contiguous q/k/v buffers. ⚠️ The device weight cache keys on the
+  host pointer, so part 0 shares the fused tensor's pointer — never upload both.
+- **Head width is exactly 128**, what the coop/PTX attention builders tile, so unlike
+  the SD family there is **no head padding**; every trunk GEMM width (3840 / 10240 /
+  11520) is a multiple of 128 too.
+- **Keep on the host**: the timestep MLP and all AdaLN linears (precomputed for the
+  whole schedule at `Session.init`), the entire caption half (⚠️ `context_refiner` is
+  `modulation=False`, so it is per-*image*, not per-step), patchify, and the final layer.
+- ⚠️ **Two sequence lengths per forward**: the `noise_refiner` blocks run on the image
+  half alone at the positions it will hold in the joint sequence, so the rope table is
+  *sliced*, not rebuilt; the trunk then runs on the concatenation.
+- ⚠️ The Q/K norms take `finfo(f32).eps` (1.19e-7), **not** the blocks' 1e-5.
+- ⚠️ `ctx.independent(n)` counts **dispatches, not calls**, and a coop GEMM is three of
+  them sharing scratch — do not mark the three qkv GEMMs independent.
 
 ### 2A. The SD family (SD1.5 / SDXL)
 

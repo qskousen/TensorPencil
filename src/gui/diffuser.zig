@@ -422,7 +422,9 @@ pub fn nowNs(io: std.Io) i64 {
 /// `schedule.Scheduler.defaultFor`, which takes a sigma table rather than a family.
 fn defaultSchedulerFor(fam: pipeline.Family) tp.sampler.Scheduler {
     return switch (fam) {
-        .krea2 => .simple,
+        // Both flow-matching families; `simple` is what ComfyUI's own templates
+        // select for each.
+        .krea2, .zimage => .simple,
         .sd15, .sdxl => .normal,
     };
 }

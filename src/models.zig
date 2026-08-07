@@ -58,6 +58,11 @@ pub const embed_siglip_cuda = @import("models/embed_siglip_cuda.zig");
 pub const dit = @import("models/dit.zig");
 pub const dit_gpu = @import("models/dit_gpu.zig");
 pub const dit_cuda = @import("models/dit_cuda.zig");
+/// Z-Image (`NextDiT`) denoiser — the architecture "zit" checkpoints use.
+pub const zimage = @import("models/zimage.zig");
+pub const zimage_text = @import("models/zimage_text.zig");
+pub const zimage_gpu = @import("models/zimage_gpu.zig");
+pub const zimage_cuda = @import("models/zimage_cuda.zig");
 
 test {
     _ = loader;
@@ -113,6 +118,10 @@ test {
     _ = dit;
     _ = dit_gpu;
     _ = dit_cuda;
+    _ = zimage;
+    _ = zimage_text;
+    _ = zimage_gpu;
+    _ = zimage_cuda;
     // Device test relocated out of the gpu backend (it needs both tp_gpu and a
     // model CPU reference); lives here in the model tier.
     _ = @import("models/vit35_gpu_test.zig");

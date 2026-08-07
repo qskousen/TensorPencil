@@ -221,9 +221,54 @@ pub const Config = struct {
     pub const max_layers = 64;
 };
 
+/// Whether a GGUF actually declares its RoPE base, as opposed to `detectGguf`
+/// having guessed one. Checked under both metadata prefixes this stack accepts.
+fn statesRopeTheta(g: *const gguf_mod.Gguf) bool {
+    return g.getFloat("qwen3.rope.freq_base") != null or g.getFloat("llama.rope.freq_base") != null;
+}
+
 /// Tap k is the hidden state before layer k runs.
 pub const tap_layers = [_]usize{ 2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35 };
 pub const tap_count = tap_layers.len;
+
+/// Z-Image conditions on the **penultimate** hidden state with the final norm
+/// skipped (`sd1_clip` `layer_idx = -2`, `layer_norm_hidden_state = False`), which
+/// comfy resolves to `intermediate_output = 36 - 2 = 34` and captures *after* layer
+/// 34 has run. In this file's convention — tap k is the state entering layer k —
+/// that is tap 35, i.e. **exactly krea2's last tap**. Both variants therefore run
+/// the identical 35 layers and differ only in how many states they keep.
+pub const zimage_taps = [_]usize{35};
+
+/// Which conditioning stack a `TextEncoder` produces.
+///
+/// The two are the same 36-layer, 2560-wide Qwen3-4B body; they differ in three
+/// things and nothing else: the checkpoint's tensor prefix (krea2 ships the VL
+/// checkpoint, so its language model is nested under `model.language_model.`), the
+/// RoPE theta (5e6 for the VL variant, 1e6 for plain Qwen3-4B), and the tap list.
+///
+/// ⚠️ The theta is the dangerous one — it is not recoverable from the weights, and
+/// the wrong value produces a perfectly finite encode whose long-range positions
+/// are simply wrong. Both live in `Config` presets so the choice is made once.
+pub const Variant = enum {
+    /// Krea 2: Qwen3-VL-4B, the 12-layer tap stack the DiT's `txtfusion` consumes.
+    krea2,
+    /// Z-Image: plain Qwen3-4B, one hidden state.
+    zimage,
+
+    pub fn config(self: Variant) Config {
+        return switch (self) {
+            .krea2 => Config.vl_4b,
+            .zimage => Config.qwen3_4b,
+        };
+    }
+
+    pub fn taps(self: Variant) []const usize {
+        return switch (self) {
+            .krea2 => &tap_layers,
+            .zimage => &zimage_taps,
+        };
+    }
+};
 
 pub const q_dim = n_heads * head_dim; // 4096
 pub const kv_dim = n_kv_heads * head_dim; // 1024
@@ -252,25 +297,78 @@ pub const TextEncoder = struct {
     pub const supports_prompt_weights = false;
 
     arena: std.heap.ArenaAllocator,
-    /// bf16 [vocab, hidden] view into the mapped file.
-    embed_bytes: []const u8,
+    /// `[vocab, hidden]` view into the mapped file. ⚠️ A `Weight`, not a byte
+    /// slice, because the dtype is a property of the CHECKPOINT: a safetensors
+    /// encoder ships bf16, a GGUF one ships whatever it was quantized to (q6_k for
+    /// Qwen3-4B-Q4_K_M). Every gather goes through `embedTokens`, which dispatches
+    /// on it — three call sites used to hardcode `bf16` and a `* 2` row stride.
+    embed: Weight,
     /// Layers 0..34 — the last tap fires before layer 35.
     layers: []Layer,
+    variant: Variant,
+    cfg: Config,
+    /// Hidden states to keep, in layer order. `encode` emits them token-major.
+    taps: []const usize,
 
+    pub fn tapCount(self: *const TextEncoder) usize {
+        return self.taps.len;
+    }
+
+    /// Krea 2's encoder. Kept as the unqualified name because it is what every
+    /// existing caller means; `loadVariant` is the general form.
+    ///
     /// `store` may be a `weights.Prefixed` view of a bundled checkpoint — this loader
     /// always sees its own component at the root. See `weights.Prefixed`.
     pub fn load(gpa: std.mem.Allocator, store: weights_mod.WeightStore) !TextEncoder {
+        return loadVariant(gpa, store, .krea2);
+    }
+
+    pub fn loadVariant(gpa: std.mem.Allocator, store: weights_mod.WeightStore, variant: Variant) !TextEncoder {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const alloc = arena.allocator();
 
-        const embed = try store.require("model.language_model.embed_tokens.weight");
-        if (embed.info.dtype != .bf16 or embed.info.elemCount() != vocab_size * hidden)
-            return error.ShapeMismatch;
+        // ⚠️ **The checkpoint's own metadata wins for everything the checkpoint
+        // states; the Variant supplies only what it cannot know.** A GGUF carries
+        // its dims, its tensor prefix (bare, no `model.`) and — the one that
+        // matters most — its `rope.freq_base`, which for a safetensors file is not
+        // recoverable and has to come from the Variant's constant. What stays with
+        // the Variant is the TAP LIST, because which hidden states to keep is a
+        // property of how the *diffusion* model was trained, not of the encoder.
+        const cfg = if (store == .gguf) blk: {
+            var c = try Config.detect(store);
+            c.vocab = @max(c.vocab, 1);
+            // ⚠️ **A checkpoint that states nothing must not win.** ComfyUI-style
+            // GGUFs (city96's converter) carry only `general.architecture`, so
+            // `detectGguf` falls back to matching a preset by embedding shape and
+            // GUESSES plain-Qwen3's 1e6 theta. That is right for Z-Image and
+            // silently wrong for krea2, whose Qwen3-VL encoder is 5e6 — a value
+            // that is not recoverable from weights and encodes perfectly finite
+            // nonsense when wrong. Where the file is silent, the Variant's
+            // constant is the better answer, since it is what the *diffusion*
+            // model was trained against.
+            if (!statesRopeTheta(store.gguf)) c.rope_theta = variant.config().rope_theta;
+            break :blk c;
+        } else variant.config();
+        var nbuf: [96]u8 = undefined;
+        const embed_name = try std.fmt.bufPrint(&nbuf, "{s}embed_tokens.weight", .{cfg.prefix});
+        const embed_view = try store.require(embed_name);
+        if (embed_view.info.elemCount() != cfg.vocab * cfg.hidden) return error.ShapeMismatch;
+        const embed = Weight.init(embed_view.bytes, embed_view.info.dtype, cfg.vocab, cfg.hidden);
 
-        const layers = try loadLayers(alloc, store, n_layers - 1);
+        // One past the last tap: both variants tap at 35, so layer 35 and the final
+        // norm are never evaluated and are not loaded.
+        const taps = variant.taps();
+        const layers = try loadLayersCfg(alloc, store, cfg, taps[taps.len - 1]);
 
-        return .{ .arena = arena, .embed_bytes = embed.bytes, .layers = layers };
+        return .{
+            .arena = arena,
+            .embed = embed,
+            .layers = layers,
+            .variant = variant,
+            .cfg = cfg,
+            .taps = taps,
+        };
     }
 
     pub fn deinit(self: *TextEncoder) void {
@@ -278,47 +376,53 @@ pub const TextEncoder = struct {
         self.* = undefined;
     }
 
-    /// Encode token ids to the Krea 2 conditioning stack, [seq][tap_count][hidden]
-    /// row-major (token-major, matching the DiT's unpacked context layout).
+    /// Encode token ids to this variant's conditioning stack,
+    /// `[seq][tapCount()][hidden]` row-major (token-major, matching the krea2 DiT's
+    /// unpacked context layout). For `.zimage` there is one tap, so the result is
+    /// just `[seq][hidden]`.
     pub fn encode(self: *const TextEncoder, io: std.Io, gpa: std.mem.Allocator, ids: []const u32, cancel: ?*std.atomic.Value(bool)) ![]f32 {
         const seq = ids.len;
         std.debug.assert(seq > 0);
+        const n_taps = self.taps.len;
         // Arm fine-grained cancel inside the CPU matmul/attention kernels so a
         // stop lands mid-layer, not just between layers.
         const prev_tok = ops.cancel.token;
         ops.cancel.token = cancel;
         defer ops.cancel.token = prev_tok;
 
-        const out = try gpa.alloc(f32, seq * tap_count * hidden);
+        const out = try gpa.alloc(f32, seq * n_taps * hidden);
         errdefer gpa.free(out);
 
         const x = try gpa.alloc(f32, seq * hidden);
         defer gpa.free(x);
-        try embedTokens(Weight.init(self.embed_bytes, .bf16, vocab_size, hidden), ids, x);
+        try embedTokens(self.embed, ids, x);
 
-        var freqs = try ops.rope.rotateHalfFreqs(gpa, seq, head_dim, rope_theta);
+        // ⚠️ From the variant's config, not the module constant: the VL checkpoint's
+        // theta is 5e6 and plain Qwen3-4B's is 1e6, and the wrong one encodes
+        // perfectly finite nonsense.
+        var freqs = try ops.rope.rotateHalfFreqs(gpa, seq, head_dim, self.cfg.rope_theta);
         defer freqs.deinit(gpa);
 
-        var scratch = try Scratch.init(gpa, seq, Config.vl_4b);
+        var scratch = try Scratch.init(gpa, seq, self.cfg);
         defer scratch.deinit(gpa);
 
-        const dims = encoderDims;
+        const dims = dimsFor(self.cfg);
         var tap_idx: usize = 0;
         for (0..n_layers) |l| {
             // Poll cancel between layers so a stop lands mid-encode (a full CPU
             // encode is 36 layers of full-sequence attention).
             if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
-            if (tap_idx < tap_layers.len and tap_layers[tap_idx] == l) {
+            if (tap_idx < n_taps and self.taps[tap_idx] == l) {
                 for (0..seq) |t| {
-                    @memcpy(out[(t * tap_count + tap_idx) * hidden ..][0..hidden], x[t * hidden ..][0..hidden]);
+                    @memcpy(out[(t * n_taps + tap_idx) * hidden ..][0..hidden], x[t * hidden ..][0..hidden]);
                 }
                 tap_idx += 1;
             }
             if (l >= self.layers.len) break;
             // Encoder: full-sequence, no persistent KV cache.
-            try transformer.layerForward(transformer.qwen3_spec, .fresh, io, gpa, self.layers[l], x, seq, dims, freqs, rms_eps, {}, 0, 0, false, &scratch);
+            try transformer.layerForward(transformer.qwen3_spec, .fresh, io, gpa, self.layers[l], x, seq, dims, freqs, self.cfg.rms_eps, {}, 0, 0, false, &scratch);
         }
-        std.debug.assert(tap_idx == tap_count);
+        std.debug.assert(tap_idx == n_taps);
         return out;
     }
 };
