@@ -2047,6 +2047,167 @@ export fn copy() callconv(.spirv_kernel) void {
     b.data[pc.u2 + idx] = a.data[pc.u3 + idx];
 }
 
+// --- f16 ACTIVATION STORAGE (VAE decode) ------------------------------------
+//
+// ⚠️ Storage-format twins, NOT new maths: each reads and/or writes the big VAE
+// activation buffers as f16 while computing in f32 exactly as its f32 original a
+// few lines away. A 16-channel VAE decoding 1056x1584 holds 256 channels at FULL
+// image resolution (428M floats, 1.71 GB) in each of two buffers; f32 storage made
+// a whole-image decode cost 4.3 GB of activations. `sd_vae.Config.act_f16` gates
+// them, on RANGE not precision — SDXL's residual reaches 4.2e5, past f16.
+//
+// ⚠️ **f16 rides as u32 PAIRS**, because every storage buffer here is `[*]f32`:
+// element `i` is half `i & 1` of word `i >> 1`. Reads may therefore be
+// per-element, but a WRITE must own the whole word or two threads race on it — so
+// every store kernel below indexes PAIRS and does two elements per thread. That is
+// the one structural difference from the CUDA twins, which have real `b16` stores.
+//
+// ⚠️ Each takes its f32 original's push layout EXACTLY (Vulkan's, which is not
+// CUDA's — `im2col_sd` carries the source width in u3 and the output width in u6,
+// and `bias_compact` carries a bias offset in u4 and `act_div` in f0). A first
+// attempt ported the PTX conventions instead; it compiled and would have been
+// silently wrong.
+
+inline fn ldH16(buf: *addrspace(.storage_buffer) FBuf, i: u32) f32 {
+    const w: u32 = @bitCast(buf.data[i >> 1]);
+    const sh: u5 = @intCast((i & 1) * 16);
+    return @floatCast(@as(f16, @bitCast(@as(u16, @truncate(w >> sh)))));
+}
+
+inline fn packH16(lo: f32, hi: f32) f32 {
+    const a16: u16 = @bitCast(@as(f16, @floatCast(lo)));
+    const b16: u16 = @bitCast(@as(f16, @floatCast(hi)));
+    return @bitCast(@as(u32, a16) | (@as(u32, b16) << 16));
+}
+
+// gn_stats over an f16 activation. Read-only, so no pairing. ⚠️ Welford stays in
+// f32: the shifted E[x²]-E[x]² form loses catastrophically once the mean is large
+// relative to the spread, which a late VAE block is.
+export fn gn_stats_h16() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const nch = pc.u2;
+    const per_group = pc.u3;
+    const g = idx / nch;
+    const chunk = idx % nch;
+    const total = pc.u4 * per_group;
+    const c0 = g * per_group;
+    var count: f32 = 0;
+    var mean: f32 = 0;
+    var m2: f32 = 0;
+    var i: u32 = chunk;
+    while (i < total) : (i += nch) {
+        const v = ldH16(&a, (i / per_group) * pc.u1 + c0 + i % per_group);
+        count += 1;
+        const delta = v - mean;
+        mean += delta / count;
+        m2 += delta * (v - mean);
+    }
+    d.data[idx * 3] = count;
+    d.data[idx * 3 + 1] = mean;
+    d.data[idx * 3 + 2] = m2;
+}
+
+// gn_apply reading AND writing f16, one thread per PAIR of elements. ⚠️ The two
+// halves can land in different groups (`per_group` = ch/32 is odd for ch = 96 or
+// 160), so the group lookup is per element, not per pair.
+export fn gn_apply_h16() callconv(.spirv_kernel) void {
+    decorate();
+    const pair = gpu.global_invocation_id[0];
+    const e0 = pair * 2;
+    if (e0 >= pc.u0) return;
+    var out: [2]f32 = undefined;
+    inline for (0..2) |j| {
+        const idx = e0 + @as(u32, @intCast(j));
+        const ch = idx % pc.u1;
+        const g = ch / pc.u2;
+        var v = (ldH16(&a, idx) - d.data[g]) * d.data[pc.u3 + g] * c.data[ch] + c.data[pc.u4 + ch];
+        if (pc.u5 != 0) v = v / (1.0 + @exp(-v));
+        out[j] = v;
+    }
+    b.data[pair] = packH16(out[0], out[1]);
+}
+
+// a += b over two f16 activations, summed in f32.
+export fn add_h16() callconv(.spirv_kernel) void {
+    decorate();
+    const pair = gpu.global_invocation_id[0];
+    if (pair * 2 >= pc.u0) return;
+    const lo = ldH16(&a, pair * 2) + ldH16(&b, pair * 2);
+    const hi = ldH16(&a, pair * 2 + 1) + ldH16(&b, pair * 2 + 1);
+    a.data[pair] = packH16(lo, hi);
+}
+
+// bias_compact writing f16: the GEMM accumulator `a` stays f32 and the `act_div`
+// unscale and bias add still happen in f32; only `d` narrows. ⚠️ `pc.u3` (the
+// destination offset) must be EVEN for the pair write to align — it is
+// `p0 * co` and `co` is always even here.
+export fn bias_compact_h16() callconv(.spirv_kernel) void {
+    decorate();
+    const pair = gpu.global_invocation_id[0];
+    const e0 = pair * 2;
+    if (e0 >= pc.u0) return;
+    var out: [2]f32 = undefined;
+    inline for (0..2) |j| {
+        const idx = e0 + @as(u32, @intCast(j));
+        const cc = idx % pc.u1;
+        out[j] = a.data[(idx / pc.u1) * pc.u2 + cc] * pc.f0 + b.data[pc.u4 + cc];
+    }
+    d.data[(pc.u3 + e0) >> 1] = packH16(out[0], out[1]);
+}
+
+// im2col_sd reading an f16 source. ⚠️ The patch it WRITES stays f32 — it is banded
+// (a few MB, `convBand`) so it is not where the memory goes, and leaving it f32
+// keeps the GEMM's own conversion and the zero-padding untouched.
+export fn im2col_sd_h16() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const plen = pc.u1;
+    const ci = pc.u2;
+    const sw = pc.u3;
+    const up: u5 = if (pc.f0 == 1) 1 else 0;
+    const stride: u32 = if (pc.f0 == 2) 2 else 1;
+    const gw = sw << up;
+    const gh = pc.u4 << up;
+    const ow = pc.u6;
+    const col = idx % plen;
+    const p = pc.u5 + idx / plen;
+    const tap = col / ci;
+    const cc = col % ci;
+    const yk = (p / ow) * stride + tap / 3;
+    const xk = (p % ow) * stride + tap % 3;
+    var v: f32 = 0;
+    if (yk >= 1 and yk <= gh and xk >= 1 and xk <= gw) {
+        const sy = (yk - 1) >> up;
+        const sx = (xk - 1) >> up;
+        v = ldH16(&a, (sy * sw + sx) * ci + cc);
+    }
+    d.data[idx] = v;
+}
+
+// `f32_to_h16_pad` whose SOURCE is already f16: the k=1 convolution path converts
+// its activation inside `coopF16WDispatch`, so an f16 activation needs this rather
+// than the f32 form. Same push layout; only the load changes.
+export fn h16_to_h16_pad() callconv(.spirv_kernel) void {
+    decorate();
+    const idx = gpu.global_invocation_id[0];
+    if (idx >= pc.u0) return;
+    const e0 = idx * 2;
+    const row = e0 / pc.u2;
+    const col = e0 % pc.u2;
+    var out: u32 = 0;
+    inline for (0..2) |j| {
+        const cc = col + @as(u32, @intCast(j));
+        if (cc < pc.u1 and row < pc.u3) {
+            const v: f16 = @floatCast(ldH16(&a, row * pc.u1 + cc) * pc.f0);
+            out |= @as(u32, @as(u16, @bitCast(v))) << (16 * j);
+        }
+    }
+    d.data[idx] = @bitCast(out);
+}
+
 // --- GEMM-ified attention (scores buffer batched over head groups) -------
 // attn_scores: S[z][q][j] = scale * dot(Q[q, head, :], K[j, kv(head), :])
 //   where head = u4 + z. 4x4 register tile per thread; x = key tile,

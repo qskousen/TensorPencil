@@ -218,7 +218,8 @@ fn attn(be: *Backend, bufs: *Bufs, norms: *NormBufs, h: usize, w: usize, ab: sd_
     try conv(be, bufs, &bufs.ak, &bufs.t, h, w, ab.k, .stride1, a16, false);
     try conv(be, bufs, &bufs.av, &bufs.t, h, w, ab.v, .stride1, a16, false);
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(ch)));
-    // ⚠️ **`be.attn`, not `opAttnTC`, and that is forced by measurement.** The
+    // ⚠️ **`opAttnTC` on BOTH arms as of the f32 scores band.** The rejection below
+    // was real and is kept because it explains the shape of the constraint:
     // tensor-core path materializes the scores plane in **f16**, and the
     // Flux/Z-Image VAE's attention *logits* reach **9.95e6** on a 12x10 latent where
     // SD1.5's reach **8.3** — 152x past f16's 65504 ceiling, and even without
@@ -228,7 +229,7 @@ fn attn(be: *Backend, bufs: *Bufs, norms: *NormBufs, h: usize, w: usize, ab: sd_
     //
     // `be.attn` keeps an **online softmax in f32** and materializes no scores plane
     // at all, so it cannot overflow and needs no O(seq²) buffer.
-    if (force_naive_attn or be.kernels != .libs) {
+    if (force_naive_attn) {
         try be.attn(bufs.aq, bufs.ak, bufs.av, bufs.ao, n, n, 1, 1, ch, scale, false);
     } else {
         try be.opAttnTC(bufs.aq, bufs.ak, bufs.av, bufs.ao, n, 1, 1, ch, scale);

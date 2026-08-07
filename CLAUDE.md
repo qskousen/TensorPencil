@@ -1287,11 +1287,83 @@ accumulator, and the norms still reduce in f32 — only the two 1.71 GB buffers 
 Five storage-format twin kernels (`gn_stats_h16`, `gn_apply_h16`, `add_h16`,
 `bias_compact_h16`, `im2col_sd_h16`) plus `src_f16`/`dst_f16` on `convIntoPrec`.
 
+**Then Vulkan's scores plane got QUERY-BANDED**, which was its single largest item.
+`sd_vae_gpu.attn` loops over bands of `sd_vae.scoresBand(seq)` queries; `attn_scores`
+takes an offset + band size in `u5`/`u6` and `attn_out` an offset in `u6` **encoded
++1, so 0 keeps meaning "not banded"** — that kernel had exactly one free push slot and
+had to distinguish "band starting at row 0" from "no band". Every pre-existing caller
+passes 0, so the DiT, UNet and CLIP paths are unchanged *by construction*.
+- The arithmetic is untouched because `attn_out` already runs an **online softmax over
+  whole key rows**, so a band of queries is exactly independent work. Render verified
+  **bit-identical** (PSNR ∞).
+- ⚠️ `scoresBand` lives in `sd_vae.zig` and is called by BOTH the decoder and
+  `estimatePeakBytes`. Two copies of that constant is precisely the drift that makes a
+  peak estimate lie — the same duplication that had the GUI refusing GGUF encoders the
+  engine loads fine.
+
+**Vulkan then got the same f16 activation storage**, so both GPU backends now read
+`Config.act_f16`. Six kernels rather than CUDA's five: SPIR-V storage buffers are all
+`[*]f32`, so f16 rides as **u32 pairs** — element `i` is half `i & 1` of word
+`i >> 1`.
+
+- ⚠️ **Reads may be per-element; a WRITE must own the whole word**, or two threads
+  race on it. So every store twin (`gn_apply_h16`, `add_h16`, `bias_compact_h16`)
+  indexes PAIRS and does two elements per thread. `gn_apply_h16`'s pair can land in
+  two different GroupNorm groups (`per_group = ch/32` is odd at ch = 96 or 160), so
+  its group lookup is per element, not per pair.
+- The sixth is `h16_to_h16_pad`: Vulkan's k=1 conv converts its activation *inside*
+  `coopF16WDispatch` via `f32_to_h16_pad`, so an f16 source needs an f16-input twin
+  of that. CUDA got this free — `f16_pad2d` already existed there.
+- ⚠️ **A first attempt wrote all five against CUDA's push layout and was thrown
+  away.** They compiled. Vulkan's `im2col_sd` carries the source width in `u3` and
+  the output width in `u6`; `bias_compact` carries a bias offset in `u4` and
+  `act_div` in `f0` — none of which CUDA's do. Two backends with same-named kernels
+  and different push conventions is exactly the trap: **read the f32 original in the
+  same file, never port the twin from the other backend.**
+
 | backend | decode | est peak | note |
 |---|---|---|---|
 | **`cuda`** | 12.0 -> **1.4 s** | 7.7 -> **2.2 GB** | cuDNN SDPA + f16 storage |
-| `vulkan` | 2.1 s | 6.9 GB | f32 storage AND an f32 `seq²` plane (2.73 GB of it) |
-| `zig-cuda` | 13.2 s | 2.2 GB | f16 storage, but still `be.attn` |
+| **`vulkan`** | 2.1 s | 7.7 -> **2.6 GB** | banded plane + f16 storage |
+| **`zig-cuda`** | 13.2 -> **1.4 s** | 7.7 -> **2.2 GB** | f16 storage + f32 scores band |
+
+Vulkan's f16 render is **68.54 dB / SSIM 0.9999** against its own f32 one (max
+difference one 8-bit level) — matching CUDA's 68.52 dB, which is what you want to see
+from two independent implementations of the same idea.
+
+**Finally `zig-cuda` got an f32 SCORES BAND, and its decode went 13.2 -> 1.4 s**,
+bit-identical. `opAttnTCFlash` stored its query band in f16, which this VAE's 9.95e6
+logits cannot survive, so `sd_vae_cuda` had been falling back to the naive per-query
+kernel. Three pieces, and two of them already existed:
+
+- the scores GEMM is `hgemmBatchedFn` — `buildHgemm`'s `c_f16` was already a
+  parameter, so the f32-C form was there all along;
+- `softmax_md_f32` is **derived** from `softmax_md_f16` by `replaceOnce`, a comptime
+  substitution that `@compileError`s if a pattern is absent **or not unique**. The
+  two differ in three lines (element size and the load), and this way they cannot
+  drift — it caught a wrong pattern of mine at compile time;
+- `buildHgemm` gained `a_f32`: the `attnout` GEMM reads S as a pair of f32 instead of
+  a packed f16 word. ⚠️ **P stays f16** — it is a probability in [0,1], so only S
+  widens and the MMA is untouched. A needs its own row step and k offset because B
+  keeps its f16 stride.
+
+⚠️ **The routing gate was on the wrong axis, and that is the actual bug this
+exposed.** `opAttnTC` sent single-head attention to the flash path only when the
+plane exceeded the scratch budget — so a SMALL latent took the batched f16 path and
+came out non-finite while a large one was fine. Size never decided correctness; score
+magnitude did. Single-head now goes to the flash path at every size, which costs
+nothing (it degenerates to one band when the plane already fits).
+
+⚠️ **Measured dead end, recorded so nobody re-walks it:** before this, a warp-per-query
+`attn` was tried — coalesced loads, `hd/32` accumulator instead of `hd`. It is **18.3x**
+faster at seq 1736 and **1.1x** at seq 26,136, because at the real size both naive forms
+sit at ~0.13 TFLOP/s and neither coalescing nor L1 reuse is what binds them. It was
+reverted. The isolation that settled it is in `zimage-cuda-bench`:
+
+| at seq 26,136, 1 head x 512 | time | TFLOP/s |
+|---|---|---|
+| `be.attn` (thread per query) | 11,431 ms | 0.12 |
+| `opAttnTC` (flash, f32 scores) | **34 ms** | **40.85** |
 
 **3.4x less VRAM and 8.6x faster, for 1/255.** The f16 render is **68.5 dB / SSIM
 0.9999** against the f32 one (max difference one 8-bit level) and unchanged at 30.00
@@ -1488,8 +1560,9 @@ expensive bucket is the problem, check what the timer actually spans (`ptic`/`pt
 wrapped an *op*, not a kernel) and give each part a ceiling to be judged against. Both
 fixes here were in code the profile said was 7% and 0% of the problem.
 
-⚠️ **Found, NOT caused, in the same pass: `cuda-dit-test` on a bf16 krea2 checkpoint
-fails** — rel L2 0.141 against the CPU forward, and a 256px forward taking ~11.5 s/step.
+⚠️ **Found, NOT caused: `cuda-dit-test` on a krea2 checkpoint fails at BOTH dtypes** —
+rel L2 0.141 (bf16) and 0.132 (int8 convrot) against the CPU forward, the bf16 arm also
+taking ~11.5 s for a 256px forward.
 A/B'd across the `qkNorm` change (0.14061 with the old kernel, 0.14098 with the new), so
 it is pre-existing and unrelated to any of the above. Unfixed, and worth someone's time:
 it means krea2's bf16 CUDA arm has no working validation today.

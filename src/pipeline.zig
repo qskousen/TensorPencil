@@ -658,12 +658,11 @@ const SdVae = struct {
     /// (512² pixels) costs 3 x 256 MiB and is also what ComfyUI's tiled SD decode
     /// defaults to; overlap 8 keeps its 25% seam ratio.
     const tiling: vae_tiled.Params = .{ .tile = 64, .overlap = 8 };
-    /// `scores_resident` doubles as "this is the Vulkan arm": it is the only
-    /// backend that materializes the scores plane, and also the only one that has
-    /// not been taught f16 activation storage. Kept as one flag rather than two so
-    /// they cannot be set inconsistently.
+    /// `scores_resident` means "the Vulkan arm" — the only backend that
+    /// materializes a band of the scores plane. Both arms now implement f16
+    /// activation storage, so that follows the config on either.
     fn estimate(self: SdVae, zh: usize, zw: usize, scores_resident: bool) u64 {
-        return self.vae.estimatePeakBytes(zh, zw, scores_resident, self.vae.cfg.act_f16 and !scores_resident);
+        return self.vae.estimatePeakBytes(zh, zw, scores_resident, self.vae.cfg.act_f16);
     }
     fn cudaCtx(self: SdVae, be: *cuda.Backend, cancel: ?*std.atomic.Value(bool)) SdCudaTile {
         return .{ .vae = self.vae, .be = be, .cancel = cancel };

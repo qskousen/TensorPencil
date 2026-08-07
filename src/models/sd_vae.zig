@@ -238,6 +238,24 @@ pub const Level = struct {
 /// receives a convolution's OUTPUT, so it peaks one level narrower (128 channels at
 /// full resolution, 214M). Sizing all three at `wide` cost **856 MB** per decode,
 /// and made `estimatePeakBytes` demand room the decode never used.
+/// Query rows per mid-block attention scores band, for a backend that materializes
+/// the plane (Vulkan; both CUDA arms stream instead).
+///
+/// ⚠️ **Shared by the kernel caller AND `estimatePeakBytes` on purpose.** The whole
+/// `seq²` plane is 2.73 GB at a 1056x1584 render — larger than the activations it
+/// serves — so the estimate is only meaningful if it uses the same band the decode
+/// will actually allocate. Two copies of this constant is exactly the drift that
+/// makes a peak estimate lie.
+///
+/// A whole multiple of the 8-wide kernel tile, so a band's last tile is never
+/// partial — which is what lets `attn_out` skip its row clamp when banded.
+pub fn scoresBand(n: usize) usize {
+    const cap: usize = (256 << 20) / 4; // f32 entries we are willing to hold
+    var qb = @max(@as(usize, 8), (cap / @max(n, 1)) & ~@as(usize, 7));
+    if (qb > n) qb = std.mem.alignForward(usize, n, 8);
+    return qb;
+}
+
 pub const ActWidths = struct { wide: u64, out: u64 };
 
 pub fn activationElems(cfg: Config, zh: usize, zw: usize) ActWidths {
@@ -417,7 +435,7 @@ pub const Decoder = struct {
         // ⚠️ `scores_resident` is the Vulkan arm, which materializes ONE QUERY BAND
         // of the plane (`sd_vae_gpu.scoresBand`), not the whole `seq²`. Both GPU
         // arms also keep a k-major f32 copy of Q and K.
-        const band: u64 = @min(seq, (64 << 20) / @max(seq, 1));
+        const band: u64 = scoresBand(@intCast(seq));
         const attn = 4 * seq * self.cfg.innermost() * 4 +
             if (scores_resident) 2 * seq * self.cfg.innermost() * 4 + band * seq * 4 else 0;
         // ⚠️ The activation buffers narrow with `act_f16`; the attention scratch does

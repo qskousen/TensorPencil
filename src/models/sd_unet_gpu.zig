@@ -844,7 +844,7 @@ fn groupNorm(
     eps: f32,
     silu: bool,
 ) !void {
-    return groupNormInto(ctx, ws.gstat, ws.gmi, dst, src, n, ch, cat, groups, eps, silu);
+    return groupNormInto(ctx, ws.gstat, ws.gmi, dst, src, n, ch, cat, groups, eps, silu, false);
 }
 
 /// GroupNorm with the two statistics buffers passed in, so the SD VAE decoder
@@ -862,12 +862,15 @@ pub fn groupNormInto(
     groups: usize,
     eps: f32,
     silu: bool,
+    /// `src` and `dst` are f16 rather than f32. The statistics, weight and bias
+    /// stay f32 either way — they are per-channel, not per-position.
+    act_f16: bool,
 ) !void {
     std.debug.assert(cat.len == 2 * ch);
     const per_group = ch / groups;
     const cbuf: DeviceBuffer = .{ .buf = try ctx.smallBuffer(std.mem.sliceAsBytes(cat)), .mem = .null_handle, .size = 0 };
 
-    try ctx.opElt(.gn_stats, src.*, null, null, gstat, .{
+    try ctx.opElt(if (act_f16) .gn_stats_h16 else .gn_stats, src.*, null, null, gstat, .{
         .u0 = @intCast(groups * gn_chunks),
         .u1 = @intCast(ch),
         .u2 = gn_chunks,
@@ -879,7 +882,7 @@ pub fn groupNormInto(
         .u2 = gn_chunks,
         .f0 = eps,
     }, groups, 1, 1);
-    try ctx.opElt(.gn_apply, src.*, dst.*, cbuf, gmi, .{
+    try ctx.opElt(if (act_f16) .gn_apply_h16 else .gn_apply, src.*, dst.*, cbuf, gmi, .{
         .u0 = @intCast(n * ch),
         .u1 = @intCast(ch),
         .u2 = @intCast(per_group),
@@ -1042,19 +1045,47 @@ pub fn convIntoScaled(
     bias_dev: ?BiasSlice,
     act_div: f32,
 ) !void {
-    const coop = ctx.pipe_coop_f16w != .null_handle and cv.co >= coop_min_co;
+    return convIntoPrec(ctx, patch, dst, src, h, w, cv, mode, bias_dev, act_div, false, false);
+}
+
+/// `convIntoScaled` with f16 activation STORAGE on either side. Mirrors
+/// `sd_unet_cuda.convIntoPrec`; see `sd_vae.Config.act_f16`.
+///
+/// ⚠️ f16 storage FORCES the cooperative path, because the plain f32 GEMM arm has
+/// no f16 form. `coop_min_co` is a PERFORMANCE threshold, not a correctness one —
+/// and not forcing it is a real bug, not a theoretical one: on CUDA it left SD1.5's
+/// 4->4 `post_quant_conv` on the f32 arm writing f32 into an f16 buffer, and every
+/// pixel came out non-finite.
+pub fn convIntoPrec(
+    ctx: *Context,
+    patch: *DeviceBuffer,
+    dst: *DeviceBuffer,
+    src: *const DeviceBuffer,
+    h: usize,
+    w: usize,
+    cv: Conv2d,
+    mode: SampleMode,
+    bias_dev: ?BiasSlice,
+    act_div: f32,
+    src_f16: bool,
+    dst_f16: bool,
+) !void {
+    std.debug.assert(!(src_f16 and act_div != 1.0));
+    const coop = ctx.pipe_coop_f16w != .null_handle and (cv.co >= coop_min_co or src_f16 or dst_f16);
     // Every convolution in an LDM UNet carries a bias; `Conv2d` models the
     // general case, so pin the assumption here rather than in five call sites.
     const cb = cv.b orelse return error.MissingConvBias;
     if (cv.k == 1) {
         std.debug.assert(mode == .stride1);
         const n = h * w;
-        try probeInput(ctx, src.*, n, convWeight(cv, cv.ci));
+        // The capture probe reads f32; an f16 buffer would be filed as noise.
+        if (!src_f16) try probeInput(ctx, src.*, n, convWeight(cv, cv.ci));
         if (bias_dev) |bd| {
-            std.debug.assert(coop);
+            std.debug.assert(coop and !src_f16 and !dst_f16);
             return ctx.opMatmulCoopF16WDev(dst.*, 0, src.*, n, cv.w, cv.co, cv.ci, bd.buf, bd.off);
         }
-        if (coop) return ctx.opMatmulCoopF16WScaled(dst.*, 0, src.*, n, cv.w, cv.co, cv.ci, cb, act_div);
+        if (coop) return ctx.opMatmulCoopF16WPrec(dst.*, 0, src.*, n, cv.w, cv.co, cv.ci, cb, act_div, src_f16, dst_f16);
+        std.debug.assert(!src_f16 and !dst_f16); // unreachable: `coop` covers those
         return ctx.opMatmul(dst.*, 0, src.*, 0, n, std.mem.sliceAsBytes(cv.w), false, cv.co, cv.ci, 1.0, cb);
     }
     std.debug.assert(cv.k == 3);
@@ -1078,7 +1109,7 @@ pub fn convIntoScaled(
     var p0: usize = 0;
     while (p0 < n_out) : (p0 += band) {
         const bn = @min(band, n_out - p0);
-        try ctx.opElt(.im2col_sd, src.*, null, null, patch.*, .{
+        try ctx.opElt(if (src_f16) .im2col_sd_h16 else .im2col_sd, src.*, null, null, patch.*, .{
             .u0 = @intCast(bn * patch_len),
             .u1 = @intCast(patch_len),
             .u2 = @intCast(cv.ci),
@@ -1094,8 +1125,10 @@ pub fn convIntoScaled(
             std.debug.assert(coop);
             try ctx.opMatmulCoopF16WDev(dst.*, p0 * cv.co, patch.*, bn, cv.w, cv.co, patch_len, bd.buf, bd.off);
         } else if (coop) {
-            try ctx.opMatmulCoopF16WScaled(dst.*, p0 * cv.co, patch.*, bn, cv.w, cv.co, patch_len, cb, act_div);
+            // The patch is f32 whatever `src_f16` said, so only `dst_f16` applies.
+            try ctx.opMatmulCoopF16WPrec(dst.*, p0 * cv.co, patch.*, bn, cv.w, cv.co, patch_len, cb, act_div, false, dst_f16);
         } else {
+            std.debug.assert(!dst_f16);
             try ctx.opMatmul(dst.*, p0 * cv.co * 4, patch.*, 0, bn, std.mem.sliceAsBytes(cv.w), false, cv.co, patch_len, 1.0, cb);
         }
     }

@@ -111,7 +111,7 @@ pub const topk_lanes = 1024;
 /// llm.kv_cache.KvDtype). q8_0 is the ggml 34-byte block (f16 scale + 32 i8).
 pub const KvFmt = enum { f32, f16, q8_0 };
 
-pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, rope_qwen35, attn_decode_q35, attn_dsplit_gemma, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, attn_dsplit_gemma_f16, kv_store_f16, penalize, attn_dsplit_gemma_q8, kv_store_q8_0, gemv_iq4_nl, gemv_iq4_nl_t, dequant_q8_0_f32, dequant_q4_k_f32, dequant_q5_k_f32, dequant_q6_k_f32, dequant_iq4_nl_f32, pack_h16_kmajor, gn_stats, gn_combine, gn_apply, silu, geglu, concat_ch, attn_cross, head_pad_h16, head_unpad, im2col_sd, attn_causal_batched, gelu_quick, gelu_erf };
+pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, rope_qwen35, attn_decode_q35, attn_dsplit_gemma, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, attn_dsplit_gemma_f16, kv_store_f16, penalize, attn_dsplit_gemma_q8, kv_store_q8_0, gemv_iq4_nl, gemv_iq4_nl_t, dequant_q8_0_f32, dequant_q4_k_f32, dequant_q5_k_f32, dequant_q6_k_f32, dequant_iq4_nl_f32, pack_h16_kmajor, gn_stats, gn_combine, gn_apply, silu, geglu, concat_ch, attn_cross, head_pad_h16, head_unpad, im2col_sd, attn_causal_batched, gelu_quick, gelu_erf, gn_stats_h16, gn_apply_h16, add_h16, bias_compact_h16, im2col_sd_h16, h16_to_h16_pad };
 const elt_entry_sizes = [_]EntrySize{
     .{ .name = "rmsnorm", .x = 64, .y = 1 },
     .{ .name = "rms_partial", .x = 256, .y = 1 },
@@ -217,6 +217,13 @@ const elt_entry_sizes = [_]EntrySize{
     .{ .name = "attn_causal_batched", .x = 64, .y = 1 },
     .{ .name = "gelu_quick", .x = 256, .y = 1 },
     .{ .name = "gelu_erf", .x = 256, .y = 1 },
+    // f16 activation-storage twins for the VAE decode (see eltwise.zig).
+    .{ .name = "gn_stats_h16", .x = 256, .y = 1 },
+    .{ .name = "gn_apply_h16", .x = 256, .y = 1 },
+    .{ .name = "add_h16", .x = 256, .y = 1 },
+    .{ .name = "bias_compact_h16", .x = 256, .y = 1 },
+    .{ .name = "im2col_sd_h16", .x = 256, .y = 1 },
+    .{ .name = "h16_to_h16_pad", .x = 256, .y = 1 },
 };
 
 /// Push block shared by all eltwise entries; meaning per entry (see kernels).
@@ -3271,9 +3278,28 @@ pub const Context = struct {
         bias: []const f32,
         act_div: f32,
     ) Error!void {
+        return self.opMatmulCoopF16WPrec(y, y_off, x, m, w, rows, cols, bias, act_div, false, false);
+    }
+
+    /// `opMatmulCoopF16WScaled` with f16 activation storage selectable on either
+    /// side — see `coopF16WDispatch`.
+    pub fn opMatmulCoopF16WPrec(
+        self: *Context,
+        y: DeviceBuffer,
+        y_off: usize,
+        x: DeviceBuffer,
+        m: usize,
+        w: []const f32,
+        rows: usize,
+        cols: usize,
+        bias: []const f32,
+        act_div: f32,
+        src_f16: bool,
+        dst_f16: bool,
+    ) Error!void {
         std.debug.assert(self.pipe_coop_f16w != .null_handle);
         const w_buf = try self.weightBufferF16From32(w, rows, cols);
-        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, false, act_div);
+        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, false, act_div, src_f16, dst_f16);
     }
 
     /// `opMatmulCoopF16W` with a **device-resident** bias, for the SD UNet's
@@ -3297,7 +3323,7 @@ pub const Context = struct {
     ) Error!void {
         std.debug.assert(self.pipe_coop_f16w != .null_handle);
         const w_buf = try self.weightBufferF16From32(w, rows, cols);
-        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, bias.buf, bias_off, false, 1.0);
+        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, bias.buf, bias_off, false, 1.0, false, false);
     }
 
     /// Same f16-weight tensor-core GEMM as opMatmulCoopF16W, but the weight is a
@@ -3319,7 +3345,7 @@ pub const Context = struct {
     ) Error!void {
         std.debug.assert(self.pipe_coop_f16w != .null_handle);
         const w_buf = try self.weightBufferF16FromBf16(w_bytes, rows, cols, false);
-        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, false, 1.0);
+        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, false, 1.0, false, false);
     }
 
     /// Same f16-weight tensor-core GEMM again, but the weight is a raw **f16**
@@ -3345,7 +3371,7 @@ pub const Context = struct {
     ) Error!void {
         std.debug.assert(self.pipe_coop_f16w != .null_handle);
         const w_buf = try self.weightBufferF16FromBf16(w_bytes, rows, cols, true);
-        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, false, 1.0);
+        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, false, 1.0, false, false);
     }
 
     /// Native bf16 twin of opMatmulCoopF16Wb: the raw bf16 weight is kept bf16
@@ -3365,7 +3391,7 @@ pub const Context = struct {
     ) Error!void {
         std.debug.assert(self.pipe_coop_bf16w != .null_handle);
         const w_buf = try self.weightBufferF16FromBf16(w_bytes, rows, cols, true);
-        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, true, 1.0);
+        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, true, 1.0, false, false);
     }
 
     /// Shared body of the f16/bf16-weight coop GEMM: the weight is already
@@ -3392,7 +3418,16 @@ pub const Context = struct {
         bias_off: usize,
         bf16_ab: bool,
         act_div: f32,
+        /// f16 activation STORAGE on either side. The GEMM is unchanged — it already
+        /// ran f16 operands with an f32 accumulator; these say only how the caller's
+        /// big activation buffers are laid out, which is where a VAE decode's
+        /// gigabytes live. ⚠️ `src_f16` and `act_div != 1` are mutually exclusive:
+        /// the divisor exists to bring a value too large for f16 THROUGH the cast,
+        /// and an f16 buffer could not have held it in the first place.
+        src_f16: bool,
+        dst_f16: bool,
     ) Error!void {
+        std.debug.assert(!(src_f16 and act_div != 1.0));
         const n_pad = std.mem.alignForward(usize, rows, 128);
         const k_pad = std.mem.alignForward(usize, cols, 64);
         const m_pad = std.mem.alignForward(usize, m, 128);
@@ -3402,7 +3437,8 @@ pub const Context = struct {
         // x f32 [m][cols] -> f16/bf16 [m_pad][k_pad], zeros in both pads. The
         // `act_div` division rides along here and is undone in `bias_compact`; see
         // `opMatmulCoopF16WScaled`.
-        try self.opElt(if (bf16_ab) .f32_to_bf16_pad else .f32_to_h16_pad, x, null, null, self.x_h16, .{
+        const conv_kind: Elt = if (src_f16) .h16_to_h16_pad else if (bf16_ab) .f32_to_bf16_pad else .f32_to_h16_pad;
+        try self.opElt(conv_kind, x, null, null, self.x_h16, .{
             .u0 = @intCast(m_pad * k_pad / 2),
             .u1 = @intCast(cols),
             .u2 = @intCast(k_pad),
@@ -3420,7 +3456,7 @@ pub const Context = struct {
         try self.opEnd();
 
         const bias_db: DeviceBuffer = .{ .buf = bias_buf, .mem = .null_handle, .size = 0 };
-        try self.opElt(.bias_compact, self.y_pad, bias_db, null, y, .{
+        try self.opElt(if (dst_f16) .bias_compact_h16 else .bias_compact, self.y_pad, bias_db, null, y, .{
             .u0 = @intCast(m * rows),
             .u1 = @intCast(rows),
             .u2 = @intCast(n_pad),
@@ -3514,7 +3550,7 @@ pub const Context = struct {
     pub fn opMatmulCoopQuant(self: *Context, dt: @import("tp_core").dtype.DType, y: DeviceBuffer, y_off: usize, x: DeviceBuffer, m: usize, w_bytes: []const u8, rows: usize, cols: usize, scale: f32, bias: []const f32, repacked: bool) Error!void {
         std.debug.assert(self.pipe_coop_f16w != .null_handle);
         const w_buf = try self.quantWeightF16K(dt, w_bytes, rows, cols, scale, repacked);
-        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, false, 1.0);
+        return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, false, 1.0, false, false);
     }
 
     /// Whether the int8 dp4a decode GEMV is available (q8_0 / iq4_nl).

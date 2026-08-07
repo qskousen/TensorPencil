@@ -2211,6 +2211,52 @@ fn zimageCudaBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, seq: us
     var t_elt: f64 = 0;
     for (parts) |p| t_elt += p.t;
 
+    // --- the VAE mid-block attention, isolated -----------------------------------
+    // ⚠️ Its own section because it is a DIFFERENT shape from the DiT's: one head
+    // over 512 channels attending across every latent position, so seq is ~26k where
+    // the DiT's heads are 30x128. That difference is why the naive per-query kernel
+    // is merely slow in the DiT and catastrophic here.
+    {
+        // ⚠️ The VAE attends at LATENT resolution over every position, so its seq is
+        // the latent size, not the DiT token count. Pass the bench a latent-sized seq
+        // (26136 = 132x198, a 1056x1584 render) to see the shape that actually runs.
+        const vseq = seq;
+        const vhd: usize = 512;
+        var vq: Buf = .{};
+        var vk: Buf = .{};
+        var vv: Buf = .{};
+        var vo: Buf = .{};
+        inline for (.{ &vq, &vk, &vv, &vo }) |bp| try be.ensureDeviceBuffer(bp, vseq * vhd * 4);
+        {
+            const host = try arena.alloc(f32, vseq * vhd);
+            defer arena.free(host);
+            var pr = std.Random.DefaultPrng.init(5);
+            for (host) |*hv| hv.* = pr.random().floatNorm(f32);
+            inline for (.{ vq, vk, vv }) |bb| try be.tensorUpload(bb, std.mem.sliceAsBytes(host));
+        }
+        const vscale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(vhd)));
+        const A = struct {
+            fn naive(b: *cuda.Backend, ar: anytype) !void {
+                try b.beginBatch();
+                try b.attn(ar.q, ar.k, ar.v, ar.o, ar.n, ar.n, 1, 1, ar.hd, ar.sc, false);
+                try b.endBatch();
+            }
+            fn tc(b: *cuda.Backend, ar: anytype) !void {
+                try b.beginBatch();
+                try b.opAttnTC(ar.q, ar.k, ar.v, ar.o, ar.n, 1, 1, ar.hd, ar.sc);
+                try b.endBatch();
+            }
+        };
+        const va = .{ .q = vq, .k = vk, .v = vv, .o = vo, .n = vseq, .hd = vhd, .sc = vscale };
+        // 4·seq²·hd: QK then PV, no mask.
+        const vflop = 4.0 * @as(f64, @floatFromInt(vseq)) * @as(f64, @floatFromInt(vseq)) * @as(f64, @floatFromInt(vhd));
+        try stdout.print("\n-- VAE mid-block attention (seq={d}, 1 head x {d}) --\n", .{ vseq, vhd });
+        const t_naive = try timeBest(io, 1, A.naive, be, va);
+        const t_tc = timeBest(io, 2, A.tc, be, va) catch std.math.nan(f64);
+        try stdout.print("be.attn (thread/query) {d:8.0} ms  {d:6.2} TFLOP/s\n", .{ t_naive, vflop / (t_naive / 1e3) / 1e12 });
+        try stdout.print("opAttnTC               {d:8.0} ms  {d:6.2} TFLOP/s  ({d:.1}x)\n", .{ t_tc, vflop / (t_tc / 1e3) / 1e12, t_naive / t_tc });
+    }
+
     const total = t_full + t_attn + t_elt;
     // Attention is 4·seq²·hd per head (QK then PV), both at full width — Z-Image
     // has no causal mask, so nothing is skipped.

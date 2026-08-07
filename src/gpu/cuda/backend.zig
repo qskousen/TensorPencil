@@ -474,8 +474,10 @@ pub const Backend = struct {
     hgemm_b_fn: cu.CUfunction = null,
     hgemm_bc16_mod: ?ctxmod.Module = null,
     hgemm_bc16_fn: cu.CUfunction = null,
-    hgemm_ao_mod: ?ctxmod.Module = null, // fused attn-out P@V (P computed from S+MD)
-    hgemm_ao_fn: cu.CUfunction = null,
+    hgemm_ao_mod: ?ctxmod.Module = null,
+    hgemm_ao_fn: cu.CUfunction = null, // fused attn-out P@V (P computed from S+MD)
+    hgemm_ao32_mod: ?ctxmod.Module = null,
+    hgemm_ao32_fn: cu.CUfunction = null, // ... reading f32 scores
 
     // tensor-core attention: batch `G` heads per launch (grid.z), G derived so the
     // scores+probs scratch stays under `attn_scratch_budget`. attn_batched=false
@@ -676,6 +678,7 @@ pub const Backend = struct {
         if (self.hgemm_b_mod) |m| m.unload(self.ctx);
         if (self.hgemm_bc16_mod) |m| m.unload(self.ctx);
         if (self.hgemm_ao_mod) |m| m.unload(self.ctx);
+        if (self.hgemm_ao32_mod) |m| m.unload(self.ctx);
         for (self.elt_mods.items) |m| m.unload(self.ctx);
         self.elt_mods.deinit(self.gpa);
         self.elt_fns.deinit(self.gpa);
@@ -1672,7 +1675,7 @@ pub const Backend = struct {
 
     fn hgemmFn(self: *Backend) Error!cu.CUfunction {
         if (self.hgemm_mod != null) return self.hgemm_fn;
-        const ptx = kernels.buildHgemm(self.gpa, false, false, false, false, true) catch return error.OutOfMemory;
+        const ptx = kernels.buildHgemm(self.gpa, false, false, false, false, true, false) catch return error.OutOfMemory;
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         self.hgemm_fn = mod.getFunction(self.ctx, "hgemm") catch return error.CudaError;
@@ -1685,7 +1688,7 @@ pub const Backend = struct {
     /// Ampere+ (sm_80) only; callers must gate on cc_major >= 8.
     fn hgemmBf16Fn(self: *Backend) Error!cu.CUfunction {
         if (self.hgemm_bf16_mod != null) return self.hgemm_bf16_fn;
-        const ptx = kernels.buildHgemm(self.gpa, false, false, false, true, true) catch return error.OutOfMemory;
+        const ptx = kernels.buildHgemm(self.gpa, false, false, false, true, true, false) catch return error.OutOfMemory;
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         self.hgemm_bf16_fn = mod.getFunction(self.ctx, "hgemm") catch return error.CudaError;
@@ -1695,7 +1698,7 @@ pub const Backend = struct {
 
     fn hgemmBatchedFn(self: *Backend) Error!cu.CUfunction {
         if (self.hgemm_b_mod != null) return self.hgemm_b_fn;
-        const ptx = kernels.buildHgemm(self.gpa, true, false, false, false, true) catch return error.OutOfMemory;
+        const ptx = kernels.buildHgemm(self.gpa, true, false, false, false, true, false) catch return error.OutOfMemory;
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         self.hgemm_b_fn = mod.getFunction(self.ctx, "hgemm_batched") catch return error.CudaError;
@@ -1706,7 +1709,7 @@ pub const Backend = struct {
     /// Batched hgemm with f16 C output (scores → softmax path).
     fn hgemmBatchedC16Fn(self: *Backend) Error!cu.CUfunction {
         if (self.hgemm_bc16_mod != null) return self.hgemm_bc16_fn;
-        const ptx = kernels.buildHgemm(self.gpa, true, true, false, false, true) catch return error.OutOfMemory;
+        const ptx = kernels.buildHgemm(self.gpa, true, true, false, false, true, false) catch return error.OutOfMemory;
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         self.hgemm_bc16_fn = mod.getFunction(self.ctx, "hgemm_batched_c16") catch return error.CudaError;
@@ -1714,11 +1717,22 @@ pub const Backend = struct {
         return self.hgemm_bc16_fn;
     }
 
+    /// `hgemm_attnout` reading **f32** scores. See `buildHgemm`'s `a_f32`.
+    fn hgemmAttnOutA32Fn(self: *Backend) Error!cu.CUfunction {
+        if (self.hgemm_ao32_mod != null) return self.hgemm_ao32_fn;
+        const ptx = kernels.buildHgemm(self.gpa, true, false, true, false, true, true) catch return error.OutOfMemory;
+        defer self.gpa.free(ptx);
+        var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
+        self.hgemm_ao32_fn = mod.getFunction(self.ctx, "hgemm_attnout_a32") catch return error.CudaError;
+        self.hgemm_ao32_mod = mod;
+        return self.hgemm_ao32_fn;
+    }
+
     /// Fused attention-output GEMM: O = P@V where P = exp(S-max)/sum is recomputed
     /// from S (f16) + the per-row MD table during A-staging (no P materialization).
     fn hgemmAttnOutFn(self: *Backend) Error!cu.CUfunction {
         if (self.hgemm_ao_mod != null) return self.hgemm_ao_fn;
-        const ptx = kernels.buildHgemm(self.gpa, true, false, true, false, true) catch return error.OutOfMemory;
+        const ptx = kernels.buildHgemm(self.gpa, true, false, true, false, true, false) catch return error.OutOfMemory;
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         self.hgemm_ao_fn = mod.getFunction(self.ctx, "hgemm_attnout") catch return error.CudaError;
@@ -3800,12 +3814,16 @@ pub const Backend = struct {
             defer self.ptoc(.attn);
             return self.opAttnCudnn(q, k, v, out, seq, n_heads, kv_heads, hd, scale);
         }
-        // A single head whose full scores plane (seq²·2 B) blows the scratch
-        // budget — the VAE mid-block attention over every latent position, tens
-        // of GB at high resolution. Tile the query dimension so the scores plane
-        // never materializes in full (the hand-PTX analogue of flash attention).
-        const mpad_full = std.mem.alignForward(usize, seq, 128);
-        if (n_heads == 1 and kv_heads == 1 and mpad_full * mpad_full * 2 > self.attn_scratch_budget) {
+        // ⚠️ **Single-head goes to the flash path at EVERY size, not just when the
+        // plane is large.** That was the old gate, and it is the wrong axis: the
+        // batched path stores the scores in **f16**, and the one caller with a
+        // single head is the VAE mid-block, whose logits reach 9.95e6 — so a SMALL
+        // latent took the f16 path and produced non-finite output while a large one
+        // was fine. Size was never what decided correctness; the score magnitude
+        // was, and the flash path (f32 scores, query-banded) is safe at both ends.
+        // It also degenerates to a single band when the plane already fits, so
+        // routing everything through it costs nothing.
+        if (n_heads == 1 and kv_heads == 1) {
             self.ptic();
             defer self.ptoc(.attn);
             return self.opAttnTCFlash(q, k, v, out, seq, hd, scale);
@@ -3970,17 +3988,25 @@ pub const Backend = struct {
         try self.ensureDeviceBuffer(&self.attn_vth, hd * mpad * 2);
         try self.ensureDeviceBuffer(&self.attn_oh, mpad * hd * 4);
 
-        // Query block: the largest 128-multiple whose scores plane fits the
-        // budget (both mpad and qb are 128-multiples, so every block is full).
-        var qb: usize = (self.attn_scratch_budget / (mpad * 2)) & ~@as(usize, 127);
+        // ⚠️ **The scores band is f32, not f16, and that is not a precision nicety.**
+        // This path exists for the VAE mid-block, whose attention *logits* reach
+        // **9.95e6** — 152x past f16's 65504 ceiling, and even inside the range f16's
+        // quantum up there is ~8000 against a softmax whose differences are O(1).
+        // Prescaling cannot rescue it either: 11 mantissa bits leave ~4900 of
+        // absolute error on such a logit however it is scaled. In f16 this rendered
+        // solid white, which is why `sd_vae_cuda` used the naive per-query kernel
+        // instead — at **11.4 s** for one decode against this path's 34 ms.
+        // P itself stays f16 (a probability in [0,1]), so only S widens.
+        const sbytes: usize = 4;
+        var qb: usize = (self.attn_scratch_budget / (mpad * sbytes)) & ~@as(usize, 127);
         if (qb < 128) qb = 128;
         if (qb > mpad) qb = mpad;
-        try self.ensureDeviceBuffer(&self.attn_s, qb * mpad * 2);
+        try self.ensureDeviceBuffer(&self.attn_s, qb * mpad * sbytes);
         try self.ensureDeviceBuffer(&self.attn_md, qb * 8);
 
-        const f_scores = try self.hgemmBatchedC16Fn();
-        const f_pv = try self.hgemmAttnOutFn();
-        const f_sm = try self.eltFn(kernels.softmax_md_f16_ptx, "softmax_md_f16");
+        const f_scores = try self.hgemmBatchedFn(); // f32-C scores GEMM
+        const f_pv = try self.hgemmAttnOutA32Fn();
+        const f_sm = try self.eltFn(kernels.softmax_md_f32_ptx, "softmax_md_f32");
         const f_gh = try self.eltFn(elt.gather_head_ptx, "gather_head");
         const f_gvt = try self.eltFn(elt.gather_vt_ptx, "gather_vt");
         const f_sc = try self.eltFn(elt.scatter_head_ptx, "scatter_head");

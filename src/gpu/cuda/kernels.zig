@@ -1346,7 +1346,14 @@ pub const irescale_h16_ptx: [:0]const u8 =
 ///     from the per-row MD={max,1/sum} table (`softmax_md_f16`). This eliminates
 ///     the P materialization entirely (no P write in softmax, no P read here) —
 ///     the Vulkan-parity win. attnout implies batched; C is f32; p_scale is 1.
-pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout: bool, bf16: bool, use_ldmatrix: bool) ![:0]u8 {
+///   a_f32   — (attnout only) the scores S are **f32**, not packed f16. ⚠️ Needed
+///     because the Flux/Z-Image VAE's attention logits reach 9.95e6, 152x past
+///     f16's ceiling, and even in range f16's quantum up there is ~8000 against a
+///     softmax whose differences are O(1). P itself stays f16 — it is a probability
+///     in [0,1] — so only the LOAD and A's pointer arithmetic change, and the MMA is
+///     untouched. B keeps its f16 stride, hence the separate A registers below.
+pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout: bool, bf16: bool, use_ldmatrix: bool, a_f32: bool) ![:0]u8 {
+    std.debug.assert(!a_f32 or attnout);
     const BM = 128;
     const KSTEP = 32;
     const MT = 4;
@@ -1393,7 +1400,7 @@ pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
         try b.linef("mov.u32 {s}, %ctaid.z;", .{r_z});
         try b.linef("ld.param.u32 {s}, [p_sa];", .{r_st});
         try b.linef("mul.wide.u32 {s}, {s}, {s};", .{ rd_off, r_z, r_st });
-        try b.linef("shl.b64 {s}, {s}, 1;", .{ rd_off, rd_off });
+        try b.linef("shl.b64 {s}, {s}, {d};", .{ rd_off, rd_off, @as(usize, if (a_f32) 2 else 1) });
         try b.linef("add.s64 {s}, {s}, {s};", .{ rd_a, rd_a, rd_off });
         try b.linef("ld.param.u32 {s}, [p_sb];", .{r_st});
         try b.linef("mul.wide.u32 {s}, {s}, {s};", .{ rd_off, r_z, r_st });
@@ -1469,14 +1476,18 @@ pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
     const rd_abase = try b.reg(.b64);
     const rd_bbase = try b.reg(.b64);
     const rd_8k = try b.reg(.b64);
+    const rd_8k_a = if (a_f32) try b.reg(.b64) else rd_8k;
     try b.linef("shl.b32 {s}, {s}, 1;", .{ r_kq2, r_kq }); // kq*2 (f16 col)
     try b.linef("mul.wide.u32 {s}, {s}, 16;", .{ rd_8k, r_k }); // 8 rows * k f16 * 2 bytes
+    // ⚠️ A's element size differs from B's under `a_f32`, so it needs its own row
+    // step and k offset — B stays f16 either way.
+    if (a_f32) try b.linef("mul.wide.u32 {s}, {s}, 32;", .{ rd_8k_a, r_k });
     // A
     try b.linef("add.u32 {s}, {s}, {s};", .{ r_arow, r_row0, r_rowq });
     try b.linef("mul.wide.u32 {s}, {s}, {s};", .{ rd_tmp, r_arow, r_k });
     try b.linef("cvt.u64.u32 {s}, {s};", .{ rd_abase, r_kq2 });
-    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_tmp, rd_tmp, rd_abase }); // (row0+rowq)*k + kq2 (f16)
-    try b.linef("shl.b64 {s}, {s}, 1;", .{ rd_tmp, rd_tmp }); // *2 bytes
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_tmp, rd_tmp, rd_abase }); // (row0+rowq)*k + kq2
+    try b.linef("shl.b64 {s}, {s}, {d};", .{ rd_tmp, rd_tmp, @as(usize, if (a_f32) 2 else 1) });
     try b.linef("add.s64 {s}, {s}, {s};", .{ rd_abase, rd_a, rd_tmp });
     // B
     try b.linef("add.u32 {s}, {s}, {s};", .{ r_arow, r_col0, r_rowq });
@@ -1603,6 +1614,8 @@ pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
     try b.label("HLOOP");
     try b.linef("mul.wide.u32 {s}, {s}, 2;", .{ rd_k0, r_k0 }); // k0 f16 -> bytes
     try b.linef("add.s64 {s}, {s}, {s};", .{ rd_ap, rd_abase, rd_k0 });
+    // f32 A: the same element offset is twice the bytes.
+    if (a_f32) try b.linef("add.s64 {s}, {s}, {s};", .{ rd_ap, rd_ap, rd_k0 });
     try b.linef("add.s64 {s}, {s}, {s};", .{ rd_bp, rd_bbase, rd_k0 });
     if (attnout) {
         // key columns of this k-slab's A pair: j0 = k0 + kq*2, j1 = j0+1 (constant
@@ -1614,7 +1627,14 @@ pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
     }
     var i: usize = 0;
     while (i < 16) : (i += 1) {
-        try b.linef("ld.global.u32 {s}, [{s}];", .{ r_tA, rd_ap });
+        // ⚠️ f32 scores arrive as a PAIR of f32 (8 B; the base is 8-aligned because
+        // `k` is a multiple of 128 and `kq2` is even), so the f16 unpack below is
+        // skipped and `f_x0`/`f_x1` are loaded directly.
+        if (a_f32) {
+            try b.linef("ld.global.v2.f32 {{{s}, {s}}}, [{s}];", .{ f_x0, f_x1, rd_ap });
+        } else {
+            try b.linef("ld.global.u32 {s}, [{s}];", .{ r_tA, rd_ap });
+        }
         if (attnout) {
             // this iteration's A row q = qbase + i*8 (clamp to mpad-1 so the MD read
             // for redundant/pad staging rows stays in-bounds); load {max, 1/sum}.
@@ -1625,10 +1645,13 @@ pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
             try b.linef("add.s64 {s}, {s}, {s};", .{ rd_mdp, rd_md, rd_mdp });
             try b.linef("ld.global.f32 {s}, [{s}];", .{ f_m, rd_mdp });
             try b.linef("ld.global.f32 {s}, [{s}+4];", .{ f_inv, rd_mdp });
-            // unpack the 2 packed f16 scores → P = exp2((S-max)*log2e)*inv → repack.
-            try b.linef("mov.b32 {{{s}, {s}}}, {s};", .{ rs_lo, rs_hi, r_tA });
-            try b.linef("cvt.f32.f16 {s}, {s};", .{ f_x0, rs_lo });
-            try b.linef("cvt.f32.f16 {s}, {s};", .{ f_x1, rs_hi });
+            // P = exp2((S-max)*log2e)*inv, then repack to f16 for the MMA — P is a
+            // probability in [0,1], so f16 is exact there whatever S's range was.
+            if (!a_f32) {
+                try b.linef("mov.b32 {{{s}, {s}}}, {s};", .{ rs_lo, rs_hi, r_tA });
+                try b.linef("cvt.f32.f16 {s}, {s};", .{ f_x0, rs_lo });
+                try b.linef("cvt.f32.f16 {s}, {s};", .{ f_x1, rs_hi });
+            }
             try b.linef("sub.f32 {s}, {s}, {s}; mul.f32 {s}, {s}, {s}; ex2.approx.f32 {s}, {s}; mul.f32 {s}, {s}, {s};", .{ f_p0, f_x0, f_m, f_p0, f_p0, r_l2e, f_p0, f_p0, f_p0, f_p0, f_inv });
             try b.linef("sub.f32 {s}, {s}, {s}; mul.f32 {s}, {s}, {s}; ex2.approx.f32 {s}, {s}; mul.f32 {s}, {s}, {s};", .{ f_p1, f_x1, f_m, f_p1, f_p1, r_l2e, f_p1, f_p1, f_p1, f_p1, f_inv });
             try b.linef("selp.f32 {s}, {s}, {s}, {s};", .{ f_p0, f_p0, f_zero, p_j0 });
@@ -1640,7 +1663,7 @@ pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
         try b.linef("st.shared.u32 [{s}+{d}], {s};", .{ r_shA, i * 512, r_tA });
         try b.linef("ld.global.u32 {s}, [{s}];", .{ r_tB, rd_bp });
         try b.linef("st.shared.u32 [{s}+{d}], {s};", .{ r_shB, i * 512, r_tB });
-        try b.linef("add.s64 {s}, {s}, {s};", .{ rd_ap, rd_ap, rd_8k });
+        try b.linef("add.s64 {s}, {s}, {s};", .{ rd_ap, rd_ap, rd_8k_a });
         try b.linef("add.s64 {s}, {s}, {s};", .{ rd_bp, rd_bp, rd_8k });
     }
     try b.line("bar.sync 0;");
@@ -1754,7 +1777,7 @@ pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
 
     const shared_decl = try std.fmt.allocPrint(alloc, ".shared .align 16 .b8 smem[{d}];", .{SH_BYTES});
     defer alloc.free(shared_decl);
-    const name = if (attnout) "hgemm_attnout" else if (batched and c_f16) "hgemm_batched_c16" else if (batched) "hgemm_batched" else "hgemm";
+    const name = if (attnout and a_f32) "hgemm_attnout_a32" else if (attnout) "hgemm_attnout" else if (batched and c_f16) "hgemm_batched_c16" else if (batched) "hgemm_batched" else "hgemm";
     const batched_params = "    .param .u64 p_a,\n    .param .u64 p_b,\n    .param .u64 p_c,\n    .param .u32 p_n,\n    .param .u32 p_k,\n    .param .u32 p_sa,\n    .param .u32 p_sb,\n    .param .u32 p_sc,\n    .param .f32 p_scale";
     return b.build(
         name,
@@ -2161,6 +2184,37 @@ pub const softmax_md_f16_ptx: [:0]const u8 =
     \\    ret;
     \\}
 ;
+
+/// Replace `from` with `to` exactly once, at comptime. ⚠️ Errors if the pattern is
+/// absent OR appears twice, so a kernel derived this way cannot silently drift from
+/// its source when the source is edited.
+fn replaceOnce(comptime src: []const u8, comptime from: []const u8, comptime to: []const u8) []const u8 {
+    const i = std.mem.indexOf(u8, src, from) orelse @compileError("replaceOnce: pattern absent: " ++ from);
+    if (std.mem.indexOf(u8, src[i + from.len ..], from) != null) @compileError("replaceOnce: pattern not unique: " ++ from);
+    return src[0..i] ++ to ++ src[i + from.len ..];
+}
+
+/// `softmax_md_f16` over **f32** scores. Entry `softmax_md_f32`.
+///
+/// ⚠️ Exists because the flash attention path's f16 scores band is unusable for the
+/// Flux/Z-Image VAE, whose attention *logits* reach **9.95e6** — 152x past f16's
+/// ceiling, and even in range f16's quantum up there is ~8000 against a softmax whose
+/// differences are O(1). Scaling cannot rescue it: 11 mantissa bits leave ~4900 of
+/// absolute error on such a logit however it is prescaled. f32 scores are the only
+/// option, and the cost is one byte per score, not an algorithm.
+///
+/// Derived from the f16 source by three asserted substitutions rather than copied —
+/// the only differences are the element size and the load.
+pub const softmax_md_f32_ptx: [:0]const u8 = blk: {
+    @setEvalBranchQuota(100000);
+    const a = replaceOnce(softmax_md_f16_ptx, ".visible .entry softmax_md_f16(", ".visible .entry softmax_md_f32(");
+    const b2 = replaceOnce(a, "shl.b64 %rd3, %rd3, 1;                // *2 (f16) S row byte offset", "shl.b64 %rd3, %rd3, 2;                // *4 (f32) S row byte offset");
+    const c = replaceOnce(b2, "mul.wide.u32 %rd5, %r5, 2;", "mul.wide.u32 %rd5, %r5, 4;");
+    const d = replaceOnce(c, "ld.global.b16 %h0, [%rd6];\n    cvt.f32.f16 %f3, %h0;                 // x", "ld.global.f32 %f3, [%rd6];\n    // (f32 scores: loaded directly, no unpack)");
+    // Concatenation of comptime slices drops the sentinel; re-attach one for the
+    // PTX loader, which needs a NUL-terminated string.
+    break :blk (d ++ "\x00")[0..d.len :0];
+};
 
 
 const gpa = std.heap.page_allocator;
@@ -2814,7 +2868,7 @@ fn f16val(u: u16) f32 {
 /// CPU references. Attention primitives on the hand-PTX backend.
 pub fn attnTest(ctx: *Context, io: anytype, stdout: anytype) !void {
     _ = io;
-    const hg_ptx = try buildHgemm(gpa, false, false, false, false, true);
+    const hg_ptx = try buildHgemm(gpa, false, false, false, false, true, false);
     defer gpa.free(hg_ptx);
     var hmod = try ctx.loadModule(hg_ptx);
     defer hmod.unload(ctx);
@@ -2825,7 +2879,7 @@ pub fn attnTest(ctx: *Context, io: anytype, stdout: anytype) !void {
     const f_sm = try smod.getFunction(ctx, "softmax_row");
 
     // f16-C batched hgemm (used for scores in the DiT attention path).
-    const hgc16_ptx = try buildHgemm(gpa, true, true, false, false, true);
+    const hgc16_ptx = try buildHgemm(gpa, true, true, false, false, true, false);
     defer gpa.free(hgc16_ptx);
     var hc16mod = try ctx.loadModule(hgc16_ptx);
     defer hc16mod.unload(ctx);

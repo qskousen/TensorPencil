@@ -45,6 +45,9 @@ const Bufs = struct {
     /// Running activation, plus two scratches (`u` carries both of a resnet's
     /// convolution outputs — conv1's is dead once norm2 has read it).
     x: DeviceBuffer = none,
+    /// f32 on both ends of the decode: the incoming latent and the outgoing RGB.
+    /// Separate from `x`/`t` because those are f16 under `Config.act_f16`.
+    stage: DeviceBuffer = none,
     t: DeviceBuffer = none,
     u: DeviceBuffer = none,
     patch: DeviceBuffer = none,
@@ -132,15 +135,21 @@ pub fn decode(
         @as(usize, @intCast(widths.wide)),
     );
 
-    try ctx.ensureDeviceBuffer(&bufs.x, @max(z.len, max_elems) * 4);
-    try ctx.ensureDeviceBuffer(&bufs.t, max_elems * 4);
+    // ⚠️ `act_f16` halves the two widest buffers — at 1056x1584 each holds 256
+    // channels at FULL image resolution (428M elements), which is where a
+    // whole-image decode's gigabytes are. The latent coming IN and the RGB going
+    // OUT stay f32, in their own small staging buffer.
+    const asz: usize = if (cfg.act_f16) 2 else 4;
+    try ctx.ensureDeviceBuffer(&bufs.x, max_elems * asz);
+    try ctx.ensureDeviceBuffer(&bufs.t, max_elems * asz);
+    try ctx.ensureDeviceBuffer(&bufs.stage, @max(z.len, lat_h * lat_w * 64 * 3) * 4);
     // ⚠️ The upload target depends on whether the checkpoint HAS a
     // `post_quant_conv`: the Flux-lineage 16-channel VAE does not, so the latent is
     // staged straight into `t` — which is where `conv_in` reads from — instead of
     // going through a convolution that does not exist. Allocated before the upload
     // so `ensureDeviceBuffer` cannot move the buffer out from under it.
-    try ctx.tensorUpload(if (dec.post_quant != null) bufs.x else bufs.t, std.mem.sliceAsBytes(z));
-    try ctx.ensureDeviceBuffer(&bufs.u, @as(usize, @intCast(widths.out)) * 4);
+    try ctx.tensorUpload(bufs.stage, std.mem.sliceAsBytes(z));
+    try ctx.ensureDeviceBuffer(&bufs.u, @as(usize, @intCast(widths.out)) * asz);
     try ctx.ensureDeviceBuffer(&bufs.gstat, cfg.norm_groups * sd_unet_gpu.gn_chunks * 3 * 4);
     try ctx.ensureDeviceBuffer(&bufs.gmi, cfg.norm_groups * 2 * 4);
 
@@ -158,7 +167,7 @@ pub fn decode(
         // past f16 — see `attn`) but only ONE QUERY BAND of it is ever resident:
         // `seq²` at a 1056x1584 render is 2.73 GB, more than the activations it
         // serves. `scoresBand` rows x `nseq` keys instead.
-        try ctx.ensureDeviceBuffer(&bufs.s, scoresBand(nseq) * nseq * 4);
+        try ctx.ensureDeviceBuffer(&bufs.s, sd_vae.scoresBand(nseq) * nseq * 4);
         // The im2col band for the widest 3x3 convolution, so `convInto` never has
         // to grow it either. The widest patch row is 9 x the innermost width.
         const patch_len = 9 * cfg.innermost();
@@ -169,8 +178,13 @@ pub fn decode(
     var batched = true;
     errdefer if (batched) ctx.endBatch() catch {};
 
-    if (dec.post_quant) |pq| try conv(ctx, &bufs, &bufs.t, &bufs.x, h, w, pq, .stride1);
-    try conv(ctx, &bufs, &bufs.x, &bufs.t, h, w, dec.conv_in, .stride1);
+    const a16 = cfg.act_f16;
+    if (dec.post_quant) |pq| {
+        try conv(ctx, &bufs, &bufs.t, &bufs.stage, h, w, pq, .stride1, false, a16);
+        try conv(ctx, &bufs, &bufs.x, &bufs.t, h, w, dec.conv_in, .stride1, a16, a16);
+    } else {
+        try conv(ctx, &bufs, &bufs.x, &bufs.stage, h, w, dec.conv_in, .stride1, false, a16);
+    }
 
     try resnet(ctx, &bufs, &cats, h, w, dec.mid1, cfg);
     try attn(ctx, &bufs, &cats, h, w, dec.mid_attn, cfg);
@@ -200,7 +214,7 @@ pub fn decode(
         if (level.upsample) |up| {
             // Nearest 2x then a 3x3 convolution, with the resample fused into the
             // patch gather so the doubled tensor never exists.
-            try convResidual(ctx, &bufs, &bufs.t, &bufs.x, h, w, up, .upsample2x);
+            try convResidual(ctx, &bufs, &bufs.t, &bufs.x, h, w, up, .upsample2x, a16);
             std.mem.swap(DeviceBuffer, &bufs.x, &bufs.t);
             h *= 2;
             w *= 2;
@@ -208,14 +222,15 @@ pub fn decode(
     }
 
     try groupNorm(ctx, &bufs, &bufs.t, &bufs.x, h * w, ch, try cats.get(dec.norm_out), cfg, true);
-    try conv(ctx, &bufs, &bufs.u, &bufs.t, h, w, dec.conv_out, .stride1);
+    // The head writes RGB back into the f32 staging buffer — the host wants f32.
+    try conv(ctx, &bufs, &bufs.stage, &bufs.t, h, w, dec.conv_out, .stride1, a16, false);
 
     batched = false;
     try ctx.endBatch();
 
     const rgb = try gpa.alloc(f32, h * w * 3);
     errdefer gpa.free(rgb);
-    try ctx.tensorDownload(bufs.u, std.mem.sliceAsBytes(rgb));
+    try ctx.tensorDownload(bufs.stage, std.mem.sliceAsBytes(rgb));
 
     // ⚠️ **A non-finite result is REPORTED, never returned.** `planarF32ToRgb8`
     // clamps NaN to white, so without this check an overflow anywhere above becomes a
@@ -242,18 +257,25 @@ pub fn decode(
 }
 
 /// A resnet over `bufs.x` in place (result swapped back into `x`).
+/// `a += b` over two activation buffers in whichever format they are stored.
+fn addAct(ctx: *Context, a: DeviceBuffer, b: DeviceBuffer, total: usize, act16: bool) !void {
+    const n = if (act16) (total + 1) / 2 else total;
+    try ctx.opElt(if (act16) .add_h16 else .add, a, b, null, null, .{ .u0 = @intCast(total) }, n, 1, 1);
+}
+
 fn resnet(ctx: *Context, bufs: *Bufs, cats: *NormCats, h: usize, w: usize, r: sd_vae.Resnet, cfg: Config) !void {
     const n = h * w;
     const out_n = n * r.out_ch;
     try groupNorm(ctx, bufs, &bufs.t, &bufs.x, n, r.in_ch, try cats.get(r.norm1), cfg, true);
-    try conv(ctx, bufs, &bufs.u, &bufs.t, h, w, r.conv1, .stride1);
+    const a16 = cfg.act_f16;
+    try conv(ctx, bufs, &bufs.u, &bufs.t, h, w, r.conv1, .stride1, a16, a16);
     try groupNorm(ctx, bufs, &bufs.t, &bufs.u, n, r.out_ch, try cats.get(r.norm2), cfg, true); // consumes u
-    try conv(ctx, bufs, &bufs.u, &bufs.t, h, w, r.conv2, .stride1); // reuses u
+    try conv(ctx, bufs, &bufs.u, &bufs.t, h, w, r.conv2, .stride1, a16, a16); // reuses u
     if (r.nin) |nin| {
-        try convResidual(ctx, bufs, &bufs.t, &bufs.x, h, w, nin, .stride1);
-        try ctx.opElt(.add, bufs.u, bufs.t, null, null, .{ .u0 = @intCast(out_n) }, out_n, 1, 1);
+        try convResidual(ctx, bufs, &bufs.t, &bufs.x, h, w, nin, .stride1, a16);
+        try addAct(ctx, bufs.u, bufs.t, out_n, a16);
     } else {
-        try ctx.opElt(.add, bufs.u, bufs.x, null, null, .{ .u0 = @intCast(out_n) }, out_n, 1, 1);
+        try addAct(ctx, bufs.u, bufs.x, out_n, a16);
     }
     std.mem.swap(DeviceBuffer, &bufs.x, &bufs.u);
 }
@@ -275,17 +297,6 @@ fn resnet(ctx: *Context, bufs: *Bufs, cats: *NormCats, h: usize, w: usize, r: sd
 /// ⚠️ **`attn_out` runs its OWN online softmax** over the raw scores, so there is no
 /// softmax pass between it and `attn_scores`. Adding one exponentiates twice — finite,
 /// plausible, and wrong by rel L2 0.26.
-/// Query rows per scores band. A whole multiple of the 8-wide kernel tile (so a
-/// band's last tile is never partial, which is what lets `attn_out` skip its row
-/// clamp), and chosen so the band plane stays ~256 MB: at seq 26,136 that is
-/// 2048 rows and 214 MB, against 2.73 GB for the whole plane.
-fn scoresBand(n: usize) usize {
-    const cap: usize = (256 << 20) / 4; // f32 entries we are willing to hold
-    var qb = @max(@as(usize, 8), (cap / @max(n, 1)) & ~@as(usize, 7));
-    if (qb > n) qb = std.mem.alignForward(usize, n, 8);
-    return qb;
-}
-
 fn attn(ctx: *Context, bufs: *Bufs, cats: *NormCats, h: usize, w: usize, ab: sd_vae.AttnBlock, cfg: Config) !void {
     const n = h * w;
     const ch = ab.channels;
@@ -294,9 +305,12 @@ fn attn(ctx: *Context, bufs: *Bufs, cats: *NormCats, h: usize, w: usize, ab: sd_
 
     // q/k/v are 1x1 convolutions in LDM's AttnBlock, so no patch gather is involved
     // and these three can safely be distinct dedicated buffers.
-    try conv(ctx, bufs, &bufs.aq, &bufs.t, h, w, ab.q, .stride1);
-    try conv(ctx, bufs, &bufs.ak, &bufs.t, h, w, ab.k, .stride1);
-    try conv(ctx, bufs, &bufs.av, &bufs.t, h, w, ab.v, .stride1);
+    // ⚠️ q/k/v/out stay **f32**: at latent resolution they are tens of MB, not where
+    // the memory goes, and the scores/PV kernels take f32 buffers.
+    const a16 = cfg.act_f16;
+    try conv(ctx, bufs, &bufs.aq, &bufs.t, h, w, ab.q, .stride1, a16, false);
+    try conv(ctx, bufs, &bufs.ak, &bufs.t, h, w, ab.k, .stride1, a16, false);
+    try conv(ctx, bufs, &bufs.av, &bufs.t, h, w, ab.v, .stride1, a16, false);
 
     // Per-head k-major (one head here), so the scores kernel loads contiguously.
     ctx.independent(2);
@@ -320,7 +334,7 @@ fn attn(ctx: *Context, bufs: *Bufs, cats: *NormCats, h: usize, w: usize, ab: sd_
     // more than the activations it exists to serve. `scoresBand` caps it; the
     // arithmetic is unchanged because `attn_out` already runs an ONLINE softmax over
     // whole key rows, so a band of queries is exactly independent work.
-    const qb = scoresBand(n);
+    const qb = sd_vae.scoresBand(n);
     const jblk = std.math.divCeil(usize, n, 8) catch unreachable;
     var q0: usize = 0;
     while (q0 < n) : (q0 += qb) {
@@ -354,8 +368,10 @@ fn attn(ctx: *Context, bufs: *Bufs, cats: *NormCats, h: usize, w: usize, ab: sd_
     }
 
     // Reuse aq for the projection: its query content was consumed by the gather.
-    try conv(ctx, bufs, &bufs.aq, &bufs.ao, h, w, ab.proj, .stride1);
-    try ctx.opElt(.add, bufs.x, bufs.aq, null, null, .{ .u0 = @intCast(n * ch) }, n * ch, 1, 1);
+    // ⚠️ The projection lands in `t`, not back in `aq`: the residual add is against
+    // `x`, which is f16 under `act_f16`. (`t` is free — the three projections read it.)
+    try conv(ctx, bufs, &bufs.t, &bufs.ao, h, w, ab.proj, .stride1, false, a16);
+    try addAct(ctx, bufs.x, bufs.t, n * ch, a16);
 }
 
 fn groupNorm(
@@ -369,7 +385,7 @@ fn groupNorm(
     cfg: Config,
     silu: bool,
 ) !void {
-    try sd_unet_gpu.groupNormInto(ctx, bufs.gstat, bufs.gmi, dst, src, n, ch, cat, cfg.norm_groups, cfg.norm_eps, silu);
+    try sd_unet_gpu.groupNormInto(ctx, bufs.gstat, bufs.gmi, dst, src, n, ch, cat, cfg.norm_groups, cfg.norm_eps, silu, cfg.act_f16);
 }
 
 fn conv(
@@ -381,13 +397,17 @@ fn conv(
     w: usize,
     cv: Conv2d,
     mode: sd_unet_gpu.SampleMode,
+    /// Storage format of `src` / `dst`. `x`/`t`/`u` are f16 under `cfg.act_f16`;
+    /// the attention projections and the host-facing staging buffer stay f32.
+    src16: bool,
+    dst16: bool,
 ) !void {
     const oh = if (mode == .upsample2x) 2 * h else h;
     const ow = if (mode == .upsample2x) 2 * w else w;
     // Pre-sized in `decode`, deliberately: growing it here would be inside the
     // recording batch. Assert rather than silently reallocate.
-    std.debug.assert(dst.size >= oh * ow * cv.co * 4);
-    try sd_unet_gpu.convInto(ctx, &bufs.patch, dst, src, h, w, cv, mode, null);
+    std.debug.assert(dst.size >= oh * ow * cv.co * @as(usize, if (dst16) 2 else 4));
+    try sd_unet_gpu.convIntoPrec(ctx, &bufs.patch, dst, src, h, w, cv, mode, null, 1.0, src16, dst16);
 }
 
 /// Divisor applied to the activation of a convolution that reads the RESIDUAL
@@ -419,11 +439,16 @@ fn convResidual(
     w: usize,
     cv: Conv2d,
     mode: sd_unet_gpu.SampleMode,
+    act16: bool,
 ) !void {
     const oh = if (mode == .upsample2x) 2 * h else h;
     const ow = if (mode == .upsample2x) 2 * w else w;
-    std.debug.assert(dst.size >= oh * ow * cv.co * 4);
-    try sd_unet_gpu.convIntoScaled(ctx, &bufs.patch, dst, src, h, w, cv, mode, null, residual_act_div);
+    std.debug.assert(dst.size >= oh * ow * cv.co * @as(usize, if (act16) 2 else 4));
+    // ⚠️ Under f16 storage the divisor is 1.0: `act_div` exists to bring a value too
+    // big for f16 THROUGH a cast, and an f16 buffer could never have held it. The two
+    // are alternatives, and `Config.act_f16` is off exactly where the divisor matters.
+    const div: f32 = if (act16) 1.0 else residual_act_div;
+    try sd_unet_gpu.convIntoPrec(ctx, &bufs.patch, dst, src, h, w, cv, mode, null, div, act16, act16);
 }
 
 
