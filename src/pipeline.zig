@@ -852,6 +852,8 @@ pub const Denoiser = struct {
     an_cu: ?anima_cuda.Session = null,
     an_cu_neg: ?anima_cuda.Session = null,
     an_cu_ws: ?anima_cuda.Workspace = null,
+    /// The folded modulation schedule both Anima device sessions borrow.
+    an_mods: ?[]f32 = null,
 
     pub fn deinit(self: *Denoiser, gpa: std.mem.Allocator) void {
         if (self.v_neg) |b| gpa.free(b);
@@ -882,6 +884,7 @@ pub const Denoiser = struct {
         if (self.an_cu) |*x| x.deinit(gpa, self.sess.cu_be.?);
         if (self.an_cu_neg) |*x| x.deinit(gpa, self.sess.cu_be.?);
         if (self.an_cu_ws) |*w| w.deinit(self.sess.cu_be.?);
+        if (self.an_mods) |m| gpa.free(m);
         if (self.vk_pos) |*s| s.deinit(gpa, self.sess.gpu_ctx.?);
         if (self.vk_neg) |*s| s.deinit(gpa, self.sess.gpu_ctx.?);
         if (self.vk_ws) |*w| w.deinit(self.sess.gpu_ctx.?);
@@ -1438,7 +1441,14 @@ pub fn componentSpec(fam: Family, comp: Component) error{NoSuchComponent}!Compon
         // Those two probes are what stop a wrong side file from being loaded as if
         // it belonged here.
         .anima => switch (comp) {
-            .denoiser => .{ .prefixes = &.{ "model.diffusion_model.", "" }, .probes = &.{anima_probe} },
+            // ⚠️ **`net.` is a real Anima spelling and its omission made the BASE
+            // checkpoint unloadable.** `anima_baseV10.safetensors` stores all 685
+            // tensors under `net.`, so `detectFamily` found no adapter and reported
+            // `error.UnknownArchitecture` — a checkpoint ComfyUI opens fine, refused
+            // with an error that names the architecture rather than the prefix. It is
+            // ComfyUI's own third candidate in `unet_prefix_from_state_dict`, where the
+            // comment against it reads `# cosmos` — and Anima IS Cosmos-Predict2's DiT.
+            .denoiser => .{ .prefixes = &.{ "model.diffusion_model.", "net.", "" }, .probes = &.{anima_probe} },
             .conditioner => .{ .prefixes = &.{ "text_encoders.", "" }, .probes = &.{ "model.embed_tokens.weight", "embed_tokens.weight" } },
             .decoder => .{ .prefixes = &.{ "first_stage_model.", "vae.", "" }, .probes = &.{"decoder.conv1.weight"} },
             .conditioner2 => error.NoSuchComponent,
@@ -1720,7 +1730,7 @@ pub fn detectFamily(store: weights_mod.WeightStore) !Family {
     // Lumina 2 and with OmniGen2, and the `noise_refiner` qk-norm is what says this
     // is the NextDiT shape rather than one of those. The width (3840) is then what
     // distinguishes Z-Image from Lumina 2, and `zimage.DiT.load` checks it.
-    for ([_][]const u8{ "model.diffusion_model.", "" }) |pfx| {
+    for ((componentSpec(.zimage, .denoiser) catch unreachable).prefixes) |pfx| {
         var b1: [96]u8 = undefined;
         var b2: [96]u8 = undefined;
         const cap = std.fmt.bufPrint(&b1, "{s}cap_embedder.1.weight", .{pfx}) catch continue;
@@ -1736,7 +1746,12 @@ pub fn detectFamily(store: weights_mod.WeightStore) !Family {
     // weights — so the adapter is the only sound probe. (Cosmos itself is not
     // supported; `blocks.0.mlp.layer1.weight` without an adapter falls through to
     // `UnknownArchitecture`, which says so.)
-    for ([_][]const u8{ "model.diffusion_model.", "" }) |pfx| {
+    //
+    // ⚠️ The prefix list comes from `componentSpec`, NOT a second literal here. Two
+    // copies is exactly the drift that made `net.`-prefixed Anima report
+    // `UnknownArchitecture` while the resolver would have opened it — a load gap in
+    // the shape of a "this is not an Anima model" error.
+    for ((componentSpec(.anima, .denoiser) catch unreachable).prefixes) |pfx| {
         var b1: [96]u8 = undefined;
         const ad = std.fmt.bufPrint(&b1, "{s}" ++ anima_probe, .{pfx}) catch continue;
         if (store.get(ad) != null) return .anima;
@@ -1838,6 +1853,12 @@ pub const Session = struct {
     /// image and both CFG branches. Null until a Vulkan Anima denoiser needs it.
     /// ⚠️ Per-model on purpose: one copy per session would upload a second full set of
     /// quantized weights for the negative branch (measured 3291 MB against 1779 MB).
+    ///
+    /// ⚠️ **The `= null` here is documentation, NOT initialization.** `Session.init`
+    /// `gpa.create`s uninitialized memory and assigns every field by hand, so a default
+    /// initializer never runs — this field held garbage, its optional tag read non-null,
+    /// and `deinit` walked a garbage `ArenaAllocator` into a general protection fault on
+    /// GUI close. **Any new field here must be assigned explicitly in `init`.**
     an_vk_lins: ?anima_gpu.Lins = null,
     models: Models,
     /// Which ecosystem's sampling conventions this session's forwards follow. Set from
@@ -1926,6 +1947,9 @@ pub const Session = struct {
         self.backend = opts.backend;
         self.gpu_ctx = null;
         self.cu_be = null;
+        // ⚠️ Explicit, because `gpa.create` above does not run field defaults — see the
+        // note on the field.
+        self.an_vk_lins = null;
 
         // Vulkan context (--backend vulkan): encoder / DiT / VAE GEMMs on Vulkan.
         if (opts.backend == .vulkan) {
@@ -2413,7 +2437,10 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session) void {
-        if (self.an_vk_lins) |*l| l.deinit();
+        if (self.an_vk_lins) |*l| {
+            l.deinit();
+            self.an_vk_lins = null; // `Lins.deinit` undefines its payload; do not revisit it
+        }
         const gpa = self.gpa;
         // The session may be torn down from a different thread than it was used
         // on (the GUI frees it on the UI thread when the image queue drains);
@@ -2700,7 +2727,25 @@ pub const Session = struct {
         }
         switch (self.models) {
             .krea2 => |*m| {
-                return encodePrompt(self.io, gpa, self.gpu_ctx, self.cu_be, o.encoder_f16, &m.tok, &m.enc, text, o.cancel);
+                var ids: std.ArrayList(u32) = .empty;
+                defer ids.deinit(gpa);
+                try krea2_text.buildIds(&m.tok, gpa, text, &ids);
+                // ⚠️ **Through `runQwen3`, not a private copy of the dispatch.** The
+                // free `encodePrompt` this replaced called `qwen3_cuda.encode`
+                // *unguarded* — and that arm's GEMM reads its weights as fp8, so a bf16
+                // krea2 encoder would have been turned into noise rather than refused.
+                // `runQwen3` asks `supportsWeights` first, which is the whole reason it
+                // exists. It also hardcoded `qwen3.tap_count * qwen3.hidden`, the 4B
+                // module constants, which the width generalization made wrong for any
+                // other body.
+                const full = try self.runQwen3(gpa, &m.enc, ids.items, o);
+                defer gpa.free(full);
+                const offset = krea2_text.stripOffset(ids.items);
+                const seq = ids.items.len - offset;
+                const row = m.enc.taps.len * m.enc.cfg.hidden;
+                const data = try gpa.alloc(f32, seq * row);
+                @memcpy(data, full[offset * row ..][0 .. seq * row]);
+                return .{ .data = data, .seq = seq };
             },
             .sd15 => |*m| {
                 var p = try self.tokenizePrompt(gpa, &m.tok, text, clip_tok.eos_id, o);
@@ -2734,8 +2779,10 @@ pub const Session = struct {
                 // forced to 1.0, `min_length = 1` so an empty prompt is one token.
                 const q_ids = try m.tok.encodeSegmented(gpa, text, 1, tokenizer_mod.pad_token);
                 defer gpa.free(q_ids);
+                const t_enc0 = std.Io.Clock.real.now(self.io);
                 const src = try self.runQwen3(gpa, &m.enc, q_ids, o);
                 defer gpa.free(src);
+                const t_enc = std.Io.Clock.real.now(self.io);
                 const n_src = q_ids.len;
 
                 // The T5 branch, which is where the emphasis weights live.
@@ -2750,7 +2797,21 @@ pub const Session = struct {
                     wt.* = w.weight;
                 }
 
+                const t_ad0 = std.Io.Clock.real.now(self.io);
                 const data = try m.dit.adapter.forward(self.io, gpa, src, n_src, t5_ids, weights, o.cancel);
+                const t_ad = std.Io.Clock.real.now(self.io);
+                // ⚠️ **Where each half of "the encode" actually ran.** Anima's conditioning is
+                // TWO models: the Qwen3 encoder (device, when the backend supports its
+                // weights) and the `llm_adapter` (host, always). Without this split the log
+                // says "encoded prompt in 1.6s" and a device-resident encoder looks like it
+                // is being ignored — which is exactly how it was reported.
+                std.log.info("[encode] qwen3 {d} tok on {s} {d:.2}s · llm_adapter {d} rows on cpu {d:.2}s", .{
+                    q_ids.len,
+                    if (self.cu_be != null) "cuda" else if (self.gpu_ctx != null) "vulkan" else "cpu",
+                    @as(f64, @floatFromInt(t_enc.nanoseconds - t_enc0.nanoseconds)) / 1e9,
+                    @max(t5_ids.len, anima.anima_2b.adapter.min_rows),
+                    @as(f64, @floatFromInt(t_ad.nanoseconds - t_ad0.nanoseconds)) / 1e9,
+                });
                 // ⚠️ `seq` is the ADAPTER's row count, which is `max(512, n_t)` — not
                 // either token count. The pad rows are attended to (see
                 // `Adapter.forward`), so trimming `seq` here would be a different
@@ -3178,12 +3239,29 @@ pub const Session = struct {
             // ⚠️ Both device arms precompute cross-attention's K and V for every block
             // here, from `cond` — they are per-IMAGE constants, so a session is bound to
             // one conditioning and CFG needs two of them, exactly as Z-Image's is.
+            const t_sess0 = std.Io.Clock.real.now(self.io);
+            defer {
+                const dt = @as(f64, @floatFromInt(std.Io.Clock.real.now(self.io).nanoseconds - t_sess0.nanoseconds)) / 1e9;
+                // ⚠️ **This is the "slow to start" cost.** Both device arms precompute
+                // cross-attention's K/V for all 28 blocks on the HOST, per conditioning —
+                // 28 x 2 GEMMs of [512, 2048] x [2048, 1024] = ~120 GFLOP each, doubled
+                // under CFG. Cheap as a share of a STEP (0.56%) and expensive as a
+                // one-off before the first step, which is a distinction the earlier
+                // per-step framing hid.
+                if (dt > 0.05) std.log.info("[anima] per-image device session built in {d:.2}s", .{dt});
+            }
+            // ⚠️ ONE folded modulation schedule, shared by both branches: it depends on the
+            // sigma alone, so building it per session did the whole thing twice per image
+            // (measured 0.51 s + 0.29 s of a 1.11 s setup).
+            if (self.cu_be != null or self.gpu_ctx != null) {
+                d.an_mods = try dit.modulationSchedule(self.io, gpa, sigmas);
+            }
             if (self.cu_be) |b| {
                 if (anima_cuda.supported(dit)) {
-                    d.an_cu = try anima_cuda.Session.init(gpa, self.io, b, dit, lat_h, lat_w, cond_pos.data, cond_pos.seq, sigmas);
+                    d.an_cu = try anima_cuda.Session.init(gpa, b, dit, lat_h, lat_w, cond_pos.data, cond_pos.seq, sigmas, d.an_mods.?);
                     if (use_cfg) {
                         const cn = cond_neg.?;
-                        d.an_cu_neg = try anima_cuda.Session.init(gpa, self.io, b, dit, lat_h, lat_w, cn.data, cn.seq, sigmas);
+                        d.an_cu_neg = try anima_cuda.Session.init(gpa, b, dit, lat_h, lat_w, cn.data, cn.seq, sigmas, d.an_mods.?);
                     }
                     d.an_cu_ws = try anima_cuda.Workspace.init(b, dit, lat_h, lat_w);
                 } else {
@@ -3194,10 +3272,10 @@ pub const Session = struct {
                     // Built once per model; both branches and every later image share it.
                     if (self.an_vk_lins == null) self.an_vk_lins = try anima_gpu.Lins.init(gpa, dit);
                     const lins = &self.an_vk_lins.?;
-                    d.an_vk = try anima_gpu.Session.init(gpa, self.io, gc, dit, lat_h, lat_w, cond_pos.data, cond_pos.seq, sigmas, lins);
+                    d.an_vk = try anima_gpu.Session.init(gpa, self.io, gc, dit, lat_h, lat_w, cond_pos.data, cond_pos.seq, sigmas, d.an_mods.?, lins);
                     if (use_cfg) {
                         const cn = cond_neg.?;
-                        d.an_vk_neg = try anima_gpu.Session.init(gpa, self.io, gc, dit, lat_h, lat_w, cn.data, cn.seq, sigmas, lins);
+                        d.an_vk_neg = try anima_gpu.Session.init(gpa, self.io, gc, dit, lat_h, lat_w, cn.data, cn.seq, sigmas, d.an_mods.?, lins);
                     }
                     d.an_vk_ws = try anima_gpu.Workspace.init(gc, dit, lat_h, lat_w, d.an_vk.?.tc);
                 } else {
@@ -4034,39 +4112,6 @@ pub fn generate(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*s
     var s = try Session.init(io, gpa, opts, progress);
     defer s.deinit();
     return s.generate(opts, progress);
-}
-
-fn encodePrompt(io: std.Io, gpa: std.mem.Allocator, gpu_ctx: ?*gpu_mod.Context, cu_be: ?*cuda.Backend, encoder_f16: bool, tok: *const tokenizer_mod.Tokenizer, enc: *const qwen3.TextEncoder, text: []const u8, cancel: ?*std.atomic.Value(bool)) !Cond {
-    var ids: std.ArrayList(u32) = .empty;
-    defer ids.deinit(gpa);
-    try krea2_text.buildIds(tok, gpa, text, &ids);
-
-    // GPU-resident encode (batched, keeps the device saturated): the CUDA
-    // backend when active, else Vulkan; the CPU forward is the fallback (and
-    // used on any GPU error — except a cancel, which must propagate, not
-    // silently restart the encode on the CPU).
-    const full = if (cu_be) |b|
-        qwen3_cuda.encode(enc, b, io, gpa, ids.items, cancel) catch |err| blk: {
-            if (err == error.Canceled) return err;
-            std.log.warn("cuda text encode failed ({t}); falling back to CPU (slow)", .{err});
-            break :blk try enc.encode(io, gpa, ids.items, cancel);
-        }
-    else if (gpu_ctx) |gc|
-        qwen3_gpu.encode(enc, gc, io, gpa, ids.items, encoder_f16, cancel) catch |err| blk: {
-            if (err == error.Canceled) return err;
-            std.log.warn("vulkan text encode failed ({t}); falling back to CPU (slow)", .{err});
-            break :blk try enc.encode(io, gpa, ids.items, cancel);
-        }
-    else
-        try enc.encode(io, gpa, ids.items, cancel);
-    defer gpa.free(full);
-
-    const offset = krea2_text.stripOffset(ids.items);
-    const seq = ids.items.len - offset;
-    const row = qwen3.tap_count * qwen3.hidden;
-    const data = try gpa.alloc(f32, seq * row);
-    @memcpy(data, full[offset * row ..][0 .. seq * row]);
-    return .{ .data = data, .seq = seq };
 }
 
 /// Box-average a planar [c][h][w] latent down by integer factor `f`

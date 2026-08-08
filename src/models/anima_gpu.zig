@@ -129,7 +129,10 @@ pub const Session = struct {
     /// The schedule this session precomputed for, and the FOLDED per-sigma
     /// modulation tables (see `anima.DiT.foldModulationTable`).
     sigmas: []f32,
-    mods: []f32,
+    /// Borrowed, model-owned: the FOLDED table for every scheduled sigma, stride
+    /// `mod_stride`. ⚠️ Per SIGMA, not per conditioning — see
+    /// `anima.DiT.modulationSchedule` for why building it per session cost 0.8 s an image.
+    mods: []const f32,
     mod_stride: usize,
 
     pub fn init(
@@ -142,6 +145,8 @@ pub const Session = struct {
         cond: []const f32,
         ctx_seq: usize,
         sigmas: []const f32,
+        /// Model-owned, shared by both conditioning branches (`modulationSchedule`).
+        mods: []const f32,
         /// Model-owned, shared by both conditioning branches.
         lins: *const Lins,
     ) !Session {
@@ -169,7 +174,7 @@ pub const Session = struct {
             .cv_d = &.{},
             .n_kv = 0,
             .sigmas = &.{},
-            .mods = &.{},
+            .mods = mods,
             .mod_stride = anima.modulationTableLen(cfg),
         };
         var made: usize = 0;
@@ -180,7 +185,6 @@ pub const Session = struct {
             if (self.ck_d.len != 0) gpa.free(self.ck_d);
             if (self.cv_d.len != 0) gpa.free(self.cv_d);
             if (self.sigmas.len != 0) gpa.free(self.sigmas);
-            if (self.mods.len != 0) gpa.free(self.mods);
         }
 
         {
@@ -195,16 +199,16 @@ pub const Session = struct {
             try ctx.tensorUpload(self.freqs_d, std.mem.sliceAsBytes(flat));
         }
 
-        try self.buildCrossKv(gpa, io, ctx, model, cond);
+        const t0 = std.Io.Clock.real.now(io);
+        try self.buildCrossKv(gpa, ctx, model, cond, lins);
+        const t1 = std.Io.Clock.real.now(io);
+        if (t1.nanoseconds - t0.nanoseconds > 20_000_000) std.log.info(
+            "[anima_gpu] cross K/V ({d} blocks, {d} device buffers): {d:.2}s",
+            .{ cfg.n_layers, 2 * cfg.n_layers, @as(f64, @floatFromInt(t1.nanoseconds - t0.nanoseconds)) / 1e9 },
+        );
 
+        std.debug.assert(mods.len == sigmas.len * self.mod_stride);
         self.sigmas = try gpa.dupe(f32, sigmas);
-        self.mods = try gpa.alloc(f32, sigmas.len * self.mod_stride);
-        for (sigmas, 0..) |s, i| {
-            const tbl = try model.modulationTable(io, gpa, s);
-            defer gpa.free(tbl);
-            anima.foldModulationTable(cfg, tbl);
-            @memcpy(self.mods[i * self.mod_stride ..][0..self.mod_stride], tbl);
-        }
         return self;
     }
 
@@ -220,10 +224,10 @@ pub const Session = struct {
     fn buildCrossKv(
         self: *Session,
         gpa: std.mem.Allocator,
-        io: std.Io,
         ctx: *gpu.Context,
         model: *const DiT,
         cond: []const f32,
+        lins: *const Lins,
     ) !void {
         const cfg = self.cfg;
         const d = cfg.dim;
@@ -232,45 +236,64 @@ pub const Session = struct {
         const heads = cfg.n_heads;
         const nl = cfg.n_layers;
 
-        const k = try gpa.alloc(f32, n * d);
-        defer gpa.free(k);
-        const v = try gpa.alloc(f32, n * d);
-        defer gpa.free(v);
-
         self.ck_d = try gpa.alloc(Buf, nl);
         self.cv_d = try gpa.alloc(Buf, nl);
 
-        // f16 operands are zero-padded past `ctx_seq`, so a padded key scores 0 and a
-        // padded-j probability contributes nothing to P@V.
-        const kt = try gpa.alloc(u16, if (self.tc) heads * hd * self.ctx_pad else 0);
-        defer gpa.free(kt);
-        const v16 = try gpa.alloc(u16, if (self.tc) self.ctx_pad * d else 0);
-        defer gpa.free(v16);
+        // ⚠️ **On the DEVICE, and it used to be on the host — that was ~0.4 s of a 0.73 s
+        // per-image setup**, the Vulkan half of the "Anima images are slow to start"
+        // report. The CUDA arm was moved first; this is its twin. What made the host
+        // version look cheap was pricing it as a share of a STEP (0.56%) rather than as a
+        // one-off before the first one.
+        var cond_d = try ctx.tensorCreate(cond.len * 4);
+        defer ctx.tensorDestroy(&cond_d);
+        try ctx.tensorUpload(cond_d, std.mem.sliceAsBytes(cond));
 
-        for (model.blocks, 0..) |*blk, bi| {
-            try model.crossKv(io, gpa, blk, cond, n, k, v);
-            const kb: []const u8 = if (self.tc) blk_k: {
-                @memset(kt, 0);
-                // K per-head k-major: [head][component][position].
-                for (0..n) |p| for (0..heads) |hh| for (0..hd) |cc| {
-                    kt[(hh * hd + cc) * self.ctx_pad + p] = f16Bits(k[p * d + hh * hd + cc]);
-                };
-                break :blk_k std.mem.sliceAsBytes(kt);
-            } else std.mem.sliceAsBytes(k);
-            const vb: []const u8 = if (self.tc) blk_v: {
-                @memset(v16, 0);
-                for (0..n * d) |i| v16[i] = f16Bits(v[i]);
-                break :blk_v std.mem.sliceAsBytes(v16);
-            } else std.mem.sliceAsBytes(v);
+        // f32 scratch for one block's projections, reused across blocks. 128-row padded
+        // because a quantized GEMM writes `i8_mpad` rows.
+        const pad = std.mem.alignForward(usize, n, 128);
+        var ks = try ctx.tensorCreate(pad * d * 4);
+        defer ctx.tensorDestroy(&ks);
+        var vs = try ctx.tensorCreate(pad * d * 4);
+        defer ctx.tensorDestroy(&vs);
 
-            // Both buffers land in the arrays only once both exist, so `n_kv` never
-            // names an uninitialized `Buf` for the caller's errdefer to destroy.
-            var kbuf = try ctx.tensorCreate(kb.len);
+        for (model.blocks, 0..) |_, bi| {
+            const kw = lins.blocks[bi].ck;
+            const vw = lins.blocks[bi].cv;
+            // f16 operands where the flash path reads them; plain f32 for `attn_cross`.
+            const kb: usize = if (self.tc) heads * hd * self.ctx_pad * 2 else n * d * 4;
+            const vb: usize = if (self.tc) self.ctx_pad * d * 2 else n * d * 4;
+            var kbuf = try ctx.tensorCreate(kb);
             errdefer ctx.tensorDestroy(&kbuf);
-            try ctx.tensorUpload(kbuf, kb);
-            var vbuf = try ctx.tensorCreate(vb.len);
+            var vbuf = try ctx.tensorCreate(vb);
             errdefer ctx.tensorDestroy(&vbuf);
-            try ctx.tensorUpload(vbuf, vb);
+
+            // k and v share the context activation, so one prep serves both.
+            try prepGroup(ctx, cond_d, n, cfg.context_dim, &.{ kw, vw });
+            try lin(ctx, ks, cond_d, n, kw);
+            try lin(ctx, vs, cond_d, n, vw);
+            // ⚠️ K is normed, V is NOT (`v_norm = nn.Identity()`) — the asymmetry
+            // `DiT.projectKv` owns on the host path.
+            try qkNorm(ctx, ks, model.blocks[bi].cross_attn.knorm, n * heads, hd, cfg.qk_eps);
+
+            if (self.tc) {
+                // Straight into the attention-operand layout: K per-head k-major, V
+                // row-major, both zero-padded past `ctx_seq` so a padded key scores 0.
+                try ctx.opElt(.gather_kmajor_h16, ks, null, null, kbuf, .{
+                    .u0 = @intCast(d * self.ctx_pad / 2),
+                    .u1 = @intCast(hd),
+                    .u2 = @intCast(self.ctx_pad),
+                    .u3 = @intCast(n),
+                    .u4 = @intCast(heads),
+                }, d * self.ctx_pad / 2, 1, 1);
+                try ctx.opElt(.f32_to_h16, vs, null, null, vbuf, .{
+                    .u0 = @intCast(self.ctx_pad * d / 2),
+                    .u1 = @intCast(n * d),
+                    .f0 = 1.0,
+                }, self.ctx_pad * d / 2, 1, 1);
+            } else {
+                try ctx.opElt(.copy, ks, kbuf, null, null, .{ .u0 = @intCast(n * d), .u2 = 0, .u3 = 0 }, n * d, 1, 1);
+                try ctx.opElt(.copy, vs, vbuf, null, null, .{ .u0 = @intCast(n * d), .u2 = 0, .u3 = 0 }, n * d, 1, 1);
+            }
             self.ck_d[bi] = kbuf;
             self.cv_d[bi] = vbuf;
             self.n_kv = bi + 1;
@@ -284,7 +307,6 @@ pub const Session = struct {
         gpa.free(self.ck_d);
         gpa.free(self.cv_d);
         gpa.free(self.sigmas);
-        gpa.free(self.mods);
         self.* = undefined;
     }
 
@@ -311,12 +333,17 @@ pub const Lins = struct {
     blocks: []DevLins,
 
     pub fn init(gpa: std.mem.Allocator, model: *const DiT) !Lins {
-        var self: Lins = .{ .arena = std.heap.ArenaAllocator.init(gpa), .blocks = &.{} };
-        errdefer self.arena.deinit();
-        const alloc = self.arena.allocator();
-        self.blocks = try alloc.alloc(DevLins, model.blocks.len);
+        // ⚠️ The arena is built in a LOCAL and the struct constructed at the end.
+        // `.arena = ArenaAllocator.init(gpa)` inside a struct literal snapshots the
+        // arena's state before anything allocates into it, so allocations made through a
+        // later field initializer are lost — the trap `dit.zig` records and `clip_text`
+        // had to learn.
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
+        const alloc = arena.allocator();
+        const blocks = try alloc.alloc(DevLins, model.blocks.len);
         for (model.blocks, 0..) |*b, bi| {
-            self.blocks[bi] = .{
+            blocks[bi] = .{
                 .q = try widen(alloc, b.self_attn.q),
                 .k = try widen(alloc, b.self_attn.k),
                 .v = try widen(alloc, b.self_attn.v),
@@ -325,9 +352,11 @@ pub const Lins = struct {
                 .co = try widen(alloc, b.cross_attn.out),
                 .mlp1 = try widen(alloc, b.mlp1),
                 .mlp2 = try widen(alloc, b.mlp2),
+                .ck = try widen(alloc, b.cross_attn.k),
+                .cv = try widen(alloc, b.cross_attn.v),
             };
         }
-        return self;
+        return .{ .arena = arena, .blocks = blocks };
     }
 
     pub fn deinit(self: *Lins) void {
@@ -348,6 +377,11 @@ const DevLins = struct {
     co: Weight,
     mlp1: Weight,
     mlp2: Weight,
+    /// ⚠️ Cross-attention's k/v, needed here because `buildCrossKv` now projects them on
+    /// the DEVICE — so on an int4 checkpoint they need widening just like the rest.
+    /// They are consumed once per image, never in the step loop.
+    ck: Weight,
+    cv: Weight,
 };
 
 /// `w` unchanged unless it is int4, in which case its nibbles are unpacked into an int8
@@ -1057,7 +1091,9 @@ test "Anima gpu forward matches the CPU forward on a real checkpoint" {
     // attention arms are compared against the same CPU forward.
     var lins = try Lins.init(gpa, &model);
     defer lins.deinit();
-    var sess = try Session.init(gpa, io, ctx, &model, lat_h, lat_w, cond, ctx_seq, &.{ sigma, 0 }, &lins);
+    const sched = try model.modulationSchedule(io, gpa, &.{ sigma, 0 });
+    defer gpa.free(sched);
+    var sess = try Session.init(gpa, io, ctx, &model, lat_h, lat_w, cond, ctx_seq, &.{ sigma, 0 }, sched, &lins);
     defer sess.deinit(gpa, ctx);
     if (!sess.tc) return error.SkipZigTest;
     var ws = try Workspace.init(ctx, &model, lat_h, lat_w, sess.tc);

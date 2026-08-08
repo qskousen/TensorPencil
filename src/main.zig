@@ -2795,6 +2795,8 @@ fn animaForwardCheck(
         const mod = try model.modulationTable(io, arena, sigma);
         try model.predict(io, arena, want, x_lat, lat_h, lat_w, cond, ctx_seq, mod, null);
     }
+    // The device sessions borrow one folded schedule, shared by both branches.
+    const sched = try model.modulationSchedule(io, arena, &.{ sigma, 0 });
 
     // ⚠️ **A quantized checkpoint is a DIFFERENT computation on the two sides, not just a
     // different rounding of the same one.** The CPU `matmul` dequantizes the weight to f32
@@ -2824,7 +2826,7 @@ fn animaForwardCheck(
     defer anima_cuda.force_naive_attn = saved;
     for ([_]bool{ false, true }) |naive| {
         anima_cuda.force_naive_attn = naive;
-        var sess = try anima_cuda.Session.init(arena, io, be, model, lat_h, lat_w, cond, ctx_seq, &.{ sigma, 0 });
+        var sess = try anima_cuda.Session.init(arena, be, model, lat_h, lat_w, cond, ctx_seq, &.{ sigma, 0 }, sched);
         defer sess.deinit(arena, be);
         var ws = try anima_cuda.Workspace.init(be, model, lat_h, lat_w);
         defer ws.deinit(be);

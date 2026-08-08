@@ -1973,6 +1973,67 @@ width silently takes a 3-pass fallback that round-trips a full f32 copy of the a
 through global memory. The table is now `{2048, 6144, 8192, 16384}` and looked up rather
 than switched on.
 
+### "Anima images are slow to start": three candidates, and it was the third
+
+Reported as "it looks like it is loading the text encoder on the GPU, then doing the encoding
+on the CPU". The encoder was on the GPU. An `[encode]` log line now states where each half
+ran, because the answer was not guessable and I guessed wrong twice.
+
+Measured at 512x768 / 30 steps / cfg 5 on `cuda`, before any fix:
+
+| | | |
+|---|---|---|
+| qwen3 encode on `cuda` | 1.15 s first call, **0.03 s second** | one-time weight upload + PTX JIT, not host work |
+| `llm_adapter` on the host | **0.17 s** | cheap, as designed — not the problem |
+| **per-image device session build** | **1.24 s** | ← the actual cost |
+
+⚠️ **Both halves of that 1.24 s were my own per-step reasoning applied to a per-image cost.**
+
+1. **Cross-attention K/V were projected on the HOST** — 28 blocks x 2 GEMMs of
+   `[512, 2048] x [2048, 1024]`, per conditioning. The old comment justified it with "one
+   512-row pass per block, done once per image", and as a share of a *step* it is 0.56%. As a
+   one-off before the first step it was hundreds of milliseconds, every image. Now device
+   GEMMs (`prepGroup`/`lin`, so a quantized checkpoint works too), which also means the cross
+   `k`/`v` weights get uploaded (~235 MB) where before only the host read them — a trade the
+   original comment named and I had priced only in per-step terms.
+2. ⚠️ **The AdaLN modulation schedule was built PER CONDITIONING, and it depends on the sigma
+   alone** — so the positive and negative sessions computed byte-identical tables:
+   **0.51 s + 0.29 s** at 31 sigmas. `anima.DiT.modulationSchedule` builds one and
+   `pipeline.Denoiser` owns it; both sessions borrow.
+
+**Result: setup before the first step 2.9 s -> 0.7 s** (session build **1.24 -> 0.32 s**),
+sampling unchanged at 0.35 s/step, quality slightly *better* — **33.72 dB** against ComfyUI
+fp32 where it was 33.36, because the k/v projections now run in the same tensor-core regime
+as everything else rather than in host f32.
+
+**Vulkan's cross K/V moved to the device too** (`gather_kmajor_h16` / `f32_to_h16` straight
+into the per-block f16 cache; `DevLins` gained `ck`/`cv` so an int4 checkpoint widens them like
+the rest). Forward parity unchanged, 14/14 gated.
+
+⚠️ **But it did NOT reduce Vulkan's single-image setup, and the measurement says why:
+0.69 s for the first conditioning against 0.05 s for the second** — a 14x gap for identical
+work, so that 0.69 s is **one-time** (the ~235 MB cross-k/v weight upload plus first-use shape
+warm-up), not per-conditioning. Net effect: a single image is roughly unchanged (0.71 ->
+0.74 s), while every image after the first drops from ~0.6 s of host GEMM to **~0.10 s**,
+because `ctx.weights` outlives the per-image session. So it is a queue win, not a first-render
+win, and saying "moved to the device, therefore faster" would have been wrong.
+
+⚠️ **What that exposes is a Vulkan WEIGHT-UPLOAD gap, not a cross-K/V one.** CUDA absorbs the
+same 235 MB inside a 0.32 s total build; Vulkan spends 0.69 s on it. CUDA's path is pinned
+staging fanned over `Context.FillPool`'s 4 threads (the fix that took Z-Image's step 1 from
+5.1 s to 2.6 s); Vulkan's has no equivalent. That is the next thing to measure — and it would
+help every model, not just Anima.
+
+⚠️ **The legacy krea2 `encodePrompt` free function is gone**, folded into `runQwen3`. It
+called `qwen3_cuda.encode` **unguarded** — that arm reads its weights as fp8, so a bf16 krea2
+encoder would have become noise rather than being refused — and it hardcoded
+`qwen3.tap_count * qwen3.hidden`, the 4B module constants that the width generalization made
+wrong for any other body. There is now one Qwen3 dispatch for all three families.
+
+**The generalizable rule, and it is the second time this file records a version of it:**
+a cost has to be measured in the units the user experiences. "0.56% of a step" and "1.2 s
+before the first pixel" were the same code, and only one of those framings was ever checked.
+
 ### `anima-vk-bench`: int8 was never the problem
 
 **`TensorPencil anima-vk-bench [<seq>]`** is the Vulkan counterpart of `anima-cuda-bench`,
@@ -2121,10 +2182,73 @@ weights. The detection test's Anima cases carry the Cosmos trunk tensor **as wel
 they pin that the adapter is what decides, and a negative case asserts a Cosmos trunk
 *without* an adapter is `UnknownArchitecture`.
 
+⚠️ **`net.` is a third denoiser prefix, and omitting it made the BASE checkpoint
+unloadable (fixed 2026-08-07).** `anima_baseV10.safetensors` stores all 685 tensors
+under `net.`; the prefix list was `{"model.diffusion_model.", ""}`, so `detectFamily`
+found no adapter and the render died with **`error.UnknownArchitecture`** — a checkpoint
+ComfyUI opens fine, refused with an error that names the *architecture* when the problem
+was the *prefix*. It is ComfyUI's own third candidate in `unet_prefix_from_state_dict`,
+where the comment against it reads `# cosmos`, and Anima **is** Cosmos-Predict2's DiT.
+- The prefix list was **duplicated** between `detectFamily` and `componentSpec`, which is
+  what let the two disagree: the resolver would have opened the file that detection had
+  already refused. `detectFamily` now reads `(componentSpec(fam, .denoiser)).prefixes`
+  for both Anima and Z-Image, so a new spelling is added in one place.
+- Verified end to end: that checkpoint now renders. ⚠️ It is **denoiser-only** (no
+  bundled VAE), so it needs an explicit `--vae` — and the resolver says exactly that
+  (`decoder not found: the checkpoint has no 'decoder.conv1.weight' under any known
+  prefix`) rather than failing deep in a weight load.
+
+⚠️ **The gated Anima real-checkpoint tests had been silently SELF-SKIPPING**, because
+`anima_ckpt` names the checkpoint the fixture was generated from (tied to it by sha256,
+correctly) and that file is no longer on the box. So "17/17 green" meant 17 tests of
+which the real-weight ones never ran. Nothing is wrong with the gating — that is what
+`requireModelFile` is for — but **a green summary is not coverage**, and the fix for the
+one case that needed no real weights was to make it synthetic and ungated rather than to
+repoint the shared constant, which would have compared against the wrong weights.
+
 **Defaults**, from ComfyUI's own `image_anima_base_v1` template: 1024², **30 steps**,
 **cfg 4.0**, euler + **`simple`**, shift 3.0, with `qwen_3_06b_base.safetensors` as the
 encoder. (The reference render this was validated against used cfg 5 and `normal` —
 the user's own choice, not a default.)
+
+### The per-image stall: 13.7 s -> 1.3 s, and why the bench understated it 3x
+
+Reported as "all anima images are super slow to actually start … i don't see this kind of
+delay with other models, it's just this anima one", with `[anima] per-image device session
+built in 12.21s` **repeating on every image** and high CPU throughout.
+
+Cause: `DiT.modulationSchedule` built the AdaLN table **one sigma at a time**, calling
+`modulationTable` per sigma. At 28 blocks x 3 sublayers that is **5270 GEMV calls with
+m = 1** per image — 11.96 GFLOP with no weight reuse. Batched over the sigma axis it is
+**170 GEMMs with m = n_sigmas**, the same arithmetic with each weight read once.
+**Measured** (Debug, 1024², 30 steps, cfg 5, `cuda`, isolated with a temporary env switch
+over exactly that branch): **13.74 s -> 1.28 s**.
+
+⚠️ **The first bench of the two forms said 3.5x, understating the real win by 3x, and the
+reason generalizes.** It ran on `testing.io`, which has no thread pool. Most of what
+batching removes is not arithmetic but **task-spawn overhead**: `ops.matmul` splits into
+`4 * n_threads` tasks whenever an op clears 1 MFLOP, which every one of these tiny GEMVs
+does, so the unbatched form paid **~168,000 task spawns per image**. An Io with no pool
+cannot see the dominant cost. Same rule as the profiler-bucket lesson: **measure in the
+units the caller experiences**, and check what the harness actually exercises.
+
+⚠️ **Two wrong diagnoses first, both from ratios rather than isolations.** (1) The host
+cross-KV projection, correctly sized at 0.56% of a *step* — a share of the wrong quantity,
+since this is a one-off before the first step. (2) The **Debug build**, which is real
+(measured **10.7x** on this path: 0.96 s vs 0.09 s at 256²) and is why the user found it
+"barely noticeable in ReleaseFast" — but Debug alone accounts for 1.24 s of 13.74 s, so it
+was a multiplier on the defect, not the defect. Only the A/B over the branch settled it.
+
+⚠️ **Bit-identical below 16 sigmas, last-bits different at or above it**, because `m`
+crosses `ops.matmul.small_m_max`: under 16 a row still goes through ggml's `vec_dot`
+exactly as the m = 1 form did, at 16 and up it takes the packed f32-panel path with a
+different reduction order. Verified in **both** regimes — **PSNR inf (bit-identical)** at
+8 steps / cfg 1, and **46.8 dB** at 30 steps / cfg 5, the latter being trajectory
+amplification of a last-bits input change and **24 dB inside this model's own measured
+cfg-5 precision envelope** (ComfyUI disagrees with itself by 23.04 dB there). A single
+render comparison would have read 46.8 dB as a defect; the cfg-1 control is what says it
+is not. Pinned by an **ungated** synthetic-weight test asserting rel L2 < 1e-6 against
+`modulationTable` at five sigmas spanning the schedule.
 
 ### What the width generalization cost
 

@@ -76,12 +76,14 @@ pub const Session = struct {
     /// The schedule this session precomputed for, and the FOLDED per-sigma modulation
     /// tables (see `anima.foldModulationTable`).
     sigmas: []f32,
-    mods: []f32,
+    /// Borrowed, model-owned: the FOLDED table for every scheduled sigma, stride
+    /// `mod_stride`. ⚠️ Per SIGMA, not per conditioning — see
+    /// `anima.DiT.modulationSchedule` for why building it per session cost 0.8 s an image.
+    mods: []const f32,
     mod_stride: usize,
 
     pub fn init(
         gpa: std.mem.Allocator,
-        io: std.Io,
         be: *Backend,
         model: *const DiT,
         lat_h: usize,
@@ -89,6 +91,8 @@ pub const Session = struct {
         cond: []const f32,
         ctx_seq: usize,
         sigmas: []const f32,
+        /// Model-owned, shared by both conditioning branches (`modulationSchedule`).
+        mods: []const f32,
     ) !Session {
         const cfg = model.cfg;
         std.debug.assert(cond.len == ctx_seq * cfg.context_dim);
@@ -109,7 +113,7 @@ pub const Session = struct {
             .ck_d = undefined,
             .cv_d = undefined,
             .sigmas = &.{},
-            .mods = &.{},
+            .mods = mods,
             .mod_stride = anima.modulationTableLen(cfg),
         };
         var made: usize = 0;
@@ -117,7 +121,6 @@ pub const Session = struct {
             const bufs = [_]*Buf{ &self.freqs_d, &self.ck_d, &self.cv_d };
             for (bufs[0..made]) |b| be.tensorDestroy(b);
             if (self.sigmas.len != 0) gpa.free(self.sigmas);
-            if (self.mods.len != 0) gpa.free(self.mods);
         }
 
         {
@@ -132,34 +135,48 @@ pub const Session = struct {
             try be.tensorUpload(self.freqs_d, std.mem.sliceAsBytes(flat));
         }
 
-        // Cross-attention K/V, once per block. On the HOST: it is one 512-row pass per
-        // block done once per image, and doing it on the device would mean uploading
-        // 28 blocks' k/v weights before the first step instead of letting the step loop
-        // stream them in the order it wants them.
+        // Cross-attention K/V for every block, ON THE DEVICE.
+        //
+        // ⚠️ **This used to run on the host and it was the "Anima images are slow to
+        // start" bug.** 28 blocks x 2 GEMMs of `[512, 2048] x [2048, 1024]` is ~120 GFLOP
+        // per conditioning, doubled under CFG — **measured 1.24 s per image** at 512x768,
+        // repeated for every image in a queue. The original comment justified the host by
+        // "one 512-row pass per block, done once per image", and as a share of a STEP it is
+        // 0.56%; as a one-off before the first step it was seconds. **A cost that is
+        // negligible per step is not therefore negligible per image** — the two framings
+        // needed separate measurements and only one was taken.
+        //
+        // The trade the old comment named is real but small: the cross `k`/`v` weights now
+        // get uploaded (~235 MB) where before only the host read them. They are uploaded
+        // once and cached, against 1.2 s of host GEMM per image.
         {
-            const kv = try gpa.alloc(f32, cfg.n_layers * ctx_seq * d);
-            defer gpa.free(kv);
-            const vv = try gpa.alloc(f32, cfg.n_layers * ctx_seq * d);
-            defer gpa.free(vv);
+            var cond_d = try be.tensorCreate(cond.len * 4);
+            defer be.tensorDestroy(&cond_d);
+            try be.tensorUpload(cond_d, std.mem.sliceAsBytes(cond));
+            self.ck_d = try be.tensorCreate(cfg.n_layers * ctx_seq * d * 4);
+            made += 1;
+            self.cv_d = try be.tensorCreate(cfg.n_layers * ctx_seq * d * 4);
+            made += 1;
+
+            try be.beginBatch();
+            errdefer if (be.batching()) be.abortBatch();
             for (model.blocks, 0..) |*blk, bi| {
-                try model.crossKv(io, gpa, blk, cond, ctx_seq, kv[bi * ctx_seq * d ..][0 .. ctx_seq * d], vv[bi * ctx_seq * d ..][0 .. ctx_seq * d]);
+                const off = bi * ctx_seq * d;
+                const kv_out = self.ck_d.viewF32(off);
+                const vv_out = self.cv_d.viewF32(off);
+                // k and v share the context activation, so one prep serves both.
+                try prepGroup(be, cond_d, ctx_seq, cfg.context_dim, &.{ blk.cross_attn.k, blk.cross_attn.v });
+                try lin(be, kv_out, cond_d, ctx_seq, blk.cross_attn.k);
+                try lin(be, vv_out, cond_d, ctx_seq, blk.cross_attn.v);
+                // ⚠️ K is normed, V is NOT (`v_norm = nn.Identity()`) — the asymmetry
+                // `DiT.projectKv` owns on the host path.
+                try be.qkNorm(kv_out, kv_out, try normBuf(be, blk.cross_attn.knorm), ctx_seq * cfg.n_heads, cfg.headDim(), cfg.qk_eps);
             }
-            self.ck_d = try be.tensorCreate(kv.len * 4);
-            made += 1;
-            try be.tensorUpload(self.ck_d, std.mem.sliceAsBytes(kv));
-            self.cv_d = try be.tensorCreate(vv.len * 4);
-            made += 1;
-            try be.tensorUpload(self.cv_d, std.mem.sliceAsBytes(vv));
+            try be.endBatch();
         }
 
+        std.debug.assert(mods.len == sigmas.len * self.mod_stride);
         self.sigmas = try gpa.dupe(f32, sigmas);
-        self.mods = try gpa.alloc(f32, sigmas.len * self.mod_stride);
-        for (sigmas, 0..) |s, i| {
-            const tbl = try model.modulationTable(io, gpa, s);
-            defer gpa.free(tbl);
-            anima.foldModulationTable(cfg, tbl);
-            @memcpy(self.mods[i * self.mod_stride ..][0..self.mod_stride], tbl);
-        }
         return self;
     }
 
@@ -168,7 +185,6 @@ pub const Session = struct {
         be.tensorDestroy(&self.ck_d);
         be.tensorDestroy(&self.cv_d);
         gpa.free(self.sigmas);
-        gpa.free(self.mods);
         self.* = undefined;
     }
 
@@ -453,9 +469,9 @@ fn blockForward(
 /// pointers `blockForward` later fetches, or the prefetch is a cache miss and pure
 /// waste.
 ///
-/// ⚠️ `cross_attn.k`/`.v` are deliberately absent: `Session.init` consumed them on the
-/// host once per image and the step loop never touches their device copies, so
-/// prefetching them would upload ~230 MB per step that nothing reads.
+/// ⚠️ `cross_attn.k`/`.v` are deliberately absent: `Session.init` consumes them ONCE per
+/// image (now on the device), and the step loop never touches them again — so prefetching
+/// them here would re-upload ~235 MB per step that nothing reads.
 fn prefetchBlock(be: *Backend, blk: anytype) void {
     const bytes = std.mem.sliceAsBytes;
     inline for (.{ blk.self_attn.q, blk.self_attn.k, blk.self_attn.v, blk.self_attn.out }) |w| be.prefetchWeight(w.bytes);

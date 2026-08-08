@@ -636,6 +636,117 @@ pub const DiT = struct {
         return out;
     }
 
+    /// Every sigma's FOLDED modulation table, back to back with stride
+    /// `modulationTableLen(cfg)`. Caller frees.
+    ///
+    /// ⚠️ **Per SIGMA, not per conditioning** — the AdaLN input is the timestep alone, so
+    /// the positive and negative branches need identical tables. Building it once per
+    /// `anima_gpu`/`anima_cuda` session did it twice per image: **measured 0.51 s + 0.29 s
+    /// of a 1.11 s per-image setup** at 31 sigmas. `pipeline.Session` builds one of these
+    /// and both device sessions borrow it.
+    pub fn modulationSchedule(self: *const DiT, io: std.Io, gpa: std.mem.Allocator, sigmas: []const f32) ![]f32 {
+        const cfg = self.cfg;
+        const d = cfg.dim;
+        const n = sigmas.len;
+        const stride = modulationTableLen(cfg);
+        const out = try gpa.alloc(f32, n * stride);
+        errdefer gpa.free(out);
+        if (n == 0) return out;
+
+        // ⚠️ **BATCHED over sigmas, and that is the whole point of this function.** Done one
+        // sigma at a time it is 12 GFLOP spread over **5270 GEMV calls with m = 1** — no
+        // weight reuse and all call overhead. Batched it is **170 GEMMs with m = n**, the
+        // same arithmetic with each weight read once.
+        //
+        // ⚠️ It was reported as "Anima images are super slow to start, but only Anima", with
+        // **12.3 s** of per-image setup and high CPU, repeating on every image. Two
+        // multipliers stacked: this shape, and a **Debug** GUI build (`zig build run-gui`
+        // does not imply `-Doptimize=ReleaseFast`), which costs ~10x on host numeric code.
+        // Anima-specific because no other family precomputes a per-sigma AdaLN table of this
+        // size on the host — krea2's timestep vectors are far smaller.
+        //
+        // **Measured** (Debug, 1024^2, 30 steps, cfg 5, `cuda`, isolated with a temporary
+        // env switch over exactly this branch): the per-image device session goes
+        // **13.74 s -> 1.28 s**. ⚠️ A single-threaded bench of the two forms showed only
+        // 3.5x, understating it by 3x, because most of what batching removes is
+        // **task-spawn overhead**: `matmul` splits into `4 * n_threads` tasks whenever the
+        // op clears 1 MFLOP, which every one of these tiny GEMVs does — so the unbatched
+        // form paid ~168,000 task spawns per image. A bench on an Io with no thread pool
+        // cannot see the dominant cost, which is the same "measure it in the units the
+        // caller experiences" rule the profiler-bucket lesson above turns on.
+        //
+        // ⚠️ **Bit-identical below 16 sigmas, last-bits different at or above it**, because
+        // `m` crosses `ops.matmul.small_m_max`: at m < 16 a row still goes through ggml's
+        // `vec_dot` exactly as the m = 1 form did, while at m >= 16 it takes the packed
+        // f32-panel path with a different reduction order. Verified both ways — **PSNR inf
+        // (bit-identical)** at 8 steps / cfg 1, and **46.8 dB** at 30 steps / cfg 5, the
+        // latter being trajectory amplification of a last-bits input change and **24 dB
+        // inside this model's own measured cfg-5 precision envelope** (ComfyUI disagrees
+        // with itself by 23.04 dB there).
+        const sinus = try gpa.alloc(f32, n * d);
+        defer gpa.free(sinus);
+        for (sigmas, 0..) |sg, i| timestepEmbedding(sinus[i * d ..][0..d], sg);
+
+        // Convention 4: `emb` is the RMSNorm'd sinusoid; the LoRA comes from the raw one.
+        const emb = try gpa.alloc(f32, n * d);
+        defer gpa.free(emb);
+        ops.norm.rmsNorm(emb, sinus, self.t_norm, cfg.t_norm_eps);
+
+        const lora = try gpa.alloc(f32, n * 3 * d);
+        defer gpa.free(lora);
+        {
+            const h1 = try gpa.alloc(f32, n * d);
+            defer gpa.free(h1);
+            try ops.matmul.matmul(io, gpa, h1, sinus, n, self.t_linear1, null);
+            ops.act.silu(h1);
+            try ops.matmul.matmul(io, gpa, lora, h1, n, self.t_linear2, null);
+        }
+
+        // Convention 5: SiLU on the input, then the rank-`adaln_dim` pair with no
+        // activation between. Shared by all four consumers, so computed once.
+        const gated = try gpa.alloc(f32, n * d);
+        defer gpa.free(gated);
+        @memcpy(gated, emb);
+        ops.act.silu(gated);
+
+        const low = try gpa.alloc(f32, n * cfg.adaln_dim);
+        defer gpa.free(low);
+        const dst = try gpa.alloc(f32, n * 3 * d);
+        defer gpa.free(dst);
+
+        for (self.blocks, 0..) |*blk, bi| {
+            for ([_][2]Weight{ blk.ada_sa, blk.ada_ca, blk.ada_mlp }, 0..) |ada, si| {
+                try ops.matmul.matmul(io, gpa, low, gated, n, ada[0], null);
+                try ops.matmul.matmul(io, gpa, dst, low, n, ada[1], null);
+                for (0..n) |i| {
+                    const row = dst[i * 3 * d ..][0 .. 3 * d];
+                    const lo = lora[i * 3 * d ..][0 .. 3 * d];
+                    const o = out[i * stride + bi * 9 * d + si * 3 * d ..][0 .. 3 * d];
+                    // Convention 4: the one shared LoRA vector is added to all three.
+                    for (o, row, lo) |*v, rv, lv| v.* = rv + lv;
+                }
+            }
+        }
+
+        // The final layer takes only the FIRST 2*dim of the LoRA vector.
+        {
+            try ops.matmul.matmul(io, gpa, low, gated, n, self.final_ada[0], null);
+            const fin = try gpa.alloc(f32, n * 2 * d);
+            defer gpa.free(fin);
+            try ops.matmul.matmul(io, gpa, fin, low, n, self.final_ada[1], null);
+            for (0..n) |i| {
+                const row = fin[i * 2 * d ..][0 .. 2 * d];
+                const lo = lora[i * 3 * d ..][0 .. 2 * d];
+                const o = out[i * stride + cfg.n_layers * 9 * d ..][0 .. 2 * d];
+                for (o, row, lo) |*v, rv, lv| v.* = rv + lv;
+            }
+        }
+
+        // The device norms consume `1 + scale`; the host `finalize` adds its own 1.
+        for (0..n) |i| foldModulationTable(cfg, out[i * stride ..][0..stride]);
+        return out;
+    }
+
     /// `ropeFreqs(cfg, ...)` for a loaded model.
     pub fn ropeFreqs(self: *const DiT, gpa: std.mem.Allocator, h: usize, w: usize) !ops.rope.Freqs {
         return ropeFreqsFor(gpa, self.cfg, h, w);
@@ -1947,4 +2058,87 @@ test "the loader wires int8/int4 convrot scales, and refuses a weight with none"
     // has no level below `err`, so asserting it would make every passing run print. The
     // `bad` tensor is left in the synthetic file so the next person can check it by hand.
     try testing.expect(st.get("bad") != null and st.get("bad_scale") == null);
+}
+
+test "the batched modulation schedule matches the per-sigma one" {
+    // ⚠️ `modulationSchedule` is a BATCHED rewrite of `modulationTable` — m = n_sigmas
+    // instead of 5270 GEMV calls at m = 1 — so it has to be pinned against the thing it
+    // replaced. The arithmetic is the same but the GEMM reduction order need not be, and
+    // this table feeds the AdaLN of every block of every step.
+    //
+    // Built on SYNTHETIC weights and deliberately UNGATED: nothing here needs a real
+    // checkpoint (the two functions must agree on any weights at all), and a gated test
+    // would silently skip on a box without the multi-GB file — which is exactly how the
+    // real-checkpoint tests above went unrun once already.
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var cfg = anima_2b;
+    cfg.n_layers = 3;
+    cfg.dim = 32;
+    cfg.adaln_dim = 8;
+    const d = cfg.dim;
+    const ad = cfg.adaln_dim;
+
+    // One deterministic pool; every weight is a view into it, so no allocation churn and
+    // the values are reproducible without a fixture.
+    var prng = std.Random.DefaultPrng.init(0x4e1ffa);
+    const rnd = prng.random();
+    const pool_len = d + d * d + 3 * d * d + cfg.n_layers * 3 * (ad * d + 3 * d * ad) + ad * d + 2 * d * ad;
+    const pool = try gpa.alloc(f32, pool_len);
+    defer gpa.free(pool);
+    for (pool) |*v| v.* = rnd.floatNorm(f32) * 0.1;
+    var off: usize = 0;
+    const take = struct {
+        fn f(p: []f32, o: *usize, n: usize) []f32 {
+            const r = p[o.*..][0..n];
+            o.* += n;
+            return r;
+        }
+    }.f;
+
+    var model: DiT = undefined;
+    model.cfg = cfg;
+    // `t_norm` is a gain vector, so keep it near 1 rather than near 0.
+    const tn = take(pool, &off, d);
+    for (tn) |*v| v.* = 1.0 + v.* * 0.1;
+    model.t_norm = tn;
+    model.t_linear1 = .fromF32(take(pool, &off, d * d), d, d);
+    model.t_linear2 = .fromF32(take(pool, &off, 3 * d * d), 3 * d, d);
+
+    const blocks = try gpa.alloc(Block, cfg.n_layers);
+    defer gpa.free(blocks);
+    for (blocks) |*b| {
+        b.ada_sa = .{ .fromF32(take(pool, &off, ad * d), ad, d), .fromF32(take(pool, &off, 3 * d * ad), 3 * d, ad) };
+        b.ada_ca = .{ .fromF32(take(pool, &off, ad * d), ad, d), .fromF32(take(pool, &off, 3 * d * ad), 3 * d, ad) };
+        b.ada_mlp = .{ .fromF32(take(pool, &off, ad * d), ad, d), .fromF32(take(pool, &off, 3 * d * ad), 3 * d, ad) };
+    }
+    model.blocks = blocks;
+    model.final_ada = .{ .fromF32(take(pool, &off, ad * d), ad, d), .fromF32(take(pool, &off, 2 * d * ad), 2 * d, ad) };
+    try testing.expectEqual(pool_len, off);
+
+    // Sigmas spanning what a real schedule uses, both endpoints included.
+    const sigmas = [_]f32{ 1.0, 0.87, 0.5, 0.13, 0.0 };
+    const batched = try model.modulationSchedule(io, gpa, &sigmas);
+    defer gpa.free(batched);
+    const stride = modulationTableLen(cfg);
+    try testing.expectEqual(sigmas.len * stride, batched.len);
+
+    for (sigmas, 0..) |sg, i| {
+        const one = try model.modulationTable(io, gpa, sg);
+        defer gpa.free(one);
+        // `modulationSchedule` folds; `modulationTable` does not.
+        foldModulationTable(cfg, one);
+        const got = batched[i * stride ..][0..stride];
+        var num: f64 = 0;
+        var den: f64 = 0;
+        for (one, got) |w, g| {
+            num += (@as(f64, w) - g) * (@as(f64, w) - g);
+            den += @as(f64, w) * w;
+        }
+        const rel = @sqrt(num / den);
+        errdefer std.debug.print("sigma {d}: rel L2 {e:.3}\n", .{ sg, rel });
+        // Same arithmetic; only the GEMM reduction order may differ.
+        try testing.expect(rel < 1e-6);
+    }
 }
