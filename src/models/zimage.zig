@@ -53,6 +53,7 @@ const tp_core = @import("tp_core");
 const safetensors = tp_core.safetensors;
 const weights_mod = tp_core.weights;
 const ops = @import("tp_ops");
+const quant_weight = @import("quant_weight.zig");
 
 const SafeTensors = safetensors.SafeTensors;
 const WeightStore = weights_mod.WeightStore;
@@ -907,9 +908,47 @@ fn linear(io: std.Io, gpa: std.mem.Allocator, out: []f32, x: []const f32, m: usi
 /// slow path, it is silently wrong output, so both gate on this before dispatching.
 pub fn gpuLinKindSupported(dt: DType) bool {
     return switch (dt) {
-        .bf16, .f16, .f32, .f8_e4m3 => true,
+        // `.nvfp4` is decoded to f16 inside the GEMM (weight-only, which is what NVFP4 is
+        // below Blackwell), so it runs wherever the f16 GEMM does.
+        .bf16, .f16, .f32, .f8_e4m3, .nvfp4 => true,
         else => false,
     };
+}
+
+/// The first block linear the device forward cannot run, or null if it can run all of them.
+///
+/// ⚠️ **Scans EVERY layer, not `layers[0].attn.qkv`.** That single-tensor probe was correct
+/// only while no mixed Z-Image checkpoint existed — and `anima_baseV10-INT8_CONVROT-MIXED`
+/// is the standing proof that "mixed" means mixed PER BLOCK, where a block-0 probe says yes
+/// and the forward then panics on the first thing it does. Returns the tensor's name so the
+/// refusal can say which layer.
+pub fn unsupportedGpuLin(model: *const DiT, extra: fn (DType) bool) ?struct { tag: []const u8, dtype: DType } {
+    for (model.layers) |*b| {
+        const lins = [_]Weight{ b.attn.qkv, b.attn.out, b.ffn.w1, b.ffn.w3, b.ffn.w2 };
+        for (lins) |w| {
+            if (!gpuLinKindSupported(w.dtype) or !extra(w.dtype))
+                return .{ .tag = w.tag orelse "?", .dtype = w.dtype };
+        }
+        if (b.ada) |a| if (!gpuLinKindSupported(a.w.dtype) or !extra(a.w.dtype))
+            return .{ .tag = a.w.tag orelse "?", .dtype = a.w.dtype };
+    }
+    return null;
+}
+
+/// Largest transient buffer any NVFP4 block linear decodes into, per the backend's own
+/// sizing rule, or 0 when the model has none.
+pub fn maxNvfp4Scratch(model: *const DiT, comptime bytesFor: fn (rows: usize, cols: usize) usize) usize {
+    var max: usize = 0;
+    for (model.layers) |*b| {
+        const lins = [_]Weight{ b.attn.qkv, b.attn.out, b.ffn.w1, b.ffn.w3, b.ffn.w2 };
+        for (lins) |w| {
+            if (w.dtype == .nvfp4) max = @max(max, bytesFor(w.rows, w.cols));
+        }
+        if (b.ada) |a| if (a.w.dtype == .nvfp4) {
+            max = @max(max, bytesFor(a.w.rows, a.w.cols));
+        };
+    }
+    return max;
 }
 
 // --- weight loading ---------------------------------------------------------
@@ -936,6 +975,28 @@ const Loader = struct {
             return error.MissingTensor;
         };
         const shape = view.info.shape.slice();
+        // ⚠️ **The packed ComfyUI 4-bit formats come first**, each detected by its OWN
+        // sidecar (`_scale_2` for NVFP4, `_s_rel` for W4A8) rather than by dtype or shape:
+        // both store `[rows, cols/2]`, so the plain shape check below would reject them.
+        // NVFP4's nibbles are E2M1 floats with a per-16-block fp8 scale and W4A8's are
+        // unsigned indices into a non-uniform Lloyd-Max codebook — one implementation for
+        // every family that ships them (`quant_weight.zig`).
+        //
+        // ⚠️ **W4A8 is here because being krea2-only made the FIRST Anima W4A8 checkpoint
+        // unloadable**, and nothing about Z-Image would have stopped it arriving here
+        // instead. `.w4a8` is absent from `gpuLinKindSupported`, so such a checkpoint runs
+        // on the CPU (where `ops.matmul` decodes per k-slice) and every GPU arm declines
+        // rather than reading the nibbles as something else.
+        if (try quant_weight.nvfp4(l.alloc, l.store, nm, rows, cols)) |nv| {
+            var w = nv;
+            w.tag = try l.alloc.dupe(u8, nm);
+            return w;
+        }
+        if (try quant_weight.w4a8(l.alloc, l.store, nm, rows, cols)) |q| {
+            var w = q;
+            w.tag = try l.alloc.dupe(u8, nm);
+            return w;
+        }
         if (shape.len != 2 or shape[0] != rows or shape[1] != cols) {
             // Name the tensor and both shapes: a bare ShapeMismatch across ~450
             // weights is not actionable, and the usual cause is a container whose
@@ -1034,7 +1095,6 @@ fn relL2(want: []const f32, got: []const f32) f64 {
     }
     return if (l2_ref > 0) @sqrt(l2_err / l2_ref) else @sqrt(l2_err);
 }
-
 
 test "patchify and unpatchify round-trip with the (ph, pw, c) feature order" {
     // Two things at once, because the second is the one that bites: the round trip

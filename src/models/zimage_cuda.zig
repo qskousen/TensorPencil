@@ -246,7 +246,17 @@ pub const Workspace = struct {
 /// CPU rather than being read as the wrong dtype.
 pub fn supported(model: *const DiT) bool {
     if (model.layers.len == 0) return false;
-    return zimage.gpuLinKindSupported(model.layers[0].attn.qkv.dtype);
+    const always = struct {
+        fn f(_: @import("tp_core").dtype.DType) bool {
+            return true;
+        }
+    }.f;
+    if (zimage.unsupportedGpuLin(model, always)) |bad| {
+        std.log.warn("zimage_cuda: {s} is {t}, which this backend has no GEMM for — the trunk " ++
+            "runs on the CPU. Expect CPU sampling speed.", .{ bad.tag, bad.dtype });
+        return false;
+    }
+    return true;
 }
 
 /// One denoiser forward. `out`/`x_lat` are planar `[channels][lat_h][lat_w]`.
@@ -369,9 +379,12 @@ fn blockForward(
     // table's trailing zero block: Z-Image's modulation has no shift.
     try be.rmsMod(x, ws.nrm_d, ws.mv_d, rows, dim, mod_base + 0 * dim, zero_off, cfg.norm_eps);
 
-    const wq = qkvPart(blk.attn.qkv, 0, cfg.qDim());
-    const wk = qkvPart(blk.attn.qkv, cfg.qDim(), cfg.kvDim());
-    const wv = qkvPart(blk.attn.qkv, cfg.qDim() + cfg.kvDim(), cfg.kvDim());
+    var nvq: ops.nvfp4.Meta = undefined;
+    var nvk: ops.nvfp4.Meta = undefined;
+    var nvv: ops.nvfp4.Meta = undefined;
+    const wq = qkvPart(blk.attn.qkv, 0, cfg.qDim(), &nvq);
+    const wk = qkvPart(blk.attn.qkv, cfg.qDim(), cfg.kvDim(), &nvk);
+    const wv = qkvPart(blk.attn.qkv, cfg.qDim() + cfg.kvDim(), cfg.kvDim(), &nvv);
     try gemm(be, ws.q_d, ws.nrm_d, rows, wq);
     try gemm(be, ws.k_d, ws.nrm_d, rows, wk);
     try gemm(be, ws.v_d, ws.nrm_d, rows, wv);
@@ -415,10 +428,12 @@ fn prefetchBlock(be: *Backend, cfg: zimage.Config, blk: anytype) void {
     const bytes = std.mem.sliceAsBytes;
     const qkv = blk.attn.qkv;
     inline for (.{ 0, 1, 2 }) |i| {
+        // Prefetch only touches `.bytes`, so the sliced metadata is unused here.
+        var nv: ops.nvfp4.Meta = undefined;
         const part = switch (i) {
-            0 => qkvPart(qkv, 0, cfg.qDim()),
-            1 => qkvPart(qkv, cfg.qDim(), cfg.kvDim()),
-            else => qkvPart(qkv, cfg.qDim() + cfg.kvDim(), cfg.kvDim()),
+            0 => qkvPart(qkv, 0, cfg.qDim(), &nv),
+            1 => qkvPart(qkv, cfg.qDim(), cfg.kvDim(), &nv),
+            else => qkvPart(qkv, cfg.qDim() + cfg.kvDim(), cfg.kvDim(), &nv),
         };
         be.prefetchWeight(part.bytes);
     }
@@ -439,11 +454,18 @@ fn offsetBuf(b: Buf, off_bytes: usize, size: usize) Buf {
 /// — `[q|k|v]` are row blocks — and the device weight cache keys on the host pointer,
 /// so the three views cache separately. ⚠️ Part 0 shares the fused tensor's pointer, so
 /// the whole tensor must never be uploaded as well.
-fn qkvPart(w: Weight, row0: usize, nrows: usize) Weight {
+fn qkvPart(w: Weight, row0: usize, nrows: usize, nv: *ops.nvfp4.Meta) Weight {
     const row_bytes = w.dtype.storageBytes(w.cols);
     var s = w;
     s.rows = nrows;
     s.bytes = w.bytes[row0 * row_bytes ..][0 .. nrows * row_bytes];
+    // ⚠️ An NVFP4 weight's per-block scales have to be row-sliced too, into caller-owned
+    // storage that outlives the returned `Weight`. Without it the k and v views would read
+    // q's block scales — see `ops.nvfp4.Meta.rowSlice`.
+    if (w.nvfp4) |m| {
+        nv.* = m.rowSlice(w.cols, row0, nrows);
+        s.nvfp4 = nv;
+    }
     return s;
 }
 
@@ -462,6 +484,14 @@ fn gemm(be: *Backend, y: Buf, x: Buf, m: usize, w: Weight) !void {
         else
             try be.opMatmulBf16(y, x, m, w.bytes, w.rows, w.cols, zeros),
         .f8_e4m3 => try be.opMatmulFp8(y, x, m, w.bytes, w.scale, w.rows, w.cols),
+        // Weight-only NVFP4: the 4-bit weight is decoded to an f16 scratch inside the GEMM
+        // and the packed form stays resident. `rows % 128` / `cols % 32` come from the f16
+        // GEMM it feeds; every NVFP4 layer in the shipped checkpoints satisfies both.
+        .nvfp4 => {
+            std.debug.assert(w.rows % 128 == 0 and w.cols % 32 == 0);
+            const meta = w.nvfp4.?;
+            try be.opMatmulNvfp4(y, x, m, w.bytes, meta.scales, std.mem.asBytes(&meta.levels.bf16v), w.rows, w.cols, zeros);
+        },
         .f32 => try be.opMatmul(y, 0, x, 0, m, w.bytes, false, w.rows, w.cols, w.scale, null),
         // `supported` gates this before a session is built.
         else => return error.UnsupportedDType,

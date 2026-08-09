@@ -22,7 +22,8 @@ extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 const usage =
     \\usage: tp-llm --model <qwen3.safetensors> --prompt <text>
     \\              [--backend cpu|zig-cuda|cuda|vulkan]
-    \\              [--system <text>] [--max-tokens <n>] [--max-context <n>]
+    \\              [--system <text>] [--tools <tools.json>]
+    \\              [--max-tokens <n>] [--max-context <n>]
     \\              [--kv-dtype f32|f16|q8_0] [--mmap pread|mmap|buffered]
     \\              [--temperature <t>] [--top-k <n>] [--top-p <p>] [--min-p <p>]
     \\              [--repeat-penalty <r>] [--repeat-last-n <n>]
@@ -72,6 +73,14 @@ const usage =
     \\--tree drafts a branching token TREE per verify forward instead of a
     \\chain (up to <nodes> tree nodes, e.g. 16; requires --eagle and
     \\--greedy; still lossless — byte-identical to vanilla greedy).
+    \\--tools <tools.json> declares functions the model may call, rendered in
+    \\its OWN trained format by its embedded chat template (a JSON array of
+    \\{"name","description","parameters"} objects, or the OpenAI
+    \\{"type":"function","function":{…}} wrapping — either spelling). The calls
+    \\in each reply are parsed back out and printed; nothing is executed, so
+    \\answer one by hand with /tool <result> and the model sees it as a real
+    \\tool response. A template that renders no tool declarations (Gemma 3,
+    \\plain llama) says so instead of silently dropping them.
     \\Without --prompt, tp-llm runs an interactive multi-turn chat: Enter
     \\sends the message, Shift-Enter (or Alt-Enter) inserts a newline, and
     \\pasted multi-line text stays one message (bracketed paste); /exit or
@@ -122,6 +131,7 @@ pub fn main(init: std.process.Init) !void {
     var eagle_path: ?[]const u8 = null;
     var prompt: ?[]const u8 = null;
     var system: ?[]const u8 = null;
+    var tools_path: ?[]const u8 = null;
     var backend: BackendKind = .cpu;
     var profile = false;
     var vram_budget: u64 = 0;
@@ -155,6 +165,8 @@ pub fn main(init: std.process.Init) !void {
             prompt = try nextArg(args, &i);
         } else if (std.mem.eql(u8, a, "--system")) {
             system = try nextArg(args, &i);
+        } else if (std.mem.eql(u8, a, "--tools")) {
+            tools_path = try nextArg(args, &i);
         } else if (std.mem.eql(u8, a, "--max-tokens")) {
             opts.max_new_tokens = try std.fmt.parseInt(usize, try nextArg(args, &i), 10);
         } else if (std.mem.eql(u8, a, "--max-context")) {
@@ -241,6 +253,25 @@ pub fn main(init: std.process.Init) !void {
         try stdout.flush();
         return error.MissingArgument;
     };
+    // Tool declarations, if any: parsed ONCE into the process arena and read
+    // from the global by every render site (one-shot and interactive alike), so
+    // the two cannot disagree about what the model was told it can call. A bad
+    // file is fatal here rather than a silently tool-less prompt — the failure
+    // mode of "declared tools that never arrived" is a model that simply never
+    // calls anything, which looks like the model's fault.
+    if (tools_path) |tp| {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, tp, arena, .limited(4 * 1024 * 1024)) catch |err| {
+            try stdout.print("cannot read --tools {s}: {t}\n", .{ tp, err });
+            try stdout.flush();
+            return error.InvalidArgument;
+        };
+        llm.chat_template.tools = llm.chat_template.parseTools(arena, bytes) catch |err| {
+            try stdout.print("--tools {s} is not a valid tool declaration ({t}); expected a JSON array of " ++
+                "{{\"name\",\"description\",\"parameters\"}} (or the OpenAI {{\"type\":\"function\",…}} wrapping)\n", .{ tp, err });
+            try stdout.flush();
+            return error.InvalidArgument;
+        };
+    }
     // LLM weights never stream: --vram-budget only sizes the CPU/GPU split
     // planners, so alone it would silently do nothing.
     if (vram_budget != 0 and cpu_split == null and !dynamic_offload) {
@@ -744,6 +775,7 @@ fn appendOneShotPrompt(
             .eos_token = llm.chat_template.eos,
             .enable_thinking = llm.chat.enable_thinking,
             .add_generation_prompt = true,
+            .tools = llm.chat_template.tools,
         }, ids);
     } else {
         if (system) |s| try llm.chat.appendSystem(tok, gpa, s, ids);
@@ -880,6 +912,40 @@ fn prefillTail(model: anytype, gpa: std.mem.Allocator, ids: []const u32, from: u
     if (to > cur) try model.prefill(ids[cur..to]);
 }
 
+/// Print the tool calls a finished reply contains, so a human can see what the
+/// model asked for and answer it with `/tool`. Purely a report: nothing is
+/// executed, and the assistant turn is replayed as the RAW text it generated
+/// (which already carries the call in the model's own trained format), so this
+/// cannot alter the next prompt.
+///
+/// ⚠️ Scans the ANSWER only. A reasoning model routinely writes a call out while
+/// deciding whether to make it; printing those would have a user answering a
+/// call that was never made.
+fn reportToolCalls(
+    gpa: std.mem.Allocator,
+    reply: []const u8,
+    primed: bool,
+    tool_role_ok: bool,
+    stdout: *Io.Writer,
+) !void {
+    const answer = llm.tool_call.answerText(reply, llm.chat.reasoning(), primed);
+    if (std.mem.indexOf(u8, answer, "<tool_call>") == null) return;
+
+    var calls: std.ArrayList(llm.tool_call.Call) = .empty;
+    defer {
+        for (calls.items) |*c| c.deinit(gpa);
+        calls.deinit(gpa);
+    }
+    var bad: usize = 0;
+    llm.tool_call.parseAll(gpa, answer, &calls, &bad) catch return;
+    for (calls.items) |c| try stdout.print("\n[tool call] {s}({s})", .{ c.name, c.arguments_json });
+    if (bad > 0) try stdout.print("\n[{d} malformed tool call(s) in this reply]", .{bad});
+    if (calls.items.len > 0 and tool_role_ok)
+        try stdout.writeAll("\n[answer with: /tool <result>]");
+    try stdout.writeAll("\n");
+    try stdout.flush();
+}
+
 fn renderDrivenChat(
     model: anytype,
     tok: *const TensorPencil.tokenizer.Tokenizer,
@@ -897,6 +963,20 @@ fn renderDrivenChat(
     const eos = llm.chat_template.eos;
     const img_ok = comptime @hasDecl(M, "prefillImage");
     const exp: ?llm.chat_template.ImageExpand = if (img_ok and img_chat != null) imageExpandFor(tok) else null;
+
+    // Tool capability is MEASURED off the loaded template, never inferred from
+    // the architecture (see chat_template.supportsTools): a finetune that strips
+    // its tool branch would otherwise be handed a declaration that silently
+    // vanishes, and the model would look like it just refuses to call anything.
+    const tool_role_ok = ct.supportsToolRole(gpa);
+    if (llm.chat_template.tools) |decls| {
+        if (ct.supportsTools(gpa)) {
+            try stdout.print("[{d} tool(s) declared; the reply's calls are parsed back out, answer one with /tool <result>]\n", .{decls.len});
+        } else {
+            try stdout.writeAll("[warning: this model's chat template renders no tool declarations — --tools has no effect on it]\n");
+        }
+        try stdout.flush();
+    }
 
     var transcript: std.ArrayList(llm.chat_template.Message) = .empty;
     defer {
@@ -940,6 +1020,29 @@ fn renderDrivenChat(
         if (line.len == 0) continue;
         if (std.mem.eql(u8, line, "/exit")) break;
 
+        // `/tool <result>` replays a tool's OUTPUT as the next turn instead of a
+        // user message, so a real call/answer round trip can be driven by hand:
+        // this engine declares tools and parses the calls back out, but it
+        // executes nothing, and inventing an executor here would be guessing at
+        // what a caller wants run. Refused outright when the loaded template has
+        // no tool role — gemma3 RAISES on one, which would kill the render.
+        var is_tool_turn = false;
+        if (std.mem.startsWith(u8, line, "/tool")) {
+            const body = std.mem.trim(u8, line["/tool".len..], " \t");
+            if (!tool_role_ok) {
+                try stdout.writeAll("[this model's chat template has no tool role; send the result as an ordinary message]\n");
+                try stdout.flush();
+                continue;
+            }
+            if (body.len == 0) {
+                try stdout.writeAll("usage: /tool <what the tool returned>\n");
+                try stdout.flush();
+                continue;
+            }
+            try transcript.append(gpa, .{ .role = .tool, .content = try gpa.dupe(u8, body) });
+            is_tool_turn = true;
+        }
+
         // @image mentions: encode this turn's images now (on the session ViT)
         // and stage a multimodal user message; the ViT embeds are spliced in at
         // the image rows during prefill below. Only enabled when the arch has a
@@ -950,7 +1053,7 @@ fn renderDrivenChat(
             cur_imgs.deinit(gpa);
         }
         var used_parts = false;
-        if (exp != null and std.mem.indexOfScalar(u8, line, '@') != null) {
+        if (!is_tool_turn and exp != null and std.mem.indexOfScalar(u8, line, '@') != null) {
             var parts: std.ArrayList(llm.chat.Part) = .empty;
             defer parts.deinit(gpa);
             try llm.chat.parseImageMentions(gpa, line, &parts);
@@ -987,7 +1090,7 @@ fn renderDrivenChat(
                 used_parts = true;
             }
         }
-        if (!used_parts)
+        if (!used_parts and !is_tool_turn)
             try transcript.append(gpa, .{ .role = .user, .content = try gpa.dupe(u8, line) });
 
         // Collect every image's grid (transcript order) for the placeholder
@@ -1007,6 +1110,7 @@ fn renderDrivenChat(
             .eos_token = eos,
             .enable_thinking = llm.chat.enable_thinking,
             .add_generation_prompt = true,
+            .tools = llm.chat_template.tools,
         };
         if (exp) |e|
             try ct.renderIdsMM(tok, gpa, ropts, e, grids.items, &desired, &image_rows)
@@ -1037,6 +1141,17 @@ fn renderDrivenChat(
         }
         updateBoundary(model, gpa, &boundary);
 
+        // Does THIS render leave the reasoning block open? Measured from the
+        // prompt's tail (the template primes `…assistant\n<think>\n` when
+        // thinking is on), because it decides where the answer — and so where a
+        // real tool call, as opposed to one the model merely weighed — starts.
+        const primed = blk: {
+            const tail_n = @min(desired.items.len, 16);
+            const tail = tok.decodeAlloc(gpa, desired.items[desired.items.len - tail_n ..]) catch break :blk false;
+            defer gpa.free(tail);
+            break :blk llm.tool_call.endsInsideThought(tail, llm.chat.reasoning());
+        };
+
         const t0 = Io.Clock.real.now(io).nanoseconds;
         turn_opts.seed = seeds.next();
         var turn_timing: llm.engine.Timing = .{};
@@ -1059,6 +1174,7 @@ fn renderDrivenChat(
         const reply = try tok.decodeAlloc(gpa, desired.items[gen_start..]);
         try transcript.append(gpa, .{ .role = .assistant, .content = reply });
         total += n;
+        try reportToolCalls(gpa, reply, primed, tool_role_ok, stdout);
 
         const st = llm.session.Stats.of(model);
         const dt = @as(f64, @floatFromInt(Io.Clock.real.now(io).nanoseconds - t0)) / 1e9;

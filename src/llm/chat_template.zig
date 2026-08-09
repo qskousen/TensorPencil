@@ -24,14 +24,52 @@ pub const Role = enum {
     system,
     user,
     assistant,
+    /// A tool's RESULT, replayed so the model can see what its call returned.
+    /// ⚠️ Not every template accepts one: qwen3.5/Bonsai render it as a user
+    /// turn wrapped in `<tool_response>`, gemma4 resolves it back to the calling
+    /// function through `tool_call_id`, and **gemma3 raises** ("Conversation
+    /// roles must alternate user/assistant"). Probe with `supportsToolRole`
+    /// rather than assuming — the answer is a property of the loaded template.
+    tool,
 
     pub fn str(self: Role) []const u8 {
         return switch (self) {
             .system => "system",
             .user => "user",
             .assistant => "assistant",
+            .tool => "tool",
         };
     }
+};
+
+/// A function the model may call, rendered into the template's `tools` global
+/// as the OpenAI shape every chat template expects:
+/// `{"type":"function","function":{"name":…,"description":…,"parameters":…}}`.
+///
+/// `parameters_json` is JSON **text** rather than a Zig type because it *is* a
+/// JSON Schema — arbitrarily nested — and the templates emit it straight back
+/// out (`{{ tool | tojson }}`), so anything less than free-form JSON would
+/// silently truncate a caller's schema.
+pub const Tool = struct {
+    name: []const u8,
+    description: []const u8 = "",
+    /// JSON Schema **object** for the arguments, as JSON text.
+    parameters_json: []const u8 = "{}",
+};
+
+/// One call the assistant made, replayed on the next turn so the model sees its
+/// own request alongside the result. Sits on `Message.tool_calls`.
+pub const ToolCall = struct {
+    /// Correlates this call with the `.tool` message answering it. Emitted only
+    /// when non-empty: gemma4 resolves the *name* of the responding function
+    /// through it (`tc.get('id') == follow.get('tool_call_id')`), while
+    /// qwen3.5/Bonsai ignore it entirely.
+    id: []const u8 = "",
+    name: []const u8,
+    /// The arguments as a JSON **object**, in JSON text. A dict rather than a
+    /// string on purpose: the templates iterate it (`arguments | items`) to emit
+    /// one `<parameter=…>` block per key.
+    arguments_json: []const u8 = "{}",
 };
 
 /// An image's ViT token grid (its cache-row footprint is `grid_w*grid_h`).
@@ -54,6 +92,12 @@ pub const Message = struct {
     role: Role,
     content: []const u8 = "",
     parts: ?[]const Part = null,
+    /// Calls this (assistant) message made. Rendered as the template's trained
+    /// tool-call format; `content` carries whatever prose came with them.
+    tool_calls: ?[]const ToolCall = null,
+    /// On a `.tool` message: which `ToolCall.id` this result answers. Emitted
+    /// only when non-empty (see `ToolCall.id`).
+    tool_call_id: []const u8 = "",
 };
 
 /// How a family's single image-placeholder token expands into the real image
@@ -126,6 +170,10 @@ pub const RenderOpts = struct {
     /// The model's EOS string (Mistral/llama templates emit `{{ eos_token }}`
     /// to close each assistant turn); "" for none.
     eos_token: []const u8 = "",
+    /// Functions the model may call. Null leaves `tools` **undefined**, which is
+    /// what every template tests (`{%- if tools %}`) — so a caller that declares
+    /// none renders byte-identically to one that never knew about tools.
+    tools: ?[]const Tool = null,
 };
 
 pub const ChatTemplate = struct {
@@ -207,6 +255,48 @@ pub const ChatTemplate = struct {
         }
         if (k != grids.len) return error.ChatTemplateImageMismatch;
     }
+
+    // --- capability probes --------------------------------------------------
+    // Both are MEASURED by rendering, never inferred from the architecture. A
+    // template either has a `{% if tools %}` branch and a `role == "tool"` arm
+    // or it does not, and the loaded template is the only thing that knows:
+    // gemma3 raises on a tool turn, plain llama concatenates any role verbatim,
+    // qwen3.5/Bonsai and gemma4 each render their own trained format. A name
+    // list would be wrong for the first finetune that strips its tool support.
+
+    const probe_fn = "tp_probe_fn_9a3";
+    const probe_result = "tp_probe_result_9a3";
+
+    /// Whether declaring `RenderOpts.tools` actually reaches the model.
+    pub fn supportsTools(self: *const ChatTemplate, gpa: std.mem.Allocator) bool {
+        const msgs = [_]Message{.{ .role = .user, .content = "hi" }};
+        return self.probeContains(gpa, &.{
+            .messages = &msgs,
+            .tools = &.{.{ .name = probe_fn, .description = "probe" }},
+        }, probe_fn);
+    }
+
+    /// Whether a `.tool` message can be replayed — the template renders one
+    /// without raising AND its content survives into the prompt.
+    pub fn supportsToolRole(self: *const ChatTemplate, gpa: std.mem.Allocator) bool {
+        const calls = [_]ToolCall{.{ .id = "probe1", .name = probe_fn }};
+        const msgs = [_]Message{
+            .{ .role = .user, .content = "hi" },
+            .{ .role = .assistant, .tool_calls = &calls },
+            .{ .role = .tool, .content = probe_result, .tool_call_id = "probe1" },
+        };
+        return self.probeContains(gpa, &.{
+            .messages = &msgs,
+            .tools = &.{.{ .name = probe_fn, .description = "probe" }},
+        }, probe_result);
+    }
+
+    fn probeContains(self: *const ChatTemplate, gpa: std.mem.Allocator, opts: *const RenderOpts, needle: []const u8) bool {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(gpa);
+        self.renderString(gpa, opts.*, &out) catch return false;
+        return std.mem.indexOf(u8, out.items, needle) != null;
+    }
 };
 
 // Process-global active template + its BOS string and the session system
@@ -217,6 +307,45 @@ pub var active: ?ChatTemplate = null;
 pub var bos: []const u8 = "";
 pub var eos: []const u8 = "";
 pub var system_prompt: ?[]const u8 = null;
+/// Functions declared to the model for this session (`--tools`), or null.
+pub var tools: ?[]const Tool = null;
+
+/// Parse an OpenAI-style tools declaration (JSON text) into `Tool`s, allocated
+/// in `a` — what a `--tools file.json` flag or an API request body carries.
+///
+/// Both spellings in the wild are accepted, since the file is written by hand as
+/// often as it is copied from an API payload:
+///   - wrapped:  `[{"type":"function","function":{"name":…,"parameters":{…}}}]`
+///   - bare:     `[{"name":…,"description":…,"parameters":{…}}]`
+/// A single object rather than an array is taken as a one-element list.
+pub fn parseTools(a: std.mem.Allocator, json_text: []const u8) ![]Tool {
+    const root = std.json.parseFromSliceLeaky(std.json.Value, a, json_text, .{}) catch
+        return error.InvalidToolJson;
+    const items: []const std.json.Value = switch (root) {
+        .array => |arr| arr.items,
+        .object => (try a.dupe(std.json.Value, &.{root})),
+        else => return error.InvalidToolJson,
+    };
+    var out = try a.alloc(Tool, items.len);
+    for (items, 0..) |it, k| {
+        if (it != .object) return error.InvalidToolJson;
+        // The wrapped form nests everything under "function"; the bare form is
+        // the same object one level up.
+        const f = if (it.object.get("function")) |fv| blk: {
+            if (fv != .object) return error.InvalidToolJson;
+            break :blk fv;
+        } else it;
+        const name = f.object.get("name") orelse return error.InvalidToolJson;
+        if (name != .string) return error.InvalidToolJson;
+        const desc = if (f.object.get("description")) |d| (if (d == .string) d.string else "") else "";
+        const params = if (f.object.get("parameters")) |p|
+            try std.json.Stringify.valueAlloc(a, p, .{})
+        else
+            "{}";
+        out[k] = .{ .name = name.string, .description = desc, .parameters_json = params };
+    }
+    return out;
+}
 
 fn mapErr(e: jinja.Error) anyerror {
     return switch (e) {
@@ -257,6 +386,14 @@ fn buildGlobals(a: std.mem.Allocator, opts: RenderOpts) !jinja.Value {
         } else {
             try d.put(a, "content", .{ .str = m.content });
         }
+        if (m.tool_calls) |calls| if (calls.len > 0) {
+            const list = try a.create(jinja.List);
+            list.* = .{};
+            for (calls) |c| try list.items.append(a, try toolCallValue(a, c));
+            try d.put(a, "tool_calls", .{ .list = list });
+        };
+        // Absent (not empty-string) when unset: templates test `is defined`.
+        if (m.tool_call_id.len > 0) try d.put(a, "tool_call_id", .{ .str = m.tool_call_id });
         try msgs.items.append(a, .{ .dict = d });
     }
     const g = try a.create(jinja.Dict);
@@ -266,7 +403,54 @@ fn buildGlobals(a: std.mem.Allocator, opts: RenderOpts) !jinja.Value {
     try g.put(a, "enable_thinking", .{ .boolean = opts.enable_thinking });
     try g.put(a, "bos_token", .{ .str = opts.bos_token });
     try g.put(a, "eos_token", .{ .str = opts.eos_token });
+    if (opts.tools) |decls| {
+        const list = try a.create(jinja.List);
+        list.* = .{};
+        for (decls) |t| try list.items.append(a, try toolValue(a, t));
+        try g.put(a, "tools", .{ .list = list });
+    }
     return .{ .dict = g };
+}
+
+/// Parse a caller-supplied JSON blob (a schema or an argument object) into a
+/// jinja value. Reported as `error.InvalidToolJson` rather than a std.json
+/// error, so a caller can tell "your tool declaration is malformed" from "the
+/// template failed to render".
+fn jsonValue(a: std.mem.Allocator, text: []const u8) !jinja.Value {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}) catch
+        return error.InvalidToolJson;
+    return jinja.fromJson(a, parsed) catch |e| mapErr(e);
+}
+
+/// `{"type":"function","function":{"name":…,"description":…,"parameters":…}}`.
+/// ⚠️ The key ORDER is load-bearing: qwen3.5/Bonsai emit the declaration with
+/// `{{ tool | tojson }}`, so it reaches the model exactly as inserted here.
+fn toolValue(a: std.mem.Allocator, t: Tool) !jinja.Value {
+    const params = try jsonValue(a, t.parameters_json);
+    const f = try a.create(jinja.Dict);
+    f.* = .{};
+    try f.put(a, "name", .{ .str = t.name });
+    try f.put(a, "description", .{ .str = t.description });
+    try f.put(a, "parameters", params);
+    const d = try a.create(jinja.Dict);
+    d.* = .{};
+    try d.put(a, "type", .{ .str = "function" });
+    try d.put(a, "function", .{ .dict = f });
+    return .{ .dict = d };
+}
+
+fn toolCallValue(a: std.mem.Allocator, c: ToolCall) !jinja.Value {
+    const args = try jsonValue(a, c.arguments_json);
+    const f = try a.create(jinja.Dict);
+    f.* = .{};
+    try f.put(a, "name", .{ .str = c.name });
+    try f.put(a, "arguments", args);
+    const d = try a.create(jinja.Dict);
+    d.* = .{};
+    if (c.id.len > 0) try d.put(a, "id", .{ .str = c.id });
+    try d.put(a, "type", .{ .str = "function" });
+    try d.put(a, "function", .{ .dict = f });
+    return .{ .dict = d };
 }
 
 // ---------------------------------------------------------------------------
@@ -307,6 +491,228 @@ const mistral_v3_src =
     \\    {%- endif %}
     \\{%- endfor %}
 ;
+
+// tp_core's jinja golden corpus: every `expected` in it was rendered by REAL
+// jinja2 (`tools/gen_jinja_fixtures.py`). Reusing the Bonsai tool cases here
+// tests the one thing those goldens cannot — that the TYPED API above builds
+// the same context jinja2 was handed. Embedded (not read from disk) so the test
+// does not depend on the cwd; test-only, so it costs shipped binaries nothing.
+const jinja_fixtures_json = @embedFile("../core/assets/jinja/fixtures.json");
+
+/// The named template's source out of the golden corpus, in `a`.
+fn fixtureTemplate(a: std.mem.Allocator, name: []const u8) ![]const u8 {
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a, jinja_fixtures_json, .{});
+    return root.object.get("templates").?.object.get(name).?.string;
+}
+
+/// The named case's jinja2-rendered `expected` output, in `a`.
+fn fixtureExpected(a: std.mem.Allocator, key: []const u8) ![]const u8 {
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a, jinja_fixtures_json, .{});
+    for (root.object.get("cases").?.array.items) |c| {
+        if (std.mem.eql(u8, c.object.get("key").?.string, key))
+            return c.object.get("expected").?.string;
+    }
+    return error.TestUnexpectedResult;
+}
+
+// The end-to-end proof for pieces (1) and (2) of the tool work: `Tool`,
+// `ToolCall` and the `.tool` role, rendered through Bonsai's REAL embedded
+// template, must reproduce jinja2's output byte for byte. The case is chosen
+// because its argument values (bool, null, dict, list, int, string) are exactly
+// the ones where the template's own `args_value` spellings disagree — so a
+// wrongly-typed argument (e.g. arguments handed over as a JSON *string*, the
+// OpenAI wire shape) cannot pass.
+test "chat_template: tools + tool_calls + the tool role render byte-exact vs jinja2 (Bonsai)" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var ct = try ChatTemplate.fromSource(gpa, try fixtureTemplate(a, "bonsai"));
+    defer ct.deinit();
+
+    const calls = [_]ToolCall{.{
+        .name = "get_weather",
+        .arguments_json =
+        \\{"city": "Paris", "opts": {"units": "c"}, "days": [1, 2],
+        \\ "count": 3, "verbose": true, "note": null}
+        ,
+    }};
+    const msgs = [_]Message{
+        .{ .role = .user, .content = "Hello" },
+        .{ .role = .assistant, .tool_calls = &calls },
+        .{ .role = .tool, .content = "18C" },
+    };
+    const decls = [_]Tool{.{
+        .name = "get_weather",
+        .description = "Look up the weather.",
+        .parameters_json =
+        \\{"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
+        ,
+    }};
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try ct.renderString(gpa, .{ .messages = &msgs, .tools = &decls }, &out);
+    try std.testing.expectEqualStrings(try fixtureExpected(a, "bonsai__tool_call_args"), out.items);
+}
+
+// The two halves must be INVERSES: what the model emits, parsed by
+// `tool_call.zig` and replayed as a `ToolCall`, has to re-render as the same
+// block — or the model sees a garbled version of its own request one turn later.
+// Rendering with a REAL template rather than a hand-written block is the point:
+// it is the template that decides how an argument is stringified.
+test "chat_template: a rendered tool call parses back to the arguments it was built from" {
+    const tool_call = @import("tool_call.zig");
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var ct = try ChatTemplate.fromSource(gpa, try fixtureTemplate(a, "bonsai"));
+    defer ct.deinit();
+
+    const args =
+        \\{"city": "Paris", "opts": {"units": "c"}, "days": [1, 2], "count": 3, "verbose": true, "note": null}
+    ;
+    const calls = [_]ToolCall{.{ .name = "get_weather", .arguments_json = args }};
+    const msgs = [_]Message{
+        .{ .role = .user, .content = "Weather?" },
+        .{ .role = .assistant, .tool_calls = &calls },
+    };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try ct.renderString(gpa, .{ .messages = &msgs, .add_generation_prompt = false }, &out);
+
+    const blk = switch (tool_call.nextBlock(out.items)) {
+        .block => |b| b,
+        else => return error.TestUnexpectedResult,
+    };
+    var got = try tool_call.parse(gpa, blk.body);
+    defer got.deinit(gpa);
+    try std.testing.expectEqualStrings("get_weather", got.name);
+    try std.testing.expectEqualStrings(args, got.arguments_json);
+}
+
+// Declaring no tools must leave `tools` UNDEFINED, so a caller that never heard
+// of tool calling renders exactly what it always did. (The templates all test
+// `{%- if tools %}`, and an empty list would take the same branch — but a `[]`
+// that some future template `| length`s or joins would not.)
+test "chat_template: no tools declared renders identically to before tools existed" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var ct = try ChatTemplate.fromSource(gpa, try fixtureTemplate(a, "bonsai"));
+    defer ct.deinit();
+    const msgs = [_]Message{.{ .role = .user, .content = "Hello" }};
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try ct.renderString(gpa, .{ .messages = &msgs }, &out);
+    try std.testing.expectEqualStrings(try fixtureExpected(a, "bonsai__user_only__default"), out.items);
+}
+
+// ⚠️ The load-bearing half of "gemma3 has no tool role": it raises on an
+// INSERTED TURN OF ANY ROLE, not just on `tool`. So the obvious fallback for a
+// tool result on such a model — slip it in as an extra user message — kills
+// every render from that point on. Any caller adding a turn the user did not
+// type needs this: the failure is a dead render, not a degraded one.
+test "chat_template: gemma3 raises on any inserted turn, whatever its role" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var ct = try ChatTemplate.fromSource(gpa, try fixtureTemplate(arena.allocator(), "gemma3"));
+    defer ct.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+
+    // The alternating baseline renders.
+    const ok = [_]Message{
+        .{ .role = .user, .content = "draw a fox" },
+        .{ .role = .assistant, .content = "here" },
+        .{ .role = .user, .content = "thanks" },
+    };
+    try ct.renderString(gpa, .{ .messages = &ok }, &out);
+    // One extra turn between them does not — as a tool result OR as a user one.
+    for ([_]Role{ .tool, .user }) |r| {
+        const bad = [_]Message{
+            .{ .role = .user, .content = "draw a fox" },
+            .{ .role = .assistant, .content = "here" },
+            .{ .role = r, .content = "image 1: FAILED" },
+            .{ .role = .user, .content = "thanks" },
+        };
+        out.clearRetainingCapacity();
+        try std.testing.expectError(error.ChatTemplateRender, ct.renderString(gpa, .{ .messages = &bad }, &out));
+    }
+}
+
+// Both declaration spellings must reach the model identically — a hand-written
+// tools file uses the bare form, an API payload the wrapped one, and a user who
+// copies the wrong one would otherwise get a silently tool-less prompt.
+test "chat_template: parseTools accepts the bare and the wrapped declaration" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const bare =
+        \\[{"name": "get_weather", "description": "Look up the weather.",
+        \\  "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]
+    ;
+    const wrapped =
+        \\[{"type": "function", "function": {"name": "get_weather", "description": "Look up the weather.",
+        \\  "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
+    ;
+    var ct = try ChatTemplate.fromSource(gpa, try fixtureTemplate(a, "bonsai"));
+    defer ct.deinit();
+    const msgs = [_]Message{.{ .role = .user, .content = "Hello" }};
+
+    var a_out: std.ArrayList(u8) = .empty;
+    defer a_out.deinit(gpa);
+    var b_out: std.ArrayList(u8) = .empty;
+    defer b_out.deinit(gpa);
+    try ct.renderString(gpa, .{ .messages = &msgs, .tools = try parseTools(a, bare) }, &a_out);
+    try ct.renderString(gpa, .{ .messages = &msgs, .tools = try parseTools(a, wrapped) }, &b_out);
+    try std.testing.expectEqualStrings(a_out.items, b_out.items);
+    // And both are the jinja2 golden for that declaration, so neither spelling
+    // is merely "consistently wrong".
+    try std.testing.expectEqualStrings(try fixtureExpected(a, "bonsai__tools_decl"), a_out.items);
+
+    try std.testing.expectError(error.InvalidToolJson, parseTools(a, "[{\"description\": \"no name\"}]"));
+    try std.testing.expectError(error.InvalidToolJson, parseTools(a, "not json"));
+}
+
+// ⚠️ The capability is a property of the TEMPLATE, not of the architecture, and
+// gemma3 is the case that makes it matter: it raises `Conversation roles must
+// alternate user/assistant` on a tool turn, so a caller that assumes every
+// model can take one kills the render. Pinned in both directions so neither
+// probe can silently start answering "yes" to everything.
+test "chat_template: tool support is measured per template (gemma3 refuses)" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    for ([_][]const u8{ "bonsai", "qwen35", "gemma4" }) |name| {
+        var ct = try ChatTemplate.fromSource(gpa, try fixtureTemplate(a, name));
+        defer ct.deinit();
+        errdefer std.debug.print("template {s}\n", .{name});
+        try std.testing.expect(ct.supportsTools(gpa));
+        try std.testing.expect(ct.supportsToolRole(gpa));
+    }
+    // gemma3 has neither a tools branch nor a tool role — and RAISES on the
+    // latter, which is why the probe renders instead of pattern-matching a name.
+    var g3 = try ChatTemplate.fromSource(gpa, try fixtureTemplate(a, "gemma3"));
+    defer g3.deinit();
+    try std.testing.expect(!g3.supportsTools(gpa));
+    try std.testing.expect(!g3.supportsToolRole(gpa));
+    // Plain llama has no tools branch either; its bare role loop does echo a
+    // tool turn, which is exactly why the two probes are separate questions.
+    var ll = try ChatTemplate.fromSource(gpa, try fixtureTemplate(a, "llama"));
+    defer ll.deinit();
+    try std.testing.expect(!ll.supportsTools(gpa));
+}
 
 test "chat_template: Mistral v3 [INST] template renders byte-exact vs jinja2" {
     const gpa = std.testing.allocator;

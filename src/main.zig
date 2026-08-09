@@ -245,7 +245,8 @@ pub fn main(init: std.process.Init) !void {
             \\                         pipeline on the pure-Zig hand-PTX CUDA
             \\                         backend; cuda runs it on NVIDIA's dlopen'd
             \\                         cuBLASLt/cuDNN kernels (both take an fp8 /
-            \\                         int8|int4 convrot / dense bf16 --dit ckpt)
+            \\                         int8|int4 convrot / w4a8 / dense bf16
+            \\                         --dit ckpt)
             \\      --vram-budget 0    GiB of device memory to use (0 = ask the
             \\                         driver); weights past it stream per step.
             \\                         "min" holds only the in-flight weights
@@ -259,7 +260,12 @@ pub fn main(init: std.process.Init) !void {
             \\                         instead of the f16 tensor-core path
             \\                         (slower, more exact) (on/off)
             \\      --dit <path>       diffusion checkpoint (fp8 / int8 / int4
-            \\                         convrot / dense bf16; auto-detected). The
+            \\                         convrot / asym_w4a8_int8 / nvfp4 / dense
+            \\                         bf16; auto-detected). w4a8 and nvfp4 keep
+            \\                         4-bit weights resident and decode per GEMM
+            \\                         (w4a8 -> int8, nvfp4 -> f16, so nvfp4 is
+            \\                         ~2x slower at the same VRAM on pre-
+            \\                         Blackwell cards). The
             \\                         "model.diffusion_model." key prefix is also
             \\                         auto-detected. Default: krea2 Fp8
             \\      --vae <path>       VAE decoder checkpoint
@@ -364,7 +370,7 @@ fn gpuI8Test(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
         const flops: f64 = 2.0 * @as(f64, @floatFromInt(m * n * k));
         for (0..iters) |it| {
             const start = std.Io.Clock.real.now(io);
-            try ctx.opMatmulCoopI8(y_d, x_d, m, wb, n, k);
+            try ctx.opMatmulCoopI8(y_d, x_d, m, null, wb, n, k);
             const end = std.Io.Clock.real.now(io);
             const ns: f64 = @floatFromInt(end.nanoseconds - start.nanoseconds);
             if (!c.check) {
@@ -526,7 +532,7 @@ fn gpuI8Test(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
             try ctx.tensorUpload(x_d, xb);
             try ctx.tensorUpload(s_d, std.mem.sliceAsBytes(scat));
 
-            const ok = try ctx.opMatmulCoopI8Fused(y_d, x_d, m, wb, rows, cols, s_d.buf, false);
+            const ok = try ctx.opMatmulCoopI8Fused(y_d, x_d, m, null, wb, rows, cols, s_d.buf, false);
             if (!ok) {
                 try stdout.print("fused i8 {d}x{d}x{d}: not dispatched (shape/pipe)\n", .{ m, rows, cols });
                 continue;
@@ -1942,8 +1948,7 @@ fn zimageCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []
         if (!ok) failures += 1;
         try stdout.print("forward vs CPU ({s:<11})  rel L2 {e:.4}  {s}{s}\n", .{
             if (naive) "naive attn" else "opAttnTC", rel,
-            if (ok) "ok" else "FAILED",
-            if (nonfinite != 0) " (non-finite output)" else "",
+            if (ok) "ok" else "FAILED",              if (nonfinite != 0) " (non-finite output)" else "",
         });
     }
     // --- the VAE decode ---------------------------------------------------------
@@ -2306,7 +2311,9 @@ fn vkNormBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
     for (cases) |c| {
         const bytes = @as(f64, @floatFromInt(c.rows * c.dim)) * 4 * 2; // read + write
         const thr = try T.run(gpu.Context.opElt, .{ ctx, gpu.Elt.rmsnorm, x_d, @as(?gpu.DeviceBuffer, y_d), @as(?gpu.DeviceBuffer, w_d), @as(?gpu.DeviceBuffer, null), gpu.EltPush{
-            .u0 = @intCast(c.rows), .u1 = @intCast(c.dim), .f0 = 1e-6,
+            .u0 = @intCast(c.rows),
+            .u1 = @intCast(c.dim),
+            .f0 = 1e-6,
         }, c.rows, @as(usize, 1), @as(usize, 1) });
         const sub = try T.run(gpu.Context.opRmsNormSg, .{ ctx, x_d, y_d, w_d, c.rows, c.dim, @as(f32, 1e-6) });
         try stdout.print("{s} {d:6}x{d:<4} {d:7.2} ms {d:4.0} GB/s {d:7.2} ms {d:4.0} GB/s {d:6.1}x  {d:6.0} -> {d:4.0} ms\n", .{
@@ -2468,7 +2475,9 @@ fn animaVkBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, seq: usize
     // read against it. Outside a batch each op is its own submit+fence, and a render
     // BATCHES — so an op whose time is close to this floor is being measured, not timed.
     const floor = try T.run(64, gpu.Context.opElt, .{ ctx, gpu.Elt.copy, x_d, @as(?gpu.DeviceBuffer, y_d), @as(?gpu.DeviceBuffer, null), @as(?gpu.DeviceBuffer, null), gpu.EltPush{
-        .u0 = 256, .u2 = 0, .u3 = 0,
+        .u0 = 256,
+        .u2 = 0,
+        .u3 = 0,
     }, @as(usize, 256), @as(usize, 1), @as(usize, 1) });
     try stdout.print("\n-- submit+fence floor (a 256-element copy): {d:.3} ms/op --\n", .{floor});
     try stdout.print("   Subtract it to judge a kernel; a batched render pays it ~once per 512 dispatches.\n", .{});
@@ -2547,13 +2556,20 @@ fn animaVkBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, seq: usize
     {
         const ln = try T.run(iters, gpu.Context.opLnModSg, .{ ctx, x_d, y_d, mod_d, seq, d, @as(usize, d), @as(usize, 0), cfg.norm_eps });
         const ga = try T.run(iters, gpu.Context.opElt, .{ ctx, gpu.Elt.gated_add, x_d, @as(?gpu.DeviceBuffer, y_d), @as(?gpu.DeviceBuffer, mod_d), @as(?gpu.DeviceBuffer, null), gpu.EltPush{
-            .u0 = @intCast(seq * d), .u1 = @intCast(d), .u2 = 0,
+            .u0 = @intCast(seq * d),
+            .u1 = @intCast(d),
+            .u2 = 0,
         }, seq * d, @as(usize, 1), @as(usize, 1) });
         const qn = try T.run(iters, gpu.Context.opElt, .{ ctx, gpu.Elt.rmsnorm, x_d, @as(?gpu.DeviceBuffer, x_d), @as(?gpu.DeviceBuffer, nrm_d), @as(?gpu.DeviceBuffer, null), gpu.EltPush{
-            .u0 = @intCast(seq * heads), .u1 = @intCast(hd), .f0 = cfg.qk_eps,
+            .u0 = @intCast(seq * heads),
+            .u1 = @intCast(hd),
+            .f0 = cfg.qk_eps,
         }, seq * heads, @as(usize, 1), @as(usize, 1) });
         const rp = try T.run(iters, gpu.Context.opElt, .{ ctx, gpu.Elt.rope_half, x_d, @as(?gpu.DeviceBuffer, null), @as(?gpu.DeviceBuffer, frq_d), @as(?gpu.DeviceBuffer, null), gpu.EltPush{
-            .u0 = @intCast(seq * heads * half), .u1 = @intCast(half), .u2 = @intCast(seq * half), .u3 = @intCast(heads),
+            .u0 = @intCast(seq * heads * half),
+            .u1 = @intCast(half),
+            .u2 = @intCast(seq * half),
+            .u3 = @intCast(heads),
         }, seq * heads * half, @as(usize, 1), @as(usize, 1) });
         const gl = try T.run(iters, gpu.Context.opElt, .{ ctx, gpu.Elt.gelu_erf, x_d, @as(?gpu.DeviceBuffer, null), @as(?gpu.DeviceBuffer, null), @as(?gpu.DeviceBuffer, null), gpu.EltPush{
             .u0 = @intCast(seq * mlp),
@@ -2744,11 +2760,19 @@ fn animaCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []c
     // A quantized Anima file leaves block 0 dense and quantizes block 1 onward, so depth 1
     // measures the dense pipeline alone and depth 2 adds exactly one quantized block. Two
     // numbers separate "the port is wrong" from "int8 changes the answer", which one number
-    // cannot. Truncating at all is because a full-depth CPU reference forward takes minutes
-    // and depth adds no new WIRING — which third of the modulation table each sublayer
-    // reads, whether RoPE applies, whether the cached cross K/V line up. The end-to-end
-    // render covers the loop bound.
-    for ([_]usize{ 1, 2 }) |depth| {
+    // cannot.
+    //
+    // ⚠️ **The deeper points exist because "depth adds no new WIRING" was WRONG, and
+    // believing it cost a real bug.** That claim justified stopping at 2, and it hid the
+    // `opI4Prep` word-count truncation for as long as it existed: at depth 2 the broken
+    // int4 kernel reads 3.86e-2, which is exactly int4's expected coarseness, so the one
+    // number that was measured looked perfect. What a defect like that changes is the
+    // SHAPE of the curve, not its first point — int8 and W4A8 stay flat from 2 to 28
+    // (2.1e-3 -> 7-9e-3) while broken int4 climbed 3.9e-2 -> 5.2e-1 and healthy int4 is
+    // flat at ~3.9e-2. **A single depth cannot distinguish "coarse" from "accumulating",
+    // and that distinction is the whole diagnostic.** Cheap: the deep CPU reference at a
+    // 24x32 latent is seconds.
+    for ([_]usize{ 1, 2, 8, 28 }) |depth| {
         var cfg = anima.anima_2b;
         cfg.n_layers = depth;
         var model = try anima.DiT.load(arena, .{ .safetensors = &ck }, cfg);
@@ -2816,11 +2840,32 @@ fn animaForwardCheck(
     // (3.80e-2 against 2.09e-3) — a quantization-coarseness signature, not a wiring
     // error, which would not scale with the level count. Both attention arms agree to
     // three digits at both dtypes, so it is not attention either.
-    const tol: f64 = switch (qdt orelse .f32) {
+    // ⚠️ **W4A8 takes int8's bound because it IS int8 on the device**, not because the
+    // dense one failed. Its decode emits int8-convrot values that then run `opI8Prep` +
+    // the same int8 GEMM, so its residual against the same weight-only f32 reference must
+    // land where int8's does — and the isolation says it does: the SAME model quantized
+    // both ways measures **2.0721e-3 (int8) against 2.0968e-3 (w4a8)**, a 1.2% gap, with
+    // both attention arms agreeing to three digits and depth-1 dense bit-identical across
+    // the two files. Giving it the dense `else` bound (1e-3) fails a correct
+    // implementation, which is what it did on the first W4A8 Anima checkpoint.
+    // ⚠️ **The bound grows with depth, and the growth factor is MEASURED, not chosen to
+    // make the deep points pass.** Every healthy arm accumulates by the same ~4x from
+    // depth 2 to depth 28 — int8 2.07e-3 -> 7.34e-3, W4A8 2.10e-3 -> 8.91e-3, int4
+    // 3.80e-2 -> 1.59e-1 — so `1 + depth/8` (1.25x at depth 2, 4.5x at 28) tracks the
+    // real curve with roughly 3x headroom at every point.
+    //
+    // ⚠️ **Verified to still have teeth at the depth that matters**, which is the only
+    // thing that makes a depth-scaled bound honest: the `opI4Prep` truncation bug read
+    // 2.96e-1 at depth 8 against this rule's 1.2e-1 (FAIL) and 5.2e-1 at depth 12. It
+    // would have PASSED a bound keyed on depth 28 alone (2.13e-1 against 2.7e-1), because
+    // that defect saturates rather than diverging — which is exactly why the sweep runs
+    // intermediate depths and not just the endpoints.
+    const base: f64 = switch (qdt orelse .f32) {
         .i4 => 6e-2,
-        .i8 => 6e-3,
+        .i8, .w4a8 => 6e-3,
         else => if (depth == 1) 2.5e-3 else 1e-3,
     };
+    const tol: f64 = base * (1.0 + @as(f64, @floatFromInt(depth)) / 8.0);
     var failures: usize = 0;
     const saved = anima_cuda.force_naive_attn;
     defer anima_cuda.force_naive_attn = saved;
@@ -3020,9 +3065,22 @@ fn zimageCudaBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, seq: us
     // which of them is far from the 936 GB/s the card can do, and a single total
     // averages the answer away.
     const ea = .{
-        .x = y, .nrm = nrm, .mv = mv, .q = q, .k = kk, .nw = nw, .frq = frq,
-        .mg = mg, .mu = mu, .seq = seq, .dim = cfg.dim, .mlp = cfg.mlp_dim,
-        .h = heads, .hd = hd, .zoff = blocks * 4 * cfg.dim - cfg.dim, .nb = blocks,
+        .x = y,
+        .nrm = nrm,
+        .mv = mv,
+        .q = q,
+        .k = kk,
+        .nw = nw,
+        .frq = frq,
+        .mg = mg,
+        .mu = mu,
+        .seq = seq,
+        .dim = cfg.dim,
+        .mlp = cfg.mlp_dim,
+        .h = heads,
+        .hd = hd,
+        .zoff = blocks * 4 * cfg.dim - cfg.dim,
+        .nb = blocks,
     };
     const E = struct {
         // ⚠️ Each is the exact call `zimage_cuda.blockForward` makes, per block.

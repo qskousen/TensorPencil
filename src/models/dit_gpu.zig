@@ -32,6 +32,10 @@ const Prof = struct {
     aout_ns: i96 = 0,
     elt_ns: i96 = 0,
     prep_ns: i96 = 0, // int8 rotate/rowscale/quantize prep (opI8Prep)
+    // Packed W4A8 -> k-major int8 decode (w4a8_decode_t), its own category because it
+    // is a per-GEMM cost that buys VRAM and has a bandwidth ceiling to be judged
+    // against — folded into `matmul` it would just look like a slower GEMM.
+    w4a8_ns: i96 = 0,
     xfer_ns: i96 = 0,
     cpu_ns: i96 = 0,
 };
@@ -155,6 +159,39 @@ pub const Session = struct {
         return null;
     }
 };
+
+/// Accumulate the time since `m` into `bucket` and restamp. Only meaningful when the
+/// forward is NOT batching (`--profile on`), where each op is submit-and-wait; inside a
+/// recording batch it would time recording, not execution.
+fn lapNs(io_: std.Io, m: *std.Io.Timestamp, bucket: *i96) void {
+    const now = std.Io.Clock.real.now(io_);
+    bucket.* += now.nanoseconds - m.nanoseconds;
+    m.* = now;
+}
+
+/// One int8-convrot GEMM, dispatching on how the weight is STORED: plain int8 goes
+/// straight to the GEMM, a packed W4A8 weight is decoded (and k-major transposed) into
+/// the context's transient scratch first. Both then run the identical int8 kernel —
+/// W4A8's "A8" is precisely that the activation stays 8-bit.
+///
+/// Per weight rather than per model, so a checkpoint that mixes the two storage forms
+/// computes correctly even where `is_i8` is decided from one block.
+fn i8GemmW(io: std.Io, prof: *Prof, t_mark: *std.Io.Timestamp, ctx: *gpu.Context, y: gpu.DeviceBuffer, w: ops.matmul.Weight, c_h16: bool) !void {
+    if (w.dtype == .w4a8) {
+        const meta = w.w4a8.?;
+        const wbuf = try ctx.w4a8Decode(
+            w.bytes,
+            meta.s_rel,
+            std.mem.asBytes(meta.levels),
+            w.rows,
+            w.cols,
+            meta.group_size,
+        );
+        lapNs(io, t_mark, &prof.w4a8_ns);
+        return ctx.opI8GemmBuf(y, wbuf, &.{}, w.row_scale.?, w.rows, c_h16);
+    }
+    return ctx.opI8Gemm(y, w.bytes, w.row_scale.?, w.rows, c_h16);
+}
 
 /// Per-run device activation buffers, allocated once and reused every step
 /// (a forward used to create/destroy ~20 buffers per call — including the
@@ -284,6 +321,19 @@ pub fn forward(
     // exactly what happened once `pipeline` learned to open a GGUF — the path
     // became reachable, so it needs the refusal.
     if (!dit.gpuLinKindSupported(model.blocks[0].attn.wq.dtype)) return error.UnsupportedCheckpoint;
+    // ⚠️ A packed W4A8 weight is `[rows][cols/2]` bytes, and the `else` arm below feeds
+    // anything it does not recognize to the fp8 GEMM — the same shape as the GGUF blank
+    // image this gate already exists for. `is_i8` covers it now, but keep the explicit
+    // refusal so a future storage form cannot reach that arm by default.
+    if (!ctx.hasW4A8Decode() and dit.anyW4A8(model)) return error.UnsupportedCheckpoint;
+    if (!ctx.hasNvfp4Decode() and dit.anyNvfp4(model)) return error.UnsupportedCheckpoint;
+    if (dit.anyNvfp4(model))
+        try ctx.ensureDeviceBuffer(&ctx.nvfp4_w16, dit.maxNvfp4Scratch(model, gpu.Context.nvfp4ScratchBytes));
+    // Pre-size the W4A8 decode scratch to the model's widest weight BEFORE the batch
+    // opens. ⚠️ Growing it mid-forward is *safe* (Vulkan's `ensureDeviceBuffer` flushes
+    // the recording batch first) but costs a submit-and-wait per growth, and the first
+    // block would pay several — the exact hazard BACKEND.md records for the SD VAE.
+    if (dit.anyW4A8(model)) try ctx.ensureDeviceBuffer(&ctx.w4a8_t, dit.maxW4A8Scratch(model, gpu.Context.w4a8ScratchBytes));
 
     const lat_h = sess.lat_h;
     const lat_w = sess.lat_w;
@@ -308,13 +358,7 @@ pub fn forward(
     const coop = !force_f32 and !probing and ctx.pipe_coop != .null_handle;
     var prof: Prof = .{};
     var t_mark = std.Io.Clock.real.now(io);
-    const mark = struct {
-        fn lap(io_: std.Io, m: *std.Io.Timestamp, bucket: *i96) void {
-            const now = std.Io.Clock.real.now(io_);
-            bucket.* += now.nanoseconds - m.nanoseconds;
-            m.* = now;
-        }
-    }.lap;
+    const mark = lapNs;
 
     // CPU: timestep vectors (cached in the session for schedule sigmas) and
     // per-block modulation (tvec + block offset).
@@ -440,7 +484,25 @@ pub fn forward(
             // Dense bf16 weights run through the f16-weight tensor-core GEMM
             // (bf16 -> f16 at upload); its f32 output matches opMatmulCoop, so
             // the surrounding f32-operand attention/mlp path is unchanged.
-            if (w_.dtype == .bf16) {
+            // ⚠️ NVFP4 must be handled BEFORE the `else` arms: `opMatmulCoop` reads a
+            // 1-byte weight as raw e4m3, so a packed NVFP4 weight would decode as fp8 and
+            // render a blank image with no error — the same failure this file records for
+            // a GGUF block quant. Weight-only here (its activation quantization is the
+            // Blackwell path), so it feeds the ordinary f16 GEMM.
+            if (w_.dtype == .nvfp4) {
+                const meta = w_.nvfp4.?;
+                try c.opMatmulNvfp4(
+                    y,
+                    x,
+                    m,
+                    w_.bytes,
+                    meta.scales,
+                    std.mem.asBytes(&meta.levels.bf16v),
+                    w_.rows,
+                    w_.cols,
+                    bias,
+                );
+            } else if (w_.dtype == .bf16) {
                 // Native bf16 tensor cores when the device has a bf16 coop
                 // config; else convert bf16->f16 on the GPU (both keep the
                 // conversion off the CPU under weight streaming).
@@ -484,12 +546,26 @@ pub fn forward(
         // one rotate+quantize of the modulated-norm input feeds all four
         // GEMMs (opI8Prep/opI8Gemm), producing f32 q/k/v/g — so it takes the
         // f32-output branches below (which still run tensor-core attention).
-        const is_i8 = blk.attn.wq.dtype == .i8;
+        // ⚠️ `.w4a8` belongs on the int8 side of every branch below, not merely "not
+        // fp8": the `else` arms feed the weight to the fp8 GEMM, which would read the
+        // packed nibbles as e4m3 bytes and render a blank image with no error — the same
+        // failure this file already records for a GGUF block quant. Its activation prep
+        // and GEMM are int8's; only the weight's storage differs (`opI8GemmW4A8`).
+        const is_i8 = blk.attn.wq.dtype == .i8 or blk.attn.wq.dtype == .w4a8;
         // Dense bf16 weights take the f32-operand fallback branch (Gemm.go
         // routes them to the f16-weight coop GEMM); they must be kept out of the
         // fp8-coop shared/att16 fast paths, which assume 1-byte e4m3 weights.
         const is_bf16 = blk.attn.wq.dtype == .bf16;
-        const qkv_shared = coop and !is_i8 and !is_bf16 and
+        // ⚠️ NVFP4 must be excluded from the fp8 SHARED paths below as well, not just from
+        // `Gemm.go`. Those are gated on `!is_i8 and !is_bf16`, which for a packed NVFP4
+        // weight is TRUE — and they call `opMatmulCoopH16`/`opMatmulCoop`, which read a
+        // 1-byte weight as raw e4m3. That is how it first behaved: the q/k/v/gate and MLP
+        // GEMMs took the fp8 path, decoding nibble pairs as e4m3 bytes, and it was visible
+        // only as VRAM (84 layers cached at their LOGICAL byte count, 2x the packed size —
+        // 8064 MiB of an 11899 MiB total) because a 4-step 256px render still looked
+        // plausible. Weight storage has to gate every arm, not the one you remembered.
+        const is_nvfp4 = blk.attn.wq.dtype == .nvfp4;
+        const qkv_shared = coop and !is_i8 and !is_bf16 and !is_nvfp4 and
             blk.attn.wq.scale == blk.attn.wk.scale and
             blk.attn.wq.scale == blk.attn.wv.scale and
             blk.attn.wq.scale == blk.attn.gate.scale;
@@ -549,7 +625,7 @@ pub fn forward(
                     const w_ = @field(blk.attn, name);
                     const is_gate = comptime std.mem.eql(u8, name, "gate");
                     const dst = if (comptime std.mem.eql(u8, name, "wq")) q_d else if (comptime std.mem.eql(u8, name, "wk")) k_d else if (comptime std.mem.eql(u8, name, "wv")) (if (i8_f16) v16_d else v_d) else g_d;
-                    try ctx.opI8Gemm(dst, w_.bytes, w_.row_scale.?, w_.rows, i8_f16 and !is_gate);
+                    try i8GemmW(io, &prof, &t_mark, ctx, dst, w_, i8_f16 and !is_gate);
                     mark(io, &t_mark, &prof.matmul_ns);
                 }
             } else {
@@ -791,7 +867,7 @@ pub fn forward(
             }
         }
         mark(io, &t_mark, &prof.attn_ns);
-        if (coop and !is_i8 and !is_bf16) {
+        if (coop and !is_i8 and !is_bf16 and !is_nvfp4) {
             if (att16) {
                 try ctx.opElt(.sigmoid_mul_g16, attn_d, g_d, null, h16_d, .{
                     .u0 = @intCast(seq_pad * F / 2),
@@ -813,7 +889,7 @@ pub fn forward(
             if (is_i8) {
                 try ctx.opI8Prep(attn_d, seq, blk.attn.wo.cols);
                 mark(io, &t_mark, &prof.prep_ns);
-                try ctx.opI8Gemm(t1_d, blk.attn.wo.bytes, blk.attn.wo.row_scale.?, blk.attn.wo.rows, false);
+                try i8GemmW(io, &prof, &t_mark, ctx, t1_d, blk.attn.wo, false);
             } else {
                 try Gemm.go(ctx, coop, t1_d, attn_d, seq, seq_pad, blk.attn.wo, zeros);
             }
@@ -846,7 +922,7 @@ pub fn forward(
             .u2 = rms_ch,
             .f0 = 1e-5,
         }, seq, 1, 1);
-        const mlp_shared = coop and !is_i8 and !is_bf16 and blk.mlp.gate.scale == blk.mlp.up.scale;
+        const mlp_shared = coop and !is_i8 and !is_bf16 and !is_nvfp4 and blk.mlp.gate.scale == blk.mlp.up.scale;
         const mlp16 = mlp_shared and ctx.pipe_coop_c16 != .null_handle;
         if (mlp_shared) {
             try ctx.opElt(.rms_apply_mod_h16, x_d, h16_d, mv_d, rmsi_d, .{
@@ -874,9 +950,9 @@ pub fn forward(
             if (is_i8) {
                 try ctx.opI8Prep(t1_d, seq, F);
                 mark(io, &t_mark, &prof.prep_ns);
-                try ctx.opI8Gemm(mg_d, blk.mlp.gate.bytes, blk.mlp.gate.row_scale.?, blk.mlp.gate.rows, false);
+                try i8GemmW(io, &prof, &t_mark, ctx, mg_d, blk.mlp.gate, false);
                 mark(io, &t_mark, &prof.matmul_ns);
-                try ctx.opI8Gemm(mu_d, blk.mlp.up.bytes, blk.mlp.up.row_scale.?, blk.mlp.up.rows, false);
+                try i8GemmW(io, &prof, &t_mark, ctx, mu_d, blk.mlp.up, false);
                 mark(io, &t_mark, &prof.matmul_ns);
             } else {
                 try Gemm.go(ctx, coop, mg_d, t1_d, seq, seq_pad, blk.mlp.gate, zeros);
@@ -885,7 +961,7 @@ pub fn forward(
                 mark(io, &t_mark, &prof.matmul_ns);
             }
         }
-        if (coop and !is_i8 and !is_bf16) {
+        if (coop and !is_i8 and !is_bf16 and !is_nvfp4) {
             if (mlp16) {
                 try ctx.opElt(.silu_mul16, mg_d, mu_d, null, h16_d, .{
                     .u0 = @intCast(seq_pad * dit.mlp_dim / 2),
@@ -906,7 +982,7 @@ pub fn forward(
             if (is_i8) {
                 try ctx.opI8Prep(mg_d, seq, blk.mlp.down.cols);
                 mark(io, &t_mark, &prof.prep_ns);
-                try ctx.opI8Gemm(t1_d, blk.mlp.down.bytes, blk.mlp.down.row_scale.?, blk.mlp.down.rows, false);
+                try i8GemmW(io, &prof, &t_mark, ctx, t1_d, blk.mlp.down, false);
             } else {
                 try Gemm.go(ctx, coop, t1_d, mg_d, seq, seq_pad, blk.mlp.down, zeros);
             }
@@ -971,8 +1047,8 @@ pub fn forward(
             }
         }.go;
         std.debug.print(
-            "dit gpu profile: matmul {d:.0}ms  attn {d:.0}ms (scores {d:.0} smax {d:.0} out {d:.0})  elt {d:.0}ms  prep {d:.0}ms  xfer {d:.0}ms  cpu {d:.0}ms\n",
-            .{ ms(prof.matmul_ns), ms(prof.attn_ns + prof.scores_ns + prof.smax_ns + prof.aout_ns), ms(prof.scores_ns), ms(prof.smax_ns), ms(prof.aout_ns), ms(prof.elt_ns), ms(prof.prep_ns), ms(prof.xfer_ns), ms(prof.cpu_ns) },
+            "dit gpu profile: matmul {d:.0}ms  attn {d:.0}ms (scores {d:.0} smax {d:.0} out {d:.0})  elt {d:.0}ms  prep {d:.0}ms  w4a8 {d:.0}ms  xfer {d:.0}ms  cpu {d:.0}ms\n",
+            .{ ms(prof.matmul_ns), ms(prof.attn_ns + prof.scores_ns + prof.smax_ns + prof.aout_ns), ms(prof.scores_ns), ms(prof.smax_ns), ms(prof.aout_ns), ms(prof.elt_ns), ms(prof.prep_ns), ms(prof.w4a8_ns), ms(prof.xfer_ns), ms(prof.cpu_ns) },
         );
     }
 }
@@ -1114,4 +1190,155 @@ test "gpu-resident forward matches comfyui fixture" {
     // usable afterwards.
     var canceled = std.atomic.Value(bool).init(true);
     try std.testing.expectError(error.Canceled, forward(&model, ctx, &sess, &ws, io, gpa, out2, x_lat, 0.875, &canceled));
+}
+
+// The W4A8 decode kernel against the CPU decode it must reproduce. Needs a device
+// (testdata/gpu-tests) but NO checkpoint — synthetic weights are enough, and that is
+// deliberate: the kernel's correctness must be checkable without a multi-GB file on
+// disk, which is exactly the situation that leaves a gated test silently self-skipping.
+//
+// ⚠️ This is also the test that would have caught the layout half. The first version of
+// `w4a8_decode_t` read the row-major storage and transposed as it went (correct, and
+// 1757 ms/step); the current one reads inputs that `weightBuffer` has already
+// byte-transposed. Those two kernels agree on nothing about their input indexing, so a
+// render is the only other thing that can tell them apart.
+test "the Vulkan W4A8 decode matches ops.w4a8.decode, including the row padding" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const w4a8 = ops.w4a8;
+    std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    var ctx = gpu.Context.init(gpa) catch return error.SkipZigTest;
+    defer ctx.deinit();
+    if (!ctx.hasW4A8Decode()) return error.SkipZigTest;
+
+    // Two heights: one that needs no row padding and one that does, since the padded
+    // slots are read by the GEMM and must decode to zero.
+    const cases = [_]struct { rows: usize, cols: usize, gs: usize }{
+        .{ .rows = 256, .cols = 512, .gs = 16 },
+        .{ .rows = 1536, .cols = 256, .gs = 16 },
+        .{ .rows = 192, .cols = 512, .gs = 32 },
+        // Group sizes 8 and 4 are legal in the format and this kernel is general over
+        // them, unlike the CUDA one, which needs one scale per 8 columns because it
+        // decodes four packed bytes per thread. Pinning them here is what makes that a
+        // documented backend difference rather than an accident.
+        .{ .rows = 256, .cols = 256, .gs = 8 },
+        .{ .rows = 128, .cols = 256, .gs = 4 },
+    };
+    // ⚠️ Every case's buffers stay ALIVE in one arena, and that is load-bearing rather
+    // than tidy: the device weight cache keys on the HOST POINTER, so freeing a case's
+    // arrays and letting the allocator hand the same address to the next case scores a
+    // stale cache hit and the kernel reads the previous case's weights. (A model never
+    // hits it: the weights live in the model arena for the model's lifetime.)
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    for (cases) |c| {
+        const stride = gpu.Context.w4a8ScratchBytes(c.rows, c.cols) / c.cols;
+        const groups = c.cols / c.gs;
+
+        var rnd = std.Random.DefaultPrng.init(0xA8 + c.rows);
+        const r = rnd.random();
+        const packed_bytes = try alloc.alloc(u8, c.rows * c.cols / 2);
+        r.bytes(packed_bytes);
+        const s_rel = try alloc.alloc(u8, c.rows * groups);
+        // Every fp8 byte, NaN (0x7F/0xFF) included: the level table maps those to 0 on
+        // both sides, so this pins that the two agree there rather than diverging on a
+        // value neither reference defines.
+        r.bytes(s_rel);
+        const levels = try alloc.create(w4a8.Levels);
+        levels.* = w4a8.Levels.init(&w4a8.fixed_lut);
+
+        // Expected: the CPU decode, laid out k-major with zeroed row padding.
+        const row_major = try alloc.alloc(i8, c.rows * c.cols);
+        w4a8.decode(row_major, packed_bytes, s_rel, levels, c.rows, c.cols, c.gs);
+        const want = try alloc.alloc(i8, stride * c.cols);
+        @memset(want, 0);
+        for (0..c.cols) |k| {
+            for (0..c.rows) |row| want[k * stride + row] = row_major[row * c.cols + k];
+        }
+
+        const buf = try ctx.w4a8Decode(packed_bytes, s_rel, std.mem.asBytes(levels), c.rows, c.cols, c.gs);
+        _ = buf;
+        const got = try alloc.alloc(i8, stride * c.cols);
+        try ctx.tensorDownload(ctx.w4a8_t, std.mem.sliceAsBytes(got));
+
+        for (want, got, 0..) |wv, gv, i| {
+            std.testing.expectEqual(wv, gv) catch |e| {
+                std.debug.print("rows {d} cols {d} gs {d} stride {d}: element {d} (k {d}, row {d}) got {d}, want {d}\n", .{
+                    c.rows, c.cols, c.gs, stride, i, i / stride, i % stride, gv, wv,
+                });
+                return e;
+            };
+        }
+    }
+}
+
+// The Vulkan NVFP4 decode kernel against the CPU decode it must reproduce. Synthetic
+// weights, so no checkpoint is needed — the durable form of the check.
+//
+// ⚠️ Covers the two things a render cannot localize and the CUDA twin does not share: the
+// f16 `[k_pad][n_pad]` output layout (a different padding rule from the inputs' own
+// stride) and the fact that BOTH paddings must be written, since this scratch is reused
+// between weights of different shapes.
+test "the Vulkan NVFP4 decode matches ops.nvfp4.decode, including both paddings" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const nvfp4 = ops.nvfp4;
+    std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
+    var ctx = gpu.Context.init(gpa) catch return error.SkipZigTest;
+    defer ctx.deinit();
+    if (!ctx.hasNvfp4Decode()) return error.SkipZigTest;
+
+    const cases = [_]struct { rows: usize, cols: usize }{
+        .{ .rows = 128, .cols = 256 }, // no padding on either axis
+        .{ .rows = 40, .cols = 192 }, // rows pad to 128, cols to 192 (already 64-aligned)
+        .{ .rows = 256, .cols = 64 }, // several row blocks, one k block
+    };
+    // One arena for every case: the weight cache keys on the HOST POINTER, so a freed and
+    // re-allocated address would score a stale hit and decode the previous case's bytes.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    for (cases) |c| {
+        var rnd = std.Random.DefaultPrng.init(0x4F4 + c.rows);
+        const r = rnd.random();
+        const packed_bytes = try alloc.alloc(u8, c.rows * c.cols / 2);
+        r.bytes(packed_bytes);
+        const scales = try alloc.alloc(u8, c.rows * c.cols / nvfp4.block_size);
+        r.bytes(scales);
+        const levels = try alloc.create(nvfp4.Levels);
+        levels.* = nvfp4.Levels.init(0.0125);
+        const meta: nvfp4.Meta = .{ .scales = scales, .levels = levels };
+
+        const plain = try alloc.alloc(f32, c.rows * c.cols);
+        nvfp4.decode(plain, packed_bytes, meta, c.rows, c.cols);
+
+        const n_pad = std.mem.alignForward(usize, c.rows, 128);
+        const k_pad = std.mem.alignForward(usize, c.cols, 64);
+        const want = try alloc.alloc(f32, k_pad * n_pad);
+        @memset(want, 0); // both paddings must come out zero
+        for (0..c.cols) |k| {
+            for (0..c.rows) |row| want[k * n_pad + row] = plain[row * c.cols + k];
+        }
+
+        _ = try ctx.nvfp4Decode(packed_bytes, scales, std.mem.asBytes(&levels.bf16v), c.rows, c.cols);
+        const got_bits = try alloc.alloc(u16, k_pad * n_pad);
+        try ctx.tensorDownload(ctx.nvfp4_w16, std.mem.sliceAsBytes(got_bits));
+
+        for (want, got_bits, 0..) |wv, gb, i| {
+            const gv: f32 = @bitCast(@as(u32, gb) << 16); // bf16 -> f32
+            // A NaN block-scale byte propagates on both sides (see ops/nvfp4.zig); bf16
+            // rounds the value, 8 mantissa bits = 2^-8 relative, and nothing else may
+            // change it. A wrong nibble or block index moves by a whole E2M1 level.
+            const both_nan = std.math.isNan(wv) and std.math.isNan(gv);
+            const tol = @max(@abs(wv) * 5e-3, 1e-30);
+            std.testing.expect(both_nan or @abs(gv - wv) <= tol) catch |e| {
+                std.debug.print("{d}x{d} (n_pad {d}, k_pad {d}): word {d} (k {d}, row {d}) got {d}, want {d}\n", .{
+                    c.rows, c.cols, n_pad, k_pad, i, i / n_pad, i % n_pad, gv, wv,
+                });
+                return e;
+            };
+        }
+    }
 }

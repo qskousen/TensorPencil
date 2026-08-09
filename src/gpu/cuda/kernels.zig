@@ -981,7 +981,28 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: boo
     const ngroups = cols / 256;
     const nbf = ngroups * 64 / 256; // butterflies/thread/pass (all 256 threads busy)
     const load_iters = cols / 256;
-    const word_iters = cols / (per_word * 256); // packed u32 words / thread
+    // Packed u32 output words for the whole row, and how many each of the 256 threads
+    // takes. ⚠️ **This used to be `cols / (per_word * 256)`, and that truncation to ZERO
+    // silently produced garbage.** At `bits == 4` there are 8 elements per word, so a
+    // 1024-wide reduction has only 128 words for 256 threads — the store loop was then
+    // emitted zero times, `p_q` was never written, and `opI4Gemm` multiplied the weight
+    // against whatever the shared int8/int4 activation scratch held from the previous
+    // call. No error, no assert, and the block's other linears are fine; it is visible
+    // only as a render that degrades into static over depth. Anima's cross-attention
+    // K/V are exactly `cols = 1024` and are the only linears here that reach it.
+    const total_words = cols / per_word;
+    const word_iters = (total_words + 255) / 256;
+    // Threads past the word count must not store. For every width where `total_words` is
+    // a whole number of blocks (every int8 width, and every int4 width >= 2048 — i.e.
+    // every case that worked before) the guard is always true, so those kernels are
+    // unchanged instruction-for-instruction apart from one predicated branch.
+    const guard_words = total_words % 256 != 0;
+    // The FWHT below gives each thread `nbf` butterflies per pass and has the same
+    // truncation hazard: `nbf` is `cols / 1024`, so anything narrower than one full
+    // rotation group per thread would silently skip the rotation entirely. No linear here
+    // is that narrow (the smallest is cross-attention's 1024), and a wrong basis is not
+    // something to guess at, so refuse rather than emit a kernel that does not rotate.
+    if (nbf == 0) return error.UnsupportedWidth;
     const SMAX_OFF = cols * 4; // smax[256] f32 region
     const SCALE_OFF = SMAX_OFF + 256 * 4; // scale broadcast slot
 
@@ -1170,6 +1191,12 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: boo
         var i: usize = 0;
         while (i < word_iters) : (i += 1) {
             try b.linef("add.u32 {s}, {s}, {d};", .{ r_word, r_t, i * 256 });
+            const lbl_wsk = if (guard_words) try b.newLabel("wsk") else "";
+            if (guard_words) {
+                const p_w = try b.reg(.pred);
+                try b.linef("setp.ge.u32 {s}, {s}, {d};", .{ p_w, r_word, total_words });
+                try b.linef("@{s} bra {s};", .{ p_w, lbl_wsk });
+            }
             try b.linef("mov.u32 {s}, 0;", .{r_out});
             // element base col = word*per_word ; shared byte = smem + col*4
             try b.linef("shl.b32 {s}, {s}, {d};", .{ r_ecol, r_word, per_word_log2 });
@@ -1196,6 +1223,7 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: boo
             try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rd_tmp, r_word });
             try b.linef("add.s64 {s}, {s}, {s};", .{ rd_g, rd_qrow, rd_tmp });
             try b.linef("st.global.u32 [{s}], {s};", .{ rd_g, r_out });
+            if (guard_words) try b.label(lbl_wsk);
         }
     }
 

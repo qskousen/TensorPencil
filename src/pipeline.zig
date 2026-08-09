@@ -1849,17 +1849,6 @@ pub fn supportsPromptWeights(fam: Family) bool {
 }
 
 pub const Session = struct {
-    /// Anima's int4->int8 widened linears, built once per MODEL and shared by every
-    /// image and both CFG branches. Null until a Vulkan Anima denoiser needs it.
-    /// ⚠️ Per-model on purpose: one copy per session would upload a second full set of
-    /// quantized weights for the negative branch (measured 3291 MB against 1779 MB).
-    ///
-    /// ⚠️ **The `= null` here is documentation, NOT initialization.** `Session.init`
-    /// `gpa.create`s uninitialized memory and assigns every field by hand, so a default
-    /// initializer never runs — this field held garbage, its optional tag read non-null,
-    /// and `deinit` walked a garbage `ArenaAllocator` into a general protection fault on
-    /// GUI close. **Any new field here must be assigned explicitly in `init`.**
-    an_vk_lins: ?anima_gpu.Lins = null,
     models: Models,
     /// Which ecosystem's sampling conventions this session's forwards follow. Set from
     /// `Options` at `init` and refreshed at the top of `generate`, so a caller driving the
@@ -1947,10 +1936,6 @@ pub const Session = struct {
         self.backend = opts.backend;
         self.gpu_ctx = null;
         self.cu_be = null;
-        // ⚠️ Explicit, because `gpa.create` above does not run field defaults — see the
-        // note on the field.
-        self.an_vk_lins = null;
-
         // Vulkan context (--backend vulkan): encoder / DiT / VAE GEMMs on Vulkan.
         if (opts.backend == .vulkan) {
             if (gpu_mod.Context.init(gpa)) |ctx| {
@@ -2258,7 +2243,14 @@ pub const Session = struct {
                 else => {},
             }
         }
-        try note(progress, "models loaded (encoder {d:.1}s, dit+vae {d:.1}s)\n", .{
+        // ⚠️ `t1` is taken AFTER the denoiser and `t2` after the encoder + VAE — in
+        // every one of the five arms above, which all load the denoiser first. This
+        // line used to read them the other way round ("encoder …, dit+vae …"), so a
+        // slow denoiser load was reported as a slow *encoder* load: the W4A8 arm's
+        // 2.0 s of read-and-decode showed up as `encoder 2.0s, dit+vae 0.3s` and read
+        // as the encoder being the expensive half. Same class of mistake as a
+        // mislabelled profiler bucket — the numbers were right and the names were not.
+        try note(progress, "models loaded (denoiser {d:.1}s, encoder+vae {d:.1}s)\n", .{
             @as(f64, @floatFromInt(t1 - t0)) / 1e9, @as(f64, @floatFromInt(t2 - t1)) / 1e9,
         });
 
@@ -2437,10 +2429,6 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session) void {
-        if (self.an_vk_lins) |*l| {
-            l.deinit();
-            self.an_vk_lins = null; // `Lins.deinit` undefines its payload; do not revisit it
-        }
         const gpa = self.gpa;
         // The session may be torn down from a different thread than it was used
         // on (the GUI frees it on the UI thread when the image queue drains);
@@ -3269,13 +3257,10 @@ pub const Session = struct {
                 }
             } else if (self.gpu_ctx) |gc| {
                 if (anima_gpu.supported(gc, dit)) {
-                    // Built once per model; both branches and every later image share it.
-                    if (self.an_vk_lins == null) self.an_vk_lins = try anima_gpu.Lins.init(gpa, dit);
-                    const lins = &self.an_vk_lins.?;
-                    d.an_vk = try anima_gpu.Session.init(gpa, self.io, gc, dit, lat_h, lat_w, cond_pos.data, cond_pos.seq, sigmas, d.an_mods.?, lins);
+                    d.an_vk = try anima_gpu.Session.init(gpa, self.io, gc, dit, lat_h, lat_w, cond_pos.data, cond_pos.seq, sigmas, d.an_mods.?);
                     if (use_cfg) {
                         const cn = cond_neg.?;
-                        d.an_vk_neg = try anima_gpu.Session.init(gpa, self.io, gc, dit, lat_h, lat_w, cn.data, cn.seq, sigmas, d.an_mods.?, lins);
+                        d.an_vk_neg = try anima_gpu.Session.init(gpa, self.io, gc, dit, lat_h, lat_w, cn.data, cn.seq, sigmas, d.an_mods.?);
                     }
                     d.an_vk_ws = try anima_gpu.Workspace.init(gc, dit, lat_h, lat_w, d.an_vk.?.tc);
                 } else {

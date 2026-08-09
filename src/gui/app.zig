@@ -2112,13 +2112,35 @@ fn renderGenImage(s: ?*chat.Session, gi: *chat.GenImage, gi_idx: usize) void {
             }
         },
         .failed => {
-            fonts.richLabel(@src(), "⚠ image generation failed", .{});
+            // Name the cause. "failed" alone is unactionable, and the most
+            // common cause here — VRAM — is one the user can actually fix
+            // (unload the LLM, drop the resolution) and then retry into.
+            var fbuf: [160]u8 = undefined;
+            const msg = if (gi.failure()) |err|
+                std.fmt.bufPrint(&fbuf, "⚠ image generation failed: {s}", .{diffuser.failureText(err)}) catch "⚠ image generation failed"
+            else
+                "⚠ image generation failed";
+            fonts.richLabel(@src(), msg, .{});
             genInfo(gi);
+            retryButton(gi);
         },
         .canceled => {
             fonts.richLabel(@src(), "⚠ image generation canceled", .{});
             genInfo(gi);
+            retryButton(gi);
         },
+    }
+}
+
+/// "Try again" for a failed or canceled image: re-queues it IN PLACE, so this
+/// same tile turns back into a progress bar rather than a second image
+/// appearing. Retrying picks up the CURRENT model/backend (see `Diffuser.retry`)
+/// — which is the point, since the usual fix for the usual failure is to change
+/// something first.
+fn retryButton(gi: *chat.GenImage) void {
+    if (g_diffuser) |*d| {
+        if (dvui.button(@src(), "Try again", .{}, .{ .margin = .{ .y = 4 } }))
+            d.retry(gi) catch |err| std.log.err("retry image: {t}", .{err});
     }
 }
 

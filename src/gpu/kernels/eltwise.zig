@@ -2936,6 +2936,195 @@ export fn quantize_i8() callconv(.spirv_kernel) void {
     b.data[w] = @bitCast(out);
 }
 
+// w4a8_decode_t: decode a packed ComfyUI `asym_w4a8_int8` weight into the k-major int8
+// layout the coop GEMM reads. The packed form stays resident and this runs PER GEMM — a
+// decoded krea2 is 12.2 GB of int8 against 6.1 GB packed, which is the entire difference
+// between this format and int8 (see ops/w4a8.zig). `levels` is the [256][16] table the
+// host built, so this kernel does no arithmetic at all and is bit-identical to the CPU
+// decode by construction rather than by agreement.
+//
+// ⚠️ **Both inputs arrive ALREADY BYTE-TRANSPOSED**, through the same cached
+// `weightBuffer` path every other weight here uses, and that is what makes this kernel
+// fast rather than merely correct. A transposing decode straight from the row-major
+// storage was tried first and measured **1757 ms/step against a ~20 ms bandwidth roof**:
+// a transpose has one unavoidably strided side, so a warp's 32 lanes hit 32 separate
+// sectors per load instruction, and paying that PER GEMM rather than once at load is what
+// made it 50x off. Transposing the *packed* bytes once at load costs the same one-time
+// pass every dense weight already pays, and leaves every stream here coalesced.
+//
+// Layout, with `stride = align(rows, tile_n)` shared by both inputs and the output:
+//   a  = pT   packed,  [cols/2][stride] — byte (j, r) holds columns 2j, 2j+1 of row r
+//   c  = sT   s_rel,   [cols/group_size][stride] fp8 bytes
+//   b  = out  int8,    [cols][stride]
+// One thread owns 4 consecutive rows of one packed byte-column: it reads ONE u32 of `a`
+// (at index `t` exactly — `j*(stride/4) + rq` is the thread id) and one u32 of `c`, and
+// writes one u32 into each of the two output planes 2j and 2j+1. Adjacent threads hold
+// adjacent row quads, so every read and both writes are fully coalesced.
+//
+// The row PADDING needs no special case: `weightBuffer` zeroes it in both inputs, and a
+// zero scale byte is fp8 0.0, whose level table row is all zeros — so a pad row decodes
+// to 0, which is what the GEMM must see.
+//
+// u0 = total threads = (cols/2)*(stride/4), u1 = group_size/2 (packed byte-columns per
+// group), u2 = stride/4.
+export fn w4a8_decode_t() callconv(.spirv_kernel) void {
+    decorate();
+    const t = gpu.global_invocation_id[0];
+    if (t >= pc.u0) return;
+    const rq = pc.u2; // row quads per byte-column plane
+    const j = t / rq; // packed byte-column
+    const r = t % rq; // row quad within it
+    const pw: u32 = @bitCast(a.data[t]);
+    const sw: u32 = @bitCast(c.data[(j / pc.u1) * rq + r]);
+    var lo_out: u32 = 0;
+    var hi_out: u32 = 0;
+    inline for (0..4) |i| {
+        const byte: u32 = (pw >> @intCast(8 * i)) & 0xFF;
+        const s: u32 = (sw >> @intCast(8 * i)) & 0xFF;
+        const base = s * 16;
+        const llo = base + (byte & 0xF);
+        const lhi = base + (byte >> 4);
+        const wlo: u32 = @bitCast(d.data[llo >> 2]);
+        const whi: u32 = @bitCast(d.data[lhi >> 2]);
+        lo_out |= ((wlo >> @intCast(8 * (llo & 3))) & 0xFF) << @intCast(8 * i);
+        hi_out |= ((whi >> @intCast(8 * (lhi & 3))) & 0xFF) << @intCast(8 * i);
+    }
+    b.data[2 * j * rq + r] = @bitCast(lo_out);
+    b.data[(2 * j + 1) * rq + r] = @bitCast(hi_out);
+}
+
+// i4_decode_t: unpack a nibble-packed int4-convrot weight into the k-major int8 layout the
+// coop GEMM reads. `w4a8_decode_t` above with the scale plane and the level table removed —
+// a `.i4` nibble sign-extends straight to int8, and its per-OUTPUT-ROW scale is applied
+// afterwards by `opI8GemmBuf`'s rescale, exactly as it is for a plain int8 weight. So this
+// kernel does no arithmetic beyond a 4-bit sign extension.
+//
+// ⚠️ **This exists so int4 stops costing int8's VRAM on Vulkan.** There is no `sint4`
+// cooperative matrix on this device, so the nibbles must reach the GEMM as int8 either way —
+// but `anima_gpu.Lins` used to do that by widening every weight ONCE AT LOAD, which keeps a
+// full int8 copy resident. Measured on `terraRising`: both int4 and W4A8 hold **1050.7 MB of
+// packed weight bytes** (both are 4-bit), yet int4 occupied **1778 MB against W4A8's 1118**
+// purely because W4A8 had a per-GEMM decode and int4 did not. Same policy, same footprint.
+//
+// ⚠️ The result is W4A8-shaped arithmetic, NOT the CUDA arms' W4A4: the weight is 4-bit and
+// the activation stays int8 (`opI8Prep`). That is what the widening already did, so this
+// changes residency only — renders are expected bit-identical, and the test asserts it.
+//
+// ⚠️ **Input arrives ALREADY BYTE-TRANSPOSED** through the same cached `weightBuffer` path,
+// for the reason `w4a8_decode_t` documents at length: a transposing decode has one strided
+// side and cost that kernel 1757 ms/step against a ~20 ms roof before its inputs were
+// pre-transposed. Do not "simplify" this by reading the row-major storage.
+//
+// Layout, `stride = align(rows, tile_n)` shared by input and output:
+//   a = pT  packed, [cols/2][stride] — byte (j, r) holds columns 2j, 2j+1 of row r
+//   b = out int8,   [cols][stride]
+// One thread owns 4 consecutive rows of one packed byte-column: one u32 in, one u32 into
+// each of the two output planes 2j and 2j+1. Every access is coalesced.
+//
+// The row PADDING needs no special case: `weightBuffer` zeroes it, and nibble 0 sign-extends
+// to int8 0 — which is what the GEMM must see for a pad row.
+//
+// u0 = total threads = (cols/2)*(stride/4), u1 = stride/4.
+export fn i4_decode_t() callconv(.spirv_kernel) void {
+    decorate();
+    const t = gpu.global_invocation_id[0];
+    if (t >= pc.u0) return;
+    const pw: u32 = @bitCast(a.data[t]);
+    const rq = pc.u1; // row quads per byte-column plane
+    const j = t / rq; // packed byte-column
+    const r = t % rq; // row quad within it
+    var lo_out: u32 = 0;
+    var hi_out: u32 = 0;
+    inline for (0..4) |i| {
+        const byte: u32 = (pw >> @intCast(8 * i)) & 0xFF;
+        // ⚠️ LOW nibble = EVEN element, sign-extended — the packing `ops.matmul`'s i4 path
+        // and ComfyUI's W4A4 converter both use. Swapping the halves is not an error, it is
+        // a different (wrong) weight matrix, and it is rms-preserving.
+        const lo: u32 = @bitCast(@as(i32, @as(i4, @bitCast(@as(u4, @truncate(byte))))));
+        const hi: u32 = @bitCast(@as(i32, @as(i4, @bitCast(@as(u4, @truncate(byte >> 4))))));
+        lo_out |= (lo & 0xFF) << @intCast(8 * i);
+        hi_out |= (hi & 0xFF) << @intCast(8 * i);
+    }
+    b.data[2 * j * rq + r] = @bitCast(lo_out);
+    b.data[(2 * j + 1) * rq + r] = @bitCast(hi_out);
+}
+
+// nvfp4_decode_t: decode a packed ComfyUI NVFP4 weight into the f16 `[k_pad][n_pad]`
+// k-major layout the coop f16 GEMM reads. Weight-only quantization, per GEMM, so the
+// 4-bit form stays resident — which is what NVFP4 is on anything below Blackwell and what
+// ComfyUI itself does there (see ops/nvfp4.zig).
+//
+// ⚠️ Element 2k is the HIGH nibble (`hi_first`), the opposite of `.i4`/`.w4a8` here.
+// ⚠️ Both inputs arrive ALREADY BYTE-TRANSPOSED through `weightBuffer`, and the scales
+// arrive already UNSWIZZLED from the loader — the same arrangement `w4a8_decode_t` needs
+// and for the same measured reason: transposing per GEMM puts 32 sectors on every warp
+// load, which cost that kernel 1757 ms/step before its inputs were pre-transposed.
+//
+// Layouts (`sin` = the inputs' shared row stride, `n_pad` = the output's):
+//   a = pT      packed, [cols/2][sin] — byte (j, r) holds columns 2j, 2j+1 of row r
+//   c = sT      fp8 block scales, [cols/16][sin], unswizzled
+//   d = levels  f16 [256][16], the host's table (E2M1 * per_tensor * block already folded)
+//   b = out     f16 [k_pad][n_pad]
+// One thread owns 4 consecutive rows of one packed byte-column: one u32 of `a`, one u32 of
+// `c`, and two pairs of u32 written into output planes 2j and 2j+1 — all coalesced.
+//
+// ⚠️ It writes BOTH paddings. `n_pad`/`k_pad` round rows/cols up to 128/64 and the GEMM
+// reads all of it, while this scratch is shared between weights of different shapes — so
+// an unwritten pad slot would feed the next GEMM the previous weight's values.
+//
+// ⚠️ The INPUT planes and the OUTPUT have DIFFERENT row strides — `weightBuffer` pads rows
+// to `tile_n` (8) while the coop GEMM's layout pads to 128 — so the dispatch must cover the
+// OUTPUT's quads and guard the input read. Getting that backwards leaves every row-padding
+// slot unwritten, which the first version did: a 40-row weight wrote 40 of 128 rows and the
+// GEMM read the previous weight's values from the rest.
+//
+// u0 = total threads = (k_pad/2)*(n_pad/4), u1 = n_pad/4 (output row quads), u2 = n_pad,
+// u3 = rows, u4 = cols, u5 = sin/4 (INPUT row quads).
+export fn nvfp4_decode_t() callconv(.spirv_kernel) void {
+    decorate();
+    const t = gpu.global_invocation_id[0];
+    if (t >= pc.u0) return;
+    const rq = pc.u1;
+    const j = t / rq; // packed byte-column -> output planes 2j, 2j+1
+    const r = t % rq;
+    const row0 = r * 4;
+    // Only the real region has data; k- and row-padding decode to zero.
+    const live_k = 2 * j < pc.u4 and r < pc.u5;
+    const pw: u32 = if (live_k) @bitCast(a.data[j * pc.u5 + r]) else 0;
+    const sw: u32 = if (live_k) @bitCast(c.data[(j / 8) * pc.u5 + r]) else 0;
+    var hi0: u32 = 0;
+    var hi1: u32 = 0;
+    var lo0: u32 = 0;
+    var lo1: u32 = 0;
+    inline for (0..4) |i| {
+        if (live_k and row0 + i < pc.u3) {
+            const byte: u32 = (pw >> @intCast(8 * i)) & 0xFF;
+            const s: u32 = (sw >> @intCast(8 * i)) & 0xFF;
+            const base = s * 8; // 16 f16 entries = 8 u32 words per scale byte
+            const chi = byte >> 4; // element 2j  — HIGH nibble first
+            const clo = byte & 0xF; // element 2j+1
+            const whi: u32 = @bitCast(d.data[base + (chi >> 1)]);
+            const wlo: u32 = @bitCast(d.data[base + (clo >> 1)]);
+            const vhi: u32 = (whi >> @intCast(16 * (chi & 1))) & 0xFFFF;
+            const vlo: u32 = (wlo >> @intCast(16 * (clo & 1))) & 0xFFFF;
+            // Four f16 per plane pack into two u32: rows r0,r0+1 then r0+2,r0+3.
+            if (i < 2) {
+                hi0 |= vhi << @intCast(16 * i);
+                lo0 |= vlo << @intCast(16 * i);
+            } else {
+                hi1 |= vhi << @intCast(16 * (i - 2));
+                lo1 |= vlo << @intCast(16 * (i - 2));
+            }
+        }
+    }
+    const w_hi = (2 * j * pc.u2 + row0) >> 1; // f16 -> u32 word index
+    const w_lo = ((2 * j + 1) * pc.u2 + row0) >> 1;
+    b.data[w_hi] = @bitCast(hi0);
+    b.data[w_hi + 1] = @bitCast(hi1);
+    b.data[w_lo] = @bitCast(lo0);
+    b.data[w_lo + 1] = @bitCast(lo1);
+}
+
 // scale_concat: assemble the fused int8 GEMM's scale buffer = [act(m_pad) |
 // weight(rows)] in one dispatch (batch-barrier-safe, no transfer/compute race).
 // a = act_scale (m entries on device), c = weight_scale (rows), b = concat out.

@@ -60,7 +60,11 @@ pub fn setThinking(on: bool) void {
 /// Delimiters of a family's reasoning block as they appear in the *generated
 /// text* (decoded tokens): `open` starts the thought, `close` ends it. null =>
 /// the family has no reasoning channel and the thinking toggle is a no-op.
-pub const Reasoning = struct { open: []const u8, close: []const u8 };
+///
+/// Aliased from `tool_call.zig` — which owns the splitter that consumes it — so
+/// a family's markers pass into `answerText`/`endsInsideThought` with no
+/// conversion step that could quietly disagree.
+pub const Reasoning = @import("tool_call.zig").Reasoning;
 
 /// A given family's reasoning-block markers, or null if it can't reason. The
 /// single source of truth; `reasoning`/`supportsThinking` read the active

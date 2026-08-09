@@ -6171,6 +6171,143 @@ pub const scatter_head_b_ptx: [:0]const u8 =
     \\}
 ;
 
+/// Decode a packed ComfyUI NVFP4 weight to the f16 the tensor-core GEMM consumes:
+/// `out[e] = levels[scales[block(e)]][E2M1 code]`.
+///
+/// `levels` is the `[256][16]` **f16** table `ops.nvfp4.Levels` builds on the host, which
+/// already folds `E2M1 * (weight_scale_2 * block_scale)` in the reference's own multiply
+/// order — so this kernel does no arithmetic at all and cannot drift from the CPU decode.
+/// `scales` must already be UNSWIZZLED (the loader does it once; cuBLAS's tiled block-scale
+/// layout has no business in an inner loop).
+///
+/// ⚠️ **Element 2k is the HIGH nibble** (`hi_first` in the reference) — the opposite of
+/// `.i4` and `.w4a8` here. Getting it backwards permutes adjacent weight pairs, which
+/// preserves every row's rms exactly, so nothing downstream can notice.
+///
+/// One thread per FOUR packed bytes (a `u32` in, a `v4.u32` of 8 f16 out) for the same
+/// reason the W4A8 kernel does it: the level lookups are dependent loads, so one byte per
+/// thread has a single memory chain and goes latency-bound. Two index facts make it need
+/// no row/column decomposition and no division at all:
+///   - the output element base is `8*idx`, so the byte offset is `16*idx`;
+///   - the block-scale index is exactly `idx >> 1`, since `scales` is `[row][cols/16]`
+///     row-major and a `u32` of packed bytes is 8 columns aligned to 8, hence always
+///     inside one 16-element block.
+///
+/// b0=packed(u8 [rows][cols/2]), b1=scales(u8 fp8 [rows][cols/16], unswizzled),
+/// b2=levels(f16[256*16]), b3=out(f16 [rows][cols]). u0=rows*cols/8 (threads).
+pub const nvfp4_decode_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry nvfp4_decode(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<2>;
+    \\  .reg .b32 %r<48>;
+    \\  .reg .b64 %rd<48>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2]; ld.param.u64 %rd4,[p3];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2;
+    \\  cvta.to.global.u64 %rd3,%rd3; cvta.to.global.u64 %rd4,%rd4;
+    \\  mul.wide.u32 %rd5,%r4,4; add.s64 %rd6,%rd1,%rd5; ld.global.u32 %r7,[%rd6];  // 4 packed bytes
+    \\  shr.u32 %r8,%r4,1;                                                          // block index
+    \\  cvt.u64.u32 %rd7,%r8; add.s64 %rd8,%rd2,%rd7; ld.global.u8 %r9,[%rd8];      // fp8 scale byte
+    \\  mul.wide.u32 %rd9,%r9,32; add.s64 %rd10,%rd3,%rd9;                          // &levels[s][0] (f16)
+    \\  bfe.u32 %r10,%r7,4,4;  bfe.u32 %r11,%r7,0,4;    // byte 0: HIGH first, then low
+    \\  bfe.u32 %r12,%r7,12,4; bfe.u32 %r13,%r7,8,4;
+    \\  bfe.u32 %r14,%r7,20,4; bfe.u32 %r15,%r7,16,4;
+    \\  bfe.u32 %r16,%r7,28,4; bfe.u32 %r17,%r7,24,4;
+    \\  mul.wide.u32 %rd11,%r10,2; add.s64 %rd11,%rd10,%rd11; ld.global.u16 %r20,[%rd11];
+    \\  mul.wide.u32 %rd12,%r11,2; add.s64 %rd12,%rd10,%rd12; ld.global.u16 %r21,[%rd12];
+    \\  mul.wide.u32 %rd13,%r12,2; add.s64 %rd13,%rd10,%rd13; ld.global.u16 %r22,[%rd13];
+    \\  mul.wide.u32 %rd14,%r13,2; add.s64 %rd14,%rd10,%rd14; ld.global.u16 %r23,[%rd14];
+    \\  mul.wide.u32 %rd15,%r14,2; add.s64 %rd15,%rd10,%rd15; ld.global.u16 %r24,[%rd15];
+    \\  mul.wide.u32 %rd16,%r15,2; add.s64 %rd16,%rd10,%rd16; ld.global.u16 %r25,[%rd16];
+    \\  mul.wide.u32 %rd17,%r16,2; add.s64 %rd17,%rd10,%rd17; ld.global.u16 %r26,[%rd17];
+    \\  mul.wide.u32 %rd18,%r17,2; add.s64 %rd18,%rd10,%rd18; ld.global.u16 %r27,[%rd18];
+    \\  shl.b32 %r30,%r21,16; or.b32 %r30,%r30,%r20;
+    \\  shl.b32 %r31,%r23,16; or.b32 %r31,%r31,%r22;
+    \\  shl.b32 %r32,%r25,16; or.b32 %r32,%r32,%r24;
+    \\  shl.b32 %r33,%r27,16; or.b32 %r33,%r33,%r26;
+    \\  mul.wide.u32 %rd20,%r4,16; add.s64 %rd20,%rd4,%rd20;
+    \\  st.global.v4.u32 [%rd20],{%r30,%r31,%r32,%r33};
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// Decode a packed ComfyUI `asym_w4a8_int8` weight to the int8 the int8 GEMM
+/// consumes: `out[e] = levels[s_rel[group(e)]][nibble(e)]`.
+///
+/// `levels` is the `[256][16]` int8 table `ops.w4a8.Levels` builds on the host — it
+/// already folds the reference's `rint(clamp(codebook[q] * s_rel, -127, 127))`, so this
+/// kernel does no arithmetic at all and is bit-identical to the CPU decode by
+/// construction rather than by agreement. 4 KiB, so it lives in L1 for the whole
+/// weight.
+///
+/// ⚠️ **One thread per FOUR packed bytes** (a `u32` in, two `u32` out — 8 elements), not
+/// one per byte. The level lookups are *dependent* loads (the address comes from the
+/// loaded nibble), so a byte-per-thread version has a single memory chain per thread and
+/// is latency-bound rather than bandwidth-bound: it measured 270 ms/step against a
+/// ~20 ms roof. Four bytes give eight independent chains in flight for the same traffic.
+///
+/// The index math collapses to two facts, which is why this needs no row/column
+/// decomposition and only one division:
+///   - the output offset is exactly `2*idx`, since `row*cols + 2*cp == 2*(row*cols/2 + cp)`;
+///   - the group-scale offset is exactly `byte_idx / (group_size/2)`, since `s_rel` is
+///     `[row][group]` row-major and `cols/2` is divisible by `group_size/2`.
+/// A `u32` of packed bytes spans 8 columns aligned to 8, so with `group_size >= 8` all
+/// four bytes share one scale and the division is done once per thread. `group_size` 4 is
+/// legal in the format but no checkpoint uses it, so the host routes it to the CPU decode
+/// rather than have this kernel carry a per-byte scale lookup for a case that never runs.
+///
+/// b0=packed(u8 [rows][cols/2]), b1=s_rel(u8 fp8 [rows][cols/group_size]),
+/// b2=levels(s8[256*16]), b3=out(s8 [rows][cols]). u0=rows*cols/8 (threads),
+/// u1=group_size/8 (u32 words of packed per group).
+pub const w4a8_decode_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry w4a8_decode(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<2>;
+    \\  .reg .b32 %r<40>;
+    \\  .reg .b64 %rd<40>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1];
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2]; ld.param.u64 %rd4,[p3];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2;
+    \\  cvta.to.global.u64 %rd3,%rd3; cvta.to.global.u64 %rd4,%rd4;
+    \\  mul.wide.u32 %rd5,%r4,4; add.s64 %rd6,%rd1,%rd5; ld.global.u32 %r7,[%rd6]; // 4 packed bytes
+    \\  div.u32 %r8,%r4,%r6;                                                       // group index
+    \\  cvt.u64.u32 %rd7,%r8; add.s64 %rd8,%rd2,%rd7; ld.global.u8 %r9,[%rd8];     // fp8 scale byte
+    \\  mul.wide.u32 %rd9,%r9,16; add.s64 %rd10,%rd3,%rd9;                         // &levels[s][0]
+    \\  bfe.u32 %r10,%r7,0,4;  bfe.u32 %r11,%r7,4,4;
+    \\  bfe.u32 %r12,%r7,8,4;  bfe.u32 %r13,%r7,12,4;
+    \\  bfe.u32 %r14,%r7,16,4; bfe.u32 %r15,%r7,20,4;
+    \\  bfe.u32 %r16,%r7,24,4; bfe.u32 %r17,%r7,28,4;
+    \\  cvt.u64.u32 %rd11,%r10; add.s64 %rd11,%rd10,%rd11; ld.global.u8 %r20,[%rd11];
+    \\  cvt.u64.u32 %rd12,%r11; add.s64 %rd12,%rd10,%rd12; ld.global.u8 %r21,[%rd12];
+    \\  cvt.u64.u32 %rd13,%r12; add.s64 %rd13,%rd10,%rd13; ld.global.u8 %r22,[%rd13];
+    \\  cvt.u64.u32 %rd14,%r13; add.s64 %rd14,%rd10,%rd14; ld.global.u8 %r23,[%rd14];
+    \\  cvt.u64.u32 %rd15,%r14; add.s64 %rd15,%rd10,%rd15; ld.global.u8 %r24,[%rd15];
+    \\  cvt.u64.u32 %rd16,%r15; add.s64 %rd16,%rd10,%rd16; ld.global.u8 %r25,[%rd16];
+    \\  cvt.u64.u32 %rd17,%r16; add.s64 %rd17,%rd10,%rd17; ld.global.u8 %r26,[%rd17];
+    \\  cvt.u64.u32 %rd18,%r17; add.s64 %rd18,%rd10,%rd18; ld.global.u8 %r27,[%rd18];
+    \\  prmt.b32 %r30,%r20,%r21,0x4440; prmt.b32 %r31,%r22,%r23,0x4440;
+    \\  prmt.b32 %r32,%r30,%r31,0x5410;
+    \\  prmt.b32 %r33,%r24,%r25,0x4440; prmt.b32 %r34,%r26,%r27,0x4440;
+    \\  prmt.b32 %r35,%r33,%r34,0x5410;
+    \\  mul.wide.u32 %rd20,%r4,8; add.s64 %rd20,%rd4,%rd20;
+    \\  st.global.v2.u32 [%rd20],{%r32,%r35};
+    \\END:
+    \\  ret;
+    \\}
+;
+
 /// Dequantize fp8-e4m3 weights to f16: out[i] = f16(lut[in[i]] * scale). The
 /// e4m3 byte indexes a 256-entry f32 lookup table (dtype.f8_e4m3_to_f32_table),
 /// then the per-tensor weight scale is folded in. b0=in(u8 fp8), b1=lut(f32[256]),

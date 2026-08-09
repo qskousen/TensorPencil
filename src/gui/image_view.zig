@@ -359,12 +359,12 @@ fn renderGallery(engine: *diffuser.Diffuser) void {
         var c: usize = 0;
         while (c < cols and i + c < n) : (c += 1) {
             // Newest first.
-            renderCell(imgs[n - 1 - (i + c)], i + c, cell);
+            renderCell(engine, imgs[n - 1 - (i + c)], i + c, cell);
         }
     }
 }
 
-fn renderCell(gi: *GenImage, idx: usize, cell: f32) void {
+fn renderCell(engine: *diffuser.Diffuser, gi: *GenImage, idx: usize, cell: f32) void {
     var b = dvui.box(@src(), .{ .dir = .vertical }, .{ .id_extra = idx, .min_size_content = .{ .w = cell }, .margin = .{ .w = 12 } });
     defer b.deinit();
 
@@ -432,7 +432,30 @@ fn renderCell(gi: *GenImage, idx: usize, cell: f32) void {
                 hint.hover(@src(), &wd, "Copy image to clipboard");
             }
         },
-        .failed => dvui.label(@src(), "⚠ failed", .{}, .{}),
-        .canceled => dvui.label(@src(), "⚠ canceled", .{}, .{}),
+        // Both terminal-but-unsuccessful states name themselves and offer a
+        // retry. The cell is narrow, so the reason wraps in a textLayout rather
+        // than being truncated into a label — an error the user cannot read is
+        // the state this replaced.
+        .failed => {
+            var fbuf: [180]u8 = undefined;
+            const msg = if (gi.failure()) |err|
+                std.fmt.bufPrint(&fbuf, "⚠ failed: {s}", .{diffuser.failureText(err)}) catch "⚠ failed"
+            else
+                "⚠ failed";
+            var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal });
+            fonts.addRich(tl, msg);
+            tl.deinit();
+            retryButton(engine, gi);
+        },
+        .canceled => {
+            dvui.label(@src(), "⚠ canceled", .{}, .{});
+            retryButton(engine, gi);
+        },
     }
+}
+
+/// Re-queue this image in place (see `Diffuser.retry`).
+fn retryButton(engine: *diffuser.Diffuser, gi: *GenImage) void {
+    if (dvui.button(@src(), "Try again", .{}, .{ .margin = .{ .y = 2 } }))
+        engine.retry(gi) catch |err| std.log.err("retry image: {t}", .{err});
 }

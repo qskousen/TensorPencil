@@ -333,10 +333,25 @@ pub const Workspace = struct {
 /// CPU rather than silently producing something.
 pub fn supported(ctx: *gpu.Context, model: *const DiT) bool {
     if (model.layers.len == 0) return false;
-    const dt = model.layers[0].attn.qkv.dtype;
-    if (!zimage.gpuLinKindSupported(dt)) return false;
-    if (dt == .bf16 or dt == .f16) {
-        return ctx.pipe_coop_bf16w != .null_handle or ctx.pipe_coop_f16w != .null_handle;
+    // ⚠️ Every layer, and every dtype checked against what THIS device has — a bf16 weight
+    // needs one of the f16-weight coop pipelines and an NVFP4 one needs the decode entry.
+    const Cap = struct {
+        var has_f16w: bool = false;
+        var has_nvfp4: bool = false;
+        fn f(dt: @import("tp_core").dtype.DType) bool {
+            return switch (dt) {
+                .bf16, .f16 => has_f16w,
+                .nvfp4 => has_nvfp4,
+                else => true,
+            };
+        }
+    };
+    Cap.has_f16w = ctx.pipe_coop_bf16w != .null_handle or ctx.pipe_coop_f16w != .null_handle;
+    Cap.has_nvfp4 = ctx.hasNvfp4Decode();
+    if (zimage.unsupportedGpuLin(model, Cap.f)) |bad| {
+        std.log.warn("zimage_gpu: {s} is {t}, which this device has no GEMM for — the trunk " ++
+            "runs on the CPU. Expect CPU sampling speed.", .{ bad.tag, bad.dtype });
+        return false;
     }
     return true;
 }
@@ -384,6 +399,13 @@ pub fn forward(
 
     try ctx.tensorUpload(ws.mv_d, std.mem.sliceAsBytes(step.mods));
     try ctx.tensorUpload(ws.imgin_d, std.mem.sliceAsBytes(patches));
+
+    // Pre-size the NVFP4 decode scratch to the model's widest linear BEFORE the batch
+    // opens; growing it mid-forward flushes the recording batch.
+    {
+        const need = zimage.maxNvfp4Scratch(model, gpu.Context.nvfp4ScratchBytes);
+        if (need > 0) try ctx.ensureDeviceBuffer(&ctx.nvfp4_w16, need);
+    }
 
     try ctx.beginBatch();
     errdefer if (ctx.batching) ctx.abortBatch();
@@ -477,9 +499,12 @@ fn blockForward(
     }, rows * dim, 1, 1);
 
     // The fused qkv as three zero-copy row views — see the module header.
-    const wq = qkvPart(blk.attn.qkv, 0, cfg.qDim());
-    const wk = qkvPart(blk.attn.qkv, cfg.qDim(), cfg.kvDim());
-    const wv = qkvPart(blk.attn.qkv, cfg.qDim() + cfg.kvDim(), cfg.kvDim());
+    var nvq: ops.nvfp4.Meta = undefined;
+    var nvk: ops.nvfp4.Meta = undefined;
+    var nvv: ops.nvfp4.Meta = undefined;
+    const wq = qkvPart(blk.attn.qkv, 0, cfg.qDim(), &nvq);
+    const wk = qkvPart(blk.attn.qkv, cfg.qDim(), cfg.kvDim(), &nvk);
+    const wv = qkvPart(blk.attn.qkv, cfg.qDim() + cfg.kvDim(), cfg.kvDim(), &nvv);
     try gemm(ctx, ws.q_d, ws.nrm_d, rows, wq);
     try gemm(ctx, ws.k_d, ws.nrm_d, rows, wk);
     try gemm(ctx, ws.v_d, ws.nrm_d, rows, wv);
@@ -637,11 +662,18 @@ fn attention(ctx: *gpu.Context, cfg: zimage.Config, ws: *Workspace, rows: usize,
 /// A contiguous row range of the fused `[q_dim + 2*kv_dim, dim]` qkv weight, as a
 /// `Weight` in its own right. Zero-copy: `[q|k|v]` are row blocks, so this is a
 /// slice, and the device weight cache keys on the pointer.
-fn qkvPart(w: Weight, row0: usize, nrows: usize) Weight {
+fn qkvPart(w: Weight, row0: usize, nrows: usize, nv: *ops.nvfp4.Meta) Weight {
     const row_bytes = w.dtype.storageBytes(w.cols);
     var s = w;
     s.rows = nrows;
     s.bytes = w.bytes[row0 * row_bytes ..][0 .. nrows * row_bytes];
+    // ⚠️ An NVFP4 weight's per-block scales have to be row-sliced too, into caller-owned
+    // storage that outlives the returned `Weight`. Without it the k and v views would read
+    // q's block scales — see `ops.nvfp4.Meta.rowSlice`.
+    if (w.nvfp4) |m| {
+        nv.* = m.rowSlice(w.cols, row0, nrows);
+        s.nvfp4 = nv;
+    }
     return s;
 }
 
@@ -670,6 +702,13 @@ fn gemm(ctx: *gpu.Context, y: Buf, x: Buf, m: usize, w: Weight) !void {
             }
         },
         .f16 => try ctx.opMatmulCoopF16Wh(y, 0, x, m, w.bytes, w.rows, w.cols, zeros),
+        // Weight-only NVFP4: decoded to an f16 scratch inside the GEMM, so the 4-bit form
+        // stays resident. ⚠️ `zeros` is the FULL vector for the reason above.
+        .nvfp4 => {
+            std.debug.assert(w.rows % 128 == 0 and w.cols % 32 == 0);
+            const meta = w.nvfp4.?;
+            try ctx.opMatmulNvfp4(y, x, m, w.bytes, meta.scales, std.mem.asBytes(&meta.levels.bf16v), w.rows, w.cols, zeros);
+        },
         .f32, .f8_e4m3 => try ctx.opMatmul(y, 0, x, 0, m, w.bytes, w.dtype == .f8_e4m3, w.rows, w.cols, w.scale, null),
         // `zimage.gpuLinKindSupported` gates this before a session is built, so
         // reaching here is a programming error rather than a bad checkpoint.
@@ -761,7 +800,8 @@ test "the fused qkv splits into three row views the CPU forward agrees with" {
 
     // Three row-view GEMMs, as `blockForward` does.
     inline for (.{ .{ 0, q_dim }, .{ q_dim, kv_dim }, .{ q_dim + kv_dim, kv_dim } }, 0..) |part, pi| {
-        const sub = qkvPart(w, part[0], part[1]);
+        var nv: ops.nvfp4.Meta = undefined;
+        const sub = qkvPart(w, part[0], part[1], &nv);
         try testing.expectEqual(@as(usize, part[1]), sub.rows);
         try testing.expectEqual(dim, sub.cols);
         const got = try gpa.alloc(f32, m * part[1]);

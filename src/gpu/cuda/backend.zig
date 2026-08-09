@@ -20,7 +20,7 @@ const sample = @import("tp_core").sample;
 
 const Context = ctxmod.Context;
 
-pub const Error = error{ CudaError, OutOfMemory, NoSuitableDevice, DeviceOutOfMemory };
+pub const Error = error{ CudaError, OutOfMemory, NoSuitableDevice, DeviceOutOfMemory, UnsupportedWidth };
 
 /// Coordinator hook for freeing VRAM held by a DIFFERENT device context on the
 /// same card (see `Backend.foreign_reclaim`). Returns the bytes actually freed;
@@ -389,6 +389,10 @@ pub const Backend = struct {
     // hand-PTX fused kernel folds the rescale into the C-store and needs no acc
     // buffer, but cuBLASLt emits raw s32, rescaled by a separate irescale pass.
     i8_acc: DeviceBuffer = .{},
+    // Transient int8 form of a packed W4A8 weight (w4a8ToI8): one buffer at the
+    // model's widest weight, reused by every GEMM. Keeping it transient is the whole
+    // reason the format costs 4 bits per weight here instead of 8 — see opI8GemmW4A8.
+    w4a8_i8: DeviceBuffer = .{},
 
     // tensor-core attention scratch (per-head, reused across heads/calls; grown
     // to the largest seq seen). f16 Q/K/Vt tiles, f32 scores, f16 probs, f32 out.
@@ -693,6 +697,7 @@ pub const Backend = struct {
         self.tensorDestroy(&self.i8_x);
         self.tensorDestroy(&self.i8_scale);
         self.tensorDestroy(&self.i8_acc);
+        self.tensorDestroy(&self.w4a8_i8);
         self.tensorDestroy(&self.cudnn_q16);
         self.tensorDestroy(&self.cudnn_k16);
         self.tensorDestroy(&self.cudnn_v16);
@@ -1645,7 +1650,17 @@ pub const Backend = struct {
     fn prepFn(self: *Backend, cols: usize, in_f16: bool) Error!cu.CUfunction {
         const key = cols | (if (in_f16) @as(usize, 1) << 40 else 0); // f16-input variant keyed separately
         if (self.prep_mods.get(key)) |f| return f;
-        const ptx = kernels.buildPrep(self.gpa, cols, 8, in_f16) catch return error.OutOfMemory;
+        // ⚠️ Distinguish the two failures: `UnsupportedWidth` means the FWHT would give
+        // each thread zero butterflies (cols < 1024), which is a silent non-rotation the
+        // generator now refuses — reporting it as OutOfMemory would send a reader after
+        // memory. No live linear is that narrow (the narrowest here is 1024).
+        const ptx = kernels.buildPrep(self.gpa, cols, 8, in_f16) catch |e| switch (e) {
+            error.UnsupportedWidth => {
+                std.log.err("prep: {d}-wide reduction is narrower than one convrot group per thread", .{cols});
+                return error.UnsupportedWidth;
+            },
+            else => return error.OutOfMemory,
+        };
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         const f = mod.getFunction(self.ctx, "iprep") catch return error.CudaError;
@@ -1801,6 +1816,117 @@ pub const Backend = struct {
             const f_hg = try self.hgemmFn();
             try self.launchHgemm(f_hg, self.fp8_a16, self.fp8_w16, y, mpad, rows, cols);
         }
+    }
+
+    /// NVFP4 GEMM: `y[m][rows] f32 = x[m][cols] f32 @ Wᵀ`, W a packed NVFP4 weight.
+    ///
+    /// Structurally the fp8 path above: the 4-bit weight streams through the cache, is
+    /// decoded to an f16 scratch, and the validated f16 GEMM produces f32. **Weight-only
+    /// quantization, which is what NVFP4 is on anything below Blackwell** — its tensor
+    /// cores are sm_100+, and ComfyUI itself falls back to exactly this shape (its log
+    /// calls it "emulated ops"): keep the weight 4-bit resident, dequantize per call.
+    ///
+    /// `scales` are the UNSWIZZLED per-block fp8 bytes and `levels` the `[256][16]` f16
+    /// table, both built once by the loader — so the resident cost is
+    /// `rows*cols/2 + rows*cols/16 + 8192` instead of the 2 bytes/weight an f16 copy
+    /// would take.
+    ///
+    /// ⚠️ Shares `fp8_w16`/`fp8_a16` with the fp8 path. They hold the same thing (an f16
+    /// weight and activation scratch at the same sizes) and no forward uses both formats
+    /// for one GEMM, so one pair serves both rather than doubling the scratch.
+    pub fn opMatmulNvfp4(
+        self: *Backend,
+        y: DeviceBuffer,
+        x: DeviceBuffer,
+        m: usize,
+        packed_bytes: []const u8,
+        scales: []const u8,
+        levels: []const u8,
+        rows: usize,
+        cols: usize,
+        /// A zero vector of at least `rows` entries, from a STABLE full-width array the
+        /// caller owns. ⚠️ NOT `Backend.zeroBias`: that reallocates on growth and returns
+        /// the whole buffer, so its pointer moves — and `cachedWeight` keys on the host
+        /// pointer, which would leave a device buffer registered against a freed address
+        /// for a later allocation to collide with. Every caller already has a file-scope
+        /// `zero_bias` for exactly this reason (see `zimage_cuda.gemm`'s note).
+        bias: []const f32,
+    ) Error!void {
+        self.ptic();
+        defer self.ptoc(.matmul);
+        std.debug.assert(packed_bytes.len == rows * cols / 2);
+        std.debug.assert(scales.len == rows * cols / 16);
+        std.debug.assert(bias.len >= rows);
+        const w_db = try self.cachedWeight(packed_bytes);
+        const s_db = try self.cachedWeight(scales);
+        const l_db = try self.cachedWeight(levels);
+        const mpad = std.mem.alignForward(usize, m, 128);
+        try self.ensureDeviceBuffer(&self.fp8_w16, rows * cols * 2);
+        try self.ensureDeviceBuffer(&self.fp8_a16, mpad * cols * 2);
+        const f_deq = try self.eltFn(elt.nvfp4_decode_ptx, "nvfp4_decode");
+        const threads = rows * cols / 8; // 8 elements (4 packed bytes) per thread
+        try self.eltLaunch(f_deq, w_db, s_db, l_db, self.fp8_w16, .{ @intCast(threads), 0, 0, 0, 0, 0 }, .{ 0, 0 }, threads);
+        // ⚠️ **cuBLASLt takes an arbitrary `m` and writes exactly `m` rows**, so the libs
+        // arm needs neither the padded staging buffer nor the compaction pass below — the
+        // same fast path `opGemmBf16` takes. Forcing it through them cost two extra kernels
+        // per GEMM plus ~2x the output volume in traffic (486 MB written + 481 MB
+        // read-and-rewritten for one 1120x1680 MLP weight), which is what made `cuda`
+        // measure SLOWER than the hand-PTX arm at small sizes — an ordering that
+        // contradicts every other table in BACKEND.md and was the tell.
+        if (self.kernels == .libs) {
+            try self.ensureDeviceBuffer(&self.fp8_a16, m * cols * 2);
+            const f_c = try self.eltFn(elt.f32_to_bf16_pad2d_ptx, "f32_to_bf16_pad2d");
+            try self.eltLaunch(f_c, x, self.fp8_a16, null, null, .{ @intCast(m * cols), @intCast(cols), @intCast(m), @intCast(cols), 0, 0 }, .{ 0, 0 }, m * cols);
+            try self.ltMatmulBf16(y, self.fp8_w16, self.fp8_a16, rows, m, cols);
+            return;
+        }
+        // ⚠️ **bf16, not f16** — see `ops/nvfp4.zig`. The decoded weights are tiny, but this
+        // converts the ACTIVATION to the same format, and Z-Image's trunk activations pass
+        // f16's 65504 ceiling: an f16 path rendered it solid white on all three backends
+        // identically. `f32_to_bf16_pad2d` zeroes the m-padding the GEMM's C tiles read.
+        const f_cvt = try self.eltFn(elt.f32_to_bf16_pad2d_ptx, "f32_to_bf16_pad2d");
+        try self.eltLaunch(f_cvt, x, self.fp8_a16, null, null, .{ @intCast(mpad * cols), @intCast(cols), @intCast(m), @intCast(cols), 0, 0 }, .{ 0, 0 }, mpad * cols);
+        // ⚠️ **The GEMM writes `mpad` rows, not `m`** — `launchHgemm` dispatches
+        // `grid.y = mpad/128` and each block stores a whole 128x128 C tile, and the
+        // cuBLASLt arm is handed `mpad` too. So it CANNOT write straight into a caller
+        // buffer sized for `m`: measured as `CUDA_ERROR_ILLEGAL_ADDRESS` on Z-Image's
+        // first `[10240, 3840]` MLP weight at m=288/mpad=384, i.e. 3.9 MB past the end of
+        // a workspace sized `m*rows`. It stages into the padded `conv_c` and compacts,
+        // exactly as `opGemmBf16` does for the same reason.
+        //
+        // ⚠️ `opMatmulFp8` above still writes `y` directly and therefore carries the same
+        // requirement on its callers implicitly ("the text encoder writes each GEMM to its
+        // own buffer"); its zimage/anima `.f8_e4m3` arms have never been exercised. Worth
+        // fixing the same way if an fp8 checkpoint for either ever shows up.
+        try self.ensureDeviceBuffer(&self.conv_c, mpad * rows * 4);
+        const f_hg = try self.hgemmBf16Fn();
+        try self.launchHgemm(f_hg, self.fp8_a16, self.fp8_w16, self.conv_c, mpad, rows, cols);
+        // Strip the row padding into the tight `y`. These linears have no bias, but
+        // `bias_compact` needs a buffer regardless — the caller's full-width zero array.
+        const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias));
+        const f_bc = try self.eltFn(elt.bias_compact_ptx, "bias_compact");
+        try self.eltLaunch(f_bc, self.conv_c, b_db, y, null, .{ @intCast(m * rows), @intCast(rows), @intCast(rows), 0, 0, 0 }, .{ 1.0, 0 }, m * rows);
+    }
+
+    /// Decode a packed NVFP4 weight to bf16 in `fp8_w16` and return it — the decode half of
+    /// `opMatmulNvfp4`, exposed so a device test can check the kernel against
+    /// `ops.nvfp4.decode` without a GEMM in the way.
+    pub fn nvfp4ToBf16(
+        self: *Backend,
+        packed_bytes: []const u8,
+        scales: []const u8,
+        levels: []const u8,
+        rows: usize,
+        cols: usize,
+    ) Error!DeviceBuffer {
+        const w_db = try self.cachedWeight(packed_bytes);
+        const s_db = try self.cachedWeight(scales);
+        const l_db = try self.cachedWeight(levels);
+        try self.ensureDeviceBuffer(&self.fp8_w16, rows * cols * 2);
+        const f = try self.eltFn(elt.nvfp4_decode_ptx, "nvfp4_decode");
+        const threads = rows * cols / 8;
+        try self.eltLaunch(f, w_db, s_db, l_db, self.fp8_w16, .{ @intCast(threads), 0, 0, 0, 0, 0 }, .{ 0, 0 }, threads);
+        return self.fp8_w16;
     }
 
     /// Fused fp8 GEMV for m=1 decode: y[rows] f32 = scale * (W fp8 [rows][cols] @ x).
@@ -3166,10 +3292,88 @@ pub const Backend = struct {
     /// int8 GEMM + fused rescale against the last opI8Prep:
     /// y[m][rows] = prepped @ Wᵀ * act_scale[row] * weight_scale[col] (f32).
     pub fn opI8Gemm(self: *Backend, y: DeviceBuffer, w_bytes: []const u8, weight_scale: []const f32, rows: usize, c_h16: bool) Error!void {
+        const w_db = try self.cachedWeight(w_bytes);
+        return self.opI8GemmDev(y, w_db, weight_scale, rows, c_h16);
+    }
+
+    /// Decode a packed ComfyUI `asym_w4a8_int8` weight into a reusable device scratch
+    /// and run the ordinary int8 GEMM on it.
+    ///
+    /// ⚠️ **The point of the scratch is that the 4-bit form stays resident**: a decoded
+    /// krea2 is 12.2 GB of int8 against 6.1 GB packed, and materializing at load costs
+    /// exactly the memory the format exists to save. This is also what ComfyUI's own
+    /// Triton and CUDA backends do (`_dequant_int4_grouped_to_int8` into a per-call
+    /// buffer, then `int8_linear`). The extra traffic is one 1.5x pass over the weight
+    /// per GEMM, ~1% of a krea2 step.
+    ///
+    /// ⚠️ One scratch serves every GEMM, so a decode must not be reordered past the
+    /// GEMM that consumes the previous one. That holds here because both are issued on
+    /// `ctx.stream` and CUDA kernels on one stream serialize; do NOT move either into a
+    /// concurrent stream without giving each its own scratch.
+    pub fn opI8GemmW4A8(
+        self: *Backend,
+        y: DeviceBuffer,
+        packed_bytes: []const u8,
+        s_rel: []const u8,
+        levels: []const u8,
+        weight_scale: []const f32,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        c_h16: bool,
+    ) Error!void {
+        const w_db = try self.w4a8ToI8(packed_bytes, s_rel, levels, rows, cols, group_size);
+        return self.opI8GemmDev(y, w_db, weight_scale, rows, c_h16);
+    }
+
+    /// Bytes of int8 scratch a W4A8 weight of this shape decodes into here — the raw
+    /// `[rows][cols]` the hand-PTX and cuBLASLt int8 GEMMs both read directly. (Vulkan's
+    /// rule differs: its GEMM wants a row-padded k-major copy.)
+    pub fn w4a8ScratchBytes(rows: usize, cols: usize) usize {
+        return rows * cols;
+    }
+
+    /// Decode packed W4A8 -> int8 into `self.w4a8_i8` and return it.
+    ///
+    /// The packed weight, its fp8 group scales and its 4 KiB level table all go through
+    /// the ordinary weight cache, so they stream and evict like any other weight — the
+    /// resident cost is `rows*cols/2 + rows*cols/group_size + 4096` instead of
+    /// `rows*cols`.
+    pub fn w4a8ToI8(
+        self: *Backend,
+        packed_bytes: []const u8,
+        s_rel: []const u8,
+        levels: []const u8,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+    ) Error!DeviceBuffer {
+        self.ptic();
+        defer self.ptoc(.prep);
+        std.debug.assert(packed_bytes.len == rows * cols / 2);
+        std.debug.assert(s_rel.len == rows * cols / group_size);
+        // The kernel reads FOUR packed bytes per thread and so loads one group scale per
+        // thread; that is only valid when a u32 of packed bytes (8 columns, 8-aligned)
+        // lies inside one group. `dit_cuda` gates on the same predicate.
+        std.debug.assert(group_size % 8 == 0);
+        const p_db = try self.cachedWeight(packed_bytes);
+        const s_db = try self.cachedWeight(s_rel);
+        const l_db = try self.cachedWeight(levels);
+        // Sized here rather than grown mid-forward where possible; growth syncs the
+        // stream (see ensureDeviceBuffer), so it is safe either way, just not free.
+        try self.ensureDeviceBuffer(&self.w4a8_i8, rows * cols);
+        const f = try self.eltFn(elt.w4a8_decode_ptx, "w4a8_decode");
+        const threads = rows * cols / 8; // 8 elements (4 packed bytes) per thread
+        try self.eltLaunch(f, p_db, s_db, l_db, self.w4a8_i8, .{
+            @intCast(threads), @intCast(group_size / 8), 0, 0, 0, 0,
+        }, .{ 0, 0 }, threads);
+        return self.w4a8_i8;
+    }
+
+    fn opI8GemmDev(self: *Backend, y: DeviceBuffer, w_db: DeviceBuffer, weight_scale: []const f32, rows: usize, c_h16: bool) Error!void {
         self.ptic();
         defer self.ptoc(.matmul);
         std.debug.assert(!c_h16 or self.kernels == .libs); // f16 output only on the cuBLASLt/irescale path
-        const w_db = try self.cachedWeight(w_bytes);
         const ws_db = try self.cachedWeight(std.mem.sliceAsBytes(weight_scale));
         if (self.kernels == .libs) return self.opI8GemmLibs(y, w_db, ws_db, rows, c_h16);
         const f = try self.fusedFn();
@@ -3188,7 +3392,17 @@ pub const Backend = struct {
 
     fn i4prepFn(self: *Backend, cols: usize) Error!cu.CUfunction {
         if (self.i4_prep_mods.get(cols)) |f| return f;
-        const ptx = kernels.buildPrep(self.gpa, cols, 4, false) catch return error.OutOfMemory;
+        // ⚠️ Distinguish the two failures: `UnsupportedWidth` means the FWHT would give
+        // each thread zero butterflies (cols < 1024), which is a silent non-rotation the
+        // generator now refuses — reporting it as OutOfMemory would send a reader after
+        // memory. No live linear is that narrow (the narrowest here is 1024).
+        const ptx = kernels.buildPrep(self.gpa, cols, 4, false) catch |e| switch (e) {
+            error.UnsupportedWidth => {
+                std.log.err("prep: {d}-wide reduction is narrower than one convrot group per thread", .{cols});
+                return error.UnsupportedWidth;
+            },
+            else => return error.OutOfMemory,
+        };
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         const f = mod.getFunction(self.ctx, "i4prep") catch return error.CudaError;

@@ -56,7 +56,7 @@ const zero_bias: [mlp_dim]f32 = @splat(0);
 /// bf16 (each linear a standalone f16 tensor-core GEMM); an fp8-e4m3 checkpoint
 /// streams each linear through the dequant-to-f16 + hgemm path. Uniform across
 /// blocks.
-const LinKind = enum { i8, i4, bf16, fp8 };
+const LinKind = enum { i8, i4, w4a8, nvfp4, bf16, fp8 };
 
 /// Prep the shared linear input. int8/int4 rotate+quantize `x` in place (all the
 /// block's GEMMs then read that internal state); bf16/fp8 GEMMs consume the f32
@@ -64,8 +64,13 @@ const LinKind = enum { i8, i4, bf16, fp8 };
 fn linPrep(be: *Backend, kind: LinKind, x: DeviceBuffer, m: usize, cols: usize) !void {
     switch (kind) {
         .i4 => try be.opI4Prep(x, m, cols),
-        .i8 => try be.opI8Prep(x, m, cols, false),
-        .bf16, .fp8 => {},
+        // W4A8's activation prep IS int8's: the "A8" in the name is exactly that the
+        // activation stays 8-bit, so only the WEIGHT's storage differs. That is also
+        // what lets a mixed int8/W4A8 checkpoint share one prep per group.
+        .i8, .w4a8 => try be.opI8Prep(x, m, cols, false),
+        // NVFP4 needs no prep: it is weight-only here (its own activation quantization is
+        // the Blackwell-only path), so the GEMM consumes the f32 `x` like bf16/fp8 do.
+        .nvfp4, .bf16, .fp8 => {},
     }
 }
 
@@ -79,7 +84,7 @@ fn lin(be: *Backend, kind: LinKind, y: DeviceBuffer, x: DeviceBuffer, m: usize, 
     try probeLinInput(be, kind, x, m, w);
     switch (kind) {
         .i4 => try be.opI4Gemm(y, w.bytes, w.row_scale.?, w.rows),
-        .i8 => try be.opI8Gemm(y, w.bytes, w.row_scale.?, w.rows, false),
+        .i8, .w4a8 => try i8GemmW(be, y, w, false),
         // Ampere+ feeds raw bf16 straight to the tensor cores (no f16 convert, so
         // a streamed weight is touched once); older cards fall back to the
         // GPU-side bf16→f16 GEMM.
@@ -88,6 +93,17 @@ fn lin(be: *Backend, kind: LinKind, y: DeviceBuffer, x: DeviceBuffer, m: usize, 
         else
             try be.opMatmulBf16(y, x, m, w.bytes, w.rows, w.cols, bias[0..w.rows]),
         .fp8 => try be.opMatmulFp8(y, x, m, w.bytes, w.scale, w.rows, w.cols),
+        .nvfp4 => try be.opMatmulNvfp4(
+            y,
+            x,
+            m,
+            w.bytes,
+            w.nvfp4.?.scales,
+            std.mem.asBytes(&w.nvfp4.?.levels.bf16v),
+            w.rows,
+            w.cols,
+            &zero_bias,
+        ),
     }
 }
 
@@ -123,11 +139,35 @@ fn probeInput(be: *Backend, x: DeviceBuffer, m: usize, w: anytype) !void {
     p.input(p.ctx, w, host, m);
 }
 
+/// One int8-convrot GEMM, dispatching on how the weight is STORED rather than on the
+/// model's `LinKind`: a plain int8 weight goes straight to the GEMM, a packed W4A8 one
+/// is decoded into the backend's transient scratch first. Both then run the identical
+/// int8 kernel, so this is the only place the two storage forms differ — and dispatching
+/// per weight rather than per model means a checkpoint that mixes them computes
+/// correctly even though krea2's `LinKind` is still one value for the whole trunk.
+fn i8GemmW(be: *Backend, y: DeviceBuffer, w: anytype, c_h16: bool) !void {
+    if (w.dtype == .w4a8) {
+        const meta = w.w4a8.?;
+        return be.opI8GemmW4A8(
+            y,
+            w.bytes,
+            meta.s_rel,
+            std.mem.asBytes(meta.levels),
+            w.row_scale.?,
+            w.rows,
+            w.cols,
+            meta.group_size,
+            c_h16,
+        );
+    }
+    return be.opI8Gemm(y, w.bytes, w.row_scale.?, w.rows, c_h16);
+}
+
 /// `probeInput` for the block linears, which are the only GEMMs here whose input
 /// may already have been consumed in place.
 fn probeLinInput(be: *Backend, kind: LinKind, x: DeviceBuffer, m: usize, w: anytype) !void {
     if (ops.matmul.probe == null) return;
-    if (kind == .i8 or kind == .i4) return; // see the note above
+    if (kind == .i8 or kind == .i4 or kind == .w4a8) return; // see the note above
     try probeInput(be, x, m, w);
 }
 
@@ -491,6 +531,8 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
     const kind: LinKind = switch (wqt) {
         .i8 => .i8,
         .i4 => .i4,
+        .w4a8 => .w4a8,
+        .nvfp4 => .nvfp4,
         .bf16 => .bf16,
         .f8_e4m3 => .fp8,
         else => unreachable, // gated above
@@ -499,7 +541,17 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
     // f16 activation chain (c16): only on the cuBLASLt/irescale int8 libs path.
     // Halves the mlp gate/up/silu/down-input DRAM traffic (the biggest eltwise
     // category). Hand-PTX (igemm_pipe_fused writes f32), int4, and bf16 keep f32.
-    const mlp_f16 = (be.kernels == .libs) and kind == .i8;
+    const mlp_f16 = (be.kernels == .libs) and (kind == .i8 or kind == .w4a8);
+    if (dit.w4a8SmallGroup(model)) |tag| {
+        std.log.err("dit cuda: {s} is W4A8 with a group_size that is not a multiple of 8; " ++
+            "this backend's decode kernel needs one scale per 8 columns (use --backend cpu or vulkan)", .{tag});
+        return error.UnsupportedCheckpoint;
+    }
+    // Pre-size the W4A8 decode scratch to the model's widest weight, so it never grows
+    // mid-forward: growth is safe (ensureDeviceBuffer syncs the stream first) but the
+    // first block would pay several syncs for nothing.
+    if (dit.anyW4A8(model))
+        try be.ensureDeviceBuffer(&be.w4a8_i8, dit.maxW4A8Scratch(model, Backend.w4a8ScratchBytes));
 
     // patch embed: x[seq_txt..] = img_in @ first^T + bias
     const first_f8 = model.first.w.dtype == .f8_e4m3;
@@ -550,8 +602,8 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
             if (mlp_f16) {
                 // gate/up GEMMs emit f16 (irescale_h16); silu_mul_h16 reads/writes
                 // f16; the down prep reads f16 — halving the 16384-dim traffic.
-                try be.opI8Gemm(mg_d, blk.mlp.gate.bytes, blk.mlp.gate.row_scale.?, blk.mlp.gate.rows, true);
-                try be.opI8Gemm(mu_d, blk.mlp.up.bytes, blk.mlp.up.row_scale.?, blk.mlp.up.rows, true);
+                try i8GemmW(be, mg_d, blk.mlp.gate, true);
+                try i8GemmW(be, mu_d, blk.mlp.up, true);
                 try be.siluMul16(mg_d, mu_d, tile * mlp_dim);
                 try be.opI8Prep(mg_d, tile, blk.mlp.down.cols, true);
             } else {
@@ -578,4 +630,136 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
     defer gpa.free(final_rows);
     try be.tensorDownload(imgin_d, std.mem.sliceAsBytes(final_rows));
     DiT.unpatchify(out, final_rows, lat_h, lat_w);
+}
+
+// --- tests -----------------------------------------------------------------
+
+// The CUDA W4A8 decode kernel against the CPU decode it must reproduce. Synthetic
+// weights, so no checkpoint is needed — which is the point: the kernel's only earlier
+// validation was that a real render came out bit-identical to the load-time
+// materialization, and that check stops being reproducible the moment the checkpoint
+// leaves the disk.
+//
+// ⚠️ Covers what the PTX quietly assumes and a render would not localize: the `prmt.b32`
+// byte packing (its selector nibbles must stay under 8 or the instruction
+// sign-replicates), the `v2.u32` store's 8-byte alignment, and the one-group-scale-per-
+// thread shortcut that makes `group_size % 8 == 0` a requirement.
+test "the CUDA W4A8 decode matches ops.w4a8.decode" {
+    const gpa = std.testing.allocator;
+    const w4a8 = ops.w4a8;
+    const test_gate = @import("../test_gate.zig");
+    try test_gate.requireIntegration();
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+
+    const cases = [_]struct { rows: usize, cols: usize, gs: usize }{
+        .{ .rows = 256, .cols = 512, .gs = 16 },
+        .{ .rows = 128, .cols = 1024, .gs = 32 },
+        .{ .rows = 64, .cols = 256, .gs = 8 }, // the smallest group the kernel allows
+    };
+    // ⚠️ Every case's buffers stay ALIVE in one arena, and that is load-bearing rather
+    // than tidy: both device weight caches key on the HOST POINTER, so freeing a case's
+    // arrays and letting the allocator hand the same address to the next case scores a
+    // stale cache hit and the kernel reads the previous case's weights. Found the hard
+    // way — this test failed on its third case with the first case's data. (A model
+    // never hits it: the weights live in the model arena for the model's lifetime.)
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    for (cases) |c| {
+        var rnd = std.Random.DefaultPrng.init(0xA8 + c.cols);
+        const r = rnd.random();
+        const packed_bytes = try alloc.alloc(u8, c.rows * c.cols / 2);
+        r.bytes(packed_bytes);
+        // Every fp8 byte including NaN (0x7F/0xFF); the level table sends those to 0 on
+        // both sides, so this pins that they agree rather than diverging where neither
+        // reference defines a value.
+        const s_rel = try alloc.alloc(u8, c.rows * c.cols / c.gs);
+        r.bytes(s_rel);
+        const levels = try alloc.create(w4a8.Levels);
+        levels.* = w4a8.Levels.init(&w4a8.fixed_lut);
+
+        const want = try alloc.alloc(i8, c.rows * c.cols);
+        w4a8.decode(want, packed_bytes, s_rel, levels, c.rows, c.cols, c.gs);
+
+        const db = try be.w4a8ToI8(packed_bytes, s_rel, std.mem.asBytes(levels), c.rows, c.cols, c.gs);
+        const got = try alloc.alloc(i8, c.rows * c.cols);
+        try be.tensorDownload(db, std.mem.sliceAsBytes(got));
+
+        for (want, got, 0..) |wv, gv, i| {
+            std.testing.expectEqual(wv, gv) catch |e| {
+                std.debug.print("rows {d} cols {d} gs {d}: element {d} (row {d}, col {d}) got {d}, want {d}\n", .{
+                    c.rows, c.cols, c.gs, i, i / c.cols, i % c.cols, gv, wv,
+                });
+                return e;
+            };
+        }
+    }
+}
+
+// The CUDA NVFP4 decode kernel against the CPU decode it must reproduce. Synthetic
+// weights, so no checkpoint is needed.
+//
+// ⚠️ f16 output, so this is a TOLERANCE against the f32 CPU decode rather than an
+// equality — but a tight one, because both sides read the same level table and f16 only
+// rounds the store. The bound is set from f16's own quantum, so a nibble-order or
+// block-index error (which move values by whole levels) cannot hide inside it.
+test "the CUDA NVFP4 decode matches ops.nvfp4.decode" {
+    const gpa = std.testing.allocator;
+    const nvfp4 = ops.nvfp4;
+    const test_gate = @import("../test_gate.zig");
+    try test_gate.requireIntegration();
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+
+    const cases = [_]struct { rows: usize, cols: usize }{
+        .{ .rows = 128, .cols = 256 },
+        .{ .rows = 64, .cols = 1024 },
+        .{ .rows = 16, .cols = 16 }, // one block per row
+    };
+    // One arena for every case: the weight cache keys on the HOST POINTER, so reusing an
+    // address across cases would score a stale hit and decode the previous case's bytes.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    for (cases) |c| {
+        var rnd = std.Random.DefaultPrng.init(0xF4 + c.cols);
+        const r = rnd.random();
+        const packed_bytes = try alloc.alloc(u8, c.rows * c.cols / 2);
+        r.bytes(packed_bytes);
+        // Every fp8 byte including NaN: the level table maps those identically on both
+        // sides, so this pins that they agree rather than diverging where nothing defines
+        // a value.
+        const scales = try alloc.alloc(u8, c.rows * c.cols / nvfp4.block_size);
+        r.bytes(scales);
+        const levels = try alloc.create(nvfp4.Levels);
+        levels.* = nvfp4.Levels.init(0.0125);
+        const meta: nvfp4.Meta = .{ .scales = scales, .levels = levels };
+
+        const want = try alloc.alloc(f32, c.rows * c.cols);
+        nvfp4.decode(want, packed_bytes, meta, c.rows, c.cols);
+
+        const db = try be.nvfp4ToBf16(packed_bytes, scales, std.mem.asBytes(&levels.bf16v), c.rows, c.cols);
+        const got_bits = try alloc.alloc(u16, c.rows * c.cols);
+        try be.tensorDownload(db, std.mem.sliceAsBytes(got_bits));
+
+        for (want, got_bits, 0..) |wv, gb, i| {
+            const gv: f32 = @bitCast(@as(u32, gb) << 16); // bf16 -> f32
+            // ⚠️ A NaN block-scale byte (fp8 0x7F/0xFF) PROPAGATES here, unlike `.w4a8`
+            // whose int8 target forces it to 0 — and it propagates in the reference too,
+            // so agreeing on NaN is the correct outcome, not a hole in the check.
+            const both_nan = std.math.isNan(wv) and std.math.isNan(gv);
+            // Otherwise bf16 rounds the value and nothing else may change it: 8 mantissa
+            // bits is 2^-8 relative. A wrong nibble or block index moves by at least one
+            // E2M1 level (>= 1/6 of the value), far outside this.
+            const tol = @max(@abs(wv) * 5e-3, 1e-30);
+            std.testing.expect(both_nan or @abs(gv - wv) <= tol) catch |e| {
+                std.debug.print("{d}x{d}: element {d} (row {d}, col {d}) got {d}, want {d}\n", .{
+                    c.rows, c.cols, i, i / c.cols, i % c.cols, gv, wv,
+                });
+                return e;
+            };
+        }
+    }
 }

@@ -22,6 +22,22 @@ pub const DType = enum {
     /// DiT loader reinterprets them as `.i4` with the logical [rows, cols].
     /// Sub-byte, so `byteSize` is undefined; use `storageBytes` for lengths.
     i4,
+    /// ComfyUI's `asym_w4a8_int8`: 4-bit UNSIGNED indices into a 16-entry
+    /// codebook, two per byte (same nibble order as `.i4`), which decode to an
+    /// int8-convrot weight via a per-group fp8 scale. Same 4 bits per element as
+    /// `.i4` and deliberately a DISTINCT dtype: the levels are non-uniform, so
+    /// reading these nibbles as signed int4 times a per-row scale is finite,
+    /// plausible and wrong. The sidecars a decode needs (`s_rel`, the level
+    /// table, the group size) hang off `ops.matmul.Weight.w4a8`; see
+    /// `ops/w4a8.zig`. Sub-byte, so use `storageBytes` for lengths.
+    w4a8,
+    /// ComfyUI's NVFP4: 4-bit **E2M1 floats** with an fp8 per-16-element block scale and
+    /// a per-tensor scale. A distinct dtype from `.i4`/`.w4a8` because all three of its
+    /// conventions differ — element 2k is the HIGH nibble, the block scales arrive
+    /// swizzled, and there is no ConvRot rotation or per-output-row scale. Sidecars hang
+    /// off `ops.matmul.Weight.nvfp4`; see `ops/nvfp4.zig`. Sub-byte, so use
+    /// `storageBytes` for lengths.
+    nvfp4,
     u16,
     i16,
     u32,
@@ -117,7 +133,7 @@ pub const DType = enum {
             .f16, .bf16, .u16, .i16 => .{ .byte_size = 2, .bit_size = 16, .block_elems = 1, .block_bytes = null },
             .f32, .u32, .i32 => .{ .byte_size = 4, .bit_size = 32, .block_elems = 1, .block_bytes = null },
             .f64, .u64, .i64 => .{ .byte_size = 8, .bit_size = 64, .block_elems = 1, .block_bytes = null },
-            .i4 => .{ .byte_size = null, .bit_size = 4, .block_elems = 1, .block_bytes = null },
+            .i4, .w4a8, .nvfp4 => .{ .byte_size = null, .bit_size = 4, .block_elems = 1, .block_bytes = null },
             .q4_0 => .{ .byte_size = null, .bit_size = null, .block_elems = 32, .block_bytes = 18 },
             .q8_0 => .{ .byte_size = null, .bit_size = null, .block_elems = 32, .block_bytes = 34 },
             .q4_k => .{ .byte_size = null, .bit_size = null, .block_elems = 256, .block_bytes = 144 },

@@ -541,16 +541,29 @@ test "open via buffered read round trip (read_mode = .buffered)" {
     try std.testing.expectEqualSlices(f32, &.{ 1.0, -2.0 }, vals);
 }
 
-// Validation against the real Krea 2 checkpoints; skipped when models/ is not
-// present (e.g. CI or a fresh checkout).
+// Validation against the real Krea 2 checkpoints; each block skipped when its own
+// file is not present (e.g. CI, a fresh checkout, or a pruned models/ dir).
+//
+// ⚠️ **Per file, not once for the set.** This used to guard on the VAE alone and then
+// open the DiT and the text encoder unconditionally, so deleting any ONE of the three
+// hard-failed a *fast-suite* test with a bare `FileNotFound` five frames deep — which is
+// exactly what happened when the krea2 fp8 checkpoint was pruned off this box. A
+// real-model check has to self-skip on the file it actually needs.
 test "real model headers" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    const vae_path = "models/vae/krea2RealVae_v10.safetensors";
-    std.Io.Dir.cwd().access(io, vae_path, .{}) catch return error.SkipZigTest;
+    const have = struct {
+        fn f(io_: std.Io, path: []const u8) bool {
+            std.Io.Dir.cwd().access(io_, path, .{}) catch return false;
+            return true;
+        }
+    }.f;
+    var checked: usize = 0;
 
-    {
+    const vae_path = "models/vae/krea2RealVae_v10.safetensors";
+    if (have(io, vae_path)) {
+        checked += 1;
         var st = try SafeTensors.open(gpa, io, vae_path);
         defer st.deinit();
         try std.testing.expectEqual(@as(usize, 194), st.count());
@@ -559,8 +572,10 @@ test "real model headers" {
         try std.testing.expectEqualSlices(usize, &.{ 384, 16, 3, 3, 3 }, conv1.info.shape.slice());
     }
 
-    {
-        var st = try SafeTensors.open(gpa, io, "models/diffusion_model/krea2CenterSemiraw_v10Fp8.safetensors");
+    const dit_path = "models/diffusion_model/krea2CenterSemiraw_v10Fp8.safetensors";
+    if (have(io, dit_path)) {
+        checked += 1;
+        var st = try SafeTensors.open(gpa, io, dit_path);
         defer st.deinit();
         try std.testing.expectEqual(@as(usize, 431), st.count());
         const wq = try st.require("blocks.0.attn.wq.weight");
@@ -573,8 +588,10 @@ test "real model headers" {
         try std.testing.expectEqualSlices(usize, &.{10000}, sigmas.info.shape.slice());
     }
 
-    {
-        var st = try SafeTensors.open(gpa, io, "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors");
+    const te_path = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors";
+    if (have(io, te_path)) {
+        checked += 1;
+        var st = try SafeTensors.open(gpa, io, te_path);
         defer st.deinit();
         try std.testing.expectEqual(@as(usize, 1217), st.count());
         const emb = try st.require("model.language_model.embed_tokens.weight");
@@ -587,4 +604,8 @@ test "real model headers" {
         try std.testing.expectEqual(DType.f32, scale.info.dtype);
         _ = try scale.asScalarF32();
     }
+
+    // Report a skip rather than a silent pass when none of the three is present: a green
+    // "real model headers" that checked no real model is worse than no test.
+    if (checked == 0) return error.SkipZigTest;
 }

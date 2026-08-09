@@ -150,6 +150,14 @@ pub const Session = struct {
         // get uploaded (~235 MB) where before only the host read them. They are uploaded
         // once and cached, against 1.2 s of host GEMM per image.
         {
+            // Pre-size the W4A8 decode scratch to the model's widest linear before any
+            // batch opens. Growth is safe (`ensureDeviceBuffer` syncs the stream first)
+            // but the first block would otherwise pay several syncs for nothing. One
+            // sizing serves the cross-K/V batch below and every later forward, since it
+            // is the model-wide maximum.
+            const need = anima.maxW4A8Scratch(model, Backend.w4a8ScratchBytes);
+            if (need > 0) try be.ensureDeviceBuffer(&be.w4a8_i8, need);
+
             var cond_d = try be.tensorCreate(cond.len * 4);
             defer be.tensorDestroy(&cond_d);
             try be.tensorUpload(cond_d, std.mem.sliceAsBytes(cond));
@@ -262,8 +270,17 @@ pub fn supported(model: *const DiT) bool {
     // ⚠️ EVERY block's linears, not block 0's — see `anima.unsupportedLin`. This arm HAS
     // int8/int4 convrot (`opI8Prep`/`opI8Gemm`), which the Vulkan one does not, so the
     // support set is passed rather than assumed.
-    // Both CUDA arms have int8 AND int4 convrot.
-    return anima.unsupportedLin(model, .{ .i8 = true, .i4 = true }) == null;
+    // Both CUDA arms have int8 AND int4 convrot, plus the W4A8 and NVFP4 decode kernels.
+    if (anima.unsupportedLin(model, .{ .i8 = true, .i4 = true, .w4a8 = true, .nvfp4 = true }) != null) return false;
+    // ⚠️ The W4A8 decode kernel reads four packed bytes per thread as one `u32`, so a
+    // group must not straddle that word. Checked here rather than asserted in `lin`:
+    // a checkpoint we cannot run belongs on the CPU, not in a panic.
+    if (anima.w4a8SmallGroup(model)) |tag| {
+        std.log.err("anima_cuda: {s} is W4A8 with a group_size that is not a multiple of 8; " ++
+            "the CUDA decode kernel needs one (Vulkan's is general)", .{tag});
+        return false;
+    }
+    return true;
 }
 
 const LinKind = anima.LinKind;
@@ -281,24 +298,25 @@ const kindOf = anima.linKind;
 /// The prep state is global and each call replaces it, so every group that contains a
 /// quantized linear pays exactly one prep.
 fn prepGroup(be: *Backend, x: Buf, m: usize, cols: usize, group: []const Weight) !void {
-    var want: ?LinKind = null;
+    // ⚠️ Grouped by the PREP a kind needs, not by the kind: int8 and W4A8 share one
+    // (`anima.prepKind` says why), so a block mixing them pays a single `opI8Prep`.
+    var want: anima.PrepKind = .none;
     for (group) |w| {
-        const k = kindOf(w);
-        if (k == .dense) continue;
-        if (want) |prev| {
-            // ⚠️ int8 and int4 in ONE group would need two preps of the same activation
-            // and two live prep states, which the backend does not have. No checkpoint
-            // does this; refuse loudly rather than silently use the wrong scale set.
-            if (prev != k) {
-                std.log.err("anima_cuda: a linear group mixes {t} and {t}; one prep cannot serve both", .{ prev, k });
-                return error.UnsupportedCheckpoint;
-            }
-        } else want = k;
+        const k = anima.prepKind(kindOf(w));
+        if (k == .none) continue;
+        // ⚠️ int8 and int4 in ONE group would need two preps of the same activation
+        // and two live prep states, which the backend does not have. No checkpoint
+        // does this; refuse loudly rather than silently use the wrong scale set.
+        if (want != .none and want != k) {
+            std.log.err("anima_cuda: a linear group mixes {t} and {t} activation preps; one cannot serve both", .{ want, k });
+            return error.UnsupportedCheckpoint;
+        }
+        want = k;
     }
-    switch (want orelse return) {
+    switch (want) {
         .i8 => try be.opI8Prep(x, m, cols, false),
         .i4 => try be.opI4Prep(x, m, cols),
-        .dense => unreachable,
+        .none => {},
     }
 }
 
@@ -319,6 +337,23 @@ fn lin(be: *Backend, y: Buf, x: Buf, m: usize, w: Weight) !void {
         .i4 => {
             std.debug.assert(w.rows % 128 == 0);
             try be.opI4Gemm(y, w.bytes, w.row_scale.?, w.rows);
+        },
+        // W4A8 reads the SAME prep state and runs the SAME int8 GEMM as `.i8` above; the
+        // only difference is that the packed 4-bit weight is decoded into a device scratch
+        // on the way in, so the 4-bit form stays resident (see `quant_weight.w4a8`).
+        .w4a8 => {
+            std.debug.assert(w.rows % 128 == 0);
+            const meta = w.w4a8.?;
+            try be.opI8GemmW4A8(y, w.bytes, meta.s_rel, std.mem.asBytes(meta.levels), w.row_scale.?, w.rows, w.cols, meta.group_size, false);
+        },
+        // Weight-only NVFP4: the 4-bit weight is decoded to an f16 scratch inside the
+        // GEMM and the packed form stays resident. `rows % 128` / `cols % 32` come from
+        // the f16 GEMM it feeds; every NVFP4 layer in the shipped checkpoints satisfies
+        // both (audited across all three families).
+        .nvfp4 => {
+            std.debug.assert(w.rows % 128 == 0 and w.cols % 32 == 0);
+            const meta = w.nvfp4.?;
+            try be.opMatmulNvfp4(y, x, m, w.bytes, meta.scales, std.mem.asBytes(&meta.levels.bf16v), w.rows, w.cols, &zero_bias);
         },
         .dense => try gemm(be, y, x, m, w),
     }

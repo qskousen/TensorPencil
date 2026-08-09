@@ -127,7 +127,7 @@ fn i8PrepIndex(cols: usize) ?usize {
     return null;
 }
 
-pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, rope_qwen35, attn_decode_q35, attn_dsplit_gemma, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, attn_dsplit_gemma_f16, kv_store_f16, penalize, attn_dsplit_gemma_q8, kv_store_q8_0, gemv_iq4_nl, gemv_iq4_nl_t, dequant_q8_0_f32, dequant_q4_k_f32, dequant_q5_k_f32, dequant_q6_k_f32, dequant_iq4_nl_f32, pack_h16_kmajor, gn_stats, gn_combine, gn_apply, silu, geglu, concat_ch, attn_cross, head_pad_h16, head_unpad, im2col_sd, attn_causal_batched, gelu_quick, gelu_erf, gn_stats_h16, gn_apply_h16, add_h16, bias_compact_h16, im2col_sd_h16, h16_to_h16_pad };
+pub const Elt = enum(usize) { rmsnorm, rms_partial, rms_combine, rms_apply_mod, rms_apply_mod_h16, modulate, gated_add, add, silu_mul, sigmoid_mul, silu_mul_h16, sigmoid_mul_h16, rope_inter, attention, gather_kmajor, gather_kmajor_h16, attn_scores, softmax_partial, softmax_combine, softmax_rows, attn_out, f32_to_h16, f32_to_h16_pad, vae_norm, im2col, bias_compact, qknorm_rope16, gather_kmajor16, silu_mul16, sigmoid_mul_g16, gated_add16, rope_half, copy, rotate, rotate_fwht, rowmax_i8, rowscale_i8, quantize_i8, w4a8_decode_t, i4_decode_t, nvfp4_decode_t, scale_i32, scale_concat, qknorm_rope_f32, rms_apply_w, attn_dsplit, attn_dmerge, gemv_partial, gemv_combine, gemv_partial4, gemv_combine4, gemv_q8_0, gemv_q4_k, gemv_q5_k, gemv_q6_k, l2norm_rows, deinterleave2, gdn_gates, gdn_conv_step, gdn_delta_step, rope_qwen35, attn_decode_q35, attn_dsplit_gemma, gemv_q6_k_t, gemv_q8_0_t, gemv_q4_k_t, gemv_q5_k_t, gelu_mul, gelu, layernorm, attn_full, f32_to_bf16_pad, relu, add_relu, argmax_reduce, argmax_final, topk_reduce, attn_dsplit_gemma_f16, kv_store_f16, penalize, attn_dsplit_gemma_q8, kv_store_q8_0, gemv_iq4_nl, gemv_iq4_nl_t, dequant_q8_0_f32, dequant_q4_k_f32, dequant_q5_k_f32, dequant_q6_k_f32, dequant_iq4_nl_f32, pack_h16_kmajor, gn_stats, gn_combine, gn_apply, silu, geglu, concat_ch, attn_cross, head_pad_h16, head_unpad, im2col_sd, attn_causal_batched, gelu_quick, gelu_erf, gn_stats_h16, gn_apply_h16, add_h16, bias_compact_h16, im2col_sd_h16, h16_to_h16_pad };
 const elt_entry_sizes = [_]EntrySize{
     .{ .name = "rmsnorm", .x = 64, .y = 1 },
     .{ .name = "rms_partial", .x = 256, .y = 1 },
@@ -167,6 +167,9 @@ const elt_entry_sizes = [_]EntrySize{
     .{ .name = "rowmax_i8", .x = 64, .y = 1 },
     .{ .name = "rowscale_i8", .x = 64, .y = 1 },
     .{ .name = "quantize_i8", .x = 256, .y = 1 },
+    .{ .name = "w4a8_decode_t", .x = 256, .y = 1 },
+    .{ .name = "i4_decode_t", .x = 256, .y = 1 },
+    .{ .name = "nvfp4_decode_t", .x = 256, .y = 1 },
     .{ .name = "scale_i32", .x = 256, .y = 1 },
     .{ .name = "scale_concat", .x = 256, .y = 1 },
     .{ .name = "qknorm_rope_f32", .x = 64, .y = 1 },
@@ -658,6 +661,18 @@ pub const Context = struct {
     /// Stage A: assembled [act(m_pad) | weight(rows)] scale buffer for the
     /// fused-rescale GEMM (rebuilt per GEMM by scale_concat; batch-safe).
     i8_scalecat: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
+    /// Transient k-major int8 form of a packed W4A8 weight (`w4a8Decode`): one buffer
+    /// at the model's widest weight, reused by every GEMM. Transient on purpose — a
+    /// resident int8 copy of krea2 is 12.2 GB against 6.1 GB packed.
+    w4a8_t: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
+    /// Transient k-major int8 form of a nibble-packed int4-convrot weight (`i4Decode`).
+    /// Separate from `w4a8_t` only so a model mixing the two formats cannot have one
+    /// decode's output overwritten by the other's; both are a few MB.
+    i4_t: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
+    /// Transient bf16 form of a packed NVFP4 weight (`nvfp4Decode`), in the coop GEMM's
+    /// padded k-major layout. Transient because NVFP4's whole point here is that the
+    /// 4-bit weight is what stays resident.
+    nvfp4_w16: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
     /// Shape of the activation last prepped by opI8Prep (consumed by opI8Gemm).
     i8_m: usize = 0,
     i8_cols: usize = 0,
@@ -1697,7 +1712,7 @@ pub const Context = struct {
             }
             self.small_bufs.deinit(self.gpa);
         }
-        for ([_]*DeviceBuffer{ &self.x_dev, &self.y_dev, &self.raw_dev, &self.deq_f32, &self.deq_f16k, &self.dp4a_xi8, &self.dp4a_xscale, &self.dummy, &self.pen_wire, &self.x_h16, &self.y_pad, &self.i8_xr, &self.i8_scale, &self.i8_x, &self.i8_acc, &self.i8_acc1, &self.i8_acc2, &self.i8_acc3, &self.i8_hadamard, &self.i8_partials, &self.i8_scalecat }) |db| {
+        for ([_]*DeviceBuffer{ &self.x_dev, &self.y_dev, &self.raw_dev, &self.deq_f32, &self.deq_f16k, &self.dp4a_xi8, &self.dp4a_xscale, &self.dummy, &self.pen_wire, &self.x_h16, &self.y_pad, &self.i8_xr, &self.i8_scale, &self.i8_x, &self.i8_acc, &self.i8_acc1, &self.i8_acc2, &self.i8_acc3, &self.i8_hadamard, &self.i8_partials, &self.i8_scalecat, &self.w4a8_t, &self.i4_t, &self.nvfp4_w16 }) |db| {
             if (db.buf != .null_handle) {
                 self.freeDeviceBuffer(db.*);
             }
@@ -2863,6 +2878,7 @@ pub const Context = struct {
         y: DeviceBuffer,
         x_i8: DeviceBuffer,
         m_pad: usize,
+        w_buf_in: ?vk.Buffer,
         w_bytes: []const u8,
         rows: usize,
         cols: usize,
@@ -2871,7 +2887,7 @@ pub const Context = struct {
         const ntile = 16 * coopmat.i8_nt;
         std.debug.assert(self.pipe_coop_i8 != .null_handle);
         std.debug.assert(m_pad % mtile == 0 and rows % ntile == 0 and cols % 32 == 0);
-        const w_buf = try self.weightBuffer(w_bytes, 1, rows, cols);
+        const w_buf = w_buf_in orelse try self.weightBuffer(w_bytes, 1, rows, cols);
         const w_stride: u32 = @intCast(std.mem.alignForward(usize, rows, tile_n));
         const push: [4]u32 = .{ @intCast(m_pad), @intCast(rows), @intCast(cols), w_stride };
         // Prefer the shared-memory kernel when the shape fits its 128x128 wg
@@ -2906,6 +2922,7 @@ pub const Context = struct {
         y: DeviceBuffer,
         x_i8: DeviceBuffer,
         m_pad: usize,
+        w_buf_in: ?vk.Buffer,
         w_bytes: []const u8,
         rows: usize,
         cols: usize,
@@ -2917,7 +2934,9 @@ pub const Context = struct {
         if (pipe == .null_handle or
             m_pad % 128 != 0 or rows % 128 != 0 or cols % 64 != 0 or w_stride % 4 != 0)
             return false;
-        const w_buf = try self.weightBuffer(w_bytes, 1, rows, cols);
+        // `w_buf_in` is an ALREADY k-major device buffer (the W4A8 decode writes one
+        // per GEMM); otherwise upload+transpose the host bytes through the weight cache.
+        const w_buf = w_buf_in orelse try self.weightBuffer(w_bytes, 1, rows, cols);
         const push: [4]u32 = .{ @intCast(m_pad), @intCast(rows), @intCast(cols), w_stride };
         try self.opBegin();
         var set = self.bind4(.{ w_buf, x_i8.buf, y.buf, scale_buf });
@@ -2997,6 +3016,140 @@ pub const Context = struct {
     /// `c_h16` stores y half-precision (feeds the fused f16 attention chain);
     /// only honored on the fused shared path (falls back to f32 s32+scale_i32).
     pub fn opI8Gemm(self: *Context, y: DeviceBuffer, w_bytes: []const u8, weight_scale: []const f32, rows: usize, c_h16: bool) Error!void {
+        return self.opI8GemmBuf(y, null, w_bytes, weight_scale, rows, c_h16);
+    }
+
+    /// int8 GEMM against a PACKED ComfyUI `asym_w4a8_int8` weight: decode it into the
+    /// GEMM's own k-major layout in a reusable scratch (one recorded dispatch), then run
+    /// the ordinary int8 GEMM on that.
+    ///
+    /// ⚠️ **Keeping the packed form resident is the point** — a decoded krea2 is 12.2 GB
+    /// of int8 against 6.1 GB packed, which is the whole difference between this format
+    /// and int8 — so the int8 form is transient and re-decoded per GEMM. ComfyUI's own
+    /// Triton and CUDA backends do the same.
+    ///
+    /// ⚠️ ONE scratch serves every GEMM, so the decode must stay ordered with respect to
+    /// the GEMM consuming the previous one. Both are recorded through `opElt`/`opBegin`,
+    /// which insert the batch's write→read barrier, so a plain sequence is safe — but do
+    /// NOT put a group of these inside `ctx.independent(...)`.
+    pub fn opI8GemmW4A8(
+        self: *Context,
+        y: DeviceBuffer,
+        packed_bytes: []const u8,
+        s_rel: []const u8,
+        levels: []const u8,
+        weight_scale: []const f32,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        c_h16: bool,
+    ) Error!void {
+        const w_buf = try self.w4a8Decode(packed_bytes, s_rel, levels, rows, cols, group_size);
+        return self.opI8GemmBuf(y, w_buf, &.{}, weight_scale, rows, c_h16);
+    }
+
+    /// Whether this context can decode a packed W4A8 weight at all. The decode is an
+    /// eltwise entry, so it needs that pipeline plus the int8 coop GEMM it feeds; a
+    /// device without either must be REFUSED rather than fall through to the fp8 arm,
+    /// which would read the packed nibbles as e4m3 and render a blank image.
+    pub fn hasW4A8Decode(self: *const Context) bool {
+        return self.pipe_coop_i8 != .null_handle and
+            self.pipes_e[@intFromEnum(Elt.w4a8_decode_t)] != .null_handle;
+    }
+
+    /// Bytes of k-major int8 scratch a W4A8 weight of this shape decodes into.
+    /// `dit_gpu` pre-sizes with the max over the model so `ensureDeviceBuffer` never has
+    /// to flush a recording batch mid-forward.
+    pub fn w4a8ScratchBytes(rows: usize, cols: usize) usize {
+        return std.mem.alignForward(usize, rows, tile_n) * cols;
+    }
+
+    /// Decode a packed W4A8 weight into `self.w4a8_t` (k-major int8) and return it.
+    ///
+    /// ⚠️ **Both inputs go through `weightBuffer`, i.e. they are BYTE-TRANSPOSED once at
+    /// load and cached**, exactly like a dense weight. That is a performance requirement,
+    /// not tidiness: decoding straight from the row-major storage means transposing per
+    /// GEMM, and the strided side of that measured **1757 ms/step against a ~20 ms
+    /// bandwidth roof** (a warp's 32 lanes land in 32 separate sectors per load).
+    /// Pre-transposing costs the same one-time pass every other weight already pays and
+    /// leaves every stream in the per-GEMM decode coalesced.
+    ///
+    /// The transposed shapes are `[cols/2][stride]` packed and `[cols/group_size][stride]`
+    /// fp8, with the SAME `stride = align(rows, tile_n)` as the GEMM's own weight layout —
+    /// which is what lets one thread index all three by the same row-quad offset.
+    pub fn w4a8Decode(
+        self: *Context,
+        packed_bytes: []const u8,
+        s_rel: []const u8,
+        levels: []const u8,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+    ) Error!vk.Buffer {
+        std.debug.assert(packed_bytes.len == rows * cols / 2);
+        std.debug.assert(s_rel.len == rows * cols / group_size);
+        std.debug.assert(group_size % 2 == 0);
+        const stride = std.mem.alignForward(usize, rows, tile_n);
+        std.debug.assert(stride % 4 == 0);
+        try self.ensureDeviceBuffer(&self.w4a8_t, w4a8ScratchBytes(rows, cols));
+        const p: DeviceBuffer = .{ .buf = try self.weightBuffer(packed_bytes, 1, rows, cols / 2), .mem = .null_handle, .size = 0 };
+        const sc: DeviceBuffer = .{ .buf = try self.weightBuffer(s_rel, 1, rows, cols / group_size), .mem = .null_handle, .size = 0 };
+        const lv: DeviceBuffer = .{ .buf = try self.smallBuffer(levels), .mem = .null_handle, .size = 0 };
+        const quads = stride / 4;
+        const total = (cols / 2) * quads;
+        try self.opElt(.w4a8_decode_t, p, self.w4a8_t, sc, lv, .{
+            .u0 = @intCast(total),
+            .u1 = @intCast(group_size / 2),
+            .u2 = @intCast(quads),
+            .u3 = 0,
+            .u4 = 0,
+            .u5 = 0,
+            .u6 = 0,
+        }, total, 1, 1);
+        return self.w4a8_t.buf;
+    }
+
+    /// Whether a nibble-packed int4-convrot weight can be decoded on the device instead of
+    /// being widened to int8 at load. Needs the int8 coop pipeline the decode feeds.
+    pub fn hasI4Decode(self: *const Context) bool {
+        return self.pipe_coop_i8 != .null_handle and
+            self.pipes_e[@intFromEnum(Elt.i4_decode_t)] != .null_handle;
+    }
+
+    /// Bytes of k-major int8 scratch an int4 weight of this shape decodes into. Identical
+    /// to `w4a8ScratchBytes` — the decoded form is the same int8 either format produces.
+    pub fn i4ScratchBytes(rows: usize, cols: usize) usize {
+        return std.mem.alignForward(usize, rows, tile_n) * cols;
+    }
+
+    /// Unpack a nibble-packed int4-convrot weight into `self.i4_t` (k-major int8) and return
+    /// it, for `opI8GemmBuf` to consume with the weight's per-row scale.
+    ///
+    /// ⚠️ **The packed form stays resident**, which is the whole point: widening at load put
+    /// a full int8 copy in VRAM (1778 MB against this path's ~1050 on `terraRising`) for
+    /// weights that are 4-bit on disk. Same trade `w4a8Decode` already makes, and the two
+    /// share the pre-transposed `weightBuffer` input path.
+    pub fn i4Decode(self: *Context, packed_bytes: []const u8, rows: usize, cols: usize) Error!vk.Buffer {
+        std.debug.assert(packed_bytes.len == rows * cols / 2);
+        const stride = std.mem.alignForward(usize, rows, tile_n);
+        std.debug.assert(stride % 4 == 0);
+        try self.ensureDeviceBuffer(&self.i4_t, i4ScratchBytes(rows, cols));
+        const p: DeviceBuffer = .{ .buf = try self.weightBuffer(packed_bytes, 1, rows, cols / 2), .mem = .null_handle, .size = 0 };
+        const quads = stride / 4;
+        const total = (cols / 2) * quads;
+        try self.opElt(.i4_decode_t, p, self.i4_t, null, null, .{
+            .u0 = @intCast(total),
+            .u1 = @intCast(quads),
+            .u2 = 0,
+            .u3 = 0,
+            .u4 = 0,
+            .u5 = 0,
+            .u6 = 0,
+        }, total, 1, 1);
+        return self.i4_t.buf;
+    }
+
+    pub fn opI8GemmBuf(self: *Context, y: DeviceBuffer, w_buf_in: ?vk.Buffer, w_bytes: []const u8, weight_scale: []const f32, rows: usize, c_h16: bool) Error!void {
         std.debug.assert(self.pipe_coop_i8 != .null_handle);
         std.debug.assert(rows % (16 * coopmat.i8_nt) == 0);
         const m = self.i8_m;
@@ -3018,12 +3171,12 @@ pub const Context = struct {
                 .u1 = @intCast(m),
                 .u2 = @intCast(self.i8_mpad),
             }, total, 1, 1);
-            if (try self.opMatmulCoopI8Fused(y, self.i8_x, self.i8_mpad, w_bytes, rows, self.i8_cols, self.i8_scalecat.buf, c_h16))
+            if (try self.opMatmulCoopI8Fused(y, self.i8_x, self.i8_mpad, w_buf_in, w_bytes, rows, self.i8_cols, self.i8_scalecat.buf, c_h16))
                 return;
         }
         // Fallback: s32 GEMM + separate scale_i32 pass.
         try self.ensureDeviceBuffer(&self.i8_acc, self.i8_mpad * rows * 4);
-        try self.opMatmulCoopI8(self.i8_acc, self.i8_x, self.i8_mpad, w_bytes, rows, self.i8_cols);
+        try self.opMatmulCoopI8(self.i8_acc, self.i8_x, self.i8_mpad, w_buf_in, w_bytes, rows, self.i8_cols);
         try self.opElt(.scale_i32, self.i8_acc, y, ws_buf, self.i8_scale, .{
             .u0 = @intCast(m * rows),
             .u1 = @intCast(rows),
@@ -3047,7 +3200,7 @@ pub const Context = struct {
     pub fn opI8GemmRaw(self: *Context, acc: *DeviceBuffer, w_bytes: []const u8, rows: usize) Error!void {
         std.debug.assert(rows % (16 * coopmat.i8_nt) == 0);
         try self.ensureDeviceBuffer(acc, self.i8_mpad * rows * 4);
-        try self.opMatmulCoopI8(acc.*, self.i8_x, self.i8_mpad, w_bytes, rows, self.i8_cols);
+        try self.opMatmulCoopI8(acc.*, self.i8_x, self.i8_mpad, null, w_bytes, rows, self.i8_cols);
     }
 
     /// Rescale an int8 GEMM accumulator: y = acc * act_scale * weight_scale.
@@ -3416,6 +3569,97 @@ pub const Context = struct {
     /// back into the same host array would silently keep the first forward's
     /// values. The SD UNet folds each ResBlock's time-embedding projection into
     /// its convolution bias, which is exactly that case.
+    /// NVFP4 GEMM: `y[m][rows] f32 = x[m][cols] f32 @ Wᵀ`, W a packed NVFP4 weight.
+    ///
+    /// Decodes the 4-bit weight to f16 in the GEMM's own `[k_pad][n_pad]` k-major layout
+    /// (one recorded dispatch) and runs the existing f16-weight coop GEMM on it. **The
+    /// 4-bit form stays resident**, which is what NVFP4 is below Blackwell and what
+    /// ComfyUI does there too.
+    ///
+    /// ⚠️ Both inputs go through `weightBuffer` — byte-transposed once at load and cached,
+    /// exactly like a dense weight. Not tidiness: the alternative is transposing inside
+    /// the per-GEMM decode, whose strided side cost the W4A8 kernel 1757 ms/step before
+    /// the same fix. `scales` are already unswizzled by the loader.
+    ///
+    /// ⚠️ ONE scratch serves every GEMM, so a decode must stay ordered against the GEMM
+    /// consuming the previous one. Both are recorded through `opElt`/`opBegin`, which
+    /// insert the batch's write→read barrier — but do NOT put a group of these inside
+    /// `independent(...)`.
+    pub fn opMatmulNvfp4(
+        self: *Context,
+        y: DeviceBuffer,
+        x: DeviceBuffer,
+        m: usize,
+        packed_bytes: []const u8,
+        scales: []const u8,
+        levels: []const u8,
+        rows: usize,
+        cols: usize,
+        bias: []const f32,
+    ) Error!void {
+        std.debug.assert(packed_bytes.len == rows * cols / 2);
+        std.debug.assert(scales.len == rows * cols / 16);
+        const w_buf = try self.nvfp4Decode(packed_bytes, scales, levels, rows, cols);
+        // ⚠️ `bf16_ab = true`: the decode emits bf16 and this converts the ACTIVATION to
+        // match. f16 would clip Z-Image's trunk activations at 65504 and render white —
+        // see `ops/nvfp4.zig`.
+        return self.coopF16WDispatch(y, 0, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, true, 1.0, false, false);
+    }
+
+    /// Bytes of bf16 scratch an NVFP4 weight of this shape decodes into — the padded
+    /// k-major layout `coopF16WDispatch` reads. `dit_gpu` pre-sizes with the max over the
+    /// model so `ensureDeviceBuffer` never flushes a recording batch mid-forward.
+    pub fn nvfp4ScratchBytes(rows: usize, cols: usize) usize {
+        return std.mem.alignForward(usize, cols, 64) * std.mem.alignForward(usize, rows, 128) * 2;
+    }
+
+    /// Decode a packed NVFP4 weight to bf16 in `self.nvfp4_w16` and return it. Public so a
+    /// gated device test can check the kernel against `ops.nvfp4.decode` directly.
+    pub fn nvfp4Decode(
+        self: *Context,
+        packed_bytes: []const u8,
+        scales: []const u8,
+        levels: []const u8,
+        rows: usize,
+        cols: usize,
+    ) Error!vk.Buffer {
+        const nblk = cols / 16;
+        const n_pad = std.mem.alignForward(usize, rows, 128);
+        const k_pad = std.mem.alignForward(usize, cols, 64);
+        try self.ensureDeviceBuffer(&self.nvfp4_w16, nvfp4ScratchBytes(rows, cols));
+        const p: DeviceBuffer = .{ .buf = try self.weightBuffer(packed_bytes, 1, rows, cols / 2), .mem = .null_handle, .size = 0 };
+        const sc: DeviceBuffer = .{ .buf = try self.weightBuffer(scales, 1, rows, nblk), .mem = .null_handle, .size = 0 };
+        const lv: DeviceBuffer = .{ .buf = try self.smallBuffer(levels), .mem = .null_handle, .size = 0 };
+        // The two inputs share `weightBuffer`'s row stride; the output has its own.
+        const sin = std.mem.alignForward(usize, rows, tile_n);
+        std.debug.assert(sin % 4 == 0);
+        // ⚠️ The dispatch covers the OUTPUT's row quads (n_pad), not the inputs' (sin):
+        // the two paddings differ (128 vs tile_n), and sizing by the input leaves the
+        // output's row padding unwritten for the GEMM to read as stale.
+        const in_quads = sin / 4;
+        const out_quads = n_pad / 4;
+        const total = (k_pad / 2) * out_quads;
+        try self.opElt(.nvfp4_decode_t, p, self.nvfp4_w16, sc, lv, .{
+            .u0 = @intCast(total),
+            .u1 = @intCast(out_quads),
+            .u2 = @intCast(n_pad),
+            .u3 = @intCast(rows),
+            .u4 = @intCast(cols),
+            .u5 = @intCast(in_quads),
+            .u6 = 0,
+        }, total, 1, 1);
+        return self.nvfp4_w16.buf;
+    }
+
+    /// Whether this context can decode a packed NVFP4 weight. Needs the decode entry and
+    /// the f16-weight coop GEMM it feeds; without both a caller must REFUSE rather than
+    /// fall through to the fp8 arm, which would read the packed nibbles as e4m3 and render
+    /// a blank image with no error.
+    pub fn hasNvfp4Decode(self: *const Context) bool {
+        return self.pipe_coop_f16w != .null_handle and
+            self.pipes_e[@intFromEnum(Elt.nvfp4_decode_t)] != .null_handle;
+    }
+
     fn coopF16WDispatch(
         self: *Context,
         y: DeviceBuffer,

@@ -98,6 +98,7 @@ const std = @import("std");
 const tp_core = @import("tp_core");
 const weights_mod = tp_core.weights;
 const ops = @import("tp_ops");
+const quant_weight = @import("quant_weight.zig");
 
 const WeightStore = weights_mod.WeightStore;
 const Weight = ops.matmul.Weight;
@@ -752,7 +753,6 @@ pub const DiT = struct {
         return ropeFreqsFor(gpa, self.cfg, h, w);
     }
 
-
     /// One denoiser forward. `x_lat` is the planar `[16][lat_h][lat_w]` sampler
     /// latent, `ctx` the adapter's `[ctx_seq][context_dim]` output, and `out`
     /// receives the predicted velocity in the same planar layout.
@@ -1008,7 +1008,6 @@ pub const DiT = struct {
     }
 };
 
-
 /// The 3-axis RoPE table for a `[h, w]` token grid at `T = 1`, ready for
 /// `applyRotateHalf`. Caller `deinit`s.
 ///
@@ -1231,12 +1230,21 @@ pub const UnsupportedLin = struct { block: usize, tag: []const u8, dtype: DType 
 /// mixed checkpoint is mixed by block: `easonAnimaHOTStyle_animaV10-INT8_CONVROT` leaves
 /// block 0 entirely dense, quantizes block 1's ten attention/MLP linears, and quantizes all
 /// sixteen in blocks 2-27. A per-model kind would be wrong for at least one block of it.
-pub const LinKind = enum { dense, i8, i4 };
+pub const LinKind = enum { dense, i8, i4, w4a8, nvfp4 };
 
 pub fn linKind(w: Weight) LinKind {
     return switch (w.dtype) {
         .i8 => .i8,
         .i4 => .i4,
+        // ⚠️ W4A8 is its own kind even though its GEMM *is* the int8 one: only the
+        // WEIGHT's storage differs, so it shares int8's activation prep (see `prepKind`)
+        // but needs a decode step the plain int8 entry point does not have.
+        .w4a8 => .w4a8,
+        // ⚠️ NVFP4 is its OWN kind, not `.dense`. It needs no activation prep (weight-only
+        // here, so the GEMM takes f32 `x` like a dense weight does) but it does need its
+        // own GEMM entry point — and `gemm`'s dense arm would read the packed nibbles as
+        // fp8 or f32, which is finite, plausible and wrong.
+        .nvfp4 => .nvfp4,
         else => .dense,
     };
 }
@@ -1247,27 +1255,110 @@ pub fn linKind(w: Weight) LinKind {
 pub const LinSupport = struct {
     i8: bool = false,
     i4: bool = false,
+    /// Needs the backend's W4A8 decode kernel plus the int8 GEMM it feeds — so it implies
+    /// `i8`, and a backend with int8 but no decode kernel must still say false here.
+    w4a8: bool = false,
+    /// Needs the backend's NVFP4 decode kernel plus the f16-weight GEMM it feeds.
+    nvfp4: bool = false,
 };
+
+/// The activation prep a linear's GEMM reads, which is NOT one-to-one with `LinKind`.
+///
+/// ⚠️ **W4A8 and int8 share one prep, and that is what makes a mixed checkpoint work.**
+/// The "A8" is exactly that the activation stays 8-bit: only the weight's storage differs,
+/// so a group holding both kinds needs one `opI8Prep`, not two. Treating them as distinct
+/// here would refuse `terraRising_20TerraRisingAnima-ASYM_W4A8_INT8` (whose block 1 has
+/// W4A8 attention weights beside block 0's dense ones) as an unserviceable mix.
+pub const PrepKind = enum { none, i8, i4 };
+
+pub fn prepKind(k: LinKind) PrepKind {
+    return switch (k) {
+        .i8, .w4a8 => .i8,
+        .i4 => .i4,
+        // Weight-only: the GEMM reads the f32 activation, like a dense one does.
+        .nvfp4, .dense => .none,
+    };
+}
 
 /// The first block linear this backend cannot run, or null if it can run all of them.
 pub fn unsupportedLin(model: *const DiT, support: LinSupport) ?UnsupportedLin {
     for (model.blocks, 0..) |*b, bi| {
-        // Every linear the DEVICE forward runs. The AdaLN pair and cross-attention's
-        // k/v are deliberately absent: those are evaluated on the host
-        // (`modulationTable`, `crossKv`), where the CPU `matmul` handles convrot, so
-        // their dtype does not gate the device path.
-        const lins = [_]Weight{
-            b.self_attn.q,  b.self_attn.k,  b.self_attn.v,  b.self_attn.out,
-            b.cross_attn.q, b.cross_attn.out,
-            b.mlp1,         b.mlp2,
-        };
-        for (lins) |w| {
+        for (deviceLins(b)) |w| {
             const ok = switch (linKind(w)) {
                 .i8 => support.i8,
                 .i4 => support.i4,
+                .w4a8 => support.w4a8,
+                .nvfp4 => support.nvfp4,
                 .dense => gpuLinKindSupported(w.dtype),
             };
             if (!ok) return .{ .block = bi, .tag = w.tag orelse "?", .dtype = w.dtype };
+        }
+    }
+    return null;
+}
+
+/// Every linear one block's DEVICE forward runs, and the one list all three scans below
+/// share.
+///
+/// ⚠️ **Cross-attention's k/v belong here and were missing until 2026-08-08.** They were
+/// host GEMMs when this scan was written, and the comment saying so outlived the change
+/// that moved them onto the device (the per-image stall fix) — so a checkpoint whose cross
+/// k/v were quantized in a form the backend lacks would have passed the gate and then met
+/// it inside `buildCrossKv`. That is the identical shape of the block-0-only probe this
+/// function exists to replace, one level down.
+///
+/// The AdaLN pair IS deliberately absent: `modulationTable` is evaluated on the host, where
+/// `ops.matmul` handles convrot at any shape — which is what lets the device path require
+/// `rows % 128 == 0` without special-casing AdaLN's 256 and 6144.
+pub fn deviceLins(b: anytype) [10]Weight {
+    return .{
+        b.self_attn.q,  b.self_attn.k,    b.self_attn.v,  b.self_attn.out,
+        b.cross_attn.q, b.cross_attn.out, b.cross_attn.k, b.cross_attn.v,
+        b.mlp1,         b.mlp2,
+    };
+}
+
+/// Largest transient buffer any NVFP4 block linear decodes into, per the backend's own
+/// sizing rule, or 0 when the model has none. A caller pre-sizes with this so the scratch
+/// never grows mid-forward — on Vulkan that would flush the recording batch.
+///
+/// Scans every block's DEVICE linears, the same set `unsupportedLin` uses.
+pub fn maxNvfp4Scratch(model: *const DiT, comptime bytesFor: fn (rows: usize, cols: usize) usize) usize {
+    var max: usize = 0;
+    for (model.blocks) |*b| {
+        for (deviceLins(b)) |w| {
+            if (w.dtype == .nvfp4) max = @max(max, bytesFor(w.rows, w.cols));
+        }
+    }
+    return max;
+}
+
+/// Largest transient int8 buffer any packed W4A8 block linear decodes into, per the
+/// backend's own sizing rule, or 0 when the model has none. Mirrors `maxNvfp4Scratch` and
+/// `dit.maxW4A8Scratch`; a caller pre-sizes with this so the scratch never grows
+/// mid-forward, which on Vulkan would flush the recording batch.
+pub fn maxW4A8Scratch(model: *const DiT, comptime bytesFor: fn (rows: usize, cols: usize) usize) usize {
+    var max: usize = 0;
+    for (model.blocks) |*b| {
+        for (deviceLins(b)) |w| {
+            if (w.dtype == .w4a8) max = @max(max, bytesFor(w.rows, w.cols));
+        }
+    }
+    return max;
+}
+
+/// A packed W4A8 block linear whose `group_size` is not a multiple of 8, if any.
+///
+/// ⚠️ The CUDA decode kernel reads FOUR packed bytes per thread as one `u32`, which is what
+/// puts eight independent dependent-load chains in flight and takes it from 270 to ~100
+/// ms/step — and that requires a `u32` of packed bytes to lie inside one group, so the
+/// group scale is loaded once. Vulkan's kernel is general over the group size. No shipped
+/// checkpoint uses a smaller group (every one seen here is 16), so this refuses by name
+/// rather than asserting. Mirrors `dit.w4a8SmallGroup`.
+pub fn w4a8SmallGroup(model: *const DiT) ?[]const u8 {
+    for (model.blocks) |*b| {
+        for (deviceLins(b)) |w| {
+            if (w.dtype == .w4a8 and w.w4a8.?.group_size % 8 != 0) return w.tag orelse "<untagged>";
         }
     }
     return null;
@@ -1304,6 +1395,29 @@ const Loader = struct {
         };
         const shape = view.info.shape.slice();
         const dt = view.info.dtype;
+        // ⚠️ **Both ComfyUI 4-bit formats must be recognized BEFORE the int4 heuristic
+        // below, and each by its OWN sidecar rather than by dtype or shape**: NVFP4 is
+        // stored `U8 [rows, cols/2]` and W4A8 `I8 [rows, cols/2]`, which is exactly the
+        // signature that heuristic keys on. NVFP4's nibbles are E2M1 floats with a
+        // per-16-block fp8 scale and W4A8's are unsigned indices into a non-uniform
+        // Lloyd-Max codebook, so reading either as signed int4 times a per-row scale is
+        // finite, plausible and wrong. One implementation for every family that ships
+        // them (`quant_weight.zig`).
+        //
+        // ⚠️ W4A8 was krea2-only for one day, and that is precisely how
+        // `terraRising_20TerraRisingAnima-ASYM_W4A8_INT8` became unloadable: this loader
+        // fell through to the int4 arm and died on the `_scale` that format does not
+        // have. Anything ComfyUI's quantizers emit reaches every family they support.
+        if (try quant_weight.nvfp4(l.alloc, l.store, nm, rows, cols)) |nv| {
+            var w = nv;
+            w.tag = try l.alloc.dupe(u8, nm);
+            return w;
+        }
+        if (try quant_weight.w4a8(l.alloc, l.store, nm, rows, cols)) |q| {
+            var w = q;
+            w.tag = try l.alloc.dupe(u8, nm);
+            return w;
+        }
 
         // ⚠️ **int4 convrot weights are nibble-packed**, so the on-disk shape is
         // `[rows, cols/2]`; a genuine int8 convrot weight is also I8 but at the full
@@ -2058,6 +2172,96 @@ test "the loader wires int8/int4 convrot scales, and refuses a weight with none"
     // has no level below `err`, so asserting it would make every passing run print. The
     // `bad` tensor is left in the synthetic file so the next person can check it by hand.
     try testing.expect(st.get("bad") != null and st.get("bad_scale") == null);
+}
+
+test "the loader reads a W4A8 weight as W4A8, not as the int4 it is shaped like" {
+    // ⚠️ **This is the exact regression `terraRising_20TerraRisingAnima-ASYM_W4A8_INT8`
+    // hit.** W4A8 stores `I8 [rows, cols/2]`, which is bit-for-bit the signature the int4
+    // arm above keys on — so a loader that has not heard of the format falls through to it
+    // and dies on the `_scale` W4A8 does not have (`weight_s_channel` is its spelling).
+    // That is the lucky outcome; had the names matched, the nibbles would have been read as
+    // signed int4 times a per-row scale, which is finite, plausible and wrong.
+    //
+    // Ungated and synthetic: the contract is a container convention, and a test resting on
+    // a multi-GB file silently skips on a box without it — which is how the real-checkpoint
+    // Anima tests went unrun once already.
+    const gpa = testing.allocator;
+    const cols = ops.convrot.group_size; // 256 — one whole rotation group
+    const rows = 4;
+    const group = 16; // what every shipped W4A8 checkpoint uses
+    const groups = cols / group;
+
+    const pk_bytes = rows * cols / 2; // two 4-bit indices per byte
+    const sr_bytes = rows * groups; // fp8, one per group
+    const sc_bytes = rows * 4;
+    const cb_bytes = 16 * 4;
+    var hbuf: [768]u8 = undefined;
+    var fbs = std.Io.Writer.fixed(&hbuf);
+    var off: usize = 0;
+    try fbs.writeByte('{');
+    try fbs.print("\"p\":{{\"dtype\":\"I8\",\"shape\":[{d},{d}],\"data_offsets\":[{d},{d}]}}", .{ rows, cols / 2, off, off + pk_bytes });
+    off += pk_bytes;
+    try fbs.print(",\"p_s_rel\":{{\"dtype\":\"F8_E4M3\",\"shape\":[{d},{d}],\"data_offsets\":[{d},{d}]}}", .{ rows, groups, off, off + sr_bytes });
+    off += sr_bytes;
+    try fbs.print(",\"p_s_channel\":{{\"dtype\":\"F32\",\"shape\":[{d}],\"data_offsets\":[{d},{d}]}}", .{ rows, off, off + sc_bytes });
+    off += sc_bytes;
+    try fbs.print(",\"p_codebook\":{{\"dtype\":\"F32\",\"shape\":[16],\"data_offsets\":[{d},{d}]}}", .{ off, off + cb_bytes });
+    off += cb_bytes;
+    try fbs.writeByte('}');
+    const header = fbs.buffered();
+
+    const file = try gpa.alloc(u8, 8 + header.len + off);
+    defer gpa.free(file);
+    std.mem.writeInt(u64, file[0..8], header.len, .little);
+    @memcpy(file[8..][0..header.len], header);
+    const payload = file[8 + header.len ..];
+    // Every packed byte 0x21: low nibble (EVEN column) = 1, high nibble (odd) = 2. The two
+    // differ so a swapped nibble order shows up as a value rather than as a shape.
+    @memset(payload[0..pk_bytes], 0x21);
+    // fp8-e4m3 0x38 is exactly 1.0, so the decoded int8 is the codebook level itself.
+    @memset(payload[pk_bytes..][0..sr_bytes], 0x38);
+    for (0..rows) |r| {
+        const v: f32 = 0.25 + @as(f32, @floatFromInt(r)) * 0.5;
+        std.mem.writeInt(u32, payload[pk_bytes + sr_bytes + r * 4 ..][0..4], @bitCast(v), .little);
+    }
+    // A deliberately NON-uniform codebook at half-integer spacing: level 1 is -3.5, which
+    // is a tie, so it also pins that the rounding is ties-to-EVEN (-4, not -3).
+    var cb: [16]f32 = undefined;
+    for (&cb, 0..) |*v, i| v.* = (@as(f32, @floatFromInt(i)) - 8.0) * 0.5;
+    for (cb, 0..) |v, i|
+        std.mem.writeInt(u32, payload[pk_bytes + sr_bytes + sc_bytes + i * 4 ..][0..4], @bitCast(v), .little);
+
+    var st = try SafeTensors.initFromSlice(gpa, file);
+    defer st.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const l = Loader{ .store = .{ .safetensors = &st }, .alloc = arena.allocator(), .pfx = "", .cfg = anima_2b };
+
+    const w = try l.mat("p", .{}, rows, cols);
+    errdefer std.debug.print("loaded as {t}\n", .{w.dtype});
+    // The whole point: `.w4a8`, NOT `.i4`.
+    try testing.expectEqual(DType.w4a8, w.dtype);
+    try testing.expectEqual(cols, w.cols); // logical, not the halved storage width
+    try testing.expect(w.w4a8 != null);
+    try testing.expectEqual(@as(u32, group), w.w4a8.?.group_size);
+    // `s_rel` is a VIEW into the store, not a copy — the packed form is what stays
+    // resident, which is the entire reason this format is smaller than int8.
+    try testing.expectEqual(@as(usize, sr_bytes), w.w4a8.?.s_rel.len);
+    try testing.expectEqual(@as(usize, pk_bytes), w.bytes.len);
+    // `weight_s_channel` becomes the per-output-row scale, and convrot is on (unlike
+    // NVFP4, which sets neither).
+    try testing.expect(w.row_scale != null);
+    try testing.expectEqual(@as(u32, ops.convrot.group_size), w.convrot);
+    for (0..rows) |r|
+        try testing.expectApproxEqAbs(0.25 + @as(f32, @floatFromInt(r)) * 0.5, w.row_scale.?[r], 1e-6);
+
+    // The decode itself, through the levels the loader built from `p_codebook`: level 1 is
+    // -3.5 (a tie, so -4 under ties-to-even) and level 2 is -3.0.
+    const got = try arena.allocator().alloc(i8, rows * cols);
+    const meta = w.w4a8.?;
+    ops.w4a8.decode(got, w.bytes, meta.s_rel, meta.levels, rows, cols, meta.group_size);
+    for (got, 0..) |v, i|
+        try testing.expectEqual(@as(i8, if (i % 2 == 0) -4 else -3), v);
 }
 
 test "the batched modulation schedule matches the per-sigma one" {

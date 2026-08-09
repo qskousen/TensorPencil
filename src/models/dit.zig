@@ -20,6 +20,7 @@ const std = @import("std");
 const safetensors = @import("tp_core").safetensors;
 const weights_mod = @import("tp_core").weights;
 const ops = @import("tp_ops");
+const quant_weight = @import("quant_weight.zig");
 
 const SafeTensors = safetensors.SafeTensors;
 const WeightStore = weights_mod.WeightStore;
@@ -668,9 +669,83 @@ fn linear(io: std.Io, gpa: std.mem.Allocator, out: []f32, x: []const f32, m: usi
 /// is silently wrong output. Both gate on this before dispatching.
 pub fn gpuLinKindSupported(dt: DType) bool {
     return switch (dt) {
-        .i8, .i4, .bf16, .f8_e4m3 => true,
+        // `.w4a8` is decoded to int8 inside each backend's GEMM (the packed form stays
+        // resident), so it runs wherever int8 does.
+        // `.nvfp4` decodes to f16 inside each backend's GEMM (weight-only, which is what
+        // NVFP4 is below Blackwell), so it runs wherever the f16 GEMM does — everywhere.
+        .i8, .i4, .w4a8, .nvfp4, .bf16, .f8_e4m3 => true,
         else => false,
     };
+}
+
+/// Whether any block linear is stored in ComfyUI's packed `asym_w4a8_int8` form.
+///
+/// Scans EVERY block's linears rather than reading one tensor: a real ComfyUI mixed
+/// checkpoint quantizes per block (`anima_baseV10-INT8_CONVROT-MIXED` leaves block 0
+/// entirely dense), so a probe of `blocks[0]` answers a different question.
+pub fn anyW4A8(model: *const DiT) bool {
+    for (model.blocks) |*b| {
+        for ([_]Weight{ b.attn.wq, b.attn.wk, b.attn.wv, b.attn.wo, b.attn.gate, b.mlp.gate, b.mlp.up, b.mlp.down }) |w|
+            if (w.dtype == .w4a8) return true;
+    }
+    return false;
+}
+
+/// A packed W4A8 block linear whose `group_size` is not a multiple of 8, if any — the
+/// CUDA decode kernel reads four packed bytes (8 columns) per thread and so assumes one
+/// group scale covers them. Returns the offending tensor's name so the refusal can say
+/// which layer, since "unsupported" is unactionable across 224 weights.
+///
+/// No checkpoint in the wild uses a group size below 16 (ComfyUI's default), but the
+/// format permits 4 and 8, so this is a refusal rather than an assert. Vulkan's decode is
+/// general over the group size and does not need it.
+pub fn w4a8SmallGroup(model: *const DiT) ?[]const u8 {
+    for (model.blocks) |*b| {
+        for ([_]Weight{ b.attn.wq, b.attn.wk, b.attn.wv, b.attn.wo, b.attn.gate, b.mlp.gate, b.mlp.up, b.mlp.down }) |w| {
+            if (w.dtype == .w4a8 and w.w4a8.?.group_size % 8 != 0) return w.tag orelse "<untagged>";
+        }
+    }
+    return null;
+}
+
+/// Whether any block linear is stored in ComfyUI's packed NVFP4 form. Scans every block
+/// for the reason `anyW4A8` does: a real ComfyUI mixed checkpoint quantizes per block.
+pub fn anyNvfp4(model: *const DiT) bool {
+    for (model.blocks) |*b| {
+        for ([_]Weight{ b.attn.wq, b.attn.wk, b.attn.wv, b.attn.wo, b.attn.gate, b.mlp.gate, b.mlp.up, b.mlp.down }) |w| {
+            if (w.dtype == .nvfp4) return true;
+        }
+    }
+    return false;
+}
+
+/// Largest transient f16 buffer any packed NVFP4 block linear decodes into, per the
+/// backend's own sizing rule. A caller pre-sizes with this so the scratch never grows
+/// mid-forward (which on Vulkan flushes the recording batch).
+pub fn maxNvfp4Scratch(model: *const DiT, comptime bytesFor: fn (rows: usize, cols: usize) usize) usize {
+    var max: usize = 0;
+    for (model.blocks) |*b| {
+        for ([_]Weight{ b.attn.wq, b.attn.wk, b.attn.wv, b.attn.wo, b.attn.gate, b.mlp.gate, b.mlp.up, b.mlp.down }) |w| {
+            if (w.dtype == .nvfp4) max = @max(max, bytesFor(w.rows, w.cols));
+        }
+    }
+    return max;
+}
+
+/// Largest transient int8 buffer any packed W4A8 block linear decodes into, per the
+/// backend's own sizing rule (the two differ: CUDA's GEMM reads the raw `[rows][cols]`
+/// while Vulkan's reads a row-padded k-major copy).
+///
+/// A caller pre-sizes with this so the scratch never has to grow mid-forward, which on
+/// Vulkan would flush the recording batch and on CUDA sync the stream.
+pub fn maxW4A8Scratch(model: *const DiT, comptime bytesFor: fn (rows: usize, cols: usize) usize) usize {
+    var max: usize = 0;
+    for (model.blocks) |*b| {
+        for ([_]Weight{ b.attn.wq, b.attn.wk, b.attn.wv, b.attn.wo, b.attn.gate, b.mlp.gate, b.mlp.up, b.mlp.down }) |w| {
+            if (w.dtype == .w4a8) max = @max(max, bytesFor(w.rows, w.cols));
+        }
+    }
+    return max;
 }
 
 // --- weight loading --------------------------------------------------------
@@ -696,6 +771,25 @@ const Loader = struct {
         const nm = try l.name(&buf, fmt, args, "");
         const view = l.store.get(nm) orelse return error.MissingTensor;
         const shape = view.info.shape.slice();
+
+        // ⚠️ **Both ComfyUI 4-bit formats must be recognized BEFORE the int4 heuristic
+        // below, and each by its OWN sidecar rather than by dtype or shape**: NVFP4 is
+        // stored `U8 [rows, cols/2]` and W4A8 `I8 [rows, cols/2]`, which is exactly the
+        // signature that heuristic keys on. NVFP4's nibbles are E2M1 floats with a
+        // per-16-block fp8 scale and W4A8's are unsigned indices into a non-uniform
+        // Lloyd-Max codebook, so reading either as signed int4 times a per-row scale is
+        // finite, plausible and wrong. One implementation for all the families that
+        // ship them (`quant_weight.zig`).
+        if (try quant_weight.nvfp4(l.alloc, l.store, nm, rows, cols)) |nv| {
+            var w = nv;
+            w.tag = try l.alloc.dupe(u8, nm);
+            return w;
+        }
+        if (try quant_weight.w4a8(l.alloc, l.store, nm, rows, cols)) |q| {
+            var w = q;
+            w.tag = try l.alloc.dupe(u8, nm);
+            return w;
+        }
 
         // int4 convrot weights are nibble-packed (two values per byte), so the
         // on-disk shape is [rows, cols/2]. Our home-grown converter stores the
@@ -803,6 +897,8 @@ const Loader = struct {
 };
 
 // --- tests -----------------------------------------------------------------
+
+const test_gate = @import("../test_gate.zig");
 
 test "modulate and gatedAdd broadcast over rows" {
     var x = [_]f32{ 1, 2, 3, 4 }; // 2 rows, dim 2
@@ -1045,6 +1141,98 @@ test "int8 convrot matmul agrees with fp8 within quant noise" {
     // runner print a spurious red "failed command:" line (see ZIG.md).
     errdefer std.debug.print("int8-vs-fp8 wq GEMM relative RMSE: {d:.4}\n", .{rel});
     try std.testing.expect(rel < 0.05);
+}
+
+const w4a8_real_layer_json = @embedFile("assets/w4a8_real_layer.json");
+
+fn fnv1a64(bytes: []const u8) u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for (bytes) |b| h = (h ^ b) *% 0x100000001b3;
+    return h;
+}
+
+test "a W4A8 layer of a real checkpoint decodes to comfy_kitchen's int8 weight" {
+    // The synthetic tier in `ops/w4a8.zig` pins the arithmetic; this pins the
+    // CONTAINER half, which is what the loader adds and what nothing else can see:
+    // the [N, K/2] shape doubling, `weight_s_rel` read as fp8 rather than as u8, the
+    // codebook tensor, and `group_size` derived from the scale's own shape and
+    // cross-checked against `comfy_quant`.
+    //
+    // Goes through `Loader.mat` on ONE tensor rather than `DiT.load`, deliberately:
+    // the whole model decodes to 12.2 GB, which in a Debug test binary is neither
+    // affordable nor necessary to check the format.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "models/diffusion_model/krea2CenterSemiraw_v10Int8-ASYM_W4A8_INT8.safetensors";
+    try test_gate.requireModelFile(io, path);
+
+    const Ref = struct {
+        layer: []const u8,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        convrot_groupsize: usize,
+        packed_fnv1a64: u64,
+        s_rel_fnv1a64: u64,
+        s_channel_fnv1a64: u64,
+        expect_i8_fnv1a64: u64,
+        expect_i8_head: []const i32,
+        expect_i8_tail: []const i32,
+    };
+    var parsed = try std.json.parseFromSlice(Ref, gpa, w4a8_real_layer_json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const ref = parsed.value;
+    // The fixture is generated for one layer; if that constant ever moves, the
+    // expectations below are about a different tensor.
+    try std.testing.expectEqualStrings("blocks.0.attn.wk", ref.layer);
+
+    var st = try SafeTensors.open(gpa, io, path);
+    defer st.deinit();
+    const store: WeightStore = .{ .safetensors = &st };
+
+    // Check the INPUTS first. A mismatch here means the checkpoint changed, which is a
+    // different fact from "the decode is wrong" — and the fixture cannot tell them
+    // apart after the fact.
+    try std.testing.expectEqual(ref.packed_fnv1a64, fnv1a64((try store.require("blocks.0.attn.wk.weight")).bytes));
+    try std.testing.expectEqual(ref.s_rel_fnv1a64, fnv1a64((try store.require("blocks.0.attn.wk.weight_s_rel")).bytes));
+    try std.testing.expectEqual(ref.s_channel_fnv1a64, fnv1a64((try store.require("blocks.0.attn.wk.weight_s_channel")).bytes));
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const l = Loader{ .store = store, .alloc = arena.allocator(), .pfx = "" };
+    const w = try l.mat("blocks.0.attn.wk.weight", .{}, ref.rows, ref.cols);
+
+    // The weight stays PACKED — half the logical element count in bytes — with the
+    // sidecars a decode needs hanging off it. That is what keeps the format at its own
+    // bit width instead of int8's.
+    try std.testing.expectEqual(@as(DType, .w4a8), w.dtype);
+    try std.testing.expectEqual(ref.rows, w.rows);
+    try std.testing.expectEqual(ref.cols, w.cols);
+    try std.testing.expectEqual(@as(u32, @intCast(ref.convrot_groupsize)), w.convrot);
+    try std.testing.expectEqual(ref.rows * ref.cols / 2, w.bytes.len);
+    try std.testing.expect(w.row_scale != null);
+    try std.testing.expectEqual(ref.rows, w.row_scale.?.len);
+    try std.testing.expect(w.w4a8 != null);
+    try std.testing.expectEqual(@as(u32, @intCast(ref.group_size)), w.w4a8.?.group_size);
+    try std.testing.expectEqual(ref.rows * ref.cols / ref.group_size, w.w4a8.?.s_rel.len);
+
+    // Decode it here — the loader no longer does — and check that against the
+    // reference. This is what pins the metadata wiring: a `s_rel` slice off by a row
+    // or a codebook read from the wrong tensor shows up only in the decoded values.
+    const got = try arena.allocator().alloc(i8, ref.rows * ref.cols);
+    ops.w4a8.decode(got, w.bytes, w.w4a8.?.s_rel, w.w4a8.?.levels, ref.rows, ref.cols, ref.group_size);
+    // Head and tail first: a bare hash mismatch says nothing about where, and these
+    // localize it to the first or last row.
+    for (ref.expect_i8_head, 0..) |want, i| {
+        errdefer std.debug.print("element {d}\n", .{i});
+        try std.testing.expectEqual(@as(i8, @intCast(want)), got[i]);
+    }
+    for (ref.expect_i8_tail, 0..) |want, i| {
+        const idx = got.len - ref.expect_i8_tail.len + i;
+        errdefer std.debug.print("element {d} (of {d})\n", .{ idx, got.len });
+        try std.testing.expectEqual(@as(i8, @intCast(want)), got[idx]);
+    }
+    try std.testing.expectEqual(ref.expect_i8_fnv1a64, fnv1a64(std.mem.sliceAsBytes(got)));
 }
 
 test "int4 convrot checkpoint loads with per-row scale + rotation metadata" {

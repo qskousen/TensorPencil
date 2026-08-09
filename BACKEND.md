@@ -50,7 +50,7 @@ Five families: krea2 (below), the SD family (§2A), Z-Image (§2B), and Anima (�
 | Stage | cpu | vulkan | zig-cuda | cuda | Files |
 |---|---|---|---|---|---|
 | **Text encoder** (Qwen3-VL-4B) | ✅ f32 | ✅ f32 (⚠️ f16 opt via `--encoder-f16`) | ✅ fp8→f16 TC | ✅ fp8→f16 TC | `krea2_text.zig`, `qwen3{,_gpu,_cuda}.zig` |
-| **DiT** (Krea 2, 28 blocks) | ✅ all dtypes | ✅ fp8 / int8 / bf16 | ✅ fp8 / int8 / int4 / bf16 | ✅ fp8 / int8 / int4 / bf16 | `dit{,_gpu,_cuda}.zig` |
+| **DiT** (Krea 2, 28 blocks) | ✅ all dtypes | ✅ fp8 / int8 / **w4a8** / **nvfp4** / bf16 | ✅ fp8 / int8 / int4 / **w4a8** / **nvfp4** / bf16 | ✅ fp8 / int8 / int4 / **w4a8** / **nvfp4** / bf16 | `dit{,_gpu,_cuda}.zig` |
 | **VAE decode** (Wan 2.1) | ✅ | ✅ | ✅ | ✅ (+cuDNN conv avail.) | `wan_vae.zig`, `vae_{gpu,cuda}.zig` |
 | **VAE tiling** | CPU-tile | GPU-tile + CPU floor | GPU-tile + CPU floor | GPU-tile + CPU floor | `vae_tiled.zig` |
 | **TAEHV preview** (taew2_1) | ✅ | ✅ *(new)* | ✅ | ✅ | `taehv{,_gpu,_cuda}.zig` |
@@ -312,7 +312,7 @@ per *image* inside `encode`, and a device port would buy ~1/30th of a render.
 | **T5 tokenizer** (SentencePiece Unigram) | ✅ | — | — | — | `core/t5_tokenizer.zig` |
 | **Text encoder** (Qwen3-**0.6B**, final state + `model.norm`) | ✅ f32 424 ms | ✅ 47 ms / 3.9e-3 | ✅ 98 ms / 3.7e-3 | ✅ 82 ms / 3.6e-3 | `qwen3{,_gpu,_cuda}.zig`, `Variant.anima` |
 | **`llm_adapter`** (6 blocks, 1024, T5-indexed) | ✅ | host | host | host | `anima.zig` (`Adapter`) — per-image, see above |
-| **DiT** (`MiniTrainDIT`, 28 blocks, 2048) | ✅ bf16 / f16 / f32 / fp8 / **int8+int4 convrot** | ✅ (not convrot) | ✅ (not convrot) | ✅ (not convrot) | `anima{,_gpu,_cuda}.zig` |
+| **DiT** (`MiniTrainDIT`, 28 blocks, 2048) | ✅ bf16 / f16 / f32 / fp8 / **int8+int4 convrot** / **w4a8** / **nvfp4** | ✅ int8 / int4→int8 / **w4a8** / **nvfp4** / bf16 | ✅ int8 / int4 / **w4a8** / **nvfp4** / bf16 | ✅ int8 / int4 / **w4a8** / **nvfp4** / bf16 | `anima{,_gpu,_cuda}.zig` |
 | **VAE decode** (Wan 2.1, 16-ch) | ✅ | ✅ | ✅ | ✅ | `wan_vae.zig`, `vae_{gpu,cuda}.zig` |
 | **VAE tiling** | CPU-tile | GPU-tile + CPU floor | GPU-tile + CPU floor | GPU-tile + CPU floor | `vae_tiled.zig` |
 | **TAEHV preview** (taew2_1) | ✅ | ✅ | ✅ | ✅ | ⚠️ inferred from the shared Wan latent format, not measured on an Anima render |
@@ -323,9 +323,9 @@ each backend against its own CPU forward) — the `--anima` flag exists because 
 decides the config, so a 0.6B encoder under the default 4B variant is a `ShapeMismatch`
 at load rather than a wrong answer.
 
-**int8/int4 convrot runs on the DEVICE on all three GPU backends**, with the kind resolved
-**per block** (`anima.linKind` / `prepGroup`). Measured at 512x768 / 20 steps / cfg 4 on a
-3090, against the same model's own bf16 render:
+**int8 / int4 convrot and packed W4A8 run on the DEVICE on all three GPU backends**, with
+the kind resolved **per block** (`anima.linKind` / `prepGroup`). Measured at 512x768 / 20
+steps / cfg 4 on a 3090, against the same model's own bf16 render:
 
 | | `cuda` s/step | DiT VRAM | quality vs bf16 | `vulkan` s/step | DiT VRAM |
 |---|---|---|---|---|---|
@@ -333,14 +333,83 @@ at load rather than a wrong answer.
 | **int8** | **0.23** | **1781 MB** | **25.8 dB / SSIM 0.936** | **0.48** | **1779 MB** |
 | **int4** | **0.18** | **1025 MB** | 11.9 dB / SSIM 0.451 | **0.48** | **1779 MB** (= int8's) |
 
+W4A8 landed 2026-08-08 for `terraRising_20TerraRisingAnima-ASYM_W4A8_INT8`. On the same
+model at the same settings (`terraRising`, a different file from the row above, so read this
+block against its own bf16 rather than against those numbers):
+
+| `terraRising`, 512x768 / 20 steps / cfg 4 | `cuda` s/step | `cuda` DiT VRAM | `vulkan` s/step | `vulkan` DiT VRAM | vs its own bf16 |
+|---|---|---|---|---|---|
+| bf16 | 0.44 | 3230 MB | 0.59 | 3272 MB | — |
+| int8 convrot | 0.28 | 1781 MB | 0.47 | 1778 MB | 32.31 dB / SSIM 0.978 |
+| **w4a8** | **0.26** | **1120 MB** | **0.49** | **1118 MB** | **20.86 dB / SSIM 0.856** |
+| int4 convrot | 0.20 | 971 MB | 0.46 | **1038 MB** | 20.45 dB / SSIM 0.837 (was 2.32 dB — see below) |
+
+**So on Anima W4A8 lands at int8's speed for 63% of its VRAM**, which is the same shape as
+krea2's result (§7). The three GPU arms agree with each other at **34.9–38.2 dB / SSIM
+0.987–0.996** on this checkpoint, which is what says the spread against bf16 is *format*
+loss rather than any one arm's kernel.
+
+⚠️ **W4A8 is NOT widened on Vulkan — int4 is, and only int4.** `anima_gpu.widen` early-returns
+for anything that is not `.i4`, so a packed W4A8 weight stays 4-bit resident and decodes per
+GEMM into `ctx.w4a8_t` exactly as it does on CUDA: **1118 MB against CUDA's 1120**. int4 is the
+format that pays int8's footprint there, because no `sint4` cooperative matrix exists on this
+device. Easy to conflate, and the VRAM column is what separates them.
+
+**Both are decoded per GEMM as of 2026-08-08** (`i4_decode_t` / `w4a8_decode_t`). int4 was
+widened to int8 at load until then, which is why it used to cost 8-bit memory for a 4-bit
+checkpoint: **1778 -> 1038 MB, bit-identical, and 0.48 -> 0.46 s/step**. `Lins`/`DevLins`/`widen`
+are gone; `blockForward` reads the model's own weights.
+
+⚠️ **The tell was arithmetic, not profiling**: the device linears hold **1050.7 MB of packed
+weight in BOTH formats** (both nibble-packed 4-bit), differing only in sidecars — 2.9 MB of f32
+per-row scales for int4 against 109 MB of fp8 per-group ones for W4A8. int4 held *less* data and
+occupied 660 MB more, which is a policy difference, not a format one. Worth checking whenever two
+similar formats disagree on VRAM.
+
+⚠️ **Vulkan's int4 is W4A8-shaped, not W4A4** — no `sint4` coopmat, so the weight is decoded to
+int8 per GEMM and the activation stays int8. That is more accurate than CUDA's true W4A4, which
+is why the same file scores differently per backend.
+
+⚠️ **int4 on both CUDA arms was BROKEN until 2026-08-08 — `opI4Prep` wrote nothing for a
+1024-wide reduction.** `word_iters = cols / (per_word * 256)` truncates to **0** at `bits == 4`
+and `cols == 1024` (128 packed words for 256 threads), so the packed activation was never
+stored and the GEMM read stale scratch. Anima's cross-attention k/v are the only linears in
+the repo that narrow, and they only reached the kernel when cross k/v moved to the device.
+Fixed with `ceil` + a per-thread guard emitted only when `total_words % 256 != 0`; every other
+width is instruction-identical and a krea2 int4 render is byte-identical across the change.
+
+| int4, this checkpoint | before | after |
+|---|---|---|
+| `cuda` vs its own CPU forward (256² render) | 5.95 dB | **24.46 dB** |
+| `zig-cuda`, same | 5.05 dB | **23.20 dB** |
+| `vulkan` (widens int4→int8, never took the path) | 30.03 dB | unchanged |
+| vs **ComfyUI's own int4**, its 1056x1584/30-step workflow | 4.48 dB | **14.63 dB** |
+
+⚠️ **int4 remains a poor quantization of this checkpoint in BOTH engines** (ComfyUI's own int4
+is 9.47 dB / SSIM 0.252 against its bf16). TP now reproduces ComfyUI rather than diverging
+from it. ⚠️ **Do not read "both are bad" as "both are equally bad"** — ComfyUI's was
+degraded-with-structure and TP's was structureless static, and that qualitative difference,
+not any aggregate, is what said there was a defect. See CLAUDE.md for the postmortem on the
+first (wrong) diagnosis.
+
 Device-forward parity against `anima.DiT.predict` (`anima-cuda-test`, depth 1 = dense block
 0, depth 2 = one quantized block, both attention arms):
 
 | | depth 1 (dense) | depth 2 |
 |---|---|---|
 | bf16 checkpoint | 1.42e-3 | 8.0e-4 |
-| int8 checkpoint | **1.42e-3** (identical) | 2.09e-3 |
+| int8 checkpoint | **1.42e-3** (identical) | 2.0721e-3 |
+| **w4a8 checkpoint** | **1.42e-3** (identical) | **2.0968e-3** |
 | int4 checkpoint | **1.42e-3** (identical) | 3.80e-2 |
+
+⚠️ **W4A8's 2.0968e-3 against int8's 2.0721e-3 — a 1.2% gap — is the receipt that its
+wiring is right, and it is the *predicted* answer rather than a tolerance that was widened
+until it passed.** W4A8 decodes TO int8-convrot and then runs `opI8Prep` + the identical
+int8 GEMM, so it must land where int8 lands; anywhere else would be the bug. Vulkan
+independently measures **2.1004e-3** on the same file (`test "Anima gpu forward matches the
+CPU forward on a real W4A8 checkpoint"`). ⚠️ Its tolerance in `anima-cuda-test` is therefore
+int8's, not the dense one: the dense bound (1e-3) **fails a correct implementation**, which
+is what it did on the first W4A8 Anima checkpoint.
 
 ⚠️ **Read those three depth-1 figures together: they are identical**, because block 0 is bf16
 in all three files — which is the cross-check that quantization changed nothing it should
@@ -774,6 +843,8 @@ DType enum: `src/dtype.zig:11` — `f8_e4m3, f16, bf16, f32, i8, i4, q4_0, q8_0,
 | **fp8-e4m3** | ✅ (LUT) | ✅ `pipe_f8` → f16 coop | ✅ `gemv_fp8`, `dequant_fp8_f16` | ✅ dequant→f16, `R_16F` | 1-byte weights, dequant in kernel |
 | **int8 (+convrot)** | ✅ | ✅ **s8→s32 tensor cores** | ✅ **m16n8k32 s8** IMMA | ✅ cuBLASLt `R_8I`/`COMPUTE_32I` | Hadamard un-rotate at dequant |
 | **int4 (+convrot)** | ✅ | ❌ **no sint4 coopmat** | ✅ **m16n8k64 s4** IMMA (W4A4) | ❌ (no cuBLASLt s4) | nibble-packed 2/byte |
+| **w4a8** (`asym_w4a8_int8`) | ✅ | ✅ | ✅ | ✅ | 4-bit codebook indices + fp8 per-group scale; stays PACKED and decodes to int8 **per GEMM** into a device scratch (`w4a8_decode` PTX / `w4a8_decode_t` SPIR-V), then runs the ordinary int8 convrot GEMM. `ops/w4a8.zig` |
+| **nvfp4** (E2M1) | ✅ | ✅ | ✅ | ✅ | 4-bit E2M1 + fp8 per-16-block scale + per-tensor scale; stays PACKED and decodes to **f16** per GEMM (`nvfp4_decode` PTX / `nvfp4_decode_t` SPIR-V), then the existing f16 tensor-core GEMM. Weight-only — its native W4A4-fp4 GEMM is sm_100+. `ops/nvfp4.zig` |
 | **GGUF q4_0** | ✅ ggml | ❌ (no GEMV kernel) | ✅ `gemv_q4_0(_q8n)` | ⤷ dequant→f16 | — |
 | **GGUF q8_0** | ✅ ggml | ✅ `gemv_q8_0`/`_t` (scalar) | ✅ `gemv_q8_0(_q8n)` | ⤷ dequant→f16 | — |
 | **GGUF q4_k** | ✅ ggml | ✅ `gemv_q4_k`/`_t` (scalar) | ✅ `gemv_q4_k(_q8n)` | ⤷ dequant→f16 | — |
@@ -788,6 +859,30 @@ Notes:
 - **int4 / W4A4 is CUDA-hand-PTX-only** (`s4 m16n8k64` tensor cores). CPU has a correctness path; Vulkan and cuBLASLt cannot do sint4.
 - **GGUF block-quant on GPU dequants on-the-fly inside the GEMV** — never expanded to VRAM. Vulkan's GEMV is **scalar f32 (no dp4a)** and lacks `q4_0`. The `cuda` (libs) arm dequants GGUF to f16 for prefill GEMM but uses the shared **hand-PTX** GEMV at decode (cuBLASLt/cuDNN never consume GGUF block-quant directly).
 - **convrot** (`src/ops/convrot.zig`): size-256 Hadamard rotation, applied at int8/int4 dequant. `cols` must be a multiple of 256 (i4 also even from nibble-packing).
+- ⚠️ **The two packed 4-bit formats are read by ONE shared container loader**
+  (`models/quant_weight.zig`), called from krea2's, Anima's and Z-Image's `mat`. Both store
+  `[rows, cols/2]`, which is *exactly* the int4-convrot signature, so each is detected by its own
+  sidecar (`_scale_2` for NVFP4, `_s_rel` for W4A8) and **before** the int4 heuristic. ⚠️ W4A8 was
+  krea2-only for one day and that made the first Anima W4A8 checkpoint unloadable — Anima's loader
+  fell through to the int4 arm and died on a `_scale` the format does not have. **Every format
+  ComfyUI's quantizers emit reaches every family they support**, so a reader for one belongs in the
+  shared module from the start.
+- **`w4a8` shares int8's activation prep and GEMM** (`opI8Prep` / `opI8Gemm`) — the "A8" is exactly
+  that the activation stays 8-bit — so only the weight's *storage* differs and the dispatch is per
+  weight (`i8GemmW`; `anima.prepKind` on the Anima arm, which is what lets one prep serve a block
+  mixing int8 and W4A8), which is why a mixed int8/W4A8 checkpoint works. On `cuda` at 1120x1680 it runs
+  **2.26 s/step on `dit=7081MB`** against int8's 2.25 s/step on 12056 MB and int4-convrot's 1.95 s/step
+  on 6054 MB: int8 speed at ~int4 VRAM, with weights **2.26x closer to int8's than int4's are**.
+- ⚠️ **Both decode kernels were first written ~50x off their bandwidth ceiling** (the level table makes
+  a decode pure byte lookup, so ~20 ms/step is the roof for the whole model). CUDA's needed **four
+  packed bytes per thread** — the level lookups are dependent loads, so one byte per thread is
+  latency-bound (270 ms/step) — which makes `group_size % 8 == 0` a requirement there; Vulkan's is
+  general over the group size. Vulkan's needed its inputs **pre-transposed through `weightBuffer`**
+  instead of transposing per GEMM (1757 ms/step, isolated with the new `w4a8` profile category): a
+  transpose's strided side is 32 sectors per warp-load, and paying it per GEMM rather than once at load
+  was the whole gap. ⚠️ Vulkan's post-fix speed is **unmeasured** (the checkpoints were pruned before
+  the render could be repeated); correctness is pinned by a gated device test against
+  `ops.w4a8.decode`, which needs no checkpoint. See the CLAUDE.md section.
 - **q1_0 is the first 128-element block** (every other quant here is 32 or 256), so anything that hardcoded those two sizes is wrong for it — `matmul.packedTaskBlock`'s k-slice assert is now per-dtype for that reason.
 - ⚠️ **GGUF type id 42 is claimed by TWO formats, and picking the wrong one is silent.** Both spell
   themselves "Q2_0", both compute `v = (code - 1) * d` from 2-bit codes packed 4 per byte LSB-first, and

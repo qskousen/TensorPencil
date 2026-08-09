@@ -10,6 +10,8 @@ const std = @import("std");
 const dtypes = @import("tp_core").dtype;
 const quants = @import("tp_core").quants;
 const convrot_mod = @import("convrot.zig");
+const w4a8_mod = @import("w4a8.zig");
+const nvfp4_mod = @import("nvfp4.zig");
 const prof = @import("tp_core").prof;
 const cancel = @import("cancel.zig");
 
@@ -146,7 +148,19 @@ pub const Weight = struct {
     /// Per-output-row dequant scale (ComfyUI int8 `weight_scale`, `[rows]`).
     /// When set, overrides `scale` for `.i8`/`.i4` weights.
     row_scale: ?[]const f32 = null,
-    /// ConvRot group size (0 = none). When non-zero, `.i8`/`.i4` weights are
+    /// ComfyUI `asym_w4a8_int8` sidecars, set iff `dtype == .w4a8`. `bytes` is then
+    /// the packed `[rows][cols/2]` nibble storage and `row_scale` is `s_channel`;
+    /// decoding a nibble needs the per-group scale and level table in here. Kept
+    /// packed on purpose — materializing the int8 doubles the footprint, which is
+    /// the entire difference between this format and int8. See `ops/w4a8.zig`.
+    w4a8: ?*const w4a8_mod.Meta = null,
+    /// ComfyUI NVFP4 sidecars, set iff `dtype == .nvfp4`. `bytes` is then the packed
+    /// `[rows][cols/2]` E2M1 storage. ⚠️ Unlike every other 4-bit format here this one has
+    /// NO per-output-row scale and NO ConvRot rotation — `row_scale` stays null and
+    /// `convrot` 0 — because its scale is per 16-element block plus one per tensor. See
+    /// `ops/nvfp4.zig`.
+    nvfp4: ?*const nvfp4_mod.Meta = null,
+    /// ConvRot group size (0 = none). When non-zero, `.i8`/`.i4`/`.w4a8` weights are
     /// stored rotated by a group-wise Hadamard along the input dim and are
     /// un-rotated at dequant time; `cols` must be a multiple of this. i4 packs
     /// two values per byte so `cols` is also even. See ops/convrot.zig.
@@ -182,7 +196,7 @@ pub const Error = error{ UnsupportedDType, QuantBackendUnavailable, OutOfMemory 
 /// problem at the point furthest from its cause.
 pub fn supportsDType(dt: DType) bool {
     return switch (dt) {
-        .f8_e4m3, .bf16, .f16, .f32, .i8, .i4 => true,
+        .f8_e4m3, .bf16, .f16, .f32, .i8, .i4, .w4a8, .nvfp4 => true,
         .q4_0, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl, .q1_0, .q2_0_g64 => have_ggml,
         // q2_0_g128 decodes natively (quants.dequantQ2_0G128), so it needs no ggml.
         .q2_0_g128 => true,
@@ -241,7 +255,7 @@ pub fn matmul(
     std.debug.assert(y.len == m * w.rows);
     if (bias) |b| std.debug.assert(b.len == w.rows);
     switch (w.dtype) {
-        .f8_e4m3, .bf16, .f16, .f32, .i8, .i4 => {},
+        .f8_e4m3, .bf16, .f16, .f32, .i8, .i4, .w4a8, .nvfp4 => {},
         .q4_0, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl, .q1_0, .q2_0_g64 => {
             if (have_ggml) {
                 // ggml rows are whole blocks; block-aligned k-slicing depends on it.
@@ -255,8 +269,17 @@ pub fn matmul(
         .q2_0_g128 => std.debug.assert(w.cols % w.dtype.blockElems() == 0),
         else => return error.UnsupportedDType,
     }
-    if (w.dtype == .i8 or w.dtype == .i4)
+    if (w.dtype == .i8 or w.dtype == .i4 or w.dtype == .w4a8)
         std.debug.assert(w.row_scale != null and w.row_scale.?.len == w.rows);
+    // A `.w4a8` weight without its sidecars cannot be decoded at all, and the nibbles
+    // would otherwise be read as signed int4 — plausible values, wrong weight.
+    if (w.dtype == .w4a8) std.debug.assert(w.w4a8 != null);
+    // NVFP4 carries no row scale and no rotation; its block scales and level table are
+    // the only way to read the nibbles at all.
+    if (w.dtype == .nvfp4) {
+        std.debug.assert(w.nvfp4 != null);
+        std.debug.assert(w.row_scale == null and w.convrot == 0);
+    }
     if (m == 0 or w.rows == 0) return;
 
     // Activation observer (see `probe`): after validation, before any dispatch, so
@@ -528,7 +551,7 @@ fn packedTask(
 ) void {
     // i4 is sub-byte packed (nibbles), so it can't ride the byteSize-based
     // typed path; it has its own kernel that unpacks two values per byte.
-    if (w.dtype == .i4) return packedTaskI4(y, x, m, w, bias, row_start, row_end, panel, tok);
+    if (w.dtype == .i4 or w.dtype == .w4a8 or w.dtype == .nvfp4) return packedTaskI4(y, x, m, w, bias, row_start, row_end, panel, tok);
     switch (w.dtype) {
         inline .f8_e4m3, .bf16, .f16, .f32, .i8 => |dt| {
             packedTaskTyped(dt, y, x, m, w, bias, row_start, row_end, panel, tok);
@@ -702,6 +725,28 @@ inline fn dequantI4Slice(bytes: []const u8, elem0: usize, n: usize, scale: f32, 
     }
 }
 
+/// Dequant `n` elements of row `row` starting at column `col0` (even) of a PACKED
+/// W4A8 weight: `levels[s_rel[row][group]][nibble] * s_channel[row]`.
+///
+/// The level table already folds the reference's f32 multiply-round-clamp, so this is
+/// two byte lookups and a multiply per element — no floating point until the last
+/// step, and bit-identical to the int8 weight ComfyUI would have materialized.
+inline fn dequantW4A8Slice(w: Weight, row: usize, col0: usize, n: usize, dst: []f32) void {
+    std.debug.assert(col0 % 2 == 0);
+    const meta = w.w4a8.?;
+    const gs = meta.group_size;
+    const srow = meta.s_rel[row * meta.groups(w.cols) ..];
+    const rs = w.row_scale.?[row];
+    const byte0 = (row * w.cols + col0) / 2;
+    for (0..n) |k| {
+        const c = col0 + k;
+        const tbl = &meta.levels.table[srow[c / gs]];
+        const byte = w.bytes[byte0 + k / 2];
+        const nib: u4 = @truncate(if (c & 1 == 0) byte else byte >> 4);
+        dst[k] = @as(f32, @floatFromInt(tbl[nib])) * rs;
+    }
+}
+
 /// Packed outer-product path for i4 convrot weights. Mirrors `packedTaskTyped`'s
 /// `.i8` branch (dequant a k-slice row-major, un-rotate the whole group, scatter
 /// k-major) but unpacks two 4-bit values per byte.
@@ -734,7 +779,12 @@ fn packedTaskI4(
                     continue;
                 }
                 var tmp: [KC]f32 = undefined;
-                dequantI4Slice(w.bytes, row * cols + kc0, kl, w.row_scale.?[row], tmp[0..kl]);
+                if (w.dtype == .w4a8)
+                    dequantW4A8Slice(w, row, kc0, kl, tmp[0..kl])
+                else if (w.dtype == .nvfp4)
+                    nvfp4_mod.decodeSliceF32(tmp[0..kl], w.bytes, w.nvfp4.?.*, cols, row, kc0, kl)
+                else
+                    dequantI4Slice(w.bytes, row * cols + kc0, kl, w.row_scale.?[row], tmp[0..kl]);
                 if (w.convrot != 0) convrot_mod.rotate(tmp[0..kl]);
                 for (0..kl) |k| sub[k * NR + j] = tmp[k];
             }
@@ -861,7 +911,7 @@ fn runRange(
     scratch: []f32,
     tok: cancel.Token,
 ) void {
-    if (w.dtype == .i4) return runRangeI4(y, x, m, w, bias, row_start, row_end, scratch, tok);
+    if (w.dtype == .i4 or w.dtype == .w4a8 or w.dtype == .nvfp4) return runRangeI4(y, x, m, w, bias, row_start, row_end, scratch, tok);
     switch (w.dtype) {
         inline .f8_e4m3, .bf16, .f16, .f32, .i8 => |dt| {
             runRangeTyped(dt, y, x, m, w, bias, row_start, row_end, scratch, tok);
@@ -943,7 +993,12 @@ fn runRangeI4(
         const nr = @min(panel_rows, row_end - r);
         for (0..nr) |j| {
             const dst = scratch[j * cols ..][0..cols];
-            dequantI4Slice(w.bytes, (r + j) * cols, cols, w.row_scale.?[r + j], dst);
+            if (w.dtype == .w4a8)
+                dequantW4A8Slice(w, r + j, 0, cols, dst)
+            else if (w.dtype == .nvfp4)
+                nvfp4_mod.decodeSliceF32(dst, w.bytes, w.nvfp4.?.*, cols, r + j, 0, cols)
+            else
+                dequantI4Slice(w.bytes, (r + j) * cols, cols, w.row_scale.?[r + j], dst);
             if (w.convrot != 0) convrot_mod.rotate(dst);
         }
         for (0..m) |t| {

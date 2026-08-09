@@ -55,6 +55,7 @@ pub const embed_snowflake_cuda = @import("models/embed_snowflake_cuda.zig");
 pub const embed_siglip = @import("models/embed_siglip.zig");
 pub const embed_siglip_gpu = @import("models/embed_siglip_gpu.zig");
 pub const embed_siglip_cuda = @import("models/embed_siglip_cuda.zig");
+pub const quant_weight = @import("models/quant_weight.zig");
 pub const dit = @import("models/dit.zig");
 pub const dit_gpu = @import("models/dit_gpu.zig");
 pub const dit_cuda = @import("models/dit_cuda.zig");
@@ -70,6 +71,7 @@ pub const anima_gpu = @import("models/anima_gpu.zig");
 pub const anima_cuda = @import("models/anima_cuda.zig");
 
 test {
+    _ = quant_weight;
     _ = loader;
     _ = clip_text;
     _ = clip_text_gpu;

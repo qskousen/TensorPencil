@@ -76,6 +76,32 @@ const LogWriter = struct {
 
 pub const GenStatus = enum(u8) { pending, generating, done, failed, canceled, suspended };
 
+/// A short human explanation of a generation failure, for the tile that reports
+/// it. The recognized cases are the ones a user can ACT on; everything else
+/// falls back to the error name, which is at least specific enough to search
+/// for. ⚠️ VRAM exhaustion reaches here under four different names — the CUDA
+/// libraries report an out-of-workspace as their own error, and the hand-PTX
+/// path surfaces a post-OOM fault as `CudaError` (`pipeline.recoverableDecodeErr`
+/// documents the same set) — so mapping only `OutOfMemory` would leave the most
+/// common failure looking like an internal bug.
+pub fn failureText(err: anyerror) []const u8 {
+    return switch (err) {
+        error.OutOfMemory => "out of memory",
+        error.DeviceOutOfMemory,
+        error.CudaError,
+        error.CublasLtError,
+        error.CudnnError,
+        => "out of VRAM",
+        error.GpuDecodeNonFinite => "the GPU decode produced invalid pixels",
+        error.FileNotFound => "a model file is missing",
+        error.UnknownArchitecture => "the checkpoint's architecture is not recognized",
+        error.UnsupportedCheckpoint => "this checkpoint cannot run on the selected backend",
+        error.ComponentNotInCheckpoint => "the checkpoint is missing a component (VAE or text encoder)",
+        error.IncompleteMetadata => "the checkpoint file is corrupt",
+        else => @errorName(err),
+    };
+}
+
 /// The model-defining config for one generation — exactly the fields that decide
 /// which `pipeline.Session` an image needs (paths + backend + VAE decode path).
 /// Captured onto each `GenImage` at `enqueue` so a mid-queue backend/model switch
@@ -183,6 +209,15 @@ pub const GenImage = struct {
     /// steps (a generating image aborts) and by the source's next-pending scan
     /// (a queued image is dropped before it starts).
     cancel: std.atomic.Value(bool) = .init(false),
+    /// Why this image failed (`@intFromError`), 0 while it has not. Same shape as
+    /// `Diffuser.load_error`, and read through `failure()` so an invalid code can
+    /// never reach `@errorFromInt`.
+    ///
+    /// ⚠️ Recorded because the reason has to leave this thread: the LLM's tool
+    /// outcome line reports it back to the model ("out of VRAM" is actionable,
+    /// "failed" is not), and it is what the retry UI (TODO #3) needs too. It was
+    /// previously only `std.log.err`'d, i.e. visible to nobody but a terminal.
+    gen_error: std.atomic.Value(u16) = .init(0),
     wake: *const fn () void,
     /// Clock source for the worker's timing timestamps (set at creation).
     io: std.Io,
@@ -215,6 +250,20 @@ pub const GenImage = struct {
 
     pub fn get(self: *const GenImage) GenStatus {
         return @enumFromInt(self.status.load(.acquire));
+    }
+
+    /// Why this image failed, or null if it did not (or has not yet).
+    pub fn failure(self: *const GenImage) ?anyerror {
+        const code = self.gen_error.load(.acquire);
+        return if (code == 0) null else @errorFromInt(code);
+    }
+
+    /// Record a failure with its cause. Store the reason BEFORE the status: the
+    /// UI thread learns of the failure by polling `status`, so the other order
+    /// would let it read a fresh `.failed` beside a stale (zero) reason.
+    pub fn fail(self: *GenImage, err: anyerror) void {
+        self.gen_error.store(@intFromError(err), .release);
+        self.status.store(@intFromEnum(GenStatus.failed), .release);
     }
 };
 
@@ -734,6 +783,55 @@ pub const Diffuser = struct {
             .backend = self.opts.backend,
             .vae_decode = self.opts.vae_decode,
         };
+    }
+
+    /// Re-queue a failed or canceled image, IN PLACE. The `*GenImage` is unchanged,
+    /// so a chat variant holding a borrowed pointer re-renders the same tile going
+    /// pending → generating → done: "try this one again", not "make another".
+    ///
+    /// ⚠️ **The model snapshot is REFRESHED to the live config, deliberately
+    /// inverting `enqueue`'s rule** that an image finishes on the config it was
+    /// created with. That rule protects a queue from a mid-run switch; a retry is a
+    /// fresh request the user is making NOW, and the whole reason to press it after
+    /// an OOM is that they just changed something (unloaded the LLM, picked a
+    /// smaller model, switched backend). Honouring the old snapshot would retry the
+    /// exact configuration that just failed.
+    pub fn retry(self: *Diffuser, gi: *GenImage) !void {
+        switch (gi.get()) {
+            .failed, .canceled => {},
+            // Never touch one the worker may be holding, and never re-run a
+            // finished one (that would discard a good image in place).
+            .pending, .generating, .suspended, .done => return,
+        }
+        const fresh = try ModelConfig.dupe(self.gpa, self.liveConfig());
+        if (gi.model) |m| m.deinit(self.gpa);
+        gi.model = fresh;
+        // A stale latent from some earlier pause would resume mid-render into a run
+        // that has nothing to do with it; a retry starts clean.
+        if (gi.resume_snapshot) |*s| {
+            s.deinit(self.gpa);
+            gi.resume_snapshot = null;
+        }
+        // Drop the resident pipeline first (only when nothing is in flight —
+        // `freeSession` requires that). ⚠️ This is what makes the retry a
+        // genuinely different attempt rather than a replay of the conditions
+        // that just failed: after a VRAM failure the resident session is
+        // holding the memory the retry needs, and after a device fault a fresh
+        // session is the only recovery available at all. The cost is one model
+        // reload on a path the user explicitly asked for, after a failure.
+        //
+        // ⚠️ NOT verified to clear a sticky CUDA fault — `CUDA_ERROR_ILLEGAL_
+        // ADDRESS` poisons its context, and whether tearing the session down
+        // rebuilds far enough to escape that has not been measured here. If it
+        // does not, the retry reports the same error again, which is at least
+        // honest.
+        if (!self.busyNow()) self.freeSession();
+        gi.gen_error.store(0, .release);
+        gi.step.store(0, .monotonic);
+        gi.total.store(0, .monotonic);
+        gi.cancel.store(false, .release);
+        gi.status.store(@intFromEnum(GenStatus.pending), .release);
+        gi.wake();
     }
 
     /// The unified image list (creation order) for rendering / viewer nav.
@@ -1269,8 +1367,8 @@ pub const Diffuser = struct {
         defer self.res_mu.unlock(self.io);
         gi.status.store(@intFromEnum(GenStatus.generating), .release);
         self.busy.store(true, .release);
-        self.thread = std.Thread.spawn(.{}, worker, .{ self, gi }) catch {
-            gi.status.store(@intFromEnum(GenStatus.failed), .release);
+        self.thread = std.Thread.spawn(.{}, worker, .{ self, gi }) catch |err| {
+            gi.fail(err);
             self.busy.store(false, .release);
             return;
         };
@@ -1391,7 +1489,7 @@ pub const Diffuser = struct {
             sess = pipeline.Session.init(self.io, self.gpa, opts, progress) catch |err| {
                 std.log.err("diffusion model load failed: {t}", .{err});
                 self.load_error.store(@intFromError(err), .release);
-                gi.status.store(@intFromEnum(GenStatus.failed), .release);
+                gi.fail(err);
                 self.busy.store(false, .release);
                 self.wake();
                 return;
@@ -1421,11 +1519,12 @@ pub const Diffuser = struct {
                 self.wake();
                 return;
             }
-            const st: GenStatus = if (err == error.Canceled) .canceled else blk: {
+            if (err == error.Canceled) {
+                gi.status.store(@intFromEnum(GenStatus.canceled), .release);
+            } else {
                 std.log.err("image generation failed: {t}", .{err});
-                break :blk .failed;
-            };
-            gi.status.store(@intFromEnum(st), .release);
+                gi.fail(err);
+            }
             self.busy.store(false, .release);
             self.wake();
             return;
@@ -1443,8 +1542,8 @@ pub const Diffuser = struct {
 
         // The pipeline returns packed RGB; dvui wants RGBA. Convert once.
         const px = img.width * img.height;
-        const rgba = self.gpa.alloc(u8, px * 4) catch {
-            gi.status.store(@intFromEnum(GenStatus.failed), .release);
+        const rgba = self.gpa.alloc(u8, px * 4) catch |err| {
+            gi.fail(err);
             self.busy.store(false, .release);
             self.wake();
             return;
@@ -1553,6 +1652,34 @@ test "loadError/loadedFamily round-trip through their atomic encodings" {
         d.loaded_family.store(@as(u8, @intFromEnum(fam)) + 1, .release);
         try std.testing.expectEqual(@as(?pipeline.Family, fam), d.loadedFamily());
     }
+}
+
+// The failure reason has to survive the trip from the worker thread to the tile
+// that reports it, and `fail` has to leave the two atomics consistent — a UI
+// thread that sees `.failed` must never read a zero reason beside it.
+test "a failure records its cause, and only a failure does" {
+    const nop = struct {
+        fn f() void {}
+    }.f;
+    var gi: GenImage = .{ .prompt = "", .wake = nop, .io = std.testing.io };
+    try std.testing.expectEqual(@as(?anyerror, null), gi.failure());
+    gi.fail(error.DeviceOutOfMemory);
+    try std.testing.expectEqual(GenStatus.failed, gi.get());
+    try std.testing.expectEqual(@as(?anyerror, error.DeviceOutOfMemory), gi.failure());
+}
+
+// ⚠️ VRAM exhaustion arrives under four different names (the CUDA libraries
+// report an out-of-workspace as their own error, and the hand-PTX path surfaces
+// a post-OOM fault as `CudaError`), so the one failure a user can actually act
+// on must not fall through to a bare error name. Anything unrecognized still
+// says *something* specific rather than "failed".
+test "failureText names the VRAM family, and falls back to the error name" {
+    for ([_]anyerror{ error.DeviceOutOfMemory, error.CudaError, error.CublasLtError, error.CudnnError }) |e| {
+        errdefer std.debug.print("error {t}\n", .{e});
+        try std.testing.expectEqualStrings("out of VRAM", failureText(e));
+    }
+    try std.testing.expectEqualStrings("out of memory", failureText(error.OutOfMemory));
+    try std.testing.expectEqualStrings("SomethingNovel", failureText(error.SomethingNovel));
 }
 
 test "ModelConfig.dupe owns all four paths and eql sees each of them" {

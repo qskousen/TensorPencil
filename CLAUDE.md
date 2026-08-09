@@ -239,6 +239,366 @@ garbage.
 is not a "permissive reader", it is a deferred crash. The failure surfaced five frames deep
 in `ops.matmul` on an assert about something else entirely.
 
+## ComfyUI's `asym_w4a8_int8`: a 4-bit weight that DECODES to int8 convrot
+
+Landed 2026-08-08 for `krea2CenterSemiraw_v10Int8-ASYM_W4A8_INT8.safetensors`. Added
+to ComfyUI in `344b4398 Support asym w4a8_int (#15308)`; the arithmetic lives in
+`comfy_kitchen/tensor/w4a8_int8.py` + `backends/{eager,triton}/w4a8_int8.py`. A layer
+ships five tensors — `weight` (I8, **`[N, K/2]`**, two 4-bit indices per byte),
+`weight_s_rel` (F8_E4M3, `[N, K/group_size]`), `weight_s_channel` (F32, `[N]`),
+`weight_codebook` (F32, `[16]`, optional) and `comfy_quant` — and decodes as
+
+```
+q    = nibble(packed)                              // 0..15, even col = LOW nibble
+lvl  = codebook[q]   (or  q - 8  with no codebook)
+int8 = rint(clamp(lvl * s_rel[row, group], -127, 127))
+```
+
+**The whole reason this cost almost nothing is the last line: from there it is the
+int8-convrot GEMM this engine already runs** — `row_scale` = `s_channel`, `convrot` =
+256 — so `Weight.dtype` is `.i8` after load and **all four backends ran it on day one
+with no new kernel**. ComfyUI does the same thing (`_dequant_int4_grouped_to_int8`,
+then `int8_linear(..., convrot=True)`), which is what makes a correct decode
+bit-identical to its result rather than merely close. `ops/w4a8.zig` owns the decode,
+`dit.Loader.matW4A8` the container half.
+
+**Four things that are silent wrong answers rather than errors:**
+
+- ⚠️ **The stored shape is EXACTLY the int4-convrot signature**, so detection must come
+  first and must key on `weight_s_rel`, not on dtype or shape. `Loader.mat`'s existing
+  heuristic reads "I8 at `[rows, cols/2]`" as nibble-packed **signed** int4 times a
+  per-row scale; W4A8's nibbles are **unsigned indices into a non-uniform codebook**.
+  (It happens to fail today on the missing `_scale`, but that is an accident of naming,
+  not a check.)
+- ⚠️ **The codebook is NOT uniform, so this is not `.i4` with a finer scale.** The 16
+  levels are Lloyd-Max-optimal for a Gaussian — ConvRot makes the rotated groups
+  Gaussian — spaced 0.186 at the tails and 0.103 in the middle. All 224 layers of this
+  checkpoint ship the *frozen* table (`_FIXED_LUT`), but it is read per tensor because a
+  heavy-tailed one gets a fitted table (`_codebook_for`'s kurtosis gate).
+- ⚠️ **The rounding is ties-to-EVEN.** torch's `.round()` and the Triton kernel's
+  `libdevice.rint` both are; Zig's `@round` is half-away-from-zero. `s_rel` is fp8, i.e.
+  a small mantissa times a power of two, so exact `.5` products are rare but not
+  negligible — every checkpoint would carry a handful of off-by-one weights, visible to
+  nothing. The `ties_to_even` fixture case uses a half-integer codebook so 8 of 16
+  levels distinguish the two modes; without it the difference cannot be seen.
+- ⚠️ **`group_size` is derived from `weight_s_rel`'s OWN shape and only then
+  cross-checked against `comfy_quant`.** Trusting the JSON alone would let a stale value
+  read every scale from the wrong group — a finite, plausible weight. A disagreement is
+  an error. `convrot_groupsize` is *not* derivable and must be 256, since
+  `ops.convrot` is a comptime 256 table and a radix-4 FWHT over four base-4 digits.
+
+**The decode goes through a 4 KiB LUT, and that is what makes it affordable.** `s_rel`
+is fp8, so there are only 256 possible group scales; one `[256][16] i8` table therefore
+holds every value a tensor can decode to (`w4a8.Levels`, built once per weight, exact by
+construction — its entries use the same f32 multiply-round-clamp). The per-element work
+becomes one L1 load and one store, so a whole-model decode is bandwidth-bound rather
+than arithmetic-bound: **12.2 GB decoded in ~2.0 s** fanned over `std.Thread`s (the
+model loaders are synchronous and take no `Io`; a spawn failure just means the caller's
+thread does that share).
+
+### Measured
+
+**Pinned against comfy_kitchen's own reference in two tiers**
+(`tools/gen_w4a8_fixtures.py`): 6 synthetic cases exact on every int8 value (frozen LUT,
+no-codebook, `group_size` 4/16/32, saturation, ties) plus the full
+`dequantize_w4a8_int8_weight` at 2e-6 through our convrot; and one **real layer** of the
+checkpoint, hashed input and output, living in `tp_models` because that tier is about the
+*container* (`tp_ops` cannot reach `test_gate`). Both tiers were verified to have teeth
+by breaking them.
+
+⚠️ **A render comparison of two differently-quantized checkpoints CANNOT rank the
+formats, and reading only that table would have got this backwards.** Every pair of the
+four krea2 quantizations lands in the same 22–26 dB band, because at 20 steps a small
+weight perturbation is amplified into a different-but-equally-plausible image — the
+control is that **ComfyUI's own fp8 and int8 renders of this seed differ by 24.71 dB /
+SSIM 0.865**. The isolation that does rank them is at the *weight* level: dequantize
+each format back to f32 in the original basis and compare (mean rel L2 over 4 layers
+spanning the trunk).
+
+| | vs fp8¹ | **vs int8 (reference-free)** | file |
+|---|---|---|---|
+| int8 convrot | 2.95% | — | 14.13 GB |
+| **w4a8** | **7.88%** | **7.31%** | **8.81 GB** |
+| int4 convrot (W4A4) | 16.80% | 16.53% | 8.05 GB |
+
+¹ fp8-e4m3 is itself quantized (~2–3% RMS), so that column is inflated by an error
+common to all three rows; the ordering holds, the absolute figures do not.
+
+**So W4A8's peer is int4, not int8** — it is a 4-bit format whose per-16-group scale and
+optimal codebook recover **2.26x** of int4's weight error at essentially the same file
+size, while sitting ~2.5x behind int8. The renders agree once read that way (1120x1680,
+20 steps, seed 252469767172722, `cuda`, against TP's own int8 render as the anchor):
+**w4a8 23.57 dB / SSIM 0.876 against int4's 17.89 dB / 0.694.** Neither is *broken* —
+int4 produces a good poster with a different pose, which is what quantization divergence
+looks like as opposed to damage.
+
+### The weight stays PACKED: a device decode per GEMM
+
+⚠️ **The first version decoded to int8 at LOAD, and that threw away the point of the
+format.** It worked on all four backends with no kernel at all — the decode's output is an
+ordinary int8-convrot weight — but a decoded krea2 is **12.2 GB against 6.1 GB packed**,
+i.e. exactly int8's footprint, and unlike an int8 checkpoint's mmap'd views those are
+*anonymous* allocations (measured maxrss 19.3 GB against int8's evictable page cache). A
+4-bit format that occupies 8 bits buys only accuracy and a smaller download.
+
+So the packed form is what stays resident, and each consumer decodes on demand — the CPU
+GEMM per k-slice into its existing dequant panel (`matmul.dequantW4A8Slice`), each GPU
+backend per GEMM into a transient device scratch. That is also what ComfyUI's own Triton
+and CUDA backends do. `Weight.dtype` is `.w4a8` with the sidecars on `Weight.w4a8`.
+
+| `cuda`, 1120x1680 / 20 steps / cfg 1 | s/step | DiT VRAM | host maxrss |
+|---|---|---|---|
+| int8 convrot — the accuracy control | 2.25 | 12056 MB | mmap'd |
+| int4 convrot (W4A4) — the *size* control | **1.95** | **6054 MB** | mmap'd |
+| W4A8 materialized at load | 2.09 | 12056 MB | 19.3 GB |
+| W4A8 packed, first decode kernel | 2.36 | 7081 MB | 12.3 GB |
+| **W4A8 packed, final** | **2.26** | **7081 MB** | **12.3 GB** |
+
+**So on `cuda` W4A8 now runs at int8's speed (2.26 vs 2.25 s/step) on 41% less VRAM**, and
+lands within 16% of int4's speed and 17% of its VRAM while its weights are **2.26x closer
+to int8's**. The residual VRAM over int4 is the fp8 per-group scales (0.77 GB), which are
+intrinsic to the format, plus one 100 MB scratch.
+
+**Every decode path is bit-identical to the load-time materialization** — `PSNR inf` on
+all three GPU backends against the pre-change renders — so none of this moved the image.
+
+⚠️ **Both device kernels are ALSO pinned against `ops.w4a8.decode` on synthetic weights,
+and that is the durable check.** The render comparison above stopped being reproducible
+the moment the checkpoint left the disk; a gated test that needs no model file does not.
+Both were verified to have teeth by breaking them.
+
+### Two kernels, and both were first written ~50x off their ceiling
+
+Neither is arithmetic — the `[256][16]` level table means a decode is pure byte lookup —
+so both have a hard bandwidth ceiling of ~20 ms/step for the whole model, and both missed
+it badly in their first form. ⚠️ **Judge these by achieved GB/s against the card's roof,
+never by share of the step** — this is the third time this file records that rule.
+
+- **CUDA (`w4a8_decode` PTX, shared by `cuda` and `zig-cuda`): 270 -> ~100 ms/step.** The
+  first version was one thread per packed byte. The level lookups are *dependent* loads
+  (the address comes from the loaded nibble), so one byte per thread gives a single memory
+  chain per thread and is latency-bound, not bandwidth-bound. Four bytes per thread
+  (`u32` in, `v2.u32` out, `prmt.b32` packing) puts eight independent chains in flight for
+  the same traffic. ⚠️ That makes `group_size % 8 == 0` a requirement — a `u32` of packed
+  bytes must lie inside one group so the group scale is loaded once — and
+  `dit.w4a8SmallGroup` refuses the checkpoint by name rather than asserting. No file uses
+  a smaller group; Vulkan's kernel is general over it.
+- **Vulkan (`w4a8_decode_t`): 1757 ms/step, isolated with a new `w4a8` profile
+  category.** Its GEMM reads a k-major weight, so this kernel also has to transpose — and
+  a transpose has one unavoidably strided side, which at 32 lanes per warp is 32 separate
+  sectors per load instruction. Paying that *per GEMM* rather than once at load is the
+  whole 50x. ⚠️ **The fix was to stop transposing here at all**: both the packed bytes and
+  the fp8 group scales now go through `weightBuffer`, i.e. they are byte-transposed once
+  at load and cached exactly like every dense weight, and the per-GEMM decode is then
+  coalesced on all three streams. It reads `a.data[t]` — the thread id *is* the source
+  index. ⚠️ Its post-rewrite speed is **UNMEASURED**: the checkpoints were pruned off this
+  box before the render could be repeated. Correctness is pinned by the device test, not
+  by a render.
+  - The `w4a8` profile category is kept for the reason it was added: folded into `matmul`
+    this cost looked like a slower GEMM, and a per-GEMM pass with a known ceiling deserves
+    its own row.
+
+⚠️ **The device weight caches key on HOST POINTER, and that bit the test, not the model.**
+Both kernel tests allocate per case; freeing a case's arrays let the allocator hand the
+same address to the next one, which scored a stale cache hit and decoded the *previous*
+case's weights — a real failure ("got 0, want -4") that looked like a group-size bug. The
+tests hold every case in one arena now. A model never hits it (weights live in the model
+arena for its lifetime), but anything that reuses a weight-shaped buffer does.
+
+⚠️ **`opI8Prep` is shared, and that is the structural reason this cost so little.** W4A8's
+activation prep *is* int8's — the "A8" is exactly that the activation stays 8-bit — so
+only the weight's storage differs, one GEMM entry point per backend changed, and a
+checkpoint that mixes int8 and W4A8 linears works because the dispatch is per weight
+(`i8GemmW`) rather than per model.
+
+⚠️ **A load-timing label had been backwards for every family, and it sent me after the
+wrong component.** All five arms of `Session.init` load the denoiser first and take `t1`
+after it, but the summary line read `"models loaded (encoder {t1-t0}, dit+vae {t2-t1})"` —
+so the W4A8 arm's 2.0 s of read-and-decode was reported as `encoder 2.0s, dit+vae 0.3s`,
+i.e. as a slow *encoder* and a suspiciously instant 12 GB decode. The numbers were right
+and the names were not; same class as a mislabelled profiler bucket. Now
+`denoiser … , encoder+vae …`.
+
+⚠️ **Also fixed on the way past: `safetensors`' "real model headers" test guarded on ONE
+of the three checkpoints it opens** and then opened the other two unconditionally, so
+pruning any single file hard-failed a *fast-suite* test with a bare `FileNotFound` five
+frames deep. Each block guards its own path now, and the test skips rather than passing
+green when none is present.
+
+## ComfyUI's NVFP4: 4-bit E2M1 floats, and a weight-only format below Blackwell
+
+Landed 2026-08-08 for three checkpoints at once — krea2, Anima and Z-Image all ship one.
+Reference: `comfy_kitchen/tensor/nvfp4.py` + `backends/eager/quantization.py`. A layer
+carries `weight` (U8 `[rows, cols/2]`, two E2M1 codes per byte), `weight_scale`
+(F8_E4M3, per-16-element block), `weight_scale_2` (F32 scalar) and `input_scale`
+(F32 scalar, **Blackwell-only, unused here**), decoding as
+
+```
+total[row, blk] = weight_scale_2 * fp8(block_scale[row, blk])
+value           = E2M1[nibble] * total[row, blk]
+```
+
+⚠️ **`MIN_SM_VERSION = (10, 0)` gates the NATIVE op, not loading — NVFP4 runs fine on an
+Ampere card and I initially said it could not.** ComfyUI's `pick_operations` calls
+`supports_nvfp4_compute`; when false it moves `nvfp4` from what its log calls "native ops"
+to **"emulated ops"**, which sets `_full_precision_mm`, and every linear then dequantizes
+the weight to the compute dtype per call before a normal GEMM. The 4-bit weight stays
+resident. This engine does the same: `Weight.dtype == .nvfp4` keeps the packed bytes, the
+CPU GEMM decodes into its f32 panel and each GPU backend into a transient f16 scratch
+feeding the existing f16 tensor-core GEMM.
+
+### Three conventions that differ from every other 4-bit format here
+
+Each is a silent wrong answer, and each would be got wrong by analogy with `.i4`/`.w4a8`:
+
+1. ⚠️ **Element 2k is the HIGH nibble** (`hi_first = True`). `.i4` convrot and `.w4a8` are
+   both low-first. The wrong order permutes adjacent weight pairs, which is **exactly
+   rms-preserving** — a fast test asserts both that it differs on 7584/8192 fixture values
+   AND that the sum of squares is bit-identical, because that is why no magnitude check
+   can find it.
+2. ⚠️ **The block scales are SWIZZLED** into cuBLAS's tiled layout (`to_blocked`), while
+   on disk they keep the LOGICAL `[rows, cols/16]` *shape* — so nothing in the header
+   hints at it. `nvfp4.unswizzleScales` is the inverse of the reference's five reshapes,
+   applied ONCE at load so no consumer carries a five-way tiled index in an inner loop.
+   Measured: reading the stored order as row-major moves 6281/8192 values.
+3. ⚠️ **The multiply association is `E2M1 * (per_tensor * block)`**, not
+   `(E2M1 * block) * per_tensor`. Only the first is bit-exact against the reference, and
+   it is what a per-scale-byte table computes naturally.
+
+**No ConvRot and no per-output-row scale**, unlike int8/int4/W4A8 here — `row_scale` stays
+null and `convrot` 0, and `matmul` asserts both are absent for `.nvfp4`. A `[256][16]`
+table (`Levels`, f32 for the CPU panel and f16 for the GPU operand) folds the whole decode,
+so the per-element work is one lookup.
+
+⚠️ **A NaN block-scale byte PROPAGATES here**, where `ops/w4a8.zig` maps it to 0 — only
+because W4A8's target is an integer and `@intFromFloat(nan)` is illegal, not because 0 is
+more right. Both match their reference; the device tests assert NaN-for-NaN agreement.
+
+### Detected by `weight_scale_2`, not by `comfy_quant`
+
+⚠️ **Z-Image's NVFP4 checkpoint ships NO `comfy_quant` blob at all** (krea2's and Anima's
+carry `{"format": "nvfp4"}`), so a loader keyed on the metadata silently fails to recognize
+one of the three files. `_scale_2` is the tensor only this format has. `models/quant_weight.zig`
+holds the ONE implementation, called from all three families' `mat` — three copies of
+"read the scale, unswizzle it, build the table" is the drift that makes one family's
+renders disagree with another's for reasons no shape check sees.
+
+### Measured
+
+**Pinned against comfy_kitchen in two tiers** (`tools/gen_nvfp4_fixtures.py`): 4 synthetic
+cases **exact** at f32 output (the generator asserts our model of the reference before
+emitting, and self-checks that both traps above change the answer), plus **one real layer
+per family**, hashed input and output, through the actual loader. Both verified to have
+teeth by flipping the nibble order — 3 tests fail.
+
+| krea2, 1120x1680 / 20 steps / cfg 1 | s/step | DiT VRAM |
+|---|---|---|
+| **`cuda`** | **4.36** | **7034 MB** |
+| `zig-cuda` | 6.39 | 8948 MB |
+| `vulkan` | 6.52 | 7453 MB |
+| `cpu` | 8.26 (256²) | — |
+
+The three GPU arms agree with each other at **28.9–36.8 dB / SSIM 0.987–0.996**, and each
+agrees with the CPU f32 decode at 256² (vulkan 28.5, cuda 23.7, zig-cuda 19.9 dB — a
+4-step 256px trajectory is chaotic, so read the reference-resolution spread instead).
+
+⚠️ **NVFP4 costs W4A8's VRAM at roughly TWICE W4A8's step time, and that is structural.**
+Same checkpoint family, same settings: W4A8 is **2.26 s/step on 7081 MB**, NVFP4 **4.36 on
+7034 MB**. Both keep 4-bit weights resident; the difference is the arithmetic partner —
+W4A8's is the int8 tensor-core GEMM, NVFP4's is f16, at half int8's throughput and twice
+the decoded weight traffic. **On this hardware NVFP4 is therefore the worse of the two for
+a model that has both**, and its value is (a) running checkpoints you already have and
+(b) being ready for Blackwell, where its native W4A4-fp4 GEMM would invert the comparison.
+
+**All three families run the device trunk on all three GPU backends**, through one shared
+loader and one `Meta`/`Levels` pair. At 256² / 4 steps, each device trunk against the SAME
+model's CPU trunk — the check that matters for a port, since it is the same weights through
+two independent decoders:
+
+| device trunk vs the same model's CPU trunk, 256² / 4 steps | `cuda` | `zig-cuda` | `vulkan` |
+|---|---|---|---|
+| krea2 | 23.9 dB | 23.0 | 22.9 |
+| Anima | 53.4 dB | 54.2 | 55.1 |
+| Z-Image | 51.1 dB | 55.0 | 43.4 |
+
+krea2's 23 dB is a 4-step 256px trajectory, which is chaotic; its reference-resolution
+figure is in the table above. Anima's and Z-Image's 43-55 dB is the real signal: the same
+weights through two independent decoders, differing only by bf16's rounding.
+
+⚠️ **Do NOT take s/step from a 256²/4-step run on this card, and I did once.** Those
+numbers put `cuda` SLOWEST — 2.2x behind the hand-PTX arm — which contradicts every other
+table in BACKEND.md, and a contradicted prior means the measurement is suspect. Two causes,
+and only the second was a real defect:
+- **The 3090 idles its clocks**, so a short cold render is not a measurement: the *same*
+  krea2 config read 0.36 and 0.66 s/step on consecutive runs. At 1120x1680 / 8 steps the
+  repeat variance is ±1.3% and the ordering is the expected one (`cuda` **4.35-4.46**,
+  `zig-cuda` 6.68, `vulkan` 6.56-6.60 s/step). This file already records the rule for
+  `anima-vk-bench`; it applies to whole renders too.
+- **`opMatmulNvfp4` forced the cuBLASLt arm through a padded staging buffer and a
+  compaction pass it does not need.** cuBLASLt takes an arbitrary `m` and writes exactly
+  `m` rows, so the libs arm now writes `y` directly — the same fast path `opGemmBf16`
+  already had. Worth 4.73 -> 4.43 s/step at reference size, **183 MB of VRAM** (no
+  `conv_c`), and 2 fewer kernels per GEMM. Verified bit-identical on Anima and Z-Image;
+  krea2 moved 21.6 -> 23.9 dB against its CPU trunk, i.e. *closer*, because the staged path
+  it replaced also had the `zeroBias` hazard below.
+  - ⚠️ **`Backend.zeroBias` is not safe to hand to `cachedWeight`**: it reallocates on
+    growth and returns the whole buffer, so its pointer MOVES, leaving a device buffer
+    registered against a freed host address for a later allocation to collide with. The
+    hand-PTX arm takes the caller's stable file-scope `zero_bias` instead — which is what
+    `zimage_cuda.gemm` already documents for the same reason.
+  - The hand-PTX arm still stages, because `launchHgemm` genuinely writes `mpad` rows; that
+    is also why `zig-cuda` holds 9131 MB against `cuda`'s 7034.
+
+⚠️ **Four things the per-family wiring turned up. Two were silent, two were fatal:**
+
+- **f16's 65504 ceiling, and it made Z-Image a SOLID WHITE image.** The decoded weights are
+  tiny, but the GEMM converts the *activation* to the same format, and Z-Image's trunk
+  activations pass f16's range. The tell was that all three backends were **byte-identical**
+  (same md5) at 7.50 dB — three independent GEMM implementations cannot agree pixel-for-pixel,
+  so it was not arithmetic; white is white. Switching the whole format to **bf16** — the level
+  table, both decode kernels' output and `coopF16WDispatch`'s `bf16_ab` — fixed it: **7.50 ->
+  43-55 dB** on all three. ⚠️ **Named cost: bf16 is the ROBUST choice, not the free one.** Its
+  8-bit mantissa is coarser than f16's 11, which costs krea2 ~1-2 dB and Anima ~4 dB at 256²
+  against the f16 version — but a 4-bit payload cannot use f16's extra mantissa anyway, this is
+  the same regime these models' own dense bf16 weights run in, and a per-model choice would be
+  a knob that can be set wrong. Third time this repo has met f16's range on a real checkpoint
+  (SDXL's VAE residual stream, the Flux/Z-Image VAE's 9.95e6 attention logits, now this).
+- **`launchHgemm` writes `mpad` rows, not `m`** — `grid.y = mpad/128` and each block stores a
+  whole 128x128 C tile — so it cannot write into a caller buffer sized `m*rows`. Reported as
+  `CUDA_ERROR_ILLEGAL_ADDRESS` on Z-Image's first `[10240, 3840]` MLP weight at m=288/mpad=384,
+  3.9 MB past the end. `opMatmulNvfp4` now stages into the padded `conv_c` and compacts, as
+  `opGemmBf16` already did for exactly this reason. ⚠️ **`opMatmulFp8` still writes `y`
+  directly** and so carries the same requirement on its callers implicitly; its zimage/anima
+  `.f8_e4m3` arms have never been exercised and would hit this the day an fp8 checkpoint for
+  either shows up.
+  - ⚠️ Found by bisection, not by the sanitizer: `compute-sanitizer` on this box fails with
+    "Unable to find injection library libsanitizer-collection.so". A temporary sync-and-report
+    after each NVFP4 GEMM named the shape in one run.
+
+
+- **Z-Image splits its fused qkv into three row-block GEMMs** (`qkvPart`), and a row range
+  of an NVFP4 weight must slice the **per-block scales** with it — they are
+  `[rows][cols/16]`, so it is a plain slice, but leaving the full array behind a shortened
+  `Weight` makes the k and v views read **q's** block scales. `Meta.rowSlice` owns it and
+  `qkvPart` now takes caller storage for the sliced `Meta`.
+- **`zimage_*.supported` probed `layers[0].attn.qkv.dtype` — one tensor of one layer.**
+  This file already flagged that as "correct only because no mixed Z-Image checkpoint
+  exists"; it now scans every layer's linears (and each `ada`) against what the *device*
+  has, and names the offending tensor. `anima.LinKind` gained `.nvfp4` as a distinct kind
+  rather than folding into `.dense`, and the exhaustive switch that made the Vulkan arm
+  fail to compile is exactly why that was the right shape.
+
+⚠️ **The bug this cost, and it is the same lesson as the fp8-vs-GGUF blank image already in
+this file.** `dit_gpu` has GEMM call sites BESIDES `Gemm.go` — the fp8 "shared" fast paths,
+gated on `!is_i8 and !is_bf16`, which for a packed NVFP4 weight is **true**. So q/k/v/gate
+and the MLP took `opMatmulCoopH16`, reading nibble pairs as e4m3 bytes. It was visible only
+as **VRAM**: 84 layers cached at their LOGICAL byte count (2x packed), 8064 MB of an
+11899 MB total, because a 4-step 256px render still looked plausible. Found by asking why
+Vulkan held 11899 MB where CUDA held 6737 — a histogram of the weight cache showed 84
+entries at exactly `rows*cols` bytes. Fixing it took Vulkan to **6869 MB and 2.4x faster**,
+and turned it into the arm that agrees BEST with the CPU. **Weight storage has to gate
+every arm, not the one you remembered writing.**
+
 ## Weight overlays: substituting one tensor without rewriting a checkpoint
 
 `weights.Overlay` is a third `WeightStore` arm — a base store plus a
@@ -1942,10 +2302,19 @@ like; a broken kernel gives noise or a flat field, not the same pose with a grai
 that is WRONG here.** A real mixed checkpoint is mixed by block:
 `easonAnimaHOTStyle_animaV10-INT8_CONVROT` leaves block 0 entirely dense, quantizes block
 1's ten attention/MLP linears, and quantizes all sixteen (AdaLN included) in blocks 2-27. So
-`anima.linKind` is per linear and `prepGroup` is per shared activation. The AdaLN pair and
-cross-attention's k/v are quantized too but are evaluated on the HOST, where `ops.matmul`
-handles convrot at any shape — which is what lets the device path require `rows % 128 == 0`
-(CUDA) / `% 64` (Vulkan) without special-casing their 256 and 6144.
+`anima.linKind` is per linear and `prepGroup` is per shared activation. The AdaLN pair is
+quantized too but is evaluated on the HOST, where `ops.matmul` handles convrot at any shape —
+which is what lets the device path require `rows % 128 == 0` (CUDA) / `% 64` (Vulkan) without
+special-casing its 256 and 6144.
+
+⚠️ **Cross-attention's k/v are on the DEVICE and were missing from that scan until
+2026-08-08.** They *were* host GEMMs when `unsupportedLin` was written, and the comment saying
+so outlived the change that moved them (the per-image stall fix below) — so a checkpoint whose
+cross k/v were quantized in a form the backend lacks would have passed the gate and met it
+inside `buildCrossKv`. That is the block-0-only probe's mistake exactly, one level down, in the
+very function that exists to prevent it. `anima.deviceLins` is now the single list all three
+scans (`unsupportedLin`, `maxNvfp4Scratch`, `maxW4A8Scratch`) read. **Generalizable: when a
+computation moves from host to device, the SUPPORT SCAN is part of what moves.**
 
 ⚠️ **`opI8Prep` does NOT overwrite its input** on either backend — it writes int8 rows and
 per-row scales into the backend's own scratch — so a dense GEMM in the same group may still
@@ -1953,13 +2322,49 @@ read the f32 activation afterwards. The only constraints are that the prep prece
 quantized GEMMs of its group and that one prep serves one reduction width. Anima's MLP is
 8192 wide where everything else is 2048, so `mlp2` gets its own prep.
 
-⚠️ **Vulkan has NO `sint4` cooperative matrix**, only `sint8`. `anima_gpu.Lins` therefore
-**widens every int4 weight to int8 once**, which is exact — a 4-bit value is representable
-in 8 bits and the per-row scale and rotation are untouched — and against CUDA's true W4A4 it
-is *more* accurate, since the activation stays int8. **Named cost: int4 costs int8's memory
-on Vulkan.** The fix that recovers it is a nibble-reading coop GEMM or an i4→i8 repack
-inside `weightBufferRepacked` (device-only widening); both are real kernel work, neither
-done.
+⚠️ **Vulkan has NO `sint4` cooperative matrix**, only `sint8`, so the nibbles must reach the
+GEMM as int8 either way and the activation stays int8 (`opI8Prep`) — i.e. Vulkan's int4 is
+W4A8-shaped, not the CUDA arms' W4A4, and is in fact *more* accurate for it.
+
+**Until 2026-08-08 that unpack happened ONCE AT LOAD** (`anima_gpu.Lins.widen`), which keeps a
+full int8 copy resident — so a 4-bit checkpoint cost 8-bit memory. It now happens **per GEMM**
+into `ctx.i4_t` (`i4_decode_t` / `Context.i4Decode`), and `Lins`/`DevLins`/`widen` are gone
+entirely: `blockForward` reads the model's own weights again.
+
+| `terraRising`, vulkan, 512x768 / 20 steps / cfg 4 | DiT VRAM | s/step |
+|---|---|---|
+| int4, widened at load | 1778 MB | 0.48 |
+| **int4, decoded per GEMM** | **1038 MB** | **0.46** |
+| (W4A8, for scale) | 1118 MB | 0.49 |
+| (int8) | 1778 MB | 0.47 |
+
+**-740 MB and bit-identical** — the render md5 is unchanged, as it must be, since a 4-bit value
+is exact in 8 bits and the scale and rotation are untouched. int4 now sits *below* W4A8, which
+is the right ordering: it carries 2.9 MB of f32 per-row scales where W4A8 carries 109 MB of fp8
+per-group ones.
+
+⚠️ **What made this worth doing was noticing the two formats were treated differently for no
+reason**, and the arithmetic is what exposed it: the device linears hold **1050.7 MB of packed
+weight in BOTH formats** (both are nibble-packed 4-bit), so int4 held strictly *less* data than
+W4A8 and yet occupied 660 MB more. A footprint difference with no corresponding data difference
+is a policy, not a property — worth checking whenever two similar formats disagree on VRAM.
+
+⚠️ **The old cost estimate here was badly wrong and is worth remembering as a pattern.** It read
+"a nibble-reading coop GEMM or an i4→i8 repack … both are real kernel work, neither done" — true
+when written, and never revisited after `w4a8_decode_t` landed and made it a ~10-line
+simplification (same pre-transposed `weightBuffer` input, same `[cols][stride]` int8 output,
+same `opI8GemmBuf` after; just no scale plane and no level table). **An effort estimate has an
+expiry date set by what else gets built**, and a "not done, too expensive" note is exactly the
+kind that stops being re-examined.
+
+**Pinned by `test "the Vulkan int4 decode matches the CPU nibble unpack, including the row
+padding"`** — the reference is precisely the unpack `widen` used to do, so the test asserts the
+replacement rather than merely something plausible. Verified to have teeth by swapping the
+nibble halves. ⚠️ It checks the row PADDING too: the scratch is shared between weights of
+different shapes, so an unwritten pad slot would feed the next GEMM the previous weight's values.
+
+**krea2's Vulkan DiT still has no int4 path at all** (`dit_gpu` never accepted it), and this
+kernel is now most of what it would need. Not attempted.
 
 ⚠️ **That widening must be per MODEL, and making it per session doubled the VRAM.** The
 device weight cache keys on the host POINTER, so one shadow per `anima_gpu.Session` uploaded
@@ -1972,6 +2377,177 @@ kernel unrolls its FWHT for a fixed `cols` and only krea2's 6144/16384 existed; 
 width silently takes a 3-pass fallback that round-trips a full f32 copy of the activation
 through global memory. The table is now `{2048, 6144, 8192, 16384}` and looked up rather
 than switched on.
+
+### W4A8 on Anima: a format that shipped for one family and arrived on another
+
+Landed 2026-08-08 for `terraRising_20TerraRisingAnima-ASYM_W4A8_INT8.safetensors`, reported
+as "this one has an error when running it in the gui (maybe CLI too?)". It was both — the
+failure is at *load*, so every surface hit it:
+
+```
+error: anima: blocks.1.self_attn.q_proj.weight is i8 but
+       blocks.1.self_attn.q_proj.weight_scale is missing
+       (int8/int4 convrot needs a per-row scale)
+```
+
+⚠️ **The bug is that W4A8 landed in `dit.zig` alone, one day earlier, and the format is not
+krea2's.** A W4A8 weight is stored `I8 [rows, cols/2]`, which is *bit-for-bit* the int4-convrot
+signature — so Anima's loader, which had never heard of the format, fell through to its int4
+arm and died on the `_scale` W4A8 does not have (its spelling is `weight_s_channel`). **That
+was the lucky outcome.** Had the names matched, the nibbles — unsigned indices into a
+non-uniform Lloyd-Max codebook — would have been read as signed int4 times a per-row scale:
+finite, plausible and wrong. `dit.zig`'s own comment predicted exactly this ("it would in fact
+fail on the missing `_scale` today, but that is an accident of naming, not a check") and the
+conclusion drawn from it was to write the comment rather than to move the reader.
+
+**The fix is where, not what.** `models/quant_weight.zig` already existed for precisely this
+reason — NVFP4 arrived on three architectures at once and got one shared container reader —
+and W4A8 simply was not put there. It is now (`quant_weight.w4a8`, hoisted verbatim out of
+`dit.Loader.matW4A8`), called from krea2's, Anima's **and Z-Image's** `mat`. ⚠️ **Z-Image is
+included although no such checkpoint exists for it**: nothing about that family would have
+stopped one arriving, and `.w4a8` is absent from its `gpuLinKindSupported`, so it would run on
+the CPU while every GPU arm declines — a strictly better state than a hard error.
+
+⚠️ **Generalizable, and this is the whole content of the section: every format ComfyUI's
+quantizers emit reaches every family they support.** A container reader for one of them
+belongs in the shared module the day it is written, not after the second checkpoint arrives.
+The cost of getting it wrong is not a slow path; it is a file the engine refuses.
+
+**Verified bit-identical across the hoist**: krea2's own W4A8 checkpoint renders the same md5
+before and after (512², 4 steps, seed 42, `cuda`), A/B'd by temporarily restoring the old
+inline path. ⚠️ The obvious control — `test "a W4A8 layer of a real checkpoint decodes to
+comfy_kitchen's int8 weight"` — could **not** serve, because the file it is tied to by sha256
+is gone from this box and it had been silently self-skipping. The file with a similar name
+(`v10Int8AndBf16-` against the fixture's `v10Int8-`) has *matching shapes and different bytes*,
+so repointing it would have compared against the wrong weights while passing green. Same trap
+this file already records for the Anima gated tests.
+
+**The compute side needed no new kernel on any backend** — W4A8's activation prep *is* int8's
+and its decode output *is* an int8-convrot weight, so all three GPU arms already had
+`opI8GemmW4A8` / `w4a8Decode` from the krea2 work. What Anima needed was the per-block
+dispatch: `LinKind.w4a8`, the scratch pre-sizing, and one new concept —
+
+⚠️ **`anima.prepKind`, because `LinKind` is NOT one-to-one with the activation prep.** int8 and
+W4A8 share `opI8Prep`; grouping by `LinKind` would have refused this very checkpoint as an
+unserviceable mix (its block 1 has W4A8 attention weights next to block 0's dense ones). The
+prep is a property of the *activation*, the kind a property of the *weight*, and only the
+second is what the GEMM dispatches on.
+
+| `terraRising`, 512x768 / 20 steps / cfg 4, `cuda` | s/step | DiT VRAM | vs its own bf16 |
+|---|---|---|---|
+| bf16 | 0.44 | 3230 MB | — |
+| int8 convrot | 0.28 | 1781 MB | 32.31 dB / SSIM 0.978 |
+| **w4a8** | **0.26** | **1120 MB** | **20.86 dB / SSIM 0.856** |
+
+**So W4A8 runs at int8's speed on 63% of its VRAM**, the same shape as krea2's result. The
+three GPU arms agree with each other at **34.9–38.2 dB / SSIM 0.987–0.996**, which is what
+says the spread against bf16 is format loss and not any one arm's kernel.
+
+⚠️ **The parity harness FAILED a correct implementation, and the fix was the tolerance — but
+only after an isolation said so.** `anima-cuda-test` read **2.0968e-3** against a 1e-3 bound,
+because `.w4a8` fell into the *dense* arm of the tolerance switch. W4A8 decodes to int8 and
+then runs int8's prep and GEMM, so it must land where int8 lands — and the same model
+quantized int8 measures **2.0721e-3**, a 1.2% gap, with both attention arms agreeing to three
+digits and depth-1 (dense block 0) bit-identical across the two files. Vulkan independently
+reads **2.1004e-3**. **Widening a bound to make a test pass is only legitimate when the
+predicted value is known first**; here it was, and the receipt is a sibling checkpoint rather
+than an argument.
+
+**Pinned by two new tests, one of each tier.** ⚠️ The ungated one is the important one — a
+synthetic store fed through `anima.Loader.mat`, asserting the weight loads as `.w4a8` and not
+`.i4`, that the packed bytes and `s_rel` stay VIEWS (the whole point of the format), and that
+the decode produces the right int8 for a deliberately non-uniform codebook whose level 1 is
+`-3.5`, so it pins ties-to-even too. **Verified to have teeth: with the loader call removed it
+fails with the user's exact `MissingTensor`.** The gated one adds the real W4A8 checkpoint to
+the Vulkan forward-parity test, and was likewise confirmed to run rather than self-skip.
+
+### `opI4Prep` wrote NOTHING for a 1024-wide reduction
+
+Fixed 2026-08-08, reported as "it renders just fine in comfyui, something must be wrong with
+the tp code" against a ComfyUI render of the same seed. It was, and the first diagnosis in
+this file was wrong — see the postmortem at the end of this section.
+
+**The bug is one integer division.** `kernels.buildPrep` sized the packing loop as
+
+```zig
+const word_iters = cols / (per_word * 256);   // per_word = 32/bits: 4 for s8, 8 for s4
+```
+
+At `bits == 4` a 1024-wide row is **128 packed words for 256 threads**, so `word_iters` is
+**0**, the store loop is emitted zero times, `p_q` is never written, and `opI4Gemm` multiplies
+the weight against whatever the shared int8/int4 activation scratch held from the previous
+call. No error, no assert, nothing non-finite.
+
+⚠️ **Only one linear in the repo is that narrow: Anima's cross-attention k/v (`context_dim`
+= 1024).** Every krea2 width (6144, 16384) and every other Anima width (2048, 8192) divides
+evenly, and int8 (`per_word` = 4) is safe at 1024 too — which is why this survived: it is
+reachable by exactly one dtype at exactly one width, on one architecture. It became reachable
+at all only when cross k/v **moved from the host to the device** (the per-image stall fix
+below), so the code that broke it is not the code that contains it.
+
+The fix is `word_iters = ceil(total_words / 256)` plus a per-thread `word < total_words`
+guard, emitted **only** when `total_words % 256 != 0` — i.e. only for this one case. Every
+previously-working width keeps the same iteration count and the same instructions.
+`nbf == 0` (cols < 1024, where the FWHT itself would be skipped) is now `error.UnsupportedWidth`
+rather than a silently non-rotating kernel; no live linear is that narrow.
+
+| | before | after |
+|---|---|---|
+| int4 `cuda` vs its own CPU forward, 256² render | 5.95 dB | **24.46 dB** |
+| int4 `zig-cuda`, same | 5.05 dB | **23.20 dB** |
+| int4 `vulkan` (never took the broken path) | 30.03 dB | 30.03 dB (unchanged) |
+| TP int4 vs **ComfyUI's own int4**, its 1056x1584/30-step workflow | 4.48 dB | **14.63 dB** |
+| krea2 int4 render | — | **byte-identical** (A/B'd across the change) |
+
+⚠️ **Vulkan was the control that localized it, and it is a control by accident.**
+`anima_gpu.Lins` widens int4 to int8 because there is no `sint4` coopmat, so it runs
+`opI8Prep` and never touches the broken path — CPU and Vulkan clean, both CUDA arms static.
+That immediately ruled out the weight decode, the nibble order, `weight_scale` and the convrot
+basis (Vulkan exercises all four), leaving only the int4 **activation** path. Worth
+remembering: a backend that implements a format *differently* is a free bisector.
+
+### ⚠️ The postmortem: why the first diagnosis said "found, not caused"
+
+This file previously claimed int4's breakage was "depth accumulation of W4A4 specific to this
+quantization", explicitly not a TP defect. That was wrong, and every step of the reasoning is
+worth keeping because each looked sound:
+
+1. **The depth-2 parity check passed at 3.86e-2 — int4's own documented coarseness figure.**
+   The harness only ran depths 1 and 2, justified in a comment reading "depth adds no new
+   WIRING". True of the wiring; false of the *defect*, which corrupts only cross-attention
+   and so needs depth to show. ⚠️ **A single depth cannot distinguish "coarse" from
+   "accumulating"**, and that distinction was the entire question. `anima-cuda-test` now
+   sweeps `{1, 2, 8, 28}` with a depth-scaled bound; healthy int8/W4A8/int4 are flat from 2
+   to 8 (2.1e-3, 2.1e-3, 3.9e-2) where the broken kernel climbed to 1.97e-1 at depth 8 and
+   5.2e-1 at 12. Verified to have teeth by reintroducing the bug: 4 failures.
+2. **The CPU-vs-GPU comparison that "exonerated" the kernel was CONFOUNDED** — CPU at 256²
+   against CUDA at 512x768, two variables at once. Re-run at one resolution it says the
+   opposite immediately.
+3. **The reference was never consulted.** ComfyUI renders this checkpoint's int4 badly too
+   (9.47 dB / SSIM 0.252 against its own bf16), and that superficial agreement is what made
+   "the checkpoint is just bad" feel confirmed. But ComfyUI's is degraded-**with-structure**
+   and TP's was structureless static — a qualitative difference visible in two seconds of
+   looking, which no aggregate I computed would have surfaced. **"Both are bad" is not
+   "both are equally bad."**
+
+**Generalizable:** a negative conclusion needs an isolation that removes exactly the component
+in question, and "the device matches the CPU at depth 2" does not isolate a defect that only
+manifests at depth 28. When a user says the reference does it better, render the reference's
+exact workflow and *look at both images* before reasoning about the numbers.
+
+⚠️ **The fix also moved the headline quality figure, and by more than the bug's "one
+narrow linear" framing suggests.** At 512x768 / 20 steps / cfg 4 against this model's own
+bf16, int4 went **2.32 dB / SSIM 0.191 -> 20.45 dB / SSIM 0.837** — i.e. from unusable to
+essentially level with W4A8's 20.86 / 0.856 at a further 149 MB saved. Two GEMMs per block
+out of sixteen were corrupt, and that was the whole difference between "this format is
+broken" and "this format is competitive". ⚠️ **Worth remembering when triaging a quantization
+arm: a small number of wrong linears does not produce proportionally small damage**, because
+the corruption re-enters the residual stream every block and then gets amplified 30 times by
+the sampler.
+
+int4 is still the coarsest arm and still degrades this checkpoint more than int8 does
+(32.31 dB), but it is no longer in a different category — and ComfyUI's own int4 of the same
+file is *worse* than TP's is now.
 
 ### "Anima images are slow to start": three candidates, and it was the third
 
@@ -2476,6 +3052,150 @@ which emits three fixture files — one per module it validates:
   same-padding shape they share. ⚠️ The banding cap is **not** bit-neutral — a band is one
   GEMM and the CPU GEMM's reduction order depends on its row count, so the cap is a fixed
   constant (`conv.default_band_bytes`) rather than a tuning knob.
+
+## Tool calling: the model's own trained format, both directions
+
+Landed 2026-08-07. Before it, **no model in TP could be given tools at all**: the jinja
+engine could render the trained format correctly (that was fixed while landing Bonsai-27B —
+`tojson`'s separators and the missing `items` filter), but nothing could feed it.
+`chat_template.zig` had no `tools` global, no `Message.tool_calls`, and `Role` had no
+`.tool`.
+
+Four pieces, plus the read half:
+
+| | |
+|---|---|
+| `RenderOpts.tools: ?[]const Tool` | → the template's `tools` variable |
+| `Message.tool_calls` / `.tool_call_id` / `Role.tool` | an assistant call turn and its answer, replayable |
+| `llm/tool_call.zig` | parses the calls a model EMITS, back into that typed form |
+| `tp-llm --tools <file.json>` + `/tool <result>` | a real round trip, driven by hand |
+| `chat_template.parseTools` | an OpenAI-style declaration (bare or `{"type":"function",…}`-wrapped) |
+
+**Verified end to end** on Bonsai-27B (`--backend cuda`, `--tools` with one `get_weather`):
+the declaration renders into the system prompt, the model emits
+`<tool_call><function=get_weather><parameter=city>Paris</parameter></function></tool_call>`,
+that parses back to `get_weather({"city": "Paris"})`, `/tool 18C and sunny` replays as
+`<|im_start|>user\n<tool_response>\n18C and sunny\n</tool_response>`, and the model answers
+from it.
+
+⚠️ **The wire format is NOT JSON on the models here.** qwen3.5/Bonsai are trained on the
+XML-ish form above (their own template documents it in the system prompt), while plain
+qwen3 and most llama finetunes emit the Hermes `{"name":…,"arguments":{…}}` body. `parse`
+auto-detects on the first non-space byte, because a session cannot know which it will get.
+
+⚠️ **`arguments` is a DICT, not a string.** The templates iterate it (`arguments | items`)
+to emit one `<parameter=…>` block per key. Handing over OpenAI's wire shape — the arguments
+as a JSON *string* — renders one `<parameter=…>` containing the whole JSON blob. The golden
+test's argument values (bool, null, dict, list, int, string) are exactly the ones where the
+template's own `args_value` spellings disagree, so this cannot pass by accident.
+
+⚠️ **Tool support is a property of the TEMPLATE and is MEASURED, never inferred from the
+architecture** (`supportsTools` / `supportsToolRole` render a probe transcript). The four
+templates in the golden corpus land in three different places: qwen3.5/Bonsai and gemma4
+do both, plain llama echoes a tool turn but declares nothing, and **gemma3 raises**. A name
+list would additionally be wrong for the first finetune that strips its tool branch.
+
+⚠️ **gemma3 raises on an INSERTED TURN OF ANY ROLE**, not just on `tool` — its template
+asserts strict user/assistant alternation. So "just slip the result in as an extra user
+message" is not a safe fallback: it kills every render from that point on, and the failure
+is a dead render rather than a degraded one. Anything that inserts a turn the user did not
+type has to reckon with this; pinned by a test that renders the alternating baseline *and*
+both bad variants.
+
+**The two halves are pinned as INVERSES**, not just individually: a `ToolCall` rendered
+through Bonsai's real template, parsed back by `tool_call.parse`, returns the same name and
+the byte-identical `arguments_json`. A drift there means the model sees a garbled version
+of its own request one turn later — which no shape check would catch.
+- ⚠️ The inverse is genuinely **ambiguous for a string that looks like JSON**: an argument
+  whose value is the text `3` comes back as the number 3. The format carries no types and
+  the template renders the two identically, so no reader can distinguish them; the tool
+  schema is what a consumer has to rely on. Recorded rather than papered over.
+- Value delimiting strips **exactly one newline per side**, the exact inverse of the
+  template's `'\n' + value + '\n'` — a `std.mem.trim` would eat the leading indentation of
+  a multi-line value, which the format explicitly supports.
+
+**`splitThought`/`answerText`/`endsInsideThought` moved out of `gui/toolcall.zig` into
+`llm/tool_call.zig`.** Both scanners need "where does the answer start", and ⚠️ two
+definitions of it is exactly the drift that lets one caller fire a tool the other hides —
+the `primed` bug this file already records once. `chat.Reasoning` now aliases
+`tool_call.Reasoning` so a family's markers pass through with no conversion step.
+
+### The GUI's `<image>` tool: a tool RESULT was built, measured against the product, and removed
+
+⚠️ **Recorded because the code was right and the feature was still wrong, and the next
+person to read TODO #2 will be tempted to rebuild it.** The stated defect is real — the
+`<image>` tag is prompted and fire-and-forget, so nothing returns to the model and it
+cannot tell "generated" from "OOM"; it will say "here's your image!" when there is none.
+A per-call outcome turn (generated + size/seed, FAILED + reason, canceled, still
+generating), inserted after the assistant turn that made the calls, was built and unit
+tested. It was then taken back out.
+
+**Why, and the reasoning generalizes to any tool in a conversational UI:**
+
+- **A tool result earns its keep when the model must act on it to continue.** This one
+  never continues: it emits the tag, the turn ends, and the next event is the *user*
+  looking at the screen. The human is in the loop on every single turn and can see the
+  image, or its failure, directly — they have strictly more information than the model.
+- **It cannot fix the sentence it was meant to fix.** "Here's your image!" is written in
+  the SAME turn as the call, before generation starts. No result can retract it; it only
+  lets the model be correct one turn later, by which point the user already knew.
+- ⚠️ **A result turn is not free on a small local model.** `<tool_response>` for a tool
+  the system prompt never declared invites narrating the report at the user; the
+  no-tool-role fallback (folding it into the assistant's own turn) invites *imitating* the
+  marker, i.e. fabricating outcomes — which is the exact lie being fixed.
+- **Identification was the concrete defect**: results were keyed by an ordinal over the
+  turn's calls, so the model had to count its own `<image>` tags to match one. The natural
+  key is the prompt text the model itself wrote. Worth knowing if this is ever revisited.
+- Minor: a pending→done transition rewrites the middle of the transcript, re-prefilling the
+  tail.
+
+**What was kept, because the audience was wrong rather than the information:**
+`GenImage.gen_error` / `failure()` records *why* a generation failed (same `@intFromError`
+shape as `Diffuser.load_error`); it was previously only `std.log.err`'d, i.e. visible to
+nobody but a terminal. It belongs to the **user**, not the model — which is TODO #3's error
+message and retry button, now unblocked. ⚠️ `fail()` stores the reason **before** the
+status: the UI thread learns of a failure by polling `status`, so the other order lets it
+read a fresh `.failed` beside a stale zero reason.
+
+**The capability that would actually be worth it** is the other half of TODO #2 — handing
+the generated image back **as an image** so a multimodal model can look at what it made.
+Note that the user-driven form already exists: the "discuss this image" button attaches a
+generated image to the next user turn (`attachOrStageRgba`, gated on vision capability).
+So the open question there is only whether it should ever be automatic, not whether the
+plumbing exists.
+
+### A failed image says why, and retries in place
+
+`GenImage.gen_error` (above) is consumed by both image surfaces — the chat transcript and
+the studio gallery — which previously rendered a bare `⚠ failed`.
+
+⚠️ **VRAM exhaustion reaches the UI under FOUR different error names**, so mapping only
+`OutOfMemory` would leave the single most common failure looking like an internal bug: the
+cuBLASLt/cuDNN libraries report an out-of-workspace as their own error, and the hand-PTX
+path surfaces a post-OOM fault as `CudaError`. `diffuser.failureText` collapses that family
+to "out of VRAM" and names the other actionable cases; anything unrecognized falls back to
+the error name, which is at least specific enough to search for. Same set
+`pipeline.recoverableDecodeErr` already had to enumerate — worth checking both if a new
+device error appears.
+
+**"Try again" re-queues the image IN PLACE** (`Diffuser.retry`): the `*GenImage` is
+unchanged, so a chat variant's borrowed pointer turns the same tile back into a progress
+bar instead of a second image appearing below the first. Two deliberate inversions:
+
+- ⚠️ **The model snapshot is REFRESHED to the live config**, inverting `enqueue`'s rule that
+  an image finishes on the config it was created with. That rule protects a queue from a
+  mid-run switch; a retry is a fresh request made *now*, and the whole reason to press it
+  after an OOM is that the user just changed something. Honouring the old snapshot would
+  retry the exact configuration that failed.
+- ⚠️ **The resident pipeline is dropped first** (when nothing is in flight), which is what
+  makes the retry a different attempt rather than a replay: after a VRAM failure the
+  resident session is holding the memory the retry needs. **NOT verified to clear a sticky
+  CUDA fault** — `CUDA_ERROR_ILLEGAL_ADDRESS` poisons its context and whether a session
+  rebuild escapes that has not been measured here; if it does not, the retry reports the
+  same error again, which is at least honest.
+
+A stale `resume_snapshot` is dropped too — resuming a retry from some earlier pause's latent
+would start mid-render into a run that has nothing to do with it.
 
 ## Zig 0.16 conventions (differ from older Zig — do not use pre-0.16 patterns)
 
