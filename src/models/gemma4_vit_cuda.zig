@@ -1,8 +1,8 @@
 //! Gemma 4 "unified" vision embedder on the CUDA backend. The embedder is
-//! shallow (no transformer — see gemma4_vit.zig), so the whole thing runs
+//! shallow (no transformer, see gemma4_vit.zig), so the whole thing runs
 //! device-side as a short op chain: upload the im2col patch matrix, then
-//! LayerNorm → patch-embed GEMM → LayerNorm → +pos-embed → LayerNorm →
-//! weightless RMSNorm → projection GEMM, and download the embeddings. The
+//! LayerNorm -> patch-embed GEMM -> LayerNorm -> +pos-embed -> LayerNorm ->
+//! weightless RMSNorm -> projection GEMM, and download the embeddings. The
 //! smart-resize / normalize / im2col preprocessing and the positional-row
 //! gather stay on the host (cheap) via gemma4_vit's shared helpers.
 //!
@@ -102,7 +102,7 @@ pub fn encode(vit: *const Vit, be: *Backend, io: std.Io, gpa: std.mem.Allocator,
 
 // Gated on a CUDA device + the real gemma4 mmproj: the GPU encode vs the CPU
 // reference on a small gradient image (GPU runs f16-regime GEMMs, so parity is
-// relative — per-token cosine).
+// relative, per-token cosine).
 test "cuda gemma4 vit matches cpu encode" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

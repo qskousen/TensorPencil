@@ -5,7 +5,7 @@
 //! are direct GEMMs; the per-position channel L2 norms (+ their trailing silus)
 //! are the `vae_norm` kernel; residual adds are `opAdd`. The mid-block single
 //! head (dim 384) reuses the DiT's tensor-core attention (`opAttnTC` with
-//! n_heads=1, hd=384) — no VAE-specific attention kernel. Everything is device
+//! n_heads=1, hd=384), no VAE-specific attention kernel. Everything is device
 //! resident from the latent upload to the RGB download.
 //!
 //! Conv/attention weights are f32 and stream through the Backend weight cache,
@@ -24,7 +24,7 @@ const patch_band_bytes: usize = 256 << 20;
 const Bufs = struct {
     x: Buf = .{},
     t: Buf = .{},
-    u: Buf = .{}, // also serves as conv2's output (`v` aliases `u` — see res)
+    u: Buf = .{}, // also serves as conv2's output (`v` aliases `u`, see res)
     patch: Buf = .{},
     // mid-block attention q/k/v/out (reused proj into aq).
     aq: Buf = .{},
@@ -160,7 +160,7 @@ fn conv(be: *Backend, bufs: *Bufs, src: *const Buf, dst: *Buf, h: usize, w: usiz
 /// Residual block over bufs.x in place (result swapped back into bufs.x).
 /// `u` is reused for both conv outputs: conv1's result is consumed by norm2
 /// before conv2 overwrites it, so conv2 (the old `v`) can share the same buffer
-/// — one fewer full-resolution buffer (~720 MiB at 1 MP).
+/// one fewer full-resolution buffer (~720 MiB at 1 MP).
 fn res(be: *Backend, bufs: *Bufs, h: usize, w: usize, rb: wan_vae.ResBlock) !void {
     const n = h * w;
     try norm(be, &bufs.x, &bufs.t, n, rb.norm1, true);
@@ -176,8 +176,8 @@ fn res(be: *Backend, bufs: *Bufs, h: usize, w: usize, rb: wan_vae.ResBlock) !voi
     std.mem.swap(Buf, &bufs.x, &bufs.u);
 }
 
-/// Mid-block single-head (dim c) self-attention: qkv GEMMs → tensor-core
-/// attention (n_heads=1, hd=c) → proj GEMM → residual add.
+/// Mid-block single-head (dim c) self-attention: qkv GEMMs -> tensor-core
+/// attention (n_heads=1, hd=c) -> proj GEMM -> residual add.
 fn attn(be: *Backend, bufs: *Bufs, h: usize, w: usize, ab: wan_vae.AttnBlock) !void {
     const n = h * w;
     const c = ab.qkv.ci;

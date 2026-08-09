@@ -1,13 +1,13 @@
 //! Per-turn measurement shown in a chat message's footer, and its formatting.
 //!
 //! Split out of `chat.zig` (which pulls in the whole engine) so the arithmetic
-//! and the strings are pure std and unit-testable — the same reason
+//! and the strings are pure std and unit-testable, the same reason
 //! `viewmath.zig` and `toolcall.zig` are separate: the numbers here are easy to
 //! get subtly wrong (a rate over the wrong token count, a context readout that
 //! shows more tokens than its cap) and impossible to eyeball from a screenshot.
 //!
-//! Who fills the fields, and when, is `chat.Session`'s business — see
-//! `TurnStats` there — but the split matters for reading the footers:
+//! Who fills the fields, and when, is `chat.Session`'s business, see
+//! `TurnStats` there, but the split matters for reading the footers:
 //! prefill/prompt numbers are a property of the USER's turn, generation numbers
 //! of the assistant VARIANT that answered it.
 
@@ -17,14 +17,14 @@ pub const TurnStats = struct {
     /// Prompt tokens this USER turn contributed to the context: its text, the
     /// chat template's wrapper around it, and any image pad rows.
     prompt_tokens: usize = 0,
-    /// Tokens the model actually PREFILLED for this turn — deliberately not the
+    /// Tokens the model actually PREFILLED for this turn, deliberately not the
     /// same number. A render that strips the previous reply's thought re-prefills
     /// that reply too (so this is larger), and a regenerate that rolls back to a
     /// checkpoint prefills nothing at all (so it is zero).
     prefill_tokens: usize = 0,
     prefill_ns: u64 = 0,
     /// Tokens generated into this (assistant) variant. `decode_tokens` is the
-    /// decode-loop forward count the rate is over — one fewer than `gen_tokens`,
+    /// decode-loop forward count the rate is over, one fewer than `gen_tokens`,
     /// since the last prefill chunk's logits produce the first token.
     gen_tokens: usize = 0,
     decode_tokens: usize = 0,
@@ -62,7 +62,7 @@ pub const TurnStats = struct {
 /// Buffer big enough for either footer at any plausible token count.
 pub const buf_len = 192;
 
-/// `12,345` — grouped, because these run to six digits (a 131,072-token cap
+/// `12,345`, grouped, because these run to six digits (a 131,072-token cap
 /// against a 5,310-token context is unreadable ungrouped).
 pub fn grouped(buf: []u8, n: usize) []const u8 {
     var digits: [24]u8 = undefined;
@@ -85,10 +85,10 @@ pub fn grouped(buf: []u8, n: usize) []const u8 {
 /// The user message's footer: what this turn cost the prompt, and what the
 /// model actually chewed through for it.
 ///
-///     `2,341 tok · 3,102 prefilled @ 1,068 tok/s`
+///     `2,341 tok * 3,102 prefilled @ 1,068 tok/s`
 ///
 /// The two counts differ on purpose (see `TurnStats.prefill_tokens`), so the
-/// prefilled figure is only shown when there was one — a regenerate rolls back
+/// prefilled figure is only shown when there was one, a regenerate rolls back
 /// to a cached boundary and prefills nothing.
 pub fn formatUser(buf: []u8, s: TurnStats) []const u8 {
     var w = std.Io.Writer.fixed(buf);
@@ -109,7 +109,7 @@ pub fn formatUser(buf: []u8, s: TurnStats) []const u8 {
 /// The assistant message's footer: the turn's two rates, this reply's size, and
 /// where the context now stands against both caps.
 ///
-///     `prefill 1,068 tok/s · 24.3 tok/s · 512 tok · ctx 5,310 / 8,192 of 131,072`
+///     `prefill 1,068 tok/s * 24.3 tok/s * 512 tok * ctx 5,310 / 8,192 of 131,072`
 ///
 /// The two caps are separate numbers on purpose: `ctx_cap` is the KV capacity
 /// COMMITTED right now (it starts at 4096 and grows in steps), `ctx_max` the
@@ -172,7 +172,7 @@ test "rates are over the right counts" {
 }
 
 test "a single generated token has no rate yet" {
-    // The first token comes from the prefill's logits — zero decode forwards,
+    // The first token comes from the prefill's logits, zero decode forwards,
     // so a rate would be a division by an interval nothing happened in.
     const s: TurnStats = .{ .gen_tokens = 1, .decode_tokens = 0, .decode_ns = 3 * std.time.ns_per_ms };
     try std.testing.expect(s.tgRate() == null);
@@ -182,7 +182,7 @@ test "a single generated token has no rate yet" {
 
 test "footers omit what was not measured" {
     var b: [buf_len]u8 = undefined;
-    // A regenerate: prompt cached, nothing prefilled — no prefill segment, and
+    // A regenerate: prompt cached, nothing prefilled, no prefill segment, and
     // the user message keeps only its own size.
     const regen: TurnStats = .{
         .gen_tokens = 240,

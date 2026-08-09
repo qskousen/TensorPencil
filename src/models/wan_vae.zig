@@ -29,9 +29,9 @@ pub const spatial_scale = 8;
 pub const latents_mean = [latent_channels]f32{ -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508, 0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921 };
 pub const latents_std = [latent_channels]f32{ 2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743, 3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160 };
 
-/// Linear latent→RGB approximation (WAN 2.1 factors, from ComfyUI's
+/// Linear latent->RGB approximation (WAN 2.1 factors, from ComfyUI's
 /// latent_formats.Wan21). Maps the 16-channel sampler latent to a rough RGB
-/// preview with a per-pixel 16×3 matmul — no VAE needed, cheap enough to run
+/// preview with a per-pixel 16×3 matmul, no VAE needed, cheap enough to run
 /// every sampling step for a live preview.
 pub const latent_rgb_factors = [latent_channels][3]f32{
     .{ -0.1299, -0.1692, 0.2932 },
@@ -113,7 +113,7 @@ pub const Decoder = struct {
     head_norm: []const f32,
     head_conv: Conv2d, // 96 -> 3
 
-    /// `store` may be a `weights.Prefixed` view of a bundled checkpoint — this loader
+    /// `store` may be a `weights.Prefixed` view of a bundled checkpoint, this loader
     /// always sees the VAE at the root. See `weights.Prefixed`.
     pub fn load(gpa: std.mem.Allocator, store: weights_mod.WeightStore) !Decoder {
         var arena = std.heap.ArenaAllocator.init(gpa);
@@ -148,7 +148,7 @@ pub const Decoder = struct {
         std.debug.assert(idx == 15);
 
         // All arena allocations must happen before `arena` is copied into the
-        // result — chunks allocated afterwards would be missed by deinit.
+        // result, chunks allocated afterwards would be missed by deinit.
         const post_quant = try loadConv(alloc, store, "conv2", 16, 16, 1);
         const conv_in = try loadConv(alloc, store, "decoder.conv1", 16, 384, 3);
         const mid_res1 = try loadRes(alloc, store, "decoder.middle", 0, 384, 384);
@@ -182,10 +182,10 @@ pub const Decoder = struct {
     /// Rough upper bound on the PEAK device VRAM (bytes) a whole-image GPU decode
     /// of a [16][zh][zw] latent needs for its ACTIVATIONS: the three grow-and-keep
     /// ping-pong buffers (x/t/u in vae_cuda / vae_gpu, each sized to the largest
-    /// activation `max(h·w·ch)`) plus the capped im2col patch band. Mirrors
+    /// activation `max(h*w*ch)`) plus the capped im2col patch band. Mirrors
     /// decode()'s resolution/channel walk (res keeps resolution; up doubles h,w).
-    /// Deliberately approximate — it can't see the opaque cuBLASLt/cuDNN conv
-    /// workspace — so callers pre-free with a margin and keep a reactive fallback.
+    /// Deliberately approximate, it can't see the opaque cuBLASLt/cuDNN conv
+    /// workspace, so callers pre-free with a margin and keep a reactive fallback.
     /// (For a tiled decode, call with the tile side to bound a single tile.)
     pub fn estimatePeakBytes(self: *const Decoder, zh: usize, zw: usize) u64 {
         var h = zh;
@@ -219,7 +219,7 @@ pub const Decoder = struct {
         ops.cancel.token = cancel;
         defer ops.cancel.token = prev_tok;
         // Poll cancel between layers (the free-on-error is handled by each
-        // apply* freeing its input) so a stop lands mid-decode — a whole-image
+        // apply* freeing its input) so a stop lands mid-decode, a whole-image
         // CPU decode can take minutes.
         const canceled = struct {
             fn f(c: ?*std.atomic.Value(bool)) bool {
@@ -483,7 +483,7 @@ pub fn loadConv(alloc: std.mem.Allocator, st: weights_mod.WeightStore, prefix: [
         }
     }
 
-    // Bias may be absent (bias=False convs, e.g. TAEHV's TGrow/stage convs) —
+    // Bias may be absent (bias=False convs, e.g. TAEHV's TGrow/stage convs),
     // synthesize zeros then.
     const bias = if (st.get(bname)) |bv| blk: {
         if (bv.info.elemCount() != co) return error.ShapeMismatch;
@@ -559,7 +559,7 @@ test "decode matches comfyui reference" {
     }
     const mean_err = sum_err / @as(f64, @floatFromInt(out.len));
     // Diagnostic only on failure: stderr from a passing test makes the build
-    // runner print a spurious red "failed command:" line (see ZIG.md).
+    // runner print a spurious red "failed command:" line.
     errdefer std.debug.print("vae parity: max_err={d:.6} mean_err={d:.6}\n", .{ max_err, mean_err });
     try std.testing.expect(max_err < 5e-3);
     try std.testing.expect(mean_err < 5e-4);
@@ -582,7 +582,7 @@ fn stageErr(gpa: std.mem.Allocator, io: std.Io, name: []const u8, rows: []const 
 }
 
 /// Asserts one stage of the parity walk, printing the stage error only when it
-/// exceeds tolerance (a passing test must be silent on stderr, see ZIG.md).
+/// exceeds tolerance (a passing test must be silent on stderr).
 fn checkStage(gpa: std.mem.Allocator, io: std.Io, name: []const u8, rows: []const f32, c: usize, n: usize) !void {
     const err = try stageErr(gpa, io, name, rows, c, n);
     errdefer std.debug.print("{s} err {d:.7}\n", .{ name, err });

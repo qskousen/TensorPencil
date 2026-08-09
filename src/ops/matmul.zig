@@ -24,7 +24,7 @@ const DType = dtypes.DType;
 /// GPU GEMM dispatch, injected by the pipeline. Dependency injection keeps this
 /// CPU-ops layer from importing the GPU backend: the pipeline sets `gpu_dispatch`
 /// (pipeline --gpu) and large f8/f32 GEMMs are routed to the device via
-/// `call(ctx, ...)`. Single-threaded use only — the pipeline runs matmuls
+/// `call(ctx, ...)`. Single-threaded use only, the pipeline runs matmuls
 /// sequentially.
 pub const GpuDispatch = struct {
     /// Opaque device backend (e.g. a `*gpu.Context`); passed back to `call`.
@@ -55,7 +55,7 @@ pub var gpu_dispatch: ?GpuDispatch = null;
 /// calibration), time or count GEMMs per layer (profiling), or dump intermediates
 /// (debugging) without any of that living in the kernels.
 ///
-/// `x` is `[m, w.cols]` row-major and is only valid for the duration of the call —
+/// `x` is `[m, w.cols]` row-major and is only valid for the duration of the call,
 /// copy anything you keep. The hook must not mutate it.
 pub const Probe = struct {
     ctx: *anyopaque,
@@ -69,7 +69,7 @@ pub const Probe = struct {
 ///
 /// Note this sees only GEMMs that go THROUGH this function: the CPU path, plus
 /// whatever the GPU dispatch above forwards. Backends with their own GEMM bypass it
-/// and carry their own probe points — **both DiT backends now do**:
+/// and carry their own probe points, both DiT backends now do:
 ///
 /// - `dit_cuda`: `lin` (all 224 block linears), `txtGemm` (the txtfusion tower and
 ///   both txtmlp linears), and the two patch-embed GEMMs.
@@ -79,7 +79,7 @@ pub const Probe = struct {
 ///
 /// Each stages the activation to host memory and calls this same hook, so the
 /// statistics come out of one implementation whichever backend ran the model.
-/// **int8/int4 checkpoints are skipped on both**: their activation is rotated and
+/// int8/int4 checkpoints are skipped on both: their activation is rotated and
 /// quantized in place before the GEMM, so there is no f32 activation left to
 /// observe.
 pub var probe: ?Probe = null;
@@ -90,7 +90,7 @@ pub var probe: ?Probe = null;
 /// just speed (see `small_m_max`). At large `m` the weights are dequantized into
 /// a packed panel and multiplied in f32, so only the weights are quantized. At
 /// small `m` the work is memory-bound instead of compute-bound, and ggml's
-/// `vec_dot` GEMV wins by a wide margin — but it reaches that speed by also
+/// `vec_dot` GEMV wins by a wide margin, but it reaches that speed by also
 /// quantizing the activations to the weight type's `vec_dot_type` (Q8_K for
 /// k-quants), which introduces activation quantization error the packed path
 /// does not have.
@@ -132,7 +132,7 @@ const KC = 512; // k-block: one packed subpanel slice is KC*NR*4 = 128 KiB max
 /// Public because it changes the *semantics* of a block-quant GEMM, not just its
 /// speed: at or above this, block-quant weights are dequantized and multiplied in
 /// f32, so only the weights are quantized. Below it, they take ggml's int8
-/// `vec_dot` GEMV, which quantizes the **activations** too — a W8A8-shaped
+/// `vec_dot` GEMV, which quantizes the activations too, a W8A8-shaped
 /// computation. A caller measuring weight-format loss in isolation has to know
 /// which side of this line it is on, so it has to be able to read the line.
 pub const small_m_max = 16;
@@ -151,13 +151,13 @@ pub const Weight = struct {
     /// ComfyUI `asym_w4a8_int8` sidecars, set iff `dtype == .w4a8`. `bytes` is then
     /// the packed `[rows][cols/2]` nibble storage and `row_scale` is `s_channel`;
     /// decoding a nibble needs the per-group scale and level table in here. Kept
-    /// packed on purpose — materializing the int8 doubles the footprint, which is
+    /// packed on purpose, materializing the int8 doubles the footprint, which is
     /// the entire difference between this format and int8. See `ops/w4a8.zig`.
     w4a8: ?*const w4a8_mod.Meta = null,
     /// ComfyUI NVFP4 sidecars, set iff `dtype == .nvfp4`. `bytes` is then the packed
-    /// `[rows][cols/2]` E2M1 storage. ⚠️ Unlike every other 4-bit format here this one has
-    /// NO per-output-row scale and NO ConvRot rotation — `row_scale` stays null and
-    /// `convrot` 0 — because its scale is per 16-element block plus one per tensor. See
+    /// `[rows][cols/2]` E2M1 storage. Unlike every other 4-bit format here this one has
+    /// NO per-output-row scale and NO ConvRot rotation, `row_scale` stays null and
+    /// `convrot` 0, because its scale is per 16-element block plus one per tensor. See
     /// `ops/nvfp4.zig`.
     nvfp4: ?*const nvfp4_mod.Meta = null,
     /// ConvRot group size (0 = none). When non-zero, `.i8`/`.i4`/`.w4a8` weights are
@@ -166,7 +166,7 @@ pub const Weight = struct {
     /// two values per byte so `cols` is also even. See ops/convrot.zig.
     convrot: u32 = 0,
     /// Checkpoint tensor name, when the loader knows it (e.g.
-    /// "blocks.12.attn.wq.weight"). Purely informational to the kernels — it is
+    /// "blocks.12.attn.wq.weight"). Purely informational to the kernels, it is
     /// what lets a caller attribute a GEMM to a layer: the `probe` hook below,
     /// profiling breakdowns, and error messages. Owned by whoever built the
     /// Weight (model loaders allocate it in the model arena).
@@ -185,14 +185,14 @@ pub const Weight = struct {
 
 pub const Error = error{ UnsupportedDType, QuantBackendUnavailable, OutOfMemory } || std.Io.Cancelable;
 
-/// Whether `matmul` can take a weight of this dtype at all — the same set its own
+/// Whether `matmul` can take a weight of this dtype at all, the same set its own
 /// validation switch accepts, exposed so a *loader* can decide up front instead of
 /// discovering it mid-forward.
 ///
 /// A model loader that meets an unsupported dtype has one correct move: materialize
 /// the weight to f32 once, at load. Checkpoints in the wild do carry surprises (an
-/// SD1.5 merge with **f64** CLIP linears is the case that prompted this), and the
-/// alternative — a `UnsupportedDType` from inside the first forward — reports the
+/// SD1.5 merge with f64 CLIP linears is the case that prompted this), and the
+/// alternative, a `UnsupportedDType` from inside the first forward, reports the
 /// problem at the point furthest from its cause.
 pub fn supportsDType(dt: DType) bool {
     return switch (dt) {
@@ -207,15 +207,15 @@ pub fn supportsDType(dt: DType) bool {
 /// Materialize a weight to f32 once, into `alloc`, folding any per-tensor scale.
 ///
 /// The GPU backends' fused `opMatmul` (the one with bias + destination-offset
-/// support, used for a model's small in/out projections) has an **f32 pipeline
-/// only** — handed bf16 bytes it reinterprets them as f32 and the render is pure
+/// support, used for a model's small in/out projections) has an f32 pipeline
+/// only, handed bf16 bytes it reinterprets them as f32 and the render is pure
 /// noise, and handed fp8 it trips an assert. So a loader normalizes those few
 /// projections here rather than discovering the problem inside the first forward.
 ///
 /// - `f32` passes through untouched, so the device is fed the original mmap.
 /// - `f8_e4m3` / `bf16` / `f16` are converted (fp8 too: the CUDA fused kernel has
 ///   no fp8 variant).
-/// - Anything else — int8/int4 convrot, ggml block quants — refuses loudly.
+/// - Anything else, int8/int4 convrot, ggml block quants, refuses loudly.
 ///   Dequantizing those needs metadata this function does not have (a per-row
 ///   scale and group rotation, or a ggml block layout), so converting them here
 ///   would emit silent garbage rather than an error.
@@ -272,7 +272,7 @@ pub fn matmul(
     if (w.dtype == .i8 or w.dtype == .i4 or w.dtype == .w4a8)
         std.debug.assert(w.row_scale != null and w.row_scale.?.len == w.rows);
     // A `.w4a8` weight without its sidecars cannot be decoded at all, and the nibbles
-    // would otherwise be read as signed int4 — plausible values, wrong weight.
+    // would otherwise be read as signed int4, plausible values, wrong weight.
     if (w.dtype == .w4a8) std.debug.assert(w.w4a8 != null);
     // NVFP4 carries no row scale and no rotation; its block scales and level table are
     // the only way to read the nibbles at all.
@@ -309,11 +309,11 @@ pub fn matmul(
     if (m >= small_m_max or (exact_activations and w.dtype.isBlockQuant()))
         return matmulPacked(io, gpa, y, x, m, w, bias, tok);
 
-    // Decode (small m) block-quant GEMV → ggml's AVX2 quant vec_dot, which is
+    // Decode (small m) block-quant GEMV -> ggml's AVX2 quant vec_dot, which is
     // memory-bound (~30x faster than our Zig dequant/int8 kernels). Non-block-
     // quant small-m falls through to the threaded runRange path below.
     //
-    // ⚠️ Gated on `quants.usesGgml`, not `isBlockQuant`: q2_0_g128 has no ggml
+    // Gated on `quants.usesGgml`, not `isBlockQuant`: q2_0_g128 has no ggml
     // type (its blocks are 128 elements where ggml's type 42 is 64), so it takes
     // the native fused GEMV instead of a call into ggml with the wrong stride.
     if (w.dtype.isBlockQuant() and quants.usesGgml(w.dtype)) {
@@ -397,7 +397,7 @@ fn matmulPacked(
     if (cancel.canceled(tok)) return error.Canceled;
 }
 
-// Small-m GEMV for block-quant dtypes ggml cannot serve — today only q2_0_g128,
+// Small-m GEMV for block-quant dtypes ggml cannot serve, today only q2_0_g128,
 // whose 128-element blocks ggml's 64-element type 42 cannot address (see
 // quants.dequantQ2_0G128). Same shape as `ggml_gemv` below (thread over row
 // chunks, weight row read once) minus the activation quantization: the fused dot
@@ -427,15 +427,15 @@ const native_gemv = struct {
         }
     }
 
-    /// y[m*rows] = W[rows*cols] (q2_0_g128) · x[m*cols] + bias.
+    /// y[m*rows] = W[rows*cols] (q2_0_g128) * x[m*cols] + bias.
     ///
     /// Threaded over row chunks for the reason `quantGemv` documents: one core
     /// cannot pull the model's weight bandwidth, so rows are split across cores.
     ///
-    /// ⚠️ At m > 1 the weight row is re-read per token, so weight traffic scales
+    /// At m > 1 the weight row is re-read per token, so weight traffic scales
     /// with m. That is exactly what `ggml_gemv` does for every other quant (its
     /// `vec_dot` is likewise called per token), so this is parity rather than a
-    /// new deficiency — and `small_m_max` hands anything from 16 tokens up to the
+    /// new deficiency, and `small_m_max` hands anything from 16 tokens up to the
     /// packed path, which amortizes the weight over the whole batch.
     pub fn q2Gemv(io: std.Io, y: []f32, x: []const f32, m: usize, w_bytes: []const u8, rows: usize, cols: usize, bias: ?[]const f32) Error!void {
         const row_bytes = DType.q2_0_g128.storageBytes(cols);
@@ -496,9 +496,9 @@ const ggml_gemv = if (have_ggml) struct {
     }
 
     /// Decode-path (small m) block-quant GEMV via ggml's AVX2 vec_dot:
-    /// y[m*rows] = W[rows*cols] (`dt`) · x[m*cols] + bias. Quantizes each activation
+    /// y[m*rows] = W[rows*cols] (`dt`) * x[m*cols] + bias. Quantizes each activation
     /// column once to ggml's vec_dot_type (Q8_K for k-quants), then dots every weight
-    /// row — threaded over row chunks: a single ggml vec_dot saturates one core, but
+    /// row, threaded over row chunks: a single ggml vec_dot saturates one core, but
     /// the full model's weights exceed single-core memory bandwidth, so splitting
     /// rows across cores pulls more aggregate DRAM bandwidth.
     pub fn quantGemv(io: std.Io, dt: DType, y: []f32, x: []const f32, m: usize, w_bytes: []const u8, rows: usize, cols: usize, bias: ?[]const f32) Error!void {
@@ -566,7 +566,7 @@ fn packedTask(
 /// Packed outer-product path for ggml block-quantized weights. Mirrors
 /// `packedTaskI4` (dequant a k-slice of each row into a temp, scatter
 /// k-major) with quants.zig doing the block decode. KC is a multiple of every
-/// block size we carry (32, 64, 128, 256), so k-slices stay block-aligned — which
+/// block size we carry (32, 64, 128, 256), so k-slices stay block-aligned, which
 /// `dequantSlice` asserts on, and which the comptime check below pins per dtype
 /// rather than against a single hardcoded super-block size.
 fn packedTaskBlock(
@@ -655,7 +655,7 @@ fn packedTaskTyped(
     while (kc0 < cols) : (kc0 += KC) {
         if (cancel.canceled(tok)) return; // matmul() reports error.Canceled
         // Note the explicit type: @min with a comptime bound would narrow to
-        // u10 and make `kl * NR` overflow (see ZIG.md).
+        // u10 and make `kl * NR` overflow.
         const kl: usize = @min(KC, cols - kc0);
 
         // Pack + dequantize this k-slice of the row chunk, k-major per subpanel.
@@ -729,7 +729,7 @@ inline fn dequantI4Slice(bytes: []const u8, elem0: usize, n: usize, scale: f32, 
 /// W4A8 weight: `levels[s_rel[row][group]][nibble] * s_channel[row]`.
 ///
 /// The level table already folds the reference's f32 multiply-round-clamp, so this is
-/// two byte lookups and a multiply per element — no floating point until the last
+/// two byte lookups and a multiply per element, no floating point until the last
 /// step, and bit-identical to the int8 weight ComfyUI would have materialized.
 inline fn dequantW4A8Slice(w: Weight, row: usize, col0: usize, n: usize, dst: []f32) void {
     std.debug.assert(col0 % 2 == 0);
@@ -1154,7 +1154,7 @@ test "probe observes each GEMM's input, attributed by weight tag" {
     defer probe = null; // a leaked probe would silently observe every later test
 
     try matmul(io, gpa, &y, &x, 2, w, null);
-    // An untagged weight still fires — the consumer decides what to do with null.
+    // An untagged weight still fires, the consumer decides what to do with null.
     const untagged = Weight.fromF32(&wdata, 2, 3);
     try matmul(io, gpa, &y, &x, 2, untagged, null);
     // A zero-row GEMM does no work, so there is nothing to observe.
@@ -1304,8 +1304,8 @@ test "matmul i8 convrot packed path" {
 }
 
 /// int4 ConvRot: two signed 4-bit weights packed per byte + per-row scale,
-/// dequantized with the group rotation. Same shape as the i8 helper — the
-/// naive reference uses the fully un-rotated f32 weights — but weights are
+/// dequantized with the group rotation. Same shape as the i8 helper, the
+/// naive reference uses the fully un-rotated f32 weights, but weights are
 /// int4 [-8,7] packed low-nibble-first.
 fn testI4ConvrotAgainstNaive(m: usize, rows: usize, cols: usize, with_bias: bool) !void {
     std.debug.assert(cols % convrot_mod.group_size == 0);
@@ -1381,7 +1381,7 @@ test "matmul i4 convrot packed path" {
 }
 
 /// ggml block-quantized weights: random block bytes with pinned-finite f16
-/// scales, decoded to f32 by quants.zig for the naive reference — exercises
+/// scales, decoded to f32 by quants.zig for the naive reference, exercises
 /// the block dequant plumbing in both the small-m and packed paths.
 fn testBlockQuantAgainstNaive(m: usize, rows: usize, cols: usize, dt: DType, with_bias: bool) !void {
     if (!have_ggml) return error.SkipZigTest; // block-quant needs the ggml backend
@@ -1451,11 +1451,11 @@ fn testBlockQuantAgainstNaive(m: usize, rows: usize, cols: usize, dt: DType, wit
     naiveMatmul(y_ref, x, m, w_f32, rows, cols, bias);
 
     // Small-m block-quant runs through ggml's vec_dot, which quantizes the
-    // activation to int8 (Q8_K / Q8_0) — approximate by design. Use a robust,
+    // activation to int8 (Q8_K / Q8_0), approximate by design. Use a robust,
     // dtype-agnostic relative-L2 tolerance over the whole output (a per-row
     // metric blows up on near-zero dots; a per-256-block bound breaks for q8_0).
     //
-    // ⚠️ Gated on `usesGgml`, not on `m` alone: a dtype with no ggml vec_dot
+    // Gated on `usesGgml`, not on `m` alone: a dtype with no ggml vec_dot
     // (q2_0_g128) takes the exact packed path at every m, and holding it to the
     // 5% activation-quantization bound would leave it with no teeth.
     if (m < small_m_max and quants_mod.usesGgml(dt)) {
@@ -1513,7 +1513,7 @@ test "matmul q2_0 on both paths, both block sizes" {
     // arithmetic: `cols = KC + blk` gives a partial final slice that is still
     // block-aligned. g128 additionally takes the PACKED path at every m (it has
     // no ggml vec_dot), so its small-m cases exercise a different kernel than
-    // every other block quant's do — which is the point of running both here.
+    // every other block quant's do, which is the point of running both here.
     for ([_]DType{ .q2_0_g64, .q2_0_g128 }) |dt| {
         const blk = dt.blockElems();
         try testBlockQuantAgainstNaive(1, 9, blk, dt, false); // one block/row

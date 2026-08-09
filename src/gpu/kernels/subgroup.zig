@@ -1,13 +1,13 @@
 //! Subgroup-cooperative kernels: reductions done WITHIN a subgroup via
 //! OpGroupNonUniform* ops, which need no workgroup storage class. This is the
 //! verified escape hatch from the NVIDIA hang on Zig-emitted workgroup memory
-//! (see ZIG.md / VULKAN_MEMORY.md): the Zig SPIR-V backend can emit these
+//!: the Zig SPIR-V backend can emit these
 //! subgroup ops through inline asm (same trick as OpSDot), and they RUN on
 //! 580.173.02 where Zig-emitted `var addrspace(.shared)` reductions DEVICE_LOST.
 //!
 //! One subgroup (32 lanes on NVIDIA) cooperates on one row: lanes read the row
 //! coalesced+strided, each accumulates a partial, then a single subgroup reduce
-//! yields the full result in every lane — replacing the *_partial -> *_combine
+//! yields the full result in every lane, replacing the *_partial -> *_combine
 //! kernel pairs that round-tripped partials through global memory.
 //!
 //! Bindings mirror the eltwise module (a,b,c,d + EltPush) so these pipelines
@@ -115,7 +115,7 @@ export fn subgroup_sum() callconv(.spirv_kernel) void {
 // Byte-addressed reads into the RAW row-major GGUF block layout (identical to
 // eltwise.zig's wbyte/wf16/wi8). The cooperative GEMV coalesces by spreading a
 // block's 32 elements across the 32 subgroup lanes, so it reads this raw layout
-// directly — no 32-row-group transpose (`weightBufferRawT`) and no dp4a repack.
+// directly, no 32-row-group transpose (`weightBufferRawT`) and no dp4a repack.
 inline fn wbyte(bo: u32) u32 {
     const word: u32 = @bitCast(a.data[bo / 4]);
     const sh: u5 = @intCast(8 * (bo % 4));
@@ -144,7 +144,7 @@ const kvalues_iq4nl = [16]i8{ -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 2
 // Cooperative block-quant decode GEMV: one subgroup (32 lanes) per output row.
 // Lane `l` owns element `l` within every block, accumulates its per-lane
 // partial dot (block scale folded in), then a single subgroup reduce yields the
-// full row dot — the exact math of the serial gemv_q*_* kernels with the inner
+// full row dot, the exact math of the serial gemv_q*_* kernels with the inner
 // `while (l < 32)` loop parallelized across lanes. Reads are coalesced (a
 // block's 32 elements are contiguous) with no transpose/repack. Bindings /
 // push mirror opGemvQuant: a = W (raw), b = x, d = y; u0 = rows, u1 = cols,
@@ -320,12 +320,12 @@ export fn gemv_iq4_nl_sg() callconv(.spirv_kernel) void {
     if (lane == 0) d.data[pc.u2 + row] = sum * pc.f0;
 }
 
-// attn_decode_sg: flash-decoding attention for ONE decode query, folded — one
+// attn_decode_sg: flash-decoding attention for ONE decode query, folded, one
 // subgroup (32 lanes) per head, lane = one of 32 KV chunks. Each lane runs the
 // online softmax over its chunk (m, dsum, acc[hd]) exactly like
 // attn_dsplit_gemma, then the cross-chunk merge is done IN-SUBGROUP (max-reduce
 // the running maxes, then add-reduce the reweighted dsum and each acc element)
-// and lane 0 writes out[h][hd] directly — no global scratch, no attn_dmerge
+// and lane 0 writes out[h][hd] directly, no global scratch, no attn_dmerge
 // dispatch. f32 KV. Supports GQA + sliding-window + ring + bidirectional block,
 // same push as attn_dsplit_gemma (u4 nsplit is ignored; lanes ARE the 32 split).
 // a = q [heads][hd], b = k_cache, c = v_cache, d = out [heads][hd].
@@ -415,24 +415,22 @@ export fn rmsnorm_sg() callconv(.spirv_kernel) void {
 // ln_mod_sg: one subgroup per row, fused WEIGHTLESS LayerNorm + AdaLN modulation.
 //   y[row][i] = (x[row][i] - mean) * inv * premul[i] + shift[i]
 // with `inv = 1/sqrt(var + eps)` and `premul`/`shift` read out of ONE modulation
-// buffer at two element offsets. This is `anima.modulatedNorm` — the DiT's
+// buffer at two element offsets. This is `anima.modulatedNorm`, the DiT's
 // `(1 + scale)` is folded into `premul` on the host, exactly as `rms_mod_par` on
 // the CUDA side takes a pre-folded scale, so both backends read the same table and
 // the two conventions cannot drift.
 //
-// ⚠️ **Two passes over the row, deviation-based — NOT the shifted
-// `E[x^2] - E[x]^2` form.** `ops.norm.layerNormUnit` is written that way and
+// Two passes over the row, deviation-based, NOT the shifted
+// `E[x^2] - E[x]^2` form. `ops.norm.layerNormUnit` is written that way and
 // `ops.norm.groupNorm` records why: once the mean is large relative to the spread
 // the shifted form has to resolve a catastrophic cancellation in f32. A DiT
 // residual stream is exactly a place where that can happen, and the second pass is
-// nearly free — an 8 KB row is L1-resident by then.
+// nearly free, an 8 KB row is L1-resident by then.
 //
-// ⚠️ **A thread-per-row version of this is a bandwidth trap, which is why this is
-// a subgroup kernel.** At 6534 rows x 2048 wide, one thread per row gives each
-// lane a whole row, so a warp's 32 loads land 8 KB apart and every one is its own
-// sector fetch. The same mistake cost a quarter of a Z-Image step on CUDA
-// (`qk_rmsnorm_warp`'s 37 GB/s on a 936 GB/s card); here it is 3 calls per block
-// across 28 blocks.
+// A subgroup kernel because thread-per-row is a bandwidth trap here: at 6534 rows x
+// 2048 wide, one thread per row gives each lane a whole row, so a warp's 32 loads land
+// 8 KB apart and every one is its own sector fetch. Measured elsewhere at 37 GB/s on a
+// 936 GB/s card, and this runs 3 times per block across 28 blocks.
 //
 // Dispatch LocalSize x = 32, one workgroup per row. a = x, b = out, c = mod.
 // u0 = rows, u1 = dim, u2 = premul elem offset, u3 = shift elem offset, f0 = eps.

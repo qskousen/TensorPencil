@@ -3,16 +3,16 @@
 //! Stored as a JSON document under the platform config dir
 //! (`~/.config/tp-gui/config` on Linux), resolved via the `known-folders`
 //! package. Serialization is derived directly from the `Config` struct by
-//! `std.json` — there is no per-field marshalling to keep in sync; add a field
+//! `std.json`, there is no per-field marshalling to keep in sync; add a field
 //! (with a default) and it round-trips automatically. Every setting has a sane
 //! default, so a missing or partial file reads back cleanly (unknown keys are
-//! ignored, missing keys fall back to the struct default) — the GUI degrades
+//! ignored, missing keys fall back to the struct default), the GUI degrades
 //! gracefully when a model is unset (see `PathBuf.opt`, which reports an empty
 //! path as "not configured").
 //!
 //! Legacy migration: older builds wrote a flat `key = value` text file. `load`
 //! tries JSON first and, if that fails, falls back to the old line parser
-//! (`apply`) and immediately rewrites the file as JSON — so an existing config
+//! (`apply`) and immediately rewrites the file as JSON, so an existing config
 //! upgrades in place on the first launch of a new build.
 //!
 //! Path fields double as dvui text-entry buffers: the fixed `PathBuf.data`
@@ -35,11 +35,11 @@ pub const max_prompt = 8192;
 
 /// The simple built-in system prompt used when the user hasn't set one. The
 /// image-tool instructions (in chat.zig) are appended to this automatically
-/// when a diffusion model is configured — this stays tool-agnostic.
+/// when a diffusion model is configured, this stays tool-agnostic.
 pub const default_system_prompt = "You are a helpful assistant.";
 
 /// Which workload gets VRAM preference when chat and image generation compete
-/// for the card (see GUI_VRAM.md). `chat` keeps the LLM resident and streams
+/// for the card. `chat` keeps the LLM resident and streams
 /// diffusion in the leftover VRAM; `image` evicts LLM layers to the CPU (only as
 /// many as needed) so the image model fits resident, then migrates them back
 /// once the image queue drains.
@@ -107,7 +107,7 @@ pub const TaesdSize = enum(u8) {
 /// mapping it across.
 ///
 /// The two SDE variants are DPM-Solver++(2M) SDE, differing only in how the
-/// multistep correction is applied — ComfyUI ships both under these names and they
+/// multistep correction is applied, ComfyUI ships both under these names and they
 /// give visibly different images. Both draw their noise from a seed-determined
 /// Brownian tree, so a seed reproduces ComfyUI's render rather than merely being
 /// repeatable here. `eta`/`s_noise` are left at ComfyUI's defaults (1.0); the CLI's
@@ -115,7 +115,7 @@ pub const TaesdSize = enum(u8) {
 /// Which prompt dialect the prompt boxes are written in. Load-neutral: it changes how
 /// the next image's prompt is parsed, not what is loaded.
 ///
-/// ⚠️ Switching this changes the image for the SAME prompt text — `(x:1.2)` multiplies
+/// Switching this changes the image for the SAME prompt text, `(x:1.2)` multiplies
 /// under A1111 and replaces under ComfyUI, `[x]` de-emphasizes under one and is literal
 /// text under the other. See `core/prompt_a1111.zig`.
 pub const PromptSyntax = enum(u8) {
@@ -160,12 +160,12 @@ pub const Emphasis = enum(u8) {
     }
 };
 
-/// Whose **sampling** conventions to reproduce — a separate axis from `PromptSyntax`,
+/// Whose sampling conventions to reproduce, a separate axis from `PromptSyntax`,
 /// which is about the prompt text. See `pipeline.Compat`.
 ///
-/// ⚠️ Switching this changes the image for the same seed, and more drastically than any
+/// Switching this changes the image for the same seed, and more drastically than any
 /// other setting here: A1111 draws its noise from NVIDIA's Philox rather than torch's CPU
-/// generator, so the seed does not merely shift the result — it starts somewhere else
+/// generator, so the seed does not merely shift the result, it starts somewhere else
 /// entirely. The two sampling-convention differences that ride along with it (initial
 /// noise scale, fractional vs trained timestep) are worth ~9 dB and ~25 dB.
 pub const Compat = enum(u8) {
@@ -211,7 +211,7 @@ pub const Sampler = enum(u8) {
 /// Where the sampling steps go. Mirrors `schedule.Scheduler` plus a `default` member
 /// the engine enum does not need: the default differs per architecture (`simple` for
 /// krea2, `normal` for the SD family), so "leave it to the model" is a real choice a
-/// user has to be able to express — and it is what every render used before this became
+/// user has to be able to express, and it is what every render used before this became
 /// selectable.
 pub const Scheduler = enum(u8) {
     default,
@@ -251,7 +251,7 @@ pub const Scheduler = enum(u8) {
 /// Compute backend. Mirrors `pipeline.Backend`; kept here so the config data
 /// model stays free of an engine dependency (app.zig maps it across). Diffusion
 /// supports all four; the chat LLM only supports the two CUDA variants today
-/// (non-CUDA selections error at load — see chat.Session.init).
+/// (non-CUDA selections error at load, see chat.Session.init).
 pub const Backend = enum(u8) {
     cpu,
     vulkan,
@@ -271,11 +271,11 @@ pub const Backend = enum(u8) {
 /// blocks) roughly quarters it, each at a small precision cost (output is not
 /// identical to f32). Mirrors `kv_cache.KvDtype` in the library; mapped to it
 /// in `app.buildSession`. Changing it rebuilds the KV context (weights stay
-/// resident) — see `ctxReloadEql`.
+/// resident), see `ctxReloadEql`.
 /// How checkpoint bytes are read. Mirrors `core/safetensors.zig`'s `ReadMode`
 /// (this module is deliberately std-only, so the enum is duplicated rather than
 /// imported); `app` translates it to the global. Takes effect on the next model
-/// load — it governs loading, so nothing resident changes.
+/// load, it governs loading, so nothing resident changes.
 pub const WeightRead = enum(u8) {
     pread,
     mmap,
@@ -302,7 +302,7 @@ pub const KvDtype = enum(u8) {
     }
 };
 
-/// Gemma-4 (gemma4v) vision token budget — Google's `gemma4_vision_token_budget`
+/// Gemma-4 (gemma4v) vision token budget, Google's `gemma4_vision_token_budget`
 /// ladder. The image is resized (aspect-preserving, no crop/pad) so its
 /// post-merge token count targets this many; more tokens = more spatial detail
 /// and more compute. Ignored by non-gemma4v mmprojs.
@@ -333,7 +333,7 @@ pub const VisionBudget = enum(u8) {
 };
 
 /// VAE decode-path override for image generation. `auto` is the adaptive chain
-/// (whole-image → GPU-tiled → CPU-tiled with OOM fallback); the others force the
+/// (whole-image -> GPU-tiled -> CPU-tiled with OOM fallback); the others force the
 /// starting strategy but still degrade gracefully on OOM (see pipeline.zig).
 pub const VaeDecode = enum(u8) {
     auto,
@@ -350,7 +350,7 @@ pub const VaeDecode = enum(u8) {
 };
 
 /// LLM sampling controls, mirroring the library's `llm.sample.Params` field
-/// for field (kept engine-free here — `chat.samplingParams` maps it across).
+/// for field (kept engine-free here, `chat.samplingParams` maps it across).
 /// Applied LIVE: a change (or a loaded preset) takes effect on the next chat
 /// turn, never a reload.
 pub const Sampling = struct {
@@ -396,7 +396,7 @@ pub const SysPrompt = struct {
 
 /// A fixed-capacity list (`items[0..count]`). Kept as a value type (no
 /// allocation) so `Config` stays a plain copyable value, but (de)serializes as
-/// a variable-length JSON array of the live entries — a raw `[cap]T` would
+/// a variable-length JSON array of the live entries, a raw `[cap]T` would
 /// emit/require exactly `cap` elements.
 pub fn FixedList(comptime T: type, comptime cap: usize) type {
     return struct {
@@ -473,7 +473,7 @@ pub fn TextBuf(comptime cap: usize) type {
             @memcpy(self.data[0..n], s[0..n]);
         }
 
-        /// Like `set`, but decodes `\n` / `\\` escapes — used for the multi-line
+        /// Like `set`, but decodes `\n` / `\\` escapes, used for the multi-line
         /// system prompt, which is stored escaped on a single config line.
         pub fn setUnescaped(self: *Self, s: []const u8) void {
             @memset(&self.data, 0);
@@ -510,7 +510,7 @@ pub fn TextBuf(comptime cap: usize) type {
         }
 
         /// Parse from a JSON string, copying (truncated to capacity) into the
-        /// fixed buffer — so the parsed `Config` owns no arena memory and stays
+        /// fixed buffer, so the parsed `Config` owns no arena memory and stays
         /// a plain value type.
         pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !Self {
             const s = try std.json.innerParse([]const u8, allocator, source, options);
@@ -530,7 +530,7 @@ pub const pos_unset: i32 = std.math.minInt(i32);
 pub const Config = struct {
     llm_model: PathBuf = .{},
     vision_tower: PathBuf = .{},
-    /// The PRIMARY diffusion checkpoint — the only path image generation actually
+    /// The PRIMARY diffusion checkpoint, the only path image generation actually
     /// requires. It may be a bundled "checkpoint-style" file carrying the text
     /// encoder and VAE too, or a denoiser-only file (a GGUF UNet, krea2's separate
     /// DiT); `pipeline.resolveComponent` works out which, and `text_encoder` / `vae`
@@ -539,7 +539,7 @@ pub const Config = struct {
     /// MEASURED peak resident VRAM of the diffusion pipeline (bytes), plus the DiT
     /// path it was measured against. Persisted so the FIRST image of a session
     /// sizes the LLM's eviction by what the pipeline actually costs rather than by
-    /// what its checkpoints weigh — the file-size bootstrap is only for a model
+    /// what its checkpoints weigh, the file-size bootstrap is only for a model
     /// that has never run here. Ignored when the key no longer matches.
     diff_peak_resident: u64 = 0,
     /// Hash of the DiT path the figure was measured against, NOT the path itself:
@@ -552,14 +552,14 @@ pub const Config = struct {
     /// a bundled copy (the CLI's `--text-encoder` / `--vae` precedence, mapped onto
     /// `pipeline.Options.explicit_text_encoder` / `explicit_vae` in `diffuser`).
     ///
-    /// ⚠️ Empty must stay distinguishable from "a path we happened to default to":
+    /// Empty must stay distinguishable from "a path we happened to default to":
     /// treating a defaulted path as a request is what broke a joined SD1.5
     /// checkpoint in the CLI (the resolver opened krea2's qwen3 encoder, looked for
     /// CLIP's tensors in it, and reported `ComponentNotInCheckpoint`). The GUI never
     /// pre-fills these, so non-empty always means the user typed or browsed to it.
     text_encoder: PathBuf = .{},
     /// SDXL's SECOND text tower (OpenCLIP bigG), resolved independently of the
-    /// first — `text_encoder` overrides embedder 0, this one embedder 1. Ignored
+    /// first, `text_encoder` overrides embedder 0, this one embedder 1. Ignored
     /// by every single-tower architecture, so leaving it set while running SD1.5
     /// or krea2 costs nothing.
     text_encoder_2: PathBuf = .{},
@@ -593,13 +593,13 @@ pub const Config = struct {
     /// handles; they replace the old max-VRAM cap + priority toggle). `vram_split`
     /// is the LLM|diffusion contention boundary (the LLM's guaranteed share);
     /// `vram_limit_frac` is the ceiling nothing allocates past. Applied LIVE (a
-    /// drag reshuffles residency on the fly) — never load-affecting.
+    /// drag reshuffles residency on the fly), never load-affecting.
     vram_split: f32 = 0.60,
     vram_limit_frac: f32 = 0.95,
     /// Compute backend for the chat LLM. Only the CUDA variants work today
     /// (non-CUDA errors cleanly at load). Changing it forces a reload.
     llm_backend: Backend = .zig_cuda,
-    /// Compute backend for image generation. Independent of `llm_backend` — the
+    /// Compute backend for image generation. Independent of `llm_backend`, the
     /// two run as separate backend objects, so e.g. LLM on CUDA + diffusion on
     /// Vulkan is fine. Changing it rebuilds the diffusion session live.
     diff_backend: Backend = .zig_cuda,
@@ -608,11 +608,11 @@ pub const Config = struct {
     system_prompt: TextBuf(max_prompt) = TextBuf(max_prompt).lit(default_system_prompt),
     /// Saved named system prompts the user can load into `system_prompt` and
     /// switch between (see the settings view). Pure data, like `presets`; the
-    /// *active* prompt is always `system_prompt` — this is just the library.
+    /// *active* prompt is always `system_prompt`, this is just the library.
     sys_prompts: SysPromptList = .{},
     /// Whether the chat model reasons (emits a "thought" block) before its
     /// answer, for models that support it (see `chat.supportsThinking`). Applied
-    /// live — the GUI toolbar toggle flips this without a reload; the block is
+    /// live, the GUI toolbar toggle flips this without a reload; the block is
     /// rendered collapsed. No effect on non-reasoning models (e.g. Gemma 3).
     reasoning: bool = true,
     /// Replace a Gemma 4 model's own embedded chat_template with Google's
@@ -622,34 +622,34 @@ pub const Config = struct {
     /// (see `llmReloadEql`): a toggle triggers a transcript-preserving reload.
     gemma4_canonical_template: bool = false,
     /// KV-cache element storage type (f32 default; f16 halves the KV VRAM
-    /// footprint, lossy). Changing it rebuilds the KV context — the weights stay
+    /// footprint, lossy). Changing it rebuilds the KV context, the weights stay
     /// resident (see `ctxReloadEql`), not a full model reload.
     kv_dtype: KvDtype = .f32,
     /// How checkpoint bytes are read (see `WeightRead`). Applies to every loader
-    /// — LLM and diffusion alike — and to the next load, not the resident model.
+    /// LLM and diffusion alike, and to the next load, not the resident model.
     weight_read: WeightRead = .pread,
     /// Gemma-4 (gemma4v) vision token budget. Applied live per image encode
     /// (no reload); ignored by other archs / non-gemma4v mmprojs.
     vision_budget: VisionBudget = .high,
-    /// Host-RAM budget (MB) for turn-boundary context checkpoints — the fast
+    /// Host-RAM budget (MB) for turn-boundary context checkpoints, the fast
     /// "regenerate response / switch variant" rollback path. Bounds how many
     /// turn boundaries stay instantly rewindable (snapshot size is per-arch,
     /// context-independent). The newest turn's checkpoint is always kept
     /// regardless of the budget, so the last response stays instantly
     /// regenerable; the budget only bounds the older boundaries retained.
-    /// Applied live at the next turn — never load- or context-affecting.
+    /// Applied live at the next turn, never load- or context-affecting.
     regen_cache_mb: usize = 2048,
-    /// Ceiling on how many tokens ONE reply may generate. **0 = no explicit cap**
-    /// (the reply runs until the model stops or the context window fills — a
-    /// clean stop, not an error). Applied live at the next reply — never load- or
+    /// Ceiling on how many tokens ONE reply may generate. 0 = no explicit cap
+    /// (the reply runs until the model stops or the context window fills, a
+    /// clean stop, not an error). Applied live at the next reply, never load- or
     /// context-affecting (not compared by any `*ReloadEql`).
     ///
     /// Deliberately NOT part of `Sampling`: that struct is what a preset stores,
-    /// in a fixed 8-field `name|t|k|p|…` line (`parsePreset`), so adding a ninth
+    /// in a fixed 8-field `name|t|k|p|...` line (`parsePreset`), so adding a ninth
     /// would invalidate every preset already saved to disk.
     max_new_tokens: usize = 2048,
     /// LLM sampling controls (see `Sampling`). Applied live: pushed into the
-    /// running session on Apply and picked up at the next turn — never load-
+    /// running session on Apply and picked up at the next turn, never load-
     /// or context-affecting (not compared by any `*ReloadEql`).
     sampling: Sampling = .{},
     /// Saved sampling presets (`presets.slice()`). Pure data the settings view
@@ -658,7 +658,7 @@ pub const Config = struct {
 
     /// Persisted window geometry for the main window and the image viewer,
     /// restored on the next launch. Size/position track the *restored* (non-
-    /// maximized) geometry — while a window is maximized these keep the last
+    /// maximized) geometry, while a window is maximized these keep the last
     /// unmaximized values so un-maximizing (and the next launch) lands sensibly.
     /// `*_x`/`*_y` are `pos_unset` until a window has been moved. These are pure
     /// view state: never load- or reload-affecting (not compared by any
@@ -675,7 +675,7 @@ pub const Config = struct {
     viewer_max: bool = false,
 
     /// The LLM side (model, vision tower, VRAM limit) matches. A change here
-    /// needs a reload — but a transcript-preserving one: the chat is carried
+    /// needs a reload, but a transcript-preserving one: the chat is carried
     /// across and replayed into the new model, never wiped.
     pub fn llmReloadEql(a: *const Config, b: *const Config) bool {
         return pathEql(&a.llm_model, &b.llm_model) and
@@ -690,8 +690,8 @@ pub const Config = struct {
     }
 
     /// The LLM's KV-cache CONTEXT config matches. A change here (currently just
-    /// `kv_dtype`) needs a context rebuild — the KV cache is re-allocated at the
-    /// new dtype and the transcript re-prefilled — but the model WEIGHTS stay
+    /// `kv_dtype`) needs a context rebuild, the KV cache is re-allocated at the
+    /// new dtype and the transcript re-prefilled, but the model WEIGHTS stay
     /// resident (no full `llmReloadEql` reload). Kept separate from
     /// `llmReloadEql` precisely so a dtype flip doesn't reload multi-GB weights.
     pub fn ctxReloadEql(a: *const Config, b: *const Config) bool {
@@ -798,11 +798,11 @@ pub const Config = struct {
     /// (matches `app.hasDiffModel`). Toggling this needs a reload (the system
     /// prompt gains/loses the image-tool instructions).
     ///
-    /// ⚠️ This deliberately does NOT require `text_encoder` / `vae`. Container style
+    /// This deliberately does NOT require `text_encoder` / `vae`. Container style
     /// is a property of the file, not of the architecture: a bundled checkpoint
     /// carries all three components itself, and demanding two more paths made every
     /// such model unconfigurable here. Whether the pieces are actually reachable is
-    /// `pipeline.resolveComponent`'s call, not a path count's —
+    /// `pipeline.resolveComponent`'s call, not a path count's,
     /// `gui/model_spec.missing` is the GUI's advisory preview of that answer.
     pub fn diffEnabled(self: *const Config) bool {
         return self.diffusion_model.opt() != null;
@@ -850,12 +850,12 @@ pub const Config = struct {
     /// Load settings from disk. A missing file (or missing keys) yields
     /// defaults. The on-disk format is JSON (unknown keys ignored, missing keys
     /// default); a file that doesn't parse as JSON is treated as the legacy
-    /// `key = value` format — parsed line-by-line (malformed lines skipped) and
+    /// `key = value` format, parsed line-by-line (malformed lines skipped) and
     /// then rewritten as JSON in place, so old configs migrate on first load.
     /// `path_override` bypasses the well-known location (used by `--config`).
     /// Parse `bytes` as a JSON `Config` on a dedicated thread with a large stack,
-    /// returning the value by copy (the parsed `Config` owns no arena memory —
-    /// `TextBuf.jsonParse` copies strings into its fixed buffers — so the copy is
+    /// returning the value by copy (the parsed `Config` owns no arena memory,
+    /// `TextBuf.jsonParse` copies strings into its fixed buffers, so the copy is
     /// self-contained after `parsed.deinit()`). Returns null on any parse error
     /// (caller falls back to the legacy key=value reader) or if the thread can't
     /// be spawned. Keeps the huge std.json parse frames off the caller's stack;
@@ -874,7 +874,7 @@ pub const Config = struct {
         var ctx: Ctx = .{ .gpa = gpa, .bytes = bytes };
         // 64 MB, not 16: `std.json`'s recursive `innerParse` builds a frame per
         // struct field and `Config` is ~150 KB BY VALUE, so the stack this needs
-        // scales with the FIELD COUNT — adding two scalar fields was enough to
+        // scales with the FIELD COUNT, adding two scalar fields was enough to
         // blow a 16 MB stack and segfault every save/load test. A thread stack is
         // reserved address space, so the headroom costs nothing until touched;
         // sizing it tight here just means the next field added crashes config
@@ -928,7 +928,7 @@ pub const Config = struct {
         return cfg;
     }
 
-    /// Legacy `key = value` line applier — used only to read pre-JSON config
+    /// Legacy `key = value` line applier, used only to read pre-JSON config
     /// files during migration (see `load`). New writes go through `save`'s JSON
     /// path; this can be retired once no old configs remain in the wild.
     fn apply(self: *Config, key: []const u8, val: []const u8) void {
@@ -1036,7 +1036,7 @@ pub const Config = struct {
 
     /// Serialize settings to disk as JSON (creating the parent dir if needed).
     /// The document is derived straight from this struct by `std.json`, so it
-    /// stays in sync with the fields automatically — no per-field template.
+    /// stays in sync with the fields automatically, no per-field template.
     /// `path_override` bypasses the well-known location (used by `--config`).
     pub fn save(self: *const Config, io: std.Io, gpa: std.mem.Allocator, environ: *const Environ, path_override: ?[]const u8) !void {
         const path = (try filePath(io, gpa, environ, path_override)) orelse return error.NoConfigDir;
@@ -1056,7 +1056,7 @@ pub const Config = struct {
 };
 
 /// Key a measured-residency figure to the model it was measured on, so a changed
-/// checkpoint invalidates it. Hash rather than path — see `diff_peak_key`.
+/// checkpoint invalidates it. Hash rather than path, see `diff_peak_key`.
 pub fn modelKey(path: []const u8) u64 {
     return std.hash.Wyhash.hash(0, path);
 }
@@ -1099,7 +1099,7 @@ fn parsePreset(val: []const u8) ?Preset {
 /// Test-only: a per-PROCESS unique config filename. These tests are compiled
 /// into several gui test binaries (config.zig is imported by the diffuser and
 /// chat test roots too), which `zig build gui-test` runs in PARALLEL from the
-/// same cwd — a fixed filename races across binaries and flakes.
+/// same cwd, a fixed filename races across binaries and flakes.
 fn testFile(buf: []u8, comptime tag: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, ".gui-config-{s}-test.{d}", .{ tag, std.posix.system.getpid() }) catch unreachable;
 }
@@ -1133,7 +1133,7 @@ test "apply parses the sampler and leaves it alone on junk" {
     try std.testing.expectEqual(Sampler.dpmpp_2m_sde_heun, cfg.sampler);
     cfg.apply("sampler", "dpmpp_2m_sde");
     try std.testing.expectEqual(Sampler.dpmpp_2m_sde, cfg.sampler);
-    // A stale/unknown name must not silently reset the sampler to Euler — that would
+    // A stale/unknown name must not silently reset the sampler to Euler, that would
     // change what a saved config renders.
     cfg.apply("sampler", "dpmpp_3m_sde");
     try std.testing.expectEqual(Sampler.dpmpp_2m_sde, cfg.sampler);
@@ -1146,7 +1146,7 @@ test "apply parses the scheduler, including the model-default sentinel" {
     try std.testing.expectEqual(Scheduler.karras, cfg.scheduler);
     cfg.apply("scheduler", "kl_optimal");
     try std.testing.expectEqual(Scheduler.kl_optimal, cfg.scheduler);
-    // `default` must survive a round trip — it is not a stand-in for `normal`, it means
+    // `default` must survive a round trip, it is not a stand-in for `normal`, it means
     // "whatever this architecture samples with", which differs per family.
     cfg.apply("scheduler", "default");
     try std.testing.expectEqual(Scheduler.default, cfg.scheduler);
@@ -1279,7 +1279,7 @@ test "multi-line system prompt survives a JSON save/load round-trip" {
     var environ: Environ = .init(gpa);
     defer environ.deinit();
 
-    // Newlines, backslashes and quotes are all handled natively by JSON — no
+    // Newlines, backslashes and quotes are all handled natively by JSON, no
     // escaping helper needed the way the old key=value format required.
     var a: Config = .{};
     a.system_prompt.set("line one\nline two\\end \"quoted\"");
@@ -1429,7 +1429,7 @@ test "window geometry round-trips (size, position, maximized)" {
     try std.testing.expectEqual(@as(usize, 600), b.viewer_h);
     try std.testing.expectEqual(@as(i32, 100), b.viewer_x);
     try std.testing.expectEqual(@as(i32, 200), b.viewer_y);
-    try std.testing.expect(!b.viewer_max); // untouched → default
+    try std.testing.expect(!b.viewer_max); // untouched -> default
 }
 
 test "output_dir round-trips and apply parses it" {
@@ -1694,7 +1694,7 @@ test "sys_prompts save/load round-trip (JSON, multi-line text)" {
     var a: Config = .{};
     try std.testing.expect(a.upsertSysPrompt("coder", "You write Zig.\nBe terse."));
     try std.testing.expect(a.upsertSysPrompt("pirate", "Arr, matey!"));
-    // Saved prompts are pure data — never load- or context-affecting.
+    // Saved prompts are pure data, never load- or context-affecting.
     const base: Config = .{};
     try std.testing.expect(a.llmReloadEql(&base));
     try std.testing.expect(a.ctxReloadEql(&base));

@@ -4,7 +4,7 @@
 //! `layerForward` / `layerForwardTree` compose the ops once.
 //!
 //! `layer`/`cache`/`s` are `anytype`: each model keeps its own `Config`/`Layer`/
-//! `Scratch` (unchanged — the GPU steppers depend on their exact shapes), and
+//! `Scratch` (unchanged, the GPU steppers depend on their exact shapes), and
 //! optional per-arch fields (`post_attn_norm`, `layer.v`, `out_scale`) are read
 //! only under `if (comptime spec.<flag>)`, so an arch whose struct lacks a field
 //! never compiles that branch. Per-layer geometry, the RoPE table (global vs
@@ -41,14 +41,14 @@ pub const LayerSpec = struct {
     /// into its QK norms and passes 1.0.
     attn_scale: ?f32 = null,
     /// Per-head QK RMS-norm before RoPE (qwen3/gemma). false for the plain
-    /// llama/Mistral family, which has no q_norm/k_norm tensors — those layer
+    /// llama/Mistral family, which has no q_norm/k_norm tensors, those layer
     /// fields go unread, so the arch's Layer struct may leave them empty.
     qk_norm: bool = true,
 };
 
 pub const qwen3_spec: LayerSpec = .{ .activation = .silu_mul };
 /// llama/Mistral: SwiGLU, no QK-norm. (RoPE is made rotate-half-compatible by
-/// un-permuting q/k weights at load — see qwen3.loadLayersCfg.)
+/// un-permuting q/k weights at load, see qwen3.loadLayersCfg.)
 pub const llama_spec: LayerSpec = .{ .activation = .silu_mul, .qk_norm = false };
 pub const gemma3_spec: LayerSpec = .{ .activation = .gelu_tanh_mul, .sandwich_norms = true };
 pub const gemma4_spec: LayerSpec = .{
@@ -80,8 +80,8 @@ pub const Dims = struct {
     sliding_window: usize = 0,
 };
 
-/// The shared MLP block: norm → gate/up → gated activation → down → [post-ffn
-/// norm] → residual add. `x` is [seq, hidden].
+/// The shared MLP block: norm -> gate/up -> gated activation -> down -> [post-ffn
+/// norm] -> residual add. `x` is [seq, hidden].
 fn mlpBlock(comptime spec: LayerSpec, io: std.Io, gpa: std.mem.Allocator, layer: anytype, x: []f32, seq: usize, dims: Dims, eps: f32, s: anytype) !void {
     const normed = s.normed[0 .. seq * dims.hidden];
     const gate = s.gate[0 .. seq * dims.intermediate];
@@ -216,7 +216,7 @@ pub fn layerForward(
 }
 
 /// Batched `.fresh` encoder layer: B independent sequences packed contiguously
-/// into `x` [total_rows, hidden] (ragged — item i occupies rows
+/// into `x` [total_rows, hidden] (ragged, item i occupies rows
 /// [row_off[i], row_off[i+1])). Every projection / norm / activation runs once
 /// over all `total` rows (via the shared `qkvProject`/`mlpBlock`), so the batch
 /// amortizes fork/join and weight reuse; only RoPE and attention are per-item
@@ -333,7 +333,7 @@ pub fn layerForwardTree(
 // through the KV-cached `.cached` path (the prefill == sequential-decode
 // property the engine relies on). This exercises rope positioning, cache views,
 // residual wiring, norm placement, and the activation on tiny synthetic weights
-// — no checkpoint, runs in `zig build test`.
+// no checkpoint, runs in `zig build test`.
 
 const kv_cache = @import("tp_core").kv_cache;
 

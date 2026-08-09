@@ -1,5 +1,5 @@
 //! Chat session for tp-gui: owns the resident LLM (qwen3 / qwen35 / gemma3 /
-//! gemma4 on the CUDA backends — see `Arch`) and runs generation on a
+//! gemma4 on the CUDA backends, see `Arch`) and runs generation on a
 //! background thread, streaming decoded tokens back to the UI through a
 //! mutex-guarded queue.
 //!
@@ -9,7 +9,7 @@
 //!    touches `messages` and `ids` while no worker is running (`submit` refuses
 //!    to start a second turn, so the two never race).
 //!  - The worker thread runs `engine.generate`, whose per-token writes land in
-//!    `TokenSink.drain` — the only place `pending` is written. `drain` fires the
+//!    `TokenSink.drain`, the only place `pending` is written. `drain` fires the
 //!    SDL wakeup so the event-driven render loop repaints promptly.
 const std = @import("std");
 const tp = @import("TensorPencil");
@@ -38,7 +38,7 @@ const gemma4v_vit_cuda = tp.models.gemma4v_vit_cuda;
 
 /// The resident LLM + its vision tower, one variant per supported GGUF
 /// architecture. `model` retains a `*const lm`, so the bundle must live at a
-/// stable address (it does — inside the heap-pinned Session) and its tag is
+/// stable address (it does, inside the heap-pinned Session) and its tag is
 /// never reassigned after init.
 const Arch = union(enum) {
     qwen3: struct { lm: qwen3.CausalLM, model: qwen3_cuda.CudaLM, vit: ?NoVit = null },
@@ -102,8 +102,8 @@ const parseGenAttrs = diffuser.parseGenAttrs;
 const rgbToRgba = diffuser.rgbToRgba;
 const freeGenImage = diffuser.freeGenImage;
 
-/// Tool-only description of the `<image>…</image>` image tool. This is NOT a
-/// full system prompt — it carries no persona — and is appended to the user's
+/// Tool-only description of the `<image>...</image>` image tool. This is NOT a
+/// full system prompt, it carries no persona, and is appended to the user's
 /// configured system prompt only when a diffusion model is available.
 const image_tool_prompt =
     \\# Image generation tool
@@ -135,8 +135,8 @@ pub const GenImage = diffuser.GenImage;
 
 /// What a message's footer reports: how much of the turn was prompt, how much
 /// was generation, and where the context stood afterwards. ONE struct for both
-/// roles — a user message's variant carries the prompt half, an assistant
-/// variant the generation half — because it is the same question ("what did
+/// roles, a user message's variant carries the prompt half, an assistant
+/// variant the generation half, because it is the same question ("what did
 /// this turn cost") asked at two points in the same turn, and the two halves
 /// are measured by the same worker pass.
 ///
@@ -160,9 +160,9 @@ pub const Variant = struct {
     images_scanned: bool = false,
     /// Whether the prompt this variant was generated from already had the
     /// reasoning block OPEN (the render-driven template primes
-    /// `…assistant\n<think>\n`), so the text starts inside the thought and only
+    /// `...assistant\n<think>\n`), so the text starts inside the thought and only
     /// ever emits the CLOSE marker. Recorded per variant rather than per session
-    /// because a session can render both ways over its lifetime — thinking can be
+    /// because a session can render both ways over its lifetime, thinking can be
     /// toggled, and a vision turn falls back to the unprimed hand glue.
     /// Consumed by `toolcall.splitThought`; see there for why it matters.
     thought_primed: bool = false,
@@ -181,13 +181,13 @@ pub const Variant = struct {
 
 pub const Message = struct {
     role: Role,
-    /// The message's takes, oldest first — always at least one (init/adopt
+    /// The message's takes, oldest first, always at least one (init/adopt
     /// guarantee it). `cur` selects the ACTIVE take: the one the UI displays
     /// and the one the model context contains. Regeneration appends a variant;
     /// ‹/› navigation moves `cur` (see `navTarget`).
     variants: std.ArrayList(Variant) = .empty,
     cur: usize = 0,
-    /// Images the user attached to this (user) message — displayed inline and
+    /// Images the user attached to this (user) message, displayed inline and
     /// the re-encode source when the following response is regenerated.
     attachments: std.ArrayList(*GenImage) = .empty,
     /// ViT token grids of this (user) message's images, parallel to
@@ -223,7 +223,7 @@ pub const Message = struct {
 /// (`snap`, from the arch's `checkpoint()`) taken at `q` committed tokens,
 /// with `ids[0..ids_len)` being the boundary's prompt (everything prefilled
 /// except the last token, which `engine.generate` forwards). Restoring it
-/// rolls the whole context back to "user turn cached, nothing generated" —
+/// rolls the whole context back to "user turn cached, nothing generated",
 /// in O(snapshot) time, independent of context length.
 pub const Checkpoint = struct { q: usize, ids_len: usize, snap: []u8 };
 
@@ -233,12 +233,12 @@ pub fn checkpointsBytes(list: []const Checkpoint) u64 {
     return total;
 }
 
-/// Bytes → MiB for the `[ckpt]` log lines.
+/// Bytes -> MiB for the `[ckpt]` log lines.
 fn mib(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / (1 << 20);
 }
 
-/// Drop oldest-first until the snapshots fit `budget` — but ALWAYS keep the
+/// Drop oldest-first until the snapshots fit `budget`, but ALWAYS keep the
 /// newest one, even when it alone exceeds the budget (or the budget is 0):
 /// the last turn must stay instantly regenerable; the budget only bounds how
 /// many OLDER boundaries are kept around.
@@ -320,10 +320,10 @@ pub const Options = struct {
     /// KV window ceiling; growth commits rows lazily up to this. `null` (the
     /// default) auto-sizes to the model's trained context length (capped at
     /// `auto_context_cap`), so a session isn't silently clipped to a fixed
-    /// window — CUDA grows KV rows on demand, so a large ceiling costs VRAM
+    /// window, CUDA grows KV rows on demand, so a large ceiling costs VRAM
     /// only as the conversation fills.
     max_context: ?usize = null,
-    /// Per-reply token ceiling. **0 means no explicit cap** — generate until the
+    /// Per-reply token ceiling. 0 means no explicit cap, generate until the
     /// model stops or the context window fills (see `resolveMaxNew`). Applied
     /// live: `updateSettings` stages it and the next turn boundary adopts it,
     /// exactly like `sampling`.
@@ -347,7 +347,7 @@ pub const Options = struct {
     /// Requires a CUDA backend (which this session always uses).
     mmproj_path: ?[]const u8 = null,
     /// VRAM meter policy, as fractions of the whole card (resolved to bytes
-    /// against the live card total at load). `vram_limit_frac` is the ceiling —
+    /// against the live card total at load). `vram_limit_frac` is the ceiling,
     /// the LLM + image model never allocate past it. `vram_split` is the LLM's
     /// guaranteed share under contention: with the image model resident the LLM
     /// settles to this and diffusion gets the rest up to the ceiling; with
@@ -367,7 +367,7 @@ pub const Options = struct {
     /// regenerate/variant-switch path). Snapshot size is context-independent
     /// but per-arch (qwen35: tens of MB), so this bounds how many turn
     /// boundaries stay instantly rewindable. The newest turn's checkpoint is
-    /// ALWAYS kept, whatever the budget — only older boundaries (future
+    /// ALWAYS kept, whatever the budget, only older boundaries (future
     /// branch points) are evicted; a rollback past those re-prefills.
     regen_cache_mb: usize = 2048,
     /// Replace a Gemma 4 model's OWN embedded chat_template with Google's
@@ -382,9 +382,9 @@ pub const Options = struct {
 /// Resolve the configured per-reply token cap against the session's context
 /// ceiling. 0 means "no explicit cap": the reply runs until the model emits a
 /// stop token or the KV window fills, which `engine.generate` handles as a clean
-/// break (`ensureRoom` → `error.ContextFull` → stop), not an error.
+/// break (`ensureRoom` -> `error.ContextFull` -> stop), not an error.
 ///
-/// ⚠️ `max_context` — not a huge sentinel — is what expresses that. The engine
+/// `max_context`, not a huge sentinel, is what expresses that. The engine
 /// sizes a one-shot KV plan as `prompt_len + max_new_tokens`
 /// (`engine.capacityPlanFor`), so `maxInt(usize)` there is an integer overflow,
 /// and `max_context` is anyway the *exact* upper bound on how many tokens one
@@ -394,7 +394,7 @@ fn resolveMaxNew(cfg_max_new: usize, max_context: usize) usize {
 }
 
 /// Map the GUI's engine-free `config.Sampling` onto the library's
-/// `sample.Params`, field for field — explicit so the two can't drift silently.
+/// `sample.Params`, field for field, explicit so the two can't drift silently.
 pub fn samplingParams(cfg: *const config.Config) sample.Params {
     const s = &cfg.sampling;
     return .{
@@ -429,28 +429,28 @@ pub const Session = struct {
     /// `chat_template`. When present AND the session is text-only (no vision
     /// tower), each turn's prompt is RENDERED from the transcript so prior-turn
     /// thoughts are stripped (`strip_thinking`) instead of accumulating. Null =>
-    /// the model shipped no template, or a vision session — the hand glue runs.
+    /// the model shipped no template, or a vision session, the hand glue runs.
     template: ?chat_template.ChatTemplate = null,
     /// The full system prompt (base + image-tool description), the BOS string the
-    /// template emits, and whether reasoning is on — the render inputs.
+    /// template emits, and whether reasoning is on, the render inputs.
     system_text: []const u8 = "",
     bos_str: []const u8 = "",
     eos_str: []const u8 = "",
     opts: engine.Options,
     /// Sampling params staged by `updateSettings` (UI thread) and copied into
-    /// `opts.sampling` by `submit` — also UI-thread, and never while a worker
+    /// `opts.sampling` by `submit`, also UI-thread, and never while a worker
     /// runs (`submit` refuses when busy). Keeps live settings edits from racing
     /// the worker's read of `opts`, and gives "takes effect next turn" exactly.
     pending_sampling: sample.Params = .{},
     /// Per-reply token cap staged by `updateSettings` and adopted into
-    /// `opts.max_new_tokens` at the next turn boundary — the same discipline as
+    /// `opts.max_new_tokens` at the next turn boundary, the same discipline as
     /// `pending_sampling`, and for the same reason: the worker reads `opts`
     /// throughout a turn, so a live edit must not land mid-generation. Already
-    /// resolved (0 → the context ceiling), so the boundary is a plain copy.
+    /// resolved (0 -> the context ceiling), so the boundary is a plain copy.
     pending_max_new_tokens: usize = 0,
     /// A changed system prompt staged by `updateSettings` (UI thread), gpa-owned,
     /// adopted into `system_text` by `submit`/`regenerate` at the next turn
-    /// boundary — same discipline as `pending_sampling` (the worker reads
+    /// boundary, same discipline as `pending_sampling` (the worker reads
     /// `system_text` mid-turn in `buildRenderedTurn`, so it must not be swapped
     /// under it). Only staged for render-driven (template) sessions, where the
     /// re-rendered system turn + reconcile apply it on the next message; the
@@ -458,7 +458,7 @@ pub const Session = struct {
     /// when nothing is pending.
     pending_system_text: ?[]const u8 = null,
     /// Per-turn sampling seeds, drawn at each turn boundary (`submit`, UI
-    /// thread — same discipline as `pending_sampling`). Deliberately NOT
+    /// thread, same discipline as `pending_sampling`). Deliberately NOT
     /// reset by `reset`: a new chat must not replay the previous chat's
     /// seeds, and a future "regenerate reply" just draws again.
     seeds: sample.SeedSeq = .{ .state = 0 },
@@ -484,9 +484,9 @@ pub const Session = struct {
     progress: engine.Progress = .{},
 
     /// Token length of the template's generation-prompt suffix (the
-    /// `…<|im_start|>assistant\n[<think>\n]` it appends when
+    /// `...<|im_start|>assistant\n[<think>\n]` it appends when
     /// `add_generation_prompt` is set). Measured ONCE per session by rendering
-    /// the same messages both ways — it is a property of the template and
+    /// the same messages both ways, it is a property of the template and
     /// `enable_thinking`, not of the conversation, so it does not need
     /// re-measuring per turn (which would add a third full render to `build`).
     /// `gen_prompt_think` records which setting it was measured under so a
@@ -515,7 +515,7 @@ pub const Session = struct {
     /// from.
     stats_live: bool = false,
     /// Whether this turn built a new user message (submit) rather than
-    /// re-running an existing one (regenerate) — see `user_stats`. UI thread.
+    /// re-running an existing one (regenerate), see `user_stats`. UI thread.
     fresh_user_turn: bool = false,
     /// Prompt tokens the turn just built contributes (`TurnStats.prompt_tokens`),
     /// handed from `buildTurn` to `publishPromptStats`. Worker thread only.
@@ -528,7 +528,7 @@ pub const Session = struct {
     // eviction) + queue source (nextPending over the transcript). The flag gates
     // the image-tool system prompt and the post-turn scan.
     images_enabled: bool = false,
-    /// The LLM's dynamic-offload budget (bytes) — the ceiling it keeps device
+    /// The LLM's dynamic-offload budget (bytes), the ceiling it keeps device
     /// usage under. Equals `vram_limit` (the meter's limit handle); the offload
     /// scheduler migrates layers to the CPU once weights + KV would exceed it.
     vram_budget: u64 = 0,
@@ -547,12 +547,12 @@ pub const Session = struct {
     /// Set when a regenerate / variant switch rebuilt `ids` for a transcript
     /// the device context no longer matches. The next turn's worker clears the
     /// context (KV + recurrent state) before prefilling, so the whole rebuilt
-    /// `ids` replays. UI-thread writes, worker-thread read — never concurrent
+    /// `ids` replays. UI-thread writes, worker-thread read, never concurrent
     /// (both only happen while no worker runs / at worker start).
     ctx_dirty: bool = false,
     /// Turn-boundary checkpoints, oldest first (strictly increasing `q`).
     /// Appended by the worker at each turn's boundary (takeCheckpoint), read
-    /// by the UI thread only while idle — the same non-overlap discipline as
+    /// by the UI thread only while idle, the same non-overlap discipline as
     /// `messages`. Emptied whenever cache CONTENT is rebuilt (reset, dtype
     /// rebuild, full-reprefill fallback): a snapshot pairs with the exact KV
     /// rows it was taken over.
@@ -563,7 +563,7 @@ pub const Session = struct {
     checkpoint_budget: u64 = 0,
     pending_budget: u64 = 0,
     /// `q` of the checkpoint covering the CURRENT last turn, or null when
-    /// that boundary has none (arch unsupported, snapshot failed) — then
+    /// that boundary has none (arch unsupported, snapshot failed), then
     /// regenerate/variant-switch take the full-reprefill fallback. Written by
     /// the worker (takeCheckpoint) and the UI invalidation paths.
     cur_turn_q: ?usize = null,
@@ -629,7 +629,7 @@ pub const Session = struct {
         chat.applyTokenizer(&self.tok);
 
         // The chat LLM runs on CUDA only for now. Both CUDA variants work (the
-        // decode driver is identical — hand-PTX kernels either way; libs just
+        // decode driver is identical, hand-PTX kernels either way; libs just
         // adds cuBLASLt/cuDNN). Non-CUDA selections error cleanly (the loader
         // surfaces it) rather than silently falling back.
         self.be = switch (cfg.backend) {
@@ -641,7 +641,7 @@ pub const Session = struct {
         // LLM weights pin resident on first touch and NEVER stream: without
         // this, weights sit in the backend's evictable LRU cache, and once the
         // working set is within ~a layer of the card, per-token allocations
-        // evict them in exactly the (cyclic) order decode re-reads them —
+        // evict them in exactly the (cyclic) order decode re-reads them,
         // ~the whole model re-uploads from the mmap EVERY token (the 31B
         // 0.1 tok/s cliff). VRAM pressure is handled by the always-armed
         // dynamic split + the vram Arbiter migrating whole layers instead.
@@ -744,7 +744,7 @@ pub const Session = struct {
             a.model = try gemma4_cuda.CudaLM.init(gpa, self.be, &a.lm, cap);
         } else unreachable; // familyForArch above is the single arch gate: any
         // arch reaching here already passed it, and this dispatch covers the
-        // same set (adding an arch means adding it to both — a lockstep invariant,
+        // same set (adding an arch means adding it to both, in lockstep,
         // not a runtime case). A mismatch is a dev bug, caught loudly in Debug.
 
         // Read weight bytes from the checkpoint FILE rather than faulting the
@@ -753,10 +753,10 @@ pub const Session = struct {
         session.useFileReads(self.be, &self.gguf);
         if (self.mmproj_gguf) |*mg| session.useFileReads(self.be, mg);
 
-        // ⚠️ Upload the weights NOW, while the UI is still showing "Loading…".
+        // Upload the weights NOW, while the UI is still showing "Loading...".
         // `Backend.cachedWeight` is lazy, so without this the one-time
         // host->device copy of every weight happens inside the FIRST turn's
-        // prefill — which both charges it to "Processing…" and makes the first
+        // prefill, which both charges it to "Processing..." and makes the first
         // response feel far slower than later ones for no visible reason
         // (measured ~600 ms on Bonsai-27B). `session.run` does the same for the
         // CLI. Opt-in per stepper; an arch without the decl keeps the old
@@ -818,7 +818,7 @@ pub const Session = struct {
         // MUST be nulled explicitly: the session is `gpa.create`d (undefined
         // memory), so the field's `= null` default does NOT apply. Left
         // undefined, `adoptPendingSystemText` reads it as a live pointer at the
-        // first turn, frees the real `system_text`, and swaps in garbage — the
+        // first turn, frees the real `system_text`, and swaps in garbage, the
         // rendered prompt then concatenates a wild-length slice (OOM / integer
         // overflow). Only surfaced once a template session actually renders the
         // system prompt (e.g. Mistral `[INST]`); the first buggy turn happens to
@@ -827,7 +827,7 @@ pub const Session = struct {
         // Same `gpa.create` undefined-memory trap: these have `= default`
         // declarations that do NOT apply, and both are read (control by the VRAM
         // arbiter poll, suspended_midturn by the worker) before their first
-        // write in some orderings — initialize them to their intended defaults.
+        // write in some orderings, initialize them to their intended defaults.
         self.control = .{};
         self.suspended_midturn = false;
         self.turn_staged = false;
@@ -841,10 +841,10 @@ pub const Session = struct {
         self.opts.progress = &self.progress; // stable heap address for the worker
         self.images_enabled = cfg.images_enabled;
 
-        // Dynamic VRAM offload (GUI_VRAM.md): always arm the dynamic split (free
-        // when the model fits — 0 layers on CPU, per-op decode ties the graph;
+        // Dynamic VRAM offload: always arm the dynamic split (free
+        // when the model fits, 0 layers on CPU, per-op decode ties the graph;
         // measured 76 vs 77 tok/s on the 9B). Once context + weights outgrow the
-        // budget it migrates layers to the CPU — the ONLY degradation path now
+        // budget it migrates layers to the CPU, the ONLY degradation path now
         // (weights are pinned; the old streaming fallback, ~2.5x slower at best
         // and a per-token full-model re-upload at worst, is gone). Vision sessions
         // arm it too: text turns run the fast offload path, and an IMAGE turn
@@ -854,7 +854,7 @@ pub const Session = struct {
         {
             // Resolve the meter fractions against THIS card's total VRAM. The
             // ceiling (limit handle) is the LLM's offload budget: it loads fully
-            // up to the ceiling — the split is not a hard reservation, it only
+            // up to the ceiling, the split is not a hard reservation, it only
             // bites when the image model actually loads (imageVramEnter settles
             // the LLM to its share then). With diffusion idle the LLM keeps
             // everything up to the ceiling.
@@ -881,7 +881,7 @@ pub const Session = struct {
 
         // Render-driven templating: load the model's own chat_template. Drives
         // text AND vision turns (the render's image placeholders expand to the
-        // real pad-row block, embeddings spliced in during prefill — see
+        // real pad-row block, embeddings spliced in during prefill, see
         // `buildRenderedTurn`). A model without an embedded template keeps the
         // hand glue. The gemma4-canonical override swaps in Google's upstream
         // template (for finetunes shipping an older/stripped one).
@@ -901,7 +901,7 @@ pub const Session = struct {
     /// Start a fresh conversation (KV + transcript reset, LLM residency re-armed).
     /// CONTRACT: the caller must first stop the app-level diffusion engine (join
     /// its worker) so no diffusion thread is still touching a transcript GenImage
-    /// as this frees the messages — the session no longer owns that engine.
+    /// as this frees the messages, the session no longer owns that engine.
     pub fn reset(self: *Session) void {
         if (self.busy()) return;
 
@@ -945,7 +945,7 @@ pub const Session = struct {
     }
 
     /// Drop every turn checkpoint (and any rollback request naming one). Called
-    /// whenever the cache CONTENT is about to be rebuilt or destroyed — a
+    /// whenever the cache CONTENT is about to be rebuilt or destroyed, a
     /// snapshot is only meaningful over the exact rows it was taken with.
     fn invalidateCheckpoints(self: *Session) void {
         if (self.checkpoints.items.len > 0) {
@@ -959,7 +959,7 @@ pub const Session = struct {
     }
 
     /// Rebuild the KV cache at a new element dtype (the config f32<->f16 toggle),
-    /// keeping the model WEIGHTS resident — a "context reload", not a model
+    /// keeping the model WEIGHTS resident, a "context reload", not a model
     /// reload. Frees + re-creates the K/V buffers at `dtype` and resets the
     /// committed length to 0; `ids` still hold the whole transcript, so the next
     /// turn re-prefills it. Runs on the UI thread like `updateSettings`; the
@@ -983,7 +983,7 @@ pub const Session = struct {
     pub fn requestCancel(self: *Session) void {
         self.cancel.store(true, .release);
         // A worker parked at the pause gate would never observe the cancel; wake
-        // it (without unpausing — the pause button stays in sync) so its
+        // it (without unpausing, the pause button stays in sync) so its
         // checkpoint re-reads `cancel` and returns `.canceled`.
         self.pause.wake(self.io);
     }
@@ -991,7 +991,7 @@ pub const Session = struct {
     /// Park the decode worker at the next token boundary (holding KV + weights),
     /// or release it. UI-thread; driven by the LLM's own pause button. On resume,
     /// dispatch any turn that was queued while paused (staged by `submit` but
-    /// never spawned — see the `turn_staged && !busy() && worker == null` state).
+    /// never spawned, see the `turn_staged && !busy() && worker == null` state).
     pub fn setPaused(self: *Session, paused: bool) void {
         if (paused) {
             self.pause.pause(self.io);
@@ -1008,7 +1008,7 @@ pub const Session = struct {
 
     /// Ask a paused, in-flight decode worker to suspend at its next token
     /// boundary: it stops with the assistant turn left OPEN and sets
-    /// `suspended_midturn`. Async — poll `busy()`; when it clears, the raw `ids`
+    /// `suspended_midturn`. Async, poll `busy()`; when it clears, the raw `ids`
     /// (prompt + partial response) can be carried across an unload and resumed
     /// (reprefill + continue). No-op if not generating. (Tier 3.)
     pub fn requestSuspend(self: *Session) void {
@@ -1016,12 +1016,12 @@ pub const Session = struct {
     }
 
     /// Resume a suspended mid-turn response after an unload+reload: `ids` already
-    /// holds the open turn (adoptSuspended set it), so spawn the decode worker —
+    /// holds the open turn (adoptSuspended set it), so spawn the decode worker,
     /// prepareTurn reprefills all of `ids` (KV empty) and engine.generate
     /// continues that same response. No new turn is staged. (Tier 3.)
     pub fn continueOpenTurn(self: *Session) !void {
         // Resuming an existing turn: its user message was measured before the
-        // unload, and this pass re-prefills the whole transcript — publishing
+        // unload, and this pass re-prefills the whole transcript, publishing
         // that as the message's cost would overwrite the real figure with the
         // reload's, and with no prompt size beside it (nothing is built here).
         self.fresh_user_turn = false;
@@ -1049,7 +1049,7 @@ pub const Session = struct {
     }
 
     /// Adopt a system-prompt change staged by `updateSettings`, at a turn
-    /// boundary (UI thread, no worker running — callers guard on `busy()`), so
+    /// boundary (UI thread, no worker running, callers guard on `busy()`), so
     /// the worker never reads `system_text` while it is swapped.
     fn adoptPendingSystemText(self: *Session) void {
         if (self.pending_system_text) |t| {
@@ -1066,11 +1066,11 @@ pub const Session = struct {
     pub fn updateSettings(self: *Session, cfg: *const config.Config) void {
         // Reasoning is process-global (like the family) and only shapes the
         // *next* prompt built, so flipping it mid-conversation is safe without a
-        // reload — the current turn already has its ids.
+        // reload, the current turn already has its ids.
         chat.setThinking(cfg.reasoning);
         // Sampling is staged, not applied: `submit` copies it into `opts` at the
         // next turn boundary (a turn possibly generating right now keeps the
-        // params it started with — no racing the worker's read of `opts`).
+        // params it started with, no racing the worker's read of `opts`).
         self.pending_sampling = samplingParams(cfg);
         // The per-reply token cap is staged the same way (the worker's decode
         // loop reads `opts.max_new_tokens` for the whole turn). Resolved against
@@ -1080,16 +1080,16 @@ pub const Session = struct {
         self.pending_budget = @as(u64, cfg.regen_cache_mb) << 20;
         // System prompt: for a render-driven (template) session, restage it so
         // the next turn re-renders the new system turn and `reconcile` rewinds
-        // the KV to apply it — TODO #8, "changing system prompt takes effect on
+        // the KV to apply it, TODO #8, "changing system prompt takes effect on
         // the next message". Staged (not applied) to avoid racing the worker's
         // read of `system_text`; `submit`/`regenerate` adopt it at the boundary.
         // Non-template sessions bake the system into `initial_ids` and can't do
-        // this live — app.zig forces a transcript-preserving reload for them.
+        // this live, app.zig forces a transcript-preserving reload for them.
         if (self.template != null) {
             const base = cfg.system_prompt.opt() orelse config.default_system_prompt;
             const next = composeSystemText(self.gpa, self.images_enabled, base) catch return;
             // Compare against the pending value if one is already staged, else
-            // the live one — so repeated settings-applies don't leak.
+            // the live one, so repeated settings-applies don't leak.
             const current = self.pending_system_text orelse self.system_text;
             if (std.mem.eql(u8, next, current)) {
                 self.gpa.free(next);
@@ -1098,7 +1098,7 @@ pub const Session = struct {
                 self.pending_system_text = next;
             }
         }
-        // (vision_budget is reload-triggering, not live — it sizes the LLM's
+        // (vision_budget is reload-triggering, not live, it sizes the LLM's
         // image-prefill buffers at load; see `reloadEql` / the gemma4 load path.)
     }
 
@@ -1107,11 +1107,11 @@ pub const Session = struct {
     // same way it (will) drive diffusion. Read thunks are thread-safe (plain
     // field/atomic reads). `applyBudget` mutates residency + binds the context,
     // so it runs ONLY on the worker (via `pollAndApply` at a token boundary) or
-    // on the arbiter thread while the LLM is idle — never racing the worker.
+    // on the arbiter thread while the LLM is idle, never racing the worker.
     fn vpUsage(ctx: *anyopaque) u64 {
         return fromCtx(ctx).be.deviceUsed();
     }
-    /// Footprint with every offloaded layer promoted back — what the LLM would
+    /// Footprint with every offloaded layer promoted back, what the LLM would
     /// hold if nothing contended. Lets the arbiter tell "this LLM is small" from
     /// "this LLM is squeezed", so an idle image model yields only the deficit.
     fn vpDemand(ctx: *anyopaque) u64 {
@@ -1146,7 +1146,7 @@ pub const Session = struct {
         switch (self.arch) {
             inline else => |*a| {
                 // Snapshot residency around the settle so we can log exactly what
-                // moved (settleTo is idempotent — an already-satisfied target
+                // moved (settleTo is idempotent, an already-satisfied target
                 // shifts nothing, so we stay quiet unless the split actually
                 // changed, mirroring the per-turn tok/s summary).
                 const before = residency.snapshot(&a.model);
@@ -1163,7 +1163,7 @@ pub const Session = struct {
                     });
                     // An offload wave that STILL ends over target means the
                     // ceiling is below the un-evictable minimum (KV + embeddings
-                    // + head + scratch) — every layer was migrated chasing it.
+                    // + head + scratch), every layer was migrated chasing it.
                     // That target is garbage; say so instead of failing silently.
                     if (after.n_cpu > before.n_cpu and after.device_mib > (target >> 20))
                         std.log.warn("[vram] LLM residency target {d} MiB is unreachable: {d} MiB remain resident with {d}/{d} layers on host — suspect a bogus published budget", .{
@@ -1190,21 +1190,21 @@ pub const Session = struct {
     }
 
     /// `engine.residency_poll` thunk: at each token boundary, enact any target
-    /// the arbiter published to `control` — on the worker's own bound thread.
+    /// the arbiter published to `control`, on the worker's own bound thread.
     fn residencyPollThunk(ctx: *anyopaque) void {
         fromCtx(ctx).participant().pollAndApply();
     }
 
-    /// pipeline reclaim hook (GUI_VRAM.md Phase 5): free LLM VRAM for a large VAE
-    /// decode by migrating chat layers to the CPU — done even under chat priority,
+    /// pipeline reclaim hook: free LLM VRAM for a large VAE
+    /// decode by migrating chat layers to the CPU, done even under chat priority,
     /// as the agreed last resort so a big image never just fails. Migrates JUST
     /// ENOUGH to free ~`needed` bytes (the decode's remaining deficit), leaving
     /// the rest of the LLM resident so it stays fast; `needed == 0` (or more than
     /// the LLM holds) migrates everything it can. Returns the device bytes freed.
     /// Runs on the DIFFUSION thread, so it binds the LLM context and is safe only
-    /// when the LLM is idle (else it declines — returns 0 — and the pipeline
+    /// when the LLM is idle (else it declines, returns 0, and the pipeline
     /// falls back to tiling / CPU). The `vram.Arbiter` promotes the layers back
-    /// back when the image queue drains (`vcExit` → the arbiter's rebalance).
+    /// back when the image queue drains (`vcExit` -> the arbiter's rebalance).
     pub fn imageReclaim(self: *Session, needed: u64) u64 {
         if (self.busy()) {
             std.log.info("[reclaim] declined: LLM is generating (can't migrate mid-decode)", .{});
@@ -1251,7 +1251,7 @@ pub const Session = struct {
 
     /// Adopt a transcript carried from a previous session and rebuild `ids` by
     /// replaying each turn's text into THIS model's tokenizer/chat template. KV
-    /// stays empty (len 0) — the next turn's prefill replays the whole context
+    /// stays empty (len 0), the next turn's prefill replays the whole context
     /// into the new model. `ids` must already hold the init prompt prefix
     /// (BOS + system), which a fresh session has. Image attachments are not
     /// re-encoded across a model swap (text is preserved; the model won't re-see
@@ -1264,7 +1264,7 @@ pub const Session = struct {
 
     /// Adopt a transcript AND its exact `ids` token sequence carried from an
     /// unload-while-paused suspend (Tier 3). Unlike `adoptTranscript`, this does
-    /// NOT replay/close the turns — it restores the raw `ids` verbatim (which may
+    /// NOT replay/close the turns, it restores the raw `ids` verbatim (which may
     /// end inside an OPEN assistant turn: prompt + partial response, no turn-end),
     /// so a subsequent worker reprefills all of `ids` (KV is empty on this fresh
     /// session) and continues decoding that same response. Takes ownership of
@@ -1278,10 +1278,10 @@ pub const Session = struct {
 
     /// Rebuild `ids` from scratch: the init prompt prefix + each message's
     /// ACTIVE variant replayed through this model's tokenizer/chat template.
-    /// The device context is NOT touched — callers either run on a fresh
+    /// The device context is NOT touched, callers either run on a fresh
     /// session (adopt: KV len 0, so the next prefill replays everything) or
     /// set `ctx_dirty` so the next turn's worker clears it first. Past image
-    /// turns replay as their text only (embeddings are not re-encoded — the
+    /// turns replay as their text only (embeddings are not re-encoded, the
     /// model won't re-see those images), the same accepted limitation as a
     /// model-swap adopt; the CURRENT turn's images are re-encoded for real on
     /// a regenerate (see `regenerate`).
@@ -1301,7 +1301,7 @@ pub const Session = struct {
 
     pub fn deinit(self: *Session) void {
         if (self.worker) |t| t.join();
-        // The diffusion engine is owned app-level, not here — the app stops it
+        // The diffusion engine is owned app-level, not here, the app stops it
         // (so no diffusion worker still touches a transcript GenImage) before
         // tearing the session down.
         for (self.attach_view.items) |gi| freeGenImage(self.gpa, gi);
@@ -1363,7 +1363,7 @@ pub const Session = struct {
     }
 
     /// Total KV-cache bytes for the current context (all attention layers,
-    /// logical footprint — K+V at the session's KV dtype) — what the context
+    /// logical footprint, K+V at the session's KV dtype), what the context
     /// "costs" in memory regardless of whether a given layer's KV lives on the
     /// GPU or the CPU.
     pub fn ctxKvBytes(self: *Session) u64 {
@@ -1441,7 +1441,7 @@ pub const Session = struct {
     }
 
     /// Attach an RGBA image (e.g. a generated one) to the next message so the
-    /// model can see it — converts to the RGB the encoder expects.
+    /// model can see it, converts to the RGB the encoder expects.
     pub fn attachRgba(self: *Session, rgba: []const u8, w: usize, h: usize) !void {
         if (!self.hasVit()) return;
         const px = w * h;
@@ -1457,7 +1457,7 @@ pub const Session = struct {
 
     /// Append a user turn and spawn the worker to stream the reply. No-op if a
     /// turn is already generating or there is nothing to send. Also refused while
-    /// a turn is staged but not yet running (queued while paused — Tier 2): the
+    /// a turn is staged but not yet running (queued while paused, Tier 2): the
     /// LLM runs one turn at a time, so a second submit would clobber the staged
     /// turn's data. The queued turn must run (on resume) or be canceled first.
     pub fn submit(self: *Session, text: []const u8) !void {
@@ -1498,7 +1498,7 @@ pub const Session = struct {
     }
 
     /// The checkpoint covering the CURRENT last turn's boundary, when one
-    /// exists — the fast-rollback target for regenerate/variant switch.
+    /// exists, the fast-rollback target for regenerate/variant switch.
     fn turnCheckpoint(self: *Session) ?*const Checkpoint {
         const tq = self.cur_turn_q orelse return null;
         for (self.checkpoints.items) |*cp| {
@@ -1509,10 +1509,10 @@ pub const Session = struct {
 
     /// Regenerate the LAST assistant response as a NEW variant (the › button
     /// on the newest variant). The displaced variant keeps its text AND its
-    /// images — an in-flight generation for it just keeps going in the
+    /// images, an in-flight generation for it just keeps going in the
     /// app-level engine's queue; nothing is canceled here. FAST path: roll
     /// the context back to this turn's checkpoint (O(snapshot), keeps all
-    /// prior KV — image embeddings included). FALLBACK (no checkpoint: arch
+    /// prior KV, image embeddings included). FALLBACK (no checkpoint: arch
     /// unsupported, disabled, or a swap-adopted transcript): re-stage the turn
     /// from the transcript and replay the whole context, re-encoding this
     /// turn's attachments through the real vision path. No-op while busy.
@@ -1545,7 +1545,7 @@ pub const Session = struct {
         if (self.template != null) {
             // Render-driven: the empty new variant drops from the render, so the
             // next build re-renders the same prompt and reconcile rewinds to the
-            // turn boundary — the fast rollback and the replay fallback collapse
+            // turn boundary, the fast rollback and the replay fallback collapse
             // into one path. Just stage the turn.
             self.turn_staged = true;
             self.mu.lockUncancelable(self.io);
@@ -1557,7 +1557,7 @@ pub const Session = struct {
         if (self.turnCheckpoint()) |cp| {
             // ids[0..ids_len) are byte-identical to what the boundary saw
             // (append-only within a turn; a variant switch re-derives the
-            // same tokens), so truncating is enough — the worker restores the
+            // same tokens), so truncating is enough, the worker restores the
             // snapshot on its own context-bound thread.
             std.log.info("[ckpt] regenerate (take {d}): fast rollback to boundary @tok {d}", .{
                 target.variants.items.len, cp.q,
@@ -1610,7 +1610,7 @@ pub const Session = struct {
     /// ‹/› navigation) and re-derive `ids` to match, so the next turn
     /// continues from the DISPLAYED response. FAST path (checkpoint live):
     /// swap just this turn's assistant text in `ids` and request a rollback
-    /// the next worker turn consumes — prior KV stays. FALLBACK: full
+    /// the next worker turn consumes, prior KV stays. FALLBACK: full
     /// transcript replay through a cleared context. No-op while generating,
     /// on a non-assistant tail, or for an out-of-range/unchanged index.
     pub fn selectVariant(self: *Session, idx: usize) void {
@@ -1619,7 +1619,7 @@ pub const Session = struct {
         const m = &self.messages.items[self.messages.items.len - 1];
         if (m.role != .assistant or idx >= m.variants.items.len or idx == m.cur) return;
         m.cur = idx;
-        // Render-driven: nothing to splice — the next turn re-renders the
+        // Render-driven: nothing to splice, the next turn re-renders the
         // transcript with this variant active and reconcile rewinds to match.
         if (self.template != null) {
             self.wake();
@@ -1655,7 +1655,7 @@ pub const Session = struct {
     /// generation worker for the already-staged turn.
     fn spawnWorker(self: *Session) !void {
         // Paused: leave the turn staged (the caller has already appended it) and
-        // don't run — no prefill, no decode — until resumed. `setPaused(false)`
+        // don't run, no prefill, no decode, until resumed. `setPaused(false)`
         // dispatches it then. This is the single gate covering every dispatch
         // site (submit, regenerate). The resume path calls spawnWorker only after
         // unpausing, so it isn't blocked here.
@@ -1697,7 +1697,7 @@ pub const Session = struct {
         // Snapshot this turn's boundary so it can be regenerated / switched
         // in O(snapshot) later. Non-fatal: without one, a later rollback just
         // takes the full-reprefill fallback. Skipped when `prepareTurn` already
-        // snapshotted at the pre-generation-prompt boundary — a second one here
+        // snapshotted at the pre-generation-prompt boundary, a second one here
         // would cost another 150 MiB and be the unusable-by-next-turn position.
         if (!self.turn_ckpt_done) self.takeCheckpoint();
 
@@ -1722,7 +1722,7 @@ pub const Session = struct {
                 // The footer's authoritative numbers for this take, replacing the
                 // live `progress` counters `poll` has been showing.
                 self.publishGenStats(n, timing);
-                // End-of-response telemetry, mirroring the CLI's summary line —
+                // End-of-response telemetry, mirroring the CLI's summary line,
                 // routed through std.log so it lands on the same channel the GUI
                 // already shows diffusion "gen:" progress on (dvui.App.logFn).
                 const dt = @as(f64, @floatFromInt(std.Io.Clock.real.now(self.io).nanoseconds - t0)) / 1e9;
@@ -1770,7 +1770,7 @@ pub const Session = struct {
         // truncate + restore the boundary snapshot. The caller already
         // arranged `ids`; the checkpoint cannot have been freed since (every
         // invalidation also clears `pending_restore`), so a miss is a logic
-        // error — surface it rather than limp into a corrupt context.
+        // error, surface it rather than limp into a corrupt context.
         if (self.pending_restore) |q| {
             self.pending_restore = null;
             const before_tok = self.ctxTokens();
@@ -1780,7 +1780,7 @@ pub const Session = struct {
                 if (cp.q != q) continue;
                 switch (self.arch) {
                     // The @hasDecl gate only satisfies future archs without
-                    // checkpoint support at comptime — takeCheckpoint never
+                    // checkpoint support at comptime, takeCheckpoint never
                     // records a boundary for them, so this path can't be
                     // reached at runtime (falls to CheckpointMissing if it is).
                     inline else => |*a| if (comptime @hasDecl(@TypeOf(a.model), "restoreCheckpoint")) {
@@ -1805,7 +1805,7 @@ pub const Session = struct {
         }
         // A fallback regenerate / variant switch rebuilt `ids` for a
         // transcript the device context no longer matches: clear the context
-        // (KV, recurrent state, ring positions — resetResidency is the one
+        // (KV, recurrent state, ring positions, resetResidency is the one
         // primitive that does this on every arch) so the prefill below
         // replays the whole rebuilt transcript.
         if (self.ctx_dirty) {
@@ -1818,7 +1818,7 @@ pub const Session = struct {
         }
         // Build the staged turn (image turns encode + inject inside) and
         // prefill everything but the last prompt token, so generation always
-        // starts from a well-defined boundary — the position takeCheckpoint
+        // starts from a well-defined boundary, the position takeCheckpoint
         // records. (After a fast rollback there is nothing left to prefill.)
         // Timed as one unit so the "prefill done" line covers a turn's whole
         // prompt processing, vision encode included.
@@ -1831,13 +1831,13 @@ pub const Session = struct {
         // Split the two halves: re-rendering the template and re-tokenizing the
         // whole transcript is CPU work that grows with the CONVERSATION, while
         // prefill scales with what is actually new. They look identical from the
-        // UI (both sit under "Processing…"), so a turn that feels slow with a
+        // UI (both sit under "Processing..."), so a turn that feels slow with a
         // short prompt is only diagnosable if they are timed apart.
         const t_built = std.Io.Clock.real.now(self.io).nanoseconds;
-        // ⚠️ Counted from the model's cache across the prefill call, NOT as a
+        // Counted from the model's cache across the prefill call, NOT as a
         // delta of `ctxTokens()` around the whole of prepareTurn. `buildTurn`'s
         // reconcile can REWIND (or clear) the context first, so the outer delta
-        // saturates to 0 on exactly the turns that did the most work — which is
+        // saturates to 0 on exactly the turns that did the most work, which is
         // how a full 2090-token transcript replay logged as "prefill 0 tok".
         var prefilled: usize = 0;
         const total = self.ids.items.len;
@@ -1875,9 +1875,9 @@ pub const Session = struct {
         self.publishPromptStats(prefilled, @intCast(t_end - t0));
         const build_ms = @as(f64, @floatFromInt(t_built - t0)) / 1e6;
         const pre_s = @as(f64, @floatFromInt(t_end - t_built)) / 1e9;
-        // ⚠️ Logged even when `prefilled == 0`. A cached-prefix turn still spends
+        // Logged even when `prefilled == 0`. A cached-prefix turn still spends
         // real time here (render + tokenize), and reporting nothing is what made
-        // that time look like an unexplained stall behind "Processing…".
+        // that time look like an unexplained stall behind "Processing...".
         if (prefilled > 0 or t_end - t0 > 2 * std.time.ns_per_ms) {
             std.log.info("[llm] turn prep: build {d:.0} ms · prefill {d} tok in {d:.2}s ({d:.0} tok/s) · ctx now {d} tok", .{
                 build_ms, prefilled, pre_s,
@@ -1889,7 +1889,7 @@ pub const Session = struct {
 
     /// The context window as the footer reports it: how many rows the KV cache
     /// has COMMITTED (it starts at 4096 and grows lazily) and the session's
-    /// ceiling. Two different numbers, and the gap is the point — a chat sitting
+    /// ceiling. Two different numbers, and the gap is the point, a chat sitting
     /// at 3.9k/4k tokens is nowhere near its 128k limit, it is one token from
     /// the next growth step.
     fn ctxCaps(self: *Session) struct { cap: usize, max: usize } {
@@ -1905,8 +1905,8 @@ pub const Session = struct {
     }
 
     /// Publish the turn's prompt half for the message footers (worker thread,
-    /// end of `prepareTurn`). The assistant's copy carries the context BASE —
-    /// `poll` adds the tokens generated since — and its generation half is
+    /// end of `prepareTurn`). The assistant's copy carries the context BASE,
+    /// `poll` adds the tokens generated since, and its generation half is
     /// overwritten with the authoritative numbers when the turn ends. The user
     /// message's copy is published only for a fresh turn (see `user_stats`).
     fn publishPromptStats(self: *Session, prefilled: usize, prefill_ns: u64) void {
@@ -1942,7 +1942,7 @@ pub const Session = struct {
         self.turn_stats.decode_ns = t.decode_ns;
         // `t.prefill_*` is deliberately NOT folded in. `prepareTurn` prefills
         // everything but the last prompt token, so what `generate` prefills is
-        // that ONE token — a decode-shaped forward, not prompt processing.
+        // that ONE token, a decode-shaped forward, not prompt processing.
         // Folding it in would report "prefill 33 tok/s" for a regenerate whose
         // prompt was entirely cached, which describes nothing.
         self.turn_stats.ctx_tokens = ctx;
@@ -1960,7 +1960,7 @@ pub const Session = struct {
 
     /// Render-driven turn (TODO #1): render the whole transcript through the
     /// model's chat_template (stripping prior-turn thoughts), then reconcile the
-    /// committed KV with the render — rewind to the longest common prefix (which
+    /// committed KV with the render, rewind to the longest common prefix (which
     /// for a stripped thought is the previous turn's boundary) and leave `ids` =
     /// the rendered prompt for prepareTurn to prefill from `cached()`. Drops the
     /// trailing in-flight assistant slot (add_generation_prompt opens it).
@@ -2010,7 +2010,7 @@ pub const Session = struct {
 
     fn buildRenderedTurn(self: *Session) !void {
         // Encode this turn's attached images (fresh submit only; a regenerate
-        // re-stages none — its image sits before the rollback boundary and is
+        // re-stages none, its image sits before the rollback boundary and is
         // preserved in the KV). Image turns must run on the GPU (M-RoPE), so
         // promote any CPU-offloaded layers back first.
         var cur_embeds: std.ArrayList(EncImg) = .empty;
@@ -2088,9 +2088,9 @@ pub const Session = struct {
             std.log.info("[tmpl] rendered prompt ({d} tok):\n{s}\n[tmpl] end", .{ desired.items.len, dbg });
         }
         // Does this render leave the reasoning block OPEN? A model's own template
-        // primes `…assistant\n<think>\n` when thinking is on (and the CLOSED
+        // primes `...assistant\n<think>\n` when thinking is on (and the CLOSED
         // `<think>\n\n</think>` when it is off), so the answer differs per template
-        // AND per setting — hence measured from the render, never assumed. Only the
+        // AND per setting, hence measured from the render, never assumed. Only the
         // tail is scanned so an earlier turn quoting `</think>` cannot decide it.
         self.recordThoughtPrimed(desired.items);
         self.turn_ckpt_q = self.safeCheckpointQ(ropts, desired.items.len);
@@ -2127,7 +2127,7 @@ pub const Session = struct {
     /// How many prompt tokens this turn's user message contributes: render the
     /// same transcript with that message EMPTIED (no text, no image parts) and
     /// diff against the full render's `full_len`. So it counts the message's own
-    /// content — its text and its image pad rows — but not the per-turn wrapper
+    /// content, its text and its image pad rows, but not the per-turn wrapper
     /// the template pays for any message at all.
     ///
     /// A second render rather than arithmetic on the first, because the template
@@ -2136,16 +2136,16 @@ pub const Session = struct {
     /// instead would be wrong by the previous reply's thought, which this turn's
     /// render strips.
     ///
-    /// ⚠️ **Emptied, not removed**, and that is not a stylistic choice: a real
+    /// Emptied, not removed, and that is not a stylistic choice: a real
     /// chat template can REFUSE to render a transcript with the last user turn
-    /// dropped. Qwen3.5's raises `No user query found in messages` — so on the
+    /// dropped. Qwen3.5's raises `No user query found in messages`, so on the
     /// first turn, where removing it leaves only the system message, the obvious
     /// version of this measurement fails on exactly the turn a user is most
     /// likely to be looking at. Emptying keeps the message list legal on every
     /// turn and keeps ONE definition for all of them.
     ///
-    /// Cost is a render + tokenize with no forward pass — small next to the
-    /// prefill it labels — and it is skipped for a regenerate, whose prompt is
+    /// Cost is a render + tokenize with no forward pass, small next to the
+    /// prefill it labels, and it is skipped for a regenerate, whose prompt is
     /// already measured. Returns 0 (the footer omits the figure) if anything
     /// fails: a measurement must never be able to kill the turn it measures.
     fn measureTurnPrompt(
@@ -2158,7 +2158,7 @@ pub const Session = struct {
     ) usize {
         if (!self.fresh_user_turn) return 0;
         if (msgs.len < 2 or msgs[msgs.len - 1].role != .user) return 0;
-        // Grids are collected in message order, so this turn's are the tail —
+        // Grids are collected in message order, so this turn's are the tail,
         // and they leave with the message they belong to.
         const n = self.messages.items.len;
         const cur = if (n >= 2 and self.messages.items[n - 2].role == .user)
@@ -2207,7 +2207,7 @@ pub const Session = struct {
 
     /// Rewind the model's committed KV so it holds only the longest prefix it
     /// shares with `desired`, so prepareTurn re-prefills exactly the tail that
-    /// changed (a stripped thought → just the prior answer + this turn). Uses
+    /// changed (a stripped thought -> just the prior answer + this turn). Uses
     /// `truncate` (append-only attention) for an exact rewind, else the nearest
     /// turn-boundary checkpoint ≤ d (SWA/recurrent), else a full reset.
     fn reconcile(self: *Session, model: anytype, desired: []const u32) !void {
@@ -2216,7 +2216,7 @@ pub const Session = struct {
         // Compare against the COMMITTED prefix only (ids may hold uncommitted
         // trailing tokens from a prior closeAssistant). Clamp to desired.len-1 so
         // ≥1 prompt token stays uncommitted for generate to forward (the caller
-        // prefills all-but-last) — matters when `desired` is a prefix of what's
+        // prefills all-but-last), matters when `desired` is a prefix of what's
         // committed (regenerate: same prompt, drop the old reply).
         const lcp = lcpLen(self.ids.items[0..@min(cached, self.ids.items.len)], desired);
         const d = @min(lcp, desired.len -| 1);
@@ -2249,19 +2249,18 @@ pub const Session = struct {
     /// Where this turn's checkpoint must be taken: the position just BEFORE the
     /// template's generation prompt, or null to keep the old behaviour.
     ///
-    /// ⚠️ **This exists because the obvious boundary — `cached()` after prefill —
-    /// is a few tokens TOO LATE, and that silently cost a full transcript replay
-    /// on every turn of a hybrid model.** Next turn re-renders the history with
-    /// this turn's reply in place of the generation prompt (and, with reasoning
-    /// on, with the thought stripped), so `reconcile`'s divergence point `d`
-    /// lands exactly where `…assistant\n<think>\n` began. A snapshot taken at
-    /// `cached()` sits PAST that, fails `cp.q <= d`, and drops `reconcile` all
-    /// the way through to `resetResidency` — measured on Bonsai-27B as 2090 and
-    /// then 2644 tokens re-prefilled on turns 2 and 3, 4.6 s and 5.7 s.
+    /// The obvious boundary, `cached()` after prefill, is a few tokens TOO LATE and
+    /// silently costs a full transcript replay on every turn of a hybrid model. Next
+    /// turn re-renders the history with this turn's reply in place of the generation
+    /// prompt (and, with reasoning on, the thought stripped), so `reconcile`'s
+    /// divergence point `d` lands where the generation prompt began. A snapshot at
+    /// `cached()` sits PAST that, fails `cp.q <= d`, and drops `reconcile` through to
+    /// `resetResidency`: measured as 2090 then 2644 tokens re-prefilled on turns 2 and
+    /// 3 of a 27B model, 4.6 s and 5.7 s.
     ///
     /// Only for archs that cannot `truncate` (recurrent/SWA: qwen35, gemma3,
-    /// gemma4). ⚠️ **qwen3 and any other append-only-attention arch is left
-    /// completely alone** — `reconcile` rewinds those exactly with `truncate`,
+    /// gemma4). qwen3 and any other append-only-attention arch is left
+    /// completely alone, `reconcile` rewinds those exactly with `truncate`,
     /// needs no checkpoint to do it, and must not start paying for a split
     /// prefill or an extra render to fix a problem it does not have.
     ///
@@ -2295,10 +2294,10 @@ pub const Session = struct {
     /// Build this turn's tokens. Text-only turns just append (prepareTurn
     /// prefills); image turns encode each image (the arch's vision tower on
     /// CUDA), build the interleaved vision token layout, and inject the
-    /// embeddings at their pad rows — mirroring `llm_main.imageTurn`.
+    /// embeddings at their pad rows, mirroring `llm_main.imageTurn`.
     fn buildTurn(self: *Session) !void {
         if (self.template != null) {
-            // Render-driven path — handles text AND image turns (encodes this
+            // Render-driven path, handles text AND image turns (encodes this
             // turn's images, expands the template's image placeholders to the
             // real pad-row block, and splices embeds in during prefill). It
             // measures its own prompt contribution (the render is wholesale).
@@ -2354,9 +2353,9 @@ pub const Session = struct {
         try session.prefillImageTurn(&a.model, &self.tok, self.gpa, &self.ids, segs.items, encs.items);
     }
 
-    /// imageTurn for gemma4: encode each image with the active tower — the
+    /// imageTurn for gemma4: encode each image with the active tower, the
     /// "gemma4uv" unified embedder runs device-side via gemma4_vit_cuda, the
-    /// "gemma4v" SigLIP tower on CPU — then inject the projected embeddings into
+    /// "gemma4v" SigLIP tower on CPU, then inject the projected embeddings into
     /// the LLM at their placeholder rows. Otherwise identical to imageTurn.
     fn imageTurnGemma4(self: *Session, a: anytype) !void {
         // Both towers' Encoded types are structurally identical; a local struct
@@ -2399,10 +2398,10 @@ pub const Session = struct {
     /// Snapshot the current turn boundary (worker thread, right after
     /// prepareTurn) so this turn can be rolled back in O(snapshot) instead of
     /// a full re-prefill. All three GUI archs support checkpoints (qwen35:
-    /// recurrent conv/ssm state; gemma3/gemma4: the SWA rings) — the @hasDecl
+    /// recurrent conv/ssm state; gemma3/gemma4: the SWA rings), the @hasDecl
     /// gate future-proofs new archs. Skipped when this boundary already has
     /// one (a fast regenerate lands on the same q). The NEWEST checkpoint is
-    /// always kept whatever the budget — the last turn must stay instantly
+    /// always kept whatever the budget, the last turn must stay instantly
     /// regenerable; the budget bounds how many OLDER boundaries survive as
     /// future branch points. `cur_turn_q` records whether the CURRENT turn is
     /// fast-rollback-capable.
@@ -2432,8 +2431,8 @@ pub const Session = struct {
                     self.gpa.free(snap);
                     return;
                 };
-                // Eviction only ever drops OLDER boundaries (the newest — this
-                // one — is always kept, whatever the budget), so the current
+                // Eviction only ever drops OLDER boundaries (the newest, this
+                // one, is always kept, whatever the budget), so the current
                 // turn is now fast-rollback-capable unconditionally.
                 const n_before = self.checkpoints.items.len;
                 evictCheckpointsToBudget(self.gpa, &self.checkpoints, self.checkpoint_budget);
@@ -2444,11 +2443,11 @@ pub const Session = struct {
                     });
                 }
                 self.cur_turn_q = q;
-                // ⚠️ Timed: this is a device->host copy of the whole recurrent
-                // state (~157 MiB on Bonsai-27B — 48 DeltaNet layers x 3.1 MiB of
+                // Timed: this is a device->host copy of the whole recurrent
+                // state (~157 MiB on Bonsai-27B, 48 DeltaNet layers x 3.1 MiB of
                 // ssm state) plus a host allocation of the same size, and it runs
                 // on EVERY turn between prefill and the first token. It is inside
-                // the "Processing…" window but is not prefill, so without this
+                // the "Processing..." window but is not prefill, so without this
                 // number it is invisible.
                 std.log.info("[ckpt] saved turn boundary @tok {d} ({d:.1} MiB in {d:.0} ms) · {d} in cache, {d:.1}/{d} MiB used", .{
                     q,                          mib(snap.len),
@@ -2500,7 +2499,7 @@ pub const Session = struct {
         }
     }
 
-    /// Fold the prompt half into the user message this turn was built from —
+    /// Fold the prompt half into the user message this turn was built from,
     /// the one before the in-flight assistant slot. UI thread (`poll`), which
     /// is the only thread allowed to touch `messages`.
     fn applyUserStats(self: *Session, s: TurnStats) void {
@@ -2525,12 +2524,12 @@ pub const Session = struct {
             s.decode_tokens = p.timing.decode_tokens;
             s.decode_ns = p.timing.decode_ns;
             // `base.ctx_tokens` is the context at generation start (the last
-            // prompt token is still uncommitted — `generate` forwards it), so
+            // prompt token is still uncommitted, `generate` forwards it), so
             // this trails the truth by one token until the final publish.
             s.ctx_tokens = base.ctx_tokens + p.emitted;
         }
         // The committed capacity grows DURING a long reply (ensureCapacity), and
-        // the value published at prefill time is the one before that growth —
+        // the value published at prefill time is the one before that growth,
         // clamp so the readout can never show more tokens than cap.
         s.ctx_cap = @max(s.ctx_cap, s.ctx_tokens);
         last.active().stats = s;
@@ -2580,7 +2579,7 @@ pub const Session = struct {
     /// attributes (width/height/steps/seed) override the engine defaults.
     fn scanImageCalls(self: *Session, v: *Variant, d: *diffuser.Diffuser) !void {
         // Scan only the answer, not the reasoning block, and only line-anchored
-        // tags — see toolcall.answerText/nextImageCall for why (spurious fires
+        // tags, see toolcall.answerText/nextImageCall for why (spurious fires
         // from the model merely *mentioning* the tag while thinking/explaining).
         var rest = toolcall.answerText(v.text.items, reasoningMarkers(), v.thought_primed);
         while (true) {
@@ -2601,7 +2600,7 @@ pub const Session = struct {
                 };
                 parseGenAttrs(c.attrs, gi);
                 // Assign a fresh, distinct seed now (unless the tag set one
-                // explicitly) so it's known and displayable immediately — even
+                // explicitly) so it's known and displayable immediately, even
                 // while the image is still queued. Advancing per image keeps
                 // repeated generations varied.
                 if (gi.req_seed == 0) gi.req_seed = d.nextSeed();
@@ -2618,12 +2617,12 @@ pub const Session = struct {
 // ── Tests (pure, CPU-only; run via `zig build gui-test`) ─────────────────────
 
 test "resolveMaxNew: 0 means the context ceiling, any other value passes through" {
-    // 0 = "no explicit cap" resolves to the context ceiling — the exact upper
+    // 0 = "no explicit cap" resolves to the context ceiling, the exact upper
     // bound on one turn's output, and never a sentinel that could overflow
     // engine.capacityPlanFor's `prompt_len + max_new_tokens`.
     try std.testing.expectEqual(@as(usize, 32768), resolveMaxNew(0, 32768));
     // A set cap is used verbatim, including one ABOVE the context (the engine
-    // stops on ContextFull first, so this must not be silently clamped here —
+    // stops on ContextFull first, so this must not be silently clamped here,
     // clamping would make "unlimited" and "larger than context" differ).
     try std.testing.expectEqual(@as(usize, 2048), resolveMaxNew(2048, 32768));
     try std.testing.expectEqual(@as(usize, 99999), resolveMaxNew(99999, 4096));
@@ -2659,7 +2658,7 @@ test "checkpoint budget: oldest evicted first; an oversize newest is dropped too
     evictCheckpointsToBudget(gpa, &list, 250); // oldest (q=10) goes
     try std.testing.expectEqual(@as(usize, 2), list.items.len);
     try std.testing.expectEqual(@as(usize, 20), list.items[0].q);
-    // Below a single snapshot (even 0): the NEWEST is always kept — the last
+    // Below a single snapshot (even 0): the NEWEST is always kept, the last
     // turn must stay instantly regenerable; the budget bounds only the extras.
     evictCheckpointsToBudget(gpa, &list, 50);
     try std.testing.expectEqual(@as(usize, 1), list.items.len);

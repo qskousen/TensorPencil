@@ -2,7 +2,7 @@
 //! head restride) checked against their CPU references. Lives in the model tier
 //! (not the gpu backend) because it depends on both the gpu backend
 //! (`tp_gpu.cuda.Backend`) and a model's CPU reference (`vit35.applyVisionRope`),
-//! which the gpu module — a lower layer — cannot import. Self-skips without a
+//! which the gpu module, a lower layer, cannot import. Self-skips without a
 //! CUDA device / the integration build.
 
 const std = @import("std");

@@ -1,18 +1,18 @@
 //! Cooperative pause for long-running generation loops.
 //!
 //! The sibling of `ops/cancel.zig`: wherever a loop polls its cancel flag at a
-//! clean boundary — between diffusion sampling steps, between decoded tokens —
+//! clean boundary, between diffusion sampling steps, between decoded tokens,
 //! it can also consult a pause `Gate`. Where cancel *unwinds* the loop, pause
 //! *parks* it: a paused worker blocks on the gate at the boundary, holding its
 //! in-flight state (and, by default, its VRAM) until it is unpaused.
 //!
-//! Unlike cancel, pause is NEVER polled mid-kernel — parking inside a matmul
+//! Unlike cancel, pause is NEVER polled mid-kernel, parking inside a matmul
 //! would strand half-computed state and held locks. It is a coarse,
 //! loop-boundary primitive, so there is no threadlocal token: the loop simply
 //! holds a `*Gate` (in its Options) and calls `checkpoint()` at the same points
 //! it checks cancel.
 //!
-//! One Gate per worker (the LLM decode worker, the diffusion worker) — mirroring
+//! One Gate per worker (the LLM decode worker, the diffusion worker), mirroring
 //! cancel's per-worker isolation, so pausing one engine never parks the other.
 //! The UI exposes an independent pause button per model (next to each unload
 //! button), each driving its own gate.
@@ -49,7 +49,7 @@ pub const Gate = struct {
         /// The cancel flag passed to `checkpoint` went true while parked: the
         /// caller should unwind exactly as it would for a normal cancel. Lets a
         /// UI stop a *paused* generation without unpausing the gate (which would
-        /// desync the pause button) — the parked worker is woken by `wake()`,
+        /// desync the pause button), the parked worker is woken by `wake()`,
         /// sees the cancel here, and exits.
         canceled,
     };
@@ -58,7 +58,7 @@ pub const Gate = struct {
     /// not paused. While paused, blocks (no CPU spin) until one of: the cancel
     /// flag goes true (`.canceled`), an unload is requested (`.unload`), or the
     /// gate is unpaused (`.proceed`). `cancel` is the same flag the loop polls
-    /// itself — passing it lets a cancel land on a *parked* worker.
+    /// itself, passing it lets a cancel land on a *parked* worker.
     pub fn checkpoint(self: *Gate, io: Io, cancel: ?*std.atomic.Value(bool)) Outcome {
         self.mu.lockUncancelable(io);
         defer self.mu.unlock(io);
@@ -106,7 +106,7 @@ pub const Gate = struct {
         self.cond.broadcast(io);
     }
 
-    /// Re-evaluate parked workers WITHOUT changing the pause state — used to
+    /// Re-evaluate parked workers WITHOUT changing the pause state, used to
     /// deliver a cancel to a `checkpoint()` waiter (it will re-read its cancel
     /// flag and return `.canceled`). Unlike `unpause`, leaves `paused` set so the
     /// UI pause button stays in sync.

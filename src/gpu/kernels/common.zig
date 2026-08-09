@@ -5,9 +5,9 @@
 //! y[m, rows] = x[m, cols] @ W^T (+ bias). The weight buffer holds W
 //! TRANSPOSED to k-major with the output dimension padded to a multiple of 4
 //! (`w_stride`): element (k, col) sits at k * w_stride + col. That makes
-//! reads coalesced without workgroup shared memory — deliberately, since the
-//! NVIDIA 580 driver faults on Zig-emitted workgroup-storage kernels (see
-//! ZIG.md). Each thread computes a tm x tn register tile instead.
+//! reads coalesced without workgroup shared memory, deliberately, since the
+//! NVIDIA 580 driver faults on Zig-emitted workgroup-storage kernels. Each thread
+//! computes a tm x tn register tile instead.
 //!
 //! Bindings (set 0): 0 = W (u32 words: fp8 bytes or f32 bits), 1 = x,
 //! 2 = y, 3 = bias. Workgroup size is patched in at load time (spv.zig);

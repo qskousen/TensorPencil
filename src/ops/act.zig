@@ -124,7 +124,7 @@ pub inline fn geluQuickScalar(x: f32) f32 {
     return x * sigmoidScalar(1.702 * x);
 }
 
-/// Plain (ungated) quick-GELU, in place — CLIP's text-encoder MLP, whose two
+/// Plain (ungated) quick-GELU, in place, CLIP's text-encoder MLP, whose two
 /// linears are sequential rather than gated, so there is no `up` to multiply by.
 pub fn geluQuick(xs: []f32) void {
     const c: Vec = @splat(1.702);
@@ -136,7 +136,7 @@ pub fn geluQuick(xs: []f32) void {
     while (i < xs.len) : (i += 1) xs[i] = geluQuickScalar(xs[i]);
 }
 
-/// Plain (ungated) exact-erf GELU, in place — CLIP-G's MLP (SDXL's second tower)
+/// Plain (ungated) exact-erf GELU, in place, CLIP-G's MLP (SDXL's second tower)
 /// uses the erf form where CLIP-L uses the sigmoid approximation above. They differ
 /// by ~1e-3 at the peak, which is small enough to look like rounding and large
 /// enough to move a 32-layer tower's output.

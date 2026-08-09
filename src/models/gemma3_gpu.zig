@@ -1,5 +1,5 @@
 //! Gemma 3 on the Vulkan backend (tp-llm --backend vulkan). Text-only, fixed
-//! KV capacity, one token at a time — a port of gemma3_cuda.zig that reuses
+//! KV capacity, one token at a time, a port of gemma3_cuda.zig that reuses
 //! the validated block-quant GEMV + RoPE + attention Context ops, mirroring
 //! qwen35_gpu's structure.
 //!
@@ -77,8 +77,8 @@ pub const VulkanLM = struct {
     /// KV-cache element storage type (f32 / f16); selects the attention kernel
     /// variant and halves the per-element cache stride.
     kv_dtype: kvmod.KvDtype,
-    /// Fold decode attention (dsplit+dmerge → one subgroup-reduce pass,
-    /// opAttnDecodeSg) — f32 KV only; opt-in via TP_VK_SG_ATTN.
+    /// Fold decode attention (dsplit+dmerge -> one subgroup-reduce pass,
+    /// opAttnDecodeSg), f32 KV only; opt-in via TP_VK_SG_ATTN.
     use_sg_attn: bool = false,
     /// Set (to the block end position) only while an image block is prefilling:
     /// `attention` passes it as the bidirectional kv_end so each image query
@@ -101,7 +101,7 @@ pub const VulkanLM = struct {
     /// Block-resident hidden [max_image_tokens * hidden] and rope'd Q
     /// [max_image_tokens * qDim] for the two-phase bidirectional image prefill
     /// (Vulkan is single-query, so the block is driven token-by-token but with
-    /// all K/V committed before any attention — see prefillImage).
+    /// all K/V committed before any attention, see prefillImage).
     block_x: Buf,
     block_q: Buf,
 
@@ -196,7 +196,7 @@ pub const VulkanLM = struct {
     pub fn vocab(self: *const VulkanLM) usize {
         return self.cfg.vocab;
     }
-    /// Device VRAM (bytes) this Vulkan context has allocated — the analog of the
+    /// Device VRAM (bytes) this Vulkan context has allocated, the analog of the
     /// CUDA backend's `deviceUsed()`, for the end-of-response telemetry.
     pub fn vramUsed(self: *const VulkanLM) u64 {
         return self.ctx.device_used;
@@ -241,7 +241,7 @@ pub const VulkanLM = struct {
         try self.ctx.tensorDownload(self.logits, std.mem.sliceAsBytes(logits));
     }
 
-    /// Prefill text tokens (no logits) — for interleaving with prefillImage.
+    /// Prefill text tokens (no logits), for interleaving with prefillImage.
     pub fn prefill(self: *VulkanLM, ids: []const u32) !void {
         const cfg = self.cfg;
         const xh = try self.gpa.alloc(f32, cfg.hidden);
@@ -317,8 +317,8 @@ pub const VulkanLM = struct {
     }
 
     // --- transformer_gpu.decoderLayer stepper methods (faithful lift of the
-    // former decodeBody inline loop; seq is 1 here — Vulkan gemma3 decodes one
-    // token at a time — but written in terms of `seq` for the contract). ---
+    // former decodeBody inline loop; seq is 1 here, Vulkan gemma3 decodes one
+    // token at a time, but written in terms of `seq` for the contract). ---
 
     pub fn normInput(self: *VulkanLM, layer: anytype, seq: usize) !void {
         try self.rms(self.x, self.normed, layer.input_norm, seq, self.cfg.hidden);
@@ -349,7 +349,7 @@ pub const VulkanLM = struct {
         const cfg = self.cfg;
         const kvdim = cfg.kvDim();
         // In-batch device copy: dst[u2+i] = src[i]. LOCAL ring layers store at
-        // row pos0%ring (single row per forward — no wrap to split).
+        // row pos0%ring (single row per forward, no wrap to split).
         const row = if (usesRing(cfg, l)) pos0 % localRingRows(cfg) else pos0;
         switch (self.kv_dtype) {
             .f16 => {

@@ -6,7 +6,7 @@
 //! timestep MLPs, patchify, unpatchify) stay on the CPU.
 //!
 //! Numerics match `DiT.forward` up to floating-point reordering (int8 quant +
-//! ex2.approx softmax) — the same regime the Vulkan int8 path runs in.
+//! ex2.approx softmax), the same regime the Vulkan int8 path runs in.
 
 const std = @import("std");
 const dit = @import("dit.zig");
@@ -36,11 +36,11 @@ const eps: f32 = 1e-5;
 
 /// MLP sequence-tile: the gate/up/down GEMMs run over chunks of this many rows
 /// so the mg/mu intermediates are [tile][mlp_dim] instead of [seq][mlp_dim]
-/// (512 MiB → 128 MiB each at 1 MP). The MLP is per-row so chunks are independent.
+/// (512 MiB -> 128 MiB each at 1 MP). The MLP is per-row so chunks are independent.
 const mlp_tile: usize = 2048;
 
 /// A device-buffer sub-view offset `off_bytes` into `b` (CUDA buffers are raw
-/// pointers, so a mid-buffer view is just pointer arithmetic — the eltwise/GEMM
+/// pointers, so a mid-buffer view is just pointer arithmetic, the eltwise/GEMM
 /// kernels index from the given base).
 fn offsetBuf(b: DeviceBuffer, off_bytes: usize) DeviceBuffer {
     return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off_bytes), .mem = .null_handle, .size = b.size - off_bytes };
@@ -48,7 +48,7 @@ fn offsetBuf(b: DeviceBuffer, off_bytes: usize) DeviceBuffer {
 
 /// Zero bias for the block linears (they have none, but opMatmulBf16 always
 /// folds a bias in). A file-scope constant so every GEMM width shares one stable
-/// host pointer — cachedWeight then caches it once at the widest slice.
+/// host pointer, cachedWeight then caches it once at the widest slice.
 const zero_bias: [mlp_dim]f32 = @splat(0);
 
 /// Weight class of the DiT block linears. A convrot checkpoint is int8/int4
@@ -76,7 +76,7 @@ fn linPrep(be: *Backend, kind: LinKind, x: DeviceBuffer, m: usize, cols: usize) 
 
 /// One block linear y[m][rows] f32 = x[m][cols] @ Wᵀ. int8/int4 read the prepped
 /// activation state (`x` is ignored); bf16 runs the f32-in/f32-out f16
-/// tensor-core GEMM (opMatmulBf16, weight bf16→f16 at upload) with a zero bias.
+/// tensor-core GEMM (opMatmulBf16, weight bf16->f16 at upload) with a zero bias.
 /// fp8 streams the weight, dequants it to an f16 scratch (per-tensor `w.scale`
 /// folded in) and runs the same validated hgemm. Block linears carry no bias, so
 /// `bias` is unused for the bf16/fp8 GEMMs (they all pass the shared zero_bias).
@@ -87,7 +87,7 @@ fn lin(be: *Backend, kind: LinKind, y: DeviceBuffer, x: DeviceBuffer, m: usize, 
         .i8, .w4a8 => try i8GemmW(be, y, w, false),
         // Ampere+ feeds raw bf16 straight to the tensor cores (no f16 convert, so
         // a streamed weight is touched once); older cards fall back to the
-        // GPU-side bf16→f16 GEMM.
+        // GPU-side bf16->f16 GEMM.
         .bf16 => if (be.ctx.cc_major >= 8)
             try be.opGemmBf16(y, x, m, w.bytes, w.rows, w.cols, bias[0..w.rows])
         else
@@ -110,21 +110,21 @@ fn lin(be: *Backend, kind: LinKind, y: DeviceBuffer, x: DeviceBuffer, m: usize, 
 /// Feed `ops.matmul.probe` this GEMM's input, so an activation capture works when
 /// the DiT runs on CUDA.
 ///
-/// The hook exists here because **this backend never goes through `ops.matmul`** —
-/// it owns its upload and GEMM — so the CPU probe call site sees nothing at all on a
+/// The hook exists here because this backend never goes through `ops.matmul`,
+/// it owns its upload and GEMM, so the CPU probe call site sees nothing at all on a
 /// GPU run. `lin` is the single choke point for all 224 block linears (the same role
 /// `Loader.mat` plays for tagging), so one call covers every one of them.
 ///
-/// ⚠️ **int8/int4 are skipped, not captured.** `linPrep` has already rotated and
+/// int8/int4 are skipped, not captured. `linPrep` has already rotated and
 /// quantized `x` in place by the time a GEMM runs, so the buffer no longer holds the
-/// f32 activation — recording it would be a W4A4-shaped number filed as a weight-only
+/// f32 activation, recording it would be a W4A4-shaped number filed as a weight-only
 /// one (ACTIVATION_AWARE hygiene rule 4). The capture driver refuses those
 /// checkpoints outright rather than relying on this returning quietly.
 ///
-/// The activation is **downloaded and handed to the same host accumulator a CPU
-/// capture uses**, rather than reduced on device. That is deliberate for a first
+/// The activation is downloaded and handed to the same host accumulator a CPU
+/// capture uses, rather than reduced on device. That is deliberate for a first
 /// version: the statistics then come out of identical f64 code, so a GPU-captured
-/// cache differs from a CPU one only by the DiT's own GEMM arithmetic — which is the
+/// cache differs from a CPU one only by the DiT's own GEMM arithmetic, which is the
 /// open question, not a confound in it. It costs one `cuStreamSynchronize` plus
 /// `m × cols × 4 B` over PCIe per linear; if that ever dominates a capture, the
 /// reduction moves onto the device and this shrinks to a small download.
@@ -142,7 +142,7 @@ fn probeInput(be: *Backend, x: DeviceBuffer, m: usize, w: anytype) !void {
 /// One int8-convrot GEMM, dispatching on how the weight is STORED rather than on the
 /// model's `LinKind`: a plain int8 weight goes straight to the GEMM, a packed W4A8 one
 /// is decoded into the backend's transient scratch first. Both then run the identical
-/// int8 kernel, so this is the only place the two storage forms differ — and dispatching
+/// int8 kernel, so this is the only place the two storage forms differ, and dispatching
 /// per weight rather than per model means a checkpoint that mixes them computes
 /// correctly even though krea2's `LinKind` is still one value for the whole trunk.
 fn i8GemmW(be: *Backend, y: DeviceBuffer, w: anytype, c_h16: bool) !void {
@@ -172,7 +172,7 @@ fn probeLinInput(be: *Backend, kind: LinKind, x: DeviceBuffer, m: usize, w: anyt
 }
 
 /// Use the tensor-core GQA attention path (hgemm+softmax_row) instead of the
-/// naive one-thread-per-(q,head) kernel. On by default — it is O(seq²) faster on
+/// naive one-thread-per-(q,head) kernel. On by default, it is O(seq²) faster on
 /// the tensor cores and the naive path is O(seq²) latency-bound. Toggle for A/B.
 pub var use_tc_attn: bool = true;
 
@@ -180,7 +180,7 @@ pub var use_tc_attn: bool = true;
 //
 // The int8/int4 convrot checkpoints leave the text-fusion stack unquantized
 // (BF16 attn/mlp, F32 projector/txtmlp). Run on the CPU it is ~2 TFLOP of dense
-// GEMM — the entire "loading diffusion model" stall on --backend zig-cuda. This
+// GEMM, the entire "loading diffusion model" stall on --backend zig-cuda. This
 // mirrors DiT.txtFusion+textTokens on the backend: BF16 weights are dequantized
 // to f32 once and fed through the f32 `opMatmul` (no int GEMM applies here); the
 // block is the plain (no modulation, no RoPE) variant of the sampling block.
@@ -196,7 +196,7 @@ fn txtF32(arena: std.mem.Allocator, w: anytype) ![]const u8 {
 }
 
 /// Device scratch for the text-fusion blocks, sized for the widest phase (the
-/// layerwise blocks over seq_txt·12 rows). Reused by the refiner and txtmlp.
+/// layerwise blocks over seq_txt*12 rows). Reused by the refiner and txtmlp.
 const TxtScratch = struct {
     normed: DeviceBuffer,
     q: DeviceBuffer,
@@ -205,7 +205,7 @@ const TxtScratch = struct {
     g: DeviceBuffer,
     attn: DeviceBuffer,
     t1: DeviceBuffer,
-    gate: DeviceBuffer, // also holds txtmlp mid (seq_txt·6144 ≤ rows_lw·6912)
+    gate: DeviceBuffer, // also holds txtmlp mid (seq_txt*6144 ≤ rows_lw*6912)
     up: DeviceBuffer, // also holds txtmlp out
 
     fn init(be: *Backend, rows_lw: usize) !TxtScratch {
@@ -234,7 +234,7 @@ const TxtScratch = struct {
 fn txtGemm(be: *Backend, arena: std.mem.Allocator, y: DeviceBuffer, x: DeviceBuffer, m: usize, w: anytype, out: usize, in: usize, bias: []const f32) !void {
     // The second probe choke point: every txtfusion linear and both txtmlp linears
     // come through here, and a capture that recorded only the 224 block linears
-    // would be missing 34 of the model's 263 measurable layers — a cache that looks
+    // would be missing 34 of the model's 263 measurable layers, a cache that looks
     // complete and is not.
     try probeInput(be, x, m, w);
     try be.opConvF16(y, 0, x, m, try txtF32(arena, w), out, in, bias);
@@ -255,7 +255,7 @@ fn txtBlockCuda(be: *Backend, arena: std.mem.Allocator, blk: anytype, x_d: Devic
     try be.qkNorm(s.q, s.q, try normBuf(be, blk.attn.qnorm), rows * txt_heads, hd, eps);
     try be.qkNorm(s.k, s.k, try normBuf(be, blk.attn.knorm), rows * txt_heads, hd, eps);
     // Each of the n_seqs sequences attends only within itself (12-long layerwise,
-    // or the whole prompt for the refiner) — the naive kernel handles one at a
+    // or the whole prompt for the refiner), the naive kernel handles one at a
     // time; seq_len is small so the launch count is cheap and one-time.
     for (0..n_seqs) |i| {
         const off = i * seq_len * txt_dim * 4;
@@ -274,9 +274,9 @@ fn txtBlockCuda(be: *Backend, arena: std.mem.Allocator, blk: anytype, x_d: Devic
     try be.opAdd(x_d, s.t1, rows * txt_dim);
 }
 
-/// CUDA port of `DiT.textTokens`: text conditioning [seq_txt·12·txt_dim] → the
-/// combined-sequence tokens [seq_txt·features] the sampler consumes. Runs the
-/// whole txtfusion + txtmlp stack on the backend so it no longer stalls the CPU.
+/// CUDA port of `DiT.textTokens`: text conditioning [seq_txt*12*txt_dim] -> the
+/// combined-sequence tokens [seq_txt*features] the sampler consumes. Runs the
+/// whole txtfusion + txtmlp stack on the backend, so it does not stall the CPU.
 /// Transient f32 weights are dropped from the cache before returning.
 pub fn textTokensCuda(model: *const DiT, be: *Backend, gpa: std.mem.Allocator, cond: []const f32) ![]f32 {
     const seq_txt = cond.len / (txt_layers * txt_dim);
@@ -295,8 +295,8 @@ pub fn textTokensCuda(model: *const DiT, be: *Backend, gpa: std.mem.Allocator, c
     // backend cache; they are unused during sampling and would otherwise pin VRAM.
     // SCOPED (not evictWeights, which nukes ALL cached weights): this runs per
     // image inside a persistent pipeline.Session, and a full evict would drop the
-    // resident DiT that the next queued image reuses (GUI_VRAM.md Phase 4). The
-    // scope drops exactly the weights cached here — the DiT (cached later, in the
+    // resident DiT that the next queued image reuses. The
+    // scope drops exactly the weights cached here, the DiT (cached later, in the
     // sampling loop, and pinned) survives.
     be.weightScopeBegin();
     defer be.weightScopeEnd();
@@ -315,8 +315,8 @@ pub fn textTokensCuda(model: *const DiT, be: *Backend, gpa: std.mem.Allocator, c
     for (&model.txt_layerwise) |*blk| try txtBlockCuda(be, arena, blk, x_d, &s, zero, seq_txt, txt_layers);
     try be.endBatch();
 
-    // Projector: collapse the 12-layer axis (projected[tok][d] = Σ_l pw[l]·x[tok·12+l][d]).
-    // Tiny [1,12] contraction — a host round-trip is simpler than a bespoke kernel.
+    // Projector: collapse the 12-layer axis (projected[tok][d] = Σ_l pw[l]*x[tok*12+l][d]).
+    // Tiny [1,12] contraction, a host round-trip is simpler than a bespoke kernel.
     {
         const work = try arena.alloc(f32, rows_lw * txt_dim);
         try be.tensorDownload(x_d, std.mem.sliceAsBytes(work));
@@ -338,7 +338,7 @@ pub fn textTokensCuda(model: *const DiT, be: *Backend, gpa: std.mem.Allocator, c
     // Refiner blocks: one sequence of length seq_txt.
     for (&model.txt_refiner) |*blk| try txtBlockCuda(be, arena, blk, x_d, &s, zero, 1, seq_txt);
 
-    // txtmlp: rmsnorm → Linear(2560→6144) → geluTanh → Linear(6144→6144).
+    // txtmlp: rmsnorm -> Linear(2560->6144) -> geluTanh -> Linear(6144->6144).
     try be.qkNorm(x_d, s.normed, try normBuf(be, model.txtmlp_norm), seq_txt, txt_dim, eps);
     try txtGemm(be, arena, s.gate, s.normed, seq_txt, model.txtmlp1.w, F, txt_dim, model.txtmlp1.b.?);
     try be.gelu(s.gate, seq_txt * F);
@@ -405,7 +405,7 @@ fn normBuf(be: *Backend, w: []const f32) !DeviceBuffer {
 
 /// Queue all of a DiT block's streamable weights for async prefetch (called one
 /// block ahead so the uploads overlap the previous block's compute). Keys must
-/// match the byte slices `forward` later fetches (same host pointers → cache hit).
+/// match the byte slices `forward` later fetches (same host pointers -> cache hit).
 fn prefetchBlock(be: *Backend, blk: anytype) void {
     const bytes = std.mem.sliceAsBytes;
     inline for (.{ blk.attn.wq, blk.attn.wk, blk.attn.wv, blk.attn.gate, blk.attn.wo }) |w| {
@@ -421,8 +421,8 @@ fn prefetchBlock(be: *Backend, blk: anytype) void {
 }
 
 /// Per-run device scratch shared across sampler steps (and both CFG sessions):
-/// the ~12 activation buffers `forward` used to `cuMemAlloc`/free every call. Size
-/// once for the largest sequence (both prompts share n_img; only seq_txt differs).
+/// the ~12 activation buffers a forward would otherwise `cuMemAlloc`/free every call.
+/// Sized once for the largest sequence (both prompts share n_img, only seq_txt differs).
 pub const Workspace = struct {
     x_d: DeviceBuffer = .{},
     imgin_d: DeviceBuffer = .{},
@@ -452,7 +452,7 @@ pub const Workspace = struct {
         ws.v_d = try be.tensorCreate(mpad * kv_heads * hd * 4);
         ws.g_d = try be.tensorCreate(mpad * F * 4);
         ws.attn_d = try be.tensorCreate(mpad * heads * hd * 4);
-        // mg/mu hold one MLP tile (see mlp_tile) — not the full padded sequence.
+        // mg/mu hold one MLP tile (see mlp_tile), not the full padded sequence.
         const mlp_rows = @min(mpad, std.mem.alignForward(usize, mlp_tile, 128));
         ws.mg_d = try be.tensorCreate(mlp_rows * mlp_dim * 4);
         ws.mu_d = try be.tensorCreate(mlp_rows * mlp_dim * 4);
@@ -564,7 +564,7 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
 
     for (model.blocks, 0..) |blk, b| {
         // Poll cancel between blocks so a stop lands mid-step (≈1/28 of a step)
-        // rather than only at step boundaries — matters most under weight
+        // rather than only at step boundaries, matters most under weight
         // streaming, where each block waits on its uploaded weights. The
         // `errdefer` above aborts the in-flight CUDA batch on the way out.
         if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
@@ -601,7 +601,7 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
             try linPrep(be, kind, t1_d, tile, F);
             if (mlp_f16) {
                 // gate/up GEMMs emit f16 (irescale_h16); silu_mul_h16 reads/writes
-                // f16; the down prep reads f16 — halving the 16384-dim traffic.
+                // f16; the down prep reads f16, halving the 16384-dim traffic.
                 try i8GemmW(be, mg_d, blk.mlp.gate, true);
                 try i8GemmW(be, mu_d, blk.mlp.up, true);
                 try be.siluMul16(mg_d, mu_d, tile * mlp_dim);
@@ -612,7 +612,7 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
                 try be.siluMul(mg_d, mu_d, tile * mlp_dim);
                 try linPrep(be, kind, mg_d, tile, blk.mlp.down.cols);
             }
-            try lin(be, kind, t1_d, mg_d, tile, blk.mlp.down, zeros); // down → f32 t1_d for gatedAdd
+            try lin(be, kind, t1_d, mg_d, tile, blk.mlp.down, zeros); // down -> f32 t1_d for gatedAdd
             try be.gatedAdd(xo, t1_d, mv_d, tile * F, F, mb + 5 * F);
         }
     }
@@ -635,12 +635,12 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
 // --- tests -----------------------------------------------------------------
 
 // The CUDA W4A8 decode kernel against the CPU decode it must reproduce. Synthetic
-// weights, so no checkpoint is needed — which is the point: the kernel's only earlier
+// weights, so no checkpoint is needed, which is the point: the kernel's only earlier
 // validation was that a real render came out bit-identical to the load-time
 // materialization, and that check stops being reproducible the moment the checkpoint
 // leaves the disk.
 //
-// ⚠️ Covers what the PTX quietly assumes and a render would not localize: the `prmt.b32`
+// Covers what the PTX quietly assumes and a render would not localize: the `prmt.b32`
 // byte packing (its selector nibbles must stay under 8 or the instruction
 // sign-replicates), the `v2.u32` store's 8-byte alignment, and the one-group-scale-per-
 // thread shortcut that makes `group_size % 8 == 0` a requirement.
@@ -657,11 +657,11 @@ test "the CUDA W4A8 decode matches ops.w4a8.decode" {
         .{ .rows = 128, .cols = 1024, .gs = 32 },
         .{ .rows = 64, .cols = 256, .gs = 8 }, // the smallest group the kernel allows
     };
-    // ⚠️ Every case's buffers stay ALIVE in one arena, and that is load-bearing rather
+    // Every case's buffers stay ALIVE in one arena, and that is load-bearing rather
     // than tidy: both device weight caches key on the HOST POINTER, so freeing a case's
     // arrays and letting the allocator hand the same address to the next case scores a
     // stale cache hit and the kernel reads the previous case's weights. Found the hard
-    // way — this test failed on its third case with the first case's data. (A model
+    // way, this test failed on its third case with the first case's data. (A model
     // never hits it: the weights live in the model arena for the model's lifetime.)
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -700,8 +700,8 @@ test "the CUDA W4A8 decode matches ops.w4a8.decode" {
 // The CUDA NVFP4 decode kernel against the CPU decode it must reproduce. Synthetic
 // weights, so no checkpoint is needed.
 //
-// ⚠️ f16 output, so this is a TOLERANCE against the f32 CPU decode rather than an
-// equality — but a tight one, because both sides read the same level table and f16 only
+// f16 output, so this is a TOLERANCE against the f32 CPU decode rather than an
+// equality, but a tight one, because both sides read the same level table and f16 only
 // rounds the store. The bound is set from f16's own quantum, so a nibble-order or
 // block-index error (which move values by whole levels) cannot hide inside it.
 test "the CUDA NVFP4 decode matches ops.nvfp4.decode" {
@@ -746,8 +746,8 @@ test "the CUDA NVFP4 decode matches ops.nvfp4.decode" {
 
         for (want, got_bits, 0..) |wv, gb, i| {
             const gv: f32 = @bitCast(@as(u32, gb) << 16); // bf16 -> f32
-            // ⚠️ A NaN block-scale byte (fp8 0x7F/0xFF) PROPAGATES here, unlike `.w4a8`
-            // whose int8 target forces it to 0 — and it propagates in the reference too,
+            // A NaN block-scale byte (fp8 0x7F/0xFF) PROPAGATES here, unlike `.w4a8`
+            // whose int8 target forces it to 0, and it propagates in the reference too,
             // so agreeing on NaN is the correct outcome, not a hole in the check.
             const both_nan = std.math.isNan(wv) and std.math.isNan(gv);
             // Otherwise bf16 rounds the value and nothing else may change it: 8 mantissa

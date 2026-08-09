@@ -17,7 +17,7 @@ pub const Params = struct {
     top_p: f32 = 0.8,
     /// Min-p: drop candidates whose probability is below min_p times the top
     /// candidate's (0 = off). Thresholded in raw-logit space, independent of
-    /// temperature — matches llama.cpp's min_p sampler.
+    /// temperature, matches llama.cpp's min_p sampler.
     min_p: f32 = 0.0,
     /// llama.cpp-style repetition penalty over the recent window (1.0 = off):
     /// positive logits of recent ids are divided by this, negative multiplied.
@@ -77,7 +77,7 @@ pub const Dist = struct {
     }
 
     /// Draw from the distribution with `excl` removed and the rest
-    /// renormalized — the speculative-decode residual for a rejected token
+    /// renormalized, the speculative-decode residual for a rejected token
     /// proposed by a deterministic drafter (max(p - q, 0) with q a point
     /// mass at `excl`).
     pub fn sampleExcluding(self: *const Dist, rand: std.Random, excl: u32) u32 {
@@ -99,7 +99,7 @@ pub const Dist = struct {
 
 /// Per-turn seed sequence for multi-turn sessions. A Sampler is constructed
 /// fresh for every generate call from `Options.seed`, so a session that reuses
-/// one seed replays the identical RNG stream each turn — a repeated prompt
+/// one seed replays the identical RNG stream each turn, a repeated prompt
 /// (new chat, or a regenerated reply) then reproduces the identical response.
 /// Chat drivers hold one SeedSeq per session and pull `next()` at every turn
 /// boundary instead: turns never share an RNG stream, while a fixed base seed
@@ -155,7 +155,7 @@ pub const Sampler = struct {
         if (p.temperature <= 0) {
             return distFromSorted(p, &.{.{ .id = argmax(logits), .logit = 0 }});
         }
-        // Top-k candidates (id, logit), highest first — the only full-vocab
+        // Top-k candidates (id, logit), highest first, the only full-vocab
         // step; everything downstream is on this <= max_candidates set.
         const k = candidateCount(p);
         var cand: [max_candidates]Candidate = undefined;
@@ -166,14 +166,14 @@ pub const Sampler = struct {
     /// GPU-sampling entry point: the device selected the top-k, downloading
     /// just these candidates (a few KB vs the full ~608 KB vocab); the engine
     /// only routes here when no penalty is active (penalties need the full
-    /// logits). We sort them descending — k is tiny — and run the identical
+    /// logits). We sort them descending, k is tiny, and run the identical
     /// softmax / min-p / top-p / normalize / RNG tail as the full-vocab path,
     /// so the emitted token is bit-identical to what the CPU sampler would
     /// have produced from the same logits.
     pub fn nextFromCandidates(self: *Sampler, cands: []Candidate) u32 {
         std.mem.sort(Candidate, cands, {}, candDesc);
         // Trim the (possibly larger, e.g. GPU per-lane) candidate pool to the
-        // top-k the params consider — matching the CPU path's topK(k) so the
+        // top-k the params consider, matching the CPU path's topK(k) so the
         // softmax runs over the same set.
         const k = @min(candidateCount(self.params), cands.len);
         const d = distFromSorted(self.params, cands[0..k]);
@@ -194,8 +194,8 @@ pub const max_penalty_window = 2048;
 
 /// One unique token of the penalty window: its id and occurrence count.
 /// `count` is f32 (not integer) because it only ever feeds the frequency
-/// term's float math — and so the GPU penalize kernels can consume the
-/// entry buffer without an int→float convert.
+/// term's float math, and so the GPU penalize kernels can consume the
+/// entry buffer without an int->float convert.
 pub const PenaltyEntry = extern struct { id: u32, count: f32 };
 
 /// Collect the unique (id, count) pairs of the trailing penalty window,
@@ -223,8 +223,8 @@ pub fn collectPenalties(recent: []const u32, p: Params, out: *[max_penalty_windo
 }
 
 /// The per-token penalty formula (mirrored bit-for-bit by the device penalize
-/// kernels): repetition divides a positive logit / multiplies a negative one —
-/// once per unique token — then presence/frequency subtract.
+/// kernels): repetition divides a positive logit / multiplies a negative one,
+/// once per unique token, then presence/frequency subtract.
 pub fn penalizeLogit(l: f32, count: f32, p: Params) f32 {
     const r = if (l > 0) l / p.repeat_penalty else l * p.repeat_penalty;
     return r - (count * p.frequency_penalty + p.presence_penalty);
@@ -237,7 +237,7 @@ pub fn penalizeLogit(l: f32, count: f32, p: Params) f32 {
 /// the CPU formula.
 pub const PenaltyWire = [2 * max_penalty_window]u32;
 
-/// Pack entries for the CUDA penalize kernel: interleaved u32 words —
+/// Pack entries for the CUDA penalize kernel: interleaved u32 words,
 /// the token id, then the f32 bits of the precomputed subtract term.
 pub fn packPenaltyWireU32(entries: []const PenaltyEntry, p: Params, out: *PenaltyWire) []const u32 {
     for (entries, 0..) |e, i| {
@@ -248,7 +248,7 @@ pub fn packPenaltyWireU32(entries: []const PenaltyEntry, p: Params, out: *Penalt
 }
 
 /// Pack entries for the Vulkan penalize kernel, whose storage buffers are
-/// f32-only: the token id stored AS f32 (exact below 2^24 — every vocab is)
+/// f32-only: the token id stored AS f32 (exact below 2^24, every vocab is)
 /// and the same precomputed subtract term.
 pub fn packPenaltyWireF32(entries: []const PenaltyEntry, p: Params, out: *[2 * max_penalty_window]f32) []const f32 {
     for (entries, 0..) |e, i| {
@@ -262,7 +262,7 @@ pub fn packPenaltyWireF32(entries: []const PenaltyEntry, p: Params, out: *[2 * m
 /// full logits (a no-op when `p.penaltiesActive()` is false). Per unique token
 /// in the window (count = its occurrences):
 ///   - repetition: positive logits divided by repeat_penalty, negative
-///     multiplied — applied ONCE, regardless of count;
+///     multiplied, applied ONCE, regardless of count;
 ///   - presence/frequency: logit -= count * frequency_penalty + presence_penalty.
 /// Matches llama.cpp's llama_sampler_penalties formula exactly.
 pub fn applyPenalties(logits: []f32, recent: []const u32, p: Params) void {
@@ -279,7 +279,7 @@ pub fn applyPenalties(logits: []f32, recent: []const u32, p: Params) void {
 /// collapses to a point mass on `cands[0]` (which must be the argmax).
 /// Penalties are assumed already applied to the logits these candidates came
 /// from. Both cuts are prefix cuts computed on the full candidate set and then
-/// intersected — the same result as llama.cpp's top_p-then-min_p chain order.
+/// intersected, the same result as llama.cpp's top_p-then-min_p chain order.
 pub fn distFromSorted(p: Params, cands: []const Candidate) Dist {
     std.debug.assert(cands.len >= 1);
     var d: Dist = undefined;
@@ -513,7 +513,7 @@ test "collectPenalties dedups the window into id-sorted (id, count) entries" {
 
 // gemma4_cuda's device suppress mask reuses the penalize kernel with an
 // infinite presence penalty: rp=1 leaves the logit exactly unchanged (x/1),
-// and any finite value minus +inf is exactly -inf — this test pins that
+// and any finite value minus +inf is exactly -inf, this test pins that
 // contract so a formula change can't silently break the mask.
 test "infinite presence penalty is an exact -inf mask" {
     const p: Params = .{ .repeat_penalty = 1.0, .presence_penalty = std.math.inf(f32) };
@@ -620,7 +620,7 @@ test "accept + sampleExcluding preserves the target distribution" {
     }
 }
 
-// The GPU path (device top-k → download candidates → nextFromCandidates) must
+// The GPU path (device top-k -> download candidates -> nextFromCandidates) must
 // emit the SAME token as the CPU full-vocab next() for the same logits + seed.
 test "nextFromCandidates matches full-vocab next()" {
     var prng = std.Random.DefaultPrng.init(0xC0FFEE);
@@ -628,7 +628,7 @@ test "nextFromCandidates matches full-vocab next()" {
     const params_sets = [_]Params{
         .{ .temperature = 0.0 }, // greedy
         .{ .temperature = 1.0, .top_k = 20, .top_p = 1.0 },
-        .{ .temperature = 0.7, .top_k = 0, .top_p = 0.8 }, // top_k=0 → cap
+        .{ .temperature = 0.7, .top_k = 0, .top_p = 0.8 }, // top_k=0 -> cap
         .{ .temperature = 1.3, .top_k = 5, .top_p = 0.95 },
         .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .min_p = 0.1 },
         .{ .temperature = 1.0, .top_k = 0, .top_p = 1.0, .min_p = 0.3 },

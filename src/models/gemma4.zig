@@ -5,7 +5,7 @@
 //! post-ffw RMSNorm), sqrt(hidden) embedding scale, per-head QK RMS-norm,
 //! GeGLU FFN, tied LM head, and the local/global sliding-window layer split
 //! (period 6: every 6th layer is GLOBAL full-attention, the rest LOCAL). What
-//! is NEW in Gemma 4 (this is the dense 12B variant — no MoE, no per-layer
+//! is NEW in Gemma 4 (this is the dense 12B variant, no MoE, no per-layer
 //! input embeddings):
 //!
 //!   - Per-layer attention geometry. LOCAL (sliding-window) layers use
@@ -13,13 +13,13 @@
 //!     512 with a single KV head (MQA, 512-wide KV). Query heads are always 16,
 //!     so q/o widths also differ per layer. The KV cache therefore has a
 //!     per-layer stride (see PerLayerKvCache).
-//!   - Attention score scale is 1.0 (NOT 1/sqrt(head_dim)) — llama.cpp
+//!   - Attention score scale is 1.0 (NOT 1/sqrt(head_dim)), llama.cpp
 //!     f_attention_scale; the scale is folded into training via the QK norms.
 //!   - V is RMS-normalized per head_dim WITHOUT a learned weight (Q/K keep
 //!     their weighted norms); V is not rotated.
 //!   - RoPE: LOCAL layers theta 1e4 over head_dim 256; GLOBAL layers theta 1e6
 //!     over head_dim 512 with per-dimension frequency factors (rope_freqs.weight
-//!     — "proportional"/long-context RoPE), replacing Gemma 3's scalar 1/8.
+//!     "proportional"/long-context RoPE), replacing Gemma 3's scalar 1/8.
 //!   - A per-layer scalar `out_scale` multiplies the whole layer output.
 //!   - Final logits are tanh-softcapped at 30, and `suppress_tokens` are forced
 //!     to -inf (the checkpoint's <image>/<audio> placeholder ids).
@@ -64,7 +64,7 @@ pub const Config = struct {
     swa_pattern: usize,
     /// tanh logit softcapping (0 = disabled).
     final_logit_softcap: f32,
-    /// Largest single bidirectional image block, in soft-image tokens — sizes the
+    /// Largest single bidirectional image block, in soft-image tokens, sizes the
     /// prefill activation scratch and the LOCAL KV ring slack (a whole image
     /// block is prefilled in ONE pass). Set from the gemma4v vision token budget
     /// at load (`gemma4v_vit.Budget`); `detect` defaults it to `high` (280) so a
@@ -197,7 +197,7 @@ const max_layers = 128;
 const prefill_chunk = 256;
 
 // The largest single prefill batch (a text chunk or a whole bidirectional image
-// block) is `Config.maxBatch()` — runtime, sized from the vision token budget
+// block) is `Config.maxBatch()`, runtime, sized from the vision token budget
 // (`Config.image_budget`), so a bigger budget grows the scratch + LOCAL ring
 // without inflating the default/text-only case.
 
@@ -236,7 +236,7 @@ const Layer = struct {
     q: Weight,
     k: Weight,
     /// V projection. Absent on GLOBAL layers (llama.cpp: reuse the raw K
-    /// projection output as V — see layerForward).
+    /// projection output as V, see layerForward).
     v: ?Weight,
     o: Weight,
     q_norm: []const f32, // [head_dim]
@@ -371,7 +371,7 @@ pub const Model = struct {
 
         // Prefill in prefill_chunk-sized batches so a LOCAL layer's ring never
         // has to hold more than `window + prefill_chunk` live positions at once
-        // (chunked prefill is token-identical to a single pass — attention is
+        // (chunked prefill is token-identical to a single pass, attention is
         // causal, so a later chunk only reads earlier chunks' committed KV). A
         // bidirectional image block runs as one chunk of the whole `seq`.
         const chunk = if (bidirectional) seq else prefill_chunk;
@@ -412,8 +412,8 @@ pub const Model = struct {
     /// logits (gemma4_cuda.stepSelectPen): the exact host softcap (the same
     /// tanh as finalizeLogits, so values are bit-identical to the CPU path),
     /// the suppress mask, then the sampling penalties. This works because the
-    /// softcap is strictly monotonic — the raw-logit top-k IS the capped
-    /// top-k — and penalties only push seen tokens DOWN, so the post-penalty
+    /// softcap is strictly monotonic, the raw-logit top-k IS the capped
+    /// top-k, and penalties only push seen tokens DOWN, so the post-penalty
     /// top-k stays within the (much larger) downloaded candidate superset,
     /// the same lane guarantee the plain top-k already relies on.
     pub fn finalizeCandidates(self: *const Model, ids: []const u32, logits: []f32, pen: []const sample.PenaltyEntry, sp: sample.Params) void {
@@ -615,14 +615,14 @@ pub const CpuModel = struct {
         self.lm.finalizeLogits(logits);
     }
 
-    /// Prefill text tokens (no logits) — for interleaving with prefillImage.
+    /// Prefill text tokens (no logits), for interleaving with prefillImage.
     /// Uses `self.io` (set by step, or by the caller before an image turn).
     pub fn prefill(self: *CpuModel, ids: []const u32) !void {
         try self.lm.forwardCached(self.io, self.gpa, ids, &self.cache, self.rope.get(0), self.rope.get(1), null);
     }
 
     /// Prefill one image's projected embeddings ([grid_w*grid_h][hidden],
-    /// injected UNSCALED — Gemma multiplies only text embeddings by
+    /// injected UNSCALED, Gemma multiplies only text embeddings by
     /// sqrt(hidden)) at the next sequential positions. grid dims are carried
     /// for interface parity (gemma4 grids are variable, W/48 x H/48).
     pub fn prefillImage(self: *CpuModel, embeds: []const f32, grid_w: usize, grid_h: usize) !void {
@@ -639,7 +639,7 @@ pub const CpuModel = struct {
 // --- tests -----------------------------------------------------------------
 
 // Config + weight wiring against the real Gemma 4 12B checkpoint; skipped when
-// absent. Load-only — generation is validated end-to-end via tp-llm against
+// absent. Load-only, generation is validated end-to-end via tp-llm against
 // llama.cpp (a Debug 12B forward is too slow for the suite).
 test "gemma4 loads from real gemma4-12b gguf" {
     const gpa = std.testing.allocator;
@@ -685,7 +685,7 @@ test "gemma4 loads from real gemma4-12b gguf" {
 // The gemma4_cuda GPU sampling path selects top-k over RAW device logits and
 // finalizes only the downloaded candidates on the host. Every finalized
 // candidate value must be BIT-identical to the full-vocab CPU path
-// (finalizeLogits + sample.applyPenalties) — same tanh, same formula order.
+// (finalizeLogits + sample.applyPenalties), same tanh, same formula order.
 test "finalizeCandidatesRaw matches the full-vocab finalize + penalties path" {
     const gpa = std.testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xF1A4);
@@ -707,7 +707,7 @@ test "finalizeCandidatesRaw matches the full-vocab finalize + penalties path" {
     for (suppress) |id| ref[id] = -std.math.inf(f32);
     sample.applyPenalties(ref, &recent, sp);
 
-    // Candidate path over a full-vocab "superset" — every value bit-identical.
+    // Candidate path over a full-vocab "superset", every value bit-identical.
     const ids = try gpa.alloc(u32, vocab);
     defer gpa.free(ids);
     for (ids, 0..) |*d, i| d.* = @intCast(i);

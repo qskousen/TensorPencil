@@ -8,7 +8,7 @@
 //! the dequantized-and-scaled `W_rot` therefore applies the same rotation once
 //! more: `W = W_rot @ H^T = W_rot @ H`. The rotation spreads per-group outliers
 //! so int8 quantization (of both weights offline and activations online) is
-//! more accurate — but for our correctness path we simply rotate back to the
+//! more accurate, but for our correctness path we simply rotate back to the
 //! original weights at dequant time and reuse the normal GEMM.
 
 const std = @import("std");

@@ -1,4 +1,4 @@
-//! TensorPencil CLI — thin driver over the TensorPencil library module.
+//! TensorPencil CLI, thin driver over the TensorPencil library module.
 
 const std = @import("std");
 const Io = std.Io;
@@ -70,7 +70,7 @@ pub fn main(init: std.process.Init) !void {
         try cudaEncodeTest(arena, io, stdout);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "sd-cuda-test")) {
         // `libs` selects the cuBLASLt/cuDNN arm, which takes a DIFFERENT attention
-        // path (true head width, no padding) — so both are worth running.
+        // path (true head width, no padding), so both are worth running.
         var ckpt: []const u8 = "/home/qt/genai/comfyui/models/checkpoints/sd1.5/perfectdeliberate_v20.safetensors";
         var libs = false;
         for (args[2..]) |a| {
@@ -89,7 +89,7 @@ pub fn main(init: std.process.Init) !void {
             } else if (std.mem.eql(u8, args[i], "--krea2")) {
                 variant = .krea2;
             } else if (std.mem.eql(u8, args[i], "--anima")) {
-                // ⚠️ The variant decides the CONFIG (0.6B: 28 layers, hidden 1024),
+                // The variant decides the CONFIG (0.6B: 28 layers, hidden 1024),
                 // so a 0.6B encoder under the default `.zimage` variant is a
                 // `ShapeMismatch` at load rather than a wrong answer. This flag is how
                 // Anima's encoder gets checked on every backend.
@@ -496,7 +496,7 @@ fn gpuI8Test(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
         try stdout.print("i8 linear {d}x{d}x{d}: rel vs cpu-sim {d:.5} (wiring), rel vs f32 {d:.4} (int8 accuracy)\n", .{ m, rows, cols, rel_sim, rel_truth });
         try stdout.flush();
         // Stage B (cols>=6144) rotates in f16 shared, so GPU-vs-f32-CPU-replica
-        // diverges ~0.4% — but that f16 rotation error stays WITHIN int8 quant
+        // diverges ~0.4%, but that f16 rotation error stays WITHIN int8 quant
         // noise (rel-vs-f32 is unchanged, ~0.9%), so the real accuracy gate is
         // rel_truth. Small cols use the f32 register path (bit-close, 1e-3).
         const sim_gate: f64 = if (cols >= 6144) 1e-2 else 1e-3;
@@ -580,7 +580,7 @@ fn cudaTest(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
 
 /// Phase-2 library backend bring-up (`--backend cuda`): dlopen cuBLASLt + cuDNN,
 /// create handles bound to the compute stream, report their versions. Validates
-/// bindings→handle end to end (the analog of `cuda-test` for the driver path).
+/// bindings->handle end to end (the analog of `cuda-test` for the driver path).
 fn cudaLibsTest(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
     const cuda = TensorPencil.gpu.cuda;
     var be = cuda.Backend.initLibs(arena) catch |err| {
@@ -596,7 +596,7 @@ fn cudaLibsTest(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
 }
 
 /// Phase-2 milestone 2.1: cuBLASLt int8 IMMA GEMM. Bit-exact validation vs a CPU
-/// integer matmul (s8·s8→s32 is exact, so 0 mismatches expected), then a min-of-N
+/// integer matmul (s8*s8->s32 is exact, so 0 mismatches expected), then a min-of-N
 /// TOP/s benchmark at the DiT GEMM shapes to compare against the hand-PTX
 /// `igemm_pipe` (~135 TOP/s) and the Vulkan coopmat (~85).
 fn cudaLibsI8Test(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
@@ -676,10 +676,10 @@ fn cudaLibsI8Test(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
     }
 }
 
-/// Phase-2 milestone 2.2: cuBLASLt f16 GEMM (HMMA, f32 accumulate) — the drop-in
+/// Phase-2 milestone 2.2: cuBLASLt f16 GEMM (HMMA, f32 accumulate), the drop-in
 /// for the hand-PTX `buildHgemm` behind the fp8 encoder GEMMs and the VAE convs.
 /// Validates D[m][n] f32 = A[m][k] @ W[n][k]ᵀ vs a CPU f32-accumulate reference
-/// (f16 inputs widen exactly; only the reduction order differs → f16 regime),
+/// (f16 inputs widen exactly; only the reduction order differs -> f16 regime),
 /// then a min-of-N TFLOP/s bench.
 fn cudaLibsF16Test(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
     const cuda = TensorPencil.gpu.cuda;
@@ -762,7 +762,7 @@ fn cudaLibsF16Test(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
 }
 
 /// Phase-2 milestone 2.7: cuDNN fused int8 GEMM + per-row×per-col dequant (one
-/// op graph). Validates D = (A·B in s32)·act_scale·weight_scale vs a CPU
+/// op graph). Validates D = (A*B in s32)*act_scale*weight_scale vs a CPU
 /// reference (s32 matmul exact; dequant in f32), then a min-of-N bench vs the
 /// separate ltMatmulI8 + irescale path.
 fn cudaLibsI8FusedTest(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
@@ -844,7 +844,7 @@ fn cudaLibsI8FusedTest(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
 }
 
 /// Phase-2 milestone 2.4: cuDNN fused SDPA (flash attention). Validates the
-/// backend-graph SDPA op in ISOLATION — synthetic f16 Q/K/V (GQA), non-causal —
+/// backend-graph SDPA op in ISOLATION, synthetic f16 Q/K/V (GQA), non-causal,
 /// vs a CPU softmax-attention reference, before any DiT wiring. Tensors stored
 /// [s,h,d] (the DiT layout). Scale = 1/sqrt(d).
 fn cudaLibsAttnTest(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
@@ -1083,7 +1083,7 @@ fn cudaFp8Test(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
 /// This exists because the hand-PTX kernels cannot have unit tests the way their
 /// SPIR-V twins do (`sd_unet_gpu`'s test block): the test binary brings up no
 /// CUDA context. Without it the CUDA path's only evidence is that a whole render
-/// lands within 0.3 dB of the Vulkan arm — real, but it localizes nothing.
+/// lands within 0.3 dB of the Vulkan arm, real, but it localizes nothing.
 ///
 /// Every check is against the CPU op, on random data, and the command exits with
 /// an error if any fails, so it is usable as a gate.
@@ -1118,7 +1118,7 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
             var nan = false;
             // Which SIDE went non-finite, and how big each side's values get. A bare
             // `rel L2 nan` says a check failed but not whether the reference or the
-            // kernel produced it — and "the reference overflowed" is a completely
+            // kernel produced it, and "the reference overflowed" is a completely
             // different bug from "the kernel did".
             var bad_want: usize = 0;
             var bad_got: usize = 0;
@@ -1146,7 +1146,7 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
             }
             // Flush per check: the whole-stage sweep takes minutes and can be
             // killed by the host OOM killer mid-run, and a buffered report loses
-            // every line it had already produced — i.e. exactly the diagnostic.
+            // every line it had already produced, i.e. exactly the diagnostic.
             try self.out.flush();
         }
     };
@@ -1220,7 +1220,7 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
         try be.tensorDownload(b_d, std.mem.sliceAsBytes(got));
         // 2e-5, not the 1e-6 the SPIR-V twin holds: every kernel in `cuda/elt.zig`
         // computes exp as `ex2.approx(x*log2e)` (its header says so), which is an
-        // approximate instruction, where SPIR-V's `@exp` is not. Measured 6.6e-6 —
+        // approximate instruction, where SPIR-V's `@exp` is not. Measured 6.6e-6,
         // two orders below the f16 GEMM error either side of it, so the two
         // backends legitimately disagree here and neither is wrong.
         try rep.check("geglu (erf gate, value-first halves)", want, got, 2e-5);
@@ -1402,7 +1402,7 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
     }
 
     // --- the VAE mid-block's attention shape ---------------------------------
-    // ONE head 512 wide over every latent position — nothing like the UNet's
+    // ONE head 512 wide over every latent position, nothing like the UNet's
     // 40..160-wide multi-head cases above, and the shape that makes `opAttnTC`
     // switch to its query-tiled (flash) path once the scores plane outgrows the
     // scratch budget. That switch is between seq 384 and seq 4096, i.e. between a
@@ -1452,10 +1452,10 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
                 var name_buf: [72]u8 = undefined;
                 const name = try std.fmt.bufPrint(&name_buf, "vae mid attention seq={d} hd=512 (x{d:.0})", .{ n, mag });
                 // The x8 arm is looser BY MEASUREMENT, not to make it pass: scores
-                // grow with |q|·|k|, so an f16 GEMM feeding a softmax lands at ~6e-3
+                // grow with |q|*|k|, so an f16 GEMM feeding a softmax lands at ~6e-3
                 // relative at every seq length tested (1.0 holds 6e-4). What this arm
                 // is for is catching `inf`/NaN, which is what the SDXL VAE actually
-                // hit — a rel-L2 bound would report that as `nan`, not as 0.006.
+                // hit, a rel-L2 bound would report that as `nan`, not as 0.006.
                 try rep.check(name, want, got, if (mag > 1.0) 1e-2 else 5e-3);
             }
         }
@@ -1534,7 +1534,7 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
         const want = try arena.alloc(f32, n);
         const got = try arena.alloc(f32, n);
         // `2e-5` rather than the Vulkan arm's 2e-6 because every exp in `cuda/elt.zig`
-        // is `ex2.approx` — an approximate instruction, per that file's header. Do not
+        // is `ex2.approx`, an approximate instruction, per that file's header. Do not
         // "fix" it by tightening the bound.
         for ([_]struct { []const u8, bool }{ .{ "gelu_quick (CLIP-L)", true }, .{ "gelu_erf (CLIP-G)", false } }) |arm| {
             const name, const is_quick = arm;
@@ -1559,16 +1559,16 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
     try stdout.print("\nwhole stages against the CPU forward ({s}):\n", .{ckpt});
 
     // The UNet check is SD1.5-specific (config + a 768-wide context and no `y`);
-    // the VAE below is not — the two families' decoders are architecturally
+    // the VAE below is not, the two families' decoders are architecturally
     // IDENTICAL and differ only in weights and in `scaling_factor`, which `decode`
-    // never sees — so an SDXL checkpoint still exercises the sweep, which is how
+    // never sees, so an SDXL checkpoint still exercises the sweep, which is how
     // that family's fp16 behaviour gets measured at all.
     const family = TensorPencil.pipeline.detectFamily(store) catch .sd15;
     try stdout.print("checkpoint family: {t}\n", .{family});
 
     // --- the CLIP text tower, whole, on a weighted two-chunk prompt -----------
     // Both towers when the checkpoint has both, since they differ in naming (fused
-    // q/k/v), depth, head count AND activation — the SDXL arm is the one that
+    // q/k/v), depth, head count AND activation, the SDXL arm is the one that
     // exercises the erf-GELU path and the captured-penultimate-layer path.
     {
         const clip_text = TensorPencil.models.clip_text;
@@ -1642,7 +1642,7 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
 
             var name_buf: [80]u8 = undefined;
             const name = try std.fmt.bufPrint(&name_buf, "clip_text_cuda {s} (2 chunks, weighted)", .{tw.name});
-            // f16 tensor-core GEMMs against an f32 CPU forward over 12/32 layers —
+            // f16 tensor-core GEMMs against an f32 CPU forward over 12/32 layers,
             // the same regime as the whole-UNet check below, and the per-kernel checks
             // above are what pin the arithmetic.
             try rep.check(name, want, got, 2e-2);
@@ -1680,10 +1680,10 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
     {
         var dec = try sd_vae.Decoder.load(arena, store, if (family == .sdxl) sd_vae.sdxl else sd_vae.sd15, "first_stage_model.");
         defer dec.deinit();
-        // ⚠️ A SWEEP, not one size, and that is the point: this check passed at
+        // A SWEEP, not one size, and that is the point: this check passed at
         // 12x10 for months while a 96x96 latent (a 768-square render) decoded to a
-        // solid white image. Anything that reduces over positions — GroupNorm's
-        // chunked Welford statistics, the conv's banding, the attention tiling —
+        // solid white image. Anything that reduces over positions, GroupNorm's
+        // chunked Welford statistics, the conv's banding, the attention tiling,
         // can be correct on a small tile and wrong once the position count crosses
         // a kernel's own blocking, so the sizes below deliberately straddle the
         // render sizes people actually use (64 = 512², 96 = 768², 128 = 1024²) and
@@ -1696,15 +1696,15 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
             .{ 96, 96 }, // 768² render
             .{ 128, 128 }, // 1024² render
         };
-        // ⚠️ NOT `arena`: the CPU reference frees every intermediate it allocates,
+        // NOT `arena`: the CPU reference frees every intermediate it allocates,
         // but an arena only returns memory at scope exit, so the sweep accumulates
         // every buffer of every size and the OOM killer takes the process at 128²
         // (~2 GB per activation there). A freeing allocator keeps the peak at the
         // few live buffers the decoder actually holds.
         const ref_gpa = std.heap.page_allocator;
-        // ⚠️ The MAGNITUDE arm is as load-bearing as the size arm. `decode` is
+        // The MAGNITUDE arm is as load-bearing as the size arm. `decode` is
         // handed `z / scaling_factor`, so a real latent arrives ~5.5x (SD1.5) to
-        // ~7.7x (SDXL) wider than the unit gaussian a fixture naturally uses — and
+        // ~7.7x (SDXL) wider than the unit gaussian a fixture naturally uses, and
         // a unit-gaussian check passed at every size while a REAL 768-square render
         // decoded to a solid white image.
         const mags = [_]f32{ 1.0, 1.0 / 0.13025 };
@@ -1744,10 +1744,10 @@ fn summarize(stdout: *Io.Writer, failures: usize) !void {
 /// forward of the SAME file, and optionally a second encoder against the first
 /// (which is how a quantized GGUF is compared to its bf16 original).
 ///
-/// A CLI command rather than a test for the usual reason — the test binary brings
-/// up no CUDA/Vulkan context — and because an 8 GB encoder is not a unit test.
+/// A CLI command rather than a test for the usual reason, the test binary brings
+/// up no CUDA/Vulkan context, and because an 8 GB encoder is not a unit test.
 ///
-/// ⚠️ The two questions it separates are genuinely different and were being
+/// The two questions it separates are genuinely different and were being
 /// conflated by looking at renders: "does this backend compute what the CPU
 /// computes" (a kernel question, expect ~1e-3) and "does this quantization change
 /// the conditioning" (a format question, expect much more). A render comparison
@@ -1863,7 +1863,7 @@ fn teTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []const u8
 }
 
 /// Check `zimage_cuda`'s device forward against `zimage.DiT.predict` on real
-/// checkpoint weights — the CUDA twin of `zimage_gpu`'s gated Vulkan test, and a
+/// checkpoint weights, the CUDA twin of `zimage_gpu`'s gated Vulkan test, and a
 /// CLI command for the reason `sd-cuda-test` and `cuda-dit-test` are: the test
 /// binary brings up no CUDA context, so a `test` block here would only ever skip.
 ///
@@ -1918,9 +1918,9 @@ fn zimageCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []
     }
 
     var failures: usize = 0;
-    // ⚠️ BOTH attention paths. `opAttnTC` is what runs; the naive one is the
+    // BOTH attention paths. `opAttnTC` is what runs; the naive one is the
     // fallback and the reference the fast path was validated against. Checking
-    // only the fast one leaves the fallback free to rot — and checking only the
+    // only the fast one leaves the fallback free to rot, and checking only the
     // slow one is what let the watchdog problem reach a render on Vulkan.
     const saved = zimage_cuda.force_naive_attn;
     defer zimage_cuda.force_naive_attn = saved;
@@ -1942,7 +1942,7 @@ fn zimageCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []
             den += @as(f64, e) * e;
         }
         const rel = if (den == 0) 0 else @sqrt(num / den);
-        // The GEMMs run tensor cores against the CPU's f32 accumulation — the same
+        // The GEMMs run tensor cores against the CPU's f32 accumulation, the same
         // regime `sd_unet_cuda` sits in, and `zimage_gpu` measures 2.2e-4 there.
         const ok = nonfinite == 0 and rel < 1e-3;
         if (!ok) failures += 1;
@@ -1952,7 +1952,7 @@ fn zimageCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []
         });
     }
     // --- the VAE decode ---------------------------------------------------------
-    // ⚠️ Checked at a SMALL and a LARGE latent, because the mid-block attention takes
+    // Checked at a SMALL and a LARGE latent, because the mid-block attention takes
     // a different path at each and the small one is where the f16-logit overflow that
     // once rendered solid white actually shows. A single size is how that bug hid.
     if (vae_path.len != 0) {
@@ -2021,19 +2021,19 @@ fn timeBest(io: Io, n: usize, comptime go: anytype, be: anytype, args: anytype) 
 
 /// Time ONE Z-Image trunk step's worth of bf16 GEMMs in isolation, with and
 /// without the two streaming passes `opGemmBf16` wraps around every call (the
-/// f32→bf16 activation pad, and `bias_compact` on the f32 output).
+/// f32->bf16 activation pad, and `bias_compact` on the f32 output).
 ///
 /// The point is a receipt rather than an estimate. A whole-render profile puts
-/// ~88% of a step under `.matmul`, but that bucket spans the op, not the GEMM —
+/// ~88% of a step under `.matmul`, but that bucket spans the op, not the GEMM,
 /// `opGemmBf16` is `ptic()`-scoped, so the conversion passes are counted inside
 /// it. Without this split, "cuBLASLt is as fast as it gets" and "we spend a
 /// third of the step converting operands" are indistinguishable.
 ///
 /// `seq` is the joint (caption ++ image) token count; 6848 is a 1056x1584 render.
-/// Weights are random and each shape is uploaded once — the working set is far
+/// Weights are random and each shape is uploaded once, the working set is far
 /// past L2 either way, so reuse costs nothing in fidelity and 11.6 GB in VRAM.
 /// Time ONE Anima trunk step's device work at real shapes, with no checkpoint and no
-/// sampler, split GEMM / attention / elementwise — and give each part a CEILING to be
+/// sampler, split GEMM / attention / elementwise, and give each part a CEILING to be
 /// judged against (achieved TFLOP/s for the arithmetic, achieved GB/s for the
 /// bandwidth-bound kernels).
 ///
@@ -2046,7 +2046,7 @@ fn timeBest(io: Io, n: usize, comptime go: anytype, be: anytype, args: anytype) 
 /// kernel.
 ///
 /// `seq` is the image token count: 6534 is a 1056x1584 render, 1536 a 512x768 one.
-/// Weights are random and each shape is allocated once — the working set is far past L2
+/// Weights are random and each shape is allocated once, the working set is far past L2
 /// either way, so the reuse costs nothing in fidelity and several GB in VRAM.
 fn animaCudaBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, seq: usize, libs: bool) !void {
     const cuda = TensorPencil.gpu.cuda;
@@ -2137,9 +2137,9 @@ fn animaCudaBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, seq: usi
         .{ .name = "q/k/v/out  2048<-2048", .y = y_d, .x = x_d, .w = wsq, .co = d, .k = d, .per_block = 6, .m = seq },
         .{ .name = "mlp1       8192<-2048", .y = big_d, .x = x_d, .w = wup, .co = cfg.mlp_dim, .k = d, .per_block = 1, .m = seq },
         .{ .name = "mlp2       2048<-8192", .y = y_d, .x = big_d, .w = wdn, .co = d, .k = cfg.mlp_dim, .per_block = 1, .m = seq },
-        // ⚠️ NOT part of the step: these are the cross-attention K/V projections, which
+        // NOT part of the step: these are the cross-attention K/V projections, which
         // `Session.init` hoists out of the step loop because they depend only on the
-        // context. Timed here so the hoist's worth is MEASURED rather than asserted —
+        // context. Timed here so the hoist's worth is MEASURED rather than asserted,
         // and it is small (see the roll-up), which a FLOP count off by 30x once claimed
         // otherwise.
         .{ .name = "cross k/v  2048<-1024 (hoisted)", .y = y_d, .x = x_d, .w = wsq, .co = d, .k = 1024, .per_block = 2, .m = ctx_seq },
@@ -2176,7 +2176,7 @@ fn animaCudaBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, seq: usi
     try stdout.print("  cross {d:>5}q x {d:>5}kv  x1  {d:7.2} ms  {d:6.1} TFLOP/s\n", .{ seq, ctx_seq, cross_ms, cross_flop / cross_ms / 1e9 });
 
     // --- elementwise, judged by achieved BANDWIDTH ------------------------------
-    // ⚠️ This is the column that makes a broken kernel legible: these do almost no
+    // This is the column that makes a broken kernel legible: these do almost no
     // arithmetic, so bytes-moved / seconds has a known ceiling (~936 GB/s on a 3090,
     // ~700 achievable), and a kernel at a tenth of it is broken rather than merely
     // small. Share-of-time cannot say that.
@@ -2218,11 +2218,11 @@ fn animaCudaBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, seq: usi
 /// Sweep the weighted-RMSNorm shapes the three Vulkan DiTs actually use, timing the
 /// thread-per-row `Elt.rmsnorm` against the subgroup `rmsnorm_sg` at each.
 ///
-/// ⚠️ Exists because the choice between them is **shape-dependent and the fast one is not
-/// always the subgroup one**: `rmsnorm` gives a thread a whole row, which is catastrophic
+/// Exists because the choice between them is shape-dependent and the fast one is not
+/// always the subgroup one: `rmsnorm` gives a thread a whole row, which is catastrophic
 /// for a narrow row (a warp's loads land `dim*4` bytes apart) but not obviously so for a
 /// wide one, where a single thread's own reads are at least sequential. Anima's 128-wide
-/// heads measured **45 GB/s against 511** at production size — and only **176 against 355**
+/// heads measured 45 GB/s against 511 at production size, and only 176 against 355
 /// at a third of it, so a small-shape measurement understates the gap by 3x. Judge each
 /// geometry, and judge it at the size the model runs.
 fn vkNormBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
@@ -2246,13 +2246,13 @@ fn vkNormBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
         .{ .who = "anima  Q/K      @512x768  ", .rows = 1536 * 16, .dim = 128, .per_step = 3 * 28 },
         .{ .who = "zimage Q/K      @1056x1584", .rows = 6848 * 30, .dim = 128, .per_step = 2 * 32 },
         .{ .who = "zimage sandwich @1056x1584", .rows = 6848, .dim = 3840, .per_step = 4 * 32 },
-        // ⚠️ krea2's Q/K `Elt.rmsnorm` sits in an ELSE branch behind two fused
-        // alternatives (`qknorm_rope16`, `qknorm_rope_f32`). It is live for a **bf16 or fp8**
-        // checkpoint — `qkv_shared` requires `!is_bf16`, so those fall through — and NOT for
+        // krea2's Q/K `Elt.rmsnorm` sits in an ELSE branch behind two fused
+        // alternatives (`qknorm_rope16`, `qknorm_rope_f32`). It is live for a bf16 or fp8
+        // checkpoint, `qkv_shared` requires `!is_bf16`, so those fall through, and NOT for
         // an int8 one, which takes the fused f32 path. So this row is a real saving for the
         // dense checkpoints only.
         .{ .who = "krea2  Q/K bf16 @1120x1680", .rows = 7350 * 48, .dim = 128, .per_step = 2 * 28 },
-        // ⚠️ **Reference only — `per_step = 0`.** A 6144-wide row is krea2's block-norm
+        // Reference only, `per_step = 0`. A 6144-wide row is krea2's block-norm
         // shape, but `dit_gpu` routes those through the already-parallel
         // `rms_partial`/`rms_combine`/`rms_apply_mod` chain, NOT `Elt.rmsnorm`. Timed here
         // so nobody reads the wide-row numbers as an available krea2 win; there is none.
@@ -2329,14 +2329,14 @@ fn vkNormBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
 }
 
 /// Time ONE Anima trunk step's VULKAN device work at real shapes, split GEMM / int8 prep /
-/// attention / elementwise, each against a CEILING — the Vulkan counterpart of
+/// attention / elementwise, each against a CEILING, the Vulkan counterpart of
 /// `anima-cuda-bench`, and the harness whose absence made "Vulkan's int8 speedup is 1.2x
 /// where CUDA's is 1.9x" an observation rather than a diagnosis.
 ///
-/// ⚠️ Timing is sync-per-op and that is exact here, not an approximation: outside
+/// Timing is sync-per-op and that is exact here, not an approximation: outside
 /// `beginBatch` every `opBegin`/`opEnd` pair ends in `submitAndWait`, which is the same
 /// methodology `dit_gpu`'s `--profile` uses. It does mean the numbers include per-submit
-/// overhead, which a batched render elides — so the roll-up is an upper bound on the step
+/// overhead, which a batched render elides, so the roll-up is an upper bound on the step
 /// and the PER-OP ratios are the trustworthy part.
 ///
 /// Prints bf16 and int8 side by side at identical shapes, because the question is not "how
@@ -2360,7 +2360,7 @@ fn animaVkBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, seq: usize
         if (ctx.hasLnModSg()) "yes" else "NO",
         if (ctx.pipe_flash_md != .null_handle) "yes" else "NO",
     });
-    // ⚠️ Stated, not inferred: a width with no fused prep silently takes the 3-pass chain.
+    // Stated, not inferred: a width with no fused prep silently takes the 3-pass chain.
     for ([_]usize{ cfg.dim, cfg.mlp_dim }) |c| {
         try stdout.print("  fused int8 prep @ cols {d}: {s}\n", .{ c, if (ctx.hasFusedI8Prep(c)) "yes" else "NO (3-pass fallback)" });
     }
@@ -2439,12 +2439,12 @@ fn animaVkBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, seq: usize
     const zeros = try arena.alloc(f32, mlp);
     @memset(zeros, 0);
 
-    // ⚠️ **BEST-of-rounds after a timed warm-up, not a single mean — the 3090 idles its
-    // clocks and a cold short run reads 2x slow.** A first version of this harness used one
+    // BEST-of-rounds after a timed warm-up, not a single mean, the 3090 idles its
+    // clocks and a cold short run reads 2x slow. A first version of this harness used one
     // 8-iteration mean and produced numbers that moved by 2.2x between runs (bf16 mlp1 read
     // 2.29 ms then 5.06 ms; `gelu_erf` 672 then 342 GB/s), which is enough to invert a
     // conclusion. The warm-up spins the clocks up on the op being measured, and the minimum
-    // over rounds is the estimate least polluted by interference — the same reason
+    // over rounds is the estimate least polluted by interference, the same reason
     // `gpu-perf-lab-notes` says never to trust a short run on this card.
     const T = struct {
         io: Io,
@@ -2471,9 +2471,9 @@ fn animaVkBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, seq: usize
     }{ .io = io };
 
     // --- the sync-per-op floor -------------------------------------------------
-    // ⚠️ Measure the per-submit cost before anything else, so every number below can be
+    // Measure the per-submit cost before anything else, so every number below can be
     // read against it. Outside a batch each op is its own submit+fence, and a render
-    // BATCHES — so an op whose time is close to this floor is being measured, not timed.
+    // BATCHES, so an op whose time is close to this floor is being measured, not timed.
     const floor = try T.run(64, gpu.Context.opElt, .{ ctx, gpu.Elt.copy, x_d, @as(?gpu.DeviceBuffer, y_d), @as(?gpu.DeviceBuffer, null), @as(?gpu.DeviceBuffer, null), gpu.EltPush{
         .u0 = 256,
         .u2 = 0,
@@ -2574,10 +2574,10 @@ fn animaVkBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, seq: usize
         const gl = try T.run(iters, gpu.Context.opElt, .{ ctx, gpu.Elt.gelu_erf, x_d, @as(?gpu.DeviceBuffer, null), @as(?gpu.DeviceBuffer, null), @as(?gpu.DeviceBuffer, null), gpu.EltPush{
             .u0 = @intCast(seq * mlp),
         }, seq * mlp, @as(usize, 1), @as(usize, 1) });
-        // ⚠️ The subgroup RMSNorm exists on this backend and the qk-norm was not using it.
+        // The subgroup RMSNorm exists on this backend and the qk-norm was not using it.
         // Timed alongside the thread-per-row one so the choice is measured, not assumed:
         // `rmsnorm`'s thread owns a whole 128-wide head, so a warp's 32 loads land 512 B
-        // apart and each is its own sector — the identical mistake `qk_rmsnorm_warp` fixed
+        // apart and each is its own sector, the identical mistake `qk_rmsnorm_warp` fixed
         // on CUDA, where it was worth 17x.
         const qs = if (ctx.hasSubgroupNorm())
             try T.run(iters, gpu.Context.opRmsNormSg, .{ ctx, x_d, x_d, nrm_d, seq * heads, hd, cfg.qk_eps })
@@ -2615,7 +2615,7 @@ fn animaVkBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, seq: usize
 /// and the whole-forward check on real weights is what catches a wiring mistake that
 /// every individual kernel survives. Exits non-zero if anything fails, so it works as
 /// a gate. (A CLI command rather than a unit test because the test binary brings up no
-/// CUDA context — matching `zimage-cuda-test` / `sd-cuda-test`.)
+/// CUDA context, matching `zimage-cuda-test` / `sd-cuda-test`.)
 fn animaCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []const u8, libs: bool) !void {
     const cuda = TensorPencil.gpu.cuda;
     const anima = TensorPencil.models.anima;
@@ -2635,7 +2635,7 @@ fn animaCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []c
     var failures: usize = 0;
 
     // --- kernel: fused weightless LayerNorm + AdaLN modulation ------------------
-    // ⚠️ Includes a row whose MEAN dwarfs its spread, which is where the shifted
+    // Includes a row whose MEAN dwarfs its spread, which is where the shifted
     // `E[x^2]-E[x]^2` variance cancels catastrophically in f32. A mean-0 case alone
     // cannot tell the two forms apart, and `ops.norm.groupNorm` records what that
     // costs. The reference is f64 for the same reason: at mean 400 the f32 host path's
@@ -2686,7 +2686,7 @@ fn animaCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []c
     }
 
     // --- kernel: rectangular tensor-core attention ------------------------------
-    // ⚠️ This is the new capability the cross-attention path rests on, so it is
+    // This is the new capability the cross-attention path rests on, so it is
     // checked at Anima's real shape (512-row context, 16 heads of 128) AND at a
     // non-multiple-of-128 key length, which is what exercises the padded-key masking.
     {
@@ -2737,7 +2737,7 @@ fn animaCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []c
                 den += @as(f64, e) * e;
             }
             const rel = if (den == 0) 0 else @sqrt(num / den);
-            // f16 operands against the CPU's f32 accumulation — the regime every
+            // f16 operands against the CPU's f32 accumulation, the regime every
             // tensor-core attention here sits in.
             const ok = bad == 0 and rel < 5e-3;
             if (!ok) failures += 1;
@@ -2756,21 +2756,20 @@ fn animaCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []c
     var ck = try safetensors.open(arena, io, ckpt);
     defer ck.deinit();
     try stdout.print("\n-- forward (real weights) --\n", .{});
-    // ⚠️ **Depth 1 AND depth 2, because that is the ATTRIBUTION on a mixed checkpoint.**
+    // Depth 1 AND depth 2, because that is the ATTRIBUTION on a mixed checkpoint.
     // A quantized Anima file leaves block 0 dense and quantizes block 1 onward, so depth 1
     // measures the dense pipeline alone and depth 2 adds exactly one quantized block. Two
     // numbers separate "the port is wrong" from "int8 changes the answer", which one number
     // cannot.
     //
-    // ⚠️ **The deeper points exist because "depth adds no new WIRING" was WRONG, and
-    // believing it cost a real bug.** That claim justified stopping at 2, and it hid the
-    // `opI4Prep` word-count truncation for as long as it existed: at depth 2 the broken
-    // int4 kernel reads 3.86e-2, which is exactly int4's expected coarseness, so the one
-    // number that was measured looked perfect. What a defect like that changes is the
-    // SHAPE of the curve, not its first point — int8 and W4A8 stay flat from 2 to 28
+    // The deeper points exist because "depth adds no new WIRING" is a trap: it is true
+    // of the wiring and false of a defect that only manifests with depth. A broken int4
+    // activation prep reads 3.86e-2 at depth 2, exactly int4's expected coarseness, so a
+    // single depth cannot tell "coarse" from "accumulating". What such a defect changes
+    // is the SHAPE of the curve, not its first point: int8 and W4A8 stay flat from 2 to 28
     // (2.1e-3 -> 7-9e-3) while broken int4 climbed 3.9e-2 -> 5.2e-1 and healthy int4 is
-    // flat at ~3.9e-2. **A single depth cannot distinguish "coarse" from "accumulating",
-    // and that distinction is the whole diagnostic.** Cheap: the deep CPU reference at a
+    // flat at ~3.9e-2. A single depth cannot distinguish "coarse" from "accumulating",
+    // and that distinction is the whole diagnostic. Cheap: the deep CPU reference at a
     // 24x32 latent is seconds.
     for ([_]usize{ 1, 2, 8, 28 }) |depth| {
         var cfg = anima.anima_2b;
@@ -2822,44 +2821,40 @@ fn animaForwardCheck(
     // The device sessions borrow one folded schedule, shared by both branches.
     const sched = try model.modulationSchedule(io, arena, &.{ sigma, 0 });
 
-    // ⚠️ **A quantized checkpoint is a DIFFERENT computation on the two sides, not just a
-    // different rounding of the same one.** The CPU `matmul` dequantizes the weight to f32
-    // and multiplies in f32 (W8A16, weight-only); `opI8Prep`/`opI8Gemm` additionally
-    // quantize the ACTIVATION to int8 (W8A8). So the residual here includes the activation
-    // quantization the reference never does, and the bound has to allow it. The dense
-    // arms' own figure (depth 1, printed above) is what says the pipeline is otherwise
-    // unchanged.
-    // ⚠️ The bound is looser at depth 1 than at depth 2, which looks backwards and is not:
-    // with one block the trunk barely transforms `x`, so the output magnitude the relative
-    // error is measured against is smaller. Measured on a dense checkpoint: **1.42e-3 at
-    // depth 1 against 8.0e-4 at depth 2**, and those depth-1 figures are IDENTICAL between
-    // a dense file and its quantized sibling (block 0 is bf16 in both) — which is the
-    // cross-check that quantization changed nothing it should not have.
-    // ⚠️ **int4's bound is ~16x int8's because it has 16 levels against 256, and that
-    // RATIO is the receipt.** Predicted 16x from the bit width, measured 18x
-    // (3.80e-2 against 2.09e-3) — a quantization-coarseness signature, not a wiring
-    // error, which would not scale with the level count. Both attention arms agree to
-    // three digits at both dtypes, so it is not attention either.
-    // ⚠️ **W4A8 takes int8's bound because it IS int8 on the device**, not because the
-    // dense one failed. Its decode emits int8-convrot values that then run `opI8Prep` +
-    // the same int8 GEMM, so its residual against the same weight-only f32 reference must
-    // land where int8's does — and the isolation says it does: the SAME model quantized
-    // both ways measures **2.0721e-3 (int8) against 2.0968e-3 (w4a8)**, a 1.2% gap, with
-    // both attention arms agreeing to three digits and depth-1 dense bit-identical across
-    // the two files. Giving it the dense `else` bound (1e-3) fails a correct
-    // implementation, which is what it did on the first W4A8 Anima checkpoint.
-    // ⚠️ **The bound grows with depth, and the growth factor is MEASURED, not chosen to
-    // make the deep points pass.** Every healthy arm accumulates by the same ~4x from
-    // depth 2 to depth 28 — int8 2.07e-3 -> 7.34e-3, W4A8 2.10e-3 -> 8.91e-3, int4
-    // 3.80e-2 -> 1.59e-1 — so `1 + depth/8` (1.25x at depth 2, 4.5x at 28) tracks the
-    // real curve with roughly 3x headroom at every point.
+    // Tolerances, and why each is the value it is.
     //
-    // ⚠️ **Verified to still have teeth at the depth that matters**, which is the only
-    // thing that makes a depth-scaled bound honest: the `opI4Prep` truncation bug read
-    // 2.96e-1 at depth 8 against this rule's 1.2e-1 (FAIL) and 5.2e-1 at depth 12. It
-    // would have PASSED a bound keyed on depth 28 alone (2.13e-1 against 2.7e-1), because
-    // that defect saturates rather than diverging — which is exactly why the sweep runs
-    // intermediate depths and not just the endpoints.
+    // A quantized checkpoint is a DIFFERENT computation on the two sides, not a different
+    // rounding of the same one: the CPU `matmul` dequantizes the weight and multiplies in
+    // f32 (W8A16, weight-only) while `opI8Prep`/`opI8Gemm` also quantize the ACTIVATION
+    // (W8A8), so the residual includes an activation quantization the reference never
+    // does.
+    //
+    // Depth 1 is looser than depth 2, which looks backwards and is not: with one block
+    // the trunk barely transforms `x`, so the magnitude the relative error is measured
+    // against is smaller (1.42e-3 against 8.0e-4 on a dense checkpoint). Those depth-1
+    // figures are IDENTICAL between a dense file and its quantized sibling, block 0 being
+    // bf16 in both, which is the cross-check that quantization changed nothing it should
+    // not have.
+    //
+    // int4 gets ~16x int8's bound because it has 16 levels against 256, and that RATIO is
+    // the receipt: predicted 16x from the bit width, measured 18x (3.80e-2 against
+    // 2.09e-3). A wiring error would not scale with the level count, and both attention
+    // arms agree to three digits, so it is not attention either.
+    //
+    // W4A8 takes int8's bound because it IS int8 on the device: its decode emits
+    // int8-convrot values that run the same prep and GEMM, so it must land where int8
+    // lands. The same model quantized both ways measures 2.0721e-3 against 2.0968e-3, a
+    // 1.2% gap. The dense bound of 1e-3 fails a correct implementation here.
+    //
+    // The growth with depth is MEASURED, not chosen to make the deep points pass: every
+    // healthy arm accumulates by ~4x from depth 2 to 28 (int8 2.07e-3 -> 7.34e-3, W4A8
+    // 2.10e-3 -> 8.91e-3, int4 3.80e-2 -> 1.59e-1), so `1 + depth/8` tracks the real
+    // curve with roughly 3x headroom throughout.
+    //
+    // It still has teeth at the depth that matters, which is what makes a depth-scaled
+    // bound honest: an `opI4Prep` truncation reads 2.96e-1 at depth 8 against this rule's
+    // 1.2e-1, and would PASS a bound keyed on depth 28 alone (2.13e-1 against 2.7e-1)
+    // because that defect saturates rather than diverging. Hence the intermediate depths.
     const base: f64 = switch (qdt orelse .f32) {
         .i4 => 6e-2,
         .i8, .w4a8 => 6e-3,
@@ -2955,7 +2950,7 @@ fn zimageCudaBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, seq: us
         try be.tensorUpload(x, std.mem.sliceAsBytes(host));
     }
     // One host-side bf16 weight per distinct (co,k); `cachedWeight` keys by host
-    // pointer, so a shared buffer would also share the device copy — which is what
+    // pointer, so a shared buffer would also share the device copy, which is what
     // we want, since the real weights are read from VRAM either way.
     var wbytes: [shapes.len][]u8 = undefined;
     var seen: [shapes.len]?usize = @splat(null);
@@ -3060,8 +3055,8 @@ fn zimageCudaBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, seq: us
         }
     }.go, be, .{ .q = q, .k = kk, .v = v, .o = ao, .seq = seq, .h = heads, .hd = hd, .nb = blocks });
 
-    // ⚠️ Timed per op FAMILY, not as one lump. "elementwise is 30% of the step"
-    // is not actionable — these are pure-bandwidth kernels, so the question is
+    // Timed per op FAMILY, not as one lump. "elementwise is 30% of the step"
+    // is not actionable, these are pure-bandwidth kernels, so the question is
     // which of them is far from the 936 GB/s the card can do, and a single total
     // averages the answer away.
     const ea = .{
@@ -3083,7 +3078,7 @@ fn zimageCudaBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, seq: us
         .nb = blocks,
     };
     const E = struct {
-        // ⚠️ Each is the exact call `zimage_cuda.blockForward` makes, per block.
+        // Each is the exact call `zimage_cuda.blockForward` makes, per block.
         fn rmsmod(b: *cuda.Backend, a: anytype) !void {
             try b.beginBatch();
             for (0..a.nb) |_| {
@@ -3146,12 +3141,12 @@ fn zimageCudaBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, seq: us
     for (parts) |p| t_elt += p.t;
 
     // --- the VAE mid-block attention, isolated -----------------------------------
-    // ⚠️ Its own section because it is a DIFFERENT shape from the DiT's: one head
+    // Its own section because it is a DIFFERENT shape from the DiT's: one head
     // over 512 channels attending across every latent position, so seq is ~26k where
     // the DiT's heads are 30x128. That difference is why the naive per-query kernel
     // is merely slow in the DiT and catastrophic here.
     {
-        // ⚠️ The VAE attends at LATENT resolution over every position, so its seq is
+        // The VAE attends at LATENT resolution over every position, so its seq is
         // the latent size, not the DiT token count. Pass the bench a latent-sized seq
         // (26136 = 132x198, a 1056x1584 render) to see the shape that actually runs.
         const vseq = seq;
@@ -3182,7 +3177,7 @@ fn zimageCudaBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, seq: us
             }
         };
         const va = .{ .q = vq, .k = vk, .v = vv, .o = vo, .n = vseq, .hd = vhd, .sc = vscale };
-        // 4·seq²·hd: QK then PV, no mask.
+        // 4*seq²*hd: QK then PV, no mask.
         const vflop = 4.0 * @as(f64, @floatFromInt(vseq)) * @as(f64, @floatFromInt(vseq)) * @as(f64, @floatFromInt(vhd));
         try stdout.print("\n-- VAE mid-block attention (seq={d}, 1 head x {d}) --\n", .{ vseq, vhd });
         const t_naive = try timeBest(io, 1, A.naive, be, va);
@@ -3192,7 +3187,7 @@ fn zimageCudaBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, seq: us
     }
 
     const total = t_full + t_attn + t_elt;
-    // Attention is 4·seq²·hd per head (QK then PV), both at full width — Z-Image
+    // Attention is 4*seq²*hd per head (QK then PV), both at full width, Z-Image
     // has no causal mask, so nothing is skipped.
     const aflop = 4.0 * @as(f64, @floatFromInt(seq)) * @as(f64, @floatFromInt(seq)) *
         @as(f64, @floatFromInt(hd * heads * blocks));
@@ -3201,7 +3196,7 @@ fn zimageCudaBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, seq: us
     try stdout.print("attention         : {d:7.1} ms  {d:5.1}%   ({d:.1} TFLOP/step, {d:.1} TFLOP/s)\n", .{ t_attn, 100 * t_attn / total, aflop / 1e12, aflop / (t_attn / 1e3) / 1e12 });
     try stdout.print("elementwise       : {d:7.1} ms  {d:5.1}%\n", .{ t_elt, 100 * t_elt / total });
     try stdout.print("                    {d:7.1} ms total device work\n", .{total});
-    // ⚠️ The achieved bandwidth is the number that says whether a kernel is
+    // The achieved bandwidth is the number that says whether a kernel is
     // *finished* or merely *working*: these move a known number of bytes and do
     // almost no arithmetic, so anything far under the card's ~936 GB/s is a
     // kernel problem, not a workload.
@@ -3524,7 +3519,7 @@ fn cudaStreamTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []
     const budget: u64 = @intFromFloat(budget_gib * (1 << 30));
 
     // COLD-LOAD (the real "step 1" cost): first forward after evict, budget=0 so
-    // the whole model pins in — this is the ~12 GB host->VRAM upload. SYNC pageable
+    // the whole model pins in, this is the ~12 GB host->VRAM upload. SYNC pageable
     // path first.
     be.budget_override = 0;
     be.evictWeights();
@@ -3553,7 +3548,7 @@ fn cudaStreamTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []
     }
     be.budget_override = 0;
 
-    // Async staging-ring COLD-LOAD: bounded 512 MB pinned ring (NOT registerHost —
+    // Async staging-ring COLD-LOAD: bounded 512 MB pinned ring (NOT registerHost,
     // no whole-file page-lock), weights read from the page-cache-backed mmap and
     // DMA'd off the main thread with block-N+1-ahead prefetch overlapping block-N
     // compute. "Lean on the mmap": cold reads fault from disk, warm reads hit page
@@ -3652,7 +3647,7 @@ fn cudaDitTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []con
     // Warm-up pass (uploads weights, JITs modules).
     try dit_cuda.forward(&model, be, &sess, &ws, io, arena, out_cuda, x, sigma, null);
     const reps: usize = if (lat <= 64) 4 else 2;
-    // Batched (profile off) timing — the real steady-state s/step.
+    // Batched (profile off) timing, the real steady-state s/step.
     var best_ms: f64 = std.math.inf(f64);
     for (0..reps) |_| {
         const ta = std.Io.Clock.real.now(io);
@@ -3692,7 +3687,7 @@ fn cudaDitTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []con
         // The CPU reference is weight-only (W{4,8}A16: dequant weights, f32
         // activations); CUDA also quantizes activations (W4A4 / W8A8). int8's
         // activation-quant error is tiny (<0.08); int4's 16-level activation
-        // quant diverges ~0.15-0.20 from the f32-activation reference — that's
+        // quant diverges ~0.15-0.20 from the f32-activation reference, that's
         // the price of W4A4, not a wiring bug (the per-linear sim is bit-exact).
         const tol: f32 = if (wqt == .i4) 0.25 else 0.08;
         if (rel > tol) return error.GpuMismatch;
@@ -3839,7 +3834,7 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
             opts.text_encoder_2_path = val;
             opts.explicit_text_encoder_2 = true;
         } else if (std.mem.eql(u8, flag, "--mmap")) {
-            // pread (default) | mmap | buffered — see safetensors.ReadMode.
+            // pread (default) | mmap | buffered, see safetensors.ReadMode.
             TensorPencil.safetensors.read_mode = TensorPencil.safetensors.parseReadMode(val) orelse {
                 std.log.err("--mmap: expected pread|mmap|buffered (got '{s}')", .{val});
                 return error.InvalidArgs;
@@ -3867,7 +3862,7 @@ fn generate(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, args: []const 
     if (opts.preview) opts.on_step = .{ .ctx = &cap, .step = PreviewCap.onStep };
 
     // --repeat N>1: keep ONE pipeline.Session resident across N images (the GUI's
-    // cross-queue path) and time each — the model loads only on image 1; images
+    // cross-queue path) and time each, the model loads only on image 1; images
     // 2..N should skip the reload/weight-upload warmup. seed advances per image.
     if (repeat > 1) {
         var sess = try TensorPencil.pipeline.Session.init(io, arena, opts, stdout);

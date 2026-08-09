@@ -14,7 +14,7 @@ const model_spec = @import("model_spec.zig");
 const SDLBackend = @import("backend");
 
 // SDL owns file picking: SDL_ShowOpen*Dialog parents the native dialog to the
-// main window (so it appears ON TOP, not behind it) — unlike tinyfiledialogs,
+// main window (so it appears ON TOP, not behind it), unlike tinyfiledialogs,
 // which spawns an unparented helper process. The dialogs are ASYNC: the callback
 // fires on the main thread during SDL event pumping and writes the chosen path
 // straight into the target PathBuf, then wakes a frame to show it.
@@ -26,7 +26,7 @@ var g_wakeup: ?*const fn () void = null;
 var g_dialog_open: bool = false;
 
 // Memoized checkpoint inspection for the three diffusion path rows (see
-// `model_spec.Cache` — a probe opens and parses a checkpoint header, far too
+// `model_spec.Cache`, a probe opens and parses a checkpoint header, far too
 // expensive for a per-frame render). Only live once `setEnv` has run.
 var g_spec_ready: bool = false;
 var g_primary_cache: model_spec.Cache = undefined;
@@ -62,7 +62,7 @@ pub fn deinit() void {
     g_spec_ready = false;
 }
 
-// Static filter sets — SDL keeps the pointer across the async call, so these
+// Static filter sets, SDL keeps the pointer across the async call, so these
 // MUST outlive the dialog (module-level const, never a stack local).
 const gguf_sdl = [_]SDLBackend.c.SDL_DialogFileFilter{
     .{ .name = "GGUF models", .pattern = "gguf" },
@@ -72,12 +72,11 @@ const safetensors_sdl = [_]SDLBackend.c.SDL_DialogFileFilter{
     .{ .name = "Safetensors", .pattern = "safetensors" },
     .{ .name = "All files", .pattern = "*" },
 };
-/// Any component that can arrive as its own file — the primary checkpoint, and the
+/// Any component that can arrive as its own file, the primary checkpoint, and the
 /// text encoders. `pipeline.Container` opens all of them by MAGIC, not by extension,
-/// so the picker must not hide GGUFs. ⚠️ A default filter that omits a format the
-/// engine supports reads as "unsupported": the encoder rows used to offer
-/// `safetensors` only, and a perfectly loadable `qwen_3_4b-q8_0.gguf` simply did not
-/// appear in the dialog.
+/// so the picker must not hide GGUFs. A default filter that omits a format the
+/// engine supports reads as "unsupported": an encoder row offering `safetensors` only
+/// hides perfectly loadable GGUF encoders from the dialog.
 const checkpoint_sdl = [_]SDLBackend.c.SDL_DialogFileFilter{
     .{ .name = "Checkpoints", .pattern = "safetensors;gguf" },
     .{ .name = "Safetensors", .pattern = "safetensors" },
@@ -113,7 +112,7 @@ var height_buf: [16]u8 = [_]u8{0} ** 16;
 var regen_buf: [16]u8 = [_]u8{0} ** 16;
 // Per-reply token cap. Sits in the sampling SECTION but is committed with the
 // other plain integers (commitNumbers), not with commitSampling: it is not part
-// of a preset — see config.Config.max_new_tokens.
+// of a preset, see config.Config.max_new_tokens.
 var maxnew_buf: [16]u8 = [_]u8{0} ** 16;
 // LLM sampling controls (same text-buffer pattern; floats parse on commit).
 var temp_buf: [16]u8 = [_]u8{0} ** 16;
@@ -135,7 +134,7 @@ pub fn open() void {
     seeded = false;
     // Re-read the checkpoints on every visit to Settings. The memo keys on the
     // path text, so it would otherwise never notice a file REPLACED under an
-    // unchanged path — a once-per-open probe is the cheap way to stay honest.
+    // unchanged path, a once-per-open probe is the cheap way to stay honest.
     if (g_spec_ready) {
         g_primary_cache.invalidate();
         g_te_cache.invalidate();
@@ -154,7 +153,7 @@ fn seed(cfg: *const config.Config) void {
     seeded = true;
 }
 
-/// Reseed just the sampling buffers from the config — also used when a preset
+/// Reseed just the sampling buffers from the config, also used when a preset
 /// is loaded (the studio numeric buffers keep their in-progress edits).
 fn seedSampling(cfg: *const config.Config) void {
     const s = &cfg.sampling;
@@ -192,7 +191,7 @@ fn commitNumbers(cfg: *config.Config) void {
     // Regen (checkpoint) cache: host RAM, capped at 64 GB to catch typos.
     cfg.regen_cache_mb = @min(parseNum(&regen_buf, cfg.regen_cache_mb), 64 << 10);
     // Max response: 0 keeps its "no explicit cap" meaning, so this only bounds
-    // typos at the top end — the real limit is the context window either way.
+    // typos at the top end, the real limit is the context window either way.
     cfg.max_new_tokens = @min(parseNum(&maxnew_buf, cfg.max_new_tokens), 1 << 20);
     commitSampling(cfg);
 }
@@ -620,7 +619,7 @@ fn taesdSizeDropdown(choice: *config.TaesdSize) void {
 
 /// Widget id for a settings row, derived from its visible text. Every
 /// section/help/row helper shares a single `@src()` across all its calls, so
-/// `id_extra` is the only thing keeping them distinct — and the visible text
+/// `id_extra` is the only thing keeping them distinct, and the visible text
 /// (section title, row label, help body) is already a unique natural key.
 /// Hashing it beats hand-numbered ids (which collide silently on edit) and a
 /// per-frame counter (whose ids shift when a row is reordered or becomes
@@ -699,11 +698,11 @@ fn dirRow(label: []const u8, pb: *config.PathBuf) void {
 // ── Checkpoint inspection panel ───────────────────────────────────────────────
 // What the configured diffusion files actually are, shown under the path rows so
 // the user finds out here rather than from a failed image. Purely informational:
-// it never blocks Apply and never edits the config — `pipeline.Session.init` is
+// it never blocks Apply and never edits the config, `pipeline.Session.init` is
 // the authority, and `model_spec` mirrors just enough of it to give a preview
 // (see that module's advisory warning).
 
-/// A `⚠ …` / `• …` status line. Colored by severity so the two problem kinds
+/// A `...` / `• ...` status line. Colored by severity so the two problem kinds
 /// (something is missing, something will refuse to load) stand out from the
 /// several ordinary "this is what you have" lines.
 fn statusLine(text: []const u8, err: bool) void {
@@ -750,7 +749,7 @@ fn checkpointPanel(cfg: *config.Config) void {
     statusFmt(&buf, "• Architecture: {s}", .{t.label}, false);
 
     // What the primary file carries, and what the overrides add. An override is
-    // reported even when the checkpoint has its own copy — that is the case where
+    // reported even when the checkpoint has its own copy, that is the case where
     // knowing which one wins actually matters.
     const te_set = cfg.text_encoder.opt();
     const te2_set = cfg.text_encoder_2.opt();
@@ -792,7 +791,7 @@ fn checkpointPanel(cfg: *config.Config) void {
     // that catches an upgrade in particular: switch the primary checkpoint to a
     // bundled SD1.5 file and leave krea2's encoder path set, and the resolver
     // (rightly) prefers the explicit file, opens krea2's qwen3 encoder, hunts for
-    // CLIP's tensors in it and reports `ComponentNotInCheckpoint` — an error that
+    // CLIP's tensors in it and reports `ComponentNotInCheckpoint`, an error that
     // names neither the file nor the reason. Say it here instead.
     //
     // Reported, never enforced: silently ignoring a path the user set would be a
@@ -830,7 +829,7 @@ fn checkpointPanel(cfg: *config.Config) void {
     };
 
     // Backend compatibility. Every architecture runs on every backend today, so
-    // this normally says nothing — it stays because "which backends" is a
+    // this normally says nothing, it stays because "which backends" is a
     // per-family fact (it was cpu-only for the SD family until its device kernels
     // landed) and the next architecture will arrive CPU-first.
     const want = diffuser.toPipelineBackend(cfg.diff_backend);

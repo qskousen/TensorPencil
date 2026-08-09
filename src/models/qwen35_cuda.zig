@@ -56,9 +56,9 @@ const nsplit = 32;
 /// (bounds the flash-decode scratch).
 ///
 /// 256, not 128: the MMQ prefill kernel tiles 128 tokens x 128 rows per block, so
-/// a 128-token chunk launches only `rows/128` blocks — 136 for the widest FFN,
+/// a 128-token chunk launches only `rows/128` blocks, 136 for the widest FFN,
 /// under two waves on a 3090's 82 SMs, so a large part of each launch is tail. The
-/// same change was worth +46% on gemma4 before its MMQ landed. It costs activation
+/// same change is worth +46% on gemma4 without MMQ. It costs activation
 /// scratch, which `Bufs.pad_rows` sizes from this constant rather than a second
 /// hardcoded 128.
 const prefill_chunk = 512;
@@ -89,7 +89,7 @@ pub const CudaLM = struct {
     cfg: qwen35.Config,
     /// Committed KV rows; grows in place toward max_capacity (ensureCapacity).
     capacity: usize,
-    /// Growth ceiling — the VA reservation behind each KV cache and the RoPE
+    /// Growth ceiling, the VA reservation behind each KV cache and the RoPE
     /// table are sized to this, so growth never moves a device pointer.
     max_capacity: usize,
     /// The KV capacity a fresh session starts at; resetResidency shrinks back to
@@ -128,7 +128,7 @@ pub const CudaLM = struct {
     op_dump: ?[]f32 = null,
     op_dump_row: usize = 0,
     /// Which activation (and its width) the backend q8 scratch currently
-    /// holds — gemv() asserts the dp4a path reads what quantizeX staged.
+    /// holds, gemv() asserts the dp4a path reads what quantizeX staged.
     q8_for: Buf = .{},
     q8_cols: usize = 0,
     /// Captured decode step (CUDA graph): one launch replays the whole
@@ -148,7 +148,7 @@ pub const CudaLM = struct {
     /// Hybrid CPU/GPU layer split (null = every layer on device). When set,
     /// the layers with `on_gpu[l] == false` run on the host via
     /// `qwen35.Model.cpuLayer`, keeping their weights off the device entirely
-    /// (no per-token PCIe re-stream). Forces the per-op decode path — a
+    /// (no per-token PCIe re-stream). Forces the per-op decode path, a
     /// captured graph cannot record host compute.
     split: ?Split = null,
     arena: std.heap.ArenaAllocator,
@@ -167,7 +167,7 @@ pub const CudaLM = struct {
         state: qwen35.State,
         /// Host activation scratch, sized for a full prefill chunk.
         scratch: qwen35.Scratch,
-        /// Host RoPE table, grows with capacity (scalar positions — text only).
+        /// Host RoPE table, grows with capacity (scalar positions, text only).
         freqs: ops.rope.Freqs,
         /// Host hidden buffer ([prefill_chunk * hidden]).
         hx: []f32,
@@ -214,7 +214,7 @@ pub const CudaLM = struct {
         // The graph path needs a device-side embedding gather kernel.
         self.graph_ok = graphOkFor(lm.embed.dtype);
 
-        // Rope table for the rotated span (rope_dim), like qwen3_cuda's —
+        // Rope table for the rotated span (rope_dim), like qwen3_cuda's,
         // computed to max_capacity up front so sin_off (baked into captured
         // graphs as a kernel param) never changes when the KV caches grow.
         var freqs = try ops.rope.rotateHalfFreqs(gpa, cap.max, cfg.rope_dim, cfg.rope_theta);
@@ -296,7 +296,7 @@ pub const CudaLM = struct {
         self.decode_warm = false;
         // Host-resident attention layers keep no device KV (their growables
         // were already destroyed by migrateLayer; growableDestroy is
-        // idempotent) — only GPU-resident slots are re-created at the new
+        // idempotent), only GPU-resident slots are re-created at the new
         // element size.
         for (self.k_cache) |*b| be.growableDestroy(b);
         for (self.v_cache) |*b| be.growableDestroy(b);
@@ -316,7 +316,7 @@ pub const CudaLM = struct {
         }
         // Full context clear, not just `len = 0`: the caller re-prefills the
         // whole transcript, which must start from ZEROED conv/ssm recurrent
-        // state and pos 0 — stale state would double-apply the transcript
+        // state and pos 0, stale state would double-apply the transcript
         // through the linear-attention layers.
         try self.resetCache();
     }
@@ -355,14 +355,14 @@ pub const CudaLM = struct {
     pub fn capacityMax(self: *const CudaLM) usize {
         return self.max_capacity;
     }
-    /// Device VRAM (bytes) currently in use by this backend — for the
+    /// Device VRAM (bytes) currently in use by this backend, for the
     /// end-of-response telemetry (`session.statsOf`).
     pub fn vramUsed(self: *const CudaLM) u64 {
         return self.be.deviceUsed();
     }
 
     /// Commit more KV rows, in place: device pointers (and the captured
-    /// decode graph — sin_off and the KV strides are capacity-independent)
+    /// decode graph, sin_off and the KV strides are capacity-independent)
     /// stay valid. Under VRAM pressure the commit evicts LRU weights into
     /// the streaming path, which flips the graph off via the evictions guard
     /// in step(). error.ContextFull past the window or when even eviction
@@ -371,12 +371,12 @@ pub const CudaLM = struct {
         const target = (try kvmod.growPlan(self.capacity, self.max_capacity, min_rows)) orelse return;
         // Byte size MUST match how the buffers were created (kv_dtype block
         // math), or an f16/q8_0 cache requests f32-sized growth, overshoots its
-        // VA reservation, and growableEnsure fails with DeviceOutOfMemory →
+        // VA reservation, and growableEnsure fails with DeviceOutOfMemory ->
         // ContextFull once the window grows past ~max_capacity/2.
         const bytes = self.kv_dtype.sizeBytes(target * self.cfg.kvDim());
 
         // Dynamic offload: migrate layers GPU->CPU until there's headroom to
-        // grow the device KV — instead of streaming weights (the cliff). Each
+        // grow the device KV, instead of streaming weights (the cliff). Each
         // migrated attention layer frees its device KV immediately; linear
         // layers free weight VRAM via the cache. Migrate attention-first (the
         // policy's order) so headroom recovers per step.
@@ -395,7 +395,7 @@ pub const CudaLM = struct {
         // was room: a resident image model on another CUDA context may grab it
         // between the headroom check and this commit. On a real OOM, offload one
         // more layer to the CPU and retry the whole grow, so a full window only
-        // ever fails once nothing is left to migrate — never a premature
+        // ever fails once nothing is left to migrate, never a premature
         // ContextFull while layers can still move to host. growableEnsure is
         // idempotent, so re-running the loop is cheap.
         grow: while (true) {
@@ -469,7 +469,7 @@ pub const CudaLM = struct {
             try self.be.tensorDownload(offsetBufSized(self.ssm_state, lin_idx * ssm_n * 4, ssm_n * 4), std.mem.sliceAsBytes(hs));
         }
         // Free the migrated layer's device weights (ggml reads them from host
-        // now) — this is the bulk of the reclaimed VRAM.
+        // now), this is the bulk of the reclaimed VRAM.
         const layer = &self.lm.layers[l];
         const mlp = switch (layer.*) {
             .attn => |*a| &a.mlp,
@@ -499,7 +499,7 @@ pub const CudaLM = struct {
     }
 
     /// Total device footprint of one layer's streamable weights (quantized
-    /// bytes, as uploaded) — the big projection + MLP matrices; norms/conv
+    /// bytes, as uploaded), the big projection + MLP matrices; norms/conv
     /// are negligible and ignored.
     fn layerDeviceBytes(layer: *const qwen35.Layer) usize {
         const mlp = switch (layer.*) {
@@ -515,7 +515,7 @@ pub const CudaLM = struct {
     }
 
     /// Upload every device-resident weight NOW, so the one-time host->device copy
-    /// is not charged to the first forward. Mirrors `layerDeviceBytes` exactly —
+    /// is not charged to the first forward. Mirrors `layerDeviceBytes` exactly,
     /// the same tensors it counts are the ones warmed here, so the two cannot
     /// drift. See `Backend.warmWeight` for why this exists.
     ///
@@ -599,7 +599,7 @@ pub const CudaLM = struct {
         errdefer gpa.free(order);
         switch (policy) {
             .tail => for (0..n) |i| {
-                order[i] = n - 1 - i; // last layer first → contiguous device prefix
+                order[i] = n - 1 - i; // last layer first -> contiguous device prefix
             },
             .attn => {
                 // Attention layers first (descending), then linear (descending):
@@ -636,7 +636,7 @@ pub const CudaLM = struct {
         if (n_cpu == 0 and !dynamic) {
             gpa.free(on_gpu);
             gpa.free(order);
-            return; // everything fits resident — no split needed
+            return; // everything fits resident, no split needed
         }
 
         // Host state for the CPU-resident layers (sized to the current KV
@@ -677,11 +677,11 @@ pub const CudaLM = struct {
         self.graph_ok = false; // per-op path: host layers can't be captured
 
         // Place the statically-planned layers on the host. Before any tokens
-        // (the autoOffload-at-init path) there is nothing to copy — mark them
+        // (the autoOffload-at-init path) there is nothing to copy, mark them
         // and free the device KV; weights are reclaimed lazily by the cache
         // and conv/ssm start zeroed on both sides. Armed MID-conversation
         // (imageReclaim), each layer's live rows/state must move to the host
-        // instead — migrateLayer does the copy AND the on_gpu/n_cpu
+        // instead, migrateLayer does the copy AND the on_gpu/n_cpu
         // bookkeeping, or the context would be destroyed with the device KV.
         if (self.len == 0) {
             const sp = &self.split.?;
@@ -705,18 +705,18 @@ pub const CudaLM = struct {
 
     /// Arm dynamic CPU offload iff the projected max-context footprint (all layer
     /// weights + KV grown to `max_capacity` + reserve slack) won't fit under
-    /// `budget` bytes. When it fits, do nothing — the model stays fully resident
+    /// `budget` bytes. When it fits, do nothing, the model stays fully resident
     /// on the fast path. When it doesn't, `enableCpuSplit(.attn, budget, dynamic)`
     /// packs the GPU now and migrates layers to the host as the KV cache grows
     /// (instead of the weight-streaming cliff). Must run before any tokens.
     /// `budget == 0` is treated as "no limit" (never offload). Text sessions
-    /// only — the host layer path uses scalar RoPE (see enableCpuSplit / the GUI
+    /// only, the host layer path uses scalar RoPE (see enableCpuSplit / the GUI
     /// guard). Returns whether a split was armed.
     pub fn autoOffload(self: *CudaLM, budget: u64) !bool {
-        if (budget == 0) return false; // no budget → fully resident, no offload path
+        if (budget == 0) return false; // no budget -> fully resident, no offload path
         // Always arm the dynamic split. When the model fits its budget it places
-        // ZERO layers on the CPU — measured free (per-op decode ties the captured
-        // graph: 76.2 vs 77.2 tok/s on the 9B) — and migrates layers on demand as
+        // ZERO layers on the CPU, measured free (per-op decode ties the captured
+        // graph: 76.2 vs 77.2 tok/s on the 9B), and migrates layers on demand as
         // the KV cache grows. Arming unconditionally means over-budget growth
         // degrades via CPU offload (measured ~2.5x FASTER than weight streaming on
         // this box: 18.3 vs 7.0 tok/s) instead of falling into the slow streaming
@@ -729,16 +729,16 @@ pub const CudaLM = struct {
     /// reaches `needed_free` bytes, or nothing is left. Fixed-target variant used
     /// by the VRAM coordinator (free room for the image model). No-op without a
     /// dynamic split. (ensureCapacity keeps its own loop, whose target shrinks per
-    /// iteration as liveAttnSlots drops — a fixed target here can't express that.)
+    /// iteration as liveAttnSlots drops, a fixed target here can't express that.)
     pub fn offloadUntilFree(self: *CudaLM, needed_free: u64) !void {
         return residency.offloadUntilFree(self, needed_free);
     }
 
     /// Migrate layers to the host until the LLM's ACTUAL total device usage is at
-    /// or under `target` bytes — used by the GUI's `balanced` mode to settle the
+    /// or under `target` bytes, used by the GUI's `balanced` mode to settle the
     /// LLM to its share (e.g. 75% of the limit) ONLY when an image model loads
     /// (contention); with no image loaded the LLM keeps the whole limit. Uses live
-    /// `deviceUsed()` (robust — no size estimation), so it must run after the
+    /// `deviceUsed()` (robust, no size estimation), so it must run after the
     /// weights are on the device. One-way + idempotent: once under `target` it's a
     /// no-op, so repeat calls (per image) don't re-shuffle.
     pub fn offloadToBudget(self: *CudaLM, target: u64) !void {
@@ -746,8 +746,8 @@ pub const CudaLM = struct {
     }
 
     /// `residency.demand` hook: this layer's weight bytes alone (no KV). Lets the
-    /// demand estimate separate "weights not uploaded yet" — which the backend's
-    /// pinned-bytes counter already accounts for globally — from the device KV a
+    /// demand estimate separate "weights not uploaded yet", which the backend's
+    /// pinned-bytes counter already accounts for globally, from the device KV a
     /// promote has to re-create.
     pub fn layerWeightBytes(self: *CudaLM, l: usize) usize {
         return layerDeviceBytes(&self.lm.layers[l]);
@@ -762,7 +762,7 @@ pub const CudaLM = struct {
         return h.len + if (e.ptr == h.ptr) 0 else e.len;
     }
 
-    /// `residency.promoteBack` cost hook: VRAM a promote of layer `l` needs — its
+    /// `residency.promoteBack` cost hook: VRAM a promote of layer `l` needs, its
     /// streamable weights, the KV it re-commits at capacity (attention layers
     /// only; recurrent layers hold fixed-size conv/ssm state, no KV), plus slack.
     pub fn promoteCost(self: *CudaLM, l: usize) usize {
@@ -803,7 +803,7 @@ pub const CudaLM = struct {
     }
 
     /// Migrate CPU layers back onto the GPU (LIFO by offload order), stopping
-    /// before the next would overflow `budget` — so the caller (VRAM coordinator,
+    /// before the next would overflow `budget`, so the caller (VRAM coordinator,
     /// after image generation) reclaims LLM residency while leaving room for
     /// whatever else stays resident. Keeps the split armed. Returns the count
     /// promoted; 0 without a split.
@@ -855,7 +855,7 @@ pub const CudaLM = struct {
 
     /// Fixed byte size of a turn checkpoint (see `checkpoint`): the M-RoPE
     /// position plus every DeltaNet layer's conv + ssm recurrent state.
-    /// Independent of context length — attention KV is append-only, so a
+    /// Independent of context length, attention KV is append-only, so a
     /// rollback copies none of it (`restoreCheckpoint` just truncates).
     pub fn checkpointBytes(self: *const CudaLM) usize {
         const cfg = self.cfg;
@@ -879,8 +879,8 @@ pub const CudaLM = struct {
     }
 
     /// Roll the context back to `q` committed tokens (a turn boundary) using a
-    /// snapshot taken there. Rows past `q` in the append-only attention KV —
-    /// device growables and the split's host shadow alike — are simply
+    /// snapshot taken there. Rows past `q` in the append-only attention KV,
+    /// device growables and the split's host shadow alike, are simply
     /// abandoned (the next write overwrites them), and the recurrent conv/ssm
     /// state is written back to each layer's CURRENT owner. The captured
     /// decode graph stays valid: it reads {token, len} and the M-RoPE triple
@@ -903,7 +903,7 @@ pub const CudaLM = struct {
 
     /// Shared body of checkpoint/restoreCheckpoint: move every DeltaNet
     /// layer's conv+ssm slice between the snapshot buffer (`buf`, laid out as
-    /// all conv states then all ssm states, lin-layer major — the same order
+    /// all conv states then all ssm states, lin-layer major, the same order
     /// as the device buffers and the split host arrays) and the layer's
     /// current owner.
     fn checkpointState(self: *CudaLM, comptime dir: CheckpointDir, buf: if (dir == .save) []u8 else []const u8) !void {
@@ -982,7 +982,7 @@ pub const CudaLM = struct {
     }
 
     /// `stepArgmax` with sampling penalties scattered onto the device logits
-    /// first (opPenalize; see sample.zig) — keeps penalized greedy decode
+    /// first (opPenalize; see sample.zig), keeps penalized greedy decode
     /// on the GPU path instead of the full-vocab download.
     pub fn stepArgmaxPen(self: *CudaLM, io: std.Io, ids_new: []const u32, pen: []const sample.PenaltyEntry, sp: sample.Params) !u32 {
         try self.forwardDecode(io, ids_new);
@@ -1008,7 +1008,7 @@ pub const CudaLM = struct {
     }
 
     /// `stepSelect` with sampling penalties scattered onto the device logits
-    /// before the top-k (opPenalize) — the selected candidates are the true
+    /// before the top-k (opPenalize), the selected candidates are the true
     /// post-penalty top set, so penalized stochastic decode stays on the GPU.
     pub fn stepSelectPen(self: *CudaLM, io: std.Io, ids_new: []const u32, pen: []const sample.PenaltyEntry, sp: sample.Params, out_id: []u32, out_logit: []f32) !usize {
         try self.forwardDecode(io, ids_new);
@@ -1035,7 +1035,7 @@ pub const CudaLM = struct {
         while (off < ids.len) {
             // usize annotation matters: @min with a comptime_int bound yields
             // a range-narrowed type (u7 here), and `n * 3` would overflow it.
-            // See ZIG.md "@min/@max narrow their result type".
+            //
             const n: usize = @min(prefill_chunk, ids.len - off);
             try qwen3.embedTokens(self.lm.embed, ids[off..][0..n], x[0 .. n * cfg.hidden]);
             for (0..n) |t| {
@@ -1075,7 +1075,7 @@ pub const CudaLM = struct {
         var off: usize = 0;
         const total = grid_w * grid_h;
         while (off < total) {
-            // usize annotation: see prefill (@min range-narrowing, ZIG.md).
+            // usize annotation: see prefill (@min narrows its result type).
             const n: usize = @min(@min(debug_image_chunk, prefill_chunk), total - off);
             for (0..n) |t| {
                 const i = off + t;
@@ -1116,7 +1116,7 @@ pub const CudaLM = struct {
         // forward is ~0.5 s, far too long to sit on a cancel; the `errdefer` above
         // aborts the recording batch and `self.len` is only advanced after
         // `endBatch`, so an unwind here commits nothing and leaves `cached()` truthful.
-        // Pause deliberately does NOT park here — see `ops/pause.zig` and the engine.
+        // Pause deliberately does NOT park here, see `ops/pause.zig` and the engine.
         const ctok = ops.cancel.token;
         for (self.lm.layers, 0..) |*layer, l| {
             if (ops.cancel.canceled(ctok)) return error.Canceled;
@@ -1205,12 +1205,12 @@ pub const CudaLM = struct {
                     const ssm_off = lin_idx * heads * d * d * 4;
                     const ssm = offsetBufSized(self.ssm_state, ssm_off, heads * d * d * 4);
                     // Everything except the state recurrence is batched over the
-                    // chunk. ⚠️ Measured on Bonsai-27B: running all seven of these
-                    // per token cost **46% of prefill** (333 → 614 tok/s with the
+                    // chunk. Measured on Bonsai-27B: running all seven of these
+                    // per token cost 46% of prefill (333 -> 614 tok/s with the
                     // loop removed entirely), and only `opGdnDeltaStep` is
-                    // genuinely sequential — the conv is a convolution, and the
+                    // genuinely sequential, the conv is a convolution, and the
                     // gates / L2-norm / alpha / beta are per-token independent.
-                    // Batching the other six is worth 333 → 411 tok/s.
+                    // Batching the other six is worth 333 -> 411 tok/s.
                     const batched = skipMask() & 4 == 0 and n > 1 and Backend.quantQ8BatchSupported(ll.alpha.dtype) and
                         ll.alpha.cols % 256 == 0 and heads % 8 == 0;
                     if (batched) {
@@ -1225,7 +1225,7 @@ pub const CudaLM = struct {
                         // sits between them), hence the grouped form.
                         try be.opL2NormRowsGrouped(b.lin_conv, n * 2 * cfg.lin_k_heads, d, 2 * cfg.lin_k_heads, channels, eps);
                         // The recurrence itself, state resident in registers for the
-                        // whole chunk — bit-identical to the per-token form below.
+                        // whole chunk, bit-identical to the per-token form below.
                         try be.opGdnDeltaChunk(
                             ssm,
                             b.lin_conv,
@@ -1292,7 +1292,7 @@ pub const CudaLM = struct {
             }
         }
         // Split: advance the host KV in lockstep (the residual stream itself is
-        // discarded — prefill reads no logits; the next chunk re-embeds anew).
+        // discarded, prefill reads no logits; the next chunk re-embeds anew).
         if (self.split) |*sp| {
             sp.state.kv.commit(n);
             sp.state.len += n;
@@ -1305,7 +1305,7 @@ pub const CudaLM = struct {
     /// (weight streamed ceil(n/8) times) instead of opMatmulQuant's full
     /// dequant-to-f16 GEMM. Measured on the 3090 27B: one grouped pass is
     /// ~165 us vs ~0.92 ms per weight per chunk for dequant+hgemm
-    /// (n-independent), so the crossover sits near n = 44 — grouped wins
+    /// (n-independent), so the crossover sits near n = 44, grouped wins
     /// 3-6x on chat-turn-sized chunks, GEMM wins on full 128-row chunks.
     const grouped_prefill_max = 40;
 
@@ -1316,7 +1316,7 @@ pub const CudaLM = struct {
             try self.quantizeX(x, w.cols);
             return self.gemv(y, x, w);
         }
-        // Same gate as `gemv` — see the comment there.
+        // Same gate as `gemv`, see the comment there.
         if (w.dtype.isBlockQuant() and !Backend.quantKernelSupported(w.dtype))
             return error.UnsupportedDType;
         if (debug_gemv_prefill) {
@@ -1331,7 +1331,7 @@ pub const CudaLM = struct {
             try self.quantizeX(x, n * w.cols);
             var off: usize = 0;
             while (off < n) : (off += 8) {
-                // usize annotation: @min range-narrows (ZIG.md).
+                // usize annotation: @min range-narrows.
                 const ng: usize = @min(8, n - off);
                 try self.be.opGemvQuantQ8N(w.dtype, offsetBufSized(y, off * w.rows * 4, ng * w.rows * 4), w.bytes, w.scale, w.rows, w.cols, ng, off, n);
             }
@@ -1339,7 +1339,7 @@ pub const CudaLM = struct {
         }
         // Batched prefill: MMQ on the s8 tensor cores straight from the packed
         // weight, when the backend says it beats dequant-to-f16 for this dtype.
-        // The margin is widest for q1_0 — the f16 expansion it avoids is ~14x the
+        // The margin is widest for q1_0, the f16 expansion it avoids is ~14x the
         // bytes MMQ reads, against ~3.5x for q4_k.
         if (Backend.mmqPipeFaster(w.dtype, w.rows, w.cols)) {
             return self.be.opMatmulQuantMmqPipe(w.dtype, y, x, n, w.bytes, w.rows, w.cols);
@@ -1347,12 +1347,12 @@ pub const CudaLM = struct {
         try self.be.opMatmulQuant(w.dtype, y, x, n, w.bytes, w.rows, w.cols);
     }
 
-    /// `TP_SKIP` — prefill BUDGET bitmask: each bit removes one component from
+    /// `TP_SKIP`, prefill BUDGET bitmask: each bit removes one component from
     /// `stepBatch`, so a run measures the prefill cost of everything *except* it.
     ///
     /// The output is garbage by construction; this is a stopwatch, not a mode. Its
-    /// value is that the removed costs must **sum to the baseline**, which is what
-    /// makes the resulting budget trustworthy — a per-component `--profile` number
+    /// value is that the removed costs must sum to the baseline, which is what
+    /// makes the resulting budget trustworthy, a per-component `--profile` number
     /// cannot be checked that way (and its timings are distorted by added syncs).
     ///
     ///   1 MLP (gate/up/down + silu)      8 attention op
@@ -1420,7 +1420,7 @@ pub const CudaLM = struct {
 
         // Hybrid split: the hidden begins on the device (bufs.x). A CPU-resident
         // layer pulls it to the host once, runs there, and the next device layer
-        // (if any) pushes it back — see enableCpuSplit. on_host tracks where the
+        // (if any) pushes it back, see enableCpuSplit. on_host tracks where the
         // live residual stream currently sits.
         if (self.split) |*sp| sp.on_host = false;
 
@@ -1563,7 +1563,7 @@ pub const CudaLM = struct {
 
     /// Single-token decode as one captured-graph replay: {token, len} land
     /// in g_state and the M-RoPE triple in pos3_d before the launch (the
-    /// graph's kernels read both). Captured on the second decode step — the
+    /// graph's kernels read both). Captured on the second decode step, the
     /// first (per-op) step warms weight residency, JIT, and the activation
     /// scratch sizes. Any weight eviction invalidates baked device pointers,
     /// so capture failures and eviction fall back to per-op decode for good.
@@ -1599,7 +1599,7 @@ pub const CudaLM = struct {
         // capturing stream.
         try self.embedGather();
         // That upload (~874 MB for the 27B) may itself have evicted LRU
-        // weights under VRAM pressure — the capture would then re-upload
+        // weights under VRAM pressure, the capture would then re-upload
         // them mid-capture (cuMemAlloc, illegal while capturing). Bail to
         // per-op decode instead of starting a capture that must fail.
         if (be.evictions != 0) return error.WeightsEvicted;
@@ -1622,7 +1622,7 @@ pub const CudaLM = struct {
 
     /// The recorded decode step: device-side embedding gather (token id from
     /// g_state[0]) followed by the shared decode body in graph mode. No
-    /// uploads, downloads, or batch bookkeeping — those live outside the
+    /// uploads, downloads, or batch bookkeeping, those live outside the
     /// replay.
     fn recordDecodeOps(self: *CudaLM) !void {
         try self.embedGather();
@@ -1659,7 +1659,7 @@ pub const CudaLM = struct {
             std.debug.assert(self.q8_for.buf == x.buf and self.q8_cols == w.cols);
             try be.opGemvQuantQ8(w.dtype, y, w.bytes, w.scale, w.rows, w.cols);
         } else if (w.dtype.isBlockQuant()) {
-            // ⚠️ Checked, not assumed: `opGemvQuant`/`opMatmulQuant` switch on
+            // Checked, not assumed: `opGemvQuant`/`opMatmulQuant` switch on
             // dtype with `else => unreachable`, so a block quant with no CUDA
             // kernel (q2_0_g64 today) would panic deep in a forward instead of
             // reporting. The check lives here rather than at load because a mixed
@@ -1776,7 +1776,7 @@ const Bufs = struct {
 
 // Gated on -Dintegration + a CUDA device + the real 27B checkpoint: a greedy
 // continuation after `restoreCheckpoint` must be TOKEN-IDENTICAL to the first
-// greedy continuation from the same boundary — including after some layers
+// greedy continuation from the same boundary, including after some layers
 // migrate to the CPU between the two runs (the snapshot is owner-agnostic and
 // restore writes to each layer's current owner). This is the engine-level
 // guarantee behind the GUI's fast "regenerate response" rollback.
@@ -1797,7 +1797,7 @@ fn checkpointRestoreBody(kv_dtype: kvmod.KvDtype) !void {
     var model = try CudaLM.init(gpa, be, &lm, .{ .initial = 256, .max = 512, .kv_dtype = kv_dtype });
     defer model.deinit();
 
-    // A fixed prompt of raw ids (no tokenizer needed — greedy determinism is
+    // A fixed prompt of raw ids (no tokenizer needed, greedy determinism is
     // what's under test, not language). Prefill to the boundary, snapshot.
     var prompt: [48]u32 = undefined;
     for (&prompt, 0..) |*t, i| t.* = @intCast(1000 + i * 37);
@@ -1832,7 +1832,7 @@ fn checkpointRestoreBody(kv_dtype: kvmod.KvDtype) !void {
     // host, then restore the SAME snapshot (taken while fully device-resident):
     // restore must write each layer's state to its NEW owner. Hybrid CPU/GPU
     // decode is not bit-identical to all-GPU decode (host f32 vs device dp4a),
-    // so assert REPEATABILITY here — two restored continuations must agree.
+    // so assert REPEATABILITY here, two restored continuations must agree.
     try model.enableCpuSplit(.tail, std.math.maxInt(u64), true);
     try model.offloadToBudget(be.deviceUsed() * 4 / 5);
     try model.restoreCheckpoint(snap, q);
@@ -1852,8 +1852,8 @@ fn checkpointRestoreBody(kv_dtype: kvmod.KvDtype) !void {
     try std.testing.expectEqualSlices(u32, &seq3, &seq4);
 
     // Promote everything back onto the device and restore once more: the
-    // recurrent state round-trips host→device, so an owner-misdirected
-    // restore would now surface as divergence from the all-GPU baseline —
+    // recurrent state round-trips host->device, so an owner-misdirected
+    // restore would now surface as divergence from the all-GPU baseline,
     // which this continuation must match bit-for-bit again.
     _ = try model.promoteLayers(std.math.maxInt(u64));
     try model.restoreCheckpoint(snap, q);
@@ -1872,7 +1872,7 @@ test "checkpoint restore regenerates token-identical on the real model" {
 
 // Same workout on an f16 KV cache: the split's host shadow stores packed f16
 // (byte-identical to the device caches, slot-indexed like the device), so the
-// mid-conversation migrate and the promote round trip must stay exact —
+// mid-conversation migrate and the promote round trip must stay exact,
 // token-identical within the f16 session.
 test "checkpoint restore regenerates token-identical on the real model (f16 kv)" {
     try checkpointRestoreBody(.f16);
@@ -1886,7 +1886,7 @@ test "checkpoint restore regenerates token-identical on the real model (q8_0 kv)
 
 // The initial split plan must respect the card's LIVE free VRAM, not just the
 // abstract budget: with most of the card occupied (another process, a resident
-// image model), a generous budget must still plan layers onto the host —
+// image model), a generous budget must still plan layers onto the host,
 // planning them all resident faults at the first prefill instead (weight
 // uploads + lazy PTX JIT collide at zero free; surfaced in tp-gui as
 // "PTX JIT failed: CUDA_ERROR_ILLEGAL_ADDRESS").
@@ -1922,7 +1922,7 @@ test "cpu split plan respects live free VRAM" {
 
 // A hybrid split's host layers can run BEFORE any step(): the tp-gui turn flow
 // prefills first, and an over-budget model has host layers from init. With the
-// stepper's `io` unseeded that used to be undefined-pointer UB (GP fault deep
+// stepper's `io` unseeded that is undefined-pointer UB (a GP fault deep
 // in the host matmul's groupAsync); it must instead fail closed, and work once
 // the session owner seeds it (gui/chat.zig Session.init does).
 test "cpu split prefill before any step needs a seeded io" {

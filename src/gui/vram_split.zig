@@ -1,44 +1,31 @@
-//! Attribution math for the status-bar VRAM meter: turns one coherent snapshot
-//! of four readings — whole-card used, OUR process's card footprint, the LLM's
-//! tracked bytes, diffusion's tracked bytes — into the meter's two residual
-//! blocks: `overhead` (ours, untracked) and `system` (other processes/driver).
+//! Attribution math for the status-bar VRAM meter: turns one coherent snapshot of four
+//! readings (whole-card used, OUR process's card footprint, the LLM's tracked bytes,
+//! diffusion's tracked bytes) into the meter's two residual blocks, `overhead` (ours,
+//! untracked) and `system` (other processes and the driver).
 //!
-//! Pure math, no dvui/NVML: unit-tested via `zig build gui-test`.
+//! Pure math, no dvui or NVML: unit-tested via `zig build gui-test`.
 //!
-//! ## Why this module exists (two measured bugs it fixes)
+//! `system` is `device_used - proc_used`, derived only from two numbers out of the SAME
+//! driver snapshot. Computing it as `device_used - llm - diffusion` instead mixes a
+//! device total sampled every 500 ms with per-component reads taken live every frame, so
+//! every diffusion alloc/free moves it the opposite way at frame rate, in GB-sized swings
+//! when the DiT is evicting and reloading weights each step.
 //!
-//! 1. **"system" bounced during diffusion.** The meter computed
-//!    `system = device_used − llm − diffusion` from a device total sampled every
-//!    500 ms but per-component reads taken LIVE every frame. Every diffusion
-//!    alloc/free therefore moved "system" the opposite way at frame rate until
-//!    the next device sample landed — worst when VRAM-constrained (the DiT
-//!    evicts + reloads weights every step, so the swings are GB-sized), and
-//!    invisible during LLM decode (its tracked bytes barely move). The fix is
-//!    structural, not cosmetic: `system` is now `device_used − proc_used`, i.e.
-//!    derived ONLY from two numbers out of the same driver snapshot, so our own
-//!    allocation churn cannot enter it at all.
+//! `overhead` exists because a large part of our own VRAM is untracked: the CUDA contexts
+//! and JIT'd modules, cuBLASLt/cuDNN internals, the SDL/GL window and image textures.
+//! Measured on a 3090 with a 12.3 G LLM and a 5.8 G diffusion model resident, the card
+//! reads 23.4 G used, our process 21.9 G and our tracked components 20.9 G, so ~1 G is
+//! ours rather than the system's. The same hole covers the model-load window, where the
+//! session is not published yet and its uploads would otherwise count as system.
 //!
-//! 2. **~1 GiB of OUR VRAM was drawn as "system".** Whatever our allocators
-//!    don't count — the CUDA context(s) + JIT'd modules, cuBLASLt/cuDNN
-//!    internals, the SDL/GL window and image textures — fell into the residual.
-//!    Measured on a 3090 with a 12.3 G LLM + a 5.8 G diffusion model resident:
-//!    card 23.4 G used, our process 21.9 G, our tracked components 20.9 G → the
-//!    ~1 G difference is ours, not the system's. It gets its own block now.
-//!    (Same hole covered the model-LOAD window, where the session isn't
-//!    published yet and its uploads counted as "system".)
-//!
-//! ## Why the residuals are low-passed
-//!
-//! Both residuals are physically slow-moving (other processes' usage; our
-//! context/kernel/texture footprint), while `ours` swings hard mid-generation
-//! and the driver's per-process number lags our exact counters by up to a
-//! sample. Smoothing keeps that lag out of the display; the leftover skew lands
-//! in `free`, which is *defined* as the unaccounted gap and is drawn as bare
-//! background.
+//! Both residuals are low-passed because they are physically slow-moving, while `ours`
+//! swings hard mid-generation and the driver's per-process number lags our own counters
+//! by up to a sample. Smoothing keeps that lag out of the display; the leftover skew
+//! lands in `free`, which is defined as the unaccounted gap.
 const std = @import("std");
 
 /// One coherent snapshot. `device_used`/`proc_used` MUST come from the same
-/// driver query pass as each other, and `ours` from the same instant — mixing a
+/// driver query pass as each other, and `ours` from the same instant, mixing a
 /// stale total with live component reads is bug 1 above.
 pub const Reading = struct {
     /// Card capacity.
@@ -56,7 +43,7 @@ pub const Reading = struct {
 /// The two residual blocks, in bytes.
 pub const Parts = struct {
     /// Ours but untracked: CUDA contexts, JIT'd modules, library internals, UI
-    /// textures — plus anything resident before its session is published.
+    /// textures, plus anything resident before its session is published.
     overhead: u64 = 0,
     /// Not ours: other processes and driver-side allocations.
     system: u64 = 0,
@@ -67,7 +54,7 @@ pub const Smoother = struct {
     /// Smoothed state; null until the first reading seeds it (so the meter never
     /// ramps up from zero on the first frame).
     parts: ?Parts = null,
-    /// Weight of a NEW reading. At the 200–500 ms sample cadence 0.25 gives a
+    /// Weight of a NEW reading. At the 200-500 ms sample cadence 0.25 gives a
     /// ~1.5 s time constant: fast enough to follow a real change (unloading a
     /// model frees its context), slow enough to ignore driver lag.
     alpha: f32 = 0.25,
@@ -93,7 +80,7 @@ pub const Smoother = struct {
     }
 };
 
-/// Shrink the residuals so `ours + overhead + system` can't exceed the card —
+/// Shrink the residuals so `ours + overhead + system` can't exceed the card,
 /// otherwise the meter's segments would draw past the end of the bar. Only
 /// reachable transiently, when smoothed residuals meet a freshly grown `ours`.
 fn fit(p: Parts, r: Reading) Parts {
@@ -143,7 +130,7 @@ test "a diffusion allocation cannot move system (the reported bounce)" {
     const after = s.update(churned);
     errdefer std.debug.print("system {d} MiB -> {d} MiB\n", .{ before.system / mib, after.system / mib });
     try std.testing.expectEqual(before.system, after.system); // EXACTLY unmoved
-    // The lag lands in `overhead` (damped) — never in `system`.
+    // The lag lands in `overhead` (damped), never in `system`.
     try std.testing.expect(after.overhead < before.overhead);
 }
 
@@ -170,8 +157,8 @@ test "residuals never overflow the card" {
 test "smoothing converges on a real change within a couple seconds" {
     var s: Smoother = .{};
     _ = s.update(.{ .total = 24 * gib, .device_used = 20 * gib, .proc_used = 18 * gib, .ours = 17 * gib });
-    // Another process grabs 2 GiB and stays. At 0.25/sample (≈2–5 Hz) the meter
-    // should be within 5% after 10 samples (≈2–5 s).
+    // Another process grabs 2 GiB and stays. At 0.25/sample (≈2-5 Hz) the meter
+    // should be within 5% after 10 samples (≈2-5 s).
     const changed: Reading = .{ .total = 24 * gib, .device_used = 22 * gib, .proc_used = 18 * gib, .ours = 17 * gib };
     var p: Parts = .{};
     for (0..10) |_| p = s.update(changed);
@@ -182,7 +169,7 @@ test "smoothing converges on a real change within a couple seconds" {
 }
 
 test "fit shrinks system before overhead" {
-    // Overhead is ours and measured; system is the guess — so the guess yields first.
+    // Overhead is ours and measured; system is the guess, so the guess yields first.
     const p = fit(
         .{ .overhead = 1 * gib, .system = 2 * gib },
         .{ .total = 24 * gib, .device_used = 23 * gib, .proc_used = 0, .ours = 23 * gib },

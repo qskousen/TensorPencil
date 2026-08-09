@@ -1,6 +1,6 @@
-//! The tp-gui bottom status bar (GUI_VRAM.md, Phase 6): live VRAM (total + the
+//! The tp-gui bottom status bar: live VRAM (total + the
 //! chat model's resident footprint), the active VRAM limit, and CPU / GPU
-//! utilization — each with a small rolling sparkline. Sampled from `sysmon`
+//! utilization, each with a small rolling sparkline. Sampled from `sysmon`
 //! (CPU via /proc/stat, GPU via NVML) and the LLM backend's device accounting.
 //!
 //! Rendered as the last child of the chat frame's root vbox; its fixed height
@@ -21,7 +21,7 @@ pub const bar_height: f32 = 52;
 /// Number of samples kept per sparkline.
 const hist_n = 48;
 
-/// A small fixed-capacity rolling history, iterated oldest→newest via `at`.
+/// A small fixed-capacity rolling history, iterated oldest->newest via `at`.
 const Ring = struct {
     data: [hist_n]f32 = [_]f32{0} ** hist_n,
     len: usize = 0,
@@ -47,7 +47,7 @@ var h_cpu: Ring = .{};
 var h_gpu: Ring = .{};
 
 const gib: f64 = 1 << 30;
-/// Sampling cadence (µs) — decoupled from the frame rate. A dvui timer fires on
+/// Sampling cadence (µs), decoupled from the frame rate. A dvui timer fires on
 /// this interval, which also wakes the (event-driven) main loop when idle so the
 /// meters keep advancing even with no UI activity. Faster while a worker is busy,
 /// since that's when the segments actually move.
@@ -56,7 +56,7 @@ const sample_interval_busy_us: i32 = 200_000;
 
 /// The most recent sample, rendered every frame regardless of when it was taken.
 ///
-/// EVERY VRAM number here is read in one pass in `sampleInto` — the whole-card
+/// EVERY VRAM number here is read in one pass in `sampleInto`, the whole-card
 /// total, our process's footprint, and each component. They must stay coherent:
 /// mixing a timer-sampled total with live per-frame component reads is what made
 /// "system" bounce during diffusion (see vram_split.zig).
@@ -105,7 +105,7 @@ fn sampleInto(s: ?*chat.Session, diff_busy: bool, diff: diffuser.VramBreakdown) 
             n.vram_total = g.mem_total;
             n.have_gpu = true;
         }
-        // Same pass as the whole-card numbers above — the meter subtracts the two.
+        // Same pass as the whole-card numbers above, the meter subtracts the two.
         n.vram_proc = nv.selfUsed() orelse 0;
     }
     // Diffusion state comes from the app-level engine (not the session).
@@ -141,7 +141,7 @@ fn sampleInto(s: ?*chat.Session, diff_busy: bool, diff: diffuser.VramBreakdown) 
     cur = n;
 }
 
-/// Draw the bar. `s` is the live session (null before a model loads — the bar
+/// Draw the bar. `s` is the live session (null before a model loads, the bar
 /// still shows CPU/GPU/total VRAM). `diff_busy`/`diff_used` come from the
 /// app-level diffusion engine.
 pub fn render(s: ?*chat.Session, diff_busy: bool, diff: diffuser.VramBreakdown, split: *f32, limit: *f32, llm_armed: bool, diff_armed: bool, llm_paused: bool, diff_paused: bool, acts: meter.Actions) void {
@@ -159,7 +159,7 @@ pub fn render(s: ?*chat.Session, diff_busy: bool, diff: diffuser.VramBreakdown, 
 
     // Time-based sampling: EVERY meter number (card total, our process
     // footprint, per-component residency) is taken here, in one pass, and the
-    // meter renders that snapshot — never a mix of sampled and live reads.
+    // meter renders that snapshot, never a mix of sampled and live reads.
     if (dvui.timerDoneOrNone(bar.data().id)) {
         sampleInto(s, diff_busy, diff);
         dvui.timer(bar.data().id, if (diff_busy) sample_interval_busy_us else sample_interval_us);
@@ -167,7 +167,7 @@ pub fn render(s: ?*chat.Session, diff_busy: bool, diff: diffuser.VramBreakdown, 
 
     var top: [24]u8 = undefined;
     var bot: [24]u8 = undefined;
-    // Left: CPU/GPU/VRAM — util% on top, clock/size beneath (a 2-row stack that
+    // Left: CPU/GPU/VRAM, util% on top, clock/size beneath (a 2-row stack that
     // matches the meter's number columns), plus a trend sparkline.
     if (cur.have_gpu) {
         metric(0, 72, &h_gpu, .{ .r = 120, .g = 200, .b = 120, .a = 235 }, std.fmt.bufPrint(&top, "GPU {d:.0}%", .{cur.gpu_util}) catch "GPU", std.fmt.bufPrint(&bot, "{d:.2} GHz", .{@as(f64, @floatFromInt(cur.gpu_mhz)) / 1000.0}) catch "");
@@ -187,7 +187,7 @@ pub fn render(s: ?*chat.Session, diff_busy: bool, diff: diffuser.VramBreakdown, 
 /// (see pipeline.vramBreakdown); `latent` is the per-image working set (GPU
 /// session + activation workspace + preview decode), populated mid-generation.
 fn renderMeter(s: ?*chat.Session, diff: diffuser.VramBreakdown, split: *f32, limit: *f32, llm_armed: bool, diff_armed: bool, llm_paused: bool, diff_paused: bool, acts: meter.Actions) void {
-    // EVERY byte count below comes from `cur` — one snapshot (see Sample). The
+    // EVERY byte count below comes from `cur`, one snapshot (see Sample). The
     // whole-card total is the same NVML reading the left VRAM meter shows, so the
     // two always agree; with no NVML at all we fall back to the LLM context's
     // cuMemGetInfo, then to a sane default.
@@ -219,7 +219,7 @@ fn renderMeter(s: ?*chat.Session, diff: diffuser.VramBreakdown, split: *f32, lim
         // be dragged left of the LLM's incompressible context (KV can't evict);
         // diffusion keeps a small gap when loaded. Both are CAPPED well below the
         // limit so a noisy byte-accounting reading can never invert the drag
-        // range and lock the handles (system VRAM is NOT counted here — it lives
+        // range and lock the handles (system VRAM is NOT counted here, it lives
         // in the right-hand block against the ceiling, not the LLM's share).
         .floor_llm = std.math.clamp(0.04 + @as(f32, @floatFromInt(ctx_b)) / tf, 0.04, 0.80),
         .floor_diff = if (diff_b > 0) @as(f32, 0.04) else 0.01,

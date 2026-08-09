@@ -4,14 +4,14 @@
 //! Three differences from krea2's otherwise-similar path, all of them conventions
 //! the checkpoint does not record:
 //!
-//! 1. **No system turn.** krea2 prefixes a "Describe the image by detailing…"
+//! 1. No system turn. krea2 prefixes a "Describe the image by detailing..."
 //!    system message; Z-Image's template is just a user turn.
-//! 2. **Nothing is stripped.** krea2 drops everything up to and including the
+//! 2. Nothing is stripped. krea2 drops everything up to and including the
 //!    second `<|im_start|>` (+ `user` `\n`) before handing the states to the DiT.
-//!    Z-Image conditions on the **whole** token sequence, template included — the
+//!    Z-Image conditions on the whole token sequence, template included, the
 //!    `cap_embedder` and `context_refiner` see the chat markers. Stripping them
 //!    would shorten the caption by 9 tokens and shift every RoPE position after it.
-//! 3. **No padding.** ComfyUI's `Qwen3Tokenizer` is built with
+//! 3. No padding. ComfyUI's `Qwen3Tokenizer` is built with
 //!    `pad_to_max_length=False`, `min_length=1` and no start/end token, so the
 //!    sequence is exactly the template's tokens. The DiT's own 32-token pad is a
 //!    separate thing and uses a *learned* pad embedding, not a pad token id.
@@ -26,9 +26,9 @@ pub const template_suffix = "<|im_end|>\n<|im_start|>assistant\n";
 
 /// Tokenize a prompt wrapped in the Z-Image template. A prompt that already opens
 /// with `<|im_start|>` is passed through untouched, matching what krea2's path does
-/// — it is how a caller supplies its own turn structure.
+/// it is how a caller supplies its own turn structure.
 ///
-/// The formatted string is built and encoded in **one** call rather than as three
+/// The formatted string is built and encoded in one call rather than as three
 /// (prefix, text, suffix). Splitting would be equivalent only as long as BPE never
 /// merges across the boundaries, which happens to hold for this template but is a
 /// property of the vocabulary rather than of the code.
@@ -54,10 +54,10 @@ const te_ckpt = "/home/qt/genai/comfyui/models/text_encoders/qwen_3_4b.safetenso
 test "the Z-Image template tokenizes exactly like ComfyUI's ZImageTokenizer" {
     // Ungated: needs only the fixture's stored ids, not the 8 GB encoder. Worth
     // separating, because a template that is one token off still encodes and still
-    // renders — it just conditions on a different sequence than the reference.
+    // renders, it just conditions on a different sequence than the reference.
     const gpa = testing.allocator;
     const io = testing.io;
-    // Not `test_gate.requireModelFile` — that also gates on `-Dintegration`, and
+    // Not `test_gate.requireModelFile`, that also gates on `-Dintegration`, and
     // this needs no external checkpoint, only the in-repo fixture.
     std.Io.Dir.cwd().access(io, ref_path, .{}) catch return error.SkipZigTest;
 
@@ -139,9 +139,9 @@ test "the Z-Image text encoder matches ComfyUI's Qwen3-4B penultimate state" {
 }
 
 test "the Vulkan text encoder matches the CPU one on Z-Image's bf16 weights" {
-    // ⚠️ **This test exists because its absence cost a blank white render.**
+    // This test exists because its absence cost a blank white render.
     // `qwen3_gpu.encode`'s GEMM handled fp8 only: krea2's encoder checkpoint is fp8,
-    // Z-Image's `qwen_3_4b.safetensors` is **bf16**, and the fallback branch read the
+    // Z-Image's encoder is bf16, and the fallback branch read the
     // bf16 bytes as f32. Every GEMM was garbage, the conditioning came out
     // non-finite, and `planarF32ToRgb8` clamped the whole image to white with no
     // error at any layer.
@@ -179,7 +179,7 @@ test "the Vulkan text encoder matches the CPU one on Z-Image's bf16 weights" {
     try testing.expectEqual(want.len, got.len);
 
     // Non-finite output is the actual failure mode, so name it separately from a
-    // numeric mismatch — "rel L2 = nan" does not say which side blew up.
+    // numeric mismatch, "rel L2 = nan" does not say which side blew up.
     for (got) |v| {
         errdefer std.debug.print("gpu encode produced a non-finite value\n", .{});
         try testing.expect(std.math.isFinite(v));

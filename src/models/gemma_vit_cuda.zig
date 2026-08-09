@@ -2,7 +2,7 @@
 //! (patch embed, learned position add, 27 pre-LN blocks) runs device-side;
 //! the cheap projector (4x4 avg-pool -> soft_emb_norm -> input projection)
 //! runs on the host via gemma_vit.Vit.project (256 tokens, negligible next
-//! to the 27 blocks over 4096 patches — the part that made the CPU encode
+//! to the 27 blocks over 4096 patches, the part that made the CPU encode
 //! ~39 s). Mirrors vit35_cuda, minus the vision RoPE (Gemma uses a learned
 //! position embedding) and with separate q/k/v (not fused).
 //!
@@ -118,7 +118,7 @@ pub fn encode(vit: *const Vit, be: *Backend, io: std.Io, gpa: std.mem.Allocator,
     try be.endBatch();
 
     // Download the post-LN patch states; the projector (pool + soft_emb_norm
-    // + input projection) runs on the host — 256 tokens, cheap.
+    // + input projection) runs on the host, 256 tokens, cheap.
     const x_host = try gpa.alloc(f32, np * dim);
     defer gpa.free(x_host);
     try be.tensorDownload(sized(x_d, 0, np * dim * 4), std.mem.sliceAsBytes(x_host));

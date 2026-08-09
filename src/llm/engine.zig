@@ -1,5 +1,5 @@
 //! Autoregressive generation loop: one full-sequence prefill into the KV
-//! cache, then seq-1 decode steps (LLM_PLAN.md M2).
+//! cache, then seq-1 decode steps.
 
 const std = @import("std");
 const qwen3 = @import("../models/qwen3.zig");
@@ -27,13 +27,13 @@ pub const Options = struct {
     /// RNG seed for sampling THIS generate call (irrelevant when temperature
     /// = 0). The sampler is constructed fresh per call, so a multi-turn
     /// driver must supply a fresh seed each turn (see sample.SeedSeq) or
-    /// every turn replays the same RNG stream — a repeated prompt would then
+    /// every turn replays the same RNG stream, a repeated prompt would then
     /// reproduce the identical "random" response.
     seed: u64 = 0,
     /// Speculative decoding: max drafted tokens per verify forward
     /// (0 = off). Requires a backend stepper with stepAll + truncate.
     spec_k: usize = 0,
-    /// Tree drafting (LLM_PLAN.md M8): total tree size per verify forward —
+    /// Tree drafting: total tree size per verify forward,
     /// the root (pending token) plus up to tree_nodes-1 drafted branch nodes
     /// (0 = chain drafting). Greedy-only in v1; requires a drafter exposing
     /// proposeTree and a stepper exposing stepAllTree + commitTreePath
@@ -46,11 +46,11 @@ pub const Options = struct {
     /// (a clean stop, not an error). Lets a UI interrupt a long reply.
     cancel: ?*std.atomic.Value(bool) = null,
     /// Optional pause gate, consulted before each decode step (the same boundary
-    /// as `cancel`). While paused the loop parks here — holding the KV cache and
-    /// resident weights — until unpaused. See `ops/pause.zig`.
+    /// as `cancel`). While paused the loop parks here, holding the KV cache and
+    /// resident weights, until unpaused. See `ops/pause.zig`.
     pause: ?*ops.pause.Gate = null,
     /// Set true (when non-null) if the loop stops because the pause gate returned
-    /// `.unload` — i.e. an unload-while-paused suspend, distinct from a cancel or
+    /// `.unload`, i.e. an unload-while-paused suspend, distinct from a cancel or
     /// a natural stop. Lets the caller keep the assistant turn OPEN (no
     /// closeAssistant) so a later reload can reprefill `ids` and continue. (Tier 3.)
     suspended_out: ?*bool = null,
@@ -66,7 +66,7 @@ pub const Options = struct {
     residency_poll: ?ResidencyPoll = null,
     /// When set, `generate` records its prefill-vs-decode wall-clock split here.
     timing: ?*Timing = null,
-    /// When set, `generate` publishes the SAME split as it accrues — for a UI
+    /// When set, `generate` publishes the SAME split as it accrues, for a UI
     /// that shows a turn's rates while it is still streaming. `timing` is the
     /// final word (written once, on return); this is the running one, read by
     /// another thread. See `Progress`.
@@ -76,7 +76,7 @@ pub const Options = struct {
 /// Wall-clock split of one `generate` call. A caller that times the whole call
 /// and divides by the token count conflates prompt processing with token
 /// generation: `generate` prefills the uncached prompt prefix ITSELF, so that
-/// forward pass (plus any first-touch device work it triggers — kernel JIT,
+/// forward pass (plus any first-touch device work it triggers, kernel JIT,
 /// cuDNN/cuBLASLt plan construction, clock ramp) lands inside the measurement
 /// and drags the reported rate down, badly so on a short run. Keep the two
 /// apart to report llama.cpp-comparable `pp` (prompt) and `tg` (generation)
@@ -119,13 +119,13 @@ pub const Timing = struct {
 /// tokens" as the reply streams. The fields are atomic because the reader is a
 /// different thread (the GUI's UI thread) from the writer (its generation
 /// worker); they are published independently, so a reader can observe a
-/// token count one step ahead of the elapsed time it is divided by — a sub-frame
+/// token count one step ahead of the elapsed time it is divided by, a sub-frame
 /// skew on a live counter, not a correctness question.
 ///
 /// `emitted` is the tokens appended to `ids` (what a UI shows as the reply's
 /// length); `decode_tokens` stays the decode-loop FORWARD count `Timing`
 /// documents, which is one fewer. Left untouched by the speculative-decoding
-/// path, for the reason `Timing` gives — so a UI on that path shows a reply's
+/// path, for the reason `Timing` gives, so a UI on that path shows a reply's
 /// text without a rate rather than a wrong one.
 pub const Progress = struct {
     prefill_tokens: std.atomic.Value(usize) = .init(0),
@@ -162,14 +162,14 @@ pub const Progress = struct {
     }
 };
 
-/// Publish the running prefill split — called per prefill batch, so a long
+/// Publish the running prefill split, called per prefill batch, so a long
 /// prompt's rate climbs into view instead of appearing only once it is done.
 fn progPrefill(opts: Options, io: std.Io, tokens: usize, t_pre: i96) void {
     const p = opts.progress orelse return;
     p.publish(.{ .prefill_tokens = tokens, .prefill_ns = @intCast(nowNs(io) - t_pre) }, 0);
 }
 
-/// Publish the running decode split — called per emitted token. `steps` is the
+/// Publish the running decode split, called per emitted token. `steps` is the
 /// forward count (one behind `emitted` by construction; see `Timing`).
 fn progDecode(opts: Options, io: std.Io, prefill_tokens: usize, prefill_ns: u64, steps: usize, emitted: usize, t_dec: i96) void {
     const p = opts.progress orelse return;
@@ -198,7 +198,7 @@ pub const ResidencyPoll = struct {
 /// was one un-interruptible `model.step` over the whole uncached prefix, so a
 /// long prompt couldn't be paused or canceled until the first token decoded.
 /// Chunking it lets the gate land mid-prefill. Incremental chunked stepping is
-/// token-identical (attention is causal → a later chunk only reads earlier
+/// token-identical (attention is causal -> a later chunk only reads earlier
 /// chunks' committed KV; see gemma3.forwardCached), and the steppers already run
 /// the LM head per internal chunk, so per-chunk output here costs nothing beyond
 /// what `step` does anyway. 256 bounds cancel latency to a fraction of a second
@@ -207,12 +207,12 @@ pub const prefill_gate_chunk: usize = 256;
 
 /// How many prompt tokens to hand a stepper per prefill forward.
 ///
-/// ⚠️ **This is the STEPPER's choice, not the engine's.** Every prefill loop below
-/// used to force `prefill_gate_chunk` on every arch, which silently capped each
-/// model's own internal chunk: qwen3.5's `prefill_chunk` was set to 512 and never saw
-/// more than 255 ids, so the knob looked like it "preferred" 256 when it was simply
-/// disconnected — and raising it alone cost 31% on the matmul bucket (bigger buffers,
-/// same work). A stepper that knows what its kernels want declares `prefill_batch`
+/// This is the STEPPER's choice, not the engine's. A prefill loop that forces
+/// `prefill_gate_chunk` on every arch silently caps each model's own internal chunk:
+/// a stepper asking for 512 never sees more than 255 ids, so its knob looks like it
+/// "prefers" 256 when it is simply disconnected, and raising that knob alone costs 31%
+/// on the matmul bucket (bigger buffers, same work). A stepper that knows what its
+/// kernels want declares `prefill_batch`
 /// (qwen35_cuda ties it to its own `prefill_chunk` so the two cannot drift); everyone
 /// else keeps the old constant and the old behaviour.
 pub fn prefillBatchOf(model: anytype) usize {
@@ -222,7 +222,7 @@ pub fn prefillBatchOf(model: anytype) usize {
     });
 }
 
-/// `prefillBatchOf` on the type alone — for tests that need to size a prompt to span
+/// `prefillBatchOf` on the type alone, for tests that need to size a prompt to span
 /// several chunks of whatever batch the stepper under test will actually use.
 pub fn prefillBatchOfType(comptime M: type) usize {
     return if (comptime @hasDecl(M, "prefill_batch")) M.prefill_batch else prefill_gate_chunk;
@@ -232,10 +232,10 @@ pub fn prefillBatchOfType(comptime M: type) usize {
 /// duration of prefill, so a stepper can poll it BETWEEN LAYERS and unwind
 /// immediately instead of waiting out a whole forward.
 ///
-/// ⚠️ **Pause and cancel are deliberately polled at DIFFERENT granularities.** Pause
+/// Pause and cancel are deliberately polled at DIFFERENT granularities. Pause
 /// parks only at batch boundaries (`checkpoint` in the loops below): `ops/pause.zig`
 /// is explicit that parking mid-kernel would strand half-computed state and held
-/// locks, so a paused worker waits at most one forward — the accepted cost of a
+/// locks, so a paused worker waits at most one forward, the accepted cost of a
 /// larger batch. Cancel discards its work by definition, so unwinding mid-forward is
 /// safe where parking is not, and at a 512-token batch a boundary-only cancel would
 /// mean sitting on it for ~0.5 s. A stepper that ignores the token behaves as before.
@@ -262,10 +262,10 @@ pub fn isCancelUnwind(err: anyerror) bool {
 pub const StepAction = enum { proceed, stop };
 
 /// A pause/cancel/residency checkpoint shared by the decode loop and the chunked
-/// prefill. Poll it at clean boundaries — between decoded tokens and between
+/// prefill. Poll it at clean boundaries, between decoded tokens and between
 /// prefill chunks. Returns `.stop` when generation should end: a cancel, a
 /// cancel delivered to a parked (paused) worker, or an unload-while-paused
-/// suspend — the last also sets `suspended_out` so the caller keeps the turn
+/// suspend, the last also sets `suspended_out` so the caller keeps the turn
 /// OPEN for a reprefill-resume on reload (Tier 3). `.proceed` otherwise (the
 /// fast path when neither paused nor canceled). A paused worker BLOCKS here.
 pub fn checkpoint(io: std.Io, opts: Options) StepAction {
@@ -303,8 +303,8 @@ pub fn capacityPlanFor(opts: Options, prompt_len: usize) !Capacity {
 }
 
 /// Make room for `need` more rows, growing dynamic-capacity models (steppers
-/// exposing ensureCapacity). error.ContextFull when the window — or the
-/// memory backing its growth — can't cover the rows.
+/// exposing ensureCapacity). error.ContextFull when the window, or the
+/// memory backing its growth, can't cover the rows.
 fn ensureRoom(model: anytype, need: usize) !void {
     if (need <= model.remaining()) return;
     const M = switch (@typeInfo(@TypeOf(model))) {
@@ -325,19 +325,19 @@ fn ensureRoom(model: anytype, need: usize) !void {
 /// Returns the number of tokens generated.
 ///
 /// `model` is a pointer to any backend stepper exposing
-///   step(io, ids_new: []const u32, logits: []f32) — forward the new tokens
+///   step(io, ids_new: []const u32, logits: []f32), forward the new tokens
 ///     at the next cache positions and write last-position vocab logits,
-///   cached() usize — committed cache length, and
-///   remaining() usize — cache room left.
+///   cached() usize, committed cache length, and
+///   remaining() usize, cache room left.
 /// Speculative decoding (opts.spec_k > 0) additionally requires
-///   stepAll(io, ids_new, logits) — one vocab row per new token, and
-///   truncate(new_len) — roll the cache back to `new_len` tokens;
+///   stepAll(io, ids_new, logits), one vocab row per new token, and
+///   truncate(new_len), roll the cache back to `new_len` tokens;
 /// backends without them return error.SpecUnsupported.
 /// Tree drafting (opts.tree_nodes > 0, spec.generateTree) requires
-///   stepAllTree(io, tokens, parents, logits) — tree-verify forward, and
-///   commitTreePath(path) — append the accepted root path to the cache;
+///   stepAllTree(io, tokens, parents, logits), tree-verify forward, and
+///   commitTreePath(path), append the accepted root path to the cache;
 /// plus a drafter exposing proposeTree (error.TreeUnsupported otherwise).
-/// The first step call carries the not-yet-cached prompt suffix (prefill —
+/// The first step call carries the not-yet-cached prompt suffix (prefill,
 /// the whole prompt on turn one, only the new turn's tokens on later turns
 /// of a multi-turn session); each later call carries the single sampled
 /// token (decode).
@@ -396,21 +396,21 @@ pub fn generate(
     try ensureRoom(model, new.len);
     // Chunked prefill. Only the final chunk's logits feed the first sample.
     //
-    // ⚠️ The batch size is the STEPPER's choice, not the engine's. This loop used to
-    // force `prefill_gate_chunk` on every arch, which silently capped each model's
-    // own `prefill_chunk` — qwen3.5's was set to 512 and never saw more than 255
-    // ids, so the knob looked like it "preferred" 256 when it was simply
-    // disconnected (see BACKEND.md). A stepper that knows what its kernels want
+    // The batch size is the STEPPER's choice, not the engine's. Forcing
+    // `prefill_gate_chunk` on every arch silently caps each model's own
+    // `prefill_chunk`: a stepper asking for 512 never sees more than 255 ids, so its
+    // knob looks like it "prefers" 256 when it is simply
+    // disconnected. A stepper that knows what its kernels want
     // declares `prefill_batch`; everyone else keeps the old constant.
     //
     // PAUSE and CANCEL are deliberately polled at DIFFERENT granularities:
-    //   - **pause** parks here, at batch boundaries only. `ops/pause.zig` is explicit
+    //   - pause parks here, at batch boundaries only. `ops/pause.zig` is explicit
     //     that parking mid-kernel would strand half-computed state and held locks, so
     //     a paused worker waits at most one forward before parking. That is the
     //     accepted cost of a larger batch.
-    //   - **cancel** is published to `ops.cancel`'s threadlocal token so the stepper
+    //   - cancel is published to `ops.cancel`'s threadlocal token so the stepper
     //     can poll it BETWEEN LAYERS and unwind immediately. Cancel discards its work
-    //     by definition, so unwinding mid-forward is safe where parking is not — and
+    //     by definition, so unwinding mid-forward is safe where parking is not, and
     //     at a 512-token batch a boundary-only cancel would mean waiting ~0.5 s.
     // A stepper that never polls the token simply behaves as before.
     const t_pre = nowNs(io);
@@ -498,7 +498,7 @@ fn stepSelectOf(model: anytype, io: std.Io, new: []const u32, pen: []const sampl
 }
 
 /// Greedy generation via on-device argmax (`model.stepArgmax`): no host logits
-/// buffer, no per-step vocab download — just the sampled id comes back. Emits
+/// buffer, no per-step vocab download, just the sampled id comes back. Emits
 /// identical tokens to the full-vocab greedy path (both are argmax, lowest
 /// index on ties). Active penalties ride along as a per-token entry upload to
 /// the device penalize kernel (same window the CPU path scans: `ids` so far).
@@ -729,7 +729,7 @@ pub const CpuModel = struct {
     }
 
     /// step, but with vocab logits for every new token ([ids_new.len, vocab]
-    /// row-major) — the speculative-decode verify forward.
+    /// row-major), the speculative-decode verify forward.
     pub fn stepAll(self: *CpuModel, io: std.Io, ids_new: []const u32, logits: []f32) !void {
         const n = ids_new.len;
         std.debug.assert(logits.len == n * self.lm.cfg.vocab);
@@ -843,7 +843,7 @@ test "utf8 prefix scanner" {
 }
 
 // Multi-turn cache continuation: a second generate() on the same model must
-// prefill only the new turn's tokens (kept tiny — gated on the model).
+// prefill only the new turn's tokens (kept tiny, gated on the model).
 test "multi-turn generation continues the cache" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -883,7 +883,7 @@ test "multi-turn generation continues the cache" {
 
 test "Progress publishes what Timing finally reports" {
     // The live counters a UI renders and the final split a log line prints must
-    // describe the same turn — otherwise a reply's footer changes the moment it
+    // describe the same turn, otherwise a reply's footer changes the moment it
     // stops streaming. Cheap to fold into a real generate; 4 tokens is enough to
     // exercise the decode loop's publication (1 would leave decode_tokens 0).
     const gpa = std.testing.allocator;
@@ -922,7 +922,7 @@ test "Progress publishes what Timing finally reports" {
     try std.testing.expectEqual(timing.decode_tokens, live.timing.decode_tokens);
     try std.testing.expectEqual(timing.prefill_tokens, live.timing.prefill_tokens);
     // `generate` prefills the whole uncached prompt (here: all of it, cache
-    // empty) and the last chunk's logits yield the first token — hence one
+    // empty) and the last chunk's logits yield the first token, hence one
     // fewer decode forward than tokens returned.
     try std.testing.expectEqual(prompt_len, live.timing.prefill_tokens);
     try std.testing.expectEqual(n - 1, live.timing.decode_tokens);
@@ -982,7 +982,7 @@ test "generation with a growing cache matches fixed capacity" {
 }
 
 // End-to-end mechanics (forward -> lm_head -> argmax -> append) against the
-// real checkpoint; skipped when the model is absent. Kept to 2 tokens — each
+// real checkpoint; skipped when the model is absent. Kept to 2 tokens, each
 // costs a full 36-layer forward.
 test "greedy generation produces valid tokens" {
     const gpa = std.testing.allocator;
@@ -1014,10 +1014,10 @@ test "greedy generation produces valid tokens" {
 }
 
 test "prefillBatchOf honours a stepper's declared batch, else the gate constant" {
-    // The bug this pins: every prefill loop used to hardcode `prefill_gate_chunk`,
-    // so a stepper's own `prefill_chunk` was silently capped and raising it only
-    // inflated buffers (measured -31% on the matmul bucket). Five call sites now
-    // share this, so it is worth a test rather than five careful readings.
+    // The bug this pins: a prefill loop that hardcodes `prefill_gate_chunk` silently
+    // caps a stepper's own `prefill_chunk`, so raising that only inflates buffers
+    // (measured -31% on the matmul bucket). Five call sites share this, so it is worth
+    // a test rather than five careful readings.
     const Declared = struct {
         pub const prefill_batch: usize = 512;
     };
@@ -1034,7 +1034,7 @@ test "prefillBatchOf honours a stepper's declared batch, else the gate constant"
 test "publishCancel exposes the engine's flag to ops.cancel and restores it" {
     // Steppers poll `ops.cancel.token` BETWEEN LAYERS; the engine owns the flag, so
     // the token must be published for exactly the prefill's duration and restored
-    // after — a leaked token would let one worker's cancel unwind another's forward.
+    // after, a leaked token would let one worker's cancel unwind another's forward.
     var flag = std.atomic.Value(bool).init(false);
     const outer = ops.cancel.token;
     {

@@ -1,98 +1,22 @@
-//! Anima — CircleStone/Comfy Org's 2B anime text-to-image model, the fifth family
-//! here and the first that is a **Cosmos** derivative.
+//! Anima: a 2B anime text-to-image model, Cosmos-Predict2's MiniTrainDIT with an
+//! LLMAdapter bolted onto its front. ComfyUI distinguishes it from stock
+//! cosmos_predict2 purely by the presence of the adapter's tensors. It is a video
+//! DiT run on one frame: patch_temporal = 1, T = 1, and the 3-axis RoPE's temporal
+//! axis is identically zero.
 //!
-//! ⚠️ **Anima IS Cosmos-Predict2's DiT.** `comfy/ldm/anima/model.py` is 214 lines
-//! that subclass `MiniTrainDIT` from `comfy/ldm/cosmos/predict2.py` and bolt an
-//! `LLMAdapter` onto its front; `model_detection` selects `"anima"` over
-//! `"cosmos_predict2"` purely by the presence of
-//! `llm_adapter.blocks.0.cross_attn.q_proj.weight`. So everything below that reads
-//! as "a video DiT used on one frame" is exactly that — `patch_temporal = 1`,
-//! `T = 1`, and a 3-axis RoPE whose temporal axis is therefore all zeros.
+//! Adapter (6 blocks, 1024 wide) turns the prompt into the denoiser's
+//! cross-attention context. Its queries come from its own Embedding(32128, 1024)
+//! indexed by T5 ids; its keys and values are a Qwen3-0.6B encoder's final hidden
+//! states. So the prompt is tokenized twice, by two unrelated tokenizers, and the
+//! adapter is where the two streams meet. Output is [max(512, n_t)][1024],
+//! zero-padded.
 //!
-//! Two halves, and they have different jobs:
+//! DiT (28 blocks, 2048 wide, 16 heads of 128) is the denoiser: AdaLN-LoRA
+//! modulated self-attention, then cross-attention, then a GELU MLP, over 2x2
+//! patches of a 16-channel latent, flow-matching parameterized.
 //!
-//! 1. **`Adapter`** (6 blocks, 1024 wide) turns the prompt into the denoiser's
-//!    cross-attention context. Its *queries* come from its own
-//!    `Embedding(32128, 1024)` indexed by **T5** token ids; its *keys and values*
-//!    come from a Qwen3-0.6B encoder's final hidden states. So the prompt is
-//!    tokenized twice, by two unrelated tokenizers, and the adapter is where the
-//!    two streams meet. Output is `[max(512, n_t)][1024]`, zero-padded.
-//! 2. **`DiT`** (28 blocks, 2048 wide, 16 heads of 128) is the denoiser: AdaLN-LoRA
-//!    modulated self-attention → cross-attention → GELU MLP, on 2x2 patches of a
-//!    16-channel latent, flow-matching parameterization.
-//!
-//! Reference: ComfyUI, pinned by `tools/gen_anima_fixtures.py`.
-//!
-//! ## The seven conventions that are silent wrong answers
-//!
-//! 1. ⚠️ **The input and output patch feature orders are DIFFERENT.** `x_embedder`
-//!    takes `(c, ph, pw)` — channel **slowest** — from
-//!    `Rearrange("b c (t r) (h m) (w n) -> b t h w (c r m n)")`. `unpatchify` emits
-//!    `(ph, pw, t, c)` — channel **fastest** — from
-//!    `"B T H W (p1 p2 t C) -> B C (T t) (H p1) (W p2)"`. They are not each other's
-//!    inverse, and using one order for both is a pure permutation: every norm, every
-//!    per-stage magnitude and every rel-L2 against a stage fixture still matches,
-//!    and only the image is wrong. This repo has paid for that class of bug twice
-//!    already (the SD planar/channel-last mixup, Z-Image's `(ph, pw, c)`).
-//! 2. ⚠️ **`concat_padding_mask = True` appends a 17th, ALL-ZERO channel** before
-//!    patchifying, which is why `x_embedder.proj.1.weight` is `[2048, 68]` and not
-//!    `[2048, 64]`. It is not optional and it is not derivable from the latent.
-//! 3. ⚠️ **The timestep IS the sigma.** `Anima.sampling_settings` sets
-//!    `multiplier: 1.0`, so `model_sampling.timestep(sigma) = sigma * 1.0` and the
-//!    sinusoidal embedding sees a value in (0, 1]. Z-Image, whose sigma table is
-//!    otherwise **bit-identical** to Anima's, feeds `(1 - sigma) * 1000` instead.
-//!    Same table, different argument; borrowing the wrong one is finite nonsense.
-//! 4. ⚠️ **AdaLN-LoRA: one low-rank vector is shared by all three sublayers.**
-//!    `t_embedder[1]` emits a `3*dim` vector that is ADDED to each of
-//!    `adaln_modulation_{self_attn,cross_attn,mlp}(emb)`; the final layer adds only
-//!    its **first `2*dim`**. And `emb` itself is the RMSNorm'd *sinusoid*, not the
-//!    MLP's output — under `use_adaln_lora` the `TimestepEmbedding` returns
-//!    `(sample, mlp(sample))`, keeping the raw sinusoid as the modulation input.
-//! 5. ⚠️ **`adaln_modulation_*` has no activation between its two linears.** It is
-//!    `Sequential(SiLU, Linear(2048, 256), Linear(256, 3*2048))` — the SiLU is on the
-//!    input and the pair is a rank-256 factorization, not an MLP.
-//! 6. ⚠️ **RoPE applies to self-attention ONLY in the DiT, and to BOTH q and k in
-//!    the adapter's cross-attention.** The DiT's `Attention.compute_qkv` guards with
-//!    `if self.is_selfattn and rope_emb is not None`; the adapter's separate
-//!    `Attention` class has no such guard and rotates its queries by the target
-//!    positions and its keys by the *source* positions.
-//! 7. ⚠️ **The DiT's RoPE frequency vector is `[t(22) | h(21) | w(21)]`** in that
-//!    order, with `h`/`w` on an NTK-scaled theta (`10000 * 4^(42/40)`) and `t` on a
-//!    plain 10000 — and it is applied **split-half** (pairs `(i, i+64)`), not
-//!    interleaved. The temporal block is 22 of the 64 frequencies and is identically
-//!    zero at `T = 1`, so a wrong axis ORDER still leaves a third of the vector
-//!    looking right.
-//!
-//! Everything else is shared with what is already here: flow matching, the Wan 2.1
-//! VAE (`first_stage_model.*` in a bundled checkpoint is byte-for-byte
-//! `qwen_image_vae.safetensors`, and shape-for-shape krea2's decoder), Wan21 latent
-//! statistics, and the Qwen3 encoder body.
-//!
-//! ## Measured
-//!
-//! Against ComfyUI on the real `terraRising_20TerraRisingAnima` checkpoint, fp32 on
-//! both sides (`tools/gen_anima_fixtures.py`; the trunk is truncated to 8 and 2
-//! blocks so the reference fits in RAM at full width, the adapter is referenced in
-//! full):
-//!
-//! | stage | rel L2 |
-//! |---|---|
-//! | sinusoidal timestep embedding | 1.8e-8 |
-//! | RoPE table (cos / sin) | 1.7e-8 / 1.4e-7 |
-//! | patchify + `x_embedder` | **exactly 0** — bit-identical |
-//! | block 0's modulation vectors / the final layer's | 4.6e-7 / 1.4e-6 |
-//! | `llm_adapter`, all 6 blocks | 3.2e-6 |
-//! | ...plus emphasis weights and the 512-row pad | 3.2e-6 |
-//! | one whole block | 1.9e-6 |
-//! | the whole forward, 8 blocks | 1.9e-6 (12x10) / 3.1e-6 (40x32) |
-//! | the whole forward, 2 blocks | 2.2e-6 / 3.3e-6 |
-//! | Qwen3-0.6B conditioning | 2.5e-6 … 7.8e-6 |
-//! | both tokenizations, on the real prompts | exact ids |
-//!
-//! ⚠️ **Read the last two DiT rows together.** The disagreement is FLAT in depth —
-//! 2 blocks and 8 blocks land at the same 2e-6 — so nothing is accumulating, which
-//! is what says the block form is right rather than merely close. A bound alone
-//! could not distinguish those.
+//! Reference is ComfyUI, pinned by tools/gen_anima_fixtures.py. The GPU twins are
+//! anima_gpu.zig and anima_cuda.zig.
 
 const std = @import("std");
 const tp_core = @import("tp_core");
@@ -106,7 +30,7 @@ const DType = tp_core.dtype.DType;
 
 /// The `LLMAdapter` half. Its dims are hardcoded in `comfy/ldm/anima/model.py`'s
 /// signature (nothing in `model_detection` describes them), so they are constants
-/// here rather than probed — but the loader still checks every shape.
+/// here rather than probed, but the loader still checks every shape.
 pub const AdapterConfig = struct {
     /// Hidden width of the encoder whose states are the cross-attention source
     /// (Qwen3-0.6B: 1024). Must equal `qwen3.Config.qwen3_0_6b.hidden`.
@@ -115,19 +39,19 @@ pub const AdapterConfig = struct {
     dim: usize,
     n_layers: usize,
     n_heads: usize,
-    /// `Embedding(32128, dim)` over **T5** ids. 32128 > the T5 tokenizer's 32100;
+    /// `Embedding(32128, dim)` over T5 ids. 32128 > the T5 tokenizer's 32100;
     /// the tail rows are unreachable and that is upstream's shape.
     vocab: usize,
     mlp_dim: usize,
     rope_theta: f64,
     /// RMSNorm epsilon for the block pre-norms and the output norm.
     norm_eps: f32,
-    /// Per-head Q/K RMSNorm epsilon. ⚠️ Unlike Z-Image, whose Q/K norms fall back
-    /// to `finfo(float32).eps`, these are built with an explicit `eps=1e-6` — the
+    /// Per-head Q/K RMSNorm epsilon. Unlike Z-Image, whose Q/K norms fall back
+    /// to `finfo(float32).eps`, these are built with an explicit `eps=1e-6`, the
     /// same value as the block norms. Do not "fix" one to match the other.
     qk_eps: f32,
     /// Rows the output is zero-padded up to (`preprocess_text_embeds`). A longer
-    /// prompt is NOT truncated — it stays at its own length.
+    /// prompt is NOT truncated, it stays at its own length.
     min_rows: usize,
 
     pub fn headDim(self: AdapterConfig) usize {
@@ -141,10 +65,10 @@ pub const Config = struct {
     /// `num_blocks`.
     n_layers: usize,
     n_heads: usize,
-    /// `int(model_channels * mlp_ratio)` — stored, because a loader can only check
+    /// `int(model_channels * mlp_ratio)`, stored, because a loader can only check
     /// the shape it actually expects.
     mlp_dim: usize,
-    /// `crossattn_emb_channels` — the adapter's output width.
+    /// `crossattn_emb_channels`, the adapter's output width.
     context_dim: usize,
     /// `adaln_lora_dim`, the rank of the AdaLN factorization.
     adaln_dim: usize,
@@ -163,7 +87,7 @@ pub const Config = struct {
     qk_eps: f32,
     /// `t_embedding_norm`'s `RMSNorm(model_channels, eps=1e-6)`.
     t_norm_eps: f32,
-    /// NTK extrapolation ratios per axis. ⚠️ These are *ratios*, not thetas: the
+    /// NTK extrapolation ratios per axis. These are *ratios*, not thetas: the
     /// factor applied to 10000 is `ratio ** (axis_dim / (axis_dim - 2))`.
     rope_h_ratio: f64,
     rope_w_ratio: f64,
@@ -188,7 +112,7 @@ pub const Config = struct {
 
     /// The three RoPE axis widths, `[t, h, w]`, from `VideoRopePosition3DEmb`:
     /// `dim_h = dim_w = head_dim // 6 * 2` and `dim_t` is the remainder. For
-    /// head_dim 128 that is `[44, 42, 42]` — note **t is the WIDEST**, which is
+    /// head_dim 128 that is `[44, 42, 42]`, note t is the WIDEST, which is
     /// counter-intuitive for an image model and is simply what the remainder gives.
     pub fn ropeAxes(self: Config) [3]usize {
         const hd = self.headDim();
@@ -234,14 +158,14 @@ pub const anima_2b: Config = .{
 };
 
 /// Latent geometry, for callers that need it without a loaded model. Anima uses the
-/// Wan 2.1 VAE, so these are `wan_vae`'s — including its `latents_mean`/`latents_std`
+/// Wan 2.1 VAE, so these are `wan_vae`'s, including its `latents_mean`/`latents_std`
 /// and its latent2rgb preview matrix (`latent_formats.Wan21`).
 pub const latent_channels = anima_2b.channels;
 pub const spatial_scale = 8;
 
 /// The sigma-table shift Anima trained on (`sampling_settings.shift`). Numerically
 /// the same 3.0 Z-Image uses, and over the same 1000-rung `ModelSamplingDiscreteFlow`
-/// table — the two tables are bit-identical. ⚠️ What differs is the argument handed
+/// table, the two tables are bit-identical. What differs is the argument handed
 /// to the model; see convention 3.
 pub const shift: f32 = 3.0;
 
@@ -252,7 +176,7 @@ const LinearW = struct {
 
 /// One `Attention`, in either of the two shapes this file has: the DiT's (query
 /// 2048, context 2048 or 1024) and the adapter's (1024/1024). Separate q/k/v
-/// because the checkpoint stores them separately — unlike Z-Image's fused QKV, so
+/// because the checkpoint stores them separately, unlike Z-Image's fused QKV, so
 /// there is no split-out step here.
 const Attn = struct {
     q: Weight,
@@ -297,14 +221,14 @@ pub fn modulationTableLen(cfg: Config) usize {
     return cfg.n_layers * 9 * cfg.dim + 2 * cfg.dim;
 }
 
-/// `modulationTable` with `(1 + scale)` pre-multiplied into every scale block —
+/// `modulationTable` with `(1 + scale)` pre-multiplied into every scale block,
 /// the form BOTH GPU arms upload. Same layout and length; in place.
 ///
-/// ⚠️ It exists because the fused device norms (`Context.opLnModSg`,
+/// It exists because the fused device norms (`Context.opLnModSg`,
 /// `Backend.lnMod`) compute `(x - mean) * inv * premul[c] + shift[c]`, with no
 /// place to add the 1. The CPU's `modulatedNorm` does the `1 +` itself, so the two
 /// forms are the same arithmetic and this is the one function that expresses the
-/// difference — the reasoning `zimage.modulationTableFolded` records, and the
+/// difference, the reasoning `zimage.modulationTableFolded` records, and the
 /// reason neither backend folds it privately.
 pub fn foldModulationTable(cfg: Config, tbl: []f32) void {
     std.debug.assert(tbl.len == modulationTableLen(cfg));
@@ -316,8 +240,8 @@ pub fn foldModulationTable(cfg: Config, tbl: []f32) void {
             for (per_block[si * 3 * d + d ..][0..d]) |*v| v.* += 1.0;
         }
     }
-    // ⚠️ **The FINAL layer's scale is deliberately NOT folded**, and folding it cost a
-    // rel L2 of 0.10 against the CPU forward — a plausible-looking magnitude, identical
+    // The FINAL layer's scale is deliberately NOT folded, and folding it cost a
+    // rel L2 of 0.10 against the CPU forward, a plausible-looking magnitude, identical
     // on both attention paths, which is what said "shared wiring, not attention".
     // Both GPU arms run the final layer on the HOST through `DiT.finalize`, whose
     // `modulatedNorm` adds its own `1 +`; a folded scale there is counted twice. The
@@ -328,7 +252,7 @@ pub fn foldModulationTable(cfg: Config, tbl: []f32) void {
 pub const Adapter = struct {
     cfg: AdapterConfig,
     /// `[vocab, dim]`, kept in checkpoint dtype and gathered through
-    /// `embedRows` — the same reasoning `qwen3.TextEncoder.embed` records.
+    /// `embedRows`, the same reasoning `qwen3.TextEncoder.embed` records.
     embed: Weight,
     blocks: []AdapterBlock,
     out_proj: LinearW,
@@ -341,7 +265,7 @@ pub const Adapter = struct {
     /// Returns `[rows][dim]` with `rows = max(min_rows, ids.len)`, zero-padded.
     /// Caller frees.
     ///
-    /// ⚠️ **The zero padding is attended to.** `preprocess_text_embeds` pads with
+    /// The zero padding is attended to. `preprocess_text_embeds` pads with
     /// zeros and `Anima.forward` passes no source mask, so the denoiser cross-attends
     /// over all 512 rows including the pad. Trimming them is not an optimization, it
     /// is a different model.
@@ -373,7 +297,7 @@ pub const Adapter = struct {
         // Two RoPE tables over the same theta: the target positions `0..n_t` and the
         // source positions `0..n_src`. `RotaryEmbedding` is built once on
         // `model_dim // num_heads` and called twice with different `position_ids`, so
-        // one builder at `max` rows would do — but the two are consumed as separate
+        // one builder at `max` rows would do, but the two are consumed as separate
         // (cos, sin) pairs and keeping them separate is what makes convention 6 legible.
         var tf = try ops.rope.rotateHalfFreqs(gpa, n_t, cfg.headDim(), cfg.rope_theta);
         defer tf.deinit(gpa);
@@ -405,7 +329,7 @@ pub const Adapter = struct {
         try ops.matmul.matmul(io, gpa, delta, x, n_t, self.out_proj.w, self.out_proj.b);
         ops.norm.rmsNorm(x, delta, self.norm, cfg.norm_eps);
 
-        // ⚠️ A per-ROW scalar, applied after the norm: `out = out * t5xxl_weights`
+        // A per-ROW scalar, applied after the norm: `out = out * t5xxl_weights`
         // with the weights broadcast over the feature axis
         // (`t5xxl_weights.unsqueeze(0).unsqueeze(-1)`). The pad rows stay zero, which
         // is why this loops over `n_t` and not `rows`.
@@ -436,9 +360,9 @@ pub const Adapter = struct {
         try ops.matmul.matmul(io, gpa, out, hidden, n, blk.mlp2.w, blk.mlp2.b);
     }
 
-    /// Shared by both of the adapter's attentions. ⚠️ Queries are rotated by
+    /// Shared by both of the adapter's attentions. Queries are rotated by
     /// `q_freqs` and keys by `k_freqs`, which are the SAME table for self-attention
-    /// and DIFFERENT tables for cross-attention — convention 6.
+    /// and DIFFERENT tables for cross-attention, convention 6.
     fn attnForward(
         self: *const Adapter,
         io: std.Io,
@@ -497,7 +421,7 @@ pub const DiT = struct {
     /// because `use_adaln_lora`), `linear_2` is `dim -> 3*dim`.
     t_linear1: Weight,
     t_linear2: Weight,
-    /// `t_embedding_norm`, an RMSNorm **with** weight over the raw sinusoid.
+    /// `t_embedding_norm`, an RMSNorm with weight over the raw sinusoid.
     t_norm: []const f32,
     blocks: []Block,
     final_ada: [2]Weight,
@@ -569,7 +493,7 @@ pub const DiT = struct {
     // per-image constants once and the per-step part per step. Anima's modulation
     // is one vector per sublayer per block for the WHOLE image (`emb` is `[B, T, D]`
     // with T = 1, broadcast over h and w), so the entire AdaLN evaluation is a
-    // per-step constant — 28 blocks x 3 x a rank-256 factorization, which is
+    // per-step constant, 28 blocks x 3 x a rank-256 factorization, which is
     // ~0.2 GFLOP against the trunk's hundreds.
 
     /// Every block's modulation vectors for one sigma, plus the final layer's, laid
@@ -640,10 +564,10 @@ pub const DiT = struct {
     /// Every sigma's FOLDED modulation table, back to back with stride
     /// `modulationTableLen(cfg)`. Caller frees.
     ///
-    /// ⚠️ **Per SIGMA, not per conditioning** — the AdaLN input is the timestep alone, so
+    /// Per SIGMA, not per conditioning, the AdaLN input is the timestep alone, so
     /// the positive and negative branches need identical tables. Building it once per
-    /// `anima_gpu`/`anima_cuda` session did it twice per image: **measured 0.51 s + 0.29 s
-    /// of a 1.11 s per-image setup** at 31 sigmas. `pipeline.Session` builds one of these
+    /// `anima_gpu`/`anima_cuda` session did it twice per image: measured 0.51 s + 0.29 s
+    /// of a 1.11 s per-image setup at 31 sigmas. `pipeline.Session` builds one of these
     /// and both device sessions borrow it.
     pub fn modulationSchedule(self: *const DiT, io: std.Io, gpa: std.mem.Allocator, sigmas: []const f32) ![]f32 {
         const cfg = self.cfg;
@@ -654,36 +578,21 @@ pub const DiT = struct {
         errdefer gpa.free(out);
         if (n == 0) return out;
 
-        // ⚠️ **BATCHED over sigmas, and that is the whole point of this function.** Done one
-        // sigma at a time it is 12 GFLOP spread over **5270 GEMV calls with m = 1** — no
-        // weight reuse and all call overhead. Batched it is **170 GEMMs with m = n**, the
-        // same arithmetic with each weight read once.
+        // BATCHED over sigmas, which is why this function exists. One sigma at a time is
+        // 12 GFLOP spread over 5270 GEMV calls at m = 1, no weight reuse and all call
+        // overhead; batched it is 170 GEMMs at m = n_sigmas, the same arithmetic with each
+        // weight read once. Measured on the per-image device session: 13.74 s -> 1.28 s.
         //
-        // ⚠️ It was reported as "Anima images are super slow to start, but only Anima", with
-        // **12.3 s** of per-image setup and high CPU, repeating on every image. Two
-        // multipliers stacked: this shape, and a **Debug** GUI build (`zig build run-gui`
-        // does not imply `-Doptimize=ReleaseFast`), which costs ~10x on host numeric code.
-        // Anima-specific because no other family precomputes a per-sigma AdaLN table of this
-        // size on the host — krea2's timestep vectors are far smaller.
+        // Most of what batching removes is task-spawn overhead, not arithmetic:
+        // `ops.matmul` splits into `4 * n_threads` tasks whenever an op clears 1 MFLOP,
+        // which every one of these tiny GEMVs does, so the unbatched form pays ~168,000
+        // spawns per image. A bench on an Io with no thread pool cannot see that and
+        // reports only 3.5x.
         //
-        // **Measured** (Debug, 1024^2, 30 steps, cfg 5, `cuda`, isolated with a temporary
-        // env switch over exactly this branch): the per-image device session goes
-        // **13.74 s -> 1.28 s**. ⚠️ A single-threaded bench of the two forms showed only
-        // 3.5x, understating it by 3x, because most of what batching removes is
-        // **task-spawn overhead**: `matmul` splits into `4 * n_threads` tasks whenever the
-        // op clears 1 MFLOP, which every one of these tiny GEMVs does — so the unbatched
-        // form paid ~168,000 task spawns per image. A bench on an Io with no thread pool
-        // cannot see the dominant cost, which is the same "measure it in the units the
-        // caller experiences" rule the profiler-bucket lesson above turns on.
-        //
-        // ⚠️ **Bit-identical below 16 sigmas, last-bits different at or above it**, because
-        // `m` crosses `ops.matmul.small_m_max`: at m < 16 a row still goes through ggml's
-        // `vec_dot` exactly as the m = 1 form did, while at m >= 16 it takes the packed
-        // f32-panel path with a different reduction order. Verified both ways — **PSNR inf
-        // (bit-identical)** at 8 steps / cfg 1, and **46.8 dB** at 30 steps / cfg 5, the
-        // latter being trajectory amplification of a last-bits input change and **24 dB
-        // inside this model's own measured cfg-5 precision envelope** (ComfyUI disagrees
-        // with itself by 23.04 dB there).
+        // Bit-identical below 16 sigmas and last-bits different at or above it, because
+        // `m` crosses `ops.matmul.small_m_max`: under 16 a row goes through ggml's
+        // `vec_dot` exactly as the m = 1 form did, at 16 and up it takes the packed
+        // f32-panel path with a different reduction order. Verified in both regimes.
         const sinus = try gpa.alloc(f32, n * d);
         defer gpa.free(sinus);
         for (sigmas, 0..) |sg, i| timestepEmbedding(sinus[i * d ..][0..d], sg);
@@ -770,9 +679,9 @@ pub const DiT = struct {
         cancel: ?*std.atomic.Value(bool),
     ) !void {
         const cfg = self.cfg;
-        // ⚠️ The reference `pad_to_patch_size`s and crops back. Every caller here
+        // The reference `pad_to_patch_size`s and crops back. Every caller here
         // derives the latent from `width / 8` with `width` a multiple of 16, so an
-        // odd latent dim is unreachable — the same argument Z-Image's DiT makes.
+        // odd latent dim is unreachable, the same argument Z-Image's DiT makes.
         // Assert rather than pad, so a future caller that breaks it says so.
         std.debug.assert(lat_h % cfg.patch == 0 and lat_w % cfg.patch == 0);
         std.debug.assert(x_lat.len == cfg.channels * lat_h * lat_w);
@@ -864,8 +773,8 @@ pub const DiT = struct {
 
     /// `blockForward` with caller-owned scratch.
     ///
-    /// The three sublayers are identical in shape — modulated weightless LayerNorm,
-    /// sublayer, gated residual — and differ only in which third of `m` they read and
+    /// The three sublayers are identical in shape, modulated weightless LayerNorm,
+    /// sublayer, gated residual, and differ only in which third of `m` they read and
     /// whether RoPE applies (convention 6: self-attention only).
     fn blockForwardIn(
         self: *const DiT,
@@ -891,7 +800,7 @@ pub const DiT = struct {
         try self.attnForward(io, gpa, &blk.self_attn, normed, seq, normed, seq, freqs, delta);
         gatedAdd(x, delta, m[2 * d .. 3 * d]);
 
-        // Cross-attention onto the adapter's output. ⚠️ No RoPE here.
+        // Cross-attention onto the adapter's output. No RoPE here.
         modulatedNorm(normed, x, m[3 * d .. 4 * d], m[4 * d .. 5 * d], cfg.norm_eps);
         try self.attnForward(io, gpa, &blk.cross_attn, normed, seq, ctx, ctx_seq, null, delta);
         gatedAdd(x, delta, m[5 * d .. 6 * d]);
@@ -915,7 +824,7 @@ pub const DiT = struct {
         const hidden = try gpa.alloc(f32, seq * inner);
         defer gpa.free(hidden);
         try ops.matmul.matmul(io, gpa, hidden, x, seq, blk.mlp1, null);
-        // `nn.GELU()` with the default `approximate='none'` — the erf form, not tanh.
+        // `nn.GELU()` with the default `approximate='none'`, the erf form, not tanh.
         ops.act.geluErf(hidden);
         try ops.matmul.matmul(io, gpa, out, hidden, seq, blk.mlp2, null);
     }
@@ -923,9 +832,9 @@ pub const DiT = struct {
     /// The key/value half of one attention: project `src` and apply the K norm
     /// (`v_norm = nn.Identity()`, so V is untouched). `k`/`v` are `[n][dim]`.
     ///
-    /// ⚠️ Its own function because BOTH GPU arms precompute cross-attention's K and V
-    /// once per image — they are projections of the adapter's output, which no step
-    /// changes — and "what K and V are" must have exactly one implementation. Two
+    /// Its own function because BOTH GPU arms precompute cross-attention's K and V
+    /// once per image, they are projections of the adapter's output, which no step
+    /// changes, and "what K and V are" must have exactly one implementation. Two
     /// copies of "project, then norm K but not V" is precisely the drift that makes a
     /// device forward disagree with the host one in a way no shape check sees.
     fn projectKv(
@@ -945,7 +854,7 @@ pub const DiT = struct {
         ops.norm.rmsNorm(k, k, attn.knorm, self.cfg.qk_eps);
     }
 
-    /// One block's CROSS-attention K and V for a fixed context — the per-image
+    /// One block's CROSS-attention K and V for a fixed context, the per-image
     /// constant both GPU arms cache for every block. `k`/`v` are `[n][dim]`.
     pub fn crossKv(
         self: *const DiT,
@@ -1053,7 +962,7 @@ pub fn ropeFreqsFor(gpa: std.mem.Allocator, cfg: Config, h: usize, w: usize) !op
     for (0..h) |hi| {
         for (0..w) |wi| {
             const row = (hi * w + wi) * half;
-            // ⚠️ `T = 1`, so every temporal position is 0 and the first `n_t`
+            // `T = 1`, so every temporal position is 0 and the first `n_t`
             // frequencies are cos 1 / sin 0. A wrong axis ORDER therefore leaves
             // 22 of 64 slots looking correct, which is why the fixture checks a
             // non-square grid where h and w cannot be confused either.
@@ -1081,8 +990,8 @@ pub fn ropeFreqsFor(gpa: std.mem.Allocator, cfg: Config, h: usize, w: usize) !op
 /// `Timesteps.forward`: `cat([cos(t * w), sin(t * w)])` with
 /// `w_i = exp(-log(10000) * i / half)`.
 ///
-/// ⚠️ Identical in form to `zimage.timestepEmbedding` (both are cos-first, both
-/// divide by `half` rather than `half - 1`) and **different from**
+/// Identical in form to `zimage.timestepEmbedding` (both are cos-first, both
+/// divide by `half` rather than `half - 1`) and different from
 /// `sd_unet.timestepEmbedding`, which is diffusers' sin-first `flip_sin_to_cos`
 /// variant. f64 internals for the reason those two record: at `i = 0` the frequency
 /// is 1, so a 1e-7 relative slip in the argument shows up directly in `cos`, and
@@ -1113,8 +1022,8 @@ fn modulatedNorm(dst: []f32, src: []const f32, shift_v: []const f32, scale_v: []
     }
 }
 
-/// `torch.addcmul(x, gate, delta)`, row-wise: `x += gate * delta`. ⚠️ The gate is
-/// NOT passed through anything here — unlike Z-Image, whose gates are `tanh`'d.
+/// Row-wise `x += gate * delta`. The gate is NOT passed through anything here,
+/// unlike Z-Image, whose gates are tanh'd.
 fn gatedAdd(x: []f32, delta: []const f32, gate: []const f32) void {
     const dim = gate.len;
     var row: usize = 0;
@@ -1123,12 +1032,15 @@ fn gatedAdd(x: []f32, delta: []const f32, gate: []const f32) void {
     }
 }
 
-/// Planar `[channels][lat_h][lat_w]` → `[seq][patchDim]` patch rows, appending the
-/// all-zero padding-mask channel when the config asks for it.
+/// Planar [channels][lat_h][lat_w] to [seq][patchDim] patch rows, appending the
+/// all-zero padding-mask channel when the config asks for it. That extra channel
+/// is why x_embedder.proj.1.weight is [2048, 68] and not [2048, 64]; it is not
+/// optional and not derivable from the latent.
 ///
-/// ⚠️ Feature order is `(c, ph, pw)` — **channel SLOWEST** — and the padding-mask
-/// channel is the LAST channel, so its four slots are at indices 64..67 of each
-/// token. See convention 1; the output order is different.
+/// Feature order is (c, ph, pw), channel SLOWEST, and the padding mask is the last
+/// channel, so its four slots are indices 64..67 of each token. unpatchify uses the
+/// opposite order and the two are NOT inverses. Swapping them permutes values
+/// without changing any norm or per-stage magnitude, so only the image shows it.
 pub fn patchify(gpa: std.mem.Allocator, cfg: Config, x_lat: []const f32, lat_h: usize, lat_w: usize) ![]f32 {
     const p = cfg.patch;
     const cin = cfg.inChannels();
@@ -1156,11 +1068,10 @@ pub fn patchify(gpa: std.mem.Allocator, cfg: Config, x_lat: []const f32, lat_h: 
     return out;
 }
 
-/// `[seq][outPatchDim]` → planar `[out_channels][lat_h][lat_w]`.
+/// [seq][outPatchDim] to planar [out_channels][lat_h][lat_w].
 ///
-/// ⚠️ Feature order is `(ph, pw, c)` — **channel FASTEST**, the opposite of
-/// `patchify`'s. From `"B T H W (p1 p2 t C) -> B C (T t) (H p1) (W p2)"` with
-/// `t = patch_temporal = 1`. There is no output sign flip here (Z-Image has one).
+/// Feature order is (ph, pw, c), channel FASTEST, the opposite of patchify's. There
+/// is no output sign flip here; Z-Image has one.
 pub fn unpatchify(cfg: Config, out: []f32, patches: []const f32, lat_h: usize, lat_w: usize) void {
     const p = cfg.patch;
     const co = cfg.out_channels;
@@ -1184,7 +1095,7 @@ pub fn unpatchify(cfg: Config, out: []f32, patches: []const f32, lat_h: usize, l
 }
 
 /// Gather `[n][cols]` f32 rows out of a dtype-generic `[rows][cols]` embedding
-/// matrix — `qwen3.embedTokens` for the adapter's own (T5) vocabulary. Dispatching
+/// matrix, `qwen3.embedTokens` for the adapter's own (T5) vocabulary. Dispatching
 /// on the stored dtype rather than assuming bf16 is the fix that file records: three
 /// call sites there hardcoded a `* 2` row stride and read a q6_k embedding as noise.
 fn embedRows(embed: Weight, ids: []const u32, out: []f32) !void {
@@ -1202,7 +1113,7 @@ fn embedRows(embed: Weight, ids: []const u32, out: []f32) !void {
 /// `dit.gpuLinKindSupported` / `zimage.gpuLinKindSupported`: an unrecognized dtype
 /// on those paths is not a slow path, it is silently wrong output.
 ///
-/// ⚠️ int8/int4 convrot is **absent on purpose**: the CPU `matmul` runs it (rotate +
+/// int8/int4 convrot is absent on purpose: the CPU `matmul` runs it (rotate +
 /// per-row dequant) but neither `anima_gpu` nor `anima_cuda` has a W8A8 path yet. See
 /// `unsupportedGpuLin`.
 pub fn gpuLinKindSupported(dt: DType) bool {
@@ -1214,48 +1125,47 @@ pub fn gpuLinKindSupported(dt: DType) bool {
 
 /// The first block linear whose dtype no GPU arm can run, or null if every one can.
 ///
-/// ⚠️ **This exists because checking ONE tensor of ONE block is wrong on a real
-/// checkpoint, and that mistake produced a panic.** `anima_baseV10-INT8_CONVROT-MIXED`
-/// keeps **block 0 entirely bf16** and quantizes blocks 1-27 — so a `supported()` that
-/// read `blocks[0].self_attn.q.dtype` said yes, a device session was built, and the very
-/// first thing it did (`crossKv`, on the host) tripped `matmul`'s int8 assert. "Mixed"
-/// means mixed **per block**, and a per-block-uniform checkpoint is the easy case, not
-/// the general one.
+/// Checking ONE tensor of ONE block is wrong on a real checkpoint and produces a panic
+/// rather than a refusal: mixed checkpoints keep block 0 entirely bf16 and quantize
+/// blocks 1-27, so a `supported()` reading `blocks[0].self_attn.q.dtype` says yes, a
+/// device session is built, and the first thing it does trips `matmul`'s int8 assert.
+/// "Mixed" means mixed per block; per-block-uniform is the easy case, not the general
+/// one.
 ///
 /// Returns the offending `{block, name, dtype}` so the warning can say which layer, not
 /// just that something is unsupported.
 pub const UnsupportedLin = struct { block: usize, tag: []const u8, dtype: DType };
 
-/// Which GEMM family one linear takes. ⚠️ Resolved PER LINEAR and used per BLOCK — a real
-/// mixed checkpoint is mixed by block: `easonAnimaHOTStyle_animaV10-INT8_CONVROT` leaves
-/// block 0 entirely dense, quantizes block 1's ten attention/MLP linears, and quantizes all
-/// sixteen in blocks 2-27. A per-model kind would be wrong for at least one block of it.
+/// Which GEMM family one linear takes. Resolved PER LINEAR and used per BLOCK, because a
+/// real mixed checkpoint is mixed by block: block 0 entirely dense, block 1 quantizing
+/// only its ten attention/MLP linears, blocks 2-27 quantizing all sixteen. A per-model
+/// kind would be wrong for at least one block of it.
 pub const LinKind = enum { dense, i8, i4, w4a8, nvfp4 };
 
 pub fn linKind(w: Weight) LinKind {
     return switch (w.dtype) {
         .i8 => .i8,
         .i4 => .i4,
-        // ⚠️ W4A8 is its own kind even though its GEMM *is* the int8 one: only the
+        // W4A8 is its own kind even though its GEMM *is* the int8 one: only the
         // WEIGHT's storage differs, so it shares int8's activation prep (see `prepKind`)
         // but needs a decode step the plain int8 entry point does not have.
         .w4a8 => .w4a8,
-        // ⚠️ NVFP4 is its OWN kind, not `.dense`. It needs no activation prep (weight-only
+        // NVFP4 is its OWN kind, not `.dense`. It needs no activation prep (weight-only
         // here, so the GEMM takes f32 `x` like a dense weight does) but it does need its
-        // own GEMM entry point — and `gemm`'s dense arm would read the packed nibbles as
+        // own GEMM entry point, and `gemm`'s dense arm would read the packed nibbles as
         // fp8 or f32, which is finite, plausible and wrong.
         .nvfp4 => .nvfp4,
         else => .dense,
     };
 }
 
-/// What a given backend's GEMM surface can run. ⚠️ Not the same on both arms: both CUDA
-/// arms have int8 AND int4 convrot; Vulkan has int8 (native `sint8` coopmat) but **no
-/// `sint4` coopmat exists on this device**, so int4 needs a different strategy there.
+/// What a given backend's GEMM surface can run. Not the same on both arms: both CUDA
+/// arms have int8 AND int4 convrot; Vulkan has int8 (native `sint8` coopmat) but no
+/// `sint4` coopmat exists on this device, so int4 needs a different strategy there.
 pub const LinSupport = struct {
     i8: bool = false,
     i4: bool = false,
-    /// Needs the backend's W4A8 decode kernel plus the int8 GEMM it feeds — so it implies
+    /// Needs the backend's W4A8 decode kernel plus the int8 GEMM it feeds, so it implies
     /// `i8`, and a backend with int8 but no decode kernel must still say false here.
     w4a8: bool = false,
     /// Needs the backend's NVFP4 decode kernel plus the f16-weight GEMM it feeds.
@@ -1264,11 +1174,11 @@ pub const LinSupport = struct {
 
 /// The activation prep a linear's GEMM reads, which is NOT one-to-one with `LinKind`.
 ///
-/// ⚠️ **W4A8 and int8 share one prep, and that is what makes a mixed checkpoint work.**
+/// W4A8 and int8 share one prep, and that is what makes a mixed checkpoint work.
 /// The "A8" is exactly that the activation stays 8-bit: only the weight's storage differs,
 /// so a group holding both kinds needs one `opI8Prep`, not two. Treating them as distinct
-/// here would refuse `terraRising_20TerraRisingAnima-ASYM_W4A8_INT8` (whose block 1 has
-/// W4A8 attention weights beside block 0's dense ones) as an unserviceable mix.
+/// here would refuse a checkpoint whose block 1 has W4A8 attention weights beside block
+/// 0's dense ones as an unserviceable mix.
 pub const PrepKind = enum { none, i8, i4 };
 
 pub fn prepKind(k: LinKind) PrepKind {
@@ -1300,15 +1210,13 @@ pub fn unsupportedLin(model: *const DiT, support: LinSupport) ?UnsupportedLin {
 /// Every linear one block's DEVICE forward runs, and the one list all three scans below
 /// share.
 ///
-/// ⚠️ **Cross-attention's k/v belong here and were missing until 2026-08-08.** They were
-/// host GEMMs when this scan was written, and the comment saying so outlived the change
-/// that moved them onto the device (the per-image stall fix) — so a checkpoint whose cross
-/// k/v were quantized in a form the backend lacks would have passed the gate and then met
-/// it inside `buildCrossKv`. That is the identical shape of the block-0-only probe this
-/// function exists to replace, one level down.
+/// Cross-attention's k/v belong here: they run on the device, so a checkpoint that
+/// quantizes them in a form the backend lacks must fail the support gate rather than
+/// fail inside `buildCrossKv`. When a computation moves from host to device, the
+/// support scan is part of what moves.
 ///
 /// The AdaLN pair IS deliberately absent: `modulationTable` is evaluated on the host, where
-/// `ops.matmul` handles convrot at any shape — which is what lets the device path require
+/// `ops.matmul` handles convrot at any shape, which is what lets the device path require
 /// `rows % 128 == 0` without special-casing AdaLN's 256 and 6144.
 pub fn deviceLins(b: anytype) [10]Weight {
     return .{
@@ -1320,7 +1228,7 @@ pub fn deviceLins(b: anytype) [10]Weight {
 
 /// Largest transient buffer any NVFP4 block linear decodes into, per the backend's own
 /// sizing rule, or 0 when the model has none. A caller pre-sizes with this so the scratch
-/// never grows mid-forward — on Vulkan that would flush the recording batch.
+/// never grows mid-forward, on Vulkan that would flush the recording batch.
 ///
 /// Scans every block's DEVICE linears, the same set `unsupportedLin` uses.
 pub fn maxNvfp4Scratch(model: *const DiT, comptime bytesFor: fn (rows: usize, cols: usize) usize) usize {
@@ -1349,9 +1257,9 @@ pub fn maxW4A8Scratch(model: *const DiT, comptime bytesFor: fn (rows: usize, col
 
 /// A packed W4A8 block linear whose `group_size` is not a multiple of 8, if any.
 ///
-/// ⚠️ The CUDA decode kernel reads FOUR packed bytes per thread as one `u32`, which is what
+/// The CUDA decode kernel reads FOUR packed bytes per thread as one `u32`, which is what
 /// puts eight independent dependent-load chains in flight and takes it from 270 to ~100
-/// ms/step — and that requires a `u32` of packed bytes to lie inside one group, so the
+/// ms/step, and that requires a `u32` of packed bytes to lie inside one group, so the
 /// group scale is loaded once. Vulkan's kernel is general over the group size. No shipped
 /// checkpoint uses a smaller group (every one seen here is 16), so this refuses by name
 /// rather than asserting. Mirrors `dit.w4a8SmallGroup`.
@@ -1364,7 +1272,7 @@ pub fn w4a8SmallGroup(model: *const DiT) ?[]const u8 {
     return null;
 }
 
-/// `unsupportedLin` for a backend with no convrot GEMM — the conservative default, and
+/// `unsupportedLin` for a backend with no convrot GEMM, the conservative default, and
 /// what `anima_gpu` passes.
 pub fn unsupportedGpuLin(model: *const DiT) ?UnsupportedLin {
     return unsupportedLin(model, .{});
@@ -1395,8 +1303,8 @@ const Loader = struct {
         };
         const shape = view.info.shape.slice();
         const dt = view.info.dtype;
-        // ⚠️ **Both ComfyUI 4-bit formats must be recognized BEFORE the int4 heuristic
-        // below, and each by its OWN sidecar rather than by dtype or shape**: NVFP4 is
+        // Both ComfyUI 4-bit formats must be recognized BEFORE the int4 heuristic
+        // below, and each by its OWN sidecar rather than by dtype or shape: NVFP4 is
         // stored `U8 [rows, cols/2]` and W4A8 `I8 [rows, cols/2]`, which is exactly the
         // signature that heuristic keys on. NVFP4's nibbles are E2M1 floats with a
         // per-16-block fp8 scale and W4A8's are unsigned indices into a non-uniform
@@ -1404,10 +1312,11 @@ const Loader = struct {
         // finite, plausible and wrong. One implementation for every family that ships
         // them (`quant_weight.zig`).
         //
-        // ⚠️ W4A8 was krea2-only for one day, and that is precisely how
-        // `terraRising_20TerraRisingAnima-ASYM_W4A8_INT8` became unloadable: this loader
-        // fell through to the int4 arm and died on the `_scale` that format does not
-        // have. Anything ComfyUI's quantizers emit reaches every family they support.
+        // Detection must come first and must key on the sidecar tensors. A W4A8 or
+        // NVFP4 weight is stored `I8 [rows, cols/2]`, exactly the int4-convrot
+        // signature, so a loader that skips this falls through to the int4 arm and dies
+        // on a `_scale` those formats do not have. Anything ComfyUI's quantizers emit
+        // reaches every family they support.
         if (try quant_weight.nvfp4(l.alloc, l.store, nm, rows, cols)) |nv| {
             var w = nv;
             w.tag = try l.alloc.dupe(u8, nm);
@@ -1419,9 +1328,9 @@ const Loader = struct {
             return w;
         }
 
-        // ⚠️ **int4 convrot weights are nibble-packed**, so the on-disk shape is
+        // int4 convrot weights are nibble-packed, so the on-disk shape is
         // `[rows, cols/2]`; a genuine int8 convrot weight is also I8 but at the full
-        // `[rows, cols]`. Disambiguate by the halved column count, not by dtype alone —
+        // `[rows, cols]`. Disambiguate by the halved column count, not by dtype alone,
         // exactly as `dit.zig` does, and for the same reason: our own converter stores
         // the packed bytes as U8 where ComfyUI's W4A4 converter stores the identical
         // bytes as I8.
@@ -1452,13 +1361,13 @@ const Loader = struct {
         // (ops.matmul.probe, profiling, error messages).
         w.tag = try l.alloc.dupe(u8, nm);
 
-        // ⚠️ **int8/int4 "convrot" needs its per-row scale and rotation metadata wired
-        // here, and omitting it is a PANIC rather than a wrong answer**:
+        // int8/int4 "convrot" needs its per-row scale and rotation metadata wired
+        // here, and omitting it is a PANIC rather than a wrong answer:
         // `ops.matmul.matmul` asserts `row_scale != null` for an integer weight. That is
-        // exactly what a `-INT8_CONVROT-MIXED` Anima checkpoint hit — the loader accepted
+        // exactly what a `-INT8_CONVROT-MIXED` Anima checkpoint hit, the loader accepted
         // the I8 tensor (`supportsDType(.i8)` is true) and the assert fired 5 frames
         // deep, in `crossKv`. The companion tensor is `<name>_scale`, i.e.
-        // `…q_proj.weight_scale`, with one entry per output row.
+        // `...q_proj.weight_scale`, with one entry per output row.
         if (wdt == .i8 or wdt == .i4) {
             var sbuf: [200]u8 = undefined;
             const sname = try l.name(&sbuf, fmt, args, "_scale");
@@ -1503,7 +1412,7 @@ const Loader = struct {
             .q = try l.mat(fmt ++ ".q_proj.weight", args, inner, cfg.dim),
             .k = try l.mat(fmt ++ ".k_proj.weight", args, inner, ctx_dim),
             .v = try l.mat(fmt ++ ".v_proj.weight", args, inner, ctx_dim),
-            // ⚠️ The DiT calls it `output_proj`; the adapter calls the same thing
+            // The DiT calls it `output_proj`; the adapter calls the same thing
             // `o_proj`. Two names for one role, in one checkpoint.
             .out = try l.mat(fmt ++ ".output_proj.weight", args, cfg.dim, inner),
             .qnorm = try l.vec(fmt ++ ".q_norm.weight", args, cfg.headDim()),
@@ -1520,7 +1429,7 @@ const Loader = struct {
             .cross_attn = try l.ditAttn("blocks.{d}.cross_attn", .{i}, cfg.context_dim),
             .mlp1 = try l.mat("blocks.{d}.mlp.layer1.weight", .{i}, cfg.mlp_dim, d),
             .mlp2 = try l.mat("blocks.{d}.mlp.layer2.weight", .{i}, d, cfg.mlp_dim),
-            // `.1` and `.2` because `.0` is the SiLU — convention 5.
+            // `.1` and `.2` because `.0` is the SiLU, convention 5.
             .ada_sa = .{
                 try l.mat("blocks.{d}.adaln_modulation_self_attn.1.weight", .{i}, a, d),
                 try l.mat("blocks.{d}.adaln_modulation_self_attn.2.weight", .{i}, 3 * d, a),
@@ -1536,8 +1445,8 @@ const Loader = struct {
         };
     }
 
-    /// One adapter attention. Square throughout — source_dim equals the adapter's
-    /// own width for this checkpoint — but named separately from `ditAttn` because
+    /// One adapter attention. Square throughout, source_dim equals the adapter's
+    /// own width for this checkpoint, but named separately from `ditAttn` because
     /// the tensors are spelled differently (`o_proj`, not `output_proj`).
     fn adapterAttn(l: Loader, comptime fmt: []const u8, args: anytype) !Attn {
         const ac = l.cfg.adapter;
@@ -1559,7 +1468,7 @@ const Loader = struct {
             .norm_cross = try l.vec("llm_adapter.blocks.{d}.norm_cross_attn.weight", .{i}, ac.dim),
             .cross_attn = try l.adapterAttn("llm_adapter.blocks.{d}.cross_attn", .{i}),
             .norm_mlp = try l.vec("llm_adapter.blocks.{d}.norm_mlp.weight", .{i}, ac.dim),
-            // ⚠️ Indices 0 and 2 (`.1` is the GELU), and these DO have biases where
+            // Indices 0 and 2 (`.1` is the GELU), and these DO have biases where
             // every linear in the DiT half does not.
             .mlp1 = .{
                 .w = try l.mat("llm_adapter.blocks.{d}.mlp.0.weight", .{i}, ac.mlp_dim, ac.dim),
@@ -1588,7 +1497,7 @@ const ref_path = "src/models/assets/anima_ref.safetensors";
 const anima_ckpt = "/home/qt/genai/comfyui/models/diffusion_models/anima/terraRising_20TerraRisingAnima.safetensors";
 const anima_te = "/home/qt/genai/comfyui/models/text_encoders/qwen_3_06b_base.safetensors";
 const anima_int8_ckpt = "/home/qt/genai/comfyui/models/diffusion_models/anima/anima_baseV10-INT8_CONVROT-MIXED.safetensors";
-/// Trunk depths the fp32 reference keeps — see the generator's docstring. The pair
+/// Trunk depths the fp32 reference keeps, see the generator's docstring. The pair
 /// is what shows whether the disagreement grows linearly with depth (the block is
 /// right) or compounds (it is merely close).
 const ref_layers = [2]usize{ 8, 2 };
@@ -1605,7 +1514,7 @@ fn relL2(want: []const f32, got: []const f32) f64 {
 }
 
 /// The prompts the fixture was generated from, read out of its OWN metadata rather
-/// than duplicated here — a second copy of the prompt text is exactly the drift that
+/// than duplicated here, a second copy of the prompt text is exactly the drift that
 /// would make a token-id comparison pass against the wrong string. Caller frees the
 /// parsed value.
 fn refPrompts(gpa: std.mem.Allocator, ref: *const SafeTensors) !std.json.Parsed([]const []const u8) {
@@ -1615,7 +1524,7 @@ fn refPrompts(gpa: std.mem.Allocator, ref: *const SafeTensors) !std.json.Parsed(
 }
 
 /// The Qwen3 branch's ids: `Qwen3Tokenizer` takes no start or end token and pads only
-/// to `min_length = 1`, so this is the bare Qwen2 BPE of the prompt — with one
+/// to `min_length = 1`, so this is the bare Qwen2 BPE of the prompt, with one
 /// `<|endoftext|>` when that would otherwise be empty.
 fn qwenIds(gpa: std.mem.Allocator, tok: *const tokenizer_mod.Tokenizer, text: []const u8) ![]u32 {
     return tok.encodeSegmented(gpa, text, 1, tokenizer_mod.pad_token);
@@ -1634,7 +1543,7 @@ fn refIds(gpa: std.mem.Allocator, ref: *const SafeTensors, name: []const u8) ![]
 test "the RoPE axis widths are the remainder split VideoRopePosition3DEmb computes" {
     const axes = anima_2b.ropeAxes();
     // head_dim 128: dim_h = dim_w = 128 // 6 * 2 = 42, dim_t = 128 - 84 = 44.
-    // ⚠️ The temporal axis is the WIDEST, which is counter-intuitive for a model
+    // The temporal axis is the WIDEST, which is counter-intuitive for a model
     // that only ever runs at T = 1.
     try testing.expectEqual([3]usize{ 44, 42, 42 }, axes);
     try testing.expectEqual(anima_2b.headDim(), axes[0] + axes[1] + axes[2]);
@@ -1692,7 +1601,7 @@ test "patchify and unpatchify use DIFFERENT feature orders, and each round-trips
     // (ph=1, pw=0, c=0) is feature 32 -> channel 0 at (1,0).
     try testing.expectEqual(@as(f32, 32), back[lat_w]);
 
-    // ⚠️ And the reason a single order looks fine: the two disagree, but both are
+    // And the reason a single order looks fine: the two disagree, but both are
     // permutations, so the multiset of values is identical either way. Nothing that
     // checks magnitudes can see the difference.
     var sum_in: f64 = 0;
@@ -1725,7 +1634,7 @@ test "the temporal RoPE block is identity at T = 1 and h/w are not interchangeab
     const n_t = axes[0] / 2;
     const n_h = axes[1] / 2;
     // Convention 7: the first 22 frequencies are the temporal axis, which at T = 1
-    // is every position 0 — cos 1, sin 0. So a third of the vector is identity and
+    // is every position 0, cos 1, sin 0. So a third of the vector is identity and
     // a wrong axis order still looks partly right.
     for (0..3 * 5) |tok| {
         for (0..n_t) |i| {
@@ -1743,7 +1652,7 @@ test "the temporal RoPE block is identity at T = 1 and h/w are not interchangeab
     try testing.expect(f.cos[t10 * 64 + n_t + 1] != 1.0); // h moved
     try testing.expectEqual(@as(f32, 1), f.cos[t10 * 64 + n_t + n_h + 1]); // w still 0
 
-    // The h/w NTK factor is 4 ** (42/40), applied to 10000 — not 4 * 10000, and not
+    // The h/w NTK factor is 4 ** (42/40), applied to 10000, not 4 * 10000, and not
     // 4 ** (42/42). Check it through the first non-trivial frequency.
     const th = 10000.0 * std.math.pow(f64, 4.0, 42.0 / 40.0);
     const inv1 = 1.0 / std.math.pow(f64, th, 2.0 / 42.0);
@@ -1751,14 +1660,14 @@ test "the temporal RoPE block is identity at T = 1 and h/w are not interchangeab
 }
 
 test "the Anima adapter and DiT match ComfyUI on a real checkpoint" {
-    // ⚠️ Compared stage by stage rather than end to end, because the stages fail for
+    // Compared stage by stage rather than end to end, because the stages fail for
     // genuinely different reasons: the encoder is a tap/final-norm question, the
     // adapter is a cross-attention-wiring question, the timestep path is conventions
     // 3-5, the RoPE table is convention 7, `x_embed` is conventions 1-2, and the
     // trunk is the block form. One output comparison would say only "wrong".
     //
     // The reference keeps 8 (and 2) of the 28 trunk blocks, so the model is loaded at
-    // those depths. What that does not check is the loop bound itself — the
+    // those depths. What that does not check is the loop bound itself, the
     // end-to-end render comparison covers that.
     const gpa = testing.allocator;
     const io = testing.io;
@@ -1781,9 +1690,9 @@ test "the Anima adapter and DiT match ComfyUI on a real checkpoint" {
         const d = cfg.dim;
 
         for (0..2) |ci| {
-            // ⚠️ Two tags: the per-depth one carries only `out`, while every INPUT
+            // Two tags: the per-depth one carries only `out`, while every INPUT
             // lives under the deepest tag and is shared across depths. The generator
-            // draws them once for exactly this reason — a per-depth draw would make
+            // draws them once for exactly this reason, a per-depth draw would make
             // the "depth trend" a comparison of two unrelated forwards.
             const tag = try std.fmt.bufPrint(&kb, "dit{d}.{d}", .{ n_layers, ci });
             var inb: [64]u8 = undefined;
@@ -1880,7 +1789,7 @@ test "the Anima adapter and DiT match ComfyUI on a real checkpoint" {
                     try ops.matmul.matmul(io, gpa, got, patches, seq, model.x_embedder, null);
                     const rel = relL2(want, got);
                     errdefer std.debug.print("{s} x_embed rel L2 {e:.4}\n", .{ tag, rel });
-                    // ⚠️ Measured **exactly 0.0** at both latent sizes — this stage is
+                    // Measured exactly 0.0 at both latent sizes, this stage is
                     // bit-identical to torch, which is what pins the input patch order
                     // and the padding-mask channel with no room for interpretation. The
                     // bound is not 0 only because a future change to the GEMM's blocking
@@ -1920,7 +1829,7 @@ test "the Anima adapter and DiT match ComfyUI on a real checkpoint" {
                     const rel = relL2(ctx, weighted);
                     errdefer std.debug.print("{s} ctx rel L2 {e:.4}\n", .{ tag, rel });
                     try testing.expect(rel < 2e-5); // measured 3.2e-6 / 3.6e-6
-                    // ⚠️ And the pad rows must be exactly zero, not "small": the
+                    // And the pad rows must be exactly zero, not "small": the
                     // denoiser cross-attends over them.
                     for (weighted[t5.len * cfg.adapter.dim ..]) |v| try testing.expectEqual(@as(f32, 0), v);
                 }
@@ -1941,9 +1850,9 @@ test "the Anima adapter and DiT match ComfyUI on a real checkpoint" {
             // Stored f32 and computed from the same f32-dequantized bf16 weights on
             // both sides, so the only difference is reduction order.
             //
-            // ⚠️ **The depth trend is the informative part**, and it is FLAT: 2.2e-6 at
+            // The depth trend is the informative part, and it is FLAT: 2.2e-6 at
             // 2 layers and 1.9e-6 at 8 (12x10), 3.3e-6 and 3.1e-6 (40x32). A
-            // disagreement that does not grow with depth is not accumulating — which
+            // disagreement that does not grow with depth is not accumulating, which
             // is what says the block is right rather than merely close. (Z-Image's
             // grows linearly, 1.6e-6 -> 3.5e-6, and that was already good enough.)
             try testing.expect(rel < 2e-5);
@@ -1972,7 +1881,7 @@ test "the Anima adapter and DiT match ComfyUI on a real checkpoint" {
 
 test "the Anima text encoder matches ComfyUI's Qwen3-0.6B tap" {
     // The encoder half, separately from the adapter: this is what pins
-    // `qwen3.Variant.anima` — all 28 layers AND `model.norm` applied, which is
+    // `qwen3.Variant.anima`, all 28 layers AND `model.norm` applied, which is
     // ComfyUI's `layer = "last"` with `final_norm = True`. Tapping one layer early,
     // or skipping the final norm, is a finite encode of the wrong state.
     const gpa = testing.allocator;
@@ -2015,7 +1924,7 @@ test "the Anima text encoder matches ComfyUI's Qwen3-0.6B tap" {
         errdefer std.debug.print("prompt {d}: t5 want {d} got {d} ids\n", .{ pi, want_t5.len, got_t5.len });
         try testing.expectEqualSlices(u32, want_t5, got_t5);
 
-        // ⚠️ The Qwen3 branch takes NO start/end token and NO padding beyond
+        // The Qwen3 branch takes NO start/end token and NO padding beyond
         // `min_length = 1`, so an empty prompt is one `<|endoftext|>`.
         const got_q = try qwenIds(gpa, &tok, prompts[pi]);
         defer gpa.free(got_q);
@@ -2032,10 +1941,10 @@ test "the Anima text encoder matches ComfyUI's Qwen3-0.6B tap" {
 }
 
 test "unsupportedGpuLin scans every block, not just the first" {
-    // ⚠️ The regression this pins is a real crash. `anima_baseV10-INT8_CONVROT-MIXED`
-    // keeps block 0 entirely bf16 and quantizes blocks 1-27, so a predicate that read
-    // `blocks[0].self_attn.q.dtype` reported "GPU ok", a device session was built, and
-    // the FIRST thing it did — `crossKv` on the host — tripped `matmul`'s
+    // The regression this pins is a real crash. A mixed checkpoint keeps block 0
+    // entirely bf16 and quantizes blocks 1-27, so a predicate reading
+    // `blocks[0].self_attn.q.dtype` reports "GPU ok", a device session is built, and
+    // the FIRST thing it does, `crossKv` on the host, trips `matmul`'s
     // `row_scale != null` assert. A synthetic model here so the test needs no
     // checkpoint: bf16 in block 0, i8 in block 1, exactly the shape that fooled it.
     const gpa = testing.allocator;
@@ -2048,7 +1957,7 @@ test "unsupportedGpuLin scans every block, not just the first" {
     const blocks = try alloc.alloc(Block, cfg.n_layers);
     // Only the fields the predicate reads (dtype, tag) need to be meaningful, but
     // `Weight.init` checks the byte count, so the shapes are 1x8 rather than the real
-    // 2048x2048 — this test is about the SCAN, not about any arithmetic.
+    // 2048x2048, this test is about the SCAN, not about any arithmetic.
     const bytes = try alloc.alloc(u8, 8 * 2);
     @memset(bytes, 0);
     for (blocks, 0..) |*b, bi| {
@@ -2072,7 +1981,7 @@ test "unsupportedGpuLin scans every block, not just the first" {
 
     const bad = unsupportedGpuLin(&model);
     try testing.expect(bad != null);
-    // ⚠️ Block ONE, not zero: the point is that it looked past the first block.
+    // Block ONE, not zero: the point is that it looked past the first block.
     try testing.expectEqual(@as(usize, 1), bad.?.block);
     try testing.expectEqual(DType.i8, bad.?.dtype);
 
@@ -2092,18 +2001,18 @@ test "unsupportedGpuLin scans every block, not just the first" {
 }
 
 test "the loader wires int8/int4 convrot scales, and refuses a weight with none" {
-    // ⚠️ Without this wiring an integer weight does not merely run slowly, it **PANICS**:
-    // `ops.matmul.matmul` asserts `row_scale != null`, and the loader used to accept the
-    // I8 tensor because `supportsDType(.i8)` is true. That is what an
-    // `-INT8_CONVROT-MIXED` Anima checkpoint hit, five frames deep inside `crossKv`.
+    // Without this wiring an integer weight does not merely run slowly, it PANICS:
+    // `ops.matmul.matmul` asserts `row_scale != null`, while the loader accepts the I8
+    // tensor because `supportsDType(.i8)` is true, so the failure lands five frames deep
+    // inside `crossKv`.
     //
     // Synthetic rather than checkpoint-backed on purpose: this pins the LOADER's
     // contract, and the only int8 Anima file to hand turned out to be corrupt (its
-    // tensor table covers 41.9 MB less than its payload — see
+    // tensor table covers 41.9 MB less than its payload, see
     // `safetensors.initFromSlice`), so a test resting on it would have been testing the
     // wrong thing.
     const gpa = testing.allocator;
-    const cols = ops.convrot.group_size; // 256 — one whole rotation group
+    const cols = ops.convrot.group_size; // 256, one whole rotation group
     const rows = 4;
 
     // `w`: i8 [4, 256]; `w_scale`: f32 [4]; `q`: i4 (u8-packed) [4, 128]; `q_scale`.
@@ -2156,7 +2065,7 @@ test "the loader wires int8/int4 convrot scales, and refuses a weight with none"
         try testing.expectApproxEqAbs(0.25 + @as(f32, @floatFromInt(r)) * 0.5, w.row_scale.?[r], 1e-6);
     }
 
-    // ⚠️ int4 is detected by the HALVED column count, not by dtype: our converter writes
+    // int4 is detected by the HALVED column count, not by dtype: our converter writes
     // the packed bytes as U8 where ComfyUI's W4A4 converter writes the identical bytes as
     // I8. `cols` stays logical (256) while only `rows x cols/2` bytes are stored.
     const q = try l.mat("q", .{}, rows, cols);
@@ -2165,7 +2074,7 @@ test "the loader wires int8/int4 convrot scales, and refuses a weight with none"
     try testing.expect(q.row_scale != null);
     try testing.expectEqual(@as(u32, ops.convrot.group_size), q.convrot);
 
-    // ⚠️ The third case — an integer weight with NO companion scale — is deliberately
+    // The third case, an integer weight with NO companion scale, is deliberately
     // not asserted here. `mat` reports it with `std.log.err` before returning
     // `MissingTensor`, which is the right behaviour in production (the whole reason this
     // branch exists is that the silent version PANICS in `matmul`), but `testing.log_level`
@@ -2175,18 +2084,17 @@ test "the loader wires int8/int4 convrot scales, and refuses a weight with none"
 }
 
 test "the loader reads a W4A8 weight as W4A8, not as the int4 it is shaped like" {
-    // ⚠️ **This is the exact regression `terraRising_20TerraRisingAnima-ASYM_W4A8_INT8`
-    // hit.** W4A8 stores `I8 [rows, cols/2]`, which is bit-for-bit the signature the int4
-    // arm above keys on — so a loader that has not heard of the format falls through to it
+    // W4A8 stores `I8 [rows, cols/2]`, which is bit-for-bit the signature the int4
+    // arm above keys on, so a loader that has not heard of the format falls through to it
     // and dies on the `_scale` W4A8 does not have (`weight_s_channel` is its spelling).
     // That is the lucky outcome; had the names matched, the nibbles would have been read as
     // signed int4 times a per-row scale, which is finite, plausible and wrong.
     //
     // Ungated and synthetic: the contract is a container convention, and a test resting on
-    // a multi-GB file silently skips on a box without it — which is how the real-checkpoint
+    // a multi-GB file silently skips on a box without it, which is how the real-checkpoint
     // Anima tests went unrun once already.
     const gpa = testing.allocator;
-    const cols = ops.convrot.group_size; // 256 — one whole rotation group
+    const cols = ops.convrot.group_size; // 256, one whole rotation group
     const rows = 4;
     const group = 16; // what every shipped W4A8 checkpoint uses
     const groups = cols / group;
@@ -2244,7 +2152,7 @@ test "the loader reads a W4A8 weight as W4A8, not as the int4 it is shaped like"
     try testing.expectEqual(cols, w.cols); // logical, not the halved storage width
     try testing.expect(w.w4a8 != null);
     try testing.expectEqual(@as(u32, group), w.w4a8.?.group_size);
-    // `s_rel` is a VIEW into the store, not a copy — the packed form is what stays
+    // `s_rel` is a VIEW into the store, not a copy, the packed form is what stays
     // resident, which is the entire reason this format is smaller than int8.
     try testing.expectEqual(@as(usize, sr_bytes), w.w4a8.?.s_rel.len);
     try testing.expectEqual(@as(usize, pk_bytes), w.bytes.len);
@@ -2265,14 +2173,14 @@ test "the loader reads a W4A8 weight as W4A8, not as the int4 it is shaped like"
 }
 
 test "the batched modulation schedule matches the per-sigma one" {
-    // ⚠️ `modulationSchedule` is a BATCHED rewrite of `modulationTable` — m = n_sigmas
-    // instead of 5270 GEMV calls at m = 1 — so it has to be pinned against the thing it
+    // `modulationSchedule` is a BATCHED rewrite of `modulationTable`, m = n_sigmas
+    // instead of 5270 GEMV calls at m = 1, so it has to be pinned against the thing it
     // replaced. The arithmetic is the same but the GEMM reduction order need not be, and
     // this table feeds the AdaLN of every block of every step.
     //
     // Built on SYNTHETIC weights and deliberately UNGATED: nothing here needs a real
     // checkpoint (the two functions must agree on any weights at all), and a gated test
-    // would silently skip on a box without the multi-GB file — which is exactly how the
+    // would silently skip on a box without the multi-GB file, which is exactly how the
     // real-checkpoint tests above went unrun once already.
     const gpa = testing.allocator;
     const io = testing.io;

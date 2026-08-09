@@ -1,11 +1,11 @@
 //! Qwen3-VL / Qwen3.5 vision tower (mmproj GGUF, projector "qwen3vl_merger").
 //! Ported from llama.cpp tools/mtmd (clip.cpp + models/qwen3vl.cpp +
-//! mtmd-image.cpp) — CPU forward, f32 compute over the bf16/f32 mmproj.
+//! mtmd-image.cpp), CPU forward, f32 compute over the bf16/f32 mmproj.
 //!
 //! Pipeline: smart-resize (multiples of patch*merge=32, aspect-preserving
 //! fit + center pad, align-corners bilinear on u8) -> normalize
 //! ((p/255 - mean)/std) -> patch embed (two 16x16 convs over the same image,
-//! summed — temporal_patch_size 2 for a still — as an im2col GEMM) with
+//! summed, temporal_patch_size 2 for a still, as an im2col GEMM) with
 //! tokens produced directly in the 2x2-merged block order -> interpolated
 //! 48x48 learned position embedding (bilinear+antialias, align_corners
 //! false) -> 27 pre-LN blocks (fused qkv+bias, 16 heads x 72, 2-D vision
@@ -151,7 +151,7 @@ pub const Vit = struct {
 
         const merged_dim = cfg.dim * cfg.merge * cfg.merge;
         // All arena allocations must happen BEFORE `.arena = arena` copies
-        // the arena state into the result — later allocations would extend a
+        // the arena state into the result, later allocations would extend a
         // buffer list the snapshot doesn't know about and leak at deinit.
         const patch_b = try loader.vector(alloc, store, "v.patch_embd.bias", cfg.dim);
         const pos_embd = try loader.vector(alloc, store, "v.position_embd.weight", cfg.pos_grid * cfg.pos_grid * cfg.dim);

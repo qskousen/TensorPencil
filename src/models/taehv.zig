@@ -1,4 +1,4 @@
-//! TAEHV (Tiny AutoEncoder for Hunyuan/WanVideo) decoder — the "approx VAE"
+//! TAEHV (Tiny AutoEncoder for Hunyuan/WanVideo) decoder, the "approx VAE"
 //! ComfyUI uses for fast previews. This is the WAN 2.1 variant (taew2_1),
 //! wired here as a CPU prototype to validate fidelity before a GPU port.
 //!
@@ -6,7 +6,7 @@
 //! first-frame path: MemBlock "past" is zeros, and each temporal-upscale TGrow
 //! (a 1x1 conv that would split channels into 2 frames) keeps the first frame
 //! (its first half of channels). All convs are 2D. Input is the raw sampler
-//! latent (no scaling for taew2_1); output is [0,1] → RGB8. Architecture read
+//! latent (no scaling for taew2_1); output is [0,1] -> RGB8. Architecture read
 //! from ComfyUI comfy/taesd/taehv.py + the taew2_1 checkpoint keys.
 const std = @import("std");
 const safetensors = @import("tp_core").safetensors;
@@ -21,7 +21,7 @@ pub const spatial_scale = 8;
 pub const MemBlock = struct {
     // conv0 is (2n -> n) in the model, taking cat[x, past]. Since past is
     // always zero for a still image, the past-half weights vanish, so we keep
-    // only the first-half input channels → a plain (n -> n) conv.
+    // only the first-half input channels -> a plain (n -> n) conv.
     conv0: Conv2d, // (n -> n) 3x3
     conv2: Conv2d, // (n -> n) 3x3
     conv4: Conv2d, // (n -> n) 3x3
@@ -168,7 +168,7 @@ fn firstHalfInput(a: std.mem.Allocator, cv: Conv2d) !Conv2d {
 /// Keep only the first `n` output channels of a conv (w is [co][k][k][ci]
 /// row-major, so the first n rows are the leading n*k*k*ci floats). Used for
 /// the TGrow 1x1 conv whose second half of output channels is the dropped
-/// second frame. Slices w and b to keep the Weight (bytes == co*ci) invariant.
+/// second frame. Slices w and b so the Weight still satisfies bytes == co*ci.
 fn firstNOutput(cv: Conv2d, n: usize) Conv2d {
     std.debug.assert(n <= cv.co);
     const per_out = cv.k * cv.k * cv.ci;
@@ -180,7 +180,7 @@ fn loadSub(a: std.mem.Allocator, st: @import("tp_core").weights.WeightStore, bas
     return wan_vae.loadConv(a, st, name, ci, co, k);
 }
 
-test "firstNOutput keeps the Weight length invariant for the TGrow slice" {
+test "firstNOutput keeps the Weight length rule for the TGrow slice" {
     const ops = @import("tp_ops");
     const Weight = ops.matmul.Weight;
     // A 1x1 conv with 2n output channels (stride-2 tgrow), ci = n = 3.
@@ -193,7 +193,7 @@ test "firstNOutput keeps the Weight length invariant for the TGrow slice" {
     try std.testing.expectEqual(@as(usize, n), sliced.co);
     try std.testing.expectEqual(@as(usize, n * n), sliced.w.len);
     try std.testing.expectEqual(@as(usize, n), sliced.b.len);
-    // The sliced weight must satisfy the matmul Weight invariant (bytes ==
-    // storageBytes(co*ci)); constructing it used to assert-crash previews.
+    // The sliced weight must satisfy the matmul Weight length rule
+    // (bytes == storageBytes(co*ci)); violating it asserts inside the preview decode.
     _ = Weight.fromF32(sliced.w, sliced.co, sliced.ci);
 }

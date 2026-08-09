@@ -1,7 +1,7 @@
 //! GPU-resident SD-family VAE decode on the CUDA backends (AutoencoderKL).
 //!
-//! The CUDA analogue of `sd_vae_gpu`. ⚠️ The mid-block attention runs `be.attn` —
-//! an f32 online softmax that materializes no scores plane — rather than the
+//! The CUDA analogue of `sd_vae_gpu`. The mid-block attention runs `be.attn`,
+//! an f32 online softmax that materializes no scores plane, rather than the
 //! tensor-core `opAttnTC`, because that path stores scores in f16 and the
 //! Flux/Z-Image VAE's logits overflow it by 152x. See `attn` for the measurement.
 //!
@@ -71,7 +71,7 @@ const NormBufs = struct {
 };
 
 /// Decode a latent (channel-last `[lat_h*lat_w][4]`, already divided by
-/// `scaling_factor`) to channel-last `[8·lat_h * 8·lat_w][3]`. Caller frees.
+/// `scaling_factor`) to channel-last `[8*lat_h * 8*lat_w][3]`. Caller frees.
 pub fn decode(
     dec: *const sd_vae.Decoder,
     be: *Backend,
@@ -95,17 +95,17 @@ pub fn decode(
     var w = lat_w;
     var ch = cfg.innermost();
 
-    // ⚠️ Sizing mirrors the loader's own width bookkeeping: the first resnet of a
+    // Sizing mirrors the loader's own width bookkeeping: the first resnet of a
     // level reads the PREVIOUS level's (wider) input at the NEW (doubled)
     // resolution, so sizing off `block_out_channels` alone under-allocates by 2x.
     // See the same note in `sd_vae_gpu`, where it cost a wrong decode.
     var max_elems: usize = 0;
-    // ⚠️ TWO widths, not one. `u` only ever receives a convolution's OUTPUT, so it
-    // peaks one level narrower than `x`/`t` — see `sd_vae.activationElems`.
+    // TWO widths, not one. `u` only ever receives a convolution's OUTPUT, so it
+    // peaks one level narrower than `x`/`t`, see `sd_vae.activationElems`.
     const widths = sd_vae.activationElems(cfg, lat_h, lat_w);
     max_elems = @intCast(widths.wide);
 
-    // ⚠️ `act_f16` halves the two widest buffers, which is where a whole-image
+    // `act_f16` halves the two widest buffers, which is where a whole-image
     // decode's gigabytes are: at 1056x1584 each holds 256 channels at FULL image
     // resolution (428M elements). The latent coming IN and the RGB going OUT are
     // f32 either way, so they get their own small staging buffer rather than
@@ -114,9 +114,9 @@ pub fn decode(
     try be.ensureDeviceBuffer(&bufs.x, max_elems * asz);
     try be.ensureDeviceBuffer(&bufs.t, max_elems * asz);
     try be.ensureDeviceBuffer(&bufs.stage, @max(z.len, lat_h * lat_w * 64 * 3) * 4);
-    // ⚠️ The upload target depends on whether the checkpoint HAS a
+    // The upload target depends on whether the checkpoint HAS a
     // `post_quant_conv`: the Flux-lineage 16-channel VAE does not, so the latent is
-    // staged straight into `t` — which is where `conv_in` reads from — instead of
+    // staged straight into `t`, which is where `conv_in` reads from, instead of
     // going through a convolution that does not exist. Allocated before the upload
     // so `ensureDeviceBuffer` cannot move the buffer out from under it.
     try be.tensorUpload(bufs.stage, std.mem.sliceAsBytes(z));
@@ -130,7 +130,7 @@ pub fn decode(
     try be.beginBatch();
     errdefer if (be.batching()) be.abortBatch();
 
-    // ⚠️ The Flux-lineage 16-channel VAE has NO `post_quant_conv` (BFL dropped it),
+    // The Flux-lineage 16-channel VAE has NO `post_quant_conv` (BFL dropped it),
     // so `conv_in` reads the staged latent directly; with one it runs first.
     const a16 = cfg.act_f16;
     if (dec.post_quant) |pq| {
@@ -167,7 +167,7 @@ pub fn decode(
     }
 
     try groupNorm(be, &bufs, &norms, &bufs.t, &bufs.x, h * w, ch, dec.norm_out, cfg, true);
-    // The head writes RGB back into the f32 staging buffer — the host wants f32.
+    // The head writes RGB back into the f32 staging buffer, the host wants f32.
     try conv(be, &bufs, &bufs.stage, &bufs.t, h, w, dec.conv_out, .stride1, a16, false);
 
     try be.endBatch();
@@ -205,38 +205,38 @@ fn resnet(be: *Backend, bufs: *Bufs, norms: *NormBufs, h: usize, w: usize, r: sd
 pub var force_naive_attn: bool = false;
 
 /// Mid-block attention: one head over all `ch` channels (512), so `opAttnTC`
-/// takes it directly — and selects its own query-tiled path when the scores plane
+/// takes it directly, and selects its own query-tiled path when the scores plane
 /// exceeds the scratch budget, which at a 1024-square render it does.
 fn attn(be: *Backend, bufs: *Bufs, norms: *NormBufs, h: usize, w: usize, ab: sd_vae.AttnBlock, cfg: Config) !void {
     const n = h * w;
     const ch = ab.channels;
     const a16 = cfg.act_f16;
     try groupNorm(be, bufs, norms, &bufs.t, &bufs.x, n, ch, ab.norm, cfg, false);
-    // ⚠️ q/k/v/out stay **f32**: they are at latent resolution (tens of MB, not
+    // q/k/v/out stay f32: they are at latent resolution (tens of MB, not
     // where the memory goes) and both attention paths take f32 buffers.
     try conv(be, bufs, &bufs.aq, &bufs.t, h, w, ab.q, .stride1, a16, false);
     try conv(be, bufs, &bufs.ak, &bufs.t, h, w, ab.k, .stride1, a16, false);
     try conv(be, bufs, &bufs.av, &bufs.t, h, w, ab.v, .stride1, a16, false);
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(ch)));
-    // ⚠️ **`opAttnTC` on BOTH arms as of the f32 scores band.** The rejection below
-    // was real and is kept because it explains the shape of the constraint:
-    // tensor-core path materializes the scores plane in **f16**, and the
-    // Flux/Z-Image VAE's attention *logits* reach **9.95e6** on a 12x10 latent where
-    // SD1.5's reach **8.3** — 152x past f16's 65504 ceiling, and even without
+    // `opAttnTC` on BOTH arms, given the f32 scores band. The constraint it has to
+    // respect: a tensor-core path that materializes the scores plane in f16 cannot
+    // serve this VAE, because the
+    // Flux/Z-Image VAE's attention *logits* reach 9.95e6 on a 12x10 latent where
+    // SD1.5's reach 8.3, 152x past f16's 65504 ceiling, and even without
     // overflow f16's quantum up there is ~8000, which destroys a softmax whose
     // differences are O(1). It rendered solid white with no error. Everything
     // upstream is finite and in fact *smaller* than SD's, so only the logits show it.
     //
-    // `be.attn` keeps an **online softmax in f32** and materializes no scores plane
+    // `be.attn` keeps an online softmax in f32 and materializes no scores plane
     // at all, so it cannot overflow and needs no O(seq²) buffer.
     if (force_naive_attn) {
         try be.attn(bufs.aq, bufs.ak, bufs.av, bufs.ao, n, n, 1, 1, ch, scale, false);
     } else {
         try be.opAttnTC(bufs.aq, bufs.ak, bufs.av, bufs.ao, n, 1, 1, ch, scale);
     }
-    // ⚠️ The projection lands in `t`, not back in `aq`: the residual add is against
+    // The projection lands in `t`, not back in `aq`: the residual add is against
     // `x`, which is f16 under `act_f16`, and `t` is the activation-format scratch.
-    // (`t` is free here — the three projections consumed it.)
+    // (`t` is free here, the three projections consumed it.)
     try conv(be, bufs, &bufs.t, &bufs.ao, h, w, ab.proj, .stride1, false, a16);
     try addAct(be, bufs.x, bufs.t, n * ch, a16);
 }
@@ -278,29 +278,29 @@ fn conv(
 /// Divisor applied to the activation of a convolution that reads the RESIDUAL
 /// STREAM, before it is cast to f16 (`Backend.opConvF16Scaled` undoes it exactly).
 ///
-/// ⚠️ Not defensive — measured. An SDXL VAE decoder's residual reaches **4.2e5**
+/// Not defensive, measured. An SDXL VAE decoder's residual reaches 4.2e5
 /// (probed at a 64² latent: the last upsample conv's f32 output is 1.26e5 and the
 /// next block's 1x1 shortcut reads it), against f16's ceiling of 65504. Without
 /// this, that cast produced `inf`, the following GroupNorm turned it into NaN via
-/// its mean, and **every SDXL render at 512² or larger came out solid white with no
-/// error** on `cuda`, `zig-cuda` and `vulkan` alike. SD1.5's VAE peaks near 7e3, two
+/// its mean, and every SDXL render at 512² or larger came out solid white with no
+/// error on `cuda`, `zig-cuda` and `vulkan` alike. SD1.5's VAE peaks near 7e3, two
 /// orders lower, which is why this was invisible for the family the code was
-/// written against — and it is the same reason ComfyUI decodes the SDXL VAE in fp32
+/// written against, and it is the same reason ComfyUI decodes the SDXL VAE in fp32
 /// (or ships the "fp16-fix" weights) by default.
 ///
-/// 256 is a power of two (so the scaling is exact — it only shifts the exponent and
+/// 256 is a power of two (so the scaling is exact, it only shifts the exponent and
 /// f16 keeps all 11 mantissa bits) and leaves 38x headroom over the measured peak.
-/// Its cost is that true values below 256·6e-8 = 1.5e-5 underflow to zero, which
-/// against a residual whose peak is ~1e5 is 1e-10 relative — hence a modest divisor
+/// Its cost is that true values below 256*6e-8 = 1.5e-5 underflow to zero, which
+/// against a residual whose peak is ~1e5 is 1e-10 relative, hence a modest divisor
 /// rather than a blanket huge one.
 ///
-/// ⚠️ Only the residual-reading convolutions need it, and that is a measured claim
+/// Only the residual-reading convolutions need it, and that is a measured claim
 /// too: every OTHER convolution here reads a GroupNorm output (peak 67 measured, and
-/// bounded by |gamma|·O(1)+|beta| by construction) or the latent itself, so scaling
+/// bounded by |gamma|*O(1)+|beta| by construction) or the latent itself, so scaling
 /// them would only cost precision at the bottom of the range.
 const residual_act_div: f32 = 256.0;
 
-/// `conv` for a convolution whose input is the residual stream — the 1x1 shortcut
+/// `conv` for a convolution whose input is the residual stream, the 1x1 shortcut
 /// and the level upsamples. See `residual_act_div`.
 fn convResidual(
     be: *Backend,
@@ -313,7 +313,7 @@ fn convResidual(
     mode: sd_unet_cuda.SampleMode,
     act16: bool,
 ) !void {
-    // ⚠️ Under f16 storage the divisor is 1.0, and that is not a shortcut: `act_div`
+    // Under f16 storage the divisor is 1.0, and that is not a shortcut: `act_div`
     // exists to bring a value too big for f16 *through* the cast, and an f16 buffer
     // could never have held that value. The two answer the same question and
     // `Config.act_f16` is off exactly where the divisor is load-bearing (SDXL).

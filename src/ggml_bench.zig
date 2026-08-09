@@ -112,7 +112,7 @@ fn prefillSweep(gpa: std.mem.Allocator, io: std.Io) !void {
         const w = tp.ops.matmul.Weight.init(q, k.dt, rows, cols);
         const y = try gpa.alloc(f32, M * rows);
 
-        // ours (public matmul → threaded f32 packed path for m>=16)
+        // ours (public matmul -> threaded f32 packed path for m>=16)
         const OC = struct { io: std.Io, gpa: std.mem.Allocator, y: []f32, xm: []f32, w: tp.ops.matmul.Weight };
         const oc = OC{ .io = io, .gpa = gpa, .y = y, .xm = xm, .w = w };
         const t_o = best(3, oc, struct {
@@ -129,7 +129,7 @@ fn prefillSweep(gpa: std.mem.Allocator, io: std.Io) !void {
 }
 
 /// Time ggml's real ggml_mul_mat (tiled kernel + ggml threadpool): out[rows,M] =
-/// W[cols,rows] · X[cols,M]. Weight `q` is row-major packed `gtype`.
+/// W[cols,rows] * X[cols,M]. Weight `q` is row-major packed `gtype`.
 fn ggmlMulMat(gtype: c.enum_ggml_type, q: []const u8, xm: []const f32, rows: usize, cols: usize, M: usize, nth: c_int) u64 {
     const mem: usize = q.len + M * cols * 4 + M * rows * 4 + (32 << 20);
     const ctx = c.ggml_init(.{ .mem_size = mem, .mem_buffer = null, .no_alloc = false });

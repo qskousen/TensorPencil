@@ -4,15 +4,15 @@
 //! fonts), and its built-in font is Latin-only, so LLM output with CJK /
 //! arrows / math / box-drawing shows tofu boxes. We bundle:
 //!
-//! - NotoSansCJK Regular + Bold (pan-CJK + Latin + symbols) — body text.
-//! - NotoSansMonoCJK JP Regular (pan-CJK monospace) — code, `font_mono`.
-//! - NotoSans Italic + BoldItalic (Latin/Greek/Cyrillic only — CJK has no
-//!   italic tradition and Noto ships none) — italic runs fall back to the
+//! - NotoSansCJK Regular + Bold (pan-CJK + Latin + symbols), body text.
+//! - NotoSansMonoCJK JP Regular (pan-CJK monospace), code, `font_mono`.
+//! - NotoSans Italic + BoldItalic (Latin/Greek/Cyrillic only, CJK has no
+//!   italic tradition and Noto ships none), italic runs fall back to the
 //!   upright CJK face outside LGC coverage.
-//! - NotoEmoji (monochrome outlines — dvui's rasterizer is monochrome, so
-//!   color emoji fonts can't be used) — rendered per-run for emoji.
+//! - NotoEmoji (monochrome outlines, dvui's rasterizer is monochrome, so
+//!   color emoji fonts can't be used), rendered per-run for emoji.
 //!
-//! `addStyled` is the single place that maps (codepoint, style) → font: it
+//! `addStyled` is the single place that maps (codepoint, style) -> font: it
 //! splits text into same-font runs so every glyph lands on a face that has
 //! it. Use it (or `addRich`/`richLabel`) for ANY user/LLM-visible text.
 const std = @import("std");
@@ -20,7 +20,7 @@ const dvui = @import("dvui");
 
 pub const family = "NotoSansCJK";
 pub const mono_family = "NotoSansMonoCJK";
-/// Latin/Greek/Cyrillic family — only italic faces are bundled (used solely
+/// Latin/Greek/Cyrillic family, only italic faces are bundled (used solely
 /// for italic runs; upright text stays on the CJK family).
 pub const lgc_family = "NotoSans";
 pub const emoji_family = "NotoEmoji";
@@ -35,7 +35,7 @@ const emoji_bytes = @embedFile("fonts/NotoEmoji.ttf");
 /// Weight/style-tagged font sources, registered via `Theme.embedded_fonts`
 /// (plain `dvui.addFont` can only register normal weight/style). Note dvui
 /// dedups sources by bytes pointer, so the same bytes can't alias a second
-/// weight — code runs therefore never ask for bold (see `fontFor`).
+/// weight, code runs therefore never ask for bold (see `fontFor`).
 const sources = [_]dvui.Font.Source{
     .{ .family = dvui.Font.array(family), .bytes = regular_bytes },
     .{ .family = dvui.Font.array(family), .weight = .bold, .bytes = bold_bytes },
@@ -73,22 +73,22 @@ pub fn emojiFont() dvui.Font {
 }
 
 /// Codepoints routed to the monochrome emoji font. Kept to clearly-emoji
-/// blocks — arrows / CJK / punctuation stay in NotoSansCJK, which covers them.
+/// blocks, arrows / CJK / punctuation stay in NotoSansCJK, which covers them.
 fn isEmoji(cp: u21) bool {
     return switch (cp) {
         0x1F000...0x1FAFF => true, // emoji + pictographs (incl. flags, skin tones)
-        0x23E9...0x23FA => true, // media controls (⏸ ⏯ ⏹ ⏺ …) — NotoSansCJK lacks these
-        0x2600...0x27BF => true, // misc symbols + dingbats (⚙ ⚠ …)
+        0x23E9...0x23FA => true, // media controls (⏸ ⏯ ⏹ ⏺ ...), NotoSansCJK lacks these
+        0x2600...0x27BF => true, // misc symbols + dingbats (⚙ ⚠ ...)
         0x2B00...0x2BFF => true, // misc symbols & arrows (emoji-presentation)
-        0xFE00...0xFE0F => true, // variation selectors — keep with the emoji run
-        0x200D => true, // ZWJ — keep emoji sequences together
+        0xFE00...0xFE0F => true, // variation selectors, keep with the emoji run
+        0x200D => true, // ZWJ, keep emoji sequences together
         else => false,
     };
 }
 
 /// Codepoints the bundled NotoSans italic faces cover (Latin/Greek/Cyrillic
 /// and shared punctuation). Italic runs outside this render upright in the
-/// CJK face — matching how CJK text is conventionally emphasized elsewhere.
+/// CJK face, matching how CJK text is conventionally emphasized elsewhere.
 fn isLgc(cp: u21) bool {
     return switch (cp) {
         0x00...0x2FF => true, // ASCII + Latin-1 + Latin Extended-A/B + IPA + modifiers
@@ -97,9 +97,9 @@ fn isLgc(cp: u21) bool {
         0x400...0x52F => true, // Cyrillic + supplement
         0x1E00...0x1EFF => true, // Latin Extended Additional
         0x1F00...0x1FFF => true, // Greek Extended
-        0x2000...0x206F => true, // general punctuation (quotes, dashes, …)
+        0x2000...0x206F => true, // general punctuation (quotes, dashes, ...)
         0x20A0...0x20CF => true, // currency symbols
-        0x2100...0x214F => true, // letterlike (™ Ω …)
+        0x2100...0x214F => true, // letterlike (™ Ω ...)
         else => false,
     };
 }
@@ -121,7 +121,7 @@ fn fontFor(cp: u21, style: Style, base: dvui.Font) dvui.Font {
 /// Add `text` to a text layout, split into same-font runs: emoji go to the
 /// emoji face, code to the mono face, italic to the LGC italic face where
 /// covered, everything else to the CJK face (bold-aware). `opts` is applied
-/// to every run (colors, background for inline code, …); `opts.font` (or the
+/// to every run (colors, background for inline code, ...); `opts.font` (or the
 /// theme body font) sets the base size.
 pub fn addStyled(tl: *dvui.TextLayoutWidget, text: []const u8, style: Style, opts: dvui.Options) void {
     const base = opts.font orelse dvui.themeGet().font_body;
@@ -155,7 +155,7 @@ pub fn addStyled(tl: *dvui.TextLayoutWidget, text: []const u8, style: Style, opt
     }
 }
 
-/// Plain-styled `addStyled` — drop-in for the common "just show this string
+/// Plain-styled `addStyled`, drop-in for the common "just show this string
 /// with emoji/symbol coverage" case.
 pub fn addRich(tl: *dvui.TextLayoutWidget, text: []const u8) void {
     addStyled(tl, text, .{}, .{});

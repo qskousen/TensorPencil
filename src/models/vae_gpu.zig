@@ -2,8 +2,8 @@
 //!
 //! Mirrors `wan_vae.Decoder.decode` with the heavy work on the device:
 //! 3x3 convs run as banded im2col (kernels/eltwise.zig `im2col`, which also
-//! fuses the nearest-exact 2x upsample by halving source coordinates — the
-//! upsampled tensor is never materialized) followed by a GEMM — tensor
+//! fuses the nearest-exact 2x upsample by halving source coordinates, the
+//! upsampled tensor is never materialized) followed by a GEMM, tensor
 //! cores via `opMatmulCoopF16W` for co >= 96, the f32 register-tile GEMM
 //! (`opMatmul`, bias included) below that; 1x1 convs are direct GEMMs with
 //! the same routing; the per-position
@@ -12,7 +12,7 @@
 //! download + one attn-out upload); everything else stays device-resident
 //! from the latent upload to the RGB download.
 //!
-//! Weights are read straight from a loaded `wan_vae.Decoder` — the packed
+//! Weights are read straight from a loaded `wan_vae.Decoder`, the packed
 //! [co][kh][kw][ci] layout is exactly the [rows][cols] the GEMM's weight
 //! cache expects, so buffers upload/transpose lazily on first use and stay
 //! cached for the run.
@@ -84,8 +84,8 @@ pub fn decode(dec: *const wan_vae.Decoder, ctx: *Context, io: std.Io, gpa: std.m
     try res(ctx, &bufs, h, w, dec.mid_res1);
     try attn(ctx, &bufs, io, gpa, h, w, dec.mid_attn);
 
-    // The attention scratch — above all the ~seq^2 scores plane (bufs.s,
-    // ~1.7 GB at 1120x1680) — is dead for the rest of the decode, but it sits
+    // The attention scratch, above all the ~seq^2 scores plane (bufs.s,
+    // ~1.7 GB at 1120x1680), is dead for the rest of the decode, but it sits
     // at the START (mid-block runs at latent resolution) and would otherwise
     // stay resident through the whole 8x upsampling, doubling peak VRAM. Free
     // it now. endBatch does a submitAndWait, so no recorded dispatch still
@@ -146,7 +146,7 @@ fn norm(ctx: *Context, src: *const DeviceBuffer, dst: *DeviceBuffer, n: usize, g
 /// Conv into `dst` ([n_out][co]); with `up`, the source is read through a
 /// fused nearest-exact 2x upsample and n_out covers the doubled dims.
 /// Convs with co >= 96 run on tensor cores (f16 weights/activations, f32
-/// accumulate — opMatmulCoopF16W); smaller ones (post_quant's 16, the
+/// accumulate, opMatmulCoopF16W); smaller ones (post_quant's 16, the
 /// 3-channel head) stay on the f32 GEMM, where padding co to the 128-wide
 /// coop tile would waste more than the tensor cores return.
 fn conv(ctx: *Context, bufs: *Bufs, src: *const DeviceBuffer, dst: *DeviceBuffer, h: usize, w: usize, cv: wan_vae.Conv2d, up: bool) !void {
@@ -194,7 +194,7 @@ fn conv(ctx: *Context, bufs: *Bufs, src: *const DeviceBuffer, dst: *DeviceBuffer
 
 /// Residual block over bufs.x in place (result swapped back into bufs.x).
 /// conv2 reuses `u` (conv1's output is dead once norm2 has read it), so the
-/// full-resolution `v` allocation is avoided — `v` then only grows to the
+/// full-resolution `v` allocation is avoided, `v` then only grows to the
 /// latent-resolution mid-attention size. One fewer full-res buffer (~720 MiB@1MP).
 fn res(ctx: *Context, bufs: *Bufs, h: usize, w: usize, rb: wan_vae.ResBlock) !void {
     const n = h * w;
@@ -261,12 +261,12 @@ fn attn(ctx: *Context, bufs: *Bufs, io: std.Io, gpa: std.mem.Allocator, h: usize
         .f0 = 1.0,
     }, seq_pad * c / 2, 1, 1);
 
-    // The scores plane S is [seq_pad][seq_pad] f16 — O(seq²), tens of GB at
+    // The scores plane S is [seq_pad][seq_pad] f16, O(seq²), tens of GB at
     // high resolution. When it fits `flash_cap`, decode it whole; otherwise
     // query-tile it (flash attention): S for a band of query rows at a time in
     // a bounded [QB][seq_pad] buffer, streaming the P@V output back into the
     // full attention buffer. Both paths use the SAME scores / two-pass softmax
-    // / P@V kernels — a band is just a smaller query grid.
+    // / P@V kernels, a band is just a smaller query grid.
     const flash_cap: usize = 1 << 30; // 1 GiB scores plane before query-tiling
     if (seq_pad * seq_pad * 2 <= flash_cap) {
         try ctx.ensureDeviceBuffer(&bufs.s, seq_pad * seq_pad * 2);
@@ -315,7 +315,7 @@ fn attn(ctx: *Context, bufs: *Bufs, io: std.Io, gpa: std.mem.Allocator, h: usize
     try ctx.opElt(.add, bufs.x, bufs.v, null, null, .{ .u0 = @intCast(n * c) }, n * c, 1, 1);
 }
 
-/// S[grid_rows][seq_pad] f16 = scale·(Q @ Kᵀ). `qsrc` holds `grid_rows` query
+/// S[grid_rows][seq_pad] f16 = scale*(Q @ Kᵀ). `qsrc` holds `grid_rows` query
 /// rows ([grid_rows][c] f16, scale prefolded); `kh` is the full k-major K.
 fn attnScores(ctx: *Context, s: DeviceBuffer, qsrc: DeviceBuffer, kh: DeviceBuffer, seq_pad: usize, c: usize, grid_rows: usize) !void {
     try ctx.opAttnScoresVae(s, qsrc, kh, .{
@@ -329,7 +329,7 @@ fn attnScores(ctx: *Context, s: DeviceBuffer, qsrc: DeviceBuffer, kh: DeviceBuff
 }
 
 /// Two-pass softmax over the `n` valid key columns for `soft_rows` query rows of
-/// S ([soft_rows][seq_pad]) → per-row {max, 1/denom} in `md`. `soft_rows` must be
+/// S ([soft_rows][seq_pad]) -> per-row {max, 1/denom} in `md`. `soft_rows` must be
 /// <= n (the softmax kernel folds the row index and the valid-column count into
 /// one push field, so they must not diverge).
 fn attnSoftmax(ctx: *Context, s: DeviceBuffer, pt: DeviceBuffer, md: DeviceBuffer, soft_rows: usize, n: usize, seq_pad: usize, nchunks: usize) !void {

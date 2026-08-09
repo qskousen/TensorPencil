@@ -1,6 +1,6 @@
 //! Standalone SPIR-V module for block-diagonal BATCHED attention. It lives in
 //! its own module (not `eltwise.zig`) because the Zig 0.16 SPIR-V backend
-//! segfaults once `eltwise` — already ~80 entry points — gains one more; a fresh
+//! segfaults once `eltwise`, already ~80 entry points, gains one more; a fresh
 //! small module compiles fine and also lets this kernel use a 5th storage buffer
 //! (the per-item bounds table) that the shared 4-buffer eltwise layout can't.
 //!

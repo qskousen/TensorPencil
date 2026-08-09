@@ -7,13 +7,13 @@
 //! them (the diffusion CLI and tp-llm have a single model and need no arbiter,
 //! but the primitives are shared).
 //!
-//! Design constraint that shapes everything: **a CUDA context is bound
-//! per-thread** — each model's device residency may only be mutated on the
+//! Design constraint that shapes everything: a CUDA context is bound
+//! per-thread, each model's device residency may only be mutated on the
 //! worker thread that bound its context. So the arbiter never touches the GPU
 //! directly. It computes a desired residency budget per model and publishes it
 //! to that model's `ControlPoint`; the model's own worker observes the intent
 //! at a safe boundary (between LLM tokens / diffusion steps) and applies it on
-//! its own thread. That eliminates cross-thread device races by construction —
+//! its own thread. That eliminates cross-thread device races by construction,
 //! the failure mode of the ad-hoc `imageVramEnter`/`settleLlm` hooks this
 //! replaces.
 
@@ -21,41 +21,32 @@ const std = @import("std");
 
 /// How much of the card this process may commit, and why.
 ///
-/// ## The rule
+/// The rule:
 ///
 ///   requested = total - limit          what the user asked to keep free
 ///   reserve   = max(requested, foreign)  what actually stays out of our hands
 ///   ours      = total - reserve          cap on our WHOLE footprint
 ///   tracked   = ours - untracked         cap on what our allocators count
 ///
-/// ## Why `reserve` is a max and not a subtraction
+/// `reserve` is a max, not a subtraction. The alternative, `budget = limit - system`
+/// with `system` the residual `device_used - our_tracked`, enforces `card_used <= limit`
+/// but puts an unreliable measurement alone on the right-hand side: any under-reading of
+/// `system` inflates the budget directly, we promote layers to fill it, and the first big
+/// allocation OOMs. It IS under-read, because the policy resolves right after a load,
+/// before our own CUDA context, JIT'd modules and library workspaces exist. Taking the
+/// larger of what the user asked for and what other processes hold means an
+/// under-measured `foreign` cannot inflate anything; it falls back to the user's figure.
 ///
-/// This used to be `budget = limit - system`, where `system` was the residual
-/// `device_used - our_tracked`. That is self-consistent (it enforces
-/// `card_used <= limit`) but it puts an unreliable measurement alone on the
-/// right-hand side: any under-reading of `system` inflates the budget directly,
-/// we promote layers to fill it, and the first big allocation then OOMs. And it
-/// IS under-read — the policy resolves right after a load, when our own CUDA
-/// context, JIT'd modules and library workspaces do not exist yet.
+/// Consequence: once `foreign` exceeds the requested reserve the limit handle stops
+/// binding, and every setting collapses to `total - foreign`. That is intended, since
+/// other processes are already keeping more than N bytes out of our reach.
 ///
-/// Framing the user's handle as a RESERVE removes that failure mode: the reserve
-/// is the larger of what the user asked for and what other processes hold, so an
-/// under-measured `foreign` cannot inflate anything — it just falls back to the
-/// user's own figure. The unreliable term stops being load-bearing.
-///
-/// Consequence worth knowing: once `foreign` exceeds the requested reserve, the
-/// limit handle no longer binds (every setting collapses to `total - foreign`).
-/// That is intended — the user asked to keep N bytes free, and other processes
-/// are already keeping more than N out of our reach.
-///
-/// ## Why the cap is on our WHOLE footprint
-///
-/// Physical usage is `tracked + our untracked + foreign`. Capping only `tracked`
-/// leaves the untracked part — measured at ~1.1 GiB on a 3090 with one LLM
-/// resident — with nowhere to live, so the card overcommits by exactly that much
-/// and the next batched allocation fails. `untracked` is therefore subtracted
-/// explicitly, and the caller passes a HIGH-WATER value so a cold reading of ~0
-/// cannot re-inflate the budget mid-session.
+/// The cap is on our WHOLE footprint because physical usage is
+/// `tracked + our untracked + foreign`. Capping only `tracked` leaves the untracked part
+/// (~1.1 GiB on a 3090 with one LLM resident) with nowhere to live, so the card
+/// overcommits by exactly that much and the next batched allocation fails. The caller
+/// passes a HIGH-WATER `untracked` so a cold reading of ~0 cannot re-inflate the budget
+/// mid-session.
 pub const Reserve = struct {
     /// Card bytes that must stay out of our hands.
     bytes: u64,
@@ -65,12 +56,12 @@ pub const Reserve = struct {
     foreign: u64,
     /// Cap on our whole footprint (tracked + untracked).
     ours: u64,
-    /// Cap on what our allocators count — what the arbiter budgets.
+    /// Cap on what our allocators count, what the arbiter budgets.
     tracked: u64,
     /// Our untracked overhead, as folded into the cap.
     untracked: u64,
 
-    /// "card 24101 · want 361 free, others hold 2064 -> reserve 2064 · ours <= 22037
+    /// "card 24101 * want 361 free, others hold 2064 -> reserve 2064 * ours <= 22037
     ///  (untracked 1104) -> tracked <= 20933 MiB"
     pub fn render(self: Reserve, buf: []u8) []const u8 {
         var w = std.Io.Writer.fixed(buf);
@@ -90,14 +81,14 @@ pub const Limit = union(enum) {
     none,
     /// Whole-card ceiling in bytes.
     card_bytes: u64,
-    /// Whole-card ceiling as a fraction of the card — the GUI meter's handle.
+    /// Whole-card ceiling as a fraction of the card, the GUI meter's handle.
     fraction: f32,
     /// A cap on OUR OWN tracked residency rather than on total card usage. This
     /// is what `tp-llm --vram-budget <GiB>` has always meant ("cap device memory
     /// for the split planner"), and it is kept as a distinct variant rather than
     /// converted so the CLI flag's documented meaning does not silently change.
     /// The physical reserve still applies on top: a cap larger than the card can
-    /// safely hold is clamped down, which the CLI previously had no way to do.
+    /// safely hold is clamped down.
     ours_bytes: u64,
 
     /// The whole-card ceiling this limit implies (the card itself when the limit
@@ -112,7 +103,7 @@ pub const Limit = union(enum) {
 };
 
 /// One coherent measurement of the card. Every field MUST come from the same
-/// sampling pass — mixing a stale total with live component reads is what made
+/// sampling pass, mixing a stale total with live component reads is what made
 /// the old status-bar residual bounce at frame rate.
 pub const Card = struct {
     total: u64,
@@ -161,8 +152,8 @@ pub fn resolve(limit: Limit, card: Card, untracked_floor: u64) Reserve {
 /// same shape, so the two can be printed side by side and differenced.
 ///
 /// Itemized rather than a single number on purpose. Every residency bug in this
-/// subsystem has been ONE TERM SILENTLY MISSING from a scalar estimate — the LM
-/// head, the embeddings, the RoPE tables, the dequant staging — and a scalar
+/// subsystem has been ONE TERM SILENTLY MISSING from a scalar estimate, the LM
+/// head, the embeddings, the RoPE tables, the dequant staging, and a scalar
 /// offers nothing to check against reality, so each was found only by noticing
 /// layers stranded on the host. With line items, a wrong estimate is visible the
 /// first time a model loads (see `logResidency`).
@@ -174,7 +165,7 @@ pub const Bytes = struct {
     /// Everything sized from the batch or context rather than the parameter
     /// count: activations, logits, RoPE tables, dequant staging.
     scratch: u64 = 0,
-    /// Ours but unattributed — what the process holds on the card that our
+    /// Ours but unattributed, what the process holds on the card that our
     /// allocators never counted: the CUDA context and JIT'd modules, cuBLASLt /
     /// cuDNN workspaces, UI textures. Only ever MEASURED (it has no predictable
     /// size), and only when the driver exposes per-process data.
@@ -246,10 +237,10 @@ pub fn logResidency(who: []const u8, need_b: Bytes, have: Bytes) void {
 /// boundaries and acts on its own thread. Nothing here touches the device.
 ///
 /// Two intents:
-///   - `budget` — the desired device-residency ceiling (bytes) the worker
+///   - `budget`, the desired device-residency ceiling (bytes) the worker
 ///     should settle toward. Persistent + last-write-wins (it is also the
 ///     ongoing growth ceiling, not a one-shot), `unconstrained` = no limit.
-///   - `pause` — reserved for the upcoming pause feature (park the worker at
+///   - `pause`, reserved for the upcoming pause feature (park the worker at
 ///     its next safe boundary). Published + observable now; not yet consumed by
 ///     any worker, so it is inert until the pause handshake lands. Wiring it in
 ///     from day one keeps that a fill-in rather than a re-architecture.
@@ -282,7 +273,7 @@ pub const ControlPoint = struct {
     /// The pending residency ceiling (bytes), or null when unconstrained. The
     /// worker calls this at a safe boundary and settles its device residency
     /// toward the returned target. Persistent (a peek, not a take): the target
-    /// stays in effect — settle ops are idempotent, so re-observing a satisfied
+    /// stays in effect, settle ops are idempotent, so re-observing a satisfied
     /// target is a cheap no-op.
     pub fn budgetTarget(self: *const ControlPoint) ?u64 {
         const b = self.budget.load(.acquire);
@@ -298,7 +289,7 @@ pub const ControlPoint = struct {
 /// A model the arbiter can drive, behind a stable vtable so LLM and diffusion
 /// look identical to the arbiter. Read methods (`usage`/`demand`/`floor`/`busy`)
 /// may be called from any thread; `applyBudget` mutates device residency and so
-/// is only invoked on a thread that may bind this model's context — the idle path
+/// is only invoked on a thread that may bind this model's context, the idle path
 /// (arbiter thread) or the model's own worker (via `pollAndApply`).
 pub const Participant = struct {
     ctx: *anyopaque,
@@ -318,7 +309,7 @@ pub const Participant = struct {
         /// old policy computed each model's target from the OTHER model's
         /// *usage*, which made the pair algebraically cancel: the LLM was
         /// settled to `limit − diff_usage`, so diffusion was then offered
-        /// `limit − llm_usage == diff_usage` — its own residency back, i.e. a
+        /// `limit − llm_usage == diff_usage`, its own residency back, i.e. a
         /// guaranteed no-op, every time. See `Arbiter.plan`.
         demand: *const fn (ctx: *anyopaque) u64,
         /// Bytes that cannot be evicted (LLM: committed KV; diffusion: its whole
@@ -356,8 +347,8 @@ pub const Participant = struct {
     ///
     /// A `target` of 0 is IGNORED (nothing published or applied): 0 means the
     /// arbiter has no real budget (uninitialized, or a fully-collapsed
-    /// measurement), and clamping it up to the floor would manufacture a real —
-    /// and typically unreachable — ceiling out of garbage, evicting the whole
+    /// measurement), and clamping it up to the floor would manufacture a real,
+    /// and typically unreachable, ceiling out of garbage, evicting the whole
     /// model (the qwen3-32B first-message mass-offload bug). A coordinator that
     /// wants a model to yield everything it can targets a small nonzero budget;
     /// the floor clamp keeps that safe.
@@ -385,7 +376,7 @@ pub const Side = enum { llm, diffusion };
 
 /// A coherent residency target for BOTH models, computed in one pass.
 pub const Plan = struct {
-    /// Residency CEILING published to the LLM — how much it MAY hold.
+    /// Residency CEILING published to the LLM, how much it MAY hold.
     llm: u64,
     diffusion: u64,
     /// What the LLM actually NEEDS, as opposed to what it is allowed. These differ
@@ -402,11 +393,11 @@ pub const Plan = struct {
     pub const Arm = enum {
         /// Both fit; nobody gets a growth-blocking ceiling.
         uncontended,
-        /// Over budget with BOTH models working — the split handle decides.
+        /// Over budget with BOTH models working, the split handle decides.
         split,
-        /// Over budget, only diffusion working — the idle LLM yields the deficit.
+        /// Over budget, only diffusion working, the idle LLM yields the deficit.
         diffusion_only,
-        /// Over budget, diffusion idle — its cache yields to the LLM.
+        /// Over budget, diffusion idle, its cache yields to the LLM.
         llm_only,
     };
 };
@@ -420,7 +411,7 @@ pub const Plan = struct {
 ///
 /// Both models are full `Participant`s: `plan` computes their targets TOGETHER
 /// and `rebalance` enacts them shrink-before-grow. This is the fix for the
-/// structural defect behind the "diffusion never yields to the LLM" report —
+/// structural defect behind the "diffusion never yields to the LLM" report,
 /// the previous version drove only the LLM (to `limit − diffusion's current
 /// usage`, i.e. treating an idle image model's opportunistic cache as a hard
 /// reservation) and left the reverse direction to a separate, later call in the
@@ -435,7 +426,7 @@ pub const Arbiter = struct {
     /// The LLM's guaranteed floor under contention (the meter's `split` handle).
     llm_share: u64 = 0,
     /// Diffusion has queued/running work that wants VRAM (queue non-empty).
-    /// Genuinely external state — the queue is not derivable from residency —
+    /// Genuinely external state, the queue is not derivable from residency,
     /// unlike the old `diff_used` mirror of `diffusion.usage()`, which was
     /// hand-updated from three call sites and went stale between them.
     diff_active: bool = false,
@@ -444,20 +435,20 @@ pub const Arbiter = struct {
     /// floor) plus the meter's ceiling/split. Pure: reads participants, mutates
     /// nothing. Returns null when there is no real ceiling to plan against
     /// (`limit == 0`: `setBudgets` never ran, or the VRAM query behind it
-    /// failed) — driving residency from that would publish garbage, which is how
+    /// failed), driving residency from that would publish garbage, which is how
     /// the qwen3-32B first-message mass-offload happened.
     ///
     /// Policy, in priority order:
     ///
-    ///  1. **No contention** (both demands fit under the ceiling) — everyone
+    ///  1. No contention (both demands fit under the ceiling), everyone
     ///     stays fully resident. Covers the single-model case too: an absent
     ///     participant contributes 0 demand and 0 floor.
-    ///  2. **Diffusion active** (something queued or generating) — diffusion
+    ///  2. Diffusion active (something queued or generating), diffusion
     ///     gets the room, except that the meter's split handle guarantees the
     ///     LLM `llm_share` no matter what. The LLM yields even mid-generation:
     ///     the target is published to its control point and applied at its next
     ///     token boundary.
-    ///  3. **Diffusion idle** — its residency is *opportunistic cache* (the next
+    ///  3. Diffusion idle, its residency is *opportunistic cache* (the next
     ///     image re-uploads what it needs), so the LLM has priority and
     ///     diffusion yields exactly the deficit: `limit − llm_demand`, never
     ///     below its own floor, never above what it wants. This is the direction
@@ -472,7 +463,7 @@ pub const Arbiter = struct {
         const l_flr = if (self.llm) |p| p.floor() else 0;
         const d_flr = if (self.diffusion) |p| p.floor() else 0;
         // An ACTIVE queue is entitled to the complement of the LLM's guaranteed
-        // share whether or not we can size the image model yet — this is the whole
+        // share whether or not we can size the image model yet, this is the whole
         // meaning of the split handle. Floored rather than measured because at the
         // queue-start edge the pipeline is not loaded (`usage` is 0) and the
         // estimate behind `demand` reads checkpoint file sizes, which can fail; a
@@ -501,17 +492,17 @@ pub const Arbiter = struct {
 
         const l_busy = if (self.llm) |p| p.busy() else false;
 
-        // ONE rule, four cases. The invariant every arm keeps: the two ceilings
+        // ONE rule, four cases. What every arm keeps true: the two ceilings
         // SUM TO AT MOST `limit`, so the cap holds even with both models running.
         //
         // "Active" means WORKING RIGHT NOW, not merely loaded. Between messages a
         // chat session is fair game: the image model may take what it needs and the
         // LLM gives it up, because promote/migrate is fast and in practice only the
-        // deficit moves. That is a deliberate product call — the split is a
+        // deficit moves. That is a deliberate product call, the split is a
         // contention rule, not a standing reservation, so an idle model never holds
         // VRAM that a working one could use.
         var out: Plan = if (l_dem + d_dem <= self.limit) blk: {
-            // (1) Uncontended — both fit. Neither gets a growth-blocking ceiling:
+            // (1) Uncontended, both fit. Neither gets a growth-blocking ceiling:
             // the LLM may use everything diffusion does not need.
             //
             // Emphatically NOT `l_dem`. `Participant.demand` is `max(demand,
@@ -519,7 +510,7 @@ pub const Arbiter = struct {
             // model already holds, and the first byte of KV growth then trips
             // `settleTo`'s `deviceUsed() > target` and offloads a layer. Measured
             // on a 12B with nothing else resident: budget 21395 MiB, target 8224,
-            // usage 8227 — one layer pushed to the host with 13.3 GiB free.
+            // usage 8227, one layer pushed to the host with 13.3 GiB free.
             //
             // The slack goes to the LLM rather than being split: it is the side
             // that grows continuously (KV) and the side where yielding costs an
@@ -528,13 +519,13 @@ pub const Arbiter = struct {
             // not NEED, so an image model can still load into it.
             break :blk .{ .llm = self.limit -| d_dem, .diffusion = d_dem, .llm_need = l_dem, .arm = .uncontended };
         } else if (self.diff_active and l_busy) blk: {
-            // (2) BOTH working and over budget — the only case the split decides.
+            // (2) BOTH working and over budget, the only case the split decides.
             const l = clamp(self.llm_share, l_flr, l_dem);
             break :blk .{ .llm = l, .diffusion = clamp(self.limit -| l, d_flr, d_dem), .llm_need = l, .arm = .split };
         } else if (self.diff_active) blk: {
             // (3) Only diffusion is working. It takes what it NEEDS (the `d_want`
             // clamp) rather than everything it is allowed, so the idle LLM yields
-            // just the deficit instead of being evicted wholesale — that is what
+            // just the deficit instead of being evicted wholesale, that is what
             // keeps the bouncing small. `l_flr` (committed KV) is never taken.
             const d = clamp(self.limit -| l_flr, d_flr, d_want);
             break :blk .{ .llm = @max(self.limit -| d, l_flr), .diffusion = d, .llm_need = @min(l_dem, self.limit -| d), .arm = .diffusion_only };
@@ -550,8 +541,8 @@ pub const Arbiter = struct {
         // transient buffers a forward pass allocates, so a ceiling pinned at demand
         // guarantees the next spike OOMs. `llm_need` above still reports the real
         // need, which is what diffusion's allowance is computed against.
-        // "Hold nothing" is a legitimate target for DIFFUSION — its residency is
-        // pure cache — but 0 is also the sentinel the enactment paths read as "no
+        // "Hold nothing" is a legitimate target for DIFFUSION, its residency is
+        // pure cache, but 0 is also the sentinel the enactment paths read as "no
         // target, do nothing". Ask for 1 byte instead; the incremental evict then
         // frees `usage − 1`, i.e. everything.
         //
@@ -559,7 +550,7 @@ pub const Arbiter = struct {
         // nothing to give it (the ceiling dragged below what a mid-image diffusion
         // holds, or the split handle at zero with no committed KV yet to floor it),
         // and turning that into a real 1-byte ceiling would offload every layer to
-        // the host chasing it — the qwen3-32B mass-offload bug. `settle` rejects a
+        // the host chasing it, the qwen3-32B mass-offload bug. `settle` rejects a
         // zero target, so the LLM simply keeps what it has and recovers through the
         // reactive `requestRoom` path instead.
         out.diffusion = @max(out.diffusion, 1);
@@ -571,7 +562,7 @@ pub const Arbiter = struct {
     ///
     /// The two targets come from ONE plan, but they must be ENACTED in order:
     /// the model that grows would otherwise allocate into room the other has not
-    /// released yet — i.e. into a full card. Shrink first, grow second. Ordering
+    /// released yet, i.e. into a full card. Shrink first, grow second. Ordering
     /// on "is this target below what the model currently holds" gets that right
     /// in every combination and is stable when neither side shrinks.
     pub fn rebalance(self: *Arbiter) void {
@@ -632,14 +623,14 @@ pub const Arbiter = struct {
     /// ladder cannot reach diffusion's weights, and LLM weights are all pinned
     /// so that ladder has nothing of its own to drop either. A resident-but-idle
     /// image model was therefore an immovable reservation the LLM could only
-    /// work around by offloading its own layers to the CPU — or, when the
+    /// work around by offloading its own layers to the CPU, or, when the
     /// allocation wasn't a layer it could migrate, by failing the turn outright
     /// with DeviceOutOfMemory.
     ///
     /// Only an IDLE peer is touched: the apply binds the peer's device context,
     /// which its own worker would otherwise be using. Callable from either
     /// model's worker thread, so it deliberately does NOT publish a new ceiling
-    /// to the peer's control point — `rebalance` stays the single owner of the
+    /// to the peer's control point, `rebalance` stays the single owner of the
     /// steady-state targets, and this is purely "free something now".
     pub fn requestRoom(self: *Arbiter, side: Side, bytes: u64) u64 {
         if (bytes == 0) return 0;
@@ -664,9 +655,9 @@ pub const Arbiter = struct {
 
     /// The resident-weight budget the next image may pin: the room the plan
     /// leaves once the LLM is at its planned target, so it agrees with what
-    /// `rebalance` is driving the LLM toward (the two used to be separate
-    /// formulas that disagreed, one reading the LLM's live usage and the other
-    /// its share). Deliberately the *allowance* rather than `plan.diffusion` —
+    /// `rebalance` is driving the LLM toward. One formula, not two: reading the LLM's
+    /// live usage in one place and its planned share in another makes them disagree.
+    /// Deliberately the *allowance* rather than `plan.diffusion`,
     /// diffusion's own `demand` is an estimate from file sizes, and an estimate
     /// that undershoots the real resident size would pin part of the image model
     /// and stream the rest. Floored so a tiny allowance still streams rather than
@@ -860,14 +851,14 @@ test "Arbiter: diffusion active drives the LLM down to its share; idle frees it"
     var m: MockModel = .{ .used = 20 << 30, .want = 22 << 30, .floor_b = 2 << 30 };
     var arb: Arbiter = .{ .llm = m.participant(), .limit = 22 << 30, .llm_share = 6 << 30 };
 
-    // Diffusion starts → LLM yields to its share immediately.
+    // Diffusion starts -> LLM yields to its share immediately.
     arb.setDiffusionActive(true);
     try std.testing.expectEqual(@as(?u64, 6 << 30), m.applied);
     // Diffusion may plan for limit − share even though the LLM only just started
     // coming down (the VAE reclaim ladder covers the transient).
     try std.testing.expectEqual(@as(u64, 16 << 30), arb.diffusionBudget());
 
-    // Diffusion drains → LLM may reclaim up to the whole limit.
+    // Diffusion drains -> LLM may reclaim up to the whole limit.
     arb.setDiffusionActive(false);
     try std.testing.expectEqual(@as(?u64, 22 << 30), m.applied);
 }
@@ -876,7 +867,7 @@ test "Arbiter: an IDLE resident image model yields to the LLM (TODO #1)" {
     // The reported bug. Diffusion holds 8 GiB of a 22 GiB budget and is idle; the
     // LLM wants 18 GiB. Old behaviour: the LLM was settled to limit − 8 = 14 GiB
     // (offloading layers to the CPU) and diffusion was then offered
-    // limit − 14 = 8 GiB — exactly what it already held, so it never freed a byte.
+    // limit − 14 = 8 GiB, exactly what it already held, so it never freed a byte.
     var llm: MockModel = .{ .used = 14 << 30, .want = 18 << 30, .floor_b = 2 << 30, .name = "llm" };
     var diff: MockModel = .{ .used = 8 << 30, .want = 8 << 30, .floor_b = 0, .name = "diff" };
     var log: std.ArrayList(MockModel.Entry) = .empty;
@@ -893,9 +884,9 @@ test "Arbiter: an IDLE resident image model yields to the LLM (TODO #1)" {
     };
     arb.rebalance();
 
-    // Diffusion yields exactly the deficit (22 − 18 = 4 GiB kept) …
+    // Diffusion yields exactly the deficit (22 − 18 = 4 GiB kept) ...
     try std.testing.expectEqual(@as(?u64, 4 << 30), diff.applied);
-    // … and the LLM gets its full demand rather than being capped at 14 GiB.
+    // ... and the LLM gets its full demand rather than being capped at 14 GiB.
     try std.testing.expectEqual(@as(?u64, 18 << 30), llm.applied);
     // SHRINK BEFORE GROW: diffusion must free before the LLM allocates into it,
     // or the LLM grows into a card the other model still occupies.
@@ -942,7 +933,7 @@ test "Arbiter: mid-image diffusion is never shrunk (its floor is its working set
     try std.testing.expectEqual(@as(?u64, 13 << 30), llm.applied);
 
     // Once the LLM is working too, both want the card and the split decides. A
-    // BUSY participant is not applied directly — the target is published and its
+    // BUSY participant is not applied directly, the target is published and its
     // worker enacts it at the next token boundary (see the busy-yield test).
     llm.is_busy = true;
     arb.rebalance();
@@ -953,7 +944,7 @@ test "Arbiter: mid-image diffusion is never shrunk (its floor is its working set
 test "Arbiter.plan: an IDLE llm yields the deficit to a working diffuser" {
     // Deliberate policy: the split is a contention rule, not a standing
     // reservation. Between messages the image model may take what it needs and the
-    // LLM gives it up — promote/migrate is fast and only the deficit moves.
+    // LLM gives it up, promote/migrate is fast and only the deficit moves.
     var llm: MockModel = .{ .used = 18 << 30, .want = 18 << 30, .floor_b = 2 << 30 }; // not busy
     var diff: MockModel = .{ .used = 0, .want = 9 << 30 };
     var arb: Arbiter = .{
@@ -1008,7 +999,7 @@ test "Arbiter.plan: ceilings never sum past the limit" {
         for ([_]u64{ 4 << 30, 18 << 30, 30 << 30 }) |want| {
             llm.want = want;
             const p = arb.plan().?;
-            // `plan` floors diffusion at 1 BYTE — the "hold nothing" sentinel, so
+            // `plan` floors diffusion at 1 BYTE, the "hold nothing" sentinel, so
             // the enactment path can tell it apart from "no target". That is a
             // marker, not an allocation, so it does not count against the cap.
             const d: u64 = if (p.diffusion <= 1) 0 else p.diffusion;
@@ -1020,8 +1011,8 @@ test "Arbiter.plan: ceilings never sum past the limit" {
 test "Arbiter.plan: the split handle bounds diffusion when both models are active" {
     // TODO #2 "split is not respected": under real contention the meter's split
     // handle is what divides the card. The LLM is guaranteed `llm_share` and
-    // diffusion gets the rest — not "whatever the LLM happens to hold".
-    // BOTH must be working for the split to apply — an idle LLM instead yields the
+    // diffusion gets the rest, not "whatever the LLM happens to hold".
+    // BOTH must be working for the split to apply, an idle LLM instead yields the
     // deficit to a working diffuser (see the arm-3 test below).
     var llm: MockModel = .{ .used = 20 << 30, .want = 20 << 30, .floor_b = 2 << 30, .is_busy = true };
     var diff: MockModel = .{ .used = 0, .want = 12 << 30 };
@@ -1066,7 +1057,7 @@ test "Arbiter.plan: an unsatisfiable LLM target stays 0 rather than becoming 1" 
     // Regression guard on the new 1-byte floor. Diffusion is mid-image holding
     // MORE than the (just-lowered) ceiling, so the plan has nothing to give the
     // LLM. Flooring that to 1 byte would publish a real ceiling of 1 byte and the
-    // LLM would migrate every layer to the host chasing it — the qwen3-32B
+    // LLM would migrate every layer to the host chasing it, the qwen3-32B
     // mass-offload bug. It must come out 0, which `settle` then declines.
     std.testing.log_level = .err; // the declined settle logs on purpose
     var llm: MockModel = .{ .used = 4 << 30, .want = 4 << 30, .floor_b = 0 };
@@ -1079,8 +1070,8 @@ test "Arbiter.plan: an unsatisfiable LLM target stays 0 rather than becoming 1" 
     };
     const p = arb.plan().?;
     try std.testing.expectEqual(@as(u64, 0), p.llm);
-    // Diffusion, by contrast, is floored to 1 — "hold nothing" is legitimate for a
-    // pure cache — though its own busy floor keeps it where it is here.
+    // Diffusion, by contrast, is floored to 1, "hold nothing" is legitimate for a
+    // pure cache, though its own busy floor keeps it where it is here.
     try std.testing.expectEqual(@as(u64, 10 << 30), p.diffusion);
 
     // And the LLM is left alone rather than stripped.
@@ -1107,7 +1098,7 @@ test "Arbiter.plan: an idle image model can be asked to hold nothing" {
     // weight buffers, so it lands at 0; the mock tracks the target exactly).
     try std.testing.expect(diff.used <= 1);
     // The LLM gets the whole ceiling (its 30 GiB demand exceeds it, so the ceiling
-    // is what binds — not diffusion's former 4 GiB).
+    // is what binds, not diffusion's former 4 GiB).
     try std.testing.expectEqual(@as(?u64, 22 << 30), llm.applied);
 }
 
@@ -1125,7 +1116,7 @@ test "Arbiter.requestRoom: the LLM can reclaim from an idle image model" {
     };
     try std.testing.expectEqual(@as(u64, 3 << 30), arb.requestRoom(.llm, 3 << 30));
     try std.testing.expectEqual(@as(u64, 5 << 30), diff.used);
-    // It frees NOW without publishing a new ceiling — `rebalance` stays the sole
+    // It frees NOW without publishing a new ceiling, `rebalance` stays the sole
     // owner of the steady-state target.
     try std.testing.expectEqual(@as(?u64, null), diff.cp.budgetTarget());
 
@@ -1156,10 +1147,10 @@ test "Arbiter.requestRoom: a busy peer is never touched, and a missing peer is 0
 }
 
 test "Participant.settle: a zero target is ignored, not clamped up to the floor" {
-    // Regression: the qwen3-32B first-message mass-offload. A zero raw target
-    // (uninitialized arbiter) used to be clamped UP to the committed-KV floor
-    // (384 MiB mid-prefill) and published as a real ceiling — below the model's
-    // un-evictable minimum, so the worker evicted every layer chasing it.
+    // Regression: a first-message mass-offload. Clamping a zero raw target (an
+    // uninitialized arbiter) UP to the committed-KV floor publishes it as a real
+    // ceiling below the model's un-evictable minimum, so the worker evicts every
+    // layer chasing it.
     std.testing.log_level = .err; // the skip logs on purpose; keep a passing run silent
     var m: MockModel = .{ .used = 20 << 30, .floor_b = 384 << 20 };
     m.participant().settle(0);
@@ -1168,11 +1159,10 @@ test "Participant.settle: a zero target is ignored, not clamped up to the floor"
 }
 
 test "Arbiter: uninitialized budgets (limit 0) never drive the LLM" {
-    // Regression companion: with `setBudgets` never called (meter policy
-    // early-returned on a failed VRAM query), the per-frame diffusion
-    // queue-drained edge used to rebalance with limit 0 and publish the
-    // floor-clamped garbage that `settle` now also rejects. The arbiter must
-    // leave residency alone until it has real budgets.
+    // Regression companion: with `setBudgets` never called (the meter policy
+    // early-returns on a failed VRAM query), the per-frame diffusion queue-drained
+    // edge rebalances with limit 0 and publishes floor-clamped garbage. The arbiter
+    // must leave residency alone until it has real budgets.
     std.testing.log_level = .err; // the skipped rebalances warn on purpose
     var m: MockModel = .{ .used = 20 << 30, .want = 21 << 30, .floor_b = 384 << 20 };
     var arb: Arbiter = .{ .llm = m.participant() }; // limit/llm_share left 0
@@ -1186,7 +1176,7 @@ test "Arbiter: uninitialized budgets (limit 0) never drive the LLM" {
     arb.setDiffusionActive(false);
     arb.setBudgets(22 << 30, 6 << 30);
     // Uncontended, so the ceiling is the whole limit (nothing else claims any of
-    // it) rather than the LLM's demand — a ceiling equal to demand is a ceiling
+    // it) rather than the LLM's demand, a ceiling equal to demand is a ceiling
     // equal to current usage, which blocks KV growth and offloads layers into
     // free VRAM. `plan` arm (1).
     try std.testing.expectEqual(@as(?u64, 22 << 30), m.applied);
@@ -1196,17 +1186,17 @@ test "Arbiter: a busy LLM still yields (via its control point, not a direct appl
     var m: MockModel = .{ .used = 20 << 30, .want = 20 << 30, .floor_b = 2 << 30, .is_busy = true };
     var arb: Arbiter = .{ .llm = m.participant(), .limit = 22 << 30, .llm_share = 6 << 30 };
     arb.setDiffusionActive(true);
-    // The core bug fix: busy no longer means "decline". Nothing applied directly…
+    // Busy does not mean "decline". Nothing applied directly...
     try std.testing.expectEqual(@as(?u64, null), m.applied);
-    // …but the target is published, so the LLM worker yields at its next token.
+    // ...but the target is published, so the LLM worker yields at its next token.
     try std.testing.expectEqual(@as(?u64, 6 << 30), m.cp.budgetTarget());
 }
 
 test "Arbiter.diffusionBudget: uninitialized budgets mean auto (0), not the 256 MiB floor" {
     // Regression: pure image-studio mode (no LLM session) never runs the meter
-    // policy, so `limit` stays 0. diffusionBudget used to return
-    // max(256 MiB, 0) — a hard 256 MiB pin budget that pinned a sliver of the
-    // image model and evicted the rest. 0 is the pipeline's AUTO sentinel.
+    // policy, so `limit` stays 0. Returning max(256 MiB, 0) there is a hard 256 MiB
+    // pin budget that pins a sliver of the image model and evicts the rest. 0 is the
+    // pipeline's AUTO sentinel.
     std.testing.log_level = .err; // the auto fallback logs on purpose
     var arb: Arbiter = .{};
     try std.testing.expectEqual(@as(u64, 0), arb.diffusionBudget());

@@ -1,53 +1,37 @@
-//! AUTOMATIC1111 prompt syntax — emphasis and per-step scheduling.
+//! AUTOMATIC1111 prompt syntax: emphasis and per-step scheduling.
 //!
-//! A port of `modules/prompt_parser.py`, pinned against that file *executed* (see
-//! `tools/gen_a1111_prompt_fixtures.py`, which downloads and runs it rather than
-//! re-deriving it). This is the second prompt dialect here; `clip_tokenizer.encodeWeighted`
-//! is ComfyUI's. They are NOT variations on a theme — four things differ, and each one
-//! changes the image:
+//! A port of `modules/prompt_parser.py`, pinned against that file EXECUTED (see
+//! tools/gen_a1111_prompt_fixtures.py, which downloads and runs it rather than
+//! re-deriving it). This is the second prompt dialect here; `clip_tokenizer` has
+//! ComfyUI's. They are not variations on a theme, and each difference changes the image:
 //!
-//! | | ComfyUI | A1111 (this file) |
-//! |---|---|---|
-//! | `(x:w)` | **replaces** the weight | **MULTIPLIES** the enclosed range |
-//! | `[x]` | literal text | **1/1.1 de-emphasis** |
-//! | `BREAK` | the literal word `break` | **forces a chunk boundary** |
-//! | 75-token boundary | hard cut | **backtracks to the last comma** |
+//!     (x:w)              ComfyUI replaces the weight; A1111 MULTIPLIES the range
+//!     [x]                ComfyUI literal text;        A1111 1/1.1 de-emphasis
+//!     BREAK              ComfyUI the literal word;    A1111 forces a chunk boundary
+//!     75-token boundary  ComfyUI hard cut;            A1111 backtracks to last comma
 //!
-//! ⚠️ The first row is the one that surprises: because `:w` multiplies, `(((house:1.3))`
-//! is `1.3 × 1.1 × 1.1 = 1.573`, not 1.3. The two unclosed parens still apply — A1111
-//! flushes open brackets at end of input rather than discarding them.
+//! The first row surprises: because `:w` multiplies, `(((house:1.3))` is
+//! `1.3 * 1.1 * 1.1 = 1.573`, not 1.3, and the two unclosed parens still apply because
+//! A1111 flushes open brackets at end of input rather than discarding them. The
+//! weighting is applied differently downstream too (`clip_text.applyWeightsA1111`):
+//! A1111 multiplies the hidden states and restores the chunk's mean, where ComfyUI
+//! interpolates away from the empty prompt's states per position.
 //!
-//! The weighting is also applied differently downstream (`clip_text.applyWeightsA1111`):
-//! A1111 multiplies the hidden states and then restores the chunk's *mean*, where
-//! ComfyUI interpolates away from the empty prompt's states per position.
+//! Two passes, in this order:
 //!
-//! ## Two passes, in this order
-//!
-//! ```
-//! text --schedule(steps)--> per-step flattened texts --parseAttention--> (text, weight) parts
-//! ```
+//!     text --schedule(steps)--> per-step texts --parseAttention--> (text, weight) parts
 //!
 //! Scheduling runs FIRST and its output still contains emphasis brackets, exactly as
-//! upstream does it (`get_learned_conditioning_prompt_schedules` then
-//! `parse_prompt_attention`). Getting the order backwards would resolve `[a|b]` after
-//! the brackets had already been consumed as de-emphasis.
+//! upstream does it. The other order resolves `[a|b]` after the brackets have already
+//! been consumed as de-emphasis.
 //!
-//! ## What is and is not equivalent to upstream
-//!
-//! Upstream parses the scheduling syntax with **Lark's Earley parser** over an ambiguous
-//! grammar; this is recursive descent. Those cannot be equivalent for arbitrary input, so
-//! the claim is measured rather than assumed: **283 schedule cases agree exactly** — 43
-//! hand-picked (every upstream doctest, the `|`/`:` placement rules, the stray-bracket
-//! and unbalanced cases) plus a **240-case seeded random corpus** over the alphabet that
-//! stresses the grammar (`( ) [ ] : | { } \( \|`, `BREAK`, bare `.5`), at 4/10/20 steps.
-//! Both halves live in `fixtures_a1111.json`.
-//!
-//! The equivalence rests on reproducing upstream's *failure* behaviour, not just its
-//! successes: on any parse error it discards scheduling and renders the prompt verbatim,
-//! and `unschedulable` recognizes exactly the two constraints that make real prompts fail
-//! (see its doc comment). One upstream doctest — `a [{b|d{:.5] c` — documents a reading
-//! its own code no longer produces and **fails upstream at this revision**; the fixture
-//! records the code's behaviour, not the docstring's.
+//! Upstream parses the scheduling syntax with Lark's Earley parser over an ambiguous
+//! grammar; this is recursive descent, so equivalence is MEASURED rather than assumed:
+//! 283 schedule cases agree exactly, 43 hand-picked plus a 240-case seeded random corpus
+//! over the stressing alphabet, at 4/10/20 steps. It rests on reproducing upstream's
+//! FAILURE behaviour as well, since on any parse error it discards scheduling and
+//! renders verbatim; `unschedulable` recognizes the two constraints that make real
+//! prompts fail.
 
 const std = @import("std");
 
@@ -73,8 +57,8 @@ const square_mul: f64 = 1.0 / 1.1;
 /// Parse A1111 emphasis into flat weighted parts. `arena` owns the returned text.
 ///
 /// The algorithm is upstream's and its shape matters: weights are applied
-/// **retroactively** by multiplying every part emitted since the opening bracket, so an
-/// unbalanced `(` still weights everything after it (`"(unbalanced"` → 1.1), and
+/// retroactively by multiplying every part emitted since the opening bracket, so an
+/// unbalanced `(` still weights everything after it (`"(unbalanced"` -> 1.1), and
 /// brackets left open at end of input are flushed rather than dropped.
 pub fn parseAttention(arena: std.mem.Allocator, text: []const u8) ![]Part {
     var res: std.ArrayList(Part) = .empty;
@@ -94,7 +78,7 @@ pub fn parseAttention(arena: std.mem.Allocator, text: []const u8) ![]Part {
     var it: TokenIter = .{ .text = text };
     while (it.next()) |tk| {
         if (tk.kind == .escaped) {
-            // `\(` → `(`. The token includes the backslash; upstream appends `text[1:]`,
+            // `\(` -> `(`. The token includes the backslash; upstream appends `text[1:]`,
             // so a lone trailing backslash appends an empty part (kept, not skipped).
             try res.append(arena, .{ .text = tk.slice[1..], .weight = 1.0 });
             try w64.append(arena, 1.0);
@@ -103,14 +87,14 @@ pub fn parseAttention(arena: std.mem.Allocator, text: []const u8) ![]Part {
         } else if (tk.kind == .open_square) {
             try square.append(arena, res.items.len);
         } else if (tk.kind == .weight and round.items.len > 0) {
-            // ⚠️ MULTIPLIES the range — this is the ComfyUI difference.
+            // MULTIPLIES the range, this is the ComfyUI difference.
             multiplyRange(&w64, round.pop().?, tk.weight);
         } else if (tk.kind == .close_round and round.items.len > 0) {
             multiplyRange(&w64, round.pop().?, round_mul);
         } else if (tk.kind == .close_square and square.items.len > 0) {
             multiplyRange(&w64, square.pop().?, square_mul);
         } else {
-            // Plain text — and also a `)`/`]`/`:w)` with no matching opener, which
+            // Plain text, and also a `)`/`]`/`:w)` with no matching opener, which
             // upstream falls through to here and keeps as literal text.
             var parts = breakSplit(tk.slice);
             var first = true;
@@ -151,7 +135,7 @@ pub fn parseAttention(arena: std.mem.Allocator, text: []const u8) ![]Part {
     return res.toOwnedSlice(arena);
 }
 
-/// The tokens of upstream's `re_attention`, in its alternation order — which is also
+/// The tokens of upstream's `re_attention`, in its alternation order, which is also
 /// the matching priority, since Python's `re` takes the first alternative that matches
 /// at a position.
 const Token = struct {
@@ -189,7 +173,7 @@ const TokenIter = struct {
             self.pos += 1;
             return .{ .kind = .open_square, .slice = s[0..1] };
         }
-        // 9: `:\s*([+-]?[.\d]+)\s*\)` — tried BEFORE the bare `:` and before `)`, and
+        // 9: `:\s*([+-]?[.\d]+)\s*\)`, tried BEFORE the bare `:` and before `)`, and
         // it is the only alternative with a capture group.
         if (s[0] == ':') {
             if (matchWeight(s)) |m| {
@@ -225,8 +209,8 @@ const TokenIter = struct {
 
     const WeightMatch = struct { len: usize, value: f64 };
 
-    /// `:\s*([+-]?[.\d]+)\s*\)`. ⚠️ The character class is `[.\d]`, so the numeric run
-    /// may contain several dots (`1.2.3`) — the regex matches it and `float()` then
+    /// `:\s*([+-]?[.\d]+)\s*\)`. The character class is `[.\d]`, so the numeric run
+    /// may contain several dots (`1.2.3`), the regex matches it and `float()` then
     /// raises... except upstream never guards it, so a malformed number is a Python
     /// exception rather than a fallback. In practice the class only ever sees a real
     /// number; an unparseable run here declines the match and the `:` becomes plain
@@ -251,7 +235,7 @@ const TokenIter = struct {
     }
 };
 
-/// `re.split(/\s*\bBREAK\b\s*/, text)` — the pieces between `BREAK` occurrences, with
+/// `re.split(/\s*\bBREAK\b\s*/, text)`, the pieces between `BREAK` occurrences, with
 /// the surrounding whitespace consumed. The `\b` matters: `BREAKfast` is not a break.
 const BreakSplit = struct {
     text: []const u8,
@@ -299,18 +283,18 @@ pub const Entry = struct { until: usize, text: []const u8 };
 /// `get_learned_conditioning_prompt_schedules` does. Always returns at least one entry,
 /// whose `until` is `steps`.
 ///
-/// ⚠️ **This runs BEFORE `parseAttention`, and its output still contains emphasis
-/// brackets** — upstream's order. Resolving emphasis first would consume the `[` that
+/// This runs BEFORE `parseAttention`, and its output still contains emphasis
+/// brackets, upstream's order. Resolving emphasis first would consume the `[` that
 /// `[a|b]` needs.
 ///
-/// ⚠️ **`when` is a fraction of `steps` only when the literal contains a `.`**, and an
+/// `when` is a fraction of `steps` only when the literal contains a `.`, and an
 /// integer is an absolute step: `[b:3]` is step 3 but `[b:.5]` is half way. So `[b:1]`
-/// and `[b:1.0]` are different schedules — 1 vs `steps`. That is upstream's rule (its
+/// and `[b:1.0]` are different schedules, 1 vs `steps`. That is upstream's rule (its
 /// non-hires branch) and it is not derivable from anything.
 ///
-/// ⚠️ **An `[a|b]` makes EVERY step its own entry** (upstream's `collect_steps` extends
+/// An `[a|b]` makes EVERY step its own entry (upstream's `collect_steps` extends
 /// the set with `range(1, steps+1)`), so a 35-step render with one alternation yields 35
-/// entries — of which only 2 are distinct texts. Deduplicate downstream by text, or a
+/// entries, of which only 2 are distinct texts. Deduplicate downstream by text, or a
 /// render builds 35 conditionings for 2 prompts.
 ///
 /// `arena` owns the returned text.
@@ -348,9 +332,9 @@ pub fn schedule(arena: std.mem.Allocator, text: []const u8, steps: usize) ![]Ent
 }
 
 const Node = union(enum) {
-    /// Verbatim, including any emphasis characters — `parseAttention` handles those.
+    /// Verbatim, including any emphasis characters, `parseAttention` handles those.
     text: []const u8,
-    /// A `(…)` or de-emphasis `[…]` span. Re-emitted with its delimiters, because the
+    /// A `(...)` or de-emphasis `[...]` span. Re-emitted with its delimiters, because the
     /// emphasis pass still has to see them.
     group: struct { open: u8, close: u8, children: []const Node },
     scheduled: struct { before: []const Node, after: []const Node, when: i64 },
@@ -399,7 +383,7 @@ const Parser = struct {
         if (lit_start < span.len) try out.append(self.arena, .{ .text = span[lit_start..] });
     }
 
-    /// Classify a bracketed span. Only `[…]` can be scheduled or alternating; `(…)` is
+    /// Classify a bracketed span. Only `[...]` can be scheduled or alternating; `(...)` is
     /// always an emphasis group (its `:w` is the emphasis pass's business).
     fn parseBracket(self: *Parser, out: *std.ArrayList(Node), inner: []const u8, open: u8, close: u8) Err!void {
         if (open == '[') {
@@ -452,15 +436,15 @@ const max_depth: usize = 64;
 /// Whether upstream's grammar would fail to parse this prompt at all, in which case it
 /// renders verbatim with no scheduling.
 ///
-/// ⚠️ **The rule is about `|`, not about braces.** The grammar gives `|` exactly one
-/// home — separating the options of an `alternate`, i.e. directly inside a MATCHED
-/// `[…]`. A `|` anywhere else fails to lex, and upstream's `except lark.LarkError`
+/// The rule is about `|`, not about braces. The grammar gives `|` exactly one
+/// home, separating the options of an `alternate`, i.e. directly inside a MATCHED
+/// `[...]`. A `|` anywhere else fails to lex, and upstream's `except lark.LarkError`
 /// turns the whole prompt into a single verbatim entry. Measured against the real
 /// parser: `[a|b]` and `[[a|b]]` parse; `a|b`, `(a|b)`, `[(a|b)]`, `{a|b}`,
 /// `a [b|c] d|e` and even `a [b|c` (unbalanced, so the `[` is literal text) all fail.
 ///
-/// That last group matters in practice — **NovelAI-style `{a|b}` prompts silently lose
-/// all scheduling in A1111**, and reproducing that is the difference between matching
+/// That last group matters in practice, NovelAI-style `{a|b}` prompts silently lose
+/// all scheduling in A1111, and reproducing that is the difference between matching
 /// the reference and being "reasonable".
 ///
 /// This is also the one place a hand-written parser cannot be equivalent to Lark's
@@ -471,7 +455,7 @@ fn unschedulable(text: []const u8) bool {
 }
 
 /// Recognizer for the two constraints above. `alternation_allowed` is true exactly when
-/// `span` is the direct interior of a matched `[…]`, the one context where `|` has a
+/// `span` is the direct interior of a matched `[...]`, the one context where `|` has a
 /// grammar rule.
 fn badSpan(span: []const u8, alternation_allowed: bool, depth: usize) bool {
     if (depth > max_depth) return true;
@@ -479,7 +463,7 @@ fn badSpan(span: []const u8, alternation_allowed: bool, depth: usize) bool {
     if (hasTopLevel(span, '|')) {
         if (!alternation_allowed) return true;
         // Each option must be derivable as a `prompt`, and `prompt` has no bare-`:`
-        // alternative — so a top-level `:` in any option kills the whole prompt.
+        // alternative, so a top-level `:` in any option kills the whole prompt.
         var from: usize = 0;
         var i: usize = 0;
         var d: isize = 0;
@@ -511,14 +495,14 @@ fn badSpan(span: []const u8, alternation_allowed: bool, depth: usize) bool {
         return false;
     }
 
-    // No alternation here: descend into each matched bracket. `[…]` opens an
-    // alternation context, `(…)` does not.
+    // No alternation here: descend into each matched bracket. `[...]` opens an
+    // alternation context, `(...)` does not.
     var i: usize = 0;
     while (i < span.len) : (i += 1) {
         switch (span[i]) {
             '\\' => i += 1,
             '[', '(' => {
-                // An UNBALANCED bracket is literal text, not a nesting level — which is
+                // An UNBALANCED bracket is literal text, not a nesting level, which is
                 // why `a [b|c` fails: its `|` stays at the top level.
                 if (matchClose(span, i)) |e| {
                     if (badSpan(span[i + 1 .. e], span[i] == '[', depth + 1)) return true;
@@ -588,7 +572,7 @@ fn topLevel(arena: std.mem.Allocator, span: []const u8, needle: u8, out: *std.Ar
     }
 }
 
-/// `[WHITESPACE] NUMBER [WHITESPACE]` filling the whole slice → the resolved step.
+/// `[WHITESPACE] NUMBER [WHITESPACE]` filling the whole slice -> the resolved step.
 ///
 /// The conversion is upstream's non-hires branch: a literal containing `.` is a
 /// FRACTION of `steps`, an integer is absolute, then `min(steps, int(v))` with `int`
@@ -655,7 +639,7 @@ const A1111Fixtures = struct { a1111_attention: []const AttnCase };
 
 test "A1111 emphasis parsing matches parse_prompt_attention" {
     // 22 cases from `tools/gen_a1111_prompt_fixtures.py`, which runs A1111's own
-    // `parse_prompt_attention` — including every one of its upstream doctests.
+    // `parse_prompt_attention`, including every one of its upstream doctests.
     const gpa = testing.allocator;
     var parsed = try std.json.parseFromSlice(
         A1111Fixtures,
@@ -785,7 +769,7 @@ test "an integer `when` is an absolute step but a decimal is a fraction" {
 
 test "scheduling runs before emphasis, so an alternation's brackets survive to it" {
     // The pass order, as a property: `[a|(b:1.2)]` must hand `(b:1.2)` to the emphasis
-    // parser on even steps — if emphasis ran first, the `[`…`]` would already have been
+    // parser on even steps, if emphasis ran first, the `[`...`]` would already have been
     // eaten as de-emphasis and there would be no alternation left.
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);

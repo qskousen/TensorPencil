@@ -1,13 +1,13 @@
 //! Correctness-first elementwise / attention PTX kernels for the CUDA DiT
 //! forward (the f32 fallback path). One thread per element / row / (query,head);
-//! no tiling or shared memory — simple and obviously-correct, matching the CPU
+//! no tiling or shared memory, simple and obviously-correct, matching the CPU
 //! DiT numerics (exp via ex2.approx + log2e, negligible vs the int8 regime).
 //! All kernels share a uniform 12-parameter signature so one launcher fits all:
 //!   (p0,p1,p2,p3 : .u64 buffers)  (u0..u5 : .u32)  (f0,f1 : .f32)
 //! log2(e) = 0f3FB8AA3B; exp(x) = ex2.approx(x * log2e).
 
 /// rms + modulation, fused, ONE BLOCK (256 threads) per row with a parallel
-/// shared-memory reduction (replaces the serial-per-row rms_mod — that launched
+/// shared-memory reduction (replaces the serial-per-row rms_mod, that launched
 /// only `rows` threads, e.g. 264 at 256px = 2 blocks on 82 SMs, each doing a
 /// 6144-long serial reduction). Same math/order-independent result. b0=x, b1=out,
 /// b2=mod. u0=rows, u1=dim, u2=premul_off, u3=shift_off, f0=eps. grid=(rows,1,1).
@@ -74,26 +74,26 @@ pub const rms_mod_par_ptx: [:0]const u8 =
 
 /// per-head RMS norm with one WARP per row: lane `l` walks the row at stride 32,
 /// so a warp's 32 loads are one contiguous 128-byte line. Reduction is a butterfly
-/// shuffle — no shared memory, no `bar.sync` — and any `dim` works (the loop is
+/// shuffle, no shared memory, no `bar.sync`, and any `dim` works (the loop is
 /// guarded, not unrolled). b0=x, b1=out, b2=weight[dim]. u0=rows, u1=dim, f0=eps.
 ///
-/// ⚠️ **This replaced a one-thread-per-row kernel that was a bandwidth trap at
-/// every shape a DiT uses**, and nothing had ever measured it because a norm
+/// This replaced a one-thread-per-row kernel that was a bandwidth trap at
+/// every shape a DiT uses, and nothing had ever measured it because a norm
 /// "obviously" costs nothing next to a GEMM. That form gave each lane a whole
-/// row, so a warp's 32 loads were 32 sector fetches 4·dim apart. Measured on a
+/// row, so a warp's 32 loads were 32 sector fetches 4*dim apart. Measured on a
 /// 3090 at Z-Image's own shapes (32 blocks, seq 6944): the per-head q/k norms ran
-/// at **37.5 GB/s** and the two sandwich norms at **47.1 GB/s**, against 500-750
+/// at 37.5 GB/s and the two sandwich norms at 47.1 GB/s, against 500-750
 /// GB/s for every other elementwise kernel in the same block and ~936 GB/s of
-/// card. Together they were **654 ms of a 2556 ms step** — more than a quarter of
+/// card. Together they were 654 ms of a 2556 ms step, more than a quarter of
 /// it. Coalescing them cost 17x and 10x respectively (654 ms -> 49 ms).
 ///
-/// ⚠️ The row sum is a TREE where the old kernel accumulated serially, so this is
-/// NOT bit-identical to it — it is the more accurate of the two (shallower
+/// The row sum is a TREE where the old kernel accumulated serially, so this is
+/// NOT bit-identical to it, it is the more accurate of the two (shallower
 /// dependency chain), and `rms_mod_par` next door already reduced this way. A
 /// Z-Image render moved 29.42 -> 29.38 dB against ComfyUI (SSIM 0.9586 ->
 /// 0.9592), i.e. inside that model's own precision noise.
 ///
-/// ⚠️ `rows < 512` still takes `qk_rmsnorm_par` (a whole block per row): the LLM
+/// `rows < 512` still takes `qk_rmsnorm_par` (a whole block per row): the LLM
 /// decode path norms 1 x 2560, where 8 rows per block would leave 82 SMs idle.
 pub const qk_rmsnorm_warp_ptx: [:0]const u8 =
     \\.version 8.0
@@ -191,7 +191,7 @@ pub const rope_ptx: [:0]const u8 =
 /// b3=out[seq_q][heads][hd]. u0=seq_q, u1=heads, u2=kv_heads, u3=hd,
 /// u4=causal, u5=seq_kv, f0=scale. acc[hd] in .local.
 /// Causal treats the queries as the LAST seq_q positions of the kv sequence
-/// (query i attends to keys [0, seq_kv - seq_q + i]) — seq_q == seq_kv is the
+/// (query i attends to keys [0, seq_kv - seq_q + i]), seq_q == seq_kv is the
 /// classic square case, seq_q == 1 with longer seq_kv is KV-cached decode.
 pub const attn_ptx: [:0]const u8 =
     \\.version 8.0
@@ -287,8 +287,8 @@ pub const attn_ptx: [:0]const u8 =
 /// [total_rows, heads*hd] (q/out) / [total_rows, kv*hd] (k/v) activation for B
 /// ragged items concatenated. p4 = bounds (u32[2*total]): for query row q,
 /// bounds[q] = its item's first row, bounds[total+q] = one-past its item's last
-/// row — so each query attends ONLY its own item's keys. One launch over all
-/// total*heads (query,head) threads → B× the parallelism of the per-item loop,
+/// row, so each query attends ONLY its own item's keys. One launch over all
+/// total*heads (query,head) threads -> B× the parallelism of the per-item loop,
 /// which is what fills the GPU for short-sequence encoders. u0=total, u1=heads,
 /// u2=kv_heads, u3=hd, f0=scale. Same online-softmax math as `attn`.
 pub const attn_batched_ptx: [:0]const u8 =
@@ -372,7 +372,7 @@ pub const attn_batched_ptx: [:0]const u8 =
     \\}
 ;
 
-/// qk_rmsnorm with one 256-thread block per row (shared-memory reduction) —
+/// qk_rmsnorm with one 256-thread block per row (shared-memory reduction),
 /// the LLM decode path norms rows=1 x dim=2560, where the one-thread-per-row
 /// kernel serializes the whole row on a single lane. Same math/params:
 /// out = x * rsqrt(mean(x^2)+eps) * w. b0=x, b1=out, b2=w. u0=rows, u1=dim,
@@ -517,10 +517,10 @@ pub const ln_bias_par_ptx: [:0]const u8 =
 ;
 
 /// `ln_bias_par` with its per-column weight and bias read out of ONE modulation
-/// buffer at two element offsets — Anima's `modulatedNorm`:
+/// buffer at two element offsets, Anima's `modulatedNorm`:
 ///   out = (x - mean) * inv * mod[u2 + c] + mod[u3 + c]
 ///
-/// ⚠️ `mod[u2..]` must already carry the `(1 + scale)` fold. That is the same
+/// `mod[u2..]` must already carry the `(1 + scale)` fold. That is the same
 /// convention `rms_mod_par` takes (its "premul" is `norm_weight * (1 + scale)`), so
 /// one host-built table feeds this and the Vulkan `ln_mod_sg` and the two backends
 /// cannot drift apart.
@@ -530,7 +530,7 @@ pub const ln_bias_par_ptx: [:0]const u8 =
 ///
 /// Derived from `ln_bias_par_ptx` by asserted substitution rather than copied: the
 /// two differ only in where the per-column pair comes from, and `replaceOnce`
-/// @compileErrors if a pattern is absent or not unique — so the reduction, the
+/// @compileErrors if a pattern is absent or not unique, so the reduction, the
 /// two-pass variance and the strided loop stay literally shared.
 pub const ln_mod_par_ptx: [:0]const u8 = blk: {
     @setEvalBranchQuota(20000);
@@ -813,7 +813,7 @@ pub const gemv_q8_0_ptx: [:0]const u8 =
 /// 256 threads, shared reduction (gemv_q8_0 shape). Iterates the 16 qs BYTES
 /// per block: byte g holds element (b*32 + jj) in its LOW nibble and element
 /// (b*32 + jj + 16) in its HIGH nibble, so each weight byte is read ONCE and
-/// contributes two FMAs — v = (nibble - 8) * d. cols % 32 == 0.
+/// contributes two FMAs, v = (nibble - 8) * d. cols % 32 == 0.
 pub const gemv_q4_0_ptx: [:0]const u8 =
     \\.version 8.0
     \\.target sm_86
@@ -898,28 +898,28 @@ fn q1BitSteps() []const u8 {
 }
 
 /// ggml q1_0 GEMV, warp-per-row (8 rows per 256-thread block, warp-shuffle
-/// reduction, no shared memory / bar.sync — the gemv_iq4_nl/q5_k/q6_k shape):
+/// reduction, no shared memory / bar.sync, the gemv_iq4_nl/q5_k/q6_k shape):
 /// y[row] = scale * dot(W[row], x), W q1_0 [rows][cols/128 blocks of 18 B:
 /// f16 d + 16 bytes of sign bits].
 ///
-/// Iterates the 16 qs BYTES per block, and one byte is EIGHT elements — bit b
+/// Iterates the 16 qs BYTES per block, and one byte is EIGHT elements, bit b
 /// of byte g is element g*8 + b, value `bit ? d : -d`. So each weight byte is
 /// read once and drives eight elements' work, which is why the eight signed
 /// activations are summed FIRST and multiplied by `d` once: 8 adds + 1 fma
 /// instead of 8 fmas, at no accuracy cost worth naming because every element of
 /// a block shares one magnitude.
 ///
-/// ⚠️ Warp-per-row is not a stylistic choice here, it is the difference between
+/// Warp-per-row is not a stylistic choice here, it is the difference between
 /// 28 and 55 tok/s on Bonsai-27B. The block-per-row form this started as spends
 /// 8 rounds of `bar.sync` reducing 256 partials per row while each thread has
-/// only `cols/8/256` = 2.5 bytes of weight to consume at cols=5120 — the
+/// only `cols/8/256` = 2.5 bytes of weight to consume at cols=5120, the
 /// reduction costs more than the dot product. q1_0 is the format most exposed to
 /// this, because one bit per weight means the least work per row of any quant.
 ///
-/// ⚠️ The arithmetic intensity is also inverted relative to every other quant
+/// The arithmetic intensity is also inverted relative to every other quant
 /// here: one byte of weight pulls 32 bytes of activation, so a row reads 8x LESS
 /// weight and the SAME activation as q8_0. It stays DRAM-bound overall only
-/// because x is shared by every row and lives in cache — a variant that re-read
+/// because x is shared by every row and lives in cache, a variant that re-read
 /// x from global per row would be activation-bound instead.
 ///
 /// The 8 activations are contiguous from element g*8, so their byte offset is a
@@ -1013,7 +1013,7 @@ pub const q2_g128: Q2Geom = .{ .qk = 128, .tag = "g128" };
 /// Unlike q1_0's sign bit this cannot be a predicated negate, so it is an integer
 /// subtract, a convert and an fma. The multiplier is still an exact small integer,
 /// which is what lets the four products be summed BEFORE the single multiply by
-/// `d` below with no accuracy cost at all — every term is exact in f32.
+/// `d` below with no accuracy cost at all, every term is exact in f32.
 fn q2CodeStep(comptime k: u32) []const u8 {
     return std.fmt.comptimePrint(
         \\  and.b32 %r14,%r13,3; sub.s32 %r15,%r14,1; cvt.rn.f32.s32 %f13,%r15;
@@ -1032,15 +1032,15 @@ fn q2CodeSteps() []const u8 {
 }
 
 /// q2_0 (g128) GEMV, warp-per-row (8 rows per 256-thread block, warp-shuffle
-/// reduction, no shared memory / bar.sync — the gemv_q1_0/iq4_nl/q5_k shape):
+/// reduction, no shared memory / bar.sync, the gemv_q1_0/iq4_nl/q5_k shape):
 /// y[row] = scale * dot(W[row], x), W q2_0_g128 [rows][cols/128 blocks of 34 B:
 /// f16 d + 32 bytes of 2-bit codes].
 ///
-/// ⚠️ **g128 only** (see `DType.q2_0_g128`). GGUF type id 42 is also claimed by
+/// g128 only (see `DType.q2_0_g128`). GGUF type id 42 is also claimed by
 /// ggml's 64-element Q2_0, for which this 34-byte stride is wrong; that dtype is
 /// refused at load rather than routed here.
 ///
-/// Iterates the 32 qs BYTES per block, and one byte is FOUR elements — code c of
+/// Iterates the 32 qs BYTES per block, and one byte is FOUR elements, code c of
 /// byte g is element g*4 + c, value `(code - 1) * d`. Each weight byte is read
 /// once and drives four elements, so the four weighted activations are summed
 /// first and multiplied by `d` once: 4 fmas + 1 fma instead of 4 fmas against
@@ -1134,7 +1134,7 @@ const q2_0_tail =
 ///
 /// The whole unpack is `prmt` used as a lookup table. %r56 holds the four symbols
 /// `{-1, 0, +1, +2}` as bytes (0x020100FF), and a `prmt` selector is four NIBBLES
-/// each naming a source byte — so if the selector's nibbles are the 2-bit codes,
+/// each naming a source byte, so if the selector's nibbles are the 2-bit codes,
 /// one `prmt` maps four codes straight to their symbols with no arithmetic:
 ///
 ///   sel_even = q       & 0x33333333   -> nibbles c0 c2 c4 c6
@@ -1144,15 +1144,15 @@ const q2_0_tail =
 ///   qx = prmt(qe, qo, 0x5140)         -> back to element order c0 c1 c2 c3
 ///   qy = prmt(qe, qo, 0x7362)         ->                       c4 c5 c6 c7
 ///
-/// ⚠️ **The `0x33333333` mask is load-bearing, not tidiness.** `prmt` reads bit 3
-/// of each selector nibble as SIGN-REPLICATE — it emits 0x00/0xFF from the source
+/// The `0x33333333` mask is load-bearing, not tidiness. `prmt` reads bit 3
+/// of each selector nibble as SIGN-REPLICATE, it emits 0x00/0xFF from the source
 /// byte's msb instead of the byte. Without the mask a nibble carries the NEXT
 /// code in its high 2 bits, so any code >= 2 sets bit 3 and silently corrupts its
 /// neighbour's symbol whenever that neighbour is also >= 2 (constantly, in a
 /// ternary model). This is the same trap recorded for `gemv_q1_0_q8`, where the
 /// symptom was a model running at full speed emitting one token forever.
 ///
-/// Symbols come out SIGNED, so this needs no `sum(xq)` correction term — which is
+/// Symbols come out SIGNED, so this needs no `sum(xq)` correction term, which is
 /// what lets the kernel skip the `s` region entirely: 9 ops per 8 elements and one
 /// fewer global load per chunk than the unsigned-code form this replaced.
 /// `t` is the base of a 6-register scratch block, and `sumi` the accumulator, so
@@ -1212,18 +1212,18 @@ fn q2Dp4aChunkX2() []const u8 {
     }
 }
 
-/// q2_0 GEMV against a `quantize_q8_1` activation (dp4a int8 dot) — the decode
+/// q2_0 GEMV against a `quantize_q8_1` activation (dp4a int8 dot), the decode
 /// twin of `gemv_q1_0_q8`, and what makes q2_0 decode competitive: warp per row,
 /// 8 rows per 256-thread block, warp-shuffle reduction, no shared memory.
 ///
 /// One lane handles one 32-element chunk per iteration: a whole q8 activation
 /// block, and 8 code bytes of a weight block (a HALF block at g64, a QUARTER at
-/// g128 — the only place the two geometries differ, and `Q2Geom` supplies it).
+/// g128, the only place the two geometries differ, and `Q2Geom` supplies it).
 /// Per chunk: four u16 weight loads (a q2_0 block is 18 or 34 bytes, so `qs` is
 /// only 2-byte aligned and a u32 load would be misaligned), eight u32 activation
 /// loads, 8 spreads and 8 `dp4a`.
 ///
-/// ⚠️ NOT the same arithmetic as `gemv_q2_0_*`: the activation goes through int8
+/// NOT the same arithmetic as `gemv_q2_0_*`: the activation goes through int8
 /// here, so this is approximate where that kernel is f32-exact. Same tradeoff
 /// every other dp4a decode GEMV here already makes, and what llama.cpp computes.
 ///
@@ -1325,14 +1325,14 @@ const q2_0_q8_tail =
 /// Two-row-per-warp variant of `gemv_q2_0_*_q8`: 16 rows per 256-thread block
 /// instead of 8, with both rows sharing ONE set of activation registers.
 ///
-/// ⚠️ **Measured, and it is a trade, not a win** — see BACKEND.md. It halves the
+/// Measured, and it is a trade, not a win. It halves the
 /// activation re-reads (the one-row kernel has every warp read the whole q8
 /// activation for its single row, so a GEMV's activation traffic is `rows * cols`
-/// bytes — several times the weight stream, all through L2), but it also halves
-/// the block count. `gemv_q2_0_*_q8` already reaches **100% occupancy** (38
+/// bytes, several times the weight stream, all through L2), but it also halves
+/// the block count. `gemv_q2_0_*_q8` already reaches 100% occupancy (38
 /// registers, 48 warps/SM), so there is no latency-hiding headroom to buy back,
 /// and on a narrow weight the halved grid stops filling the GPU: Bonsai's
-/// 5120-row weights drop from 640 blocks (1.3 waves over 82 SMs) to 320 (0.65) —
+/// 5120-row weights drop from 640 blocks (1.3 waves over 82 SMs) to 320 (0.65),
 /// less than one wave.
 ///
 /// Selected by `TP_Q2_X2` so the two forms can be A/B'd from ONE binary; the
@@ -1448,21 +1448,21 @@ const q2_0_q8x2_tail =
 /// cheap (the technique is PrismML's, from their llama.cpp fork's
 /// `unpack_q1_0_bytes`):
 ///
-///   1. `prmt(0x11100100, ., q & 0x33333333)` — the four source bytes are
+///   1. `prmt(0x11100100, ., q & 0x33333333)`, the four source bytes are
 ///      {0x00,0x01,0x10,0x11}, so each 2 bits of `q` become one byte holding those
 ///      bits as two NIBBLES. Run on `q` and `q >> 2` to spread all 16 bits.
-///      ⚠️ The mask is load-bearing: `prmt` reads bit 3 of each selector nibble as
+///      The mask is load-bearing: `prmt` reads bit 3 of each selector nibble as
 ///      a SIGN-REPLICATE flag, not as part of the index, and every source byte
-///      here has its msb clear — so an unmasked nibble >= 8 silently yields 0x00
+///      here has its msb clear, so an unmasked nibble >= 8 silently yields 0x00
 ///      and those two weights come out as -1,-1 regardless of their real signs.
 ///      The symptom is a model that runs at full speed and emits one token
 ///      forever, which is why the mask is verified by comparison against the CPU
 ///      op rather than by reading the kernel.
-///   2. `prmt(0x01FF, ., n)` — source bytes {0xFF,0x01,0x00,0x00}, so each nibble
+///   2. `prmt(0x01FF, ., n)`, source bytes {0xFF,0x01,0x00,0x00}, so each nibble
 ///      (0 or 1) becomes 0xFF = -1 or 0x01 = +1 as s8.
 ///
 /// The final two `prmt`s per half interleave the two spread streams back into
-/// ELEMENT order, so word k holds elements 4k..4k+3 — which is exactly the byte
+/// ELEMENT order, so word k holds elements 4k..4k+3, which is exactly the byte
 /// order dp4a needs against a q8 activation word covering the same elements.
 /// Getting that interleave wrong is not a crash, just a wrong dot product, so the
 /// order is pinned by `sd-cuda-test`-style comparison against the CPU op.
@@ -1491,13 +1491,13 @@ fn q1Dp4aHalf(comptime q: u32, comptime act: u32) []const u8 {
 /// decode-path twin of `gemv_q5_k_q8`/`gemv_q6_k_q8`: warp per row, 8 rows per
 /// 256-thread block, warp-shuffle reduction.
 ///
-/// One lane handles one 32-element chunk per iteration — a q8 activation block,
+/// One lane handles one 32-element chunk per iteration, a q8 activation block,
 /// and a quarter of a q1_0 weight block, so the weight's single `d` multiplies
 /// four chunks and each chunk brings its own `d8`. Per chunk: two u16 weight
 /// loads (q1_0's qs is only 2-byte aligned, since a block is 18 bytes), eight u32
 /// activation loads, 16 `prmt` and 8 `dp4a`.
 ///
-/// ⚠️ NOT the same arithmetic as `gemv_q1_0`: the activation goes through int8
+/// NOT the same arithmetic as `gemv_q1_0`: the activation goes through int8
 /// here, so this is approximate where that kernel is f32-exact. Same tradeoff the
 /// other dp4a decode GEMVs already make, and it is what llama.cpp computes.
 ///
@@ -1582,7 +1582,7 @@ const q1_0_q8_tail =
 ;
 
 /// ggml IQ4_NL GEMV, warp-per-row (8 rows per 256-thread block; warp-shuffle
-/// reduction, no shared mem / bar.sync — same structure as gemv_q5_k/q6_k).
+/// reduction, no shared mem / bar.sync, same structure as gemv_q5_k/q6_k).
 /// Same block layout as q4_0 (f16 d + 16 nibble bytes, 32 elems) but the nibble
 /// maps through the non-linear codebook kvalues_iq4nl (a 16-entry .const LUT)
 /// instead of the affine (nibble - 8). Launch grid = ceil(rows/8).
@@ -2015,7 +2015,7 @@ pub const gemv_q6_k_ptx: [:0]const u8 =
 /// The dp4a GEMVs recover per-quad sums themselves (dp4a against 0x01010101)
 /// and only read d/qs, so the trailing `s` region is inert for them. It exists
 /// for the MMQ tensor-core path, whose k-quant min term (`-dmin*m*Σq`) is
-/// folded per 32-elem sub-block AFTER the mma — there the sum can't come out
+/// folded per 32-elem sub-block AFTER the mma, there the sum can't come out
 /// of the integer dot, and recomputing it per weight tile would repeat work
 /// that is identical across every weight matrix in a layer.
 ///
@@ -2085,7 +2085,7 @@ pub const quantize_q8_1_ptx: [:0]const u8 =
 /// high) strided 32 units, so the inline 6-bit scale decode amortizes over
 /// 16 elems (v3 paid it per 8). Per unit: 8 dp4a (4 value dots + 4 sums of u
 /// for the dmin*m term), integer sc/m muls, 4 cvt+fma; six vector LDGs
-/// (v2 qs, v2 qh, v4 header, v2 d8, 2x v2 u) — the kernel is load-slot
+/// (v2 qs, v2 qh, v4 header, v2 d8, 2x v2 u), the kernel is load-slot
 /// bound, so every 32-bit scalar load matters more than ALU here.
 /// cols % 256 == 0, rows % 8 == 0. b0=W, b1=xq (SoA: f32 d[cols/32] then
 /// i8 qs[cols]), b2=y. u0=rows, u1=cols, f0=scale.
@@ -2485,7 +2485,7 @@ const q8n_epi_head =
 ;
 
 /// Grouped-GEMV epilogue block: butterfly-reduce acc i across the warp
-/// (uniform early-out at ng — all 32 lanes branch together), lane 0 stores
+/// (uniform early-out at ng, all 32 lanes branch together), lane 0 stores
 /// y[i*rows + row].
 fn q8nEpilogue(comptime i: u32) []const u8 {
     return std.fmt.comptimePrint(
@@ -2635,7 +2635,7 @@ fn q6nInput(comptime i: u32) []const u8 {
 }
 
 /// gemv_q5_k_q8n's q4_k sibling: identical scale decode, dp4a dot (dot*sc -
-/// su*m min term), and epilogue — the only difference is the weight value is
+/// su*m min term), and epilogue, the only difference is the weight value is
 /// just the 4-bit nibble (q4_k has no 5th-bit qh plane), so the block is 144 B
 /// and qs sits at offset 16. Reuses q5nInput unchanged: the per-input block
 /// only touches the shared v words, which q4n_head builds without the qh OR.
@@ -2728,7 +2728,7 @@ const q4n_head =
 ;
 
 /// Grouped dp4a GEMV for q8_0 (llama.cpp vec_dot_q8_0_q8_1 math): q8_0 has no
-/// sub-block scales or mins, so the dot is just d_w * d_x * Σ(qw·qx) per 32-elem
+/// sub-block scales or mins, so the dot is just d_w * d_x * Σ(qw*qx) per 32-elem
 /// block. Weights are SIGNED int8 -> dp4a.s32.s32 (the k-quant nibbles are
 /// unsigned -> .u32.s32). The 34-B block stride leaves the quant bytes only
 /// 2-B aligned, so each weight u32 is assembled from a u16 pair (q6_k does the
@@ -2932,9 +2932,9 @@ pub const KvFmt = enum { f32, f16, q8_0 };
 ///     q8_0 addresses the row's 34-byte block (a lane's fragment never
 ///     straddles one: fragments are dims-aligned and dims divides 32), loads
 ///     the f16 scale once and the quants as u16 pairs, sign-extends and
-///     multiplies — see emitKVLoad;
+///     multiplies, see emitKVLoad;
 ///   - ring addressing (u6) wraps the KV row (j%ring) for LOCAL sliding-window
-///     layers; GLOBAL layers pass ring=0 (linear) — same code, no branch cost.
+///     layers; GLOBAL layers pass ring=0 (linear), same code, no branch cost.
 /// The masking is uniform: causal kv_len = kv_len0+t, a bidirectional image
 /// block (u7) extends the upper bound (kv_end) to kv_len0+seq_q-1 while the
 /// sliding window (f1) keeps kv_start on the query's own causal position.
@@ -3020,7 +3020,7 @@ fn genAttnSplit(comptime hd: u32, comptime kvf: KvFmt) [:0]const u8 {
     inline for (0..dims) |dd| s = s ++ cp("  mov.f32 %f{d},0f00000000;\n", .{AB + dd});
     s = s ++ "  ld.param.u32 %r32,[u6];              // ring (0 = linear KV addressing)\n";
     if (kvf == .q8_0) {
-        // Loop-invariant quant byte offset within the lane's block: rows are
+        // Quant byte offset within the lane's block, hoisted out of the loop: rows are
         // block-aligned, so elem%32 == lane_off%32; quants start at +2.
         s = s ++ "  and.b32 %r45,%r15,31; add.u32 %r45,%r45,2; cvt.u64.u32 %rd21,%r45;\n";
     }
@@ -3097,8 +3097,8 @@ fn genAttnSplit(comptime hd: u32, comptime kvf: KvFmt) [:0]const u8 {
 /// from the global address in `addr`. f32 reads v4.f32 (4 dims/load); f16 reads
 /// v4.u32 (8 packed halfs/load) and widens each with cvt.f32.f16. q8_0 expects
 /// `addr` to point at the lane's 34-byte block (and %rd21 = 2 + elem%32, the
-/// loop-invariant quant offset): it loads the block's f16 scale once, then the
-/// quants as u16 pairs (2-byte aligned — dims is even), sign-extends each i8
+/// hoisted quant offset): it loads the block's f16 scale once, then the
+/// quants as u16 pairs (2-byte aligned, dims is even), sign-extends each i8
 /// with shl/shr.s32 and multiplies by the scale into the same f32 registers.
 fn emitKVLoad(comptime kvf: KvFmt, comptime dims: u32, comptime base: u32, comptime addr: []const u8) []const u8 {
     const cp = std.fmt.comptimePrint;
@@ -3146,7 +3146,7 @@ pub const attn_split_h512_q8_ptx = genAttnSplit(512, .q8_0);
 /// weight traffic; amortizing x over 8 rows restores the W-stream-bound
 /// regime. Per-thread element order matches gemv_fp8 (c = tid*8, stride
 /// 2048) and each accumulator sums in that same order, so results are
-/// bitwise identical to the single-input kernel — greedy speculative decode
+/// bitwise identical to the single-input kernel, greedy speculative decode
 /// stays byte-identical to vanilla. x must have 4 rows of backing store
 /// (garbage rows beyond n are computed and discarded via predicated stores);
 /// W streams with .cs (evict-first). 32 accumulators (8 rows x 4 inputs)
@@ -3754,11 +3754,11 @@ pub const gemv_bf16n_ptx: [:0]const u8 =
 /// one WARP per (query, head, split). Queries are consecutive positions with
 /// causal attention: query t sees kv_len0 + t keys (kv_len0 = pos0 + 1), so
 /// seq_q == 1 is plain decode and seq_q > 1 is the speculative-verify batch.
-/// Requires hd == 128: each lane owns 4 dims (q/k/v as v4.f32), the k·q dot
+/// Requires hd == 128: each lane owns 4 dims (q/k/v as v4.f32), the k*q dot
 /// closes with a shfl.bfly tree (all lanes get the sum), softmax scalars are
 /// computed redundantly per lane, and the accumulator lives in 4 registers
-/// per lane — no local memory. Partial (m, d, pad, pad, acc[hd]) rows go to
-/// scratch at row `warp` — [t][h][split] order — stride hd+4 so the lane v4
+/// per lane, no local memory. Partial (m, d, pad, pad, acc[hd]) rows go to
+/// scratch at row `warp`, [t][h][split] order, stride hd+4 so the lane v4
 /// stores stay 16B-aligned (attn_merge then runs with heads' = seq_q*heads).
 /// b0=q[seq_q][heads][hd], b1=k[seq_kv][kv][hd], b2=v, b3=scratch.
 /// u0=kv_len0, u1=heads, u2=kv_heads, u3=hd(=128), u4=nsplit, u5=seq_q, f0=scale.
@@ -4007,7 +4007,7 @@ pub const attn_split_q8_ptx: [:0]const u8 =
     \\  mad.lo.s32 %r14,%r31,%r6,%r10; mul.lo.s32 %r14,%r14,%r9; shl.b32 %r15,%r28,2; add.u32 %r14,%r14,%r15;
     \\  mul.wide.u32 %rd5,%r14,4; add.s64 %rd6,%rd1,%rd5;
     \\  ld.global.v4.f32 {%f2,%f3,%f4,%f5},[%rd6];
-    \\  // Loop-invariant quant byte offset within the lane's block (+2 header).
+    \\  // Quant byte offset within the lane's block, hoisted (+2 header).
     \\  and.b32 %r34,%r15,31; add.u32 %r34,%r34,2; cvt.u64.u32 %rd21,%r34;
     \\  mov.f32 %f10,0fFF800000;              // m
     \\  mov.f32 %f11,0f00000000;              // d
@@ -4120,7 +4120,7 @@ pub const attn_merge_ptx: [:0]const u8 =
     \\}
 ;
 
-/// Tree-verify attn_split (speculative tree drafting, LLM_PLAN.md M8):
+/// Tree-verify attn_split (speculative tree drafting):
 /// seq_q tree-node queries, query t attending kv rows [0, L) of the linear
 /// cache plus its ancestor chain, whose K/V live at rows tree_base+idx of
 /// the SAME k/v buffers. Per-query kv lengths and ancestor row lists come
@@ -4374,7 +4374,7 @@ pub const rope_half_part_ptx: [:0]const u8 =
 
 /// Interleaved M-RoPE (qwen35 with images): like rope_half_part but the
 /// position for pair p comes from one of three channels (t, h, w) selected
-/// by ggml's imrope round-robin — p%3==1 and p<3*s1 -> h, p%3==2 and
+/// by ggml's imrope round-robin, p%3==1 and p<3*s1 -> h, p%3==2 and
 /// p<3*s2 -> w, p%3==0 and p<3*s0 -> t, else t. Frequencies stay tied to
 /// the global pair index, so equal positions reproduce rope_half_part
 /// exactly. Single-row (seq=1) decode stepping.
@@ -4546,8 +4546,8 @@ pub const rope_vision_ptx: [:0]const u8 =
 ;
 
 /// gemma4v vision 2-D RoPE (neox). Distinct from rope_vision (Qwen3-VL): here
-/// each head is split into two HALVES [0,2h) and [2h,4h) — span 0 rotates
-/// against grid col (pos2[t][0]=x), span 1 against row (pos2[t][1]=y) — with the
+/// each head is split into two HALVES [0,2h) and [2h,4h), span 0 rotates
+/// against grid col (pos2[t][0]=x), span 1 against row (pos2[t][1]=y), with the
 /// neox pairing WITHIN each span: (off+i, off+h+i). Matches the CPU
 /// rope.applyRotateHalfPosSpan applied twice. b0=qk, b1=pos2(u32[rows*2]),
 /// b2=freqs(cos then sin at sin_off). u0=total(rows*n_heads*2*half), u1=half,
@@ -4628,7 +4628,7 @@ pub const deinterleave2_ptx: [:0]const u8 =
     \\}
 ;
 
-/// a[idx] *= sigmoid(b[idx]) — the qwen35 attention output gate.
+/// a[idx] *= sigmoid(b[idx]), the qwen35 attention output gate.
 /// b0=a, b1=b. u0=total.
 pub const mul_sigmoid_ptx: [:0]const u8 =
     \\.version 8.0
@@ -4706,7 +4706,7 @@ pub const l2norm_rows_ptx: [:0]const u8 =
 /// batched GDN needs it because each token's q/k slice is separated from the next
 /// token's by that token's v slice.
 ///
-/// ⚠️ A SEPARATE kernel rather than a mode flag on `l2norm_rows`: the plain form is
+/// A SEPARATE kernel rather than a mode flag on `l2norm_rows`: the plain form is
 /// launched once per token per GDN layer on models that don't take the batched
 /// path (55k times in a 9B prefill), and folding a runtime branch into it measured
 /// ~4% slower there. Duplicating ~20 lines of reduction is the cheaper trade.
@@ -4761,8 +4761,8 @@ pub const l2norm_rows_g_ptx: [:0]const u8 =
 ;
 
 /// Emit one tap of `gdn_conv_batch`: read the channel's value at token `t-3+k`
-/// — from `x` when that token is inside this chunk, else from the carried
-/// 3-column state — and accumulate `w[k] * v`.
+/// from `x` when that token is inside this chunk, else from the carried
+/// 3-column state, and accumulate `w[k] * v`.
 ///
 /// The out-of-chunk branch is a `selp` on the ADDRESS, not a branch on the load,
 /// so the four taps stay straight-line. Computing the (negative, invalid) `x`
@@ -4783,19 +4783,17 @@ fn gdnConvTap(comptime k: i32) []const u8 {
 /// Batched qwen35 depthwise causal conv (kernel 4) + SiLU: every token of a
 /// prefill chunk at once, one thread per (token, channel).
 ///
-/// ⚠️ This is a CONVOLUTION, not a recurrence — that is the whole point. The
-/// per-token `gdn_conv_step` below rolls a 3-column state forward and so had to
-/// run once per token inside batched prefill; but `out[t]` depends only on
-/// `x[t-3..t]`, so all tokens are independent given the state carried IN. Running
-/// it per token cost 7 launches per token per GDN layer, and that loop measured
-/// **46% of Bonsai-27B's prefill**. The state roll moves to
-/// `gdn_conv_state` (one launch per chunk) because doing it here would race:
-/// every token's threads read the same old state.
+/// This is a CONVOLUTION, not a recurrence, which is what makes it batchable: `out[t]`
+/// depends only on `x[t-3..t]`, so given the state carried IN every token is independent.
+/// The per-token `gdn_conv_step` below rolls a 3-column state forward and therefore has
+/// to run once per token, which is 7 launches per token per GDN layer and measured 46% of
+/// a 27B model's prefill. The state roll lives in `gdn_conv_state`, one launch per chunk,
+/// because doing it here would race: every token's threads read the same old state.
 ///
 /// b0=conv_state [channels][3] (read-only), b1=x [n][channels],
 /// b2=conv_w [channels][4] (w[0] oldest), b3=out [n][channels].
 /// u0=n*channels, u1=channels, u2=n.
-/// ⚠️ Tap order is 3, 0, 1, 2 — NOT ascending — to reproduce `gdn_conv_step`'s
+/// Tap order is 3, 0, 1, 2, NOT ascending, to reproduce `gdn_conv_step`'s
 /// summation order exactly (`w3*x`, then `w0*s0`, `w1*s1`, `w2*s2`). f32 addition
 /// is not associative, so ascending order would make batched prefill and
 /// single-token decode disagree in the last bits, and this model's output is
@@ -4841,7 +4839,7 @@ const gdn_conv_batch_tail =
 /// the carried 3 columns must become the chunk's LAST 3 token columns. One thread
 /// per channel, one launch per chunk.
 ///
-/// ⚠️ All three old values are read BEFORE any is written — the update is in place
+/// All three old values are read BEFORE any is written, the update is in place
 /// and, for a chunk shorter than the 3-column window, a new column can come from
 /// the old state itself (n=2 gives {old[2], x[0], x[1]}).
 /// b0=conv_state [channels][3] (in/out), b1=x [n][channels]. u0=channels, u1=n.
@@ -5028,7 +5026,7 @@ pub const gdn_gates_ptx: [:0]const u8 =
 ///   S[i,j] += k_i d_j;  o_j = sum_i S[i,j] (q_i * scale)
 /// q/k are the L2-normalized conv outputs; v-head h uses k-head h % k_heads.
 /// Threads 0..d-1 stage k into shared, d..2d-1 stage q*scale. Both state
-/// walks are unrolled x4 (same fma order — bitwise-identical m/o): with
+/// walks are unrolled x4 (same fma order, bitwise-identical m/o): with
 /// only `heads` CTAs of 4 active warps the kernel is load-latency bound,
 /// so per-thread memory-level parallelism is the lever. d % 4 == 0.
 /// b0=S (all heads, [heads][d][d]), b1=conv_out ([q(k_heads*d) |
@@ -5236,11 +5234,11 @@ pub const im2col_ptx: [:0]const u8 =
 /// (r<rows and c<cols) ? f16(f0*src[r*cols+c]) : 0. b0=src(f32), b1=out(f16).
 /// u0=total(rows_pad*cols_pad), u1=cols_pad, u2=rows, u3=cols.
 ///
-/// ⚠️ `f0` is a pre-cast scale and callers MUST pass 1.0, not 0.0, for the plain
+/// `f0` is a pre-cast scale and callers MUST pass 1.0, not 0.0, for the plain
 /// case. f16 tops out at 65504 and an SDXL VAE decoder's residual stream reaches
 /// ~4e5 (measured), so the cast alone turns a perfectly good f32 activation into
 /// `inf`; dividing here by a power of two and multiplying back in `bias_compact`
-/// is exact (it only shifts the exponent) and costs nothing — this kernel already
+/// is exact (it only shifts the exponent) and costs nothing, this kernel already
 /// touches every element. See `opConvF16Scaled`.
 pub const f32_to_f16_pad2d_ptx: [:0]const u8 =
     \\.version 8.0
@@ -5348,7 +5346,7 @@ pub const bf16_to_f16_pad2d_ptx: [:0]const u8 =
     \\}
 ;
 
-/// f16 → f16 2-D pad: copy W[co][cols] into a [rows][cols_pad] f16 tile,
+/// f16 -> f16 2-D pad: copy W[co][cols] into a [rows][cols_pad] f16 tile,
 /// zero-padding the tail. Same shape as `bf16_to_f16_pad2d` but the source is
 /// already f16, so each lane is a straight 16-bit copy (no conversion). Used by
 /// `opMatmulF16` for GGUF mmproj weights stored as f16.
@@ -5388,9 +5386,9 @@ pub const f16_pad2d_ptx: [:0]const u8 =
 /// b0=C(f32 padded), b1=bias(f32[co]), b2=dst(f32). u0=total(m*co), u1=co,
 /// u2=co_pad, u3=dst offset (elements).
 ///
-/// ⚠️ `f0` is the GEMM output scale and callers MUST pass 1.0, not 0.0, for the
+/// `f0` is the GEMM output scale and callers MUST pass 1.0, not 0.0, for the
 /// plain case. It exists so a caller can divide the activation by a constant
-/// before the f16 cast and undo it here — the two halves of `opConvF16Scaled`,
+/// before the f16 cast and undo it here, the two halves of `opConvF16Scaled`,
 /// which is what keeps the SDXL VAE's ~4e5 activations from becoming `inf`. The
 /// bias is added AFTER the unscale, so it is passed unscaled.
 pub const bias_compact_ptx: [:0]const u8 =
@@ -5730,7 +5728,7 @@ pub const silu_mul_ptx: [:0]const u8 =
 ;
 
 /// a[idx] = geluTanh(a[idx]), in place. b0=a. u0=total. Tanh-gelu folds to
-/// x·sigmoid(w), w = x·(c1 + c2·x²) with c1=2·√(2/π), c2=c1·0.044715 — matches
+/// x*sigmoid(w), w = x*(c1 + c2*x²) with c1=2*√(2/π), c2=c1*0.044715, matches
 /// ops.act.geluTanh to f32 rounding (sigmoid via ex2.approx, as in silu_mul).
 pub const gelu_ptx: [:0]const u8 =
     \\.version 8.0
@@ -5760,8 +5758,8 @@ pub const gelu_ptx: [:0]const u8 =
 ;
 
 /// GeGLU gate: a[idx] = geluTanh(a[idx]) * b[idx], in place (Gemma FFN).
-/// Same folded tanh-gelu as `gelu` (x·sigmoid(w), w = x·(c1 + c2·x²)),
-/// then multiplied by the up projection b — the fused twin of silu_mul.
+/// Same folded tanh-gelu as `gelu` (x*sigmoid(w), w = x*(c1 + c2*x²)),
+/// then multiplied by the up projection b, the fused twin of silu_mul.
 /// b0=a (gate), b1=b (up). u0=total.
 pub const gelu_mul_ptx: [:0]const u8 =
     \\.version 8.0
@@ -5819,7 +5817,7 @@ pub const gelu_quick_mul_ptx: [:0]const u8 =
     \\}
 ;
 
-/// a[idx] = gelu_quick(a[idx]) = x*sigmoid(1.702x), in place — CLIP-L's FFN (and so
+/// a[idx] = gelu_quick(a[idx]) = x*sigmoid(1.702x), in place, CLIP-L's FFN (and so
 /// SD1.5's whole text tower). The ungated twin of `gelu_quick_mul`, sharing its exact
 /// instruction sequence so the two cannot drift; `ex2.approx` makes this ~1e-6 off the
 /// CPU's `ops.act.geluQuick`, per this file's header. b0=a. u0=total.
@@ -5848,8 +5846,8 @@ pub const gelu_quick_ptx: [:0]const u8 =
     \\}
 ;
 
-/// a[idx] = geluErf(a[idx]) = 0.5x(1 + erf(x/sqrt2)), in place — CLIP-G's FFN (SDXL's
-/// second tower). The **erf** GELU, not the tanh approximation and not quick-GELU: the
+/// a[idx] = geluErf(a[idx]) = 0.5x(1 + erf(x/sqrt2)), in place, CLIP-G's FFN (SDXL's
+/// second tower). The erf GELU, not the tanh approximation and not quick-GELU: the
 /// three agree to ~1e-2, which is close enough to look correct and far enough to shift
 /// style. Same A&S 7.1.26 sequence as `geglu_ptx`'s gate, so the two cannot drift.
 /// b0=a. u0=total.
@@ -6102,7 +6100,7 @@ pub const gather_head_b_ptx: [:0]const u8 =
     \\}
 ;
 
-/// Batched V→Vt gather: dst[z][hd][mpad] f16 for kv heads (base_h+z)/group.
+/// Batched V->Vt gather: dst[z][hd][mpad] f16 for kv heads (base_h+z)/group.
 /// b0=src(f32 [seq][kv_heads][hd]), b1=dst(f16). u0=seq, u1=kv_heads, u2=base_h,
 /// u3=group, u4=hd, u5=mpad, u6=total (=gsize*hd*mpad).
 pub const gather_vt_b_ptx: [:0]const u8 =
@@ -6138,7 +6136,7 @@ pub const gather_vt_b_ptx: [:0]const u8 =
     \\}
 ;
 
-/// Batched scatter: src[z][mpad][hd] f32 (rows 0..seq) → out[row][base_h+z][hd].
+/// Batched scatter: src[z][mpad][hd] f32 (rows 0..seq) -> out[row][base_h+z][hd].
 /// b0=src(f32), b1=dst(f32 [seq][heads][hd]). u0=seq, u1=heads, u2=base_h, u3=hd,
 /// u4=mpad, u5=total (=gsize*seq*hd).
 pub const scatter_head_b_ptx: [:0]const u8 =
@@ -6174,13 +6172,13 @@ pub const scatter_head_b_ptx: [:0]const u8 =
 /// Decode a packed ComfyUI NVFP4 weight to the f16 the tensor-core GEMM consumes:
 /// `out[e] = levels[scales[block(e)]][E2M1 code]`.
 ///
-/// `levels` is the `[256][16]` **f16** table `ops.nvfp4.Levels` builds on the host, which
+/// `levels` is the `[256][16]` f16 table `ops.nvfp4.Levels` builds on the host, which
 /// already folds `E2M1 * (weight_scale_2 * block_scale)` in the reference's own multiply
-/// order — so this kernel does no arithmetic at all and cannot drift from the CPU decode.
+/// order, so this kernel does no arithmetic at all and cannot drift from the CPU decode.
 /// `scales` must already be UNSWIZZLED (the loader does it once; cuBLAS's tiled block-scale
 /// layout has no business in an inner loop).
 ///
-/// ⚠️ **Element 2k is the HIGH nibble** (`hi_first` in the reference) — the opposite of
+/// Element 2k is the HIGH nibble (`hi_first` in the reference), the opposite of
 /// `.i4` and `.w4a8` here. Getting it backwards permutes adjacent weight pairs, which
 /// preserves every row's rms exactly, so nothing downstream can notice.
 ///
@@ -6240,13 +6238,13 @@ pub const nvfp4_decode_ptx: [:0]const u8 =
 /// Decode a packed ComfyUI `asym_w4a8_int8` weight to the int8 the int8 GEMM
 /// consumes: `out[e] = levels[s_rel[group(e)]][nibble(e)]`.
 ///
-/// `levels` is the `[256][16]` int8 table `ops.w4a8.Levels` builds on the host — it
+/// `levels` is the `[256][16]` int8 table `ops.w4a8.Levels` builds on the host, it
 /// already folds the reference's `rint(clamp(codebook[q] * s_rel, -127, 127))`, so this
 /// kernel does no arithmetic at all and is bit-identical to the CPU decode by
 /// construction rather than by agreement. 4 KiB, so it lives in L1 for the whole
 /// weight.
 ///
-/// ⚠️ **One thread per FOUR packed bytes** (a `u32` in, two `u32` out — 8 elements), not
+/// One thread per FOUR packed bytes (a `u32` in, two `u32` out, 8 elements), not
 /// one per byte. The level lookups are *dependent* loads (the address comes from the
 /// loaded nibble), so a byte-per-thread version has a single memory chain per thread and
 /// is latency-bound rather than bandwidth-bound: it measured 270 ms/step against a
@@ -6413,7 +6411,7 @@ pub const dequant_q4_0_f16_ptx: [:0]const u8 =
 /// (f16 d + 16 bytes of sign bits, LSB-first), value `bit ? d : -d`. One thread
 /// per output element. b0=W(q1_0), b1=out(f16), u0=count.
 ///
-/// f16 holds `d` exactly — it IS an f16 in the block — so unlike every other
+/// f16 holds `d` exactly, it IS an f16 in the block, so unlike every other
 /// dequant here this conversion is lossless, and the f16 GEMM that follows sees
 /// the same values the CPU path computes with.
 pub const dequant_q1_0_f16_ptx: [:0]const u8 =
@@ -6453,9 +6451,9 @@ pub const dequant_q1_0_f16_ptx: [:0]const u8 =
 /// `(code - 1) * d`. One thread per output element. b0=W(q2_0_g128),
 /// b1=out(f16), u0=count.
 ///
-/// ⚠️ This is the **g128** variant of GGUF type 42 (see `DType.q2_0_g128`);
+/// This is the g128 variant of GGUF type 42 (see `DType.q2_0_g128`);
 /// ggml's own type 42 is g64 and this stride would be wrong for it. There is no
-/// g64 CUDA kernel — `qwen35_cuda` refuses that dtype at load rather than
+/// g64 CUDA kernel, `qwen35_cuda` refuses that dtype at load rather than
 /// silently running this one.
 ///
 /// Like q1_0's, the conversion is lossless in the scale (`d` IS an f16 in the
@@ -6706,18 +6704,18 @@ pub const dequant_q6_k_f16_ptx: [:0]const u8 =
 /// to bring the cuDNN fused-SDPA O (f16) back to the DiT's f32 attention buffer.
 // --- f16 ACTIVATION STORAGE -------------------------------------------------
 //
-// ⚠️ These five are storage-format twins of the kernels above, NOT new maths: each
+// These five are storage-format twins of the kernels above, NOT new maths: each
 // reads and/or writes the big VAE activation buffers as f16 while computing in f32
 // exactly as before. They exist because a 16-channel VAE decoding 1056x1584 needs
-// 256 channels at FULL image resolution — 428M floats, 1.71 GB — in each of two
+// 256 channels at FULL image resolution, 428M floats, 1.71 GB, in each of two
 // buffers, and f32 storage made a whole-image decode cost 4.3 GB.
 //
-// ⚠️ **Range, not precision, is what gates their use.** The activations these hold
+// Range, not precision, is what gates their use. The activations these hold
 // peak around 489 for the Flux/Z-Image VAE and ~7e3 for SD1.5, both far inside
-// f16's 65504 — but SDXL's VAE **residual stream reaches 4.2e5**, which is why
+// f16's 65504, but SDXL's VAE residual stream reaches 4.2e5, which is why
 // `sd_vae.Config.act_f16` is off there. See `sd_vae_cuda.decode`.
 
-/// `gn_stats` reading an f16 activation. ⚠️ Welford stays in f32 — see
+/// `gn_stats` reading an f16 activation. Welford stays in f32, see
 /// `ops.norm.groupNorm`: the shifted `E[x²]-E[x]²` form loses catastrophically once
 /// the mean is large relative to the spread, which a late VAE block is.
 /// Diff from `gn_stats`: one load, `*4` -> `*2` + `cvt`.
@@ -6764,7 +6762,7 @@ pub const gn_stats_h16_ptx: [:0]const u8 =
 ;
 
 /// `gn_apply` reading AND writing f16. Weight, bias and the group statistics stay
-/// f32 — they are per-channel, not per-position, so they cost nothing. Diff from
+/// f32, they are per-channel, not per-position, so they cost nothing. Diff from
 /// `gn_apply`: `%rd13` is now a *2 offset (x and out are both f16), one `cvt` in
 /// on the load and one out before the store.
 pub const gn_apply_h16_ptx: [:0]const u8 =
@@ -6859,7 +6857,7 @@ pub const bias_compact_h16_ptx: [:0]const u8 =
     \\}
 ;
 
-/// `im2col_sd` reading an f16 source. ⚠️ The patch it writes stays **f32** — it is
+/// `im2col_sd` reading an f16 source. The patch it writes stays f32, it is
 /// banded (a few MB, `convBand`) so it is not where the memory goes, and leaving it
 /// f32 means the GEMM's own `f32_to_f16_pad2d` and the zero-padding logic are
 /// untouched. Only the gather narrows.
@@ -6992,7 +6990,7 @@ pub const f32_to_f16_ptx: [:0]const u8 =
 
 /// Quantize f32 into ggml q8_0 blocks: one thread per 32-element block.
 /// b0 = src f32, b1 = dst blocks (34 B each), u0 = block count. Per block:
-/// d = absmax/127 stored as f16, q[i] = rni(x[i]/d) as i8 — div.rn + cvt.rni
+/// d = absmax/127 stored as f16, q[i] = rni(x[i]/d) as i8, div.rn + cvt.rni
 /// (round-to-nearest-EVEN) are bit-identical to the host packQ80, so a row
 /// quantized on either side of a CPU-offload split produces the same bytes.
 pub const f32_to_q8_0_ptx: [:0]const u8 =
@@ -7070,12 +7068,12 @@ pub const f32_scale_ptx: [:0]const u8 =
     \\}
 ;
 
-/// Decode-graph state module (CUDA graphs, LLM_PLAN.md M6): the per-token
-/// dynamic values — sampled token id and cache position — live in the
+/// Decode-graph state module (CUDA graphs): the per-token
+/// dynamic values, sampled token id and cache position, live in the
 /// g_state module global instead of kernel parameters, so the captured
 /// decode graph replays unmodified: one 8-byte HtoD + one cuGraphLaunch per
 /// token. Entries mirror their param-driven twins exactly (same math, same
-/// order — byte-identical logits): embed_gather_s replaces the CPU
+/// order, byte-identical logits): embed_gather_s replaces the CPU
 /// embedding gather + upload, rope_half_s takes pos0 from g_state[1],
 /// kv_append_s replaces the KV-append memcpy, attn_split_s is the seq_q=1
 /// flash-decode split with kv_len = g_state[1] + 1. g_state = [token, pos0].
@@ -8002,7 +8000,7 @@ pub const decode_state_ptx: [:0]const u8 =
     \\}
 ;
 
-/// Plain element copy with source/destination element offsets — keeps
+/// Plain element copy with source/destination element offsets, keeps
 /// hidden-state tap snapshots inside a recorded batch (cuMemcpyDtoD runs on
 /// the null stream, which a graph capture rejects and a batch would flush).
 /// b0=src, b1=dst. u0=count, u1=dst offset, u2=src offset.
@@ -8040,7 +8038,7 @@ pub const copy_off_ptx: [:0]const u8 =
 /// elements in the interleaved slice i = chunk, chunk+u2, ... and writes
 /// {count, mean, M2} as three floats.
 ///
-/// ⚠️ Welford, not sum-and-sum-of-squares, for the reason `ops.norm.groupNorm`
+/// Welford, not sum-and-sum-of-squares, for the reason `ops.norm.groupNorm`
 /// spells out: the shifted form loses catastrophically once the mean is large
 /// relative to the spread, which is where a late VAE decoder block sits.
 /// b0=x [n][u1], b3=stats [u0][3].
@@ -8168,7 +8166,7 @@ pub const gn_apply_ptx: [:0]const u8 =
 ;
 
 /// GEGLU: dst[p][j] = src[p][j] * geluErf(src[p][inner+j]). The halves are
-/// (value, gate) in that order and the gate takes the **erf** GELU
+/// (value, gate) in that order and the gate takes the erf GELU
 /// (Abramowitz & Stegun 7.1.26, matching `ops.act.geluErfScalar`); swapping
 /// either is a silent quality loss.
 /// b0=src [n][2*u1], b1=dst [n][u1]. u0=n*u1, u1=inner.
@@ -8238,7 +8236,7 @@ pub const concat_ch_ptx: [:0]const u8 =
     \\}
 ;
 
-/// Non-causal attention where the KEYS ARE A DIFFERENT LENGTH from the queries —
+/// Non-causal attention where the KEYS ARE A DIFFERENT LENGTH from the queries,
 /// the UNet's cross-attention onto the 77-row text conditioning. One thread per
 /// (query, head), online softmax, accumulator in local memory (head_dim <= 256).
 /// Padding K/V out to the query length to reuse `opAttnTC` instead would build an
@@ -8325,12 +8323,12 @@ pub const attn_cross_ptx: [:0]const u8 =
 
 /// The SD family's 3x3 patch matrix. The Wan decoder's `im2col` above covers
 /// stride 1 and the fused nearest-2x upsample; the UNet additionally has
-/// **stride-2** convolutions (LDM's `Downsample`), whose output width is
+/// stride-2 convolutions (LDM's `Downsample`), whose output width is
 /// ceil(w/2) and so cannot be derived by shifting the source width.
 /// b0=src [h*w][ci], b1=patches [bn][9*ci].
 /// u0=bn*patch_len, u1=patch_len, u2=ci, u3=src w, u4=src h, u5=band start.
 /// f0 = sampling mode (0 stride 1, 1 fused 2x upsample, 2 stride 2);
-/// f1 = OUT width, as raw u32 bits — this signature has no u6.
+/// f1 = OUT width, as raw u32 bits, this signature has no u6.
 pub const im2col_sd_ptx: [:0]const u8 =
     \\.version 8.0
     \\.target sm_86
@@ -8453,7 +8451,7 @@ pub const head_unpad_ptx: [:0]const u8 =
 /// Broadcast a per-channel vector over positions: dst[p][c] += bias[u3 + c].
 /// This is how the CUDA UNet applies a ResBlock's timestep-embedding projection.
 /// The Vulkan path instead FOLDS the projection into the convolution's bias,
-/// which is exact and costs no extra pass — but that needs a device-resident
+/// which is exact and costs no extra pass, but that needs a device-resident
 /// GEMM bias, and the CUDA GEMM entry points take a host slice. One
 /// read-modify-write of the activation per ResBlock is ~2% of it, so the simpler
 /// arm is the right trade here rather than reworking the bias plumbing.
@@ -8482,11 +8480,11 @@ pub const add_bias_rows_ptx: [:0]const u8 =
     \\}
 ;
 
-// ⚠️ **Every PTX string in this file must be pure ASCII**, comments included:
+// Every PTX string in this file must be pure ASCII, comments included:
 // `ptxas` rejects the whole module with `Unexpected non-ASCII character
 // encountered on line N` and the model then dies at PTX-JIT time on a GPU box,
 // far from the edit. A stray Sigma or em-dash in a `//` comment is enough, and
-// this repo's prose style makes those easy to type — it happened twice while
+// this repo's prose style makes those easy to type, it happened twice while
 // landing `gemv_q2_0_*_q8`.
 //
 // This walks every `*_ptx` declaration, so the failure is caught by the fast CPU

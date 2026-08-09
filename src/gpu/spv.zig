@@ -163,7 +163,7 @@ const op_member_decorate: u16 = 72;
 /// Drop exact-duplicate OpDecorate/OpMemberDecorate instructions. The Zig
 /// backend emits automatic layout decorations for storage structs and our
 /// kernels add the Vulkan-required ones via inline asm, so members end up
-/// decorated twice — invalid SPIR-V that NVIDIA rejects at runtime.
+/// decorated twice, invalid SPIR-V that NVIDIA rejects at runtime.
 pub fn dedupeDecorations(gpa: std.mem.Allocator, spv: []const u8) Error![]align(4) u8 {
     if (spv.len % 4 != 0 or spv.len < 20) return error.InvalidSpirv;
     const n_words = spv.len / 4;
@@ -219,8 +219,8 @@ pub const cap_storage_buffer_16bit: u32 = 4433; // StorageBuffer16BitAccess (nat
 
 /// Inject `caps` (OpCapability) + optional `ext` (OpExtension) into a module so
 /// it can use ops the Zig backend emits via inline asm but never declares
-/// (OpSDot, OpGroupNonUniform*, …). New capability words lead the capability
-/// block; the extension follows it — the order SPIR-V requires (all
+/// (OpSDot, OpGroupNonUniform*, ...). New capability words lead the capability
+/// block; the extension follows it, the order SPIR-V requires (all
 /// capabilities, then extensions, then the rest). Applied per-module so the
 /// shared kernels stay valid on devices lacking the capability.
 pub fn withCapabilities(gpa: std.mem.Allocator, spv: []const u8, caps: []const u32, ext: ?[]const u8) Error![]align(4) u8 {

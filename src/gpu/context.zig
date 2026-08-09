@@ -1,4 +1,4 @@
-//! Vulkan compute context: loads libvulkan at runtime (std.DynLib — no C
+//! Vulkan compute context: loads libvulkan at runtime (std.DynLib, no C
 //! linkage), owns one compute queue on the best available GPU, and executes
 //! the embedded SPIR-V matmul kernels.
 //!
@@ -76,7 +76,7 @@ const tile_n = 8;
 /// Dense-GEMV weight storage dtype. The integer values are the `u4` dtype flag
 /// the gemv_partial / gemv_partial4 kernels branch on; `esize()` is the
 /// per-element byte count weightBuffer transposes with (and picks the matching
-/// transpose pipeline: 1→f8, 2→bf16, 4→f32).
+/// transpose pipeline: 1->f8, 2->bf16, 4->f32).
 pub const WCode = enum(u32) {
     f32 = 0,
     f8 = 1,
@@ -112,7 +112,7 @@ pub const topk_lanes = 1024;
 /// llm.kv_cache.KvDtype). q8_0 is the ggml 34-byte block (f16 scale + 32 i8).
 pub const KvFmt = enum { f32, f16, q8_0 };
 
-/// Reduction widths with a FUSED int8 prep kernel. ⚠️ Every convrot `cols` a model's
+/// Reduction widths with a FUSED int8 prep kernel. Every convrot `cols` a model's
 /// device GEMMs use should appear here or that prep silently takes the 3-pass fallback,
 /// which round-trips a full f32 copy of the activation through global memory. krea2 needs
 /// 6144 and 16384; Anima needs 2048 (`dim`) and 8192 (`mlp_dim`).
@@ -232,7 +232,7 @@ const elt_entry_sizes = [_]EntrySize{
     // CLIP's text tower (`clip_text_gpu`): causal self-attention batched over prompt
     // chunks, and the two GELU forms its two towers use. Appended rather than grouped
     // with their non-causal siblings above because `Elt` is indexed by
-    // `@intFromEnum` into this table — inserting mid-list silently renames kernels.
+    // `@intFromEnum` into this table, inserting mid-list silently renames kernels.
     .{ .name = "attn_causal_batched", .x = 64, .y = 1 },
     .{ .name = "gelu_quick", .x = 256, .y = 1 },
     .{ .name = "gelu_erf", .x = 256, .y = 1 },
@@ -271,7 +271,7 @@ pub const Error = error{
     NoSuitableDevice,
     VulkanFailed,
     /// Device allocation failed even after evicting every cached weight
-    /// buffer — the working set genuinely doesn't fit.
+    /// buffer, the working set genuinely doesn't fit.
     DeviceOutOfMemory,
     OutOfMemory,
     /// A GGUF block-quant dtype without a Vulkan GEMV kernel yet.
@@ -279,7 +279,7 @@ pub const Error = error{
 } || spv.Error;
 
 /// Patch a Zig-emitted kernel into strict-Vulkan shape (LocalSize per entry,
-/// logical addressing, no workgroup ArrayStrides — see spv.zig) and create
+/// logical addressing, no workgroup ArrayStrides, see spv.zig) and create
 /// the module. All listed entry points get the same workgroup size.
 const EntrySize = struct { name: []const u8, x: u32, y: u32 };
 
@@ -332,8 +332,8 @@ fn check(r: vk.Result) Error!void {
 /// Create a compute pipeline for a cooperative-matrix kernel, pinning the
 /// subgroup size when the device needs it. The coopmat SPIR-V assumes
 /// warp == subgroup == 32 lanes (every coop kernel declares `LocalSize 32,
-/// NWARPS, 1`). On a device whose native subgroup size isn't 32 — AMD RADV
-/// runs wave64 — the cooperative-matrix operands span the wrong lanes and the
+/// NWARPS, 1`). On a device whose native subgroup size isn't 32, AMD RADV
+/// runs wave64, the cooperative-matrix operands span the wrong lanes and the
 /// GEMM silently produces all zeros. `coop_sg` is 32 there (and the pipeline
 /// gets a RequiredSubgroupSize create-info via VK_EXT_subgroup_size_control,
 /// core 1.3); it is null on wave32 devices (e.g. NVIDIA), leaving the created
@@ -470,8 +470,8 @@ pub const Context = struct {
     budget_override: u64 = 0,
     /// First-touch weight pinning: newly cached weights are pinned (immune to
     /// eviction) until their total reaches this cap; later weights stream.
-    /// For a fixed repeating walk (LLM decode) this turns the LRU cliff —
-    /// where any cap below full residency re-uploads EVERYTHING — into cost
+    /// For a fixed repeating walk (LLM decode) this turns the LRU cliff,
+    /// where any cap below full residency re-uploads EVERYTHING, into cost
     /// proportional to the streamed fraction. 0 = off. Must stay off for the
     /// diffusion pipeline: first-touch would pin the single-use text encoder
     /// and stream the whole DiT.
@@ -505,8 +505,8 @@ pub const Context = struct {
     fence: vk.Fence,
 
     /// Batch recording: while active, op* dispatches are recorded into `cmd`
-    /// — one descriptor set per op from the preallocated ring, a global
-    /// compute->compute barrier between dispatches — and submitted once at
+    /// one descriptor set per op from the preallocated ring, a global
+    /// compute->compute barrier between dispatches, and submitted once at
     /// endBatch, so the queue stays fed and per-op fence waits disappear.
     batch_pool: vk.DescriptorPool,
     batch_sets: []vk.DescriptorSet,
@@ -536,16 +536,16 @@ pub const Context = struct {
     pipeline_layout_e: vk.PipelineLayout,
     shader_e: vk.ShaderModule,
     pipes_e: [elt_entry_sizes.len]vk.Pipeline,
-    /// int8 dp4a block-quant decode GEMV — present iff the device supports
+    /// int8 dp4a block-quant decode GEMV, present iff the device supports
     /// VK_KHR_shader_integer_dot_product. Pipelines: [0] quant_act_i8,
     /// [1] gemv_q8_0_dp4a, [2] gemv_iq4_nl_dp4a.
     has_int_dot: bool = false,
     shader_dp4a: vk.ShaderModule = .null_handle,
     /// [0] quant_act_i8, [1] gemv_repack_dp4a, [2] dequant_repack_f32,
     /// [3] gemv_q8_0_sg_dp4a, [4] gemv_iq4_nl_sg_dp4a (cooperative dp4a: raw
-    /// weight + subgroup reduce, no repack — need GroupNonUniform caps too),
+    /// weight + subgroup reduce, no repack, need GroupNonUniform caps too),
     /// [5] gemv_q8_0_t_dp4a, [6] gemv_iq4_nl_t_dp4a (dp4a over the _t layout +
-    /// k-split — repack-dp4a speed, no int8 repack / no extra VRAM).
+    /// k-split, repack-dp4a speed, no int8 repack / no extra VRAM).
     pipe_dp4a: [7]vk.Pipeline = @splat(.null_handle),
     /// Subgroup-cooperative kernels (kernels/subgroup.zig): reductions done
     /// within a subgroup, no workgroup storage (the NVIDIA-safe escape hatch).
@@ -597,7 +597,7 @@ pub const Context = struct {
     /// f16-shared-memory kernel. Two builds: cols=6144 (qkv/wo/mlp-gu) and
     /// cols=16384 (mlp.down). Replaces the 3-pass chain + its xr round-trip.
     /// Fused int8 prep (rotate + rowmax + quantize in one kernel), one build per
-    /// reduction width — the FWHT is unrolled for a fixed `cols`. Indexed by
+    /// reduction width, the FWHT is unrolled for a fixed `cols`. Indexed by
     /// `i8_prep_cols`; `.null_handle` for a width with no build, which falls back to the
     /// width-general 3-pass chain.
     shader_i8_prep: [i8_prep_cols.len]vk.ShaderModule = @splat(.null_handle),
@@ -662,7 +662,7 @@ pub const Context = struct {
     /// fused-rescale GEMM (rebuilt per GEMM by scale_concat; batch-safe).
     i8_scalecat: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
     /// Transient k-major int8 form of a packed W4A8 weight (`w4a8Decode`): one buffer
-    /// at the model's widest weight, reused by every GEMM. Transient on purpose — a
+    /// at the model's widest weight, reused by every GEMM. Transient on purpose, a
     /// resident int8 copy of krea2 is 12.2 GB against 6.1 GB packed.
     w4a8_t: DeviceBuffer = .{ .buf = .null_handle, .mem = .null_handle, .size = 0 },
     /// Transient k-major int8 form of a nibble-packed int4-convrot weight (`i4Decode`).
@@ -815,7 +815,7 @@ pub const Context = struct {
 
         // The coop kernels are authored for a fixed subgroup width
         // (coopmat.subgroup_lanes = 32; see there). We query the device's
-        // *native* subgroup size at runtime and adapt — nothing is hardcoded
+        // *native* subgroup size at runtime and adapt, nothing is hardcoded
         // per GPU; the only constant is the kernels' own width, and every
         // decision is driven by the queried native size and the device's
         // advertised [min,max] pinnable range:
@@ -902,7 +902,7 @@ pub const Context = struct {
 
         // storageBuffer16BitAccess: needed by the aligned-u16 dp4a GEMV kernels
         // (they read quant blocks as native 16-bit words instead of assembling
-        // from u32). Query support before enabling — turning on an unsupported
+        // from u32). Query support before enabling, turning on an unsupported
         // feature would fail CreateDevice and break ALL Vulkan. Only used by the
         // dp4a path, so only queried when has_int_dot.
         var has_16bit = false;
@@ -1185,8 +1185,8 @@ pub const Context = struct {
         // dp4a int8 decode GEMV (block-quant): a SEPARATE module so the injected
         // DotProduct capability never touches the shared eltwise module (which
         // must stay valid where integer dot product is absent). Reuses the
-        // eltwise 4-buffer set layout + push range. Any failure — an invalid
-        // patched module, missing pipeline — degrades to the scalar GEMV rather
+        // eltwise 4-buffer set layout + push range. Any failure, an invalid
+        // patched module, missing pipeline, degrades to the scalar GEMV rather
         // than failing device bring-up.
         var shader_dp4a: vk.ShaderModule = .null_handle;
         var pipe_dp4a: [7]vk.Pipeline = @splat(vk.Pipeline.null_handle);
@@ -1204,7 +1204,7 @@ pub const Context = struct {
                 .{ .name = "gemv_q8_0_t_dp4a", .x = 256, .y = 1 },
                 .{ .name = "gemv_iq4_nl_t_dp4a", .x = 256, .y = 1 },
             };
-            // StorageBuffer16BitAccess only when supported — the aligned-u16 dp4a
+            // StorageBuffer16BitAccess only when supported, the aligned-u16 dp4a
             // GEMV kernels use it; the module carries u16 storage regardless, so
             // on a device without it the module build fails and block-quant
             // decode falls back to the scalar GEMV (graceful, exotic devices only).
@@ -1241,8 +1241,8 @@ pub const Context = struct {
 
         // Subgroup-cooperative kernel module (kernels/subgroup.zig): reductions
         // WITHIN a subgroup via OpGroupNonUniform*, needing no workgroup storage
-        // class — the verified escape hatch from the NVIDIA hang on Zig-emitted
-        // workgroup memory (VULKAN_MEMORY.md). Subgroup arithmetic is core
+        // class, the verified escape hatch from the NVIDIA hang on Zig-emitted
+        // workgroup memory. Subgroup arithmetic is core
         // Vulkan 1.1: only the module capabilities are injected, no extension
         // and no device feature. Independent of has_int_dot. A failure here just
         // leaves the subgroup pipelines null (callers fall back to the multi-pass
@@ -1254,7 +1254,7 @@ pub const Context = struct {
                 .{ .name = "subgroup_sum", .x = 32, .y = 1 },
                 .{ .name = "rmsnorm_sg", .x = 32, .y = 1 },
                 // gemv_*_sg: 256-thread workgroups = 8 subgroups each (one row
-                // per subgroup, row = gid/32) so the SM stays occupied — a
+                // per subgroup, row = gid/32) so the SM stays occupied, a
                 // 32-thread (1-warp) workgroup runs at ~1/8 occupancy.
                 .{ .name = "gemv_q8_0_sg", .x = 256, .y = 1 },
                 .{ .name = "gemv_q4_k_sg", .x = 256, .y = 1 },
@@ -1264,7 +1264,7 @@ pub const Context = struct {
                 // attn_decode_sg: one subgroup (=1 wg) per head; big acc[] per
                 // lane, so keep 1 subgroup/wg (not 8) to limit register pressure.
                 .{ .name = "attn_decode_sg", .x = 32, .y = 1 },
-                // ln_mod_sg: one row per subgroup, 8 subgroups per workgroup —
+                // ln_mod_sg: one row per subgroup, 8 subgroups per workgroup,
                 // same reasoning as the gemv_*_sg entries above.
                 .{ .name = "ln_mod_sg", .x = 256, .y = 1 },
             };
@@ -1864,7 +1864,7 @@ pub const Context = struct {
         return .{ .buf = buf, .mem = mem, .size = size };
     }
 
-    /// Central device-buffer free — keeps `device_used` honest. All
+    /// Central device-buffer free, keeps `device_used` honest. All
     /// DeviceBuffer teardown must route through here.
     fn freeDeviceBuffer(self: *Context, db: DeviceBuffer) void {
         self.d.DestroyBuffer(self.device, db.buf, null);
@@ -1924,7 +1924,7 @@ pub const Context = struct {
     /// Device-local weight buffer in the transposed k-major layout
     /// (element (k, col) at k * w_stride + col, w_stride = align(rows, tile_n)),
     /// uploaded once and cached by host pointer. The raw bytes are DMA'd as-is
-    /// and transposed on the GPU (kernels/transpose.zig) — no CPU-side work
+    /// and transposed on the GPU (kernels/transpose.zig), no CPU-side work
     /// beyond the staging memcpy.
     fn weightBuffer(self: *Context, bytes: []const u8, esize: u64, rows: usize, cols: usize) Error!vk.Buffer {
         const key = @intFromPtr(bytes.ptr);
@@ -2029,7 +2029,7 @@ pub const Context = struct {
     }
 
     /// Like weightBuffer, but uploads the bytes VERBATIM (no k-major transpose)
-    /// — for GGUF block-quant weights whose row-major block layout the quant
+    /// for GGUF block-quant weights whose row-major block layout the quant
     /// GEMV kernels read directly. Cached by host pointer, same residency.
     fn weightBufferRaw(self: *Context, bytes: []const u8) Error!vk.Buffer {
         const key = @intFromPtr(bytes.ptr);
@@ -2072,7 +2072,7 @@ pub const Context = struct {
     /// (row/32)*row_bytes*32 + row%32). The bytes are unchanged (bit-identical
     /// dequant); only their order changes. Cached by host pointer (one-time).
     /// The transpose runs ON THE GPU (transpose_grp32): the raw weight streams
-    /// to a device scratch, then one compute pass writes the grouped layout —
+    /// to a device scratch, then one compute pass writes the grouped layout,
     /// replacing the single-thread ~8 GiB CPU byte-scatter (the cold-start
     /// bottleneck). Rows are padded up to a multiple of 32; the pad slots are
     /// zeroed by the kernel (out-of-range rows contribute 0) and never read.
@@ -2176,7 +2176,7 @@ pub const Context = struct {
     /// decode GEMV + prefill dequant read (see dp4a.zig / repack_* kernels):
     /// four consecutive quant int8 per u32, 32 rows interleaved, plus an f32
     /// row-scale per block; the iq4_nl codebook is pre-applied. Uploads the raw
-    /// weight to a device scratch, then one GPU repack pass — like
+    /// weight to a device scratch, then one GPU repack pass, like
     /// weightBufferRawT. Cached by host pointer. Larger than the source (int8 vs
     /// packed nibbles for iq4_nl), so only built when the dp4a path is active.
     fn weightBufferRepacked(self: *Context, dt: @import("tp_core").dtype.DType, bytes: []const u8, rows: usize, cols: usize) Error!vk.Buffer {
@@ -2278,7 +2278,7 @@ pub const Context = struct {
         }
         // Grow with slack to avoid realloc churn, but don't power-of-two
         // round large buffers: a 722 MB activation plane would jump to
-        // 1 GiB, wasting ~40% of VRAM per buffer — invisible on an empty
+        // 1 GiB, wasting ~40% of VRAM per buffer, invisible on an empty
         // card, fatal when another process holds most of it. Pow2 stays for
         // small buffers (cheap, avoids churn); large ones round to 8 MiB.
         const min_sz = @max(size, 1 << 16);
@@ -2644,7 +2644,7 @@ pub const Context = struct {
     pub const attn_decode_nsplit = 64;
 
     /// Causal GQA decode attention (one query), flash-split across nsplit kv
-    /// chunks then merged — parallelizes the naive one-thread-per-head kernel.
+    /// chunks then merged, parallelizes the naive one-thread-per-head kernel.
     /// `scratch` holds n_heads*attn_decode_nsplit*(head_dim+2) f32 partials.
     /// `window` (> 0) restricts to the last `window` keys; `ring` (> 0) enables
     /// sliding-window ring addressing (KV storage row = pos%ring, gemma3 LOCAL
@@ -2682,7 +2682,7 @@ pub const Context = struct {
     }
 
     /// Folded flash-decode GQA attention (f32 KV): one subgroup per head, the
-    /// 32-way KV split + online-softmax merge done in-subgroup — no scratch, no
+    /// 32-way KV split + online-softmax merge done in-subgroup, no scratch, no
     /// separate merge dispatch (vs opAttnDecodeQ35's dsplit+dmerge). Same
     /// semantics: window/ring/kv_end as there. Requires hasAttnDecodeSg().
     pub fn opAttnDecodeSg(self: *Context, q: DeviceBuffer, k_cache: DeviceBuffer, v_cache: DeviceBuffer, out: DeviceBuffer, n_heads: usize, n_kv: usize, head_dim: usize, kv_len: usize, scale: f32, window: usize, ring: usize, kv_end: usize) Error!void {
@@ -2722,7 +2722,7 @@ pub const Context = struct {
 
     /// Quantize-store `n` f32 K/V elements from `src` (+`src_off` elems) into
     /// the q8_0 block cache `dst` at element offset `dst_off`: one thread per
-    /// PAIR of 32-element blocks (a lone 34-byte block ends mid-word — see
+    /// PAIR of 32-element blocks (a lone 34-byte block ends mid-word, see
     /// kv_store_q8_0 in eltwise.zig). `n` and `dst_off` must be multiples of
     /// 64 (kv_dim always is).
     pub fn opStoreKvQ8(self: *Context, dst: DeviceBuffer, dst_off: usize, src: DeviceBuffer, src_off: usize, n: usize) Error!void {
@@ -2822,7 +2822,7 @@ pub const Context = struct {
         scale: f32,
     ) Error!void {
         std.debug.assert(m_pad % 128 == 0);
-        // Two dependent recorded ops — must not sit inside an `independent`
+        // Two dependent recorded ops, must not sit inside an `independent`
         // group, which would elide the barrier between them.
         std.debug.assert(self.indep_remaining == 0);
         try self.ensureDeviceBuffer(&self.x_h16, m_pad * cols * 2);
@@ -2839,7 +2839,7 @@ pub const Context = struct {
     /// Tensor-core GEMM whose f16 activations were already produced (the
     /// fused gate kernels fold the weight scale in themselves): just the
     /// coop dispatch on the cached raw fp8 weights. With `c16` the C tile
-    /// stores half-precision (y is an f16 buffer) — exact under f16
+    /// stores half-precision (y is an f16 buffer), exact under f16
     /// accumulators; callers must check pipe_coop_c16 exists.
     pub fn opMatmulCoopH16(
         self: *Context,
@@ -2869,7 +2869,7 @@ pub const Context = struct {
 
     /// Raw int8 tensor-core GEMM: `y(s32)[m_pad][rows] = x(s8)[m_pad][cols] @ W^T`,
     /// where `w_bytes` is the raw int8 weight [rows][cols] (transposed to k-major
-    /// on upload, cached by pointer — same 1-byte path as fp8). No dequant scale
+    /// on upload, cached by pointer, same 1-byte path as fp8). No dequant scale
     /// here; the caller scales the s32 result by act/weight per-row scales.
     /// `x_i8` is row-major s8 [m_pad][cols]; `y` holds m_pad*rows s32.
     /// m_pad/rows multiples of 16, cols a multiple of 32.
@@ -2911,7 +2911,7 @@ pub const Context = struct {
         try self.opEnd();
     }
 
-    /// Stage A: shared int8 GEMM with fused rescale — `y(f32)[m_pad][rows] =
+    /// Stage A: shared int8 GEMM with fused rescale, `y(f32)[m_pad][rows] =
     /// (x @ W^T) * act_scale[row] * weight_scale[col]` in one kernel (no s32 acc
     /// buffer, no scale_i32 pass). `scale_buf` holds [act(m_pad) | weight(rows)]
     /// f32 (act at index 0, weight at index m_pad). Shape must fit the shared
@@ -3023,14 +3023,14 @@ pub const Context = struct {
     /// GEMM's own k-major layout in a reusable scratch (one recorded dispatch), then run
     /// the ordinary int8 GEMM on that.
     ///
-    /// ⚠️ **Keeping the packed form resident is the point** — a decoded krea2 is 12.2 GB
+    /// Keeping the packed form resident is the point, a decoded krea2 is 12.2 GB
     /// of int8 against 6.1 GB packed, which is the whole difference between this format
-    /// and int8 — so the int8 form is transient and re-decoded per GEMM. ComfyUI's own
+    /// and int8, so the int8 form is transient and re-decoded per GEMM. ComfyUI's own
     /// Triton and CUDA backends do the same.
     ///
-    /// ⚠️ ONE scratch serves every GEMM, so the decode must stay ordered with respect to
+    /// ONE scratch serves every GEMM, so the decode must stay ordered with respect to
     /// the GEMM consuming the previous one. Both are recorded through `opElt`/`opBegin`,
-    /// which insert the batch's write→read barrier, so a plain sequence is safe — but do
+    /// which insert the batch's write->read barrier, so a plain sequence is safe, but do
     /// NOT put a group of these inside `ctx.independent(...)`.
     pub fn opI8GemmW4A8(
         self: *Context,
@@ -3066,16 +3066,16 @@ pub const Context = struct {
 
     /// Decode a packed W4A8 weight into `self.w4a8_t` (k-major int8) and return it.
     ///
-    /// ⚠️ **Both inputs go through `weightBuffer`, i.e. they are BYTE-TRANSPOSED once at
-    /// load and cached**, exactly like a dense weight. That is a performance requirement,
+    /// Both inputs go through `weightBuffer`, i.e. they are BYTE-TRANSPOSED once at
+    /// load and cached, exactly like a dense weight. That is a performance requirement,
     /// not tidiness: decoding straight from the row-major storage means transposing per
-    /// GEMM, and the strided side of that measured **1757 ms/step against a ~20 ms
-    /// bandwidth roof** (a warp's 32 lanes land in 32 separate sectors per load).
+    /// GEMM, and the strided side of that measured 1757 ms/step against a ~20 ms
+    /// bandwidth roof (a warp's 32 lanes land in 32 separate sectors per load).
     /// Pre-transposing costs the same one-time pass every other weight already pays and
     /// leaves every stream in the per-GEMM decode coalesced.
     ///
     /// The transposed shapes are `[cols/2][stride]` packed and `[cols/group_size][stride]`
-    /// fp8, with the SAME `stride = align(rows, tile_n)` as the GEMM's own weight layout —
+    /// fp8, with the SAME `stride = align(rows, tile_n)` as the GEMM's own weight layout,
     /// which is what lets one thread index all three by the same row-quad offset.
     pub fn w4a8Decode(
         self: *Context,
@@ -3117,7 +3117,7 @@ pub const Context = struct {
     }
 
     /// Bytes of k-major int8 scratch an int4 weight of this shape decodes into. Identical
-    /// to `w4a8ScratchBytes` — the decoded form is the same int8 either format produces.
+    /// to `w4a8ScratchBytes`, the decoded form is the same int8 either format produces.
     pub fn i4ScratchBytes(rows: usize, cols: usize) usize {
         return std.mem.alignForward(usize, rows, tile_n) * cols;
     }
@@ -3125,10 +3125,10 @@ pub const Context = struct {
     /// Unpack a nibble-packed int4-convrot weight into `self.i4_t` (k-major int8) and return
     /// it, for `opI8GemmBuf` to consume with the weight's per-row scale.
     ///
-    /// ⚠️ **The packed form stays resident**, which is the whole point: widening at load put
-    /// a full int8 copy in VRAM (1778 MB against this path's ~1050 on `terraRising`) for
-    /// weights that are 4-bit on disk. Same trade `w4a8Decode` already makes, and the two
-    /// share the pre-transposed `weightBuffer` input path.
+    /// The packed form stays resident, which is the whole point: widening at load keeps
+    /// a full int8 copy in VRAM for weights that are 4-bit on disk, measured at 1778 MB
+    /// against this path's ~1050 on a 2B trunk. Same trade `w4a8Decode` makes, and the
+    /// two share the pre-transposed `weightBuffer` input path.
     pub fn i4Decode(self: *Context, packed_bytes: []const u8, rows: usize, cols: usize) Error!vk.Buffer {
         std.debug.assert(packed_bytes.len == rows * cols / 2);
         const stride = std.mem.alignForward(usize, rows, tile_n);
@@ -3158,7 +3158,7 @@ pub const Context = struct {
             .mem = .null_handle,
             .size = 0,
         };
-        // Stage A: fused rescale — assemble [act(m_pad) | weight(rows)] into one
+        // Stage A: fused rescale, assemble [act(m_pad) | weight(rows)] into one
         // scale buffer (batch-barrier-safe scale_concat dispatch) and run the
         // GEMM that stores y directly (f16 if c_h16), no s32 acc / scale_i32 pass.
         if (self.pipe_coop_i8_fs != .null_handle and
@@ -3268,7 +3268,7 @@ pub const Context = struct {
             self.d.FreeMemory(self.device, db.mem, null);
         }
         // Chunked staging upload + visibility barrier (same recipe as
-        // weightBuffer, minus the transpose — the layout is built on the CPU).
+        // weightBuffer, minus the transpose, the layout is built on the CPU).
         const cb = self.nowCmd();
         const chunk: u64 = 256 << 20;
         const mapped = try self.ensureHostBuffer(&self.staging, @min(bytes.len, chunk));
@@ -3299,7 +3299,7 @@ pub const Context = struct {
     /// bf16 DiT checkpoint) and the bf16 -> f16 conversion + k-major transpose
     /// runs ON THE GPU (bf16_to_f16_coopw): raw bf16 streams to the device once,
     /// then one compute dispatch produces the [k_pad][n_pad] f16 layout the
-    /// f16-weight coop GEMM reads — no single-threaded CPU conversion loop (the
+    /// f16-weight coop GEMM reads, no single-threaded CPU conversion loop (the
     /// bottleneck when a >VRAM model re-streams weights every step). f16 keeps
     /// more mantissa bits than bf16, so the round trip is near-lossless for the
     /// < 1 weight range. Cached by host pointer, same residency accounting.
@@ -3423,12 +3423,12 @@ pub const Context = struct {
     /// cast and the GEMM result multiplied back afterwards (the bias is added after
     /// the unscale, so it is passed unscaled). `act_div = 1.0` is `opMatmulCoopF16W`.
     ///
-    /// ⚠️ f16's 65504 ceiling is reachable on real checkpoints: an SDXL VAE
+    /// f16's 65504 ceiling is reachable on real checkpoints: an SDXL VAE
     /// decoder's residual stream measures ~4.2e5, so the cast alone produced `inf`,
     /// the next GroupNorm turned that into NaN through its mean, and every SDXL
     /// render at 512² or larger came out solid white with no error. A power-of-two
     /// divisor makes the correction exact (it shifts the exponent only, and f16
-    /// keeps all 11 mantissa bits) and free — both halves ride in kernels that
+    /// keeps all 11 mantissa bits) and free, both halves ride in kernels that
     /// already touch every element. See `sd_vae_gpu`'s `residual_act_div`.
     pub fn opMatmulCoopF16WScaled(
         self: *Context,
@@ -3446,7 +3446,7 @@ pub const Context = struct {
     }
 
     /// `opMatmulCoopF16WScaled` with f16 activation storage selectable on either
-    /// side — see `coopF16WDispatch`.
+    /// side, see `coopF16WDispatch`.
     pub fn opMatmulCoopF16WPrec(
         self: *Context,
         y: DeviceBuffer,
@@ -3466,12 +3466,12 @@ pub const Context = struct {
         return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, false, act_div, src_f16, dst_f16);
     }
 
-    /// `opMatmulCoopF16W` with a **device-resident** bias, for the SD UNet's
+    /// `opMatmulCoopF16W` with a device-resident bias, for the SD UNet's
     /// ResBlocks: their convolution bias has the timestep-embedding projection
     /// folded into it, so it changes every forward and cannot go through the
     /// pointer-keyed `smallBuffer` cache (see `coopF16WDispatch`). Folding rather
-    /// than adding is exact — the projection is a per-channel constant over
-    /// positions, which is what a conv bias already is — and it saves a full
+    /// than adding is exact, the projection is a per-channel constant over
+    /// positions, which is what a conv bias already is, and it saves a full
     /// read-modify-write pass over the activation per ResBlock.
     pub fn opMatmulCoopF16WDev(
         self: *Context,
@@ -3493,7 +3493,7 @@ pub const Context = struct {
     /// Same f16-weight tensor-core GEMM as opMatmulCoopF16W, but the weight is a
     /// raw bf16 tensor (a dense bf16 DiT block linear). bf16 -> f16 conversion
     /// happens once at upload (weightBufferF16FromBf16, cached); everything else
-    /// — f16 activations, coop dispatch, bias-compact — is identical, so the
+    /// f16 activations, coop dispatch, bias-compact, is identical, so the
     /// f32 output matches opMatmulCoop's contract and the bf16 DiT can reuse the
     /// backend's f32-operand attention/mlp path unchanged.
     pub fn opMatmulCoopF16Wb(
@@ -3512,15 +3512,15 @@ pub const Context = struct {
         return self.coopF16WDispatch(y, y_off, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, false, 1.0, false, false);
     }
 
-    /// Same f16-weight tensor-core GEMM again, but the weight is a raw **f16**
-    /// tensor — the dtype most SD-family checkpoints ship their UNet linears in
+    /// Same f16-weight tensor-core GEMM again, but the weight is a raw f16
+    /// tensor, the dtype most SD-family checkpoints ship their UNet linears in
     /// (`sd_unet`'s loader keeps every weight in its checkpoint dtype so a
     /// quantized UNet still runs and `ops.matmul.probe` can attribute the GEMM).
     ///
     /// It reuses the *bf16* transpose pipeline deliberately: `transpose.bf16_coopw`
     /// copies the 16-bit lanes VERBATIM into the k-major coop layout, so it is a
     /// pure permutation and carries f16 bits just as faithfully as bf16 ones. What
-    /// makes this the f16 arm rather than the bf16 one is the dispatch flag —
+    /// makes this the f16 arm rather than the bf16 one is the dispatch flag,
     /// `bf16_ab = false` converts the activation to f16, so both operands are f16.
     pub fn opMatmulCoopF16Wh(
         self: *Context,
@@ -3540,7 +3540,7 @@ pub const Context = struct {
 
     /// Native bf16 twin of opMatmulCoopF16Wb: the raw bf16 weight is kept bf16
     /// (k-major transpose only) and the activation converts f32 -> bf16, so the
-    /// bf16 tensor cores consume both operands directly — no f16 round trip.
+    /// bf16 tensor cores consume both operands directly, no f16 round trip.
     /// Requires a bf16 cooperative-matrix config (pipe_coop_bf16w).
     pub fn opMatmulCoopBf16(
         self: *Context,
@@ -3572,18 +3572,18 @@ pub const Context = struct {
     /// NVFP4 GEMM: `y[m][rows] f32 = x[m][cols] f32 @ Wᵀ`, W a packed NVFP4 weight.
     ///
     /// Decodes the 4-bit weight to f16 in the GEMM's own `[k_pad][n_pad]` k-major layout
-    /// (one recorded dispatch) and runs the existing f16-weight coop GEMM on it. **The
-    /// 4-bit form stays resident**, which is what NVFP4 is below Blackwell and what
+    /// (one recorded dispatch) and runs the existing f16-weight coop GEMM on it. The
+    /// 4-bit form stays resident, which is what NVFP4 is below Blackwell and what
     /// ComfyUI does there too.
     ///
-    /// ⚠️ Both inputs go through `weightBuffer` — byte-transposed once at load and cached,
+    /// Both inputs go through `weightBuffer`, byte-transposed once at load and cached,
     /// exactly like a dense weight. Not tidiness: the alternative is transposing inside
     /// the per-GEMM decode, whose strided side cost the W4A8 kernel 1757 ms/step before
     /// the same fix. `scales` are already unswizzled by the loader.
     ///
-    /// ⚠️ ONE scratch serves every GEMM, so a decode must stay ordered against the GEMM
+    /// ONE scratch serves every GEMM, so a decode must stay ordered against the GEMM
     /// consuming the previous one. Both are recorded through `opElt`/`opBegin`, which
-    /// insert the batch's write→read barrier — but do NOT put a group of these inside
+    /// insert the batch's write->read barrier, but do NOT put a group of these inside
     /// `independent(...)`.
     pub fn opMatmulNvfp4(
         self: *Context,
@@ -3600,13 +3600,13 @@ pub const Context = struct {
         std.debug.assert(packed_bytes.len == rows * cols / 2);
         std.debug.assert(scales.len == rows * cols / 16);
         const w_buf = try self.nvfp4Decode(packed_bytes, scales, levels, rows, cols);
-        // ⚠️ `bf16_ab = true`: the decode emits bf16 and this converts the ACTIVATION to
-        // match. f16 would clip Z-Image's trunk activations at 65504 and render white —
+        // `bf16_ab = true`: the decode emits bf16 and this converts the ACTIVATION to
+        // match. f16 would clip Z-Image's trunk activations at 65504 and render white,
         // see `ops/nvfp4.zig`.
         return self.coopF16WDispatch(y, 0, x, m, w_buf, rows, cols, try self.smallBuffer(std.mem.sliceAsBytes(bias)), 0, true, 1.0, false, false);
     }
 
-    /// Bytes of bf16 scratch an NVFP4 weight of this shape decodes into — the padded
+    /// Bytes of bf16 scratch an NVFP4 weight of this shape decodes into, the padded
     /// k-major layout `coopF16WDispatch` reads. `dit_gpu` pre-sizes with the max over the
     /// model so `ensureDeviceBuffer` never flushes a recording batch mid-forward.
     pub fn nvfp4ScratchBytes(rows: usize, cols: usize) usize {
@@ -3633,7 +3633,7 @@ pub const Context = struct {
         // The two inputs share `weightBuffer`'s row stride; the output has its own.
         const sin = std.mem.alignForward(usize, rows, tile_n);
         std.debug.assert(sin % 4 == 0);
-        // ⚠️ The dispatch covers the OUTPUT's row quads (n_pad), not the inputs' (sin):
+        // The dispatch covers the OUTPUT's row quads (n_pad), not the inputs' (sin):
         // the two paddings differ (128 vs tile_n), and sizing by the input leaves the
         // output's row padding unwritten for the GEMM to read as stale.
         const in_quads = sin / 4;
@@ -3673,10 +3673,10 @@ pub const Context = struct {
         bias_off: usize,
         bf16_ab: bool,
         act_div: f32,
-        /// f16 activation STORAGE on either side. The GEMM is unchanged — it already
+        /// f16 activation STORAGE on either side. The GEMM is unchanged, it already
         /// ran f16 operands with an f32 accumulator; these say only how the caller's
         /// big activation buffers are laid out, which is where a VAE decode's
-        /// gigabytes live. ⚠️ `src_f16` and `act_div != 1` are mutually exclusive:
+        /// gigabytes live. `src_f16` and `act_div != 1` are mutually exclusive:
         /// the divisor exists to bring a value too large for f16 THROUGH the cast,
         /// and an f16 buffer could not have held it in the first place.
         src_f16: bool,
@@ -3743,11 +3743,11 @@ pub const Context = struct {
 
     /// Dequant a block-quant weight into the k-major padded f16 layout the coop
     /// GEMM consumes, returning its device buffer (`self.deq_f16k`). Reads the
-    /// resident 32-row-group transposed weight (weightBufferRawT — the same
+    /// resident 32-row-group transposed weight (weightBufferRawT, the same
     /// buffer the decode GEMV uses, so no second copy), dequants it to f32
     /// row-major (`self.deq_f32`), then repacks to f16 k-major. Both scratches
     /// are reused across a batched prefill; the per-op barriers order each
-    /// weight's dequant→pack→GEMM→(next weight) so the reuse is race-free.
+    /// weight's dequant->pack->GEMM->(next weight) so the reuse is race-free.
     fn quantWeightF16K(self: *Context, dt: @import("tp_core").dtype.DType, w_bytes: []const u8, rows: usize, cols: usize, scale: f32, repacked: bool) Error!vk.Buffer {
         std.debug.assert(cols % 32 == 0);
         try self.ensureDeviceBuffer(&self.deq_f32, rows * cols * 4);
@@ -3816,7 +3816,7 @@ pub const Context = struct {
     /// Run the subgroup-reduce capability probe: dispatch one 32-lane subgroup
     /// summing 32 ones via OpGroupNonUniformFAdd, and return lane 0's result
     /// (32.0 on success). Verifies that a Zig-emitted subgroup-scope kernel
-    /// actually EXECUTES on this device — the escape hatch from the NVIDIA hang
+    /// actually EXECUTES on this device, the escape hatch from the NVIDIA hang
     /// on Zig-emitted workgroup memory. Returns error.VulkanFailed on
     /// DEVICE_LOST (the failure mode), error.VulkanUnavailable if the probe
     /// pipeline didn't build.
@@ -3882,11 +3882,11 @@ pub const Context = struct {
         return self.pipe_sg[8] != .null_handle;
     }
 
-    /// Fused **weightless** LayerNorm + AdaLN modulation over `[rows][dim]`:
+    /// Fused weightless LayerNorm + AdaLN modulation over `[rows][dim]`:
     /// `out = (x - mean) * inv * mod[premul_off + c] + mod[shift_off + c]`. One
     /// subgroup per row, two deviation-based passes (see `ln_mod_sg`).
     ///
-    /// ⚠️ `premul` must already carry the `(1 + scale)` fold — the same convention
+    /// `premul` must already carry the `(1 + scale)` fold, the same convention
     /// `Backend.rmsMod` takes on the CUDA side, so one host-built table serves both
     /// backends. Requires `hasLnModSg()`.
     pub fn opLnModSg(
@@ -3927,7 +3927,7 @@ pub const Context = struct {
     /// Cooperative block-quant decode GEMV: `y[rows] = scale * (dequant(W) @ x)`,
     /// ONE subgroup (32 lanes) per output row over the RAW row-major weight
     /// (weightBufferRaw). Lane l owns element l of each block; a single subgroup
-    /// reduce yields the row dot — same math as opGemvQuant / opGemvQuantT but
+    /// reduce yields the row dot, same math as opGemvQuant / opGemvQuantT but
     /// with no 32-row-group transpose, no dp4a repack, and no partials/combine
     /// pass. Requires hasSubgroupGemv(). a = W (raw), b = x, d = y.
     pub fn opGemvQuantSg(
@@ -3987,7 +3987,7 @@ pub const Context = struct {
     /// `y[rows] = scale * dequant(W) @ x`. Quantizes the activation `x` [cols]
     /// to int8 per 32-block, then dots 4 weight int8 × 4 activation int8 per
     /// hardware dp4a (OpSDot) over the REPACKED int8-interleaved weight (4
-    /// contiguous quants per u32, warp-coalesced — no gather). The int8
+    /// contiguous quants per u32, warp-coalesced, no gather). The int8
     /// activation quant is lossy (per-block scale, like q8_0 KV), so output is
     /// bit-close but not identical to the scalar GEMV. Requires hasIntDot().
     pub fn opGemvDp4a(self: *Context, dt: @import("tp_core").dtype.DType, y: DeviceBuffer, y_off: usize, x: DeviceBuffer, w_bytes: []const u8, scale: f32, rows: usize, cols: usize, nchunk: usize, partials: DeviceBuffer) Error!void {
@@ -4000,7 +4000,7 @@ pub const Context = struct {
         // Quantize the activation: a=x, c=xi8, d=xscale.
         try self.dp4aDispatch(0, x, null, xi8, xsc, .{ .u0 = @intCast(nblk), .u1 = @intCast(cols) }, nblk);
         // dp4a GEMV over the repacked weight: a=repacked, b=xi8, c=xscale,
-        // d=partials → gemv_combine applies the weight scale.
+        // d=partials -> gemv_combine applies the weight scale.
         const w_buf = try self.weightBufferRepacked(dt, w_bytes, rows, cols);
         const w_db: DeviceBuffer = .{ .buf = w_buf, .mem = .null_handle, .size = 0 };
         try self.dp4aDispatch(1, w_db, xi8, xsc, partials, .{
@@ -4020,7 +4020,7 @@ pub const Context = struct {
     /// Cooperative dp4a decode GEMV (q8_0 / iq4_nl): dp4a speed WITHOUT the
     /// repack. Quantizes the activation to int8 per 32-block (quant_act_i8),
     /// then one subgroup per row does OpSDot over the RAW weight quads and a
-    /// single subgroup reduce — no 32-row-group transpose, no repacked weight
+    /// single subgroup reduce, no 32-row-group transpose, no repacked weight
     /// (~2× VRAM), no partials/combine. `y[rows] = scale * (dequant(W) @ x)`,
     /// output bit-close to opGemvDp4a. Requires hasSubgroupDp4a(). Writes y
     /// directly (weight scale folded in via f0). a = raw W, b = xi8, c = xscale.
@@ -4060,10 +4060,10 @@ pub const Context = struct {
 
     /// dp4a decode GEMV over the 32-row-group TRANSPOSED weight (q8_0 / iq4_nl):
     /// repack-dp4a's fast k-split shape, but reading the `_t` layout
-    /// (weightBufferRawT) — so NO int8 repack, no extra VRAM (iq4_nl stays 4-bit,
+    /// (weightBufferRawT), so NO int8 repack, no extra VRAM (iq4_nl stays 4-bit,
     /// half the repack footprint), and it shares the resident `_t` buffer with
     /// the GEMM prefill (no cache collision). Quantizes the activation to int8
-    /// (quant_act_i8), dp4a's the weight quads, k-split partials → gemv_combine.
+    /// (quant_act_i8), dp4a's the weight quads, k-split partials -> gemv_combine.
     /// Output bit-close to opGemvDp4a. Requires hasTransposedDp4a().
     pub fn opGemvQuantTDp4a(self: *Context, dt: @import("tp_core").dtype.DType, y: DeviceBuffer, y_off: usize, x: DeviceBuffer, w_bytes: []const u8, scale: f32, rows: usize, cols: usize, nchunk: usize, partials: DeviceBuffer) Error!void {
         std.debug.assert(self.has_int_dot and cols % 32 == 0);
@@ -4085,7 +4085,7 @@ pub const Context = struct {
         const xsc: DeviceBuffer = .{ .buf = self.dp4a_xscale.buf, .mem = .null_handle, .size = 0 };
         // Quantize the activation: a=x, c=xi8, d=xscale.
         try self.dp4aDispatch(0, x, null, xi8, xsc, .{ .u0 = @intCast(nblk), .u1 = @intCast(cols) }, nblk);
-        // dp4a over _t: a=W(_t), b=xi8, c=xscale, d=partials → gemv_combine scales.
+        // dp4a over _t: a=W(_t), b=xi8, c=xscale, d=partials -> gemv_combine scales.
         const w_buf = try self.weightBufferRawT(w_bytes, row_bytes);
         const w_db: DeviceBuffer = .{ .buf = w_buf, .mem = .null_handle, .size = 0 };
         try self.dp4aDispatch(pipe_idx, w_db, xi8, xsc, partials, .{
@@ -4251,7 +4251,7 @@ pub const Context = struct {
     }
 
     /// Bind the 5 buffers (q,k,v,out,bounds) for `attnBatchedDispatch`. Call
-    /// ONCE before `beginBatch` — the buffers are stable across a forward's
+    /// ONCE before `beginBatch`, the buffers are stable across a forward's
     /// layers, so one persistent descriptor set (no ring) suffices, and updating
     /// it before the batch avoids touching a set referenced by recorded commands.
     /// `bounds` is a device u32[2*total]: bounds[q]=item-start, bounds[total+q]=
@@ -4279,7 +4279,7 @@ pub const Context = struct {
     /// Block-diagonal batched non-causal attention over the buffers last bound by
     /// `attnBatchedBind`: one launch over all total*n_heads (query,head) threads,
     /// each query attending only its own item's key range (from the bounds
-    /// buffer). B× the parallelism of a per-item attention loop — the lever that
+    /// buffer). B× the parallelism of a per-item attention loop, the lever that
     /// fills the GPU for short-sequence encoders.
     pub fn attnBatchedDispatch(self: *Context, total: usize, n_heads: usize, kv_heads: usize, hd: usize, scale: f32) Error!void {
         try self.opBegin();
@@ -4291,7 +4291,7 @@ pub const Context = struct {
         try self.opEnd();
     }
 
-    /// Argmax over `logits` (device [vocab] f32) → token id written as an exact
+    /// Argmax over `logits` (device [vocab] f32) -> token id written as an exact
     /// f32 into out_id[0] (download 4 bytes, not the ~608 KB vocab). Two passes:
     /// `lanes` stride-scanners each find a local max, then one thread reduces
     /// them, tie-breaking to the lowest index (matches sample.argmax). Caller
@@ -4368,8 +4368,8 @@ pub const Context = struct {
         self.small_bufs.clearRetainingCapacity();
     }
 
-    /// Evict cached weights LRU-first — INCLUDING pinned ones (under VAE-decode
-    /// memory pressure the resident DiT pin must yield) — until at least `want`
+    /// Evict cached weights LRU-first, INCLUDING pinned ones (under VAE-decode
+    /// memory pressure the resident DiT pin must yield), until at least `want`
     /// bytes are freed or nothing more is evictable; return the bytes freed.
     /// The "make just enough room, keep the rest resident" counterpart to the
     /// full `evictWeights` nuke: used on a VAE-decode OOM so the untouched
@@ -4414,9 +4414,8 @@ pub const Context = struct {
         // must still yield to what's physically free: another process holding
         // most of the card can leave less than the budget available. Take the
         // min of the two so the budget never over-promises under external
-        // pressure (previously it ignored the live query entirely, which is
-        // why the same budget behaved fine on an empty card and OOM'd when
-        // ~17 GB was held elsewhere).
+        // pressure. Ignoring the live query makes the same budget behave fine on an
+        // empty card and OOM when ~17 GB is held elsewhere.
         const live = self.liveHeadroom();
         if (self.budget_override != 0) {
             return @min(self.budget_override -| self.device_used, live);
@@ -4573,7 +4572,7 @@ pub const Context = struct {
     /// Declare that the next `n` recorded ops are pairwise independent (no
     /// op reads or writes a buffer another op in the group writes): no
     /// barrier is recorded between them, so their dispatches may overlap on
-    /// the device — the tail waves of one fill with the next. One barrier is
+    /// the device, the tail waves of one fill with the next. One barrier is
     /// still recorded after the group's last op. A mid-group flush (ring or
     /// dispatch cap) is harmless: submit-and-wait is a stronger sync than
     /// the elided barrier. Sync (non-batched) mode ignores grouping.
@@ -4711,7 +4710,7 @@ pub const Context = struct {
 // GPU tests run only when a Vulkan device is actually present, and only
 // when opted in via the `testdata/gpu-tests` marker: the NVIDIA 580 driver
 // faults on Zig-emitted workgroup-storage kernels (validator-clean; fine on
-// RADV/llvmpipe), which would kill the test process. See PLAN.md (M9).
+// RADV/llvmpipe), which would kill the test process.
 test "gpu gdn kernels match cpu reference" {
     const gpa = std.testing.allocator;
     std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
@@ -4978,7 +4977,7 @@ test "gpu block-quant gemv matches cpu reference" {
     }
 
     // Cooperative subgroup path (opGemvQuantSg): raw row-major weight, one
-    // subgroup per row, subgroup-reduce — no transpose, no partials. Same CPU
+    // subgroup per row, subgroup-reduce, no transpose, no partials. Same CPU
     // reference. Reuses the raw `ws` buffers (weightBufferRaw keys by host ptr,
     // so it hits the same device upload as opGemvQuant above).
     if (ctx.hasSubgroupGemv()) {
@@ -4997,7 +4996,7 @@ test "gpu block-quant gemv matches cpu reference" {
             }
         }
 
-        // iq4_nl (18 B block, f16 d + 16 nibble bytes) — not in `dts` above.
+        // iq4_nl (18 B block, f16 d + 16 nibble bytes), not in `dts` above.
         const nl = dtypes.DType.iq4_nl;
         const w_nl = try gpa.alloc(u8, nl.storageBytes(rows * cols));
         defer gpa.free(w_nl);
@@ -5095,11 +5094,11 @@ test "gpu block-quant prefill GEMM matches cpu reference" {
             for (0..m) |mi| {
                 // Reference rounds BOTH operands to f16 (as the GPU does: the
                 // pack kernel casts the dequanted weight to f16, f32_to_h16_pad
-                // casts x), so only the f32 accumulation ORDER differs — the
+                // casts x), so only the f32 accumulation ORDER differs, the
                 // dequant math is then checked tightly. (Comparing against a
                 // full-precision dot would fold in f16 input rounding, which on
                 // these ±6 synthetic weights with heavy cancellation is several
-                // % — a precision artifact, not a GEMM error.)
+                // %, a precision artifact, not a GEMM error.)
                 var acc: f64 = 0;
                 for (row_f32, x[mi * cols ..][0..cols]) |wv, xv| {
                     const w16: f32 = @floatCast(@as(f16, @floatCast(wv)));
@@ -5128,7 +5127,7 @@ test "gpu block-quant prefill GEMM matches cpu reference" {
 // per-block int8 quantization the kernel uses (so only f32 accumulation order
 // differs). q8_0 + iq4_nl (the dp4a formats). Skips without integer dot product.
 // Verifies a Zig-emitted subgroup-scope kernel (OpGroupNonUniformFAdd) runs on
-// the device — the escape hatch from the NVIDIA-hangs-on-Zig-workgroup-memory
+// the device, the escape hatch from the NVIDIA-hangs-on-Zig-workgroup-memory
 // issue. One 32-lane subgroup sums 32 ones; every lane must read back 32.0.
 // A hang/reject surfaces as DEVICE_LOST (error), not an infinite loop.
 test "subgroup reduce runs on device" {
@@ -5214,7 +5213,7 @@ test "gpu fused LayerNorm+modulate matches ops.norm.layerNormUnit" {
     var prng = std.Random.DefaultPrng.init(0x11e5);
     const rand = prng.random();
     const eps: f32 = 1e-6;
-    // Anima's own width, a strided tail, and — the case that matters — a row whose
+    // Anima's own width, a strided tail, and, the case that matters, a row whose
     // MEAN dwarfs its spread. That is where the shifted `E[x^2] - E[x]^2` variance
     // catastrophically cancels in f32, and the reason this kernel is two-pass; a
     // mean-0 test alone cannot tell the two forms apart.
@@ -5253,11 +5252,11 @@ test "gpu fused LayerNorm+modulate matches ops.norm.layerNormUnit" {
         defer gpa.free(cpu);
         ops.norm.layerNormUnit(cpu, x, dim, eps);
 
-        // ⚠️ **The reference is f64, and at `bias = 400` that is the whole point.**
+        // The reference is f64, and at `bias = 400` that is the whole point.
         // `layerNormUnit` sums 2048 values near 400 serially in f32, so its own mean
-        // carries ~5e-4 of error — larger than the GPU's, whose per-lane partials then
+        // carries ~5e-4 of error, larger than the GPU's, whose per-lane partials then
         // tree-reduce. Comparing to it would fail the accurate implementation. So both
-        // are scored against f64 and the device is required to be **no worse than** the
+        // are scored against f64 and the device is required to be no worse than the
         // f32 host path: that is the claim that actually distinguishes this two-pass
         // kernel from the shifted `E[x^2]-E[x]^2` form, which cancels catastrophically
         // in exactly this regime and would lose by orders of magnitude.
@@ -5488,7 +5487,7 @@ test "gpu matmul matches cpu reference" {
         // Reference with f16-rounded operands (the kernel's exact regime),
         // f64 accumulation. With f16 ACCUMULATORS (coop_acc_h16) each MMA
         // step rounds the running sum at ~2^-11 relative of its magnitude,
-        // which is bounded by the row's absolute-product sum — this test's
+        // which is bounded by the row's absolute-product sum, this test's
         // random e4m3 bytes drive that into the thousands (measured
         // max_abs ~4 on sums bounded ~6700, i.e. a few f16 ulps), so the
         // gate scales with that bound. The exact rounding depends on the
@@ -5694,7 +5693,7 @@ test "gpu matmul matches cpu reference" {
 // Flash attention (md + out passes) against a CPU reference computed in the
 // kernels' exact regime: f16 Q/K/V, f16-rounded scores, f32 softmax, f16 P.
 //
-// ⚠️ Runs SQUARE and RECTANGULAR. The rectangular arm is what Anima's
+// Runs SQUARE and RECTANGULAR. The rectangular arm is what Anima's
 // cross-attention needs (`seq x 512`), and it is the case that exercises the MD
 // plane stride (push f1): with q_pad > kv_pad the old kernel indexed the MD table
 // by the *key* padded length and every head past the first read another head's
@@ -5709,7 +5708,7 @@ test "flash attention matches reference" {
 
     const cases = [_]struct { q: usize, kv: usize }{
         .{ .q = 200, .kv = 200 }, // square, f1 = 0
-        .{ .q = 300, .kv = 128 }, // q_pad 384 > kv_pad 128 — the MD-stride case
+        .{ .q = 300, .kv = 128 }, // q_pad 384 > kv_pad 128, the MD-stride case
         .{ .q = 130, .kv = 500 }, // and the other way round
     };
     for (cases) |cs| {

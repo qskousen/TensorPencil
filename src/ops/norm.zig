@@ -59,12 +59,12 @@ pub fn layerNorm(out: []f32, x: []const f32, weight: []const f32, bias: []const 
     }
 }
 
-/// LayerNorm with **no learned weight or bias** (`elementwise_affine=False`):
+/// LayerNorm with no learned weight or bias (`elementwise_affine=False`):
 /// out = (x - mean) / sqrt(var + eps), in rows of `dim`. `out` may alias `x`.
 ///
 /// Z-Image's `final_layer.norm_final` is this: the affine part is supplied
 /// separately by the AdaLN modulation that follows, so the norm itself carries no
-/// parameters. Uses the **biased** variance (divide by `n`), like `torch.nn.LayerNorm`.
+/// parameters. Uses the biased variance (divide by `n`), like `torch.nn.LayerNorm`.
 pub fn layerNormUnit(out: []f32, x: []const f32, dim: usize, eps: f32) void {
     std.debug.assert(x.len == out.len);
     std.debug.assert(dim != 0 and x.len % dim == 0);
@@ -130,17 +130,17 @@ test "rmsnorm in place and odd dims" {
 }
 
 /// GroupNorm over channel-last activations: `x` is `[n_positions][channels]`, and
-/// each group of `channels / groups` **adjacent channels** is normalized over its own
-/// mean and variance **across all positions**. `out` may alias `x`.
+/// each group of `channels / groups` adjacent channels is normalized over its own
+/// mean and variance across all positions. `out` may alias `x`.
 ///
 /// This is what every SD-family ResBlock and VAE block runs before its convolution,
-/// and it is the one normalization in this codebase whose statistics are **not**
+/// and it is the one normalization in this codebase whose statistics are not
 /// per-position. RMSNorm and LayerNorm reduce along the row a position owns;
-/// GroupNorm reduces over `h·w·(channels/groups)` values at once. Laying activations
+/// GroupNorm reduces over `h*w*(channels/groups)` values at once. Laying activations
 /// out channel-last therefore makes its access pattern strided, which is why this
 /// takes a whole activation rather than a row.
 ///
-/// ⚠️ **Biased variance, matching `torch.nn.functional.group_norm`** — divide by `n`,
+/// Biased variance, matching `torch.nn.functional.group_norm`, divide by `n`,
 /// never `n − 1`. With 32 groups over a 320-channel 8×8 activation that is 640 values
 /// per group, so the difference is ~0.08% of the variance: far too small to look like
 /// a bug and far too large to leave to chance in a 25-block network.
@@ -210,7 +210,7 @@ const GroupNormCase = struct {
     width: usize,
     groups: usize,
     eps: f32,
-    /// `[h*w][channels]`, channel-last — our layout, not torch's.
+    /// `[h*w][channels]`, channel-last, our layout, not torch's.
     input: []const f32,
     weight: []const f32,
     bias: []const f32,

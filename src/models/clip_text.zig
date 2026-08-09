@@ -1,24 +1,24 @@
-//! CLIP text encoder — the SD-family conditioner (`cond_stage_model` in an LDM
+//! CLIP text encoder, the SD-family conditioner (`cond_stage_model` in an LDM
 //! single-file checkpoint), mirroring `transformers.CLIPTextModel`.
 //!
 //! A plain pre-LN transformer, but four details are load-bearing and each one
 //! produces a *plausible* wrong conditioning rather than an obvious failure:
 //!
-//! 1. **The attention is causal.** A text encoder that reads bidirectionally is a
+//! 1. The attention is causal. A text encoder that reads bidirectionally is a
 //!    different model; every prompt still encodes, and every image still renders.
-//! 2. **The MLP activation is `quick_gelu`** (`x·σ(1.702x)`), not tanh-gelu and not
+//! 2. The MLP activation is `quick_gelu` (`x*σ(1.702x)`), not tanh-gelu and not
 //!    erf-gelu. CLIP-L (SD1.5) uses quick_gelu; CLIP-G (SDXL's second tower) uses
-//!    the erf form — `Config.act` carries which.
-//! 3. **Positions are a learned table**, not RoPE and not sinusoidal, and the table
+//!    the erf form, `Config.act` carries which.
+//! 3. Positions are a learned table, not RoPE and not sinusoidal, and the table
 //!    is exactly `max_positions` long: SD's 77-token window is a property of the
 //!    weights, not a convention we choose.
-//! 4. **The output SD conditions on is `final_layer_norm(x)`** — the last hidden
+//! 4. The output SD conditions on is `final_layer_norm(x)`, the last hidden
 //!    state, layer-normed. Skipping that norm leaves activations off by a scale the
 //!    UNet's cross-attention silently absorbs into softer images.
 //!
 //! Loads from any `WeightStore` and keeps large weights in their checkpoint dtype
 //! (so a quantized text tower runs, and so `ops.matmul.probe` can attribute its
-//! GEMMs — ggufy quantizes this encoder today and could not measure it before).
+//! GEMMs, ggufy quantizes this encoder today and could not measure it before).
 //! The token embedding is the exception: it is a lookup table, never a GEMM, and is
 //! read a row at a time.
 
@@ -46,28 +46,27 @@ pub const Config = struct {
     eos_id: u32,
     /// Which spelling the checkpoint stores this tower under. See `Naming`.
     naming: Naming = .hf,
-    /// Whether a `text_projection` matrix is present — CLIP-G's, which turns its
+    /// Whether a `text_projection` matrix is present, CLIP-G's, which turns its
     /// pooled row into the vector SDXL's `y` carries. CLIP-L has none in SD
     /// checkpoints (nothing consumes it).
     projection: bool = false,
 
     pub const Act = enum { quick_gelu, gelu_erf };
 
-    /// ⚠️ **The two towers of one SDXL checkpoint are stored under different
-    /// conventions**, and this is not a quirk of one file — it is what the ecosystem
+    /// The two towers of one SDXL checkpoint are stored under different
+    /// conventions, and this is not a quirk of one file, it is what the ecosystem
     /// ships, because CLIP-L came through `transformers` and CLIP-G through
     /// `open_clip`:
     ///
-    /// | | `.hf` (CLIP-L) | `.open_clip` (CLIP-G) |
-    /// |---|---|---|
-    /// | block | `encoder.layers.N` | `transformer.resblocks.N` |
-    /// | norms | `layer_norm1` / `layer_norm2` | `ln_1` / `ln_2` |
-    /// | MLP | `mlp.fc1` / `mlp.fc2` | `mlp.c_fc` / `mlp.c_proj` |
-    /// | q/k/v | three `self_attn.{q,k,v}_proj` | **one fused `attn.in_proj_weight`** |
-    /// | positions | `embeddings.position_embedding.weight` | `positional_embedding` |
-    /// | final norm | `final_layer_norm` | `ln_final` |
+    ///     name          .hf (CLIP-L)                     .open_clip (CLIP-G)
+    ///     block         encoder.layers.N                 transformer.resblocks.N
+    ///     norms         layer_norm1 / layer_norm2        ln_1 / ln_2
+    ///     MLP           mlp.fc1 / mlp.fc2                mlp.c_fc / mlp.c_proj
+    ///     q/k/v         three self_attn.{q,k,v}_proj     one fused attn.in_proj_weight
+    ///     positions     embeddings.position_embedding    positional_embedding
+    ///     final norm    final_layer_norm                 ln_final
     ///
-    /// The fused `[3·hidden, hidden]` matrix is the load-bearing difference: q, k and v
+    /// The fused `[3*hidden, hidden]` matrix is the load-bearing difference: q, k and v
     /// are its three row blocks, in that order.
     pub const Naming = enum { hf, open_clip };
 
@@ -124,14 +123,14 @@ const Layer = struct {
 };
 
 pub const TextEncoder = struct {
-    /// **This tower can apply per-token prompt weights.** Read by `pipeline` instead of a
+    /// This tower can apply per-token prompt weights. Read by `pipeline` instead of a
     /// list of architecture names, so the capability cannot drift from the encoder that
     /// has it, and a newly added encoder has to state its answer or fail to compile.
     ///
     /// What makes it true here, and these are the actual requirements rather than "it is
-    /// CLIP": the conditioning is a **fixed 77-slot window** whose rows correspond 1:1 to
-    /// prompt tokens, the denoiser cross-attends to those rows, and an **empty-prompt
-    /// encode of the same shape** exists to interpolate against (`applyWeights`). An
+    /// CLIP": the conditioning is a fixed 77-slot window whose rows correspond 1:1 to
+    /// prompt tokens, the denoiser cross-attends to those rows, and an empty-prompt
+    /// encode of the same shape exists to interpolate against (`applyWeights`). An
     /// encoder producing a variable-length LLM tap state has none of the three.
     pub const supports_prompt_weights = true;
 
@@ -181,10 +180,10 @@ pub const TextEncoder = struct {
             };
         }
 
-        // ⚠️ Every allocation must happen BEFORE the struct literal. `.arena = arena`
+        // Every allocation must happen BEFORE the struct literal. `.arena = arena`
         // copies the arena's state by value, so an allocation made by a *later* field
         // initializer lands in the local arena's chunk list and is invisible to the
-        // copy the caller will `deinit()` — a leak the test allocator catches and
+        // copy the caller will `deinit()`, a leak the test allocator catches and
         // nothing else would. Same reason `dit.zig` builds its fields up front.
         const pos_embed = switch (cfg.naming) {
             .hf => try l.vec("embeddings.position_embedding.weight", .{}, cfg.max_positions * cfg.hidden),
@@ -222,7 +221,7 @@ pub const TextEncoder = struct {
     }
 
     /// `out` is `[ids.len][hidden]`, the final hidden state after
-    /// `final_layer_norm` — what SD's cross-attention consumes.
+    /// `final_layer_norm`, what SD's cross-attention consumes.
     ///
     /// `hidden_out`, when given, receives the same-shaped activation at
     /// `capture_layer`: 0 = the embedding output, n = after encoder layer n−1. That
@@ -314,7 +313,7 @@ pub const TextEncoder = struct {
         a1111_no_norm,
 
         /// Whether the empty-prompt reference has to be computed at all. Only ComfyUI's
-        /// form needs it — so an A1111 render skips that tower forward entirely.
+        /// form needs it, so an A1111 render skips that tower forward entirely.
         pub fn needsEmpty(self: WeightMode) bool {
             return self == .comfy;
         }
@@ -326,13 +325,13 @@ pub const TextEncoder = struct {
         /// Caller-owned slot holding this tower's `z_empty`, filled on first need and
         /// reused after. See `applyWeights` for what it is.
         empty_cache: *?[]f32,
-        /// Trailing filler for a short chunk *and* for the empty reference sequence —
+        /// Trailing filler for a short chunk *and* for the empty reference sequence,
         /// EOS for CLIP-L, 0 for CLIP-G.
         pad_id: u32,
         /// Null when the conditioning is this tower's final output (SD1.5); otherwise
         /// the layer to capture (SDXL's penultimate, final LayerNorm skipped).
         capture_layer: ?usize = null,
-        /// When given, receives chunk 0's post-final-LN rows — the only thing `pooled`
+        /// When given, receives chunk 0's post-final-LN rows, the only thing `pooled`
         /// may read, and only from the first chunk.
         final_chunk0: ?[]f32 = null,
     };
@@ -340,7 +339,7 @@ pub const TextEncoder = struct {
     /// Run this tower over every chunk of a tokenized prompt and apply the attention
     /// weights, filling `out` (`[p.seq()][hidden]`).
     ///
-    /// The chunks are **independent forwards concatenated along the sequence axis** —
+    /// The chunks are independent forwards concatenated along the sequence axis,
     /// each carries its own BOS/EOS and its own 77 positional embeddings, so a 154-row
     /// conditioning is two separate encodings of a *causal* tower rather than one long
     /// one. That is why a chunk boundary is a real semantic seam, and why
@@ -424,22 +423,22 @@ pub const TextEncoder = struct {
     /// Apply the prompt's per-token attention weights to one chunk's hidden rows,
     /// in place.
     ///
-    /// ⚠️ **This is an interpolation away from the EMPTY prompt's hidden state, not a
-    /// multiply**, and not the mean-renormalized form A1111 uses either:
+    /// This is an interpolation away from the EMPTY prompt's hidden state, not a
+    /// multiply, and not the mean-renormalized form A1111 uses either:
     ///
     /// ```
     /// z[j] = (z[j] - z_empty[j]) * w + z_empty[j]
     /// ```
     ///
-    /// `z_empty` is this same tower run on `[BOS] [EOS] pad…` (`clip_tokenizer.emptyIds`)
-    /// at the same capture layer, indexed by the **same position** j. So a weight of 0
+    /// `z_empty` is this same tower run on `[BOS] [EOS] pad...` (`clip_tokenizer.emptyIds`)
+    /// at the same capture layer, indexed by the same position j. So a weight of 0
     /// means "whatever this slot would say with no prompt at all" rather than a zero
     /// vector, and a weight of 2 extrapolates along that direction. Multiplying the row
     /// instead is a plausible-looking image with the wrong emphasis everywhere, since a
     /// CLIP hidden row is nowhere near zero-centred.
     ///
     /// Rows whose weight is exactly 1.0 are skipped rather than computed, so the
-    /// arithmetic is bit-identical to not having weights at all — which is what lets the
+    /// arithmetic is bit-identical to not having weights at all, which is what lets the
     /// unweighted path stay untouched. `empty` may therefore be `undefined` when the
     /// caller knows `Prompt.hasWeights()` is false.
     pub fn applyWeights(
@@ -458,7 +457,7 @@ pub const TextEncoder = struct {
         }
     }
 
-    /// A1111's emphasis application — the alternative to `applyWeights` above, and a
+    /// A1111's emphasis application, the alternative to `applyWeights` above, and a
     /// genuinely different picture from the same numbers.
     ///
     /// ```
@@ -466,8 +465,8 @@ pub const TextEncoder = struct {
     /// z    *= original_mean / new_mean    (ONE scalar over the whole chunk)
     /// ```
     ///
-    /// ⚠️ **The rescale is global, so emphasising one tag rescales every other token in
-    /// that chunk** — including the ones at weight 1.0. That is the substantive
+    /// The rescale is global, so emphasising one tag rescales every other token in
+    /// that chunk, including the ones at weight 1.0. That is the substantive
     /// difference from ComfyUI's form, which only moves the weighted positions. The mean
     /// is `z.mean()` over all positions × all channels of this chunk, matching
     /// `EmphasisOriginal`.
@@ -516,10 +515,10 @@ pub const TextEncoder = struct {
         dst: []f32,
     };
 
-    /// The pooled vector SDXL conditions on: the hidden row at the **first**
+    /// The pooled vector SDXL conditions on: the hidden row at the first
     /// `eos_id`. HF selects it with `argmax(input_ids)`, which is equivalent only
     /// because `<|endoftext|>` is the highest id in SD's vocabularies and every
-    /// padding slot holds it — so "first eos" is the well-defined form of the same
+    /// padding slot holds it, so "first eos" is the well-defined form of the same
     /// choice. Returns null when the sequence has no eos (an unterminated prompt).
     pub fn pooled(self: *const TextEncoder, hidden: []const f32, ids: []const u32) ?[]const f32 {
         for (ids, 0..) |id, p| {
@@ -528,14 +527,14 @@ pub const TextEncoder = struct {
         return null;
     }
 
-    /// `dst = row @ text_projection` — the vector SDXL's `y` carries, from CLIP-G's
+    /// `dst = row @ text_projection`, the vector SDXL's `y` carries, from CLIP-G's
     /// pooled row.
     ///
-    /// ⚠️ **The stored matrix is `[hidden][hidden]` in `x @ T` orientation**, which is
+    /// The stored matrix is `[hidden][hidden]` in `x @ T` orientation, which is
     /// the *transpose* of an `nn.Linear` weight; the reference implementations transpose
     /// it on load. Since the transpose is the whole content of this function it is done
-    /// here explicitly rather than by materializing a flipped copy — `dst[j]` sums over
-    /// the **column** j. Getting it backwards is a 1280-vector of the right magnitude
+    /// here explicitly rather than by materializing a flipped copy, `dst[j]` sums over
+    /// the column j. Getting it backwards is a 1280-vector of the right magnitude
     /// pointing somewhere else entirely.
     pub fn projectPooled(self: *const TextEncoder, dst: []f32, row: []const f32) void {
         const h = self.cfg.hidden;
@@ -578,8 +577,8 @@ const Loader = struct {
         };
     }
 
-    /// OpenCLIP naming: `resblocks`, `ln_1`/`ln_2`, `c_fc`/`c_proj`, and **one fused
-    /// `attn.in_proj_weight`** whose three row blocks are q, k, v in that order.
+    /// OpenCLIP naming: `resblocks`, `ln_1`/`ln_2`, `c_fc`/`c_proj`, and one fused
+    /// `attn.in_proj_weight` whose three row blocks are q, k, v in that order.
     fn layerOpenClip(l: Loader, i: usize) !Layer {
         const h = l.cfg.hidden;
         const qkv = try l.fusedQkv("transformer.resblocks.{d}.attn.in_proj_weight", .{i});
@@ -604,18 +603,18 @@ const Loader = struct {
         };
     }
 
-    /// Split a `[3·hidden, hidden]` fused projection into q, k, v.
+    /// Split a `[3*hidden, hidden]` fused projection into q, k, v.
     ///
     /// The three blocks are contiguous rows of one row-major tensor, so this is a view
-    /// per block and copies nothing — the same zero-copy path an unfused checkpoint
+    /// per block and copies nothing, the same zero-copy path an unfused checkpoint
     /// takes. (A quantized store would hand us a dtype the GEMM reads directly too; only
     /// the dtypes it cannot read are materialized, and then the split is over f32.)
     ///
-    /// All three carry the **fused tensor's** name as their probe tag, deliberately: q, k
+    /// All three carry the fused tensor's name as their probe tag, deliberately: q, k
     /// and v are three GEMMs over the *same* input, so per-input-column activation
     /// statistics are identical for all three, and the fused tensor is also the unit
     /// ggufy quantizes. Three contributions instead of one scales every column of that
-    /// row's importance equally, which a per-row-relative imatrix is invariant to.
+    /// row's importance equally, which a per-row-relative imatrix is unaffected by.
     fn fusedQkv(l: Loader, comptime fmt: []const u8, args: anytype) ![3]Weight {
         var buf: [200]u8 = undefined;
         const nm = try l.name(&buf, fmt, args);
@@ -633,12 +632,12 @@ const Loader = struct {
         var out: [3]Weight = undefined;
         // `!flat_blocks`: a shape-fixed block-quantized tensor's blocks tile its flat
         // element sequence, so neither the byte split below nor `Weight.init`'s
-        // row-aligned blocking is valid for it — materialize instead.
+        // row-aligned blocking is valid for it, materialize instead.
         if (ops.matmul.supportsDType(view.info.dtype) and !view.info.flat_blocks) {
             // A block-quantized tower would put `h*h` elements per third, and the split
             // is only byte-addressable if that is a whole number of blocks. It is for
             // every real CLIP (h is a multiple of 64, so h² is a multiple of 256), but
-            // `storageBytes` only *asserts* it — and asserts are gone in ReleaseFast,
+            // `storageBytes` only *asserts* it, and asserts are gone in ReleaseFast,
             // where the result would be a silently wrong byte count.
             if (view.info.dtype.info().block_elems > 1 and (h * h) % view.info.dtype.info().block_elems != 0) {
                 std.log.err("clip_text: {s} is {t} and hidden² ({d}) is not a whole number of blocks", .{ nm, view.info.dtype, h * h });
@@ -680,7 +679,7 @@ const Loader = struct {
         }
         // Most checkpoints hand us a dtype the GEMM reads directly (f32/f16/bf16/fp8,
         // or a quantized text tower). The rest are materialized to f32 once, here:
-        // this SD1.5 merge stores its CLIP linears as **f64**, which ComfyUI also
+        // this SD1.5 merge stores its CLIP linears as f64, which ComfyUI also
         // casts on load, and discovering that from inside the first forward would
         // report the problem as far from its cause as possible.
         var w = if (ops.matmul.supportsDType(view.info.dtype) and !view.info.flat_blocks) blk: {
@@ -691,7 +690,7 @@ const Loader = struct {
             break :blk Weight.fromF32(f32s, rows, cols);
         };
         // The checkpoint name travels with the weight so `ops.matmul.probe` can
-        // attribute a GEMM to a layer — which is what makes the text tower
+        // attribute a GEMM to a layer, which is what makes the text tower
         // measurable at all.
         w.tag = try l.alloc.dupe(u8, nm);
         return w;
@@ -738,7 +737,7 @@ test "CLIP-L matches transformers.CLIPTextModel on a real SD1.5 checkpoint" {
     var enc = try TextEncoder.load(gpa, .{ .safetensors = &ck }, clip_l, "cond_stage_model.transformer.text_model.");
     defer enc.deinit();
 
-    // Token ids for two prompts (one of them empty — the CFG branch), [2][77] i32.
+    // Token ids for two prompts (one of them empty, the CFG branch), [2][77] i32.
     // Read as raw i32: `convertToF32` deliberately refuses integer dtypes, since
     // silently turning token ids into floats is never what a caller wants.
     const tokens_view = ref.get("clip.tokens").?;
@@ -810,11 +809,11 @@ const sdxl_ckpt = "/home/qt/genai/comfyui/models/checkpoints/sdxl/blackMAGICXL_v
 test "SDXL's two towers match ComfyUI on a real SDXL checkpoint" {
     // The reference is ComfyUI (`tools/gen_sdxl_fixtures.py`), which is both the
     // compatibility target and the thing that settles SDXL's three conventions: the
-    // penultimate hidden state with **no** final LayerNorm, CLIP-G padded with 0, and
+    // penultimate hidden state with no final LayerNorm, CLIP-G padded with 0, and
     // pooled taken from CLIP-G's projected final state.
     //
     // The two towers are checked through the concatenated context ComfyUI hands the UNet,
-    // sliced back into halves — `[0..768)` is CLIP-L's, `[768..2048)` is CLIP-G's — so
+    // sliced back into halves, `[0..768)` is CLIP-L's, `[768..2048)` is CLIP-G's, so
     // this pins the concatenation order too, which is otherwise a coin flip that
     // produces a plausible image either way.
     const gpa = testing.allocator;
@@ -896,7 +895,7 @@ test "SDXL's two towers match ComfyUI on a real SDXL checkpoint" {
         }
 
         // And the pooled vector, from the FINAL (LayerNormed) state through
-        // `text_projection` — a different quantity than either context half.
+        // `text_projection`, a different quantity than either context half.
         const row = g_enc.pooled(out_g, ids_g).?;
         g_enc.projectPooled(pooled, row);
         try expectRel("clip.pooled", want_pooled[p * hg ..][0..hg], pooled, 3e-3);
@@ -924,7 +923,7 @@ fn expectRel(what: []const u8, want: []const f32, got: []const f32, tol: f64) !v
 test "the causal mask is what makes this an encoder and not a bidirectional one" {
     // A property test that needs no checkpoint: with causal attention, appending a
     // token cannot change the rows before it. If the mask were dropped, every row
-    // would move — and the model would still produce plausible conditioning, which is
+    // would move, and the model would still produce plausible conditioning, which is
     // why this is worth pinning separately from the fixture.
     const gpa = testing.allocator;
     const io = testing.io;
@@ -954,11 +953,11 @@ test "the causal mask is what makes this an encoder and not a bidirectional one"
     }
 }
 
-/// A deterministic in-memory **safetensors** checkpoint for the small property
+/// A deterministic in-memory safetensors checkpoint for the small property
 /// tests: every weight is a fixed pseudo-random f32, serialized into a caller-owned
 /// buffer and opened through the real parser. Built as a real container rather than
 /// a stub store because `WeightStore` is a closed union over the two formats we
-/// actually read — and because a test that bypasses the parser would not catch a
+/// actually read, and because a test that bypasses the parser would not catch a
 /// loader that mis-reads shapes.
 ///
 /// `pub` so the device-parity tests in `clip_text_gpu` can build the same tower the CPU
@@ -1051,8 +1050,8 @@ pub const TinyCheckpoint = struct {
 // --- weighted, multi-chunk prompts -----------------------------------------
 
 /// `tools/gen_clip_cond_ref.py`: ComfyUI's `CLIPTextEncode` output for seven prompts on
-/// two real checkpoints. Pins the *encoder* half of long-prompt support — the chunk
-/// forwards and `applyWeights` — where `clip_tokenizer`'s own fixture pins the tokenizer
+/// two real checkpoints. Pins the *encoder* half of long-prompt support, the chunk
+/// forwards and `applyWeights`, where `clip_tokenizer`'s own fixture pins the tokenizer
 /// half. Both are needed: the ids can be right while the weighting form is wrong, and
 /// that combination is a plausible image with the wrong emphasis everywhere.
 const cond_ref_path = "src/models/assets/clip_cond_ref.safetensors";
@@ -1063,7 +1062,7 @@ const cond_cases = [_][]const u8{ "real_pos", "real_neg", "plain", "empty", "zer
 
 /// The prompt strings the fixture was generated from, in the same order. Kept here
 /// rather than in the fixture because the *point* is that this engine tokenizes them
-/// itself — a fixture supplying the ids would leave the tokenizer untested from here.
+/// itself, a fixture supplying the ids would leave the tokenizer untested from here.
 const cond_prompts = [_][]const u8{
     "1girl, original, general, blonde hair, long hair, ponytail, light blue eyes, " ++
         "(shiny skin:1.1), gentle smile, bare shoulders, collarbone, " ++
@@ -1088,7 +1087,7 @@ const cond_prompts = [_][]const u8{
 /// Measured across all 14 prompt x tower comparisons: CLIP-L 1.2e-6 to 2.3e-6, CLIP-G
 /// 1.6e-5 to 2.7e-5 (32 layers of f32 reduction-order difference), pooled 4.4e-6 to
 /// 2.1e-5. The 5e-5 bound below is ~2x the worst of those, not a round number chosen
-/// for comfort — a weighting form that is merely *plausible* misses by 1e-1, so the
+/// for comfort, a weighting form that is merely *plausible* misses by 1e-1, so the
 /// bound has room to be this tight.
 fn relL2(want: []const f32, got: []const f32) f32 {
     var num: f64 = 0;
@@ -1119,7 +1118,7 @@ test "SD1.5 weighted multi-chunk conditioning matches ComfyUI's CLIPTextEncode" 
     var tok = try tp_core.clip_tokenizer.Tokenizer.init(gpa);
     defer tok.deinit();
 
-    // One cache across all seven prompts, which is also what `SdModels` does — so this
+    // One cache across all seven prompts, which is also what `SdModels` does, so this
     // incidentally covers the cached arm rather than only the first-fill one.
     var empty_cache: ?[]f32 = null;
     defer if (empty_cache) |e| gpa.free(e);
@@ -1132,7 +1131,7 @@ test "SD1.5 weighted multi-chunk conditioning matches ComfyUI's CLIPTextEncode" 
         var p = try tok.encodeWeighted(gpa, text, tp_core.clip_tokenizer.eos_id);
         defer p.deinit(gpa);
         // The row count is itself a claim: 154 where ComfyUI chunked and 77 where it
-        // did not. Getting this wrong used to be silent truncation.
+        // did not. Getting it wrong is silent truncation of the prompt.
         try testing.expectEqual(want.len, p.seq() * clip_l.hidden);
 
         const got = try gpa.alloc(f32, p.seq() * clip_l.hidden);
@@ -1192,7 +1191,7 @@ test "SDXL weighted multi-chunk conditioning matches ComfyUI's CLIPTextEncode" {
         defer pl.deinit(gpa);
         var pg = try tok.encodeWeighted(gpa, text, 0);
         defer pg.deinit(gpa);
-        // The two paddings must never change the chunk split — that is what makes the
+        // The two paddings must never change the chunk split, that is what makes the
         // halves of the concatenated context line up row for row.
         try testing.expectEqual(pl.chunks, pg.chunks);
         try testing.expectEqual(want.len, pl.seq() * wide);
@@ -1217,7 +1216,7 @@ test "SDXL weighted multi-chunk conditioning matches ComfyUI's CLIPTextEncode" {
         });
 
         // Compared as the two halves of ComfyUI's concatenated context rather than
-        // rebuilt into one — the concat order is pinned by the SDXL test above, and
+        // rebuilt into one, the concat order is pinned by the SDXL test above, and
         // slicing keeps a failure attributable to a specific tower.
         const l_rows = try gpa.alloc(f32, pl.seq() * hl);
         defer gpa.free(l_rows);
@@ -1237,7 +1236,7 @@ test "SDXL weighted multi-chunk conditioning matches ComfyUI's CLIPTextEncode" {
         try testing.expect(rel_l < 5e-5);
         try testing.expect(rel_g < 5e-5);
 
-        // Pooled: chunk 0's final-LayerNormed row at the first EOS, projected — and
+        // Pooled: chunk 0's final-LayerNormed row at the first EOS, projected, and
         // never weighted. Taking it from the last chunk would condition `y` on the
         // quality tags alone.
         var ids0: [tp_core.clip_tokenizer.context_length]u32 = undefined;

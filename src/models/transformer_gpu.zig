@@ -1,31 +1,33 @@
-//! Backend-generic GPU transformer decoder layer. `decoderLayer(spec, st, …)`
-//! sequences the per-layer ops in the architecture order defined by `LayerSpec`
-//! (shared with the CPU `transformer.zig`); the stepper `st` (a `*VulkanLM` /
-//! `*CudaLM`) supplies each op as a method that wraps its backend's kernels and
-//! perf policy — GEMV grouping, `independent()` scheduling hints, flash-split vs
-//! square attention, weight streaming. The op ORDER is single-sourced here; the
-//! op IMPL stays per-backend, so output is byte-identical to the hand-written
-//! loops this replaces (each method is a faithful lift of one loop block,
-//! including its leading scheduling hints).
+//! Backend-generic GPU transformer decoder layer. `decoderLayer(spec, st, ...)` sequences
+//! the per-layer ops in the order `LayerSpec` defines (shared with the CPU
+//! `transformer.zig`); the stepper `st`, a `*VulkanLM` or `*CudaLM`, supplies each op as
+//! a method wrapping its backend's kernels and perf policy: GEMV grouping,
+//! `independent()` scheduling hints, flash-split versus square attention, weight
+//! streaming.
 //!
-//! Stepper method contract (all `!void`, operating on the stepper's own
-//! device buffers / KV cache):
-//!   normInput(layer, seq)           x → normed via input_norm
-//!   projectQKV(layer, seq)          normed → q,k,v
-//!   normQK(layer, seq)              per-head RMSNorm of q,k
-//!   normV(seq)                      weightless RMSNorm of v (v_norm_unit specs)
-//!   applyRope(seq, pos0)            rotate-half rope on q,k
-//!   appendKV(l, seq, pos0)          write k,v into cache layer l at pos0
-//!   attention(l, seq, pos0)         attn over the cached prefix → attn buf
-//!   projectO(layer, seq)            attn → t via o_proj
-//!   postAttnNorm(layer, seq)        (sandwich) RMSNorm t before residual
-//!   addResidual(seq)                x += t
-//!   normPreFfn(layer, seq)          x → normed via the pre-MLP norm
-//!   projectGateUp(layer, seq)       normed → gate,up
-//!   activate(comptime act, seq)     gate = act(gate) * up
-//!   projectDown(layer, seq)         gate → t via down_proj
-//!   postFfnNorm(layer, seq)         (sandwich) RMSNorm t before residual
-//!   outScale(layer, seq)            (gemma4) x *= layer.out_scale
+//! The op ORDER is single-sourced here, the op IMPL stays per-backend, and each method is
+//! a faithful lift of one hand-written loop block including its leading scheduling hints,
+//! so output is byte-identical to the loops this replaces.
+//!
+//! Stepper method contract, all `!void`, operating on the stepper's own device buffers
+//! and KV cache:
+//!
+//!     normInput(layer, seq)        x -> normed via input_norm
+//!     projectQKV(layer, seq)       normed -> q,k,v
+//!     normQK(layer, seq)           per-head RMSNorm of q,k
+//!     normV(seq)                   weightless RMSNorm of v (v_norm_unit specs)
+//!     applyRope(seq, pos0)         rotate-half rope on q,k
+//!     appendKV(l, seq, pos0)       write k,v into cache layer l at pos0
+//!     attention(l, seq, pos0)      attn over the cached prefix -> attn buf
+//!     projectO(layer, seq)         attn -> t via o_proj
+//!     postAttnNorm(layer, seq)     (sandwich) RMSNorm t before residual
+//!     addResidual(seq)             x += t
+//!     normPreFfn(layer, seq)       x -> normed via the pre-MLP norm
+//!     projectGateUp(layer, seq)    normed -> gate,up
+//!     activate(comptime act, seq)  gate = act(gate) * up
+//!     projectDown(layer, seq)      gate -> t via down_proj
+//!     postFfnNorm(layer, seq)      (sandwich) RMSNorm t before residual
+//!     outScale(layer, seq)         (gemma4) x *= layer.out_scale
 
 const transformer = @import("transformer.zig");
 
@@ -42,7 +44,7 @@ pub fn decoderLayer(comptime spec: LayerSpec, st: anytype, layer: anytype, l: us
 
 /// First half of a decoder layer: project Q/K/V, norm/rope them, and commit K/V
 /// to the cache. Split out so the Vulkan bidirectional image prefill can run
-/// this for EVERY block token (committing all K/V) before any attention — the
+/// this for EVERY block token (committing all K/V) before any attention, the
 /// single-query kernel can't see forward within a batch otherwise. `st.q` holds
 /// the rope'd Q on return.
 pub fn decoderLayerQKV(comptime spec: LayerSpec, st: anytype, layer: anytype, l: usize, seq: usize, pos0: usize) !void {

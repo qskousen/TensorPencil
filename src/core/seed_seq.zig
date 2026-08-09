@@ -1,30 +1,26 @@
-//! `numpy.random.SeedSequence` — the splittable seed deriver.
+//! `numpy.random.SeedSequence`, the splittable seed deriver.
 //!
-//! This exists for exactly one consumer: `brownian.zig`, the Brownian-tree noise
-//! sampler ComfyUI's SDE samplers draw from. torchsde derives each tree node's
-//! RNG seed as
+//! One consumer: `brownian.zig`, the Brownian-tree noise sampler ComfyUI's SDE samplers
+//! draw from. torchsde derives each tree node's RNG seed as
 //!
 //!     np.random.SeedSequence(entropy=seed, spawn_key=(node, depth), pool_size=24)
 //!         .generate_state(4)
 //!
-//! so a bit-exact `dpmpp_2m_sde` needs a bit-exact SeedSequence. It is a small,
-//! self-contained integer hash — no dependency on numpy's generators — so porting
-//! it is cheap; *guessing* at it is not, because a wrong seed produces perfectly
-//! plausible noise that simply is not ComfyUI's.
+//! so a bit-exact `dpmpp_2m_sde` needs a bit-exact SeedSequence. It is a small
+//! self-contained integer hash with no dependency on numpy's generators, so porting it
+//! is cheap; GUESSING at it is not, because a wrong seed produces perfectly plausible
+//! noise that simply is not ComfyUI's.
 //!
-//! The algorithm (numpy's `bit_generator.pyx`, stable since 1.19):
+//! The algorithm (numpy's `bit_generator.pyx`, stable since 1.19): assemble the entropy
+//! as little-endian u32 words, then, ONLY if a spawn key is present, zero-pad up to
+//! `pool_size` and append the spawn key's words (that conditional padding is numpy's
+//! gh-16539 fix, and is why an unspawned sequence and a `spawn_key=(0, 0)` one differ);
+//! mix it into a `pool_size`-word pool with `hashmix`/`mix`, sharing one running
+//! `hash_const` across the whole pass; then run a second, independent hash
+//! (`INIT_B`/`MULT_B`) over the pool cyclically in `generate_state`.
 //!
-//!  1. Assemble the entropy: the seed as little-endian u32 words, then — **only if
-//!     a spawn key is present** — zero-padded up to `pool_size`, then the spawn
-//!     key's words appended. That conditional padding is numpy's gh-16539 fix and
-//!     is why an unspawned sequence and a `spawn_key=(0, 0)` one differ.
-//!  2. Mix it into a `pool_size`-word pool with `hashmix`/`mix`, sharing one
-//!     running `hash_const` across the whole pass.
-//!  3. `generate_state(n)` runs a second, independent hash (`INIT_B`/`MULT_B`)
-//!     over the pool cyclically.
-//!
-//! ⚠️ Every multiply is u32 wraparound and every shift is by 16. Pinned against
-//! numpy 2.2.6 by `test "matches numpy.random.SeedSequence"`.
+//! Every multiply is u32 wraparound and every shift is by 16. Pinned against numpy
+//! 2.2.6.
 
 const std = @import("std");
 
@@ -62,8 +58,8 @@ fn mix(x: u32, y: u32) u32 {
     return result;
 }
 
-/// Little-endian u32 words of a non-negative integer. **Zero is one word, not
-/// zero words** (`_int_to_uint32_array` appends before its loop), and that matters:
+/// Little-endian u32 words of a non-negative integer. Zero is one word, not
+/// zero words (`_int_to_uint32_array` appends before its loop), and that matters:
 /// the spawn key `(0, 0)` contributes two words and so triggers the pool padding.
 fn intWords(n: u64, out: []u32) usize {
     if (n == 0) {
@@ -103,8 +99,8 @@ pub const SeedSequence = struct {
         }
 
         if (n_key > 0) {
-            // ⚠️ Pad the seed's words out to the pool size *before* appending the
-            // spawn key — numpy's gh-16539 fix, applied only when a spawn key is
+            // Pad the seed's words out to the pool size *before* appending the
+            // spawn key, numpy's gh-16539 fix, applied only when a spawn key is
             // present so unspawned streams stay backwards-compatible. Skipping it
             // makes every non-root tree node draw the wrong noise.
             while (n < pool_size) {
@@ -180,7 +176,7 @@ test "matches numpy.random.SeedSequence" {
         ss.generateState(&state);
         try std.testing.expectEqualSlices(u32, &.{ 2888090517, 4151165838, 1159728038 }, &state);
     }
-    // A spawn key of all zeros is NOT the same as no spawn key — it is what
+    // A spawn key of all zeros is NOT the same as no spawn key, it is what
     // triggers the zero-padding to `pool_size`. torchsde's root split uses
     // exactly `(0, 0)`, so this case is load-bearing.
     {

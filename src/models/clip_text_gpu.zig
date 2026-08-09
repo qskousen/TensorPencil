@@ -1,33 +1,26 @@
-//! CLIP text tower on the Vulkan backend — SD1.5's CLIP-L and SDXL's CLIP-G.
+//! CLIP text tower on the Vulkan backend: SD1.5's CLIP-L and SDXL's CLIP-G.
 //!
 //! A thin device forward over the CPU model's own weights, in the shape
 //! `embed_siglip_gpu` established: every op is an existing `Context` entry point, the
 //! weights are read straight from the checkpoint mapping (`opMatmul` caches a device
-//! buffer keyed on the host pointer, so nothing is dequantized or copied), and the
-//! cheap head — the pooled row and its projection — stays on the host.
+//! buffer keyed on the host pointer, so nothing is dequantized or copied), and the cheap
+//! head (the pooled row and its projection) stays on the host.
 //!
-//! Three things make this not just SigLIP's tower again:
+//! Three things make this not SigLIP's tower again:
 //!
-//! 1. ⚠️ **The attention is CAUSAL** (`attn_causal_batched`, added for this). Every
-//!    other encoder tower here reads bidirectionally. A non-causal CLIP encodes every
-//!    prompt and renders every image — it is simply a different model — so there is no
-//!    failure to observe if this is wrong.
-//! 2. ⚠️ **The activation differs BETWEEN THE TWO TOWERS**: CLIP-L is quick-GELU
-//!    (`x·σ(1.702x)`), CLIP-G is erf-GELU. `cfg.act` carries which and the kernels are
-//!    separate, because the three GELU forms in this codebase agree to ~1e-2 — close
-//!    enough to look right and far enough to shift style.
-//! 3. **The prompt is many chunks**, so the batch axis is the chunk: a 77-row window
-//!    gives 77·heads threads, which does not fill a GPU, while a long prompt has two or
-//!    three windows that are independent by construction. The empty-prompt reference
-//!    `z_empty` rides along as one more batch item — which is also exactly how ComfyUI
-//!    computes it.
+//! 1. The attention is CAUSAL (`attn_causal_batched`, added for this). Every other
+//!    encoder tower here reads bidirectionally, and a non-causal CLIP still encodes
+//!    every prompt and renders every image, so there is no failure to observe.
+//! 2. The activation differs BETWEEN THE TWO TOWERS: CLIP-L is quick-GELU, CLIP-G is
+//!    erf-GELU. `cfg.act` carries which, and the kernels are separate because the three
+//!    GELU forms here agree to ~1e-2, close enough to look right and far enough to shift
+//!    style.
+//! 3. The prompt is many chunks, so the batch axis is the chunk: one 77-row window gives
+//!    77*heads threads, which does not fill a GPU. The empty-prompt reference `z_empty`
+//!    rides along as one more batch item, which is how ComfyUI computes it too.
 //!
-//! GEMM precision follows `qwen3_gpu`'s convention: f32 by default, tensor-core f16
-//! only when the caller opts in (`--encoder-f16`). The default therefore tracks the CPU
-//! forward the fixtures pin, and the fast path stays a deliberate choice.
-//!
-//! Validated against the CPU forward by the device parity tests at the bottom
-//! (`-Dintegration` plus the `testdata/gpu-tests` marker).
+//! GEMM precision follows `qwen3_gpu`'s convention: f32 by default, tensor-core f16 only
+//! under `--encoder-f16`, so the default tracks the CPU forward the fixtures pin.
 
 const std = @import("std");
 const tp_core = @import("tp_core");
@@ -46,7 +39,7 @@ fn nbuf(ctx: *gpu.Context, w: []const f32) !Buf {
     return .{ .buf = try ctx.smallBuffer(std.mem.sliceAsBytes(w)), .mem = .null_handle, .size = 0 };
 }
 
-/// A GEMM against a checkpoint weight, routed by the dtype it was stored in — the
+/// A GEMM against a checkpoint weight, routed by the dtype it was stored in, the
 /// same routing `sd_unet_gpu.gemm` does, and for the same reason: a CLIP tower can
 /// arrive as f32, f16, bf16, or (from ggufy) block-quantized.
 ///
@@ -74,7 +67,7 @@ fn gemm(
             return ctx.opMatmul(y, y_off_elems * 4, x, 0, m, wt.bytes, false, rows, cols, 1.0, bias);
         },
         // A 2-byte weight has no f32 GEMM entry point, so these take the coop path
-        // regardless of `use_f16` — the storage dtype already decided the precision.
+        // regardless of `use_f16`, the storage dtype already decided the precision.
         .f16 => return ctx.opMatmulCoopF16Wh(y, y_off_elems, x, m, wt.bytes, rows, cols, bias),
         .bf16 => {
             if (ctx.pipe_coop_bf16w != .null_handle) {
@@ -94,7 +87,7 @@ fn gemm(
 /// with this tower's conditioning for every chunk of `p`, weights applied.
 ///
 /// Identical contract to the CPU form, including `r.final_chunk0` and the `r.empty_cache`
-/// slot — so the caller cannot tell which ran except by speed.
+/// slot, so the caller cannot tell which ran except by speed.
 pub fn encodePrompt(
     enc: *const clip_text.TextEncoder,
     ctx: *gpu.Context,
@@ -117,7 +110,7 @@ pub fn encodePrompt(
     std.debug.assert(out.len == p.seq() * h);
 
     // The empty reference rides along as one more batch item, but only when it is both
-    // needed and not already cached — so a second render with the same tower pays
+    // needed and not already cached, so a second render with the same tower pays
     // nothing, and an unweighted prompt never computes it at all.
     const need_empty = p.hasWeights() and r.mode.needsEmpty() and r.empty_cache.* == null;
     const items = p.chunks + @as(usize, if (need_empty) 1 else 0);
@@ -206,7 +199,7 @@ pub fn encodePrompt(
     }
 
     // The final LayerNorm is what SD1.5 conditions on and what SDXL's pooled row is
-    // read from — SDXL's *context* deliberately stops short of it.
+    // read from, SDXL's *context* deliberately stops short of it.
     try ctx.opElt(.layernorm, x_d, x_d, try nbuf(ctx, enc.final_ln_w), try nbuf(ctx, enc.final_ln_b), .{
         .u0 = @intCast(total), .u1 = @intCast(h), .f0 = cfg.eps,
     }, total, 1, 1);
@@ -223,7 +216,7 @@ pub fn encodePrompt(
             @memcpy(dst, all[0 .. clen * h]);
         } else {
             // Needs the post-final-LN activation, which `all` is not when a layer was
-            // captured — one extra download of chunk 0's rows only.
+            // captured, one extra download of chunk 0's rows only.
             try ctx.tensorDownloadAt(x_d, 0, std.mem.sliceAsBytes(dst));
         }
     }
@@ -235,7 +228,7 @@ pub fn encodePrompt(
         @memcpy(e, all[p.chunks * clen * h ..][0 .. clen * h]);
         r.empty_cache.* = e;
     }
-    // ⚠️ The load-bearing formulas are NOT reimplemented here — this calls the CPU
+    // The load-bearing formulas are NOT reimplemented here, this calls the CPU
     // functions, so the three paths cannot disagree about either dialect's weighting.
     const empty = if (r.mode.needsEmpty()) r.empty_cache.*.? else &[_]f32{};
     for (0..p.chunks) |c| enc.applyMode(out[c * clen * h ..][0 .. clen * h], empty, p.chunk(c), r.mode);
@@ -272,7 +265,7 @@ fn relL2(want: []const f32, got: []const f32) f64 {
 test "gpu gelu_quick and gelu_erf match ops.act, and are not each other" {
     // Checked value by value, not in aggregate: the three GELU forms in this codebase
     // agree to ~1e-2, so an aggregate bound loose enough to pass f32 noise would also
-    // pass the wrong kernel. The final assertion is the one that matters — it fails if
+    // pass the wrong kernel. The final assertion is the one that matters, it fails if
     // the two entry points are ever wired to the same kernel.
     const gpa = testing.allocator;
     const io = testing.io;
@@ -343,7 +336,7 @@ test "gpu attn_causal_batched matches causal CPU attention per chunk" {
     for (k) |*x| x.* = rand.floatNorm(f32);
     for (v) |*x| x.* = rand.floatNorm(f32);
 
-    // Reference: the CPU op, run per chunk with causal masking — which is exactly what
+    // Reference: the CPU op, run per chunk with causal masking, which is exactly what
     // the tower does on the host path, so this compares the two things that must agree.
     const want = try gpa.alloc(f32, total * dim);
     defer gpa.free(want);
@@ -411,7 +404,7 @@ test "gpu clip tower matches the CPU forward on a weighted two-chunk prompt" {
             .eos_id = clip_tok.eos_id,
         };
         // The full CLIP vocabulary, because BOS/EOS are ids 49406/49407 and the empty
-        // reference sequence is built from them — a small vocab would be out of range.
+        // reference sequence is built from them, a small vocab would be out of range.
         var ckpt = try clip_text.TinyCheckpoint.init(gpa, cfg, clip_tok.eos_id + 1);
         defer ckpt.deinit(gpa);
         var enc = try clip_text.TextEncoder.load(gpa, ckpt.store(), cfg, "");
@@ -474,12 +467,12 @@ test "gpu clip tower matches the CPU forward on a weighted two-chunk prompt" {
             );
             // f32 GEMMs on both sides, so this is reduction-order noise only: measured
             // 1.1e-5 (no capture) and 3.3e-6 (captured) on this 3-layer tower. The bound
-            // is ~4x that rather than a round number — a wrong activation, a missing
+            // is ~4x that rather than a round number, a wrong activation, a missing
             // causal mask or a dropped weight application all miss by >1e-3, so there is
             // room to keep it tight.
             try testing.expect(rel < 5e-5);
             try testing.expect(rel_f < 5e-5);
-            // The captured layer must NOT be the final output — if `capture_layer` were
+            // The captured layer must NOT be the final output, if `capture_layer` were
             // ignored, both arms would agree with each other and be wrong together.
             // Compared against chunk 0's rows, which is what `final_chunk0` holds.
             if (capture != null) {

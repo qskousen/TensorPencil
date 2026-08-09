@@ -1,4 +1,4 @@
-//! CUDA `GpuBackend` — the dit_gpu/vae_gpu-facing surface on top of the thin
+//! CUDA `GpuBackend`, the dit_gpu/vae_gpu-facing surface on top of the thin
 //! driver `Context` (cu.zig/context.zig) and the hand-PTX `kernels`. Mirrors the
 //! method surface of the Vulkan `gpu.Context` so a generic (comptime-dispatched)
 //! `dit_gpu.forward` runs on either backend. Buffers are CUDA device pointers
@@ -75,18 +75,18 @@ pub const Libs = struct {
 const lt_workspace_bytes: usize = 32 << 20;
 
 /// DIAGNOSTIC ONLY: skip the int8 irescale pass (produces garbage output) to
-/// measure its batched cost — the ceiling on what fusing dequant could save.
+/// measure its batched cost, the ceiling on what fusing dequant could save.
 pub var bench_skip_rescale: bool = false;
 
-/// DIAGNOSTIC ONLY: in `opGemmBf16`, skip the f32→bf16 activation pad and the
+/// DIAGNOSTIC ONLY: in `opGemmBf16`, skip the f32->bf16 activation pad and the
 /// `bias_compact` output pass, leaving only the GEMM itself (produces garbage
 /// output). The isolation measurement behind any "the GEMM is/isn't the
 /// bottleneck" claim: `zimage-cuda-bench` times the op with this off and on, so
 /// the difference IS the two streaming passes' cost rather than an estimate.
 pub var bench_gemm_only: bool = false;
 
-/// Numeric kind of a cuBLASLt matmul plan: int8 A/B → s32 D (32I compute) or
-/// f16 A/B → f32 D (32F compute, HMMA). Both are the TN case with the same
+/// Numeric kind of a cuBLASLt matmul plan: int8 A/B -> s32 D (32I compute) or
+/// f16 A/B -> f32 D (32F compute, HMMA). Both are the TN case with the same
 /// layout mapping; only the data/compute/scale types differ.
 const LtKind = enum { i8, f16, bf16 };
 
@@ -120,7 +120,7 @@ pub const DeviceBuffer = struct {
 
     /// A non-owning view offset `off_elems` f32 elements into this buffer, for a
     /// kernel launch that touches a sub-region (e.g. one item of a batched
-    /// activation). `mem` is cleared — views never free.
+    /// activation). `mem` is cleared, views never free.
     pub fn viewF32(self: DeviceBuffer, off_elems: usize) DeviceBuffer {
         const off: u64 = off_elems * @sizeOf(f32);
         return .{ .buf = @enumFromInt(@intFromEnum(self.buf) + off), .mem = .null_handle, .size = if (self.size > off) self.size - off else 0 };
@@ -132,9 +132,9 @@ fn dbFromPtr(p: cu.CUdeviceptr, size: u64) DeviceBuffer {
 }
 
 /// A non-owning view of `b` offset `off` bytes in (for a kernel launch that
-/// touches a sub-region). `mem` is cleared — views never free.
+/// touches a sub-region). `mem` is cleared, views never free.
 ///
-/// Public so a model file can drive a per-item launch over a batched activation —
+/// Public so a model file can drive a per-item launch over a batched activation,
 /// `clip_text_cuda` runs one causal `attn` per prompt chunk this way.
 pub fn dbOffset(b: DeviceBuffer, off: u64) DeviceBuffer {
     return .{ .buf = @enumFromInt(@intFromEnum(b.buf) + off), .mem = .null_handle, .size = if (b.size > off) b.size - off else 0 };
@@ -188,7 +188,7 @@ const WeightEntry = struct {
     pinned: bool = false,
     /// Cached while a weight scope was open (weightScopeBegin): released as
     /// a group by weightScopeEnd. The GPU ViT tags its weights so a
-    /// mid-session image encode can drop exactly them — not the resident
+    /// mid-session image encode can drop exactly them, not the resident
     /// LLM weights a captured decode graph has baked pointers into.
     scoped: bool = false,
     /// Prefetched but not yet read by any op. Shielded from eviction: evicting
@@ -239,7 +239,7 @@ pub const Backend = struct {
 
     // weight cache: host pointer -> uploaded device buffer (LRU-stamped for
     // streaming: under memory pressure the least-recently-used weights are
-    // evicted and re-uploaded on next use — see reserveForWeights/evictOneWeight).
+    // evicted and re-uploaded on next use, see reserveForWeights/evictOneWeight).
     weights: std.AutoHashMapUnmanaged(usize, WeightEntry) = .empty,
     use_counter: u64 = 0,
     /// A weight scope is open: new cache entries are tagged for group
@@ -249,7 +249,7 @@ pub const Backend = struct {
     /// (only the live cuMemGetInfo headroom bounds the weight cache).
     budget_override: u64 = 0,
     /// Total weights evicted over the backend's lifetime. Nonzero means weight
-    /// streaming is (or has been) active — device weight pointers are not
+    /// streaming is (or has been) active, device weight pointers are not
     /// stable, so anything that bakes them in (the CudaLM decode graph) must
     /// stay on per-op launches.
     evictions: u64 = 0,
@@ -257,7 +257,7 @@ pub const Backend = struct {
     /// eviction) until their total reaches this cap; later weights stream.
     /// 0 = off. Must stay off for the diffusion pipeline: first-touch would
     /// pin the single-use text encoder and stream the whole DiT. LLM sessions
-    /// set maxInt via `pinAllWeights` — LLM weights are NEVER streamed (an LLM
+    /// set maxInt via `pinAllWeights`, LLM weights are NEVER streamed (an LLM
     /// that doesn't fit degrades via the CPU layer split, never per-token
     /// PCIe re-uploads); a weight that physically can't pin is a hard
     /// DeviceOutOfMemory the model's offload machinery handles.
@@ -273,7 +273,7 @@ pub const Backend = struct {
     /// over-commit; pinned weights are then non-evictable on the streaming path
     /// (evictOneWeight skips them), leaving no way to recover. Gating each pin on
     /// live free VRAM staying above this floor makes pinning self-limit to
-    /// genuinely-free memory and stream the rest — the low-VRAM case just streams
+    /// genuinely-free memory and stream the rest, the low-VRAM case just streams
     /// more. 0 = disabled (only refuse a pin that physically won't fit): the LLM
     /// decode path leaves it off (its residency is managed by pin_budget +
     /// offload); the diffusion pipeline sets it to its activation-scratch reserve.
@@ -286,7 +286,7 @@ pub const Backend = struct {
     ///
     /// Why it can't be done locally: the GUI runs the LLM and the image model in
     /// SEPARATE contexts, so `evictOneWeight` and the recycle pool below can only
-    /// ever reach this model's own bytes — and an LLM pins all of its weights, so
+    /// ever reach this model's own bytes, and an LLM pins all of its weights, so
     /// for the LLM those rungs reclaim nothing at all. Without this hook a
     /// resident-but-idle image model was an immovable reservation, and any LLM
     /// allocation that didn't fit under it (prefill activations, a promoted
@@ -294,7 +294,7 @@ pub const Backend = struct {
     /// while gigabytes sat evictable in the other context.
     ///
     /// The callee frees memory in the peer's context, which leaves THAT context
-    /// current on this thread — `foreignReclaim` re-binds ours before retrying.
+    /// current on this thread, `foreignReclaim` re-binds ours before retrying.
     foreign_reclaim: ?ForeignReclaim = null,
     /// Last evictOneWeight skip-reason tally, for the tensorCreate OOM diagnostic
     /// ([oom-dbg]). A failed eviction is now routine (the recycle pool, not the
@@ -314,12 +314,12 @@ pub const Backend = struct {
     pending_free_bytes: u64 = 0,
     /// Recycled streamed-weight buffers by exact size (async path). Streamed
     /// decode cycles the same handful of weight sizes every token, and
-    /// cuMemAlloc/cuMemFree cost ~0.3-1 ms each under an active DMA queue —
+    /// cuMemAlloc/cuMemFree cost ~0.3-1 ms each under an active DMA queue,
     /// per-token churn was 2x slower than the transfers themselves. Buffers
     /// here still count in ctx.device_used (they are still held).
     weight_pool: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(DeviceBuffer)) = .empty,
     /// Total bytes in streamed circulation (unpinned cache entries + deferred
-    /// frees + pool) — diffusion streaming accounting; always 0 under the LLM
+    /// frees + pool), diffusion streaming accounting; always 0 under the LLM
     /// pin-all mode.
     streamed_bytes: u64 = 0,
 
@@ -336,7 +336,7 @@ pub const Backend = struct {
     pf_shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     // Wake signal for the prefetch thread: bumped on every enqueue and on
     // shutdown so the idle thread blocks (futex) instead of busy-spinning on an
-    // empty ring — a resident-but-idle CUDA session otherwise pinned a core.
+    // empty ring, a resident-but-idle CUDA session otherwise pinned a core.
     pf_wake: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     pf_gen: u64 = 0, // last assigned generation (main-only)
 
@@ -349,7 +349,7 @@ pub const Backend = struct {
     fp8_a16: DeviceBuffer = .{},
     /// q8-quantized decode activation (opGemvQuantizeX / opGemvQuantQ8).
     q8_act: DeviceBuffer = .{},
-    /// Per-step penalty-entry wire for opPenalize (id + subtract pairs; tiny —
+    /// Per-step penalty-entry wire for opPenalize (id + subtract pairs; tiny,
     /// at most sample.max_penalty_window entries, uploaded each sampled token).
     pen_wire: DeviceBuffer = .{},
 
@@ -391,7 +391,7 @@ pub const Backend = struct {
     i8_acc: DeviceBuffer = .{},
     // Transient int8 form of a packed W4A8 weight (w4a8ToI8): one buffer at the
     // model's widest weight, reused by every GEMM. Keeping it transient is the whole
-    // reason the format costs 4 bits per weight here instead of 8 — see opI8GemmW4A8.
+    // reason the format costs 4 bits per weight here instead of 8, see opI8GemmW4A8.
     w4a8_i8: DeviceBuffer = .{},
 
     // tensor-core attention scratch (per-head, reused across heads/calls; grown
@@ -408,7 +408,7 @@ pub const Backend = struct {
     // (heads,kv_heads,seq,hd), f16 Q/K/V/O scratch, and the SDPA workspace.
     sdpa_plans: std.AutoHashMapUnmanaged(u64, cudnn.SdpaPlan) = .empty,
     // fused int8-GEMM+dequant plans (cuDNN op graph), keyed by packed (m,n,k,d_f16).
-    // When `use_fused_i8`, opI8GemmLibs uses these instead of cuBLASLt+irescale —
+    // When `use_fused_i8`, opI8GemmLibs uses these instead of cuBLASLt+irescale,
     // the s32 accumulator never round-trips to DRAM.
     mdq_plans: std.AutoHashMapUnmanaged(u64, cudnn.MatmulDequantPlan) = .empty,
     use_fused_i8: bool = false,
@@ -431,7 +431,7 @@ pub const Backend = struct {
     irescale_h16_fn: cu.CUfunction = null,
     // cuBLASLt int8 matmul plans (desc + layouts + heuristic algo), keyed by
     // packed (n,m,k). Layouts hold no data pointer, so a plan is reused across
-    // steps/blocks/weights of the same shape — the expensive heuristic query
+    // steps/blocks/weights of the same shape, the expensive heuristic query
     // runs once, and the timed matmul is a pure enqueue.
     lt_plans: std.AutoHashMapUnmanaged(u64, LtPlan) = .empty,
     // Warmup attribution (TP_WARMUP_PROFILE): wall time in cuBLASLt heuristic
@@ -489,9 +489,9 @@ pub const Backend = struct {
     attn_batched: bool = true,
     /// Fused attention output: the softmax pass emits only per-row {max, 1/sum}
     /// (softmax_md_f16, one S read) and the P@V GEMM recomputes P from S+MD during
-    /// A-staging (hgemm_attnout) — no P materialization. Eliminates the P write +
+    /// A-staging (hgemm_attnout), no P materialization. Eliminates the P write +
     /// the extra softmax S reads (the Vulkan-parity win). Off = the materialized
-    /// softmax_row_f16 → P → hgemm_batched path (kept as the A/B reference).
+    /// softmax_row_f16 -> P -> hgemm_batched path (kept as the A/B reference).
     attn_fused: bool = true,
     attn_scratch_budget: usize = 2 << 30, // 2 GiB for S+P
 
@@ -506,9 +506,9 @@ pub const Backend = struct {
     ptimer: ?ctxmod.Context.Timer = null,
 
     /// `dequant` is the block-quant weight -> f16 expansion `opMatmulQuant` does
-    /// before its tensor-core GEMM. It used to be charged to `matmul`, which hid
-    /// the fact that a batched prefill re-expands the WHOLE weight matrix on every
-    /// call — keep it separate so that cost stays visible.
+    /// before its tensor-core GEMM. Kept separate from `matmul`, which would otherwise
+    /// hide the fact that a batched prefill re-expands the WHOLE weight matrix on every
+    /// call.
     pub const ProfCat = enum { matmul, dequant, prep, attn, elt, attn_scores, attn_softmax, attn_pv };
     pub const Prof = struct {
         /// Sized from ProfCat so adding a category can't desync the arrays.
@@ -522,7 +522,7 @@ pub const Backend = struct {
 
     /// Host-side zeros for a `null` bias on a path that still needs one (the
     /// hand-PTX arm's `bias_compact` does the m-pad compaction as well as the
-    /// add, so it runs either way). Grown, never shrunk, and handed out WHOLE —
+    /// add, so it runs either way). Grown, never shrunk, and handed out WHOLE,
     /// the device weight cache keys on the host pointer and sizes from the first
     /// call, so a narrow slice cached first would leave every wider call reading
     /// past the end.
@@ -541,7 +541,7 @@ pub const Backend = struct {
         if (self.ptimer == null) self.ptimer = self.ctx.timerCreate() catch null;
         if (self.ptimer) |t| self.ctx.timerBegin(t) catch {};
     }
-    /// End timing and accumulate into category `c` (syncs the stream — exact
+    /// End timing and accumulate into category `c` (syncs the stream, exact
     /// host timing, matching the Vulkan --profile sync-per-op mode).
     fn ptoc(self: *Backend, c: ProfCat) void {
         if (!self.profile) return;
@@ -585,7 +585,7 @@ pub const Backend = struct {
         // NEUTRAL vs cuBLASLt+irescale (cuDNN's int8 matmul is ~0.22 s/step slower
         // than cuBLASLt IMMA, exactly canceling the irescale round-trip it removes).
         // cuBLASLt IMMA is the more-proven path; the fused graph stays dormant +
-        // documented (MatmulDequantPlan, cuda-libs-i8fused-test). See PLAN.md 2.7.
+        // documented (MatmulDequantPlan, cuda-libs-i8fused-test).7.
         self.use_fused_i8 = false;
 
         var lt = cublaslt.Api.load() catch return error.CudaError;
@@ -725,7 +725,7 @@ pub const Backend = struct {
 
     /// Enable async weight streaming: allocate a pinned staging ring and spawn a
     /// prefetch thread. The DiT driver prefetches block N+1's weights (via
-    /// prefetchWeight) while block N computes; the thread does the mmap→pinned
+    /// prefetchWeight) while block N computes; the thread does the mmap->pinned
     /// memcpy + async DMA off the main thread, so the upload overlaps compute.
     /// No-op / falls back to synchronous uploads if pinning or the thread fails.
     /// 128 MiB slots cover the largest DiT weight (mlp ~101 MiB).
@@ -737,7 +737,7 @@ pub const Backend = struct {
     }
 
     /// LLM weight residency: pin EVERY weight on first touch (immune to LRU
-    /// eviction), so decode never degrades to per-token PCIe re-streaming —
+    /// eviction), so decode never degrades to per-token PCIe re-streaming,
     /// an LLM that outgrows VRAM offloads whole layers to the CPU instead
     /// (measured ~2.5x faster than streaming, and streaming's LRU-vs-cyclic-
     /// walk pathology re-uploads ~the whole model per token the moment the
@@ -764,7 +764,7 @@ pub const Backend = struct {
 
     /// Prefetch-thread body: drain the request ring, uploading each weight through
     /// the pinned staging ring on the transfer stream (blocks THIS thread on the
-    /// mmap→pinned memcpy and slot reuse — never the main thread). Advances
+    /// mmap->pinned memcpy and slot reuse, never the main thread). Advances
     /// pf_completed so consumers know a weight's upload event is recorded.
     fn prefetchLoop(self: *Backend) void {
         _ = self.ctx.api.cuCtxSetCurrent(self.ctx.ctx);
@@ -775,7 +775,7 @@ pub const Backend = struct {
                 if (self.pf_shutdown.load(.acquire)) return; // drained + shutdown
                 // Ring empty: sleep until an enqueue (or shutdown) bumps pf_wake,
                 // instead of yield-spinning. Sample the wake signal, then re-check
-                // for work published in the meantime so no wakeup is lost — the
+                // for work published in the meantime so no wakeup is lost, the
                 // producer stores head BEFORE bumping pf_wake, so if it raced in
                 // after our top-of-loop head load, either the re-check sees it or
                 // pf_wake has already moved past `w` and the wait returns at once.
@@ -794,7 +794,7 @@ pub const Backend = struct {
 
     /// Queue a weight upload for the prefetch thread (main thread). Allocates the
     /// device buffer + event now (touching the cache/budget, which is main-only)
-    /// and enqueues the mmap→device copy for the thread. No-op if already cached.
+    /// and enqueues the mmap->device copy for the thread. No-op if already cached.
     pub fn prefetchWeight(self: *Backend, bytes: []const u8) void {
         if (!self.async_uploads) return;
         const key = @intFromPtr(bytes.ptr);
@@ -803,11 +803,11 @@ pub const Backend = struct {
             e.last_use = self.use_counter;
             return; // already resident or in flight
         }
-        // Bound prefetch-ahead by live VRAM (see pin_floor; off → no throttle,
+        // Bound prefetch-ahead by live VRAM (see pin_floor; off -> no throttle,
         // the LLM path). A prefetched weight is held `awaiting_use` (unevictable)
         // until the compute consumes it, so prefetching under pressure piles up
         // unreclaimable bytes and starves the current block's activation scratch
-        // — the exact OOM the [oom-dbg] "await=N" tally reports. When free VRAM is
+        // the exact OOM the [oom-dbg] "await=N" tally reports. When free VRAM is
         // at the floor, skip the prefetch: cachedWeight sync-loads the weight on
         // demand once the block's scratch has freed, and prefetch resumes as room
         // opens.
@@ -827,7 +827,7 @@ pub const Backend = struct {
             return;
         };
         const head = self.pf_head.load(.monotonic);
-        if (head - self.pf_tail.load(.acquire) >= pf_ring_sz) { // ring full — drop (sync fallback later)
+        if (head - self.pf_tail.load(.acquire) >= pf_ring_sz) { // ring full, drop (sync fallback later)
             self.ctx.eventDestroy(ev);
             if (pin) {
                 self.pinned_bytes -|= db.size; // refund: buffer returns to streamed circulation
@@ -915,7 +915,7 @@ pub const Backend = struct {
     }
 
     /// Headroom for a new weight upload (bytes). Bounded by the live device-free
-    /// query (cuMemGetInfo — sees other processes) and, if set, our --vram-budget
+    /// query (cuMemGetInfo, sees other processes) and, if set, our --vram-budget
     /// ceiling minus what we already hold.
     /// Live free device memory (headroom), for the dynamic KV/layer offload
     /// scheduler to decide when to migrate a layer to the host.
@@ -939,7 +939,7 @@ pub const Backend = struct {
             if (self.ctx.api.cuEventQuery(pf.ev) == cu.CUDA_SUCCESS) {
                 self.ctx.eventDestroy(pf.ev);
                 self.pending_free_bytes -= pf.db.size;
-                self.poolPut(pf.db); // recycle — cuMemFree under DMA load costs ~1 ms
+                self.poolPut(pf.db); // recycle, cuMemFree under DMA load costs ~1 ms
                 _ = self.free_pending.swapRemove(i);
             } else i += 1;
         }
@@ -963,13 +963,13 @@ pub const Backend = struct {
     /// the protected MRU).
     ///
     /// CRITICAL: never evict the MOST-recently-used weight. An op (e.g. opI8Gemm)
-    /// fetches its weight, then fetches weight_scale — that second fetch's reserve
+    /// fetches its weight, then fetches weight_scale, that second fetch's reserve
     /// must not free the weight the imminent kernel reads. Unlike Vulkan (where
     /// eviction flushes recorded ops already bound to the weight), CUDA launches
     /// after both fetches, so the just-fetched weight is protected here instead.
     ///
     /// Async path: DEFER the free (record a compute-stream event; reclaim once the
-    /// weight's last GEMM signals) so eviction doesn't stall the pipeline — the
+    /// weight's last GEMM signals) so eviction doesn't stall the pipeline, the
     /// buffer lingers a moment (soft-over-budget, physical VRAM has room) and the
     /// next weight uploads concurrently. Sync path: cuStreamSynchronize then free.
     /// Total device bytes currently held (weights + KV + buffers).
@@ -977,7 +977,7 @@ pub const Backend = struct {
         return self.ctx.device_used;
     }
 
-    /// Bytes held by UNPINNED cached weights — i.e. VRAM that will free itself
+    /// Bytes held by UNPINNED cached weights, i.e. VRAM that will free itself
     /// (evict + re-stream on next use) under allocation pressure. Added to the
     /// live free VRAM this is the room actually reachable for pinning the next
     /// model, even when another process holds part of the card.
@@ -1000,7 +1000,7 @@ pub const Backend = struct {
 
     /// Bytes currently held by the dequant staging buffers `opMatmulQuant` sizes
     /// to the widest weight it has been asked to expand. Zero until the first
-    /// BATCHED forward — which is exactly why `residency.demand` has to predict
+    /// BATCHED forward, which is exactly why `residency.demand` has to predict
     /// them for a cold model and net off this figure once they exist.
     pub fn dequantScratchBytes(self: *Backend) u64 {
         return self.fp8_w16.size + self.fp8_a16.size;
@@ -1014,7 +1014,7 @@ pub const Backend = struct {
     }
 
     /// Free resident weights so the footprint fits `budget` (the GUI VRAM limit
-    /// lowered while idle). Coarse: if over budget, drop the whole weight cache —
+    /// lowered while idle). Coarse: if over budget, drop the whole weight cache,
     /// the next generate() re-uploads what fits its (new) pin budget. Caller must
     /// bind the context and ensure no worker is in flight.
     pub fn trimToBudget(self: *Backend, budget: u64) void {
@@ -1028,7 +1028,7 @@ pub const Backend = struct {
         return self.ctx.memTagUsed(tag);
     }
 
-    /// Free a specific weight's device copy — the dynamic offload scheduler
+    /// Free a specific weight's device copy, the dynamic offload scheduler
     /// migrates a layer to the host, so its weights won't be read on the device
     /// again. Refunds the pin claim (LLM weights are always pinned), so a
     /// migrated-back layer can pin again. No-op if not resident.
@@ -1045,7 +1045,7 @@ pub const Backend = struct {
     }
 
     fn evictOneWeight(self: *Backend) bool {
-        // In-flight prefetches (pf_gen > pf_completed) must not be freed — the
+        // In-flight prefetches (pf_gen > pf_completed) must not be freed, the
         // prefetch thread is about to DMA into them.
         const completed = self.pf_completed.load(.acquire);
         var mru_use: u64 = 0;
@@ -1126,17 +1126,17 @@ pub const Backend = struct {
 
     /// LAST-resort reclaim (below evictOneWeight + the pool drain in tensorCreate's
     /// OOM ladder): free the prefetched-but-unconsumed weight FARTHEST from use.
-    /// Normally these `awaiting_use` buffers are protected — we prefetched them and
-    /// will consume them soon — but when another process grows its VRAM AFTER we
+    /// Normally these `awaiting_use` buffers are protected, we prefetched them and
+    /// will consume them soon, but when another process grows its VRAM AFTER we
     /// sized the prefetch (our free-memory estimate is now stale), reclaiming them
     /// is the only way to avoid a hard OOM. Prefetch is FIFO (the DiT walks blocks
     /// in order), so the HIGHEST gen is consumed last: evicting it is least
-    /// disruptive — it just re-streams synchronously much later, once nearer
+    /// disruptive, it just re-streams synchronously much later, once nearer
     /// weights have freed room. Returns false if no safe candidate exists.
     ///
     /// SAFETY: only `pf_gen <= pf_completed` weights are touchable. A weight with a
     /// higher gen is either still queued in the ring or has the transfer stream
-    /// mid-write into its buffer — freeing it is the use-after-free the teardown
+    /// mid-write into its buffer, freeing it is the use-after-free the teardown
     /// reorder fixed. Completed prefetches are ring-drained (pf_tail passed their
     /// slot); we still wait on the upload event so the enqueued DMA finishes before
     /// the free. Frees synchronously (a stall is fine on the about-to-OOM path).
@@ -1149,7 +1149,7 @@ pub const Backend = struct {
         while (it.next()) |e| {
             if (e.value_ptr.pinned) continue;
             if (!e.value_ptr.awaiting_use) continue; // only prefetched-not-consumed
-            if (e.value_ptr.pf_gen > completed) continue; // DMA in flight / ring-owned — NEVER free
+            if (e.value_ptr.pf_gen > completed) continue; // DMA in flight / ring-owned, NEVER free
             if (e.value_ptr.db.size <= evict_min_size) continue; // not worth the sync stall
             if (!found or e.value_ptr.pf_gen > best_gen) { // farthest from use = highest gen
                 best_gen = e.value_ptr.pf_gen;
@@ -1171,8 +1171,8 @@ pub const Backend = struct {
         return true;
     }
 
-    /// Evict cached weights LRU-first — INCLUDING pinned ones (under VAE-decode
-    /// memory pressure the resident DiT pin must yield) — until at least `want`
+    /// Evict cached weights LRU-first, INCLUDING pinned ones (under VAE-decode
+    /// memory pressure the resident DiT pin must yield), until at least `want`
     /// bytes are freed or nothing more is evictable, and return the bytes freed.
     /// Unlike `evictOneWeight` (streaming backstop: defers frees, protects the
     /// pin) this is the "make just enough room, keep the rest resident" path:
@@ -1241,7 +1241,7 @@ pub const Backend = struct {
     }
 
     /// Get a device buffer for a weight upload. Exact-size reuse from the
-    /// recycling pool first — streamed diffusion decode cycles the same
+    /// recycling pool first, streamed diffusion decode cycles the same
     /// handful of sizes every step, and cuMemAlloc/cuMemFree under an active
     /// DMA queue cost more than the transfers they serve.
     fn weightBufAcquire(self: *Backend, size: u64, pinned: bool) Error!DeviceBuffer {
@@ -1291,7 +1291,7 @@ pub const Backend = struct {
     /// Free recycled pool buffers for real to reclaim VRAM (tensorCreate OOM
     /// backstop). The pool holds streamed-weight buffers by size to dodge
     /// cuMemAlloc/Free churn in steady-state decode, but those bytes stay in
-    /// `streamed_bytes`/device_used and are invisible to evictOneWeight — so a
+    /// `streamed_bytes`/device_used and are invisible to evictOneWeight, so a
     /// large NON-weight allocation (activation scratch) can OOM with gigabytes
     /// sitting idle in the pool. Under that OOM the churn-avoidance trade must
     /// yield: free the pool, adjusting streamed_bytes. Returns bytes freed.
@@ -1335,7 +1335,7 @@ pub const Backend = struct {
     /// A device buffer that grows in place (KV caches under dynamic context):
     /// `buf.buf` is the base of a `va_size`-byte VMM virtual-address
     /// reservation with `buf.size` bytes of physical memory committed. Growth
-    /// commits more physical chunks — the pointer never moves, so recorded
+    /// commits more physical chunks, the pointer never moves, so recorded
     /// offsets and captured graphs stay valid. When the driver lacks the VMM
     /// entry points, or initial == max, `va_size` is 0 and `buf` is a plain
     /// full-size allocation (committed up front; growth is then free).
@@ -1401,7 +1401,7 @@ pub const Backend = struct {
         if (db.size >= size and db.buf != .null_handle) return;
         // Queued-but-unexecuted kernels may still read the old buffer;
         // cuMemFree does not wait for them (use-after-free, intermittent
-        // garbage under load — the CUDA twin of the Vulkan lab invariant
+        // garbage under load, the CUDA twin of the Vulkan rule
         // "ensureDeviceBuffer flushes the batch before reallocating").
         // Growth is rare (scratch reaches its high-water mark quickly), so
         // the sync is cheap.
@@ -1431,10 +1431,10 @@ pub const Backend = struct {
 
     /// Force one weight resident NOW rather than on its first use.
     ///
-    /// ⚠️ **This exists so weight upload stops being counted as prefill.**
+    /// This exists so weight upload stops being counted as prefill.
     /// `cachedWeight` uploads lazily, so without a warm-up pass the host->device
-    /// copy of every weight lands inside the FIRST forward — i.e. inside the `pp`
-    /// timer — which both inflates our prefill number and makes it incomparable to
+    /// copy of every weight lands inside the FIRST forward, i.e. inside the `pp`
+    /// timer, which both inflates our prefill number and makes it incomparable to
     /// llama.cpp, whose `prompt eval time` excludes upload because it offloads at
     /// model-load time. Measured on Bonsai-27B: a warm 13-token one-shot prefill
     /// took 743 ms, against 14 ms for the same prompt on a later turn of the SAME
@@ -1464,7 +1464,7 @@ pub const Backend = struct {
 
     /// Open a weight scope: weights cached from now on are tagged and
     /// released together by weightScopeEnd. Pre-existing entries (cache
-    /// hits during the scope) are untouched — the GPU ViT wraps its encode
+    /// hits during the scope) are untouched, the GPU ViT wraps its encode
     /// in a scope so a mid-session image drops exactly the ViT's weights,
     /// not the resident LLM weights whose device pointers a captured
     /// decode graph has baked in.
@@ -1475,7 +1475,7 @@ pub const Backend = struct {
     /// Free every weight cached since weightScopeBegin and drop its cache
     /// entry (the scope's host-pointer keys may die with the caller's
     /// arena). Syncs first: recorded ops may still read the buffers. Not
-    /// an eviction — the `evictions` counter (the decode-graph guard)
+    /// an eviction, the `evictions` counter (the decode-graph guard)
     /// stays untouched.
     pub fn weightScopeEnd(self: *Backend) void {
         self.weight_scope = false;
@@ -1499,7 +1499,7 @@ pub const Backend = struct {
     /// Free all UNPINNED cached weights (keep the pinned prefix), returning bytes
     /// freed. The diffusion pipeline calls this right after encode to drop the
     /// transient text encoder before sampling: at that point the DiT hasn't been
-    /// touched this image, so the only unpinned entries are the encoder's — and a
+    /// touched this image, so the only unpinned entries are the encoder's, and a
     /// DiT pinned by a PREVIOUS queued image (the GUI keeps it resident across the
     /// queue) is pinned, so it survives. Reliable regardless of buffer-pool tag
     /// reuse (keys on the `pinned` flag, set at cache time). Any stray leftover
@@ -1546,7 +1546,7 @@ pub const Backend = struct {
     /// Under memory pressure the LRU weight is evicted to make room; this weight
     /// re-uploads here on its next use (the host bytes are the mmap'd checkpoint).
     /// When async_uploads is on, the (re)upload runs on the transfer stream and
-    /// the compute stream waits on a per-weight event before the dependent GEMM —
+    /// the compute stream waits on a per-weight event before the dependent GEMM,
     /// so a re-upload overlaps the previous op's compute.
     fn cachedWeight(self: *Backend, bytes: []const u8) Error!DeviceBuffer {
         const key = @intFromPtr(bytes.ptr);
@@ -1554,7 +1554,7 @@ pub const Backend = struct {
         // A cached entry too small for `bytes` means the SAME host pointer was
         // cached earlier as a shorter slice (e.g. a shared zero-bias buffer
         // sliced to different GEMM widths). Returning it would read the tail out
-        // of bounds — drop it and re-upload at the larger size. Sync first: the
+        // of bounds, drop it and re-upload at the larger size. Sync first: the
         // stale buffer may still back queued reads.
         if (self.weights.getPtr(key)) |e| if (e.db.size < bytes.len) {
             _ = self.ctx.api.cuStreamSynchronize(self.ctx.stream);
@@ -1572,7 +1572,7 @@ pub const Backend = struct {
             // If prefetched (in flight), wait until the thread has queued its DMA +
             // recorded the event (block-ahead: usually already done, no wait). The
             // map isn't mutated during the wait (single main thread), so `e` stays
-            // valid — but we already copied what we need.
+            // valid, but we already copied what we need.
             if (gen != 0) {
                 const stall_t0 = ctxmod.monoNs();
                 while (self.pf_completed.load(.acquire) < gen) std.Thread.yield() catch {};
@@ -1581,13 +1581,13 @@ pub const Backend = struct {
             if (ev) |x| self.ctx.computeWaitEvent(x) catch {};
             return db;
         }
-        // Miss (not prefetched — e.g. the f32 first/last layers): plain synchronous
+        // Miss (not prefetched, e.g. the f32 first/last layers): plain synchronous
         // upload. The staging ring is used ONLY by the prefetch thread, so the main
         // thread never touches it here (no race).
         self.reserveForWeights(bytes.len);
         const pin = self.pinNew(bytes.len);
         // Refund the pin claim if the alloc/upload below fails: an OOM-retry
-        // loop (forward → offload → retry) otherwise re-claims the same weight
+        // loop (forward -> offload -> retry) otherwise re-claims the same weight
         // every attempt and pinned_bytes runs away into phantom terabytes.
         errdefer if (pin) {
             self.pinned_bytes -|= bytes.len;
@@ -1617,7 +1617,7 @@ pub const Backend = struct {
         // memory the working set + ongoing streaming still need and can't be
         // reclaimed by the streaming backstop, so pin_budget alone (blind to
         // the not-yet-allocated working set and to other processes) is not a
-        // safe ceiling. Off (pin_floor 0, the LLM path) → pure pin_budget, no
+        // safe ceiling. Off (pin_floor 0, the LLM path) -> pure pin_budget, no
         // query. On (diffusion) the query is cheap and runs only on first touch.
         if (self.pin_floor != 0 and self.ctx.memGetInfo().free < size + self.pin_floor) return false;
         self.pinned_bytes += size;
@@ -1650,9 +1650,9 @@ pub const Backend = struct {
     fn prepFn(self: *Backend, cols: usize, in_f16: bool) Error!cu.CUfunction {
         const key = cols | (if (in_f16) @as(usize, 1) << 40 else 0); // f16-input variant keyed separately
         if (self.prep_mods.get(key)) |f| return f;
-        // ⚠️ Distinguish the two failures: `UnsupportedWidth` means the FWHT would give
+        // Distinguish the two failures: `UnsupportedWidth` means the FWHT would give
         // each thread zero butterflies (cols < 1024), which is a silent non-rotation the
-        // generator now refuses — reporting it as OutOfMemory would send a reader after
+        // generator now refuses, reporting it as OutOfMemory would send a reader after
         // memory. No live linear is that narrow (the narrowest here is 1024).
         const ptx = kernels.buildPrep(self.gpa, cols, 8, in_f16) catch |e| switch (e) {
             error.UnsupportedWidth => {
@@ -1699,7 +1699,7 @@ pub const Backend = struct {
     }
 
     /// Native bf16 tensor-core GEMM (dense bf16 DiT): same tiling as hgemmFn but
-    /// the MMA consumes bf16 A/B directly (f32 accumulate) — no f16 round trip.
+    /// the MMA consumes bf16 A/B directly (f32 accumulate), no f16 round trip.
     /// Ampere+ (sm_80) only; callers must gate on cc_major >= 8.
     fn hgemmBf16Fn(self: *Backend) Error!cu.CUfunction {
         if (self.hgemm_bf16_mod != null) return self.hgemm_bf16_fn;
@@ -1721,7 +1721,7 @@ pub const Backend = struct {
         return self.hgemm_b_fn;
     }
 
-    /// Batched hgemm with f16 C output (scores → softmax path).
+    /// Batched hgemm with f16 C output (scores -> softmax path).
     fn hgemmBatchedC16Fn(self: *Backend) Error!cu.CUfunction {
         if (self.hgemm_bc16_mod != null) return self.hgemm_bc16_fn;
         const ptx = kernels.buildHgemm(self.gpa, true, true, false, false, true, false) catch return error.OutOfMemory;
@@ -1732,7 +1732,7 @@ pub const Backend = struct {
         return self.hgemm_bc16_fn;
     }
 
-    /// `hgemm_attnout` reading **f32** scores. See `buildHgemm`'s `a_f32`.
+    /// `hgemm_attnout` reading f32 scores. See `buildHgemm`'s `a_f32`.
     fn hgemmAttnOutA32Fn(self: *Backend) Error!cu.CUfunction {
         if (self.hgemm_ao32_mod != null) return self.hgemm_ao32_fn;
         const ptx = kernels.buildHgemm(self.gpa, true, false, true, false, true, true) catch return error.OutOfMemory;
@@ -1757,7 +1757,7 @@ pub const Backend = struct {
 
     /// Plain f32 GEMM: y[m][rows] = scale*(x[m][cols] @ Wᵀ) (+bias). y_off/x_off
     /// are BYTE offsets to the first row. Only f32 weights (dtype_f8=false) are
-    /// supported here — the int8 checkpoint's non-int8 layers (first/last) are f32.
+    /// supported here, the int8 checkpoint's non-int8 layers (first/last) are f32.
     pub fn opMatmul(self: *Backend, y: DeviceBuffer, y_off: u64, x: DeviceBuffer, x_off: u64, m: usize, w_bytes: []const u8, dtype_f8: bool, rows: usize, cols: usize, scale: f32, bias: ?[]const f32) Error!void {
         self.ptic();
         defer self.ptoc(.matmul);
@@ -1791,9 +1791,9 @@ pub const Backend = struct {
     /// fp8-e4m3 GEMM: y[m][rows] f32 = x[m][cols] f32 @ Wᵀ, W fp8-e4m3 [rows][cols]
     /// with a per-tensor `scale`. The fp8 weight streams through the cache; it is
     /// decoded to an f16 scratch (dequant_fp8_f16, scale folded), the activations
-    /// are converted to f16 with the m→128 pad zeroed, and the validated f16
+    /// are converted to f16 with the m->128 pad zeroed, and the validated f16
     /// buildHgemm produces the f32 output. rows,cols must be multiples of 128,32.
-    /// (No y_off / bias — the text encoder writes each GEMM to its own buffer.)
+    /// (No y_off / bias, the text encoder writes each GEMM to its own buffer.)
     pub fn opMatmulFp8(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, m: usize, w_bytes: []const u8, scale: f32, rows: usize, cols: usize) Error!void {
         self.ptic();
         defer self.ptoc(.matmul);
@@ -1821,17 +1821,17 @@ pub const Backend = struct {
     /// NVFP4 GEMM: `y[m][rows] f32 = x[m][cols] f32 @ Wᵀ`, W a packed NVFP4 weight.
     ///
     /// Structurally the fp8 path above: the 4-bit weight streams through the cache, is
-    /// decoded to an f16 scratch, and the validated f16 GEMM produces f32. **Weight-only
-    /// quantization, which is what NVFP4 is on anything below Blackwell** — its tensor
+    /// decoded to an f16 scratch, and the validated f16 GEMM produces f32. Weight-only
+    /// quantization, which is what NVFP4 is on anything below Blackwell, its tensor
     /// cores are sm_100+, and ComfyUI itself falls back to exactly this shape (its log
     /// calls it "emulated ops"): keep the weight 4-bit resident, dequantize per call.
     ///
     /// `scales` are the UNSWIZZLED per-block fp8 bytes and `levels` the `[256][16]` f16
-    /// table, both built once by the loader — so the resident cost is
+    /// table, both built once by the loader, so the resident cost is
     /// `rows*cols/2 + rows*cols/16 + 8192` instead of the 2 bytes/weight an f16 copy
     /// would take.
     ///
-    /// ⚠️ Shares `fp8_w16`/`fp8_a16` with the fp8 path. They hold the same thing (an f16
+    /// Shares `fp8_w16`/`fp8_a16` with the fp8 path. They hold the same thing (an f16
     /// weight and activation scratch at the same sizes) and no forward uses both formats
     /// for one GEMM, so one pair serves both rather than doubling the scratch.
     pub fn opMatmulNvfp4(
@@ -1845,8 +1845,8 @@ pub const Backend = struct {
         rows: usize,
         cols: usize,
         /// A zero vector of at least `rows` entries, from a STABLE full-width array the
-        /// caller owns. ⚠️ NOT `Backend.zeroBias`: that reallocates on growth and returns
-        /// the whole buffer, so its pointer moves — and `cachedWeight` keys on the host
+        /// caller owns. NOT `Backend.zeroBias`: that reallocates on growth and returns
+        /// the whole buffer, so its pointer moves, and `cachedWeight` keys on the host
         /// pointer, which would leave a device buffer registered against a freed address
         /// for a later allocation to collide with. Every caller already has a file-scope
         /// `zero_bias` for exactly this reason (see `zimage_cuda.gemm`'s note).
@@ -1866,13 +1866,13 @@ pub const Backend = struct {
         const f_deq = try self.eltFn(elt.nvfp4_decode_ptx, "nvfp4_decode");
         const threads = rows * cols / 8; // 8 elements (4 packed bytes) per thread
         try self.eltLaunch(f_deq, w_db, s_db, l_db, self.fp8_w16, .{ @intCast(threads), 0, 0, 0, 0, 0 }, .{ 0, 0 }, threads);
-        // ⚠️ **cuBLASLt takes an arbitrary `m` and writes exactly `m` rows**, so the libs
-        // arm needs neither the padded staging buffer nor the compaction pass below — the
+        // cuBLASLt takes an arbitrary `m` and writes exactly `m` rows, so the libs
+        // arm needs neither the padded staging buffer nor the compaction pass below, the
         // same fast path `opGemmBf16` takes. Forcing it through them cost two extra kernels
         // per GEMM plus ~2x the output volume in traffic (486 MB written + 481 MB
         // read-and-rewritten for one 1120x1680 MLP weight), which is what made `cuda`
-        // measure SLOWER than the hand-PTX arm at small sizes — an ordering that
-        // contradicts every other table in BACKEND.md and was the tell.
+        // measure SLOWER than the hand-PTX arm at small sizes, which is the opposite
+        // of the expected ordering.
         if (self.kernels == .libs) {
             try self.ensureDeviceBuffer(&self.fp8_a16, m * cols * 2);
             const f_c = try self.eltFn(elt.f32_to_bf16_pad2d_ptx, "f32_to_bf16_pad2d");
@@ -1880,13 +1880,13 @@ pub const Backend = struct {
             try self.ltMatmulBf16(y, self.fp8_w16, self.fp8_a16, rows, m, cols);
             return;
         }
-        // ⚠️ **bf16, not f16** — see `ops/nvfp4.zig`. The decoded weights are tiny, but this
+        // bf16, not f16, see `ops/nvfp4.zig`. The decoded weights are tiny, but this
         // converts the ACTIVATION to the same format, and Z-Image's trunk activations pass
         // f16's 65504 ceiling: an f16 path rendered it solid white on all three backends
         // identically. `f32_to_bf16_pad2d` zeroes the m-padding the GEMM's C tiles read.
         const f_cvt = try self.eltFn(elt.f32_to_bf16_pad2d_ptx, "f32_to_bf16_pad2d");
         try self.eltLaunch(f_cvt, x, self.fp8_a16, null, null, .{ @intCast(mpad * cols), @intCast(cols), @intCast(m), @intCast(cols), 0, 0 }, .{ 0, 0 }, mpad * cols);
-        // ⚠️ **The GEMM writes `mpad` rows, not `m`** — `launchHgemm` dispatches
+        // The GEMM writes `mpad` rows, not `m`, `launchHgemm` dispatches
         // `grid.y = mpad/128` and each block stores a whole 128x128 C tile, and the
         // cuBLASLt arm is handed `mpad` too. So it CANNOT write straight into a caller
         // buffer sized for `m`: measured as `CUDA_ERROR_ILLEGAL_ADDRESS` on Z-Image's
@@ -1894,7 +1894,7 @@ pub const Backend = struct {
         // a workspace sized `m*rows`. It stages into the padded `conv_c` and compacts,
         // exactly as `opGemmBf16` does for the same reason.
         //
-        // ⚠️ `opMatmulFp8` above still writes `y` directly and therefore carries the same
+        // `opMatmulFp8` above still writes `y` directly and therefore carries the same
         // requirement on its callers implicitly ("the text encoder writes each GEMM to its
         // own buffer"); its zimage/anima `.f8_e4m3` arms have never been exercised. Worth
         // fixing the same way if an fp8 checkpoint for either ever shows up.
@@ -1902,13 +1902,13 @@ pub const Backend = struct {
         const f_hg = try self.hgemmBf16Fn();
         try self.launchHgemm(f_hg, self.fp8_a16, self.fp8_w16, self.conv_c, mpad, rows, cols);
         // Strip the row padding into the tight `y`. These linears have no bias, but
-        // `bias_compact` needs a buffer regardless — the caller's full-width zero array.
+        // `bias_compact` needs a buffer regardless, the caller's full-width zero array.
         const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bias));
         const f_bc = try self.eltFn(elt.bias_compact_ptx, "bias_compact");
         try self.eltLaunch(f_bc, self.conv_c, b_db, y, null, .{ @intCast(m * rows), @intCast(rows), @intCast(rows), 0, 0, 0 }, .{ 1.0, 0 }, m * rows);
     }
 
-    /// Decode a packed NVFP4 weight to bf16 in `fp8_w16` and return it — the decode half of
+    /// Decode a packed NVFP4 weight to bf16 in `fp8_w16` and return it, the decode half of
     /// `opMatmulNvfp4`, exposed so a device test can check the kernel against
     /// `ops.nvfp4.decode` without a GEMM in the way.
     pub fn nvfp4ToBf16(
@@ -1930,7 +1930,7 @@ pub const Backend = struct {
     }
 
     /// Fused fp8 GEMV for m=1 decode: y[rows] f32 = scale * (W fp8 [rows][cols] @ x).
-    /// One 256-thread block per row, inline LUT dequant — no f16 scratch, each
+    /// One 256-thread block per row, inline LUT dequant, no f16 scratch, each
     /// weight byte is read exactly once (memory-bound optimal for decode).
     pub fn opGemvFp8(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, w_bytes: []const u8, scale: f32, rows: usize, cols: usize) Error!void {
         self.ptic();
@@ -1946,7 +1946,7 @@ pub const Backend = struct {
     }
 
     /// Multi-input fused fp8 GEMV: y[i][rows] f32 = scale * (W @ x_i) for
-    /// i < n (n <= 4), reading the fp8 weight once for all inputs — the
+    /// i < n (n <= 4), reading the fp8 weight once for all inputs, the
     /// small-batch regime (speculative verify, short multi-turn prefills)
     /// where opMatmulFp8's dequant-to-f16-scratch round trip costs ~5x the
     /// weight traffic. x must have 4 rows of backing store; rows beyond n
@@ -1970,7 +1970,7 @@ pub const Backend = struct {
     /// a block format with no kernel must check here and refuse rather than
     /// discover it as a panic mid-forward.
     ///
-    /// ⚠️ `.q2_0_g64` is deliberately absent while `.q2_0_g128` is present: they
+    /// `.q2_0_g64` is deliberately absent while `.q2_0_g128` is present: they
     /// share a GGUF type id and differ in block stride, so there is no kernel that
     /// serves both and running the wrong one is silent corruption, not a fault.
     pub fn quantKernelSupported(dt: dtypes.DType) bool {
@@ -1981,7 +1981,7 @@ pub const Backend = struct {
     }
 
     /// Fused ggml block-quant GEMV for m=1 decode: y[rows] f32 =
-    /// scale * (W quant [rows][cols] @ x), inline dequant — each weight byte
+    /// scale * (W quant [rows][cols] @ x), inline dequant, each weight byte
     /// read exactly once (memory-bound optimal, like opGemvFp8). cols must be
     /// a whole number of blocks; the k-quant kernels stage per-sub-block
     /// scales in an 8 KiB shared table, capping cols at 32768.
@@ -2005,7 +2005,7 @@ pub const Backend = struct {
         // q5_k/q6_k run warp-per-row (8 rows per block); the kernel guards
         // `row < rows`, so a non-multiple-of-8 row count (e.g. Gemma 3's
         // 262145-token tied head) just leaves the last block's extra warps
-        // idle — round the grid UP so every row is covered.
+        // idle, round the grid UP so every row is covered.
         const warp_per_row = dt == .q5_k or dt == .q6_k or dt == .iq4_nl or dt == .q1_0 or dt == .q2_0_g64 or dt == .q2_0_g128;
         const grid = if (warp_per_row) (rows + 7) / 8 else rows;
         try self.rowLaunch(f, w_db, x, y, null, .{ @intCast(rows), @intCast(cols), 0, 0, 0, 0 }, .{ scale, 0 }, grid);
@@ -2027,7 +2027,7 @@ pub const Backend = struct {
     }
 
     /// `opGemvQuantizeX` into a layout sized for `pad` elements while only
-    /// quantizing the first `real` — the region offsets (qs at nblk*4, sums at
+    /// quantizing the first `real`, the region offsets (qs at nblk*4, sums at
     /// nblk*4 + cols) are a function of the TOKEN COUNT, so a tiled consumer that
     /// reads whole 128-token tiles past the real count needs the bigger layout,
     /// not just a zeroed tail on the small one. The whole buffer is zeroed first
@@ -2050,7 +2050,7 @@ pub const Backend = struct {
 
     /// dp4a block-quant GEMV for m=1 decode against the q8 activation
     /// written by opGemvQuantizeX: y[rows] f32 = scale * (W quant @ x̂).
-    /// Integer dot products (llama.cpp mmvq math) — ~2.5x less ALU than
+    /// Integer dot products (llama.cpp mmvq math), ~2.5x less ALU than
     /// opGemvQuant's f32 path, which stays as the q8_0/q4_k fallback.
     pub fn opGemvQuantQ8(self: *Backend, dt: dtypes.DType, y: DeviceBuffer, w_bytes: []const u8, scale: f32, rows: usize, cols: usize) Error!void {
         self.ptic();
@@ -2060,7 +2060,7 @@ pub const Backend = struct {
         const w_db = try self.cachedWeight(w_bytes);
         // `TP_Q2_X2` selects q2_0's two-row kernel (see gemvQ2_0Q8X2Ptx). Off by
         // default and env-gated rather than compiled out, so the two forms can be
-        // A/B'd from ONE binary — which matters here because this box drifts
+        // A/B'd from ONE binary, which matters here because this box drifts
         // several percent between sessions and only an interleaved comparison of
         // the same build is trustworthy.
         const x2 = q2X2() and rows % 16 == 0 and (dt == .q2_0_g64 or dt == .q2_0_g128);
@@ -2083,7 +2083,7 @@ pub const Backend = struct {
         try self.rowLaunch(f, w_db, self.q8_act, y, null, .{ @intCast(rows), @intCast(cols), nt, 0, 0, 0 }, .{ scale, 0 }, if (x2) rows / 16 else rows / 8);
     }
 
-    /// Whether `opGemvQuantQ8Batch` has a kernel for this dtype — i.e. whether its
+    /// Whether `opGemvQuantQ8Batch` has a kernel for this dtype, i.e. whether its
     /// dp4a GEMV carries the token dimension in grid.y.
     pub fn quantQ8BatchSupported(dt: dtypes.DType) bool {
         return dt == .q1_0 or dt == .q2_0_g64 or dt == .q2_0_g128;
@@ -2096,9 +2096,9 @@ pub const Backend = struct {
     /// This exists for the SKINNY weights a GEMM cannot take: qwen35's GDN
     /// `ssm_alpha`/`ssm_beta` are [48, hidden], and `launchHgemm` computes
     /// `grid.x = rows/128`, so rows=48 would launch a zero-sized grid
-    /// (`CUDA_ERROR_INVALID_VALUE`). Prefill previously called the single-token
-    /// GEMV once per token for them, which measured a large part of the per-token
-    /// GDN loop's 46% share of prefill.
+    /// (`CUDA_ERROR_INVALID_VALUE`). The alternative, calling the single-token GEMV
+    /// once per token for them, is a large part of the per-token GDN loop's 46% share
+    /// of prefill.
     pub fn opGemvQuantQ8Batch(self: *Backend, dt: dtypes.DType, y: DeviceBuffer, w_bytes: []const u8, scale: f32, rows: usize, cols: usize, n: usize) Error!void {
         self.ptic();
         defer self.ptoc(.matmul);
@@ -2117,7 +2117,7 @@ pub const Backend = struct {
 
     /// Grouped dp4a GEMV for small-batch prefill: y[i][rows] f32 = scale *
     /// (W quant @ x̂_(row_off+i)) for ng <= 8 activation rows staged by ONE
-    /// opGemvQuantizeX(x, n*cols) — the weight streams once per pass instead
+    /// opGemvQuantizeX(x, n*cols), the weight streams once per pass instead
     /// of the dequant-to-f16 GEMM's ~6.5x traffic for small chunks.
     pub fn opGemvQuantQ8N(self: *Backend, dt: dtypes.DType, y: DeviceBuffer, w_bytes: []const u8, scale: f32, rows: usize, cols: usize, ng: usize, row_off: usize, n_total: usize) Error!void {
         self.ptic();
@@ -2137,7 +2137,7 @@ pub const Backend = struct {
         try self.rowLaunch(f, w_db, self.q8_act, y, null, .{ @intCast(rows), @intCast(cols), @intCast(ng), @intCast(row_off), @intCast(n_total * cols / 32), 0 }, .{ scale, 0 }, rows / 8);
     }
 
-    /// ggml block-quant GEMM (prefill): the opMatmulFp8 shape — dequant the
+    /// ggml block-quant GEMM (prefill): the opMatmulFp8 shape, dequant the
     /// weight to the shared f16 scratch, convert/pad the activations, run the
     /// f16 tensor-core GEMM. rows,cols must be multiples of 128,32.
     /// Column tiles per warp / warps per block for the MMQ kernel. nt*8 = 128
@@ -2208,7 +2208,7 @@ pub const Backend = struct {
     pub const mmq_pipe_tile = 128;
 
     /// Whether `opMatmulQuantMmqPipe` has a kernel for this shape/dtype. Having a
-    /// kernel is not the same as it being the fastest choice — q6_k's is correct
+    /// kernel is not the same as it being the fastest choice, q6_k's is correct
     /// but loses to dequant+f16 on real shapes (see `buildMmqPipeQ6K`), so the
     /// decision of what to actually call belongs to the caller.
     pub fn mmqPipeSupported(dt: dtypes.DType, rows: usize, cols: usize) bool {
@@ -2269,7 +2269,7 @@ pub const Backend = struct {
     }
 
     /// MMQ: y[m][rows] f32 = W(q4_k)[rows][cols] @ x[m][cols], computed on the s8
-    /// tensor cores straight from the packed nibbles — no f16 weight expansion in
+    /// tensor cores straight from the packed nibbles, no f16 weight expansion in
     /// global memory (see the MMQ block comment in kernels.zig). `x` is f32 and is
     /// quantized to q8_1 here; that quantize is per-activation, so a caller doing
     /// several weights against the same x can hoist it (this op re-quantizes).
@@ -2353,7 +2353,7 @@ pub const Backend = struct {
 
     /// f16 GEMV (small high-precision weights some GGUF quants keep at f16,
     /// e.g. Unsloth ssm_alpha/ssm_beta). Same call shape as `opGemvBf16`; the
-    /// only difference is the kernel's per-lane f16→f32 decode.
+    /// only difference is the kernel's per-lane f16->f32 decode.
     pub fn opGemvF16(self: *Backend, y: DeviceBuffer, x: DeviceBuffer, w_bytes: []const u8, scale: f32, rows: usize, cols: usize) Error!void {
         self.ptic();
         defer self.ptoc(.matmul);
@@ -2384,7 +2384,7 @@ pub const Backend = struct {
     /// per lane) or 256 (8 dims per lane, qwen35).
     /// Flash-decode attention. `window` (0 = full causal) enables a sliding
     /// window: query at absolute position p attends only keys in
-    /// (p - window, p] — Gemma 3 local layers, and any future SWA arch. The
+    /// (p - window, p], Gemma 3 local layers, and any future SWA arch. The
     /// bound is applied per query (kv_len0 + t), so it works for both a single
     /// decode row and a batched prefill.
     /// `ring` (> 0) enables sliding-window ring addressing in the h256 kernel:
@@ -2403,7 +2403,7 @@ pub const Backend = struct {
         if (attnSplitGroupOk(hd, kv_fmt, window, ring, bidir, seq_q, n_heads, kv_heads)) {
             // Prefill: share the KV fragment across the query-head group, which cuts
             // L2->SM traffic by `group`. That traffic, not arithmetic, is what bounds
-            // prefill attention — see `kernels.buildAttnSplitGroup`. Checked FIRST
+            // prefill attention, see `kernels.buildAttnSplitGroup`. Checked FIRST
             // because the model this matters for (qwen3.5) has hd=256.
             const group = n_heads / kv_heads;
             const f_split = try self.attnGroupFn(hd, group, kv_fmt);
@@ -2591,7 +2591,7 @@ pub const Backend = struct {
         try self.eltLaunch(f, qg, q, gate, null, .{ @intCast(total), @intCast(hd), 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
-    /// a[i] *= sigmoid(b[i]) — the qwen35 attention output gate.
+    /// a[i] *= sigmoid(b[i]), the qwen35 attention output gate.
     pub fn opMulSigmoid(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, total: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
@@ -2633,7 +2633,7 @@ pub const Backend = struct {
 
     /// Batched causal conv + SiLU over a whole prefill chunk: `n` tokens in two
     /// launches instead of `n` (see `elt.gdn_conv_batch_ptx` for why this is
-    /// legal — it is a convolution, so tokens are independent given the carried
+    /// legal, it is a convolution, so tokens are independent given the carried
     /// state). The state roll is a separate launch because every token's threads
     /// read the same incoming state.
     pub fn opGdnConvBatch(self: *Backend, conv_state: DeviceBuffer, x: DeviceBuffer, conv_w: DeviceBuffer, out: DeviceBuffer, channels: usize, n: usize) Error!void {
@@ -2647,7 +2647,7 @@ pub const Backend = struct {
 
     /// Batched delta-net gates: `n` tokens in one launch. `alpha`/`beta` are
     /// separate [n][heads] buffers (two batched GEMVs), `out` is per token
-    /// `[decay(heads) | beta(heads)]` — the layout `opGdnDeltaStep` reads.
+    /// `[decay(heads) | beta(heads)]`, the layout `opGdnDeltaStep` reads.
     pub fn opGdnGatesBatch(self: *Backend, alpha: DeviceBuffer, beta: DeviceBuffer, a_dt: DeviceBuffer, out: DeviceBuffer, heads: usize, n: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
@@ -2671,7 +2671,7 @@ pub const Backend = struct {
     /// Whether the group-shared prefill attention kernel covers this call. Narrow
     /// on purpose: it only implements hd=128 / f32 KV / full causal, and only pays
     /// off when there are several queries AND several heads per kv head. Everything
-    /// else keeps the general `attn_split`, which is the honest default — the two
+    /// else keeps the general `attn_split`, which is the honest default, the two
     /// are bit-identical per head, so this predicate is a pure performance choice.
     pub fn attnSplitGroupOk(hd: usize, kv_fmt: KvFmt, window: usize, ring: usize, bidir: bool, seq_q: usize, n_heads: usize, kv_heads: usize) bool {
         _ = kv_fmt; // all three KV formats have a variant now
@@ -2699,12 +2699,12 @@ pub const Backend = struct {
     }
 
     /// Whole-chunk gated-delta-net recurrence with the state resident in registers
-    /// — one launch per layer per chunk instead of one per token, and the
-    /// `[heads][d][d]` state read/written once instead of `n` times. **Bit-identical
-    /// to `opGdnDeltaStep`**; see `kernels.buildGdnDeltaChunk` for why that matters
+    /// one launch per layer per chunk instead of one per token, and the
+    /// `[heads][d][d]` state read/written once instead of `n` times. Bit-identical
+    /// to `opGdnDeltaStep`; see `kernels.buildGdnDeltaChunk` for why that matters
     /// and what it constrains.
     ///
-    /// `conv_out` is [n][channels] and `gates` [n][2*heads] — the batched layouts —
+    /// `conv_out` is [n][channels] and `gates` [n][2*heads], the batched layouts,
     /// and `o` is [n][heads*d].
     pub fn opGdnDeltaChunk(self: *Backend, state: DeviceBuffer, conv_out: DeviceBuffer, gates: DeviceBuffer, o: DeviceBuffer, heads: usize, d: usize, k_heads: usize, n: usize, channels: usize, scale: f32) Error!void {
         self.ptic();
@@ -2749,13 +2749,13 @@ pub const Backend = struct {
         try self.rowLaunch(f, state, conv_out, gates, o, .{ @intCast(heads), @intCast(d), @intCast(k_heads), 0, 0, 0 }, .{ scale, 0 }, heads);
     }
 
-    /// Tree-verify flash-decoding attention (LLM_PLAN.md M8): seq_q tree
+    /// Tree-verify flash-decoding attention: seq_q tree
     /// nodes, node t attending kv rows [0, prefix_len) of the linear cache
     /// plus its ancestor chain stored at rows tree_base+idx of the SAME k/v
     /// buffers. Per-query kv lengths and ancestor row lists live in a meta
     /// table at the scratch tail (see elt.attn_split_tree_ptx; the caller
     /// uploads it before the batch). Chunking matches the decode kernel at
-    /// the same kv_len — merged outputs are bitwise-identical to plain
+    /// the same kv_len, merged outputs are bitwise-identical to plain
     /// decode. hd must be 128.
     pub fn opAttnDecodeTree(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, scratch: DeviceBuffer, prefix_len: usize, tree_base: usize, seq_q: usize, n_heads: usize, kv_heads: usize, hd: usize, nsplit: usize, scale: f32) Error!void {
         self.ptic();
@@ -2793,7 +2793,7 @@ pub const Backend = struct {
         self.ctx.launch(f, .{ @intCast(grid_rows), 1, 1 }, .{ 256, 1, 1 }, 0, &params) catch return error.CudaError;
     }
 
-    /// `rowLaunch` with a second grid dimension — used by the batched decode
+    /// `rowLaunch` with a second grid dimension, used by the batched decode
     /// GEMVs, where grid.y is the TOKEN so one launch covers a whole chunk.
     fn rowLaunch2(self: *Backend, f: cu.CUfunction, b0: ?DeviceBuffer, b1: ?DeviceBuffer, b2: ?DeviceBuffer, b3: ?DeviceBuffer, u: [6]u32, fp: [2]f32, grid_rows: usize, grid_y: usize) Error!void {
         var p0: cu.CUdeviceptr = if (b0) |b| b.ptr() else 0;
@@ -2812,7 +2812,7 @@ pub const Backend = struct {
 
     /// f16 tensor-core conv/GEMM for the VAE: y[m][co] f32 = x[m][k] f32 @ Wᵀ + bias,
     /// W f32 [co][k]. Weight and activation convert to f16 zero-padded to the coop
-    /// tile (co→128-mult, k→32-mult, m→128), the validated buildHgemm produces a
+    /// tile (co->128-mult, k->32-mult, m->128), the validated buildHgemm produces a
     /// padded f32 tile, and bias_compact strips the pad + adds bias into `dst` at
     /// `dst_off_elems`. Much faster than the f32 GEMM for the large (co≥96) convs.
     pub fn opConvF16(self: *Backend, dst: DeviceBuffer, dst_off_elems: usize, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: []const f32) Error!void {
@@ -2823,17 +2823,17 @@ pub const Backend = struct {
     /// the GEMM result multiplied back afterwards. `act_div = 1.0` is exactly
     /// `opConvF16`.
     ///
-    /// ⚠️ This exists because **f16's 65504 ceiling is a real limit on real
-    /// checkpoints, not a theoretical one**: an SDXL VAE decoder's residual stream
-    /// reaches ~4.2e5 (measured at a 64² latent — the upsample conv's f32 output is
+    /// This exists because f16's 65504 ceiling is a real limit on real
+    /// checkpoints, not a theoretical one: an SDXL VAE decoder's residual stream
+    /// reaches ~4.2e5 (measured at a 64² latent, the upsample conv's f32 output is
     /// 1.26e5 and the next block's 1x1 shortcut reads it), so casting the activation
     /// to f16 produced `inf`, the following GroupNorm turned `inf` into NaN through
-    /// its mean, and **every SDXL render at 512² or larger came out solid white with
-    /// no error anywhere**. SD1.5's VAE peaks two orders lower, which is why the
+    /// its mean, and every SDXL render at 512² or larger came out solid white with
+    /// no error anywhere. SD1.5's VAE peaks two orders lower, which is why the
     /// same code was correct for years on that family.
     ///
-    /// The correction is exact when `act_div` is a power of two — it only shifts the
-    /// exponent, and f16 keeps all 11 mantissa bits — and it is free, because both
+    /// The correction is exact when `act_div` is a power of two, it only shifts the
+    /// exponent, and f16 keeps all 11 mantissa bits, and it is free, because both
     /// halves fold into kernels that already read every element (`f32_to_f16_pad2d`
     /// and `bias_compact`). Values below `6e-8 * act_div` do underflow to zero,
     /// which is why the caller picks the smallest divisor that clears its measured
@@ -2845,7 +2845,7 @@ pub const Backend = struct {
     }
 
     /// `opConvF16Scaled` with f16 activation STORAGE on either side. The GEMM is
-    /// unchanged — it already ran f16 operands with an f32 accumulator; these flags
+    /// unchanged, it already ran f16 operands with an f32 accumulator; these flags
     /// only say how `src` and `dst` are laid out in memory, which is where a VAE
     /// decode's gigabytes actually live.
     pub fn opConvF16Prec(self: *Backend, dst: DeviceBuffer, dst_off_elems: usize, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: []const f32, act_div: f32, src_f16: bool, dst_f16: bool) Error!void {
@@ -2860,11 +2860,11 @@ pub const Backend = struct {
         try self.ensureDeviceBuffer(&self.conv_a16, m_pad * k_pad * 2);
         try self.ensureDeviceBuffer(&self.conv_c, m_pad * co_pad * 4);
         const f_pad = try self.eltFn(elt.f32_to_f16_pad2d_ptx, "f32_to_f16_pad2d");
-        // The WEIGHT is never scaled — conv weights are O(1) and it is the
+        // The WEIGHT is never scaled, conv weights are O(1) and it is the
         // activation that overflows.
         try self.eltLaunch(f_pad, w_db, self.conv_w16, null, null, .{ @intCast(co_pad * k_pad), @intCast(k_pad), @intCast(co), @intCast(k), 0, 0 }, .{ 1.0, 0 }, co_pad * k_pad);
         // An f16 source is already in the GEMM's format: `f16_pad2d` only pads.
-        // ⚠️ It takes no scale, so an f16 source cannot carry `act_div` — asserted
+        // It takes no scale, so an f16 source cannot carry `act_div`, asserted
         // rather than silently ignored, since that is a wrong image, not an error.
         if (src_f16) {
             std.debug.assert(act_div == 1.0);
@@ -2888,18 +2888,18 @@ pub const Backend = struct {
 
     /// Native bf16 GEMM: dst[m][co] f32 = src[m][k] f32 @ Wᵀ + bias, W bf16
     /// [co][k]. The weight is fed to the bf16 tensor cores DIRECTLY from the
-    /// cached raw checkpoint bytes — no f16 conversion, so a streamed weight is
+    /// cached raw checkpoint bytes, no f16 conversion, so a streamed weight is
     /// touched exactly once (DMA in, read by the MMA). Requires co%128==0 and
     /// k%32==0 (true for every krea2 DiT block linear) so the raw [co][k] layout
-    /// is already the GEMM's B operand — no pad/transpose. Only the small
-    /// activation converts (f32→bf16) per call. Ampere+ only (bf16 MMA).
+    /// is already the GEMM's B operand, no pad/transpose. Only the small
+    /// activation converts (f32->bf16) per call. Ampere+ only (bf16 MMA).
     ///
-    /// ⚠️ `bias` is OPTIONAL, and passing `null` is not just tidier — under
+    /// `bias` is OPTIONAL, and passing `null` is not just tidier, under
     /// `.libs` it removes a whole streaming pass. With no bias to add and
     /// cuBLASLt free of the hand-PTX kernel's `m % 128` tiling rule, the GEMM can
     /// write its f32 result straight into `dst`: no `m` padding, no `conv_c`
     /// staging buffer, and no `bias_compact` re-read of the entire output. That
-    /// pass moves `m·co` f32 in and out again for what is otherwise a copy —
+    /// pass moves `m*co` f32 in and out again for what is otherwise a copy,
     /// measured at 70 GB per Z-Image step. Callers with a real bias (`dit_cuda`)
     /// keep the staged path unchanged.
     pub fn opGemmBf16(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: ?[]const f32) Error!void {
@@ -2917,16 +2917,13 @@ pub const Backend = struct {
             try self.ltMatmulBf16(dst, w_direct, self.conv_a16, co, m, k);
             return;
         }
-        // ⚠️ `bias.len >= co`, not `== co`. `sd_unet_cuda.gemm` deliberately passes its
+        // `bias.len >= co`, not `== co`. `sd_unet_cuda.gemm` deliberately passes its
         // WHOLE `sess.zeros` array for a null bias (see the comment there: a bias is
         // cached by pointer and sized from the first call's length, so a narrow layer
         // seen first would leave every wider one reading past the end). The kernels read
-        // only `co` entries, so a longer slice is free — and `== co` asserted the exact
-        // opposite of the documented caller contract. Measured 2026-08-02: it panicked
-        // on any **f16 or bf16 SD checkpoint** on CUDA, i.e. these branches had never
-        // run — the published SD CUDA timings were taken on an F32 checkpoint, which
-        // routes to `opMatmul`/`opConvF16` instead. Debug-only, since asserts vanish in
-        // ReleaseFast, so it was a build-mode-dependent crash rather than a wrong number.
+        // only `co` entries, so a longer slice is free. Asserting `== co` is the exact
+        // opposite of the caller contract and panics on any f16 or bf16 SD checkpoint,
+        // in Debug only, since asserts vanish in ReleaseFast.
         const bias_s = bias orelse try self.zeroBias(co);
         std.debug.assert(w_bytes.len == co * k * 2 and bias_s.len >= co);
         std.debug.assert(co % 128 == 0 and k % 32 == 0); // raw weight IS the B operand
@@ -2953,22 +2950,19 @@ pub const Backend = struct {
     /// opConvF16's bf16-weight twin (ViT GEMMs over the mmproj's bf16
     /// tensors): dst[m][co] f32 = src[m][k] f32 @ Wᵀ + bias, W bf16 [co][k]
     /// straight from the GGUF mmap. Weight and activation convert to f16
-    /// zero-padded to the coop tile (co→128-mult, k→32-mult, m→128), then
+    /// zero-padded to the coop tile (co->128-mult, k->32-mult, m->128), then
     /// bias_compact strips the pad + adds bias into the tight dst. Handles
     /// any co/k (e.g. the ViT's ffn 4304).
     pub fn opMatmulBf16(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: ?[]const f32) Error!void {
         self.ptic();
         defer self.ptoc(.matmul);
-        // ⚠️ `bias.len >= co`, not `== co`. `sd_unet_cuda.gemm` deliberately passes its
+        // `bias.len >= co`, not `== co`. `sd_unet_cuda.gemm` deliberately passes its
         // WHOLE `sess.zeros` array for a null bias (see the comment there: a bias is
         // cached by pointer and sized from the first call's length, so a narrow layer
         // seen first would leave every wider one reading past the end). The kernels read
-        // only `co` entries, so a longer slice is free — and `== co` asserted the exact
-        // opposite of the documented caller contract. Measured 2026-08-02: it panicked
-        // on any **f16 or bf16 SD checkpoint** on CUDA, i.e. these branches had never
-        // run — the published SD CUDA timings were taken on an F32 checkpoint, which
-        // routes to `opMatmul`/`opConvF16` instead. Debug-only, since asserts vanish in
-        // ReleaseFast, so it was a build-mode-dependent crash rather than a wrong number.
+        // only `co` entries, so a longer slice is free. Asserting `== co` is the exact
+        // opposite of the caller contract and panics on any f16 or bf16 SD checkpoint,
+        // in Debug only, since asserts vanish in ReleaseFast.
         const bias_s = bias orelse try self.zeroBias(co);
         std.debug.assert(w_bytes.len == co * k * 2 and bias_s.len >= co);
         const co_pad = std.mem.alignForward(usize, co, 128);
@@ -2995,20 +2989,17 @@ pub const Backend = struct {
 
     /// Like `opMatmulBf16` but for an f16 weight (some GGUF mmproj towers ship
     /// f16, e.g. Qwen3.5-9B's). Identical except the weight is padded with a
-    /// straight f16 copy instead of a bf16→f16 convert.
+    /// straight f16 copy instead of a bf16->f16 convert.
     pub fn opMatmulF16(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: ?[]const f32) Error!void {
         self.ptic();
         defer self.ptoc(.matmul);
-        // ⚠️ `bias.len >= co`, not `== co`. `sd_unet_cuda.gemm` deliberately passes its
+        // `bias.len >= co`, not `== co`. `sd_unet_cuda.gemm` deliberately passes its
         // WHOLE `sess.zeros` array for a null bias (see the comment there: a bias is
         // cached by pointer and sized from the first call's length, so a narrow layer
         // seen first would leave every wider one reading past the end). The kernels read
-        // only `co` entries, so a longer slice is free — and `== co` asserted the exact
-        // opposite of the documented caller contract. Measured 2026-08-02: it panicked
-        // on any **f16 or bf16 SD checkpoint** on CUDA, i.e. these branches had never
-        // run — the published SD CUDA timings were taken on an F32 checkpoint, which
-        // routes to `opMatmul`/`opConvF16` instead. Debug-only, since asserts vanish in
-        // ReleaseFast, so it was a build-mode-dependent crash rather than a wrong number.
+        // only `co` entries, so a longer slice is free. Asserting `== co` is the exact
+        // opposite of the caller contract and panics on any f16 or bf16 SD checkpoint,
+        // in Debug only, since asserts vanish in ReleaseFast.
         const bias_s = bias orelse try self.zeroBias(co);
         std.debug.assert(w_bytes.len == co * k * 2 and bias_s.len >= co);
         const co_pad = std.mem.alignForward(usize, co, 128);
@@ -3033,7 +3024,7 @@ pub const Backend = struct {
         try self.eltLaunch(f_bc, self.conv_c, b_db, dst, null, .{ @intCast(m * co), @intCast(co), @intCast(co_pad), 0, 0, 0 }, .{ 1.0, 0 }, m * co);
     }
 
-    /// Free the shared GEMM conversion scratch (conv_w16/a16/c — the padded
+    /// Free the shared GEMM conversion scratch (conv_w16/a16/c, the padded
     /// f16 weight/activation planes and the padded f32 C). The GPU ViT calls
     /// this after encoding so image-sized scratch doesn't stay resident
     /// through the LLM session. Syncs first (recorded ops may still read it).
@@ -3044,7 +3035,7 @@ pub const Backend = struct {
         self.tensorDestroy(&self.conv_c);
     }
 
-    /// cuDNN fused 3×3 NHWC convolution (.libs mode) — the VAE's big convs.
+    /// cuDNN fused 3×3 NHWC convolution (.libs mode), the VAE's big convs.
     /// dst[dst_off_elems..][n][co] f32 = conv3x3(src[n][ci] f32, W[co][3][3][ci]
     /// f32) + bias. src/weight convert to f16 (tensor cores, f32 accumulate),
     /// cuDNN writes f16, then `bias_add_f16` adds the per-channel bias into the
@@ -3193,7 +3184,7 @@ pub const Backend = struct {
 
     /// s32 = Wᵀ @ A on int8 tensor cores via cuBLASLt. `w` is the weight W[n][k]
     /// row-major; `a` the prepped activation A[m][k] row-major; `d` the s32
-    /// accumulator (row-major [m][n]). cuBLASLt does ONLY the GEMM — the
+    /// accumulator (row-major [m][n]). cuBLASLt does ONLY the GEMM, the
     /// per-row×per-col rescale is a separate `irescale` pass.
     pub fn ltMatmulI8(self: *Backend, d: DeviceBuffer, w: DeviceBuffer, a: DeviceBuffer, n: usize, m: usize, k: usize) Error!void {
         const plan = try self.ltPlan(.i8, n, m, k);
@@ -3203,7 +3194,7 @@ pub const Backend = struct {
     }
 
     /// f32 D[m][n] = A[m][k](f16) @ W[n][k](f16)ᵀ on the f16 tensor cores (HMMA,
-    /// f32 accumulate) via cuBLASLt — the drop-in for the hand-PTX `buildHgemm`
+    /// f32 accumulate) via cuBLASLt, the drop-in for the hand-PTX `buildHgemm`
     /// used by the fp8 encoder GEMMs and the VAE convs.
     pub fn ltMatmulF16(self: *Backend, d: DeviceBuffer, w: DeviceBuffer, a: DeviceBuffer, n: usize, m: usize, k: usize) Error!void {
         const plan = try self.ltPlan(.f16, n, m, k);
@@ -3267,8 +3258,8 @@ pub const Backend = struct {
         const mpad = std.mem.alignForward(usize, m, 128);
         try self.ensureDeviceBuffer(&self.i8_x, mpad * cols);
         try self.ensureDeviceBuffer(&self.i8_scale, mpad * 4);
-        // The prep kernel (grid = {m,1,1}) fully overwrites rows 0..m-1 — every
-        // column (cols % 1024 == 0, see buildPrep) plus i8_scale[row] — so only
+        // The prep kernel (grid = {m,1,1}) fully overwrites rows 0..m-1, every
+        // column (cols % 1024 == 0, see buildPrep) plus i8_scale[row], so only
         // the pad rows [m..mpad) need zeroing (GEMM pad rows -> 0 acc, scale 0).
         // When m is already 128-aligned there is no pad, so skip the memset
         // entirely. Async on the compute stream: stays ordered within the batch
@@ -3299,14 +3290,14 @@ pub const Backend = struct {
     /// Decode a packed ComfyUI `asym_w4a8_int8` weight into a reusable device scratch
     /// and run the ordinary int8 GEMM on it.
     ///
-    /// ⚠️ **The point of the scratch is that the 4-bit form stays resident**: a decoded
+    /// The point of the scratch is that the 4-bit form stays resident: a decoded
     /// krea2 is 12.2 GB of int8 against 6.1 GB packed, and materializing at load costs
     /// exactly the memory the format exists to save. This is also what ComfyUI's own
     /// Triton and CUDA backends do (`_dequant_int4_grouped_to_int8` into a per-call
     /// buffer, then `int8_linear`). The extra traffic is one 1.5x pass over the weight
     /// per GEMM, ~1% of a krea2 step.
     ///
-    /// ⚠️ One scratch serves every GEMM, so a decode must not be reordered past the
+    /// One scratch serves every GEMM, so a decode must not be reordered past the
     /// GEMM that consumes the previous one. That holds here because both are issued on
     /// `ctx.stream` and CUDA kernels on one stream serialize; do NOT move either into a
     /// concurrent stream without giving each its own scratch.
@@ -3326,7 +3317,7 @@ pub const Backend = struct {
         return self.opI8GemmDev(y, w_db, weight_scale, rows, c_h16);
     }
 
-    /// Bytes of int8 scratch a W4A8 weight of this shape decodes into here — the raw
+    /// Bytes of int8 scratch a W4A8 weight of this shape decodes into here, the raw
     /// `[rows][cols]` the hand-PTX and cuBLASLt int8 GEMMs both read directly. (Vulkan's
     /// rule differs: its GEMM wants a row-padded k-major copy.)
     pub fn w4a8ScratchBytes(rows: usize, cols: usize) usize {
@@ -3336,7 +3327,7 @@ pub const Backend = struct {
     /// Decode packed W4A8 -> int8 into `self.w4a8_i8` and return it.
     ///
     /// The packed weight, its fp8 group scales and its 4 KiB level table all go through
-    /// the ordinary weight cache, so they stream and evict like any other weight — the
+    /// the ordinary weight cache, so they stream and evict like any other weight, the
     /// resident cost is `rows*cols/2 + rows*cols/group_size + 4096` instead of
     /// `rows*cols`.
     pub fn w4a8ToI8(
@@ -3392,9 +3383,9 @@ pub const Backend = struct {
 
     fn i4prepFn(self: *Backend, cols: usize) Error!cu.CUfunction {
         if (self.i4_prep_mods.get(cols)) |f| return f;
-        // ⚠️ Distinguish the two failures: `UnsupportedWidth` means the FWHT would give
+        // Distinguish the two failures: `UnsupportedWidth` means the FWHT would give
         // each thread zero butterflies (cols < 1024), which is a silent non-rotation the
-        // generator now refuses — reporting it as OutOfMemory would send a reader after
+        // generator now refuses, reporting it as OutOfMemory would send a reader after
         // memory. No live linear is that narrow (the narrowest here is 1024).
         const ptx = kernels.buildPrep(self.gpa, cols, 4, false) catch |e| switch (e) {
             error.UnsupportedWidth => {
@@ -3426,7 +3417,7 @@ pub const Backend = struct {
     /// x[m][cols] to s4 [-8,7], nibble-packed 2/byte -> i8_x (reused as the
     /// packed-s4 activation scratch) + i8_scale (per-row f32), padding m up to
     /// 128. Consumed by opI4Gemm. (The i8_* state is a homogeneous checkpoint's
-    /// single "prepped activation" slot — a run is all-i8 or all-i4.)
+    /// single "prepped activation" slot, a run is all-i8 or all-i4.)
     pub fn opI4Prep(self: *Backend, x: DeviceBuffer, m: usize, cols: usize) Error!void {
         self.ptic();
         defer self.ptoc(.prep);
@@ -3472,7 +3463,7 @@ pub const Backend = struct {
 
     // ---- eltwise / attention (correctness-first f32 kernels) ----------------
 
-    // --- decode-graph support (CUDA graphs, LLM_PLAN.md M6) ----------------
+    // --- decode-graph support (CUDA graphs) ----------------
 
     /// Lazy-load the decode-state module (one g_state global shared by the
     /// graph-mode kernel entries) and resolve its pieces.
@@ -3577,7 +3568,7 @@ pub const Backend = struct {
         try self.eltLaunch(f, src, dst, null, null, .{ @intCast(count), @intCast(stride), @intCast(base), 0, 0, 0 }, .{ 0, 0 }, count);
     }
 
-    /// dst[dst_off + i] = src[src_off + i] as a kernel — usable inside
+    /// dst[dst_off + i] = src[src_off + i] as a kernel, usable inside
     /// recorded batches and graph captures (unlike the null-stream memcpy).
     pub fn opCopyOff(self: *Backend, dst: DeviceBuffer, dst_off_elems: usize, src: DeviceBuffer, src_off_elems: usize, count: usize) Error!void {
         const f = try self.eltFn(elt.copy_off_ptx, "copy_off");
@@ -3653,10 +3644,10 @@ pub const Backend = struct {
     }
 
     /// out = (x - mean)*inv*mod[premul+c] + mod[shift+c], inv = 1/sqrt(var+eps).
-    /// Fused **weightless** LayerNorm + AdaLN modulation — `anima.modulatedNorm` —
+    /// Fused weightless LayerNorm + AdaLN modulation, `anima.modulatedNorm`,
     /// one 256-thread block per row with a two-pass (deviation-based) variance.
     ///
-    /// ⚠️ `premul` must already carry the `(1 + scale)` fold, as `rmsMod`'s does, so
+    /// `premul` must already carry the `(1 + scale)` fold, as `rmsMod`'s does, so
     /// one host-built table serves this and Vulkan's `opLnModSg`.
     pub fn lnMod(self: *Backend, x: DeviceBuffer, out: DeviceBuffer, mod: DeviceBuffer, rows: usize, dim: usize, premul_off: usize, shift_off: usize, eps: f32) Error!void {
         self.ptic();
@@ -3678,7 +3669,7 @@ pub const Backend = struct {
         }
         // Many rows: a WARP each, so the 32 lanes of a load cover one contiguous
         // line. The one-thread-per-row kernel this replaced was reading a whole
-        // row per lane — see `qk_rmsnorm_warp_ptx` for the measurement, but the
+        // row per lane, see `qk_rmsnorm_warp_ptx` for the measurement, but the
         // short version is 37-47 GB/s on a 936 GB/s card, and a quarter of a
         // Z-Image step. 256 threads = 8 rows per block.
         const f = try self.eltFn(elt.qk_rmsnorm_warp_ptx, "qk_rmsnorm_warp");
@@ -3696,7 +3687,7 @@ pub const Backend = struct {
 
     /// naive GQA attention, online softmax, f32. out[q][h][c]. `causal`
     /// treats the seq_q queries as the last positions of the seq_kv keys
-    /// (square when equal — text encoder; seq_q 1 — KV-cached LLM decode);
+    /// (square when equal, text encoder; seq_q 1, KV-cached LLM decode);
     /// the DiT passes false.
     pub fn attn(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, seq_q: usize, seq_kv: usize, n_heads: usize, kv_heads: usize, hd: usize, scale: f32, causal: bool) Error!void {
         self.ptic();
@@ -3709,9 +3700,9 @@ pub const Backend = struct {
     /// Block-diagonal BATCHED non-causal attention over B ragged items packed
     /// into one [total, heads*hd] (q/out) / [total, kv*hd] (k/v) activation.
     /// `bounds` is a device u32[2*total]: bounds[q]=item-start row,
-    /// bounds[total+q]=item-end (exclusive) for each query row q — so query q
+    /// bounds[total+q]=item-end (exclusive) for each query row q, so query q
     /// attends only its own item's keys. One launch over all total*heads
-    /// (query,head) threads (vs a per-item loop of B tiny launches) → the
+    /// (query,head) threads (vs a per-item loop of B tiny launches) -> the
     /// parallelism short-sequence encoder attention needs to fill the GPU.
     pub fn opAttnBatched(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, bounds: DeviceBuffer, total: usize, n_heads: usize, kv_heads: usize, hd: usize, scale: f32) Error!void {
         self.ptic();
@@ -3734,7 +3725,7 @@ pub const Backend = struct {
     }
 
     /// rotate-half RoPE in place. total = rows*n_heads*half. `pos0` offsets
-    /// the freqs row (rows hold absolute positions pos0.. — KV-cached decode).
+    /// the freqs row (rows hold absolute positions pos0.., KV-cached decode).
     pub fn ropeHalf(self: *Backend, qk: DeviceBuffer, freqs: DeviceBuffer, rows: usize, n_heads: usize, half: usize, sin_off: usize, pos0: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
@@ -3744,7 +3735,7 @@ pub const Backend = struct {
     }
 
     /// a += b, in place (plain residual add). total = element count.
-    /// `a += b` over two **f16** activations, summed in f32. See `elt.add_h16_ptx`.
+    /// `a += b` over two f16 activations, summed in f32. See `elt.add_h16_ptx`.
     pub fn opAddH16(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, total: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
@@ -3808,7 +3799,7 @@ pub const Backend = struct {
         return count;
     }
 
-    /// Argmax over `logits` (device [vocab] f32) → token id written as an exact
+    /// Argmax over `logits` (device [vocab] f32) -> token id written as an exact
     /// f32 into out_id[0] (download 4 bytes, not the ~608 KB vocab). Two passes:
     /// `lanes` stride-scanners find local maxima, then one thread reduces them,
     /// tie-breaking to the lowest index (matches sample.argmax). Caller owns the
@@ -3865,7 +3856,7 @@ pub const Backend = struct {
         eps: f32,
         silu: bool,
         /// `x` and `out` are f16 rather than f32. Statistics, weight and bias stay
-        /// f32 either way — they are per-channel, not per-position.
+        /// f32 either way, they are per-channel, not per-position.
         act_f16: bool,
     ) Error!void {
         self.ptic();
@@ -4029,9 +4020,9 @@ pub const Backend = struct {
         try self.eltLaunch(f, src, patch, null, null, .{ @intCast(total), @intCast(patch_len), @intCast(ci), @intCast(w), @intCast(h), @intCast(p0) }, .{ if (up) 1.0 else 0.0, 0 }, total);
     }
 
-    /// Tensor-core GQA attention: out[q][h][hd] = softmax(scale·Q·Kᵀ)·V. Q/K/V are
+    /// Tensor-core GQA attention: out[q][h][hd] = softmax(scale*Q*Kᵀ)*V. Q/K/V are
     /// the interleaved [seq][*][hd] f32 tensors from rope; heads are gathered to
-    /// contiguous f16 (V transposed to [hd][mpad]), run through hgemm→softmax→hgemm
+    /// contiguous f16 (V transposed to [hd][mpad]), run through hgemm->softmax->hgemm
     /// on tensor cores, and scattered back. GQA: Q head h reads KV head h/group.
     /// Dispatches to the head-batched path (grid.z fills the GPU) or the per-head
     /// loop reference.
@@ -4041,10 +4032,10 @@ pub const Backend = struct {
             defer self.ptoc(.attn);
             return self.opAttnCudnn(q, k, v, out, seq, n_heads, kv_heads, hd, scale);
         }
-        // ⚠️ **Single-head goes to the flash path at EVERY size, not just when the
-        // plane is large.** That was the old gate, and it is the wrong axis: the
-        // batched path stores the scores in **f16**, and the one caller with a
-        // single head is the VAE mid-block, whose logits reach 9.95e6 — so a SMALL
+        // Single-head goes to the flash path at EVERY size, not just when the
+        // plane is large. That was the old gate, and it is the wrong axis: the
+        // batched path stores the scores in f16, and the one caller with a
+        // single head is the VAE mid-block, whose logits reach 9.95e6, so a SMALL
         // latent took the f16 path and produced non-finite output while a large one
         // was fine. Size was never what decided correctness; the score magnitude
         // was, and the flash path (f32 scores, query-banded) is safe at both ends.
@@ -4078,8 +4069,8 @@ pub const Backend = struct {
         return p;
     }
 
-    /// cuDNN fused flash attention (.libs mode): O = softmax(scale·Q·Kᵀ)·V in one
-    /// fused kernel — no per-head gather/scatter, no S materialization, no seq
+    /// cuDNN fused flash attention (.libs mode): O = softmax(scale*Q*Kᵀ)*V in one
+    /// fused kernel, no per-head gather/scatter, no S materialization, no seq
     /// padding, native GQA. Q/K/V/O are the DiT's f32 [seq][heads][hd] buffers;
     /// they convert to f16 for the op and O converts back to f32. Replaces the
     /// whole hand-PTX scores/softmax/pv pipeline (~80× faster on the GEMMs).
@@ -4104,26 +4095,26 @@ pub const Backend = struct {
     }
 
     /// Head-batched attention: process `G` heads per launch (grid.z=G) so the PV
-    /// GEMM (n=hd=128 → grid.x=1) and the whole pipeline fill the SMs, and the
-    /// per-head launch count collapses to ~7·(n_heads/G). G is capped so the
+    /// GEMM (n=hd=128 -> grid.x=1) and the whole pipeline fill the SMs, and the
+    /// per-head launch count collapses to ~7*(n_heads/G). G is capped so the
     /// scores+probs scratch fits `attn_scratch_budget`.
     fn opAttnTCBatched(self: *Backend, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, out: DeviceBuffer, seq: usize, n_heads: usize, kv_heads: usize, hd: usize, scale: f32) Error!void {
         const mpad = std.mem.alignForward(usize, seq, 128);
         const group = n_heads / kv_heads;
         const fused = self.attn_fused;
         // scratch/head: S (f16) always; fused adds a tiny MD table, the materialized
-        // path adds a full P (f16) — so the fused path fits ~2× the heads per launch.
+        // path adds a full P (f16), so the fused path fits ~2× the heads per launch.
         const per_head = if (fused) mpad * mpad * 2 + mpad * 8 else mpad * mpad * 4;
-        // A --vram-budget shrinks the scores scratch (more head-batches) — the
+        // A --vram-budget shrinks the scores scratch (more head-batches), the
         // single biggest activation buffer at high resolution.
         const cap = if (self.budget_override != 0) @min(self.attn_scratch_budget, @max(64 << 20, self.budget_override / 4)) else self.attn_scratch_budget;
         var g = cap / per_head;
         if (g < 1) g = 1;
         if (g > n_heads) g = n_heads;
 
-        // scores S are f16 (halves the S write + softmax reads — the memory-bound
+        // scores S are f16 (halves the S write + softmax reads, the memory-bound
         // cost at large seq); O keeps f32. Fused: MD={max,1/sum} f32 pairs replaces
-        // the materialized P; non-fused: P is a full f16 [gs·mpad][mpad] tile.
+        // the materialized P; non-fused: P is a full f16 [gs*mpad][mpad] tile.
         try self.ensureDeviceBuffer(&self.attn_qh, g * mpad * hd * 2);
         try self.ensureDeviceBuffer(&self.attn_kh, g * mpad * hd * 2);
         try self.ensureDeviceBuffer(&self.attn_vth, g * hd * mpad * 2);
@@ -4168,22 +4159,22 @@ pub const Backend = struct {
             try self.launch7(f_ghb, .{ k.ptr(), self.attn_kh.ptr() }, .{ seq32, kvh32, bh, grp32, hd32, mpad32, gs32 * mpad32 * hd32 }, gs * mpad * hd);
             try self.launch7(f_gvtb, .{ v.ptr(), self.attn_vth.ptr() }, .{ seq32, kvh32, bh, grp32, hd32, mpad32, gs32 * hd32 * mpad32 }, gs * hd * mpad);
             self.ptoc(.attn);
-            // scores S[gs][mpad][mpad] f16 = scale·(Q @ Kᵀ)  (scale prefolded in
+            // scores S[gs][mpad][mpad] f16 = scale*(Q @ Kᵀ)  (scale prefolded in
             // the C-store so f16 S can't overflow; softmax then uses scale=1)
             self.ptic();
             try self.launchHgemmB(f_scores, self.attn_qh, self.attn_kh, self.attn_s, mpad, mpad, hd, gs, s_qk, s_qk, s_s, scale);
             self.ptoc(.attn_scores);
             if (fused) {
-                // MD[gs·mpad][2] f32 = {max, 1/sum} per row (one S read, no P write)
+                // MD[gs*mpad][2] f32 = {max, 1/sum} per row (one S read, no P write)
                 self.ptic();
                 try self.launchSoftmaxMd(f_sm, self.attn_s, self.attn_md, gs * mpad, mpad, seq);
                 self.ptoc(.attn_softmax);
-                // O[gs][mpad][hd] f32 = (softmax S) @ Vtᵀ — P recomputed in-GEMM
+                // O[gs][mpad][hd] f32 = (softmax S) @ Vtᵀ, P recomputed in-GEMM
                 self.ptic();
                 try self.launchAttnOut(f_pv, self.attn_s, self.attn_vth, self.attn_oh, self.attn_md, mpad, hd, mpad, gs, s_s, s_vt, s_o, seq32, mpad32);
                 self.ptoc(.attn_pv);
             } else {
-                // P[gs·mpad][mpad] f16 = softmax(S) — flat over all gs heads' rows
+                // P[gs*mpad][mpad] f16 = softmax(S), flat over all gs heads' rows
                 self.ptic();
                 try self.launchSoftmax(f_sm, self.attn_s, self.attn_p, gs * mpad, mpad, seq, 1.0);
                 self.ptoc(.attn_softmax);
@@ -4199,12 +4190,12 @@ pub const Backend = struct {
         }
     }
 
-    /// **Rectangular** tensor-core attention: `seq_q` queries against `seq_kv` keys,
+    /// Rectangular tensor-core attention: `seq_q` queries against `seq_kv` keys,
     /// f32 in / f32 out, non-causal, GQA-aware. `opAttnTCBatched` with the two
     /// sequence lengths pulled apart.
     ///
-    /// This exists for **cross-attention** — Anima's denoiser attends `seq` image
-    /// tokens onto a fixed 512-row context — and it is a requirement rather than an
+    /// This exists for cross-attention, Anima's denoiser attends `seq` image
+    /// tokens onto a fixed 512-row context, and it is a requirement rather than an
     /// optimization: at 1056x1584 the naive `opAttnCross` (one thread per (query,
     /// head), streaming K/V per thread) would spend an estimated ~0.6 s/step on what
     /// is only ~8% of the step's FLOPs. Nothing about the pipeline was square to begin
@@ -4212,7 +4203,7 @@ pub const Backend = struct {
     /// `launchAttnOut` already documented that its `k` "== m only for square
     /// (whole-seq) attention".
     ///
-    /// ⚠️ Always the hand-PTX path, in **both** `kernels` modes. Under `--backend cuda`
+    /// Always the hand-PTX path, in both `kernels` modes. Under `--backend cuda`
     /// self-attention still goes to cuDNN's fused SDPA (`opAttnTC`), whose `SdpaPlan`
     /// is built for one sequence length; teaching it a rectangular shape is a real but
     /// separate change, deliberately not made here. So a `cuda` render's cross-attention
@@ -4278,7 +4269,7 @@ pub const Backend = struct {
             const gs = @min(g, n_heads - base);
             const gs32: u32 = @intCast(gs);
             const bh: u32 = @intCast(base);
-            // ⚠️ Q/scatter carry the QUERY length and pad; K/Vᵀ the KEY length and pad.
+            // Q/scatter carry the QUERY length and pad; K/Vᵀ the KEY length and pad.
             self.ptic();
             try self.launch7(f_ghb, .{ q.ptr(), self.attn_qh.ptr() }, .{ qs32, nh32, bh, 1, hd32, qp32, gs32 * qp32 * hd32 }, gs * qpad * hd);
             try self.launch7(f_ghb, .{ k.ptr(), self.attn_kh.ptr() }, .{ ks32, kvh32, bh, grp32, hd32, kp32, gs32 * kp32 * hd32 }, gs * kpad * hd);
@@ -4315,14 +4306,14 @@ pub const Backend = struct {
         try self.ensureDeviceBuffer(&self.attn_vth, hd * mpad * 2);
         try self.ensureDeviceBuffer(&self.attn_oh, mpad * hd * 4);
 
-        // ⚠️ **The scores band is f32, not f16, and that is not a precision nicety.**
+        // The scores band is f32, not f16, and that is not a precision nicety.
         // This path exists for the VAE mid-block, whose attention *logits* reach
-        // **9.95e6** — 152x past f16's 65504 ceiling, and even inside the range f16's
+        // 9.95e6, 152x past f16's 65504 ceiling, and even inside the range f16's
         // quantum up there is ~8000 against a softmax whose differences are O(1).
         // Prescaling cannot rescue it either: 11 mantissa bits leave ~4900 of
         // absolute error on such a logit however it is scaled. In f16 this rendered
         // solid white, which is why `sd_vae_cuda` used the naive per-query kernel
-        // instead — at **11.4 s** for one decode against this path's 34 ms.
+        // instead, at 11.4 s for one decode against this path's 34 ms.
         // P itself stays f16 (a probability in [0,1]), so only S widens.
         const sbytes: usize = 4;
         var qb: usize = (self.attn_scratch_budget / (mpad * sbytes)) & ~@as(usize, 127);
@@ -4357,7 +4348,7 @@ pub const Backend = struct {
             const m32: u32 = @intCast(m);
             const qblk = dbFromPtr(self.attn_qh.ptr() + @as(u64, q0) * hd * 2, m * hd * 2);
             const oblk = dbFromPtr(self.attn_oh.ptr() + @as(u64, q0) * hd * 4, m * hd * 4);
-            // S[m][mpad] f16 = scale·(Qblk @ Kᵀ)  (scale prefolded in the C-store)
+            // S[m][mpad] f16 = scale*(Qblk @ Kᵀ)  (scale prefolded in the C-store)
             try self.launchHgemmB(f_scores, qblk, self.attn_kh, self.attn_s, m, mpad, hd, 1, s_qk, s_qk, s_s, scale);
             // MD[m][2] f32 = {max, 1/sum} per row over valid cols 0..seq
             try self.launchSoftmaxMd(f_sm, self.attn_s, self.attn_md, m, mpad, seq);
@@ -4416,7 +4407,7 @@ pub const Backend = struct {
             @ptrCast(&uu[6]),
         };
         // param count is fixed by the entry (gather_vt uses 8, others 7); passing
-        // extra pointers is harmless — the driver reads only what the entry declares.
+        // extra pointers is harmless, the driver reads only what the entry declares.
         const grid: u32 = @intCast((total + 255) / 256);
         self.ctx.launch(f, .{ grid, 1, 1 }, .{ 256, 1, 1 }, 0, &params) catch return error.CudaError;
     }
@@ -4488,9 +4479,9 @@ pub const Backend = struct {
         self.ctx.launch(f, .{ @intCast(rows), 1, 1 }, .{ 256, 1, 1 }, 0, &params) catch return error.CudaError;
     }
 
-    /// softmax_row: P[rows][pn] f16 = softmax(scale·S[rows][pn]) over valid cols
-    /// 0..seq, pad cols → 0. One block (256) per row; 1 KiB shared for the reduction.
-    /// `rows` may span several batched heads (S contiguous [gs·mpad][pn]).
+    /// softmax_row: P[rows][pn] f16 = softmax(scale*S[rows][pn]) over valid cols
+    /// 0..seq, pad cols -> 0. One block (256) per row; 1 KiB shared for the reduction.
+    /// `rows` may span several batched heads (S contiguous [gs*mpad][pn]).
     fn launchSoftmax(self: *Backend, f: cu.CUfunction, s: DeviceBuffer, p: DeviceBuffer, rows: usize, pn: usize, seq: usize, scale: f32) Error!void {
         var ps = s.ptr();
         var pp = p.ptr();
@@ -4510,7 +4501,7 @@ pub const Backend = struct {
     }
 
     /// a = silu(a)*b, in place (a=gate, b=up).
-    /// f16 SwiGLU gate (c16 chain): a = silu(a)·b, all f16.
+    /// f16 SwiGLU gate (c16 chain): a = silu(a)*b, all f16.
     pub fn siluMul16(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, total: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
@@ -4549,7 +4540,7 @@ pub const Backend = struct {
         try self.eltLaunch(f, a, null, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
-    /// a = x*sigmoid(1.702x), in place — CLIP-L's FFN activation. total = element count.
+    /// a = x*sigmoid(1.702x), in place, CLIP-L's FFN activation. total = element count.
     pub fn geluQuick(self: *Backend, a: DeviceBuffer, total: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
@@ -4557,7 +4548,7 @@ pub const Backend = struct {
         try self.eltLaunch(f, a, null, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
     }
 
-    /// a = 0.5x(1 + erf(x/sqrt2)), in place — CLIP-G's FFN activation. NOT
+    /// a = 0.5x(1 + erf(x/sqrt2)), in place, CLIP-G's FFN activation. NOT
     /// interchangeable with `gelu` (tanh) or `geluQuick`. total = element count.
     pub fn geluErf(self: *Backend, a: DeviceBuffer, total: usize) Error!void {
         self.ptic();
@@ -4606,7 +4597,7 @@ fn testQuantWeightBytes(gpa: std.mem.Allocator, dt: dtypes.DType, rows: usize, c
 
 // Gated on a CUDA device with VMM support: a growable tensor keeps its base
 // pointer and earlier contents across in-place growth (the property dynamic
-// KV caches — and the decode graphs holding their pointers — rely on).
+// KV caches, and the decode graphs holding their pointers, rely on).
 test "growable tensor grows in place" {
     const gpa = std.testing.allocator;
     const be = Backend.init(gpa) catch return error.SkipZigTest;
@@ -4663,7 +4654,7 @@ test "cuda argmax matches cpu argmax (incl. tie -> lowest index)" {
         for (logits) |*v| v.* = rand.floatNorm(f32) * 5.0;
         if (vocab > 10) {
             logits[vocab / 3] = 1000.0;
-            logits[vocab / 3 + 5] = 1000.0; // exact tie → lowest index wins
+            logits[vocab / 3 + 5] = 1000.0; // exact tie -> lowest index wins
         }
 
         var lg = try be.tensorCreate(vocab * 4);
@@ -5481,7 +5472,7 @@ test "flash (query-tiled) attention matches CPU reference" {
 }
 
 // Gated on a CUDA device: batched flash-decode (seq_q >> 1) at hd=256
-// against a CPU causal reference — the qwen35 batched-prefill regime.
+// against a CPU causal reference, the qwen35 batched-prefill regime.
 test "qkNorm PAR batch rows matches CPU reference" {
     const gpa = std.testing.allocator;
     const be = Backend.init(gpa) catch return error.SkipZigTest;
@@ -5619,7 +5610,7 @@ test "attn decode seq_q batch matches CPU reference" {
 
 test "attn decode with f16 KV cache matches the f32 reference" {
     // f16 KV: K/V stored as half precision (attn_split_h256_f16 /
-    // attn_split_h512_f16). Not bit-exact vs f32 — checked within an f16
+    // attn_split_h512_f16). Not bit-exact vs f32, checked within an f16
     // tolerance. Covers gemma4's two decode kernels (local hd=256, global 512).
     const gpa = std.testing.allocator;
     const be = Backend.init(gpa) catch return error.SkipZigTest;
@@ -5643,7 +5634,7 @@ test "attn decode with f16 KV cache matches the f32 reference" {
         defer gpa.free(v);
         for (q) |*x| x.* = rand.floatNorm(f32) * 0.3;
         // Round K/V through f16 so the CPU reference sees the SAME values the
-        // kernel loads — isolating the test to the kernel math, not the f16
+        // kernel loads, isolating the test to the kernel math, not the f16
         // rounding of the inputs.
         for (k) |*x| x.* = @floatCast(@as(f16, @floatCast(rand.floatNorm(f32) * 0.3)));
         for (v) |*x| x.* = @floatCast(@as(f16, @floatCast(rand.floatNorm(f32))));
@@ -5715,7 +5706,7 @@ test "attn decode with f16 KV cache matches the f32 reference" {
 test "attn decode with q8_0 KV cache matches the f32 reference" {
     // q8_0 KV: K/V stored as ggml 34-byte blocks (attn_split_q8 /
     // attn_split_h256_q8 / attn_split_h512_q8). The host cache quantizes and
-    // the reference reads its dequantized view, so — like the f16 test — the
+    // the reference reads its dequantized view, so, like the f16 test, the
     // comparison isolates the kernel math from the quantization loss.
     // Covers all three head dims (qwen3 128, gemma local 256, gemma4 global 512).
     const gpa = std.testing.allocator;
@@ -5813,7 +5804,7 @@ test "opStoreKvQ8 and kv_append_s_q8 quantize bit-identically to the host cache"
     // The store kernels use div.rn + cvt.rni (ties to even) to match the host
     // packQ80 exactly: a row quantized on the device must equal the same row
     // quantized by the host KvCache byte for byte (the offload-split /
-    // migrate-promote invariant).
+    // migrate-promote rule).
     const gpa = std.testing.allocator;
     const be = Backend.init(gpa) catch return error.SkipZigTest;
     defer be.deinit();
@@ -5863,8 +5854,8 @@ test "opStoreKvQ8 and kv_append_s_q8 quantize bit-identically to the host cache"
 }
 
 // Gated on a CUDA device: the sliding-window path of attn_split_h256
-// (Gemma 3 local layers). Exercises kv_start > 0 — query t attends only the
-// last `window` keys — which short generations (context < window) never hit.
+// (Gemma 3 local layers). Exercises kv_start > 0, query t attends only the
+// last `window` keys, which short generations (context < window) never hit.
 test "attn decode sliding window matches CPU reference" {
     const gpa = std.testing.allocator;
     const be = Backend.init(gpa) catch return error.SkipZigTest;
@@ -5979,7 +5970,7 @@ test "attn decode sliding window matches CPU reference" {
 // Gated on a CUDA device: the bidirectional image-block path of the batched
 // attn_split kernels (bidir=1). Every query attends the WHOLE batch forward
 // (kv_end = kv_total) while the sliding-window lower bound still tracks each
-// query's own position — the mask Gemma image tokens use. Covers hd=256 (local,
+// query's own position, the mask Gemma image tokens use. Covers hd=256 (local,
 // window + ring) and hd=512 (global, window 0).
 test "attn decode bidirectional image block matches CPU reference" {
     const gpa = std.testing.allocator;
@@ -6010,8 +6001,8 @@ test "attn decode bidirectional image block matches CPU reference" {
         for (v) |*x| x.* = rand.floatNorm(f32);
         const scale = 1.0 / @sqrt(@as(f32, hd));
 
-        // Bidirectional reference: query t attends [kv_start, kv_total) — the
-        // whole sequence FORWARD — with kv_start windowed off its OWN causal
+        // Bidirectional reference: query t attends [kv_start, kv_total), the
+        // whole sequence FORWARD, with kv_start windowed off its OWN causal
         // position (max(0, klen - window)), not the extended end.
         const ref = try gpa.alloc(f32, seq_q * heads * hd);
         defer gpa.free(ref);
@@ -6302,7 +6293,7 @@ test "rope_half_pos matches CPU reference" {
 }
 
 // Gated on a CUDA device: attn_split_tree + attn_merge against the CPU
-// tree-attention reference — branching tree, GQA, prefix + ancestor rows in
+// tree-attention reference, branching tree, GQA, prefix + ancestor rows in
 // one K/V buffer with the batch rows at tree_base.
 test "tree flash-decode attention matches CPU reference" {
     const gpa = std.testing.allocator;

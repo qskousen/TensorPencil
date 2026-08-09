@@ -6,7 +6,7 @@
 //! in raw mode and understands:
 //!
 //! - Enter (CR/LF)                      -> submit the message
-//! - Shift-Enter (kitty CSI 13;2u — any modified 13u) or Alt-Enter (ESC CR)
+//! - Shift-Enter (kitty CSI 13;2u, any modified 13u) or Alt-Enter (ESC CR)
 //!                                      -> insert a newline, keep editing
 //! - bracketed paste (CSI 200~ .. 201~) -> pasted newlines are literal;
 //!                                         nothing submits during a paste
@@ -19,7 +19,7 @@
 //! writer), so it is unit-testable without a terminal; `RawTty` holds the
 //! termios save/restore. The caller enables the terminal modes around each
 //! read (bracketed paste `CSI ?2004 h/l`, kitty keyboard `CSI >1u`/`CSI <u`
-//! — unsupported terminals ignore both; Alt-Enter is the newline fallback
+//! unsupported terminals ignore both; Alt-Enter is the newline fallback
 //! there) so the tty is cooked again while the model generates and Ctrl-C
 //! keeps killing a running generation.
 

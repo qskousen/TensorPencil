@@ -1,4 +1,4 @@
-//! Thin Zig wrapper over lib/vips/vips_helper.c (system libvips) — image
+//! Thin Zig wrapper over lib/vips/vips_helper.c (system libvips), image
 //! DECODE for tp-llm's --image flag and @path mentions, so chat input takes
 //! any common format (jpeg incl. progressive + EXIF rotation, png, webp,
 //! gif, tiff, ...) instead of PNG only.
@@ -54,7 +54,7 @@ pub fn loadRgb(gpa: std.mem.Allocator, path: []const u8) !Decoded {
     };
 }
 
-/// Decode an in-memory encoded image (any libvips-supported format — PNG,
+/// Decode an in-memory encoded image (any libvips-supported format, PNG,
 /// JPEG, ...) to packed RGB8, as `loadRgb` does for a file. Used for images
 /// pasted from the clipboard, where the format is sniffed from the bytes.
 pub fn loadRgbFromMemory(gpa: std.mem.Allocator, bytes: []const u8) !Decoded {

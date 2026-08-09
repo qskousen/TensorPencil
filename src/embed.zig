@@ -1,14 +1,14 @@
-//! `tp.embed` — the high-level embedding façade DiffKeep calls. It hides the
+//! `tp.embed`, the high-level embedding façade DiffKeep calls. It hides the
 //! per-model tokenizer, role prefixes, frame tokens, and pooling behind two
 //! types that each return an L2-normalized 768-d vector:
-//!   - `TextEncoder` — text → vec (Snowflake / EmbeddingGemma / SigLIP2 text).
-//!   - `ImageEncoder` — decoded RGB → vec (SigLIP2 visual).
+//!   - `TextEncoder`, text -> vec (Snowflake / EmbeddingGemma / SigLIP2 text).
+//!   - `ImageEncoder`, decoded RGB -> vec (SigLIP2 visual).
 //!
 //! The underlying model forwards (`models.embed_*`) are validated bit-faithful
 //! vs the reference ONNX; this layer only adds the text-side glue that the plan
-//! (DIFFKEEP.md) specifies: Snowflake's `"query: "` asymmetry, EmbeddingGemma's
+//! specifies: Snowflake's `"query: "` asymmetry, EmbeddingGemma's
 //! task prefixes, SigLIP2's fixed 64-token frame. CPU only for now (a `backend`
-//! parameter will arrive with the GPU paths — see DIFFKEEP.md M6).
+//! parameter will arrive with the GPU paths.
 
 const std = @import("std");
 const models = @import("tp_models").models;
@@ -94,7 +94,7 @@ pub const TextEncoder = struct {
 
     /// Batch variant: one vector per input text (DiffKeep batches ~8 at index
     /// time). Runs a single fused forward over the whole batch on the selected
-    /// backend (CPU / Vulkan / CUDA) — the passed slice IS the "configurable
+    /// backend (CPU / Vulkan / CUDA), the passed slice IS the "configurable
     /// amount". Returns caller-owned vectors + slice.
     pub fn embedTextBatch(self: *const TextEncoder, gpa: std.mem.Allocator, texts: []const []const u8, opts: Options) ![][]f32 {
         const vecs = try gpa.alloc([]f32, texts.len);
@@ -103,7 +103,7 @@ pub const TextEncoder = struct {
         errdefer for (vecs) |v| if (v.len != 0) gpa.free(v);
         for (vecs) |*v| v.* = try gpa.alloc(f32, dim);
 
-        // B=1 has no cross-item amortization — take the single path (avoids the
+        // B=1 has no cross-item amortization, take the single path (avoids the
         // batched forward's per-item offset bookkeeping for the query case).
         if (texts.len == 1) {
             try self.embedTextInto(gpa, texts[0], opts, vecs[0]);
@@ -138,7 +138,7 @@ pub const TextEncoder = struct {
         return vecs;
     }
 
-    /// Role prefix → tokenize → model frame, returning the framed id list
+    /// Role prefix -> tokenize -> model frame, returning the framed id list
     /// (allocated with `a`). Shared by the single and batched paths.
     fn frameText(self: *const TextEncoder, a: std.mem.Allocator, text: []const u8, opts: Options) ![]const u32 {
         const kind: TextModelKind = self.impl;
@@ -161,7 +161,7 @@ pub const TextEncoder = struct {
                 try framed.append(a, 1); // <eos>
             },
             .siglip2_text => {
-                // SigLIP: [content…(≤60), <eos>=1]; the model pads to 64.
+                // SigLIP: [content...(≤60), <eos>=1]; the model pads to 64.
                 const n = @min(content.items.len, 60);
                 try framed.appendSlice(a, content.items[0..n]);
                 try framed.append(a, 1); // <eos>
@@ -195,7 +195,7 @@ pub const TextEncoder = struct {
     }
 };
 
-/// SigLIP2 visual encoder: decoded, preprocessed RGB → 768-d.
+/// SigLIP2 visual encoder: decoded, preprocessed RGB -> 768-d.
 pub const ImageEncoder = struct {
     io: std.Io,
     model: models.embed_siglip.VisualModel,
@@ -302,7 +302,7 @@ test "embed façade: Snowflake document matches ONNX reference" {
     }
     errdefer std.debug.print("cosine {d}, |got| {d}\n", .{ dot, @sqrt(ss) });
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), @sqrt(ss), 1e-4); // unit norm
-    try std.testing.expect(dot >= 0.999); // both unit → cosine
+    try std.testing.expect(dot >= 0.999); // both unit -> cosine
 
     // Batch variant returns one vector per input.
     const batch = try enc.embedTextBatch(gpa, &.{ "hello world", "a query" }, .{ .role = .query });
@@ -314,7 +314,7 @@ test "embed façade: Snowflake document matches ONNX reference" {
     try std.testing.expectEqual(@as(usize, dim), batch[0].len);
 }
 
-// Façade → GPU dispatch: opening with `.vulkan` must route through the device
+// Façade -> GPU dispatch: opening with `.vulkan` must route through the device
 // forward and match the CPU façade. Gated on a Vulkan device + the checkpoint.
 test "embed façade Vulkan matches CPU" {
     const gpa = std.testing.allocator;

@@ -1,90 +1,56 @@
-//! T5 SentencePiece-**Unigram** tokenizer — the second of Anima's two prompt
-//! tokenizers, and the one that is genuinely new to this engine.
+//! T5 SentencePiece-Unigram tokenizer, the second of Anima's two prompt tokenizers.
 //!
-//! Anima tokenizes every prompt TWICE (`comfy/text_encoders/anima.py`): once with
-//! Qwen2 byte-level BPE (`tokenizer.zig`) for the Qwen3-0.6B encoder whose hidden
-//! states are the `llm_adapter`'s cross-attention *source*, and once with this,
-//! whose ids index the adapter's own `Embedding(32128, 1024)` as
-//! `target_input_ids`. So this file does not feed a T5 model — there is no T5 here
-//! at all. It feeds a 1024-wide learned embedding that happens to have been
-//! trained against T5's vocabulary.
+//! Anima tokenizes every prompt TWICE: once with Qwen2 byte-level BPE
+//! (`tokenizer.zig`) for the Qwen3-0.6B encoder whose hidden states are the
+//! `llm_adapter`'s cross-attention source, and once with this, whose ids index the
+//! adapter's own `Embedding(32128, 1024)`. So this file does not feed a T5 model, and
+//! there is no T5 here at all: it feeds a learned embedding that happens to have been
+//! trained against T5's vocabulary. Emphasis weights live on THIS branch only, and
+//! multiply the adapter's output rows.
 //!
-//! ⚠️ **The emphasis weights live on THIS branch only.** `AnimaTokenizer` forces
-//! every Qwen3 weight to 1.0 and keeps the T5 ones, which then multiply the
-//! adapter's output rows. `(a:1.5)` in an Anima prompt is a T5-side effect.
+//! The reference is HuggingFace `tokenizers`' Unigram model plus the
+//! `Precompiled`/`Strip`/`Replace` normalizers and the `Metaspace` pre-tokenizer,
+//! wrapped in ComfyUI's `sd1_clip.SDTokenizer`, and pinned by
+//! tools/gen_anima_prompt_fixtures.py, which executes it rather than re-deriving it.
+//! The conventions that are silent wrong answers are documented at the code that
+//! implements each: segment-at-a-time tokenization in `encodeWeighted`, the single
+//! trailing `</s>` in `tokenizeCall`, the byte-0 prefix rule and the empty-span rule
+//! in `tokenizeSpan`, and unknown-piece fusion in `viterbi`.
 //!
-//! Reference: HuggingFace `tokenizers`' Unigram model + `Precompiled`/`Strip`/
-//! `Replace` normalizers + `Metaspace` pre-tokenizer, wrapped in ComfyUI's
-//! `sd1_clip.SDTokenizer`. Pinned by `tools/gen_anima_prompt_fixtures.py`, which
-//! *executes* `AnimaTokenizer` rather than re-deriving it.
+//! `Precompiled(precompiled_charsmap)` is a serialized darts-clone double-array trie
+//! plus a NUL-separated replacement blob, SentencePiece's `nmt_nfkc`. It is embedded
+//! verbatim (237 KB) and walked here rather than approximated by "NFKC is identity on
+//! ASCII": it maps NBSP/ZWSP/ZWJ/ideographic space to a plain space, deletes 30
+//! control characters, folds ligatures and fullwidth Latin, expands one char to two
+//! for things like the Roman numerals, and composes `e`+U+0301 into a single
+//! codepoint. Every one of those changes the id stream of a realistic prompt.
 //!
-//! ## The five conventions that are not derivable, each a silent wrong answer
-//!
-//! 1. **Weighted segments are tokenized SEPARATELY** — one tokenizer call each.
-//!    `Metaspace`'s prefix therefore fires per segment, so `a cat(s:1.1)` is
-//!    `▁a ▁cat ▁s …`, never `▁a ▁cats …`. ⚠️ A split at a SPACE is transparent
-//!    (the segment's own prefix reproduces the space's `▁`), so only a mid-word
-//!    split reveals a wrong port — which is why the fixture carries one.
-//! 2. **`</s>` appears once, at the very end, and per-segment ones are dropped.**
-//!    `SDTokenizer` slices `input_ids[0:-1]` per segment — removing what
-//!    `TemplateProcessing` appended — then appends `self.end_token` once for the
-//!    whole chunk. `end_token` is 1 because `SDTokenizer.__init__` resolved it
-//!    from `tokenizer("")["input_ids"][0]`, not because it was configured.
-//! 3. **The `▁` prefix is added iff the span starts at byte 0 of the call's
-//!    input** — `Metaspace`'s `prepend_scheme = "first"` tests
-//!    `offsets_original().0 == 0`, NOT "is this the first split". An added token
-//!    splits the input into spans, and a later span gets no prefix:
-//!    `prefix<extra_id_0>suffix` ends `… [s][uff][ix]`, with no `▁`.
-//! 4. **An empty normalized span produces NOTHING**, not a bare `▁`. `" "`,
-//!    `"   "` and `"\x01"` all tokenize to the empty id list (then the one
-//!    trailing `</s>` of rule 2). The prefix is never prepended to an empty
-//!    string, so a naive "always prepend" gives every whitespace-only prompt an
-//!    extra token.
-//! 5. **Unknown pieces FUSE.** Consecutive `<unk>`s inside one pre-token collapse
-//!    to a single `<unk>` (`fuse_unk`), so the two Gothic letters of `𐌰𐌱` are one
-//!    id, while two unknown characters separated by a space are two — they land in
-//!    different pre-tokens, and fusion does not cross them.
-//!
-//! ## The normalizer is a real piece of SentencePiece, not an approximation
-//!
-//! `Precompiled(precompiled_charsmap)` is a serialized darts-clone double-array
-//! trie plus a NUL-separated replacement blob — SentencePiece's `nmt_nfkc`. It is
-//! embedded verbatim (237 KB) and walked here, rather than approximated by "NFKC
-//! is identity on ASCII": it maps NBSP/ZWSP/ZWJ/ideographic space to a plain
-//! space, deletes 30 control characters, folds ligatures (`ﬁ`→`fi`), fullwidth
-//! Latin, superscripts and circled digits, expands `Ⅸ`→`IX` (one char to two),
-//! and composes `e`+U+0301 into `é`. Every one of those changes the id stream of a
-//! realistic prompt.
-//!
-//! ⚠️ **Grapheme clustering, and why "base + marks" is exact here rather than a
-//! shortcut.** The reference segments into UAX#29 extended grapheme clusters and
-//! only tries a whole-cluster charsmap lookup when the cluster is **under 6
-//! bytes**, falling back to per-codepoint otherwise. Every cluster that can pass
-//! that gate is a base codepoint plus one or two combining marks (a Hangul L+V+T
-//! jamo sequence is 9 bytes, an emoji ZWJ sequence 11, a flag 8 — all take the
-//! per-codepoint path in the reference too), so clustering as base+Extend is
-//! equivalent to full UAX#29 for every input the gate admits. CR LF is the one
-//! non-mark cluster short enough to matter and is handled explicitly.
+//! Grapheme clustering as base+Extend is exact here rather than a shortcut. The
+//! reference segments into UAX#29 clusters and only tries a whole-cluster charsmap
+//! lookup when the cluster is under 6 bytes, falling back to per-codepoint otherwise.
+//! Every cluster that can pass that gate is a base codepoint plus one or two combining
+//! marks, so the two agree on every input the gate admits. CR LF is the one non-mark
+//! cluster short enough to matter and is handled explicitly.
 
-//! ## Why this is not a variant of `tokenizer.zig`'s existing `.unigram` kind
+//! Why this is not a variant of `tokenizer.zig`'s existing `.unigram` kind:
 //!
-//! ⚠️ `tokenizer.zig` already has a SentencePiece-Unigram path
+//! `tokenizer.zig` already has a SentencePiece-Unigram path
 //! (`initUnigramFromTokenizerJson`, for Snowflake Arctic Embed / GTE), and it is a
-//! **different tokenizer**, not a configuration of this one. Three differences, each
+//! different tokenizer, not a configuration of this one. Three differences, each
 //! decisive:
 //!
 //! * Its pre-tokenization splits on ASCII whitespace and prepends `▁` to EVERY word.
 //!   Metaspace with `prepend_scheme = "first"` prepends to exactly one span
 //!   (rule 3), and its split is on `▁` after a `Replace`, not on whitespace.
-//! * It has **no normalizer at all** — no charsmap, so no NFKC, no NBSP-to-space and
+//! * It has no normalizer at all, no charsmap, so no NFKC, no NBSP-to-space and
 //!   no control-character deletion.
 //! * Its lattice has no `<unk>` NODES: a word it cannot segment becomes a single
 //!   `<unk>` for the whole word, where `tokenizers` inserts one per unsegmentable
 //!   *character* at `min_score - 10` and then fuses runs. Its tie-break also prefers
 //!   the shortest incoming piece where `tokenizers` prefers the longest.
 //!
-//! Those last two are worth a look by whoever owns the embedding tokenizers — its own
-//! fixture passes, so its corpus evidently never exercises a partially-unknown word —
+//! Those last two are worth a look by whoever owns the embedding tokenizers, its own
+//! fixture passes, so its corpus evidently never exercises a partially-unknown word,
 //! but they are NOT this file's to change, since altering them would move every
 //! embedding this repo has computed. Kept separate deliberately.
 
@@ -95,7 +61,7 @@ const prompt_weights = @import("prompt_weights.zig");
 const vocab_bin = @embedFile("assets/t5_tokenizer/vocab.bin");
 const charsmap_bin = @embedFile("assets/t5_tokenizer/charsmap.bin");
 
-/// U+2581 LOWER ONE EIGHTH BLOCK — SentencePiece's visible stand-in for a space,
+/// U+2581 LOWER ONE EIGHTH BLOCK, SentencePiece's visible stand-in for a space,
 /// and `Metaspace`'s `replacement`.
 pub const meta = "\u{2581}";
 
@@ -257,7 +223,7 @@ pub const Tokenizer = struct {
         const trie_bytes = std.mem.readInt(u32, charsmap_bin[0..4], .little);
         if (trie_bytes % 4 != 0 or 4 + trie_bytes > charsmap_bin.len) return error.InvalidCharsmapAsset;
         // `@embedFile` gives byte alignment, so the u32 units are copied rather than
-        // cast — and read little-endian explicitly, since the blob's endianness is a
+        // cast, and read little-endian explicitly, since the blob's endianness is a
         // property of the file, not of the host.
         const trie = try alloc.alloc(u32, trie_bytes / 4);
         for (trie, 0..) |*u, i| {
@@ -286,6 +252,10 @@ pub const Tokenizer = struct {
 
     /// The full ComfyUI prompt path: resolve `(a:1.2)` emphasis, tokenize each
     /// weighted segment on its own, concatenate, and append one `</s>`. Caller frees.
+    /// Weighted segments are tokenized SEPARATELY, one call each, so `Metaspace`'s
+    /// prefix fires per segment: `a cat(s:1.1)` is `_a _cat _s ...`, never `_a _cats`.
+    /// A split at a SPACE is transparent, since the segment's own prefix reproduces
+    /// what the space would have become, so only a mid-word split shows a wrong port.
     pub fn encodeWeighted(self: *const Tokenizer, gpa: std.mem.Allocator, text: []const u8) ![]Weighted {
         var scratch = std.heap.ArenaAllocator.init(gpa);
         defer scratch.deinit();
@@ -313,7 +283,7 @@ pub const Tokenizer = struct {
         return out.toOwnedSlice(gpa);
     }
 
-    /// `encodeWeighted` with the weights dropped — for callers (and tests) that only
+    /// `encodeWeighted` with the weights dropped, for callers (and tests) that only
     /// want the id stream. Caller frees.
     pub fn encode(self: *const Tokenizer, gpa: std.mem.Allocator, text: []const u8) ![]u32 {
         const w = try self.encodeWeighted(gpa, text);
@@ -326,6 +296,12 @@ pub const Tokenizer = struct {
     /// One `self.tokenizer(word)` call: split out added tokens, then normalize and
     /// pre-tokenize each remaining span and run the Unigram lattice over its
     /// pre-tokens.
+    ///
+    /// `</s>` appears once, at the very end of the whole chunk, and per-segment ones
+    /// are dropped: `SDTokenizer` slices `input_ids[0:-1]` per segment to remove what
+    /// `TemplateProcessing` appended, then appends `end_token` once. That token is 1
+    /// because `SDTokenizer.__init__` resolved it from `tokenizer("")["input_ids"][0]`,
+    /// not because anything configured it.
     fn tokenizeCall(
         self: *const Tokenizer,
         arena: std.mem.Allocator,
@@ -359,6 +335,11 @@ pub const Tokenizer = struct {
 
     /// Normalize one non-added span, split it into `Metaspace` pre-tokens, and
     /// append each one's ids. `at_zero` is rule 3's condition.
+    /// `at_zero` is `Metaspace`'s `prepend_scheme = "first"`: the prefix is added iff
+    /// the span starts at byte 0 of the CALL's input, tested as
+    /// `offsets_original().0 == 0`, not "is this the first split". An added token
+    /// splits the input into spans and a later span gets no prefix, so
+    /// `prefix<extra_id_0>suffix` ends `... [s][uff][ix]` with no prefix marker.
     fn tokenizeSpan(
         self: *const Tokenizer,
         arena: std.mem.Allocator,
@@ -367,8 +348,9 @@ pub const Tokenizer = struct {
         at_zero: bool,
     ) !void {
         const normalized = try self.normalize(arena, span);
-        // Rule 4: an empty normalized span contributes nothing — in particular NOT
-        // a bare `▁` from the prefix that would otherwise be prepended.
+        // An empty normalized span contributes NOTHING, in particular not a bare
+        // prefix marker. " ", "   " and "\x01" all tokenize to no ids at all, so a
+        // naive "always prepend" gives every whitespace-only prompt an extra token.
         if (normalized.len == 0) return;
 
         // Metaspace, in the reference's order: replace every space with `▁`, THEN test
@@ -380,7 +362,7 @@ pub const Tokenizer = struct {
 
         // Rule 3: the prefix goes on iff this span began at byte 0 of the tokenizer
         // call's input and the (space-replaced) text does not already start with `▁`.
-        // ⚠️ The order matters for readability rather than for the answer — testing
+        // The order matters for readability rather than for the answer, testing
         // `normalized` instead would have to special-case a leading plain space, which
         // is the same condition written less obviously.
         var s: std.ArrayList(u8) = .empty;
@@ -407,9 +389,9 @@ pub const Tokenizer = struct {
     fn normalize(self: *const Tokenizer, arena: std.mem.Allocator, span: []const u8) ![]u8 {
         var buf: std.ArrayList(u8) = .empty;
 
-        // 1. The charsmap, over grapheme clusters. ⚠️ A cluster lookup that matches
+        // 1. The charsmap, over grapheme clusters. A cluster lookup that matches
         //    only a PREFIX of the cluster still wins and the rest of the cluster is
-        //    dropped — `common_prefix_search` returns every leaf on the path and the
+        //    dropped, `common_prefix_search` returns every leaf on the path and the
         //    reference takes the last. Faithful, and the reason this is not written
         //    as "look up the whole cluster or nothing".
         var i: usize = 0;
@@ -445,7 +427,7 @@ pub const Tokenizer = struct {
         }
         const stripped = buf.items[0..n];
 
-        // 3. Collapse runs of two or more ASCII spaces into one `▁`. ⚠️ This runs
+        // 3. Collapse runs of two or more ASCII spaces into one `▁`. This runs
         //    AFTER the charsmap, so an NBSP that became a space participates.
         var out: std.ArrayList(u8) = .empty;
         var j: usize = 0;
@@ -549,7 +531,10 @@ pub const Tokenizer = struct {
         // to the next one), so `n` is too.
         std.debug.assert(best[n] != -std.math.inf(f64));
 
-        // Backtrack, then emit forwards, fusing consecutive `<unk>` (rule 5).
+        // Backtrack, then emit forwards, FUSING consecutive `<unk>` (`fuse_unk`), so
+        // the two Gothic letters of one unsegmentable word are a single id while two
+        // unknown characters separated by a space are two: they land in different
+        // pre-tokens and fusion does not cross them.
         var path: std.ArrayList(u32) = .empty;
         var at = n;
         while (at > 0) {
@@ -641,8 +626,8 @@ test "an empty normalized span contributes no token, not a bare metaspace" {
     var tok = try Tokenizer.init(gpa);
     defer tok.deinit();
 
-    // Rule 4. Each of these normalizes to "" — whitespace stripped, control chars
-    // deleted by the charsmap — and must yield only the trailing `</s>`.
+    // Rule 4. Each of these normalizes to "", whitespace stripped, control chars
+    // deleted by the charsmap, and must yield only the trailing `</s>`.
     for ([_][]const u8{ "", " ", "   ", "\t", "\x01", "\x01\x02", " \t\n " }) |text| {
         const got = try tok.encode(gpa, text);
         defer gpa.free(got);
@@ -674,7 +659,7 @@ test "the charsmap normalizer is applied, not assumed to be identity" {
         .{ .in = "a\u{200B}b", .want = "a b" }, // ZWSP -> space
         .{ .in = "a\u{200D}b", .want = "a b" }, // ZWJ -> space
         .{ .in = "a\u{3000}b", .want = "a b" }, // ideographic space
-        // ⚠️ Needs grapheme clustering: `e` + U+0301 is one cluster with a charsmap
+        // Needs grapheme clustering: `e` + U+0301 is one cluster with a charsmap
         // entry, where per-codepoint lookup leaves both characters alone.
         .{ .in = "cafe\u{0301}", .want = "caf\u{00E9}" },
         .{ .in = "a\u{0301}b", .want = "\u{00E1}b" },
@@ -682,7 +667,7 @@ test "the charsmap normalizer is applied, not assumed to be identity" {
         .{ .in = "x\u{0301}\u{0301}", .want = "x\u{0301}\u{0301}" },
         .{ .in = "a\x01b", .want = "ab" }, // control char deleted
         .{ .in = "a\tb", .want = "a b" }, // tab -> space
-        .{ .in = "a\r\nb", .want = "a b" }, // ⚠️ CR LF is ONE cluster -> ONE space
+        .{ .in = "a\r\nb", .want = "a b" }, // CR LF is ONE cluster -> ONE space
         // Strip(right), then the 2+-space collapse.
         .{ .in = "trailing   ", .want = "trailing" },
         .{ .in = "a  b", .want = "a" ++ meta ++ "b" },

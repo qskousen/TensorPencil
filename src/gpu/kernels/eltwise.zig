@@ -1,6 +1,6 @@
-//! Device-side elementwise / normalization / attention kernels for the
-//! GPU-resident DiT forward. No workgroup memory anywhere (see ZIG.md on the
-//! NVIDIA + Zig-SPIR-V workgroup issue), so all entries share this module.
+//! Device-side elementwise, normalization and attention kernels for the GPU-resident
+//! DiT forward. No workgroup memory anywhere, because the NVIDIA driver faults on
+//! Zig-emitted workgroup-storage kernels, so all entries share this module.
 //!
 //! Universal binding layout (set 0): four storage buffers a, b, c, d whose
 //! roles depend on the entry point; unused bindings get a dummy buffer.
@@ -150,7 +150,7 @@ export fn rms_apply_mod() callconv(.spirv_kernel) void {
     b.data[idx] = a.data[idx] * d.data[idx / pc.u1] * c.data[pc.u2 + col] + c.data[pc.u3 + col];
 }
 
-// rms_apply_w: y = x*inv[row]*w[col] — the plain-weight epilogue of the
+// rms_apply_w: y = x*inv[row]*w[col], the plain-weight epilogue of the
 //   3-pass parallel rmsnorm (rms_partial/rms_combine), for wide rows with a
 //   norm weight but no AdaLN modulation (the LLM decode path's rows=1
 //   hidden norms). a = x, b = out, c = weight, d = inv. u0 = n, u1 = dim.
@@ -203,10 +203,10 @@ export fn add_relu() callconv(.spirv_kernel) void {
 
 // penalize: sampling penalties (sample.zig penalizeLogit), one thread per
 //   unique recent token: logits[id] = (l>0 ? l/rp : l*rp) - sub. a=logits (in
-//   place), b=wire — f32 pairs of (token id, stored as an exact f32 < 2^24,
+//   place), b=wire, f32 pairs of (token id, stored as an exact f32 < 2^24,
 //   and the host-precomputed presence+frequency subtract term; see
 //   sample.packPenaltyWireF32). u0=entry count, f0=repeat penalty. Ids are
-//   unique so no two threads touch the same logit — no atomics.
+//   unique so no two threads touch the same logit, no atomics.
 export fn penalize() callconv(.spirv_kernel) void {
     decorate();
     const e = gpu.global_invocation_id[0];
@@ -221,7 +221,7 @@ export fn penalize() callconv(.spirv_kernel) void {
 // argmax_reduce: L lanes; lane i stride-scans logits[i], logits[i+L], ... and
 //   records its local max and the LOWEST index achieving it (ascending scan +
 //   strict `>` keeps the lowest). a=logits, c=out_val[L], d=out_idx[L] (index
-//   as an exact f32 — vocab < 2^24). u0=L (lanes), u1=vocab. Pairs with
+//   as an exact f32, vocab < 2^24). u0=L (lanes), u1=vocab. Pairs with
 //   argmax_final; no workgroup memory, no atomics.
 export fn argmax_reduce() callconv(.spirv_kernel) void {
     decorate();
@@ -244,7 +244,7 @@ export fn argmax_reduce() callconv(.spirv_kernel) void {
 // topk_reduce: L lanes each keep their M highest (value, index) over their
 //   stride-slice, via min-slot tracking (strict `>` keeps the lower index on
 //   ties). a=logits, c=out_val[L*M], d=out_idx[L*M] (index as exact f32).
-//   u0=L, u1=vocab. The host does exact top-k over the L*M candidates — this
+//   u0=L, u1=vocab. The host does exact top-k over the L*M candidates, this
 //   is a superset selection, exact unless a single lane holds >M of the global
 //   top-k (astronomically unlikely for k<=512 over 1024 lanes). No workgroup
 //   memory, no atomics.
@@ -318,7 +318,7 @@ export fn sigmoid_mul() callconv(.spirv_kernel) void {
 }
 
 // GeGLU gate (Gemma FFN): a = geluTanh(a) * b. Folded tanh-gelu as
-// x·sigmoid(2c·(x + c3·x³)), c = √(2/π), c3 = 0.044715 (2c = 1.59576912) —
+// x*sigmoid(2c*(x + c3*x³)), c = √(2/π), c3 = 0.044715 (2c = 1.59576912),
 // matches the CPU ops.act.geluTanhMul / the CUDA gelu_mul to f32 rounding.
 export fn gelu_mul() callconv(.spirv_kernel) void {
     decorate();
@@ -364,7 +364,7 @@ export fn layernorm() callconv(.spirv_kernel) void {
     while (i < dim) : (i += 1) b.data[base + i] = (a.data[base + i] - mean) * inv * c.data[i] + d.data[i];
 }
 
-// Full non-causal attention, one thread per (query, head) — arbitrary
+// Full non-causal attention, one thread per (query, head), arbitrary
 // head_dim (unlike the 32-slice `attention` kernel). a=q, b=k, c=v, d=out,
 // each [seq][n_heads*hd] (position j at j*n_kv*hd + kvh*hd). u0=seq,
 // u1=n_heads, u2=n_kv_heads, u3=head_dim (<=256), f0=scale. Online softmax.
@@ -380,7 +380,7 @@ export fn attn_full() callconv(.spirv_kernel) void {
     const head = idx % n_heads;
     const kvh = head / (n_heads / n_kv);
     // u4/u5 = element base offsets into the q/out and k/v buffers (batched
-    // ragged packing — one item's sub-region; 0 for the single-item path). q
+    // ragged packing, one item's sub-region; 0 for the single-item path). q
     // and k/v may have different per-position strides (GQA), hence two offsets.
     const qoff = pc.u4;
     const kvoff = pc.u5;
@@ -415,7 +415,7 @@ export fn attn_full() callconv(.spirv_kernel) void {
 // Block-diagonal BATCHED non-causal attention over B UNIFORM-length items
 // packed into one [total, n_heads*hd] (q/out) / [total, n_kv*hd] (k/v)
 // activation. Each item is `s_rows` rows; query at global row q attends only
-// keys [item*s_rows, item*s_rows + s_rows) where item = q/s_rows — so one
+// keys [item*s_rows, item*s_rows + s_rows) where item = q/s_rows, so one
 // launch over all total*n_heads (query,head) threads gives B× the parallelism
 // of the per-item loop (what fills the GPU for short encoder sequences). No
 // per-item bounds buffer needed since lengths are uniform. u0=total, u1=n_heads,
@@ -462,12 +462,12 @@ export fn attn_full_batched() callconv(.spirv_kernel) void {
     while (t < hd) : (t += 1) d.data[qb + t] = acc[t] * inv;
 }
 
-// Block-diagonal batched CAUSAL attention — `attn_full_batched` with the key
+// Block-diagonal batched CAUSAL attention, `attn_full_batched` with the key
 // range clipped to `[item_start, query]` instead of the whole item.
 //
 // This is CLIP's text tower: a causal LM body used as an encoder, so unlike every
-// other encoder here it must not see forward. ⚠️ A non-causal CLIP still encodes
-// every prompt and still renders every image — it is simply a different model — so
+// other encoder here it must not see forward. A non-causal CLIP still encodes
+// every prompt and still renders every image, it is simply a different model, so
 // there is no failure to observe, which is why this gets its own kernel rather than
 // a flag on `attn_full_batched` that a caller could forget.
 //
@@ -491,7 +491,7 @@ export fn attn_causal_batched() callconv(.spirv_kernel) void {
     const head = idx % n_heads;
     const kvh = head / (n_heads / n_kv);
     const kv_start = (q_global / s_rows) * s_rows;
-    // Inclusive of the query's own row, exclusive above it — the only difference
+    // Inclusive of the query's own row, exclusive above it, the only difference
     // from the non-causal form, and the whole point of the kernel.
     const kv_end = q_global + 1;
     const qb = idx * hd;
@@ -522,7 +522,7 @@ export fn attn_causal_batched() callconv(.spirv_kernel) void {
 }
 
 // quick-GELU, in place: a = x * sigmoid(1.702x). CLIP-L's (and SD1.5's whole text
-// tower's) activation. ⚠️ NOT interchangeable with the `gelu` above (tanh) or with
+// tower's) activation. NOT interchangeable with the `gelu` above (tanh) or with
 // `gelu_erf` below: the three agree to ~1e-2 and disagree enough to shift style.
 // Matches `ops.act.geluQuick` term for term. a=in/out. u0=total.
 export fn gelu_quick() callconv(.spirv_kernel) void {
@@ -534,7 +534,7 @@ export fn gelu_quick() callconv(.spirv_kernel) void {
 }
 
 // erf-GELU, in place: a = 0.5x(1 + erf(x/sqrt2)). CLIP-G's (SDXL's second tower's)
-// activation — the exact form `F.gelu` defaults to, with the same A&S 7.1.26 erf
+// activation, the exact form `F.gelu` defaults to, with the same A&S 7.1.26 erf
 // the `geglu` kernel below uses, so the two cannot drift. a=in/out. u0=total.
 export fn gelu_erf() callconv(.spirv_kernel) void {
     decorate();
@@ -566,7 +566,7 @@ export fn rope_inter() callconv(.spirv_kernel) void {
     a.data[at + 1] = x0 * sin_v + x1 * cos_v;
 }
 
-// rope_half: rotate-half RoPE (Qwen/Llama convention) in place — pairs
+// rope_half: rotate-half RoPE (Qwen/Llama convention) in place, pairs
 // element i with i+half rather than adjacent lanes. a = qk, c = freqs (cos
 // then sin halves). u0 = total (seq*n_heads*half), u1 = half, u2 = sin_off,
 // u3 = n_heads. Matches ops.rope.applyRotateHalf exactly.
@@ -582,7 +582,7 @@ export fn rope_half() callconv(.spirv_kernel) void {
     const row = idx / half; // pos*n_heads + head
     const cos_v = c.data[pos * half + i];
     const sin_v = c.data[pc.u2 + pos * half + i];
-    // u5 = element base offset into `a` (batched ragged packing — one item's
+    // u5 = element base offset into `a` (batched ragged packing, one item's
     // sub-region; 0 for the single-item path). The freqs table (c) stays
     // absolute: each item's positions start at 0.
     const base = pc.u5 + row * (2 * half);
@@ -595,7 +595,7 @@ export fn rope_half() callconv(.spirv_kernel) void {
 // --- k-split GEMV (m=1 decode; the tiled GEMM leaves rows/8 threads) ------
 // gemv_partial: y[col] = dot(W[:, col], x) split over u2 interleaved k
 //   chunks; one thread per (chunk, 4-column group) so an fp8 thread reads a
-//   whole u32 word per k (a warp touches 128 consecutive bytes — per-column
+//   whole u32 word per k (a warp touches 128 consecutive bytes, per-column
 //   threads would touch 32 and waste 4x bandwidth). Weight is the k-major
 //   transposed layout of the matmul kernels: element (k, col) at
 //   k*w_stride + col; rows must be a multiple of 4. a = W (raw words through
@@ -711,7 +711,7 @@ inline fn wi8(bo: u32) i32 {
 // `row` lives at physical byte grp_base + j*32 (grp_base = (row/32)*row_bytes*32
 // + row%32). A 32-lane warp = one full row-group, so at every read the warp
 // touches 32 consecutive bytes = one coalesced transaction (the raw row-major
-// layout has lanes row_bytes apart — ~1.7% of peak bandwidth). `gb` is the
+// layout has lanes row_bytes apart, ~1.7% of peak bandwidth). `gb` is the
 // caller's grp_base; `j` is the logical byte within the row.
 const GROUP = 32;
 inline fn tbyte(gb: u32, j: u32) u32 {
@@ -1148,7 +1148,7 @@ export fn gemv_q5_k_t() callconv(.spirv_kernel) void {
 
 // --- block-quant dequant -> f32 row-major (prefill tensor-core GEMM path) ---
 // These read the SAME 32-row-group transposed weight the gemv_*_t kernels read
-// (so the resident decode weight is reused — no second copy) and write the
+// (so the resident decode weight is reused, no second copy) and write the
 // dequantized weight in natural [rows][cols] row-major order (element (row,col)
 // at row*cols + col; the value `col` would multiply in the GEMV). One thread
 // per (row, block/superblock); idx = unit*rows + row so a 32-lane warp reads
@@ -1321,7 +1321,7 @@ export fn dequant_q6_k_f32() callconv(.spirv_kernel) void {
 }
 
 // pack_h16_kmajor: f32 row-major [rows][cols] -> f16 k-major padded [k_pad][n_pad]
-//   (element (k,row) at k*n_pad + row), zeros in both pads — the layout the
+//   (element (k,row) at k*n_pad + row), zeros in both pads, the layout the
 //   f16-weight coop GEMM (weightBufferF16From32) reads. One thread per OUTPUT
 //   WORD, holding two adjacent rows of the same column k (n_pad is even, so a
 //   word never straddles a column). a = f32 row-major, d = f16 words.
@@ -1507,7 +1507,7 @@ export fn rope_qwen35() callconv(.spirv_kernel) void {
 //   [kv_len*kvDim], c = v_cache [kv_len*kvDim] (kvDim = n_kv*hd, position j at
 //   j*kvDim + kvh*hd), d = out [n_heads*hd]. u0 = n_heads, u1 = n_kv_heads,
 //   u2 = head_dim (<=256), u3 = kv_len, u4 = window (0 = full causal;
-//   sliding-window for Gemma 3 local layers — attend only the last `window`
+//   sliding-window for Gemma 3 local layers, attend only the last `window`
 //   keys), u5 = ring (0 = linear; >0 => KV storage row is pos%ring, gemma3
 //   LOCAL ring cache), f0 = scale.
 export fn attn_decode_q35() callconv(.spirv_kernel) void {
@@ -1557,13 +1557,13 @@ export fn attn_decode_q35() callconv(.spirv_kernel) void {
 //   reading each weight word once for all four inputs and each x value once
 //   for eight columns. Per-(column, input) k order is identical to
 //   gemv_partial (k = ch, stride nchunk), so results are bitwise equal to
-//   four single-input GEMVs — greedy speculative decode stays byte-identical
+//   four single-input GEMVs, greedy speculative decode stays byte-identical
 //   to vanilla. x must have 4 rows of backing store past the offset (garbage
 //   rows beyond the live count are discarded by gemv_combine4's n). rows
 //   must be a multiple of 8. a = W (k-major), b = x, d = partials
 //   [ch][4][rows]. u0 = (rows/8)*nchunk, u1 = cols, u2 = nchunk,
 //   u3 = w_stride, u4 = is_f8, u5 = rows, f1 = x element offset (bitcast u32
-//   — the input-group base for seq > 4 verifies).
+//   the input-group base for seq > 4 verifies).
 export fn gemv_partial4() callconv(.spirv_kernel) void {
     decorate();
     const idx = gpu.global_invocation_id[0];
@@ -1628,7 +1628,7 @@ export fn gemv_partial4() callconv(.spirv_kernel) void {
 }
 
 // gemv_combine4: y[u2 + i*u3 + col] = scale * sum_ch partials[ch][i][col]
-//   for the n live inputs — the reduce half of gemv_partial4. Same ascending
+//   for the n live inputs, the reduce half of gemv_partial4. Same ascending
 //   chunk order as gemv_combine (bitwise equal). a = partials [ch][4][rows],
 //   d = y. u0 = rows, u1 = nchunk, u2 = dest element offset, u3 = dest row
 //   stride (elements between consecutive inputs' outputs), u4 = n (1..4),
@@ -1665,9 +1665,9 @@ inline fn e4m3ToF32(byte: u32) f32 {
 }
 
 // --- flash-decoding attention (queries vs. the KV cache) ------------------
-// attn_dsplit: pass 1 — one thread per (query, head, kv chunk): online
+// attn_dsplit: pass 1, one thread per (query, head, kv chunk): online
 //   softmax over the chunk, unnormalized partial (m, d, acc[hd]) to scratch
-//   at [idx*(hd+2)] ([t][h][i] order — attn_dmerge runs with heads' =
+//   at [idx*(hd+2)] ([t][h][i] order, attn_dmerge runs with heads' =
 //   seq_q*heads). Queries are consecutive causal positions: query t sees
 //   kv_len0 + t keys, so seq_q == 1 is plain decode and seq_q > 1 the
 //   speculative-verify batch / multi-turn prefill chunk. Empty chunks write
@@ -1718,7 +1718,7 @@ export fn attn_dsplit() callconv(.spirv_kernel) void {
     while (t < hd) : (t += 1) d.data[base + 2 + t] = acc[t];
 }
 
-// attn_dmerge: pass 2 — one thread per (head, dim c): M = max_i m_i,
+// attn_dmerge: pass 2, one thread per (head, dim c): M = max_i m_i,
 //   D = sum_i d_i*exp(m_i-M), out[h][c] = sum_i acc_i[c]*exp(m_i-M) / D.
 //   a = scratch (see attn_dsplit), d = out [heads][hd].
 //   u0=heads, u1=hd, u2=nsplit.
@@ -1750,7 +1750,7 @@ export fn attn_dmerge() callconv(.spirv_kernel) void {
 //   with sliding-window + ring addressing (gemma3 LOCAL layers) and GQA. One
 //   thread per (head, kv chunk): online softmax over its chunk of the visible
 //   window, unnormalized partial (m, d, acc[hd]) to scratch at [idx*(hd+2)]
-//   ([h][i] order — attn_dmerge runs with heads' = heads). Pairs with
+//   ([h][i] order, attn_dmerge runs with heads' = heads). Pairs with
 //   attn_dmerge (hd-agnostic). Parallelizes the old one-thread-per-head
 //   attn_decode_q35 by `nsplit`.
 //   a = q [heads][hd], b = k_cache, c = v_cache, d = scratch.
@@ -1810,7 +1810,7 @@ export fn attn_dsplit_gemma() callconv(.spirv_kernel) void {
 
 // f16 K/V readers: the K (b) / V (c) caches hold f16, two per f32 slot. Element
 // e lives in slot e/2, low half if e even else high (little-endian). Mirrors
-// `wf16` (buffer a) for the K/V bindings — used by attn_dsplit_gemma_f16.
+// `wf16` (buffer a) for the K/V bindings, used by attn_dsplit_gemma_f16.
 inline fn kf16(e: u32) f32 {
     const word: u32 = @bitCast(b.data[e / 2]);
     const bits: u16 = if (e % 2 == 0) @truncate(word) else @truncate(word >> 16);
@@ -1907,7 +1907,7 @@ inline fn vq8q(e: u32) f32 {
 
 // attn_dsplit_gemma_q8: q8_0-KV variant of attn_dsplit_gemma. Identical online
 // softmax + sliding-window + ring, but K/V are read from the q8_0 block caches
-// (kq8*/vq8*) and widened to f32 — the row base is a block multiple (kv_dim is),
+// (kq8*/vq8*) and widened to f32, the row base is a block multiple (kv_dim is),
 // so 32-wide chunks hoist each block's scale once. Q (a) and scratch (d) stay
 // f32. Params match attn_dsplit_gemma exactly. Lossy vs f32.
 export fn attn_dsplit_gemma_q8() callconv(.spirv_kernel) void {
@@ -1972,7 +1972,7 @@ export fn attn_dsplit_gemma_q8() callconv(.spirv_kernel) void {
 // 34-byte block ends mid-word and adjacent threads would race on the shared
 // word; kv_dim is a multiple of 64, so rows always hold whole pairs. Reads
 // a.data[u3 + idx*64 ..][64] (f32), writes 17 words at b word (u2/64)*17 +
-// idx*17. Per block: d = absmax/127 (f16), q = roundEven(x/d) — same
+// idx*17. Per block: d = absmax/127 (f16), q = roundEven(x/d), same
 // round-to-nearest-even as the host packQ80 and the CUDA cvt.rni kernels.
 // u0 = pair count, u2 = dst element offset (pair-aligned), u3 = src elem off.
 export fn kv_store_q8_0() callconv(.spirv_kernel) void {
@@ -2049,21 +2049,21 @@ export fn copy() callconv(.spirv_kernel) void {
 
 // --- f16 ACTIVATION STORAGE (VAE decode) ------------------------------------
 //
-// ⚠️ Storage-format twins, NOT new maths: each reads and/or writes the big VAE
+// Storage-format twins, NOT new maths: each reads and/or writes the big VAE
 // activation buffers as f16 while computing in f32 exactly as its f32 original a
 // few lines away. A 16-channel VAE decoding 1056x1584 holds 256 channels at FULL
 // image resolution (428M floats, 1.71 GB) in each of two buffers; f32 storage made
 // a whole-image decode cost 4.3 GB of activations. `sd_vae.Config.act_f16` gates
-// them, on RANGE not precision — SDXL's residual reaches 4.2e5, past f16.
+// them, on RANGE not precision, SDXL's residual reaches 4.2e5, past f16.
 //
-// ⚠️ **f16 rides as u32 PAIRS**, because every storage buffer here is `[*]f32`:
+// f16 rides as u32 PAIRS, because every storage buffer here is `[*]f32`:
 // element `i` is half `i & 1` of word `i >> 1`. Reads may therefore be
-// per-element, but a WRITE must own the whole word or two threads race on it — so
+// per-element, but a WRITE must own the whole word or two threads race on it, so
 // every store kernel below indexes PAIRS and does two elements per thread. That is
 // the one structural difference from the CUDA twins, which have real `b16` stores.
 //
-// ⚠️ Each takes its f32 original's push layout EXACTLY (Vulkan's, which is not
-// CUDA's — `im2col_sd` carries the source width in u3 and the output width in u6,
+// Each takes its f32 original's push layout EXACTLY (Vulkan's, which is not
+// CUDA's, `im2col_sd` carries the source width in u3 and the output width in u6,
 // and `bias_compact` carries a bias offset in u4 and `act_div` in f0). A first
 // attempt ported the PTX conventions instead; it compiled and would have been
 // silently wrong.
@@ -2080,7 +2080,7 @@ inline fn packH16(lo: f32, hi: f32) f32 {
     return @bitCast(@as(u32, a16) | (@as(u32, b16) << 16));
 }
 
-// gn_stats over an f16 activation. Read-only, so no pairing. ⚠️ Welford stays in
+// gn_stats over an f16 activation. Read-only, so no pairing. Welford stays in
 // f32: the shifted E[x²]-E[x]² form loses catastrophically once the mean is large
 // relative to the spread, which a late VAE block is.
 export fn gn_stats_h16() callconv(.spirv_kernel) void {
@@ -2109,7 +2109,7 @@ export fn gn_stats_h16() callconv(.spirv_kernel) void {
     d.data[idx * 3 + 2] = m2;
 }
 
-// gn_apply reading AND writing f16, one thread per PAIR of elements. ⚠️ The two
+// gn_apply reading AND writing f16, one thread per PAIR of elements. The two
 // halves can land in different groups (`per_group` = ch/32 is odd for ch = 96 or
 // 160), so the group lookup is per element, not per pair.
 export fn gn_apply_h16() callconv(.spirv_kernel) void {
@@ -2140,8 +2140,8 @@ export fn add_h16() callconv(.spirv_kernel) void {
 }
 
 // bias_compact writing f16: the GEMM accumulator `a` stays f32 and the `act_div`
-// unscale and bias add still happen in f32; only `d` narrows. ⚠️ `pc.u3` (the
-// destination offset) must be EVEN for the pair write to align — it is
+// unscale and bias add still happen in f32; only `d` narrows. `pc.u3` (the
+// destination offset) must be EVEN for the pair write to align, it is
 // `p0 * co` and `co` is always even here.
 export fn bias_compact_h16() callconv(.spirv_kernel) void {
     decorate();
@@ -2157,7 +2157,7 @@ export fn bias_compact_h16() callconv(.spirv_kernel) void {
     d.data[(pc.u3 + e0) >> 1] = packH16(out[0], out[1]);
 }
 
-// im2col_sd reading an f16 source. ⚠️ The patch it WRITES stays f32 — it is banded
+// im2col_sd reading an f16 source. The patch it WRITES stays f32, it is banded
 // (a few MB, `convBand`) so it is not where the memory goes, and leaving it f32
 // keeps the GEMM's own conversion and the zero-padding untouched.
 export fn im2col_sd_h16() callconv(.spirv_kernel) void {
@@ -2219,7 +2219,7 @@ export fn h16_to_h16_pad() callconv(.spirv_kernel) void {
 //   z = head-in-batch. a=S, c=V, d=out. u0..u4 as attn_scores.
 const amm_tile = 8;
 
-// gather_kmajor: d[(h*hd + k)*seq + s] = a[(s*n_heads + h)*hd + k] —
+// gather_kmajor: d[(h*hd + k)*seq + s] = a[(s*n_heads + h)*hd + k],
 // per-head k-major layout so the scores kernel loads contiguously.
 // u0=seq*n_heads*hd u1=n_heads u2=hd u3=seq. x = flat source index.
 export fn gather_kmajor() callconv(.spirv_kernel) void {
@@ -2269,7 +2269,7 @@ export fn gather_kmajor_h16() callconv(.spirv_kernel) void {
 }
 
 // head_pad_h16: tight f32 [seq][heads*hd_src] -> f16 [seq_pad][heads*hd_out]
-// with each head zero-extended to hd_out and rows past `seq` zeroed — the Q and
+// with each head zero-extended to hd_out and rows past `seq` zeroed, the Q and
 // V operands of the tensor-core attention, whose pipelines are compiled for
 // head_dim 128 while the SD UNet's heads are 40 (SD1.5 level 0), 64 (SDXL) or
 // 80. `f32_to_h16` cannot do this: the padding is INTERLEAVED per head, not
@@ -2300,10 +2300,10 @@ export fn head_pad_h16() callconv(.spirv_kernel) void {
     d.data[idx] = @bitCast(out);
 }
 
-// head_unpad: the inverse for the f32 attention output — [seq_pad][heads*hd_out]
+// head_unpad: the inverse for the f32 attention output, [seq_pad][heads*hd_out]
 // back to tight [seq][heads*hd_src], dropping each head's padding columns (whose
 // values come from V's zero columns and are therefore not merely unwanted but
-// meaningless). a = src, **b = dst** (an f32 a->b elementwise op, like `copy`
+// meaningless). a = src, b = dst (an f32 a->b elementwise op, like `copy`
 // and `gn_apply`; the f16-emitting `head_pad_h16` above writes `d` instead).
 // u0 = seq*heads*hd_src, u1 = hd_src, u2 = hd_out, u4 = heads.
 export fn head_unpad() callconv(.spirv_kernel) void {
@@ -2327,7 +2327,7 @@ export fn attn_scores() callconv(.spirv_kernel) void {
     const j0 = gpu.global_invocation_id[0] * amm_tile;
     const q0 = gpu.global_invocation_id[1] * amm_tile;
     // Query banding (u6 != 0): compute rows [u5, u5+u6) of the scores plane into a
-    // band-local buffer of `u6` rows. u6 == 0 is the whole plane, exactly as before —
+    // band-local buffer of `u6` rows. u6 == 0 is the whole plane, exactly as before,
     // every pre-existing caller passes 0 for both, so their behaviour is unchanged
     // by construction. Exists because the VAE mid-block attends over EVERY latent
     // position: at a 132x198 latent that is seq = 26,136 and a full f32 plane is
@@ -2376,7 +2376,7 @@ export fn attn_scores() callconv(.spirv_kernel) void {
 // --- two-pass softmax feeding the tensor-core P@V GEMM -------------------
 // softmax_partial: one thread per (head z, row q, chunk): online max/sum-exp
 // over an INTERLEAVED slice of f16-pair WORDS (the scores kernel stores S
-// half-precision) — consecutive threads read consecutive words every
+// half-precision), consecutive threads read consecutive words every
 // iteration (a contiguous-block split makes warp lanes stride kilobytes
 // apart and costs ~30x bandwidth). Max and exp-sum are order-independent,
 // so the interleaving is free. a = S (f16 pairs read through the f32 view),
@@ -2416,7 +2416,7 @@ export fn softmax_partial() callconv(.spirv_kernel) void {
 
 // softmax_combine: one thread per (z, q): fold the chunk partials into the
 // row max and reciprocal denominator. a = partials, d = md [z][rows_pad]
-// x {m, 1/d} (pad rows stay garbage — their P@V output rows are never
+// x {m, 1/d} (pad rows stay garbage, their P@V output rows are never
 // read). u0 = total threads (z*rows), u1 = nchunks, u2 = rows (seq),
 // u3 = rows_pad (md rows per head plane).
 export fn softmax_combine() callconv(.spirv_kernel) void {
@@ -2467,14 +2467,14 @@ export fn attn_out() callconv(.spirv_kernel) void {
     const kv_head = head / (pc.u1 / pc.u2);
     const c0 = gpu.global_invocation_id[0] * amm_tile;
     const q0 = gpu.global_invocation_id[1] * amm_tile;
-    // ⚠️ `u6` carries the query-band offset **plus one**, so that 0 keeps meaning
-    // "not banded" — the kernel has exactly one free push slot and needs to
+    // `u6` carries the query-band offset plus one, so that 0 keeps meaning
+    // "not banded", the kernel has exactly one free push slot and needs to
     // distinguish "band starting at row 0" from "no banding". See `attn_scores`.
     const banded = pc.u6 != 0;
     const qoff = if (banded) pc.u6 - 1 else 0;
     if (c0 >= hd or (!banded and q0 >= seq) or qoff + q0 >= seq) return;
 
-    // Scores layout: row stride u5, per-head plane stride in f0 (u32 bits) —
+    // Scores layout: row stride u5, per-head plane stride in f0 (u32 bits),
     // the tensor-core scores path pads both to multiples of 128.
     const z = gpu.global_invocation_id[2];
     const kv_stride = pc.u2 * hd;
@@ -2533,7 +2533,7 @@ export fn attn_out() callconv(.spirv_kernel) void {
 }
 
 // rms_apply_mod_h16: fused modulated rmsnorm + f16 conversion feeding the
-// coop GEMMs — when every consumer of the normed rows shares one dequant
+// coop GEMMs, when every consumer of the normed rows shares one dequant
 // scale, the f32 intermediate (and its round trip) is skipped entirely:
 // b[word] = pack(f16((x*inv[row]*premul[col] + shift[col]) * f0)), zero pad
 // words past the real element count. a = x, b = out (f16 pair words),
@@ -2558,7 +2558,7 @@ export fn rms_apply_mod_h16() callconv(.spirv_kernel) void {
 
 // f16 conversion for the cooperative-matrix path. Output is packed f16
 // pairs in u32 words (binding d). Inputs beyond the real element count
-// (u1) write zero — used to pad rows up to multiples of the GEMM tile.
+// (u1) write zero, used to pad rows up to multiples of the GEMM tile.
 // f32_to_h16: a = f32 source. u0 = out words, u1 = real elems, f0 = scale
 // (the weight dequant scale rides on the activations; the coop kernel
 // decodes raw fp8 weights unscaled).
@@ -2574,7 +2574,7 @@ export fn f32_to_h16() callconv(.spirv_kernel) void {
 
 // f32_to_h16_pad: strided variant for the f16-weight coop path (VAE convs):
 // tight [rows][u1] f32 source rows become [*][u2] f16 rows (u2 >= u1, even),
-// zero in the column tail and beyond u3 source rows — the coop GEMM needs
+// zero in the column tail and beyond u3 source rows, the coop GEMM needs
 // k%64 and the im2col patch length is 9*ci, which usually isn't.
 // a = f32 source, d = packed f16 pairs. u0 = out words, u1 = src cols,
 // u2 = dst cols, u3 = src rows, f0 = scale.
@@ -2621,7 +2621,7 @@ export fn f32_to_bf16_pad() callconv(.spirv_kernel) void {
 }
 
 // silu_mul_h16: fused SwiGLU gate + f16 conversion feeding the coop GEMM:
-// d[word] = pack(f16(silu(a)*b*scale)) — skips the f32 intermediate the
+// d[word] = pack(f16(silu(a)*b*scale)), skips the f32 intermediate the
 // GEMM conversion would immediately re-read. Same push layout as
 // f32_to_h16 (u0 = out words, u1 = real elems, f0 = scale).
 export fn silu_mul_h16() callconv(.spirv_kernel) void {
@@ -2662,7 +2662,7 @@ export fn sigmoid_mul_h16() callconv(.spirv_kernel) void {
 // --- f16-input variants for the f16-C-store coop GEMM path ----------------
 // With f16 accumulators the coop GEMM's C values are exactly representable
 // in f16, so these kernels read the half-precision C directly and compute
-// in f32 — value-identical to the old f32-C + convert chain, at half the
+// in f32, value-identical to the old f32-C + convert chain, at half the
 // GEMM-output traffic.
 
 // qknorm_rope16: fused per-head RMS norm + interleaved rope + output scale,
@@ -2705,7 +2705,7 @@ export fn qknorm_rope16() callconv(.spirv_kernel) void {
     }
 }
 
-// qknorm_rope_f32: qknorm_rope16 entirely in f32, in place — fuses rmsnorm +
+// qknorm_rope_f32: qknorm_rope16 entirely in f32, in place, fuses rmsnorm +
 // rope (2 int8-path passes into 1). a = x (f32 [rows][hd], in place), b = norm
 // weight, c = freqs. u0 = rows, u1 = half, u2 = sin_off, u3 = n_heads,
 // f0 = scale, f1 = eps.
@@ -2734,7 +2734,7 @@ export fn qknorm_rope_f32() callconv(.spirv_kernel) void {
     }
 }
 
-// gather_kmajor16: gather_kmajor_h16 with an f16 source — raw u16 moves, no
+// gather_kmajor16: gather_kmajor_h16 with an f16 source, raw u16 moves, no
 // conversion. a = f16 [seq][kv][hd] pair words, d = packed f16 pairs
 // [kv][hd][s_stride]; positions >= seq write zero. u0 = out words, u1 = hd,
 // u2 = s_stride (even), u3 = seq, u4 = n_kv_heads.
@@ -2783,7 +2783,7 @@ export fn silu_mul16() callconv(.spirv_kernel) void {
 }
 
 // sigmoid_mul_g16: sigmoid_mul_h16 with an f16 gate. a = dst (f32, bound by
-// u1 — attention pad rows are never read), b = gate words, d = out words.
+// u1, attention pad rows are never read), b = gate words, d = out words.
 // u0 = words, u1 = real elems, f0 = scale.
 export fn sigmoid_mul_g16() callconv(.spirv_kernel) void {
     decorate();
@@ -2839,7 +2839,7 @@ export fn rotate() callconv(.spirv_kernel) void {
     var acc: f32 = 0;
     var l: u32 = 0;
     // H is symmetric (H[local][l] == H[l][local]); index as [l][local] so that
-    // consecutive threads (consecutive `local`) read consecutive H addresses —
+    // consecutive threads (consecutive `local`) read consecutive H addresses,
     // coalesced instead of stride-gs.
     while (l < gs) : (l += 1) acc += c.data[l * gs + local] * a.data[base + l];
     b.data[idx] = acc;
@@ -2847,7 +2847,7 @@ export fn rotate() callconv(.spirv_kernel) void {
 
 // rotate_fwht: same rotation as `rotate`, but one thread owns a whole 256
 // group and runs the radix-4 fast Walsh-Hadamard (4 passes, strides 1/4/16/64,
-// then /16) — ~16x fewer ops than the matvec, at the cost of a 256-f32 private
+// then /16), ~16x fewer ops than the matvec, at the cost of a 256-f32 private
 // array per thread. Also emits the group's abs-max as a partial (d), so the
 // per-row quant scale becomes a cheap O(groups/row) reduction instead of a
 // latency-bound O(cols) row scan. a = x, b = x_rot, d = partial abs-max per
@@ -2916,7 +2916,7 @@ export fn rowmax_i8() callconv(.spirv_kernel) void {
 
 // quantize_i8: pack 4 int8 per u32 word, q = clamp(round(x_rot/scale[row]),
 // -127, 127). a = x_rot, d = scale [rows], b = packed int8. u0 = words (n/4),
-// u1 = cols, u2 = real element count (words past it — GEMM pad rows — zero).
+// u1 = cols, u2 = real element count (words past it, GEMM pad rows, zero).
 export fn quantize_i8() callconv(.spirv_kernel) void {
     decorate();
     const w = gpu.global_invocation_id[0];
@@ -2937,32 +2937,31 @@ export fn quantize_i8() callconv(.spirv_kernel) void {
 }
 
 // w4a8_decode_t: decode a packed ComfyUI `asym_w4a8_int8` weight into the k-major int8
-// layout the coop GEMM reads. The packed form stays resident and this runs PER GEMM — a
+// layout the coop GEMM reads. The packed form stays resident and this runs PER GEMM, a
 // decoded krea2 is 12.2 GB of int8 against 6.1 GB packed, which is the entire difference
 // between this format and int8 (see ops/w4a8.zig). `levels` is the [256][16] table the
 // host built, so this kernel does no arithmetic at all and is bit-identical to the CPU
 // decode by construction rather than by agreement.
 //
-// ⚠️ **Both inputs arrive ALREADY BYTE-TRANSPOSED**, through the same cached
-// `weightBuffer` path every other weight here uses, and that is what makes this kernel
-// fast rather than merely correct. A transposing decode straight from the row-major
-// storage was tried first and measured **1757 ms/step against a ~20 ms bandwidth roof**:
-// a transpose has one unavoidably strided side, so a warp's 32 lanes hit 32 separate
-// sectors per load instruction, and paying that PER GEMM rather than once at load is what
-// made it 50x off. Transposing the *packed* bytes once at load costs the same one-time
-// pass every dense weight already pays, and leaves every stream here coalesced.
+// Both inputs arrive ALREADY BYTE-TRANSPOSED, through the same cached `weightBuffer`
+// path every other weight uses, and that is what makes this kernel fast rather than
+// merely correct. Transposing inside the decode instead measures 1757 ms/step against a
+// ~20 ms bandwidth roof: a transpose has one unavoidably strided side, so a warp's 32
+// lanes hit 32 separate sectors per load instruction, and paying that PER GEMM rather
+// than once at load is the whole 50x. Transposing the PACKED bytes at load costs the same
+// one-time pass every dense weight already pays and leaves every stream here coalesced.
 //
 // Layout, with `stride = align(rows, tile_n)` shared by both inputs and the output:
-//   a  = pT   packed,  [cols/2][stride] — byte (j, r) holds columns 2j, 2j+1 of row r
+//   a  = pT   packed,  [cols/2][stride], byte (j, r) holds columns 2j, 2j+1 of row r
 //   c  = sT   s_rel,   [cols/group_size][stride] fp8 bytes
 //   b  = out  int8,    [cols][stride]
 // One thread owns 4 consecutive rows of one packed byte-column: it reads ONE u32 of `a`
-// (at index `t` exactly — `j*(stride/4) + rq` is the thread id) and one u32 of `c`, and
+// (at index `t` exactly, `j*(stride/4) + rq` is the thread id) and one u32 of `c`, and
 // writes one u32 into each of the two output planes 2j and 2j+1. Adjacent threads hold
 // adjacent row quads, so every read and both writes are fully coalesced.
 //
 // The row PADDING needs no special case: `weightBuffer` zeroes it in both inputs, and a
-// zero scale byte is fp8 0.0, whose level table row is all zeros — so a pad row decodes
+// zero scale byte is fp8 0.0, whose level table row is all zeros, so a pad row decodes
 // to 0, which is what the GEMM must see.
 //
 // u0 = total threads = (cols/2)*(stride/4), u1 = group_size/2 (packed byte-columns per
@@ -2994,35 +2993,35 @@ export fn w4a8_decode_t() callconv(.spirv_kernel) void {
 }
 
 // i4_decode_t: unpack a nibble-packed int4-convrot weight into the k-major int8 layout the
-// coop GEMM reads. `w4a8_decode_t` above with the scale plane and the level table removed —
+// coop GEMM reads. `w4a8_decode_t` above with the scale plane and the level table removed,
 // a `.i4` nibble sign-extends straight to int8, and its per-OUTPUT-ROW scale is applied
 // afterwards by `opI8GemmBuf`'s rescale, exactly as it is for a plain int8 weight. So this
 // kernel does no arithmetic beyond a 4-bit sign extension.
 //
-// ⚠️ **This exists so int4 stops costing int8's VRAM on Vulkan.** There is no `sint4`
-// cooperative matrix on this device, so the nibbles must reach the GEMM as int8 either way —
-// but `anima_gpu.Lins` used to do that by widening every weight ONCE AT LOAD, which keeps a
-// full int8 copy resident. Measured on `terraRising`: both int4 and W4A8 hold **1050.7 MB of
-// packed weight bytes** (both are 4-bit), yet int4 occupied **1778 MB against W4A8's 1118**
-// purely because W4A8 had a per-GEMM decode and int4 did not. Same policy, same footprint.
+// This exists so int4 stops costing int8's VRAM on Vulkan. There is no `sint4`
+// cooperative matrix on this device, so the nibbles must reach the GEMM as int8 either way,
+// but widening every weight ONCE AT LOAD keeps a full int8 copy resident. Measured on a
+// 2B trunk: int4 and W4A8 hold the same 1050.7 MB of packed weight bytes, both being
+// 4-bit, yet widening at load costs 1778 MB against W4A8's 1118 purely because W4A8
+// decodes per GEMM. Same policy, same footprint.
 //
-// ⚠️ The result is W4A8-shaped arithmetic, NOT the CUDA arms' W4A4: the weight is 4-bit and
+// The result is W4A8-shaped arithmetic, NOT the CUDA arms' W4A4: the weight is 4-bit and
 // the activation stays int8 (`opI8Prep`). That is what the widening already did, so this
-// changes residency only — renders are expected bit-identical, and the test asserts it.
+// changes residency only, renders are expected bit-identical, and the test asserts it.
 //
-// ⚠️ **Input arrives ALREADY BYTE-TRANSPOSED** through the same cached `weightBuffer` path,
+// Input arrives ALREADY BYTE-TRANSPOSED through the same cached `weightBuffer` path,
 // for the reason `w4a8_decode_t` documents at length: a transposing decode has one strided
 // side and cost that kernel 1757 ms/step against a ~20 ms roof before its inputs were
 // pre-transposed. Do not "simplify" this by reading the row-major storage.
 //
 // Layout, `stride = align(rows, tile_n)` shared by input and output:
-//   a = pT  packed, [cols/2][stride] — byte (j, r) holds columns 2j, 2j+1 of row r
+//   a = pT  packed, [cols/2][stride], byte (j, r) holds columns 2j, 2j+1 of row r
 //   b = out int8,   [cols][stride]
 // One thread owns 4 consecutive rows of one packed byte-column: one u32 in, one u32 into
 // each of the two output planes 2j and 2j+1. Every access is coalesced.
 //
 // The row PADDING needs no special case: `weightBuffer` zeroes it, and nibble 0 sign-extends
-// to int8 0 — which is what the GEMM must see for a pad row.
+// to int8 0, which is what the GEMM must see for a pad row.
 //
 // u0 = total threads = (cols/2)*(stride/4), u1 = stride/4.
 export fn i4_decode_t() callconv(.spirv_kernel) void {
@@ -3037,7 +3036,7 @@ export fn i4_decode_t() callconv(.spirv_kernel) void {
     var hi_out: u32 = 0;
     inline for (0..4) |i| {
         const byte: u32 = (pw >> @intCast(8 * i)) & 0xFF;
-        // ⚠️ LOW nibble = EVEN element, sign-extended — the packing `ops.matmul`'s i4 path
+        // LOW nibble = EVEN element, sign-extended, the packing `ops.matmul`'s i4 path
         // and ComfyUI's W4A4 converter both use. Swapping the halves is not an error, it is
         // a different (wrong) weight matrix, and it is rms-preserving.
         const lo: u32 = @bitCast(@as(i32, @as(i4, @bitCast(@as(u4, @truncate(byte))))));
@@ -3051,29 +3050,29 @@ export fn i4_decode_t() callconv(.spirv_kernel) void {
 
 // nvfp4_decode_t: decode a packed ComfyUI NVFP4 weight into the f16 `[k_pad][n_pad]`
 // k-major layout the coop f16 GEMM reads. Weight-only quantization, per GEMM, so the
-// 4-bit form stays resident — which is what NVFP4 is on anything below Blackwell and what
+// 4-bit form stays resident, which is what NVFP4 is on anything below Blackwell and what
 // ComfyUI itself does there (see ops/nvfp4.zig).
 //
-// ⚠️ Element 2k is the HIGH nibble (`hi_first`), the opposite of `.i4`/`.w4a8` here.
-// ⚠️ Both inputs arrive ALREADY BYTE-TRANSPOSED through `weightBuffer`, and the scales
-// arrive already UNSWIZZLED from the loader — the same arrangement `w4a8_decode_t` needs
+// Element 2k is the HIGH nibble (`hi_first`), the opposite of `.i4`/`.w4a8` here.
+// Both inputs arrive ALREADY BYTE-TRANSPOSED through `weightBuffer`, and the scales
+// arrive already UNSWIZZLED from the loader, the same arrangement `w4a8_decode_t` needs
 // and for the same measured reason: transposing per GEMM puts 32 sectors on every warp
 // load, which cost that kernel 1757 ms/step before its inputs were pre-transposed.
 //
 // Layouts (`sin` = the inputs' shared row stride, `n_pad` = the output's):
-//   a = pT      packed, [cols/2][sin] — byte (j, r) holds columns 2j, 2j+1 of row r
+//   a = pT      packed, [cols/2][sin], byte (j, r) holds columns 2j, 2j+1 of row r
 //   c = sT      fp8 block scales, [cols/16][sin], unswizzled
 //   d = levels  f16 [256][16], the host's table (E2M1 * per_tensor * block already folded)
 //   b = out     f16 [k_pad][n_pad]
 // One thread owns 4 consecutive rows of one packed byte-column: one u32 of `a`, one u32 of
-// `c`, and two pairs of u32 written into output planes 2j and 2j+1 — all coalesced.
+// `c`, and two pairs of u32 written into output planes 2j and 2j+1, all coalesced.
 //
-// ⚠️ It writes BOTH paddings. `n_pad`/`k_pad` round rows/cols up to 128/64 and the GEMM
-// reads all of it, while this scratch is shared between weights of different shapes — so
+// It writes BOTH paddings. `n_pad`/`k_pad` round rows/cols up to 128/64 and the GEMM
+// reads all of it, while this scratch is shared between weights of different shapes, so
 // an unwritten pad slot would feed the next GEMM the previous weight's values.
 //
-// ⚠️ The INPUT planes and the OUTPUT have DIFFERENT row strides — `weightBuffer` pads rows
-// to `tile_n` (8) while the coop GEMM's layout pads to 128 — so the dispatch must cover the
+// The INPUT planes and the OUTPUT have DIFFERENT row strides, `weightBuffer` pads rows
+// to `tile_n` (8) while the coop GEMM's layout pads to 128, so the dispatch must cover the
 // OUTPUT's quads and guard the input read. Getting that backwards leaves every row-padding
 // slot unwritten, which the first version did: a 40-row weight wrote 40 of 128 rows and the
 // GEMM read the previous weight's values from the rest.
@@ -3101,7 +3100,7 @@ export fn nvfp4_decode_t() callconv(.spirv_kernel) void {
             const byte: u32 = (pw >> @intCast(8 * i)) & 0xFF;
             const s: u32 = (sw >> @intCast(8 * i)) & 0xFF;
             const base = s * 8; // 16 f16 entries = 8 u32 words per scale byte
-            const chi = byte >> 4; // element 2j  — HIGH nibble first
+            const chi = byte >> 4; // element 2j, HIGH nibble first
             const clo = byte & 0xF; // element 2j+1
             const whi: u32 = @bitCast(d.data[base + (chi >> 1)]);
             const wlo: u32 = @bitCast(d.data[base + (clo >> 1)]);
@@ -3186,11 +3185,11 @@ export fn vae_norm() callconv(.spirv_kernel) void {
 // GroupNorm is the SD family's normalization, and it is the only norm here
 // whose statistics are NOT per-position: a group reduces over
 // positions * (channels/groups) values at once. With one image in the batch
-// that makes mean/inv per GROUP — 32 numbers for the whole activation — so
+// that makes mean/inv per GROUP, 32 numbers for the whole activation, so
 // the three kernels below are (per-chunk statistics) -> (merge per group) ->
 // (apply per element).
 //
-// ⚠️ The statistic is Welford, not sum-and-sum-of-squares, for the reason the
+// The statistic is Welford, not sum-and-sum-of-squares, for the reason the
 // CPU `ops.norm.groupNorm` spells out: the shifted form `E[x²] - E[x]²` loses
 // catastrophically once the mean is large relative to the spread, which is
 // exactly the regime a late VAE decoder block sits in. Welford per chunk plus
@@ -3219,7 +3218,7 @@ export fn gn_stats() callconv(.spirv_kernel) void {
     var i: u32 = chunk;
     while (i < total) : (i += nch) {
         // Element i of the group is channel c0 + i%per_group at position
-        // i/per_group — the group's channels are a contiguous run, so this is
+        // i/per_group, the group's channels are a contiguous run, so this is
         // the tight channel-last address.
         const v = a.data[(i / per_group) * pc.u1 + c0 + i % per_group];
         count += 1;
@@ -3288,8 +3287,8 @@ export fn silu() callconv(.spirv_kernel) void {
 }
 
 // geglu: the SpatialTransformer feed-forward's gate. `ff.net.0.proj` emits
-// [value | gate] per row in THAT order, and the gate takes the **erf** GELU
-// (`F.gelu`'s default), not the tanh approximation — swapping either is a
+// [value | gate] per row in THAT order, and the gate takes the erf GELU
+// (`F.gelu`'s default), not the tanh approximation, swapping either is a
 // silent quality loss, so this matches `ops.act.geluErfScalar` term for term
 // (Abramowitz & Stegun 7.1.26).
 // a = src [n][2*inner], b = dst [n][inner]. u0 = n*inner, u1 = inner.
@@ -3313,7 +3312,7 @@ export fn geglu() callconv(.spirv_kernel) void {
     b.data[idx] = value * (0.5 * x * (1.0 + erf));
 }
 
-// concat_ch: channel-axis concatenation, one thread per SOURCE element —
+// concat_ch: channel-axis concatenation, one thread per SOURCE element,
 // the UNet's output side prepends each popped skip's channels to the current
 // activation before the ResBlock. dst[p][u3 + j] = src[p][j].
 // a = src [n][u1], b = dst [n][u2]. u0 = n*u1, u1 = src channels,
@@ -3327,7 +3326,7 @@ export fn concat_ch() callconv(.spirv_kernel) void {
 }
 
 // attn_cross: non-causal attention where the KEYS ARE A DIFFERENT LENGTH from
-// the queries — the UNet's cross-attention onto the 77-row text conditioning.
+// the queries, the UNet's cross-attention onto the 77-row text conditioning.
 // `attn_full` folds both into one `seq`, and padding K/V up to seq_q to reuse
 // it would build an n×n scores plane where an n×77 one is wanted (16M against
 // 315K entries at a 512² SD1.5 latent). One thread per (query, head); K/V are
@@ -3374,7 +3373,7 @@ export fn attn_cross() callconv(.spirv_kernel) void {
 // im2col: build the f32 patch matrix for a band of output positions of a
 // zero-padded 3x3 conv over tight channel-last activations, so the conv is
 // a plain GEMM (patches [bn][9*ci] @ W^T). With f0 != 0 the source is
-// sampled nearest-exact 2x upsampled (coordinates halve) — the decoder's
+// sampled nearest-exact 2x upsampled (coordinates halve), the decoder's
 // upsample+conv pairs never materialize the upsampled tensor. One thread
 // per output f32. a = src [h*w][ci], d = patches.
 // u0 = bn*patch_len threads, u1 = patch_len (9*ci), u2 = ci, u3 = src w,
@@ -3407,8 +3406,8 @@ export fn im2col() callconv(.spirv_kernel) void {
 
 // im2col_sd: the SD family's 3x3 patch matrix. The VAE's `im2col` above covers
 // stride 1 and the fused nearest-2x upsample; the UNet additionally has
-// **stride-2** convolutions (LDM's `Downsample`), whose output width is
-// ceil(w/2) and therefore cannot be derived by shifting the source width — so
+// stride-2 convolutions (LDM's `Downsample`), whose output width is
+// ceil(w/2) and therefore cannot be derived by shifting the source width, so
 // the output width is an explicit field here rather than inferred.
 // a = src [h*w][ci], d = patches [bn][9*ci].
 // u0 = bn*patch_len threads, u1 = patch_len (9*ci), u2 = ci, u3 = src w,
@@ -3450,13 +3449,13 @@ export fn im2col_sd() callconv(.spirv_kernel) void {
 // d[u3 + i] = f0*a[(i/u1)*u2 + i%u1] + b[u4 + i%u1].
 // One thread per real output element. a = padded GEMM out [*][u2],
 // b = bias [u1], d = tight dst. u0 = positions*u1, u1 = co, u2 = n_pad,
-// u3 = dst offset (elements), u4 = bias offset (elements — the SD UNet packs
+// u3 = dst offset (elements), u4 = bias offset (elements, the SD UNet packs
 // every ResBlock's per-forward bias into one buffer, so it needs to index into
 // the middle of it).
 //
-// ⚠️ f0 is the GEMM output scale and every caller MUST set it (1.0 for the plain
+// f0 is the GEMM output scale and every caller MUST set it (1.0 for the plain
 // case). It pairs with `f32_to_h16_pad`'s own f0 to let a caller divide the
-// activation by a power of two before the f16 cast and undo it here — f16 tops out
+// activation by a power of two before the f16 cast and undo it here, f16 tops out
 // at 65504 and an SDXL VAE decoder's residual stream reaches ~4e5, so without it
 // the cast alone yields `inf`. The bias is added AFTER the unscale, unscaled.
 export fn bias_compact() callconv(.spirv_kernel) void {

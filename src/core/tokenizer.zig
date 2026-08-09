@@ -146,7 +146,7 @@ pub const Pretok = enum { qwen2, qwen35, tekken };
 /// `spm` is SentencePiece (tokenizer.ggml.model == "llama"; Gemma 3, Llama);
 /// `gemma4` is "SPM-style BPE" (tokenizer.ggml.model == "gemma4"): rank-based
 /// BPE merges over ▁-escaped raw UTF-8, newline-only pre-split, `<0xNN>` byte
-/// fallback — shares the SPM vocab layout but merges by rank, not score.
+/// fallback, shares the SPM vocab layout but merges by rank, not score.
 /// `unigram` is SentencePiece Unigram (XLM-RoBERTa / GTE; Snowflake Arctic
 /// Embed): whitespace pre-split, ▁-prefix per word, Viterbi over per-piece
 /// log-scores, whole-word `<unk>` fallback (no byte fallback).
@@ -184,7 +184,7 @@ pub const Tokenizer = struct {
     /// End-of-sequence token (`tokenizer.ggml.eos_token_id`), when the vocab
     /// declares one distinct from `turn_end`. A model can end a turn on EITHER
     /// its turn marker OR raw `<eos>` (some finetunes emit eos), so chat.isStop
-    /// treats both as stops — else the engine runs past the model's own end and
+    /// treats both as stops, else the engine runs past the model's own end and
     /// degenerates. Null when unknown/absent.
     eos: ?u32 = null,
     pretok: Pretok = .qwen2,
@@ -264,7 +264,7 @@ pub const Tokenizer = struct {
     /// Qwen3 tokenizer. CONTROL / USER_DEFINED tokens (token_type 3 / 4)
     /// become verbatim-matched specials; the template/stop ids resolve from
     /// the control tokens and the eos/padding kv entries. Everything is
-    /// copied into the tokenizer's arena — the Gguf may be closed after.
+    /// copied into the tokenizer's arena, the Gguf may be closed after.
     pub fn initFromGguf(gpa: std.mem.Allocator, g: *const gguf_mod.Gguf) !Tokenizer {
         const model = g.getStr("tokenizer.ggml.model") orelse return error.MissingTokenizer;
         if (std.mem.eql(u8, model, "llama")) return initSpmFromGguf(gpa, g);
@@ -438,7 +438,7 @@ pub const Tokenizer = struct {
     /// CONTROL/USER_DEFINED specials) but merges are RANK-ordered BPE rules
     /// (llama.cpp LLAMA_VOCAB_TYPE_BPE + pre-type "gemma4"). Encoding escapes
     /// spaces to ▁ (no dummy prefix), splits on newline runs, then runs
-    /// rank-BPE with byte fallback — see `encodeGemma4`.
+    /// rank-BPE with byte fallback, see `encodeGemma4`.
     pub fn initGemma4FromGguf(gpa: std.mem.Allocator, g: *const gguf_mod.Gguf) !Tokenizer {
         const tokens_arr = g.getArr("tokenizer.ggml.tokens") orelse return error.MissingTokenizer;
         const types_arr = g.getArr("tokenizer.ggml.token_type") orelse return error.MissingTokenizer;
@@ -532,7 +532,7 @@ pub const Tokenizer = struct {
         t.pad = if (g.getUint("tokenizer.ggml.padding_token_id")) |p| @intCast(p) else eos orelse t.turn_end;
         t.newline = text_id.get("\n") orelse 0;
         // BOS: Gemma prompts REQUIRE a leading <bos>. The chat_template renders
-        // it via `{{ bos_token }}`, so `bos` must be populated — otherwise the
+        // it via `{{ bos_token }}`, so `bos` must be populated, otherwise the
         // render-driven path emits no BOS and the model degenerates (badly on
         // larger models). The hand glue adds it via specialId, but the template
         // path relies on this field.
@@ -543,7 +543,7 @@ pub const Tokenizer = struct {
     /// Build a Gemma-style BPE tokenizer (kind == .gemma4) from a HuggingFace
     /// `tokenizer.json` (model.type == "BPE"): metaspace ▁, `<0xNN>` byte
     /// fallback, rank-ordered merges. Covers models sharing the SentencePiece
-    /// BPE layout regardless of vocab size — EmbeddingGemma (262144) and
+    /// BPE layout regardless of vocab size, EmbeddingGemma (262144) and
     /// SigLIP2's text tower (256000) both parse here. `json_bytes` is the raw
     /// file contents; everything needed is copied into the tokenizer's arena,
     /// so the buffer may be freed afterward.
@@ -551,11 +551,11 @@ pub const Tokenizer = struct {
     /// This reuses the exact `encodeGemma4` merge path used for GGUF gemma4
     /// vocabs (validated bit-identical to llama.cpp / transformers): the vocab
     /// pieces and merge halves are the ▁-escaped stored form, keyed the same
-    /// way. HF's normalizer (Replace " "→"▁") and pre_tokenizer (Split " ")
+    /// way. HF's normalizer (Replace " "->"▁") and pre_tokenizer (Split " ")
     /// reduce to the ▁-escaping `gemma4EncodeRaw` already performs, so no
     /// separate normalization step is needed. Added tokens are matched verbatim
     /// as specials. Callers that need the model's post-processor frame
-    /// (`<bos>…<eos>` vs `…<eos>`) add it themselves — `encode` emits content
+    /// (`<bos>...<eos>` vs `...<eos>`) add it themselves, `encode` emits content
     /// ids only.
     pub fn initGemma4FromTokenizerJson(gpa: std.mem.Allocator, json_bytes: []const u8) !Tokenizer {
         var scratch = std.heap.ArenaAllocator.init(gpa);
@@ -716,18 +716,18 @@ pub const Tokenizer = struct {
         return t;
     }
 
-    /// Build a SentencePiece **Unigram** tokenizer (kind == .unigram) from a
+    /// Build a SentencePiece Unigram tokenizer (kind == .unigram) from a
     /// HuggingFace `tokenizer.json` (model.type == "Unigram"; XLM-RoBERTa / GTE,
     /// e.g. Snowflake Arctic Embed). `model.vocab` is an array of `[piece,
     /// score]` (id = index); `model.unk_id` is the fallback id. Pieces are the
     /// ▁-escaped SentencePiece form.
     ///
     /// Matches the deployed DiffKeep `onnx_tokenizers.zig` behavior exactly: the
-    /// `Precompiled` (SentencePiece charsmap / NFKC) normalizer is **not**
-    /// applied — DiffKeep's index was built without it, so reproducing its
+    /// `Precompiled` (SentencePiece charsmap / NFKC) normalizer is not
+    /// applied, DiffKeep's index was built without it, so reproducing its
     /// vectors means tokenizing the same way. `encode` emits content ids only
-    /// (whitespace-split → ▁-prefix → Viterbi); the embedding façade adds the
-    /// `<s> … </s>` frame.
+    /// (whitespace-split -> ▁-prefix -> Viterbi); the embedding façade adds the
+    /// `<s> ... </s>` frame.
     pub fn initUnigramFromTokenizerJson(gpa: std.mem.Allocator, json_bytes: []const u8) !Tokenizer {
         var scratch = std.heap.ArenaAllocator.init(gpa);
         defer scratch.deinit();
@@ -916,10 +916,10 @@ pub const Tokenizer = struct {
     }
 
     /// Encode `text` the way ComfyUI's `sd1_clip.SDTokenizer` does: resolve the
-    /// `(a:1.2)` emphasis syntax into segments and make **one tokenizer call per
-    /// segment**, concatenating the results. Caller frees.
+    /// `(a:1.2)` emphasis syntax into segments and make one tokenizer call per
+    /// segment, concatenating the results. Caller frees.
     ///
-    /// ⚠️ This is not the same id stream as `encode` on the whole string, and the
+    /// This is not the same id stream as `encode` on the whole string, and the
     /// difference is not confined to where the weights are. A segment boundary is a
     /// tokenizer-call boundary, so byte-level BPE re-derives its pretokens on each
     /// side of it: the positive prompt of Anima's reference render has a segment
@@ -927,15 +927,15 @@ pub const Tokenizer = struct {
     /// whole-string encode merges it into the following word. Measured: the two
     /// disagree from token 37 onward on that prompt.
     ///
-    /// ⚠️ **The weights are DISCARDED**, deliberately. This exists for Anima's Qwen3
+    /// The weights are DISCARDED, deliberately. This exists for Anima's Qwen3
     /// branch, and `AnimaTokenizer.tokenize_with_weights` forces every weight on that
-    /// branch to 1.0 — emphasis reaches Anima only through its T5 branch
+    /// branch to 1.0, emphasis reaches Anima only through its T5 branch
     /// (`t5_tokenizer.encodeWeighted`). A caller that needs weighted ids for a
     /// BPE tower wants `clip_tokenizer.encodeWeighted`, which also does the 77-token
     /// chunking this deliberately does not.
     ///
     /// `min_len` pads with `pad_id` (`SDTokenizer`'s `min_length`, 1 for the Qwen3
-    /// branch — so an empty prompt is one `<|endoftext|>` rather than no tokens).
+    /// branch, so an empty prompt is one `<|endoftext|>` rather than no tokens).
     /// There is no start token, no end token and no chunking: Anima's Qwen3
     /// sub-tokenizer sets `has_start_token=False`, `has_end_token=False`,
     /// `pad_to_max_length=False` and `max_length=99999999`.
@@ -1156,7 +1156,7 @@ pub const Tokenizer = struct {
 
     /// End (exclusive) of one tekken case-split letter segment starting at `s`
     /// (`s` is a letter or mark). Consumes the maximal upper-class prefix, then
-    /// the following lower-class run — i.e. `U* L+`, falling back to `U+ L*`
+    /// the following lower-class run, i.e. `U* L+`, falling back to `U+ L*`
     /// when no lower-class char follows (an all-uppercase run). Ambiguous
     /// letters (Lm/Lo/M) are in both classes and greedily join the upper prefix.
     fn caseRun(cps: []const u21, s: usize) usize {
@@ -1464,7 +1464,7 @@ pub const Tokenizer = struct {
 
     /// Unigram encode: split on ASCII whitespace, prepend ▁ to each word, and
     /// Viterbi-segment each word into ids. Mirrors DiffKeep's `onnx_tokenizers`
-    /// (no Precompiled/NFKC normalization). Content ids only — no `<s>`/`</s>`.
+    /// (no Precompiled/NFKC normalization). Content ids only, no `<s>`/`</s>`.
     fn encodeUnigram(self: *const Tokenizer, gpa: std.mem.Allocator, text: []const u8, out: *std.ArrayList(u32)) !void {
         var word: std.ArrayList(u8) = .empty;
         defer word.deinit(gpa);
@@ -1586,7 +1586,7 @@ fn expectEncode(tok: *const Tokenizer, text: []const u8, expected: []const u32) 
 }
 
 // Reference ids from transformers' Qwen2Tokenizer (slow) on the same
-// vocab/merges — see the fixture dump in tools/gen_op_fixtures.py history.
+// vocab/merges, see the fixture dump in tools/gen_op_fixtures.py history.
 test "tokenizer matches transformers Qwen2Tokenizer" {
     const gpa = std.testing.allocator;
     var tok = try Tokenizer.init(gpa);
@@ -1686,7 +1686,7 @@ test "qwen3.6 gguf tokenizer matches llama-tokenize" {
 // (gpt2 byte-level BPE, tokenizer.ggml.pre == "tekken"; Mistral-Nemo). Skipped
 // when absent. Exercises the tekken-specific pretokenizer: case-split letter
 // runs (iOS -> " i","OS"; camelCase -> "camel","Case"), single-digit numbers
-// (42.50 -> 4,2,.,5,0), no contractions ("don't" is not glued), and the '/'
+// (42.50 -> 4,2.,5,0), no contractions ("don't" is not glued), and the '/'
 // punctuation tail ("/path").
 test "tekken gguf tokenizer matches llama-tokenize" {
     const gpa = std.testing.allocator;
@@ -1795,7 +1795,7 @@ test "gemma4 gguf tokenizer matches llama-tokenize" {
 // tokenizer.json (HuggingFace) loader parity: build the gemma4 BPE path from
 // each model's tokenizer.json and require exact token-id match against golden
 // ids produced by HF `tokenizers` (testdata/embed_tokenizer_golden.json,
-// `ids_no_special` — encode emits content ids only). Covers EmbeddingGemma
+// `ids_no_special`, encode emits content ids only). Covers EmbeddingGemma
 // (262144 vocab) and SigLIP2's text tower (256000 vocab). Skipped when the
 // DiffKeep model checkpoints are absent.
 test "gemma4 tokenizer.json matches HF tokenizers" {

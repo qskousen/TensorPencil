@@ -1,5 +1,5 @@
 //! The text-to-image studio: a full-window view for generating images directly
-//! from a prompt, with no LLM in the loop. It owns NOTHING persistent — the
+//! from a prompt, with no LLM in the loop. It owns NOTHING persistent, the
 //! diffusion engine (`diffuser.Diffuser`) is app-level and owns the single
 //! unified image queue/history (shared with the chat tool-call path). This
 //! module is just the studio UI: a prompt/param form plus a results grid that
@@ -43,7 +43,7 @@ var height_buf: [12]u8 = [_]u8{0} ** 12;
 var steps_buf: [8]u8 = [_]u8{0} ** 8;
 var cfg_buf: [8]u8 = [_]u8{0} ** 8;
 // Wide enough to type any u64 (20 digits + null): the queue count is
-// deliberately uncapped — see `generate`.
+// deliberately uncapped, see `generate`.
 var count_buf: [24]u8 = [_]u8{0} ** 24;
 var seed_buf: [24]u8 = [_]u8{0} ** 24;
 var random_seed: bool = true;
@@ -86,7 +86,7 @@ fn currentFamily(cfg: *const config.Config) ?model_spec.Family {
 }
 
 fn seed(cfg: *const config.Config, fam: ?model_spec.Family) void {
-    // Width / height / steps belong to Settings — they are the user's explicit
+    // Width / height / steps belong to Settings, they are the user's explicit
     // global defaults, so the form must not overwrite them with an
     // architecture's suggestion.
     _ = std.fmt.bufPrintZ(&width_buf, "{d}", .{cfg.width}) catch {};
@@ -126,7 +126,7 @@ pub const Callbacks = struct {
 };
 
 /// Render the studio. `d` is the app's diffusion engine (null when no diffusion
-/// model is configured → a notice is shown). `ready` is false while the LLM is
+/// model is configured -> a notice is shown). `ready` is false while the LLM is
 /// still being torn down (Generate is disabled until the device is free).
 pub fn render(cfg: *const config.Config, d: ?*diffuser.Diffuser, ready: bool, cb: Callbacks) void {
     const fam = currentFamily(cfg);
@@ -178,13 +178,13 @@ pub fn render(cfg: *const config.Config, d: ?*diffuser.Diffuser, ready: bool, cb
 }
 
 /// Tell the user, BEFORE they hit Generate, when this model set cannot produce an
-/// image — and afterwards, why the last load failed.
+/// image, and afterwards, why the last load failed.
 ///
 /// A model set can now fail to load for reasons the studio has no other way to
 /// show: a missing component the checkpoint does not bundle, an override holding
-/// the wrong architecture's weights, or a backend without kernels for it. All of
-/// those used to surface as a bare "⚠ failed" on the image with the reason only
-/// in the terminal.
+/// the wrong architecture's weights, or a backend without kernels for it. Without
+/// this they surface as a bare "failed" on the image, with the reason only in the
+/// terminal.
 fn renderModelNotice(cfg: *const config.Config, engine: *diffuser.Diffuser, fam: ?model_spec.Family) void {
     var buf: [320]u8 = undefined;
     const theme = dvui.themeGet();
@@ -298,7 +298,7 @@ fn generate(cfg: *const config.Config, engine: *diffuser.Diffuser) void {
     const steps = std.math.clamp(parseNum(&steps_buf, cfg.steps), 1, 100);
     const cfg_scale = std.math.clamp(parseFloat(&cfg_buf, 1.0), 0.0, 30.0);
     // Uncapped by design: queue as many as you ask for (min 1). Each is
-    // allocated up front, so a huge count is on you — that's the intent.
+    // allocated up front, so a huge count is on you, that's the intent.
     const count = @max(1, parseNum(&count_buf, 1));
     const base_seed: u64 = if (random_seed) 0 else std.fmt.parseInt(u64, std.mem.trim(u8, std.mem.sliceTo(&seed_buf, 0), " \t\r"), 10) catch 0;
 
@@ -336,7 +336,7 @@ fn fitSize(w: usize, h: usize, max: f32) dvui.Size {
     return .{ .w = @as(f32, @floatFromInt(w)) * scale, .h = @as(f32, @floatFromInt(h)) * scale };
 }
 
-/// The results grid — the engine's whole image list (chat + studio), newest
+/// The results grid, the engine's whole image list (chat + studio), newest
 /// first, laid out in as many columns as fit.
 fn renderGallery(engine: *diffuser.Diffuser) void {
     const imgs = engine.items();
@@ -394,7 +394,7 @@ fn renderCell(engine: *diffuser.Diffuser, gi: *GenImage, idx: usize, cell: f32) 
                 .pending => "Queued…",
                 else => std.fmt.bufPrint(&buf, "step {d}/{d}", .{ done, total }) catch "…",
             };
-            // richLabel so the ⏸ (suspended) routes to the emoji face — the prose
+            // richLabel so the ⏸ (suspended) routes to the emoji face, the prose
             // font lacks media-control glyphs (see fonts.isEmoji).
             fonts.richLabel(@src(), status, .{});
             if (dvui.button(@src(), "Cancel", .{}, .{ .margin = .{ .y = 2 } })) {
@@ -434,7 +434,7 @@ fn renderCell(engine: *diffuser.Diffuser, gi: *GenImage, idx: usize, cell: f32) 
         },
         // Both terminal-but-unsuccessful states name themselves and offer a
         // retry. The cell is narrow, so the reason wraps in a textLayout rather
-        // than being truncated into a label — an error the user cannot read is
+        // than being truncated into a label, an error the user cannot read is
         // the state this replaced.
         .failed => {
             var fbuf: [180]u8 = undefined;

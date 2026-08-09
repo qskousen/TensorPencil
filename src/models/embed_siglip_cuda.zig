@@ -14,7 +14,7 @@ const Backend = cuda.Backend;
 const Buf = cuda.backend.DeviceBuffer;
 const Weight = ops.matmul.Weight;
 
-/// GEMM in the weight's dtype (f32 here → opConvF16). y[m][co] = x @ Wᵀ + bias.
+/// GEMM in the weight's dtype (f32 here -> opConvF16). y[m][co] = x @ Wᵀ + bias.
 fn gemm(be: *Backend, dst: Buf, src: Buf, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: []const f32) !void {
     try be.opConvF16(dst, 0, src, m, w_bytes, co, k, bias);
 }
@@ -51,7 +51,7 @@ pub const TextModelCuda = struct {
 
         // No weight scope: the f16-converted GEMM weights stay RESIDENT across
         // embed calls (they borrow the mmap-stable CPU model). A scope would
-        // free+re-upload the whole model every call — a per-forward cost that
+        // free+re-upload the whole model every call, a per-forward cost that
         // dwarfs the compute. The encoder is opened once and reused.
         defer {
             be.freeAttnScratch();
@@ -99,7 +99,7 @@ pub const TextModelCuda = struct {
     }
 
     /// Batched CUDA text encode: mirrors CPU `TextModel.embedBatch`. Uniform
-    /// 64-token windows → one [B*context_length, width] device activation; only
+    /// 64-token windows -> one [B*context_length, width] device activation; only
     /// `attn` loops per item (via `dbOffset` views); pool + projection on host.
     pub fn embedBatch(self: *const TextModelCuda, be: *Backend, io: std.Io, gpa: std.mem.Allocator, ids_list: []const []const u32, outs: [][]f32) !void {
         const cpu = self.cpu;
@@ -131,7 +131,7 @@ pub const TextModelCuda = struct {
 
         // No weight scope: the f16-converted GEMM weights stay RESIDENT across
         // embed calls (they borrow the mmap-stable CPU model). A scope would
-        // free+re-upload the whole model every call — a per-forward cost that
+        // free+re-upload the whole model every call, a per-forward cost that
         // dwarfs the compute. The encoder is opened once and reused.
         defer {
             be.freeAttnScratch();
@@ -227,7 +227,7 @@ pub const VisualModelCuda = struct {
 
         // No weight scope: the f16-converted GEMM weights stay RESIDENT across
         // embed calls (they borrow the mmap-stable CPU model). A scope would
-        // free+re-upload the whole model every call — a per-forward cost that
+        // free+re-upload the whole model every call, a per-forward cost that
         // dwarfs the compute. The encoder is opened once and reused.
         defer {
             be.freeAttnScratch();
@@ -279,7 +279,7 @@ pub const VisualModelCuda = struct {
     }
 
     /// Batched CUDA visual encode: mirrors CPU `VisualModel.embedBatch`. Fixed
-    /// 196 patches per image → ViT body over one [B*nPatches, width] activation;
+    /// 196 patches per image -> ViT body over one [B*nPatches, width] activation;
     /// only `attn` loops per image (via `dbOffset` views); MAP head on host.
     pub fn embedBatch(self: *const VisualModelCuda, be: *Backend, io: std.Io, gpa: std.mem.Allocator, imgs: []const []const f32, outs: [][]f32) !void {
         const cpu = self.cpu;
@@ -309,7 +309,7 @@ pub const VisualModelCuda = struct {
 
         // No weight scope: the f16-converted GEMM weights stay RESIDENT across
         // embed calls (they borrow the mmap-stable CPU model). A scope would
-        // free+re-upload the whole model every call — a per-forward cost that
+        // free+re-upload the whole model every call, a per-forward cost that
         // dwarfs the compute. The encoder is opened once and reused.
         defer {
             be.freeAttnScratch();

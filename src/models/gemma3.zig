@@ -2,7 +2,7 @@
 //! llama.cpp (src/models/gemma3.cpp + the GEMMA3 hparams in llama-model.cpp).
 //!
 //! Differences from the Qwen stack this engine already runs:
-//!   - "Sandwich" norms: each layer has FOUR RMSNorms — input (pre-attn),
+//!   - "Sandwich" norms: each layer has FOUR RMSNorms, input (pre-attn),
 //!     post-attention (on the attn output, BEFORE the residual add),
 //!     pre-feedforward, and post-feedforward (on the MLP output, before its
 //!     residual add). RMSNorm weights ship with +1 already folded in by the
@@ -10,7 +10,7 @@
 //!   - Input embeddings are scaled by sqrt(hidden).
 //!   - Per-head QK RMS-norm over head_dim (256), then full rotate-half
 //!     (NEOX) RoPE. RoPE base/scale alternate by layer: every 6th layer
-//!     (`sliding_window_pattern`) is GLOBAL (theta 1e6, linear scale 1/8 —
+//!     (`sliding_window_pattern`) is GLOBAL (theta 1e6, linear scale 1/8,
 //!     position interpolation) with full causal attention; the rest are
 //!     LOCAL, using a sliding-window causal mask (window 1024, theta 1e4,
 //!     no scaling).
@@ -38,7 +38,7 @@ const Weight = ops.matmul.Weight;
 const KvCache = kv_cache_mod.KvCache;
 const PerLayerKvCache = kv_cache_mod.PerLayerKvCache;
 
-/// CPU prefill batch size — bounds per-forward `seq` so a LOCAL layer's KV ring
+/// CPU prefill batch size, bounds per-forward `seq` so a LOCAL layer's KV ring
 /// (`sliding_window + prefill_chunk` rows) can't alias a still-needed key in one
 /// batch (TODO lever 1). Also caps the activation scratch height.
 const prefill_chunk = 128;
@@ -249,7 +249,7 @@ pub const Model = struct {
 
     /// forwardCached over PRE-EMBEDDED input hidden states `x` ([seq*hidden],
     /// mutated in place). Used for image-token rows (SigLIP projector output,
-    /// injected UNSCALED — Gemma multiplies only text embeddings by
+    /// injected UNSCALED, Gemma multiplies only text embeddings by
     /// sqrt(hidden)). `out` semantics match forwardCached.
     pub fn forwardHidden(
         self: *const Model,
@@ -307,7 +307,7 @@ pub const Model = struct {
 /// Public so the CUDA hybrid CPU/GPU split (gemma3_cuda) can run host-resident
 /// layers through the exact same code path. `cache` is `anytype` so it accepts
 /// both the pure-CPU `PerLayerKvCache` (with LOCAL rings) and gemma3_cuda's
-/// uniform `KvCache` host shadow (ringOf → 0, so linear/full context).
+/// uniform `KvCache` host shadow (ringOf -> 0, so linear/full context).
 pub fn layerForward(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -352,10 +352,10 @@ pub const Scratch = struct {
 
     /// A borrowed view of the first `seq` rows of a larger scratch (no alloc).
     /// The CUDA split sizes its scratch to a full prefill chunk once, then views
-    /// it down to the actual chunk length each call — `layerForward`'s ops
+    /// it down to the actual chunk length each call, `layerForward`'s ops
     /// require exact-length slices, so passing the oversized buffer would trip a
     /// length assert (the qwen35 split hit this; same fix here). Never deinit a
-    /// view — it aliases the parent scratch's memory.
+    /// view, it aliases the parent scratch's memory.
     pub fn viewSeq(self: *const Scratch, seq: usize, cfg: Config) Scratch {
         return .{
             .normed = self.normed[0 .. seq * cfg.hidden],
@@ -465,7 +465,7 @@ pub const CpuModel = struct {
         try ops.matmul.matmul(io, self.gpa, logits, self.last_hidden, 1, self.lm.head, null);
     }
 
-    /// Prefill text tokens (no logits) — for interleaving with prefillImage.
+    /// Prefill text tokens (no logits), for interleaving with prefillImage.
     /// Uses `self.io` (set by step, or by the caller before an image turn).
     pub fn prefill(self: *CpuModel, ids: []const u32) !void {
         try self.lm.forwardCached(self.io, self.gpa, ids, &self.cache, self.rope.get(0), self.rope.get(1), null);
@@ -488,7 +488,7 @@ pub const CpuModel = struct {
 // --- tests -----------------------------------------------------------------
 
 // Config + weight wiring against the real Gemma 3 12B checkpoint; skipped
-// when absent. Load-only — generation is validated end-to-end via tp-llm
+// when absent. Load-only, generation is validated end-to-end via tp-llm
 // against llama.cpp (a Debug 12B forward is too slow for the suite).
 test "gemma3 loads from real gemma3-12b gguf" {
     const gpa = std.testing.allocator;

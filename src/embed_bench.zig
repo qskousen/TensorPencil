@@ -2,7 +2,7 @@
 //! embed-bench -- [opts]`. Times the four DiffKeep encoders (Snowflake,
 //! EmbeddingGemma, SigLIP2 text, SigLIP2 visual) on a chosen backend, at a
 //! chosen batch size, so we can measure the win from true batched forwards
-//! (DIFFKEEP.md M8) against the per-item baseline (batch=1).
+//! against the per-item baseline (batch=1).
 //!
 //! The harness drives the public façade `embedTextBatch`/`embedImageBatch` in
 //! chunks of `--batch`, so batch=1 reproduces the per-item loop and larger
@@ -75,7 +75,7 @@ fn parseArgs(argv: []const []const u8) !Args {
 
 // Dump the CUDA backend's per-category device profiler (sync-per-op timing:
 // each op fences the stream, so `ms` is real device time and `ops` is the op
-// count — the count reveals how the per-item attention/RoPE loop inflates the
+// count, the count reveals how the per-item attention/RoPE loop inflates the
 // attn/elt categories with batch size).
 fn dumpCudaProf(be: *tp.gpu.cuda.Backend) void {
     const names = [_][]const u8{ "matmul", "prep", "attn", "elt", "attn_scores", "attn_softmax", "attn_pv" };

@@ -66,7 +66,7 @@ pub const ModelCuda = struct {
         const es_scale = cfg.embedScale();
         for (x_host) |*v| v.* *= es_scale;
 
-        // Zero bias (length ≥ every co) — gemma GEMMs are bias-free.
+        // Zero bias (length ≥ every co), gemma GEMMs are bias-free.
         const zero_bias = try gpa.alloc(f32, @max(qd, inter));
         defer gpa.free(zero_bias);
         @memset(zero_bias, 0);
@@ -74,7 +74,7 @@ pub const ModelCuda = struct {
         // No weight scope: the f16-converted GEMM weights stay RESIDENT across
         // embed calls (they borrow the mmap-stable CPU model, so the pointer-
         // keyed cache is valid indefinitely). A scope would free+re-upload the
-        // whole ~300M model every call — a per-forward cost that dwarfs the
+        // whole ~300M model every call, a per-forward cost that dwarfs the
         // actual compute and defeats batching. The encoder is opened once and
         // reused, so resident weights are the right lifetime.
         defer {
@@ -138,7 +138,7 @@ pub const ModelCuda = struct {
         for (cpu.layers, 0..) |*l, li| {
             const freqs = if (cfg.isGlobal(li)) freqs_g else freqs_l;
             const ln = lns[li];
-            // Attention (input RMSNorm → QKV → QK-norm → RoPE → GQA attn).
+            // Attention (input RMSNorm -> QKV -> QK-norm -> RoPE -> GQA attn).
             try be.qkNorm(x_d, normed_d, ln.input, seq, w, eps);
             try gemm(be, q_d, normed_d, seq, l.q.bytes, qd, w, zero_bias);
             try gemm(be, k_d, normed_d, seq, l.k.bytes, kvd, w, zero_bias);
@@ -152,7 +152,7 @@ pub const ModelCuda = struct {
             try be.qkNorm(t_d, t_d, ln.pa, seq, w, eps); // post-attn (sandwich)
             try be.opAdd(x_d, t_d, seq * w);
 
-            // MLP (pre-FFN norm → GeGLU → down → post-FFN norm).
+            // MLP (pre-FFN norm -> GeGLU -> down -> post-FFN norm).
             try be.qkNorm(x_d, normed_d, ln.pf, seq, w, eps);
             try gemm(be, gate_d, normed_d, seq, l.gate.bytes, inter, w, zero_bias);
             try gemm(be, up_d, normed_d, seq, l.up.bytes, inter, w, zero_bias);
@@ -170,8 +170,8 @@ pub const ModelCuda = struct {
         try cpu.head(io, gpa, lhs, out);
     }
 
-    /// Batched CUDA encode: `ids_list[i]` → `outs[i]`. Mirrors the CPU
-    /// `Model.embedBatch` — whole Gemma-3 body over `total = sum(seq_i)` packed
+    /// Batched CUDA encode: `ids_list[i]` -> `outs[i]`. Mirrors the CPU
+    /// `Model.embedBatch`, whole Gemma-3 body over `total = sum(seq_i)` packed
     /// rows; QK-norm/GeGLU/norms batch trivially, RoPE + GQA attention loop per
     /// item via `dbOffset` views (q and k/v get distinct offsets: q_dim ≠ kv_dim).
     pub fn embedBatch(self: *const ModelCuda, be: *Backend, io: std.Io, gpa: std.mem.Allocator, ids_list: []const []const u32, outs: [][]f32) !void {
@@ -215,7 +215,7 @@ pub const ModelCuda = struct {
         // No weight scope: the f16-converted GEMM weights stay RESIDENT across
         // embed calls (they borrow the mmap-stable CPU model, so the pointer-
         // keyed cache is valid indefinitely). A scope would free+re-upload the
-        // whole ~300M model every call — a per-forward cost that dwarfs the
+        // whole ~300M model every call, a per-forward cost that dwarfs the
         // actual compute and defeats batching. The encoder is opened once and
         // reused, so resident weights are the right lifetime.
         defer {

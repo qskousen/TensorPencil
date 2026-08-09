@@ -1,25 +1,25 @@
-//! Snowflake Arctic Embed M v2.0 — a GTE-multilingual-base text encoder that
+//! Snowflake Arctic Embed M v2.0, a GTE-multilingual-base text encoder that
 //! maps text to one L2-normalized 768-d embedding (the `.semantic` text space
 //! for DiffKeep, candidate A1).
 //!
 //! Architecture (HF `GteModel` / alibaba-nlp GTE, from the shipped
 //! modeling_hf_alibaba_nlp_gte.py):
 //!   - Embeddings: word_embeddings[id] + token_type_embeddings[0] (single type)
-//!     → LayerNorm (eps 1e-12). No learned position embeddings — RoPE instead.
-//!   - 12 **post-LayerNorm** blocks (BERT-style, NOT pre-norm): packed
-//!     qkv_proj (+bias) → split q/k/v → NEOX rotate-half RoPE (θ=160000) on q/k
-//!     → non-causal (bidirectional) attention (scale 1/√head_dim) → o_proj
-//!     (+bias) → residual add → `attn_ln` (LayerNorm) → GeGLU MLP → residual add
-//!     → `mlp_ln`.
-//!   - GeGLU: up_gate_proj (no bias) → split up=first `intermediate`, gate=second
-//!     → **exact-erf** gelu(gate) * up → down_proj (+bias).
-//!   - Pooling: CLS (token 0) of the last hidden state → L2 normalize. No dense
-//!     pooler (sentence-transformers modules: Transformer → Pooling(CLS) →
+//!     -> LayerNorm (eps 1e-12). No learned position embeddings, RoPE instead.
+//!   - 12 post-LayerNorm blocks (BERT-style, NOT pre-norm): packed
+//!     qkv_proj (+bias) -> split q/k/v -> NEOX rotate-half RoPE (θ=160000) on q/k
+//!     -> non-causal (bidirectional) attention (scale 1/√head_dim) -> o_proj
+//!     (+bias) -> residual add -> `attn_ln` (LayerNorm) -> GeGLU MLP -> residual add
+//!     -> `mlp_ln`.
+//!   - GeGLU: up_gate_proj (no bias) -> split up=first `intermediate`, gate=second
+//!     -> exact-erf gelu(gate) * up -> down_proj (+bias).
+//!   - Pooling: CLS (token 0) of the last hidden state -> L2 normalize. No dense
+//!     pooler (sentence-transformers modules: Transformer -> Pooling(CLS) ->
 //!     Normalize).
 //!
-//! Tokenization: `Tokenizer.initUnigramFromTokenizerJson` + the `<s> … </s>`
+//! Tokenization: `Tokenizer.initUnigramFromTokenizerJson` + the `<s> ... </s>`
 //! frame; CLS pooling reads position 0 (`<s>`). Query texts get a `"query: "`
-//! prefix (documents raw) — applied by the caller/façade, not here.
+//! prefix (documents raw), applied by the caller/façade, not here.
 
 const std = @import("std");
 const tp_core = @import("tp_core");
@@ -148,9 +148,9 @@ pub const Model = struct {
         self.* = undefined;
     }
 
-    /// Batched encode: `ids_list[i]` (already framed `<s> … </s>`) → `outs[i]`
+    /// Batched encode: `ids_list[i]` (already framed `<s> ... </s>`) -> `outs[i]`
     /// [embed_dim]. All items are packed into one contiguous [total_rows, hidden]
-    /// activation (ragged — no padding), so every GEMM / LayerNorm / GeGLU runs
+    /// activation (ragged, no padding), so every GEMM / LayerNorm / GeGLU runs
     /// once over `sum(seq_i)` rows and amortizes fork/join + weight reuse across
     /// the batch. RoPE and attention are the only per-item ops (each item attends
     /// only itself), so they loop over the batch. Bit-identical to calling
@@ -249,7 +249,7 @@ pub const Model = struct {
         }
     }
 
-    /// Encode `ids` (already framed `<s> … </s>`) into `out` [embed_dim], an
+    /// Encode `ids` (already framed `<s> ... </s>`) into `out` [embed_dim], an
     /// L2-normalized CLS embedding.
     pub fn embed(self: *const Model, io: std.Io, gpa: std.mem.Allocator, ids: []const u32, out: []f32) !void {
         const cfg = self.cfg;
@@ -284,7 +284,7 @@ pub const Model = struct {
         const mlp = try a.alloc(f32, seq * h);
 
         for (self.layers) |*layer| {
-            // Attention: packed qkv → split → RoPE(q,k) → non-causal attention.
+            // Attention: packed qkv -> split -> RoPE(q,k) -> non-causal attention.
             try ops.matmul.matmul(io, gpa, qkv, x, seq, layer.qkv, layer.qkv_bias);
             for (0..seq) |t| {
                 const src = qkv[t * 3 * h ..];
@@ -306,7 +306,7 @@ pub const Model = struct {
             for (x, proj) |*xi, pi| xi.* += pi; // residual
             ops.norm.layerNorm(x, x, layer.attn_ln_w, layer.attn_ln_b, cfg.ln_eps);
 
-            // GeGLU MLP: up_gate → split → gelu(gate)*up → down.
+            // GeGLU MLP: up_gate -> split -> gelu(gate)*up -> down.
             try ops.matmul.matmul(io, gpa, ug, x, seq, layer.up_gate, null);
             for (0..seq) |t| {
                 const src = ug[t * 2 * cfg.intermediate ..];

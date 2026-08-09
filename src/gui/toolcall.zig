@@ -1,8 +1,8 @@
-//! Parsing of the `<image ...>…</image>` tool call that tp-gui's LLM emits to
+//! Parsing of the `<image ...>...</image>` tool call that tp-gui's LLM emits to
 //! request image generation.
 //!
-//! Pure string logic so it unit-tests cheaply and both consumers — the
-//! generation scanner (chat.zig) and the display hider (app.zig) — share one
+//! Pure string logic so it unit-tests cheaply and both consumers, the
+//! generation scanner (chat.zig) and the display hider (app.zig), share one
 //! definition of "what counts as a call". Keeping them in lockstep means a call
 //! that fires a generation is exactly a call that's hidden from the reply.
 //!
@@ -16,24 +16,23 @@
 const std = @import("std");
 const tool_call = @import("TensorPencil").llm.tool_call;
 
-// The reasoning-block splitter moved into the library (`llm/tool_call.zig`)
-// when the trained-format tool parser landed: BOTH scanners need "where does the
-// answer start", and two definitions of it is exactly the drift that lets one
-// caller fire a tool the other hides. Re-exported so this module stays the one
-// place the GUI reaches for tool-call string logic.
+// The reasoning-block splitter lives in the library (`llm/tool_call.zig`) because
+// BOTH scanners need "where does the answer start", and two definitions of it is the
+// drift that lets one caller fire a tool the other hides. Re-exported so this module
+// stays the one place the GUI reaches for tool-call string logic.
 pub const Reasoning = tool_call.Reasoning;
 pub const Split = tool_call.Split;
 pub const splitThought = tool_call.splitThought;
 pub const endsInsideThought = tool_call.endsInsideThought;
 pub const answerText = tool_call.answerText;
 
-/// Result of scanning for the next `<image ...>…</image>` tool call.
-///  - `.call` — a complete call: `text_before` (ordinary text to render),
+/// Result of scanning for the next `<image ...>...</image>` tool call.
+///  - `.call`, a complete call: `text_before` (ordinary text to render),
 ///    the parsed `attrs`/`prompt`, and `after` (remaining text to keep scanning).
-///  - `.partial` — a line-anchored `<image` whose open tag or body is still
+///  - `.partial`, a line-anchored `<image` whose open tag or body is still
 ///    streaming: everything from it onward is pending (display hides it; the
 ///    turn-complete scanner stops).
-///  - `.none` — no line-anchored tool call remains; the whole buffer is text.
+///  - `.none`, no line-anchored tool call remains; the whole buffer is text.
 pub const ScanResult = union(enum) {
     none,
     partial: struct { text_before: []const u8 },
@@ -55,8 +54,8 @@ fn atLineStart(buf: []const u8, idx: usize) bool {
     return true;
 }
 
-/// Find the next `<image ...>…</image>` tool call in `buf`. Only tags that
-/// begin a line (after optional leading whitespace) count — an inline/casual
+/// Find the next `<image ...>...</image>` tool call in `buf`. Only tags that
+/// begin a line (after optional leading whitespace) count, an inline/casual
 /// mention of the tag is left as ordinary text, so it neither fires a
 /// generation nor gets hidden from the reply. Callers must strip the reasoning
 /// block first (see `answerText`); this scans only text.
@@ -102,7 +101,7 @@ test "nextImageCall: attributes are captured verbatim" {
 }
 
 test "nextImageCall: an inline/casual mention is NOT a call" {
-    // The model explaining the tool, mid-sentence — must stay ordinary text.
+    // The model explaining the tool, mid-sentence, must stay ordinary text.
     try testing.expectEqual(ScanResult.none, nextImageCall("Just write <image>…</image> on its own line."));
     // Backtick-wrapped mention is likewise not line-anchored.
     try testing.expectEqual(ScanResult.none, nextImageCall("Use the `<image>desc</image>` tag."));

@@ -1,7 +1,7 @@
 //! Element data types for model weights and activations, plus conversions to f32.
 //!
 //! The fp8 type used by the Krea 2 checkpoints is e4m3fn (torch.float8_e4m3fn):
-//! 1 sign, 4 exponent (bias 7), 3 mantissa bits; no infinities — exponent 0xF
+//! 1 sign, 4 exponent (bias 7), 3 mantissa bits; no infinities, exponent 0xF
 //! with mantissa 0x7 is NaN, everything else is a finite number (max ±448).
 
 const std = @import("std");
@@ -17,7 +17,7 @@ pub const DType = enum {
     u8,
     i8,
     /// Signed 4-bit, two values packed per byte (element 2k in the low nibble,
-    /// 2k+1 in the high nibble). Internal compute dtype only — int4 "convrot"
+    /// 2k+1 in the high nibble). Internal compute dtype only, int4 "convrot"
     /// weights are stored on disk as raw `U8` (shape [rows, cols/2]) and the
     /// DiT loader reinterprets them as `.i4` with the logical [rows, cols].
     /// Sub-byte, so `byteSize` is undefined; use `storageBytes` for lengths.
@@ -31,9 +31,9 @@ pub const DType = enum {
     /// table, the group size) hang off `ops.matmul.Weight.w4a8`; see
     /// `ops/w4a8.zig`. Sub-byte, so use `storageBytes` for lengths.
     w4a8,
-    /// ComfyUI's NVFP4: 4-bit **E2M1 floats** with an fp8 per-16-element block scale and
+    /// ComfyUI's NVFP4: 4-bit E2M1 floats with an fp8 per-16-element block scale and
     /// a per-tensor scale. A distinct dtype from `.i4`/`.w4a8` because all three of its
-    /// conventions differ — element 2k is the HIGH nibble, the block scales arrive
+    /// conventions differ, element 2k is the HIGH nibble, the block scales arrive
     /// swizzled, and there is no ConvRot rotation or per-output-row scale. Sidecars hang
     /// off `ops.matmul.Weight.nvfp4`; see `ops/nvfp4.zig`. Sub-byte, so use
     /// `storageBytes` for lengths.
@@ -46,7 +46,7 @@ pub const DType = enum {
     i64,
     bool,
     /// ggml/GGUF block-quantized formats: a block of elements shares packed
-    /// scale metadata, so the per-element size is fractional — `byteSize` is
+    /// scale metadata, so the per-element size is fractional, `byteSize` is
     /// undefined; use `storageBytes` (whole blocks only). Never appears in
     /// safetensors headers; produced by the GGUF loader. Layouts and
     /// dequantization live in quants.zig.
@@ -57,33 +57,33 @@ pub const DType = enum {
     q6_k, // 256 elems / 210 B: 128 B low nibbles + 64 B high 2-bits + 16 x i8 scales + f16 d
     iq4_nl, // 32 elems / 18 B: f16 d + 16 B nibbles; v = d * kvalues_iq4nl[nibble] (non-linear LUT)
     /// 128 elems / 18 B: f16 d + 16 B of sign bits; v = bit ? d : -d. One bit per
-    /// weight (1.125 bpw including the scale) — the *sign* of the weight times the
+    /// weight (1.125 bpw including the scale), the *sign* of the weight times the
     /// block's mean absolute value. Note the two ways this differs from every other
     /// block quant here: it cannot represent zero, and its 128-element block is
     /// neither 32 nor 256, so anything that hardcoded those two sizes is wrong for it.
     q1_0,
-    /// ⚠️ **GGUF type id 42 is AMBIGUOUS, which is why there are two arms here.**
+    /// GGUF type id 42 is AMBIGUOUS, which is why there are two arms here.
     /// Two shipped formats claim it with *identical* arithmetic
     /// (`v = (code - 1) * d`, 2-bit codes packed LSB-first, 4 per byte, so the
     /// set is {-1, 0, +1, +2} * d) and *different* block sizes:
     ///
-    /// - `q2_0_g64`  — upstream ggml `GGML_TYPE_Q2_0`, `QK2_0 = 64`:  64 elems / 18 B
-    /// - `q2_0_g128` — PrismML llama.cpp fork (`prism` branch), `QK2_0 = 128`:
+    /// - `q2_0_g64`, upstream ggml `GGML_TYPE_Q2_0`, `QK2_0 = 64`:  64 elems / 18 B
+    /// - `q2_0_g128`, PrismML llama.cpp fork (`prism` branch), `QK2_0 = 128`:
     ///   128 elems / 34 B. Every published Bonsai / "Ternary" GGUF is this one;
     ///   the model cards advertise it as "Q2_0 g128".
     ///
-    /// **Nothing inside a GGUF distinguishes them** — not the type id, not the
-    /// file_type KV — only the on-disk row byte size does, and they differ by
+    /// Nothing inside a GGUF distinguishes them, not the type id, not the
+    /// file_type KV, only the on-disk row byte size does, and they differ by
     /// just 17/18. `gguf.detectQ2_0Variant` resolves it from file geometry;
     /// never assume one from the type id alone. Decoding with the wrong arm is
     /// silent: it yields plausible-magnitude garbage, not an error.
     ///
     /// Note the ASYMMETRY in both: unlike q1_0 (and unlike ggml's *ternary*
     /// tq1_0/tq2_0, which these share no layout with) the representable set is
-    /// not centred on zero — +2d is reachable and -2d is not.
+    /// not centred on zero, +2d is reachable and -2d is not.
     q2_0_g64,
     /// The 128-element variant of the above. 2.125 bpw including the scale.
-    /// Decoded natively rather than by ggml — see `quants.dequantQ2_0G128`.
+    /// Decoded natively rather than by ggml, see `quants.dequantQ2_0G128`.
     q2_0_g128,
 
     const name_table = .{
@@ -111,7 +111,7 @@ pub const DType = enum {
         return null;
     }
 
-    /// Per-dtype size facts — the single source of truth the size accessors
+    /// Per-dtype size facts, the single source of truth the size accessors
     /// below read from (one row per dtype in `info`, instead of the same set
     /// of dtypes re-listed across six parallel switches). Adding a dtype is one
     /// `info` arm.
@@ -147,7 +147,7 @@ pub const DType = enum {
     }
 
     /// Bytes per element. Undefined for sub-byte (`.i4`) and block-quantized
-    /// types — those are unreachable here; use `storageBytes` for their
+    /// types, those are unreachable here; use `storageBytes` for their
     /// packed on-disk length.
     pub fn byteSize(self: DType) usize {
         return self.info().byte_size orelse unreachable;
@@ -176,7 +176,7 @@ pub const DType = enum {
 
     /// Packed storage size in bytes for `count` elements. Handles sub-byte
     /// types (`.i4`: two values per byte, rounding up) and block-quantized
-    /// types (`count` must be a multiple of the block size — ggml rows are
+    /// types (`count` must be a multiple of the block size, ggml rows are
     /// whole blocks). For whole-byte types this is just `count * byteSize()`.
     pub fn storageBytes(self: DType, count: usize) usize {
         const inf = self.info();
@@ -251,7 +251,7 @@ pub inline fn f16ToF32(bits: u16) f32 {
 }
 
 /// Vectorized f16 (little-endian bytes) -> f32 row, scaled. `@floatCast` on an
-/// 8-wide f16 vector emits hardware vcvtph2ps (F16C) — ~10x the per-element
+/// 8-wide f16 vector emits hardware vcvtph2ps (F16C), ~10x the per-element
 /// scalar loop it replaces. `src` holds dst.len little-endian u16s.
 pub fn f16ToF32Row(src: []const u8, dst: []f32, scale: f32) void {
     const V = 8;
@@ -266,7 +266,7 @@ pub fn f16ToF32Row(src: []const u8, dst: []f32, scale: f32) void {
 }
 
 /// Vectorized bf16 (little-endian bytes) -> f32 row, scaled (bf16 is the high
-/// 16 bits of f32, so this is a widening shift — no rounding).
+/// 16 bits of f32, so this is a widening shift, no rounding).
 pub fn bf16ToF32Row(src: []const u8, dst: []f32, scale: f32) void {
     const V = 8;
     const sv: @Vector(V, f32) = @splat(scale);
@@ -303,7 +303,7 @@ pub fn f32ToF16Row(src: []const f32, dst: []u8) void {
 
 /// Vectorized f32 -> bf16 row: `src.len` values into `dst.len == src.len * 2`
 /// little-endian u16s. The inverse of `bf16ToF32Row`, round-to-nearest-even with
-/// ggml's NaN handling — bit-identical to `ggml_compute_fp32_to_bf16` and to the
+/// ggml's NaN handling, bit-identical to `ggml_compute_fp32_to_bf16` and to the
 /// scalar `f32ToBf16` above.
 ///
 /// Note this matches ggml's *scalar* path. `ggml_fp32_to_bf16_row` has an

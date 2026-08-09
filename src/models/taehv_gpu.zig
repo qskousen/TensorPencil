@@ -1,4 +1,4 @@
-//! Vulkan (generic-GPU) decode for the taew2_1 (TAEHV) approx VAE — the GPU
+//! Vulkan (generic-GPU) decode for the taew2_1 (TAEHV) approx VAE, the GPU
 //! path for the live per-step preview when the diffuser runs on the Vulkan
 //! backend. Mirrors `taehv_cuda.decode` on the `Context` abstraction, reusing
 //! the same banded im2col + GEMM conv as `vae_gpu` (tensor cores via
@@ -6,7 +6,7 @@
 //!
 //! The input Clamp (tanh(x/3)*3) is applied on the host before upload (it's on
 //! the small latent). Each stage's spatial Upsample is fused into that stage's
-//! 3x3 conv (`up=true`) — valid because it commutes with the per-pixel TGrow
+//! 3x3 conv (`up=true`), valid because it commutes with the per-pixel TGrow
 //! 1x1 conv that sits between them. Weights are read straight from the loaded
 //! `taehv.Decoder`; the packed [co][kh][kw][ci] layout is exactly the
 //! [rows][cols] the GEMM weight cache expects, so they upload/transpose lazily
@@ -248,7 +248,7 @@ fn syntheticDecoder(gpa: std.mem.Allocator) !taehv.Decoder {
         fn f(al: std.mem.Allocator, r: std.Random, ci: usize, co: usize, k: usize) !wan_vae.Conv2d {
             const wd = try al.alloc(f32, co * k * k * ci);
             // He-style init (std = 1/sqrt(fan_in)) so per-layer gain is ~1 and
-            // activations stay O(1) through the deep net — the well-conditioned
+            // activations stay O(1) through the deep net, the well-conditioned
             // regime real trained weights live in, where f16 error stays bounded.
             // (Larger weights make the net exponentially amplify f16 rounding,
             // which is a property of the weights, not the GEMM.)

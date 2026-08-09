@@ -1,61 +1,33 @@
 //! GPU-resident Z-Image (`NextDiT`) forward on Vulkan: the two `noise_refiner`
-//! blocks and the whole 30-block trunk run on the device, with the small paths kept
-//! on the host exactly as `dit_gpu` keeps krea2's.
+//! blocks and the whole 30-block trunk run on the device, with the small paths kept on
+//! the host exactly as `dit_gpu` keeps krea2's.
 //!
-//! **What stays on the CPU, and why it is not laziness:**
+//! Host-side, because none of it depends on the timestep or is worth a kernel: the
+//! caption half (`cap_embedder`, the pad and both `context_refiner` blocks, all built
+//! with `modulation=False`, so it is computed once per image rather than per step); the
+//! timestep MLP and every block's AdaLN linear, precomputed for the whole schedule at
+//! `Session.init`; patchify and the final layer.
 //!
-//! - The **caption half** (`cap_embedder`, the pad, and both `context_refiner`
-//!   blocks). ⚠️ Those blocks are built with `modulation=False`, so the text half
-//!   does not depend on the timestep at all — it is computed once per *image*, not
-//!   per step, and moving it to the device would buy nothing while costing a second
-//!   sequence length's worth of buffers.
-//! - The **timestep MLP** and every block's AdaLN linear, precomputed for the whole
-//!   schedule at `Session.init` (see `zimage.modulationTable`). A `[15360, 256]`
-//!   GEMV per block is negligible next to the block, and hoisting it out of the step
-//!   loop is what `dit_gpu` does with its `tvs` table for the same reason.
-//! - **Patchify** and the **final layer**, both of which touch only the image rows
-//!   and are a memcpy-and-a-GEMV apiece.
+//! Two mappings that are not obvious. Z-Image's modulation has no shift, and the device
+//! `modulate` kernel computes `(1 + c[scale_off]) * x + c[shift_off]`, so
+//! `zimage.modulationTable` appends one zero block and `shift_off` points at it: exactly
+//! equal, and both backends read the same table. The gates are tanh'd on the host inside
+//! that same table, which costs nothing at one `dim`-wide vector per block per step and
+//! saves a kernel.
 //!
-//! **No new kernel was needed for any of this** — the whole block maps onto the
-//! existing vocabulary — which is the main way this port differs from the SD family's
-//! (GroupNorm, the SpatialTransformer and the LIFO skip stack were all new there).
-//! Two mappings are worth naming because they are not obvious:
+//! The fused `qkv` weight is split into three zero-copy row views rather than
+//! de-interleaved after one wide GEMM, so three GEMMs write straight into contiguous
+//! q/k/v buffers. The device weight cache keys on the host pointer, so the three views
+//! cache separately, but it also means the whole fused tensor must never be uploaded as
+//! well: part 0 shares its pointer.
 //!
-//! - ⚠️ **Z-Image's modulation has NO SHIFT**, and the device `modulate` kernel
-//!   computes `(1 + c[scale_off]) * x + c[shift_off]`. Rather than a second kernel,
-//!   `zimage.modulationTable` appends one **zero block** and `shift_off` points at
-//!   it. Exactly equal, and it keeps the two backends reading the same table.
-//! - ⚠️ **The gates are `tanh`'d on the host**, inside that same table. A gate is one
-//!   `dim`-wide vector per block per step, so this costs nothing measurable and saves
-//!   a kernel.
-//!
-//! ⚠️ **The fused `qkv` weight is split into three zero-copy ROW VIEWS** rather than
-//! de-interleaved after one wide GEMM (which is what the CPU path prefers). `[q|k|v]`
-//! are contiguous row blocks of `[3*dim, dim]`, so three GEMMs write straight into
-//! contiguous q/k/v buffers. The device weight cache keys on the host pointer, so the
-//! three views cache as three separate device weights — which is what we want, but it
-//! also means the *whole* fused tensor must never be uploaded as well (part 0 shares
-//! its pointer).
-//!
-//! **Attention runs the tensor-core scores/PV pipeline**, with the self-contained
-//! `attn_full` kept behind `force_attn_full` as the reference the device test compares
-//! against — both are checked against the CPU forward independently.
-//!
-//! ⚠️ **The tensor-core path is a REQUIREMENT here, not an optimization.** `attn_full`
-//! is one thread per (query, head) looping every key, so a 1056x1584 render (~6800
-//! tokens) runs long enough to trip the GPU watchdog — `error_device_lost`, not a slow
-//! render. Landing correctness-first was still right (it is how the Vulkan qwen35 port
-//! went in, and it is what the fast path got validated against), but calling the fast
-//! path a "follow-up" was wrong: nothing above ~768px works without it. Z-Image needs
-//! no head padding for it — head_dim is exactly the 128 `coopmat.buildGemmAttnOut`
-//! tiles — and every GEMM width is a multiple of 128.
-//!
-//! **Measured** (`zig build test -Dintegration -Dtest-filter="Z-Image gpu"`, needs
-//! the `testdata/gpu-tests` marker): `attn_full` at Z-Image's own 30 x 128 head
-//! geometry matches `ops.attention` at **4.9e-7** rel L2, and the whole forward on
-//! real checkpoint weights matches `zimage.DiT.predict` at **2.1e-4** — the f16
-//! tensor-core regime `sd_unet_cuda` already sits in, and three orders below the
-//! layout mistakes these tests exist to catch.
+//! Attention runs the tensor-core scores/PV pipeline. That is a REQUIREMENT, not an
+//! optimization: `attn_full` is one thread per (query, head) looping every key, so
+//! anything above ~768px trips the GPU watchdog and fails with `error_device_lost`
+//! rather than merely running slowly. `attn_full` stays behind `force_attn_full` as the
+//! reference the device test compares against. No head padding is needed, head_dim is
+//! exactly the 128 `coopmat.buildGemmAttnOut` tiles, and every GEMM width is a
+//! multiple of 128.
 
 const std = @import("std");
 const zimage = @import("zimage.zig");
@@ -66,7 +38,7 @@ const DiT = zimage.DiT;
 const Buf = gpu.DeviceBuffer;
 const Weight = ops.matmul.Weight;
 
-/// Two-pass softmax chunk count — 32 interleaved chunks per row so a warp covers a
+/// Two-pass softmax chunk count, 32 interleaved chunks per row so a warp covers a
 /// row with coalesced reads. Same value `dit_gpu` uses.
 const nchunks = 32;
 /// Cap on the materialized attention-scores buffer; heads batch to fit it.
@@ -102,7 +74,7 @@ pub const Session = struct {
     cap_padded: usize,
     n_img: usize,
     img_padded: usize,
-    /// `cap_padded + img_padded` — the joint sequence the trunk runs on.
+    /// `cap_padded + img_padded`, the joint sequence the trunk runs on.
     seq: usize,
 
     /// The refined caption half, `[cap_padded][dim]`, uploaded once.
@@ -113,7 +85,7 @@ pub const Session = struct {
     /// `seq * half` each.
     freqs_d: Buf,
     /// The image half's own table, i.e. the same positions the image tokens hold in
-    /// the joint sequence. ⚠️ A separate upload rather than an offset into
+    /// the joint sequence. A separate upload rather than an offset into
     /// `freqs_d`, because `opElt` binds whole buffers: the `noise_refiner` runs on
     /// the image tokens alone and its `rope_inter` needs row 0 of its table to be the
     /// image's first position, not the caption's.
@@ -266,7 +238,7 @@ pub const Workspace = struct {
     mu_d: Buf,
     mv_d: Buf, // the whole modulation table for this step
     imgin_d: Buf, // [n_img][patchDim] raw patches
-    // Tensor-core attention operands and scratch. ⚠️ Sized for the TRUNK sequence,
+    // Tensor-core attention operands and scratch. Sized for the TRUNK sequence,
     // which is the longer of the two the forward runs (the `noise_refiner` sees only
     // the image half), and `hb` is recomputed per call from `s_d.size` so a shorter
     // sequence just batches more heads at once.
@@ -292,7 +264,7 @@ pub const Workspace = struct {
             img_padded * cfg.dim * 4,
             seq * cfg.dim * 4,
             seq * cfg.dim * 4,
-            // ⚠️ q/k/v are 128-row PADDED: the f16 conversion writes whole padded
+            // q/k/v are 128-row PADDED: the f16 conversion writes whole padded
             // rows, and `opAttnOut` writes `rows_pad` of them back into `attn_d`.
             seq_pad * cfg.qDim() * 4,
             seq_pad * cfg.kvDim() * 4,
@@ -333,7 +305,7 @@ pub const Workspace = struct {
 /// CPU rather than silently producing something.
 pub fn supported(ctx: *gpu.Context, model: *const DiT) bool {
     if (model.layers.len == 0) return false;
-    // ⚠️ Every layer, and every dtype checked against what THIS device has — a bf16 weight
+    // Every layer, and every dtype checked against what THIS device has, a bf16 weight
     // needs one of the f16-weight coop pipelines and an NVFP4 one needs the decode entry.
     const Cap = struct {
         var has_f16w: bool = false;
@@ -449,7 +421,7 @@ pub fn forward(
 
     // --- the final layer, on the host ------------------------------------------
     // Row-wise, so running it on the image rows alone is exactly equal to running it
-    // on the whole sequence and slicing — which is what the reference does.
+    // on the whole sequence and slicing, which is what the reference does.
     const img_rows = try gpa.alloc(f32, sess.n_img * dim);
     defer gpa.free(img_rows);
     try ctx.tensorDownloadAt(ws.x_d, sess.cap_padded * dim * 4, std.mem.sliceAsBytes(img_rows));
@@ -489,7 +461,7 @@ fn blockForward(
 
     // --- attention: x += tanh(gate_msa) * norm2(attn(modulate(norm1(x), scale_msa)))
     try rmsNorm(ctx, x, ws.nrm_d, blk.attn_norm1, rows, dim, cfg.norm_eps);
-    // ⚠️ `u3` points at the table's trailing ZERO block: Z-Image's modulation has no
+    // `u3` points at the table's trailing ZERO block: Z-Image's modulation has no
     // shift, and this is how the shared `modulate` kernel expresses that.
     try ctx.opElt(.modulate, ws.nrm_d, null, ws.mv_d, null, .{
         .u0 = total,
@@ -498,7 +470,7 @@ fn blockForward(
         .u3 = zero_off,
     }, rows * dim, 1, 1);
 
-    // The fused qkv as three zero-copy row views — see the module header.
+    // The fused qkv as three zero-copy row views, see the module header.
     var nvq: ops.nvfp4.Meta = undefined;
     var nvk: ops.nvfp4.Meta = undefined;
     var nvv: ops.nvfp4.Meta = undefined;
@@ -509,7 +481,7 @@ fn blockForward(
     try gemm(ctx, ws.k_d, ws.nrm_d, rows, wk);
     try gemm(ctx, ws.v_d, ws.nrm_d, rows, wv);
 
-    // ⚠️ The Q/K norms take `finfo(f32).eps`, NOT the blocks' 1e-5 — see
+    // The Q/K norms take `finfo(f32).eps`, NOT the blocks' 1e-5, see
     // `zimage.Config.qk_eps`. Same kernel, different push constant.
     ctx.independent(2);
     try rmsNorm(ctx, ws.q_d, ws.q_d, blk.attn.qnorm, rows * heads, hd, cfg.qk_eps);
@@ -566,9 +538,9 @@ fn blockForward(
 /// `v_d`, result into `ws.attn_d`. Both paths are non-causal and mathematically the
 /// same; they differ in how the scores are produced.
 ///
-/// ⚠️ **The tensor-core path is not an optimization here, it is a requirement.**
+/// The tensor-core path is not an optimization here, it is a requirement.
 /// `attn_full` is one thread per (query, head) looping every key, which at a 1056x1584
-/// render (~6800 tokens) runs long enough to trip the GPU watchdog —
+/// render (~6800 tokens) runs long enough to trip the GPU watchdog,
 /// `error_device_lost`, not a slow render. It stays as the reference the device test
 /// compares against, and as the fallback where `pipe_scores` is absent.
 fn attention(ctx: *gpu.Context, cfg: zimage.Config, ws: *Workspace, rows: usize, scale: f32) !void {
@@ -590,7 +562,7 @@ fn attention(ctx: *gpu.Context, cfg: zimage.Config, ws: *Workspace, rows: usize,
 
     const rows_pad = std.mem.alignForward(usize, rows, 128);
     // f16 operands: Q with the softmax scale prefolded and zero pad rows, K per-head
-    // k-major with zero pad columns, V with zero pad rows — so padded keys score 0 and
+    // k-major with zero pad columns, V with zero pad rows, so padded keys score 0 and
     // padded-j probabilities contribute nothing to P@V.
     ctx.independent(3);
     try ctx.opElt(.f32_to_h16, ws.q_d, null, null, ws.qt_d, .{
@@ -611,7 +583,7 @@ fn attention(ctx: *gpu.Context, cfg: zimage.Config, ws: *Workspace, rows: usize,
         .f0 = 1.0,
     }, rows_pad * kv_dim / 2, 1, 1);
 
-    // ⚠️ Recomputed per call, not taken from `Workspace.init`: the two sequence
+    // Recomputed per call, not taken from `Workspace.init`: the two sequence
     // lengths a forward runs (image half, then the joint sequence) give different
     // plane sizes, and the buffers were sized for the longer one.
     const plane = rows_pad * rows_pad * 2;
@@ -667,9 +639,9 @@ fn qkvPart(w: Weight, row0: usize, nrows: usize, nv: *ops.nvfp4.Meta) Weight {
     var s = w;
     s.rows = nrows;
     s.bytes = w.bytes[row0 * row_bytes ..][0 .. nrows * row_bytes];
-    // ⚠️ An NVFP4 weight's per-block scales have to be row-sliced too, into caller-owned
+    // An NVFP4 weight's per-block scales have to be row-sliced too, into caller-owned
     // storage that outlives the returned `Weight`. Without it the k and v views would read
-    // q's block scales — see `ops.nvfp4.Meta.rowSlice`.
+    // q's block scales, see `ops.nvfp4.Meta.rowSlice`.
     if (w.nvfp4) |m| {
         nv.* = m.rowSlice(w.cols, row0, nrows);
         s.nvfp4 = nv;
@@ -679,17 +651,17 @@ fn qkvPart(w: Weight, row0: usize, nrows: usize, nv: *ops.nvfp4.Meta) Weight {
 
 /// A block GEMM, dispatched by weight dtype. Z-Image ships dense bf16, which takes
 /// one of the two f16-weight tensor-core pipelines (native bf16 where the device has
-/// a bf16 coop config, else bf16→f16 at upload — both keep the conversion off the
+/// a bf16 coop config, else bf16->f16 at upload, both keep the conversion off the
 /// host under weight streaming), exactly as `dit_gpu` routes its dense bf16 blocks.
 fn gemm(ctx: *gpu.Context, y: Buf, x: Buf, m: usize, w: Weight) !void {
     // The block linears carry no bias, but the f16-weight coop GEMM always folds one
     // in, so hand it a zero vector.
     //
-    // ⚠️ **The FULL slice, never `zeros[0..w.rows]`.** `smallBuffer` caches by host
+    // The FULL slice, never `zeros[0..w.rows]`. `smallBuffer` caches by host
     // POINTER alone, so every width would map to whichever length was uploaded first:
     // once a `dim`-wide GEMM cached a 3840-float buffer, the `mlp_dim` GEMM's
     // `bias_compact` would read 10240 floats out of it and run off the end. The
-    // dispatch reads only `rows` entries, so one full-width buffer serves them all —
+    // dispatch reads only `rows` entries, so one full-width buffer serves them all,
     // which is also exactly what `dit_gpu` does and why.
     const zeros: []const f32 = &zero_bias;
     std.debug.assert(w.rows <= zeros.len);
@@ -703,7 +675,7 @@ fn gemm(ctx: *gpu.Context, y: Buf, x: Buf, m: usize, w: Weight) !void {
         },
         .f16 => try ctx.opMatmulCoopF16Wh(y, 0, x, m, w.bytes, w.rows, w.cols, zeros),
         // Weight-only NVFP4: decoded to an f16 scratch inside the GEMM, so the 4-bit form
-        // stays resident. ⚠️ `zeros` is the FULL vector for the reason above.
+        // stays resident. `zeros` is the FULL vector for the reason above.
         .nvfp4 => {
             std.debug.assert(w.rows % 128 == 0 and w.cols % 32 == 0);
             const meta = w.nvfp4.?;
@@ -721,17 +693,15 @@ const zero_bias: [zimage.z_image.mlp_dim]f32 = @splat(0);
 
 /// Weighted RMSNorm over `[rows][dim]`, `x -> out` (may alias).
 ///
-/// ⚠️ **The SUBGROUP kernel wherever it exists.** `Elt.rmsnorm` gives each THREAD a whole
+/// The SUBGROUP kernel wherever it exists. `Elt.rmsnorm` gives each THREAD a whole
 /// row, so a warp's 32 loads land `dim * 4` bytes apart and each is its own sector fetch.
 /// Measured at Z-Image's own geometries at 1056x1584 (`vk-norm-bench`):
 ///
-/// | | thread/row | subgroup | |
-/// |---|---|---|---|
-/// | Q/K, 205440 x 128 | **37 GB/s** | **555 GB/s** | 15.2x |
-/// | sandwich, 6848 x 3840 | 114 GB/s | 345 GB/s | 3.0x |
+///     Q/K, 205440 x 128:       37 GB/s thread-per-row vs 555 subgroup, 15.2x
+///     sandwich, 6848 x 3840:  114 GB/s thread-per-row vs 345 subgroup,  3.0x
 ///
-/// ⚠️ **Not bit-identical**: the row sum becomes a subgroup tree where it was serial. It is
-/// the more accurate of the two, and `ln_mod_sg` next door already reduces that way — but it
+/// Not bit-identical: the row sum becomes a subgroup tree where it was serial. It is
+/// the more accurate of the two, and `ln_mod_sg` next door already reduces that way, but it
 /// does move the parity figures, so the gated forward test's bound is the thing to watch.
 fn rmsNorm(ctx: *gpu.Context, x: Buf, out: Buf, weights: []const f32, rows: usize, dim: usize, eps: f32) !void {
     const w = try normBuf(ctx, weights);
@@ -752,7 +722,7 @@ fn normBuf(ctx: *gpu.Context, weights: []const f32) !Buf {
 // --- tests ------------------------------------------------------------------
 //
 // Two tiers. The first two need no device at all and pin the pieces a GPU port
-// gets wrong — the weight split and the modulation layout, both of which are pure
+// gets wrong, the weight split and the modulation layout, both of which are pure
 // conventions that produce a plausible image when muddled. The device tests below
 // them check each kernel against the CPU op it reproduces, then the whole forward
 // against `zimage.DiT.predict`.
@@ -773,9 +743,9 @@ fn relL2(want: []const f32, got: []const f32) f64 {
 }
 
 test "the fused qkv splits into three row views the CPU forward agrees with" {
-    // ⚠️ The GPU path does three GEMMs on row slices where the CPU path does one wide
+    // The GPU path does three GEMMs on row slices where the CPU path does one wide
     // GEMM and de-interleaves the result. Those must be the same linear map, and a
-    // swapped or misaligned slice is not an error — q/k/v would simply be each
+    // swapped or misaligned slice is not an error, q/k/v would simply be each
     // other's, which renders as structured noise. Checked against the CPU's own
     // fused GEMM rather than against a re-derivation.
     const gpa = testing.allocator;
@@ -821,7 +791,7 @@ test "the modulation table is laid out the way the device kernels index it" {
     //  - the chunk ORDER is `scale_msa, gate_msa, scale_mlp, gate_mlp`;
     //  - the two GATE chunks are already `tanh`'d (the device has no tanh kernel);
     //  - a trailing ZERO block exists, which is what lets the shared `modulate`
-    //    kernel — `(1 + c[scale_off]) * x + c[shift_off]` — express Z-Image's
+    //    kernel, `(1 + c[scale_off]) * x + c[shift_off]`, express Z-Image's
     //    shift-free modulation. A missing zero block would add whatever followed.
     const gpa = testing.allocator;
     const io = testing.io;
@@ -871,7 +841,7 @@ fn gpuCtx(gpa: std.mem.Allocator, io: std.Io) !*gpu.Context {
 const zit_ckpt = "/home/qt/genai/comfyui/models/checkpoints/zit/unstableRevolution_V2Fp16.safetensors";
 
 test "Z-Image gpu attention matches ops.attention at the model's head geometry" {
-    // `attn_full` at 30 heads x 128 — Z-Image's exact shape, and the one place the
+    // `attn_full` at 30 heads x 128, Z-Image's exact shape, and the one place the
     // GPU path uses a different algorithm (online softmax) from the CPU's two-pass
     // form rather than the same one in a different order.
     const gpa = testing.allocator;
@@ -936,7 +906,7 @@ test "Z-Image gpu attention matches ops.attention at the model's head geometry" 
 
 test "Z-Image gpu forward matches the CPU forward on a real checkpoint" {
     // The definitive one: same weights, same latent, same conditioning, both
-    // forwards. Truncated to 2 trunk layers so it loads in seconds — the loop bound
+    // forwards. Truncated to 2 trunk layers so it loads in seconds, the loop bound
     // is not what a kernel port gets wrong, the block's shape is.
     const gpa = testing.allocator;
     const io = testing.io;
@@ -978,7 +948,7 @@ test "Z-Image gpu forward matches the CPU forward on a real checkpoint" {
         try model.predict(io, gpa, want, x_lat, lat, lat, cap, cap_padded, adaln, null);
     }
 
-    // ⚠️ **Both attention paths, and they must agree with the CPU independently.**
+    // Both attention paths, and they must agree with the CPU independently.
     // `attn_full` is the correctness reference but trips the GPU watchdog at
     // production resolutions; the tensor-core scores/PV path is what actually runs.
     // Testing only the fast one would leave the fallback free to rot, and testing only
@@ -1002,7 +972,7 @@ test "Z-Image gpu forward matches the CPU forward on a real checkpoint" {
         errdefer std.debug.print("zimage gpu forward ({s}) rel L2 {e:.4}\n", .{ if (full) "attn_full" else "tensor-core", rel });
         // The GEMMs run f16 tensor cores against the CPU's f32 accumulation, which is
         // the regime `sd_unet_cuda` already sits in: measured 2.15e-4 with `attn_full`
-        // and 2.19e-4 with the tensor-core path — i.e. the attention choice is not
+        // and 2.19e-4 with the tensor-core path, i.e. the attention choice is not
         // what the residual is made of.
         try testing.expect(rel < 1e-3);
     }

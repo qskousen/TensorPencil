@@ -1,31 +1,22 @@
-//! GPU-resident Z-Image (`NextDiT`) forward on the CUDA backends (`zig-cuda`'s
-//! hand-PTX and `cuda`'s vendor libraries) — the CUDA twin of `zimage_gpu`.
+//! GPU-resident Z-Image (`NextDiT`) forward on the CUDA backends (`zig-cuda`'s hand-PTX
+//! and `cuda`'s vendor libraries), the CUDA twin of `zimage_gpu`.
 //!
-//! The split is identical to the Vulkan arm's and to `dit_cuda`'s: the two
-//! `noise_refiner` blocks and the whole 30-block trunk run on the device; the
-//! timestep MLP, every block's AdaLN linear, the entire caption half, patchify and
-//! the final layer stay on the host. See `zimage_gpu`'s header for why each of those
-//! is not laziness — in particular the caption half is `modulation=False` and so is
-//! per-*image*, not per-step.
+//! The host/device split is identical to the Vulkan arm's; see `zimage_gpu`'s header.
+//! Two differences, both forced by the op surface:
 //!
-//! **Two differences from the Vulkan arm, both forced by the op surface:**
+//! 1. The modulation table is the FOLDED one (`zimage.modulationTableFolded`). CUDA has
+//!    no standalone `modulate`, only `rmsMod` (`out = x*inv*premul[col] + shift[col]`),
+//!    so the pre-norm weight must arrive already multiplied into the scale. Vulkan takes
+//!    the unfused table because it has a separate `modulate`. Both come out of one AdaLN
+//!    evaluation, so they cannot drift.
+//! 2. Attention is `opAttnTC`: cuDNN's fused SDPA under `cuda`, hand-PTX tensor cores
+//!    under `zig-cuda`. The naive `be.attn` is one thread per (query, head) and trips the
+//!    GPU watchdog at production resolutions, so it is the fallback, not the default.
 //!
-//! 1. ⚠️ **The modulation table is the FOLDED one** (`zimage.modulationTableFolded`).
-//!    CUDA has no standalone `modulate` kernel — only `rmsMod`, which computes
-//!    `out = x*inv*premul[col] + shift[col]` — so the pre-norm's weight has to arrive
-//!    already multiplied into the scale. Vulkan takes the unfused table because it
-//!    has a separate `modulate`. Both come out of the same AdaLN evaluation so they
-//!    cannot drift, and each backend is compared against the same CPU forward.
-//! 2. **Attention is `opAttnTC`**, which is cuDNN's fused SDPA under `--backend cuda`
-//!    and the hand-PTX tensor-core path under `zig-cuda`. ⚠️ The naive `be.attn` is
-//!    one thread per (query, head) and is what tripped the GPU watchdog on Vulkan at
-//!    production resolutions, so it is the fallback and not the default here.
-//!
-//! ⚠️ **Head width is exactly 128**, which both `launchHgemmB`'s P@V tiling and
-//! cuDNN handle directly — so unlike the SD family there is no head padding and no
-//! `head_pad`/`head_unpad` round trip. Every trunk GEMM width (3840 / 10240 / 11520)
-//! is a multiple of 128 and every reduction width a multiple of 32, so `opGemmBf16`'s
-//! shape constraints are met without special-casing.
+//! Head width is exactly 128, which both `launchHgemmB`'s P@V tiling and cuDNN handle
+//! directly, so unlike the SD family there is no head padding and no `head_pad` /
+//! `head_unpad` round trip. Every trunk GEMM width (3840 / 10240 / 11520) is a multiple
+//! of 128 and every reduction width a multiple of 32.
 
 const std = @import("std");
 const zimage = @import("zimage.zig");
@@ -41,7 +32,7 @@ const Weight = ops.matmul.Weight;
 /// A/B and for reproducing a mismatch; the device test runs both.
 pub var force_naive_attn: bool = false;
 
-/// Widest zero bias any Z-Image GEMM needs. ⚠️ Passed WHOLE, never sliced: a bias is
+/// Widest zero bias any Z-Image GEMM needs. Passed WHOLE, never sliced: a bias is
 /// cached by host pointer and sized from the first call's length, so a narrow layer
 /// seen first would leave every wider one reading past the end. `opGemmBf16` asserts
 /// `bias.len >= co` and the kernels read only `co` entries, so one full-width buffer
@@ -56,14 +47,14 @@ pub const Session = struct {
     cap_padded: usize,
     n_img: usize,
     img_padded: usize,
-    /// `cap_padded + img_padded` — the joint sequence the trunk runs on.
+    /// `cap_padded + img_padded`, the joint sequence the trunk runs on.
     seq: usize,
 
     cap_d: Buf,
     x_pad_d: Buf,
     /// Interleaved-RoPE table for the joint sequence, `cos` then `sin`.
     freqs_d: Buf,
-    /// The image half's own table — a separate upload, because the `noise_refiner`
+    /// The image half's own table, a separate upload, because the `noise_refiner`
     /// runs on the image tokens alone and needs row 0 of its table to be the image's
     /// first position, not the caption's.
     img_freqs_d: Buf,
@@ -374,7 +365,7 @@ fn blockForward(
     const half = hd / 2;
 
     // x += tanh(gate_msa) * norm2(attn(rmsMod(x, premul_attn)))
-    // ⚠️ `premul` is `attn_norm1 * (1 + scale_msa)` — folded on the host, because
+    // `premul` is `attn_norm1 * (1 + scale_msa)`, folded on the host, because
     // `rmsMod` has no place for a separate norm weight. `shift_off` points at the
     // table's trailing zero block: Z-Image's modulation has no shift.
     try be.rmsMod(x, ws.nrm_d, ws.mv_d, rows, dim, mod_base + 0 * dim, zero_off, cfg.norm_eps);
@@ -389,7 +380,7 @@ fn blockForward(
     try gemm(be, ws.k_d, ws.nrm_d, rows, wk);
     try gemm(be, ws.v_d, ws.nrm_d, rows, wv);
 
-    // ⚠️ The Q/K norms take `finfo(f32).eps`, NOT the blocks' 1e-5.
+    // The Q/K norms take `finfo(f32).eps`, NOT the blocks' 1e-5.
     try be.qkNorm(ws.q_d, ws.q_d, try normBuf(be, blk.attn.qnorm), rows * heads, hd, cfg.qk_eps);
     try be.qkNorm(ws.k_d, ws.k_d, try normBuf(be, blk.attn.knorm), rows * kv_heads, hd, cfg.qk_eps);
     try be.rope(ws.q_d, freqs, rows, heads, half, sin_off);
@@ -418,11 +409,11 @@ fn blockForward(
 
 /// Queue a block's streamable weights for async prefetch, called ONE BLOCK AHEAD so
 /// the upload overlaps the previous block's compute. Keys must be the same host
-/// pointers `forward` later fetches, or the prefetch is a cache miss and pure waste —
+/// pointers `forward` later fetches, or the prefetch is a cache miss and pure waste,
 /// hence the qkv ROW VIEWS here, matching `qkvPart` exactly.
 ///
-/// ⚠️ Without this the first step pays the whole ~11.6 GB upload serially: measured
-/// **8.0 s for step 1 against a 2.6 s steady state** at 1056x1584, which on a 9-step
+/// Without this the first step pays the whole ~11.6 GB upload serially: measured
+/// 8.0 s for step 1 against a 2.6 s steady state at 1056x1584, which on a 9-step
 /// turbo render is a fifth of the total time.
 fn prefetchBlock(be: *Backend, cfg: zimage.Config, blk: anytype) void {
     const bytes = std.mem.sliceAsBytes;
@@ -451,17 +442,17 @@ fn offsetBuf(b: Buf, off_bytes: usize, size: usize) Buf {
 }
 
 /// A contiguous row range of the fused `[q_dim + 2*kv_dim, dim]` qkv weight. Zero-copy
-/// — `[q|k|v]` are row blocks — and the device weight cache keys on the host pointer,
-/// so the three views cache separately. ⚠️ Part 0 shares the fused tensor's pointer, so
+/// `[q|k|v]` are row blocks, and the device weight cache keys on the host pointer,
+/// so the three views cache separately. Part 0 shares the fused tensor's pointer, so
 /// the whole tensor must never be uploaded as well.
 fn qkvPart(w: Weight, row0: usize, nrows: usize, nv: *ops.nvfp4.Meta) Weight {
     const row_bytes = w.dtype.storageBytes(w.cols);
     var s = w;
     s.rows = nrows;
     s.bytes = w.bytes[row0 * row_bytes ..][0 .. nrows * row_bytes];
-    // ⚠️ An NVFP4 weight's per-block scales have to be row-sliced too, into caller-owned
+    // An NVFP4 weight's per-block scales have to be row-sliced too, into caller-owned
     // storage that outlives the returned `Weight`. Without it the k and v views would read
-    // q's block scales — see `ops.nvfp4.Meta.rowSlice`.
+    // q's block scales, see `ops.nvfp4.Meta.rowSlice`.
     if (w.nvfp4) |m| {
         nv.* = m.rowSlice(w.cols, row0, nrows);
         s.nvfp4 = nv;
@@ -469,14 +460,14 @@ fn qkvPart(w: Weight, row0: usize, nrows: usize, nv: *ops.nvfp4.Meta) Weight {
     return s;
 }
 
-/// A block GEMM, dispatched by weight dtype — the same routing `dit_cuda.lin` uses.
+/// A block GEMM, dispatched by weight dtype, the same routing `dit_cuda.lin` uses.
 /// Ampere+ feeds raw bf16 straight to the tensor cores; older cards take the
-/// GPU-side bf16→f16 GEMM.
+/// GPU-side bf16->f16 GEMM.
 fn gemm(be: *Backend, y: Buf, x: Buf, m: usize, w: Weight) !void {
     const zeros: []const f32 = &zero_bias;
     std.debug.assert(w.rows <= zeros.len);
     switch (w.dtype) {
-        // ⚠️ `null`, not `zeros`: Z-Image's block linears are all bias-free, and a
+        // `null`, not `zeros`: Z-Image's block linears are all bias-free, and a
         // null bias lets the `.libs` arm write the GEMM straight into `y` instead
         // of staging through `conv_c` and re-reading the whole output to add zero.
         .bf16 => if (be.ctx.cc_major >= 8 and w.rows % 128 == 0 and w.cols % 32 == 0)

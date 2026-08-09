@@ -1,23 +1,22 @@
 //! GPU-resident SD1.5 / SDXL UNet forward on the CUDA backends.
 //!
-//! The CUDA analogue of `sd_unet_gpu`, stage for stage, and it covers **both**
+//! The CUDA analogue of `sd_unet_gpu`, stage for stage, and it covers both
 //! `zig-cuda` and `cuda`: they share this one code path and differ only in where
 //! the batched GEMM and prefill attention go (hand-PTX mma against cuBLASLt /
 //! cuDNN), which `Backend` decides internally.
 //!
-//! Two places it deliberately differs from the Vulkan path, and both are the
-//! backend's shape rather than a policy choice:
+//! Two places it differs from the Vulkan path, both forced by the backend's shape:
 //!
-//! 1. **`cuda` attends at the true head width; `zig-cuda` pads to 128.** cuDNN's
+//! 1. `cuda` attends at the true head width; `zig-cuda` pads to 128. cuDNN's
 //!    fused SDPA takes any head width, so the library arm runs SD's 40/64/80/160
 //!    exactly. The hand-PTX arm cannot: its P@V GEMM tiles the head dimension in
 //!    128-wide blocks, so narrower heads are zero-padded up to 128 (and 160 up to
 //!    256) exactly as the Vulkan path does. Zero dimensions contribute nothing to
 //!    a dot product and V's zero columns give output columns `opHeadUnpad` drops,
-//!    so the padding is exact — it just costs arithmetic. This is the one place
+//!    so the padding is exact, it just costs arithmetic. This is the one place
 //!    the two CUDA arms do not share a shape.
 //!
-//! 2. **The ResBlock timestep projection is added, not folded.** Vulkan folds it
+//! 2. The ResBlock timestep projection is added, not folded. Vulkan folds it
 //!    into the convolution bias for free; the CUDA GEMM entry points take a host
 //!    bias slice, so folding would mean reworking that plumbing for a ~2% pass.
 //!    See `opAddBiasRows`.
@@ -50,7 +49,7 @@ const coop_min_co: usize = 96;
 
 /// The head width the hand-PTX attention tiles its P@V GEMM in.
 ///
-/// ⚠️ **`launchHgemmB` launches `grid.x = n / 128` with `n = head_dim`**, so a
+/// `launchHgemmB` launches `grid.x = n / 128` with `n = head_dim`, so a
 /// narrower head asks for a zero-sized grid (`CUDA_ERROR_INVALID_VALUE`) and a
 /// non-multiple silently computes only part of the head. Every SD head width
 /// trips one or the other: 40, 64 and 80 the former, 160 the latter.
@@ -72,8 +71,8 @@ pub const Session = struct {
     /// serves the whole forward.
     proj_host: []f32,
     proj_d: Buf = .{},
-    /// Element offset per ResBlock, indexed by its **ordinal in the graph walk**.
-    /// ⚠️ Not by a host pointer: `Session.replaceDenoiser` reloads the UNet into a
+    /// Element offset per ResBlock, indexed by its ordinal in the graph walk.
+    /// Not by a host pointer: `Session.replaceDenoiser` reloads the UNet into a
     /// fresh arena while this session stays alive, so pointer keys go stale. See
     /// the longer note on `sd_unet_gpu.Session.bias_off`.
     proj_off: []usize,
@@ -115,7 +114,7 @@ pub const Session = struct {
         var max_ch: usize = cfg.model_channels;
         for (cfg.channel_mult) |m| max_ch = @max(max_ch, cfg.model_channels * m);
 
-        // ⚠️ Allocate BEFORE the literal: `.arena = arena` copies the arena's
+        // Allocate BEFORE the literal: `.arena = arena` copies the arena's
         // state, so a later field initializer's allocation leaks. See the same
         // note in `sd_unet_gpu.Session.init`.
         const proj_host = try alloc.alloc(f32, total);
@@ -482,7 +481,7 @@ fn applySpatial(
         try gemm(be, sess, &ws.nb, &ws.ao, n, b.attn1.out.w, b.attn1.out.b);
         try be.opAdd(ws.stream, ws.nb, n * ch);
 
-        // attn2: cross-attention onto the text conditioning — `ctx_seq` keys, not `n`.
+        // attn2: cross-attention onto the text conditioning, `ctx_seq` keys, not `n`.
         try be.opLayerNorm(ws.stream, ws.nb, b.norm2.w, b.norm2.b, n, ch, cfg.norm_eps);
         try gemm(be, sess, &ws.q, &ws.nb, n, b.attn2.q, null);
         try gemm(be, sess, &ws.k, &sess.ctx_d, ctx_seq, b.attn2.k, null);
@@ -559,13 +558,12 @@ fn groupNorm(
 /// Feed `ops.matmul.probe` this GEMM's input, so an activation capture works when
 /// the SD UNet runs on CUDA.
 ///
-/// ⚠️ **Without these call sites a CUDA capture of an SD model is silently almost
-/// empty, and it passes the cache's own sanity gate.** This backend owns its GEMM,
-/// so `ops.matmul`'s probe point never fires here; measured before the fix, a
-/// dreamshaper_8 capture recorded **23 of ~282 layers** — every one of them an
-/// `emb_layers` timestep projection, which are the only linears that fall back to
-/// `ops.matmul`. Attention, the feed-forwards and every convolution — i.e. the model —
-/// were invisible. That is the same failure the Vulkan DiT capture had (39 of 263).
+/// Without these call sites a CUDA capture of an SD model is silently almost
+/// empty, and it passes the cache's own sanity gate. This backend owns its GEMM,
+/// so `ops.matmul`'s probe point never fires here. Without them a capture records only
+/// the `emb_layers` timestep projections, the sole linears that fall back to
+/// `ops.matmul`: 23 of ~282 layers, with attention, the feed-forwards and every
+/// convolution invisible.
 ///
 /// Mirrors `dit_cuda.probeInput`: the activation is downloaded and handed to the same
 /// host accumulator a CPU capture uses, so a GPU-captured cache differs from a CPU one
@@ -581,7 +579,7 @@ fn probeInput(be: *Backend, x: Buf, m: usize, w: Weight) !void {
 
 /// The `Weight` a convolution's GEMM is equivalent to, matching `ops.conv` exactly:
 /// a 1x1 reads `ci` columns and a 3x3 reads the im2col patch (`9*ci`). Getting this
-/// wrong would not fail — it would file a cache whose column count disagrees with the
+/// wrong would not fail, it would file a cache whose column count disagrees with the
 /// checkpoint, which is what the validator catches, or worse, silently mis-shape the
 /// per-column statistics an imatrix is built from.
 fn convWeight(cv: Conv2d, cols: usize) Weight {
@@ -593,15 +591,15 @@ fn convWeight(cv: Conv2d, cols: usize) Weight {
 fn gemm(be: *Backend, sess: *Session, y: *Buf, x: *const Buf, m: usize, wt: Weight, bias: ?[]const f32) !void {
     const rows = wt.rows;
     const cols = wt.cols;
-    // ⚠️ The whole `zeros` array, NOT `zeros[0..rows]`. Both backends cache a bias
+    // The whole `zeros` array, NOT `zeros[0..rows]`. Both backends cache a bias
     // by POINTER and size the device buffer from the FIRST call's length, so a
-    // narrow layer seen first would leave every wider one reading past the end —
+    // narrow layer seen first would leave every wider one reading past the end,
     // which robust-buffer-access hides by returning zeros, i.e. exactly the right
     // answer for THIS bias and nothing else. The kernels read only `rows`
     // entries, so handing them a longer slice is free. (Backend.cachedWeight)
     const b = bias orelse sess.zeros;
     // Before the dispatch: `x` still holds the f32 activation here (unlike the
-    // int8/int4 DiT paths, which consume it in place — the SD UNet has no such path,
+    // int8/int4 DiT paths, which consume it in place, the SD UNet has no such path,
     // its GEMM switch is {f32, f16, bf16}).
     try probeInput(be, x.*, m, wt);
     switch (wt.dtype) {
@@ -631,7 +629,7 @@ fn conv(
 }
 
 /// `conv` with the im2col band buffer passed in, so `sd_vae_cuda` shares this
-/// exact mapping rather than reimplementing it. Grows `dst` as needed — the VAE
+/// exact mapping rather than reimplementing it. Grows `dst` as needed, the VAE
 /// decoder's activations change width per level.
 pub fn convInto(
     be: *Backend,
@@ -647,7 +645,7 @@ pub fn convInto(
 }
 
 /// `convInto` with the activation divided by `act_div` before the f16 cast (and
-/// the result multiplied back) — see `Backend.opConvF16Scaled` for why f16's 65504
+/// the result multiplied back), see `Backend.opConvF16Scaled` for why f16's 65504
 /// ceiling is reachable in practice. `act_div = 1.0` is exactly `convInto`.
 ///
 /// The f32 arm (`co < coop_min_co`) ignores it: it never casts to f16, so it has
@@ -667,14 +665,14 @@ pub fn convIntoScaled(
 }
 
 /// `convIntoScaled` with f16 activation STORAGE selectable on either side. The GEMM
-/// is unchanged — it already ran f16 operands with an f32 accumulator; `src_f16` /
+/// is unchanged, it already ran f16 operands with an f32 accumulator; `src_f16` /
 /// `dst_f16` only say how the big activation buffers are laid out in memory, which
 /// is where a VAE decode's gigabytes live.
 ///
-/// ⚠️ For a 3x3 the **patch stays f32** (it is banded, a few MB), so `src_f16` is
+/// For a 3x3 the patch stays f32 (it is banded, a few MB), so `src_f16` is
 /// consumed by the im2col gather and the GEMM's own source is f32 either way.
 ///
-/// ⚠️ `src_f16` and `act_div != 1` are MUTUALLY EXCLUSIVE, and that is a property of
+/// `src_f16` and `act_div != 1` are MUTUALLY EXCLUSIVE, and that is a property of
 /// the problem rather than a limitation: `act_div` exists because a value too large
 /// for f16 has to be scaled down before the cast, and an f16 *buffer* could not have
 /// held that value in the first place. `sd_vae.Config.act_f16` is off exactly where
@@ -694,19 +692,19 @@ pub fn convIntoPrec(
 ) !void {
     std.debug.assert(!(src_f16 and act_div != 1.0));
     const cb = cv.b orelse return error.MissingConvBias;
-    // ⚠️ f16 storage FORCES the cooperative path, because the f32 GEMM arm has no
+    // f16 storage FORCES the cooperative path, because the f32 GEMM arm has no
     // f16 form. `coop_min_co` is a performance threshold, not a correctness one
     // (padding `co` to the tile costs more than the tensor cores return below it),
-    // so widening it here is free of consequence — and not widening it was a real
+    // so widening it here is free of consequence, and not widening it was a real
     // bug: SD1.5's `post_quant_conv` is 4->4, fell to the f32 arm, and wrote f32
     // into an f16 buffer. Every pixel non-finite, caught by `sd-cuda-test`'s sweep.
     const coop = cv.co >= coop_min_co or src_f16 or dst_f16;
     if (cv.k == 1) {
         std.debug.assert(mode == .stride1);
         const n = h * w;
-        // ⚠️ The activation-capture probe reads f32; an f16 buffer would be filed as
+        // The activation-capture probe reads f32; an f16 buffer would be filed as
         // noise, so it is skipped rather than lied to (capture and f16 storage are
-        // not used together — one is a measurement run, the other a render).
+        // not used together, one is a measurement run, the other a render).
         if (!src_f16) try probeInput(be, src.*, n, convWeight(cv, cv.ci));
         if (coop) return be.opConvF16Prec(dst.*, 0, src.*, n, std.mem.sliceAsBytes(cv.w), cv.co, cv.ci, cb, act_div, src_f16, dst_f16);
         std.debug.assert(!src_f16 and !dst_f16); // unreachable: `coop` covers those

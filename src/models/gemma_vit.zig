@@ -268,7 +268,7 @@ pub const Vit = struct {
     /// ([side*side][dim]): 4x4 average pool over the patch grid -> 256 tokens,
     /// soft_emb_norm (RMSNorm; +1 folded into the weight), input projection.
     /// Shared by the CPU encode and the CUDA encode (which runs the encoder
-    /// device-side, downloads the post-LN states, and projects here — the
+    /// device-side, downloads the post-LN states, and projects here, the
     /// projector is cheap next to the 27 blocks).
     pub fn project(self: *const Vit, io: std.Io, gpa: std.mem.Allocator, x: []const f32) !Encoded {
         const cfg = self.cfg;
@@ -367,7 +367,7 @@ const Scratch = struct {
 /// Resize `rgb` (interleaved, sw x sh) into a `size` x `size` square and
 /// normalize to planar CHW f32. Matches llama.cpp mtmd gemma3 (PAD_CEIL):
 /// aspect-preserving align-corners bilinear (truncating u8) into a fitted
-/// rectangle, centered on a black canvas, then (p/255 - mean)/std — so the
+/// rectangle, centered on a black canvas, then (p/255 - mean)/std, so the
 /// black pad normalizes to (0 - mean)/std.
 fn preprocess(gpa: std.mem.Allocator, rgb: []const u8, sw: usize, sh: usize, size: usize, mean: [3]f32, stdv: [3]f32) ![]f32 {
     const scale = @min(

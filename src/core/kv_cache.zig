@@ -1,5 +1,5 @@
-//! Per-layer K/V cache for autoregressive decode (f32, host memory —
-//! LLM_PLAN.md M2; a GPU-resident variant lands with M4).
+//! Per-layer K/V cache for autoregressive decode (f32, host memory). The GPU
+//! backends keep their own device-resident caches.
 //!
 //! Layout: k/v are [n_layers][capacity][kv_dim] row-major. A forward pass
 //! writes the new tokens' K/V at row `len` for every layer, then `commit`s
@@ -10,7 +10,7 @@ const std = @import("std");
 /// Element storage type for the KV cache K/V data. `f32` is the default and is
 /// bit-exact (unchanged behavior); `f16` halves the footprint, `q8_0` (the ggml
 /// 34-byte block quant: f16 scale + 32 x i8, ~1.06 B/elem) roughly quarters it.
-/// Both are lossy — their output is NOT token-identical to f32.
+/// Both are lossy, their output is NOT token-identical to f32.
 pub const KvDtype = enum {
     f32,
     f16,
@@ -55,7 +55,7 @@ pub const q8_block_bytes = 34;
 
 /// Sizing plan for a session's KV cache: start with `initial` rows committed
 /// and grow on demand up to `max`. `initial == max` is a fixed-capacity cache
-/// (no growth) — required whenever the capacity is baked into device layouts
+/// (no growth), required whenever the capacity is baked into device layouts
 /// (speculative tree batch regions, EAGLE tap strides). `kv_dtype` selects the
 /// K/V element storage type (default f32) and is threaded into every model
 /// init so the device allocation and attention kernels agree on the width.
@@ -87,9 +87,9 @@ pub fn growTarget(cur: usize, min: usize, max: usize) usize {
 /// The growth decision every stepper's `ensureCapacity` shares: from the
 /// current committed capacity `cur` and the hard ceiling `max`, decide whether
 /// `min_rows` needs a grow and, if so, to what capacity.
-///   - `null`  → `min_rows` already fits; the caller returns without growing.
-///   - `target`→ grow the cache (and RoPE tables) to this many rows.
-///   - `error.ContextFull` → `min_rows` exceeds `max`; unrecoverable.
+///   - `null`  -> `min_rows` already fits; the caller returns without growing.
+///   - `target`-> grow the cache (and RoPE tables) to this many rows.
+///   - `error.ContextFull` -> `min_rows` exceeds `max`; unrecoverable.
 /// Single-sources the bounds-check + geometric `growTarget` that was copy-pasted
 /// (and independently bug-fixed) across every CPU and CUDA stepper.
 pub fn growPlan(cur: usize, max: usize, min_rows: usize) error{ContextFull}!?usize {
@@ -134,7 +134,7 @@ fn unpackF16(dst: []f32, buf: []const f32, base: usize, count: usize) void {
 
 /// Round to nearest, ties to EVEN. The q8_0 quantizer uses this instead of the
 /// ggml reference's roundf (ties away from zero) so the CUDA store kernels
-/// (`cvt.rni`) produce bit-identical cache bytes — a row quantized on the host
+/// (`cvt.rni`) produce bit-identical cache bytes, a row quantized on the host
 /// (offload split) matches the same row quantized on the device. Differs from
 /// ggml only on exact .5 ties. Valid for |v| < 2^22 (quants are within ±127.5).
 fn roundEven(v: f32) f32 {
@@ -145,7 +145,7 @@ fn roundEven(v: f32) f32 {
 /// Quantize `src` (f32, block-multiple length) into ggml q8_0 blocks at logical
 /// element `base` (block-aligned) of `buf`'s byte storage. Per 32-element
 /// block: d = absmax/127 stored as f16, q[i] = roundEven(x[i]/d) as i8. The
-/// byte layout is exactly ggml's block_q8_0 — the device caches' layout — so
+/// byte layout is exactly ggml's block_q8_0, the device caches' layout, so
 /// rowBytes copies stay raw.
 fn packQ80(buf: []f32, base: usize, src: []const f32) void {
     std.debug.assert(base % q8_block_elems == 0 and src.len % q8_block_elems == 0);
@@ -251,7 +251,7 @@ pub const KvCache = struct {
         }
     }
 
-    /// K rows [0, len + extra) of `layer` — `extra` covers written-but-not-yet
+    /// K rows [0, len + extra) of `layer`, `extra` covers written-but-not-yet
     /// committed tokens mid-forward. For f16 this expands into `k_scratch`.
     pub fn kView(self: *KvCache, layer: usize, extra: usize) []const f32 {
         return self.view(self.k, self.k_scratch, layer, extra);
@@ -361,7 +361,7 @@ pub const KvCache = struct {
 pub const PerLayerKvCache = struct {
     /// Backing storage: f32 slots. For f16, two logical elements pack per slot
     /// (all layer offsets are even, so `offsets` stay LOGICAL element counts and
-    /// the packed slot for logical element E is E/2 — see slotsFor/packF16).
+    /// the packed slot for logical element E is E/2, see slotsFor/packF16).
     k: []f32,
     v: []f32,
     /// f32 read scratch (one layer's block) for the f16 path; empty for f32.
@@ -381,12 +381,12 @@ pub const PerLayerKvCache = struct {
     kv_dtype: KvDtype = .f32,
     len: usize = 0,
 
-    /// Ring size of layer `l` (0 = full/linear) — read by the attention op.
+    /// Ring size of layer `l` (0 = full/linear), read by the attention op.
     pub fn ringOf(self: *const PerLayerKvCache, l: usize) usize {
         return self.rings[l];
     }
 
-    /// Largest single-layer block (logical elements) — the f16 read scratch size.
+    /// Largest single-layer block (logical elements), the f16 read scratch size.
     fn maxBlock(capacity: usize, dims: []const usize, rings: []const usize) usize {
         var m: usize = 0;
         for (dims, 0..) |d, l| {
@@ -515,8 +515,8 @@ pub const PerLayerKvCache = struct {
     /// Raw storage bytes of K rows [row, row+rows) of `layer`, addressed in the
     /// layer's own storage layout: absolute rows for full layers, ring rows
     /// (pos % ring) for ring layers. Like `KvCache.kRowBytes`, the packed f16
-    /// slots are byte-identical to a contiguous little-endian f16 array — the
-    /// device caches' exact layout — so a CUDA stepper's migrate/promote and
+    /// slots are byte-identical to a contiguous little-endian f16 array, the
+    /// device caches' exact layout, so a CUDA stepper's migrate/promote and
     /// ring-checkpoint copies stay raw (and lossless) for f32 and f16 alike.
     pub fn kRowBytes(self: *PerLayerKvCache, layer: usize, row: usize, rows: usize) []u8 {
         return self.rowBytes(self.k, layer, row, rows);
@@ -683,7 +683,7 @@ test "kRowBytes matches the device byte layout for f32 and f16" {
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(k0[2..4]), c32.vRowBytes(1, 1, 1));
 
     // f16: the packed slots must read back as a contiguous little-endian f16
-    // array — the device caches' exact layout, so migrate/promote raw copies
+    // array, the device caches' exact layout, so migrate/promote raw copies
     // are format-preserving.
     var c16 = try KvCache.init(gpa, 2, 4, 2, .f16);
     defer c16.deinit(gpa);
@@ -957,7 +957,7 @@ test "KvCache q8_0 storage: write/view round trip and device byte layout" {
 
 test "PerLayerKvCache q8_0: mixed dims, ring wrap, row bytes, grow" {
     const gpa = std.testing.allocator;
-    // Layer 0 full (dim 64), layer 1 ring of 3 rows (dim 128) — gemma4-style.
+    // Layer 0 full (dim 64), layer 1 ring of 3 rows (dim 128), gemma4-style.
     var cache = try PerLayerKvCache.init(gpa, 8, &.{ 64, 128 }, &.{ 0, 3 }, .q8_0);
     defer cache.deinit(gpa);
 

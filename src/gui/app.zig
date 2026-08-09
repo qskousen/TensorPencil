@@ -1,8 +1,8 @@
 //! tp-gui application: window, manual render loop, and the chat frame.
 //!
 //! The loop mirrors DiffKeep's hand-written SDL loop (rather than
-//! `dvui.App.run`) so that secondary windows — notably a zoom/pan viewer for
-//! generated images — can be added later without restructuring. For now there
+//! `dvui.App.run`) so that secondary windows, notably a zoom/pan viewer for
+//! generated images, can be added later without restructuring. For now there
 //! is a single window; per-window event routing is introduced when the first
 //! secondary window lands.
 const std = @import("std");
@@ -31,11 +31,11 @@ const vips = @import("vips");
 //
 // The session (LLM + optional diffusion/vision) is (re)loaded on a background
 // thread whenever settings change, so it can be swapped without a restart and
-// the UI stays responsive with a "Loading…" state. `g_session` is only read by
+// the UI stays responsive with a "Loading..." state. `g_session` is only read by
 // the UI thread while `g_loading` is false (release/acquire hand-off from the
 // loader), so the pointer swap is race-free without a lock.
 var g_session: ?*chat.Session = null;
-/// The single owner of LLM↔diffusion VRAM arbitration. Its `llm` participant is
+/// The single owner of LLM<->diffusion VRAM arbitration. Its `llm` participant is
 /// (re)bound to `g_session` under `g_session_mu` on every load/unload. Driven by
 /// the coordinator hooks (`vcEnter`/`vcExit`) and the meter policy.
 var g_arbiter: vram.Arbiter = .{};
@@ -63,7 +63,7 @@ var g_think_probe_len: usize = 0;
 var g_think_probe_result: bool = false;
 var g_think_probe_valid: bool = false;
 
-// The diffusion engine — APP-LEVEL and persistent (survives chat↔image mode
+// The diffusion engine, APP-LEVEL and persistent (survives chat<->image mode
 // switches, so the image model isn't reloaded each way). It owns the single
 // unified image queue/history shared by the chat tool-call path and the studio.
 // Built when a diffusion model is configured; its resident pipeline still loads
@@ -78,12 +78,12 @@ var g_split: f32 = 0.60;
 var g_limit: f32 = 0.95;
 // Eject (⏏) state: set when the user clicks an end button. Fully unloads that
 // model to free VRAM. If the model is busy the request stays ARMED and fires
-// once it (and the shared image queue) go idle — see maybeProcessEjects. The
+// once it (and the shared image queue) go idle, see maybeProcessEjects. The
 // meter renders the armed state (accent border) so the deferral is visible.
 var g_llm_eject_armed: bool = false;
 var g_diff_eject_armed: bool = false;
 // LLM pause is mirrored app-level so it survives an unload (the gate itself lives
-// on the Session, which is destroyed on unload — unlike the diffuser's gate,
+// on the Session, which is destroyed on unload, unlike the diffuser's gate,
 // which lives on the persistent Diffuser). The button reads this; setPaused keeps
 // the session gate in sync while one is resident. (Tier 3.)
 var g_llm_paused: bool = false;
@@ -110,9 +110,9 @@ var g_session_mu: std.Io.Mutex = std.Io.Mutex.init;
 // `syncDiffuser`/`freeDiffuser` (UI thread) publish and retract the participant
 // under it, so the worker never dereferences a freed engine.
 //
-// Lock order note: each worker thread takes exactly ONE of these two — the
+// Lock order note: each worker thread takes exactly ONE of these two, the
 // diffusion worker takes g_session_mu to reach the LLM, the LLM worker takes
-// g_diff_mu to reach diffusion — and neither ever asks for the other, so the pair
+// g_diff_mu to reach diffusion, and neither ever asks for the other, so the pair
 // cannot cycle. The UI thread is the only place both are ever held, and never
 // nested. `Diffuser.res_mu` sits below both and is only ever tryLock'd from a
 // foreign thread, so it cannot participate in a cycle either.
@@ -120,10 +120,10 @@ var g_diff_mu: std.Io.Mutex = std.Io.Mutex.init;
 
 /// on_change: fired every drag-motion frame. The meter already mutated
 /// g_split/g_limit in place; motion repaints on its own, so this is a no-op (we
-/// deliberately do NOT reshuffle VRAM mid-drag — only on release).
+/// deliberately do NOT reshuffle VRAM mid-drag, only on release).
 fn meterChanged() void {}
 
-/// on_commit: fired on drag release — persist the settled fractions and apply
+/// on_commit: fired on drag release, persist the settled fractions and apply
 /// the new policy to the live session.
 fn meterCommit() void {
     g_config.vram_split = g_split;
@@ -140,21 +140,21 @@ fn meterCommit() void {
 /// OS/desktop + CUDA-context overhead we don't control), and the split handle is
 /// the LLM's guaranteed share under contention.
 ///
-/// This used to also carry the diffusion half of the policy by hand — settle the
-/// LLM, then offer diffusion `available − (the LLM's just-shrunk usage)`. That
-/// second target algebraically cancelled to diffusion's own residency, so the
-/// image model never yielded a byte to the LLM (TODO #1). Both targets now come
+/// Carrying the diffusion half by hand does not work: settling the LLM first and then
+/// offering diffusion `available - (the LLM's just-shrunk usage)` gives a second target
+/// that algebraically cancels to diffusion's own residency, so the image model never
+/// yields a byte. Both targets come
 /// from one `Arbiter.plan`, which is also what makes the split handle mean
 /// something. No-op with no session or mid-load.
 fn applyMeterPolicy() void {
     const s = g_session orelse return;
     if (g_loading.load(.acquire)) return;
     // cuMemGetInfo reads the CALLING thread's current CUDA context, and this
-    // runs on the UI thread — which starts with none bound (the LLM's context
+    // runs on the UI thread, which starts with none bound (the LLM's context
     // is created on the loader thread). Bind it first, or the query fails and
-    // returns zeros: that silent zero used to skip `setBudgets` entirely,
-    // leaving the arbiter uninitialized (the qwen3-32B first-message
-    // mass-offload bug). Binding here is the same thing the idle-settle path
+    // returns zeros, and that silent zero skips `setBudgets` entirely, leaving the
+    // arbiter uninitialized and the first message mass-offloading. Binding here is
+    // the same thing the idle-settle path
     // (`vpApply`) already does on this thread.
     s.be.bindThread();
     const mi = s.be.ctx.memGetInfo();
@@ -168,7 +168,7 @@ fn applyMeterPolicy() void {
     // This replaced `budget = limit - system`, where `system` was the residual
     // `device_used - our_tracked`. That put an unreliable number alone on the
     // right-hand side: it is sampled here, right after a load, when our own CUDA
-    // context / JIT'd modules / library workspaces do not exist yet — so it read
+    // context / JIT'd modules / library workspaces do not exist yet, so it read
     // ~1.1 GiB low, the budget came out that much too generous, the LLM promoted
     // every layer to fill it, and the next batched allocation OOM'd and offloaded
     // them straight back. `resolve` frames the handle as a RESERVE instead, where
@@ -193,7 +193,7 @@ fn applyMeterPolicy() void {
     // High-water the untracked term: it is ~0 on a cold model and grows as modules
     // and workspaces are JIT'd/allocated. Letting it fall back would re-inflate the
     // budget mid-session and restart the promote -> OOM -> offload cycle. It is
-    // deliberately NOT reset per model load — the CUDA context and compiled modules
+    // deliberately NOT reset per model load, the CUDA context and compiled modules
     // behind most of it outlive any one session.
     const res = vram.resolve(.{ .fraction = g_limit }, card, g_untracked_high_water);
     g_untracked_high_water = res.untracked;
@@ -204,7 +204,7 @@ fn applyMeterPolicy() void {
     const share: u64 = @min(@as(u64, @intFromFloat(g_split * tf)), available);
 
     // Guarded so a direct (idle) settle can't race the diffusion worker's reclaim
-    // hook — both touch the LLM context. The diffusion half of the rebalance takes
+    // hook, both touch the LLM context. The diffusion half of the rebalance takes
     // the engine's own `res_mu` internally.
     g_session_mu.lockUncancelable(g_io);
     defer g_session_mu.unlock(g_io);
@@ -223,7 +223,7 @@ fn applyMeterPolicy() void {
 }
 
 /// Restore a persisted window geometry onto a freshly created SDL window. Size
-/// is applied first, then position (only when one was saved — otherwise SDL's
+/// is applied first, then position (only when one was saved, otherwise SDL's
 /// default placement stands), then maximize last so it overrides the rect.
 fn applyWindowGeom(window: ?*SDLBackend.c.SDL_Window, w: usize, h: usize, x: i32, y: i32, maximized: bool) void {
     _ = SDLBackend.c.SDL_SetWindowSize(window, @intCast(w), @intCast(h));
@@ -234,7 +234,7 @@ fn applyWindowGeom(window: ?*SDLBackend.c.SDL_Window, w: usize, h: usize, x: i32
 
 /// Read a window's current geometry into the given config fields, returning
 /// whether anything changed. While the window is maximized (or minimized) the
-/// size/position are left alone — the stored values keep the last *restored*
+/// size/position are left alone, the stored values keep the last *restored*
 /// geometry so un-maximizing (and the next launch) lands on a sensible rect;
 /// only the maximized flag tracks the transition.
 fn captureGeom(window: ?*SDLBackend.c.SDL_Window, w: *usize, h: *usize, x: *i32, y: *i32, maximized: *bool) bool {
@@ -274,8 +274,8 @@ fn captureGeom(window: ?*SDLBackend.c.SDL_Window, w: *usize, h: *usize, x: *i32,
 
 /// Persist window geometry that changed this frame. Geometry is pure view state,
 /// so we write the committed baseline (not the live `g_config`, which may hold
-/// mid-edit Settings text) with the current geometry overlaid — this keeps
-/// Settings → Cancel able to discard unsaved edits while a concurrent resize
+/// mid-edit Settings text) with the current geometry overlaid, this keeps
+/// Settings -> Cancel able to discard unsaved edits while a concurrent resize
 /// still sticks.
 fn saveGeometry() void {
     g_config_baseline.win_w = g_config.win_w;
@@ -316,14 +316,14 @@ fn toggleLlmPause() void {
     if (g_loading.load(.acquire)) return; // applied to the fresh gate on publish
     if (g_session) |s| {
         // Resident: drive the session gate (unpause also dispatches a turn that
-        // was queued while paused — see Session.setPaused).
+        // was queued while paused, see Session.setPaused).
         s.setPaused(now_paused);
     } else if (!now_paused) {
-        // Resuming with nothing resident: fire any load we HELD while paused — a
+        // Resuming with nothing resident: fire any load we HELD while paused, a
         // message / regenerate stashed by submitChat / requestRegenLoad (both set
         // g_reload_requested), or a suspended turn to resume. Wake a frame so
         // maybeStartReload runs now that the gate is lifted. Nothing pending ⇒
-        // nothing loads (a bare pause→resume on a cold engine is a no-op).
+        // nothing loads (a bare pause->resume on a cold engine is a no-op).
         if (g_reload_requested or g_pending_submit != null or g_pending_regenerate or g_llm_suspend != null) {
             g_reload_requested = true;
             wakeupFrame();
@@ -341,7 +341,7 @@ fn toggleDiffPause() void {
 }
 
 /// Main-loop hook: carry out any armed eject once ITS OWN model is idle. Each
-/// model ejects independently — the LLM can drop while diffusion is still
+/// model ejects independently, the LLM can drop while diffusion is still
 /// generating (it isn't generating anything, so there's nothing to wait for),
 /// and vice versa. A model that's busy when clicked stays armed and ejects the
 /// moment it finishes.
@@ -352,7 +352,7 @@ fn maybeProcessEjects() void {
                 // Unload-while-paused (Tier 3): snapshot the in-flight image to
                 // host, then free the weights and KEEP the queue (incl. the
                 // suspended image), which resumes on unpause. Free even with
-                // pending images — they're parked by the pause gate anyway.
+                // pending images, they're parked by the pause gate anyway.
                 if (d.busyNow()) {
                     d.requestSuspend(); // worker snapshots + exits; poll next frame
                 } else {
@@ -378,7 +378,7 @@ fn maybeProcessEjects() void {
                 // unload once it clears below.
                 s.requestSuspend();
             } else if (!s.busy()) {
-                // Fire as soon as the LLM itself is idle — do NOT wait on
+                // Fire as soon as the LLM itself is idle, do NOT wait on
                 // diffusion. The worker only touches the session through the
                 // coordinator hooks, which unloadLlm serializes with g_session_mu.
                 // If we suspended a mid-turn response, carry its raw `ids` so the
@@ -415,10 +415,10 @@ fn freeLlmSuspend() void {
 
 /// Fully unload the LLM (free its VRAM) while KEEPING the conversation: the
 /// transcript is detached into `g_carry` (rendered read-only until a message
-/// reloads + replays it — see renderMessages), never wiped. Runs synchronously
+/// reloads + replays it, see renderMessages), never wiped. Runs synchronously
 /// on the UI thread (LLM is idle here); the teardown is serialized with the
 /// diffusion worker's session access via `g_session_mu`. A model swap / new-chat
-/// is unaffected — only a "new chat" click ever resets the transcript.
+/// is unaffected, only a "new chat" click ever resets the transcript.
 fn unloadLlm() void {
     const s = g_session orelse return;
     if (s.worker) |t| { // idle here, but be safe
@@ -556,7 +556,7 @@ pub fn run(init: std.process.Init) !void {
 
     g_wakeup_event_type = SDLBackend.c.SDL_RegisterEvents(1);
 
-    // The LLM is NOT loaded at startup — it lazy-loads on the first chat message
+    // The LLM is NOT loaded at startup, it lazy-loads on the first chat message
     // (see submitChat). Build the app-level diffusion engine now if a model is
     // configured (its pipeline still loads lazily on the first image).
     image_view.setEnv(g_gpa, g_io, wakeupFrame);
@@ -594,7 +594,7 @@ pub fn run(init: std.process.Init) !void {
         maybeStartReload();
         maybeRefreshMeterPolicy();
         // Pump the app-level diffusion engine every frame (both modes; even under
-        // Settings) so an in-flight generation finishes — it drains its own
+        // Settings) so an in-flight generation finishes, it drains its own
         // unified queue. Gated on !loading so no diffusion worker touches the
         // session while the LLM (re)loads (see maybeStartReload).
         if (!g_loading.load(.acquire)) if (g_diffuser) |*d| d.pump();
@@ -657,7 +657,7 @@ pub fn run(init: std.process.Init) !void {
                     break :vblk null;
                 };
                 // Restore the viewer window's saved geometry (created hidden, so
-                // this lands before it's first shown — no flash).
+                // this lands before it's first shown, no flash).
                 if (g_viewer) |v| applyWindowGeom(v.back.window, g_config.viewer_w, g_config.viewer_h, g_config.viewer_x, g_config.viewer_y, g_config.viewer_max);
             }
         }
@@ -732,7 +732,7 @@ fn sdlEventWindowID(event: SDLBackend.c.SDL_Event) u32 {
 }
 
 /// Can the next message carry an image? True when a vision tower is resident,
-/// or — before the lazy first-message load — when the configured model has one
+/// or, before the lazy first-message load, when the configured model has one
 /// (an mmproj path is set alongside an LLM). Lets drop/paste and "Discuss this
 /// image" work as the first message, staging into `g_staged_images` until the
 /// session comes up. While a load is in flight the session is off-limits to the
@@ -823,7 +823,7 @@ fn configuredSupportsThinking() bool {
 }
 
 /// Read the configured GGUF's architecture and map it to reasoning support.
-/// Any failure (missing/unreadable file, unknown arch) → false.
+/// Any failure (missing/unreadable file, unknown arch) -> false.
 fn probeThinking(path: []const u8) bool {
     var gg = tp.Gguf.open(g_gpa, g_io, path) catch return false;
     defer gg.deinit();
@@ -832,7 +832,7 @@ fn probeThinking(path: []const u8) bool {
     return tp.llm.chat.familySupportsThinking(fam);
 }
 
-/// A file was dropped on the window: decode it (libvips → RGB) and attach it
+/// A file was dropped on the window: decode it (libvips -> RGB) and attach it
 /// to the next message for the model to see.
 fn handleDropFile(path: []const u8) void {
     if (g_loading.load(.acquire)) return; // session being rebuilt on the loader thread
@@ -904,11 +904,11 @@ fn frame() void {
 
     if (g_view == .image) {
         // Generation is gated only while an LLM (re)load is in flight (the pump
-        // is paused then). The studio doesn't need the LLM — both stay resident.
+        // is paused then). The studio doesn't need the LLM, both stay resident.
         const ready = !g_loading.load(.acquire);
         const d: ?*diffuser.Diffuser = if (g_diffuser) |*dd| dd else null;
         // Cap the studio to leave the status bar its row at the bottom (same
-        // VRAM/LLM/diffusion readout as chat — we want it in both views).
+        // VRAM/LLM/diffusion readout as chat, we want it in both views).
         const h = @max(120, root.data().contentRect().h - status_bar.bar_height);
         {
             var area = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .min_size_content = .{ .h = h }, .max_size_content = .height(h) });
@@ -916,20 +916,20 @@ fn frame() void {
             image_view.render(&g_config, d, ready, .{ .to_chat = enterChatMode, .settings = openSettings });
         }
         // `ready` == !g_loading: only touch the session when no reload is tearing
-        // it down on the loader thread (same invariant as the chat view).
+        // it down on the loader thread (same rule as the chat view).
         status_bar.render(if (ready) g_session else null, diffBusy(), diffVram(), &g_split, &g_limit, g_llm_eject_armed, g_diff_eject_armed, llmPaused(), diffPaused(), meterActions());
         return;
     }
 
     // Chat view. A background (re)load never takes over the screen: the layout
     // stays put, the just-sent message shows as a normal user bubble, and the
-    // assistant slot shows a small "Loading…" until the session is live (see
+    // assistant slot shows a small "Loading..." until the session is live (see
     // renderMessages). No spinner flashing in and out.
     const loading = g_loading.load(.acquire);
     // While a (re)load is in flight the loader thread is tearing down / rebuilding
     // g_session on its own thread, so the UI MUST NOT dereference the session
     // pointer (the release/acquire hand-off only guarantees it valid when
-    // g_loading is false — see the g_session doc comment). Treat it as unavailable
+    // g_loading is false, see the g_session doc comment). Treat it as unavailable
     // and fall back to the carried transcript; otherwise a backend switch that
     // triggers a reload use-after-frees the session mid-frame. (This is why every
     // session-consuming render below takes `s_ui`, not `g_session`.)
@@ -937,7 +937,7 @@ fn frame() void {
 
     // Show the "no model" notice when there's genuinely nothing configured, OR
     // when the last load failed (e.g. a non-mmproj file in the vision-tower slot
-    // → error.MmprojNotVisionTower): the session load returns the error, so there
+    // -> error.MmprojNotVisionTower): the session load returns the error, so there
     // is NO working session at all and renderNoModel surfaces `g_load_err`. Both
     // are terminal null-session states; during a load `loading` is set so the
     // transiently-null session never trips this.
@@ -971,8 +971,8 @@ fn diffVram() diffuser.VramBreakdown {
 }
 
 /// Chat view while the session (re)loads on the background thread.
-/// A small "Loading…" bubble shown in the assistant response slot while the
-/// model (re)loads — same left-leaning neutral style as a real assistant turn,
+/// A small "Loading..." bubble shown in the assistant response slot while the
+/// model (re)loads, same left-leaning neutral style as a real assistant turn,
 /// with a spinner. Replaced by the real streaming response the instant the
 /// session is live.
 fn loadingAssistantBubble() void {
@@ -991,7 +991,7 @@ fn loadingAssistantBubble() void {
 
 /// Assistant slot for a message sent while the LLM is paused with nothing
 /// resident: no spinner (nothing is loading), just a paused hint. The load +
-/// generation fire on resume — see toggleLlmPause → maybeStartReload.
+/// generation fire on resume, see toggleLlmPause -> maybeStartReload.
 fn queuedAssistantBubble() void {
     const theme = dvui.themeGet();
     var bubble = dvui.box(@src(), .{ .dir = .horizontal }, .{
@@ -1002,7 +1002,7 @@ fn queuedAssistantBubble() void {
         .padding = dvui.Rect.all(10),
     });
     defer bubble.deinit();
-    // richLabel (not dvui.label) so the ⏸ routes to the emoji face — the prose
+    // richLabel (not dvui.label) so the ⏸ routes to the emoji face, the prose
     // font (NotoSansCJK) has no media-control glyphs. See fonts.isEmoji.
     fonts.richLabel(@src(), "⏸ queued — resume to generate", .{ .gravity_y = 0.5, .color_text = theme.text.lerp(theme.fill, 0.4) });
 }
@@ -1058,20 +1058,20 @@ fn diffuserCollect(_: *anyopaque, buf: *std.ArrayList(*chat.GenImage)) void {
 // is one, else no-ops (diffusion has the device to itself). The engine owns its
 // queue directly now, so there is no source hook.
 fn vcEnter(_: *anyopaque) void {
-    // Image queue started → the arbiter drives the LLM down to its share. Under
+    // Image queue started -> the arbiter drives the LLM down to its share. Under
     // the lock: an idle LLM is settled directly on this (UI) thread, which must
     // not race the diffusion worker's reclaim hook (both touch the LLM context).
     // A busy LLM is only published to its control point (an atomic) and yields at
-    // its next token — the fix for the old "no-op while generating" bug.
+    // its next token, the fix for the old "no-op while generating" bug.
     g_session_mu.lockUncancelable(g_io);
     defer g_session_mu.unlock(g_io);
     g_arbiter.setDiffusionActive(true);
 }
 fn vcExit(_: *anyopaque) void {
-    // Queue drained → idle. The image model's residency becomes opportunistic
-    // cache, so the LLM gets priority over it again — one rebalance now settles
-    // BOTH sides (this used to be a `setDiffusionActive` plus a separate
-    // hand-written diffusion trim, whose two passes disagreed).
+    // Queue drained -> idle. The image model's residency becomes opportunistic
+    // cache, so the LLM gets priority over it again. One rebalance settles BOTH
+    // sides: a `setDiffusionActive` plus a separate hand-written diffusion trim is
+    // two passes that disagree.
     //
     // The flag is set directly rather than via `setDiffusionActive` so the ceiling
     // re-resolve below is what triggers the single rebalance; flipping it first
@@ -1103,7 +1103,7 @@ fn persistDiffPeak() void {
 }
 
 fn vcBudget(_: *anyopaque) u64 {
-    // Called on the diffusion WORKER thread — serialize with a concurrent LLM
+    // Called on the diffusion WORKER thread, serialize with a concurrent LLM
     // eject (unloadLlm) that may be freeing the session right now. Pure read.
     g_session_mu.lockUncancelable(g_io);
     defer g_session_mu.unlock(g_io);
@@ -1126,7 +1126,7 @@ fn appCoordinator() diffuser.VramCoordinator {
 // allocation that didn't fit under a resident-but-idle image model had no way to
 // reach that model's bytes (separate device contexts, and LLM weights are all
 // pinned so its own eviction ladder reclaims nothing), so the turn died with
-// DeviceOutOfMemory — the "llm sometimes ooms when diffusion is loaded" report.
+// DeviceOutOfMemory, the "llm sometimes ooms when diffusion is loaded" report.
 //
 // Runs on the LLM WORKER thread, as the last rung of `cuda.Backend`'s OOM ladder.
 // It does NOT take `g_session_mu`: the LLM session cannot be freed underneath its
@@ -1138,7 +1138,7 @@ fn llmForeignReclaim(_: *anyopaque, needed: u64) u64 {
     return g_arbiter.requestRoom(.llm, needed);
 }
 
-/// Whether a diffusion model is configured. ONE path — the primary checkpoint —
+/// Whether a diffusion model is configured. ONE path, the primary checkpoint,
 /// is the requirement; the text encoder and VAE are overrides for whatever it
 /// does not carry itself (see `config.diffEnabled`, and `model_spec.missing` for
 /// the advisory "is this set actually complete" preview the settings screen
@@ -1152,7 +1152,7 @@ fn hasDiffModel(cfg: *const config.Config) bool {
 /// (live swap), so the two cannot drift as components are added.
 ///
 /// "" = not overridden; the pipeline resolves that component out of the primary
-/// checkpoint. Never substitute a default here — a defaulted path that reaches
+/// checkpoint. Never substitute a default here, a defaulted path that reaches
 /// `Options` is indistinguishable from a user request, which is what broke a
 /// joined SD1.5 checkpoint in the CLI.
 fn modelConfigFromConfig() diffuser.ModelConfig {
@@ -1248,7 +1248,7 @@ fn freeDiffuser() void {
         // Drop the arbiter's participant FIRST: it borrows the engine we are about
         // to free, and the LLM's worker thread can be reading it right now through
         // `llmForeignReclaim`. Mirrors `g_arbiter.llm = null` on the LLM side.
-        // `diff_active` goes with it — we tear down without pumping, so the
+        // `diff_active` goes with it, we tear down without pumping, so the
         // queue-drain edge that normally clears it never fires, and a stale `true`
         // would keep the LLM pinned to its share with nothing left to use the rest.
         g_diff_mu.lockUncancelable(g_io);
@@ -1268,7 +1268,7 @@ fn freeDiffuser() void {
     }
 }
 
-/// Mode switches are PURE VIEW changes — they never free, unload, or reload a
+/// Mode switches are PURE VIEW changes, they never free, unload, or reload a
 /// model. Both the LLM and the diffusion engine stay resident across switches;
 /// VRAM is shared live via the split (the meter handle), so toggling touches no
 /// GPU state and can't leak or mis-budget. The transcript is always intact
@@ -1283,7 +1283,7 @@ fn enterChatMode() void {
 /// Apply button: persist settings, reconcile the app-level diffusion engine,
 /// and apply everything else WITHOUT wiping the chat. A change that alters the
 /// LLM load or the image-tool availability (which changes the system prompt)
-/// forces a transcript-preserving reload — but only if the LLM is currently
+/// forces a transcript-preserving reload, but only if the LLM is currently
 /// resident; if it hasn't lazy-loaded yet, the new config is simply picked up on
 /// the first message.
 fn applyConfig() void {
@@ -1292,7 +1292,7 @@ fn applyConfig() void {
     // The diffusion engine is shared by both modes; reconcile it either way.
     syncDiffuser();
 
-    // A system-prompt edit applies live on a render-driven (template) session —
+    // A system-prompt edit applies live on a render-driven (template) session,
     // updateSettings restages it and the next message re-renders (TODO #8). A
     // hand-glue session bakes the system into the prompt prefix, so it needs a
     // transcript-preserving reload instead.
@@ -1326,9 +1326,9 @@ fn applyConfig() void {
 }
 
 /// Toolbar reasoning toggle: flip whether the model reasons before answering,
-/// persist it, and push it into the running session live (no reload — it only
+/// persist it, and push it into the running session live (no reload, it only
 /// shapes the next prompt built). Keeps the baseline in sync so a later
-/// Settings → Cancel doesn't resurrect the old value.
+/// Settings -> Cancel doesn't resurrect the old value.
 fn toggleReasoning() void {
     g_config.reasoning = !g_config.reasoning;
     g_config_baseline.reasoning = g_config.reasoning;
@@ -1355,14 +1355,14 @@ var g_untracked_high_water: u64 = 0;
 /// Main-loop hook: re-resolve the meter policy when the LLM finishes a turn.
 ///
 /// The arbiter's residency targets come from `residency.demand`, and for an
-/// LLM-only session the plan behind them was computed exactly once — at load,
+/// LLM-only session the plan behind them was computed exactly once, at load,
 /// when the model is COLD. Its RoPE tables, activation/logits scratch and dequant
 /// buffers are not allocated until the first forward, so `demand`'s cold bound
 /// cannot see them and reports less than full residency costs. That
 /// under-estimate then sticks as the ceiling for the whole session: the LLM
 /// offloads layers to obey a target below its real footprint while GiBs of the
 /// card sit unused (measured on gemma4-31B: target 19796 MiB against a 21527 MiB
-/// budget — 6/60 layers pushed to the host with 2 GiB idle).
+/// budget, 6/60 layers pushed to the host with 2 GiB idle).
 ///
 /// Re-planning at a turn boundary keeps residency tracking a budget that moves:
 /// `system` steps once as our untracked CUDA/library footprint materializes, and
@@ -1399,7 +1399,7 @@ fn maybeStartReload() void {
             // Move any images staged before the lazy load into the fresh session
             // (BEFORE the deferred submit, so the first message carries them). If
             // the load failed (no session) or the model has no vision tower, drop
-            // them — attachImage no-ops without a tower.
+            // them, attachImage no-ops without a tower.
             if (g_session) |s| {
                 for (g_staged_images.items) |st|
                     s.attachImage(st.rgb, st.width, st.height) catch |err| std.log.err("attach staged image: {t}", .{err});
@@ -1430,10 +1430,10 @@ fn maybeStartReload() void {
     if (!g_reload_requested or g_loading.load(.acquire) or g_loader != null) return;
     // Paused with nothing resident: HOLD the load. A message / regenerate / turn
     // queued while paused keeps `g_reload_requested` set but loads NOTHING until
-    // the user resumes (toggleLlmPause kicks this the moment the gate lifts) —
+    // the user resumes (toggleLlmPause kicks this the moment the gate lifts),
     // mirroring the diffusion side, where Diffuser.pump defers loads while paused.
     if (g_llm_paused and g_session == null) return;
-    // The LLM (re)loads CONCURRENTLY with diffusion — a running image keeps
+    // The LLM (re)loads CONCURRENTLY with diffusion, a running image keeps
     // generating on its own context while the LLM builds on a fresh one, so a
     // chat sent mid-image loads and responds right away instead of waiting for
     // the image. The only shared state is the session pointer, which the loader's
@@ -1452,7 +1452,7 @@ fn maybeStartReload() void {
 }
 
 /// Background (re)load: tear down the old session, then build a new one from
-/// `g_config`. Runs on its own thread — creates the CUDA context there; the
+/// `g_config`. Runs on its own thread, creates the CUDA context there; the
 /// generation/diffusion workers bind to it as before. On completion it publishes
 /// `g_session` and clears `g_loading` (release) so the UI thread can adopt it.
 fn loaderMain() void {
@@ -1469,7 +1469,7 @@ fn loaderMain() void {
         }
         // Diffusion may be generating concurrently (its worker reads the session
         // via the coordinator hooks), so serialize the teardown with
-        // `g_session_mu` — the same guard unloadLlm uses. The transcript is
+        // `g_session_mu`, the same guard unloadLlm uses. The transcript is
         // detached (carried) so the chat survives the swap.
         g_session_mu.lockUncancelable(g_io);
         g_carry = s.detachTranscript();
@@ -1585,8 +1585,8 @@ fn buildSession(arena: std.mem.Allocator) !*chat.Session {
         .gemma4_canonical_template = g_config.gemma4_canonical_template,
     });
     // Let this LLM's OOM ladder reach the image model's device context as its last
-    // rung (see llmForeignReclaim). Installed on the session's own backend — the
-    // same instance the stepper allocates through (`be` is a pointer) — as soon as
+    // rung (see llmForeignReclaim). Installed on the session's own backend, the
+    // same instance the stepper allocates through (`be` is a pointer), as soon as
     // it exists, so it also covers device work done before the session is
     // published. It dies with the session, so it can never outlive the arbiter
     // entry `loaderMain` adds.
@@ -1630,7 +1630,7 @@ fn renderMessages(s: ?*chat.Session, list_h: f32, loading: bool) void {
 
         // With no live session, fall back to the CARRIED transcript (present when
         // the LLM was ejected / is between loads) so the conversation stays on
-        // screen read-only and is never visually "reset" — only a "new chat"
+        // screen read-only and is never visually "reset", only a "new chat"
         // click clears it. It reloads + replays on the next message.
         const msgs: []chat.Message = if (s) |ss| ss.messages.items else if (g_carry) |c| c.items else &.{};
         if (msgs.len == 0 and !loading and g_pending_submit == null) {
@@ -1644,17 +1644,17 @@ fn renderMessages(s: ?*chat.Session, list_h: f32, loading: bool) void {
             for (msgs, 0..) |*m, idx| renderMessage(s, m, idx);
         }
         // While the model (re)loads in the background: the just-sent message
-        // (not yet in the transcript — it submits once the session is live) shows
-        // as a normal user bubble, and the assistant slot shows a small "Loading…"
+        // (not yet in the transcript, it submits once the session is live) shows
+        // as a normal user bubble, and the assistant slot shows a small "Loading..."
         // The instant the session is ready these are replaced by the real turn.
         if (loading) {
             if (g_pending_submit) |txt| pendingUserBubble(txt);
             loadingAssistantBubble();
         } else if (g_llm_paused) {
             // Paused with nothing resident: the just-sent message is HELD (no load
-            // at all) until resume. Show it + a paused hint rather than "Loading…"
+            // at all) until resume. Show it + a paused hint rather than "Loading..."
             // or the empty-state placeholder. (Session-resident pause is Tier 2,
-            // shown inline per-message above — g_pending_submit is null then.)
+            // shown inline per-message above, g_pending_submit is null then.)
             if (g_pending_submit) |txt| {
                 pendingUserBubble(txt);
                 queuedAssistantBubble();
@@ -1699,9 +1699,9 @@ fn pendingUserBubble(text: []const u8) void {
     markdown_view.render(@src(), text, .{});
 }
 
-/// Spinner + "Processing…": the model is working on this turn but has produced
+/// Spinner + "Processing...": the model is working on this turn but has produced
 /// no visible text yet. See `renderMessage` for why this is distinct from the
-/// session-load "Loading…" bubble.
+/// session-load "Loading..." bubble.
 fn processingRow(theme: dvui.Theme) void {
     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{});
     defer row.deinit();
@@ -1711,7 +1711,7 @@ fn processingRow(theme: dvui.Theme) void {
 
 /// The assistant bubble's body when there is nothing to show and nothing is
 /// running: a generation error, or a turn queued behind a paused LLM.
-/// (The live case is the "Processing…" spinner in `renderMessage`.)
+/// (The live case is the "Processing..." spinner in `renderMessage`.)
 fn renderEmptyAssistant(s: ?*chat.Session, theme: dvui.Theme, idx: usize) void {
     var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal });
     defer tl.deinit();
@@ -1719,9 +1719,9 @@ fn renderEmptyAssistant(s: ?*chat.Session, theme: dvui.Theme, idx: usize) void {
         var msg: [128]u8 = undefined;
         fonts.addRich(tl, std.fmt.bufPrint(&msg, "⚠ generation error: {t}", .{err}) catch "⚠ generation error");
     } else if (idx + 1 == (if (s) |ss| ss.messages.items.len else 0) and (if (s) |ss| ss.isPaused() else false)) {
-        // A turn queued while the LLM is paused — it runs on resume (Tier 2).
+        // A turn queued while the LLM is paused, it runs on resume (Tier 2).
         // addStyled (not addText) routes the ⏸ to the emoji face (NotoSansCJK
-        // lacks media-control glyphs — see fonts.isEmoji).
+        // lacks media-control glyphs, see fonts.isEmoji).
         fonts.addStyled(tl, "⏸ queued — resume to generate", .{}, .{ .color_text = theme.text.lerp(theme.fill, 0.4) });
     }
 }
@@ -1760,7 +1760,7 @@ fn renderMessage(s: ?*chat.Session, m: *chat.Message, idx: usize) void {
     // last assistant response switches it; older takes stay stored).
     const v = m.activeConst();
     const p = parseThink(v.text.items, v.thought_primed);
-    // Only the last assistant message is actively generating; "Thinking…" means
+    // Only the last assistant message is actively generating; "Thinking..." means
     // the block is still open AND generation is live. A think block left open
     // because generation stopped (e.g. hit max tokens) reads "Thoughts". With no
     // live session (carried transcript), nothing is generating.
@@ -1769,21 +1769,21 @@ fn renderMessage(s: ?*chat.Session, m: *chat.Message, idx: usize) void {
     // The model is working but has not emitted a single token yet: prompt
     // processing (prefill), plus the short gap before the first token.
     //
-    // ⚠️ This is tested BEFORE the thought block, and that ordering is the whole
+    // This is tested BEFORE the thought block, and that ordering is the whole
     // point. When reasoning is on the chat template PRIMES `<think>` into the
     // prompt, so `parseThink` reports a non-null (empty) thought and
-    // `p.thinking = true` from the very FIRST frame — before generation has
+    // `p.thinking = true` from the very FIRST frame, before generation has
     // produced anything. Checking the thought first therefore jumped straight
-    // from "Loading…" to "Thinking…" and displayed prompt processing as
+    // from "Loading..." to "Thinking..." and displayed prompt processing as
     // reasoning. Raw variant text being empty is the honest signal.
     const nothing_yet = live and v.text.items.len == 0 and m.role == .assistant;
 
     if (nothing_yet) {
-        // ⚠️ Deliberately a DIFFERENT word from the session-load "Loading…"
+        // Deliberately a DIFFERENT word from the session-load "Loading..."
         // bubble: they are different phases with different costs, and a user
-        // reads one unchanging spinner as one thing. "Loading…" is reading the
+        // reads one unchanging spinner as one thing. "Loading..." is reading the
         // checkpoint and uploading weights to VRAM (chat.zig warms those up front
-        // so they land in that phase, not this one); "Processing…" is per-turn
+        // so they land in that phase, not this one); "Processing..." is per-turn
         // work that scales with the prompt.
         processingRow(theme);
     }
@@ -1791,8 +1791,8 @@ fn renderMessage(s: ?*chat.Session, m: *chat.Message, idx: usize) void {
     // Reasoning: collapse the thought block behind an expander, default
     // collapsed. The label doubles as a "thinking" indicator while the block is
     // still open. An empty thought (e.g. a model that opened and closed the
-    // channel with nothing inside) shows no bubble at all — unless it's still
-    // actively streaming, where "Thinking…" is the right cue.
+    // channel with nothing inside) shows no bubble at all, unless it's still
+    // actively streaming, where "Thinking..." is the right cue.
     if (p.think) |think| {
         if (!nothing_yet and (think.len > 0 or (p.thinking and live))) {
             if (dvui.expander(@src(), if (p.thinking and live) "Thinking…" else "Thoughts", .{ .default_expanded = false }, .{})) {
@@ -1817,7 +1817,7 @@ fn renderMessage(s: ?*chat.Session, m: *chat.Message, idx: usize) void {
     if (p.answer.len > 0) {
         renderAnswer(p.answer);
         // Selection copies rendered text; this copies the raw markdown of
-        // the whole reply (assistant messages only — a user's own text is
+        // the whole reply (assistant messages only, a user's own text is
         // already in their hands).
         if (!is_user) {
             var wd: dvui.WidgetData = undefined;
@@ -1847,7 +1847,7 @@ fn renderMessage(s: ?*chat.Session, m: *chat.Message, idx: usize) void {
     renderStatsFooter(v.stats, is_user);
 
     // ‹ n/m › navigation on the LAST assistant response (TODO #3): ‹ shows the
-    // previous take, › the next — or, on the newest take, regenerates a fresh
+    // previous take, › the next, or, on the newest take, regenerates a fresh
     // one. Hidden while generating (Stop is the control then). Shown even with
     // NO live session (carried read-only transcript): ‹/› just switch the shown
     // take, and › regenerate lazy-loads the LLM first (see renderVariantNav).
@@ -1869,7 +1869,7 @@ fn renderMessage(s: ?*chat.Session, m: *chat.Message, idx: usize) void {
 
 /// A message's stats line: dim, small, and right-aligned so it reads as a
 /// margin note on the bubble rather than as content. Draws nothing at all
-/// until there is something measured — a bubble that has only just appeared
+/// until there is something measured, a bubble that has only just appeared
 /// (or a transcript carried across a model swap) would otherwise show a row of
 /// zeros. The strings come from `turn_stats`, which is where they're tested.
 fn renderStatsFooter(st: chat.TurnStats, is_user: bool) void {
@@ -1951,15 +1951,15 @@ fn renderVariantNav(s: ?*chat.Session, m: *chat.Message) void {
         "Next response");
 }
 
-/// Render answer text as markdown with `<image>…</image>` tool-call tags
+/// Render answer text as markdown with `<image>...</image>` tool-call tags
 /// hidden (the images render separately). Uses the same line-anchored matcher
 /// as the generation scanner (`chat.nextImageCall`), so a call that fires is
-/// exactly a call that's hidden — a casual inline mention of the tag stays
+/// exactly a call that's hidden, a casual inline mention of the tag stays
 /// visible text. A still-streaming, unterminated call hides everything from
 /// it onward. Stripped text is assembled in the frame arena so the markdown
 /// parser sees one contiguous document (blocks may span a hidden call).
 fn renderAnswer(text: []const u8) void {
-    // Common case: no tool call anywhere — render the original slice.
+    // Common case: no tool call anywhere, render the original slice.
     var display = text;
     switch (toolcall.nextImageCall(text)) {
         .none => {},
@@ -2065,7 +2065,7 @@ fn renderGenImage(s: ?*chat.Session, gi: *chat.GenImage, gi_idx: usize) void {
             if (dvui.button(@src(), "Cancel", .{}, .{ .margin = .{ .y = 4 } })) {
                 gi.cancel.store(true, .release);
                 gi.wake();
-                // If we're paused, the worker is parked at the gate — wake it so
+                // If we're paused, the worker is parked at the gate, wake it so
                 // it re-checks this image's cancel flag now, not on resume.
                 if (g_diffuser) |*d| d.wakePaused();
             }
@@ -2113,7 +2113,7 @@ fn renderGenImage(s: ?*chat.Session, gi: *chat.GenImage, gi_idx: usize) void {
         },
         .failed => {
             // Name the cause. "failed" alone is unactionable, and the most
-            // common cause here — VRAM — is one the user can actually fix
+            // common cause here, VRAM, is one the user can actually fix
             // (unload the LLM, drop the resolution) and then retry into.
             var fbuf: [160]u8 = undefined;
             const msg = if (gi.failure()) |err|
@@ -2135,7 +2135,7 @@ fn renderGenImage(s: ?*chat.Session, gi: *chat.GenImage, gi_idx: usize) void {
 /// "Try again" for a failed or canceled image: re-queues it IN PLACE, so this
 /// same tile turns back into a progress bar rather than a second image
 /// appearing. Retrying picks up the CURRENT model/backend (see `Diffuser.retry`)
-/// — which is the point, since the usual fix for the usual failure is to change
+/// which is the point, since the usual fix for the usual failure is to change
 /// something first.
 fn retryButton(gi: *chat.GenImage) void {
     if (g_diffuser) |*d| {
@@ -2144,7 +2144,7 @@ fn retryButton(gi: *chat.GenImage) void {
     }
 }
 
-/// A compact metadata line (resolution · seed) plus a collapsed-by-default
+/// A compact metadata line (resolution * seed) plus a collapsed-by-default
 /// prompt expander, shown under an image in every state. Uses the actual output
 /// dimensions once known, else the requested ones; the seed is shown once
 /// assigned (non-zero).
@@ -2166,8 +2166,8 @@ fn genInfo(gi: *chat.GenImage) void {
             0;
         break :blk std.fmt.bufPrint(&buf, "{d}×{d}  ·  {d} steps  ·  seed {d}  ·  {d:.2} s/step  ·  {d:.1}s total", .{ w, h, gi.req_steps, gi.req_seed, sps, total_s }) catch "";
     } else std.fmt.bufPrint(&buf, "{d}×{d}  ·  {d} steps  ·  seed {d}", .{ w, h, gi.req_steps, gi.req_seed }) catch "";
-    // Rendered through a text layout (not a plain label) so the metadata —
-    // seed especially — is mouse-selectable.
+    // Rendered through a text layout (not a plain label) so the metadata,
+    // seed especially, is mouse-selectable.
     fonts.richLabel(@src(), meta, .{ .margin = .{ .y = 2 } });
     if (dvui.expander(@src(), "Prompt", .{ .default_expanded = false }, .{})) {
         var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .padding = .{ .x = 6, .y = 2, .w = 6, .h = 4 } });
@@ -2179,13 +2179,13 @@ fn genInfo(gi: *chat.GenImage) void {
 const Parsed = struct { think: ?[]const u8, answer: []const u8, thinking: bool };
 
 /// Split an assistant message into its reasoning block and the answer, using
-/// the active model family's thought markers (chat.reasoning() — e.g. Qwen's
-/// `<think>…</think>`, Gemma 4's `<|channel>thought…<channel|>`). The markers
+/// the active model family's thought markers (chat.reasoning(), e.g. Qwen's
+/// `<think>...</think>`, Gemma 4's `<|channel>thought...<channel|>`). The markers
 /// themselves are dropped. `thinking` is true while the block is still open (no
 /// close marker yet). Families that don't reason return everything as answer.
 ///
 /// `primed` says the prompt already opened the block, so the generated text
-/// starts INSIDE the thought and never emits an opening marker — the render-driven
+/// starts INSIDE the thought and never emits an opening marker, the render-driven
 /// (template) path does exactly that. It is recorded per variant at generation
 /// time (`Variant.thought_primed`), because a session can render both ways over
 /// its lifetime. See `toolcall.splitThought`, which owns the rule so the display
@@ -2286,7 +2286,7 @@ fn renderInput(s: ?*chat.Session) void {
     })) enterImageMode();
     hint.hover(@src(), &wd, "Image studio — text-to-image without chat");
 
-    // Reasoning toggle (no brain icon in entypo — a lit bulb reads as
+    // Reasoning toggle (no brain icon in entypo, a lit bulb reads as
     // "thinking"). Shown for any model whose family can reason (Gemma 3 etc.
     // hide it). A live session's loaded family is authoritative; before the
     // lazy first-message load we probe the configured model's GGUF so the toggle
@@ -2366,7 +2366,7 @@ fn renderInput(s: ?*chat.Session) void {
         // and shove the Send button off-screen. Capping max_size_content.w
         // clamps the *reported* min (minSizeSetAndRefresh) while expand still
         // stretches the entry to the real available width and break_lines wraps
-        // at that width — so no horizontal scroll and Send never collapses.
+        // at that width, so no horizontal scroll and Send never collapses.
         .max_size_content = .size(.{ .w = 160, .h = 140 }),
     });
     g_input_id = te.data().id;
@@ -2408,7 +2408,7 @@ fn renderInput(s: ?*chat.Session) void {
 fn submitChat(text: []const u8) void {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
     if (trimmed.len == 0) return;
-    // Never touch the session while a (re)load is in flight — the loader thread is
+    // Never touch the session while a (re)load is in flight, the loader thread is
     // freeing/rebuilding it. Submit only when it's live; otherwise stash the text
     // and the load-completion path (maybeStartReload) auto-submits it.
     if (!g_loading.load(.acquire)) if (g_session) |s| {
@@ -2434,8 +2434,8 @@ fn requestRegenLoad() void {
 /// reset; generated images live in the engine's shared history and stay in the
 /// studio gallery (and the viewer keeps working). No-op if no session is loaded.
 fn newChat() void {
-    if (!g_loading.load(.acquire)) if (g_session) |s| s.reset(); // session being rebuilt → g_carry clear below suffices
-    // If the LLM is ejected, the transcript lives in g_carry — clear it too so
+    if (!g_loading.load(.acquire)) if (g_session) |s| s.reset(); // session being rebuilt -> g_carry clear below suffices
+    // If the LLM is ejected, the transcript lives in g_carry, clear it too so
     // "new chat" starts fresh even while unloaded. (No-op when a session is
     // live, since g_carry is null then.)
     freeCarry();

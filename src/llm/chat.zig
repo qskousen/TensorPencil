@@ -8,7 +8,7 @@
 //! block, and no implicit default system prompt.
 //!
 //! User text is tokenized with the same special-token scanner as everything
-//! else, so a prompt containing e.g. "<|im_end|>" maps to the special id —
+//! else, so a prompt containing e.g. "<|im_end|>" maps to the special id,
 //! matching transformers' behavior with special tokens left unescaped.
 
 const std = @import("std");
@@ -28,13 +28,13 @@ pub var pad: u32 = tokenizer_mod.pad_token;
 pub var newline: u32 = newline_id;
 /// Raw end-of-sequence id, when the vocab declares one distinct from `turn_end`
 /// (`tokenizer.ggml.eos_token_id`). Some finetunes end a turn on `<eos>` rather
-/// than the turn marker, so `isStop` accepts it too — otherwise generation runs
+/// than the turn marker, so `isStop` accepts it too, otherwise generation runs
 /// past the model's own stop and degenerates. Null => no separate eos.
 pub var eos: ?u32 = null;
 
-/// Chat template family. `chatml` is Qwen's `<|im_start|>role\n…<|im_end|>`;
-/// `gemma` is Gemma 3's `<start_of_turn>role\n…<end_of_turn>\n`; `gemma4` is
-/// Gemma 4's `<|turn>role\n…<turn|>\n` (roles system / user / model, each its
+/// Chat template family. `chatml` is Qwen's `<|im_start|>role\n...<|im_end|>`;
+/// `gemma` is Gemma 3's `<start_of_turn>role\n...<end_of_turn>\n`; `gemma4` is
+/// Gemma 4's `<|turn>role\n...<turn|>\n` (roles system / user / model, each its
 /// own turn; the system turn also carries the `<|think|>` reasoning cue).
 pub const Family = enum { chatml, gemma, gemma4 };
 pub var family: Family = .chatml;
@@ -61,7 +61,7 @@ pub fn setThinking(on: bool) void {
 /// text* (decoded tokens): `open` starts the thought, `close` ends it. null =>
 /// the family has no reasoning channel and the thinking toggle is a no-op.
 ///
-/// Aliased from `tool_call.zig` — which owns the splitter that consumes it — so
+/// Aliased from `tool_call.zig`, which owns the splitter that consumes it, so
 /// a family's markers pass into `answerText`/`endsInsideThought` with no
 /// conversion step that could quietly disagree.
 pub const Reasoning = @import("tool_call.zig").Reasoning;
@@ -82,7 +82,7 @@ pub fn reasoning() ?Reasoning {
     return reasoningFor(family);
 }
 
-/// Whether a given family supports a reasoning block (pure — lets the GUI probe
+/// Whether a given family supports a reasoning block (pure, lets the GUI probe
 /// a configured-but-not-loaded model without disturbing the process-global
 /// `family`).
 pub fn familySupportsThinking(f: Family) bool {
@@ -96,13 +96,13 @@ pub fn supportsThinking() bool {
 
 /// Map a GGUF `general.architecture` string to its chat template family, or
 /// null if it isn't a family we template here. Single source of truth for the
-/// arch→family mapping (used by the session loader and the GUI's pre-load
+/// arch->family mapping (used by the session loader and the GUI's pre-load
 /// capability probe).
 pub fn familyForArch(arch: []const u8) ?Family {
     if (std.mem.eql(u8, arch, "qwen3")) return .chatml;
     if (std.mem.eql(u8, arch, "qwen35")) return .chatml;
     // Mistral-Nemo & the plain llama family ship a ChatML chat_template
-    // (<|im_start|>…<|im_end|>) and reuse the qwen3 stack (see qwen3.zig).
+    // (<|im_start|>...<|im_end|>) and reuse the qwen3 stack (see qwen3.zig).
     if (std.mem.eql(u8, arch, "llama")) return .chatml;
     if (std.mem.eql(u8, arch, "gemma3")) return .gemma;
     if (std.mem.eql(u8, arch, "gemma4")) return .gemma4;
@@ -150,9 +150,9 @@ pub fn appendSystem(tok: *const Tokenizer, gpa: std.mem.Allocator, text: []const
         },
         .gemma4 => {
             // Gemma 4 has a dedicated system turn (unlike Gemma 3): a full
-            // <|turn>system\n … <turn|>\n block. In thinking mode the <|think|>
+            // <|turn>system\n ... <turn|>\n block. In thinking mode the <|think|>
             // reasoning cue is injected at the very top of it, before the
-            // system content — matching the reference template. The system turn
+            // system content, matching the reference template. The system turn
             // stands alone, so the next appendUser opens a fresh user turn.
             try tok.encode(gpa, "<|turn>system\n", out);
             if (enable_thinking) try tok.encode(gpa, "<|think|>\n", out);
@@ -191,8 +191,8 @@ pub const Segment = union(enum) {
 /// Append a user turn with interleaved text and image segments (Qwen3-VL:
 /// each image is <|vision_start|> + grid_w*grid_h <|image_pad|> rows +
 /// <|vision_end|>, inline in the turn at its mention point). The
-/// placeholder pads keep ids aligned with cache rows — sampling penalties
-/// and cached()-based prefill index by row — and each image's first pad
+/// placeholder pads keep ids aligned with cache rows, sampling penalties
+/// and cached()-based prefill index by row, and each image's first pad
 /// row index is appended to image_rows so the caller can interleave
 /// prefill() with prefillImage().
 pub fn appendUserSegments(tok: *const Tokenizer, gpa: std.mem.Allocator, segments: []const Segment, out: *std.ArrayList(u32), image_rows: *std.ArrayList(usize)) !void {
@@ -254,7 +254,7 @@ pub fn appendGemmaImage(tok: *const Tokenizer, gpa: std.mem.Allocator, n_tokens:
 /// Gemma 4 image block: `<|image>` + `n_tokens` placeholder rows (pad) +
 /// `<image|>`. Returns the first placeholder row so the caller can splice the
 /// embedder output in with prefillImage. Unlike Gemma 3 there is no dedicated
-/// soft token — the placeholder id is immaterial (those rows are overwritten by
+/// soft token, the placeholder id is immaterial (those rows are overwritten by
 /// the projected image embeddings), so `pad` keeps `ids` aligned with cache rows.
 pub fn appendGemma4Image(tok: *const Tokenizer, gpa: std.mem.Allocator, n_tokens: usize, out: *std.ArrayList(u32)) !usize {
     try tok.encode(gpa, "<|image>", out);
@@ -272,15 +272,15 @@ pub fn openAssistant(tok: *const Tokenizer, gpa: std.mem.Allocator, out: *std.Ar
             try tok.encode(gpa, "<|im_start|>assistant\n", out);
             // Non-thinking: prime an empty reasoning block (Qwen's
             // <think>\n\n</think> convention) so the model answers directly.
-            // Thinking: unprimed — the model emits its own <think>…</think>.
+            // Thinking: unprimed, the model emits its own <think>...</think>.
             if (!enable_thinking) try tok.encode(gpa, "<think>\n\n</think>\n\n", out);
         },
         .gemma => try tok.encode(gpa, "<start_of_turn>model\n", out),
         .gemma4 => {
             try tok.encode(gpa, "<|turn>model\n", out);
             // Non-thinking: prime an empty thought channel so the model answers
-            // directly. Thinking: unprimed — the model opens its own
-            // <|channel>thought … <channel|> (cued by <|think|> in the system).
+            // directly. Thinking: unprimed, the model opens its own
+            // <|channel>thought ... <channel|> (cued by <|think|> in the system).
             if (!enable_thinking) try tok.encode(gpa, "<|channel>thought\n<channel|>", out);
         },
     }
@@ -310,7 +310,7 @@ fn hasImageExt(path: []const u8) bool {
 
 /// Split an interactive chat line into text and @image mentions:
 /// `@path.jpg` or `@"path with spaces.png"` becomes an image part (the
-/// path must end in a known image extension — anything else, e.g. @handles
+/// path must end in a known image extension, anything else, e.g. @handles
 /// or emails, stays text), and trailing sentence punctuation after an
 /// unquoted path returns to the text. All parts are slices of `line`.
 pub fn parseImageMentions(gpa: std.mem.Allocator, line: []const u8, parts: *std.ArrayList(Part)) !void {
@@ -473,7 +473,7 @@ test "gemma turn building matches whole-template tokenization" {
     defer tok.deinit();
     // applyTokenizer + setFamily mutate process-global template state; capture
     // and restore ALL of it (not just family) so later tests still see the
-    // chatml/Qwen defaults — otherwise gemma's stop/glue ids leak out.
+    // chatml/Qwen defaults, otherwise gemma's stop/glue ids leak out.
     const saved_turn_end = turn_end;
     const saved_pad = pad;
     const saved_newline = newline;
@@ -610,7 +610,7 @@ test "stop tokens" {
     try std.testing.expect(!isStop(newline_id));
 
     // A raw <eos> distinct from the turn marker must also stop (some finetunes
-    // — e.g. gemma4 DarkIdol — end a turn on <eos>, not <turn|>; missing this
+    // e.g. gemma4 DarkIdol, end a turn on <eos>, not <turn|>; missing this
     // ran generation past the model's own end into a degenerate repeat tail).
     const saved_eos = eos;
     defer eos = saved_eos;

@@ -4,7 +4,7 @@
 //!
 //! Lossless: a drafted token is accepted with its probability under the
 //! target's fully processed sampling distribution, and a rejection resamples
-//! from the renormalized residual — so emitted tokens follow exactly the
+//! from the renormalized residual, so emitted tokens follow exactly the
 //! distribution vanilla sampling draws from (byte-identical for greedy,
 //! where no randomness is consumed at all).
 //!
@@ -43,7 +43,7 @@ pub const Stats = struct {
 
 /// Prompt-lookup drafter: find the longest trailing n-gram (max_n down to
 /// min_n) that occurred earlier in the context and propose the tokens that
-/// followed its most recent occurrence. No model, no weights — pays off on
+/// followed its most recent occurrence. No model, no weights, pays off on
 /// repetition (code, structured output, multi-turn chat restating context)
 /// and costs only an already-needed forward when wrong.
 pub const NgramDrafter = struct {
@@ -71,12 +71,12 @@ pub const NgramDrafter = struct {
     }
 };
 
-/// Draft-model drafter (LLM_PLAN.md M5): a second, smaller CausalLM on its
+/// Draft-model drafter: a second, smaller CausalLM on its
 /// own backend stepper proposes greedy continuations. It mirrors the token
 /// history its KV cache reflects, so after the target rejects drafts it
 /// re-syncs by truncating to the longest common prefix and prefilling the
 /// rest. Draft errors and a full draft context degrade to proposing nothing
-/// (the target just decodes vanilla) — the drafter can never corrupt output.
+/// (the target just decodes vanilla), the drafter can never corrupt output.
 pub fn ModelDrafter(comptime Stepper: type) type {
     return struct {
         model: *Stepper,
@@ -141,7 +141,7 @@ pub fn ModelDrafter(comptime Stepper: type) type {
     };
 }
 
-/// Adapt a chain drafter to the tree interface as a single-path tree — no
+/// Adapt a chain drafter to the tree interface as a single-path tree, no
 /// acceptance gain over chain mode (a chain is a degenerate tree), but it
 /// lets any drafter drive the tree-verify path (parity tests, plumbing).
 pub fn ChainAsTree(comptime D: type) type {
@@ -157,7 +157,7 @@ pub fn ChainAsTree(comptime D: type) type {
     };
 }
 
-/// Speculative counterpart of engine.generate — same contract (extends `ids`
+/// Speculative counterpart of engine.generate, same contract (extends `ids`
 /// in place, streams to `out`, returns tokens generated), driven by a
 /// `drafter` exposing propose(ids: []const u32, buf: []u32) usize.
 ///
@@ -191,7 +191,7 @@ pub fn generate(
     if (comptime !@hasDecl(D, "propose")) return error.TreeUnsupported;
     // Greedy on a GPU stepper: verify by per-row on-device argmax, downloading
     // just the ids instead of (k+1)*vocab logits. Acceptance is identical to
-    // the download path — the greedy dist is a point mass at the argmax.
+    // the download path, the greedy dist is a point mass at the argmax.
     // Repetition penalty needs the full logits, so it stays on the download path.
     if (comptime @hasDecl(M, "stepAllArgmax")) {
         if (opts.sampling.temperature == 0 and opts.sampling.repeat_penalty == 1.0)
@@ -358,7 +358,7 @@ fn generateChainGreedy(
         var next_tok: ?u32 = null;
         for (draft, 0..) |d, i| {
             if (d != g[i]) {
-                next_tok = g[i]; // reject → resample = the point-mass argmax
+                next_tok = g[i]; // reject -> resample = the point-mass argmax
                 break;
             }
             if (opts.spec_stats) |s| s.accepted += 1;
@@ -378,17 +378,17 @@ fn generateChainGreedy(
             model.truncate(ids.items.len);
             pending = t;
         } else {
-            pending = g[m]; // all accepted → the row-m bonus token
+            pending = g[m]; // all accepted -> the row-m bonus token
         }
     }
     return n;
 }
 
-/// Tree-drafted speculative decoding (LLM_PLAN.md M8), greedy-only. The
+/// Tree-drafted speculative decoding, greedy-only. The
 /// drafter proposes a branching tree of candidate continuations instead of a
 /// single chain, one forward verifies every node under a tree-attention
 /// mask, and the walk keeps the deepest root path whose tokens match the
-/// target's greedy choices — a chain dies at its first wrong token, a tree
+/// target's greedy choices, a chain dies at its first wrong token, a tree
 /// survives as long as ANY branch guessed right.
 ///
 /// Node layout: node 0 is the root (the pending token, already emitted, at
@@ -540,7 +540,7 @@ test "ngram drafter proposes the continuation of a repeated pattern" {
     const d: NgramDrafter = .{ .max_n = 3, .min_n = 1 };
     var buf: [4]u32 = undefined;
 
-    // "5 6 7 8 ... 5 6 7" — trigram match, continuation is 8 then 9.
+    // "5 6 7 8 ... 5 6 7", trigram match, continuation is 8 then 9.
     const ids = [_]u32{ 5, 6, 7, 8, 9, 1, 5, 6, 7 };
     const m = d.propose(&ids, &buf);
     try std.testing.expectEqual(@as(usize, 4), m);
@@ -610,7 +610,7 @@ const ToyModel = struct {
 
     /// Tree verify: node i's logits are the rule applied to the committed
     /// history plus the tokens along node i's root path. Nothing is
-    /// committed — any acceptance-walk/commit bug leaves hist poisoned and
+    /// committed, any acceptance-walk/commit bug leaves hist poisoned and
     /// diverges the output.
     pub fn stepAllTree(self: *ToyModel, io: std.Io, tokens: []const u32, parents: []const u32, logits: []f32) !void {
         _ = io;
@@ -790,10 +790,10 @@ test "spec greedy is byte-identical: budget lands mid-acceptance" {
 test "chunked prefill is byte-identical across the gate-chunk boundary" {
     // A prompt LONGER than the batch ToyModel will actually be handed forces the
     // chunked prefill loop (added so pause/cancel can land mid-prefill) to run several
-    // chunks. ⚠️ Derived from `prefillBatchOfType`, not from `prefill_gate_chunk`:
+    // chunks. Derived from `prefillBatchOfType`, not from `prefill_gate_chunk`:
     // the batch is now the stepper's choice, so a hardcoded constant here would let
     // the test silently stop spanning chunks the day ToyModel declares one. Incremental chunked stepping must reconstruct the identical KV
-    // history — a dropped / duplicated / reordered token would change
+    // history, a dropped / duplicated / reordered token would change
     // rule(hist) and diverge from vanilla greedy. sumRule folds the WHOLE
     // history, so any such bug is caught.
     const gpa = std.testing.allocator;
@@ -1161,7 +1161,7 @@ test "model drafter is byte-identical and re-syncs after rejections" {
 }
 
 // Gated on the real checkpoint: spec-k greedy output must equal vanilla
-// greedy output through the CpuModel path. Kept tiny — every token is a full
+// greedy output through the CpuModel path. Kept tiny, every token is a full
 // 36-layer forward in Debug.
 test "spec matches vanilla greedy on the real model" {
     const gpa = std.testing.allocator;
@@ -1208,7 +1208,7 @@ test "spec matches vanilla greedy on the real model" {
 // Gated on the real checkpoint: tree-verify greedy output through the
 // CpuModel path (forwardTree + attentionTree + commitTreePath) must equal
 // vanilla greedy. The n-gram chain rides ChainAsTree so real drafts (and
-// real rejections) flow through the tree machinery. Kept tiny — every
+// real rejections) flow through the tree machinery. Kept tiny, every
 // forward is a full 36-layer pass in Debug.
 test "tree spec matches vanilla greedy on the real model" {
     const gpa = std.testing.allocator;
@@ -1254,7 +1254,7 @@ test "tree spec matches vanilla greedy on the real model" {
 }
 
 // Gated on both checkpoints: the real 4B target with the real 0.6B draft
-// model on the CPU stepper, greedy, byte-identical to vanilla. Kept tiny —
+// model on the CPU stepper, greedy, byte-identical to vanilla. Kept tiny,
 // Debug forwards are slow.
 test "model drafter matches vanilla greedy on the real models" {
     const gpa = std.testing.allocator;

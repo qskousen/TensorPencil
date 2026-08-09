@@ -1,53 +1,39 @@
 //! ComfyUI's `asym_w4a8_int8` weight format: a 4-bit weight that DECODES to the
 //! int8-convrot weight this engine already runs.
 //!
-//! Reference: `comfy_kitchen/tensor/w4a8_int8.py` plus
-//! `comfy_kitchen/backends/{eager,triton}/w4a8_int8.py`, added to ComfyUI in
-//! `344b4398 Support asym w4a8_int (#15308)`. A layer ships five tensors:
+//! A layer ships five tensors: `weight` (I8 [N, K/2], two 4-bit codebook indices per
+//! byte), `weight_s_rel` (F8_E4M3 [N, K/group_size], the per-group relative scale),
+//! `weight_s_channel` (F32 [N], the per-output-row scale), `weight_codebook` (F32 [16],
+//! optional) and `comfy_quant` (U8 JSON carrying `group_size` and `convrot_groupsize`).
+//! The decode is:
 //!
-//! | tensor | shape | dtype | |
-//! |---|---|---|---|
-//! | `weight` | `[N, K/2]` | I8 | two 4-bit codebook indices per byte |
-//! | `weight_s_rel` | `[N, K/group_size]` | F8_E4M3 | per-group relative scale |
-//! | `weight_s_channel` | `[N]` | F32 | per-output-row scale |
-//! | `weight_codebook` | `[16]` | F32 | level table (optional) |
-//! | `comfy_quant` | — | U8 | JSON: `group_size`, `convrot_groupsize` |
+//!     q    = nibble(packed)                        // 0..15, even col = LOW nibble
+//!     lvl  = codebook[q]  (or q - 8 with no codebook)
+//!     int8 = rint(clamp(lvl * s_rel[row, group], -127, 127))
 //!
-//! and the decode is
+//! After that it is `ops.matmul`'s existing `.i8` path verbatim, with `row_scale` =
+//! `s_channel` and `convrot` = `convrot_groupsize`. That is why this file is small: the
+//! novelty is entirely in the level decode, and ComfyUI's own backends do the same thing,
+//! so a correct decode reproduces its result bit for bit rather than approximately.
 //!
-//! ```
-//! q    = nibble(packed)                              // 0..15, even col = LOW nibble
-//! lvl  = codebook[q]   (or  q - 8  with no codebook)
-//! int8 = rint(clamp(lvl * s_rel[row, group], -127, 127))
-//! ```
+//! The rounding is ties-to-EVEN. torch's `.round()` and the Triton kernel's
+//! `libdevice.rint` both are; Zig's `@round` is half-away-from-zero. An exact tie needs
+//! `codebook[i] * s_rel` to land on a .5 boundary, which is rare but not negligible
+//! because s_rel is fp8, so every checkpoint would carry a handful of off-by-one weights.
+//! `roundTiesEven` and the `ties_to_even` fixture case pin it.
 //!
-//! After that it is `ops.matmul`'s existing `.i8` path verbatim: `row_scale` =
-//! `s_channel`, `convrot` = `convrot_groupsize`. **That is the whole reason this file
-//! is small** — the format's novelty is entirely in the level decode, and ComfyUI's
-//! own backends do exactly the same thing (`_dequant_int4_grouped_to_int8`, then
-//! `int8_linear(..., convrot=True)`), so a correct decode reproduces its result
-//! bit-for-bit rather than approximately.
+//! The codebook is NOT uniform, so this is not `.i4` with a per-group scale. The levels
+//! are Lloyd-Max-optimal for a Gaussian (ConvRot makes the rotated groups Gaussian),
+//! spaced 0.186 at the tails and 0.103 in the middle. Reading the nibbles as signed int4
+//! times a scale, which is what the int4-convrot path does, is finite, plausible and
+//! wrong.
 //!
-//! ⚠️ **The rounding is ties-to-EVEN.** torch's `.round()` and the Triton kernel's
-//! `libdevice.rint` both are; Zig's `@round` is half-away-from-zero. On the frozen
-//! Lloyd-Max codebook an exact tie needs `codebook[i] * s_rel` to land on a `.5`
-//! boundary — rare, but s_rel is a power-of-two-ish fp8 value, so not negligible, and
-//! every checkpoint would carry a handful of off-by-one weights. `roundTiesEven`
-//! below and the `ties_to_even` fixture case pin it.
-//!
-//! ⚠️ **The codebook is NOT uniform**, so this is not `.i4` with a per-group scale.
-//! The levels are Lloyd-Max-optimal for a Gaussian (ConvRot makes the rotated groups
-//! Gaussian), spaced 0.186 apart at the tails and 0.103 in the middle. Reading the
-//! nibbles as signed int4 times a scale — which is what the existing int4-convrot
-//! path does — is finite, plausible and wrong.
-//!
-//! **The decode goes through a 4 KiB lookup table** (`Levels`), not per-element float
+//! The decode goes through a 4 KiB lookup table (`Levels`) rather than per-element float
 //! arithmetic: `s_rel` is fp8, so there are only 256 possible group scales, and one
-//! `[256][16] i8` table therefore holds every value the tensor can decode to. The
-//! per-element work becomes one L1 load and one store, which is what makes a
-//! 12 GB whole-model decode bandwidth-bound instead of arithmetic-bound. It is exact
-//! by construction rather than approximate: the table's entries are computed with the
-//! same f32 multiply-round-clamp the reference uses.
+//! `[256][16] i8` table holds every value the tensor can decode to. The per-element work
+//! becomes one L1 load and one store, which makes a whole-model decode bandwidth-bound.
+//! It is exact by construction: the table entries use the same f32 multiply-round-clamp
+//! the reference does.
 
 const std = @import("std");
 const dtypes = @import("tp_core").dtype;
@@ -62,7 +48,7 @@ pub const default_convrot_groupsize = 256;
 /// are heavy-tailed (`_FIXED_LUT`, gated by an excess-kurtosis probe that real models
 /// never trip). All 224 layers of the krea2 W4A8 checkpoint ship exactly this.
 ///
-/// Present for tests and tooling only — a loader must still read each layer's own
+/// Present for tests and tooling only, a loader must still read each layer's own
 /// `weight_codebook`, because the whole point of the kurtosis gate is that a future
 /// tensor may carry a fitted table instead. A fast test pins it against the fixture.
 pub const fixed_lut: [16]f32 = .{
@@ -92,7 +78,7 @@ pub const QuantConf = struct {
 };
 
 /// Parse a layer's `comfy_quant` blob. Allocations land in `alloc` (the caller's
-/// arena) — `format` is a slice into the parse.
+/// arena), `format` is a slice into the parse.
 pub fn parseConf(alloc: std.mem.Allocator, bytes: []const u8) !QuantConf {
     return std.json.parseFromSliceLeaky(QuantConf, alloc, bytes, .{ .ignore_unknown_fields = true });
 }
@@ -127,7 +113,7 @@ pub const Levels = struct {
             const s = dtypes.f8e4m3ToF32(@intCast(b));
             for (0..16) |i| {
                 // The f32 multiply, then ties-to-even, then the clamp, in the
-                // reference's order. A NaN group scale is a corrupt checkpoint — the
+                // reference's order. A NaN group scale is a corrupt checkpoint, the
                 // reference's own `.to(torch.int8)` is undefined there and Zig's
                 // `@intFromFloat` is illegal behaviour, so it decodes to 0 rather
                 // than to whatever the host happens to do.
@@ -145,7 +131,7 @@ pub const Levels = struct {
 ///
 /// Keeping the packed form is the whole point: a decoded krea2 is 12.2 GB of int8
 /// against 6.1 GB packed, and on a 24 GB card that difference is the format. Every
-/// consumer therefore decodes on demand — the CPU GEMM per k-slice into its existing
+/// consumer therefore decodes on demand, the CPU GEMM per k-slice into its existing
 /// dequant panel, the GPU backends per GEMM into a device scratch (which is also what
 /// ComfyUI's Triton and CUDA backends do).
 pub const Meta = struct {
@@ -168,7 +154,7 @@ pub const Meta = struct {
 pub fn validate(rows: usize, cols: usize, group_size: usize, convrot_groupsize: usize, packed_len: usize, s_rel_len: usize) !usize {
     // The reference's own constraints (`validate_w4a8_operands`): K divisible by 16,
     // by the group size and by the ConvRot group size, and a group size that is at
-    // least 4 and either divides 16 or is a multiple of it — which makes every legal
+    // least 4 and either divides 16 or is a multiple of it, which makes every legal
     // group size even, and that is what lets a byte's two nibbles share one scale.
     if (group_size < 4 or cols % 16 != 0 or cols % group_size != 0 or
         cols % convrot_groupsize != 0 or (16 % group_size != 0 and group_size % 16 != 0))
@@ -411,7 +397,7 @@ test "a W4A8 weight dequantizes to the reference's f32 weight through the int8 c
         decode(q, packed_bytes, s_rel, &lv, c.rows, c.cols, c.group_size);
 
         // int8 * per-row scale, then rotate each 256-group back to the original basis
-        // — exactly what `ops.matmul`'s `.i8` convrot dequant does per k-slice.
+        // exactly what `ops.matmul`'s `.i8` convrot dequant does per k-slice.
         const w = try gpa.alloc(f32, c.rows * c.cols);
         defer gpa.free(w);
         for (0..c.rows) |r| {
@@ -514,8 +500,8 @@ test "roundTiesEven matches rint on the cases @round gets wrong" {
         if (@round(p.x) != p.want) differ += 1;
     }
     // Teeth: `@round` must actually disagree somewhere, else this test proves nothing.
-    // It disagrees on exactly the ties whose away-from-zero neighbour is odd —
-    // ±0.5, ±2.5 and 126.5 here — and agrees on ±1.5, ±3.5, 127.5, where rounding
+    // It disagrees on exactly the ties whose away-from-zero neighbour is odd,
+    // ±0.5, ±2.5 and 126.5 here, and agrees on ±1.5, ±3.5, 127.5, where rounding
     // away from zero already lands on the even value.
     try std.testing.expectEqual(@as(usize, 5), differ);
 }
@@ -523,7 +509,7 @@ test "roundTiesEven matches rint on the cases @round gets wrong" {
 test "W4A8 validate refuses the shapes the reference refuses" {
     // A group size that neither divides 16 nor is a multiple of it, K not divisible by
     // the ConvRot group, and mis-sized sidecars. Each of these would otherwise read a
-    // scale from the wrong group — finite and plausible, so it has to be an error.
+    // scale from the wrong group, finite and plausible, so it has to be an error.
     try std.testing.expectError(error.ShapeMismatch, validate(4, 256, 24, 256, 4 * 128, 4 * 10));
     try std.testing.expectError(error.ShapeMismatch, validate(4, 128, 16, 256, 4 * 64, 4 * 8));
     try std.testing.expectError(error.ShapeMismatch, validate(4, 256, 2, 256, 4 * 128, 4 * 128));

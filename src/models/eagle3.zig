@@ -1,19 +1,18 @@
-//! EAGLE-3 draft head (LLM_PLAN.md M7): a trained one-layer drafter that
+//! EAGLE-3 draft head: a trained one-layer drafter that
 //! reads the TARGET model's own hidden states instead of running a second
 //! full model. Per committed position the target taps its residual stream
 //! entering three layers (CudaLM.enableTaps); the head fuses them
 //! (fc: 3*hidden -> hidden), pairs the fused feature with the NEXT token's
 //! embedding, and one llama-style decoder layer + a reduced 32k-vocab LM
-//! head (d2t delta-maps draft ids to target ids) drafts greedily — its own
+//! head (d2t delta-maps draft ids to target ids) drafts greedily, its own
 //! hidden output feeds subsequent rollout steps (EAGLE-3 "training-time
 //! test"). ~218M bf16 params: a draft step is one layer instead of the 0.6B
 //! draft model's 28.
 //!
-//! The head weights here (AngelSlim/Qwen3-4B_eagle3) were trained on vanilla
-//! Qwen3-4B-Instruct; running them against the Heretic-abliterated VL
-//! checkpoint at fp8 is an experiment — acceptance measures the feature
-//! drift. Verification stays lossless either way: a bad drafter only costs
-//! speed, never correctness.
+//! Published EAGLE-3 heads are trained against a specific base model, so running one
+//! against a finetuned or differently quantized checkpoint is an experiment and the
+//! acceptance rate measures the feature drift. Verification stays lossless either way:
+//! a bad drafter costs speed, never correctness.
 
 const std = @import("std");
 const qwen3 = @import("qwen3.zig");
@@ -51,8 +50,8 @@ const nsplit = 32;
 /// longer (prefill) groundings chunk.
 const max_rows = spec_limits.max_draft + 2;
 
-/// Tree drafting (LLM_PLAN.md M8): widest tree level the head forwards in
-/// one batch, and the beam-search shape — top candidates per node, each
+/// Tree drafting: widest tree level the head forwards in
+/// one batch, and the beam-search shape, top candidates per node, each
 /// level keeping the `beam` best by cumulative draft log-probability.
 /// Deep-narrow (2/2/2) measured best: this head's acceptance concentrates
 /// in its top-1, so a tree is worth most as "chain + second-chance
@@ -62,7 +61,7 @@ const tree_root_top = 2;
 const tree_branch_top = 2;
 const tree_beam = 2;
 
-/// Target layers whose incoming residual stream feeds fc, low/mid/high —
+/// Target layers whose incoming residual stream feeds fc, low/mid/high,
 /// outputs of layers (2, N/2, N-3) for the 36-layer target (measured best
 /// acceptance among the tap conventions on this checkpoint pair).
 pub const default_tap_layers: [3]usize = .{ 3, 19, 34 };
@@ -463,7 +462,7 @@ pub const Eagle3Drafter = struct {
 
     /// Re-sync the head with the committed ids and ground every position's
     /// head row from the target's tap features; returns the row count of
-    /// the freshest forward (b.feat occupancy — the tip hidden lives at row
+    /// the freshest forward (b.feat occupancy, the tip hidden lives at row
     /// count-1), or 0 when no new row was grounded (no fresh tip to draft
     /// from) or the target hasn't forwarded the features yet.
     fn ground(self: *Eagle3Drafter, ids: []const u32) !usize {
@@ -502,7 +501,7 @@ pub const Eagle3Drafter = struct {
         return rows_in_buf;
     }
 
-    /// Tree proposal (spec.generateTree, LLM_PLAN.md M8): level-synchronous
+    /// Tree proposal (spec.generateTree): level-synchronous
     /// beam expansion. The root's top tree_root_top candidates seed level 1;
     /// each level is forwarded through the head in ONE batch (uniform depth,
     /// tree attention over the grounded prefix + draft-ancestor chains),
@@ -622,7 +621,7 @@ pub const Eagle3Drafter = struct {
 
     /// Top-|out| draft-vocab candidates by logit, converted to
     /// log-probabilities (log-softmax over the row). Strict-greater
-    /// insertion keeps the lowest index on ties, matching argmax — the
+    /// insertion keeps the lowest index on ties, matching argmax, the
     /// beam's best candidate is exactly the chain drafter's greedy pick.
     fn topNLogits(row: []const f32, out_tok: []u32, out_lp: []f32) usize {
         std.debug.assert(out_tok.len == out_lp.len);
@@ -669,7 +668,7 @@ pub const Eagle3Drafter = struct {
 
 // Gated on the GPU marker + both checkpoints: EAGLE-drafted greedy output
 // must equal vanilla greedy (the lossless-verification contract holds no
-// matter what the head proposes). Kept tiny — Debug forwards are slow.
+// matter what the head proposes). Kept tiny, Debug forwards are slow.
 test "eagle drafter matches vanilla greedy on the real models" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -722,7 +721,7 @@ test "eagle drafter matches vanilla greedy on the real models" {
 }
 
 // Gated like the chain test above: EAGLE TREE drafting (proposeTree beam +
-// the target's tree-verify forward) stays byte-identical to vanilla greedy —
+// the target's tree-verify forward) stays byte-identical to vanilla greedy,
 // the lossless contract holds no matter what tree the head proposes.
 test "eagle tree drafter matches vanilla greedy on the real models" {
     const gpa = std.testing.allocator;

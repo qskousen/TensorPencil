@@ -2,58 +2,25 @@
 //! 28-block trunk runs on the device, with the small per-image paths kept on the host
 //! exactly as `zimage_gpu` keeps Z-Image's.
 //!
-//! **What stays on the CPU, and why none of it is laziness:**
+//! Host-side, because none of it depends on the timestep: the entire `llm_adapter`
+//! (6 blocks, 1024 wide, 512 rows), which `pipeline` already runs inside `encode`; the
+//! timestep sinusoid, `t_embedder` MLP and every block's AdaLN pair, precomputed for the
+//! whole schedule at `Session.init`; patchify and the final layer.
 //!
-//! - The **entire `llm_adapter`** (6 blocks, 1024 wide, 512 rows). ⚠️ It does not
-//!   depend on the timestep at all — its inputs are the two tokenizations and the
-//!   Qwen3 encoder's states — so it is computed once per *image*, not per step, and
-//!   `pipeline` already runs it inside `encode`. Moving it to the device would buy
-//!   ~1/30th of one render and cost a second model's worth of device weights.
-//! - The **timestep sinusoid, `t_embedder` MLP and every block's AdaLN pair**,
-//!   precomputed for the whole schedule at `Session.init` (see
-//!   `anima.DiT.modulationTable`). Anima's modulation is one vector per sublayer per
-//!   block for the *whole image* — `emb` is `[B, T, D]` with T = 1, broadcast over h
-//!   and w — so the entire AdaLN evaluation is ~0.2 GFLOP against a trunk of
-//!   hundreds, and hoisting it out of the step loop is what `dit_gpu` does with its
-//!   timestep vectors for the same reason.
-//! - **Patchify** and the **final layer**, a transposition and a GEMV apiece.
+//! The one thing that is not just the CPU forward with device ops: cross-attention's K
+//! and V are per-image constants, precomputed for every block at `Session.init`. They
+//! are projections of the adapter's output, which no step changes, so 28 blocks x 2
+//! GEMMs leave the step loop along with the f16 conversion and k-major gather they would
+//! otherwise need every step; they are cached directly in the attention-operand layout
+//! (K per-head k-major, V row-major) and the K norm is applied before caching. This is a
+//! small win, 0.38% of a step, and it costs 117 MB of f16 operands, doubled under CFG.
+//! It is kept for the removed per-step conversion, not because it is what makes the port
+//! fast.
 //!
-//! **The one thing that is NOT just "the CPU forward with device ops":**
-//!
-//! ⚠️ **Cross-attention's K and V are per-IMAGE constants and are precomputed for
-//! every block at `Session.init`.** They are projections of the adapter's output,
-//! which does not change across steps, so 28 blocks x 2 GEMMs of
-//! `[512, 2048] x [2048, 1024]` leave the step loop entirely — along with the f16
-//! conversion and k-major gather they would need every step, since they are cached
-//! directly in the **attention-operand layout** (K per-head k-major, V row-major).
-//! The K norm is per-image too and is applied before caching. Same observation
-//! `zimage_gpu` makes about its `modulation=False` caption half.
-//!
-//! ⚠️ **It is a SMALL win, and an earlier version of this comment claimed 17% of the
-//! trunk's per-step GEMM FLOPs — wrong by a factor of 30**, from comparing a 28-block
-//! total against a per-block figure. The true share is **0.56%** at 6534 tokens (4.29
-//! GFLOP against a block's 767) and 2.4% at 1536, because these GEMMs run over the
-//! 512-row *context* while every other one runs over the *sequence*. **Measured** by
-//! `anima-cuda-bench`: 0.10 ms/block, so hoisting them saves **0.38% of a step**. The cost
-//! is real — 117 MB of f16 operands here (235 MB of f32 on CUDA), doubled under CFG. Kept
-//! because it is also what removes the per-step conversion, but it is not why this port
-//! is fast.
-//!
-//! **No new attention kernel was needed** — `coopmat.buildFlashAttn` was already
-//! parameterized by query tiles and key length independently; what it lacked was a
-//! separate MD plane stride, since `s_stride` served as K's row stride, the j loop
-//! bound *and* the MD plane stride at once. Push word 7 now carries it, with 0
-//! meaning "= s_stride" so every pre-existing caller is unchanged by construction.
-//! One genuinely new kernel: `ln_mod_sg`, the fused weightless LayerNorm +
-//! modulation, which is a subgroup kernel because a thread-per-row form at
-//! 6534 x 2048 x 3 calls x 28 blocks is the bandwidth trap `qk_rmsnorm_warp`
-//! already paid for once.
-//!
-//! ⚠️ **Head width is exactly 128** — the width `coopmat.buildGemmAttnOut` and the
-//! flash kernels tile — so unlike the SD family there is no head padding and no
-//! `head_pad`/`head_unpad` round trip. Every GEMM width here (2048 / 8192 / 1024) is
-//! a multiple of 128 and every reduction width a multiple of 32, so `opMatmulCoop*`'s
-//! shape constraints are met without special-casing.
+//! Head width is exactly 128, the width `coopmat.buildGemmAttnOut` and the flash kernels
+//! tile, so unlike the SD family there is no head padding. Every GEMM width (2048 / 8192
+//! / 1024) is a multiple of 128 and every reduction width a multiple of 32, so
+//! `opMatmulCoop*`'s shape constraints are met without special-casing.
 
 const std = @import("std");
 const anima = @import("anima.zig");
@@ -68,7 +35,7 @@ const Weight = ops.matmul.Weight;
 /// q/kv shape) instead of the tensor-core flash pipeline. For A/B and for reproducing
 /// a mismatch.
 ///
-/// ⚠️ **Read once, at `Session.init`** — not per call — because it decides whether the
+/// Read once, at `Session.init`, not per call, because it decides whether the
 /// per-image cross-attention K/V are cached as f16 attention operands or as plain f32.
 /// Flipping it under a live session would leave the forward reading buffers that were
 /// never filled. `Session.tc` is the value actually in force, and `forward` branches on
@@ -77,10 +44,10 @@ pub var force_attn_cross: bool = false;
 
 /// Widest zero bias any Anima GEMM needs (the MLP's `mlp_dim`).
 ///
-/// ⚠️ Passed WHOLE, never sliced: `smallBuffer` caches by host POINTER alone and sizes
+/// Passed WHOLE, never sliced: `smallBuffer` caches by host POINTER alone and sizes
 /// from the first call, so once a 2048-wide GEMM cached it, an 8192-wide one would read
 /// off the end. The dispatch reads only `rows` entries, so one full-width buffer serves
-/// every GEMM — the same rule `dit_gpu` and `zimage_gpu` record.
+/// every GEMM, the same rule `dit_gpu` and `zimage_gpu` record.
 const zero_bias: [anima.anima_2b.mlp_dim]f32 = @splat(0);
 
 /// Whether the tensor-core flash pipeline is available and wanted.
@@ -99,7 +66,7 @@ pub const Session = struct {
     /// Rows of the adapter's output the trunk cross-attends to.
     ctx_seq: usize,
     ctx_pad: usize,
-    /// Whether the flash path is in force for this session — see `force_attn_cross`.
+    /// Whether the flash path is in force for this session, see `force_attn_cross`.
     tc: bool,
 
     /// 3-axis RoPE table for the image grid: `cos` then `sin`, `seq * half` each.
@@ -110,9 +77,9 @@ pub const Session = struct {
     /// `cv_d[i]` is f16 `[ctx_pad][dim]`; otherwise both are f32 `[ctx_seq][dim]`,
     /// which is what `attn_cross` reads.
     ///
-    /// ⚠️ **Per block rather than one buffer with a per-block offset, because on Vulkan
-    /// a `DeviceBuffer.buf` is an opaque HANDLE, not a device pointer.** `zimage_cuda`'s
-    /// `offsetBuf` trick — adding a byte offset to `.buf` — is meaningful only on CUDA;
+    /// Per block rather than one buffer with a per-block offset, because on Vulkan
+    /// a `DeviceBuffer.buf` is an opaque HANDLE, not a device pointer. `zimage_cuda`'s
+    /// `offsetBuf` trick, adding a byte offset to `.buf`, is meaningful only on CUDA;
     /// doing it here produced an invalid handle and `error_device_lost` on the first
     /// cross-attention, at a latent far too small for the watchdog to be the cause.
     /// A descriptor binds a whole buffer, so the offset has to be an allocation.
@@ -127,7 +94,7 @@ pub const Session = struct {
     /// modulation tables (see `anima.DiT.foldModulationTable`).
     sigmas: []f32,
     /// Borrowed, model-owned: the FOLDED table for every scheduled sigma, stride
-    /// `mod_stride`. ⚠️ Per SIGMA, not per conditioning — see
+    /// `mod_stride`. Per SIGMA, not per conditioning, see
     /// `anima.DiT.modulationSchedule` for why building it per session cost 0.8 s an image.
     mods: []const f32,
     mod_stride: usize,
@@ -208,11 +175,11 @@ pub const Session = struct {
     /// Project the adapter's output through every block's cross-attention `k`/`v`
     /// (and `knorm`) once, into the layout the active attention path reads.
     ///
-    /// Runs on the **host**: it is one 512-row pass per block, done once per image,
+    /// Runs on the host: it is one 512-row pass per block, done once per image,
     /// and doing it on the device would mean uploading 28 blocks' k/v weights before
     /// the first step rather than letting the step loop stream them in the order it
-    /// wants them. ⚠️ Which also means the k/v weights are touched here and again in
-    /// the trunk — but only their *device* copies are cached, and this path never
+    /// wants them. Which also means the k/v weights are touched here and again in
+    /// the trunk, but only their *device* copies are cached, and this path never
     /// creates one.
     fn buildCrossKv(
         self: *Session,
@@ -231,17 +198,15 @@ pub const Session = struct {
         self.ck_d = try gpa.alloc(Buf, nl);
         self.cv_d = try gpa.alloc(Buf, nl);
 
-        // ⚠️ **On the DEVICE, and it used to be on the host — that was ~0.4 s of a 0.73 s
-        // per-image setup**, the Vulkan half of the "Anima images are slow to start"
-        // report. The CUDA arm was moved first; this is its twin. What made the host
-        // version look cheap was pricing it as a share of a STEP (0.56%) rather than as a
-        // one-off before the first one.
+        // On the DEVICE. On the host this is ~0.4 s of a 0.73 s per-image setup. What
+        // makes the host version look cheap is pricing it as a share of a STEP (0.56%)
+        // rather than as a one-off before the first one. `anima_cuda` does the same.
         var cond_d = try ctx.tensorCreate(cond.len * 4);
         defer ctx.tensorDestroy(&cond_d);
         try ctx.tensorUpload(cond_d, std.mem.sliceAsBytes(cond));
 
         // The cross K/V linears go through `lin` like any other, so a W4A8 checkpoint
-        // decodes here too and needs its scratch sized to the model-wide maximum first —
+        // decodes here too and needs its scratch sized to the model-wide maximum first,
         // growing it later would be correct but costs a submit-and-wait per growth.
         {
             const w4 = anima.maxW4A8Scratch(model, gpu.Context.w4a8ScratchBytes);
@@ -271,7 +236,7 @@ pub const Session = struct {
             try prepGroup(ctx, cond_d, n, cfg.context_dim, &.{ kw, vw });
             try lin(ctx, ks, cond_d, n, kw);
             try lin(ctx, vs, cond_d, n, vw);
-            // ⚠️ K is normed, V is NOT (`v_norm = nn.Identity()`) — the asymmetry
+            // K is normed, V is NOT (`v_norm = nn.Identity()`), the asymmetry
             // `DiT.projectKv` owns on the host path.
             try qkNorm(ctx, ks, model.blocks[bi].cross_attn.knorm, n * heads, hd, cfg.qk_eps);
 
@@ -311,7 +276,7 @@ pub const Session = struct {
     }
 
     /// The precomputed (folded) modulation for `sigma`, or null when the caller probed
-    /// a sigma off the schedule this session was built for — a teacher-forced
+    /// a sigma off the schedule this session was built for, a teacher-forced
     /// measurement; `forward` then builds one on the fly.
     fn tv(self: *const Session, sigma: f32) ?[]const f32 {
         for (self.sigmas, 0..) |s, i| {
@@ -345,7 +310,7 @@ pub const Workspace = struct {
 
     const fields = [_][]const u8{ "x_d", "nrm_d", "dlt_d", "q_d", "k_d", "v_d", "attn_d", "mlp_d", "mod_d", "patch_d", "qt_d", "kt_d", "v16_d" };
 
-    /// ⚠️ `tc` comes from the SESSION (`Session.tc`), not from `useFlash(ctx)` again: the
+    /// `tc` comes from the SESSION (`Session.tc`), not from `useFlash(ctx)` again: the
     /// f16 attention scratch exists only on the flash path, and two independent reads of
     /// a mutable global could disagree if it were flipped between the two constructions.
     /// One decision, made once, passed in.
@@ -354,11 +319,11 @@ pub const Workspace = struct {
         const seq = (lat_h / cfg.patch) * (lat_w / cfg.patch);
         const seq_pad = std.mem.alignForward(usize, seq, 128);
         const d = cfg.dim;
-        // ⚠️ **Every activation buffer is 128-ROW PADDED.** Two independent reasons, and
+        // Every activation buffer is 128-ROW PADDED. Two independent reasons, and
         // both are silent when violated: the f16 attention conversion writes whole padded
         // rows and the flash `out` pass writes `seq_pad` of them back; and a quantized
         // GEMM writes `i8_mpad` rows (`opI8Prep` pads m up to 128 and the coop tile is
-        // 128x128), not `m`. The CUDA twin learned the second one the hard way —
+        // 128x128), not `m`. The CUDA twin learned the second one the hard way,
         // `compute-sanitizer` caught `igemm_pipe_fused` writing past a seq-sized buffer.
         const sizes = [fields.len]usize{
             seq_pad * d * 4,
@@ -396,27 +361,27 @@ pub const Workspace = struct {
 /// Whether this context can run Anima's block GEMMs at all. The trunk weights are
 /// dense bf16 in every checkpoint seen so far, which needs one of the two f16-weight
 /// tensor-core pipelines; a device without either has no path and must stay on the
-/// CPU rather than silently reading the bytes as something else — the failure
+/// CPU rather than silently reading the bytes as something else, the failure
 /// `qwen3_gpu.supportsWeights` exists to prevent.
 pub fn supported(ctx: *gpu.Context, model: *const DiT) bool {
     if (model.blocks.len == 0) return false;
-    // ⚠️ The fused norm is checked HERE, not discovered inside the first forward. Every
+    // The fused norm is checked HERE, not discovered inside the first forward. Every
     // block pre-norm goes through `ln_mod_sg`, and there is no unfused fallback: the
     // shared `modulate` kernel adds its own `1 +`, so it cannot consume the folded table
     // the device path uploads. Without this gate a device lacking subgroup arithmetic
     // would build a whole session and then error three stages in, where `Session.denoiser`
     // can instead warn and leave the trunk on the CPU.
     if (!ctx.hasLnModSg()) return false;
-    // ⚠️ EVERY block's linears, not block 0's — see `anima.unsupportedGpuLin`.
-    // ⚠️ int8 convrot needs the `sint8` coopmat pipeline; **int4 is absent because no
-    // `sint4` coopmat exists on this device** (see the module header).
-    // ⚠️ int4 is accepted because `lin` DECODES it to int8 per GEMM (`ctx.i4Decode`), not
-    // because a `sint4` coopmat exists — it does not. The packed 4-bit form stays resident,
+    // EVERY block's linears, not block 0's, see `anima.unsupportedGpuLin`.
+    // int8 convrot needs the `sint8` coopmat pipeline; int4 is absent because no
+    // `sint4` coopmat exists on this device (see the module header).
+    // int4 is accepted because `lin` DECODES it to int8 per GEMM (`ctx.i4Decode`), not
+    // because a `sint4` coopmat exists, it does not. The packed 4-bit form stays resident,
     // which is what makes int4 cheaper than int8 here rather than the same price.
     const has_i8 = ctx.pipe_coop_i8 != .null_handle;
-    // ⚠️ int4 AND W4A8 each need BOTH the int8 pipeline and their own decode kernel that
-    // feeds it — each decode's output is an ordinary int8-convrot weight, so neither half
-    // alone is a path. (int4 used to need only `has_i8`, because it was widened at load.)
+    // int4 AND W4A8 each need BOTH the int8 pipeline and their own decode kernel that
+    // feeds it, each decode's output is an ordinary int8-convrot weight, so neither half
+    // alone is a path.
     const support: anima.LinSupport = .{
         .i8 = has_i8,
         .i4 = has_i8 and ctx.hasI4Decode(),
@@ -442,11 +407,11 @@ pub fn supported(ctx: *gpu.Context, model: *const DiT) bool {
 /// `i8_x`/`i8_scale` rather than overwriting `x`, so a dense GEMM in the same group is
 /// still free to read the f32 activation.
 ///
-/// ⚠️ `cols` must be one of `gpu.i8_prep_cols` or the prep falls back to a 3-pass chain
+/// `cols` must be one of `gpu.i8_prep_cols` or the prep falls back to a 3-pass chain
 /// that round-trips a full f32 copy of the activation through global memory. Anima's 2048
 /// and 8192 were added to that table for this reason.
 fn prepGroup(ctx: *gpu.Context, x: Buf, m: usize, cols: usize, group: []const Weight) !void {
-    // ⚠️ Grouped by the PREP a kind needs, not by the kind: int8 and W4A8 share one
+    // Grouped by the PREP a kind needs, not by the kind: int8 and W4A8 share one
     // (`anima.prepKind` says why), so a block mixing them pays a single `opI8Prep`.
     var want: anima.PrepKind = .none;
     for (group) |w| {
@@ -459,7 +424,7 @@ fn prepGroup(ctx: *gpu.Context, x: Buf, m: usize, cols: usize, group: []const We
         want = k;
     }
     switch (want) {
-        // ⚠️ **`.i4` takes the INT8 prep here, and that is not a bug.** `anima.prepKind` maps
+        // `.i4` takes the INT8 prep here, and that is not a bug. `anima.prepKind` maps
         // int4 to an int4 activation prep because the CUDA arms run true W4A4; Vulkan has no
         // `sint4` coopmat, so its int4 weights are decoded to int8 per GEMM (`lin`) and the
         // activation stays 8-bit. The prep is a property of the BACKEND's GEMM, not of the
@@ -472,7 +437,7 @@ fn prepGroup(ctx: *gpu.Context, x: Buf, m: usize, cols: usize, group: []const We
 /// One block linear. A quantized weight reads the prep state and fuses the per-row
 /// rescale; a dense one goes to `gemm`.
 ///
-/// ⚠️ `opI8Gemm` requires `rows % (16 * coopmat.i8_nt) == 0`, i.e. a multiple of 64. Every
+/// `opI8Gemm` requires `rows % (16 * coopmat.i8_nt) == 0`, i.e. a multiple of 64. Every
 /// linear the device runs here is 2048 or 8192; the AdaLN pair's 256/6144 and
 /// cross-attention's k/v are evaluated on the HOST.
 fn lin(ctx: *gpu.Context, y: Buf, x: Buf, m: usize, w: Weight) !void {
@@ -481,12 +446,12 @@ fn lin(ctx: *gpu.Context, y: Buf, x: Buf, m: usize, w: Weight) !void {
             std.debug.assert(w.rows % 64 == 0);
             try ctx.opI8Gemm(y, w.bytes, w.row_scale.?, w.rows, false);
         },
-        // ⚠️ **int4 on Vulkan is W4A8-shaped, not W4A4**: there is no `sint4` cooperative
+        // int4 on Vulkan is W4A8-shaped, not W4A4: there is no `sint4` cooperative
         // matrix, so the nibbles must reach the GEMM as int8 either way and the activation
-        // stays int8 (`opI8Prep`). What changed on 2026-08-08 is only WHERE that unpack
-        // happens — per GEMM into a scratch, rather than once at load into a resident int8
-        // copy. Identical arithmetic (a 4-bit value is exact in 8 bits, and the row scale
-        // and rotation are untouched), so renders are bit-identical; it buys 660 MB.
+        // stays int8 (`opI8Prep`). The unpack happens per GEMM into a scratch rather than
+        // once at load into a resident int8 copy, which is worth 660 MB and costs nothing
+        // numerically: a 4-bit value is exact in 8 bits and the row scale and rotation are
+        // untouched.
         .i4 => {
             std.debug.assert(w.rows % 64 == 0);
             const wbuf = try ctx.i4Decode(w.bytes, w.rows, w.cols);
@@ -504,13 +469,13 @@ fn lin(ctx: *gpu.Context, y: Buf, x: Buf, m: usize, w: Weight) !void {
             try ctx.opI8GemmBuf(y, wbuf, &.{}, w.row_scale.?, w.rows, false);
         },
         // Weight-only NVFP4: decoded to an f16 scratch inside the GEMM, so the 4-bit form
-        // stays resident — like both int arms above, decoded per GEMM rather than unpacked
+        // stays resident, like both int arms above, decoded per GEMM rather than unpacked
         // at load, since unpacking gives back exactly the memory a 4-bit format buys.
         .nvfp4 => {
             std.debug.assert(w.rows % 128 == 0 and w.cols % 32 == 0);
             const meta = w.nvfp4.?;
-            // ⚠️ The f16-weight coop GEMM ALWAYS folds a bias in, so it needs the full
-            // zero vector — an empty slice would give `smallBuffer` a 0-byte buffer for
+            // The f16-weight coop GEMM ALWAYS folds a bias in, so it needs the full
+            // zero vector, an empty slice would give `smallBuffer` a 0-byte buffer for
             // `bias_compact` to read `rows` floats out of. Same reason `gemm` does it.
             const zeros: []const f32 = &zero_bias;
             std.debug.assert(w.rows <= zeros.len);
@@ -591,8 +556,8 @@ pub fn forward(
 /// One `MiniTrainDIT` `Block` on the device. `ws.x_d` is `[seq][dim]`, modified in
 /// place; `mod_base` is this block's offset into the uploaded modulation table.
 ///
-/// The three sublayers are identical in shape — modulated weightless LayerNorm,
-/// sublayer, gated residual — and differ only in which third of the table they read
+/// The three sublayers are identical in shape, modulated weightless LayerNorm,
+/// sublayer, gated residual, and differ only in which third of the table they read
 /// and, for attention, whether RoPE applies (Anima's convention 6: self-attention
 /// only).
 fn blockForward(
@@ -622,14 +587,14 @@ fn blockForward(
     try lin(ctx, ws.k_d, ws.nrm_d, seq, blk.self_attn.k);
     try lin(ctx, ws.v_d, ws.nrm_d, seq, blk.self_attn.v);
 
-    // ⚠️ Anima's Q/K norms take the BLOCKS' 1e-6, not `finfo(f32).eps` — unlike
+    // Anima's Q/K norms take the BLOCKS' 1e-6, not `finfo(f32).eps`, unlike
     // Z-Image, whose `RMSNorm(head_dim)` is built with no `eps` at all. Same kernel,
     // different push constant, and no error either way.
     ctx.independent(2);
     try qkNorm(ctx, ws.q_d, blk.self_attn.qnorm, seq * heads, hd, cfg.qk_eps);
     try qkNorm(ctx, ws.k_d, blk.self_attn.knorm, seq * heads, hd, cfg.qk_eps);
-    // ⚠️ SPLIT-half RoPE (pairs `(i, i + 64)`), not the interleaved form Z-Image and
-    // krea2 use — hence `rope_half` rather than `rope_inter`.
+    // SPLIT-half RoPE (pairs `(i, i + 64)`), not the interleaved form Z-Image and
+    // krea2 use, hence `rope_half` rather than `rope_inter`.
     ctx.independent(2);
     try ropeHalf(ctx, ws.q_d, sess.freqs_d, seq, heads, half);
     try ropeHalf(ctx, ws.k_d, sess.freqs_d, seq, heads, half);
@@ -650,8 +615,8 @@ fn blockForward(
     }, seq * d, 1, 1);
 
     // --- cross-attention onto the adapter's output ------------------------------
-    // ⚠️ No RoPE here at all, and K/V come from the session's per-image cache rather
-    // than from two GEMMs — see the module header.
+    // No RoPE here at all, and K/V come from the session's per-image cache rather
+    // than from two GEMMs, see the module header.
     try lnMod(ctx, ws, seq, d, mod_base + 4 * dim32, mod_base + 3 * dim32, cfg.norm_eps);
     try prepGroup(ctx, ws.nrm_d, seq, d, &.{blk.cross_attn.q});
     try lin(ctx, ws.q_d, ws.nrm_d, seq, blk.cross_attn.q);
@@ -675,11 +640,11 @@ fn blockForward(
     try lnMod(ctx, ws, seq, d, mod_base + 7 * dim32, mod_base + 6 * dim32, cfg.norm_eps);
     try prepGroup(ctx, ws.nrm_d, seq, d, &.{blk.mlp1});
     try lin(ctx, ws.mlp_d, ws.nrm_d, seq, blk.mlp1);
-    // `nn.GELU()` with the default `approximate='none'` — the erf form, not tanh.
+    // `nn.GELU()` with the default `approximate='none'`, the erf form, not tanh.
     try ctx.opElt(.gelu_erf, ws.mlp_d, null, null, null, .{
         .u0 = @intCast(seq * cfg.mlp_dim),
     }, seq * cfg.mlp_dim, 1, 1);
-    // ⚠️ Its own prep: the reduction width here is `mlp_dim`, not `dim`.
+    // Its own prep: the reduction width here is `mlp_dim`, not `dim`.
     try prepGroup(ctx, ws.mlp_d, seq, cfg.mlp_dim, &.{blk.mlp2});
     try lin(ctx, ws.dlt_d, ws.mlp_d, seq, blk.mlp2);
     try ctx.opElt(.gated_add, ws.x_d, ws.dlt_d, ws.mod_d, null, .{
@@ -703,8 +668,8 @@ const Kv = struct {
 /// Attention from `ws.q_d` (normed, roped, f32) against `kv`, into `ws.attn_d`.
 ///
 /// Both paths are non-causal and compute the same thing; they differ in how the
-/// scores are produced. ⚠️ **The flash path is a requirement at production
-/// resolutions, not an optimization** — the same statement `zimage_gpu` makes about
+/// scores are produced. The flash path is a requirement at production
+/// resolutions, not an optimization, the same statement `zimage_gpu` makes about
 /// `attn_full`: a thread-per-(query, head) kernel at ~6800 tokens runs long enough to
 /// trip the GPU watchdog (`error_device_lost`, not a slow render), and for
 /// cross-attention it would additionally stream a 512-key context per thread.
@@ -726,7 +691,7 @@ fn attention(ctx: *gpu.Context, sess: *Session, cfg: anima.Config, ws: *Workspac
     }
 
     // Q always converts: it is a fresh activation every block. K/V convert only for
-    // self-attention — the cross cache already holds them in this exact layout.
+    // self-attention, the cross cache already holds them in this exact layout.
     try ctx.opElt(.f32_to_h16, ws.q_d, null, null, ws.qt_d, .{
         .u0 = @intCast(q_pad * d / 2),
         .u1 = @intCast(seq * d),
@@ -761,7 +726,7 @@ fn attention(ctx: *gpu.Context, sess: *Session, cfg: anima.Config, ws: *Workspac
         .u4 = @intCast(heads * hd),
         .u5 = @intCast(md_off),
         .f0 = @bitCast(@as(u32, @intCast(kv.kv_seq))),
-        // ⚠️ The MD table is indexed by QUERY row, so its plane stride is `q_pad` —
+        // The MD table is indexed by QUERY row, so its plane stride is `q_pad`,
         // NOT `u1`, which is the key padded length. 0 would mean "= u1" and is only
         // right for square self-attention; passing it explicitly covers both.
         .f1 = @bitCast(@as(u32, @intCast(q_pad))),
@@ -772,7 +737,7 @@ fn attention(ctx: *gpu.Context, sess: *Session, cfg: anima.Config, ws: *Workspac
 
 /// Fused weightless LayerNorm + AdaLN modulation, `x_d -> nrm_d`.
 ///
-/// ⚠️ `premul_off` points at the table's SCALE block, which `foldModulationTable`
+/// `premul_off` points at the table's SCALE block, which `foldModulationTable`
 /// has already turned into `1 + scale`. The two-kernel alternative
 /// (`layernorm` + `modulate`) exists on this backend but would read and write the
 /// whole activation twice, and its `layernorm` is one thread per row.
@@ -785,12 +750,12 @@ fn lnMod(ctx: *gpu.Context, ws: *Workspace, rows: usize, dim: usize, premul_off:
 
 /// Per-head RMSNorm over `[rows][hd]`, in place.
 ///
-/// ⚠️ **The SUBGROUP kernel, not `Elt.rmsnorm`** — measured **173 -> 358 GB/s** at Anima's
+/// The SUBGROUP kernel, not `Elt.rmsnorm`, measured 173 -> 358 GB/s at Anima's
 /// geometry (`anima-vk-bench`, seq 1536, 16 heads of 128). `rmsnorm` gives each thread a
 /// whole 128-wide head, so a warp's 32 loads land 512 B apart and every one is its own
 /// sector fetch; `rmsnorm_sg` gives each head to a subgroup, so the 32 lanes read one
 /// contiguous line. Exactly the mistake `qk_rmsnorm_warp` fixed on CUDA, where it was worth
-/// 17x — and the subgroup kernel had been sitting here unused. Three calls per block.
+/// 17x, and the subgroup kernel had been sitting here unused. Three calls per block.
 fn qkNorm(ctx: *gpu.Context, x: Buf, weights: []const f32, rows: usize, hd: usize, eps: f32) !void {
     const w = try normBuf(ctx, weights);
     if (ctx.hasSubgroupNorm()) return ctx.opRmsNormSg(x, x, w, rows, hd, eps);
@@ -811,13 +776,13 @@ fn ropeHalf(ctx: *gpu.Context, x: Buf, freqs: Buf, rows: usize, heads: usize, ha
     }, total, 1, 1);
 }
 
-/// A block GEMM, dispatched by weight dtype — the same routing `zimage_gpu.gemm`
+/// A block GEMM, dispatched by weight dtype, the same routing `zimage_gpu.gemm`
 /// uses. Anima ships dense bf16, which takes one of the two f16-weight tensor-core
 /// pipelines (native bf16 where the device has a bf16 coop config, else bf16->f16 at
 /// upload; both keep the conversion off the host under weight streaming).
 fn gemm(ctx: *gpu.Context, y: Buf, x: Buf, m: usize, w: Weight) !void {
     // Every Anima block linear is bias-free, but the f16-weight coop GEMM always folds
-    // one in, so hand it the FULL zero vector — see `zero_bias`.
+    // one in, so hand it the FULL zero vector, see `zero_bias`.
     const zeros: []const f32 = &zero_bias;
     std.debug.assert(w.rows <= zeros.len);
     switch (w.dtype) {
@@ -845,7 +810,7 @@ fn normBuf(ctx: *gpu.Context, weights: []const f32) !Buf {
 // --- tests ------------------------------------------------------------------
 //
 // Two tiers. The first needs no device and pins the modulation-table fold, which is a
-// pure convention that yields a plausible image when muddled — and did: folding the
+// pure convention that yields a plausible image when muddled, and did: folding the
 // FINAL layer's scale as well as the blocks' cost a rel L2 of 0.10 against the CPU
 // forward, identical on both attention paths. The device tests below it check the
 // rectangular attention against `ops.attention` and then the whole forward against
@@ -856,7 +821,7 @@ const test_gate = @import("../test_gate.zig");
 const safetensors = @import("tp_core").safetensors;
 
 const anima_ckpt = "/home/qt/genai/comfyui/models/diffusion_models/anima/terraRising_20TerraRisingAnima.safetensors";
-/// The same model, quantized to ComfyUI's packed `asym_w4a8_int8`. ⚠️ Block 0 is left
+/// The same model, quantized to ComfyUI's packed `asym_w4a8_int8`. Block 0 is left
 /// dense and block 1 onward is quantized (every real "mixed" checkpoint does this), so a
 /// 2-block model is the shallowest one that exercises a quantized block at all.
 const anima_w4a8_ckpt = "/home/qt/genai/comfyui/models/diffusion_models/anima/terraRising_20TerraRisingAnima-ASYM_W4A8_INT8.safetensors";
@@ -873,9 +838,9 @@ fn relL2(want: []const f32, got: []const f32) f64 {
 }
 
 test "the modulation fold touches every block scale and NOT the final layer's" {
-    // ⚠️ The asymmetry is the whole content of this test. The device's fused norm
+    // The asymmetry is the whole content of this test. The device's fused norm
     // computes `(x-mean)*inv*premul + shift` with no place for the `1 +`, so every
-    // BLOCK scale arrives pre-folded — but the final layer runs on the HOST through
+    // BLOCK scale arrives pre-folded, but the final layer runs on the HOST through
     // `DiT.finalize`, whose `modulatedNorm` adds its own 1. Folding it there too was a
     // real bug (rel L2 0.10 vs the CPU forward, identical on both attention paths,
     // which is what said "shared wiring, not attention"). Nothing about it is loud:
@@ -914,9 +879,9 @@ fn gpuCtx(gpa: std.mem.Allocator, io: std.Io) !*gpu.Context {
 test "Anima gpu cross-attention matches ops.attention at unequal q/kv lengths" {
     // The rectangular flash path, at Anima's real cross-attention shape (16 heads of
     // 128 against a 512-row context) plus a key length that is NOT a multiple of 128,
-    // which is what exercises the padded-key masking. ⚠️ This shape is new to the
-    // kernel — `s_stride` used to double as the MD plane stride, so every head past the
-    // first read another head's {max, 1/sum} once q_pad exceeded kv_pad.
+    // which is what exercises the padded-key masking. This shape is new to the
+    // kernel: if `s_stride` doubles as the MD plane stride, every head past the first
+    // reads another head's {max, 1/sum} once q_pad exceeds kv_pad.
     const gpa = testing.allocator;
     const io = testing.io;
     try test_gate.requireIntegration();
@@ -958,7 +923,7 @@ test "Anima gpu cross-attention matches ops.attention at unequal q/kv lengths" {
         });
 
         // Drive the same buffers `attention()` builds: Q f16 with the scale prefolded,
-        // K per-head k-major f16, V f16 — here from the host so the test exercises the
+        // K per-head k-major f16, V f16, here from the host so the test exercises the
         // kernel rather than the session's cache builder.
         var q16 = try ctx.tensorCreate(q_pad * dim * 2);
         defer ctx.tensorDestroy(&q16);
@@ -1014,13 +979,13 @@ test "Anima gpu cross-attention matches ops.attention at unequal q/kv lengths" {
 }
 
 test "the Vulkan int4 decode matches the CPU nibble unpack, including the row padding" {
-    // ⚠️ **This kernel replaced a load-time widening, so what it must reproduce EXACTLY is
-    // that widening** — otherwise the change is a silent quality regression rather than a
+    // This kernel replaced a load-time widening, so what it must reproduce EXACTLY is
+    // that widening, otherwise the change is a silent quality regression rather than a
     // VRAM win. The reference here is therefore the same sign-extending unpack
-    // `anima_gpu.widen` used to do (and that `ops.matmul`'s i4 path does), laid out k-major
-    // with zeroed row padding, which is what the GEMM reads.
+    // `ops.matmul`'s i4 path does, laid out k-major with zeroed row padding, which is
+    // what the GEMM reads.
     //
-    // ⚠️ The PADDING is not incidental: `opI8GemmBuf` reads whole 64-row tiles and this
+    // The PADDING is not incidental: `opI8GemmBuf` reads whole 64-row tiles and this
     // scratch is shared between weights of different shapes, so an unwritten pad slot would
     // feed the next GEMM the previous weight's values.
     const gpa = testing.allocator;
@@ -1036,7 +1001,7 @@ test "the Vulkan int4 decode matches the CPU nibble unpack, including the row pa
         .{ .rows = 2048, .cols = 1024 }, // Anima's cross-attention k/v shape
         .{ .rows = 132, .cols = 256 },
     };
-    // ⚠️ Every case's buffers stay ALIVE in one arena: the device weight cache keys on the
+    // Every case's buffers stay ALIVE in one arena: the device weight cache keys on the
     // HOST POINTER, so freeing one case's array and letting the allocator reuse the address
     // scores a stale cache hit and decodes the PREVIOUS case's weights. That is a real
     // failure the W4A8 kernel's test hit first, and it looks like a shape bug.
@@ -1053,7 +1018,7 @@ test "the Vulkan int4 decode matches the CPU nibble unpack, including the row pa
         const want = try alloc.alloc(i8, stride * c.cols);
         @memset(want, 0);
         for (packed_bytes, 0..) |byte, i| {
-            // ⚠️ LOW nibble = EVEN element, sign-extended — the packing `ops.matmul`'s i4
+            // LOW nibble = EVEN element, sign-extended, the packing `ops.matmul`'s i4
             // path and ComfyUI's W4A4 converter both use. Swapping the halves is
             // rms-preserving, so only a positional check like this one can see it.
             const row = i / (c.cols / 2);
@@ -1083,11 +1048,11 @@ test "Anima gpu forward matches the CPU forward on a real checkpoint" {
 }
 
 test "Anima gpu forward matches the CPU forward on a real W4A8 checkpoint" {
-    // ⚠️ **A LOOSER bound, and it is not the dense one relaxed until it passed.** A
+    // A LOOSER bound, and it is not the dense one relaxed until it passed. A
     // quantized checkpoint is a different computation on the two sides, not a different
     // rounding of one: the CPU `matmul` decodes the packed weight and multiplies in f32
-    // (weight-only), while the device additionally quantizes the ACTIVATION to int8 —
-    // W4A8's "A8" — so the residual includes an error the reference never incurs.
+    // (weight-only), while the device additionally quantizes the ACTIVATION to int8,
+    // W4A8's "A8", so the residual includes an error the reference never incurs.
     //
     // The receipt that this is quantization and not wiring is that the SAME model
     // quantized int8 measures the same figure: 2.0721e-3 (int8) against 2.0968e-3 (w4a8)
@@ -1098,7 +1063,7 @@ test "Anima gpu forward matches the CPU forward on a real W4A8 checkpoint" {
 
 /// One checkpoint's Vulkan forward against `anima.DiT.predict` on the same weights.
 ///
-/// Truncated to 2 trunk blocks so it loads in seconds — the loop bound is not what a
+/// Truncated to 2 trunk blocks so it loads in seconds, the loop bound is not what a
 /// kernel port gets wrong, the block's shape is, and the end-to-end render covers the
 /// depth. Two blocks is also the minimum that reaches a quantized one, since every real
 /// mixed checkpoint leaves block 0 dense.
@@ -1139,9 +1104,9 @@ fn forwardParity(path: []const u8, tol: f64) !void {
         try model.predict(io, gpa, want, x_lat, lat_h, lat_w, cond, ctx_seq, mod, null);
     }
 
-    // ⚠️ **The flash path only**, unlike Z-Image's equivalent test. `Session` caches
-    // cross-attention's K/V in whichever form the chosen path reads — f16 attention
-    // operands or plain f32 — so the two arms cannot share a session, and the flash one
+    // The flash path only, unlike Z-Image's equivalent test. `Session` caches
+    // cross-attention's K/V in whichever form the chosen path reads, f16 attention
+    // operands or plain f32, so the two arms cannot share a session, and the flash one
     // is what actually runs at every resolution. `anima-cuda-test` is where both
     // attention arms are compared against the same CPU forward.
     const sched = try model.modulationSchedule(io, gpa, &.{ sigma, 0 });
@@ -1158,7 +1123,7 @@ fn forwardParity(path: []const u8, tol: f64) !void {
 
     const rel = relL2(want, got);
     errdefer std.debug.print("anima gpu forward on {s}: rel L2 {e:.4} (tol {e:.1})\n", .{ path, rel, tol });
-    // bf16 GEMMs and f16 attention against the CPU's f32 accumulation — the regime
+    // bf16 GEMMs and f16 attention against the CPU's f32 accumulation, the regime
     // `zimage_gpu` and `sd_unet_cuda` already sit in.
     try testing.expect(rel < tol);
 }

@@ -57,9 +57,9 @@ pub const API_VERSION_1_3: u32 = makeApiVersion(0, 1, 3, 0);
 // ---------------------------------------------------------------------------
 // Handles
 //
-// Dispatchable handles are `typedef struct Vk*_T* Vk*;` in C — pointer-sized.
+// Dispatchable handles are `typedef struct Vk*_T* Vk*;` in C, pointer-sized.
 // Non-dispatchable handles are 64-bit on all targets
-// (`VK_DEFINE_NON_DISPATCHABLE_HANDLE` → uint64_t on non-64-bit platforms).
+// (`VK_DEFINE_NON_DISPATCHABLE_HANDLE` -> uint64_t on non-64-bit platforms).
 // Both are represented as non-exhaustive enums so `.null_handle` replaces
 // VK_NULL_HANDLE and accidental integer mixing is a compile error.
 // ---------------------------------------------------------------------------
@@ -90,11 +90,11 @@ pub const ImageView = enum(u64) { null_handle = 0, _ };
 pub const RenderPass = enum(u64) { null_handle = 0, _ };
 pub const Framebuffer = enum(u64) { null_handle = 0, _ };
 
-/// `VkAllocationCallbacks` — we never provide host allocation callbacks;
+/// `VkAllocationCallbacks`, we never provide host allocation callbacks;
 /// only `?*const AllocationCallbacks == null` is ever passed.
 pub const AllocationCallbacks = opaque {};
 
-/// `VkImageMemoryBarrier` — TensorPencil uses no images; only a null pointer
+/// `VkImageMemoryBarrier`, TensorPencil uses no images; only a null pointer
 /// with `imageMemoryBarrierCount == 0` is ever passed to vkCmdPipelineBarrier.
 pub const ImageMemoryBarrier = opaque {};
 
@@ -218,7 +218,7 @@ pub const ImageLayout = enum(i32) {
     _,
 };
 
-/// `VkShaderStageFlagBits` — used as a typed (single-bit) field in
+/// `VkShaderStageFlagBits`, used as a typed (single-bit) field in
 /// `PipelineShaderStageCreateInfo`; a C enum, 4 bytes.
 pub const ShaderStageFlagBits = enum(u32) {
     vertex = 0x00000001,
@@ -335,7 +335,7 @@ pub const MemoryAllocate = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Structs — field order and types exactly as in vulkan_core.h.
+// Structs, field order and types exactly as in vulkan_core.h.
 // sType-carrying structs default their s_type/p_next (and zero their flags)
 // so call sites stay terse.
 // ---------------------------------------------------------------------------
@@ -986,7 +986,7 @@ pub const BufferCopy = extern struct {
 // C calling convention on Linux x86_64.
 // ---------------------------------------------------------------------------
 
-/// `PFN_vkVoidFunction` — what the proc-addr loaders return; cast to a
+/// `PFN_vkVoidFunction`, what the proc-addr loaders return; cast to a
 /// concrete `Pfn*` type with `@ptrCast`.
 pub const PfnVoidFunction = ?*const fn () callconv(.c) void;
 

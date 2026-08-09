@@ -1,9 +1,9 @@
-//! tp_models — the model tier: neural-net architectures plus the LLM generation
+//! tp_models, the model tier: neural-net architectures plus the LLM generation
 //! machinery that drives them. Depends on tp_core, tp_ops, tp_gpu, tp_runtime.
 //!
 //! `models` holds the architectures (text encoders, DiT, VAE, qwen/gemma LLMs,
 //! ViT towers, the EAGLE-3 drafter). `llm` holds the generation orchestration
-//! that operates over any model via duck typing — chat templating, the decode
+//! that operates over any model via duck typing, chat templating, the decode
 //! `engine`, speculative decoding (`spec`), the REPL, and the session wrapper.
 //! They live in one module because they are mutually recursive (spec drafts for
 //! a concrete model; models' integration tests drive the engine), and neither

@@ -188,13 +188,13 @@ pub const TreeParams = struct {
     scale: ?f32 = null,
 };
 
-/// Tree-verify attention (speculative tree drafting, LLM_PLAN.md M8):
+/// Tree-verify attention (speculative tree drafting):
 /// `parents.len` query nodes, node i attending the full committed prefix
 /// plus its own ancestor chain among the batch rows (parents[i] < i;
 /// parents[0] == 0 is the root, which attends only the prefix and itself).
 /// q/out are [n][n_heads*hd]; k/v_prefix are the cached rows
 /// [prefix_len][n_kv_heads*hd]; k/v_tree are the batch rows [n][kv_dim].
-/// Serial per (node, head) — verify batches are tiny and this is the
+/// Serial per (node, head), verify batches are tiny and this is the
 /// reference implementation for the GPU kernels, not a production CPU path.
 pub fn attentionTree(
     gpa: std.mem.Allocator,
@@ -378,7 +378,7 @@ test "bidirectional block attends the full sequence forward" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     // A whole-batch bidirectional block (image-token prefill, no prefix) makes
-    // every query attend every key forward AND back — identical to plain
+    // every query attend every key forward AND back, identical to plain
     // non-causal attention, even though `causal` is set.
     {
         var out: [24]f32 = undefined;
@@ -394,7 +394,7 @@ test "bidirectional block attends the full sequence forward" {
         for (attn_out, out) |e, a| try std.testing.expectApproxEqAbs(e, a, 3e-6);
     }
     // With a prefix (seq_q < seq_kv): the block queries (rows 1,2) still attend
-    // the whole kv sequence — the prefix key 0 AND the forward key 2 — so their
+    // the whole kv sequence, the prefix key 0 AND the forward key 2, so their
     // outputs equal the corresponding full-attention rows. Confirms the forward
     // extension is not clipped by the query's own causal position.
     {
@@ -504,7 +504,7 @@ test "tree attention: a node never sees its sibling branch" {
     const gpa = std.testing.allocator;
     // Nodes: A (root, position 1), B and C both children of A (position 2).
     // B carries garbage K/V; C's output must still equal the full-causal row
-    // for the chain prefix->A->C — proof it attends only its own ancestors.
+    // for the chain prefix->A->C, proof it attends only its own ancestors.
     const junk = [_]f32{ 100, -100, 100, -100 };
     const q = attn_q[8..16] ++ junk ++ junk ++ attn_q[16..24];
     const k_tree = attn_k[4..8] ++ junk ++ attn_k[8..12];

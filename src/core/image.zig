@@ -59,7 +59,7 @@ pub fn encodePngRgbText(gpa: std.mem.Allocator, out: *std.ArrayList(u8), pixels:
     defer gpa.free(raw);
     try filterScanlines(gpa, raw, pixels, width, height);
 
-    // zlib stream: 2-byte header (level 4 → FLEVEL "fast", matching ComfyUI),
+    // zlib stream: 2-byte header (level 4 -> FLEVEL "fast", matching ComfyUI),
     // the raw deflate body, then an Adler-32 of the filtered scanlines.
     const deflated = try deflateRaw(gpa, raw);
     defer gpa.free(deflated);
@@ -159,7 +159,7 @@ fn paeth(a: u8, b: u8, c: u8) u8 {
     return c;
 }
 
-/// Absolute value of `v` interpreted as a signed byte — the filter cost metric.
+/// Absolute value of `v` interpreted as a signed byte, the filter cost metric.
 fn absSigned(v: u8) u64 {
     return if (v < 128) v else @as(u64, 256) - v;
 }
@@ -186,7 +186,7 @@ pub const DecodedPng = struct {
 };
 
 /// Decode an 8-bit non-interlaced truecolor PNG (color type 2 RGB or
-/// 6 RGBA — alpha is dropped) to interleaved RGB. Covers what image
+/// 6 RGBA, alpha is dropped) to interleaved RGB. Covers what image
 /// editors and ComfyUI emit; not a general PNG reader (no palette, no
 /// 16-bit, no interlacing). Caller frees `pixels`.
 pub fn decodePngRgb(gpa: std.mem.Allocator, data: []const u8) !DecodedPng {
@@ -352,7 +352,7 @@ test "tEXt metadata chunk is embedded after IHDR" {
         if (std.mem.eql(u8, chunk_type, "tEXt")) text_payload = data;
         i += 12 + len;
     }
-    // Expected chunk order: IHDR, tEXt, IDAT…, IEND.
+    // Expected chunk order: IHDR, tEXt, IDAT..., IEND.
     try std.testing.expectEqualStrings("IHDR", order.items[0]);
     try std.testing.expectEqualStrings("tEXt", order.items[1]);
     try std.testing.expectEqualStrings("IDAT", order.items[2]);
@@ -369,7 +369,7 @@ test "png round-trips through deflate and filtering" {
     const width = 7;
     const height = 5;
 
-    // A gradient so adjacent pixels differ — exercises the filter heuristic.
+    // A gradient so adjacent pixels differ, exercises the filter heuristic.
     var pixels: [width * height * 3]u8 = undefined;
     for (0..height) |y| {
         for (0..width) |x| {
@@ -468,7 +468,7 @@ test "planar conversion clamps and scales" {
 // tEXt metadata, reading
 // ---------------------------------------------------------------------------
 
-/// Read every `tEXt` chunk out of a PNG — the counterpart to
+/// Read every `tEXt` chunk out of a PNG, the counterpart to
 /// `encodePngRgbText`. AUTOMATIC1111, ComfyUI and this project all record
 /// generation parameters this way, so a consumer comparing generated images can
 /// recover the seed, sampler and model that produced each one instead of being
@@ -495,7 +495,7 @@ pub fn readTextChunks(gpa: std.mem.Allocator, data: []const u8) ![]TextChunk {
 
         if (std.mem.eql(u8, kind, "tEXt")) {
             const body = data[body_start .. body_start + len];
-            // keyword \0 text — a chunk without the separator is malformed.
+            // keyword \0 text, a chunk without the separator is malformed.
             const nul = std.mem.indexOfScalar(u8, body, 0) orelse return error.InvalidPng;
             try out.append(gpa, .{ .keyword = body[0..nul], .text = body[nul + 1 ..] });
         } else if (std.mem.eql(u8, kind, "IEND")) {
@@ -530,7 +530,7 @@ pub fn mse(a: []const u8, b: []const u8) !f64 {
 
 /// Peak signal-to-noise ratio in dB against an 8-bit peak of 255.
 ///
-/// Unambiguous as metrics go — unlike SSIM (`ssim` below), whose conventions had
+/// Unambiguous as metrics go, unlike SSIM (`ssim` below), whose conventions had
 /// to be pinned against scikit-image before it could be trusted. Identical
 /// images return infinity rather than a large sentinel; a caller reporting a
 /// table should special-case it rather than print `inf` and let a reader wonder.
@@ -540,10 +540,10 @@ pub fn psnr(a: []const u8, b: []const u8) !f64 {
     return 10.0 * std.math.log10(255.0 * 255.0 / m);
 }
 
-/// RMS of the horizontal and vertical first differences of luma — a crude
+/// RMS of the horizontal and vertical first differences of luma, a crude
 /// measure of how much fine detail an image carries at all.
 ///
-/// **Not a standard metric, and not a similarity metric.** It exists because
+/// Not a standard metric, and not a similarity metric. It exists because
 /// PSNR between two generated images is confounded when their composition
 /// drifts: a quantization that keeps the subject but loses texture and one that
 /// draws a different picture both score badly, and the two failures call for
@@ -598,7 +598,7 @@ pub const SsimWindow = enum {
 /// Mean structural similarity between two equally sized 8-bit RGB images, in
 /// [-1, 1]; 1 for identical input.
 ///
-/// Computed per channel over `window`, then averaged over the three channels —
+/// Computed per channel over `window`, then averaged over the three channels,
 /// scikit-image's `channel_axis=-1` convention, not luma. Only fully-interior
 /// windows contribute (the reference crops the border by the window radius),
 /// which is also why no boundary-extension mode appears here: cropped-away

@@ -1,9 +1,8 @@
-//! tp-llm — LLM chat CLI, a thin driver over the TensorPencil library.
+//! tp-llm, LLM chat CLI, a thin driver over the TensorPencil library.
 //!
 //! One-shot (--prompt) or interactive multi-turn chat (no --prompt) over the
-//! Qwen3-VL-4B stack on the cpu / vulkan / zig-cuda / cuda backends; see
-//! LLM_PLAN.md. Use -Doptimize=ReleaseFast; Debug is far too slow for a 4B
-//! model.
+//! Qwen3-VL-4B stack on the cpu / vulkan / zig-cuda / cuda backends. Use
+//! -Doptimize=ReleaseFast; Debug is far too slow for a 4B model.
 
 const std = @import("std");
 const Io = std.Io;
@@ -256,7 +255,7 @@ pub fn main(init: std.process.Init) !void {
     // Tool declarations, if any: parsed ONCE into the process arena and read
     // from the global by every render site (one-shot and interactive alike), so
     // the two cannot disagree about what the model was told it can call. A bad
-    // file is fatal here rather than a silently tool-less prompt — the failure
+    // file is fatal here rather than a silently tool-less prompt, the failure
     // mode of "declared tools that never arrived" is a model that simply never
     // calls anything, which looks like the model's fault.
     if (tools_path) |tp| {
@@ -286,7 +285,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Default context ceiling: the model's trained context length (growth
     // commits KV rows only as the conversation fills, so a big ceiling costs
-    // VRAM lazily — and stops gracefully when even layer offload can't
+    // VRAM lazily, and stops gracefully when even layer offload can't
     // free enough). Speculative sessions allocate the whole window physically
     // up front, so without an explicit --max-context they keep the 4096
     // default. Vulkan also reserves up front but AUTO-SIZES to what VRAM holds
@@ -409,7 +408,7 @@ fn runQwen3(
     defer lm.deinit();
     // Vulkan runs block-quant layer weights + an untied block-quant head
     // (per-row fused-dequant GEMV, VulkanLM.gemvW), but the token embedding is
-    // host-gathered into an f32 copy — there is no Vulkan block-quant gather
+    // host-gathered into an f32 copy, there is no Vulkan block-quant gather
     // kernel, so a block-quant embedding still needs cpu / zig-cuda / cuda.
     if (backend == .vulkan and lm.embed.dtype.isBlockQuant()) {
         try stdout.writeAll("A GGUF checkpoint with a block-quantized token embedding runs on cpu / zig-cuda / cuda only (Vulkan needs an f16/bf16 embed table)\n");
@@ -417,7 +416,7 @@ fn runQwen3(
         return error.InvalidArgument;
     }
     // Tokenizer: a GGUF checkpoint carries its own vocab (which may differ from
-    // the embedded Qwen3 one — e.g. Qwen3.6's 248k tokens); fall back to the
+    // the embedded Qwen3 one, e.g. Qwen3.6's 248k tokens); fall back to the
     // embedded tokenizer when the file has none (ComfyUI-style conversions strip it).
     var tok = switch (st.*) {
         .gguf => |*g| TensorPencil.tokenizer.Tokenizer.initFromGguf(arena, g) catch |err| switch (err) {
@@ -432,7 +431,7 @@ fn runQwen3(
 
     // Draft model for speculative decoding (same tokenizer family; its own KV
     // cache and stepper). Implies spec decoding. The mapped checkpoint must
-    // outlive the session — weights are views into it.
+    // outlive the session, weights are views into it.
     var draft_st: ?ModelFile = null;
     defer if (draft_st) |*s| s.deinit();
     var draft_lm: ?qwen3.CausalLM = null;
@@ -486,7 +485,7 @@ fn runQwen3(
     defer ids.deinit(gpa);
     // One-shot `--prompt` renders through the embedded template when present
     // (correct `[INST]` for Mistral/llama; identical to a chat first turn).
-    // Interactive (prompt == null) with a template leaves `ids` empty here —
+    // Interactive (prompt == null) with a template leaves `ids` empty here,
     // `renderDrivenChat` re-renders the whole transcript and takes the system
     // from `chat_template.system_prompt`; only the no-template hand-glue
     // interactive fallback needs the system primed into `ids` up front.
@@ -600,8 +599,8 @@ const ImageChat = union(enum) {
 /// encode each mentioned PNG on the session ViT, append the interleaved
 /// user turn + assistant open, then prefill everything through the last
 /// image (text via prefill, image rows via prefillImage) so the engine's
-/// cached()-based prefill takes over from the tail. Returns false — with
-/// a message, and ids untouched or rolled back — when images are
+/// cached()-based prefill takes over from the tail. Returns false, with
+/// a message, and ids untouched or rolled back, when images are
 /// unavailable, a file fails to decode, or the turn doesn't fit the
 /// remaining context.
 fn imageTurn(
@@ -690,7 +689,7 @@ fn imageTurn(
 
 /// Read one interactive message with the raw-mode editor (Shift/Alt-Enter
 /// insert newlines, bracketed paste keeps pasted newlines literal). The
-/// tty is raw and the terminal modes are enabled only inside this call —
+/// tty is raw and the terminal modes are enabled only inside this call,
 /// generation runs with the terminal cooked again, so Ctrl-C still kills
 /// a running reply. Returns null at end of session (Ctrl-D, closed stdin).
 fn readEditorMessage(ed: *llm.repl.Editor, fd: std.posix.fd_t, stdin: *Io.Reader, gpa: std.mem.Allocator, stdout: *Io.Writer) !?[]const u8 {
@@ -725,7 +724,7 @@ fn readEditorMessage(ed: *llm.repl.Editor, fd: std.posix.fd_t, stdin: *Io.Reader
 // prompt (strips prior-turn thoughts, handles the system/`<|think|>` cue, BOS,
 // etc.). We keep a transcript of {role, raw content} and, each turn, render the
 // FULL transcript to a token sequence, reconcile it with the committed KV
-// (rewind to the longest common prefix — which for a stripped thought lands
+// (rewind to the longest common prefix, which for a stripped thought lands
 // exactly on the previous turn's boundary), and generate. Text-only CUDA path
 // only (gated in runSession); image/spec/no-template sessions keep the glue.
 
@@ -740,7 +739,7 @@ fn setupChatTemplate(arena: std.mem.Allocator, g: *const TensorPencil.Gguf, tok:
 }
 
 /// As `setupChatTemplate`, but `override_src` (when non-null) replaces the
-/// model's embedded template — used by the gemma4 canonical-template override.
+/// model's embedded template, used by the gemma4 canonical-template override.
 fn setupChatTemplateEx(arena: std.mem.Allocator, g: *const TensorPencil.Gguf, tok: *const TensorPencil.tokenizer.Tokenizer, system: ?[]const u8, override_src: ?[]const u8) void {
     llm.chat_template.active = if (override_src) |src|
         (llm.chat_template.ChatTemplate.fromSource(arena, src) catch null)
@@ -752,8 +751,8 @@ fn setupChatTemplateEx(arena: std.mem.Allocator, g: *const TensorPencil.Gguf, to
 }
 
 /// Build the initial `--prompt` one-shot token ids. When the model shipped an
-/// embedded chat_template, render `[system,] user` through it — the SAME source
-/// of truth the interactive `renderDrivenChat` uses — so a one-shot and a chat
+/// embedded chat_template, render `[system,] user` through it, the SAME source
+/// of truth the interactive `renderDrivenChat` uses, so a one-shot and a chat
 /// first turn are byte-identical (and Mistral/llama models get their real
 /// `[INST]` format instead of the ChatML hand glue). Falls back to the
 /// per-family hand glue when there is no template.
@@ -899,7 +898,7 @@ fn imageExpandFor(tok: *const TensorPencil.tokenizer.Tokenizer) ?llm.chat_templa
 /// Prefill `ids[from..to)`, splicing each current-turn image's ViT embeddings
 /// in at its recorded row (via `prefillImage`) instead of the pad tokens. Rows
 /// not in `cur_rows` (past-turn images, only reachable after a full context
-/// reset) prefill as their plain pad tokens — degraded but safe.
+/// reset) prefill as their plain pad tokens, degraded but safe.
 fn prefillTail(model: anytype, gpa: std.mem.Allocator, ids: []const u32, from: usize, to: usize, cur_rows: []const usize, cur_imgs: []const RenderImg) !void {
     _ = gpa;
     var cur = from;
@@ -918,7 +917,7 @@ fn prefillTail(model: anytype, gpa: std.mem.Allocator, ids: []const u32, from: u
 /// (which already carries the call in the model's own trained format), so this
 /// cannot alter the next prompt.
 ///
-/// ⚠️ Scans the ANSWER only. A reasoning model routinely writes a call out while
+/// Scans the ANSWER only. A reasoning model routinely writes a call out while
 /// deciding whether to make it; printing those would have a user answering a
 /// call that was never made.
 fn reportToolCalls(
@@ -1025,7 +1024,7 @@ fn renderDrivenChat(
         // this engine declares tools and parses the calls back out, but it
         // executes nothing, and inventing an executor here would be guessing at
         // what a caller wants run. Refused outright when the loaded template has
-        // no tool role — gemma3 RAISES on one, which would kill the render.
+        // no tool role, gemma3 RAISES on one, which would kill the render.
         var is_tool_turn = false;
         if (std.mem.startsWith(u8, line, "/tool")) {
             const body = std.mem.trim(u8, line["/tool".len..], " \t");
@@ -1142,9 +1141,9 @@ fn renderDrivenChat(
         updateBoundary(model, gpa, &boundary);
 
         // Does THIS render leave the reasoning block open? Measured from the
-        // prompt's tail (the template primes `…assistant\n<think>\n` when
-        // thinking is on), because it decides where the answer — and so where a
-        // real tool call, as opposed to one the model merely weighed — starts.
+        // prompt's tail (the template primes `...assistant\n<think>\n` when
+        // thinking is on), because it decides where the answer, and so where a
+        // real tool call, as opposed to one the model merely weighed, starts.
         const primed = blk: {
             const tail_n = @min(desired.items.len, 16);
             const tail = tok.decodeAlloc(gpa, desired.items[desired.items.len - tail_n ..]) catch break :blk false;
@@ -1169,7 +1168,7 @@ fn renderDrivenChat(
         timing.add(turn_timing);
         committed.clearRetainingCapacity();
         try committed.appendSlice(gpa, desired.items);
-        // Store the assistant reply RAW (thought included) — strip_thinking
+        // Store the assistant reply RAW (thought included), strip_thinking
         // removes it from context on the next render.
         const reply = try tok.decodeAlloc(gpa, desired.items[gen_start..]);
         try transcript.append(gpa, .{ .role = .assistant, .content = reply });
@@ -1225,7 +1224,7 @@ fn runSession(
     // the stepper exposes the KV primitives (no speculative drafter). Handles
     // both text and @image turns; the hand glue below only runs for
     // no-template / speculative sessions. Fixes prior-turn thought
-    // accumulation (TODO #1) — text and vision alike.
+    // accumulation (TODO #1), text and vision alike.
     {
         const M = childType(@TypeOf(model));
         const drafter_null = @typeInfo(@TypeOf(drafter)) == .null;
@@ -1336,7 +1335,7 @@ const SimpleDriver = struct {
 /// The generation `driver` for qwen35: like `SimpleDriver`, but first applies a
 /// hybrid CPU/GPU layer split (`--cpu-layers` / `--offload-grow`) to the built
 /// CUDA model and prints the split banner. The split is CUDA-only, so the setup
-/// is `@hasDecl`-guarded — it compiles away for the cpu / vulkan steppers (which
+/// is `@hasDecl`-guarded, it compiles away for the cpu / vulkan steppers (which
 /// the earlier feature gate has already restricted to no-split).
 const Qwen35Driver = struct {
     cpu_split: ?TensorPencil.models.qwen35_cuda.CpuSplitPolicy,
@@ -1863,7 +1862,7 @@ fn runGemma3(
     defer ids.deinit(gpa);
     // Gemma prompts begin with a single BOS ({{ bos_token }} in the template).
     if (tok.specialId("<bos>")) |bos| try ids.append(gpa, bos);
-    // Rows before the image block, and the block's soft-token count — the
+    // Rows before the image block, and the block's soft-token count, the
     // one-shot prefill interleaves text / image / text around them.
     var n_pre: usize = 0;
     var n_img: usize = 0;
@@ -1916,7 +1915,7 @@ fn runGemma3(
         .ids = ids.items,
     };
     // On Vulkan there is no CUDA backend, so img_chat is already null (interactive
-    // @image is CUDA-only) — the driver passes it uniformly.
+    // @image is CUDA-only), the driver passes it uniformly.
     const driver: SimpleDriver = .{ .tok = &tok, .io = io, .gpa = gpa, .ids = &ids, .opts = opts, .stdout = stdout, .prompt = prompt, .img_chat = img_chat };
 
     const t_init = Io.Clock.real.now(io).nanoseconds;
@@ -2053,7 +2052,7 @@ fn runGemma4(
     defer ids.deinit(gpa);
     // Gemma 4 prompts begin with a single BOS.
     if (tok.specialId("<bos>")) |bos| try ids.append(gpa, bos);
-    // Rows before the image block, and the block's token count — the one-shot
+    // Rows before the image block, and the block's token count, the one-shot
     // prefill interleaves text / image / text around them.
     var n_pre: usize = 0;
     var n_img: usize = 0;
@@ -2094,7 +2093,7 @@ fn runGemma4(
     defer if (profile) TensorPencil.prof.report(stdout) catch {};
 
     // CUDA backend + pinning were set up front (before the vision encode). No
-    // CPU-split / offload / streaming — the 12B fits. gemma4 has no Vulkan
+    // CPU-split / offload / streaming, the 12B fits. gemma4 has no Vulkan
     // backend (Spec.Vulkan = void); main() rejects --backend vulkan before here.
     const dev: llm.session.Devices = .{ .cu_be = be_cuda };
     const Spec = llm.session.UniformSpec(
@@ -2141,13 +2140,13 @@ fn runGemma4(
 }
 
 /// Ceiling for the auto (no --max-context) window: bounds the up-front RoPE
-/// table (rows x head_dim/2 x 2 f32 — 64 MB at 128k for head_dim 128) and
+/// table (rows x head_dim/2 x 2 f32, 64 MB at 128k for head_dim 128) and
 /// the per-layer VA reservations. Physical VRAM, not this, is what actually
 /// limits a session; pass --max-context to raise it.
 const auto_context_cap: usize = 128 << 10;
 
 /// The model's trained context length (`<arch>.context_length`), when the
-/// container records one. Safetensors checkpoints carry no metadata — fall
+/// container records one. Safetensors checkpoints carry no metadata, fall
 /// back to the native Qwen3 window.
 fn trainedContext(st: *const ModelFile) usize {
     switch (st.*) {

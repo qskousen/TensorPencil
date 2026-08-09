@@ -1,52 +1,25 @@
-//! Z-Image (`NextDiT`) — Tongyi's 6B text-to-image diffusion transformer, the
+//! Z-Image (`NextDiT`), Tongyi's 6B text-to-image diffusion transformer, the
 //! architecture "zit" checkpoints use.
 //!
-//! ⚠️ **It is not its own model in ComfyUI**: Z-Image runs through
+//! It is not its own model in ComfyUI: Z-Image runs through
 //! `comfy/ldm/lumina/model.py`, the Lumina-Image-2.0 `NextDiT`, switched into a
 //! different shape by `z_image_modulation=True` / `pad_tokens_multiple=32` /
-//! `time_scale=1000` / `rope_theta=256`, and selected purely by `dim == 3840`
-//! (`supported_models.py::ZImage`). Anything here that reads as "Lumina but
-//! different" is that flag.
+//! `time_scale=1000` / `rope_theta=256`, and selected purely by `dim == 3840`.
+//! Anything here that reads as "Lumina but different" is that flag.
 //!
-//! Single-stream, like krea2's DiT: the text half and the 2x2-patchified latent
-//! half are refined separately, concatenated into one sequence, and run through 30
-//! identical blocks. It shares krea2's RMSNorm/SwiGLU/3-axis-interleaved-RoPE
-//! vocabulary, so most of `ops` carries straight over. Six things do **not**, and
-//! each one is a silent wrong answer rather than an error:
+//! Single-stream, like krea2's DiT: the text half and the 2x2-patchified latent half
+//! are refined separately, concatenated into one sequence, and run through 30 identical
+//! blocks. It shares krea2's RMSNorm / SwiGLU / 3-axis-interleaved-RoPE vocabulary, so
+//! most of `ops` carries straight over. What differs is documented at the code it
+//! governs: sandwich norms and tanh'd gates in `blockForward`, shiftless four-chunk
+//! modulation in `modulationTable`, the weightless final LayerNorm in `finalize`, the
+//! two learned pad tokens in `ropeFreqs`, and the (ph, pw, c) patch order plus the
+//! output negation in `patchify`/`unpatchify`.
 //!
-//! 1. **Sandwich norms.** A block is
-//!    `x += tanh(gate) * norm2(sublayer(modulate(norm1(x), scale)))` — there is a
-//!    second RMSNorm on the sublayer's *output*, inside the residual. krea2 has
-//!    only the pre-norm.
-//! 2. **The gate is `tanh`'d and the modulation has NO SHIFT.**
-//!    `modulate(x, scale) = x * (1 + scale)`, and the AdaLN linear emits four
-//!    chunks (`scale_msa, gate_msa, scale_mlp, gate_mlp`) rather than six.
-//! 3. **No SiLU before the block AdaLN linear.** Under `z_image_modulation` the
-//!    per-block `adaLN_modulation` is a bare `Linear(256, 4*dim)` — the
-//!    `nn.Sequential(nn.SiLU(), Linear(...))` of stock Lumina is dropped. The
-//!    *final layer* keeps its SiLU. That asymmetry is why the checkpoint numbers
-//!    them `layers.N.adaLN_modulation.0` and `final_layer.adaLN_modulation.1`.
-//! 4. **The final norm is a weightless LayerNorm (eps 1e-6)**, not an RMSNorm.
-//! 5. **Two learned pad tokens.** Both halves are padded up to a multiple of 32
-//!    with `cap_pad_token` / `x_pad_token`, and the two halves get their pad
-//!    *positions* differently — see `ropeFreqs`.
-//! 6. **The output is NEGATED** (`return -img`). Combined with CONST/flow
-//!    parameterization (`denoised = x - v*sigma`) the sign is load-bearing: get it
-//!    wrong and the sampler walks away from the data manifold, producing noise
-//!    with no error anywhere.
-//!
-//! ⚠️ **The patch feature order is `(ph, pw, c)` — channel FASTEST — where krea2's
-//! is `(c, ph, pw)`.** Both patchify and unpatchify use it (`permute(0,2,4,3,5,1)`
-//! and `view(h, w, pH, pW, C).permute(4,0,2,1,3)`). Getting it backwards is a pure
-//! permutation: every norm, every magnitude and every per-stage statistic still
-//! matches, and only the rendered image is wrong. Same class of bug as the SD
-//! planar/channel-last mixup this repo already paid for once.
-//!
-//! Loads from any `WeightStore` — safetensors or GGUF. Large weights keep their
-//! checkpoint dtype and dequantize inside the GEMM; norm scales and biases become
-//! f32 at load. **The store's mapping must outlive the model.**
-//!
-//! Pinned against ComfyUI by `tools/gen_zimage_fixtures.py`.
+//! Loads from any `WeightStore`, safetensors or GGUF. Large weights keep their
+//! checkpoint dtype and dequantize inside the GEMM; norm scales and biases become f32
+//! at load. The store's mapping must outlive the model. Pinned against ComfyUI by
+//! tools/gen_zimage_fixtures.py; GPU twins are zimage_gpu.zig and zimage_cuda.zig.
 
 const std = @import("std");
 const tp_core = @import("tp_core");
@@ -77,7 +50,7 @@ pub const Config = struct {
     cap_dim: usize,
     patch: usize,
     channels: usize,
-    /// AdaLN conditioning width — `min(dim, 256)` under `z_image_modulation`,
+    /// AdaLN conditioning width, `min(dim, 256)` under `z_image_modulation`,
     /// and also the `t_embedder`'s output width.
     mod_dim: usize,
     /// `TimestepEmbedder`'s hidden width, `min(dim, 1024)`.
@@ -93,9 +66,9 @@ pub const Config = struct {
     time_scale: f32,
     /// RMSNorm epsilon for the block and `cap_embedder` norms.
     norm_eps: f32,
-    /// ⚠️ The per-head Q/K RMSNorms are built as `RMSNorm(head_dim,
-    /// elementwise_affine=True)` with **no eps argument**, so torch falls back to
-    /// `finfo(float32).eps` — a *different*, far smaller epsilon than the 1e-5 the
+    /// The per-head Q/K RMSNorms are built as `RMSNorm(head_dim,
+    /// elementwise_affine=True)` with no eps argument, so torch falls back to
+    /// `finfo(float32).eps`, a *different*, far smaller epsilon than the 1e-5 the
     /// block norms use. ComfyUI's own fused path spells this out
     /// (`self.q_norm.eps if ... is not None else torch.finfo(torch.float32).eps`).
     qk_eps: f32,
@@ -149,11 +122,11 @@ pub const z_image: Config = .{
 pub const latent_channels = z_image.channels;
 pub const spatial_scale = 8;
 
-/// ComfyUI `latent_formats.Flux` — Z-Image inherits it through `Lumina2`.
+/// ComfyUI `latent_formats.Flux`, Z-Image inherits it through `Lumina2`.
 pub const scale_factor: f32 = 0.3611;
 pub const shift_factor: f32 = 0.1159;
 
-/// Linear latent→RGB approximation for the live sampling preview
+/// Linear latent->RGB approximation for the live sampling preview
 /// (`latent_formats.Flux.latent_rgb_factors`). Distinct from krea2's Wan matrix
 /// and from either SD one; the wrong matrix is not a crash, just a preview with
 /// plausible structure and wrong colours.
@@ -180,7 +153,7 @@ pub const latent_rgb_bias = [3]f32{ -0.0329, -0.0718, -0.0851 };
 /// Fill `rgb_out` (`[zh*zw][3]` RGB8) with the latent2rgb preview of the planar
 /// `[16][zh*zw]` sampler latent `z`, using ComfyUI's `((v + 1) / 2).clamp(0, 1) * 255`
 /// mapping. Its own function rather than `sd_vae`'s because that one is compiled
-/// against a 4-channel matrix — the same reason `wan_vae` has its own.
+/// against a 4-channel matrix, the same reason `wan_vae` has its own.
 pub fn latentPreviewInto(rgb_out: []u8, z: []const f32, zh: usize, zw: usize) void {
     const plane = zh * zw;
     std.debug.assert(rgb_out.len >= plane * 3 and z.len >= latent_channels * plane);
@@ -291,7 +264,7 @@ pub const DiT = struct {
             .context_refiner = context_refiner,
             .noise_refiner = noise_refiner,
             .layers = layers,
-            // ⚠️ Index 1, not 0: the final layer keeps stock Lumina's
+            // Index 1, not 0: the final layer keeps stock Lumina's
             // `Sequential(SiLU, Linear)` while the blocks lose the SiLU and so
             // number their linear 0. See the module header.
             .final_ada = try l.linear("final_layer.adaLN_modulation.1", cfg.dim, cfg.mod_dim, true),
@@ -308,16 +281,16 @@ pub const DiT = struct {
     //
     // Split the way krea2's DiT is, and for the same reason: `pipeline.Denoiser`
     // builds the per-image constants once and calls only the per-step part.
-    // ⚠️ `context_refiner` has NO modulation, so the whole text half is a per-image
-    // constant here — unlike krea2, where the text fusion is also t-independent but
+    // `context_refiner` has NO modulation, so the whole text half is a per-image
+    // constant here, unlike krea2, where the text fusion is also t-independent but
     // for a different reason. Recomputing it per step would be pure waste.
 
     /// The AdaLN conditioning vector: `t_embedder((1 - sigma) * time_scale)`.
     /// Returns `[mod_dim]`; caller frees.
     ///
-    /// ⚠️ `t = 1 - sigma` (`NextDiT._forward`), and ComfyUI reaches here with
+    /// `t = 1 - sigma` (`NextDiT._forward`), and ComfyUI reaches here with
     /// `timesteps = model_sampling.timestep(sigma) = sigma * multiplier` where
-    /// Z-Image's multiplier is **1.0**, so the timestep *is* the sigma. Flux-family
+    /// Z-Image's multiplier is 1.0, so the timestep *is* the sigma. Flux-family
     /// models with multiplier 1000 do not have that identity.
     pub fn adalnInput(self: *const DiT, io: std.Io, gpa: std.mem.Allocator, sigma: f32) ![]f32 {
         const cfg = self.cfg;
@@ -337,24 +310,24 @@ pub const DiT = struct {
     }
 
     /// How many blocks take a modulation vector: the `noise_refiner` stack then the
-    /// trunk. ⚠️ `context_refiner` is NOT among them (`modulation=False`), which is
+    /// trunk. `context_refiner` is NOT among them (`modulation=False`), which is
     /// also why the caption half is timestep-independent.
     pub fn modulatedBlocks(self: *const DiT) usize {
         return self.noise_refiner.len + self.layers.len;
     }
 
     /// Every modulated block's AdaLN vector for one timestep, laid out contiguously
-    /// as `[modulatedBlocks()][4 * dim]` — `noise_refiner` first, then the trunk, in
-    /// execution order — followed by one **zero block** of `dim`. Caller frees.
+    /// as `[modulatedBlocks()][4 * dim]`, `noise_refiner` first, then the trunk, in
+    /// execution order, followed by one zero block of `dim`. Caller frees.
     ///
     /// This is the form the GPU backends upload: the device `modulate` kernel reads
     /// `(1 + c[scale_off + col]) * x + c[shift_off + col]`, and Z-Image's modulation
-    /// has **no shift**, so `shift_off` points at that trailing zero block. Cheaper
+    /// has no shift, so `shift_off` points at that trailing zero block. Cheaper
     /// than a shift-free kernel variant and exactly equal to it.
     ///
-    /// ⚠️ **The gates are `tanh`'d here, on the host, and that is deliberate.** A gate
-    /// is one `dim`-wide vector per block per step — 32 x 3840 values against the
-    /// millions the block itself touches — so doing it here costs nothing measurable
+    /// The gates are `tanh`'d here, on the host, and that is deliberate. A gate
+    /// is one `dim`-wide vector per block per step, 32 x 3840 values against the
+    /// millions the block itself touches, so doing it here costs nothing measurable
     /// and saves the device a kernel it does not otherwise need.
     pub fn modulationTable(self: *const DiT, io: std.Io, gpa: std.mem.Allocator, adaln: []const f32) ![]f32 {
         const cfg = self.cfg;
@@ -369,7 +342,7 @@ pub const DiT = struct {
             for (group) |*blk| {
                 const dst = out[i * 4 * cfg.dim ..][0 .. 4 * cfg.dim];
                 try linear(io, gpa, dst, adaln, 1, blk.ada.?);
-                // The two gate chunks — `gate_msa` and `gate_mlp` — in the order
+                // The two gate chunks, `gate_msa` and `gate_mlp`, in the order
                 // `scale_msa, gate_msa, scale_mlp, gate_mlp`.
                 for (dst[1 * cfg.dim ..][0..cfg.dim]) |*g| g.* = std.math.tanh(g.*);
                 for (dst[3 * cfg.dim ..][0..cfg.dim]) |*g| g.* = std.math.tanh(g.*);
@@ -379,19 +352,19 @@ pub const DiT = struct {
         return out;
     }
 
-    /// `modulationTable` with each pre-norm's WEIGHT FOLDED INTO THE SCALE — the form
+    /// `modulationTable` with each pre-norm's WEIGHT FOLDED INTO THE SCALE, the form
     /// a fused rms+modulate kernel wants. `[modulatedBlocks()][4 * dim]` laid out as
     /// `premul_attn, gate_attn, premul_ffn, gate_ffn`, then one zero block of `dim`.
     ///
-    /// ⚠️ A second layout exists because the two backends fuse differently, not by
+    /// A second layout exists because the two backends fuse differently, not by
     /// accident: Vulkan has a standalone `modulate` kernel and takes the *unfused*
     /// table, while CUDA has only `rmsMod` (`out = x*inv*premul[col] + shift[col]`),
     /// so the norm weight has to arrive already multiplied in. Both are built here,
-    /// from the same AdaLN evaluation, so they cannot drift apart — and the device
+    /// from the same AdaLN evaluation, so they cannot drift apart, and the device
     /// tests compare each backend against the same CPU forward.
     ///
     /// `premul = norm_w * (1 + scale)` is exactly `rmsNorm(x, norm_w)` followed by
-    /// `modulate(·, scale)`, since both are per-column multiplies.
+    /// `modulate(*, scale)`, since both are per-column multiplies.
     pub fn modulationTableFolded(self: *const DiT, io: std.Io, gpa: std.mem.Allocator, adaln: []const f32) ![]f32 {
         const cfg = self.cfg;
         const raw = try self.modulationTable(io, gpa, adaln);
@@ -418,7 +391,7 @@ pub const DiT = struct {
     }
 
     /// The final layer's AdaLN scale for one timestep, `[dim]`. Caller frees.
-    /// Keeps the SiLU the blocks drop — see the module header.
+    /// Keeps the SiLU the per-block AdaLN linears drop.
     pub fn finalScale(self: *const DiT, io: std.Io, gpa: std.mem.Allocator, adaln: []const f32) ![]f32 {
         const cfg = self.cfg;
         const gated = try gpa.alloc(f32, cfg.mod_dim);
@@ -466,7 +439,7 @@ pub const DiT = struct {
 
     /// RoPE table for the text half: axis 0 runs `1 .. n`, axes 1 and 2 are zero.
     ///
-    /// ⚠️ The `+ 1` is real — `embed_cap` writes `arange(len) + 1.0 + offset`, so
+    /// The `+ 1` is real, `embed_cap` writes `arange(len) + 1.0 + offset`, so
     /// position 0 is never used by a caption token. It exists so the image half can
     /// start at `cap_len + 1` and leave a gap.
     pub fn capFreqs(self: *const DiT, gpa: std.mem.Allocator, cap_padded: usize) !ops.rope.Freqs {
@@ -482,11 +455,11 @@ pub const DiT = struct {
 
     /// RoPE table for the whole `[cap | image]` sequence.
     ///
-    /// ⚠️ **The two halves pad differently, and it is not symmetry you can restore.**
+    /// The two halves pad differently, and it is not symmetry you can restore.
     /// The caption's pad tokens are appended *before* its position ids are built, so
     /// they continue the `1..n` ramp. The image's pad tokens are appended and then
-    /// its position tensor is `F.pad`ded with **zeros**, so every image pad token
-    /// sits at `(0, 0, 0)` — the same position as each other, and a position no real
+    /// its position tensor is `F.pad`ded with zeros, so every image pad token
+    /// sits at `(0, 0, 0)`, the same position as each other, and a position no real
     /// token occupies. Making them consistent (either way) changes the attention
     /// pattern of every padded render.
     pub fn ropeFreqs(
@@ -524,7 +497,7 @@ pub const DiT = struct {
     /// The image half up to the joint trunk: patchify, `x_embedder`, pad, then the
     /// `noise_refiner` stack. Returns `[padded(h*w), dim]`; caller frees.
     ///
-    /// `freqs` must be the **image slice** of the full table — the refiner runs on
+    /// `freqs` must be the image slice of the full table, the refiner runs on
     /// the image tokens alone, at the positions they will hold in the joint
     /// sequence.
     pub fn noiseTokens(
@@ -628,7 +601,7 @@ pub const DiT = struct {
         const img = try self.noiseTokens(io, gpa, x_lat, lat_h, lat_w, adaln, img_freqs);
         defer gpa.free(img);
 
-        // Joint sequence: [cap | image], in that order — `unpatchify` slices the
+        // Joint sequence: [cap | image], in that order, `unpatchify` slices the
         // image half back out at `cap_padded`.
         const x = try gpa.alloc(f32, seq * cfg.dim);
         defer gpa.free(x);
@@ -643,7 +616,7 @@ pub const DiT = struct {
         }
 
         // The final layer is row-wise, so running it on the image rows alone is
-        // exactly equal to running it on the whole sequence and slicing — which is
+        // exactly equal to running it on the whole sequence and slicing, which is
         // what the reference does. The caption and pad rows are discarded either way.
         try self.finalize(io, gpa, out, x[cap_padded * cfg.dim ..][0 .. n_img * cfg.dim], adaln, lat_h, lat_w);
     }
@@ -698,7 +671,7 @@ pub const DiT = struct {
         std.debug.assert(x.len == seq * cfg.dim);
         std.debug.assert((blk.ada != null) == (adaln != null));
 
-        // scale_msa, gate_msa, scale_mlp, gate_mlp — in that order, one chunk each.
+        // scale_msa, gate_msa, scale_mlp, gate_mlp, in that order, one chunk each.
         var mv: []f32 = &.{};
         defer if (mv.len != 0) gpa.free(mv);
         if (blk.ada) |ada| {
@@ -806,7 +779,7 @@ pub const DiT = struct {
 // --- free helpers -----------------------------------------------------------
 
 /// Sinusoidal timestep embedding, `[cos(t w_i) ... sin(t w_i) ...]` with
-/// `w_i = 10000^(-i/half)` — `comfy/ldm/modules/diffusionmodules/util.py`.
+/// `w_i = 10000^(-i/half)`, `comfy/ldm/modules/diffusionmodules/util.py`.
 ///
 /// f64 internals on purpose, the same reasoning `sd_unet.timestepEmbedding`
 /// records: at `i = 0` the argument is the scaled timestep itself (up to 1000), so
@@ -825,7 +798,7 @@ pub fn timestepEmbedding(out: []f32, t: f32) void {
     }
 }
 
-/// Row-wise AdaLN with **no shift**: `x = (1 + scale) * x`.
+/// Row-wise AdaLN with no shift: `x = (1 + scale) * x`.
 fn modulate(x: []f32, scale: []const f32) void {
     const dim = scale.len;
     var row: usize = 0;
@@ -847,9 +820,9 @@ fn plainAdd(x: []f32, delta: []const f32) void {
     for (x, delta) |*v, d| v.* += d;
 }
 
-/// Planar `[c][lat_h][lat_w]` → `[n_img, patch*patch*channels]` patch rows.
+/// Planar `[c][lat_h][lat_w]` -> `[n_img, patch*patch*channels]` patch rows.
 ///
-/// ⚠️ The feature order inside a token is `(ph, pw, c)` — **channel fastest** —
+/// The feature order inside a token is `(ph, pw, c)`, channel fastest,
 /// from `x.view(B, C, H/p, p, W/p, p).permute(0, 2, 4, 3, 5, 1).flatten(3)`. krea2's
 /// is `(c, ph, pw)`; swapping them is rms-preserving and invisible to every check
 /// except the rendered image.
@@ -876,7 +849,7 @@ pub fn patchify(gpa: std.mem.Allocator, cfg: Config, x_lat: []const f32, lat_h: 
     return out;
 }
 
-/// The inverse of `patchify`, **with the output sign flip** (`NextDiT` returns
+/// The inverse of `patchify`, with the output sign flip (`NextDiT` returns
 /// `-img`). Scatters `[n_img, patch*patch*channels]` back into planar `out`.
 pub fn unpatchify(cfg: Config, out: []f32, patches: []const f32, lat_h: usize, lat_w: usize) void {
     const p = cfg.patch;
@@ -917,10 +890,10 @@ pub fn gpuLinKindSupported(dt: DType) bool {
 
 /// The first block linear the device forward cannot run, or null if it can run all of them.
 ///
-/// ⚠️ **Scans EVERY layer, not `layers[0].attn.qkv`.** That single-tensor probe was correct
-/// only while no mixed Z-Image checkpoint existed — and `anima_baseV10-INT8_CONVROT-MIXED`
-/// is the standing proof that "mixed" means mixed PER BLOCK, where a block-0 probe says yes
-/// and the forward then panics on the first thing it does. Returns the tensor's name so the
+/// Scans EVERY layer, not `layers[0].attn.qkv`. A single-tensor probe is correct only
+/// while no mixed Z-Image checkpoint exists, and Anima's mixed checkpoints show what
+/// "mixed" means in practice: mixed PER BLOCK, so a block-0 probe says yes and the
+/// forward then panics on the first thing it does. Returns the tensor's name so the
 /// refusal can say which layer.
 pub fn unsupportedGpuLin(model: *const DiT, extra: fn (DType) bool) ?struct { tag: []const u8, dtype: DType } {
     for (model.layers) |*b| {
@@ -975,15 +948,15 @@ const Loader = struct {
             return error.MissingTensor;
         };
         const shape = view.info.shape.slice();
-        // ⚠️ **The packed ComfyUI 4-bit formats come first**, each detected by its OWN
+        // The packed ComfyUI 4-bit formats come first, each detected by its OWN
         // sidecar (`_scale_2` for NVFP4, `_s_rel` for W4A8) rather than by dtype or shape:
         // both store `[rows, cols/2]`, so the plain shape check below would reject them.
         // NVFP4's nibbles are E2M1 floats with a per-16-block fp8 scale and W4A8's are
-        // unsigned indices into a non-uniform Lloyd-Max codebook — one implementation for
+        // unsigned indices into a non-uniform Lloyd-Max codebook, one implementation for
         // every family that ships them (`quant_weight.zig`).
         //
-        // ⚠️ **W4A8 is here because being krea2-only made the FIRST Anima W4A8 checkpoint
-        // unloadable**, and nothing about Z-Image would have stopped it arriving here
+        // W4A8 is here because being krea2-only made the FIRST Anima W4A8 checkpoint
+        // unloadable, and nothing about Z-Image would have stopped it arriving here
         // instead. `.w4a8` is absent from `gpuLinKindSupported`, so such a checkpoint runs
         // on the CPU (where `ops.matmul` decodes per k-slice) and every GPU arm declines
         // rather than reading the nibbles as something else.
@@ -1081,7 +1054,7 @@ const test_gate = @import("../test_gate.zig");
 
 const ref_path = "src/models/assets/zimage_ref.safetensors";
 const zit_ckpt = "/home/qt/genai/comfyui/models/checkpoints/zit/unstableRevolution_V2Fp16.safetensors";
-/// How many trunk blocks the fp32 reference keeps — see the generator's docstring.
+/// How many trunk blocks the fp32 reference keeps, see the generator's docstring.
 /// A full 30-layer comparison would need a 24.6 GB fp32 torch model.
 const ref_layers = 8;
 
@@ -1114,7 +1087,7 @@ test "patchify and unpatchify round-trip with the (ph, pw, c) feature order" {
 
     // Token (0,0) covers latent rows 0..1, cols 0..1. Channel c contributes
     // lat[c*8 + row*2 + col]. With (ph, pw, c) ordering the token reads
-    // [c0(0,0), c1(0,0), c2(0,0), c0(0,1), ...] — channel-major inside each pixel.
+    // [c0(0,0), c1(0,0), c2(0,0), c0(0,1), ...], channel-major inside each pixel.
     try std.testing.expectEqualSlices(f32, &.{ 0, 8, 16, 1, 9, 17, 2, 10, 18, 3, 11, 19 }, patches[0..12]);
 
     var back: [3 * 4 * 2]f32 = undefined;
@@ -1142,7 +1115,7 @@ test "padded rounds up to the pad-token multiple" {
 }
 
 test "the Z-Image DiT matches ComfyUI's NextDiT on a real checkpoint" {
-    // ⚠️ Compared stage by stage rather than end to end, because the four stages
+    // Compared stage by stage rather than end to end, because the four stages
     // fail for genuinely different reasons: the text half is a naming/eps problem,
     // the timestep vector is the `1 - sigma` and `time_scale` conventions, the image
     // half is patch order and pad tokens, and the trunk is the block form. A single
@@ -1150,7 +1123,7 @@ test "the Z-Image DiT matches ComfyUI's NextDiT on a real checkpoint" {
     //
     // The reference keeps `ref_layers` of the 30 trunk blocks (see the generator),
     // so the model is loaded at that depth. What this therefore does not check is
-    // the loop bound itself — the end-to-end render comparison covers that.
+    // the loop bound itself, the end-to-end render comparison covers that.
     const gpa = testing.allocator;
     const io = testing.io;
     try test_gate.requireIntegration();
@@ -1193,7 +1166,7 @@ test "the Z-Image DiT matches ComfyUI's NextDiT on a real checkpoint" {
             defer gpa.free(want);
             const rel = relL2(want, adaln);
             errdefer std.debug.print("t_emb rel L2 {e:.4}\n", .{rel});
-            // Measured 1.5e-4, which IS the f16 storage floor of the fixture — the
+            // Measured 1.5e-4, which IS the f16 storage floor of the fixture, the
             // three stage bounds below all sit on it, so they are checking "exact
             // up to how the fixture is stored", not a real disagreement.
             try testing.expect(rel < 1e-3);
@@ -1242,8 +1215,8 @@ test "the Z-Image DiT matches ComfyUI's NextDiT on a real checkpoint" {
         errdefer std.debug.print("case {d} (latent {d}): velocity rel L2 {e:.4}\n", .{ ci, lat, rel });
         // Stored f32 and computed from f32 weights on both sides, so the only
         // difference is reduction order and the fused rms+rope kernel ComfyUI uses:
-        // measured **3.5e-6 at 8 layers** (and 1.6e-6 at 2), i.e. the disagreement
-        // grows roughly LINEARLY with depth rather than compounding — which is what
+        // measured 3.5e-6 at 8 layers (and 1.6e-6 at 2), i.e. the disagreement
+        // grows roughly LINEARLY with depth rather than compounding, which is what
         // says the block is right and not merely close. Three orders below the f16
         // stage bounds above.
         try testing.expect(rel < 2e-5);
@@ -1270,7 +1243,7 @@ test "the Z-Image DiT loads every weight with a tag and the right shapes" {
     try testing.expectEqual(@as(usize, 2), model.context_refiner.len);
     try testing.expectEqual(@as(usize, 2), model.noise_refiner.len);
 
-    // context_refiner blocks are `modulation=False` — no AdaLN linear at all. If
+    // context_refiner blocks are `modulation=False`, no AdaLN linear at all. If
     // one were loaded the block would silently modulate the text half.
     for (model.context_refiner) |b| try testing.expect(b.ada == null);
     for (model.noise_refiner) |b| try testing.expect(b.ada != null);

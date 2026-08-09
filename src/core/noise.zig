@@ -1,4 +1,4 @@
-//! Which generator standard-normal noise comes from — the one thing ComfyUI and
+//! Which generator standard-normal noise comes from, the one thing ComfyUI and
 //! AUTOMATIC1111 disagree about that makes the same seed a *different picture* rather
 //! than a slightly different one.
 //!
@@ -6,11 +6,11 @@
 //! what ComfyUI draws with) and `philox_rng.zig` (NVIDIA's Philox4x32-10, what A1111
 //! draws with by default, since its `randn_source` defaults to `"GPU"`).
 //!
-//! ⚠️ **This has to apply to BOTH noise consumers, and missing the second one would be
-//! invisible on the default sampler.** The initial latent is the obvious one. But the SDE
+//! This has to apply to BOTH noise consumers, and missing the second one would be
+//! invisible on the default sampler. The initial latent is the obvious one. But the SDE
 //! samplers' Brownian tree also draws a `torch.randn` per node, and the k-diffusion
 //! commit A1111 pins (`ab527a9a`) builds `torchsde.BrownianTree` on `zeros_like(x)` with
-//! **no `cpu` kwarg** — i.e. on the CUDA tensor's own device — where ComfyUI's fork forces
+//! no `cpu` kwarg, i.e. on the CUDA tensor's own device, where ComfyUI's fork forces
 //! that tree to the CPU. So under A1111 every tree node is a Philox draw too. Euler would
 //! have reproduced perfectly while every SDE render stayed wrong, which is the failure
 //! shape this codebase keeps recording: fix one of two paths and the tests still pass.
@@ -22,9 +22,9 @@ const philox_rng = @import("philox_rng.zig");
 /// Named after the two ecosystems' settings rather than the algorithms, since that is how
 /// a user encounters them: A1111 calls this option `randn_source` (`CPU` vs `GPU`/`NV`).
 pub const Source = enum {
-    /// torch's CPU generator — ComfyUI's `prepare_noise`, and A1111's `randn_source="CPU"`.
+    /// torch's CPU generator, ComfyUI's `prepare_noise`, and A1111's `randn_source="CPU"`.
     torch_cpu,
-    /// NVIDIA's Philox — A1111's default (`randn_source="GPU"`, and its `"NV"` CPU
+    /// NVIDIA's Philox, A1111's default (`randn_source="GPU"`, and its `"NV"` CPU
     /// imitation of the same thing).
     nv_philox,
 };
@@ -32,7 +32,7 @@ pub const Source = enum {
 /// Fill `out` with seeded standard normals from `src`.
 pub fn randn(out: []f32, seed: u64, src: Source) void {
     switch (src) {
-        // ⚠️ Requires `out.len >= 16` — torch's `normal_fill` path redraws an
+        // Requires `out.len >= 16`, torch's `normal_fill` path redraws an
         // overlapping final block below that. Every latent and every Brownian node is
         // far larger; the philox arm has no such floor.
         .torch_cpu => torch_rng.randn(out, seed),

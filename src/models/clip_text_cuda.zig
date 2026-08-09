@@ -1,4 +1,4 @@
-//! CLIP text tower on the CUDA backend — SD1.5's CLIP-L and SDXL's CLIP-G.
+//! CLIP text tower on the CUDA backend, SD1.5's CLIP-L and SDXL's CLIP-G.
 //!
 //! The CUDA twin of `clip_text_gpu`, in the shape `embed_siglip_cuda` established:
 //! device body via `cuda.Backend` ops, cheap head (the pooled row and its projection)
@@ -8,19 +8,19 @@
 //! Two differences from the Vulkan arm, both because the CUDA backend already had what
 //! was missing there:
 //!
-//! - **Attention needs no new kernel**: `Backend.attn` already takes a `causal` flag.
+//! - Attention needs no new kernel: `Backend.attn` already takes a `causal` flag.
 //!   Chunks are driven as one launch each over `dbOffset` views rather than as a
 //!   block-diagonal batch, because the batched CUDA kernel is the non-causal one and a
-//!   prompt has one to three chunks — not worth a fourth attention kernel.
-//! - ⚠️ **Precision is NOT the caller's choice here**: `opConvF16` is the only wide GEMM
+//!   prompt has one to three chunks, not worth a fourth attention kernel.
+//! - Precision is NOT the caller's choice here: `opConvF16` is the only wide GEMM
 //!   entry point, so a CLIP-L-sized layer computes in f16 regardless of
 //!   `--encoder-f16`. That is the same regime `sd_unet_cuda` and `embed_siglip_cuda`
 //!   run in, so parity against the CPU forward is *relative* (~1e-3), not the ~1e-6 the
 //!   Vulkan f32 path holds. `Session.encode`'s fallback order matters for that reason
 //!   and is documented there.
 //!
-//! Validated by `TensorPencil sd-cuda-test`, not by a unit test: the test binary brings
-//! up no CUDA context (see the SD-family section of CLAUDE.md).
+//! Validated by `TensorPencil sd-cuda-test`, not by a unit test, because the test binary
+//! brings up no CUDA context.
 
 const std = @import("std");
 const tp_core = @import("tp_core");
@@ -78,7 +78,7 @@ pub fn encodePrompt(
     std.debug.assert(out.len == p.seq() * h);
 
     // The empty reference rides along as one more chunk, but only when it is needed and
-    // not already cached — the same policy as the Vulkan arm.
+    // not already cached, the same policy as the Vulkan arm.
     const need_empty = p.hasWeights() and r.mode.needsEmpty() and r.empty_cache.* == null;
     const items = p.chunks + @as(usize, if (need_empty) 1 else 0);
     const total = items * clen;
@@ -102,7 +102,7 @@ pub fn encodePrompt(
 
     // No weight scope: the f16-converted GEMM weights stay RESIDENT across calls (they
     // borrow the mmap-stable CPU model). A scope would free and re-upload the whole
-    // tower every encode — a per-call cost that dwarfs the compute.
+    // tower every encode, a per-call cost that dwarfs the compute.
     defer {
         be.freeAttnScratch();
         be.freeConvScratch();
@@ -176,7 +176,7 @@ pub fn encodePrompt(
     }
 
     // The final LayerNorm is what SD1.5 conditions on and where SDXL's pooled row comes
-    // from — SDXL's *context* deliberately stops short of it.
+    // from, SDXL's *context* deliberately stops short of it.
     try be.opLayerNorm(x_d, x_d, enc.final_ln_w, enc.final_ln_b, total, h, cfg.eps);
     try be.endBatch();
 
@@ -191,7 +191,7 @@ pub fn encodePrompt(
             @memcpy(dst, all[0 .. clen * h]);
         } else {
             // Needs the post-final-LN activation, which `all` is not when a layer was
-            // captured — one extra download of chunk 0's rows only.
+            // captured, one extra download of chunk 0's rows only.
             const finals = try gpa.alloc(f32, total * h);
             defer gpa.free(finals);
             try be.tensorDownload(x_d, std.mem.sliceAsBytes(finals));
@@ -206,7 +206,7 @@ pub fn encodePrompt(
         @memcpy(e, all[p.chunks * clen * h ..][0 .. clen * h]);
         r.empty_cache.* = e;
     }
-    // ⚠️ The load-bearing formulas are NOT reimplemented here — this calls the CPU
+    // The load-bearing formulas are NOT reimplemented here, this calls the CPU
     // functions, so the three paths cannot disagree about either dialect's weighting.
     // A1111's forms need no empty-prompt reference at all, so it may be unset.
     const empty = if (r.mode.needsEmpty()) r.empty_cache.*.? else &[_]f32{};

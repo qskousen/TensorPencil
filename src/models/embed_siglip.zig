@@ -1,20 +1,20 @@
 //! SigLIP2 ViT-B-16 (webli) encoders for DiffKeep's image / cross-modal space.
 //! Two towers share one open_clip checkpoint (`open_clip_model.safetensors`):
-//!   - `TextModel` — text → 768-d (cross-modal query). [this file]
-//!   - `VisualModel` — image → 768-d (index-time). [TODO]
+//!   - `TextModel`, text -> 768-d (cross-modal query). [this file]
+//!   - `VisualModel`, image -> 768-d (index-time). [TODO]
 //! Both emit L2-normalized 768-d vectors comparable to each other (contrastive).
 //!
-//! ## Text tower (open_clip CLIP text, SigLIP2 variant)
-//! `token_embedding[id] + positional_embedding` (learned, NOT RoPE) → 12
-//! **pre-LayerNorm** residual blocks (`x += attn(ln_1(x)); x += mlp(ln_2(x))`),
-//! non-causal attention (no mask — SigLIP pads to a fixed `context_length` and
-//! attends everything), gelu-tanh plain FFN (`c_fc → gelu → c_proj`) → `ln_final`
-//! → **last-token pool** (position `context_length-1`) → `text_projection`
-//! (Linear +bias) → L2 normalize.
+//! Text tower (open_clip CLIP text, SigLIP2 variant):
+//! `token_embedding[id] + positional_embedding` (learned, NOT RoPE) -> 12
+//! pre-LayerNorm residual blocks (`x += attn(ln_1(x)); x += mlp(ln_2(x))`),
+//! non-causal attention (no mask, SigLIP pads to a fixed `context_length` and
+//! attends everything), gelu-tanh plain FFN (`c_fc -> gelu -> c_proj`) -> `ln_final`
+//! -> last-token pool (position `context_length-1`) -> `text_projection`
+//! (Linear +bias) -> L2 normalize.
 //!
 //! SigLIP text input is a fixed 64-token window, right-padded with token 0 (no
 //! attention mask); pooling reads the final position. Callers pass the framed
-//! ids `[content… , <eos>=1]` (typically ≤60 tokens, matching DiffKeep's
+//! ids `[content..., <eos>=1]` (typically ≤60 tokens, matching DiffKeep's
 //! `SIGLIP_MAX_TOKENS-4`); `embed` truncates/pads to `context_length`.
 
 const std = @import("std");
@@ -136,7 +136,7 @@ pub const TextModel = struct {
         self.* = undefined;
     }
 
-    /// Encode framed ids (`content…, <eos>`) into `out` [embed_dim], L2-normalized.
+    /// Encode framed ids (`content..., <eos>`) into `out` [embed_dim], L2-normalized.
     /// The sequence is truncated/right-padded (token 0) to `context_length`.
     pub fn embed(self: *const TextModel, io: std.Io, gpa: std.mem.Allocator, ids: []const u32, out: []f32) !void {
         const cfg = self.cfg;
@@ -203,9 +203,9 @@ pub const TextModel = struct {
         l2normalize(out);
     }
 
-    /// Batched text encode: `ids_list[i]` → `outs[i]` [embed_dim]. Every item is
+    /// Batched text encode: `ids_list[i]` -> `outs[i]` [embed_dim]. Every item is
     /// truncated/padded to the fixed 64-token window, so the batch is a uniform
-    /// [B*context_length, width] activation — all GEMMs / LayerNorms / GeGLU run
+    /// [B*context_length, width] activation, all GEMMs / LayerNorms / GeGLU run
     /// once over `B*64` rows; only attention (per item) and the final pool loop
     /// over the batch. Bit-identical to per-item `embed`.
     pub fn embedBatch(self: *const TextModel, io: std.Io, gpa: std.mem.Allocator, ids_list: []const []const u32, outs: [][]f32) !void {
@@ -486,7 +486,7 @@ pub const VisualModel = struct {
     }
 
     /// Gather the input image into per-patch (c,ky,kx) rows [nPatches, patchIn]
-    /// — the conv patch-embed reduces to a matmul over these. Caller owns.
+    /// the conv patch-embed reduces to a matmul over these. Caller owns.
     pub fn patchify(self: *const VisualModel, a: std.mem.Allocator, img: []const f32) ![]f32 {
         const cfg = self.cfg;
         const ps = cfg.patch;
@@ -510,8 +510,8 @@ pub const VisualModel = struct {
     }
 
     /// MAP attention-pool head over post-`trunk.norm` patch tokens `x_normed`
-    /// [nPatches * width]: one latent query cross-attends the tokens → proj →
-    /// residual pre-norm MLP → L2-normalized 768-d `out`. Cheap; always host.
+    /// [nPatches * width]: one latent query cross-attends the tokens -> proj ->
+    /// residual pre-norm MLP -> L2-normalized 768-d `out`. Cheap; always host.
     pub fn mapHead(self: *const VisualModel, io: std.Io, gpa: std.mem.Allocator, x_normed: []const f32, out: []f32) !void {
         const cfg = self.cfg;
         const w = cfg.width;
@@ -556,9 +556,9 @@ pub const VisualModel = struct {
         l2normalize(out);
     }
 
-    /// Batched image encode: `imgs[i]` (CHW [3*224*224]) → `outs[i]` [embed_dim].
+    /// Batched image encode: `imgs[i]` (CHW [3*224*224]) -> `outs[i]` [embed_dim].
     /// The per-image patch count is fixed (196), so the batch is a uniform
-    /// [B*nPatches, width] activation — every ViT GEMM / LayerNorm / GeGLU runs
+    /// [B*nPatches, width] activation, every ViT GEMM / LayerNorm / GeGLU runs
     /// once over `B*196` rows; only the self-attention (per image) and the MAP
     /// pool head loop over the batch. Bit-identical to per-item `embed`.
     pub fn embedBatch(self: *const VisualModel, io: std.Io, gpa: std.mem.Allocator, imgs: []const []const f32, outs: [][]f32) !void {
@@ -665,7 +665,7 @@ pub const VisualModel = struct {
             });
         }
 
-        // proj → residual pre-norm MLP, batched over B rows.
+        // proj -> residual pre-norm MLP, batched over B rows.
         const p = try a.alloc(f32, b * w);
         try ops.matmul.matmul(io, gpa, p, pooled, b, self.proj_w, self.proj_b);
         const hn = try a.alloc(f32, b * w);

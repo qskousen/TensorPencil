@@ -6,7 +6,7 @@
 //! (normal_fill_AVX2 in aten's DistributionTemplates.h): an MT19937 engine
 //! writes one uniform per element ((random() & 0xFFFFFF) * 2^-24), then
 //! each 16-block is Box-Mullered in place (pairs j / j+8) using the Cephes
-//! polynomial log/sincos from avx_mathfun.h — NOT libm; sizes not divisible
+//! polynomial log/sincos from avx_mathfun.h, NOT libm; sizes not divisible
 //! by 16 redraw fresh uniforms for a final, overlapping 16-block.
 //!
 //! The polynomials here replicate the *compiled* instruction sequence of
@@ -99,7 +99,7 @@ fn cephesLog(x0: f32) f32 {
     y = @mulAdd(f32, y, x, 3.3333331174e-1);
     y = y * x;
     // The y*z multiply fuses into the e*q1 addition (the build contracts
-    // each pending multiply into its consuming add — same choice as the
+    // each pending multiply into its consuming add, same choice as the
     // cosine polynomial's fmsub below).
     const eq1 = e * -2.12194440e-4;
     y = @mulAdd(f32, y, z, eq1);

@@ -1,19 +1,17 @@
 //! Container-level loading for the ComfyUI quantized weight formats that more than one
 //! model family ships.
 //!
-//! Exists because NVFP4 arrives on **three** architectures here (krea2, Anima, Z-Image),
+//! Exists because NVFP4 arrives on three architectures here (krea2, Anima, Z-Image),
 //! each with its own loader, and three copies of "read `weight_scale`, unswizzle it,
 //! build the level table" is exactly the drift that makes one family's renders disagree
 //! with another's for reasons no shape check can see. One implementation, called from
 //! each family's `mat`.
 //!
-//! ⚠️ **W4A8 lived in `dit.zig` alone for exactly one day and that was a bug**, not a
-//! shortcut: `terraRising_20TerraRisingAnima-ASYM_W4A8_INT8.safetensors` shipped, and
-//! Anima's loader — which had never heard of the format — read its `I8 [rows, cols/2]`
-//! weight as the int4-convrot signature and died on a missing `_scale`. Every format
-//! ComfyUI's quantizers emit shows up on every family they support, so a container
-//! reader for one of them belongs here from the start rather than after the second
-//! checkpoint arrives.
+//! Every format ComfyUI's quantizers emit shows up on every family they support, so a
+//! container reader for one of them belongs here from the start. A format known to only
+//! one family's loader is worse than unsupported: W4A8 and NVFP4 both store
+//! `I8 [rows, cols/2]`, which is exactly the int4-convrot signature, so a loader that
+//! has not heard of them reads their nibbles as signed int4 times a per-row scale.
 
 const std = @import("std");
 const weights_mod = @import("tp_core").weights;
@@ -26,15 +24,15 @@ const Weight = ops.matmul.Weight;
 ///
 /// `name` is the weight tensor's full name (e.g. `model.diffusion_model.blocks.0.attn.wq
 /// .weight`); the sidecars are `<name>_scale` (fp8 per-block, swizzled) and
-/// `<name>_scale_2` (f32 per-tensor). `rows`/`cols` are the LOGICAL dims — the stored
+/// `<name>_scale_2` (f32 per-tensor). `rows`/`cols` are the LOGICAL dims, the stored
 /// weight is `[rows, cols/2]`.
 ///
-/// ⚠️ **Detection is on `_scale_2`, not on `comfy_quant`.** Z-Image's NVFP4 checkpoint
+/// Detection is on `_scale_2`, not on `comfy_quant`. Z-Image's NVFP4 checkpoint
 /// ships no `comfy_quant` blob at all (krea2's and Anima's carry `{"format": "nvfp4"}`),
 /// so a loader keyed on the metadata would silently fail to recognize one of the three
 /// files. `_scale_2` is the tensor only this format has.
 ///
-/// Everything allocated — the unswizzled scales, the level table, the `Meta` — lands in
+/// Everything allocated, the unswizzled scales, the level table, the `Meta`, lands in
 /// `alloc` (the model arena) and must outlive the model. The packed weight bytes are a
 /// view into the store, like every other weight here.
 pub fn nvfp4(
@@ -112,16 +110,16 @@ fn quantConfName(buf: []u8, name: []const u8) ![]u8 {
 ///
 /// The sidecars are `<name>_s_rel` (fp8, per `group_size` elements), `<name>_s_channel`
 /// (f32, one per output row), an optional `<name>_codebook` (f32[16]) and the layer's
-/// `comfy_quant` blob. `rows`/`cols` are the LOGICAL dims — the stored weight is
+/// `comfy_quant` blob. `rows`/`cols` are the LOGICAL dims, the stored weight is
 /// `I8 [rows, cols/2]`, two 4-bit indices per byte. `ops/w4a8.zig` documents the format.
 ///
-/// ⚠️ **Detection is on `_s_rel`, and it must be tried BEFORE any int4 heuristic**, since
+/// Detection is on `_s_rel`, and it must be tried BEFORE any int4 heuristic, since
 /// `I8 [rows, cols/2]` is exactly the int4-convrot signature. W4A8's nibbles are unsigned
 /// indices into a non-uniform Lloyd-Max codebook, so reading them as signed int4 times a
 /// per-row scale is finite, plausible and wrong.
 ///
-/// ⚠️ **The weight stays PACKED.** Materializing the int8 here works on every backend with
-/// no kernel — the decode's output is an ordinary int8-convrot weight — but it doubles the
+/// The weight stays PACKED. Materializing the int8 here works on every backend with
+/// no kernel, the decode's output is an ordinary int8-convrot weight, but it doubles the
 /// footprint (12.2 GB against 6.1 GB for krea2) and turns an mmap'd, evictable checkpoint
 /// into that much anonymous RSS, which is precisely the difference between this format and
 /// int8. Every consumer decodes on demand instead: the CPU GEMM per k-slice into its
@@ -151,9 +149,9 @@ pub fn w4a8(
         return error.ShapeMismatch;
     }
 
-    // ⚠️ The group size is derived from `_s_rel`'s OWN shape and only then cross-checked
+    // The group size is derived from `_s_rel`'s OWN shape and only then cross-checked
     // against `comfy_quant`. Trusting the JSON alone would let a stale or mistyped
-    // `group_size` read every scale from the wrong group — a finite, plausible weight —
+    // `group_size` read every scale from the wrong group, a finite, plausible weight,
     // where a disagreement between the two is an error.
     const sshape = sv.info.shape.slice();
     if (sv.info.dtype != .f8_e4m3 or sshape.len != 2 or sshape[0] != rows or
@@ -286,7 +284,7 @@ test "an NVFP4 layer of each real checkpoint decodes to comfy_kitchen's weight" 
         var pbuf: [512]u8 = undefined;
         const path = blk: {
             // The repo's `models/` symlink set, one per checkpoint directory. `models/`
-            // is gitignored, so these are a local convenience — a family without one
+            // is gitignored, so these are a local convenience, a family without one
             // skips rather than failing.
             for ([_][]const u8{ "models/diffusion_model/", "models/anima/", "models/zit/", "models/" }) |root| {
                 const p = std.fmt.bufPrint(&pbuf, "{s}{s}", .{ root, L.checkpoint }) catch continue;

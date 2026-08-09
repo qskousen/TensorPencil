@@ -1,7 +1,7 @@
 //! GPU-resident Qwen3-VL-4B text encoder (Krea 2 conditioning).
 //!
 //! Mirrors `qwen3.TextEncoder.encode` with the whole 35-layer transformer on
-//! the device in a single batched submission — one upload of the embedded
+//! the device in a single batched submission, one upload of the embedded
 //! tokens in, one download of the 12-tap conditioning stack out. This
 //! replaces the CPU forward's sync-per-GEMM offload (a CPU<->GPU ping-pong
 //! that kept the GPU idle and made the encode latency-bound); here every op
@@ -23,11 +23,11 @@ const sample = @import("tp_core").sample;
 const transformer = @import("transformer.zig");
 const transformer_gpu = @import("transformer_gpu.zig");
 
-// ⚠️ Only `head_dim` is a family-wide constant here. Every other dimension is read
-// off `enc.cfg` inside `encode`, because Anima's encoder is Qwen3-**0.6B** (28
-// layers, 1024 wide, SwiGLU 3072) where krea2's and Z-Image's are 4B. These used to
-// be module constants; a 0.6B encoder ran with 2560-wide strides and produced
-// garbage with no error.
+// Only `head_dim` is a family-wide constant here. Every other dimension is read
+// off `enc.cfg` inside `encode`, because Anima's encoder is Qwen3-0.6B (28
+// layers, 1024 wide, SwiGLU 3072) where krea2's and Z-Image's are 4B. As module
+// constants they make a 0.6B encoder run with 2560-wide strides, which is garbage with
+// no error.
 const hd = qwen3.head_dim;
 const half = hd / 2;
 const attn_scale: f32 = 1.0 / @sqrt(@as(f32, hd));
@@ -40,7 +40,7 @@ extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 /// `[seq][enc.tapCount()][hidden]` (same layout the CPU `encode` returns). Caller
 /// frees the result.
 ///
-/// ⚠️ The tap list and the RoPE theta come off `enc`, never from this file's
+/// The tap list and the RoPE theta come off `enc`, never from this file's
 /// constants: krea2 keeps 12 hidden states at theta 5e6, Z-Image keeps one at theta
 /// 1e6, and both would run to completion with the other's values.
 pub fn encode(enc: *const qwen3.TextEncoder, ctx: *gpu.Context, io: std.Io, gpa: std.mem.Allocator, ids: []const u32, use_f16: bool, cancel: ?*std.atomic.Value(bool)) ![]f32 {
@@ -57,10 +57,9 @@ pub fn encode(enc: *const qwen3.TextEncoder, ctx: *gpu.Context, io: std.Io, gpa:
     const intermediate = c.intermediate;
     const eps = c.rms_eps;
 
-    // CPU: embedding gather and the rotate-half rope table. ⚠️ Through
-    // `embedTokens`, which dispatches on the embedding's own dtype — this used to
-    // hardcode bf16 and a `* 2` row stride, which a GGUF encoder (q6_k embedding)
-    // would have read as garbage.
+    // CPU: embedding gather and the rotate-half rope table. Through
+    // `embedTokens`, which dispatches on the embedding's own dtype. Hardcoding bf16
+    // and a `* 2` row stride here reads a GGUF encoder's q6_k embedding as garbage.
     const x = try gpa.alloc(f32, seq * hidden);
     defer gpa.free(x);
     try qwen3.embedTokens(enc.embed, ids, x);
@@ -74,7 +73,7 @@ pub fn encode(enc: *const qwen3.TextEncoder, ctx: *gpu.Context, io: std.Io, gpa:
     const sin_off: u32 = @intCast(seq * half);
 
     // Coop (tensor-core) GEMMs when requested and available: f32 activations
-    // in, f16 weights/accumulate, f32 out — GEMM outputs are 128-row padded.
+    // in, f16 weights/accumulate, f32 out, GEMM outputs are 128-row padded.
     // f16 shaves ~0.4s off the encode but ~doubles its image-delta
     // contribution (0.23% -> 0.49%), so the caller decides; default is f32.
     const coop = use_f16 and ctx.pipe_coop != .null_handle;
@@ -117,9 +116,9 @@ pub fn encode(enc: *const qwen3.TextEncoder, ctx: *gpu.Context, io: std.Io, gpa:
             // Snapshot the hidden state entering layer l into the tap-major
             // output buffer (contiguous copy with a per-tap offset).
             //
-            // ⚠️ A tap past the last layer carries the final norm. `.rmsnorm` has no
+            // A tap past the last layer carries the final norm. `.rmsnorm` has no
             // destination-offset push slot, so it lands in the `normed` scratch and
-            // the existing offset copy moves it — two ops, no new kernel, and the
+            // the existing offset copy moves it, two ops, no new kernel, and the
             // f32 arm's reduction matches the CPU's.
             var src = x_d;
             if (enc.final_norm) |w| {
@@ -233,19 +232,19 @@ fn wcode(dt: @import("tp_core").dtype.DType) gpu.WCode {
 }
 
 /// Widest zero bias any encoder GEMM needs: the f16-weight coop GEMM always folds a
-/// bias in and these linears have none. One full-width buffer for every width —
+/// bias in and these linears have none. One full-width buffer for every width,
 /// `smallBuffer` caches by host POINTER, so a per-width slice would hand a later,
 /// wider GEMM whichever length was uploaded first.
 const zero_bias: [qwen3.intermediate]f32 = @splat(0);
 
 /// Whether this context can run the encoder's weights at all.
 ///
-/// ⚠️ **This exists because assuming it cost a blank white image.** krea2's encoder
-/// checkpoint is fp8 and Z-Image's `qwen_3_4b.safetensors` is **bf16**; before the
-/// bf16 arm below, `gemm` fell through to `opMatmul` with `dtype_f8 = false`, which
-/// reads the bf16 bytes as f32 — every GEMM garbage, the conditioning non-finite, and
-/// the render pure white with no error anywhere. The `wcode` helper further down this
-/// file does read bf16 natively, but that is the LM's GEMV path, not this one; the two
+/// Assuming instead costs a blank white image. krea2's encoder is fp8 and Z-Image's is
+/// bf16; without the bf16 arm below, `gemm` falls through to `opMatmul` with
+/// `dtype_f8 = false`, which reads bf16 bytes as f32, so every GEMM is garbage, the
+/// conditioning non-finite, and the render pure white with no error anywhere. The
+/// `wcode` helper further down this file does read bf16 natively, but that is the LM's
+/// GEMV path, not this one; the two
 /// are easy to conflate and one comment does not cover the other.
 pub fn supportsWeights(ctx: *gpu.Context, enc: *const qwen3.TextEncoder) bool {
     if (enc.layers.len == 0) return false;
@@ -265,10 +264,10 @@ fn gemm(ctx: *gpu.Context, coop: bool, y: Buf, x: Buf, m: usize, m_pad: usize, w
         // GGUF text encoder (`--text-encoder foo.gguf`): dequant the weight to f16
         // k-major once, then the same coop GEMM every other arm below uses. This is
         // the LLM prefill path (`opMatmulCoopQuant`), which suits an encoder exactly
-        // — one call over the whole prompt, so the per-call re-dequant amortizes.
+        // one call over the whole prompt, so the per-call re-dequant amortizes.
         //
-        // ⚠️ NOT `wcode` below: that maps every non-f8/bf16 dtype to `.f32`, so a
-        // block quant reaching it would be read as f32 — the same silent-garbage
+        // NOT `wcode` below: that maps every non-f8/bf16 dtype to `.f32`, so a
+        // block quant reaching it would be read as f32, the same silent-garbage
         // shape as the bf16 bug this file's `supportsWeights` comment describes.
         return ctx.opMatmulCoopQuant(w.dtype, y, 0, x, m, w.bytes, w.rows, w.cols, w.scale, zeros[0..w.rows], false);
     }
@@ -361,7 +360,7 @@ const Bufs = struct {
 /// runs device-resident, one batched submission per step.
 ///
 /// Two weight regimes share this stepper:
-///   * Dense (bf16/fp8, tied head — the Qwen3-VL text encoder checkpoints):
+///   * Dense (bf16/fp8, tied head, the Qwen3-VL text encoder checkpoints):
 ///     prefill (seq > 1, empty cache) reuses the encoder's square attention
 ///     (gather_kmajor + attn_scores + attn_out); decode uses the flash-decoding
 ///     attn_dsplit/attn_dmerge pair. GEMMs are the f32-accumulate kernel with
@@ -369,14 +368,14 @@ const Bufs = struct {
 ///     to f32 once and split into 4 vocab chunks (each under the kernels' 1 GiB
 ///     type-level buffer bound). Speculative decode (stepAll) is supported.
 ///   * Block-quant (GGUF q8_0/q4_k/q5_k/q6_k/iq4_nl layers, F16 embed, untied
-///     block-quant head — the llama/Mistral arch): every weight matmul routes
+///     block-quant head, the llama/Mistral arch): every weight matmul routes
 ///     through `gemvW` (per-row fused-dequant GEMV; no GEMM path on Vulkan), so
-///     the whole forward — prefill included — runs one token at a time. The
+///     the whole forward, prefill included, runs one token at a time. The
 ///     head is a separate block-quant tensor; the F16 embedding is host-gathered
 ///     via the same f32 copy the dense path uses.
 ///
 /// Hidden-dim norms take the 3-pass parallel rmsnorm (rms_partial/rms_combine/
-/// rms_apply_w — one thread per row would serialize rows = 1). Optional per-head
+/// rms_apply_w, one thread per row would serialize rows = 1). Optional per-head
 /// QK-norm (`cfg.qk_norm`; llama/Mistral omit it). eps / rope θ / vocab all come
 /// from `cfg`.
 pub const VulkanLM = struct {
@@ -389,8 +388,8 @@ pub const VulkanLM = struct {
     /// per-row dequant GEMV. Dense (bf16/fp8) models keep the grouped-GEMV / GEMM
     /// paths.
     quant: bool,
-    /// Block-quant prefill runs the tensor-core GEMM (dequant→f16→coopmat) in
-    /// one batched pass over the whole prompt instead of a forward per token —
+    /// Block-quant prefill runs the tensor-core GEMM (dequant->f16->coopmat) in
+    /// one batched pass over the whole prompt instead of a forward per token,
     /// but only when the device has the f16-weight coopmat pipeline. Without it,
     /// prefill falls back to the one-token-at-a-time GEMV.
     can_gemm_prefill: bool,
@@ -405,7 +404,7 @@ pub const VulkanLM = struct {
     use_sg_rms: bool,
     /// Route block-quant decode GEMV through the cooperative subgroup kernel
     /// (opGemvQuantSg): raw row-major weight, one subgroup per row, subgroup
-    /// reduce — drops the 32-row-group `_t` transpose AND the dp4a repack. Opt-in
+    /// reduce, drops the 32-row-group `_t` transpose AND the dp4a repack. Opt-in
     /// via TP_VK_SG_GEMV while it's A/B'd against opGemvQuantT / dp4a.
     use_sg_gemv: bool,
     /// Cooperative dp4a decode GEMV for q8_0/iq4_nl (opGemvQuantSgDp4a): dp4a
@@ -413,7 +412,7 @@ pub const VulkanLM = struct {
     /// precedence over use_dp4a / use_sg_gemv for those two dtypes.
     use_sg_dp4a: bool,
     /// dp4a decode GEMV over the _t layout + k-split (opGemvQuantTDp4a): the
-    /// fast repack-dp4a shape with NO int8 repack — reuses the resident _t
+    /// fast repack-dp4a shape with NO int8 repack, reuses the resident _t
     /// buffer (shared with prefill; no cache collision, no VRAM increase). Opt-in
     /// via TP_VK_T_DP4A for q8_0/iq4_nl. Takes precedence over the others.
     use_t_dp4a: bool,
@@ -429,7 +428,7 @@ pub const VulkanLM = struct {
     max_rows: usize,
     sin_off: u32,
     /// Token embedding converted to f32 (bf16 or f16 source): the CPU-side
-    /// gather scratch, and — for the dense tied-head path — the LM-head weight
+    /// gather scratch, and, for the dense tied-head path, the LM-head weight
     /// source (weightBuffer caches by host pointer, so this must stay alive).
     /// Block-quant models use it only for the gather; their head is `lm.head`.
     embed_f32: []f32,
@@ -445,8 +444,8 @@ pub const VulkanLM = struct {
     const nsplit = 128;
     /// Largest batch that runs the small-batch path (4-input grouped GEMVs +
     /// batched flash-decoding): every speculative verify batch, and the
-    /// chunk size for follow-up (pos0 > 0) prefills — which previously went
-    /// token-by-token because the square attention kernel is pos0=0-only.
+    /// chunk size for follow-up (pos0 > 0) prefills, which cannot use the square
+    /// attention kernel because that one is pos0=0-only.
     const gemv_batch_max = spec_limits.max_draft + 1;
     /// Interleaved chunks per row in the 3-pass rmsnorm.
     const rms_chunks = 64;
@@ -461,7 +460,7 @@ pub const VulkanLM = struct {
 
     /// Device bytes the KV cache reserves up front for `capacity` tokens (k +
     /// v across all layers). Vulkan has no growable buffers, so this whole
-    /// window is allocated in init() — callers sizing a default weight-pin
+    /// window is allocated in init(), callers sizing a default weight-pin
     /// budget must leave this much VRAM unpinned for it.
     pub fn kvWindowBytes(cfg: qwen3.Config, capacity: usize) usize {
         return 2 * cfg.n_layers * capacity * cfg.kvDim() * 4;
@@ -470,7 +469,7 @@ pub const VulkanLM = struct {
     pub fn init(gpa: std.mem.Allocator, ctx: *gpu.Context, lm: *const qwen3.CausalLM, capacity: usize, first_seq: usize) !VulkanLM {
         const c = lm.cfg;
         if (c.n_layers > qwen3.Config.max_layers) return error.UnsupportedModelConfig;
-        // The embedding table is host-gathered into an f32 copy — bf16 / f16
+        // The embedding table is host-gathered into an f32 copy, bf16 / f16
         // only (no Vulkan block-quant gather kernel; those checkpoints run on
         // cpu / zig-cuda / cuda).
         if (lm.embed.dtype != .bf16 and lm.embed.dtype != .f16)
@@ -497,7 +496,7 @@ pub const VulkanLM = struct {
         self.use_sg_dp4a = quant and ctx.hasSubgroupDp4a() and getenv("TP_VK_SG_DP4A") != null;
         self.use_t_dp4a = quant and ctx.hasTransposedDp4a() and getenv("TP_VK_T_DP4A") != null;
         // The raw-reading coop GEMV (use_sg_gemv/use_sg_dp4a) reads the RAW
-        // weight while the prefill GEMM reads _t/repacked — and the weight cache
+        // weight while the prefill GEMM reads _t/repacked, and the weight cache
         // keys by host pointer, so mixing layouts for one weight returns the
         // wrong bytes. Force token-by-token prefill for those so every weight
         // stays raw-only. use_t_dp4a is exempt: it reads the SAME _t buffer as
@@ -578,7 +577,7 @@ pub const VulkanLM = struct {
     /// Rows to forward per chunk. Dense: the whole fresh prompt through the
     /// square-attention GEMM path, follow-up (pos0 > 0) through the batched
     /// flash-decoding path. Block-quant WITH the tensor-core prefill: the fresh
-    /// prompt in one square-attention chunk (projections via the dequant→f16
+    /// prompt in one square-attention chunk (projections via the dequant->f16
     /// GEMM), then one token at a time (decode / short follow-ups stay on the
     /// exact per-row GEMV). Block-quant WITHOUT it: one token at a time always.
     fn chunkRows(self: *const VulkanLM, avail: usize) usize {
@@ -593,7 +592,7 @@ pub const VulkanLM = struct {
     }
 
     /// Whether a block-quant weight of this dtype routes through the int8 dp4a
-    /// path (repacked int8-interleaved layout, ~2.4× decode) — used for BOTH
+    /// path (repacked int8-interleaved layout, ~2.4× decode), used for BOTH
     /// decode (opGemvDp4a) and prefill (opMatmulCoopQuant repacked=true) so the
     /// weight's cached device layout is consistent (the cache keys by host ptr).
     /// q8_0 is ON by default: its repack is only ~6% larger than raw, so the win
@@ -630,9 +629,9 @@ pub const VulkanLM = struct {
         };
         switch (w.dtype) {
             // q8_0 / iq4_nl: int8 dp4a decode GEMV over the repacked
-            // int8-interleaved layout — MEASURED ~2.4× faster than scalar on the
+            // int8-interleaved layout, MEASURED ~2.4× faster than scalar on the
             // 3090. Default ON for q8_0 (repack ~6% larger than raw); opt-in for
-            // iq4_nl (TP_VK_DP4A — its int8 repack ~doubles the 4-bit footprint).
+            // iq4_nl (TP_VK_DP4A, its int8 repack ~doubles the 4-bit footprint).
             .q8_0, .iq4_nl => if (self.dp4aRepack(w.dtype))
                 try self.ctx.opGemvDp4a(w.dtype, y, y_off, x, w.bytes, w.scale, w.rows, w.cols, gemv_nchunk, self.bufs.quant_partials)
             else
@@ -644,14 +643,14 @@ pub const VulkanLM = struct {
 
     /// A block-quant-model projection over `m` rows: the exact per-row dequant
     /// GEMV at m == 1 (decode / short follow-up prefill), else the tensor-core
-    /// dequant→f16 GEMM over the whole batch (fresh-prompt prefill — the ~N×
+    /// dequant->f16 GEMM over the whole batch (fresh-prompt prefill, the ~N×
     /// weight-read reuse that turns an O(prompt) stack of forwards into one).
     /// A stray dense weight inside a quant model routes through the dense GEMM.
     fn linearQuant(self: *VulkanLM, y: Buf, x: Buf, m: usize, w: ops.matmul.Weight, rows: usize, cols: usize) !void {
         if (m == 1) return self.gemvW(y, 0, x, w);
         switch (w.dtype) {
             // q8_0 / iq4_nl: dequant from the int8-interleaved layout when the
-            // dp4a repack is used for this dtype (shared with decode — one
+            // dp4a repack is used for this dtype (shared with decode, one
             // resident copy, consistent cache layout), else from _t.
             .q8_0, .iq4_nl => try self.ctx.opMatmulCoopQuant(w.dtype, y, 0, x, m, w.bytes, rows, cols, w.scale, self.zero_bias, self.dp4aRepack(w.dtype)),
             .q4_k, .q5_k, .q6_k => try self.ctx.opMatmulCoopQuant(w.dtype, y, 0, x, m, w.bytes, rows, cols, w.scale, self.zero_bias, false),
@@ -669,7 +668,7 @@ pub const VulkanLM = struct {
         }, rows, 1, 1);
     }
 
-    /// Device VRAM (bytes) this Vulkan context has allocated — the analog of the
+    /// Device VRAM (bytes) this Vulkan context has allocated, the analog of the
     /// CUDA backend's `deviceUsed()`, for the end-of-response telemetry.
     pub fn vramUsed(self: *const VulkanLM) u64 {
         return self.ctx.device_used;
@@ -689,7 +688,7 @@ pub const VulkanLM = struct {
     }
 
     /// step, but with vocab logits for every new token ([ids.len, vocab]
-    /// row-major) — the speculative-decode verify forward. The batch is
+    /// row-major), the speculative-decode verify forward. The batch is
     /// engine-capped at spec_limits.max_draft + 1.
     pub fn stepAll(self: *VulkanLM, io: std.Io, ids: []const u32, logits: []f32) !void {
         const ctx = self.ctx;
@@ -698,7 +697,7 @@ pub const VulkanLM = struct {
         std.debug.assert(logits.len == seq * nvocab);
         std.debug.assert(seq > 0 and seq <= gemv_batch_max);
 
-        // Block-quant has no batched forward — verify each draft position with
+        // Block-quant has no batched forward, verify each draft position with
         // its own one-token forward (linear chain: position t appends its K/V
         // and attends the committed prefix, exactly as a batched verify would).
         if (self.quant) {
@@ -791,7 +790,7 @@ pub const VulkanLM = struct {
     }
 
     /// `stepArgmax` with sampling penalties scattered onto the device logits
-    /// first (opPenalize; see sample.zig) — keeps penalized greedy decode
+    /// first (opPenalize; see sample.zig), keeps penalized greedy decode
     /// on the GPU path instead of the full-vocab download.
     pub fn stepArgmaxPen(self: *VulkanLM, io: std.Io, ids: []const u32, pen: []const sample.PenaltyEntry, sp: sample.Params) !u32 {
         var off: usize = 0;
@@ -824,7 +823,7 @@ pub const VulkanLM = struct {
     }
 
     /// `stepSelect` with sampling penalties scattered onto the device logits
-    /// before the top-k (opPenalize) — the selected candidates are the true
+    /// before the top-k (opPenalize), the selected candidates are the true
     /// post-penalty top set, so penalized stochastic decode stays on the GPU.
     pub fn stepSelectPen(self: *VulkanLM, io: std.Io, ids: []const u32, pen: []const sample.PenaltyEntry, sp: sample.Params, out_id: []u32, out_logit: []f32) !usize {
         var off: usize = 0;
@@ -847,7 +846,7 @@ pub const VulkanLM = struct {
 
     /// The `cfg.n_layers` stack over `ids` at positions [len, len+seq):
     /// embedding upload, then the whole transformer inside an open batch. The
-    /// caller finishes the batch (LM head variants differ) — on success the
+    /// caller finishes the batch (LM head variants differ), on success the
     /// batch is still open, with the final hidden states in bufs.x.
     fn layersForward(self: *VulkanLM, ids: []const u32) !void {
         const gpa = self.gpa;
@@ -965,7 +964,7 @@ pub const VulkanLM = struct {
         const c = self.cfg;
         if (seq <= gemv_batch_max) {
             // Batched flash-decoding split/merge against the cached prefix:
-            // query t sees pos0 + 1 + t keys (causal) — covers decode (seq == 1),
+            // query t sees pos0 + 1 + t keys (causal), covers decode (seq == 1),
             // speculative verify, and follow-up prefill chunks at any pos0.
             try ctx.opElt(.attn_dsplit, b.q, self.k_cache[l], self.v_cache[l], b.attn_scratch, .{
                 .u0 = @intCast(pos0 + 1),
@@ -1076,10 +1075,10 @@ pub const VulkanLM = struct {
     }
 
     /// Dense linear over `m` rows, kernel picked by batch size: k-split GEMV
-    /// (m = 1), grouped 4-input GEMVs (small batches — speculative verify
+    /// (m = 1), grouped 4-input GEMVs (small batches, speculative verify
     /// and follow-up prefill chunks; bitwise equal to the m = 1 path), or
     /// the tiled GEMM (large fresh prefills). bf16 weights have no tiled GEMM
-    /// (only fp8/f32), so bf16 always streams through the grouped GEMV — the
+    /// (only fp8/f32), so bf16 always streams through the grouped GEMV, the
     /// weight is read ceil(m/4)x, matching CUDA's bf16 opGemvBf16N.
     fn gemm(self: *VulkanLM, y: Buf, x: Buf, m: usize, w: ops.matmul.Weight, rows: usize, cols: usize) !void {
         const ctx = self.ctx;
@@ -1314,13 +1313,13 @@ test "vulkan spec decode matches vanilla greedy" {
     try std.testing.expectEqualSlices(u32, ids_vanilla.items, ids_spec.items);
 }
 
-// Regression for the bf16-generation bug: the Vulkan dense matmul / decode-GEMV
-// kernels used to handle only 1-byte (fp8) and 4-byte (f32) weights, so a bf16
-// checkpoint's 2-byte weights were read as f32 and generation produced garbage.
-// bf16 is now read natively (2-byte transpose `transpose_bf16` + a bf16 branch
-// in gemv_partial/gemv_partial4, weight code `WCode.bf16`). The pre-existing
+// Regression for bf16 generation. A Vulkan dense matmul / decode-GEMV that handles
+// only 1-byte (fp8) and 4-byte (f32) weights reads a bf16 checkpoint's 2-byte weights
+// as f32 and produces garbage. bf16 is read natively (2-byte transpose
+// `transpose_bf16` plus a bf16 branch in gemv_partial/gemv_partial4, weight code
+// `WCode.bf16`). The pre-existing
 // spec test above uses the *fp8* encoder checkpoint and only compares
-// Vulkan-to-Vulkan, so it never exercised the bf16 path — hence a bf16 model AND
+// Vulkan-to-Vulkan, so it never exercised the bf16 path, hence a bf16 model AND
 // a comparison against the CPU reference here. Compares the prefill's next-token
 // argmax (the crisp signal: garbage diverged at token 1; bf16-GEMV-vs-CPU
 // reduction-order drift can diverge multi-token decode, so we don't chase full

@@ -1,8 +1,8 @@
 //! Test gating for the slow integration suite.
 //!
 //! `zig build test` runs only the fast CPU unit tests. The slow integration
-//! tests — GPU device tests and the real-model LLM/parity tests that load
-//! multi-GB checkpoints and run inference in Debug — are gated behind
+//! tests, GPU device tests and the real-model LLM/parity tests that load
+//! multi-GB checkpoints and run inference in Debug, are gated behind
 //! `-Dintegration` (see build.zig). GPU tests self-skip because the device
 //! `init` fails in test builds when the flag is off; the heavy real-model tests
 //! call `requireIntegration` (or `requireModelFile`) at their top.
@@ -28,7 +28,7 @@ pub fn requireModelFile(io: std.Io, path: []const u8) error{SkipZigTest}!void {
 /// simulating another process / a resident image model for tests that assert
 /// VRAM-pressure behavior (split planning, eviction, reclaim). Allocates in
 /// 1 GiB chunks (one huge allocation can fail on a fragmented card) and stops
-/// early if the allocator refuses — the caller asserts on the RESULTING free
+/// early if the allocator refuses, the caller asserts on the RESULTING free
 /// figure, not on how much was ballooned. Release with `deinit`.
 pub const VramBalloon = struct {
     be: *cuda.Backend,

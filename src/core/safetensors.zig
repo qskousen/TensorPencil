@@ -24,7 +24,7 @@ pub const ParseError = error{
     InvalidShape,
     InvalidOffsets,
     DuplicateTensor,
-    /// The declared tensor ranges do not cover the whole payload — a truncated or
+    /// The declared tensor ranges do not cover the whole payload, a truncated or
     /// mis-assembled file. See the check in `initFromSlice`.
     IncompleteMetadata,
     OutOfMemory,
@@ -57,13 +57,13 @@ pub const TensorView = struct {
 /// How checkpoint bytes reach the consumer. Applies to BOTH loaders (safetensors
 /// and GGUF) and to every front end (`--mmap` on the CLIs, a setting in the GUI).
 pub const ReadMode = enum {
-    /// **Default.** Map the file (headers and CPU access still use the mapping),
+    /// Default. Map the file (headers and CPU access still use the mapping),
     /// but fetch bulk weight bytes for GPU upload with positional reads. Large
     /// explicit reads do not depend on the kernel's readahead heuristic, which is
     /// what collapses a cold multi-GB checkpoint to page-granularity speed when
     /// the host is short of free RAM.
     pread,
-    /// Map the file and copy weight bytes straight out of the mapping — the
+    /// Map the file and copy weight bytes straight out of the mapping, the
     /// behaviour before `pread` became the default. Kept because the read path is
     /// the sort of thing worth being able to A/B without a rebuild.
     mmap,
@@ -103,8 +103,8 @@ pub const SafeTensors = struct {
     /// The mapped file, kept OPEN so a consumer can read tensor bytes with
     /// positional reads (`readTo`) instead of faulting the mapping.
     ///
-    /// ⚠️ Exists because a cold 14 GB checkpoint faults in at ~4 KiB granularity
-    /// when the host is under memory pressure — `MADV_WILLNEED` is advisory and
+    /// Exists because a cold 14 GB checkpoint faults in at ~4 KiB granularity
+    /// when the host is under memory pressure, `MADV_WILLNEED` is advisory and
     /// the kernel will not schedule that much readahead with little free RAM.
     /// Measured on this NVMe: 192 MB/s at 4 KiB reads against 3.2 GB/s at 1 MiB,
     /// and a GUI first sampling step of 116 s against 9 s when readahead happened
@@ -159,7 +159,7 @@ pub const SafeTensors = struct {
         errdefer std.posix.munmap(mapping);
         // Kick off an async read-ahead of the whole file. The weights are
         // each touched once (GPU upload / transpose), so a cold file
-        // otherwise faults in synchronously on first access — a 12 GB DiT
+        // otherwise faults in synchronously on first access, a 12 GB DiT
         // adds tens of seconds to the first sampling step, and the 4.9 GB
         // text encoder inflates the encode. WILLNEED overlaps that disk read
         // with setup/compute instead. Advisory and best-effort.
@@ -210,18 +210,15 @@ pub const SafeTensors = struct {
             covered = @max(covered, info.end);
         }
 
-        // ⚠️ **The tensor table must COVER the payload, and not checking that let a
-        // corrupt checkpoint render a solid white image instead of failing.**
-        // `anima_baseV10-INT8_CONVROT-MIXED.safetensors` declares 2,324,776,986 bytes of
-        // tensors in a 2,366,726,170-byte payload — 41,949,184 bytes short — and its
-        // actual data is displaced by ~41.94 MB from where the header says, so every
-        // tensor past the first ~28 read someone else's bytes. Per-tensor bounds
-        // (`end <= payload_len`, `end - start == storageBytes`) all passed.
+        // The tensor table must COVER the payload. A corrupt checkpoint whose data is
+        // displaced from where its header says still passes every per-tensor bound
+        // (`end <= payload_len`, `end - start == storageBytes`); the shortfall shows up
+        // only in the aggregate, and each tensor past the displacement reads its
+        // neighbour's bytes. That renders a solid white image rather than failing.
         //
-        // The reference implementation makes exactly this check and refuses the same file
-        // with "incomplete metadata, file not fully covered"; being more permissive than
-        // it buys nothing but silent garbage. A tensor table that does not describe the
-        // whole payload is not a file we can reason about.
+        // The reference implementation makes this check and refuses such a file with
+        // "incomplete metadata, file not fully covered". Being more permissive buys
+        // nothing but silent garbage.
         if (covered != payload.len) {
             std.log.err(
                 "safetensors: the tensor table covers {d} of {d} payload bytes ({d} unaccounted). " ++
@@ -284,28 +281,28 @@ pub const SafeTensors = struct {
     }
 
     /// Read `dst.len` bytes of this checkpoint into `dst`, where `dst` mirrors a
-    /// slice of the mapping — i.e. the caller passes the mapped `src` it would
+    /// slice of the mapping, i.e. the caller passes the mapped `src` it would
     /// otherwise have copied, and gets the same bytes via a positional read.
     ///
-    /// ⚠️ **The point is to avoid faulting the mapping.** A read-once 14 GB
+    /// The point is to avoid faulting the mapping. A read-once 14 GB
     /// checkpoint faulted at page granularity runs ~192 MB/s on this NVMe against
     /// 3.2 GB/s for large reads, and the kernel will not schedule the readahead
     /// that would fix it when the host is short on free RAM. Positional reads are
     /// large and explicit, so throughput does not depend on the kernel's readahead
     /// heuristic firing.
     ///
-    /// ⚠️ It does NOT avoid page-cache pollution — a buffered `pread` populates the
+    /// It does NOT avoid page-cache pollution, a buffered `pread` populates the
     /// cache just as a fault does. Only O_DIRECT would, and that needs alignment
     /// handling this does not do.
     ///
     /// Measured (cold cache, interleaved A/B from one binary, 13.5 GB DiT):
     /// step 1 8.5/8.1 s vs 8.9/8.9 s for the mapping copy, prefetch stall
-    /// 7.9/7.6 s vs 8.4/8.3 s — a consistent but small ~6-9%. ⚠️ The large win this
+    /// 7.9/7.6 s vs 8.4/8.3 s, a consistent but small ~6-9%. The large win this
     /// was built for (a 116 s first step under host memory pressure) is UNPROVEN:
     /// that state could not be reproduced on demand.
     ///
     /// Returns false when this store has no open file (buffered-read or
-    /// caller-slice path) or `src` is not inside the mapping — the caller then
+    /// caller-slice path) or `src` is not inside the mapping, the caller then
     /// keeps using `src` directly, which is the pre-existing behaviour.
     pub fn readTo(self: *const SafeTensors, dst: []u8, src: []const u8) bool {
         if (read_mode != .pread) return false;
@@ -329,7 +326,7 @@ pub const SafeTensors = struct {
         return .{ .info = info, .bytes = self.payload[info.start..info.end] };
     }
 
-    /// Like `get`, but a missing tensor is an error — for required weights.
+    /// Like `get`, but a missing tensor is an error, for required weights.
     pub fn require(self: *const SafeTensors, name: []const u8) !TensorView {
         return self.get(name) orelse error.MissingTensor;
     }
@@ -357,8 +354,8 @@ pub fn convertToF32(dt: DType, bytes: []const u8, out: []f32) ConvertError!void 
         },
         .bf16 => dtypes.bf16ToF32Row(bytes, out, 1.0),
         .f16 => dtypes.f16ToF32Row(bytes, out, 1.0),
-        // f64 appears in real checkpoints — an SD1.5 merge in the wild stores its
-        // CLIP text-encoder linears this way — and a converting *read* is the right
+        // f64 appears in real checkpoints, an SD1.5 merge in the wild stores its
+        // CLIP text-encoder linears this way, and a converting *read* is the right
         // handling: ComfyUI casts them at load too. Integer dtypes deliberately stay
         // unsupported below, because silently turning token ids or `position_ids`
         // into floats is never what a caller wants.
@@ -544,10 +541,9 @@ test "open via buffered read round trip (read_mode = .buffered)" {
 // Validation against the real Krea 2 checkpoints; each block skipped when its own
 // file is not present (e.g. CI, a fresh checkout, or a pruned models/ dir).
 //
-// ⚠️ **Per file, not once for the set.** This used to guard on the VAE alone and then
-// open the DiT and the text encoder unconditionally, so deleting any ONE of the three
-// hard-failed a *fast-suite* test with a bare `FileNotFound` five frames deep — which is
-// exactly what happened when the krea2 fp8 checkpoint was pruned off this box. A
+// Per file, not once for the set. Guarding on one file and then opening the others
+// unconditionally makes deleting any ONE of them hard-fail a FAST-SUITE test with a
+// bare `FileNotFound` five frames deep. A
 // real-model check has to self-skip on the file it actually needs.
 test "real model headers" {
     const gpa = std.testing.allocator;

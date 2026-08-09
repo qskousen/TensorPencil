@@ -1,10 +1,10 @@
-//! CUDA decode for the taew2_1 (TAEHV) approx VAE — the GPU path for the live
+//! CUDA decode for the taew2_1 (TAEHV) approx VAE, the GPU path for the live
 //! per-step preview. Mirrors vae_cuda's conv (im2col + f16/f32 GEMM, with a
 //! fused nearest-2x upsample), driving the layer sequence from taehv.zig.
 //!
 //! The input Clamp (tanh(x/3)*3) is applied on the host before upload (it's on
 //! the small latent). Each stage's spatial Upsample is fused into that stage's
-//! 3x3 conv (`up=true`) — valid because it commutes with the per-pixel TGrow
+//! 3x3 conv (`up=true`), valid because it commutes with the per-pixel TGrow
 //! 1x1 conv that sits between them.
 const std = @import("std");
 const cuda = @import("tp_gpu").cuda;

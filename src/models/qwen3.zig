@@ -1,4 +1,4 @@
-//! Qwen3-VL-4B language model, text-only path — the Krea 2 text encoder.
+//! Qwen3-VL-4B language model, text-only path, the Krea 2 text encoder.
 //!
 //! Reference: comfy/text_encoders/llama.py (`Llama2_`, Qwen3VL_4BConfig) and
 //! comfy/text_encoders/krea2.py. Config: 36 layers, hidden 2560, GQA 32/8
@@ -6,7 +6,7 @@
 //! per-head QK-norm before RoPE, rotate-half RoPE theta 5e6, causal
 //! attention. Text-only inputs never trigger the interleaved-mRoPE branch.
 //!
-//! Krea 2 conditions on the hidden states *entering* layers [2,5,...,35]
+//! Krea 2 conditions on the hidden states *entering* layers [2,5...,35]
 //! (hidden_states[k] = output of layer k-1), so layer 35 and the final norm
 //! are never evaluated and are not loaded.
 //!
@@ -67,10 +67,10 @@ pub fn dimsFor(cfg: Config) transformer.Dims {
     };
 }
 
-/// Runtime model configuration for `CausalLM` — the extension point for
-/// other Qwen3-family checkpoints (LLM_PLAN.md M5 uses Qwen3-0.6B as the
-/// speculative-decoding draft model) AND the plain llama/Mistral family
-/// (which is structurally identical once q/k are un-permuted at load — see
+/// Runtime model configuration for `CausalLM`, the extension point for
+/// other Qwen3-family checkpoints (Qwen3-0.6B serves as the speculative-decoding
+/// draft model) AND the plain llama/Mistral family
+/// (which is structurally identical once q/k are un-permuted at load, see
 /// `qk_norm`/`permute_qk`). All checkpoints share head_dim 128 (the
 /// flash-decoding kernels require it) and rms_eps 1e-6; everything else
 /// (incl. vocab size and whether QK-norm is present) varies.
@@ -115,7 +115,7 @@ pub const Config = struct {
         .prefix = "model.language_model.",
     };
 
-    /// Qwen3-0.6B (base or instruct) — the draft model.
+    /// Qwen3-0.6B (base or instruct), the draft model.
     pub const qwen3_0_6b: Config = .{
         .n_layers = 28,
         .hidden = 1024,
@@ -127,7 +127,7 @@ pub const Config = struct {
     };
 
     /// Vanilla Qwen3-4B (text-only): the VL's dims but rope_theta 1e6 and
-    /// bare tensor names — the EAGLE-3 head's actual training target.
+    /// bare tensor names, the EAGLE-3 head's actual training target.
     pub const qwen3_4b: Config = .{
         .n_layers = 36,
         .hidden = 2560,
@@ -174,7 +174,7 @@ pub const Config = struct {
         }.f;
         if (g.getUint(key(&kbuf, p, "block_count"))) |block_count| {
             if (block_count == 0 or block_count > max_layers) return error.UnknownModelConfig;
-            // head_dim is a kernel invariant, not configurable.
+            // head_dim is fixed by the kernels, not configurable.
             if ((g.getUint(key(&kbuf, p, "attention.key_length")) orelse head_dim) != head_dim or
                 (g.getUint(key(&kbuf, p, "attention.value_length")) orelse head_dim) != head_dim)
                 return error.UnknownModelConfig;
@@ -196,7 +196,7 @@ pub const Config = struct {
         // Hyperparameter-less GGUF (ComfyUI-style conversion, bare HF names,
         // at most an architecture tag): match a plain-Qwen3 preset by
         // embedding shape. rope_theta is unrecoverable, so a VL-derived
-        // conversion would silently get the plain-Qwen3 theta — hence the
+        // conversion would silently get the plain-Qwen3 theta, hence the
         // warning.
         const view = g.get("embed_tokens.weight") orelse return error.UnknownModelConfig;
         const shape = view.info.shape.slice();
@@ -215,7 +215,7 @@ pub const Config = struct {
         return error.UnknownModelConfig;
     }
 
-    /// Upper bound on n_layers — backend steppers use fixed-size per-layer
+    /// Upper bound on n_layers, backend steppers use fixed-size per-layer
     /// arrays. Covers the presets (36) and GGUF checkpoints up to Qwen3-32B
     /// (64 layers).
     pub const max_layers = 64;
@@ -231,17 +231,17 @@ fn statesRopeTheta(g: *const gguf_mod.Gguf) bool {
 pub const tap_layers = [_]usize{ 2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35 };
 pub const tap_count = tap_layers.len;
 
-/// Z-Image conditions on the **penultimate** hidden state with the final norm
+/// Z-Image conditions on the penultimate hidden state with the final norm
 /// skipped (`sd1_clip` `layer_idx = -2`, `layer_norm_hidden_state = False`), which
 /// comfy resolves to `intermediate_output = 36 - 2 = 34` and captures *after* layer
-/// 34 has run. In this file's convention — tap k is the state entering layer k —
-/// that is tap 35, i.e. **exactly krea2's last tap**. Both variants therefore run
+/// 34 has run. In this file's convention, tap k is the state entering layer k,
+/// that is tap 35, i.e. exactly krea2's last tap. Both variants therefore run
 /// the identical 35 layers and differ only in how many states they keep.
 pub const zimage_taps = [_]usize{35};
 
-/// Anima conditions on the **final** hidden state with `model.norm` APPLIED
+/// Anima conditions on the final hidden state with `model.norm` APPLIED
 /// (`sd1_clip` `layer = "last"`, and `Qwen3_06BConfig.final_norm = True`). In this
-/// file's convention — tap k is the state entering layer k — that is tap
+/// file's convention, tap k is the state entering layer k, that is tap
 /// `n_layers`, one past the last layer, so unlike the other two variants every
 /// layer runs AND the final norm is evaluated. Derived from the preset rather than
 /// written as `28`, so the two cannot disagree.
@@ -252,11 +252,11 @@ pub const anima_taps = [_]usize{Config.qwen3_0_6b.n_layers};
 /// krea2 and Z-Image are the same 36-layer, 2560-wide Qwen3-4B body and differ only
 /// in the checkpoint's tensor prefix (krea2 ships the VL checkpoint, so its language
 /// model is nested under `model.language_model.`), the RoPE theta (5e6 vs 1e6) and
-/// the tap list. **Anima is a different body** — Qwen3-0.6B, 28 layers, 1024 wide —
+/// the tap list. Anima is a different body, Qwen3-0.6B, 28 layers, 1024 wide,
 /// which is why the encoder is written against `cfg` rather than this file's
 /// module-level dims.
 ///
-/// ⚠️ The theta is the dangerous one — it is not recoverable from the weights, and
+/// The theta is the dangerous one, it is not recoverable from the weights, and
 /// the wrong value produces a perfectly finite encode whose long-range positions
 /// are simply wrong. All three live in `Config` presets so the choice is made once.
 pub const Variant = enum {
@@ -264,9 +264,9 @@ pub const Variant = enum {
     krea2,
     /// Z-Image: plain Qwen3-4B, one hidden state.
     zimage,
-    /// Anima: Qwen3-0.6B **base**, the final hidden state after `model.norm`. Its
+    /// Anima: Qwen3-0.6B base, the final hidden state after `model.norm`. Its
     /// states are the `llm_adapter`'s cross-attention source, not the denoiser's
-    /// context directly — see `models/anima.zig`.
+    /// context directly, see `models/anima.zig`.
     anima,
 
     pub fn config(self: Variant) Config {
@@ -287,7 +287,7 @@ pub const Variant = enum {
 
     /// Whether `norm.weight` is loaded and applied to the last tap.
     ///
-    /// ⚠️ This is NOT the same knob as `sd1_clip`'s `layer_norm_hidden_state`, which
+    /// This is NOT the same knob as `sd1_clip`'s `layer_norm_hidden_state`, which
     /// only governs an *intermediate* output. krea2 and Z-Image tap before a layer
     /// that still has to run, so the final norm is genuinely never evaluated for
     /// them and is not even loaded; Anima taps past the end, where it always is.
@@ -317,7 +317,7 @@ const Layer = struct {
 };
 
 pub const TextEncoder = struct {
-    /// **This tower cannot apply per-token prompt weights**, and the reason is structural
+    /// This tower cannot apply per-token prompt weights, and the reason is structural
     /// rather than a missing feature: krea2 conditions on qwen3 tap states with no fixed
     /// token window, no chunking, and no empty-prompt reference of matching shape to
     /// interpolate against. See `clip_text.TextEncoder.supports_prompt_weights` for the
@@ -326,13 +326,13 @@ pub const TextEncoder = struct {
     pub const supports_prompt_weights = false;
 
     arena: std.heap.ArenaAllocator,
-    /// `[vocab, hidden]` view into the mapped file. ⚠️ A `Weight`, not a byte
+    /// `[vocab, hidden]` view into the mapped file. A `Weight`, not a byte
     /// slice, because the dtype is a property of the CHECKPOINT: a safetensors
     /// encoder ships bf16, a GGUF one ships whatever it was quantized to (q6_k for
     /// Qwen3-4B-Q4_K_M). Every gather goes through `embedTokens`, which dispatches
-    /// on it — three call sites used to hardcode `bf16` and a `* 2` row stride.
+    /// on it, so no call site may assume bf16 and a `* 2` row stride.
     embed: Weight,
-    /// Layers `0..taps[last]` — krea2/Z-Image tap before layer 35, so layer 35 is
+    /// Layers `0..taps[last]`, krea2/Z-Image tap before layer 35, so layer 35 is
     /// never loaded; Anima taps past layer 27, so all 28 are.
     layers: []Layer,
     variant: Variant,
@@ -350,7 +350,7 @@ pub const TextEncoder = struct {
     /// Krea 2's encoder. Kept as the unqualified name because it is what every
     /// existing caller means; `loadVariant` is the general form.
     ///
-    /// `store` may be a `weights.Prefixed` view of a bundled checkpoint — this loader
+    /// `store` may be a `weights.Prefixed` view of a bundled checkpoint, this loader
     /// always sees its own component at the root. See `weights.Prefixed`.
     pub fn load(gpa: std.mem.Allocator, store: weights_mod.WeightStore) !TextEncoder {
         return loadVariant(gpa, store, .krea2);
@@ -361,21 +361,21 @@ pub const TextEncoder = struct {
         errdefer arena.deinit();
         const alloc = arena.allocator();
 
-        // ⚠️ **The checkpoint's own metadata wins for everything the checkpoint
-        // states; the Variant supplies only what it cannot know.** A GGUF carries
-        // its dims, its tensor prefix (bare, no `model.`) and — the one that
-        // matters most — its `rope.freq_base`, which for a safetensors file is not
+        // The checkpoint's own metadata wins for everything the checkpoint
+        // states; the Variant supplies only what it cannot know. A GGUF carries
+        // its dims, its tensor prefix (bare, no `model.`) and, the one that
+        // matters most, its `rope.freq_base`, which for a safetensors file is not
         // recoverable and has to come from the Variant's constant. What stays with
         // the Variant is the TAP LIST, because which hidden states to keep is a
         // property of how the *diffusion* model was trained, not of the encoder.
         const cfg = if (store == .gguf) blk: {
             var c = try Config.detect(store);
             c.vocab = @max(c.vocab, 1);
-            // ⚠️ **A checkpoint that states nothing must not win.** ComfyUI-style
+            // A checkpoint that states nothing must not win. ComfyUI-style
             // GGUFs (city96's converter) carry only `general.architecture`, so
             // `detectGguf` falls back to matching a preset by embedding shape and
             // GUESSES plain-Qwen3's 1e6 theta. That is right for Z-Image and
-            // silently wrong for krea2, whose Qwen3-VL encoder is 5e6 — a value
+            // silently wrong for krea2, whose Qwen3-VL encoder is 5e6, a value
             // that is not recoverable from weights and encodes perfectly finite
             // nonsense when wrong. Where the file is silent, the Variant's
             // constant is the better answer, since it is what the *diffusion*
@@ -431,7 +431,7 @@ pub const TextEncoder = struct {
         ops.cancel.token = cancel;
         defer ops.cancel.token = prev_tok;
 
-        // ⚠️ `self.cfg.hidden`, not this file's 2560: Anima's body is Qwen3-0.6B at
+        // `self.cfg.hidden`, not this file's 2560: Anima's body is Qwen3-0.6B at
         // 1024. Reading the module constant here allocated 2.5x the rows needed and
         // strode the wrong distance through them.
         const h = self.cfg.hidden;
@@ -443,7 +443,7 @@ pub const TextEncoder = struct {
         defer gpa.free(x);
         try embedTokens(self.embed, ids, x);
 
-        // ⚠️ From the variant's config, not the module constant: the VL checkpoint's
+        // From the variant's config, not the module constant: the VL checkpoint's
         // theta is 5e6 and plain Qwen3-4B's is 1e6, and the wrong one encodes
         // perfectly finite nonsense.
         var freqs = try ops.rope.rotateHalfFreqs(gpa, seq, head_dim, self.cfg.rope_theta);
@@ -454,10 +454,10 @@ pub const TextEncoder = struct {
 
         const dims = dimsFor(self.cfg);
         var tap_idx: usize = 0;
-        // ⚠️ `n_layers + 1`, because a tap index may be one PAST the last layer:
+        // `n_layers + 1`, because a tap index may be one PAST the last layer:
         // Anima's tap is `cfg.n_layers`. The `l >= self.layers.len` break below is
         // what actually terminates the loop, so no variant runs a layer it should
-        // not — but a range of exactly `n_layers` would never fire that final tap,
+        // not, but a range of exactly `n_layers` would never fire that final tap,
         // and the `tap_idx == n_taps` assert is what would catch it.
         for (0..self.cfg.n_layers + 1) |l| {
             // Poll cancel between layers so a stop lands mid-encode (a full CPU
@@ -467,7 +467,7 @@ pub const TextEncoder = struct {
                 for (0..seq) |t| {
                     const dst = out[(t * n_taps + tap_idx) * h ..][0..h];
                     const src = x[t * h ..][0..h];
-                    // The final norm applies only to a tap past the last layer —
+                    // The final norm applies only to a tap past the last layer,
                     // which is the only tap a variant that has one ever takes.
                     if (self.final_norm) |w| {
                         if (l == self.cfg.n_layers) {
@@ -541,7 +541,7 @@ pub const CausalLM = struct {
         return self.head;
     }
 
-    /// True when any weight is a ggml block-quantized dtype — such models
+    /// True when any weight is a ggml block-quantized dtype, such models
     /// only run on the cpu backend until the GPU kernels land.
     pub fn hasBlockQuantWeights(self: *const CausalLM) bool {
         if (self.embed.dtype.isBlockQuant() or self.head.dtype.isBlockQuant()) return true;
@@ -598,7 +598,7 @@ pub const CausalLM = struct {
         }
     }
 
-    /// Tree-verify forward (speculative tree drafting, LLM_PLAN.md M8):
+    /// Tree-verify forward (speculative tree drafting):
     /// `ids.len` tree nodes forwarded against the committed cache WITHOUT
     /// appending to it. Node i (parents[i] < i; node 0 is the root) sits at
     /// absolute position cache.len + depth(i) and attends the committed
@@ -680,10 +680,10 @@ pub const Scratch = struct {
 
     /// A borrowed view of the first `seq` rows of a larger scratch (no alloc).
     /// The CUDA split sizes its scratch to a full chunk once, then views it
-    /// down to the actual chunk length each call — `layerForward`'s ops
+    /// down to the actual chunk length each call, `layerForward`'s ops
     /// require exact-length slices, so passing the oversized buffer would trip
     /// a length assert (same fix as gemma3.Scratch.viewSeq). Never deinit a
-    /// view — it aliases the parent scratch's memory.
+    /// view, it aliases the parent scratch's memory.
     pub fn viewSeq(self: *const Scratch, seq: usize, cfg: Config) Scratch {
         return .{
             .normed = self.normed[0 .. seq * cfg.hidden],
@@ -745,7 +745,7 @@ fn loadLayersCfg(alloc: std.mem.Allocator, store: WeightStore, cfg: Config, coun
             .v = try loadWeight(store, cfg, i, "self_attn.v_proj.weight", cfg.kvDim(), cfg.hidden),
             .o = try loadWeight(store, cfg, i, "self_attn.o_proj.weight", cfg.hidden, cfg.qDim()),
             // llama/Mistral has no per-head QK-norm; leave the slices empty
-            // (the llama LayerSpec never reads them — see transformer.qkvProject).
+            // (the llama LayerSpec never reads them, see transformer.qkvProject).
             .q_norm = if (cfg.qk_norm) try loadNorm(alloc, store, cfg, i, "self_attn.q_norm.weight", head_dim) else &.{},
             .k_norm = if (cfg.qk_norm) try loadNorm(alloc, store, cfg, i, "self_attn.k_norm.weight", head_dim) else &.{},
             .post_norm = try loadNorm(alloc, store, cfg, i, "post_attention_layernorm.weight", cfg.hidden),
@@ -821,8 +821,8 @@ fn readF32File(gpa: std.mem.Allocator, io: std.Io, path: []const u8, n: usize) !
 }
 
 // The three conditioning variants differ in body, taps and whether the final norm
-// runs. This is a fast structural pin, not a numeric one — the numbers are checked
-// against ComfyUI by the krea2 test below and by the Anima fixtures — but it is what
+// runs. This is a fast structural pin, not a numeric one, the numbers are checked
+// against ComfyUI by the krea2 test below and by the Anima fixtures, but it is what
 // catches a tap list that stops agreeing with the config it indexes, which produces
 // a finite encode of the wrong hidden state.
 test "each encoder variant's tap list is consistent with its own body" {
@@ -831,12 +831,12 @@ test "each encoder variant's tap list is consistent with its own body" {
         const taps = v.taps();
         errdefer std.debug.print("variant {t}: n_layers={d} taps={any}\n", .{ v, cfg.n_layers, taps });
         try std.testing.expect(taps.len > 0);
-        // A tap may be one PAST the last layer — that is exactly the case that
-        // carries the final norm — but never further, or `loadVariant` would be
+        // A tap may be one PAST the last layer, that is exactly the case that
+        // carries the final norm, but never further, or `loadVariant` would be
         // asked for a layer the checkpoint does not have.
         try std.testing.expect(taps[taps.len - 1] <= cfg.n_layers);
         for (taps[1..], taps[0 .. taps.len - 1]) |b, a| try std.testing.expect(b > a);
-        // ⚠️ The load-bearing invariant: the final norm is applied if and only if
+        // The load-bearing rule: the final norm is applied if and only if
         // the last tap is past the last layer. krea2/Z-Image tap before a layer that
         // still has to run, so their final norm is genuinely never evaluated; Anima
         // taps past the end, where ComfyUI's `layer = "last"` always applies it.
@@ -849,7 +849,7 @@ test "each encoder variant's tap list is consistent with its own body" {
 }
 
 // Config detection + weight wiring against a real llama.cpp GGUF; skipped
-// when the checkpoint is absent. Load-only — generation quality is validated
+// when the checkpoint is absent. Load-only, generation quality is validated
 // end-to-end via tp-llm (a Debug 4B forward is too slow for the suite).
 test "causal lm loads from real qwen3-4b gguf" {
     const gpa = std.testing.allocator;
@@ -879,7 +879,7 @@ test "causal lm loads from real qwen3-4b gguf" {
 }
 
 // Config detection from synthetic GGUF metadata: a Qwen3-32B-shaped header
-// (64 layers — larger than any preset) builds the right Config, and a
+// (64 layers, larger than any preset) builds the right Config, and a
 // block_count above max_layers is rejected.
 test "config detects 32b gguf metadata" {
     const gpa = std.testing.allocator;

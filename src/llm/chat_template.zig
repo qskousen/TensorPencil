@@ -1,4 +1,4 @@
-//! chat_template.zig — render a chat transcript into a token-id prompt using
+//! chat_template.zig, render a chat transcript into a token-id prompt using
 //! the model's OWN embedded Jinja `chat_template` (via `jinja.zig`), instead of
 //! the hand-maintained per-family glue in `chat.zig`.
 //!
@@ -6,13 +6,13 @@
 //! reasoning model's prior-turn thought blocks accumulated in context forever
 //! and the model degraded after a few turns (see TODO #1). The real templates
 //! strip prior thoughts (`strip_thinking`), handle the system/`<|think|>` cue,
-//! BOS, tool/image placeholders, etc. — rendering the model's template is the
+//! BOS, tool/image placeholders, etc., rendering the model's template is the
 //! single source of truth and fixes that class of drift generically.
 //!
 //! The rendered string is tokenized with the tokenizer's special-token scanner
-//! (one special-aware pass — the same way llama.cpp/transformers tokenize a
+//! (one special-aware pass, the same way llama.cpp/transformers tokenize a
 //! templated prompt), so template markers (`<bos>`, `<|turn>`, `<|channel>`,
-//! `<|im_start|>`, `<think>`, …) map to their special ids.
+//! `<|im_start|>`, `<think>`, ...) map to their special ids.
 
 const std = @import("std");
 const tp_core = @import("tp_core");
@@ -25,11 +25,11 @@ pub const Role = enum {
     user,
     assistant,
     /// A tool's RESULT, replayed so the model can see what its call returned.
-    /// ⚠️ Not every template accepts one: qwen3.5/Bonsai render it as a user
+    /// Not every template accepts one: qwen3.5/Bonsai render it as a user
     /// turn wrapped in `<tool_response>`, gemma4 resolves it back to the calling
-    /// function through `tool_call_id`, and **gemma3 raises** ("Conversation
+    /// function through `tool_call_id`, and gemma3 raises ("Conversation
     /// roles must alternate user/assistant"). Probe with `supportsToolRole`
-    /// rather than assuming — the answer is a property of the loaded template.
+    /// rather than assuming, the answer is a property of the loaded template.
     tool,
 
     pub fn str(self: Role) []const u8 {
@@ -44,16 +44,16 @@ pub const Role = enum {
 
 /// A function the model may call, rendered into the template's `tools` global
 /// as the OpenAI shape every chat template expects:
-/// `{"type":"function","function":{"name":…,"description":…,"parameters":…}}`.
+/// `{"type":"function","function":{"name":...,"description":...,"parameters":...}}`.
 ///
-/// `parameters_json` is JSON **text** rather than a Zig type because it *is* a
-/// JSON Schema — arbitrarily nested — and the templates emit it straight back
+/// `parameters_json` is JSON text rather than a Zig type because it *is* a
+/// JSON Schema, arbitrarily nested, and the templates emit it straight back
 /// out (`{{ tool | tojson }}`), so anything less than free-form JSON would
 /// silently truncate a caller's schema.
 pub const Tool = struct {
     name: []const u8,
     description: []const u8 = "",
-    /// JSON Schema **object** for the arguments, as JSON text.
+    /// JSON Schema object for the arguments, as JSON text.
     parameters_json: []const u8 = "{}",
 };
 
@@ -66,9 +66,9 @@ pub const ToolCall = struct {
     /// qwen3.5/Bonsai ignore it entirely.
     id: []const u8 = "",
     name: []const u8,
-    /// The arguments as a JSON **object**, in JSON text. A dict rather than a
+    /// The arguments as a JSON object, in JSON text. A dict rather than a
     /// string on purpose: the templates iterate it (`arguments | items`) to emit
-    /// one `<parameter=…>` block per key.
+    /// one `<parameter=...>` block per key.
     arguments_json: []const u8 = "{}",
 };
 
@@ -83,7 +83,7 @@ pub const Part = union(enum) {
 };
 
 /// One transcript message. `content` is the RAW text (an assistant message
-/// keeps its thought block inline — the template's `strip_thinking` removes it
+/// keeps its thought block inline, the template's `strip_thinking` removes it
 /// from prior turns; we must NOT pre-strip it here). When `parts` is set the
 /// message is multimodal: the template renders each part in order (an image
 /// part emits the family's single image-placeholder token, later expanded to
@@ -130,7 +130,7 @@ pub const ImageExpand = struct {
         return .{ .placeholder = ph, .pad = ph };
     }
 
-    /// Gemma 3 layout: `<start_of_image>` → itself + `<image_soft_token>`×N +
+    /// Gemma 3 layout: `<start_of_image>` -> itself + `<image_soft_token>`×N +
     /// `<end_of_image>` (the template emits `<start_of_image>` as the single
     /// placeholder).
     pub fn gemma3(tok: *const Tokenizer) ?ImageExpand {
@@ -145,7 +145,7 @@ pub const ImageExpand = struct {
         return e;
     }
 
-    /// The gemma4 layout: `<|image|>` → `<|image>` + pad×N + `<image|>`.
+    /// The gemma4 layout: `<|image|>` -> `<|image>` + pad×N + `<image|>`.
     pub fn gemma4(tok: *const Tokenizer) ?ImageExpand {
         const ph = tok.specialId("<|image|>") orelse return null;
         const open = tok.specialId("<|image>") orelse return null;
@@ -170,8 +170,8 @@ pub const RenderOpts = struct {
     /// The model's EOS string (Mistral/llama templates emit `{{ eos_token }}`
     /// to close each assistant turn); "" for none.
     eos_token: []const u8 = "",
-    /// Functions the model may call. Null leaves `tools` **undefined**, which is
-    /// what every template tests (`{%- if tools %}`) — so a caller that declares
+    /// Functions the model may call. Null leaves `tools` undefined, which is
+    /// what every template tests (`{%- if tools %}`), so a caller that declares
     /// none renders byte-identically to one that never knew about tools.
     tools: ?[]const Tool = null,
 };
@@ -192,7 +192,7 @@ pub const ChatTemplate = struct {
 
     /// Google's current upstream "canonical" Gemma 4 chat template (identical
     /// across the 12B/31B releases). Used by the config override that replaces
-    /// a model's own embedded template — some finetunes (e.g. DarkIdol 31B)
+    /// a model's own embedded template, some finetunes (e.g. DarkIdol 31B)
     /// ship an older/stripped variant; this renders exactly what Google's
     /// `apply_chat_template` would. Byte-exact vs jinja2 (golden fixtures).
     pub const gemma4_canonical_src = jinja.gemma4_canonical_template;
@@ -226,7 +226,7 @@ pub const ChatTemplate = struct {
     /// real pad-row block per `exp`. The first pad row of each image is recorded
     /// in `image_rows` so the caller can splice the ViT embeddings in with
     /// `model.prefillImage`. `grids` gives every image's `grid_w*grid_h`, in the
-    /// same order the parts appear — used for the pad-row counts.
+    /// same order the parts appear, used for the pad-row counts.
     pub fn renderIdsMM(
         self: *const ChatTemplate,
         tok: *const Tokenizer,
@@ -276,7 +276,7 @@ pub const ChatTemplate = struct {
         }, probe_fn);
     }
 
-    /// Whether a `.tool` message can be replayed — the template renders one
+    /// Whether a `.tool` message can be replayed, the template renders one
     /// without raising AND its content survives into the prompt.
     pub fn supportsToolRole(self: *const ChatTemplate, gpa: std.mem.Allocator) bool {
         const calls = [_]ToolCall{.{ .id = "probe1", .name = probe_fn }};
@@ -311,12 +311,12 @@ pub var system_prompt: ?[]const u8 = null;
 pub var tools: ?[]const Tool = null;
 
 /// Parse an OpenAI-style tools declaration (JSON text) into `Tool`s, allocated
-/// in `a` — what a `--tools file.json` flag or an API request body carries.
+/// in `a`, what a `--tools file.json` flag or an API request body carries.
 ///
 /// Both spellings in the wild are accepted, since the file is written by hand as
 /// often as it is copied from an API payload:
-///   - wrapped:  `[{"type":"function","function":{"name":…,"parameters":{…}}}]`
-///   - bare:     `[{"name":…,"description":…,"parameters":{…}}]`
+///   - wrapped:  `[{"type":"function","function":{"name":...,"parameters":{...}}}]`
+///   - bare:     `[{"name":...,"description":...,"parameters":{...}}]`
 /// A single object rather than an array is taken as a one-element list.
 pub fn parseTools(a: std.mem.Allocator, json_text: []const u8) ![]Tool {
     const root = std.json.parseFromSliceLeaky(std.json.Value, a, json_text, .{}) catch
@@ -422,8 +422,8 @@ fn jsonValue(a: std.mem.Allocator, text: []const u8) !jinja.Value {
     return jinja.fromJson(a, parsed) catch |e| mapErr(e);
 }
 
-/// `{"type":"function","function":{"name":…,"description":…,"parameters":…}}`.
-/// ⚠️ The key ORDER is load-bearing: qwen3.5/Bonsai emit the declaration with
+/// `{"type":"function","function":{"name":...,"description":...,"parameters":...}}`.
+/// The key ORDER is load-bearing: qwen3.5/Bonsai emit the declaration with
 /// `{{ tool | tojson }}`, so it reaches the model exactly as inserted here.
 fn toolValue(a: std.mem.Allocator, t: Tool) !jinja.Value {
     const params = try jsonValue(a, t.parameters_json);
@@ -461,7 +461,7 @@ fn toolCallValue(a: std.mem.Allocator, c: ToolCall) !jinja.Value {
 // finetunes, e.g. Pantheon-RP-Pure). Exercises the engine features these
 // templates need that simpler ChatML ones don't: a literal `}}` emitted from a
 // string (`{{- "}}" }}`, which requires the scanner to skip quoted strings when
-// finding the tag close), `messages[1:]` slicing, `selectattr(...,"equalto",...)`,
+// finding the tag close), `messages[1:]` slicing, `selectattr(...,"equalto"...)`,
 // the `{{ eos_token }}` global, and the system prompt folded into the LAST user
 // turn. The expected string is byte-identical to jinja2's render of the real
 // GGUF template (verified against jinja2 3.1.6).
@@ -494,7 +494,7 @@ const mistral_v3_src =
 
 // tp_core's jinja golden corpus: every `expected` in it was rendered by REAL
 // jinja2 (`tools/gen_jinja_fixtures.py`). Reusing the Bonsai tool cases here
-// tests the one thing those goldens cannot — that the TYPED API above builds
+// tests the one thing those goldens cannot, that the TYPED API above builds
 // the same context jinja2 was handed. Embedded (not read from disk) so the test
 // does not depend on the cwd; test-only, so it costs shipped binaries nothing.
 const jinja_fixtures_json = @embedFile("../core/assets/jinja/fixtures.json");
@@ -519,7 +519,7 @@ fn fixtureExpected(a: std.mem.Allocator, key: []const u8) ![]const u8 {
 // `ToolCall` and the `.tool` role, rendered through Bonsai's REAL embedded
 // template, must reproduce jinja2's output byte for byte. The case is chosen
 // because its argument values (bool, null, dict, list, int, string) are exactly
-// the ones where the template's own `args_value` spellings disagree — so a
+// the ones where the template's own `args_value` spellings disagree, so a
 // wrongly-typed argument (e.g. arguments handed over as a JSON *string*, the
 // OpenAI wire shape) cannot pass.
 test "chat_template: tools + tool_calls + the tool role render byte-exact vs jinja2 (Bonsai)" {
@@ -559,7 +559,7 @@ test "chat_template: tools + tool_calls + the tool role render byte-exact vs jin
 
 // The two halves must be INVERSES: what the model emits, parsed by
 // `tool_call.zig` and replayed as a `ToolCall`, has to re-render as the same
-// block — or the model sees a garbled version of its own request one turn later.
+// block, or the model sees a garbled version of its own request one turn later.
 // Rendering with a REAL template rather than a hand-written block is the point:
 // it is the template that decides how an argument is stringified.
 test "chat_template: a rendered tool call parses back to the arguments it was built from" {
@@ -596,7 +596,7 @@ test "chat_template: a rendered tool call parses back to the arguments it was bu
 
 // Declaring no tools must leave `tools` UNDEFINED, so a caller that never heard
 // of tool calling renders exactly what it always did. (The templates all test
-// `{%- if tools %}`, and an empty list would take the same branch — but a `[]`
+// `{%- if tools %}`, and an empty list would take the same branch, but a `[]`
 // that some future template `| length`s or joins would not.)
 test "chat_template: no tools declared renders identically to before tools existed" {
     const gpa = std.testing.allocator;
@@ -613,9 +613,9 @@ test "chat_template: no tools declared renders identically to before tools exist
     try std.testing.expectEqualStrings(try fixtureExpected(a, "bonsai__user_only__default"), out.items);
 }
 
-// ⚠️ The load-bearing half of "gemma3 has no tool role": it raises on an
+// The load-bearing half of "gemma3 has no tool role": it raises on an
 // INSERTED TURN OF ANY ROLE, not just on `tool`. So the obvious fallback for a
-// tool result on such a model — slip it in as an extra user message — kills
+// tool result on such a model, slip it in as an extra user message, kills
 // every render from that point on. Any caller adding a turn the user did not
 // type needs this: the failure is a dead render, not a degraded one.
 test "chat_template: gemma3 raises on any inserted turn, whatever its role" {
@@ -634,7 +634,7 @@ test "chat_template: gemma3 raises on any inserted turn, whatever its role" {
         .{ .role = .user, .content = "thanks" },
     };
     try ct.renderString(gpa, .{ .messages = &ok }, &out);
-    // One extra turn between them does not — as a tool result OR as a user one.
+    // One extra turn between them does not, as a tool result OR as a user one.
     for ([_]Role{ .tool, .user }) |r| {
         const bad = [_]Message{
             .{ .role = .user, .content = "draw a fox" },
@@ -647,7 +647,7 @@ test "chat_template: gemma3 raises on any inserted turn, whatever its role" {
     }
 }
 
-// Both declaration spellings must reach the model identically — a hand-written
+// Both declaration spellings must reach the model identically, a hand-written
 // tools file uses the bare form, an API payload the wrapped one, and a user who
 // copies the wrong one would otherwise get a silently tool-less prompt.
 test "chat_template: parseTools accepts the bare and the wrapped declaration" {
@@ -683,7 +683,7 @@ test "chat_template: parseTools accepts the bare and the wrapped declaration" {
     try std.testing.expectError(error.InvalidToolJson, parseTools(a, "not json"));
 }
 
-// ⚠️ The capability is a property of the TEMPLATE, not of the architecture, and
+// The capability is a property of the TEMPLATE, not of the architecture, and
 // gemma3 is the case that makes it matter: it raises `Conversation roles must
 // alternate user/assistant` on a tool turn, so a caller that assumes every
 // model can take one kills the render. Pinned in both directions so neither
@@ -701,7 +701,7 @@ test "chat_template: tool support is measured per template (gemma3 refuses)" {
         try std.testing.expect(ct.supportsTools(gpa));
         try std.testing.expect(ct.supportsToolRole(gpa));
     }
-    // gemma3 has neither a tools branch nor a tool role — and RAISES on the
+    // gemma3 has neither a tools branch nor a tool role, and RAISES on the
     // latter, which is why the probe renders instead of pattern-matching a name.
     var g3 = try ChatTemplate.fromSource(gpa, try fixtureTemplate(a, "gemma3"));
     defer g3.deinit();
@@ -749,7 +749,7 @@ test "jinja: scanner finds tag close outside quoted strings (literal }} in a str
 }
 
 // Real GGUF: parse + render the Mistral-Small finetune's actual embedded
-// template. Proves the shipping template loads (no JinjaParse → no silent
+// template. Proves the shipping template loads (no JinjaParse -> no silent
 // ChatML fallback) and produces the `[INST]` format. Self-skips when absent;
 // mmaps header+tokenizer only (no weights), so it stays in the fast suite.
 test "chat_template: real Mistral-Small GGUF renders [INST] (no fallback)" {
@@ -774,8 +774,8 @@ test "chat_template: real Mistral-Small GGUF renders [INST] (no fallback)" {
     try std.testing.expectEqualStrings("<s>[INST] You are Lyra.\n\nHi[/INST]", out.items);
 }
 
-// A tiny ChatML template mirroring the llama/qwen shape, so the render→tokenize
-// path is testable with the embedded default (Qwen ChatML) tokenizer — no GGUF.
+// A tiny ChatML template mirroring the llama/qwen shape, so the render->tokenize
+// path is testable with the embedded default (Qwen ChatML) tokenizer, no GGUF.
 const chatml_src =
     "{% for message in messages %}{{ '<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n' }}{% endfor %}" ++
     "{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}";
@@ -807,7 +807,7 @@ test "chat_template: render + tokenize round-trips through special tokens" {
 test "chat_template: prior-turn thoughts are stripped, current turn primed" {
     // Uses the real gemma4 embedded template shape via the reference file if
     // present; otherwise a compact stand-in exercising strip_thinking. This is
-    // the crux of TODO #1: past <|channel>…<channel|> blocks must NOT appear.
+    // the crux of TODO #1: past <|channel>...<channel|> blocks must NOT appear.
     const gpa = std.testing.allocator;
     const src =
         "{{ bos_token }}{% for m in messages %}<|turn>{{ 'model' if m['role']=='assistant' else m['role'] }}\n" ++
@@ -837,7 +837,7 @@ test "chat_template: prior-turn thoughts are stripped, current turn primed" {
 }
 
 // Real GGUF: the actual gemma4 embedded template + tokenizer. Proves the fix
-// on the shipping template — prior-turn thoughts vanish from the TOKEN stream,
+// on the shipping template, prior-turn thoughts vanish from the TOKEN stream,
 // not just the string. Self-skips when the checkpoint is absent (mmaps the
 // header + tokenizer only; no weights loaded, so it stays in the fast suite).
 test "chat_template: real gemma4 GGUF strips prior thoughts from the token stream" {
@@ -875,7 +875,7 @@ test "chat_template: real gemma4 GGUF strips prior thoughts from the token strea
 
 // Regression: Gemma prompts REQUIRE a leading <bos>. The gemma4 tokenizer must
 // populate `tok.bos` (from tokenizer.ggml.bos_token_id) so the render-driven
-// path — which derives the template's `{{ bos_token }}` string from it — emits
+// path, which derives the template's `{{ bos_token }}` string from it, emits
 // the BOS. When it was left null, the render dropped BOS and the model
 // degenerated into a repeat loop (worst on larger models). Self-skips if absent.
 test "chat_template: gemma4 render emits a leading BOS (tok.bos populated)" {
@@ -907,8 +907,8 @@ test "chat_template: gemma4 render emits a leading BOS (tok.bos populated)" {
 }
 
 // Task #4: the multimodal render must expand the template's single image
-// placeholder into the model's real image block — `<|image>` + pad×N +
-// `<image|>` for gemma4 — with the recorded row pointing at the first pad, so
+// placeholder into the model's real image block, `<|image>` + pad×N +
+// `<image|>` for gemma4, with the recorded row pointing at the first pad, so
 // ViT embeddings splice in at the right cache rows. (The block matches the hand
 // glue's layout; the render is otherwise the authoritative template output,
 // which e.g. trims the space before the tag where the old glue kept it.)

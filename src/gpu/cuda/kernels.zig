@@ -106,16 +106,16 @@ pub fn smokeTest(ctx: *Context) !void {
 // int8 IMMA GEMM.  C[m][n] (s32) = A(s8)[m][k] @ B(s8)[n][k]^T, i.e.
 // C[i][j] = sum_k A[i][k]*B[j][k].  For `mma.row.col` the B operand must be
 // col-major K x N, which is exactly the natural row-major weight W[n][k] (k
-// contiguous) — so NO k-major transpose is needed (unlike the Vulkan coopmat
+// contiguous), so NO k-major transpose is needed (unlike the Vulkan coopmat
 // path). Both A and B fragments load 4-consecutive-k s8 as a u32 from global.
 //
 // m16n8k32 s8 fragment layout (verified): groupID = lane>>2, tid = lane&3.
 //   A: a0=(row gid, k tid*4+0..3), a1=(row gid+8, same k), a2/a3 = +16 in k.
 //   B: b0=(col gid, k tid*4+0..3), b1 = +16 in k.
-//   C: c0=(row gid, col tid*2+0), c1=(gid,tid*2+1), c2=(gid+8,..), c3=(gid+8,..).
+//   C: c0=(row gid, col tid*2+0), c1=(gid,tid*2+1), c2=(gid+8..), c3=(gid+8..).
 // ---------------------------------------------------------------------------
 
-/// v0 — correctness reference: one warp per 16x8 output tile, fragments loaded
+/// v0, correctness reference: one warp per 16x8 output tile, fragments loaded
 /// straight from global, s32 accumulate over the full k. Obviously-correct,
 /// slow (no reuse). Requires m%16==0, n%8==0, k%32==0. Grid (n/8, m/16), 32 thr.
 pub const igemm_v0_ptx: [:0]const u8 =
@@ -210,7 +210,7 @@ pub const igemm_v0_ptx: [:0]const u8 =
 // A and B are nibble-packed: two signed 4-bit values per byte, element 2j in
 // the low nibble, 2j+1 in the high (the on-disk convrot weight layout, and the
 // same layout opI4Prep writes for activations). k is contiguous, so 8
-// consecutive-k s4 values are exactly one u32 — loadable straight into an mma
+// consecutive-k s4 values are exactly one u32, loadable straight into an mma
 // fragment register, no repack (mirrors the s8 path's 4-consecutive-k u32).
 //
 // m16n8k64 s4 fragment layout: groupID = lane>>2, tid = lane&3.
@@ -222,7 +222,7 @@ pub const igemm_v0_ptx: [:0]const u8 =
 //   row*(k/2) + tid*4 + k0/2 covers k = k0+tid*8 .. +7. a2/b1 sit +16 bytes.
 // ---------------------------------------------------------------------------
 
-/// v0 — correctness reference for the s4 tensor-core GEMM: one warp per 16x8
+/// v0, correctness reference for the s4 tensor-core GEMM: one warp per 16x8
 /// output tile, fragments loaded straight from global, s32 accumulate over the
 /// full k. Slow (no reuse) but obviously correct. Requires m%16==0, n%8==0,
 /// k%64==0. Grid (n/8, m/16), 32 threads.
@@ -320,13 +320,13 @@ pub const i4gemm_v0_ptx: [:0]const u8 =
 
 const ptx = @import("ptx.zig");
 
-/// v1 — shared-memory register-tiled IMMA GEMM. 128x128 block tile, 4 warps
+/// v1, shared-memory register-tiled IMMA GEMM. 128x128 block tile, 4 warps
 /// (2x2 grid of 64x64 warp tiles), 128 s32 accumulators/thread, K_STEP=64.
 /// A/B staged synchronously into 16 KB static shared, fragments loaded with
 /// plain `ld.shared.b32`. Requires m%128==0, n%128==0, k%64==0. Grid (n/128,
 /// m/128), 128 threads. (cp.async + dynamic shared come in v2.)
 ///
-/// Generated with the PTX emitter — the 32 MMAs/k-step and their fragment loads
+/// Generated with the PTX emitter, the 32 MMAs/k-step and their fragment loads
 /// are unrolled here rather than hand-typed. Caller frees the returned bytes.
 pub fn buildIgemmSmem(alloc: std.mem.Allocator) ![:0]u8 {
     const BM = 128;
@@ -548,7 +548,7 @@ pub fn buildIgemmSmem(alloc: std.mem.Allocator) ![:0]u8 {
     );
 }
 
-/// v2 — cp.async double-buffered IMMA GEMM. Same 128x128 tile / 2x2 warps / 128
+/// v2, cp.async double-buffered IMMA GEMM. Same 128x128 tile / 2x2 warps / 128
 /// accumulators as v1, but A/B slabs are streamed global->shared with
 /// `cp.async.cg` (the Ampere `LDGSTS` the Vulkan path can't emit) and
 /// double-buffered so the next slab loads while the current one computes.
@@ -960,11 +960,11 @@ pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool, bits: 
 
 /// Fused activation prep, one block (256 threads) per row: load x[row] into
 /// dynamic shared f32, radix-4 FWHT per 256-group (bit-identical to
-/// convrot.rotate — each butterfly output is a fixed 4-input sum, so the
+/// convrot.rotate, each butterfly output is a fixed 4-input sum, so the
 /// parallel order matches the serial CPU order exactly), /16 normalize +
 /// per-row abs-max, dynamic scale = max(absmax/maxq, 1e-12), then round-half-away
-/// quantize + pack. `bits` selects the output format: 8 → int8, 4 s8/u32,
-/// entry `iprep`, clamp [-128,127]; 4 → int4, 8 s4/u32, entry `i4prep`, clamp
+/// quantize + pack. `bits` selects the output format: 8 -> int8, 4 s8/u32,
+/// entry `iprep`, clamp [-128,127]; 4 -> int4, 8 s4/u32, entry `i4prep`, clamp
 /// [-8,7]. Packed row is [m][cols/(32/bits)] u32. Uses >48 KB dynamic shared for
 /// cols=16384 (the Vulkan path was forced to f16 there by the 48 KB cap; here
 /// f32 rotation is exact). Requires cols%256==0, (cols/256)%4==0 (FWHT) and
@@ -982,10 +982,10 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: boo
     const nbf = ngroups * 64 / 256; // butterflies/thread/pass (all 256 threads busy)
     const load_iters = cols / 256;
     // Packed u32 output words for the whole row, and how many each of the 256 threads
-    // takes. ⚠️ **This used to be `cols / (per_word * 256)`, and that truncation to ZERO
-    // silently produced garbage.** At `bits == 4` there are 8 elements per word, so a
-    // 1024-wide reduction has only 128 words for 256 threads — the store loop was then
-    // emitted zero times, `p_q` was never written, and `opI4Gemm` multiplied the weight
+    // takes. Writing it as `cols / (per_word * 256)` truncates to ZERO and silently
+    // produces garbage: at `bits == 4` there are 8 elements per word, so a 1024-wide
+    // reduction has only 128 words for 256 threads, the store loop is emitted zero
+    // times, `p_q` is never written, and `opI4Gemm` multiplies the weight
     // against whatever the shared int8/int4 activation scratch held from the previous
     // call. No error, no assert, and the block's other linears are fine; it is visible
     // only as a render that degrades into static over depth. Anima's cross-attention
@@ -993,7 +993,7 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: boo
     const total_words = cols / per_word;
     const word_iters = (total_words + 255) / 256;
     // Threads past the word count must not store. For every width where `total_words` is
-    // a whole number of blocks (every int8 width, and every int4 width >= 2048 — i.e.
+    // a whole number of blocks (every int8 width, and every int4 width >= 2048, i.e.
     // every case that worked before) the guard is always true, so those kernels are
     // unchanged instruction-for-instruction apart from one predicated branch.
     const guard_words = total_words % 256 != 0;
@@ -1364,21 +1364,21 @@ pub const irescale_h16_ptx: [:0]const u8 =
 /// `hgemm`. block 128, grid (n/128, m/128).
 /// f16 tensor-core GEMM C[m][n] = A[m][k] @ B[n][k]ᵀ (128×128 tile, 4×8 warp
 /// register tile, k stepped 32 through shared). Three modes threaded via flags:
-///   batched — gid.z selects an independent GEMM (per-head strides p_sa/sb/sc);
+///   batched, gid.z selects an independent GEMM (per-head strides p_sa/sb/sc);
 ///     the C-store also folds a scalar p_scale into the accumulators (used by the
 ///     scores GEMM to prefold the softmax scale so f16 S can't overflow).
-///   c_f16   — store C as f16 (scores→softmax path; halves the S write).
-///   attnout — the FUSED attention output: A operand is the raw scores S (f16),
+///   c_f16, store C as f16 (scores->softmax path; halves the S write).
+///   attnout, the FUSED attention output: A operand is the raw scores S (f16),
 ///     and during A-staging each element is turned into a softmax probability
-///     P[q][j] = exp2((S[q][j]-max[q])·log2e)·inv[q] (pad keys j≥seq → 0), read
+///     P[q][j] = exp2((S[q][j]-max[q])*log2e)*inv[q] (pad keys j≥seq -> 0), read
 ///     from the per-row MD={max,1/sum} table (`softmax_md_f16`). This eliminates
-///     the P materialization entirely (no P write in softmax, no P read here) —
+///     the P materialization entirely (no P write in softmax, no P read here),
 ///     the Vulkan-parity win. attnout implies batched; C is f32; p_scale is 1.
-///   a_f32   — (attnout only) the scores S are **f32**, not packed f16. ⚠️ Needed
+///   a_f32, (attnout only) the scores S are f32, not packed f16. Needed
 ///     because the Flux/Z-Image VAE's attention logits reach 9.95e6, 152x past
 ///     f16's ceiling, and even in range f16's quantum up there is ~8000 against a
-///     softmax whose differences are O(1). P itself stays f16 — it is a probability
-///     in [0,1] — so only the LOAD and A's pointer arithmetic change, and the MMA is
+///     softmax whose differences are O(1). P itself stays f16, it is a probability
+///     in [0,1], so only the LOAD and A's pointer arithmetic change, and the MMA is
 ///     untouched. B keeps its f16 stride, hence the separate A registers below.
 pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout: bool, bf16: bool, use_ldmatrix: bool, a_f32: bool) ![:0]u8 {
     std.debug.assert(!a_f32 or attnout);
@@ -1409,8 +1409,8 @@ pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
     try b.linef("ld.param.u32 {s}, [p_n];", .{r_n});
     try b.linef("ld.param.u32 {s}, [p_k];", .{r_k});
     // scores prefold: the C accumulators are multiplied by p_scale before store,
-    // so the f16-C path stores scale·(Q·K). The true score can exceed f16's 65504
-    // max (large qk-norm weights → Inf → NaN in softmax); the f32 accumulator
+    // so the f16-C path stores scale*(Q*K). The true score can exceed f16's 65504
+    // max (large qk-norm weights -> Inf -> NaN in softmax); the f32 accumulator
     // holds the true value and the scaled store stays in range. PV passes 1.0.
     if (batched) try b.linef("ld.param.f32 {s}, [p_scale];", .{f_scale});
     try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_a, rd_a });
@@ -1507,8 +1507,8 @@ pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
     const rd_8k_a = if (a_f32) try b.reg(.b64) else rd_8k;
     try b.linef("shl.b32 {s}, {s}, 1;", .{ r_kq2, r_kq }); // kq*2 (f16 col)
     try b.linef("mul.wide.u32 {s}, {s}, 16;", .{ rd_8k, r_k }); // 8 rows * k f16 * 2 bytes
-    // ⚠️ A's element size differs from B's under `a_f32`, so it needs its own row
-    // step and k offset — B stays f16 either way.
+    // A's element size differs from B's under `a_f32`, so it needs its own row
+    // step and k offset, B stays f16 either way.
     if (a_f32) try b.linef("mul.wide.u32 {s}, {s}, 32;", .{ rd_8k_a, r_k });
     // A
     try b.linef("add.u32 {s}, {s}, {s};", .{ r_arow, r_row0, r_rowq });
@@ -1655,7 +1655,7 @@ pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
     }
     var i: usize = 0;
     while (i < 16) : (i += 1) {
-        // ⚠️ f32 scores arrive as a PAIR of f32 (8 B; the base is 8-aligned because
+        // f32 scores arrive as a PAIR of f32 (8 B; the base is 8-aligned because
         // `k` is a multiple of 128 and `kq2` is even), so the f16 unpack below is
         // skipped and `f_x0`/`f_x1` are loaded directly.
         if (a_f32) {
@@ -1673,7 +1673,7 @@ pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
             try b.linef("add.s64 {s}, {s}, {s};", .{ rd_mdp, rd_md, rd_mdp });
             try b.linef("ld.global.f32 {s}, [{s}];", .{ f_m, rd_mdp });
             try b.linef("ld.global.f32 {s}, [{s}+4];", .{ f_inv, rd_mdp });
-            // P = exp2((S-max)*log2e)*inv, then repack to f16 for the MMA — P is a
+            // P = exp2((S-max)*log2e)*inv, then repack to f16 for the MMA, P is a
             // probability in [0,1], so f16 is exact there whatever S's range was.
             if (!a_f32) {
                 try b.linef("mov.b32 {{{s}, {s}}}, {s};", .{ rs_lo, rs_hi, r_tA });
@@ -1749,7 +1749,7 @@ pub fn buildHgemm(alloc: std.mem.Allocator, batched: bool, c_f16: bool, attnout:
     try b.linef("setp.lt.u32 {s}, {s}, {s};", .{ p0, r_k0, r_k });
     try b.linef("@{s} bra HLOOP;", .{p0});
 
-    // store C [m][n]: f32 (4 B) or, for the scores→softmax path, f16 (2 B) — the
+    // store C [m][n]: f32 (4 B) or, for the scores->softmax path, f16 (2 B), the
     // accumulators are f32 and converted at store, halving the S write + softmax
     // read traffic (the memory-bound cost at large seq). elem = C element size.
     const elem: usize = if (c_f16) 2 else 4;
@@ -2109,15 +2109,15 @@ pub const softmax_row_f16_ptx: [:0]const u8 =
 
 /// Single-pass "flash" softmax reduction: for each row of S (f16 [rows][pn],
 /// scale already folded in by the scores GEMM), read S ONCE and emit per-row
-/// MD[row] = {max, 1/sum} (f32 pair). No P materialization — the fused attn-out
+/// MD[row] = {max, 1/sum} (f32 pair). No P materialization, the fused attn-out
 /// GEMM (`hgemm_attnout`) recomputes P = exp(S-max)/sum from S + this MD during
 /// its A-staging. One block (256) per row; the block-reduce combines running
-/// (m, d) partials the FlashAttention way: M=max(mᵢ), D=Σ dᵢ·exp2((mᵢ-M)·log2e).
+/// (m, d) partials the FlashAttention way: M=max(mᵢ), D=Σ dᵢ*exp2((mᵢ-M)*log2e).
 ///
 /// The running-max is initialised to -FLT_MAX (not -inf) so that combining two
 /// empty partials gives m-M = 0 (finite) rather than -inf-(-inf) = NaN; every
 /// real score is > -FLT_MAX so the max result is unchanged, and empty lanes
-/// (d=0) contribute 0·anything = 0. (In practice attention seq ≥ 256 so every
+/// (d=0) contribute 0*anything = 0. (In practice attention seq ≥ 256 so every
 /// lane has a valid column, but the sentinel keeps it robust for any seq ≥ 1.)
 /// Entry `softmax_md_f16`. params: p_s(f16 [rows][pn]), p_md(f32 [rows][2]),
 /// p_n(u32 pn=mpad), p_seq(u32 valid cols). grid=(rows,1,1), block=256.
@@ -2213,7 +2213,7 @@ pub const softmax_md_f16_ptx: [:0]const u8 =
     \\}
 ;
 
-/// Replace `from` with `to` exactly once, at comptime. ⚠️ Errors if the pattern is
+/// Replace `from` with `to` exactly once, at comptime. Errors if the pattern is
 /// absent OR appears twice, so a kernel derived this way cannot silently drift from
 /// its source when the source is edited.
 fn replaceOnce(comptime src: []const u8, comptime from: []const u8, comptime to: []const u8) []const u8 {
@@ -2222,16 +2222,16 @@ fn replaceOnce(comptime src: []const u8, comptime from: []const u8, comptime to:
     return src[0..i] ++ to ++ src[i + from.len ..];
 }
 
-/// `softmax_md_f16` over **f32** scores. Entry `softmax_md_f32`.
+/// `softmax_md_f16` over f32 scores. Entry `softmax_md_f32`.
 ///
-/// ⚠️ Exists because the flash attention path's f16 scores band is unusable for the
-/// Flux/Z-Image VAE, whose attention *logits* reach **9.95e6** — 152x past f16's
+/// Exists because the flash attention path's f16 scores band is unusable for the
+/// Flux/Z-Image VAE, whose attention *logits* reach 9.95e6, 152x past f16's
 /// ceiling, and even in range f16's quantum up there is ~8000 against a softmax whose
 /// differences are O(1). Scaling cannot rescue it: 11 mantissa bits leave ~4900 of
 /// absolute error on such a logit however it is prescaled. f32 scores are the only
 /// option, and the cost is one byte per score, not an algorithm.
 ///
-/// Derived from the f16 source by three asserted substitutions rather than copied —
+/// Derived from the f16 source by three asserted substitutions rather than copied,
 /// the only differences are the element size and the load.
 pub const softmax_md_f32_ptx: [:0]const u8 = blk: {
     @setEvalBranchQuota(100000);
@@ -2271,7 +2271,7 @@ pub fn i8GemmTest(ctx: *Context, io: anytype, stdout: anytype) !void {
     defer mod2.unload(ctx);
     const f_pipe = try mod2.getFunction(ctx, "igemm_pipe");
     // ldmatrix fragment-load variant (warp-cooperative frag loads; must stay
-    // bit-exact vs the plain ld.shared path — same math, different load path).
+    // bit-exact vs the plain ld.shared path, same math, different load path).
     const pipe_lm_ptx = try buildIgemmPipe(gpa, 64, false, 8, true);
     defer gpa.free(pipe_lm_ptx);
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = "/tmp/claude-1000/-dump-projects-zig-TensorPencil/eccfce6f-7c1f-4c32-b182-cc9c60d44a58/scratchpad/igemm_pipe_lm.gen.ptx", .data = pipe_lm_ptx }) catch {};
@@ -3264,7 +3264,7 @@ pub const f32gemm_ptx: [:0]const u8 =
 
 
 // ---------------------------------------------------------------------------
-// MMQ — q4_k weight x q8_1 activation on the s8 tensor cores, with the
+// MMQ, q4_k weight x q8_1 activation on the s8 tensor cores, with the
 // dequantized weight NEVER materialized in global memory.
 //
 // The m>1 fallback (`opMatmulQuant`) expands the whole weight matrix to f16 in
@@ -3280,7 +3280,7 @@ pub const f32gemm_ptx: [:0]const u8 =
 // mma mmq).
 //
 //   v = d*sc*q - dmin*m            (q4_k; sc/m per 32-elem sub-block)
-//   Σ_k v_k·a_k = d*sc*da*Σ(q·qa) - dmin*m*da*Σ(qa)
+//   Σ_k v_k*a_k = d*sc*da*Σ(q*qa) - dmin*m*da*Σ(qa)
 //
 // The first term is the mma's s32 output; the second needs Σ(qa) per activation
 // block, which `quantize_q8_1` stores in its trailing `s` region.
@@ -3297,7 +3297,7 @@ pub const f32gemm_ptx: [:0]const u8 =
 // column and the sub-block, so nothing hoists); staged per super-block by the
 // whole block they cost 8 vector-ish loads per 8 mmas instead.
 //
-// Requires cols % 256 == 0 and rows % (16*warps) == 0. `n` is free — the column
+// Requires cols % 256 == 0 and rows % (16*warps) == 0. `n` is free, the column
 // tiles are predicated. Entry `mmq_q4_k`.
 // ---------------------------------------------------------------------------
 
@@ -3347,7 +3347,7 @@ fn q4kScaleMin(
 /// Grid: x = ceil(n/(nt*8)), y = rows/(16*warps), block = 32*warps threads.
 ///   p_w      q4_k weight, row-major, row stride (cols/256)*144
 ///   p_x      quantize_q8_1 output: f32 d[n*cols/32] | i8 qs[n*cols] | f32 s[n*cols/32]
-///   p_y      f32 [n][rows] (y[t*rows + r]) — the layout both existing paths write
+///   p_y      f32 [n][rows] (y[t*rows + r]), the layout both existing paths write
 ///   p_scale  multiplies the result
 pub fn buildMmqQ4K(alloc: std.mem.Allocator, nt: usize, warps: usize) ![:0]u8 {
     std.debug.assert(nt >= 1 and warps >= 1);
@@ -3669,7 +3669,7 @@ pub fn buildMmqQ4K(alloc: std.mem.Allocator, nt: usize, warps: usize) ![:0]u8 {
     );
 }
 
-/// q4_k MMQ on the igemm-pipe tiling — the v1 `buildMmqQ4K` above is correct but
+/// q4_k MMQ on the igemm-pipe tiling, the v1 `buildMmqQ4K` above is correct but
 /// loses to cuBLASLt at prefill batch sizes because its warp owns only 16 rows,
 /// so every A+B fragment-load pair feeds exactly ONE mma. This version uses the
 /// proven 128x128 / 2x2-warp / MT=4 / NT=8 shape from `buildIgemmPipe`: 32 mmas
@@ -3677,7 +3677,7 @@ pub fn buildMmqQ4K(alloc: std.mem.Allocator, nt: usize, warps: usize) ![:0]u8 {
 /// and reused by all four warps.
 ///
 /// The pipe already issues one `mma.m16n8k32` per 32-k substep, which is exactly
-/// a q4_k sub-block — so the per-sub-block scale fold drops straight in after
+/// a q4_k sub-block, so the per-sub-block scale fold drops straight in after
 /// each substep. The mma writes a scratch s32 quad (C operand held at zero) and
 /// the result is folded into f32 accumulators:
 ///     acc += (d*sc)*da*c - (dmin*m)*da*sum(qa)
@@ -3950,7 +3950,7 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
     try b.linef("shl.b32 {s}, {s}, 6;", .{ tm[0], r_i }); // i*kstep
     try b.linef("cvt.u64.u32 {s}, {s};", .{ rdt[0], tm[0] });
     try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[1], rd_bcol, rdt[0] });
-    // ⚠️ All FOUR loads issue before any store. Interleaving load/store/load/store
+    // All FOUR loads issue before any store. Interleaving load/store/load/store
     // makes the second pair wait on the first pair's registers, serializing two
     // ~500-cycle global latencies that should overlap; this costs 16 registers of
     // staging and measured +7% on the whole kernel.
@@ -4073,7 +4073,7 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
 ///
 ///   1. q6_k's scale changes every 16 elements, not 32, so the mma is
 ///      `m16n8k16` (one per sub-block) instead of `m16n8k32`. Same MACs per k,
-///      twice the instructions — but no wasted lanes, which zero-padding a
+///      twice the instructions, but no wasted lanes, which zero-padding a
 ///      k32 mma to cover one 16-element scale would cost.
 ///   2. `v = d*sc*(q-32)` has NO min term, so there is no sum(qa) to carry and
 ///      the fold is just `acc += d*sc*da*c`. The -32 is folded into the staged
@@ -4081,7 +4081,7 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
 ///      operand a plain s8 in [-32,31].
 ///   3. The 210-byte block is only 2-BYTE aligned (210 = 2 mod 4, and the row
 ///      stride nsb*210 inherits that), so the weight bytes come in as u16 pairs
-///      assembled into u32 — the same dance `gemv_q6_k_q8n` does. q4_k's 144-byte
+///      assembled into u32, the same dance `gemv_q6_k_q8n` does. q4_k's 144-byte
 ///      block is 16-aligned and could use v4.u32.
 ///
 /// Element mapping, checked against ggml's `dequantize_row_q6_K`: for slab
@@ -4440,13 +4440,13 @@ pub fn buildMmqPipeQ6K(alloc: std.mem.Allocator) ![:0]u8 {
 }
 
 /// Decode one lane's `dims`-wide K or V fragment from `addr` into `dst`, for one of
-/// the three KV cache formats. **Mirrors `elt.emitKVLoad` instruction for
-/// instruction** — same load widths, same sign-extend shifts, same multiply order —
+/// the three KV cache formats. Mirrors `elt.emitKVLoad` instruction for
+/// instruction, same load widths, same sign-extend shifts, same multiply order,
 /// so `attn_split_g*` stays bit-identical to the `attn_split*` kernel it replaces.
 /// A reassociation here would silently change the KV cache that decode reads.
 ///
 /// `kt` are b32 scratch, `hs` b16 scratch (empty for f32), `f_kd` the q8_0 block
-/// scale, `rd_t` a scratch address register, and `rd_qoff` the loop-invariant q8_0
+/// scale, `rd_t` a scratch address register, and `rd_qoff` the hoisted q8_0
 /// quant offset `(lane*dims & 31) + 2`.
 fn emitKvFrag(
     b: *ptx.Builder,
@@ -4495,31 +4495,31 @@ fn emitKvFrag(
 }
 
 /// Flash-decoding pass 1 for PREFILL, with the KV fragment shared across the whole
-/// query-head group: one warp per (query, **kv head**, split) instead of per
-/// (query, **head**, split), looping the group's `group = heads/kv_heads` q heads
+/// query-head group: one warp per (query, kv head, split) instead of per
+/// (query, head, split), looping the group's `group = heads/kv_heads` q heads
 /// inside. Entry `attn_split_g`. Emits the same scratch layout as `attn_split`, so
 /// `attn_merge` is unchanged.
 ///
-/// ⚠️ **The win is L2 traffic, not arithmetic, and `attn_split` is ALREADY exactly
-/// causal** — each warp there uses `kv_len = kv_len0 + t`, so no masked work is
+/// The win is L2 traffic, not arithmetic, and `attn_split` is ALREADY exactly
+/// causal, each warp there uses `kv_len = kv_len0 + t`, so no masked work is
 /// computed and thrown away. What it does do is read the same KV head once per
 /// *query head*: with 24 heads over 4 kv heads and 256 queries that is a 1536x
-/// re-read of K and V. Measured on Bonsai prefill: 6.29 GB of L2→SM traffic per
+/// re-read of K and V. Measured on Bonsai prefill: 6.29 GB of L2->SM traffic per
 /// attention call, 503 GB over a 1155-token prefill, ~252 ms at the 3090's ~2 TB/s
-/// L2 — against 217 ms measured for the whole `attn` bucket. Sharing the fragment
+/// L2, against 217 ms measured for the whole `attn` bucket. Sharing the fragment
 /// across the group divides that by `group`.
 ///
 /// The instruction count per warp rises by ~`group` (each head still needs its own
 /// butterfly reduction and softmax update) while the warp count falls by `group`, so
-/// total instructions are unchanged — and they were ~27 ms against a 252 ms traffic
+/// total instructions are unchanged, and they were ~27 ms against a 252 ms traffic
 /// bound, i.e. 9x of headroom to spend.
 ///
-/// ⚠️ **Bit-identical to `attn_split` per head**: same j order, same dot order, same
+/// Bit-identical to `attn_split` per head: same j order, same dot order, same
 /// butterfly, same `ex2.approx` softmax sequence. Prefill attention feeds the KV
 /// cache that decode then reads, and this model is validated token-identical, so a
 /// reassociation here would be a behaviour change.
 ///
-/// Narrow on purpose — hd ∈ {128, 256}, full causal (no sliding window, no ring, no
+/// Narrow on purpose, hd ∈ {128, 256}, full causal (no sliding window, no ring, no
 /// bidirectional). All three KV formats are supported; the per-format fragment decode
 /// mirrors `elt.emitKVLoad` instruction for instruction, so each variant stays
 /// bit-identical to the `attn_split*` kernel it replaces. Anything else keeps the
@@ -4603,7 +4603,7 @@ pub fn buildAttnSplitGroup(alloc: std.mem.Allocator, hd: usize, group: usize, kv
     try b.label(lp);
     try b.linef("setp.ge.u32 {s}, {s}, {s}; @{s} bra {s};", .{ pr[1], r[18], r[19], pr[1], done });
     // The shared fragment: k and v at ((j*kv_heads + kvh)*hd + lane*4), read ONCE
-    // for the whole group — this is the entire point of the kernel.
+    // for the whole group, this is the entire point of the kernel.
     try b.linef("mad.lo.s32 {s}, {s}, {s}, {s}; mul.lo.s32 {s}, {s}, {d}; add.u32 {s}, {s}, {s};", .{ r[2], r[18], r[8], r[15], r[2], r[2], hd, r[2], r[2], r[1] });
     // Byte offset of the lane's fragment, per KV format. q8_0 addresses the row's
     // 34-byte block; f16/f32 are a plain element stride.
@@ -4634,7 +4634,7 @@ pub fn buildAttnSplitGroup(alloc: std.mem.Allocator, hd: usize, group: usize, kv
     try b.linef("add.u32 {s}, {s}, 1; bra {s};", .{ r[18], r[18], lp });
     try b.label(done);
 
-    // Scratch row ((t*heads + h)*nsplit + split)*(hd+4) — attn_split's own layout.
+    // Scratch row ((t*heads + h)*nsplit + split)*(hd+4), attn_split's own layout.
     try b.linef("mul.lo.s32 {s}, {s}, {d};", .{ r[0], r[15], group });
     for (0..group) |g| {
         try b.linef("add.u32 {s}, {s}, {d};", .{ r[2], r[0], g });
@@ -4667,29 +4667,23 @@ pub fn buildAttnSplitGroup(alloc: std.mem.Allocator, hd: usize, group: usize, kv
 /// REGISTERS: one block per v-head, thread `j` owning column `j` of the `[d][d]`
 /// state for the entire chunk. Entry `gdn_delta_chunk`.
 ///
-/// This is `elt.gdn_delta_step_ptx`'s exact arithmetic, in the exact same order,
-/// restructured so the state is read and written ONCE per chunk instead of once
-/// per token. That distinction is the whole point:
+/// `elt.gdn_delta_step_ptx`'s exact arithmetic in the exact same order, restructured so
+/// the state is read and written ONCE per chunk instead of once per token. The per-token
+/// kernel streams `[heads][d][d]` f32 in AND out every token, 3.1 MB each way per layer
+/// per token and ~350 GB over a 1157-token prefill, which is load-latency bound and
+/// measures ~33% of prefill. Registers hold `d` floats per thread (128 for qwen3.5), so
+/// the state never leaves the SM between tokens and only the staged k/q vectors and the
+/// small per-token gates/v/o touch memory.
 ///
-///   - The per-token kernel streams the state through global memory every token —
-///     `[heads][d][d]` f32 read AND written, 3.1 MB each way per layer per token,
-///     ~350 GB over a 1157-token prefill. Its own doc comment says it is
-///     "load-latency bound", and it measured ~33% of prefill.
-///   - Registers hold `d` floats per thread (128 for qwen3.5), so the state never
-///     leaves the SM between tokens. Only the staged k/q vectors and the small
-///     per-token gates/v/o touch memory.
+/// Bit-identical to the per-token kernel, and that is a REQUIREMENT: the recurrence is
+/// reassociation-sensitive, decode can only ever run the per-token form, and this model
+/// is validated token-identical to llama.cpp, so a re-prefill (regenerate, variant
+/// rollback, suspend/resume) must not diverge from the incremental path. Hence ascending
+/// `i` in both passes, `mul` then `fma` in pass 1, `fma` then `fma` in pass 2, and
+/// `(v - m) * beta` in that order. A chunked or parallel DeltaNet formulation would not
+/// have this property, which is why this restructuring was chosen over one.
 ///
-/// ⚠️ **Bit-identical to the per-token kernel, and that is a requirement, not a
-/// nicety.** The recurrence is reassociation-sensitive, decode can only ever run
-/// the per-token form, and this model is validated token-identical to llama.cpp —
-/// so prefill and decode must agree exactly or a re-prefill (regenerate, variant
-/// rollback, suspend/resume) would diverge from the incremental path. Hence:
-/// ascending `i` in both passes, `mul` then `fma` in pass 1, `fma` then `fma` in
-/// pass 2, and `(v - m) * beta` in that order. A chunked/parallel DeltaNet
-/// formulation would NOT have this property — it is the reason this restructuring
-/// was chosen over one.
-///
-/// ⚠️ The `i` walk is FULLY unrolled because PTX cannot index a register file;
+/// The `i` walk is FULLY unrolled because PTX cannot index a register file;
 /// that is what forces this kernel to be generated rather than written. `d` is
 /// baked in, so the caller must rebuild when it changes.
 ///
@@ -4842,7 +4836,7 @@ pub fn buildGdnDeltaChunk(alloc: std.mem.Allocator, d: usize) ![:0]u8 {
 /// four u32 of four s8 each, in element order (v[0] = elements 0..3). Uses `l1`
 /// = 0x11100100 and `l2` = 0x000001FF as `prmt` byte LUTs and `t` as a scratch.
 ///
-/// This is `elt.zig`'s `q1Dp4aHalf` unpack without the dp4a — see there for what
+/// This is `elt.zig`'s `q1Dp4aHalf` unpack without the dp4a, see there for what
 /// the two LUTs do and, in particular, why the `0x33333333` mask on the selector
 /// is load-bearing (`prmt` reads bit 3 of each nibble as a sign-replicate flag,
 /// and every byte of `l1` has its msb clear).
@@ -4876,7 +4870,7 @@ fn emitQ1Unpack(
 }
 
 /// Decode 16 q2_0 codes (a u32, packed 2 bits each) into 16 SIGNED bytes, as four
-/// u32 in element order — the q2_0 twin of `emitQ1Unpack`.
+/// u32 in element order, the q2_0 twin of `emitQ1Unpack`.
 ///
 /// `l2` holds the symbol table `{-1, 0, +1, +2}` as bytes (0x020100FF) and `l1` the
 /// selector mask 0x33333333, so one `prmt` maps four codes straight to their
@@ -4887,17 +4881,17 @@ fn emitQ1Unpack(
 ///   qe/qo    = prmt(l2, l2, sel)     -> their symbol bytes
 ///   prmt(qe, qo, 0x5140 / 0x7362)    -> back to element order
 ///
-/// ⚠️ **`prmt` reads only the LOW 16 BITS of the selector**, which is why a u32 of
-/// 16 codes has to be split into two halves rather than masked in one go — the top
+/// `prmt` reads only the LOW 16 BITS of the selector, which is why a u32 of
+/// 16 codes has to be split into two halves rather than masked in one go, the top
 /// four nibbles would simply be ignored.
 ///
-/// ⚠️ **The 0x33333333 mask is load-bearing**: bit 3 of a `prmt` selector nibble
+/// The 0x33333333 mask is load-bearing: bit 3 of a `prmt` selector nibble
 /// means SIGN-REPLICATE, and an unmasked nibble carries the neighbouring code in
 /// its high bits, so any code >= 2 would silently corrupt its neighbour's symbol.
 /// Same trap `emitQ1Unpack` masks for. (CUDA's `__byte_perm` intrinsic ignores
 /// bit 3, which is why llama.cpp's C++ needs no mask and this does.)
 ///
-/// Symbols come out signed, so the caller needs no activation `sum(q)` min term —
+/// Symbols come out signed, so the caller needs no activation `sum(q)` min term,
 /// the property that makes q2_0's MMQ as simple as q1_0's.
 fn emitQ2Unpack(
     b: *ptx.Builder,
@@ -4928,7 +4922,7 @@ fn emitQ2Unpack(
     }
 }
 
-/// q2_0 MMQ — the q1_0 kernel's twin, and deliberately a near-copy of it.
+/// q2_0 MMQ, the q1_0 kernel's twin, and deliberately a near-copy of it.
 ///
 /// The two formats line up on exactly the two properties that make
 /// `buildMmqPipeQ1_0` the simplest of the MMQ family, so the whole pipe
@@ -4936,22 +4930,22 @@ fn emitQ2Unpack(
 /// padded row stride that removes the 4-way fragment bank conflict) is reused
 /// unchanged:
 ///
-///   1. **No min term.** `emitQ2Unpack` emits SIGNED symbols straight out of a
+///   1. No min term. `emitQ2Unpack` emits SIGNED symbols straight out of a
 ///      `prmt` table, so like q1_0's `+-d` there is no zero point to cancel and
 ///      the B-side sums region and half the fold arithmetic never appear.
-///   2. **One scale per block, constant across a 64-k slab.** g128's block is 128
+///   2. One scale per block, constant across a 64-k slab. g128's block is 128
 ///      elements (two slabs) and g64's is 64 (one), so `d` is loaded once per slab
-///      either way — where q4_k reloads a pair every 32-k and q6_k every 16.
+///      either way, where q4_k reloads a pair every 32-k and q6_k every 16.
 ///
 /// What actually differs from q1_0, and it is only addressing plus the unpack:
-/// a slab needs **16** code bytes per row rather than 8, the block stride is
+/// a slab needs 16 code bytes per row rather than 8, the block stride is
 /// 34/18 rather than 18, and a block spans `SPB` slabs rather than always 2.
 ///
-/// ⚠️ The 16 bytes are read as eight `u16` and OR'd into four u32 immediately.
+/// The 16 bytes are read as eight `u16` and OR'd into four u32 immediately.
 /// They must stay u16 because `block + 2 + sub*16` is only 2-byte aligned (the
 /// block stride is 2 mod 4, so its parity alternates), and they must be packed
-/// rather than held because `mmq_pipe_q1_0` measures at **255 registers with zero
-/// spill** — there is no room for four more live values. The high halves reuse the
+/// rather than held because `mmq_pipe_q1_0` measures at 255 registers with zero
+/// spill, there is no room for four more live values. The high halves reuse the
 /// addressing temps, which are dead by then.
 ///
 /// Requires cols % 256 == 0, rows % 128 == 0, and `n` padded to a multiple of 128
@@ -4967,10 +4961,10 @@ pub fn buildMmqPipeQ2_0(alloc: std.mem.Allocator, g: elt.Q2Geom) ![:0]u8 {
     const KS = kstep / 32; // 32-k substeps (== q8_1 activation blocks) per slab
     const MT = 4;
     const NT = 8;
-    // ⚠️ Shared rows are padded to 80 bytes, not the 64 they hold. The fragment
+    // Shared rows are padded to 80 bytes, not the 64 they hold. The fragment
     // load has lane L read row `base + L/4` at word `ks*8 + L%4`, so with a
-    // 64-byte (16-word) stride the 32 lanes touch only 8 of the 32 banks — a
-    // **4-way bank conflict on every fragment load**, and there are 32 of them per
+    // 64-byte (16-word) stride the 32 lanes touch only 8 of the 32 banks, a
+    // 4-way bank conflict on every fragment load, and there are 32 of them per
     // substep. At a 20-word stride the row term is `20*gid mod 32` =
     // {0,20,8,28,16,4,24,12}, eight distinct multiples of 4, so adding `tf` 0..3
     // covers all 32 banks exactly once: conflict-free.
@@ -5128,21 +5122,21 @@ pub fn buildMmqPipeQ2_0(alloc: std.mem.Allocator, g: elt.Q2Geom) ![:0]u8 {
 
     // ---- slab loop: cp.async double-buffered software pipeline -------------
     //
-    // ⚠️ The single-buffered version this replaces measured 19% of the kernel in
+    // The single-buffered version this replaces measured 19% of the kernel in
     // EXPOSED global-load latency: staging wrote shared, `bar.sync`d, computed,
     // `bar.sync`d again, so nothing overlapped the ~500-cycle loads. Removing the
     // staging entirely (garbage output, timing only) gave 80.4 TOPS against 65.0
-    // with it — that measurement is what justified this rewrite, and the fold is
+    // with it, that measurement is what justified this rewrite, and the fold is
     // NOT the limiter (cutting it 4x was worth only +10%).
     //
     // Three things make it fit:
-    //   - **B goes global -> shared with `cp.async`**, so its 16 staging registers
+    //   - B goes global -> shared with `cp.async`, so its 16 staging registers
     //     disappear. At 254 registers there was no headroom for prefetch state
     //     otherwise; cp.async pays for itself before any latency is hidden.
-    //   - **A cannot use cp.async** (its bytes are transformed by the prmt decode),
+    //   - A cannot use cp.async (its bytes are transformed by the prmt decode),
     //     so its raw u16s are prefetched into REGISTERS a slab ahead and decoded
     //     into shared after the compute that hides their latency.
-    //   - **The slab loop is unrolled 2x so the buffer parity is COMPILE-TIME**, and
+    //   - The slab loop is unrolled 2x so the buffer parity is COMPILE-TIME, and
     //     every shared offset stays an immediate (`buf * SH_HALF`). `cols % 256 == 0`
     //     makes `cols/kstep` a multiple of 4, so nslab is always even.
     //
@@ -5185,11 +5179,11 @@ pub fn buildMmqPipeQ2_0(alloc: std.mem.Allocator, g: elt.Q2Geom) ![:0]u8 {
             try bb.linef("shl.b32 {s}, {s}, 4; add.u32 {s}, {s}, 2;", .{ args.tm[3], args.tm[1], args.tm[3], args.tm[3] });
             try bb.linef("cvt.u64.u32 {s}, {s};", .{ args.rdt[0], args.tm[3] });
             try bb.linef("add.s64 {s}, {s}, {s};", .{ args.rdt[2], args.rdt[1], args.rdt[0] });
-            // 16 code bytes per row per slab (q1_0 needs 8). ⚠️ They must stay u16 —
+            // 16 code bytes per row per slab (q1_0 needs 8). They must stay u16,
             // a q2_0 block is 34/18 bytes, so `block + 2 + sub*16` is only 2-byte
             // aligned and its parity alternates with the block index.
             //
-            // ⚠️ The pairs are OR'd into 4 u32 immediately rather than held as 8
+            // The pairs are OR'd into 4 u32 immediately rather than held as 8
             // live u16: `mmq_pipe_q1_0` measures at 255 registers with zero spill,
             // so there is no headroom for four more. The high halves land in the
             // addressing temps, which are dead by this point. A u32 of 16 codes is
@@ -5361,18 +5355,18 @@ pub fn buildMmqPipeQ2_0(alloc: std.mem.Allocator, g: elt.Q2Geom) ![:0]u8 {
 /// This is the SIMPLEST of the three, because q1_0's format removes both of the
 /// things that complicate the others:
 ///
-///   1. **No min term.** q4_k reconstructs `d*sc*q - dmin*m`, so it needs the
+///   1. No min term. q4_k reconstructs `d*sc*q - dmin*m`, so it needs the
 ///      activation's per-block quant SUM to cancel the offset, and stages a
-///      (da, sum) pair per column. q1_0 is `v = ±d` — symmetric, no zero point —
+///      (da, sum) pair per column. q1_0 is `v = ±d`, symmetric, no zero point,
 ///      so the whole B-side sums region and half the fold arithmetic disappear:
 ///      `acc += (d * da) * c`.
-///   2. **One scale per 128 elements.** A 64-k slab is half a block, so `d` is
-///      constant across the slab — the row scale is loaded ONCE per slab, outside
+///   2. One scale per 128 elements. A 64-k slab is half a block, so `d` is
+///      constant across the slab, the row scale is loaded ONCE per slab, outside
 ///      the substep loop, where q4_k reloads a pair per 32-k substep and q6_k per
 ///      16. Shared memory drops to 17.9 KB from q4_k's 20.5 KB.
 ///
 /// The A staging decodes one row's 64 weights from 8 bytes of sign bits with
-/// `emitQ1Unpack` (4 u16 loads -> 16 u32 of ±1). ⚠️ Those loads must stay u16:
+/// `emitQ1Unpack` (4 u16 loads -> 16 u32 of ±1). Those loads must stay u16:
 /// a q1_0 block is 18 bytes, so `block + 2 + h*8` is only ever 2-byte aligned
 /// (its alignment alternates with the block parity), and a u32 or v4 load there
 /// is misaligned for half the blocks.
@@ -5386,10 +5380,10 @@ pub fn buildMmqPipeQ1_0(alloc: std.mem.Allocator) ![:0]u8 {
     const KS = kstep / 32; // 32-k substeps (== q8_1 activation blocks) per slab
     const MT = 4;
     const NT = 8;
-    // ⚠️ Shared rows are padded to 80 bytes, not the 64 they hold. The fragment
+    // Shared rows are padded to 80 bytes, not the 64 they hold. The fragment
     // load has lane L read row `base + L/4` at word `ks*8 + L%4`, so with a
-    // 64-byte (16-word) stride the 32 lanes touch only 8 of the 32 banks — a
-    // **4-way bank conflict on every fragment load**, and there are 32 of them per
+    // 64-byte (16-word) stride the 32 lanes touch only 8 of the 32 banks, a
+    // 4-way bank conflict on every fragment load, and there are 32 of them per
     // substep. At a 20-word stride the row term is `20*gid mod 32` =
     // {0,20,8,28,16,4,24,12}, eight distinct multiples of 4, so adding `tf` 0..3
     // covers all 32 banks exactly once: conflict-free.
@@ -5547,21 +5541,21 @@ pub fn buildMmqPipeQ1_0(alloc: std.mem.Allocator) ![:0]u8 {
 
     // ---- slab loop: cp.async double-buffered software pipeline -------------
     //
-    // ⚠️ The single-buffered version this replaces measured 19% of the kernel in
+    // The single-buffered version this replaces measured 19% of the kernel in
     // EXPOSED global-load latency: staging wrote shared, `bar.sync`d, computed,
     // `bar.sync`d again, so nothing overlapped the ~500-cycle loads. Removing the
     // staging entirely (garbage output, timing only) gave 80.4 TOPS against 65.0
-    // with it — that measurement is what justified this rewrite, and the fold is
+    // with it, that measurement is what justified this rewrite, and the fold is
     // NOT the limiter (cutting it 4x was worth only +10%).
     //
     // Three things make it fit:
-    //   - **B goes global -> shared with `cp.async`**, so its 16 staging registers
+    //   - B goes global -> shared with `cp.async`, so its 16 staging registers
     //     disappear. At 254 registers there was no headroom for prefetch state
     //     otherwise; cp.async pays for itself before any latency is hidden.
-    //   - **A cannot use cp.async** (its bytes are transformed by the prmt decode),
+    //   - A cannot use cp.async (its bytes are transformed by the prmt decode),
     //     so its raw u16s are prefetched into REGISTERS a slab ahead and decoded
     //     into shared after the compute that hides their latency.
-    //   - **The slab loop is unrolled 2x so the buffer parity is COMPILE-TIME**, and
+    //   - The slab loop is unrolled 2x so the buffer parity is COMPILE-TIME, and
     //     every shared offset stays an immediate (`buf * SH_HALF`). `cols % 256 == 0`
     //     makes `cols/kstep` a multiple of 4, so nslab is always even.
     //

@@ -7,13 +7,13 @@
 //! QK-norm and sigmoid-gated output, SwiGLU MLPs, and 3-axis interleaved RoPE
 //! (theta 1000, dims 32/48/48; text tokens sit at position (0,0,0)).
 //!
-//! Loads from any `WeightStore` — safetensors *or* GGUF — so a checkpoint's
+//! Loads from any `WeightStore`, safetensors *or* GGUF, so a checkpoint's
 //! container is not part of this file's business. Large weights keep their
 //! checkpoint dtype (fp8-e4m3, int8/int4 convrot with per-row scales, or the ggml
 //! block quants from a GGUF) and dequantize inside the GEMM; small vectors (norm
 //! scales, biases, modulation) are dequantized to f32 at load. Norms use the
 //! `(1 + scale)` convention with eps 1e-5, folded into the weight at load time.
-//! **The store's mapping must outlive the model** — the `Weight`s are views into
+//! The store's mapping must outlive the model, the `Weight`s are views into
 //! it.
 
 const std = @import("std");
@@ -103,7 +103,7 @@ pub const DiT = struct {
 
     /// Materialize a projection weight to f32 for the GPU `opMatmul` fused-GEMM
     /// path (`dit_cuda`/`dit_gpu`). Used for the two non-quantized linears fed to
-    /// it raw — the `first` patch embed and the `last.linear` output projection —
+    /// it raw, the `first` patch embed and the `last.linear` output projection,
     /// which need its bias + destination-offset support that the bulk-weight
     /// GEMMs don't. That path only has an f32 pipeline (the CUDA fused kernel has
     /// no fp8 variant, `backend.zig` `opMatmul`), so every dtype is normalized to
@@ -129,7 +129,7 @@ pub const DiT = struct {
         errdefer arena.deinit();
         const alloc = arena.allocator();
 
-        // The fp8 checkpoint uses bare tensor names (`blocks.0…`); the int8
+        // The fp8 checkpoint uses bare tensor names (`blocks.0...`); the int8
         // convrot checkpoint nests them under `model.diffusion_model.`.
         const pfx: []const u8 = if (store.get("model.diffusion_model.blocks.0.mod.lin") != null)
             "model.diffusion_model."
@@ -665,14 +665,14 @@ fn linear(io: std.Io, gpa: std.mem.Allocator, out: []f32, x: []const f32, m: usi
 
 /// Whether the GPU DiT forwards (`dit_gpu`, `dit_cuda`) have a GEMM path for block
 /// linears of this dtype. They branch on int8/int4 convrot and dense bf16 and treat
-/// anything else as raw fp8-e4m3, so an unrecognized dtype is not a slow path — it
+/// anything else as raw fp8-e4m3, so an unrecognized dtype is not a slow path, it
 /// is silently wrong output. Both gate on this before dispatching.
 pub fn gpuLinKindSupported(dt: DType) bool {
     return switch (dt) {
         // `.w4a8` is decoded to int8 inside each backend's GEMM (the packed form stays
         // resident), so it runs wherever int8 does.
         // `.nvfp4` decodes to f16 inside each backend's GEMM (weight-only, which is what
-        // NVFP4 is below Blackwell), so it runs wherever the f16 GEMM does — everywhere.
+        // NVFP4 is below Blackwell), so it runs wherever the f16 GEMM does, everywhere.
         .i8, .i4, .w4a8, .nvfp4, .bf16, .f8_e4m3 => true,
         else => false,
     };
@@ -681,8 +681,8 @@ pub fn gpuLinKindSupported(dt: DType) bool {
 /// Whether any block linear is stored in ComfyUI's packed `asym_w4a8_int8` form.
 ///
 /// Scans EVERY block's linears rather than reading one tensor: a real ComfyUI mixed
-/// checkpoint quantizes per block (`anima_baseV10-INT8_CONVROT-MIXED` leaves block 0
-/// entirely dense), so a probe of `blocks[0]` answers a different question.
+/// checkpoint quantizes per block, often leaving block 0 entirely dense, so a probe of
+/// `blocks[0]` answers a different question.
 pub fn anyW4A8(model: *const DiT) bool {
     for (model.blocks) |*b| {
         for ([_]Weight{ b.attn.wq, b.attn.wk, b.attn.wv, b.attn.wo, b.attn.gate, b.mlp.gate, b.mlp.up, b.mlp.down }) |w|
@@ -691,7 +691,7 @@ pub fn anyW4A8(model: *const DiT) bool {
     return false;
 }
 
-/// A packed W4A8 block linear whose `group_size` is not a multiple of 8, if any — the
+/// A packed W4A8 block linear whose `group_size` is not a multiple of 8, if any, the
 /// CUDA decode kernel reads four packed bytes (8 columns) per thread and so assumes one
 /// group scale covers them. Returns the offending tensor's name so the refusal can say
 /// which layer, since "unsupported" is unactionable across 224 weights.
@@ -772,8 +772,8 @@ const Loader = struct {
         const view = l.store.get(nm) orelse return error.MissingTensor;
         const shape = view.info.shape.slice();
 
-        // ⚠️ **Both ComfyUI 4-bit formats must be recognized BEFORE the int4 heuristic
-        // below, and each by its OWN sidecar rather than by dtype or shape**: NVFP4 is
+        // Both ComfyUI 4-bit formats must be recognized BEFORE the int4 heuristic
+        // below, and each by its OWN sidecar rather than by dtype or shape: NVFP4 is
         // stored `U8 [rows, cols/2]` and W4A8 `I8 [rows, cols/2]`, which is exactly the
         // signature that heuristic keys on. NVFP4's nibbles are E2M1 floats with a
         // per-16-block fp8 scale and W4A8's are unsigned indices into a non-uniform
@@ -794,7 +794,7 @@ const Loader = struct {
         // int4 convrot weights are nibble-packed (two values per byte), so the
         // on-disk shape is [rows, cols/2]. Our home-grown converter stores the
         // packed bytes as U8; ComfyUI's official W4A4 converter stores the same
-        // bytes as I8 (the raw bits — and thus the nibble decode — are identical).
+        // bytes as I8 (the raw bits, and thus the nibble decode, are identical).
         // A genuine int8-convrot weight is also I8 but at the full [rows, cols],
         // so disambiguate int4 from int8 by the halved column count, not dtype
         // alone. Everything else (fp8/f32/bf16) is one element per stored slot.
@@ -815,8 +815,8 @@ const Loader = struct {
 
         // A shape-fixed block-quantized tensor (`TensorInfo.flat_blocks`) has its
         // blocks tiling the flat element sequence rather than each logical row, which
-        // is not what `Weight.init` assumes. krea2 never hits this — its only
-        // shape-fixed tensor, `first.weight`, is `keys_hiprec` and so unquantized —
+        // is not what `Weight.init` assumes. krea2 never hits this, its only
+        // shape-fixed tensor, `first.weight`, is `keys_hiprec` and so unquantized,
         // but refusing loudly beats a silently wrong byte count in ReleaseFast.
         if (view.info.flat_blocks) {
             std.log.err("dit: {s} is {t} with flat block layout (shape-fixed); the DiT loader needs row-aligned blocks", .{ nm, dt });
@@ -931,8 +931,8 @@ test "opMatmulF32 passes f32/fp8 through and materializes bf16 to f32" {
     const g8 = std.mem.bytesAsSlice(f32, w8.bytes);
     for (f8, g8) |byte, g| try std.testing.expectEqual(dt.f8e4m3ToF32(byte), g);
 
-    // bf16 is materialized to f32 with the exact bf16-rounded values (this is
-    // the ComfyUI-native int8-checkpoint case that used to render as noise).
+    // bf16 is materialized to f32 with the exact bf16-rounded values. This is the
+    // ComfyUI-native int8-checkpoint case; reading the packed bytes as f32 renders noise.
     const vals = [_]f32{ 1.0, -2.5, 0.125, 42.0 };
     var bf: [vals.len]u16 = undefined;
     for (&bf, vals) |*b, v| b.* = dtypes.f32ToBf16(v);
@@ -978,7 +978,7 @@ test "int8 convrot checkpoint loads with per-row scale + rotation metadata" {
 test "every loaded weight carries its checkpoint tensor name as a tag" {
     // The tag is what makes `ops.matmul.probe` able to attribute a GEMM to a layer
     // (per-layer activation statistics, profiling). A weight that silently loses its
-    // name would just vanish from any such report, so assert the names are exact —
+    // name would just vanish from any such report, so assert the names are exact,
     // not merely present.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -992,7 +992,7 @@ test "every loaded weight carries its checkpoint tensor name as a tag" {
 
     // Block 0's eight linears, with the names this checkpoint uses (bare `blocks.N.`;
     // the int8/int4 checkpoints nest under `model.diffusion_model.`, which the loader
-    // prefixes — so this also pins that the tag is the RESOLVED name, not the format).
+    // prefixes, so this also pins that the tag is the RESOLVED name, not the format).
     const b0 = model.blocks[0];
     const expected = [_]struct { w: Weight, name: []const u8 }{
         .{ .w = b0.attn.wq, .name = "blocks.0.attn.wq.weight" },
@@ -1029,7 +1029,7 @@ test "every loaded weight carries its checkpoint tensor name as a tag" {
 
 test "a DiT loads through an overlay with exactly one weight substituted" {
     // The composition the per-layer attribution arm rests on: a base checkpoint
-    // plus one tensor from memory. Two things have to hold — the patched weight is
+    // plus one tensor from memory. Two things have to hold, the patched weight is
     // the caller's buffer at the caller's dtype, and *nothing else moves*. The
     // second is the one that would quietly ruin an attribution measurement, so it
     // is asserted pointer-by-pointer against an unpatched load of the same file.
@@ -1045,7 +1045,7 @@ test "a DiT loads through an overlay with exactly one weight substituted" {
     var plain = try DiT.load(gpa, base);
     defer plain.deinit();
 
-    // `first.weight` is [6144, 64] — the smallest matmul weight in the model, so
+    // `first.weight` is [6144, 64], the smallest matmul weight in the model, so
     // the substitute buffer is 1.5 MB rather than 150.
     const n = plain.first.w.rows * plain.first.w.cols;
     const sub = try gpa.alloc(f32, n);
@@ -1082,7 +1082,7 @@ test "a DiT loads through an overlay with exactly one weight substituted" {
     // And dropping the patch restores the base tensor exactly. Compared by value,
     // not by pointer: `first`/`last.linear` are materialized to f32 into the model
     // arena at load (opMatmulF32), so a second load legitimately lands at a
-    // different address — which is also why the patched load above compares equal
+    // different address, which is also why the patched load above compares equal
     // to the patch buffer (an f32 patch passes through untouched).
     try std.testing.expect(ov.remove("first.weight"));
     var restored = try DiT.load(gpa, ov.store());
@@ -1093,8 +1093,8 @@ test "a DiT loads through an overlay with exactly one weight substituted" {
 
 // The int8 convrot weights should reconstruct the same linear map as the fp8
 // weights (both quantize the same base checkpoint), so a GEMM through each must
-// agree to within quantization noise. This validates the whole int8 path —
-// loader, per-row scale, and group un-rotation — against the trusted fp8 path.
+// agree to within quantization noise. This validates the whole int8 path,
+// loader, per-row scale, and group un-rotation, against the trusted fp8 path.
 test "int8 convrot matmul agrees with fp8 within quant noise" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -1138,7 +1138,7 @@ test "int8 convrot matmul agrees with fp8 within quant noise" {
     }
     const rel = @sqrt(num / den);
     // Diagnostic only on failure: stderr from a passing test makes the build
-    // runner print a spurious red "failed command:" line (see ZIG.md).
+    // runner print a spurious red "failed command:" line.
     errdefer std.debug.print("int8-vs-fp8 wq GEMM relative RMSE: {d:.4}\n", .{rel});
     try std.testing.expect(rel < 0.05);
 }
@@ -1191,7 +1191,7 @@ test "a W4A8 layer of a real checkpoint decodes to comfy_kitchen's int8 weight" 
     const store: WeightStore = .{ .safetensors = &st };
 
     // Check the INPUTS first. A mismatch here means the checkpoint changed, which is a
-    // different fact from "the decode is wrong" — and the fixture cannot tell them
+    // different fact from "the decode is wrong", and the fixture cannot tell them
     // apart after the fact.
     try std.testing.expectEqual(ref.packed_fnv1a64, fnv1a64((try store.require("blocks.0.attn.wk.weight")).bytes));
     try std.testing.expectEqual(ref.s_rel_fnv1a64, fnv1a64((try store.require("blocks.0.attn.wk.weight_s_rel")).bytes));
@@ -1202,7 +1202,7 @@ test "a W4A8 layer of a real checkpoint decodes to comfy_kitchen's int8 weight" 
     const l = Loader{ .store = store, .alloc = arena.allocator(), .pfx = "" };
     const w = try l.mat("blocks.0.attn.wk.weight", .{}, ref.rows, ref.cols);
 
-    // The weight stays PACKED — half the logical element count in bytes — with the
+    // The weight stays PACKED, half the logical element count in bytes, with the
     // sidecars a decode needs hanging off it. That is what keeps the format at its own
     // bit width instead of int8's.
     try std.testing.expectEqual(@as(DType, .w4a8), w.dtype);
@@ -1216,8 +1216,8 @@ test "a W4A8 layer of a real checkpoint decodes to comfy_kitchen's int8 weight" 
     try std.testing.expectEqual(@as(u32, @intCast(ref.group_size)), w.w4a8.?.group_size);
     try std.testing.expectEqual(ref.rows * ref.cols / ref.group_size, w.w4a8.?.s_rel.len);
 
-    // Decode it here — the loader no longer does — and check that against the
-    // reference. This is what pins the metadata wiring: a `s_rel` slice off by a row
+    // Decode it here, since the loader keeps the weight packed, and check that against
+    // the reference. This is what pins the metadata wiring: a `s_rel` slice off by a row
     // or a codebook read from the wrong tensor shows up only in the decoded values.
     const got = try arena.allocator().alloc(i8, ref.rows * ref.cols);
     ops.w4a8.decode(got, w.bytes, w.w4a8.?.s_rel, w.w4a8.?.levels, ref.rows, ref.cols, ref.group_size);
@@ -1240,7 +1240,7 @@ test "int4 convrot checkpoint loads with per-row scale + rotation metadata" {
     const io = std.testing.io;
     // ComfyUI's official W4A4 converter (packed nibbles stored as I8). This is a
     // mixed int8/int4 checkpoint: the per-block linears are packed int4, while
-    // txtfusion stays bf16 — so it also exercises the per-layer int8/int4
+    // txtfusion stays bf16, so it also exercises the per-layer int8/int4
     // disambiguation in Loader.mat.
     const path = "models/diffusion_model/krea2CenterSemiraw_v10Int8-INT4_CONVROT_SR.safetensors";
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
@@ -1268,9 +1268,9 @@ test "int4 convrot checkpoint loads with per-row scale + rotation metadata" {
 }
 
 // Like the int8 test: the int4 convrot weights quantize the same base
-// checkpoint as fp8, so a GEMM through each must agree — but int4's 16 levels
+// checkpoint as fp8, so a GEMM through each must agree, but int4's 16 levels
 // give a looser bound than int8's 256. This validates the whole int4 path
-// (loader, I8→i4 reinterpret, nibble unpack, per-row scale, group un-rotation).
+// (loader, I8->i4 reinterpret, nibble unpack, per-row scale, group un-rotation).
 test "int4 convrot matmul agrees with fp8 within quant noise" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -1317,7 +1317,7 @@ test "int4 convrot matmul agrees with fp8 within quant noise" {
     // int4 (16 levels) is much coarser than int8; convrot keeps it usable but
     // the GEMM-level relative error is naturally several × higher. This is a
     // sanity bound (garbage from a wrong rotation/packing would land near ~1.0,
-    // uncorrelated) — the tight bit-exact check lives in the convrot fixture
+    // uncorrelated), the tight bit-exact check lives in the convrot fixture
     // test. ComfyUI's official W4A4 file is quantized independently of the fp8
     // reference, so it sits a touch above the old home-grown checkpoint's ~0.25.
     try std.testing.expect(rel < 0.30);
@@ -1382,7 +1382,7 @@ test "dit forward matches comfyui" {
 
 test "a GGUF checkpoint loads, with its block-quant dtypes intact" {
     // The GGUF half of ggufy's output (the ggml block quants) could not be loaded
-    // at all before `load` took a `WeightStore` — which meant the whole k-quant
+    // at all before `load` took a `WeightStore`, which meant the whole k-quant
     // path had level-1 evidence and nothing else. This is the receipt that it is
     // reachable: same bare tensor names as the safetensors checkpoints, dims
     // un-reversed by the GGUF reader into [rows, cols], and per-layer mixed types
@@ -1426,7 +1426,7 @@ test "a GGUF checkpoint loads, with its block-quant dtypes intact" {
 test "the GPU DiT paths refuse a block-quant checkpoint instead of misreading it" {
     // Both GPU forwards recognize int8/int4/bf16 and treat everything else as raw
     // fp8 bytes. A GGUF checkpoint is neither, and before `pipeline` could open a
-    // GGUF the case was unreachable — so the day it became reachable, Vulkan
+    // GGUF the case was unreachable, so the day it became reachable, Vulkan
     // rendered a blank white image with no error, while CUDA (which already had the
     // gate) refused. This pins both to refusing.
     //

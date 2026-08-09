@@ -1,61 +1,42 @@
-//! **Where the sampling steps go** — the sigma schedules, all nine of ComfyUI's.
+//! Where the sampling steps go: the sigma schedules, all nine of ComfyUI's.
 //!
-//! This is a separate concern from `sampler.zig`, which owns *how* to move between
-//! two sigmas (Euler, DPM++ 2M SDE, …). The two axes are independent: any sampler
-//! runs on any schedule, and ComfyUI presents them as two dropdowns for that reason.
-//! `sampler.zig` re-exports the handful of names that used to live there.
+//! Separate from `sampler.zig`, which owns HOW to move between two sigmas. The axes are
+//! independent (any sampler runs on any schedule) and ComfyUI presents them as two
+//! dropdowns for that reason. `sampler.zig` re-exports the names that belong to both.
 //!
-//! A scheduler reads the model's own **sigma table** and decides which points of it
-//! a short run visits. `SigmaTable` is the family-neutral view of that table:
+//! A scheduler reads the model's own sigma table and decides which points of it a short
+//! run visits. `SigmaTable` is the family-neutral view of that table:
 //!
-//! | | krea2 / flux (`ModelSamplingFlux`) | SD1.5 / SDXL (`ModelSamplingDiscrete`) |
-//! |---|---|---|
-//! | entries | 10000, `sigma(t) = e^mu / (e^mu + (1/t − 1))` at `t = (i+1)/10000` | 1000, the beta ladder |
-//! | `sigma_min … sigma_max` | 0.00031575 … 1.0 | 0.029167 … 14.614641 |
-//! | `timestep(sigma)` | identity | `argmin |log σ − log σ_i|` (an integer index) |
-//! | `sigma(timestep)` | the same formula | lerp `log_sigmas`, then `exp` |
+//!   krea2 and flux (`ModelSamplingFlux`): 10000 entries of
+//!   `sigma(t) = e^mu / (e^mu + (1/t - 1))` at `t = (i+1)/10000`, spanning 0.00031575
+//!   to 1.0. `timestep(sigma)` is the identity and `sigma(timestep)` the same formula.
 //!
-//! ⚠️ **Everything here computes in f32, matching the reference's rounding rather
-//! than bounding it** — the opposite of this codebase's usual "be more accurate than
-//! the reference" policy (`timestepEmbedding`). The reason is `brownian.zig`: an SDE
-//! sampler quantises the sigma axis to 1e-6 and uses it as a **tree key**, so a
-//! schedule value that is one f32 ulp off can select a different noise draw. Measured:
-//! one sigma of twenty crossing one 1e-6 cell costs **28.9 dB** (ComfyUI against
-//! itself), where staying inside the cell costs 0.6 dB. A quantised key has to agree
-//! digit for digit; being *more* accurate is simply being different.
+//!   SD1.5 and SDXL (`ModelSamplingDiscrete`): 1000 entries of the beta ladder,
+//!   spanning 0.029167 to 14.614641. `timestep(sigma)` is an integer index,
+//!   `argmin |log sigma - log sigma_i|`, and `sigma(timestep)` lerps `log_sigmas` then
+//!   exponentiates.
 //!
-//! Three torch behaviours had to be reverse-engineered to get there, none of which is
-//! visible in the Python source, and each of which was worth ulps in a few hundred of
-//! the 10000 table entries:
+//! Everything here computes in f32, matching the reference's rounding rather than
+//! bounding it, which is the opposite of this codebase's usual "be more accurate than
+//! the reference" policy. The reason is `brownian.zig`: an SDE sampler quantises the
+//! sigma axis to 1e-6 and uses it as a tree key, so being one ulp off can land in the
+//! neighbouring cell and draw unrelated noise. Three torch behaviours therefore have to
+//! be reproduced exactly, each documented at the function that does it: the
+//! reciprocal-then-multiply division in `fluxSigma`, FMA contraction in `torchLinspace`,
+//! and the f64 scalar path in `sigmaAt`.
 //!
-//!  1. ⚠️ **`scalar / tensor` in PyTorch is `reciprocal(tensor) * scalar`** — *two*
-//!     roundings, not one. `flux_time_shift`'s `math.exp(mu) / (…)` is exactly that
-//!     shape, and computing it as a single f32 division disagrees on **3114 of 10000**
-//!     table entries, 165 of them crossing a `round6` cell. `fluxSigma` reproduces the
-//!     reciprocal-then-multiply.
-//!  2. ⚠️ **`torch.linspace` for f32 is FMA-contracted**: ATen's kernel is
-//!     `scalar_start + step * i` in `float`, which the build's `-ffp-contract=fast`
-//!     turns into a single `fmaf`. Two separate f32 operations disagree by an ulp
-//!     wherever the intermediate is inexact (3 of 20 for a log-space ramp). Hence
-//!     `@mulAdd` in `torchLinspace`, plus torch's halfway split so both endpoints land
-//!     exactly.
-//!  3. ⚠️ **The same formula has two precisions depending on how it is called.**
-//!     `ModelSamplingFlux.sigma(t)` on a *tensor* takes the f32 path above; the same
-//!     class's `percent_to_sigma` is called with a *Python float* and is therefore f64.
-//!     `sigmaAt` is that second path, and `offsetFirstSigma` needs it.
-//!
-//! ⚠️ **Two schedulers do not return `steps + 1` sigmas.** `ddim_uniform` strides the
-//! table (30 requested steps → 31), and `beta` de-duplicates repeated indices. A
-//! sampling loop must take its step count from `sigmas.len - 1`, never from the
-//! requested `steps` — `pipeline.generate` does.
+//! Two schedulers do not return `steps + 1` sigmas. `ddim_uniform` strides the table
+//! (30 requested steps gives 31) and `beta` de-duplicates repeated indices. A sampling
+//! loop must take its step count from `sigmas.len - 1`, never from the requested
+//! `steps`; `pipeline.generate` does.
 
 const std = @import("std");
 
 pub const default_shift: f32 = 1.15;
 /// `ModelSamplingFlux.set_parameters(timesteps=10000)`.
 pub const flux_table_len: usize = 10000;
-/// `ModelSamplingDiscreteFlow.set_parameters(timesteps=1000)` — Lumina 2 / Z-Image.
-/// ⚠️ A TENTH of the flux table, which is why the two cannot share a variant even
+/// `ModelSamplingDiscreteFlow.set_parameters(timesteps=1000)`, Lumina 2 / Z-Image.
+/// A TENTH of the flux table, which is why the two cannot share a variant even
 /// though their sigma formulas are algebraically the same function: every scheduler
 /// that indexes the table (`normal`, `sgm_uniform`, `ddim_uniform`, `beta`) reads a
 /// different number of rungs.
@@ -72,7 +53,7 @@ pub const sd_train_steps: usize = 1000;
 
 // --- primitives -------------------------------------------------------------
 
-/// `flux_time_shift(mu, 1.0, t)` on a **Python float** — f64 throughout.
+/// `flux_time_shift(mu, 1.0, t)` on a Python float, f64 throughout.
 ///
 /// This is the path `ModelSamplingFlux.percent_to_sigma` takes; the *tensor* path is
 /// `fluxSigma`, and they differ in the last f32 digit. Only `offsetFirstSigma` wants
@@ -82,10 +63,10 @@ pub fn sigmaAt(shift_mu: f64, t: f64) f64 {
     return e / (e + (1.0 / t - 1.0));
 }
 
-/// `flux_time_shift(mu, 1.0, t)` on an **f32 tensor** — the path that builds
+/// `flux_time_shift(mu, 1.0, t)` on an f32 tensor, the path that builds
 /// `ModelSamplingFlux.sigmas` and that `normal`/`sgm_uniform` evaluate per step.
 ///
-/// ⚠️ The final division is `reciprocal * scalar`, because that is what PyTorch's
+/// The final division is `reciprocal * scalar`, because that is what PyTorch's
 /// `scalar / tensor` lowers to (`__rtruediv__`). Writing it as one f32 division is a
 /// one-ulp difference on ~31% of the table. Verified bit-exact against
 /// `ModelSamplingFlux.sigmas` on all 10000 entries.
@@ -103,11 +84,11 @@ pub fn fluxTableAt(shift: f32, i: usize) f32 {
     return fluxSigma(shift, t);
 }
 
-/// `time_snr_shift(alpha, t)` — `ModelSamplingDiscreteFlow.sigma`, on an f32 tensor.
+/// `time_snr_shift(alpha, t)`, `ModelSamplingDiscreteFlow.sigma`, on an f32 tensor.
 ///
 /// Algebraically identical to `fluxSigma` with `alpha = exp(mu)`, and deliberately
 /// NOT written that way: torch evaluates this one as `(alpha*t) / (1 + (alpha-1)*t)`
-/// — a single tensor/tensor division — where the flux form is `scalar / tensor`,
+/// a single tensor/tensor division, where the flux form is `scalar / tensor`,
 /// which lowers to `reciprocal * scalar` and rounds twice. Schedule values are
 /// quantised to 1e-6 and used as Brownian-tree keys, so a one-ulp difference is a
 /// different noise draw (see the module doc).
@@ -142,12 +123,12 @@ pub fn sdSigmasFull(gpa: std.mem.Allocator) ![]f32 {
 }
 
 /// `ModelSamplingDiscrete.sigma(timestep)`: interpolation into an ascending ladder at
-/// a fractional index, **in log space** and in f32.
+/// a fractional index, in log space and in f32.
 ///
-/// ⚠️ At an integral index this is `exp(log(ladder[i]))`, which is *not* `ladder[i]` to
+/// At an integral index this is `exp(log(ladder[i]))`, which is *not* `ladder[i]` to
 /// the last f32 ulp. That round trip is part of the convention, not an accident to
-/// clean up — see the module doc, and CLAUDE.md's SD section for what interpolating in
-/// sigma instead cost.
+/// clean up: see the module doc. Interpolating in sigma instead is what diffusers
+/// does, and it moves values enough to change an SDE sampler's noise draw.
 pub fn interpLadder(ladder: []const f32, idx: f64) f32 {
     const clamped = std.math.clamp(idx, 0, @as(f64, @floatFromInt(ladder.len - 1)));
     const lo: usize = @intFromFloat(@floor(clamped));
@@ -160,10 +141,10 @@ pub fn interpLadder(ladder: []const f32, idx: f64) f32 {
 
 /// Element `i` of `torch.linspace(start, end, n)` for an f32 tensor.
 ///
-/// ⚠️ Two things that are not obvious from `torch.linspace`'s docs and both matter:
-/// `step` is computed in the tensor's **own** dtype (f32, not the double accumulator
-/// its `accscalar_t` suggests), and `start + step * i` is **FMA-contracted** by the
-/// build — so `@mulAdd`, not a multiply followed by an add. The halfway split is what
+/// Two things that are not obvious from `torch.linspace`'s docs and both matter:
+/// `step` is computed in the tensor's own dtype (f32, not the double accumulator
+/// its `accscalar_t` suggests), and `start + step * i` is FMA-contracted by the
+/// build, so `@mulAdd`, not a multiply followed by an add. The halfway split is what
 /// makes both endpoints exact.
 pub fn torchLinspace(start: f32, end: f32, n: usize, i: usize) f32 {
     std.debug.assert(i < n);
@@ -191,7 +172,7 @@ pub const SigmaTable = union(enum) {
     discrete: []const f32,
     /// Lumina 2 / Z-Image (`ModelSamplingDiscreteFlow`), parameterized by its shift.
     /// Flow matching like `.flux`, but a 1000-rung table under a differently-rounded
-    /// form of the same formula — see `discreteFlowSigma`.
+    /// form of the same formula, see `discreteFlowSigma`.
     discrete_flow: f32,
 
     pub fn len(self: SigmaTable) usize {
@@ -219,17 +200,17 @@ pub const SigmaTable = union(enum) {
         return self.at(self.len() - 1);
     }
 
-    /// `model_sampling.timestep(sigma)` — the abscissa the table is indexed by.
+    /// `model_sampling.timestep(sigma)`, the abscissa the table is indexed by.
     ///
-    /// ⚠️ These are different *kinds* of quantity, which is why `normal` produces such
+    /// These are different *kinds* of quantity, which is why `normal` produces such
     /// different schedules per family: for flux the "timestep" IS the sigma (so
-    /// `normal` applies the shift formula a second time, on purpose — that is what
+    /// `normal` applies the shift formula a second time, on purpose, that is what
     /// ComfyUI does), while for SD it is an integer training index found by an argmin
     /// in log-sigma.
     pub fn timestep(self: SigmaTable, sigma: f32) f32 {
         return switch (self) {
             // Both flow tables index by the sigma itself. For `.discrete_flow` that
-            // is `sigma * multiplier` with Z-Image's multiplier of 1.0 — an identity
+            // is `sigma * multiplier` with Z-Image's multiplier of 1.0, an identity
             // only because of that value, not a property of the class.
             .flux, .discrete_flow => sigma,
             .discrete => |l| blk: {
@@ -248,7 +229,7 @@ pub const SigmaTable = union(enum) {
         };
     }
 
-    /// `model_sampling.sigma(timestep)` — the inverse of `timestep`, continuous.
+    /// `model_sampling.sigma(timestep)`, the inverse of `timestep`, continuous.
     pub fn sigmaOf(self: SigmaTable, t: f32) f32 {
         return switch (self) {
             .flux => |shift| fluxSigma(shift, t),
@@ -296,7 +277,7 @@ pub const Scheduler = enum {
         };
     }
 
-    /// The scheduler a family samples with when the caller did not choose — the
+    /// The scheduler a family samples with when the caller did not choose, the
     /// behaviour that predates this module, and what each ecosystem actually uses:
     /// `simple` for flow-matching checkpoints, `normal` for the SD family.
     pub fn defaultFor(table: SigmaTable) Scheduler {
@@ -311,7 +292,7 @@ pub const Scheduler = enum {
 
 /// Build a descending sigma schedule ending at exactly 0. Caller frees.
 ///
-/// ⚠️ **The result is not always `steps + 1` long** — see the module doc. Drive a
+/// The result is not always `steps + 1` long, see the module doc. Drive a
 /// sampling loop off `result.len - 1`.
 pub fn build(gpa: std.mem.Allocator, table: SigmaTable, sched: Scheduler, steps: usize) ![]f32 {
     if (steps < 1) return error.NoSteps;
@@ -351,7 +332,7 @@ fn normal(gpa: std.mem.Allocator, table: SigmaTable, steps_in: usize, sgm: bool)
     var append_zero = true;
     var n: usize = undefined; // linspace length
     if (sgm) {
-        // `linspace(start, end, steps + 1)[:-1]` — the last (sigma ~ 0) point dropped
+        // `linspace(start, end, steps + 1)[:-1]`, the last (sigma ~ 0) point dropped
         // and a hard 0 appended instead, which is what makes `sgm_uniform` end higher.
         n = steps + 1;
     } else {
@@ -371,10 +352,10 @@ fn normal(gpa: std.mem.Allocator, table: SigmaTable, steps_in: usize, sgm: bool)
     return out;
 }
 
-/// `get_sigmas_karras`, rho = 7 — uniform in `sigma^(1/rho)`.
+/// `get_sigmas_karras`, rho = 7, uniform in `sigma^(1/rho)`.
 fn karras(gpa: std.mem.Allocator, table: SigmaTable, steps: usize) ![]f32 {
     const rho: f64 = 7.0;
-    // ⚠️ The two endpoints are raised to 1/rho as **Python floats** (f64) and only the
+    // The two endpoints are raised to 1/rho as Python floats (f64) and only the
     // ramp arithmetic is f32, so the narrowing happens here and not earlier.
     const min_inv_rho = std.math.pow(f64, @as(f64, table.sigmaMin()), 1.0 / rho);
     const max_inv_rho = std.math.pow(f64, @as(f64, table.sigmaMax()), 1.0 / rho);
@@ -405,8 +386,8 @@ fn exponential(gpa: std.mem.Allocator, table: SigmaTable, steps: usize) ![]f32 {
 
 /// `ddim_scheduler`: every `len/steps`-th table entry, bottom-up, then reversed.
 ///
-/// ⚠️ **This one's length is `len(table)/stride + 1`, which is only `steps + 1` when
-/// the stride divides evenly** — 30 requested steps over the 1000-rung SD ladder gives
+/// This one's length is `len(table)/stride + 1`, which is only `steps + 1` when
+/// the stride divides evenly, 30 requested steps over the 1000-rung SD ladder gives
 /// a stride of 33 and therefore 31 steps. It is the reason `build` documents that the
 /// caller must read the step count back off the result.
 fn ddimUniform(gpa: std.mem.Allocator, table: SigmaTable, steps_in: usize) ![]f32 {
@@ -430,7 +411,7 @@ fn ddimUniform(gpa: std.mem.Allocator, table: SigmaTable, steps_in: usize) ![]f3
 /// `beta_scheduler` (arXiv 2407.12173), alpha = beta = 0.6: place the steps at the
 /// Beta distribution's quantiles, which concentrates them at both ends.
 ///
-/// ⚠️ **De-duplicates**, so a high step count over a short table returns fewer sigmas
+/// De-duplicates, so a high step count over a short table returns fewer sigmas
 /// than requested: neighbouring quantiles can round to the same table index, and
 /// ComfyUI drops the repeat rather than emitting a zero-length step.
 fn betaSchedule(gpa: std.mem.Allocator, table: SigmaTable, steps: usize) ![]f32 {
@@ -474,7 +455,7 @@ fn linearQuadratic(gpa: std.mem.Allocator, table: SigmaTable, steps: usize) ![]f
     const constant = quadratic_coef * fl * fl;
 
     // `sigma_schedule` is built ascending in "noise removed", then flipped by
-    // `1 - x` and scaled — so the trailing 1.0 becomes the trailing 0 sigma for free.
+    // `1 - x` and scaled, so the trailing 1.0 becomes the trailing 0 sigma for free.
     const out = try gpa.alloc(f32, steps + 1);
     for (0..steps) |i| {
         const fi: f64 = @floatFromInt(i);
@@ -510,7 +491,7 @@ fn klOptimal(gpa: std.mem.Allocator, table: SigmaTable, steps: usize) ![]f32 {
 
 // --- the inverse incomplete beta, for the `beta` scheduler -------------------
 
-/// `numpy.rint` — round half to **even**, which `@round` (half away from zero) is not.
+/// `numpy.rint`, round half to even, which `@round` (half away from zero) is not.
 fn rintEven(x: f64) f64 {
     const r = @round(x);
     if (@abs(x - @trunc(x)) != 0.5) return r;
@@ -553,7 +534,7 @@ fn betaCf(a: f64, b: f64, x: f64) f64 {
     return h;
 }
 
-/// The regularized incomplete beta `I_x(a, b)` — the Beta distribution's CDF.
+/// The regularized incomplete beta `I_x(a, b)`, the Beta distribution's CDF.
 pub fn betaInc(a: f64, b: f64, x: f64) f64 {
     if (x <= 0) return 0;
     if (x >= 1) return 1;
@@ -565,7 +546,7 @@ pub fn betaInc(a: f64, b: f64, x: f64) f64 {
     return 1.0 - front * betaCf(b, a, 1.0 - x) / b;
 }
 
-/// `scipy.stats.beta.ppf` — the inverse of `betaInc` in `x`.
+/// `scipy.stats.beta.ppf`, the inverse of `betaInc` in `x`.
 ///
 /// Plain bisection rather than a Newton scheme with an analytic seed: the CDF is
 /// monotone on [0, 1] so bisection cannot fail, it converges to adjacent doubles for
@@ -588,12 +569,12 @@ pub fn betaIncInv(a: f64, b: f64, p: f64) f64 {
 
 // --- family-default wrappers, kept for the callers that predate this module ---
 
-/// ComfyUI's "simple" scheduler over the flux table — krea2's default.
+/// ComfyUI's "simple" scheduler over the flux table, krea2's default.
 pub fn simpleSchedule(gpa: std.mem.Allocator, steps: usize, shift: f64) ![]f32 {
     return build(gpa, .{ .flux = @floatCast(shift) }, .simple, steps);
 }
 
-/// ComfyUI's "normal" scheduler over the SD beta ladder — the SD family's default.
+/// ComfyUI's "normal" scheduler over the SD beta ladder, the SD family's default.
 /// Allocates the ladder internally; `Session` passes its cached one to `build` instead.
 pub fn sdSchedule(gpa: std.mem.Allocator, steps: usize) ![]f32 {
     const ladder = try sdSigmasFull(gpa);
@@ -604,9 +585,9 @@ pub fn sdSchedule(gpa: std.mem.Allocator, steps: usize) ![]f32 {
 /// The (fractional) training index the `i`-th step of a `steps`-step SD run samples at
 /// under the `normal` scheduler: `torch.linspace(999, 0, steps)`.
 ///
-/// ⚠️ **This is `timestep_spacing = "linspace"`, and the alternative is not a detail.**
+/// This is `timestep_spacing = "linspace"`, and the alternative is not a detail.
 /// diffusers' "leading" spacing (the old PNDM discretization, `steps_offset = 1`)
-/// starts a 4-step run at index 751 — **sigma 4.12 instead of 14.615**. The sampler is
+/// starts a 4-step run at index 751, sigma 4.12 instead of 14.615. The sampler is
 /// then told the latent is only moderately noisy while `scaleInitialNoise` has scaled
 /// it as pure noise, so no global structure forms and the image comes out as
 /// noise-textured mush. It is a *correct* implementation of the wrong convention, which
@@ -616,11 +597,11 @@ pub fn sdTrainIndex(i: usize, steps: usize) f64 {
     return torchLinspace(last, 0, steps, i);
 }
 
-/// The **fractional** training indices the SD `normal` schedule reads at — the quantity
+/// The fractional training indices the SD `normal` schedule reads at, the quantity
 /// diffusers' `EulerDiscreteScheduler.timesteps` holds, and what its UNet is
 /// conditioned on.
 ///
-/// ⚠️ **This is not what *this* engine conditions on.** See `sampler.sdModelTimestep`:
+/// This is not what *this* engine conditions on. See `sampler.sdModelTimestep`:
 /// ComfyUI snaps to the nearest trained index, and that is the convention followed
 /// here. This function stays as the diffusers-side quantity, because it is what the
 /// schedule fixture compares against.
@@ -642,8 +623,8 @@ fn f32At(v: std.json.Value) f32 {
     };
 }
 
-/// A u64 out of the fixture. ⚠️ `std.json` parks an integer that does not fit `i64`
-/// in `number_string`, and the Z-Image table's FNV-1a hash is exactly such a value —
+/// A u64 out of the fixture. `std.json` parks an integer that does not fit `i64`
+/// in `number_string`, and the Z-Image table's FNV-1a hash is exactly such a value,
 /// reading `.integer` unconditionally panics on it while passing for the other two
 /// tables, which is how this stayed latent until a third table was added.
 fn u64At(v: std.json.Value) !u64 {
@@ -655,9 +636,9 @@ fn u64At(v: std.json.Value) !u64 {
 }
 
 test "both sigma tables are bit-exact to model_sampling.sigmas, every entry" {
-    // ⚠️ Checked by a hash over EVERY entry's raw f32 bits, not by sampling indices,
+    // Checked by a hash over EVERY entry's raw f32 bits, not by sampling indices,
     // and that is the point: the `scalar / tensor` reciprocal convention (see the
-    // module doc) moves only **165 of 10000** flux entries into a different `round6`
+    // module doc) moves only 165 of 10000 flux entries into a different `round6`
     // cell and 3114 by an ulp, so a seven-index spot check would miss it outright.
     // These tables are the foundation of `simple`, `ddim_uniform` and `beta` (pure
     // lookups) and of every scheduler's sigma_min/max, so a single wrong ulp here is a
@@ -757,7 +738,7 @@ test "every scheduler matches ComfyUI's calculate_sigmas, on both sigma tables" 
                 // from a correctly-rounded one in the last ulp lands ~3e-7 out (max
                 // observed across all 72 combos: 3.0e-7, at sd|sgm_uniform|30). Still an
                 // order of magnitude tighter than the conventions this module had to
-                // reverse-engineer, which were 4.1e-6 relative and up — so it has teeth.
+                // reverse-engineer, which were 4.1e-6 relative and up, so it has teeth.
                 try std.testing.expectApproxEqRel(e, a, 4e-7);
             }
             if (brownian.round6(e) == brownian.round6(a)) same_cell += 1;
@@ -767,7 +748,7 @@ test "every scheduler matches ComfyUI's calculate_sigmas, on both sigma tables" 
         // own cell; the other four (sd sgm_uniform at 4/20/30 steps, sd kl_optimal at
         // 20) miss exactly one, from torch's vs Zig's `log`/`tan` differing in the last
         // ulp. Bounded as a count so a libm shift is not a failure, while a reverted
-        // convention — which misplaced 18 of 21 when it happened — still is.
+        // convention, which misplaced 18 of 21 when it happened, still is.
         try std.testing.expect(want.len - same_cell <= 1 + want.len / 8);
         checked += 1;
     }
@@ -834,7 +815,7 @@ test "torch.linspace hits both endpoints exactly and is FMA-contracted" {
 }
 
 test "schedules are descending, end at exactly zero, and stay in the table's range" {
-    // A shape invariant every scheduler owes the sampling loop, independent of the
+    // A shape rule every scheduler owes the sampling loop, independent of the
     // fixture: `generate` steps `sigmas[i] -> sigmas[i+1]` and `decode` assumes the
     // trajectory finished at 0.
     const gpa = std.testing.allocator;
@@ -849,9 +830,9 @@ test "schedules are descending, end at exactly zero, and stay in the table's ran
                 errdefer std.debug.print("{t} / {t} at {d} steps\n", .{ table, sched, steps });
                 try std.testing.expect(s.len >= 2);
                 try std.testing.expectEqual(@as(f32, 0), s[s.len - 1]);
-                // ⚠️ Not `<= sigmaMax()`: `karras` computes `(sigma_max^(1/rho))^rho`,
+                // Not `<= sigmaMax()`: `karras` computes `(sigma_max^(1/rho))^rho`,
                 // whose round trip can land an ulp ABOVE sigma_max (it does, at 2
-                // steps). That is the reference's own behaviour, and harmless — the
+                // steps). That is the reference's own behaviour, and harmless, the
                 // model is evaluated slightly off the top of its trained range, which is
                 // exactly what `sdTimestepForSigma`'s clamp is for.
                 try std.testing.expect(s[0] > 0 and s[0] <= table.sigmaMax() * 1.001);
@@ -931,7 +912,7 @@ test "the SD sigma ladder and normal schedule match diffusers' EulerDiscreteSche
         }
     }
 
-    // ⚠️ The 2e-4 tolerance below is the whole reason this file also has a test against
+    // The 2e-4 tolerance below is the whole reason this file also has a test against
     // ComfyUI's `normal_scheduler`: diffusers lerps sigma where ComfyUI lerps its
     // logarithm, which is a 4.4e-5 difference this bound cannot see. Do not tighten it
     // (the log/exp round trip forces it) and do not treat it as the parity check.

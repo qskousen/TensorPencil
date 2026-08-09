@@ -1,10 +1,9 @@
-//! Gemma 4 "unified" vision embedder (mmproj GGUF, arch "clip", projector
-//! "gemma4uv"). Unlike Gemma 3's SigLIP tower there is NO transformer — the
-//! "token merging" is baked into a large conv patch, so this is a shallow
-//! embedder. CPU forward, f32 compute. Ported from llama.cpp
-//! tools/mtmd/models/gemma4uv.cpp + clip.cpp/mtmd-image.cpp preprocessing.
+//! Gemma 4 "unified" vision embedder (mmproj GGUF, arch "clip", projector "gemma4uv").
+//! Unlike Gemma 3's SigLIP tower there is NO transformer: token merging is baked into a
+//! large conv patch, so this is a shallow embedder. CPU forward, f32 compute. Ported
+//! from llama.cpp's gemma4uv.cpp plus its clip.cpp/mtmd-image.cpp preprocessing.
 //!
-//! Pipeline (per llama.cpp):
+//! Pipeline:
 //!   - Smart-resize the image so its area lands in [40, 280] patch tokens,
 //!     each dim snapped to a 48-px multiple (aspect ~preserved), bilinear +
 //!     PAD_CEIL onto a black canvas; normalize to [0,1] (mean 0, std 1).
@@ -21,7 +20,7 @@
 //! One image is `n_patches = (W/48)*(H/48)` tokens (variable, NO pooling); the
 //! LLM injects them UNSCALED between the `<|image>` / `<image|>` markers. The
 //! injected block attends BIDIRECTIONALLY in the LLM (every image token sees the
-//! whole block, causal only to the prefix), matching llama.cpp — see the
+//! whole block, causal only to the prefix), matching llama.cpp, see the
 //! `bidirectional` prefill path in gemma4.zig / gemma4_cuda.zig.
 
 const std = @import("std");

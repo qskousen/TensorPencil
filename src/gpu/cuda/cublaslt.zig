@@ -1,12 +1,12 @@
-//! cuBLASLt bindings — pure Zig, runtime-loaded via std.DynLib.
+//! cuBLASLt bindings, pure Zig, runtime-loaded via std.DynLib.
 //!
 //! The 4th backend (`--backend cuda`) reaches ComfyUI-class GEMM speed by
 //! calling the same closed math library ComfyUI does. Loaded exactly like the
 //! driver (`cu.zig`) and Vulkan (`vk.zig`): `dlopen` the `.so`, hand-declare the
 //! C-ABI entry points as `callconv(.c)` externs, no linking / headers / nvcc.
-//! This is where the project's pure-Zig line is deliberately crossed (a
-//! closed-source math library, not just the driver) — documented in PLAN.md /
-//! README; the CPU/Vulkan/zig-cuda backends stay pure and default.
+//! This is where the project's pure-Zig line is deliberately crossed: a
+//! closed-source math library, not just the driver. The cpu, vulkan and zig-cuda
+//! backends stay pure, and are the default.
 //!
 //! cuBLASLt does ONLY the GEMM. The int8 convrot prep (rotate + per-row
 //! quantize) and the per-row×per-col rescale stay in our hand-PTX kernels; this
@@ -29,7 +29,7 @@ pub const MatmulPreference = ?*anyopaque;
 pub const Status = c_int;
 pub const SUCCESS: Status = 0;
 
-/// cublasLtMatmulAlgo_t — 64 opaque bytes the heuristic fills in.
+/// cublasLtMatmulAlgo_t, 64 opaque bytes the heuristic fills in.
 pub const MatmulAlgo = extern struct {
     data: [8]u64 = @splat(0),
 };
@@ -204,7 +204,7 @@ pub fn statusName(s: Status) []const u8 {
 test "cublasLt loads (skips without the library / a GPU)" {
     var api = Api.load() catch return error.SkipZigTest;
     defer api.deinit();
-    // cublasLtGetVersion is context-free — a nonzero version proves the symbols
+    // cublasLtGetVersion is context-free, a nonzero version proves the symbols
     // resolved and the ABI is sane.
     try std.testing.expect(api.cublasLtGetVersion() > 0);
 }

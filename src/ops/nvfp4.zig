@@ -1,65 +1,46 @@
 //! ComfyUI's NVFP4 weight format: 4-bit E2M1 floats with an fp8 per-16-block scale.
 //!
-//! Reference: `comfy_kitchen/tensor/nvfp4.py` plus
-//! `backends/eager/quantization.py::dequantize_nvfp4` and `float_utils.{to,from}_blocked`.
-//! A layer ships:
+//! A layer ships `weight` (U8 [rows, cols/2], two E2M1 codes per byte), `weight_scale`
+//! (F8_E4M3, one per 16 elements, swizzled), `weight_scale_2` (F32 per-tensor scalar)
+//! and `input_scale` (F32, a static activation scale, Blackwell-only and unused here).
+//! It decodes as:
 //!
-//! | tensor | dtype | |
-//! |---|---|---|
-//! | `weight` | U8 `[rows, cols/2]` | two E2M1 codes per byte |
-//! | `weight_scale` | F8_E4M3 | per-16-element block scale, **swizzled** |
-//! | `weight_scale_2` | F32 scalar | per-tensor scale |
-//! | `input_scale` | F32 scalar | static ACTIVATION scale — Blackwell-only, unused here |
+//!     total[row, blk] = weight_scale_2 * fp8(block_scale[row, blk])
+//!     value           = E2M1[nibble] * total[row, blk]
 //!
-//! and decodes as
+//! Weight-only below Blackwell, matching ComfyUI:
+//! NVFP4's tensor cores are sm_100+, and on an older card `pick_operations` moves the
+//! format to what its log calls emulated ops, dequantizing the weight to the compute
+//! dtype per call before a normal GEMM. The weight stays 4-bit resident. Here
+//! `Weight.dtype == .nvfp4` keeps the packed bytes and each consumer decodes on demand:
+//! the CPU GEMM into its f32 panel, the GPU backends into a scratch feeding the existing
+//! tensor-core GEMM.
 //!
-//! ```
-//! total[row, blk] = weight_scale_2 * fp8(block_scale[row, blk])
-//! value           = E2M1[nibble] * total[row, blk]
-//! ```
+//! Three conventions differ from every other 4-bit format here, and each is a silent
+//! wrong answer rather than an error:
 //!
-//! **This is a weight-only format on anything below Blackwell, and that is ComfyUI's own
-//! behaviour, not a shortcut here.** NVFP4's tensor cores are sm_100+
-//! (`TensorCoreNVFP4Layout.MIN_SM_VERSION = (10, 0)`); on an older card
-//! `pick_operations` moves `nvfp4` from "native ops" to what ComfyUI's log calls
-//! "emulated ops", which sets `_full_precision_mm` and makes every linear dequantize the
-//! weight to the compute dtype per call before a normal GEMM. The weight stays 4-bit
-//! resident. This engine does the same thing: `Weight.dtype == .nvfp4` keeps the packed
-//! bytes, and each consumer decodes on demand — the CPU GEMM into its f32 panel, the GPU
-//! backends into an f16 scratch feeding the existing f16 tensor-core GEMM.
+//! 1. Element 2k is the HIGH nibble. `.i4` convrot and `.w4a8` are both low-first.
+//!    Swapping them permutes adjacent weight pairs, which is rms-preserving, so no
+//!    magnitude check can see it. `nibble` below owns the choice.
+//! 2. The block scales are SWIZZLED into cuBLAS's tiled layout while keeping their
+//!    logical `[rows, cols/16]` shape on disk, so nothing in the header hints at it.
+//!    `unswizzleScales` is the inverse, applied ONCE at load.
+//! 3. The multiply association is `E2M1 * (per_tensor * block)`, not
+//!    `(E2M1 * block) * per_tensor`. Only the first is bit-exact against the reference.
 //!
-//! ⚠️ **Three conventions differ from every other 4-bit format in this engine**, and each
-//! is a silent wrong answer rather than an error:
+//! No ConvRot and no per-output-row scale, unlike int8/int4/W4A8 here, so
+//! `Weight.convrot` stays 0 and `row_scale` stays null. A GEMM path assuming either is
+//! wrong for this format.
 //!
-//! 1. **Element 2k is the HIGH nibble** (`hi_first = True`). `.i4` convrot and `.w4a8`
-//!    are both low-nibble-first. Swapping them permutes adjacent weight pairs, which is
-//!    rms-preserving — no magnitude check can see it. `nibble` below owns the choice.
-//! 2. **The block scales are SWIZZLED** into cuBLAS's tiled layout, and on disk they
-//!    still carry the LOGICAL `[rows, cols/16]` shape — so nothing in the header hints at
-//!    it. `unswizzleScales` is the inverse (`from_blocked`), applied ONCE at load so
-//!    every consumer sees plain row-major.
-//! 3. **The multiply association is `E2M1 * (per_tensor * block)`**, not
-//!    `(E2M1 * block) * per_tensor`. Only the first is bit-exact against the reference —
-//!    and it is what a per-scale-byte table computes naturally, which is the other reason
-//!    for the table below.
+//! The decode goes through a `[256][16]` table (`Levels`), the same trick `ops/w4a8.zig`
+//! uses: the block scale is fp8, so only 256 values are possible, and folding the
+//! per-tensor scale in makes one table per weight answer every lookup.
 //!
-//! ⚠️ **No ConvRot.** The int8/int4/W4A8 formats here are all Hadamard-rotated and this
-//! one is not, so `Weight.convrot` stays 0 and there is no per-output-row scale either
-//! (`row_scale` is null). A GEMM path that assumes either is wrong for this format.
-//!
-//! **The decode goes through a `[256][16]` table** (`Levels`), the same trick
-//! `ops/w4a8.zig` uses and for the same reason: the block scale is fp8, so only 256
-//! values are possible, and folding the per-tensor scale in makes one table per weight
-//! answer every lookup. Held in both f32 (for the CPU panel) and f16 (the GPU GEMM
-//! operand) so neither consumer converts per element.
-//!
-//! ⚠️ **The GPU half of the table is bf16, not f16, and that is a RANGE decision.** The
-//! decoded weights are tiny (E2M1 x fp8 x a per-tensor scale), but the GEMM converts the
-//! ACTIVATION to the same format, and Z-Image's trunk activations exceed f16's 65504
-//! ceiling — an f16 path renders it solid white, non-finite end to end, and identically on
-//! all three backends. bf16 has f32's exponent range and its 8-bit mantissa is more than a
-//! 4-bit payload can use, which is also the regime these models' own dense bf16 weights
-//! already run in. Same class of failure this repo records for the SDXL VAE.
+//! The GPU half of that table is bf16, not f16, and that is a RANGE decision. The
+//! decoded weights are tiny, but the GEMM converts the ACTIVATION to the same format and
+//! Z-Image's trunk activations exceed f16's 65504 ceiling, which renders solid white,
+//! non-finite end to end and identically on all three backends. bf16 has f32's exponent
+//! range, and its 8-bit mantissa is more than a 4-bit payload can use anyway.
 
 const std = @import("std");
 const dtypes = @import("tp_core").dtype;
@@ -69,11 +50,11 @@ const dtypes = @import("tp_core").dtype;
 pub const block_size = 16;
 
 /// The `format` string a layer's `comfy_quant` carries, when it has one.
-/// ⚠️ Z-Image's NVFP4 checkpoint ships NO `comfy_quant` at all, so a loader must be able
+/// Z-Image's NVFP4 checkpoint ships NO `comfy_quant` at all, so a loader must be able
 /// to recognize the format from `weight_scale_2`'s presence alone.
 pub const format_name = "nvfp4";
 
-/// E2M1: 1 sign bit, 2 exponent bits, 1 mantissa bit — 16 codes, sign in bit 3.
+/// E2M1: 1 sign bit, 2 exponent bits, 1 mantissa bit, 16 codes, sign in bit 3.
 /// Verbatim `backends/eager/quantization.py::E2M1_LUT`; a fast test pins it.
 pub const e2m1: [16]f32 = .{
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
@@ -82,7 +63,7 @@ pub const e2m1: [16]f32 = .{
 
 /// The E2M1 code of logical element `k` of a packed byte.
 ///
-/// ⚠️ **HIGH nibble first** — `hi_first = True` in the reference, the opposite of `.i4`
+/// HIGH nibble first, `hi_first = True` in the reference, the opposite of `.i4`
 /// and `.w4a8` here. Inlined and tiny so the loop stays branch-free after unrolling.
 pub inline fn nibble(byte: u8, k: u1) u4 {
     return @truncate(if (k == 0) byte >> 4 else byte);
@@ -94,22 +75,22 @@ pub inline fn nibble(byte: u8, k: u1) u4 {
 /// and the per-element work becomes one lookup with no arithmetic at all.
 pub const Levels = struct {
     f32v: [256][16]f32,
-    /// The same values as **bf16** bit patterns, for the GPU decode that feeds the bf16
+    /// The same values as bf16 bit patterns, for the GPU decode that feeds the bf16
     /// tensor-core GEMM. See the module header on why bf16 rather than f16.
     bf16v: [256][16]u16,
 
     /// `global` is `weight_scale_2`.
     ///
-    /// ⚠️ A NaN block-scale byte (fp8 `0x7F`/`0xFF`) **propagates** into the table, and
+    /// A NaN block-scale byte (fp8 `0x7F`/`0xFF`) propagates into the table, and
     /// that is deliberate: the reference propagates it too, so matching is correct.
-    /// `ops/w4a8.zig` maps NaN to 0 instead — but only because its target is an integer
+    /// `ops/w4a8.zig` maps NaN to 0 instead, but only because its target is an integer
     /// and `@intFromFloat(nan)` is illegal behaviour, not because 0 is more right. Either
     /// way a real checkpoint has no NaN scale; this is about which wrong answer to give
     /// for a corrupt one, and here it is the reference's.
     pub fn init(global: f32) Levels {
         var lv: Levels = undefined;
         for (0..256) |b| {
-            // ⚠️ The association: `per_tensor * block` FIRST, then `* E2M1`. The other
+            // The association: `per_tensor * block` FIRST, then `* E2M1`. The other
             // order rounds differently and is not the reference's.
             const total = global * dtypes.f8e4m3ToF32(@intCast(b));
             for (0..16) |i| {
@@ -124,8 +105,8 @@ pub const Levels = struct {
 
 /// The sidecars a packed NVFP4 weight needs, carried on `ops.matmul.Weight.nvfp4`.
 pub const Meta = struct {
-    /// Per-block scale bytes, **already unswizzled** to row-major `[rows][cols/16]`.
-    /// Owned by the loader (a copy — the on-disk order is not this one).
+    /// Per-block scale bytes, already unswizzled to row-major `[rows][cols/16]`.
+    /// Owned by the loader (a copy, the on-disk order is not this one).
     scales: []const u8,
     /// This weight's `[256][16]` decode table. A pointer so a GPU backend can key a
     /// device copy on its address the way it keys weights.
@@ -135,11 +116,11 @@ pub const Meta = struct {
         return cols / block_size;
     }
 
-    /// The metadata for a contiguous ROW RANGE of the weight — what a fused qkv split
+    /// The metadata for a contiguous ROW RANGE of the weight, what a fused qkv split
     /// into three row-block GEMMs needs.
     ///
-    /// ⚠️ **The scales MUST be sliced along with the bytes.** They are `[rows][cols/16]`
-    /// row-major, so a row range is a plain slice — but leaving the full array behind a
+    /// The scales MUST be sliced along with the bytes. They are `[rows][cols/16]`
+    /// row-major, so a row range is a plain slice, but leaving the full array behind a
     /// shortened `Weight` makes rows index from the FUSED tensor's row 0, so the k and v
     /// blocks read q's block scales. Finite, plausible, and wrong. `levels` is per
     /// TENSOR (it folds `weight_scale_2`), so it is shared unchanged.
@@ -163,7 +144,7 @@ pub const Meta = struct {
 /// which composes to: logical `(r, c)` lives at `blocked[rb][cb][r%32][(r/32)%4][c%4]`
 /// in the `(n_row_blk, n_col_blk, 32, 4, 4)` view, with `rb = r/128`, `cb = c/4`.
 ///
-/// ⚠️ Applied ONCE at load, into a caller-owned copy. Doing it per access would put a
+/// Applied ONCE at load, into a caller-owned copy. Doing it per access would put a
 /// five-way index computation in the inner loop of every GEMM, and doing it on the device
 /// would need the swizzle in a kernel; neither is necessary for a `rows*nblk`-byte array
 /// that is 1/16 the weight.
@@ -193,7 +174,7 @@ pub fn validate(rows: usize, cols: usize, packed_len: usize, scale_len: usize) !
     if (packed_len != rows * cols / 2) return error.ShapeMismatch;
     const nblk = cols / block_size;
     // The stored scale array is the SWIZZLED, padded grid, so it can be larger than
-    // rows*nblk — but never smaller, or the unswizzle would read past it.
+    // rows*nblk, but never smaller, or the unswizzle would read past it.
     if (scale_len < rows * nblk) return error.ShapeMismatch;
     return nblk;
 }
@@ -265,8 +246,8 @@ test "the E2M1 table matches comfy_kitchen's" {
 }
 
 test "unswizzleScales inverts comfy_kitchen's to_blocked" {
-    // Checked against the fixture's own pair of arrays — the swizzled bytes as a
-    // checkpoint stores them and the row-major logical scales — rather than against our
+    // Checked against the fixture's own pair of arrays, the swizzled bytes as a
+    // checkpoint stores them and the row-major logical scales, rather than against our
     // own re-derivation, which would prove nothing about the layout.
     const gpa = std.testing.allocator;
     var parsed = try loadFixtures(gpa);
@@ -370,7 +351,7 @@ test "NVFP4 validate refuses shapes the format cannot have" {
     try std.testing.expectError(error.ShapeMismatch, validate(4, 32, 4 * 15, 4 * 2));
     try std.testing.expectError(error.ShapeMismatch, validate(4, 32, 4 * 16, 4 * 2 - 1));
     try std.testing.expectEqual(@as(usize, 2), try validate(4, 32, 4 * 16, 4 * 2));
-    // A larger scale array is fine — the stored grid is padded to 128x4 blocks.
+    // A larger scale array is fine, the stored grid is padded to 128x4 blocks.
     try std.testing.expectEqual(@as(usize, 2), try validate(4, 32, 4 * 16, 128 * 4));
 }
 

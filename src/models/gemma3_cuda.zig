@@ -3,7 +3,7 @@
 //! (opMatmulQuant / grouped dp4a GEMVs); decode is per-op fused GEMVs.
 //!
 //! Gemma-specific vs qwen3_cuda: FOUR RMSNorms per layer (input, post-attn,
-//! pre-FFN, post-FFN — the two "post" norms apply to the sublayer output
+//! pre-FFN, post-FFN, the two "post" norms apply to the sublayer output
 //! before its residual add), embeddings scaled by sqrt(hidden) on the host
 //! before upload, GeGLU (be.geluMul), a tied LM head, and RoPE whose
 //! base/scale alternate by layer: every `swa_pattern`-th layer is GLOBAL
@@ -11,7 +11,7 @@
 //! (theta 1e4, sliding-window causal mask via opAttnDecode's window arg).
 //! Two RoPE tables (global/local) live on device; each layer picks one.
 //!
-//! No decode-graph capture (measured +0% on this memory-bound regime — the
+//! No decode-graph capture (measured +0% on this memory-bound regime, the
 //! async queue already hides per-op launches), and speculative decoding is
 //! unsupported. All weights are GGUF block quants and dequantize inside the
 //! GEMM; the Gguf mapping must outlive the model.
@@ -165,7 +165,7 @@ pub const CudaLM = struct {
         /// Host activation scratch, sized for a full prefill chunk (viewed down
         /// to the actual chunk length per call).
         scratch: gemma3.Scratch,
-        /// Host RoPE tables (global + local), grown with capacity — text only.
+        /// Host RoPE tables (global + local), grown with capacity, text only.
         freqs_global: ops.rope.Freqs,
         freqs_local: ops.rope.Freqs,
         /// Host hidden buffer ([prefill_chunk * hidden]).
@@ -239,7 +239,7 @@ pub const CudaLM = struct {
     /// (Re)create the per-layer K/V device buffers at `self.kv_dtype`, sized
     /// from `self.initial_capacity`/`self.max_capacity` (LOCAL layers = fixed
     /// sliding-window ring). The `k_cache`/`v_cache` slices must already exist.
-    /// Host-resident layers of an armed split are skipped — they keep no
+    /// Host-resident layers of an armed split are skipped, they keep no
     /// device KV (their shadow lives in `split.cache`).
     fn allocKvCaches(self: *CudaLM) !void {
         const cfg = self.cfg;
@@ -319,7 +319,7 @@ pub const CudaLM = struct {
     pub fn capacityMax(self: *const CudaLM) usize {
         return self.max_capacity;
     }
-    /// Device VRAM (bytes) currently in use by this backend — for the
+    /// Device VRAM (bytes) currently in use by this backend, for the
     /// end-of-response telemetry (`session.statsOf`).
     pub fn vramUsed(self: *const CudaLM) u64 {
         return self.be.deviceUsed();
@@ -333,7 +333,7 @@ pub const CudaLM = struct {
 
     /// Fixed byte size of a turn checkpoint (see `checkpoint`): every LOCAL
     /// (sliding-window) layer's full KV ring. GLOBAL layers are append-only, so
-    /// truncation alone rolls them back — but a LOCAL ring OVERWRITES its
+    /// truncation alone rolls them back, but a LOCAL ring OVERWRITES its
     /// oldest rows as generation advances, so a rollback further than the ring
     /// slack needs them restored. Context-independent (rings are fixed-size).
     pub fn checkpointBytes(self: *const CudaLM) usize {
@@ -379,7 +379,7 @@ pub const CudaLM = struct {
     /// ring between the snapshot buffer (ring-row format, K then V per layer)
     /// and the layer's current owner. Device-resident rings copy wholesale;
     /// a host-resident layer's linear shadow is translated per live segment
-    /// (`ringSegments(self.len, ring)` — the caller ensures `self.len` is the
+    /// (`ringSegments(self.len, ring)`, the caller ensures `self.len` is the
     /// snapshot's q in both directions).
     fn checkpointRings(self: *CudaLM, comptime dir: CheckpointDir, buf: if (dir == .save) []u8 else []const u8) !void {
         const cfg = self.cfg;
@@ -429,7 +429,7 @@ pub const CudaLM = struct {
     }
 
     /// Total device footprint of one layer's streamable weights (quantized
-    /// bytes) — the projection + MLP matrices; norms are negligible. `anytype`
+    /// bytes), the projection + MLP matrices; norms are negligible. `anytype`
     /// avoids naming gemma3's private `Layer` type.
     fn layerDeviceBytes(layer: anytype) usize {
         return layer.q.bytes.len + layer.k.bytes.len + layer.v.bytes.len + layer.o.bytes.len +
@@ -449,7 +449,7 @@ pub const CudaLM = struct {
 
     /// Move layer `l`'s live K/V device->host, free its device K/V + weights,
     /// and mark it CPU-resident (a `residency` hook). Mirrors qwen35_cuda's
-    /// migrateLayer (attention case only — gemma3 has no recurrent/conv state).
+    /// migrateLayer (attention case only, gemma3 has no recurrent/conv state).
     pub fn migrateLayer(self: *CudaLM, l: usize) !void {
         const cfg = self.cfg;
         const sp = &self.split.?;
@@ -474,7 +474,7 @@ pub const CudaLM = struct {
         self.be.growableDestroy(&self.k_cache[l]);
         self.be.growableDestroy(&self.v_cache[l]);
         // Free the migrated layer's device weights (the host path reads them from
-        // the GGUF mapping) — the bulk of the reclaimed VRAM.
+        // the GGUF mapping), the bulk of the reclaimed VRAM.
         const layer = &self.lm.layers[l];
         self.be.evictWeightBytes(layer.q.bytes);
         self.be.evictWeightBytes(layer.k.bytes);
@@ -492,7 +492,7 @@ pub const CudaLM = struct {
     /// reaches `needed_free` bytes, or nothing is left. Fixed-target variant used
     /// by the VRAM coordinator (free room for the image model). No-op without a
     /// dynamic split. (ensureCapacity keeps its own loop, whose target shrinks per
-    /// iteration as liveSlots drops — a fixed target here can't express that.)
+    /// iteration as liveSlots drops, a fixed target here can't express that.)
     pub fn offloadUntilFree(self: *CudaLM, needed_free: u64) !void {
         return residency.offloadUntilFree(self, needed_free);
     }
@@ -505,8 +505,8 @@ pub const CudaLM = struct {
     }
 
     /// `residency.demand` hook: this layer's weight bytes alone (no KV). Lets the
-    /// demand estimate separate "weights not uploaded yet" — which the backend's
-    /// pinned-bytes counter already accounts for globally — from the device KV a
+    /// demand estimate separate "weights not uploaded yet", which the backend's
+    /// pinned-bytes counter already accounts for globally, from the device KV a
     /// promote has to re-create.
     pub fn layerWeightBytes(self: *CudaLM, l: usize) usize {
         return layerDeviceBytes(&self.lm.layers[l]);
@@ -516,7 +516,7 @@ pub const CudaLM = struct {
     /// A tied head/embedding is ONE cached device buffer (the weight cache keys
     /// on the byte slice), so count it once.
     /// Upload every device-resident weight NOW, so the one-time host->device copy
-    /// is not charged to the first forward. Mirrors `layerDeviceBytes` exactly —
+    /// is not charged to the first forward. Mirrors `layerDeviceBytes` exactly,
     /// the same tensors it counts are the ones warmed here, so the two cannot
     /// drift. See `Backend.warmWeight` for why this exists.
     ///
@@ -545,7 +545,7 @@ pub const CudaLM = struct {
         return h.len + if (e.ptr == h.ptr) 0 else e.len;
     }
 
-    /// `residency.promoteBack` cost hook: VRAM a promote of layer `l` needs — its
+    /// `residency.promoteBack` cost hook: VRAM a promote of layer `l` needs, its
     /// streamable weights, the KV it re-commits at the current capacity (all
     /// gemma3 layers are attention), plus slack.
     pub fn promoteCost(self: *CudaLM, l: usize) usize {
@@ -588,7 +588,7 @@ pub const CudaLM = struct {
     }
 
     /// Migrate CPU layers back onto the GPU (LIFO by offload order), stopping
-    /// before the next one would overflow `budget` — so the caller (VRAM
+    /// before the next one would overflow `budget`, so the caller (VRAM
     /// coordinator, after image generation) reclaims LLM residency while leaving
     /// room for whatever else stays resident. Keeps the split armed (offload can
     /// fire again). Returns the number promoted; 0 without a split.
@@ -621,7 +621,7 @@ pub const CudaLM = struct {
 
     /// Always arm the dynamic split (text sessions; `budget == 0` = no offload).
     /// Free when the model fits (0 layers on CPU, per-op decode), and migrates
-    /// layers on demand as the KV cache grows — so over-budget growth degrades
+    /// layers on demand as the KV cache grows, so over-budget growth degrades
     /// via CPU offload (faster than weight streaming) rather than the streaming
     /// fallback. See qwen35_cuda.autoOffload for the measured rationale.
     pub fn autoOffload(self: *CudaLM, budget: u64) !bool {
@@ -686,7 +686,7 @@ pub const CudaLM = struct {
         if (n_cpu == 0 and !dynamic) {
             gpa.free(on_gpu);
             gpa.free(order);
-            return; // everything fits resident — no split needed
+            return; // everything fits resident, no split needed
         }
 
         // Host state for the CPU-resident layers (sized to the current KV
@@ -726,10 +726,10 @@ pub const CudaLM = struct {
         };
 
         // Place the statically-planned layers on the host. Before any tokens
-        // (autoOffload-at-init) there is nothing to copy — mark them and free
+        // (autoOffload-at-init) there is nothing to copy, mark them and free
         // the device K/V; weights are reclaimed lazily. Armed MID-conversation
         // (imageReclaim), each layer's live rows must move to the host instead
-        // — migrateLayer does the copy AND the on_gpu/n_cpu bookkeeping, or
+        // migrateLayer does the copy AND the on_gpu/n_cpu bookkeeping, or
         // the context would be destroyed with the device KV.
         if (self.len == 0) {
             const sp = &self.split.?;
@@ -748,7 +748,7 @@ pub const CudaLM = struct {
         const target = (try kvmod.growPlan(self.capacity, self.max_capacity, min_rows)) orelse return;
         // Byte size MUST match how the buffers were created (kv_dtype block
         // math), or an f16/q8_0 cache requests f32-sized growth, overshoots its
-        // VA reservation, and growableEnsure fails with DeviceOutOfMemory →
+        // VA reservation, and growableEnsure fails with DeviceOutOfMemory ->
         // ContextFull once the window grows past ~max_capacity/2.
         const bytes = self.kv_dtype.sizeBytes(target * self.cfg.kvDim());
 
@@ -766,12 +766,12 @@ pub const CudaLM = struct {
         };
 
         // Grow device KV of the layers still on the GPU (LOCAL ring layers are
-        // fixed-size — never grow them). Physical VRAM can be exhausted even when
+        // fixed-size, never grow them). Physical VRAM can be exhausted even when
         // the proactive migration above thought there was room: a resident image
         // model on another CUDA context may grab it between the headroom check and
         // this commit. On a real OOM, offload one more layer to the CPU and retry
         // the whole grow, so a full window only ever fails once nothing is left to
-        // migrate — never a premature ContextFull while layers can still move to
+        // migrate, never a premature ContextFull while layers can still move to
         // host. growableEnsure is idempotent, so re-running the loop is cheap.
         grow: while (true) {
             for (0..self.cfg.n_layers) |l| {
@@ -836,7 +836,7 @@ pub const CudaLM = struct {
     }
 
     /// `stepArgmax` with sampling penalties scattered onto the device logits
-    /// first (opPenalize; see sample.zig) — keeps penalized greedy decode
+    /// first (opPenalize; see sample.zig), keeps penalized greedy decode
     /// on the GPU path instead of the full-vocab download.
     pub fn stepArgmaxPen(self: *CudaLM, io: std.Io, ids: []const u32, pen: []const sample.PenaltyEntry, sp: sample.Params) !u32 {
         try self.forwardDecode(io, ids, null);
@@ -862,7 +862,7 @@ pub const CudaLM = struct {
     }
 
     /// `stepSelect` with sampling penalties scattered onto the device logits
-    /// before the top-k (opPenalize) — the selected candidates are the true
+    /// before the top-k (opPenalize), the selected candidates are the true
     /// post-penalty top set, so penalized stochastic decode stays on the GPU.
     pub fn stepSelectPen(self: *CudaLM, io: std.Io, ids: []const u32, pen: []const sample.PenaltyEntry, sp: sample.Params, out_id: []u32, out_logit: []f32) !usize {
         try self.forwardDecode(io, ids, null);
@@ -878,7 +878,7 @@ pub const CudaLM = struct {
         return count;
     }
 
-    /// Prefill text tokens (no logits) — for interleaving with prefillImage.
+    /// Prefill text tokens (no logits), for interleaving with prefillImage.
     pub fn prefill(self: *CudaLM, ids: []const u32) !void {
         var off: usize = 0;
         while (off < ids.len) {
@@ -1092,7 +1092,7 @@ pub const CudaLM = struct {
     }
 
     /// Dense linear over `seq` rows: int8 dp4a GEMV (decode + small batches,
-    /// quantized activation × block-quant weight — faster than the f32
+    /// quantized activation × block-quant weight, faster than the f32
     /// dequant GEMV and numerically matches llama.cpp's mmvq), or the
     /// dequant-to-f16 tensor-core GEMM (large prefills). All Gemma weights are
     /// GGUF block quants; a weight whose shape isn't dp4a-tileable
@@ -1214,13 +1214,13 @@ test "ringSegments covers the live window contiguously" {
 // regeneration after `restoreCheckpoint` must be TOKEN-IDENTICAL. The geometry
 // deliberately exercises the SWA rings: the prompt exceeds the ring size (so
 // the rings have wrapped) and the generation exceeds the ring slack (so it
-// OVERWRITES live-window rows the rollback needs) — only the checkpoint's ring
+// OVERWRITES live-window rows the rollback needs), only the checkpoint's ring
 // snapshot can bring those rows back; a bare `len` rollback would replay over
 // destroyed keys. Also re-runs under a mid-conversation CPU split (host-linear
 // ring translation + owner-aware restore), asserting repeatability there and
 // bit-identity again after promoting back (hybrid CPU/GPU arithmetic isn't
 // guaranteed bit-identical to all-GPU, so the split leg can't compare to seq1
-// directly — mirrors the qwen35_cuda test).
+// directly, mirrors the qwen35_cuda test).
 fn checkpointRestoreBody(kv_dtype: kvmod.KvDtype) !void {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -1294,7 +1294,7 @@ fn checkpointRestoreBody(kv_dtype: kvmod.KvDtype) !void {
     try std.testing.expectEqualSlices(u32, seq3, seq4);
 
     // Promote everything back and restore once more: the rings round-trip
-    // host→device, so an owner-misdirected restore would now surface as
+    // host->device, so an owner-misdirected restore would now surface as
     // divergence from the all-GPU baseline.
     _ = try model.promoteLayers(std.math.maxInt(u64));
     try model.restoreCheckpoint(snap, q);
@@ -1315,7 +1315,7 @@ test "checkpoint restore regenerates token-identical on the real model" {
 // Same workout on an f16 KV cache: the split's host shadow stores packed f16
 // (byte-identical to the device rings), so the mid-conversation migrate, the
 // owner-aware ring checkpoints, and the promote round trip must all stay
-// exact — token-identical within the f16 session.
+// exact, token-identical within the f16 session.
 test "checkpoint restore regenerates token-identical on the real model (f16 kv)" {
     try checkpointRestoreBody(.f16);
 }
@@ -1328,7 +1328,7 @@ test "checkpoint restore regenerates token-identical on the real model (q8_0 kv)
 
 // The initial split plan must respect the card's LIVE free VRAM, not just the
 // abstract budget: with most of the card occupied (another process, a resident
-// image model), a generous budget must still plan layers onto the host —
+// image model), a generous budget must still plan layers onto the host,
 // planning them all resident faults at the first prefill instead (weight
 // uploads + lazy PTX JIT collide at zero free; surfaced in tp-gui as
 // "PTX JIT failed: CUDA_ERROR_ILLEGAL_ADDRESS").
@@ -1364,9 +1364,9 @@ test "cpu split plan respects live free VRAM" {
 
 // A hybrid split's host layers can run BEFORE any step(): the tp-gui turn flow
 // prefills first, and an over-budget model has host layers from init. With the
-// stepper's `io` unseeded that used to be undefined-pointer UB (GP fault deep
-// in the host matmul's groupAsync); it must instead fail closed, and work once
-// the session owner seeds it (gui/chat.zig Session.init does).
+// stepper's `io` unseeded that is undefined-pointer UB (a GP fault deep in the host
+// matmul's groupAsync), so it must fail closed instead, and work once the session
+// owner seeds it (gui/chat.zig Session.init does).
 test "cpu split prefill before any step needs a seeded io" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

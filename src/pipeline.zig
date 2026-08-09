@@ -119,20 +119,20 @@ pub const Backend = enum {
 /// VAE decode-path override (see `Options.vae_decode`). `auto` runs the adaptive
 /// chain; the others force the *starting* strategy but still degrade gracefully
 /// on OOM, so a forced path never hard-fails:
-///   - `auto`      — whole-image first, then GPU-tiled, then CPU-tiled.
-///   - `whole`     — same as `auto` (whole-image is already the first attempt).
-///   - `gpu_tiled` — skip the whole-image attempt; tile on the GPU, CPU-tile on OOM.
-///   - `cpu_tiled` — go straight to CPU tiling.
+///   - `auto`, whole-image first, then GPU-tiled, then CPU-tiled.
+///   - `whole`, same as `auto` (whole-image is already the first attempt).
+///   - `gpu_tiled`, skip the whole-image attempt; tile on the GPU, CPU-tile on OOM.
+///   - `cpu_tiled`, go straight to CPU tiling.
 /// On a CPU-only backend the GPU options collapse to the CPU paths.
 pub const VaeDecode = enum { auto, whole, gpu_tiled, cpu_tiled };
 
 /// A cheap latent2rgb preview of the in-progress latent (RGB8, latent
-/// resolution). Valid only for the duration of the `step` callback — copy it.
+/// resolution). Valid only for the duration of the `step` callback, copy it.
 pub const Preview = struct { rgb: []const u8, width: usize, height: usize };
 
 /// Live preview controls, read once per sampling step so a caller (the GUI) can
 /// change the preview METHOD or RESOLUTION mid-generation and see it on the very
-/// next completed step — no reload, no waiting for the image to finish. When
+/// next completed step, no reload, no waiting for the image to finish. When
 /// `Options.preview_live` points at one of these, it OVERRIDES the static
 /// `preview`/`preview_ds` fields each step; the static fields are the fallback
 /// for callers that don't need live control (the CLI).
@@ -156,19 +156,19 @@ pub const Progress = struct {
 
 /// A suspended generation's in-flight state: the sampler latent and the step it
 /// was captured at (the loop checkpoint runs at the TOP of a step, before that
-/// step's forward — so the latent is the input to `step`, and resuming re-runs
+/// step's forward, so the latent is the input to `step`, and resuming re-runs
 /// step `step`). Small (one latent, ~1 MB at 1024²). See `Options.suspend_out` /
 /// `Options.resume_from`. (Tier 3 unload-while-paused.)
 pub const Snapshot = struct {
-    /// Host copy of the sampler latent (len == 16·(h/8)·(w/8)); gpa-owned.
+    /// Host copy of the sampler latent (len == 16*(h/8)*(w/8)); gpa-owned.
     latent: []f32,
     /// Sampling step to resume at.
     step: usize,
-    /// **Multistep sampler state**, gpa-owned, null for a first-order sampler.
+    /// Multistep sampler state, gpa-owned, null for a first-order sampler.
     ///
-    /// ⚠️ A latent alone is not enough to resume a DPM++(2M) run bit-identically:
+    /// A latent alone is not enough to resume a DPM++(2M) run bit-identically:
     /// the step after the resume applies a second-order correction built from the
-    /// PREVIOUS step's denoised prediction. Dropping it is not a crash — the
+    /// PREVIOUS step's denoised prediction. Dropping it is not a crash, the
     /// resumed step silently degrades to first order and the image differs from an
     /// uninterrupted render, which is exactly the promise `resume_from` makes.
     sde_old_denoised: ?[]f32 = null,
@@ -185,12 +185,12 @@ pub const Snapshot = struct {
 pub const Options = struct {
     prompt: []const u8,
     negative: []const u8 = "",
-    /// Which prompt dialect `prompt`/`negative` are written in. See `PromptSyntax` —
+    /// Which prompt dialect `prompt`/`negative` are written in. See `PromptSyntax`,
     /// the two are not interchangeable spellings of the same thing.
     prompt_syntax: PromptSyntax = .comfy,
     /// How an A1111 attention weight reaches the hidden states. Ignored under `.comfy`.
     emphasis: Emphasis = .original,
-    /// Whose **sampling** conventions to follow. Orthogonal to `prompt_syntax`: the same
+    /// Whose sampling conventions to follow. Orthogonal to `prompt_syntax`: the same
     /// prompt text can be read either dialect's way under either ecosystem's sampler, and
     /// reproducing an A1111 render needs both set. See `Compat`.
     compat: Compat = .comfy,
@@ -205,7 +205,7 @@ pub const Options = struct {
     steps: usize = 8,
     cfg: f32 = 1.0,
     seed: u64 = 0,
-    /// Sigma-schedule shift. ⚠️ **Its default is family-dependent**, so leaving
+    /// Sigma-schedule shift. Its default is family-dependent, so leaving
     /// `explicit_shift` false is not the same as passing this value: krea2 wants
     /// 1.15, Z-Image 3.0, and the SD family ignores it entirely (its ladder comes
     /// from the training betas). `Session.resolvedShift` picks.
@@ -221,7 +221,7 @@ pub const Options = struct {
     /// krea2, `normal` for the SD family), which is what every render used before
     /// this became selectable. See `sampler.Scheduler`.
     ///
-    /// ⚠️ `ddim_uniform` and `beta` can return a different number of steps than
+    /// `ddim_uniform` and `beta` can return a different number of steps than
     /// `steps` asks for; `generate` reports and drives off the real count.
     scheduler: ?sampler.Scheduler = null,
     /// SDE noise level (`eta`) and noise multiplier (`s_noise`), ignored by `euler`.
@@ -239,19 +239,19 @@ pub const Options = struct {
     /// Run the GPU text encoder's GEMMs on tensor cores (f16). ~0.4s faster
     /// encode but ~doubles its image-delta contribution; default f32.
     encoder_f16: bool = false,
-    /// Where the conditioner and decoder come from **when they are not in the primary
-    /// checkpoint**. These defaults are krea2's separate files, and they are a
+    /// Where the conditioner and decoder come from when they are not in the primary
+    /// checkpoint. These defaults are krea2's separate files, and they are a
     /// *fallback*, not an override: `resolveComponent` prefers the primary checkpoint's
     /// own copy over a defaulted path, and prefers an explicitly supplied path over
     /// both (see `explicit_text_encoder` / `explicit_vae`).
     ///
-    /// ⚠️ Treating a *defaulted* path as "the user specified this" broke a joined SD1.5
+    /// Treating a *defaulted* path as "the user specified this" broke a joined SD1.5
     /// checkpoint: the resolver dutifully opened krea2's qwen3 encoder, looked for
     /// CLIP's tensors in it and reported `ComponentNotInCheckpoint`.
     text_encoder_path: []const u8 = "models/text_encoders/qwen3VLInstruct4bHeretic_v10.safetensors",
     dit_path: []const u8 = "models/diffusion_model/krea2CenterSemiraw_v10Fp8.safetensors",
     vae_path: []const u8 = "models/vae/krea2RealVae_v10.safetensors",
-    /// SDXL's **second** text encoder (OpenCLIP bigG), for the split-file case. Empty by
+    /// SDXL's second text encoder (OpenCLIP bigG), for the split-file case. Empty by
     /// default rather than pointing anywhere: unlike krea2's components there is no
     /// canonical standalone file for it, and a bundled SDXL checkpoint always carries it.
     text_encoder_2_path: []const u8 = "",
@@ -276,15 +276,15 @@ pub const Options = struct {
     /// `preview`/`preview_ds` above are the static fallback. The taew decoder is
     /// still loaded up front (from `taew_path`) so switching TO taesd is instant.
     preview_live: ?*const LivePreview = null,
-    /// Optional cancel flag, polled throughout generation — between encoder
+    /// Optional cancel flag, polled throughout generation, between encoder
     /// layers, between DiT blocks (mid-step, on every backend), and between
-    /// VAE decode layers/tiles — so a stop lands within a fraction of a step
+    /// VAE decode layers/tiles, so a stop lands within a fraction of a step
     /// even on the CPU backend. When it flips true, `generate` unwinds and
     /// returns `error.Canceled` (a caller-driven stop, not a failure).
     cancel: ?*std.atomic.Value(bool) = null,
     /// Optional pause gate, consulted between sampling steps (the same boundary
-    /// as `cancel`). While paused the loop parks here — holding the in-flight
-    /// latent and the resident DiT weights — until unpaused. See `ops/pause.zig`.
+    /// as `cancel`). While paused the loop parks here, holding the in-flight
+    /// latent and the resident DiT weights, until unpaused. See `ops/pause.zig`.
     pause: ?*ops.pause.Gate = null,
     /// Resume a suspended generation: skip noise init, load this latent, and
     /// start the sampling loop at `step` instead of 0. Conditioning + schedule
@@ -302,13 +302,13 @@ pub const Options = struct {
     /// device memory held by ANOTHER context in the process (the GUI's resident
     /// chat LLM) to the host, freeing room for the decode. `needed` is roughly
     /// how many more bytes the decode wants; the hook frees about that much
-    /// (just enough — the LLM layers left resident stay fast) and returns the
+    /// (just enough, the LLM layers left resident stay fast) and returns the
     /// bytes actually freed. It may switch the calling thread's current CUDA
-    /// context, so the pipeline re-binds its own after. (GUI_VRAM.md Phase 5;
-    /// null everywhere else.)
+    /// context, so the pipeline re-binds its own after. Set by the GUI, null
+    /// everywhere else.
     reclaim: ?Reclaim = null,
 
-    /// `compat` with the per-knob overrides applied — the form the sampling code reads.
+    /// `compat` with the per-knob overrides applied, the form the sampling code reads.
     pub fn compatConfig(self: *const Options) CompatConfig {
         var c: CompatConfig = .of(self.compat);
         if (self.rng) |v| c.noise_src = v;
@@ -347,20 +347,20 @@ pub const Cond = struct {
     ///
     /// It rides on the conditioning rather than being folded into it because the vector
     /// the UNet actually consumes (`y`) also carries the *image size*, which `encode` does
-    /// not know — so the pooled half is produced here and combined in `Session.denoiser`,
+    /// not know, so the pooled half is produced here and combined in `Session.denoiser`,
     /// which does.
     pooled: ?[]f32 = null,
-    /// Extra conditionings for a prompt whose text CHANGES DURING the render — A1111's
+    /// Extra conditionings for a prompt whose text CHANGES DURING the render, A1111's
     /// `[a:b:0.5]` and `[a|b]`. Null for every static prompt, which is every prompt in
     /// the ComfyUI dialect.
     ///
-    /// ⚠️ **Entry 0 is this `Cond` itself** (`data`/`seq`/`pooled`), so a caller that
+    /// Entry 0 is this `Cond` itself (`data`/`seq`/`pooled`), so a caller that
     /// ignores `sched` reads the step-0 conditioning and behaves exactly as before. That
-    /// is what keeps `Session.predict`, the composed-stages invariant and ggufy's whole
+    /// is what keeps `Session.predict`, the composed-stages equality and ggufy's whole
     /// measurement ladder working unchanged.
     sched: ?Schedule = null,
 
-    /// The step → conditioning map for a scheduled prompt.
+    /// The step -> conditioning map for a scheduled prompt.
     pub const Schedule = struct {
         /// Entries 1.., each a complete conditioning with its own `seq` and `pooled`.
         /// Deduplicated by prompt text: `[a|b]` over 35 steps has 35 schedule *entries*
@@ -413,7 +413,7 @@ pub const EncodeOptions = struct {
     prompt_syntax: PromptSyntax = .comfy,
     /// How an attention weight reaches the hidden states. Only read for `.a1111`.
     emphasis: Emphasis = .original,
-    /// Steps the render will take — needed only by `.a1111`, whose `[a:b:when]` and
+    /// Steps the render will take, needed only by `.a1111`, whose `[a:b:when]` and
     /// `[a|b]` resolve against the step count. Zero means "one entry", which is what a
     /// caller that is not rendering a schedule wants.
     steps: usize = 0,
@@ -440,34 +440,35 @@ pub const Emphasis = enum {
     /// `EmphasisOriginalNoNorm`: multiply only. Upstream documents this as working
     /// better for SDXL, and it is the form that leaves unweighted tokens untouched.
     no_norm,
-    /// `EmphasisIgnore`: parse the syntax and strip it, but weight everything 1.0 —
+    /// `EmphasisIgnore`: parse the syntax and strip it, but weight everything 1.0,
     /// useful for isolating how much of a difference the weighting itself makes.
     ignore,
 };
 
-/// Which ecosystem's **sampling** conventions to reproduce — a separate axis from
+/// Which ecosystem's sampling conventions to reproduce, a separate axis from
 /// `PromptSyntax`, which is about the prompt *text*.
 ///
-/// ⚠️ **Three independent conventions, each a documented A1111 option whose default
-/// disagrees with ComfyUI's behaviour**, and this engine hardwired ComfyUI's choice for
+/// Three independent conventions, each a documented A1111 option whose default
+/// disagrees with ComfyUI's behaviour, and this engine hardwired ComfyUI's choice for
 /// all three. Reproducing an A1111 render needs all of them; getting one wrong is enough
 /// to make the image a different image:
 ///
-/// | | A1111 default | ComfyUI (was unconditional here) | cost of the wrong one |
-/// |---|---|---|---|
-/// | `randn_source` | **`GPU`** — NVIDIA Philox | CPU MT19937 | an *unrelated* image |
-/// | `sgm_noise_multiplier` | **`False`** — `x·σ₀` | `x·sqrt(1+σ₀²)` | ~9 dB |
-/// | `enable_quantization` | **`False`** — fractional σ→t | nearest trained index | ~25 dB |
+///     randn_source          A1111 GPU (NVIDIA Philox)  vs ComfyUI CPU MT19937,
+///                           worth an unrelated image
+///     sgm_noise_multiplier  A1111 False (x*sigma0)     vs ComfyUI x*sqrt(1+sigma0^2),
+///                           worth ~9 dB
+///     enable_quantization   A1111 False (fractional)   vs ComfyUI nearest trained
+///                           index, worth ~25 dB
 ///
 /// The first is categorically worse than the other two: they perturb a trajectory, it
 /// replaces the starting point. Upstream's own note on the option is "changes seeds
 /// drastically". The second and third are measured in `sampler.sdScaleInitialNoise` and
 /// `sampler.sdModelTimestep`, whose doc comments already name diffusers as the other side
-/// of the same disagreement — A1111 happens to sit on diffusers' side of both.
+/// of the same disagreement, A1111 happens to sit on diffusers' side of both.
 pub const Compat = enum {
     /// ComfyUI's conventions, which every render here used before this was selectable.
     comfy,
-    /// AUTOMATIC1111's **defaults**. ⚠️ Not "A1111" in general: each of the three is a
+    /// AUTOMATIC1111's defaults. Not "A1111" in general: each of the three is a
     /// user-visible setting there, so an A1111 user who changed one needs the matching
     /// override below.
     a1111,
@@ -476,10 +477,10 @@ pub const Compat = enum {
 /// `Compat` resolved into the three switches the sampling code reads, after any
 /// per-knob override. Built by `Options.compatConfig`.
 pub const CompatConfig = struct {
-    /// Which generator the initial latent — and every Brownian-tree node — draws from.
+    /// Which generator the initial latent, and every Brownian-tree node, draws from.
     noise_src: noise_mod.Source = .torch_cpu,
-    /// `x·sqrt(1+σ₀²)` when true (ComfyUI / the official SGM implementation), a bare
-    /// `x·σ₀` when false (A1111's default).
+    /// `x*sqrt(1+σ₀²)` when true (ComfyUI / the official SGM implementation), a bare
+    /// `x*σ₀` when false (A1111's default).
     sgm_noise_multiplier: bool = true,
     /// Snap the UNet's timestep to the nearest *trained* index (ComfyUI) rather than
     /// passing the fractional one (A1111's `enable_quantization = False`).
@@ -514,7 +515,7 @@ pub fn schedule(gpa: std.mem.Allocator, steps: usize, shift: f32) ![]f32 {
 }
 
 // --- Tiled VAE decode adapters (see models/vae_tiled.zig) ------------------
-// Each decodes a planar [16][th][tw] sub-latent to planar [3][8·th][8·tw]
+// Each decodes a planar [16][th][tw] sub-latent to planar [3][8*th][8*tw]
 // pixels on its backend; `vae_tiled.decode` drives the tiling and feather-blends
 // the seams so decode VRAM stays bounded regardless of image size.
 
@@ -544,13 +545,13 @@ const CpuTile = struct {
     }
 };
 
-/// The SD family's three tile adapters. Same contract as the krea2 ones above —
-/// planar `[c][th][tw]` sub-latent in, planar `[3][8·th][8·tw]` pixels out — with
+/// The SD family's three tile adapters. Same contract as the krea2 ones above,
+/// planar `[c][th][tw]` sub-latent in, planar `[3][8*th][8*tw]` pixels out, with
 /// the channel-last transposition the SD decoders want folded in on either side,
 /// so `vae_tiled` and `Session.decode` stay planar-only.
 ///
-/// ⚠️ The transposition is the layout trap that produced a periodic streak
-/// pattern when the UNet landed (see CLAUDE.md): it moves every value's position
+/// The transposition is the layout trap that produced a periodic streak
+/// pattern when the UNet landed: it moves every value's position
 /// and none of its magnitude, so getting it wrong is invisible to any norm check.
 /// It lives here, once, for exactly that reason.
 fn sdTile(
@@ -562,10 +563,10 @@ fn sdTile(
     comptime inner: fn (@TypeOf(ctx), std.mem.Allocator, []const f32, usize, usize) anyerror![]f32,
 ) anyerror![]f32 {
     const n = th * tw;
-    // ⚠️ **DERIVED, not `sd_vae.latent_channels`.** That constant is 4, and the same
+    // DERIVED, not `sd_vae.latent_channels`. That constant is 4, and the same
     // decoder body also runs Z-Image's 16-channel Flux latent. Hardcoding it
     // transposed only the first quarter of the latent and left the rest reading
-    // whatever followed — which rendered as a band of colour noise across the top of
+    // whatever followed, which rendered as a band of colour noise across the top of
     // an otherwise flat grey image, with the assert below compiled out in ReleaseFast.
     // `vae_tiled.decode` already derives its channel count the same way.
     std.debug.assert(n != 0 and sub.len % n == 0);
@@ -655,14 +656,14 @@ const KreaVae = struct {
 
 const SdVae = struct {
     vae: *const sd_vae.Decoder,
-    /// ⚠️ HALF krea2's tile, and that is the whole point of tiling here. The SD
+    /// HALF krea2's tile, and that is the whole point of tiling here. The SD
     /// decoder's widest activation is 256 channels at FULL image resolution, so a
-    /// 128² latent tile (1024² pixels) still needs 3 x 1 GiB — barely under a
+    /// 128² latent tile (1024² pixels) still needs 3 x 1 GiB, barely under a
     /// 1024x1536 whole-image decode, i.e. a tiling that saves nothing. 64² latent
     /// (512² pixels) costs 3 x 256 MiB and is also what ComfyUI's tiled SD decode
     /// defaults to; overlap 8 keeps its 25% seam ratio.
     const tiling: vae_tiled.Params = .{ .tile = 64, .overlap = 8 };
-    /// `scores_resident` means "the Vulkan arm" — the only backend that
+    /// `scores_resident` means "the Vulkan arm", the only backend that
     /// materializes a band of the scores plane. Both arms now implement f16
     /// activation storage, so that follows the config on either.
     fn estimate(self: SdVae, zh: usize, zw: usize, scores_resident: bool) u64 {
@@ -679,7 +680,7 @@ const SdVae = struct {
     }
 };
 
-/// Bytes of the whole-image mid-block attention scores plane (seq = zh·zw, one
+/// Bytes of the whole-image mid-block attention scores plane (seq = zh*zw, one
 /// head; `elem` = 2 for f16 GPU scores, 4 for f32 CPU). This term grows
 /// quadratically with image area and is what forces tiling on large images.
 fn attnPlaneBytes(zh: usize, zw: usize, elem: u64) u64 {
@@ -689,29 +690,28 @@ fn attnPlaneBytes(zh: usize, zw: usize, elem: u64) u64 {
 
 /// VAE-decode OOM recovery: bytes to free on the first retry round. The decode's
 /// exact deficit is unknown, so we free this much, retry, and double each round
-/// (see `max_reclaim_rounds`) — small enough to keep resident weights we didn't
+/// (see `max_reclaim_rounds`), small enough to keep resident weights we didn't
 /// need to drop, large enough that a multi-GB deficit converges in a few retries
 /// (each retry re-runs the decode, so we don't want hundreds of tiny steps).
 const reclaim_chunk: u64 = 1 << 30; // 1 GiB
 
 /// Cap on VAE-decode reclaim retries before giving up on the whole-image decode
 /// and dropping to tiling. With `reclaim_chunk` doubling each round this frees up
-/// to ~1 TiB, far past any card — it's a stall backstop, not a real bound.
+/// to ~1 TiB, far past any card, it's a stall backstop, not a real bound.
 const max_reclaim_rounds: usize = 16;
 
 /// Whether a GPU VAE-decode error is one we recover from by freeing VRAM and/or
-/// stepping down the fallback ladder (whole-image → reclaim+retry → GPU tiling →
+/// stepping down the fallback ladder (whole-image -> reclaim+retry -> GPU tiling ->
 /// CPU tiling), rather than failing the whole image. VRAM exhaustion surfaces as
 /// `DeviceOutOfMemory`, but the cuBLASLt / cuDNN libraries report an
 /// out-of-workspace as `CublasLtError` / `CudnnError`, and the hand-PTX path can
-/// surface a post-OOM stream fault as `CudaError` — all of which used to hit the
-/// `else => return err` arm and hard-fail the decode even though a CPU tiled
-/// decode would have succeeded. `error.Canceled` and any structural error still
+/// surface a post-OOM stream fault as `CudaError`. All of those must be recognized
+/// here, or the decode hard-fails on the `else => return err` arm even though a CPU
+/// tiled decode would have succeeded. `error.Canceled` and any structural error
 /// propagate (we never want to mask those behind a silent CPU fallback).
-/// Why the ladder is stepping down, for the progress log. ⚠️ Not cosmetic: every
-/// rung used to say "OOM", which is a wrong diagnosis for a decode that came back
-/// non-finite and would send the next reader hunting for a memory problem that is
-/// not there.
+/// Why the ladder is stepping down, for the progress log. Not cosmetic: every
+/// rung saying "OOM" is a wrong diagnosis for a decode that came back non-finite, and
+/// sends the next reader hunting for a memory problem that is not there.
 fn decodeStepReason(err: anyerror) []const u8 {
     return switch (err) {
         error.GpuDecodeNonFinite => "produced non-finite values",
@@ -735,8 +735,8 @@ fn recoverableDecodeErr(err: anyerror) bool {
     };
 }
 
-/// One image's denoiser: everything a DiT forward needs that is built **once per
-/// image** rather than once per step — the text fusion, rope table and timestep
+/// One image's denoiser: everything a DiT forward needs that is built once per
+/// image rather than once per step, the text fusion, rope table and timestep
 /// vectors uploaded to the device, the activation workspace, and (when CFG is on)
 /// the second conditioning's session plus a scratch velocity.
 ///
@@ -747,15 +747,15 @@ fn recoverableDecodeErr(err: anyerror) bool {
 /// single forward (level-2 style: one latent, one sigma, one conditioning) can use
 /// `Session.predict`, which wraps init/predict/deinit.
 ///
-/// Borrows its conditionings — they must outlive the `Denoiser`. Bound to one
+/// Borrows its conditionings, they must outlive the `Denoiser`. Bound to one
 /// resolution. `sigmas` is a cache, not a constraint: the Vulkan session
 /// precomputes a timestep vector per entry, and `predict` at a sigma that is not
-/// in the list recomputes one on the fly (correct, just slower) — so pass the
+/// in the list recomputes one on the fly (correct, just slower), so pass the
 /// schedule you intend to sample with, and an off-schedule probe still works.
 /// One conditioning entry's device state for the SD family, per branch.
 ///
 /// `adm` is SDXL's `y` vector, built here rather than in `encode` because it carries the
-/// image SIZE — a property of this denoiser's resolution, not of the prompt. It is
+/// image SIZE, a property of this denoiser's resolution, not of the prompt. It is
 /// per-entry because it embeds that entry's pooled CLIP-G vector, which a scheduled
 /// prompt changes along with everything else.
 pub const SdBranch = struct {
@@ -764,10 +764,10 @@ pub const SdBranch = struct {
     adm: ?[]f32 = null,
 };
 
-/// Say WHY Anima's trunk is on the host, naming the layer when a dtype is the
-/// reason. ⚠️ A bare "unsupported dtype" is not actionable on a MIXED checkpoint:
-/// `anima_baseV10-INT8_CONVROT-MIXED` keeps block 0 in bf16 and quantizes blocks
-/// 1-27, so the answer to "but my checkpoint is bf16" is "block 1 is not".
+/// Say WHY Anima's trunk is on the host, naming the layer when a dtype is the reason.
+/// A bare "unsupported dtype" is not actionable on a MIXED checkpoint that keeps block 0
+/// in bf16 and quantizes blocks 1-27: the answer to "but my checkpoint is bf16" is
+/// "block 1 is not".
 fn warnAnimaCpu(dit: *const anima.DiT, support: anima.LinSupport) void {
     if (anima.unsupportedLin(dit, support)) |bad| {
         std.log.warn(
@@ -808,7 +808,7 @@ pub const Denoiser = struct {
     /// One session per (entry, branch) rather than one per branch: a session carries that
     /// conditioning's context on the device plus its folded per-forward ResBlock biases,
     /// so a prompt that changes mid-render needs a session per variant. They are built
-    /// eagerly in `denoiser` — deduplication at encode time keeps the count at the number
+    /// eagerly in `denoiser`, deduplication at encode time keeps the count at the number
     /// of distinct prompt *texts* (2 for an `[a|b]`), not the number of steps.
     sd_pos: []SdBranch = &.{},
     sd_neg: []SdBranch = &.{},
@@ -822,10 +822,10 @@ pub const Denoiser = struct {
     /// planar layout by `channelLastToPlanar`.
     sd_eps: ?[]f32 = null,
 
-    /// Z-Image's caption half — `cap_embedder` + pad + both `context_refiner`
-    /// blocks — one per branch.
+    /// Z-Image's caption half, `cap_embedder` + pad + both `context_refiner`
+    /// blocks, one per branch.
     ///
-    /// ⚠️ Cached because it is genuinely constant across steps, and that is a
+    /// Cached because it is genuinely constant across steps, and that is a
     /// property of the architecture rather than an optimization guess: the
     /// `context_refiner` blocks are built with `modulation=False`, so the text half
     /// never sees the timestep. Recomputing it per step would add two full attention
@@ -836,7 +836,7 @@ pub const Denoiser = struct {
     /// occupies. The image half starts here.
     zi_cap_padded: usize = 0,
     /// Z-Image's Vulkan state, when the device can run its GEMMs. Null means the
-    /// trunk runs on the CPU — which is also the case on every CUDA backend, which
+    /// trunk runs on the CPU, which is also the case on every CUDA backend, which
     /// has no Z-Image forward at all yet.
     zi_vk: ?zimage_gpu.Session = null,
     zi_vk_neg: ?zimage_gpu.Session = null,
@@ -896,10 +896,10 @@ pub const Denoiser = struct {
 
     /// One denoiser forward at `sigma`, using the STEP-0 conditioning.
     ///
-    /// Unchanged in signature and behaviour: for a static prompt — every prompt in the
-    /// ComfyUI dialect — there is only one conditioning, so this is the whole story. A
+    /// Unchanged in signature and behaviour: for a static prompt, every prompt in the
+    /// ComfyUI dialect, there is only one conditioning, so this is the whole story. A
     /// caller driving the stages itself (ggufy's measurement ladder, the composed-stages
-    /// invariant test) keeps working verbatim.
+    /// equality test) keeps working verbatim.
     pub fn predict(
         self: *Denoiser,
         gpa: std.mem.Allocator,
@@ -913,10 +913,10 @@ pub const Denoiser = struct {
 
     /// One denoiser forward at `sigma` on the conditioning scheduled for `step` (0-based):
     /// `v_out = model(latent, sigma, cond[step])`, with classifier-free guidance folded in
-    /// when `cfg != 1`. `v_out` and `latent` are both `channels·lat_h·lat_w` long.
+    /// when `cfg != 1`. `v_out` and `latent` are both `channels*lat_h*lat_w` long.
     ///
     /// `step` selects among A1111's per-step prompt variants and is ignored for a static
-    /// prompt. It is the *sampling* step index, not a sigma — the schedule is defined over
+    /// prompt. It is the *sampling* step index, not a sigma, the schedule is defined over
     /// step ordinals, so a teacher-forced off-schedule sigma still needs to say which step
     /// it stands for.
     pub fn predictAt(
@@ -960,7 +960,7 @@ pub const Denoiser = struct {
     /// Z-Image's forward: the timestep vector, then the image half and the joint
     /// trunk on top of the cached caption half.
     ///
-    /// No input pre-scaling and no timestep inversion — it is flow matching, like
+    /// No input pre-scaling and no timestep inversion, it is flow matching, like
     /// krea2, so the sampler's sigma reaches the model directly (`NextDiT` turns it
     /// into `1 - sigma` itself). The output is the trajectory derivative, which is
     /// what makes CFG mixing valid here for the same reason it is for krea2.
@@ -1009,12 +1009,12 @@ pub const Denoiser = struct {
 
     /// Anima's forward, on whichever of `anima_cuda` / `anima_gpu` / the host DiT the
     /// backend and checkpoint support. When neither device arm was built, the warning
-    /// naming why was already logged in `denoiser` — a GPU render that silently drops
+    /// naming why was already logged in `denoiser`, a GPU render that silently drops
     /// to the CPU looks like a hang.
     ///
-    /// ⚠️ **The sigma reaches the model unchanged.** `Anima.sampling_settings` has
+    /// The sigma reaches the model unchanged. `Anima.sampling_settings` has
     /// `multiplier: 1.0`, so ComfyUI's `model_sampling.timestep(sigma)` is the sigma
-    /// itself — where Z-Image, on a bit-identical sigma table, conditions on
+    /// itself, where Z-Image, on a bit-identical sigma table, conditions on
     /// `(1 - sigma) * 1000`. Passing Z-Image's argument here is finite nonsense.
     ///
     /// The modulation table is rebuilt per step rather than cached per schedule entry
@@ -1036,7 +1036,7 @@ pub const Denoiser = struct {
         std.debug.assert(v_out.len == anima.latent_channels * self.lat_h * self.lat_w);
         std.debug.assert(latent.len == v_out.len);
 
-        // A1111's `[a:b:0.5]` / `[a|b]` resolve here, as they do for the SD family —
+        // A1111's `[a:b:0.5]` / `[a|b]` resolve here, as they do for the SD family,
         // and unlike krea2 and Z-Image, which read entry 0 unconditionally because a
         // scheduled prompt would need one DEVICE session per variant. Anima has no
         // per-entry state at all: the cross-attention context is a plain host slice, so
@@ -1044,9 +1044,9 @@ pub const Denoiser = struct {
         // family whose encoder can carry weights, so an a1111 prompt is realistic here.)
         const cp = self.cond_pos.entry(if (self.cond_pos.sched) |sc| sc.indexAt(step) else 0);
 
-        // ⚠️ **The device arms serve entry 0 only.** A device session caches
+        // The device arms serve entry 0 only. A device session caches
         // cross-attention's K/V for the conditioning it was built with, so a per-step
-        // prompt schedule would need one session per variant — the same reason krea2's
+        // prompt schedule would need one session per variant, the same reason krea2's
         // and Z-Image's device paths read entry 0. Scheduling therefore falls back to
         // the host forward rather than silently rendering the wrong prompt.
         const scheduled = (self.cond_pos.sched != null and self.cond_pos.data.ptr != cp.data.ptr);
@@ -1088,7 +1088,7 @@ pub const Denoiser = struct {
     /// SD1.5's forward: pre-scale the latent, invert sigma back to the timestep the
     /// UNet is conditioned on, run it, and mix the two branches under CFG.
     ///
-    /// ⚠️ **Both of the first two steps are silent if omitted.** Feeding the raw
+    /// Both of the first two steps are silent if omitted. Feeding the raw
     /// latent runs the model off its training distribution (softer, washed images,
     /// no error), and conditioning on the wrong timestep runs the right model at the
     /// wrong noise level. Neither shows up as anything but "the sampler seems bad".
@@ -1107,9 +1107,9 @@ pub const Denoiser = struct {
         std.debug.assert(v_out.len == cfg_unet.channels * self.lat_h * self.lat_w);
         std.debug.assert(latent.len == v_out.len);
 
-        // ⚠️ **LAYOUT.** The sampler's latent is **planar** `[c][h][w]` — krea2's DiT and
-        // both VAEs use that, and `generate`/`decode` are written to it — while
-        // `sd_unet.forward` works in **channel-last** `[h*w][c]`, the layout `ops.conv`
+        // LAYOUT. The sampler's latent is planar `[c][h][w]`, krea2's DiT and
+        // both VAEs use that, and `generate`/`decode` are written to it, while
+        // `sd_unet.forward` works in channel-last `[h*w][c]`, the layout `ops.conv`
         // and the GEMMs want. So this transposes on the way in and back on the way out.
         //
         // Getting this wrong is *rms-preserving*: every value survives, only its
@@ -1129,7 +1129,7 @@ pub const Denoiser = struct {
             }
         }
         sampler.sdScaleInput(scaled, scaled, sigma);
-        // The nearest *trained* index, not the fractional one — see `sdModelTimestep`,
+        // The nearest *trained* index, not the fractional one, see `sdModelTimestep`,
         // where the measured cost of the fractional form is 25 dB of render agreement.
         // A1111 is the one ecosystem that passes the fractional index by default
         // (`enable_quantization = False`), so `--compat a1111` takes the other branch.
@@ -1193,7 +1193,7 @@ pub const Denoiser = struct {
 /// into them. `texts` lives in `arena`; `at` is allocated from `gpa` because it outlives
 /// the call as part of `Cond.Schedule`.
 ///
-/// Split out from `encodeScheduled` so the deduplication is testable without a model —
+/// Split out from `encodeScheduled` so the deduplication is testable without a model,
 /// it is the part with the interesting behaviour, and the part whose absence would cost
 /// 33 tower forwards on a 35-step `[a|b]`.
 pub const SchedulePlan = struct { texts: []const []const u8, at: []u8 };
@@ -1227,15 +1227,15 @@ pub fn planSchedule(
     return .{ .texts = uniq.items, .at = at };
 }
 
-/// A checkpoint container, which may be either format — used for every component
+/// A checkpoint container, which may be either format, used for every component
 /// that can arrive as its own file (denoiser, text encoder, VAE).
 ///
-/// ggufy emits both — int4/int8 cluster formats as safetensors, the ggml block
-/// quants as GGUF — and until this existed only the safetensors half could be
+/// ggufy emits both, int4/int8 cluster formats as safetensors, the ggml block
+/// quants as GGUF, and until this existed only the safetensors half could be
 /// loaded, so the GGUF half of the quantization work could not be run or measured
 /// at all. `dit.DiT.load` takes a `WeightStore`, so the only thing missing was
 /// opening the file.
-/// `Context.WeightReader` over an optional side-file container — the encoder/VAE
+/// `Context.WeightReader` over an optional side-file container, the encoder/VAE
 /// twin of `Container.weightReader`, which it now simply delegates to. See
 /// `SafeTensors.readTo`.
 fn storeReader(opt: *?Container) ?cuda.Context.WeightReader {
@@ -1249,7 +1249,7 @@ pub const Container = union(enum) {
 
     /// A `Context.WeightReader` over this container, or null when it cannot serve
     /// one. Lets the CUDA staging path pull weight bytes with positional reads
-    /// instead of faulting the (multi-GB, read-once) checkpoint mapping — see
+    /// instead of faulting the (multi-GB, read-once) checkpoint mapping, see
     /// `SafeTensors.readTo` for why that matters under host memory pressure.
     ///
     /// GGUF returns null for now: same idea applies, but the DiT GGUF path is
@@ -1270,10 +1270,10 @@ pub const Container = union(enum) {
         };
     }
 
-    /// Open by **content**, not extension: a leading `GGUF` magic picks the GGUF
+    /// Open by content, not extension: a leading `GGUF` magic picks the GGUF
     /// reader, anything else the safetensors one. Sniffing rather than trusting the
     /// name because the failure mode of guessing wrong is a baffling error from the
-    /// other parser — handing a GGUF to the safetensors reader reports
+    /// other parser, handing a GGUF to the safetensors reader reports
     /// `InvalidHeader`, which says nothing about what actually happened.
     pub fn open(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !Container {
         return openIn(gpa, io, std.Io.Dir.cwd(), path);
@@ -1310,7 +1310,7 @@ pub const Container = union(enum) {
         };
     }
 
-    /// Tensor-data bytes — what the VRAM pinning policy sizes itself against.
+    /// Tensor-data bytes, what the VRAM pinning policy sizes itself against.
     pub fn payloadLen(self: *const Container) usize {
         return switch (self.*) {
             .safetensors => |*st| st.payload.len,
@@ -1321,15 +1321,15 @@ pub const Container = union(enum) {
 
 /// A reusable text-to-image pipeline. `init` creates the backend and loads the
 /// text encoder, DiT, and VAE ONCE (their safetensors mappings stay open for the
-/// session lifetime), so `generate` can produce many images without reloading —
+/// session lifetime), so `generate` can produce many images without reloading,
 /// the DiT stays resident in the backend's weight cache across a queue when the
 /// VRAM budget allows. The GUI keeps one alive while its image queue is
 /// non-empty; the one-shot `generate` free function below wraps init+generate+
 /// deinit for the CLI / tests. NOT thread-safe: serialize `generate` calls.
 /// Open `path` only when the caller actually gave one: an empty path means "not
 /// specified", and the component is then expected in the primary checkpoint.
-/// Open a side-file component if one was given. ⚠️ Goes through `Container`, so a
-/// side file is opened by **magic** and may be a GGUF — a `.gguf` text encoder used
+/// Open a side-file component if one was given. Goes through `Container`, so a
+/// side file is opened by magic and may be a GGUF, a `.gguf` text encoder used
 /// to die with `InvalidHeader` from the safetensors parser, an error that says
 /// nothing about what happened (the same trap `Container.open` exists to avoid for
 /// the denoiser).
@@ -1357,13 +1357,13 @@ fn channelLastToPlanar(dst: []f32, src: []const f32, ch: usize, plane: usize) vo
 }
 
 /// One of the three things a diffusion pipeline is made of. Each may live in the
-/// primary checkpoint or in a file of its own — **independently of the architecture**.
-/// `conditioner2` exists only for SDXL, which conditions on **two** text towers whose
+/// primary checkpoint or in a file of its own, independently of the architecture.
+/// `conditioner2` exists only for SDXL, which conditions on two text towers whose
 /// outputs are concatenated. Asking any other family for it is a programming error
 /// (`error.NoSuchComponent`), not a missing-weights condition.
 pub const Component = enum { denoiser, conditioner, conditioner2, decoder };
 
-/// Where a component's weights were found: a store in which it sits **at the root**
+/// Where a component's weights were found: a store in which it sits at the root
 /// (wrapped in a `weights.Prefixed` view when it was nested), plus the file it came
 /// from, for the load log.
 const Resolved = struct {
@@ -1378,17 +1378,17 @@ const Resolved = struct {
 /// are ordered most-specific first, so a bundled checkpoint's nested spelling wins over
 /// a bare one that could also match by accident.
 ///
-/// ⚠️ `probes` is a LIST because a component's own tensor names are not the same in
+/// `probes` is a LIST because a component's own tensor names are not the same in
 /// every container. A GGUF text encoder is `embed_tokens.weight` where safetensors is
-/// `model.embed_tokens.weight` — `canonicalName` strips llama.cpp's `blk.N.` spelling
+/// `model.embed_tokens.weight`, `canonicalName` strips llama.cpp's `blk.N.` spelling
 /// but there is no `model.` to restore, and with one probe a `.gguf` encoder resolved
 /// to nothing and reported `ComponentNotInCheckpoint`.
 /// The one tensor that says "this is an Anima denoiser", used by BOTH `detectFamily`
 /// and `componentSpec` so the two cannot disagree about what identifies this family.
 ///
-/// ⚠️ It is in the **LLM adapter**, not the trunk. Anima IS Cosmos-Predict2's
-/// `MiniTrainDIT`, so every trunk tensor name — `blocks.0.mlp.layer1.weight` included
-/// — is shared with stock Cosmos, and `model_detection` upgrades `"cosmos_predict2"`
+/// It is in the LLM adapter, not the trunk. Anima IS Cosmos-Predict2's
+/// `MiniTrainDIT`, so every trunk tensor name, `blocks.0.mlp.layer1.weight` included
+/// is shared with stock Cosmos, and `model_detection` upgrades `"cosmos_predict2"`
 /// to `"anima"` purely on this tensor's presence. A trunk probe would load a Cosmos
 /// checkpoint as Anima and then fail on ~100 missing adapter weights.
 pub const anima_probe = "llm_adapter.blocks.0.cross_attn.q_proj.weight";
@@ -1417,8 +1417,8 @@ pub fn componentSpec(fam: Family, comp: Component) error{NoSuchComponent}!Compon
         // resolver is the same: each component is looked for in the primary
         // checkpoint first and in a side file second.
         //
-        // ⚠️ The conditioner probe is `model.embed_tokens.weight`, NOT krea2's
-        // `model.language_model.embed_tokens.weight`: krea2 uses the Qwen3-**VL**
+        // The conditioner probe is `model.embed_tokens.weight`, NOT krea2's
+        // `model.language_model.embed_tokens.weight`: krea2 uses the Qwen3-VL
         // checkpoint, whose language model is nested a level deeper. Feeding either
         // encoder to the other family resolves to nothing and reports it, which is
         // the point of probing rather than assuming.
@@ -1430,30 +1430,28 @@ pub fn componentSpec(fam: Family, comp: Component) error{NoSuchComponent}!Compon
         },
         // Anima normally BUNDLES its VAE (a single-file checkpoint carrying
         // `first_stage_model.*` alongside `model.diffusion_model.*`) and ships its
-        // encoder separately — the opposite split from Z-Image, and the reason
+        // encoder separately, the opposite split from Z-Image, and the reason
         // `resolveComponent` decides per component rather than per family.
         //
-        // ⚠️ The conditioner probe is Z-Image's, not krea2's: Anima's encoder is a
+        // The conditioner probe is Z-Image's, not krea2's: Anima's encoder is a
         // plain Qwen3-0.6B, so its language model sits at `model.`, where krea2's
         // Qwen3-VL nests it under `model.language_model.`. The decoder probe is
-        // krea2's `decoder.conv1.weight` — the Wan VAE's naming, NOT the
+        // krea2's `decoder.conv1.weight`, the Wan VAE's naming, NOT the
         // `AutoencoderKL` `decoder.conv_in.weight` the SD family and Z-Image use.
         // Those two probes are what stop a wrong side file from being loaded as if
         // it belonged here.
         .anima => switch (comp) {
-            // ⚠️ **`net.` is a real Anima spelling and its omission made the BASE
-            // checkpoint unloadable.** `anima_baseV10.safetensors` stores all 685
-            // tensors under `net.`, so `detectFamily` found no adapter and reported
-            // `error.UnknownArchitecture` — a checkpoint ComfyUI opens fine, refused
-            // with an error that names the architecture rather than the prefix. It is
-            // ComfyUI's own third candidate in `unet_prefix_from_state_dict`, where the
-            // comment against it reads `# cosmos` — and Anima IS Cosmos-Predict2's DiT.
+            // `net.` is a real Anima spelling: base checkpoints store every tensor
+            // under it. Omitting it makes `detectFamily` find no adapter and report
+            // `error.UnknownArchitecture`, i.e. an error naming the architecture when
+            // the problem is the prefix. It is ComfyUI's own third candidate in
+            // `unet_prefix_from_state_dict`, tagged there as the cosmos spelling.
             .denoiser => .{ .prefixes = &.{ "model.diffusion_model.", "net.", "" }, .probes = &.{anima_probe} },
             .conditioner => .{ .prefixes = &.{ "text_encoders.", "" }, .probes = &.{ "model.embed_tokens.weight", "embed_tokens.weight" } },
             .decoder => .{ .prefixes = &.{ "first_stage_model.", "vae.", "" }, .probes = &.{"decoder.conv1.weight"} },
             .conditioner2 => error.NoSuchComponent,
         },
-        // SDXL bundles its two towers under `conditioner.embedders.{0,1}` — and the two
+        // SDXL bundles its two towers under `conditioner.embedders.{0,1}`, and the two
         // are spelled differently *within one file*: embedder 0 is a `transformers`
         // CLIPTextModel, embedder 1 an OpenCLIP tower. Hence the different probes.
         .sdxl => switch (comp) {
@@ -1473,8 +1471,8 @@ pub fn componentSpec(fam: Family, comp: Component) error{NoSuchComponent}!Compon
 
 /// Resolve where a component's weights are, with the precedence the CLI promises:
 ///
-/// 1. **An explicitly given path wins.** If the user passed `--text-encoder` or
-///    `--vae`, that file is used even when the primary checkpoint also carries one —
+/// 1. An explicitly given path wins. If the user passed `--text-encoder` or
+///    `--vae`, that file is used even when the primary checkpoint also carries one,
 ///    overriding a bundled component is the whole reason to pass the flag.
 /// 2. Otherwise the primary checkpoint must contain it.
 ///
@@ -1564,28 +1562,28 @@ fn reportResolve(
 
 /// Which architecture a session is running.
 ///
-/// The engine started as a krea2 pipeline and the stage API (`encode` → `denoiser` →
-/// `predict` → `decode`) turned out to be the right shape for both families, so the
+/// The engine started as a krea2 pipeline and the stage API (`encode` -> `denoiser` ->
+/// `predict` -> `decode`) turned out to be the right shape for both families, so the
 /// generalization is a tagged union *inside* `Session` rather than a second pipeline:
-/// callers — including ggufy's whole measurement ladder — are unchanged.
+/// callers, including ggufy's whole measurement ladder, are unchanged.
 ///
-/// ⚠️ **The two families differ in what a "step" means**, and `sampler.zig` documents
+/// The two families differ in what a "step" means, and `sampler.zig` documents
 /// it: krea2 predicts a velocity on a continuous flow-matching schedule, SD predicts
 /// eps on a discrete ladder, is conditioned on a timestep *index*, and needs its input
 /// pre-scaled. What makes one API cover both is that the Euler step consumes the same
-/// quantity either way — for eps-prediction the trajectory derivative *is* eps.
+/// quantity either way, for eps-prediction the trajectory derivative *is* eps.
 pub const Family = enum {
     krea2,
     sd15,
     sdxl,
     /// Z-Image (`NextDiT`), the architecture "zit" checkpoints use. Flow matching
-    /// like krea2, and it shares krea2's Qwen3-4B text encoder body — but a
+    /// like krea2, and it shares krea2's Qwen3-4B text encoder body, but a
     /// different tap, a different RoPE theta, a 16-channel `AutoencoderKL` rather
     /// than the Wan VAE, and its own 1000-rung sigma table. See `models/zimage.zig`.
     zimage,
-    /// Anima — Cosmos-Predict2's `MiniTrainDIT` plus an `llm_adapter`. Flow matching
-    /// like krea2 and Z-Image, and it uses **krea2's** Wan 2.1 VAE and latent
-    /// statistics; what is new is a Qwen3-**0.6B** encoder whose states feed the
+    /// Anima, Cosmos-Predict2's `MiniTrainDIT` plus an `llm_adapter`. Flow matching
+    /// like krea2 and Z-Image, and it uses krea2's Wan 2.1 VAE and latent
+    /// statistics; what is new is a Qwen3-0.6B encoder whose states feed the
     /// adapter rather than the denoiser directly, and a second (T5) tokenization of
     /// the prompt that indexes the adapter's own embedding. Its sigma table is
     /// bit-identical to Z-Image's, but the timestep handed to the model is the sigma
@@ -1617,13 +1615,13 @@ pub const Krea2Models = struct {
 };
 
 /// The SD family (SD1.5 and SDXL): one LDM single-file checkpoint normally holds every
-/// model — but the denoiser may come from a *different* file than the conditioner and
+/// model, but the denoiser may come from a *different* file than the conditioner and
 /// decoder, which is the case that matters here: ggufy writes a GGUF containing only the
 /// UNet (with the container prefix stripped), so a quantized arm is measured with CLIP
 /// and the VAE loaded from the original checkpoint.
 ///
 /// One struct for both architectures, because they differ only in `Config`s and in
-/// SDXL's second text tower — so `denoiser`, `predict`, `decode` and teardown are shared
+/// SDXL's second text tower, so `denoiser`, `predict`, `decode` and teardown are shared
 /// verbatim rather than duplicated per family.
 pub const SdModels = struct {
     tok: clip_tok.Tokenizer,
@@ -1640,10 +1638,10 @@ pub const SdModels = struct {
     clip_view: ?*weights_mod.Prefixed,
     clip_g_view: ?*weights_mod.Prefixed,
     vae_view: ?*weights_mod.Prefixed,
-    /// The full per-training-step sigma ladder, for the sigma → timestep inverse a
+    /// The full per-training-step sigma ladder, for the sigma -> timestep inverse a
     /// teacher-forced (off-schedule) sigma needs. Built once.
     sigma_ladder: []f32,
-    /// `z_empty` for each tower — the empty prompt's hidden rows at the same capture
+    /// `z_empty` for each tower, the empty prompt's hidden rows at the same capture
     /// layer the conditioning is taken from, which is the reference point attention
     /// weighting interpolates away from (`clip_text.applyWeights`).
     ///
@@ -1655,7 +1653,7 @@ pub const SdModels = struct {
 };
 
 /// Z-Image: a denoiser-only checkpoint plus Qwen3-4B and the 16-channel Flux VAE,
-/// each normally in a file of its own — the shape the official ComfyUI template
+/// each normally in a file of its own, the shape the official ComfyUI template
 /// distributes it in. Structurally krea2's set with two of the three models swapped.
 pub const ZImageModels = struct {
     tok: tokenizer_mod.Tokenizer,
@@ -1674,9 +1672,10 @@ pub const ZImageModels = struct {
 /// The loaded model set, tagged by family. A named type rather than an anonymous
 /// union in the field: an inline `union(Family)` there makes the compiler derive its
 /// name from the first field's type and then report a dependency loop.
-/// Anima: a denoiser checkpoint that normally BUNDLES its VAE (`first_stage_model.*`,
-/// byte-for-byte `qwen_image_vae.safetensors`) plus a side-file Qwen3-0.6B encoder.
-/// Two tokenizers, because the prompt is tokenized twice — see `models/anima.zig`.
+/// Anima: a denoiser checkpoint that normally BUNDLES its VAE under
+/// `first_stage_model.*` (byte-for-byte the stock Qwen-Image VAE) plus a side-file
+/// Qwen3-0.6B encoder.
+/// Two tokenizers, because the prompt is tokenized twice, see `models/anima.zig`.
 pub const AnimaModels = struct {
     /// Qwen2 BPE, for the encoder branch. The same vocabulary krea2 and Z-Image use.
     tok: tokenizer_mod.Tokenizer,
@@ -1708,11 +1707,11 @@ pub const Models = union(Family) {
 
 /// Which family a denoiser checkpoint belongs to, from its tensor names alone.
 ///
-/// Name-based, like ggufy's own `ImageArch` detection, because the alternative —
-/// asking the caller — puts a mistypeable flag in front of a measurement whose whole
+/// Name-based, like ggufy's own `ImageArch` detection, because the alternative,
+/// asking the caller, puts a mistypeable flag in front of a measurement whose whole
 /// point is that the inputs are what they claim to be.
 pub fn detectFamily(store: weights_mod.WeightStore) !Family {
-    // ⚠️ **SDXL must be tested before SD1.5, and by a tensor SD1.5 does not have.** Both
+    // SDXL must be tested before SD1.5, and by a tensor SD1.5 does not have. Both
     // are LDM UNets with the same `input_blocks.0.0` stem, so the stem cannot tell them
     // apart; `label_emb` (the micro-conditioning projection) exists only in SDXL. Reading
     // the stem first would load every SDXL checkpoint as SD1.5, which fails at the fourth
@@ -1725,7 +1724,7 @@ pub fn detectFamily(store: weights_mod.WeightStore) !Family {
     if (store.get("input_blocks.0.0.weight") != null) return .sd15;
     if (store.get("model.diffusion_model.blocks.0.attn.wq.weight") != null) return .krea2;
     if (store.get("blocks.0.attn.wq.weight") != null) return .krea2;
-    // Z-Image. ⚠️ Both tensors, which is ComfyUI's own test
+    // Z-Image. Both tensors, which is ComfyUI's own test
     // (`model_detection.py`): `cap_embedder.1.weight` alone is shared with stock
     // Lumina 2 and with OmniGen2, and the `noise_refiner` qk-norm is what says this
     // is the NextDiT shape rather than one of those. The width (3840) is then what
@@ -1737,19 +1736,19 @@ pub fn detectFamily(store: weights_mod.WeightStore) !Family {
         const ref = std.fmt.bufPrint(&b2, "{s}noise_refiner.0.attention.k_norm.weight", .{pfx}) catch continue;
         if (store.get(cap) != null and store.get(ref) != null) return .zimage;
     }
-    // Anima. ⚠️ This is ComfyUI's own test, and it is the LLM ADAPTER, not anything
+    // Anima. This is ComfyUI's own test, and it is the LLM ADAPTER, not anything
     // in the trunk: `model_detection` reaches the Cosmos-Predict2 arm on
     // `blocks.0.mlp.layer1.weight` and then upgrades `"cosmos_predict2"` to
     // `"anima"` purely because `llm_adapter.blocks.0.cross_attn.q_proj.weight`
     // exists. A stock Cosmos-Predict2 checkpoint shares every trunk tensor name with
     // Anima and would load here as Anima, then fail on the adapter's missing
-    // weights — so the adapter is the only sound probe. (Cosmos itself is not
+    // weights, so the adapter is the only sound probe. (Cosmos itself is not
     // supported; `blocks.0.mlp.layer1.weight` without an adapter falls through to
     // `UnknownArchitecture`, which says so.)
     //
-    // ⚠️ The prefix list comes from `componentSpec`, NOT a second literal here. Two
+    // The prefix list comes from `componentSpec`, NOT a second literal here. Two
     // copies is exactly the drift that made `net.`-prefixed Anima report
-    // `UnknownArchitecture` while the resolver would have opened it — a load gap in
+    // `UnknownArchitecture` while the resolver would have opened it, a load gap in
     // the shape of a "this is not an Anima model" error.
     for ((componentSpec(.anima, .denoiser) catch unreachable).prefixes) |pfx| {
         var b1: [96]u8 = undefined;
@@ -1768,30 +1767,26 @@ fn sdConfigs(fam: Family) struct { unet: sd_unet.Config, vae: sd_vae.Config, cli
     };
 }
 
-/// **Whether this family's text encoder can apply per-token prompt weights at all.**
+/// Whether this family's text encoder can apply per-token prompt weights at all.
 ///
-/// ⚠️ **Derived from the ENCODER's own declaration, deliberately not from a list of
-/// architectures.** SD.Next's equivalent is a hardcoded allow-list matched against pipeline
-/// *class names* (`'StableDiffusion' in cls or 'StableCascade' in cls or 'Flux' in cls`), and
-/// the cost of that shape is visible in their own file: Chroma and HiDream sit **commented
-/// out** of it, and Flux2 needs a `'Flux2' not in cls` special case to avoid being caught by
-/// the `Flux` substring. A name-matched list has to be edited for every new pipeline and
-/// silently gives the wrong answer until someone does.
+/// Read from `TextEncoder.supports_prompt_weights` on the encoder actually loaded, never
+/// from a list of architectures, so it cannot disagree with the real capability and any
+/// new encoder must state an answer or fail to compile. The three properties that decide
+/// it are documented on `clip_text.TextEncoder`: a fixed token window, rows the denoiser
+/// cross-attends to 1:1, and an empty-prompt encode of matching shape to interpolate
+/// against.
 ///
-/// Here the answer comes from `TextEncoder.supports_prompt_weights` on the encoder actually
-/// loaded, which cannot disagree with the encoder's real capability and forces a *deliberate*
-/// answer from any new one — omitting the declaration is a compile error, not a default. The
-/// three properties that decide it are documented on `clip_text.TextEncoder`: a fixed token
-/// window, rows the denoiser cross-attends to 1:1, and an empty-prompt encode of the same
-/// shape to interpolate against.
+/// An architecture allow-list is the alternative and it ages badly: SD.Next matches
+/// substrings of pipeline class names, so `Flux` needs a `'Flux2' not in cls` guard and
+/// Chroma and HiDream sit commented out of the list. Such a list has to be edited for
+/// every new pipeline and gives the wrong answer silently until someone does.
 /// Where a family's side components live when the caller did not name one.
 ///
-/// ⚠️ `Options`' own `text_encoder_path` / `vae_path` defaults are **krea2's**, and
-/// they predate there being more than one family. Handing them to another
-/// architecture is exactly the failure the `explicit_*` flags exist to prevent — the
-/// resolver would open krea2's Qwen3-**VL** encoder, look for Z-Image's
-/// `model.embed_tokens.weight` in it and report `ComponentNotInCheckpoint`. So a
-/// defaulted path is chosen per family here, and only an *explicit* one overrides it.
+/// `Options`' own `text_encoder_path` / `vae_path` defaults are krea2's. Handing them to
+/// another architecture is the failure the `explicit_*` flags exist to prevent: the
+/// resolver opens krea2's Qwen3-VL encoder, looks for another family's tensors in it, and
+/// reports `ComponentNotInCheckpoint`. So a defaulted path is chosen per family here, and
+/// only an EXPLICIT one overrides it.
 ///
 /// Both Z-Image paths are what the official ComfyUI template names.
 pub fn defaultComponentPath(fam: Family, comp: Component) []const u8 {
@@ -1801,8 +1796,8 @@ pub fn defaultComponentPath(fam: Family, comp: Component) []const u8 {
             .decoder => "models/vae/ae.safetensors",
             else => "",
         },
-        // ⚠️ No decoder default: Anima's VAE is normally BUNDLED in the denoiser
-        // checkpoint, and a defaulted path that does not exist is not an error — the
+        // No decoder default: Anima's VAE is normally BUNDLED in the denoiser
+        // checkpoint, and a defaulted path that does not exist is not an error, the
         // resolver falls through to the checkpoint's own copy. Naming one here would
         // send it looking at a file that has nothing to do with this family.
         .anima => switch (comp) {
@@ -1814,13 +1809,13 @@ pub fn defaultComponentPath(fam: Family, comp: Component) []const u8 {
 }
 
 /// The sigma-schedule shift a family was trained with, for a caller that did not ask
-/// for one. The SD arm's value is unused — its ladder comes from the betas — and is
+/// for one. The SD arm's value is unused, its ladder comes from the betas, and is
 /// returned only so this is total.
 pub fn defaultShift(fam: Family) f32 {
     return switch (fam) {
         .krea2 => sampler.default_shift,
         .zimage => sampler.schedule_mod.z_image_shift,
-        // ⚠️ Numerically the same 3.0 as Z-Image's, over a bit-identical table — but
+        // Numerically the same 3.0 as Z-Image's, over a bit-identical table, but
         // read from `anima`'s own constant, because the two are the same value for
         // different reasons and a future retrain of either must be able to move
         // independently.
@@ -1832,14 +1827,14 @@ pub fn defaultShift(fam: Family) f32 {
 pub fn supportsPromptWeights(fam: Family) bool {
     return switch (fam) {
         // Z-Image conditions on a Qwen3 hidden state exactly as krea2 does, so it
-        // inherits the same answer from the same encoder type — and for the same
+        // inherits the same answer from the same encoder type, and for the same
         // structural reason, not by analogy.
         .krea2, .zimage => qwen3.TextEncoder.supports_prompt_weights,
-        // ⚠️ **True, where the other Qwen3-conditioned families are false**, and the
+        // True, where the other Qwen3-conditioned families are false, and the
         // difference is structural rather than a judgement call. krea2 and Z-Image
         // weight the *encoder's* tap states, which have no fixed token window to
         // interpolate in. Anima's weights apply to the `llm_adapter`'s output rows,
-        // which are indexed 1:1 by the T5 tokenization — `AnimaTokenizer` keeps the
+        // which are indexed 1:1 by the T5 tokenization, `AnimaTokenizer` keeps the
         // T5 weights and forces the Qwen3 ones to 1.0, so the emphasis has a
         // well-defined home. It is also NOT the CLIP interpolation form: it is a
         // plain per-row multiply (`out * t5xxl_weights`).
@@ -1879,7 +1874,7 @@ pub const Session = struct {
         return self.models;
     }
 
-    /// krea2's model set, asserting the family — every krea2-only path binds this
+    /// krea2's model set, asserting the family, every krea2-only path binds this
     /// once at the top and its body is then unchanged from before the split.
     fn k(self: *Session) *Krea2Models {
         return &self.models.krea2;
@@ -1974,13 +1969,13 @@ pub const Session = struct {
         errdefer if (self.cu_be) |b| b.deinit();
 
         // MEASURED per-component VRAM attribution for the GUI meter: tag device
-        // allocations by pipeline phase (set in generate()). Diffusion-only — the
+        // allocations by pipeline phase (set in generate()). Diffusion-only, the
         // LLM backend leaves this off, so its allocator hot path is untouched.
         if (self.cu_be) |b| b.enableMemTags();
         if (self.gpu_ctx) |c| c.enableMemTags();
 
         // Load all three models once; keep every mapping OPEN so weight pointers
-        // stay valid across images. NO proactive evictWeights anywhere — the
+        // stay valid across images. NO proactive evictWeights anywhere, the
         // encoder/DiT/VAE coexist under the default full-card budget, and a tight
         // budget lets the backend's LRU cache stream the overflow reactively.
         // The denoiser's container decides the architecture, so it is opened first
@@ -2060,7 +2055,7 @@ pub const Session = struct {
                 t1 = std.Io.Clock.real.now(io).nanoseconds;
 
                 try note(progress, "loading text encoder...\n", .{});
-                // The same Qwen2 BPE vocabulary krea2 uses — Z-Image's ComfyUI
+                // The same Qwen2 BPE vocabulary krea2 uses, Z-Image's ComfyUI
                 // tokenizer is `Qwen2Tokenizer` over the qwen2.5 vocab.
                 m.tok = try tokenizer_mod.Tokenizer.init(gpa);
                 errdefer m.tok.deinit();
@@ -2107,11 +2102,11 @@ pub const Session = struct {
                 t1 = std.Io.Clock.real.now(io).nanoseconds;
 
                 try note(progress, "loading text encoder...\n", .{});
-                // ⚠️ TWO tokenizers, because Anima tokenizes every prompt twice: the
+                // TWO tokenizers, because Anima tokenizes every prompt twice: the
                 // Qwen2 BPE for the encoder branch (the same vocabulary krea2 and
                 // Z-Image use) and SentencePiece Unigram for the `llm_adapter`'s own
                 // T5-vocabulary embedding. Neither is optional and they are not
-                // interchangeable — see `models/anima.zig`.
+                // interchangeable, see `models/anima.zig`.
                 m.tok = try tokenizer_mod.Tokenizer.init(gpa);
                 errdefer m.tok.deinit();
                 m.t5 = try t5_tokenizer.Tokenizer.init(gpa);
@@ -2126,7 +2121,7 @@ pub const Session = struct {
                 errdefer m.enc.deinit();
 
                 // The VAE is normally BUNDLED in the primary checkpoint here, so a
-                // defaulted side path that does not exist is not an error — the
+                // defaulted side path that does not exist is not an error, the
                 // resolver falls through to the checkpoint's own copy.
                 const vae_path = if (opts.explicit_vae) opts.vae_path else defaultComponentPath(fam, .decoder);
                 m.vae_st = try openIfGiven(gpa, io, vae_path, opts.explicit_vae);
@@ -2175,7 +2170,7 @@ pub const Session = struct {
                 m.clip = try clip_text.TextEncoder.load(gpa, clip_r.store, cfgs.clip, "");
                 errdefer m.clip.deinit();
 
-                // SDXL's second tower. It resolves independently — `--text-encoder`
+                // SDXL's second tower. It resolves independently, `--text-encoder`
                 // overrides the *first* one, and a checkpoint carrying only CLIP-L is a
                 // real (if unusual) split, so this gets its own resolution rather than
                 // assuming both towers live wherever the first was found.
@@ -2211,15 +2206,15 @@ pub const Session = struct {
         }
 
         // Async weight streaming via a BOUNDED pinned staging ring (4×128 MB =
-        // 512 MB), NOT registerHost — we deliberately do NOT page-lock the ~12 GB
+        // 512 MB), NOT registerHost, we deliberately do NOT page-lock the ~12 GB
         // checkpoints (that filled RAM and stalled the box). Weights are read from
-        // the page-cache-backed mmap (cold→disk, warm→RAM, always reclaimable) and
+        // the page-cache-backed mmap (cold->disk, warm->RAM, always reclaimable) and
         // DMA'd off the main thread, so dit_cuda's block-N+1-ahead prefetch
         // overlaps block-N compute instead of a synchronous pageable copy per
         // weight on first touch. Bounded by the existing pin_budget/eviction, so a
         // tight --vram-budget still streams within VRAM bounds. Isolated
-        // (cuda-stream-test, DiT-only): cold-load 10.1s→2.4s (cold disk) /
-        // 2.8s→2.2s (warm), bit-identical, MemAvailable dropped only ~2 GB.
+        // (cuda-stream-test, DiT-only): cold-load 10.1s->2.4s (cold disk) /
+        // 2.8s->2.2s (warm), bit-identical, MemAvailable dropped only ~2 GB.
         if (self.cu_be) |b| {
             b.enableAsyncStreaming(io);
             // Feed the staging ring from the checkpoint FILE rather than its
@@ -2243,13 +2238,12 @@ pub const Session = struct {
                 else => {},
             }
         }
-        // ⚠️ `t1` is taken AFTER the denoiser and `t2` after the encoder + VAE — in
+        // `t1` is taken AFTER the denoiser and `t2` after the encoder + VAE, in
         // every one of the five arms above, which all load the denoiser first. This
-        // line used to read them the other way round ("encoder …, dit+vae …"), so a
-        // slow denoiser load was reported as a slow *encoder* load: the W4A8 arm's
-        // 2.0 s of read-and-decode showed up as `encoder 2.0s, dit+vae 0.3s` and read
-        // as the encoder being the expensive half. Same class of mistake as a
-        // mislabelled profiler bucket — the numbers were right and the names were not.
+        // labels must match that order. Reading them the other way round reports a slow
+        // denoiser load as a slow ENCODER load: a W4A8 arm's 2.0 s of read-and-decode
+        // shows up as `encoder 2.0s, dit+vae 0.3s`. Same class of mistake as a
+        // mislabelled profiler bucket, the numbers were right and the names were not.
         try note(progress, "models loaded (denoiser {d:.1}s, encoder+vae {d:.1}s)\n", .{
             @as(f64, @floatFromInt(t1 - t0)) / 1e9, @as(f64, @floatFromInt(t2 - t1)) / 1e9,
         });
@@ -2260,7 +2254,7 @@ pub const Session = struct {
     /// Swap the DiT for one loaded from `store`, keeping the tokenizer, text
     /// encoder, VAE and backend exactly as they are.
     ///
-    /// For sweeps that vary only the diffusion weights — the level-2 per-tensor
+    /// For sweeps that vary only the diffusion weights, the level-2 per-tensor
     /// attribution arm this was added for substitutes ONE tensor via
     /// `weights.Overlay` and re-measures, once per layer. Reloading a whole
     /// `Session` per point would re-load the text encoder and VAE (tens of seconds
@@ -2275,17 +2269,16 @@ pub const Session = struct {
     /// The new DiT is loaded *before* the old one is freed, so a failed load leaves
     /// the session intact and usable.
     pub fn replaceDenoiser(self: *Session, store: weights_mod.WeightStore) !void {
-        // ⚠️ Device weight caches are keyed by HOST POINTER, so they must be dropped
+        // Device weight caches are keyed by HOST POINTER, so they must be dropped
         // whatever the family: the outgoing denoiser's arena is about to be freed,
         // and a later allocation reusing one of those addresses for a different
         // tensor would score a stale cache hit and compute with the wrong weights.
         // Cheap next to a reload, and the next forward re-uploads what fits.
         //
-        // This used to sit after an early return for the SD family, which was
-        // harmless only while SD was CPU-only. Once it had GPU paths the omission
-        // made a per-tensor patch a **silent no-op** — the host UNet held the
-        // patched weight, the device served the cached original — reported as a
-        // velocity identical to the reference (cos 1.0) rather than as an error.
+        // This must run for EVERY family. Skipping it for one that has GPU paths makes
+        // a per-tensor patch a silent no-op: the host UNet holds the patched weight
+        // while the device serves the cached original, which reports as a velocity
+        // identical to the reference (cos 1.0) rather than as an error.
         if (self.cu_be) |b| {
             b.bindThread();
             b.evictWeights();
@@ -2409,11 +2402,11 @@ pub const Session = struct {
     }
 
     /// Incrementally free resident weights down to `target` bytes (LRU), returning
-    /// the bytes freed. Unlike `trimToBudget` (all-or-nothing — `evictWeights`
+    /// the bytes freed. Unlike `trimToBudget` (all-or-nothing, `evictWeights`
     /// drops the whole cache when over budget), this frees only the excess, so the
     /// rest stays resident and the next image reloads less. This is diffusion's
-    /// live VRAM-yield lever — the analog of the LLM stepper's `offloadToBudget`
-    /// — so the cross-model `vram.Arbiter` can shrink an idle image model to make
+    /// live VRAM-yield lever, the analog of the LLM stepper's `offloadToBudget`
+    /// so the cross-model `vram.Arbiter` can shrink an idle image model to make
     /// room for a growing LLM. Caller ensures no diffusion worker is in flight;
     /// no-op already under `target` or on a non-device backend.
     pub fn giveUpToBudget(self: *Session, target: u64) u64 {
@@ -2435,13 +2428,13 @@ pub const Session = struct {
         // CUDA's "current context" is per-thread, so bind before freeing device
         // memory / destroying the context.
         if (self.cu_be) |b| b.bindThread();
-        // Tear the compute backend down FIRST — before unmapping the checkpoint
+        // Tear the compute backend down FIRST, before unmapping the checkpoint
         // safetensors below. The CUDA backend's prefetch thread streams weights
         // straight from those mmaps and DRAINS its queued requests as it joins
         // (Backend.deinit's contract: "the caller munmaps after Backend.deinit").
         // The old order unmapped first, so when a forward aborted mid-stream
         // (e.g. an OOM under VRAM pressure left a block's prefetches queued) the
-        // still-draining thread read the freed DiT mapping → SIGSEGV during
+        // still-draining thread read the freed DiT mapping -> SIGSEGV during
         // teardown. Stopping the thread first keeps the mappings valid until no
         // one reads them.
         if (self.gpu_ctx) |ctx| {
@@ -2515,30 +2508,30 @@ pub const Session = struct {
     /// Generate one image, reusing the loaded models. Rebuilds only the
     /// per-image state: conditioning, the DiT session/workspace (depend on the
     /// prompt AND resolution), the noise latent, and the schedule.
-    /// This session's **sigma table** — `model_sampling.sigmas`, the thing a scheduler
+    /// This session's sigma table, `model_sampling.sigmas`, the thing a scheduler
     /// reads. krea2's is the shift-parameterized flux formula; the SD family's is the
     /// beta ladder it already caches, borrowed (so this allocates nothing, and the
     /// slice lives as long as the session).
     pub fn sigmaTable(self: *const Session, shift: f32) sampler.SigmaTable {
         return switch (self.models) {
             .krea2 => .{ .flux = shift },
-            // ⚠️ A DIFFERENT flow table, not `.flux` with a converted shift: 1000
+            // A DIFFERENT flow table, not `.flux` with a converted shift: 1000
             // rungs against 10000, and the same formula rounded differently. See
             // `schedule.discreteFlowSigma`.
             .zimage => .{ .discrete_flow = shift },
-            // ⚠️ The SAME table as Z-Image's, bit for bit: both are
+            // The SAME table as Z-Image's, bit for bit: both are
             // `ModelSamplingDiscreteFlow` at multiplier 1.0. What differs is the
-            // argument the DiT is then conditioned on — see `predictAnima`.
+            // argument the DiT is then conditioned on, see `predictAnima`.
             .anima => .{ .discrete_flow = shift },
             .sd15, .sdxl => |*m| .{ .discrete = m.sigma_ladder },
         };
     }
 
     /// The sigma schedule this session's family samples with, descending and ending at
-    /// 0 — using each family's **default** scheduler, which is the behaviour that
+    /// 0, using each family's default scheduler, which is the behaviour that
     /// predates schedulers being selectable (`simple` for krea2, `normal` for SD).
     /// krea2 reads `shift`; SD1.5 ignores it (its ladder comes from the training betas),
-    /// which is why this is a method rather than the free `pipeline.schedule` — a caller
+    /// which is why this is a method rather than the free `pipeline.schedule`, a caller
     /// that cannot see the family cannot pick.
     pub fn schedule(self: *const Session, gpa: std.mem.Allocator, steps: usize, shift: f32) ![]f32 {
         return self.scheduleWith(gpa, steps, shift, null);
@@ -2546,9 +2539,9 @@ pub const Session = struct {
 
     /// `schedule` with an explicit scheduler; null means the family default.
     ///
-    /// ⚠️ **The result is not always `steps + 1` long.** `ddim_uniform` strides the sigma
+    /// The result is not always `steps + 1` long. `ddim_uniform` strides the sigma
     /// table and `beta` de-duplicates repeated rungs, so 30 requested steps can come
-    /// back as 31 or fewer. Drive a sampling loop off `sigmas.len - 1` — `generate`
+    /// back as 31 or fewer. Drive a sampling loop off `sigmas.len - 1`, `generate`
     /// does, and hardcoding `opts.steps` instead would read one past the end.
     pub fn scheduleWith(
         self: *const Session,
@@ -2564,9 +2557,9 @@ pub const Session = struct {
     /// The shift this session's sigma table should use, honouring an explicit
     /// request and otherwise taking the family's own trained value.
     ///
-    /// ⚠️ Z-Image's is **3.0** (`supported_models.py::ZImage.sampling_settings`, and
+    /// Z-Image's is 3.0 (`supported_models.py::ZImage.sampling_settings`, and
     /// the official ComfyUI template sets it again explicitly through a
-    /// `ModelSamplingAuraFlow` node). Rendering it on krea2's 1.15 is not an error —
+    /// `ModelSamplingAuraFlow` node). Rendering it on krea2's 1.15 is not an error,
     /// it is a valid schedule that puts the steps in the wrong places, which at 8
     /// steps is the difference between a finished image and a smeared one.
     pub fn resolvedShift(self: *const Session, opts: Options) f32 {
@@ -2574,11 +2567,11 @@ pub const Session = struct {
         return defaultShift(self.family());
     }
 
-    /// Scale a freshly drawn unit-normal latent to `sigmas[0]`, the way **this family**
+    /// Scale a freshly drawn unit-normal latent to `sigmas[0]`, the way this family
     /// starts a trajectory. A method for the same reason `schedule` is one: the two
     /// parameterizations disagree and a caller that cannot see the family cannot pick.
     ///
-    /// krea2 (flow matching) multiplies by `sigma0`, which is exactly 1.0 — a
+    /// krea2 (flow matching) multiplies by `sigma0`, which is exactly 1.0, a
     /// bit-identical no-op. The SD family multiplies by `sqrt(1 + sigma0²)`; see
     /// `sampler.sdScaleInitialNoise` for why that is not the same as `sigma0` and what
     /// getting it wrong costs.
@@ -2588,7 +2581,7 @@ pub const Session = struct {
             // each of them is exactly 1.0 at the top of the schedule (Z-Image's and
             // Anima's `time_snr_shift(3, 1)` is 3/3), so it is a bit-identical no-op.
             .krea2, .zimage, .anima => sampler.scaleInitialNoise(x, sigma0),
-            // ⚠️ Under `--compat a1111` this is the BARE sigma: A1111's
+            // Under `--compat a1111` this is the BARE sigma: A1111's
             // `sgm_noise_multiplier` defaults to False, and its own description of the
             // option ("match initial noise to official SDXL implementation - only useful
             // for reproducing images") is an admission that its default is the odd one
@@ -2600,7 +2593,7 @@ pub const Session = struct {
         }
     }
 
-    /// The half-logSNR parameterization this family's denoiser is trained in — what a
+    /// The half-logSNR parameterization this family's denoiser is trained in, what a
     /// higher-order sampler needs and Euler does not. A method for the same reason
     /// `schedule` is one, and the failure mode is worse: `flow` on an SD ladder is
     /// NaN from the first step, `eps` on a krea2 schedule silently integrates the
@@ -2612,14 +2605,14 @@ pub const Session = struct {
         };
     }
 
-    /// Latent channel count for this family — 16 for krea2's Wan VAE, 4 for SD's
+    /// Latent channel count for this family, 16 for krea2's Wan VAE, 4 for SD's
     /// AutoencoderKL. A caller sizing its own latent needs this.
     pub fn latentChannels(self: *const Session) usize {
         return switch (self.models) {
             .krea2 => wan_vae.latent_channels,
             .zimage => zimage.latent_channels,
             // Anima uses krea2's Wan VAE, so it is the same 16-channel latent in the
-            // same normalization — see `latentPreviewInto` and `decodePlanar`.
+            // same normalization, see `latentPreviewInto` and `decodePlanar`.
             .anima => anima.latent_channels,
             .sd15, .sdxl => |*m| m.unet.cfg.channels,
         };
@@ -2633,10 +2626,10 @@ pub const Session = struct {
     pub fn latentPreviewInto(self: *const Session, rgb_out: []u8, z: []const f32, lat_h: usize, lat_w: usize) void {
         switch (self.models) {
             .krea2 => wan_vae.latentPreviewInto(rgb_out, z, lat_h, lat_w),
-            // Also 16 channels, but the Flux matrix and a non-zero bias — a
+            // Also 16 channels, but the Flux matrix and a non-zero bias, a
             // different picture from krea2's Wan matrix, not a shared one.
             .zimage => zimage.latentPreviewInto(rgb_out, z, lat_h, lat_w),
-            // ⚠️ krea2's Wan matrix, NOT Z-Image's Flux one, even though both are
+            // krea2's Wan matrix, NOT Z-Image's Flux one, even though both are
             // 16-channel: Anima's `latent_format` is `Wan21`. The wrong matrix is not
             // a crash, just a preview with plausible structure and wrong colours.
             .anima => wan_vae.latentPreviewInto(rgb_out, z, lat_h, lat_w),
@@ -2645,7 +2638,7 @@ pub const Session = struct {
         }
     }
 
-    /// Stage 1 — text → conditioning, on the resident encoder. Caller frees the
+    /// Stage 1, text -> conditioning, on the resident encoder. Caller frees the
     /// returned `Cond`. Device allocations are tagged `.te` for the VRAM meter.
     pub fn encode(self: *Session, gpa: std.mem.Allocator, text: []const u8, o: EncodeOptions) !Cond {
         self.setMemTag(.te);
@@ -2660,7 +2653,7 @@ pub const Session = struct {
     /// Resolve A1111 scheduling, deduplicate the resulting prompts by text, and encode
     /// each distinct one.
     ///
-    /// ⚠️ **Deduplication is load-bearing, not an optimization.** `[a|b]` contributes an
+    /// Deduplication is load-bearing, not an optimization. `[a|b]` contributes an
     /// entry for EVERY step (upstream's `collect_steps` does), so a 35-step render yields
     /// 35 schedule entries over 2 distinct texts. Encoding per entry would mean 33
     /// redundant tower forwards and 33 redundant device sessions.
@@ -2694,16 +2687,16 @@ pub const Session = struct {
         return first;
     }
 
-    /// One conditioning for one concrete prompt text — the whole of `encode` before
+    /// One conditioning for one concrete prompt text, the whole of `encode` before
     /// scheduling existed, plus the dialect switch in how the text is tokenized.
     fn encodeText(self: *Session, gpa: std.mem.Allocator, text: []const u8, o: EncodeOptions) !Cond {
         // Weights the loaded encoder cannot honour are WARNED about and the prompt encoded
-        // verbatim — not refused, and not silently dropped. Generic rather than a branch in
+        // verbatim, not refused, and not silently dropped. Generic rather than a branch in
         // the family switch below, because it is a property of the encoder (see
         // `supportsPromptWeights`) and every future family gets it for free. Per-step
         // scheduling is unaffected and works on all of them: `Cond.sched` is family-neutral
         // and this function runs once per resolved text, so krea2 gains something the
-        // ComfyUI dialect cannot express, where `[…]` is literal text.
+        // ComfyUI dialect cannot express, where `[...]` is literal text.
         if (o.prompt_syntax == .a1111 and !supportsPromptWeights(self.family())) {
             if (try weightsWouldBeDropped(gpa, text, o)) std.log.warn(
                 "prompt weights are not applied by this model's text encoder: it has no " ++
@@ -2718,9 +2711,9 @@ pub const Session = struct {
                 var ids: std.ArrayList(u32) = .empty;
                 defer ids.deinit(gpa);
                 try krea2_text.buildIds(&m.tok, gpa, text, &ids);
-                // ⚠️ **Through `runQwen3`, not a private copy of the dispatch.** The
+                // Through `runQwen3`, not a private copy of the dispatch. The
                 // free `encodePrompt` this replaced called `qwen3_cuda.encode`
-                // *unguarded* — and that arm's GEMM reads its weights as fp8, so a bf16
+                // *unguarded*, and that arm's GEMM reads its weights as fp8, so a bf16
                 // krea2 encoder would have been turned into noise rather than refused.
                 // `runQwen3` asks `supportsWeights` first, which is the whole reason it
                 // exists. It also hardcoded `qwen3.tap_count * qwen3.hidden`, the 4B
@@ -2752,12 +2745,12 @@ pub const Session = struct {
                 var ids: std.ArrayList(u32) = .empty;
                 defer ids.deinit(gpa);
                 try zimage_text.buildIds(&m.tok, gpa, text, &ids);
-                // ⚠️ No prefix strip, unlike krea2: Z-Image conditions on the WHOLE
+                // No prefix strip, unlike krea2: Z-Image conditions on the WHOLE
                 // token sequence, chat markers included. See `zimage_text`.
                 const data = try self.runQwen3(gpa, &m.enc, ids.items, o);
                 return .{ .data = data, .seq = ids.items.len };
             },
-            // ⚠️ Anima's conditioning is the `llm_adapter`'s output, not the
+            // Anima's conditioning is the `llm_adapter`'s output, not the
             // encoder's. Three steps, and the middle one is what makes this family
             // different from every other one here: the prompt is tokenized TWICE, by
             // two unrelated tokenizers, and the adapter cross-attends a T5-indexed
@@ -2788,11 +2781,11 @@ pub const Session = struct {
                 const t_ad0 = std.Io.Clock.real.now(self.io);
                 const data = try m.dit.adapter.forward(self.io, gpa, src, n_src, t5_ids, weights, o.cancel);
                 const t_ad = std.Io.Clock.real.now(self.io);
-                // ⚠️ **Where each half of "the encode" actually ran.** Anima's conditioning is
+                // Where each half of "the encode" actually ran. Anima's conditioning is
                 // TWO models: the Qwen3 encoder (device, when the backend supports its
                 // weights) and the `llm_adapter` (host, always). Without this split the log
                 // says "encoded prompt in 1.6s" and a device-resident encoder looks like it
-                // is being ignored — which is exactly how it was reported.
+                // is being ignored, which is exactly how it was reported.
                 std.log.info("[encode] qwen3 {d} tok on {s} {d:.2}s · llm_adapter {d} rows on cpu {d:.2}s", .{
                     q_ids.len,
                     if (self.cu_be != null) "cuda" else if (self.gpu_ctx != null) "vulkan" else "cpu",
@@ -2800,7 +2793,7 @@ pub const Session = struct {
                     @max(t5_ids.len, anima.anima_2b.adapter.min_rows),
                     @as(f64, @floatFromInt(t_ad.nanoseconds - t_ad0.nanoseconds)) / 1e9,
                 });
-                // ⚠️ `seq` is the ADAPTER's row count, which is `max(512, n_t)` — not
+                // `seq` is the ADAPTER's row count, which is `max(512, n_t)`, not
                 // either token count. The pad rows are attended to (see
                 // `Adapter.forward`), so trimming `seq` here would be a different
                 // model rather than a saving.
@@ -2810,12 +2803,12 @@ pub const Session = struct {
     }
 
     /// One Qwen3 encode, dispatched by backend with the CPU forward as the fallback.
-    /// Shared by krea2's `encodePrompt` and Z-Image's arm above — the difference
+    /// Shared by krea2's `encodePrompt` and Z-Image's arm above, the difference
     /// between the two families is the tap list and the template, both of which are
     /// already decided by the time this runs.
     fn runQwen3(self: *Session, gpa: std.mem.Allocator, enc: *const qwen3.TextEncoder, ids: []const u32, o: EncodeOptions) ![]f32 {
         if (self.cu_be) |b| {
-            // ⚠️ Only when the CUDA arm can actually run these weights: its encode
+            // Only when the CUDA arm can actually run these weights: its encode
             // GEMM is `opMatmulFp8` unconditionally, and Z-Image's Qwen3-4B ships
             // bf16, which it would read as fp8 bytes and turn into noise.
             if (qwen3_cuda.supportsWeights(enc)) {
@@ -2852,8 +2845,8 @@ pub const Session = struct {
         defer arena_state.deinit();
         const parts = try prompt_a1111.parseAttention(arena_state.allocator(), text);
         if (o.emphasis == .ignore) {
-            // `EmphasisIgnore`: the syntax is still parsed and stripped — so `(a:1.5)`
-            // conditions on `a`, not on the punctuation — but every weight becomes 1.0.
+            // `EmphasisIgnore`: the syntax is still parsed and stripped, so `(a:1.5)`
+            // conditions on `a`, not on the punctuation, but every weight becomes 1.0.
             for (parts) |*part| if (!part.isBreak()) {
                 part.weight = 1.0;
             };
@@ -2863,32 +2856,32 @@ pub const Session = struct {
 
     /// Whether an A1111 prompt carries a weight that an emphasis-incapable encoder would
     /// leave unapplied. Returns a fact rather than logging or erroring, so the caller decides
-    /// what to do with it — and so a test can assert it without printing to stderr on success
+    /// what to do with it, and so a test can assert it without printing to stderr on success
     /// (any output from a passing test makes the runner print a misleading failure line).
     ///
-    /// ⚠️ **This was `error.PromptSyntaxUnsupportedForFamily`, first blanket and then narrowed
-    /// to weighted prompts, and both were wrong.** The reasoning was the house rule that
-    /// silently dropping weights a caller asked for is this area's recurring failure — but
+    /// This was `error.PromptSyntaxUnsupportedForFamily`, first blanket and then narrowed
+    /// to weighted prompts, and both were wrong. The reasoning was the house rule that
+    /// silently dropping weights a caller asked for is this area's recurring failure, but
     /// refusing is not the only alternative to silence, and it is not what the ecosystem does.
-    /// **Emphasis weighting is a CLIP-only feature everywhere it is implemented**, checked
+    /// Emphasis weighting is a CLIP-only feature everywhere it is implemented, checked
     /// against SD.Next (`dev`; A1111 itself never had to decide, having only ever had CLIP):
     ///
     /// - `processing_prompt.set_prompt` gates the emphasis parser behind an allow-list of
-    ///   `StableDiffusion*` / `StableCascade` / `Flux`; everything else — Qwen-Image, Wan,
-    ///   Lumina, Flux2, and krea2's shape — falls to `prompt_attention = 'fixed'`, i.e. the
+    ///   `StableDiffusion*` / `StableCascade` / `Flux`; everything else, Qwen-Image, Wan,
+    ///   Lumina, Flux2, and krea2's shape, falls to `prompt_attention = 'fixed'`, i.e. the
     ///   raw string reaches the pipeline unparsed. Chroma and HiDream sit *commented out* of
     ///   that list: tried, then disabled.
     /// - SD3 settles it, having both kinds of encoder at once: the CLIP towers go through the
-    ///   weighted provider while the T5 tower is `_get_t5_prompt_embeds(prompt=…)` on the raw
+    ///   weighted provider while the T5 tower is `_get_t5_prompt_embeds(prompt=...)` on the raw
     ///   string, the two then concatenated. Flux is *on* the allow-list and still encodes via
     ///   `pipe.encode_prompt` unweighted ("clip is only used for the pooled embeds").
     ///
     /// So refusing made this engine stricter than any live tool, on a *persistent* setting: a
     /// global choice made for an SDXL render became a hard error on every later krea2 render.
-    /// A warning satisfies the house rule (nothing is silent — SD.Next only `debug_log`s its
+    /// A warning satisfies the house rule (nothing is silent, SD.Next only `debug_log`s its
     /// own fallback) without failing a render nobody else fails.
     ///
-    /// The prompt is then encoded **verbatim rather than stripped**, deliberately: it keeps
+    /// The prompt is then encoded verbatim rather than stripped, deliberately: it keeps
     /// `.comfy` and `.a1111` byte-identical on such a model, and `--emphasis ignore` is the
     /// explicit way to ask for the syntax to be parsed away instead.
     fn weightsWouldBeDropped(gpa: std.mem.Allocator, text: []const u8, o: EncodeOptions) !bool {
@@ -2897,8 +2890,8 @@ pub const Session = struct {
         defer arena_state.deinit();
         const parts = try prompt_a1111.parseAttention(arena_state.allocator(), text);
         for (parts) |part| {
-            // A BREAK is a chunk boundary such a model has no concept of in EITHER dialect —
-            // under `.comfy` the word tokenizes literally too — so it is not worth a word.
+            // A BREAK is a chunk boundary such a model has no concept of in EITHER dialect,
+            // under `.comfy` the word tokenizes literally too, so it is not worth a word.
             if (part.isBreak()) continue;
             if (part.weight != 1.0) return true;
         }
@@ -2919,38 +2912,30 @@ pub const Session = struct {
     /// Run one CLIP tower on the best available backend, falling back to the CPU only
     /// for errors the CPU can actually recover from.
     ///
-    /// ⚠️ **A device FAULT must NOT fall back, and getting this wrong hid a real bug
-    /// behind an error naming the wrong stage.** `CUDA_ERROR_ILLEGAL_ADDRESS` (and a
-    /// Vulkan device loss) is **sticky**: once a kernel faults, every later call in that
-    /// context fails too. The original policy — copied from krea2's `encodePrompt` —
-    /// caught *any* error, logged a warning, re-ran the encode on the CPU (which
-    /// succeeds, needing no device) and returned normally. The render then died at the
-    /// denoiser's first conditioning upload with
-    /// `cuMemcpyHtoD failed: CUDA_ERROR_ILLEGAL_ADDRESS`, three stages downstream of the
-    /// fault, with the actual error demoted to a warning nobody reads. Reported as
-    /// "fails after the TE step", which is exactly where it did *not* fail.
+    /// The fallback is an ALLOW-LIST, not a catch-all:
     ///
-    /// So the fallback is now allow-listed rather than catch-all:
+    /// - `UnsupportedDType`: this tower's weights have no GPU GEMM (a block-quantized
+    ///   text encoder). A real, expected condition, and the CPU is the right answer.
+    /// - `OutOfMemory`: the device reclaim ladder came up short. The context is intact
+    ///   and the CPU path needs no VRAM, so recovering is safe and useful.
+    /// - everything else, `CudaError` above all: propagate.
     ///
-    /// - `UnsupportedDType` — this tower's weights have no GPU GEMM (a block-quantized
-    ///   text encoder). A real, expected condition; the CPU is the right answer.
-    /// - `OutOfMemory` — the device reclaim ladder came up short. The context is intact
-    ///   and the CPU path needs no VRAM, so recovering is both safe and useful.
-    /// - everything else, `CudaError` above all — **propagate**. A poisoned context
-    ///   cannot be recovered by running the next stage anyway, and the error that names
-    ///   the faulting stage is worth far more than a render that limps one stage further.
+    /// A device FAULT must NOT fall back. `CUDA_ERROR_ILLEGAL_ADDRESS`, and a Vulkan
+    /// device loss, are STICKY: once a kernel faults every later call in that context
+    /// fails too. Catching any error, warning, and re-running the encode on the CPU
+    /// succeeds (it needs no device) and then dies at the denoiser's first conditioning
+    /// upload, three stages downstream of the fault, with the real error demoted to a
+    /// warning nobody reads. Never recover from a device fault by running the next stage.
     ///
-    /// ⚠️ **A cancel must propagate too**, or cancelling a render silently restarts the
-    /// encode on the CPU and takes longer than not cancelling.
+    /// A cancel must propagate too, or cancelling a render silently restarts the encode
+    /// on the CPU and takes longer than not cancelling.
     ///
-    /// ⚠️ **The three arms are not numerically equal, and CUDA is the loosest.** Vulkan
-    /// computes the GEMMs in f32 by default (f16 only under `--encoder-f16`), so it
-    /// tracks the CPU forward the ComfyUI fixtures pin to ~1e-6; the CUDA arm has only a
-    /// tensor-core entry point at these widths and lands ~1e-3. That is the regime
-    /// `sd_unet_cuda` already runs the denoiser in, so it is consistent rather than
-    /// newly lossy — but it does mean a `cuda` render and a `cpu` render of the same seed
-    /// differ slightly, which is worth knowing before attributing such a difference to
-    /// something else.
+    /// The three arms are not numerically equal and CUDA is the loosest: Vulkan computes
+    /// the GEMMs in f32 by default (f16 only under `--encoder-f16`) and tracks the CPU
+    /// forward to ~1e-6, while the CUDA arm has only a tensor-core entry point at these
+    /// widths and lands ~1e-3. That is the regime `sd_unet_cuda` runs the denoiser in, so
+    /// it is consistent rather than newly lossy, but a `cuda` render and a `cpu` render
+    /// of one seed do differ slightly.
     fn runClip(
         self: *Session,
         gpa: std.mem.Allocator,
@@ -2994,13 +2979,13 @@ pub const Session = struct {
     /// produces a plausible image if got wrong (see `clip_tokenizer.encodePadded` and
     /// `clip_text.Config.Naming`):
     ///
-    /// 1. **The penultimate hidden state, with the final LayerNorm SKIPPED.** Both towers,
+    /// 1. The penultimate hidden state, with the final LayerNorm SKIPPED. Both towers,
     ///    not just one. Using the final state instead is the "clip skip 1 vs 2" difference
     ///    and shifts style across the whole image.
-    /// 2. **CLIP-L is padded with EOS and CLIP-G with 0**, so the prompt is tokenized
+    /// 2. CLIP-L is padded with EOS and CLIP-G with 0, so the prompt is tokenized
     ///    twice. The padded slots are conditioning too.
-    /// 3. **Pooled comes from CLIP-G only**, from its *final-LayerNormed* last hidden state
-    ///    at the first EOS, then through `text_projection` — a different tensor than
+    /// 3. Pooled comes from CLIP-G only, from its *final-LayerNormed* last hidden state
+    ///    at the first EOS, then through `text_projection`, a different tensor than
     ///    either half of the concatenated context.
     fn encodeSdxl(self: *Session, gpa: std.mem.Allocator, m: *SdModels, o: EncodeOptions, text: []const u8) !Cond {
         const g = &m.clip_g.?;
@@ -3010,7 +2995,7 @@ pub const Session = struct {
 
         // Tokenized twice: same ids, different padding (convention 2 above). The chunk
         // split is length-driven and the two differ only in padding, so the counts always
-        // agree — `min` is ComfyUI's own defensive form, not a case that arises here.
+        // agree, `min` is ComfyUI's own defensive form, not a case that arises here.
         var pl = try self.tokenizePrompt(gpa, &m.tok, text, clip_tok.eos_id, o);
         defer pl.deinit(gpa);
         var pg = try self.tokenizePrompt(gpa, &m.tok, text, 0, o);
@@ -3023,7 +3008,7 @@ pub const Session = struct {
         const cap_l = try gpa.alloc(f32, pl.seq() * hl);
         defer gpa.free(cap_l);
         // `layers - 1` is "after encoder layer layers-2", i.e. the reference's
-        // `hidden_states[-2]` — one short of the last block, before the final norm.
+        // `hidden_states[-2]`, one short of the last block, before the final norm.
         try self.runClip(gpa, &m.clip, cap_l, &pl, .{
             .mode = weightMode(o),
             .empty_cache = &m.empty_ref,
@@ -3050,7 +3035,7 @@ pub const Session = struct {
             @memcpy(data[p * (hl + hg) + hl ..][0..hg], cap_g[p * hg ..][0..hg]);
         }
 
-        // ⚠️ Pooled comes from CHUNK 0 only, and is never weighted. It is one vector for
+        // Pooled comes from CHUNK 0 only, and is never weighted. It is one vector for
         // the whole prompt, so there is nothing to concatenate; taking it from the last
         // chunk instead would condition `y` on the quality tags alone.
         const pooled = try gpa.alloc(f32, hg);
@@ -3063,7 +3048,7 @@ pub const Session = struct {
         return .{ .data = data, .seq = seq, .pooled = pooled };
     }
 
-    /// Stage 2 — build the per-image denoiser (see `Denoiser`). `cond_neg` and a
+    /// Stage 2, build the per-image denoiser (see `Denoiser`). `cond_neg` and a
     /// `cfg` other than 1.0 go together: pass both for classifier-free guidance,
     /// neither for a single forward per step. `sigmas` is the whole schedule (the
     /// Vulkan backend precomputes a timestep vector per entry).
@@ -3091,7 +3076,7 @@ pub const Session = struct {
         errdefer d.deinit(gpa);
 
         // The SD family needs the input-scaling scratch and a UNet workspace, both
-        // per resolution — plus SDXL's `y`, which is per resolution too. On Vulkan
+        // per resolution, plus SDXL's `y`, which is per resolution too. On Vulkan
         // the workspace is device-side and there is one session per conditioning
         // branch; on the CPU it is the host `sd_unet.Workspace`.
         if (self.sd()) |m| {
@@ -3099,7 +3084,7 @@ pub const Session = struct {
             if (use_cfg) d.v_neg = try gpa.alloc(f32, n);
             d.sd_scaled = try gpa.alloc(f32, n);
             d.sd_eps = try gpa.alloc(f32, n);
-            // ⚠️ **The cap is over EVERY scheduled entry, not just entry 0.** A prompt
+            // The cap is over EVERY scheduled entry, not just entry 0. A prompt
             // whose variants tokenize to different chunk counts (`[a:a very long tail
             // that spills past 77 tokens:0.5]`) would otherwise size the shared
             // workspace for the wrong one, and cross-attention writes `ctx_seq` rows
@@ -3127,12 +3112,12 @@ pub const Session = struct {
                     const arr = if (side == 0) d.sd_pos else d.sd_neg;
                     for (arr, 0..) |*br, i| {
                         const ce = c.entry(i);
-                        // ⚠️ `y` first: a session folds the label embedding into its
+                        // `y` first: a session folds the label embedding into its
                         // per-forward biases and therefore needs the micro-conditioning
                         // already built.
                         //
                         // The micro-conditioning is `original == target == this image, no
-                        // crop` — what ComfyUI and diffusers both default to, and not a
+                        // crop`, what ComfyUI and diffusers both default to, and not a
                         // free choice: SDXL learned to associate small declared originals
                         // with low-quality training crops, so declaring anything smaller
                         // than the render asks the model for a worse image.
@@ -3166,7 +3151,7 @@ pub const Session = struct {
         if (self.family() == .zimage) {
             const m = self.zi();
             if (use_cfg) d.v_neg = try gpa.alloc(f32, zimage.latent_channels * lat_h * lat_w);
-            // ⚠️ Both branches must pad to the SAME caption length, or the image
+            // Both branches must pad to the SAME caption length, or the image
             // half's RoPE positions (which start at `cap_padded + 1`) would differ
             // between the two CFG passes and the guidance would mix two different
             // geometries. The pad multiple makes that automatic only when the two
@@ -3178,7 +3163,7 @@ pub const Session = struct {
                 d.zi_cap_neg = try m.dit.capTokens(self.io, gpa, cn.data, cn.seq);
             }
 
-            // ⚠️ **Vulkan only** — there is no CUDA Z-Image forward yet, and that case
+            // Vulkan only, there is no CUDA Z-Image forward yet, and that case
             // says so rather than being quietly 100x slow: a silent CPU trunk under
             // `--backend cuda` reads as a hang, not as a fallback.
             if (self.gpu_ctx) |gc| {
@@ -3214,7 +3199,7 @@ pub const Session = struct {
         if (use_cfg) d.v_neg = try gpa.alloc(f32, wan_vae.latent_channels * lat_h * lat_w);
 
         // The per-image device buffers (session + activation workspace) are the
-        // meter's "latent / working" segment — tagged so it is MEASURED rather
+        // meter's "latent / working" segment, tagged so it is MEASURED rather
         // than left as a remainder. Restored to `.dit` on the way out, since what
         // follows is the sampling loop's lazily streamed weights and attention
         // scratch.
@@ -3224,21 +3209,21 @@ pub const Session = struct {
         if (self.family() == .anima) {
             if (use_cfg) d.v_neg = try gpa.alloc(f32, anima.latent_channels * lat_h * lat_w);
             const dit = &self.models.anima.dit;
-            // ⚠️ Both device arms precompute cross-attention's K and V for every block
-            // here, from `cond` — they are per-IMAGE constants, so a session is bound to
+            // Both device arms precompute cross-attention's K and V for every block
+            // here, from `cond`, they are per-IMAGE constants, so a session is bound to
             // one conditioning and CFG needs two of them, exactly as Z-Image's is.
             const t_sess0 = std.Io.Clock.real.now(self.io);
             defer {
                 const dt = @as(f64, @floatFromInt(std.Io.Clock.real.now(self.io).nanoseconds - t_sess0.nanoseconds)) / 1e9;
-                // ⚠️ **This is the "slow to start" cost.** Both device arms precompute
-                // cross-attention's K/V for all 28 blocks on the HOST, per conditioning —
+                // This is the "slow to start" cost. Both device arms precompute
+                // cross-attention's K/V for all 28 blocks on the HOST, per conditioning,
                 // 28 x 2 GEMMs of [512, 2048] x [2048, 1024] = ~120 GFLOP each, doubled
                 // under CFG. Cheap as a share of a STEP (0.56%) and expensive as a
                 // one-off before the first step, which is a distinction the earlier
                 // per-step framing hid.
                 if (dt > 0.05) std.log.info("[anima] per-image device session built in {d:.2}s", .{dt});
             }
-            // ⚠️ ONE folded modulation schedule, shared by both branches: it depends on the
+            // ONE folded modulation schedule, shared by both branches: it depends on the
             // sigma alone, so building it per session did the whole thing twice per image
             // (measured 0.51 s + 0.29 s of a 1.11 s setup).
             if (self.cu_be != null or self.gpu_ctx != null) {
@@ -3288,7 +3273,7 @@ pub const Session = struct {
 
     /// One denoiser forward, self-contained: `v_out = model(latent, sigma, cond)`.
     ///
-    /// This is level 2's primitive (plan §7) — a fixed latent, sigma and
+    /// This is level 2's primitive (plan §7), a fixed latent, sigma and
     /// conditioning through the model once, with no sampler and therefore no
     /// trajectory to drift. It builds and tears down a `Denoiser` per call, which
     /// is free on CPU and wasteful on a GPU backend; for many forwards at one
@@ -3308,8 +3293,8 @@ pub const Session = struct {
         try d.predict(gpa, v_out, latent, sigma, null);
     }
 
-    /// Stage 3 — latent → pixels on the resident VAE: denormalize, then decode
-    /// through the adaptive whole-image → GPU-tiled → CPU-tiled ladder (see
+    /// Stage 3, latent -> pixels on the resident VAE: denormalize, then decode
+    /// through the adaptive whole-image -> GPU-tiled -> CPU-tiled ladder (see
     /// `VaeDecode`), then interleave to RGB8. `latent` is `[16][lat_h][lat_w]`
     /// planar and is NOT modified. The image comes back at `lat_w*8 x lat_h*8`.
     pub fn decode(
@@ -3323,27 +3308,26 @@ pub const Session = struct {
         const gpa = self.gpa;
         const io = self.io;
 
-        // The SD family differs from krea2 only in its normalization — its
+        // The SD family differs from krea2 only in its normalization, its
         // AutoencoderKL takes `z / scaling_factor`, where Wan's is per-channel
-        // (mean, std) — and in which decoder the ladder below drives. Both arms
-        // end up in `decodePlanar`, so the whole-image → reclaim → GPU-tiled →
+        // (mean, std), and in which decoder the ladder below drives. Both arms
+        // end up in `decodePlanar`, so the whole-image -> reclaim -> GPU-tiled ->
         // CPU-tiled recovery is shared.
         //
-        // ⚠️ It was NOT shared until 2026-08-03, and that hard-failed every render
-        // whose SD VAE decode did not fit: at 1024x1536 the decoder wants 3 x 1.5 GiB
-        // of activations, and with a resident LLM or another process on the card
-        // that surfaces either as `DeviceOutOfMemory` or — once the OOM ladder has
-        // freed memory an in-flight kernel still referenced — as a post-OOM stream
-        // fault reported at the next `cuMemcpyHtoD` (`CUDA_ERROR_ILLEGAL_ADDRESS`,
-        // i.e. `error.CudaError`). `recoverableDecodeErr` already names that exact
-        // case; the SD path just returned before ever reaching it.
+        // Keep the SD arm inside the ladder. At 1024x1536 the decoder wants 3 x 1.5 GiB
+        // of activations, so with a resident LLM or another process on the card it will
+        // not fit, and returning early instead surfaces either as `DeviceOutOfMemory`
+        // or, once the OOM ladder has freed memory an in-flight kernel still referenced,
+        // as a post-OOM stream fault at the next `cuMemcpyHtoD`
+        // (`CUDA_ERROR_ILLEGAL_ADDRESS`, i.e. `error.CudaError`).
+        // `recoverableDecodeErr` names that exact case.
         if (self.sd()) |m| {
             const ch = m.unet.cfg.channels;
             if (latent.len != ch * lat_h * lat_w) return error.LatentSizeMismatch;
             self.setMemTag(.vae);
             // Denormalize onto a copy: `decode` must not modify the caller's latent
             // (a caller holding it for a drift curve would otherwise have it
-            // silently rescaled — there is a test for it).
+            // silently rescaled, there is a test for it).
             const x = try gpa.dupe(f32, latent);
             defer gpa.free(x);
             const inv = 1.0 / m.vae.cfg.scaling_factor;
@@ -3367,7 +3351,7 @@ pub const Session = struct {
             if (latent.len != zimage.latent_channels * lat_h * lat_w) return error.LatentSizeMismatch;
             self.setMemTag(.vae);
             // Denormalize onto a copy (`decode` must not modify the caller's latent).
-            // ⚠️ `latent_formats.Flux.process_out` is `z / scale + SHIFT` — the shift
+            // `latent_formats.Flux.process_out` is `z / scale + SHIFT`, the shift
             // term has no SD analogue, and dropping it decodes a latent offset by
             // 0.116, which is a plausible image with a colour cast rather than an error.
             const x = try gpa.dupe(f32, latent);
@@ -3390,10 +3374,10 @@ pub const Session = struct {
 
         if (latent.len != wan_vae.latent_channels * lat_h * lat_w) return error.LatentSizeMismatch;
 
-        // ⚠️ Anima shares this whole arm with krea2, and that is a fact about the
+        // Anima shares this whole arm with krea2, and that is a fact about the
         // checkpoints rather than a convenience: its bundled `first_stage_model.*` is
-        // byte-for-byte `qwen_image_vae.safetensors`, which is shape-for-shape krea2's
-        // Wan 2.1 decoder, and its `latent_format` is `Wan21` — the same
+        // byte-for-byte the stock Qwen-Image VAE, which is shape-for-shape krea2's
+        // Wan 2.1 decoder, and its `latent_format` is `Wan21`, the same
         // `latents_mean`/`latents_std` this denormalization applies. Only the model
         // pointer differs.
         const wan: *const wan_vae.Decoder = switch (self.models) {
@@ -3403,7 +3387,7 @@ pub const Session = struct {
         };
 
         // Device allocations here (VAE weights + decode scratch) are tagged VAE.
-        // NO evictWeights — the DiT stays resident for the next queued image;
+        // NO evictWeights, the DiT stays resident for the next queued image;
         // under a tight budget the backend's LRU cache streams the overflow
         // reactively.
         self.setMemTag(.vae);
@@ -3433,11 +3417,11 @@ pub const Session = struct {
     }
 
     /// Decode an already-denormalized planar `[c][lat_h][lat_w]` latent to planar
-    /// `[3][8·lat_h][8·lat_w]` pixels, through the adaptive ladder: whole-image
-    /// (fastest, seamless) → free VRAM and retry → GPU tiling (bounded footprint)
-    /// → CPU tiling (the floor that cannot OOM). `v` is the family's adapter
+    /// `[3][8*lat_h][8*lat_w]` pixels, through the adaptive ladder: whole-image
+    /// (fastest, seamless) -> free VRAM and retry -> GPU tiling (bounded footprint)
+    /// -> CPU tiling (the floor that cannot OOM). `v` is the family's adapter
     /// (`KreaVae` / `SdVae`), which supplies the per-backend tile context, the
-    /// peak-VRAM estimate and the tile geometry — a whole-image decode is just a
+    /// peak-VRAM estimate and the tile geometry, a whole-image decode is just a
     /// single tile covering the whole latent, so nothing else here is
     /// family-specific. Caller frees the result.
     fn decodePlanar(
@@ -3451,8 +3435,8 @@ pub const Session = struct {
     ) ![]f32 {
         const gpa = self.gpa;
         const io = self.io;
-        // The whole-image decode is fastest and seamless, but its peak VRAM — in
-        // particular the O(seq²) mid-block attention scores plane — grows with
+        // The whole-image decode is fastest and seamless, but its peak VRAM, in
+        // particular the O(seq²) mid-block attention scores plane, grows with
         // image area and OOMs on large images. When it won't fit we decode in
         // overlapping tiles (bounded footprint, feather-blended seams) on the GPU
         // rather than crawling on the CPU; only if even a tile can't fit do we
@@ -3460,7 +3444,7 @@ pub const Session = struct {
         const tp = @TypeOf(v).tiling;
         // Decode-path override (o.vae_decode). `force_cpu` short-circuits every
         // backend to CPU tiling; `skip_whole` starts at GPU tiling (no whole-image
-        // attempt). `auto`/`whole` leave both false — whole-image is already the
+        // attempt). `auto`/`whole` leave both false, whole-image is already the
         // first attempt, so the two behave identically.
         const force_cpu = o.vae_decode == .cpu_tiled;
         const skip_whole = o.vae_decode == .gpu_tiled or o.vae_decode == .cpu_tiled;
@@ -3475,11 +3459,11 @@ pub const Session = struct {
         if (self.cu_be) |b| {
             const wt = v.cudaCtx(b, o.cancel);
             const Whole = @TypeOf(wt);
-            // Attempt ladder — whole-image (fastest, seamless) → GPU tiling
-            // (bounded footprint) → CPU (guaranteed). Before EACH GPU retry free
+            // Attempt ladder, whole-image (fastest, seamless) -> GPU tiling
+            // (bounded footprint) -> CPU (guaranteed). Before EACH GPU retry free
             // JUST ENOUGH VRAM and try again, keeping the rest resident so we
             // reload as little as possible: drop LRU weights from THIS backend's
-            // own cache first (the denoiser — dead for the rest of this image,
+            // own cache first (the denoiser, dead for the rest of this image,
             // re-streams next image), and only when that can't cover the deficit
             // reach into the chat LLM's context. The freed amount escalates so a
             // big deficit converges in a few retries. OOM can arrive as
@@ -3511,13 +3495,13 @@ pub const Session = struct {
                 }
             }.call;
             // PROACTIVE pre-free: estimate the first attempt's peak activation VRAM
-            // and free up front so we hit free ≥ 110% of it — avoids burning full
+            // and free up front so we hit free ≥ 110% of it, avoids burning full
             // failed decodes just to discover the deficit (the reactive loops below
             // still catch any shortfall, since the estimate can't see the opaque
             // cuBLASLt/cuDNN conv workspace). Tiled decode's first attempt is one
             // tile, so estimate at the tile size when skip_whole.
             {
-                // CUDA never materializes the mid-block scores plane — cuDNN's
+                // CUDA never materializes the mid-block scores plane, cuDNN's
                 // fused SDPA under `.libs`, `be.attn`'s online softmax otherwise.
                 const est = if (skip_whole) v.estimate(tp.tile, tp.tile, false) else v.estimate(lat_h, lat_w, false);
                 const target = est + est / 10; // 110%
@@ -3532,11 +3516,11 @@ pub const Session = struct {
                     if (Whole.call(wt, gpa, io, x, lat_h, lat_w)) |p| {
                         return p;
                     } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: whole-image OOM ({t}) → freeing VRAM\n", .{err});
-                    if (try freeSome(b, o.reclaim, progress, io, want) == 0) break; // nothing left → tile
+                    if (try freeSome(b, o.reclaim, progress, io, want) == 0) break; // nothing left -> tile
                     want *|= 2;
                 }
             }
-            // Phase 2: GPU tiling (bounded) with the same incremental eviction —
+            // Phase 2: GPU tiling (bounded) with the same incremental eviction,
             // after the denoiser is evicted a tile easily fits, and it's far faster
             // than the CPU floor below.
             {
@@ -3546,11 +3530,11 @@ pub const Session = struct {
                     if (vae_tiled.decode(gpa, io, x, lat_h, lat_w, tp, wt, Whole.call)) |p| {
                         return p;
                     } else |err| if (!recoverableDecodeErr(err)) return err else try note(progress, "vae decode: GPU tiling {s} ({t}) → freeing VRAM\n", .{ decodeStepReason(err), err });
-                    if (try freeSome(b, o.reclaim, progress, io, want) == 0) break; // nothing left → CPU
+                    if (try freeSome(b, o.reclaim, progress, io, want) == 0) break; // nothing left -> CPU
                     want *|= 2;
                 }
             }
-            // Phase 3: CPU tiling — the guaranteed VRAM-can't-OOM floor (slow).
+            // Phase 3: CPU tiling, the guaranteed VRAM-can't-OOM floor (slow).
             try note(progress, "vae decode: GPU out of VRAM → CPU tiled decode (slow)\n", .{});
             const saved = ops.matmul.gpu_dispatch;
             ops.matmul.gpu_dispatch = null;
@@ -3599,7 +3583,7 @@ pub const Session = struct {
                     };
                     const ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0)) / 1e6;
                     try note(progress, "vae decode: freed {d}MB (own {d}MB + llm {d}MB) of {d}MB wanted in {d:.0}ms\n", .{ got >> 20, from_self >> 20, (got - from_self) >> 20, want >> 20, ms });
-                    if (got == 0) break; // nothing left to free → tile
+                    if (got == 0) break; // nothing left to free -> tile
                     want *|= 2; // escalate so a big deficit converges fast
                 }
             }
@@ -3620,11 +3604,11 @@ pub const Session = struct {
                     };
                     const ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0)) / 1e6;
                     try note(progress, "vae decode: freed {d}MB (own {d}MB + llm {d}MB) for tiling in {d:.0}ms\n", .{ got >> 20, from_self >> 20, (got - from_self) >> 20, ms });
-                    if (got == 0) break; // nothing left → CPU
+                    if (got == 0) break; // nothing left -> CPU
                     wnt *|= 2;
                 }
             }
-            // Phase 3: CPU tiling — the guaranteed VRAM-can't-OOM floor (slow).
+            // Phase 3: CPU tiling, the guaranteed VRAM-can't-OOM floor (slow).
             try note(progress, "vae decode: falling back to the CPU tier (exact, slow)\n", .{});
             const saved = ops.matmul.gpu_dispatch;
             ops.matmul.gpu_dispatch = null;
@@ -3634,7 +3618,7 @@ pub const Session = struct {
         }
         // CPU-only: tile once the whole-image scores plane (f32) gets large,
         // so a big image doesn't try to allocate tens of GB of host RAM.
-        // (skip_whole — e.g. gpu_tiled with no GPU — forces tiling.)
+        // (skip_whole, e.g. gpu_tiled with no GPU, forces tiling.)
         const ct = v.cpuCtx(io, o.cancel);
         if (!skip_whole and attnPlaneBytes(lat_h, lat_w, 4) < (1 << 30))
             return @TypeOf(ct).call(ct, gpa, io, x, lat_h, lat_w);
@@ -3653,7 +3637,7 @@ pub const Session = struct {
         const lat_w = opts.width / 8;
         // Family-dependent: 16 latent channels for krea2's Wan VAE, 4 for SD's
         // AutoencoderKL. Hardcoding 16 here ran SD's 4-channel UNet correctly for
-        // four steps and then failed in `decode` with `LatentSizeMismatch` — the
+        // four steps and then failed in `decode` with `LatentSizeMismatch`, the
         // sampling loop only ever touches whole latents, so the mismatch surfaced as
         // far from its cause as possible.
         const lat_len = self.latentChannels() * lat_h * lat_w;
@@ -3678,9 +3662,9 @@ pub const Session = struct {
 
         // The sigma schedule is computed HERE, before the text encode, only because an
         // A1111 prompt schedule is indexed by step and so needs the step count up front.
-        // ⚠️ That count is `sigmas.len - 1`, NOT `opts.steps`: `ddim_uniform` strides the
+        // That count is `sigmas.len - 1`, NOT `opts.steps`: `ddim_uniform` strides the
         // sigma table and `beta` de-duplicates rungs, so either can return a different
-        // number than requested. Hoisting is safe — `scheduleWith` is pure and touches no
+        // number than requested. Hoisting is safe, `scheduleWith` is pure and touches no
         // RNG, so the noise draw below is unchanged and the render stays bit-identical.
         const shift = self.resolvedShift(opts);
         const sigmas = try self.scheduleWith(gpa, opts.steps, shift, opts.scheduler);
@@ -3717,19 +3701,19 @@ pub const Session = struct {
         });
         if (n_variants > 1) try note(progress, "prompt schedule: {d} distinct conditionings\n", .{n_variants});
 
-        // Pin the DiT across images (GUI_VRAM.md Phase 4): first-touch pinning
+        // Pin the DiT across images: first-touch pinning
         // during sampling keeps the (large) DiT weights resident so a queued
         // image reuses them instead of re-uploading ~13 GB each time. Sized to the
         // available budget minus a reserve for the encoder (~5 GB, unpinned) +
-        // sampling activations — so it self-limits: a generous budget (image
+        // sampling activations, so it self-limits: a generous budget (image
         // priority) pins the whole DiT; a tight one pins part (rest streams). The
         // encoder above stayed unpinned (pin_budget 0); the VAE (after the DiT
         // fills pin_budget) stays unpinned too.
         if (cu_be) |b| {
             // Pin as much DiT as fits. Two caps: the shared BUDGET (opts.vram_budget,
-            // 0 = no cap; = card limit − LLM resident in the GUI), and — critically
-            // — what is PHYSICALLY reachable right now. The budget is blind to other
-            // processes on the card (desktop, a running ComfyUI, …); if we pin to it
+            // 0 = no cap; = card limit − LLM resident in the GUI), and, critically
+            // what is PHYSICALLY reachable right now. The budget is blind to other
+            // processes on the card (desktop, a running ComfyUI, ...); if we pin to it
             // we OOM the moment physical VRAM runs out, and pinned weights can't be
             // evicted to recover. Physical room = live free VRAM + our own unpinned
             // weights (the text encoder), which evict + re-stream as the DiT pins.
@@ -3739,9 +3723,9 @@ pub const Session = struct {
             const room = free_now + evictable;
             const budget = if (opts.vram_budget > 0) @min(opts.vram_budget, room) else room;
             const pin_reserve: u64 = b.attn_scratch_budget + (512 << 20);
-            // ⚠️ `pin_budget` is a TOTAL cap (`pinNew` tests
+            // `pin_budget` is a TOTAL cap (`pinNew` tests
             // `pinned_bytes + size > pin_budget`), but `room` is what is ADDITIONALLY
-            // reachable — live free VRAM plus our own evictable weights — and so
+            // reachable, live free VRAM plus our own evictable weights, and so
             // excludes whatever is already pinned. Adding the resident total back is
             // what keeps the two in the same units.
             //
@@ -3753,7 +3737,7 @@ pub const Session = struct {
             //
             // Safe to be generous here: `pin_floor` is the physical backstop and is
             // still checked per pin, so a budget larger than live VRAM cannot
-            // over-commit — it only stops the cap from being the binding constraint
+            // over-commit, it only stops the cap from being the binding constraint
             // when it should not be.
             b.pin_budget = b.pinnedWeightBytes() + (budget -| pin_reserve);
             // Same reserve as a LIVE floor for first-touch pinning: pinNew keeps
@@ -3761,9 +3745,9 @@ pub const Session = struct {
             // allocated, per-block) attention scratch + activation workspace need.
             // pin_budget above is blind to the working set not yet allocated at
             // pin time; the floor is the physical backstop that makes streaming
-            // actually fit — the whole point of a tight budget.
+            // actually fit, the whole point of a tight budget.
             b.pin_floor = pin_reserve;
-            // ⚠️ `req` is what the caller ASKED for; `eff` is what physical room
+            // `req` is what the caller ASKED for; `eff` is what physical room
             // allows and what actually governs. Printing only `req` next to a much
             // smaller `pin` reads as a bug ("16 GB budget, pinning 689 MB?") when
             // it is the `@min` above doing its job.
@@ -3776,20 +3760,20 @@ pub const Session = struct {
             // Proactively drop the transient text encoder when it can't stay
             // resident alongside the DiT's working set. It's evictable but nothing
             // forces it out until the DiT's own allocations reactively reclaim it
-            // — which happens DURING step 1, so step 1 pins little (streams around
+            // which happens DURING step 1, so step 1 pins little (streams around
             // the resident encoder) and runs slow; only once it's cleared do later
-            // steps pin properly and speed up (the 11s→3s first-step cliff under a
+            // steps pin properly and speed up (the 11s->3s first-step cliff under a
             // resident LLM). Evicting up front lets step 1 pin from the start. The
             // encode (both CFG passes) is already done, so the encoder has no
             // further use THIS image; on a big card where it all fits we keep it
             // (the next queued image's encode reuses it).
             //
-            // ⚠️ **The test must discount the DiT already on the card, and getting
-            // that wrong made this fire on every queued image.** On the FIRST image
+            // The test must discount the DiT already on the card, and getting
+            // that wrong made this fire on every queued image. On the FIRST image
             // the cache holds only the encoder, so "does dit + reserve fit in free?"
             // is right. On a SUBSEQUENT image the previous DiT is still pinned
-            // (evictUnpinned below deliberately keeps it) — which is *why* free VRAM
-            // is low — so counting the whole DiT again double-counts it against a
+            // (evictUnpinned below deliberately keeps it), which is *why* free VRAM
+            // is low, so counting the whole DiT again double-counts it against a
             // `free_now` that already excludes it. Observed: dit=13477 + reserve=2560
             // > free=2628 "true" with the DiT wholly resident, evicting an encoder
             // that fit perfectly well. Subtracting the resident part reduces the
@@ -3806,9 +3790,9 @@ pub const Session = struct {
                 // evictUnpinned (NOT evictWeights): keep a DiT pinned by a previous
                 // queued image, drop only the (unpinned) encoder + any stray stream.
                 const freed = b.evictUnpinned();
-                // ⚠️ Says "unpinned weights", not "text encoder": on a subsequent
+                // Says "unpinned weights", not "text encoder": on a subsequent
                 // image the VAE is resident and unpinned too, so this drops that as
-                // well (harmless — the decode is after sampling, by which point the
+                // well (harmless, the decode is after sampling, by which point the
                 // streaming DiT would have reclaimed it anyway). Naming only the
                 // encoder made the line describe less than it did.
                 //
@@ -3835,7 +3819,7 @@ pub const Session = struct {
         defer gpa.free(x);
         // Resume: restore the suspended latent instead of drawing fresh noise
         // (the schedule + conditioning above are recomputed identically). A
-        // length mismatch (shouldn't happen — resume reuses the same opts) falls
+        // length mismatch (shouldn't happen, resume reuses the same opts) falls
         // back to a fresh draw rather than a bad copy.
         if (opts.resume_from) |r| {
             if (r.latent.len == x.len) @memcpy(x, r.latent) else {
@@ -3855,11 +3839,11 @@ pub const Session = struct {
             // Brownian noise path). Built HERE, between the initial-noise scaling and
             // the denoiser, because both orderings matter:
             //
-            //  - **After** `scaleInitialNoise`: ComfyUI scales the starting latent by
+            //  - After `scaleInitialNoise`: ComfyUI scales the starting latent by
             //    the *unoffset* first sigma (its `noise_scaling` runs before the
             //    sampler function, which offsets a clone), and `init` mutates
             //    `sigmas[0]`.
-            //  - **Before** `self.denoiser(...)`: that precomputes a timestep vector
+            //  - Before `self.denoiser(...)`: that precomputes a timestep vector
             //    per schedule entry, so it has to see the offset value or step 0 falls
             //    off its own cache.
             var sde: ?sampler.SdeStepper = if (opts.sampler.isSde()) try .init(
@@ -3874,7 +3858,7 @@ pub const Session = struct {
                     // ComfyUI seeds the Brownian path from the render's own seed
                     // (`extra_args["seed"]`), the same one that drew the latent.
                     .seed = opts.seed,
-                    // ⚠️ And the same generator, which is the half that is easy to miss:
+                    // And the same generator, which is the half that is easy to miss:
                     // A1111's pinned k-diffusion builds the tree on the CUDA tensor's
                     // device, so its per-node draws are Philox too. Wiring only the
                     // initial latent would have made euler reproduce and left every SDE
@@ -3914,7 +3898,7 @@ pub const Session = struct {
 
             // Scratch for the per-step denoised (x0) estimate that we preview.
             // We decode the model's clean-image estimate `x - sigma*v`, not the
-            // raw noisy latent `x` — matching ComfyUI's preview (it decodes the
+            // raw noisy latent `x`, matching ComfyUI's preview (it decodes the
             // `denoised` sample), so the preview reads as a blurry image that
             // sharpens rather than noise that resolves only at the last steps.
             const preview_x0: ?[]f32 = if (preview_active)
@@ -3924,7 +3908,7 @@ pub const Session = struct {
             defer if (preview_x0) |p| gpa.free(p);
 
             // Clamp a latent-resolution divisor to the grid so a large divisor on
-            // a small latent can't collapse to a 0-sized decode. 0 → the adaptive
+            // a small latent can't collapse to a 0-sized decode. 0 -> the adaptive
             // default that targets a ~256px preview.
             const clampDs = struct {
                 fn f(ds: usize, lh: usize, lw: usize) usize {
@@ -3933,11 +3917,11 @@ pub const Session = struct {
             }.f;
 
             // Optional taew2_1 (TAEHV) approx-VAE for a sharper preview. Loaded up
-            // front whenever a preview is active and a taew is configured — even if
-            // the current method isn't taesd — so a live switch to taesd is instant.
+            // front whenever a preview is active and a taew is configured, even if
+            // the current method isn't taesd, so a live switch to taesd is instant.
             //
             // krea2 ONLY: TAEHV is a 16-channel Wan approx-VAE, so it cannot decode an
-            // SD latent at all — the SD family's equivalent is TAESD/TAESDXL, a
+            // SD latent at all, the SD family's equivalent is TAESD/TAESDXL, a
             // different (4-channel, image) decoder that isn't implemented here. Leaving
             // `taehv_dec` null makes the `method == 2` request degrade to latent2rgb
             // through the existing path, which is the only correct preview for SD today.
@@ -3945,13 +3929,13 @@ pub const Session = struct {
             defer if (taew_st) |*s| s.deinit();
             var taehv_dec: ?taehv_mod.Decoder = null;
             defer if (taehv_dec) |*d| d.deinit();
-            // ⚠️ krea2 AND Anima, because TAEHV (`taew2_1`) is a 16-channel **Wan**
+            // krea2 AND Anima, because TAEHV (`taew2_1`) is a 16-channel Wan
             // approx-VAE and Anima's latent is a Wan 2.1 latent in the same
-            // normalization — same VAE file, same `latents_mean`/`latents_std`. Z-Image
+            // normalization, same VAE file, same `latents_mean`/`latents_std`. Z-Image
             // is excluded for the opposite reason: its 16 channels are a Flux latent,
             // which this decoder cannot read at all (and loading it anyway is what
-            // panicked mid-generation once). ⚠️ **Inferred from the latent format, not
-            // measured on an Anima render** — if it looks wrong, `--preview latent2rgb`
+            // panicked mid-generation once). Inferred from the latent format, not
+            // measured on an Anima render, if it looks wrong, `--preview latent2rgb`
             // is the fallback and the ladder already degrades to it on a load failure.
             const taehv_ok = self.family() == .krea2 or self.family() == .anima;
             if (preview_active and taehv_ok) if (opts.taew_path) |tp| {
@@ -4065,7 +4049,7 @@ pub const Session = struct {
             const sampling_s = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - sampling_start.nanoseconds)) / 1e9;
             try note(progress, "sampling {d} steps in {d:.1}s ({d:.2}s/step)\n", .{ nsteps, sampling_s, sampling_s / @as(f64, @floatFromInt(nsteps)) });
             // Peak-of-sampling attribution (the per-image session/workspace is
-            // still alive here) — the same numbers the GUI meter shows.
+            // still alive here), the same numbers the GUI meter shows.
             if (self.cu_be != null or self.gpu_ctx != null) {
                 const bd = self.vramBreakdown();
                 std.log.info("[diff-vram] breakdown te={d}MB dit={d}MB latent={d}MB vae={d}MB (used={d}MB)", .{
@@ -4100,9 +4084,9 @@ pub fn generate(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*s
 }
 
 /// Box-average a planar [c][h][w] latent down by integer factor `f`
-/// (→ [c][h/f][w/f]) so the taew preview decode stays cheap.
+/// (-> [c][h/f][w/f]) so the taew preview decode stays cheap.
 ///
-/// ⚠️ `c` is a parameter, not `wan_vae.latent_channels`: hardcoding krea2's 16 read
+/// `c` is a parameter, not `wan_vae.latent_channels`: hardcoding krea2's 16 read
 /// four times past the end of an SD latent, which crashed the GUI's first previewed
 /// SD render (`index out of bounds: index 0, len 0`) rather than producing a bad
 /// preview.
@@ -4133,8 +4117,8 @@ fn note(progress: ?*std.Io.Writer, comptime fmt: []const u8, args: anytype) !voi
 }
 
 test "the live preview follows the family's own latent format" {
-    // Regression: the per-step preview was krea2-only — `downsampleLatent` hardcoded 16
-    // channels and the latent2rgb call went straight to `wan_vae` — so the first
+    // Regression: the per-step preview was krea2-only, `downsampleLatent` hardcoded 16
+    // channels and the latent2rgb call went straight to `wan_vae`, so the first
     // previewed SD render read four planes past the end of a 4-channel latent and
     // panicked mid-generation (`index out of bounds: index 0, len 0`), for BOTH SD1.5
     // and SDXL. Only the union's tag is read here, so an undefined payload is safe and
@@ -4161,7 +4145,7 @@ test "the live preview follows the family's own latent format" {
             .anima => anima.latent_channels,
             .sd15, .sdxl => sd_vae.latent_channels,
         };
-        // Exactly the family's channel count — a read one plane past the end is an
+        // Exactly the family's channel count, a read one plane past the end is an
         // out-of-bounds panic, which is what the bug was.
         const z = try gpa.alloc(f32, ch * lat_h * lat_w);
         defer gpa.free(z);
@@ -4172,11 +4156,11 @@ test "the live preview follows the family's own latent format" {
     defer for (prev) |p| gpa.free(p);
     // Each family uses its OWN factors: sharing SD1.5's for SDXL is not a crash, just a
     // preview with plausible structure and wrong colours. krea2 and Z-Image are the
-    // pair that matters most here — both are 16-channel, so the wrong matrix is not
+    // pair that matters most here, both are 16-channel, so the wrong matrix is not
     // even an out-of-bounds read, just quietly wrong colours.
     try std.testing.expect(!std.mem.eql(u8, prev[1], prev[2]));
     try std.testing.expect(!std.mem.eql(u8, prev[0], prev[3]));
-    // ⚠️ ...and the one pair that must be IDENTICAL: Anima's latent format IS
+    // ...and the one pair that must be IDENTICAL: Anima's latent format IS
     // `Wan21`, the same one krea2 uses, so it must resolve to krea2's matrix and not
     // to Z-Image's (which is also 16-channel, and therefore also not a crash). This
     // asserts the sharing is deliberate rather than a fall-through.
@@ -4230,16 +4214,17 @@ test "vramBreakdown folds only the untagged remainder into latent" {
 test "the SD tile adapter transposes both ways at every latent width" {
     // `vae_tiled` and `Session.decode` speak planar `[c][h][w]`; the SD decoders
     // speak channel-last `[h*w][c]`. `sdTile` is the single seam between them, and
-    // it is the seam because getting this wrong is **rms-preserving** — every value
-    // survives, only its position moves — which is how the layout bug that reached a
+    // it is the seam because getting this wrong is rms-preserving, every value
+    // survives, only its position moves, which is how the layout bug that reached a
     // rendered image stayed invisible to every magnitude check (see "the sampler's
     // planar latent survives a round trip through the UNet's layout").
     //
-    // ⚠️ **Run at 4 AND 16 channels.** The same decoder body serves SD's 4-channel
-    // latent and Z-Image's 16-channel Flux latent, and `sdTile` used to take the
-    // count from `sd_vae.latent_channels` — so it transposed the first quarter of a
-    // Z-Image latent and read past it for the rest. A 4-channel-only test could not
-    // see that (it was the hardcoded value), and the render it produced was a band of
+    // Run at 4 AND 16 channels. The same decoder body serves SD's 4-channel
+    // latent and Z-Image's 16-channel Flux latent, so `sdTile` must derive the count
+    // from the data rather than from `sd_vae.latent_channels`: the constant transposes
+    // the first quarter of a Z-Image latent and reads past it for the rest. A
+    // 4-channel-only test cannot see that, 4 being the hardcoded value, and the render
+    // it produces is a band of
     // colour noise over flat grey rather than an error.
     //
     // The dummy decoder asserts the layout it is HANDED and emits a distinct known
@@ -4292,8 +4277,8 @@ test "the SD tile adapter transposes both ways at every latent width" {
 
 test "recoverableDecodeErr classifies VAE-decode fallbacks" {
     // Every way a GPU decode can run out of VRAM must trigger the reclaim +
-    // tiling ladder — including the cuBLASLt / cuDNN out-of-workspace errors and
-    // the hand-PTX post-OOM stream fault, which previously escaped it.
+    // tiling ladder, including the cuBLASLt / cuDNN out-of-workspace errors and
+    // the hand-PTX post-OOM stream fault.
     try std.testing.expect(recoverableDecodeErr(error.DeviceOutOfMemory));
     try std.testing.expect(recoverableDecodeErr(error.OutOfMemory));
     try std.testing.expect(recoverableDecodeErr(error.CudaError));
@@ -4352,7 +4337,7 @@ test "generate composed from the public stages is bit-identical to Session.gener
     var whole = try sess.generate(opts, null);
     defer whole.deinit(gpa);
 
-    // The same image, driven stage by stage — this is the reference usage.
+    // The same image, driven stage by stage, this is the reference usage.
     var cond = try sess.encode(gpa, opts.prompt, .{ .encoder_f16 = opts.encoder_f16 });
     defer cond.deinit(gpa);
 
@@ -4373,7 +4358,7 @@ test "generate composed from the public stages is bit-identical to Session.gener
     var den = try sess.denoiser(gpa, cond, null, opts.cfg, lat_h, lat_w, sigmas);
     defer den.deinit(gpa);
 
-    // The one-shot `Session.predict` — level 2's primitive — must agree with the
+    // The one-shot `Session.predict`, level 2's primitive, must agree with the
     // loop's own first forward. If it does not, every level-2 number describes a
     // model nobody renders with.
     const v_oneshot = try gpa.alloc(f32, lat_len);
@@ -4443,9 +4428,9 @@ test "a CFG denoiser needs a negative conditioning" {
 }
 
 test "Container picks the reader by magic, not by extension" {
-    // A misnamed checkpoint used to reach the wrong parser and report
-    // `InvalidHeader`, which says nothing about the real problem. Sniffing means the
-    // name is irrelevant; only the bytes decide.
+    // A misnamed checkpoint reaching the wrong parser reports `InvalidHeader`, which
+    // says nothing about the real problem. Sniffing means the name is irrelevant; only
+    // the bytes decide.
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
@@ -4480,13 +4465,13 @@ test "Container picks the reader by magic, not by extension" {
 test "family detection reads the denoiser's own tensor names" {
     // Name-based rather than flag-based on purpose: a mistyped `--arch` in front of a
     // measurement is exactly the kind of input error the whole harness exists to rule
-    // out. Both spellings of each family must resolve — a full single-file checkpoint
+    // out. Both spellings of each family must resolve, a full single-file checkpoint
     // keeps the LDM container prefix, and ggufy's model-only GGUF strips it.
     const gpa = std.testing.allocator;
 
-    // ⚠️ The SDXL cases carry the SD1.5 stem **as well**, because that is what a real
+    // The SDXL cases carry the SD1.5 stem as well, because that is what a real
     // SDXL checkpoint looks like: both are LDM UNets with the same `input_blocks.0.0`.
-    // So these two cases are the ones that pin the *order* of the checks — testing SDXL
+    // So these two cases are the ones that pin the *order* of the checks, testing SDXL
     // with `label_emb` alone would pass even if the stem were read first, and every SDXL
     // checkpoint would then load as SD1.5 and fail on a missing fourth level.
     const cases = [_]struct { names: []const []const u8, want: Family }{
@@ -4496,14 +4481,14 @@ test "family detection reads the denoiser's own tensor names" {
         .{ .names = &.{ "input_blocks.0.0.weight", "label_emb.0.0.weight" }, .want = .sdxl },
         .{ .names = &.{"model.diffusion_model.blocks.0.attn.wq.weight"}, .want = .krea2 },
         .{ .names = &.{"blocks.0.attn.wq.weight"}, .want = .krea2 },
-        // ⚠️ Z-Image needs BOTH tensors, which is ComfyUI's own test:
+        // Z-Image needs BOTH tensors, which is ComfyUI's own test:
         // `cap_embedder.1.weight` alone is shared with stock Lumina 2 and OmniGen2,
         // and the `noise_refiner` qk-norm is what says this is the NextDiT shape.
         // These cases therefore also pin that a `cap_embedder` on its own is NOT
         // enough (the negative case below).
         .{ .names = &.{ "model.diffusion_model.cap_embedder.1.weight", "model.diffusion_model.noise_refiner.0.attention.k_norm.weight" }, .want = .zimage },
         .{ .names = &.{ "cap_embedder.1.weight", "noise_refiner.0.attention.k_norm.weight" }, .want = .zimage },
-        // ⚠️ The Anima cases carry the Cosmos-Predict2 trunk tensor **as well**,
+        // The Anima cases carry the Cosmos-Predict2 trunk tensor as well,
         // because that is what a real Anima checkpoint looks like: it IS a
         // `MiniTrainDIT`, so `blocks.0.mlp.layer1.weight` is shared with stock Cosmos
         // and is NOT a usable probe. `model_detection` upgrades `"cosmos_predict2"`
@@ -4555,8 +4540,8 @@ test "family detection reads the denoiser's own tensor names" {
         try std.testing.expectError(error.UnknownArchitecture, detectFamily(.{ .safetensors = &st }));
     }
 
-    // ⚠️ `cap_embedder.1.weight` on its OWN is not Z-Image: stock Lumina 2 and
-    // OmniGen2 have it too. This case is what gives the two-tensor probe teeth —
+    // `cap_embedder.1.weight` on its OWN is not Z-Image: stock Lumina 2 and
+    // OmniGen2 have it too. This case is what gives the two-tensor probe teeth,
     // without it, a single-tensor test would pass either way.
     {
         const header = "{\"cap_embedder.1.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}}";
@@ -4569,9 +4554,9 @@ test "family detection reads the denoiser's own tensor names" {
         try std.testing.expectError(error.UnknownArchitecture, detectFamily(.{ .safetensors = &st }));
     }
 
-    // ⚠️ And the same shape for Anima: a Cosmos-Predict2 trunk WITHOUT the adapter is
+    // And the same shape for Anima: a Cosmos-Predict2 trunk WITHOUT the adapter is
     // not Anima, and must be reported rather than loaded as one and then failing on
-    // ~100 missing adapter tensors. This is what gives the adapter probe teeth — a
+    // ~100 missing adapter tensors. This is what gives the adapter probe teeth, a
     // probe on `blocks.0.mlp.layer1.weight` would pass the positive cases above and
     // this one too.
     {
@@ -4587,17 +4572,17 @@ test "family detection reads the denoiser's own tensor names" {
 }
 
 test "each family's schedule shift and defaulted component paths are its own" {
-    // ⚠️ Three constants that produce a plausible image when wrong, so none of them
+    // Three constants that produce a plausible image when wrong, so none of them
     // can be left to a shared default:
     //
     //  - the SHIFT. Z-Image trained on 3.0 and krea2 on 1.15, and `Options.shift`
     //    defaults to krea2's. At 8 steps the wrong one is the difference between a
-    //    finished image and a smeared one — a valid schedule with the steps in the
+    //    finished image and a smeared one, a valid schedule with the steps in the
     //    wrong places, not an error.
     //  - the two DEFAULTED component paths. `Options`' are krea2's files, and
-    //    handing krea2's Qwen3-**VL** encoder to Z-Image resolves to nothing (its
+    //    handing krea2's Qwen3-VL encoder to Z-Image resolves to nothing (its
     //    language model is nested a level deeper), which reports
-    //    `ComponentNotInCheckpoint` — the exact failure a joined SD1.5 checkpoint hit.
+    //    `ComponentNotInCheckpoint`, the exact failure a joined SD1.5 checkpoint hit.
     try std.testing.expectEqual(sampler.default_shift, defaultShift(.krea2));
     try std.testing.expectEqual(@as(f32, 3.0), defaultShift(.zimage));
     try std.testing.expect(defaultShift(.krea2) != defaultShift(.zimage));
@@ -4622,17 +4607,17 @@ test "each family's schedule shift and defaulted component paths are its own" {
     sess.models = .{ .anima = undefined };
     try std.testing.expectEqual(@as(f32, 3.0), sess.resolvedShift(.{ .prompt = "" }));
 
-    // ⚠️ Anima names a default ENCODER but deliberately **no default decoder**: its
+    // Anima names a default ENCODER but deliberately no default decoder: its
     // VAE is normally bundled in the denoiser checkpoint, and naming a path here would
-    // send the resolver at a file that has nothing to do with this family — the same
+    // send the resolver at a file that has nothing to do with this family, the same
     // failure a joined SD1.5 checkpoint hit when a *defaulted* path was treated as a
     // request. A defaulted path that does not exist is not an error; the resolver
     // falls through to the checkpoint's own copy.
     try std.testing.expect(defaultComponentPath(.anima, .conditioner).len > 0);
     try std.testing.expectEqual(@as(usize, 0), defaultComponentPath(.anima, .decoder).len);
 
-    // ⚠️ Anima's decoder probe is the WAN VAE's (`decoder.conv1.weight`), not the
-    // `AutoencoderKL` one the SD family and Z-Image use — the two namings are
+    // Anima's decoder probe is the WAN VAE's (`decoder.conv1.weight`), not the
+    // `AutoencoderKL` one the SD family and Z-Image use, the two namings are
     // disjoint, which is what stops a wrong side file being accepted here.
     const a_dec = try componentSpec(.anima, .decoder);
     const k_dec = try componentSpec(.krea2, .decoder);
@@ -4641,13 +4626,13 @@ test "each family's schedule shift and defaulted component paths are its own" {
     try std.testing.expect(!std.mem.eql(u8, z_dec.probes[0], a_dec.probes[0]));
 
     // ...and its conditioner probe is Z-Image's plain-Qwen3 one, not krea2's
-    // VL-nested one: `model.embed_tokens.weight` vs `model.language_model.…`.
+    // VL-nested one: `model.embed_tokens.weight` vs `model.language_model....`.
     const a_cond = try componentSpec(.anima, .conditioner);
     const k_cond = try componentSpec(.krea2, .conditioner);
     try std.testing.expectEqualStrings("model.embed_tokens.weight", a_cond.probes[0]);
     try std.testing.expect(!std.mem.eql(u8, k_cond.probes[0], a_cond.probes[0]));
 
-    // Unlike every other family here, Anima CAN apply prompt weights — on its T5
+    // Unlike every other family here, Anima CAN apply prompt weights, on its T5
     // branch. See `supportsPromptWeights`.
     try std.testing.expect(supportsPromptWeights(.anima));
     try std.testing.expect(!supportsPromptWeights(.krea2));
@@ -4655,9 +4640,9 @@ test "each family's schedule shift and defaulted component paths are its own" {
 }
 
 test "container style is orthogonal to family: bundled, split, and explicit override" {
-    // The rule this pins, which an earlier version got wrong by tying container style
-    // to the architecture: any family ships joined OR split, an explicitly requested
-    // file overrides a bundled component, and a *defaulted* path never does.
+    // Container style is orthogonal to the architecture: any family ships joined OR
+    // split, an explicitly requested file overrides a bundled component, and a
+    // DEFAULTED path never does.
     const gpa = std.testing.allocator;
 
     const Builder = struct {
@@ -4721,7 +4706,7 @@ test "container style is orthogonal to family: bundled, split, and explicit over
         // Which prefix resolved is how we know WHERE it came from: the side file
         // spells it `text_model.`, the bundle `cond_stage_model.transformer.text_model.`.
         // (Both are candidate spellings, so "no view" would not have distinguished
-        // them — the first version of this test asserted that and was simply wrong.)
+        // them, the first version of this test asserted that and was simply wrong.)
         try std.testing.expectEqualStrings("text_model.", r.view.?.prefix);
     }
 
@@ -4750,12 +4735,12 @@ test "container style is orthogonal to family: bundled, split, and explicit over
 }
 
 test "the sampler's planar latent survives a round trip through the UNet's layout" {
-    // ⚠️ The bug this pins reached a rendered image. The sampler works in planar
+    // The bug this pins reached a rendered image. The sampler works in planar
     // `[c][h][w]` (krea2's DiT and both VAEs do) while `sd_unet.forward` works in
-    // channel-last `[h*w][c]`, and feeding one to the other is **rms-preserving**:
+    // channel-last `[h*w][c]`, and feeding one to the other is rms-preserving:
     // every value survives, only its position moves. Per-step magnitudes therefore
     // matched the reference to a fraction of a percent while the image became a
-    // periodic streak pattern — and the UNet parity tests could not see it, because
+    // periodic streak pattern, and the UNet parity tests could not see it, because
     // they transpose explicitly before calling `forward`.
     const gpa = std.testing.allocator;
     const ch = 4;
@@ -4807,7 +4792,7 @@ test "a scheduled prompt deduplicates by text and indexes every step" {
         defer gpa.free(plan.at);
         try std.testing.expectEqual(@as(usize, 2), plan.texts.len);
         try std.testing.expectEqual(@as(usize, 35), plan.at.len);
-        // Alternating, 1-based: step 1 -> "a", step 2 -> "b", …
+        // Alternating, 1-based: step 1 -> "a", step 2 -> "b", ...
         try std.testing.expectEqualStrings("a cat", plan.texts[0]);
         try std.testing.expectEqualStrings("b cat", plan.texts[1]);
         for (plan.at, 0..) |ix, step| try std.testing.expectEqual(@as(u8, @intCast(step % 2)), ix);
@@ -4833,7 +4818,7 @@ test "a scheduled prompt deduplicates by text and indexes every step" {
 }
 
 test "Cond entry accessors treat the parent as entry 0" {
-    // The compatibility claim that keeps ggufy and the composed-stages invariant working:
+    // The compatibility claim that keeps ggufy and the composed-stages equality working:
     // a Cond with no schedule has exactly one entry and it is itself.
     const gpa = std.testing.allocator;
     var plain: Cond = .{ .data = try gpa.alloc(f32, 4), .seq = 1 };
@@ -4850,13 +4835,13 @@ test "Cond entry accessors treat the parent as entry 0" {
     try std.testing.expectEqual(@as(usize, 2), sched.entryCount());
     try std.testing.expectEqual(@as(usize, 2), sched.entry(1).seq);
     try std.testing.expectEqual(@as(usize, 1), sched.sched.?.indexAt(2));
-    // Past the end clamps to the last step rather than reading out of bounds — a schedule
+    // Past the end clamps to the last step rather than reading out of bounds, a schedule
     // built for fewer steps than the render still resolves.
     try std.testing.expectEqual(@as(usize, 0), sched.sched.?.indexAt(99));
 }
 
 test "compat resolves A1111's three sampling defaults, and a per-knob override wins" {
-    // ⚠️ All THREE, which is the point of the aggregate: A1111 disagrees with ComfyUI on
+    // All THREE, which is the point of the aggregate: A1111 disagrees with ComfyUI on
     // every one of them, and the render only reproduces if they all flip together. A
     // future edit that added a fourth convention to `.a1111` while leaving one at
     // ComfyUI's value is exactly what this catches.
@@ -4875,7 +4860,7 @@ test "compat resolves A1111's three sampling defaults, and a per-knob override w
     const dflt: Options = .{ .prompt = "x" };
     try std.testing.expectEqual(c, dflt.compatConfig());
 
-    // An override beats the aggregate in both directions — an A1111 user who set
+    // An override beats the aggregate in both directions, an A1111 user who set
     // `randn_source` to CPU, or a ComfyUI user probing just the RNG.
     var o: Options = .{ .prompt = "x", .compat = .a1111, .rng = .torch_cpu };
     var got = o.compatConfig();
@@ -4910,7 +4895,7 @@ test "the timestep quantization switch is not a no-op on a real schedule" {
 }
 
 test "prompt-weight support is read off the encoder, not a list of architectures" {
-    // ⚠️ The predicate must come from the ENCODER. SD.Next's equivalent is a substring match
+    // The predicate must come from the ENCODER. SD.Next's equivalent is a substring match
     // on pipeline class names, and its own file shows the failure mode: Chroma and HiDream
     // commented out of the list, and a `'Flux2' not in cls` guard bolted on so the `Flux`
     // substring does not swallow a different architecture. Ours cannot drift, and a new
@@ -4943,7 +4928,7 @@ test "an unweightable prompt is reported as such, never refused" {
         try std.testing.expect(!try Session.weightsWouldBeDropped(gpa, text, o));
     }
 
-    // Real weights: reported, so the caller can say so — and the render still proceeds.
+    // Real weights: reported, so the caller can say so, and the render still proceeds.
     for ([_][]const u8{
         "a (cat:1.3) on a mat",
         "a (cat) on a mat", // bare parens are 1.1 under this dialect
@@ -4956,10 +4941,10 @@ test "an unweightable prompt is reported as such, never refused" {
     // `.ignore` already asked for the weights to be dropped, so there is nothing to report.
     try std.testing.expect(!try Session.weightsWouldBeDropped(gpa, "a (cat:1.3) on a mat", .{ .prompt_syntax = .a1111, .emphasis = .ignore }));
 
-    // ⚠️ Per-step scheduling checked THROUGH `planSchedule`, not on the raw text: the
+    // Per-step scheduling checked THROUGH `planSchedule`, not on the raw text: the
     // scheduling brackets are resolved before `encodeText` ever sees the prompt, so checking
-    // `[cat:dog:0.5]` directly would describe a string the pipeline never passes — and would
-    // read as de-emphasis, since a bare `[…]` is 1/1.1 once the schedule is stripped.
+    // `[cat:dog:0.5]` directly would describe a string the pipeline never passes, and would
+    // read as de-emphasis, since a bare `[...]` is 1/1.1 once the schedule is stripped.
     for ([_][]const u8{ "a [cat:dog:0.5] on a mat", "a [cat|dog] on a mat" }) |text| {
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();

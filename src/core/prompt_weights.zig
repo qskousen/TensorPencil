@@ -1,42 +1,25 @@
 //! ComfyUI's prompt emphasis syntax, resolved into flat weighted segments.
 //!
-//! This is `comfy.sd1_clip`'s `escape_important` / `token_weights` /
-//! `parse_parentheses` trio and nothing else: it turns a prompt string into a list
-//! of `(text, weight)` runs. What a *tokenizer* then does with those runs — CLIP's
-//! 77-token chunking, T5's per-segment SentencePiece pass — is that tokenizer's
-//! business and lives in its own file.
+//! This is `comfy.sd1_clip`'s `escape_important` / `token_weights` / `parse_parentheses`
+//! trio and nothing else: it turns a prompt string into a list of `(text, weight)` runs.
+//! What a TOKENIZER then does with those runs (CLIP's 77-token chunking, T5's
+//! per-segment SentencePiece pass) lives in its own file.
 //!
-//! It exists as a module because **two unrelated tokenizers consume it**:
-//! `clip_tokenizer` for the SD family, and `t5_tokenizer` for Anima's
-//! `llm_adapter` branch. Both need the same three non-obvious rules to be the
-//! same three rules, and a second copy of them is precisely the kind of drift
-//! that makes one prompt path silently disagree with another:
-//!
-//! 1. **A bare paren MULTIPLIES by 1.1; an explicit `:w` REPLACES the weight.**
-//!    `((a))` is 1.21 but `((a:1.5))` is 1.5, not 1.65 — the innermost absolute
-//!    wins over every enclosing multiplier. (A1111 multiplies instead; that
-//!    dialect is `prompt_a1111.zig`.)
-//! 2. **The product accumulates in f64 and narrows once**, because Python's
-//!    `1.1 * 1.1` is 1.2100000000000002 where f32 gives 1.2100001.
-//! 3. **Unbalanced parentheses are text, not an error.** `a)b` is one plain
-//!    segment; `(a` is one segment that simply fails the `(`…`)` test. The
-//!    reference lets its nesting counter go negative for exactly this reason.
-//!
-//! ⚠️ An **empty** segment is dropped by the caller, not here: ComfyUI filters
-//! `to_tokenize` for `x != ""` after unescaping, so `a () mat` contributes no
-//! token at all for the `()`. `segments` still reports it, since only the caller
-//! knows what "empty" means after its own unescaping.
+//! It is a module because two unrelated tokenizers consume it, `clip_tokenizer` for the
+//! SD family and `t5_tokenizer` for Anima's adapter branch, and a second copy of its
+//! rules is the drift that makes one prompt path silently disagree with another. The
+//! three non-obvious rules are documented at `segments`, which implements them.
 
 const std = @import("std");
 
 /// One run of prompt text and the attention weight its enclosing parentheses gave
-/// it. `text` borrows from the arena passed to `segments`, still in escaped form —
+/// it. `text` borrows from the arena passed to `segments`, still in escaped form,
 /// call `unescape` before handing it to a tokenizer.
 pub const Segment = struct { text: []const u8, weight: f64 };
 
-/// The deepest `(((…)))` nesting accepted. Python's own recursion limit stops the
+/// The deepest `(((...)))` nesting accepted. Python's own recursion limit stops the
 /// reference at ~1000 frames; a real prompt never exceeds two or three, so this is a
-/// stack guard against a pathological input rather than a semantic limit — and it is
+/// stack guard against a pathological input rather than a semantic limit, and it is
 /// an error instead of a silent literal reading, since a prompt this malformed should
 /// be reported rather than rendered differently than it looks.
 pub const max_nesting: usize = 32;
@@ -45,6 +28,21 @@ pub const Error = error{ OutOfMemory, PromptNestingTooDeep };
 
 /// Resolve `text`'s emphasis syntax into flat weighted segments, appended to `out`.
 /// Everything allocated (including each segment's `text`) comes from `arena`.
+///
+/// Three rules that are not obvious, and that both consuming tokenizers must share:
+///
+/// 1. A bare paren MULTIPLIES by 1.1; an explicit `:w` REPLACES the weight. `((a))` is
+///    1.21 but `((a:1.5))` is 1.5, not 1.65: the innermost absolute wins over every
+///    enclosing multiplier. A1111 multiplies instead; that dialect is `prompt_a1111`.
+/// 2. The product accumulates in f64 and narrows once, because Python's `1.1 * 1.1` is
+///    1.2100000000000002 where f32 gives 1.2100001.
+/// 3. Unbalanced parentheses are TEXT, not an error. `a)b` is one plain segment and
+///    `(a` is one segment that simply fails the paren test; the reference lets its
+///    nesting counter go negative for exactly this reason.
+///
+/// An empty segment is reported here and dropped by the caller: ComfyUI filters
+/// `to_tokenize` for `x != ""` after unescaping, so `a () mat` contributes no token for
+/// the `()`, but only the caller knows what "empty" means after its own unescaping.
 pub fn segments(arena: std.mem.Allocator, out: *std.ArrayList(Segment), text: []const u8) Error!void {
     try tokenWeights(arena, out, try escape(arena, text), 1.0, 0);
 }
@@ -92,8 +90,8 @@ pub fn unescape(arena: std.mem.Allocator, text: []const u8) ![]u8 {
     return out[0..n];
 }
 
-/// Split `string` at its **top-level** parenthesised groups, so each returned item is
-/// either one whole `(…)` group (outer parens included) or a run of text between
+/// Split `string` at its top-level parenthesised groups, so each returned item is
+/// either one whole `(...)` group (outer parens included) or a run of text between
 /// them. Every item is a contiguous slice of the input, which is what lets the whole
 /// weight parse stay zero-copy.
 fn parseParentheses(arena: std.mem.Allocator, out: *std.ArrayList([]const u8), string: []const u8) !void {
@@ -117,7 +115,7 @@ fn parseParentheses(arena: std.mem.Allocator, out: *std.ArrayList([]const u8), s
     if (start < string.len) try out.append(arena, string[start..]);
 }
 
-/// See rules 1–3 in the module header. The multiply happens first and the explicit
+/// See rules 1-3 in the module header. The multiply happens first and the explicit
 /// assignment overwrites it, which is the reference's order and the only way to get
 /// the `((a:1.5))` case right.
 fn tokenWeights(
@@ -158,8 +156,8 @@ fn tokenWeights(
 /// Null when Python would have raised, which the caller treats as "this colon was not
 /// a weight" and leaves the text alone.
 ///
-/// Zig's `parseFloat` is the more permissive of the two — it also takes hex floats and
-/// `_` digit separators — so those are rejected explicitly rather than silently
+/// Zig's `parseFloat` is the more permissive of the two, it also takes hex floats and
+/// `_` digit separators, so those are rejected explicitly rather than silently
 /// accepted, which would read `(a:0x1p4)` as a weight where ComfyUI reads it as text.
 fn parsePyFloat(s: []const u8) ?f64 {
     const t = std.mem.trim(u8, s, " \t\n\r\x0b\x0c");
@@ -187,10 +185,10 @@ test "a bare paren multiplies and an explicit weight replaces" {
     errdefer std.debug.print("weights: {any}\n", .{seen.items});
     try testing.expectEqual(@as(usize, 3), seen.items.len);
     try testing.expectApproxEqAbs(@as(f64, 1.1 * 1.1), seen.items[0], 1e-12);
-    // ⚠️ 1.5, not 1.5 * 1.21: the inner absolute wins.
+    // 1.5, not 1.5 * 1.21: the inner absolute wins.
     try testing.expectEqual(@as(f64, 1.5), seen.items[1]);
-    // ⚠️ The shape that tells "replace" apart from "multiply": the outer `:1.5`
-    // sets 1.5, then the inner `:1.2` REPLACES it — 1.2, not 1.5 * 1.2 = 1.8.
+    // The shape that tells "replace" apart from "multiply": the outer `:1.5`
+    // sets 1.5, then the inner `:1.2` REPLACES it, 1.2, not 1.5 * 1.2 = 1.8.
     // Verified against `comfy.sd1_clip.token_weights`.
     try testing.expectEqual(@as(f64, 1.2), seen.items[2]);
 }
@@ -201,9 +199,9 @@ test "unbalanced parentheses are literal text, not an error" {
     const a = arena.allocator();
 
     // Verbatim from `comfy.sd1_clip.token_weights(escape_important(t), 1.0)`.
-    // ⚠️ `((a)` is the interesting one and it is NOT weight 1.0: `parseParentheses`
+    // `((a)` is the interesting one and it is NOT weight 1.0: `parseParentheses`
     // never closes the outer group, so the whole string arrives as one item whose
-    // first and last bytes are `(` and `)` — it IS read as a group, dropping one
+    // first and last bytes are `(` and `)`, it IS read as a group, dropping one
     // paren and applying the 1.1 multiplier to `(a`. Anything that "fixes" the
     // unbalanced input diverges here.
     const Case = struct { text: []const u8, want: []const Segment };

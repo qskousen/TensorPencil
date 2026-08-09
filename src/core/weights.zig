@@ -1,11 +1,11 @@
-//! WeightStore — uniform read access over checkpoint containers
+//! WeightStore, uniform read access over checkpoint containers
 //! (safetensors, GGUF), so model loaders don't care which format a
 //! checkpoint ships in. Both containers resolve HF-style tensor names
 //! (GGUF llama.cpp names are canonicalized at parse time; see gguf.zig).
 //!
 //! The third arm is an `Overlay`: a base store with a few tensors substituted
 //! from caller-owned memory. It exists so an experiment can change one weight
-//! without rewriting the checkpoint — see the doc comment on `Overlay`.
+//! without rewriting the checkpoint, see the doc comment on `Overlay`.
 
 const std = @import("std");
 const safetensors = @import("safetensors.zig");
@@ -29,7 +29,7 @@ pub const WeightStore = union(enum) {
         };
     }
 
-    /// Like `get`, but a missing tensor is an error — for required weights.
+    /// Like `get`, but a missing tensor is an error, for required weights.
     pub fn require(self: WeightStore, name: []const u8) !TensorView {
         return self.get(name) orelse error.MissingTensor;
     }
@@ -71,7 +71,7 @@ pub const WeightStore = union(enum) {
             // bytes are caller-owned and lie OUTSIDE the base mapping, so a
             // consumer that turns a view into a mapping-relative offset (which is
             // what this accessor is for) would compute a garbage offset for exactly
-            // the tensors an experiment changed — and read the unpatched bytes.
+            // the tensors an experiment changed, and read the unpatched bytes.
             // Losing the streaming fast path is a slowdown; that would be a silent
             // wrong answer.
             .overlay => null,
@@ -81,40 +81,30 @@ pub const WeightStore = union(enum) {
 
 /// A base store with a few tensors substituted from caller-owned memory.
 ///
-/// The measurement this exists for: quantize exactly ONE tensor of a checkpoint
-/// and run the whole model, to attribute the model's error to that layer. Doing
-/// it by writing a modified checkpoint costs a full copy of the file per data
-/// point (~26 GB for krea2), which is what made per-layer attribution
-/// unaffordable; here it costs one tensor's worth of memory.
+/// Exists for per-layer attribution: quantize exactly ONE tensor and run the whole
+/// model. Writing a modified checkpoint per data point costs a full copy of the file
+/// (tens of GB); here it costs one tensor's worth of memory. Being a plain read-through
+/// map it also serves merged LoRA/delta weights, per-layer dtype experiments and a GUI
+/// hot-swap.
 ///
-/// It is a plain read-through map, so it serves anything else shaped the same
-/// way — merged LoRA/delta weights, per-layer dtype experiments, a GUI hot-swap.
+/// Two lifetime rules, both because model loaders keep VIEWS into the store rather than
+/// copies: the patch bytes must outlive the model, and the `Overlay` must stay at a
+/// stable address for as long as a `WeightStore` refers to it.
 ///
-/// Two lifetime rules, both because model loaders keep *views* into the store
-/// rather than copies:
-///
-///   1. the patch bytes must outlive the model loaded from the overlay, and
-///   2. the `Overlay` itself must stay at a stable address for as long as a
-///      `WeightStore` refers to it (it is held by pointer).
-///
-/// A patch may change a tensor's **dtype** — substituting f32 for the base's
-/// bf16 is the normal case, since the f32 holds a dequantized round-trip
-/// exactly — but not its **shape**, which is checked. Substituting a
-/// differently-shaped tensor is a bug every time (a transposed buffer, the wrong
-/// layer), and the shape check catches it here rather than as a puzzling
-/// `ShapeMismatch` from a loader 200 weights later.
+/// A patch may change a tensor's dtype (f32 for the base's bf16 is the normal case,
+/// since f32 holds a dequantized round-trip exactly) but not its shape, which is
+/// checked. A differently-shaped substitution is a bug every time, and catching it here
+/// beats a puzzling `ShapeMismatch` from a loader 200 weights later.
 /// A view of one component inside a larger container: `get("decoder.conv_in.weight")`
 /// resolves `prefix ++ "decoder.conv_in.weight"` in the base.
 ///
-/// This is what makes **container style orthogonal to architecture**. Any model may
-/// ship as one bundled checkpoint (denoiser + text encoder + VAE in a single file,
-/// each under its own prefix) or as separate files, and the same model is distributed
-/// both ways. Without this, every loader would need its own prefix parameter and every
-/// caller would need to know which spelling a given file used; with it, a loader is
-/// handed a store in which its component sits at the root — exactly as if it had come
-/// from a dedicated file.
+/// This is what makes container style orthogonal to architecture. Any model ships either
+/// bundled (denoiser, text encoder and VAE in one file under their own prefixes) or as
+/// separate files. Without this every loader needs a prefix parameter and every caller
+/// needs to know which spelling a file used; with it, a loader is handed a store in which
+/// its component sits at the root, exactly as if it came from a dedicated file.
 ///
-/// ⚠️ **`names()` returns the STRIPPED names**, built once here. A consumer that
+/// `names()` returns the STRIPPED names, built once here. A consumer that
 /// enumerates the view and then looks those names up (the activation-capture sanity
 /// gate does exactly that) would otherwise miss on every one of them.
 pub const Prefixed = struct {
@@ -168,12 +158,12 @@ pub const Overlay = struct {
     /// Substitute `name`. `bytes` and `name` are borrowed, not copied.
     ///
     /// The replacement keeps the base tensor's shape and takes the given dtype, so
-    /// `bytes` must be exactly that many bytes — the one thing a caller can get
+    /// `bytes` must be exactly that many bytes, the one thing a caller can get
     /// wrong here (an f32 buffer handed in as bf16 reads as noise, and every
     /// downstream number would be about a model nobody meant to run).
     ///
     /// Errors: `MissingTensor` if the base has no such tensor (the overlay may
-    /// not extend the namespace — see `WeightStore.names`), `LengthMismatch` if
+    /// not extend the namespace, see `WeightStore.names`), `LengthMismatch` if
     /// `bytes` does not match shape × dtype.
     pub fn put(self: *Overlay, gpa: std.mem.Allocator, name: []const u8, dt: dtypes.DType, bytes: []const u8) !void {
         const orig = self.base.get(name) orelse return error.MissingTensor;
@@ -189,7 +179,7 @@ pub const Overlay = struct {
         try self.patch.put(gpa, name, .{ .info = info, .bytes = bytes });
     }
 
-    /// `put`, taking a whole view — for a replacement that already carries its own
+    /// `put`, taking a whole view, for a replacement that already carries its own
     /// metadata (another container's tensor, say). The shape must match the base's.
     pub fn putView(self: *Overlay, gpa: std.mem.Allocator, name: []const u8, view: TensorView) !void {
         const orig = self.base.get(name) orelse return error.MissingTensor;
@@ -292,7 +282,7 @@ test "overlay substitutes one tensor and passes the rest through" {
     try std.testing.expectEqualStrings("a", store.names()[0]);
     try std.testing.expect(store.get("nope") == null);
 
-    // Restoring is exact — this is what lets one overlay serve a whole sweep.
+    // Restoring is exact, this is what lets one overlay serve a whole sweep.
     try std.testing.expect(ov.remove("a"));
     const a2 = try (try store.require("a")).toF32Alloc(gpa);
     defer gpa.free(a2);
@@ -314,7 +304,7 @@ test "overlay refuses a patch it cannot honestly represent" {
     const bytes = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 };
     try std.testing.expectError(error.MissingTensor, ov.put(gpa, "nope", .f32, &bytes));
 
-    // Right dtype, wrong length — the mistake that would otherwise be read as
+    // Right dtype, wrong length, the mistake that would otherwise be read as
     // valid weights.
     try std.testing.expectError(error.LengthMismatch, ov.put(gpa, "a", .f32, bytes[0..4]));
     // Right length in bytes, wrong dtype for that length (2 f32s != 8 bf16 slots).

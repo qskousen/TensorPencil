@@ -3,7 +3,7 @@
 //!  - weight residency (pin everything; LLM weights never stream),
 //!  - the per-run timing summary and CUDA profile dump,
 //!  - CUDA backend bring-up (`bringUpCuda`), and
-//!  - the generic `run` that owns the cpu/cuda/vulkan construct→prefill→drive→time
+//!  - the generic `run` that owns the cpu/cuda/vulkan construct->prefill->drive->time
 //!    skeleton, parameterized by a per-architecture `Spec` (the concrete stepper
 //!    types + builders) plus a caller-supplied `prefiller` and `driver`.
 //!
@@ -23,7 +23,7 @@ const tokenizer = @import("tp_core").tokenizer;
 // LLM weights are NEVER streamed: every weight pins on first touch
 // (`pinAllWeights` below), and a model that outgrows VRAM degrades via the
 // CPU layer split (--cpu-layers/--offload-grow, or the GUI's always-armed
-// dynamic offload) — measured ~2.5x faster than the old weight-streaming
+// dynamic offload), measured ~2.5x faster than the old weight-streaming
 // fallback, whose LRU-vs-cyclic-walk pathology re-uploaded ~the whole model
 // per token the moment the budget fell short. Weight streaming remains a
 // diffusion-only mechanism.
@@ -45,7 +45,7 @@ pub const Stats = struct {
         return .{ .tokens = tokens, .window = window, .vram = vram };
     }
 
-    /// " , vram 8123 MiB" (leading separator) or "" when there's no device —
+    /// ", vram 8123 MiB" (leading separator) or "" when there's no device,
     /// so callers can splice it into a stats line uniformly.
     pub fn vramSuffix(self: Stats, buf: []u8) []const u8 {
         const mb = (self.vram orelse return "") >> 20;
@@ -158,7 +158,7 @@ pub fn bringUpCuda(arena: std.mem.Allocator, backend: BackendKind, profile: bool
 /// itself no-ops unless `safetensors.read_mode == .pread`, so `--mmap mmap`
 /// disables it without any caller needing to know.
 ///
-/// ⚠️ The `Gguf` must outlive the backend — it is borrowed, not copied. Every
+/// The `Gguf` must outlive the backend, it is borrowed, not copied. Every
 /// caller holds it for the whole session, which is why this takes a pointer.
 pub fn useFileReads(be: ?*cuda.Backend, g: *const gguf_mod.Gguf) void {
     const b = be orelse return;
@@ -206,7 +206,7 @@ pub fn UniformSpec(
 }
 
 /// Construct the per-backend stepper (`S.build*`), run the arch's one-shot image
-/// prefill (`prefiller.prefill`), then drive generation (`driver.drive`) — the
+/// prefill (`prefiller.prefill`), then drive generation (`driver.drive`), the
 /// skeleton every architecture shares. The stepper type never escapes its arm,
 /// so no tagged union is needed; `prefiller`/`driver` are small structs with
 /// generic (`model: anytype`) methods. `first_seq` is the prompt length the
@@ -246,7 +246,7 @@ pub fn run(
         },
         .@"zig-cuda", .cuda => {
             // Weights never stream: an OOM anywhere below means the model (plus
-            // KV/activations) genuinely doesn't fit resident — point at the CPU
+            // KV/activations) genuinely doesn't fit resident, point at the CPU
             // split instead of failing silently.
             errdefer |err| if (err == error.DeviceOutOfMemory) {
                 stdout.writeAll("\n[out of device VRAM: LLM weights never stream — rerun with --vram-budget <GiB> and --cpu-layers/--offload-grow to run part of the model on the CPU]\n") catch {};
@@ -257,9 +257,9 @@ pub fn run(
             // Prefill may arm a CPU split on VRAM pressure (auto-offload), whose
             // host layers need `io`; set it before prefill, not just at decode.
             if (@hasField(@TypeOf(model), "io")) model.io = io;
-            // ⚠️ Upload the weights BEFORE the first forward. `cachedWeight` is
+            // Upload the weights BEFORE the first forward. `cachedWeight` is
             // lazy, so without this the one-time host->device copy of every weight
-            // is charged to prefill — inflating `pp` and making it incomparable to
+            // is charged to prefill, inflating `pp` and making it incomparable to
             // llama.cpp, which offloads at load time and reports that separately.
             // Opt-in per stepper; those without the decl keep the old behaviour.
             if (@hasDecl(@TypeOf(model), "warmWeights")) model.warmWeights();
@@ -295,7 +295,7 @@ pub const no_prefill: struct {
     }
 } = .{};
 
-/// Append an interleaved image+text user turn and prefill it — the shared core
+/// Append an interleaved image+text user turn and prefill it, the shared core
 /// of the CLI's `imageTurn` and the GUI worker's `imageTurn`/`imageTurnGemma4`.
 /// Builds the family-aware segment layout, opens the assistant turn, grows the
 /// KV window to fit, then injects each encoded image's embeddings at its
@@ -306,7 +306,7 @@ pub const no_prefill: struct {
 /// `model` is any stepper exposing cached/remaining/ensureCapacity/prefill/
 /// prefillImage; `segs` is the caller-built segment list (image placeholders +
 /// text, in display order); `encs` is a slice whose elements have `.embeds`/
-/// `.grid_w`/`.grid_h` (the arch ViT's `Encoded`) — one per image segment, in
+/// `.grid_w`/`.grid_h` (the arch ViT's `Encoded`), one per image segment, in
 /// order. The image ENCODE (arch-specific ViT) stays with the caller; this owns
 /// only the backend-agnostic layout + interleave. Errors (e.g. ContextFull from
 /// ensureCapacity) propagate after `segs`/assistant tokens are already appended,
@@ -337,7 +337,7 @@ pub fn prefillImageTurn(
 
 /// A `prefiller` for a one-shot `--image` turn: prefill the tokens before the
 /// image block, then the image embeddings (in place of the placeholder rows),
-/// then all but the last token — the engine's generate() prefills that one and
+/// then all but the last token, the engine's generate() prefills that one and
 /// samples. A no-op when `img` is null (text-only). `Embeds` is the arch's ViT
 /// `Encoded` type (needs `.embeds`, `.grid_w`, `.grid_h`); `ids` is the built
 /// prompt and `n_pre`/`n_img` bound the placeholder block within it.
@@ -349,7 +349,7 @@ pub fn ImagePrefiller(comptime Embeds: type) type {
         ids: []const u32 = &.{},
         pub fn prefill(self: @This(), model: anytype) !void {
             const M = @typeInfo(@TypeOf(model)).pointer.child;
-            // Steppers without an image path (e.g. qwen35's CPU model — its
+            // Steppers without an image path (e.g. qwen35's CPU model, its
             // images are CUDA-only) never receive an image; compile the interleave
             // away for them. `img` is null on those backends at runtime anyway.
             if (comptime !@hasDecl(M, "prefillImage")) return;
@@ -370,7 +370,7 @@ test "bringUpCuda returns null for cpu / vulkan (no device)" {
 // Stub steppers + model to exercise `run`'s CPU arm end-to-end (forcing the
 // generic `run`/`UniformSpec`/`no_prefill` to be analyzed on CPU, no device).
 // `run` analyzes every arm, so the CPU and CUDA steppers must carry the real
-// (differing) init arities — CPU `(gpa, lm, cap)`, CUDA `(gpa, be, lm, cap)`.
+// (differing) init arities, CPU `(gpa, lm, cap)`, CUDA `(gpa, be, lm, cap)`.
 const StubModel = struct {};
 const StubCpu = struct {
     driven: bool = false,

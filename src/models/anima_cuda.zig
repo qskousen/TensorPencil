@@ -1,41 +1,31 @@
 //! GPU-resident Anima (`MiniTrainDIT` + `LLMAdapter`) forward on the CUDA backends
-//! (`zig-cuda`'s hand-PTX and `cuda`'s vendor libraries) — the CUDA twin of
-//! `anima_gpu`.
+//! (`zig-cuda`'s hand-PTX and `cuda`'s vendor libraries), the CUDA twin of `anima_gpu`.
 //!
-//! The split is identical to the Vulkan arm's and to `zimage_cuda`'s: the whole
-//! 28-block trunk runs on the device; the `llm_adapter`, the timestep MLP, every
-//! block's AdaLN pair, patchify and the final layer stay on the host. See
-//! `anima_gpu`'s header for why each of those is not laziness — in particular the
-//! adapter is per-*image*, not per-step, and so is cross-attention's K and V.
+//! The host/device split is identical to the Vulkan arm's; see `anima_gpu`'s header.
+//! Three differences, all forced by the op surface:
 //!
-//! **Three differences from the Vulkan arm, all forced by the op surface:**
+//! 1. Self-attention is `opAttnTC`: cuDNN's fused SDPA under `cuda`, the hand-PTX
+//!    tensor-core path under `zig-cuda`.
+//! 2. Cross-attention is always `opAttnTCRect`, in BOTH arms, because cuDNN's `SdpaPlan`
+//!    is built for a single sequence length and Anima's cross-attention is `seq x 512`.
+//!    Teaching that plan a rectangular shape is a separate change, deliberately not
+//!    made. It is ~8% of the step's FLOPs.
+//! 3. The per-image cross-attention K/V cache is f32 here, f16 on Vulkan: the CUDA
+//!    attention entry points take f32 and gather/convert internally, so there is nothing
+//!    to pre-convert into. 235 MB against Vulkan's 117 MB, and the per-step
+//!    re-conversion it costs is well under a millisecond.
 //!
-//! 1. **Self-attention is `opAttnTC`**, which is cuDNN's fused SDPA under
-//!    `--backend cuda` and the hand-PTX tensor-core path under `zig-cuda`.
-//! 2. ⚠️ **Cross-attention is always `opAttnTCRect`, in BOTH arms.** cuDNN's
-//!    `SdpaPlan` is built for a single sequence length, and Anima's cross-attention is
-//!    `seq x 512`; teaching that plan a rectangular shape is a real but separate
-//!    change, deliberately not made. So a `cuda` render's cross-attention and a
-//!    `zig-cuda` render's run the same kernels. It is ~8% of the step's FLOPs.
-//! 3. ⚠️ **The per-image cross-attention K/V cache is f32 here, f16 on Vulkan.** The
-//!    CUDA attention entry points take f32 buffers and gather/convert internally, so
-//!    there is nothing to pre-convert into; the cache is `[n_layers][ctx_seq][dim]`
-//!    f32 (235 MB at 28 x 512 x 2048) against Vulkan's 117 MB of f16 operands. The
-//!    per-step re-conversion it costs is ~29 M elements, well under a millisecond.
+//! int8/int4 convrot runs here with the kind resolved PER BLOCK (`kindOf` per linear,
+//! `prepGroup` per shared activation). A real mixed checkpoint quantizes different
+//! linears in different blocks, so `dit_cuda`'s one-value-per-model `LinKind` would be
+//! wrong for at least one of them. Cross-attention's k/v and the AdaLN pair may be
+//! quantized too but are evaluated on the HOST, where `ops.matmul` handles convrot at
+//! any shape, which is what lets the device path require `rows % 128 == 0` without
+//! special-casing their 256/6144 widths.
 //!
-//! **int8/int4 convrot runs here, and the kind is resolved PER BLOCK.** ⚠️ `dit_cuda`'s
-//! `LinKind` is one value for the whole model ("uniform across blocks"), which is wrong for
-//! a real mixed Anima checkpoint: `easonAnimaHOTStyle_animaV10-INT8_CONVROT` leaves block 0
-//! entirely dense, quantizes block 1's ten attention/MLP linears, and quantizes all sixteen
-//! in blocks 2-27. So `kindOf` is per linear and `prepGroup` is per shared activation.
-//! Cross-attention's k/v and the AdaLN pair are quantized too in that file but are
-//! evaluated on the HOST, where `ops.matmul` handles convrot at any shape — which is what
-//! lets the device path require `rows % 128 == 0` without special-casing their 256/6144.
-//!
-//! ⚠️ **Head width is exactly 128**, which both `launchHgemmB`'s P@V tiling and cuDNN
-//! handle directly — so unlike the SD family there is no head padding. Every GEMM
-//! width (2048 / 8192 / 1024) is a multiple of 128 and every reduction width a
-//! multiple of 32, so `opGemmBf16`'s shape constraints are met without special-casing.
+//! Head width is exactly 128, which both `launchHgemmB`'s P@V tiling and cuDNN handle
+//! directly, so unlike the SD family there is no head padding. Every GEMM width (2048 /
+//! 8192 / 1024) is a multiple of 128 and every reduction width a multiple of 32.
 
 const std = @import("std");
 const anima = @import("anima.zig");
@@ -51,7 +41,7 @@ const Weight = ops.matmul.Weight;
 /// paths. For A/B and for reproducing a mismatch; `anima-cuda-test` runs both.
 pub var force_naive_attn: bool = false;
 
-/// Widest zero bias any Anima GEMM needs (the MLP's `mlp_dim`). ⚠️ Passed WHOLE,
+/// Widest zero bias any Anima GEMM needs (the MLP's `mlp_dim`). Passed WHOLE,
 /// never sliced: a bias is cached by host pointer and sized from the first call's
 /// length, so a narrow layer seen first would leave every wider one reading past the
 /// end. `opGemmBf16` asserts `bias.len >= co` and the kernels read only `co` entries.
@@ -68,7 +58,7 @@ pub const Session = struct {
 
     /// 3-axis RoPE table for the image grid: `cos` then `sin`, `seq * half` each.
     freqs_d: Buf,
-    /// Cross-attention K and V for EVERY block, `[n_layers][ctx_seq][dim]` f32 —
+    /// Cross-attention K and V for EVERY block, `[n_layers][ctx_seq][dim]` f32,
     /// projections of the adapter's output, which no step changes. See the header.
     ck_d: Buf,
     cv_d: Buf,
@@ -77,7 +67,7 @@ pub const Session = struct {
     /// tables (see `anima.foldModulationTable`).
     sigmas: []f32,
     /// Borrowed, model-owned: the FOLDED table for every scheduled sigma, stride
-    /// `mod_stride`. ⚠️ Per SIGMA, not per conditioning — see
+    /// `mod_stride`. Per SIGMA, not per conditioning, see
     /// `anima.DiT.modulationSchedule` for why building it per session cost 0.8 s an image.
     mods: []const f32,
     mod_stride: usize,
@@ -137,13 +127,12 @@ pub const Session = struct {
 
         // Cross-attention K/V for every block, ON THE DEVICE.
         //
-        // ⚠️ **This used to run on the host and it was the "Anima images are slow to
-        // start" bug.** 28 blocks x 2 GEMMs of `[512, 2048] x [2048, 1024]` is ~120 GFLOP
-        // per conditioning, doubled under CFG — **measured 1.24 s per image** at 512x768,
-        // repeated for every image in a queue. The original comment justified the host by
-        // "one 512-row pass per block, done once per image", and as a share of a STEP it is
-        // 0.56%; as a one-off before the first step it was seconds. **A cost that is
-        // negligible per step is not therefore negligible per image** — the two framings
+        // Running these on the host costs seconds per image: 28 blocks x 2 GEMMs of
+        // `[512, 2048] x [2048, 1024]` is ~120 GFLOP per conditioning, doubled under
+        // CFG, measured 1.24 s at 512x768, repeated for every image in a queue. As a
+        // share of a STEP that is 0.56%, which is what makes the host version look
+        // cheap. A cost that is negligible per step is not therefore negligible per
+        // image, and the two framings
         // needed separate measurements and only one was taken.
         //
         // The trade the old comment named is real but small: the cross `k`/`v` weights now
@@ -176,7 +165,7 @@ pub const Session = struct {
                 try prepGroup(be, cond_d, ctx_seq, cfg.context_dim, &.{ blk.cross_attn.k, blk.cross_attn.v });
                 try lin(be, kv_out, cond_d, ctx_seq, blk.cross_attn.k);
                 try lin(be, vv_out, cond_d, ctx_seq, blk.cross_attn.v);
-                // ⚠️ K is normed, V is NOT (`v_norm = nn.Identity()`) — the asymmetry
+                // K is normed, V is NOT (`v_norm = nn.Identity()`), the asymmetry
                 // `DiT.projectKv` owns on the host path.
                 try be.qkNorm(kv_out, kv_out, try normBuf(be, blk.cross_attn.knorm), ctx_seq * cfg.n_heads, cfg.headDim(), cfg.qk_eps);
             }
@@ -223,13 +212,13 @@ pub const Workspace = struct {
         const cfg = model.cfg;
         const seq = (lat_h / cfg.patch) * (lat_w / cfg.patch);
         const d = cfg.dim;
-        // ⚠️ **Every activation buffer is 128-ROW PADDED, because a quantized GEMM writes
-        // `i8_mpad` rows, not `m`.** `opI8Prep` pads the activation up to a multiple of 128
+        // Every activation buffer is 128-ROW PADDED, because a quantized GEMM writes
+        // `i8_mpad` rows, not `m`. `opI8Prep` pads the activation up to a multiple of 128
         // and `opI8Gemm` launches `grid.y = i8_mpad / 128`, so its output covers the padded
         // row count. At the validator's 192-token latent that is 256 rows into a 192-row
-        // buffer — a 25% overrun, and `compute-sanitizer` named it as
+        // buffer, a 25% overrun, and `compute-sanitizer` named it as
         // `igemm_pipe_fused` writing 1 byte past a 1,572,864-byte allocation. The dense
-        // path writes exactly `m` rows, which is why this was invisible until int8 landed.
+        // path writes exactly `m` rows, so only the quantized path exposes it.
         const seq_pad = std.mem.alignForward(usize, seq, 128);
         const sizes = [fields.len]usize{
             seq_pad * d * 4,
@@ -267,12 +256,12 @@ pub const Workspace = struct {
 /// rather than being read as the wrong dtype.
 pub fn supported(model: *const DiT) bool {
     if (model.blocks.len == 0) return false;
-    // ⚠️ EVERY block's linears, not block 0's — see `anima.unsupportedLin`. This arm HAS
+    // EVERY block's linears, not block 0's, see `anima.unsupportedLin`. This arm HAS
     // int8/int4 convrot (`opI8Prep`/`opI8Gemm`), which the Vulkan one does not, so the
     // support set is passed rather than assumed.
     // Both CUDA arms have int8 AND int4 convrot, plus the W4A8 and NVFP4 decode kernels.
     if (anima.unsupportedLin(model, .{ .i8 = true, .i4 = true, .w4a8 = true, .nvfp4 = true }) != null) return false;
-    // ⚠️ The W4A8 decode kernel reads four packed bytes per thread as one `u32`, so a
+    // The W4A8 decode kernel reads four packed bytes per thread as one `u32`, so a
     // group must not straddle that word. Checked here rather than asserted in `lin`:
     // a checkpoint we cannot run belongs on the CPU, not in a panic.
     if (anima.w4a8SmallGroup(model)) |tag| {
@@ -289,7 +278,7 @@ const kindOf = anima.linKind;
 /// Quantize+rotate the activation `x` once for a group of GEMMs that share it, if any
 /// member of the group needs it.
 ///
-/// ⚠️ **`opI8Prep` does NOT overwrite `x`** — it writes int8 rows and per-row scales into
+/// `opI8Prep` does NOT overwrite `x`, it writes int8 rows and per-row scales into
 /// the backend's own `i8_x`/`i8_scale` and records `i8_cols`. So a dense GEMM in the same
 /// group is free to read the f32 `x` afterwards, and the only real constraint is that the
 /// prep happens before the quant GEMMs and that `cols` matches (which it does: a group
@@ -298,13 +287,13 @@ const kindOf = anima.linKind;
 /// The prep state is global and each call replaces it, so every group that contains a
 /// quantized linear pays exactly one prep.
 fn prepGroup(be: *Backend, x: Buf, m: usize, cols: usize, group: []const Weight) !void {
-    // ⚠️ Grouped by the PREP a kind needs, not by the kind: int8 and W4A8 share one
+    // Grouped by the PREP a kind needs, not by the kind: int8 and W4A8 share one
     // (`anima.prepKind` says why), so a block mixing them pays a single `opI8Prep`.
     var want: anima.PrepKind = .none;
     for (group) |w| {
         const k = anima.prepKind(kindOf(w));
         if (k == .none) continue;
-        // ⚠️ int8 and int4 in ONE group would need two preps of the same activation
+        // int8 and int4 in ONE group would need two preps of the same activation
         // and two live prep states, which the backend does not have. No checkpoint
         // does this; refuse loudly rather than silently use the wrong scale set.
         if (want != .none and want != k) {
@@ -324,7 +313,7 @@ fn prepGroup(be: *Backend, x: Buf, m: usize, cols: usize, group: []const Weight)
 /// prep state (so `x` is unused for it) and fuses the per-row rescale; a dense one takes
 /// the tensor-core path in `gemm`.
 ///
-/// ⚠️ `opI8Gemm`/`opI4Gemm` launch `grid.x = rows / 128`, so a quantized linear needs
+/// `opI8Gemm`/`opI4Gemm` launch `grid.x = rows / 128`, so a quantized linear needs
 /// `rows % 128 == 0`. Every one the device runs here is 2048 or 8192; the odd widths
 /// (the AdaLN pair's 256 and 6144, and cross-attention's k/v) are evaluated on the HOST,
 /// where `ops.matmul` handles convrot regardless of shape.
@@ -404,9 +393,9 @@ pub fn forward(
     try be.opMatmul(ws.x_d, 0, ws.patch_d, 0, seq, model.x_embedder.bytes, model.x_embedder.dtype == .f8_e4m3, d, cfg.patchDim(), model.x_embedder.scale, null);
 
     // Prefetch one block ahead throughout, so each block's upload overlaps the
-    // previous block's compute. ⚠️ Without it the first step pays the whole weight
-    // upload serially — `zimage_cuda` measured **8.0 s for step 1 against a 2.6 s
-    // steady state** at 1056x1584, which on a short render is a fifth of the total.
+    // previous block's compute. Without it the first step pays the whole weight
+    // upload serially, `zimage_cuda` measured 8.0 s for step 1 against a 2.6 s
+    // steady state at 1056x1584, which on a short render is a fifth of the total.
     if (be.async_uploads and model.blocks.len > 0) prefetchBlock(be, model.blocks[0]);
     for (model.blocks, 0..) |*blk, bi| {
         if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
@@ -447,11 +436,11 @@ fn blockForward(
     try lin(be, ws.k_d, ws.nrm_d, seq, blk.self_attn.k);
     try lin(be, ws.v_d, ws.nrm_d, seq, blk.self_attn.v);
 
-    // ⚠️ Anima's Q/K norms take the BLOCKS' 1e-6, not `finfo(f32).eps` — unlike
+    // Anima's Q/K norms take the BLOCKS' 1e-6, not `finfo(f32).eps`, unlike
     // Z-Image, whose `RMSNorm(head_dim)` is built with no `eps` at all.
     try be.qkNorm(ws.q_d, ws.q_d, try normBuf(be, blk.self_attn.qnorm), seq * heads, hd, cfg.qk_eps);
     try be.qkNorm(ws.k_d, ws.k_d, try normBuf(be, blk.self_attn.knorm), seq * heads, hd, cfg.qk_eps);
-    // ⚠️ SPLIT-half RoPE (pairs `(i, i + 64)`), not the interleaved `be.rope` that
+    // SPLIT-half RoPE (pairs `(i, i + 64)`), not the interleaved `be.rope` that
     // Z-Image and krea2 use.
     try be.ropeHalf(ws.q_d, sess.freqs_d, seq, heads, half, seq * half, 0);
     try be.ropeHalf(ws.k_d, sess.freqs_d, seq, heads, half, seq * half, 0);
@@ -466,8 +455,8 @@ fn blockForward(
     try be.gatedAdd(ws.x_d, ws.dlt_d, ws.mod_d, seq * d, d, mod_base + 2 * d);
 
     // --- cross-attention onto the adapter's output ------------------------------
-    // ⚠️ No RoPE here at all, and K/V come from the session's per-image cache rather
-    // than from two GEMMs — see the module header.
+    // No RoPE here at all, and K/V come from the session's per-image cache rather
+    // than from two GEMMs, see the module header.
     try be.lnMod(ws.x_d, ws.nrm_d, ws.mod_d, seq, d, mod_base + 4 * d, mod_base + 3 * d, cfg.norm_eps);
     try prepGroup(be, ws.nrm_d, seq, d, &.{blk.cross_attn.q});
     try lin(be, ws.q_d, ws.nrm_d, seq, blk.cross_attn.q);
@@ -490,9 +479,9 @@ fn blockForward(
     try be.lnMod(ws.x_d, ws.nrm_d, ws.mod_d, seq, d, mod_base + 7 * d, mod_base + 6 * d, cfg.norm_eps);
     try prepGroup(be, ws.nrm_d, seq, d, &.{blk.mlp1});
     try lin(be, ws.mlp_d, ws.nrm_d, seq, blk.mlp1);
-    // `nn.GELU()` with the default `approximate='none'` — the erf form, not tanh.
+    // `nn.GELU()` with the default `approximate='none'`, the erf form, not tanh.
     try be.geluErf(ws.mlp_d, seq * cfg.mlp_dim);
-    // ⚠️ Its own prep: the reduction width here is `mlp_dim`, not `dim`, and the prep
+    // Its own prep: the reduction width here is `mlp_dim`, not `dim`, and the prep
     // state records ONE `cols`.
     try prepGroup(be, ws.mlp_d, seq, cfg.mlp_dim, &.{blk.mlp2});
     try lin(be, ws.dlt_d, ws.mlp_d, seq, blk.mlp2);
@@ -504,8 +493,8 @@ fn blockForward(
 /// pointers `blockForward` later fetches, or the prefetch is a cache miss and pure
 /// waste.
 ///
-/// ⚠️ `cross_attn.k`/`.v` are deliberately absent: `Session.init` consumes them ONCE per
-/// image (now on the device), and the step loop never touches them again — so prefetching
+/// `cross_attn.k`/`.v` are deliberately absent: `Session.init` consumes them ONCE per
+/// image (now on the device), and the step loop never touches them again, so prefetching
 /// them here would re-upload ~235 MB per step that nothing reads.
 fn prefetchBlock(be: *Backend, blk: anytype) void {
     const bytes = std.mem.sliceAsBytes;
@@ -517,14 +506,14 @@ fn prefetchBlock(be: *Backend, blk: anytype) void {
     inline for (.{ blk.mlp1, blk.mlp2 }) |w| be.prefetchWeight(w.bytes);
 }
 
-/// A block GEMM, dispatched by weight dtype — the same routing `zimage_cuda.gemm`
+/// A block GEMM, dispatched by weight dtype, the same routing `zimage_cuda.gemm`
 /// uses. Ampere+ feeds raw bf16 straight to the tensor cores; older cards take the
 /// GPU-side bf16->f16 GEMM.
 fn gemm(be: *Backend, y: Buf, x: Buf, m: usize, w: Weight) !void {
     const zeros: []const f32 = &zero_bias;
     std.debug.assert(w.rows <= zeros.len);
     switch (w.dtype) {
-        // ⚠️ `null`, not `zeros`: Anima's block linears are all bias-free, and a null
+        // `null`, not `zeros`: Anima's block linears are all bias-free, and a null
         // bias lets the `.libs` arm write the GEMM straight into `y` instead of staging
         // through `conv_c` and re-reading the whole output to add zero.
         .bf16 => if (be.ctx.cc_major >= 8 and w.rows % 128 == 0 and w.cols % 32 == 0)

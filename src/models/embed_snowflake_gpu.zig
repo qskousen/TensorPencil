@@ -1,5 +1,5 @@
 //! Snowflake Arctic Embed (GTE) on the Vulkan backend. The bidirectional
-//! **post-LayerNorm** GTE body runs device-side; the CLS pool + L2 normalize
+//! post-LayerNorm GTE body runs device-side; the CLS pool + L2 normalize
 //! (trivial) on the host. Reuses the CPU model's f32 weights directly.
 //!
 //! GTE differs from the pre-norm encoders: attention/MLP read the residual
@@ -8,7 +8,7 @@
 //! byte-slicing at row boundaries is exact). RoPE is single-theta rotate-half.
 //!
 //! GELU: GTE's FFN uses exact-erf gelu on the CPU; the Vulkan `gelu_mul` kernel
-//! is tanh-approx. The two differ by ~1e-3/elt — within the parity floor here —
+//! is tanh-approx. The two differ by ~1e-3/elt, within the parity floor here,
 //! so we use `gelu_mul`; revisit with a dedicated erf kernel if it ever drifts.
 
 const std = @import("std");
@@ -129,11 +129,11 @@ pub const ModelGpu = struct {
         l2normalize(out);
     }
 
-    /// Batched Vulkan encode: `ids_list[i]` → `outs[i]`. Mirrors the CPU
+    /// Batched Vulkan encode: `ids_list[i]` -> `outs[i]`. Mirrors the CPU
     /// `Model.embedBatch` (ragged packing: all GEMMs / LayerNorms / GeGLU over
     /// `total = sum(seq_i)` rows; only RoPE + attention loop per item, via the
     /// `rope_half`/`attn_full` element-offset push fields). One
-    /// upload→forward→download for the whole batch.
+    /// upload->forward->download for the whole batch.
     pub fn embedBatch(self: *const ModelGpu, ctx: *gpu.Context, io: std.Io, gpa: std.mem.Allocator, ids_list: []const []const u32, outs: [][]f32) !void {
         _ = io;
         const cpu = self.cpu;

@@ -4,7 +4,7 @@
 //! Decode is compute-bound (~12% of memory bandwidth at the scalar-f32 GEMV's
 //! throughput), so the lever is faster arithmetic. The weight is pre-repacked so
 //! four consecutive quant values of a row sit contiguously in one u32 and a
-//! 32-lane warp reads coalesced — so a thread issues one `OpSDot` (hardware
+//! 32-lane warp reads coalesced, so a thread issues one `OpSDot` (hardware
 //! dp4a: 4 int8 MACs) per quad with NO gather/pack. The iq4_nl codebook is
 //! pre-applied during repack, so q8_0 and iq4_nl share this single kernel
 //! (uniform int8 + f32-scale blocks).
@@ -41,7 +41,7 @@ extern var pc: Push addrspace(.push_constant);
 
 // A u16-typed ALIAS of binding 0 (the raw weight `a`): lets the aligned-u16
 // dp4a GEMV kernels read quant blocks as native 16-bit words (2 loads/quad, 4
-// bytes) instead of assembling from u32 loads (2 loads, 8 bytes) — matching
+// bytes) instead of assembling from u32 loads (2 loads, 8 bytes), matching
 // llama.cpp's block_q*_packed16 views. Needs StorageBuffer16BitAccess (injected
 // host-side when the device supports it).
 const WU16 = extern struct { data: [1 << 27]u16 };
@@ -94,7 +94,7 @@ inline fn decorate16() void {
     );
 }
 
-// Aligned 4-int8 quad from an EVEN byte offset: 2 native u16 loads → u32 for
+// Aligned 4-int8 quad from an EVEN byte offset: 2 native u16 loads -> u32 for
 // OpSDot. Reads exactly 4 bytes (vs the u32-view's 8) and is 16-bit-aligned.
 inline fn wquad16(bo: u32) u32 {
     const i = bo / 2;
@@ -123,7 +123,7 @@ const BLOCK_U32 = 256 + 32;
 
 // --- raw block readers + subgroup reduce (cooperative dp4a GEMV) -----------
 // Byte-addressed reads into the RAW row-major GGUF layout (the cooperative
-// kernels read raw, not repacked — no VRAM doubling).
+// kernels read raw, not repacked, no VRAM doubling).
 inline fn wbyte(bo: u32) u32 {
     const word: u32 = @bitCast(a.data[bo / 4]);
     const sh: u5 = @intCast(8 * (bo % 4));
@@ -135,9 +135,9 @@ inline fn wf16(bo: u32) f32 { // bo is 2-byte aligned
     return @floatCast(@as(f16, @bitCast(bits)));
 }
 // Assemble a u32 of 4 consecutive raw bytes at byte offset `bo` (q8_0 quads sit
-// at +2 mod 4, so a plain u32 load would be misaligned — this is the alignment
+// at +2 mod 4, so a plain u32 load would be misaligned, this is the alignment
 // tax the repack avoids). Reads the (at most two) overlapping aligned u32s and
-// shift-combines — 1–2 loads, not 4.
+// shift-combines, 1-2 loads, not 4.
 inline fn wquad(bo: u32) u32 {
     const i = bo / 4;
     const sh: u5 = @intCast((bo % 4) * 8);
@@ -163,7 +163,7 @@ const kvalues_iq4nl = [16]i32{ -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 
 // Logical byte `j` of row `row` lives at gb + j*32 (gb = (row/32)*row_bytes*32
 // + row%32). A 32-lane warp of consecutive rows reads 32 contiguous bytes per
 // `j` (coalesced). This is the SAME layout the scalar `gemv_*_t` kernels and the
-// GEMM prefill (weightBufferRawT) read — so a dp4a-over-_t kernel adds NO extra
+// GEMM prefill (weightBufferRawT) read, so a dp4a-over-_t kernel adds NO extra
 // VRAM and shares the resident buffer.
 const GROUP = 32;
 inline fn tbyte(gb: u32, j: u32) u32 {
@@ -182,7 +182,7 @@ inline fn tquad(gb: u32, j: u32) u32 {
 }
 
 // gemv_q8_0_t_dp4a: dp4a decode GEMV over the 32-row-group TRANSPOSED q8_0
-// weight (weightBufferRawT) + k-split — the fast repack-dp4a shape but reading
+// weight (weightBufferRawT) + k-split, the fast repack-dp4a shape but reading
 // the _t layout, so NO int8 repack (no extra VRAM, shares the prefill buffer).
 // Thread (row, ch) dp4a's the contiguous block range [ch*chunk,(ch+1)*chunk) of
 // its row into partials[ch*rows+row]; gemv_combine reduces over ch + applies the
@@ -221,7 +221,7 @@ export fn gemv_q8_0_t_dp4a() callconv(.spirv_kernel) void {
 
 // gemv_iq4_nl_t_dp4a: dp4a decode GEMV over the transposed iq4_nl weight
 // (weightBufferRawT, 18 B block) + k-split. Nibbles are LUT'd to int8 in-
-// register (no int8 repack → stays 4-bit in VRAM, HALF the repack footprint).
+// register (no int8 repack -> stays 4-bit in VRAM, HALF the repack footprint).
 // quad q<4 = low nibbles of logical bytes 4q.., q>=4 = high nibbles of 4(q-4)..;
 // matches quant_act_i8's element order. a = W (_t), b = xi8, c = xscale,
 // d = partials. u0 = rows*nchunk, u1 = cols, u2 = nchunk, u3 = rows.
@@ -316,10 +316,10 @@ export fn gemv_q8_0_sg_dp4a() callconv(.spirv_kernel) void {
 }
 
 // gemv_iq4_nl_sg_dp4a: as above for RAW iq4_nl (block 18 B = f16 d + 16 nibble
-// bytes; v = kvalues[nibble]). Lane tid → block (base+tid/4), chunk (tid%4) =
+// bytes; v = kvalues[nibble]). Lane tid -> block (base+tid/4), chunk (tid%4) =
 // elements [chunk*8, chunk*8+8): chunk<2 = low nibbles of bytes chunk*8.., chunk
 // >=2 = high nibbles of bytes (chunk-2)*8.. (matches quant_act_i8 element order).
-// LUT'd to int8 in-register (no repack → stays 4-bit in VRAM). a = raw W, b =
+// LUT'd to int8 in-register (no repack -> stays 4-bit in VRAM). a = raw W, b =
 // xi8, c = xscale, d = y. Dispatch LocalSize 32, one row per wg.
 export fn gemv_iq4_nl_sg_dp4a() callconv(.spirv_kernel) void {
     decorate16();

@@ -1,4 +1,4 @@
-//! LPIPS — Learned Perceptual Image Patch Similarity (Zhang et al. 2018), the
+//! LPIPS, Learned Perceptual Image Patch Similarity (Zhang et al. 2018), the
 //! AlexNet variant, v0.1.
 //!
 //! LPIPS is not "a perceptual distance"; it is one specific computation, and
@@ -51,7 +51,7 @@ const pool_k = 3;
 const pool_stride = 2;
 
 /// The eps inside `normalize_tensor`, which is added to the norm rather than to
-/// its square — worth stating because the two differ at the 1e-5 the fixtures
+/// its square, worth stating because the two differ at the 1e-5 the fixtures
 /// check.
 const norm_eps = 1e-10;
 
@@ -69,7 +69,7 @@ pub const Tap = struct {
 
 /// Errors this module raises itself, on top of whatever the safetensors reader,
 /// the allocator and the GEMM raise. `ImageTooSmall` means the tower would
-/// produce a zero-extent tap — below ~32x32 for AlexNet.
+/// produce a zero-extent tap, below ~32x32 for AlexNet.
 pub const Error = error{ MissingTensor, ShapeMismatch, SizeMismatch, ImageTooSmall };
 
 pub const Lpips = struct {
@@ -157,7 +157,7 @@ pub const Lpips = struct {
         self.arena.deinit();
     }
 
-    /// The 5 tapped feature maps for one image, **before** normalization — i.e.
+    /// The 5 tapped feature maps for one image, before normalization, i.e.
     /// exactly what conv+ReLU produced, which is what the per-layer fixture
     /// checksums pin. `pixels` is `[h][w][3]` u8 RGB. Caller frees each
     /// `Tap.data` with `gpa`.
@@ -238,7 +238,7 @@ pub const Lpips = struct {
     /// LPIPS distance between two equally sized `[h][w][3]` u8 RGB images, and
     /// the 5 per-layer contributions it is the sum of.
     ///
-    /// Lower is more similar; 0 for identical input. Typical range 0–1, though
+    /// Lower is more similar; 0 for identical input. Typical range 0-1, though
     /// nothing bounds it above.
     pub fn distancePerLayer(
         self: *const Lpips,
@@ -296,7 +296,7 @@ pub const Lpips = struct {
     }
 };
 
-/// In-place `x /= ‖x‖₂ + eps` per spatial position, across channels — the
+/// In-place `x /= ‖x‖₂ + eps` per spatial position, across channels, the
 /// reference's `normalize_tensor`.
 fn normalizeChannels(t: Tap) void {
     var p: usize = 0;

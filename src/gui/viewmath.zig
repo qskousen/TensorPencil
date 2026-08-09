@@ -13,7 +13,7 @@ pub fn zoomAt(pan: f32, cur: f32, zoom: f32, new_zoom: f32) f32 {
     return (pan + cur) * (zoom / new_zoom) - cur;
 }
 
-/// Screen position of image point `u` under the viewer's render mapping —
+/// Screen position of image point `u` under the viewer's render mapping,
 /// test-only mirror of `Viewer.renderImageArea`.
 fn screenPos(center: f32, pan: f32, u: f32, zoom: f32, scale: f32) f32 {
     return center + (pan + u) * zoom * scale;

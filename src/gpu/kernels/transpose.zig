@@ -230,7 +230,7 @@ export fn bf16_to_f16_coopw() callconv(.spirv_kernel) void {
 
 /// bf16 weight [rows][cols] -> bf16 k-major [k_pad][stride] (native bf16 coop
 /// GEMM). Same layout as bf16_to_f16_coopw but the 16-bit bits are copied
-/// VERBATIM (bf16 in, bf16 out) — no conversion, so the tensor cores consume
+/// VERBATIM (bf16 in, bf16 out), no conversion, so the tensor cores consume
 /// the raw checkpoint values. Two adjacent r packed per output u32.
 export fn bf16_coopw() callconv(.spirv_kernel) void {
     decorate();

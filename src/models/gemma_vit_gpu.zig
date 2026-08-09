@@ -3,10 +3,10 @@
 //! gemma_vit_cuda). Correctness-first, mirroring the Vulkan LLM path.
 //!
 //! Vulkan has no f16-weight GEMM, so the f16 block weights are dequantized to
-//! f32 once at load (stable host pointers → the Context weight cache works)
+//! f32 once at load (stable host pointers -> the Context weight cache works)
 //! and fed to the f32 `opMatmul` (+bias). Attention is the full non-causal
 //! `attn_full` kernel (arbitrary head_dim 72), LayerNorm the `layernorm`
-//! kernel, GELU the `gelu` kernel — all added for this port. The patch conv
+//! kernel, GELU the `gelu` kernel, all added for this port. The patch conv
 //! and learned position embedding, and the host projector, are the same as
 //! the CPU/CUDA paths.
 

@@ -19,7 +19,7 @@ const DiT = dit.DiT;
 pub var profile: bool = false;
 
 /// When true, force the full-f32 path (opMatmul GEMMs + eltwise f32
-/// attention) even where the tensor-core / coop pipelines exist — the
+/// attention) even where the tensor-core / coop pipelines exist, the
 /// hardware-fallback path, exposed for A/B (speed vs f16 rounding). Must be
 /// set before Workspace.init, which sizes its buffers from the same choice.
 pub var force_f32: bool = false;
@@ -34,7 +34,7 @@ const Prof = struct {
     prep_ns: i96 = 0, // int8 rotate/rowscale/quantize prep (opI8Prep)
     // Packed W4A8 -> k-major int8 decode (w4a8_decode_t), its own category because it
     // is a per-GEMM cost that buys VRAM and has a bandwidth ceiling to be judged
-    // against — folded into `matmul` it would just look like a slower GEMM.
+    // against, folded into `matmul` it would just look like a slower GEMM.
     w4a8_ns: i96 = 0,
     xfer_ns: i96 = 0,
     cpu_ns: i96 = 0,
@@ -46,7 +46,7 @@ const hd = dit.head_dim;
 const attn_scale: f32 = 1.0 / 11.313708498984761; // 1/sqrt(128)
 
 /// Flash attention (coopmat.buildFlashAttn) keeps the {m, 1/d} table in the
-/// tail of attn_d and never materializes S — but measured SLOWER than the
+/// tail of attn_d and never materializes S, but measured SLOWER than the
 /// two-pass path at DiT sizes (attn 1.49 -> 2.43 s at 1120x1680): the out
 /// pass recomputes S at the global-fragment-load rate (~0.8 s), which costs
 /// more than the coalesced S write + reads it eliminates (~0.5 s). It would
@@ -66,9 +66,9 @@ const rms_ch = 32;
 /// Cap on the materialized attention-scores buffer; heads batch to fit it.
 const s_bytes_cap: usize = 2 << 30;
 
-/// Per-sampling-run cache: everything constant across steps — the text
+/// Per-sampling-run cache: everything constant across steps, the text
 /// fusion tokens (a full CPU transformer pass), the rope table, and the
-/// timestep vectors for the whole schedule — computed once and, where
+/// timestep vectors for the whole schedule, computed once and, where
 /// device-resident, uploaded once.
 pub const Session = struct {
     seq_txt: usize,
@@ -171,7 +171,7 @@ fn lapNs(io_: std.Io, m: *std.Io.Timestamp, bucket: *i96) void {
 
 /// One int8-convrot GEMM, dispatching on how the weight is STORED: plain int8 goes
 /// straight to the GEMM, a packed W4A8 weight is decoded (and k-major transposed) into
-/// the context's transient scratch first. Both then run the identical int8 kernel —
+/// the context's transient scratch first. Both then run the identical int8 kernel,
 /// W4A8's "A8" is precisely that the activation stays 8-bit.
 ///
 /// Per weight rather than per model, so a checkpoint that mixes the two storage forms
@@ -193,9 +193,9 @@ fn i8GemmW(io: std.Io, prof: *Prof, t_mark: *std.Io.Timestamp, ctx: *gpu.Context
     return ctx.opI8Gemm(y, w.bytes, w.row_scale.?, w.rows, c_h16);
 }
 
-/// Per-run device activation buffers, allocated once and reused every step
-/// (a forward used to create/destroy ~20 buffers per call — including the
-/// ~2 GiB scores buffer — and each tensorCreate is a raw vkAllocateMemory).
+/// Per-run device activation buffers, allocated once and reused every step. Allocating
+/// per forward means ~20 create/destroy pairs per call, including the ~2 GiB scores
+/// buffer, and each `tensorCreate` is a raw `vkAllocateMemory`.
 /// Sized for a maximum sequence; one Workspace is shared by the positive and
 /// negative CFG sessions (they differ only in text length). Every kernel
 /// writes the regions it later reads (including zero padding), so reuse
@@ -294,7 +294,7 @@ fn headsPerBatch(s_rows: usize, s_esize: usize, cap: usize, ws_s_bytes: ?usize) 
 
 /// Byte budget for the materialized attention-scores buffer. Defaults to the
 /// 2 GiB cap; a `--vram-budget` shrinks it (attention batches over more head
-/// groups, trading a few launches for a much smaller `s_d` — the single biggest
+/// groups, trading a few launches for a much smaller `s_d`, the single biggest
 /// activation buffer at high resolution). Floored so at least one head fits.
 fn scoresCap(budget: u64) usize {
     if (budget == 0) return s_bytes_cap;
@@ -313,16 +313,16 @@ pub fn forward(
     sigma: f32,
     cancel: ?*std.atomic.Value(bool),
 ) !void {
-    // Weight class of the DiT block linears, gated once — the same check
+    // Weight class of the DiT block linears, gated once, the same check
     // `dit_cuda.forward` makes, and for the same reason. The branches below
     // recognize int8/int4 convrot and dense bf16 and treat *everything else* as
     // raw fp8-e4m3, so a ggml block quant (a GGUF checkpoint) would be read as
     // fp8 bytes and render a blank image with no error at all. Measured: that is
-    // exactly what happened once `pipeline` learned to open a GGUF — the path
+    // exactly what happened once `pipeline` learned to open a GGUF, the path
     // became reachable, so it needs the refusal.
     if (!dit.gpuLinKindSupported(model.blocks[0].attn.wq.dtype)) return error.UnsupportedCheckpoint;
-    // ⚠️ A packed W4A8 weight is `[rows][cols/2]` bytes, and the `else` arm below feeds
-    // anything it does not recognize to the fp8 GEMM — the same shape as the GGUF blank
+    // A packed W4A8 weight is `[rows][cols/2]` bytes, and the `else` arm below feeds
+    // anything it does not recognize to the fp8 GEMM, the same shape as the GGUF blank
     // image this gate already exists for. `is_i8` covers it now, but keep the explicit
     // refusal so a future storage form cannot reach that arm by default.
     if (!ctx.hasW4A8Decode() and dit.anyW4A8(model)) return error.UnsupportedCheckpoint;
@@ -330,9 +330,10 @@ pub fn forward(
     if (dit.anyNvfp4(model))
         try ctx.ensureDeviceBuffer(&ctx.nvfp4_w16, dit.maxNvfp4Scratch(model, gpu.Context.nvfp4ScratchBytes));
     // Pre-size the W4A8 decode scratch to the model's widest weight BEFORE the batch
-    // opens. ⚠️ Growing it mid-forward is *safe* (Vulkan's `ensureDeviceBuffer` flushes
+    // opens. Growing it mid-forward is *safe* (Vulkan's `ensureDeviceBuffer` flushes
     // the recording batch first) but costs a submit-and-wait per growth, and the first
-    // block would pay several — the exact hazard BACKEND.md records for the SD VAE.
+    // block would pay several. The SD VAE decoders allocate up front for the same
+    // reason.
     if (dit.anyW4A8(model)) try ctx.ensureDeviceBuffer(&ctx.w4a8_t, dit.maxW4A8Scratch(model, gpu.Context.w4a8ScratchBytes));
 
     const lat_h = sess.lat_h;
@@ -346,10 +347,10 @@ pub fn forward(
     // tiles); buffers that receive GEMM output are sized for seq_pad (pad
     // rows stay zero).
     const seq_pad = std.mem.alignForward(usize, seq, 128);
-    // ⚠️ **An activation capture forces the f32 GEMM path** (plan item 9), for
+    // An activation capture forces the f32 GEMM path (plan item 9), for
     // coverage first and fidelity second. The cooperative-matrix fast path for fp8
-    // weights converts the modulated norm to **f16** and calls `opMatmulCoopH16`
-    // directly, bypassing `Gemm.go` — the one place a probe can see a block linear's
+    // weights converts the modulated norm to f16 and calls `opMatmulCoopH16`
+    // directly, bypassing `Gemm.go`, the one place a probe can see a block linear's
     // input. Measured: a Vulkan capture recorded 39 of the model's 263 layers, every
     // one of them from another path, and the cache looked perfectly well-formed.
     // Second, what that path would hand the probe is the f16 activation, not the f32
@@ -471,7 +472,7 @@ pub fn forward(
     // bf16 weights always folds a bias in (bias_compact), and the DiT block
     // GEMMs have none. Hand it the full-width zero bias (a stable file-scope
     // pointer): opMatmulCoopF16Wb reads only `rows` of it, so one buffer serves
-    // every GEMM width — a per-width slice of a shared buffer would collide in
+    // every GEMM width, a per-width slice of a shared buffer would collide in
     // the smallBuffer cache (same pointer, first-seen length).
     const zeros: []const f32 = &zero_bias;
     const Gemm = struct {
@@ -484,9 +485,9 @@ pub fn forward(
             // Dense bf16 weights run through the f16-weight tensor-core GEMM
             // (bf16 -> f16 at upload); its f32 output matches opMatmulCoop, so
             // the surrounding f32-operand attention/mlp path is unchanged.
-            // ⚠️ NVFP4 must be handled BEFORE the `else` arms: `opMatmulCoop` reads a
+            // NVFP4 must be handled BEFORE the `else` arms: `opMatmulCoop` reads a
             // 1-byte weight as raw e4m3, so a packed NVFP4 weight would decode as fp8 and
-            // render a blank image with no error — the same failure this file records for
+            // render a blank image with no error, the same failure this file records for
             // a GGUF block quant. Weight-only here (its activation quantization is the
             // Blackwell path), so it feeds the ordinary f16 GEMM.
             if (w_.dtype == .nvfp4) {
@@ -523,7 +524,7 @@ pub fn forward(
         if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
         const mv_base: u32 = @intCast(b * 6 * F);
 
-        // t1 = (1+pre_scale) * prenorm(x) + pre_shift — the norm weight is
+        // t1 = (1+pre_scale) * prenorm(x) + pre_shift, the norm weight is
         // prefolded into mv slot 0; inv-rms comes from the parallel
         // partial/combine pair (a one-thread-per-row loop over dim 6144 is
         // latency-bound).
@@ -540,15 +541,15 @@ pub fn forward(
         }, seq, 1, 1);
         // Attention. When every consumer shares one dequant scale (the Krea
         // 2 DiT stores raw e4m3: all scales are 1), the modulated norm
-        // converts straight to f16 once and feeds all four GEMMs — the f32
+        // converts straight to f16 once and feeds all four GEMMs, the f32
         // intermediate and three redundant conversions disappear.
         // int8 (convrot) weights route through the int8 tensor-core path:
         // one rotate+quantize of the modulated-norm input feeds all four
-        // GEMMs (opI8Prep/opI8Gemm), producing f32 q/k/v/g — so it takes the
+        // GEMMs (opI8Prep/opI8Gemm), producing f32 q/k/v/g, so it takes the
         // f32-output branches below (which still run tensor-core attention).
-        // ⚠️ `.w4a8` belongs on the int8 side of every branch below, not merely "not
+        // `.w4a8` belongs on the int8 side of every branch below, not merely "not
         // fp8": the `else` arms feed the weight to the fp8 GEMM, which would read the
-        // packed nibbles as e4m3 bytes and render a blank image with no error — the same
+        // packed nibbles as e4m3 bytes and render a blank image with no error, the same
         // failure this file already records for a GGUF block quant. Its activation prep
         // and GEMM are int8's; only the weight's storage differs (`opI8GemmW4A8`).
         const is_i8 = blk.attn.wq.dtype == .i8 or blk.attn.wq.dtype == .w4a8;
@@ -556,12 +557,12 @@ pub fn forward(
         // routes them to the f16-weight coop GEMM); they must be kept out of the
         // fp8-coop shared/att16 fast paths, which assume 1-byte e4m3 weights.
         const is_bf16 = blk.attn.wq.dtype == .bf16;
-        // ⚠️ NVFP4 must be excluded from the fp8 SHARED paths below as well, not just from
+        // NVFP4 must be excluded from the fp8 SHARED paths below as well, not just from
         // `Gemm.go`. Those are gated on `!is_i8 and !is_bf16`, which for a packed NVFP4
-        // weight is TRUE — and they call `opMatmulCoopH16`/`opMatmulCoop`, which read a
+        // weight is TRUE, and they call `opMatmulCoopH16`/`opMatmulCoop`, which read a
         // 1-byte weight as raw e4m3. That is how it first behaved: the q/k/v/gate and MLP
         // GEMMs took the fp8 path, decoding nibble pairs as e4m3 bytes, and it was visible
-        // only as VRAM (84 layers cached at their LOGICAL byte count, 2x the packed size —
+        // only as VRAM (84 layers cached at their LOGICAL byte count, 2x the packed size,
         // 8064 MiB of an 11899 MiB total) because a 4-step 256px render still looked
         // plausible. Weight storage has to gate every arm, not the one you remembered.
         const is_nvfp4 = blk.attn.wq.dtype == .nvfp4;
@@ -576,7 +577,7 @@ pub fn forward(
         const att16 = qkv_shared and tc_attn and ctx.pipe_coop_c16 != .null_handle;
         // int8 attention in f16: wq/wk/wv output f16 directly (c_h16 GEMM) so
         // the fused att16 norm/rope/gather chain applies (gate stays f32, so the
-        // gate/wo/mlp path is unchanged — no f16-input prep needed).
+        // gate/wo/mlp path is unchanged, no f16-input prep needed).
         const i8_f16 = is_i8 and tc_attn and ctx.pipe_coop_i8_fs16 != .null_handle;
         const attn_f16 = att16 or i8_f16;
         if (qkv_shared) {
@@ -615,8 +616,8 @@ pub fn forward(
             if (is_i8) {
                 // Prep the modulated norm once, then four int8 GEMMs share it.
                 // (Overlapping them via distinct accs was measured neutral on
-                // this driver — the register-tiled GEMM is the bottleneck, not
-                // serialization — so keep the single-acc path to save VRAM.)
+                // this driver, the register-tiled GEMM is the bottleneck, not
+                // serialization, so keep the single-acc path to save VRAM.)
                 try ctx.opI8Prep(t1_d, seq, F);
                 mark(io, &t_mark, &prof.prep_ns);
                 // i8_f16: q/k/v come out f16 (v lands in the P@V layout v16_d)
@@ -641,7 +642,7 @@ pub fn forward(
         }
         if (attn_f16) {
             // Fused per-head norm + rope + scale, in place on the f16 GEMM
-            // outputs (value-identical to the chain below — see the kernel);
+            // outputs (value-identical to the chain below, see the kernel);
             // K then gathers f16 -> f16 into the scores layout. V needs
             // nothing: its GEMM already wrote the P@V operand.
             ctx.independent(2);
@@ -716,18 +717,18 @@ pub fn forward(
         } else {
         // The q and k chains (norm -> rope -> convert/gather) touch disjoint
         // buffers stage by stage; each stage pair/triple runs barrier-free.
-        // ⚠️ **The SUBGROUP norm, because `Elt.rmsnorm` gives each THREAD a whole 128-wide
-        // head** — a warp's 32 loads land 512 B apart and each is its own sector. Measured
-        // at krea2's geometry at 1120x1680 (`vk-norm-bench`, 352800 x 128): **35 GB/s
-        // against 558**, 16x, worth ~600 ms/step across the two calls x 28 blocks.
+        // The SUBGROUP norm, because `Elt.rmsnorm` gives each THREAD a whole 128-wide
+        // head, a warp's 32 loads land 512 B apart and each is its own sector. Measured
+        // at krea2's geometry at 1120x1680 (`vk-norm-bench`, 352800 x 128): 35 GB/s
+        // against 558, 16x, worth ~600 ms/step across the two calls x 28 blocks.
         //
-        // ⚠️ This `else` arm is reached by **bf16 and fp8** checkpoints only — `qkv_shared`
+        // This `else` arm is reached by bf16 and fp8 checkpoints only, `qkv_shared`
         // requires `!is_bf16` so they fall through, while an int8 one takes the fused
         // `qknorm_rope_f32` path above and never gets here. So this is a dense-checkpoint
         // win; the int8 arm already avoided the separate norm.
         //
-        // ⚠️ Not bit-identical: the row sum becomes a subgroup tree where it was serial (the
-        // more accurate of the two). `independent(2)` still applies — one dispatch either way.
+        // Not bit-identical: the row sum becomes a subgroup tree where it was serial (the
+        // more accurate of the two). `independent(2)` still applies, one dispatch either way.
         ctx.independent(2);
         try rmsNormQk(ctx, q_d, blk.attn.qnorm, seq * heads, hd);
         mark(io, &t_mark, &prof.elt_ns);
@@ -1005,7 +1006,7 @@ pub fn forward(
     }
 
     // Final layer on device: modulated rmsnorm then the 6144 -> 64 linear
-    // (norm runs over all rows — the text-row waste is negligible next to
+    // (norm runs over all rows, the text-row waste is negligible next to
     // downloading 100 MB of hidden image rows for a CPU finalize).
     try ctx.opElt(.rms_partial, x_d, null, null, rmsp_d, .{
         .u0 = @intCast(seq * rms_ch),
@@ -1057,7 +1058,7 @@ pub fn forward(
 /// capture running on Vulkan. See `dit_cuda.probeInput` for why this is a download
 /// into the CPU accumulator rather than an on-device reduction.
 ///
-/// ⚠️ **int8/int4 weights are skipped.** Their activation has already been rotated
+/// int8/int4 weights are skipped. Their activation has already been rotated
 /// and quantized in place, so the buffer holds a W4A4-shaped value and recording it
 /// as a weight-only statistic would be a category error (ACTIVATION_AWARE hygiene
 /// rule 4). `ggufy calibrate` refuses those checkpoints on a GPU backend outright.
@@ -1176,7 +1177,7 @@ test "gpu-resident forward matches comfyui fixture" {
     // Weight streaming under memory pressure: force a budget far below the
     // model size so the LRU weight cache evicts and re-uploads every block,
     // then check the forward is BIT-IDENTICAL to the resident run (same
-    // weights, same kernels — only residency changed).
+    // weights, same kernels, only residency changed).
     ctx.evictWeights();
     ctx.budget_override = 3 << 30;
     defer ctx.budget_override = 0;
@@ -1193,11 +1194,11 @@ test "gpu-resident forward matches comfyui fixture" {
 }
 
 // The W4A8 decode kernel against the CPU decode it must reproduce. Needs a device
-// (testdata/gpu-tests) but NO checkpoint — synthetic weights are enough, and that is
+// (testdata/gpu-tests) but NO checkpoint, synthetic weights are enough, and that is
 // deliberate: the kernel's correctness must be checkable without a multi-GB file on
 // disk, which is exactly the situation that leaves a gated test silently self-skipping.
 //
-// ⚠️ This is also the test that would have caught the layout half. The first version of
+// This is also the test that would have caught the layout half. The first version of
 // `w4a8_decode_t` read the row-major storage and transposed as it went (correct, and
 // 1757 ms/step); the current one reads inputs that `weightBuffer` has already
 // byte-transposed. Those two kernels agree on nothing about their input indexing, so a
@@ -1224,7 +1225,7 @@ test "the Vulkan W4A8 decode matches ops.w4a8.decode, including the row padding"
         .{ .rows = 256, .cols = 256, .gs = 8 },
         .{ .rows = 128, .cols = 256, .gs = 4 },
     };
-    // ⚠️ Every case's buffers stay ALIVE in one arena, and that is load-bearing rather
+    // Every case's buffers stay ALIVE in one arena, and that is load-bearing rather
     // than tidy: the device weight cache keys on the HOST POINTER, so freeing a case's
     // arrays and letting the allocator hand the same address to the next case scores a
     // stale cache hit and the kernel reads the previous case's weights. (A model never
@@ -1274,9 +1275,9 @@ test "the Vulkan W4A8 decode matches ops.w4a8.decode, including the row padding"
 }
 
 // The Vulkan NVFP4 decode kernel against the CPU decode it must reproduce. Synthetic
-// weights, so no checkpoint is needed — the durable form of the check.
+// weights, so no checkpoint is needed, the durable form of the check.
 //
-// ⚠️ Covers the two things a render cannot localize and the CUDA twin does not share: the
+// Covers the two things a render cannot localize and the CUDA twin does not share: the
 // f16 `[k_pad][n_pad]` output layout (a different padding rule from the inputs' own
 // stride) and the fact that BOTH paddings must be written, since this scratch is reused
 // between weights of different shapes.

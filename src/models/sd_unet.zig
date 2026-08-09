@@ -1,13 +1,12 @@
-//! The Stable Diffusion UNet (LDM `openaimodel.UNetModel`) — **SD1.5 and SDXL, one
-//! implementation differing only by `Config`** — mirroring the reference numerically
-//! and the LDM single-file checkpoint's names structurally.
+//! The Stable Diffusion UNet (LDM `openaimodel.UNetModel`). SD1.5 and SDXL are one
+//! implementation differing only by `Config`.
 //!
-//! This is the first *convolutional*, multi-resolution architecture in this engine;
-//! everything else here is a stack of identical transformer blocks. Activations are
-//! channel-last `[h*w][c]` f32, the same convention `wan_vae` and `ops.conv` use, so
-//! a "row" is one pixel's channels and a GEMM over `h*w` rows is a 1x1 convolution.
+//! This is the only convolutional, multi-resolution architecture here; everything else
+//! is a stack of identical transformer blocks. Activations are channel-last `[h*w][c]`
+//! f32, the same convention `wan_vae` and `ops.conv` use, so a row is one pixel's
+//! channels and a GEMM over `h*w` rows is a 1x1 convolution.
 //!
-//! ## The graph, since the checkpoint's names do not show it
+//! The graph, since the checkpoint's tensor names do not show it:
 //!
 //! ```
 //! t --> sinusoidal(320) --> time_embed.0 --> silu --> time_embed.2 --> emb[1280]
@@ -27,37 +26,14 @@
 //! out.0 (GroupNorm) --> silu --> out.2 (conv 3x3) --> eps[4]
 //! ```
 //!
-//! SDXL is the same graph with three levels instead of four (so 9 skips and 9 output
-//! blocks), no attention at the outermost level, transformer depth `{_, 2, 10}` instead
+//! SDXL is the same graph with three levels instead of four (9 skips and 9 output
+//! blocks), no attention at the outermost level, transformer depth {_, 2, 10} instead
 //! of 1 everywhere, `nn.Linear` in place of the SpatialTransformers' 1x1 projections,
-//! and the `y` micro-conditioning above. See `Config`.
+//! and the `y` micro-conditioning. See `Config`.
 //!
-//! Six things are easy to get wrong and produce a model that still renders:
-//!
-//! 1. **The skip stack is LIFO and includes the stem.** `input_blocks.0`'s output is
-//!    pushed too, so there are 12 skips for 12 output blocks; popping them in the
-//!    wrong order gives a plausible-but-wrong image.
-//! 2. **`ff.net.0.proj` is a GEGLU whose halves are (value, gate) in that order**,
-//!    and the gate uses **erf** GELU (`F.gelu`'s default), not the tanh
-//!    approximation. Swapping the halves is a silent quality loss.
-//! 3. **`attn1`/`attn2` q/k/v have no bias**; only `to_out.0` does. A loader that
-//!    expects biases everywhere fails loudly, but one that *invents* zeros for
-//!    `to_out` would not.
-//! 4. **The timestep embedding is diffusers' convention** — `flip_sin_to_cos` with
-//!    `downscale_freq_shift = 0` — i.e. cos half first. See `ops.act`/the fixture:
-//!    the wrong order is a smooth reparameterization the model half-absorbs.
-//! 5. **SDXL's head count is per level** (`num_head_channels = 64`), SD1.5's is fixed
-//!    (`num_heads = 8`). Both keep every shape valid, so the wrong one is an attention
-//!    that mixes the wrong values with no error anywhere. `Config.Heads`.
-//! 6. **`y`'s layout is pooled ++ six 256-d sinusoids**, in the order (height, width,
-//!    crop_h, crop_w, target_h, target_w). Any permutation is a valid-looking
-//!    2816-vector that SDXL absorbs as a *composition* shift — a differently framed
-//!    image, not a broken one.
-//!
-//! Loads from any `WeightStore` (safetensors or GGUF) and keeps large weights in
-//! their checkpoint dtype so a quantized UNet runs and `ops.matmul.probe` can
-//! attribute every GEMM — which is the entire point of adding this architecture:
-//! ggufy's quantization programme has measured exactly one model so far.
+//! Loads from any `WeightStore` and keeps large weights in their checkpoint dtype, so
+//! a quantized UNet runs and `ops.matmul.probe` can attribute every GEMM. The GPU
+//! twins are sd_unet_gpu.zig and sd_unet_cuda.zig.
 
 const std = @import("std");
 const tp_core = @import("tp_core");
@@ -87,7 +63,7 @@ pub const Config = struct {
     /// 1 everywhere for SD1.5, `{1, 2, 10}` for SDXL. The entry for a level without
     /// attention is never read.
     transformer_depth: []const usize,
-    /// How a level's attention head count is derived — the two LDM configs specify
+    /// How a level's attention head count is derived, the two LDM configs specify
     /// *different* halves of the same product, and neither can be read off the
     /// weights (q/k/v are square either way).
     heads: Heads,
@@ -95,7 +71,7 @@ pub const Config = struct {
     /// 2048 for SDXL.
     context_dim: usize,
     /// LDM's `use_linear_in_transformer`. A SpatialTransformer's `proj_in`/`proj_out`
-    /// are 1x1 convolutions in SD1.5 and `nn.Linear` in SDXL — the same function, but
+    /// are 1x1 convolutions in SD1.5 and `nn.Linear` in SDXL, the same function, but
     /// stored at a different rank (`[c, c, 1, 1]` vs `[c, c]`), so a loader that
     /// assumes either one fails on the other checkpoint.
     linear_proj: bool,
@@ -214,8 +190,8 @@ pub const LayerNormW = struct {
     b: []const f32,
 };
 
-/// A SpatialTransformer's in/out projection. Both arms compute the same function — a
-/// per-pixel affine map — but SD1.5 stores it as a 1x1 convolution and SDXL as an
+/// A SpatialTransformer's in/out projection. Both arms compute the same function, a
+/// per-pixel affine map, but SD1.5 stores it as a 1x1 convolution and SDXL as an
 /// `nn.Linear` (`use_linear_in_transformer`). Kept as a union rather than normalized to
 /// one form at load, so SD1.5's already-validated convolution path stays untouched.
 pub const Proj = union(enum) {
@@ -246,7 +222,7 @@ pub const UNet = struct {
     cfg: Config,
     time_1: Linear,
     time_2: Linear,
-    /// SDXL's `label_emb.0` — the two-layer MLP projecting the `y` micro-conditioning
+    /// SDXL's `label_emb.0`, the two-layer MLP projecting the `y` micro-conditioning
     /// vector into the time embedding. Null for SD1.5, which has no `y` at all.
     label_1: ?Linear,
     label_2: ?Linear,
@@ -305,7 +281,7 @@ pub const UNet = struct {
         }
 
         const mid_res1 = try l.res("middle_block.0", .{}, ch, ch);
-        // The middle block attends at the innermost level's depth — 1 for SD1.5, 10 for
+        // The middle block attends at the innermost level's depth, 1 for SD1.5, 10 for
         // SDXL, which is also the innermost level's own depth in both.
         const mid_attn = try l.spatial("middle_block.1", .{}, ch, cfg.transformer_depth[cfg.levels() - 1]);
         const mid_res2 = try l.res("middle_block.2", .{}, ch, ch);
@@ -347,7 +323,7 @@ pub const UNet = struct {
                 }
                 // The upsample rides on the LAST block of each level except the
                 // innermost-first one, and its member index depends on whether an
-                // attention block preceded it — which is why this is positional.
+                // attention block preceded it, which is why this is positional.
                 if (level > 0 and j == cfg.layers_per_block) {
                     st.sample = try l.convMember("output_blocks.{d}.{d}.conv", .{ idx, member }, ch, ch, 3, 1, 1);
                     st.sample_kind = .up;
@@ -426,7 +402,7 @@ const Loader = struct {
             return error.ShapeMismatch;
         }
         // `flat_blocks` means the blocks tile the flat element sequence rather than
-        // each logical row — the ComfyUI shape fix, which ggufy applies to 72.7% of an
+        // each logical row, the ComfyUI shape fix, which ggufy applies to 72.7% of an
         // SD1.5 checkpoint's parameters (every convolution). `Weight.init` assumes
         // row-aligned blocks and a logical row here need not be a multiple of 256, so
         // such a tensor must be dequantized flat. See `TensorInfo.flat_blocks`.
@@ -471,7 +447,7 @@ const Loader = struct {
     }
 
     /// A k×k convolution. `ops.conv` wants weights packed `[k][k][ci][co]`, so this
-    /// repacks at load — once per weight rather than once per forward.
+    /// repacks at load, once per weight rather than once per forward.
     fn conv(l: Loader, comptime fmt: []const u8, args: anytype, co: usize, ci: usize, k: usize, stride: usize, pad: usize) !Conv2d {
         return l.convMember(fmt, args, co, ci, k, stride, pad);
     }
@@ -505,8 +481,8 @@ const Loader = struct {
 
     fn res(l: Loader, comptime fmt: []const u8, args: anytype, in_ch: usize, out_ch: usize) !ResBlock {
         // The RELATIVE base (no store prefix): the inner helpers add the prefix
-        // themselves, and passing an already-prefixed base through them doubled it —
-        // `model.diffusion_model.model.diffusion_model.input_blocks…`, which surfaces
+        // themselves, and passing an already-prefixed base through them doubled it,
+        // `model.diffusion_model.model.diffusion_model.input_blocks...`, which surfaces
         // as a missing tensor rather than as the naming bug it is.
         var buf: [200]u8 = undefined;
         const base = try std.fmt.bufPrint(&buf, fmt, args);
@@ -535,7 +511,7 @@ const Loader = struct {
 
     /// `proj_in` / `proj_out`: a 1x1 convolution for SD1.5, an `nn.Linear` for SDXL.
     /// Both are the same per-pixel affine map, so which one a checkpoint stores is only
-    /// visible in the tensor's rank — `[c, c, 1, 1]` against `[c, c]`.
+    /// visible in the tensor's rank, `[c, c, 1, 1]` against `[c, c]`.
     fn proj(l: Loader, comptime fmt: []const u8, args: anytype, ch: usize) !Proj {
         if (l.cfg.linear_proj) return .{ .linear = try l.linear(fmt, args, ch, ch, true) };
         return .{ .conv = try l.conv(fmt, args, ch, ch, 1, 1, 0) };
@@ -625,7 +601,7 @@ pub const ResBlockIter = struct {
 
 /// Scratch buffers for one resolution, allocated once per denoiser rather than per
 /// step. A UNet forward touches activations from `[h*w][320]` down to
-/// `[h/8·w/8][1280]`, so the workspace is sized by the largest of them.
+/// `[h/8*w/8][1280]`, so the workspace is sized by the largest of them.
 pub const Workspace = struct {
     gpa: std.mem.Allocator,
     /// Two ping-pong activation buffers, each big enough for any stage.
@@ -644,16 +620,16 @@ pub const Workspace = struct {
     /// `ctx_seq` is the conditioning length the workspace must accommodate (77 for the
     /// SD family). It is a parameter rather than an assumption because cross-attention
     /// writes `ctx_seq` rows of keys and values into `k`/`v`, which at a small latent
-    /// **exceeds** the position count: a 16x16 latent gives 64 positions at the innermost
-    /// level against 77 context rows. Sizing off positions alone used to be sufficient
-    /// only by accident, via an allocation ~10x larger than needed.
+    /// exceeds the position count: a 16x16 latent gives 64 positions at the innermost
+    /// level against 77 context rows. Sizing off positions alone is sufficient only by
+    /// accident, via an allocation ~10x larger than needed.
     pub fn init(gpa: std.mem.Allocator, u: *const UNet, lat_h: usize, lat_w: usize, ctx_seq: usize) !Workspace {
         const cfg = u.cfg;
         // The widest activation is the stem's, the deepest is the innermost level's;
         // one buffer that fits every (positions × channels) product covers both.
         var max_elems: usize = 0;
         // Attention scratch is sized over the levels that *attend*, at each one's own
-        // resolution and width — not over the outermost resolution times the innermost
+        // resolution and width, not over the outermost resolution times the innermost
         // width, which is a product no stage ever has. On SDXL at 1024x1024 the loose
         // bound asks for 671 MB of feed-forward buffer against a real need of 84 MB, and
         // SDXL is the architecture where the outermost level does not attend at all.
@@ -677,7 +653,7 @@ pub const Workspace = struct {
                 w = (w + 1) / 2;
             }
         }
-        // The middle block always attends, at the innermost level's resolution — which
+        // The middle block always attends, at the innermost level's resolution, which
         // the loop above skips when that level carries no SpatialTransformer of its own
         // (SD1.5's fourth level). `h`/`w` are the innermost resolution here.
         {
@@ -691,6 +667,9 @@ pub const Workspace = struct {
             .gpa = gpa,
             .a = try gpa.alloc(f32, max_elems),
             .b = try gpa.alloc(f32, max_elems),
+            // The +1 is the stem: input_blocks.0's output is pushed too, so there are
+            // 12 skips for 12 output blocks. The stack is LIFO, and popping in the
+            // wrong order gives a plausible but wrong image.
             .skips = try gpa.alloc([]f32, u.input_stages.len + 1),
             .q = try gpa.alloc(f32, attn_elems),
             .k = try gpa.alloc(f32, attn_elems),
@@ -726,7 +705,7 @@ pub const Workspace = struct {
     }
 };
 
-/// The sinusoidal timestep embedding, in diffusers' convention: **cos half first**
+/// The sinusoidal timestep embedding, in diffusers' convention: cos half first
 /// (`flip_sin_to_cos`) and an exponent denominator of `half` (`downscale_freq_shift
 /// = 0`). Both are choices, and both are silently absorbable if wrong, which is why
 /// the fixture pins them.
@@ -737,7 +716,7 @@ pub fn timestepEmbedding(out: []f32, timestep: f32) void {
     // argument is the timestep itself (~1000), so a 1e-7 relative slip in `freq`
     // becomes ~1e-4 in `cos(freq)`. Computing more accurately than the reference
     // bounds the disagreement by the *reference's* own rounding instead of stacking
-    // two errors — which is why the fixture tolerance is 2e-4 and not 1e-6.
+    // two errors, which is why the fixture tolerance is 2e-4 and not 1e-6.
     const log_max: f64 = @log(10000.0);
     for (0..half) |i| {
         const exponent = -log_max * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(half));
@@ -777,8 +756,8 @@ pub const adm_freq_dim: usize = 256;
 /// Build SDXL's `y`: the pooled CLIP-G vector, then six `adm_freq_dim`-wide sinusoidal
 /// embeddings of the micro-conditioning.
 ///
-/// ⚠️ **The order is (height, width, crop_h, crop_w, target_h, target_w)** and h comes
-/// before w — LDM's own order, which is the transpose of how sizes are usually written.
+/// The order is (height, width, crop_h, crop_w, target_h, target_w) and h comes
+/// before w, LDM's own order, which is the transpose of how sizes are usually written.
 /// Swapping any pair yields a perfectly valid vector and a differently composed image,
 /// so this is pinned by a fixture rather than reasoned about.
 pub fn admVector(out: []f32, pooled: []const f32, mc: MicroCond) void {
@@ -786,7 +765,7 @@ pub fn admVector(out: []f32, pooled: []const f32, mc: MicroCond) void {
     @memcpy(out[0..pooled.len], pooled);
     const vals = [6]f32{ mc.height, mc.width, mc.crop_h, mc.crop_w, mc.target_height, mc.target_width };
     for (vals, 0..) |v, i| {
-        // The same sinusoid as the timestep's — LDM reuses `timestep_embedding` here,
+        // The same sinusoid as the timestep's, LDM reuses `timestep_embedding` here,
         // cos half first and all.
         timestepEmbedding(out[pooled.len + i * adm_freq_dim ..][0..adm_freq_dim], v);
     }
@@ -796,7 +775,7 @@ pub fn admVector(out: []f32, pooled: []const f32, mc: MicroCond) void {
 /// `[lat_h*lat_w][channels]`; `context` is `[ctx_seq][context_dim]`.
 ///
 /// `adm` is SDXL's `y` micro-conditioning vector (`adm_channels` long, built by
-/// `admVector`) and must be present exactly when the config asks for one — a config
+/// `admVector`) and must be present exactly when the config asks for one, a config
 /// mismatch here would otherwise run SDXL with no size conditioning at all, which it
 /// absorbs as a badly framed image rather than an error.
 pub fn forward(
@@ -831,7 +810,7 @@ pub fn forward(
         ops.act.silu(hidden);
         try ops.matmul.matmul(io, gpa, ws.emb, hidden, 1, u.time_2.w, u.time_2.b);
 
-        // `emb = time_embed(t) + label_emb(y)` — a sum, not a concatenation, and the
+        // `emb = time_embed(t) + label_emb(y)`, a sum, not a concatenation, and the
         // same shape either way, so a missing term is invisible downstream.
         if (adm) |y| {
             try ops.matmul.matmul(io, gpa, hidden, y, 1, u.label_1.?.w, u.label_1.?.b);
@@ -910,7 +889,7 @@ pub fn forward(
             try applySpatial(io, gpa, ws, st, cur[0 .. h * w * ch], h, w, context, ctx_seq, cfg);
         }
         if (stage.sample_kind == .up) {
-            // Nearest-neighbour 2x, then a 3x3 convolution — LDM's `Upsample`.
+            // Nearest-neighbour 2x, then a 3x3 convolution, LDM's `Upsample`.
             const oh = h * 2;
             const ow = w * 2;
             const up = try gpa.alloc(f32, oh * ow * ch);
@@ -1071,7 +1050,7 @@ fn applySpatial(
         for (stream, norm_buf) |*s, r| s.* += r;
 
         // ff: GEGLU. `proj` emits [value | gate] per row, in that order, and the gate
-        // takes the ERF gelu — diffusers' `GEGLU` uses `F.gelu`'s default.
+        // takes the ERF gelu, diffusers' `GEGLU` uses `F.gelu`'s default.
         ops.norm.layerNorm(norm_buf, stream, b.norm3.w, b.norm3.b, cfg.norm_eps);
         const two = 2 * b.inner;
         try ops.matmul.matmul(io, gpa, ws.ff[0 .. n * two], norm_buf, n, b.ff_proj.w, b.ff_proj.b);
@@ -1286,10 +1265,10 @@ test "the UNet still matches diffusers at the size images are actually rendered 
     }
     const rel = @sqrt(l2_err / l2_ref);
 
-    // ⚠️ A global rel-L2 bound hides a *structured* error, and structure is what
+    // A global rel-L2 bound hides a *structured* error, and structure is what
     // matters: a periodic error compounds coherently over a sampling loop where random
     // error cancels. So this also checks that the error is not concentrated on a
-    // spatial grid — the artifact that reached a rendered image was a 4-latent-pixel
+    // spatial grid, the artifact that reached a rendered image was a 4-latent-pixel
     // checkerboard sitting under a rel L2 of well under 1e-3.
     // Period 4, not 2: the artifact that reached a rendered image modulated the latent
     // with a 4-pixel period (one pixel at the UNet's 16x16 level, upsampled twice), and
@@ -1323,7 +1302,7 @@ test "the UNet still matches diffusers at the size images are actually rendered 
     // A clean implementation has no phase preference; a checkerboard has a large one.
     try testing.expect(hi / lo < 2.0);
 
-    // ⚠️ **A second forward through the SAME workspace must give the same answer.** The
+    // A second forward through the SAME workspace must give the same answer. The
     // parity tests above each build a fresh `Workspace` and call `forward` once; a real
     // render calls it 40 times (20 steps x CFG) through one workspace, so any state
     // that leaks between calls is invisible to a single-shot test and compounds
@@ -1356,7 +1335,7 @@ fn relL2(want: []const f32, got: []const f32) f64 {
 test "the y micro-conditioning vector matches ComfyUI's encode_adm" {
     // Needs the fixture but NOT the 7 GB checkpoint: `y` is pooled ++ six sinusoids, so
     // everything except the pooled half is arithmetic. Worth its own test because the
-    // ordering is a pure convention — six 256-wide blocks, any permutation of which is a
+    // ordering is a pure convention, six 256-wide blocks, any permutation of which is a
     // valid vector that SDXL absorbs as a differently composed image.
     const gpa = testing.allocator;
     const io = testing.io;
@@ -1429,7 +1408,7 @@ test "the SDXL UNet matches ComfyUI's UNetModel on a real checkpoint" {
 
     // The combined embedding first: `emb = time_embed(t) + label_emb(y)`, and both
     // terms feed every ResBlock. The diagnostic compares against the time-only figure
-    // too, because the two failure modes are worth telling apart — matching
+    // too, because the two failure modes are worth telling apart, matching
     // `temb_time_only` means `label_emb` never contributed.
     {
         var ws = try Workspace.init(gpa, &u, lat, lat, ctx_seq);
@@ -1483,7 +1462,7 @@ test "the SDXL UNet matches ComfyUI's UNetModel on a real checkpoint" {
         errdefer std.debug.print("sdxl eps batch {d}: rel L2 {e:.4}\n", .{ b, rel });
         // Same bound as SD1.5's, over a deeper network (SDXL's innermost level stacks 10
         // transformer blocks against SD1.5's 1), so f32 accumulation order has more room
-        // to diverge from torch's — 1e-3 relative is still far tighter than any
+        // to diverge from torch's, 1e-3 relative is still far tighter than any
         // structural error could hide under.
         try testing.expect(rel < 1e-3);
     }
@@ -1542,7 +1521,7 @@ test "the SDXL UNet still matches at the size images are rendered at" {
 
     const rel = relL2(want, out);
 
-    // ⚠️ A global rel-L2 bound hides a *structured* error, and structure is what matters:
+    // A global rel-L2 bound hides a *structured* error, and structure is what matters:
     // a periodic error compounds coherently over a sampling loop where random error
     // cancels. Period 4, the same as SD1.5's, because SDXL upsamples twice as well.
     const period = 4;
@@ -1588,7 +1567,7 @@ test "the SDXL UNet still matches at the size images are rendered at" {
 test "a config mismatch on the y conditioning is refused, not absorbed" {
     // SDXL without `y` is a valid-looking forward that ignores the size conditioning
     // entirely, and SD1.5 handed a `y` has nothing to project it with. Both are caller
-    // errors, and both would otherwise be silent — hence a hard error rather than an
+    // errors, and both would otherwise be silent, hence a hard error rather than an
     // `if (adm) |..|`.
     const gpa = testing.allocator;
     const io = testing.io;

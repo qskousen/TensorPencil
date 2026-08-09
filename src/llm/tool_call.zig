@@ -1,37 +1,33 @@
-//! tool_call.zig — parse the tool calls a model EMITS, back into the typed form
-//! `chat_template.ToolCall` replays on the next turn.
+//! Parse the tool calls a model EMITS, back into the typed `chat_template.ToolCall`
+//! replayed on the next turn, and split a generated block into thought and answer.
 //!
-//! This is the read half of tool calling; `chat_template.zig` is the write half.
-//! The two must be inverses: what `parse` returns for a block, handed back as a
-//! `ToolCall`, has to re-render as that same block — otherwise the model sees a
-//! garbled version of its own request one turn later. The tests pin exactly that
-//! round trip against the Bonsai golden.
+//! This is the read half of tool calling; `chat_template.zig` is the write half. The two
+//! must be INVERSES: what `parse` returns for a block, handed back as a `ToolCall`, has
+//! to re-render as that same block, or the model sees a garbled version of its own
+//! request one turn later. The tests pin that round trip.
 //!
-//! **Two wire formats, auto-detected**, because the models this engine runs do
-//! not agree:
+//! Two wire formats, auto-detected on the first non-space byte, because the models this
+//! engine runs do not agree. qwen3.5 and Bonsai are trained on an XML-ish form their own
+//! chat template documents in the system prompt:
 //!
-//!   - the XML-ish form qwen3.5 / Bonsai are trained on, and which their own
-//!     chat template documents in the system prompt:
+//!     <tool_call>
+//!     <function=get_weather>
+//!     <parameter=city>
+//!     Paris
+//!     </parameter>
+//!     </function>
+//!     </tool_call>
 //!
-//!         <tool_call>
-//!         <function=get_weather>
-//!         <parameter=city>
-//!         Paris
-//!         </parameter>
-//!         </function>
-//!         </tool_call>
+//! Plain qwen3 and most llama finetunes emit the Hermes/qwen2 JSON body instead:
+//! `<tool_call>{"name": ..., "arguments": {...}}</tool_call>`.
 //!
-//!   - the Hermes/qwen2-style JSON body, which plain qwen3 and most llama
-//!     finetunes emit: `<tool_call>{"name": …, "arguments": {…}}</tool_call>`.
+//! `splitThought` / `answerText` / `endsInsideThought` live here rather than in the GUI
+//! because both the CLI and the GUI scanners need "where does the answer start", and two
+//! definitions of that is the drift that lets one caller fire a tool the other hides. A
+//! caller must scan only the ANSWER, never the reasoning block: a model routinely writes
+//! a tool call out while thinking about whether to make it.
 //!
-//! Pure string/JSON logic (std only), like `gui/toolcall.zig`, so it unit-tests
-//! without a model and both the CLI and the GUI can share one definition of
-//! "what counts as a call".
-//!
-//! ⚠️ **Scan only the ANSWER, never the reasoning block.** A model routinely
-//! writes a tool call out while *thinking about* whether to make it, and the
-//! templates place the thought inside the same generated text. `gui/toolcall.zig
-//! answerText` is the splitter; this module deliberately does not re-implement it.
+//! Pure string and JSON logic, std only, so it unit-tests without a model.
 
 const std = @import("std");
 
@@ -59,20 +55,20 @@ pub const Split = struct {
 /// shared by the display (the GUI's thought expander) and every tool-call
 /// scanner, so a call that fires is exactly a call that's hidden from the reply.
 ///
-/// ⚠️ **`primed` is the whole subtlety, and getting it wrong is what broke
-/// thinking for Qwen3.5/Bonsai in the GUI.** The two prompt builders disagree
+/// `primed` is the whole subtlety, and getting it wrong is what broke
+/// thinking for Qwen3.5/Bonsai in the GUI. The two prompt builders disagree
 /// about who writes the OPENING marker:
 ///
 ///   - the hand glue (`llm/chat.zig openAssistant`) leaves a thinking turn
 ///     UNPRIMED, so the model emits its own `<think>` and the generated text
 ///     starts with it;
 ///   - a model's own jinja template (the render-driven path) PRIMES
-///     `…assistant\n<think>\n` into the prompt, so the generated text starts
+///     `...assistant\n<think>\n` into the prompt, so the generated text starts
 ///     *inside* the block and the only marker it ever emits is the CLOSE.
 ///
 /// With `primed` false against a primed prompt, nothing matches, the thought is
-/// rendered as part of the answer with a stray `</think>` in the middle, and —
-/// far worse — `answerText` returns the whole text, so a tool call the model
+/// rendered as part of the answer with a stray `</think>` in the middle, and,
+/// far worse, `answerText` returns the whole text, so a tool call the model
 /// wrote *while reasoning about* whether to make it FIRES. That is precisely the
 /// failure this guard exists to prevent, so `primed` is measured from the
 /// rendered prompt (`endsInsideThought`) rather than assumed per family.
@@ -97,7 +93,7 @@ pub fn splitThought(text: []const u8, r: ?Reasoning, primed: bool) Split {
     return .{ .think = std.mem.trimStart(u8, body, ws), .answer = "", .open = true };
 }
 
-/// Whether a RENDERED prompt ends inside an open reasoning block — i.e. whether
+/// Whether a RENDERED prompt ends inside an open reasoning block, i.e. whether
 /// the generation that follows it starts already inside the model's thought.
 /// This is the `primed` input to `splitThought`, and it is measured rather than
 /// derived from the family so it stays right for any template, including ones
@@ -114,13 +110,13 @@ pub fn endsInsideThought(prompt_tail: []const u8, r: ?Reasoning) bool {
 }
 
 /// The answer portion of a completed assistant turn: everything after the
-/// model's reasoning block closes (or the whole text if `r` is null — the family
+/// model's reasoning block closes (or the whole text if `r` is null, the family
 /// doesn't reason, or thinking is off so no block is emitted). Tool calls are
 /// scanned only here, NEVER inside the thought. See `splitThought` for `primed`.
 pub fn answerText(text: []const u8, r: ?Reasoning, primed: bool) []const u8 {
     const s = splitThought(text, r, primed);
     if (s.think == null) return s.answer;
-    return s.answer; // "" while the block is still open — nothing to scan yet
+    return s.answer; // "" while the block is still open, nothing to scan yet
 }
 
 /// One parsed call. Owns both fields (`deinit`), because neither can be a slice
@@ -128,7 +124,7 @@ pub fn answerText(text: []const u8, r: ?Reasoning, primed: bool) []const u8 {
 /// JSON, and the JSON form's have to be re-serialized out of the parsed doc.
 pub const Call = struct {
     name: []const u8,
-    /// The arguments as a JSON **object**, in JSON text — the exact shape
+    /// The arguments as a JSON object, in JSON text, the exact shape
     /// `chat_template.ToolCall.arguments_json` takes.
     arguments_json: []const u8,
 
@@ -138,12 +134,12 @@ pub const Call = struct {
     }
 };
 
-/// Result of scanning for the next `<tool_call>…</tool_call>` block.
-///  - `.block` — a complete one: `text_before` (ordinary reply text), the raw
+/// Result of scanning for the next `<tool_call>...</tool_call>` block.
+///  - `.block`, a complete one: `text_before` (ordinary reply text), the raw
 ///    `body` to hand to `parse`, and `after` to keep scanning.
-///  - `.partial` — an opened block still streaming: everything from it onward is
+///  - `.partial`, an opened block still streaming: everything from it onward is
 ///    pending, so a live display can hide it and a turn-complete scanner stops.
-///  - `.none` — no call remains; the whole buffer is text.
+///  - `.none`, no call remains; the whole buffer is text.
 pub const Found = union(enum) {
     none,
     partial: struct { text_before: []const u8 },
@@ -158,7 +154,7 @@ const close_tag = "</tool_call>";
 /// Unlike `gui/toolcall.nextImageCall` this does NOT require the tag to start a
 /// line: `<tool_call>` is a token the model was trained to emit, not a
 /// convention invented by a prompt, and the templates themselves render it
-/// mid-line (`…\n\n<tool_call>\n<function=…`). The reasoning-block guard is what
+/// mid-line (`...\n\n<tool_call>\n<function=...`). The reasoning-block guard is what
 /// keeps a merely-contemplated call from firing here.
 pub fn nextBlock(buf: []const u8) Found {
     const a = std.mem.indexOf(u8, buf, open_tag) orelse return .none;
@@ -182,8 +178,8 @@ pub fn parse(gpa: std.mem.Allocator, body: []const u8) !Call {
 }
 
 /// Every call in `buf`, appended to `out` (caller `deinit`s each). A block that
-/// fails to parse is SKIPPED rather than aborting the scan — one malformed call
-/// in a reply must not discard the well-formed ones beside it — and the reason
+/// fails to parse is SKIPPED rather than aborting the scan, one malformed call
+/// in a reply must not discard the well-formed ones beside it, and the reason
 /// is returned via `bad` so a caller can tell the user.
 pub fn parseAll(gpa: std.mem.Allocator, buf: []const u8, out: *std.ArrayList(Call), bad: ?*usize) !void {
     var rest = buf;
@@ -250,10 +246,10 @@ fn parseXml(gpa: std.mem.Allocator, body: []const u8) !Call {
     return .{ .name = try gpa.dupe(u8, name), .arguments_json = args };
 }
 
-/// Strip exactly the ONE newline the format puts on each side of a value —
+/// Strip exactly the ONE newline the format puts on each side of a value,
 /// never a full trim.
 ///
-/// ⚠️ The template's own `args_value` writes `'\n' + value + '\n'`, so removing
+/// The template's own `args_value` writes `'\n' + value + '\n'`, so removing
 /// one newline per side is its exact inverse; a `std.mem.trim` would additionally
 /// eat leading indentation, which is real content for the multi-line values the
 /// format explicitly supports ("a value that can span multiple lines"). Models
@@ -270,7 +266,7 @@ fn stripDelimiterNewlines(v: []const u8) []const u8 {
 /// a value it stringified as JSON (dict/list/number/bool/null) comes back as
 /// that JSON, anything else as a JSON string.
 ///
-/// ⚠️ The inverse is AMBIGUOUS for a string that happens to look like JSON — an
+/// The inverse is AMBIGUOUS for a string that happens to look like JSON, an
 /// argument whose value is literally the text `3` returns as the number 3. That
 /// is a property of the wire format (it carries no types), not of this parser:
 /// the template renders the string `3` and the number 3 identically, so no
@@ -288,7 +284,7 @@ fn writeArgValue(gpa: std.mem.Allocator, w: *std.Io.Writer, raw: []const u8) !vo
 }
 
 /// Cheap pre-filter so `json.validate` is only asked about text that could
-/// plausibly be JSON — a bare word like `Paris` never reaches the allocator.
+/// plausibly be JSON, a bare word like `Paris` never reaches the allocator.
 fn isJsonScalarOrContainer(t: []const u8) bool {
     return switch (t[0]) {
         '{', '[', '-', '0'...'9' => true,
@@ -301,8 +297,8 @@ fn isJsonScalarOrContainer(t: []const u8) bool {
 
 // --- the JSON form ----------------------------------------------------------
 
-/// `{"name": "f", "arguments": {…}}`. `arguments` may also arrive as a JSON
-/// **string** (OpenAI's wire shape, which some finetunes imitate); it is then
+/// `{"name": "f", "arguments": {...}}`. `arguments` may also arrive as a JSON
+/// string (OpenAI's wire shape, which some finetunes imitate); it is then
 /// used verbatim once validated, so a nested object is not double-encoded.
 fn parseJson(gpa: std.mem.Allocator, body: []const u8) !Call {
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -358,7 +354,7 @@ test "answerText: gemma4-style channel markers" {
 }
 
 // --- primed thoughts (the render-driven template path) ----------------------
-// The prompt ends `…assistant\n<think>\n`, so the generated text starts INSIDE
+// The prompt ends `...assistant\n<think>\n`, so the generated text starts INSIDE
 // the block and the only marker it emits is the CLOSE. This is what Qwen3.5 /
 // Bonsai actually produce.
 
@@ -383,7 +379,7 @@ test "answerText: a primed thought's tool call must NOT reach the scanner" {
     // The serious half of the bug: a call written while reasoning would fire.
     const txt = "I could:\n<tool_call>a</tool_call>\n</think>\nSure!\n<tool_call>b</tool_call>";
     try testing.expectEqualStrings("b", nextBlock(answerText(txt, think_markers, true)).block.body);
-    // Unprimed, the thought's call DOES leak through — which is the bug.
+    // Unprimed, the thought's call DOES leak through, which is the bug.
     try testing.expectEqualStrings("a", nextBlock(answerText(txt, think_markers, false)).block.body);
 }
 
@@ -408,7 +404,7 @@ test "splitThought: primed and still streaming stays open" {
 test "endsInsideThought: measures the render rather than trusting the family" {
     // Thinking ON: the template primes an OPEN block.
     try testing.expect(endsInsideThought("<|im_start|>assistant\n<think>\n", think_markers));
-    // Thinking OFF: it primes a CLOSED empty block — not primed.
+    // Thinking OFF: it primes a CLOSED empty block, not primed.
     try testing.expect(!endsInsideThought("<|im_start|>assistant\n<think>\n\n</think>\n\n", think_markers));
     // Hand glue leaves the turn unprimed.
     try testing.expect(!endsInsideThought("<|im_start|>assistant\n", think_markers));
@@ -442,7 +438,7 @@ test "nextBlock: an unclosed call is partial, plain text is none" {
 
 // The exact block Bonsai's own template renders for the golden fixture case
 // (see chat_template.zig's byte-exact test). Parsing it back must reproduce the
-// arguments the template was given — that round trip is the whole contract.
+// arguments the template was given, that round trip is the whole contract.
 const golden_body =
     \\
     \\<function=get_weather>
@@ -473,7 +469,7 @@ test "parse: the XML form round-trips the template's own rendering" {
     var c = try parse(gpa, golden_body);
     defer c.deinit(gpa);
     try testing.expectEqualStrings("get_weather", c.name);
-    // Every value comes back with the type the template stringified it from —
+    // Every value comes back with the type the template stringified it from,
     // a bare word as a string, everything else as the JSON it was written as.
     try testing.expectEqualStrings(
         \\{"city": "Paris", "opts": {"units": "c"}, "days": [1, 2], "count": 3, "verbose": true, "note": null}

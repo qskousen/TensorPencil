@@ -26,7 +26,7 @@ const Weight = ops.matmul.Weight;
 
 /// GEMM in the weight's storage dtype (all gemma4v matmuls are bias-free):
 /// y[m][w.rows] = x @ Wᵀ. Q8_0 blocks dequant->f16 (opMatmulQuant, pads output
-/// rows to /128 — see buffer sizing); F16 ffn_down straight; f32 patch via conv.
+/// rows to /128, see buffer sizing); F16 ffn_down straight; f32 patch via conv.
 /// The f16/bf16/f32 paths ADD a bias unconditionally (bias_compact asserts
 /// bias.len==w.rows), so a length-`w.rows` zero slice stands in for the absent
 /// gemma4v biases; the quant path takes no bias.
@@ -246,7 +246,7 @@ test "cuda gemma4v vit matches cpu encode" {
     errdefer std.debug.print("cuda gemma4v vit parity: min token cos {d:.6}, rel RMSE {d:.6}\n", .{ min_cos, @sqrt(num / den) });
     // Looser than gemma_vit's >0.999: gemma4v attention uses kq_scale = 1.0 on
     // QK-normed vectors (not 1/sqrt(hd)), so scores are large and softmax is very
-    // peaked — the f16 tensor-core attention diverges from the f32 CPU path more
+    // peaked, the f16 tensor-core attention diverges from the f32 CPU path more
     // than gemma3's does. The semantic direction is preserved (validated by an
     // image-accurate caption that matches the CPU tower's); this guards against
     // gross regressions, not f16 rounding.

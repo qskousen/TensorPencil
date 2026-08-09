@@ -1,8 +1,8 @@
 //! Tiled VAE decode.
 //!
 //! The VAE decodes the whole image at once, so its peak VRAM scales with image
-//! area — and the mid-block self-attention materializes an O(seq²) scores plane
-//! (seq = latent H·W), which is *quadratic* in area (20 GB at a 2560² image on
+//! area, and the mid-block self-attention materializes an O(seq²) scores plane
+//! (seq = latent H*W), which is *quadratic* in area (20 GB at a 2560² image on
 //! a single head). Large images therefore OOM on the GPU and fall back to a slow
 //! CPU decode.
 //!
@@ -20,27 +20,27 @@
 
 const std = @import("std");
 
-/// VAE spatial upscale factor (latent → pixels).
+/// VAE spatial upscale factor (latent -> pixels).
 const scale = 8;
 
 pub const Params = struct {
     /// Latent tile size (side, in latent pixels). Caps the per-tile attention
-    /// plane at (tile²)² · 2 bytes and conv buffers at (8·tile)² · maxC · 4.
-    /// 128 → a 512 MiB attention plane, ~1 MP conv tiles.
+    /// plane at (tile²)² * 2 bytes and conv buffers at (8*tile)² * maxC * 4.
+    /// 128 -> a 512 MiB attention plane, ~1 MP conv tiles.
     tile: usize = 128,
-    /// Latent overlap between adjacent tiles (feathered over 8·overlap pixels).
+    /// Latent overlap between adjacent tiles (feathered over 8*overlap pixels).
     /// Kept < tile so the step stays positive.
     overlap: usize = 16,
 };
 
-/// Decode a denormalized planar [c][zh][zw] latent to planar [3][8·zh][8·zw]
+/// Decode a denormalized planar [c][zh][zw] latent to planar [3][8*zh][8*zw]
 /// pixels in [-1, 1] by decoding overlapping tiles and feather-blending them.
 ///
 /// `decodeTile(ctx, gpa, io, sub, th, tw)` decodes a planar [c][th][tw]
-/// sub-latent to planar [3][8·th][8·tw] pixels (it owns the result; this frees
+/// sub-latent to planar [3][8*th][8*tw] pixels (it owns the result; this frees
 /// it). Caller frees the returned image.
 ///
-/// The latent channel count is *derived* from `z.len / (zh·zw)` rather than
+/// The latent channel count is *derived* from `z.len / (zh*zw)` rather than
 /// taken from a model constant: the tiling is identical for krea2's 16-channel
 /// Wan latent and the SD family's 4-channel one, and hardcoding either is how a
 /// second family ends up unable to tile at all.

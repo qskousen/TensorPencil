@@ -40,10 +40,10 @@ const Emit = struct {
 /// workgroup) computes an `mt` x `nt` grid of 16x16 s32 output tiles, stepping
 /// k by 32. Register-tiled: each k-step loads `mt` A fragments and `nt` B
 /// fragments and issues `mt*nt` MMAs, so each A fragment is reused `nt` times
-/// and each B fragment `mt` times — cutting the global traffic of the naive
+/// and each B fragment `mt` times, cutting the global traffic of the naive
 /// (mt=nt=1) kernel without any workgroup memory (so no shared-memory driver
 /// hazard). A is x row-major s8 [m][k]; B is the k-major s8 weight layout
-/// [k][stride] (same transpose as fp8 — both 1-byte); C is s32 [m][n]. Scaling
+/// [k][stride] (same transpose as fp8, both 1-byte); C is s32 [m][n]. Scaling
 /// by per-row activation/weight scales is a separate pass. Dims: n a multiple
 /// of 16*nt, m of 16*mt, k of 32. Bindings (set 0): 0 = B (s8), 1 = A (s8),
 /// 2 = C (s32). Push: {m,n,k,stride}. `mt`,`nt` in 1..4.
@@ -186,7 +186,7 @@ pub fn buildGemmI8(gpa: std.mem.Allocator, mt: u32, nt: u32) ![]align(4) u8 {
         try w.print(gpa, "%pval_{d} = OpLoad %u32 %pptr_{d}\n", .{ m, m });
     }
 
-    // Per-tile invariants. row = row0 + 16*mi; a_row_base = row*k;
+    // Per-tile constants. row = row0 + 16*mi; a_row_base = row*k;
     // c_row_n = row*n; col_n = col0 + 16*nj.
     for (0..mt) |mi| {
         try w.print(gpa, "%rowmi_{d} = OpIAdd %u32 %row0 %cu_{d}\n", .{ mi, 16 * mi });
@@ -270,7 +270,7 @@ pub const i8_mt: u32 = 4;
 pub const i8_nt: u32 = 4;
 
 /// Route the DiT int8 GEMM through the shared-memory kernel below (vs the
-/// register-tiled buildGemmI8). Fork #2 from PLAN.md — the shared kernel
+/// register-tiled buildGemmI8). The shared kernel
 /// stages s8 A/B through workgroup memory (no decode; half the bytes of the
 /// fp8 f16 staging), so all fragment loads are ldmatrix-from-shared.
 pub const i8_shared = true;
@@ -285,7 +285,7 @@ pub const coop_i8_warps8 = false;
 /// Double-buffer the shared int8 GEMM: issue the NEXT k-slab's global loads
 /// (into registers) before the current slab's MMA section, so the ~400-cycle
 /// global-load latency hides under tensor-core work. The int8 GEMM benches at
-/// ~85 TF/s (~30% of the 3090's int8 tensor peak) single-buffered — the
+/// ~85 TF/s (~30% of the 3090's int8 tensor peak) single-buffered, the
 /// single-buffer stall (barrier / stage / barrier / MMA, load latency exposed)
 /// is the ceiling, not the MMA rate.
 pub const coop_i8_double_buf = true;
@@ -297,7 +297,7 @@ pub const coop_i8_double_buf = true;
 /// stage into ONE workgroup u32 array per k-step of 64 (single-buffered: barrier
 /// / stage / barrier / MMA), then all cooperative fragment loads are
 /// ldmatrix-from-shared. The shared array is u32-typed (staging is a plain u32
-/// copy — no decode) and the s8 cooperative loads read it with u32-unit strides
+/// copy, no decode) and the s8 cooperative loads read it with u32-unit strides
 /// (the standard int8-matrix-from-uint-buffer pattern). Each warp is a 2x2 grid
 /// of 64x64 tiles (4 A-frags 16x32 x 4 B-frags 32x16 = 16 MMAs per 32-k, 2 ks
 /// per step). s32 accumulators, phi-carried.
@@ -792,12 +792,12 @@ pub fn buildGemmSharedI8(gpa: std.mem.Allocator, warps8: bool, fuse_scale: bool,
     return sasm.assembleChecked(gpa, sasm.version_1_5, t.items);
 }
 
-/// Stage B — fused int8 prep: rotate (radix-4 FWHT) + per-row abs-max +
+/// Stage B, fused int8 prep: rotate (radix-4 FWHT) + per-row abs-max +
 /// dynamic quantize, all in ONE hand-assembled workgroup kernel (Zig-emitted
 /// workgroup kernels DEVICE_LOST on this NVIDIA driver, so this must be hand-
 /// assembled). Replaces the 3-pass eltwise chain (rotate_fwht -> rowscale_i8 ->
 /// quantize_i8) and its xr(f32) DRAM round-trip; the FWHT runs IN SHARED (no
-/// private-array spill — the measured prep floor). SPECIALIZED for cols=6144
+/// private-array spill, the measured prep floor). SPECIALIZED for cols=6144
 /// (ng=24 groups of 256); mlp.down (cols=16384, 64 KB row > 48 KB shared) keeps
 /// the 3-pass fallback.
 ///
@@ -1267,12 +1267,12 @@ pub fn buildFusedPrepI8(gpa: std.mem.Allocator, cols: u32) ![]align(4) u8 {
 /// k sub-slabs: LocalSize (32,4) = 4 subgroups; each workgroup computes a
 /// 128(m) x 128(n) tile of C, stepping k by 64 as two 32-deep sub-slabs.
 /// BOTH operands stage through one workgroup f16 array: B decodes into
-/// [0, 8192) (2 x 32x128), A copies into [8192, 16384) (2 x 128x32) — 32 KB
+/// [0, 8192) (2 x 32x128), A copies into [8192, 16384) (2 x 128x32), 32 KB
 /// total, still 3 workgroups/SM by shared. Each half-step, the 128 threads
 /// first issue the uvec4 global loads for the *next* sub-slab (2 raw-e4m3
 /// quads for B, 4 f16 quads for A), then run the MMAs against the current
 /// one (all fragment loads ldmatrix from shared), then store the loaded
-/// words into the other buffer — the global-load latency hides under
+/// words into the other buffer, the global-load latency hides under
 /// tensor-core work. 2 barriers per 64 k. The dequant scale is folded into
 /// A by the caller (f32_to_h16). Bindings: 0 = A viewed as uvec4 (staging
 /// loads), 2 = C (f32), 3 = B (raw fp8 viewed as uvec4).
@@ -1306,13 +1306,13 @@ pub const subgroup_lanes: u32 = 32;
 /// `warps8`: 2x4 warp grid over a 128x256 wg tile (LocalSize (32,8), B
 /// slabs double to 32 KB -> 48 KB total shared, rows must be %256) instead
 /// of the 2x2 grid over 128x128 (32 KB, 3 wgs/SM). At ~165 regs/thread the
-/// wide tile is register-gated (occupancy experiment — lever 1); pair with
+/// wide tile is register-gated (occupancy experiment, lever 1); pair with
 /// `acc_h16` (f16 accumulators, converted to f32 at the C store) to fit
-/// 2 wgs/SM at <= 128 regs. acc_h16 changes accumulation NUMERICS — gate
+/// 2 wgs/SM at <= 128 regs. acc_h16 changes accumulation NUMERICS, gate
 /// any keep on the DiT parity fixture.
 pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h16: bool, c_h16: bool, bf16: bool) ![]align(4) u8 {
     // bf16 mode: the A/B operands (activations + weights) are bfloat16 instead
-    // of IEEE f16 — same 16-bit storage, so the staging is a bitwise copy and
+    // of IEEE f16, same 16-bit storage, so the staging is a bitwise copy and
     // only the type annotations change. Requires b_f16 (weight already 16-bit,
     // no fp8 dequant) and f32 accumulate. ` E`/`v2E` name the A/B element type.
     std.debug.assert(!bf16 or (b_f16 and !acc_h16 and !c_h16));
@@ -1437,7 +1437,7 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
     try em.line("%vbsh = OpVariable %ptr_wg_bsh Workgroup", .{});
     try em.line("%ptr_wg_f16 = OpTypePointer Workgroup %{s}", .{E});
 
-    // Named u32 constant block (mirrors the original — note duplicate values
+    // Named u32 constant block (mirrors the original, note duplicate values
     // like c_u3 vs c_scope_sub are intentional and must be preserved).
     for ([_]struct { []const u8, u32 }{
         .{ "c_u0", 0 },   .{ "c_u1", 1 },   .{ "c_u2", 2 },     .{ "c_u3", 3 },
@@ -1575,7 +1575,7 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
     const a_shbase = em.id();
     try em.line("%t{d} = OpIMul %u32 %t{d} %{s}", .{ a_shbase, wm64, c_astride });
 
-    // Loop-invariant B staging indices.
+    // B staging indices, constant across the loop.
     var brow_t: [2]u32 = undefined;
     var bco_t: [2]u32 = undefined;
     var sbase0_t: [2]u32 = undefined;
@@ -1601,7 +1601,7 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
         try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ sbase1_t[i], sbase0_t[i], c_bslab });
     }
 
-    // Loop-invariant A staging indices.
+    // A staging indices, constant across the loop.
     var a_inv_t: [4]u32 = undefined;
     var asb0_t: [4]u32 = undefined;
     var asb1_t: [4]u32 = undefined;
@@ -1991,7 +1991,7 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
 /// (scores ~700 ms/step at 1120x1680 both ways, back-to-back A/B), so the
 /// direct global-load variant stays the default; the staged path is kept
 /// for retest on other drivers. The global K fragment loads were NOT the
-/// scores bottleneck — same lesson as the A-stride-34 experiment.
+/// scores bottleneck, same lesson as the A-stride-34 experiment.
 pub const scores_stage_k = false;
 
 /// Attention-scores GEMM on tensor cores: S[z][q][j] = Qh . Kh^T for one
@@ -1999,7 +1999,7 @@ pub const scores_stage_k = false;
 /// cooperative-loadable directly; the f16 OUTPUT tile bounces through a
 /// 32 KB workgroup slab so the global S writes are fully coalesced u32
 /// stores (direct cooperative stores scatter 32 B tile rows across the
-/// s_stride and measured ~184 GB/s — a 4x loss). LocalSize (32,4): 2x2
+/// s_stride and measured ~184 GB/s, a 4x loss). LocalSize (32,4): 2x2
 /// warps each computing a 64x64 quarter of the workgroup's 128(q) x 128(j)
 /// tile.
 ///
@@ -2229,7 +2229,7 @@ pub fn buildGemmScores(gpa: std.mem.Allocator, hd: u32, stage_k: bool) ![]align(
     const kvmul = em.id();
     try em.line("%t{d} = OpIMul %u32 %t{d} %pkhead", .{ kvmul, kvh });
 
-    // Copy-out invariants.
+    // Copy-out constants.
     const zmul = em.id();
     try em.line("%t{d} = OpIMul %u32 %t{d} %psplane", .{ zmul, zidx });
     const srow0 = em.id();
@@ -2442,7 +2442,7 @@ pub fn buildGemmScores(gpa: std.mem.Allocator, hd: u32, stage_k: bool) ![]align(
 /// (32,4), grid (1, seq_pad/128, heads)) owns 128 q rows of one head; Q
 /// stages once into a 32 KB shared slab and is reused across the whole j
 /// loop. Per 64-wide j block, S = Q@K^T is computed on cooperative matrices
-/// and stored COLUMN-MAJOR into a 16 KB shared tile (s_sh[j][q] — so the
+/// and stored COLUMN-MAJOR into a 16 KB shared tile (s_sh[j][q], so the
 /// per-row scalar passes read lane-consecutive addresses, conflict-free).
 ///
 /// buildFlashMd (pass 1): each thread owns one q row and folds the shared S
@@ -2450,7 +2450,7 @@ pub fn buildGemmScores(gpa: std.mem.Allocator, hd: u32, stage_k: bool) ![]align(
 /// {m, 1/d} to the MD table. Replaces scores + softmax_partial/combine.
 ///
 /// buildFlashOut (pass 2): recomputes each S block the same way, transforms
-/// it in place to P = exp(S - m) * invd (padded j forced to zero — see the
+/// it in place to P = exp(S - m) * invd (padded j forced to zero, see the
 /// f16 overflow note on buildGemmAttnOut), then accumulates P@V on
 /// cooperative matrices (P loads are column-major from the shared tile).
 /// Replaces buildGemmAttnOut. The MD table lives in the TAIL of the f32
@@ -2465,14 +2465,13 @@ pub fn buildGemmScores(gpa: std.mem.Allocator, hd: u32, stage_k: bool) ![]align(
 /// (heads*128), u1 = s_stride (the KEY padded length: K's row stride and the
 /// j loop bound), u2 = head_off, u3 = heads-per-kv group, u4 = V row stride
 /// (kv*128), u5 = MD offset in f32 elements, f0 = valid j count (u32 bits),
-/// **f1 = MD plane stride, 0 meaning "= s_stride"**.
+/// f1 = MD plane stride, 0 meaning "= s_stride".
 ///
-/// ⚠️ **q and kv lengths are INDEPENDENT** — grid.y covers query tiles while
-/// `s_stride`/`pseq` describe the keys — so this runs cross-attention
-/// (Anima's `seq x 512`) as well as square self-attention. The one thing that
-/// was not independent was the MD table, whose plane stride has to cover the
-/// *query* rows; hence f1. Every caller that predates it passes 0 and gets the
-/// old square behaviour exactly.
+/// q and kv lengths are INDEPENDENT: grid.y covers query tiles while `s_stride`/`pseq`
+/// describe the keys, so this runs rectangular cross-attention as well as square
+/// self-attention. The MD table is the one thing that does not follow `s_stride`, since
+/// its plane stride has to cover the QUERY rows; that is f1, and 0 means "= s_stride" so
+/// a square caller passing 0 gets the square behaviour exactly.
 fn buildFlashAttn(gpa: std.mem.Allocator, out_phase: bool, stage_k: bool) ![]align(4) u8 {
     const STAGE_Q = false;
     const Q_SH: u32 = if (STAGE_Q) 16384 else 0; // s_sh region base
@@ -2659,11 +2658,11 @@ fn buildFlashAttn(gpa: std.mem.Allocator, out_phase: bool, stage_k: bool) ![]ali
         try em.line("%t{d} = OpAccessChain %ptr_pc_u32 %vpush %c_u{d}", .{ pptr, m });
         try em.line("%{s} = OpLoad %u32 %t{d}", .{ pnames[m], pptr });
     }
-    // MD plane stride. ⚠️ It is NOT `psstride` in general: this kernel runs
+    // MD plane stride. It is NOT `psstride` in general: this kernel runs
     // RECTANGULAR q x kv (Anima's cross-attention is `seq x 512`), where `psstride`
     // is the *key* padded length while the MD table needs one entry per *query*
-    // row. Word 7 carries it, and **0 means "same as psstride"** so every
-    // pre-existing caller — all of which pass f1 = 0 — is unchanged by
+    // row. Word 7 carries it, and 0 means "same as psstride" so every
+    // pre-existing caller, all of which pass f1 = 0, is unchanged by
     // construction. `buildGemmAttnOut` already had a `pmdplane`; this is its
     // sibling catching up.
     const mdplane = "pmdplane";
@@ -3269,7 +3268,7 @@ pub fn buildGemmAttnOut(gpa: std.mem.Allocator) ![]align(4) u8 {
     const wn64 = em.id();
     try em.line("%t{d} = OpIMul %u32 %t{d} %c_u64", .{ wn64, warp_n });
 
-    // Loop-invariant staging indices (32 f16-pair words per thread).
+    // Staging indices, constant across the loop (32 f16-pair words per thread).
     const s_zbase = em.id();
     try em.line("%t{d} = OpIMul %u32 %t{d} %psplane", .{ s_zbase, zidx });
     const md_zrow = em.id();

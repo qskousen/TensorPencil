@@ -1,33 +1,24 @@
-//! CLIP's BPE tokenizer — the SD family's prompt front end, a pure-Zig port of
-//! `transformers.CLIPTokenizer` (which is OpenAI CLIP's `SimpleTokenizer`).
+//! CLIP's BPE tokenizer, the SD family's prompt front end: a port of
+//! `transformers.CLIPTokenizer`, which is OpenAI CLIP's `SimpleTokenizer`.
 //!
-//! ## Why this is not a `Pretok` variant of `tokenizer.zig`
+//! Not a `Pretok` variant of `tokenizer.zig`, because that file is byte-level BPE: a
+//! word's initial symbols are its raw bytes and merges are looked up by
+//! `(left_id, right_id)`. CLIP appends a `</w>` suffix to the last character of every
+//! word, so the initial symbol sequence ends in `cn</w>` and the first lookup is by
+//! TEXT, not by byte. Bending the general BPE around that would complicate the path five
+//! other models use. What is genuinely shared, the GPT-2 byte/codepoint mapping and the
+//! Unicode letter and number predicates, is small and re-derived here.
 //!
-//! That file is byte-level BPE: a word's initial symbols are its raw bytes, and
-//! merges are looked up by `(left_id, right_id)`. CLIP starts differently — the
-//! **last character of every word carries a `</w>` suffix**, so the initial symbol
-//! sequence is `c₀, c₁, …, cₙ</w>` and the first lookup is by *text*, not by byte.
-//! Bending the general BPE around that would complicate the path five other models
-//! use. What is genuinely shared — the GPT-2 byte↔codepoint mapping and the Unicode
-//! letter/number predicates — is small and re-derived here from `unicode_tables`.
+//! The pipeline:
 //!
-//! ## The pipeline, and the three places a from-scratch port goes wrong
+//!     text -> collapse whitespace -> lowercase -> regex pretokenize
+//!          -> byte-encode each word -> append </w> to its last char -> BPE by rank
+//!          -> [BOS] ids... [EOS] padded to context with EOS
 //!
-//! ```
-//! text -> collapse whitespace -> lowercase -> regex pretokenize
-//!      -> byte-encode each word -> append </w> to its last char -> BPE by rank
-//!      -> [BOS] ids… [EOS] padded to context with EOS
-//! ```
-//!
-//! 1. **Whitespace is not a token.** CLIP's regex has no whitespace alternative, so
-//!    runs of it vanish entirely rather than attaching to the next word — the
-//!    opposite of the GPT-2/Qwen convention where a leading space is part of the
-//!    token. A port that keeps the space produces valid-looking ids for a different
-//!    prompt.
-//! 2. **Digits are one token each**, and letters/punctuation come in runs.
-//! 3. **Padding is EOS, not a dedicated pad id**, and truncation keeps BOS while
-//!    overwriting the final slot with EOS — so a truncated prompt still terminates.
-//!    (`clip_text.pooled` finds the *first* EOS for exactly this reason.)
+//! Three things a from-scratch port gets wrong, each documented at the code that handles
+//! it: whitespace is not a token and vanishes rather than attaching to the next word
+//! (the opposite of the GPT-2/Qwen convention), digits are one token each while letters
+//! and punctuation come in runs, and padding is EOS rather than a dedicated pad id.
 
 const std = @import("std");
 const tables = @import("unicode_tables.zig");
@@ -48,7 +39,7 @@ pub const context_length: usize = 77;
 /// Short segments are kept intact so a chunk boundary never lands mid-word.
 pub const max_word_length: usize = 8;
 
-/// Binary search over the generated Unicode ranges — the same shape
+/// Binary search over the generated Unicode ranges, the same shape
 /// `tokenizer.zig` uses (its copy is private, and duplicating fifteen lines beats
 /// making a hot predicate public across modules).
 fn inRanges(comptime ranges: []const tables.Range, cp: u21) bool {
@@ -150,7 +141,7 @@ pub const Tokenizer = struct {
         self.* = undefined;
     }
 
-    /// Encode `text` into exactly `context_length` ids: `[BOS] … [EOS]`, padded with
+    /// Encode `text` into exactly `context_length` ids: `[BOS] ... [EOS]`, padded with
     /// EOS. Truncation keeps BOS and forces the last slot to EOS. Caller frees.
     pub fn encode(self: *const Tokenizer, gpa: std.mem.Allocator, text: []const u8) ![]u32 {
         return self.encodePadded(gpa, text, eos_id);
@@ -158,11 +149,11 @@ pub const Tokenizer = struct {
 
     /// `encode`, with the padding id spelled out.
     ///
-    /// ⚠️ **SDXL's two towers pad differently and both paddings are conditioning.**
-    /// CLIP-L pads with EOS (`encode`); CLIP-G pads with **0** (`"!"`), which is what
+    /// SDXL's two towers pad differently and both paddings are conditioning.
+    /// CLIP-L pads with EOS (`encode`); CLIP-G pads with 0 (`"!"`), which is what
     /// OpenCLIP trained with and what both ComfyUI and diffusers use. The padded slots
-    /// are part of the 77-token window the UNet cross-attends to — a causal tower gives
-    /// them different hidden states — so this is not cosmetic, and the two towers must be
+    /// are part of the 77-token window the UNet cross-attends to, a causal tower gives
+    /// them different hidden states, so this is not cosmetic, and the two towers must be
     /// tokenized twice rather than once and shared.
     pub fn encodePadded(self: *const Tokenizer, gpa: std.mem.Allocator, text: []const u8, pad_id: u32) ![]u32 {
         const ids = try self.contentIds(gpa, text);
@@ -176,13 +167,13 @@ pub const Tokenizer = struct {
         // One slot is reserved for the terminating EOS, so at most len - 2 content ids.
         const n = @min(ids.len, context_length - 2);
         @memcpy(out[1 .. 1 + n], ids[0..n]);
-        // The terminator is always EOS even when the padding is not — it is what
+        // The terminator is always EOS even when the padding is not, it is what
         // `clip_text.pooled` looks for, and with pad 0 there is exactly one of them.
         out[1 + n] = eos_id;
         return out;
     }
 
-    /// The bare content ids of `text` — no BOS, no EOS, no padding and no
+    /// The bare content ids of `text`, no BOS, no EOS, no padding and no
     /// truncation. This is `transformers`' `tokenizer(text)["input_ids"][1:-1]`,
     /// which is the unit both `encodePadded` and `encodeWeighted` are built from.
     /// Caller frees.
@@ -204,24 +195,24 @@ pub const Tokenizer = struct {
         return out.toOwnedSlice(gpa);
     }
 
-    /// Chunk already-parsed A1111 weighted parts into whole `context_length` windows —
+    /// Chunk already-parsed A1111 weighted parts into whole `context_length` windows,
     /// the `tokenize_line` half of A1111's prompt path, where `prompt_a1111.parseAttention`
     /// is the other half.
     ///
     /// Two things differ from `encodeWeighted`'s ComfyUI chunker, and both are visible in
     /// a long prompt:
     ///
-    /// - ⚠️ **A `BREAK` part closes the current chunk immediately**, padding the rest. That
+    /// - A `BREAK` part closes the current chunk immediately, padding the rest. That
     ///   is what `BREAK` is *for*, and ComfyUI ignores it entirely (tokenizing the literal
     ///   word `break`).
-    /// - ⚠️ **A boundary backtracks to the last comma.** On reaching 75 content tokens with
+    /// - A boundary backtracks to the last comma. On reaching 75 content tokens with
     ///   a comma no more than `comma_backtrack` tokens behind, everything after that comma
     ///   is *relocated* into the next chunk, so a boundary does not land mid-phrase. Since
     ///   each chunk is encoded independently by a causal tower, a phrase split across the
     ///   seam is conditioning the model never sees whole.
     ///
     /// Note the reference sets `last_comma` to the index the comma is *about* to occupy,
-    /// before appending it, and resets it whenever a chunk closes — including on the
+    /// before appending it, and resets it whenever a chunk closes, including on the
     /// relocation path, where the relocated tokens land in a chunk with no known comma.
     ///
     /// `parts` come from `prompt_a1111.parseAttention`. Caller `deinit`s the result.
@@ -235,7 +226,7 @@ pub const Tokenizer = struct {
         defer scratch.deinit();
         const arena = scratch.allocator();
 
-        // `,</w>` — the comma as its own token, which is what a boundary looks for.
+        // `,</w>`, the comma as its own token, which is what a boundary looks for.
         const comma_id: ?u32 = self.vocab.get(",</w>");
 
         var out: std.ArrayList(Weighted) = .empty;
@@ -291,28 +282,26 @@ pub const Tokenizer = struct {
     }
 
     /// Tokenize a prompt the way ComfyUI does: parse the `(text:weight)` emphasis
-    /// syntax, then pack the result into **as many whole `context_length` chunks as
-    /// it takes** rather than truncating at one.
+    /// syntax, then pack the result into as many whole `context_length` chunks as
+    /// it takes rather than truncating at one.
     ///
-    /// ⚠️ **This is what `encode`/`encodePadded` get wrong for any real prompt**, and
-    /// it is not a subtle difference. A booru-style prompt is routinely 100+ tokens;
-    /// truncating at 77 silently drops the tail (typically the entire quality-tag
-    /// block), and tokenizing `(shiny skin:1.1)` literally spends nine content slots
-    /// on punctuation that ComfyUI strips — so the truncation bites *earlier* than the
-    /// prompt's real length suggests. Measured on one real 115-token prompt: ComfyUI
-    /// built 154 conditioning rows, `encode` built 77 and lost `lens flare` through
-    /// `newest`. The render was a different image, at the same seed.
+    /// `encode`/`encodePadded` get this wrong for any real prompt. A booru-style prompt
+    /// is routinely 100+ tokens, truncating at 77 silently drops the tail (typically the
+    /// whole quality-tag block), and tokenizing `(shiny skin:1.1)` literally spends nine
+    /// content slots on punctuation ComfyUI strips, so truncation bites EARLIER than the
+    /// prompt's length suggests. On a 115-token prompt ComfyUI builds 154 conditioning
+    /// rows where `encode` builds 77, which is a different image at the same seed.
     ///
-    /// The two conventions worth knowing, because neither is derivable:
+    /// Two conventions, neither derivable:
     ///
-    /// - **`BREAK` is not honoured.** A1111 pads to the next chunk on it; ComfyUI has
-    ///   no such rule, so it tokenizes as the literal word `break`. Verified against
-    ///   `comfy.sd1_clip.SDTokenizer` — the chunk split is purely length-driven.
-    /// - **A weight is absolute, not cumulative, once a `:` gives one.** `(a:1.5)`
-    ///   inside another paren group is 1.5, not 1.5 × 1.1. Bare nesting *is*
-    ///   cumulative (`((a))` is 1.21).
+    /// - `BREAK` is not honoured. A1111 pads to the next chunk on it; ComfyUI has no
+    ///   such rule, so it tokenizes as the literal word `break` and the chunk split is
+    ///   purely length-driven.
+    /// - A weight is absolute, not cumulative, once a `:` gives one: `(a:1.5)` inside
+    ///   another paren group is 1.5, not 1.65. Bare nesting IS cumulative, `((a))` being
+    ///   1.21.
     ///
-    /// `pad_id` is the trailing filler for a short final chunk — EOS for CLIP-L, 0 for
+    /// `pad_id` is the trailing filler for a short final chunk, EOS for CLIP-L, 0 for
     /// CLIP-G, exactly as in `encodePadded`. Caller `deinit`s the result.
     pub fn encodeWeighted(self: *const Tokenizer, gpa: std.mem.Allocator, text: []const u8, pad_id: u32) !Prompt {
         var scratch = std.heap.ArenaAllocator.init(gpa);
@@ -322,7 +311,7 @@ pub const Tokenizer = struct {
         var segs: std.ArrayList(prompt_weights.Segment) = .empty;
         try prompt_weights.segments(arena, &segs, text);
 
-        // Each weighted *segment* is tokenized on its own — not each word — because
+        // Each weighted *segment* is tokenized on its own, not each word, because
         // that is the unit ComfyUI hands to the tokenizer, and BPE at a segment
         // boundary is not always what it would be mid-string.
         var groups: std.ArrayList(Group) = .empty;
@@ -354,8 +343,8 @@ pub const Tokenizer = struct {
                 const room = context_length - len - 1;
                 if (is_large) {
                     // Split it: a long segment is not a word, so a boundary inside it
-                    // costs nothing. ⚠️ EOS goes directly after the content it
-                    // terminates — padding follows it, never precedes it.
+                    // costs nothing. EOS goes directly after the content it
+                    // terminates, padding follows it, never precedes it.
                     for (rest[0..room]) |id| try out.append(gpa, .{ .id = id, .weight = w });
                     rest = rest[room..];
                     try out.append(gpa, .{ .id = eos_id, .weight = 1.0 });
@@ -441,12 +430,12 @@ pub const Weighted = struct { id: u32, weight: f32 };
 /// `comma_padding_backtrack`, default 20). Zero disables it.
 pub const comma_backtrack: usize = 20;
 
-/// Content tokens per chunk — 75, with BOS and EOS making up `context_length`.
+/// Content tokens per chunk, 75, with BOS and EOS making up `context_length`.
 pub const chunk_content: usize = context_length - 2;
 
 /// A prompt tokenized into whole `context_length` chunks. `tokens` is
 /// `[chunks][context_length]` row-major, so every chunk is a complete
-/// `[BOS] … [EOS] pad…` sequence the tower can be run on directly.
+/// `[BOS] ... [EOS] pad...` sequence the tower can be run on directly.
 pub const Prompt = struct {
     tokens: []Weighted,
     chunks: usize,
@@ -467,14 +456,14 @@ pub const Prompt = struct {
         for (self.chunk(i), dst) |t, *d| d.* = t.id;
     }
 
-    /// Total conditioning rows this prompt produces — what `Cond.seq` becomes.
+    /// Total conditioning rows this prompt produces, what `Cond.seq` becomes.
     pub fn seq(self: *const Prompt) usize {
         return self.chunks * context_length;
     }
 
     /// True when any token's weight is not exactly 1.0. This is ComfyUI's
     /// `has_weights`, and it is what decides whether the empty-prompt reference
-    /// forward is needed at all (see `clip_text.applyWeights`) — so an unweighted
+    /// forward is needed at all (see `clip_text.applyWeights`), so an unweighted
     /// prompt costs exactly what it did before.
     pub fn hasWeights(self: *const Prompt) bool {
         for (self.tokens) |t| if (t.weight != 1.0) return true;
@@ -483,7 +472,7 @@ pub const Prompt = struct {
 };
 
 /// ComfyUI's `gen_empty_tokens`: the sequence whose hidden states are the reference
-/// point attention weighting interpolates away from — `[BOS] [EOS] pad…`, filled to
+/// point attention weighting interpolates away from, `[BOS] [EOS] pad...`, filled to
 /// `dst.len`.
 pub fn emptyIds(dst: []u32, pad_id: u32) void {
     std.debug.assert(dst.len >= 2);
@@ -552,7 +541,7 @@ const WordIterator = struct {
         }
 
         if (isNumber(c0)) {
-            // One digit per token — not a run.
+            // One digit per token, not a run.
             try self.emit(gpa, &out, self.pos, self.pos + start.len);
             self.pos += start.len;
             return try out.toOwnedSlice(gpa);
@@ -592,7 +581,7 @@ const WordIterator = struct {
                 break :blk 1;
             };
             // Byte-level encoding: each UTF-8 byte becomes its mapped codepoint,
-            // which is then itself UTF-8 encoded — the form the vocab keys are in.
+            // which is then itself UTF-8 encoded, the form the vocab keys are in.
             for (buf[0..n]) |b| {
                 var enc: [4]u8 = undefined;
                 const m = std.unicode.utf8Encode(byte_to_cp[b], &enc) catch unreachable;
@@ -765,7 +754,7 @@ test "a long prompt keeps every token instead of truncating at one chunk" {
         found = true;
     };
     try testing.expect(found);
-    // Two chunks, and every chunk is a complete BOS…EOS sequence — not one long run.
+    // Two chunks, and every chunk is a complete BOS...EOS sequence, not one long run.
     try testing.expectEqual(@as(usize, 2), p.chunks);
     for (0..p.chunks) |c| {
         try testing.expectEqual(bos_id, p.chunk(c)[0].id);

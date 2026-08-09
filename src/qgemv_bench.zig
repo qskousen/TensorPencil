@@ -2,7 +2,7 @@
 //! `zig build qgemv-bench`. Answers the question behind "grouped-N": is the
 //! grouped multi-input GEMV a real gain over the current m>1 fallback
 //! (dequant the whole weight to f16, then a tensor-core GEMM) for the small
-//! batches a speculative-verify pass produces — and where does the crossover
+//! batches a speculative-verify pass produces, and where does the crossover
 //! into the GEMM sit?
 //!
 //! Both paths are timed with the backend's own sync-per-op CUDA-event
@@ -26,10 +26,10 @@ const rnd = rnd_state.random();
 const Shape = struct { rows: usize, cols: usize, name: []const u8 };
 // rows multiple of 128 (hgemm), cols multiple of 256 (dp4a grouped GEMV).
 const shapes = [_]Shape{
-    // gemma4 31B (hidden 5376, ffn 21504) — the prefill shapes that matter here.
+    // gemma4 31B (hidden 5376, ffn 21504), the prefill shapes that matter here.
     .{ .rows = 21504, .cols = 5376, .name = "21504 x 5376  (g4 mlp gate/up)" },
     .{ .rows = 5376, .cols = 21504, .name = "5376 x 21504  (g4 mlp down)" },
-    // Bonsai-27B / qwen35 (hidden 5120, ffn 17408) — the q1_0 prefill shapes.
+    // Bonsai-27B / qwen35 (hidden 5120, ffn 17408), the q1_0 prefill shapes.
     .{ .rows = 17408, .cols = 5120, .name = "17408 x 5120  (b27 mlp gate/up)" },
     .{ .rows = 5120, .cols = 17408, .name = "5120 x 17408  (b27 mlp down)" },
     // The shape ggml's own `test-backend-ops perf -o MUL_MAT` reports, so our MMQ
@@ -52,13 +52,13 @@ const kinds = [_]Kind{
 };
 
 /// Whether `grouped` has a kernel for this dtype (`opGemvQuantQ8N`). q1_0 has no
-/// grouped GEMV — it went straight to MMQ for prefill — so the grouped column is
+/// grouped GEMV, it went straight to MMQ for prefill, so the grouped column is
 /// skipped rather than panicking.
 fn hasGroupedKernel(dt: tp.DType) bool {
     return dt != .q1_0;
 }
 
-/// Int8 tensor-core MACs for one GEMM, as TOPS given a millisecond timing —
+/// Int8 tensor-core MACs for one GEMM, as TOPS given a millisecond timing,
 /// the distance from the 3090's ~284 dense TOPS is what says whether a kernel is
 /// worth more work or already near the machine.
 fn tops(rows: usize, cols: usize, n: usize, ms: f64) f64 {
@@ -76,7 +76,7 @@ fn grouped(be: *Backend, dt: tp.DType, x_d: DeviceBuffer, y_d: DeviceBuffer, q: 
     be.opGemvQuantizeX(x_d, n * cols) catch @panic("quantizeX");
     var off: usize = 0;
     while (off < n) : (off += 8) {
-        const ng: usize = @min(8, n - off); // usize annotation: @min range-narrows (ZIG.md)
+        const ng: usize = @min(8, n - off); // usize annotation: @min range-narrows
         be.opGemvQuantQ8N(dt, offBuf(y_d, off * rows * 4, ng * rows * 4), q, 1.0, rows, cols, ng, off, n) catch @panic("q8n");
     }
 }
@@ -133,7 +133,7 @@ pub fn main(init: std.process.Init) !void {
                 const quant_ms = be.prof.ms[@intFromEnum(Cat.elt)] / iters;
 
                 // MMQ (q4_k only for now): correctness vs the dequant+GEMM path,
-                // then timing. Not bit-exact — the activations go through int8 —
+                // then timing. Not bit-exact, the activations go through int8,
                 // so compare with a relative-error bound over the whole output.
                 var mmq_ms: f64 = 0;
                 var mmq_rel: f64 = -1;
@@ -164,7 +164,7 @@ pub fn main(init: std.process.Init) !void {
                         mmq_ms = (be.prof.ms[@intFromEnum(Cat.matmul)] + be.prof.ms[@intFromEnum(Cat.elt)]) / iters;
                     }
 
-                    // Pipe-tiled MMQ (128x128, MT=4/NT=8) — needs rows % 128 == 0.
+                    // Pipe-tiled MMQ (128x128, MT=4/NT=8), needs rows % 128 == 0.
                     if (rows % Backend.mmq_pipe_tile == 0) {
                         be.opMatmulQuantMmqPipe(k.dt, y_d, x_d, n, q, rows, cols) catch @panic("mmqpipe");
                         const got2 = try gpa.alloc(f32, n * rows);

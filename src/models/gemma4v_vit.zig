@@ -72,7 +72,7 @@ pub const Config = struct {
     /// 2-D RoPE base (gemma4v vision: 100.0, not the LLM's 1e6/1e4).
     rope_theta: f64,
     /// Vision token budget (nMax): the image is resized so the post-merge token
-    /// count targets ~this many (aspect-preserving, no crop/pad — Google's
+    /// count targets ~this many (aspect-preserving, no crop/pad, Google's
     /// gemma4_vision_token_budget algorithm). Runtime-settable (CLI
     /// `--vision-budget`, GUI); `detect` seeds the `high` default.
     max_tokens: usize,
@@ -331,8 +331,8 @@ pub const Vit = struct {
     }
 
     /// Debug: the EXACT pixels the tower ingests (aspect-preserving resize to the
-    /// token-budget grid, reconstructed from the `2·p/255−1` normalization back to
-    /// interleaved RGB u8). No crop and no bars — the whole image is present.
+    /// token-budget grid, reconstructed from the `2*p/255−1` normalization back to
+    /// interleaved RGB u8). No crop and no bars, the whole image is present.
     /// Returns owned pixels + the resized dims.
     pub fn preprocessedRgb(self: *const Vit, gpa: std.mem.Allocator, rgb: []const u8, width: usize, height: usize) !struct { pixels: []u8, width: usize, height: usize } {
         const cfg = self.cfg;
@@ -377,7 +377,7 @@ pub const Vit = struct {
     /// ([gx*gy][dim], row-major patch order): 3x3 average-pool merge ->
     /// x*sqrt(dim) -> (x - std_bias)*std_scale -> weightless RMSNorm ->
     /// mm.input_projection. Shared by the CPU encode and a future CUDA encode
-    /// (which would run the blocks device-side and project here — cheap).
+    /// (which would run the blocks device-side and project here, cheap).
     pub fn project(self: *const Vit, io: std.Io, gpa: std.mem.Allocator, x: []const f32, gx: usize, gy: usize) !Encoded {
         const cfg = self.cfg;
         const dim = cfg.dim;
@@ -458,7 +458,7 @@ const Size = struct { w: usize, h: usize };
 /// Google's `gemma4_vision_token_budget` resize: scale the image (aspect-
 /// preserving) so its post-merge token count targets `max_tokens`, then floor
 /// each dimension to a multiple of `alignp` (= patch*merge = 48). No crop, no
-/// pad — the tiny per-dimension floor drift is absorbed by the grid. `f > 1`
+/// pad, the tiny per-dimension floor drift is absorbed by the grid. `f > 1`
 /// upscales small images to fill the budget, exactly as Google's tool does.
 fn targetSize(w: usize, h: usize, alignp: usize, max_tokens: usize) Size {
     const m: f64 = @floatFromInt(alignp);
@@ -495,7 +495,7 @@ fn patchMatrix(gpa: std.mem.Allocator, rgb: []const u8, sw: usize, sh: usize, tw
 }
 
 /// Resize `rgb` (interleaved, sw x sh) DIRECTLY to `tw` x `th` (no crop, no pad
-/// — Google's `gemma4_vision_token_budget` uses a plain aspect-preserving canvas
+/// Google's `gemma4_vision_token_budget` uses a plain aspect-preserving canvas
 /// resize; `tw`/`th` already encode the near-source aspect) and normalize to
 /// planar CHW f32 with `2*(p/255) - 1`. Align-corners bilinear in f32.
 fn preprocess(gpa: std.mem.Allocator, rgb: []const u8, sw: usize, sh: usize, tw: usize, th: usize) ![]f32 {

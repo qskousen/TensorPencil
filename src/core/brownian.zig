@@ -1,73 +1,57 @@
 //! torchsde's Brownian tree, as ComfyUI's SDE samplers use it.
 //!
-//! `dpmpp_2m_sde` / `dpmpp_3m_sde` / `dpmpp_sde` do not draw fresh noise per step.
-//! They query a **Brownian motion sampled over the sigma axis**:
+//! `dpmpp_2m_sde` / `dpmpp_3m_sde` / `dpmpp_sde` do not draw fresh noise per step. They
+//! query a Brownian motion sampled over the sigma axis:
 //!
 //!     noise(sigma, sigma_next) = W([sigma_next, sigma]) / sqrt(|sigma - sigma_next|)
 //!
-//! where `W` is one path fixed by the seed alone. That is the whole point of the
-//! construction: the increments over *adjacent* sigma intervals are consistent, so
-//! the same seed at 8 and at 20 steps walks the same underlying path and produces
-//! recognisably the same image. A per-step `randn` gives statistically valid noise
-//! and none of that property — and, more to the point here, does not reproduce
-//! ComfyUI.
+//! where `W` is one path fixed by the seed alone, so increments over ADJACENT sigma
+//! intervals are consistent and the same seed at 8 and at 20 steps
+//! walks the same underlying path and produces recognisably the same image. A per-step
+//! `randn` gives statistically valid noise, none of that property, and does not
+//! reproduce ComfyUI.
 //!
 //! ComfyUI's default is `BrownianTreeNoiseSampler`, i.e.
 //! `torchsde.BrownianTree(entropy=seed, tol=1e-6, pool_size=24)`, which is
-//! `BrownianInterval(halfway_tree=True, levy_area_approximation='none')`. Three
-//! pieces make it reproducible, and all three are ported here:
+//! `BrownianInterval(halfway_tree=True, levy_area_approximation='none')`. Three pieces
+//! make it reproducible and all three are ported: the dyadic interval tree here,
+//! `numpy.random.SeedSequence` in `seed_seq.zig` for each node's seed, and `torch.randn`
+//! in `noise.zig`, whose two engines are the two ecosystems' generators.
 //!
-//!  1. **The dyadic interval tree.** `halfway_tree=True` means the path is
-//!     determined by the seed *alone* — not by the order or location of queries.
-//!     An interval is only ever split at its own (rounded) midpoint, recursively,
-//!     until the requested boundary falls on a node edge.
-//!  2. **`numpy.random.SeedSequence`** derives each node's RNG seed from
-//!     `(entropy, spawn_key=(node, depth), pool_size=24)` — see `seed_seq.zig`.
-//!  3. **`torch.randn`** seeded with that u32 — `noise.zig`, whose two engines are the
-//!     ecosystems' two generators (see there: A1111's tree runs on the GPU's Philox),
-//!     already bit-exact.
+//! `halfway_tree=True` means the path is determined by the seed ALONE, not by the order
+//! or location of queries: an interval is only ever split at its own rounded midpoint,
+//! recursively, until the requested boundary falls on a node edge.
 //!
-//! ⚠️ **Time is quantised by Python's `round(x, 6)`** (`tol = 1e-6`), and that is
-//! not the same function as "multiply by 1e6, round, divide". Python rounds the
-//! **exact binary value** with ties-to-even; the naive form double-rounds. A single
-//! ulp of disagreement on one midpoint gives a different tree and therefore a
-//! completely different image, so `round6` below does it exactly. Zig's own float
-//! formatter is *also* not a substitute: it rounds the shortest round-trip decimal,
-//! half-up.
-//!
-//! ⚠️ **The sign flip is real.** `BatchedBrownianTree` sorts its query times and
-//! multiplies by the product of the construction-order and query-order signs. Since
-//! sampling runs *down* the sigma axis while the tree was built over
-//! `[sigma_min, sigma_max]`, every returned increment is **negated**. Statistically
-//! irrelevant (the law is symmetric), bit-exactly essential.
-//!
-//! Levy area is never needed (`levy_area_approximation='none'`), so the `H`/`A`
-//! machinery of `brownian_interval.py` is deliberately absent — only the `W`
-//! branch of `_increment_and_space_time_levy_area` is ported. `_randn(H_seed)` in
-//! the reference draws from an independent generator, so omitting it changes
-//! nothing.
+//! Levy area is never needed, so the `H`/`A` machinery of `brownian_interval.py` is
+//! deliberately absent and only the `W` branch of
+//! `_increment_and_space_time_levy_area` is ported. `_randn(H_seed)` in the reference
+//! draws from an independent generator, so omitting it changes nothing.
 
 const std = @import("std");
 const seed_seq = @import("seed_seq.zig");
 const noise_src = @import("noise.zig");
 
-/// `tol = 1e-6` → `round(x, 6)`.
+/// `tol = 1e-6` -> `round(x, 6)`.
 const round_digits: comptime_int = 6;
 const round_scale: u64 = 1_000_000;
 /// torchsde's `BrownianTree` default.
 const pool_size: usize = 24;
 
-/// **Python's `round(x, 6)`.**
+/// Python's `round(x, 6)`.
 ///
 /// CPython's `double_round` renders `x` to 6 fractional digits with `_Py_dg_dtoa`
 /// (exact, ties-to-even) and parses the decimal back with a correctly-rounded
 /// strtod. This reproduces both halves: exact integer arithmetic on the mantissa
 /// for the rounding, and `std.fmt.parseFloat` (correctly rounded) for the parse.
 ///
-/// The naive `@round(x * 1e6) / 1e6` differs from this on values where `x * 1e6`
-/// lands near a half-integer, because the multiply itself rounds first. Ties are
-/// reachable in practice: an interval midpoint that happens to be an odd multiple
-/// of 1/128 has exactly 7 decimal digits ending in 5.
+/// The naive `@round(x * 1e6) / 1e6` differs from this on values where `x * 1e6` lands
+/// near a half-integer, because the multiply itself rounds first, and Zig's own float
+/// formatter is not a substitute either: it rounds the shortest round-trip decimal,
+/// half-up. Ties are reachable in practice, since an interval midpoint that is an odd
+/// multiple of 1/128 has exactly 7 decimal digits ending in 5.
+///
+/// This is the tree's time quantisation (`tol = 1e-6`), so one ulp of disagreement on
+/// one midpoint gives a different tree and therefore a completely different image.
 pub fn round6(x: f64) f64 {
     if (!std.math.isFinite(x) or x == 0) return x;
 
@@ -86,7 +70,7 @@ pub fn round6(x: f64) f64 {
         e = @as(i32, exp_bits) - 1075;
     }
     // e >= 0 means |x| is an integer, so rounding to any number of fractional
-    // digits is the identity — and skips the overflow question entirely.
+    // digits is the identity, and skips the overflow question entirely.
     if (e >= 0) return x;
 
     const k: u32 = @intCast(-e);
@@ -123,7 +107,7 @@ const Node = struct {
     is_left: bool,
     /// `_set_spawn_key_and_depth`: `2 * parent.spawn + is_right`, root at 0. Together
     /// with `depth` this is the `spawn_key` handed to `SeedSequence`, so it is an
-    /// intrinsic property of the node's position — the same tree always derives the
+    /// intrinsic property of the node's position, the same tree always derives the
     /// same seeds regardless of the order nodes were created in.
     spawn: u64,
     depth: u32,
@@ -142,7 +126,7 @@ const Node = struct {
 /// span is ~1e-2..1e2, i.e. at most ~28 halvings before hitting the 1e-6 grid.
 const max_depth: u32 = 64;
 
-/// `BrownianTreeNoiseSampler` — a Brownian path over `[t0, t1]`, queried by
+/// `BrownianTreeNoiseSampler`, a Brownian path over `[t0, t1]`, queried by
 /// interval and normalised to unit variance.
 pub const NoiseSampler = struct {
     gpa: std.mem.Allocator,
@@ -156,13 +140,13 @@ pub const NoiseSampler = struct {
     /// Scratch: the increment being carried down the tree, and one `randn` draw.
     path_w: []f32,
     noise: []f32,
-    /// Which generator every node's draw comes from. ⚠️ NOT a detail: the k-diffusion
+    /// Which generator every node's draw comes from. NOT a detail: the k-diffusion
     /// commit A1111 pins builds the tree on the latent's own (CUDA) device, so under
     /// A1111 these are Philox draws, while ComfyUI's fork forces them to the CPU.
     src: noise_src.Source,
 
-    /// `t0`/`t1` are the schedule's `min(sigma > 0)` and `max(sigma)` — taken from
-    /// the sigmas the caller will actually query, **before** any first-sigma SNR
+    /// `t0`/`t1` are the schedule's `min(sigma > 0)` and `max(sigma)`, taken from
+    /// the sigmas the caller will actually query, before any first-sigma SNR
     /// offset, matching the order in `sample_dpmpp_2m_sde`.
     pub fn init(gpa: std.mem.Allocator, n: usize, t0: f32, t1: f32, seed: u64, src: noise_src.Source) !NoiseSampler {
         std.debug.assert(t0 < t1);
@@ -185,8 +169,8 @@ pub const NoiseSampler = struct {
         const noise = try gpa.alloc(f32, n);
         errdefer gpa.free(noise);
 
-        // The root's increment. ⚠️ `math.sqrt(t1 - t0)` in the reference uses the
-        // **unrounded** endpoints, unlike every child computation, which uses the
+        // The root's increment. `math.sqrt(t1 - t0)` in the reference uses the
+        // unrounded endpoints, unlike every child computation, which uses the
         // rounded `_start`/`_end`.
         var state: [3]u32 = undefined;
         seed_seq.SeedSequence.init(seed, &.{}, pool_size).generateState(&state);
@@ -218,9 +202,14 @@ pub const NoiseSampler = struct {
     /// The unit-variance noise for a sampler step from `sigma` down to `sigma_next`.
     ///
     /// This is `BrownianTreeNoiseSampler.__call__`: locate `[sigma_next, sigma]` in
-    /// the tree, sum the increments of the covering nodes, **negate** (the sort-sign
-    /// product, see the module doc), and divide by `sqrt(|sigma_next - sigma|)`
-    /// computed in f32 from the *unrounded* sigmas.
+    /// the tree, sum the increments of the covering nodes, negate, and divide by
+    /// `sqrt(|sigma_next - sigma|)` computed in f32 from the UNROUNDED sigmas.
+    ///
+    /// The negation is real, not a convention. `BatchedBrownianTree` sorts its query
+    /// times and multiplies by the product of the construction-order and query-order
+    /// signs; sampling runs DOWN the sigma axis while the tree was built over
+    /// `[sigma_min, sigma_max]`, so every returned increment is negated. Statistically
+    /// irrelevant, since the law is symmetric, and bit-exactly essential.
     pub fn sample(self: *NoiseSampler, out: []f32, sigma: f32, sigma_next: f32) !void {
         std.debug.assert(out.len == self.n);
         std.debug.assert(sigma != sigma_next);
@@ -248,9 +237,9 @@ pub const NoiseSampler = struct {
     /// `out` left to right (the reference's summation order, so the f32 rounding
     /// matches).
     ///
-    /// ⚠️ **The "bounce up to the parent" branch is load-bearing, not defensive.**
+    /// The "bounce up to the parent" branch is load-bearing, not defensive.
     /// A node only has jurisdiction over its own span, and `_split` in halfway mode
-    /// cuts at the *midpoint* rather than at the requested boundary — so after
+    /// cuts at the *midpoint* rather than at the requested boundary, so after
     /// splitting, the child the reference descends into is routinely too narrow for
     /// the query. It bounces back to the parent, which by then has a midpoint and
     /// takes the straddle path. Omitting the bounce sends the walk down the right
@@ -356,11 +345,11 @@ pub const NoiseSampler = struct {
 
     /// The increment `W` over one node's interval, left in `self.path_w`.
     ///
-    /// The reference recurses upward through an LRU cache; this walks the root→node
+    /// The reference recurses upward through an LRU cache; this walks the root->node
     /// path and carries `W` down, which costs one `randn` per level and no cache.
-    /// The values are identical — the cache is purely a speed device there.
+    /// The values are identical, the cache is purely a speed device there.
     fn incrementInto(self: *NoiseSampler, node_idx: u32) !void {
-        // Collect the path root→node. Depth is bounded by `max_depth` by construction.
+        // Collect the path root->node. Depth is bounded by `max_depth` by construction.
         var path: [max_depth + 2]u32 = undefined;
         var len: usize = 0;
         var cur = node_idx;
@@ -383,7 +372,7 @@ pub const NoiseSampler = struct {
 
             noise_src.randn(self.noise, parent.w_seed, self.src);
 
-            // ⚠️ f32 throughout, and in the reference's order: a Python float times
+            // f32 throughout, and in the reference's order: a Python float times
             // a f32 tensor is computed in f32, so each scalar is narrowed *before*
             // it multiplies. Folding `left_diff * h_reciprocal` into one f64 scalar
             // would be a different (more accurate, non-matching) computation.
@@ -477,8 +466,8 @@ test "the Brownian path depends on the seed and only on the seed" {
 }
 
 test "matches torchsde's BrownianTree through ComfyUI's BrownianTreeNoiseSampler" {
-    // ⚠️ This is the test that makes the whole port worth doing: **bit-exact**, not
-    // approximate. Every ingredient has to be right simultaneously — numpy's
+    // This is the test that makes the whole port worth doing: bit-exact, not
+    // approximate. Every ingredient has to be right simultaneously, numpy's
     // SeedSequence, the spawn key of every node on the path, Python's `round(x, 6)`,
     // torch's `randn`, the f32 ordering of the increment recursion, and the sort-sign
     // negation. Any one of them being wrong gives statistically indistinguishable

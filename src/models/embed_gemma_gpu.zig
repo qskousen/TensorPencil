@@ -1,7 +1,7 @@
 //! EmbeddingGemma on the Vulkan backend: the bidirectional Gemma-3 body runs
 //! device-side, the cheap head (mean-pool + 2 Dense + L2) on the host via
 //! `embed_gemma.Model.head`. Reuses the CPU model's f32 weights directly
-//! (mmap-stable → Vulkan's pointer-keyed weight cache, no dequant).
+//! (mmap-stable -> Vulkan's pointer-keyed weight cache, no dequant).
 //!
 //! Gemma-3 primitives, all existing Context ops: RMSNorm (`rmsnorm`, weights
 //! carry the +1 already, folded at CPU load), per-head QK-norm (same `rmsnorm`
@@ -100,7 +100,7 @@ pub const ModelGpu = struct {
         const eps = cfg.rms_eps;
         for (cpu.layers, 0..) |*l, li| {
             const freqs = if (cfg.isGlobal(li)) freqs_g else freqs_l;
-            // --- Attention (input RMSNorm → QKV → QK-norm → RoPE → GQA attn) ---
+            // --- Attention (input RMSNorm -> QKV -> QK-norm -> RoPE -> GQA attn) ---
             try ctx.opElt(.rmsnorm, x_d, normed_d, try nbuf(ctx, l.input_norm), null, .{ .u0 = @intCast(seq), .u1 = @intCast(w), .f0 = eps }, seq, 1, 1);
             try ctx.opMatmul(q_d, 0, normed_d, 0, seq, l.q.bytes, false, qd, w, 1.0, null);
             try ctx.opMatmul(k_d, 0, normed_d, 0, seq, l.k.bytes, false, kvd, w, 1.0, null);
@@ -116,7 +116,7 @@ pub const ModelGpu = struct {
             try ctx.opElt(.rmsnorm, t_d, t_d, try nbuf(ctx, l.post_attn_norm), null, .{ .u0 = @intCast(seq), .u1 = @intCast(w), .f0 = eps }, seq, 1, 1);
             try ctx.opElt(.add, x_d, t_d, null, null, .{ .u0 = @intCast(seq * w) }, seq * w, 1, 1);
 
-            // --- MLP (pre-FFN norm → GeGLU → down → post-FFN norm) ---
+            // --- MLP (pre-FFN norm -> GeGLU -> down -> post-FFN norm) ---
             try ctx.opElt(.rmsnorm, x_d, normed_d, try nbuf(ctx, l.pre_ffn_norm), null, .{ .u0 = @intCast(seq), .u1 = @intCast(w), .f0 = eps }, seq, 1, 1);
             try ctx.opMatmul(gate_d, 0, normed_d, 0, seq, l.gate.bytes, false, inter, w, 1.0, null);
             try ctx.opMatmul(up_d, 0, normed_d, 0, seq, l.up.bytes, false, inter, w, 1.0, null);
@@ -135,8 +135,8 @@ pub const ModelGpu = struct {
         try cpu.head(io, gpa, lhs, out);
     }
 
-    /// Batched Vulkan encode: `ids_list[i]` → `outs[i]`. Mirrors the CPU
-    /// `Model.embedBatch` — the whole Gemma-3 body runs over `total = sum(seq_i)`
+    /// Batched Vulkan encode: `ids_list[i]` -> `outs[i]`. Mirrors the CPU
+    /// `Model.embedBatch`, the whole Gemma-3 body runs over `total = sum(seq_i)`
     /// packed rows; QK-norm/GeGLU/norms batch trivially, RoPE + GQA attention
     /// loop per item via the `rope_half`/`attn_full` element-offset push fields
     /// (q and k/v use distinct offsets since q_dim ≠ kv_dim). Head per item.

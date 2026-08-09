@@ -115,7 +115,7 @@ pub fn rotateHalfFreqsScaled(gpa: std.mem.Allocator, seq: usize, head_dim: usize
 }
 
 /// rotateHalfFreqsScaled with optional per-dimension frequency factors
-/// (llama.cpp `rope_freqs` / freq_factors — "proportional"/long-context RoPE):
+/// (llama.cpp `rope_freqs` / freq_factors, "proportional"/long-context RoPE):
 /// the effective angle divides the inverse frequency by `freq_factors[i]`,
 /// matching ggml's `theta/ff` in ggml_rope_cache_init. `freq_factors` must
 /// have head_dim/2 entries (or be null for the plain scaled table). Gemma 4's
@@ -147,7 +147,7 @@ pub fn rotateHalfFreqsFactored(
 }
 
 /// Build parameters for one rotate-half RoPE table. Every LLM stepper's freq
-/// table is captured by these four fields — the three `rotateHalfFreqs*`
+/// table is captured by these four fields, the three `rotateHalfFreqs*`
 /// builders above all reduce to `rotateHalfFreqsFactored`. Capturing the spec
 /// (rather than a pre-built table) lets a growable context rebuild the table at
 /// a larger row count without the caller re-deriving theta/scale/factors.
@@ -244,7 +244,7 @@ pub fn applyRotateHalfAt(x: []f32, freqs: Freqs, pos0: usize, seq: usize, n_head
     }
 }
 
-/// applyRotateHalfAt over only the first `rot_dim` dims of each head —
+/// applyRotateHalfAt over only the first `rot_dim` dims of each head,
 /// partial RoPE (Qwen3.5 rotates 64 of 256 head dims; the rest pass
 /// through). `freqs` must be built with head_dim = rot_dim; pairs are
 /// (i, i + rot_dim/2) within the rotated span.
@@ -306,7 +306,7 @@ pub fn applyRotateHalfPos(x: []f32, freqs: Freqs, positions: []const usize, n_he
 /// max(positions)+1 rows. Used by the gemma4v vision tower's 2-D RoPE: each
 /// head's first half rotates against the x grid coordinate (span [0,hd/2),
 /// positions = patch column) and the second half against y (span [hd/2,hd),
-/// positions = patch row) — matching llama.cpp's per-half neox `ggml_rope_ext`.
+/// positions = patch row), matching llama.cpp's per-half neox `ggml_rope_ext`.
 pub fn applyRotateHalfPosSpan(
     x: []f32,
     freqs: Freqs,

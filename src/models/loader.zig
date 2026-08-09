@@ -1,8 +1,8 @@
 //! Shared weight-loading helpers for the model loaders. Every model built the
 //! same `loadMatrix`/`loadVec` (+ indexed `layers.N.` / `v.blk.N.` variants)
-//! by hand; the logic — shape/length validation, the name-formatting buffer,
-//! the dtype-preserving `Weight` view vs. f32 dequant — lives here once. Model
-//! files keep their local `loadMatrix`/`loadLayerMatrix`/… names as thin
+//! by hand; the logic, shape/length validation, the name-formatting buffer,
+//! the dtype-preserving `Weight` view vs. f32 dequant, lives here once. Model
+//! files keep their local `loadMatrix`/`loadLayerMatrix`/... names as thin
 //! shims over these, so call sites read naturally and only the logic is shared.
 
 const std = @import("std");
@@ -30,7 +30,7 @@ pub fn vector(alloc: std.mem.Allocator, store: WeightStore, name: []const u8, le
 }
 
 /// A matrix under an indexed block prefix: `prefix ++ "{i}." ++ suffix`
-/// (e.g. prefix `"layers."`, i 3, suffix `"self_attn.q_proj.weight"` →
+/// (e.g. prefix `"layers."`, i 3, suffix `"self_attn.q_proj.weight"` ->
 /// `"layers.3.self_attn.q_proj.weight"`).
 pub fn indexedMatrix(
     store: WeightStore,

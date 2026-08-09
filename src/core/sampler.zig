@@ -1,18 +1,17 @@
-//! **How to move between two sigmas** — the samplers (steppers).
+//! How to move between two sigmas, the samplers (steppers).
 //!
 //! Where the steps *go* is `schedule.zig`'s job (the nine ComfyUI schedulers and the
 //! two families' sigma tables); this file owns what happens between two of them, and
-//! re-exports the schedule names that used to live here so existing callers are
-//! unaffected.
+//! re-exports the schedule names a sampler caller also needs.
 //!
 //! Two samplers today, `Kind` selects between them:
 //!
-//!  - **Euler** — one model evaluation, first order, stateless, deterministic. For
+//!  - Euler, one model evaluation, first order, stateless, deterministic. For
 //!    krea2 the model predicts a velocity (`CONST`), for the SD family it predicts eps;
 //!    either way the prediction IS the trajectory derivative, so `denoised = x - sigma*v`
 //!    and one `eulerStep` serves both families. CFG mixes derivatives, which is
 //!    equivalent to ComfyUI mixing denoised predictions at fixed x.
-//!  - **DPM++ 2M SDE** (midpoint and Heun) — second-order multistep in half-logSNR,
+//!  - DPM++ 2M SDE (midpoint and Heun), second-order multistep in half-logSNR,
 //!    with noise from a Brownian tree. See the section at the bottom of this file.
 
 const std = @import("std");
@@ -55,7 +54,7 @@ pub fn fillNoise(x: []f32, seed: u64) void {
     fillNoiseFrom(x, seed, .torch_cpu);
 }
 
-/// The same, from an explicit generator — `.nv_philox` is what A1111 draws with. Kept as
+/// The same, from an explicit generator, `.nv_philox` is what A1111 draws with. Kept as
 /// a separate entry point so every existing caller keeps ComfyUI's behaviour by name.
 pub fn fillNoiseFrom(x: []f32, seed: u64, src: noise.Source) void {
     noise.randn(x, seed, src);
@@ -84,30 +83,30 @@ test "noise is deterministic per seed" {
 }
 
 // ---------------------------------------------------------------------------
-// Discrete-noise (eps-prediction) sampling — the SD family
+// Discrete-noise (eps-prediction) sampling, the SD family
 // ---------------------------------------------------------------------------
 //
 // Krea 2 is rectified flow: the model predicts a velocity and sigma runs over a
 // continuous schedule. SD1.5/SDXL are the older formulation and differ in three ways
 // that all have to line up or the model is being run off-distribution:
 //
-//  1. **Sigma comes from a discrete beta schedule**, not a formula:
+//  1. Sigma comes from a discrete beta schedule, not a formula:
 //     `sigma_i = sqrt((1 - alpha_bar_i) / alpha_bar_i)` over 1000 training steps.
-//  2. **The model is conditioned on a timestep index, not on sigma** — so a sampler
+//  2. The model is conditioned on a timestep index, not on sigma, so a sampler
 //     that has chosen a sigma must map back to the (fractional) index that produced
 //     it. `timestepForSigma` is that inverse.
-//  3. **The input is pre-scaled by `1/sqrt(sigma^2 + 1)`.** SD's UNet expects a
+//  3. The input is pre-scaled by `1/sqrt(sigma^2 + 1)`. SD's UNet expects a
 //     unit-variance input; feeding it the raw latent silently runs a model outside
 //     its training distribution, which looks like "the sampler is bad" rather than
 //     like a missing scale.
 //
 // The *step* is the same Euler as above once eps is in hand, because for this
-// parameterization the trajectory derivative **is** eps: `denoised = x - sigma·eps`,
+// parameterization the trajectory derivative is eps: `denoised = x - sigma*eps`,
 // so `d = (x - denoised)/sigma = eps`. That is what lets one measurement harness
 // (ggufy's teacher-forced level 2) compare both families without knowing which is
 // which.
 
-/// The (fractional) training index whose sigma is `sigma` — the inverse of the
+/// The (fractional) training index whose sigma is `sigma`, the inverse of the
 /// ladder, for a sampler that picked a sigma off-schedule (an off-list sigma is
 /// exactly what a teacher-forced measurement feeds in).
 pub fn sdTimestepForSigma(ladder: []const f32, sigma: f32) f32 {
@@ -119,8 +118,8 @@ pub fn sdTimestepForSigma(ladder: []const f32, sigma: f32) f32 {
         const mid = (lo + hi) / 2;
         if (ladder[mid] <= sigma) lo = mid else hi = mid;
     }
-    // ⚠️ Interpolate in LOG space, because that is what `interpLadder` (and hence the
-    // schedule) does — so this is the actual inverse rather than an approximate one,
+    // Interpolate in LOG space, because that is what `interpLadder` (and hence the
+    // schedule) does, so this is the actual inverse rather than an approximate one,
     // and `sdModelTimestep`'s rounding of it is then *exactly* ComfyUI's
     // `argmin |log sigma - log sigma_i|` instead of merely agreeing with it in the
     // common case.
@@ -131,38 +130,38 @@ pub fn sdTimestepForSigma(ladder: []const f32, sigma: f32) f32 {
     return @as(f32, @floatFromInt(lo)) + frac;
 }
 
-/// **The timestep the SD UNet is actually conditioned on at `sigma`**: the nearest
+/// The timestep the SD UNet is actually conditioned on at `sigma`: the nearest
 /// *trained* index, not the fractional one.
 ///
-/// ⚠️ **The second place ComfyUI and diffusers disagree** (the first is
+/// The second place ComfyUI and diffusers disagree (the first is
 /// `sdScaleInitialNoise`), and the more expensive one to get wrong:
 ///
-/// - **ComfyUI**'s `model_sampling.timestep(sigma)` is `argmin |log sigma - log sigma_i|`
-///   — it snaps to an integer index the model was trained at.
-/// - **diffusers** passes its fractional `timesteps` straight to the UNet.
+/// - ComfyUI's `model_sampling.timestep(sigma)` is `argmin |log sigma - log sigma_i|`
+///   it snaps to an integer index the model was trained at.
+/// - diffusers passes its fractional `timesteps` straight to the UNet.
 ///
 /// The sinusoidal embedding is continuous, so both are well-defined and neither errors.
-/// **Measured on SDXL** (512², 8 steps, CFG 7.5, same seed, against a ComfyUI render):
-/// fractional gives **30.9 dB**, snapping gives **56.1 dB** — i.e. the fractional form is
+/// Measured on SDXL (512², 8 steps, CFG 7.5, same seed, against a ComfyUI render):
+/// fractional gives 30.9 dB, snapping gives 56.1 dB, i.e. the fractional form is
 /// visibly a different image, and this one is pixel-level agreement (RMSE 0.4/255). At 8
 /// steps the fractional indices land ~0.3 off an integer, and that offset is present in
 /// *every* step's conditioning.
 ///
 /// Rounding the fractional index is equivalent to ComfyUI's log-space `argmin` for any
 /// sigma that came off the ladder, which is every sigma a schedule produces. A sigma
-/// sitting almost exactly between two indices — only a teacher-forced probe would supply
-/// one — could round the other way; the two indices are adjacent, so it does not matter.
+/// sitting almost exactly between two indices, only a teacher-forced probe would supply
+/// one, could round the other way; the two indices are adjacent, so it does not matter.
 pub fn sdModelTimestep(ladder: []const f32, sigma: f32) f32 {
     return @round(sdTimestepForSigma(ladder, sigma));
 }
 
 /// Scale a freshly drawn unit-normal latent to the schedule's starting noise level:
-/// `x *= sigmas[0]`. This is the **flow-matching** form; the SD family uses
+/// `x *= sigmas[0]`. This is the flow-matching form; the SD family uses
 /// `sdScaleInitialNoise`, and `Session.scaleInitialNoise` picks between them.
 ///
-/// ⚠️ **Both families need this and only one of them notices.** Flow matching starts at
-/// sigma = 1, so for krea2 this is a multiply by exactly 1.0 — bit-identical, which is
-/// what lets it be applied unconditionally. SD's ladder starts near **14.6**, and
+/// Both families need this and only one of them notices. Flow matching starts at
+/// sigma = 1, so for krea2 this is a multiply by exactly 1.0, bit-identical, which is
+/// what lets it be applied unconditionally. SD's ladder starts near 14.6, and
 /// skipping it hands the UNet a latent ~15x too small: it denoises something that was
 /// never noisy, and produces a washed, low-contrast image with no error anywhere.
 pub fn scaleInitialNoise(x: []f32, sigma0: f32) void {
@@ -170,27 +169,27 @@ pub fn scaleInitialNoise(x: []f32, sigma0: f32) void {
     for (x) |*v| v.* *= sigma0;
 }
 
-/// The SD family's initial noise scaling when starting from **full** noise:
+/// The SD family's initial noise scaling when starting from full noise:
 /// `x *= sqrt(1 + sigma_max²)`, *not* `x *= sigma_max`.
 ///
-/// ⚠️ **A 0.23% difference worth ~28 dB of render agreement, and the two reference
-/// implementations disagree about it** — which is why it needs saying out loud rather
+/// A 0.23% difference worth ~28 dB of render agreement, and the two reference
+/// implementations disagree about it, which is why it needs saying out loud rather
 /// than being derived:
 ///
-/// - **ComfyUI** always uses `sqrt(1 + sigma²)` at max denoise
+/// - ComfyUI always uses `sqrt(1 + sigma²)` at max denoise
 ///   (`model_sampling.noise_scaling` under `Sampler.max_denoise`), for any spacing.
-/// - **diffusers**' `EulerDiscreteScheduler.init_noise_sigma` returns a bare `max_sigma`
+/// - diffusers' `EulerDiscreteScheduler.init_noise_sigma` returns a bare `max_sigma`
 ///   when `timestep_spacing in {"linspace", "trailing"}` and `sqrt(max_sigma² + 1)`
-///   otherwise — and `linspace` is the spacing this engine samples with, so diffusers'
+///   otherwise, and `linspace` is the spacing this engine samples with, so diffusers'
 ///   figure here is the bare sigma.
 ///
-/// **ComfyUI's is the target**: it is the compatibility target for renders here, it is
-/// what k-diffusion/A1111 do, and it is the principled one — the UNet's input is
+/// ComfyUI's is the target: it is the compatibility target for renders here, it is
+/// what k-diffusion/A1111 do, and it is the principled one, the UNet's input is
 /// pre-scaled by `1/sqrt(sigma²+1)` (`sdScaleInput`), so scaling pure noise by
 /// `sqrt(1+sigma²)` is exactly what hands the model a unit-variance input at step 0.
 ///
 /// Measured on SDXL (512², 8 steps, CFG 7.5, same seed): the bare-sigma start renders the
-/// *same composition* with visibly different fine detail and colour fringing — **22.0 dB**
+/// *same composition* with visibly different fine detail and colour fringing, 22.0 dB
 /// against ComfyUI, where this form gives 50+. An 0.23% perturbation of the starting
 /// latent is not small once eight denoising steps have amplified it.
 pub fn sdScaleInitialNoise(x: []f32, sigma_max: f32) void {
@@ -231,7 +230,7 @@ test "the SD sigma ladder and schedule match diffusers' EulerDiscreteScheduler" 
         }
     }
 
-    // Then the N-step ladders and their timesteps — the interpolation-in-index
+    // Then the N-step ladders and their timesteps, the interpolation-in-index
     // convention, which is the part a hand-rolled schedule gets wrong while still
     // producing plausible images.
     inline for (.{ 4, 10 }) |n| {
@@ -259,17 +258,17 @@ test "the SD sigma ladder and schedule match diffusers' EulerDiscreteScheduler" 
 }
 
 test "the SD schedule matches ComfyUI's `normal` scheduler, not diffusers'" {
-    // ⚠️ **This is the test the diffusers fixture above could not be.** Both
+    // This is the test the diffusers fixture above could not be. Both
     // schedules read the same (bit-identical) beta ladder at the same indices; they
-    // disagree only on the interpolation *space* — ComfyUI lerps `log_sigmas`,
+    // disagree only on the interpolation *space*, ComfyUI lerps `log_sigmas`,
     // diffusers lerps sigma. That is worth up to 4.4e-5, so a comparison at the
     // 2e-4 the diffusers fixture needs is blind to it, and Euler barely notices
     // (53.8 dB against a ComfyUI render either way). DPM++ 2M SDE notices
     // completely: `brownian.zig` quantises sigma to 1e-6 as a tree key, so the
     // wrong space re-rolls the whole noise path (~20 dB, measured).
     //
-    // Hence a TIGHT bound here — a few f32 ulp, which is all that torch's and Zig's
-    // `exp`/`log` differ by — against ComfyUI's own `normal_scheduler` output.
+    // Hence a TIGHT bound here, a few f32 ulp, which is all that torch's and Zig's
+    // `exp`/`log` differ by, against ComfyUI's own `normal_scheduler` output.
     const gpa = std.testing.allocator;
     const json_text = @embedFile("assets/dpmpp_sde_fixtures.json");
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, json_text, .{});
@@ -299,14 +298,14 @@ test "the SD schedule matches ComfyUI's `normal` scheduler, not diffusers'" {
             if (brownian.round6(e) == brownian.round6(a)) same_cell += 1;
         }
 
-        // ⚠️ **The bound above is not the whole story, because the SDE sampler consumes
-        // these as QUANTISED tree keys**: `round6` cells are 1e-6 wide and an f32 ulp
+        // The bound above is not the whole story, because the SDE sampler consumes
+        // these as QUANTISED tree keys: `round6` cells are 1e-6 wide and an f32 ulp
         // near sigma 10 is 9.5e-7, so a legitimate one-ulp libm difference sometimes
         // lands in the neighbouring cell and that step draws different noise.
         //
         // Measured against ComfyUI on this machine: 5/5 and 11/11 cells at 4 and 10
         // steps (bit-exact), 19/21 at 20, 29/31 at 30. Asserted as a fraction rather
-        // than a count so a one-ulp shift in Zig's libm is not a failure — while a
+        // than a count so a one-ulp shift in Zig's libm is not a failure, while a
         // reverted convention, which puts nearly every sigma in the wrong cell, still
         // is. See the SdeStepper section for what the residual costs.
         const frac = @as(f64, @floatFromInt(same_cell)) / @as(f64, @floatFromInt(want.len));
@@ -336,8 +335,8 @@ test "sigma -> timestep inverts the ladder, including off-schedule sigmas" {
 }
 
 test "the two ComfyUI sampling conventions the SD family follows" {
-    // ⚠️ Both of these differ from diffusers, both are silent when wrong, and both were
-    // *measured* rather than derived — a 512² SDXL render against a ComfyUI render of the
+    // Both of these differ from diffusers, both are silent when wrong, and both were
+    // *measured* rather than derived, a 512² SDXL render against a ComfyUI render of the
     // same seed went 22.0 dB -> 30.9 dB -> 56.1 dB as they were fixed in turn. This test
     // exists so neither can quietly revert to the diffusers form.
     const gpa = std.testing.allocator;
@@ -388,38 +387,34 @@ test "the input scaling is what keeps SD's UNet in distribution" {
 }
 
 // ---------------------------------------------------------------------------
-// DPM-Solver++(2M) SDE — the second sampler
+// DPM-Solver++(2M) SDE, the second sampler
 // ---------------------------------------------------------------------------
 //
-// Everything above integrates with **Euler**: one model evaluation, one first-order
-// step, no state carried between steps, and no stochasticity. `dpmpp_2m_sde` differs
-// on all three counts, and each difference is a place a plausible-looking
-// implementation goes quietly wrong:
+// Euler above is one model evaluation, one first-order step, no state between steps and
+// no stochasticity. `dpmpp_2m_sde` differs on all three counts, and each is a place a
+// plausible-looking implementation goes quietly wrong:
 //
-//  1. **It works in half-logSNR, not in sigma.** `lambda = log(alpha_t / sigma_t)`,
-//     and the two families compute it *differently* — see `SdeStepper.Parameterization`.
-//     The exponential-integrator coefficients are then exact for the linear part of
-//     the ODE, which is where the accuracy over Euler comes from.
-//  2. **It is multistep (the "2M").** The second-order correction reuses the
-//     PREVIOUS step's denoised prediction, so the stepper is stateful, and a resumed
-//     render has to restore that state or its first step silently degrades to first
-//     order. `Snapshot` carries it for exactly that reason.
-//  3. **It injects noise (the "SDE"), from a Brownian tree.** Not a fresh `randn`
-//     per step — see `brownian.zig`. This is the piece with no shortcut: the noise
-//     is a single seed-determined path over the sigma axis, and reproducing
-//     ComfyUI's image requires reproducing it exactly.
+//  1. It works in half-logSNR, not in sigma: `lambda = log(alpha_t / sigma_t)`, which
+//     the two families compute DIFFERENTLY (see `SdeStepper.Parameterization`). The
+//     exponential-integrator coefficients are then exact for the ODE's linear part,
+//     which is where the accuracy over Euler comes from.
+//  2. It is multistep (the "2M"): the second-order correction reuses the PREVIOUS
+//     step's denoised prediction, so the stepper is stateful and a resumed render must
+//     restore that state or its first step silently degrades to first order.
+//     `Snapshot` carries it.
+//  3. It injects noise (the "SDE") from a Brownian tree, not a fresh `randn` per step
+//     (see `brownian.zig`). The noise is a single seed-determined path over the sigma
+//     axis, and reproducing ComfyUI's image requires reproducing it exactly.
 //
-// `solver_type` picks between two ways of applying the multistep correction, and
-// ComfyUI exposes both as separate sampler names: `dpmpp_2m_sde` is `midpoint`,
-// `dpmpp_2m_sde_heun` is `heun`. They are the same order of accuracy and give
-// visibly different images.
+// `solver_type` picks between two ways of applying the multistep correction, which
+// ComfyUI exposes as separate sampler names: `dpmpp_2m_sde` is `midpoint`,
+// `dpmpp_2m_sde_heun` is `heun`. Same order of accuracy, visibly different images.
 //
-// ⚠️ **Coefficients are computed in f64 here where the reference computes them on
-// 0-dim f32 tensors**, deliberately, for the same reason `timestepEmbedding` uses
-// f64: being more accurate than the reference bounds the disagreement by the
-// reference's own rounding instead of stacking two errors. It costs nothing — there
-// are ~6 scalars per step — and it is why the trajectory fixture is compared at 1e-4
-// relative rather than bit-for-bit. The element-wise arithmetic stays f32, matching.
+// Coefficients are computed in f64 where the reference uses 0-dim f32 tensors, for the
+// same reason `timestepEmbedding` does: being more accurate than the reference bounds
+// the disagreement by the reference's own rounding instead of stacking two errors. It
+// costs nothing at ~6 scalars per step, and it is why the trajectory fixture compares at
+// 1e-4 relative rather than bit for bit. The element-wise arithmetic stays f32.
 
 /// Which sampler drives the loop. Names match ComfyUI's.
 pub const Kind = enum {
@@ -441,7 +436,7 @@ pub const Kind = enum {
     }
 
     /// The AUTOMATIC1111 `parameters` spelling, for PNG metadata. Different from
-    /// `label` (which is ComfyUI's/the CLI's) because a1111 is what reads that field —
+    /// `label` (which is ComfyUI's/the CLI's) because a1111 is what reads that field,
     /// including ComfyUI's own metadata importers.
     pub fn a1111Name(self: Kind) []const u8 {
         return switch (self) {
@@ -457,16 +452,16 @@ pub const Kind = enum {
     }
 };
 
-/// The half-logSNR the noise level is expressed in — a property of the model's
+/// The half-logSNR the noise level is expressed in, a property of the model's
 /// prediction target, not of the sampler.
 ///
-/// ⚠️ **These are not interchangeable and neither errors on the other's schedule.**
+/// These are not interchangeable and neither errors on the other's schedule.
 /// `flow` on an SD ladder takes `log` of a negative number for any sigma above 1
 /// (every step of an SD run) and produces NaN; `eps` on a krea2 schedule is
 /// perfectly finite and simply integrates the wrong ODE.
 pub const Parameterization = enum {
     /// Rectified flow / `CONST` (krea2): `sigma` is the interpolation coefficient, so
-    /// `alpha = 1 - sigma` and `lambda = log((1 - sigma) / sigma)` — ComfyUI's
+    /// `alpha = 1 - sigma` and `lambda = log((1 - sigma) / sigma)`, ComfyUI's
     /// `sigma.logit().neg()`. Requires `sigma < 1`, hence `offsetFirstSigma`.
     flow,
     /// `EPS` (SD1.5 / SDXL): `alpha = 1` and `lambda = -log(sigma)`.
@@ -492,10 +487,10 @@ pub const Parameterization = enum {
 
 /// ComfyUI's `offset_first_sigma_for_snr`, in place.
 ///
-/// ⚠️ **Without this a flow-matching SDE run is all NaN from the first step.** A
-/// krea2 schedule starts at sigma **exactly 1**, where `lambda = log(0/1)` is -inf,
+/// Without this a flow-matching SDE run is all NaN from the first step. A
+/// krea2 schedule starts at sigma exactly 1, where `lambda = log(0/1)` is -inf,
 /// so `h` is -inf and every coefficient is NaN. ComfyUI nudges the first sigma to
-/// `percent_to_sigma(1e-4)` — the sigma at 0.01% denoising — which for shift 1.15 is
+/// `percent_to_sigma(1e-4)`, the sigma at 0.01% denoising, which for shift 1.15 is
 /// 0.99996833. The model is then evaluated at that sigma rather than at 1.0, so this
 /// is a (tiny) change to the render and not merely a guard.
 ///
@@ -510,9 +505,9 @@ pub fn offsetFirstSigma(sigmas: []f32, param: Parameterization, shift: f32) bool
 
 /// A DPM-Solver++(2M) SDE stepper: the per-render state Euler does not need.
 ///
-/// Bound to one schedule and one latent length. **`init` mutates `sigmas[0]`**
+/// Bound to one schedule and one latent length. `init` mutates `sigmas[0]`
 /// (`offsetFirstSigma`), so it must run before anything that caches per-sigma data
-/// off that array — `Session.denoiser` precomputes a timestep vector per entry — and
+/// off that array, `Session.denoiser` precomputes a timestep vector per entry, and
 /// after `scaleInitialNoise`, which ComfyUI applies to the *unoffset* first sigma.
 /// The slice is borrowed and must outlive the stepper.
 pub const SdeStepper = struct {
@@ -523,7 +518,7 @@ pub const SdeStepper = struct {
     eta: f64,
     s_noise: f64,
     noise: brownian.NoiseSampler,
-    /// The clean-image estimate for the step just taken — the same quantity a
+    /// The clean-image estimate for the step just taken, the same quantity a
     /// preview wants, and better than reconstructing it from `x` afterwards.
     denoised: []f32,
     old_denoised: []f32,
@@ -543,7 +538,7 @@ pub const SdeStepper = struct {
         /// Brownian-path seed. ComfyUI passes the render's own seed here
         /// (`extra_args["seed"]`), so the noise and the initial latent share it.
         seed: u64 = 0,
-        /// Which generator the tree's per-node draws come from — the same choice as the
+        /// Which generator the tree's per-node draws come from, the same choice as the
         /// initial latent's, and for the same reason. See `noise.zig`: A1111's pinned
         /// k-diffusion builds the tree on the CUDA tensor's device, so an A1111 SDE
         /// render's noise is Philox at *every* node, not just at step 0.
@@ -563,8 +558,8 @@ pub const SdeStepper = struct {
         std.debug.assert(sigmas.len >= 2);
         std.debug.assert(n > 0);
 
-        // ⚠️ The tree's span comes from the schedule **before** the first-sigma
-        // offset — that is the order in `sample_dpmpp_2m_sde`, and the span is part
+        // The tree's span comes from the schedule before the first-sigma
+        // offset, that is the order in `sample_dpmpp_2m_sde`, and the span is part
         // of the path's identity, so getting it from the offset array would change
         // every sample.
         var t0: f32 = std.math.floatMax(f32);
@@ -615,8 +610,8 @@ pub const SdeStepper = struct {
     /// the model's derivative prediction `v` at `sigmas[i]`. Leaves the step's
     /// clean-image estimate in `self.denoised`.
     ///
-    /// `v` is the trajectory derivative either family's forward already returns —
-    /// krea2's velocity or SD's eps — so `denoised = x - sigma * v` covers both, the
+    /// `v` is the trajectory derivative either family's forward already returns,
+    /// krea2's velocity or SD's eps, so `denoised = x - sigma * v` covers both, the
     /// same identity that lets `eulerStep` be family-neutral.
     pub fn step(self: *SdeStepper, x: []f32, v: []const f32, i: usize) !void {
         std.debug.assert(x.len == self.denoised.len);
@@ -633,7 +628,7 @@ pub const SdeStepper = struct {
         if (sigma_next == 0) {
             // The final step is a pure denoising step: no drift, no noise. (Reaching
             // sigma 0 by the exponential-integrator formula would need lambda = +inf.)
-            // ⚠️ `h_last` is deliberately left alone here, matching the reference: it
+            // `h_last` is deliberately left alone here, matching the reference: it
             // never assigns `h` in this branch, so the trailing `h_last = h` carries
             // the previous iteration's value forward. No step follows either way.
             @memcpy(x, self.denoised);
@@ -714,7 +709,7 @@ test "the two half-logSNR parameterizations, and why they are not interchangeabl
         try std.testing.expectApproxEqRel(@as(f64, -@log(4.0)), lam, 1e-12);
         try std.testing.expectApproxEqRel(@as(f64, 1.0), p.alpha(4.0, lam), 1e-12);
     }
-    // lambda must increase as sigma falls, for both — the step direction depends on it.
+    // lambda must increase as sigma falls, for both, the step direction depends on it.
     try std.testing.expect(Parameterization.flow.halfLogSnr(0.2) > Parameterization.flow.halfLogSnr(0.9));
     try std.testing.expect(Parameterization.eps.halfLogSnr(0.2) > Parameterization.eps.halfLogSnr(9.0));
     // An SD sigma through the flow branch is NaN, not merely inaccurate: that is the
@@ -738,7 +733,7 @@ test "the first-sigma offset is required for flow matching and a no-op elsewhere
         try std.testing.expect(!offsetFirstSigma(sigmas, .flow, default_shift));
     }
     {
-        // An SD ladder is untouched — `eps` has no singularity at the top.
+        // An SD ladder is untouched, `eps` has no singularity at the top.
         const sigmas = try sdSchedule(gpa, 8);
         defer gpa.free(sigmas);
         const before = sigmas[0];
@@ -853,11 +848,11 @@ test "restore reinstates the multistep history bit-identically" {
 }
 
 test "DPM++ 2M SDE matches ComfyUI's own solver on both families" {
-    // ⚠️ The fixture is generated by driving ComfyUI's `sample_dpmpp_2m_sde` /
+    // The fixture is generated by driving ComfyUI's `sample_dpmpp_2m_sde` /
     // `..._heun` over a toy analytic denoiser (`tools/gen_sampler_fixtures.py`), so
     // the solver, the half-logSNR branch, the first-sigma offset AND the Brownian
-    // tree are all under test at once. The toy model is `(x + c) / (1 + sigma)` —
-    // pure f32 add/divide, no transcendental — so a disagreement here is this code's
+    // tree are all under test at once. The toy model is `(x + c) / (1 + sigma)`,
+    // pure f32 add/divide, no transcendental, so a disagreement here is this code's
     // and not libm's.
     //
     // Self-skip rather than go through `test_gate`: that lives outside `tp_core`,
@@ -923,7 +918,7 @@ test "DPM++ 2M SDE matches ComfyUI's own solver on both families" {
         // 1e-4 relative: the reference computes its ~6 scalar coefficients per step on
         // 0-dim f32 tensors, this computes them in f64 (see the section header), and
         // the difference compounds over the run. The Brownian samples themselves are
-        // bit-exact — pinned separately below — so this bound is about the solver
+        // bit-exact, pinned separately below, so this bound is about the solver
         // arithmetic only.
         var max_rel: f64 = 0;
         for (want, x, 0..) |e, a, j| {

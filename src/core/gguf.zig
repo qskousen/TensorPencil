@@ -1,4 +1,4 @@
-//! Read-only GGUF (ggml universal file) loader — the llama.cpp checkpoint
+//! Read-only GGUF (ggml universal file) loader, the llama.cpp checkpoint
 //! container. Format: "GGUF" magic, u32 version (2 or 3 supported), u64
 //! tensor count, u64 kv count, kv metadata (typed key/value pairs), a tensor
 //! table (name, dims, ggml type, data offset), then the tensor data section
@@ -9,7 +9,7 @@
 //! - Dims are stored fastest-first (ggml `ne` order); `TensorInfo.shape` is
 //!   reversed into torch/safetensors row-major order, so a torch
 //!   `[vocab, hidden]` matrix reads back as `[vocab, hidden]`. The byte
-//!   layout is identical (row-major, last dim contiguous) — no repacking.
+//!   layout is identical (row-major, last dim contiguous), no repacking.
 //! - llama.cpp tensor names ("blk.3.attn_q.weight", "token_embd.weight")
 //!   are translated to the HF-style names the model loaders use
 //!   ("layers.3.self_attn.q_proj.weight", "embed_tokens.weight");
@@ -35,7 +35,7 @@ pub const ParseError = error{
     InvalidOffsets,
     /// GGUF type id 42 (Q2_0) is claimed by two formats with different block
     /// sizes and the file's geometry does not identify which. See
-    /// `detectQ2_0Variant` — guessing here is a silent wrong answer.
+    /// `detectQ2_0Variant`, guessing here is a silent wrong answer.
     AmbiguousQ2_0Variant,
     DuplicateTensor,
     OutOfMemory,
@@ -43,7 +43,7 @@ pub const ParseError = error{
 
 /// ggml tensor type ids (ggml.h `enum ggml_type`) we can load.
 ///
-/// `q2_0` supplies the resolution of the ambiguous id 42 — see
+/// `q2_0` supplies the resolution of the ambiguous id 42, see
 /// `detectQ2_0Variant`. Passing the wrong one is a silent wrong answer, so there
 /// is no default; the only caller resolves it from file geometry first.
 fn dtypeFromGgml(id: u32, q2_0: DType) ?DType {
@@ -57,8 +57,8 @@ fn dtypeFromGgml(id: u32, q2_0: DType) ?DType {
         14 => .q6_k,
         20 => .iq4_nl, // GGML_TYPE_IQ4_NL (32-elem block, non-linear 4-bit LUT)
         41 => .q1_0, // GGML_TYPE_Q1_0 (128-elem block, 1 sign bit per weight)
-        42 => q2_0, // GGML_TYPE_Q2_0 — AMBIGUOUS, resolved by the caller
-        24 => .i8, // GGML_TYPE_I8 (raw, no blocks) — NOT 16, which is IQ2_XXS
+        42 => q2_0, // GGML_TYPE_Q2_0, AMBIGUOUS, resolved by the caller
+        24 => .i8, // GGML_TYPE_I8 (raw, no blocks), NOT 16, which is IQ2_XXS
         26 => .i32, // GGML_TYPE_I32
         30 => .bf16,
         else => null,
@@ -68,13 +68,13 @@ fn dtypeFromGgml(id: u32, q2_0: DType) ?DType {
 /// One tensor-table row, reduced to what `detectQ2_0Variant` needs.
 const Span = struct { type_id: u32, elems: u64, offset: u64 };
 
-/// Resolve GGUF type id 42 — which two shipped formats claim — from the file's
+/// Resolve GGUF type id 42, which two shipped formats claim, from the file's
 /// own geometry. Returns `.q2_0_g64` (upstream ggml, 64 elems / 18 B) or
 /// `.q2_0_g128` (the PrismML fork's `prism` branch, 128 elems / 34 B).
 ///
-/// ⚠️ **This cannot be skipped or guessed.** The two are indistinguishable from
+/// This cannot be skipped or guessed. The two are indistinguishable from
 /// the header: same type id, same `general.file_type`, same arithmetic. Only the
-/// on-disk row length differs, by 17/18. And the error is not symmetric — reading
+/// on-disk row length differs, by 17/18. And the error is not symmetric, reading
 /// a g64 file as g128 computes *smaller* spans than reality, so the bounds check
 /// below passes and every tensor view is silently short and misaligned against
 /// the real block stream. That is a wrong answer with no diagnostic, which is why
@@ -83,7 +83,7 @@ const Span = struct { type_id: u32, elems: u64, offset: u64 };
 /// The discriminator is the gap to the next tensor in offset order: a candidate
 /// is accepted only if `alignForward(size) == gap` exactly. The two candidates
 /// differ by ~5.6% (80 B on a 1440 B row) against at most `alignment` (typically
-/// 32 B) of padding, so for any real weight matrix there is no ambiguity band —
+/// 32 B) of padding, so for any real weight matrix there is no ambiguity band,
 /// but a gap that fits *both* (tiny tensors) or *neither* (a non-contiguous
 /// writer) simply casts no vote rather than guessing. Disagreement between
 /// tensors, or no vote at all, is an error: this is exactly the situation where
@@ -115,7 +115,7 @@ fn detectQ2_0Variant(alloc: std.mem.Allocator, spans: []const Span, alignment: u
             const size = s.elems / be * cand.blockBytes();
             if (std.mem.alignForward(u64, size, alignment) != gap) continue;
             if (vote != null) {
-                vote = null; // both fit this gap — too small to discriminate
+                vote = null; // both fit this gap, too small to discriminate
                 break;
             }
             vote = cand;
@@ -129,7 +129,7 @@ fn detectQ2_0Variant(alloc: std.mem.Allocator, spans: []const Span, alignment: u
 }
 
 /// A parsed metadata value. Strings and array spans point into the mapped
-/// file (or the caller's slice) — valid until deinit.
+/// file (or the caller's slice), valid until deinit.
 pub const Value = union(enum) {
     uint: u64,
     int: i64,
@@ -241,7 +241,7 @@ pub const Gguf = struct {
     pub fn openIn(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []const u8) !Gguf {
         const file = try dir.openFile(io, path, .{ .mode = .read_only });
         // Closed on every path EXCEPT a successful mmap, which keeps it for
-        // `readTo` (see SafeTensors.openIn — same one-flag arrangement).
+        // `readTo` (see SafeTensors.openIn, same one-flag arrangement).
         var keep_file = false;
         defer if (!keep_file) file.close(io);
         const len = try file.length(io);
@@ -374,41 +374,40 @@ pub const Gguf = struct {
             // a tensor whose contiguous dim is not a multiple of 256 to
             // `(n/256, 256)` so ggml's block quants can tile it, recording the true
             // shape in `comfy.gguf.orig_shape.<name>`. Without restoring it here a
-            // consumer sees the storage shape — krea2's patch embed arrives as
-            // [1536, 256] instead of [6144, 64] — and every shape check downstream
+            // consumer sees the storage shape, krea2's patch embed arrives as
+            // [1536, 256] instead of [6144, 64], and every shape check downstream
             // fails on a file that is perfectly well formed.
             var shape: tensors.Shape = .{ .dims = dims, .rank = n_dims };
             var flat_blocks = false;
             if (origShape(&kv, alloc, raw_name)) |orig| {
-                // ⚠️ **This used to refuse block-quantized tensors**, on the reasoning
-                // that "ComfyUI only ever applies the fix to tensors it then leaves
-                // unquantized, since the criterion that triggers it — a contiguous dim
-                // not divisible by 256 — is the same one that makes k-quantization
-                // impossible". That is true of ComfyUI's converter and **false of
-                // ggufy's**, which blocks over a tensor's *flat* element count rather
+                // Block-quantized tensors get the restore too. The tempting reasoning
+                // against it is that "a converter only applies the fix to tensors it
+                // then leaves unquantized, since the criterion that triggers it, a
+                // contiguous dim not divisible by 256, is the same one that makes
+                // k-quantization impossible". True of ComfyUI's converter, false of
+                // ggufy's, which blocks over a tensor's *flat* element count rather
                 // than per row: it reshapes first and then happily k-quantizes the
-                // result. Measured on a ggufy SD1.5 q4_k file: **166 of 686 tensors,
-                // 72.7% of the parameters** — every convolution, whose contiguous dim
+                // result. Measured on a ggufy SD1.5 q4_k file: 166 of 686 tensors,
+                // 72.7% of the parameters, every convolution, whose contiguous dim
                 // is `kw` (1 or 3). So the refusal made TensorPencil unable to load any
                 // ggufy SD-family GGUF at all (`time_embed.0.weight has shape
                 // {1600, 256}, expected [1280, 320]`), i.e. the whole GGUF output path
-                // for the SD family was unmeasurable — the same gap that was closed for
+                // for the SD family was unmeasurable, the same gap that was closed for
                 // krea2 and missed here.
                 //
                 // Restoring the shape is correct for the values: the fix is a pure
                 // regrouping, so flat row-major order is preserved, and 256-wide
-                // storage rows hold exactly one block each — flat and per-row blocking
+                // storage rows hold exactly one block each, flat and per-row blocking
                 // coincide, with or without an imatrix. What it is *not* is compatible
                 // with row-aligned blocking, so `flat_blocks` tells the loaders to
                 // materialize instead of pointing a packed `Weight` at the bytes.
                 //
-                // ⚠️ **Named shortcut:** materializing costs the memory the
+                // Named shortcut: materializing costs the memory the
                 // quantization saved (SD1.5 q4_k: ~0.5 GB on disk, ~3.4 GB f32
                 // resident). The robust alternative is a block GEMM that understands
-                // flat blocking, on all four backends — a real kernel project, and not
-                // one to undertake incidentally. This path is functionally complete
-                // (correct values, every consumer works) and purely additive: these
-                // files previously hard-errored, so nothing that loads today changes.
+                // flat blocking, on all four backends, a real kernel project, and not
+                // one to undertake incidentally. This path is functionally complete:
+                // correct values, and every consumer works.
                 if (orig.count() != shape.count()) {
                     std.log.warn("gguf: ignoring orig_shape for '{s}': {d} elements, stored has {d}", .{
                         raw_name, orig.count(), shape.count(),
@@ -489,7 +488,7 @@ pub const Gguf = struct {
     }
 
     /// Fill `dst` with the bytes `src` (a slice of this file's mapping) points at,
-    /// via a positional read. The GGUF twin of `SafeTensors.readTo` — see there for
+    /// via a positional read. The GGUF twin of `SafeTensors.readTo`, see there for
     /// why reading beats faulting on a cold multi-GB checkpoint. False when this
     /// store has no open file or `src` is not inside the mapping; the caller then
     /// uses `src` directly, which is the pre-existing behaviour.
@@ -515,7 +514,7 @@ pub const Gguf = struct {
         return .{ .info = info, .bytes = self.payload[info.start..info.end] };
     }
 
-    /// Like `get`, but a missing tensor is an error — for required weights.
+    /// Like `get`, but a missing tensor is an error, for required weights.
     pub fn require(self: *const Gguf, name: []const u8) !TensorView {
         return self.get(name) orelse error.MissingTensor;
     }
@@ -561,7 +560,7 @@ pub const Gguf = struct {
         return if (v == .arr) v.arr else null;
     }
 
-    /// True if this GGUF is a CLIP/vision projector — an `mmproj-*.gguf` vision
+    /// True if this GGUF is a CLIP/vision projector, an `mmproj-*.gguf` vision
     /// tower (`general.architecture == "clip"`) rather than an LLM. Lets a
     /// vision-tower slot reject a wrong pick (e.g. a second LLM file) with a
     /// clear error instead of dying deep in the tower loader with a cryptic
@@ -642,12 +641,12 @@ const gemma4_layer_suffix_map = [_][2][]const u8{
 /// Translate a llama.cpp tensor name to the HF-style name the model loaders
 /// use (prefix-less, e.g. "layers.3.self_attn.q_proj.weight"). The per-layer
 /// suffix map is `arch`-dependent (gemma3 differs from the Qwen/llama
-/// family — see gemma3_layer_suffix_map). Names that don't match the
+/// family, see gemma3_layer_suffix_map). Names that don't match the
 /// convention (including ComfyUI-style GGUFs that already carry HF names)
 /// pass through unchanged.
 /// The logical shape ComfyUI-GGUF records for a tensor it reshaped to fit ggml's
 /// block quants: `comfy.gguf.orig_shape.<raw name>`, an array of dimensions in
-/// row-major (torch) order — already the order this reader uses, so no reversal.
+/// row-major (torch) order, already the order this reader uses, so no reversal.
 /// Null when absent or malformed.
 fn origShape(kv: *const std.StringArrayHashMapUnmanaged(Value), alloc: std.mem.Allocator, raw_name: []const u8) ?tensors.Shape {
     const key = std.fmt.allocPrint(alloc, "comfy.gguf.orig_shape.{s}", .{raw_name}) catch return null;
@@ -829,7 +828,7 @@ test "the q2_0 variant is detected from file geometry, not the type id" {
     // GGUF type 42 is claimed by two formats (see `detectQ2_0Variant`). Build the
     // SAME header twice, differing only in how much data each tensor occupies,
     // and require the parser to reach opposite conclusions. A 1024-element row is
-    // 288 B as g64 (16 blocks x 18) and 272 B as g128 (8 x 34) — and 272 rounds up
+    // 288 B as g64 (16 blocks x 18) and 272 B as g128 (8 x 34), and 272 rounds up
     // to 288 under 32 B alignment, so the FIRST tensor's gap is deliberately
     // ambiguous. Detection must therefore come from the second tensor, which is
     // what pins that a too-small gap casts no vote instead of guessing.
@@ -863,7 +862,7 @@ test "the q2_0 variant is detected from file geometry, not the type id" {
 test "a q2_0 file whose geometry fits neither variant is refused, not guessed" {
     const gpa = std.testing.allocator;
     // Sizes that match no candidate must be an error. Guessing would hand the
-    // loader silently short, misaligned tensor views — the failure mode the
+    // loader silently short, misaligned tensor views, the failure mode the
     // detector exists to prevent, and one no bounds check downstream can see.
     const payload = try gpa.alloc(u8, 4096);
     defer gpa.free(payload);
@@ -1047,18 +1046,16 @@ test "isVisionProjector: mmproj yes, LLM no" {
 }
 
 test "shape-fixed block-quantized tensors restore their logical shape and flag flat blocks" {
-    // ⚠️ The regression this pins, measured 2026-08-02: the parser used to REFUSE to
-    // restore `comfy.gguf.orig_shape` for a block-quantized tensor, on the reasoning
-    // that the shape fix only ever lands on tensors the converter then leaves
-    // unquantized. True of ComfyUI's converter; false of ggufy's, which blocks over a
-    // tensor's flat element count and so reshapes *then* k-quantizes. Measured on a
-    // ggufy SD1.5 q4_k file: 166 of 686 tensors, 72.7% of the parameters — every
-    // convolution. The result was that TensorPencil could not load any ggufy SD-family
-    // GGUF at all, so that whole output path was unmeasurable above level 1.
+    // `comfy.gguf.orig_shape` must be restored for block-quantized tensors too. The
+    // tempting reasoning is that the shape fix only lands on tensors a converter then
+    // leaves unquantized: true of ComfyUI's converter, false of ggufy's, which blocks
+    // over a tensor's flat element count and so reshapes then k-quantizes. On a ggufy
+    // SD1.5 q4_k file that is 166 of 686 tensors and 72.7% of the parameters, every
+    // convolution. Skipping the restore makes those files unloadable.
     const gpa = std.testing.allocator;
 
     // One q4_k super-block is 256 elements in 144 bytes. Stored as [1, 256]; the
-    // logical shape is [2, 128] — 256 elements, but a row length that is NOT a
+    // logical shape is [2, 128], 256 elements, but a row length that is NOT a
     // multiple of 256, which is exactly the case `Weight.init` cannot take.
     var payload: [144]u8 = @splat(0);
     payload[0] = 0x11; // any non-zero content; the parser does not decode it
@@ -1082,7 +1079,7 @@ test "shape-fixed block-quantized tensors restore their logical shape and flag f
     defer g.deinit();
 
     const v = g.get("conv.weight").?;
-    // The logical shape is restored — a consumer must see [2, 128], not [1, 256].
+    // The logical shape is restored, a consumer must see [2, 128], not [1, 256].
     try std.testing.expectEqualSlices(usize, &.{ 2, 128 }, v.info.shape.slice());
     // ...and it is flagged, because 128 is not a whole number of q4_k blocks, so the
     // bytes can only be read as one flat 256-element sequence.

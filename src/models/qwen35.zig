@@ -347,7 +347,7 @@ pub const Model = struct {
     /// all layers). This is the CPU half of the hybrid CPU/GPU layer split:
     /// GPU-resident layers run on the device, the rest here.
     ///
-    /// RoPE is scalar (pos, pos, pos) — position-correct for text tokens only.
+    /// RoPE is scalar (pos, pos, pos), position-correct for text tokens only.
     /// Image/M-RoPE positions differ per axis, so a split session must stay
     /// all-GPU while an image is in context (the caller guards this).
     pub fn cpuLayer(
@@ -383,7 +383,7 @@ pub const Model = struct {
 };
 
 /// Pointer into the layer's stored Mlp (the layer must be passed by
-/// pointer — a by-value union would hand back a dangling stack address).
+/// pointer, a by-value union would hand back a dangling stack address).
 fn layerMlp(layer: *const Layer) *const Mlp {
     return switch (layer.*) {
         .attn => |*al| &al.mlp,
@@ -642,7 +642,7 @@ pub const Scratch = struct {
     }
 
     /// A view of this scratch sliced to `seq` tokens (fields are borrowed
-    /// slices — no allocation, do not deinit). Used by the CPU/GPU split, whose
+    /// slices, no allocation, do not deinit). Used by the CPU/GPU split, whose
     /// shared scratch is sized to the max prefill chunk but runs layers at a
     /// smaller seq (1 for decode). `lin_conv`/`lin_m`/`lin_d` are per-token.
     pub fn viewSeq(s: *Scratch, seq: usize, cfg: Config) Scratch {
@@ -733,7 +733,7 @@ pub const CpuModel = struct {
 // --- tests -----------------------------------------------------------------
 
 // The delta-rule recurrence against an independent naive f64 reference
-// (same formulas, straightforward loops) over a few tokens — catches
+// (same formulas, straightforward loops) over a few tokens, catches
 // state-layout / decay / tiling mistakes in the optimized two-pass sweep.
 test "delta rule recurrence matches naive reference" {
     const d = 4;
@@ -821,7 +821,7 @@ test "delta rule recurrence matches naive reference" {
 }
 
 // Config + weight wiring against the real Qwen3.6 checkpoint; skipped when
-// absent. Load-only — the 27B forward is validated end-to-end via tp-llm
+// absent. Load-only, the 27B forward is validated end-to-end via tp-llm
 // against llama.cpp.
 test "qwen35 loads from real qwen3.6 gguf" {
     const gpa = std.testing.allocator;

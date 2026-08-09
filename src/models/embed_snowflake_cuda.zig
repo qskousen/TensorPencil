@@ -1,7 +1,7 @@
 //! Snowflake Arctic Embed (GTE) on the CUDA backend. Post-LayerNorm body
 //! device-side (opConvF16 GEMMs, opLayerNorm, rotate-half RoPE via a device
 //! freqs buffer, generic non-causal `attn`, tanh `geluMul` GeGLU, opAdd); CLS
-//! pool + L2 on host. f16 tensor-core GEMM regime → relative parity vs CPU.
+//! pool + L2 on host. f16 tensor-core GEMM regime -> relative parity vs CPU.
 
 const std = @import("std");
 const cuda = @import("tp_gpu").cuda;
@@ -70,7 +70,7 @@ pub const ModelCuda = struct {
 
         // No weight scope: the f16-converted GEMM weights stay RESIDENT across
         // embed calls (they borrow the mmap-stable CPU model). A scope would
-        // free+re-upload the whole model every call — a per-forward cost that
+        // free+re-upload the whole model every call, a per-forward cost that
         // dwarfs the compute. The encoder is opened once and reused.
         defer {
             be.freeAttnScratch();
@@ -123,10 +123,10 @@ pub const ModelCuda = struct {
         l2normalize(out);
     }
 
-    /// Batched CUDA encode: `ids_list[i]` → `outs[i]`. Mirrors the CPU
+    /// Batched CUDA encode: `ids_list[i]` -> `outs[i]`. Mirrors the CPU
     /// `Model.embedBatch` (ragged packing: GEMMs / LayerNorm / GeGLU over
     /// `total = sum(seq_i)`; RoPE + attention loop per item via `dbOffset` views
-    /// into the packed q/k/v/attn buffers). One upload → forward → download.
+    /// into the packed q/k/v/attn buffers). One upload -> forward -> download.
     pub fn embedBatch(self: *const ModelCuda, be: *Backend, io: std.Io, gpa: std.mem.Allocator, ids_list: []const []const u32, outs: [][]f32) !void {
         _ = io;
         const cpu = self.cpu;
@@ -168,7 +168,7 @@ pub const ModelCuda = struct {
 
         // No weight scope: the f16-converted GEMM weights stay RESIDENT across
         // embed calls (they borrow the mmap-stable CPU model). A scope would
-        // free+re-upload the whole model every call — a per-forward cost that
+        // free+re-upload the whole model every call, a per-forward cost that
         // dwarfs the compute. The encoder is opened once and reused.
         defer {
             be.freeAttnScratch();

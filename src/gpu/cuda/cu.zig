@@ -1,4 +1,4 @@
-//! CUDA Driver API bindings — pure Zig, runtime-loaded via std.DynLib.
+//! CUDA Driver API bindings, pure Zig, runtime-loaded via std.DynLib.
 //!
 //! Mirrors the pure-Zig `vk.zig` Vulkan loader: `libcuda.so.1` is a system
 //! driver we `dlopen` (no linking, no CUDA toolkit, no nvcc), and PTX is device
@@ -7,7 +7,7 @@
 //!
 //! Signatures/enum values were machine-extracted from the CUDA 13.0 driver
 //! header (`cuda.h`). Two ABI hazards baked in here:
-//!   * CUdeviceptr is `unsigned long long` (u64) on LP64 — a u32 corrupts every
+//!   * CUdeviceptr is `unsigned long long` (u64) on LP64, a u32 corrupts every
 //!     pointer-carrying call.
 //!   * Several entry points export ABI-versioned symbols (`_v2`) that differ
 //!     from the documented name (cuMemAlloc -> cuMemAlloc_v2, etc.); the exact
@@ -94,7 +94,7 @@ pub const CU_FUNC_CACHE_PREFER_EQUAL: c_int = 0x03;
 
 // ---- Virtual memory management (cuMemAddressReserve/cuMemCreate/cuMemMap;
 // driver >= CUDA 10.2). Used for growable buffers: reserve VA once, commit
-// physical 2 MB-granularity chunks as needed — the device pointer never moves.
+// physical 2 MB-granularity chunks as needed, the device pointer never moves.
 pub const CUmemGenericAllocationHandle = u64;
 
 pub const CU_MEM_ALLOCATION_TYPE_PINNED: c_int = 0x1;

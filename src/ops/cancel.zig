@@ -3,7 +3,7 @@
 //! A threadlocal token, set by CPU entry points that own a cancel flag (DiT
 //! forward, VAE decode, text encode) for the duration of their compute, and
 //! polled inside the threaded matmul/attention kernels between row panels and
-//! k-blocks — so a cancel lands in milliseconds even when a single GEMM takes
+//! k-blocks, so a cancel lands in milliseconds even when a single GEMM takes
 //! seconds. Threadlocal (not a plain global) so a diffusion worker's cancel
 //! can't leak into an LLM forward running concurrently on another thread: the
 //! kernels capture the token ONCE on the calling thread and pass it into

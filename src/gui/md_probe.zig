@@ -4,7 +4,7 @@
 //!
 //! Exists because the renderer's failure modes are visual (a bold face that
 //! resolves to regular, a mono face that isn't mono, run splits at wrong
-//! boundaries) — unit tests can't see them, and eyeballing via a live chat
+//! boundaries), unit tests can't see them, and eyeballing via a live chat
 //! needs a loaded model. Not part of any default build or test step.
 const std = @import("std");
 const dvui = @import("dvui");

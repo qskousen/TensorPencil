@@ -1,30 +1,25 @@
-//! EmbeddingGemma (google/embeddinggemma-300m) — a Gemma-3 text *encoder* that
-//! maps text to one L2-normalized 768-d embedding.
+//! EmbeddingGemma (google/embeddinggemma-300m), a Gemma-3 text ENCODER mapping text to
+//! one L2-normalized 768-d embedding.
 //!
-//! Architecturally it is the Gemma-3 decoder body (4-norm sandwich, per-head
-//! QK-norm, GeGLU/gelu-tanh MLP, dual-RoPE with a global layer every 6th) run
-//! BIDIRECTIONALLY (no causal mask, `use_bidirectional_attention`), followed by
-//! a sentence-transformers head: mean-pool over all tokens → Dense 768→3072 →
-//! Dense 3072→768 (both no-bias, identity activation) → L2 normalize.
+//! Architecturally the Gemma-3 decoder body (4-norm sandwich, per-head QK-norm,
+//! GeGLU/gelu-tanh MLP, dual-RoPE with a global layer every 6th) run BIDIRECTIONALLY,
+//! then a sentence-transformers head: mean-pool over all tokens, Dense 768->3072, Dense
+//! 3072->768 (both no-bias, identity activation), L2 normalize.
 //!
-//! Reuse: the transformer body runs through the shared `transformer.gemma3_spec`
-//! `layerForward(.fresh, bidirectional=true)` — the exact tested gemma3 math.
-//! Only the head (pooling / dense / normalize) and the safetensors loader are
-//! new here.
+//! The body runs through the shared `transformer.gemma3_spec` and
+//! `layerForward(.fresh, bidirectional=true)`, i.e. the tested gemma3 math. Only the
+//! head and the safetensors loader are new here.
 //!
-//! Two gemma-specific loading details vs the GGUF gemma3 path:
-//!   - RMSNorm weights: HF `Gemma3RMSNorm` computes `x * (1 + w)`. The GGUF
-//!     converter folds the +1 in; raw HF safetensors do NOT, so we add 1.0 to
-//!     every norm vector at load (`normVec`).
-//!   - Tensor names are the bare HF names (`embed_tokens.weight`,
-//!     `layers.N.self_attn.q_proj.weight`, `norm.weight`) — no `model.` prefix
-//!     in this sentence-transformers export — so `loader.*` matches directly.
+//! Two loading details differ from the GGUF gemma3 path. HF `Gemma3RMSNorm` computes
+//! `x * (1 + w)` and the GGUF converter folds the +1 in, while raw HF safetensors do
+//! not, so `normVec` adds 1.0 to every norm vector at load. And the tensor names are
+//! bare HF names with no `model.` prefix in this sentence-transformers export, so
+//! `loader.*` matches directly.
 //!
-//! Sliding window: EmbeddingGemma's local layers use a 512 sliding window, but
-//! for the common case seq <= 512 a window is indistinguishable from full
-//! attention, so we run every layer with the full bidirectional mask (window 0)
-//! and only alternate the RoPE base per layer. Long inputs (> 512 tokens) would
-//! need a bidirectional sliding window; not yet implemented (see TODO in embed).
+//! EmbeddingGemma's local layers use a 512 sliding window, but at seq <= 512 a window is
+//! indistinguishable from full attention, so every layer runs with the full
+//! bidirectional mask (window 0) and only the RoPE base alternates per layer. Inputs
+//! past 512 tokens would need a bidirectional sliding window, which is not implemented.
 
 const std = @import("std");
 const tp_core = @import("tp_core");
@@ -42,7 +37,7 @@ const Weight = ops.matmul.Weight;
 pub const Config = gemma3.Config;
 
 /// EmbeddingGemma-300m fixed hyperparameters (config.json). `rope_scaling` is
-/// null (no linear position scaling → freq_scale 1.0) and query_pre_attn_scalar
+/// null (no linear position scaling -> freq_scale 1.0) and query_pre_attn_scalar
 /// == head_dim (256), so the default 1/sqrt(head_dim) attention scale is exact.
 pub const config_300m: Config = .{
     .n_layers = 24,
@@ -177,7 +172,7 @@ pub const Model = struct {
 
     /// Run the bidirectional Gemma-3 body over `ids` and write the final-normed
     /// hidden states (`last_hidden_state`) into `out` [seq * hidden]. `ids`
-    /// must already carry the model frame (`<bos> … <eos>`).
+    /// must already carry the model frame (`<bos> ... <eos>`).
     pub fn forwardHidden(self: *const Model, io: std.Io, gpa: std.mem.Allocator, ids: []const u32, out: []f32) !void {
         const cfg = self.cfg;
         const seq = ids.len;
@@ -220,9 +215,9 @@ pub const Model = struct {
         ops.norm.rmsNorm(out, x, self.final_norm, cfg.rms_eps);
     }
 
-    /// Batched encode: `ids_list[i]` (framed `<bos> … <eos>`) → `outs[i]`
+    /// Batched encode: `ids_list[i]` (framed `<bos> ... <eos>`) -> `outs[i]`
     /// [embed_dim]. All sequences are packed contiguously into one
-    /// [total_rows, hidden] activation (ragged — no padding), so the whole
+    /// [total_rows, hidden] activation (ragged, no padding), so the whole
     /// Gemma-3 body runs through `transformer.layerForwardBatchedFresh`: every
     /// projection / norm / GeGLU batches over `sum(seq_i)` rows and only RoPE +
     /// attention loop per item. The head (mean-pool + 2 Dense + normalize) is
@@ -274,7 +269,7 @@ pub const Model = struct {
             try transformer.layerForwardBatchedFresh(transformer.gemma3_spec, io, gpa, layer, x, row_off, dims, freqs, cfg.rms_eps, true, &s);
         }
 
-        // final norm (per row) → per-item head.
+        // final norm (per row) -> per-item head.
         const lhs = try a.alloc(f32, total * cfg.hidden);
         ops.norm.rmsNorm(lhs, x, self.final_norm, cfg.rms_eps);
         for (0..b) |i| {
@@ -283,9 +278,9 @@ pub const Model = struct {
         }
     }
 
-    /// Encode `ids` (already framed `<bos> … <eos>`) into `out` [embed_dim], an
-    /// L2-normalized 768-d embedding: bidirectional body → mean-pool over all
-    /// tokens → Dense 768→3072 → Dense 3072→768 → normalize.
+    /// Encode `ids` (already framed `<bos> ... <eos>`) into `out` [embed_dim], an
+    /// L2-normalized 768-d embedding: bidirectional body -> mean-pool over all
+    /// tokens -> Dense 768->3072 -> Dense 3072->768 -> normalize.
     pub fn embed(self: *const Model, io: std.Io, gpa: std.mem.Allocator, ids: []const u32, out: []f32) !void {
         const cfg = self.cfg;
         const seq = ids.len;
@@ -298,9 +293,9 @@ pub const Model = struct {
     }
 
     /// Pooling + projection head over the final hidden states `lhs`
-    /// [seq * hidden]: mean-pool over all tokens → Dense 768→3072 → Dense
-    /// 3072→768 → L2-normalize. Shared with the GPU path (body on device →
-    /// download `lhs` → this on host). Cheap; always host.
+    /// [seq * hidden]: mean-pool over all tokens -> Dense 768->3072 -> Dense
+    /// 3072->768 -> L2-normalize. Shared with the GPU path (body on device ->
+    /// download `lhs` -> this on host). Cheap; always host.
     pub fn head(self: *const Model, io: std.Io, gpa: std.mem.Allocator, lhs: []const f32, out: []f32) !void {
         const cfg = self.cfg;
         const seq = lhs.len / cfg.hidden;
@@ -398,7 +393,7 @@ test "embeddinggemma embedBatch matches per-item" {
     var model = try Model.open(gpa, io, dir);
     defer model.deinit();
 
-    // ragged batch: framed <bos>=2 … <eos>=1, different lengths.
+    // ragged batch: framed <bos>=2 ... <eos>=1, different lengths.
     const item0 = [_]u32{ 2, 1000, 2049, 1 };
     const item1 = [_]u32{ 2, 500, 600, 700, 800, 1 };
     const item2 = [_]u32{ 2, 42, 1 };

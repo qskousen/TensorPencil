@@ -1,12 +1,12 @@
 //! CUDA compute backend (pure Zig: runtime-loaded driver + hand-emitted PTX).
 //!
 //! The Vulkan path (`gpu/context.zig`) hits three NVIDIA-only structural
-//! ceilings — a 48 KB shared-memory cap, no `cp.async`, and opaque coopmat
+//! ceilings, a 48 KB shared-memory cap, no `cp.async`, and opaque coopmat
 //! lowering. This backend goes through the CUDA Driver API and JITs
 //! hand-written PTX, unlocking >48 KB dynamic shared (`cuFuncSetAttribute`),
 //! `cp.async` global->shared overlap, and explicit `mma.sync` IMMA tiling.
 //!
-//! Phase 1 goal (see PLAN.md M10): a hand-PTX int8 GEMM that beats the Vulkan
+//! Phase 1 goal: a hand-PTX int8 GEMM that beats the Vulkan
 //! ~85 TOPS baseline, validated bit-for-bit against the same CPU oracle as
 //! `gpu-i8-test`. Kept behind its own CLI (`cuda-test` / `cuda-i8-test`); the
 //! Vulkan path stays the portable default.

@@ -1,5 +1,5 @@
 //! LLM inference (tp-llm): chat templating, sampling, the generation loop
-//! over models.qwen3.CausalLM, and speculative decoding. See LLM_PLAN.md.
+//! over models.qwen3.CausalLM, and speculative decoding.
 
 pub const chat = @import("llm/chat.zig");
 pub const chat_template = @import("llm/chat_template.zig");

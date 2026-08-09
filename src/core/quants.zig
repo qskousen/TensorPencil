@@ -16,7 +16,7 @@
 //! - q1_0 (18 B / 128): f16 d, 16 B of sign bits (LSB-first);  v = bit ? d : -d
 //! - q2_0_g64 (18 B / 64) and q2_0_g128 (34 B / 128): f16 d, then 2-bit codes
 //!   (LSB-first, 4 per byte); v = (code - 1) * d, so the set is {-1, 0, +1, +2}
-//!   * d — NOT centred on zero. Same arithmetic, two block sizes, one GGUF type
+//!   * d, NOT centred on zero. Same arithmetic, two block sizes, one GGUF type
 //!   id; g64 is ggml's, g128 is decoded natively. See `dequantQ2_0G128`.
 
 const std = @import("std");
@@ -104,7 +104,7 @@ pub const ggmlType = gg.blockType;
 pub const ensureGgmlInit = gg.ensureInit;
 
 /// Whether this dtype's decode goes through ggml. False for non-block dtypes and
-/// for `.q2_0_g128`, which is decoded natively — so it needs neither `-Dggml` nor
+/// for `.q2_0_g128`, which is decoded natively, so it needs neither `-Dggml` nor
 /// the `ensureGgmlInit` call, and must never reach a ggml entry point. Callers
 /// choosing between the ggml `vec_dot` GEMV and the packed path gate on this.
 pub fn usesGgml(dt: DType) bool {
@@ -112,11 +112,11 @@ pub fn usesGgml(dt: DType) bool {
 }
 
 /// Dequantize elements [elem0, elem0 + n) of a block-quantized `row` into `dst`
-/// via ggml's (auto-vectorized) `to_float` — ~4-12x faster than the scalar Zig
+/// via ggml's (auto-vectorized) `to_float`, ~4-12x faster than the scalar Zig
 /// decode it replaced. `elem0`/`n` must be block-aligned (ggml blocks never span
 /// rows; callers slice at block-aligned offsets). Bit-identical to the ggml
 /// reference our golden fixtures were generated from. Panics if built without
-/// ggml — except for `.q2_0_g128`, which never needs it.
+/// ggml, except for `.q2_0_g128`, which never needs it.
 pub fn dequantSlice(dt: DType, row: []const u8, elem0: usize, n: usize, dst: []f32) void {
     if (dt == .q2_0_g128) return dequantQ2_0G128(row, elem0, n, dst);
     gg.dequantSlice(dt, row, elem0, n, dst);
@@ -133,7 +133,7 @@ const q2_shifts: @Vector(q2_vl, u5) = blk: {
     break :blk s;
 };
 /// The integer holding one vector's worth of codes (u8 / u16 / u32). Read exactly
-/// this wide — a u32 load at every step would run past the 34-byte block on the
+/// this wide, a u32 load at every step would run past the 34-byte block on the
 /// last block of a row.
 const Q2Word = std.meta.Int(.unsigned, q2_vl * 2);
 
@@ -142,24 +142,24 @@ const Q2Word = std.meta.Int(.unsigned, q2_vl * 2);
 ///
 /// This exists because the g128 arm has no ggml `vec_dot` (see `dequantQ2_0G128`),
 /// and the packed fallback it would otherwise take expands the weight to f32
-/// panels — 4 B per element against 0.266 B stored, ~15x the memory traffic, which
+/// panels, 4 B per element against 0.266 B stored, ~15x the memory traffic, which
 /// on Bonsai-27B measured as 0.2 tok/s against 2.6 for the first version of this.
 ///
-/// ⚠️ Unlike ggml's `vec_dot`, the activation is NOT quantized: this is exact in
+/// Unlike ggml's `vec_dot`, the activation is NOT quantized: this is exact in
 /// `x`, so the small-`m` and packed paths agree to summation order rather than to
 /// a 5% activation-quantization bound. It is in fact slightly MORE accurate than
 /// dequant-then-dot: `(code-1) * x` is exact in f32 (the multipliers are ±1, 0, 2),
 /// so scaling by `d` once per block rounds once where the reference rounds every
 /// `(code-1)*d*x` product. That exactness is also why the `- 1` stays in the inner
 /// loop rather than being hoisted as `Σ code*x - Σx` (which would be one vector op
-/// cheaper, and `Σx` is even row-invariant): `3 * x` is NOT exact, so hoisting
+/// cheaper, and the sum is even the same for every row): `3 * x` is NOT exact, so hoisting
 /// would trade the property for a rounding.
 ///
-/// ⚠️ **The codes are extracted with shifts, not a lookup table, and that is a
-/// measured choice.** A `[256][4]f32` coefficient table indexed per qs byte is the
+/// The codes are extracted with shifts, not a lookup table, and that is a
+/// measured choice. A `[256][4]f32` coefficient table indexed per qs byte is the
 /// obvious form and was the first version; it costs THREE loads (byte, table row,
 /// activation) per 4 elements, and profiling put `matmul` at 91.2% of CPU decode
-/// while sustaining only 17.8 GB/s of weight traffic — nowhere near this box's
+/// while sustaining only 17.8 GB/s of weight traffic, nowhere near this box's
 /// DRAM bandwidth, i.e. load-issue bound, not memory bound. Extracting instead
 /// pulls one integer load per `q2_vl` codes and leaves the activation load as the
 /// only other memory op.
@@ -194,12 +194,12 @@ pub fn dotQ2_0G128(row: []const u8, x: []const f32) f32 {
 
 /// Native q2_0 g128 decode: `v = (code - 1) * d` over 128-element / 34-byte blocks.
 ///
-/// ⚠️ **This does NOT go through ggml, and that is the whole point.** GGUF type id
+/// This does NOT go through ggml, and that is the whole point. GGUF type id
 /// 42 is claimed by two shipped formats with identical arithmetic and different
 /// block sizes: upstream ggml's `GGML_TYPE_Q2_0` uses `QK2_0 = 64` (18 B blocks,
 /// our `.q2_0_g64`, which *does* use ggml), while the PrismML llama.cpp fork's
-/// `prism` branch — which every published Bonsai / "Ternary" GGUF is quantized
-/// with, advertising itself as "Q2_0 g128" — uses `QK2_0 = 128` (34 B). Calling
+/// `prism` branch, which every published Bonsai / "Ternary" GGUF is quantized
+/// with, advertising itself as "Q2_0 g128", uses `QK2_0 = 128` (34 B). Calling
 /// ggml's `to_float` for type 42 on a g128 file walks the byte stream with the
 /// wrong stride and returns plausible garbage rather than failing, so
 /// `ggmlType(.q2_0_g128)` is null and this is the only decoder for it.
@@ -234,7 +234,7 @@ fn dequantQ2_0G128(row: []const u8, elem0: usize, n: usize, dst: []f32) void {
 //
 // `DType` above covers the formats TensorPencil can *compute* with. A tool that
 // inspects or rewrites arbitrary GGUF files (a converter, a quantizer) has to
-// handle every type ggml knows — including ones we have no kernel for and don't
+// handle every type ggml knows, including ones we have no kernel for and don't
 // want to model in `DType`. `raw` is that escape hatch: the same ggml quantize /
 // dequantize / layout entry points, keyed on the numeric `enum ggml_type` id
 // straight out of a GGUF header, with the unchecked C surface (out-of-range ids,
@@ -268,13 +268,13 @@ pub const raw = if (have_ggml) struct {
     }
 
     /// Number of `enum ggml_type` values in the linked ggml; valid ids are
-    /// `0..typeCount() - 1`. This grows with ggml versions — a GGUF written by a
+    /// `0..typeCount() - 1`. This grows with ggml versions, a GGUF written by a
     /// newer llama.cpp can carry ids this build does not know.
     pub fn typeCount() u32 {
         return @intCast(ggml.c.GGML_TYPE_COUNT);
     }
 
-    /// ggml's own name for the type ("q4_K", "f16", …).
+    /// ggml's own name for the type ("q4_K", "f16", ...).
     pub fn name(id: u32) RawError![]const u8 {
         return std.mem.span(ggml.c.ggml_type_name(try checked(id)));
     }
@@ -307,8 +307,8 @@ pub const raw = if (have_ggml) struct {
         return ggml.c.ggml_quantize_requires_imatrix(try checked(id));
     }
 
-    /// Pre-build this type's quantization tables. Optional — `quantizeChunk` does
-    /// it internally — but worth calling once up front when many threads will
+    /// Pre-build this type's quantization tables. Optional, `quantizeChunk` does
+    /// it internally, but worth calling once up front when many threads will
     /// quantize concurrently, so the table build is off the hot path. ggml
     /// documents init/free as thread-safe.
     pub fn ensureQuantizeInit(id: u32) RawError!void {
@@ -325,12 +325,12 @@ pub const raw = if (have_ggml) struct {
     /// type `id`, returning the number of bytes written.
     ///
     /// `imatrix`, when given, is the per-column importance weighting that the
-    /// k-quant and IQ scale searches minimize against — one weight per column, so
+    /// k-quant and IQ scale searches minimize against, one weight per column, so
     /// `n_per_row` of them, shared by every row in the call. This is the
     /// activation-aware hook: pass per-channel activation energy and ggml picks
     /// block scales that minimize weighted error instead of plain squared error.
     ///
-    /// Unlike ggml's `ggml_quantize_chunk` there is no `start` offset — slice
+    /// Unlike ggml's `ggml_quantize_chunk` there is no `start` offset, slice
     /// `src`/`dst` instead. Safe to call from many threads on disjoint slices.
     pub fn quantizeChunk(
         id: u32,
@@ -366,8 +366,8 @@ pub const raw = if (have_ggml) struct {
     }
 
     /// Dequantize `elems` elements of type `id` from `src` into `dst`. `elems`
-    /// must be a whole number of blocks. Same ggml `to_float` kernel — and so the
-    /// same bytes — as `dequantSlice`, but reachable for any ggml type.
+    /// must be a whole number of blocks. Same ggml `to_float` kernel, and so the
+    /// same bytes, as `dequantSlice`, but reachable for any ggml type.
     pub fn dequantRow(id: u32, src: []const u8, elems: usize, dst: []f32) RawError!void {
         const t = try checked(id);
         if (src.len < try rowBytes(id, elems)) return error.BufferSizeMismatch;
@@ -422,7 +422,7 @@ pub const raw = if (have_ggml) struct {
     }
 };
 
-/// Quantize f32 `src` into `dst` as `dt` — the typed convenience over
+/// Quantize f32 `src` into `dst` as `dt`, the typed convenience over
 /// `raw.quantizeChunk` for the block-quant dtypes TP models. See there for the
 /// `imatrix` contract and the threading rules.
 pub fn quantizeChunk(
@@ -517,7 +517,7 @@ test "raw quantize/dequantize round-trips every block type ggufy emits" {
     fillTestWeights(&src, 0xC0FFEE);
 
     // (id, expected ggml name, SNR floor in dB). Floors are well under measured
-    // values — they catch a broken path, not a rounding change.
+    // values, they catch a broken path, not a rounding change.
     const cases = [_]struct { id: u32, name: []const u8, snr_floor: f64 }{
         .{ .id = id_q8_0, .name = "q8_0", .snr_floor = 30 },
         .{ .id = id_q6_k, .name = "q6_K", .snr_floor = 25 },
@@ -583,7 +583,7 @@ test "raw dequantRow agrees with the fixture-validated dequantSlice" {
 
 test "the imatrix steers the q4_k scale search toward the weighted columns" {
     if (!have_ggml) return error.SkipZigTest;
-    // The activation-aware hook has to actually reach ggml's scale search —
+    // The activation-aware hook has to actually reach ggml's scale search,
     // otherwise every "activation-aware" number downstream is a placebo.
     //
     // Two properties, checked separately:
@@ -700,7 +700,7 @@ test "q1_0 dequant is sign-bit x block scale" {
     // Q1_0: 128-elem block = f16 d + 16 bytes of sign bits, LSB-first within each
     // byte (bit j of byte j/8 is element j); set = +d, clear = -d. There is no
     // zero, which is what makes it different in kind from every other block quant
-    // here — a cleared bit is -d, not 0.
+    // here, a cleared bit is -d, not 0.
     var block: [18]u8 = undefined;
     std.mem.writeInt(u16, block[0..2], @bitCast(@as(f16, 0.25)), .little);
     @memset(block[2..], 0); // every element = -d
@@ -746,7 +746,7 @@ test "q1_0 round-trips through ggml as the sign of the input" {
         const d: f32 = @floatCast(@as(f16, @floatCast(mean_abs))); // stored as f16
         for (src[b * 128 ..][0..128], back[b * 128 ..][0..128], 0..) |a, got, i| {
             errdefer std.debug.print("block {d} elem {d}: src {d} got {d} d {d}\n", .{ b, i, a, got, d });
-            // `>= 0` is set, so +0.0 encodes as +d — matching the reference's
+            // `>= 0` is set, so +0.0 encodes as +d, matching the reference's
             // comparison rather than a signbit test.
             try std.testing.expectEqual(if (a >= 0) d else -d, got);
         }
@@ -760,7 +760,7 @@ test "q1_0 round-trips through ggml as the sign of the input" {
 test "q2_0 dequant is a 2-bit code offset by one, at both block sizes" {
     // Q2_0: f16 d + 2-bit codes, 4 per byte, LSB-first (element j is bits
     // [2*(j%4) .. +2) of byte j/4). v = (code - 1) * d, so the set is
-    // {-d, 0, +d, +2d}. ⚠️ NOT symmetric — +2d is representable and -2d is not,
+    // {-d, 0, +d, +2d}. NOT symmetric, +2d is representable and -2d is not,
     // unlike ggml's ternary tq2_0, which this shares no layout with.
     //
     // Both arms of the ambiguous type id 42 are pinned here with the SAME code
@@ -798,7 +798,7 @@ test "the two q2_0 variants decode the same bytes differently" {
     if (!have_ggml) return error.SkipZigTest; // g64 goes through ggml
     // The whole reason `gguf.detectQ2_0Variant` exists: one byte stream is valid
     // under both block sizes and means different things. 128 elements of codes is
-    // either ONE g128 block (34 B) or TWO g64 blocks (36 B) — so laid out as g64,
+    // either ONE g128 block (34 B) or TWO g64 blocks (36 B), so laid out as g64,
     // byte 18 is a second scale, while g128 reads that same byte as 4 codes.
     //
     // Pinning the disagreement is what gives the detector's tests teeth: if these
@@ -815,7 +815,7 @@ test "the two q2_0 variants decode the same bytes differently" {
     try std.testing.expect(!std.mem.eql(f32, &as_g64, &as_g128));
     // Concretely: g64's second block re-reads a scale at byte 18 (0.25), so its
     // element 64 is a scaled code; g128 reads byte 18 as codes and its element
-    // 64 is (code-1) * 0.5. Both are "plausible" — that is the hazard.
+    // 64 is (code-1) * 0.5. Both are "plausible", that is the hazard.
     try std.testing.expectEqual(@as(f32, -0.25), as_g64[64]);
     try std.testing.expectEqual(@as(f32, -0.5), as_g128[64]);
 }
@@ -831,7 +831,7 @@ test "q2_0_g64 round-trips through ggml as round(x / amax)" {
     try std.testing.expectEqual(@as(usize, 64), try raw.blockElems(id_q2_0));
     try std.testing.expectEqual(@as(usize, 18), try raw.blockBytes(id_q2_0));
     try std.testing.expectEqual(id_q2_0, @as(u32, @intCast(ggmlType(.q2_0_g64).?)));
-    // ⚠️ And the g128 arm must NOT reach ggml, whose type 42 is the g64 layout.
+    // And the g128 arm must NOT reach ggml, whose type 42 is the g64 layout.
     try std.testing.expectEqual(@as(?@TypeOf(ggmlType(.q8_0).?), null), ggmlType(.q2_0_g128));
 
     const n = 256; // four blocks
@@ -891,7 +891,7 @@ test "storage sizes match ggml block layouts" {
     try std.testing.expectEqual(@as(usize, 36), DType.q1_0.storageBytes(256));
     // A Bonsai-27B hidden row: 5120 = 40 q1_0 blocks.
     try std.testing.expectEqual(@as(usize, 720), DType.q1_0.storageBytes(5120));
-    // The two q2_0 variants differ by exactly 17/18 on any row — the only signal
+    // The two q2_0 variants differ by exactly 17/18 on any row, the only signal
     // that tells them apart in a file (see gguf.detectQ2_0Variant). On Bonsai's
     // 5120-wide row that is 1440 vs 1360 bytes.
     try std.testing.expectEqual(@as(usize, 1440), DType.q2_0_g64.storageBytes(5120));

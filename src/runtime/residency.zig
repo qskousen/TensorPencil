@@ -11,7 +11,7 @@
 //!                             touched by the per-model hooks below):
 //!                               .dynamic: bool   .budget: u64
 //!                               .order: []usize  .next: usize
-//!   st.be                      the CUDA backend — `deviceUsed()` / `headroom()`
+//!   st.be                      the CUDA backend, `deviceUsed()` / `headroom()`
 //!   st.migrateLayer(l) !void   move layer l device->host, freeing its VRAM
 //!   st.promoteLayer(l) !void   bring layer l host->device, restoring its state
 //!   st.promoteCost(l) usize    VRAM a promote of layer l needs (weights + the
@@ -19,7 +19,7 @@
 //!
 //! `st` is the `*CudaLM` pointer; the hooks are `pub` methods on it. A stepper
 //! with no split (gemma4's resident MVP, qwen3's spec path) simply never calls
-//! these — the `st.split == null` guards make them safe no-ops regardless.
+//! these, the `st.split == null` guards make them safe no-ops regardless.
 
 const std = @import("std");
 const vram = @import("vram.zig");
@@ -48,7 +48,7 @@ pub const promote_slack = 64 << 20;
 ///   weights  the backend's pinned-weight counter. LLM weights are always pinned
 ///            (`pinAllWeights`), so this is exactly "parameters on the device".
 ///   kv       summed over the layers whose K/V still lives on the device.
-///   scratch  the remainder of `deviceUsed()` — activations, logits, RoPE tables,
+///   scratch  the remainder of `deviceUsed()`, activations, logits, RoPE tables,
 ///            dequant staging. Derived rather than enumerated so it can never
 ///            silently omit a buffer: anything the allocator counted lands here.
 pub fn measured(st: anytype) vram.Bytes {
@@ -62,13 +62,13 @@ pub fn measured(st: anytype) vram.Bytes {
     return .{ .weights = w, .kv = kv, .scratch = used -| w -| kv };
 }
 
-/// Device residency `st` WOULD hold with every layer back on the GPU — its full
+/// Device residency `st` WOULD hold with every layer back on the GPU, its full
 /// resident footprint, i.e. `vram.Participant.need`. Equal to `measured` when
 /// nothing is offloaded and the model has run a batched forward.
 ///
 /// Built by taking the measurement and replacing the two terms that residency
-/// changes — all weights instead of the uploaded ones, every layer's KV instead
-/// of the resident layers' — then adding the one allocation that does not exist
+/// changes, all weights instead of the uploaded ones, every layer's KV instead
+/// of the resident layers', then adding the one allocation that does not exist
 /// yet on a cold model. Anchoring on the measurement is what keeps this honest:
 /// `scratch` carries through unmodified, so the activation buffers, logits and
 /// RoPE tables are MEASURED rather than guessed at. An earlier version summed
@@ -109,7 +109,7 @@ fn layerKvBytes(st: anytype, l: usize) u64 {
 
 /// Dequant staging that a batched forward may allocate: `opMatmulQuant` expands
 /// the widest weight it is handed to f16 and converts the activation block
-/// alongside it. Zero once the model is WARM — by then whatever it really
+/// alongside it. Zero once the model is WARM, by then whatever it really
 /// allocated is already inside `measured.scratch`, and adding a prediction on top
 /// would inflate `need` past reality.
 ///
@@ -117,13 +117,13 @@ fn layerKvBytes(st: anytype, l: usize) u64 {
 /// assumes the widest layer linear goes through the dequant path, but a model
 /// whose weights are all q4_k now takes the MMQ path instead and never allocates
 /// the f16 staging at all. Measured on gemma4-31B, predicting it unconditionally
-/// put `need` 225 MiB above actual — safe direction, but it is 225 MiB of headroom
+/// put `need` 225 MiB above actual, safe direction, but it is 225 MiB of headroom
 /// spent on a buffer that does not exist, and headroom is what stops layers being
 /// offloaded. So: predict only while cold, measure once warm.
 ///
 /// The widest layer linear is the MLP in every arch here (`intermediate >= qDim`
 /// for qwen3/qwen35/gemma3/gemma4). The LM head is wider on large-vocab models but
-/// never uses this path — it is a GEMV (`opGemvQuant`), which streams the weight.
+/// never uses this path, it is a GEMV (`opGemvQuant`), which streams the weight.
 fn firstForwardScratch(st: anytype) u64 {
     if (st.be.pinnedWeightBytes() != 0) return 0; // warm: the measurement is the truth
     const c = st.cfg;
@@ -145,14 +145,14 @@ const prefill_rows_hint = 256;
 /// That gap is load-bearing, not cosmetic: the uncontended arm of `Arbiter.plan`
 /// hands the LLM exactly its demand, so an under-estimate becomes a hard residency
 /// ceiling and the model offloads layers to the host to get under a number below
-/// what it actually needs — with the card's real budget unspent. Measured on a
+/// what it actually needs, with the card's real budget unspent. Measured on a
 /// 3090 with nothing else resident (qwen3-32B, 64 layers): demand 19860 MiB vs a
 /// 20829 MiB budget and 20832 MiB of true full residency, so 3 layers were pushed
 /// to the host and 1.5 GiB sat idle. The 972 MiB shortfall is exactly this term.
 ///
 /// Still an estimate: activation/logits scratch is not included (it has no static
 /// size), so this remains a lower bound when cold. Once the model is warm the
-/// `warm` bound in `demand` supersedes it anyway — `used` already counts
+/// `warm` bound in `demand` supersedes it anyway, `used` already counts
 /// everything, and algebraically `all_layers + nonLayer == warm` there.
 ///
 /// Steppers without the hook keep the old behaviour rather than silently mis-report.
@@ -188,7 +188,7 @@ pub fn migrateNext(st: anytype) !bool {
 /// reaches `needed_free` bytes, or nothing is left. No-op without a dynamic
 /// split. Fixed-target variant used by the VRAM coordinator to free room for a
 /// resident image model. (`ensureCapacity` keeps its own loop, whose target
-/// shrinks per iteration as live slots drop — a fixed target can't express that.)
+/// shrinks per iteration as live slots drop, a fixed target can't express that.)
 pub fn offloadUntilFree(st: anytype, needed_free: u64) !void {
     if (st.split == null) return;
     const sp = &st.split.?;
@@ -214,7 +214,7 @@ pub fn offloadToBudget(st: anytype, target: u64) !void {
 }
 
 /// Resolve a CLI-style absolute `--vram-budget` (bytes; 0 = unset) into a device
-/// residency cap, through the SAME `vram.resolve` rule the GUI meter uses — so
+/// residency cap, through the SAME `vram.resolve` rule the GUI meter uses, so
 /// "limit" means one thing across both frontends instead of two formulas that can
 /// drift. Returns 0 when unset, which every split planner already reads as "no
 /// budget, no offload".
@@ -239,7 +239,7 @@ pub fn resolveBudget(st: anytype, vram_budget: u64) u64 {
 }
 
 /// Settle device residency to `target` bytes and set it as the ongoing KV-growth
-/// ceiling — the enactment primitive the cross-model VRAM arbiter drives each
+/// ceiling, the enactment primitive the cross-model VRAM arbiter drives each
 /// model to (`vram.Participant.applyBudget`). Arms the dynamic split if it
 /// isn't already, records `target` as the ceiling honored while KV grows, then
 /// migrates layers host-ward (currently over budget) or promotes them back
@@ -263,7 +263,7 @@ pub fn settleTo(st: anytype, target: u64) !void {
 /// Free VRAM a promote must leave untouched, beyond the per-layer cost: the
 /// per-token activation/logits allocations plus KV-growth churn need live
 /// headroom, and a promote that lands the card at the physical edge starts a
-/// per-token OOM→offload→promote thrash cycle. Promoting late is harmless
+/// per-token OOM->offload->promote thrash cycle. Promoting late is harmless
 /// (a settle retries next pump); promoting into the edge is not.
 const promote_reserve: u64 = 256 << 20;
 
@@ -271,7 +271,7 @@ const promote_reserve: u64 = 256 << 20;
 /// above is only a floor: a forward pass allocates transient buffers whose size
 /// depends on the architecture and batch (measured on gemma4-31B: a single
 /// 1102 MiB request during prefill), and filling the ceiling to within 256 MiB of
-/// the card guarantees the next one OOMs — which offloads layers, which is the
+/// the card guarantees the next one OOMs, which offloads layers, which is the
 /// churn this path exists to avoid. The backend reports its own high-water, so
 /// this is measured rather than guessed and needs no per-arch estimate.
 fn promoteReserve(st: anytype) u64 {
@@ -279,7 +279,7 @@ fn promoteReserve(st: anytype) u64 {
 }
 
 /// Migrate CPU layers back onto the GPU (LIFO by offload order), stopping before
-/// the next would overflow `budget` — so the caller (VRAM coordinator, after
+/// the next would overflow `budget`, so the caller (VRAM coordinator, after
 /// image generation) reclaims LLM residency while leaving room for whatever else
 /// stays resident. Keeps the split armed (offload can fire again). Returns the
 /// number promoted; 0 without a split.
@@ -289,7 +289,7 @@ pub fn promoteBack(st: anytype, budget: u64) !usize {
     var promoted: usize = 0;
     // A layer's WEIGHTS promote lazily (promoteLayer re-creates only its KV;
     // the weights re-cache pinned on the next forward), so deviceUsed() does
-    // not yet include them. Carry that deferred cost across the loop —
+    // not yet include them. Carry that deferred cost across the loop,
     // without it one settle promoted a dozen layers, the next forward's
     // weight uploads OOM'd, the retry offloaded them all back, and the next
     // settle promoted again: a full per-token PCIe thrash cycle.

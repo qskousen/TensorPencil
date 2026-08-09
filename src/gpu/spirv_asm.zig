@@ -1,35 +1,31 @@
-//! A tiny SPIR-V text assembler, written in Zig.
+//! A tiny SPIR-V text assembler.
 //!
-//! Kernels (see `coopmat.zig`) are authored as readable SPIR-V *assembly text*
-//! — the same `%id = OpName operands` syntax `spirv-as`/`spirv-dis` use — and
-//! this module turns that text into the binary word stream a Vulkan driver
-//! consumes. It replaces the previous approach of emitting words by hand with
-//! manual id pre-allocation and magic opcode numbers.
+//! Kernels (see `coopmat.zig`) are authored as readable SPIR-V assembly text, the same
+//! `%id = OpName operands` syntax `spirv-as` and `spirv-dis` use, and this module turns
+//! that into the binary word stream a driver consumes. The alternative is emitting words
+//! by hand with manual id pre-allocation and magic opcode numbers.
 //!
-//! Scope: this is NOT a general SPIR-V assembler. It covers the opcodes and
-//! named enum tokens this codebase actually uses; the enum table is a flat
-//! name->value map (see `enum_tokens`), which works only because our usage of
-//! each name is unambiguous. Unknown mnemonics/tokens are a hard error, so
-//! gaps surface immediately rather than miscompiling. Correctness is
-//! cross-checked against the real `spirv-as` (byte-identical output, since both
-//! number ids by first occurrence) and against `spirv-val`.
+//! NOT a general assembler: it covers the opcodes and named enum tokens this codebase
+//! uses, and the enum table is a flat name-to-value map, which works only because our
+//! usage of each name is unambiguous. Unknown mnemonics and tokens are a hard error, so
+//! gaps surface immediately rather than miscompiling. Cross-checked against the real
+//! `spirv-as` (byte-identical, since both number ids by first occurrence) and
+//! `spirv-val`.
 //!
-//! Grammar accepted, one instruction per line:
-//!   %result = OpName operand...        (ops with a result id)
-//!             OpName operand...        (ops without a result id)
-//! Operands:
-//!   %name          - an id reference (interned; allocated on first mention,
-//!                    so forward references to labels/globals just work)
-//!   "text"         - a literal string (null-terminated, word-padded)
-//!   123 / 0x7f     - a literal integer word (decimal or hex, optional '-')
-//!   Name           - a named enum token, resolved via `enum_tokens`
-//! `;` starts a comment to end of line. Blank lines are ignored.
+//! Grammar, one instruction per line:
 //!
-//! For an op that carries a result *type* (e.g. `OpLoad`, `OpIAdd`), write it
-//! as `%r = OpLoad %type %ptr`: the assembler knows from the opcode table to
-//! emit <result-type> then <result-id> then the rest, matching SPIR-V binary
-//! layout. For type/label ops (`OpTypeInt`, `OpLabel`) the result id has no
-//! preceding type and is emitted first.
+//!     %result = OpName operand...        (ops with a result id)
+//!               OpName operand...        (ops without a result id)
+//!
+//! Operands are `%name` (an id reference, interned and allocated on first mention, so
+//! forward references to labels and globals just work), `"text"` (a literal string,
+//! null-terminated and word-padded), `123` or `0x7f` (a literal integer word, optional
+//! leading `-`), or a bare `Name` resolved via `enum_tokens`. `;` starts a comment to
+//! end of line, and blank lines are ignored.
+//!
+//! For an op carrying a result TYPE, write `%r = OpLoad %type %ptr`: the opcode table
+//! says to emit result-type, then result-id, then the rest, matching the binary layout.
+//! For type and label ops the result id has no preceding type and is emitted first.
 
 const std = @import("std");
 
@@ -310,7 +306,7 @@ pub const Assembler = struct {
             } else {
                 // Not an assignment: the line starts with an id operand (rare;
                 // no such instruction here). Restore and treat `first` as the
-                // mnemonic slot — but a leading id without '=' is malformed.
+                // mnemonic slot, but a leading id without '=' is malformed.
                 toks = save;
                 return Error.UnknownOpcode;
             }
@@ -323,7 +319,7 @@ pub const Assembler = struct {
 
         if (result_name == null and info.result != .none) return Error.MissingResult;
         if (result_name != null and info.result == .none) {
-            // A result was given for a no-result op — malformed.
+            // A result was given for a no-result op, malformed.
             return Error.UnknownOpcode;
         }
 
@@ -400,7 +396,7 @@ pub fn assemble(gpa: std.mem.Allocator, version: u32, text: []const u8) Error![]
 }
 
 /// Like `assemble`, but every non-allocation error (unknown opcode/token,
-/// malformed operand) is a bug in the kernel text — panic rather than
+/// malformed operand) is a bug in the kernel text, panic rather than
 /// propagate. Lets callers keep a clean `error{OutOfMemory}` set.
 pub fn assembleChecked(gpa: std.mem.Allocator, version: u32, text: []const u8) error{OutOfMemory}![]align(4) u8 {
     return assemble(gpa, version, text) catch |e| switch (e) {

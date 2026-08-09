@@ -1,6 +1,6 @@
 //! qwen35 hybrid (gated DeltaNet) on the Vulkan backend. Text-only, fixed KV
 //! capacity, one token at a time (no batched prefill, CUDA-graph capture, or
-//! CPU split) — a port of qwen35_cuda.zig that reuses the validated
+//! CPU split), a port of qwen35_cuda.zig that reuses the validated
 //! block-quant GEMV + GDN + RoPE + attention Context ops.
 //!
 //! Each token's whole layer stack is recorded into one command buffer
@@ -204,7 +204,7 @@ pub const VulkanLM = struct {
     pub fn vocab(self: *const VulkanLM) usize {
         return self.cfg.vocab;
     }
-    /// Device VRAM (bytes) this Vulkan context has allocated — the analog of the
+    /// Device VRAM (bytes) this Vulkan context has allocated, the analog of the
     /// CUDA backend's `deviceUsed()`, for the end-of-response telemetry.
     pub fn vramUsed(self: *const VulkanLM) u64 {
         return self.ctx.device_used;
@@ -280,7 +280,7 @@ pub const VulkanLM = struct {
                     try ctx.opRopeQwen35(self.q, self.freqs_d, cfg.n_heads, half, self.sin_off, hd, pos);
                     try ctx.opRopeQwen35(self.k, self.freqs_d, cfg.n_kv_heads, half, self.sin_off, hd, pos);
                     // Append K/V to the cache with in-batch device copies
-                    // (copy kernel: dst[u2+i] = src[u3+i]) — tensorCopy would
+                    // (copy kernel: dst[u2+i] = src[u3+i]), tensorCopy would
                     // flush the recording and drain the GPU every layer.
                     switch (self.kv_dtype) {
                         .f16 => {

@@ -2,11 +2,11 @@
 //!
 //! Hybrid layout, chosen to keep text selection seamless: all consecutive
 //! prose blocks (paragraphs, headings, lists, quotes, rules) flow into ONE
-//! TextLayoutWidget — dvui selection spans a whole layout, so styled runs,
+//! TextLayoutWidget, dvui selection spans a whole layout, so styled runs,
 //! links and headings select/copy together like plain text. Only a fenced
 //! code block breaks the flow: it renders as its own card (full-width
 //! background + mono face + copy button), which a single text layout can't
-//! express — per-run backgrounds hug the glyphs and child widgets are
+//! express, per-run backgrounds hug the glyphs and child widgets are
 //! corner-only. Selecting across a fence boundary is the one thing this
 //! gives up; each code card is independently selectable and has its own
 //! copy button.
@@ -21,7 +21,7 @@ const fonts = @import("fonts.zig");
 const hint = @import("hint.zig");
 
 pub const Opts = struct {
-    /// Applied to every prose text layout — colors/background/border for
+    /// Applied to every prose text layout, colors/background/border for
     /// the surrounding context (e.g. the dimmed thought block).
     prose: dvui.Options = .{},
     /// Base for widget ids when one parent renders several documents.
@@ -49,7 +49,7 @@ const Renderer = struct {
     opts: Opts,
     /// Open prose layout, lazily created; flushed before each code card so
     /// widgets appear in document order (an open layout is the current
-    /// parent — a card created inside it would nest as a corner widget).
+    /// parent, a card created inside it would nest as a corner widget).
     tl: ?*dvui.TextLayoutWidget = null,
     /// Tag of the previous prose block, for separator choice.
     last: ?std.meta.Tag(md.Block) = null,
@@ -112,7 +112,7 @@ const Renderer = struct {
             .list_item => |li| {
                 // Two indent columns per nesting level, glyph by depth.
                 // (Type the @min result explicitly: @min(x, 3) narrows to u2
-                // by design, and `level * 2` overflows it — Zig #14039.)
+                // by design, and `level * 2` overflows it, Zig #14039.)
                 const level: usize = @min(li.indent / 2, 3);
                 var buf: [32]u8 = undefined;
                 const marker = if (li.number) |num|

@@ -1,4 +1,4 @@
-//! Minimal PTX text-assembly helper — the PTX analog of `coopmat.zig`'s
+//! Minimal PTX text-assembly helper, the PTX analog of `coopmat.zig`'s
 //! word-level SPIR-V `Asm` emitter.
 //!
 //! PTX is human-readable assembly (unlike SPIR-V's binary word stream), so this

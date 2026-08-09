@@ -1,4 +1,4 @@
-//! jinja.zig — a minimal Jinja2-subset interpreter for LLM chat templates.
+//! jinja.zig, a minimal Jinja2-subset interpreter for LLM chat templates.
 //!
 //! Scope note (a deliberate shortcut, named per the project rules): this is NOT
 //! a complete Jinja2. It implements exactly the subset the real GGUF-embedded
@@ -16,7 +16,7 @@
 //!   try tmpl.render(gpa, globals_dict_value, &out);   // out: *std.ArrayList(u8)
 //!
 //! The globals `Value` is a dict carrying `messages`, `bos_token`,
-//! `add_generation_prompt`, and any flags (`enable_thinking`, `tools`, …). The
+//! `add_generation_prompt`, and any flags (`enable_thinking`, `tools`, ...). The
 //! language builtins `range`, `namespace`, and `raise_exception` are always
 //! available; a caller may override `raise_exception` / add `strftime_now` by
 //! putting them in the globals dict.
@@ -182,7 +182,7 @@ pub const Template = struct {
         var p = Parser{ .a = a, .chunks = try scan(a, src_copy), .i = 0 };
         const nodes = p.parseNodes(&.{}) catch |e| {
             // Surface the parser diagnostic by copying it out before the arena
-            // would be freed on error — but we keep the arena for the message.
+            // would be freed on error, but we keep the arena for the message.
             var t = Template{ .arena = arena, .nodes = &.{}, .diag = p.diag };
             _ = &t;
             return e;
@@ -208,8 +208,8 @@ pub const Template = struct {
         var interp = Interp{ .a = arena.allocator(), .frames = .empty };
         try interp.frames.append(interp.a, globals.dict); // frame 0 = globals
         // Render into an arena-backed buffer, then copy the finished bytes into
-        // the caller's list with the caller's allocator (the arena — and every
-        // transient value in it — is freed on return).
+        // the caller's list with the caller's allocator (the arena, and every
+        // transient value in it, is freed on return).
         var buf: std.ArrayList(u8) = .empty;
         try interp.execNodes(self.nodes, &buf);
         try out.appendSlice(gpa, buf.items);
@@ -270,7 +270,7 @@ fn scan(a: std.mem.Allocator, src: []const u8) Error![]Chunk {
                 left_trim = true;
                 j += 1;
             } else if (j < src.len and src[j] == '+') {
-                j += 1; // explicit "no lstrip" — treated same as default here
+                j += 1; // explicit "no lstrip", treated same as default here
             }
             const inner_start = j;
             // Find the matching close for this marker.
@@ -308,7 +308,7 @@ fn scan(a: std.mem.Allocator, src: []const u8) Error![]Chunk {
                 } });
             } else {
                 // Comment: contributes only its trim flags. Represent as an
-                // empty stmt-less marker by folding trims into neighbors — we do
+                // empty stmt-less marker by folding trims into neighbors, we do
                 // that by emitting a zero-effect tag record we later drop, but
                 // simplest: keep trims by pushing a sentinel handled below.
                 try raws.append(a, .{ .tag = .{
@@ -400,7 +400,7 @@ fn lexInner(a: std.mem.Allocator, s: []const u8) Error![]Tok {
             var is_float = false;
             while (i < s.len and (std.ascii.isDigit(s[i]) or s[i] == '.')) {
                 if (s[i] == '.') {
-                    // Guard against '..' or a trailing '.' method access — only
+                    // Guard against '..' or a trailing '.' method access, only
                     // a digit-flanked dot is part of a float.
                     if (i + 1 >= s.len or !std.ascii.isDigit(s[i + 1])) break;
                     is_float = true;
@@ -1653,7 +1653,7 @@ const Interp = struct {
             return self.strVal(buf.items);
         }
         if (std.mem.eql(u8, name, "map")) {
-            // map('filtername') — apply a named filter to each item.
+            // map('filtername'), apply a named filter to each item.
             if (v != .list or args.len < 1) return v;
             const fname = try self.toStr(try self.eval(args[0]));
             const l = try self.newList();
@@ -1662,7 +1662,7 @@ const Interp = struct {
         }
         if (std.mem.eql(u8, name, "items")) {
             // jinja2 3.1's `items`: a mapping's (key, value) pairs in insertion
-            // order — `dictsort` without the sort. Its leniency is specified, not
+            // order, `dictsort` without the sort. Its leniency is specified, not
             // incidental: undefined yields nothing, and a non-mapping is an ERROR
             // rather than a pass-through, because `for k, v in <string>|items`
             // would otherwise unpack characters and render silent nonsense. Tool
@@ -1801,7 +1801,7 @@ const Interp = struct {
     }
 
     /// Render a value the way `str()` / `~` / string filters do (used for
-    /// concatenation and filter inputs — NOT the same as writeValue for output,
+    /// concatenation and filter inputs, NOT the same as writeValue for output,
     /// which matches Jinja's `{{ }}` printing of None/Undefined).
     fn toStr(self: *Interp, v: Value) Error![]const u8 {
         return switch (v) {
@@ -1854,9 +1854,9 @@ const Interp = struct {
     }
     /// Python's `json.dumps` separators, which `tojson` inherits: `", "` between
     /// items when compact, plain `","` once an indent puts a newline after it.
-    /// ⚠️ This is not cosmetic. A chat template's `tools` block goes through
+    /// This is not cosmetic. A chat template's `tools` block goes through
     /// `tojson` into the system prompt, so a compact `{"a":1}` where the
-    /// ecosystem writes `{"a": 1}` is a DIFFERENT prompt — different tokens, for
+    /// ecosystem writes `{"a": 1}` is a DIFFERENT prompt, different tokens, for
     /// every tool-calling render. llama.cpp's own jinja (`common/jinja/value.cpp`)
     /// and transformers' `tojson` override agree on these two defaults.
     fn jsonItemSep(self: *Interp, out: *std.ArrayList(u8), indent: ?usize) Error!void {
@@ -1901,7 +1901,7 @@ const Interp = struct {
 };
 
 // ---------------------------------------------------------------------------
-// JSON → Value bridge (used by tests and the config layer to build context)
+// JSON -> Value bridge (used by tests and the config layer to build context)
 // ---------------------------------------------------------------------------
 
 /// Deep-convert a parsed `std.json.Value` into a jinja `Value`, allocating in

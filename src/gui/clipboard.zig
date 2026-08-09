@@ -3,7 +3,7 @@
 //! SDL3's clipboard-set API is pull-based: instead of handing over bytes, you
 //! register a provider callback that SDL invokes lazily when another app asks
 //! for the data, plus a cleanup callback fired when the clipboard is replaced
-//! or the app exits. The encoded PNG therefore has to outlive `copyImage` — we
+//! or the app exits. The encoded PNG therefore has to outlive `copyImage`, we
 //! hand SDL a process-allocator-owned buffer and free it in `cleanup`.
 const std = @import("std");
 const SDLBackend = @import("backend");
@@ -13,8 +13,8 @@ const diffuser = @import("diffuser.zig");
 const GenImage = diffuser.GenImage;
 const SDL = SDLBackend.c;
 
-// SDL owns the clipboard payload until the clipboard changes — well past the
-// scope of `copyImage` — so it can't live on a transient/frame allocator.
+// SDL owns the clipboard payload until the clipboard changes, well past the
+// scope of `copyImage`, so it can't live on a transient/frame allocator.
 const gpa = std.heap.smp_allocator;
 
 const png_mime = "image/png";
@@ -23,7 +23,7 @@ const png_mime = "image/png";
 const Payload = struct { bytes: []u8 };
 
 /// Encode `gi`'s pixels to PNG and place them on the OS clipboard. No-op if the
-/// image hasn't finished rendering (no `rgba` yet). Logs and bails on failure —
+/// image hasn't finished rendering (no `rgba` yet). Logs and bails on failure,
 /// a failed copy should never take down the viewer.
 pub fn copyImage(gi: *GenImage) void {
     const rgba = gi.rgba orelse return;

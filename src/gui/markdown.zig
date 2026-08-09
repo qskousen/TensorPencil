@@ -1,18 +1,18 @@
 //! Streaming-tolerant markdown-subset parser for chat text.
 //!
-//! Pure string logic (std only) so it unit-tests cheaply — the dvui-facing
+//! Pure string logic (std only) so it unit-tests cheaply, the dvui-facing
 //! rendering lives in markdown_view.zig. The subset is what LLMs actually
 //! emit: headings, fenced code, lists, blockquotes, horizontal rules, and
 //! inline bold / italic / strikethrough / code / links.
 //!
 //! Chat text re-parses every frame while the model is still streaming, so
 //! partial input must render sanely, never wrongly:
-//!  - an unterminated inline marker (`**bol`) stays literal text — a span
+//!  - an unterminated inline marker (`bol`) stays literal text, a span
 //!    only opens once its closer is already in the buffer;
 //!  - an unterminated code fence IS an open code block (`closed = false`),
 //!    so streaming code displays as code live.
 //!
-//! Everything yields slices into the source — no allocation.
+//! Everything yields slices into the source, no allocation.
 const std = @import("std");
 
 // ---------------------------------------------------------------- blocks
@@ -29,7 +29,7 @@ pub const Block = union(enum) {
     code: Code,
     /// One `- item` / `1. item` line. `number == null` means a bullet.
     list_item: ListItem,
-    /// Raw source slice of consecutive `> …` lines — the renderer strips the
+    /// Raw source slice of consecutive `> ...` lines, the renderer strips the
     /// marker per line (`stripQuote`), keeping this module allocation-free.
     quote: []const u8,
     rule,
@@ -169,7 +169,7 @@ fn classify(line: []const u8) LineClass {
         return .text;
     }
     if (isRule(l)) return .rule;
-    // Bullet: `- x` / `* x` / `+ x` (marker must be followed by a space —
+    // Bullet: `- x` / `* x` / `+ x` (marker must be followed by a space,
     // `*emphasis*` at line start is not a list).
     if ((l[0] == '-' or l[0] == '*' or l[0] == '+') and l.len >= 2 and (l[1] == ' ' or l[1] == '\t'))
         return .list_item;
@@ -283,7 +283,7 @@ pub const SpanIterator = struct {
         return n;
     }
 
-    /// `` `code` `` — the closer must be a backtick run of the same length.
+    /// `` `code` ``, the closer must be a backtick run of the same length.
     fn codeSpan(self: *SpanIterator) ?Span {
         const n = self.runLen(self.pos, '`');
         var j = self.pos + n;
@@ -336,7 +336,7 @@ pub const SpanIterator = struct {
         return false;
     }
 
-    /// `**bold**` / `*italic*` / `__bold__` / `_italic_` (and `***both***`
+    /// `bold` / `*italic*` / `__bold__` / `_italic_` (and `*both*`
     /// via consuming 2 then 1 from the same run).
     fn emphasis(self: *SpanIterator, ch: u8) ?Span {
         const run = self.runLen(self.pos, ch);
@@ -403,7 +403,7 @@ pub const SpanIterator = struct {
         return null;
     }
 
-    /// `[text](url)` — label styling is not nested (rendered as link text).
+    /// `[text](url)`, label styling is not nested (rendered as link text).
     fn link(self: *SpanIterator) ?Span {
         const open = self.pos;
         const rb = std.mem.indexOfScalarPos(u8, self.src, open + 1, ']') orelse {
@@ -427,7 +427,7 @@ pub const SpanIterator = struct {
         return self.emit(open, .{ .text = label, .style = self.style, .link = url }, rp + 1);
     }
 
-    /// Bare `http(s)://…` URL at a word boundary, trailing punctuation
+    /// Bare `http(s)://...` URL at a word boundary, trailing punctuation
     /// excluded (`see https://x.org.` links `https://x.org`).
     fn autolink(self: *SpanIterator) ?Span {
         const at = self.pos;
@@ -610,7 +610,7 @@ test "spans: triple asterisk is bold+italic" {
 
 test "spans: unterminated markers stay literal (streaming)" {
     var buf: [8]Span = undefined;
-    // Mid-stream: "**bol" — the closer hasn't arrived, so no style flips on.
+    // Mid-stream: "bol", the closer hasn't arrived, so no style flips on.
     const s = collectSpans("this is **bol", &buf);
     try testing.expectEqual(1, s.len);
     try testing.expectEqualStrings("this is **bol", s[0].text);
@@ -697,7 +697,7 @@ test "spans: escaped punctuation is literal" {
 
 test "spans: multiplication asterisks stay literal" {
     var buf: [8]Span = undefined;
-    // "3 * 4 * 5": openers are followed by spaces → never emphasis.
+    // "3 * 4 * 5": openers are followed by spaces -> never emphasis.
     const s = collectSpans("3 * 4 * 5", &buf);
     try testing.expectEqual(1, s.len);
     try testing.expectEqualStrings("3 * 4 * 5", s[0].text);

@@ -22,7 +22,7 @@ const col = struct {
     const dit = C{ .r = 224, .g = 138, .b = 60 };
     const latent = C{ .r = 216, .g = 82, .b = 74 };
     const vae = C{ .r = 154, .g = 109, .b = 208 };
-    /// Ours but untracked (contexts/kernels/UI textures) — a desaturated cousin
+    /// Ours but untracked (contexts/kernels/UI textures), a desaturated cousin
     /// of `sys` so it reads as part of the right-hand block, yet distinct.
     const ovh = C{ .r = 116, .g = 106, .b = 96 };
     const head = C{ .r = 128, .g = 138, .b = 156, .a = 46 };
@@ -32,7 +32,7 @@ const col = struct {
 
 pub const Model = struct {
     total: u64,
-    /// VRAM held by OTHER processes (desktop, browsers, …) — never ours.
+    /// VRAM held by OTHER processes (desktop, browsers, ...), never ours.
     system: u64,
     /// OURS, but outside what the allocators track: the CUDA context(s) + JIT'd
     /// modules, cuBLASLt/cuDNN internals, the SDL/GL window + image textures, and
@@ -49,7 +49,7 @@ pub const Model = struct {
     split: *f32,
     limit: *f32,
     /// Dynamic floors (fractions): split can't go left of `floor_llm`
-    /// (system+context); the limit↔split gap can't close below `floor_diff`.
+    /// (system+context); the limit<->split gap can't close below `floor_diff`.
     floor_llm: f32,
     floor_diff: f32,
     llm_loaded: bool,
@@ -64,16 +64,16 @@ pub const Model = struct {
 };
 
 pub const Actions = struct {
-    /// Fired every drag-motion frame — CHEAP only (repaint / preview). The
+    /// Fired every drag-motion frame, CHEAP only (repaint / preview). The
     /// fractions are already mutated in place by the drag; this just notifies.
     on_change: *const fn () void,
-    /// Fired once on drag RELEASE — the place to do heavy work (persist the
+    /// Fired once on drag RELEASE, the place to do heavy work (persist the
     /// fractions, apply the offload/budget policy live). Never fires mid-drag,
-    /// so we don't shuffle layers CPU↔GPU on every pixel of movement.
+    /// so we don't shuffle layers CPU<->GPU on every pixel of movement.
     on_commit: *const fn () void,
     on_eject_llm: *const fn () void,
     on_eject_diff: *const fn () void,
-    /// Toggle each worker's pause independently — parks/releases the LLM decode
+    /// Toggle each worker's pause independently, parks/releases the LLM decode
     /// worker or the diffusion sampling worker at its next boundary (holding
     /// in-flight state + VRAM). See ops/pause.zig.
     on_toggle_pause_llm: *const fn () void,
@@ -87,7 +87,7 @@ var dragging: ?enum { split, limit } = null;
 /// headroom to its right.
 const limit_max: f32 = 0.985;
 
-/// Render the full status-bar row: LLM numbers · ⏏ · bar · ⏏ · diffusion
+/// Render the full status-bar row: LLM numbers * ⏏ * bar * ⏏ * diffusion
 /// numbers. One horizontal row (no vertical nesting).
 pub fn render(m: *Model, a: Actions) void {
     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .gravity_y = 0.5 });
@@ -96,7 +96,7 @@ pub fn render(m: *Model, a: Actions) void {
     // LLM numbers (left): weights + context, stacked.
     numCol(0, &.{ .{ .name = "weights", .c = col.llm_w, .v = m.llm_w }, .{ .name = "ctx", .c = col.llm_ctx, .v = m.llm_ctx } });
 
-    // Unload on the OUTSIDE, pause next to the bar — so both pause buttons flank
+    // Unload on the OUTSIDE, pause next to the bar, so both pause buttons flank
     // the meter (the diffusion side below is already pause-then-unload outward).
     if (eject(0, m.llm_loaded, m.llm_armed, "Unload the LLM — frees its VRAM (reloads on the next message)")) a.on_eject_llm();
     if (pauseBtn(0, m.llm_paused, "Pause the LLM — holds generation (nothing loads until resumed)")) a.on_toggle_pause_llm();
@@ -134,7 +134,7 @@ pub fn render(m: *Model, a: Actions) void {
 
 const Item = struct { name: []const u8, c: C, v: u64 };
 
-/// A stacked mini-column of memory readouts (swatch · label · size), dimmed
+/// A stacked mini-column of memory readouts (swatch * label * size), dimmed
 /// when a part isn't loaded. Fixed row height so the strip never pops.
 fn numCol(id: usize, items: []const Item) void {
     var colb = dvui.box(@src(), .{ .dir = .vertical }, .{ .id_extra = id, .gravity_y = 0.5, .margin = .{ .x = 6, .w = 6 } });
@@ -189,7 +189,7 @@ fn eject(id: usize, loaded: bool, armed: bool, hint_text: []const u8) bool {
 /// paused the glyph BLINKS orange (a ~1.25 Hz square wave) so the parked state
 /// is unmissable, and flips to ▶ (resume). ALWAYS clickable (never dimmed):
 /// pausing before anything is loaded pre-arms the gate so the next message /
-/// image is HELD — nothing loads at all — until resumed. See
+/// image is HELD, nothing loads at all, until resumed. See
 /// app.toggleLlmPause and Diffuser.pump (both defer loading while paused).
 fn pauseBtn(id: usize, paused: bool, hint_text: []const u8) bool {
     const th = dvui.themeGet();
@@ -243,8 +243,8 @@ fn drawBar(m: *Model, R: dvui.Rect.Physical, scale: f32) void {
             r.fill(.{}, .{ .color = c });
         }
     };
-    // ONE contiguous left→right sweep of the whole card — no anchoring, no
-    // overlap — so nothing hides beneath anything and usage that overruns the
+    // ONE contiguous left->right sweep of the whole card, no anchoring, no
+    // overlap, so nothing hides beneath anything and usage that overruns the
     // limit visibly crosses the limit marker. Order: everything WE allocate
     // first (LLM weights, context, then the diffusion stack), packed contiguous
     // on the left, THEN the free gap (bar background shows through), THEN
@@ -255,7 +255,7 @@ fn drawBar(m: *Model, R: dvui.Rect.Physical, scale: f32) void {
 
     var x: f32 = 0;
     // Our stuff: LLM (weights, context), the diffusion stack, then our untracked
-    // runtime overhead — all contiguous, so the left block is exactly "ours".
+    // runtime overhead, all contiguous, so the left block is exactly "ours".
     inline for (.{
         .{ m.llm_w, col.llm_w },
         .{ m.llm_ctx, col.llm_ctx },
@@ -269,7 +269,7 @@ fn drawBar(m: *Model, R: dvui.Rect.Physical, scale: f32) void {
         seg.at(R, x0, W, x, x + w, it[1]);
         x += w;
     }
-    // Free VRAM — advance across the gap; the box's "free"-colored background
+    // Free VRAM, advance across the gap; the box's "free"-colored background
     // shows through (no fill needed).
     x += frac(m, free_b);
     // System / reserved (OS + context overhead) at the far right.
@@ -284,7 +284,7 @@ fn drawBar(m: *Model, R: dvui.Rect.Physical, scale: f32) void {
         hr.fill(.{ .x = 0, .y = rad, .w = rad, .h = 0 }, .{ .color = col.head });
     }
 
-    // Handles are policy MARKERS overlaid on top (not usage) — the split is the
+    // Handles are policy MARKERS overlaid on top (not usage), the split is the
     // LLM|diffusion contention boundary, the limit is the ceiling.
     handle(R, x0, W, m.split.*, col.split);
     handle(R, x0, W, m.limit.*, col.limit);
@@ -321,7 +321,7 @@ fn handleDrag(m: *Model, a: Actions, wd: *dvui.WidgetData, crs: dvui.RectScale) 
                 }
             },
             // Move by the per-event DELTA (viewer.zig's proven idiom), never by
-            // absolute cursor position — so the handle tracks the drag smoothly
+            // absolute cursor position, so the handle tracks the drag smoothly
             // from where it started and can't jump to the cursor.
             .motion => |delta| {
                 if (!dvui.captured(wd.id) or dragging == null) continue;

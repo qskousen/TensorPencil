@@ -8,10 +8,10 @@
 //! hooks, so diffusion pins all free VRAM). Two things are injected so the
 //! engine never has to know who is driving it:
 //!
-//!  - `Source` — where the next pending `GenImage` comes from (chat scans its
+//!  - `Source`, where the next pending `GenImage` comes from (chat scans its
 //!    message transcript; the studio scans its gallery list). The engine never
 //!    owns the images.
-//!  - `VramCoordinator` — how to make room for the image model and how much
+//!  - `VramCoordinator`, how to make room for the image model and how much
 //!    resident-weight budget it gets (chat evicts/promotes LLM layers; the
 //!    studio no-ops and hands back a 0 "auto / pin all free VRAM" budget).
 //!
@@ -79,10 +79,10 @@ pub const GenStatus = enum(u8) { pending, generating, done, failed, canceled, su
 /// A short human explanation of a generation failure, for the tile that reports
 /// it. The recognized cases are the ones a user can ACT on; everything else
 /// falls back to the error name, which is at least specific enough to search
-/// for. ⚠️ VRAM exhaustion reaches here under four different names — the CUDA
+/// for. VRAM exhaustion reaches here under four different names, the CUDA
 /// libraries report an out-of-workspace as their own error, and the hand-PTX
 /// path surfaces a post-OOM fault as `CudaError` (`pipeline.recoverableDecodeErr`
-/// documents the same set) — so mapping only `OutOfMemory` would leave the most
+/// documents the same set), so mapping only `OutOfMemory` would leave the most
 /// common failure looking like an internal bug.
 pub fn failureText(err: anyerror) []const u8 {
     return switch (err) {
@@ -102,7 +102,7 @@ pub fn failureText(err: anyerror) []const u8 {
     };
 }
 
-/// The model-defining config for one generation — exactly the fields that decide
+/// The model-defining config for one generation, exactly the fields that decide
 /// which `pipeline.Session` an image needs (paths + backend + VAE decode path).
 /// Captured onto each `GenImage` at `enqueue` so a mid-queue backend/model switch
 /// only affects images enqueued AFTER it: already-queued images finish on the
@@ -111,11 +111,11 @@ pub fn failureText(err: anyerror) []const u8 {
 /// `freeGenImage`); preview/steps/dims stay live (cosmetic / already per-image).
 pub const ModelConfig = struct {
     dit_path: []const u8,
-    /// Conditioner / decoder OVERRIDES. **Empty means "not configured"**, which is
+    /// Conditioner / decoder OVERRIDES. Empty means "not configured", which is
     /// how `pipeline.Options` spells it too (`openIfGiven` returns null for an empty
     /// path, and the resolver then takes the component out of the primary
     /// checkpoint). Non-empty is an *explicit* request that outranks a bundled copy
-    /// — see `applyPaths`, which is the single place that turns these into
+    /// see `applyPaths`, which is the single place that turns these into
     /// `explicit_text_encoder` / `explicit_vae`.
     vae_path: []const u8,
     text_encoder_path: []const u8,
@@ -150,7 +150,7 @@ pub const ModelConfig = struct {
     }
 
     /// Do these two configs need the same resident pipeline? (Paths + backend +
-    /// decode path — the fields `pipeline.Session.init` keys the session on.)
+    /// decode path, the fields `pipeline.Session.init` keys the session on.)
     fn eql(a: ModelConfig, b: ModelConfig) bool {
         return a.backend == b.backend and a.vae_decode == b.vae_decode and
             std.mem.eql(u8, a.dit_path, b.dit_path) and
@@ -159,15 +159,15 @@ pub const ModelConfig = struct {
             std.mem.eql(u8, a.text_encoder_2_path, b.text_encoder_2_path);
     }
 
-    /// Write this model set onto `opts` — **the only place** the GUI's paths become
+    /// Write this model set onto `opts`, the only place the GUI's paths become
     /// pipeline options, so the explicit-override flags cannot be forgotten at one
     /// of the several call sites that build an `Options`.
     ///
-    /// ⚠️ A path is "explicit" exactly when it is non-empty, and that equivalence
+    /// A path is "explicit" exactly when it is non-empty, and that equivalence
     /// only holds because the GUI never pre-fills the two override fields. The
     /// distinction is not cosmetic: the CLI's `Options` ships *defaulted* krea2
     /// side paths, and treating one of those as a request is what broke a joined
-    /// SD1.5 checkpoint — the resolver opened krea2's qwen3 encoder, hunted for
+    /// SD1.5 checkpoint, the resolver opened krea2's qwen3 encoder, hunted for
     /// CLIP's tensors in it, and reported `ComponentNotInCheckpoint`. If a future
     /// settings screen ever suggests a path, it must leave the buffer empty until
     /// the user accepts it, or carry a separate "asked for" bit.
@@ -198,7 +198,7 @@ pub const GenImage = struct {
     width: usize = 0,
     height: usize = 0,
     // Live preview (RGBA), allocated (generously) before the diffusion worker
-    // starts and overwritten in place each step — the pointer is stable for the
+    // starts and overwritten in place each step, the pointer is stable for the
     // whole generation (no fat-pointer race), byte tearing on a UI read is
     // benign (rendered .always). Dimensions vary (latent2rgb ≈ latent res, taew
     // ≈ 256px), published via atomics; 0 means "no preview yet".
@@ -213,10 +213,10 @@ pub const GenImage = struct {
     /// `Diffuser.load_error`, and read through `failure()` so an invalid code can
     /// never reach `@errorFromInt`.
     ///
-    /// ⚠️ Recorded because the reason has to leave this thread: the LLM's tool
+    /// Recorded because the reason has to leave this thread: the LLM's tool
     /// outcome line reports it back to the model ("out of VRAM" is actionable,
-    /// "failed" is not), and it is what the retry UI (TODO #3) needs too. It was
-    /// previously only `std.log.err`'d, i.e. visible to nobody but a terminal.
+    /// "failed" is not), and the retry UI needs it. Logging it is not enough: that
+    /// makes it visible to nobody but a terminal.
     gen_error: std.atomic.Value(u16) = .init(0),
     wake: *const fn () void,
     /// Clock source for the worker's timing timestamps (set at creation).
@@ -235,7 +235,7 @@ pub const GenImage = struct {
     req_steps: usize = 20,
     req_seed: u64 = 0,
     // Extra studio-only params (unused by the chat tool-call path, which leaves
-    // them at these defaults — matching the pre-studio behavior).
+    // them at these defaults, matching the pre-studio behavior).
     req_negative: []u8 = "", // owned (gpa) when non-empty; "" = none
     req_cfg: f32 = 1.0,
     /// Model/backend snapshot, stamped by `enqueue` (gpa-owned paths). Null for
@@ -281,7 +281,7 @@ pub fn freeGenImage(gpa: std.mem.Allocator, gi: *GenImage) void {
 /// primary checkpoint (`pipeline.detectFamily`), never configured here.
 pub const DiffConfig = struct {
     /// Primary checkpoint (safetensors or GGUF, sniffed by magic). The only
-    /// required path — it may carry the conditioner and decoder as well.
+    /// required path, it may carry the conditioner and decoder as well.
     dit_path: []const u8,
     /// Conditioner / decoder overrides; "" = take them from the primary
     /// checkpoint. See `ModelConfig`'s note on what non-empty means.
@@ -461,7 +461,7 @@ pub fn nowNs(io: std.Io) i64 {
 
 /// The AUTOMATIC1111 name for the sigma schedule a family samples on.
 ///
-/// ⚠️ **Not cosmetic — this field is what a reader re-renders with.** krea2 walks
+/// Not cosmetic, this field is what a reader re-renders with. krea2 walks
 /// a continuous flow-matching schedule (ComfyUI calls it "Simple"); the SD family
 /// walks the discrete beta ladder linearly (A1111's default, "Normal", as opposed
 /// to "Karras"). Stamping every render "Simple" would tell anyone reproducing an
@@ -472,7 +472,7 @@ pub fn nowNs(io: std.Io) i64 {
 fn defaultSchedulerFor(fam: pipeline.Family) tp.sampler.Scheduler {
     return switch (fam) {
         // All three flow-matching families; `simple` is what ComfyUI's own templates
-        // select for each — including Anima's `image_anima_base_v1`, which pairs it
+        // select for each, including Anima's `image_anima_base_v1`, which pairs it
         // with 30 steps and cfg 4.
         .krea2, .zimage, .anima => .simple,
         .sd15, .sdxl => .normal,
@@ -488,19 +488,19 @@ fn defaultSchedulerFor(fam: pipeline.Family) tp.sampler.Scheduler {
 /// `model_name` is the diffusion checkpoint's file stem; `fam` names the schedule
 /// (the "Schedule type" field is dropped when it is null). Caller frees.
 ///
-/// ⚠️ **`Prompt syntax` is not decoration, and the block is wrong without it.** A reader
+/// `Prompt syntax` is not decoration, and the block is wrong without it. A reader
 /// (including ComfyUI's own metadata importer) re-renders from these fields, and the very
-/// same prompt text means a DIFFERENT image in the two dialects — `(x:1.2)` multiplies in
+/// same prompt text means a DIFFERENT image in the two dialects, `(x:1.2)` multiplies in
 /// one and replaces in the other, `[x]` is de-emphasis in one and literal text in the
 /// other. A1111's own format has no field for this because A1111 only ever has one
 /// dialect; here it has to be recorded, on the same reasoning that made `Sampler` and
 /// `Schedule type` stop being hardcoded. `Emphasis` rides along only when it can matter.
 ///
-/// ⚠️ **`Compat` is the same argument again, and for a bigger effect.** It selects whose
-/// *sampling* conventions ran — including which RNG drew the noise, which decides whether
+/// `Compat` is the same argument again, and for a bigger effect. It selects whose
+/// *sampling* conventions ran, including which RNG drew the noise, which decides whether
 /// a seed means the same starting latent at all. `RNG`/`SGM noise multiplier` appear only
 /// when they were overridden away from that compat's own defaults, so an ordinary ComfyUI
-/// render's block is byte-for-byte what it was before this existed. `RNG` keeps A1111's
+/// render's block carries neither. `RNG` keeps A1111's
 /// own spelling of the field and its values, since that is what a reader will recognize.
 pub fn buildA1111Params(
     gpa: std.mem.Allocator,
@@ -518,7 +518,7 @@ pub fn buildA1111Params(
     syntax: pipeline.PromptSyntax,
     emphasis: pipeline.Emphasis,
     compat: pipeline.Compat,
-    /// The resolved form — compared against `compat`'s own defaults to decide which
+    /// The resolved form, compared against `compat`'s own defaults to decide which
     /// overrides need recording.
     cc: pipeline.CompatConfig,
 ) ![]u8 {
@@ -527,10 +527,10 @@ pub fn buildA1111Params(
     else
         try gpa.dupe(u8, "");
     defer gpa.free(neg_line);
-    // ⚠️ The scheduler actually used, not a guess from the architecture. This field
-    // used to be derived from the family alone, which was only ever right because the
-    // scheduler was not selectable; a reader (including ComfyUI's own metadata
-    // importer) re-renders from it. An explicit choice wins; otherwise name the
+    // The scheduler actually used, not a guess from the architecture. Deriving it
+    // from the family is right only while the scheduler is not selectable, and a
+    // reader (including ComfyUI's own metadata importer) re-renders from this field.
+    // An explicit choice wins; otherwise name the
     // family's default, and drop the field entirely when even that is unknown.
     const sched_line = if (sched) |sc|
         try std.fmt.allocPrint(gpa, "Schedule type: {s}, ", .{sc.a1111Name()})
@@ -543,7 +543,7 @@ pub fn buildA1111Params(
         .comfy => "ComfyUI",
         .a1111 => "A1111",
     };
-    // Only under `.a1111` — under `.comfy` there is exactly one weighting form, so the
+    // Only under `.a1111`, under `.comfy` there is exactly one weighting form, so the
     // field would imply a choice that does not exist.
     const emph_line = if (syntax == .a1111)
         try std.fmt.allocPrint(gpa, ", Emphasis: {s}", .{switch (emphasis) {
@@ -583,7 +583,7 @@ pub fn buildA1111Params(
     );
 }
 
-/// The file stem of a path (basename minus final extension) — the a1111 "Model".
+/// The file stem of a path (basename minus final extension), the a1111 "Model".
 fn modelStem(path: []const u8) []const u8 {
     const base = std.fs.path.basename(path);
     return if (std.mem.lastIndexOfScalar(u8, base, '.')) |dot| base[0..dot] else base;
@@ -629,7 +629,7 @@ pub const Diffuser = struct {
     preview_method: config.Preview = .taesd,
     /// Live preview controls, shared with the running worker's sampling loop (via
     /// `opts.preview_live`). `setPreview`/`setPreviewSize` write these so a method
-    /// or quality change shows on the next step — even mid-image. Address is stable
+    /// or quality change shows on the next step, even mid-image. Address is stable
     /// (the Diffuser outlives its worker; deinit joins the thread first).
     live_preview: pipeline.LivePreview = .{},
     /// Backs the live path strings after a model swap (reset+re-dupe per swap).
@@ -665,7 +665,7 @@ pub const Diffuser = struct {
     /// can invoke them from the LLM's worker thread (a starving LLM reclaiming
     /// from an idle image model). That would otherwise race the UI thread's
     /// `pump`, which frees the session at a model seam and flips `busy` + spawns
-    /// the worker — the `busy` check alone is a TOCTOU, since the flag is set on
+    /// the worker, the `busy` check alone is a TOCTOU, since the flag is set on
     /// a different thread than the one evicting.
     ///
     /// Held across pump's free/spawn decision and across each yield. Foreign
@@ -685,14 +685,14 @@ pub const Diffuser = struct {
     peak_resident: std.atomic.Value(u64) = .init(0),
 
     /// Why the last model LOAD failed, so the UI can say what went wrong instead
-    /// of showing a bare "⚠ failed" per image. Stored as `@intFromError` (0 = no
+    /// of showing a bare "failed" per image. Stored as `@intFromError` (0 = no
     /// failure) because the worker writes it and the UI thread reads it; an error
     /// code is a plain integer, so this needs no lock and no owned string.
     ///
     /// This exists because the SD family made the most likely first-run mistake
     /// invisible: an SD1.5 checkpoint on the GUI's default CUDA backend returns
-    /// `error.UnsupportedBackend` (there are no device kernels for its UNet), and
-    /// before this the only trace was a line in the terminal.
+    /// `error.UnsupportedBackend` (there are no device kernels for its UNet), and a
+    /// log line is a trace nobody in the GUI sees.
     load_error: std.atomic.Value(u16) = .init(0),
     /// Architecture of the resident pipeline, for the UI (`@intFromEnum` + 1;
     /// 0 = nothing loaded). Detected by the pipeline from the checkpoint itself.
@@ -757,7 +757,7 @@ pub const Diffuser = struct {
     ///
     /// Stamps the CURRENT model config (paths / backend / VAE decode) onto the
     /// image so a later backend/model switch only affects images enqueued after
-    /// this one — already-queued images finish on the config they were created
+    /// this one, already-queued images finish on the config they were created
     /// with (the worker reloads the pipeline at the seam where they disagree).
     pub fn enqueue(self: *Diffuser, gi: *GenImage) !void {
         if (gi.model == null) gi.model = try ModelConfig.dupe(self.gpa, self.liveConfig());
@@ -770,7 +770,7 @@ pub const Diffuser = struct {
     /// overlays a per-image snapshot), so every "what is currently selected?"
     /// question has to reconstruct a `ModelConfig` from it. Doing that inline at
     /// each of the four sites is how one of them silently misses a newly added
-    /// path — which is exactly what a fourth component invites.
+    /// path, which is exactly what a fourth component invites.
     ///
     /// Borrowed: the slices point into `path_store` (or the init-time arena) and
     /// live until the next `requestPaths`.
@@ -787,10 +787,10 @@ pub const Diffuser = struct {
 
     /// Re-queue a failed or canceled image, IN PLACE. The `*GenImage` is unchanged,
     /// so a chat variant holding a borrowed pointer re-renders the same tile going
-    /// pending → generating → done: "try this one again", not "make another".
+    /// pending -> generating -> done: "try this one again", not "make another".
     ///
-    /// ⚠️ **The model snapshot is REFRESHED to the live config, deliberately
-    /// inverting `enqueue`'s rule** that an image finishes on the config it was
+    /// The model snapshot is REFRESHED to the live config, deliberately
+    /// inverting `enqueue`'s rule that an image finishes on the config it was
     /// created with. That rule protects a queue from a mid-run switch; a retry is a
     /// fresh request the user is making NOW, and the whole reason to press it after
     /// an OOM is that they just changed something (unloaded the LLM, picked a
@@ -812,15 +812,15 @@ pub const Diffuser = struct {
             s.deinit(self.gpa);
             gi.resume_snapshot = null;
         }
-        // Drop the resident pipeline first (only when nothing is in flight —
-        // `freeSession` requires that). ⚠️ This is what makes the retry a
+        // Drop the resident pipeline first (only when nothing is in flight,
+        // `freeSession` requires that). This is what makes the retry a
         // genuinely different attempt rather than a replay of the conditions
         // that just failed: after a VRAM failure the resident session is
         // holding the memory the retry needs, and after a device fault a fresh
         // session is the only recovery available at all. The cost is one model
         // reload on a path the user explicitly asked for, after a failure.
         //
-        // ⚠️ NOT verified to clear a sticky CUDA fault — `CUDA_ERROR_ILLEGAL_
+        // NOT verified to clear a sticky CUDA fault, `CUDA_ERROR_ILLEGAL_
         // ADDRESS` poisons its context, and whether tearing the session down
         // rebuilds far enough to escape that has not been measured here. If it
         // does not, the retry reports the same error again, which is at least
@@ -849,7 +849,7 @@ pub const Diffuser = struct {
     pub fn cancelAll(self: *Diffuser) void {
         for (self.queue.items) |gi| gi.cancel.store(true, .release);
         // A worker parked at the pause gate would never observe the per-image
-        // cancel; wake it (without unpausing — the pause button stays in sync)
+        // cancel; wake it (without unpausing, the pause button stays in sync)
         // so its checkpoint re-reads `gi.cancel` and returns `.canceled`.
         self.pause.wake(self.io);
     }
@@ -866,7 +866,7 @@ pub const Diffuser = struct {
     }
 
     /// Wake a worker parked at the pause gate so it re-checks its per-image
-    /// cancel flag — used by the single-image Cancel button while paused (no-op
+    /// cancel flag, used by the single-image Cancel button while paused (no-op
     /// when nothing is parked, and never changes the pause state).
     pub fn wakePaused(self: *Diffuser) void {
         self.pause.wake(self.io);
@@ -905,7 +905,7 @@ pub const Diffuser = struct {
         return self.seed;
     }
 
-    /// Join the worker if one is running (no cancel — an in-flight image is
+    /// Join the worker if one is running (no cancel, an in-flight image is
     /// allowed to FINISH). Used before a session teardown / model swap.
     pub fn stopAndReap(self: *Diffuser) void {
         if (self.thread) |t| {
@@ -916,7 +916,7 @@ pub const Diffuser = struct {
     }
 
     /// Ask a paused, in-flight worker to suspend: snapshot the in-flight latent
-    /// to host, mark the image `.suspended`, and exit. Async — poll `busyNow()`
+    /// to host, mark the image `.suspended`, and exit. Async, poll `busyNow()`
     /// for completion, then `reapAndFree()`. No-op if nothing is generating. Only
     /// meaningful while paused (the worker must be parked at the step gate to see
     /// the unload request). See ops/pause.zig. (Tier 3 unload-while-paused.)
@@ -960,7 +960,7 @@ pub const Diffuser = struct {
     }
 
     /// Why the last model load failed, or null if the last one succeeded (or none
-    /// has been tried). Cleared by the next successful load — a stale error would
+    /// has been tried). Cleared by the next successful load, a stale error would
     /// keep the studio warning about a model the user has since replaced.
     pub fn loadError(self: *const Diffuser) ?anyerror {
         const code = self.load_error.load(.acquire);
@@ -1006,7 +1006,7 @@ pub const Diffuser = struct {
     pub fn vramBreakdown(self: *Diffuser) VramBreakdown {
         const b: VramBreakdown = if (self.session.load(.acquire)) |s| s.vramBreakdown() else .{};
         // Same high-water as `vramBytes`, because THIS is the accessor the status
-        // bar polls every 500 ms — and that poll is the only thing sampling us
+        // bar polls every 500 ms, and that poll is the only thing sampling us
         // mid-generation, i.e. the only thing that ever sees the peak. Recording it
         // only in `vramBytes` left the figure at its pre-load 0.
         self.notePeak(b.total());
@@ -1019,7 +1019,7 @@ pub const Diffuser = struct {
         if (v > self.peak_resident.load(.monotonic)) self.peak_resident.store(v, .monotonic);
     }
 
-    /// Free resident diffusion weights to fit `budget` bytes — the GUI VRAM
+    /// Free resident diffusion weights to fit `budget` bytes, the GUI VRAM
     /// limit lowered while the queue is idle (soft residency: never mid-image,
     /// which would force per-step streaming). No-op while generating; the next
     /// image re-uploads what fits its budget.
@@ -1042,7 +1042,7 @@ pub const Diffuser = struct {
     /// returns bytes freed.
     ///
     /// Binds this engine's device context, so it may only run when no worker owns
-    /// it — `res_mu` + the `busy` check together give that guarantee against both
+    /// it, `res_mu` + the `busy` check together give that guarantee against both
     /// the UI thread's `pump` and the LLM worker's reclaim (see `res_mu`).
     pub fn giveUpToBudget(self: *Diffuser, budget: u64) u64 {
         if (!self.res_mu.tryLock()) return 0;
@@ -1061,8 +1061,8 @@ pub const Diffuser = struct {
     // Makes the image model a first-class arbiter participant alongside the LLM,
     // so `vram.Arbiter.plan` can drive BOTH from one coherent plan. Before this,
     // diffusion was only a budget CONSUMER (it read `diffusionBudget()` at spawn)
-    // and the reverse direction — an idle image model giving VRAM back to a
-    // growing LLM — was left to a separate app-level call that always cancelled
+    // and the reverse direction, an idle image model giving VRAM back to a
+    // growing LLM, was left to a separate app-level call that always cancelled
     // to a no-op. See the `vram.Arbiter` doc comment.
 
     fn vpUsage(ctx: *anyopaque) u64 {
@@ -1072,7 +1072,7 @@ pub const Diffuser = struct {
     ///
     /// MEASURED once an image has run: the high-water of `vramBytes()`. The
     /// checkpoint-file-size estimate below is only a bootstrap for the very first
-    /// image, and it is a poor one — it counts bytes that never become resident
+    /// image, and it is a poor one, it counts bytes that never become resident
     /// (the pipeline drops the text encoder when the DiT working set won't fit
     /// alongside it). Measured on krea2: files 18961 MiB vs 13052 MiB actually
     /// resident, and since the arbiter turns this number into the LLM's eviction
@@ -1089,7 +1089,7 @@ pub const Diffuser = struct {
         return if (peak != 0) peak else self.estimateResidentBytes();
     }
     /// Nothing is un-evictable while idle: resident weights are pure cache that
-    /// the next image re-uploads. Mid-image the whole working set is the floor —
+    /// the next image re-uploads. Mid-image the whole working set is the floor,
     /// evicting under a running sampler would force per-step streaming, which soft
     /// residency exists to avoid.
     fn vpFloor(ctx: *anyopaque) u64 {
@@ -1124,21 +1124,21 @@ pub const Diffuser = struct {
     /// no image has run on yet. Superseded by `peak_resident` the moment one has.
     ///
     /// Deliberately EXCLUDES the text encoder. It is the largest checkpoint on
-    /// disk here (4999 MiB) but is transient by construction — it encodes the
+    /// disk here (4999 MiB) but is transient by construction, it encodes the
     /// prompt once and its weights are then droppable, so at the actual peak it
     /// holds 52 MiB. Counting it made the estimate 18961 MiB against a measured
     /// 13055, and since the arbiter turns this into the LLM's eviction target
     /// those 5.9 GiB of phantom demand evicted every layer on the first image.
-    /// DiT + VAE gives 13961 — within ~900 MiB of the truth.
+    /// DiT + VAE gives 13961, within ~900 MiB of the truth.
     ///
     /// Erring LOW is the right direction: an under-estimate means the LLM keeps
     /// more and the pipeline reclaims reactively (`vcReclaim` / the OOM ladder),
     /// whereas an over-estimate is an eviction that was never needed.
-    /// ⚠️ A BUNDLED checkpoint therefore over-counts by its text encoder, which the
+    /// A BUNDLED checkpoint therefore over-counts by its text encoder, which the
     /// separate-file case deliberately excludes: the file size is all we have, and
     /// it cannot be broken down per component without parsing the header. Erring
     /// high here is the wrong direction (it over-evicts the LLM on the first
-    /// image), but it self-corrects after one generation — `peak_resident`
+    /// image), but it self-corrects after one generation, `peak_resident`
     /// supersedes this the moment a real measurement exists.
     pub fn estimateResidentBytes(self: *Diffuser) u64 {
         var total: u64 = 0;
@@ -1167,7 +1167,7 @@ pub const Diffuser = struct {
     }
 
     /// Update the default generation params (from settings). Only touched when
-    /// no image is in flight — the worker copies `opts` at spawn.
+    /// no image is in flight, the worker copies `opts` at spawn.
     pub fn setDefaults(self: *Diffuser, steps: usize, width: usize, height: usize) void {
         if (self.busy.load(.acquire)) return;
         self.opts.steps = steps;
@@ -1175,8 +1175,8 @@ pub const Diffuser = struct {
         self.opts.height = height;
     }
 
-    /// Update the sampler (from settings). Load-neutral — the sampler is per-render
-    /// state, not part of the session — so this needs no rebuild and applies to the
+    /// Update the sampler (from settings). Load-neutral, the sampler is per-render
+    /// state, not part of the session, so this needs no rebuild and applies to the
     /// next image. Gated on idle like `setDefaults`: the worker reads `opts` at
     /// dispatch, and switching mid-image would not take effect anyway.
     pub fn setSampler(self: *Diffuser, kind: tp.sampler.Kind) void {
@@ -1230,7 +1230,7 @@ pub const Diffuser = struct {
     }
 
     /// Set the TAESD preview resolution (latent-grid divisor; see
-    /// pipeline.Options.preview_ds). Applied live — mid-image on the next step.
+    /// pipeline.Options.preview_ds). Applied live, mid-image on the next step.
     pub fn setPreviewSize(self: *Diffuser, preview_ds: usize) void {
         self.opts.preview_ds = preview_ds;
         self.live_preview.ds.store(@intCast(preview_ds), .release);
@@ -1246,7 +1246,7 @@ pub const Diffuser = struct {
 
     /// Update the current model config (new paths/backend/decode) for FUTURE
     /// enqueues. Takes effect immediately as the source `enqueue` snapshots onto
-    /// each image — already-queued images keep the config they were stamped with,
+    /// each image, already-queued images keep the config they were stamped with,
     /// and the worker reloads the resident pipeline at the seam where consecutive
     /// images disagree. When the queue is fully idle, the now-stale resident
     /// pipeline is dropped here so a switch returns its VRAM promptly.
@@ -1269,7 +1269,7 @@ pub const Diffuser = struct {
         };
         owned.applyTo(&self.opts);
         // The config just changed, so any previous load failure describes a model
-        // set that no longer exists — clear it rather than warn about the old one.
+        // set that no longer exists, clear it rather than warn about the old one.
         self.load_error.store(0, .release);
         self.taew_owned = if (taew) |t| (a.dupe(u8, t) catch null) else null;
         self.refreshPreview(); // taew_path follows the (possibly new) taew_owned
@@ -1278,7 +1278,7 @@ pub const Diffuser = struct {
 
     /// Free the resident pipeline when it's loaded for a config the current
     /// defaults no longer match AND the queue is fully idle (no worker, nothing
-    /// pending) — so a model/backend switch made while idle returns the old VRAM
+    /// pending), so a model/backend switch made while idle returns the old VRAM
     /// at once. A mid-queue switch is NOT dropped here: queued images still carry
     /// (and need) their own snapshot, so the worker reloads lazily at the seam.
     fn dropStaleSession(self: *Diffuser) void {
@@ -1299,17 +1299,17 @@ pub const Diffuser = struct {
             t.join();
             self.thread = null;
         }
-        // While paused, don't START (or load for) new work — leave it queued
+        // While paused, don't START (or load for) new work, leave it queued
         // until resumed. A generation already in flight is parked at the step
-        // gate (Tier 1) and never reaches here (busy → returned above); this
+        // gate (Tier 1) and never reaches here (busy -> returned above); this
         // gates the NEXT image so a paused engine neither loads nor begins one.
         if (self.pause.isPaused(self.io)) return;
 
         const gi = self.nextPending() orelse {
-            // Queue drained. Keep the model resident so a later gen reuses it —
+            // Queue drained. Keep the model resident so a later gen reuses it,
             // unless the config was switched mid-queue and it's now stale, in
             // which case drop it here to return its VRAM. Let the coordinator
-            // undo any eviction — once, on the drain EDGE (see `vram_entered`).
+            // undo any eviction, once, on the drain EDGE (see `vram_entered`).
             self.dropStaleSession();
             if (self.vram_entered) {
                 self.vram_entered = false;
@@ -1319,8 +1319,8 @@ pub const Diffuser = struct {
         };
         // Seam reconcile: if the resident pipeline is loaded for a different config
         // than THIS image needs (a backend/model switch made after it was enqueued),
-        // free it now — on the UI thread, where no status-bar reader can race the
-        // free — so the worker reloads for gi's snapshot. Images without a snapshot
+        // free it now, on the UI thread, where no status-bar reader can race the
+        // free, so the worker reloads for gi's snapshot. Images without a snapshot
         // (unqueued attachments) leave the resident session as-is. (`freeSession`
         // takes `res_mu` itself, so a concurrent foreign yield can't interleave.)
         if (gi.model) |m| {
@@ -1332,13 +1332,13 @@ pub const Diffuser = struct {
         // auto-budgets from live free VRAM). Deliberately OUTSIDE `res_mu`: this
         // calls out to the app's VRAM coordinator, which rebalances the arbiter and
         // so re-enters this engine's own participant hooks. (Nothing is lost by a
-        // yield landing in this window — we hold no session state across it, and
+        // yield landing in this window, we hold no session state across it, and
         // the target the arbiter has for us here is a GROW, which is a no-op.)
         self.vram_entered = true;
         self.vram.enter(self.vram.ctx);
-        // Preview buffer, sized to the final image resolution — the upper bound
+        // Preview buffer, sized to the final image resolution, the upper bound
         // on any preview: a full-latent TAESD preview decodes at the image res
-        // (lat·spatial_scale), and latent2rgb is smaller (latent res). Sizing it
+        // (lat*spatial_scale), and latent2rgb is smaller (latent res). Sizing it
         // to a fixed 512² silently dropped the larger TAESD sizes (½, full). The
         // pointer stays put for the whole generation; dims published via atomics.
         //
@@ -1361,7 +1361,7 @@ pub const Diffuser = struct {
         // Hand this engine's device context to the worker under `res_mu`, so the
         // `busy` flag and the spawn are one atomic step. Without it a foreign yield
         // that had already passed its `busy == false` check would evict weights out
-        // from under a sampler that has just started (the flag alone is a TOCTOU —
+        // from under a sampler that has just started (the flag alone is a TOCTOU,
         // it is set on this thread, not the evicting one).
         self.res_mu.lockUncancelable(self.io);
         defer self.res_mu.unlock(self.io);
@@ -1442,7 +1442,7 @@ pub const Diffuser = struct {
 
     fn worker(self: *Diffuser, gi: *GenImage) void {
         // Start from the engine's live config (preview method / defaults / output)
-        // then override the model-defining fields from THIS image's snapshot — so a
+        // then override the model-defining fields from THIS image's snapshot, so a
         // backend/model switch made after `gi` was enqueued doesn't retro-apply to
         // it. Images that never went through the queue (no snapshot) use live opts.
         var opts = self.opts;
@@ -1481,7 +1481,7 @@ pub const Diffuser = struct {
         // Load the diffusion model when none is resident and keep it across the
         // queue. A mid-queue backend/model switch is reconciled by `pump` on the UI
         // thread BEFORE this worker spawns (it frees the stale session so `session`
-        // is null here) — freeing on the worker thread would race the status-bar
+        // is null here), freeing on the worker thread would race the status-bar
         // readers, which sample `session` without gating on `busy`.
         var sess = self.session.load(.acquire);
         if (sess == null) {
@@ -1537,7 +1537,7 @@ pub const Diffuser = struct {
         }
 
         // Persist the finished image (packed RGB) with a1111 metadata before the
-        // RGBA conversion. Best-effort — a save failure never fails the gen.
+        // RGBA conversion. Best-effort, a save failure never fails the gen.
         self.saveImage(gi, &opts, img.rgb, img.width, img.height);
 
         // The pipeline returns packed RGB; dvui wants RGBA. Convert once.
@@ -1644,7 +1644,7 @@ test "loadError/loadedFamily round-trip through their atomic encodings" {
     d.load_error.store(@intFromError(error.UnsupportedBackend), .release);
     try std.testing.expectEqual(@as(?anyerror, error.UnsupportedBackend), d.loadError());
 
-    // 0 is reserved for "nothing loaded", so the tag is stored offset by one —
+    // 0 is reserved for "nothing loaded", so the tag is stored offset by one,
     // without that, family 0 (krea2) would read back as "no model". Every family
     // must survive the round trip, including any added later.
     inline for (@typeInfo(pipeline.Family).@"enum".fields) |f| {
@@ -1655,7 +1655,7 @@ test "loadError/loadedFamily round-trip through their atomic encodings" {
 }
 
 // The failure reason has to survive the trip from the worker thread to the tile
-// that reports it, and `fail` has to leave the two atomics consistent — a UI
+// that reports it, and `fail` has to leave the two atomics consistent, a UI
 // thread that sees `.failed` must never read a zero reason beside it.
 test "a failure records its cause, and only a failure does" {
     const nop = struct {
@@ -1668,7 +1668,7 @@ test "a failure records its cause, and only a failure does" {
     try std.testing.expectEqual(@as(?anyerror, error.DeviceOutOfMemory), gi.failure());
 }
 
-// ⚠️ VRAM exhaustion arrives under four different names (the CUDA libraries
+// VRAM exhaustion arrives under four different names (the CUDA libraries
 // report an out-of-workspace as their own error, and the hand-PTX path surfaces
 // a post-OOM fault as `CudaError`), so the one failure a user can actually act
 // on must not fall through to a bare error name. Anything unrecognized still
@@ -1750,7 +1750,7 @@ test "buildA1111Params formats prompt, settings, and optional negative" {
         with_neg,
     );
 
-    // No negative → the "Negative prompt:" line is omitted entirely.
+    // No negative -> the "Negative prompt:" line is omitted entirely.
     const no_neg = try buildA1111Params(gpa, "a dog", "", 8, 1.0, 7, 512, 512, "m", .krea2, .euler, null, .comfy, .original, .comfy, .{});
     defer gpa.free(no_neg);
     try std.testing.expectEqualStrings(
@@ -1761,9 +1761,9 @@ test "buildA1111Params formats prompt, settings, and optional negative" {
 }
 
 test "buildA1111Params records the sampler actually used" {
-    // The field used to be the literal "Euler". A saved PNG is the record a user (or
-    // ComfyUI's metadata importer) re-renders from, so a hardcoded name is a wrong
-    // answer that nothing else would catch — and the a1111 spelling is not the CLI's.
+    // A saved PNG is the record a user (or ComfyUI's metadata importer) re-renders
+    // from, so a hardcoded sampler name is a wrong answer nothing else would catch,
+    // and the a1111 spelling is not the CLI's.
     const gpa = std.testing.allocator;
     for ([_]struct { k: tp.sampler.Kind, want: []const u8 }{
         .{ .k = .euler, .want = "Sampler: Euler," },
@@ -1781,7 +1781,7 @@ test "buildA1111Params records the sampling compat, and overrides only when over
     const gpa = std.testing.allocator;
 
     // An ordinary ComfyUI render's block is byte-for-byte what it was before compat
-    // existed — no new fields, so nothing that parses these PNGs has to change.
+    // existed, no new fields, so nothing that parses these PNGs has to change.
     const plain = try buildA1111Params(gpa, "p", "", 20, 7.5, 1, 512, 512, "m", .sdxl, .euler, null, .comfy, .original, .comfy, .of(.comfy));
     defer gpa.free(plain);
     try std.testing.expect(std.mem.indexOf(u8, plain, "Compat") == null);
@@ -1794,7 +1794,7 @@ test "buildA1111Params records the sampling compat, and overrides only when over
     try std.testing.expect(std.mem.indexOf(u8, a, "Compat: A1111") != null);
     try std.testing.expect(std.mem.indexOf(u8, a, "RNG") == null);
 
-    // ⚠️ An override has to be recorded or the block does not describe the render: with
+    // An override has to be recorded or the block does not describe the render: with
     // `RNG: CPU` this is a different starting latent from the line above, at the same
     // seed. Same reasoning that stopped `Sampler` being hardcoded.
     var cc: pipeline.CompatConfig = .of(.a1111);
@@ -1836,7 +1836,7 @@ test "buildA1111Params records the prompt dialect, and the emphasis only when it
 test "buildA1111Params names the family's own schedule, and omits it when unknown" {
     const gpa = std.testing.allocator;
 
-    // The SD family samples the discrete beta ladder linearly — A1111's "Normal",
+    // The SD family samples the discrete beta ladder linearly, A1111's "Normal",
     // not krea2's flow-matching "Simple". A reader re-renders from this field.
     for ([_]pipeline.Family{ .sd15, .sdxl }) |f| {
         const s = try buildA1111Params(gpa, "p", "", 20, 7.5, 1, 512, 512, "m", f, .euler, null, .comfy, .original, .comfy, .{});
@@ -1847,7 +1847,7 @@ test "buildA1111Params names the family's own schedule, and omits it when unknow
     defer gpa.free(k);
     try std.testing.expect(std.mem.indexOf(u8, k, "Schedule type: Simple,") != null);
 
-    // ⚠️ An EXPLICIT scheduler wins over the family default, and this is what the
+    // An EXPLICIT scheduler wins over the family default, and this is what the
     // field is for: with schedulers selectable, deriving it from the architecture
     // stamps a name the image was not rendered with.
     const karras = try buildA1111Params(gpa, "p", "", 20, 7.5, 1, 512, 512, "m", .sd15, .euler, .karras, .comfy, .original, .comfy, .{});

@@ -1,5 +1,5 @@
 //! SigLIP2 encoders on the Vulkan backend. Thin device forwards that reuse the
-//! CPU model's (f32, mmap-stable) weights directly — Vulkan's `opMatmul` takes
+//! CPU model's (f32, mmap-stable) weights directly, Vulkan's `opMatmul` takes
 //! host weight bytes and caches a device buffer keyed on the pointer, so no
 //! dequant is needed (unlike gemma_vit_gpu, whose weights were f16). Every op
 //! (LayerNorm, non-causal `attn_full`, tanh-gelu, residual add) is an existing
@@ -95,7 +95,7 @@ pub const TextModelGpu = struct {
         try ctx.opElt(.layernorm, x_d, x_d, try nbuf(ctx, cpu.ln_final_w), try nbuf(ctx, cpu.ln_final_b), .{ .u0 = @intCast(n), .u1 = @intCast(w), .f0 = cfg.ln_eps }, n, 1, 1);
         try ctx.endBatch();
 
-        // Host: last-token pool → text_projection → L2 normalize.
+        // Host: last-token pool -> text_projection -> L2 normalize.
         try ctx.tensorDownload(x_d, std.mem.sliceAsBytes(x_host));
         const pooled = x_host[(n - 1) * w ..][0..w];
         try ops.matmul.matmul(io, gpa, out, pooled, 1, cpu.text_proj, cpu.text_proj_bias);
@@ -204,7 +204,7 @@ pub const TextModelGpu = struct {
 
 /// SigLIP2 visual tower on Vulkan. The ViT body (patch-embed + 12 blocks +
 /// trunk.norm) runs device-side; the small MAP attention-pool head runs on the
-/// host (`VisualModel.mapHead`) — it's a cross-attention (1 latent × 196
+/// host (`VisualModel.mapHead`), it's a cross-attention (1 latent × 196
 /// tokens) the self-attention `attn_full` kernel doesn't cover, and it's cheap.
 pub const VisualModelGpu = struct {
     cpu: *const siglip.VisualModel,

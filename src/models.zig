@@ -33,11 +33,11 @@ pub const qwen35_gpu = @import("models/qwen35_gpu.zig");
 pub const qwen3_cuda = @import("models/qwen3_cuda.zig");
 pub const eagle3 = @import("models/eagle3.zig");
 pub const krea2_text = @import("models/krea2_text.zig");
-/// SD-family (SD1.5 / SDXL) conditioner — CLIP-L and CLIP-G text towers.
+/// SD-family (SD1.5 / SDXL) conditioner, CLIP-L and CLIP-G text towers.
 pub const clip_text = @import("models/clip_text.zig");
 pub const clip_text_gpu = @import("models/clip_text_gpu.zig");
 pub const clip_text_cuda = @import("models/clip_text_cuda.zig");
-/// SD-family denoiser — the LDM UNet.
+/// SD-family denoiser, the LDM UNet.
 pub const sd_unet = @import("models/sd_unet.zig");
 pub const sd_unet_gpu = @import("models/sd_unet_gpu.zig");
 pub const sd_unet_cuda = @import("models/sd_unet_cuda.zig");
@@ -59,12 +59,12 @@ pub const quant_weight = @import("models/quant_weight.zig");
 pub const dit = @import("models/dit.zig");
 pub const dit_gpu = @import("models/dit_gpu.zig");
 pub const dit_cuda = @import("models/dit_cuda.zig");
-/// Z-Image (`NextDiT`) denoiser — the architecture "zit" checkpoints use.
+/// Z-Image (`NextDiT`) denoiser, the architecture "zit" checkpoints use.
 pub const zimage = @import("models/zimage.zig");
 pub const zimage_text = @import("models/zimage_text.zig");
 pub const zimage_gpu = @import("models/zimage_gpu.zig");
 pub const zimage_cuda = @import("models/zimage_cuda.zig");
-/// Anima — a Cosmos-Predict2 `MiniTrainDIT` plus an `llm_adapter` that fuses a T5
+/// Anima, a Cosmos-Predict2 `MiniTrainDIT` plus an `llm_adapter` that fuses a T5
 /// tokenization of the prompt with a Qwen3-0.6B encode of it.
 pub const anima = @import("models/anima.zig");
 pub const anima_gpu = @import("models/anima_gpu.zig");

@@ -1,4 +1,4 @@
-//! The SD-family VAE decoder (`AutoencoderKL`, LDM `first_stage_model`) — latent to
+//! The SD-family VAE decoder (`AutoencoderKL`, LDM `first_stage_model`), latent to
 //! RGB, mirroring `diffusers.AutoencoderKL.decode`.
 //!
 //! Structurally simpler than the UNet: no conditioning, no timestep, no skip
@@ -8,15 +8,15 @@
 //!
 //! Three things differ from the UNet and are easy to carry over wrongly:
 //!
-//! 1. **GroupNorm epsilon is 1e-6 here, 1e-5 in the UNet.** LDM's `Normalize` uses
+//! 1. GroupNorm epsilon is 1e-6 here, 1e-5 in the UNet. LDM's `Normalize` uses
 //!    1e-6 for the autoencoder. The difference is invisible on well-conditioned
 //!    activations and shows up as faint banding in flat regions.
-//! 2. **`decoder.up.N` is indexed from the OUTERMOST level.** The forward runs
-//!    `up.3, up.2, up.1, up.0` — 512, 512, 256, 128 channels — and `up.0` has no
+//! 2. `decoder.up.N` is indexed from the OUTERMOST level. The forward runs
+//!    `up.3, up.2, up.1, up.0`, 512, 512, 256, 128 channels, and `up.0` has no
 //!    upsample. Reading the list forwards produces a decoder that runs but inverts
 //!    the channel ramp.
-//! 3. **The middle attention is single-head over pixels, with 1x1 convolutions for
-//!    q/k/v** (not linear layers over a flattened sequence, though it is the same
+//! 3. The middle attention is single-head over pixels, with 1x1 convolutions for
+//!    q/k/v (not linear layers over a flattened sequence, though it is the same
 //!    arithmetic). It carries biases, unlike the UNet's cross-attention q/k/v.
 //!
 //! The caller owns the latent scaling: `decode` expects `z` already divided by the
@@ -35,26 +35,26 @@ const Conv2d = ops.conv.Conv2d;
 
 /// Which spelling a checkpoint uses for the *same* `AutoencoderKL` graph.
 ///
-/// ⚠️ These are two naming schemes over identical arithmetic, and the up-block
-/// index runs in **opposite directions**: LDM numbers levels from the outermost
-/// (execution runs `up.3 … up.0`) while diffusers stores them already reversed
-/// (execution runs `up_blocks.0 … up_blocks.3`). Reading one as the other loads a
+/// These are two naming schemes over identical arithmetic, and the up-block
+/// index runs in opposite directions: LDM numbers levels from the outermost
+/// (execution runs `up.3 ... up.0`) while diffusers stores them already reversed
+/// (execution runs `up_blocks.0 ... up_blocks.3`). Reading one as the other loads a
 /// decoder that runs and inverts the channel ramp.
 ///
-/// ⚠️ **Detected from the store, never configured** (`Decoder.detectNaming`), because
+/// Detected from the store, never configured (`Decoder.detectNaming`), because
 /// it is a property of the FILE and not of the architecture: the very same 16-channel
-/// Z-Image VAE ships both ways — the official `ae.safetensors` the ComfyUI template
-/// points at is LDM-named, while `z-image-turbo.vae.safetensors` is diffusers-named.
-/// A config field here would be a flag that can disagree with the bytes.
+/// Z-Image VAE ships both ways, LDM-named in the distribution the ComfyUI template
+/// points at and diffusers-named in another. A config field here would be a flag that
+/// can disagree with the bytes.
 pub const Naming = enum {
     /// LDM / `first_stage_model` (SD1.5, SDXL): `decoder.mid.block_1`,
     /// `decoder.up.3.block.0`, `nin_shortcut`, `decoder.norm_out`, and a middle
-    /// attention stored as four **1x1 convolutions** (`q`/`k`/`v`/`proj_out`).
+    /// attention stored as four 1x1 convolutions (`q`/`k`/`v`/`proj_out`).
     ldm,
     /// diffusers `AutoencoderKL` (the Flux / Z-Image VAE exports):
     /// `decoder.mid_block.resnets.0`, `decoder.up_blocks.0.resnets.0`,
     /// `conv_shortcut`, `decoder.conv_norm_out`, and a middle attention stored as
-    /// **`nn.Linear`** (`to_q`/`to_k`/`to_v`/`to_out.0`) with `group_norm` for its
+    /// `nn.Linear` (`to_q`/`to_k`/`to_v`/`to_out.0`) with `group_norm` for its
     /// norm. A `[c, c]` Linear and a `[c, c, 1, 1]` convolution hold the same bytes
     /// in the same order, so only the shape check has to accommodate both.
     diffusers,
@@ -67,7 +67,7 @@ pub const Config = struct {
     z_channels: usize,
     /// Base width; `block_out_channels` below are multiples of it.
     base_channels: usize,
-    /// Per-level widths, **outermost first** (`{128, 256, 512, 512}` for SD).
+    /// Per-level widths, outermost first (`{128, 256, 512, 512}` for SD).
     block_out_channels: []const usize,
     /// Resnets per level on the decode path (LDM: `num_res_blocks + 1` = 3).
     layers_per_block: usize,
@@ -79,16 +79,16 @@ pub const Config = struct {
     /// (`latent_formats.Flux.process_out` is `latent / scale + shift`). Zero for
     /// SD, whose latent format has no shift term.
     shift_factor: f32 = 0,
-    /// Store the decoder's running activations as **f16** rather than f32, halving
-    /// the two widest buffers — at 1056x1584 those hold 256 channels at full image
+    /// Store the decoder's running activations as f16 rather than f32, halving
+    /// the two widest buffers, at 1056x1584 those hold 256 channels at full image
     /// resolution (428M elements each), so this is most of a whole-image decode's
     /// VRAM. The arithmetic is unchanged: every GEMM already ran f16 operands with
     /// an f32 accumulator, and the norms still reduce in f32.
     ///
-    /// ⚠️ **RANGE decides this, not precision, and the answer differs per
-    /// architecture.** These buffers carry the residual stream, whose measured peak
-    /// is ~489 for the Flux/Z-Image VAE and ~7e3 for SD1.5 — both far inside f16's
-    /// 65504 — but **4.2e5 for SDXL's**, which is why `sd_vae_cuda.residual_act_div`
+    /// RANGE decides this, not precision, and the answer differs per
+    /// architecture. These buffers carry the residual stream, whose measured peak
+    /// is ~489 for the Flux/Z-Image VAE and ~7e3 for SD1.5, both far inside f16's
+    /// 65504, but 4.2e5 for SDXL's, which is why `sd_vae_cuda.residual_act_div`
     /// exists at all. An f16 buffer cannot hold a value the divisor was invented to
     /// sneak through a cast, so the two are alternatives and this stays off for
     /// SDXL. It is a per-config constant rather than a probe because a decode
@@ -115,8 +115,8 @@ pub const sd15: Config = .{
     .act_f16 = true,
 };
 
-/// SDXL's VAE is **architecturally identical** to SD1.5's — same widths, same depth, same
-/// epsilon — and differs only in weights and in the latent scale it was trained against.
+/// SDXL's VAE is architecturally identical to SD1.5's, same widths, same depth, same
+/// epsilon, and differs only in weights and in the latent scale it was trained against.
 /// That one number is not cosmetic: decoding an SDXL latent with 0.18215 hands the decoder
 /// values 1.4x too small and produces a washed, low-contrast image with no error anywhere.
 pub const sdxl: Config = .{
@@ -148,7 +148,7 @@ pub const flux: Config = .{
 pub const latent_channels = 4;
 pub const spatial_scale = 8;
 
-/// Linear latent→RGB approximation for the live sampling preview, from ComfyUI's
+/// Linear latent->RGB approximation for the live sampling preview, from ComfyUI's
 /// `latent_formats.SD15` / `.SDXL`. A per-pixel 4x3 matmul on the *scaled* latent
 /// (the same space the sampler works in, i.e. what `decode` divides by
 /// `scaling_factor`), so it needs no VAE and runs every step.
@@ -202,7 +202,7 @@ pub fn latentPreviewInto(
 
 pub const GroupNormW = struct { w: []const f32, b: []const f32 };
 
-/// LDM's autoencoder `ResnetBlock` — no timestep embedding, unlike the UNet's.
+/// LDM's autoencoder `ResnetBlock`, no timestep embedding, unlike the UNet's.
 pub const Resnet = struct {
     norm1: GroupNormW,
     conv1: Conv2d,
@@ -231,24 +231,24 @@ pub const Level = struct {
 
 /// The two activation widths a decode needs, in f32 elements.
 ///
-/// ⚠️ **They are NOT the same number, and treating them as one over-allocated a
-/// third of every decode.** `x` (the running activation) and `t` (a norm's output)
-/// both reach the widest tensor in the ladder — for a 16-channel VAE at 1056x1584
-/// that is 256 channels at FULL image resolution, 428M floats — but `u` only ever
+/// They are NOT the same number, and treating them as one over-allocated a
+/// third of every decode. `x` (the running activation) and `t` (a norm's output)
+/// both reach the widest tensor in the ladder, for a 16-channel VAE at 1056x1584
+/// that is 256 channels at FULL image resolution, 428M floats, but `u` only ever
 /// receives a convolution's OUTPUT, so it peaks one level narrower (128 channels at
-/// full resolution, 214M). Sizing all three at `wide` cost **856 MB** per decode,
+/// full resolution, 214M). Sizing all three at `wide` cost 856 MB per decode,
 /// and made `estimatePeakBytes` demand room the decode never used.
 /// Query rows per mid-block attention scores band, for a backend that materializes
 /// the plane (Vulkan; both CUDA arms stream instead).
 ///
-/// ⚠️ **Shared by the kernel caller AND `estimatePeakBytes` on purpose.** The whole
-/// `seq²` plane is 2.73 GB at a 1056x1584 render — larger than the activations it
-/// serves — so the estimate is only meaningful if it uses the same band the decode
+/// Shared by the kernel caller AND `estimatePeakBytes` on purpose. The whole
+/// `seq²` plane is 2.73 GB at a 1056x1584 render, larger than the activations it
+/// serves, so the estimate is only meaningful if it uses the same band the decode
 /// will actually allocate. Two copies of this constant is exactly the drift that
 /// makes a peak estimate lie.
 ///
 /// A whole multiple of the 8-wide kernel tile, so a band's last tile is never
-/// partial — which is what lets `attn_out` skip its row clamp when banded.
+/// partial, which is what lets `attn_out` skip its row clamp when banded.
 pub fn scoresBand(n: usize) usize {
     const cap: usize = (256 << 20) / 4; // f32 entries we are willing to hold
     var qb = @max(@as(usize, 8), (cap / @max(n, 1)) & ~@as(usize, 7));
@@ -285,7 +285,7 @@ pub const Decoder = struct {
     cfg: Config,
     /// The spelling this checkpoint turned out to use. See `Naming`.
     naming: Naming,
-    /// ⚠️ Null for the Flux-lineage VAE, which has no `post_quant_conv` at all —
+    /// Null for the Flux-lineage VAE, which has no `post_quant_conv` at all,
     /// BFL dropped both `quant_conv` and `post_quant_conv`, so requiring it would
     /// fail the load of every Flux/Z-Image VAE in existence.
     post_quant: ?Conv2d,
@@ -293,19 +293,19 @@ pub const Decoder = struct {
     mid1: Resnet,
     mid_attn: AttnBlock,
     mid2: Resnet,
-    /// Innermost first, i.e. execution order (`up.3` … `up.0`).
+    /// Innermost first, i.e. execution order (`up.3` ... `up.0`).
     levels: []Level,
     norm_out: GroupNormW,
     conv_out: Conv2d,
 
     /// Which naming scheme this store uses, from a tensor only one of them has.
     ///
-    /// ⚠️ Probed on the **middle block**, deliberately: `decoder.conv_in` and
+    /// Probed on the middle block, deliberately: `decoder.conv_in` and
     /// `decoder.conv_out` are spelled identically in both schemes, so the obvious
     /// entry points cannot tell them apart. `decoder.mid_block.resnets.0` exists
     /// only in diffusers exports.
     ///
-    /// Defaulting to LDM on an unrecognized store is safe — the very next lookup is
+    /// Defaulting to LDM on an unrecognized store is safe, the very next lookup is
     /// `decoder.mid.block_1.norm1.weight`, which reports the missing tensor by name.
     pub fn detectNaming(store: WeightStore, prefix: []const u8) Naming {
         var buf: [200]u8 = undefined;
@@ -342,8 +342,8 @@ pub const Decoder = struct {
         else
             try l.resnet("decoder.mid_block.resnets.1", .{}, inner, inner);
 
-        // Execution order: innermost level first. ⚠️ LDM numbers that level
-        // `levels-1` and diffusers numbers it `0` — the same walk under two indices.
+        // Execution order: innermost level first. LDM numbers that level
+        // `levels-1` and diffusers numbers it `0`, the same walk under two indices.
         // `ch` tracks the width coming in, which changes at the first resnet of a
         // level whenever the level is narrower than the one before it.
         const levels = try alloc.alloc(Level, cfg.levels());
@@ -404,49 +404,46 @@ pub const Decoder = struct {
     /// f32 buffers (x / t / u) at the widest (positions x channels) product any
     /// level reaches, plus the latent-resolution attention scratch.
     ///
-    /// ⚠️ The width that matters is `max(level input, level output)`: the first
-    /// resnet of a level reads the PREVIOUS (wider) level's activation at the NEW
-    /// (doubled) resolution, so sizing off `block_out_channels` alone
-    /// under-estimates by 2x — the same trap that cost a wrong decode in
-    /// `sd_vae_gpu`.
+    /// The width that matters is `max(level input, level output)`: the first resnet of a
+    /// level reads the PREVIOUS (wider) level's activation at the NEW (doubled)
+    /// resolution, so sizing off `block_out_channels` alone under-estimates by 2x.
     /// `scores_resident` says whether the caller's mid-block attention materializes
-    /// the O(seq²) scores plane. ⚠️ It is a PARAMETER because the two GPU backends
+    /// the O(seq²) scores plane. It is a PARAMETER because the two GPU backends
     /// genuinely differ, and guessing either way costs something real: `sd_vae_gpu`
     /// materializes an f32 plane, while both CUDA arms stream (cuDNN's fused SDPA
     /// under `.libs`, `be.attn`'s online softmax otherwise) and allocate nothing.
-    /// At a 132x198 latent that term is **2.73 GB** — charging it on CUDA made the
-    /// ladder evict 2.4 GB of resident DiT weights before a decode that never needed
-    /// the room, and then re-stream them for the next image.
+    /// At a 132x198 latent that term is 2.73 GB, so charging it on CUDA makes the ladder
+    /// evict GBs of resident DiT weights before a decode that never needed the room, then
+    /// re-stream them for the next image.
     /// `act_f16` is the CALLER's storage format, not `cfg.act_f16`: only the CUDA
-    /// decoder implements it, and reporting the narrow figure to a backend that
-    /// still stores f32 would send the ladder into a whole-image decode that cannot
-    /// fit — an OOM discovered the expensive way, which is exactly what this
-    /// estimate exists to avoid.
+    /// decoder implements it, and reporting the narrow figure to a backend that still
+    /// stores f32 sends the ladder into a whole-image decode that cannot fit, which is
+    /// the OOM this estimate exists to prevent.
     pub fn estimatePeakBytes(self: *const Decoder, zh: usize, zw: usize, scores_resident: bool, act_f16: bool) u64 {
         const w = activationElems(self.cfg, zh, zw);
         const max_elems = w.wide;
         // q/k/v/out at latent resolution + the O(seq^2) mid-block scores plane
         // (f16 on the GPU paths, which query-tile it, so this term is generous).
         const seq: u64 = @as(u64, zh) * zw;
-        // ⚠️ 4 bytes for the scores plane, not 2: `sd_vae_gpu` materializes it in f32
-        // (the Flux VAE's logits overflow f16 — see that file's `attn`). Under-reporting
+        // 4 bytes for the scores plane, not 2: `sd_vae_gpu` materializes it in f32
+        // (the Flux VAE's logits overflow f16, see that file's `attn`). Under-reporting
         // it here is what would make the ladder attempt a whole-image decode that cannot
         // fit and discover it as an allocation failure.
-        // ⚠️ `scores_resident` is the Vulkan arm, which materializes ONE QUERY BAND
+        // `scores_resident` is the Vulkan arm, which materializes ONE QUERY BAND
         // of the plane (`sd_vae_gpu.scoresBand`), not the whole `seq²`. Both GPU
         // arms also keep a k-major f32 copy of Q and K.
         const band: u64 = scoresBand(@intCast(seq));
         const attn = 4 * seq * self.cfg.innermost() * 4 +
             if (scores_resident) 2 * seq * self.cfg.innermost() * 4 + band * seq * 4 else 0;
-        // ⚠️ The activation buffers narrow with `act_f16`; the attention scratch does
-        // not (q/k/v/out stay f32 — they are at latent resolution, and both GPU
+        // The activation buffers narrow with `act_f16`; the attention scratch does
+        // not (q/k/v/out stay f32, they are at latent resolution, and both GPU
         // attention paths take f32 buffers).
         const abytes: u64 = if (act_f16) 2 else 4;
         return (2 * max_elems + w.out) * abytes + attn;
     }
 
     /// `z` is channel-last `[lat_h*lat_w][z_channels]`, already divided by
-    /// `scaling_factor`. Returns channel-last `[8·lat_h * 8·lat_w][3]` in the
+    /// `scaling_factor`. Returns channel-last `[8*lat_h * 8*lat_w][3]` in the
     /// decoder's own output range (roughly [-1, 1]); the caller converts to bytes.
     pub fn decode(
         self: *const Decoder,
@@ -589,7 +586,7 @@ fn applyAttn(
 
     const attn = try gpa.alloc(f32, n * ch);
     defer gpa.free(attn);
-    // One head over all `ch` channels, scale 1/sqrt(ch) — LDM's `AttnBlock`.
+    // One head over all `ch` channels, scale 1/sqrt(ch), LDM's `AttnBlock`.
     try ops.attention.attention(io, gpa, attn, q, k, v, .{
         .seq_q = n,
         .seq_kv = n,
@@ -786,9 +783,9 @@ test "the SD1.5 VAE decoder matches diffusers.AutoencoderKL.decode" {
 }
 
 test "the VAE decoder still matches diffusers at the size images are rendered at" {
-    // ⚠️ The 8x8 case leaves every convolution in a single im2col band and the
+    // The 8x8 case leaves every convolution in a single im2col band and the
     // mid-block attention at 64 positions. A 512x512 decode bands up to 512 ways and
-    // attends over 4096 — a different code path in both ops, and the one every real
+    // attends over 4096, a different code path in both ops, and the one every real
     // render takes.
     const gpa = testing.allocator;
     const io = testing.io;
@@ -844,7 +841,7 @@ test "the SDXL VAE decoder matches ComfyUI's AutoencoderKL at both sizes" {
     // The decoder is architecturally identical to SD1.5's, so this is really a test of
     // two things the `sdxl` config asserts: that the same code path loads SDXL's weights
     // (same names, same widths), and that nothing about the wider UNet leaked into the
-    // VAE. The scale factor is NOT exercised here — `decode` takes an already-divided
+    // VAE. The scale factor is NOT exercised here, `decode` takes an already-divided
     // latent, exactly as the reference does, which is what makes this the decoder's test
     // and not the pipeline's.
     const gpa = testing.allocator;
@@ -903,7 +900,7 @@ test "the SDXL VAE decoder matches ComfyUI's AutoencoderKL at both sizes" {
 
 test "the two SD VAE configs differ only in the latent scale" {
     // The scale factor is the one number that is easy to carry over wrongly and produces
-    // no error — a washed, low-contrast image. Asserting the rest of the config is
+    // no error, a washed, low-contrast image. Asserting the rest of the config is
     // *identical* is what makes "only the scale differs" a checked claim rather than a
     // comment.
     try testing.expectEqual(sd15.z_channels, sdxl.z_channels);
@@ -926,8 +923,8 @@ test "the SD latent2rgb preview matches ComfyUI's factors, bias and clamp" {
     const plane = 2;
     var rgb: [plane * 3]u8 = undefined;
 
-    // SD1.5, unit weight on channel 0 at pixel 0 → factors[0]; a large value at
-    // pixel 1 → clamped white on R.
+    // SD1.5, unit weight on channel 0 at pixel 0 -> factors[0]; a large value at
+    // pixel 1 -> clamped white on R.
     var z15 = [_]f32{0} ** (latent_channels * plane);
     z15[0] = 1;
     z15[1] = 10;
@@ -935,7 +932,7 @@ test "the SD latent2rgb preview matches ComfyUI's factors, bias and clamp" {
     try testing.expectEqualSlices(u8, &.{ 172, 156, 168 }, rgb[0..3]);
     try testing.expectEqual(@as(u8, 255), rgb[3]);
 
-    // SDXL, an all-zero latent → the bias alone (SD1.5's would give a flat 127).
+    // SDXL, an all-zero latent -> the bias alone (SD1.5's would give a flat 127).
     const z_xl = [_]f32{0} ** (latent_channels * plane);
     latentPreviewInto(&rgb, &z_xl, 1, plane, &latent_rgb_factors_sdxl, latent_rgb_bias_sdxl);
     try testing.expectEqualSlices(u8, &.{ 141, 125, 127 }, rgb[0..3]);
@@ -949,13 +946,13 @@ const zimage_vae_ckpt = "/home/qt/genai/comfyui/models/vae/z-image-turbo.vae.saf
 test "the 16-channel Flux/Z-Image VAE decoder matches ComfyUI's AutoencoderKL" {
     // Same decoder graph as SD's, so what this actually exercises is the three
     // things the `flux` config changes, each of which fails differently:
-    //   - **diffusers naming**, whose up-block index runs the OPPOSITE way. Reading
+    //   - diffusers naming, whose up-block index runs the OPPOSITE way. Reading
     //     it as LDM would invert the channel ramp, which fails as a shape mismatch
-    //     at the first level rather than as a bad image — but only because the
+    //     at the first level rather than as a bad image, but only because the
     //     widths happen to differ; a symmetric ramp would decode silently wrong.
-    //   - **no `post_quant_conv`**, which under the old loader was a hard
+    //   - no `post_quant_conv`, which under the old loader was a hard
     //     MissingTensor on every Flux-lineage VAE in existence.
-    //   - **16 latent channels**, which changes only `conv_in`'s input width.
+    //   - 16 latent channels, which changes only `conv_in`'s input width.
     const gpa = testing.allocator;
     const io = testing.io;
     try test_gate.requireIntegration();
@@ -1005,7 +1002,7 @@ test "the 16-channel Flux/Z-Image VAE decoder matches ComfyUI's AutoencoderKL" {
         }
         const rel = @sqrt(l2_err / l2_ref);
         errdefer std.debug.print("flux vae decode at {d}px: rel L2 {d:.6}\n", .{ lat * 8, rel });
-        // Measured 2e-6 at 64px against an f32 reference — the decode is exact up to
+        // Measured 2e-6 at 64px against an f32 reference, the decode is exact up to
         // reduction order, so this bound is deliberately far tighter than the SD
         // cases above (whose references are stored f16).
         try testing.expect(rel < 1e-4);
@@ -1023,17 +1020,17 @@ test "the Flux VAE config differs from SD's only in the latent width and scaling
     try testing.expectEqual(@as(usize, 4), sd15.z_channels);
     try testing.expectEqual(@as(usize, 16), flux.z_channels);
     // SD's latent format has no shift term; Flux's does, and dropping it decodes a
-    // latent offset by 0.116 — a plausible image with a colour cast.
+    // latent offset by 0.116, a plausible image with a colour cast.
     try testing.expectEqual(@as(f32, 0), sd15.shift_factor);
     try testing.expect(flux.shift_factor != 0);
 }
 
 test "VAE naming is detected from the store, and the same VAE ships both ways" {
-    // ⚠️ The claim this exists to check is not "detection works" but that BOTH
-    // spellings are real: the official `ae.safetensors` the ComfyUI Z-Image template
-    // points at is LDM-named while `z-image-turbo.vae.safetensors` is
-    // diffusers-named, and they are the same 244-tensor 16-channel decoder. A config
-    // field for the naming would be right for one of them and wrong for the other.
+    // The claim this exists to check is not "detection works" but that BOTH spellings
+    // are real: the Z-Image VAE the ComfyUI template points at is LDM-named while
+    // another distribution of the same 244-tensor 16-channel decoder is diffusers-named.
+    // A config field for the naming would be right for one of them and wrong for the
+    // other.
     const gpa = testing.allocator;
     const io = testing.io;
     try test_gate.requireIntegration();

@@ -57,9 +57,9 @@ pub const Context = struct {
     stream: cu.CUstream = null,
     xfer_stream: cu.CUstream = null, // async weight uploads (overlaps compute)
     // Pinned staging ring: the checkpoint mmap can't be page-locked directly, so
-    // weight uploads memcpy mmap→pinned slot→async DMA. Round-robin slots each
+    // weight uploads memcpy mmap->pinned slot->async DMA. Round-robin slots each
     // with a reuse event (slot free once its DMA signals).
-    /// Sources for weight bytes that bypass the mmap — see `WeightReader`. One
+    /// Sources for weight bytes that bypass the mmap, see `WeightReader`. One
     /// slot per open checkpoint (a diffusion session has DiT + encoder + VAE);
     /// each reader answers only for its own file, so they are simply tried in turn.
     weight_readers: [4]?WeightReader = @splat(null),
@@ -93,7 +93,7 @@ pub const Context = struct {
     /// Prefetch-thread accounting, split so a slow upload can be blamed on the
     /// right half: `stage_read_ns` is the host fill of the pinned slot (pread or
     /// memcpy from the mapping), `stage_wait_ns` the block waiting for a slot's
-    /// previous DMA to drain — i.e. the PCIe side pushing back.
+    /// previous DMA to drain, i.e. the PCIe side pushing back.
     stage_read_ns: u64 = 0,
     stage_wait_ns: u64 = 0,
     shared_optin_max: c_int = 0, // bytes of opt-in dynamic shared per block
@@ -174,7 +174,7 @@ pub const Context = struct {
     const wr_chunk_size: usize = 32 << 20;
 
     /// Synchronous upload that sources the bytes through a registered
-    /// `WeightReader` when one owns them — read into a pinned chunk, DMA, repeat —
+    /// `WeightReader` when one owns them, read into a pinned chunk, DMA, repeat,
     /// instead of letting `cuMemcpyHtoD` fault them out of the checkpoint mapping.
     ///
     /// This is the path the LLM takes (it has no prefetch thread, so it never
@@ -197,7 +197,7 @@ pub const Context = struct {
         while (off < data.len) {
             const n = @min(wr_chunk_size, data.len - off);
             // A reader that declines mid-weight (not its file) means the whole
-            // weight is not ours — finish it with the plain copy rather than
+            // weight is not ours, finish it with the plain copy rather than
             // interleaving two sources.
             if (!self.readWeight(chunk[0..n], data[off..][0..n])) {
                 if (off == 0) return self.upload(buf, data);
@@ -209,7 +209,7 @@ pub const Context = struct {
         }
     }
 
-    /// Register a source of weight bytes. Ignored once the slots are full — the
+    /// Register a source of weight bytes. Ignored once the slots are full, the
     /// fallback copy is always correct, so running out degrades speed, not results.
     pub fn addWeightReader(self: *Context, wr: WeightReader) void {
         for (&self.weight_readers) |*slot| if (slot.* == null) {
@@ -229,16 +229,16 @@ pub const Context = struct {
 /// Lets `uploadStaged` fetch weight bytes with a positional file read instead of
 /// copying them out of the checkpoint mapping.
 ///
-/// ⚠️ A read-once multi-GB checkpoint faulted through mmap runs at page-granularity
+/// A read-once multi-GB checkpoint faulted through mmap runs at page-granularity
 /// speed (~192 MB/s here) whenever the host is short of free RAM, because
 /// `MADV_WILLNEED` is advisory and readahead gets throttled; large explicit reads
 /// do not depend on that heuristic firing. It is a callback rather than a file
 /// handle so this layer keeps knowing nothing about checkpoint formats.
 ///
 /// Measured worth ~6-9% on a cold 13.5 GB DiT with ample free RAM; the big win it
-/// targets (memory-pressured first step) is unproven — see `SafeTensors.readTo`.
+/// targets (memory-pressured first step) is unproven, see `SafeTensors.readTo`.
 ///
-/// `read` returns false to mean "not mine / could not read" — the caller then
+/// `read` returns false to mean "not mine / could not read", the caller then
 /// falls back to the plain copy, so a missing or failing reader is never fatal.
 pub const WeightReader = struct {
     ctx: *anyopaque,
@@ -247,28 +247,28 @@ pub const WeightReader = struct {
 
 /// Fans the host-side fill of one pinned staging slot out over several threads.
 ///
-/// ⚠️ **The fill, not the DMA, is what makes a multi-GB weight upload slow, and
-/// nothing in the code said so until it was split out.** Measured on a 3090 with
-/// an 11.57 GB Z-Image DiT: `fill 4.88s, slot-wait 0.04s` — i.e. PCIe was idle
-/// 99% of the time and one thread reading the checkpoint at **2.37 GB/s** was the
+/// The fill, not the DMA, is what makes a multi-GB weight upload slow, and
+/// nothing in the code said so until it was split out. Measured on a 3090 with
+/// an 11.57 GB Z-Image DiT: `fill 4.88s, slot-wait 0.04s`, i.e. PCIe was idle
+/// 99% of the time and one thread reading the checkpoint at 2.37 GB/s was the
 /// whole warm-up. The same file reads at 4.3 GB/s cold and 26 GB/s page-cached
 /// under `dd`, so a single reader is leaving most of both on the table: cold it is
 /// short on queue depth, warm it is one core doing a 12 GB copy.
 ///
 /// Positional reads are independent by construction (no shared file offset), and
-/// the fallback `@memcpy` splits just as freely — so a range split is safe with no
+/// the fallback `@memcpy` splits just as freely, so a range split is safe with no
 /// ordering between workers. Chunks are claimed rather than pre-assigned so a
 /// worker that lands on cold pages cannot hold up the batch.
 const FillPool = struct {
     /// Total fillers including the caller, which works alongside them rather than
-    /// blocking — so this is threads spawned + 1.
+    /// blocking, so this is threads spawned + 1.
     const workers = 4;
     /// Claim granularity. Small enough that a straggler costs little, large enough
     /// that a claim's mutex round trip is noise against the read it guards.
     const chunk_bytes = 8 << 20;
 
     ctx: *Context,
-    /// `std.Io`'s portable primitives rather than raw futex/pthread — this file
+    /// `std.Io`'s portable primitives rather than raw futex/pthread, this file
     /// is the one place a macOS/Windows port would otherwise have to rewrite.
     io: std.Io = undefined,
     mu: std.Io.Mutex = .init,
@@ -282,7 +282,7 @@ const FillPool = struct {
     src: []const u8 = &.{},
     next: usize = 0,
     /// Chunks claimed but not yet finished. The batch is over at 0 with `next`
-    /// past the end — counting claims (not completions) is what lets the producer
+    /// past the end, counting claims (not completions) is what lets the producer
     /// join without knowing how the work was divided.
     busy: usize = 0,
 
@@ -388,10 +388,10 @@ const FillPool = struct {
     }
 
     /// Staged async HtoD upload: memcpy the (pageable mmap) bytes into the next
-    /// pinned ring slot, then async-DMA slot→device on the transfer stream, so the
+    /// pinned ring slot, then async-DMA slot->device on the transfer stream, so the
     /// DMA overlaps compute. Records `ev` (weight ready) and the slot's reuse event.
     /// The memcpy runs on the host but overlaps the GPU's prior work. Falls back to
-    /// a synchronous upload for data larger than a slot (leaves `ev` unrecorded — a
+    /// a synchronous upload for data larger than a slot (leaves `ev` unrecorded, a
     /// wait on an unrecorded event is a no-op, and the sync copy already completed).
     pub fn uploadStaged(self: *Context, buf: Buffer, data: []const u8, ev: cu.CUevent) Error!void {
         std.debug.assert(data.len <= buf.bytes);
@@ -527,7 +527,7 @@ const FillPool = struct {
         return self.mem_tag_used[@intFromEnum(tag)];
     }
 
-    /// Live device free/total bytes (cuMemGetInfo) — sees OTHER processes'
+    /// Live device free/total bytes (cuMemGetInfo), sees OTHER processes'
     /// usage, the CUDA analog of VK_EXT_memory_budget. Used for weight-stream
     /// budgeting; returns free=0 on query failure (forces conservative eviction).
     pub fn memGetInfo(self: *Context) struct { free: usize, total: usize } {
@@ -626,7 +626,7 @@ const FillPool = struct {
     /// Async memsets on the context (compute) stream. Unlike the legacy
     /// null-stream variants above, these stay ordered within the single-stream
     /// batch (no hidden full-stream sync) and, crucially, are legal inside a
-    /// CUDA-graph capture — a null-stream memset mid-capture aborts it with
+    /// CUDA-graph capture, a null-stream memset mid-capture aborts it with
     /// STREAM_CAPTURE_IMPLICIT.
     pub fn memsetD8Async(self: *Context, buf: Buffer, value: u8, bytes: usize) Error!void {
         try self.check(self.api.cuMemsetD8Async(buf.ptr, value, bytes, self.stream), "cuMemsetD8Async");
@@ -691,7 +691,7 @@ const FillPool = struct {
     }
 
     /// End timing and return elapsed milliseconds (device-measured, avoids host
-    /// clock noise — the clock-governor caveat still applies, so take a min).
+    /// clock noise, the clock-governor caveat still applies, so take a min).
     pub fn timerEndMs(self: *Context, t: Timer) Error!f32 {
         try self.check(self.api.cuEventRecord(t.stop, self.stream), "cuEventRecord");
         try self.check(self.api.cuEventSynchronize(t.stop), "cuEventSynchronize");

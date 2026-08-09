@@ -1,4 +1,4 @@
-//! Full-size image viewer — a second OS window with zoom, pan, and keyboard
+//! Full-size image viewer, a second OS window with zoom, pan, and keyboard
 //! navigation between all images in the conversation. Zoom/pan mechanics are
 //! ported from DiffKeep's image_viewer (renderImage at a computed physical
 //! rect, wheel-zoom toward the cursor, drag-to-pan via mouse capture).
@@ -43,7 +43,7 @@ pub const Viewer = struct {
 
     /// Heap-allocated and built in place: `dvui.Window` captures a pointer to
     /// the `SDLBackend` (via `back.backend()`), so the backend must live at a
-    /// stable address — a by-value return would leave the window pointing at a
+    /// stable address, a by-value return would leave the window pointing at a
     /// dead copy.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, src: ImageSource, cur: *GenImage) !*Viewer {
         const self = try gpa.create(Viewer);

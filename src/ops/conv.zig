@@ -1,10 +1,10 @@
-//! General 2D convolution and max-pooling over **channel-last** activations,
+//! General 2D convolution and max-pooling over channel-last activations,
 //! expressed as banded `im2col` + the shared GEMM.
 //!
 //! `wan_vae.conv2d` predates this and covers only the VAE's case (k ∈ {1,3},
 //! stride 1, same-padding); its bytes are pinned by the VAE parity fixtures, so
-//! it stays as it is. This is the general form — arbitrary kernel, stride and
-//! zero-padding, PyTorch's floor semantics for the output size — needed by
+//! it stays as it is. This is the general form, arbitrary kernel, stride and
+//! zero-padding, PyTorch's floor semantics for the output size, needed by
 //! feature towers like LPIPS-AlexNet (k11 s4 p2, k5 s1 p2, k3 s1 p1, maxpool
 //! k3 s2). A test pins it bit-for-bit against `wan_vae.conv2d` on the shape
 //! they share, so the two cannot drift.
@@ -33,12 +33,12 @@ pub const Conv2d = struct {
     k: usize,
     stride: usize = 1,
     pad: usize = 0,
-    /// Checkpoint tensor name, when the loader knows it — carried onto the `Weight`
+    /// Checkpoint tensor name, when the loader knows it, carried onto the `Weight`
     /// this convolution's im2col GEMM is issued with.
     ///
-    /// ⚠️ **Without it a convolutional model is invisible to `ops.matmul.probe`.** A
+    /// Without it a convolutional model is invisible to `ops.matmul.probe`. A
     /// conv here *is* a GEMM, so the probe fires either way, but an untagged call
-    /// cannot be attributed to a layer — so an activation capture of a UNet would
+    /// cannot be attributed to a layer, so an activation capture of a UNet would
     /// record only its attention and feed-forward linears and silently omit the
     /// convolutions holding most of its parameters. That is the same class of partial
     /// coverage as the Vulkan capture that recorded 39 of 263 layers and looked
@@ -58,7 +58,7 @@ pub const Conv2d = struct {
     }
 };
 
-/// PyTorch's output extent: `floor((n + 2·pad − k) / stride) + 1`. Zero when the
+/// PyTorch's output extent: `floor((n + 2*pad − k) / stride) + 1`. Zero when the
 /// padded input is smaller than the kernel.
 pub fn outDim(n: usize, k: usize, stride: usize, pad: usize) usize {
     const padded = n + 2 * pad;
@@ -83,8 +83,8 @@ pub fn packWeight(gpa: std.mem.Allocator, torch_w: []const f32, co: usize, ci: u
     return out;
 }
 
-/// `out[oy][ox][co] = Σ in[oy·s−p+ky][ox·s−p+kx][ci] · w[co][ky][kx][ci] + b[co]`,
-/// zero outside the input. `out` must be `outH(h)·outW(w)·co` long and may not
+/// `out[oy][ox][co] = Σ in[oy*s−p+ky][ox*s−p+kx][ci] * w[co][ky][kx][ci] + b[co]`,
+/// zero outside the input. `out` must be `outH(h)*outW(w)*co` long and may not
 /// alias `in`.
 pub fn conv2d(
     io: std.Io,
@@ -99,7 +99,7 @@ pub fn conv2d(
 }
 
 /// `conv2d` with an explicit patch-band cap. The band size must not change the
-/// result — only the peak memory — which is what the banding test asserts.
+/// result, only the peak memory, which is what the banding test asserts.
 pub fn conv2dBanded(
     io: std.Io,
     gpa: std.mem.Allocator,
@@ -116,7 +116,7 @@ pub fn conv2dBanded(
     std.debug.assert(out.len == oh * ow * conv.co);
     if (oh == 0 or ow == 0) return;
 
-    // 1x1 stride-1 unpadded is a plain GEMM over positions — no patch buffer.
+    // 1x1 stride-1 unpadded is a plain GEMM over positions, no patch buffer.
     if (conv.k == 1 and conv.stride == 1 and conv.pad == 0) {
         var w1: Weight = Weight.fromF32(conv.w, conv.co, conv.ci);
         w1.tag = conv.tag;
@@ -169,7 +169,7 @@ pub fn conv2dBanded(
 
 /// PyTorch `max_pool2d(kernel_size=k, stride=stride)` over channel-last
 /// activations: no padding, no dilation, `ceil_mode=false`. `out` must be
-/// `outDim(h,…)·outDim(w,…)·c` long and may not alias `in`.
+/// `outDim(h...)*outDim(w...)*c` long and may not alias `in`.
 pub fn maxPool2d(out: []f32, in: []const f32, h: usize, w: usize, c: usize, k: usize, stride: usize) void {
     const oh = outDim(h, k, stride, 0);
     const ow = outDim(w, k, stride, 0);
@@ -216,7 +216,7 @@ const ConvCase = struct {
     out_w: usize,
     /// `[h][w][ci]`, channel-last.
     x: []const f32,
-    /// `[co][ci][k][k]`, PyTorch order — the test packs it, so `packWeight` is
+    /// `[co][ci][k][k]`, PyTorch order, the test packs it, so `packWeight` is
     /// under test too.
     weight: []const f32,
     bias: []const f32,

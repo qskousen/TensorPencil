@@ -1,4 +1,4 @@
-//! CUDA-backend Qwen3.5/3.6 vision tower forward (LLM_PLAN.md "GPU ViT"):
+//! CUDA-backend Qwen3.5/3.6 vision tower forward:
 //! the same qwen3vl_merger pipeline as vit35.Vit.encode, with the patch
 //! embed, 27 pre-LN blocks, and the merger projector running device-side.
 //! Host keeps only the cheap prep (smart resize, normalize, patch ordering,
@@ -16,7 +16,7 @@
 //! encoding, along with the attention/GEMM scratch
 //! (weightScopeEnd/freeAttnScratch/freeConvScratch): image-sized state must
 //! not stay resident under the 19 GB LLM, the cache must not hold pointers
-//! into a Vit the caller may free, and — for REPL image turns — resident
+//! into a Vit the caller may free, and, for REPL image turns, resident
 //! LLM weights and their captured decode graph must survive the encode.
 
 const std = @import("std");
@@ -60,7 +60,7 @@ pub fn encode(vit: *const Vit, be: *Backend, gpa: std.mem.Allocator, rgb: []cons
     // The ViT leaves nothing resident: its weights are cached under a
     // scope and dropped as a group below, along with the attention scores
     // plane and the GEMM conversion scratch. The scoped release (rather
-    // than a full evictWeights) matters for REPL image turns — a resident
+    // than a full evictWeights) matters for REPL image turns, a resident
     // LLM and its captured decode graph must survive a mid-session encode.
     // It also protects correctness: the cache is keyed by host pointer,
     // and the Vit arena those keys point into may die with the Vit.

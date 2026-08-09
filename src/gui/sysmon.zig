@@ -1,6 +1,6 @@
-//! System monitors for the tp-gui status bar (GUI_VRAM.md, Phase 6):
+//! System monitors for the tp-gui status bar:
 //! host-CPU utilization from `/proc/stat`, and GPU utilization + VRAM from
-//! NVML (runtime-`dlopen`'d, like the CUDA/Vulkan drivers — absent driver just
+//! NVML (runtime-`dlopen`'d, like the CUDA/Vulkan drivers, absent driver just
 //! reports `null`, never a hard dependency). Per-model VRAM accounting lives in
 //! the VRAM coordinator; this module only covers the system-wide meters.
 const std = @import("std");
@@ -28,7 +28,7 @@ fn parseCpuLine(line: []const u8) ?CpuTimes {
 }
 
 /// Read `/proc/stat`'s first line into `buf` via a raw syscall (no allocation,
-/// no `std.Io` threading — the status bar samples this every frame).
+/// no `std.Io` threading, the status bar samples this every frame).
 fn readProcStat(buf: []u8) ?CpuTimes {
     const fd = std.os.linux.open("/proc/stat", .{ .ACCMODE = .RDONLY }, 0);
     if (std.posix.errno(fd) != .SUCCESS) return null;
@@ -81,7 +81,7 @@ pub fn cpuFreqMhz() f32 {
     if (std.posix.errno(n) != .SUCCESS or n == 0) return 0;
     const s = std.mem.trim(u8, buf[0..@intCast(n)], " \t\r\n");
     const khz = std.fmt.parseInt(u64, s, 10) catch return 0;
-    return @as(f32, @floatFromInt(khz)) / 1000.0; // kHz → MHz
+    return @as(f32, @floatFromInt(khz)) / 1000.0; // kHz -> MHz
 }
 
 // NVML C struct layouts (nvml.h). Only the fields we read.
@@ -89,13 +89,13 @@ const NvmlUtilization = extern struct { gpu: c_uint, memory: c_uint };
 const NvmlMemory = extern struct { total: c_ulonglong, free: c_ulonglong, used: c_ulonglong };
 const NvmlDevice = ?*anyopaque; // opaque nvmlDevice_t handle
 
-/// `nvmlProcessInfo_v2_t` — what the `_v2`/`_v3` process getters write.
+/// `nvmlProcessInfo_v2_t`, what the `_v2`/`_v3` process getters write.
 const ProcInfoV2 = extern struct { pid: c_uint, used: c_ulonglong, gi: c_uint, ci: c_uint };
-/// `nvmlProcessInfo_t` — what the ORIGINAL (unversioned) getters write. Passing
+/// `nvmlProcessInfo_t`, what the ORIGINAL (unversioned) getters write. Passing
 /// this layout to a `_v2`/`_v3` symbol (or vice versa) silently misreads `used`,
 /// so each symbol is paired with its own layout below.
 const ProcInfoV1 = extern struct { pid: c_uint, used: c_ulonglong };
-/// NVML_VALUE_NOT_AVAILABLE — "this process's usage can't be determined".
+/// NVML_VALUE_NOT_AVAILABLE, "this process's usage can't be determined".
 const value_not_available: c_ulonglong = std.math.maxInt(c_ulonglong);
 /// nvmlDeviceGet{Compute,Graphics}RunningProcesses: (device, *count, *infos).
 const GetProcsFn = *const fn (NvmlDevice, *c_uint, ?*anyopaque) callconv(.c) c_int;
@@ -124,9 +124,9 @@ fn scanProcs(comptime T: type, list: []const T, pid: u32) ListHit {
 
 /// Optional NVML handle for GPU utilization + VRAM. `open()` returns null when
 /// the NVML library or a required symbol is missing (no NVIDIA driver, or a
-/// headless/container run) — the status bar then shows the GPU meter as n/a.
+/// headless/container run), the status bar then shows the GPU meter as n/a.
 /// Process-wide lazy NVML handle. Shared rather than opened per consumer so the
-/// status bar and the VRAM budget read the SAME driver in the same pass — two
+/// status bar and the VRAM budget read the SAME driver in the same pass, two
 /// handles could disagree, and the whole point of the per-process split is that
 /// its terms are coherent with each other.
 var g_nvml: ?Nvml = null;
@@ -153,7 +153,7 @@ pub const Nvml = struct {
     getMem: *const fn (NvmlDevice, *NvmlMemory) callconv(.c) c_int,
     getClock: ?*const fn (NvmlDevice, c_uint, *c_uint) callconv(.c) c_int, // nvmlDeviceGetClockInfo (optional)
     shutdown: *const fn () callconv(.c) c_int,
-    // Per-process VRAM (optional — older drivers lack the symbols).
+    // Per-process VRAM (optional, older drivers lack the symbols).
     getComputeProcs: ?GetProcsFn,
     getGraphicsProcs: ?GetProcsFn,
     proc_layout: enum { v2, v1 },
@@ -205,13 +205,13 @@ pub const Nvml = struct {
         };
     }
 
-    /// Card memory (bytes) charged to `pid` — for our own pid, that's our WHOLE
+    /// Card memory (bytes) charged to `pid`, for our own pid, that's our WHOLE
     /// footprint including everything our allocators can't see: the CUDA
     /// context(s) and JIT'd modules, cuBLASLt/cuDNN internals, and the SDL/GL
     /// window + image textures. The meter uses it to tell "ours but untracked"
     /// apart from "another process's" VRAM (see vram_split.zig).
     ///
-    /// `procUsed` for our own process — what the meter actually wants.
+    /// `procUsed` for our own process, what the meter actually wants.
     pub fn selfUsed(self: *Nvml) ?u64 {
         // `std.posix.getpid` doesn't exist in 0.16; `std.posix.system` is the
         // portable spelling of the syscall (no std.os.linux dependency).
@@ -222,7 +222,7 @@ pub const Nvml = struct {
     /// query failed, no permission); 0 when we hold nothing on this card.
     pub fn procUsed(self: *Nvml, pid: u32) ?u64 {
         var any_ok = false;
-        // A process doing both compute and graphics (tp-gui does — CUDA plus the
+        // A process doing both compute and graphics (tp-gui does, CUDA plus the
         // SDL window) appears in BOTH lists reporting the same total, so the
         // first hit wins; summing would double-count it.
         for ([_]?GetProcsFn{ self.getComputeProcs, self.getGraphicsProcs }) |maybe| {
@@ -317,7 +317,7 @@ test "parseCpuLine sums fields and idle=idle+iowait" {
 test "CpuMeter first sample returns 0 (no baseline)" {
     var m: CpuMeter = .{ .last = .{ .total = 1000, .idle = 900 } };
     // Force a deterministic delta by simulating readProcStat's result path:
-    // with a baseline set, a synthetic current of (2000, 1400) → busy 500/1000.
+    // with a baseline set, a synthetic current of (2000, 1400) -> busy 500/1000.
     // (readProcStat reads the real /proc/stat, so we only assert the math via
     // the pure helper here; the real sampler is exercised at runtime.)
     _ = &m;

@@ -1,45 +1,26 @@
-//! GPU-resident SD1.5 / SDXL UNet forward (Vulkan).
+//! GPU-resident SD1.5 / SDXL UNet forward (Vulkan), mirroring `sd_unet.forward` with
+//! everything from the latent upload to the eps download on the device.
 //!
-//! Mirrors `sd_unet.forward` with everything from the latent upload to the eps
-//! download on the device. The mapping is the same one `vae_gpu` uses for the Wan
-//! decoder — activations stay tight channel-last `[h*w][c]` f32, a 3x3
-//! convolution is a banded `im2col_sd` followed by a GEMM, a 1x1 convolution and
-//! an `nn.Linear` are the same GEMM with no patch step — plus the three things a
-//! UNet has that a VAE decoder does not: GroupNorm over 32 channel groups, a
-//! SpatialTransformer (self-attention, cross-attention onto the text
-//! conditioning, GEGLU feed-forward), and the LIFO skip stack.
+//! Same mapping `vae_gpu` uses for the Wan decoder: activations stay tight channel-last
+//! `[h*w][c]` f32, a 3x3 convolution is a banded `im2col_sd` plus a GEMM, and a 1x1
+//! convolution or `nn.Linear` is that GEMM with no patch step. What a UNet adds over a
+//! VAE decoder is GroupNorm over 32 channel groups, the SpatialTransformer, and the LIFO
+//! skip stack.
 //!
-//! Weights are read straight from a loaded `sd_unet.UNet`, in whatever dtype the
-//! checkpoint stored them (f32 and f16 are both common in the wild, and ggufy
-//! emits block-quant GGUF UNets), and the Context's weight cache uploads and
-//! transposes each one lazily on first use.
+//! Weights are read straight from a loaded `sd_unet.UNet` in whatever dtype the
+//! checkpoint stored them, and the Context's weight cache uploads and transposes each
+//! one lazily on first use.
 //!
-//! Three things here are worth knowing before changing any of it:
+//! Each ResBlock's timestep-embedding projection is folded into its first convolution's
+//! bias on the host rather than added in a pass of its own. A conv bias is already a
+//! per-channel constant over positions, which is exactly what the projection is, so this
+//! is exact and it removes one read-modify-write of the full activation per ResBlock.
+//! The folded vector changes every forward, hence `opMatmulCoopF16WDev` and one packed
+//! device buffer instead of the pointer-cached `smallBuffer` path.
 //!
-//! 1. **Each ResBlock's timestep-embedding projection is folded into its first
-//!    convolution's bias**, on the host, rather than added in a pass of its own.
-//!    A conv bias is already a per-channel constant over positions, which is
-//!    exactly what the projection is, so this is exact — and it removes one
-//!    read-modify-write of the full activation per ResBlock. The folded vector
-//!    changes every forward, hence `opMatmulCoopF16WDev` and one packed device
-//!    buffer instead of the pointer-cached `smallBuffer` path.
-//!
-//! 2. **Self-attention pads head_dim up to 128.** The cooperative-matrix
-//!    attention pipelines are compiled for head_dim 128 (`coopmat.buildFlashAttn`
-//!    and `buildGemmAttnOut` both assume it), while this family's heads are 40
-//!    (SD1.5's outermost level), 64 (SDXL everywhere) or 80. Zero-padding is
-//!    exact — a zero dimension contributes nothing to a dot product and V's zero
-//!    columns produce output columns we drop — and it buys the flash kernel,
-//!    which never materializes the `n x n` scores plane. It costs arithmetic in
-//!    proportion to `128/head_dim`; see the note on `selfAttn`.
-//!
-//! 3. **head_dim 160 (SD1.5's two innermost levels) takes the scalar kernel
-//!    instead**, because 160 does not fit a 128-wide tile at all. That is
-//!    affordable only because the wide-head levels are also the small-`n` ones:
-//!    at a 512-square render they carry 256 and 64 positions.
-//!
-//! Numerics are f16 tensor cores for the GEMMs and f32 everywhere else, so this
-//! is NOT bit-identical to `sd_unet.forward`; the CPU path remains the reference.
+//! Attention head widths are handled in `selfAttn`. Numerics are f16 tensor cores for
+//! the GEMMs and f32 everywhere else, so this is NOT bit-identical to
+//! `sd_unet.forward`; the CPU path remains the reference.
 
 const std = @import("std");
 const sd_unet = @import("sd_unet.zig");
@@ -89,7 +70,7 @@ pub const SampleMode = enum(u2) { stride1 = 0, upsample2x = 1, stride2 = 2 };
 /// Everything tied to one conditioning branch: the uploaded context, and the
 /// per-forward ResBlock bias vectors with the timestep embedding folded in.
 /// Under classifier-free guidance there are two of these against one `Workspace`
-/// — the positive and negative branches differ in their context and, for SDXL,
+/// the positive and negative branches differ in their context and, for SDXL,
 /// in `adm` (whose pooled half is prompt-dependent), so their folded biases
 /// differ too.
 pub const Session = struct {
@@ -100,17 +81,17 @@ pub const Session = struct {
     adm: ?[]const f32,
 
     /// Every ResBlock's folded bias, packed end to end so one upload serves the
-    /// whole forward — a `tensorUpload` per ResBlock would be ~30 staged copies
+    /// whole forward, a `tensorUpload` per ResBlock would be ~30 staged copies
     /// and submits per step.
     bias_host: []f32,
     bias_d: DeviceBuffer = none,
     /// Element offset into `bias_host` per ResBlock, indexed by the block's
-    /// **ordinal in the graph walk** (`sd_unet.ResBlockIter`'s order, which is the
+    /// ordinal in the graph walk (`sd_unet.ResBlockIter`'s order, which is the
     /// order `forward` visits them in).
     ///
-    /// ⚠️ NOT keyed by a host pointer, which is what this was first and is a trap:
-    /// `Session.replaceDenoiser` reloads the UNet into a fresh arena — the whole
-    /// point of the per-tensor divergence arm — so every weight pointer changes
+    /// NOT keyed by a host pointer, which is what this was first and is a trap:
+    /// `Session.replaceDenoiser` reloads the UNet into a fresh arena, the whole
+    /// point of the per-tensor divergence arm, so every weight pointer changes
     /// while this session stays alive, and a pointer-keyed lookup goes from
     /// correct to a null-unwrap panic. An ordinal is a property of the
     /// architecture, which a reload does not change.
@@ -159,9 +140,9 @@ pub const Session = struct {
         var max_ch: usize = cfg.model_channels;
         for (cfg.channel_mult) |m| max_ch = @max(max_ch, cfg.model_channels * m);
 
-        // ⚠️ Every allocation happens BEFORE the struct literal. `.arena = arena`
+        // Every allocation happens BEFORE the struct literal. `.arena = arena`
         // copies the arena's state as it stands, so anything a *later* field
-        // initializer allocates is leaked — invisible except to the test
+        // initializer allocates is leaked, invisible except to the test
         // allocator. `dit.zig` and `clip_text.zig` both learned this.
         const bias_host = try alloc.alloc(f32, total);
         const emb = try alloc.alloc(f32, cfg.time_embed_dim);
@@ -281,7 +262,7 @@ pub const Workspace = struct {
         // Same sizing walk as `sd_unet.Workspace.init`: the attention and
         // feed-forward scratches are sized per ATTENDING level at its own
         // resolution and width, not by the outermost resolution times the
-        // innermost width — a product no stage ever has (SDXL's outermost level
+        // innermost width, a product no stage ever has (SDXL's outermost level
         // does not attend at all).
         var act: usize = 0;
         var attn: usize = 0;
@@ -307,7 +288,7 @@ pub const Workspace = struct {
                 w = (w + 1) / 2;
             }
         }
-        // The middle block always attends, at the innermost resolution — which
+        // The middle block always attends, at the innermost resolution, which
         // the loop skips when that level carries no SpatialTransformer of its own
         // (SD1.5's fourth level).
         sizeAttn(cfg, h * w, cfg.model_channels * cfg.channel_mult[cfg.levels() - 1], ctx_seq, &attn, &ff, &gated, &pad_f32, &pad_f16, &scores, &part, &md);
@@ -371,7 +352,7 @@ pub const Workspace = struct {
     }
 
     /// Bytes the im2col band needs for a 3x3 convolution of this shape. A pure
-    /// function of it, so `init` and `convInto` cannot disagree about the size —
+    /// function of it, so `init` and `convInto` cannot disagree about the size,
     /// which matters because growing the band inside a recording batch would free
     /// memory that already recorded dispatches reference.
     fn sizePatch(n_out: usize, ci: usize) usize {
@@ -475,7 +456,7 @@ pub fn forward(
         {
             // Concatenate along channels into `alt`: current first, then the
             // popped skip. Two strided copies rather than one in-place widening
-            // — the source and destination are distinct buffers here, so unlike
+            // the source and destination are distinct buffers here, so unlike
             // the CPU path there is nothing to overwrite.
             const total = ch + skip_ch;
             ctx.independent(2);
@@ -541,7 +522,7 @@ fn embedAndFoldBiases(
     ops.act.silu(sess.mlp_hidden);
     try ops.matmul.matmul(io, gpa, sess.emb, sess.mlp_hidden, 1, u.time_2.w, u.time_2.b);
 
-    // `emb = time_embed(t) + label_emb(y)` — a sum, not a concatenation, and the
+    // `emb = time_embed(t) + label_emb(y)`, a sum, not a concatenation, and the
     // same shape either way, so a missing term would be invisible downstream.
     if (sess.adm) |y| {
         try ops.matmul.matmul(io, gpa, sess.mlp_hidden, y, 1, u.label_1.?.w, u.label_1.?.b);
@@ -573,7 +554,7 @@ fn setSkip(ctx: *Context, ws: *Workspace, i: usize, src: *const DeviceBuffer, el
 }
 
 /// A ResBlock, result guaranteed in `dst` (which the helper may swap with its
-/// own scratch to get there — cheaper than a copy, and `t2` is scratch either
+/// own scratch to get there, cheaper than a copy, and `t2` is scratch either
 /// way). `src` must survive to the residual add, so the first norm is
 /// out-of-place.
 fn applyRes(
@@ -636,8 +617,8 @@ fn applySpatial(
     for (st.blocks) |b| {
         // attn1: self-attention over pixels, no mask.
         try layerNorm(ctx, &ws.nb, &ws.stream, n, ch, b.norm1, cfg.norm_eps);
-        // ⚠️ NOT `ctx.independent(3)`. These three GEMMs look independent — same
-        // input, three disjoint outputs — but a coop GEMM is three dispatches
+        // NOT `ctx.independent(3)`. These three GEMMs look independent, same
+        // input, three disjoint outputs, but a coop GEMM is three dispatches
         // sharing the Context's `x_h16` / `y_pad` scratch, so removing the
         // barriers would both let them clobber each other's scratch AND (since
         // the group counts dispatches, not calls) drop the barriers *inside* the
@@ -683,14 +664,14 @@ fn applySpatial(
 
 /// Self-attention over the latent positions.
 ///
-/// ⚠️ The cooperative-matrix path is built for head_dim 128, so narrower heads
+/// The cooperative-matrix path is built for head_dim 128, so narrower heads
 /// are zero-padded up to it: exact (a zero dimension contributes nothing to a
 /// dot product, and V's zero columns give output columns `head_unpad` drops) but
 /// it does `128/head_dim` times the arithmetic of the true shape. SD1.5's
 /// outermost level pays 3.2x and SDXL pays 2x. The fix is a head_dim-parameterized
 /// `buildGemmAttnOut` / `buildFlashAttn`, not a change here.
 ///
-/// head_dim 160 — SD1.5's two innermost levels — does not fit a 128-wide tile at
+/// head_dim 160, SD1.5's two innermost levels, does not fit a 128-wide tile at
 /// all and takes the general scalar kernel. That is affordable only because the
 /// wide-head levels are the small-`n` ones.
 fn selfAttn(ctx: *Context, ws: *Workspace, n: usize, heads: usize, hd: usize) !void {
@@ -793,7 +774,7 @@ fn selfAttn(ctx: *Context, ws: *Workspace, n: usize, heads: usize, hd: usize) !v
 }
 
 /// A SpatialTransformer's in/out projection, whichever rank the checkpoint stored
-/// it at — SD1.5 a 1x1 convolution, SDXL an `nn.Linear`. On channel-last
+/// it at, SD1.5 a 1x1 convolution, SDXL an `nn.Linear`. On channel-last
 /// activations both are the same GEMM over pixels.
 fn applyProj(
     ctx: *Context,
@@ -863,7 +844,7 @@ pub fn groupNormInto(
     eps: f32,
     silu: bool,
     /// `src` and `dst` are f16 rather than f32. The statistics, weight and bias
-    /// stay f32 either way — they are per-channel, not per-position.
+    /// stay f32 either way, they are per-channel, not per-position.
     act_f16: bool,
 ) !void {
     std.debug.assert(cat.len == 2 * ch);
@@ -901,7 +882,7 @@ fn headsPerBatch(seq_pad: usize, heads: usize) usize {
 
 /// A GEMM against a checkpoint weight, routed by the dtype it was stored in.
 /// `bias` null means the weight carries none (attention q/k/v), which the
-/// bias-adding kernels still need a vector for — hence the session's zeros.
+/// bias-adding kernels still need a vector for, hence the session's zeros.
 
 /// Feed `ops.matmul.probe` this GEMM's input, so an activation capture works when
 /// the SD UNet runs on Vulkan. Mirrors `sd_unet_cuda.probeInput` and
@@ -920,7 +901,7 @@ fn probeInput(ctx: *Context, x: DeviceBuffer, m: usize, w: Weight) !void {
     p.input(p.ctx, w, host, m);
 }
 
-/// The `Weight` a convolution's GEMM is equivalent to — `ci` columns for a 1x1 and
+/// The `Weight` a convolution's GEMM is equivalent to, `ci` columns for a 1x1 and
 /// the im2col patch (`9*ci`) for a 3x3, matching `ops.conv` exactly.
 fn convWeight(cv: Conv2d, cols: usize) Weight {
     var w = Weight.fromF32(cv.w, cv.co, cols);
@@ -940,9 +921,9 @@ fn gemm(
 ) !void {
     const rows = wt.rows;
     const cols = wt.cols;
-    // ⚠️ The whole `zeros` array, NOT `zeros[0..rows]`. Both backends cache a bias
+    // The whole `zeros` array, NOT `zeros[0..rows]`. Both backends cache a bias
     // by POINTER and size the device buffer from the FIRST call's length, so a
-    // narrow layer seen first would leave every wider one reading past the end —
+    // narrow layer seen first would leave every wider one reading past the end,
     // which robust-buffer-access hides by returning zeros, i.e. exactly the right
     // answer for THIS bias and nothing else. The kernels read only `rows`
     // entries, so handing them a longer slice is free. (Context.smallBuffer)
@@ -971,7 +952,7 @@ fn gemm(
             return ctx.opMatmulCoopF16Wb(y.*, y_off_elems, x.*, m, wt.bytes, rows, cols, b);
         },
         .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl => {
-            // ggufy's quantized SD UNets — the whole reason the loader keeps
+            // ggufy's quantized SD UNets, the whole reason the loader keeps
             // weights in their checkpoint dtype.
             if (!ctx.hasQuantPrefillGemm()) return error.UnsupportedDType;
             return ctx.opMatmulCoopQuant(wt.dtype, y.*, y_off_elems, x.*, m, wt.bytes, rows, cols, 1.0, b, false);
@@ -1026,11 +1007,11 @@ pub fn convInto(
 }
 
 /// `convInto` with the activation divided by `act_div` before the f16 cast (and
-/// the result multiplied back) — see `Context.opMatmulCoopF16WScaled` for why f16's
+/// the result multiplied back), see `Context.opMatmulCoopF16WScaled` for why f16's
 /// 65504 ceiling is reachable in practice. `act_div = 1.0` is exactly `convInto`.
 ///
 /// The non-coop arm ignores it: `opMatmul` never casts to f16, so it has f32's
-/// range already. The device-bias arm (`bias_dev`) does not take it either — that
+/// range already. The device-bias arm (`bias_dev`) does not take it either, that
 /// is the SD UNet's folded timestep projection, whose activations are GroupNorm
 /// outputs, and the VAE decoder (the stage that overflows) never uses it.
 pub fn convIntoScaled(
@@ -1051,8 +1032,8 @@ pub fn convIntoScaled(
 /// `convIntoScaled` with f16 activation STORAGE on either side. Mirrors
 /// `sd_unet_cuda.convIntoPrec`; see `sd_vae.Config.act_f16`.
 ///
-/// ⚠️ f16 storage FORCES the cooperative path, because the plain f32 GEMM arm has
-/// no f16 form. `coop_min_co` is a PERFORMANCE threshold, not a correctness one —
+/// f16 storage FORCES the cooperative path, because the plain f32 GEMM arm has
+/// no f16 form. `coop_min_co` is a PERFORMANCE threshold, not a correctness one,
 /// and not forcing it is a real bug, not a theoretical one: on CUDA it left SD1.5's
 /// 4->4 `post_quant_conv` on the f32 arm writing f32 into an f16 buffer, and every
 /// pixel came out non-finite.
@@ -1211,7 +1192,7 @@ test "gpu group norm matches ops.norm.groupNorm" {
     // late VAE decoder block), and its error floor is NOT the statistics
     // algorithm: `x - mean` cancels ~400 down to ~1, so f32's 6e-8 relative
     // representation of `x` itself becomes ~2e-5 absolute in a quantity of size
-    // 1. Welford is still what makes even this much work — the shifted
+    // 1. Welford is still what makes even this much work, the shifted
     // `E[x^2] - E[x]^2` form has to resolve 160001 - 160000 in f32 and lands
     // ~1% out on the variance, two orders worse.
     const cases = [_]struct { mean: f32, tol: f64 }{
@@ -1389,8 +1370,8 @@ test "gpu self attention matches ops.attention at every SD head width" {
             try ctx.ensureDeviceBuffer(&@field(ws, f), rows * 2);
         }
         try ctx.ensureDeviceBuffer(&ws.apad, rows * 4);
-        // `selfAttn` no longer grows these — `Workspace.init` pre-sizes them so
-        // nothing reallocates inside a recording batch — so the test has to.
+        // `selfAttn` no longer grows these, `Workspace.init` pre-sizes them so
+        // nothing reallocates inside a recording batch, so the test has to.
         const hpb = headsPerBatch(seq_pad, c.heads);
         try ctx.ensureDeviceBuffer(&ws.s, hpb * seq_pad * seq_pad * 2);
         try ctx.ensureDeviceBuffer(&ws.part, hpb * n * nchunks * 2 * 4);
@@ -1485,7 +1466,7 @@ test "gpu conv matches ops.conv.conv2d at stride 1, stride 2 and fused 2x upsamp
         try ctx.tensorDownload(dst, std.mem.sliceAsBytes(got));
 
         // The CPU reference has no fused resample, so the upsample case builds
-        // the doubled tensor explicitly — which is exactly the equivalence the
+        // the doubled tensor explicitly, which is exactly the equivalence the
         // fused gather claims.
         const want = try gpa.alloc(f32, oh * ow * co);
         defer gpa.free(want);

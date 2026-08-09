@@ -1,4 +1,4 @@
-//! cuDNN bindings — pure Zig, runtime-loaded via std.DynLib.
+//! cuDNN bindings, pure Zig, runtime-loaded via std.DynLib.
 //!
 //! Loaded like the driver (`cu.zig`) and cuBLASLt (`cublaslt.zig`): `dlopen` the
 //! dispatch shim `libcudnn.so.9` (it pulls the graph/engine sub-libraries in
@@ -7,7 +7,7 @@
 //! Phase-2 milestone 2.0 binds only the handle lifecycle + version/error/stream
 //! surface (enough for the `cuda-libs-test` smoke). The fused-SDPA (attention,
 //! 2.4) and convolution (VAE, 2.5) descriptor APIs are added in their own
-//! milestones — the graph API is verbose, so it lands next to the code that
+//! milestones, the graph API is verbose, so it lands next to the code that
 //! drives it.
 
 const std = @import("std");
@@ -229,7 +229,7 @@ pub const Api = struct {
 };
 
 /// A finalized cuDNN fused-SDPA-forward execution plan for one (b,hq,hkv,s,d)
-/// shape: O[b,hq,s,d] = softmax(scale · Q·Kᵀ) · V, non-causal, f16 in/out with
+/// shape: O[b,hq,s,d] = softmax(scale * Q*Kᵀ) * V, non-causal, f16 in/out with
 /// f32 softmax. Built once per shape (the heuristic + plan finalize are the
 /// expensive host steps); `execute` just binds pointers into a variant pack.
 ///
@@ -415,7 +415,7 @@ pub const SdpaPlan = struct {
 };
 
 /// A legacy-API 3×3 (pad 1, stride 1, cross-correlation) NHWC convolution for the
-/// VAE: f16 X/W tensor-core conv (f32 accumulate) → f16 Y, algo
+/// VAE: f16 X/W tensor-core conv (f32 accumulate) -> f16 Y, algo
 /// IMPLICIT_PRECOMP_GEMM (no im2col materialization). Descriptors are cheap to
 /// build (no heuristic), so this is created/destroyed per conv call.
 pub const ConvPlan = struct {
@@ -523,9 +523,9 @@ fn planFromGraph(api: *const Api, handle: Handle, graph: BackendDescriptor) Erro
     return .{ .plan = plan, .cfg = cfgs[chosen], .ws = @intCast(ws) };
 }
 
-/// Fused int8 GEMM + per-row×per-col dequant, as one cuDNN op graph — the
+/// Fused int8 GEMM + per-row×per-col dequant, as one cuDNN op graph, the
 /// dlopen-compatible alternative to a CUTLASS epilogue. Computes
-/// D[m][n] (f32) = (A[m][k]·B[k][n] in s32) · act_scale[m] · weight_scale[n],
+/// D[m][n] (f32) = (A[m][k]*B[k][n] in s32) * act_scale[m] * weight_scale[n],
 /// so the s32 accumulator never round-trips to DRAM and there is no separate
 /// `irescale` pass. B is the weight stored [n][k] row-major, viewed as [k][n]
 /// via strides (the transpose). Built once per (m,n,k). UIDs: A=1 B=2 C=3(virt)
@@ -630,8 +630,8 @@ pub const MatmulDequantPlan = struct {
         try api.check(api.cudnnBackendSetAttribute(op_mm, b.ATTR_OPERATION_MATMUL_DESC, b.TYPE_BACKEND_DESCRIPTOR, 1, @ptrCast(&md_)), "mm desc");
         try api.check(api.cudnnBackendFinalize(op_mm), "Finalize(op matmul)");
 
-        const op_pw1 = try self.pointwiseOp(api, c, as_, s1); // C · act_scale → S1
-        const op_pw2 = try self.pointwiseOp(api, s1, ws, d); // S1 · weight_scale → D
+        const op_pw1 = try self.pointwiseOp(api, c, as_, s1); // C * act_scale -> S1
+        const op_pw2 = try self.pointwiseOp(api, s1, ws, d); // S1 * weight_scale -> D
 
         var graph: BackendDescriptor = null;
         try api.check(api.cudnnBackendCreateDescriptor(b.DESC_OPERATIONGRAPH, &graph), "CreateDescriptor(graph)");

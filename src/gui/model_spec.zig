@@ -1,40 +1,30 @@
-//! What the GUI knows about a diffusion checkpoint before it loads one.
+//! What the GUI knows about a diffusion checkpoint before it loads one, and the single
+//! place the GUI's architecture knowledge lives:
 //!
-//! The CLI grew two capabilities the GUI did not have: a second architecture
-//! (SD1.5 alongside krea2) and **container style as a property of the file, not
-//! of the architecture** — any model ships either as one bundled checkpoint
-//! (denoiser + text encoder + VAE under their own prefixes) or as separate
-//! files. `pipeline.resolveComponent` already handles all four combinations; the
-//! GUI's problem was upstream of that: it *demanded* three paths before it would
-//! build a diffusion engine at all, so a joined SD1.5 checkpoint could not be
-//! configured, and picking one would then have failed on a GPU backend with
-//! nothing but a log line.
+//! - What is in a file (`inspect` / `inspectSide`), so settings can say "this checkpoint
+//!   has its own text encoder and VAE" instead of making the user guess, and so the two
+//!   side paths can be presented as the overrides they are.
+//! - What a family supports and expects (`traits`): backends it has kernels for, and the
+//!   resolution / step / CFG defaults that make it produce an image rather than mush.
+//! - What is still missing (`missing`), the readiness predicate the studio, the chat
+//!   image tool and the settings screen all share.
 //!
-//! This module is the single place the GUI's architecture knowledge lives:
+//! Container style is a property of the FILE, not of the architecture: any model ships
+//! either bundled (denoiser, text encoder and VAE under their own prefixes) or as
+//! separate files, and `pipeline.resolveComponent` handles all four combinations. The
+//! GUI must not demand three paths before it will build an engine, or a bundled
+//! checkpoint cannot be configured at all.
 //!
-//! - **What is in a file** (`inspect` / `inspectSide`) — so settings can say
-//!   "this checkpoint has its own text encoder and VAE" instead of making the
-//!   user guess, and so the two side paths can be presented as the *overrides*
-//!   they actually are.
-//! - **What a family supports and expects** (`traits`) — backends it has kernels
-//!   for, and the resolution / step / CFG defaults that make it produce an image
-//!   rather than mush (krea2 at 1024²/CFG 1 and SD1.5 at 512²/CFG 7.5 are not
-//!   interchangeable).
-//! - **What is still missing** (`missing`) — the readiness predicate the studio,
-//!   the chat image tool and the settings screen all share.
+//! Adding an architecture is a `Family` arm in the pipeline plus one entry in each of
+//! the two tables here; nothing else in the GUI enumerates families.
 //!
-//! Adding a third architecture is a `Family` arm in the pipeline plus one entry
-//! in each of the two tables here; nothing else in the GUI enumerates families.
-//!
-//! ⚠️ **Everything here is ADVISORY, never a gate.** The authority on whether a
-//! checkpoint can be loaded is `pipeline.Session.init` — it resolves components
-//! and rejects an unsupported backend itself. Two things below deliberately
-//! mirror private knowledge in `pipeline.zig` (the per-component probe names in
-//! `componentSpec`, and the CPU-only rule for SD1.5), and mirrored knowledge
-//! drifts. Keeping this side purely advisory bounds that drift to a stale *hint*
-//! in the settings screen; it can never turn into a model the GUI refuses to
-//! load or a wrong image. If the pipeline ever exports those two facts, delete
-//! the tables and call it.
+//! Everything here is ADVISORY, never a gate. `pipeline.Session.init` is the authority on
+//! whether a checkpoint loads: it resolves components and rejects an unsupported backend
+//! itself. Two things below deliberately mirror private knowledge in `pipeline.zig` (the
+//! per-component probe names in `componentSpec`, and the CPU-only rule for SD1.5), and
+//! mirrored knowledge drifts. Staying advisory bounds that drift to a stale hint in the
+//! settings screen rather than a model the GUI refuses to load. If the pipeline ever
+//! exports those two facts, delete the tables and call it.
 const std = @import("std");
 const tp = @import("TensorPencil");
 
@@ -49,8 +39,8 @@ pub const Backend = pipeline.Backend;
 /// the denoiser, a VAE export has just the decoder.
 ///
 /// `conditioner2` is SDXL's second text tower (OpenCLIP bigG). It is a real,
-/// separately-resolved component — `--text-encoder-2` overrides it independently
-/// of the first — so it is modelled here rather than assumed to travel with
+/// separately-resolved component, `--text-encoder-2` overrides it independently
+/// of the first, so it is modelled here rather than assumed to travel with
 /// `conditioner`.
 pub const Contents = struct {
     denoiser: bool = false,
@@ -74,7 +64,7 @@ pub const Info = struct {
     contents: Contents,
 
     /// True when this one file is the whole pipeline (the "checkpoint-style"
-    /// case) — the GUI needs no side paths at all. Family-aware, because "every
+    /// case), the GUI needs no side paths at all. Family-aware, because "every
     /// component" means one more thing for SDXL than for the others.
     pub fn isComplete(self: Info) bool {
         const need2 = traits(self.family).dual_conditioner;
@@ -86,7 +76,7 @@ pub const Info = struct {
 // ── The probe table ───────────────────────────────────────────────────────────
 // A mirror of `pipeline.componentSpec`: one tensor name per component, tried
 // under each prefix spelling that architecture is distributed with. See the
-// advisory warning in the module doc — a drifted entry costs a hint, not a load.
+// advisory warning in the module doc, a drifted entry costs a hint, not a load.
 
 const Spec = struct {
     prefixes: []const []const u8,
@@ -94,12 +84,12 @@ const Spec = struct {
 };
 
 /// Does `store` carry `comp` under any prefix spelling `fam` is distributed with?
-/// ⚠️ **The prefix/probe table lives in `pipeline`, not here.** This file used to
-/// carry its own copy — same rules, written twice — and they drifted the moment the
-/// pipeline learned that a component's tensor names differ by CONTAINER. A GGUF text
+/// The prefix/probe table lives in `pipeline`, not here. A second copy of the same
+/// rules drifts as soon as the pipeline learns that a component's tensor names differ
+/// by CONTAINER. A GGUF text
 /// encoder is `embed_tokens.weight` where safetensors is `model.embed_tokens.weight`,
 /// so `pipeline.resolveComponent` loaded it happily while this copy, still probing
-/// one spelling, reported the file as carrying no conditioner — the GUI refusing a
+/// one spelling, reported the file as carrying no conditioner, the GUI refusing a
 /// file the engine could open. One table, one answer.
 pub fn storeHas(store: tp.weights.WeightStore, fam: Family, comp: Component) bool {
     const s = pipeline.componentSpec(fam, comp) catch return false;
@@ -138,7 +128,7 @@ pub const Traits = struct {
     /// architecture starts life CPU-first and offering a device it has no kernels for
     /// reads as a hang rather than as a fallback: SD was `cpu` only until
     /// `sd_unet{,_gpu,_cuda}` landed, Z-Image until `zimage_gpu` did, and Anima until
-    /// `anima_{gpu,cuda}` did. Advisory — `Session.denoiser` is what actually decides,
+    /// `anima_{gpu,cuda}` did. Advisory, `Session.denoiser` is what actually decides,
     /// and it warns by name when a checkpoint's dtype or a device leaves the trunk on
     /// the host.
     backends: []const Backend,
@@ -246,7 +236,7 @@ pub const Missing = struct {
 /// *explicit* path fails loudly in `Session.init` with a real error, and
 /// reporting it as "missing" here would name the wrong problem.
 ///
-/// `conditioner2` can only be missing for an architecture that has one — for
+/// `conditioner2` can only be missing for an architecture that has one, for
 /// everything else the pipeline never asks for it.
 pub fn missing(info: Info, have: Overrides) Missing {
     const need2 = traits(info.family).dual_conditioner;
@@ -277,8 +267,8 @@ pub const Probe = union(enum) {
 
 /// One path slot's memoized inspection.
 ///
-/// Opening a checkpoint parses (and mmaps) its header, so the settings screen —
-/// which re-renders every frame — must not do it per frame. The cache re-probes
+/// Opening a checkpoint parses (and mmaps) its header, so the settings screen,
+/// which re-renders every frame, must not do it per frame. The cache re-probes
 /// only when the path text (or, for a side file, the family it is scanned
 /// against) actually changes, which is exactly when the user edits the field.
 pub const Cache = struct {
@@ -316,7 +306,7 @@ pub const Cache = struct {
 
     /// Inspect a SIDE file (text encoder / VAE) against an already-known family.
     /// A standalone CLIP or VAE export holds no denoiser, so it cannot name its
-    /// own architecture — the primary checkpoint's family is the key.
+    /// own architecture, the primary checkpoint's family is the key.
     pub fn side(self: *Cache, path: []const u8, fam: Family) Probe {
         return self.probe(path, fam);
     }
@@ -342,7 +332,7 @@ pub const Cache = struct {
 /// non-null means "scan against this family" (a side file).
 fn read(gpa: std.mem.Allocator, io: std.Io, path: []const u8, fam: ?Family) Probe {
     // Opens by MAGIC, so a GGUF denoiser works here exactly as it does in the
-    // pipeline — the GUI never has to care which container a file uses.
+    // pipeline, the GUI never has to care which container a file uses.
     var c = pipeline.Container.open(gpa, io, path) catch |err| return .{ .failed = err };
     defer c.deinit();
     const store = c.store();
@@ -364,13 +354,13 @@ pub fn inspectSide(gpa: std.mem.Allocator, io: std.Io, path: []const u8, fam: Fa
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 test "traits: every family runs on the CPU, and the GPU list is per family" {
-    // ⚠️ Narrowed when Z-Image landed, which is exactly what the previous version of
+    // Narrowed when Z-Image landed, which is exactly what the previous version of
     // this test said should happen if an architecture ever arrived CPU-first. The
     // mechanism is unchanged: the GUI hides backends a family has no kernels for, so
     // a too-generous list here is an offered backend that then fails at render time.
     //
-    // Every family now has all four arms. ⚠️ A CPU-first arrival gets NARROWED here
-    // rather than having its traits entry over-promise — that is what the note on
+    // Every family now has all four arms. A CPU-first arrival gets NARROWED here
+    // rather than having its traits entry over-promise, that is what the note on
     // `backends` prescribes, and the opposite of what makes the GUI offer a backend
     // that then fails at render time. Anima was the last one and both its arms have
     // since landed, so the set is empty; add to it, do not edit the loop.
@@ -378,7 +368,7 @@ test "traits: every family runs on the CPU, and the GPU list is per family" {
     inline for (@typeInfo(Family).@"enum".fields) |f| {
         const fam: Family = @enumFromInt(f.value);
         const t = traits(fam);
-        // Every family runs on the CPU, without exception — that is the floor.
+        // Every family runs on the CPU, without exception, that is the floor.
         try std.testing.expect(t.supports(.cpu));
         for ([_]Backend{ .vulkan, .zig_cuda, .cuda }) |b| {
             errdefer std.debug.print("{t} supports({t}) = {}\n", .{ fam, b, t.supports(b) });
@@ -399,7 +389,7 @@ test "traits: each family has a label, a resolution and a positive step count" {
 
 test "traits: the families' defaults differ in the fields that matter" {
     // Swapping one family's CFG or resolution for another's is a visibly wrong
-    // image, not a preference — these must not converge by accident.
+    // image, not a preference, these must not converge by accident.
     try std.testing.expect(traits(.sd15).cfg != traits(.krea2).cfg);
     try std.testing.expect(traits(.sd15).width != traits(.krea2).width);
     try std.testing.expect(traits(.sdxl).width != traits(.sd15).width);
@@ -434,8 +424,8 @@ test "missing: a denoiser-only checkpoint needs both, until they are supplied" {
 
 test "missing: a bundled component is satisfied even with no override set" {
     // ggufy's SD arm: the GGUF holds only the UNet, CLIP+VAE come from the
-    // original checkpoint. The mirror case — a checkpoint with a VAE but no
-    // text encoder — must ask for exactly one file, not two.
+    // original checkpoint. The mirror case, a checkpoint with a VAE but no
+    // text encoder, must ask for exactly one file, not two.
     const unet_and_vae: Info = .{
         .family = .sd15,
         .contents = .{ .denoiser = true, .decoder = true },
@@ -480,13 +470,13 @@ test "missing: SDXL's second tower counts, and only for SDXL" {
 }
 
 test "spec: only SDXL probes a second tower, with its own spelling" {
-    // Reads `pipeline`'s table directly — this file no longer keeps a copy, and the
+    // Reads `pipeline`'s table directly, this file no longer keeps a copy, and the
     // point of the test is that the GUI's readiness view and the pipeline's resolver
     // cannot disagree about what a checkpoint contains.
     _ = try pipeline.componentSpec(.sdxl, .conditioner2);
     try std.testing.expectError(error.NoSuchComponent, pipeline.componentSpec(.sd15, .conditioner2));
     try std.testing.expectError(error.NoSuchComponent, pipeline.componentSpec(.krea2, .conditioner2));
-    // ⚠️ The two SDXL towers are spelled differently inside one file; reusing
+    // The two SDXL towers are spelled differently inside one file; reusing
     // embedder 0's probe for embedder 1 would find nothing and report a bundled
     // checkpoint as incomplete.
     try std.testing.expect(!std.mem.eql(
@@ -497,16 +487,16 @@ test "spec: only SDXL probes a second tower, with its own spelling" {
 }
 
 test "the GUI sees a GGUF text encoder as carrying a conditioner" {
-    // ⚠️ The regression this file's `storeHas` comment describes: the GUI kept its own
-    // probe table with ONE spelling per component, so a `.gguf` encoder — whose tensors
-    // are `embed_tokens.weight`, not `model.embed_tokens.weight` — scanned as empty and
+    // The regression this file's `storeHas` comment describes: the GUI kept its own
+    // probe table with ONE spelling per component, so a `.gguf` encoder, whose tensors
+    // are `embed_tokens.weight`, not `model.embed_tokens.weight`, scanned as empty and
     // the settings panel refused a file the engine loads fine.
     const gpa = std.testing.allocator;
     var b = try tp.gguf.TestBuilder.init(gpa, 3, 1, 1);
     defer b.deinit();
     try b.kvStr("general.architecture", "qwen3");
     // llama.cpp's spelling, which `canonicalName` maps to a BARE `embed_tokens.weight`
-    // — no `model.` to restore. That is the whole bug in one tensor name.
+    // no `model.` to restore. That is the whole bug in one tensor name.
     try b.tensor("token_embd.weight", &.{ 4, 2 }, 0, 0);
     const file = try b.finish(&([_]u8{0} ** 32));
     defer gpa.free(file);
@@ -541,10 +531,10 @@ test "Cache memoizes by path and re-probes when it changes" {
     // A path that cannot exist probes once and memoizes the failure.
     const p = "/nonexistent/tp-gui-test-checkpoint.safetensors";
     try std.testing.expect(cache.primary(p) == .failed);
-    // Same path → memo (no second open).
+    // Same path -> memo (no second open).
     try std.testing.expect(cache.primary(p) == .failed);
     try std.testing.expectEqualStrings(p, cache.path);
-    // Back to empty → unset again.
+    // Back to empty -> unset again.
     try std.testing.expect(cache.primary("") == .unset);
     try std.testing.expectEqual(@as(usize, 0), cache.path.len);
 }
@@ -559,7 +549,7 @@ test "Cache keys a side probe on the family too" {
     _ = cache.side(p, .krea2);
     try std.testing.expectEqual(@as(?Family, .krea2), cache.fam_key);
     // Same path, different family: must re-probe rather than reuse the krea2
-    // answer — the probe names are per-family.
+    // answer, the probe names are per-family.
     _ = cache.side(p, .sd15);
     try std.testing.expectEqual(@as(?Family, .sd15), cache.fam_key);
 }
@@ -571,8 +561,8 @@ extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 test "probe tables match a real checkpoint (opt-in)" {
     // The probe names here MIRROR `pipeline.componentSpec`, and a mirror drifts.
     // Point TP_SPEC_CHECKPOINT at a real bundled checkpoint to check the tables
-    // against one; unset (the default, and CI) skips. Silent on success — a
-    // passing test must not write to stderr (see ZIG.md).
+    // against one; unset (the default, and CI) skips. Silent on success, a
+    // passing test must not write to stderr.
     const raw = getenv("TP_SPEC_CHECKPOINT") orelse return;
     const path = std.mem.span(raw);
     if (path.len == 0) return;
