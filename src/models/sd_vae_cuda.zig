@@ -20,7 +20,7 @@ const Conv2d = ops.conv.Conv2d;
 const Config = sd_vae.Config;
 
 /// Column groups per GroupNorm statistics pass (matching the UNet's).
-const gn_chunks: usize = 256;
+const gn_chunks: usize = 32;
 
 const Bufs = struct {
     x: Buf = .{},
@@ -272,7 +272,7 @@ fn conv(
     src16: bool,
     dst16: bool,
 ) !void {
-    try sd_unet_cuda.convIntoPrec(be, &bufs.patch, dst, src, h, w, cv, mode, 1.0, src16, dst16);
+    try sd_unet_cuda.convIntoPrec(be, &bufs.patch, dst, src, h, w, cv, mode, null, 1.0, src16, dst16);
 }
 
 /// Divisor applied to the activation of a convolution that reads the RESIDUAL
@@ -318,5 +318,5 @@ fn convResidual(
     // could never have held that value. The two answer the same question and
     // `Config.act_f16` is off exactly where the divisor is load-bearing (SDXL).
     const div: f32 = if (act16) 1.0 else residual_act_div;
-    try sd_unet_cuda.convIntoPrec(be, &bufs.patch, dst, src, h, w, cv, mode, div, act16, act16);
+    try sd_unet_cuda.convIntoPrec(be, &bufs.patch, dst, src, h, w, cv, mode, null, div, act16, act16);
 }

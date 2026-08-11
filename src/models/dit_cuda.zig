@@ -17,6 +17,7 @@ const ops = @import("tp_ops");
 const DiT = dit.DiT;
 const Backend = cuda.Backend;
 const DeviceBuffer = cuda.backend.DeviceBuffer;
+const DType = @import("tp_core").dtype.DType;
 
 const F = dit.features; // 6144
 const heads = dit.n_heads; // 48
@@ -54,9 +55,54 @@ const zero_bias: [mlp_dim]f32 = @splat(0);
 /// Weight class of the DiT block linears. A convrot checkpoint is int8/int4
 /// (per-row scale + prep-once shared-input quant GEMM); a dense checkpoint is
 /// bf16 (each linear a standalone f16 tensor-core GEMM); an fp8-e4m3 checkpoint
-/// streams each linear through the dequant-to-f16 + hgemm path. Uniform across
-/// blocks.
-const LinKind = enum { i8, i4, w4a8, nvfp4, bf16, fp8 };
+/// streams each linear through the dequant-to-f16 + hgemm path; a GGUF checkpoint is a
+/// ggml block quant, decoded per GEMM either to convrot int8 (`blockq_i8`) or to f16
+/// (`blockq_f16`), which is the same choice `blockq_gemm` describes. Uniform across
+/// blocks, except that the two blockq arms cover several ggml formats and decode each
+/// weight by its own dtype, so a checkpoint that mixes them still computes correctly.
+const LinKind = enum { i8, i4, w4a8, nvfp4, bf16, fp8, blockq_i8, blockq_i4, blockq_f16, blockq_mmq };
+
+/// Which GEMM a GGUF block-quant DiT decodes its weights for.
+///
+/// `int8` rotates and re-quantizes to convrot int8, capping accuracy at int8's; `int4` is
+/// that decode one width down for the s4 tensor cores; `f16` expands the weight and keeps
+/// the format's own accuracy at about half int8's throughput; `mmq` multiplies the packed
+/// weight in place with its scale folded per 32-k substep, re-quantizing nothing.
+pub const BlockQGemm = enum { auto, int8, int4, f16, mmq };
+
+/// Default block-quant GEMM target, overridden by `--dit-gguf-gemm`.
+///
+/// What a re-quantizing route costs a format depends on how the format's own error
+/// compares to the regrid's, so `auto` takes int8 for q2_k and q4_k (0.03% and 0.7% more
+/// weight error) and f16 for the rest, where q8_0 alone would lose 84%. int4 is never
+/// `auto`: it is W4A4, and its 16-level ACTIVATIONS cost more than the weight regrid
+/// saves, 2.4 dB for 1.11x the step even on q2_k, whose weight barely notices the regrid.
+pub var blockq_gemm: BlockQGemm = .auto;
+
+/// The kind a block-quant weight of this dtype runs as, honouring `blockq_gemm`.
+///
+/// Only q2_k, q4_k and q8_0 have a convrot decode at all (`Backend.blockQFormat`), so for
+/// every other format this is f16 whatever the setting says.
+fn blockQKind(dt: DType) LinKind {
+    if (blockq_gemm == .mmq and Backend.mmqPipeDtype(dt)) return .blockq_mmq;
+    if (Backend.blockQFormat(dt) == null) return .blockq_f16;
+    return switch (blockq_gemm) {
+        .int8 => .blockq_i8,
+        .int4 => .blockq_i4,
+        .f16, .mmq => .blockq_f16,
+        .auto => switch (dt) {
+            .q2_k, .q4_k => .blockq_i8,
+            else => .blockq_f16,
+        },
+    };
+}
+
+/// Whether this dtype ends up in a W4A4 GEMM here, activation included. A GGUF's route
+/// is a runtime choice its dtype does not show, so a check calibrated on how far a route
+/// may drift from the weight-only CPU forward has to ask this, not the storage dtype.
+pub fn activationIs4Bit(dt: DType) bool {
+    return dt == .i4 or (dt.isBlockQuant() and blockQKind(dt) == .blockq_i4);
+}
 
 /// Prep the shared linear input. int8/int4 rotate+quantize `x` in place (all the
 /// block's GEMMs then read that internal state); bf16/fp8 GEMMs consume the f32
@@ -68,9 +114,24 @@ fn linPrep(be: *Backend, kind: LinKind, x: DeviceBuffer, m: usize, cols: usize) 
         // activation stays 8-bit, so only the WEIGHT's storage differs. That is also
         // what lets a mixed int8/W4A8 checkpoint share one prep per group.
         .i8, .w4a8 => try be.opI8Prep(x, m, cols, false),
+        // A block quant's activation prep IS int8's, because its weights are decoded to
+        // convrot int8 per GEMM (`opI8GemmBlockQ`) and fed to the same vendor kernel.
+        // The rotation has to match on both sides, so there is nothing format-specific
+        // to do here.
+        .blockq_i8 => try be.opI8PrepR(x, m, cols, false, blockq_rotate),
+        // The int4 decode writes s4, so the activation has to be s4 too. `opI4Prep`
+        // always rotates, so this arm ignores `blockq_rotate` rather than silently
+        // pairing an unrotated weight with a rotated activation.
+        .blockq_i4 => try be.opI4Prep(x, m, cols),
+        // MMQ quantizes the activation to q8_1 (a scale per 32 columns) and every linear
+        // sharing this `x` then reads it, which is the same prep-once the int8 arm gets
+        // and the f16 arm does not.
+        .blockq_mmq => try be.opMatmulQuantMmqPipePrep(x, m, cols),
         // NVFP4 needs no prep: it is weight-only here (its own activation quantization is
         // the Blackwell-only path), so the GEMM consumes the f32 `x` like bf16/fp8 do.
-        .nvfp4, .bf16, .fp8 => {},
+        // `blockq_f16` is weight-only for the same reason: `opMatmulQuant` converts the
+        // activation itself, and there is no rotation to match.
+        .nvfp4, .bf16, .fp8, .blockq_f16 => {},
     }
 }
 
@@ -91,8 +152,20 @@ fn lin(be: *Backend, kind: LinKind, y: DeviceBuffer, x: DeviceBuffer, m: usize, 
         .bf16 => if (be.ctx.cc_major >= 8)
             try be.opGemmBf16(y, x, m, w.bytes, w.rows, w.cols, bias[0..w.rows])
         else
-            try be.opMatmulBf16(y, x, m, w.bytes, w.rows, w.cols, bias[0..w.rows]),
+            try be.opMatmulBf16(y, x, m, w.bytes, w.rows, w.cols, bias[0..w.rows], false, false),
         .fp8 => try be.opMatmulFp8(y, x, m, w.bytes, w.scale, w.rows, w.cols),
+        // Both decode into the shared scratch and read the prepped activation out of
+        // backend state, so `x` is ignored here as it is on the other convrot arms.
+        .blockq_i8 => try i8GemmW(be, y, w, false),
+        .blockq_i4 => try be.opI4GemmBlockQ(y, w.dtype, w.bytes, w.rows, w.cols, true),
+        // Expands the weight to f16 and runs the f16 tensor cores, the same shape as the
+        // fp8 arm above. Structurally simpler than the int8 arm because nothing has to be
+        // rotated or rescaled, so the decode is a streaming dequant.
+        .blockq_f16 => try be.opMatmulQuant(w.dtype, y, x, m, w.bytes, w.rows, w.cols),
+        // The packed s8 goes straight to the int8 tensor cores, scale folded per 32-k
+        // substep, so the weight is used exactly. `x` is ignored: the prepped activation
+        // lives in backend state, like the other int8 arms.
+        .blockq_mmq => try be.opMatmulQuantMmqPipePrepped(w.dtype, y, m, w.bytes, w.rows, w.cols),
         .nvfp4 => try be.opMatmulNvfp4(
             y,
             x,
@@ -146,6 +219,10 @@ fn probeInput(be: *Backend, x: DeviceBuffer, m: usize, w: anytype) !void {
 /// per weight rather than per model means a checkpoint that mixes them computes
 /// correctly even though krea2's `LinKind` is still one value for the whole trunk.
 fn i8GemmW(be: *Backend, y: DeviceBuffer, w: anytype, c_h16: bool) !void {
+    // A block quant decodes to convrot int8 in a scratch and then runs this same GEMM,
+    // so it belongs here rather than on a path of its own.
+    if (Backend.blockQFormat(w.dtype) != null)
+        return be.opI8GemmBlockQ(y, w.dtype, w.bytes, w.rows, w.cols, c_h16, blockq_rotate);
     if (w.dtype == .w4a8) {
         const meta = w.w4a8.?;
         return be.opI8GemmW4A8(
@@ -163,6 +240,52 @@ fn i8GemmW(be: *Backend, y: DeviceBuffer, w: anytype, c_h16: bool) !void {
     return be.opI8Gemm(y, w.bytes, w.row_scale.?, w.rows, c_h16);
 }
 
+/// The first block linear the chosen decode cannot cover, by name, or null.
+///
+/// Scans every weight, not one: a checkpoint quantizes per layer, and the widths differ
+/// per layer anyway, so one probe would answer about one shape.
+fn blockQUnsupportedLin(model: *const DiT) ?[]const u8 {
+    for (model.blocks) |*b| {
+        for ([_]ops.matmul.Weight{
+            b.attn.wq, b.attn.wk, b.attn.wv, b.attn.wo, b.attn.gate,
+            b.mlp.gate, b.mlp.up,  b.mlp.down,
+        }) |w| {
+            switch (blockQKind(w.dtype)) {
+                // 1024 is the convrot FWHT's one-group-per-thread floor, and every format
+                // the int8 decode handles divides 256, so a multiple of 1024 is a whole
+                // number of blocks too. The f16 route rotates nothing and so has no floor.
+                .blockq_i8 => if (w.cols % 1024 != 0) return w.tag orelse "<untagged>",
+                // Same FWHT floor, plus the hand s4 GEMM's 128-row tile (cuBLASLt has
+                // no s4 kernel, so unlike the int8 arm there is no vendor fallback).
+                .blockq_i4 => if (w.cols % 1024 != 0 or w.rows % 128 != 0) return w.tag orelse "<untagged>",
+                .blockq_f16 => if (!Backend.quantKernelSupported(w.dtype)) return w.tag orelse "<untagged>",
+                // rows % 128 and cols % 256, which krea2's widths all satisfy.
+                .blockq_mmq => if (!Backend.mmqPipeSupported(w.dtype, w.rows, w.cols)) return w.tag orelse "<untagged>",
+                else => unreachable,
+            }
+        }
+    }
+    return null;
+}
+
+/// Bytes of decode scratch the block linears need, 0 when none of them decodes into
+/// it. Both convrot arms share `bq_i8`; the int4 one writes half as many bytes per
+/// weight, so a checkpoint mixing them sizes to the wider.
+fn blockQScratchNeed(model: *const DiT) usize {
+    var mx: usize = 0;
+    for (model.blocks) |*b| {
+        for ([_]ops.matmul.Weight{
+            b.attn.wq, b.attn.wk, b.attn.wv, b.attn.wo, b.attn.gate,
+            b.mlp.gate, b.mlp.up,  b.mlp.down,
+        }) |w| mx = @max(mx, switch (blockQKind(w.dtype)) {
+            .blockq_i8 => Backend.blockQScratchBytes(w.rows, w.cols),
+            .blockq_i4 => Backend.blockQScratchBytesI4(w.rows, w.cols),
+            else => 0,
+        });
+    }
+    return mx;
+}
+
 /// `probeInput` for the block linears, which are the only GEMMs here whose input
 /// may already have been consumed in place.
 fn probeLinInput(be: *Backend, kind: LinKind, x: DeviceBuffer, m: usize, w: anytype) !void {
@@ -175,6 +298,19 @@ fn probeLinInput(be: *Backend, kind: LinKind, x: DeviceBuffer, m: usize, w: anyt
 /// naive one-thread-per-(q,head) kernel. On by default, it is O(seq²) faster on
 /// the tensor cores and the naive path is O(seq²) latency-bound. Toggle for A/B.
 pub var use_tc_attn: bool = true;
+
+/// Whether the block-quant weight decode and the activation prep apply the convrot
+/// rotation. Both or neither: the rotation cancels between the two, so dropping it is
+/// exact arithmetic and changes only how well ONE scale per row fits the data. Toggle
+/// for A/B.
+///
+/// Leave it on. Off is 91 ms/step faster (1.181 -> 1.090, the FWHT leaving the decode
+/// AND the activation prep) and destroys the output: rel RMSE 0.915 against the CPU
+/// forward, i.e. uncorrelated, where rotated is 0.044. The weight side barely cares,
+/// unrotated per-row int8 costs 0.3% on top of q4_k's own error, measured offline, so
+/// all of that is the ACTIVATIONS. Their outliers are what one scale per row cannot
+/// span, and spreading them is the whole reason ComfyUI's int8 format is rotated at all.
+pub var blockq_rotate: bool = true;
 
 // ==== text fusion (CUDA) =====================================================
 //
@@ -527,7 +663,7 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
     // + dequant-to-f16 hgemm). A block-quant / unknown dtype has no GEMM path
     // here, so reject it with a clear error instead of a bad GPU access.
     const wqt = model.blocks[0].attn.wq.dtype;
-    if (!dit.gpuLinKindSupported(wqt)) return error.UnsupportedCheckpoint;
+    if (!dit.gpuLinKindSupported(wqt, .cuda)) return error.UnsupportedCheckpoint;
     const kind: LinKind = switch (wqt) {
         .i8 => .i8,
         .i4 => .i4,
@@ -535,13 +671,28 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
         .nvfp4 => .nvfp4,
         .bf16 => .bf16,
         .f8_e4m3 => .fp8,
-        else => unreachable, // gated above
+        else => blockQKind(wqt), // a block quant; anything else was gated above
     };
+    if (kind == .blockq_i8 or kind == .blockq_i4 or kind == .blockq_f16 or kind == .blockq_mmq) {
+        // Refuse a shape or format the chosen decode cannot cover here rather than at the
+        // launch. krea2's widths (6144, 1536, 16384) clear the int8 arm's floor.
+        if (blockQUnsupportedLin(model)) |tag| {
+            std.log.err("dit cuda: {s} is a block quant this decode cannot cover " ++
+                "(the int8/int4 routes need q2_k, q4_k or q8_0 and cols % 1024 == 0; the f16 route " ++
+                "needs a dequant kernel); try --dit-gguf-gemm f16, or --backend cpu", .{tag});
+            return error.UnsupportedCheckpoint;
+        }
+        // Pre-size the int8 decode scratch to the widest linear so it never grows
+        // mid-forward, for the reason the W4A8 one does: growth syncs the stream. The f16
+        // route's scratch is `fp8_w16`, which the fp8 arm already grows the same way.
+        const need = blockQScratchNeed(model);
+        if (need != 0) try be.ensureDeviceBuffer(&be.bq_i8, need);
+    }
     const zeros: []const f32 = &zero_bias;
     // f16 activation chain (c16): only on the cuBLASLt/irescale int8 libs path.
     // Halves the mlp gate/up/silu/down-input DRAM traffic (the biggest eltwise
     // category). Hand-PTX (igemm_pipe_fused writes f32), int4, and bf16 keep f32.
-    const mlp_f16 = (be.kernels == .libs) and (kind == .i8 or kind == .w4a8);
+    const mlp_f16 = (be.kernels == .libs) and (kind == .i8 or kind == .w4a8 or kind == .blockq_i8);
     if (dit.w4a8SmallGroup(model)) |tag| {
         std.log.err("dit cuda: {s} is W4A8 with a group_size that is not a multiple of 8; " ++
             "this backend's decode kernel needs one scale per 8 columns (use --backend cpu or vulkan)", .{tag});
@@ -633,6 +784,43 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
 }
 
 // --- tests -----------------------------------------------------------------
+
+// The block-quant route policy. Pure dispatch, so it runs on the fast suite: it decides
+// which GEMM a GGUF DiT uses, and getting it wrong is a silent 2x slowdown or a silent
+// accuracy cap rather than a failure.
+test "the block-quant route policy sends each format to the GEMM that suits it" {
+    const saved = blockq_gemm;
+    defer blockq_gemm = saved;
+
+    // `auto`: q4_k to int8, because int8-convrot's ~0.009 error floor is 0.7% on top of
+    // q4_k's own and buys 1.85x the speed. Everything else to f16, where q8_0 keeps the
+    // accuracy the int8 route would spend (84% more weight error, measured).
+    blockq_gemm = .auto;
+    try std.testing.expectEqual(LinKind.blockq_i8, blockQKind(.q4_k));
+    // q2_k too, even though its WEIGHT could take the s4 regrid: that route is W4A4 and
+    // the 4-bit activations, not the weight, are what it costs. int4 stays opt-in.
+    try std.testing.expectEqual(LinKind.blockq_i8, blockQKind(.q2_k));
+    for ([_]DType{ .q8_0, .q5_k, .q6_k, .q4_0, .iq4_nl }) |dt|
+        try std.testing.expectEqual(LinKind.blockq_f16, blockQKind(dt));
+
+    // An explicit choice is honoured for every format that has a convrot decode.
+    for ([_]DType{ .q2_k, .q4_k, .q8_0 }) |dt| {
+        blockq_gemm = .int8;
+        try std.testing.expectEqual(LinKind.blockq_i8, blockQKind(dt));
+        blockq_gemm = .int4;
+        try std.testing.expectEqual(LinKind.blockq_i4, blockQKind(dt));
+        blockq_gemm = .f16;
+        try std.testing.expectEqual(LinKind.blockq_f16, blockQKind(dt));
+    }
+
+    // Asking for int8 or int4 on a format with no convrot decode must NOT silently reach
+    // `opI8GemmBlockQ`, which would refuse mid-forward; it falls back to f16.
+    for ([_]BlockQGemm{ .int8, .int4 }) |g| {
+        blockq_gemm = g;
+        for ([_]DType{ .q5_k, .q6_k, .q4_0, .iq4_nl }) |dt|
+            try std.testing.expectEqual(LinKind.blockq_f16, blockQKind(dt));
+    }
+}
 
 // The CUDA W4A8 decode kernel against the CPU decode it must reproduce. Synthetic
 // weights, so no checkpoint is needed, which is the point: the kernel's only earlier

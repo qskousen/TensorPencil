@@ -54,6 +54,15 @@ pub const Builder = struct {
     /// Owned label strings.
     counts: [5]u32 = .{ 0, 0, 0, 0, 0 },
     label_next: u32 = 0,
+    /// Optional PTX performance-tuning directives for the entry (`.maxntid`,
+    /// `.minnctapersm`, `.maxnreg`), emitted between the parameter list and the body.
+    ///
+    /// Worth having because ptxas's default is to spend registers freely, which
+    /// maximizes single-warp speed and minimizes OCCUPANCY. For a kernel that is
+    /// latency-bound rather than throughput-bound that is the wrong trade, and
+    /// `.minnctapersm` is how you say so: it makes ptxas fit a target number of blocks
+    /// per SM and spill whatever that costs.
+    tuning: []const u8 = "",
 
     pub fn init(gpa: std.mem.Allocator) Builder {
         return .{ .gpa = gpa };
@@ -167,7 +176,12 @@ pub const Builder = struct {
         }
         try w.print(g, ".visible .entry {s}(\n", .{entry_name});
         try w.appendSlice(g, params);
-        try w.appendSlice(g, "\n)\n{\n");
+        try w.appendSlice(g, "\n)\n");
+        if (self.tuning.len != 0) {
+            try w.appendSlice(g, self.tuning);
+            try w.append(g, '\n');
+        }
+        try w.appendSlice(g, "{\n");
 
         // Register-file declarations (skip empty classes).
         inline for ([_]RegClass{ .pred, .b16, .b32, .b64, .f32 }) |c| {

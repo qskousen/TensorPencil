@@ -85,6 +85,15 @@ pub const Config = struct {
     norm_groups: usize,
     norm_eps: f32,
 
+    /// Carry activations as f16 rather than f32 on the GPU backends that support
+    /// it (`sd_unet_cuda.Workspace.act_f16`). It is RANGE that decides this, not
+    /// precision: f16 stops at 65504, and a trunk that reaches it renders solid
+    /// white with no error. Both SD UNets stay well inside it, which is why
+    /// ComfyUI runs them in fp16 by default. Same reasoning as
+    /// `sd_vae.Config.act_f16`, which is off for SDXL's decoder because that one
+    /// does overflow.
+    act_f16: bool = false,
+
     /// SD1.5's LDM config fixes `num_heads = 8`, so head_dim *grows* with the level
     /// (40, 80, 160); SDXL's fixes `num_head_channels = 64`, so the head count grows
     /// instead (10, 20). Getting this backwards keeps every shape valid and changes
@@ -94,6 +103,7 @@ pub const Config = struct {
     pub fn levels(self: Config) usize {
         return self.channel_mult.len;
     }
+
 
     /// Heads for a stage of `ch` channels.
     pub fn headsAt(self: Config, ch: usize) usize {
@@ -118,6 +128,7 @@ pub const sd15: Config = .{
     .time_embed_dim = 1280,
     .norm_groups = 32,
     .norm_eps = 1e-5,
+    .act_f16 = true,
 };
 
 /// SDXL. Three levels instead of four, no attention at the outermost one, a 10-deep
@@ -137,6 +148,7 @@ pub const sdxl: Config = .{
     .time_embed_dim = 1280,
     .norm_groups = 32,
     .norm_eps = 1e-5,
+    .act_f16 = true,
 };
 
 // --- weight groups ----------------------------------------------------------
@@ -609,6 +621,9 @@ pub const Workspace = struct {
     b: []f32,
     /// Skip-connection stack: `input_stages.len + 1` activations, contiguous.
     skips: [][]f32,
+    /// The (h, w) each skip was stored at. The decoder cannot derive it: its own grid
+    /// is one row or column larger wherever a downsample rounded up.
+    skip_hw: [][2]usize,
     /// Attention scratch (q/k/v/out at the widest stage) and the FF buffer.
     q: []f32,
     k: []f32,
@@ -671,6 +686,7 @@ pub const Workspace = struct {
             // 12 skips for 12 output blocks. The stack is LIFO, and popping in the
             // wrong order gives a plausible but wrong image.
             .skips = try gpa.alloc([]f32, u.input_stages.len + 1),
+            .skip_hw = try gpa.alloc([2]usize, u.input_stages.len + 1),
             .q = try gpa.alloc(f32, attn_elems),
             .k = try gpa.alloc(f32, attn_elems),
             .v = try gpa.alloc(f32, attn_elems),
@@ -685,6 +701,7 @@ pub const Workspace = struct {
     pub fn deinit(self: *Workspace) void {
         for (self.skips) |s| if (s.len > 0) self.gpa.free(s);
         self.gpa.free(self.skips);
+        self.gpa.free(self.skip_hw);
         self.gpa.free(self.a);
         self.gpa.free(self.b);
         self.gpa.free(self.q);
@@ -696,12 +713,13 @@ pub const Workspace = struct {
         self.* = undefined;
     }
 
-    fn setSkip(self: *Workspace, i: usize, data: []const f32) !void {
+    fn setSkip(self: *Workspace, i: usize, data: []const f32, h: usize, w: usize) !void {
         if (self.skips[i].len != data.len) {
             if (self.skips[i].len > 0) self.gpa.free(self.skips[i]);
             self.skips[i] = try self.gpa.alloc(f32, data.len);
         }
         @memcpy(self.skips[i], data);
+        self.skip_hw[i] = .{ h, w };
     }
 };
 
@@ -829,7 +847,7 @@ pub fn forward(
     var alt = ws.b;
     var ch = cfg.model_channels;
     try ops.conv.conv2d(io, gpa, cur[0 .. h * w * ch], x, h, w, u.stem);
-    try ws.setSkip(0, cur[0 .. h * w * ch]);
+    try ws.setSkip(0, cur[0 .. h * w * ch], h, w);
 
     // --- input side ---
     for (u.input_stages, 0..) |stage, si| {
@@ -849,7 +867,7 @@ pub fn forward(
             h = oh;
             w = ow;
         }
-        try ws.setSkip(si + 1, cur[0 .. h * w * ch]);
+        try ws.setSkip(si + 1, cur[0 .. h * w * ch], h, w);
     }
 
     // --- middle ---
@@ -889,9 +907,18 @@ pub fn forward(
             try applySpatial(io, gpa, ws, st, cur[0 .. h * w * ch], h, w, context, ctx_seq, cfg);
         }
         if (stage.sample_kind == .up) {
-            // Nearest-neighbour 2x, then a 3x3 convolution, LDM's `Upsample`.
-            const oh = h * 2;
-            const ow = w * 2;
+            // Nearest-neighbour up, then a 3x3 convolution, LDM's `Upsample`. The
+            // target is the grid the NEXT skip was stored at, not twice this one: the
+            // encoder halved rounding up, so on an odd dimension `2 * h` overshoots by
+            // one row. Reading the source at `y / 2` is still exactly right, because
+            // for a target of `2s - 1` that is what nearest-neighbour to an explicit
+            // size computes (diffusers passes the same thing as `upsample_size`).
+            // The last output stage is the top level and never upsamples, so there is
+            // always a shallower skip to aim at.
+            std.debug.assert(skip_top > 0);
+            const target = ws.skip_hw[skip_top - 1];
+            const oh = target[0];
+            const ow = target[1];
             const up = try gpa.alloc(f32, oh * ow * ch);
             defer gpa.free(up);
             for (0..oh) |y| {
@@ -1207,6 +1234,66 @@ test "the SD1.5 UNet matches diffusers.UNet2DConditionModel on a real checkpoint
         // 1024 outputs is far tighter than any structural error could survive.
         try testing.expect(rel < 1e-3);
     }
+}
+
+test "the UNet matches diffusers at a latent that does not halve cleanly" {
+    // 36x44 halves to 18x22, 9x11, 5x6. Coming back up, 5x6 doubles to 10x12 against a
+    // skip of 9x11, so the decoder has to follow the SKIP's size rather than twice its
+    // own. Every other fixture here is a power of two, where the two agree by accident.
+    // Non-square on purpose: a height/width swap survives any square case.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    try test_gate.requireIntegration();
+    try test_gate.requireModelFile(io, sd15_ckpt);
+    try test_gate.requireModelFile(io, ref_path);
+
+    var ref = try safetensors.SafeTensors.open(gpa, io, ref_path);
+    defer ref.deinit();
+    var ck = try safetensors.SafeTensors.open(gpa, io, sd15_ckpt);
+    defer ck.deinit();
+
+    var u = try UNet.load(gpa, .{ .safetensors = &ck }, sd15, "model.diffusion_model.");
+    defer u.deinit();
+
+    const lat_h = 36;
+    const lat_w = 44;
+    const cfg = sd15;
+    const n = lat_h * lat_w * cfg.channels;
+    const ctx_seq = 77;
+
+    const latent = try ref.get("unet_odd.latent").?.toF32Alloc(gpa);
+    defer gpa.free(latent);
+    const eps_ref = try ref.get("unet_odd.eps").?.toF32Alloc(gpa);
+    defer gpa.free(eps_ref);
+    const context = try ref.get("clip.hidden").?.toF32Alloc(gpa);
+    defer gpa.free(context);
+    const t_view = ref.get("unet.timestep").?;
+    const timesteps = std.mem.bytesAsSlice(i32, t_view.bytes);
+
+    var ws = try Workspace.init(gpa, &u, lat_h, lat_w, ctx_seq);
+    defer ws.deinit();
+
+    const x = try gpa.alloc(f32, n);
+    defer gpa.free(x);
+    plannarToChannelLast(x, latent, cfg.channels, lat_h, lat_w);
+
+    const out = try gpa.alloc(f32, n);
+    defer gpa.free(out);
+    try forward(&u, io, gpa, &ws, out, x, lat_h, lat_w, @floatFromInt(timesteps[0]), context[0 .. ctx_seq * cfg.context_dim], ctx_seq, null);
+
+    const want = try gpa.alloc(f32, n);
+    defer gpa.free(want);
+    plannarToChannelLast(want, eps_ref, cfg.channels, lat_h, lat_w);
+
+    var l2_ref: f64 = 0;
+    var l2_err: f64 = 0;
+    for (want, out) |e, a| {
+        l2_ref += @as(f64, e) * e;
+        l2_err += @as(f64, e - a) * (e - a);
+    }
+    const rel = @sqrt(l2_err / l2_ref);
+    errdefer std.debug.print("unet odd {d}x{d}: rel L2 {d:.6}\n", .{ lat_h, lat_w, rel });
+    try testing.expect(rel < 1e-3);
 }
 
 test "the UNet still matches diffusers at the size images are actually rendered at" {

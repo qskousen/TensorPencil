@@ -9,6 +9,18 @@ const ctxmod = @import("context.zig");
 const elt = @import("elt.zig"); // KvFmt only (elt imports nothing local, so no cycle)
 const Context = ctxmod.Context;
 
+/// Whether an environment variable is set, for the kernel-shape A/B switches. Its own
+/// copy rather than the backend's: `backend.zig` imports this file, not the reverse.
+fn envSet(name: [*:0]const u8) bool {
+    return std.c.getenv(name) != null;
+}
+
+/// An integer-valued kernel-shape knob from the environment, or null when unset.
+fn envInt(name: [*:0]const u8) ?usize {
+    const v = std.c.getenv(name) orelse return null;
+    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch null;
+}
+
 /// Trivial element-wise `c = a + b` over `n` f32. The toolchain smoke test:
 /// validates bindings -> PTX JIT -> launch -> readback end to end. Assembles
 /// cleanly under `ptxas -arch=sm_86`.
@@ -958,6 +970,43 @@ pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool, bits: 
     return b.build(entry, params, shared_decl);
 }
 
+/// A packed weight format `buildPrep`'s load stage can decode, so the rotate +
+/// per-row-quantize tail is shared with the activation prep. `none` is the activation
+/// case, an f32 or f16 row.
+///
+/// Every format here must divide 256 elements per block, because the load walks the row
+/// in strides of 256 columns and relies on a thread's position inside a block being the
+/// same for every block it touches.
+pub const PrepBlock = enum {
+    none,
+    q2_k,
+    q4_k,
+    q8_0,
+
+    fn blockElems(self: PrepBlock) usize {
+        return switch (self) {
+            .none => 0,
+            .q2_k, .q4_k => 256,
+            .q8_0 => 32,
+        };
+    }
+
+    fn blockBytes(self: PrepBlock) usize {
+        return switch (self) {
+            .none => 0,
+            .q2_k => 84,
+            .q4_k => 144,
+            .q8_0 => 34,
+        };
+    }
+
+    /// Storage bytes a run of `n` columns occupies. `n` must be a whole number of blocks.
+    pub fn bytesFor(self: PrepBlock, n: usize) usize {
+        std.debug.assert(self != .none); // an activation row's stride is its element width
+        return n / self.blockElems() * self.blockBytes();
+    }
+};
+
 /// Fused activation prep, one block (256 threads) per row: load x[row] into
 /// dynamic shared f32, radix-4 FWHT per 256-group (bit-identical to
 /// convrot.rotate, each butterfly output is a fixed 4-input sum, so the
@@ -969,18 +1018,44 @@ pub fn buildIgemmPipe(alloc: std.mem.Allocator, kstep: usize, fuse: bool, bits: 
 /// cols=16384 (the Vulkan path was forced to f16 there by the 48 KB cap; here
 /// f32 rotation is exact). Requires cols%256==0, (cols/256)%4==0 (FWHT) and
 /// (cols/(32/bits))%256==0 (pack). block 256, grid (m,1,1).
-pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: bool) ![:0]u8 {
+/// `block` makes the input a packed ggml-quant WEIGHT rather than an f32/f16 activation
+/// row, decoded in the load stage. Everything after the load is identical, which is the
+/// point: rotate, absmax, quantize is the same operation on a token's activations and on
+/// a weight's output row, and it is what lets a packed weight reach the vendor int8 GEMM
+/// through one reusable scratch instead of expanding in VRAM. Every supported block
+/// divides 256 and the load strides by 256 columns, so a thread's block index and offset
+/// within the block are per-thread constants.
+///
+/// `chunk` (0 = whole row) splits the row into independent column chunks and takes the
+/// per-row scale as an INPUT. The two go together: a chunk cannot compute the row's
+/// absmax, and without that reduction nothing forces the row resident, so shared drops
+/// from `cols*4` (64 KB at cols=16384, one block per SM) to `chunk*4`. Only weights use
+/// it, since only a weight's scale is fixed enough to compute once.
+///
+/// `rotate` applies the convrot FWHT, which is what makes ONE scale per row viable.
+/// Turning it off is only sound if BOTH sides skip it: the rotation is orthogonal and
+/// cancels between weight and activation, so dropping it from both is exact arithmetic,
+/// just a worse grid fit.
+pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: bool, block: PrepBlock, chunk: usize, rotate: bool) ![:0]u8 {
+    const bq = block != .none; // a packed weight input, whatever its format
     std.debug.assert(bits == 8 or bits == 4);
+    std.debug.assert(!bq or !in_f16);
+    std.debug.assert(!bq or cols % 256 == 0);
+    std.debug.assert(chunk == 0 or (bq and cols % chunk == 0 and chunk % 1024 == 0));
+    // Everything below sizes off the per-block WORK, which is the chunk when chunked.
+    const work = if (chunk != 0) chunk else cols;
+    const nchunk = if (chunk != 0) cols / chunk else 1;
     const in_bytes: usize = if (in_f16) 2 else 4; // activation elem width (f16 chain)
+    const row_bytes: usize = if (bq) block.bytesFor(cols) else cols * in_bytes;
     const per_word = 32 / bits; // s8: 4 elements/u32 ; s4: 8 elements/u32
     const per_word_log2 = std.math.log2_int(usize, per_word);
     const maxq: i32 = (@as(i32, 1) << @intCast(bits - 1)) - 1; // 127 / 7
     const minq: i32 = -(@as(i32, 1) << @intCast(bits - 1)); // -128 / -8
     const elt_mask: u32 = (@as(u32, 1) << @intCast(bits)) - 1; // 0xFF / 0xF
     const maxq_hex: u32 = @bitCast(@as(f32, @floatFromInt(maxq))); // 127.0 / 7.0 bits
-    const ngroups = cols / 256;
+    const ngroups = work / 256;
     const nbf = ngroups * 64 / 256; // butterflies/thread/pass (all 256 threads busy)
-    const load_iters = cols / 256;
+    const load_iters = work / 256;
     // Packed u32 output words for the whole row, and how many each of the 256 threads
     // takes. Writing it as `cols / (per_word * 256)` truncates to ZERO and silently
     // produces garbage: at `bits == 4` there are 8 elements per word, so a 1024-wide
@@ -990,7 +1065,7 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: boo
     // call. No error, no assert, and the block's other linears are fine; it is visible
     // only as a render that degrades into static over depth. Anima's cross-attention
     // K/V are exactly `cols = 1024` and are the only linears here that reach it.
-    const total_words = cols / per_word;
+    const total_words = work / per_word;
     const word_iters = (total_words + 255) / 256;
     // Threads past the word count must not store. For every width where `total_words` is
     // a whole number of blocks (every int8 width, and every int4 width >= 2048, i.e.
@@ -1003,7 +1078,7 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: boo
     // is that narrow (the smallest is cross-attention's 1024), and a wrong basis is not
     // something to guess at, so refuse rather than emit a kernel that does not rotate.
     if (nbf == 0) return error.UnsupportedWidth;
-    const SMAX_OFF = cols * 4; // smax[256] f32 region
+    const SMAX_OFF = work * 4; // smax[256] f32 region
     const SCALE_OFF = SMAX_OFF + 256 * 4; // scale broadcast slot
 
     var b = ptx.Builder.init(alloc);
@@ -1024,11 +1099,26 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: boo
     const r_smem = try b.reg(.b32);
     const rd_xrow = try b.reg(.b64); // p_x + row*cols*in_bytes
     const rd_tmp = try b.reg(.b64);
+    const r_smx0 = try b.reg(.b32); // scratch for the (row, chunk) split
     try b.linef("mov.u32 {s}, %tid.x;", .{r_t});
     try b.linef("mov.u32 {s}, %ctaid.x;", .{r_row});
     try b.linef("mov.u32 {s}, smem;", .{r_smem});
-    try b.linef("mul.wide.u32 {s}, {s}, {d};", .{ rd_xrow, r_row, cols * in_bytes });
+    const r_ch = try b.reg(.b32);
+    try b.linef("mov.u32 {s}, 0;", .{r_ch});
+    if (chunk != 0) {
+        // block -> (row, chunk). One div per block, against a whole chunk of work.
+        try b.linef("div.u32 {s}, {s}, {d};", .{ r_ch, r_row, nchunk });
+        try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_smx0, r_ch, nchunk });
+        try b.linef("sub.u32 {s}, {s}, {s};", .{ r_smx0, r_row, r_smx0 }); // chunk index
+        try b.linef("mov.u32 {s}, {s};", .{ r_row, r_ch });
+        try b.linef("mov.u32 {s}, {s};", .{ r_ch, r_smx0 });
+    }
+    try b.linef("mul.wide.u32 {s}, {s}, {d};", .{ rd_xrow, r_row, row_bytes });
     try b.linef("add.s64 {s}, {s}, {s};", .{ rd_xrow, rd_x, rd_xrow });
+    if (chunk != 0) {
+        try b.linef("mul.wide.u32 {s}, {s}, {d};", .{ rd_tmp, r_ch, block.bytesFor(chunk) });
+        try b.linef("add.s64 {s}, {s}, {s};", .{ rd_xrow, rd_xrow, rd_tmp });
+    }
 
     // ---- load x[row] -> shared f32 (rotation runs in f32 regardless of input) ----
     const r_sh = try b.reg(.b32); // smem + t*4
@@ -1036,6 +1126,183 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: boo
     const r_ftmp = try b.reg(.f32);
     try b.linef("shl.b32 {s}, {s}, 2;", .{ r_sh, r_t });
     try b.linef("add.u32 {s}, {s}, {s};", .{ r_sh, r_sh, r_smem });
+    if (block == .q8_0) {
+        // A 256-column group is 8 blocks of 34 B. Thread `t` reads element `t` of every
+        // group, so its block (t/32) and its element in that block (t%32) are constants:
+        // one address per thread for the scales and one for the quants, both advancing
+        // by 272 B per group. The 32 threads of a warp share a block, so the scale load
+        // is a broadcast.
+        const r_o = try b.reg(.b32);
+        const rd_d = try b.reg(.b64);
+        const h16 = try b.reg(.b16);
+        const fd = try b.reg(.f32);
+        const fq = try b.reg(.f32);
+        const r_qv = try b.reg(.b32);
+        try b.linef("shr.u32 {s}, {s}, 5;", .{ r_o, r_t }); // block within the group
+        try b.linef("mul.lo.u32 {s}, {s}, 34;", .{ r_o, r_o });
+        try b.linef("cvt.u64.u32 {s}, {s};", .{ rd_tmp, r_o });
+        try b.linef("add.s64 {s}, {s}, {s};", .{ rd_d, rd_xrow, rd_tmp }); // its f16 d
+        try b.linef("and.b32 {s}, {s}, 31;", .{ r_o, r_t }); // element in the block
+        try b.linef("add.u32 {s}, {s}, 2;", .{ r_o, r_o }); // qs follows d
+        try b.linef("cvt.u64.u32 {s}, {s};", .{ rd_tmp, r_o });
+        try b.linef("add.s64 {s}, {s}, {s};", .{ rd_g, rd_d, rd_tmp });
+        var i: usize = 0;
+        while (i < load_iters) : (i += 1) {
+            const bo = i * 8 * 34;
+            try b.linef("ld.global.b16 {s}, [{s}+{d}];", .{ h16, rd_d, bo });
+            try b.linef("ld.global.s8 {s}, [{s}+{d}];", .{ r_qv, rd_g, bo });
+            try b.linef("cvt.f32.f16 {s}, {s};", .{ fd, h16 });
+            try b.linef("cvt.rn.f32.s32 {s}, {s};", .{ fq, r_qv });
+            try b.linef("mul.f32 {s}, {s}, {s};", .{ r_ftmp, fd, fq });
+            try b.linef("st.shared.f32 [{s}+{d}], {s};", .{ r_sh, i * 256 * 4, r_ftmp });
+        }
+    } else if (block == .q2_k) {
+        // Element t of a 256-block sits at a fixed place in the block for every block,
+        // so all of this is a per-thread constant. Following ggml's
+        // dequantize_row_q2_K walk: the 256 elements are two halves of 128, each half
+        // four 32-element passes at shifts 0,2,4,6, each pass two 16-element sub-blocks.
+        //   h = t>>7 (half), j = (t>>5)&3 (pass), sub = (t>>4)&1, u = t&31
+        //   scale index = h*8 + j*2 + sub ; quant byte = 16 + h*32 + u ; shift = 2*j
+        // value = d*(sc & 15) * ((q >> shift) & 3) - dmin*(sc >> 4)
+        const r_is = try b.reg(.b32);
+        const r_qoff = try b.reg(.b32);
+        const r_shift = try b.reg(.b32);
+        const r_o = try b.reg(.b32);
+        const rd_sc = try b.reg(.b64);
+        const r_sc = try b.reg(.b32);
+        const r_qb = try b.reg(.b32);
+        const r_dd = try b.reg(.b32);
+        const h16 = try b.regs(.b16, 2);
+        const fd = try b.reg(.f32);
+        const fdm = try b.reg(.f32);
+        const fsx = try b.reg(.f32);
+        try b.linef("shr.u32 {s}, {s}, 7;", .{ r_is, r_t }); // h
+        try b.linef("shl.b32 {s}, {s}, 3;", .{ r_is, r_is }); // h*8
+        try b.linef("shr.u32 {s}, {s}, 5;", .{ r_o, r_t });
+        try b.linef("and.b32 {s}, {s}, 3;", .{ r_o, r_o }); // j
+        try b.linef("shl.b32 {s}, {s}, 1;", .{ r_shift, r_o }); // shift = 2j
+        try b.linef("shl.b32 {s}, {s}, 1;", .{ r_o, r_o }); // j*2
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_is, r_is, r_o });
+        try b.linef("shr.u32 {s}, {s}, 4;", .{ r_o, r_t });
+        try b.linef("and.b32 {s}, {s}, 1;", .{ r_o, r_o }); // sub
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_is, r_is, r_o });
+        try b.linef("shr.u32 {s}, {s}, 7;", .{ r_qoff, r_t }); // h
+        try b.linef("shl.b32 {s}, {s}, 5;", .{ r_qoff, r_qoff }); // h*32
+        try b.linef("and.b32 {s}, {s}, 31;", .{ r_o, r_t }); // u
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_qoff, r_qoff, r_o });
+        try b.linef("add.u32 {s}, {s}, 16;", .{ r_qoff, r_qoff }); // qs follows the scales
+        try b.linef("cvt.u64.u32 {s}, {s};", .{ rd_tmp, r_is });
+        try b.linef("add.s64 {s}, {s}, {s};", .{ rd_sc, rd_xrow, rd_tmp });
+        try b.linef("cvt.u64.u32 {s}, {s};", .{ rd_tmp, r_qoff });
+        try b.linef("add.s64 {s}, {s}, {s};", .{ rd_g, rd_xrow, rd_tmp });
+        var i: usize = 0;
+        while (i < load_iters) : (i += 1) {
+            const bo = i * 84;
+            // d and dmin are adjacent f16 at the block tail; 84 is a multiple of 4 and
+            // so is the row stride, so the pair is one aligned u32.
+            try b.linef("ld.global.u32 {s}, [{s}+{d}];", .{ r_dd, rd_xrow, bo + 80 });
+            try b.linef("ld.global.u8 {s}, [{s}+{d}];", .{ r_sc, rd_sc, bo });
+            try b.linef("ld.global.u8 {s}, [{s}+{d}];", .{ r_qb, rd_g, bo });
+            try b.linef("mov.b32 {{{s}, {s}}}, {s};", .{ h16[0], h16[1], r_dd });
+            try b.linef("cvt.f32.f16 {s}, {s};", .{ fd, h16[0] });
+            try b.linef("cvt.f32.f16 {s}, {s};", .{ fdm, h16[1] });
+            try b.linef("shr.u32 {s}, {s}, {s};", .{ r_qb, r_qb, r_shift });
+            try b.linef("and.b32 {s}, {s}, 3;", .{ r_qb, r_qb });
+            try b.linef("shr.u32 {s}, {s}, 4;", .{ r_o, r_sc }); // min index
+            try b.linef("and.b32 {s}, {s}, 15;", .{ r_sc, r_sc }); // scale index
+            try b.linef("cvt.rn.f32.u32 {s}, {s};", .{ fsx, r_sc });
+            try b.linef("mul.f32 {s}, {s}, {s};", .{ fd, fd, fsx });
+            try b.linef("cvt.rn.f32.u32 {s}, {s};", .{ fsx, r_qb });
+            try b.linef("mul.f32 {s}, {s}, {s};", .{ r_ftmp, fd, fsx });
+            try b.linef("cvt.rn.f32.u32 {s}, {s};", .{ fsx, r_o });
+            try b.linef("mul.f32 {s}, {s}, {s};", .{ fdm, fdm, fsx });
+            try b.linef("sub.f32 {s}, {s}, {s};", .{ r_ftmp, r_ftmp, fdm });
+            try b.linef("st.shared.f32 [{s}+{d}], {s};", .{ r_sh, i * 256 * 4, r_ftmp });
+        }
+    } else if (block == .q4_k) {
+        // Per-thread constants: within-block offset is `t` for every block, so
+        // g = t/64, l = t%32, half = (t/32)&1, sub-block = 2g + half.
+        const r_g = try b.reg(.b32);
+        const r_half = try b.reg(.b32);
+        const r_sb = try b.reg(.b32);
+        const r_qoff = try b.reg(.b32);
+        const r_shift = try b.reg(.b32);
+        const r_is8 = try b.reg(.b32);
+        const hq = try b.regs(.b32, 4);
+        const r_sc = try b.reg(.b32);
+        const r_mn = try b.reg(.b32);
+        const r_qb = try b.reg(.b32);
+        const h16 = try b.regs(.b16, 2);
+        const fdq = try b.reg(.f32);
+        const fdm = try b.reg(.f32);
+        const fsx = try b.reg(.f32);
+        const p_hi = try b.reg(.pred);
+        try b.linef("shr.u32 {s}, {s}, 6;", .{ r_g, r_t });
+        try b.linef("shr.u32 {s}, {s}, 5;", .{ r_half, r_t });
+        try b.linef("and.b32 {s}, {s}, 1;", .{ r_half, r_half });
+        try b.linef("shl.b32 {s}, {s}, 1;", .{ r_sb, r_g });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_sb, r_sb, r_half });
+        try b.linef("shl.b32 {s}, {s}, 5;", .{ r_qoff, r_g }); // g*32
+        try b.linef("and.b32 {s}, {s}, 31;", .{ r_shift, r_t }); // l = t & 31
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_qoff, r_qoff, r_shift });
+        try b.linef("add.u32 {s}, {s}, 16;", .{ r_qoff, r_qoff }); // qs follows the header
+        try b.linef("shl.b32 {s}, {s}, 2;", .{ r_shift, r_half }); // nibble shift 0 or 4
+        // Shift for get_scale_min_k4: is*8 on the low arm, (is-4)*8 on the high one.
+        try b.linef("setp.ge.u32 {s}, {s}, 4;", .{ p_hi, r_sb });
+        try b.linef("shl.b32 {s}, {s}, 3;", .{ r_is8, r_sb });
+        try b.linef("@{s} add.u32 {s}, {s}, -32;", .{ p_hi, r_is8, r_is8 });
+        try b.linef("cvt.u64.u32 {s}, {s};", .{ rd_tmp, r_qoff });
+        try b.linef("add.s64 {s}, {s}, {s};", .{ rd_g, rd_xrow, rd_tmp });
+        var i: usize = 0;
+        while (i < load_iters) : (i += 1) {
+            const bo = i * 144;
+            // Fresh labels per unrolled block: one pair for the whole loop would be
+            // defined `load_iters` times over.
+            const l_hi = try b.newLabel("qhi");
+            const l_done = try b.newLabel("qdone");
+            try b.linef("ld.global.v4.u32 {{{s}, {s}, {s}, {s}}}, [{s}+{d}];", .{ hq[0], hq[1], hq[2], hq[3], rd_xrow, bo });
+            try b.linef("ld.global.u8 {s}, [{s}+{d}];", .{ r_qb, rd_g, bo });
+            try b.linef("@{s} bra {s};", .{ p_hi, l_hi });
+            try b.linef("shr.u32 {s}, {s}, {s};", .{ r_sc, hq[1], r_is8 });
+            try b.linef("and.b32 {s}, {s}, 63;", .{ r_sc, r_sc });
+            try b.linef("shr.u32 {s}, {s}, {s};", .{ r_mn, hq[2], r_is8 });
+            try b.linef("and.b32 {s}, {s}, 63;", .{ r_mn, r_mn });
+            try b.linef("bra {s};", .{l_done});
+            try b.label(l_hi);
+            try b.linef("shr.u32 {s}, {s}, {s};", .{ r_sc, hq[3], r_is8 });
+            // Shift THEN mask: masking to 15 first drops the high nibble that is the
+            // min, and the render survives it looking merely wrong rather than broken.
+            try b.linef("shr.u32 {s}, {s}, 4;", .{ r_mn, r_sc });
+            try b.linef("and.b32 {s}, {s}, 15;", .{ r_mn, r_mn });
+            try b.linef("and.b32 {s}, {s}, 15;", .{ r_sc, r_sc });
+            try b.linef("shr.u32 {s}, {s}, {s};", .{ r_qb, hq[1], r_is8 });
+            try b.linef("shr.u32 {s}, {s}, 6;", .{ r_qb, r_qb });
+            try b.linef("and.b32 {s}, {s}, 3;", .{ r_qb, r_qb });
+            try b.linef("shl.b32 {s}, {s}, 4;", .{ r_qb, r_qb });
+            try b.linef("or.b32 {s}, {s}, {s};", .{ r_sc, r_sc, r_qb });
+            try b.linef("shr.u32 {s}, {s}, {s};", .{ r_qb, hq[2], r_is8 });
+            try b.linef("shr.u32 {s}, {s}, 6;", .{ r_qb, r_qb });
+            try b.linef("and.b32 {s}, {s}, 3;", .{ r_qb, r_qb });
+            try b.linef("shl.b32 {s}, {s}, 4;", .{ r_qb, r_qb });
+            try b.linef("or.b32 {s}, {s}, {s};", .{ r_mn, r_mn, r_qb });
+            try b.linef("ld.global.u8 {s}, [{s}+{d}];", .{ r_qb, rd_g, bo });
+            try b.label(l_done);
+            // value = d*sc*nib - dmin*m
+            try b.linef("mov.b32 {{{s}, {s}}}, {s};", .{ h16[0], h16[1], hq[0] });
+            try b.linef("cvt.f32.f16 {s}, {s};", .{ fdq, h16[0] });
+            try b.linef("cvt.f32.f16 {s}, {s};", .{ fdm, h16[1] });
+            try b.linef("shr.u32 {s}, {s}, {s};", .{ r_qb, r_qb, r_shift });
+            try b.linef("and.b32 {s}, {s}, 15;", .{ r_qb, r_qb });
+            try b.linef("cvt.rn.f32.u32 {s}, {s};", .{ fsx, r_sc });
+            try b.linef("mul.f32 {s}, {s}, {s};", .{ fdq, fdq, fsx });
+            try b.linef("cvt.rn.f32.u32 {s}, {s};", .{ fsx, r_qb });
+            try b.linef("mul.f32 {s}, {s}, {s};", .{ r_ftmp, fdq, fsx });
+            try b.linef("cvt.rn.f32.u32 {s}, {s};", .{ fsx, r_mn });
+            try b.linef("mul.f32 {s}, {s}, {s};", .{ fdm, fdm, fsx });
+            try b.linef("sub.f32 {s}, {s}, {s};", .{ r_ftmp, r_ftmp, fdm });
+            try b.linef("st.shared.f32 [{s}+{d}], {s};", .{ r_sh, i * 256 * 4, r_ftmp });
+        }
+    } else {
     try b.linef("cvt.u64.u32 {s}, {s};", .{ rd_tmp, r_t });
     try b.linef("shl.b64 {s}, {s}, {d};", .{ rd_tmp, rd_tmp, if (in_f16) @as(usize, 1) else 2 });
     try b.linef("add.s64 {s}, {s}, {s};", .{ rd_g, rd_xrow, rd_tmp });
@@ -1051,6 +1318,7 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: boo
             }
             try b.linef("st.shared.f32 [{s}+{d}], {s};", .{ r_sh, i * 256 * 4, r_ftmp });
         }
+    }
     }
     try b.line("bar.sync 0;");
 
@@ -1068,7 +1336,7 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: boo
     const fd = try b.reg(.f32);
     const fo = try b.reg(.f32);
     const strides = [_]usize{ 1, 4, 16, 64 };
-    for (strides) |s| {
+    for (if (rotate) strides[0..] else strides[0..0]) |s| {
         const logs = std.math.log2_int(usize, s);
         var bi: usize = 0;
         while (bi < nbf) : (bi += 1) {
@@ -1119,59 +1387,77 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: boo
         try b.line("bar.sync 0;");
     }
 
-    // ---- /16 normalize + per-thread abs-max ----
-    const famax = try b.reg(.f32);
-    const fav = try b.reg(.f32);
-    try b.linef("mov.f32 {s}, 0f00000000;", .{famax});
-    {
-        var i: usize = 0;
-        while (i < load_iters) : (i += 1) {
-            try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ fo, r_sh, i * 256 * 4 });
-            try b.linef("mul.f32 {s}, {s}, 0f3D800000;", .{ fo, fo }); // *0.0625 == /16
-            try b.linef("st.shared.f32 [{s}+{d}], {s};", .{ r_sh, i * 256 * 4, fo });
-            try b.linef("abs.f32 {s}, {s};", .{ fav, fo });
-            try b.linef("max.f32 {s}, {s}, {s};", .{ famax, famax, fav });
+    const fsc = try b.reg(.f32); // the row's quantization scale, however it was obtained
+    // With an external scale (chunked q4_k weights) there is no reduction at all: the
+    // abs-max pass and its bar.syncs disappear along with the need to hold the row.
+    if (chunk == 0) {
+        // ---- /16 normalize + per-thread abs-max ----
+        const famax = try b.reg(.f32);
+        const fav = try b.reg(.f32);
+        try b.linef("mov.f32 {s}, 0f00000000;", .{famax});
+        {
+            var i: usize = 0;
+            while (i < load_iters) : (i += 1) {
+                try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ fo, r_sh, i * 256 * 4 });
+                // The 1/16 is the FWHT's gain, so it only applies when it ran.
+                if (rotate) try b.linef("mul.f32 {s}, {s}, 0f3D800000;", .{ fo, fo });
+                try b.linef("st.shared.f32 [{s}+{d}], {s};", .{ r_sh, i * 256 * 4, fo });
+                try b.linef("abs.f32 {s}, {s};", .{ fav, fo });
+                try b.linef("max.f32 {s}, {s}, {s};", .{ famax, famax, fav });
+            }
         }
-    }
-    // write per-thread amax to smax[t], reduce 256->1
-    const r_smx = try b.reg(.b32);
-    try b.linef("shl.b32 {s}, {s}, 2;", .{ r_smx, r_t });
-    try b.linef("add.u32 {s}, {s}, {s};", .{ r_smx, r_smx, r_smem });
-    try b.linef("add.u32 {s}, {s}, {d};", .{ r_smx, r_smx, SMAX_OFF });
-    try b.linef("st.shared.f32 [{s}], {s};", .{ r_smx, famax });
-    try b.line("bar.sync 0;");
-    const p_red = try b.reg(.pred);
-    const foth = try b.reg(.f32);
-    const steps = [_]usize{ 128, 64, 32, 16, 8, 4, 2, 1 };
-    for (steps) |st| {
-        const lbl = try b.newLabel("red");
-        try b.linef("setp.ge.u32 {s}, {s}, {d};", .{ p_red, r_t, st });
-        try b.linef("@{s} bra {s};", .{ p_red, lbl });
-        try b.linef("ld.shared.f32 {s}, [{s}];", .{ fo, r_smx });
-        try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ foth, r_smx, st * 4 });
-        try b.linef("max.f32 {s}, {s}, {s};", .{ fo, fo, foth });
-        try b.linef("st.shared.f32 [{s}], {s};", .{ r_smx, fo });
-        try b.label(lbl);
+        // write per-thread amax to smax[t], reduce 256->1
+        const r_smx = try b.reg(.b32);
+        try b.linef("shl.b32 {s}, {s}, 2;", .{ r_smx, r_t });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_smx, r_smx, r_smem });
+        try b.linef("add.u32 {s}, {s}, {d};", .{ r_smx, r_smx, SMAX_OFF });
+        try b.linef("st.shared.f32 [{s}], {s};", .{ r_smx, famax });
+        try b.line("bar.sync 0;");
+        const p_red = try b.reg(.pred);
+        const foth = try b.reg(.f32);
+        const steps = [_]usize{ 128, 64, 32, 16, 8, 4, 2, 1 };
+        for (steps) |st| {
+            const lbl = try b.newLabel("red");
+            try b.linef("setp.ge.u32 {s}, {s}, {d};", .{ p_red, r_t, st });
+            try b.linef("@{s} bra {s};", .{ p_red, lbl });
+            try b.linef("ld.shared.f32 {s}, [{s}];", .{ fo, r_smx });
+            try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ foth, r_smx, st * 4 });
+            try b.linef("max.f32 {s}, {s}, {s};", .{ fo, fo, foth });
+            try b.linef("st.shared.f32 [{s}], {s};", .{ r_smx, fo });
+            try b.label(lbl);
+            try b.line("bar.sync 0;");
+        }
+        // thread 0: scale = max(absmax/127, 1e-12); write act_scale[row] + broadcast.
+        const lbl_sk = try b.newLabel("sk");
+        const r_scaleaddr = try b.reg(.b32);
+        const rd_srow = try b.reg(.b64);
+        try b.linef("setp.ne.u32 {s}, {s}, 0;", .{ p_red, r_t });
+        try b.linef("@{s} bra {s};", .{ p_red, lbl_sk });
+        try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ fsc, r_smem, SMAX_OFF }); // smax[0] = absmax
+        try b.linef("div.rn.f32 {s}, {s}, 0f{X:0>8};", .{ fsc, fsc, maxq_hex }); // /127.0 (s8) or /7.0 (s4)
+        try b.linef("max.f32 {s}, {s}, 0f2B8CBCCC;", .{ fsc, fsc }); // 1e-12 zero-guard
+        try b.linef("add.u32 {s}, {s}, {d};", .{ r_scaleaddr, r_smem, SCALE_OFF });
+        try b.linef("st.shared.f32 [{s}], {s};", .{ r_scaleaddr, fsc });
+        try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rd_srow, r_row });
+        try b.linef("add.s64 {s}, {s}, {s};", .{ rd_srow, rd_s, rd_srow });
+        try b.linef("st.global.f32 [{s}], {s};", .{ rd_srow, fsc });
+        try b.label(lbl_sk);
+        try b.line("bar.sync 0;");
+    } else {
+        const rd_sin = try b.reg(.b64);
+        try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rd_sin, r_row });
+        try b.linef("add.s64 {s}, {s}, {s};", .{ rd_sin, rd_s, rd_sin });
+        try b.linef("ld.global.f32 {s}, [{s}];", .{ fsc, rd_sin });
+        // The whole-row path normalizes shared by 1/16 (the radix-4 FWHT's gain) before
+        // taking the absmax, so the stored scale is against NORMALIZED values while the
+        // shared here still holds raw ones. Fold the 16 into the scale rather than
+        // re-walking shared to divide: a per-row constant, so it is one multiply.
+        if (rotate) try b.linef("mul.f32 {s}, {s}, 0f41800000;", .{ fsc, fsc }); // *16
+        const r_sca = try b.reg(.b32);
+        try b.linef("add.u32 {s}, {s}, {d};", .{ r_sca, r_smem, SCALE_OFF });
+        try b.linef("st.shared.f32 [{s}], {s};", .{ r_sca, fsc });
         try b.line("bar.sync 0;");
     }
-    // thread 0: scale = max(absmax/127, 1e-12); write act_scale[row] + broadcast.
-    const lbl_sk = try b.newLabel("sk");
-    const r_scaleaddr = try b.reg(.b32);
-    const fsc = try b.reg(.f32);
-    const rd_srow = try b.reg(.b64);
-    try b.linef("setp.ne.u32 {s}, {s}, 0;", .{ p_red, r_t });
-    try b.linef("@{s} bra {s};", .{ p_red, lbl_sk });
-    try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ fsc, r_smem, SMAX_OFF }); // smax[0] = absmax
-    try b.linef("div.rn.f32 {s}, {s}, 0f{X:0>8};", .{ fsc, fsc, maxq_hex }); // /127.0 (s8) or /7.0 (s4)
-    try b.linef("max.f32 {s}, {s}, 0f2B8CBCCC;", .{ fsc, fsc }); // 1e-12 zero-guard
-    try b.linef("add.u32 {s}, {s}, {d};", .{ r_scaleaddr, r_smem, SCALE_OFF });
-    try b.linef("st.shared.f32 [{s}], {s};", .{ r_scaleaddr, fsc });
-    try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rd_srow, r_row });
-    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_srow, rd_s, rd_srow });
-    try b.linef("st.global.f32 [{s}], {s};", .{ rd_srow, fsc });
-    try b.label(lbl_sk);
-    try b.line("bar.sync 0;");
-
     // ---- quantize + pack (round half away, clamp [-127,127]) ----
     const r_word = try b.reg(.b32);
     const r_out = try b.reg(.b32);
@@ -1186,6 +1472,12 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: boo
     try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ fsc, r_smem, SCALE_OFF });
     // q row base = p_q + row*(cols/per_word)*4 bytes  (= row*cols for s8, row*cols/2 for s4)
     try b.linef("mul.wide.u32 {s}, {s}, {d};", .{ rd_qrow, r_row, (cols / per_word) * 4 });
+    if (chunk != 0) {
+        // BYTES per chunk, not elements: at `bits == 4` a chunk is chunk/2 bytes wide,
+        // and stepping by `chunk` would write every chunk but the first past its row.
+        try b.linef("mul.wide.u32 {s}, {s}, {d};", .{ rd_tmp, r_ch, chunk / per_word * 4 });
+        try b.linef("add.s64 {s}, {s}, {s};", .{ rd_qrow, rd_qrow, rd_tmp });
+    }
     try b.linef("add.s64 {s}, {s}, {s};", .{ rd_qrow, rd_q, rd_qrow });
     {
         var i: usize = 0;
@@ -1228,7 +1520,11 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: boo
     }
 
     return b.build(
-        if (bits == 8) "iprep" else "i4prep",
+        if (bq and chunk != 0)
+            (if (bits == 4) (if (rotate) "bqdec4" else "bqdec4_nr") else if (rotate) "bqdec" else "bqdec_nr")
+        else if (bq)
+            (if (bits == 4) (if (rotate) "bqprep4" else "bqprep4_nr") else if (rotate) "bqprep" else "bqprep_nr")
+        else if (bits == 8) (if (rotate) "iprep" else "iprep_nr") else "i4prep",
         "    .param .u64 p_x,\n    .param .u64 p_q,\n    .param .u64 p_s",
         ".extern .shared .align 16 .b8 smem[];",
     );
@@ -2505,7 +2801,7 @@ pub fn i4LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         const rows = c.rows;
         const cols = c.cols;
 
-        const prep_ptx = try buildPrep(gpa, cols, 4, false);
+        const prep_ptx = try buildPrep(gpa, cols, 4, false, .none, 0, true);
         defer gpa.free(prep_ptx);
         var pmod = try ctx.loadModule(prep_ptx);
         defer pmod.unload(ctx);
@@ -2652,7 +2948,7 @@ pub fn i8LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         const rows = c.rows;
         const cols = c.cols;
 
-        const prep_ptx = try buildPrep(gpa, cols, 8, false);
+        const prep_ptx = try buildPrep(gpa, cols, 8, false, .none, 0, true);
         defer gpa.free(prep_ptx);
         var pmod = try ctx.loadModule(prep_ptx);
         defer pmod.unload(ctx);
@@ -2797,7 +3093,7 @@ pub fn i8LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         const m = c.m;
         const rows = c.rows;
         const cols = c.cols;
-        const prep_ptx = try buildPrep(gpa, cols, 8, false);
+        const prep_ptx = try buildPrep(gpa, cols, 8, false, .none, 0, true);
         defer gpa.free(prep_ptx);
         var pmod = try ctx.loadModule(prep_ptx);
         defer pmod.unload(ctx);
@@ -3689,26 +3985,89 @@ pub fn buildMmqQ4K(alloc: std.mem.Allocator, nt: usize, warps: usize) ![:0]u8 {
 ///     thread per row: 32 qs bytes in, 64 int8 out, plus the row's two sub-block
 ///     scale pairs. cp.async can't be used for A because the bytes are
 ///     transformed on the way in.
-///   - Single-buffered. Without cp.async on A there is no async copy to overlap,
-///     so double buffering would mean holding the next slab in registers on top
-///     of 128 f32 accumulators. Fixing the arithmetic intensity is the dominant
-///     term; pipelining is the next lever, not this one.
-///   - No ldmatrix/swizzle (plain `ld.shared.u32` fragment loads, the pipe's
-///     `use_ldmatrix=false` path). kstep is 64 here, so the pipe's (row&7)<<4
-///     swizzle would XOR bit 6 and cross into the next row; a correct mask would
-///     be (row&3)<<4. Left off until the tiling change is measured.
+///   - Single-buffered. Not for want of trying: see the stage-A note below.
+///   - No ldmatrix (plain `ld.shared.u32` fragment loads, the pipe's
+///     `use_ldmatrix=false` path). Bank conflicts are handled by padding the shared
+///     row strides instead, see ASTRIDE/BSTRIDE.
+///
+/// It measures 369 ms/step on a 3090 against krea2's block linears, ~24% of the card's
+/// 284 TOPS int8 peak, where cuBLASLt reaches ~72%. Nsight puts it at 1.93 active warps
+/// per scheduler of a possible 12 and 4.13 cycles between issues: latency bound with
+/// nothing to hide latency behind, and an L1TEX scoreboard stall worth ~1.5x if it were
+/// eliminated entirely. The mmas alone floor it at 88 ms, the fold's 24 f32 ops per mma
+/// at ~150.
+///
+/// Read this before optimizing it. Seven things that look like the problem and are NOT,
+/// each measured on the real DiT (`cuda-dit-test <ckpt> 64 libs`):
+///   - ALU. Deleting half the per-accumulator fold buys 4%.
+///   - Spill. `kstep` 128 compiles with zero spill and runs 24% SLOWER.
+///   - Occupancy. Forcing it is 10x WORSE, see `ctas_per_sm`. The 128 f32 accumulators
+///     are the only registers big enough to give back and they live in the innermost
+///     loop, and unlike `igemm_pipe_fused` this kernel cannot chain the mma's own s32 C
+///     operand across k, because the q4_k scale changes every 32 elements.
+///   - Staging latency. cp.async double buffering is 10% slower, see stage A.
+///   - The s32->f32 `cvt`. The magic-number bitcast is slower too, see the fold.
+///   - DRAM bandwidth. It is at 6%.
+///   - L1/TEX op count. `ldmatrix`, the obvious answer to L1/TEX at 62.5%, is 50% SLOWER.
+/// Only one axis has ever worked: shared-memory bank conflicts on the fragment loads
+/// (the packed-A tile and the padded row strides, together 434 -> 369).
 ///
 /// Requires cols % 256 == 0, rows % 128 == 0, and `n` padded to a multiple of 128
 /// with the padding zero-filled (see `opMatmulQuantMmq`). Entry `mmq_pipe_q4_k`.
 pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
+    // Opt-in for the rank-1 min-term fold, which is FEWER instructions and MEASURED
+    // SLOWER. See the fold site. Kept switchable because "this kernel does not want
+    // less arithmetic" is the sort of thing that gets re-litigated.
+    const fold_min_rank1 = envSet("TP_MMQ_FOLD_RANK1");
     const BM = 128;
     const BN = 128;
+    // 64, not 128. A wider slab means fewer staging round-trips and it compiles with
+    // zero spill, but it MEASURED 24% SLOWER (475 vs 383 ms of GEMM per step): doubling
+    // the shared row stride doubles the fragment loads' bank conflicts, and this kernel
+    // is far more sensitive to those than to either staging latency or spill.
     const kstep = 64;
     const KS = kstep / 32; // 32-k substeps == q4_k sub-blocks per slab
     const MT = 4;
     const NT = 8;
-    const ATILE = BM * kstep;
-    const BTILE = BN * kstep;
+    // A is staged as the RAW q4_k nibbles, two k per byte, and unpacked into the mma
+    // fragments at load time. `kstep` is 64 = one q4_k 32-byte group, whose low nibbles
+    // are sub-block 2*grp (substep 0) and high nibbles 2*grp+1 (substep 1), so both
+    // substeps read the SAME 32 bytes and the tile is half the size.
+    const APACK = kstep / 2; // staged bytes per A row
+    const GPS = 256 / kstep; // slabs per q4_k superblock (256 elements)
+    const LG_GPS = std.math.log2_int(usize, GPS);
+    // Shared rows are padded 16 bytes so the fragment loads are conflict-free, and this
+    // is the single biggest thing in the kernel. The eight lanes of a `gid` group read
+    // eight different rows at one column, so the bank each hits is
+    // (row_stride_in_words * gid) mod 32: a power-of-two stride collapses them onto a
+    // few banks (A 2-way, B 4-way), where 12 and 20 words spread the eight over distinct
+    // multiples of 4 with the four `tf` lanes filling in between.
+    //
+    // 16 bytes rather than 4 keeps every row aligned for the `v4` staging stores. It
+    // spends shared memory, which this kernel has spare (its 255 registers cap
+    // occupancy), where the XOR-swizzle alternative would spend registers, which it
+    // has none of.
+    const ASTRIDE = APACK + 16;
+    const BSTRIDE = kstep + 16;
+    const ATILE = BM * ASTRIDE;
+    const BTILE = BN * BSTRIDE;
+    // 0 = let ptxas choose, and that is the right answer. The profile says latency
+    // bound at 1.93 warps per scheduler (see the header), so "raise occupancy" is the
+    // obvious read, and `.minnctapersm` does force it: 3 blocks/SM at 168 registers
+    // measures 4057 ms and 4 at 128 measures 6649, against 382. The only registers big
+    // enough to give back are the 128 f32 accumulators, which every mma in the innermost
+    // loop touches, so capping spills them per mma. Even `.minnctapersm 2`, which
+    // changes no register count, measures 417. Knob kept for A/B only.
+    const ctas_per_sm: usize = envInt("TP_MMQ_CTAS") orelse 0;
+    // Opt-in, because it is MEASURED 50% SLOWER (558 vs 371 ms) even though it
+    // produces bit-identical fragments. `ldmatrix.x4` replaces four `ld.shared.u32`
+    // with one warp-cooperative load and looks like the obvious win when L1/TEX is the
+    // busiest unit in the profile, but it moves the SAME 512 bytes per warp, so there
+    // is no bandwidth to win, and it costs a `.sync` per use, an address `add` per
+    // load, and 168 bytes of spill against 16. `igemm_pipe_fused` pairs ldmatrix with
+    // an XOR swizzle; this kernel gets its conflict-freedom from padded row strides
+    // instead, and the two do not appear to compose.
+    const use_ldmatrix = envSet("TP_MMQ_LDMATRIX");
     const ASC = BM * KS * 2 * 4; // (d*sc, dmin*m) f32 pair per row per substep
     const BSC = BN * KS * 2 * 4; // (da, sum qa) f32 pair per col per substep
     const B_OFF = ATILE;
@@ -3718,12 +4077,15 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
 
     var b = ptx.Builder.init(alloc);
     defer b.deinit();
+    var tuning_buf: [64]u8 = undefined;
+    if (ctas_per_sm != 0)
+        b.tuning = std.fmt.bufPrint(&tuning_buf, ".maxntid 128, 1, 1\n.minnctapersm {d}", .{ctas_per_sm}) catch unreachable;
 
     const acc = try b.regs(.f32, MT * NT * 4);
     const af = try b.regs(.b32, MT * 4);
     const bf = try b.regs(.b32, NT * 2);
     const ct = try b.regs(.b32, 4); // mma destination (C operand is the zero quad)
-    const zq = try b.regs(.b32, 4); // permanently zero
+    const zq = try b.regs(.b32, 4); // permanently zero (mma's C operand)
     const rsc = try b.regs(.f32, MT * 4); // per-mi: (dsc,dm) for rows gid and gid+8
     const csc = try b.regs(.f32, 4); // per-nj: (da,sa) for cols tf*2 and tf*2+1
 
@@ -3803,9 +4165,9 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
     const r_bdst = try b.reg(.b32);
     const r_ascd = try b.reg(.b32);
     const r_bscd = try b.reg(.b32);
-    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_adst, r_t, kstep });
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_adst, r_t, ASTRIDE });
     try b.linef("add.u32 {s}, {s}, {s};", .{ r_adst, r_adst, r_smem });
-    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_bdst, r_t, kstep });
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_bdst, r_t, BSTRIDE });
     try b.linef("add.u32 {s}, {s}, {s};", .{ r_bdst, r_bdst, r_smem });
     try b.linef("add.u32 {s}, {s}, {d};", .{ r_bdst, r_bdst, B_OFF });
     try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_ascd, r_t, KS * 8 });
@@ -3815,21 +4177,53 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
     try b.linef("add.u32 {s}, {s}, {s};", .{ r_bscd, r_bscd, r_smem });
     try b.linef("add.u32 {s}, {s}, {d};", .{ r_bscd, r_bscd, BSC_OFF });
 
-    // Fragment-load bases (pipe's use_ldmatrix=false layout).
+    // Fragment-load bases. Two conventions: the scalar one indexes each lane's own
+    // 4 bytes; the `ldmatrix` one has each lane supply the 16 B-aligned start of one
+    // ROW of one 8x8 b16 tile (matrix = lane>>3, row = lane&7), which is why the two
+    // address computations look nothing alike. Mapping per `buildIgemmPipe`.
     const r_asl = try b.reg(.b32);
     const r_bsl = try b.reg(.b32);
-    try b.linef("shl.b32 {s}, {s}, 6;", .{ tm[0], r_wm });
-    try b.linef("add.u32 {s}, {s}, {s};", .{ tm[0], tm[0], r_gid });
-    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_asl, tm[0], kstep });
-    try b.linef("shl.b32 {s}, {s}, 2;", .{ tm[1], r_tf });
-    try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl, r_asl, tm[1] });
-    try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl, r_asl, r_smem });
-    try b.linef("shl.b32 {s}, {s}, 6;", .{ tm[0], r_wn });
-    try b.linef("add.u32 {s}, {s}, {s};", .{ tm[0], tm[0], r_gid });
-    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_bsl, tm[0], kstep });
-    try b.linef("add.u32 {s}, {s}, {s};", .{ r_bsl, r_bsl, tm[1] });
-    try b.linef("add.u32 {s}, {s}, {s};", .{ r_bsl, r_bsl, r_smem });
-    try b.linef("add.u32 {s}, {s}, {d};", .{ r_bsl, r_bsl, B_OFF });
+    const r_lda = if (use_ldmatrix) try b.reg(.b32) else ""; // ldmatrix address temp
+    if (use_ldmatrix) {
+        const r_l8 = try b.reg(.b32);
+        const r_mtx = try b.reg(.b32);
+        try b.linef("and.b32 {s}, {s}, 7;", .{ r_l8, r_lane });
+        try b.linef("shr.u32 {s}, {s}, 3;", .{ r_mtx, r_lane });
+        // A: row_within = (lane&7) + (matrix&1)*8, col_byte = (matrix&2)*8 -> 0 or 16,
+        // which lands exactly on the two halves of the 32-byte packed row.
+        try b.linef("and.b32 {s}, {s}, 1;", .{ r_asl, r_mtx });
+        try b.linef("shl.b32 {s}, {s}, 3;", .{ r_asl, r_asl });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl, r_asl, r_l8 });
+        try b.linef("shl.b32 {s}, {s}, 6;", .{ tm[0], r_wm });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl, r_asl, tm[0] });
+        try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_asl, r_asl, ASTRIDE });
+        try b.linef("and.b32 {s}, {s}, 2;", .{ tm[1], r_mtx });
+        try b.linef("shl.b32 {s}, {s}, 3;", .{ tm[1], tm[1] });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl, r_asl, tm[1] });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl, r_asl, r_smem });
+        // B: row = lane&7, col_byte = (lane&8)<<1.
+        try b.linef("shl.b32 {s}, {s}, 6;", .{ tm[0], r_wn });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ tm[0], tm[0], r_l8 });
+        try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_bsl, tm[0], BSTRIDE });
+        try b.linef("and.b32 {s}, {s}, 8;", .{ tm[1], r_lane });
+        try b.linef("shl.b32 {s}, {s}, 1;", .{ tm[1], tm[1] });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_bsl, r_bsl, tm[1] });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_bsl, r_bsl, r_smem });
+        try b.linef("add.u32 {s}, {s}, {d};", .{ r_bsl, r_bsl, B_OFF });
+    } else {
+        try b.linef("shl.b32 {s}, {s}, 6;", .{ tm[0], r_wm });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ tm[0], tm[0], r_gid });
+        try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_asl, tm[0], ASTRIDE });
+        try b.linef("shl.b32 {s}, {s}, 2;", .{ tm[1], r_tf });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl, r_asl, tm[1] });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl, r_asl, r_smem });
+        try b.linef("shl.b32 {s}, {s}, 6;", .{ tm[0], r_wn });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ tm[0], tm[0], r_gid });
+        try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_bsl, tm[0], BSTRIDE });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_bsl, r_bsl, tm[1] });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_bsl, r_bsl, r_smem });
+        try b.linef("add.u32 {s}, {s}, {d};", .{ r_bsl, r_bsl, B_OFF });
+    }
 
     // Scale-read bases: row (wm*64 + mi*16 + gid) and col (wn*64 + nj*8 + tf*2).
     const r_ascr = try b.reg(.b32);
@@ -3856,67 +4250,77 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
     const lp = try b.newLabel("slab");
     const hi_lbl = try b.newLabel("schi");
     const sd_lbl = try b.newLabel("scdone");
-    try b.linef("shr.u32 {s}, {s}, 6;", .{ r_nslab, r_cols }); // cols/kstep
+    try b.linef("shr.u32 {s}, {s}, {d};", .{ r_nslab, r_cols, std.math.log2_int(usize, kstep) });
     try b.linef("mov.u32 {s}, 0;", .{r_i});
     try b.label(lp);
 
-    // -- stage A: decode this thread's row of q4_k nibbles into shared -------
+    // -- stage A: copy this thread's row of PACKED q4_k nibbles into shared --
+    //
+    // Deliberately no decode here. Unpacking on the way in cost a second 32-byte
+    // shared tile, eight `and`/`shr` pairs and eight staging registers per thread,
+    // to save one mask per fragment word later.
+    //
+    // And deliberately NOT `cp.async`. Staging the raw bytes makes both tiles plain
+    // global->shared copies, so the whole double-buffered `cp.async` pipeline that
+    // `igemm_pipe_fused` uses does drop in here, and it is correct, but it
+    // MEASURED 10% SLOWER (407 vs 369 ms). The reason is that at 2 blocks/SM the two
+    // blocks already interleave: one stages while the other runs its mmas, so there was
+    // little exposed latency left for an explicit pipeline to hide, and it costs a
+    // second set of tiles, an extra loop pass and per-slab buffer arithmetic.
     const hh = try b.regs(.b32, 4);
-    const qw = try b.regs(.b32, 8);
-    const nib = try b.regs(.b32, 8);
-    try b.linef("shr.u32 {s}, {s}, 2;", .{ tm[0], r_i }); // sb = i/4
-    try b.linef("and.b32 {s}, {s}, 3;", .{ tm[1], r_i }); // grp = i&3
+    const qw = try b.regs(.b32, APACK / 4);
+    // Stage B's activation staging, below: `kstep` int8 per thread, all held at once
+    // so the loads issue before the first store. Interleaving load/store/load/store
+    // makes the second pair wait on the first pair's registers, serializing two
+    // ~500-cycle global latencies that should overlap; measured +7% on the whole
+    // kernel. Its own array rather than a wider `qw`: these are virtual registers,
+    // ptxas allocates them off the live ranges, and sharing one array is what let the
+    // load count outgrow the declaration unnoticed.
+    const bstg = try b.regs(.b32, kstep / 4);
+    try b.linef("shr.u32 {s}, {s}, {d};", .{ tm[0], r_i, LG_GPS }); // sb = i/GPS
+    try b.linef("and.b32 {s}, {s}, {d};", .{ tm[1], r_i, GPS - 1 }); // grp = i%GPS
     try b.linef("mul.lo.u32 {s}, {s}, 144;", .{ tm[2], tm[0] });
     try b.linef("cvt.u64.u32 {s}, {s};", .{ rdt[0], tm[2] });
     try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[1], rd_wrow, rdt[0] });
     try b.linef("ld.global.v4.u32 {{{s}, {s}, {s}, {s}}}, [{s}];", .{ hh[0], hh[1], hh[2], hh[3], rdt[1] });
-    try b.linef("shl.b32 {s}, {s}, 5;", .{ tm[3], tm[1] }); // grp*32
-    try b.linef("add.u32 {s}, {s}, 16;", .{ tm[3], tm[3] });
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ tm[3], tm[1], APACK }); // grp*APACK
+    try b.linef("add.u32 {s}, {s}, 16;", .{ tm[3], tm[3] }); // qs follows the 16 B header
     try b.linef("cvt.u64.u32 {s}, {s};", .{ rdt[0], tm[3] });
     try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[2], rdt[1], rdt[0] });
-    try b.linef("ld.global.v4.u32 {{{s}, {s}, {s}, {s}}}, [{s}];", .{ qw[0], qw[1], qw[2], qw[3], rdt[2] });
-    try b.linef("ld.global.v4.u32 {{{s}, {s}, {s}, {s}}}, [{s}+16];", .{ qw[4], qw[5], qw[6], qw[7], rdt[2] });
-    for (0..8) |j| try b.linef("and.b32 {s}, {s}, 0x0f0f0f0f;", .{ nib[j], qw[j] });
-    try b.linef("st.shared.v4.u32 [{s}], {{{s}, {s}, {s}, {s}}};", .{ r_adst, nib[0], nib[1], nib[2], nib[3] });
-    try b.linef("st.shared.v4.u32 [{s}+16], {{{s}, {s}, {s}, {s}}};", .{ r_adst, nib[4], nib[5], nib[6], nib[7] });
-    for (0..8) |j| {
-        try b.linef("shr.u32 {s}, {s}, 4;", .{ nib[j], qw[j] });
-        try b.linef("and.b32 {s}, {s}, 0x0f0f0f0f;", .{ nib[j], nib[j] });
-    }
-    try b.linef("st.shared.v4.u32 [{s}+32], {{{s}, {s}, {s}, {s}}};", .{ r_adst, nib[0], nib[1], nib[2], nib[3] });
-    try b.linef("st.shared.v4.u32 [{s}+48], {{{s}, {s}, {s}, {s}}};", .{ r_adst, nib[4], nib[5], nib[6], nib[7] });
+    for (0..APACK / 16) |v| try b.linef("ld.global.v4.u32 {{{s}, {s}, {s}, {s}}}, [{s}+{d}];", .{ qw[v * 4], qw[v * 4 + 1], qw[v * 4 + 2], qw[v * 4 + 3], rdt[2], v * 16 });
+    for (0..APACK / 16) |v| try b.linef("st.shared.v4.u32 [{s}+{d}], {{{s}, {s}, {s}, {s}}};", .{ r_adst, v * 16, qw[v * 4], qw[v * 4 + 1], qw[v * 4 + 2], qw[v * 4 + 3] });
 
-    // -- stage A scales: (d*sc, dmin*m) for sub-blocks grp*2 and grp*2+1 -----
+    // -- stage A scales: (d*sc, dmin*m) for sub-blocks grp*KS .. grp*KS+KS-1 --
     // Runtime `is` here (grp comes from the slab index), so this is ggml's
     // get_scale_min_k4 branch rather than the comptime form used elsewhere.
-    const sc0 = try b.reg(.b32);
-    const mn0 = try b.reg(.b32);
-    const sc1 = try b.reg(.b32);
-    const mn1 = try b.reg(.b32);
+    // A slab's KS sub-blocks are `is0 .. is0+KS-1` with `is0 = grp*KS`, and KS divides
+    // 4, so they all land on ONE side of get_scale_min_k4's is<4 split. That is what
+    // lets the branch be taken once for the whole slab rather than per sub-block.
+    const scr = try b.regs(.b32, KS);
+    const mnr = try b.regs(.b32, KS);
     const h16 = try b.regs(.b16, 2);
     const fd = try b.reg(.f32);
     const fdm = try b.reg(.f32);
-    const fs = try b.regs(.f32, 4);
-    try b.linef("shl.b32 {s}, {s}, 1;", .{ tm[4], tm[1] }); // is0 = grp*2
+    const fs = try b.regs(.f32, if (KS * 2 > 4) KS * 2 else 4);
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ tm[4], tm[1], KS }); // is0 = grp*KS
     try b.linef("shl.b32 {s}, {s}, 3;", .{ tm[5], tm[4] }); // is0*8
     try b.linef("setp.ge.u32 {s}, {s}, 4;", .{ pr[0], tm[4] });
     try b.linef("@{s} bra {s};", .{ pr[0], hi_lbl });
-    try b.linef("shr.u32 {s}, {s}, {s};", .{ sc0, hh[1], tm[5] });
-    try b.linef("and.b32 {s}, {s}, 63;", .{ sc0, sc0 });
-    try b.linef("shr.u32 {s}, {s}, {s};", .{ mn0, hh[2], tm[5] });
-    try b.linef("and.b32 {s}, {s}, 63;", .{ mn0, mn0 });
-    try b.linef("add.u32 {s}, {s}, 8;", .{ tm[6], tm[5] });
-    try b.linef("shr.u32 {s}, {s}, {s};", .{ sc1, hh[1], tm[6] });
-    try b.linef("and.b32 {s}, {s}, 63;", .{ sc1, sc1 });
-    try b.linef("shr.u32 {s}, {s}, {s};", .{ mn1, hh[2], tm[6] });
-    try b.linef("and.b32 {s}, {s}, 63;", .{ mn1, mn1 });
+    try b.linef("mov.u32 {s}, {s};", .{ tm[6], tm[5] });
+    for (0..KS) |j| {
+        if (j != 0) try b.linef("add.u32 {s}, {s}, 8;", .{ tm[6], tm[6] });
+        try b.linef("shr.u32 {s}, {s}, {s};", .{ scr[j], hh[1], tm[6] });
+        try b.linef("and.b32 {s}, {s}, 63;", .{ scr[j], scr[j] });
+        try b.linef("shr.u32 {s}, {s}, {s};", .{ mnr[j], hh[2], tm[6] });
+        try b.linef("and.b32 {s}, {s}, 63;", .{ mnr[j], mnr[j] });
+    }
     try b.linef("bra {s};", .{sd_lbl});
     try b.label(hi_lbl);
     try b.linef("add.u32 {s}, {s}, -32;", .{ tm[6], tm[5] }); // (is0-4)*8
-    inline for (.{ 0, 1 }) |half| {
-        const sc = if (half == 0) sc0 else sc1;
-        const mn = if (half == 0) mn0 else mn1;
-        if (half == 1) try b.linef("add.u32 {s}, {s}, 8;", .{ tm[6], tm[6] });
+    for (0..KS) |j| {
+        const sc = scr[j];
+        const mn = mnr[j];
+        if (j != 0) try b.linef("add.u32 {s}, {s}, 8;", .{ tm[6], tm[6] });
         try b.linef("shr.u32 {s}, {s}, {s};", .{ tm[7], hh[3], tm[6] });
         try b.linef("and.b32 {s}, {s}, 15;", .{ sc, tm[7] });
         try b.linef("shr.u32 {s}, {s}, 4;", .{ mn, tm[7] });
@@ -3936,37 +4340,32 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
     try b.linef("mov.b32 {{{s}, {s}}}, {s};", .{ h16[0], h16[1], hh[0] });
     try b.linef("cvt.f32.f16 {s}, {s};", .{ fd, h16[0] });
     try b.linef("cvt.f32.f16 {s}, {s};", .{ fdm, h16[1] });
-    try b.linef("cvt.rn.f32.u32 {s}, {s};", .{ fs[0], sc0 });
-    try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[0], fs[0], fd });
-    try b.linef("cvt.rn.f32.u32 {s}, {s};", .{ fs[1], mn0 });
-    try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[1], fs[1], fdm });
-    try b.linef("cvt.rn.f32.u32 {s}, {s};", .{ fs[2], sc1 });
-    try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[2], fs[2], fd });
-    try b.linef("cvt.rn.f32.u32 {s}, {s};", .{ fs[3], mn1 });
-    try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[3], fs[3], fdm });
-    try b.linef("st.shared.v4.f32 [{s}], {{{s}, {s}, {s}, {s}}};", .{ r_ascd, fs[0], fs[1], fs[2], fs[3] });
+    for (0..KS) |j| {
+        try b.linef("cvt.rn.f32.u32 {s}, {s};", .{ fs[j * 2], scr[j] });
+        try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[j * 2], fs[j * 2], fd });
+        try b.linef("cvt.rn.f32.u32 {s}, {s};", .{ fs[j * 2 + 1], mnr[j] });
+        try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[j * 2 + 1], fs[j * 2 + 1], fdm });
+    }
+    for (0..KS / 2) |v| try b.linef("st.shared.v4.f32 [{s}+{d}], {{{s}, {s}, {s}, {s}}};", .{ r_ascd, v * 16, fs[v * 4], fs[v * 4 + 1], fs[v * 4 + 2], fs[v * 4 + 3] });
 
     // -- stage B: activation int8 (already in the right layout) + its scales --
-    try b.linef("shl.b32 {s}, {s}, 6;", .{ tm[0], r_i }); // i*kstep
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ tm[0], r_i, kstep });
     try b.linef("cvt.u64.u32 {s}, {s};", .{ rdt[0], tm[0] });
     try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[1], rd_bcol, rdt[0] });
-    // All FOUR loads issue before any store. Interleaving load/store/load/store
-    // makes the second pair wait on the first pair's registers, serializing two
-    // ~500-cycle global latencies that should overlap; this costs 16 registers of
-    // staging and measured +7% on the whole kernel.
-    for (0..4) |q4| try b.linef("ld.global.v4.u32 {{{s}, {s}, {s}, {s}}}, [{s}+{d}];", .{ qw[q4 * 4], qw[q4 * 4 + 1], qw[q4 * 4 + 2], qw[q4 * 4 + 3], rdt[1], q4 * 16 });
-    for (0..4) |q4| try b.linef("st.shared.v4.u32 [{s}+{d}], {{{s}, {s}, {s}, {s}}};", .{ r_bdst, q4 * 16, qw[q4 * 4], qw[q4 * 4 + 1], qw[q4 * 4 + 2], qw[q4 * 4 + 3] });
-    // blk = i*KS + ks; d and sum live in separate regions, both indexed col*bpt+blk.
+    for (0..kstep / 16) |q4| try b.linef("ld.global.v4.u32 {{{s}, {s}, {s}, {s}}}, [{s}+{d}];", .{ bstg[q4 * 4], bstg[q4 * 4 + 1], bstg[q4 * 4 + 2], bstg[q4 * 4 + 3], rdt[1], q4 * 16 });
+    for (0..kstep / 16) |q4| try b.linef("st.shared.v4.u32 [{s}+{d}], {{{s}, {s}, {s}, {s}}};", .{ r_bdst, q4 * 16, bstg[q4 * 4], bstg[q4 * 4 + 1], bstg[q4 * 4 + 2], bstg[q4 * 4 + 3] });
+    // blk = i*KS + ks; d and sum live in separate regions, both indexed col*bpt+blk,
+    // and are interleaved into (da,sa) pairs here so the compute loop reads one v2.
     try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ tm[0], r_i, KS });
     try b.linef("mad.lo.u32 {s}, {s}, {s}, {s};", .{ tm[1], r_gcol, r_bpt, tm[0] });
     try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rdt[0], tm[1] });
     try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[1], rd_x, rdt[0] });
     try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[2], rd_sm, rdt[0] });
-    try b.linef("ld.global.f32 {s}, [{s}];", .{ fs[0], rdt[1] });
-    try b.linef("ld.global.f32 {s}, [{s}];", .{ fs[1], rdt[2] });
-    try b.linef("ld.global.f32 {s}, [{s}+4];", .{ fs[2], rdt[1] });
-    try b.linef("ld.global.f32 {s}, [{s}+4];", .{ fs[3], rdt[2] });
-    try b.linef("st.shared.v4.f32 [{s}], {{{s}, {s}, {s}, {s}}};", .{ r_bscd, fs[0], fs[1], fs[2], fs[3] });
+    for (0..KS) |j| {
+        try b.linef("ld.global.f32 {s}, [{s}+{d}];", .{ fs[j * 2], rdt[1], j * 4 });
+        try b.linef("ld.global.f32 {s}, [{s}+{d}];", .{ fs[j * 2 + 1], rdt[2], j * 4 });
+    }
+    for (0..KS / 2) |v| try b.linef("st.shared.v4.f32 [{s}+{d}], {{{s}, {s}, {s}, {s}}};", .{ r_bscd, v * 16, fs[v * 4], fs[v * 4 + 1], fs[v * 4 + 2], fs[v * 4 + 3] });
 
     try b.line("bar.sync 0;");
 
@@ -3975,11 +4374,30 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
     while (ks < KS) : (ks += 1) {
         var mi: usize = 0;
         while (mi < MT) : (mi += 1) {
-            const o = mi * 16 * kstep + ks * 32;
-            try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ af[mi * 4 + 0], r_asl, o });
-            try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ af[mi * 4 + 1], r_asl, o + 8 * kstep });
-            try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ af[mi * 4 + 2], r_asl, o + 16 });
-            try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ af[mi * 4 + 3], r_asl, o + 8 * kstep + 16 });
+            // Substep `ks` is q4_k sub-block `ks` of this slab, which lives in the
+            // 32-byte group `ks/2` as its low nibbles when ks is even and its high
+            // nibbles when odd. So consecutive substep PAIRS read the same words. The
+            // nibbles are unsigned 0..15, already the s8 value the mma wants, so the
+            // unpack is one mask (plus a shift for the high half) and no sign handling.
+            const o = mi * 16 * ASTRIDE + (ks / 2) * 32;
+            if (use_ldmatrix) {
+                // One warp-cooperative load pulls the whole 16x32 A fragment into the
+                // exact {a0,a1,a2,a3} layout the mma wants, still packed two k per
+                // byte; the unpack below is unchanged.
+                try b.linef("add.u32 {s}, {s}, {d};", .{ r_lda, r_asl, o });
+                try b.linef("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{{s}, {s}, {s}, {s}}}, [{s}];", .{
+                    af[mi * 4 + 0], af[mi * 4 + 1], af[mi * 4 + 2], af[mi * 4 + 3], r_lda,
+                });
+            } else {
+                try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ af[mi * 4 + 0], r_asl, o });
+                try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ af[mi * 4 + 1], r_asl, o + 8 * ASTRIDE });
+                try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ af[mi * 4 + 2], r_asl, o + 16 });
+                try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ af[mi * 4 + 3], r_asl, o + 8 * ASTRIDE + 16 });
+            }
+            for (0..4) |j| {
+                if (ks % 2 == 1) try b.linef("shr.u32 {s}, {s}, 4;", .{ af[mi * 4 + j], af[mi * 4 + j] });
+                try b.linef("and.b32 {s}, {s}, 0x0f0f0f0f;", .{ af[mi * 4 + j], af[mi * 4 + j] });
+            }
             // Row scale pairs for this mi: rows (mi*16+gid) and (mi*16+gid+8).
             const so = mi * 16 * KS * 8 + ks * 8;
             try b.linef("ld.shared.v2.f32 {{{s}, {s}}}, [{s}+{d}];", .{ rsc[mi * 4 + 0], rsc[mi * 4 + 1], r_ascr, so });
@@ -3987,9 +4405,16 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
         }
         var nj: usize = 0;
         while (nj < NT) : (nj += 1) {
-            const o = nj * 8 * kstep + ks * 32;
-            try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ bf[nj * 2 + 0], r_bsl, o });
-            try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ bf[nj * 2 + 1], r_bsl, o + 16 });
+            const o = nj * 8 * BSTRIDE + ks * 32;
+            if (use_ldmatrix) {
+                try b.linef("add.u32 {s}, {s}, {d};", .{ r_lda, r_bsl, o });
+                try b.linef("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {{{s}, {s}}}, [{s}];", .{
+                    bf[nj * 2 + 0], bf[nj * 2 + 1], r_lda,
+                });
+            } else {
+                try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ bf[nj * 2 + 0], r_bsl, o });
+                try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ bf[nj * 2 + 1], r_bsl, o + 16 });
+            }
         }
         nj = 0;
         while (nj < NT) : (nj += 1) {
@@ -3997,6 +4422,19 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
             const co = nj * 8 * KS * 8 + ks * 8;
             try b.linef("ld.shared.v2.f32 {{{s}, {s}}}, [{s}+{d}];", .{ csc[0], csc[1], r_bscr, co });
             try b.linef("ld.shared.v2.f32 {{{s}, {s}}}, [{s}+{d}];", .{ csc[2], csc[3], r_bscr, co + KS * 8 });
+            // The min term `-(dmin*m)*da*Σq` never touches the mma result, so folding it
+            // as a rank-1 update cuts the per-accumulator cost from three ops to one fma,
+            // a third of the inner loop's f32 work. MEASURED SLOWER, 493 vs 434 ms: the
+            // two extra live values take spill traffic from 8 to 80 bytes, and reusing
+            // the dead `sa` slots does not help, since liveness costs, not names.
+            //
+            // Not register-bound either: deleting the min term outright, which removes
+            // half the fold AND all the spill, buys 4% (369.7 -> 355.0). The f32 work is
+            // not what this kernel waits on, see the ASTRIDE bank-conflict note.
+            if (fold_min_rank1) for (0..2) |c| {
+                try b.linef("mul.f32 {s}, {s}, {s};", .{ csc[c * 2 + 1], csc[c * 2], csc[c * 2 + 1] });
+                try b.linef("neg.f32 {s}, {s};", .{ csc[c * 2 + 1], csc[c * 2 + 1] });
+            };
             mi = 0;
             while (mi < MT) : (mi += 1) {
                 try b.linef("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {{{s},{s},{s},{s}}}, {{{s},{s},{s},{s}}}, {{{s},{s}}}, {{{s},{s},{s},{s}}};", .{
@@ -4013,13 +4451,22 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
                     const dsc = rsc[mi * 4 + rows2[ci]];
                     const dm = rsc[mi * 4 + rows2[ci] + 1];
                     const da = csc[cols2[ci]];
-                    const sa = csc[cols2[ci] + 1];
+                    // Not worth replacing with the magic-number bitcast (add
+                    // 1.5*2^23, reinterpret, subtract), which is bit-exact here since
+                    // |x| <= 32*15*127. That trades one `cvt` for three full-rate ops
+                    // on the theory that int-to-float is the 16-per-SM-per-clock
+                    // "other conversions" tier where FP32 fma is 128. MEASURED SLOWER
+                    // (428 vs 417 ms), so on this part it is not eight-cycle.
                     try b.linef("cvt.rn.f32.s32 {s}, {s};", .{ fs[0], ct[ci] });
                     try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[1], dsc, da });
                     try b.linef("fma.rn.f32 {s}, {s}, {s}, {s};", .{ a[ci], fs[1], fs[0], a[ci] });
-                    try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[1], dm, da });
-                    try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[1], fs[1], sa });
-                    try b.linef("sub.f32 {s}, {s}, {s};", .{ a[ci], a[ci], fs[1] });
+                    if (fold_min_rank1) {
+                        try b.linef("fma.rn.f32 {s}, {s}, {s}, {s};", .{ a[ci], dm, csc[cols2[ci] + 1], a[ci] });
+                    } else {
+                        try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[1], dm, da });
+                        try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[1], fs[1], csc[cols2[ci] + 1] });
+                        try b.linef("sub.f32 {s}, {s}, {s};", .{ a[ci], a[ci], fs[1] });
+                    }
                 }
             }
         }
@@ -4062,6 +4509,331 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
     defer alloc.free(shared_decl);
     return b.build(
         "mmq_pipe_q4_k",
+        "    .param .u64 p_w,\n    .param .u64 p_x,\n    .param .u64 p_y,\n    .param .u32 p_rows,\n    .param .u32 p_cols,\n    .param .u32 p_n,\n    .param .f32 p_scale",
+        shared_decl,
+    );
+}
+
+/// q8_0 MMQ, `buildMmqPipeQ4K`'s sibling at the same 128x128 / 2x2-warp / MT=4 / NT=8
+/// shape. q8_0's stored values ARE the s8 the tensor cores want, so this is the only path
+/// that reaches them without re-quantizing: `opI8GemmBlockQ` costs q8_0 84% more weight
+/// error and `opMatmulQuant` spends the f16 tensor cores, 3.06x the int8 ones.
+///
+/// The one trap is alignment. A q8_0 block is 34 bytes, so a two-block slab starts at
+/// `68*i`: the even block's qs land at +2 and the odd block's at +36, so the even one is
+/// read as 9 u32 and funnelled two bytes with `prmt` and the odd one as 8 direct u32.
+/// Both parities are compile-time constants, which is what keeps this branch-free.
+///
+/// It LOSES to the f16 route and is opt-in only (`--dit-gguf-gemm mmq`): on krea2's block
+/// linears, 566 ms of GEMM per step against f16's 440 and cuBLASLt int8's 141. Staging is
+/// 225 of that and cannot vectorize past u32, because the 34-byte block stride keeps the
+/// qs off 16-byte boundaries; a one-time repack to planar qs plus a scale plane is the
+/// only real lever. Even with staging free it is 342, because q4_k's nibble packing feeds
+/// two substeps from one 32-byte A fragment where 8-bit weights need their own, doubling
+/// the shared A-load traffic this kernel family is bound by. Kept for the repack lever,
+/// and because a card with a worse f16:int8 ratio would flip the comparison.
+///
+/// Requires cols % 256 == 0, rows % 128 == 0, and `n` padded to a multiple of 128 with
+/// the padding zero-filled (see `opMatmulQuantMmqPipe`). Entry `mmq_pipe_q8_0`.
+pub fn buildMmqPipeQ8_0(alloc: std.mem.Allocator) ![:0]u8 {
+    const BM = 128;
+    const BN = 128;
+    const kstep = 64;
+    const KS = kstep / 32; // 32-k substeps == q8_0 blocks per slab
+    const MT = 4;
+    const NT = 8;
+    const BLK = 34; // q8_0 block: f16 d + 32 s8
+    const SLAB_B = KS * BLK; // weight bytes per row per slab
+    // Rows padded 16 bytes, for the reason `buildMmqPipeQ4K`'s ASTRIDE is: the eight
+    // lanes of a `gid` group read eight different rows at one column, so the bank each
+    // hits is (row_words * gid) mod 32, and a power-of-two stride collapses them onto a
+    // few banks. A is now the full `kstep` bytes (raw s8, not two k per byte), so both
+    // strides are the same 20 words, where q4_k's A was 12.
+    const ASTRIDE = kstep + 16;
+    const BSTRIDE = kstep + 16;
+    const ATILE = BM * ASTRIDE;
+    const BTILE = BN * BSTRIDE;
+    const ASC = BM * KS * 4; // one f32 d per row per substep (no min term)
+    const BSC = BN * KS * 4; // one f32 da per col per substep (no sums)
+    const B_OFF = ATILE;
+    const ASC_OFF = ATILE + BTILE;
+    const BSC_OFF = ASC_OFF + ASC;
+    const SH = BSC_OFF + BSC;
+
+    var b = ptx.Builder.init(alloc);
+    defer b.deinit();
+
+    const acc = try b.regs(.f32, MT * NT * 4);
+    const af = try b.regs(.b32, MT * 4);
+    const bf = try b.regs(.b32, NT * 2);
+    const ct = try b.regs(.b32, 4); // mma destination (C operand is the zero quad)
+    const zq = try b.regs(.b32, 4); // permanently zero
+    const rsc = try b.regs(.f32, MT * 2); // per-mi: d for rows gid and gid+8
+    const csc = try b.regs(.f32, 2); // per-nj: da for cols tf*2 and tf*2+1
+
+    const rd_w = try b.reg(.b64);
+    const rd_x = try b.reg(.b64);
+    const rd_y = try b.reg(.b64);
+    const r_rows = try b.reg(.b32);
+    const r_cols = try b.reg(.b32);
+    const r_n = try b.reg(.b32);
+    const f_scale = try b.reg(.f32);
+    try b.linef("ld.param.u64 {s}, [p_w];", .{rd_w});
+    try b.linef("ld.param.u64 {s}, [p_x];", .{rd_x});
+    try b.linef("ld.param.u64 {s}, [p_y];", .{rd_y});
+    try b.linef("ld.param.u32 {s}, [p_rows];", .{r_rows});
+    try b.linef("ld.param.u32 {s}, [p_cols];", .{r_cols});
+    try b.linef("ld.param.u32 {s}, [p_n];", .{r_n});
+    try b.linef("ld.param.f32 {s}, [p_scale];", .{f_scale});
+    try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_w, rd_w });
+    try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_x, rd_x });
+    try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_y, rd_y });
+
+    const r_t = try b.reg(.b32);
+    const r_lane = try b.reg(.b32);
+    const r_warp = try b.reg(.b32);
+    const r_wm = try b.reg(.b32);
+    const r_wn = try b.reg(.b32);
+    const r_gid = try b.reg(.b32);
+    const r_tf = try b.reg(.b32);
+    const r_row0 = try b.reg(.b32);
+    const r_col0 = try b.reg(.b32);
+    const r_smem = try b.reg(.b32);
+    const r_nblk = try b.reg(.b32);
+    const r_rb = try b.reg(.b32);
+    const r_bpt = try b.reg(.b32);
+    const tm = try b.regs(.b32, 8);
+    const rdt = try b.regs(.b64, 4);
+
+    try b.linef("mov.u32 {s}, smem;", .{r_smem});
+    try b.linef("mov.u32 {s}, %tid.x;", .{r_t});
+    try b.linef("and.b32 {s}, {s}, 31;", .{ r_lane, r_t });
+    try b.linef("shr.u32 {s}, {s}, 5;", .{ r_warp, r_t });
+    try b.linef("and.b32 {s}, {s}, 1;", .{ r_wm, r_warp });
+    try b.linef("shr.u32 {s}, {s}, 1;", .{ r_wn, r_warp });
+    try b.linef("shr.u32 {s}, {s}, 2;", .{ r_gid, r_lane });
+    try b.linef("and.b32 {s}, {s}, 3;", .{ r_tf, r_lane });
+    try b.linef("mov.u32 {s}, %ctaid.y;", .{r_row0});
+    try b.linef("shl.b32 {s}, {s}, 7;", .{ r_row0, r_row0 });
+    try b.linef("mov.u32 {s}, %ctaid.x;", .{r_col0});
+    try b.linef("shl.b32 {s}, {s}, 7;", .{ r_col0, r_col0 });
+    try b.linef("shr.u32 {s}, {s}, 5;", .{ r_nblk, r_cols }); // q8_0 blocks per row
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_rb, r_nblk, BLK });
+    try b.linef("mov.u32 {s}, {s};", .{ r_bpt, r_nblk }); // == q8_1 blocks per token
+
+    // Activation qs region. No sums region: q8_0 needs no min term.
+    const rd_qs = try b.reg(.b64);
+    try b.linef("mul.lo.u32 {s}, {s}, {s};", .{ tm[0], r_n, r_bpt });
+    try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rd_qs, tm[0] });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_qs, rd_x, rd_qs });
+
+    // Staging identities: one thread per A row and per B column (BM=BN=128=nthreads).
+    const rd_wrow = try b.reg(.b64);
+    const rd_bcol = try b.reg(.b64);
+    const r_gcol = try b.reg(.b32);
+    try b.linef("add.u32 {s}, {s}, {s};", .{ tm[0], r_row0, r_t });
+    try b.linef("mul.wide.u32 {s}, {s}, {s};", .{ rd_wrow, tm[0], r_rb });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_wrow, rd_w, rd_wrow });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_gcol, r_col0, r_t });
+    try b.linef("mul.wide.u32 {s}, {s}, {s};", .{ rd_bcol, r_gcol, r_cols });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rd_bcol, rd_qs, rd_bcol });
+
+    // Shared destinations for this thread's staged row/column.
+    const r_adst = try b.reg(.b32);
+    const r_bdst = try b.reg(.b32);
+    const r_ascd = try b.reg(.b32);
+    const r_bscd = try b.reg(.b32);
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_adst, r_t, ASTRIDE });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_adst, r_adst, r_smem });
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_bdst, r_t, BSTRIDE });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_bdst, r_bdst, r_smem });
+    try b.linef("add.u32 {s}, {s}, {d};", .{ r_bdst, r_bdst, B_OFF });
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_ascd, r_t, KS * 4 });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_ascd, r_ascd, r_smem });
+    try b.linef("add.u32 {s}, {s}, {d};", .{ r_ascd, r_ascd, ASC_OFF });
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_bscd, r_t, KS * 4 });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_bscd, r_bscd, r_smem });
+    try b.linef("add.u32 {s}, {s}, {d};", .{ r_bscd, r_bscd, BSC_OFF });
+
+    // Fragment-load bases (the pipe's use_ldmatrix=false layout).
+    const r_asl = try b.reg(.b32);
+    const r_bsl = try b.reg(.b32);
+    try b.linef("shl.b32 {s}, {s}, 6;", .{ tm[0], r_wm });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ tm[0], tm[0], r_gid });
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_asl, tm[0], ASTRIDE });
+    try b.linef("shl.b32 {s}, {s}, 2;", .{ tm[1], r_tf });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl, r_asl, tm[1] });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_asl, r_asl, r_smem });
+    try b.linef("shl.b32 {s}, {s}, 6;", .{ tm[0], r_wn });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ tm[0], tm[0], r_gid });
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_bsl, tm[0], BSTRIDE });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_bsl, r_bsl, tm[1] });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_bsl, r_bsl, r_smem });
+    try b.linef("add.u32 {s}, {s}, {d};", .{ r_bsl, r_bsl, B_OFF });
+
+    // Scale-read bases: row (wm*64 + mi*16 + gid), col (wn*64 + nj*8 + tf*2).
+    const r_ascr = try b.reg(.b32);
+    const r_bscr = try b.reg(.b32);
+    try b.linef("shl.b32 {s}, {s}, 6;", .{ tm[0], r_wm });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ tm[0], tm[0], r_gid });
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_ascr, tm[0], KS * 4 });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_ascr, r_ascr, r_smem });
+    try b.linef("add.u32 {s}, {s}, {d};", .{ r_ascr, r_ascr, ASC_OFF });
+    try b.linef("shl.b32 {s}, {s}, 6;", .{ tm[0], r_wn });
+    try b.linef("shl.b32 {s}, {s}, 1;", .{ tm[1], r_tf });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ tm[0], tm[0], tm[1] });
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_bscr, tm[0], KS * 4 });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_bscr, r_bscr, r_smem });
+    try b.linef("add.u32 {s}, {s}, {d};", .{ r_bscr, r_bscr, BSC_OFF });
+
+    for (acc) |r| try b.linef("mov.f32 {s}, 0f00000000;", .{r});
+    for (zq) |r| try b.linef("mov.u32 {s}, 0;", .{r});
+
+    // ---- slab loop --------------------------------------------------------
+    const r_i = try b.reg(.b32);
+    const r_nslab = try b.reg(.b32);
+    const pr = try b.regs(.pred, 2);
+    const lp = try b.newLabel("slab");
+    try b.linef("shr.u32 {s}, {s}, {d};", .{ r_nslab, r_cols, std.math.log2_int(usize, kstep) });
+    try b.linef("mov.u32 {s}, 0;", .{r_i});
+    try b.label(lp);
+
+    // -- stage A: this thread's row of raw s8, plus one f32 d per substep -----
+    //
+    // Not `cp.async`: the two blocks' qs are separated by the odd block's f16 d, so a
+    // slab's 64 payload bytes are not a contiguous run, and the even block's qs are
+    // 2 mod 4 anyway. See the alignment note in the block comment above.
+    //
+    // All 17 loads issue before the first shared store, for the reason
+    // `buildMmqPipeQ4K`'s stage B holds its whole tile: interleaving load/store makes
+    // the second load wait on the first store's register, serializing two ~500-cycle
+    // global latencies that should overlap.
+    // A/B isolation only: skip A's global->shared staging, leaving whatever the tile
+    // held. Output is garbage; the point is to time the staging against the compute.
+    const nostage = envSet("TP_MMQ8_NOSTAGE");
+    const awr = try b.regs(.b32, 9); // even block: block start, 9 words = bytes 0..35
+    const aqo = try b.regs(.b32, 8); // odd block: qs, already 4-byte aligned
+    const bstg = try b.regs(.b32, kstep / 4);
+    const h16 = try b.regs(.b16, 3);
+    const fs = try b.regs(.f32, 4);
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ tm[0], r_i, SLAB_B });
+    try b.linef("cvt.u64.u32 {s}, {s};", .{ rdt[0], tm[0] });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[1], rd_wrow, rdt[0] });
+    if (!nostage) for (0..9) |j| try b.linef("ld.global.u32 {s}, [{s}+{d}];", .{ awr[j], rdt[1], j * 4 });
+    try b.linef("ld.global.u16 {s}, [{s}+{d}];", .{ h16[1], rdt[1], BLK });
+    if (!nostage) for (0..8) |j| try b.linef("ld.global.u32 {s}, [{s}+{d}];", .{ aqo[j], rdt[1], BLK + 2 + j * 4 });
+    // The even block's d is the low half of word 0; its 32 qs start two bytes in, so
+    // each output word is a two-byte funnel of consecutive input words. Written back
+    // over `awr` in ascending order, which is safe: out[j] consumes awr[j] and
+    // awr[j+1], and awr[j+1] is not overwritten until the next step.
+    try b.linef("mov.b32 {{{s}, {s}}}, {s};", .{ h16[0], h16[2], awr[0] });
+    if (!nostage) for (0..8) |j| try b.linef("prmt.b32 {s}, {s}, {s}, 0x5432;", .{ awr[j], awr[j], awr[j + 1] });
+    if (!nostage) for (0..2) |v| try b.linef("st.shared.v4.u32 [{s}+{d}], {{{s}, {s}, {s}, {s}}};", .{ r_adst, v * 16, awr[v * 4], awr[v * 4 + 1], awr[v * 4 + 2], awr[v * 4 + 3] });
+    if (!nostage) for (0..2) |v| try b.linef("st.shared.v4.u32 [{s}+{d}], {{{s}, {s}, {s}, {s}}};", .{ r_adst, 32 + v * 16, aqo[v * 4], aqo[v * 4 + 1], aqo[v * 4 + 2], aqo[v * 4 + 3] });
+    try b.linef("cvt.f32.f16 {s}, {s};", .{ fs[0], h16[0] });
+    try b.linef("cvt.f32.f16 {s}, {s};", .{ fs[1], h16[1] });
+    try b.linef("st.shared.v2.f32 [{s}], {{{s}, {s}}};", .{ r_ascd, fs[0], fs[1] });
+
+    // -- stage B: activation int8 (already in the right layout) + its scales --
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ tm[0], r_i, kstep });
+    try b.linef("cvt.u64.u32 {s}, {s};", .{ rdt[0], tm[0] });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[1], rd_bcol, rdt[0] });
+    for (0..kstep / 16) |q4| try b.linef("ld.global.v4.u32 {{{s}, {s}, {s}, {s}}}, [{s}+{d}];", .{ bstg[q4 * 4], bstg[q4 * 4 + 1], bstg[q4 * 4 + 2], bstg[q4 * 4 + 3], rdt[1], q4 * 16 });
+    for (0..kstep / 16) |q4| try b.linef("st.shared.v4.u32 [{s}+{d}], {{{s}, {s}, {s}, {s}}};", .{ r_bdst, q4 * 16, bstg[q4 * 4], bstg[q4 * 4 + 1], bstg[q4 * 4 + 2], bstg[q4 * 4 + 3] });
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ tm[0], r_i, KS });
+    try b.linef("mad.lo.u32 {s}, {s}, {s}, {s};", .{ tm[1], r_gcol, r_bpt, tm[0] });
+    try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rdt[0], tm[1] });
+    try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[1], rd_x, rdt[0] });
+    try b.linef("ld.global.v2.f32 {{{s}, {s}}}, [{s}];", .{ fs[2], fs[3], rdt[1] });
+    try b.linef("st.shared.v2.f32 [{s}], {{{s}, {s}}};", .{ r_bscd, fs[2], fs[3] });
+
+    try b.line("bar.sync 0;");
+
+    // ---- compute: KS substeps of MT x NT mmas, folding scales each substep --
+    var ks: usize = 0;
+    while (ks < KS) : (ks += 1) {
+        var mi: usize = 0;
+        while (mi < MT) : (mi += 1) {
+            // Raw s8: substep `ks` owns its own 32 bytes and the words go into the mma
+            // untouched, where q4_k masks a nibble half out of a shared 32-byte group.
+            const o = mi * 16 * ASTRIDE + ks * 32;
+            try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ af[mi * 4 + 0], r_asl, o });
+            try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ af[mi * 4 + 1], r_asl, o + 8 * ASTRIDE });
+            try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ af[mi * 4 + 2], r_asl, o + 16 });
+            try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ af[mi * 4 + 3], r_asl, o + 8 * ASTRIDE + 16 });
+            const so = mi * 16 * KS * 4 + ks * 4;
+            try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ rsc[mi * 2 + 0], r_ascr, so });
+            try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ rsc[mi * 2 + 1], r_ascr, so + 8 * KS * 4 });
+        }
+        var nj: usize = 0;
+        while (nj < NT) : (nj += 1) {
+            const o = nj * 8 * BSTRIDE + ks * 32;
+            try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ bf[nj * 2 + 0], r_bsl, o });
+            try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ bf[nj * 2 + 1], r_bsl, o + 16 });
+        }
+        nj = 0;
+        while (nj < NT) : (nj += 1) {
+            const co = nj * 8 * KS * 4 + ks * 4;
+            try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ csc[0], r_bscr, co });
+            try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ csc[1], r_bscr, co + KS * 4 });
+            mi = 0;
+            while (mi < MT) : (mi += 1) {
+                try b.linef("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {{{s},{s},{s},{s}}}, {{{s},{s},{s},{s}}}, {{{s},{s}}}, {{{s},{s},{s},{s}}};", .{
+                    ct[0],          ct[1],          ct[2],          ct[3],
+                    af[mi * 4 + 0], af[mi * 4 + 1], af[mi * 4 + 2], af[mi * 4 + 3],
+                    bf[nj * 2 + 0], bf[nj * 2 + 1],
+                    zq[0],          zq[1],          zq[2],          zq[3],
+                });
+                // c0=(row gid,col tf*2) c1=(gid,tf*2+1) c2=(gid+8,tf*2) c3=(gid+8,+1)
+                const a = acc[(mi * NT + nj) * 4 ..][0..4];
+                const rows2 = [_]usize{ 0, 0, 1, 1 };
+                const cols2 = [_]usize{ 0, 1, 0, 1 };
+                for (0..4) |ci| {
+                    try b.linef("cvt.rn.f32.s32 {s}, {s};", .{ fs[0], ct[ci] });
+                    try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[1], rsc[mi * 2 + rows2[ci]], csc[cols2[ci]] });
+                    try b.linef("fma.rn.f32 {s}, {s}, {s}, {s};", .{ a[ci], fs[1], fs[0], a[ci] });
+                }
+            }
+        }
+    }
+    try b.line("bar.sync 0;");
+    try b.linef("add.u32 {s}, {s}, 1;", .{ r_i, r_i });
+    try b.linef("setp.lt.u32 {s}, {s}, {s};", .{ pr[0], r_i, r_nslab });
+    try b.linef("@{s} bra {s};", .{ pr[0], lp });
+
+    // ---- store: y[col*rows + row] -----------------------------------------
+    const r_crow = try b.reg(.b32);
+    const r_ccol = try b.reg(.b32);
+    try b.linef("shl.b32 {s}, {s}, 6;", .{ r_crow, r_wm });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_crow, r_crow, r_row0 });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_crow, r_crow, r_gid });
+    try b.linef("shl.b32 {s}, {s}, 6;", .{ r_ccol, r_wn });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_ccol, r_ccol, r_col0 });
+    try b.linef("shl.b32 {s}, {s}, 1;", .{ tm[0], r_tf });
+    try b.linef("add.u32 {s}, {s}, {s};", .{ r_ccol, r_ccol, tm[0] });
+    var mi2: usize = 0;
+    while (mi2 < MT) : (mi2 += 1) {
+        var nj2: usize = 0;
+        while (nj2 < NT) : (nj2 += 1) {
+            const a = acc[(mi2 * NT + nj2) * 4 ..][0..4];
+            const rowoff = [_]usize{ 0, 0, 8, 8 };
+            const coloff = [_]usize{ 0, 1, 0, 1 };
+            for (0..4) |ci| {
+                try b.linef("add.u32 {s}, {s}, {d};", .{ tm[1], r_crow, mi2 * 16 + rowoff[ci] });
+                try b.linef("add.u32 {s}, {s}, {d};", .{ tm[2], r_ccol, nj2 * 8 + coloff[ci] });
+                try b.linef("mad.lo.u32 {s}, {s}, {s}, {s};", .{ tm[3], tm[2], r_rows, tm[1] });
+                try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ rdt[0], tm[3] });
+                try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[0], rd_y, rdt[0] });
+                try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[0], a[ci], f_scale });
+                try b.linef("st.global.f32 [{s}], {s};", .{ rdt[0], fs[0] });
+            }
+        }
+    }
+
+    const shared_decl = try std.fmt.allocPrint(alloc, ".shared .align 16 .b8 smem[{d}];", .{SH});
+    defer alloc.free(shared_decl);
+    return b.build(
+        "mmq_pipe_q8_0",
         "    .param .u64 p_w,\n    .param .u64 p_x,\n    .param .u64 p_y,\n    .param .u32 p_rows,\n    .param .u32 p_cols,\n    .param .u32 p_n,\n    .param .f32 p_scale",
         shared_decl,
     );
@@ -5748,4 +6520,135 @@ pub fn buildMmqPipeQ1_0(alloc: std.mem.Allocator) ![:0]u8 {
         "    .param .u64 p_w,\n    .param .u64 p_x,\n    .param .u64 p_y,\n    .param .u32 p_rows,\n    .param .u32 p_cols,\n    .param .u32 p_n,\n    .param .f32 p_scale",
         shared_decl,
     );
+}
+
+/// Validate the block-quant weight decode against the CPU pipeline it reproduces:
+/// ggml dequant -> convrot rotate -> per-row absmax scale -> round-half-away quantize.
+/// Runs the whole-row prep and the chunked decode as the GEMMs call them, since what a
+/// chunked kernel gets wrong is their disagreement over the scale it takes as input.
+pub fn blockQDecodeTest(ctx: *Context, io: anytype, stdout: anytype) !void {
+    _ = io;
+    const convrot = @import("tp_ops").convrot;
+    const quants = @import("tp_core").quants;
+    const DT = @import("tp_core").dtype.DType;
+    if (!quants.have_ggml) {
+        try stdout.print("built without ggml; no reference quantizer\n", .{});
+        return;
+    }
+    quants.ensureGgmlInit();
+
+    const Case = struct { dt: DT, blk: PrepBlock, bits: usize, rows: usize, cols: usize };
+    const cases = [_]Case{
+        .{ .dt = .q2_k, .blk = .q2_k, .bits = 8, .rows = 128, .cols = 6144 },
+        .{ .dt = .q2_k, .blk = .q2_k, .bits = 4, .rows = 128, .cols = 6144 },
+        .{ .dt = .q2_k, .blk = .q2_k, .bits = 4, .rows = 128, .cols = 16384 },
+        // The two arms that were already live, as the control: a harness that
+        // flags the new one has to pass these.
+        .{ .dt = .q4_k, .blk = .q4_k, .bits = 8, .rows = 128, .cols = 6144 },
+        .{ .dt = .q8_0, .blk = .q8_0, .bits = 8, .rows = 128, .cols = 6144 },
+    };
+
+    var prng = std.Random.DefaultPrng.init(31);
+    const rand = prng.random();
+    for (cases) |c| {
+        const maxq: f32 = if (c.bits == 8) 127.0 else 7.0;
+        const minc: i32 = if (c.bits == 8) -128 else -8;
+        const maxc: i32 = if (c.bits == 8) 127 else 7;
+        const per_word = 32 / c.bits;
+        const chunk: usize = if (c.cols % 2048 == 0) 2048 else 1024;
+        const gid: u32 = @intCast(quants.ggmlType(c.dt).?);
+        const row_bytes = c.blk.bytesFor(c.cols);
+
+        // A realistic weight: normal, with a scattered heavy tail, which is what
+        // makes one scale per row a real question rather than a formality.
+        const wf = try gpa.alloc(f32, c.rows * c.cols);
+        defer gpa.free(wf);
+        for (wf) |*v| v.* = rand.floatNorm(f32) * 0.02;
+        for (0..c.rows * c.cols / 512) |_| wf[rand.uintLessThan(usize, wf.len)] *= 30;
+
+        const packed_w = try gpa.alloc(u8, c.rows * row_bytes);
+        defer gpa.free(packed_w);
+        for (0..c.rows) |r| {
+            _ = try quants.raw.quantizeChunk(gid, wf[r * c.cols ..][0..c.cols], packed_w[r * row_bytes ..][0..row_bytes], 1, c.cols, null);
+        }
+
+        var dw = try ctx.alloc(packed_w.len);
+        defer ctx.free(&dw);
+        try ctx.upload(dw, packed_w);
+        var dq = try ctx.alloc(c.rows * c.cols / per_word * 4);
+        defer ctx.free(&dq);
+        var ds = try ctx.alloc(c.rows * 4);
+        defer ctx.free(&ds);
+
+        const shb = prepSharedBytes(c.cols);
+        const prep_ptx = try buildPrep(gpa, c.cols, c.bits, false, c.blk, 0, true);
+        defer gpa.free(prep_ptx);
+        var pmod = try ctx.loadModule(prep_ptx);
+        defer pmod.unload(ctx);
+        const f_prep = try pmod.getFunction(ctx, if (c.bits == 4) "bqprep4" else "bqprep");
+        try ctx.setMaxDynamicShared(f_prep, shb);
+
+        const dec_ptx = try buildPrep(gpa, c.cols, c.bits, false, c.blk, chunk, true);
+        defer gpa.free(dec_ptx);
+        var dmod = try ctx.loadModule(dec_ptx);
+        defer dmod.unload(ctx);
+        const f_dec = try dmod.getFunction(ctx, if (c.bits == 4) "bqdec4" else "bqdec");
+        try ctx.setMaxDynamicShared(f_dec, prepSharedBytes(chunk));
+
+        var pw = dw.ptr;
+        var pq = dq.ptr;
+        var ps = ds.ptr;
+        var params = [_]?*anyopaque{ @ptrCast(&pw), @ptrCast(&pq), @ptrCast(&ps) };
+        try ctx.launch(f_prep, .{ @intCast(c.rows), 1, 1 }, .{ 256, 1, 1 }, @intCast(shb), &params);
+        try ctx.launch(f_dec, .{ @intCast(c.rows * (c.cols / chunk)), 1, 1 }, .{ 256, 1, 1 }, @intCast(prepSharedBytes(chunk)), &params);
+
+        const sg = try gpa.alloc(u8, c.rows * 4);
+        defer gpa.free(sg);
+        try ctx.download(ds, sg);
+        const scale_gpu: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, sg));
+        const qg = try gpa.alloc(u8, c.rows * c.cols / per_word * 4);
+        defer gpa.free(qg);
+        try ctx.download(dq, qg);
+
+        const row = try gpa.alloc(f32, c.cols);
+        defer gpa.free(row);
+        var bad_scale: usize = 0;
+        var off_by_one: usize = 0;
+        var worse: usize = 0;
+        for (0..c.rows) |r| {
+            quants.dequantSlice(c.dt, packed_w[r * row_bytes ..][0..row_bytes], 0, c.cols, row);
+            convrot.rotate(row);
+            var amax: f32 = 0;
+            for (row) |v| amax = @max(amax, @abs(v));
+            const sc = @max(amax / maxq, 1e-12);
+            if (@abs(sc - scale_gpu[r]) > 1e-6 * @max(sc, 1e-9)) {
+                if (bad_scale < 3) try stdout.print("  scale[{d}]: gpu {d} cpu {d}\n", .{ r, scale_gpu[r], sc });
+                bad_scale += 1;
+            }
+            for (0..c.cols) |k| {
+                const fr = row[k] / sc;
+                const q: i32 = @intFromFloat(std.math.clamp(@trunc(fr + std.math.copysign(@as(f32, 0.5), fr)), @as(f32, @floatFromInt(minc)), @as(f32, @floatFromInt(maxc))));
+                const word = qg[(r * c.cols + k) / per_word * 4 ..][0..4];
+                const w32 = std.mem.readInt(u32, word, .little);
+                const shift: u5 = @intCast((k % per_word) * c.bits);
+                const raw_code: u32 = (w32 >> shift) & (@as(u32, 1) << @intCast(c.bits)) - 1;
+                const got: i32 = if (c.bits == 8) @as(i8, @bitCast(@as(u8, @truncate(raw_code)))) else @as(i4, @bitCast(@as(u4, @truncate(raw_code))));
+                const d = @abs(got - q);
+                if (d == 1) off_by_one += 1;
+                if (d > 1) {
+                    if (worse < 5) try stdout.print("  [{d},{d}]: gpu {d} cpu {d} (v {d}, sc {d})\n", .{ r, k, got, q, row[k], sc });
+                    worse += 1;
+                }
+            }
+        }
+        const total = c.rows * c.cols;
+        try stdout.print(
+            "{t} -> int{d} {d}x{d}: {d} bad scales, {d} off-by-one ({d:.4}%), {d} worse\n",
+            .{ c.dt, c.bits, c.rows, c.cols, bad_scale, off_by_one, 100.0 * @as(f64, @floatFromInt(off_by_one)) / @as(f64, @floatFromInt(total)), worse },
+        );
+        // An off-by-one is a tie landing either side of the f32 division; a
+        // layout error is not off by one, it is off by the whole value.
+        if (bad_scale != 0 or worse != 0 or off_by_one * 1000 > total) return error.CudaError;
+    }
+    try stdout.print("block-quant decode OK\n", .{});
 }

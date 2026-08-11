@@ -280,23 +280,26 @@ pub const SdpaPlan = struct {
         return t;
     }
 
-    pub fn build(api: *const Api, handle: Handle, bsz: usize, hq: usize, hkv: usize, s: usize, d: usize) Error!SdpaPlan {
+    /// `s_q` and `s_kv` differ for cross-attention (a UNet's image tokens onto a
+    /// 77-row text conditioning); pass them equal for self-attention.
+    pub fn build(api: *const Api, handle: Handle, bsz: usize, hq: usize, hkv: usize, s_q: usize, s_kv: usize, d: usize) Error!SdpaPlan {
         var self: SdpaPlan = .{};
         errdefer self.deinit(api);
 
-        const S: i64 = @intCast(s);
+        const SQ: i64 = @intCast(s_q);
+        const SK: i64 = @intCast(s_kv);
         const D: i64 = @intCast(d);
         const HQ: i64 = @intCast(hq);
         const HKV: i64 = @intCast(hkv);
         const B: i64 = @intCast(bsz);
         // Our tensors are stored [b][s][h][d] (h and d contiguous per token), so
         // in [b,h,s,d] dim order the strides are: b=h*s*d, h=d, s=h*d, d=1.
-        const q_dims = [4]i64{ B, HQ, S, D };
-        const q_str = [4]i64{ HQ * S * D, D, HQ * D, 1 };
-        const kv_dims = [4]i64{ B, HKV, S, D };
-        const kv_str = [4]i64{ HKV * S * D, D, HKV * D, 1 };
-        const o_dims = [4]i64{ B, HQ, S, D };
-        const o_str = [4]i64{ HQ * S * D, D, HQ * D, 1 };
+        const q_dims = [4]i64{ B, HQ, SQ, D };
+        const q_str = [4]i64{ HQ * SQ * D, D, HQ * D, 1 };
+        const kv_dims = [4]i64{ B, HKV, SK, D };
+        const kv_str = [4]i64{ HKV * SK * D, D, HKV * D, 1 };
+        const o_dims = [4]i64{ B, HQ, SQ, D };
+        const o_str = [4]i64{ HQ * SQ * D, D, HQ * D, 1 };
         const sc_dims = [4]i64{ 1, 1, 1, 1 };
         const sc_str = [4]i64{ 1, 1, 1, 1 };
 

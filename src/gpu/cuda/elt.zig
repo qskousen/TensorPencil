@@ -6715,10 +6715,7 @@ pub const dequant_q6_k_f16_ptx: [:0]const u8 =
 // f16's 65504, but SDXL's VAE residual stream reaches 4.2e5, which is why
 // `sd_vae.Config.act_f16` is off there. See `sd_vae_cuda.decode`.
 
-/// `gn_stats` reading an f16 activation. Welford stays in f32, see
-/// `ops.norm.groupNorm`: the shifted `E[x²]-E[x]²` form loses catastrophically once
-/// the mean is large relative to the spread, which a late VAE block is.
-/// Diff from `gn_stats`: one load, `*4` -> `*2` + `cvt`.
+/// `gn_stats` over an f16 activation. Statistics stay f32.
 pub const gn_stats_h16_ptx: [:0]const u8 =
     \\.version 8.0
     \\.target sm_86
@@ -6726,35 +6723,69 @@ pub const gn_stats_h16_ptx: [:0]const u8 =
     \\.visible .entry gn_stats_h16(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
-    \\  .reg .pred %p<4>;
+    \\  .reg .pred %p<4>, %pM, %pR;
     \\  .reg .b16 %rs<4>;
-    \\  .reg .b32 %r<20>;
-    \\  .reg .f32 %f<12>;
-    \\  .reg .b64 %rd<10>;
-    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
-    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
-    \\  ld.param.u32 %r6,[u1]; ld.param.u32 %r7,[u2]; ld.param.u32 %r8,[u3]; ld.param.u32 %r9,[u4];
+    \\  .reg .b32 %r<8>, %rT, %rS, %rSH, %rOFF, %rA1, %rB2, %rG, %rC, %rCH, %rCK, %rPG, %rN, %rTOT, %rC0, %rI, %rST, %rP, %rJ, %rAD;
+    \\  .reg .f32 %f<16>, %fK, %fS1, %fS2, %fV, %fD, %fT;
+    \\  .reg .b64 %rd<8>;
+    \\  .shared .align 4 .b8 shbuf[3072];
+    \\  mov.u32 %rT,%tid.x; mov.u32 %r1,%ctaid.x;
+    \\  ld.param.u32 %rCH,[u1]; ld.param.u32 %rCK,[u2]; ld.param.u32 %rPG,[u3]; ld.param.u32 %rN,[u4];
     \\  ld.param.u64 %rd1,[p0]; cvta.to.global.u64 %rd1,%rd1;
-    \\  div.u32 %r10,%r4,%r7; rem.u32 %r11,%r4,%r7;        // g, chunk
-    \\  mul.lo.s32 %r12,%r9,%r8;                            // total = positions*per_group
-    \\  mul.lo.s32 %r13,%r10,%r8;                           // c0 = g*per_group
-    \\  mov.f32 %f1,0f00000000;                             // count
-    \\  mov.f32 %f2,0f00000000;                             // mean
-    \\  mov.f32 %f3,0f00000000;                             // m2
-    \\  mov.u32 %r14,%r11;                                  // i = chunk
+    \\  div.u32 %rG,%r1,%rCK; rem.u32 %rC,%r1,%rCK;         // group, partial
+    \\  mul.lo.s32 %rTOT,%rN,%rPG;                          // logical indices in the group
+    \\  mul.lo.s32 %rC0,%rG,%rPG;                           // group's first channel
+    \\  shl.b32 %rI,%rC,8; add.u32 %rI,%rI,%rT;             // i = partial*256 + tid
+    \\  shl.b32 %rST,%rCK,8;                                // stride = chunks*256
+    \\  mov.f32 %f1,0f00000000; mov.f32 %fS1,0f00000000; mov.f32 %fS2,0f00000000; mov.f32 %fK,0f00000000;
     \\LOOP:
-    \\  setp.ge.u32 %p2,%r14,%r12; @%p2 bra DONE;
-    \\  div.u32 %r15,%r14,%r8; rem.u32 %r16,%r14,%r8;       // p, j
-    \\  mad.lo.s32 %r17,%r15,%r6,%r13; add.u32 %r17,%r17,%r16;   // p*ch + c0 + j
-    \\  mul.wide.u32 %rd2,%r17,2; add.s64 %rd3,%rd1,%rd2; ld.global.b16 %rs1,[%rd3]; cvt.f32.f16 %f4,%rs1;
-    \\  add.f32 %f1,%f1,0f3F800000;                         // count += 1
-    \\  sub.f32 %f5,%f4,%f2;                                // delta = v - mean
-    \\  div.rn.f32 %f6,%f5,%f1; add.f32 %f2,%f2,%f6;        // mean += delta/count
-    \\  sub.f32 %f7,%f4,%f2; fma.rn.f32 %f3,%f5,%f7,%f3;    // m2 += delta*(v-mean)
-    \\  add.u32 %r14,%r14,%r7; bra LOOP;
+    \\  setp.ge.u32 %p1,%rI,%rTOT; @%p1 bra DONE;
+    \\  div.u32 %rP,%rI,%rPG; rem.u32 %rJ,%rI,%rPG;
+    \\  mad.lo.s32 %rAD,%rP,%rCH,%rC0; add.u32 %rAD,%rAD,%rJ;
+    \\  mul.wide.u32 %rd4,%rAD,2; add.s64 %rd5,%rd1,%rd4; ld.global.b16 %rs1,[%rd5]; cvt.f32.f16 %fV,%rs1;
+    \\  setp.eq.f32 %p2,%f1,0f00000000; @%p2 mov.f32 %fK,%fV;   // shift = this thread's first value
+    \\  sub.f32 %fD,%fV,%fK;
+    \\  add.f32 %fS1,%fS1,%fD; fma.rn.f32 %fS2,%fD,%fD,%fS2;
+    \\  add.f32 %f1,%f1,0f3F800000;
+    \\  add.u32 %rI,%rI,%rST; bra LOOP;
     \\DONE:
-    \\  ld.param.u64 %rd4,[p3]; cvta.to.global.u64 %rd4,%rd4;
-    \\  mul.lo.s32 %r18,%r4,3; mul.wide.u32 %rd5,%r18,4; add.s64 %rd6,%rd4,%rd5;
+    \\  // Shifted sums -> (count, mean, m2). The shift is a sample of the group itself,
+    \\  // so `x - K` stays O(sigma) even when the values sit at 400 and the plain
+    \\  // sum-of-squares form would cancel away the variance.
+    \\  mov.f32 %f2,0f00000000; mov.f32 %f3,0f00000000;
+    \\  setp.eq.f32 %p3,%f1,0f00000000; @%p3 bra RSTORE;
+    \\  div.rn.f32 %fT,%fS1,%f1; add.f32 %f2,%fK,%fT;
+    \\  mul.f32 %f11,%fS1,%fT; sub.f32 %f3,%fS2,%f11;
+    \\  max.f32 %f3,%f3,0f00000000;                         // rounding can push it just under 0
+    \\RSTORE:
+    \\
+    \\  mov.u32 %rSH,shbuf;
+    \\  shl.b32 %rOFF,%rT,2; add.u32 %rA1,%rSH,%rOFF;
+    \\  st.shared.f32 [%rA1],%f1; st.shared.f32 [%rA1+1024],%f2; st.shared.f32 [%rA1+2048],%f3;
+    \\  bar.sync 0;
+    \\  mov.u32 %rS,128;
+    \\RED:
+    \\  setp.eq.u32 %pR,%rS,0; @%pR bra REDDONE;
+    \\  setp.ge.u32 %pR,%rT,%rS; @%pR bra RED_NOMERGE;
+    \\  add.u32 %rB2,%rS,%rT; shl.b32 %rB2,%rB2,2; add.u32 %rB2,%rB2,%rSH;
+    \\  ld.shared.f32 %f4,[%rB2]; ld.shared.f32 %f5,[%rB2+1024]; ld.shared.f32 %f6,[%rB2+2048];
+    \\
+    \\  add.f32 %f7,%f1,%f4;                                // n = ca + cb
+    \\  setp.eq.f32 %pM,%f7,0f00000000; @%pM bra RED_SKIP;
+    \\  sub.f32 %f8,%f5,%f2;                                // delta = mb - ma
+    \\  mul.f32 %f9,%f8,%f4; div.rn.f32 %f9,%f9,%f7; add.f32 %f2,%f2,%f9;   // mean += delta*cb/n
+    \\  mul.f32 %f10,%f8,%f8; mul.f32 %f10,%f10,%f1; mul.f32 %f10,%f10,%f4;
+    \\  div.rn.f32 %f10,%f10,%f7; add.f32 %f3,%f3,%f6; add.f32 %f3,%f3,%f10; // m2 += m2b + delta^2*ca*cb/n
+    \\  mov.f32 %f1,%f7;
+    \\RED_SKIP:
+    \\  st.shared.f32 [%rA1],%f1; st.shared.f32 [%rA1+1024],%f2; st.shared.f32 [%rA1+2048],%f3;
+    \\RED_NOMERGE:
+    \\  bar.sync 0;
+    \\  shr.u32 %rS,%rS,1; bra RED;
+    \\REDDONE:
+    \\  setp.ne.u32 %pR,%rT,0; @%pR bra END;
+    \\  ld.param.u64 %rd2,[p3]; cvta.to.global.u64 %rd2,%rd2;
+    \\  mul.lo.s32 %r2,%r1,3; mul.wide.u32 %rd3,%r2,4; add.s64 %rd6,%rd2,%rd3;
     \\  st.global.f32 [%rd6],%f1; st.global.f32 [%rd6+4],%f2; st.global.f32 [%rd6+8],%f3;
     \\END:
     \\  ret;
@@ -6879,7 +6910,8 @@ pub const im2col_sd_h16_ptx: [:0]const u8 =
     \\  ld.param.f32 %f1,[f0]; ld.param.b32 %r24,[f1];      // mode, out width (raw bits)
     \\  setp.eq.f32 %p2,%f1,0f3F800000; selp.b32 %r11,1,0,%p2;      // up = (mode == 1)
     \\  setp.eq.f32 %p2,%f1,0f40000000; selp.b32 %r25,2,1,%p2;      // stride = (mode == 2) ? 2 : 1
-    \\  shl.b32 %r12,%r8,%r11; shl.b32 %r13,%r9,%r11;       // gw, gh (the doubled grid when upsampling)
+    \\  setp.eq.u32 %p4,%r11,1; selp.b32 %r12,%r24,%r8,%p4; // gw = up ? out w : src w
+    \\  mov.u32 %r13,%r9;                                   // gh = tap extent (u4), see the kernel note
     \\  rem.u32 %r14,%r4,%r6; div.u32 %r15,%r4,%r6;         // col, band-row
     \\  add.u32 %r16,%r10,%r15;                              // p
     \\  div.u32 %r17,%r14,%r7; rem.u32 %r18,%r14,%r7;       // tap, cc
@@ -8034,15 +8066,15 @@ pub const copy_off_ptx: [:0]const u8 =
 // that this signature has no u6, so `im2col_sd` carries its output width in f1's
 // raw bits.
 
-/// GroupNorm statistics, one thread per (group, chunk). Walks the group's
-/// elements in the interleaved slice i = chunk, chunk+u2, ... and writes
-/// {count, mean, M2} as three floats.
+/// GroupNorm pass 1: one BLOCK (256 threads) per (group, partial), each thread
+/// walking a strided slice of the group and the block tree-reducing to one
+/// {count, mean, m2} triple at `gstat[(group*chunks + partial)*3]`.
 ///
-/// Welford, not sum-and-sum-of-squares, for the reason `ops.norm.groupNorm`
-/// spells out: the shifted form loses catastrophically once the mean is large
-/// relative to the spread, which is where a late VAE decoder block sits.
-/// b0=x [n][u1], b3=stats [u0][3].
-/// u0=groups*chunks, u1=channels, u2=chunks, u3=per_group, u4=positions.
+/// `chunks` sets the partials per group, so the launch is `groups*chunks` blocks:
+/// it is a parallelism knob, and one thread per partial left the card idle.
+/// Per thread the accumulation is shifted sums rather than Welford, which drops
+/// a full-rate divide per element; the shift is the thread's own first value, so
+/// it is stable where a plain sum of squares is not.
 pub const gn_stats_ptx: [:0]const u8 =
     \\.version 8.0
     \\.target sm_86
@@ -8050,43 +8082,78 @@ pub const gn_stats_ptx: [:0]const u8 =
     \\.visible .entry gn_stats(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
-    \\  .reg .pred %p<4>;
-    \\  .reg .b32 %r<20>;
-    \\  .reg .f32 %f<12>;
-    \\  .reg .b64 %rd<10>;
-    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
-    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
-    \\  ld.param.u32 %r6,[u1]; ld.param.u32 %r7,[u2]; ld.param.u32 %r8,[u3]; ld.param.u32 %r9,[u4];
+    \\  .reg .pred %p<4>, %pM, %pR;
+    \\  .reg .b16 %rs<4>;
+    \\  .reg .b32 %r<8>, %rT, %rS, %rSH, %rOFF, %rA1, %rB2, %rG, %rC, %rCH, %rCK, %rPG, %rN, %rTOT, %rC0, %rI, %rST, %rP, %rJ, %rAD;
+    \\  .reg .f32 %f<16>, %fK, %fS1, %fS2, %fV, %fD, %fT;
+    \\  .reg .b64 %rd<8>;
+    \\  .shared .align 4 .b8 shbuf[3072];
+    \\  mov.u32 %rT,%tid.x; mov.u32 %r1,%ctaid.x;
+    \\  ld.param.u32 %rCH,[u1]; ld.param.u32 %rCK,[u2]; ld.param.u32 %rPG,[u3]; ld.param.u32 %rN,[u4];
     \\  ld.param.u64 %rd1,[p0]; cvta.to.global.u64 %rd1,%rd1;
-    \\  div.u32 %r10,%r4,%r7; rem.u32 %r11,%r4,%r7;        // g, chunk
-    \\  mul.lo.s32 %r12,%r9,%r8;                            // total = positions*per_group
-    \\  mul.lo.s32 %r13,%r10,%r8;                           // c0 = g*per_group
-    \\  mov.f32 %f1,0f00000000;                             // count
-    \\  mov.f32 %f2,0f00000000;                             // mean
-    \\  mov.f32 %f3,0f00000000;                             // m2
-    \\  mov.u32 %r14,%r11;                                  // i = chunk
+    \\  div.u32 %rG,%r1,%rCK; rem.u32 %rC,%r1,%rCK;         // group, partial
+    \\  mul.lo.s32 %rTOT,%rN,%rPG;                          // logical indices in the group
+    \\  mul.lo.s32 %rC0,%rG,%rPG;                           // group's first channel
+    \\  shl.b32 %rI,%rC,8; add.u32 %rI,%rI,%rT;             // i = partial*256 + tid
+    \\  shl.b32 %rST,%rCK,8;                                // stride = chunks*256
+    \\  mov.f32 %f1,0f00000000; mov.f32 %fS1,0f00000000; mov.f32 %fS2,0f00000000; mov.f32 %fK,0f00000000;
     \\LOOP:
-    \\  setp.ge.u32 %p2,%r14,%r12; @%p2 bra DONE;
-    \\  div.u32 %r15,%r14,%r8; rem.u32 %r16,%r14,%r8;       // p, j
-    \\  mad.lo.s32 %r17,%r15,%r6,%r13; add.u32 %r17,%r17,%r16;   // p*ch + c0 + j
-    \\  mul.wide.u32 %rd2,%r17,4; add.s64 %rd3,%rd1,%rd2; ld.global.f32 %f4,[%rd3];
-    \\  add.f32 %f1,%f1,0f3F800000;                         // count += 1
-    \\  sub.f32 %f5,%f4,%f2;                                // delta = v - mean
-    \\  div.rn.f32 %f6,%f5,%f1; add.f32 %f2,%f2,%f6;        // mean += delta/count
-    \\  sub.f32 %f7,%f4,%f2; fma.rn.f32 %f3,%f5,%f7,%f3;    // m2 += delta*(v-mean)
-    \\  add.u32 %r14,%r14,%r7; bra LOOP;
+    \\  setp.ge.u32 %p1,%rI,%rTOT; @%p1 bra DONE;
+    \\  div.u32 %rP,%rI,%rPG; rem.u32 %rJ,%rI,%rPG;
+    \\  mad.lo.s32 %rAD,%rP,%rCH,%rC0; add.u32 %rAD,%rAD,%rJ;
+    \\  mul.wide.u32 %rd4,%rAD,4; add.s64 %rd5,%rd1,%rd4; ld.global.f32 %fV,[%rd5];
+    \\  setp.eq.f32 %p2,%f1,0f00000000; @%p2 mov.f32 %fK,%fV;   // shift = this thread's first value
+    \\  sub.f32 %fD,%fV,%fK;
+    \\  add.f32 %fS1,%fS1,%fD; fma.rn.f32 %fS2,%fD,%fD,%fS2;
+    \\  add.f32 %f1,%f1,0f3F800000;
+    \\  add.u32 %rI,%rI,%rST; bra LOOP;
     \\DONE:
-    \\  ld.param.u64 %rd4,[p3]; cvta.to.global.u64 %rd4,%rd4;
-    \\  mul.lo.s32 %r18,%r4,3; mul.wide.u32 %rd5,%r18,4; add.s64 %rd6,%rd4,%rd5;
+    \\  // Shifted sums -> (count, mean, m2). The shift is a sample of the group itself,
+    \\  // so `x - K` stays O(sigma) even when the values sit at 400 and the plain
+    \\  // sum-of-squares form would cancel away the variance.
+    \\  mov.f32 %f2,0f00000000; mov.f32 %f3,0f00000000;
+    \\  setp.eq.f32 %p3,%f1,0f00000000; @%p3 bra RSTORE;
+    \\  div.rn.f32 %fT,%fS1,%f1; add.f32 %f2,%fK,%fT;
+    \\  mul.f32 %f11,%fS1,%fT; sub.f32 %f3,%fS2,%f11;
+    \\  max.f32 %f3,%f3,0f00000000;                         // rounding can push it just under 0
+    \\RSTORE:
+    \\
+    \\  mov.u32 %rSH,shbuf;
+    \\  shl.b32 %rOFF,%rT,2; add.u32 %rA1,%rSH,%rOFF;
+    \\  st.shared.f32 [%rA1],%f1; st.shared.f32 [%rA1+1024],%f2; st.shared.f32 [%rA1+2048],%f3;
+    \\  bar.sync 0;
+    \\  mov.u32 %rS,128;
+    \\RED:
+    \\  setp.eq.u32 %pR,%rS,0; @%pR bra REDDONE;
+    \\  setp.ge.u32 %pR,%rT,%rS; @%pR bra RED_NOMERGE;
+    \\  add.u32 %rB2,%rS,%rT; shl.b32 %rB2,%rB2,2; add.u32 %rB2,%rB2,%rSH;
+    \\  ld.shared.f32 %f4,[%rB2]; ld.shared.f32 %f5,[%rB2+1024]; ld.shared.f32 %f6,[%rB2+2048];
+    \\
+    \\  add.f32 %f7,%f1,%f4;                                // n = ca + cb
+    \\  setp.eq.f32 %pM,%f7,0f00000000; @%pM bra RED_SKIP;
+    \\  sub.f32 %f8,%f5,%f2;                                // delta = mb - ma
+    \\  mul.f32 %f9,%f8,%f4; div.rn.f32 %f9,%f9,%f7; add.f32 %f2,%f2,%f9;   // mean += delta*cb/n
+    \\  mul.f32 %f10,%f8,%f8; mul.f32 %f10,%f10,%f1; mul.f32 %f10,%f10,%f4;
+    \\  div.rn.f32 %f10,%f10,%f7; add.f32 %f3,%f3,%f6; add.f32 %f3,%f3,%f10; // m2 += m2b + delta^2*ca*cb/n
+    \\  mov.f32 %f1,%f7;
+    \\RED_SKIP:
+    \\  st.shared.f32 [%rA1],%f1; st.shared.f32 [%rA1+1024],%f2; st.shared.f32 [%rA1+2048],%f3;
+    \\RED_NOMERGE:
+    \\  bar.sync 0;
+    \\  shr.u32 %rS,%rS,1; bra RED;
+    \\REDDONE:
+    \\  setp.ne.u32 %pR,%rT,0; @%pR bra END;
+    \\  ld.param.u64 %rd2,[p3]; cvta.to.global.u64 %rd2,%rd2;
+    \\  mul.lo.s32 %r2,%r1,3; mul.wide.u32 %rd3,%r2,4; add.s64 %rd6,%rd2,%rd3;
     \\  st.global.f32 [%rd6],%f1; st.global.f32 [%rd6+4],%f2; st.global.f32 [%rd6+8],%f3;
     \\END:
     \\  ret;
     \\}
 ;
 
-/// Merge the chunk statistics per group with Chan's stable pairwise formula and
-/// write mean[g] at out[g], inv[g] at out[groups+g].
-/// b0=stats, b3=out [2*u0]. u0=groups, u2=chunks, f0=eps.
+/// GroupNorm pass 2: one BLOCK (256 threads) per group, merging that group's
+/// `chunks` triples and writing `gmi[g]` = mean, `gmi[groups + g]` = 1/sqrt(var+eps).
+/// Partials with count 0 (a group shorter than its chunk count) merge as identities.
 pub const gn_combine_ptx: [:0]const u8 =
     \\.version 8.0
     \\.target sm_86
@@ -8094,36 +8161,63 @@ pub const gn_combine_ptx: [:0]const u8 =
     \\.visible .entry gn_combine(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
-    \\  .reg .pred %p<5>;
-    \\  .reg .b32 %r<16>;
-    \\  .reg .f32 %f<20>;
-    \\  .reg .b64 %rd<10>;
-    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
-    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
-    \\  ld.param.u32 %r6,[u2]; ld.param.f32 %f10,[f0];
+    \\  .reg .pred %p<4>, %pM, %pR;
+    \\  .reg .b16 %rs<4>;
+    \\  .reg .b32 %r<8>, %rT, %rS, %rSH, %rOFF, %rA1, %rB2, %rG, %rC, %rCH, %rCK, %rPG, %rN, %rTOT, %rC0, %rI, %rST, %rP, %rJ, %rAD;
+    \\  .reg .f32 %f<16>, %fK, %fS1, %fS2, %fV, %fD, %fT;
+    \\  .reg .b64 %rd<8>;
+    \\  .shared .align 4 .b8 shbuf[3072];
+    \\  mov.u32 %rT,%tid.x; mov.u32 %r1,%ctaid.x;         // block = group
+    \\  ld.param.u32 %r2,[u0]; ld.param.u32 %rCK,[u2]; ld.param.f32 %f12,[f0];
     \\  ld.param.u64 %rd1,[p0]; cvta.to.global.u64 %rd1,%rd1;
-    \\  mov.f32 %f1,0f00000000; mov.f32 %f2,0f00000000; mov.f32 %f3,0f00000000;  // count, mean, m2
-    \\  mov.u32 %r7,0;                                      // k
-    \\  mul.lo.s32 %r8,%r4,%r6; mul.lo.s32 %r8,%r8,3;       // (g*chunks)*3
-    \\  mul.wide.u32 %rd2,%r8,4; add.s64 %rd3,%rd1,%rd2;
-    \\LOOP:
-    \\  setp.ge.u32 %p2,%r7,%r6; @%p2 bra DONE;
-    \\  ld.global.f32 %f4,[%rd3];                           // cb
-    \\  setp.eq.f32 %p3,%f4,0f00000000; @%p3 bra NEXT;      // chunk past the end
-    \\  ld.global.f32 %f5,[%rd3+4]; ld.global.f32 %f6,[%rd3+8];  // mb, m2b
-    \\  add.f32 %f7,%f1,%f4;                                // n = count + cb
-    \\  sub.f32 %f8,%f5,%f2;                                // delta
+    \\  mul.lo.s32 %r3,%r1,%rCK; mul.lo.s32 %r3,%r3,3;      // (group*chunks)*3
+    \\  mov.f32 %f1,0f00000000; mov.f32 %f2,0f00000000; mov.f32 %f3,0f00000000;
+    \\  mov.u32 %rI,%rT;
+    \\CLOOP:
+    \\  setp.ge.u32 %p1,%rI,%rCK; @%p1 bra CDONE;
+    \\  mad.lo.s32 %rAD,%rI,3,%r3; mul.wide.u32 %rd4,%rAD,4; add.s64 %rd5,%rd1,%rd4;
+    \\  ld.global.f32 %f4,[%rd5]; ld.global.f32 %f5,[%rd5+4]; ld.global.f32 %f6,[%rd5+8];
+    \\
+    \\  add.f32 %f7,%f1,%f4;                                // n = ca + cb
+    \\  setp.eq.f32 %pM,%f7,0f00000000; @%pM bra CL_SKIP;
+    \\  sub.f32 %f8,%f5,%f2;                                // delta = mb - ma
     \\  mul.f32 %f9,%f8,%f4; div.rn.f32 %f9,%f9,%f7; add.f32 %f2,%f2,%f9;   // mean += delta*cb/n
-    \\  mul.f32 %f11,%f8,%f8; mul.f32 %f11,%f11,%f1; mul.f32 %f11,%f11,%f4;
-    \\  div.rn.f32 %f11,%f11,%f7; add.f32 %f3,%f3,%f6; add.f32 %f3,%f3,%f11; // m2 += m2b + delta^2*count*cb/n
+    \\  mul.f32 %f10,%f8,%f8; mul.f32 %f10,%f10,%f1; mul.f32 %f10,%f10,%f4;
+    \\  div.rn.f32 %f10,%f10,%f7; add.f32 %f3,%f3,%f6; add.f32 %f3,%f3,%f10; // m2 += m2b + delta^2*ca*cb/n
     \\  mov.f32 %f1,%f7;
-    \\NEXT:
-    \\  add.u32 %r7,%r7,1; add.s64 %rd3,%rd3,12; bra LOOP;
-    \\DONE:
-    \\  div.rn.f32 %f12,%f3,%f1; add.f32 %f12,%f12,%f10; rsqrt.approx.f32 %f13,%f12;
-    \\  ld.param.u64 %rd4,[p3]; cvta.to.global.u64 %rd4,%rd4;
-    \\  mul.wide.u32 %rd5,%r4,4; add.s64 %rd6,%rd4,%rd5; st.global.f32 [%rd6],%f2;
-    \\  add.u32 %r9,%r4,%r5; mul.wide.u32 %rd7,%r9,4; add.s64 %rd8,%rd4,%rd7; st.global.f32 [%rd8],%f13;
+    \\CL_SKIP:
+    \\  add.u32 %rI,%rI,256; bra CLOOP;
+    \\CDONE:
+    \\
+    \\  mov.u32 %rSH,shbuf;
+    \\  shl.b32 %rOFF,%rT,2; add.u32 %rA1,%rSH,%rOFF;
+    \\  st.shared.f32 [%rA1],%f1; st.shared.f32 [%rA1+1024],%f2; st.shared.f32 [%rA1+2048],%f3;
+    \\  bar.sync 0;
+    \\  mov.u32 %rS,128;
+    \\RED:
+    \\  setp.eq.u32 %pR,%rS,0; @%pR bra REDDONE;
+    \\  setp.ge.u32 %pR,%rT,%rS; @%pR bra RED_NOMERGE;
+    \\  add.u32 %rB2,%rS,%rT; shl.b32 %rB2,%rB2,2; add.u32 %rB2,%rB2,%rSH;
+    \\  ld.shared.f32 %f4,[%rB2]; ld.shared.f32 %f5,[%rB2+1024]; ld.shared.f32 %f6,[%rB2+2048];
+    \\
+    \\  add.f32 %f7,%f1,%f4;                                // n = ca + cb
+    \\  setp.eq.f32 %pM,%f7,0f00000000; @%pM bra RED_SKIP;
+    \\  sub.f32 %f8,%f5,%f2;                                // delta = mb - ma
+    \\  mul.f32 %f9,%f8,%f4; div.rn.f32 %f9,%f9,%f7; add.f32 %f2,%f2,%f9;   // mean += delta*cb/n
+    \\  mul.f32 %f10,%f8,%f8; mul.f32 %f10,%f10,%f1; mul.f32 %f10,%f10,%f4;
+    \\  div.rn.f32 %f10,%f10,%f7; add.f32 %f3,%f3,%f6; add.f32 %f3,%f3,%f10; // m2 += m2b + delta^2*ca*cb/n
+    \\  mov.f32 %f1,%f7;
+    \\RED_SKIP:
+    \\  st.shared.f32 [%rA1],%f1; st.shared.f32 [%rA1+1024],%f2; st.shared.f32 [%rA1+2048],%f3;
+    \\RED_NOMERGE:
+    \\  bar.sync 0;
+    \\  shr.u32 %rS,%rS,1; bra RED;
+    \\REDDONE:
+    \\  setp.ne.u32 %pR,%rT,0; @%pR bra END;
+    \\  div.rn.f32 %f13,%f3,%f1; add.f32 %f13,%f13,%f12; rsqrt.approx.f32 %f13,%f13;
+    \\  ld.param.u64 %rd2,[p3]; cvta.to.global.u64 %rd2,%rd2;
+    \\  mul.wide.u32 %rd3,%r1,4; add.s64 %rd6,%rd2,%rd3; st.global.f32 [%rd6],%f2;
+    \\  add.u32 %r4,%r1,%r2; mul.wide.u32 %rd7,%r4,4; add.s64 %rd7,%rd2,%rd7; st.global.f32 [%rd7],%f13;
     \\END:
     \\  ret;
     \\}
@@ -8346,7 +8440,8 @@ pub const im2col_sd_ptx: [:0]const u8 =
     \\  ld.param.f32 %f1,[f0]; ld.param.b32 %r24,[f1];      // mode, out width (raw bits)
     \\  setp.eq.f32 %p2,%f1,0f3F800000; selp.b32 %r11,1,0,%p2;      // up = (mode == 1)
     \\  setp.eq.f32 %p2,%f1,0f40000000; selp.b32 %r25,2,1,%p2;      // stride = (mode == 2) ? 2 : 1
-    \\  shl.b32 %r12,%r8,%r11; shl.b32 %r13,%r9,%r11;       // gw, gh (the doubled grid when upsampling)
+    \\  setp.eq.u32 %p4,%r11,1; selp.b32 %r12,%r24,%r8,%p4; // gw = up ? out w : src w
+    \\  mov.u32 %r13,%r9;                                   // gh = tap extent (u4), see the kernel note
     \\  rem.u32 %r14,%r4,%r6; div.u32 %r15,%r4,%r6;         // col, band-row
     \\  add.u32 %r16,%r10,%r15;                              // p
     \\  div.u32 %r17,%r14,%r7; rem.u32 %r18,%r14,%r7;       // tap, cc
@@ -8501,3 +8596,239 @@ test "every PTX kernel string is ASCII" {
         }
     }
 }
+
+// ---- f16 activation-storage twins ------------------------------------------
+// The SD UNet carries its activations as f16 in DRAM under `--backend cuda` (see
+// `sd_unet_cuda.Workspace.act_f16`). These are the f32 kernels above with the
+// activation loads and stores narrowed; everything they compute is still f32, and
+// per-channel parameters (norm weight/bias, the ResBlock timestep projection,
+// convolution bias) stay f32 because they are per-channel, not per-position.
+
+/// `ln_bias_par` over f16 activations. `w`/`b` stay f32, so the row offset is
+/// scaled by 2 and the parameter offset by 4.
+pub const ln_bias_par_h16_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry ln_bias_par_h16(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<6>;
+    \\  .reg .b16 %rs<4>;
+    \\  .reg .b32 %r<20>;
+    \\  .reg .f32 %f<16>;
+    \\  .reg .b64 %rd<20>;
+    \\  .shared .align 4 .b8 red[1024];
+    \\  mov.u32 %r1,%ctaid.x;                  // row
+    \\  ld.param.u32 %r2,[u0]; setp.ge.u32 %p1,%r1,%r2; @%p1 bra END;
+    \\  mov.u32 %r3,%tid.x;
+    \\  ld.param.u32 %r4,[u1];                 // dim
+    \\  ld.param.f32 %f1,[f0];                 // eps
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2]; ld.param.u64 %rd4,[p3];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3; cvta.to.global.u64 %rd4,%rd4;
+    \\  mul.lo.s32 %r7,%r1,%r4; mul.wide.u32 %rd5,%r7,2;
+    \\  add.s64 %rd6,%rd1,%rd5;                // x row (f16)
+    \\  add.s64 %rd7,%rd2,%rd5;                // out row (f16)
+    \\  cvt.rn.f32.u32 %f8,%r4;
+    \\  mov.u32 %r9,red; shl.b32 %r10,%r3,2; add.u32 %r10,%r10,%r9;
+    \\  mov.f32 %f2,0f00000000; mov.u32 %r8,%r3;
+    \\S1:
+    \\  setp.ge.u32 %p2,%r8,%r4; @%p2 bra S1D;
+    \\  mul.wide.u32 %rd8,%r8,2; add.s64 %rd9,%rd6,%rd8;
+    \\  ld.global.b16 %rs1,[%rd9]; cvt.f32.f16 %f4,%rs1; add.f32 %f2,%f2,%f4;
+    \\  add.u32 %r8,%r8,256; bra S1;
+    \\S1D:
+    \\  st.shared.f32 [%r10],%f2; bar.sync 0;
+    \\  mov.u32 %r11,128;
+    \\R1:
+    \\  setp.eq.u32 %p2,%r11,0; @%p2 bra R1D;
+    \\  setp.ge.u32 %p3,%r3,%r11; @%p3 bra R1S;
+    \\  shl.b32 %r12,%r11,2; add.u32 %r12,%r10,%r12;
+    \\  ld.shared.f32 %f4,[%r10]; ld.shared.f32 %f5,[%r12]; add.f32 %f4,%f4,%f5; st.shared.f32 [%r10],%f4;
+    \\R1S:
+    \\  bar.sync 0; shr.u32 %r11,%r11,1; bra R1;
+    \\R1D:
+    \\  ld.shared.f32 %f6,[%r9]; div.rn.f32 %f6,%f6,%f8;
+    \\  bar.sync 0;
+    \\  mov.f32 %f3,0f00000000; mov.u32 %r8,%r3;
+    \\S2:
+    \\  setp.ge.u32 %p2,%r8,%r4; @%p2 bra S2D;
+    \\  mul.wide.u32 %rd8,%r8,2; add.s64 %rd9,%rd6,%rd8;
+    \\  ld.global.b16 %rs1,[%rd9]; cvt.f32.f16 %f4,%rs1; sub.f32 %f4,%f4,%f6; fma.rn.f32 %f3,%f4,%f4,%f3;
+    \\  add.u32 %r8,%r8,256; bra S2;
+    \\S2D:
+    \\  st.shared.f32 [%r10],%f3; bar.sync 0;
+    \\  mov.u32 %r11,128;
+    \\R2:
+    \\  setp.eq.u32 %p2,%r11,0; @%p2 bra R2D;
+    \\  setp.ge.u32 %p3,%r3,%r11; @%p3 bra R2S;
+    \\  shl.b32 %r12,%r11,2; add.u32 %r12,%r10,%r12;
+    \\  ld.shared.f32 %f4,[%r10]; ld.shared.f32 %f5,[%r12]; add.f32 %f4,%f4,%f5; st.shared.f32 [%r10],%f4;
+    \\R2S:
+    \\  bar.sync 0; shr.u32 %r11,%r11,1; bra R2;
+    \\R2D:
+    \\  ld.shared.f32 %f7,[%r9]; div.rn.f32 %f7,%f7,%f8; add.f32 %f7,%f7,%f1;
+    \\  rsqrt.approx.f32 %f10,%f7;
+    \\  mov.u32 %r8,%r3;
+    \\AP:
+    \\  setp.ge.u32 %p2,%r8,%r4; @%p2 bra END;
+    \\  mul.wide.u32 %rd8,%r8,2; add.s64 %rd9,%rd6,%rd8; ld.global.b16 %rs1,[%rd9]; cvt.f32.f16 %f4,%rs1;
+    \\  mul.wide.u32 %rd13,%r8,4;
+    \\  add.s64 %rd10,%rd3,%rd13; ld.global.f32 %f11,[%rd10];
+    \\  add.s64 %rd11,%rd4,%rd13; ld.global.f32 %f12,[%rd11];
+    \\  sub.f32 %f4,%f4,%f6; mul.f32 %f4,%f4,%f10; fma.rn.f32 %f4,%f4,%f11,%f12;
+    \\  add.s64 %rd12,%rd7,%rd8; cvt.rn.f16.f32 %rs1,%f4; st.global.b16 [%rd12],%rs1;
+    \\  add.u32 %r8,%r8,256; bra AP;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// `geglu` over f16 activations. The erf gate is computed in f32 exactly as the
+/// f32 twin does, so only the loads and the store differ.
+pub const geglu_h16_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry geglu_h16(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<4>;
+    \\  .reg .b16 %rs<4>;
+    \\  .reg .b32 %r<12>;
+    \\  .reg .f32 %f<20>;
+    \\  .reg .b64 %rd<12>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1];
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2;
+    \\  div.u32 %r7,%r4,%r6; rem.u32 %r8,%r4,%r6;
+    \\  shl.b32 %r9,%r6,1; mul.lo.s32 %r9,%r7,%r9; add.u32 %r9,%r9,%r8;
+    \\  mul.wide.u32 %rd3,%r9,2; add.s64 %rd4,%rd1,%rd3; ld.global.b16 %rs1,[%rd4]; cvt.f32.f16 %f1,%rs1;
+    \\  add.u32 %r10,%r9,%r6; mul.wide.u32 %rd5,%r10,2; add.s64 %rd6,%rd1,%rd5; ld.global.b16 %rs2,[%rd6]; cvt.f32.f16 %f2,%rs2;
+    \\  mul.f32 %f3,%f2,0f3F3504F3;
+    \\  abs.f32 %f4,%f3;
+    \\  mov.f32 %f5,0f3EA7BA05; fma.rn.f32 %f5,%f5,%f4,0f3F800000; rcp.rn.f32 %f5,%f5;
+    \\  mov.f32 %f6,0f3F87DDA5;
+    \\  fma.rn.f32 %f6,%f6,%f5,0fBFB9F35A;
+    \\  fma.rn.f32 %f6,%f6,%f5,0f3FB5F0E3;
+    \\  fma.rn.f32 %f6,%f6,%f5,0fBE91A98E;
+    \\  fma.rn.f32 %f6,%f6,%f5,0f3E824C63;
+    \\  mul.f32 %f6,%f6,%f5;
+    \\  mul.f32 %f7,%f4,%f4; neg.f32 %f7,%f7; mul.f32 %f7,%f7,0f3FB8AA3B; ex2.approx.f32 %f7,%f7;
+    \\  mul.f32 %f6,%f6,%f7; mov.f32 %f8,0f3F800000; sub.f32 %f8,%f8,%f6;
+    \\  setp.lt.f32 %p2,%f3,0f00000000; @%p2 neg.f32 %f8,%f8;
+    \\  add.f32 %f8,%f8,0f3F800000; mul.f32 %f8,%f8,0f3F000000; mul.f32 %f8,%f8,%f2;
+    \\  mul.f32 %f9,%f1,%f8;
+    \\  mul.wide.u32 %rd7,%r4,2; add.s64 %rd8,%rd2,%rd7; cvt.rn.f16.f32 %rs1,%f9; st.global.b16 [%rd8],%rs1;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// `concat_ch` over f16 activations. A pure move, so the value never leaves f16.
+pub const concat_ch_h16_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry concat_ch_h16(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<3>;
+    \\  .reg .b16 %rs<3>;
+    \\  .reg .b32 %r<12>;
+    \\  .reg .b64 %rd<8>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1]; ld.param.u32 %r7,[u2]; ld.param.u32 %r8,[u3];
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2;
+    \\  div.u32 %r9,%r4,%r6; rem.u32 %r10,%r4,%r6;
+    \\  mul.wide.u32 %rd3,%r4,2; add.s64 %rd4,%rd1,%rd3; ld.global.b16 %rs1,[%rd4];
+    \\  mad.lo.s32 %r11,%r9,%r7,%r8; add.u32 %r11,%r11,%r10;
+    \\  mul.wide.u32 %rd5,%r11,2; add.s64 %rd6,%rd2,%rd5; st.global.b16 [%rd6],%rs1;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// `add_bias_rows` into an f16 activation. The bias (a ResBlock's timestep
+/// projection) stays f32.
+pub const add_bias_rows_h16_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry add_bias_rows_h16(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<3>;
+    \\  .reg .b16 %rs<3>;
+    \\  .reg .b32 %r<12>;
+    \\  .reg .f32 %f<4>;
+    \\  .reg .b64 %rd<8>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1]; ld.param.u32 %r7,[u3];
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2;
+    \\  rem.u32 %r8,%r4,%r6; add.u32 %r8,%r8,%r7;
+    \\  mul.wide.u32 %rd3,%r8,4; add.s64 %rd4,%rd2,%rd3; ld.global.f32 %f1,[%rd4];
+    \\  mul.wide.u32 %rd5,%r4,2; add.s64 %rd6,%rd1,%rd5; ld.global.b16 %rs1,[%rd6]; cvt.f32.f16 %f2,%rs1;
+    \\  add.f32 %f2,%f2,%f1; cvt.rn.f16.f32 %rs1,%f2; st.global.b16 [%rd6],%rs1;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// `bias_add_f16` writing an f16 destination: the cuDNN convolution's f16 output
+/// plus the f32 per-channel bias, stored back as f16. `u2` is the destination
+/// offset in ELEMENTS, as in the f32 twin.
+pub const bias_add_h16_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry bias_add_h16(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<2>;
+    \\  .reg .b32 %r<10>;
+    \\  .reg .f32 %f<4>;
+    \\  .reg .b16 %h<2>;
+    \\  .reg .b64 %rd<10>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1]; rem.u32 %r7,%r4,%r6;
+    \\  ld.param.u64 %rd1,[p0]; cvta.to.global.u64 %rd1,%rd1;
+    \\  mul.wide.u32 %rd2,%r4,2; add.s64 %rd3,%rd1,%rd2; ld.global.b16 %h0,[%rd3]; cvt.f32.f16 %f1,%h0;
+    \\  ld.param.u64 %rd4,[p1]; cvta.to.global.u64 %rd4,%rd4;
+    \\  mul.wide.u32 %rd5,%r7,4; add.s64 %rd6,%rd4,%rd5; ld.global.f32 %f2,[%rd6];
+    \\  add.f32 %f3,%f1,%f2;
+    \\  ld.param.u32 %r8,[u2]; add.s32 %r9,%r8,%r4;
+    \\  ld.param.u64 %rd7,[p2]; cvta.to.global.u64 %rd7,%rd7;
+    \\  mul.wide.u32 %rd8,%r9,2; add.s64 %rd9,%rd7,%rd8; cvt.rn.f16.f32 %h0,%f3; st.global.b16 [%rd9],%h0;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// `copy_off` over f16 elements (the UNet's skip-connection stores).
+pub const copy_off_h16_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry copy_off_h16(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<2>;
+    \\  .reg .b16 %rs<2>;
+    \\  .reg .b32 %r<10>;
+    \\  .reg .b64 %rd<10>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1]; ld.param.u32 %r7,[u2];
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2;
+    \\  add.u32 %r8,%r4,%r7; mul.wide.u32 %rd3,%r8,2; add.s64 %rd4,%rd1,%rd3; ld.global.b16 %rs1,[%rd4];
+    \\  add.u32 %r9,%r4,%r6; mul.wide.u32 %rd5,%r9,2; add.s64 %rd6,%rd2,%rd5; st.global.b16 [%rd6],%rs1;
+    \\END:
+    \\  ret;
+    \\}
+;

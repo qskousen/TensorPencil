@@ -663,17 +663,28 @@ fn linear(io: std.Io, gpa: std.mem.Allocator, out: []f32, x: []const f32, m: usi
     try ops.matmul.matmul(io, gpa, out, x, m, lw.w, lw.b);
 }
 
-/// Whether the GPU DiT forwards (`dit_gpu`, `dit_cuda`) have a GEMM path for block
+/// Which GPU forward is asking `gpuLinKindSupported`. The two do not accept the same
+/// set, so a single answer would either lock CUDA out of a format it has or hand Vulkan
+/// one it does not.
+pub const GpuArm = enum { vulkan, cuda };
+
+/// Whether that GPU DiT forward (`dit_gpu`, `dit_cuda`) has a GEMM path for block
 /// linears of this dtype. They branch on int8/int4 convrot and dense bf16 and treat
 /// anything else as raw fp8-e4m3, so an unrecognized dtype is not a slow path, it
 /// is silently wrong output. Both gate on this before dispatching.
-pub fn gpuLinKindSupported(dt: DType) bool {
+pub fn gpuLinKindSupported(dt: DType, arm: GpuArm) bool {
     return switch (dt) {
         // `.w4a8` is decoded to int8 inside each backend's GEMM (the packed form stays
         // resident), so it runs wherever int8 does.
         // `.nvfp4` decodes to f16 inside each backend's GEMM (weight-only, which is what
         // NVFP4 is below Blackwell), so it runs wherever the f16 GEMM does, everywhere.
         .i8, .i4, .w4a8, .nvfp4, .bf16, .f8_e4m3 => true,
+        // The ggml block quants decode per GEMM instead of expanding in VRAM, either to
+        // convrot int8 (`Backend.blockQFormat`, q4_k/q8_0 only) or to f16
+        // (`Backend.quantKernelSupported`, everything with a dequant kernel), which is
+        // what `dit_cuda.blockQKind` picks between. Only the CUDA arm has either; Vulkan
+        // has no block-quant GEMM at all.
+        .q4_0, .q8_0, .q2_k, .q4_k, .q5_k, .q6_k, .iq4_nl => arm == .cuda,
         else => false,
     };
 }
@@ -1409,7 +1420,7 @@ test "a GGUF checkpoint loads, with its block-quant dtypes intact" {
             try std.testing.expect(w.row_scale == null);
             try std.testing.expectEqual(@as(u32, 0), w.convrot);
             switch (w.dtype) {
-                .q4_0, .q4_k, .q5_k, .q6_k, .q8_0, .iq4_nl, .f16, .bf16, .f32 => {},
+                .q4_0, .q2_k, .q4_k, .q5_k, .q6_k, .q8_0, .iq4_nl, .f16, .bf16, .f32 => {},
                 else => {
                     std.debug.print("unexpected GGUF dtype {t} for {s}\n", .{ w.dtype, w.tag orelse "?" });
                     return error.UnexpectedDtype;
@@ -1433,16 +1444,33 @@ test "the GPU DiT paths refuse a block-quant checkpoint instead of misreading it
     // Checks the *gate*, not a device: it asserts the dtype classification both
     // forwards do, so it runs on the fast suite with no GPU and no checkpoint.
     const supported = [_]DType{ .i8, .i4, .bf16, .f8_e4m3 };
-    const block_quants = [_]DType{ .q4_0, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl };
+    // The block quants the CUDA arm decodes per GEMM are checked separately below. These
+    // are the ones with no diffusion dequant kernel at all, still fp8-shaped garbage on
+    // both arms. `.q2_0_g64`/`.q2_0_g128` are LLM-only formats no diffusion quantizer
+    // emits, so they belong here rather than in the CUDA list.
+    const block_quants = [_]DType{ .q2_0_g64, .q2_0_g128, .q1_0 };
 
-    for (supported) |dt| try std.testing.expect(gpuLinKindSupported(dt));
+    for (supported) |dt| {
+        try std.testing.expect(gpuLinKindSupported(dt, .vulkan));
+        try std.testing.expect(gpuLinKindSupported(dt, .cuda));
+    }
     for (block_quants) |dt| {
-        std.testing.expect(!gpuLinKindSupported(dt)) catch |e| {
-            std.debug.print("block quant {t} would be misread as fp8 by a GPU DiT forward\n", .{dt});
-            return e;
-        };
+        for ([_]GpuArm{ .vulkan, .cuda }) |arm| {
+            std.testing.expect(!gpuLinKindSupported(dt, arm)) catch |e| {
+                std.debug.print("block quant {t} would be misread as fp8 by the {t} DiT forward\n", .{ dt, arm });
+                return e;
+            };
+        }
+    }
+    // The decodable block quants are CUDA-only. Vulkan has no block-quant GEMM, so
+    // accepting one there feeds the packed bytes to the fp8 GEMM: a blank white image
+    // with no error, which is what this test exists to catch.
+    for ([_]DType{ .q4_0, .q8_0, .q2_k, .q4_k, .q5_k, .q6_k, .iq4_nl }) |dt| {
+        try std.testing.expect(gpuLinKindSupported(dt, .cuda));
+        try std.testing.expect(!gpuLinKindSupported(dt, .vulkan));
     }
     // f32 block linears are not a thing a checkpoint ships, and the GPU paths have
     // no branch for them either.
-    try std.testing.expect(!gpuLinKindSupported(.f32));
+    try std.testing.expect(!gpuLinKindSupported(.f32, .vulkan));
+    try std.testing.expect(!gpuLinKindSupported(.f32, .cuda));
 }

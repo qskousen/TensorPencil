@@ -98,6 +98,7 @@ pub const Context = struct {
     stage_wait_ns: u64 = 0,
     shared_optin_max: c_int = 0, // bytes of opt-in dynamic shared per block
     shared_per_sm: c_int = 0,
+    regs_per_sm: c_int = 0,
     clock_khz: c_int = 0,
 
     device_used: usize = 0,
@@ -149,6 +150,7 @@ pub const Context = struct {
         _ = self.api.cuDeviceGetAttribute(&self.sm_count, cu.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, self.dev);
         _ = self.api.cuDeviceGetAttribute(&self.shared_optin_max, cu.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, self.dev);
         _ = self.api.cuDeviceGetAttribute(&self.shared_per_sm, cu.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR, self.dev);
+        _ = self.api.cuDeviceGetAttribute(&self.regs_per_sm, cu.CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR, self.dev);
         _ = self.api.cuDeviceGetAttribute(&self.clock_khz, cu.CU_DEVICE_ATTRIBUTE_CLOCK_RATE, self.dev);
 
         self.vmm_granularity = self.vmmQueryGranularity();
@@ -480,6 +482,34 @@ const FillPool = struct {
             return error.CudaError;
         }
         return .{ .mod = mod };
+    }
+
+    /// Registers and static shared memory a loaded kernel actually compiled to, and
+    /// how many blocks of `threads` that lets an SM hold.
+    ///
+    /// Occupancy is the first thing to check when a hand-PTX tensor-core kernel lands
+    /// far under peak, and it is the one thing Nsight would tell you that the driver
+    /// will also tell you: `cuFuncGetAttribute` needs no profiling permission, where
+    /// `ncu` needs the GPU performance counters unlocked by root. At one block per SM
+    /// a warp has nothing to interleave with, so every ALU instruction between two
+    /// mmas is time the tensor cores spend idle.
+    pub fn kernelOccupancy(self: *Context, func: cu.CUfunction, threads: usize) Error!struct { regs: u32, shared: u32, blocks_per_sm: u32 } {
+        var regs: c_int = 0;
+        var shared: c_int = 0;
+        try self.check(self.api.cuFuncGetAttribute(&regs, cu.CU_FUNC_ATTRIBUTE_NUM_REGS, func), "cuFuncGetAttribute(NUM_REGS)");
+        try self.check(self.api.cuFuncGetAttribute(&shared, cu.CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, func), "cuFuncGetAttribute(SHARED)");
+        // Registers are allocated per warp in fixed steps (256 on sm_8x), so the
+        // per-block cost is the ROUNDED-UP figure; using the raw count overstates
+        // how many blocks fit, which is exactly the answer being checked here.
+        const warps = (threads + 31) / 32;
+        const per_warp = std.mem.alignForward(usize, @as(usize, @intCast(regs)) * 32, 256);
+        const by_regs = if (regs == 0) 32 else @as(usize, @intCast(self.regs_per_sm)) / (per_warp * warps);
+        const by_shared = if (shared == 0) 32 else @as(usize, @intCast(self.shared_per_sm)) / @as(usize, @intCast(shared));
+        return .{
+            .regs = @intCast(regs),
+            .shared = @intCast(shared),
+            .blocks_per_sm = @intCast(@min(by_regs, by_shared)),
+        };
     }
 
     /// Raise a function's dynamic-shared-memory cap above the 48 KB default

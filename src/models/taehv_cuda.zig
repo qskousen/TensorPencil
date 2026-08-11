@@ -109,7 +109,7 @@ fn conv(be: *Backend, bufs: *Bufs, src: *const Buf, dst: *Buf, h: usize, w: usiz
     try be.ensureDeviceBuffer(dst, n_out * cv.co * 4);
 
     if (be.kernels == .libs and coop and !up) {
-        return be.opConvCudnn(dst.*, 0, src.*, h, w, wbytes, cv.co, cv.ci, cv.b);
+        return be.opConvCudnn(dst.*, 0, src.*, h, w, wbytes, cv.co, cv.ci, cv.b, false, false);
     }
 
     const band = @max(4, @min(n_out, patch_band_bytes / (patch_len * 4)) & ~@as(usize, 3));

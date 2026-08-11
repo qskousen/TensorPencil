@@ -9,12 +9,12 @@
 //!
 //! 1. `cuda` attends at the true head width; `zig-cuda` pads to 128. cuDNN's
 //!    fused SDPA takes any head width, so the library arm runs SD's 40/64/80/160
-//!    exactly. The hand-PTX arm cannot: its P@V GEMM tiles the head dimension in
-//!    128-wide blocks, so narrower heads are zero-padded up to 128 (and 160 up to
-//!    256) exactly as the Vulkan path does. Zero dimensions contribute nothing to
-//!    a dot product and V's zero columns give output columns `opHeadUnpad` drops,
-//!    so the padding is exact, it just costs arithmetic. This is the one place
-//!    the two CUDA arms do not share a shape.
+//!    exactly, for self- and cross-attention alike. The hand-PTX arm cannot: its
+//!    P@V GEMM tiles the head dimension in 128-wide blocks, so narrower heads are
+//!    zero-padded up to 128 (and 160 up to 256) exactly as the Vulkan path does.
+//!    Zero dimensions contribute nothing to a dot product and V's zero columns give
+//!    output columns `opHeadUnpad` drops, so the padding is exact, it just costs
+//!    arithmetic. This is the one place the two CUDA arms do not share a shape.
 //!
 //! 2. The ResBlock timestep projection is added, not folded. Vulkan folds it
 //!    into the convolution bias for free; the CUDA GEMM entry points take a host
@@ -22,7 +22,9 @@
 //!    See `opAddBiasRows`.
 //!
 //! Numerics are f16 tensor cores for the GEMMs and f32 elsewhere, so this is not
-//! bit-identical to `sd_unet.forward`; the CPU path remains the reference.
+//! bit-identical to `sd_unet.forward`; the CPU path remains the reference. Under
+//! `cuda` the activations are additionally STORED as f16 (`Workspace.act_f16`),
+//! which is a change of buffer width, not of arithmetic.
 
 const std = @import("std");
 const sd_unet = @import("sd_unet.zig");
@@ -38,9 +40,12 @@ const Config = sd_unet.Config;
 /// Cap on the im2col patch band (bytes); bands iterate over output rows.
 const patch_band_bytes: usize = 256 << 20;
 
-/// Column groups per GroupNorm statistics pass (must match the Vulkan path's, so
-/// the two produce the same partition of the reduction).
-const gn_chunks: usize = 256;
+/// Partials per group in the GroupNorm statistics pass, which is the CUDA
+/// kernel's parallelism knob: `gn_stats` runs one 256-thread block per partial,
+/// so this is `groups * gn_chunks` blocks. Too few starves the card, too many
+/// leaves each block reducing almost nothing. The Vulkan path's value is its own;
+/// the two kernels partition the reduction differently and always did.
+const gn_chunks: usize = 32;
 
 /// Convolutions at least this wide take the f16 tensor-core GEMM; below it the
 /// f32 GEMM wins, because padding `co` out to the cooperative tile costs more
@@ -58,6 +63,13 @@ const pv_tile: usize = 128;
 /// Shared with the Vulkan path so the two `im2col_sd` kernels cannot disagree
 /// about the encoding of their sampling mode.
 pub const SampleMode = @import("sd_unet_gpu.zig").SampleMode;
+
+/// Whether this architecture's activations are carried as f16 on this backend.
+/// Session and Workspace must agree: the cross-attention K/V projections read the
+/// Session's context with the Workspace's width.
+fn actF16(be: *const Backend, cfg: Config) bool {
+    return cfg.act_f16 and be.kernels == .libs;
+}
 
 /// Per-conditioning state: the uploaded context, and the per-forward ResBlock
 /// timestep projections packed into one device buffer.
@@ -136,8 +148,18 @@ pub const Session = struct {
             .zeros = zeros,
         };
 
-        try be.ensureDeviceBuffer(&self.ctx_d, context.len * 4);
-        try be.tensorUpload(self.ctx_d, std.mem.sliceAsBytes(context));
+        // The context is a GEMM source like any other, so it is stored at the
+        // activation stream's width. Converted once per image on the host: it is
+        // 77 rows, against a forward that reads it 32 times.
+        if (actF16(be, cfg)) {
+            const half = try alloc.alloc(u16, context.len);
+            for (context, half) |v, *o| o.* = @bitCast(@as(f16, @floatCast(v)));
+            try be.ensureDeviceBuffer(&self.ctx_d, half.len * 2);
+            try be.tensorUpload(self.ctx_d, std.mem.sliceAsBytes(half));
+        } else {
+            try be.ensureDeviceBuffer(&self.ctx_d, context.len * 4);
+            try be.tensorUpload(self.ctx_d, std.mem.sliceAsBytes(context));
+        }
         try be.ensureDeviceBuffer(&self.proj_d, @max(total, 1) * 4);
         return self;
     }
@@ -176,6 +198,9 @@ pub const Workspace = struct {
     patch: Buf = .{},
     skips: []Buf,
     skip_ch: []usize,
+    /// The (h, w) each skip was stored at. The decoder cannot derive it: its own grid
+    /// is one row or column larger wherever a downsample rounded up.
+    skip_hw: [][2]usize,
     stream: Buf = .{},
     nb: Buf = .{},
     q: Buf = .{},
@@ -195,6 +220,29 @@ pub const Workspace = struct {
     eps: Buf = .{},
     gpa: std.mem.Allocator,
 
+    /// Activations live in DRAM as f16 rather than f32. Every kernel here still
+    /// computes in f32 and every per-channel parameter stays f32; this is purely
+    /// how the big buffers are stored, and it halves the traffic of the whole
+    /// bandwidth-bound half of the step (the norms, the adds, the GEGLU) while
+    /// deleting the per-GEMM and per-attention conversions outright.
+    ///
+    /// `.libs` only. The hand-PTX arm pads narrow heads through `opHeadPad`, which
+    /// has no f16-to-f16 form, and its GEMM has no f16-D form either; it keeps f32.
+    ///
+    /// ⚠️ f16 tops out at 65504 and this codebase has met that ceiling three times.
+    /// The SDXL/SD1.5 UNet trunk is not one of them — ComfyUI runs these models in
+    /// fp16 by default — but that is an empirical fact about these architectures,
+    /// not a general one, which is why this is a per-architecture switch
+    /// (`sd_unet.Config.act_f16`) and not a backend default. The `sd-cuda-test`
+    /// whole-forward parity check is what would catch an overflow, as a hard
+    /// failure rather than the solid-white image it renders as.
+    act_f16: bool = false,
+
+    /// Bytes per activation element.
+    fn aw(self: *const Workspace) usize {
+        return if (self.act_f16) 2 else 4;
+    }
+
     pub fn init(
         gpa: std.mem.Allocator,
         be: *Backend,
@@ -206,12 +254,15 @@ pub const Workspace = struct {
         const cfg = u.cfg;
         var self: Workspace = .{
             .gpa = gpa,
+            .act_f16 = actF16(be, cfg),
             .skips = try gpa.alloc(Buf, u.input_stages.len + 1),
             .skip_ch = try gpa.alloc(usize, u.input_stages.len + 1),
+            .skip_hw = try gpa.alloc([2]usize, u.input_stages.len + 1),
         };
         errdefer {
             gpa.free(self.skips);
             gpa.free(self.skip_ch);
+            gpa.free(self.skip_hw);
         }
         for (self.skips) |*s| s.* = .{};
         @memset(self.skip_ch, 0);
@@ -237,11 +288,12 @@ pub const Workspace = struct {
         }
         sizeAttn(be, cfg, h * w, cfg.model_channels * cfg.channel_mult[cfg.levels() - 1], ctx_seq, &attn, &ff, &gated, &padded);
 
-        inline for (.{ "cur", "alt", "t1", "t2" }) |f| try be.ensureDeviceBuffer(&@field(self, f), act * 4);
-        inline for (.{ "stream", "nb", "q", "k", "v", "ao" }) |f| try be.ensureDeviceBuffer(&@field(self, f), attn * 4);
+        const ew = self.aw();
+        inline for (.{ "cur", "alt", "t1", "t2" }) |f| try be.ensureDeviceBuffer(&@field(self, f), act * ew);
+        inline for (.{ "stream", "nb", "q", "k", "v", "ao" }) |f| try be.ensureDeviceBuffer(&@field(self, f), attn * ew);
         inline for (.{ "qp", "kp", "vp", "op" }) |f| try be.ensureDeviceBuffer(&@field(self, f), padded);
-        try be.ensureDeviceBuffer(&self.ff, ff * 4);
-        try be.ensureDeviceBuffer(&self.gated, gated * 4);
+        try be.ensureDeviceBuffer(&self.ff, ff * ew);
+        try be.ensureDeviceBuffer(&self.gated, gated * ew);
         try be.ensureDeviceBuffer(&self.patch, patch);
         try be.ensureDeviceBuffer(&self.gstat, cfg.norm_groups * gn_chunks * 3 * 4);
         try be.ensureDeviceBuffer(&self.gmi, cfg.norm_groups * 2 * 4);
@@ -267,6 +319,7 @@ pub const Workspace = struct {
         for (self.skips) |*s| be.tensorDestroy(s);
         self.gpa.free(self.skips);
         self.gpa.free(self.skip_ch);
+        self.gpa.free(self.skip_hw);
         self.* = undefined;
     }
 };
@@ -300,6 +353,10 @@ pub fn forward(
 
     try be.beginBatch();
     errdefer if (be.batching()) be.abortBatch();
+    // The attention entry points take the stream's width off the backend rather
+    // than as an argument, since every family and both arms share them.
+    be.attn_io_f16 = ws.act_f16;
+    defer be.attn_io_f16 = false;
 
     var h = lat_h;
     var w = lat_w;
@@ -307,8 +364,8 @@ pub fn forward(
     // ResBlocks in `ResBlockIter`'s order, which is the order below.
     var rb_ord: usize = 0;
 
-    try conv(be, ws, &ws.cur, &ws.xin, h, w, u.stem, .stride1);
-    try setSkip(be, ws, 0, &ws.cur, h * w * ch, ch);
+    try convIntoPrec(be, &ws.patch, &ws.cur, &ws.xin, h, w, u.stem, .stride1, null, 1.0, false, ws.act_f16);
+    try setSkip(be, ws, 0, &ws.cur, h * w * ch, ch, h, w);
 
     for (u.input_stages, 0..) |stage, si| {
         if (cancel) |c| if (c.load(.acquire)) return error.Canceled;
@@ -318,14 +375,16 @@ pub fn forward(
             std.mem.swap(Buf, &ws.cur, &ws.alt);
             ch = rb.out_ch;
         }
-        if (stage.attn) |st| try applySpatial(be, sess, ws, st, h, w, cfg);
+        if (stage.attn) |st| {
+            try applySpatial(be, sess, ws, st, h, w, cfg);
+        }
         if (stage.sample_kind == .down) {
-            try conv(be, ws, &ws.alt, &ws.cur, h, w, stage.sample.?, .stride2);
+            try conv(be, ws, &ws.alt, &ws.cur, h, w, stage.sample.?, .stride2, null);
             std.mem.swap(Buf, &ws.cur, &ws.alt);
             h = (h + 1) / 2;
             w = (w + 1) / 2;
         }
-        try setSkip(be, ws, si + 1, &ws.cur, h * w * ch, ch);
+        try setSkip(be, ws, si + 1, &ws.cur, h * w * ch, ch, h, w);
     }
 
     try applyRes(be, sess, ws, u.mid_res1, rb_ord, &ws.cur, &ws.alt, h, w, cfg);
@@ -345,8 +404,8 @@ pub fn forward(
         const skip_ch = ws.skip_ch[skip_top];
         {
             const total = ch + skip_ch;
-            try be.opConcatCh(ws.cur, ws.alt, h * w, ch, total, 0);
-            try be.opConcatCh(ws.skips[skip_top], ws.alt, h * w, skip_ch, total, ch);
+            try be.opConcatCh(ws.cur, ws.alt, h * w, ch, total, 0, ws.act_f16);
+            try be.opConcatCh(ws.skips[skip_top], ws.alt, h * w, skip_ch, total, ch, ws.act_f16);
             std.mem.swap(Buf, &ws.cur, &ws.alt);
             ch = total;
         }
@@ -357,15 +416,23 @@ pub fn forward(
         ch = rb.out_ch;
         if (stage.attn) |st| try applySpatial(be, sess, ws, st, h, w, cfg);
         if (stage.sample_kind == .up) {
-            try conv(be, ws, &ws.alt, &ws.cur, h, w, stage.sample.?, .upsample2x);
+            // LDM's `Upsample`: nearest up then a 3x3 convolution, fused into the
+            // patch gather so the resampled tensor never exists. The target is the grid
+            // the NEXT skip was stored at, not twice this one: the encoder halved
+            // rounding up, so `2 * h` overshoots an odd dimension by a row. The last
+            // output stage is the top level and never upsamples, so there is always a
+            // shallower skip to aim at.
+            std.debug.assert(skip_top > 0);
+            const target = ws.skip_hw[skip_top - 1];
+            try conv(be, ws, &ws.alt, &ws.cur, h, w, stage.sample.?, .upsample2x, target);
             std.mem.swap(Buf, &ws.cur, &ws.alt);
-            h *= 2;
-            w *= 2;
+            h = target[0];
+            w = target[1];
         }
     }
 
     try groupNorm(be, sess, ws, &ws.t1, &ws.cur, h * w, ch, u.out_norm, cfg, true);
-    try conv(be, ws, &ws.eps, &ws.t1, h, w, u.out_conv, .stride1);
+    try convIntoPrec(be, &ws.patch, &ws.eps, &ws.t1, h, w, u.out_conv, .stride1, null, 1.0, ws.act_f16, false);
 
     try be.endBatch();
     try be.tensorDownload(ws.eps, std.mem.sliceAsBytes(out));
@@ -411,10 +478,17 @@ fn embedAndProject(
     }
 }
 
-fn setSkip(be: *Backend, ws: *Workspace, i: usize, src: *const Buf, elems: usize, ch: usize) !void {
-    try be.ensureDeviceBuffer(&ws.skips[i], elems * 4);
+/// `a += b` over the activation stream, at whatever width it is stored in.
+fn addAct(be: *Backend, ws: *const Workspace, a: Buf, b: Buf, total: usize) !void {
+    if (ws.act_f16) return be.opAddH16(a, b, total);
+    return be.opAdd(a, b, total);
+}
+
+fn setSkip(be: *Backend, ws: *Workspace, i: usize, src: *const Buf, elems: usize, ch: usize, h: usize, w: usize) !void {
+    try be.ensureDeviceBuffer(&ws.skips[i], elems * ws.aw());
     ws.skip_ch[i] = ch;
-    try be.opCopyOff(ws.skips[i], 0, src.*, 0, elems);
+    ws.skip_hw[i] = .{ h, w };
+    try be.opCopyOff(ws.skips[i], 0, src.*, 0, elems, ws.act_f16);
 }
 
 /// A ResBlock, result guaranteed in `dst`.
@@ -436,17 +510,17 @@ fn applyRes(
     const off = sess.proj_off[ordinal];
 
     try groupNorm(be, sess, ws, &ws.t1, src, n, rb.in_ch, rb.in_norm, cfg, true);
-    try conv(be, ws, dst, &ws.t1, h, w, rb.in_conv, .stride1);
-    try be.opAddBiasRows(dst.*, sess.proj_d, n, rb.out_ch, off);
+    try conv(be, ws, dst, &ws.t1, h, w, rb.in_conv, .stride1, null);
+    try be.opAddBiasRows(dst.*, sess.proj_d, n, rb.out_ch, off, ws.act_f16);
 
     try groupNorm(be, sess, ws, &ws.t1, dst, n, rb.out_ch, rb.out_norm, cfg, true);
-    try conv(be, ws, &ws.t2, &ws.t1, h, w, rb.out_conv, .stride1);
+    try conv(be, ws, &ws.t2, &ws.t1, h, w, rb.out_conv, .stride1, null);
 
     if (rb.skip) |sk| {
-        try conv(be, ws, dst, src, h, w, sk, .stride1);
-        try be.opAdd(dst.*, ws.t2, out_n);
+        try conv(be, ws, dst, src, h, w, sk, .stride1, null);
+        try addAct(be, ws, dst.*, ws.t2, out_n);
     } else {
-        try be.opAdd(ws.t2, src.*, out_n);
+        try addAct(be, ws, ws.t2, src.*, out_n);
         std.mem.swap(Buf, &ws.t2, dst);
     }
 }
@@ -473,33 +547,33 @@ fn applySpatial(
 
     for (st.blocks) |b| {
         // attn1: self-attention over pixels.
-        try be.opLayerNorm(ws.stream, ws.nb, b.norm1.w, b.norm1.b, n, ch, cfg.norm_eps);
-        try gemm(be, sess, &ws.q, &ws.nb, n, b.attn1.q, null);
-        try gemm(be, sess, &ws.k, &ws.nb, n, b.attn1.k, null);
-        try gemm(be, sess, &ws.v, &ws.nb, n, b.attn1.v, null);
+        try be.opLayerNorm(ws.stream, ws.nb, b.norm1.w, b.norm1.b, n, ch, cfg.norm_eps, ws.act_f16);
+        try gemm(be, sess, ws, &ws.q, &ws.nb, n, b.attn1.q, null);
+        try gemm(be, sess, ws, &ws.k, &ws.nb, n, b.attn1.k, null);
+        try gemm(be, sess, ws, &ws.v, &ws.nb, n, b.attn1.v, null);
         try selfAttn(be, ws, n, heads, hd, scale);
-        try gemm(be, sess, &ws.nb, &ws.ao, n, b.attn1.out.w, b.attn1.out.b);
-        try be.opAdd(ws.stream, ws.nb, n * ch);
+        try gemm(be, sess, ws, &ws.nb, &ws.ao, n, b.attn1.out.w, b.attn1.out.b);
+        try addAct(be, ws, ws.stream, ws.nb, n * ch);
 
         // attn2: cross-attention onto the text conditioning, `ctx_seq` keys, not `n`.
-        try be.opLayerNorm(ws.stream, ws.nb, b.norm2.w, b.norm2.b, n, ch, cfg.norm_eps);
-        try gemm(be, sess, &ws.q, &ws.nb, n, b.attn2.q, null);
-        try gemm(be, sess, &ws.k, &sess.ctx_d, ctx_seq, b.attn2.k, null);
-        try gemm(be, sess, &ws.v, &sess.ctx_d, ctx_seq, b.attn2.v, null);
+        try be.opLayerNorm(ws.stream, ws.nb, b.norm2.w, b.norm2.b, n, ch, cfg.norm_eps, ws.act_f16);
+        try gemm(be, sess, ws, &ws.q, &ws.nb, n, b.attn2.q, null);
+        try gemm(be, sess, ws, &ws.k, &sess.ctx_d, ctx_seq, b.attn2.k, null);
+        try gemm(be, sess, ws, &ws.v, &sess.ctx_d, ctx_seq, b.attn2.v, null);
         try be.opAttnCross(ws.q, ws.k, ws.v, ws.ao, n, ctx_seq, heads, hd, scale);
-        try gemm(be, sess, &ws.nb, &ws.ao, n, b.attn2.out.w, b.attn2.out.b);
-        try be.opAdd(ws.stream, ws.nb, n * ch);
+        try gemm(be, sess, ws, &ws.nb, &ws.ao, n, b.attn2.out.w, b.attn2.out.b);
+        try addAct(be, ws, ws.stream, ws.nb, n * ch);
 
         // ff: GEGLU, whose halves are (value, gate) and whose gate is erf-GELU.
-        try be.opLayerNorm(ws.stream, ws.nb, b.norm3.w, b.norm3.b, n, ch, cfg.norm_eps);
-        try gemm(be, sess, &ws.ff, &ws.nb, n, b.ff_proj.w, b.ff_proj.b);
-        try be.opGeglu(ws.ff, ws.gated, n, b.inner);
-        try gemm(be, sess, &ws.nb, &ws.gated, n, b.ff_out.w, b.ff_out.b);
-        try be.opAdd(ws.stream, ws.nb, n * ch);
+        try be.opLayerNorm(ws.stream, ws.nb, b.norm3.w, b.norm3.b, n, ch, cfg.norm_eps, ws.act_f16);
+        try gemm(be, sess, ws, &ws.ff, &ws.nb, n, b.ff_proj.w, b.ff_proj.b);
+        try be.opGeglu(ws.ff, ws.gated, n, b.inner, ws.act_f16);
+        try gemm(be, sess, ws, &ws.nb, &ws.gated, n, b.ff_out.w, b.ff_out.b);
+        try addAct(be, ws, ws.stream, ws.nb, n * ch);
     }
 
     try applyProj(be, ws, sess, &ws.nb, &ws.stream, h, w, st.proj_out);
-    try be.opAdd(ws.cur, ws.nb, n * ch);
+    try addAct(be, ws, ws.cur, ws.nb, n * ch);
 }
 
 /// The head width the attention actually runs at: the true one under cuDNN, the
@@ -532,8 +606,8 @@ pub fn selfAttn(be: *Backend, ws: *Workspace, n: usize, heads: usize, hd: usize,
 /// `nn.Linear` in SDXL. On channel-last activations both are the same GEMM.
 fn applyProj(be: *Backend, ws: *Workspace, sess: *Session, dst: *Buf, src: *const Buf, h: usize, w: usize, p: sd_unet.Proj) !void {
     switch (p) {
-        .conv => |cv| try conv(be, ws, dst, src, h, w, cv, .stride1),
-        .linear => |lin| try gemm(be, sess, dst, src, h * w, lin.w, lin.b),
+        .conv => |cv| try conv(be, ws, dst, src, h, w, cv, .stride1, null),
+        .linear => |lin| try gemm(be, sess, ws, dst, src, h * w, lin.w, lin.b),
     }
 }
 
@@ -550,7 +624,7 @@ fn groupNorm(
     silu: bool,
 ) !void {
     const cat = try sess.normBuf(be, nw);
-    try be.opGroupNorm(src.*, dst.*, cat, ws.gstat, ws.gmi, n, ch, cfg.norm_groups, gn_chunks, cfg.norm_eps, silu, false);
+    try be.opGroupNorm(src.*, dst.*, cat, ws.gstat, ws.gmi, n, ch, cfg.norm_groups, gn_chunks, cfg.norm_eps, silu, ws.act_f16);
 }
 
 /// A GEMM against a checkpoint weight, routed by the dtype it was stored in.
@@ -588,7 +662,7 @@ fn convWeight(cv: Conv2d, cols: usize) Weight {
     return w;
 }
 
-fn gemm(be: *Backend, sess: *Session, y: *Buf, x: *const Buf, m: usize, wt: Weight, bias: ?[]const f32) !void {
+fn gemm(be: *Backend, sess: *Session, ws: *const Workspace, y: *Buf, x: *const Buf, m: usize, wt: Weight, bias: ?[]const f32) !void {
     const rows = wt.rows;
     const cols = wt.cols;
     // The whole `zeros` array, NOT `zeros[0..rows]`. Both backends cache a bias
@@ -598,17 +672,20 @@ fn gemm(be: *Backend, sess: *Session, y: *Buf, x: *const Buf, m: usize, wt: Weig
     // answer for THIS bias and nothing else. The kernels read only `rows`
     // entries, so handing them a longer slice is free. (Backend.cachedWeight)
     const b = bias orelse sess.zeros;
-    // Before the dispatch: `x` still holds the f32 activation here (unlike the
+    const a16 = ws.act_f16;
+    // Before the dispatch: `x` still holds the activation here (unlike the
     // int8/int4 DiT paths, which consume it in place, the SD UNet has no such path,
-    // its GEMM switch is {f32, f16, bf16}).
-    try probeInput(be, x.*, m, wt);
+    // its GEMM switch is {f32, f16, bf16}). The probe reads f32, which is why an
+    // f16 stream and an activation capture cannot both be on.
+    if (!a16) try probeInput(be, x.*, m, wt);
     switch (wt.dtype) {
         .f32 => {
-            if (rows >= coop_min_co) return be.opConvF16(y.*, 0, x.*, m, wt.bytes, rows, cols, b);
+            if (rows >= coop_min_co) return be.opConvF16Prec(y.*, 0, x.*, m, wt.bytes, rows, cols, b, 1.0, a16, a16);
+            std.debug.assert(!a16); // the f32 GEMM arm has no f16-storage form
             return be.opMatmul(y.*, 0, x.*, 0, m, wt.bytes, false, rows, cols, 1.0, b);
         },
-        .f16 => return be.opMatmulF16(y.*, x.*, m, wt.bytes, rows, cols, b),
-        .bf16 => return be.opMatmulBf16(y.*, x.*, m, wt.bytes, rows, cols, b),
+        .f16 => return be.opMatmulF16(y.*, x.*, m, wt.bytes, rows, cols, b, a16, a16),
+        .bf16 => return be.opMatmulBf16(y.*, x.*, m, wt.bytes, rows, cols, b, a16, a16),
         else => return error.UnsupportedDType,
     }
 }
@@ -624,8 +701,16 @@ fn conv(
     w: usize,
     cv: Conv2d,
     mode: SampleMode,
+    /// Output grid override, for the decoder's upsample only: `null` derives it from
+    /// `mode`. The encoder halves rounding up, so on an odd dimension the skip this
+    /// output feeds is one row short of `2 * h` and the conv has to produce exactly it.
+    /// Sampling the source at `dst / 2` stays correct, which is what makes an explicit
+    /// size the whole change (`sd_unet` has the arithmetic).
+    out_hw: ?[2]usize,
 ) !void {
-    return convInto(be, &ws.patch, dst, src, h, w, cv, mode);
+    // The activation stream's width on both sides: everything between the stem and
+    // the output convolution is f16 when `Workspace.act_f16` is on.
+    return convIntoPrec(be, &ws.patch, dst, src, h, w, cv, mode, out_hw, 1.0, ws.act_f16, ws.act_f16);
 }
 
 /// `conv` with the im2col band buffer passed in, so `sd_vae_cuda` shares this
@@ -640,8 +725,14 @@ pub fn convInto(
     w: usize,
     cv: Conv2d,
     mode: SampleMode,
+    /// Output grid override, for the decoder's upsample only: `null` derives it from
+    /// `mode`. The encoder halves rounding up, so on an odd dimension the skip this
+    /// output feeds is one row short of `2 * h` and the conv has to produce exactly it.
+    /// Sampling the source at `dst / 2` stays correct, which is what makes an explicit
+    /// size the whole change (`sd_unet` has the arithmetic).
+    out_hw: ?[2]usize,
 ) !void {
-    return convIntoScaled(be, patch, dst, src, h, w, cv, mode, 1.0);
+    return convIntoScaled(be, patch, dst, src, h, w, cv, mode, out_hw, 1.0);
 }
 
 /// `convInto` with the activation divided by `act_div` before the f16 cast (and
@@ -659,9 +750,15 @@ pub fn convIntoScaled(
     w: usize,
     cv: Conv2d,
     mode: SampleMode,
+    /// Output grid override, for the decoder's upsample only: `null` derives it from
+    /// `mode`. The encoder halves rounding up, so on an odd dimension the skip this
+    /// output feeds is one row short of `2 * h` and the conv has to produce exactly it.
+    /// Sampling the source at `dst / 2` stays correct, which is what makes an explicit
+    /// size the whole change (`sd_unet` has the arithmetic).
+    out_hw: ?[2]usize,
     act_div: f32,
 ) !void {
-    return convIntoPrec(be, patch, dst, src, h, w, cv, mode, act_div, false, false);
+    return convIntoPrec(be, patch, dst, src, h, w, cv, mode, out_hw, act_div, false, false);
 }
 
 /// `convIntoScaled` with f16 activation STORAGE selectable on either side. The GEMM
@@ -686,6 +783,12 @@ pub fn convIntoPrec(
     w: usize,
     cv: Conv2d,
     mode: SampleMode,
+    /// Output grid override, for the decoder's upsample only: `null` derives it from
+    /// `mode`. The encoder halves rounding up, so on an odd dimension the skip this
+    /// output feeds is one row short of `2 * h` and the conv has to produce exactly it.
+    /// Sampling the source at `dst / 2` stays correct, which is what makes an explicit
+    /// size the whole change (`sd_unet` has the arithmetic).
+    out_hw: ?[2]usize,
     act_div: f32,
     src_f16: bool,
     dst_f16: bool,
@@ -712,25 +815,46 @@ pub fn convIntoPrec(
     }
     std.debug.assert(cv.k == 3);
 
-    const oh = switch (mode) {
+    const oh = if (out_hw) |o| o[0] else switch (mode) {
         .stride1 => h,
         .upsample2x => 2 * h,
         .stride2 => (h + 1) / 2,
     };
-    const ow = switch (mode) {
+    const ow = if (out_hw) |o| o[1] else switch (mode) {
         .stride1 => w,
         .upsample2x => 2 * w,
         .stride2 => (w + 1) / 2,
     };
     const n_out = oh * ow;
     const patch_len = 9 * cv.ci;
+
+    // Library backend: a fused cuDNN NHWC convolution, which does the im2col
+    // implicitly in shared memory. The banded path materializes a [n][9*ci] f32
+    // patch and then converts it to f16, so it moves nine times the activation
+    // twice; cuDNN reads the activation once. Same routing as `vae_cuda`.
+    //
+    // Only stride 1: `cudnn.ConvPlan` is a 3x3 pad-1 stride-1 plan, and the
+    // upsample convolutions need the resample fused into the gather, which no
+    // convolution op can do.
+    //
+    // An activation capture stays banded too: the GEMM this convolution is
+    // equivalent to reads the [n][9*ci] patch, and that matrix is what the probe
+    // has to see. cuDNN never builds it, so probing here would file per-column
+    // statistics `9*ci` wide over a `ci`-wide activation.
+    if (be.kernels == .libs and mode == .stride1 and act_div == 1.0 and ops.matmul.probe == null) {
+        return be.opConvCudnn(dst.*, 0, src.*, h, w, std.mem.sliceAsBytes(cv.w), cv.co, cv.ci, cb, src_f16, dst_f16);
+    }
+
     const band = convBand(n_out, patch_len);
     try be.ensureDeviceBuffer(patch, band * patch_len * 4);
 
     var p0: usize = 0;
     while (p0 < n_out) : (p0 += band) {
         const bn = @min(band, n_out - p0);
-        try be.opIm2colSd(src.*, patch.*, bn, patch_len, cv.ci, w, h, p0, ow, @intFromEnum(mode), src_f16);
+        // `h` here is the tap EXTENT, not the source height: when upsampling the taps
+        // live in the output grid, and that is where the conv pads (see `im2col_sd`).
+        const ext_h = if (mode == .upsample2x) oh else h;
+        try be.opIm2colSd(src.*, patch.*, bn, patch_len, cv.ci, w, ext_h, p0, ow, @intFromEnum(mode), src_f16);
         // Per band, not per convolution: the accumulator sums over rows, so N banded
         // calls contribute exactly the rows one unbanded call would.
         try probeInput(be, patch.*, bn, convWeight(cv, patch_len));

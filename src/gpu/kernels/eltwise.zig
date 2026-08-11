@@ -3423,10 +3423,14 @@ export fn im2col_sd() callconv(.spirv_kernel) void {
     const sw = pc.u3;
     const up: u5 = if (pc.f0 == 1) 1 else 0;
     const stride: u32 = if (pc.f0 == 2) 2 else 1;
-    // The grid the taps are addressed in: the doubled one when upsampling.
-    const gw = sw << up;
-    const gh = pc.u4 << up;
     const ow = pc.u6;
+    // The grid the taps are addressed in, which is what decides where the conv PADS.
+    // When upsampling that is the OUTPUT grid, and it is not `sw << 1`: the encoder
+    // halved rounding up, so a level whose source is `s` may be upsampled back to
+    // `2s - 1`, and treating the missing last row as present reads real data where the
+    // reference pads with zero. Hence `u4` carries the extent, not the source height.
+    const gw = if (up == 1) ow else sw;
+    const gh = pc.u4;
     const col = idx % plen;
     const p = pc.u5 + idx / plen;
     const tap = col / ci;

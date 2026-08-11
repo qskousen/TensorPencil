@@ -407,7 +407,7 @@ fn conv(
     // Pre-sized in `decode`, deliberately: growing it here would be inside the
     // recording batch. Assert rather than silently reallocate.
     std.debug.assert(dst.size >= oh * ow * cv.co * @as(usize, if (dst16) 2 else 4));
-    try sd_unet_gpu.convIntoPrec(ctx, &bufs.patch, dst, src, h, w, cv, mode, null, 1.0, src16, dst16);
+    try sd_unet_gpu.convIntoPrec(ctx, &bufs.patch, dst, src, h, w, cv, mode, null, null, 1.0, src16, dst16);
 }
 
 /// Divisor applied to the activation of a convolution that reads the RESIDUAL
@@ -448,7 +448,7 @@ fn convResidual(
     // big for f16 THROUGH a cast, and an f16 buffer could never have held it. The two
     // are alternatives, and `Config.act_f16` is off exactly where the divisor matters.
     const div: f32 = if (act16) 1.0 else residual_act_div;
-    try sd_unet_gpu.convIntoPrec(ctx, &bufs.patch, dst, src, h, w, cv, mode, null, div, act16, act16);
+    try sd_unet_gpu.convIntoPrec(ctx, &bufs.patch, dst, src, h, w, cv, mode, null, null, div, act16, act16);
 }
 
 

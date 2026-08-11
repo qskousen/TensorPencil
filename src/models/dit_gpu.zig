@@ -320,7 +320,7 @@ pub fn forward(
     // fp8 bytes and render a blank image with no error at all. Measured: that is
     // exactly what happened once `pipeline` learned to open a GGUF, the path
     // became reachable, so it needs the refusal.
-    if (!dit.gpuLinKindSupported(model.blocks[0].attn.wq.dtype)) return error.UnsupportedCheckpoint;
+    if (!dit.gpuLinKindSupported(model.blocks[0].attn.wq.dtype, .vulkan)) return error.UnsupportedCheckpoint;
     // A packed W4A8 weight is `[rows][cols/2]` bytes, and the `else` arm below feeds
     // anything it does not recognize to the fp8 GEMM, the same shape as the GGUF blank
     // image this gate already exists for. `is_i8` covers it now, but keep the explicit

@@ -207,6 +207,9 @@ pub const Workspace = struct {
     /// Skip stack: `input_stages.len + 1` activations, and their widths.
     skips: []DeviceBuffer,
     skip_ch: []usize,
+    /// The (h, w) each skip was stored at. The decoder cannot derive it: its own grid
+    /// is one row or column larger wherever a downsample rounded up.
+    skip_hw: [][2]usize,
     /// SpatialTransformer residual stream and a general `[n][ch]`-ish scratch.
     stream: DeviceBuffer = none,
     nb: DeviceBuffer = none,
@@ -251,10 +254,12 @@ pub const Workspace = struct {
             .gpa = gpa,
             .skips = try gpa.alloc(DeviceBuffer, u.input_stages.len + 1),
             .skip_ch = try gpa.alloc(usize, u.input_stages.len + 1),
+            .skip_hw = try gpa.alloc([2]usize, u.input_stages.len + 1),
         };
         errdefer {
             gpa.free(self.skips);
             gpa.free(self.skip_ch);
+            gpa.free(self.skip_hw);
         }
         for (self.skips) |*s| s.* = none;
         @memset(self.skip_ch, 0);
@@ -367,6 +372,7 @@ pub const Workspace = struct {
         for (self.skips) |*s| ctx.tensorDestroy(s);
         self.gpa.free(self.skips);
         self.gpa.free(self.skip_ch);
+        self.gpa.free(self.skip_hw);
         self.* = undefined;
     }
 };
@@ -410,8 +416,8 @@ pub fn forward(
     var rb_ord: usize = 0;
 
     // --- stem ---
-    try conv(ctx, ws, &ws.cur, &ws.xin, h, w, u.stem, .stride1, null);
-    try setSkip(ctx, ws, 0, &ws.cur, h * w * ch, ch);
+    try conv(ctx, ws, &ws.cur, &ws.xin, h, w, u.stem, .stride1, null, null);
+    try setSkip(ctx, ws, 0, &ws.cur, h * w * ch, ch, h, w);
 
     // --- input side ---
     for (u.input_stages, 0..) |stage, si| {
@@ -428,12 +434,12 @@ pub fn forward(
         if (stage.sample_kind == .down) {
             const oh = (h + 1) / 2;
             const ow = (w + 1) / 2;
-            try conv(ctx, ws, &ws.alt, &ws.cur, h, w, stage.sample.?, .stride2, null);
+            try conv(ctx, ws, &ws.alt, &ws.cur, h, w, stage.sample.?, .stride2, null, null);
             std.mem.swap(DeviceBuffer, &ws.cur, &ws.alt);
             h = oh;
             w = ow;
         }
-        try setSkip(ctx, ws, si + 1, &ws.cur, h * w * ch, ch);
+        try setSkip(ctx, ws, si + 1, &ws.cur, h * w * ch, ch, h, w);
     }
 
     // --- middle ---
@@ -484,18 +490,24 @@ pub fn forward(
             try applySpatial(ctx, sess, ws, st, h, w, cfg);
         }
         if (stage.sample_kind == .up) {
-            // LDM's `Upsample`: nearest 2x then a 3x3 convolution. The resample
-            // is fused into the patch gather, so the doubled tensor never exists.
-            try conv(ctx, ws, &ws.alt, &ws.cur, h, w, stage.sample.?, .upsample2x, null);
+            // LDM's `Upsample`: nearest up then a 3x3 convolution, fused into the
+            // patch gather so the resampled tensor never exists. The target is the grid
+            // the NEXT skip was stored at, not twice this one: the encoder halved
+            // rounding up, so `2 * h` overshoots an odd dimension by a row. The last
+            // output stage is the top level and never upsamples, so there is always a
+            // shallower skip to aim at.
+            std.debug.assert(skip_top > 0);
+            const target = ws.skip_hw[skip_top - 1];
+            try conv(ctx, ws, &ws.alt, &ws.cur, h, w, stage.sample.?, .upsample2x, target, null);
             std.mem.swap(DeviceBuffer, &ws.cur, &ws.alt);
-            h *= 2;
-            w *= 2;
+            h = target[0];
+            w = target[1];
         }
     }
 
     // --- head ---
     try groupNorm(ctx, ws, &ws.t1, &ws.cur, h * w, ch, try sess.normCat(u.out_norm), cfg.norm_groups, cfg.norm_eps, true);
-    try conv(ctx, ws, &ws.eps, &ws.t1, h, w, u.out_conv, .stride1, null);
+    try conv(ctx, ws, &ws.eps, &ws.t1, h, w, u.out_conv, .stride1, null, null);
 
     batched = false;
     try ctx.endBatch();
@@ -547,9 +559,10 @@ fn embedAndFoldBiases(
     }
 }
 
-fn setSkip(ctx: *Context, ws: *Workspace, i: usize, src: *const DeviceBuffer, elems: usize, ch: usize) !void {
+fn setSkip(ctx: *Context, ws: *Workspace, i: usize, src: *const DeviceBuffer, elems: usize, ch: usize, h: usize, w: usize) !void {
     try ctx.ensureDeviceBuffer(&ws.skips[i], elems * 4);
     ws.skip_ch[i] = ch;
+    ws.skip_hw[i] = .{ h, w };
     try ctx.opElt(.copy, src.*, ws.skips[i], null, null, .{ .u0 = @intCast(elems) }, elems, 1, 1);
 }
 
@@ -577,16 +590,16 @@ fn applyRes(
     // in_layers: GroupNorm -> SiLU -> conv3x3, with the timestep projection
     // riding in on the convolution's bias.
     try groupNorm(ctx, ws, &ws.t1, src, n, rb.in_ch, try sess.normCat(rb.in_norm), cfg.norm_groups, cfg.norm_eps, true);
-    try conv(ctx, ws, dst, &ws.t1, h, w, rb.in_conv, .stride1, .{ .buf = sess.bias_d, .off = bias_off });
+    try conv(ctx, ws, dst, &ws.t1, h, w, rb.in_conv, .stride1, null, .{ .buf = sess.bias_d, .off = bias_off });
 
     // out_layers: GroupNorm -> SiLU -> conv3x3.
     try groupNorm(ctx, ws, &ws.t1, dst, n, rb.out_ch, try sess.normCat(rb.out_norm), cfg.norm_groups, cfg.norm_eps, true);
-    try conv(ctx, ws, &ws.t2, &ws.t1, h, w, rb.out_conv, .stride1, null);
+    try conv(ctx, ws, &ws.t2, &ws.t1, h, w, rb.out_conv, .stride1, null, null);
 
     const out_n = n * rb.out_ch;
     if (rb.skip) |sk| {
         // `dst` held conv1's output, which out_norm has already consumed.
-        try conv(ctx, ws, dst, src, h, w, sk, .stride1, null);
+        try conv(ctx, ws, dst, src, h, w, sk, .stride1, null, null);
         try ctx.opElt(.add, dst.*, ws.t2, null, null, .{ .u0 = @intCast(out_n) }, out_n, 1, 1);
     } else {
         try ctx.opElt(.add, ws.t2, src.*, null, null, .{ .u0 = @intCast(out_n) }, out_n, 1, 1);
@@ -787,7 +800,7 @@ fn applyProj(
     p: sd_unet.Proj,
 ) !void {
     switch (p) {
-        .conv => |cv| try conv(ctx, ws, dst, src, h, w, cv, .stride1, null),
+        .conv => |cv| try conv(ctx, ws, dst, src, h, w, cv, .stride1, null, null),
         .linear => |lin| try gemm(ctx, sess, dst, 0, src, h * w, lin.w, lin.b),
     }
 }
@@ -975,9 +988,15 @@ fn conv(
     w: usize,
     cv: Conv2d,
     mode: SampleMode,
+    /// Output grid override, for the decoder's upsample only: `null` derives it from
+    /// `mode`. The encoder halves rounding up, so on an odd dimension the skip this
+    /// output feeds is one row short of `2 * h` and the conv has to produce exactly it.
+    /// Sampling the source at `dst / 2` stays correct, which is what makes an explicit
+    /// size the whole change (`sd_unet` has the arithmetic).
+    out_hw: ?[2]usize,
     bias_dev: ?BiasSlice,
 ) !void {
-    return convInto(ctx, &ws.patch, dst, src, h, w, cv, mode, bias_dev);
+    return convInto(ctx, &ws.patch, dst, src, h, w, cv, mode, out_hw, bias_dev);
 }
 
 /// A slice of a device buffer holding a per-forward convolution bias.
@@ -1001,9 +1020,15 @@ pub fn convInto(
     w: usize,
     cv: Conv2d,
     mode: SampleMode,
+    /// Output grid override, for the decoder's upsample only: `null` derives it from
+    /// `mode`. The encoder halves rounding up, so on an odd dimension the skip this
+    /// output feeds is one row short of `2 * h` and the conv has to produce exactly it.
+    /// Sampling the source at `dst / 2` stays correct, which is what makes an explicit
+    /// size the whole change (`sd_unet` has the arithmetic).
+    out_hw: ?[2]usize,
     bias_dev: ?BiasSlice,
 ) !void {
-    return convIntoScaled(ctx, patch, dst, src, h, w, cv, mode, bias_dev, 1.0);
+    return convIntoScaled(ctx, patch, dst, src, h, w, cv, mode, out_hw, bias_dev, 1.0);
 }
 
 /// `convInto` with the activation divided by `act_div` before the f16 cast (and
@@ -1023,10 +1048,16 @@ pub fn convIntoScaled(
     w: usize,
     cv: Conv2d,
     mode: SampleMode,
+    /// Output grid override, for the decoder's upsample only: `null` derives it from
+    /// `mode`. The encoder halves rounding up, so on an odd dimension the skip this
+    /// output feeds is one row short of `2 * h` and the conv has to produce exactly it.
+    /// Sampling the source at `dst / 2` stays correct, which is what makes an explicit
+    /// size the whole change (`sd_unet` has the arithmetic).
+    out_hw: ?[2]usize,
     bias_dev: ?BiasSlice,
     act_div: f32,
 ) !void {
-    return convIntoPrec(ctx, patch, dst, src, h, w, cv, mode, bias_dev, act_div, false, false);
+    return convIntoPrec(ctx, patch, dst, src, h, w, cv, mode, out_hw, bias_dev, act_div, false, false);
 }
 
 /// `convIntoScaled` with f16 activation STORAGE on either side. Mirrors
@@ -1046,6 +1077,12 @@ pub fn convIntoPrec(
     w: usize,
     cv: Conv2d,
     mode: SampleMode,
+    /// Output grid override, for the decoder's upsample only: `null` derives it from
+    /// `mode`. The encoder halves rounding up, so on an odd dimension the skip this
+    /// output feeds is one row short of `2 * h` and the conv has to produce exactly it.
+    /// Sampling the source at `dst / 2` stays correct, which is what makes an explicit
+    /// size the whole change (`sd_unet` has the arithmetic).
+    out_hw: ?[2]usize,
     bias_dev: ?BiasSlice,
     act_div: f32,
     src_f16: bool,
@@ -1071,12 +1108,12 @@ pub fn convIntoPrec(
     }
     std.debug.assert(cv.k == 3);
 
-    const oh = switch (mode) {
+    const oh = if (out_hw) |o| o[0] else switch (mode) {
         .stride1 => h,
         .upsample2x => 2 * h,
         .stride2 => (h + 1) / 2,
     };
-    const ow = switch (mode) {
+    const ow = if (out_hw) |o| o[1] else switch (mode) {
         .stride1 => w,
         .upsample2x => 2 * w,
         .stride2 => (w + 1) / 2,
@@ -1095,7 +1132,9 @@ pub fn convIntoPrec(
             .u1 = @intCast(patch_len),
             .u2 = @intCast(cv.ci),
             .u3 = @intCast(w),
-            .u4 = @intCast(h),
+            // The tap extent, not the source height: when upsampling, the taps live in
+            // the OUTPUT grid and that is where the conv pads (see `im2col_sd`).
+            .u4 = @intCast(if (mode == .upsample2x) oh else h),
             .u5 = @intCast(p0),
             .u6 = @intCast(ow),
             .f0 = @floatFromInt(@intFromEnum(mode)),
@@ -1173,6 +1212,7 @@ test "gpu group norm matches ops.norm.groupNorm" {
         .gpa = gpa,
         .skips = try gpa.alloc(DeviceBuffer, 0),
         .skip_ch = try gpa.alloc(usize, 0),
+        .skip_hw = try gpa.alloc([2]usize, 0),
     };
     defer ws.deinit(ctx);
     try ctx.ensureDeviceBuffer(&ws.gstat, groups * gn_chunks * 3 * 4);
@@ -1358,6 +1398,7 @@ test "gpu self attention matches ops.attention at every SD head width" {
             .gpa = gpa,
             .skips = try gpa.alloc(DeviceBuffer, 0),
             .skip_ch = try gpa.alloc(usize, 0),
+        .skip_hw = try gpa.alloc([2]usize, 0),
         };
         defer ws.deinit(ctx);
         try upload(ctx, &ws.q, q);
@@ -1431,6 +1472,7 @@ test "gpu conv matches ops.conv.conv2d at stride 1, stride 2 and fused 2x upsamp
         .gpa = gpa,
         .skips = try gpa.alloc(DeviceBuffer, 0),
         .skip_ch = try gpa.alloc(usize, 0),
+        .skip_hw = try gpa.alloc([2]usize, 0),
     };
     defer ws.deinit(ctx);
     var src: DeviceBuffer = none;
@@ -1460,7 +1502,7 @@ test "gpu conv matches ops.conv.conv2d at stride 1, stride 2 and fused 2x upsamp
             .pad = 1,
         };
         try ctx.ensureDeviceBuffer(&dst, oh * ow * co * 4);
-        try conv(ctx, &ws, &dst, &src, h, w, cv, mode, null);
+        try conv(ctx, &ws, &dst, &src, h, w, cv, mode, null, null);
         const got = try gpa.alloc(f32, oh * ow * co);
         defer gpa.free(got);
         try ctx.tensorDownload(dst, std.mem.sliceAsBytes(got));

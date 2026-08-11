@@ -138,7 +138,7 @@ fn conv(be: *Backend, bufs: *Bufs, src: *const Buf, dst: *Buf, h: usize, w: usiz
     // convs. Upsample convs keep the fused im2col-upsample path (cuDNN can't do the
     // fused 2x resample); small convs stay on the GEMM (co padding not worth it).
     if (be.kernels == .libs and coop and !up) {
-        return be.opConvCudnn(dst.*, 0, src.*, h, w, wbytes, cv.co, cv.ci, cv.b);
+        return be.opConvCudnn(dst.*, 0, src.*, h, w, wbytes, cv.co, cv.ci, cv.b, false, false);
     }
 
     // Band positions: multiple of 4 keeps the GEMM's y byte offset 16-aligned.

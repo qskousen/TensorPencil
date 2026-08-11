@@ -75,7 +75,7 @@ pub const TextModelCuda = struct {
 
         for (cpu.layers) |*l| {
             const ip = l.in_proj.bytes;
-            try be.opLayerNorm(x_d, normed_d, l.ln1_w, l.ln1_b, n, w, cfg.ln_eps);
+            try be.opLayerNorm(x_d, normed_d, l.ln1_w, l.ln1_b, n, w, cfg.ln_eps, false);
             try gemm(be, q_d, normed_d, n, ip[0..seg], w, w, l.in_proj_bias[0..w]);
             try gemm(be, k_d, normed_d, n, ip[seg .. 2 * seg], w, w, l.in_proj_bias[w .. 2 * w]);
             try gemm(be, v_d, normed_d, n, ip[2 * seg .. 3 * seg], w, w, l.in_proj_bias[2 * w .. 3 * w]);
@@ -83,13 +83,13 @@ pub const TextModelCuda = struct {
             try gemm(be, t_d, big_d, n, l.out_proj.bytes, w, w, l.out_proj_bias);
             try be.opAdd(x_d, t_d, n * w);
 
-            try be.opLayerNorm(x_d, normed_d, l.ln2_w, l.ln2_b, n, w, cfg.ln_eps);
+            try be.opLayerNorm(x_d, normed_d, l.ln2_w, l.ln2_b, n, w, cfg.ln_eps, false);
             try gemm(be, big_d, normed_d, n, l.c_fc.bytes, inter, w, l.c_fc_bias);
             try be.gelu(big_d, n * inter);
             try gemm(be, t_d, big_d, n, l.c_proj.bytes, w, inter, l.c_proj_bias);
             try be.opAdd(x_d, t_d, n * w);
         }
-        try be.opLayerNorm(x_d, x_d, cpu.ln_final_w, cpu.ln_final_b, n, w, cfg.ln_eps);
+        try be.opLayerNorm(x_d, x_d, cpu.ln_final_w, cpu.ln_final_b, n, w, cfg.ln_eps, false);
         try be.endBatch();
 
         try be.tensorDownload(x_d, std.mem.sliceAsBytes(x_host));
@@ -170,7 +170,7 @@ pub const TextModelCuda = struct {
 
         for (cpu.layers) |*l| {
             const ip = l.in_proj.bytes;
-            try be.opLayerNorm(x_d, normed_d, l.ln1_w, l.ln1_b, total, w, cfg.ln_eps);
+            try be.opLayerNorm(x_d, normed_d, l.ln1_w, l.ln1_b, total, w, cfg.ln_eps, false);
             try gemm(be, q_d, normed_d, total, ip[0..seg], w, w, l.in_proj_bias[0..w]);
             try gemm(be, k_d, normed_d, total, ip[seg .. 2 * seg], w, w, l.in_proj_bias[w .. 2 * w]);
             try gemm(be, v_d, normed_d, total, ip[2 * seg .. 3 * seg], w, w, l.in_proj_bias[2 * w .. 3 * w]);
@@ -178,13 +178,13 @@ pub const TextModelCuda = struct {
             try gemm(be, t_d, big_d, total, l.out_proj.bytes, w, w, l.out_proj_bias);
             try be.opAdd(x_d, t_d, total * w);
 
-            try be.opLayerNorm(x_d, normed_d, l.ln2_w, l.ln2_b, total, w, cfg.ln_eps);
+            try be.opLayerNorm(x_d, normed_d, l.ln2_w, l.ln2_b, total, w, cfg.ln_eps, false);
             try gemm(be, big_d, normed_d, total, l.c_fc.bytes, inter, w, l.c_fc_bias);
             try be.gelu(big_d, total * inter);
             try gemm(be, t_d, big_d, total, l.c_proj.bytes, w, inter, l.c_proj_bias);
             try be.opAdd(x_d, t_d, total * w);
         }
-        try be.opLayerNorm(x_d, x_d, cpu.ln_final_w, cpu.ln_final_b, total, w, cfg.ln_eps);
+        try be.opLayerNorm(x_d, x_d, cpu.ln_final_w, cpu.ln_final_b, total, w, cfg.ln_eps, false);
         try be.endBatch();
 
         try be.tensorDownload(x_d, std.mem.sliceAsBytes(x_host));
@@ -255,7 +255,7 @@ pub const VisualModelCuda = struct {
 
         for (cpu.blocks) |*b| {
             const qkv = b.qkv.bytes;
-            try be.opLayerNorm(x_d, normed_d, b.norm1_w, b.norm1_b, np, w, cfg.ln_eps);
+            try be.opLayerNorm(x_d, normed_d, b.norm1_w, b.norm1_b, np, w, cfg.ln_eps, false);
             try gemm(be, q_d, normed_d, np, qkv[0..seg], w, w, b.qkv_b[0..w]);
             try gemm(be, k_d, normed_d, np, qkv[seg .. 2 * seg], w, w, b.qkv_b[w .. 2 * w]);
             try gemm(be, v_d, normed_d, np, qkv[2 * seg .. 3 * seg], w, w, b.qkv_b[2 * w .. 3 * w]);
@@ -263,13 +263,13 @@ pub const VisualModelCuda = struct {
             try gemm(be, t_d, big_d, np, b.attn_proj.bytes, w, w, b.attn_proj_b);
             try be.opAdd(x_d, t_d, np * w);
 
-            try be.opLayerNorm(x_d, normed_d, b.norm2_w, b.norm2_b, np, w, cfg.ln_eps);
+            try be.opLayerNorm(x_d, normed_d, b.norm2_w, b.norm2_b, np, w, cfg.ln_eps, false);
             try gemm(be, big_d, normed_d, np, b.fc1.bytes, inter, w, b.fc1_b);
             try be.gelu(big_d, np * inter);
             try gemm(be, t_d, big_d, np, b.fc2.bytes, w, inter, b.fc2_b);
             try be.opAdd(x_d, t_d, np * w);
         }
-        try be.opLayerNorm(x_d, x_d, cpu.norm_w, cpu.norm_b, np, w, cfg.ln_eps);
+        try be.opLayerNorm(x_d, x_d, cpu.norm_w, cpu.norm_b, np, w, cfg.ln_eps, false);
         try be.endBatch();
 
         const x_host = try gpa.alloc(f32, np * w);
@@ -352,7 +352,7 @@ pub const VisualModelCuda = struct {
 
         for (cpu.blocks) |*bl| {
             const qkv = bl.qkv.bytes;
-            try be.opLayerNorm(x_d, normed_d, bl.norm1_w, bl.norm1_b, total, w, cfg.ln_eps);
+            try be.opLayerNorm(x_d, normed_d, bl.norm1_w, bl.norm1_b, total, w, cfg.ln_eps, false);
             try gemm(be, q_d, normed_d, total, qkv[0..seg], w, w, bl.qkv_b[0..w]);
             try gemm(be, k_d, normed_d, total, qkv[seg .. 2 * seg], w, w, bl.qkv_b[w .. 2 * w]);
             try gemm(be, v_d, normed_d, total, qkv[2 * seg .. 3 * seg], w, w, bl.qkv_b[2 * w .. 3 * w]);
@@ -360,13 +360,13 @@ pub const VisualModelCuda = struct {
             try gemm(be, t_d, big_d, total, bl.attn_proj.bytes, w, w, bl.attn_proj_b);
             try be.opAdd(x_d, t_d, total * w);
 
-            try be.opLayerNorm(x_d, normed_d, bl.norm2_w, bl.norm2_b, total, w, cfg.ln_eps);
+            try be.opLayerNorm(x_d, normed_d, bl.norm2_w, bl.norm2_b, total, w, cfg.ln_eps, false);
             try gemm(be, big_d, normed_d, total, bl.fc1.bytes, inter, w, bl.fc1_b);
             try be.gelu(big_d, total * inter);
             try gemm(be, t_d, big_d, total, bl.fc2.bytes, w, inter, bl.fc2_b);
             try be.opAdd(x_d, t_d, total * w);
         }
-        try be.opLayerNorm(x_d, x_d, cpu.norm_w, cpu.norm_b, total, w, cfg.ln_eps);
+        try be.opLayerNorm(x_d, x_d, cpu.norm_w, cpu.norm_b, total, w, cfg.ln_eps, false);
         try be.endBatch();
 
         const x_host = try gpa.alloc(f32, total * w);

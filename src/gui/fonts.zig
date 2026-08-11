@@ -78,7 +78,7 @@ fn isEmoji(cp: u21) bool {
     return switch (cp) {
         0x1F000...0x1FAFF => true, // emoji + pictographs (incl. flags, skin tones)
         0x23E9...0x23FA => true, // media controls (⏸ ⏯ ⏹ ⏺ ...), NotoSansCJK lacks these
-        0x2600...0x27BF => true, // misc symbols + dingbats (⚙ ⚠ ...)
+        0x2600...0x27BF => true, // misc symbols + dingbats (⚙ ✅ ...)
         0x2B00...0x2BFF => true, // misc symbols & arrows (emoji-presentation)
         0xFE00...0xFE0F => true, // variation selectors, keep with the emoji run
         0x200D => true, // ZWJ, keep emoji sequences together

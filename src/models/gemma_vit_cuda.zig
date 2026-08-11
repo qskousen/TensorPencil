@@ -28,8 +28,8 @@ const Weight = ops.matmul.Weight;
 fn gemm(be: *Backend, dst: Buf, src: Buf, m: usize, w: Weight, bias: ?[]const f32) !void {
     const b = bias orelse &.{};
     switch (w.dtype) {
-        .f16 => try be.opMatmulF16(dst, src, m, w.bytes, w.rows, w.cols, b),
-        .bf16 => try be.opMatmulBf16(dst, src, m, w.bytes, w.rows, w.cols, b),
+        .f16 => try be.opMatmulF16(dst, src, m, w.bytes, w.rows, w.cols, b, false, false),
+        .bf16 => try be.opMatmulBf16(dst, src, m, w.bytes, w.rows, w.cols, b, false, false),
         .f32 => try be.opConvF16(dst, 0, src, m, w.bytes, w.rows, w.cols, b),
         else => return error.UnsupportedDType,
     }
@@ -96,7 +96,7 @@ pub fn encode(vit: *const Vit, be: *Backend, io: std.Io, gpa: std.mem.Allocator,
 
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
     for (vit.blocks) |*blk| {
-        try be.opLayerNorm(x_d, normed_d, blk.ln1_w, blk.ln1_b, np, dim, cfg.eps);
+        try be.opLayerNorm(x_d, normed_d, blk.ln1_w, blk.ln1_b, np, dim, cfg.eps, false);
         try gemm(be, proj_d, normed_d, np, blk.q, blk.q_b);
         try be.opHeadPad(q_d, proj_d, np, heads, hd_pad, hd, dim, 0);
         try gemm(be, proj_d, normed_d, np, blk.k, blk.k_b);
@@ -108,13 +108,13 @@ pub fn encode(vit: *const Vit, be: *Backend, io: std.Io, gpa: std.mem.Allocator,
         try gemm(be, t_d, normed_d, np, blk.out, blk.out_b);
         try be.opAdd(x_d, t_d, np * dim);
 
-        try be.opLayerNorm(x_d, normed_d, blk.ln2_w, blk.ln2_b, np, dim, cfg.eps);
+        try be.opLayerNorm(x_d, normed_d, blk.ln2_w, blk.ln2_b, np, dim, cfg.eps, false);
         try gemm(be, big_d, normed_d, np, blk.up, blk.up_b);
         try be.gelu(big_d, np * cfg.ffn);
         try gemm(be, t_d, big_d, np, blk.down, blk.down_b);
         try be.opAdd(x_d, t_d, np * dim);
     }
-    try be.opLayerNorm(x_d, x_d, vit.post_ln_w, vit.post_ln_b, np, dim, cfg.eps);
+    try be.opLayerNorm(x_d, x_d, vit.post_ln_w, vit.post_ln_b, np, dim, cfg.eps, false);
     try be.endBatch();
 
     // Download the post-LN patch states; the projector (pool + soft_emb_norm

@@ -33,8 +33,8 @@ const Weight = ops.matmul.Weight;
 /// host-summed patch kernel), y[m][w.rows] = x @ Wᵀ + bias, tight rows.
 fn gemm(be: *Backend, dst: Buf, src: Buf, m: usize, w: Weight, bias: []const f32) !void {
     switch (w.dtype) {
-        .bf16 => try be.opMatmulBf16(dst, src, m, w.bytes, w.rows, w.cols, bias),
-        .f16 => try be.opMatmulF16(dst, src, m, w.bytes, w.rows, w.cols, bias),
+        .bf16 => try be.opMatmulBf16(dst, src, m, w.bytes, w.rows, w.cols, bias, false, false),
+        .f16 => try be.opMatmulF16(dst, src, m, w.bytes, w.rows, w.cols, bias, false, false),
         .f32 => try be.opConvF16(dst, 0, src, m, w.bytes, w.rows, w.cols, bias),
         else => return error.UnsupportedDType,
     }
@@ -132,7 +132,7 @@ pub fn encode(vit: *const Vit, be: *Backend, gpa: std.mem.Allocator, rgb: []cons
 
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
     for (vit.blocks) |*blk| {
-        try be.opLayerNorm(x_d, normed_d, blk.ln1_w, blk.ln1_b, np, dim, cfg.eps);
+        try be.opLayerNorm(x_d, normed_d, blk.ln1_w, blk.ln1_b, np, dim, cfg.eps, false);
         try gemm(be, qkv_d, normed_d, np, blk.qkv, blk.qkv_b);
         try be.opHeadPad(q_d, qkv_d, np, heads, hd_pad, hd, 3 * dim, 0);
         try be.opHeadPad(k_d, qkv_d, np, heads, hd_pad, hd, 3 * dim, dim);
@@ -144,13 +144,13 @@ pub fn encode(vit: *const Vit, be: *Backend, gpa: std.mem.Allocator, rgb: []cons
         try gemm(be, t_d, normed_d, np, blk.out, blk.out_b);
         try be.opAdd(x_d, t_d, np * dim);
 
-        try be.opLayerNorm(x_d, normed_d, blk.ln2_w, blk.ln2_b, np, dim, cfg.eps);
+        try be.opLayerNorm(x_d, normed_d, blk.ln2_w, blk.ln2_b, np, dim, cfg.eps, false);
         try gemm(be, big_d, normed_d, np, blk.up, blk.up_b);
         try be.gelu(big_d, np * cfg.ffn);
         try gemm(be, t_d, big_d, np, blk.down, blk.down_b);
         try be.opAdd(x_d, t_d, np * dim);
     }
-    try be.opLayerNorm(x_d, x_d, vit.post_ln_w, vit.post_ln_b, np, dim, cfg.eps);
+    try be.opLayerNorm(x_d, x_d, vit.post_ln_w, vit.post_ln_b, np, dim, cfg.eps, false);
 
     // 2x2 merge is a reinterpret (tokens are block-ordered), then the
     // two-layer projector. h0 reuses normed (nm*merged_dim == np*dim).

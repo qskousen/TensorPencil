@@ -19,6 +19,22 @@ the source of truth.
 They differ *only* in batched GEMM and prefill attention. Decode (m=1) GEMV, flash-decode
 attention, RoPE, RMSNorm, GDN, convrot prep and embedding are hand-PTX in both.
 
+⚠️ **A GEMM writing f16 D needs an f16 BIAS.** cuBLASLt's epilogue bias type follows D, and
+the heuristic rejects an f32 bias over an f16 D outright (`INVALID_VALUE`, no algo) rather
+than converting. `cachedBiasF16` keeps the converted vector; a bias is `co` floats, so unlike
+a weight the second copy costs nothing.
+
+⚠️ **The `m`/`co`/`k` padding around the f16 GEMMs is the hand-PTX tile's requirement, not
+cuBLASLt's, and it is not free.** The padded form converts the activation into an
+`[m_pad][k_pad]` plane, accumulates into an `[m_pad][co_pad]` f32 plane, then reads that whole
+plane back to compact it and add the bias. Under `.libs`, `opMatmulF16` / `opMatmulBf16` /
+`opConvF16Prec` instead go through `ltGemmHalfBias`: nothing padded, and the bias added in the
+GEMM's own epilogue (`CUBLASLT_EPILOGUE_BIAS`, which is why the chosen kernels have `relu` in
+their names). Needs `k % 8 == 0`; the padded path stays for everything else and for
+`zig-cuda`. A bf16 weight is rewritten to f16 **in place** on first use
+(`cachedWeightF16`) rather than re-converted per call — both are 16 bits, so a second copy
+would cost the weight's size again in VRAM for nothing.
+
 Legend: ✅ full · ⚠️ works but slow / limited · ❌ unsupported · — not applicable
 
 ---
@@ -54,7 +70,7 @@ the VAE OOM ladder and the GPU→CPU encode fallback both propagate it.
 | Stage | cpu | vulkan | zig-cuda | cuda | Files |
 |---|---|---|---|---|---|
 | **Text encoder** (Qwen3-VL-4B) | ✅ f32 | ✅ f32 (f16 via `--encoder-f16`) | ✅ fp8→f16 TC | ✅ fp8→f16 TC | `krea2_text.zig`, `qwen3{,_gpu,_cuda}.zig` |
-| **DiT** (28 blocks) | ✅ all dtypes | ✅ fp8/int8/w4a8/nvfp4/bf16 | ✅ + int4 | ✅ + int4 | `dit{,_gpu,_cuda}.zig` |
+| **DiT** (28 blocks) | ✅ all dtypes | ✅ fp8/int8/w4a8/nvfp4/bf16 | ✅ + int4 + GGUF block quants | ✅ + int4 + GGUF block quants | `dit{,_gpu,_cuda}.zig` |
 | **VAE decode** (Wan 2.1) | ✅ | ✅ | ✅ | ✅ (+cuDNN conv) | `wan_vae.zig`, `vae_{gpu,cuda}.zig` |
 | **VAE tiling** | CPU-tile | GPU-tile + CPU floor | ↤ | ↤ | `vae_tiled.zig` |
 | **TAEHV preview** | ✅ | ✅ | ✅ | ✅ | `taehv{,_gpu,_cuda}.zig` |
@@ -87,15 +103,35 @@ head_dim 40/80/160 (8 fixed heads), SDXL at 64 (fixed width, growing head count)
 
 | backend | how it attends | cost |
 |---|---|---|
-| **cuda** | cuDNN fused SDPA at the true width | none |
+| **cuda** | cuDNN fused SDPA at the true width, self and cross alike | none |
 | **zig-cuda** | zero-padded to a multiple of 128 | `128/hd` on the attention |
 | **vulkan** | zero-padded to 128; hd 160 falls back to the scalar kernel | as above |
+
+Cross-attention onto the 77-row text conditioning goes through `opAttnCross`, which picks
+cuDNN's rectangular SDPA under `cuda` and the head-padded `opAttnTCRect` under `zig-cuda`.
 
 The padding is exact (a zero dimension contributes nothing to a dot product, and V's zero
 columns give output columns that are dropped), so it costs only arithmetic. Both GPU limits
 are the same one: the P@V GEMM tiles the head dimension in 128-wide blocks
 (`coopmat.buildGemmAttnOut`, `launchHgemmB`'s `grid.x = n/128`). Removing the padding means
 parameterizing those two builders by head width, not changing the model code.
+
+⚠️ **Under `--backend cuda` the SD UNet carries its activations as f16 in DRAM**
+(`sd_unet.Config.act_f16` → `sd_unet_cuda.Workspace.act_f16`). Every kernel still computes in
+f32 and every per-channel parameter (norm weight/bias, timestep projection, convolution bias)
+stays f32; only the big buffers narrow. It is worth 1.2-1.3x on the whole step at every
+resolution, from two effects: the per-GEMM and per-attention conversions disappear outright
+rather than shrinking, and the bandwidth-bound half of the step (GroupNorm, LayerNorm, GEGLU,
+the residual adds) moves half the bytes. `zig-cuda` stays f32: its narrow-head attention pads
+through `opHeadPad`, which has no f16-to-f16 form, and its hand-PTX GEMM has no f16-D form.
+
+Two things this forces, both of which are silent wrong answers when missed:
+- **Every buffer a GEMM reads has to be at the stream's width, including the ones that are
+  not activations.** The per-image text conditioning is a GEMM source for the cross-attention
+  K/V projections, so `Session.ctx_d` is uploaded as f16 too. Read as f32 it renders NaN.
+- **An activation capture (`ops.matmul.probe`) and an f16 stream are mutually exclusive.** The
+  probe accumulates f32, and a convolution's probe wants the `[n][9*ci]` im2col matrix that
+  the cuDNN path never builds; both are gated off rather than fed the wrong thing.
 
 ⚠️ **The SDXL VAE overflows f16 and every GPU arm divides the residual stream before the
 cast.** Its decoder residual reaches 4.2e5 against f16's 65504 ceiling; unscaled, the cast
@@ -155,14 +191,19 @@ conditioning. ⚠️ **One buffer per block on Vulkan**, not one buffer with a p
 Vulkan `DeviceBuffer.buf` is an opaque handle, so `zimage_cuda`'s `offsetBuf` trick is
 CUDA-only and gives `error_device_lost` here.
 
-⚠️ **Under `--backend cuda`, self-attention takes cuDNN's fused SDPA but cross-attention takes
-the hand-PTX rectangular path**, because `SdpaPlan` is built for a single sequence length.
-Teaching it a rectangular shape is a real but separate change (~6% of the step).
+⚠️ **Anima calls `opAttnTCRect` directly, so both CUDA arms run the same hand-PTX kernels on
+its `seq × 512` cross-attention.** `SdpaPlan` does take a rectangular shape now, and the
+dispatching `opAttnCross` would send `--backend cuda` to cuDNN; Anima deliberately does not
+go through it.
 
 ⚠️ **Rectangular tensor-core attention is a requirement, not an optimization.**
 Cross-attention is `seq × 512` — 2.4% of a step's FLOPs — but the naive
-thread-per-(query, head) kernels stream the whole 512-key context per thread, costing an
+thread-per-(query, head) kernel (`opAttnCrossNaive`, kept as the validation reference)
+streams the whole context per thread through a local-memory accumulator, costing an
 estimated ~0.6 s/step at 1056x1584. The FLOP share is not what decides; the data reuse is.
+The SD family paid the same bill for real: its 70 cross-attentions onto a 77-row text
+conditioning were **45% of an SDXL step** at 1120x1680 until they were routed through
+`opAttnCross`.
 
 ⚠️ **Quantization kind is resolved PER BLOCK** (`anima.linKind` / `prepGroup`). Real mixed
 checkpoints leave block 0 entirely dense, quantize block 1's ten attention/MLP linears, and
@@ -215,7 +256,9 @@ with each other inside their models' own precision envelopes.
 | **nvfp4** | ✅ | ✅ | ✅ | ✅ |
 | **bf16 dense** | ✅ | ✅ native/f16 | ✅ native/f16 | ✅ cuBLASLt `R_16BF` |
 | **f32** | ✅ | ✅ (offload) | — | — |
-| **GGUF block quants** | ✅ | ❌ | ❌ | ❌ |
+| **GGUF q2_k** | ✅ | ❌ | ✅ →int8-convrot or →int4-convrot | ✅ ditto |
+| **GGUF q4_k / q8_0** | ✅ | ❌ | ✅ →int8-convrot or →f16 | ✅ →int8-convrot or →f16 |
+| **GGUF q4_0/q5_k/q6_k/iq4_nl** | ✅ | ❌ | ✅ →f16 (unmeasured) | ✅ →f16 (unmeasured) |
 
 ¹ fp8 block linears stream through `opMatmulFp8`: the weight decodes to an f16 scratch
 (`dequant_fp8_f16`, per-tensor scale folded) and runs through `buildHgemm` (hand-PTX) or
@@ -225,10 +268,176 @@ so fp8 on the CUDA backends is correctness-first and slower per step than int8.
 has no fp8 variant, so those two projections — like bf16 — are materialized to f32 once at load
 (`DiT.opMatmulF32`); otherwise the run aborts on the fp8 assert or reads packed bytes as f32.
 
-⚠️ **A GGUF DiT is CPU-only and that is enforced** (`dit.gpuLinKindSupported`,
-`anima`/`zimage` equivalents). Both GPU forwards return `error.UnsupportedCheckpoint`; before
-the gate, Vulkan treated any unrecognized dtype as raw fp8 and rendered a blank white image
-with no error.
+**A q4_k or q8_0 GGUF krea2 DiT runs on both CUDA arms**, and it reaches the ordinary
+int8 path rather than a block-quant GEMM of its own. `opI8GemmBlockQ` decodes each packed
+weight into ONE reusable scratch — dequantize, rotate by the convrot FWHT, take each
+output row's absmax, quantize to int8 with it — and then runs the same vendor kernel
+int8 uses. This is `opI8GemmW4A8`'s trick: the packed weight stays resident, so a q4_k
+krea2 costs 6.9 GB of VRAM against int8's 11.9, and the GEMM measures 489 ms against
+int8's 494 — the same kernel, so the same speed. `linPrep` is int8's, unchanged; the
+rotation has to match on both sides.
+
+The two formats share everything after the load stage, so a new one is `buildPrep`'s
+`PrepBlock` plus a block walk: block stride, where the scale sits, and which element of
+a block a thread reads. It must divide 256 elements per block, because the load walks the
+row in strides of 256 columns and relies on a thread's position inside a block being
+constant across the blocks it touches. A checkpoint may mix the formats: `i8GemmW`
+dispatches per WEIGHT dtype, not on the model's one `LinKind`.
+
+⚠️ **The int8 decode re-quantizes, so it caps accuracy at int8-convrot's whatever the
+source format carried**, which is why there is a second route (`--dit-gguf-gemm`, below).
+q8_0 stores a scale per 32 columns and arrives at the GEMM with one per row: swept over 4
+blocks × 4 linears its derived int8 weight carries **1.19x** the error of a native ComfyUI
+int8 checkpoint's (0.0107 vs 0.0090 relative, uniform across every layer, with the
+computed row scales agreeing with ComfyUI's stored ones to under 1%).
+
+⚠️ **The per-row scales are computed here, not read from the file.** int8 and w4a8
+carry theirs from the quantizer; a block quant's scale is the absmax of the ROTATED
+weight and nothing in the GGUF knows it. It falls out for free because the weight
+decode IS `buildPrep` with a packed input mode — rotating a row, taking its absmax and
+quantizing to int8 is the same operation whether the row is a token's activations or a
+weight's output row.
+
+**Two decode routes, `--dit-gguf-gemm auto|int8|f16`** (`dit_cuda.blockQKind`). `int8` is
+the convrot path above. `f16` expands the weight to f16 and runs the f16 tensor cores via
+`opMatmulQuant`, the same op the LLM prefill uses, so it needs no rotation, no per-row
+scale and no absmax reduction: those exist only to make ONE int8 scale per row viable.
+That also makes it the wider route, covering every format with a dequant kernel
+(q4_0/q8_0/q4_k/q5_k/q6_k/iq4_nl) where int8 covers only q4_k and q8_0, and it drops the
+convrot `cols % 1024` floor.
+
+⚠️ **Which route wins is a property of the FORMAT, and the deciding number is the format's
+own weight error, not its bit width.** The two errors add roughly in quadrature and
+int8-convrot's floor is ~0.009 relative, so it vanishes under a 4-bit format's error and
+dominates an 8-bit one's. Measured against the dense checkpoint over 4 blocks × 4 linears,
+choosing int8 over f16 costs:
+
+| format | own error | via int8 | cost of int8 |
+|---|---|---|---|
+| q4_k | 0.0917 | 0.0923 | **+0.7%** |
+| q8_0 | 0.0073 | 0.0134 | **+84%** |
+
+So `auto` sends q4_k to int8 and everything else to f16. Pushing q4_k through f16 is
+1.85x the time (2.40 vs 1.30 s/step) for nothing: over 4 seeds it measures **-1.44 dB
+±1.14**, i.e. zero, and the 3-7% it does take off the DiT-vs-CPU velocity error is mostly
+the ACTIVATIONS (which f16 does not quantize), not the weights.
+
+⚠️ **Do not run q8_0 through the int8 route.** It is strictly dominated: a native int8
+checkpoint is SMALLER (13.2 vs 15.6 GB) and equal in accuracy, so the only reason to hold
+a q8_0 file is the accuracy the f16 route keeps.
+
+**q8_0 on f16 is how to run a 24 GB card at near-dense accuracy**, and it costs almost
+nothing over a dense f16 model that fit: the weight expansion is 61 ms/step, measured on
+the `dequant` bucket, and it is resolution-INDEPENDENT (224 launches over the same weights
+whatever the sequence length), so at 1024² it is **2.6%** of the 2.34 s step. The rest is
+the f16 GEMM, which measures **3.06x** the int8 one at identical shapes (441 vs 144 ms at
+lat=64) against a 4x spec ratio for f32 accumulate. That 3x is the whole gap between the
+two routes, so no amount of decode tuning closes it.
+
+⚠️ **Do not compare against the dense bf16 checkpoint's wall time on a 24 GB card.** It
+needs 25.1 GB, so it streams and measures 3.3-7.0 s/step depending on what else is
+resident. It is a correctness reference, not a speed baseline.
+
+⚠️ **Every other GGUF block quant is still CPU-only, and that is enforced**
+(`dit.gpuLinKindSupported`, which takes which GPU arm is asking, and whose list is the
+union of `Backend.blockQFormat` and `Backend.quantKernelSupported`, plus the
+`anima`/`zimage` equivalents). Vulkan has neither decode.
+
+**q2_k is the smallest krea2 that renders**, 6.6 GB on disk and 4.0-4.2 GB of DiT VRAM,
+and it renders a coherent image. Its weight error is 4x q4_k's, so treat it as the low-VRAM
+option, not a quality one. The int8 regrid is free on it (0.3086 against the file's own
+0.3085), and it is the only format for which the int4 route is even arguable, because
+int4-convrot's own ~0.17 floor sits below what q2_k already costs. It is still not the
+default: `cuda-dit-test <q2_k> 128 libs int4` improves the matmul bucket 502 -> 404 ms but
+leaves `prep` and attention untouched, so the step only moves 1.11x, and one seed rendered
+2.4 dB below the int8 route. `--dit-gguf-gemm int4` for it.
+
+⚠️ **q4_0/q5_k/q6_k/iq4_nl are wired but UNMEASURED here** — no such diffusion checkpoint
+is on this box. They reach `opMatmulQuant`, which is covered per-dtype by its own device
+test, but no render has been made with one.
+
+**Measured, krea2 1024², 3090, against the bf16 checkpoint:**
+
+| format | file | DiT VRAM | s/step | weight err | PSNR |
+|---|---|---|---|---|---|
+| dense bf16 | 26.3 GB | 25.1 GB (streams) | 3.3-7.0 | 0 | reference |
+| **q8_0 GGUF, f16** | **15.6 GB** | **12.7 GB** | **2.46** | **0.0059** | **34.6** |
+| q8_0 GGUF, int8 | 15.6 GB | 12.7 GB | 1.37 | 0.0109 | 34.5 |
+| int8 convrot | 13.2 GB | 11.9 GB | 1.14 | 0.0091 | 31.8 |
+| fp8 e4m3 | 13.2 GB | 6.9 GB | 2.45 | - | 28.40 |
+| **q4_k GGUF, int8** | **9.5 GB** | **6.9 GB** | **1.33** | **0.0768** | **21.9** |
+| q4_k GGUF, f16 | 9.5 GB | 6.9 GB | 2.40 | 0.0762 | - |
+| int4 convrot | 8.1 GB | 5.9 GB | 0.95 | 0.1657 | 19.2 |
+| **q2_k GGUF, int8** | **6.6 GB** | **4.2 GB** | **1.29** | **0.3086** | **-** |
+| q2_k GGUF, int4 | 6.6 GB | 4.0 GB | 1.21 | 0.3348 | - |
+
+s/step and VRAM at 1024², `--backend cuda`. **`weight err`** is the relative Frobenius
+error of what the GEMM actually multiplies, against the dense checkpoint, over 4 blocks × 4
+linears. **PSNR** is the mean over 4 prompts at one seed.
+
+⚠️ **Rank close formats by `weight err`, never by PSNR.** PSNR over a 20-step trajectory
+has a per-prompt sd of ~11 dB here, so paired over 4 prompts it resolves q4_k vs int4
+(+2.71 dB, SE 0.82) and NOTHING inside the near-lossless group: q8_0's two routes differ by
+1.84x in weight error and measure +0.06 dB apart with SE 2.69. The weight error is stable
+to a few percent across every layer and is what generalizes across prompts. Do not read a
+PSNR gap under ~3 dB in this table as real.
+
+q4_k is the quality leader of the 4-bit class and within 1.17x of int8 on time.
+
+The q8_0 PSNRs are the two routes on the same file: on int8 it costs more than a native
+int8 checkpoint on both axes and matches it on quality, which is why `auto` does not send
+it there.
+
+⚠️ **Read that column as a multi-seed mean: one seed's PSNR is worth about ±8 dB.**
+20 steps of a sampler amplify a weight perturbation chaotically, so a single render cannot
+rank two formats this close. Over 4 seeds int8 alone spans 28.08 to 45.00 (16.9 dB) and
+crosses q8_0's line in both directions, while their means sit 0.05 dB apart. Rank two
+close formats by weight error against the dense checkpoint instead, which is stable to
+0.01x across every layer.
+
+The decode costs ~0.2 s/step and that is nearly INDEPENDENT of the source format (q8_0 and
+q4_k measure the same per step despite q8_0 reading 1.9x the packed bytes). Its extra DRAM
+traffic over a plain int8 GEMM is only ~25 GB/step, ~31 ms at the 3090's bandwidth, so the
+kernel is ~6x off its roofline: the cost is the FWHT and the shared-memory traffic, not
+reading the weight. That is also why a fatter block quant is not proportionally slower.
+
+The decode is chunked and takes its per-row scale as an INPUT (`buildPrep`'s `chunk`
+argument), which is what got it from ~300 to ~180 ms/step. The two go together: a chunk
+cannot compute a whole row's absmax, and without that reduction nothing forces the row
+to be resident, so shared drops from `cols*4` (64 KB at mlp.down's cols=16384, ONE block
+per SM) to `chunk*4`. Recomputing the scale per GEMM was pure waste — a weight's scale is
+a property of the weight, so it is computed once on first use and cached per weight
+(`bq_scales`, ~7 MB for krea2). An activation's is data and still costs a reduction.
+
+⚠️ **The chunk must DIVIDE cols** (`bqChunk`). The kernel derives its chunk count as
+`cols / chunk`, so a chunk that does not divide truncates it and silently leaves the tail
+of every row undecoded: 4096 against krea2's 6144 covers two thirds of the weight and
+still renders a plausible image. The builder asserts it and asserts are off in the builds
+this runs in. ⚠️ The whole-row path normalizes shared by the FWHT's 1/16 gain before
+taking the absmax; the chunked path folds that 16 into the incoming scale instead, and
+omitting it gives a fully saturated int8 weight (rel RMSE 0.97).
+
+⚠️ **The convrot rotation is load-bearing and cannot be dropped to close the last 91 ms**
+against w4a8 (`dit_cuda.blockq_rotate`). Skipping it on BOTH sides is exact arithmetic — the
+rotation cancels between weight and activation — and it is 1.181 -> 1.090 s/step because
+the FWHT leaves the decode and the activation prep at once. It also destroys the output:
+rel RMSE 0.915 against the CPU forward, where rotated is 0.044. The weight side barely
+cares (unrotated per-row int8 costs 0.3% on top of q4_k's own error); it is entirely the
+ACTIVATIONS, whose outliers one scale per row cannot span. That is what w4a8's format buys
+by quantizing in the rotated domain up front, and it is why q4_k pays a decode w4a8 does
+not. Closing that gap needs precomputed rotated weights, which costs the 6.9 -> 12.2 GB
+that the packed form exists to avoid.
+
+Real eltwise is ~90 ms/step at 75-93% of DRAM bandwidth (`gated_add` 844 GB/s,
+`sigmoid_mul` 841, `rms_mod_par` 833, `rope` 829), already at the roofline, so only fusion
+could help.
+
+⚠️ **`cuda-dit-test`'s bucket labels were misaligned with `ProfCat`**, which omitted
+`dequant`, so every row after `matmul` printed the NEXT category's total: the row labelled
+`prep` was the weight dequant, `attn(g/s)` was prep, `elt` was attn, and `attn_pv` never
+printed. Any earlier reading of this breakdown that named a bucket by its printed label is
+off by one. Launch counts identify the rows if you meet an old figure: 224 is one per block
+linear (dequant), 336 is prep, 28 is attn, 281 is elt. The names now come off the enum.
 
 ---
 
@@ -237,7 +446,7 @@ with no error.
 | Op | cpu | vulkan | zig-cuda | cuda | Formats |
 |---|---|---|---|---|---|
 | **GEMM / linear** | `ops/matmul.zig` | `opMatmul`/`opMatmulCoop*` | hand hgemm/igemm/i4gemm | cuBLASLt | see §7 |
-| **Conv2d** (im2col + GEMM, fused 2× upsample) | ✅ f32 | ✅ f16-TC (co≥96) / f32 | ✅ | ✅ (+cuDNN conv) | f32 weights; f16 TC wide-co |
+| **Conv2d** (im2col + GEMM, fused 2× upsample) | ✅ f32 | ✅ f16-TC (co≥96) / f32 | ✅ | ✅ (cuDNN NHWC conv for stride-1 3×3; im2col for stride-2 and upsample) | f32 weights; f16 TC wide-co; f16 activation storage either side |
 | **Attention** (DiT GQA 48/12, hd128) | f32 | f16 two-pass TC (+flash) | `opAttnTC` | f16 TC | f16 scores |
 | **VAE mid-block attn** | f32 | f32 scores plane, query-banded | TC flash, f32 scores band | cuDNN SDPA | see below |
 | RMSNorm + AdaLN modulate | ✅ | `rms_apply_mod`/`modulate` | `rms_mod_par` | ↤ | f32 (+h16) |
@@ -484,8 +693,8 @@ not token-identical to f32 — and a dtype toggle rebuilds the context.
 
 ## 7. Data-format support matrix
 
-DType enum (`src/dtype.zig`): `f8_e4m3, f16, bf16, f32, i8, i4, q4_0, q8_0, q4_k, q5_k, q6_k,
-iq4_nl, q1_0, q2_0_g64, q2_0_g128`. `i8`/`i4` are the ComfyUI convrot formats for the **image**
+DType enum (`src/dtype.zig`): `f8_e4m3, f16, bf16, f32, i8, i4, q4_0, q8_0, q2_k, q4_k, q5_k,
+q6_k, iq4_nl, q1_0, q2_0_g64, q2_0_g128`. `i8`/`i4` are the ComfyUI convrot formats for the **image**
 path; GGUF `q*` are the **LLM** path.
 
 | Format | cpu | vulkan | zig-cuda | cuda | How it computes |
@@ -501,6 +710,7 @@ path; GGUF `q*` are the **LLM** path.
 | **GGUF q4_0** | ✅ ggml | ❌ | ✅ `gemv_q4_0(_q8n)` | ⤷ dequant→f16 | |
 | **GGUF q8_0** | ✅ ggml | ✅ `gemv_q8_0{,_t}` (scalar) | ✅ `gemv_q8_0(_q8n)` | ⤷ dequant→f16 | |
 | **GGUF q4_k / q5_k / q6_k** | ✅ ggml | ✅ scalar `gemv_*{,_t}` | ✅ `gemv_*(_q8/_q8n)` + MMQ | ⤷ dequant→f16 | |
+| **GGUF q2_k** | ✅ ggml | ❌ | ✅ decode→int8/int4 convrot (`buildPrep`) | ✅ ditto | 256 elems / 84 B; 2-bit codes, 4-bit scale+min per 16, f16 d/dmin at the block TAIL. Diffusion only so far: no GEMV, so no LLM decode path |
 | **GGUF iq4_nl** | ✅ ggml | ✅ scalar (module-const LUT) | ✅ shared-mem LUT | ⤷ dequant→f16 | 32 elems / 18 B, non-linear `kvalues_iq4nl` |
 | **GGUF q1_0** | ✅ ggml | ❌ | ✅ `gemv_q1_0{,_q8}`, `mmq_pipe_q1_0` | ⤷ dequant→f16 | 128 elems / 18 B; **1 sign bit per weight**, `v = bit ? d : -d`, `d = mean\|x\|` |
 | **GGUF q2_0 g128** | ✅ **native** `dotQ2_0G128` (not ggml) | ❌ | ✅ `gemv_q2_0_g128{,_q8}`, `mmq_pipe_q2_0` | ⤷ dequant→f16 | 128 elems / 34 B; 2 bits/weight, `v = (code − 1)·d`, codes → {−1, 0, +1, +2} |
@@ -646,7 +856,9 @@ Delete a row when it closes.
 | Vulkan block-quant embedding | rejected in `llm_main.zig` — no block-quant gather kernel, so an f16/bf16 embed table is required. |
 | Vulkan dp4a decode is opt-in | `TP_VK_DP4A=1`; the repacked int8 weight roughly doubles VRAM, so it stays opt-in until VRAM-aware auto-sizing lands. |
 | `opMatmulFp8` writes `y` directly | unlike `opGemmBf16`/`opMatmulNvfp4` it carries `launchHgemm`'s `mpad`-rows requirement implicitly. Its zimage/anima `.f8_e4m3` arms have never been exercised and would hit it the day an fp8 checkpoint for either shows up. |
-| No GPU GEMM for GGUF block quants in diffusion | a GGUF DiT is CPU-only on every backend; `gpuLinKindSupported` is the one place to widen. |
+| `mmq_pipe_q4_k` at ~24% of int8 peak | **Not on the diffusion path** (a q4_k/q8_0 DiT decodes to int8-convrot and uses the vendor GEMM); it is the LLM q4_k prefill kernel. 369 ms/step at lat=64, down from 434, all of it from shared-memory BANK CONFLICTS on the fragment loads. ⚠️ SEVEN plausible causes measured NOT to be it: ALU (4%), spill (`kstep` 128 spills zero, 24% slower), occupancy (forcing 3-4 blocks/SM is 10x WORSE — the 128 f32 accumulators spill per mma), cp.async double-buffering (10% slower), the s32→f32 `cvt`, DRAM (6%), ldmatrix (50% slower). Nsight: latency bound at 1.93 warps/scheduler of 12, ~1.5x ceiling. Read the block comment before optimizing. |
+| q8_0 MMQ built and LOST | `mmq_pipe_q8_0` exists, is correct (device test against an exact f64 reference, teeth checked by mis-wiring the per-substep scale) and is opt-in via `--dit-gguf-gemm mmq`. It measures **566 ms** of GEMM per step against the f16 route's **440** and cuBLASLt int8's **141**. ⚠️ Do not retry it expecting the estimate that motivated it: the premise was that `igemm_pipe` runs ~1.68x cuBLASLt, but igemm_pipe chains the mma's s32 C operand across k and NO MMQ can, because the scale changes every 32 elements. Isolation: A staging is 225 of the 566 (`TP_MMQ8_NOSTAGE` gives 342), and even at 342 it loses, because q4_k's nibble packing feeds TWO substeps from one 32-byte A fragment where 8-bit weights need their own, doubling shared A-load traffic on the one axis this kernel family responds to. The only real lever left is a one-time repack to planar qs + a scale plane, worth ~5% end-to-end on this card. |
+| No GPU GEMM for GGUF block quants other than q4_k/q8_0 in diffusion | q5_k/q6_k/q4_0/iq4_nl DiTs are CPU-only on every backend; `gpuLinKindSupported` + `Backend.blockQFormat` are the two places to widen, and each needs only a load-stage block walk in `buildPrep`. |
 | krea2 has no Vulkan int4 path | `dit_gpu` never accepted it. `i4_decode_t` is now most of what it would need. |
 | q2_0 g64 kernels unexecuted | GEMV and MMQ are generated from the same templates as g128 but no g64 file exists here to run them against. |
 | `--text-encoder-2` split path unexercised | every SDXL checkpoint here is bundled, so the flag is built and reviewed but not measured. |

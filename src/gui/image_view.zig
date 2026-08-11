@@ -193,17 +193,17 @@ fn renderModelNotice(cfg: *const config.Config, engine: *diffuser.Diffuser, fam:
     const text: []const u8 = blk: {
         if (engine.loadError()) |err| break :blk std.fmt.bufPrint(
             &buf,
-            "⚠ The diffusion model failed to load: {t}. Check the model paths and backend in Settings.",
+            "The diffusion model failed to load: {t}. Check the model paths and backend in Settings.",
             .{err},
-        ) catch "⚠ The diffusion model failed to load.";
+        ) catch "The diffusion model failed to load.";
         const f = fam orelse return; // unreadable/unknown: Settings says why
         const t = model_spec.traits(f);
         const want = diffuser.toPipelineBackend(cfg.diff_backend);
         if (!t.supports(want)) break :blk std.fmt.bufPrint(
             &buf,
-            "⚠ {s} has no kernels for the {t} backend. Generation will fail to load — change it in Settings.",
+            "{s} has no kernels for the {t} backend. Generation will fail to load — change it in Settings.",
             .{ t.label, cfg.diff_backend },
-        ) catch "⚠ This architecture has no kernels for the selected backend.";
+        ) catch "This architecture has no kernels for the selected backend.";
         return;
     };
 
@@ -289,8 +289,9 @@ fn numField(id: usize, label: []const u8, buf: []u8) void {
 /// Queue `count` generations from the current form values into the engine's
 /// unified queue and start the pump.
 fn generate(cfg: *const config.Config, engine: *diffuser.Diffuser) void {
+    // Empty is allowed: it encodes to the unconditional embedding, which is a render
+    // the model can do and some workflows want.
     const prompt = std.mem.trim(u8, std.mem.sliceTo(&prompt_buf, 0), " \t\r\n");
-    if (prompt.len == 0) return;
     const neg = std.mem.trim(u8, std.mem.sliceTo(&negative_buf, 0), " \t\r\n");
 
     const w = diffuser.clampDim(parseNum(&width_buf, cfg.width));
@@ -439,16 +440,16 @@ fn renderCell(engine: *diffuser.Diffuser, gi: *GenImage, idx: usize, cell: f32) 
         .failed => {
             var fbuf: [180]u8 = undefined;
             const msg = if (gi.failure()) |err|
-                std.fmt.bufPrint(&fbuf, "⚠ failed: {s}", .{diffuser.failureText(err)}) catch "⚠ failed"
+                std.fmt.bufPrint(&fbuf, "failed: {s}", .{diffuser.failureText(err)}) catch "failed"
             else
-                "⚠ failed";
+                "failed";
             var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal });
             fonts.addRich(tl, msg);
             tl.deinit();
             retryButton(engine, gi);
         },
         .canceled => {
-            dvui.label(@src(), "⚠ canceled", .{}, .{});
+            dvui.label(@src(), "canceled", .{}, .{});
             retryButton(engine, gi);
         },
     }

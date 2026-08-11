@@ -95,8 +95,8 @@ fn wgemm(be: *Backend, y: Buf, x: Buf, m: usize, w: ops.matmul.Weight, co: usize
         .bf16 => if (be.ctx.cc_major >= 8 and co % 128 == 0 and k % 32 == 0)
             try be.opGemmBf16(y, x, m, w.bytes, co, k, null)
         else
-            try be.opMatmulBf16(y, x, m, w.bytes, co, k, null),
-        .f16 => try be.opMatmulF16(y, x, m, w.bytes, co, k, null),
+            try be.opMatmulBf16(y, x, m, w.bytes, co, k, null, false, false),
+        .f16 => try be.opMatmulF16(y, x, m, w.bytes, co, k, null, false, false),
         else => return error.UnsupportedDType,
     }
 }
@@ -1192,7 +1192,7 @@ pub const CudaLM = struct {
         for (self.lm.layers, 0..) |layer, l| {
             if (self.taps_on) {
                 for (self.tap_layers, 0..) |tl, j| {
-                    if (l == tl) try be.opCopyOff(tb.taps, j * spec_limits.max_tree_nodes * c.hidden, b.x, 0, n * c.hidden);
+                    if (l == tl) try be.opCopyOff(tb.taps, j * spec_limits.max_tree_nodes * c.hidden, b.x, 0, n * c.hidden, false);
                 }
             }
             // --- Attention ---
@@ -1245,15 +1245,15 @@ pub const CudaLM = struct {
         for (0..c.n_layers) |l| {
             for (path, 0..) |idx, j| {
                 std.debug.assert(idx < self.tree_n);
-                try be.opCopyOff(self.k_cache[l].buf, (self.len + j) * kvd, self.k_cache[l].buf, (self.capacity + idx) * kvd, kvd);
-                try be.opCopyOff(self.v_cache[l].buf, (self.len + j) * kvd, self.v_cache[l].buf, (self.capacity + idx) * kvd, kvd);
+                try be.opCopyOff(self.k_cache[l].buf, (self.len + j) * kvd, self.k_cache[l].buf, (self.capacity + idx) * kvd, kvd, false);
+                try be.opCopyOff(self.v_cache[l].buf, (self.len + j) * kvd, self.v_cache[l].buf, (self.capacity + idx) * kvd, kvd, false);
             }
         }
         if (self.taps_on) {
             const tb = &self.tree.?;
             for (0..3) |t| {
                 for (path, 0..) |idx, j| {
-                    try be.opCopyOff(self.tap_d, (t * self.capacity + self.len + j) * c.hidden, tb.taps, (t * spec_limits.max_tree_nodes + idx) * c.hidden, c.hidden);
+                    try be.opCopyOff(self.tap_d, (t * self.capacity + self.len + j) * c.hidden, tb.taps, (t * spec_limits.max_tree_nodes + idx) * c.hidden, c.hidden, false);
                 }
             }
         }
@@ -1488,7 +1488,7 @@ pub const CudaLM = struct {
         for (self.lm.layers, 0..) |layer, l| {
             if (self.taps_on) {
                 for (self.tap_layers, 0..) |tl, j| {
-                    if (l == tl) try be.opCopyOff(self.tap_d, (j * self.capacity + pos0) * c.hidden, b.x, 0, seq * c.hidden);
+                    if (l == tl) try be.opCopyOff(self.tap_d, (j * self.capacity + pos0) * c.hidden, b.x, 0, seq * c.hidden, false);
                 }
             }
             // Hybrid CPU/GPU split: run host-resident layers on the CPU via the

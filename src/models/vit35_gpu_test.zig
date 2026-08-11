@@ -42,7 +42,7 @@ test "vit eltwise kernels match CPU reference" {
             be.tensorDestroy(&yd);
         }
         try be.tensorUpload(x_d, std.mem.sliceAsBytes(x));
-        try be.opLayerNorm(x_d, y_d, w, b, rows, dim, 1e-6);
+        try be.opLayerNorm(x_d, y_d, w, b, rows, dim, 1e-6, false);
 
         const got = try gpa.alloc(f32, rows * dim);
         defer gpa.free(got);

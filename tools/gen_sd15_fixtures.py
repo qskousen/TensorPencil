@@ -282,6 +282,21 @@ def main() -> None:
         meta["unet_big.stage_names"] = ",".join(stage_names_big)
         meta["unet_big.latent"] = str(big)
 
+        # A THIRD UNet case at a latent whose dimensions do NOT halve cleanly.
+        # ⚠️ Both cases above are powers of two, so every downsample is exact and the
+        # decoder's upsample lands on the encoder's grid by luck. SD1.5 halves three
+        # times: 36 -> 18 -> 9 -> 5 and 44 -> 22 -> 11 -> 6, so the innermost level
+        # comes back up 10x12 against a skip of 9x11 and the concat has to follow the
+        # SKIP's size, not twice its own. diffusers does this by passing
+        # `upsample_size` down from the encoder. Non-square on purpose: a height/width
+        # swap survives every square fixture here.
+        odd_h, odd_w = 36, 44
+        latent_odd = torch.randn(1, 4, odd_h, odd_w, generator=g)
+        eps_odd = unet(latent_odd, t[:1], encoder_hidden_states=context[:1]).sample.float()
+        out["unet_odd.latent"] = latent_odd
+        out["unet_odd.eps"] = eps_odd
+        meta["unet_odd.latent"] = f"{odd_h}x{odd_w}"
+
         # --- VAE decode -------------------------------------------------------
         vl = torch.randn(1, 4, VAE_LATENT, VAE_LATENT, generator=g)
         img = vae.decode(vl).sample.float()

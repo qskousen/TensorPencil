@@ -52,6 +52,7 @@ fn dtypeFromGgml(id: u32, q2_0: DType) ?DType {
         1 => .f16,
         2 => .q4_0,
         8 => .q8_0,
+        10 => .q2_k,
         12 => .q4_k,
         13 => .q5_k,
         14 => .q6_k,

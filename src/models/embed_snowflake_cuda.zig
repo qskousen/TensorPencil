@@ -107,14 +107,14 @@ pub const ModelCuda = struct {
             try be.attn(q_d, k_d, v_d, attn_d, seq, seq, heads, heads, hd, scale, false);
             try gemm(be, t_d, attn_d, seq, l.o.bytes, w, w, l.o_bias);
             try be.opAdd(x_d, t_d, seq * w);
-            try be.opLayerNorm(x_d, x_d, l.attn_ln_w, l.attn_ln_b, seq, w, eps);
+            try be.opLayerNorm(x_d, x_d, l.attn_ln_w, l.attn_ln_b, seq, w, eps, false);
 
             try gemm(be, up_d, x_d, seq, ug[0..useg], inter, w, zero_bias);
             try gemm(be, gate_d, x_d, seq, ug[useg .. 2 * useg], inter, w, zero_bias);
             try be.geluMul(gate_d, up_d, seq * inter);
             try gemm(be, t_d, gate_d, seq, l.down.bytes, w, inter, l.down_bias);
             try be.opAdd(x_d, t_d, seq * w);
-            try be.opLayerNorm(x_d, x_d, l.mlp_ln_w, l.mlp_ln_b, seq, w, eps);
+            try be.opLayerNorm(x_d, x_d, l.mlp_ln_w, l.mlp_ln_b, seq, w, eps, false);
         }
         try be.endBatch();
 
@@ -224,14 +224,14 @@ pub const ModelCuda = struct {
             try be.opAttnBatched(q_d, k_d, v_d, attn_d, bounds_d, total, heads, heads, hd, scale);
             try gemm(be, t_d, attn_d, total, l.o.bytes, w, w, l.o_bias);
             try be.opAdd(x_d, t_d, total * w);
-            try be.opLayerNorm(x_d, x_d, l.attn_ln_w, l.attn_ln_b, total, w, eps);
+            try be.opLayerNorm(x_d, x_d, l.attn_ln_w, l.attn_ln_b, total, w, eps, false);
 
             try gemm(be, up_d, x_d, total, ug[0..useg], inter, w, zero_bias);
             try gemm(be, gate_d, x_d, total, ug[useg .. 2 * useg], inter, w, zero_bias);
             try be.geluMul(gate_d, up_d, total * inter);
             try gemm(be, t_d, gate_d, total, l.down.bytes, w, inter, l.down_bias);
             try be.opAdd(x_d, t_d, total * w);
-            try be.opLayerNorm(x_d, x_d, l.mlp_ln_w, l.mlp_ln_b, total, w, eps);
+            try be.opLayerNorm(x_d, x_d, l.mlp_ln_w, l.mlp_ln_b, total, w, eps, false);
         }
         try be.endBatch();
 

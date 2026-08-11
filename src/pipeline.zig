@@ -1252,9 +1252,10 @@ pub const Container = union(enum) {
     /// instead of faulting the (multi-GB, read-once) checkpoint mapping, see
     /// `SafeTensors.readTo` for why that matters under host memory pressure.
     ///
-    /// GGUF returns null for now: same idea applies, but the DiT GGUF path is
-    /// CPU-only today (no GPU block-quant GEMM), so it never reaches this staging
-    /// ring and wiring it would be untestable here.
+    /// GGUF returns null, so a GGUF DiT faults its own mapping instead. That is now
+    /// reachable (a q4_k DiT runs on CUDA), but it does not bite: q4_k krea2 is 8.8 GB
+    /// and stays wholly pinned, so nothing streams. A block quant big enough to stream
+    /// is what would make this worth wiring.
     pub fn weightReader(self: *Container) ?cuda.Context.WeightReader {
         return switch (self.*) {
             .safetensors => |*st| .{
@@ -2332,10 +2333,12 @@ pub const Session = struct {
         const spec = componentSpec(self.family(), .denoiser) catch return "";
         for (spec.prefixes) |pfx| {
             var buf: [256]u8 = undefined;
-            if (pfx.len + spec.probe.len > buf.len) continue;
-            @memcpy(buf[0..pfx.len], pfx);
-            @memcpy(buf[pfx.len..][0..spec.probe.len], spec.probe);
-            if (store.get(buf[0 .. pfx.len + spec.probe.len]) != null) return pfx;
+            for (spec.probes) |probe| {
+                if (pfx.len + probe.len > buf.len) continue;
+                @memcpy(buf[0..pfx.len], pfx);
+                @memcpy(buf[pfx.len..][0..probe.len], probe);
+                if (store.get(buf[0 .. pfx.len + probe.len]) != null) return pfx;
+            }
         }
         return "";
     }

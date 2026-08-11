@@ -50,8 +50,8 @@ fn gemm(be: *Backend, y: Buf, x: Buf, m: usize, wt: Weight, bias: []const f32) !
             if (rows >= coop_min_co) return be.opConvF16(y, 0, x, m, wt.bytes, rows, cols, bias);
             return be.opMatmul(y, 0, x, 0, m, wt.bytes, false, rows, cols, 1.0, bias);
         },
-        .f16 => return be.opMatmulF16(y, x, m, wt.bytes, rows, cols, bias),
-        .bf16 => return be.opMatmulBf16(y, x, m, wt.bytes, rows, cols, bias),
+        .f16 => return be.opMatmulF16(y, x, m, wt.bytes, rows, cols, bias, false, false),
+        .bf16 => return be.opMatmulBf16(y, x, m, wt.bytes, rows, cols, bias, false, false),
         else => return error.UnsupportedDType,
     }
 }
@@ -130,12 +130,12 @@ pub fn encodePrompt(
     errdefer if (be.batching()) be.abortBatch();
 
     if (r.capture_layer) |layer| if (layer == 0) {
-        try be.opCopyOff(cap_d, 0, x_d, 0, total * h);
+        try be.opCopyOff(cap_d, 0, x_d, 0, total * h, false);
     };
 
     for (enc.layers, 0..) |*l, li| {
         // --- attention: x += o(causal_attn(ln1(x))) ---
-        try be.opLayerNorm(x_d, normed_d, l.ln1_w, l.ln1_b, total, h, cfg.eps);
+        try be.opLayerNorm(x_d, normed_d, l.ln1_w, l.ln1_b, total, h, cfg.eps, false);
         try gemm(be, q_d, normed_d, total, l.q, l.q_b);
         try gemm(be, k_d, normed_d, total, l.k, l.k_b);
         try gemm(be, v_d, normed_d, total, l.v, l.v_b);
@@ -161,7 +161,7 @@ pub fn encodePrompt(
         try be.opAdd(x_d, t_d, total * h);
 
         // --- mlp: x += fc2(act(fc1(ln2(x)))) ---
-        try be.opLayerNorm(x_d, normed_d, l.ln2_w, l.ln2_b, total, h, cfg.eps);
+        try be.opLayerNorm(x_d, normed_d, l.ln2_w, l.ln2_b, total, h, cfg.eps, false);
         try gemm(be, big_d, normed_d, total, l.fc1, l.fc1_b);
         switch (cfg.act) {
             .quick_gelu => try be.geluQuick(big_d, total * inter),
@@ -171,13 +171,13 @@ pub fn encodePrompt(
         try be.opAdd(x_d, t_d, total * h);
 
         if (r.capture_layer) |layer| if (layer == li + 1) {
-            try be.opCopyOff(cap_d, 0, x_d, 0, total * h);
+            try be.opCopyOff(cap_d, 0, x_d, 0, total * h, false);
         };
     }
 
     // The final LayerNorm is what SD1.5 conditions on and where SDXL's pooled row comes
     // from, SDXL's *context* deliberately stops short of it.
-    try be.opLayerNorm(x_d, x_d, enc.final_ln_w, enc.final_ln_b, total, h, cfg.eps);
+    try be.opLayerNorm(x_d, x_d, enc.final_ln_w, enc.final_ln_b, total, h, cfg.eps, false);
     try be.endBatch();
 
     // --- host: download, cache z_empty, apply the weights ---------------------

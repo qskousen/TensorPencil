@@ -46,6 +46,7 @@ const gg = if (have_ggml) struct {
         return switch (dt) {
             .q4_0 => ggml.c.GGML_TYPE_Q4_0,
             .q8_0 => ggml.c.GGML_TYPE_Q8_0,
+            .q2_k => ggml.c.GGML_TYPE_Q2_K,
             .q4_k => ggml.c.GGML_TYPE_Q4_K,
             .q5_k => ggml.c.GGML_TYPE_Q5_K,
             .q6_k => ggml.c.GGML_TYPE_Q6_K,
@@ -90,7 +91,7 @@ const gg = if (have_ggml) struct {
     pub fn dequantSlice(dt: DType, row: []const u8, elem0: usize, n: usize, dst: []f32) void {
         _ = .{ dt, row, elem0, n, dst };
         @panic("quants.dequantSlice: TensorPencil built with -Dggml=false; " ++
-            "GGUF block-quant (q4_0/q8_0/q4_k/q5_k/q6_k/iq4_nl/q1_0) is unavailable");
+            "GGUF block-quant (q4_0/q8_0/q2_k/q4_k/q5_k/q6_k/iq4_nl/q1_0) is unavailable");
     }
 };
 

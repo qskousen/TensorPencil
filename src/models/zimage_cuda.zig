@@ -473,7 +473,7 @@ fn gemm(be: *Backend, y: Buf, x: Buf, m: usize, w: Weight) !void {
         .bf16 => if (be.ctx.cc_major >= 8 and w.rows % 128 == 0 and w.cols % 32 == 0)
             try be.opGemmBf16(y, x, m, w.bytes, w.rows, w.cols, null)
         else
-            try be.opMatmulBf16(y, x, m, w.bytes, w.rows, w.cols, zeros),
+            try be.opMatmulBf16(y, x, m, w.bytes, w.rows, w.cols, zeros, false, false),
         .f8_e4m3 => try be.opMatmulFp8(y, x, m, w.bytes, w.scale, w.rows, w.cols),
         // Weight-only NVFP4: the 4-bit weight is decoded to an f16 scratch inside the GEMM
         // and the packed form stays resident. `rows % 128` / `cols % 32` come from the f16

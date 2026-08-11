@@ -25,8 +25,8 @@ const Weight = ops.matmul.Weight;
 fn gemm(be: *Backend, dst: Buf, src: Buf, m: usize, w: Weight, bias: ?[]const f32) !void {
     const b = bias orelse &.{};
     switch (w.dtype) {
-        .f16 => try be.opMatmulF16(dst, src, m, w.bytes, w.rows, w.cols, b),
-        .bf16 => try be.opMatmulBf16(dst, src, m, w.bytes, w.rows, w.cols, b),
+        .f16 => try be.opMatmulF16(dst, src, m, w.bytes, w.rows, w.cols, b, false, false),
+        .bf16 => try be.opMatmulBf16(dst, src, m, w.bytes, w.rows, w.cols, b, false, false),
         .f32 => try be.opConvF16(dst, 0, src, m, w.bytes, w.rows, w.cols, b),
         else => return error.UnsupportedDType,
     }
@@ -82,12 +82,12 @@ pub fn encode(vit: *const Vit, be: *Backend, io: std.Io, gpa: std.mem.Allocator,
     errdefer if (be.batching()) be.abortBatch();
 
     try be.tensorUpload(sized(patch_d, 0, np * kdim * 4), std.mem.sliceAsBytes(pm.data));
-    try be.opLayerNorm(patch_d, patch_d, vit.patch_norm_1_w, vit.patch_norm_1_b, np, kdim, cfg.eps_ln);
+    try be.opLayerNorm(patch_d, patch_d, vit.patch_norm_1_w, vit.patch_norm_1_b, np, kdim, cfg.eps_ln, false);
     try gemm(be, x_d, patch_d, np, vit.patch_w, vit.patch_b); // patch embed (6912 -> 3840)
-    try be.opLayerNorm(x_d, x_d, vit.patch_norm_2_w, vit.patch_norm_2_b, np, dim, cfg.eps_ln);
+    try be.opLayerNorm(x_d, x_d, vit.patch_norm_2_w, vit.patch_norm_2_b, np, dim, cfg.eps_ln, false);
     try be.tensorUpload(sized(t_d, 0, np * dim * 4), std.mem.sliceAsBytes(pos));
     try be.opAdd(x_d, t_d, np * dim); // + learned positional embedding
-    try be.opLayerNorm(x_d, x_d, vit.patch_norm_3_w, vit.patch_norm_3_b, np, dim, cfg.eps_ln);
+    try be.opLayerNorm(x_d, x_d, vit.patch_norm_3_w, vit.patch_norm_3_b, np, dim, cfg.eps_ln, false);
     try be.qkNorm(x_d, x_d, ones_d, np, dim, cfg.eps_rms); // weightless RMSNorm
     try gemm(be, patch_d, x_d, np, vit.mm_proj, zbias); // projection (3840 -> 3840)
     try be.endBatch();

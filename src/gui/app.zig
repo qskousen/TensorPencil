@@ -1717,7 +1717,7 @@ fn renderEmptyAssistant(s: ?*chat.Session, theme: dvui.Theme, idx: usize) void {
     defer tl.deinit();
     if (if (s) |ss| ss.gen_err else null) |err| {
         var msg: [128]u8 = undefined;
-        fonts.addRich(tl, std.fmt.bufPrint(&msg, "⚠ generation error: {t}", .{err}) catch "⚠ generation error");
+        fonts.addRich(tl, std.fmt.bufPrint(&msg, "generation error: {t}", .{err}) catch "generation error");
     } else if (idx + 1 == (if (s) |ss| ss.messages.items.len else 0) and (if (s) |ss| ss.isPaused() else false)) {
         // A turn queued while the LLM is paused, it runs on resume (Tier 2).
         // addStyled (not addText) routes the ⏸ to the emoji face (NotoSansCJK
@@ -2117,15 +2117,15 @@ fn renderGenImage(s: ?*chat.Session, gi: *chat.GenImage, gi_idx: usize) void {
             // (unload the LLM, drop the resolution) and then retry into.
             var fbuf: [160]u8 = undefined;
             const msg = if (gi.failure()) |err|
-                std.fmt.bufPrint(&fbuf, "⚠ image generation failed: {s}", .{diffuser.failureText(err)}) catch "⚠ image generation failed"
+                std.fmt.bufPrint(&fbuf, "image generation failed: {s}", .{diffuser.failureText(err)}) catch "image generation failed"
             else
-                "⚠ image generation failed";
+                "image generation failed";
             fonts.richLabel(@src(), msg, .{});
             genInfo(gi);
             retryButton(gi);
         },
         .canceled => {
-            fonts.richLabel(@src(), "⚠ image generation canceled", .{});
+            fonts.richLabel(@src(), "image generation canceled", .{});
             genInfo(gi);
             retryButton(gi);
         },

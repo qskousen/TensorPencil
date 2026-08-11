@@ -197,7 +197,7 @@ pub const Error = error{ UnsupportedDType, QuantBackendUnavailable, OutOfMemory 
 pub fn supportsDType(dt: DType) bool {
     return switch (dt) {
         .f8_e4m3, .bf16, .f16, .f32, .i8, .i4, .w4a8, .nvfp4 => true,
-        .q4_0, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl, .q1_0, .q2_0_g64 => have_ggml,
+        .q4_0, .q8_0, .q2_k, .q4_k, .q5_k, .q6_k, .iq4_nl, .q1_0, .q2_0_g64 => have_ggml,
         // q2_0_g128 decodes natively (quants.dequantQ2_0G128), so it needs no ggml.
         .q2_0_g128 => true,
         else => false,
@@ -256,7 +256,7 @@ pub fn matmul(
     if (bias) |b| std.debug.assert(b.len == w.rows);
     switch (w.dtype) {
         .f8_e4m3, .bf16, .f16, .f32, .i8, .i4, .w4a8, .nvfp4 => {},
-        .q4_0, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl, .q1_0, .q2_0_g64 => {
+        .q4_0, .q8_0, .q2_k, .q4_k, .q5_k, .q6_k, .iq4_nl, .q1_0, .q2_0_g64 => {
             if (have_ggml) {
                 // ggml rows are whole blocks; block-aligned k-slicing depends on it.
                 std.debug.assert(w.cols % w.dtype.blockElems() == 0);
@@ -556,7 +556,7 @@ fn packedTask(
         inline .f8_e4m3, .bf16, .f16, .f32, .i8 => |dt| {
             packedTaskTyped(dt, y, x, m, w, bias, row_start, row_end, panel, tok);
         },
-        inline .q4_0, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl, .q1_0, .q2_0_g64, .q2_0_g128 => |dt| {
+        inline .q4_0, .q8_0, .q2_k, .q4_k, .q5_k, .q6_k, .iq4_nl, .q1_0, .q2_0_g64, .q2_0_g128 => |dt| {
             packedTaskBlock(dt, y, x, m, w, bias, row_start, row_end, panel, tok);
         },
         else => unreachable, // validated in matmul()
@@ -1422,6 +1422,11 @@ fn testBlockQuantAgainstNaive(m: usize, rows: usize, cols: usize, dt: DType, wit
                 std.mem.writeInt(u16, wbytes[off..][0..2], d16, .little);
                 std.mem.writeInt(u16, wbytes[off + 2 ..][0..2], min16, .little);
             },
+            // q2_k puts d/dmin at the TAIL, after 16 B of scales and 64 B of codes.
+            .q2_k => {
+                std.mem.writeInt(u16, wbytes[off + 80 ..][0..2], d16, .little);
+                std.mem.writeInt(u16, wbytes[off + 82 ..][0..2], min16, .little);
+            },
             .q6_k => {
                 std.mem.writeInt(u16, wbytes[off + 208 ..][0..2], d16, .little);
                 // Pin the 16 i8 sub-block scales to a moderate value: random
@@ -1484,6 +1489,7 @@ test "matmul q8_0 small-m path" {
 }
 
 test "matmul k-quants small-m path" {
+    try testBlockQuantAgainstNaive(1, 9, 256, .q2_k, false);
     try testBlockQuantAgainstNaive(1, 9, 256, .q4_k, false);
     try testBlockQuantAgainstNaive(2, 7, 512, .q5_k, true);
     try testBlockQuantAgainstNaive(1, 11, 256, .q6_k, false);
@@ -1492,6 +1498,7 @@ test "matmul k-quants small-m path" {
 test "matmul block quants packed path" {
     // rows % NR != 0, cols spanning multiple KC slices with a partial last one.
     try testBlockQuantAgainstNaive(32, 61, KC + 256, .q8_0, true);
+    try testBlockQuantAgainstNaive(37, NR + 5, KC + 256, .q2_k, true);
     try testBlockQuantAgainstNaive(37, NR + 5, KC + 256, .q4_k, false);
     try testBlockQuantAgainstNaive(19, 33, 512, .q5_k, true);
     try testBlockQuantAgainstNaive(small_m_max, NR, KC + 256, .q6_k, false);

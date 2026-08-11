@@ -6,10 +6,10 @@
 //!
 //! 1. Self-attention is `opAttnTC`: cuDNN's fused SDPA under `cuda`, the hand-PTX
 //!    tensor-core path under `zig-cuda`.
-//! 2. Cross-attention is always `opAttnTCRect`, in BOTH arms, because cuDNN's `SdpaPlan`
-//!    is built for a single sequence length and Anima's cross-attention is `seq x 512`.
-//!    Teaching that plan a rectangular shape is a separate change, deliberately not
-//!    made. It is ~8% of the step's FLOPs.
+//! 2. Cross-attention is `opAttnTCRect` directly rather than through `opAttnCross`,
+//!    so both arms run the same hand-PTX kernels on Anima's `seq x 512` shape.
+//!    `opAttnCross` would send the `cuda` arm to cuDNN instead. It is ~8% of the
+//!    step's FLOPs.
 //! 3. The per-image cross-attention K/V cache is f32 here, f16 on Vulkan: the CUDA
 //!    attention entry points take f32 and gather/convert internally, so there is nothing
 //!    to pre-convert into. 235 MB against Vulkan's 117 MB, and the per-step
@@ -466,7 +466,7 @@ fn blockForward(
         const ck = sess.ck_d.viewF32(off);
         const cv = sess.cv_d.viewF32(off);
         if (force_naive_attn) {
-            try be.opAttnCross(ws.q_d, ck, cv, ws.attn_d, seq, sess.ctx_seq, heads, hd, attn_scale);
+            try be.opAttnCrossNaive(ws.q_d, ck, cv, ws.attn_d, seq, sess.ctx_seq, heads, hd, attn_scale);
         } else {
             try be.opAttnTCRect(ws.q_d, ck, cv, ws.attn_d, seq, sess.ctx_seq, heads, heads, hd, attn_scale);
         }
@@ -519,8 +519,8 @@ fn gemm(be: *Backend, y: Buf, x: Buf, m: usize, w: Weight) !void {
         .bf16 => if (be.ctx.cc_major >= 8 and w.rows % 128 == 0 and w.cols % 32 == 0)
             try be.opGemmBf16(y, x, m, w.bytes, w.rows, w.cols, null)
         else
-            try be.opMatmulBf16(y, x, m, w.bytes, w.rows, w.cols, zeros),
-        .f16 => try be.opMatmulF16(y, x, m, w.bytes, w.rows, w.cols, null),
+            try be.opMatmulBf16(y, x, m, w.bytes, w.rows, w.cols, zeros, false, false),
+        .f16 => try be.opMatmulF16(y, x, m, w.bytes, w.rows, w.cols, null, false, false),
         .f8_e4m3 => try be.opMatmulFp8(y, x, m, w.bytes, w.scale, w.rows, w.cols),
         .f32 => try be.opMatmul(y, 0, x, 0, m, w.bytes, false, w.rows, w.cols, w.scale, null),
         // `supported` gates this before a session is built.

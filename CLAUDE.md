@@ -76,7 +76,8 @@ test builds when it is off, and heavy tests call `test_gate.requireModelFile` /
 
 **Device validation is CLI commands, not unit tests**, because the test binary brings up no
 CUDA context. Each checks kernels against their CPU ops and then a whole forward against the
-CPU forward, exiting non-zero on failure: `sd-cuda-test`, `cuda-dit-test`, `cuda-vae-test`,
+CPU forward, exiting non-zero on failure: `sd-cuda-test`, `cuda-dit-test`, `cuda-bqdec-test`
+(each block-quant weight decode against its CPU replica), `cuda-vae-test`,
 `zimage-cuda-test`, `anima-cuda-test`, `te-test`, plus the `*-bench` commands
 (`anima-cuda-bench`, `anima-vk-bench`, `vk-norm-bench`, `zimage-cuda-bench`).
 
@@ -197,7 +198,7 @@ they support** — a new reader belongs in that shared module the day it is writ
 | int4 convrot | nibble-packed + per-row scale | W4A4 on CUDA; Vulkan has no `sint4`, so it decodes per GEMM to int8 |
 | `asym_w4a8_int8` | 4-bit codebook indices + fp8 per-group scales | decodes to int8 convrot, per GEMM |
 | NVFP4 | E2M1 nibbles + fp8 block scales, swizzled | decodes to bf16, feeds the bf16 GEMM |
-| GGUF block quants (q4_k, q6_k, …) | ggml blocks | **CPU only** — no GPU GEMM exists |
+| GGUF block quants (q4_k, q8_0, …) | ggml blocks | decodes per GEMM to int8 convrot or f16 (`--dit-gguf-gemm`), CUDA arms only |
 
 - Packed weights stay packed and each consumer decodes on demand; materializing at load
   gives back the memory the format saved.
@@ -212,8 +213,10 @@ they support** — a new reader belongs in that shared module the day it is writ
   (SDXL's VAE residual stream, the Flux/Z-Image VAE's attention logits, Z-Image's trunk
   activations). Symptom is a solid white image with no error. Fixes in use: bf16 instead of
   f16, an f32 scores plane, and `residual_act_div` (an exact power-of-two scale across the
-  cast). `sd_vae.Config.act_f16` picks f16 activation storage per architecture, and it is
-  **range** that gates it, not precision.
+  cast). `sd_vae.Config.act_f16` and `sd_unet.Config.act_f16` pick f16 activation storage per
+  architecture, and it is **range** that gates it, not precision. With f16 storage on, every
+  buffer a GEMM reads must be at that width, including ones that are not activations (the SD
+  UNet's text conditioning is a cross-attention GEMM source, so `Session.ctx_d` narrows too).
 
 ## Samplers, schedulers and prompt dialects
 

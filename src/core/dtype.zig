@@ -52,6 +52,7 @@ pub const DType = enum {
     /// dequantization live in quants.zig.
     q4_0, // 32 elems / 18 B: f16 d + 16 B nibbles; v = (nibble - 8) * d
     q8_0, // 32 elems / 34 B: f16 scale + 32 x i8
+    q2_k, // 256 elems / 84 B: 16 B 4-bit scales/mins + 64 B 2-bit quants + f16 d + f16 dmin
     q4_k, // 256 elems / 144 B: f16 d + f16 dmin + 12 B 6-bit scales/mins + 128 B nibbles
     q5_k, // 256 elems / 176 B: q4_k + 32 B high bits
     q6_k, // 256 elems / 210 B: 128 B low nibbles + 64 B high 2-bits + 16 x i8 scales + f16 d
@@ -136,6 +137,7 @@ pub const DType = enum {
             .i4, .w4a8, .nvfp4 => .{ .byte_size = null, .bit_size = 4, .block_elems = 1, .block_bytes = null },
             .q4_0 => .{ .byte_size = null, .bit_size = null, .block_elems = 32, .block_bytes = 18 },
             .q8_0 => .{ .byte_size = null, .bit_size = null, .block_elems = 32, .block_bytes = 34 },
+            .q2_k => .{ .byte_size = null, .bit_size = null, .block_elems = 256, .block_bytes = 84 },
             .q4_k => .{ .byte_size = null, .bit_size = null, .block_elems = 256, .block_bytes = 144 },
             .q5_k => .{ .byte_size = null, .bit_size = null, .block_elems = 256, .block_bytes = 176 },
             .q6_k => .{ .byte_size = null, .bit_size = null, .block_elems = 256, .block_bytes = 210 },

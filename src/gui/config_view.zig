@@ -20,6 +20,9 @@ const SDLBackend = @import("backend");
 // straight into the target PathBuf, then wakes a frame to show it.
 var g_window: ?*SDLBackend.c.SDL_Window = null;
 var g_wakeup: ?*const fn () void = null;
+// Used only to check that a browse start directory exists before handing it to
+// SDL (see `startDir`).
+var g_io: ?std.Io = null;
 // One dialog at a time: the SDL pickers are async (unlike the old blocking
 // tinyfiledialogs call), so without this a second Browse click would stack a
 // second dialog. Cleared in the callback.
@@ -45,6 +48,7 @@ pub fn setEnv(
 ) void {
     g_window = window;
     g_wakeup = wakeup;
+    g_io = io;
     g_primary_cache = model_spec.Cache.init(gpa, io);
     g_te_cache = model_spec.Cache.init(gpa, io);
     g_te2_cache = model_spec.Cache.init(gpa, io);
@@ -638,6 +642,30 @@ fn help(text: []const u8) void {
     tl.addText(text, .{});
 }
 
+fn isDir(path: []const u8) bool {
+    const io = g_io orelse return false;
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    return st.kind == .directory;
+}
+
+/// Where a Browse dialog should open: the folder holding the row's current
+/// value, so re-picking a model starts where the last one came from. Null means
+/// SDL's own default (last used / cwd), which is also what a value that is not
+/// under an existing directory gets, since the field is freely typed and may be
+/// half-written. Every backend takes `default_location` as a FOLDER for an open
+/// dialog (the xdg portal passes it straight through as `current_folder`), so a
+/// file path must be reduced to its parent here.
+fn startDir(buf: []u8, pb: *const config.PathBuf) ?[*:0]const u8 {
+    const p = pb.slice();
+    if (p.len == 0) return null;
+    const dir = if (isDir(p)) p else (std.fs.path.dirname(p) orelse return null);
+    if (dir.len == 0 or dir.len >= buf.len) return null;
+    if (!isDir(dir)) return null;
+    @memcpy(buf[0..dir.len], dir);
+    buf[dir.len] = 0;
+    return @ptrCast(buf.ptr);
+}
+
 fn pathRow(label: []const u8, pb: *config.PathBuf, filters: []const SDLBackend.c.SDL_DialogFileFilter) void {
     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = idFor(label), .expand = .horizontal, .padding = .{ .x = 4, .y = 3 } });
     defer row.deinit();
@@ -652,13 +680,16 @@ fn pathRow(label: []const u8, pb: *config.PathBuf, filters: []const SDLBackend.c
 
     if (dvui.button(@src(), "Browse…", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 4 } }) and !g_dialog_open) {
         g_dialog_open = true;
+        // SDL copies default_location into its own property store, so this
+        // stack buffer only has to live across the call.
+        var dir_buf: [config.max_path]u8 = undefined;
         SDLBackend.c.SDL_ShowOpenFileDialog(
             dialogCallback,
             @ptrCast(pb),
             g_window,
             filters.ptr,
             @intCast(filters.len),
-            null, // default location (null = last used / cwd)
+            startDir(&dir_buf, pb),
             false, // single selection
         );
     }
@@ -682,11 +713,12 @@ fn dirRow(label: []const u8, pb: *config.PathBuf) void {
 
     if (dvui.button(@src(), "Browse…", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 4 } }) and !g_dialog_open) {
         g_dialog_open = true;
+        var dir_buf: [config.max_path]u8 = undefined;
         SDLBackend.c.SDL_ShowOpenFolderDialog(
             dialogCallback,
             @ptrCast(pb),
             g_window,
-            null, // default location
+            startDir(&dir_buf, pb),
             false, // single selection
         );
     }
@@ -734,7 +766,7 @@ fn checkpointPanel(cfg: *config.Config) void {
     const info = switch (probe) {
         .unset => return,
         .failed => |err| {
-            statusFmt(&buf, "⚠ could not read this checkpoint: {t}", .{err}, true);
+            statusFmt(&buf, "could not read this checkpoint: {t}", .{err}, true);
             if (err == error.UnknownArchitecture) statusLine(
                 "  Its tensor names match no architecture this build knows " ++
                     "(supported: krea2 flow-matching DiT, SD1.5 and SDXL UNets).",
@@ -779,13 +811,13 @@ fn checkpointPanel(cfg: *config.Config) void {
         .conditioner2 = te2_set != null,
         .decoder = vae_set != null,
     });
-    if (miss.conditioner) statusLine("⚠ No text encoder: this checkpoint has none, and no override is set.", true);
+    if (miss.conditioner) statusLine("No text encoder: this checkpoint has none, and no override is set.", true);
     if (miss.conditioner2) statusLine(
-        "⚠ No second text encoder: SDXL needs both CLIP towers, this checkpoint " ++
+        "No second text encoder: SDXL needs both CLIP towers, this checkpoint " ++
             "carries only the first, and no override is set.",
         true,
     );
-    if (miss.decoder) statusLine("⚠ No VAE: this checkpoint has none, and no override is set.", true);
+    if (miss.decoder) statusLine("No VAE: this checkpoint has none, and no override is set.", true);
 
     // An override that does not hold what it is being asked for. This is the trap
     // that catches an upgrade in particular: switch the primary checkpoint to a
@@ -798,30 +830,30 @@ fn checkpointPanel(cfg: *config.Config) void {
     // worse failure than a loud one, and the probe names are only a mirror of the
     // pipeline's (see model_spec's advisory note).
     if (te_set) |p| switch (g_te_cache.side(p, info.family)) {
-        .failed => |err| statusFmt(&buf, "⚠ the text encoder override could not be read: {t}", .{err}, true),
+        .failed => |err| statusFmt(&buf, "the text encoder override could not be read: {t}", .{err}, true),
         .ok => |i| if (!i.contents.conditioner) statusFmt(
             &buf,
-            "⚠ the text encoder override holds no {s} text encoder. Clear it, or the load will fail.",
+            "the text encoder override holds no {s} text encoder. Clear it, or the load will fail.",
             .{t.label},
             true,
         ),
         .unset => {},
     };
     if (te2_set) |p| if (t.dual_conditioner) switch (g_te2_cache.side(p, info.family)) {
-        .failed => |err| statusFmt(&buf, "⚠ the second text encoder override could not be read: {t}", .{err}, true),
+        .failed => |err| statusFmt(&buf, "the second text encoder override could not be read: {t}", .{err}, true),
         .ok => |i| if (!i.contents.conditioner2) statusFmt(
             &buf,
-            "⚠ the second text encoder override holds no {s} OpenCLIP tower. Clear it, or the load will fail.",
+            "the second text encoder override holds no {s} OpenCLIP tower. Clear it, or the load will fail.",
             .{t.label},
             true,
         ),
         .unset => {},
     };
     if (vae_set) |p| switch (g_vae_cache.side(p, info.family)) {
-        .failed => |err| statusFmt(&buf, "⚠ the VAE override could not be read: {t}", .{err}, true),
+        .failed => |err| statusFmt(&buf, "the VAE override could not be read: {t}", .{err}, true),
         .ok => |i| if (!i.contents.decoder) statusFmt(
             &buf,
-            "⚠ the VAE override holds no {s} decoder. Clear it, or the load will fail.",
+            "the VAE override holds no {s} decoder. Clear it, or the load will fail.",
             .{t.label},
             true,
         ),
@@ -835,7 +867,7 @@ fn checkpointPanel(cfg: *config.Config) void {
     const want = diffuser.toPipelineBackend(cfg.diff_backend);
     if (!t.supports(want)) statusFmt(
         &buf,
-        "⚠ {s} has no kernels for the {t} backend — pick another below, " ++
+        "{s} has no kernels for the {t} backend — pick another below, " ++
             "or generation will fail to load.",
         .{ t.label, cfg.diff_backend },
         true,

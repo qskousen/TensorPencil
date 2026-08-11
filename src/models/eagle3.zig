@@ -180,8 +180,8 @@ pub const Eagle3Head = struct {
         try be.qkNorm(b.emb, b.embn, try nbuf(be, self.input_norm), rows, hidden, eps);
         try be.qkNorm(b.feat, b.hidn, try nbuf(be, self.hidden_norm), rows, hidden, eps);
         for (0..rows) |r| {
-            try be.opCopyOff(b.cat, r * cat_dim, b.embn, r * hidden, hidden);
-            try be.opCopyOff(b.cat, r * cat_dim + hidden, b.hidn, r * hidden, hidden);
+            try be.opCopyOff(b.cat, r * cat_dim, b.embn, r * hidden, hidden, false);
+            try be.opCopyOff(b.cat, r * cat_dim + hidden, b.hidn, r * hidden, hidden, false);
         }
         try self.linear(b.q, b.cat, self.q, q_dim, cat_dim, rows);
         try self.linear(b.k, b.cat, self.k, kv_dim, cat_dim, rows);
@@ -245,8 +245,8 @@ pub const Eagle3Head = struct {
         try be.qkNorm(b.emb, b.embn, try nbuf(be, self.input_norm), rows, hidden, eps);
         try be.qkNorm(b.feat, b.hidn, try nbuf(be, self.hidden_norm), rows, hidden, eps);
         for (0..rows) |r| {
-            try be.opCopyOff(b.cat, r * cat_dim, b.embn, r * hidden, hidden);
-            try be.opCopyOff(b.cat, r * cat_dim + hidden, b.hidn, r * hidden, hidden);
+            try be.opCopyOff(b.cat, r * cat_dim, b.embn, r * hidden, hidden, false);
+            try be.opCopyOff(b.cat, r * cat_dim + hidden, b.hidn, r * hidden, hidden, false);
         }
         try self.linear(b.q, b.cat, self.q, q_dim, cat_dim, rows);
         try self.linear(b.k, b.cat, self.k, kv_dim, cat_dim, rows);
@@ -266,7 +266,7 @@ pub const Eagle3Head = struct {
         try self.linear(b.t, b.gate, self.down, hidden, intermediate, rows);
         try be.opAdd(b.feat, b.t, rows * hidden);
 
-        try be.opCopyOff(b.node_hidden, first_node * hidden, b.feat, 0, rows * hidden);
+        try be.opCopyOff(b.node_hidden, first_node * hidden, b.feat, 0, rows * hidden, false);
         try self.logitsFromFeat(0, rows);
     }
 
@@ -489,7 +489,7 @@ pub const Eagle3Drafter = struct {
             // fc inputs: pack the 3 tap rows per position into [rows][3*hidden].
             for (0..3) |j| {
                 for (0..rows) |r| {
-                    try be.opCopyOff(head.b.fc_in, r * fused_dim + j * hidden, self.target.tap_d, (j * self.target.capacity + a + r) * hidden, hidden);
+                    try be.opCopyOff(head.b.fc_in, r * fused_dim + j * hidden, self.target.tap_d, (j * self.target.capacity + a + r) * hidden, hidden, false);
                 }
             }
             try head.linear(head.b.feat, head.b.fc_in, head.fc, hidden, fused_dim, rows);
@@ -523,7 +523,7 @@ pub const Eagle3Drafter = struct {
         if (head.len + max_depth > head.capacity) return 0;
 
         // Root: hidden feeds level 1's rollout rows; logits seed the beam.
-        try be.opCopyOff(head.b.node_hidden, 0, head.b.feat, (rows_in_buf - 1) * hidden, hidden);
+        try be.opCopyOff(head.b.node_hidden, 0, head.b.feat, (rows_in_buf - 1) * hidden, hidden, false);
         try head.logitsFromFeat(rows_in_buf - 1, 1);
         try be.tensorDownload(offsetBufSized(head.b.logits, 0, draft_vocab * 4), std.mem.sliceAsBytes(self.logits[0..draft_vocab]));
 
@@ -560,7 +560,7 @@ pub const Eagle3Drafter = struct {
             var level_tokens: [tree_level_cap]u32 = undefined;
             for (level[0..level_n], 0..) |node, r| {
                 level_tokens[r] = tokens[node - 1];
-                try be.opCopyOff(head.b.feat, r * hidden, head.b.node_hidden, node_parent[node] * hidden, hidden);
+                try be.opCopyOff(head.b.feat, r * hidden, head.b.node_hidden, node_parent[node] * hidden, hidden, false);
             }
             try self.uploadEmbeds(level_tokens[0..level_n]);
             // Attention meta: kv_len = grounded prefix + depth; the ancestor

@@ -60,6 +60,17 @@ pub const OP_T: c_int = 1;
 // cublasLtMatmulDescAttributes_t
 pub const DESC_TRANSA: c_int = 3;
 pub const DESC_TRANSB: c_int = 4;
+pub const DESC_EPILOGUE: c_int = 7;
+/// The bias vector length must match D's ROW count, which for our column-major
+/// D[n,m] is `n`, the output channel. Set it before the heuristic runs: cuBLASLt
+/// reads the pointer's value (not its target) to pick the alignment it plans for.
+pub const DESC_BIAS_POINTER: c_int = 8;
+/// Needed when D is f16: the epilogue otherwise expects the bias in D's type, and
+/// ours are f32 per-channel vectors.
+pub const DESC_BIAS_DATA_TYPE: c_int = 26;
+// cublasLtEpilogue_t
+pub const EPILOGUE_DEFAULT: u32 = 1;
+pub const EPILOGUE_BIAS: u32 = 4;
 // cublasLtMatrixLayoutAttribute_t
 pub const LAYOUT_ORDER: c_int = 1;
 pub const LAYOUT_ROWS: c_int = 2;
