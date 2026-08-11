@@ -151,6 +151,11 @@ pub const CudaLM = struct {
     /// (no per-token PCIe re-stream). Forces the per-op decode path, a
     /// captured graph cannot record host compute.
     split: ?Split = null,
+    /// Coordinator-published residency target, polled between prefill chunks so
+    /// a ceiling raised mid-turn takes effect DURING the prefill it was raised
+    /// for rather than after it. The decode loop polls the same target through
+    /// `engine.checkpoint`; prefill never reaches that call. null on the CLI.
+    residency_poll: ?residency.Poll = null,
     arena: std.heap.ArenaAllocator,
 
     /// CPU-resident layers of a hybrid split, with the host-side state they
@@ -1033,6 +1038,7 @@ pub const CudaLM = struct {
         var pos3s: [prefill_chunk * 3]u32 = undefined;
         var off: usize = 0;
         while (off < ids.len) {
+            residency.pollBoundary(self);
             // usize annotation matters: @min with a comptime_int bound yields
             // a range-narrowed type (u7 here), and `n * 3` would overflow it.
             //
@@ -1075,6 +1081,7 @@ pub const CudaLM = struct {
         var off: usize = 0;
         const total = grid_w * grid_h;
         while (off < total) {
+            residency.pollBoundary(self);
             // usize annotation: see prefill (@min narrows its result type).
             const n: usize = @min(@min(debug_image_chunk, prefill_chunk), total - off);
             for (0..n) |t| {

@@ -137,6 +137,11 @@ pub const CudaLM = struct {
     /// offload migrates more to the host as the KV cache grows). null = fully
     /// device-resident. Forces the per-op path (already the gemma3 default).
     split: ?Split = null,
+    /// Coordinator-published residency target, polled between prefill chunks so
+    /// a ceiling raised mid-turn takes effect DURING the prefill it was raised
+    /// for rather than after it. The decode loop polls the same target through
+    /// `engine.checkpoint`; prefill never reaches that call. null on the CLI.
+    residency_poll: ?residency.Poll = null,
     /// half = head_dim/2; the sin table starts at cap.max*half in each freqs
     /// buffer (baked capacity-independent, like qwen3_cuda).
     sin_off: usize,
@@ -882,6 +887,7 @@ pub const CudaLM = struct {
     pub fn prefill(self: *CudaLM, ids: []const u32) !void {
         var off: usize = 0;
         while (off < ids.len) {
+            residency.pollBoundary(self);
             const n: usize = @min(prefill_chunk, ids.len - off);
             try self.embedChunk(ids[off..][0..n], false, null);
             off += n;

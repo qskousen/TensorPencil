@@ -788,6 +788,13 @@ pub const Session = struct {
         // Let the decode loop enact arbiter-published VRAM targets on the worker
         // thread (`self` is heap-pinned, so the captured pointer stays valid).
         self.opts.residency_poll = .{ .ctx = self, .apply = residencyPollThunk };
+        // And the PREFILL chunk loop, which never reaches `engine.checkpoint`.
+        // Without it a ceiling raised because the image model just went idle took
+        // effect only after the prefill it was raised for, so a vision turn ran
+        // its whole slow half on host-resident layers.
+        switch (self.arch) {
+            inline else => |*a| a.model.residency_poll = .{ .ctx = self, .apply = residencyPollThunk },
+        }
 
         self.gpa = gpa;
         self.io = io;
@@ -1121,6 +1128,18 @@ pub const Session = struct {
         };
     }
 
+    /// Free VRAM a forward needs ABOVE steady-state residency, so the ceiling the
+    /// arbiter publishes is one the promote loop can actually fill. Same formula
+    /// `residency.promoteBack` gates on, deliberately: when the two disagree the
+    /// difference is layers stranded on the host, computing on the CPU, while the
+    /// card's real budget goes unspent.
+    fn vpHeadroom(ctx: *anyopaque) u64 {
+        const self = fromCtx(ctx);
+        return switch (self.arch) {
+            inline else => |*a| residency.promoteReserve(&a.model),
+        };
+    }
+
     /// Itemized predicted vs actual residency. Reported rather than merely
     /// summed so a prediction that disagrees with reality is visible instead of
     /// silently becoming a too-low residency ceiling.
@@ -1179,6 +1198,7 @@ pub const Session = struct {
     const vp_vtable: vram.Participant.VTable = .{
         .usage = vpUsage,
         .demand = vpDemand,
+        .headroom = vpHeadroom,
         .floor = vpFloor,
         .busy = vpBusy,
         .applyBudget = vpApply,
@@ -2021,9 +2041,23 @@ pub const Session = struct {
         const n = self.messages.items.len;
         const completed = if (n > 0 and self.messages.items[n - 1].role == .assistant) n - 1 else n;
         if (self.turn_images.items.len > 0 and self.hasVit()) {
+            // A vision turn is the worst case for host-resident layers: the whole
+            // image block goes through prefill, where a CPU layer costs a batched
+            // forward rather than one row. `promoteLayers` reaches the arbiter
+            // itself when the card is full (`residency.promoteBack`), so an idle
+            // image model's cache is no longer an immovable reservation. Report
+            // what is left on the host: a partial promote here is the difference
+            // between seconds and minutes, and it used to be silent.
             switch (self.arch) {
-                inline else => |*a| _ = a.model.promoteLayers(std.math.maxInt(u64)) catch |err|
-                    std.log.warn("promote for image turn failed: {t}", .{err}),
+                inline else => |*a| {
+                    _ = a.model.promoteLayers(std.math.maxInt(u64)) catch |err|
+                        std.log.warn("promote for image turn failed: {t}", .{err});
+                    const s = residency.snapshot(&a.model);
+                    if (s.n_cpu != 0)
+                        std.log.warn("[vram] image turn starting with {d}/{d} layers on the HOST — prefill will run them on the CPU ({d} MiB free)", .{
+                            s.n_cpu, s.n_layers, s.free_mib,
+                        });
+                },
             }
             try self.encodeCurrentImages(&cur_embeds);
             // Record the grids on the current user message so later turns

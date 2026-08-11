@@ -110,12 +110,17 @@ var g_session_mu: std.Io.Mutex = std.Io.Mutex.init;
 // `syncDiffuser`/`freeDiffuser` (UI thread) publish and retract the participant
 // under it, so the worker never dereferences a freed engine.
 //
-// Lock order note: each worker thread takes exactly ONE of these two, the
-// diffusion worker takes g_session_mu to reach the LLM, the LLM worker takes
-// g_diff_mu to reach diffusion, and neither ever asks for the other, so the pair
-// cannot cycle. The UI thread is the only place both are ever held, and never
-// nested. `Diffuser.res_mu` sits below both and is only ever tryLock'd from a
-// foreign thread, so it cannot participate in a cycle either.
+// Lock order: g_session_mu ABOVE g_diff_mu. Nothing may take them the other way.
+//
+// Each worker thread takes exactly one: the diffusion worker takes g_session_mu
+// to reach the LLM, the LLM worker takes g_diff_mu to reach diffusion. The UI
+// thread nests them in that order and only there, via `applyMeterPolicy` ->
+// `Arbiter.rebalance` -> an idle LLM's settle -> `residency.promoteBack`, which
+// asks the image model for card space when its own promote won't fit. That
+// nesting cannot contend with the LLM worker's own `llmForeignReclaim`: `settle`
+// applies directly only while the LLM is idle, and the worker path only runs
+// while it is busy. `Diffuser.res_mu` sits below both and is only ever tryLock'd
+// from a foreign thread, so it cannot participate in a cycle either.
 var g_diff_mu: std.Io.Mutex = std.Io.Mutex.init;
 
 /// on_change: fired every drag-motion frame. The meter already mutated
@@ -1128,10 +1133,16 @@ fn appCoordinator() diffuser.VramCoordinator {
 // pinned so its own eviction ladder reclaims nothing), so the turn died with
 // DeviceOutOfMemory, the "llm sometimes ooms when diffusion is loaded" report.
 //
-// Runs on the LLM WORKER thread, as the last rung of `cuda.Backend`'s OOM ladder.
-// It does NOT take `g_session_mu`: the LLM session cannot be freed underneath its
-// own worker (every teardown path joins the worker first), and taking it here
-// would invert the lock order the diffusion worker uses.
+// Two callers, both of which must be able to reach a peer in another context:
+// the last rung of `cuda.Backend`'s OOM ladder (LLM worker thread), and
+// `residency.promoteBack`, which asks BEFORE allocating, since declining to
+// promote allocates nothing and so can never trigger the OOM ladder on its own
+// behalf. The second reaches here from the UI thread too, under `g_session_mu`;
+// see the lock-order note on `g_diff_mu`.
+//
+// It does NOT take `g_session_mu` itself: the LLM session cannot be freed
+// underneath its own worker (every teardown path joins the worker first), and
+// taking it here would invert that order.
 fn llmForeignReclaim(_: *anyopaque, needed: u64) u64 {
     g_diff_mu.lockUncancelable(g_io);
     defer g_diff_mu.unlock(g_io);
@@ -1382,7 +1393,31 @@ fn maybeRefreshMeterPolicy() void {
     };
     const busy = s.busy();
     defer g_llm_was_busy = busy;
-    if (g_llm_was_busy != busy) applyMeterPolicy();
+    if (g_llm_was_busy != busy) return applyMeterPolicy();
+    retryUnsettledPlan();
+}
+
+/// Throttle for `retryUnsettledPlan`: a lost yield resolves in frames, so a
+/// quarter second between attempts is far more often than it can matter.
+var g_last_retry_ns: i96 = 0;
+
+/// Main-loop hook: re-run a plan a model did not actually enact.
+///
+/// `Diffuser.giveUpToBudget` tryLocks its residency mutex and declines rather
+/// than block a foreign thread, so a yield can be lost to a frame in which the
+/// pump happened to hold it. Nothing noticed: the settle was fire-and-forget and
+/// the next rebalance waits on an external edge that may never come, leaving the
+/// LLM squeezed next to an image model that agreed to shrink and didn't. The
+/// arbiter bounds its own retries, so this cannot spin on a peer that genuinely
+/// has nothing left; the throttle only keeps a lost race off the frame path.
+fn retryUnsettledPlan() void {
+    if (!g_arbiter.unsettled) return;
+    const now = std.Io.Clock.real.now(g_io).nanoseconds;
+    if (now - g_last_retry_ns < 250 * std.time.ns_per_ms) return;
+    g_last_retry_ns = now;
+    g_session_mu.lockUncancelable(g_io);
+    defer g_session_mu.unlock(g_io);
+    _ = g_arbiter.retryUnsettled();
 }
 
 /// Main-loop hook: reap a finished loader, and start a pending (re)load when

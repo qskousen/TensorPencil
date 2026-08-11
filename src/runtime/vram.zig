@@ -312,6 +312,21 @@ pub const Participant = struct {
         /// `limit − llm_usage == diff_usage`, its own residency back, i.e. a
         /// guaranteed no-op, every time. See `Arbiter.plan`.
         demand: *const fn (ctx: *anyopaque) u64,
+        /// Free bytes this model needs ABOVE its steady-state `demand` for the
+        /// transient buffers a forward pass allocates. Not residency: room that
+        /// must stay unclaimed under the model's ceiling so it can actually reach
+        /// full residency.
+        ///
+        /// This exists because a ceiling equal to `demand` is a ceiling the
+        /// promote path cannot fill. `residency.promoteBack` refuses to bring a
+        /// layer back unless its cost PLUS that transient fits underneath, so the
+        /// last layers stay stranded on the host forever, and no allocation ever
+        /// fails, so nothing reactive fires either. How many layers strand is
+        /// `transient / bytes-per-layer`, which on a 1-bit 27B (~60 MiB/layer)
+        /// against a ~1 GiB image-prefill buffer is most of the back half of the
+        /// model, running on the CPU. Diffusion reports 0: it has its own reclaim
+        /// ladder and re-uploads per image.
+        headroom: *const fn (ctx: *anyopaque) u64,
         /// Bytes that cannot be evicted (LLM: committed KV; diffusion: its whole
         /// working set while an image is in flight, since mid-image eviction
         /// would force per-step streaming). The arbiter never targets a model
@@ -330,6 +345,12 @@ pub const Participant = struct {
     }
     pub fn demand(self: Participant) u64 {
         return @max(self.vtable.demand(self.ctx), self.vtable.usage(self.ctx));
+    }
+    /// Steady-state footprint plus the transient a forward allocates on top of
+    /// it: the smallest ceiling under which this model can reach full residency.
+    /// This, not `demand`, is what a plan must leave a model.
+    pub fn claim(self: Participant) u64 {
+        return self.demand() +| self.vtable.headroom(self.ctx);
     }
     pub fn floor(self: Participant) u64 {
         return self.vtable.floor(self.ctx);
@@ -352,16 +373,18 @@ pub const Participant = struct {
     /// model (the qwen3-32B first-message mass-offload bug). A coordinator that
     /// wants a model to yield everything it can targets a small nonzero budget;
     /// the floor clamp keeps that safe.
-    pub fn settle(self: Participant, target: u64) void {
+    pub fn settle(self: Participant, target: u64) Settle {
         if (target == 0) {
             std.log.debug("[vram] settle skipped: zero target (would clamp to floor {d} MiB)", .{self.floor() >> 20});
-            return;
+            return .skipped;
         }
         const clamped = @max(target, self.floor());
         if (clamped != target)
             std.log.debug("[vram] settle target {d} MiB below the committed-KV floor; raised to {d} MiB", .{ target >> 20, clamped >> 20 });
         self.control.requestBudget(clamped);
-        if (!self.busy()) self.vtable.applyBudget(self.ctx, clamped);
+        if (self.busy()) return .deferred;
+        self.vtable.applyBudget(self.ctx, clamped);
+        return if (self.usage() > clamped) .short else .applied;
     }
 
     /// Worker-side: at a safe boundary, enact any pending published ceiling on
@@ -369,6 +392,26 @@ pub const Participant = struct {
     pub fn pollAndApply(self: Participant) void {
         if (self.control.budgetTarget()) |t| self.vtable.applyBudget(self.ctx, t);
     }
+};
+
+/// What a `settle` actually achieved. A settle used to be fire-and-forget, which
+/// hid the one outcome that needs handling: a yield the peer DECLINED.
+/// `Diffuser.giveUpToBudget` tryLocks its residency mutex and returns 0 rather
+/// than block a foreign thread, so a settle that loses that race leaves both
+/// models in exactly the state the plan just rejected, and nothing re-runs it
+/// until the next external edge (a meter drag, a queue edge). `.short` is what
+/// makes that recoverable.
+pub const Settle = enum {
+    /// Applied on this thread; the model is at or under the target.
+    applied,
+    /// The model is busy, so the target is published only; its worker enacts it
+    /// at the next safe boundary. Expected, not a failure.
+    deferred,
+    /// No real target (0). Nothing published, nothing applied.
+    skipped,
+    /// Applied, and the model is STILL above the target: it declined, or it has
+    /// nothing further it is allowed to release. Worth one bounded retry.
+    short,
 };
 
 /// Which model a cross-model request is on behalf of.
@@ -379,12 +422,12 @@ pub const Plan = struct {
     /// Residency CEILING published to the LLM, how much it MAY hold.
     llm: u64,
     diffusion: u64,
-    /// What the LLM actually NEEDS, as opposed to what it is allowed. These differ
-    /// only in the uncontended case, where the ceiling is deliberately the whole
-    /// unclaimed budget while the need stays the model's own demand. Diffusion's
-    /// allowance is computed against the NEED (`diffusionBudget`): the room the LLM
-    /// does not need is claimable, whereas the room it is merely permitted to grow
-    /// into is a soft cap it yields the moment an image queue starts.
+    /// What the LLM actually NEEDS: its steady-state demand PLUS the transient a
+    /// forward allocates on top of it (`Participant.claim`). Differs from the
+    /// ceiling in the uncontended case, where the ceiling is deliberately the
+    /// whole unclaimed budget. Diffusion's allowance is computed against this:
+    /// the room the LLM does not need is claimable, whereas the room it is merely
+    /// permitted to grow into is a soft cap it yields when an image queue starts.
     llm_need: u64,
     /// Which arm of `plan` produced this. Logged, because "why is my model
     /// offloaded" is almost always "a different arm fired than you assumed".
@@ -430,6 +473,18 @@ pub const Arbiter = struct {
     /// unlike the old `diff_used` mirror of `diffusion.usage()`, which was
     /// hand-updated from three call sites and went stale between them.
     diff_active: bool = false,
+    /// The last `rebalance` applied a target a model did not reach (see
+    /// `Settle.short`). Cleared by a rebalance in which everything landed.
+    unsettled: bool = false,
+    /// Consecutive retries of an unsettled plan. Bounded, because `.short` also
+    /// covers "this model has nothing left it is allowed to release", which no
+    /// amount of retrying fixes; reset by every external event.
+    retries: u8 = 0,
+
+    /// Retries beyond which an unsettled plan is treated as the best available
+    /// outcome rather than a lost race. A declined yield is resolved by the
+    /// holder finishing what it is doing, which is frames away, not minutes.
+    const max_retries = 8;
 
     /// Compute both models' residency targets from one snapshot of (demand,
     /// floor) plus the meter's ceiling/split. Pure: reads participants, mutates
@@ -450,16 +505,28 @@ pub const Arbiter = struct {
     ///     token boundary.
     ///  3. Diffusion idle, its residency is *opportunistic cache* (the next
     ///     image re-uploads what it needs), so the LLM has priority and
-    ///     diffusion yields exactly the deficit: `limit − llm_demand`, never
+    ///     diffusion yields exactly the deficit: `limit − llm_claim`, never
     ///     below its own floor, never above what it wants. This is the direction
     ///     that never worked.
     ///
-    /// Each side is clamped into `[floor, demand]`, so a target can neither evict
-    /// something un-evictable nor inflate a model past its footprint.
+    /// Each side is clamped into `[floor, claim]`, so a target can neither evict
+    /// something un-evictable nor inflate a model past what it can use.
+    ///
+    /// The LLM's side is sized by `Participant.claim` (demand PLUS the transient a
+    /// forward allocates), never by demand alone. Demand is an estimate of
+    /// steady-state residency; a ceiling set to it is one the promote path cannot
+    /// fill, which is not an estimate error the model can recover from, it is
+    /// layers left on the CPU with nothing to signal it.
     pub fn plan(self: *const Arbiter) ?Plan {
         if (self.limit == 0) return null;
 
-        const l_dem = if (self.llm) |p| p.demand() else 0;
+        // `claim`, not `demand`, everywhere below. A ceiling equal to demand is a
+        // ceiling `residency.promoteBack` cannot fill: it needs the forward's
+        // transient to fit UNDER the ceiling too, so it stops promoting a whole
+        // transient's worth of layers early and they run on the CPU forever, with
+        // no allocation failing and nothing reactive to fire. See
+        // `Participant.VTable.headroom`.
+        const l_claim = if (self.llm) |p| p.claim() else 0;
         const l_flr = if (self.llm) |p| p.floor() else 0;
         const d_flr = if (self.diffusion) |p| p.floor() else 0;
         // An ACTIVE queue is entitled to the complement of the LLM's guaranteed
@@ -473,8 +540,8 @@ pub const Arbiter = struct {
         // `demand` is an estimate from CHECKPOINT FILE SIZES, which is right when
         // a queue is about to load the pipeline and badly wrong otherwise: a
         // merely-configured diffuser reported ~17 GiB it did not hold, every plan
-        // read as contended, and arm (4) then computed `d = limit - l_dem` and
-        // `l = limit - d`, pinning the LLM's ceiling to EXACTLY its own demand.
+        // read as contended, and arm (4) then computed `d = limit - the LLM's
+        // need` and `l = limit - d`, pinning its ceiling to EXACTLY that need.
         // With no headroom above demand the first transient prefill allocation
         // (measured: a 1.1 GiB dequant buffer) had nowhere to go and OOM'd, which
         // offloaded layers, which is the eviction churn this whole path exists to
@@ -501,13 +568,13 @@ pub const Arbiter = struct {
         // deficit moves. That is a deliberate product call, the split is a
         // contention rule, not a standing reservation, so an idle model never holds
         // VRAM that a working one could use.
-        var out: Plan = if (l_dem + d_dem <= self.limit) blk: {
+        var out: Plan = if (l_claim + d_dem <= self.limit) blk: {
             // (1) Uncontended, both fit. Neither gets a growth-blocking ceiling:
             // the LLM may use everything diffusion does not need.
             //
-            // Emphatically NOT `l_dem`. `Participant.demand` is `max(demand,
-            // usage)`, so handing back the demand pins the ceiling to what the
-            // model already holds, and the first byte of KV growth then trips
+            // Emphatically NOT the LLM's own claim. `Participant.demand` is
+            // `max(demand, usage)`, so handing that back pins the ceiling to what
+            // the model already holds, and the first byte of KV growth then trips
             // `settleTo`'s `deviceUsed() > target` and offloads a layer. Measured
             // on a 12B with nothing else resident: budget 21395 MiB, target 8224,
             // usage 8227, one layer pushed to the host with 13.3 GiB free.
@@ -517,10 +584,10 @@ pub const Arbiter = struct {
             // interactive stall. Diffusion is offered its demand, which is all it
             // can use, and `diffusionBudget` still reports the room the LLM does
             // not NEED, so an image model can still load into it.
-            break :blk .{ .llm = self.limit -| d_dem, .diffusion = d_dem, .llm_need = l_dem, .arm = .uncontended };
+            break :blk .{ .llm = self.limit -| d_dem, .diffusion = d_dem, .llm_need = l_claim, .arm = .uncontended };
         } else if (self.diff_active and l_busy) blk: {
             // (2) BOTH working and over budget, the only case the split decides.
-            const l = clamp(self.llm_share, l_flr, l_dem);
+            const l = clamp(self.llm_share, l_flr, l_claim);
             break :blk .{ .llm = l, .diffusion = clamp(self.limit -| l, d_flr, d_dem), .llm_need = l, .arm = .split };
         } else if (self.diff_active) blk: {
             // (3) Only diffusion is working. It takes what it NEEDS (the `d_want`
@@ -528,13 +595,13 @@ pub const Arbiter = struct {
             // just the deficit instead of being evicted wholesale, that is what
             // keeps the bouncing small. `l_flr` (committed KV) is never taken.
             const d = clamp(self.limit -| l_flr, d_flr, d_want);
-            break :blk .{ .llm = @max(self.limit -| d, l_flr), .diffusion = d, .llm_need = @min(l_dem, self.limit -| d), .arm = .diffusion_only };
+            break :blk .{ .llm = @max(self.limit -| d, l_flr), .diffusion = d, .llm_need = @min(l_claim, self.limit -| d), .arm = .diffusion_only };
         } else blk: {
             // (4) Diffusion idle: its residency is pure cache, so the LLM takes
             // what it needs and diffusion gives the rest back (down to its floor,
             // which is 0 unless an image is mid-flight).
-            const d = clamp(self.limit -| l_dem, d_flr, d_dem);
-            break :blk .{ .llm = @max(self.limit -| d, l_flr), .diffusion = d, .llm_need = @min(l_dem, self.limit -| d), .arm = .llm_only };
+            const d = clamp(self.limit -| l_claim, d_flr, d_dem);
+            break :blk .{ .llm = @max(self.limit -| d, l_flr), .diffusion = d, .llm_need = @min(l_claim, self.limit -| d), .arm = .llm_only };
         };
         // A CEILING is not a grant: never clamp it down to demand. Demand is an
         // estimate of steady-state residency and carries no allowance for the
@@ -588,19 +655,49 @@ pub const Arbiter = struct {
             });
         }
         const llm_shrinks = if (self.llm) |q| p.llm < q.usage() else false;
+        var l_out: Settle = .skipped;
+        var d_out: Settle = .skipped;
         if (llm_shrinks) {
-            if (self.llm) |q| q.settle(p.llm);
-            if (self.diffusion) |q| q.settle(p.diffusion);
+            if (self.llm) |q| l_out = q.settle(p.llm);
+            if (self.diffusion) |q| d_out = q.settle(p.diffusion);
         } else {
-            if (self.diffusion) |q| q.settle(p.diffusion);
-            if (self.llm) |q| q.settle(p.llm);
+            if (self.diffusion) |q| d_out = q.settle(p.diffusion);
+            if (self.llm) |q| l_out = q.settle(p.llm);
         }
+        self.noteOutcome(l_out, d_out);
+    }
+
+    /// Record whether the plan actually landed. A `.short` diffusion settle is
+    /// the interesting one: `giveUpToBudget` declines rather than blocks, so the
+    /// LLM is then left growing into room that was never freed. Nothing else in
+    /// the system notices, which is why it is recorded here.
+    fn noteOutcome(self: *Arbiter, l_out: Settle, d_out: Settle) void {
+        if (l_out != .short and d_out != .short) {
+            self.unsettled = false;
+            self.retries = 0;
+            return;
+        }
+        self.unsettled = true;
+        std.log.info("[vram] plan not fully enacted (llm {t}, diffusion {t}) — retry {d}/{d}", .{
+            l_out, d_out, self.retries + 1, max_retries,
+        });
+    }
+
+    /// Re-run a plan that did not land. Called from the frontend's frame loop;
+    /// returns whether it retried, so a caller can throttle. Bounded: `.short`
+    /// also means "nothing left to release", which retrying cannot fix.
+    pub fn retryUnsettled(self: *Arbiter) bool {
+        if (!self.unsettled or self.retries >= max_retries) return false;
+        self.retries += 1;
+        self.rebalance();
+        return true;
     }
 
     /// Diffusion queue started (`true`) / drained (`false`). Triggers a rebalance
     /// so the LLM starts yielding immediately, before the image model loads.
     pub fn setDiffusionActive(self: *Arbiter, active: bool) void {
         self.diff_active = active;
+        self.retries = 0; // a real event: a fresh budget of retries
         self.rebalance();
     }
 
@@ -608,6 +705,7 @@ pub const Arbiter = struct {
     pub fn setBudgets(self: *Arbiter, limit: u64, llm_share: u64) void {
         self.limit = limit;
         self.llm_share = llm_share;
+        self.retries = 0;
         self.rebalance();
     }
 
@@ -773,7 +871,13 @@ const MockModel = struct {
     /// Footprint if unconstrained. 0 = "whatever I currently hold" (the common
     /// fully-resident case); `Participant.demand` maxes it with `used`.
     want: u64 = 0,
+    /// Transient a forward needs above `want` (real LLMs: ~1 GiB during an image
+    /// prefill). 0 in most tests so their arithmetic stays readable.
+    hdr: u64 = 0,
     floor_b: u64 = 0,
+    /// Refuse `applyBudget` outright, standing in for `giveUpToBudget`'s tryLock
+    /// decline. The target is recorded but residency does not move.
+    declines: bool = false,
     is_busy: bool = false,
     applied: ?u64 = null, // last applyBudget target (null = never applied directly)
     /// applyBudget targets in call order across ALL mocks, for ordering asserts.
@@ -790,6 +894,9 @@ const MockModel = struct {
     fn demandFn(ctx: *anyopaque) u64 {
         return mock(ctx).want;
     }
+    fn headroomFn(ctx: *anyopaque) u64 {
+        return mock(ctx).hdr;
+    }
     fn floorFn(ctx: *anyopaque) u64 {
         return mock(ctx).floor_b;
     }
@@ -800,6 +907,7 @@ const MockModel = struct {
         const m = mock(ctx);
         m.applied = target;
         if (m.has_log) m.var_log.append(std.testing.allocator, .{ .name = m.name, .target = target }) catch {};
+        if (m.declines) return; // the target was seen and ignored, as a tryLock decline is
         // Real participants only ever move toward the target: shrink to it, or
         // grow up to their demand. Mirror that so `used` stays believable.
         if (target < m.used) m.used = @max(target, m.floor_b) else m.used = @min(target, @max(m.want, m.used));
@@ -810,6 +918,7 @@ const MockModel = struct {
     const vtable: Participant.VTable = .{
         .usage = usageFn,
         .demand = demandFn,
+        .headroom = headroomFn,
         .floor = floorFn,
         .busy = busyFn,
         .applyBudget = applyFn,
@@ -823,14 +932,14 @@ test "Participant.settle: idle applies now, busy defers to control point" {
     var m: MockModel = .{ .used = 8 << 30, .floor_b = 1 << 30 };
 
     // Idle: applied directly AND published.
-    m.participant().settle(3 << 30);
+    _ = m.participant().settle(3 << 30);
     try std.testing.expectEqual(@as(?u64, 3 << 30), m.applied);
     try std.testing.expectEqual(@as(?u64, 3 << 30), m.cp.budgetTarget());
 
     // Busy: published only; NOT applied directly (would race the worker's context).
     m.applied = null;
     m.is_busy = true;
-    m.participant().settle(2 << 30);
+    _ = m.participant().settle(2 << 30);
     try std.testing.expectEqual(@as(?u64, null), m.applied);
     try std.testing.expectEqual(@as(?u64, 2 << 30), m.cp.budgetTarget());
 
@@ -841,7 +950,7 @@ test "Participant.settle: idle applies now, busy defers to control point" {
 
 test "Participant.settle: target is clamped up to the floor" {
     var m: MockModel = .{ .used = 8 << 30, .floor_b = 4 << 30 };
-    m.participant().settle(1 << 30); // below floor
+    _ = m.participant().settle(1 << 30); // below floor
     try std.testing.expectEqual(@as(?u64, 4 << 30), m.applied);
     try std.testing.expectEqual(@as(?u64, 4 << 30), m.cp.budgetTarget());
 }
@@ -981,6 +1090,98 @@ test "Arbiter.plan: uncontended, the LLM may grow into free VRAM" {
     // Diffusion is still offered everything the LLM does not NEED, so an image
     // model can load even though the LLM's ceiling is the whole limit.
     try std.testing.expectEqual(@as(u64, 13 << 30), arb.diffusionBudget());
+}
+
+test "Arbiter.plan: an LLM ceiling always leaves room for the forward's transient" {
+    // The stranded-layer bug. Arms 3 and 4 used to compute diffusion's allowance
+    // as `limit - llm_demand` and then hand the LLM back `limit - that`, i.e.
+    // EXACTLY its own demand. `residency.promoteBack` will not promote a layer
+    // unless its cost plus the forward's transient fits under the ceiling, so a
+    // ceiling at bare demand strands `transient / bytes-per-layer` layers on the
+    // host permanently: no allocation fails, so nothing reactive fires, and the
+    // model runs its prefill on the CPU while the image model sits idle.
+    //
+    // Numbers from the reported session: a 1-bit 27B (~6 GiB resident, ~60 MiB a
+    // layer) with a ~1 GiB image-prefill transient, next to a resident krea2.
+    const gib = 1 << 30;
+    var llm: MockModel = .{ .used = 4 * gib, .want = 6 * gib, .hdr = gib, .floor_b = 512 << 20 };
+    var diff: MockModel = .{ .used = 18 * gib, .want = 18 * gib, .floor_b = 0 };
+    var arb: Arbiter = .{
+        .llm = llm.participant(),
+        .diffusion = diff.participant(),
+        .limit = 21 * gib,
+        .llm_share = 15 * gib,
+    };
+    const p = arb.plan().?;
+    // Arm 4 (diffusion idle): the ceiling covers demand AND the transient, so the
+    // promote loop can reach full residency. At bare demand it would be 6 GiB and
+    // the last ~17 layers could never come back.
+    try std.testing.expectEqual(Plan.Arm.llm_only, p.arm);
+    try std.testing.expectEqual(@as(u64, 7 * gib), p.llm);
+    try std.testing.expectEqual(@as(u64, 7 * gib), p.llm_need);
+    // Diffusion gives up exactly that deficit and keeps the rest as cache.
+    try std.testing.expectEqual(@as(u64, 14 * gib), p.diffusion);
+    try std.testing.expect(p.llm + p.diffusion <= arb.limit);
+
+    // Same guarantee once the LLM is working and the split binds (arm 2): the
+    // share is what divides the card, but the clamp above it is the CLAIM, so a
+    // share generous enough for full residency is not silently cut back to demand.
+    llm.is_busy = true;
+    arb.diff_active = true;
+    const p2 = arb.plan().?;
+    try std.testing.expectEqual(Plan.Arm.split, p2.arm);
+    try std.testing.expectEqual(@as(u64, 7 * gib), p2.llm); // clamped to the claim, not to 6
+}
+
+test "Arbiter: a declined yield is recorded and retried, not lost" {
+    // `Diffuser.giveUpToBudget` tryLocks and returns 0 rather than block a foreign
+    // thread. A fire-and-forget settle that lost that race left the LLM growing
+    // into room nobody freed, with no event scheduled to try again.
+    std.testing.log_level = .err; // the retry logs on purpose
+    const gib = 1 << 30;
+    var llm: MockModel = .{ .used = 4 * gib, .want = 6 * gib, .floor_b = 0, .name = "llm" };
+    var diff: MockModel = .{ .used = 18 * gib, .want = 18 * gib, .declines = true, .name = "diff" };
+    var arb: Arbiter = .{
+        .llm = llm.participant(),
+        .diffusion = diff.participant(),
+        .limit = 21 * gib,
+        .llm_share = 15 * gib,
+    };
+    arb.rebalance();
+    try std.testing.expectEqual(@as(u64, 18 * gib), diff.used); // declined
+    try std.testing.expect(arb.unsettled);
+
+    // The frame loop retries, and the moment the peer stops declining it lands.
+    try std.testing.expect(arb.retryUnsettled());
+    diff.declines = false;
+    try std.testing.expect(arb.retryUnsettled());
+    try std.testing.expectEqual(@as(u64, 15 * gib), diff.used);
+    try std.testing.expect(!arb.unsettled);
+    // Nothing to retry once it landed.
+    try std.testing.expect(!arb.retryUnsettled());
+}
+
+test "Arbiter.retryUnsettled: a peer with nothing left to give does not spin" {
+    // `.short` also covers "already at my floor", which no retry can fix. The
+    // budget must run out rather than rebalancing every frame forever.
+    std.testing.log_level = .err;
+    const gib = 1 << 30;
+    var llm: MockModel = .{ .used = 4 * gib, .want = 6 * gib };
+    var diff: MockModel = .{ .used = 18 * gib, .want = 18 * gib, .declines = true };
+    var arb: Arbiter = .{
+        .llm = llm.participant(),
+        .diffusion = diff.participant(),
+        .limit = 21 * gib,
+        .llm_share = 15 * gib,
+    };
+    arb.rebalance();
+    var n: usize = 0;
+    while (arb.retryUnsettled()) n += 1;
+    try std.testing.expectEqual(@as(usize, Arbiter.max_retries), n);
+    // A real event restores the budget (the situation genuinely changed).
+    arb.setDiffusionActive(true);
+    arb.setDiffusionActive(false);
+    try std.testing.expect(arb.retryUnsettled());
 }
 
 test "Arbiter.plan: ceilings never sum past the limit" {
@@ -1153,7 +1354,7 @@ test "Participant.settle: a zero target is ignored, not clamped up to the floor"
     // layer chasing it.
     std.testing.log_level = .err; // the skip logs on purpose; keep a passing run silent
     var m: MockModel = .{ .used = 20 << 30, .floor_b = 384 << 20 };
-    m.participant().settle(0);
+    _ = m.participant().settle(0);
     try std.testing.expectEqual(@as(?u64, null), m.applied);
     try std.testing.expectEqual(@as(?u64, null), m.cp.budgetTarget());
 }

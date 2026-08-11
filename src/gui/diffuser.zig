@@ -1088,6 +1088,13 @@ pub const Diffuser = struct {
         const peak = self.peak_resident.load(.monotonic);
         return if (peak != 0) peak else self.estimateResidentBytes();
     }
+    /// No standing transient reservation. The pipeline sizes each stage against
+    /// live free VRAM and has its own reclaim ladder (`vcReclaim` -> tiling ->
+    /// CPU), so room it needs above its residency it asks for at the time. The
+    /// LLM cannot do that, which is why only the LLM reports headroom.
+    fn vpHeadroom(_: *anyopaque) u64 {
+        return 0;
+    }
     /// Nothing is un-evictable while idle: resident weights are pure cache that
     /// the next image re-uploads. Mid-image the whole working set is the floor,
     /// evicting under a running sampler would force per-step streaming, which soft
@@ -1108,6 +1115,7 @@ pub const Diffuser = struct {
     const vp_vtable: tp.vram.Participant.VTable = .{
         .usage = vpUsage,
         .demand = vpDemand,
+        .headroom = vpHeadroom,
         .floor = vpFloor,
         .busy = vpBusy,
         .applyBudget = vpApply,

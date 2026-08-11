@@ -301,6 +301,11 @@ pub const CudaLM = struct {
     /// layer disables the captured decode graph (migrateLayer drops it; the
     /// step dispatch re-checks per token).
     split: ?Split = null,
+    /// Coordinator-published residency target, polled between prefill chunks so
+    /// a ceiling raised mid-turn takes effect DURING the prefill it was raised
+    /// for rather than after it. The decode loop polls the same target through
+    /// `engine.checkpoint`; prefill never reaches that call. null on the CLI.
+    residency_poll: ?residency.Poll = null,
     /// Io for the host matmuls of a hybrid split's CPU-resident layers; set
     /// by the step entry points, or seeded by the session owner BEFORE the
     /// first forward (tp-gui prefills before any step). null fails the host
@@ -625,6 +630,7 @@ pub const CudaLM = struct {
     pub fn prefill(self: *CudaLM, ids: []const u32) !void {
         var off: usize = 0;
         while (off < ids.len) {
+            residency.pollBoundary(self);
             const n = @min(self.max_rows, ids.len - off);
             try self.stepChunk(ids[off..][0..n], null);
             off += n;

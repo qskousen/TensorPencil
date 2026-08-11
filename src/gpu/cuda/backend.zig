@@ -968,17 +968,27 @@ pub const Backend = struct {
     /// reports 0 once it has nothing evictable left, so a retry loop guarded on
     /// this cannot spin.
     fn foreignReclaim(self: *Backend, needed: u64) bool {
-        const fr = self.foreign_reclaim orelse return false;
+        return self.requestForeignRoom(needed) != 0;
+    }
+
+    /// Ask the coordinator to free `needed` bytes held by another device context
+    /// on this card; returns the bytes it actually freed. Same rung as the OOM
+    /// ladder's last step, reachable WITHOUT an allocation having failed, because
+    /// the residency planner needs it: `residency.promoteBack` declines to promote
+    /// when the card is full, and declining allocates nothing, so the OOM path can
+    /// never fire on its behalf. No hook (the CLI, tp-llm) returns 0.
+    pub fn requestForeignRoom(self: *Backend, needed: u64) u64 {
+        const fr = self.foreign_reclaim orelse return 0;
         const got = fr.call(fr.ctx, needed);
         // The peer's context was made current on this thread to free its memory.
         // Restore ours before the caller retries, or the retry allocates into (or
         // outright fails against) the wrong context.
         self.bindThread();
-        if (got == 0) return false;
+        if (got == 0) return 0;
         std.log.info("[vram] cross-context reclaim: needed {d} MiB, another context freed {d} MiB ({d} MiB now free)", .{
             needed >> 20, got >> 20, self.ctx.memGetInfo().free >> 20,
         });
-        return true;
+        return got;
     }
 
     /// Synchronously drain all deferred-frees (teardown / evictWeights).

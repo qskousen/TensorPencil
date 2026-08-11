@@ -140,6 +140,11 @@ pub const CudaLM = struct {
     /// offload migrates more to the host as the KV cache grows). null = fully
     /// device-resident (gemma4 is per-op already, so nothing else changes).
     split: ?Split = null,
+    /// Coordinator-published residency target, polled between prefill chunks so
+    /// a ceiling raised mid-turn takes effect DURING the prefill it was raised
+    /// for rather than after it. The decode loop polls the same target through
+    /// `engine.checkpoint`; prefill never reaches that call. null on the CLI.
+    residency_poll: ?residency.Poll = null,
 
     /// Which layers a hybrid CPU/GPU split pushes to the host. Gemma4 is
     /// uniform attention (no recurrent layers), so both policies reduce to a
@@ -958,6 +963,7 @@ pub const CudaLM = struct {
     pub fn prefill(self: *CudaLM, ids: []const u32) !void {
         var off: usize = 0;
         while (off < ids.len) {
+            residency.pollBoundary(self);
             const n: usize = @min(prefill_chunk, ids.len - off);
             try self.embedChunk(ids[off..][0..n], .none);
             off += n;
