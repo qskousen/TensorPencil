@@ -1597,6 +1597,15 @@ pub const Family = enum {
     pub fn isSd(self: Family) bool {
         return self == .sd15 or self == .sdxl;
     }
+
+    /// The patch-2 denoisers (krea2, Z-Image, Anima) fold 2x2 latent cells into one
+    /// token, so their latent has to be even; the SD UNets take any latent size.
+    pub fn latentMustBeEven(self: Family) bool {
+        return switch (self) {
+            .krea2, .zimage, .anima => true,
+            .sd15, .sdxl => false,
+        };
+    }
 };
 
 /// krea2: three separate checkpoints (encoder, DiT, VAE).
@@ -3632,7 +3641,18 @@ pub const Session = struct {
     pub fn generate(self: *Session, opts: Options, progress: ?*std.Io.Writer) !Image {
         const gpa = self.gpa;
         const io = self.io;
-        if (opts.width % 16 != 0 or opts.height % 16 != 0) return error.SizeNotMultipleOf16;
+        // A latent pixel is 8 image pixels for every family. Beyond that it is the
+        // DENOISER that constrains: the patch-2 transformers (krea2, Z-Image, Anima)
+        // need an even latent, so 16; the SD UNets take any latent, and their
+        // encoder/decoder already carry the odd case (a level that halves rounding up
+        // leaves a skip one row short of twice its own grid, which is what
+        // `Workspace.skip_hw` exists for). ComfyUI's own resolution presets emit odd
+        // latents routinely (1032x1552 -> 129x194), so rejecting them refused sizes
+        // the model renders correctly.
+        if (opts.width % 8 != 0 or opts.height % 8 != 0) return error.SizeNotMultipleOf8;
+        if (self.family().latentMustBeEven() and (opts.width % 16 != 0 or opts.height % 16 != 0)) {
+            return error.SizeNotMultipleOf16;
+        }
         if (opts.steps < 1) return error.NoSteps;
         // Per-render, not per-session: the GUI snapshots a config per queued image.
         self.compat = opts.compatConfig();
@@ -4078,8 +4098,10 @@ pub const Session = struct {
 /// Used by the CLI and tests; the GUI uses a persistent `Session` across a queue.
 pub fn generate(io: std.Io, gpa: std.mem.Allocator, opts: Options, progress: ?*std.Io.Writer) !Image {
     // Reject invalid dimensions/steps before loading any models (Session.init
-    // maps ~18 GiB of checkpoints); Session.generate re-checks per image.
-    if (opts.width % 16 != 0 or opts.height % 16 != 0) return error.SizeNotMultipleOf16;
+    // maps ~18 GiB of checkpoints). Only the /8 rule is checkable here; the /16 one
+    // depends on the family, which is not known until the denoiser is open, so
+    // `Session.generate` re-checks.
+    if (opts.width % 8 != 0 or opts.height % 8 != 0) return error.SizeNotMultipleOf8;
     if (opts.steps < 1) return error.NoSteps;
     var s = try Session.init(io, gpa, opts, progress);
     defer s.deinit();
@@ -4193,8 +4215,19 @@ test "downsampleLatent box-averages every plane of a non-krea2 latent" {
 test "options validation" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    try std.testing.expectError(error.SizeNotMultipleOf16, generate(io, gpa, .{ .prompt = "x", .width = 100, .height = 96 }, null));
+    // 100 is not a multiple of 8, so this is rejected before any checkpoint opens.
+    // The /16 rule belongs to the patch-2 denoisers and is checked in
+    // `Session.generate`, where the family is known; a size like 1032x1552 (odd
+    // latent) is valid for the SD UNets and only they can say so.
+    try std.testing.expectError(error.SizeNotMultipleOf8, generate(io, gpa, .{ .prompt = "x", .width = 100, .height = 96 }, null));
     try std.testing.expectError(error.NoSteps, generate(io, gpa, .{ .prompt = "x", .steps = 0 }, null));
+}
+
+test "only the patch-2 denoisers require an even latent" {
+    // The distinction the size gate turns on: a 2x2-patch trunk folds four latent
+    // cells into one token and cannot take an odd grid, the SD UNets can.
+    for ([_]Family{ .krea2, .zimage, .anima }) |f| try std.testing.expect(f.latentMustBeEven());
+    for ([_]Family{ .sd15, .sdxl }) |f| try std.testing.expect(!f.latentMustBeEven());
 }
 
 test "vramBreakdown folds only the untagged remainder into latent" {

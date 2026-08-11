@@ -104,7 +104,6 @@ pub const Config = struct {
         return self.channel_mult.len;
     }
 
-
     /// Heads for a stage of `ch` channels.
     pub fn headsAt(self: Config, ch: usize) usize {
         return switch (self.heads) {
