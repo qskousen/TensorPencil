@@ -42,6 +42,7 @@ fn gpuMatmulThunk(
     const c: *gpu_mod.Context = @ptrCast(@alignCast(ctx));
     return c.matmul(y, x, m, w_bytes, dtype_f8, rows, cols, scale, bias);
 }
+const init_defaults = @import("tp_core").init_defaults;
 const tokenizer_mod = @import("tp_core").tokenizer;
 const t5_tokenizer = @import("tp_core").t5_tokenizer;
 const noise_mod = @import("tp_core").noise;
@@ -4154,7 +4155,7 @@ test "the live preview follows the family's own latent format" {
     const rgb = try gpa.alloc(u8, lat_h * lat_w * 3);
     defer gpa.free(rgb);
 
-    var sess: Session = undefined;
+    var sess: Session = init_defaults.of(Session);
     var prev: [5][]u8 = undefined;
     inline for (.{ Family.krea2, Family.sd15, Family.sdxl, Family.zimage, Family.anima }, 0..) |fam, fi| {
         sess.models = switch (fam) {
@@ -4453,7 +4454,7 @@ test "a CFG denoiser needs a negative conditioning" {
     // The two go together; accepting cfg != 1 with no negative cond would
     // dereference null inside the sampling loop.
     const gpa = std.testing.allocator;
-    var sess: Session = undefined;
+    var sess: Session = init_defaults.of(Session);
     sess.gpa = gpa;
     sess.gpu_ctx = null;
     sess.cu_be = null;
@@ -4624,7 +4625,7 @@ test "each family's schedule shift and defaulted component paths are its own" {
     try std.testing.expect(defaultShift(.krea2) != defaultShift(.zimage));
 
     // Only an EXPLICIT request overrides the family's own value.
-    var sess: Session = undefined;
+    var sess: Session = init_defaults.of(Session);
     sess.models = .{ .zimage = undefined };
     try std.testing.expectEqual(@as(f32, 3.0), sess.resolvedShift(.{ .prompt = "" }));
     try std.testing.expectEqual(@as(f32, 1.7), sess.resolvedShift(.{ .prompt = "", .shift = 1.7, .explicit_shift = true }));

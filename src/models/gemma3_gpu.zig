@@ -18,6 +18,7 @@
 //! follow-up, as in qwen35_gpu).
 
 const std = @import("std");
+const init_defaults = @import("tp_core").init_defaults;
 const qwen3 = @import("qwen3.zig");
 const gemma3 = @import("gemma3.zig");
 const gpu = @import("tp_gpu").context;
@@ -121,7 +122,8 @@ pub const VulkanLM = struct {
         errdefer arena.deinit();
         const alloc = arena.allocator();
 
-        var self: VulkanLM = undefined;
+        var self: VulkanLM = init_defaults.of(VulkanLM);
+        // Declared field defaults applied; `= undefined` would skip them (ZIG.md).
         self.ctx = ctx;
         self.lm = lm;
         self.cfg = cfg;

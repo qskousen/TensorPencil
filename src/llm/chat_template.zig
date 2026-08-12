@@ -873,6 +873,91 @@ test "chat_template: real gemma4 GGUF strips prior thoughts from the token strea
     try std.testing.expect(std.mem.indexOf(u8, text, "Hello there!") != null);
 }
 
+// Gemma 4 gates thinking on a `<|think|>` cue that lives in the SYSTEM turn, so
+// the reference template emits a bare system turn holding only the cue when the
+// caller supplied no system message. Miss that and a "thinking" session
+// silently answers directly, with nothing in the output to say why. Thinking
+// OFF is the inverse: no cue, and an empty already-closed thought channel
+// primed at the tail so the model skips straight to the answer.
+test "chat_template: gemma4 thinking cue survives an absent system message" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "/home/qt/genai/lmstudio/models/gemma-4-12b-it-qat-q4_0.gguf";
+    std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
+
+    var g = try Gguf.open(gpa, io, path);
+    defer g.deinit();
+    var tok = try Tokenizer.initFromGguf(gpa, &g);
+    defer tok.deinit();
+    var ct = (try ChatTemplate.fromGguf(gpa, &g)) orelse return error.SkipZigTest;
+    defer ct.deinit();
+
+    const msgs = [_]Message{.{ .role = .user, .content = "Hi" }};
+
+    for ([_]bool{ true, false }) |think| {
+        var ids: std.ArrayList(u32) = .empty;
+        defer ids.deinit(gpa);
+        try ct.renderIds(&tok, gpa, .{
+            .messages = &msgs,
+            .bos_token = "<bos>",
+            .enable_thinking = think,
+        }, &ids);
+        const text = try tok.decodeAlloc(gpa, ids.items);
+        defer gpa.free(text);
+        errdefer std.debug.print("enable_thinking={} rendered:\n{s}\n", .{ think, text });
+
+        const has_cue = std.mem.indexOf(u8, text, "<|think|>") != null;
+        const primed_closed = std.mem.endsWith(u8, text, "<|channel>thought\n<channel|>");
+        try std.testing.expectEqual(think, has_cue);
+        try std.testing.expectEqual(!think, primed_closed);
+    }
+}
+
+// The GUI's "Gemma 4 canonical chat template" option swaps the GGUF's own
+// template for Google's upstream copy, which opens with
+// `{% set enable_thinking = enable_thinking | default(false) %}`. That
+// self-referential set must resolve its right-hand side against the caller's
+// global; read it as the not-yet-bound local and thinking silently INVERTS,
+// because the tail then primes a closed empty thought channel and the model
+// never reasons. The GGUF's own template has no such line, so this path is the
+// only one that can regress here.
+test "chat_template: gemma4 canonical template honors enable_thinking" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "/home/qt/genai/lmstudio/models/gemma-4-12b-it-qat-q4_0.gguf";
+    std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
+
+    var g = try Gguf.open(gpa, io, path);
+    defer g.deinit();
+    var tok = try Tokenizer.initFromGguf(gpa, &g);
+    defer tok.deinit();
+    var ct = try ChatTemplate.gemma4Canonical(gpa);
+    defer ct.deinit();
+
+    const msgs = [_]Message{
+        .{ .role = .system, .content = "You are terse." },
+        .{ .role = .user, .content = "Hi" },
+    };
+
+    for ([_]bool{ true, false }) |think| {
+        var ids: std.ArrayList(u32) = .empty;
+        defer ids.deinit(gpa);
+        try ct.renderIds(&tok, gpa, .{
+            .messages = &msgs,
+            .bos_token = "<bos>",
+            .enable_thinking = think,
+        }, &ids);
+        const text = try tok.decodeAlloc(gpa, ids.items);
+        defer gpa.free(text);
+        errdefer std.debug.print("enable_thinking={} rendered:\n{s}\n", .{ think, text });
+
+        const has_cue = std.mem.indexOf(u8, text, "<|think|>") != null;
+        const primed_closed = std.mem.endsWith(u8, text, "<|channel>thought\n<channel|>");
+        try std.testing.expectEqual(think, has_cue);
+        try std.testing.expectEqual(!think, primed_closed);
+    }
+}
+
 // Regression: Gemma prompts REQUIRE a leading <bos>. The gemma4 tokenizer must
 // populate `tok.bos` (from tokenizer.ggml.bos_token_id) so the render-driven
 // path, which derives the template's `{{ bos_token }}` string from it, emits

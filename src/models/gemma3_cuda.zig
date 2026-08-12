@@ -17,6 +17,7 @@
 //! GEMM; the Gguf mapping must outlive the model.
 
 const std = @import("std");
+const init_defaults = @import("tp_core").init_defaults;
 const gemma3 = @import("gemma3.zig");
 const qwen3 = @import("qwen3.zig");
 const cuda = @import("tp_gpu").cuda;
@@ -198,7 +199,8 @@ pub const CudaLM = struct {
         errdefer arena.deinit();
         const alloc = arena.allocator();
 
-        var self: CudaLM = undefined;
+        var self: CudaLM = init_defaults.of(CudaLM);
+        // Declared field defaults applied; `= undefined` would skip them (ZIG.md).
         self.lm = lm;
         self.be = be;
         self.gpa = gpa;

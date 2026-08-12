@@ -9,6 +9,7 @@
 //! unsupported (recurrent state cannot roll back).
 
 const std = @import("std");
+const init_defaults = @import("tp_core").init_defaults;
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 const qwen35 = @import("qwen35.zig");
 const qwen3 = @import("qwen3.zig");
@@ -196,7 +197,8 @@ pub const CudaLM = struct {
         errdefer arena.deinit();
         const alloc = arena.allocator();
 
-        var self: CudaLM = undefined;
+        var self: CudaLM = init_defaults.of(CudaLM);
+        // Declared field defaults applied; `= undefined` would skip them (ZIG.md).
         self.lm = lm;
         self.be = be;
         self.gpa = gpa;

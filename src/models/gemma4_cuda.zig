@@ -25,6 +25,7 @@
 //!   - Final logits tanh-softcapped + suppress_tokens forced -inf (host-side).
 
 const std = @import("std");
+const init_defaults = @import("tp_core").init_defaults;
 const gemma4 = @import("gemma4.zig");
 const qwen3 = @import("qwen3.zig");
 const cuda = @import("tp_gpu").cuda;
@@ -196,12 +197,8 @@ pub const CudaLM = struct {
         errdefer arena.deinit();
         const alloc = arena.allocator();
 
-        var self: CudaLM = undefined;
-        // `self = undefined` bypasses the fields' `= null` defaults, set them
-        // explicitly (an unset `split` would fault llmResidency; an unset `io`
-        // would be undefined-pointer UB in the host layer path).
-        self.split = null;
-        self.io = null;
+        var self: CudaLM = init_defaults.of(CudaLM);
+        // Declared field defaults applied; `= undefined` would skip them (ZIG.md).
         self.lm = lm;
         self.be = be;
         self.gpa = gpa;
@@ -363,6 +360,17 @@ pub const CudaLM = struct {
     }
     pub fn vocab(self: *const CudaLM) usize {
         return self.cfg.vocab;
+    }
+
+    /// Opts this stepper into `transformer_gpu`'s TP_DUMP_LAYERS tracing. Flip
+    /// to true to bisect a divergence down to the op; the hashes cost a device
+    /// download per traced buffer, so it does not belong on by default.
+    pub const debug_trace = false;
+
+    /// Layers currently resident on the HOST (0 = fully device-resident), for
+    /// recording residency at the moment of a forward rather than after one.
+    pub fn hostLayers(self: *const CudaLM) usize {
+        return if (self.split) |sp| sp.n_cpu else 0;
     }
 
     /// Fixed byte size of a turn checkpoint (see `checkpoint`): every LOCAL
@@ -1090,6 +1098,14 @@ pub const CudaLM = struct {
         const ns: usize = if (seq == 1) nsplit else nsplit_prefill;
         const window: usize = if (cfg.isGlobal(l)) 0 else cfg.sliding_window;
         const ring: usize = if (usesRing(cfg, l)) localRingRows(cfg) else 0;
+        // TP_DUMP_ATTN: the exact shape of every attention call. Two callers
+        // that disagree on the result must first be asked whether they are even
+        // making the same call.
+        if (l == 0 and std.c.getenv("TP_DUMP_ATTN") != null) {
+            std.debug.print("[attn l={d}] len={d} seq={d} heads={d} kv={d} hd={d} ns={d} window={d} ring={d} bidir={} kvfmt={t}\n", .{
+                l, pos0 + 1, seq, cfg.n_heads, cfg.nKv(l), cfg.headDim(l), ns, window, ring, self.bidir_prefill, kvFmt(self.kv_dtype),
+            });
+        }
         try self.be.opAttnDecode(b.q, self.k_cache[l].buf, self.v_cache[l].buf, b.attn, b.attn_scratch, pos0 + 1, seq, cfg.n_heads, cfg.nKv(l), cfg.headDim(l), ns, 1.0, window, ring, self.bidir_prefill, kvFmt(self.kv_dtype));
     }
     pub fn projectO(self: *CudaLM, l: usize, layer: anytype, seq: usize) !void {

@@ -28,6 +28,34 @@
 //!     projectDown(layer, seq)      gate -> t via down_proj
 //!     postFfnNorm(layer, seq)      (sandwich) RMSNorm t before residual
 //!     outScale(layer, seq)         (gemma4) x *= layer.out_scale
+const std = @import("std");
+
+/// TP_DUMP_LAYERS: hash the residual stream after each layer, and layer 0's
+/// sub-steps, so two runs that disagree on a logit can be bisected to the op
+/// that diverged. Read once: this sits on the per-layer path. Only steppers
+/// whose `debug_trace` is true are traced; for the rest the calls fold away.
+var trace_flag: ?bool = null;
+
+/// A stepper opts in with `pub const debug_trace = true`. Gating on the VALUE,
+/// not just the decl, is what makes flipping it to false do what it reads as.
+fn tracedStepper(comptime T: type) bool {
+    if (!@hasDecl(T, "debug_trace")) return false;
+    return T.debug_trace;
+}
+fn traceOn() bool {
+    if (trace_flag) |v| return v;
+    const v = std.c.getenv("TP_DUMP_LAYERS") != null;
+    trace_flag = v;
+    return v;
+}
+
+/// Download `n` f32s of `buf` and print their hash under `tag`.
+fn traceBuf(st: anytype, tag: []const u8, buf: anytype, n: usize) void {
+    const host = st.gpa.alloc(f32, n) catch return;
+    defer st.gpa.free(host);
+    st.be.tensorDownload(buf, std.mem.sliceAsBytes(host)) catch return;
+    std.debug.print("[{s}] hash=0x{x}\n", .{ tag, std.hash.Fnv1a_64.hash(std.mem.sliceAsBytes(host)) });
+}
 
 const transformer = @import("transformer.zig");
 
@@ -38,8 +66,16 @@ pub const Activation = transformer.Activation;
 /// `l` is the layer index (into the KV cache), `seq` the rows this call
 /// forwards, `pos0` the absolute base position for rope / cache append.
 pub fn decoderLayer(comptime spec: LayerSpec, st: anytype, layer: anytype, l: usize, seq: usize, pos0: usize) !void {
+    const trace = (comptime tracedStepper(@TypeOf(st.*))) and traceOn();
+    // Layer 0's "before" is the embedding, so a divergence visible there is
+    // upstream of the whole stack.
+    if (trace and l == 0) traceBuf(st, "embed", st.bufs.x, seq * st.cfg.hidden);
     try decoderLayerQKV(spec, st, layer, l, seq, pos0);
     try decoderLayerAttnMlp(spec, st, layer, l, seq, pos0);
+    if (trace) {
+        var lbl: [24]u8 = undefined;
+        traceBuf(st, std.fmt.bufPrint(&lbl, "layer {d}", .{l}) catch "layer", st.bufs.x, seq * st.cfg.hidden);
+    }
 }
 
 /// First half of a decoder layer: project Q/K/V, norm/rope them, and commit K/V
@@ -51,11 +87,21 @@ pub fn decoderLayerQKV(comptime spec: LayerSpec, st: anytype, layer: anytype, l:
     // The geometry-sensitive ops (q/k/v projections, q/k/v norms) take `l`
     // because per-layer-geometry archs (gemma4) vary head_dim / KV width by
     // layer; uniform archs ignore it.
+    const trace = (comptime tracedStepper(@TypeOf(st.*))) and l == 0 and traceOn();
     try st.normInput(layer, seq);
+    if (trace) traceBuf(st, "sub normed", st.bufs.normed, seq * st.cfg.hidden);
     try st.projectQKV(l, layer, seq);
+    if (trace) {
+        traceBuf(st, "sub q", st.bufs.q, seq * st.cfg.qDim(l));
+        traceBuf(st, "sub k", st.bufs.k, seq * st.cfg.kvDim(l));
+        traceBuf(st, "sub v", st.bufs.v, seq * st.cfg.kvDim(l));
+    }
     try st.normQK(l, layer, seq);
+    if (trace) traceBuf(st, "sub qk_normed_q", st.bufs.q, seq * st.cfg.qDim(l));
     if (comptime spec.v_norm_unit) try st.normV(l, seq);
+    if (trace) traceBuf(st, "sub v_normed", st.bufs.v, seq * st.cfg.kvDim(l));
     try st.applyRope(l, seq, pos0);
+    if (trace) traceBuf(st, "sub roped_q", st.bufs.q, seq * st.cfg.qDim(l));
     try st.appendKV(l, seq, pos0);
 }
 
@@ -64,8 +110,11 @@ pub fn decoderLayerQKV(comptime spec: LayerSpec, st: anytype, layer: anytype, l:
 /// run (K/V committed, `st.q` = rope'd Q).
 pub fn decoderLayerAttnMlp(comptime spec: LayerSpec, st: anytype, layer: anytype, l: usize, seq: usize, pos0: usize) !void {
     // --- Attention ---
+    const trace = (comptime tracedStepper(@TypeOf(st.*))) and l == 0 and traceOn();
     try st.attention(l, seq, pos0);
+    if (trace) traceBuf(st, "sub attn_out", st.bufs.attn, seq * st.cfg.qDim(l));
     try st.projectO(l, layer, seq);
+    if (trace) traceBuf(st, "sub proj_o", st.bufs.t, seq * st.cfg.hidden);
     if (comptime spec.sandwich_norms) try st.postAttnNorm(layer, seq);
     try st.addResidual(seq);
 

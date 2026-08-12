@@ -19,6 +19,7 @@ const safetensors = @import("tp_core").safetensors;
 const ops = @import("tp_ops");
 const spec = @import("../llm/spec.zig");
 const spec_limits = @import("tp_core").spec_limits;
+const init_defaults = @import("tp_core").init_defaults;
 const sample = @import("tp_core").sample;
 const transformer = @import("transformer.zig");
 const transformer_gpu = @import("transformer_gpu.zig");
@@ -484,7 +485,7 @@ pub const VulkanLM = struct {
             if (c.vocab % vocab_chunks != 0) return error.UnsupportedModelConfig;
         }
 
-        var self: VulkanLM = undefined;
+        var self: VulkanLM = init_defaults.of(VulkanLM);
         self.lm = lm;
         self.ctx = ctx;
         self.gpa = gpa;

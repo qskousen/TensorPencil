@@ -1643,7 +1643,7 @@ test "applyTo: a set override is explicit (it outranks a bundled copy)" {
 }
 
 test "loadError/loadedFamily round-trip through their atomic encodings" {
-    var d: Diffuser = undefined;
+    var d: Diffuser = tp.init_defaults.of(Diffuser);
     d.load_error = .init(0);
     d.loaded_family = .init(0);
     try std.testing.expectEqual(@as(?anyerror, null), d.loadError());
@@ -1877,7 +1877,7 @@ test "buildA1111Params names the family's own schedule, and omits it when unknow
 }
 
 test "nextSeed advances deterministically and distinctly" {
-    var d: Diffuser = undefined;
+    var d: Diffuser = tp.init_defaults.of(Diffuser);
     d.seed = 0;
     const a = d.nextSeed();
     const b = d.nextSeed();

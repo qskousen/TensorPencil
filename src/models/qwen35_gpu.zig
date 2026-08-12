@@ -15,6 +15,7 @@ const qwen35 = @import("qwen35.zig");
 const gpu = @import("tp_gpu").context;
 const ops = @import("tp_ops");
 const kvmod = @import("tp_core").kv_cache;
+const init_defaults = @import("tp_core").init_defaults;
 
 /// Map the session KV dtype onto the Vulkan op layer's kernel-format tag.
 fn kvFmt(dt: kvmod.KvDtype) gpu.KvFmt {
@@ -99,7 +100,7 @@ pub const VulkanLM = struct {
         errdefer arena.deinit();
         const alloc = arena.allocator();
 
-        var self: VulkanLM = undefined;
+        var self: VulkanLM = init_defaults.of(VulkanLM);
         self.ctx = ctx;
         self.lm = lm;
         self.cfg = cfg;

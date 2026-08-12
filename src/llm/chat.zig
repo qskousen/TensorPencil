@@ -136,7 +136,17 @@ pub fn isStop(id: u32) bool {
     return id == turn_end or id == pad or (eos != null and id == eos.?);
 }
 
-pub fn appendSystem(tok: *const Tokenizer, gpa: std.mem.Allocator, text: []const u8, out: *std.ArrayList(u32)) !void {
+/// The system turn, or the family's stand-in when there is no system message.
+/// Optional because gemma4 carries its thinking cue at the top of this turn, so
+/// with thinking on and no system text it still needs a bare system turn holding
+/// just the cue — the shape the reference template emits. Taking `?[]const u8`
+/// here rather than adding a second entry point means no caller can pick wrong.
+pub fn appendSystem(tok: *const Tokenizer, gpa: std.mem.Allocator, text_opt: ?[]const u8, out: *std.ArrayList(u32)) !void {
+    // Nothing to emit, so emit nothing -- not even the BOS below. gemma4 with
+    // thinking on is the one case that still wants a turn with no system text
+    // (it holds just the cue); gemma4 with thinking off wants none either.
+    if (text_opt == null and !(family == .gemma4 and enable_thinking)) return;
+    const text = text_opt orelse "";
     try appendBosIfStart(gpa, out);
     switch (family) {
         .chatml => try appendTurn(tok, gpa, "system", text, out),
@@ -150,10 +160,10 @@ pub fn appendSystem(tok: *const Tokenizer, gpa: std.mem.Allocator, text: []const
         },
         .gemma4 => {
             // Gemma 4 has a dedicated system turn (unlike Gemma 3): a full
-            // <|turn>system\n ... <turn|>\n block. In thinking mode the <|think|>
-            // reasoning cue is injected at the very top of it, before the
-            // system content, matching the reference template. The system turn
-            // stands alone, so the next appendUser opens a fresh user turn.
+            // <|turn>system\n ... <turn|>\n block, with the <|think|> cue at the
+            // very top in thinking mode. A turn holding only the cue is the
+            // whole point of the optional text. The turn stands alone, so the
+            // next appendUser opens a fresh user turn.
             try tok.encode(gpa, "<|turn>system\n", out);
             if (enable_thinking) try tok.encode(gpa, "<|think|>\n", out);
             try tok.encode(gpa, text, out);
@@ -455,6 +465,65 @@ test "openAssistant primes an empty reasoning block only when thinking is off" {
     try openAssistant(&tok, gpa, &off);
     try std.testing.expect(off.items.len > on.items.len);
     try std.testing.expectEqualSlices(u32, on.items, off.items[0..on.items.len]);
+}
+
+// The hand-glue fallback (no embedded template) must still emit gemma4's
+// thinking cue when the caller passed no system message, matching the reference
+// template's bare `<|turn>system\n<|think|>\n<turn|>\n`. Gated on the gemma4
+// GGUF for its tokenizer; self-skips when absent.
+test "appendSystem emits gemma4's thinking cue with no system message" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const gguf_mod = @import("tp_core").gguf;
+    const path = "/home/qt/genai/lmstudio/models/gemma-4-12b-it-qat-q4_0.gguf";
+    std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
+
+    var g = try gguf_mod.Gguf.open(gpa, io, path);
+    defer g.deinit();
+    var tok = try Tokenizer.initFromGguf(gpa, &g);
+    defer tok.deinit();
+
+    // applyTokenizer, not just setFamily: it is what populates `bos_token`, and
+    // the thinking-off half below asserts that NOTHING is emitted, BOS included.
+    // Without it that assertion holds for the wrong reason. Restore every global
+    // it touches so later tests still see the chatml/Qwen defaults.
+    const saved_turn_end = turn_end;
+    const saved_pad = pad;
+    const saved_newline = newline;
+    const saved_bos = bos_token;
+    const saved_eos = eos;
+    const saved_family = family;
+    const saved_thinking = enable_thinking;
+    defer {
+        turn_end = saved_turn_end;
+        pad = saved_pad;
+        newline = saved_newline;
+        bos_token = saved_bos;
+        eos = saved_eos;
+        setFamily(saved_family);
+        setThinking(saved_thinking);
+    }
+    applyTokenizer(&tok);
+    setFamily(.gemma4);
+    try std.testing.expect(bos_token != null); // else the second half is vacuous
+
+    // Thinking on, no system message: the cue still reaches the prompt.
+    setThinking(true);
+    var on: std.ArrayList(u32) = .empty;
+    defer on.deinit(gpa);
+    try appendSystem(&tok, gpa, null, &on);
+    const on_txt = try tok.decodeAlloc(gpa, on.items);
+    defer gpa.free(on_txt);
+    errdefer std.debug.print("thinking-on render: {s}\n", .{on_txt});
+    try std.testing.expect(std.mem.indexOf(u8, on_txt, "<|think|>") != null);
+
+    // Thinking off, no system message: nothing at all (the assistant open
+    // primes the closed thought channel instead).
+    setThinking(false);
+    var off: std.ArrayList(u32) = .empty;
+    defer off.deinit(gpa);
+    try appendSystem(&tok, gpa, null, &off);
+    try std.testing.expectEqual(@as(usize, 0), off.items.len);
 }
 
 // Gemma turn building (family = gemma) must match one-shot tokenization of

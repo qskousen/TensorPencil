@@ -4,6 +4,7 @@
 
 const std = @import("std");
 
+pub const init_defaults = @import("tp_core").init_defaults;
 pub const dtype = @import("tp_core").dtype;
 pub const tensor = @import("tp_core").tensor;
 pub const safetensors = @import("tp_core").safetensors;

@@ -15,6 +15,7 @@
 //! CPU/GPU layer split (--cpu-layers / --offload-grow).
 
 const std = @import("std");
+const init_defaults = @import("tp_core").init_defaults;
 const qwen3 = @import("qwen3.zig");
 const cuda = @import("tp_gpu").cuda;
 const safetensors = @import("tp_core").safetensors;
@@ -355,7 +356,8 @@ pub const CudaLM = struct {
             else => return error.UnsupportedModelConfig,
         }
         const c = lm.cfg;
-        var self: CudaLM = undefined;
+        var self: CudaLM = init_defaults.of(CudaLM);
+        // Declared field defaults applied; `= undefined` would skip them (ZIG.md).
         self.lm = lm;
         self.be = be;
         self.gpa = gpa;

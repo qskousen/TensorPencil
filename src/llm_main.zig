@@ -492,7 +492,7 @@ fn runQwen3(
     if (prompt) |p| {
         try appendOneShotPrompt(&tok, gpa, system, p, &ids);
     } else if (llm.chat_template.active == null) {
-        if (system) |s| try llm.chat.appendSystem(&tok, gpa, s, &ids);
+        try llm.chat.appendSystem(&tok, gpa, system, &ids);
     }
 
     // Vulkan reserves the whole KV window up front (no growable buffers), so
@@ -777,7 +777,7 @@ fn appendOneShotPrompt(
             .tools = llm.chat_template.tools,
         }, ids);
     } else {
-        if (system) |s| try llm.chat.appendSystem(tok, gpa, s, ids);
+        try llm.chat.appendSystem(tok, gpa, system, ids);
         try llm.chat.appendUser(tok, gpa, prompt, ids);
         try llm.chat.openAssistant(tok, gpa, ids);
     }
@@ -1625,7 +1625,7 @@ fn runQwen35(
     // For an image one-shot, the tokens before/after the embedding block are
     // tracked so prefill can interleave them with prefillImage.
     var n_pre: usize = 0;
-    if (system) |s| try llm.chat.appendSystem(&tok, gpa, s, &ids);
+    try llm.chat.appendSystem(&tok, gpa, system, &ids);
     if (img) |*e| {
         try tok.encode(gpa, "<|im_start|>user\n<|vision_start|>", &ids);
         n_pre = ids.items.len;
@@ -1877,7 +1877,7 @@ fn runGemma3(
         try tok.encode(gpa, "<end_of_turn>\n", &ids);
         try llm.chat.openAssistant(&tok, gpa, &ids);
     } else {
-        if (system) |s| try llm.chat.appendSystem(&tok, gpa, s, &ids);
+        try llm.chat.appendSystem(&tok, gpa, system, &ids);
         if (prompt) |p| {
             try llm.chat.appendUser(&tok, gpa, p, &ids);
             try llm.chat.openAssistant(&tok, gpa, &ids);
@@ -2069,7 +2069,7 @@ fn runGemma4(
         try tok.encode(gpa, "<turn|>\n", &ids);
         try llm.chat.openAssistant(&tok, gpa, &ids);
     } else {
-        if (system) |s| try llm.chat.appendSystem(&tok, gpa, s, &ids);
+        try llm.chat.appendSystem(&tok, gpa, system, &ids);
         if (prompt) |p| {
             try llm.chat.appendUser(&tok, gpa, p, &ids);
             try llm.chat.openAssistant(&tok, gpa, &ids);

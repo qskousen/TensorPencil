@@ -158,6 +158,8 @@ pub const Variant = struct {
     images: std.ArrayList(*GenImage) = .empty,
     /// Set once the completed variant has been scanned for image tool calls.
     images_scanned: bool = false,
+    /// Set once the completed variant's raw text has been dumped (TP_DUMP_REPLY).
+    reply_dumped: bool = false,
     /// Whether the prompt this variant was generated from already had the
     /// reasoning block OPEN (the render-driven template primes
     /// `...assistant\n<think>\n`), so the text starts inside the thought and only
@@ -391,6 +393,38 @@ pub const Options = struct {
 /// turn can produce. The engine's loop bound stays a plain `usize` either way.
 fn resolveMaxNew(cfg_max_new: usize, max_context: usize) usize {
     return if (cfg_max_new == 0) max_context else cfg_max_new;
+}
+
+/// Map the GUI's KV-dtype enum onto the library's. Same field names, explicit so
+/// adding a variant is a compile error until both sides agree.
+pub fn toKvDtype(d: config.KvDtype) kv_cache.KvDtype {
+    return switch (d) {
+        .f32 => .f32,
+        .f16 => .f16,
+        .q8_0 => .q8_0,
+    };
+}
+
+/// The full `Options` a config implies. One builder, so the app and any
+/// headless driver cannot drift apart on a field.
+pub fn sessionOptions(arena: std.mem.Allocator, cfg: *const config.Config, seed: u64) !Options {
+    return .{
+        .model_path = try arena.dupe(u8, cfg.llm_model.opt() orelse return error.NoModelConfigured),
+        .system_prompt = try arena.dupe(u8, cfg.system_prompt.opt() orelse config.default_system_prompt),
+        .seed = seed,
+        .sampling = samplingParams(cfg),
+        .backend = diffuser.toPipelineBackend(cfg.llm_backend),
+        .images_enabled = cfg.diffusion_model.opt() != null,
+        .mmproj_path = if (cfg.vision_tower.opt()) |m| try arena.dupe(u8, m) else null,
+        .vram_split = cfg.vram_split,
+        .vram_limit_frac = cfg.vram_limit_frac,
+        .reasoning = cfg.reasoning,
+        .kv_dtype = toKvDtype(cfg.kv_dtype),
+        .regen_cache_mb = cfg.regen_cache_mb,
+        .max_new_tokens = cfg.max_new_tokens,
+        .vision_budget_tokens = cfg.vision_budget.tokens(),
+        .gemma4_canonical_template = cfg.gemma4_canonical_template,
+    };
 }
 
 /// Map the GUI's engine-free `config.Sampling` onto the library's
@@ -905,6 +939,14 @@ pub const Session = struct {
         return self;
     }
 
+    /// Rewind the per-turn sampling seed stream to `seed`. `reset` deliberately
+    /// leaves it running, so two chats never sample alike; a caller that needs
+    /// the opposite (chat-probe's `--repeat`, comparing two runs of the same
+    /// messages) has to ask for it.
+    pub fn reseed(self: *Session, seed: u64) void {
+        self.seeds = sample.SeedSeq.init(seed);
+    }
+
     /// Start a fresh conversation (KV + transcript reset, LLM residency re-armed).
     /// CONTRACT: the caller must first stop the app-level diffusion engine (join
     /// its worker) so no diffusion thread is still touching a transcript GenImage
@@ -1369,6 +1411,18 @@ pub const Session = struct {
 
     pub fn busy(self: *Session) bool {
         return self.generating.load(.acquire);
+    }
+
+    /// A turn is staged but not running: `submit` accepted it and `spawnWorker`
+    /// deferred it at the pause gate. Its empty assistant message is already in
+    /// the transcript, so anything waiting for a reply must treat this as
+    /// unfinished instead of reading that message.
+    ///
+    /// `turn_staged` is cleared on the worker thread (freeTurn), so only read it
+    /// when `busy()` is false: then either no worker exists yet or the worker's
+    /// release store to `generating` has published the clear.
+    pub fn turnPending(self: *Session) bool {
+        return !self.busy() and self.turn_staged;
     }
 
     pub fn visionEnabled(self: *const Session) bool {
@@ -2574,13 +2628,38 @@ pub const Session = struct {
     /// transcript, using the app-level engine's defaults + seed. Called by the
     /// app after `poll` (chat mode). The app then pumps the engine.
     pub fn scanNewImages(self: *Session, d: *diffuser.Diffuser) void {
-        if (!self.images_enabled or self.busy() or self.messages.items.len == 0) return;
+        if (self.busy() or self.messages.items.len == 0) return;
         const last = &self.messages.items[self.messages.items.len - 1];
         if (last.role != .assistant) return;
         const v = last.active();
-        if (v.images_scanned) return;
+        if (!v.reply_dumped) {
+            v.reply_dumped = true;
+            dumpReply(v);
+        }
+        if (!self.images_enabled or v.images_scanned) return;
         v.images_scanned = true;
         self.scanImageCalls(v, d) catch |err| std.log.err("scan image calls: {t}", .{err});
+    }
+
+    /// TP_DUMP_REPLY: print a finished variant's RAW text once, markers and all,
+    /// before the display splits the reasoning block out. The only way to tell a
+    /// model that never opened a thought from one whose thought the split missed,
+    /// since both render as a bare answer. Pairs with TP_DUMP_CTX, which shows
+    /// the prompt the text was generated from.
+    fn dumpReply(v: *const Variant) void {
+        if (getenv("TP_DUMP_REPLY") == null) return;
+        std.log.info("[reply] {d} bytes, thought_len={d}, thought_primed={}, raw:\n{s}\n[reply] end", .{
+            v.text.items.len, thoughtLen(v), v.thought_primed, v.text.items,
+        });
+    }
+
+    /// Characters of reasoning in a finished variant. Goes through
+    /// `toolcall.splitThought` so it honors `thought_primed`: on a primed render
+    /// the text starts INSIDE the block and never emits the open marker, which a
+    /// hand-rolled open/close scan reports as "no reasoning".
+    pub fn thoughtLen(v: *const Variant) usize {
+        const s2 = toolcall.splitThought(v.text.items, reasoningMarkers(), v.thought_primed);
+        return if (s2.think) |t| std.mem.trim(u8, t, " \t\r\n").len else 0;
     }
 
     /// The active family's reasoning-block markers as `toolcall.Reasoning`

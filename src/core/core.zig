@@ -9,6 +9,7 @@
 //! scheduler (`sampler`), Torch RNG, speculative-decode size limits, and the
 //! profiling helper.
 
+pub const init_defaults = @import("init_defaults.zig");
 pub const dtype = @import("dtype.zig");
 pub const tensor = @import("tensor.zig");
 pub const quants = @import("quants.zig");

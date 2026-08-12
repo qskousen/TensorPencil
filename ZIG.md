@@ -434,3 +434,29 @@ try std.testing.expect(max_err < 5e-3);
 The print then lands inside the real failure report where it's useful.
 (`ZIG_BUILD_ERROR_STYLE=minimal` only hides the `failed command:` line,
 not the stderr dump — fix the test, not the env.)
+
+## `var x: T = undefined` bypasses EVERY field default
+
+A struct's `field: T = default` only runs for struct-literal initialization. A
+value declared `undefined` and then filled field-by-field keeps garbage in every
+field the code forgets to assign.
+
+```zig
+const LM = struct {
+    lm: *const Model,
+    bidir_prefill: bool = false, // NOT applied below
+};
+
+var self: LM = undefined;
+self.lm = lm;                    // bidir_prefill is now whatever was on the stack
+```
+
+The garbage is a plausible value, not a crash: an unset `bidir_prefill` ran TEXT
+prefill under the image block's bidirectional attention mask in about half of
+all processes, and the model stopped reasoning. It is invisible to buffer
+zeroing and to compute-sanitizer (the field is a host struct member), and stable
+under `setarch -R`, which is the signature of an uninitialised SCALAR.
+
+Use `core/init_defaults.zig` (`tp_core.init_defaults`): `var self: T = init_defaults.of(T)` applies every
+declared default and leaves the rest undefined, so an init keeps its
+field-by-field shape without the class of bug.

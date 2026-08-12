@@ -827,6 +827,49 @@ fn configuredSupportsThinking() bool {
     return g_think_probe_result;
 }
 
+/// TP_AUTO_MESSAGE: send one message through the REAL app path as soon as a
+/// session exists, then exit once it finishes. `chat-probe` drives the session
+/// directly and so misses everything the app wraps around it (the diffuser, the
+/// VRAM arbiter, per-frame `updateSettings`); this reproduces a turn with all of
+/// that in place, and pairs with TP_DUMP_REPLY to show what was generated.
+/// Run it with no display (`DISPLAY= SDL_VIDEODRIVER=dummy`) so no window opens.
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+var g_auto_sent: bool = false;
+fn autoMessage() void {
+    const msg_z = getenv("TP_AUTO_MESSAGE") orelse return;
+    if (!g_auto_sent) {
+        g_auto_sent = true;
+        // Same entry point the send button uses. The button can afford to drop a
+        // message on the floor; here there is no one to notice, so a refusal has
+        // to be loud, otherwise the harness spins until it is killed.
+        if (!submitChat(std.mem.span(msg_z))) {
+            std.log.err("[auto] message went nowhere (empty, no llm_model configured, or session refused it)", .{});
+            std.process.exit(2);
+        }
+        return;
+    }
+    // Done when the deferred submit has been consumed and the turn is finished.
+    if (g_pending_submit != null or g_loading.load(.acquire)) return;
+    const s = g_session orelse return;
+    // turnPending: a turn queued behind the pause gate has its empty assistant
+    // message in the transcript already, and dumping that as the reply would
+    // report a 0-byte success.
+    if (s.busy() or s.turnPending() or s.messages.items.len == 0) return;
+    const last = &s.messages.items[s.messages.items.len - 1];
+    if (last.role != .assistant) return;
+    // Dump here rather than leaning on scanNewImages: this hook runs at the top
+    // of the frame, so the process would exit before that ever fired.
+    const v = last.activeConst();
+    const sp = s.opts.sampling;
+    std.log.info("[sampling] temp={d:.3} top_k={d} top_p={d:.4} min_p={d:.3} rp={d:.3} rln={d}", .{
+        sp.temperature, sp.top_k, sp.top_p, sp.min_p, sp.repeat_penalty, sp.repeat_last_n,
+    });
+    std.log.info("[reply] {d} bytes, thought_len={d}\n{s}\n[reply] end", .{
+        v.text.items.len, chat.Session.thoughtLen(v), v.text.items,
+    });
+    std.process.exit(0);
+}
+
 /// Read the configured GGUF's architecture and map it to reasoning support.
 /// Any failure (missing/unreadable file, unknown arch) -> false.
 fn probeThinking(path: []const u8) bool {
@@ -899,6 +942,8 @@ fn tryPasteClipboardImage() bool {
 }
 
 fn frame() void {
+    autoMessage(); // TP_AUTO_MESSAGE; before any early return so it always runs
+
     var root = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both, .background = true });
     defer root.deinit();
 
@@ -1321,7 +1366,7 @@ fn applyConfig() void {
             g_reload_requested = true; // transcript-preserving (see loaderMain)
         } else if (!g_loading.load(.acquire)) {
             g_session.?.updateSettings(&g_config); // reasoning / VRAM priority, live
-            if (ctx_reload) g_session.?.rebuildContext(toKvDtype(g_config.kv_dtype)) catch |err|
+            if (ctx_reload) g_session.?.rebuildContext(chat.toKvDtype(g_config.kv_dtype)) catch |err|
                 std.log.err("kv-dtype context rebuild failed: {t}", .{err});
         }
     }
@@ -1598,33 +1643,8 @@ fn finishLoad(err: ?anyerror) void {
 /// itself is app-level). Paths are duped into `arena` so the session never
 /// aliases the live config edit buffers.
 fn buildSession(arena: std.mem.Allocator) !*chat.Session {
-    const llm = g_config.llm_model.opt().?;
-    const mmproj: ?[]const u8 = if (g_config.vision_tower.opt()) |m| try arena.dupe(u8, m) else null;
-    const system_prompt = g_config.system_prompt.opt() orelse config.default_system_prompt;
-
-    const s = try chat.Session.init(arena, g_gpa, g_io, wakeupFrame, .{
-        .model_path = try arena.dupe(u8, llm),
-        .system_prompt = try arena.dupe(u8, system_prompt),
-        .seed = @truncate(@as(u96, @bitCast(std.Io.Clock.real.now(g_io).nanoseconds))),
-        .sampling = chat.samplingParams(&g_config),
-        .backend = diffuser.toPipelineBackend(g_config.llm_backend),
-        .images_enabled = hasDiffModel(&g_config),
-        .mmproj_path = mmproj,
-        .vram_split = g_config.vram_split,
-        .vram_limit_frac = g_config.vram_limit_frac,
-        .reasoning = g_config.reasoning,
-        .kv_dtype = toKvDtype(g_config.kv_dtype),
-        .regen_cache_mb = g_config.regen_cache_mb,
-        .max_new_tokens = g_config.max_new_tokens,
-        .vision_budget_tokens = g_config.vision_budget.tokens(),
-        .gemma4_canonical_template = g_config.gemma4_canonical_template,
-    });
-    // Let this LLM's OOM ladder reach the image model's device context as its last
-    // rung (see llmForeignReclaim). Installed on the session's own backend, the
-    // same instance the stepper allocates through (`be` is a pointer), as soon as
-    // it exists, so it also covers device work done before the session is
-    // published. It dies with the session, so it can never outlive the arbiter
-    // entry `loaderMain` adds.
+    const seed: u64 = @truncate(@as(u96, @bitCast(std.Io.Clock.real.now(g_io).nanoseconds)));
+    const s = try chat.Session.init(arena, g_gpa, g_io, wakeupFrame, try chat.sessionOptions(arena, &g_config, seed));
     s.be.foreign_reclaim = .{ .ctx = undefined, .call = llmForeignReclaim };
     return s;
 }
@@ -1640,14 +1660,6 @@ fn applyWeightRead(w: config.WeightRead) void {
         .pread => .pread,
         .mmap => .mmap,
         .buffered => .buffered,
-    };
-}
-
-fn toKvDtype(d: config.KvDtype) tp.llm.kv_cache.KvDtype {
-    return switch (d) {
-        .f32 => .f32,
-        .f16 => .f16,
-        .q8_0 => .q8_0,
     };
 }
 
@@ -2431,7 +2443,7 @@ fn renderInput(s: ?*chat.Session) void {
         if (std.mem.eql(u8, std.mem.trim(u8, buf[0..n], " \t\r\n"), "/new")) {
             newChat();
         } else {
-            submitChat(buf[0..n]);
+            _ = submitChat(buf[0..n]);
         }
         @memset(&g_input_buf, 0);
     }
@@ -2440,20 +2452,31 @@ fn renderInput(s: ?*chat.Session) void {
 /// Send a chat message. If the LLM is resident, submit directly. Otherwise
 /// (lazy first chat) stash the text and kick a load; `maybeStartReload`
 /// auto-submits it once the model is live.
-fn submitChat(text: []const u8) void {
+///
+/// Returns false when the message went nowhere (empty after trimming, no model
+/// configured, the session refused it, allocation failed). The button ignores
+/// that -- the text stays in the box and the user sees nothing happen -- but a
+/// headless driver has no such feedback and would otherwise wait forever.
+fn submitChat(text: []const u8) bool {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
-    if (trimmed.len == 0) return;
+    if (trimmed.len == 0) return false;
     // Never touch the session while a (re)load is in flight, the loader thread is
     // freeing/rebuilding it. Submit only when it's live; otherwise stash the text
     // and the load-completion path (maybeStartReload) auto-submits it.
     if (!g_loading.load(.acquire)) if (g_session) |s| {
-        s.submit(trimmed) catch |err| std.log.err("submit failed: {t}", .{err});
-        return;
+        s.submit(trimmed) catch |err| {
+            std.log.err("submit failed: {t}", .{err});
+            return false;
+        };
+        // submit itself no-ops on a turn already in flight or queued.
+        return s.busy() or s.turnPending();
     };
-    if (g_config.llm_model.opt() == null) return; // no model to load
+    if (g_config.llm_model.opt() == null) return false; // no model to load
     if (g_pending_submit) |p| g_gpa.free(p);
     g_pending_submit = g_gpa.dupe(u8, trimmed) catch null;
+    if (g_pending_submit == null) return false; // nothing stashed, so don't reload for it
     if (!g_loading.load(.acquire)) g_reload_requested = true; // else the in-flight load will pick it up
+    return true;
 }
 
 /// The › (regenerate) button was hit while the LLM is unloaded: lazy-load it and

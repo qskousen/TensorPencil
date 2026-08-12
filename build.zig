@@ -541,6 +541,40 @@ pub fn build(b: *std.Build) void {
         }
     }
 
+    // chat-probe: run a tp-gui chat.Session headlessly and print the raw reply.
+    // The GUI session is UI-independent, so a bug that only reproduces there can
+    // be observed without the window taking over the screen and the GPU. Needs
+    // no dvui/SDL, only what the gui chat tests need.
+    // `zig build chat-probe -- --config <copy> --message <text>`
+    {
+        const cp_step = b.step("chat-probe", "Run a tp-gui chat session headlessly and dump the raw reply");
+        if (b.lazyDependency("known_folders", .{})) |kf| {
+            const cp_exe = b.addExecutable(.{
+                .name = "chat-probe",
+                .use_llvm = use_llvm,
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/gui/chat_probe.zig"),
+                    .link_libc = true,
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "TensorPencil", .module = mod },
+                        .{ .name = "known-folders", .module = kf.module("known-folders") },
+                    },
+                }),
+            });
+            // Installed as well as run, so a tool that must wrap the binary
+            // (compute-sanitizer, gdb) has a stable path built by THIS build
+            // rather than a stale glob under .zig-cache.
+            const cp_install = b.addInstallArtifact(cp_exe, .{});
+            cp_step.dependOn(&cp_install.step);
+            const cp_run = b.addRunArtifact(cp_exe);
+            cp_run.step.dependOn(&cp_install.step);
+            if (b.args) |args| cp_run.addArgs(args);
+            cp_step.dependOn(&cp_run.step);
+        }
+    }
+
     // embed-bench: throughput profiler for the tp.embed encoders (per-item vs
     // batched forwards, DIFFKEEP.md M8). Only needs the TensorPencil module +
     // a device for the GPU backends. `zig build embed-bench -- [opts]`.

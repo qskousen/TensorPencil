@@ -22,6 +22,7 @@ const safetensors = @import("tp_core").safetensors;
 const ops = @import("tp_ops");
 const spec = @import("../llm/spec.zig");
 const spec_limits = @import("tp_core").spec_limits;
+const init_defaults = @import("tp_core").init_defaults;
 const chat = @import("../llm/chat.zig");
 const sample = @import("tp_core").sample;
 
@@ -102,7 +103,7 @@ pub const Eagle3Head = struct {
         errdefer arena.deinit();
         const alloc = arena.allocator();
 
-        var self: Eagle3Head = undefined;
+        var self: Eagle3Head = init_defaults.of(Eagle3Head);
         self.be = be;
         self.embed_bytes = target.embed.bytes;
         self.capacity = capacity;

@@ -7,6 +7,29 @@ const test_gate = @import("../test_gate.zig");
 const tokenizer_mod = @import("tp_core").tokenizer;
 const ops = @import("tp_ops");
 const chat = @import("chat.zig");
+
+/// Debug-only environment reads, for diagnosing a divergence between two
+/// callers of this loop. POSIX-only by design; on Windows they read as unset
+/// so the diagnostic simply does not arm.
+fn debugEnvUint(name: [*:0]const u8) usize {
+    const v = std.c.getenv(name) orelse return 0;
+    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0;
+}
+
+/// TP_DUMP_LOGITS=N: print the top-8 raw logits (pre-penalty, pre-sampler) for
+/// the first N decode steps. Two callers that build the same prompt must reach
+/// the same logits here; when they do not, this is where it shows.
+fn dumpTopLogits(step: usize, logits: []const f32, tok: *const Tokenizer, gpa: std.mem.Allocator) void {
+    var top: [8]sample.Candidate = undefined;
+    const sel = sample.topK(logits, &top);
+    std.debug.print("[logits] step {d}:", .{step});
+    for (sel) |c| {
+        const piece = tok.decodeAlloc(gpa, &.{c.id}) catch "";
+        defer if (piece.len > 0) gpa.free(piece);
+        std.debug.print(" {d}({s})={d:.4}", .{ c.id, piece, c.logit });
+    }
+    std.debug.print("\n", .{});
+}
 const sample = @import("tp_core").sample;
 const spec = @import("spec.zig");
 const kv_cache_mod = @import("tp_core").kv_cache;
@@ -350,6 +373,40 @@ pub fn generate(
     opts: Options,
     out: ?*std.Io.Writer,
 ) !usize {
+    // TP_DUMP_ENTRY: what each caller actually hands the loop. tp-llm matches
+    // llama.cpp on gemma4 and the tp-gui session does not, so the difference has
+    // to be visible in exactly one of: the ids, the options, or how much KV the
+    // caller already committed before getting here.
+    if (std.c.getenv("TP_DUMP_ENTRY") != null) {
+        var idh: u64 = 0xcbf29ce484222325;
+        for (ids.items) |t| idh = (idh ^ t) *% 0x100000001b3;
+        const sp = opts.sampling;
+        const MH = switch (@typeInfo(@TypeOf(model))) {
+            .pointer => |p| p.child,
+            else => @TypeOf(model),
+        };
+        const hostl: usize = if (comptime @hasDecl(MH, "hostLayers")) model.hostLayers() else 0;
+        std.debug.print("[entry] host_layers={d}\n", .{hostl});
+        // Broad backend-state diff: two callers that reach this loop with the
+        // same ids and the same KV count should also have the same device state.
+        if (comptime @hasField(MH, "be")) {
+            const be = model.be;
+            std.debug.print("[entry] be async_up={} pinned={d} streamed={d} weights={d} dev_used={d} remaining={d}\n", .{
+                be.async_uploads, be.pinned_bytes, be.streamed_bytes,
+                be.weights.count(), be.ctx.device_used, model.remaining(),
+            });
+        }
+        std.debug.print(
+            "[entry] ids={d} idhash=0x{x} cached={d} first={any}\n" ++
+                "[entry] opts max_new={d} max_ctx={d} seed={d} spec_k={d} temp={d:.3} top_k={d} top_p={d:.4} min_p={d:.3} rp={d:.3} rln={d} pres={d:.3} freq={d:.3}\n",
+            .{
+                ids.items.len,   idh,        model.cached(),      ids.items[0..@min(24, ids.items.len)],
+                opts.max_new_tokens, opts.max_context, opts.seed, opts.spec_k,
+                sp.temperature,  sp.top_k,   sp.top_p,            sp.min_p,
+                sp.repeat_penalty, sp.repeat_last_n, sp.presence_penalty, sp.frequency_penalty,
+            },
+        );
+    }
     if (opts.spec_k > 0) {
         const M = switch (@typeInfo(@TypeOf(model))) {
             .pointer => |p| p.child,
@@ -374,7 +431,12 @@ pub fn generate(
         // one is active. min-p and top-p never need a fallback: they are
         // prefix cuts inside the shared distFromSorted tail.
         const pen_on = opts.sampling.penaltiesActive();
-        if (opts.sampling.temperature <= 0) {
+        // TP_NO_GPU_SAMPLE forces the download + host-sample path, so the
+        // logits are observable and the fast paths' token-identity is testable.
+        const force_host = std.c.getenv("TP_NO_GPU_SAMPLE") != null;
+        if (force_host) {
+            // fall through to the generic loop below
+        } else if (opts.sampling.temperature <= 0) {
             if (comptime @hasDecl(M, "stepArgmax")) {
                 if (!pen_on or comptime @hasDecl(M, "stepArgmaxPen"))
                     return generateGreedyArgmax(model, tok, io, gpa, ids, opts, out);
@@ -441,8 +503,10 @@ pub fn generate(
         };
     };
     var n: usize = 0;
+    const dump_steps = debugEnvUint("TP_DUMP_LOGITS");
     while (n < opts.max_new_tokens) {
         if (checkpoint(io, opts) == .stop) break;
+        if (n < dump_steps) dumpTopLogits(n, logits, tok, gpa);
         const next = sampler.next(logits, ids.items);
         if (chat.isStop(next)) break;
         try ids.append(gpa, next);

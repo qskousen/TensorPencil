@@ -1,9 +1,13 @@
-//! Logits -> token id: greedy argmax, or temperature + top-k + top-p
-//! (nucleus) + min-p sampling with optional repetition / presence /
-//! frequency penalties (llama.cpp semantics).
+//! Logits -> token id: greedy argmax, or top-k + top-p (nucleus) + min-p +
+//! temperature sampling with optional repetition / presence / frequency
+//! penalties (llama.cpp semantics).
+//!
+//! Stages run in llama.cpp's chain order: penalties, top_k, top_p, min_p, then
+//! temperature LAST (see `distFromSorted`).
 //!
 //! Defaults follow Qwen3's non-thinking-mode recommendation
 //! (temperature 0.7, top_p 0.8, top_k 20). temperature == 0 is greedy.
+//! Other families want their own: Gemma 4, for one, specifies 1.0 / 0.95 / 64.
 
 const std = @import("std");
 
@@ -272,14 +276,20 @@ pub fn applyPenalties(logits: []f32, recent: []const u32, p: Params) void {
     }
 }
 
-/// The post-top-k tail: temperature softmax + nucleus (top-p) + min-p cuts +
-/// normalize, over candidates already SORTED descending by logit. Shared by the
-/// full-vocab `dist` and the GPU candidate path so there is one source of truth
-/// for the stochastic math (and thus exact CPU/GPU parity). `temperature <= 0`
-/// collapses to a point mass on `cands[0]` (which must be the argmax).
-/// Penalties are assumed already applied to the logits these candidates came
-/// from. Both cuts are prefix cuts computed on the full candidate set and then
-/// intersected, the same result as llama.cpp's top_p-then-min_p chain order.
+/// The post-top-k tail: nucleus (top-p) and min-p cuts, then the temperature
+/// softmax + normalize, over candidates already SORTED descending by logit.
+/// Shared by the full-vocab `dist` and the GPU candidate path so there is one
+/// source of truth for the stochastic math (and thus exact CPU/GPU parity).
+/// `temperature <= 0` collapses to a point mass on `cands[0]` (which must be
+/// the argmax). Penalties are assumed already applied to the logits these
+/// candidates came from.
+///
+/// Both cuts run BEFORE temperature, on the unscaled distribution, matching
+/// llama.cpp's default chain (top_k, top_p, min_p, temperature last). The order
+/// is not cosmetic: scaling first sharpens the distribution, so a nucleus cut
+/// taken after it keeps fewer candidates than the same nominal top_p does in
+/// llama.cpp, Ollama or LM Studio at any temperature below 1. Every published
+/// "recommended top_p" for a model assumes this order.
 pub fn distFromSorted(p: Params, cands: []const Candidate) Dist {
     std.debug.assert(cands.len >= 1);
     var d: Dist = undefined;
@@ -290,17 +300,16 @@ pub fn distFromSorted(p: Params, cands: []const Candidate) Dist {
         return d;
     }
 
-    // Softmax with temperature over the candidates.
     var probs: [max_candidates]f32 = undefined;
-    var denom: f32 = 0;
-    for (cands, 0..) |c, i| {
-        probs[i] = @exp((c.logit - cands[0].logit) / p.temperature);
-        denom += probs[i];
-    }
 
-    // Nucleus cut: candidates are sorted, so walk until cumulative >= top_p.
+    // Candidates are sorted, so walk until cumulative >= top_p.
     var keep: usize = cands.len;
     if (p.top_p < 1.0) {
+        var denom: f32 = 0;
+        for (cands, 0..) |c, i| {
+            probs[i] = @exp(c.logit - cands[0].logit);
+            denom += probs[i];
+        }
         var cum: f32 = 0;
         for (probs[0..cands.len], 0..) |prob, i| {
             cum += prob / denom;
@@ -311,9 +320,8 @@ pub fn distFromSorted(p: Params, cands: []const Candidate) Dist {
         }
     }
 
-    // Min-p cut: drop candidates with probability below min_p times the top's.
-    // Thresholded in raw-logit space (temperature-independent, llama.cpp
-    // semantics); the top candidate always survives.
+    // Drop candidates below min_p times the top's, thresholded in raw-logit
+    // space; the top candidate always survives.
     if (p.min_p > 0) {
         const min_logit = cands[0].logit + @log(p.min_p);
         var m: usize = 1;
@@ -321,9 +329,13 @@ pub fn distFromSorted(p: Params, cands: []const Candidate) Dist {
         keep = m;
     }
 
-    // Normalize the kept prefix.
+    // Temperature softmax over the survivors, then normalize. Overwrites the
+    // pass above, which is done being read.
     var kept_mass: f32 = 0;
-    for (probs[0..keep]) |prob| kept_mass += prob;
+    for (cands[0..keep], 0..) |c, i| {
+        probs[i] = @exp((c.logit - cands[0].logit) / p.temperature);
+        kept_mass += probs[i];
+    }
     for (cands[0..keep], probs[0..keep], 0..) |c, prob, i| {
         d.ids[i] = c.id;
         d.probs[i] = prob / kept_mass;
@@ -344,7 +356,7 @@ pub fn candDesc(_: void, a: Candidate, b: Candidate) bool {
 /// Fill `out` with the highest-logit candidates, sorted descending.
 /// Selection over the full vocab via a min-heap keyed on the smallest kept
 /// logit (out.len is small: <= max_candidates).
-fn topK(logits: []const f32, out: []Candidate) []Candidate {
+pub fn topK(logits: []const f32, out: []Candidate) []Candidate {
     const k = @min(out.len, logits.len);
     const heap = out[0..k];
     // Heap-order the first k, min at root.
@@ -555,6 +567,41 @@ test "min-p drops candidates far below the top" {
     for (0..32) |_| {
         var l = [_]f32{ 10.0, 10.0, 0.0, -5.0 };
         try std.testing.expect(s.next(&l, &.{}) < 2);
+    }
+}
+
+test "the top-p cut runs before temperature (llama.cpp chain order)" {
+    // Unscaled masses are ~.665/.245/.090, cumulating .665/.910/1.0, so a
+    // nucleus at 0.95 keeps all three. Scaling by T=0.5 first would sharpen
+    // them to ~.867/.117/.016, reaching .984 at the second and dropping the
+    // third: the two orders disagree on the candidate set, not just the probs.
+    const cands = [_]Candidate{
+        .{ .id = 0, .logit = 2.0 },
+        .{ .id = 1, .logit = 1.0 },
+        .{ .id = 2, .logit = 0.0 },
+    };
+    const d = distFromSorted(.{ .temperature = 0.5, .top_k = 0, .top_p = 0.95 }, &cands);
+    try std.testing.expectEqual(@as(usize, 3), d.n);
+    // Only the CUT reads the unscaled distribution; the mass we sample from is
+    // still temperature-scaled.
+    try std.testing.expectApproxEqAbs(@as(f32, 0.866813), d.probOf(0), 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.117309), d.probOf(1), 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.015876), d.probOf(2), 1e-4);
+}
+
+test "the top-p candidate set is independent of temperature" {
+    // The property that makes a model card's recommended top_p mean the same
+    // number here as in llama.cpp / Ollama / LM Studio.
+    const cands = [_]Candidate{
+        .{ .id = 0, .logit = 3.0 },
+        .{ .id = 1, .logit = 2.0 },
+        .{ .id = 2, .logit = 1.0 },
+        .{ .id = 3, .logit = -4.0 },
+    };
+    for ([_]f32{ 0.1, 0.5, 0.7, 1.0, 1.5, 2.0 }) |t| {
+        const d = distFromSorted(.{ .temperature = t, .top_k = 0, .top_p = 0.95 }, &cands);
+        errdefer std.debug.print("temperature {d} kept {d} candidates\n", .{ t, d.n });
+        try std.testing.expectEqual(@as(usize, 3), d.n);
     }
 }
 
