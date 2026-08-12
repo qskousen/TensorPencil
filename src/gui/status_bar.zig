@@ -93,7 +93,7 @@ pub fn deinit() void {
 
 /// Take a fresh sample of every meter into `cur` and push the time-series rings.
 /// Called on the timer cadence, not per frame.
-fn sampleInto(s: ?*chat.Session, diff_busy: bool, diff: diffuser.VramBreakdown) void {
+fn sampleInto(s: ?*chat.Session, loading: bool, diff_busy: bool, diff: diffuser.VramBreakdown) void {
     var n: Sample = .{};
     n.cpu = cpu_meter.sample();
     n.cpu_mhz = sysmon.cpuFreqMhz();
@@ -133,7 +133,22 @@ fn sampleInto(s: ?*chat.Session, diff_busy: bool, diff: diffuser.VramBreakdown) 
         .device_used = n.vram_used,
         .proc_used = n.vram_proc,
         .ours = n.llm_used + n.diff.total(),
+        .loading = loading,
     });
+    // TP_DUMP_VRAM: the meter's attribution, per sample, in MiB. `ovh` is a
+    // RESIDUAL (our process's NVML footprint minus what our allocators count),
+    // so when it reads high this is the only way to see which side moved: a real
+    // untracked allocation grows `proc` alone, while an accounting gap shows up
+    // as `proc - ours` widening while `dev_used` holds still.
+    if (std.c.getenv("TP_DUMP_VRAM") != null) std.debug.print(
+        "[vram-dbg] dev_used={d} proc={d} ours={d} (llm {d} + diff {d}) -> ovh={d} sys={d} loading={d}\n",
+        .{
+            n.vram_used >> 20,                   n.vram_proc >> 20,
+            (n.llm_used + n.diff.total()) >> 20, n.llm_used >> 20,
+            n.diff.total() >> 20,                n.parts.overhead >> 20,
+            n.parts.system >> 20,                n.parts.loading >> 20,
+        },
+    );
     const totf: f32 = if (n.vram_total > 0) @floatFromInt(n.vram_total) else 0;
     h_cpu.push(n.cpu);
     h_gpu.push(n.gpu_util);
@@ -144,7 +159,7 @@ fn sampleInto(s: ?*chat.Session, diff_busy: bool, diff: diffuser.VramBreakdown) 
 /// Draw the bar. `s` is the live session (null before a model loads, the bar
 /// still shows CPU/GPU/total VRAM). `diff_busy`/`diff_used` come from the
 /// app-level diffusion engine.
-pub fn render(s: ?*chat.Session, diff_busy: bool, diff: diffuser.VramBreakdown, split: *f32, limit: *f32, llm_armed: bool, diff_armed: bool, llm_paused: bool, diff_paused: bool, acts: meter.Actions) void {
+pub fn render(s: ?*chat.Session, loading: bool, diff_busy: bool, diff: diffuser.VramBreakdown, split: *f32, limit: *f32, llm_armed: bool, diff_armed: bool, llm_paused: bool, diff_paused: bool, acts: meter.Actions) void {
     _ = sysmon.nvml(); // opens on first use
 
     const theme = dvui.themeGet();
@@ -161,7 +176,7 @@ pub fn render(s: ?*chat.Session, diff_busy: bool, diff: diffuser.VramBreakdown, 
     // footprint, per-component residency) is taken here, in one pass, and the
     // meter renders that snapshot, never a mix of sampled and live reads.
     if (dvui.timerDoneOrNone(bar.data().id)) {
-        sampleInto(s, diff_busy, diff);
+        sampleInto(s, loading, diff_busy, diff);
         dvui.timer(bar.data().id, if (diff_busy) sample_interval_busy_us else sample_interval_us);
     }
 
@@ -203,10 +218,13 @@ fn renderMeter(s: ?*chat.Session, diff: diffuser.VramBreakdown, split: *f32, lim
     var model: meter.Model = .{
         .total = total,
         // Ours but untracked (CUDA contexts + kernels, library internals, UI
-        // textures, a model still loading) vs genuinely other processes'.
+        // textures) vs genuinely other processes'. A model mid-load is NOT here;
+        // it goes to `llm_w` below.
         .overhead = cur.parts.overhead,
         .system = cur.parts.system,
-        .llm_w = cur.llm_used -| ctx_b,
+        // A load in flight has weights on the card that nothing tracks yet;
+        // they belong to the model, not to `ovh` (see vram_split.Parts).
+        .llm_w = (cur.llm_used -| ctx_b) + cur.parts.loading,
         .llm_ctx = ctx_b,
         // MEASURED per-component diffusion breakdown (see pipeline.vramBreakdown).
         .te = cur.diff.te,

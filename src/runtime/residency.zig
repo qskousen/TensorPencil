@@ -11,7 +11,9 @@
 //!                             touched by the per-model hooks below):
 //!                               .dynamic: bool   .budget: u64
 //!                               .order: []usize  .next: usize
-//!   st.be                      the CUDA backend, `deviceUsed()` / `headroom()`
+//!   st.be                      the CUDA backend: `deviceUsed()` / `headroom()`,
+//!                              plus `pinnedWeightBytes()` /
+//!                              `evictableWeightBytes()` for `splitHostCount`
 //!   st.migrateLayer(l) !void   move layer l device->host, freeing its VRAM
 //!   st.promoteLayer(l) !void   bring layer l host->device, restoring its state
 //!   st.promoteCost(l) usize    VRAM a promote of layer l needs (weights + the
@@ -116,6 +118,67 @@ pub fn need(st: anytype) vram.Bytes {
 /// Full resident footprint as a single figure (`vram.Participant.demand`).
 pub fn demand(st: anytype) u64 {
     return need(st).total();
+}
+
+/// Layers a fresh split must place on the HOST for the model to fit under
+/// `budget`, taken from the front of `order` (first to leave, first). `per[l]`
+/// is layer `l`'s device weight bytes. `reserve` is what must stay free for the
+/// parameters that are NOT layer weights: the LM head for a dynamic split,
+/// which migrates more layers later as the KV grows, and additionally the KV at
+/// capacity plus slack for a static one, which cannot.
+///
+/// The whole difficulty is which device bytes the budget has already been spent
+/// on. `deviceUsed()` includes the layer weights the loader has already
+/// uploaded, and those are exactly what this is placing, so charging them to the
+/// budget as well leaves almost nothing for the weights themselves and nearly
+/// every layer plans onto the host. That split then costs the prefill and buys
+/// no memory at all, because a host layer's weights are reclaimed lazily and so
+/// sit in VRAM regardless. Netting the cached weights back out is what compares
+/// `budget` against the same footprint `per` describes.
+///
+/// A `dynamic` split additionally leaves `promote_reserve` free for the first
+/// forward's transient buffers. Its own `reserve` covers only parameters, so
+/// without this the plan packs the card to within a few hundred MiB, the
+/// forward's dequant staging has nowhere to go, and the OOM handler dumps a
+/// batch of layers to the host: more offloaded than a plan that had left room,
+/// and chosen reactively rather than by the offload order. Static splits keep
+/// their own generous slack instead.
+///
+/// The flat floor, NOT `promoteReserve`: that maxes in `largestAllocation`,
+/// which at load time is the LM head's upload (measured 1102 MiB on a 31B), a
+/// buffer that is HELD rather than re-requested per forward. Reserving it costs
+/// three extra layers for a transient no forward asks for. `promoteBack` reads
+/// the high-water later, once a real forward has taught it what one costs.
+pub fn splitHostCount(st: anytype, budget: u64, reserve: u64, dynamic: bool, per: []const usize, order: []const usize) usize {
+    var total_weight: u64 = 0;
+    for (per) |b| total_weight += b;
+
+    const used = st.be.deviceUsed();
+    // Device bytes that are not model parameters: committed KV, activation
+    // scratch, RoPE tables. The parameters come back as `total_weight` (layers)
+    // and `reserve` (the head), so each is counted once.
+    const other = used -| st.be.pinnedWeightBytes() -| st.be.evictableWeightBytes();
+    // The plan must respect the card's LIVE free VRAM, not just the abstract
+    // budget: other processes may hold a chunk of the card. A plan the card
+    // cannot satisfy places everything resident and then faults at the first
+    // prefill, where weight uploads and lazy PTX JIT collide at zero free.
+    // headroom() already keeps a 10% margin.
+    const ceiling = @min(budget, used + st.be.headroom());
+    const transient: u64 = if (dynamic) promote_reserve else 0;
+    const weight_budget = ceiling -| other -| reserve -| transient;
+
+    var gpu_weight = total_weight;
+    var n_cpu: usize = 0;
+    while (gpu_weight > weight_budget and n_cpu < order.len) {
+        gpu_weight -= per[order[n_cpu]];
+        n_cpu += 1;
+    }
+    if (n_cpu != 0)
+        std.log.info("[vram] split plan: {d}/{d} layers to the host · layer weights {d} MiB vs {d} MiB (ceiling {d} - other {d} - reserve {d} - transient {d})", .{
+            n_cpu,         order.len,   total_weight >> 20, weight_budget >> 20,
+            ceiling >> 20, other >> 20, reserve >> 20,      transient >> 20,
+        });
+    return n_cpu;
 }
 
 /// Is layer `l`'s K/V still on the device? (Everything is, without a split.)
@@ -408,9 +471,19 @@ const MockLm = struct {
         peer_locked: bool = false,
         /// Largest single allocation seen; drives `promoteReserve`.
         largest: u64 = 0,
+        /// Cached model parameters inside `used`. The loader uploads weights
+        /// before the split is planned, so this is the term `splitHostCount`
+        /// must not charge to the budget twice.
+        pinned: u64 = 0,
 
         fn deviceUsed(self: *MockBe) u64 {
             return self.used;
+        }
+        fn pinnedWeightBytes(self: *MockBe) u64 {
+            return self.pinned;
+        }
+        fn evictableWeightBytes(_: *MockBe) u64 {
+            return 0; // LLM weights never stream; they pin or they offload
         }
         /// No 0.9 fudge, unlike the real backend: the arithmetic under test is
         /// about which term binds, and a fudge factor only obscures it.
@@ -523,4 +596,86 @@ test "residency.promoteBack: a big transient raises the physical margin, not the
     var buf2: [8]usize = undefined;
     var st2 = MockLm.init(mockOrder(&buf2), .{ .card = 8 * foot + (512 << 20), .largest = 1 << 30 });
     try std.testing.expectEqual(@as(usize, 0), try promoteBack(&st2, 8 * foot));
+}
+
+/// A 60-layer model whose weights the loader has already uploaded, i.e. the
+/// state `autoOffload` actually plans from. Layer bytes and the head are a
+/// gemma4-31B's, the shape the reported failure was on.
+const SplitCase = struct {
+    const layer: u64 = 276 << 20; // 60 layers ~ 16.2 GiB of weights
+    const head: u64 = 700 << 20;
+    const other: u64 = 1500 << 20; // committed KV + activation scratch
+    const n = 60;
+
+    per: [n]usize = @splat(layer),
+    order: [n]usize = undefined,
+    st: MockLm = undefined,
+
+    /// Ready to plan on a `card`-byte GPU on which the loader has already
+    /// uploaded the head and `uploaded` of the layers.
+    /// `promoteReserve`'s floor, which every dynamic plan now leaves free.
+    const transient: u64 = 256 << 20;
+
+    fn init(self: *SplitCase, card: u64, uploaded: u64) void {
+        self.per = @splat(layer);
+        for (&self.order, 0..) |*o, i| o.* = n - 1 - i;
+        const weights = uploaded * layer + head;
+        self.st = .{
+            .cfg = .{ .n_layers = n },
+            .split = null,
+            .be = .{ .used = weights + other, .card = card, .pinned = weights },
+        };
+    }
+    fn plan(self: *SplitCase, budget: u64) usize {
+        return splitHostCount(&self.st, budget, head, true, &self.per, &self.order);
+    }
+};
+
+test "residency.splitHostCount: weights already on the card are not charged twice" {
+    // The reported failure: a 31B loads, its weights upload, and the split
+    // planner then reads `deviceUsed()` ~18 GiB and concludes there is no room
+    // for the very weights that number is made of. 58 of 60 layers went to the
+    // host under a budget that fit the whole model, and because a host layer's
+    // weights are reclaimed lazily they stayed in VRAM anyway: prefill ran on the
+    // CPU at 15 tok/s and freed nothing.
+    var c: SplitCase = undefined;
+    c.init(24101 << 20, SplitCase.n); // every layer uploaded, as pread loading leaves it
+    // The GUI's ceiling for this card, comfortably above the model's footprint.
+    try std.testing.expectEqual(@as(usize, 0), c.plan(21848 << 20));
+}
+
+test "residency.splitHostCount: a budget below the model still places layers" {
+    // The counterpart: the accounting fix must not turn the planner off. A
+    // budget with room for 40 layers' weights offloads the other 20.
+    var c: SplitCase = undefined;
+    c.init(24101 << 20, SplitCase.n);
+    try std.testing.expectEqual(@as(usize, 20), c.plan(SplitCase.other + SplitCase.head + SplitCase.transient + 40 * SplitCase.layer));
+}
+
+test "residency.splitHostCount: the card's live free VRAM binds under a generous budget" {
+    // `budget` is an abstract ceiling; the card is physical. A model too big for
+    // the card gets only the layers that fit uploaded, and an unlimited budget
+    // must still plan the rest onto the host rather than trusting the number.
+    var c: SplitCase = undefined;
+    c.init(SplitCase.other + SplitCase.head + SplitCase.transient + 30 * SplitCase.layer, 30);
+    try std.testing.expectEqual(@as(usize, 30), c.plan(std.math.maxInt(u64)));
+}
+
+test "residency.splitHostCount: a dynamic plan leaves the forward's transient free" {
+    // The second half of the reported failure. With the weight accounting fixed
+    // the planner packed a 31B to within ~300 MiB of the ceiling, and the first
+    // forward's 220 MiB buffer had nowhere to go: `tensorCreate` failed, the OOM
+    // handler dumped 4 layers to the host, and prefill ran at 115 tok/s. Leaving
+    // `promoteReserve` free costs a layer, up front, where the planner picks it.
+    var c: SplitCase = undefined;
+    c.init(24101 << 20, SplitCase.n);
+    // A budget with room for every layer, the head and `other` -- and nothing
+    // over. Exactly the shape that OOM'd.
+    const snug = SplitCase.other + SplitCase.head + SplitCase.n * SplitCase.layer;
+    try std.testing.expectEqual(@as(usize, 1), c.plan(snug));
+
+    // A static split is left alone at the same budget: it reserves the KV at
+    // capacity plus its own slack instead, so charging the transient on top
+    // would offload twice for the same bytes.
+    try std.testing.expectEqual(@as(usize, 0), splitHostCount(&c.st, snug, SplitCase.head, false, &c.per, &c.order));
 }

@@ -572,11 +572,7 @@ pub const CudaLM = struct {
 
         const per = try gpa.alloc(usize, n);
         defer gpa.free(per);
-        var total_weight: usize = 0;
-        for (self.lm.layers, 0..) |*layer, l| {
-            per[l] = layerDeviceBytes(layer);
-            total_weight += per[l];
-        }
+        for (self.lm.layers, 0..) |*layer, l| per[l] = layerDeviceBytes(layer);
 
         // Device memory that is not streamable layer weight and must stay
         // resident: KV at the current capacity, the LM head, plus slack for
@@ -590,16 +586,6 @@ pub const CudaLM = struct {
             self.lm.head.bytes.len
         else
             kv_bytes + self.lm.head.bytes.len + (512 << 20);
-        // The plan must respect the card's LIVE free VRAM, not just the
-        // abstract budget: other processes may hold a chunk of the card, and
-        // the already-committed KV/activation buffers count against it too. A
-        // plan the card can't satisfy places everything resident and then
-        // faults at the first prefill (weight uploads + lazy PTX JIT collide
-        // at zero free). headroom() already keeps a 10% margin.
-        const used = self.be.deviceUsed();
-        const avail = @min(budget, used + self.be.headroom()) -| used;
-        const gpu_weight_budget: usize = if (avail > reserve) @intCast(avail - reserve) else 0;
-
         // Eviction order: which layers leave the device first. Kept in the
         // Split (dynamic migration walks it as the KV cache grows).
         const order = try gpa.alloc(usize, n);
@@ -634,12 +620,7 @@ pub const CudaLM = struct {
         const on_gpu = try gpa.alloc(bool, n);
         errdefer gpa.free(on_gpu);
         @memset(on_gpu, true);
-        var gpu_weight = total_weight;
-        var n_cpu: usize = 0;
-        while (gpu_weight > gpu_weight_budget and n_cpu < n) {
-            gpu_weight -= per[order[n_cpu]];
-            n_cpu += 1;
-        }
+        const n_cpu = residency.splitHostCount(self, budget, reserve, dynamic, per, order);
         if (n_cpu == 0 and !dynamic) {
             gpa.free(on_gpu);
             gpa.free(order);
@@ -683,27 +664,13 @@ pub const CudaLM = struct {
         };
         self.graph_ok = false; // per-op path: host layers can't be captured
 
-        // Place the statically-planned layers on the host. Before any tokens
-        // (the autoOffload-at-init path) there is nothing to copy, mark them
-        // and free the device KV; weights are reclaimed lazily by the cache
-        // and conv/ssm start zeroed on both sides. Armed MID-conversation
-        // (imageReclaim), each layer's live rows/state must move to the host
-        // instead, migrateLayer does the copy AND the on_gpu/n_cpu
-        // bookkeeping, or the context would be destroyed with the device KV.
-        if (self.len == 0) {
-            const sp = &self.split.?;
-            for (order[0..n_cpu]) |l| {
-                sp.on_gpu[l] = false;
-                sp.n_cpu += 1;
-                if (!cfg.isRecurrent(l)) {
-                    const s = l / cfg.full_attn_interval;
-                    self.be.growableDestroy(&self.k_cache[s]);
-                    self.be.growableDestroy(&self.v_cache[s]);
-                }
-            }
-        } else {
-            for (order[0..n_cpu]) |l| try self.migrateLayer(l);
-        }
+        // Place the statically-planned layers on the host. `migrateLayer` copies
+        // any live rows (none before the first token), frees the device K/V AND
+        // evicts the layer's device weights, which is the only thing that
+        // actually reclaims VRAM here: `warmWeights` uploads and PINS every
+        // weight during load, so a layer merely marked host-resident keeps its
+        // full footprint on the card while computing on the CPU.
+        for (order[0..n_cpu]) |l| try self.migrateLayer(l);
     }
 
     pub fn vocab(self: *const CudaLM) usize {

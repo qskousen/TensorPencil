@@ -967,7 +967,7 @@ fn frame() void {
         }
         // `ready` == !g_loading: only touch the session when no reload is tearing
         // it down on the loader thread (same rule as the chat view).
-        status_bar.render(if (ready) g_session else null, diffBusy(), diffVram(), &g_split, &g_limit, g_llm_eject_armed, g_diff_eject_armed, llmPaused(), diffPaused(), meterActions());
+        status_bar.render(if (ready) g_session else null, g_loading.load(.acquire), diffBusy(), diffVram(), &g_split, &g_limit, g_llm_eject_armed, g_diff_eject_armed, llmPaused(), diffPaused(), meterActions());
         return;
     }
 
@@ -1010,7 +1010,7 @@ fn frame() void {
 
     renderMessages(s_ui, list_h, loading);
     renderInput(s_ui);
-    status_bar.render(s_ui, diffBusy(), diffVram(), &g_split, &g_limit, g_llm_eject_armed, g_diff_eject_armed, llmPaused(), diffPaused(), meterActions());
+    status_bar.render(s_ui, g_loading.load(.acquire), diffBusy(), diffVram(), &g_split, &g_limit, g_llm_eject_armed, g_diff_eject_armed, llmPaused(), diffPaused(), meterActions());
 }
 
 fn diffBusy() bool {
