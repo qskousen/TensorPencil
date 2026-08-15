@@ -1,0 +1,5 @@
+provider add lmstudio --name "lmstudio" --type lmstudio --base-url "http://10.0.0.11:5000/v1"
+
+lsp add zig --command zls \
+  --filetypes zig --filetypes zon \
+  --root-markers build.zig --root-markers build.zig.zon
