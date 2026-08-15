@@ -258,7 +258,7 @@ test "snowflake Vulkan matches CPU" {
     const io = std.testing.io;
     const dir = "../DiffKeep/Models/snowflake-arctic-embed-m-v2.0";
     std.Io.Dir.cwd().access(io, dir, .{}) catch return error.SkipZigTest;
-    const ctx = gpu.Context.init(gpa) catch return error.SkipZigTest;
+    const ctx = gpu.Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
 
     var cpu = try es.Model.open(gpa, io, dir);
@@ -289,7 +289,7 @@ test "snowflake Vulkan embedBatch matches per-item" {
     const io = std.testing.io;
     const dir = "../DiffKeep/Models/snowflake-arctic-embed-m-v2.0";
     std.Io.Dir.cwd().access(io, dir, .{}) catch return error.SkipZigTest;
-    const ctx = gpu.Context.init(gpa) catch return error.SkipZigTest;
+    const ctx = gpu.Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
 
     var cpu = try es.Model.open(gpa, io, dir);

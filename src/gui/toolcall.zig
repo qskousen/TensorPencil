@@ -136,3 +136,189 @@ test "nextImageCall: multiple calls scanned in sequence via .after" {
     try testing.expectEqualStrings("two", b.call.prompt);
     try testing.expectEqual(ScanResult.none, nextImageCall(b.call.after));
 }
+
+/// One piece of a reply, in document order: either prose to render, or a run of
+/// consecutive tool calls that should share a single card.
+pub const Segment = union(enum) {
+    prose: []const u8,
+    calls: struct {
+        /// Indices into the variant's image list, `[start, start+len)`. `len`
+        /// can be FEWER than `n_calls`: a reopened conversation only rebuilt the
+        /// renders whose files it could find, and images are only on disk at all
+        /// when saving is on.
+        start: usize,
+        len: usize,
+        /// How many calls this run actually contains.
+        n_calls: usize,
+        /// The literal span of the reply these calls occupy, markup and all.
+        /// Carried rather than reconstructed so the section shows what the model
+        /// wrote, and so it still shows when no image survived.
+        text: []const u8,
+    },
+};
+
+/// Split a reply into prose and call runs, in the order the model wrote them.
+///
+/// Consecutive calls (nothing but whitespace between) group into one run, which
+/// is what makes a four-image request one 2x2 card rather than four stacked
+/// cards. A call with an empty prompt produces no image (see chat.zig), so it
+/// advances neither the index nor the run — otherwise every card after one
+/// would show the wrong picture.
+///
+/// `out` is filled up to its length; returns the slice written.
+pub fn segments(reply: []const u8, n_images: usize, out: []Segment) []Segment {
+    const base = @intFromPtr(reply.ptr);
+    var rest = reply;
+    var n: usize = 0;
+    var next_img: usize = 0;
+    var run_start: usize = 0;
+    var run_len: usize = 0;
+    var run_calls: usize = 0;
+    var run_from: usize = 0;
+    var run_to: usize = 0;
+
+    const push = struct {
+        fn prose(o: []Segment, i: *usize, t: []const u8) void {
+            if (std.mem.trim(u8, t, " \t\r\n").len == 0) return;
+            if (i.* < o.len) {
+                o[i.*] = .{ .prose = t };
+                i.* += 1;
+            }
+        }
+        fn run(o: []Segment, i: *usize, start: usize, len: usize, calls: usize, text: []const u8) void {
+            if (calls == 0) return;
+            if (i.* < o.len) {
+                o[i.*] = .{ .calls = .{ .start = start, .len = len, .n_calls = calls, .text = text } };
+                i.* += 1;
+            }
+        }
+    };
+
+    while (true) {
+        switch (nextImageCall(rest)) {
+            .call => |c| {
+                if (std.mem.trim(u8, c.text_before, " \t\r\n").len > 0) {
+                    push.run(out, &n, run_start, run_len, run_calls, reply[run_from..run_to]);
+                    run_len = 0;
+                    run_calls = 0;
+                    push.prose(out, &n, c.text_before);
+                }
+                // The call's own span: from where `text_before` ends to where
+                // `after` begins. All three are slices of `reply`, so this is
+                // pointer arithmetic on one buffer, not a search.
+                const from = @intFromPtr(c.text_before.ptr) + c.text_before.len - base;
+                const to = @intFromPtr(c.after.ptr) - base;
+                if (run_calls == 0) {
+                    run_start = next_img;
+                    run_from = from;
+                }
+                run_to = to;
+                run_calls += 1;
+                // chat.zig only creates an image for a call with a prompt, so
+                // the index walk has to skip the same ones or every card after
+                // an empty call shows the wrong picture.
+                if (c.prompt.len > 0 and next_img < n_images) {
+                    run_len += 1;
+                    next_img += 1;
+                }
+                rest = c.after;
+            },
+            .partial => |pp| {
+                push.run(out, &n, run_start, run_len, run_calls, reply[run_from..run_to]);
+                push.prose(out, &n, pp.text_before);
+                break;
+            },
+            .none => {
+                push.run(out, &n, run_start, run_len, run_calls, reply[run_from..run_to]);
+                push.prose(out, &n, rest);
+                break;
+            },
+        }
+    }
+    return out[0..n];
+}
+
+test "a reply splits into prose and call runs in document order" {
+    var buf: [8]Segment = undefined;
+
+    // Four back-to-back calls are ONE run: that is the 2x2 card.
+    const four =
+        "Here you go.\n" ++
+        "<image>a</image>\n<image>b</image>\n<image>c</image>\n<image>d</image>\n" ++
+        "Enjoy.";
+    const s1 = segments(four, 4, &buf);
+    try std.testing.expectEqual(@as(usize, 3), s1.len);
+    try std.testing.expectEqualStrings("Here you go.\n", s1[0].prose);
+    try std.testing.expectEqual(@as(usize, 0), s1[1].calls.start);
+    try std.testing.expectEqual(@as(usize, 4), s1[1].calls.len);
+    try std.testing.expectEqual(@as(usize, 4), s1[1].calls.n_calls);
+    // The span covers every call in the run and nothing else.
+    try std.testing.expectEqualStrings(
+        "<image>a</image>\n<image>b</image>\n<image>c</image>\n<image>d</image>",
+        s1[1].calls.text,
+    );
+    // The slice keeps the newline that followed the last `</image>`: prose is
+    // passed through verbatim rather than trimmed, so nothing is silently
+    // dropped from a reply. The markdown parser skips leading blank lines.
+    try std.testing.expectEqualStrings("\nEnjoy.", s1[2].prose);
+
+    // Talking between generations splits the run, and the SECOND card must map
+    // to the second image, not the first.
+    const talked =
+        "<image>a</image>\nNow a variation.\n<image>b</image>";
+    const s2 = segments(talked, 2, &buf);
+    try std.testing.expectEqual(@as(usize, 3), s2.len);
+    try std.testing.expectEqual(@as(usize, 0), s2[0].calls.start);
+    try std.testing.expectEqual(@as(usize, 1), s2[0].calls.len);
+    try std.testing.expectEqualStrings("\nNow a variation.\n", s2[1].prose);
+    try std.testing.expectEqual(@as(usize, 1), s2[2].calls.start);
+    try std.testing.expectEqual(@as(usize, 1), s2[2].calls.len);
+}
+
+test "plain prose and a bare call are each a single segment" {
+    var buf: [8]Segment = undefined;
+    const only_prose = segments("just talking", 0, &buf);
+    try std.testing.expectEqual(@as(usize, 1), only_prose.len);
+    try std.testing.expectEqualStrings("just talking", only_prose[0].prose);
+
+    const only_call = segments("<image>a</image>", 1, &buf);
+    try std.testing.expectEqual(@as(usize, 1), only_call.len);
+    try std.testing.expectEqual(@as(usize, 1), only_call[0].calls.len);
+    try std.testing.expectEqualStrings("<image>a</image>", only_call[0].calls.text);
+
+    // Nothing at all produces nothing, rather than an empty prose block that
+    // would draw a stray gap in the transcript.
+    try std.testing.expectEqual(@as(usize, 0), segments("", 0, &buf).len);
+    try std.testing.expectEqual(@as(usize, 0), segments("   \n ", 0, &buf).len);
+}
+
+test "an empty-prompt call creates no image, so it must not shift the indices" {
+    var buf: [8]Segment = undefined;
+    // chat.zig skips a call with no prompt; a naive walk would still advance
+    // and the following card would show the wrong picture.
+    const s = segments("<image></image>\n<image>real</image>", 1, &buf);
+    try std.testing.expectEqual(@as(usize, 1), s.len);
+    try std.testing.expectEqual(@as(usize, 0), s[0].calls.start);
+    try std.testing.expectEqual(@as(usize, 1), s[0].calls.len);
+    // Both calls are in the run's span even though only one made an image.
+    try std.testing.expectEqual(@as(usize, 2), s[0].calls.n_calls);
+}
+
+test "a half-streamed call renders the prose before it and stops" {
+    var buf: [8]Segment = undefined;
+    const s = segments("thinking out loud\n<image>half", 0, &buf);
+    try std.testing.expectEqual(@as(usize, 1), s.len);
+    try std.testing.expectEqualStrings("thinking out loud\n", s[0].prose);
+}
+
+test "a run still reports its calls when no image survived" {
+    var buf: [8]Segment = undefined;
+    // A reopened conversation whose PNGs were never saved: the call is still
+    // part of the reply and must remain visible, with no images behind it.
+    const s = segments("done\n<image>a</image>\n<image>b</image>", 0, &buf);
+    try std.testing.expectEqual(@as(usize, 2), s.len);
+    try std.testing.expectEqualStrings("done\n", s[0].prose);
+    try std.testing.expectEqual(@as(usize, 0), s[1].calls.len);
+    try std.testing.expectEqual(@as(usize, 2), s[1].calls.n_calls);
+    try std.testing.expectEqualStrings("<image>a</image>\n<image>b</image>", s[1].calls.text);
+}

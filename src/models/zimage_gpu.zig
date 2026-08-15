@@ -835,7 +835,7 @@ test "the modulation table is laid out the way the device kernels index it" {
 /// `-Dintegration` (`Context.init` refuses under test without it).
 fn gpuCtx(gpa: std.mem.Allocator, io: std.Io) !*gpu.Context {
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
-    return gpu.Context.init(gpa) catch error.SkipZigTest;
+    return gpu.Context.init(gpa, std.testing.io) catch error.SkipZigTest;
 }
 
 const zit_ckpt = "/home/qt/genai/comfyui/models/checkpoints/zit/unstableRevolution_V2Fp16.safetensors";

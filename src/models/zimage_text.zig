@@ -157,7 +157,7 @@ test "the Vulkan text encoder matches the CPU one on Z-Image's bf16 weights" {
 
     const gpu_mod = @import("tp_gpu").context;
     const qwen3_gpu = @import("qwen3_gpu.zig");
-    const ctx = gpu_mod.Context.init(gpa) catch return error.SkipZigTest;
+    const ctx = gpu_mod.Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
 
     var st = try safetensors.SafeTensors.open(gpa, io, te_ckpt);

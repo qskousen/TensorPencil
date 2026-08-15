@@ -189,6 +189,33 @@ pub const DecodedPng = struct {
 /// 6 RGBA, alpha is dropped) to interleaved RGB. Covers what image
 /// editors and ComfyUI emit; not a general PNG reader (no palette, no
 /// 16-bit, no interlacing). Caller frees `pixels`.
+/// The text of a PNG `tEXt` chunk with `keyword`, or null. Borrowed from `data`.
+///
+/// The counterpart to `encodePngRgbText`: a saved image carries its own
+/// AUTOMATIC1111 `parameters` block, which is the record of how it was made, so
+/// reading it back is how a render is reopened rather than re-described.
+pub fn pngText(data: []const u8, keyword: []const u8) ?[]const u8 {
+    if (data.len < 8 or !std.mem.eql(u8, data[0..8], &png_signature)) return null;
+    var i: usize = 8;
+    while (i + 8 <= data.len) {
+        const len = std.mem.readInt(u32, data[i..][0..4], .big);
+        const ctype = data[i + 4 ..][0..4];
+        const body_start = i + 8;
+        // Every chunk is length + type + body + crc; a truncated or lying
+        // length must stop the walk rather than slice past the end.
+        if (body_start + len + 4 > data.len) return null;
+        if (std.mem.eql(u8, ctype, "tEXt")) {
+            const body = data[body_start..][0..len];
+            if (std.mem.indexOfScalar(u8, body, 0)) |nul| {
+                if (std.mem.eql(u8, body[0..nul], keyword)) return body[nul + 1 ..];
+            }
+        }
+        if (std.mem.eql(u8, ctype, "IEND")) return null;
+        i = body_start + len + 4;
+    }
+    return null;
+}
+
 pub fn decodePngRgb(gpa: std.mem.Allocator, data: []const u8) !DecodedPng {
     if (data.len < 8 or !std.mem.eql(u8, data[0..8], "\x89PNG\r\n\x1a\n")) return error.InvalidPng;
 
@@ -856,4 +883,23 @@ test "ssim of an image against itself is exactly 1, and rejects a too-small imag
     try std.testing.expectApproxEqAbs(1.0, try ssim(px, px, w, h, .gaussian11), 1e-12);
     // 11x11 window does not fit in a 10-row image.
     try std.testing.expectError(error.ImageTooSmall, ssim(px[0 .. 10 * w * 3], px[0 .. 10 * w * 3], w, 10, .gaussian11));
+}
+
+test "pngText reads back an embedded parameters block" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    const px = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }; // 2x2 RGB
+    const params = "a lighthouse\nNegative prompt: blurry\nSteps: 34, CFG scale: 4.2";
+    try encodePngRgbText(gpa, &out, &px, 2, 2, &.{
+        .{ .keyword = "parameters", .text = params },
+        .{ .keyword = "other", .text = "ignored" },
+    });
+
+    try std.testing.expectEqualStrings(params, pngText(out.items, "parameters").?);
+    try std.testing.expectEqualStrings("ignored", pngText(out.items, "other").?);
+    try std.testing.expectEqual(@as(?[]const u8, null), pngText(out.items, "absent"));
+    // Not a PNG, and a truncated one, must report absence rather than read on.
+    try std.testing.expectEqual(@as(?[]const u8, null), pngText("not a png", "parameters"));
+    for (0..out.items.len) |n| _ = pngText(out.items[0..n], "parameters");
 }

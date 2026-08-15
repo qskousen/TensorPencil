@@ -1105,7 +1105,7 @@ test "gpu-resident forward matches comfyui fixture" {
     std.Io.Dir.cwd().access(io, dit_path, .{}) catch return error.SkipZigTest;
     std.Io.Dir.cwd().access(io, "testdata/dit_out.bin", .{}) catch return error.SkipZigTest;
 
-    var ctx = gpu.Context.init(gpa) catch return error.SkipZigTest;
+    var ctx = gpu.Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
 
     const readF32 = struct {
@@ -1208,7 +1208,7 @@ test "the Vulkan W4A8 decode matches ops.w4a8.decode, including the row padding"
     const io = std.testing.io;
     const w4a8 = ops.w4a8;
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
-    var ctx = gpu.Context.init(gpa) catch return error.SkipZigTest;
+    var ctx = gpu.Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
     if (!ctx.hasW4A8Decode()) return error.SkipZigTest;
 
@@ -1286,7 +1286,7 @@ test "the Vulkan NVFP4 decode matches ops.nvfp4.decode, including both paddings"
     const io = std.testing.io;
     const nvfp4 = ops.nvfp4;
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
-    var ctx = gpu.Context.init(gpa) catch return error.SkipZigTest;
+    var ctx = gpu.Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
     if (!ctx.hasNvfp4Decode()) return error.SkipZigTest;
 

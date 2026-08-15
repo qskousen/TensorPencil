@@ -1232,7 +1232,7 @@ test "gpu encode matches cpu encode" {
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
     std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
 
-    var ctx = gpu.Context.init(gpa) catch return error.SkipZigTest;
+    var ctx = gpu.Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
 
     var tok = try tokenizer_mod.Tokenizer.init(gpa);
@@ -1280,7 +1280,7 @@ test "vulkan spec decode matches vanilla greedy" {
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
     std.Io.Dir.cwd().access(io, te_path, .{}) catch return error.SkipZigTest;
 
-    var ctx = gpu.Context.init(gpa) catch return error.SkipZigTest;
+    var ctx = gpu.Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
 
     var st = try safetensors.SafeTensors.open(gpa, io, te_path);
@@ -1335,7 +1335,7 @@ test "vulkan bf16 prefill argmax matches cpu" {
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
     std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
 
-    var ctx = gpu.Context.init(gpa) catch return error.SkipZigTest;
+    var ctx = gpu.Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
 
     var tok = try tokenizer_mod.Tokenizer.init(gpa);

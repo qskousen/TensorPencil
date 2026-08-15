@@ -466,7 +466,7 @@ test "gpu sd vae decode matches the cpu decoder, at 4 AND 16 latent channels" {
     const test_gate = @import("../test_gate.zig");
     try test_gate.requireIntegration();
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
-    const ctx = Context.init(gpa) catch return error.SkipZigTest;
+    const ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
 
     const Case = struct { path: []const u8, prefix: []const u8, cfg: sd_vae.Config };

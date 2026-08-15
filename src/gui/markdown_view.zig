@@ -23,7 +23,13 @@ const hint = @import("hint.zig");
 pub const Opts = struct {
     /// Applied to every prose text layout, colors/background/border for
     /// the surrounding context (e.g. the dimmed thought block).
-    prose: dvui.Options = .{},
+    ///
+    /// NOTE the background default below. `TextLayoutWidget.defaults` sets
+    /// `.background = true` with `.style = .content`, so a layout left alone
+    /// paints a CANVAS-COLOURED block, 6px padding and all, over whatever it
+    /// sits in — which inside a chat bubble covers the bubble's own fill
+    /// completely. Callers that want a background say so.
+    prose: dvui.Options = .{ .background = false, .padding = .{} },
     /// Base for widget ids when one parent renders several documents.
     id_extra: usize = 0,
 };
@@ -126,7 +132,7 @@ const Renderer = struct {
                             else => "▪",
                         },
                     }) catch "• ";
-                tl.addText(marker, self.opts.prose);
+                fonts.addStyled(tl, marker, .{}, self.opts.prose);
                 self.emitSpans(tl, li.text, .{}, self.opts.prose);
             },
             .quote => |q| {
@@ -140,14 +146,14 @@ const Renderer = struct {
                     first = false;
                     var bar = o;
                     bar.color_text = theme.focus;
-                    tl.addText("▎", bar);
+                    fonts.addStyled(tl, "▎", .{}, bar);
                     self.emitSpans(tl, md.stripQuote(line), .{}, o);
                 }
             },
             .rule => {
                 var o = self.opts.prose;
                 o.color_text = (self.opts.prose.color_text orelse theme.text).lerp(theme.fill, 0.6);
-                tl.addText("─" ** 26, o);
+                fonts.addStyled(tl, "─" ** 26, .{}, o);
             },
         }
     }

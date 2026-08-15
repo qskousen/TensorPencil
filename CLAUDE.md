@@ -52,6 +52,7 @@ from a checkpoint, match what ComfyUI does.
 | `LIBRARY.md` | the layered module split, for external consumers |
 | `PLAN.md`, `LLM_PLAN.md` | diffusion and LLM roadmaps |
 | `DIFFKEEP.md`, `DIFFKEEP_INTEGRATION.md` | the embedding encoders for the DiffKeep consumer |
+| `UI.md` | the tp-gui design spec; §13 records what shipped and where it diverges |
 | `VULKAN_MEMORY.md` | Vulkan subgroup/shared-memory rework notes |
 | `TODO.md` | open work |
 
@@ -67,7 +68,11 @@ from a checkpoint, match what ComfyUI does.
   self-skip when their device or file is absent.
 - `zig build test -Dtest-filter="<substring>"` — one test. **The `=` is required**, and
   only one filter substring per run.
-- `zig build gui-test` — tp-gui config unit tests (not part of `test`)
+- `zig build gui-test` — tp-gui unit tests (config, fonts, style, history, framing,
+  markdown, meter math; not part of `test`)
+- `zig build ui-probe -- out.png [w h] [--states]` — render the whole chat workspace
+  (or the status bar under three loads) to a PNG from canned data, with no model,
+  GPU or engine. The GUI's failure modes are visual; this is how you see them.
 - `zig build -Doptimize=ReleaseFast` — optimized; required for any timing measurement.
 
 The gate lives in `src/test_gate.zig` (`build_options.integration`): GPU `init` fails in
@@ -97,6 +102,14 @@ depend on one tier. `LIBRARY.md` has the detail.
 
 Executables are thin drivers: `src/main.zig` (diffusion CLI), `src/llm_main.zig`,
 `src/gui_main.zig` (`src/gui/`).
+
+**The GUI has one design system, `src/gui/style.zig`**: palette, type scale, radii,
+the dvui theme, and every shared primitive. A view never names a color, a font face
+or a radius directly. `src/gui/fonts.zig` owns the three-tier face chain, and ANY
+user- or model-visible string must go through its run splitter (`addStyled` /
+`richLabel`) or it renders tofu the moment it leaves Latin. `shell.zig`,
+`bubbles.zig` and `queue_rail.zig` render from plain data through callbacks, which
+is what lets `ui-probe` draw the real screen without an engine.
 
 A model architecture is normally three files: `foo.zig` (CPU reference and the loader),
 `foo_gpu.zig` (Vulkan) and `foo_cuda.zig` (both CUDA backends, which share one code path

@@ -252,6 +252,12 @@ pub const Assembler = struct {
     version: u32,
     body: std.ArrayList(u32) = .empty,
     names: std.StringHashMapUnmanaged(u32) = .empty,
+    /// Ids that appeared as a `%result =`. Every referenced id must be defined
+    /// exactly once, but `idOf` allocates on first mention so forward references
+    /// work, which means a name that is only ever USED assembles cleanly into a
+    /// module with a dangling id. That is not a diagnosable failure later: the
+    /// driver either rejects the module or faults. `finish` compares the two sets.
+    defined: std.AutoHashMapUnmanaged(u32, void) = .empty,
     next_id: u32 = 1,
 
     pub fn init(gpa: std.mem.Allocator, version: u32) Assembler {
@@ -262,6 +268,7 @@ pub const Assembler = struct {
         var it = self.names.keyIterator();
         while (it.next()) |k| self.gpa.free(k.*);
         self.names.deinit(self.gpa);
+        self.defined.deinit(self.gpa);
         self.body.deinit(self.gpa);
     }
 
@@ -330,6 +337,7 @@ pub const Assembler = struct {
         defer words.deinit(self.gpa);
 
         const result_id: u32 = if (result_name) |rn| try self.idOf(rn) else 0;
+        if (result_id != 0) try self.defined.put(self.gpa, result_id, {});
 
         // Parse remaining operand tokens into a flat word list.
         var parsed: std.ArrayList(u32) = .empty;
@@ -373,6 +381,18 @@ pub const Assembler = struct {
     }
 
     /// Finalize: emit header + body. Caller owns the returned bytes.
+    /// First `%name` that was referenced but never defined, or null when the module
+    /// is complete. Only meaningful once the whole module has been added, which is
+    /// why `add`/`finish` do not check it: a caller may legitimately assemble a
+    /// fragment (the tests do).
+    pub fn undefinedName(self: *const Assembler) ?[]const u8 {
+        var it = self.names.iterator();
+        while (it.next()) |e| {
+            if (!self.defined.contains(e.value_ptr.*)) return e.key_ptr.*;
+        }
+        return null;
+    }
+
     pub fn finish(self: *Assembler) Error![]align(4) u8 {
         const total = 5 + self.body.items.len;
         const out = try self.gpa.alignedAlloc(u8, .of(u32), total * 4);
@@ -399,7 +419,18 @@ pub fn assemble(gpa: std.mem.Allocator, version: u32, text: []const u8) Error![]
 /// malformed operand) is a bug in the kernel text, panic rather than
 /// propagate. Lets callers keep a clean `error{OutOfMemory}` set.
 pub fn assembleChecked(gpa: std.mem.Allocator, version: u32, text: []const u8) error{OutOfMemory}![]align(4) u8 {
-    return assemble(gpa, version, text) catch |e| switch (e) {
+    var a = Assembler.init(gpa, version);
+    defer a.deinit();
+    a.add(text) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => std.debug.panic("spirv_asm: malformed kernel text: {s}", .{@errorName(e)}),
+    };
+    // A whole module is being assembled here, so a name that is referenced and never
+    // defined is a typo in the emitter, not a forward reference. Caught here it names
+    // the identifier; uncaught it becomes a dangling id that the driver answers with
+    // a fault instead of a diagnostic.
+    if (a.undefinedName()) |n| std.debug.panic("spirv_asm: %{s} is referenced but never defined", .{n});
+    return a.finish() catch |e| switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         else => std.debug.panic("spirv_asm: malformed kernel text: {s}", .{@errorName(e)}),
     };

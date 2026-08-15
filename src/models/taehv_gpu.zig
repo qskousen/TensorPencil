@@ -156,7 +156,7 @@ test "gpu taehv decode matches cpu reference" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
-    var ctx = Context.init(gpa) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
 
     var dec = try syntheticDecoder(gpa);
@@ -187,7 +187,7 @@ test "gpu single coop conv float parity" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
-    var ctx = Context.init(gpa) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
     if (ctx.pipe_coop_f16w == .null_handle) return error.SkipZigTest;
 

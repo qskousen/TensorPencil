@@ -130,7 +130,7 @@ pub fn main(init: std.process.Init) !void {
     const backend: embed.Backend = blk: {
         if (std.mem.eql(u8, a.backend_name, "cpu")) break :blk .cpu;
         if (std.mem.eql(u8, a.backend_name, "vulkan")) {
-            const ctx = try tp.gpu.context.Context.init(gpa);
+            const ctx = try tp.gpu.context.Context.init(gpa, io);
             break :blk .{ .vulkan = ctx };
         }
         if (std.mem.eql(u8, a.backend_name, "cuda")) {

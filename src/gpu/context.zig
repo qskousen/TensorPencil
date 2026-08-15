@@ -44,6 +44,259 @@ const AttnBatchedPush = extern struct {
 /// `TensorPencil gpu-test` to survey int8 tensor-core availability.
 pub var dump_coop_configs: bool = false;
 
+/// std.posix.getenv is gone in 0.16 and we link libc (same as pipeline.zig).
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+
+/// Whether `Context.init` may screen the coop warp tiles on a device it has no measurement
+/// for. Library consumers who cannot accept a sub-second first-run cost, or a write under
+/// the user's cache dir, set this false; `TP_COOP_AUTOTUNE=0` does the same from outside.
+/// An already-cached device never screens either way.
+pub var autotune_tiles: bool = true;
+
+/// Overrides where the measured-tile cache lives, for an embedder that keeps its own state
+/// directory rather than using `TP_COOP_TILE_CACHE` or the XDG location.
+pub var tile_cache_path: ?[]const u8 = null;
+
+/// Warp count of the f16-weight coop GEMM (`buildGemmShared` with warps8 = false),
+/// in a 2 x (n/2) grid. Named because the tile arithmetic below and the shader must
+/// agree on it.
+const coop_f16w_warps: u32 = 4;
+
+/// Whether the f16 coop GEMM can be BUILT at this warp tile on this device. Checks
+/// only what is queryable: the fragments must tile the warp, the A and B staging must
+/// divide evenly over the workgroup's threads, and the workgroup storage must fit.
+/// It deliberately says nothing about which legal tile is FAST — that depends on the
+/// register budget per lane, which Vulkan does not expose, so it is measured
+/// (`tune-coop`) rather than derived.
+pub fn coopTileFits(wm: u32, wn: u32, coop_m: u32, coop_n: u32, max_shared: u32, max_invocations: u32) bool {
+    if (wm == 0 or wn == 0 or coop_m == 0 or coop_n == 0) return false;
+    if (wm % coop_m != 0 or wn % coop_n != 0) return false;
+    // acc_phi / ma are sized [8][8] in the emitter.
+    if (wm / coop_m > 8 or wn / coop_n > 8) return false;
+    const threads = coop_f16w_warps * coopmat.subgroup_lanes;
+    if (threads > max_invocations) return false;
+    const a_rows = 2 * wm;
+    const wg_n = (coop_f16w_warps / 2) * wn;
+    // A stages 8 f16 per uvec4, B stages 16 f16 per thread per pass; both must cover
+    // the sub-slab in a whole number of passes, at most 4 (the staging arrays' size).
+    const a_quads = a_rows * 32 / 8;
+    const b_chunks = 32 * wg_n / 16;
+    if (a_quads % threads != 0 or b_chunks % threads != 0) return false;
+    if (a_quads / threads > 4 or b_chunks / threads > 4) return false;
+    const shared_bytes = 2 * (a_rows * 32) * 2 + 2 * (32 * wg_n) * 2;
+    if (shared_bytes > max_shared) return false;
+    return true;
+}
+
+/// Whether the shared-staged int8 coop GEMM can be BUILT at this warp tile. Same
+/// intent as `coopTileFits` but the int8 kernel's staging differs: int8 packs 4 per
+/// u32, the k step is 64, and the fused-scale variant stages a fragment per warp
+/// through extra workgroup scratch.
+pub fn coopI8TileFits(wm: u32, wn: u32, fm: u32, fnn: u32, nwarps: u32, max_shared: u32, max_invocations: u32) bool {
+    if (wm == 0 or wn == 0 or fm == 0 or fnn == 0) return false;
+    if (wm % fm != 0 or wn % fnn != 0) return false;
+    if (wm / fm > 8 or wn / fnn > 8) return false;
+    const threads = nwarps * coopmat.subgroup_lanes;
+    if (threads > max_invocations) return false;
+    const k_step: u32 = 64;
+    const wgn = (nwarps / 2) * wn;
+    if (wgn % 4 != 0) return false;
+    const a_u32 = (2 * wm) * (k_step / 4);
+    const b_u32 = k_step * (wgn / 4);
+    if (a_u32 % threads != 0 or b_u32 % threads != 0) return false;
+    // Slabs plus the fused-scale scratch (one fragment per warp), all s32/u32.
+    const shared_bytes = (a_u32 + b_u32) * 4 + nwarps * fm * fnn * 4;
+    if (shared_bytes > max_shared) return false;
+    return true;
+}
+
+// The measured-tile cache, read at init so the pipelines are built at the chosen tile the
+// first time rather than re-tiled afterwards. `tune-coop` writes it.
+/// Where the tile cache lives. `TP_COOP_TILE_CACHE` names the file outright; otherwise it
+/// is `<XDG_CACHE_HOME or HOME/.cache>/tensorpencil/coop_tile`. Returns null when neither
+/// env var is set, which just means "no cache", not an error.
+pub fn coopTileCachePath(buf: []u8) ?[:0]const u8 {
+    if (tile_cache_path) |v| {
+        if (v.len + 1 > buf.len) return null;
+        @memcpy(buf[0..v.len], v);
+        buf[v.len] = 0;
+        return buf[0..v.len :0];
+    }
+    if (getenv("TP_COOP_TILE_CACHE")) |p| {
+        const v = std.mem.sliceTo(p, 0);
+        if (v.len + 1 > buf.len) return null;
+        @memcpy(buf[0..v.len], v);
+        buf[v.len] = 0;
+        return buf[0..v.len :0];
+    }
+    const sub = "/tensorpencil/coop_tile";
+    if (getenv("XDG_CACHE_HOME")) |p| {
+        const v = std.mem.sliceTo(p, 0);
+        return std.fmt.bufPrintZ(buf, "{s}" ++ sub, .{v}) catch null;
+    }
+    if (getenv("HOME")) |p| {
+        const v = std.mem.sliceTo(p, 0);
+        return std.fmt.bufPrintZ(buf, "{s}/.cache" ++ sub, .{v}) catch null;
+    }
+    return null;
+}
+
+/// Key identifying a device+driver in the cache. Includes the driver version so a driver
+/// update re-measures rather than trusting a number produced by different codegen.
+pub fn coopTileCacheKey(buf: []u8, props: vk.PhysicalDeviceProperties) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "{x}:{x}:{x}", .{ props.vendor_id, props.device_id, props.driver_version }) catch null;
+}
+
+pub const CachedTiles = struct { f16w: ?[2]u32 = null, i8: ?[2]u32 = null };
+
+/// Read this device's measured tiles. A missing, unreadable or unparsable file yields
+/// nulls: not measured yet is the normal case, never a failure.
+pub fn readCoopTileCacheText(io: std.Io, buf: []u8) ?[]const u8 {
+    var pbuf: [512]u8 = undefined;
+    const path = coopTileCachePath(&pbuf) orelse return null;
+    const f = std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_only }) catch return null;
+    defer f.close(io);
+    const len = f.length(io) catch return null;
+    const want = @min(buf.len, @as(usize, @intCast(len)));
+    if (want == 0) return null;
+    const n = f.readPositionalAll(io, buf[0..want], 0) catch return null;
+    return if (n == 0) null else buf[0..n];
+}
+
+pub fn readCoopTileCache(io: std.Io, props: vk.PhysicalDeviceProperties) CachedTiles {
+    var text_buf: [8192]u8 = undefined;
+    const text = readCoopTileCacheText(io, &text_buf) orelse return .{};
+    const n = text.len;
+    var kbuf: [64]u8 = undefined;
+    const key = coopTileCacheKey(&kbuf, props) orelse return .{};
+
+    var out: CachedTiles = .{};
+    var lines = std.mem.splitScalar(u8, text[0..n], '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        var fields = std.mem.tokenizeAny(u8, line, " \t");
+        const lk = fields.next() orelse continue;
+        if (!std.mem.eql(u8, lk, key)) continue;
+        while (fields.next()) |fld| {
+            const eq = std.mem.indexOfScalar(u8, fld, '=') orelse continue;
+            const name = fld[0..eq];
+            var mn = std.mem.splitScalar(u8, fld[eq + 1 ..], 'x');
+            const a_s = mn.next() orelse continue;
+            const b_s = mn.next() orelse continue;
+            const wm = std.fmt.parseInt(u32, a_s, 10) catch continue;
+            const wn = std.fmt.parseInt(u32, b_s, 10) catch continue;
+            if (std.mem.eql(u8, name, "f16")) out.f16w = .{ wm, wn };
+            if (std.mem.eql(u8, name, "i8")) out.i8 = .{ wm, wn };
+        }
+    }
+    return out;
+}
+
+/// Write this device's measured tiles, preserving every other device's line so one cache
+/// serves a multi-GPU box. Best effort: a failure costs persistence, not the result.
+/// Shared by `tune-coop` and the init-time screen so the format has one implementation.
+pub fn writeCoopTileCache(io: std.Io, key: []const u8, f16w: [2]u32, i8t: [2]u32) void {
+    if (key.len == 0) return;
+    var pbuf: [512]u8 = undefined;
+    const path = coopTileCachePath(&pbuf) orelse return;
+
+    var out: [8192]u8 = undefined;
+    const hdr = "# TensorPencil measured coop warp tiles: <vendor>:<device>:<driver> f16=MxN i8=MxN\n";
+    @memcpy(out[0..hdr.len], hdr);
+    var n: usize = hdr.len;
+    var tbuf: [8192]u8 = undefined;
+    if (readCoopTileCacheText(io, &tbuf)) |text| {
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0 or line[0] == '#') continue;
+            var f = std.mem.tokenizeAny(u8, line, " \t");
+            const lk = f.next() orelse continue;
+            if (std.mem.eql(u8, lk, key)) continue;
+            if (n + line.len + 1 > out.len) break;
+            @memcpy(out[n .. n + line.len], line);
+            n += line.len;
+            out[n] = '\n';
+            n += 1;
+        }
+    }
+    const mine = std.fmt.bufPrint(out[n..], "{s} f16={d}x{d} i8={d}x{d}\n", .{ key, f16w[0], f16w[1], i8t[0], i8t[1] }) catch return;
+    n += mine.len;
+
+    if (std.fs.path.dirname(path)) |dir| std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+    var f = std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true }) catch return;
+    defer f.close(io);
+    var wbuf: [1024]u8 = undefined;
+    var w = f.writer(io, &wbuf);
+    w.interface.writeAll(out[0..n]) catch return;
+    w.interface.flush() catch return;
+}
+
+/// Pick a screened tile: the fastest candidate that beats the 64x64 default by `win` in
+/// EVERY pass. Anything less agreed-upon keeps the default, so a noisy screen cannot
+/// commit to a wrong tile -- it can only decline to change one.
+fn pickScreened(cands: []const [2]u32, passes: *const [2][9]f64, win: f64) [2]u32 {
+    var base: [2]f64 = .{ std.math.inf(f64), std.math.inf(f64) };
+    for (cands, 0..) |c, ci| if (c[0] == 64 and c[1] == 64) {
+        for (passes, 0..) |pp, pi| base[pi] = pp[ci];
+    };
+    if (!std.math.isFinite(base[0]) or !std.math.isFinite(base[1])) {
+        // No 64x64 reference (the device cannot express it): take the pass-wise best.
+        var best: [2]u32 = cands[0];
+        var best_ms = std.math.inf(f64);
+        for (cands, 0..) |c, ci| {
+            const worst = @max(passes[0][ci], passes[1][ci]);
+            if (worst < best_ms) {
+                best_ms = worst;
+                best = c;
+            }
+        }
+        return best;
+    }
+    var best: [2]u32 = .{ 64, 64 };
+    var best_ms = @min(base[0], base[1]);
+    for (cands, 0..) |c, ci| {
+        if (c[0] == 64 and c[1] == 64) continue;
+        if (passes[0][ci] > base[0] * win or passes[1][ci] > base[1] * win) continue;
+        const worst = @max(passes[0][ci], passes[1][ci]);
+        if (worst < best_ms) {
+            best_ms = worst;
+            best = c;
+        }
+    }
+    return best;
+}
+
+/// int8 twin of `coopTileCandidates`.
+pub fn coopI8TileCandidates(fm: u32, fnn: u32, nwarps: u32, max_shared: u32, max_invocations: u32, out: *[9][2]u32) []const [2]u32 {
+    const sides = [_]u32{ 64, 32, 16 };
+    var n: usize = 0;
+    for (sides) |wm| for (sides) |wn| {
+        if (coopI8TileFits(wm, wn, fm, fnn, nwarps, max_shared, max_invocations)) {
+            out[n] = .{ wm, wn };
+            n += 1;
+        }
+    };
+    return out[0..n];
+}
+
+/// Every warp tile worth measuring on this device, widest first. Powers of two from
+/// 64 down: 64 is what a ~255-register-per-thread device wants, 32 suits a lane with
+/// far less, and 16 is included so a very small register file has somewhere to go
+/// (it is usually rejected by the staging divisibility check).
+pub fn coopTileCandidates(coop_m: u32, coop_n: u32, max_shared: u32, max_invocations: u32, out: *[9][2]u32) []const [2]u32 {
+    const sides = [_]u32{ 64, 32, 16 };
+    var n: usize = 0;
+    for (sides) |wm| for (sides) |wn| {
+        if (coopTileFits(wm, wn, coop_m, coop_n, max_shared, max_invocations)) {
+            out[n] = .{ wm, wn };
+            n += 1;
+        }
+    };
+    return out[0..n];
+}
+
 /// Short name for a coopmat component type; panic-safe for values outside the
 /// known set (drivers may advertise types this build doesn't enumerate).
 fn componentName(t: vk.ComponentTypeKHR) []const u8 {
@@ -491,6 +744,34 @@ pub const Context = struct {
     coop_m: u32 = 0,
     coop_n: u32 = 0,
     coop_k: u32 = 0,
+    /// Workgroup output tile of the f16 coop GEMM, in elements. Derived from the
+    /// per-warp tile chosen at init, and the padding and dispatch grid in
+    /// `coopF16WDispatch` must use these rather than assuming 128: a device that wants
+    /// a smaller warp tile also wants a smaller wg tile, and a grid computed from the
+    /// wrong one silently covers a fraction of the output.
+    coop_wg_m: u32 = 128,
+    coop_wg_n: u32 = 128,
+    /// Workgroup output tile of the shared int8 coop GEMM. The dispatch grid AND the
+    /// divisibility guard that decides whether a shape may take this path both derive
+    /// from these; a shape that does not divide them falls back instead of being
+    /// half-computed. A smaller tile makes MORE shapes eligible, not fewer.
+    coop_i8_wg_m: u32 = 128,
+    coop_i8_wg_n: u32 = 128,
+    /// The two queried limits `coopTileFits` needs, kept because the tile can change
+    /// after init (the tuner measures candidates on the live device) and every one
+    /// still has to be checked against what the device actually allows.
+    max_shared_bytes: u32 = 0,
+    max_wg_invocations: u32 = 0,
+    /// Kept so anything the context does later that needs file or clock access has one
+    /// (0.16 puts both behind Io). The measured-tile cache read at init uses it.
+    io: std.Io,
+    /// This device+driver's key in the measured-tile cache, so a tuner can write the
+    /// entry back without re-querying properties.
+    cache_key: [64]u8 = @splat(0),
+    cache_key_len: usize = 0,
+    /// What the init-time screen picked, null when it did not run.
+    screen_f16: ?[2]u32 = null,
+    screen_i8: ?[2]u32 = null,
     /// sint8*sint8->sint32 subgroup cooperative-matrix shape (0 = unsupported).
     /// Probed for the int8 (convrot) tensor-core GEMM path.
     coop_i8_m: u32 = 0,
@@ -687,7 +968,7 @@ pub const Context = struct {
     /// LRU-evicted when the device memory budget runs out.
     weights: std.AutoHashMapUnmanaged(usize, WeightEntry) = .empty,
 
-    pub fn init(gpa: std.mem.Allocator) Error!*Context {
+    pub fn init(gpa: std.mem.Allocator, io: std.Io) Error!*Context {
         // Integration tests are gated behind `-Dintegration`: fail init in test
         // builds when it's off so the Vulkan tests self-skip (they `catch SkipZigTest`).
         if (builtin.is_test and !build_options.integration) return error.VulkanUnavailable;
@@ -763,9 +1044,12 @@ pub const Context = struct {
         var coop_i8_m: u32 = 0;
         var coop_i8_n: u32 = 0;
         var coop_i8_k: u32 = 0;
-        // Native bf16 A/B -> f32 config (SPV_KHR_bfloat16), same 16x16x16 tile as
+        // Native bf16 A/B -> f32 config (SPV_KHR_bfloat16), at the same tile as
         // f16: lets the dense bf16 DiT compute in bf16 with no f16 round trip.
         var coop_bf16 = false;
+        // Whether the device offers an f16 ACCUMULATOR at the chosen tile, which is
+        // what the acc_h16 / c_h16 variants need and is not implied by f32 accumulate.
+        var coop_acc_f16 = false;
         if (gipa(instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR")) |pfn| {
             const get_props: vk.PfnGetPhysicalDeviceCooperativeMatrixPropertiesKHR = @ptrCast(pfn);
             var count: u32 = 0;
@@ -783,8 +1067,14 @@ pub const Context = struct {
                                     componentName(cp.result_type), @intFromEnum(cp.scope),   @intFromBool(cp.saturating_accumulation == vk.TRUE),
                                 });
                             }
-                            if (coop_m == 0 and cp.scope == .subgroup and cp.a_type == .float16 and cp.b_type == .float16 and
-                                cp.c_type == .float32 and cp.result_type == .float32 and cp.m_size == 16)
+                            // The f16 GEMM expresses any 8-or-16 M/N at K=16, so take the
+                            // widest such config the device offers rather than the first:
+                            // a bigger fragment is fewer MulAdds for the same warp tile.
+                            const usable_mn = (cp.m_size == 16 or cp.m_size == 8) and
+                                (cp.n_size == 16 or cp.n_size == 8) and cp.k_size == 16;
+                            if (usable_mn and cp.scope == .subgroup and cp.a_type == .float16 and cp.b_type == .float16 and
+                                cp.c_type == .float32 and cp.result_type == .float32 and
+                                cp.m_size * cp.n_size > coop_m * coop_n)
                             {
                                 coop_m = cp.m_size;
                                 coop_n = cp.n_size;
@@ -797,10 +1087,19 @@ pub const Context = struct {
                                 coop_i8_n = cp.n_size;
                                 coop_i8_k = cp.k_size;
                             }
-                            if (cp.scope == .subgroup and cp.a_type == .bfloat16 and cp.b_type == .bfloat16 and
-                                cp.c_type == .float32 and cp.result_type == .float32 and cp.m_size == 16 and cp.n_size == 16 and cp.k_size == 16)
-                            {
-                                coop_bf16 = true;
+                        }
+                        // The f16-accumulate and native-bf16 shaders are built at the
+                        // shape chosen above, so probe for them AT that shape: neither is
+                        // implied by the f32-accumulate config existing. Alchemist offers
+                        // f32/s32 accumulate only, and advertises no f16 C at all.
+                        if (coop_m != 0) {
+                            for (pb[0..count]) |cp| {
+                                if (cp.scope != .subgroup or cp.m_size != coop_m or
+                                    cp.n_size != coop_n or cp.k_size != coop_k) continue;
+                                if (cp.a_type == .float16 and cp.b_type == .float16 and
+                                    cp.c_type == .float16 and cp.result_type == .float16) coop_acc_f16 = true;
+                                if (cp.a_type == .bfloat16 and cp.b_type == .bfloat16 and
+                                    cp.c_type == .float32 and cp.result_type == .float32) coop_bf16 = true;
                             }
                         }
                     }
@@ -1352,12 +1651,56 @@ pub const Context = struct {
         var pipe_coop_f16w: vk.Pipeline = .null_handle;
         var shader_coop_bf16w: vk.ShaderModule = .null_handle;
         var pipe_coop_bf16w: vk.Pipeline = .null_handle;
-        if (coop_m == 16 and coop_n == 16 and coop_k == 16) {
+        // The f16 GEMM is authored against the device's own fragment M/N (16 on NVIDIA
+        // and AMD, 8 on Intel Alchemist); only K is fixed, at the 16 that lets the
+        // 32-deep staging stay two k sub-steps. A shape outside this leaves the coop
+        // pipelines null and the caller falls back, rather than compiling a shader the
+        // driver never advertised.
+        const coop_shape_ok = coop_k == 16 and
+            (coop_m == 16 or coop_m == 8) and (coop_n == 16 or coop_n == 8);
+
+        // Per-warp output tile side. This trades accumulator registers against work
+        // per warp: at 64 a lane carries 128 f32 accumulators, at 32 it carries 32.
+        // Which one wins is a function of the register budget per lane, and Vulkan
+        // exposes no query for that, so it cannot be derived from limits the way the
+        // fragment shape can — it has to be measured per device. Until the autotune
+        // lands, 64 keeps the geometry every existing device was tuned at, the env var
+        // is how a device gets bisected by hand, and the checks below reject a tile
+        // the queried limits or the fragment shape cannot express.
+        // M and N are resolved TOGETHER and validated as a pair. Checking M against
+        // itself would test the square tile, and a legal rectangle whose square form is
+        // illegal (16x32 is expressible where 16x16 is not) would then be silently
+        // demoted to the default on one axis only — which reads as a measurement of the
+        // tile you asked for and is really a measurement of a different one.
+        // Precedence: env override, then the measured cache, then the default. An
+        // explicit request beats a measurement, and a measurement beats a guess.
+        const cached_tiles = readCoopTileCache(io, props);
+        var want_m: u32 = if (cached_tiles.f16w) |t| t[0] else 64;
+        var want_n: u32 = if (cached_tiles.f16w) |t| t[1] else 64;
+        if (getenv("TP_COOP_WARP_TILE")) |v| {
+            want_m = std.fmt.parseInt(u32, std.mem.sliceTo(v, 0), 10) catch 64;
+            want_n = want_m;
+        }
+        if (getenv("TP_COOP_WARP_TILE_N")) |v| {
+            want_n = std.fmt.parseInt(u32, std.mem.sliceTo(v, 0), 10) catch want_m;
+        }
+        if (coop_shape_ok and !coopTileFits(want_m, want_n, coop_m, coop_n, props.limits.max_compute_shared_memory_size, props.limits.max_compute_work_group_invocations)) {
+            std.log.warn("coop warp tile {d}x{d} is not expressible on this device (frag {d}x{d}); using 64x64", .{ want_m, want_n, coop_m, coop_n });
+            want_m = 64;
+            want_n = 64;
+        }
+        const coop_warp_tile = want_m;
+        const coop_warp_tile_n = want_n;
+        if (coop_shape_ok) {
             inline for (.{
                 .{ false, coopmat.coop_warps8, coopmat.coop_acc_h16, false, &shader_coop },
                 .{ true, false, false, false, &shader_coop_f16w },
             }) |v| {
-                const code = try coopmat.buildGemmShared(gpa, v[0], v[1], v[2], v[3], false);
+                // v[0] is b_f16: only the f16-weight variant goes through
+                // coopF16WDispatch, which is the dispatch that derives its grid from the
+                // tile. The fp8 variant has its own 8-warp geometry and its own dispatch,
+                // so it stays at 64 until that one is parameterized too.
+                const code = try coopmat.buildGemmShared(gpa, v[0], v[1], v[2], v[3], false, coop_m, coop_n, if (v[0]) coop_warp_tile else 64, if (v[0]) coop_warp_tile_n else 64);
                 defer gpa.free(code);
                 try check(d.CreateShaderModule(device, &.{
                     .code_size = code.len,
@@ -1365,9 +1708,11 @@ pub const Context = struct {
                 }, null, v[4]));
             }
             // f16 C store rides the fp8 pipe's toggles; it only exists (and
-            // is only exact) with f16 accumulators.
-            if (coopmat.coop_acc_h16) {
-                const code = try coopmat.buildGemmShared(gpa, false, coopmat.coop_warps8, true, true, false);
+            // is only exact) with f16 accumulators, which is a device property:
+            // Intel Alchemist advertises f32/s32 accumulate only, so asking for an
+            // f16 accumulator there requests a config the driver never offered.
+            if (coopmat.coop_acc_h16 and coop_acc_f16) {
+                const code = try coopmat.buildGemmShared(gpa, false, coopmat.coop_warps8, true, true, false, coop_m, coop_n, 64, 64);
                 defer gpa.free(code);
                 try check(d.CreateShaderModule(device, &.{
                     .code_size = code.len,
@@ -1376,7 +1721,7 @@ pub const Context = struct {
             }
             // Native bf16 f16-weight-style GEMM (f16-weight path with bf16 A/B).
             if (coop_bf16) {
-                const code = try coopmat.buildGemmShared(gpa, true, false, false, false, true);
+                const code = try coopmat.buildGemmShared(gpa, true, false, false, false, true, coop_m, coop_n, coop_warp_tile, coop_warp_tile_n);
                 defer gpa.free(code);
                 try check(d.CreateShaderModule(device, &.{
                     .code_size = code.len,
@@ -1403,10 +1748,34 @@ pub const Context = struct {
         errdefer if (pipe_coop_c16 != .null_handle) d.DestroyPipeline(device, pipe_coop_c16, null);
         errdefer if (pipe_coop_f16w != .null_handle) d.DestroyPipeline(device, pipe_coop_f16w, null);
 
+        // int8 warp tile, resolved as a validated PAIR exactly like the f16 one. The
+        // accumulator count per lane is warp_m * warp_n / subgroup_size here too, so an
+        // 8x8-fragment device covering a 64x64 warp needs 64 fragments and spills just
+        // as badly as the f16 path did.
+        const i8_nwarps: u32 = if (coopmat.coop_i8_warps8) 8 else 4;
+        var i8_want_m: u32 = if (cached_tiles.i8) |t| t[0] else 64;
+        var i8_want_n: u32 = if (cached_tiles.i8) |t| t[1] else 64;
+        if (getenv("TP_COOP_I8_TILE")) |v| {
+            i8_want_m = std.fmt.parseInt(u32, std.mem.sliceTo(v, 0), 10) catch 64;
+            i8_want_n = i8_want_m;
+        }
+        if (getenv("TP_COOP_I8_TILE_N")) |v| {
+            i8_want_n = std.fmt.parseInt(u32, std.mem.sliceTo(v, 0), 10) catch i8_want_m;
+        }
+        const i8_shape_ok = coop_i8_k == 32 and (coop_i8_m == 16 or coop_i8_m == 8) and
+            (coop_i8_n == 16 or coop_i8_n == 8);
+        if (i8_shape_ok and !coopI8TileFits(i8_want_m, i8_want_n, coop_i8_m, coop_i8_n, i8_nwarps, props.limits.max_compute_shared_memory_size, props.limits.max_compute_work_group_invocations)) {
+            std.log.warn("coop int8 warp tile {d}x{d} is not expressible on this device (frag {d}x{d}); using 64x64", .{ i8_want_m, i8_want_n, coop_i8_m, coop_i8_n });
+            i8_want_m = 64;
+            i8_want_n = 64;
+        }
+
         // int8 tensor-core GEMM (s8*s8->s32), independent of the f16 coop
         // support: gated on the probed sint8 cooperative-matrix config.
         var shader_coop_i8: vk.ShaderModule = .null_handle;
         var pipe_coop_i8: vk.Pipeline = .null_handle;
+        // buildGemmI8 (the non-shared fallback) still hardcodes 16-row fragments, so it
+        // needs the exact shape. `i8_shared` is on, so the shared path below is what runs.
         if (coop_i8_m == 16 and coop_i8_n == 16 and coop_i8_k == 32) {
             const code = try coopmat.buildGemmI8(gpa, coopmat.i8_mt, coopmat.i8_nt);
             defer gpa.free(code);
@@ -1427,14 +1796,14 @@ pub const Context = struct {
         var pipe_coop_i8_fs: vk.Pipeline = .null_handle;
         var shader_coop_i8_fs16: vk.ShaderModule = .null_handle;
         var pipe_coop_i8_fs16: vk.Pipeline = .null_handle;
-        if (coop_i8_m == 16 and coop_i8_n == 16 and coop_i8_k == 32 and coopmat.i8_shared) {
+        if (i8_shape_ok and coopmat.i8_shared) {
             // (fuse_scale, c_h16, shader*, pipe*): raw-s32, fused-f32, fused-f16.
             inline for (.{
                 .{ false, false, &shader_coop_i8_sh, &pipe_coop_i8_sh },
                 .{ true, false, &shader_coop_i8_fs, &pipe_coop_i8_fs },
                 .{ true, true, &shader_coop_i8_fs16, &pipe_coop_i8_fs16 },
             }) |cfg| {
-                const code = try coopmat.buildGemmSharedI8(gpa, coopmat.coop_i8_warps8, cfg[0], coopmat.coop_i8_double_buf, cfg[1]);
+                const code = try coopmat.buildGemmSharedI8(gpa, coopmat.coop_i8_warps8, cfg[0], coopmat.coop_i8_double_buf, cfg[1], coop_i8_m, coop_i8_n, i8_want_m, i8_want_n);
                 defer gpa.free(code);
                 try check(d.CreateShaderModule(device, &.{
                     .code_size = code.len,
@@ -1454,7 +1823,7 @@ pub const Context = struct {
         // one per convrot cols (6144, 16384).
         var shader_i8_prep: [i8_prep_cols.len]vk.ShaderModule = @splat(.null_handle);
         var pipe_i8_prep: [i8_prep_cols.len]vk.Pipeline = @splat(.null_handle);
-        if (coop_i8_m == 16 and coop_i8_n == 16 and coop_i8_k == 32 and coopmat.i8_shared) {
+        if (i8_shape_ok and coopmat.i8_shared) {
             for (i8_prep_cols, 0..) |cols, i| {
                 const code = try coopmat.buildFusedPrepI8(gpa, cols);
                 defer gpa.free(code);
@@ -1481,7 +1850,13 @@ pub const Context = struct {
         var pipe_scores_vae: vk.Pipeline = .null_handle;
         var shader_scores_sd: vk.ShaderModule = .null_handle;
         var pipe_scores_sd: vk.Pipeline = .null_handle;
-        if (shader_coop != .null_handle) {
+        // buildGemmScores, buildFlashAttn and buildGemmAttnOut still hardcode 16-row
+        // fragments, so they need the exact 16x16x16 shape, not merely "the f16 GEMM
+        // built". Keying these off shader_coop would compile a 16x16 shader on a device
+        // whose f16 GEMM resolved to 8x8. The SD UNet does not use them (its attention
+        // is the attn_batched shader), so they stay off on such a device.
+        const coop_shape_16 = coop_m == 16 and coop_n == 16 and coop_k == 16;
+        if (shader_coop != .null_handle and coop_shape_16) {
             inline for (.{ .{ 128, &shader_scores }, .{ 384, &shader_scores_vae }, .{ 512, &shader_scores_sd } }) |v| {
                 const code = try coopmat.buildGemmScores(gpa, v[0], coopmat.scores_stage_k);
                 defer gpa.free(code);
@@ -1509,7 +1884,7 @@ pub const Context = struct {
 
         var shader_attn_out: vk.ShaderModule = .null_handle;
         var pipe_attn_out: vk.Pipeline = .null_handle;
-        if (shader_coop != .null_handle) {
+        if (shader_coop != .null_handle and coop_shape_16) {
             const code = try coopmat.buildGemmAttnOut(gpa);
             defer gpa.free(code);
             try check(d.CreateShaderModule(device, &.{
@@ -1529,7 +1904,7 @@ pub const Context = struct {
         var pipe_flash_md: vk.Pipeline = .null_handle;
         var shader_flash_out: vk.ShaderModule = .null_handle;
         var pipe_flash_out: vk.Pipeline = .null_handle;
-        if (shader_coop != .null_handle) {
+        if (shader_coop != .null_handle and coop_shape_16) {
             inline for (.{
                 .{ coopmat.buildFlashMd, &shader_flash_md, &pipe_flash_md },
                 .{ coopmat.buildFlashOut, &shader_flash_out, &pipe_flash_out },
@@ -1612,6 +1987,15 @@ pub const Context = struct {
             .device_heap = device_heap,
             .device_name = undefined,
             .device_name_len = 0,
+            // The f16-weight variant is built with warps8 = false, so 4 warps in a
+            // 2 x 2 grid: both wg dimensions are 2 warp tiles.
+            .io = io,
+            .max_shared_bytes = props.limits.max_compute_shared_memory_size,
+            .max_wg_invocations = props.limits.max_compute_work_group_invocations,
+            .coop_i8_wg_m = 2 * i8_want_m,
+            .coop_i8_wg_n = (i8_nwarps / 2) * i8_want_n,
+            .coop_wg_m = 2 * coop_warp_tile,
+            .coop_wg_n = 2 * coop_warp_tile_n,
             .coop_m = coop_m,
             .coop_n = coop_n,
             .coop_k = coop_k,
@@ -1692,9 +2076,26 @@ pub const Context = struct {
         const name_z = std.mem.sliceTo(&props.device_name, 0);
         self.device_name_len = @min(name_z.len, self.device_name.len);
         @memcpy(self.device_name[0..self.device_name_len], name_z[0..self.device_name_len]);
+        if (coopTileCacheKey(&self.cache_key, props)) |k| self.cache_key_len = k.len;
         self.subgroup_size = native_subgroup;
         self.coop_pinned_subgroup = coop_sg orelse 0;
         self.coop_disabled_by_subgroup = coop_disabled_by_subgroup;
+
+        // Screen the warp tiles the first time this device is seen. Skipped when the cache
+        // already answers, when an env override has decided, in test builds (which create
+        // contexts constantly), and on TP_COOP_AUTOTUNE=0 for anyone who would rather pay
+        // the untuned cost than a one-off startup delay. Note the screen picks the tile,
+        // then the RESULT is cached, so only the very first run on a machine pays it.
+        const screened_before = cached_tiles.f16w != null or cached_tiles.i8 != null;
+        const env_decided = getenv("TP_COOP_WARP_TILE") != null or getenv("TP_COOP_WARP_TILE_N") != null or
+            getenv("TP_COOP_I8_TILE") != null or getenv("TP_COOP_I8_TILE_N") != null;
+        const opted_out = !autotune_tiles or
+            if (getenv("TP_COOP_AUTOTUNE")) |v| std.mem.eql(u8, std.mem.sliceTo(v, 0), "0") else false;
+        if (!@import("builtin").is_test and !screened_before and !env_decided and !opted_out and
+            (self.pipe_coop_f16w != .null_handle or self.pipe_coop_i8_sh != .null_handle))
+        {
+            self.screenCoopTiles(gpa);
+        }
         return self;
     }
 
@@ -2885,8 +3286,10 @@ pub const Context = struct {
     ) Error!void {
         const mtile = 16 * coopmat.i8_mt;
         const ntile = 16 * coopmat.i8_nt;
-        std.debug.assert(self.pipe_coop_i8 != .null_handle);
-        std.debug.assert(m_pad % mtile == 0 and rows % ntile == 0 and cols % 32 == 0);
+        // Either kernel is enough. The register-tiled one still hardcodes 16-row
+        // fragments, so a device with only 8x8 (Alchemist) has the shared one alone and
+        // must not be required to have both.
+        std.debug.assert(self.pipe_coop_i8 != .null_handle or self.pipe_coop_i8_sh != .null_handle);
         const w_buf = w_buf_in orelse try self.weightBuffer(w_bytes, 1, rows, cols);
         const w_stride: u32 = @intCast(std.mem.alignForward(usize, rows, tile_n));
         const push: [4]u32 = .{ @intCast(m_pad), @intCast(rows), @intCast(cols), w_stride };
@@ -2894,14 +3297,20 @@ pub const Context = struct {
         // tile / 64-deep k step (all DiT-block shapes qualify); else the
         // register-tiled kernel (small shapes, the standalone check cases).
         const use_sh = self.pipe_coop_i8_sh != .null_handle and
-            m_pad % 128 == 0 and rows % 128 == 0 and cols % 64 == 0 and w_stride % 4 == 0;
+            m_pad % self.coop_i8_wg_m == 0 and rows % self.coop_i8_wg_n == 0 and cols % 64 == 0 and w_stride % 4 == 0;
+        // The register-tiled fallback has its own tile requirement. A device with only
+        // the shared kernel (Alchemist, whose 8x8 fragments the register-tiled one cannot
+        // express) simply cannot serve a shape that misses the shared tile, so report it
+        // rather than assert: the caller can fall back to a non-coop path.
+        if (!use_sh and (self.pipe_coop_i8 == .null_handle or
+            m_pad % mtile != 0 or rows % ntile != 0 or cols % 32 != 0)) return error.UnsupportedDType;
         try self.opBegin();
         var set = self.bind4(.{ w_buf, x_i8.buf, y.buf, try self.dummyBuf() });
         if (use_sh) {
             self.d.CmdBindPipeline(self.cmd, .compute, self.pipe_coop_i8_sh);
             self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
             self.d.CmdPushConstants(self.cmd, self.pipeline_layout, vk.ShaderStage.compute, 0, 16, &push);
-            self.d.CmdDispatch(self.cmd, @intCast(rows / 128), @intCast(m_pad / 128), 1);
+            self.d.CmdDispatch(self.cmd, @intCast(rows / self.coop_i8_wg_n), @intCast(m_pad / self.coop_i8_wg_m), 1);
         } else {
             self.d.CmdBindPipeline(self.cmd, .compute, self.pipe_coop_i8);
             self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
@@ -2932,7 +3341,7 @@ pub const Context = struct {
         const pipe = if (c_h16) self.pipe_coop_i8_fs16 else self.pipe_coop_i8_fs;
         const w_stride: u32 = @intCast(std.mem.alignForward(usize, rows, tile_n));
         if (pipe == .null_handle or
-            m_pad % 128 != 0 or rows % 128 != 0 or cols % 64 != 0 or w_stride % 4 != 0)
+            m_pad % self.coop_i8_wg_m != 0 or rows % self.coop_i8_wg_n != 0 or cols % 64 != 0 or w_stride % 4 != 0)
             return false;
         // `w_buf_in` is an ALREADY k-major device buffer (the W4A8 decode writes one
         // per GEMM); otherwise upload+transpose the host bytes through the weight cache.
@@ -2943,7 +3352,7 @@ pub const Context = struct {
         self.d.CmdBindPipeline(self.cmd, .compute, pipe);
         self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout, vk.ShaderStage.compute, 0, 16, &push);
-        self.d.CmdDispatch(self.cmd, @intCast(rows / 128), @intCast(m_pad / 128), 1);
+        self.d.CmdDispatch(self.cmd, @intCast(rows / self.coop_i8_wg_n), @intCast(m_pad / self.coop_i8_wg_m), 1);
         try self.opEnd();
         return true;
     }
@@ -3150,7 +3559,9 @@ pub const Context = struct {
     }
 
     pub fn opI8GemmBuf(self: *Context, y: DeviceBuffer, w_buf_in: ?vk.Buffer, w_bytes: []const u8, weight_scale: []const f32, rows: usize, c_h16: bool) Error!void {
-        std.debug.assert(self.pipe_coop_i8 != .null_handle);
+        // Either kernel suffices; the register-tiled one is 16-fragment-only, so a device
+        // with just the shared kernel (8x8 fragments) must not be required to have both.
+        std.debug.assert(self.pipe_coop_i8 != .null_handle or self.pipe_coop_i8_sh != .null_handle);
         std.debug.assert(rows % (16 * coopmat.i8_nt) == 0);
         const m = self.i8_m;
         const ws_buf: DeviceBuffer = .{
@@ -3245,7 +3656,7 @@ pub const Context = struct {
             return e.db.buf;
         }
 
-        const n_pad = std.mem.alignForward(usize, rows, 128);
+        const n_pad = self.coopNPad(rows);
         const k_pad = std.mem.alignForward(usize, cols, 64);
         const half = self.gpa.alloc(u16, k_pad * n_pad) catch return error.OutOfMemory;
         defer self.gpa.free(half);
@@ -3316,7 +3727,7 @@ pub const Context = struct {
         // 16-bit k-major [k_pad][n_pad] buffer, so only the pipeline differs.
         const tr_pipe = if (native) self.pipe_tr_bf16raw else self.pipe_tr_bf16w;
 
-        const n_pad = std.mem.alignForward(usize, rows, 128);
+        const n_pad = self.coopNPad(rows);
         const k_pad = std.mem.alignForward(usize, cols, 64);
         const total: u64 = @as(u64, k_pad) * n_pad * 2; // f16 out
         self.reserveForWeights(total);
@@ -3610,6 +4021,9 @@ pub const Context = struct {
     /// k-major layout `coopF16WDispatch` reads. `dit_gpu` pre-sizes with the max over the
     /// model so `ensureDeviceBuffer` never flushes a recording batch mid-forward.
     pub fn nvfp4ScratchBytes(rows: usize, cols: usize) usize {
+        // 128 rather than the live coop wg tile: this only SIZES the scratch, and a
+        // larger alignment is an over-estimate, never a wrong stride. The decode itself
+        // uses coopNPad.
         return std.mem.alignForward(usize, cols, 64) * std.mem.alignForward(usize, rows, 128) * 2;
     }
 
@@ -3624,7 +4038,7 @@ pub const Context = struct {
         cols: usize,
     ) Error!vk.Buffer {
         const nblk = cols / 16;
-        const n_pad = std.mem.alignForward(usize, rows, 128);
+        const n_pad = self.coopNPad(rows);
         const k_pad = std.mem.alignForward(usize, cols, 64);
         try self.ensureDeviceBuffer(&self.nvfp4_w16, nvfp4ScratchBytes(rows, cols));
         const p: DeviceBuffer = .{ .buf = try self.weightBuffer(packed_bytes, 1, rows, cols / 2), .mem = .null_handle, .size = 0 };
@@ -3660,6 +4074,257 @@ pub const Context = struct {
             self.pipes_e[@intFromEnum(Elt.nvfp4_decode_t)] != .null_handle;
     }
 
+    /// Padded N (output-column) extent of the f16 coop GEMM. EVERY producer of a
+    /// k-major weight the GEMM reads must use this, not a literal: the shader is told
+    /// this value as its row stride, so a producer that pads to a different multiple
+    /// lays the weight out at offsets the GEMM does not read. That divergence is not a
+    /// crash, it is a wrong image, and it only appears once the wg tile stops being 128.
+    fn coopNPad(self: *const Context, rows: usize) usize {
+        return std.mem.alignForward(usize, rows, self.coop_wg_n);
+    }
+
+    /// Rebuild the f16-weight coop GEMM at a different warp tile, replacing the live
+    /// pipeline (and the native-bf16 twin, which shares the geometry). Exists because
+    /// the fast tile cannot be derived from any Vulkan query — there is none for the
+    /// register budget per lane, which is what decides it — so it is measured on the
+    /// device, and measuring means running each candidate. `tune-coop` drives this.
+    ///
+    /// Rejects a tile the device cannot express rather than building a broken kernel.
+    /// On failure the previous pipeline is still the live one.
+    pub fn setCoopWarpTile(self: *Context, gpa: std.mem.Allocator, wm: u32, wn: u32) Error!void {
+        if (self.pipe_coop_f16w == .null_handle) return error.NoSuitableDevice;
+        if (!coopTileFits(wm, wn, self.coop_m, self.coop_n, self.max_shared_bytes, self.max_wg_invocations))
+            return error.UnsupportedDType;
+
+        // Build both replacements before destroying anything, so a failure part-way
+        // leaves the context on its previous, working tile.
+        var new_f16w: vk.ShaderModule = .null_handle;
+        var new_f16w_pipe: vk.Pipeline = .null_handle;
+        var new_bf16w: vk.ShaderModule = .null_handle;
+        var new_bf16w_pipe: vk.Pipeline = .null_handle;
+        errdefer {
+            if (new_f16w_pipe != .null_handle) self.d.DestroyPipeline(self.device, new_f16w_pipe, null);
+            if (new_f16w != .null_handle) self.d.DestroyShaderModule(self.device, new_f16w, null);
+            if (new_bf16w_pipe != .null_handle) self.d.DestroyPipeline(self.device, new_bf16w_pipe, null);
+            if (new_bf16w != .null_handle) self.d.DestroyShaderModule(self.device, new_bf16w, null);
+        }
+        const sg: ?u32 = if (self.coop_pinned_subgroup != 0) self.coop_pinned_subgroup else null;
+        {
+            const code = try coopmat.buildGemmShared(gpa, true, false, false, false, false, self.coop_m, self.coop_n, wm, wn);
+            defer gpa.free(code);
+            try check(self.d.CreateShaderModule(self.device, &.{
+                .code_size = code.len,
+                .p_code = @ptrCast(@alignCast(code.ptr)),
+            }, null, &new_f16w));
+            try createCoopPipe(&self.d, self.device, new_f16w, self.pipeline_layout, sg, &new_f16w_pipe);
+        }
+        if (self.pipe_coop_bf16w != .null_handle) {
+            const code = try coopmat.buildGemmShared(gpa, true, false, false, false, true, self.coop_m, self.coop_n, wm, wn);
+            defer gpa.free(code);
+            try check(self.d.CreateShaderModule(self.device, &.{
+                .code_size = code.len,
+                .p_code = @ptrCast(@alignCast(code.ptr)),
+            }, null, &new_bf16w));
+            try createCoopPipe(&self.d, self.device, new_bf16w, self.pipeline_layout, sg, &new_bf16w_pipe);
+        }
+
+        self.d.DestroyPipeline(self.device, self.pipe_coop_f16w, null);
+        self.d.DestroyShaderModule(self.device, self.shader_coop_f16w, null);
+        self.pipe_coop_f16w = new_f16w_pipe;
+        self.shader_coop_f16w = new_f16w;
+        if (new_bf16w_pipe != .null_handle) {
+            self.d.DestroyPipeline(self.device, self.pipe_coop_bf16w, null);
+            self.d.DestroyShaderModule(self.device, self.shader_coop_bf16w, null);
+            self.pipe_coop_bf16w = new_bf16w_pipe;
+            self.shader_coop_bf16w = new_bf16w;
+        }
+        // The padded extents move with the tile, and every k-major weight already
+        // cached was laid out for the OLD coopNPad. Drop the cache so each is rebuilt.
+        self.coop_wg_m = 2 * wm;
+        self.coop_wg_n = 2 * wn;
+        self.evictWeights();
+    }
+
+    pub fn coopCacheKey(self: *const Context) []const u8 {
+        return self.cache_key[0..self.cache_key_len];
+    }
+
+    /// One-off screen for the coop warp tiles on a device that has never been measured.
+    /// Deliberately a SCREEN, not `tune-coop`: small shapes and few iterations, because
+    /// this runs inside init and the full sweep takes minutes on a slow device. It reliably
+    /// finds the large effect (an untuned Alchemist is ~15-18x off) and leaves the last
+    /// ~1.5x, which needs careful multi-shape timing, to the explicit command.
+    ///
+    /// Best effort throughout: any failure leaves the tile that was already resolved.
+    fn screenCoopTiles(self: *Context, gpa: std.mem.Allocator) void {
+        const t_start = std.Io.Clock.real.now(self.io);
+        // How much better than the 64x64 default a tile must measure before this coarse
+        // screen will switch to it. Deliberately far from 1.0: the screen exists to catch
+        // the large effect (an untuned Alchemist is 15-18x off), and it cannot resolve small
+        // differences from one tiny shape -- measured on a 3090 it ranks int8 64x32 ahead of
+        // 64x64, which the full sweep shows is 14% WORSE. A shave the screen cannot see is
+        // `tune-coop`'s job; picking the wrong tile here would be a silent regression.
+        const screen_win: f64 = 0.6;
+        // f16: no divisibility requirement, the dispatch pads. One narrow-m and one wide-m
+        // shape, since the tile that suits a 512-row GEMM is not always the one that suits
+        // a 4096-row one.
+        const F = struct { m: usize, rows: usize, cols: usize };
+        const fshapes = [_]F{ .{ .m = 512, .rows = 1280, .cols = 1280 }, .{ .m = 4096, .rows = 640, .cols = 1152 } };
+        if (self.pipe_coop_f16w != .null_handle) blk: {
+            var cbuf: [9][2]u32 = undefined;
+            const cands = coopTileCandidates(self.coop_m, self.coop_n, self.max_shared_bytes, self.max_wg_invocations, &cbuf);
+            if (cands.len < 2) break :blk;
+            var max_x: usize = 0;
+            var max_y: usize = 0;
+            for (fshapes) |sh| {
+                max_x = @max(max_x, sh.m * sh.cols);
+                max_y = @max(max_y, sh.m * sh.rows);
+            }
+            var x_d = self.tensorCreate(max_x * 4) catch break :blk;
+            defer self.tensorDestroy(&x_d);
+            var y_d = self.tensorCreate(max_y * 4) catch break :blk;
+            defer self.tensorDestroy(&y_d);
+            var w_of: [fshapes.len][]u16 = undefined;
+            var made: usize = 0;
+            defer for (w_of[0..made]) |w| gpa.free(w);
+            for (fshapes, 0..) |sh, i| {
+                w_of[i] = gpa.alloc(u16, sh.rows * sh.cols) catch break :blk;
+                made = i + 1;
+                @memset(w_of[i], 0x3000); // ~0.125 in f16; the values do not matter, the timing does
+            }
+            const bias = gpa.alloc(f32, 1280) catch break :blk;
+            defer gpa.free(bias);
+            @memset(bias, 0);
+
+            // Warm up BEFORE timing anything. A GPU that idles its clocks otherwise makes
+            // whichever candidate is measured first look slow, and the first candidate is
+            // the 64x64 default, so a cold screen actively picks the wrong tile.
+            for (0..8) |_| {
+                self.beginBatch() catch break;
+                for (fshapes, 0..) |sh, i| self.opMatmulCoopF16Wh(y_d, 0, x_d, sh.m, std.mem.sliceAsBytes(w_of[i]), sh.rows, sh.cols, bias[0..sh.rows]) catch {};
+                self.endBatch() catch break;
+            }
+            // Two independent passes. A single pass here is not stable enough to rank at
+            // all -- back-to-back runs of an earlier version disagreed about which tile won
+            // -- so a candidate has to beat the default by the margin in BOTH passes before
+            // it is taken. An unstable measurement then degrades to the default instead of
+            // committing to a guess.
+            var pass: [2][9]f64 = @splat(@splat(std.math.inf(f64)));
+            for (0..2) |pi| for (cands, 0..) |c, ci| {
+                self.setCoopWarpTile(gpa, c[0], c[1]) catch continue;
+                for (0..5) |it| {
+                    const t0 = std.Io.Clock.real.now(self.io);
+                    self.beginBatch() catch break;
+                    for (fshapes, 0..) |sh, i| self.opMatmulCoopF16Wh(y_d, 0, x_d, sh.m, std.mem.sliceAsBytes(w_of[i]), sh.rows, sh.cols, bias[0..sh.rows]) catch {};
+                    self.endBatch() catch break;
+                    const el = @as(f64, @floatFromInt(std.Io.Clock.real.now(self.io).nanoseconds - t0.nanoseconds)) / 1e6;
+                    if (it >= 2) pass[pi][ci] = @min(pass[pi][ci], el); // early passes upload/transpose
+                }
+            };
+            const best = pickScreened(cands, &pass, screen_win);
+            self.setCoopWarpTile(gpa, best[0], best[1]) catch {};
+            self.screen_f16 = best;
+        }
+
+        // int8: m and rows must divide the wg tile and cols the k step, so use multiples
+        // of 128 and 64 that every candidate can express.
+        if (self.pipe_coop_i8_sh != .null_handle) blk: {
+            const nwarps = self.coopI8Warps();
+            var cbuf: [9][2]u32 = undefined;
+            const cands = coopI8TileCandidates(self.coop_i8_m, self.coop_i8_n, nwarps, self.max_shared_bytes, self.max_wg_invocations, &cbuf);
+            if (cands.len < 2) break :blk;
+            const m: usize = 512;
+            const rows: usize = 1280;
+            const cols: usize = 1280;
+            var x_d = self.tensorCreate(m * cols) catch break :blk;
+            defer self.tensorDestroy(&x_d);
+            var y_d = self.tensorCreate(m * rows * 4) catch break :blk;
+            defer self.tensorDestroy(&y_d);
+            const wb = gpa.alloc(u8, rows * cols) catch break :blk;
+            defer gpa.free(wb);
+            @memset(wb, 3);
+
+            for (0..8) |_| {
+                self.beginBatch() catch break;
+                self.opMatmulCoopI8(y_d, x_d, m, null, wb, rows, cols) catch {};
+                self.endBatch() catch break;
+            }
+            var pass: [2][9]f64 = @splat(@splat(std.math.inf(f64)));
+            for (0..2) |pi| for (cands, 0..) |c, ci| {
+                self.setCoopI8WarpTile(gpa, c[0], c[1]) catch continue;
+                for (0..5) |it| {
+                    const t0 = std.Io.Clock.real.now(self.io);
+                    self.beginBatch() catch break;
+                    self.opMatmulCoopI8(y_d, x_d, m, null, wb, rows, cols) catch {};
+                    self.endBatch() catch break;
+                    const el = @as(f64, @floatFromInt(std.Io.Clock.real.now(self.io).nanoseconds - t0.nanoseconds)) / 1e6;
+                    if (it >= 2) pass[pi][ci] = @min(pass[pi][ci], el);
+                }
+            };
+            const best = pickScreened(cands, &pass, screen_win);
+            self.setCoopI8WarpTile(gpa, best[0], best[1]) catch {};
+            self.screen_i8 = best;
+        }
+
+        const took = @as(f64, @floatFromInt(std.Io.Clock.real.now(self.io).nanoseconds - t_start.nanoseconds)) / 1e9;
+        const f16w = self.screen_f16 orelse [2]u32{ 64, 64 };
+        const i8t = self.screen_i8 orelse [2]u32{ 64, 64 };
+        std.log.info("coop tiles screened in {d:.1}s: f16 {d}x{d}, int8 {d}x{d} (run `tune-coop` to refine)", .{ took, f16w[0], f16w[1], i8t[0], i8t[1] });
+        writeCoopTileCache(self.io, self.coopCacheKey(), f16w, i8t);
+    }
+
+    /// Warps per workgroup in the shared int8 GEMM. A compile-time choice in coopmat,
+    /// surfaced here so a tuner can derive the wg tile without importing that module.
+    pub fn coopI8Warps(_: *const Context) u32 {
+        return if (coopmat.coop_i8_warps8) 8 else 4;
+    }
+
+    /// int8 twin of `setCoopWarpTile`: rebuild the three shared int8 variants (raw s32,
+    /// fused f32, fused f16) at a different warp tile. Same reasoning — the tile is not
+    /// derivable from any Vulkan query, so `tune-coop` measures it.
+    pub fn setCoopI8WarpTile(self: *Context, gpa: std.mem.Allocator, wm: u32, wn: u32) Error!void {
+        if (self.pipe_coop_i8_sh == .null_handle) return error.NoSuitableDevice;
+        const nwarps: u32 = if (coopmat.coop_i8_warps8) 8 else 4;
+        if (!coopI8TileFits(wm, wn, self.coop_i8_m, self.coop_i8_n, nwarps, self.max_shared_bytes, self.max_wg_invocations))
+            return error.UnsupportedDType;
+
+        // Build all three before destroying any, so a mid-way failure leaves the context
+        // on its previous working tile.
+        var mods: [3]vk.ShaderModule = @splat(.null_handle);
+        var pipes: [3]vk.Pipeline = @splat(.null_handle);
+        errdefer for (pipes, mods) |pp, mm| {
+            if (pp != .null_handle) self.d.DestroyPipeline(self.device, pp, null);
+            if (mm != .null_handle) self.d.DestroyShaderModule(self.device, mm, null);
+        };
+        const sg: ?u32 = if (self.coop_pinned_subgroup != 0) self.coop_pinned_subgroup else null;
+        inline for (.{ .{ false, false }, .{ true, false }, .{ true, true } }, 0..) |cfg, i| {
+            const code = try coopmat.buildGemmSharedI8(gpa, coopmat.coop_i8_warps8, cfg[0], coopmat.coop_i8_double_buf, cfg[1], self.coop_i8_m, self.coop_i8_n, wm, wn);
+            defer gpa.free(code);
+            try check(self.d.CreateShaderModule(self.device, &.{
+                .code_size = code.len,
+                .p_code = @ptrCast(@alignCast(code.ptr)),
+            }, null, &mods[i]));
+            try createCoopPipe(&self.d, self.device, mods[i], self.pipeline_layout, sg, &pipes[i]);
+        }
+
+        const old_pipes = [_]vk.Pipeline{ self.pipe_coop_i8_sh, self.pipe_coop_i8_fs, self.pipe_coop_i8_fs16 };
+        const old_mods = [_]vk.ShaderModule{ self.shader_coop_i8_sh, self.shader_coop_i8_fs, self.shader_coop_i8_fs16 };
+        for (old_pipes, old_mods) |pp, mm| {
+            if (pp != .null_handle) self.d.DestroyPipeline(self.device, pp, null);
+            if (mm != .null_handle) self.d.DestroyShaderModule(self.device, mm, null);
+        }
+        self.pipe_coop_i8_sh = pipes[0];
+        self.pipe_coop_i8_fs = pipes[1];
+        self.pipe_coop_i8_fs16 = pipes[2];
+        self.shader_coop_i8_sh = mods[0];
+        self.shader_coop_i8_fs = mods[1];
+        self.shader_coop_i8_fs16 = mods[2];
+        self.coop_i8_wg_m = 2 * wm;
+        self.coop_i8_wg_n = (nwarps / 2) * wn;
+        // Cached k-major int8 weights were transposed for the previous tile's stride.
+        self.evictWeights();
+    }
+
     fn coopF16WDispatch(
         self: *Context,
         y: DeviceBuffer,
@@ -3683,9 +4348,9 @@ pub const Context = struct {
         dst_f16: bool,
     ) Error!void {
         std.debug.assert(!(src_f16 and act_div != 1.0));
-        const n_pad = std.mem.alignForward(usize, rows, 128);
+        const n_pad = self.coopNPad(rows);
         const k_pad = std.mem.alignForward(usize, cols, 64);
-        const m_pad = std.mem.alignForward(usize, m, 128);
+        const m_pad = std.mem.alignForward(usize, m, self.coop_wg_m);
         try self.ensureDeviceBuffer(&self.x_h16, m_pad * k_pad * 2);
         try self.ensureDeviceBuffer(&self.y_pad, m_pad * n_pad * 4);
 
@@ -3707,7 +4372,7 @@ pub const Context = struct {
         self.d.CmdBindPipeline(self.cmd, .compute, if (bf16_ab) self.pipe_coop_bf16w else self.pipe_coop_f16w);
         self.d.CmdBindDescriptorSets(self.cmd, .compute, self.pipeline_layout, 0, 1, @ptrCast(&set), 0, null);
         self.d.CmdPushConstants(self.cmd, self.pipeline_layout, vk.ShaderStage.compute, 0, 16, &push);
-        self.d.CmdDispatch(self.cmd, @intCast(n_pad / 128), @intCast(m_pad / 128), 1);
+        self.d.CmdDispatch(self.cmd, @intCast(n_pad / self.coop_wg_n), @intCast(m_pad / self.coop_wg_m), 1);
         try self.opEnd();
 
         const bias_db: DeviceBuffer = .{ .buf = bias_buf, .mem = .null_handle, .size = 0 };
@@ -4714,7 +5379,7 @@ pub const Context = struct {
 test "gpu gdn kernels match cpu reference" {
     const gpa = std.testing.allocator;
     std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
-    var ctx = Context.init(gpa) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
     var prng = std.Random.DefaultPrng.init(555);
     const rand = prng.random();
@@ -4882,7 +5547,7 @@ test "gpu gdn kernels match cpu reference" {
 test "gpu block-quant gemv matches cpu reference" {
     const gpa = std.testing.allocator;
     std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
-    var ctx = Context.init(gpa) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
     const dtypes = @import("tp_core").dtype;
     const quants = @import("tp_core").quants;
@@ -5029,7 +5694,7 @@ test "gpu block-quant gemv matches cpu reference" {
 test "gpu block-quant prefill GEMM matches cpu reference" {
     const gpa = std.testing.allocator;
     std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
-    var ctx = Context.init(gpa) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
     if (!ctx.hasQuantPrefillGemm()) return error.SkipZigTest; // no f16 coopmat on this device
     const dtypes = @import("tp_core").dtype;
@@ -5133,7 +5798,7 @@ test "gpu block-quant prefill GEMM matches cpu reference" {
 test "subgroup reduce runs on device" {
     const gpa = std.testing.allocator;
     std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
-    var ctx = Context.init(gpa) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
     const got = ctx.subgroupProbe() catch |e| {
         std.debug.print("subgroup probe FAILED: {t} (subgroup ops unusable on this device)\n", .{e});
@@ -5146,7 +5811,7 @@ test "subgroup reduce runs on device" {
 test "gpu subgroup rmsnorm matches cpu reference" {
     const gpa = std.testing.allocator;
     std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
-    var ctx = Context.init(gpa) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
     if (!ctx.hasSubgroupNorm()) return error.SkipZigTest;
 
@@ -5206,7 +5871,7 @@ test "gpu subgroup rmsnorm matches cpu reference" {
 test "gpu fused LayerNorm+modulate matches ops.norm.layerNormUnit" {
     const gpa = std.testing.allocator;
     std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
-    var ctx = Context.init(gpa) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
     if (!ctx.hasLnModSg()) return error.SkipZigTest;
 
@@ -5294,7 +5959,7 @@ test "gpu fused LayerNorm+modulate matches ops.norm.layerNormUnit" {
 test "gpu dp4a decode GEMV matches cpu reference" {
     const gpa = std.testing.allocator;
     std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
-    var ctx = Context.init(gpa) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
     if (!ctx.hasIntDot()) return error.SkipZigTest;
     const dtypes = @import("tp_core").dtype;
@@ -5421,7 +6086,7 @@ test "gpu dp4a decode GEMV matches cpu reference" {
 test "gpu matmul matches cpu reference" {
     const gpa = std.testing.allocator;
     std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
-    var ctx = Context.init(gpa) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
     std.debug.print("gpu device: {s}\n", .{ctx.deviceName()});
 
@@ -5702,7 +6367,7 @@ test "gpu matmul matches cpu reference" {
 test "flash attention matches reference" {
     const gpa = std.testing.allocator;
     std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
-    var ctx = Context.init(gpa) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
     if (ctx.pipe_flash_md == .null_handle) return error.SkipZigTest;
 
@@ -5833,7 +6498,7 @@ test "flash attention matches reference" {
 test "opAttnDecodeQ35 bidirectional kv_end matches cpu reference" {
     const gpa = std.testing.allocator;
     std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
-    var ctx = Context.init(gpa) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
 
     const n_heads = 4;
@@ -5929,7 +6594,7 @@ test "opAttnDecodeQ35 bidirectional kv_end matches cpu reference" {
 test "vulkan q8_0 KV: kv_store_q8_0 matches host packing, attention matches reference" {
     const gpa = std.testing.allocator;
     std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
-    var ctx = Context.init(gpa) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
     const kvmod = @import("tp_core").kv_cache;
 
@@ -6047,7 +6712,7 @@ test "vulkan q8_0 KV: kv_store_q8_0 matches host packing, attention matches refe
 test "gpu argmax matches cpu argmax (incl. tie -> lowest index)" {
     const gpa = std.testing.allocator;
     std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
-    var ctx = Context.init(gpa) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
 
     var prng = std.Random.DefaultPrng.init(0xA11CE);
@@ -6088,7 +6753,7 @@ test "gpu argmax matches cpu argmax (incl. tie -> lowest index)" {
 test "gpu topk selects the true top-k set" {
     const gpa = std.testing.allocator;
     std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
-    var ctx = Context.init(gpa) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
 
     var prng = std.Random.DefaultPrng.init(0x70FF);
@@ -6142,7 +6807,7 @@ test "gpu topk selects the true top-k set" {
 test "gpu penalize matches cpu applyPenalties" {
     const gpa = std.testing.allocator;
     std.Io.Dir.cwd().access(std.testing.io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
-    var ctx = Context.init(gpa) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
 
     var prng = std.Random.DefaultPrng.init(0x9E4A17);

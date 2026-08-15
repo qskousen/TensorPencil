@@ -9,6 +9,8 @@
 const std = @import("std");
 const dvui = @import("dvui");
 const config = @import("config.zig");
+const style = @import("style.zig");
+const bubbles = @import("bubbles.zig");
 const diffuser = @import("diffuser.zig");
 const model_spec = @import("model_spec.zig");
 const SDLBackend = @import("backend");
@@ -110,9 +112,16 @@ pub const Callbacks = struct {
 // Transient view state: numeric fields are edited as text, seeded from the
 // config the first frame after `open()`.
 var seeded: bool = false;
+
+/// Drop the seeded form buffers so the next render re-reads the config.
+///
+/// The buffers are seeded ONCE, which means an edit made anywhere else (the
+/// composer's framing chips) leaves this view holding the old numbers — and
+/// Apply would write them straight back over the change.
+pub fn reseed() void {
+    seeded = false;
+}
 var steps_buf: [16]u8 = [_]u8{0} ** 16;
-var width_buf: [16]u8 = [_]u8{0} ** 16;
-var height_buf: [16]u8 = [_]u8{0} ** 16;
 var regen_buf: [16]u8 = [_]u8{0} ** 16;
 // Per-reply token cap. Sits in the sampling SECTION but is committed with the
 // other plain integers (commitNumbers), not with commitSampling: it is not part
@@ -149,8 +158,6 @@ pub fn open() void {
 
 fn seed(cfg: *const config.Config) void {
     _ = std.fmt.bufPrintZ(&steps_buf, "{d}", .{cfg.steps}) catch {};
-    _ = std.fmt.bufPrintZ(&width_buf, "{d}", .{cfg.width}) catch {};
-    _ = std.fmt.bufPrintZ(&height_buf, "{d}", .{cfg.height}) catch {};
     _ = std.fmt.bufPrintZ(&regen_buf, "{d}", .{cfg.regen_cache_mb}) catch {};
     _ = std.fmt.bufPrintZ(&maxnew_buf, "{d}", .{cfg.max_new_tokens}) catch {};
     seedSampling(cfg);
@@ -190,8 +197,6 @@ fn clampDim(n: usize) usize {
 /// on Apply, before the app persists + reloads.
 fn commitNumbers(cfg: *config.Config) void {
     cfg.steps = std.math.clamp(parseNum(&steps_buf, cfg.steps), 1, 100);
-    cfg.width = clampDim(parseNum(&width_buf, cfg.width));
-    cfg.height = clampDim(parseNum(&height_buf, cfg.height));
     // Regen (checkpoint) cache: host RAM, capped at 64 GB to catch typos.
     cfg.regen_cache_mb = @min(parseNum(&regen_buf, cfg.regen_cache_mb), 64 << 10);
     // Max response: 0 keeps its "no explicit cap" meaning, so this only bounds
@@ -219,17 +224,33 @@ fn commitSampling(cfg: *config.Config) void {
 pub fn render(cfg: *config.Config, cb: Callbacks) void {
     if (!seeded) seed(cfg);
 
-    // Header: title + footer actions (kept at top so they're always reachable).
+    // Settings takes the whole window (it is a mode, not a place in the
+    // workspace), so unlike Studio it keeps a header of its own — it is the only
+    // way back.
     {
-        var header = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = dvui.Rect.all(10) });
+        var header = dvui.box(@src(), .{ .dir = .horizontal }, .{
+            .expand = .horizontal,
+            .min_size_content = .{ .h = style.Layout.title_h },
+            .max_size_content = .height(style.Layout.title_h),
+            .background = true,
+            .color_fill = style.C.chrome,
+            .border = style.Edge.bottom,
+            .color_border = style.hairline,
+            .padding = .{ .x = 14, .w = 14 },
+        });
         defer header.deinit();
-        dvui.label(@src(), "Settings", .{}, .{ .font = .theme(.title), .gravity_y = 0.5 });
+        dvui.labelNoFmt(@src(), "Settings", .{}, .{
+            .font = style.F.app,
+            .color_text = style.C.text_hi,
+            .gravity_y = 0.5,
+            .padding = .{},
+        });
         {
             var sp = dvui.box(@src(), .{}, .{ .expand = .horizontal });
             sp.deinit();
         }
-        if (dvui.button(@src(), "Cancel", .{}, .{ .gravity_y = 0.5 })) cb.cancel();
-        if (dvui.button(@src(), "Apply & Reload", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 6 } })) {
+        if (bubbles.secondaryButton(@src(), 0, "Cancel", true)) cb.cancel();
+        if (bubbles.primaryButton(@src(), "Apply & Reload", true)) {
             commitNumbers(cfg);
             cb.apply();
         }
@@ -265,8 +286,10 @@ pub fn render(cfg: *config.Config, cb: Callbacks) void {
         "folder in your Pictures directory; clear it to disable saving.");
     dirRow("Output folder", &cfg.output_dir);
     numRow("Default steps", &steps_buf);
-    numRow("Default width", &width_buf);
-    numRow("Default height", &height_buf);
+    // No width/height here. Image size is the composer's framing chips (aspect
+    // ratio + megapixels), which are the single source for it; a second pair of
+    // fields would be two controls writing one value, and whichever was touched
+    // last would silently win.
 
     {
         var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 4 } });
@@ -377,6 +400,16 @@ pub fn render(cfg: *config.Config, cb: Callbacks) void {
         "template that can make multi-turn or reasoning chats misbehave; this " ++
         "renders exactly what Google's reference does. Reloads the model (chat " ++
         "preserved). Ignored by non-Gemma-4 models.");
+    {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 4 } });
+        defer row.deinit();
+        _ = dvui.checkbox(@src(), &cfg.image_tool_result, "Report image results to the model", .{ .gravity_y = 0.5 });
+    }
+    help("When an image the model asked for finishes or fails, put a short note " ++
+        "in the conversation before your next message, so the model knows what " ++
+        "happened and can react (offering a smaller retry after running out of " ++
+        "VRAM, for instance). Off makes the image tool fire-and-forget: the " ++
+        "model asks, and never learns the outcome.");
     {
         var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 4 } });
         defer row.deinit();

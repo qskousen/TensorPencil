@@ -411,7 +411,7 @@ test "gpu conv matches cpu conv2d" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
-    var ctx = Context.init(gpa) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
 
     var prng = std.Random.DefaultPrng.init(31);
@@ -507,7 +507,7 @@ test "gpu decode matches comfyui reference" {
     const vae_path = "models/vae/krea2RealVae_v10.safetensors";
     std.Io.Dir.cwd().access(io, vae_path, .{}) catch return error.SkipZigTest;
     std.Io.Dir.cwd().access(io, "testdata/vae_z_8x8.bin", .{}) catch return error.SkipZigTest;
-    var ctx = Context.init(gpa) catch return error.SkipZigTest;
+    var ctx = Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
 
     const z = try gpa.alloc(f32, 16 * 8 * 8);

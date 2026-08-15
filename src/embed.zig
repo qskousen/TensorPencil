@@ -321,7 +321,7 @@ test "embed façade Vulkan matches CPU" {
     const io = std.testing.io;
     const dir = "../DiffKeep/Models/snowflake-arctic-embed-m-v2.0";
     std.Io.Dir.cwd().access(io, dir, .{}) catch return error.SkipZigTest;
-    const ctx = tp_gpu.context.Context.init(gpa) catch return error.SkipZigTest;
+    const ctx = tp_gpu.context.Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
 
     var cpu_enc = try TextEncoder.open(gpa, io, .arctic_embed_m_v2, dir, .cpu);

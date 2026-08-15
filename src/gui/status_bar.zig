@@ -1,11 +1,15 @@
-//! The tp-gui bottom status bar: live VRAM (total + the
-//! chat model's resident footprint), the active VRAM limit, and CPU / GPU
-//! utilization, each with a small rolling sparkline. Sampled from `sysmon`
-//! (CPU via /proc/stat, GPU via NVML) and the LLM backend's device accounting.
+//! The tp-gui status bar: three history meters (GPU / CPU / VRAM) on the left,
+//! then the two-sided VRAM meter (see meter.zig) filling the rest. Sampled from
+//! `sysmon` (CPU via /proc/stat, GPU via NVML) and the engines' own device
+//! accounting.
 //!
-//! Rendered as the last child of the chat frame's root vbox; its fixed height
-//! (`bar_height`) is subtracted from the message-list height so it never
-//! overlaps the list.
+//! It spans the WHOLE window, under all three columns, and never migrates into
+//! a panel: this telemetry is a property of the app, not of any one view. Its
+//! fixed height (`bar_height`) is subtracted from the body band by the caller.
+//!
+//! This module owns SAMPLING and model-building; meter.zig owns the track's
+//! drawing and interaction, and style.zig owns the history meter, which the
+//! `ui-probe` harness also draws.
 const std = @import("std");
 const dvui = @import("dvui");
 const chat = @import("chat.zig");
@@ -13,13 +17,21 @@ const diffuser = @import("diffuser.zig");
 const sysmon = @import("sysmon.zig");
 const meter = @import("meter.zig");
 const vram_split = @import("vram_split.zig");
+const style = @import("style.zig");
+const fonts = @import("fonts.zig");
 
-/// Fixed bar height (logical px), reserved by the caller. The VRAM meter row
-/// (top) plus the readout row (bottom).
-pub const bar_height: f32 = 52;
+const C = style.C;
+const F = style.F;
 
-/// Number of samples kept per sparkline.
-const hist_n = 48;
+/// Fixed bar height (logical px), reserved by the caller. Spans the WHOLE
+/// window, under all three columns: telemetry is a property of the app, not of
+/// the queue rail it used to sit in.
+pub const bar_height: f32 = style.Layout.status_h;
+
+/// Samples kept per sparkline. At the ~2 Hz cadence below this is a ~24 s
+/// window, which is long enough to show a generation start and short enough
+/// that the graph still moves.
+const hist_n = 26;
 
 /// A small fixed-capacity rolling history, iterated oldest->newest via `at`.
 const Ring = struct {
@@ -162,13 +174,15 @@ fn sampleInto(s: ?*chat.Session, loading: bool, diff_busy: bool, diff: diffuser.
 pub fn render(s: ?*chat.Session, loading: bool, diff_busy: bool, diff: diffuser.VramBreakdown, split: *f32, limit: *f32, llm_armed: bool, diff_armed: bool, llm_paused: bool, diff_paused: bool, acts: meter.Actions) void {
     _ = sysmon.nvml(); // opens on first use
 
-    const theme = dvui.themeGet();
     var bar = dvui.box(@src(), .{ .dir = .horizontal }, .{
         .expand = .horizontal,
         .min_size_content = .{ .h = bar_height },
-        .color_fill = theme.fill.lerp(theme.text, 0.06),
+        .max_size_content = .height(bar_height),
+        .color_fill = C.chrome,
         .background = true,
-        .padding = .{ .x = 8, .y = 3, .w = 8 },
+        .border = style.Edge.top,
+        .color_border = style.hairline,
+        .padding = .{ .x = 14, .y = 9, .w = 14, .h = 10 },
     });
     defer bar.deinit();
 
@@ -180,21 +194,28 @@ pub fn render(s: ?*chat.Session, loading: bool, diff_busy: bool, diff: diffuser.
         dvui.timer(bar.data().id, if (diff_busy) sample_interval_busy_us else sample_interval_us);
     }
 
-    var top: [24]u8 = undefined;
-    var bot: [24]u8 = undefined;
-    // Left: CPU/GPU/VRAM, util% on top, clock/size beneath (a 2-row stack that
-    // matches the meter's number columns), plus a trend sparkline.
-    if (cur.have_gpu) {
-        metric(0, 72, &h_gpu, .{ .r = 120, .g = 200, .b = 120, .a = 235 }, std.fmt.bufPrint(&top, "GPU {d:.0}%", .{cur.gpu_util}) catch "GPU", std.fmt.bufPrint(&bot, "{d:.2} GHz", .{@as(f64, @floatFromInt(cur.gpu_mhz)) / 1000.0}) catch "");
-    }
-    metric(6, 72, &h_cpu, .{ .r = 230, .g = 170, .b = 110, .a = 235 }, std.fmt.bufPrint(&top, "CPU {d:.0}%", .{cur.cpu}) catch "CPU", std.fmt.bufPrint(&bot, "{d:.2} GHz", .{cur.cpu_mhz / 1000.0}) catch "");
+    // Left: three history meters. The number and the history ARE the meter --
+    // no clock speeds, no x/y GB, no second progress bar.
+    if (cur.have_gpu) historyMeter(0, "GPU", cur.gpu_util / 100.0, &h_gpu, C.meter_gpu);
+    historyMeter(1, "CPU", cur.cpu / 100.0, &h_cpu, C.meter_cpu);
     if (cur.vram_total > 0) {
-        metric(2, 88, &h_vram, .{ .r = 110, .g = 160, .b = 230, .a = 235 }, std.fmt.bufPrint(&top, "VRAM {d:.0}%", .{@as(f64, @floatFromInt(cur.vram_used)) / @as(f64, @floatFromInt(cur.vram_total)) * 100}) catch "VRAM", std.fmt.bufPrint(&bot, "{d:.1}/{d:.0} GB", .{ @as(f64, @floatFromInt(cur.vram_used)) / gib, @as(f64, @floatFromInt(cur.vram_total)) / gib }) catch "");
+        const frac: f32 = @floatCast(@as(f64, @floatFromInt(cur.vram_used)) / @as(f64, @floatFromInt(cur.vram_total)));
+        // The only place the bar shouts. VRAM is the resource that actually
+        // fails, so it is the only one whose color carries a threshold.
+        const c = if (frac > 0.95) C.danger else if (frac >= 0.80) C.amber else C.meter_vram;
+        historyMeter(2, "VRAM", frac, &h_vram, c);
     }
-    sep(10);
+    style.vsep(@src());
 
-    // The rest of the bar is the live VRAM meter (see meter.zig).
+    // The rest of the bar is the two-sided VRAM meter (see meter.zig).
     renderMeter(s, diff, split, limit, llm_armed, diff_armed, llm_paused, diff_paused, acts);
+}
+
+/// Unpack a ring into the flat 0..1 slice `style.historyMeter` wants.
+fn historyMeter(id: usize, label: []const u8, value: f32, ring: *const Ring, color: dvui.Color) void {
+    var vals: [hist_n]f32 = undefined;
+    for (0..ring.len) |i| vals[i] = ring.at(i) / 100.0;
+    style.historyMeter(@src(), id, label, value, vals[0..ring.len], color);
 }
 
 /// Build the meter model from live device accounting and draw it. The diffusion
@@ -226,6 +247,7 @@ fn renderMeter(s: ?*chat.Session, diff: diffuser.VramBreakdown, split: *f32, lim
         // they belong to the model, not to `ovh` (see vram_split.Parts).
         .llm_w = (cur.llm_used -| ctx_b) + cur.parts.loading,
         .llm_ctx = ctx_b,
+        .ctx_tokens = cur.ctx_tokens,
         // MEASURED per-component diffusion breakdown (see pipeline.vramBreakdown).
         .te = cur.diff.te,
         .dit = cur.diff.dit,
@@ -255,68 +277,6 @@ fn renderMeter(s: ?*chat.Session, diff: diffuser.VramBreakdown, split: *f32, lim
 fn fmtTokens(buf: []u8, n: usize) []const u8 {
     if (n >= 1000) return std.fmt.bufPrint(buf, "{d:.1}k", .{@as(f64, @floatFromInt(n)) / 1000.0}) catch "?";
     return std.fmt.bufPrint(buf, "{d}", .{n}) catch "?";
-}
-
-/// One left-hand metric: a 2-row text stack (top = util%, bottom = clock/size)
-/// beside its trend sparkline. `wtext` fixes the text column width (pick it wide
-/// enough for the max string) so digit-count changes never shift the bar.
-fn metric(id: usize, wtext: f32, ring: *const Ring, color: dvui.Color, top: []const u8, bottom: []const u8) void {
-    var box = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = id, .gravity_y = 0.5, .margin = .{ .w = 4 } });
-    defer box.deinit();
-    {
-        var txt = dvui.box(@src(), .{ .dir = .vertical }, .{
-            .gravity_y = 0.5,
-            .min_size_content = .{ .w = wtext },
-            .max_size_content = .width(wtext),
-        });
-        defer txt.deinit();
-        stackLine(0, top, false);
-        stackLine(1, bottom, true);
-    }
-    spark(id, ring, color);
-}
-
-fn stackLine(id: usize, text: []const u8, dim: bool) void {
-    const th = dvui.themeGet();
-    dvui.label(@src(), "{s}", .{text}, .{
-        .id_extra = id,
-        .gravity_x = 0.0,
-        .font = dvui.Font.theme(.body).withSize(9),
-        .padding = .{},
-        .margin = .{ .y = 1 },
-        .color_text = if (dim) th.fill.lerp(th.text, 0.45) else null,
-    });
-}
-
-/// A thin vertical separator between meter groups.
-fn sep(id: usize) void {
-    dvui.label(@src(), "│", .{}, .{ .id_extra = id, .gravity_y = 0.5, .font = dvui.Font.theme(.body).withSize(12), .margin = .{ .x = 4 } });
-}
-
-/// Draw a rolling sparkline (bars scaled to a 0..100 range) inside a small box.
-fn spark(id: usize, ring: *const Ring, color: dvui.Color) void {
-    var bx = dvui.box(@src(), .{}, .{
-        .id_extra = id,
-        .min_size_content = .{ .w = 56, .h = 30 },
-        .gravity_y = 0.5,
-        .margin = .{ .x = 2, .w = 10 },
-    });
-    defer bx.deinit();
-    const r = bx.data().rectScale().r;
-    if (ring.len == 0 or r.w <= 0 or r.h <= 0) return;
-    const bw = r.w / @as(f32, @floatFromInt(hist_n));
-    var i: usize = 0;
-    while (i < ring.len) : (i += 1) {
-        const frac = std.math.clamp(ring.at(i) / 100.0, 0.0, 1.0);
-        const bh = @max(1.0, r.h * frac);
-        const bar_r: dvui.Rect.Physical = .{
-            .x = r.x + @as(f32, @floatFromInt(i)) * bw,
-            .y = r.y + r.h - bh,
-            .w = @max(1.0, bw - 1.0),
-            .h = bh,
-        };
-        bar_r.fill(.{}, .{ .color = color });
-    }
 }
 
 test "Ring pushes and reads oldest→newest with wraparound" {

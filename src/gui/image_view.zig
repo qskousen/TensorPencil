@@ -10,11 +10,14 @@
 const std = @import("std");
 const dvui = @import("dvui");
 const config = @import("config.zig");
+const tp = @import("TensorPencil");
 const diffuser = @import("diffuser.zig");
 const model_spec = @import("model_spec.zig");
 const clipboard = @import("clipboard.zig");
 const fonts = @import("fonts.zig");
 const hint = @import("hint.zig");
+const style = @import("style.zig");
+const bubbles = @import("bubbles.zig");
 
 const GenImage = diffuser.GenImage;
 
@@ -33,6 +36,13 @@ var g_spec_ready: bool = false;
 
 // Form fields (numeric ones edited as text, like the settings view).
 var seeded: bool = false;
+
+/// Drop the seeded form fields so the next render re-reads the config. Called
+/// when the composer's framing chips change the default size; without it the
+/// studio keeps generating at whatever size it was first opened with.
+pub fn reseed() void {
+    seeded = false;
+}
 /// The architecture the form was last seeded for. A change here means the user
 /// picked a different kind of model, and the CFG default is re-seeded.
 var seeded_family: ?model_spec.Family = null;
@@ -86,9 +96,10 @@ fn currentFamily(cfg: *const config.Config) ?model_spec.Family {
 }
 
 fn seed(cfg: *const config.Config, fam: ?model_spec.Family) void {
-    // Width / height / steps belong to Settings, they are the user's explicit
-    // global defaults, so the form must not overwrite them with an
-    // architecture's suggestion.
+    // Width / height come from the composer's framing chips and steps from
+    // Settings: both are the user's explicit global defaults, so the form must
+    // not overwrite them with an architecture's suggestion. `reseed` re-runs
+    // this when the framing changes.
     _ = std.fmt.bufPrintZ(&width_buf, "{d}", .{cfg.width}) catch {};
     _ = std.fmt.bufPrintZ(&height_buf, "{d}", .{cfg.height}) catch {};
     _ = std.fmt.bufPrintZ(&steps_buf, "{d}", .{cfg.steps}) catch {};
@@ -121,7 +132,6 @@ fn parseFloat(buf: []const u8, fallback: f32) f32 {
 }
 
 pub const Callbacks = struct {
-    to_chat: *const fn () void,
     settings: *const fn () void,
 };
 
@@ -135,35 +145,25 @@ pub fn render(cfg: *const config.Config, d: ?*diffuser.Diffuser, ready: bool, cb
     // back) is a visibly wrong image, not a preference.
     if (!seeded or !famEql(fam, seeded_family)) seed(cfg, fam);
 
-    // Header: title + Chat / Settings actions.
-    {
-        var header = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = dvui.Rect.all(10) });
-        defer header.deinit();
-        dvui.label(@src(), "Image studio", .{}, .{ .font = .theme(.title), .gravity_y = 0.5 });
-        {
-            var sp = dvui.box(@src(), .{}, .{ .expand = .horizontal });
-            sp.deinit();
-        }
-        if (dvui.button(@src(), "Chat", .{}, .{ .gravity_y = 0.5 })) cb.to_chat();
-        var wd: dvui.WidgetData = undefined;
-        if (dvui.buttonIcon(@src(), "settings", dvui.entypo.cog, .{}, .{}, .{
-            .gravity_y = 0.5,
-            .min_size_content = .{ .w = 22, .h = 22 },
-            .margin = .{ .x = 6 },
-            .data_out = &wd,
-        })) cb.settings();
-        hint.hover(@src(), &wd, "Settings");
-    }
+    // No header here: the window's title bar already names this view and owns
+    // the Chat/Studio switch, so a second title row was two things claiming to
+    // be the top of the screen.
 
     const engine = d orelse {
         // No diffusion model configured: explain + shortcut to settings.
         var col = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both, .gravity_x = 0.5, .gravity_y = 0.5, .padding = dvui.Rect.all(24) });
         defer col.deinit();
-        var tl = dvui.textLayout(@src(), .{}, .{ .gravity_x = 0.5 });
-        fonts.addRich(tl, "No diffusion model is set.\n\nOpen Settings and choose a diffusion model to generate images here. " ++
-            "Most checkpoints bundle everything they need; the text encoder and VAE fields are only for supplying or replacing a piece.");
+        var tl = dvui.textLayout(@src(), .{}, .{ .gravity_x = 0.5, .background = false, .max_size_content = .width(style.Layout.prose_max) });
+        fonts.addStyled(tl, "No diffusion model is set.\n\nOpen Settings and choose a diffusion model to generate images here. " ++
+            "Most checkpoints bundle everything they need; the text encoder and VAE fields are only for supplying or replacing a piece.", .{}, .{
+            .font = style.F.prose,
+            .color_text = style.C.text,
+        });
         tl.deinit();
-        if (dvui.button(@src(), "Open Settings", .{}, .{ .gravity_x = 0.5, .margin = .{ .y = 12 } })) cb.settings();
+        var actions = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = 0.5, .margin = .{ .y = 14 } });
+        const go = bubbles.primaryButton(@src(), "Open Settings", true);
+        actions.deinit();
+        if (go) cb.settings();
         return;
     };
 
@@ -317,6 +317,7 @@ fn generate(cfg: *const config.Config, engine: *diffuser.Diffuser) void {
             .req_height = h,
             .req_steps = steps,
             .req_cfg = cfg_scale,
+            .from_studio = true,
             // Random: a fresh distinct seed each. Fixed: the entered seed,
             // advanced per image so a batch still varies.
             .req_seed = if (random_seed) engine.nextSeed() else base_seed +% i,
@@ -328,6 +329,68 @@ fn generate(cfg: *const config.Config, engine: *diffuser.Diffuser) void {
         };
     }
     engine.pump();
+}
+
+/// Load a finished image's parameters into the studio form, for the tool
+/// card's "Open in Studio". Everything the user would otherwise re-type by
+/// reading the metadata line: prompt, negative, size, steps, cfg, and the exact
+/// seed, so the first thing Generate does is reproduce what they were looking
+/// at, and every edit from there is a deliberate change to a known starting
+/// point.
+pub fn loadFrom(gi: *const GenImage) void {
+    // Prefer the SAVED FILE's own metadata when this image has no live request
+    // behind it (one rebuilt from a reopened conversation). The PNG carries the
+    // AUTOMATIC1111 block that describes exactly how it was made, which makes
+    // the file the record and saves the transcript carrying a second copy that
+    // could disagree with it.
+    if (gi.prompt.len == 0) if (gi.saved_path) |path| {
+        if (loadFromFile(path)) return;
+    };
+
+    setBuf(&prompt_buf, gi.prompt);
+    setBuf(&negative_buf, gi.req_negative);
+    setFmt(&width_buf, "{d}", .{gi.req_width});
+    setFmt(&height_buf, "{d}", .{gi.req_height});
+    setFmt(&steps_buf, "{d}", .{gi.req_steps});
+    setFmt(&cfg_buf, "{d:.1}", .{gi.req_cfg});
+    setFmt(&seed_buf, "{d}", .{gi.req_seed});
+    setBuf(&count_buf, "1");
+    random_seed = false; // an exact seed is the whole point of reopening one
+    seeded = true; // do not let `seed()` overwrite what we just put here
+}
+
+/// Fill the form from a saved PNG's `parameters` block. Returns false when the
+/// file is gone or carries no metadata (an image saved by something that did
+/// not write one), so the caller can fall back to whatever it has in memory.
+fn loadFromFile(path: []const u8) bool {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(g_io, path, g_gpa, @enumFromInt(64 << 20)) catch return false;
+    defer g_gpa.free(bytes);
+    const text = tp.image.pngText(bytes, "parameters") orelse return false;
+    const p = diffuser.parseA1111Params(text);
+    if (p.prompt.len == 0) return false;
+
+    setBuf(&prompt_buf, p.prompt);
+    setBuf(&negative_buf, p.negative);
+    if (p.width) |v| setFmt(&width_buf, "{d}", .{v});
+    if (p.height) |v| setFmt(&height_buf, "{d}", .{v});
+    if (p.steps) |v| setFmt(&steps_buf, "{d}", .{v});
+    if (p.cfg) |v| setFmt(&cfg_buf, "{d:.1}", .{v});
+    if (p.seed) |v| setFmt(&seed_buf, "{d}", .{v});
+    setBuf(&count_buf, "1");
+    random_seed = false;
+    seeded = true;
+    return true;
+}
+
+fn setBuf(buf: []u8, text: []const u8) void {
+    @memset(buf, 0);
+    const n = @min(text.len, buf.len - 1);
+    @memcpy(buf[0..n], text[0..n]);
+}
+
+fn setFmt(buf: []u8, comptime fmt: []const u8, args: anytype) void {
+    @memset(buf, 0);
+    _ = std.fmt.bufPrint(buf, fmt, args) catch {};
 }
 
 /// Display size for an image: downscale so the longer side is `max`, never up.
@@ -443,7 +506,7 @@ fn renderCell(engine: *diffuser.Diffuser, gi: *GenImage, idx: usize, cell: f32) 
                 std.fmt.bufPrint(&fbuf, "failed: {s}", .{diffuser.failureText(err)}) catch "failed"
             else
                 "failed";
-            var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal });
+            var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .background = false });
             fonts.addRich(tl, msg);
             tl.deinit();
             retryButton(engine, gi);

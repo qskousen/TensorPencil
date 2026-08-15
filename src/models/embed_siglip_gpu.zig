@@ -391,7 +391,7 @@ test "siglip2 text tower Vulkan matches CPU" {
     const io = std.testing.io;
     const dir = "../DiffKeep/Models/ViT-B-16-SigLIP2-timm";
     std.Io.Dir.cwd().access(io, dir, .{}) catch return error.SkipZigTest;
-    const ctx = gpu.Context.init(gpa) catch return error.SkipZigTest;
+    const ctx = gpu.Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
 
     var cpu = try siglip.TextModel.open(gpa, io, dir);
@@ -422,7 +422,7 @@ test "siglip2 text tower Vulkan embedBatch matches per-item" {
     const io = std.testing.io;
     const dir = "../DiffKeep/Models/ViT-B-16-SigLIP2-timm";
     std.Io.Dir.cwd().access(io, dir, .{}) catch return error.SkipZigTest;
-    const ctx = gpu.Context.init(gpa) catch return error.SkipZigTest;
+    const ctx = gpu.Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
 
     var cpu = try siglip.TextModel.open(gpa, io, dir);
@@ -453,7 +453,7 @@ test "siglip2 visual tower Vulkan matches CPU" {
     const io = std.testing.io;
     const dir = "../DiffKeep/Models/ViT-B-16-SigLIP2-timm";
     std.Io.Dir.cwd().access(io, dir, .{}) catch return error.SkipZigTest;
-    const ctx = gpu.Context.init(gpa) catch return error.SkipZigTest;
+    const ctx = gpu.Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
 
     const raw = std.Io.Dir.cwd().readFileAlloc(io, "testdata/siglip2_visual_input.f32", gpa, .limited(4 * 1024 * 1024)) catch return error.SkipZigTest;
@@ -489,7 +489,7 @@ test "siglip2 visual tower Vulkan embedBatch matches per-item" {
     const io = std.testing.io;
     const dir = "../DiffKeep/Models/ViT-B-16-SigLIP2-timm";
     std.Io.Dir.cwd().access(io, dir, .{}) catch return error.SkipZigTest;
-    const ctx = gpu.Context.init(gpa) catch return error.SkipZigTest;
+    const ctx = gpu.Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
 
     var cpu = try siglip.VisualModel.open(gpa, io, dir);

@@ -503,7 +503,7 @@ fn runQwen3(
     var vk_ctx: ?*TensorPencil.gpu.Context = null;
     defer if (vk_ctx) |c| c.deinit();
     if (backend == .vulkan) {
-        const ctx = try TensorPencil.gpu.Context.init(arena);
+        const ctx = try TensorPencil.gpu.Context.init(arena, io);
         vk_ctx = ctx;
         if (max_context_arg == null) {
             const free = ctx.liveVram();
@@ -1578,7 +1578,7 @@ fn runQwen35(
     // mapping; no-op unless read_mode is .pread (see session.useFileReads).
     llm.session.useFileReads(be_cuda, g);
     // Vulkan context up front (the qwen35 LLM runs on it; there is no Vulkan ViT).
-    const vk_ctx: ?*TensorPencil.gpu.Context = if (backend == .vulkan) try TensorPencil.gpu.Context.init(arena) else null;
+    const vk_ctx: ?*TensorPencil.gpu.Context = if (backend == .vulkan) try TensorPencil.gpu.Context.init(arena, io) else null;
     defer if (vk_ctx) |c| c.deinit();
 
     // The vision tower stays loaded for the whole session when --mmproj is
@@ -1815,7 +1815,7 @@ fn runGemma3(
     // mapping; no-op unless read_mode is .pread (see session.useFileReads).
     llm.session.useFileReads(be_cuda, g);
     // Vulkan context created up front too (shared by the ViT and the LLM).
-    const vk_ctx: ?*TensorPencil.gpu.Context = if (backend == .vulkan) try TensorPencil.gpu.Context.init(arena) else null;
+    const vk_ctx: ?*TensorPencil.gpu.Context = if (backend == .vulkan) try TensorPencil.gpu.Context.init(arena, io) else null;
     defer if (vk_ctx) |c| c.deinit();
 
     // Vision tower stays loaded for the whole session (--mmproj): --image

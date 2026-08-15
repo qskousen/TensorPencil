@@ -22,6 +22,7 @@
 //! variable-length array rather than a raw byte/element array.
 const std = @import("std");
 const known_folders = @import("known-folders");
+const framing = @import("framing.zig");
 
 const Environ = std.process.Environ.Map;
 
@@ -572,6 +573,14 @@ pub const Config = struct {
     /// saving.
     output_dir: PathBuf = .{},
     steps: usize = 20,
+    /// Image size, as the two things the user actually picks. These are the
+    /// SOURCE; `width`/`height` are derived from them by `applyFraming`.
+    framing_ratio: framing.Ratio = .square,
+    framing_mp: f32 = 1.0,
+    /// Derived pixel dimensions, persisted so every reader (the engine, the
+    /// studio form) has concrete numbers without re-deriving. Never edited
+    /// directly: the composer's framing chips own this, which is why Settings
+    /// no longer has width/height rows.
     width: usize = 1024,
     height: usize = 1024,
     /// Sampler for image generation. Load-neutral (it is per-render state, not part
@@ -615,6 +624,11 @@ pub const Config = struct {
     /// live, the GUI toolbar toggle flips this without a reload; the block is
     /// rendered collapsed. No effect on non-reasoning models (e.g. Gemma 3).
     reasoning: bool = true,
+    /// Tell the model when an image it asked for finishes or fails, as a note
+    /// in the transcript before the user's next message. Off means the image
+    /// tool stays fire-and-forget: the model asks, and never learns what
+    /// happened, so it cannot offer a retry after a failure.
+    image_tool_result: bool = true,
     /// Replace a Gemma 4 model's own embedded chat_template with Google's
     /// current upstream "canonical" one. Some finetunes (e.g. DarkIdol 31B) ship
     /// an older/stripped template; this renders exactly what Google's
@@ -810,7 +824,15 @@ pub const Config = struct {
 
     /// Resolve the config directory (`<config>/tp-gui`); caller frees. Null if
     /// the platform has no known config location.
-    fn dirPath(io: std.Io, gpa: std.mem.Allocator, environ: *const Environ) !?[]u8 {
+    /// Recompute `width`/`height` from the framing choice. Called after load and
+    /// on every change, so the derived pair can never drift from its source.
+    pub fn applyFraming(self: *Config) void {
+        const d = framing.dimsMp(self.framing_ratio, self.framing_mp);
+        self.width = d.w;
+        self.height = d.h;
+    }
+
+    pub fn dirPath(io: std.Io, gpa: std.mem.Allocator, environ: *const Environ) !?[]u8 {
         const base = (try known_folders.getPath(io, gpa, environ, .local_configuration)) orelse return null;
         defer gpa.free(base);
         return try std.fs.path.join(gpa, &.{ base, app_dir });

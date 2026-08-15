@@ -67,7 +67,16 @@ pub const SampleMode = @import("sd_unet_gpu.zig").SampleMode;
 /// Whether this architecture's activations are carried as f16 on this backend.
 /// Session and Workspace must agree: the cross-attention K/V projections read the
 /// Session's context with the Workspace's width.
+///
+/// An f16 activation stream and an activation capture cannot both be on, because
+/// `probeInput` reads `x` as f32. A capture is the rarer and the correctness-
+/// critical one, so it wins: with a probe installed the whole UNet drops back to
+/// f32 activations rather than skipping the GEMMs it cannot read. Skipping them
+/// instead loses every `transformer_blocks` linear on SDXL — 733 of 834 layers,
+/// and precisely the ones the quantization formats cover — while still reporting
+/// a successful capture.
 fn actF16(be: *const Backend, cfg: Config) bool {
+    if (ops.matmul.probe != null) return false;
     return cfg.act_f16 and be.kernels == .libs;
 }
 
@@ -675,8 +684,9 @@ fn gemm(be: *Backend, sess: *Session, ws: *const Workspace, y: *Buf, x: *const B
     const a16 = ws.act_f16;
     // Before the dispatch: `x` still holds the activation here (unlike the
     // int8/int4 DiT paths, which consume it in place, the SD UNet has no such path,
-    // its GEMM switch is {f32, f16, bf16}). The probe reads f32, which is why an
-    // f16 stream and an activation capture cannot both be on.
+    // its GEMM switch is {f32, f16, bf16}). The probe reads f32; `actF16` already
+    // forces this false whenever one is installed, so the guard is belt-and-braces
+    // and not a silent opt-out.
     if (!a16) try probeInput(be, x.*, m, wt);
     switch (wt.dtype) {
         .f32 => {

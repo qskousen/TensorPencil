@@ -261,7 +261,7 @@ test "embeddinggemma Vulkan matches CPU" {
     const io = std.testing.io;
     const dir = "../DiffKeep/Models/embeddinggemma-300m";
     std.Io.Dir.cwd().access(io, dir, .{}) catch return error.SkipZigTest;
-    const ctx = gpu.Context.init(gpa) catch return error.SkipZigTest;
+    const ctx = gpu.Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
 
     var cpu = try eg.Model.open(gpa, io, dir);
@@ -292,7 +292,7 @@ test "embeddinggemma Vulkan embedBatch matches per-item" {
     const io = std.testing.io;
     const dir = "../DiffKeep/Models/embeddinggemma-300m";
     std.Io.Dir.cwd().access(io, dir, .{}) catch return error.SkipZigTest;
-    const ctx = gpu.Context.init(gpa) catch return error.SkipZigTest;
+    const ctx = gpu.Context.init(gpa, std.testing.io) catch return error.SkipZigTest;
     defer ctx.deinit();
 
     var cpu = try eg.Model.open(gpa, io, dir);

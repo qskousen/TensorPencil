@@ -168,13 +168,47 @@ pub const Variant = struct {
     /// toggled, and a vision turn falls back to the unprimed hand glue.
     /// Consumed by `toolcall.splitThought`; see there for why it matters.
     thought_primed: bool = false,
+    /// The reasoning markers of the template that GENERATED this text, and the
+    /// model it came from. gpa-owned; empty means "not recorded".
+    ///
+    /// Markers are a property of the model that produced the reply, NOT of
+    /// whatever is loaded now. Splitting a stored turn with the live model's
+    /// markers is wrong across a model swap and impossible with nothing loaded,
+    /// which is how a reopened conversation ended up showing a bare `</think>`
+    /// in its prose. The strings are stored rather than the family they came
+    /// from, because a family is a key into a table we still edit, and a
+    /// fine-tune can emit markers its base family does not.
+    ///
+    /// NOTE the markers we record are themselves only as good as
+    /// `chat.reasoningFor`, which guesses per family; see TODO.md.
+    reason_open: []u8 = "",
+    reason_close: []u8 = "",
+    gen_model: []u8 = "",
     /// This take's measurement, shown in the message footer (see `TurnStats`).
     /// Per VARIANT, not per message: each regenerate is its own turn, with its
     /// own rates and its own context length.
     stats: TurnStats = .{},
 
+    /// The markers to split THIS variant with: the ones recorded when it was
+    /// generated, else the live model's, else none.
+    ///
+    /// Falling back to the live model keeps turns from before this was recorded
+    /// working whenever a compatible model is loaded. With nothing loaded we
+    /// deliberately do NOT guess: a wrong split silently eats or invents part of
+    /// a reply, which is worse than showing the markers.
+    pub fn markersFor(v: *const Variant) ?toolcall.Reasoning {
+        if (v.reason_open.len > 0 and v.reason_close.len > 0) {
+            return .{ .open = v.reason_open, .close = v.reason_close };
+        }
+        const r = chat.reasoning() orelse return null;
+        return .{ .open = r.open, .close = r.close };
+    }
+
     pub fn deinit(self: *Variant, gpa: std.mem.Allocator) void {
         self.text.deinit(gpa);
+        if (self.reason_open.len > 0) gpa.free(self.reason_open);
+        if (self.reason_close.len > 0) gpa.free(self.reason_close);
+        if (self.gen_model.len > 0) gpa.free(self.gen_model);
         // `images` are BORROWED (the app-level engine owns generated images and
         // frees them); only free the ArrayList storage.
         self.images.deinit(gpa);
@@ -183,6 +217,11 @@ pub const Variant = struct {
 
 pub const Message = struct {
     role: Role,
+    /// A note the APP wrote, not the user: an image tool outcome. Carried in a
+    /// user turn because that is the only inbound role every chat template
+    /// renders, but shown as a note rather than a bubble, and never treated as
+    /// something the user typed.
+    synthetic: bool = false,
     /// The message's takes, oldest first, always at least one (init/adopt
     /// guarantee it). `cur` selects the ACTIVE take: the one the UI displays
     /// and the one the model context contains. Regeneration appends a variant;
@@ -448,6 +487,11 @@ pub const Session = struct {
     io: std.Io,
     wake: *const fn () void,
 
+    /// The loaded model's file stem, for stamping onto each turn it generates
+    /// (see `Variant.gen_model`). Arena-backed like the rest of the load-once
+    /// state, so anything that outlives the session dupes it.
+    model_name: []const u8 = "",
+
     // Load-once state (backed by the caller's arena; must outlive the session).
     gguf: Gguf,
     arch: Arch,
@@ -636,6 +680,13 @@ pub const Session = struct {
     turn_text: []u8 = "",
     turn_images: std.ArrayList(RawImage) = .empty,
 
+    /// Outcome notes waiting for a turn boundary (gpa-owned). An image can
+    /// finish at any moment, including mid-generation; splicing a message into
+    /// the transcript right then would race the worker and invalidate the KV
+    /// it is decoding against. They are flushed in `submit`, so the model reads
+    /// them just before the user's next message.
+    pending_notes: std.ArrayList([]u8) = .empty,
+
     /// Loads the model on the zig-cuda backend. `arena` holds load-once data
     /// (weights are mmap views into the GGUF and must outlive the session);
     /// `gpa` is a thread-safe allocator for the churny generation buffers and
@@ -653,6 +704,11 @@ pub const Session = struct {
         // the whole session (it is re-read when streamed weights re-upload).
         const self = try gpa.create(Session);
         errdefer gpa.destroy(self);
+
+        // The file stem, stamped onto every turn this session generates so a
+        // mixed-model conversation stays legible after a swap or a reload.
+        const base = std.fs.path.basename(cfg.model_path);
+        self.model_name = try arena.dupe(u8, base[0 .. std.mem.lastIndexOfScalar(u8, base, '.') orelse base.len]);
 
         self.gguf = try Gguf.open(arena, io, cfg.model_path);
         errdefer self.gguf.deinit();
@@ -830,6 +886,12 @@ pub const Session = struct {
             inline else => |*a| a.model.residency_poll = .{ .ctx = self, .apply = residencyPollThunk },
         }
 
+        // EVERY field below is assigned explicitly, including ones that have a
+        // default in the struct. The session is `gpa.create`d, and allocating
+        // does NOT apply field defaults: an unassigned field holds whatever was
+        // in that memory. A missed one is not a null or an empty list, it is
+        // garbage that faults the first time it is touched, arbitrarily far from
+        // here. Adding a field to `Session` means adding a line here too.
         self.gpa = gpa;
         self.io = io;
         self.wake = wake;
@@ -849,6 +911,16 @@ pub const Session = struct {
         self.attach_rgb = .empty;
         self.turn_text = "";
         self.turn_images = .empty;
+        self.pending_notes = .empty;
+        // Read as CONDITIONS before anything is guaranteed to have written
+        // them (`gen_prompt_tokens == null`, `!turn_ckpt_done`), so leaving
+        // them to the struct defaults is a garbage optional or a bool that is
+        // neither true nor false. `sink_buf` is deliberately left undefined: it
+        // is a scratch writer buffer, never read before it is written.
+        self.gen_prompt_tokens = null;
+        self.gen_prompt_think = false;
+        self.turn_ckpt_q = null;
+        self.turn_ckpt_done = false;
         self.image_evicted = false;
         self.ctx_dirty = false;
         self.checkpoints = .empty;
@@ -1372,6 +1444,8 @@ pub const Session = struct {
         self.attach_rgb.deinit(self.gpa);
         for (self.turn_images.items) |im| self.gpa.free(im.rgb);
         self.turn_images.deinit(self.gpa);
+        for (self.pending_notes.items) |n| self.gpa.free(n);
+        self.pending_notes.deinit(self.gpa);
         if (self.turn_text.len > 0) self.gpa.free(self.turn_text);
         switch (self.arch) {
             inline else => |*a| {
@@ -1534,6 +1608,13 @@ pub const Session = struct {
     /// a turn is staged but not yet running (queued while paused, Tier 2): the
     /// LLM runs one turn at a time, so a second submit would clobber the staged
     /// turn's data. The queued turn must run (on resume) or be canceled first.
+    /// Queue a note for the model to read at the next turn boundary. Takes
+    /// ownership of `text`.
+    pub fn queueNote(self: *Session, text: []u8) void {
+        self.pending_notes.append(self.gpa, text) catch self.gpa.free(text);
+        self.wake();
+    }
+
     pub fn submit(self: *Session, text: []const u8) !void {
         if (self.busy() or self.turn_staged) return;
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
@@ -1551,6 +1632,18 @@ pub const Session = struct {
         // A new user message: this turn measures its prompt (a regenerate
         // re-runs one that was already measured, and leaves its numbers alone).
         self.fresh_user_turn = true;
+
+        // Flush any queued outcome notes FIRST, as their own messages, so the
+        // model reads them before the user's message rather than having them
+        // glued onto it as if the user had typed them.
+        for (self.pending_notes.items) |n| {
+            var nm = try Message.init(self.gpa, .user);
+            nm.synthetic = true;
+            try nm.active().text.appendSlice(self.gpa, n);
+            try self.messages.append(self.gpa, nm);
+            self.gpa.free(n);
+        }
+        self.pending_notes.clearRetainingCapacity();
 
         var um = try Message.init(self.gpa, .user);
         if (trimmed.len > 0) try um.active().text.appendSlice(self.gpa, trimmed);
@@ -2658,17 +2751,10 @@ pub const Session = struct {
     /// the text starts INSIDE the block and never emits the open marker, which a
     /// hand-rolled open/close scan reports as "no reasoning".
     pub fn thoughtLen(v: *const Variant) usize {
-        const s2 = toolcall.splitThought(v.text.items, reasoningMarkers(), v.thought_primed);
+        const s2 = toolcall.splitThought(v.text.items, Variant.markersFor(v), v.thought_primed);
         return if (s2.think) |t| std.mem.trim(u8, t, " \t\r\n").len else 0;
     }
 
-    /// The active family's reasoning-block markers as `toolcall.Reasoning`
-    /// (null when the family can't reason), bridging `tp.llm.chat.reasoning()`
-    /// to the std-only tool-call module.
-    fn reasoningMarkers() ?toolcall.Reasoning {
-        const r = chat.reasoning() orelse return null;
-        return .{ .open = r.open, .close = r.close };
-    }
 
     /// Record on the in-flight assistant variant whether `prompt` ends inside an
     /// open reasoning block, so the display and the tool-call scanner know the
@@ -2680,11 +2766,31 @@ pub const Session = struct {
     fn recordThoughtPrimed(self: *Session, prompt: []const u32) void {
         const n = self.messages.items.len;
         if (n == 0 or self.messages.items[n - 1].role != .assistant) return;
+        const v = self.messages.items[n - 1].active();
+        const live: ?toolcall.Reasoning = if (chat.reasoning()) |r|
+            .{ .open = r.open, .close = r.close }
+        else
+            null;
+
+        // Stamp what is producing this turn, right where `thought_primed` is
+        // already recorded: all three are properties of the model that generates
+        // the text, and a stored turn has to be splittable without it.
+        if (v.reason_open.len == 0) if (live) |r| {
+            if (self.gpa.dupe(u8, r.open)) |o| {
+                if (self.gpa.dupe(u8, r.close)) |c| {
+                    v.reason_open = o;
+                    v.reason_close = c;
+                } else |_| self.gpa.free(o);
+            } else |_| {}
+        };
+        if (v.gen_model.len == 0 and self.model_name.len > 0) {
+            v.gen_model = self.gpa.dupe(u8, self.model_name) catch "";
+        }
+
         const tail_n = @min(prompt.len, 16);
         const tail = self.tok.decodeAlloc(self.gpa, prompt[prompt.len - tail_n ..]) catch return;
         defer self.gpa.free(tail);
-        self.messages.items[n - 1].active().thought_primed =
-            toolcall.endsInsideThought(tail, reasoningMarkers());
+        v.thought_primed = toolcall.endsInsideThought(tail, live);
     }
 
     /// Extract `<image ...>PROMPT</image>` tool calls from a finished assistant
@@ -2694,7 +2800,7 @@ pub const Session = struct {
         // Scan only the answer, not the reasoning block, and only line-anchored
         // tags, see toolcall.answerText/nextImageCall for why (spurious fires
         // from the model merely *mentioning* the tag while thinking/explaining).
-        var rest = toolcall.answerText(v.text.items, reasoningMarkers(), v.thought_primed);
+        var rest = toolcall.answerText(v.text.items, Variant.markersFor(v), v.thought_primed);
         while (true) {
             const c = switch (toolcall.nextImageCall(rest)) {
                 .none, .partial => break,

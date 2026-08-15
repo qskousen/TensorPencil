@@ -17,6 +17,24 @@ kernels, the GPU backends, the offload logic, or the whole thing:
 | `tp_models` | NN architectures (DiT/VAE/qwen/gemma/ViT) + LLM generation (chat/engine/spec) | all of the above |
 | `TensorPencil` | the umbrella: the diffusion pipeline + re-exports of every layer | all of the above |
 
+### Side effects a `tp_gpu` consumer should know about
+
+`gpu.Context.init(gpa, io)` takes an `Io` because 0.16 puts file access and clocks behind
+one, and it uses both: on a GPU it has no measurement for, it **screens the cooperative-matrix
+warp tiles once and saves the result** under the user's cache dir, keyed by
+`vendor:device:driver`. Later runs on the same device+driver just load it; a cache written by a
+different GPU is ignored. It costs 0.3s on an RTX 3090 and 13s on an Arc A310, once per machine,
+and buys ~4x end-to-end on a device whose hardware fragment shape differs from NVIDIA's.
+`pipeline.Session.init` inherits this, so neither needs an extra call.
+
+Two knobs for embedders that cannot accept a first-run cost or a write outside their own state
+directory (`BACKEND.md` has the detail):
+
+```zig
+tp.gpu.context.autotune_tiles = false;         // never screen; use the default tile
+tp.gpu.context.tile_cache_path = "/my/state";  // keep the measurement somewhere else
+```
+
 Each is exposed via `dep.module("<name>")`. Importing a lower module compiles
 only that tier and its dependencies — e.g. pulling `tp_ops` for the GEMM kernels
 does not drag in models or the pipeline. The umbrella `TensorPencil` re-exports

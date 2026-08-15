@@ -22,10 +22,13 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and std.mem.eql(u8, args[1], "gpu-test")) {
         // Survey cooperative-matrix configs (incl. int8 tensor cores) on init.
         TensorPencil.gpu.context.dump_coop_configs = true;
-        var ctx = try TensorPencil.gpu.Context.init(arena);
+        var ctx = try TensorPencil.gpu.Context.init(arena, io);
         defer ctx.deinit();
         try stdout.print("device: {s}\n", .{ctx.deviceName()});
         try stdout.print("coop matrix f16->f32:  {d}x{d}x{d}\n", .{ ctx.coop_m, ctx.coop_n, ctx.coop_k });
+        try stdout.print("warp tile f16: {d}x{d} (wg {d}x{d}); int8: wg {d}x{d}\n", .{
+            ctx.coop_wg_m / 2, ctx.coop_wg_n / 2, ctx.coop_wg_m, ctx.coop_wg_n, ctx.coop_i8_wg_m, ctx.coop_i8_wg_n,
+        });
         try stdout.print("coop matrix i8->i32:   {d}x{d}x{d}  ({s})\n", .{
             ctx.coop_i8_m, ctx.coop_i8_n, ctx.coop_i8_k,
             if (ctx.coop_i8_m != 0) "int8 tensor cores available" else "no int8 coop config",
@@ -126,6 +129,8 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, a, "libs")) libs = true else ckpt = a;
         }
         try animaCudaTest(arena, io, stdout, ckpt, libs);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "tune-coop")) {
+        try tuneCoop(arena, io, stdout);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "vk-norm-bench")) {
         try vkNormBench(arena, io, stdout);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "anima-vk-bench")) {
@@ -362,10 +367,10 @@ pub fn main(init: std.process.Init) !void {
 /// Validate + time the raw int8 tensor-core GEMM (s8*s8->s32) against a CPU
 /// reference. Correctness first (small shape), then DiT-block-sized timing.
 fn gpuI8Test(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
-    var ctx = try TensorPencil.gpu.Context.init(arena);
+    var ctx = try TensorPencil.gpu.Context.init(arena, io);
     defer ctx.deinit();
     try stdout.print("device: {s}\n", .{ctx.deviceName()});
-    if (ctx.pipe_coop_i8 == .null_handle) {
+    if (ctx.pipe_coop_i8 == .null_handle and ctx.pipe_coop_i8_sh == .null_handle) {
         try stdout.print("no int8 cooperative-matrix pipeline (coop_i8 {d}x{d}x{d})\n", .{ ctx.coop_i8_m, ctx.coop_i8_n, ctx.coop_i8_k });
         return;
     }
@@ -2078,7 +2083,7 @@ fn teTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []const u8
             try stdout.print("{s:<9} unavailable\n", .{if (libs) "cuda" else "zig-cuda"});
         }
     }
-    if (TensorPencil.gpu.Context.init(arena)) |gc| {
+    if (TensorPencil.gpu.Context.init(arena, io)) |gc| {
         defer gc.deinit();
         if (!qwen3_gpu.supportsWeights(gc, &enc)) {
             try stdout.print("{s:<9} REFUSED (supportsWeights false — would fall back to CPU)\n", .{"vulkan"});
@@ -2472,10 +2477,283 @@ fn animaCudaBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, seq: usi
 /// heads measured 45 GB/s against 511 at production size, and only 176 against 355
 /// at a third of it, so a small-shape measurement understates the gap by 3x. Judge each
 /// geometry, and judge it at the size the model runs.
+/// Persist the measured tiles and say where. The format and the merge live in
+/// `context.writeCoopTileCache`, shared with the init-time screen.
+fn writeCoopTileCache(io: Io, stdout: *Io.Writer, ctx: anytype, f16w: [2]u32, i8t: [2]u32) void {
+    const gpu = TensorPencil.gpu.context;
+    var pbuf: [512]u8 = undefined;
+    const path = gpu.coopTileCachePath(&pbuf) orelse {
+        stdout.print("no cache path (set TP_COOP_TILE_CACHE, XDG_CACHE_HOME or HOME); not persisted\n", .{}) catch {};
+        return;
+    };
+    gpu.writeCoopTileCache(io, ctx.coopCacheKey(), f16w, i8t);
+    stdout.print("persisted to {s}; future runs pick this up automatically\n", .{path}) catch {};
+}
+
+/// int8 half of `tune-coop`. Same discipline as the f16 sweep and for the same reasons:
+/// warm up before timing anything, score a SET of shapes rather than one, give each shape
+/// its own weight allocation (the weight cache keys on the host pointer with no shape in
+/// the key, so slices of one buffer collide and every shape after the first would time a
+/// read of a wrongly-transposed weight), and batch the probes into one submit.
+fn tuneCoopI8(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ctx: anytype) ![2]u32 {
+    const gpu = TensorPencil.gpu.context;
+    if (ctx.pipe_coop_i8_sh == .null_handle) {
+        try stdout.print("\nint8: no shared cooperative-matrix pipeline; nothing to tune\n", .{});
+        return .{ 64, 64 };
+    }
+    const nwarps: u32 = ctx.coopI8Warps();
+    var buf: [9][2]u32 = undefined;
+    const cands = gpu.coopI8TileCandidates(ctx.coop_i8_m, ctx.coop_i8_n, nwarps, ctx.max_shared_bytes, ctx.max_wg_invocations, &buf);
+    try stdout.print("\nint8 fragment {d}x{d}x{d}, {d} expressible tile(s)\n\n", .{ ctx.coop_i8_m, ctx.coop_i8_n, ctx.coop_i8_k, cands.len });
+    if (cands.len == 0) return .{ 64, 64 };
+
+    // DiT-block shapes, where int8 convrot actually runs. m and n are multiples of 128
+    // and k of 64 so every candidate tile can express them, which keeps the comparison
+    // about speed rather than about which tiles had to fall back.
+    const Shape = struct { m: usize, n: usize, k: usize };
+    const shapes = [_]Shape{
+        .{ .m = 2048, .n = 1280, .k = 1280 },
+        .{ .m = 2048, .n = 5120, .k = 1280 },
+        .{ .m = 2048, .n = 1280, .k = 5120 },
+        .{ .m = 1024, .n = 2560, .k = 2560 },
+    };
+    var max_x: usize = 0;
+    var max_y: usize = 0;
+    for (shapes) |sh| {
+        max_x = @max(max_x, sh.m * sh.k);
+        max_y = @max(max_y, sh.m * sh.n);
+    }
+    var x_d = try ctx.tensorCreate(max_x);
+    defer ctx.tensorDestroy(&x_d);
+    var y_d = try ctx.tensorCreate(max_y * 4);
+    defer ctx.tensorDestroy(&y_d);
+    var prng = std.Random.DefaultPrng.init(13);
+    const rand = prng.random();
+    {
+        const xb = try arena.alloc(u8, max_x);
+        for (xb) |*v| v.* = @bitCast(rand.int(i8));
+        try ctx.tensorUpload(x_d, xb);
+    }
+    var w_of: [shapes.len][]u8 = undefined;
+    for (shapes, 0..) |sh, i| {
+        w_of[i] = try arena.alloc(u8, sh.n * sh.k);
+        for (w_of[i]) |*v| v.* = @bitCast(rand.int(i8));
+    }
+
+    ctx.setCoopI8WarpTile(arena, cands[0][0], cands[0][1]) catch {};
+    for (0..4) |_| {
+        try ctx.beginBatch();
+        for (shapes, 0..) |sh, i| try ctx.opMatmulCoopI8(y_d, x_d, sh.m, null, w_of[i], sh.n, sh.k);
+        try ctx.endBatch();
+    }
+
+    var ms_of = try arena.alloc(f64, cands.len);
+    @memset(ms_of, std.math.inf(f64));
+    for (0..2) |_| for (cands, 0..) |c, ci| {
+        ctx.setCoopI8WarpTile(arena, c[0], c[1]) catch continue;
+        const reps: usize = 2;
+        var iter: usize = 0;
+        while (iter < 5) : (iter += 1) {
+            const t0 = std.Io.Clock.real.now(io);
+            try ctx.beginBatch();
+            for (0..reps) |_| for (shapes, 0..) |sh, i| {
+                try ctx.opMatmulCoopI8(y_d, x_d, sh.m, null, w_of[i], sh.n, sh.k);
+            };
+            try ctx.endBatch();
+            const el = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0.nanoseconds)) / 1e6;
+            if (iter >= 2) ms_of[ci] = @min(ms_of[ci], el / @as(f64, @floatFromInt(reps)));
+        }
+    };
+
+    var flops: f64 = 0;
+    for (shapes) |sh| flops += 2.0 * @as(f64, @floatFromInt(sh.m * sh.n * sh.k));
+    var best_ms: f64 = std.math.inf(f64);
+    var base_ms: f64 = std.math.inf(f64);
+    var best: [2]u32 = cands[0];
+    for (cands, 0..) |c, ci| {
+        const ms = ms_of[ci];
+        if (!std.math.isFinite(ms)) continue;
+        try stdout.print("  i8 warp {d:>3}x{d:<3} wg {d:>3}x{d:<3}  {d:>9.2} ms  {d:>8.1} GFLOP/s\n", .{
+            c[0], c[1], 2 * c[0], (nwarps / 2) * c[1], ms, flops / (ms * 1e6),
+        });
+        if (c[0] == 64 and c[1] == 64) base_ms = ms;
+        if (ms < best_ms) {
+            best_ms = ms;
+            best = c;
+        }
+    }
+    if (std.math.isFinite(base_ms) and best_ms > base_ms * 0.95) {
+        best = .{ 64, 64 };
+        best_ms = base_ms;
+    }
+    try stdout.print("\nfastest int8: warp {d}x{d}", .{ best[0], best[1] });
+    if (best[0] == 64 and best[1] == 64) {
+        try stdout.print(" (the default; nothing to set)\n", .{});
+    } else {
+        if (std.math.isFinite(base_ms)) {
+            try stdout.print(", {d:.2}x the 64x64 default\n", .{base_ms / best_ms});
+        } else {
+            try stdout.print(" (64x64 is not expressible here)\n", .{});
+        }
+        try stdout.print("set it with: TP_COOP_I8_TILE={d} TP_COOP_I8_TILE_N={d}\n", .{ best[0], best[1] });
+    }
+    // Leave the context on the winner so a caller that keeps using it gets the good one.
+    ctx.setCoopI8WarpTile(arena, best[0], best[1]) catch {};
+    return best;
+}
+
+/// Measure every warp tile the device can express for the f16 coop GEMM and report
+/// which is fastest. This is a measurement and not a derivation on purpose: the tile
+/// is decided by the register budget per lane, Vulkan exposes no query for that, and
+/// the legal-but-slow tiles are indistinguishable from the legal-and-fast ones by any
+/// limit we can read. So no vendor table — an unknown GPU measures itself.
+fn tuneCoop(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
+    const gpu = TensorPencil.gpu.context;
+    const ctx = gpu.Context.init(arena, io) catch |err| {
+        try stdout.print("vulkan unavailable: {t}\n", .{err});
+        return;
+    };
+    defer ctx.deinit();
+    try stdout.print("== tune-coop ==\ndevice: {s}\n", .{ctx.device_name[0..ctx.device_name_len]});
+    if (ctx.coop_m == 0) {
+        try stdout.print("no f16 cooperative-matrix pipeline on this device; nothing to tune\n", .{});
+        return;
+    }
+    var buf: [9][2]u32 = undefined;
+    const cands = gpu.coopTileCandidates(ctx.coop_m, ctx.coop_n, ctx.max_shared_bytes, ctx.max_wg_invocations, &buf);
+    try stdout.print("fragment {d}x{d}x{d}, subgroup {d}, {d} expressible tile(s)\n\n", .{
+        ctx.coop_m, ctx.coop_n, ctx.coop_k, ctx.subgroup_size, cands.len,
+    });
+    if (cands.len == 0) return;
+
+    // A SET of shapes, not one. A single representative GEMM is not representative:
+    // measured on m=2048/512/1152 alone this picks warp 16x32 on an A310, and the real
+    // render is then 1.9x SLOWER than at 32x32. These span what an SD render issues —
+    // a short CLIP sequence, a mid UNet linear, a 3x3 im2col conv, and a late VAE conv
+    // over a large pixel band — and the winner is the one with the best TOTAL time.
+    const Shape = struct { m: usize, rows: usize, cols: usize, what: []const u8 };
+    const shapes = [_]Shape{
+        .{ .m = 77, .rows = 768, .cols = 768, .what = "clip seq" },
+        .{ .m = 1024, .rows = 1280, .cols = 1280, .what = "unet lin" },
+        .{ .m = 4096, .rows = 640, .cols = 2880, .what = "unet conv" },
+        .{ .m = 16384, .rows = 128, .cols = 1152, .what = "vae conv" },
+    };
+    var max_x: usize = 0;
+    var max_y: usize = 0;
+    for (shapes) |sh| {
+        max_x = @max(max_x, sh.m * sh.cols);
+        max_y = @max(max_y, sh.m * sh.rows);
+    }
+    var x_d = try ctx.tensorCreate(max_x * 4);
+    defer ctx.tensorDestroy(&x_d);
+    var y_d = try ctx.tensorCreate(max_y * 4);
+    defer ctx.tensorDestroy(&y_d);
+    {
+        var prng = std.Random.DefaultPrng.init(7);
+        const rnd = prng.random();
+        const fill = try arena.alloc(f32, max_x);
+        for (fill) |*t| t.* = rnd.floatNorm(f32);
+        try ctx.tensorUpload(x_d, std.mem.sliceAsBytes(fill));
+    }
+    // ONE ALLOCATION PER SHAPE. The weight cache is keyed by host pointer alone
+    // (context.weightBuffer), with no shape in the key, so slices of a shared buffer
+    // would collide on a single entry and three of the four shapes would be timing
+    // reads of a buffer transposed for the first shape's dimensions.
+    var w_of: [shapes.len][]u16 = undefined;
+    {
+        var prng = std.Random.DefaultPrng.init(11);
+        const rnd = prng.random();
+        for (shapes, 0..) |sh, i| {
+            w_of[i] = try arena.alloc(u16, sh.rows * sh.cols);
+            for (w_of[i]) |*t| t.* = @bitCast(@as(f16, @floatCast(rnd.floatNorm(f32) * 0.05)));
+        }
+    }
+    const bias = try arena.alloc(f32, 1280);
+    @memset(bias, 0);
+
+    // Warm up before ANY candidate is timed. This GPU idles its clocks, and the first
+    // candidate would otherwise be measured cold and look catastrophically slow purely
+    // for being first — which is exactly what a naive sweep reports.
+    ctx.setCoopWarpTile(arena, cands[0][0], cands[0][1]) catch {};
+    for (0..8) |_| {
+        try ctx.beginBatch();
+        for (shapes, 0..) |sh, i| {
+            try ctx.opMatmulCoopF16Wh(y_d, 0, x_d, sh.m, std.mem.sliceAsBytes(w_of[i]), sh.rows, sh.cols, bias[0..sh.rows]);
+        }
+        try ctx.endBatch();
+    }
+
+    var ms_of = try arena.alloc(f64, cands.len);
+    @memset(ms_of, std.math.inf(f64));
+    // Two passes over the whole list, keeping the min per candidate: a single pass
+    // cannot distinguish a slow tile from a tile that happened to run while the clocks
+    // were still ramping.
+    for (0..2) |_| for (cands, 0..) |c, ci| {
+        ctx.setCoopWarpTile(arena, c[0], c[1]) catch continue;
+        // All probes in ONE submit, repeated, and divided back out. One submit-and-wait
+        // per GEMM measures per-dispatch LATENCY; a render records many ops per submit,
+        // so it lives in the throughput regime instead. The two rank tiles differently
+        // (that is what this loop exists to expose), so the tuner has to measure the
+        // regime the workload actually runs in.
+        // setCoopWarpTile evicts the weight cache, so the first passes re-upload and
+        // re-transpose every weight; discard them.
+        const reps: usize = 4;
+        var iter: usize = 0;
+        while (iter < 6) : (iter += 1) {
+            const t0 = std.Io.Clock.real.now(io);
+            try ctx.beginBatch();
+            for (0..reps) |_| for (shapes, 0..) |sh, si| {
+                try ctx.opMatmulCoopF16Wh(y_d, 0, x_d, sh.m, std.mem.sliceAsBytes(w_of[si]), sh.rows, sh.cols, bias[0..sh.rows]);
+            };
+            try ctx.endBatch();
+            const el = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0.nanoseconds)) / 1e6;
+            if (iter >= 2) ms_of[ci] = @min(ms_of[ci], el / @as(f64, @floatFromInt(reps)));
+        }
+    };
+
+    var best_ms: f64 = std.math.inf(f64);
+    var base_ms: f64 = std.math.inf(f64);
+    var best: [2]u32 = cands[0];
+    for (cands, 0..) |c, ci| {
+        const ms = ms_of[ci];
+        if (!std.math.isFinite(ms)) continue;
+        try stdout.print("  warp {d:>3}x{d:<3} wg {d:>3}x{d:<3}  {d:>9.2} ms total over {d} shapes\n", .{
+            c[0], c[1], 2 * c[0], 2 * c[1], ms, shapes.len,
+        });
+        if (c[0] == 64 and c[1] == 64) base_ms = ms;
+        if (ms < best_ms) {
+            best_ms = ms;
+            best = c;
+        }
+    }
+    const i8_best = try tuneCoopI8(arena, io, stdout, ctx);
+
+    // A tie is not a reason to change geometry: require a real margin over the default
+    // before recommending a switch, or the tuner churns on run-to-run noise.
+    const margin = 0.95;
+    if (std.math.isFinite(base_ms) and best_ms > base_ms * margin) {
+        best = .{ 64, 64 };
+        best_ms = base_ms;
+    }
+    try stdout.print("\nfastest: warp {d}x{d}", .{ best[0], best[1] });
+    if (best[0] == 64 and best[1] == 64) {
+        try stdout.print(" (the default; nothing to set)\n", .{});
+    } else {
+        if (std.math.isFinite(base_ms)) {
+            try stdout.print(", {d:.2}x the 64x64 default\n", .{base_ms / best_ms});
+        } else {
+            try stdout.print(" (64x64 is not expressible here)\n", .{});
+        }
+        try stdout.print("set it with: TP_COOP_WARP_TILE={d} TP_COOP_WARP_TILE_N={d}\n", .{ best[0], best[1] });
+    }
+    try stdout.print("\n", .{});
+    writeCoopTileCache(io, stdout, ctx, best, i8_best);
+}
+
 fn vkNormBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
     const gpu = TensorPencil.gpu.context;
 
-    const ctx = gpu.Context.init(arena) catch |err| {
+    const ctx = gpu.Context.init(arena, io) catch |err| {
         try stdout.print("vulkan unavailable: {t}\n", .{err});
         return;
     };
@@ -2594,7 +2872,7 @@ fn animaVkBench(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, seq: usize
     const anima = TensorPencil.models.anima;
     const cfg = anima.anima_2b;
 
-    const ctx = gpu.Context.init(arena) catch |err| {
+    const ctx = gpu.Context.init(arena, io) catch |err| {
         try stdout.print("vulkan unavailable: {t}\n", .{err});
         return;
     };
@@ -4295,7 +4573,7 @@ fn benchMatmul(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
         try stdout.flush();
     }
 
-    var ctx = TensorPencil.gpu.Context.init(arena) catch |err| {
+    var ctx = TensorPencil.gpu.Context.init(arena, io) catch |err| {
         try stdout.print("gpu unavailable: {t}\n", .{err});
         return;
     };

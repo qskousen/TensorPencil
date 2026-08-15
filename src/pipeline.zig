@@ -1944,7 +1944,7 @@ pub const Session = struct {
         self.cu_be = null;
         // Vulkan context (--backend vulkan): encoder / DiT / VAE GEMMs on Vulkan.
         if (opts.backend == .vulkan) {
-            if (gpu_mod.Context.init(gpa)) |ctx| {
+            if (gpu_mod.Context.init(gpa, io)) |ctx| {
                 self.gpu_ctx = ctx;
                 ctx.budget_override = opts.vram_budget;
                 ops.matmul.gpu_dispatch = .{ .ctx = ctx, .call = gpuMatmulThunk };

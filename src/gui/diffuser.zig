@@ -97,6 +97,9 @@ pub fn failureText(err: anyerror) []const u8 {
         error.UnknownArchitecture => "the checkpoint's architecture is not recognized",
         error.UnsupportedCheckpoint => "this checkpoint cannot run on the selected backend",
         error.ComponentNotInCheckpoint => "the checkpoint is missing a component (VAE or text encoder)",
+        // A conversation reloaded from disk whose PNG has since been moved or
+        // deleted. NOT a generation failure, and deliberately not re-run.
+        error.SavedImageMissing => "the saved image file is gone",
         error.IncompleteMetadata => "the checkpoint file is corrupt",
         else => @errorName(err),
     };
@@ -242,6 +245,21 @@ pub const GenImage = struct {
     /// images that never went through the queue (e.g. user-attached inputs, tests);
     /// the worker falls back to the engine's live config for those.
     model: ?ModelConfig = null,
+    /// Where the finished PNG was written, or null when saving was off or the
+    /// write failed. gpa-owned. This is what a saved conversation stores so a
+    /// reload can show the render instead of producing it again.
+    saved_path: ?[]u8 = null,
+    /// Set once this image's outcome has been reported to the model, so a
+    /// terminal state is announced exactly once. UI-thread only.
+    ///
+    /// An image REBUILT from a reopened conversation sets this at construction:
+    /// it was reported when it was first generated, and re-announcing every old
+    /// render on each load would bury the one that just happened.
+    outcome_noted: bool = false,
+    /// Where this image came from. The queue rail says so on a waiting row,
+    /// because "the model asked for this" and "I set this up by hand" are
+    /// different enough that a user reordering a queue needs to tell them apart.
+    from_studio: bool = false,
     /// In-flight sampler state saved when the image was suspended by an
     /// unload-while-paused (status `.suspended`); gpa-owned. On the next dispatch
     /// the worker passes it as `opts.resume_from` to continue bit-identically,
@@ -268,6 +286,7 @@ pub const GenImage = struct {
 };
 
 pub fn freeGenImage(gpa: std.mem.Allocator, gi: *GenImage) void {
+    if (gi.saved_path) |p| gpa.free(p);
     gpa.free(gi.prompt);
     if (gi.req_negative.len > 0) gpa.free(gi.req_negative);
     if (gi.rgba) |r| gpa.free(r);
@@ -583,6 +602,73 @@ pub fn buildA1111Params(
     );
 }
 
+/// The fields of an AUTOMATIC1111 `parameters` block that describe a REQUEST,
+/// as read back off a saved PNG. Slices borrow the input.
+pub const A1111Params = struct {
+    prompt: []const u8 = "",
+    negative: []const u8 = "",
+    steps: ?usize = null,
+    cfg: ?f32 = null,
+    seed: ?u64 = null,
+    width: ?usize = null,
+    height: ?usize = null,
+};
+
+/// Parse what `buildA1111Params` wrote. The saved PNG is the record of how an
+/// image was made, so reopening one reads it back rather than the transcript
+/// carrying a second copy that can disagree with the file.
+///
+/// Deliberately lenient: this also has to read blocks written by ComfyUI and
+/// A1111 themselves, where field order, spelling and which keys are present all
+/// vary. Anything unrecognised is skipped and the field stays null.
+pub fn parseA1111Params(text: []const u8) A1111Params {
+    var out: A1111Params = .{};
+
+    // The settings line is the LAST line that starts with "Steps:"; everything
+    // before it is prompt (and negative). Searching from the end is what keeps a
+    // prompt that itself contains "Steps:" from splitting the block early.
+    const neg_tag = "\nNegative prompt:";
+    var head_end = text.len;
+    var settings: []const u8 = "";
+    var it = std.mem.splitBackwardsScalar(u8, text, '\n');
+    var scanned: usize = 0;
+    while (it.next()) |line| {
+        scanned += line.len + 1;
+        if (std.mem.startsWith(u8, line, "Steps:")) {
+            settings = line;
+            head_end = text.len - scanned + 1;
+            break;
+        }
+    }
+    const head = std.mem.trimEnd(u8, text[0..@min(head_end, text.len)], "\n");
+
+    if (std.mem.indexOf(u8, head, neg_tag)) |i| {
+        out.prompt = std.mem.trim(u8, head[0..i], " \t\r\n");
+        out.negative = std.mem.trim(u8, head[i + neg_tag.len ..], " \t\r\n");
+    } else {
+        out.prompt = std.mem.trim(u8, head, " \t\r\n");
+    }
+
+    var f = std.mem.splitScalar(u8, settings, ',');
+    while (f.next()) |field| {
+        const colon = std.mem.indexOfScalar(u8, field, ':') orelse continue;
+        const key = std.mem.trim(u8, field[0..colon], " \t");
+        const val = std.mem.trim(u8, field[colon + 1 ..], " \t");
+        if (std.mem.eql(u8, key, "Steps")) {
+            out.steps = std.fmt.parseInt(usize, val, 10) catch null;
+        } else if (std.mem.eql(u8, key, "CFG scale")) {
+            out.cfg = std.fmt.parseFloat(f32, val) catch null;
+        } else if (std.mem.eql(u8, key, "Seed")) {
+            out.seed = std.fmt.parseInt(u64, val, 10) catch null;
+        } else if (std.mem.eql(u8, key, "Size")) {
+            const x = std.mem.indexOfScalar(u8, val, 'x') orelse continue;
+            out.width = std.fmt.parseInt(usize, val[0..x], 10) catch null;
+            out.height = std.fmt.parseInt(usize, val[x + 1 ..], 10) catch null;
+        }
+    }
+    return out;
+}
+
 /// The file stem of a path (basename minus final extension), the a1111 "Model".
 fn modelStem(path: []const u8) []const u8 {
     const base = std.fs.path.basename(path);
@@ -837,6 +923,54 @@ pub const Diffuser = struct {
     /// The unified image list (creation order) for rendering / viewer nav.
     pub fn items(self: *const Diffuser) []*GenImage {
         return self.queue.items;
+    }
+
+    /// The image already in `items` that came from `path`, if any.
+    ///
+    /// A finished render's file is its identity. Reopening a conversation must
+    /// find the image it already has rather than building a second one: without
+    /// this every load appended another copy and the Library filled with
+    /// duplicates of the same picture.
+    pub fn findSaved(list: []const *GenImage, path: []const u8) ?*GenImage {
+        if (path.len == 0) return null;
+        for (list) |gi| {
+            const p = gi.saved_path orelse continue;
+            if (std.mem.eql(u8, p, path)) return gi;
+        }
+        return null;
+    }
+
+    /// Take ownership of an already-finished image and put it in the unified
+    /// list, WITHOUT queueing any work. Used when a reloaded conversation
+    /// rebuilds its renders from disk: they are history, so Library and the
+    /// viewer should see them like anything else, but there is nothing to
+    /// generate. `pump` skips them because they are not `.pending`.
+    pub fn adoptFinished(self: *Diffuser, gi: *GenImage) !void {
+        try self.queue.append(self.gpa, gi);
+    }
+
+    /// Move a still-pending image so it sits before the one currently at
+    /// `to_id`, for the queue rail's drag-to-reorder. Both are identified by
+    /// pointer, since an index into a filtered view of the queue is not an index
+    /// into the queue.
+    ///
+    /// UI-thread only, which is what makes it safe without a lock: `pump` (also
+    /// UI-thread) is the only other mutator, the worker holds one borrowed
+    /// `*GenImage` and never touches the list, and a `.generating` image is
+    /// refused here so a reorder can never move the one in flight.
+    pub fn movePending(self: *Diffuser, move: *GenImage, before: ?*GenImage) void {
+        if (move.get() != .pending) return;
+        if (before) |b| if (b == move or b.get() != .pending) return;
+        const from = std.mem.indexOfScalar(*GenImage, self.queue.items, move) orelse return;
+        _ = self.queue.orderedRemove(from);
+        const to = if (before) |b|
+            (std.mem.indexOfScalar(*GenImage, self.queue.items, b) orelse self.queue.items.len)
+        else
+            self.queue.items.len;
+        self.queue.insert(self.gpa, to, move) catch {
+            // Put it back where it was; a failed reorder must not drop the job.
+            self.queue.insert(self.gpa, from, move) catch unreachable;
+        };
     }
 
     /// Any image still queued (not yet started)?
@@ -1432,7 +1566,6 @@ pub const Diffuser = struct {
         const name = std.fmt.allocPrint(gpa, "tp_{d}_{d}.png", .{ gi.start_ns.load(.acquire), gi.req_seed }) catch return;
         defer gpa.free(name);
         const path = std.fs.path.join(gpa, &.{ dir, name }) catch return;
-        defer gpa.free(path);
 
         std.Io.Dir.cwd().createDirPath(self.io, dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
@@ -1443,9 +1576,16 @@ pub const Diffuser = struct {
         };
         std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = png.items }) catch |err| {
             std.log.err("image save (write {s}) failed: {t}", .{ path, err });
+            gpa.free(path);
             return;
         };
         std.log.info("saved image to {s}", .{path});
+        // Kept, not freed: a saved conversation stores this so a reload can show
+        // the render rather than generating it again. Written on the worker
+        // thread before the image is published as `.done`, so the UI thread only
+        // ever sees it fully set.
+        if (gi.saved_path) |old| gpa.free(old);
+        gi.saved_path = path;
     }
 
     fn worker(self: *Diffuser, gi: *GenImage) void {
@@ -1883,4 +2023,61 @@ test "nextSeed advances deterministically and distinctly" {
     const b = d.nextSeed();
     try std.testing.expect(a != 0);
     try std.testing.expect(a != b);
+}
+
+test "an a1111 parameters block round-trips through its own parser" {
+    const gpa = std.testing.allocator;
+    const params = try buildA1111Params(
+        gpa,
+        "a lighthouse in heavy fog\nsecond line of prompt",
+        "blurry, low quality",
+        34,
+        4.2,
+        8812,
+        1216,
+        832,
+        "krea2",
+        null,
+        .euler,
+        null,
+        .comfy,
+        .original,
+        .comfy,
+        .of(.comfy),
+    );
+    defer gpa.free(params);
+
+    const got = parseA1111Params(params);
+    try std.testing.expectEqualStrings("a lighthouse in heavy fog\nsecond line of prompt", got.prompt);
+    try std.testing.expectEqualStrings("blurry, low quality", got.negative);
+    try std.testing.expectEqual(@as(?usize, 34), got.steps);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.2), got.cfg.?, 0.001);
+    try std.testing.expectEqual(@as(?u64, 8812), got.seed);
+    try std.testing.expectEqual(@as(?usize, 1216), got.width);
+    try std.testing.expectEqual(@as(?usize, 832), got.height);
+}
+
+test "parsing tolerates blocks we did not write" {
+    // No negative, extra unknown keys, different order: all of these come off
+    // images made by ComfyUI or A1111 itself.
+    const p = parseA1111Params(
+        "just a prompt\nSteps: 20, Sampler: DPM++ 2M, Schedule type: Karras, " ++
+            "CFG scale: 7, Seed: 1234, Size: 512x768, Model hash: abc123, Model: sd15",
+    );
+    try std.testing.expectEqualStrings("just a prompt", p.prompt);
+    try std.testing.expectEqualStrings("", p.negative);
+    try std.testing.expectEqual(@as(?usize, 20), p.steps);
+    try std.testing.expectEqual(@as(?u64, 1234), p.seed);
+    try std.testing.expectEqual(@as(?usize, 512), p.width);
+    try std.testing.expectEqual(@as(?usize, 768), p.height);
+
+    // A prompt that itself mentions "Steps:" must not be mistaken for the
+    // settings line; the LAST one wins.
+    const q = parseA1111Params("Steps: how many steps?\nSteps: 12, Seed: 9");
+    try std.testing.expectEqualStrings("Steps: how many steps?", q.prompt);
+    try std.testing.expectEqual(@as(?usize, 12), q.steps);
+
+    // Nothing at all, and a block with no settings line, must not fault.
+    try std.testing.expectEqual(@as(?usize, null), parseA1111Params("").steps);
+    try std.testing.expectEqualStrings("only a prompt", parseA1111Params("only a prompt").prompt);
 }

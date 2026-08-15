@@ -410,6 +410,35 @@ pub fn build(b: *std.Build) void {
             if (b.args) |args| run_md_probe.addArgs(args);
             md_probe_step.dependOn(&run_md_probe.step);
 
+            // ui-probe: renders the whole chat workspace from canned data to a
+            // PNG (`zig build ui-probe -- out.png [w h]`). No model, no GPU, no
+            // engine — the failure modes of this screen are all visual, and
+            // driving the real app to see them needs a loaded checkpoint.
+            const ui_probe_step = b.step("ui-probe", "Render the chat workspace to a PNG from canned data");
+            const ui_probe_exe = b.addExecutable(.{
+                .name = "ui-probe",
+                .use_llvm = use_llvm,
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/gui/ui_probe.zig"),
+                    .link_libc = true,
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "dvui", .module = dvui_dep.module("dvui_sdl3") },
+                        .{ .name = "backend", .module = dvui_dep.module("sdl3") },
+                    },
+                }),
+            });
+            if (target.result.os.tag == .linux) {
+                ui_probe_exe.root_module.linkSystemLibrary("X11", .{});
+                ui_probe_exe.root_module.linkSystemLibrary("Xcursor", .{});
+                ui_probe_exe.root_module.linkSystemLibrary("Xi", .{});
+                ui_probe_exe.root_module.linkSystemLibrary("wayland-client", .{});
+            }
+            const run_ui_probe = b.addRunArtifact(ui_probe_exe);
+            if (b.args) |args| run_ui_probe.addArgs(args);
+            ui_probe_step.dependOn(&run_ui_probe.step);
+
             // GUI config unit tests. Kept off the default `test` step (which
             // stays free of GUI deps); `config.zig` only pulls std + known-folders.
             const gui_config_tests = b.addTest(.{
@@ -491,6 +520,75 @@ pub fn build(b: *std.Build) void {
                 }),
             });
             gui_test_step.dependOn(&b.addRunArtifact(gui_sysmon_tests).step);
+
+            // Conversation store: the transcript format (a length-prefixed
+            // parse that must survive truncation), the local-day grouping the
+            // sidebar sections by, and title derivation. Pure std.
+            const gui_history_tests = b.addTest(.{
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/gui/history.zig"),
+                    .link_libc = true, // localtime_r, for the timezone offset
+                    .target = target,
+                    .optimize = optimize,
+                }),
+            });
+            gui_test_step.dependOn(&b.addRunArtifact(gui_history_tests).step);
+
+            // Composer framing: ratio + megapixels -> model-legal dimensions,
+            // and the round trip back to the chips. Pure std.
+            const gui_framing_tests = b.addTest(.{
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/gui/framing.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }),
+            });
+            gui_test_step.dependOn(&b.addRunArtifact(gui_framing_tests).step);
+
+            // Font tier routing: the cmap coverage parse plus which face each
+            // codepoint lands on. Needs the dvui module for `Font`, but no
+            // window — the routing is pure data, and its failure mode (a tofu
+            // box) is otherwise only visible in a screenshot.
+            const gui_fonts_tests = b.addTest(.{
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/gui/fonts.zig"),
+                    .link_libc = true,
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "dvui", .module = dvui_dep.module("dvui_sdl3") },
+                    },
+                }),
+            });
+            if (target.result.os.tag == .linux) {
+                gui_fonts_tests.root_module.linkSystemLibrary("X11", .{});
+                gui_fonts_tests.root_module.linkSystemLibrary("Xcursor", .{});
+                gui_fonts_tests.root_module.linkSystemLibrary("Xi", .{});
+                gui_fonts_tests.root_module.linkSystemLibrary("wayland-client", .{});
+            }
+            gui_test_step.dependOn(&b.addRunArtifact(gui_fonts_tests).step);
+
+            // Design system: the nominal-px -> cap-height type conversion, and
+            // that every role names a family we actually register (dvui
+            // silently substitutes its built-in face otherwise).
+            const gui_style_tests = b.addTest(.{
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/gui/style.zig"),
+                    .link_libc = true,
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "dvui", .module = dvui_dep.module("dvui_sdl3") },
+                    },
+                }),
+            });
+            if (target.result.os.tag == .linux) {
+                gui_style_tests.root_module.linkSystemLibrary("X11", .{});
+                gui_style_tests.root_module.linkSystemLibrary("Xcursor", .{});
+                gui_style_tests.root_module.linkSystemLibrary("Xi", .{});
+                gui_style_tests.root_module.linkSystemLibrary("wayland-client", .{});
+            }
+            gui_test_step.dependOn(&b.addRunArtifact(gui_style_tests).step);
 
             // Diffusion-engine pure-helper tests (clampDim / parseGenAttrs /
             // seed advance). Pulls in the TensorPencil module (for pipeline

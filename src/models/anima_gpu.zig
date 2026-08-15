@@ -873,7 +873,7 @@ test "the modulation fold touches every block scale and NOT the final layer's" {
 
 fn gpuCtx(gpa: std.mem.Allocator, io: std.Io) !*gpu.Context {
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
-    return gpu.Context.init(gpa) catch error.SkipZigTest;
+    return gpu.Context.init(gpa, std.testing.io) catch error.SkipZigTest;
 }
 
 test "Anima gpu cross-attention matches ops.attention at unequal q/kv lengths" {

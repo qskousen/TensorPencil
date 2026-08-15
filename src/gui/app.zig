@@ -23,6 +23,12 @@ const diffuser = @import("diffuser.zig");
 const clipboard = @import("clipboard.zig");
 const meter = @import("meter.zig");
 const status_bar = @import("status_bar.zig");
+const style = @import("style.zig");
+const shell = @import("shell.zig");
+const bubbles = @import("bubbles.zig");
+const queue_rail = @import("queue_rail.zig");
+const history = @import("history.zig");
+const framing = @import("framing.zig");
 const turn_stats = @import("turn_stats.zig");
 const sysmon = @import("sysmon.zig");
 const vips = @import("vips");
@@ -451,6 +457,24 @@ fn unloadLlm() void {
 // never wipes the chat. Owned by g_gpa; freed if there's no new session to adopt.
 var g_carry: ?std.ArrayList(chat.Message) = null;
 
+// Conversation history: the on-disk store plus the sidebar's selection state.
+// Saved after every completed turn (see maybeSaveHistory) and on exit.
+var g_history: history.Store = .{};
+/// A sidebar row was clicked; the load happens at the top of the next frame,
+/// never mid-render, because it swaps the session's whole transcript.
+var g_load_conv: ?u64 = null;
+/// Transcript size at the last save, so an idle frame does not rewrite the file
+/// 60 times a second.
+var g_saved_turns: usize = 0;
+var g_saved_tail: usize = 0;
+
+// Queue rail state. `g_rail_jobs` maps the row indices the rail reports back
+// (from a drag) onto the engine's images; it is rebuilt every frame right
+// before the rail renders, so an index can never outlive the list it came from.
+var g_rail_tab: queue_rail.Tab = .queue;
+var g_rail_jobs: [16]*chat.GenImage = undefined;
+var g_rail_jobs_len: usize = 0;
+
 // Persistent settings + which full-window view is showing. `g_config_path`
 // (from `--config`) overrides the well-known settings-file location; null uses
 // the platform config dir.
@@ -542,7 +566,7 @@ pub fn run(init: std.process.Init) !void {
         .size = .{ .w = @floatFromInt(g_config.win_w), .h = @floatFromInt(g_config.win_h) },
         .min_size = .{ .w = 640, .h = 480 },
         .vsync = true,
-        .title = "tp-gui",
+        .title = "TensorPencil",
         .environ_map = init.environ_map,
     });
     defer back.deinit();
@@ -556,7 +580,7 @@ pub fn run(init: std.process.Init) !void {
     // themeSet need the current window) so CJK / symbols in LLM output render
     // instead of tofu boxes.
     try win.begin(win.frame_time_ns);
-    fonts.install();
+    style.install(); // fonts + palette; both need the current window
     _ = try win.end(.{});
 
     g_wakeup_event_type = SDLBackend.c.SDL_RegisterEvents(1);
@@ -564,14 +588,28 @@ pub fn run(init: std.process.Init) !void {
     // The LLM is NOT loaded at startup, it lazy-loads on the first chat message
     // (see submitChat). Build the app-level diffusion engine now if a model is
     // configured (its pipeline still loads lazily on the first image).
+    // Derive width/height from the persisted framing before anything reads
+    // them: they are a cache of (ratio, megapixels), and an older config may
+    // carry a pair that predates the framing fields.
+    g_config.applyFraming();
+    g_config_baseline.width = g_config.width;
+    g_config_baseline.height = g_config.height;
+
     image_view.setEnv(g_gpa, g_io, wakeupFrame);
     config_view.setEnv(back.window, wakeupFrame, g_gpa, g_io);
     syncDiffuser();
+
+    // Conversation history lives beside the config file. With `--config <path>`
+    // it goes next to THAT file, so a throwaway config gets a throwaway history
+    // and a test run never writes into the real one.
+    openHistory();
 
     // Tear down at exit. Stop the diffusion engine FIRST (join its worker) so no
     // diffusion thread is still touching a transcript/gallery image as those are
     // freed; then the LLM, then the gallery.
     defer {
+        saveHistory(true); // flush the live transcript before anything frees it
+        g_history.deinit(g_gpa);
         if (g_loader) |t| t.join();
         freeDiffuser();
         if (g_session) |s| {
@@ -944,36 +982,62 @@ fn tryPasteClipboardImage() bool {
 fn frame() void {
     autoMessage(); // TP_AUTO_MESSAGE; before any early return so it always runs
 
-    var root = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both, .background = true });
+    var root = dvui.box(@src(), .{ .dir = .vertical }, .{
+        .expand = .both,
+        .background = true,
+        .color_fill = style.C.canvas,
+    });
     defer root.deinit();
 
+    // Settings is the one view that takes the whole window: it is a mode, not a
+    // place in the workspace, and it has its own way back.
     if (g_view == .config) {
         config_view.render(&g_config, .{ .apply = applyConfig, .cancel = cancelConfig });
         return;
     }
 
-    if (g_view == .image) {
-        // Generation is gated only while an LLM (re)load is in flight (the pump
-        // is paused then). The studio doesn't need the LLM, both stay resident.
-        const ready = !g_loading.load(.acquire);
-        const d: ?*diffuser.Diffuser = if (g_diffuser) |*dd| dd else null;
-        // Cap the studio to leave the status bar its row at the bottom (same
-        // VRAM/LLM/diffusion readout as chat, we want it in both views).
-        const h = @max(120, root.data().contentRect().h - status_bar.bar_height);
-        {
-            var area = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .min_size_content = .{ .h = h }, .max_size_content = .height(h) });
+    const bands = shell.Bands.from(root);
+    var mbuf: [96]u8 = undefined;
+    var rbuf: [96]u8 = undefined;
+    shell.titleBar(.{
+        .tab = if (g_view == .image) .studio else .chat,
+        .diff_model = diffModelLabel(&mbuf),
+        .residents = residentLabel(&rbuf),
+    }, .{ .on_tab = onTabPicked, .on_model_menu = openSettings });
+
+    {
+        var body = dvui.box(@src(), .{ .dir = .horizontal }, .{
+            .expand = .horizontal,
+            .min_size_content = .{ .h = bands.body },
+            .max_size_content = .height(bands.body),
+        });
+        defer body.deinit();
+
+        if (g_view == .image) {
+            // Studio takes the whole body: it has its own gallery and its own
+            // parameter form, and the queue rail would duplicate both.
+            const ready = !g_loading.load(.acquire);
+            const d: ?*diffuser.Diffuser = if (g_diffuser) |*dd| dd else null;
+            var area = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both, .min_size_content = .{ .w = 0 } });
             defer area.deinit();
-            image_view.render(&g_config, d, ready, .{ .to_chat = enterChatMode, .settings = openSettings });
+            image_view.render(&g_config, d, ready, .{ .settings = openSettings });
+        } else {
+            chatBody();
         }
-        // `ready` == !g_loading: only touch the session when no reload is tearing
-        // it down on the loader thread (same rule as the chat view).
-        status_bar.render(if (ready) g_session else null, g_loading.load(.acquire), diffBusy(), diffVram(), &g_split, &g_limit, g_llm_eject_armed, g_diff_eject_armed, llmPaused(), diffPaused(), meterActions());
-        return;
     }
 
-    // Chat view. A background (re)load never takes over the screen: the layout
-    // stays put, the just-sent message shows as a normal user bubble, and the
-    // assistant slot shows a small "Loading..." until the session is live (see
+    // `!g_loading`: only touch the session when no reload is tearing it down on
+    // the loader thread (the release/acquire hand-off only guarantees the
+    // pointer valid while g_loading is false).
+    const ready = !g_loading.load(.acquire);
+    status_bar.render(if (ready) g_session else null, !ready, diffBusy(), diffVram(), &g_split, &g_limit, g_llm_eject_armed, g_diff_eject_armed, llmPaused(), diffPaused(), meterActions());
+}
+
+/// The chat workspace body: sidebar | transcript + composer | queue rail.
+fn chatBody() void {
+    // A background (re)load never takes over the screen: the layout stays put,
+    // the just-sent message shows as a normal user bubble, and the assistant
+    // slot shows a small "Loading…" until the session is live (see
     // renderMessages). No spinner flashing in and out.
     const loading = g_loading.load(.acquire);
     // While a (re)load is in flight the loader thread is tearing down / rebuilding
@@ -985,32 +1049,708 @@ fn frame() void {
     // session-consuming render below takes `s_ui`, not `g_session`.)
     const s_ui: ?*chat.Session = if (loading) null else g_session;
 
-    // Show the "no model" notice when there's genuinely nothing configured, OR
-    // when the last load failed (e.g. a non-mmproj file in the vision-tower slot
-    // -> error.MmprojNotVisionTower): the session load returns the error, so there
-    // is NO working session at all and renderNoModel surfaces `g_load_err`. Both
-    // are terminal null-session states; during a load `loading` is set so the
-    // transiently-null session never trips this.
-    if (!loading and g_session == null and (g_config.llm_model.opt() == null or g_load_err != null)) {
-        renderNoModel();
-        return;
-    }
+    // The "no model" notice replaces the TRANSCRIPT, not the workspace: the
+    // rails still show, so the queue and the settings shortcut stay reachable
+    // while nothing is configured. True when there is genuinely nothing set, or
+    // when the last load failed (e.g. a non-mmproj file in the vision-tower
+    // slot) and there is no working session at all. During a load `loading` is
+    // set, so the transiently-null session never trips it.
+    const no_model = !loading and g_session == null and
+        (g_config.llm_model.opt() == null or g_load_err != null);
+
+    applyPendingConversationLoad();
 
     if (s_ui) |s| {
         s.poll();
-        if (g_diffuser) |*d| s.scanNewImages(d);
+        if (g_diffuser) |*d| {
+            s.scanNewImages(d);
+            noteFinishedImages(s, d);
+        }
+    }
+    saveHistory(false);
+
+    renderSidebar();
+
+    {
+        // The column's width is COMPUTED from the band, not left to the box
+        // layout. `min_size_content.w = 0` is not enough: a child's min size
+        // still propagates up, so one long unbroken line (a tool call, a URL)
+        // grows the column and squeezes the rails to slivers. Pinning both ends
+        // makes the rails' widths the fixed quantity they are supposed to be.
+        const band_w = dvui.parentGet().data().contentRect().w;
+        const col_w = @max(240, band_w - style.Layout.sidebar_w - style.Layout.rail_w);
+        var col = dvui.box(@src(), .{ .dir = .vertical }, .{
+            .expand = .vertical,
+            .min_size_content = .{ .w = col_w },
+            .max_size_content = .width(col_w),
+        });
+        defer col.deinit();
+
+        if (no_model) {
+            renderNoModel();
+        } else {
+            // Pin the composer to the bottom: cap the transcript's height to
+            // what is left. A scrollArea reports its full content height as its
+            // min size, so as a plain flex child it would push the composer
+            // off-screen.
+            const list_h = @max(120, col.data().contentRect().h - g_input_h);
+            renderMessages(s_ui, list_h, loading);
+            renderInput(s_ui);
+        }
     }
 
-    // Pin the input strip to the bottom: cap the message list's height to the
-    // space left after the (dynamically-measured) input row. A scrollArea
-    // reports its full content height as its min size, so as a plain flex child
-    // it would push the input off-screen (dvui's box sums every child's min
-    // height). max_size_content caps that.
-    const list_h = @max(120, root.data().contentRect().h - g_input_h - status_bar.bar_height);
+    renderQueueRail();
+}
 
-    renderMessages(s_ui, list_h, loading);
-    renderInput(s_ui);
-    status_bar.render(s_ui, g_loading.load(.acquire), diffBusy(), diffVram(), &g_split, &g_limit, g_llm_eject_armed, g_diff_eject_armed, llmPaused(), diffPaused(), meterActions());
+/// Build the queue rail's model from the live engine. The Queue tab shows only
+/// in-flight images (they move into the transcript's tool card as they land);
+/// the Library tab shows every finished one, newest first.
+fn renderQueueRail() void {
+    var jobs_buf: [16]queue_rail.Job = undefined;
+    var lib_buf: [24]queue_rail.LibraryItem = undefined;
+    var titles: [16][80]u8 = undefined;
+    var n_jobs: usize = 0;
+    var n_lib: usize = 0;
+    g_rail_jobs_len = 0;
+
+    if (g_diffuser) |*d| {
+        const items = d.items();
+        for (items) |gi| {
+            if (n_jobs >= jobs_buf.len) break;
+            const st = gi.get();
+            if (st != .pending and st != .generating and st != .suspended) continue;
+            const done = gi.step.load(.monotonic);
+            const total = gi.total.load(.monotonic);
+            jobs_buf[n_jobs] = .{
+                .id = @intFromPtr(gi),
+                .title = railTitle(&titles[n_jobs], gi),
+                .thumb = previewThumb(gi),
+                .state = if (st == .generating) .{ .running = .{
+                    .step = done,
+                    .steps = @max(total, 1),
+                    .it_s = itPerSec(gi),
+                } } else .{ .queued = .{ .eta_s = null } },
+                .from_studio = gi.from_studio,
+            };
+            g_rail_jobs[n_jobs] = gi;
+            n_jobs += 1;
+        }
+        g_rail_jobs_len = n_jobs;
+
+        // Finished images, newest first. Only the Library tab draws these, so
+        // nothing here is also sitting inline in the transcript.
+        var i = items.len;
+        while (i > 0 and n_lib < lib_buf.len) {
+            i -= 1;
+            const gi = items[i];
+            if (gi.get() != .done) continue;
+            lib_buf[n_lib] = .{ .id = @intFromPtr(gi), .thumb = doneThumb(gi) };
+            n_lib += 1;
+        }
+    }
+
+    queue_rail.render(.{
+        .tab = g_rail_tab,
+        .jobs = jobs_buf[0..n_jobs],
+        .library = lib_buf[0..n_lib],
+        .paused = diffPaused(),
+    }, .{
+        .on_tab = onRailTab,
+        .on_pause_all = toggleDiffPause,
+        .on_open = onOpenImage,
+        .on_cancel = onCancelImage,
+        .on_reorder = onReorderQueue,
+    });
+}
+
+/// A queue row's title: the first line of the prompt, since that is what the
+/// user recognizes. Truncation is left to the rail, which knows its own width.
+fn railTitle(buf: []u8, gi: *chat.GenImage) []const u8 {
+    const p = std.mem.trim(u8, gi.prompt, " \t\r\n");
+    const line = p[0 .. std.mem.indexOfScalar(u8, p, '\n') orelse p.len];
+    if (line.len == 0) return "untitled";
+    const n = @min(line.len, buf.len);
+    @memcpy(buf[0..n], line[0..n]);
+    return buf[0..n];
+}
+
+fn itPerSec(gi: *chat.GenImage) f32 {
+    const first = gi.first_step_ns.load(.monotonic);
+    const last = gi.last_step_ns.load(.monotonic);
+    const steps = gi.step.load(.monotonic);
+    if (first == 0 or last <= first or steps < 2) return 0;
+    const secs = @as(f32, @floatFromInt(last - first)) / 1e9;
+    return @as(f32, @floatFromInt(steps - 1)) / @max(secs, 1e-6);
+}
+
+/// A running image shows its live preview; a queued one has nothing to show
+/// yet, and says so with a dashed slot rather than an empty grey box.
+fn previewThumb(gi: *chat.GenImage) queue_rail.Thumb {
+    if (gi.preview) |pv| {
+        const w = gi.preview_w.load(.acquire);
+        const h = gi.preview_h.load(.acquire);
+        if (w > 0 and h > 0 and pv.len >= @as(usize, w) * h * 4) {
+            return .{ .rgba = .{ .px = pv[0 .. @as(usize, w) * h * 4], .w = w, .h = h } };
+        }
+    }
+    return .dashed;
+}
+
+fn doneThumb(gi: *chat.GenImage) queue_rail.Thumb {
+    if (gi.rgba) |px| return .{ .rgba = .{ .px = px, .w = @intCast(gi.width), .h = @intCast(gi.height) } };
+    return .loading;
+}
+
+// ----------------------------------------------------------- tool-call card
+
+/// Which card has its prompt open, and which tile is selected in it, both keyed
+/// by the variant's address. One card at a time: an accordion keeps the
+/// transcript from growing several screens of prompt text at once.
+var g_card_open: ?usize = null;
+var g_card_sel_key: ?usize = null;
+var g_card_sel_tile: usize = 0;
+/// The image run the in-flight callbacks below act on, set immediately before
+/// the card renders (dvui callbacks fire inside the same call).
+var g_card_imgs: []const *chat.GenImage = &.{};
+
+/// One card over `imgs` — a run of images the model asked for in one breath.
+fn renderToolCard(imgs: []const *chat.GenImage, id: usize) void {
+    if (imgs.len == 0) return;
+    const key = @intFromPtr(imgs[0]);
+    g_card_imgs = imgs;
+
+    var tiles_buf: [12]bubbles.Tile = undefined;
+    const n = @min(imgs.len, tiles_buf.len);
+    var n_done: usize = 0;
+    var busy = false;
+    for (imgs[0..n], 0..) |gi, i| {
+        switch (gi.get()) {
+            .done => {
+                n_done += 1;
+                tiles_buf[i] = if (gi.rgba) |px|
+                    .{ .rgba = .{ .px = px, .w = @intCast(gi.width), .h = @intCast(gi.height) } }
+                else
+                    .pending;
+            },
+            .failed, .canceled => tiles_buf[i] = .failed,
+            // Still in the queue: the card holds the slot, the rail holds the
+            // pixels. See queue_rail.
+            .pending, .generating, .suspended => {
+                tiles_buf[i] = .pending;
+                busy = true;
+            },
+        }
+    }
+    if (busy) dvui.refresh(null, @src(), null);
+
+    const first = imgs[0];
+    var meta_buf: [80]u8 = undefined;
+    var cbuf: [8]u8 = undefined;
+    const meta = std.fmt.bufPrint(&meta_buf, "{s}{d}×{d} · seed {d}", .{
+        if (n > 1) (std.fmt.bufPrint(&cbuf, "×{d} · ", .{n}) catch "") else "",
+        first.req_width,
+        first.req_height,
+        first.req_seed,
+    }) catch "";
+
+    var status_buf: [40]u8 = undefined;
+    const status = if (busy)
+        (std.fmt.bufPrint(&status_buf, "rendering {d} of {d} · in queue", .{ @min(n_done + 1, n), n }) catch "rendering")
+    else
+        "";
+
+    bubbles.toolCard(@src(), .{
+        .meta = meta,
+        .tiles = tiles_buf[0..n],
+        .selected = if (g_card_sel_key == key) g_card_sel_tile else null,
+        .prompt = first.prompt,
+        .expanded = g_card_open == key,
+        .busy = busy,
+        .status = status,
+        .id_extra = id,
+    }, .{
+        .ctx = @ptrFromInt(key),
+        .on_toggle = cardToggle,
+        .on_select = cardSelect,
+        .on_open_studio = cardOpenStudio,
+    });
+}
+
+fn cardToggle(ctx: *anyopaque) void {
+    const key = @intFromPtr(ctx);
+    g_card_open = if (g_card_open == key) null else key;
+}
+
+/// Selecting a tile also opens the viewer: "look closer" is what a click on a
+/// thumbnail means, and the selection is what makes Open in Studio unambiguous.
+fn cardSelect(ctx: *anyopaque, i: usize) void {
+    g_card_sel_key = @intFromPtr(ctx);
+    g_card_sel_tile = i;
+    if (i < g_card_imgs.len) {
+        const gi = g_card_imgs[i];
+        if (gi.get() == .done) g_viewer_request = gi;
+    }
+}
+
+/// Carry this render's parameters into the studio form and switch to it.
+fn cardOpenStudio(ctx: *anyopaque) void {
+    const key = @intFromPtr(ctx);
+    if (g_card_imgs.len == 0) return;
+    const idx = if (g_card_sel_key == key and g_card_sel_tile < g_card_imgs.len) g_card_sel_tile else 0;
+    image_view.loadFrom(g_card_imgs[idx]);
+    enterImageMode();
+}
+
+// ------------------------------------------------------------------- sidebar
+
+/// Draw the conversation list, grouped by local calendar day.
+fn renderSidebar() void {
+    var rows: [64]shell.ConvRow = undefined;
+    var subs: [64][32]u8 = undefined;
+    var groups: [3]shell.ConvGroup = undefined;
+    var n_groups: usize = 0;
+
+    const now = @divTrunc(diffuser.nowNs(g_io), std.time.ns_per_ms);
+    const tz = history.localOffsetSeconds(@divTrunc(now, 1000));
+    var n: usize = 0;
+    // The store is already newest-first, so each group is a contiguous run.
+    inline for ([_]history.Group{ .today, .yesterday, .earlier }) |grp| {
+        const start = n;
+        for (g_history.entries.items) |e| {
+            if (n >= rows.len) break;
+            if (history.groupOf(e.updated_ms, now, tz) != grp) continue;
+            rows[n] = .{
+                .id = e.id,
+                .title = e.title,
+                .sub = std.fmt.bufPrint(&subs[n], "{d} messages", .{e.turns}) catch null,
+            };
+            n += 1;
+        }
+        if (n > start) {
+            groups[n_groups] = .{ .head = grp.head(), .rows = rows[start..n] };
+            n_groups += 1;
+        }
+    }
+
+    shell.sidebar(.{
+        .groups = groups[0..n_groups],
+        .selected = if (g_history.current != 0) g_history.current else null,
+        .models_pct = null,
+    }, .{
+        .on_new_chat = onNewConversation,
+        .on_select = onSelectConversation,
+        .on_delete = onDeleteConversation,
+        .on_models = openSettings,
+        .on_settings = openSettings,
+    });
+}
+
+/// Point the store at `<config dir>/conversations` and scan it.
+fn openHistory() void {
+    const dir: ?[]u8 = blk: {
+        if (g_config_path) |p| {
+            // An explicit --config: keep the history beside that file.
+            const parent = std.fs.path.dirname(p) orelse ".";
+            break :blk std.fs.path.join(g_gpa, &.{ parent, "conversations" }) catch null;
+        }
+        const base = (config.Config.dirPath(g_io, g_gpa, g_environ) catch null) orelse break :blk null;
+        defer g_gpa.free(base);
+        break :blk std.fs.path.join(g_gpa, &.{ base, "conversations" }) catch null;
+    };
+    const d = dir orelse {
+        std.log.warn("history: no config directory — conversations will not be saved", .{});
+        return;
+    };
+    defer g_gpa.free(d);
+    g_history.open(g_gpa, g_io, d);
+}
+
+fn onNewConversation() void {
+    saveHistory(true); // don't lose the one we're leaving
+    g_history.newConversation();
+    g_saved_turns = 0;
+    g_saved_tail = 0;
+    newChat();
+}
+
+fn onSelectConversation(id: u64) void {
+    if (id == g_history.current) return;
+    g_load_conv = id;
+}
+
+fn onDeleteConversation(id: u64) void {
+    const was_current = id == g_history.current;
+    g_history.remove(g_gpa, g_io, id);
+    if (was_current) {
+        g_saved_turns = 0;
+        g_saved_tail = 0;
+        newChat();
+    }
+}
+
+/// Swap the live transcript for a stored one. Runs at the top of a frame, never
+/// mid-render: it resets the session and replays every turn into the model's
+/// tokenizer, which is not something to do while widgets hold pointers into the
+/// message list.
+fn applyPendingConversationLoad() void {
+    const id = g_load_conv orelse return;
+    g_load_conv = null;
+    if (g_loading.load(.acquire)) return; // the loader owns the session right now
+
+    var loaded = g_history.load(g_gpa, g_io, id) orelse return;
+    defer loaded.deinit();
+
+    saveHistory(true); // flush the conversation we are leaving
+
+    var msgs: std.ArrayList(chat.Message) = .empty;
+    for (loaded.turns) |t| {
+        var m = chat.Message.init(g_gpa, if (t.role == .user) .user else .assistant) catch break;
+        m.synthetic = t.synthetic;
+        m.active().text.appendSlice(g_gpa, t.text) catch {};
+        // Without this a primed reply parses as having no thought at all and
+        // the whole reasoning block spills into the answer (see history.Turn).
+        m.active().thought_primed = t.primed;
+        // The tool calls in this text have ALREADY been acted on. Marking the
+        // variant scanned is what stops `scanNewImages` re-dispatching the last
+        // assistant turn's calls every time a conversation is reopened —
+        // regenerating images the user already has.
+        m.active().images_scanned = true;
+        // The markers this turn was generated with, so it splits the same way it
+        // did when it was live — with a different model loaded, or none.
+        if (t.reason_open.len > 0 and t.reason_close.len > 0) {
+            if (g_gpa.dupe(u8, t.reason_open)) |o| {
+                if (g_gpa.dupe(u8, t.reason_close)) |c| {
+                    m.active().reason_open = o;
+                    m.active().reason_close = c;
+                } else |_| g_gpa.free(o);
+            } else |_| {}
+        }
+        if (t.model.len > 0) m.active().gen_model = g_gpa.dupe(u8, t.model) catch "";
+        restoreImages(&m, t.images);
+        msgs.append(g_gpa, m) catch {
+            m.deinit(g_gpa);
+            break;
+        };
+    }
+
+    freeCarry();
+    freeLlmSuspend();
+    clearStaged();
+    @memset(&g_input_buf, 0);
+    g_pending_regenerate = false;
+    g_follow_bottom = true;
+
+    if (g_session) |s| {
+        s.reset();
+        // Takes ownership of `msgs` and replays each turn into this model's
+        // tokenizer; the next prefill rebuilds KV from the whole context.
+        s.adoptTranscript(msgs) catch |err| {
+            std.log.err("history: adopting conversation {d} failed: {t}", .{ id, err });
+        };
+    } else {
+        // No LLM resident: the transcript still shows (read-only) and is adopted
+        // by the fresh session when one loads.
+        g_carry = msgs;
+    }
+
+    g_history.current = id;
+    // The conversation you are looking at belongs at the top of the list. Done
+    // in memory only: persisting it would be a write on open, which is the
+    // thing that broke the ordering in the first place. Across a restart the
+    // list falls back to last-modified order, which is the honest thing for a
+    // conversation nobody has touched.
+    g_history.touch(id, @divTrunc(diffuser.nowNs(g_io), std.time.ns_per_ms));
+    g_saved_turns = loaded.turns.len;
+    g_saved_tail = if (loaded.turns.len > 0) loaded.turns[loaded.turns.len - 1].text.len else 0;
+}
+
+/// Report each image's terminal state to the model, once, as a note it reads
+/// at the next turn boundary.
+///
+/// This is what closes the loop the image tool has never had: the model asks
+/// for a picture and, until now, never learned whether one appeared. Knowing a
+/// render ran out of VRAM is what lets it offer a smaller retry instead of the
+/// user wondering why nothing happened.
+///
+/// Off by setting (`image_tool_result`), which restores the fire-and-forget
+/// behaviour exactly: nothing is queued, so nothing reaches the model.
+fn noteFinishedImages(s: *chat.Session, d: *diffuser.Diffuser) void {
+    for (d.items()) |gi| {
+        if (gi.outcome_noted) continue;
+        const st = gi.get();
+        switch (st) {
+            .pending, .generating, .suspended => continue,
+            .done, .failed, .canceled => {},
+        }
+        // Marked even when the setting is off, so flipping it on mid-session
+        // does not suddenly announce a backlog of old images.
+        gi.outcome_noted = true;
+        if (!g_config.image_tool_result) continue;
+
+        var buf: [220]u8 = undefined;
+        const text = switch (st) {
+            .done => std.fmt.bufPrint(&buf, "[image tool] finished: {d}×{d}, seed {d}", .{
+                gi.width, gi.height, gi.req_seed,
+            }) catch continue,
+            .canceled => std.fmt.bufPrint(&buf, "[image tool] canceled by the user", .{}) catch continue,
+            .failed => std.fmt.bufPrint(&buf, "[image tool] failed: {s}", .{
+                if (gi.failure()) |err| diffuser.failureText(err) else "unknown error",
+            }) catch continue,
+            else => continue,
+        };
+        s.queueNote(g_gpa.dupe(u8, text) catch continue);
+    }
+}
+
+/// Rebuild a turn's finished renders from disk so its card shows the images
+/// instead of the model's request being run again.
+///
+/// A file that has since moved or been deleted becomes a FAILED image carrying
+/// `error.SavedImageMissing`, not a fresh generation: the user asked for that
+/// picture once, and silently spending VRAM to remake it is the behaviour this
+/// whole path exists to remove.
+///
+/// The engine takes ownership, so restored renders live in the same unified list
+/// as everything else and show up in Library and the viewer. With no engine
+/// (no diffusion model configured) there is nowhere to put them, and the card
+/// renders its slots empty.
+fn restoreImages(m: *chat.Message, recs: []const history.ImageRec) void {
+    const d = if (g_diffuser) |*dd| dd else return;
+    for (recs) |rec| {
+        // Already here? Reuse it. The engine owns every image and a variant
+        // only borrows, so the same render can appear in two conversations
+        // without being loaded twice — and reopening one conversation
+        // repeatedly cannot keep growing the Library.
+        if (diffuser.Diffuser.findSaved(d.items(), rec.path)) |have| {
+            m.active().images.append(g_gpa, have) catch return;
+            continue;
+        }
+        const gi = g_gpa.create(chat.GenImage) catch return;
+        gi.* = .{
+            // Left EMPTY on purpose: the request lives in the PNG's own
+            // metadata, which `image_view.loadFrom` reads when reopening it.
+            .prompt = g_gpa.dupe(u8, "") catch {
+                g_gpa.destroy(gi);
+                return;
+            },
+            .wake = wakeupFrame,
+            .io = g_io,
+            .req_width = rec.width,
+            .req_height = rec.height,
+            .req_steps = rec.steps,
+            .req_seed = rec.seed,
+            .width = rec.width,
+            .height = rec.height,
+            .saved_path = g_gpa.dupe(u8, rec.path) catch null,
+            // Already terminal, and already reported when it was generated.
+            .outcome_noted = true,
+        };
+        if (vips.loadRgb(g_gpa, rec.path)) |dec| {
+            defer g_gpa.free(dec.pixels);
+            if (diffuser.rgbToRgba(g_gpa, dec.pixels, dec.width, dec.height)) |rgba| {
+                gi.rgba = rgba;
+                gi.width = dec.width;
+                gi.height = dec.height;
+                gi.status = .init(@intFromEnum(chat.GenStatus.done));
+            } else |_| gi.fail(error.OutOfMemory);
+        } else |_| {
+            gi.fail(error.SavedImageMissing);
+        }
+        d.adoptFinished(gi) catch {
+            diffuser.freeGenImage(g_gpa, gi);
+            return;
+        };
+        m.active().images.append(g_gpa, gi) catch return;
+    }
+}
+
+/// Persist the live transcript if it changed since the last save. Skipped while
+/// a turn is streaming (`force` overrides, for a conversation switch or exit):
+/// writing on every token would rewrite the file once per frame.
+fn saveHistory(force: bool) void {
+    const msgs: []chat.Message = if (g_session) |s| s.messages.items else if (g_carry) |c| c.items else return;
+    if (msgs.len == 0) return;
+    // `force` bypasses the BUSY gate only, so a switch or an exit can flush a
+    // turn that is still streaming. It does NOT bypass the change check:
+    // rewriting an unchanged conversation stamps it with a fresh `updated`, and
+    // since the list is ordered by that, merely opening conversations
+    // reshuffled them — the one you left jumped to the top. Reading must not
+    // write.
+    if (!force) if (g_session) |s| if (s.busy()) return;
+    const tail = msgs[msgs.len - 1].activeConst().text.items.len;
+    if (msgs.len == g_saved_turns and tail == g_saved_tail) return;
+
+    var turns: std.ArrayList(history.Turn) = .empty;
+    defer turns.deinit(g_gpa);
+    var image_recs: std.ArrayList([]history.ImageRec) = .empty;
+    defer {
+        for (image_recs.items) |r| g_gpa.free(r);
+        image_recs.deinit(g_gpa);
+    }
+    for (msgs) |*m| {
+        // `chat.Role` is user|assistant only; the system prompt is rebuilt
+        // from settings on load rather than pinned into every transcript.
+        const role: history.Role = switch (m.role) {
+            .user => .user,
+            .assistant => .assistant,
+        };
+        // Renders this turn produced that made it to disk. Only saved ones:
+        // there is nothing to point at otherwise, and a reload shows the call
+        // without the picture rather than generating it again.
+        var recs: std.ArrayList(history.ImageRec) = .empty;
+        for (m.activeConst().images.items) |gi| {
+            if (gi.get() != .done) continue;
+            const path = gi.saved_path orelse continue;
+            recs.append(g_gpa, .{
+                .path = path,
+                .width = gi.width,
+                .height = gi.height,
+                .steps = gi.req_steps,
+                .seed = gi.req_seed,
+            }) catch break;
+        }
+        // Owned by `image_recs` so the slices outlive the save call below.
+        const owned: []history.ImageRec = recs.toOwnedSlice(g_gpa) catch &.{};
+        image_recs.append(g_gpa, owned) catch {};
+        turns.append(g_gpa, .{
+            .role = role,
+            .text = m.activeConst().text.items,
+            .primed = m.activeConst().thought_primed,
+            .images = owned,
+            // What produced this turn. Without the markers a reopened
+            // conversation splits its replies with whatever model is loaded now.
+            .reason_open = m.activeConst().reason_open,
+            .reason_close = m.activeConst().reason_close,
+            .model = m.activeConst().gen_model,
+            .synthetic = m.synthetic,
+        }) catch return;
+    }
+    if (turns.items.len == 0) return;
+
+    g_history.save(g_gpa, g_io, @divTrunc(diffuser.nowNs(g_io), std.time.ns_per_ms), turns.items);
+    g_saved_turns = msgs.len;
+    g_saved_tail = msgs[msgs.len - 1].activeConst().text.items.len;
+}
+
+// -------------------------------------------------------------- title bar
+
+fn onTabPicked(t: shell.Tab) void {
+    switch (t) {
+        .chat => if (g_view != .chat) enterChatMode(),
+        .studio => if (g_view != .image) enterImageMode(),
+    }
+}
+
+/// The diffusion checkpoint's file name, for the title-bar chip.
+fn diffModelLabel(buf: []u8) []const u8 {
+    const p = g_config.diffusion_model.opt() orelse return "no image model";
+    const base = std.fs.path.basename(p);
+    const stem = base[0 .. std.mem.lastIndexOfScalar(u8, base, '.') orelse base.len];
+    const n = @min(stem.len, buf.len);
+    @memcpy(buf[0..n], stem[0..n]);
+    return buf[0..n];
+}
+
+/// What is resident right now, for the second title-bar chip. Empty (chip
+/// hidden) when nothing is loaded — an empty chip is worse than no chip.
+fn residentLabel(buf: []u8) []const u8 {
+    var llm: []const u8 = "";
+    var lbuf: [64]u8 = undefined;
+    if (!g_loading.load(.acquire)) if (g_session != null) {
+        if (g_config.llm_model.opt()) |p| {
+            const base = std.fs.path.basename(p);
+            const stem = base[0 .. std.mem.lastIndexOfScalar(u8, base, '.') orelse base.len];
+            const n = @min(stem.len, lbuf.len);
+            @memcpy(lbuf[0..n], stem[0..n]);
+            llm = lbuf[0..n];
+        }
+    };
+    const diff_on = if (g_diffuser) |*d| d.vramBytes() > 0 else false;
+    if (llm.len == 0 and !diff_on) return "";
+    if (llm.len == 0) return "image model resident";
+    if (!diff_on) return std.fmt.bufPrint(buf, "{s}", .{llm}) catch "";
+    return std.fmt.bufPrint(buf, "{s} + image", .{llm}) catch "";
+}
+
+// ------------------------------------------------------------- queue rail
+
+// ------------------------------------------------------------- composer
+
+/// A stable address for the composer's callback context. The composer acts on
+/// process globals, so nothing needs to travel through the pointer, but the
+/// shared widget takes one so a caller that DOES have per-instance state can
+/// use it.
+var g_composer_ctx: u8 = 0;
+/// The megapixel field's text, held across frames because the user types into
+/// it. Synced from `g_config.framing_mp` whenever it is not focused.
+var g_mp_buf: [16]u8 = [_]u8{0} ** 16;
+
+/// Recompute the image dimensions from the framing choice, push them to the
+/// engine, and persist.
+///
+/// The two dependent views seed their form buffers ONCE, so both have to be
+/// told: without this, Studio keeps generating at the size it was opened with,
+/// and Settings' Apply writes its stale copy straight back over the change.
+fn applyFraming() void {
+    g_config.applyFraming();
+    g_config_baseline.framing_ratio = g_config.framing_ratio;
+    g_config_baseline.framing_mp = g_config.framing_mp;
+    g_config_baseline.width = g_config.width;
+    g_config_baseline.height = g_config.height;
+    if (g_diffuser) |*d| d.setDefaults(g_config.steps, g_config.width, g_config.height);
+    image_view.reseed();
+    config_view.reseed();
+    g_config.save(g_io, g_gpa, g_environ, g_config_path) catch |err| std.log.err("save settings failed: {t}", .{err});
+}
+
+fn composerQuick(_: *anyopaque, _: usize) void {
+    openSettings();
+}
+fn composerAllSettings(_: *anyopaque) void {
+    enterImageMode();
+}
+/// "+ reference": attach an image to the next message. The drop/paste paths
+/// already exist (handleDropFile / tryPasteClipboardImage); this opens a picker
+/// for the same thing.
+fn composerReference(_: *anyopaque) void {
+    const path = dvui.dialogNativeFileOpen(g_gpa, .{ .title = "Attach a reference image" }) catch null;
+    if (path) |pp| {
+        defer g_gpa.free(pp);
+        handleDropFile(pp);
+    }
+}
+
+fn onRailTab(t: queue_rail.Tab) void {
+    g_rail_tab = t;
+}
+
+fn onOpenImage(id: u64) void {
+    if (g_diffuser) |*d| for (d.items()) |gi| {
+        if (@intFromPtr(gi) == id) {
+            g_viewer_request = gi;
+            return;
+        }
+    };
+}
+
+fn onCancelImage(id: u64) void {
+    if (g_diffuser) |*d| for (d.items()) |gi| {
+        if (@intFromPtr(gi) == id) {
+            gi.cancel.store(true, .release);
+            gi.wake();
+            return;
+        }
+    };
+}
+
+/// Drag-to-reorder. The rail hands back indices into the row list it was given,
+/// which `renderQueueRail` recorded in `g_rail_jobs` for exactly this.
+fn onReorderQueue(from: usize, to: usize) void {
+    const d = if (g_diffuser) |*dd| dd else return;
+    if (from >= g_rail_jobs_len) return;
+    const move = g_rail_jobs[from];
+    const before: ?*chat.GenImage = if (to < g_rail_jobs_len) g_rail_jobs[to] else null;
+    d.movePending(move, before);
 }
 
 fn diffBusy() bool {
@@ -1026,35 +1766,27 @@ fn diffVram() diffuser.VramBreakdown {
 /// with a spinner. Replaced by the real streaming response the instant the
 /// session is live.
 fn loadingAssistantBubble() void {
-    const theme = dvui.themeGet();
     var bubble = dvui.box(@src(), .{ .dir = .horizontal }, .{
-        .margin = .{ .x = 8, .y = 3, .w = 96, .h = 3 },
-        .background = true,
-        .color_fill = theme.fill.lerp(theme.text, 0.08),
-        .corner_radius = dvui.Rect.all(10),
-        .padding = dvui.Rect.all(10),
+        .margin = .{ .y = 9, .h = 9 },
+        .padding = .{},
     });
     defer bubble.deinit();
     dvui.spinner(@src(), .{ .gravity_y = 0.5, .min_size_content = .{ .w = 14, .h = 14 }, .margin = .{ .w = 8 } });
-    dvui.label(@src(), "Loading…", .{}, .{ .gravity_y = 0.5, .color_text = theme.text.lerp(theme.fill, 0.35) });
+    dvui.labelNoFmt(@src(), "Loading…", .{}, .{ .gravity_y = 0.5, .font = style.F.prose, .color_text = style.C.text_dim });
 }
 
 /// Assistant slot for a message sent while the LLM is paused with nothing
 /// resident: no spinner (nothing is loading), just a paused hint. The load +
 /// generation fire on resume, see toggleLlmPause -> maybeStartReload.
 fn queuedAssistantBubble() void {
-    const theme = dvui.themeGet();
     var bubble = dvui.box(@src(), .{ .dir = .horizontal }, .{
-        .margin = .{ .x = 8, .y = 3, .w = 96, .h = 3 },
-        .background = true,
-        .color_fill = theme.fill.lerp(theme.text, 0.08),
-        .corner_radius = dvui.Rect.all(10),
-        .padding = dvui.Rect.all(10),
+        .margin = .{ .y = 9, .h = 9 },
+        .padding = .{},
     });
     defer bubble.deinit();
-    // richLabel (not dvui.label) so the ⏸ routes to the emoji face, the prose
-    // font (NotoSansCJK) has no media-control glyphs. See fonts.isEmoji.
-    fonts.richLabel(@src(), "⏸ queued — resume to generate", .{ .gravity_y = 0.5, .color_text = theme.text.lerp(theme.fill, 0.4) });
+    // richLabel (not dvui.label) so the ⏸ routes to the emoji face; no text
+    // face we bundle has the media-control glyphs. See fonts.isEmoji.
+    fonts.richLabel(@src(), "⏸ queued — resume to generate", .{ .gravity_y = 0.5, .font = style.F.prose, .color_text = style.C.text_dim });
 }
 
 /// Chat view when no LLM is configured (or the last load failed): explain and
@@ -1064,7 +1796,7 @@ fn renderNoModel() void {
     defer col.deinit();
 
     {
-        var tl = dvui.textLayout(@src(), .{}, .{ .gravity_x = 0.5 });
+        var tl = dvui.textLayout(@src(), .{}, .{ .gravity_x = 0.5, .background = false });
         defer tl.deinit();
         if (g_load_err) |err| {
             var msg: [320]u8 = undefined;
@@ -1072,16 +1804,19 @@ fn renderNoModel() void {
                 "The vision-tower (mmproj) file isn't a vision projector — it looks like an LLM model, not an mmproj.\n\nIn Settings, set the vision tower to an mmproj-*.gguf file, or clear it for a text-only model."
             else
                 (std.fmt.bufPrint(&msg, "Failed to load the model: {t}\n\nChoose a different model in Settings.", .{err}) catch "Failed to load the model.");
-            fonts.addRich(tl, text);
+            fonts.addStyled(tl, text, .{}, .{ .font = style.F.prose, .color_text = style.C.text });
         } else {
-            fonts.addRich(tl, "No LLM model is set.\n\nOpen Settings (or the ⚙ button) to choose a model file to get started.");
+            fonts.addStyled(tl, "No LLM model is set.\n\nOpen Settings to choose a model file and get started.", .{}, .{
+                .font = style.F.prose,
+                .color_text = style.C.text,
+            });
         }
     }
     {
-        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = 0.5, .margin = .{ .y = 12 } });
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .gravity_x = 0.5, .margin = .{ .y = 14 } });
         defer row.deinit();
-        if (dvui.button(@src(), "Open Settings", .{}, .{})) openSettings();
-        if (dvui.button(@src(), "Image studio", .{}, .{ .margin = .{ .x = 8 } })) enterImageMode();
+        if (bubbles.primaryButton(@src(), "Open Settings", true)) openSettings();
+        if (bubbles.secondaryButton(@src(), 1, "Image studio", true)) enterImageMode();
     }
 }
 
@@ -1672,7 +2407,10 @@ fn renderMessages(s: ?*chat.Session, list_h: f32, loading: bool) void {
         });
         defer scroll.deinit();
 
-        var list = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal });
+        var list = dvui.box(@src(), .{ .dir = .vertical }, .{
+            .expand = .horizontal,
+            .padding = .{ .x = 30, .y = 24, .w = 30, .h = 24 },
+        });
         defer list.deinit();
 
         // With no live session, fall back to the CARRIED transcript (present when
@@ -1683,10 +2421,13 @@ fn renderMessages(s: ?*chat.Session, list_h: f32, loading: bool) void {
         if (msgs.len == 0 and !loading and g_pending_submit == null) {
             var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .padding = dvui.Rect.all(16) });
             defer tl.deinit();
-            tl.addText(if (s == null)
+            fonts.addStyled(tl, if (s == null)
                 "Say something to start — the model loads on your first message."
             else
-                "Say something to start the conversation.", .{});
+                "Say something to start the conversation.", .{}, .{
+                .font = style.F.prose,
+                .color_text = style.C.text_ghost,
+            });
         } else {
             for (msgs, 0..) |*m, idx| renderMessage(s, m, idx);
         }
@@ -1733,33 +2474,41 @@ fn renderMessages(s: ?*chat.Session, list_h: f32, loading: bool) void {
 /// transcript (the model is still (re)loading). Same right-leaning accent style
 /// as a real user turn.
 fn pendingUserBubble(text: []const u8) void {
-    const theme = dvui.themeGet();
     var bubble = dvui.box(@src(), .{ .dir = .vertical }, .{
         .expand = .horizontal,
-        .margin = .{ .x = 160, .y = 3, .w = 8, .h = 3 },
+        .gravity_x = 1.0,
+        .max_size_content = .width(style.Layout.bubble_max),
         .background = true,
-        .color_fill = theme.fill.lerp(theme.focus, 0.30),
-        .corner_radius = dvui.Rect.all(10),
-        .padding = dvui.Rect.all(10),
+        .color_fill = style.C.bubble_user,
+        .border = style.Edge.all,
+        .color_border = style.hairline,
+        .corner_radius = .{ .x = 10, .y = 10, .w = 3, .h = 10 },
+        .padding = .{ .x = 14, .y = 11, .w = 14, .h = 11 },
+        .margin = .{ .y = 9, .h = 9 },
     });
     defer bubble.deinit();
-    markdown_view.render(@src(), text, .{});
+    markdown_view.render(@src(), text, .{ .prose = .{
+        .background = false,
+        .padding = .{},
+        .font = style.F.prose,
+        .color_text = style.C.text_hi,
+    } });
 }
 
 /// Spinner + "Processing...": the model is working on this turn but has produced
 /// no visible text yet. See `renderMessage` for why this is distinct from the
 /// session-load "Loading..." bubble.
-fn processingRow(theme: dvui.Theme) void {
+fn processingRow() void {
     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{});
     defer row.deinit();
     dvui.spinner(@src(), .{ .gravity_y = 0.5, .min_size_content = .{ .w = 12, .h = 12 }, .margin = .{ .w = 6 } });
-    dvui.label(@src(), "Processing…", .{}, .{ .gravity_y = 0.5, .color_text = theme.text.lerp(theme.fill, 0.35) });
+    dvui.labelNoFmt(@src(), "Processing…", .{}, .{ .gravity_y = 0.5, .font = style.F.prose, .color_text = style.C.text_dim });
 }
 
 /// The assistant bubble's body when there is nothing to show and nothing is
 /// running: a generation error, or a turn queued behind a paused LLM.
 /// (The live case is the "Processing..." spinner in `renderMessage`.)
-fn renderEmptyAssistant(s: ?*chat.Session, theme: dvui.Theme, idx: usize) void {
+fn renderEmptyAssistant(s: ?*chat.Session, idx: usize) void {
     var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal });
     defer tl.deinit();
     if (if (s) |ss| ss.gen_err else null) |err| {
@@ -1769,34 +2518,50 @@ fn renderEmptyAssistant(s: ?*chat.Session, theme: dvui.Theme, idx: usize) void {
         // A turn queued while the LLM is paused, it runs on resume (Tier 2).
         // addStyled (not addText) routes the ⏸ to the emoji face (NotoSansCJK
         // lacks media-control glyphs, see fonts.isEmoji).
-        fonts.addStyled(tl, "⏸ queued — resume to generate", .{}, .{ .color_text = theme.text.lerp(theme.fill, 0.4) });
+        fonts.addStyled(tl, "⏸ queued — resume to generate", .{}, .{ .font = style.F.prose, .color_text = style.C.text_dim });
     }
 }
 
 fn renderMessage(s: ?*chat.Session, m: *chat.Message, idx: usize) void {
+    // An app-written note (an image outcome), not something the user typed:
+    // centred, quiet, and no bubble. Giving it a user bubble would put words in
+    // the user's mouth in their own transcript.
+    if (m.synthetic) {
+        dvui.labelNoFmt(@src(), m.activeConst().text.items, .{}, .{
+            .id_extra = idx,
+            .font = style.F.mono_sm,
+            .color_text = style.C.text_ghost,
+            .gravity_x = 0.5,
+            .padding = .{},
+            .margin = .{ .y = 8, .h = 8 },
+        });
+        return;
+    }
     const is_user = m.role == .user;
-    const theme = dvui.themeGet();
 
-    // Instant-messenger layout: the user's turns lean right in an accent-tinted
-    // bubble, the assistant's lean left in a neutral card. The asymmetric side
-    // margin does the lean; side + color convey the sender, so there's no
-    // per-message "You"/"Assistant" label. Both fills differ from the list
-    // background so the bubbles read as cards. The assistant keeps most of the
-    // width for images/code; the user's is inset further since it's just text.
-    var bubble = dvui.box(@src(), .{ .dir = .vertical }, .{
+    // The asymmetry is load-bearing: the user's turn is a CARD ON the page, the
+    // assistant's turn IS the page. So the user gets a bubble, a right edge and
+    // a tail corner; the assistant gets no bubble, no avatar and no background
+    // at all, only a measure limit. Sender is conveyed by shape and side, which
+    // is why neither carries a "You"/"Assistant" label.
+    var wrap = dvui.box(@src(), .{ .dir = .horizontal }, .{
         .id_extra = idx,
         .expand = .horizontal,
-        .margin = if (is_user)
-            .{ .x = 160, .y = 3, .w = 8, .h = 3 }
-        else
-            .{ .x = 8, .y = 3, .w = 96, .h = 3 },
-        .background = true,
-        .color_fill = if (is_user)
-            theme.fill.lerp(theme.focus, 0.30)
-        else
-            theme.fill.lerp(theme.text, 0.08),
-        .corner_radius = dvui.Rect.all(10),
-        .padding = dvui.Rect.all(10),
+        .margin = .{ .y = 9, .h = 9 },
+    });
+    defer wrap.deinit();
+
+    var bubble = dvui.box(@src(), .{ .dir = .vertical }, .{
+        .expand = if (is_user) .none else .horizontal,
+        .gravity_x = if (is_user) 1.0 else 0.0,
+        .max_size_content = .width(if (is_user) style.Layout.bubble_max else style.Layout.prose_max),
+        .background = is_user,
+        .color_fill = style.C.bubble_user,
+        .border = if (is_user) style.Edge.all else .{},
+        .color_border = style.hairline,
+        // tl, tr, br, bl — the small one is the tail.
+        .corner_radius = if (is_user) .{ .x = 10, .y = 10, .w = 3, .h = 10 } else style.R.none,
+        .padding = if (is_user) .{ .x = 14, .y = 11, .w = 14, .h = 11 } else .{},
     });
     defer bubble.deinit();
 
@@ -1806,7 +2571,7 @@ fn renderMessage(s: ?*chat.Session, m: *chat.Message, idx: usize) void {
     // Everything below shows the message's ACTIVE variant (the ‹/› nav on the
     // last assistant response switches it; older takes stay stored).
     const v = m.activeConst();
-    const p = parseThink(v.text.items, v.thought_primed);
+    const p = parseThink(v);
     // Only the last assistant message is actively generating; "Thinking..." means
     // the block is still open AND generation is live. A think block left open
     // because generation stopped (e.g. hit max tokens) reads "Thoughts". With no
@@ -1832,7 +2597,7 @@ fn renderMessage(s: ?*chat.Session, m: *chat.Message, idx: usize) void {
         // checkpoint and uploading weights to VRAM (chat.zig warms those up front
         // so they land in that phase, not this one); "Processing..." is per-turn
         // work that scales with the prompt.
-        processingRow(theme);
+        processingRow();
     }
 
     // Reasoning: collapse the thought block behind an expander, default
@@ -1849,20 +2614,21 @@ fn renderMessage(s: ?*chat.Session, m: *chat.Message, idx: usize) void {
                 markdown_view.render(@src(), think, .{ .prose = .{
                     .expand = .horizontal,
                     .background = true,
-                    .color_fill = theme.fill.lerp(theme.text, 0.15),
-                    .color_text = theme.text.lerp(theme.fill, 0.40),
-                    .color_border = theme.focus,
-                    .border = .{ .x = 3, .y = 0, .w = 0, .h = 0 },
-                    .corner_radius = dvui.Rect.all(4),
-                    .margin = .{ .x = 2, .y = 4, .w = 2, .h = 4 },
-                    .padding = .{ .x = 9, .y = 6, .w = 9, .h = 6 },
+                    .color_fill = style.C.sunken,
+                    .color_text = style.C.text_dim,
+                    .color_border = style.tint(style.C.blue, 120),
+                    .border = .{ .x = 2 },
+                    .corner_radius = .{ .x = 0, .y = 6, .w = 6, .h = 0 },
+                    .margin = .{ .y = 4, .h = 6 },
+                    .padding = .{ .x = 11, .y = 8, .w = 11, .h = 8 },
+                    .font = style.F.prose,
                 } });
             }
         }
     }
 
     if (p.answer.len > 0) {
-        renderAnswer(p.answer);
+        renderReply(v, p.answer, if (is_user) style.C.text_hi else style.C.text);
         // Selection copies rendered text; this copies the raw markdown of
         // the whole reply (assistant messages only, a user's own text is
         // already in their hands).
@@ -1871,7 +2637,7 @@ fn renderMessage(s: ?*chat.Session, m: *chat.Message, idx: usize) void {
             if (dvui.buttonIcon(@src(), "copy markdown", dvui.entypo.clipboard, .{}, .{}, .{
                 .gravity_x = 1.0,
                 .min_size_content = .{ .h = 12 },
-                .color_text = theme.text.lerp(theme.fill, 0.5),
+                .color_text = style.C.text_ghost,
                 .padding = dvui.Rect.all(2),
                 .margin = .{ .y = 2 },
                 .data_out = &wd,
@@ -1881,17 +2647,13 @@ fn renderMessage(s: ?*chat.Session, m: *chat.Message, idx: usize) void {
     } else if (!nothing_yet and m.role == .assistant and p.think == null and v.images.items.len == 0) {
         // Text exists but currently renders to nothing (e.g. a half-streamed
         // marker); keep the working indicator rather than flashing an empty card.
-        if (live) processingRow(theme) else renderEmptyAssistant(s, theme, idx);
+        if (live) processingRow() else renderEmptyAssistant(s, idx);
     }
-
-    // Generated images requested by this variant, below its text. Offset the
-    // id base so it can't collide with attachment image ids in this bubble.
-    for (v.images.items, 0..) |gi, gi_idx| renderGenImage(s, gi, 100_000 + gi_idx);
 
     // The turn's measurement (see chat.TurnStats): what the prompt cost under a
     // user message, the rates + this reply's size + the context standing under
     // an assistant one. Updates every frame while the reply streams.
-    renderStatsFooter(v.stats, is_user);
+    renderStatsFooter(v.stats, is_user, v.gen_model);
 
     // ‹ n/m › navigation on the LAST assistant response (TODO #3): ‹ shows the
     // previous take, › the next, or, on the newest take, regenerates a fresh
@@ -1919,20 +2681,47 @@ fn renderMessage(s: ?*chat.Session, m: *chat.Message, idx: usize) void {
 /// until there is something measured, a bubble that has only just appeared
 /// (or a transcript carried across a model swap) would otherwise show a row of
 /// zeros. The strings come from `turn_stats`, which is where they're tested.
-fn renderStatsFooter(st: chat.TurnStats, is_user: bool) void {
-    if (!(if (is_user) st.hasPrompt() else st.hasGen())) return;
+fn renderStatsFooter(st: chat.TurnStats, is_user: bool, gen_model: []const u8) void {
+    // The model is named only when it is NOT the one loaded now: in a
+    // single-model conversation it would be the same string under every turn,
+    // and after a swap or a reload it is the thing you actually want to know.
+    const live: []const u8 = if (g_loading.load(.acquire)) "" else if (g_session) |sess| sess.model_name else "";
+    const show_model = gen_model.len > 0 and !std.mem.eql(u8, gen_model, live);
+
+    if (!(if (is_user) st.hasPrompt() else st.hasGen())) {
+        if (!show_model) return;
+        dvui.labelNoFmt(@src(), gen_model, .{}, .{
+            .gravity_x = if (is_user) 1.0 else 0.0,
+            .font = style.F.mono_sm,
+            .color_text = style.C.text_faint,
+            .padding = .{},
+            .margin = .{ .y = 5 },
+        });
+        return;
+    }
     var buf: [turn_stats.buf_len]u8 = undefined;
-    const text = if (is_user) turn_stats.formatUser(&buf, st) else turn_stats.formatAssistant(&buf, st);
+    const stats = if (is_user) turn_stats.formatUser(&buf, st) else turn_stats.formatAssistant(&buf, st);
+    if (stats.len == 0 and !show_model) return;
+    var joined: [turn_stats.buf_len + 96]u8 = undefined;
+    const text = if (show_model)
+        (std.fmt.bufPrint(&joined, "{s}{s}{s}", .{
+            stats,
+            if (stats.len > 0) " · " else "",
+            gen_model,
+        }) catch stats)
+    else
+        stats;
     if (text.len == 0) return;
-    const theme = dvui.themeGet();
-    dvui.label(@src(), "{s}", .{text}, .{
+    dvui.labelNoFmt(@src(), text, .{}, .{
         // Sized to its text (no expand) so `gravity_x` places it along the
         // bubble's own outer edge: the user's leans right, the assistant's left.
         .gravity_x = if (is_user) 1.0 else 0.0,
-        .font = dvui.Font.theme(.body).withSize(10),
-        .color_text = theme.text.lerp(theme.fill, 0.45),
+        // Telemetry, not prose: mono and small, so a turn's numbers sit under
+        // the message without competing with it.
+        .font = style.F.mono_sm,
+        .color_text = style.C.text_faint,
         .padding = .{},
-        .margin = .{ .y = 3 },
+        .margin = .{ .y = 5 },
     });
 }
 
@@ -1941,7 +2730,6 @@ fn renderStatsFooter(st: chat.TurnStats, is_user: bool) void {
 /// `s` may be null (carried transcript, LLM unloaded): ‹/› switch the shown
 /// take by mutating `m.cur` directly, and › regenerate lazy-loads the LLM.
 fn renderVariantNav(s: ?*chat.Session, m: *chat.Message) void {
-    const theme = dvui.themeGet();
     const n = m.variants.items.len;
     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .margin = .{ .y = 2 } });
     defer row.deinit();
@@ -1955,7 +2743,7 @@ fn renderVariantNav(s: ?*chat.Session, m: *chat.Message) void {
     var bwd: dvui.WidgetData = undefined;
     var opts = icon_opts;
     opts.data_out = &bwd;
-    if (!can_back) opts.color_text = theme.text.lerp(theme.fill, 0.75);
+    if (!can_back) opts.color_text = style.C.text_ghost;
     if (dvui.buttonIcon(@src(), "prev-variant", dvui.entypo.chevron_small_left, .{}, .{}, opts) and can_back) {
         switch (chat.navTarget(m.cur, n, .back)) {
             // Loaded: selectVariant re-syncs the KV for the next turn. Unloaded:
@@ -1970,7 +2758,7 @@ fn renderVariantNav(s: ?*chat.Session, m: *chat.Message) void {
 
     if (n > 1) dvui.label(@src(), "{d}/{d}", .{ m.cur + 1, n }, .{
         .gravity_y = 0.5,
-        .color_text = theme.text.lerp(theme.fill, 0.4),
+        .color_text = style.C.text_dim,
         .padding = .{ .x = 2, .w = 2 },
     });
 
@@ -2005,38 +2793,103 @@ fn renderVariantNav(s: ?*chat.Session, m: *chat.Message) void {
 /// visible text. A still-streaming, unterminated call hides everything from
 /// it onward. Stripped text is assembled in the frame arena so the markdown
 /// parser sees one contiguous document (blocks may span a hidden call).
-fn renderAnswer(text: []const u8) void {
-    // Common case: no tool call anywhere, render the original slice.
-    var display = text;
-    switch (toolcall.nextImageCall(text)) {
-        .none => {},
-        .partial => |p| display = p.text_before,
-        .call => |first| {
-            var out: std.ArrayList(u8) = .empty;
-            const arena = dvui.currentWindow().arena();
-            out.appendSlice(arena, first.text_before) catch return;
-            var rest = first.after;
-            strip: while (true) {
-                switch (toolcall.nextImageCall(rest)) {
-                    .none => {
-                        out.appendSlice(arena, rest) catch return;
-                        break :strip;
-                    },
-                    .partial => |p| {
-                        out.appendSlice(arena, p.text_before) catch return;
-                        break :strip;
-                    },
-                    .call => |c| {
-                        out.appendSlice(arena, c.text_before) catch return;
-                        rest = c.after;
-                    },
-                }
-            }
-            display = out.items;
-        },
-    }
-    markdown_view.render(@src(), display, .{});
+/// Render one reply IN DOCUMENT ORDER: prose, then wherever the model put a
+/// tool call, that call's collapsible section and the card for the images it
+/// produced, then the prose after it.
+///
+/// The previous version stripped every call out, rendered the surviving prose
+/// as one block and hung all the images off the end, so a reply that talked
+/// between generations read out of order.
+///
+/// Consecutive calls (nothing but whitespace between them) collapse into ONE
+/// card, which is what makes a four-image request a 2x2 grid rather than four
+/// stacked cards.
+fn renderReply(v: *const chat.Variant, answer: []const u8, color: dvui.Color) void {
+    // The walk itself is pure and tested in toolcall.zig; this only draws.
+    var segs: [16]toolcall.Segment = undefined;
+    for (toolcall.segments(answer, v.images.items.len, &segs), 0..) |seg, i| switch (seg) {
+        .prose => |t| renderProse(i, t, color),
+        .calls => |c| renderCallRun(v.images.items[c.start..][0..c.len], c.n_calls, c.text, i),
+    };
 }
+
+fn renderProse(id: usize, text: []const u8, color: dvui.Color) void {
+    markdown_view.render(@src(), text, .{
+        .id_extra = id * 64,
+        .prose = .{
+            .background = false,
+            .padding = .{},
+            .font = style.F.prose,
+            .color_text = color,
+        },
+    });
+}
+
+/// One run of calls the model made in one breath: the collapsible call section
+/// above, the card below.
+///
+/// `imgs` can be SHORTER than `n_calls` (or empty): a reopened conversation only
+/// rebuilds renders whose files it can find, and files only exist when saving is
+/// on. The section always shows, so a reply never loses the fact that it asked
+/// for a picture.
+fn renderCallRun(imgs: []const *chat.GenImage, n_calls: usize, raw: []const u8, id: usize) void {
+    if (n_calls == 0) return;
+
+    // Same expander treatment as Thoughts: this is the machine's working, and it
+    // sits where the model actually emitted it.
+    if (dvui.expander(@src(), "Tool call", .{ .default_expanded = false }, .{
+        .id_extra = id * 64 + 1,
+        .margin = .{ .y = 6 },
+    })) {
+        var tl = dvui.textLayout(@src(), .{}, .{
+            .id_extra = id * 64 + 2,
+            .expand = .horizontal,
+            .background = true,
+            .color_fill = style.C.sunken,
+            .color_border = style.tint(style.C.blue, 120),
+            .border = .{ .x = 2 },
+            .corner_radius = .{ .x = 0, .y = 6, .w = 6, .h = 0 },
+            .margin = .{ .h = 6 },
+            .padding = .{ .x = 11, .y = 8, .w = 11, .h = 8 },
+            .font = style.F.mono,
+            .color_text = style.C.text_dim,
+        });
+        defer tl.deinit();
+        fonts.addStyled(tl, raw, .{}, .{ .font = style.F.mono, .color_text = style.C.text_dim });
+    }
+
+    if (imgs.len > 0) {
+        renderToolCard(imgs, id * 64 + 3);
+        return;
+    }
+
+    // Nothing to show, and deliberately nothing regenerated. Say which it is:
+    // an image the user chose not to keep is a different situation from one that
+    // failed, and neither should look like a bug.
+    var buf: [96]u8 = undefined;
+    const why = if (g_config.output_dir.opt() == null)
+        (std.fmt.bufPrint(&buf, "{d} image{s} generated · not kept (image saving is off)", .{
+            n_calls,
+            if (n_calls == 1) "" else "s",
+        }) catch "generated, not kept")
+    else if (g_diffuser == null)
+        "generated earlier · no image model loaded to show them"
+    else
+        (std.fmt.bufPrint(&buf, "{d} image{s} generated · the saved file{s} could not be found", .{
+            n_calls,
+            if (n_calls == 1) "" else "s",
+            if (n_calls == 1) "" else "s",
+        }) catch "generated, files missing");
+
+    dvui.labelNoFmt(@src(), why, .{}, .{
+        .id_extra = id * 64 + 4,
+        .font = style.F.mono,
+        .color_text = style.C.text_ghost,
+        .padding = .{},
+        .margin = .{ .h = 8 },
+    });
+}
+
 
 /// Display size for an image: downscale so the longer side is `max`, never
 /// upscale. Sizing the widget to the actual (aspect-correct) dimensions avoids
@@ -2062,7 +2915,7 @@ fn renderGenImage(s: ?*chat.Session, gi: *chat.GenImage, gi_idx: usize) void {
                 const pw = gi.preview_w.load(.acquire);
                 const ph = gi.preview_h.load(.acquire);
                 if (pw > 0 and ph > 0) {
-                    const sz = fitSize(pw, ph, 480);
+                    const sz = fitSize(pw, ph, 200);
                     _ = dvui.image(@src(), .{
                         .source = .{ .pixels = .{ .rgba = pv[0 .. pw * ph * 4], .width = pw, .height = ph, .invalidation = .always } },
                         .shrink = .ratio,
@@ -2122,7 +2975,7 @@ fn renderGenImage(s: ?*chat.Session, gi: *chat.GenImage, gi_idx: usize) void {
                 // Wrap in a box so a click anywhere on the image opens the
                 // full-size viewer window. Size to the image's own aspect so
                 // there's no letterbox padding before the button.
-                const sz = fitSize(gi.width, gi.height, 480);
+                const sz = fitSize(gi.width, gi.height, 200);
                 var ib = dvui.box(@src(), .{}, .{});
                 _ = dvui.image(@src(), .{
                     .source = .{ .pixels = .{ .rgba = rgba, .width = @intCast(gi.width), .height = @intCast(gi.height) } },
@@ -2237,9 +3090,12 @@ const Parsed = struct { think: ?[]const u8, answer: []const u8, thinking: bool }
 /// time (`Variant.thought_primed`), because a session can render both ways over
 /// its lifetime. See `toolcall.splitThought`, which owns the rule so the display
 /// and the tool-call scanner cannot disagree about what is inside a thought.
-fn parseThink(text: []const u8, primed: bool) Parsed {
-    const r = tp.llm.chat.reasoning();
-    const s = toolcall.splitThought(text, if (r) |rr| .{ .open = rr.open, .close = rr.close } else null, primed);
+/// Split a variant with ITS OWN markers (see chat.Variant.markersFor): the ones
+/// recorded when it was generated, else the live model's, else none. Splitting
+/// with the live model's markers is what left a reopened conversation showing a
+/// bare `</think>` in its prose.
+fn parseThink(v: *const chat.Variant) Parsed {
+    const s = toolcall.splitThought(v.text.items, chat.Variant.markersFor(v), v.thought_primed);
     return .{ .think = s.think, .answer = s.answer, .thinking = s.open };
 }
 
@@ -2299,65 +3155,118 @@ fn renderInput(s: ?*chat.Session) void {
         }
     }
 
-    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = dvui.Rect.all(8) });
-    defer row.deinit();
+    var block = dvui.box(@src(), .{ .dir = .vertical }, .{
+        .expand = .horizontal,
+        // Background stated explicitly: dvui forces one on for a NON-UNIFORM
+        // border, and the fill it picks is the theme's, which is the wrong
+        // surface anywhere but the canvas. Saying so also silences the warning.
+        .background = true,
+        .color_fill = style.C.canvas,
+        .border = style.Edge.top,
+        .color_border = style.hairline_soft,
+        .padding = .{ .x = 30, .y = 12, .w = 30, .h = 18 },
+    });
+    defer block.deinit();
 
     const busy = if (s) |ss| ss.busy() else false;
 
-    // New chat: drop the conversation and start fresh (model stays resident).
-    // Disabled mid-turn so it can't race the generation worker.
-    var wd: dvui.WidgetData = undefined;
-    if (dvui.buttonIcon(@src(), "new-chat", dvui.entypo.plus, .{}, .{}, .{
-        .gravity_y = 0.5,
-        .min_size_content = .{ .w = 22, .h = 22 },
-        .margin = .{ .w = 6 },
-        .data_out = &wd,
-    }) and !busy) newChat();
-    hint.hover(@src(), &wd, "New chat — clears the conversation (model stays loaded)");
+    // Quick settings: the three knobs a beginner ever needs. Everything else is
+    // in Studio, and the link says so rather than leaving the user to guess.
+    {
+        var quick = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .margin = .{ .h = 10 } });
+        defer quick.deinit();
 
-    // Gear: switch to the settings view.
-    if (dvui.buttonIcon(@src(), "settings", dvui.entypo.cog, .{}, .{}, .{
-        .gravity_y = 0.5,
-        .min_size_content = .{ .w = 22, .h = 22 },
-        .margin = .{ .w = 6 },
-        .data_out = &wd,
-    })) openSettings();
-    hint.hover(@src(), &wd, "Settings");
+        // Ratio and pixel budget, not raw width/height: those are the two
+        // things a person decides, and since Settings no longer has size rows
+        // these chips are the single source for it. Both persist.
+        var ratio_i: usize = @intFromEnum(g_config.framing_ratio);
+        const ratio_before = ratio_i;
 
-    // Image studio: leave chat for direct text-to-image.
-    if (dvui.buttonIcon(@src(), "image-studio", dvui.entypo.image, .{}, .{}, .{
-        .gravity_y = 0.5,
-        .min_size_content = .{ .w = 22, .h = 22 },
-        .margin = .{ .w = 6 },
-        .data_out = &wd,
-    })) enterImageMode();
-    hint.hover(@src(), &wd, "Image studio — text-to-image without chat");
+        const ratios = comptime blk: {
+            var out: [std.enums.values(framing.Ratio).len][]const u8 = undefined;
+            for (std.enums.values(framing.Ratio), 0..) |r, i| out[i] = r.label();
+            break :blk out;
+        };
+        if (style.chipDropdown(@src(), &ratios, &ratio_i, .{ .id_extra = 0 }) and ratio_i != ratio_before) {
+            g_config.framing_ratio = @enumFromInt(ratio_i);
+            applyFraming();
+        }
 
-    // Reasoning toggle (no brain icon in entypo, a lit bulb reads as
-    // "thinking"). Shown for any model whose family can reason (Gemma 3 etc.
-    // hide it). A live session's loaded family is authoritative; before the
-    // lazy first-message load we probe the configured model's GGUF so the toggle
-    // is usable up front. Highlighted when on; flips live (or into config) and
-    // persists.
-    const can_reason = if (s != null) tp.llm.chat.supportsThinking() else configuredSupportsThinking();
-    if (can_reason) {
-        const on = g_config.reasoning;
-        const th = dvui.themeGet();
-        if (dvui.buttonIcon(@src(), "reasoning", dvui.entypo.light_bulb, .{}, .{}, .{
+        // Megapixels is TYPED, not picked: the useful values are continuous
+        // ("1.8"), and a preset list either omits the one you want or grows
+        // until it is a worse menu than a number.
+        const mp_res = style.chipInput(@src(), &g_mp_buf, "MP", 30, .{ .id_extra = 1, .margin_x = 8 });
+        // COMMIT BEFORE SYNC. On the frame focus leaves, the field is no longer
+        // being edited AND has just committed; syncing first would overwrite
+        // the typed text with the old config value and then parse that.
+        if (mp_res.committed) {
+            const typed = std.mem.trim(u8, std.mem.sliceTo(&g_mp_buf, 0), " \t");
+            if (std.fmt.parseFloat(f32, typed)) |v| {
+                const clamped = std.math.clamp(v, @as(f32, @floatCast(framing.mp_min)), @as(f32, @floatCast(framing.mp_max)));
+                if (clamped != g_config.framing_mp) {
+                    g_config.framing_mp = clamped;
+                    applyFraming();
+                }
+            } else |_| {}
+        }
+        if (!mp_res.editing) {
+            // Show the live value, but never while it is being typed into.
+            // After a commit this also replaces garbage or an out-of-range
+            // number with what was actually accepted.
+            var tmp: [16]u8 = undefined;
+            const want = framing.formatMp(&tmp, g_config.framing_mp);
+            if (!std.mem.eql(u8, std.mem.sliceTo(&g_mp_buf, 0), want)) {
+                @memset(&g_mp_buf, 0);
+                @memcpy(g_mp_buf[0..want.len], want);
+            }
+        }
+
+        // The reasoning toggle is a quick setting too: it changes what the next
+        // turn does, which is what this row is for. Only for a family that can.
+        const can_reason = if (s != null) tp.llm.chat.supportsThinking() else configuredSupportsThinking();
+        if (can_reason) {
+            const on = g_config.reasoning;
+            if (style.chip(@src(), if (on) "thinking: on" else "thinking: off", .{
+                .id_extra = 2,
+                .margin_x = 8,
+                .fill = if (on) style.over(style.C.chip, style.C.blue, 0.16) else style.C.chip,
+                .text = if (on) style.C.blue else style.C.text_dim,
+            })) toggleReasoning();
+        }
+
+        var link: dvui.ButtonWidget = undefined;
+        link.init(@src(), .{}, .{
+            .gravity_x = 1.0,
             .gravity_y = 0.5,
-            .min_size_content = .{ .w = 22, .h = 22 },
-            .margin = .{ .w = 6 },
-            .background = on,
-            .corner_radius = dvui.Rect.all(5),
-            .color_fill = if (on) th.fill.lerp(th.focus, 0.35) else null,
-            .color_text = if (on) th.focus else null,
-            .data_out = &wd,
-        })) toggleReasoning();
-        hint.hover(@src(), &wd, if (on)
-            "Thinking is on — click to disable reasoning"
-        else
-            "Thinking is off — click to enable reasoning");
+            .background = false,
+            .color_fill_hover = style.hover_wash,
+            .color_fill_press = style.hover_wash,
+            .corner_radius = style.R.chip,
+            .padding = .{ .x = 5, .y = 3, .w = 5, .h = 3 },
+            .margin = .{},
+        });
+        link.processEvents();
+        link.drawBackground();
+        {
+            var lr = dvui.box(@src(), .{ .dir = .horizontal }, .{});
+            defer lr.deinit();
+            dvui.labelNoFmt(@src(), "All settings in Studio", .{}, .{
+                .font = style.F.ui_sm,
+                .color_text = style.C.text_ghost,
+                .padding = .{},
+                .gravity_y = 0.5,
+            });
+            style.mark(@src(), .external, 9, style.C.text_ghost, .{ .margin = .{ .x = 4 } });
+        }
+        const go = link.clicked();
+        link.deinit();
+        if (go) enterImageMode();
     }
+
+    // Focus from LAST frame's id: the entry is created below, and a one-frame
+    // late ring is invisible.
+    const input_focused = if (g_input_id) |id| dvui.focusedWidgetId() == id else false;
+    var frame_box = bubbles.inputBegin(@src(), input_focused);
 
     var send = false;
 
@@ -2398,13 +3307,21 @@ fn renderInput(s: ?*chat.Session) void {
     var te = dvui.textEntry(@src(), .{
         .text = .{ .buffer = &g_input_buf },
         .multiline = true,
-        .placeholder = "Message…  (Enter to send · Shift+Enter for newline)",
+        .placeholder = "Describe an image, or ask for changes…",
         .scroll_horizontal = false,
         .break_lines = true,
     }, .{
         .expand = .horizontal,
         .gravity_y = 0.5,
-        .min_size_content = .{ .h = 28 },
+        // The sunken frame around it is the input's chrome (see bubbles.zig);
+        // the entry itself draws nothing.
+        .background = false,
+        .border = .{},
+        .padding = .{},
+        .font = style.F.input,
+        .color_text = style.C.text_hi,
+        .theme = style.noFocusTheme(), // the frame shows focus, not the entry
+        .min_size_content = .{ .h = 20 },
         // Bound BOTH dimensions of the reported min size. dvui's TextLayout
         // accumulates its min width across every soft-wrapped line (it only
         // resets on a literal '\n', not on a wrap), so a long wrapped message
@@ -2417,9 +3334,10 @@ fn renderInput(s: ?*chat.Session) void {
         .max_size_content = .size(.{ .w = 160, .h = 140 }),
     });
     g_input_id = te.data().id;
-    // Reserve for next frame's layout: entry height + row padding, plus the
-    // attachment strip when present.
-    g_input_h = te.data().rect.h + 24 + (if (n_thumbs > 0) @as(f32, 72) else 0);
+    // Reserve for next frame's layout: entry height, plus the frame's padding,
+    // the quick-settings row, the block padding, and the attachment strip when
+    // present.
+    g_input_h = te.data().rect.h + 100 + (if (n_thumbs > 0) @as(f32, 72) else 0);
     if (send) {
         const t = te.getText();
         n = @min(t.len, buf.len);
@@ -2427,7 +3345,16 @@ fn renderInput(s: ?*chat.Session) void {
     }
     te.deinit();
 
-    if (dvui.button(@src(), if (busy) "Stop" else "Send", .{}, .{ .gravity_y = 0.5 })) {
+    const pressed = bubbles.inputEnd(&frame_box, .{
+        .busy = busy,
+        .can_attach = visionAvailable(),
+    }, .{
+        .ctx = @ptrCast(&g_composer_ctx),
+        .on_quick = composerQuick,
+        .on_all_settings = composerAllSettings,
+        .on_reference = composerReference,
+    });
+    if (pressed) {
         if (busy) {
             if (s) |ss| ss.requestCancel();
         } else if (!send) {

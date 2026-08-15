@@ -1167,7 +1167,7 @@ const testing = std.testing;
 /// and `-Dintegration` (`Context.init` refuses under test without it).
 fn gpuCtx(gpa: std.mem.Allocator, io: std.Io) !*Context {
     std.Io.Dir.cwd().access(io, "testdata/gpu-tests", .{}) catch return error.SkipZigTest;
-    return Context.init(gpa) catch error.SkipZigTest;
+    return Context.init(gpa, std.testing.io) catch error.SkipZigTest;
 }
 
 fn upload(ctx: *Context, db: *DeviceBuffer, host: []const f32) !void {

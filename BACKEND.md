@@ -798,6 +798,112 @@ Coopmat SPIR-V builders in `src/gpu/coopmat.zig` (`buildGemmShared` f16/bf16, `b
 128 (DiT, head-padded SD UNet), 384 (Wan VAE mid-block), 512 (SD VAE mid-block) — since
 `buildGemmScores` unrolls the k-depth.
 
+**Fragment shapes: `buildGemmShared` takes the device's M/N; every other coop builder is
+16-only.** NVIDIA and AMD advertise 16×16, Intel Alchemist only 8×8 (`8x8x16` f16 and bf16,
+`8x8x32` s8/u8, f32/s32 accumulate only — no f16 C at all). K is always 16, which is what lets
+the 32-deep staging stay two k sub-steps. The warp tile is fixed at 64×64, so a smaller fragment
+means more fragments per warp (8×8 instead of 4×4), same accumulator registers per lane and 4×
+the MulAdds — not a smaller warp, so staging and host dispatch geometry are shape-independent.
+`Context.init` picks the widest usable config, and probes f16-accumulate and native bf16 *at that
+shape* rather than assuming they exist. Shapes the kernels cannot express leave the coop pipelines
+null and the caller falls back.
+
+**Warp tile: `buildGemmShared` also takes the per-warp output tile (M and N separately).**
+Accumulators per lane are `warp_m * warp_n / subgroup_size` — independent of the fragment
+shape — so 64×64 is 128 f32/lane, fine where a thread has ~255 registers (NVIDIA) and far past
+the ~32 f32/lane an Intel Xe lane gets at SIMD32. On an A310 the 64×64 tile makes the coop GEMM
+slow enough that `bench-matmul` returns `error_device_lost`; **16×32 is 4.35× faster end to end
+(VAE decode 10×)** with output identical to 1 LSB. Vulkan exposes no register-budget query, so
+this cannot be derived from limits the way the fragment shape can — `tune-coop` measures every
+expressible tile and reports the winner. `TP_COOP_WARP_TILE` / `TP_COOP_WARP_TILE_N` set it.
+
+⚠️ **A rectangular tile can be legal where its square form is not**, so M and N must be validated
+as a PAIR. 16×32 is expressible on an A310 and 16×16 is not (B staging would need fewer chunks
+than the workgroup has threads). Validating M against itself demotes M to the default alone, and
+the run then measures a tile nobody asked for — which is how 64×32 spent a while masquerading as
+16×32 here and made the tuner look wrong.
+
+The `tune-coop` harness earned three fixes worth not repeating: measure a WARMUP pass first (this
+3090 idles its clocks, so the first candidate measured otherwise reports ~18× low purely for being
+first); score a SET of shapes, since ranking on one GEMM picks a tile the render does not want; and
+give each probe shape its OWN weight allocation, because `weightBuffer` keys the cache on
+`@intFromPtr(bytes.ptr)` with no shape in the key, so slices of one buffer collide and every shape
+after the first times a read of a wrongly-transposed weight. Batching all probes into one submit
+was measured and made no difference on Alchemist, so per-dispatch latency was not the issue.
+
+⚠️ **`Context.coopNPad` is the only place that may compute the coop GEMM's padded N.** The shader
+is told that value as its B row stride, so every producer of a k-major weight it reads
+(`weightBufferF16From32`, `weightBufferF16FromBf16`, `nvfp4Decode`) must pad to the same multiple.
+A producer that keeps its own literal lays the weight out at offsets the GEMM never reads — a
+wrong image, not a crash, and invisible while the wg tile happens to be 128. `nvfp4ScratchBytes`
+is exempt because it only sizes scratch, where a larger alignment is an over-estimate.
+
+⚠️ **Per-thread staging arithmetic is not fragment arithmetic.** In `buildGemmShared` the B
+staging mask/shift divide a WGN-wide row by the 16-element chunk each *thread* stages (the `<< 4`
+beside them), so they must not follow `frag_n`. 16×16 cannot expose the difference, because
+`WGN/frag_n` and `WGN/16` are then the same number: getting it wrong renders byte-identically on
+NVIDIA and produces garbage only on an 8×8 device. `src/gpu/spirv_asm.zig` `assembleChecked` now
+rejects a `%name` that is referenced but never defined, which is the other way a hand-emitted
+kernel fails silently (the assembler allocates ids on first mention so forward references work,
+and a typo therefore used to assemble into a dangling id the driver answers with a fault).
+
+**int8 (`buildGemmSharedI8`) takes the device s8 fragment M/N and its own warp tile too**, via
+`TP_COOP_I8_TILE` / `TP_COOP_I8_TILE_N` and `coopI8TileFits`. K is always 32, so K_STEP stays two
+sub-steps. `coop_i8_wg_m/n` drive both the dispatch grid **and** the divisibility guard that
+decides whether a shape may take the shared path at all — a smaller tile makes MORE shapes
+eligible. `buildGemmI8` (the register-tiled fallback) is still 16-only and explicitly gated, so
+`opI8Gemm`/`opI8GemmBuf` require *either* kernel and return `UnsupportedDType` for a shape neither
+can express rather than asserting on the absent one.
+
+Intel Alchemist status: SD1.5 renders on an Arc A310 (4 GB) at 8×8, verified 64 dB / max 1 LSB
+against the same seed on a 3090, and int8 s8→s32 runs at 8×8×32 with `gpu-i8-test` clean (four
+shapes at 0 mismatches, fused-scale at 0.000000 rel err, the same 0.00427 wiring residual the 3090
+reports). The 16-only attention builders are gated off there; the SD UNet does not use them (its
+attention is the `attn_batched` Zig shader).
+
+`tune-coop` sweeps the int8 tile as well as the f16 one, and the int8 fit admits 16 in the N
+position, so it has 9 candidates where f16 has 6. **It persists both winners, and `Context.init`
+applies them, so tuning is a one-off per machine and every later run is fast with no flags.**
+Precedence is env override, then the measured cache, then the 64×64 default, resolved per path
+(f16 and int8 independently) and re-validated by the fit checks before use.
+
+The cache is `<XDG_CACHE_HOME or HOME/.cache>/tensorpencil/coop_tile` (or `TP_COOP_TILE_CACHE`),
+one line per device keyed `vendor:device:driver` — the driver version is in the key so a driver
+update re-measures rather than trusting a number produced by different codegen. Reading it at init,
+rather than re-tiling afterwards, is what lets the pipelines be built at the chosen tile the first
+time. `tune-coop` writes it, preserving other devices' lines so one cache serves a multi-GPU box.
+`gpu-test` prints the tile in force, which is how you check what a machine actually resolved.
+
+**`Context.init` takes an `Io`** (`init(gpa, io)`), and keeps it, because 0.16 puts both file access
+and clocks behind one. Tests pass `std.testing.io`; every other caller already had one in scope.
+
+**A device with no cache entry screens its own tiles at init and saves the result**, so the first
+run on a machine self-tunes and every later run just loads. Matching is on `vendor:device:driver`,
+so a cache from a different GPU (or a different driver) is ignored rather than applied. Precedence
+stays env → cache → screen → 64×64 default. This lives in `Context.init`, so a library consumer
+gets it from `gpu.Context.init` or `pipeline.Session.init` with no extra call; `context.autotune_tiles = false`
+disables it programmatically and `context.tile_cache_path` redirects the file, the two things an
+embedder needs (`TP_COOP_AUTOTUNE=0` / `TP_COOP_TILE_CACHE` are the env equivalents).
+
+⚠️ **The init screen is coarse on purpose and must only be trusted to find the LARGE effect.** It
+uses small shapes and runs in 0.3s on a 3090, 13s on an A310. Getting there took three corrections
+worth not repeating: without a warmup it measured the first candidate (the 64×64 default) cold and
+picked the wrong tile; with one pass it was not even self-consistent, since back-to-back runs
+disagreed about the winner; and a tight margin let it prefer a tile the full sweep shows is 14%
+worse. It now runs **two passes and only switches when a candidate beats the default by ≥1.67× in
+both**, so a noisy screen can decline to change a tile but never commit to a wrong one. On an A310
+it finds f16 16×32 (what `tune-coop` finds) and int8 16×16 (`tune-coop` finds 16×32, 1.3× better) —
+i.e. it captures ~13× of the ~15.7× and leaves the remainder to the explicit command.
+
+⚠️ **On Alchemist the best int8 tile is warp 16×32 at 781 GFLOP/s — 15.7× the 64×64 default's
+49.7, and 1.5× the 599 that square 16×16 gives.** The rectangle wins on both the f16 and int8
+paths, so never sweep only square tiles: a hand sweep of squares picked 16×16 and left 1.5× on the
+floor. For scale the 3090 does ~80,000 GFLOP/s int8 here at 64×64, so Alchemist int8 remains ~100×
+behind — far more than its ~5-8× specification gap, i.e. correct and much improved but not tuned.
+(An earlier note here claimed int8 and f16 both plateaued at ~524 and inferred the matrix units
+were therefore not the limit. That was measured on int8's square tile only; at 16×32 int8 reaches
+781 and clearly exceeds the f16 path, so the convergence argument does not hold.)
+
 ### zig-cuda — hand-PTX (`src/gpu/cuda/kernels.zig` GEMM, `elt.zig` elementwise/attn)
 
 GEMM builders: `buildHgemm` (f16/bf16 mma m16n8k16, optional f32 A/C) · `buildIgemmSmem` /

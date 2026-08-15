@@ -305,20 +305,46 @@ pub const coop_i8_double_buf = true;
 /// Bindings: 0 = B (weights, viewed u32), 1 = A (x, viewed u32), 2 = C (y, s32).
 /// Push: {m, n, k, stride} u32. m/n multiples of 128, k a multiple of 64,
 /// stride a multiple of 4.
-pub fn buildGemmSharedI8(gpa: std.mem.Allocator, warps8: bool, fuse_scale: bool, double_buf: bool, c_h16: bool) ![]align(4) u8 {
+pub fn buildGemmSharedI8(
+    gpa: std.mem.Allocator,
+    warps8: bool,
+    fuse_scale: bool,
+    double_buf: bool,
+    c_h16: bool,
+    /// s8 fragment M and N from the device. K is always 32 (every sint8 config we
+    /// accept), which is what keeps K_STEP at two k sub-steps and leaves the whole
+    /// staging path independent of the shape.
+    frag_m: u32,
+    frag_n: u32,
+    /// Per-warp output tile. Same trade as the f16 GEMM: accumulators per lane are
+    /// warp_m * warp_n / subgroup_size regardless of fragment size, so 64x64 is 128
+    /// f32/lane — fine on a ~255-register thread, far past an Intel Xe lane at SIMD32.
+    warp_tile_m: u32,
+    warp_tile_n: u32,
+) ![]align(4) u8 {
     std.debug.assert(!c_h16 or fuse_scale);
-    const WGN: u32 = 128;
     const K_STEP: u32 = 64;
     const NWARPS: u32 = if (warps8) 8 else 4;
     const THREADS: u32 = 32 * NWARPS;
     const WARP_N: u32 = NWARPS / 2; // warps along n
-    const WARP_W: u32 = WGN / WARP_N; // n-cols per warp (64 or 32)
-    const MT: u32 = 4;
-    const NT: u32 = WARP_W / 16; // 4 or 2
-    const A_U32: u32 = 128 * (K_STEP / 4); // 2048; B slab starts here (B_BASE)
-    const SH_LEN: u32 = A_U32 + K_STEP * (WGN / 4); // 4096 (16 KB)
-    const A_QUADS: u32 = A_U32 / THREADS; // u32/thread for A staging (16 or 8)
-    const B_QUADS: u32 = (K_STEP * (WGN / 4)) / THREADS; // (16 or 8) for B staging
+    const WARP_W: u32 = warp_tile_n; // n-cols per warp
+    const WGN: u32 = WARP_N * WARP_W; // wg tile n width
+    const A_ROWS: u32 = 2 * warp_tile_m; // wg tile m height (2 warp rows)
+    const MT: u32 = warp_tile_m / frag_m;
+    const NT: u32 = WARP_W / frag_n;
+    // int8 packs 4 per u32, so a slab row of K_STEP is K_STEP/4 words.
+    const A_ROW_U32: u32 = K_STEP / 4;
+    const B_ROW_U32: u32 = WGN / 4;
+    const A_U32: u32 = A_ROWS * A_ROW_U32; // B slab starts here (B_BASE)
+    const SH_LEN: u32 = A_U32 + K_STEP * B_ROW_U32;
+    const A_QUADS: u32 = A_U32 / THREADS; // u32/thread for A staging
+    const B_QUADS: u32 = (K_STEP * B_ROW_U32) / THREADS; // for B staging
+    // s32 values a lane holds per accumulator fragment, and the per-warp scratch the
+    // fused-scale path stages a fragment through.
+    const LANE_ELEMS: u32 = frag_m * frag_n / subgroup_lanes;
+    const SCR_PER_WARP: u32 = frag_m * frag_n;
+    std.debug.assert(warp_tile_m % frag_m == 0 and WARP_W % frag_n == 0);
+    std.debug.assert(MT <= 8 and NT <= 8 and A_QUADS >= 1 and B_QUADS >= 1);
 
     const c_elem = if (c_h16) "f16" else if (fuse_scale) "f32" else "s32";
 
@@ -340,12 +366,23 @@ pub fn buildGemmSharedI8(gpa: std.mem.Allocator, warps8: bool, fuse_scale: bool,
     for ([_]u32{ 0, 1, 2, 3, 4, 5, 8, 15, 16, 31, 32, 48, 64, 128, 256, 512, 768, 1024, 2048, 0x108 }) |v|
         addC(&pool, &pn, v);
     for (0..@max(A_QUADS, B_QUADS)) |tt| addC(&pool, &pn, @intCast(tt * THREADS));
-    for (0..MT) |mi| addC(&pool, &pn, @intCast(mi * 256));
-    for (0..NT) |nj| addC(&pool, &pn, @intCast(nj * 4));
+    for (0..MT) |mi| addC(&pool, &pn, @intCast(mi * frag_m * A_ROW_U32));
+    for (0..NT) |nj| addC(&pool, &pn, @intCast(nj * frag_n / 4));
     addC(&pool, &pn, WARP_W / 4);
+    // Fragment shape, wg tile and slab strides, all referenced as %cu_<value>.
+    for ([_]u32{ frag_m, frag_n, WGN, A_ROWS, A_ROW_U32, B_ROW_U32, SCR_PER_WARP, A_U32, warp_tile_m, warp_tile_m * A_ROW_U32 }) |v|
+        addC(&pool, &pn, v);
+    for (0..K_STEP / 32) |ks| addC(&pool, &pn, @intCast(ks * 32 * B_ROW_U32));
+    addC(&pool, &pn, std.math.log2_int(u32, B_ROW_U32));
+    addC(&pool, &pn, B_ROW_U32 - 1);
+    addC(&pool, &pn, std.math.log2_int(u32, frag_n));
+    addC(&pool, &pn, frag_n - 1);
+    for (0..MT) |mi| addC(&pool, &pn, @intCast(mi * frag_m * A_ROW_U32));
+    for (0..MT) |mi| addC(&pool, &pn, @intCast(mi * frag_m));
+    for (0..NT) |nj| addC(&pool, &pn, @intCast(nj * frag_n));
     if (fuse_scale) {
-        addC(&pool, &pn, NWARPS * 256);
-        for (0..8) |i| addC(&pool, &pn, @intCast(i * 32));
+        addC(&pool, &pn, NWARPS * SCR_PER_WARP);
+        for (0..LANE_ELEMS) |i| addC(&pool, &pn, @intCast(i * subgroup_lanes));
     }
 
     // --- header ---
@@ -424,7 +461,7 @@ pub fn buildGemmSharedI8(gpa: std.mem.Allocator, warps8: bool, fuse_scale: bool,
         try em.line("%ptr_scale = OpTypePointer StorageBuffer %scale", .{});
         try em.line("%vscale = OpVariable %ptr_scale StorageBuffer", .{});
         try em.line("%ptr_scale_f32 = OpTypePointer StorageBuffer %f32", .{});
-        try em.line("%c_scrlen = OpConstant %u32 {d}", .{NWARPS * 256});
+        try em.line("%c_scrlen = OpConstant %u32 {d}", .{NWARPS * SCR_PER_WARP});
         try em.line("%scr = OpTypeArray %s32 %c_scrlen", .{});
         try em.line("%ptr_wg_scr = OpTypePointer Workgroup %scr", .{});
         try em.line("%vscr = OpVariable %ptr_wg_scr Workgroup", .{});
@@ -438,9 +475,9 @@ pub fn buildGemmSharedI8(gpa: std.mem.Allocator, warps8: bool, fuse_scale: bool,
 
     for (pool[0..pn]) |v| try em.line("%cu_{d} = OpConstant %u32 {d}", .{ v, v });
 
-    try em.line("%mat_a = OpTypeCooperativeMatrixKHR %s8 %cu_3 %cu_16 %cu_32 %cu_0", .{});
-    try em.line("%mat_b = OpTypeCooperativeMatrixKHR %s8 %cu_3 %cu_32 %cu_16 %cu_1", .{});
-    try em.line("%mat_c = OpTypeCooperativeMatrixKHR %s32 %cu_3 %cu_16 %cu_16 %cu_2", .{});
+    try em.line("%mat_a = OpTypeCooperativeMatrixKHR %s8 %cu_3 %cu_{d} %cu_32 %cu_0", .{frag_m});
+    try em.line("%mat_b = OpTypeCooperativeMatrixKHR %s8 %cu_3 %cu_32 %cu_{d} %cu_1", .{frag_n});
+    try em.line("%mat_c = OpTypeCooperativeMatrixKHR %s32 %cu_3 %cu_{d} %cu_{d} %cu_2", .{ frag_m, frag_n });
     try em.line("%c_s32_0 = OpConstant %s32 0", .{});
     try em.line("%c_acc0 = OpConstantComposite %mat_c %c_s32_0", .{});
 
@@ -455,9 +492,9 @@ pub fn buildGemmSharedI8(gpa: std.mem.Allocator, warps8: bool, fuse_scale: bool,
     const tile_r = em.id();
     try em.line("%t{d} = OpCompositeExtract %u32 %t{d} 1", .{ tile_r, gidv });
     const col0 = em.id();
-    try em.line("%t{d} = OpIMul %u32 %t{d} %cu_128", .{ col0, tile_c });
+    try em.line("%t{d} = OpIMul %u32 %t{d} %cu_{d}", .{ col0, tile_c, WGN });
     const row0 = em.id();
-    try em.line("%t{d} = OpIMul %u32 %t{d} %cu_128", .{ row0, tile_r });
+    try em.line("%t{d} = OpIMul %u32 %t{d} %cu_{d}", .{ row0, tile_r, A_ROWS });
 
     const lidv = em.id();
     try em.line("%t{d} = OpLoad %v3u %lid", .{lidv});
@@ -483,11 +520,11 @@ pub fn buildGemmSharedI8(gpa: std.mem.Allocator, warps8: bool, fuse_scale: bool,
     const warp_n = em.id();
     try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_1", .{ warp_n, ly });
     const a_warp = em.id();
-    try em.line("%t{d} = OpIMul %u32 %t{d} %cu_1024", .{ a_warp, warp_m });
+    try em.line("%t{d} = OpIMul %u32 %t{d} %cu_{d}", .{ a_warp, warp_m, warp_tile_m * A_ROW_U32 });
     const b_warp = em.id();
     try em.line("%t{d} = OpIMul %u32 %t{d} %cu_{d}", .{ b_warp, warp_n, WARP_W / 4 });
     const wm64 = em.id();
-    try em.line("%t{d} = OpIMul %u32 %t{d} %cu_64", .{ wm64, warp_m });
+    try em.line("%t{d} = OpIMul %u32 %t{d} %cu_{d}", .{ wm64, warp_m, warp_tile_m });
     const c_row0 = em.id();
     try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ c_row0, row0, wm64 });
     const wn64 = em.id();
@@ -528,10 +565,12 @@ pub fn buildGemmSharedI8(gpa: std.mem.Allocator, warps8: bool, fuse_scale: bool,
             q = qn;
         }
         b_shidx[tt] = q;
+        // Split the flat staging index by the B slab's ROW WIDTH in u32 (WGN/4), which
+        // shrinks with the wg tile. The A split above uses K_STEP/4, which does not.
         b_krow[tt] = em.id();
-        try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_5", .{ b_krow[tt], q });
+        try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_{d}", .{ b_krow[tt], q, std.math.log2_int(u32, B_ROW_U32) });
         b_cq[tt] = em.id();
-        try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %cu_31", .{ b_cq[tt], q });
+        try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %cu_{d}", .{ b_cq[tt], q, B_ROW_U32 - 1 });
     }
 
     const DB = struct {
@@ -543,6 +582,9 @@ pub fn buildGemmSharedI8(gpa: std.mem.Allocator, warps8: bool, fuse_scale: bool,
         b_krow: [16]u32,
         b_cq: [16]u32,
         b_shidx: [16]u32,
+        /// Base of the B slab in the shared array (= A_U32), needed because the staging
+        /// helper writes B after the whole A slab and that offset moves with the tile.
+        a_u32: u32,
         col0: u32,
         fn load(st: @This(), e: *Emit, kb: []const u8) ![32]u32 {
             var regs: [32]u32 = undefined;
@@ -584,7 +626,7 @@ pub fn buildGemmSharedI8(gpa: std.mem.Allocator, warps8: bool, fuse_scale: bool,
             }
             for (0..st.bq) |tt| {
                 const sidx = e.id();
-                try e.line("%t{d} = OpIAdd %u32 %t{d} %cu_2048", .{ sidx, st.b_shidx[tt] });
+                try e.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ sidx, st.b_shidx[tt], st.a_u32 });
                 const sptr = e.id();
                 try e.line("%t{d} = OpAccessChain %ptr_wg_u32 %vsh %t{d}", .{ sptr, sidx });
                 try e.line("OpStore %t{d} %t{d}", .{ sptr, regs[16 + tt] });
@@ -600,13 +642,14 @@ pub fn buildGemmSharedI8(gpa: std.mem.Allocator, warps8: bool, fuse_scale: bool,
         .b_krow = b_krow,
         .b_cq = b_cq,
         .b_shidx = b_shidx,
+        .a_u32 = A_U32,
         .col0 = col0,
     };
 
     // Pre-allocate phi-carried ids (k0 induction + accumulators), referenced in
     // the head-block phis before their defining instructions.
     const k0n = em.id();
-    var acc_next: [4][4]u32 = undefined;
+    var acc_next: [8][8]u32 = undefined;
     for (0..MT) |mi| for (0..NT) |nj| {
         acc_next[mi][nj] = em.id();
     };
@@ -621,7 +664,7 @@ pub fn buildGemmSharedI8(gpa: std.mem.Allocator, warps8: bool, fuse_scale: bool,
     try em.line("%head = OpLabel", .{});
     const k0v = em.id();
     try em.line("%t{d} = OpPhi %u32 %cu_0 %entry %t{d} %cont", .{ k0v, k0n });
-    var acc_phi: [4][4]u32 = undefined;
+    var acc_phi: [8][8]u32 = undefined;
     for (0..MT) |mi| for (0..NT) |nj| {
         acc_phi[mi][nj] = em.id();
         try em.line("%t{d} = OpPhi %mat_c %c_acc0 %entry %t{d} %cont", .{ acc_phi[mi][nj], acc_next[mi][nj] });
@@ -657,28 +700,28 @@ pub fn buildGemmSharedI8(gpa: std.mem.Allocator, warps8: bool, fuse_scale: bool,
     // MMA: 2 ks of 32 k each, reading the current shared slab.
     var acc_cur = acc_phi;
     for (0..2) |ks| {
-        var ma: [4]u32 = undefined;
+        var ma: [8]u32 = undefined;
         for (0..MT) |mi| {
             const off1 = em.id();
-            try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ off1, a_warp, mi * 256 });
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ off1, a_warp, mi * frag_m * A_ROW_U32 });
             const off = em.id();
             try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ off, off1, ks * 8 });
             const aptr = em.id();
             try em.line("%t{d} = OpAccessChain %ptr_wg_u32 %vsh %t{d}", .{ aptr, off });
             ma[mi] = em.id();
-            try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_a %t{d} %cu_0 %cu_16", .{ ma[mi], aptr });
+            try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_a %t{d} %cu_0 %cu_{d}", .{ ma[mi], aptr, A_ROW_U32 });
         }
         for (0..NT) |nj| {
             const off1 = em.id();
-            try em.line("%t{d} = OpIAdd %u32 %cu_2048 %cu_{d}", .{ off1, ks * 1024 });
+            try em.line("%t{d} = OpIAdd %u32 %cu_{d} %cu_{d}", .{ off1, A_U32, ks * 32 * B_ROW_U32 });
             const off2 = em.id();
             try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ off2, off1, b_warp });
             const off = em.id();
-            try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ off, off2, nj * 4 });
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ off, off2, nj * frag_n / 4 });
             const bptr = em.id();
             try em.line("%t{d} = OpAccessChain %ptr_wg_u32 %vsh %t{d}", .{ bptr, off });
             const mb = em.id();
-            try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_b %t{d} %cu_0 %cu_32", .{ mb, bptr });
+            try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_b %t{d} %cu_0 %cu_{d}", .{ mb, bptr, B_ROW_U32 });
             for (0..MT) |mi| {
                 const acc_out = if (ks == 1) acc_next[mi][nj] else em.id();
                 try em.line("%t{d} = OpCooperativeMatrixMulAddKHR %mat_c %t{d} %t{d} %t{d} 15", .{ acc_out, ma[mi], mb, acc_cur[mi][nj] });
@@ -701,12 +744,12 @@ pub fn buildGemmSharedI8(gpa: std.mem.Allocator, warps8: bool, fuse_scale: bool,
     if (!fuse_scale) {
         for (0..MT) |mi| {
             const rowmi = em.id();
-            try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ rowmi, c_row0, mi * 16 });
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ rowmi, c_row0, mi * frag_m });
             const rowmul = em.id();
             try em.line("%t{d} = OpIMul %u32 %t{d} %pn", .{ rowmul, rowmi });
             for (0..NT) |nj| {
                 const ccol = em.id();
-                try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ ccol, c_col0, nj * 16 });
+                try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ ccol, c_col0, nj * frag_n });
                 const cbase = em.id();
                 try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ cbase, rowmul, ccol });
                 const cptr = em.id();
@@ -716,30 +759,33 @@ pub fn buildGemmSharedI8(gpa: std.mem.Allocator, warps8: bool, fuse_scale: bool,
         }
     } else {
         const scr_base = em.id();
-        try em.line("%t{d} = OpIMul %u32 %t{d} %cu_256", .{ scr_base, ly });
+        try em.line("%t{d} = OpIMul %u32 %t{d} %cu_{d}", .{ scr_base, ly, SCR_PER_WARP });
         for (0..MT) |mi| {
             const rowmi = em.id();
-            try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ rowmi, c_row0, mi * 16 });
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ rowmi, c_row0, mi * frag_m });
             const rowmul = em.id();
             try em.line("%t{d} = OpIMul %u32 %t{d} %pn", .{ rowmul, rowmi });
             for (0..NT) |nj| {
                 const ccol = em.id();
-                try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ ccol, c_col0, nj * 16 });
+                try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ ccol, c_col0, nj * frag_n });
                 const scrptr = em.id();
                 try em.line("%t{d} = OpAccessChain %ptr_wg_s32 %vscr %t{d}", .{ scrptr, scr_base });
-                try em.line("OpCooperativeMatrixStoreKHR %t{d} %t{d} %cu_0 %cu_16", .{ scrptr, acc_phi[mi][nj] });
+                try em.line("OpCooperativeMatrixStoreKHR %t{d} %t{d} %cu_0 %cu_{d}", .{ scrptr, acc_phi[mi][nj], frag_n });
                 try em.line("OpControlBarrier %cu_2 %cu_2 %cu_264", .{});
-                for (0..8) |i| {
+                for (0..LANE_ELEMS) |i| {
                     var elem = lx;
                     if (i > 0) {
                         const en = em.id();
                         try em.line("%t{d} = OpIAdd %u32 %t{d} %cu_{d}", .{ en, lx, i * 32 });
                         elem = en;
                     }
+                    // The fragment sits in scratch row-major at width frag_n, so its
+                    // index splits by frag_n -- this is what maps a value back to the
+                    // row and column whose scales get applied.
                     const lrow = em.id();
-                    try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_4", .{ lrow, elem });
+                    try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %cu_{d}", .{ lrow, elem, std.math.log2_int(u32, frag_n) });
                     const lcol = em.id();
-                    try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %cu_15", .{ lcol, elem });
+                    try em.line("%t{d} = OpBitwiseAnd %u32 %t{d} %cu_{d}", .{ lcol, elem, frag_n - 1 });
                     const grow = em.id();
                     try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ grow, rowmi, lrow });
                     const gcol = em.id();
@@ -1310,7 +1356,41 @@ pub const subgroup_lanes: u32 = 32;
 /// `acc_h16` (f16 accumulators, converted to f32 at the C store) to fit
 /// 2 wgs/SM at <= 128 regs. acc_h16 changes accumulation NUMERICS, gate
 /// any keep on the DiT parity fixture.
-pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h16: bool, c_h16: bool, bf16: bool) ![]align(4) u8 {
+pub fn buildGemmShared(
+    gpa: std.mem.Allocator,
+    b_f16: bool,
+    warps8: bool,
+    acc_h16: bool,
+    c_h16: bool,
+    bf16: bool,
+    frag_m: u32,
+    frag_n: u32,
+    /// Side of the square per-warp output tile, in elements. This is the knob that
+    /// trades accumulator registers for work per warp: at 64 a lane holds 128 f32
+    /// accumulators (fine where a thread has ~255 registers, as on NVIDIA), at 32 it
+    /// holds 32 (which is about what an Intel Xe lane gets at SIMD32). Must be a
+    /// multiple of both fragment dimensions.
+    warp_tile: u32,
+    /// N side of the warp tile. Separate from the M side because the two cost
+    /// different things: M costs A fragments and rows of shared A, N costs B
+    /// fragments and the width of the whole wg tile.
+    warp_tile_n_in: u32,
+) ![]align(4) u8 {
+    // Fragment M/N come from the device (NVIDIA and AMD offer 16x16, Intel Alchemist
+    // only 8x8); K is 16 on every config we accept, which is what lets the 32-deep
+    // staging stay two k sub-steps and the whole staging path stay shape-independent.
+    // The warp tile is covered by MT x NT fragments instead of a fixed 4x4.
+    const frag_k: u32 = 16;
+    // Per-warp output tile, in elements: a 128-row wg tile over 2 warp rows, and WGN
+    // columns over WGN/64 warp columns. It does not move when the fragment shape does,
+    // so a smaller fragment means more fragments per warp, not a smaller warp, and the
+    // staging and host-side dispatch geometry stay untouched.
+    const warp_tile_m: u32 = warp_tile;
+    const warp_tile_n: u32 = warp_tile_n_in;
+    const MT: usize = warp_tile_m / frag_m;
+    const NT: usize = warp_tile_n / frag_n;
+    std.debug.assert(warp_tile_m % frag_m == 0 and warp_tile_n % frag_n == 0);
+    std.debug.assert(MT <= 8 and NT <= 8);
     // bf16 mode: the A/B operands (activations + weights) are bfloat16 instead
     // of IEEE f16, same 16-bit storage, so the staging is a bitwise copy and
     // only the type annotations change. Requires b_f16 (weight already 16-bit,
@@ -1322,20 +1402,28 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
     // meaningful with f16 accumulators, where it is exact: the f32 store it
     // replaces was just a widening of the f16 accumulator values.
     std.debug.assert(!c_h16 or acc_h16);
-    // A slab geometry: 128 rows x 32 k f16 per sub-slab at base A_BASE of
+    // A slab geometry: A_ROWS rows x 32 k f16 per sub-slab at base A_BASE of
     // the shared array. The row stride can carry padding to spread shared-
     // memory banks, but stride 34 measured neutral vs 32 (the driver's coop
     // loads evidently swizzle already), so no padding.
     const A_STRIDE: u32 = 32;
-    const A_SLAB: u32 = 128 * A_STRIDE;
-    // Workgroup geometry. THREADS == WGN in both configs, which keeps the
-    // B staging at exactly 2 sixteen-element chunks per thread.
-    const WGN: u32 = if (warps8) 256 else 128; // wg tile N width
-    const THREADS: u32 = if (warps8) 256 else 128;
+    // Workgroup geometry. The warp grid is always 2 rows x NWARPS/2 columns of
+    // `warp_tile`-square warp tiles, so the wg tile follows the warp tile: shrinking
+    // the warp tile is how a device with a smaller register budget per lane keeps its
+    // accumulators resident instead of spilling. Everything below is derived, so no
+    // staging or dispatch constant needs to know which tile was picked.
     const NWARPS: u32 = if (warps8) 8 else 4;
+    const A_ROWS: u32 = 2 * warp_tile_m; // wg tile M height
+    const WGN: u32 = (NWARPS / 2) * warp_tile_n; // wg tile N width
+    const THREADS: u32 = NWARPS * subgroup_lanes;
+    const A_SLAB: u32 = A_ROWS * A_STRIDE;
     const B_SLAB: u32 = 32 * WGN; // one 32-deep k sub-slab
     const A_BASE: u32 = 2 * B_SLAB;
-    const AQ: usize = 512 / THREADS; // A staging quads per thread (512 uvec4/sub-slab)
+    // A staging: one uvec4 carries 8 f16, so a sub-slab is A_SLAB/8 quads.
+    const AQ: usize = A_SLAB / 8 / THREADS;
+    // B staging: `stage_chunk` f16 per thread per pass over a 32 x WGN sub-slab.
+    const BQ: usize = B_SLAB / 16 / THREADS;
+    std.debug.assert(AQ >= 1 and AQ <= 4 and BQ >= 1 and BQ <= 4);
 
     var t: std.ArrayList(u8) = .empty;
     defer t.deinit(gpa);
@@ -1448,11 +1536,45 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
         .{ "c_scope_sub", 3 }, .{ "c_scope_wg", 2 },
     }) |cv| try em.line("%{s} = OpConstant %u32 {d}", .{ cv[0], cv[1] });
 
+    // Every u32 constant below is requested by VALUE: the pool hands back the name
+    // of an already-emitted constant with that value, or emits a new one. Two names
+    // for one value are two distinct OpConstants with distinct ids, so the seeds are
+    // the names the block above emitted first, and a value present there must reuse
+    // that name rather than emit a second copy. This is also what keeps the emission
+    // for 16x16 identical to the hand-written aliasing chain it replaces.
+    var cpool: std.AutoHashMapUnmanaged(u32, []const u8) = .empty;
+    defer cpool.deinit(gpa);
+    for ([_]struct { u32, []const u8 }{
+        .{ 0, "c_u0" },   .{ 1, "c_u1" },     .{ 2, "c_u2" },       .{ 3, "c_u3" },
+        .{ 4, "c_u4" },   .{ 5, "c_u5" },     .{ 6, "c_u6" },       .{ 7, "c_u7" },
+        .{ 8, "c_u8" },   .{ 12, "c_u12" },   .{ 31, "c_u31" },     .{ 16, "c_u16" },
+        .{ 32, "c_u32c" }, .{ 64, "c_u64" }, .{ 128, "c_u128" }, .{ 4096, "c_u4096" },
+        .{ 0x108, "c_u264" },
+    }) |s| try cpool.put(gpa, s[0], s[1]);
+    const Kp = struct {
+        m: *std.AutoHashMapUnmanaged(u32, []const u8),
+        e: *Emit,
+        g: std.mem.Allocator,
+        nl: *std.ArrayList([]u8),
+        fn get(self: @This(), v: u32) ![]const u8 {
+            if (self.m.get(v)) |n| return n;
+            const name = try std.fmt.allocPrint(self.g, "c_k{d}", .{v});
+            try self.nl.append(self.g, name);
+            try self.e.line("%{s} = OpConstant %u32 {d}", .{ name, v });
+            try self.m.put(self.g, v, name);
+            return name;
+        }
+    };
+    const kp = Kp{ .m = &cpool, .e = &em, .g = gpa, .nl = &names };
+
+    const c_fm = try kp.get(frag_m);
+    const c_fn = try kp.get(frag_n);
+    const c_fk = try kp.get(frag_k);
     const c_acc_elem = if (acc_h16) "f16" else "f32";
-    try em.line("%mat_a = OpTypeCooperativeMatrixKHR %{s} %c_scope_sub %c_u16 %c_u16 %c_u0", .{E});
-    try em.line("%mat_b = OpTypeCooperativeMatrixKHR %{s} %c_scope_sub %c_u16 %c_u16 %c_u1", .{E});
-    try em.line("%mat_c = OpTypeCooperativeMatrixKHR %{s} %c_scope_sub %c_u16 %c_u16 %c_u2", .{c_acc_elem});
-    if (acc_h16 and !c_h16) try em.line("%mat_c32 = OpTypeCooperativeMatrixKHR %f32 %c_scope_sub %c_u16 %c_u16 %c_u2", .{});
+    try em.line("%mat_a = OpTypeCooperativeMatrixKHR %{s} %c_scope_sub %{s} %{s} %c_u0", .{ E, c_fm, c_fk });
+    try em.line("%mat_b = OpTypeCooperativeMatrixKHR %{s} %c_scope_sub %{s} %{s} %c_u1", .{ E, c_fk, c_fn });
+    try em.line("%mat_c = OpTypeCooperativeMatrixKHR %{s} %c_scope_sub %{s} %{s} %c_u2", .{ c_acc_elem, c_fm, c_fn });
+    if (acc_h16 and !c_h16) try em.line("%mat_c32 = OpTypeCooperativeMatrixKHR %f32 %c_scope_sub %{s} %{s} %c_u2", .{ c_fm, c_fn });
     try em.line("%v2f16 = OpTypeVector %f16 2", .{});
     if (bf16) try em.line("%v2bf16 = OpTypeVector %bf16 2", .{});
     try em.line("%c_f32_0 = OpConstant %f32 0", .{});
@@ -1461,70 +1583,34 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
     try em.line("%c_v2_256 = OpConstantComposite %v2f16 %c_h256 %c_h256", .{});
     try em.line("%c_acc0 = OpConstantComposite %mat_c %{s}", .{if (acc_h16) "c_f16_0" else "c_f32_0"});
 
-    // Body index constants (with the original's value-aliasing so emission
-    // order and set match golden exactly).
-    const c_wgn = if (WGN == 128) "c_u128" else blk: {
-        try em.line("%c_wgn = OpConstant %u32 {d}", .{WGN});
-        break :blk "c_wgn";
-    };
-    const c_bslab = if (B_SLAB == 4096) "c_u4096" else blk: {
-        try em.line("%c_bslab = OpConstant %u32 {d}", .{B_SLAB});
-        break :blk "c_bslab";
-    };
-    const c_bmask = if (WGN == 128) "c_u7" else blk: {
-        try em.line("%c_bmask = OpConstant %u32 {d}", .{WGN / 16 - 1});
-        break :blk "c_bmask";
-    };
-    const c_bshift = if (WGN == 128) "c_u3" else "c_u4"; // log2(WGN/16)
+    // Body index constants, all requested by value through the pool. Requests stay
+    // in the order the emitter needs them so the sequence of newly emitted constants
+    // (and therefore the ids) is fixed by the geometry, not by hand-written aliases.
+    const c_wgn = try kp.get(WGN);
+    const c_bslab = try kp.get(B_SLAB);
+    // B staging split: each thread stages one `stage_chunk`-wide run (the `<< 4` at
+    // the bcol16/sbase0 shifts below), so these divide the WGN-wide row into chunks
+    // per THREAD. Staging geometry, not fragment geometry: it must NOT follow frag_n,
+    // or B lands at the wrong shared-memory offsets. 16x16 cannot expose the
+    // difference, since there WGN/frag_n and WGN/stage_chunk are the same number.
+    const stage_chunk: u32 = 16;
+    const c_bmask = try kp.get(WGN / stage_chunk - 1);
+    const c_bshift = try kp.get(std.math.log2_int(u32, WGN / stage_chunk));
     var c_stage: [4][]const u8 = undefined; // t*THREADS
-    c_stage[0] = "c_u0";
-    c_stage[1] = c_wgn;
-    for (2..4) |i| {
-        try em.line("%c_stage_{d} = OpConstant %u32 {d}", .{ i, @as(u32, @intCast(i)) * THREADS });
-        c_stage[i] = try nm.f("c_stage_{d}", .{i});
-    }
-    var c_k16: [4][]const u8 = undefined;
-    c_k16[0] = "c_u0";
-    c_k16[1] = "c_u16";
-    c_k16[2] = "c_u32c";
-    try em.line("%c_k16_3 = OpConstant %u32 48", .{});
-    c_k16[3] = "c_k16_3";
-    var c_col16: [8][]const u8 = undefined;
-    c_col16[0] = "c_u0";
-    c_col16[1] = "c_u16";
-    c_col16[2] = "c_u32c";
-    c_col16[3] = "c_k16_3";
-    c_col16[4] = "c_u64";
-    for (5..8) |i| {
-        try em.line("%c_col16_{d} = OpConstant %u32 {d}", .{ i, @as(u32, @intCast(i)) * 16 });
-        c_col16[i] = try nm.f("c_col16_{d}", .{i});
-    }
+    for (0..4) |i| c_stage[i] = try kp.get(@as(u32, @intCast(i)) * THREADS);
+    // Column offset of each N fragment inside the warp tile.
+    var c_coln: [8][]const u8 = undefined;
+    for (0..NT) |i| c_coln[i] = try kp.get(@as(u32, @intCast(i)) * frag_n);
     var c_bt: [2][2][8][]const u8 = undefined;
-    for (0..2) |par| for (0..2) |ks| for (0..8) |nt| {
-        if (par == 0 and ks == 0) {
-            c_bt[par][ks][nt] = c_col16[nt];
-        } else {
-            try em.line("%c_bt_{d}_{d}_{d} = OpConstant %u32 {d}", .{ par, ks, nt, @as(u32, @intCast(par * B_SLAB + ks * (16 * WGN) + nt * 16)) });
-            c_bt[par][ks][nt] = try nm.f("c_bt_{d}_{d}_{d}", .{ par, ks, nt });
-        }
+    for (0..2) |par| for (0..2) |ks| for (0..NT) |nt| {
+        c_bt[par][ks][nt] = try kp.get(@intCast(par * B_SLAB + ks * (frag_k * WGN) + nt * frag_n));
     };
-    const c_astride = if (A_STRIDE == 32) "c_u32c" else blk: {
-        try em.line("%c_astride = OpConstant %u32 {d}", .{A_STRIDE});
-        break :blk "c_astride";
-    };
-    const c_aslab = if (A_SLAB == 4096) "c_u4096" else blk: {
-        try em.line("%c_aslab = OpConstant %u32 {d}", .{A_SLAB});
-        break :blk "c_aslab";
-    };
-    try em.line("%c_ash0 = OpConstant %u32 {d}", .{A_BASE});
-    var c_at: [2][2][4][]const u8 = undefined;
-    for (0..2) |par| for (0..2) |ks| for (0..4) |r| {
-        if (par == 0 and ks == 0 and r == 0) {
-            c_at[par][ks][r] = "c_ash0";
-        } else {
-            try em.line("%c_at_{d}_{d}_{d} = OpConstant %u32 {d}", .{ par, ks, r, @as(u32, @intCast(A_BASE + par * A_SLAB + r * 16 * A_STRIDE + ks * 16)) });
-            c_at[par][ks][r] = try nm.f("c_at_{d}_{d}_{d}", .{ par, ks, r });
-        }
+    const c_astride = try kp.get(A_STRIDE);
+    const c_aslab = try kp.get(A_SLAB);
+    const c_ash0 = try kp.get(A_BASE);
+    var c_at: [2][2][8][]const u8 = undefined;
+    for (0..2) |par| for (0..2) |ks| for (0..MT) |r| {
+        c_at[par][ks][r] = try kp.get(@intCast(A_BASE + par * A_SLAB + r * frag_m * A_STRIDE + ks * frag_k));
     };
 
     // --- function ---
@@ -1540,7 +1626,7 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
     const col0 = em.id();
     try em.line("%t{d} = OpIMul %u32 %t{d} %{s}", .{ col0, tile_c, c_wgn });
     const row0 = em.id();
-    try em.line("%t{d} = OpIMul %u32 %t{d} %c_u128", .{ row0, tile_r });
+    try em.line("%t{d} = OpIMul %u32 %t{d} %{s}", .{ row0, tile_r, try kp.get(A_ROWS) });
 
     const lidv = em.id();
     try em.line("%t{d} = OpLoad %v3u %lid", .{lidv});
@@ -1565,26 +1651,29 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
     const warp_n = em.id();
     try em.line("%t{d} = OpShiftRightLogical %u32 %t{d} %c_u1", .{ warp_n, ly });
     const wm64 = em.id();
-    try em.line("%t{d} = OpIMul %u32 %t{d} %c_u64", .{ wm64, warp_m });
+    try em.line("%t{d} = OpIMul %u32 %t{d} %{s}", .{ wm64, warp_m, try kp.get(warp_tile_m) });
     const row_s = em.id();
     try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ row_s, row0, wm64 });
     const wn64 = em.id();
-    try em.line("%t{d} = OpIMul %u32 %t{d} %c_u64", .{ wn64, warp_n });
+    try em.line("%t{d} = OpIMul %u32 %t{d} %{s}", .{ wn64, warp_n, try kp.get(warp_tile_n) });
     const col_s = em.id();
     try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ col_s, col0, wn64 });
     const a_shbase = em.id();
     try em.line("%t{d} = OpIMul %u32 %t{d} %{s}", .{ a_shbase, wm64, c_astride });
 
     // B staging indices, constant across the loop.
-    var brow_t: [2]u32 = undefined;
-    var bco_t: [2]u32 = undefined;
-    var sbase0_t: [2]u32 = undefined;
-    var sbase1_t: [2]u32 = undefined;
-    for (0..2) |i| {
+    var brow_t: [4]u32 = undefined;
+    var bco_t: [4]u32 = undefined;
+    var sbase0_t: [4]u32 = undefined;
+    var sbase1_t: [4]u32 = undefined;
+    for (0..BQ) |i| {
         var v = flat;
         if (i > 0) {
+            // Successive passes are one full workgroup of threads apart, which equals
+            // WGN only while THREADS == WGN; that stops holding once the warp tile is
+            // narrower than the wg N width.
             const vn = em.id();
-            try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ vn, flat, c_wgn });
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ vn, flat, c_stage[i] });
             v = vn;
         }
         brow_t[i] = em.id();
@@ -1631,7 +1720,7 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
         const s0 = em.id();
         try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ s0, srow, scol });
         asb0_t[i] = em.id();
-        try em.line("%t{d} = OpIAdd %u32 %t{d} %c_ash0", .{ asb0_t[i], s0 });
+        try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ asb0_t[i], s0, c_ash0 });
         asb1_t[i] = em.id();
         try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ asb1_t[i], asb0_t[i], c_aslab });
     }
@@ -1646,13 +1735,14 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
         c_j: [4][]const u8,
         c_j8: [8][]const u8,
         c_w4: [4][]const u8,
-        brow: [2]u32,
-        bco: [2]u32,
+        brow: [4]u32,
+        bco: [4]u32,
+        bq: usize,
 
         fn loads(st: @This(), kb: []const u8) ![4]u32 {
             const e = st.em;
             var quads: [4]u32 = undefined;
-            for (0..2) |i| {
+            for (0..st.bq) |i| {
                 const bk = e.id();
                 try e.line("%t{d} = OpIAdd %u32 %{s} %t{d}", .{ bk, kb, st.brow[i] });
                 const bmul = e.id();
@@ -1686,10 +1776,10 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
             return quads;
         }
 
-        fn stores(st: @This(), quads: [4]u32, sbase: [2]u32) !void {
+        fn stores(st: @This(), quads: [4]u32, sbase: [4]u32) !void {
             const e = st.em;
             if (st.b_f16) {
-                for (0..2) |i| {
+                for (0..st.bq) |i| {
                     for (0..2) |qi| {
                         var qbase = sbase[i];
                         if (qi > 0) {
@@ -1781,6 +1871,7 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
         .c_w4 = .{ "c_u0", "c_u4", "c_u8", "c_u12" },
         .brow = brow_t,
         .bco = bco_t,
+        .bq = BQ,
     };
 
     // A staging: plain f16 copy into the shared A region.
@@ -1850,10 +1941,12 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
         try astage.stores(x0, asb0_t);
     }
 
-    // Pre-allocated ids for the loop-carried values (phi back-edges).
+    // Pre-allocated ids for the loop-carried values (phi back-edges). MT x NT of
+    // them: the warp tile is fixed, so a smaller fragment means more accumulators,
+    // each holding proportionally fewer values per lane.
     const k0n = em.id();
-    var acc_next: [4][4]u32 = undefined;
-    for (&acc_next) |*row| for (row) |*v| {
+    var acc_next: [8][8]u32 = undefined;
+    for (acc_next[0..MT]) |*row| for (row[0..NT]) |*v| {
         v.* = em.id();
     };
 
@@ -1861,9 +1954,9 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
     try em.line("%head = OpLabel", .{});
     const k0v = em.id();
     try em.line("%t{d} = OpPhi %u32 %c_u0 %entry %t{d} %cont", .{ k0v, k0n });
-    var acc_phi: [4][4]u32 = undefined;
-    for (&acc_phi, acc_next) |*prow, nrow| {
-        for (prow, nrow) |*ap, an| {
+    var acc_phi: [8][8]u32 = undefined;
+    for (acc_phi[0..MT], acc_next[0..MT]) |*prow, nrow| {
+        for (prow[0..NT], nrow[0..NT]) |*ap, an| {
             ap.* = em.id();
             try em.line("%t{d} = OpPhi %mat_c %c_acc0 %entry %t{d} %cont", .{ ap.*, an });
         }
@@ -1885,8 +1978,8 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
     const w1 = try stage.loads(kb1n);
     const x1 = try astage.loads(kb1n);
     for (0..2) |ks| {
-        var ma: [4]u32 = undefined;
-        for (0..4) |r| {
+        var ma: [8]u32 = undefined;
+        for (0..MT) |r| {
             const aoff = em.id();
             try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ aoff, a_shbase, c_at[0][ks][r] });
             const aptr = em.id();
@@ -1894,14 +1987,14 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
             ma[r] = em.id();
             try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_a %t{d} %c_u0 %{s}", .{ ma[r], aptr, c_astride });
         }
-        for (0..4) |nt| {
+        for (0..NT) |nt| {
             const boff = em.id();
             try em.line("%t{d} = OpIAdd %u32 %{s} %t{d}", .{ boff, c_bt[0][ks][nt], wn64 });
             const bptr2 = em.id();
             try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vbsh %t{d}", .{ bptr2, boff });
             const mb = em.id();
             try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_b %t{d} %c_u0 %{s}", .{ mb, bptr2, c_wgn });
-            for (0..4) |r| {
+            for (0..MT) |r| {
                 const acc_out = em.id();
                 try em.line("%t{d} = OpCooperativeMatrixMulAddKHR %mat_c %t{d} %t{d} %t{d}", .{ acc_out, ma[r], mb, acc_cur[r][nt] });
                 acc_cur[r][nt] = acc_out;
@@ -1922,8 +2015,8 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
     const w2 = try stage.loads(kb2sn);
     const x2 = try astage.loads(kb2sn);
     for (0..2) |ks| {
-        var ma: [4]u32 = undefined;
-        for (0..4) |r| {
+        var ma: [8]u32 = undefined;
+        for (0..MT) |r| {
             const aoff = em.id();
             try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ aoff, a_shbase, c_at[1][ks][r] });
             const aptr = em.id();
@@ -1931,14 +2024,14 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
             ma[r] = em.id();
             try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_a %t{d} %c_u0 %{s}", .{ ma[r], aptr, c_astride });
         }
-        for (0..4) |nt| {
+        for (0..NT) |nt| {
             const boff = em.id();
             try em.line("%t{d} = OpIAdd %u32 %{s} %t{d}", .{ boff, c_bt[1][ks][nt], wn64 });
             const bptr2 = em.id();
             try em.line("%t{d} = OpAccessChain %ptr_wg_f16 %vbsh %t{d}", .{ bptr2, boff });
             const mb = em.id();
             try em.line("%t{d} = OpCooperativeMatrixLoadKHR %mat_b %t{d} %c_u0 %{s}", .{ mb, bptr2, c_wgn });
-            for (0..4) |r| {
+            for (0..MT) |r| {
                 const acc_out = if (ks == 1) acc_next[r][nt] else em.id();
                 try em.line("%t{d} = OpCooperativeMatrixMulAddKHR %mat_c %t{d} %t{d} %t{d}", .{ acc_out, ma[r], mb, acc_cur[r][nt] });
                 acc_cur[r][nt] = acc_out;
@@ -1953,21 +2046,21 @@ pub fn buildGemmShared(gpa: std.mem.Allocator, b_f16: bool, warps8: bool, acc_h1
     try em.line("%t{d} = OpIAdd %u32 %t{d} %c_u64", .{ k0n, k0v });
     try em.line("OpBranch %head", .{});
 
-    // merge: store 4x4 C tiles at (row_s + r*16, col_s + nt*16)
+    // merge: store the MT x NT C tiles at (row_s + r*frag_m, col_s + nt*frag_n)
     try em.line("%merge = OpLabel", .{});
     const rn16 = em.id();
-    try em.line("%t{d} = OpIMul %u32 %c_u16 %pn", .{rn16});
+    try em.line("%t{d} = OpIMul %u32 %{s} %pn", .{ rn16, c_fm });
     var c_rowmul = em.id();
     try em.line("%t{d} = OpIMul %u32 %t{d} %pn", .{ c_rowmul, row_s });
-    for (0..4) |r| {
+    for (0..MT) |r| {
         if (r > 0) {
             const nx = em.id();
             try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ nx, c_rowmul, rn16 });
             c_rowmul = nx;
         }
-        for (0..4) |nt| {
+        for (0..NT) |nt| {
             const ccol = em.id();
-            try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ ccol, col_s, c_col16[nt] });
+            try em.line("%t{d} = OpIAdd %u32 %t{d} %{s}", .{ ccol, col_s, c_coln[nt] });
             const cbase = em.id();
             try em.line("%t{d} = OpIAdd %u32 %t{d} %t{d}", .{ cbase, c_rowmul, ccol });
             const cptr = em.id();
@@ -3483,4 +3576,134 @@ pub fn buildGemmAttnOut(gpa: std.mem.Allocator) ![]align(4) u8 {
     try em.line("OpFunctionEnd", .{});
 
     return sasm.assembleChecked(gpa, sasm.version_1_5, t.items);
+}
+
+// Pins the emitted SPIR-V of every variant `Context.init` builds. The fragment
+// shape, tile geometry and staging offsets are threaded through these emitters by
+// hand and share constants (a `16` can be a fragment dimension, a load stride or a
+// shared-memory column offset), so a change intended to add a new shape can alter
+// an existing one without any test noticing. These hashes are what notice.
+//
+// A hash changes only together with a reason to expect it: pair the update with the
+// device-parity command for that kernel, never on its own.
+test "coop shader emission is byte-stable" {
+    const gpa = std.testing.allocator;
+    const Case = struct { name: []const u8, code: []align(4) u8, want: []const u8 };
+    var cases: std.ArrayList(Case) = .empty;
+    defer {
+        for (cases.items) |c| gpa.free(c.code);
+        cases.deinit(gpa);
+    }
+
+    try cases.append(gpa, .{
+        .name = "gemm_shared fp8",
+        .code = try buildGemmShared(gpa, false, coop_warps8, coop_acc_h16, false, false, 16, 16, 64, 64),
+        .want = "c2786ee48ca8e318f75bdfa862a6ef6eb9130607d3fc7c703ab7d2e3282b9262",
+    });
+    try cases.append(gpa, .{
+        .name = "gemm_shared f16w",
+        .code = try buildGemmShared(gpa, true, false, false, false, false, 16, 16, 64, 64),
+        .want = "278c7aa84da46975c3b74dcb0e295e6cfcd654b94c9513b2543960171fed06f9",
+    });
+    try cases.append(gpa, .{
+        .name = "gemm_shared c16",
+        .code = try buildGemmShared(gpa, false, coop_warps8, true, true, false, 16, 16, 64, 64),
+        .want = "8b40ce8411c0b3666c5512d71701a0bd779dedbbb6ed457ce459c813dbe62b55",
+    });
+    try cases.append(gpa, .{
+        .name = "gemm_shared bf16w",
+        .code = try buildGemmShared(gpa, true, false, false, false, true, 16, 16, 64, 64),
+        .want = "fafef249d33d108b70b7f3209fa342c9b724568f86a48b9b93673a120497d553",
+    });
+    // The 8x8 fragment shape Intel Alchemist advertises. Same warp tile, so this is
+    // the same GEMM expressed as 8x8 fragments instead of 4x4; pinned separately
+    // because nothing on an NVIDIA or AMD box exercises it.
+    try cases.append(gpa, .{
+        .name = "gemm_shared f16w 8x8",
+        .code = try buildGemmShared(gpa, true, false, false, false, false, 8, 8, 64, 64),
+        .want = "5b3e783096338046be35aeba89487061acd0617351dd38c3c9fa375e3781fdaf",
+    });
+    try cases.append(gpa, .{
+        .name = "gemm_shared fp8 8x8",
+        .code = try buildGemmShared(gpa, false, coop_warps8, false, false, false, 8, 8, 64, 64),
+        .want = "62ca8c86917bfc3995598c298de4990ff736443f327ad05e2b7fbf77443f3db9",
+    });
+    // The 8x8x32 s8 shape Intel Alchemist advertises, at the tiles it can express.
+    for ([_]struct { u32, u32, []const u8 }{
+        .{ 64, 64, "2627494dfe891f4cd8d1070d356e730f1d7e3db6c7500bc6fcb357ee38ec4ae7" },
+        .{ 32, 32, "29700b24c47b173b471752ef40bac41028e367ef85e727f63d83bab4becd5d43" },
+        .{ 16, 16, "a5233d78fed9fa0fc92b74fa0af632f38b2d518082126488959fad36c17a5f1b" },
+    }) |wt| {
+        try cases.append(gpa, .{
+            .name = "gemm_shared_i8 8x8",
+            .code = try buildGemmSharedI8(gpa, coop_i8_warps8, true, coop_i8_double_buf, false, 8, 8, wt[0], wt[1]),
+            .want = wt[2],
+        });
+    }
+    try cases.append(gpa, .{
+        .name = "gemm_i8",
+        .code = try buildGemmI8(gpa, i8_mt, i8_nt),
+        .want = "35eab5702972e7bd98043ce570f308065d17ef2e05405fab38678d4b1d44ee01",
+    });
+    for ([_]struct { bool, bool, []const u8, []const u8 }{
+        .{ false, false, "gemm_shared_i8 raw", "2b8c4c230568e15db93662b729ad652f34c1301eca1721db6e27808c741b4b5e" },
+        .{ true, false, "gemm_shared_i8 fused f32", "746a233b34f14921de994138152fc659fe63e26d8858d60b9e1f1c77c2982ac7" },
+        .{ true, true, "gemm_shared_i8 fused f16", "47aeeb001fc44e5b28a667902f18b89401dfd60f676e6a98e254a61a49edda15" },
+    }) |v| {
+        try cases.append(gpa, .{
+            .name = v[2],
+            .code = try buildGemmSharedI8(gpa, coop_i8_warps8, v[0], coop_i8_double_buf, v[1], 16, 16, 64, 64),
+            .want = v[3],
+        });
+    }
+    for ([_]struct { u32, []const u8, []const u8 }{
+        .{ 128, "gemm_scores 128", "75c1f20e4a67ceda7292df970a619549e0b70c8c4ee1baf97370a615d4cf1fd9" },
+        .{ 384, "gemm_scores 384", "e387f23ee3825ac12ae6f75b4e2c5c4e5428c92c8f0ffcbf12e89cc57d35661a" },
+        .{ 512, "gemm_scores 512", "5f6c156cb98a0c80451c3f18d7d73d8d82e1b799db74aac874f168380d0050fd" },
+    }) |v| {
+        try cases.append(gpa, .{
+            .name = v[1],
+            .code = try buildGemmScores(gpa, v[0], scores_stage_k),
+            .want = v[2],
+        });
+    }
+    for ([_]struct { u32, []const u8, []const u8 }{
+        .{ 2048, "fused_prep_i8 2048", "3c91e5639a4f083fa589cb0473844875f0a4986a3fdf5a778f1568b79f71abc3" },
+        .{ 6144, "fused_prep_i8 6144", "c19a9fc751161c30af8fde5ed5dbec129f2292168455d62ce29b18c41c06a30b" },
+        .{ 8192, "fused_prep_i8 8192", "37cfba81299a8a11a7c63d91df55d4ece33c880c8b36fefe458ba05489c59b90" },
+        .{ 16384, "fused_prep_i8 16384", "4c0ed7117e622d13c65147b17c7f85681988b793c37ed137ca683ccede10559f" },
+    }) |v| {
+        try cases.append(gpa, .{
+            .name = v[1],
+            .code = try buildFusedPrepI8(gpa, v[0]),
+            .want = v[2],
+        });
+    }
+    try cases.append(gpa, .{
+        .name = "flash_md",
+        .code = try buildFlashMd(gpa),
+        .want = "4207c924485f0407b58167d51ecabfd1d90253fc68bca23361c95588bbc1e2ef",
+    });
+    try cases.append(gpa, .{
+        .name = "flash_out",
+        .code = try buildFlashOut(gpa),
+        .want = "cda1b5c50c4e47648a3d69e259ef81ff568781c85da303c3016c0b139b435197",
+    });
+    try cases.append(gpa, .{
+        .name = "gemm_attn_out",
+        .code = try buildGemmAttnOut(gpa),
+        .want = "c2273b7916fde84a39a359820e50174ddf05dfb5f4f4ecf868e49af2b577ab3f",
+    });
+
+    var changed: usize = 0;
+    for (cases.items) |c| {
+        var dig: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(c.code, &dig, .{});
+        const got = std.fmt.bytesToHex(dig, .lower);
+        if (!std.mem.eql(u8, c.want, &got)) {
+            changed += 1;
+            std.debug.print("coop emission changed: {s} ({d} bytes)\n  want {s}\n  got  {s}\n", .{ c.name, c.code.len, c.want, &got });
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), changed);
 }
