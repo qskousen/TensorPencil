@@ -694,7 +694,7 @@ not token-identical to f32 — and a dtype toggle rebuilds the context.
 ## 7. Data-format support matrix
 
 DType enum (`src/dtype.zig`): `f8_e4m3, f16, bf16, f32, i8, i4, q4_0, q8_0, q2_k, q4_k, q5_k,
-q6_k, iq4_nl, q1_0, q2_0_g64, q2_0_g128`. `i8`/`i4` are the ComfyUI convrot formats for the **image**
+q6_k, iq4_nl, iq4_xs, q1_0, q2_0_g64, q2_0_g128`. `i8`/`i4` are the ComfyUI convrot formats for the **image**
 path; GGUF `q*` are the **LLM** path.
 
 | Format | cpu | vulkan | zig-cuda | cuda | How it computes |
@@ -712,6 +712,7 @@ path; GGUF `q*` are the **LLM** path.
 | **GGUF q4_k / q5_k / q6_k** | ✅ ggml | ✅ scalar `gemv_*{,_t}` | ✅ `gemv_*(_q8/_q8n)` + MMQ | ⤷ dequant→f16 | |
 | **GGUF q2_k** | ✅ ggml | ❌ | ✅ decode→int8/int4 convrot (`buildPrep`) | ✅ ditto | 256 elems / 84 B; 2-bit codes, 4-bit scale+min per 16, f16 d/dmin at the block TAIL. Diffusion only so far: no GEMV, so no LLM decode path |
 | **GGUF iq4_nl** | ✅ ggml | ✅ scalar (module-const LUT) | ✅ shared-mem LUT | ⤷ dequant→f16 | 32 elems / 18 B, non-linear `kvalues_iq4nl` |
+| **GGUF iq4_xs** | ✅ ggml | ❌ | ✅ `gemv_iq4_xs` (shared-mem LUT), `embed_gather_iq4_xs` | ⤷ dequant→f16 | 256 elems / 136 B; `kvalues_iq4nl` over a k-quant super-block, 6-bit sub-block scale split across `scales_h`/`scales_l`, biased −32. No dp4a/MMQ path |
 | **GGUF q1_0** | ✅ ggml | ❌ | ✅ `gemv_q1_0{,_q8}`, `mmq_pipe_q1_0` | ⤷ dequant→f16 | 128 elems / 18 B; **1 sign bit per weight**, `v = bit ? d : -d`, `d = mean\|x\|` |
 | **GGUF q2_0 g128** | ✅ **native** `dotQ2_0G128` (not ggml) | ❌ | ✅ `gemv_q2_0_g128{,_q8}`, `mmq_pipe_q2_0` | ⤷ dequant→f16 | 128 elems / 34 B; 2 bits/weight, `v = (code − 1)·d`, codes → {−1, 0, +1, +2} |
 | **GGUF q2_0 g64** | ✅ ggml | ❌ | ✅ built, ⚠️ **never executed** (no g64 file here) | ⤷ dequant→f16 | 64 elems / 18 B, ggml's own `QK2_0` |
@@ -912,8 +913,8 @@ GEMM builders: `buildHgemm` (f16/bf16 mma m16n8k16, optional f32 A/C) · `buildI
 `ldmatrix.x4`/`.x2` fragment loads with an XOR-swizzled conflict-free shared layout
 (`use_ldmatrix`; a pure permutation, so bit-exact).
 
-GEMV: `gemv_{fp8,bf16,f16,q8_0,q4_0,q4_k,q5_k,q6_k,iq4_nl,q1_0,q2_0_g64,q2_0_g128}` plus `_q8` and
-grouped-N `_q8n` dp4a variants.
+GEMV: `gemv_{fp8,bf16,f16,q8_0,q4_0,q4_k,q5_k,q6_k,iq4_nl,iq4_xs,q1_0,q2_0_g64,q2_0_g128}` plus `_q8`
+and grouped-N `_q8n` dp4a variants (iq4_xs has neither: it decodes f32 straight from the block).
 
 Attention: `attn` · `attn_split`/`_merge`/`_h256`/`_h512`/`_tree` · `attn_split_g` (group-shared KV
 fragment, entry for hd ∈ {128, 256}, full causal, `heads > kv_heads`; bit-identical per head to

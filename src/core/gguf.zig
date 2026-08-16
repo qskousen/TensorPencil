@@ -57,6 +57,7 @@ fn dtypeFromGgml(id: u32, q2_0: DType) ?DType {
         13 => .q5_k,
         14 => .q6_k,
         20 => .iq4_nl, // GGML_TYPE_IQ4_NL (32-elem block, non-linear 4-bit LUT)
+        23 => .iq4_xs, // GGML_TYPE_IQ4_XS (256-elem super-block over the same LUT)
         41 => .q1_0, // GGML_TYPE_Q1_0 (128-elem block, 1 sign bit per weight)
         42 => q2_0, // GGML_TYPE_Q2_0, AMBIGUOUS, resolved by the caller
         24 => .i8, // GGML_TYPE_I8 (raw, no blocks), NOT 16, which is IQ2_XXS

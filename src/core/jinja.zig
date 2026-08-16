@@ -168,6 +168,14 @@ const Chunk = union(enum) {
 /// own embedded template with it. Verified byte-exact vs jinja2 (fixtures).
 pub const gemma4_canonical_template: []const u8 = @embedFile("assets/jinja/gemma4_canonical.jinja");
 
+/// froggeric's fixed Qwen chat template (v22, Apache-2.0), one template for
+/// every Qwen 3.5 / 3.6 / 3.8 size. Embedded byte-identical to upstream
+/// (sha256 398edf5b5bb802fb6b9c9a8dba670d09f2aaeef6fdcaa0b2ca307265f59f78dc,
+/// huggingface.co/froggeric/Qwen-Fixed-Chat-Templates) so it can stand in for
+/// a qwen35 GGUF that shipped no template of its own. Verified byte-exact vs
+/// jinja2 (fixtures).
+pub const qwen35_fixed_template: []const u8 = @embedFile("assets/jinja/qwen35_fixed.jinja");
+
 pub const Template = struct {
     arena: std.heap.ArenaAllocator,
     nodes: []Node,

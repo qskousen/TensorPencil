@@ -395,6 +395,7 @@ pub const Backend = struct {
     f_embed_gather_q4_k: cu.CUfunction = null,
     f_embed_gather_q5_k: cu.CUfunction = null,
     f_embed_gather_q6_k: cu.CUfunction = null,
+    f_embed_gather_iq4_xs: cu.CUfunction = null,
 
     // f16 tensor-core VAE conv scratch (opConvF16): padded f16 weight + activation
     // and the f32 GEMM output, reused across convs.
@@ -2091,7 +2092,7 @@ pub const Backend = struct {
     /// serves both and running the wrong one is silent corruption, not a fault.
     pub fn quantKernelSupported(dt: dtypes.DType) bool {
         return switch (dt) {
-            .q4_0, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl, .q1_0, .q2_0_g64, .q2_0_g128 => true,
+            .q4_0, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_nl, .iq4_xs, .q1_0, .q2_0_g64, .q2_0_g128 => true,
             else => false,
         };
     }
@@ -2113,6 +2114,7 @@ pub const Backend = struct {
             .q5_k => try self.eltFn(elt.gemv_q5_k_ptx, "gemv_q5_k"),
             .q6_k => try self.eltFn(elt.gemv_q6_k_ptx, "gemv_q6_k"),
             .iq4_nl => try self.eltFn(elt.gemv_iq4_nl_ptx, "gemv_iq4_nl"),
+            .iq4_xs => try self.eltFn(elt.gemv_iq4_xs_ptx, "gemv_iq4_xs"),
             .q1_0 => try self.eltFn(elt.gemv_q1_0_ptx, "gemv_q1_0"),
             .q2_0_g64 => try self.eltFn(elt.gemv_q2_0_g64_ptx, "gemv_q2_0_g64"),
             .q2_0_g128 => try self.eltFn(elt.gemv_q2_0_g128_ptx, "gemv_q2_0_g128"),
@@ -2491,6 +2493,7 @@ pub const Backend = struct {
                 .q5_k => try self.eltFn(elt.dequant_q5_k_f16_ptx, "dequant_q5_k_f16"),
                 .q6_k => try self.eltFn(elt.dequant_q6_k_f16_ptx, "dequant_q6_k_f16"),
                 .iq4_nl => try self.eltFn(elt.dequant_iq4_nl_f16_ptx, "dequant_iq4_nl_f16"),
+                .iq4_xs => try self.eltFn(elt.dequant_iq4_xs_f16_ptx, "dequant_iq4_xs_f16"),
                 .q1_0 => try self.eltFn(elt.dequant_q1_0_f16_ptx, "dequant_q1_0_f16"),
                 .q2_0_g64 => try self.eltFn(elt.dequant_q2_0_g64_f16_ptx, "dequant_q2_0_g64_f16"),
                 .q2_0_g128 => try self.eltFn(elt.dequant_q2_0_g128_f16_ptx, "dequant_q2_0_g128_f16"),
@@ -3975,6 +3978,7 @@ pub const Backend = struct {
         self.f_embed_gather_q4_k = mod.getFunction(self.ctx, "embed_gather_q4_k") catch return error.CudaError;
         self.f_embed_gather_q5_k = mod.getFunction(self.ctx, "embed_gather_q5_k") catch return error.CudaError;
         self.f_embed_gather_q6_k = mod.getFunction(self.ctx, "embed_gather_q6_k") catch return error.CudaError;
+        self.f_embed_gather_iq4_xs = mod.getFunction(self.ctx, "embed_gather_iq4_xs") catch return error.CudaError;
     }
 
     /// Write the per-token dynamic state ({token id, cache position}) the
@@ -4034,6 +4038,7 @@ pub const Backend = struct {
             .q4_k => self.f_embed_gather_q4_k,
             .q5_k => self.f_embed_gather_q5_k,
             .q6_k => self.f_embed_gather_q6_k,
+            .iq4_xs => self.f_embed_gather_iq4_xs,
             else => unreachable,
         };
         try self.eltLaunch(f, w_db, x, null, null, .{ @intCast(h), 0, 0, 0, 0, 0 }, .{ 0, 0 }, h);
@@ -5154,6 +5159,12 @@ fn testQuantWeightBytes(gpa: std.mem.Allocator, dt: dtypes.DType, rows: usize, c
                 std.mem.writeInt(u16, wbytes[off + 2 ..][0..2], min16, .little);
             },
             .q6_k => std.mem.writeInt(u16, wbytes[off + 208 ..][0..2], d16, .little),
+            // iq4_xs: d at +0, and the sub-block scales are 6 bits split across
+            // scales_h (+2) and scales_l (+4). Random bytes there are fine — a
+            // scale is `ls - 32`, so every code is legal — but scales_h's top
+            // 16-6*2 bits are padding ggml never reads, so leave the random
+            // bytes as they are and only pin d.
+            .iq4_xs => std.mem.writeInt(u16, wbytes[off..][0..2], d16, .little),
             else => unreachable,
         }
     }
@@ -5374,7 +5385,7 @@ test "gemv quant kernels match CPU reference" {
     // All four weight buffers stay alive for the whole test: the device
     // weight cache is keyed by host pointer, so free-then-realloc at the
     // same address would alias a stale upload.
-    const dts = [_]dtypes.DType{ .q8_0, .q4_k, .q5_k, .q6_k };
+    const dts = [_]dtypes.DType{ .q8_0, .q4_k, .q5_k, .q6_k, .iq4_xs };
     var ws: [dts.len][]u8 = undefined;
     inline for (dts, 0..) |dt, i| ws[i] = try testQuantWeightBytes(gpa, dt, rows, cols, 100 + i);
     defer for (ws) |w| gpa.free(w);
@@ -5647,29 +5658,40 @@ test "opMatmulQuant matches CPU reference" {
     }
     try be.tensorUpload(x_d, std.mem.sliceAsBytes(x));
 
-    const w = try testQuantWeightBytes(gpa, .q4_k, rows, cols, 55);
-    defer gpa.free(w);
-    try be.opMatmulQuant(.q4_k, y_d, x_d, m, w, rows, cols);
     const y = try gpa.alloc(f32, mpad * rows);
     defer gpa.free(y);
-    try be.tensorDownload(y_d, std.mem.sliceAsBytes(y));
-
-    const row_bytes = dtypes.DType.q4_k.storageBytes(cols);
     const row_f32 = try gpa.alloc(f32, cols);
     defer gpa.free(row_f32);
-    for (0..m) |t| {
-        for (0..rows) |r| {
-            quants.dequantSlice(.q4_k, w[r * row_bytes ..][0..row_bytes], 0, cols, row_f32);
-            var acc: f64 = 0;
-            for (row_f32, 0..) |wv, c| {
-                // The GEMM rounds both operands to f16; emulate it so the
-                // reference differs only by accumulation order.
-                const wf: f32 = @floatCast(@as(f16, @floatCast(wv)));
-                const xf: f32 = @floatCast(@as(f16, @floatCast(x[t * cols + c])));
-                acc += @as(f64, wf) * xf;
+
+    // Every weight buffer stays alive for the whole test: the device weight
+    // cache is keyed by host pointer, so free-then-realloc at the same address
+    // would alias a stale upload.
+    const dts = [_]dtypes.DType{ .q4_k, .iq4_xs };
+    var ws: [dts.len][]u8 = undefined;
+    inline for (dts, 0..) |dt, i| ws[i] = try testQuantWeightBytes(gpa, dt, rows, cols, 55 + i);
+    defer for (ws) |w| gpa.free(w);
+
+    inline for (dts, 0..) |dt, i| {
+        errdefer std.debug.print("dtype {t}\n", .{dt});
+        const w = ws[i];
+        try be.opMatmulQuant(dt, y_d, x_d, m, w, rows, cols);
+        try be.tensorDownload(y_d, std.mem.sliceAsBytes(y));
+
+        const row_bytes = dt.storageBytes(cols);
+        for (0..m) |t| {
+            for (0..rows) |r| {
+                quants.dequantSlice(dt, w[r * row_bytes ..][0..row_bytes], 0, cols, row_f32);
+                var acc: f64 = 0;
+                for (row_f32, 0..) |wv, c| {
+                    // The GEMM rounds both operands to f16; emulate it so the
+                    // reference differs only by accumulation order.
+                    const wf: f32 = @floatCast(@as(f16, @floatCast(wv)));
+                    const xf: f32 = @floatCast(@as(f16, @floatCast(x[t * cols + c])));
+                    acc += @as(f64, wf) * xf;
+                }
+                const e: f32 = @floatCast(acc);
+                try std.testing.expectApproxEqAbs(e, y[t * rows + r], 0.02 + 1e-3 * @abs(e));
             }
-            const e: f32 = @floatCast(acc);
-            try std.testing.expectApproxEqAbs(e, y[t * rows + r], 0.02 + 1e-3 * @abs(e));
         }
     }
 }
@@ -5865,7 +5887,7 @@ test "embed gather quant kernels match CPU reference" {
 
     try be.setDecodeState(token, 0);
     // Weights outlive the loop: the device weight cache keys by host pointer.
-    const dts = [_]dtypes.DType{ .q8_0, .q4_k, .q5_k, .q6_k };
+    const dts = [_]dtypes.DType{ .q8_0, .q4_k, .q5_k, .q6_k, .iq4_xs };
     var ws: [dts.len][]u8 = undefined;
     inline for (dts, 0..) |dt, i| ws[i] = try testQuantWeightBytes(gpa, dt, vocab, h, 900 + i);
     defer for (ws) |w| gpa.free(w);

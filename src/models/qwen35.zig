@@ -1,6 +1,6 @@
-//! Qwen3.5/3.6 hybrid language model (GGUF arch "qwen35"): a stack where
-//! every `full_attention_interval`-th layer is gated full attention and the
-//! rest are gated-DeltaNet linear attention. Ported from llama.cpp
+//! Qwen3.5/3.6/3.8 hybrid language model (GGUF arch "qwen35" for all three): a
+//! stack where every `full_attention_interval`-th layer is gated full attention
+//! and the rest are gated-DeltaNet linear attention. Ported from llama.cpp
 //! (src/models/qwen35.cpp + delta-net-base.cpp `build_delta_net_autoregressive`).
 //!
 //! Full-attention layers (blk 3, 7, ... with interval 4): the q projection
@@ -115,8 +115,17 @@ pub const Config = struct {
                 });
             }
         }
+        // block_count counts the multi-token-prediction blocks appended past
+        // the trunk (Qwen3.6+ MTP checkpoints ship one). They are dense
+        // attention blocks with their own nextn.* tensors, used only for
+        // speculative drafting; the trunk stops before them, and counting
+        // them in would make layer 64 a linear layer with no ssm_* weights.
+        const n_blocks = try key(g, "block_count");
+        const n_nextn: usize = @intCast(g.getUint("qwen35.nextn_predict_layers") orelse 0);
+        if (n_nextn >= n_blocks) return error.UnknownModelConfig;
+
         return .{
-            .n_layers = try key(g, "block_count"),
+            .n_layers = n_blocks - n_nextn,
             .hidden = try key(g, "embedding_length"),
             .n_heads = try key(g, "attention.head_count"),
             .n_kv_heads = try key(g, "attention.head_count_kv"),
@@ -848,4 +857,63 @@ test "qwen35 loads from real qwen3.6 gguf" {
     try std.testing.expect(lm.layers[3] == .attn and lm.layers[0] == .linear);
     // Untied head: output.weight is its own tensor.
     try std.testing.expect(lm.head.bytes.ptr != lm.embed.bytes.ptr);
+}
+
+// An MTP checkpoint reports block_count including its next-token-prediction
+// blocks. Counting them as trunk layers makes the last one a linear layer with
+// no ssm_* weights, so the load fails with MissingTensor.
+test "config drops the nextn (MTP) blocks from block_count" {
+    const gpa = std.testing.allocator;
+
+    const build = struct {
+        fn f(a: std.mem.Allocator, blocks: u32, nextn: ?u32) ![]u8 {
+            var b = try gguf_mod.TestBuilder.init(a, 3, 1, if (nextn == null) 16 else 17);
+            defer b.deinit();
+            try b.kvStr("general.architecture", "qwen35");
+            try b.kvUint("qwen35.block_count", blocks);
+            if (nextn) |n| try b.kvUint("qwen35.nextn_predict_layers", n);
+            try b.kvUint("qwen35.embedding_length", 5120);
+            try b.kvUint("qwen35.attention.head_count", 24);
+            try b.kvUint("qwen35.attention.head_count_kv", 4);
+            try b.kvUint("qwen35.attention.key_length", 256);
+            try b.kvUint("qwen35.attention.value_length", 256);
+            try b.kvUint("qwen35.feed_forward_length", 17408);
+            try b.kvUint("qwen35.rope.dimension_count", 64);
+            try b.kvUint("qwen35.full_attention_interval", 4);
+            try b.kvUint("qwen35.ssm.conv_kernel", 4);
+            try b.kvUint("qwen35.ssm.state_size", 128);
+            try b.kvUint("qwen35.ssm.group_count", 16);
+            try b.kvUint("qwen35.ssm.time_step_rank", 48);
+            try b.kvUint("qwen35.ssm.inner_size", 6144);
+            // rope.dimension_sections: an i32 array [11, 11, 10, 0].
+            try b.str("qwen35.rope.dimension_sections");
+            try b.int(u32, 9);
+            try b.int(u32, 5);
+            try b.int(u64, 4);
+            for ([4]i32{ 11, 11, 10, 0 }) |v| try b.int(u32, @bitCast(v));
+            // Only its rank/shape is read (vocab); a token-sized stand-in is enough.
+            try b.tensor("token_embd.weight", &.{ 4, 8 }, 0, 0);
+            return b.finish(&@as([8 * 4 * 4]u8, @splat(0)));
+        }
+    }.f;
+
+    {
+        const file = try build(gpa, 65, 1);
+        defer gpa.free(file);
+        var g = try gguf_mod.Gguf.initFromSlice(gpa, file);
+        defer g.deinit();
+        const cfg = try Config.detect(&g);
+        try std.testing.expectEqual(@as(usize, 64), cfg.n_layers);
+        try std.testing.expectEqual(@as(usize, 16), cfg.nAttnLayers());
+        try std.testing.expect(!cfg.isRecurrent(63));
+    }
+    {
+        // No MTP blocks: block_count is the trunk depth as-is.
+        const file = try build(gpa, 64, null);
+        defer gpa.free(file);
+        var g = try gguf_mod.Gguf.initFromSlice(gpa, file);
+        defer g.deinit();
+        const cfg = try Config.detect(&g);
+        try std.testing.expectEqual(@as(usize, 64), cfg.n_layers);
+    }
 }

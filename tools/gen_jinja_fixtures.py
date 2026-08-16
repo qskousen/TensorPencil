@@ -6,7 +6,8 @@ The fixture file that `test "jinja: golden fixtures render byte-exact vs jinja2"
 reads is a set of (template, context) -> expected-output triples. This script
 appends one template's worth of them, taking the template straight out of a GGUF
 so the thing under test is the template a render actually uses, not a
-hand-transcribed copy of it.
+hand-transcribed copy of it. A standalone .jinja file works too, for the
+templates we embed as assets rather than read from a checkpoint.
 
 It also RE-RENDERS every pre-existing case and refuses to write if any of them
 now disagrees with jinja2. That guards the one thing a generator can silently get
@@ -15,7 +16,7 @@ existing goldens would quietly move the goalposts for the whole suite.
 
 Needs jinja2 (e.g. /home/qt/genai/ai-toolkit/venv/bin/python).
 
-    python3 tools/gen_jinja_fixtures.py <model.gguf> <template-name>
+    python3 tools/gen_jinja_fixtures.py <model.gguf | template.jinja> <template-name>
 """
 
 import json
@@ -126,6 +127,22 @@ THOUGHT_HISTORY = [
     {"role": "user", "content": "Bye"},
 ]
 
+# The same history in the ChatML dialect, where a prior turn's reasoning is
+# stored as `<think>...</think>` INSIDE the assistant content. Qwen templates
+# split it back out; the `<|channel>` history above reads to them as opaque
+# text, so only this one exercises the extraction and the preserve/drop choice
+# that depends on it.
+THINK_TAG_HISTORY = [
+    {"role": "user", "content": "Hi"},
+    {
+        "role": "assistant",
+        "content": "<think>\nThe user greeted me. I'll greet back.\n</think>\n\nHello there!",
+    },
+    {"role": "user", "content": "Thanks"},
+    {"role": "assistant", "content": "<think>\nStill polite.\n</think>\n\nYou are welcome."},
+    {"role": "user", "content": "Bye"},
+]
+
 # Tool-call argument values chosen so the two `args_value` spellings DISAGREE.
 #   old: `... | tojson if mapping or (sequence and not string) else ... | string`
 #   new: `... | string if string else ... | tojson`
@@ -162,14 +179,17 @@ def cases_for(name):
     for label in ("think_on", "think_off", "default"):
         kw = {} if label == "default" else {"enable_thinking": label == "think_on"}
         add(f"thought_history__{label}", messages=THOUGHT_HISTORY, **kw)
+        add(f"think_tag_history__{label}", messages=THINK_TAG_HISTORY, **kw)
 
-    # Delta 1: `preserve_thinking`. Undefined / false must drop the thoughts of
-    # every turn at or before the last user query; true must keep all of them.
-    # Needs a MULTI-turn thought history — with one assistant turn the two
-    # branches produce the same text.
-    add("preserve_thinking_true", messages=THOUGHT_HISTORY, preserve_thinking=True)
-    add("preserve_thinking_false", messages=THOUGHT_HISTORY, preserve_thinking=False)
-    add("preserve_thinking_absent", messages=THOUGHT_HISTORY)
+    # Delta 1: `preserve_thinking`. False drops the thoughts of every turn at or
+    # before the last user query; true keeps all of them. Which one `absent`
+    # means is the template's choice. Needs a MULTI-turn thought history — with
+    # one assistant turn the two branches produce the same text — and is run
+    # over both dialects, since a template only sees the one it parses.
+    for tag, msgs in (("", THOUGHT_HISTORY), ("think_tag_", THINK_TAG_HISTORY)):
+        add(f"{tag}preserve_thinking_true", messages=msgs, preserve_thinking=True)
+        add(f"{tag}preserve_thinking_false", messages=msgs, preserve_thinking=False)
+        add(f"{tag}preserve_thinking_absent", messages=msgs)
 
     # Delta 2: tool-call argument stringification (see TOOL_CALL_ARGS).
     add("tools_decl", messages=user, tools=TOOLS)
@@ -223,9 +243,12 @@ def env():
 def main():
     if len(sys.argv) != 3:
         raise SystemExit(__doc__)
-    gguf_path, name = sys.argv[1], sys.argv[2]
+    src_path, name = Path(sys.argv[1]), sys.argv[2]
 
-    tmpl_src = read_chat_template(gguf_path)
+    if src_path.suffix == ".jinja":
+        tmpl_src = src_path.read_text()
+    else:
+        tmpl_src = read_chat_template(src_path)
     data = json.loads(FIXTURES.read_text())
     e = env()
 
@@ -252,26 +275,39 @@ def main():
         data["cases"].append(c)
         added += 1
 
-    # Teeth check for the two deltas: each pair must actually differ, or the case
-    # is not testing what its name claims.
+    # Teeth check for the two deltas. Which WAY a template resolves them is the
+    # template's business (froggeric's fixed Qwen template preserves thoughts by
+    # default where the official Qwen 3.6 one drops them); what the corpus must
+    # do is tell the settings apart at all.
     by_key = {c["key"]: c["expected"] for c in data["cases"]}
-    checks = [
-        (f"{name}__preserve_thinking_true", f"{name}__preserve_thinking_absent"),
-        (f"{name}__preserve_thinking_true", f"{name}__preserve_thinking_false"),
-    ]
-    for a, b in checks:
-        if by_key[a] == by_key[b]:
-            raise SystemExit(f"no teeth: {a} and {b} render identically")
+    distinguished = False
+    for tag in ("", "think_tag_"):
+        on, off, absent = (by_key[f"{name}__{tag}preserve_thinking_{k}"] for k in ("true", "false", "absent"))
+        if on == off:
+            continue
+        distinguished = True
+        if absent == on:
+            print(f"  {tag or 'channel_'}history: preserve_thinking defaults to true (thoughts kept)")
+        elif absent == off:
+            print(f"  {tag or 'channel_'}history: preserve_thinking defaults to false (thoughts dropped)")
+        else:
+            raise SystemExit(f"{name}__{tag}preserve_thinking_absent matches neither true nor false")
+    if not distinguished:
+        raise SystemExit(f"no teeth: no {name} thought history tells preserve_thinking true from false")
+
     # Arguments render as `<parameter=k>\n<value>\n</parameter>`, so the
     # discriminator is the bare value: `tojson` gives true/null where Python's
-    # str() (the older spelling) gives True/None.
+    # str() (the older spelling) gives True/None. Both spellings are in the
+    # wild; the case has teeth as long as the render commits to one of them.
     args_out = by_key[f"{name}__tool_call_args"]
-    for needle in ("<parameter=verbose>\ntrue\n", "<parameter=note>\nnull\n"):
-        if needle not in args_out:
+    for key, json_val, str_val in (("verbose", "true", "True"), ("note", "null", "None")):
+        got = [v for v in (json_val, str_val) if f"<parameter={key}>\n{v}\n" in args_out]
+        if len(got) != 1:
             raise SystemExit(
-                f"no teeth: {needle!r} missing from the tool-call render — the args "
-                f"spelling would be indistinguishable from the older one"
+                f"no teeth: <parameter={key}> is neither {json_val!r} nor {str_val!r} in the "
+                f"tool-call render — the args spelling is not pinned"
             )
+        print(f"  tool-call {key} renders as {got[0]!r}")
 
     FIXTURES.write_text(json.dumps(data, indent=1, ensure_ascii=False) + "\n")
     print(f"wrote {added} '{name}' cases to {FIXTURES.relative_to(REPO)} ({len(data['cases'])} total)")

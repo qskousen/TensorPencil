@@ -63,6 +63,11 @@ const usage =
     \\the model emits a thought block before its answer. --no-think disables it
     \\(the turn is primed with an empty thought so the model answers directly);
     \\--think forces it on. No effect on non-reasoning models (e.g. Gemma 3).
+    \\--canonical-template ignores the model's own embedded chat template and
+    \\renders a known-good one instead: Google's upstream template for Gemma 4,
+    \\froggeric's fixed template for Qwen 3.5/3.6/3.8. For finetunes and
+    \\requantizations shipping an older or altered variant. A file carrying no
+    \\template at all already gets the stand-in without this flag.
     \\--spec-k enables speculative decoding (prompt-lookup drafting, up to n
     \\tokens verified per forward; lossless — same output distribution).
     \\--draft-model drafts with a smaller model instead (e.g. Qwen3-0.6B;
@@ -104,10 +109,13 @@ const usage =
     \\
 ;
 
-/// `--canonical-template`: for gemma4, render Google's upstream canonical chat
-/// template instead of the model's embedded one (some finetunes ship an older
-/// variant). Set in `main`'s arg loop, read by `runGemma4`.
-var g_canonical_gemma4: bool = false;
+/// `--canonical-template`: render a known-good chat template instead of the
+/// model's embedded one, for finetunes and requantizations that ship an older
+/// or altered variant. Google's upstream one for gemma4, froggeric's fixed one
+/// for qwen35. Set in `main`'s arg loop, read by `runGemma4` / `runQwen35`.
+/// A checkpoint carrying NO template at all does not need this: `fromGguf`
+/// already stands one in where it can.
+var g_canonical_template: bool = false;
 
 pub fn main(init: std.process.Init) !void {
     const arena: std.mem.Allocator = init.arena.allocator();
@@ -211,7 +219,7 @@ pub fn main(init: std.process.Init) !void {
                 return error.InvalidArgument;
             };
         } else if (std.mem.eql(u8, a, "--canonical-template")) {
-            g_canonical_gemma4 = true;
+            g_canonical_template = true;
         } else if (std.mem.eql(u8, a, "--spec-k")) {
             opts.spec_k = try std.fmt.parseInt(usize, try nextArg(args, &i), 10);
         } else if (std.mem.eql(u8, a, "--tree")) {
@@ -739,7 +747,7 @@ fn setupChatTemplate(arena: std.mem.Allocator, g: *const TensorPencil.Gguf, tok:
 }
 
 /// As `setupChatTemplate`, but `override_src` (when non-null) replaces the
-/// model's embedded template, used by the gemma4 canonical-template override.
+/// model's embedded template, used by the `--canonical-template` override.
 fn setupChatTemplateEx(arena: std.mem.Allocator, g: *const TensorPencil.Gguf, tok: *const TensorPencil.tokenizer.Tokenizer, system: ?[]const u8, override_src: ?[]const u8) void {
     llm.chat_template.active = if (override_src) |src|
         (llm.chat_template.ChatTemplate.fromSource(arena, src) catch null)
@@ -1532,7 +1540,7 @@ fn runQwen35(
     var tok = try TensorPencil.tokenizer.Tokenizer.initFromGguf(arena, g);
     defer tok.deinit();
     llm.chat.applyTokenizer(&tok);
-    setupChatTemplate(arena, g, &tok, system);
+    setupChatTemplateEx(arena, g, &tok, system, if (g_canonical_template) llm.chat_template.ChatTemplate.qwen35_fixed_src else null);
 
     // Hybrid CPU/GPU layer split (--cpu-layers / --offload-grow): CUDA-only,
     // needs a budget as the VRAM ceiling, and text-only (the CPU path uses
@@ -1625,8 +1633,10 @@ fn runQwen35(
     // For an image one-shot, the tokens before/after the embedding block are
     // tracked so prefill can interleave them with prefillImage.
     var n_pre: usize = 0;
-    try llm.chat.appendSystem(&tok, gpa, system, &ids);
     if (img) |*e| {
+        // Hand glue, not the template: the image block has to be spliced in as
+        // pad rows at a known offset, which a rendered string cannot express.
+        try llm.chat.appendSystem(&tok, gpa, system, &ids);
         try tok.encode(gpa, "<|im_start|>user\n<|vision_start|>", &ids);
         n_pre = ids.items.len;
         // Placeholders keep ids aligned with cache rows (sampling penalties
@@ -1637,8 +1647,12 @@ fn runQwen35(
         try tok.encode(gpa, prompt.?, &ids);
         try tok.encode(gpa, "<|im_end|>\n<|im_start|>assistant\n", &ids);
     } else if (prompt) |p| {
-        try llm.chat.appendUser(&tok, gpa, p, &ids);
-        try llm.chat.openAssistant(&tok, gpa, &ids);
+        // Through the chat template, the same source of truth the interactive
+        // `renderDrivenChat` below uses, so a one-shot and a chat first turn
+        // agree. Falls back to the hand glue when there is no template.
+        try appendOneShotPrompt(&tok, gpa, system, p, &ids);
+    } else {
+        try llm.chat.appendSystem(&tok, gpa, system, &ids);
     }
 
     try stdout.print("[{s} backend, qwen35 {d}L hybrid, {d} prompt tokens, ctx window {d}, max {d} new/turn, temp {d:.2}, seed {d}]\n", .{
@@ -1969,7 +1983,7 @@ fn runGemma4(
     defer tok.deinit();
     llm.chat.applyTokenizer(&tok);
     llm.chat.setFamily(.gemma4);
-    setupChatTemplateEx(arena, g, &tok, system, if (g_canonical_gemma4) llm.chat_template.ChatTemplate.gemma4_canonical_src else null);
+    setupChatTemplateEx(arena, g, &tok, system, if (g_canonical_template) llm.chat_template.ChatTemplate.gemma4_canonical_src else null);
 
     // CUDA backend created up front so the vision embedder can encode
     // device-side (the LLM claims VRAM after). Null on cpu. A 0 budget pins the

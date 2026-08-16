@@ -1652,6 +1652,87 @@ pub const gemv_iq4_nl_ptx: [:0]const u8 =
     \\}
 ;
 
+/// ggml IQ4_XS GEMV, warp-per-row (8 rows per 256-thread block; same shape as
+/// gemv_iq4_nl). iq4_nl's codebook over a 256-element super-block of 136 B:
+/// f16 d, u16 scales_h, 4 B scales_l, 128 nibble bytes. Each of the 8
+/// 32-element sub-blocks has a 6-bit scale split across the two scale fields,
+/// biased by -32, so dl = d * (ls - 32). A lane walks the row's qs BYTES:
+/// byte bb of super-block sb covers elements sb*256 + (bb>>4)*32 + (bb&15)
+/// (low nibble) and +16 (high nibble). Launch grid = ceil(rows/8).
+/// b0=W, b1=x, b2=y. u0=rows, u1=cols, f0=scale.
+pub const gemv_iq4_xs_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry gemv_iq4_xs(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<4>;
+    \\  .reg .b16 %h<2>;
+    \\  .reg .b32 %r<36>;
+    \\  .reg .f32 %f<16>;
+    \\  .reg .b64 %rd<22>;
+    \\  .shared .align 4 .b8 kvsh[16];         // kvalues_iq4nl LUT (see gemv_iq4_nl)
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r3,%tid.x;
+    \\  setp.ne.u32 %p1,%r3,0; @%p1 bra INITD; // thread 0 fills the shared LUT
+    \\  mov.u32 %r9,kvsh;
+    \\  mov.u32 %r10,0xBFAD9881; st.shared.u32 [%r9],%r10;      // kv0..3
+    \\  mov.u32 %r10,0xF6EADDCF; st.shared.u32 [%r9+4],%r10;    // kv4..7
+    \\  mov.u32 %r10,0x26190D01; st.shared.u32 [%r9+8],%r10;    // kv8..11
+    \\  mov.u32 %r10,0x71594535; st.shared.u32 [%r9+12],%r10;   // kv12..15
+    \\INITD:
+    \\  bar.sync 0;                            // all threads (before the bounds bail)
+    \\  shr.u32 %r5,%r3,5;                     // warp
+    \\  and.b32 %r6,%r3,31;                    // lane
+    \\  shl.b32 %r20,%r1,3; add.u32 %r7,%r20,%r5;          // row = ctaid*8 + warp
+    \\  ld.param.u32 %r2,[u0]; setp.ge.u32 %p1,%r7,%r2; @%p1 bra END;
+    \\  ld.param.u32 %r4,[u1];                 // cols
+    \\  ld.param.f32 %f1,[f0];                 // scale
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
+    \\  shr.u32 %r18,%r4,8; mul.lo.u32 %r19,%r18,136;      // row bytes = cols/256*136
+    \\  mul.wide.u32 %rd7,%r7,%r19; add.s64 %rd8,%rd1,%rd7; // W row base
+    \\  mov.f32 %f3,0f00000000;                // acc
+    \\  shr.u32 %r21,%r4,1;                    // nbytes = cols/2
+    \\  mov.u32 %r12,kvsh;                     // shared LUT base
+    \\  mov.u32 %r8,%r6;                       // g = lane
+    \\LOOP:
+    \\  setp.ge.u32 %p2,%r8,%r21; @%p2 bra RED;
+    \\  shr.u32 %r9,%r8,7;                     // sb = g / 128 (qs bytes per super-block)
+    \\  mul.lo.u32 %r10,%r9,136; cvt.u64.u32 %rd9,%r10; add.s64 %rd10,%rd8,%rd9;  // &super-block
+    \\  ld.global.b16 %h0,[%rd10]; cvt.f32.f16 %f6,%h0;    // d
+    \\  and.b32 %r11,%r8,127;                  // bb
+    \\  shr.u32 %r24,%r11,4;                   // ib (sub-block 0..7)
+    \\  shr.u32 %r25,%r24,1; cvt.u64.u32 %rd11,%r25; add.s64 %rd12,%rd10,%rd11;
+    \\  ld.global.u8 %r26,[%rd12+4];           // scales_l[ib>>1]
+    \\  and.b32 %r27,%r24,1; shl.b32 %r27,%r27,2; shr.u32 %r26,%r26,%r27; and.b32 %r26,%r26,15;
+    \\  ld.global.u16 %r28,[%rd10+2];          // scales_h
+    \\  shl.b32 %r29,%r24,1; shr.u32 %r28,%r28,%r29; and.b32 %r28,%r28,3; shl.b32 %r28,%r28,4;
+    \\  or.b32 %r26,%r26,%r28; sub.s32 %r26,%r26,32;       // ls - 32
+    \\  cvt.rn.f32.s32 %f10,%r26; mul.f32 %f6,%f6,%f10;    // dl
+    \\  cvt.u64.u32 %rd13,%r11; add.s64 %rd14,%rd10,%rd13; ld.global.u8 %r13,[%rd14+8];  // qs byte
+    \\  and.b32 %r14,%r13,15; add.u32 %r22,%r14,%r12; ld.shared.s8 %r14,[%r22]; cvt.rn.f32.s32 %f7,%r14; mul.f32 %f7,%f7,%f6;  // kv[lo]*dl
+    \\  shr.u32 %r15,%r13,4; add.u32 %r22,%r15,%r12; ld.shared.s8 %r15,[%r22]; cvt.rn.f32.s32 %f8,%r15; mul.f32 %f8,%f8,%f6;   // kv[hi]*dl
+    \\  and.b32 %r30,%r11,15;
+    \\  shl.b32 %r16,%r9,8; shl.b32 %r31,%r24,5; add.u32 %r16,%r16,%r31; add.u32 %r16,%r16,%r30;  // elo
+    \\  mul.wide.u32 %rd15,%r16,4; add.s64 %rd16,%rd2,%rd15; ld.global.f32 %f4,[%rd16];  // act_lo
+    \\  add.u32 %r17,%r16,16; mul.wide.u32 %rd17,%r17,4; add.s64 %rd18,%rd2,%rd17; ld.global.f32 %f5,[%rd18];  // act_hi
+    \\  fma.rn.f32 %f3,%f7,%f4,%f3; fma.rn.f32 %f3,%f8,%f5,%f3;
+    \\  add.u32 %r8,%r8,32; bra LOOP;
+    \\RED:
+    \\  mov.b32 %r22,%f3; shfl.sync.bfly.b32 %r23,%r22,16,0x1f,0xffffffff; mov.b32 %f9,%r23; add.f32 %f3,%f3,%f9;
+    \\  mov.b32 %r22,%f3; shfl.sync.bfly.b32 %r23,%r22,8,0x1f,0xffffffff;  mov.b32 %f9,%r23; add.f32 %f3,%f3,%f9;
+    \\  mov.b32 %r22,%f3; shfl.sync.bfly.b32 %r23,%r22,4,0x1f,0xffffffff;  mov.b32 %f9,%r23; add.f32 %f3,%f3,%f9;
+    \\  mov.b32 %r22,%f3; shfl.sync.bfly.b32 %r23,%r22,2,0x1f,0xffffffff;  mov.b32 %f9,%r23; add.f32 %f3,%f3,%f9;
+    \\  mov.b32 %r22,%f3; shfl.sync.bfly.b32 %r23,%r22,1,0x1f,0xffffffff;  mov.b32 %f9,%r23; add.f32 %f3,%f3,%f9;
+    \\  setp.ne.u32 %p3,%r6,0; @%p3 bra END;
+    \\  mul.f32 %f3,%f3,%f1;
+    \\  mul.wide.u32 %rd19,%r7,4; add.s64 %rd20,%rd3,%rd19; st.global.f32 [%rd20],%f3;
+    \\END:
+    \\  ret;
+    \\}
+;
+
 /// ggml q4_k GEMV: y[row] = scale * dot(W[row], x), W q4_k [rows][cols/256
 /// super-blocks of 144 B: f16 d, f16 dmin, 12 B 6-bit sub-block scales/mins,
 /// 128 B nibbles]. Phase 1 decodes every sub-block's (d*sc, dmin*m) pair
@@ -6539,6 +6620,55 @@ pub const dequant_iq4_nl_f16_ptx: [:0]const u8 =
     \\}
 ;
 
+/// IQ4_XS -> f16 dequant (prefill GEMM path): iq4_nl's codebook over a 256-elem
+/// super-block of 136 B (f16 d, u16 scales_h, 4 B scales_l, 128 nibble bytes).
+/// Element j of the super-block sits in sub-block ib = j>>5, whose 6-bit scale
+/// is split across scales_l (low 4) and scales_h (high 2) and biased by -32.
+/// Its nibble is the low half of qs[ib*16 + (j&15)] when j&16 == 0, the high
+/// half otherwise. One thread per output element. b0=W(iq4_xs), b1=out(f16),
+/// u0=count.
+pub const dequant_iq4_xs_f16_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.const .align 1 .b8 kv_iq4xs[16] = {129,152,173,191,207,221,234,246,1,13,25,38,53,69,89,113};
+    \\.visible .entry dequant_iq4_xs_f16(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<3>;
+    \\  .reg .b32 %r<28>;
+    \\  .reg .f32 %f<6>;
+    \\  .reg .b16 %h<3>;
+    \\  .reg .b64 %rd<16>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2;
+    \\  shr.u32 %r6,%r4,8; mul.wide.u32 %rd4,%r6,136; add.s64 %rd5,%rd1,%rd4;  // &super-block
+    \\  ld.global.b16 %h0,[%rd5]; cvt.f32.f16 %f1,%h0;                         // d
+    \\  and.b32 %r7,%r4,255;                                                   // j
+    \\  shr.u32 %r8,%r7,5;                                                     // ib
+    \\  shr.u32 %r9,%r8,1; cvt.u64.u32 %rd6,%r9; add.s64 %rd7,%rd5,%rd6;
+    \\  ld.global.u8 %r10,[%rd7+4];                                            // scales_l[ib>>1]
+    \\  and.b32 %r11,%r8,1; shl.b32 %r11,%r11,2; shr.u32 %r10,%r10,%r11; and.b32 %r10,%r10,15;
+    \\  ld.global.u16 %r12,[%rd5+2];                                           // scales_h
+    \\  shl.b32 %r13,%r8,1; shr.u32 %r12,%r12,%r13; and.b32 %r12,%r12,3; shl.b32 %r12,%r12,4;
+    \\  or.b32 %r14,%r10,%r12; sub.s32 %r14,%r14,32;                           // ls - 32
+    \\  cvt.rn.f32.s32 %f2,%r14; mul.f32 %f1,%f1,%f2;                          // dl
+    \\  shl.b32 %r15,%r8,4; and.b32 %r16,%r7,15; add.u32 %r15,%r15,%r16;       // qs byte index
+    \\  cvt.u64.u32 %rd8,%r15; add.s64 %rd9,%rd5,%rd8;
+    \\  ld.global.u8 %r17,[%rd9+8];                                            // qs byte
+    \\  and.b32 %r18,%r7,16; setp.eq.u32 %p2,%r18,0;                           // low nibble?
+    \\  shr.u32 %r19,%r17,4; and.b32 %r20,%r17,15; selp.b32 %r21,%r20,%r19,%p2;
+    \\  mov.u64 %rd12,kv_iq4xs; cvt.u64.u32 %rd13,%r21; add.s64 %rd13,%rd12,%rd13; ld.const.s8 %r22,[%rd13]; cvt.rn.f32.s32 %f3,%r22;
+    \\  mul.f32 %f4,%f3,%f1;
+    \\  cvt.rn.f16.f32 %h1,%f4;
+    \\  mul.wide.u32 %rd10,%r4,2; add.s64 %rd11,%rd2,%rd10; st.global.b16 [%rd11],%h1;
+    \\END:
+    \\  ret;
+    \\}
+;
+
 /// Dequantize ggml q4_k weights to f16: element e -> super-block e>>8 (144 B),
 /// sub-block scale/min via get_scale_min_k4, nibble from byte
 /// (j>>6)*32 + (j&31); out = f16(d*sc*q - dmin*m). cols % 256 == 0.
@@ -7318,6 +7448,47 @@ pub const decode_state_ptx: [:0]const u8 =
     \\  shr.u32 %r17,%r17,%r20; and.b32 %r17,%r17,15;
     \\  shr.u32 %r19,%r19,%r21; and.b32 %r19,%r19,3; shl.b32 %r19,%r19,4;
     \\  or.b32 %r17,%r17,%r19; sub.s32 %r17,%r17,32; cvt.rn.f32.s32 %f4,%r17;
+    \\  mul.f32 %f5,%f3,%f4;
+    \\  mul.wide.u32 %rd13,%r4,4; add.s64 %rd14,%rd2,%rd13; st.global.f32 [%rd14],%f5;
+    \\END:
+    \\  ret;
+    \\}
+    \\
+    \\// x[i] = dequant_iq4_xs(embed[g_state[0]], i); b0=embed(iq4_xs), b1=x, u0=hidden
+    \\.const .align 1 .b8 kv_eg_iq4xs[16] = {129,152,173,191,207,221,234,246,1,13,25,38,53,69,89,113};
+    \\.visible .entry embed_gather_iq4_xs(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<3>;
+    \\  .reg .b32 %r<28>;
+    \\  .reg .f32 %f<8>;
+    \\  .reg .b16 %h<2>;
+    \\  .reg .b64 %rd<18>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.global.u32 %r6,[g_state];
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2;
+    \\  shr.u32 %r7,%r5,8; mul.lo.u32 %r7,%r7,136;                            // row bytes
+    \\  mul.wide.u32 %rd3,%r6,%r7; add.s64 %rd4,%rd1,%rd3;                    // row base
+    \\  shr.u32 %r8,%r4,8; mul.lo.u32 %r8,%r8,136; cvt.u64.u32 %rd5,%r8; add.s64 %rd6,%rd4,%rd5;
+    \\  ld.global.b16 %h0,[%rd6]; cvt.f32.f16 %f1,%h0;                        // d
+    \\  and.b32 %r9,%r4,255;                                                  // j
+    \\  shr.u32 %r10,%r9,5;                                                   // ib
+    \\  shr.u32 %r11,%r10,1; cvt.u64.u32 %rd7,%r11; add.s64 %rd8,%rd6,%rd7;
+    \\  ld.global.u8 %r12,[%rd8+4];                                           // scales_l[ib>>1]
+    \\  and.b32 %r13,%r10,1; shl.b32 %r13,%r13,2; shr.u32 %r12,%r12,%r13; and.b32 %r12,%r12,15;
+    \\  ld.global.u16 %r14,[%rd6+2];                                          // scales_h
+    \\  shl.b32 %r15,%r10,1; shr.u32 %r14,%r14,%r15; and.b32 %r14,%r14,3; shl.b32 %r14,%r14,4;
+    \\  or.b32 %r16,%r12,%r14; sub.s32 %r16,%r16,32;                          // ls - 32
+    \\  cvt.rn.f32.s32 %f2,%r16; mul.f32 %f3,%f1,%f2;                         // dl
+    \\  shl.b32 %r17,%r10,4; and.b32 %r18,%r9,15; add.u32 %r17,%r17,%r18;
+    \\  cvt.u64.u32 %rd9,%r17; add.s64 %rd10,%rd6,%rd9;
+    \\  ld.global.u8 %r19,[%rd10+8];                                          // qs byte
+    \\  and.b32 %r20,%r9,16; setp.eq.u32 %p2,%r20,0;
+    \\  shr.u32 %r21,%r19,4; and.b32 %r22,%r19,15; selp.b32 %r23,%r22,%r21,%p2;
+    \\  mov.u64 %rd15,kv_eg_iq4xs; cvt.u64.u32 %rd16,%r23; add.s64 %rd16,%rd15,%rd16;
+    \\  ld.const.s8 %r24,[%rd16]; cvt.rn.f32.s32 %f4,%r24;
     \\  mul.f32 %f5,%f3,%f4;
     \\  mul.wide.u32 %rd13,%r4,4; add.s64 %rd14,%rd2,%rd13; st.global.f32 [%rd14],%f5;
     \\END:

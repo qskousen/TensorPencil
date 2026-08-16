@@ -180,9 +180,17 @@ pub const ChatTemplate = struct {
     tmpl: jinja.Template,
 
     /// Load the embedded `tokenizer.chat_template`; null if the GGUF has none
-    /// (caller falls back to the hand glue).
+    /// and no stand-in covers its architecture (caller falls back to the hand
+    /// glue). Quantizers do drop the template: the Qwen3.8 27B q4_k_m builds
+    /// ship none, and generic ChatML glue costs those models their thinking
+    /// block and tool format, so a qwen35 checkpoint without one gets
+    /// `qwen35Fixed` rather than nothing.
     pub fn fromGguf(gpa: std.mem.Allocator, g: *const Gguf) !?ChatTemplate {
-        const src = g.getStr("tokenizer.chat_template") orelse return null;
+        const src = g.getStr("tokenizer.chat_template") orelse {
+            const arch = g.getStr("general.architecture") orelse return null;
+            if (!std.mem.eql(u8, arch, "qwen35")) return null;
+            return try qwen35Fixed(gpa);
+        };
         return .{ .tmpl = try jinja.Template.parse(gpa, src) };
     }
 
@@ -199,6 +207,19 @@ pub const ChatTemplate = struct {
 
     pub fn gemma4Canonical(gpa: std.mem.Allocator) !ChatTemplate {
         return fromSource(gpa, gemma4_canonical_src);
+    }
+
+    /// froggeric's fixed Qwen template (v22), one template for every Qwen
+    /// 3.5 / 3.6 / 3.8 size. Against the official ones it keeps prior-turn
+    /// thoughts by default (so the prefix KV cache survives a turn), emits no
+    /// `<think></think>` block when a turn has no reasoning to replay, honors
+    /// `enable_thinking=false` on 3.8 (whose own template raises instead), and
+    /// takes tool-call arguments as a string or a mapping. Byte-exact vs jinja2
+    /// (golden fixtures).
+    pub const qwen35_fixed_src = jinja.qwen35_fixed_template;
+
+    pub fn qwen35Fixed(gpa: std.mem.Allocator) !ChatTemplate {
+        return fromSource(gpa, qwen35_fixed_src);
     }
 
     pub fn deinit(self: *ChatTemplate) void {

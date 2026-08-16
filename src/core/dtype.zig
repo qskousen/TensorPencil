@@ -57,6 +57,13 @@ pub const DType = enum {
     q5_k, // 256 elems / 176 B: q4_k + 32 B high bits
     q6_k, // 256 elems / 210 B: 128 B low nibbles + 64 B high 2-bits + 16 x i8 scales + f16 d
     iq4_nl, // 32 elems / 18 B: f16 d + 16 B nibbles; v = d * kvalues_iq4nl[nibble] (non-linear LUT)
+    /// 256 elems / 136 B: f16 d + u16 scales_h + 4 B scales_l + 128 B nibbles.
+    /// iq4_nl's codebook over a k-quant super-block: eight 32-element sub-blocks,
+    /// each with a 6-bit scale split across scales_l (low 4) and scales_h (high 2),
+    /// biased by -32. Within a sub-block the 16 bytes' LOW nibbles are elements
+    /// 0..15 and their HIGH nibbles are 16..31, which is not the interleave q4_0
+    /// and iq4_nl use.
+    iq4_xs,
     /// 128 elems / 18 B: f16 d + 16 B of sign bits; v = bit ? d : -d. One bit per
     /// weight (1.125 bpw including the scale), the *sign* of the weight times the
     /// block's mean absolute value. Note the two ways this differs from every other
@@ -142,6 +149,7 @@ pub const DType = enum {
             .q5_k => .{ .byte_size = null, .bit_size = null, .block_elems = 256, .block_bytes = 176 },
             .q6_k => .{ .byte_size = null, .bit_size = null, .block_elems = 256, .block_bytes = 210 },
             .iq4_nl => .{ .byte_size = null, .bit_size = null, .block_elems = 32, .block_bytes = 18 },
+            .iq4_xs => .{ .byte_size = null, .bit_size = null, .block_elems = 256, .block_bytes = 136 },
             .q1_0 => .{ .byte_size = null, .bit_size = null, .block_elems = 128, .block_bytes = 18 },
             .q2_0_g64 => .{ .byte_size = null, .bit_size = null, .block_elems = 64, .block_bytes = 18 },
             .q2_0_g128 => .{ .byte_size = null, .bit_size = null, .block_elems = 128, .block_bytes = 34 },

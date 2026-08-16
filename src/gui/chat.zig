@@ -418,6 +418,11 @@ pub const Options = struct {
     /// Load-time (which template the session parses); a toggle triggers a
     /// transcript-preserving reload.
     gemma4_canonical_template: bool = false,
+    /// Replace a Qwen 3.5/3.6/3.8 model's OWN embedded chat_template with
+    /// froggeric's fixed one (chat_template.qwen35Fixed). Ignored for every
+    /// other arch, including plain qwen3, which is a different template.
+    /// Load-time; a toggle triggers a transcript-preserving reload.
+    qwen35_fixed_template: bool = true,
 };
 
 /// Resolve the configured per-reply token cap against the session's context
@@ -463,6 +468,7 @@ pub fn sessionOptions(arena: std.mem.Allocator, cfg: *const config.Config, seed:
         .max_new_tokens = cfg.max_new_tokens,
         .vision_budget_tokens = cfg.vision_budget.tokens(),
         .gemma4_canonical_template = cfg.gemma4_canonical_template,
+        .qwen35_fixed_template = cfg.qwen35_fixed_template,
     };
 }
 
@@ -996,10 +1002,13 @@ pub const Session = struct {
         // text AND vision turns (the render's image placeholders expand to the
         // real pad-row block, embeddings spliced in during prefill, see
         // `buildRenderedTurn`). A model without an embedded template keeps the
-        // hand glue. The gemma4-canonical override swaps in Google's upstream
-        // template (for finetunes shipping an older/stripped one).
+        // hand glue. The two overrides swap in a known-good template instead of
+        // the model's own: Google's upstream one for gemma4 finetunes shipping
+        // an older/stripped variant, froggeric's fixed one for qwen35.
         self.template = if (cfg.gemma4_canonical_template and self.arch == .gemma4)
             (chat_template.ChatTemplate.gemma4Canonical(arena) catch null)
+        else if (cfg.qwen35_fixed_template and self.arch == .qwen35)
+            (chat_template.ChatTemplate.qwen35Fixed(arena) catch null)
         else
             (chat_template.ChatTemplate.fromGguf(arena, &self.gguf) catch null);
         self.bos_str = if (self.tok.bos) |b| (self.tok.decodeAlloc(gpa, &.{b}) catch "") else "";

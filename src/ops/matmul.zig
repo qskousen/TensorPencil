@@ -197,7 +197,7 @@ pub const Error = error{ UnsupportedDType, QuantBackendUnavailable, OutOfMemory 
 pub fn supportsDType(dt: DType) bool {
     return switch (dt) {
         .f8_e4m3, .bf16, .f16, .f32, .i8, .i4, .w4a8, .nvfp4 => true,
-        .q4_0, .q8_0, .q2_k, .q4_k, .q5_k, .q6_k, .iq4_nl, .q1_0, .q2_0_g64 => have_ggml,
+        .q4_0, .q8_0, .q2_k, .q4_k, .q5_k, .q6_k, .iq4_nl, .iq4_xs, .q1_0, .q2_0_g64 => have_ggml,
         // q2_0_g128 decodes natively (quants.dequantQ2_0G128), so it needs no ggml.
         .q2_0_g128 => true,
         else => false,
@@ -256,7 +256,7 @@ pub fn matmul(
     if (bias) |b| std.debug.assert(b.len == w.rows);
     switch (w.dtype) {
         .f8_e4m3, .bf16, .f16, .f32, .i8, .i4, .w4a8, .nvfp4 => {},
-        .q4_0, .q8_0, .q2_k, .q4_k, .q5_k, .q6_k, .iq4_nl, .q1_0, .q2_0_g64 => {
+        .q4_0, .q8_0, .q2_k, .q4_k, .q5_k, .q6_k, .iq4_nl, .iq4_xs, .q1_0, .q2_0_g64 => {
             if (have_ggml) {
                 // ggml rows are whole blocks; block-aligned k-slicing depends on it.
                 std.debug.assert(w.cols % w.dtype.blockElems() == 0);
@@ -556,7 +556,7 @@ fn packedTask(
         inline .f8_e4m3, .bf16, .f16, .f32, .i8 => |dt| {
             packedTaskTyped(dt, y, x, m, w, bias, row_start, row_end, panel, tok);
         },
-        inline .q4_0, .q8_0, .q2_k, .q4_k, .q5_k, .q6_k, .iq4_nl, .q1_0, .q2_0_g64, .q2_0_g128 => |dt| {
+        inline .q4_0, .q8_0, .q2_k, .q4_k, .q5_k, .q6_k, .iq4_nl, .iq4_xs, .q1_0, .q2_0_g64, .q2_0_g128 => |dt| {
             packedTaskBlock(dt, y, x, m, w, bias, row_start, row_end, panel, tok);
         },
         else => unreachable, // validated in matmul()

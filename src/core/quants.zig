@@ -51,6 +51,7 @@ const gg = if (have_ggml) struct {
             .q5_k => ggml.c.GGML_TYPE_Q5_K,
             .q6_k => ggml.c.GGML_TYPE_Q6_K,
             .iq4_nl => ggml.c.GGML_TYPE_IQ4_NL,
+            .iq4_xs => ggml.c.GGML_TYPE_IQ4_XS,
             .q1_0 => ggml.c.GGML_TYPE_Q1_0,
             // ggml's GGML_TYPE_Q2_0 is the 64-element variant, so ONLY g64 maps
             // here. `.q2_0_g128` is deliberately absent: its blocks are 128
@@ -694,6 +695,10 @@ test "iq4_nl dequant matches the non-linear LUT" {
         try std.testing.expectEqual(2.0 * kv[0], out[j]);
         try std.testing.expectEqual(2.0 * kv[0], out[j + 16]);
     }
+}
+
+test "iq4_xs dequant matches ggml reference" {
+    try expectGolden(.iq4_xs, &fixtures.iq4_xs_block, &fixtures.iq4_xs_expected_bits);
 }
 
 test "q1_0 dequant is sign-bit x block scale" {

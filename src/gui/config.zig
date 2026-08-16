@@ -635,6 +635,13 @@ pub const Config = struct {
     /// `apply_chat_template` produces. No effect on non-gemma4 models. Load-time
     /// (see `llmReloadEql`): a toggle triggers a transcript-preserving reload.
     gemma4_canonical_template: bool = false,
+    /// Replace a Qwen 3.5/3.6/3.8 model's own embedded chat_template with
+    /// froggeric's fixed one (see `chat_template.qwen35Fixed` for what it
+    /// fixes). Default on: the official templates re-render prior turns in a
+    /// way that invalidates the prefix KV cache, and some quantized builds ship
+    /// no template at all. No effect on non-qwen35 models. Load-time (see
+    /// `llmReloadEql`): a toggle triggers a transcript-preserving reload.
+    qwen35_fixed_template: bool = true,
     /// KV-cache element storage type (f32 default; f16 halves the KV VRAM
     /// footprint, lossy). Changing it rebuilds the KV context, the weights stay
     /// resident (see `ctxReloadEql`), not a full model reload.
@@ -700,7 +707,8 @@ pub const Config = struct {
             a.vision_budget == b.vision_budget and
             // Which chat_template the session parses is chosen at load, so a
             // toggle reloads (transcript preserved; weights re-pinned).
-            a.gemma4_canonical_template == b.gemma4_canonical_template;
+            a.gemma4_canonical_template == b.gemma4_canonical_template and
+            a.qwen35_fixed_template == b.qwen35_fixed_template;
     }
 
     /// The LLM's KV-cache CONTEXT config matches. A change here (currently just
@@ -996,6 +1004,8 @@ pub const Config = struct {
             self.reasoning = std.mem.eql(u8, val, "true");
         } else if (std.mem.eql(u8, key, "gemma4_canonical_template")) {
             self.gemma4_canonical_template = std.mem.eql(u8, val, "true");
+        } else if (std.mem.eql(u8, key, "qwen35_fixed_template")) {
+            self.qwen35_fixed_template = std.mem.eql(u8, val, "true");
         } else if (std.mem.eql(u8, key, "vision_budget")) {
             if (VisionBudget.fromStr(val)) |b| self.vision_budget = b;
         } else if (std.mem.eql(u8, key, "kv_dtype")) {

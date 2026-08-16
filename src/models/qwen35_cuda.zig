@@ -46,7 +46,7 @@ fn offsetBufSized(b: Buf, off_bytes: usize, size: usize) Buf {
 /// restore graph_ok after a split is dropped (resetResidency).
 fn graphOkFor(dtype: anytype) bool {
     return switch (dtype) {
-        .bf16, .q8_0, .q4_k, .q5_k, .q6_k => true,
+        .bf16, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_xs => true,
         else => false,
     };
 }
@@ -1527,13 +1527,13 @@ pub const CudaLM = struct {
 
         if (want_logits) {
             try be.qkNorm(b.x, b.t, try nbuf(be, self.lm.final_norm), 1, cfg.hidden, eps);
+            // Through `gemv`, not a second dispatch: the head is the one weight
+            // whose dtype can differ from every layer's (untied heads ship
+            // bf16/f16 next to a block-quant trunk), and a private switch here
+            // only covered the block quants.
             const head = self.lm.head;
-            if (head.dtype == .q5_k or head.dtype == .q6_k) {
-                try self.quantizeX(b.t, cfg.hidden);
-                try be.opGemvQuantQ8(head.dtype, b.logits, head.bytes, 1.0, cfg.vocab, cfg.hidden);
-            } else {
-                try be.opGemvQuant(head.dtype, b.logits, b.t, head.bytes, 1.0, cfg.vocab, cfg.hidden);
-            }
+            if (dp4aGemvOk(head)) try self.quantizeX(b.t, cfg.hidden);
+            try self.gemv(b.logits, b.t, head);
         }
     }
 

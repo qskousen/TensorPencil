@@ -403,6 +403,19 @@ pub fn render(cfg: *config.Config, cb: Callbacks) void {
     {
         var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 4 } });
         defer row.deinit();
+        _ = dvui.checkbox(@src(), &cfg.qwen35_fixed_template, "Qwen 3.5/3.6/3.8 fixed chat template", .{ .gravity_y = 0.5 });
+    }
+    help("Use froggeric's fixed Qwen chat template instead of the one embedded " ++
+        "in the model file (on by default). It keeps earlier turns' thinking, so " ++
+        "each new turn reuses the cached prompt instead of re-reading the whole " ++
+        "chat; it drops the empty thought block the official templates emit; and " ++
+        "it lets you turn thinking off on Qwen 3.8, which the official template " ++
+        "refuses. Some quantized files ship no template at all, and this is what " ++
+        "they get. Reloads the model (chat preserved). Ignored by other models, " ++
+        "including plain Qwen3.");
+    {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 4 } });
+        defer row.deinit();
         _ = dvui.checkbox(@src(), &cfg.image_tool_result, "Report image results to the model", .{ .gravity_y = 0.5 });
     }
     help("When an image the model asked for finishes or fails, put a short note " ++

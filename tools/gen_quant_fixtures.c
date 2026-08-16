@@ -73,5 +73,12 @@ int main(void) {
         dequantize_row_q6_K(&b, y, 256);
         dump("q6_k", (const uint8_t *)&b, sizeof(b), y, 256);
     }
+    { // IQ4_XS: [f16 d][u16 scales_h][4 scales_l][128 qs]
+        block_iq4_xs b;
+        fill((uint8_t *)&b, sizeof(b));
+        memcpy(&b.d, &d16, 2);
+        dequantize_row_iq4_xs(&b, y, 256);
+        dump("iq4_xs", (const uint8_t *)&b, sizeof(b), y, 256);
+    }
     return 0;
 }
