@@ -149,8 +149,14 @@ pub const F = struct {
     pub const prose = role(fonts.sans, 12.5, 1.65, .normal);
     /// Composer placeholder, 12.5/1.0.
     pub const input = role(fonts.sans, 12.5, 1.2, .normal);
-    /// Metadata / params, 10.5/400.
+    /// Metadata / params, 10.5/400. A SCANNING role: chips, one-line captions,
+    /// figures compared against each other. Not for anything read left to right.
     pub const mono = role(fonts.mono, 10.5, 1.0, .normal);
+    /// Monospaced text that is READ, not scanned: a tool call's body, an image
+    /// card's prompt. Sized against `prose` rather than `mono`, because it sits in
+    /// the reading column and is the same kind of content, and given real leading
+    /// since it wraps to several lines.
+    pub const code = role(fonts.mono, 12, 1.45, .normal);
     /// The smallest role, for dense captions that are scanned, not read.
     pub const mono_sm = role(fonts.mono, 10, 1.0, .normal);
     /// Status-bar legend and meter labels. The design says 8.5, which is a size

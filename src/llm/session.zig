@@ -146,6 +146,7 @@ pub fn bringUpCuda(arena: std.mem.Allocator, backend: BackendKind, profile: bool
     if (be) |b| {
         b.profile = profile;
         b.pinAllWeights();
+        b.enableLlmMemTags(); // before any allocation; see enableLlmMemTags
     }
     return be;
 }

@@ -230,6 +230,10 @@ fn applyMeterPolicy() void {
         if (card.foreign == null) " (no NVML: foreign is a residual)" else "",
     });
     vram.logResidency("LLM", s.residencyNeed(), s.residencyHave());
+    // The itemized counterpart: `logResidency` reports `scratch` as a subtraction,
+    // this reports what each allocation path actually claimed. When the two
+    // disagree the difference is the thing to chase.
+    s.logMemTags(card.ours_total);
     g_arbiter.setBudgets(available, share);
 }
 
@@ -438,7 +442,11 @@ fn unloadLlm() void {
     }
     g_session_mu.lockUncancelable(g_io);
     s.be.bindThread(); // context current on THIS thread to free its device memory
-    g_carry = s.detachTranscript();
+    {
+        g_carry_mu.lockUncancelable(g_io);
+        defer g_carry_mu.unlock(g_io);
+        g_carry = s.detachTranscript();
+    }
     s.deinit();
     g_session = null;
     g_arbiter.llm = null; // participant points into the freed session
@@ -456,6 +464,19 @@ fn unloadLlm() void {
 // the old session before teardown, adopted by the new one) so a settings save
 // never wipes the chat. Owned by g_gpa; freed if there's no new session to adopt.
 var g_carry: ?std.ArrayList(chat.Message) = null;
+// Guards `g_carry`, which the `!g_loading` gate CANNOT protect the way it
+// protects `g_session`: the UI reads the carried transcript precisely while a
+// load runs, since rendering it is what keeps the chat on screen across a swap.
+// Meanwhile the loader thread publishes it (`detachTranscript`), hands it to the
+// fresh session (`adoptTranscript`) and clears it. Every read and every write
+// takes this, on both threads.
+//
+// Held across the WALK, not just the fetch: the messages the renderers and
+// `saveHistory` follow live inside that list, so a lock that ends at the load of
+// the pointer protects nothing. That makes it the INNERMOST lock — nothing may
+// take `g_session_mu` or `g_diff_mu` while holding it, and the two places that
+// nest (the detach paths) take it under `g_session_mu`, never the other way.
+var g_carry_mu: std.Io.Mutex = std.Io.Mutex.init;
 
 // Conversation history: the on-disk store plus the sidebar's selection state.
 // Saved after every completed turn (see maybeSaveHistory) and on exit.
@@ -608,9 +629,13 @@ pub fn run(init: std.process.Init) !void {
     // diffusion thread is still touching a transcript/gallery image as those are
     // freed; then the LLM, then the gallery.
     defer {
+        // Join the loader BEFORE the flush: while it runs it owns the session and
+        // the carried transcript, so `saveHistory` steps aside and would write
+        // nothing. Neither frees the transcript, so the flush still happens before
+        // anything that does.
+        if (g_loader) |t| t.join();
         saveHistory(true); // flush the live transcript before anything frees it
         g_history.deinit(g_gpa);
-        if (g_loader) |t| t.join();
         freeDiffuser();
         if (g_session) |s| {
             s.be.bindThread();
@@ -640,7 +665,10 @@ pub fn run(init: std.process.Init) !void {
         // Settings) so an in-flight generation finishes, it drains its own
         // unified queue. Gated on !loading so no diffusion worker touches the
         // session while the LLM (re)loads (see maybeStartReload).
-        if (!g_loading.load(.acquire)) if (g_diffuser) |*d| d.pump();
+        if (!g_loading.load(.acquire)) if (g_diffuser) |*d| {
+            maybeReleaseDiffuser(d);
+            d.pump();
+        };
         const nstime = win.beginWait(interrupted);
 
         // Pump SDL events once, routing each to the window it targets (main or
@@ -789,10 +817,13 @@ fn visionAvailable() bool {
 /// or (lazy first message) stages it and kicks a load. Callers decode the source
 /// and confirm `visionAvailable()` first.
 fn attachOrStage(rgb: []const u8, w: usize, h: usize) void {
-    if (g_session) |s| {
+    // Only while the session is ours to touch. Mid-load it belongs to the loader
+    // thread, and the fall-through is exactly what that case wants anyway:
+    // stage the image and let `maybeStartReload` attach it to the fresh session.
+    if (!g_loading.load(.acquire)) if (g_session) |s| {
         s.attachImage(rgb, w, h) catch |err| std.log.err("attach image: {t}", .{err});
         return;
-    }
+    };
     const rgb_own = g_gpa.dupe(u8, rgb) catch return;
     const rgba = diffuser.rgbToRgba(g_gpa, rgb_own, w, h) catch {
         g_gpa.free(rgb_own);
@@ -1030,7 +1061,7 @@ fn frame() void {
     // the loader thread (the release/acquire hand-off only guarantees the
     // pointer valid while g_loading is false).
     const ready = !g_loading.load(.acquire);
-    status_bar.render(if (ready) g_session else null, !ready, diffBusy(), diffVram(), &g_split, &g_limit, g_llm_eject_armed, g_diff_eject_armed, llmPaused(), diffPaused(), meterActions());
+    status_bar.render(if (ready) g_session else null, !ready, diffBusy(), diffVram(), diffOffload(), &g_split, &g_limit, g_llm_eject_armed, g_diff_eject_armed, llmPaused(), diffPaused(), meterActions());
 }
 
 /// The chat workspace body: sidebar | transcript + composer | queue rail.
@@ -1394,8 +1425,17 @@ fn onDeleteConversation(id: u64) void {
 /// message list.
 fn applyPendingConversationLoad() void {
     const id = g_load_conv orelse return;
+    if (g_loading.load(.acquire)) { // the loader owns the session right now
+        g_load_conv = null;
+        return;
+    }
+    // A turn in flight owns both the transcript and the KV it is decoding
+    // against: `reset` refuses, and the `adoptTranscript` below would then swap
+    // `messages` out from under a worker that renders its prompt from them. Hold
+    // the click (keep `g_load_conv`) and apply it when the turn ends, rather than
+    // dropping it or corrupting the session.
+    if (g_session) |s| if (s.busy()) return;
     g_load_conv = null;
-    if (g_loading.load(.acquire)) return; // the loader owns the session right now
 
     var loaded = g_history.load(g_gpa, g_io, id) orelse return;
     defer loaded.deinit();
@@ -1436,12 +1476,13 @@ fn applyPendingConversationLoad() void {
     freeCarry();
     freeLlmSuspend();
     clearStaged();
+    dropPendingImageNotes(); // same boundary as `newChat`: this conversation is being left
     @memset(&g_input_buf, 0);
     g_pending_regenerate = false;
     g_follow_bottom = true;
 
     if (g_session) |s| {
-        s.reset();
+        _ = s.reset(); // takes: the busy check above is the only thing that refuses
         // Takes ownership of `msgs` and replays each turn into this model's
         // tokenizer; the next prefill rebuilds KV from the whole context.
         s.adoptTranscript(msgs) catch |err| {
@@ -1450,6 +1491,8 @@ fn applyPendingConversationLoad() void {
     } else {
         // No LLM resident: the transcript still shows (read-only) and is adopted
         // by the fresh session when one loads.
+        g_carry_mu.lockUncancelable(g_io);
+        defer g_carry_mu.unlock(g_io);
         g_carry = msgs;
     }
 
@@ -1474,6 +1517,18 @@ fn applyPendingConversationLoad() void {
 ///
 /// Off by setting (`image_tool_result`), which restores the fire-and-forget
 /// behaviour exactly: nothing is queued, so nothing reaches the model.
+/// Conversation boundary: an image still in flight belongs to the chat being
+/// left, so its outcome must not be announced to the next one. `Session.reset`
+/// drops the notes already queued; this covers the other half, images that
+/// finish AFTER the boundary (the queue deliberately keeps generating across a
+/// new chat). Marking them reported is what the toggle-off and reopened-
+/// conversation paths already do: the render stays in the queue and the gallery,
+/// only the sentence to the model is dropped.
+fn dropPendingImageNotes() void {
+    const d = &(g_diffuser orelse return);
+    for (d.items()) |gi| gi.outcome_noted = true;
+}
+
 fn noteFinishedImages(s: *chat.Session, d: *diffuser.Diffuser) void {
     for (d.items()) |gi| {
         if (gi.outcome_noted) continue;
@@ -1568,6 +1623,17 @@ fn restoreImages(m: *chat.Message, recs: []const history.ImageRec) void {
 /// a turn is streaming (`force` overrides, for a conversation switch or exit):
 /// writing on every token would rewrite the file once per frame.
 fn saveHistory(force: bool) void {
+    // While a load is in flight the loader thread owns the session: reading it
+    // here is a use-after-free (the crash was here: a model switch reached
+    // `s.deinit()` while this frame walked `s.messages`), and unlike the
+    // renderers there is no `s_ui` to fall back to. Nothing is lost by waiting:
+    // `maybeStartReload` flushes just before it arms the loader, and the fresh
+    // session's first frame saves whatever changed after that.
+    if (g_loading.load(.acquire)) return;
+    // The carry is reachable here with no load running (the LLM is ejected), and
+    // taken across the whole walk below for the reason on `g_carry_mu`.
+    g_carry_mu.lockUncancelable(g_io);
+    defer g_carry_mu.unlock(g_io);
     const msgs: []chat.Message = if (g_session) |s| s.messages.items else if (g_carry) |c| c.items else return;
     if (msgs.len == 0) return;
     // `force` bypasses the BUSY gate only, so a switch or an exit can flush a
@@ -1759,6 +1825,10 @@ fn diffBusy() bool {
 fn diffVram() diffuser.VramBreakdown {
     return if (g_diffuser) |*d| d.vramBreakdown() else .{};
 }
+/// Pipeline bytes streaming from host RAM instead of sitting in VRAM.
+fn diffOffload() u64 {
+    return if (g_diffuser) |*d| d.offloadBytes() else 0;
+}
 
 /// Chat view while the session (re)loads on the background thread.
 /// A small "Loading..." bubble shown in the assistant response slot while the
@@ -1929,6 +1999,49 @@ fn llmForeignReclaim(_: *anyopaque, needed: u64) u64 {
     return g_arbiter.requestRoom(.llm, needed);
 }
 
+/// Main-loop hook: enact a release the LLM asked for through the arbiter's rung
+/// (`Diffuser.requestRelease`). Runs HERE, on the UI thread, because the session
+/// pointer has exactly one writer by design and its readers load it unlocked;
+/// `g_diff_mu` additionally locks out the LLM worker, which reads this engine
+/// through the arbiter's participant while holding that same lock.
+fn maybeReleaseDiffuser(d: *diffuser.Diffuser) void {
+    if (!d.releaseRequested()) return;
+    g_diff_mu.lockUncancelable(g_io);
+    defer g_diff_mu.unlock(g_io);
+    _ = d.fulfillRelease();
+}
+
+/// Throttle for `llmMidTurnReplan`. Written only under `g_diff_mu`.
+var g_last_replan_ns: i96 = 0;
+
+/// Interval between mid-turn re-plans. A prefill chunk is tens of milliseconds
+/// on the GPU, so this is per-chunk work; a quarter second is far more often
+/// than a peer's residency can meaningfully move, and the poll itself is a plan
+/// over counters, no device query.
+const replan_interval_ns: i96 = 250 * std.time.ns_per_ms;
+
+/// `chat.Session.replan`: the LLM worker asking, at a prefill-chunk or token
+/// boundary, whether the plan now allows it more than it holds — the mirror of
+/// `llmForeignReclaim` for the case where nothing failed and so nothing reactive
+/// fires. Same thread and same lock (`g_diff_mu` guards the participant against
+/// a concurrent `freeDiffuser`), and, like it, deliberately NOT under
+/// `g_session_mu`: the session cannot be freed underneath its own worker, and
+/// taking it here would invert the documented order.
+///
+/// Nothing under this lock can re-enter `llmForeignReclaim`, which takes the
+/// same non-reentrant mutex: `pollLlmGrowth` runs only while the LLM is busy, so
+/// its settle publishes and returns instead of promoting layers here. The
+/// promote (and any reclaim it asks for) happens after this returns, when the
+/// worker enacts the published ceiling.
+fn llmMidTurnReplan() void {
+    g_diff_mu.lockUncancelable(g_io);
+    defer g_diff_mu.unlock(g_io);
+    const now = std.Io.Clock.real.now(g_io).nanoseconds;
+    if (now - g_last_replan_ns < replan_interval_ns) return;
+    g_last_replan_ns = now;
+    _ = g_arbiter.pollLlmGrowth();
+}
+
 /// Whether a diffusion model is configured. ONE path, the primary checkpoint,
 /// is the requirement; the text encoder and VAE are overrides for whatever it
 /// does not carry itself (see `config.diffEnabled`, and `model_spec.missing` for
@@ -2051,9 +2164,20 @@ fn freeDiffuser() void {
         // the chat transcript (live + carried) and the open viewer. Otherwise a
         // model-clear would leave dangling pointers behind.
         if (g_viewer) |v| v.open = false;
-        if (g_session) |s| s.clearImageRefs();
-        if (g_carry) |*c| for (c.items) |*m|
-            for (m.variants.items) |*v| v.images.clearRetainingCapacity();
+        {
+            // Under the same locks the loader uses, because clearing an LLM model
+            // and swapping the diffusion model are both settings actions and can
+            // overlap: `g_session_mu` makes this either-or against a teardown (the
+            // refs are in the session, or already moved to the carry), and
+            // `g_carry_mu` against the publish/adopt of the carried copy.
+            g_session_mu.lockUncancelable(g_io);
+            defer g_session_mu.unlock(g_io);
+            if (g_session) |s| s.clearImageRefs();
+            g_carry_mu.lockUncancelable(g_io);
+            defer g_carry_mu.unlock(g_io);
+            if (g_carry) |*c| for (c.items) |*m|
+                for (m.variants.items) |*v| v.images.clearRetainingCapacity();
+        }
         d.deinit();
         g_diffuser = null;
     }
@@ -2167,6 +2291,14 @@ var g_untracked_high_water: u64 = 0;
 /// Edge-triggered, so an idle UI re-plans nothing; cheap when it does fire (one
 /// memGetInfo plus a plan).
 fn maybeRefreshMeterPolicy() void {
+    // Same rule as the renderers: the loader thread owns the session while a load
+    // is in flight, so `busy()` below would read freed memory. Nothing is missed —
+    // `maybeStartReload` re-applies the policy the moment the fresh session is
+    // published, and clearing the edge here makes its first turn a real idle->busy.
+    if (g_loading.load(.acquire)) {
+        g_llm_was_busy = false;
+        return;
+    }
     const s = g_session orelse {
         g_llm_was_busy = false;
         return;
@@ -2211,6 +2343,14 @@ fn maybeStartReload() void {
             // Load finished. Apply the current meter policy to the fresh session
             // (settles the LLM to its share if diffusion is already resident).
             if (g_session != null) applyMeterPolicy();
+            // Clearing the diffusion model is a settings action like the reload
+            // itself, so the two overlap. `freeDiffuser` drops the borrowed image
+            // pointers it can reach, but a session still being BUILT is not one of
+            // them, so a transcript adopted from the carry can come back pointing
+            // at freed images. Nothing rendered them in that window (an
+            // unpublished session shows as no transcript at all); drop them now
+            // that this thread owns the session again.
+            if (g_diffuser == null) if (g_session) |s| s.clearImageRefs();
             // Move any images staged before the lazy load into the fresh session
             // (BEFORE the deferred submit, so the first message carries them). If
             // the load failed (no session) or the model has no vision tower, drop
@@ -2257,6 +2397,10 @@ fn maybeStartReload() void {
     // NEW image starts mid-load; the in-flight one is left running (not reaped).
     g_reload_requested = false;
     g_load_err = null;
+    // Flush while this thread still owns the transcript: past the store below the
+    // loader is free to detach and free it, and `saveHistory` steps aside for the
+    // whole load. Forced, because the turn being torn down may still be streaming.
+    saveHistory(true);
     g_loading.store(true, .release);
     g_loader = std.Thread.spawn(.{}, loaderMain, .{}) catch |err| {
         std.log.err("spawn loader failed: {t}", .{err});
@@ -2287,7 +2431,13 @@ fn loaderMain() void {
         // `g_session_mu`, the same guard unloadLlm uses. The transcript is
         // detached (carried) so the chat survives the swap.
         g_session_mu.lockUncancelable(g_io);
-        g_carry = s.detachTranscript();
+        {
+            // The UI renders this the moment it lands, so publish it as one
+            // step rather than letting a frame catch a half-written optional.
+            g_carry_mu.lockUncancelable(g_io);
+            defer g_carry_mu.unlock(g_io);
+            g_carry = s.detachTranscript();
+        }
         s.deinit();
         g_session = null;
         g_arbiter.llm = null; // participant points into the freed session
@@ -2325,6 +2475,11 @@ fn loaderMain() void {
     };
     // Replay the carried transcript into the new model (KV empty; the next turn's
     // prefill replays it) so a model swap keeps the chat.
+    // The hold spans the ADOPT, not just the clear: `adoptTranscript` moves the
+    // list into the new session on its first line, so a frame that read `g_carry`
+    // between that move and the clear would walk messages the session now owns
+    // (and is re-tokenizing). A few ms of a blocked render is the price.
+    g_carry_mu.lockUncancelable(g_io);
     if (g_carry) |m| {
         s.be.bindThread();
         if (g_llm_suspend) |sus| {
@@ -2340,6 +2495,7 @@ fn loaderMain() void {
         }
         g_carry = null;
     }
+    g_carry_mu.unlock(g_io);
     // A paused reload that is NOT a resume (e.g. a backend switch while paused)
     // starts the fresh gate paused so the state matches the button.
     if (g_llm_paused) s.pause.pause(g_io);
@@ -2350,6 +2506,7 @@ fn loaderMain() void {
     g_session_mu.lockUncancelable(g_io);
     g_session = s;
     g_arbiter.llm = s.participant();
+    s.replan = llmMidTurnReplan; // re-plan at the worker's own boundaries
     g_session_mu.unlock(g_io);
     finishLoad(null);
 }
@@ -2357,6 +2514,8 @@ fn loaderMain() void {
 /// Free a carried transcript that has no destination (LLM cleared or load
 /// failed). Messages are gpa-owned.
 fn freeCarry() void {
+    g_carry_mu.lockUncancelable(g_io);
+    defer g_carry_mu.unlock(g_io);
     if (g_carry) |*m| {
         for (m.items) |*msg| msg.deinit(g_gpa);
         m.deinit(g_gpa);
@@ -2417,6 +2576,14 @@ fn renderMessages(s: ?*chat.Session, list_h: f32, loading: bool) void {
         // the LLM was ejected / is between loads) so the conversation stays on
         // screen read-only and is never visually "reset", only a "new chat"
         // click clears it. It reloads + replays on the next message.
+        //
+        // That fallback is the one place the UI reads shared state DURING a load,
+        // so it holds `g_carry_mu` for as long as it follows pointers into the
+        // list — the whole render below. A live session needs no lock: it is the
+        // UI's own while `g_loading` is clear, which is what `s` already means.
+        const carried = s == null;
+        if (carried) g_carry_mu.lockUncancelable(g_io);
+        defer if (carried) g_carry_mu.unlock(g_io);
         const msgs: []chat.Message = if (s) |ss| ss.messages.items else if (g_carry) |c| c.items else &.{};
         if (msgs.len == 0 and !loading and g_pending_submit == null) {
             var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .padding = dvui.Rect.all(16) });
@@ -2429,7 +2596,7 @@ fn renderMessages(s: ?*chat.Session, list_h: f32, loading: bool) void {
                 .color_text = style.C.text_ghost,
             });
         } else {
-            for (msgs, 0..) |*m, idx| renderMessage(s, m, idx);
+            for (msgs, 0..) |*m, idx| renderMessage(s, msgs, m, idx);
         }
         // While the model (re)loads in the background: the just-sent message
         // (not yet in the transcript, it submits once the session is live) shows
@@ -2522,7 +2689,7 @@ fn renderEmptyAssistant(s: ?*chat.Session, idx: usize) void {
     }
 }
 
-fn renderMessage(s: ?*chat.Session, m: *chat.Message, idx: usize) void {
+fn renderMessage(s: ?*chat.Session, msgs: []chat.Message, m: *chat.Message, idx: usize) void {
     // An app-written note (an image outcome), not something the user typed:
     // centred, quiet, and no bubble. Giving it a user bubble would put words in
     // the user's mouth in their own transcript.
@@ -2662,15 +2829,12 @@ fn renderMessage(s: ?*chat.Session, m: *chat.Message, idx: usize) void {
     // take, and › regenerate lazy-loads the LLM first (see renderVariantNav).
     // Images belonging to a non-active take keep generating in the unified queue.
     if (!is_user) {
-        const nmsg: usize, const prev_user: bool, const busy: bool = if (s) |ss| .{
-            ss.messages.items.len,
-            ss.messages.items.len >= 2 and ss.messages.items[ss.messages.items.len - 2].role == .user,
-            ss.busy(),
-        } else if (g_carry) |c| .{
-            c.items.len,
-            c.items.len >= 2 and c.items[c.items.len - 2].role == .user,
-            false,
-        } else .{ 0, false, false };
+        // From `msgs`, the list this message belongs to, rather than re-derived
+        // from the session or the carry: the caller already resolved which of the
+        // two is live and holds the lock that makes the carried one safe to walk.
+        const nmsg = msgs.len;
+        const prev_user = nmsg >= 2 and msgs[nmsg - 2].role == .user;
+        const busy = if (s) |ss| ss.busy() else false;
         if (idx + 1 == nmsg and nmsg >= 2 and prev_user and !busy)
             renderVariantNav(s, m);
     }
@@ -2851,11 +3015,11 @@ fn renderCallRun(imgs: []const *chat.GenImage, n_calls: usize, raw: []const u8, 
             .corner_radius = .{ .x = 0, .y = 6, .w = 6, .h = 0 },
             .margin = .{ .h = 6 },
             .padding = .{ .x = 11, .y = 8, .w = 11, .h = 8 },
-            .font = style.F.mono,
+            .font = style.F.code,
             .color_text = style.C.text_dim,
         });
         defer tl.deinit();
-        fonts.addStyled(tl, raw, .{}, .{ .font = style.F.mono, .color_text = style.C.text_dim });
+        fonts.addStyled(tl, raw, .{}, .{ .font = style.F.code, .color_text = style.C.text_dim });
     }
 
     if (imgs.len > 0) {
@@ -3419,7 +3583,12 @@ fn requestRegenLoad() void {
 /// reset; generated images live in the engine's shared history and stay in the
 /// studio gallery (and the viewer keeps working). No-op if no session is loaded.
 fn newChat() void {
-    if (!g_loading.load(.acquire)) if (g_session) |s| s.reset(); // session being rebuilt -> g_carry clear below suffices
+    // The note drop follows the RESET: a session that refused (a turn is
+    // generating) is still on the same conversation, and dropping its notes there
+    // would lose the report for an image that chat did ask for. With no live
+    // session the boundary is the carry clear below, which always happens.
+    const ended = if (g_loading.load(.acquire)) true else if (g_session) |s| s.reset() else true;
+    if (ended) dropPendingImageNotes(); // in-flight renders belong to the chat being left
     // If the LLM is ejected, the transcript lives in g_carry, clear it too so
     // "new chat" starts fresh even while unloaded. (No-op when a session is
     // live, since g_carry is null then.)

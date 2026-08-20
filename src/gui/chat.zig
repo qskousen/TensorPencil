@@ -78,6 +78,7 @@ const chat = tp.llm.chat;
 const chat_template = tp.llm.chat_template;
 const vram = tp.vram;
 const residency = tp.models.residency;
+const bnd = tp.models.boundary;
 const pipeline = tp.pipeline;
 const Tokenizer = tp.tokenizer.Tokenizer;
 const Gguf = tp.Gguf;
@@ -665,6 +666,15 @@ pub const Session = struct {
     /// OPEN (no closeAssistant) so a reload can reprefill `ids` and continue.
     /// Read by the app (after `busy()` clears) to carry the raw `ids`. (Tier 3.)
     suspended_midturn: bool = false,
+    /// The same signal from a boundary INSIDE a prefill (`prefillBoundaryThunk`),
+    /// where `generate`'s stack local does not exist yet. Read by the worker to
+    /// tell an unload-while-paused from a plain cancel; cleared per turn.
+    turn_suspended: bool = false,
+    /// Installed by the app: re-run the arbiter's plan mid-turn (see
+    /// `residencyPollThunk`). Called from the WORKER thread, so the app's hook
+    /// owns the locking that reaching the image model needs. null on a session
+    /// with no coordinator.
+    replan: ?*const fn () void = null,
     /// Cross-thread residency intent published by the app's `vram.Arbiter`. The
     /// worker enacts it at each token boundary (`engine.residency_poll`) on its
     /// own context-bound thread; the arbiter enacts it directly while idle. The
@@ -742,6 +752,9 @@ pub const Session = struct {
         // 0.1 tok/s cliff). VRAM pressure is handled by the always-armed
         // dynamic split + the vram Arbiter migrating whole layers instead.
         self.be.pinAllWeights();
+        // Before the model allocates anything (see enableLlmMemTags): turns the
+        // one derived `scratch` residual into named per-component figures.
+        self.be.enableLlmMemTags();
 
         self.mmproj_gguf = null;
         self.vision_budget_tokens = cfg.vision_budget_tokens;
@@ -771,8 +784,11 @@ pub const Session = struct {
             @min(@as(usize, @intCast(self.gguf.contextLength() orelse default_trained_context)), auto_context_cap);
 
         // Interactive session: grow from a small floor toward the full window.
+        // The floor is `kv_cache.initial_context`, NOT a literal: this used to
+        // carry its own 4096, so tuning the shared constant moved tp-llm and left
+        // the GUI, where the VRAM pressure actually is, on the old value.
         const cap: engine.Capacity = .{
-            .initial = @min(max_context, 4096),
+            .initial = @min(max_context, kv_cache.initial_context),
             .max = max_context,
             .kv_dtype = cfg.kv_dtype,
         };
@@ -820,8 +836,16 @@ pub const Session = struct {
             const a = &self.arch.gemma4;
             errdefer a.lm.deinit();
             // Size the LLM's image-prefill scratch + LOCAL KV ring for the vision
-            // token budget (bidirectional image block prefills in one pass).
-            // Fixed at load, so vision_budget is a reload-triggering setting.
+            // token budget (a bidirectional image block prefills in ONE pass, so
+            // it, not the text chunk, sets the largest batch). Fixed at load, so
+            // vision_budget is a reload-triggering setting.
+            //
+            // This is the CEILING an image block may reach, not what gets
+            // allocated: the activation buffers start at the text chunk and grow
+            // to it on the first image (`ensureBufRows`), so a conversation with
+            // no images pays nothing for it however the budget is set. The LOCAL
+            // KV ring still reserves its slack from this, since the ring modulus
+            // is baked into position addressing and cannot be resized later.
             if (self.vision_budget_tokens != 0) a.lm.cfg.image_budget = self.vision_budget_tokens;
             // Vision tower dispatched by projector_type: "gemma4v" -> full SigLIP
             // tower (31B), else the shallow "gemma4uv" embedder (12B). Encodes are
@@ -884,12 +908,12 @@ pub const Session = struct {
         // Let the decode loop enact arbiter-published VRAM targets on the worker
         // thread (`self` is heap-pinned, so the captured pointer stays valid).
         self.opts.residency_poll = .{ .ctx = self, .apply = residencyPollThunk };
-        // And the PREFILL chunk loop, which never reaches `engine.checkpoint`.
-        // Without it a ceiling raised because the image model just went idle took
-        // effect only after the prefill it was raised for, so a vision turn ran
-        // its whole slow half on host-resident layers.
+        // And the PREFILL chunk loop, which never reaches `engine.checkpoint`:
+        // the same poll plus the pause gate and the cancel flag. Without it a
+        // turn's slow half (all of a vision turn) ran with a stale residency
+        // ceiling and ignored Stop until the first token decoded.
         switch (self.arch) {
-            inline else => |*a| a.model.residency_poll = .{ .ctx = self, .apply = residencyPollThunk },
+            inline else => |*a| a.model.boundary = .{ .ctx = self, .at = prefillBoundaryThunk },
         }
 
         // EVERY field below is assigned explicitly, including ones that have a
@@ -949,6 +973,8 @@ pub const Session = struct {
         // write in some orderings, initialize them to their intended defaults.
         self.control = .{};
         self.suspended_midturn = false;
+        self.turn_suspended = false;
+        self.replan = null; // the app installs one once the session is published
         self.turn_staged = false;
         // Same trap for the footer telemetry: read every frame by `poll`.
         self.progress = .{};
@@ -1032,11 +1058,22 @@ pub const Session = struct {
     /// CONTRACT: the caller must first stop the app-level diffusion engine (join
     /// its worker) so no diffusion thread is still touching a transcript GenImage
     /// as this frees the messages, the session no longer owns that engine.
-    pub fn reset(self: *Session) void {
-        if (self.busy()) return;
+    /// Returns false when a turn is generating: the reset is REFUSED then (it
+    /// would free messages the worker renders the prompt from), so the
+    /// conversation has NOT ended and a caller must not act as though it had.
+    pub fn reset(self: *Session) bool {
+        if (self.busy()) return false;
 
         for (self.messages.items) |*m| m.deinit(self.gpa);
         self.messages.clearRetainingCapacity();
+
+        // Queued outcome notes describe the conversation being cleared, and they
+        // flush on the next `submit` whenever that happens to be. Keeping them
+        // across a boundary is how a brand new chat opened with
+        // "[image tool] finished: ...", reporting a render the model it is
+        // talking to has no tool call for.
+        for (self.pending_notes.items) |n| self.gpa.free(n);
+        self.pending_notes.clearRetainingCapacity();
 
         for (self.attach_view.items) |gi| freeGenImage(self.gpa, gi);
         self.attach_view.clearRetainingCapacity();
@@ -1072,6 +1109,7 @@ pub const Session = struct {
 
         self.gen_err = null;
         self.wake();
+        return true;
     }
 
     /// Drop every turn checkpoint (and any rollback request naming one). Called
@@ -1276,8 +1314,63 @@ pub const Session = struct {
             inline else => |*a| residency.measured(&a.model),
         };
     }
+
+    /// MEASURED device memory by component, and what nothing claimed.
+    ///
+    /// `residency.measured` derives `scratch` by subtracting weights and K/V from
+    /// the total, so every buffer nobody itemized lands in it and it can only ever
+    /// be read as "the rest". These figures come from the allocator tagging each
+    /// buffer as it makes it, so `unattributed` is a real number: bytes inside
+    /// `deviceUsed` that no allocation path claimed, i.e. an accounting hole
+    /// rather than a component.
+    ///
+    /// Separately reports the driver's per-process footprint minus ours, which is
+    /// the VRAM we hold but never allocated through the backend at all (the CUDA
+    /// context, JIT'd module cubins, library workspaces, the window's textures).
+    /// That figure is what the budget gets wrong when it plans a ceiling.
+    /// Format the tag breakdown into `buf` as "weights 16920 + kv 1995 + ...",
+    /// returning it and the total it accounts for. Shared by the load-time log
+    /// and the live TP_DUMP_VRAM sample so the two can never phrase it
+    /// differently.
+    pub fn memTagLine(self: *Session, buf: []u8) struct { text: []const u8, named: u64 } {
+        const tags = self.be.memTagBreakdown();
+        var named: u64 = 0;
+        var w = std.Io.Writer.fixed(buf);
+        for (tags, 0..) |v, i| {
+            if (v == 0) continue;
+            named += v;
+            const t: @TypeOf(self.be.ctx.mem_tag) = @enumFromInt(i);
+            w.print("{s} {d} + ", .{ t.name(), v >> 20 }) catch break;
+        }
+        return .{ .text = w.buffered(), .named = named };
+    }
+
+    pub fn logMemTags(self: *Session, proc_used: u64) void {
+        const used = self.be.deviceUsed();
+        var buf: [320]u8 = undefined;
+        const line = self.memTagLine(&buf);
+        const jit = self.be.jitStats();
+        std.log.info("[vram] LLM tagged: {s}unattributed {d} = {d} MiB · {d} PTX modules JIT'd in {d} ms", .{
+            line.text, (used -| line.named) >> 20, used >> 20, jit.count, jit.ns / 1_000_000,
+        });
+        if (proc_used > 0) std.log.info("[vram] LLM outside the allocator: process {d} MiB - tracked {d} = {d} MiB (CUDA context, module cubins, library workspaces, UI textures)", .{
+            proc_used >> 20, used >> 20, (proc_used -| used) >> 20,
+        });
+    }
+    /// What an image model can never take from this LLM: only the bytes that do
+    /// not migrate (embeddings, LM head, scratch). See `residency.evictionFloor`.
+    ///
+    /// This used to report `ctxKvBytes()`, the committed context computed from the
+    /// conversation length and every layer's dims. That is a floor which keeps
+    /// reserving the K/V of layers already living on the host, so a working image
+    /// model was squeezed by GiBs nobody held — and the squeeze grew with the
+    /// conversation. Migration carries K/V to the host shadow, so the context is
+    /// not what is at stake; speed is.
     fn vpFloor(ctx: *anyopaque) u64 {
-        return fromCtx(ctx).ctxKvBytes(); // committed KV can't be evicted
+        const self = fromCtx(ctx);
+        return switch (self.arch) {
+            inline else => |*a| residency.evictionFloor(&a.model),
+        };
     }
     fn vpBusy(ctx: *anyopaque) bool {
         return fromCtx(ctx).busy();
@@ -1334,8 +1427,31 @@ pub const Session = struct {
 
     /// `engine.residency_poll` thunk: at each token boundary, enact any target
     /// the arbiter published to `control`, on the worker's own bound thread.
+    ///
+    /// `replan` runs FIRST because `pollAndApply` only enacts the LAST published
+    /// ceiling: the arbiter re-plans on external edges (a queue starting or
+    /// draining, a meter drag, the turn's own idle->busy edge), so a turn that
+    /// began squeezed stayed squeezed for its whole prefill however much VRAM the
+    /// image model handed back meanwhile.
     fn residencyPollThunk(ctx: *anyopaque) void {
-        fromCtx(ctx).participant().pollAndApply();
+        const self = fromCtx(ctx);
+        if (self.replan) |r| r();
+        self.participant().pollAndApply();
+    }
+
+    /// `boundary.Hook` thunk: a stepper's prefill chunk boundary, which reaches
+    /// none of `engine.generate`'s loops. Runs exactly what the decode loop runs
+    /// between tokens, so residency, pause and cancel behave the same in both
+    /// halves of a turn and the trio is defined in one place.
+    ///
+    /// `suspended_out` points at the session rather than at `generate`'s stack
+    /// local: an unload-while-paused during PREFILL has to leave the turn open
+    /// too, so a reload can reprefill `ids` and continue (Tier 3).
+    fn prefillBoundaryThunk(ctx: *anyopaque) bnd.Outcome {
+        const self = fromCtx(ctx);
+        var o = self.opts;
+        o.suspended_out = &self.turn_suspended;
+        return if (engine.checkpoint(self.io, o) == .stop) .stop else .proceed;
     }
 
     /// pipeline reclaim hook: free LLM VRAM for a large VAE
@@ -1554,15 +1670,20 @@ pub const Session = struct {
         };
     }
 
-    /// LLM layer residency: how many layers run on the GPU vs the CPU. `cpu` is 0
-    /// when no split is armed (fully resident).
-    pub const Residency = struct { gpu: usize, cpu: usize };
+    /// LLM layer residency: how many layers run on the GPU vs the CPU, and what
+    /// the CPU-resident ones weigh. `cpu`/`host_bytes` are 0 when no split is
+    /// armed (fully resident).
+    pub const Residency = struct { gpu: usize, cpu: usize, host_bytes: u64 };
     pub fn llmResidency(self: *Session) Residency {
         return switch (self.arch) {
             inline else => |*a| blk: {
                 const total = a.model.cfg.n_layers;
                 const cpu = if (a.model.split) |sp| sp.n_cpu else 0;
-                break :blk .{ .gpu = total - cpu, .cpu = cpu };
+                break :blk .{
+                    .gpu = total - cpu,
+                    .cpu = cpu,
+                    .host_bytes = residency.hostWeightBytes(&a.model),
+                };
             },
         };
     }
@@ -1862,7 +1983,7 @@ pub const Session = struct {
         // device op (else cuMemcpyHtoD fails with INVALID_CONTEXT).
         self.be.bindThread();
 
-        self.prepareTurn() catch |err| {
+        const prep = self.prepareTurn() catch |err| {
             self.gen_err = err;
             std.log.err("turn setup failed: {t}", .{err});
             self.freeTurn();
@@ -1870,6 +1991,21 @@ pub const Session = struct {
             self.wake();
             return;
         };
+        // Stopped inside the prefill (Stop, or a pause the user unloaded from):
+        // there is no prompt to generate from, so end the turn exactly the way a
+        // stop between decoded tokens does. A suspend keeps the turn OPEN for a
+        // reload to reprefill and continue; a cancel closes it.
+        if (prep != .ready) {
+            if (self.turn_suspended) {
+                self.suspended_midturn = true;
+            } else if (prep == .stopped) {
+                chat.closeAssistant(self.gpa, &self.ids) catch {};
+            }
+            self.freeTurn();
+            self.generating.store(false, .release);
+            self.wake();
+            return;
+        }
         // Snapshot this turn's boundary so it can be regenerated / switched
         // in O(snapshot) later. Non-fatal: without one, a later rollback just
         // takes the full-reprefill fallback. Skipped when `prepareTurn` already
@@ -1941,7 +2077,7 @@ pub const Session = struct {
     /// Bring the device context in line with `ids`, build any staged turn, and
     /// prefill up to the turn boundary (everything but the last token, which
     /// `engine.generate` forwards). All device work on the worker's thread.
-    fn prepareTurn(self: *Session) !void {
+    fn prepareTurn(self: *Session) !Prep {
         // Fast rollback (regenerate / variant switch over a live checkpoint):
         // truncate + restore the boundary snapshot. The caller already
         // arranged `ids`; the checkpoint cannot have been freed since (every
@@ -2003,7 +2139,22 @@ pub const Session = struct {
         // not rebuild (fast rollback, hand-glue path) cannot inherit the previous
         // turn's boundary and split its prefill at a stale position.
         self.turn_ckpt_q = null;
-        if (self.turn_staged) try self.buildTurn();
+        // Prefill is where a turn spends its slow half, and on this path it is
+        // ALL of it: `generate` only forwards the last token. Publishing the
+        // cancel flag lets a host-resident layer's matmul unwind mid-forward
+        // (`ops/cancel.zig`) instead of running the chunk out, which on a split
+        // model is the difference between Stop landing now and landing in
+        // seconds; `prefillBoundaryThunk` is the clean boundary underneath it.
+        const cs = engine.publishCancel(self.opts);
+        defer cs.end();
+        self.turn_suspended = false;
+        var stopped = false;
+        var built = true;
+        if (self.turn_staged) self.buildTurn() catch |err| {
+            try self.noteStop(err); // rethrows anything that is not a stop
+            stopped = true;
+            built = false;
+        };
         // Split the two halves: re-rendering the template and re-tokenizing the
         // whole transcript is CPU work that grows with the CONVERSATION, while
         // prefill scales with what is actually new. They look identical from the
@@ -2022,31 +2173,42 @@ pub const Session = struct {
         // `reconcile` finds a checkpoint at or before its divergence point
         // instead of clearing the context. See `safeCheckpointQ`.
         self.turn_ckpt_done = false;
-        if (self.turn_ckpt_q) |q| {
+        if (!stopped) if (self.turn_ckpt_q) |q| {
             const c0 = self.ctxTokens();
             if (q > c0 and q + 1 < total) {
                 switch (self.arch) {
                     inline else => |*a| {
                         if (total > a.model.cached() + a.model.remaining()) try a.model.ensureCapacity(total);
-                        try a.model.prefill(self.ids.items[c0..q]);
+                        a.model.prefill(self.ids.items[c0..q]) catch |err| {
+                            try self.noteStop(err);
+                            stopped = true;
+                        };
                         prefilled += a.model.cached() -| c0;
                     },
                 }
-                self.takeCheckpoint();
-                self.turn_ckpt_done = true;
+                // Only a complete stage-1 prefill sits at `q`; a stopped one
+                // would snapshot a boundary the next turn's `reconcile` cannot
+                // use and would silently pay for it.
+                if (!stopped) {
+                    self.takeCheckpoint();
+                    self.turn_ckpt_done = true;
+                }
             }
-        }
+        };
         // Stage 2: the rest, leaving the last token for `generate` to forward.
-        switch (self.arch) {
+        if (!stopped) switch (self.arch) {
             inline else => |*a| {
                 const cached = a.model.cached();
                 if (total >= 2 and cached + 1 < total) {
                     if (total > cached + a.model.remaining()) try a.model.ensureCapacity(total);
-                    try a.model.prefill(self.ids.items[cached .. total - 1]);
+                    a.model.prefill(self.ids.items[cached .. total - 1]) catch |err| {
+                        try self.noteStop(err);
+                        stopped = true;
+                    };
                     prefilled += a.model.cached() -| cached;
                 }
             },
-        }
+        };
         const t_end = std.Io.Clock.real.now(self.io).nanoseconds;
         self.publishPromptStats(prefilled, @intCast(t_end - t0));
         const build_ms = @as(f64, @floatFromInt(t_built - t0)) / 1e6;
@@ -2055,12 +2217,51 @@ pub const Session = struct {
         // real time here (render + tokenize), and reporting nothing is what made
         // that time look like an unexplained stall behind "Processing...".
         if (prefilled > 0 or t_end - t0 > 2 * std.time.ns_per_ms) {
-            std.log.info("[llm] turn prep: build {d:.0} ms · prefill {d} tok in {d:.2}s ({d:.0} tok/s) · ctx now {d} tok", .{
+            std.log.info("[llm] turn prep: build {d:.0} ms · prefill {d} tok in {d:.2}s ({d:.0} tok/s) · ctx now {d} tok{s}", .{
                 build_ms, prefilled, pre_s,
                 if (pre_s > 0) @as(f64, @floatFromInt(prefilled)) / pre_s else 0,
                 self.ctxTokens(),
+                if (stopped) " · STOPPED" else "",
             });
         }
+        if (!stopped) return .ready;
+        return if (built) .stopped else .stopped_unbuilt;
+    }
+
+    /// What `prepareTurn` left behind.
+    const Prep = enum {
+        /// A prompt is in the KV, generation can start.
+        ready,
+        /// Stopped after the turn was built, so the assistant turn is open in
+        /// `ids` and closes like any canceled reply.
+        stopped,
+        /// Stopped while BUILDING the turn — a canceled vision encode, which is
+        /// the slowest thing a turn does before it prefills. The hand-glue path
+        /// may not have opened the assistant yet, and there `ids` IS the
+        /// transcript, so closing one that was never opened leaves a stray
+        /// marker the model then reads.
+        stopped_unbuilt,
+    };
+
+    /// Classify an error out of a prefill call. TWO stops, not one, and the
+    /// difference is what the next turn pays:
+    ///
+    ///   `error.Stopped`   a boundary check (`prefillBoundaryThunk`) between
+    ///                     chunks. Every committed token is whole, so the KV
+    ///                     stands and `reconcile` resumes from `cached()`.
+    ///   `error.Canceled`  `ops/cancel.zig` unwound a kernel MID-forward, which
+    ///                     the published flag makes possible anywhere host
+    ///                     layers compute. Half a layer's state moved and half
+    ///                     did not; `cached()` cannot express that, so the
+    ///                     context is discarded and the next turn replays.
+    ///
+    /// Anything else is a real failure and propagates.
+    fn noteStop(self: *Session, err: anyerror) !void {
+        if (err == error.Stopped) return;
+        if (!engine.isCancelUnwind(err)) return err;
+        self.ctx_dirty = true;
+        self.invalidateCheckpoints();
+        std.log.info("[llm] prefill canceled mid-forward: context dropped (the next turn re-prefills)", .{});
     }
 
     /// The context window as the footer reports it: how many rows the KV cache

@@ -27,10 +27,21 @@ pub fn build(b: *std.Build) void {
             b.libc_file = b.pathFromRoot(".zig-crt/libc.txt");
         } else |_| {}
     }
-    // Standard optimization options allow the person running `zig build` to select
-    // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
-    // set a preferred release mode, allowing the user to decide how to optimize.
-    const optimize = b.standardOptimizeOption(.{});
+    // The gated suite is real models and real kernels, so Debug makes it ~6x
+    // slower for nothing: `-Dintegration` therefore defaults to ReleaseSafe,
+    // which keeps every assert and safety check the tests rely on. The fast unit
+    // suite stays Debug (its cost is compile time, not run time). An explicit
+    // `-Doptimize=` still wins over both.
+    const integration = b.option(bool, "integration", "Also run the slow GPU + real-model integration tests") orelse false;
+    // Declared directly rather than via `standardOptimizeOption`, which turns
+    // `-Doptimize=<mode>` into a `-Drelease` bool as soon as a preferred mode is
+    // set. Same option name and meaning as the standard one; only the DEFAULT is
+    // ours to choose.
+    const optimize = b.option(
+        std.builtin.OptimizeMode,
+        "optimize",
+        "Prioritize performance, safety, or binary size",
+    ) orelse if (integration) std.builtin.OptimizeMode.ReleaseSafe else std.builtin.OptimizeMode.Debug;
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
@@ -82,6 +93,7 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = target,
+        .optimize = optimize,
         .link_libc = true,
     });
 
@@ -92,6 +104,7 @@ pub fn build(b: *std.Build) void {
     const core_mod = b.addModule("tp_core", .{
         .root_source_file = b.path("src/core/core.zig"),
         .target = target,
+        .optimize = optimize,
         .link_libc = true,
     });
     mod.addImport("tp_core", core_mod);
@@ -102,6 +115,7 @@ pub fn build(b: *std.Build) void {
     const ops_mod = b.addModule("tp_ops", .{
         .root_source_file = b.path("src/ops.zig"),
         .target = target,
+        .optimize = optimize,
         .link_libc = true,
     });
     ops_mod.addImport("tp_core", core_mod);
@@ -114,6 +128,7 @@ pub fn build(b: *std.Build) void {
     const gpu_mod = b.addModule("tp_gpu", .{
         .root_source_file = b.path("src/gpu.zig"),
         .target = target,
+        .optimize = optimize,
         .link_libc = true,
     });
     gpu_mod.addImport("tp_core", core_mod);
@@ -128,6 +143,7 @@ pub fn build(b: *std.Build) void {
     const runtime_mod = b.addModule("tp_runtime", .{
         .root_source_file = b.path("src/runtime/runtime.zig"),
         .target = target,
+        .optimize = optimize,
         .link_libc = true,
     });
     mod.addImport("tp_runtime", runtime_mod);
@@ -139,6 +155,7 @@ pub fn build(b: *std.Build) void {
     const models_mod = b.addModule("tp_models", .{
         .root_source_file = b.path("src/tp_models.zig"),
         .target = target,
+        .optimize = optimize,
         .link_libc = true,
     });
     models_mod.addImport("tp_core", core_mod);
@@ -196,7 +213,6 @@ pub fn build(b: *std.Build) void {
     const self_hosted = b.option(bool, "self-hosted", "Build executables with the self-hosted backend (no LLVM)") orelse false;
     const use_llvm: ?bool = if (self_hosted) false else null;
 
-    const integration = b.option(bool, "integration", "Also run the slow GPU + real-model integration tests") orelse false;
     const build_opts = b.addOptions();
     build_opts.addOption(bool, "integration", integration);
     // Tie the compile-time flag to whether ggml was actually wired: if the
@@ -748,9 +764,17 @@ pub fn build(b: *std.Build) void {
     // set the releative field.
     const test_filter = b.option([]const u8, "test-filter", "Only run tests whose name matches this substring");
     const test_filters: []const []const u8 = if (test_filter) |f| &.{f} else &.{};
+    // `-Dtest-timing`: swap Zig's runner for one that reports per-test wall time
+    // (tools/test_timing_runner.zig), for finding what makes the gated suite slow.
+    const test_timing = b.option(bool, "test-timing", "Report per-test wall time instead of the normal runner") orelse false;
+    const test_runner: ?std.Build.Step.Compile.TestRunner = if (test_timing)
+        .{ .path = b.path("tools/test_timing_runner.zig"), .mode = .simple }
+    else
+        null;
     const mod_tests = b.addTest(.{
         .root_module = mod,
         .filters = test_filters,
+        .test_runner = test_runner,
     });
 
     // A run step that will run the test executable.
@@ -761,30 +785,35 @@ pub fn build(b: *std.Build) void {
     const core_tests = b.addTest(.{
         .root_module = core_mod,
         .filters = test_filters,
+        .test_runner = test_runner,
     });
     const run_core_tests = b.addRunArtifact(core_tests);
 
     const ops_tests = b.addTest(.{
         .root_module = ops_mod,
         .filters = test_filters,
+        .test_runner = test_runner,
     });
     const run_ops_tests = b.addRunArtifact(ops_tests);
 
     const gpu_tests = b.addTest(.{
         .root_module = gpu_mod,
         .filters = test_filters,
+        .test_runner = test_runner,
     });
     const run_gpu_tests = b.addRunArtifact(gpu_tests);
 
     const runtime_tests = b.addTest(.{
         .root_module = runtime_mod,
         .filters = test_filters,
+        .test_runner = test_runner,
     });
     const run_runtime_tests = b.addRunArtifact(runtime_tests);
 
     const models_tests = b.addTest(.{
         .root_module = models_mod,
         .filters = test_filters,
+        .test_runner = test_runner,
     });
     const run_models_tests = b.addRunArtifact(models_tests);
 
@@ -794,6 +823,7 @@ pub fn build(b: *std.Build) void {
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
         .filters = test_filters,
+        .test_runner = test_runner,
     });
 
     // A run step that will run the second test executable.

@@ -23,23 +23,31 @@ const std = @import("std");
 ///
 /// The rule:
 ///
-///   requested = total - limit          what the user asked to keep free
+///   requested = total - limit          how much of the card must NOT be ours
 ///   reserve   = max(requested, foreign)  what actually stays out of our hands
 ///   ours      = total - reserve          cap on our WHOLE footprint
 ///   tracked   = ours - untracked         cap on what our allocators count
 ///
-/// `reserve` is a max, not a subtraction. The alternative, `budget = limit - system`
-/// with `system` the residual `device_used - our_tracked`, enforces `card_used <= limit`
-/// but puts an unreliable measurement alone on the right-hand side: any under-reading of
-/// `system` inflates the budget directly, we promote layers to fill it, and the first big
-/// allocation OOMs. It IS under-read, because the policy resolves right after a load,
-/// before our own CUDA context, JIT'd modules and library workspaces exist. Taking the
-/// larger of what the user asked for and what other processes hold means an
-/// under-measured `foreign` cannot inflate anything; it falls back to the user's figure.
+/// `reserve` is a max, not a subtraction, and other processes count TOWARDS it.
+/// The handle asks that at least N bytes of the card are not this process's; the
+/// desktop holding more than N already satisfies that, so the handle stops
+/// binding and every setting collapses to `total - foreign`. That is intended.
 ///
-/// Consequence: once `foreign` exceeds the requested reserve the limit handle stops
-/// binding, and every setting collapses to `total - foreign`. That is intended, since
-/// other processes are already keeping more than N bytes out of our reach.
+/// The alternative, `budget = limit - system` with `system` the residual
+/// `device_used - our_tracked`, enforces `card_used <= limit` but puts an
+/// unreliable measurement alone on the right-hand side: any under-reading of
+/// `system` inflates the budget directly, we promote layers to fill it, and the
+/// first big allocation OOMs. It IS under-read, because the policy resolves right
+/// after a load, before our own CUDA context, JIT'd modules and library
+/// workspaces exist. Taking the larger of what the user asked for and what other
+/// processes hold means an under-measured `foreign` cannot inflate anything; it
+/// falls back to the user's figure.
+///
+/// This reserve is NOT the forward's transient headroom, and must not be read as
+/// it. It bounds RESIDENCY. Once it is satisfied by other processes the budget
+/// permits filling the rest of the card, so the room a forward's scratch needs
+/// has to be kept by whoever grows into that budget -- see `Participant.headroom`
+/// and the K/V growth path, which subtract `largestAllocation` for exactly this.
 ///
 /// The cap is on our WHOLE footprint because physical usage is
 /// `tracked + our untracked + foreign`. Capping only `tracked` leaves the untracked part
@@ -338,6 +346,21 @@ pub const Participant = struct {
         /// growth ceiling. Idempotent (a satisfied target is a no-op). Caller
         /// guarantees it runs on a thread that may bind this model's context.
         applyBudget: *const fn (ctx: *anyopaque, target: u64) void,
+        /// Give up EVERYTHING, keeping the work this model is queued to do.
+        /// Optional: null means "no such rung".
+        ///
+        /// `applyBudget` can only shed what a model treats as CACHE — for
+        /// diffusion, its weight LRU. What survives is the resident pipeline
+        /// itself: its context, its library workspaces, its activation scratch.
+        /// No budget target can reach those, so a peer that has "yielded
+        /// everything" can still be holding GiBs, and the asker's only remaining
+        /// option was to run on the CPU beside VRAM nothing was using.
+        ///
+        /// Only meaningful where the whole residency is recoverable work: an idle
+        /// image model reloads its pipeline for the next image. The LLM has no
+        /// such rung (its weights are pinned and its yield is layer migration,
+        /// which `applyBudget` already does), so it leaves this null.
+        releaseAll: ?*const fn (ctx: *anyopaque) void = null,
     };
 
     pub fn usage(self: Participant) u64 {
@@ -693,6 +716,43 @@ pub const Arbiter = struct {
         return true;
     }
 
+    /// MID-TURN growth poll, called from the busy LLM's own worker at a
+    /// boundary, not from an external edge. Returns whether it raised anything.
+    ///
+    /// `rebalance` runs on edges only: a queue starting or draining, a meter
+    /// drag, the turn's own idle->busy edge. Nothing re-plans WHILE a turn runs,
+    /// so a turn that began squeezed (layers on the host) stayed squeezed for the
+    /// whole of it however much the image model handed back meanwhile — and the
+    /// prefill it stayed squeezed through is the slow half. The edges that do
+    /// fire are not enough on their own: clearing the image model retracts the
+    /// participant without re-planning, and `retryUnsettled` is driven by the
+    /// frame loop, which emits no frames behind a prefill.
+    ///
+    /// GROWTH only, which is not timidity: mid-turn `usage()` carries the
+    /// transient buffers the forward just allocated, so a full plan from here
+    /// reads the LLM as fatter than it is and would migrate layers to the HOST in
+    /// the middle of the prefill this exists to speed up. Shrinking stays with
+    /// the edges and with the reactive `requestRoom` rung, which run when the
+    /// numbers are steady or when a peer actually needs the room.
+    ///
+    /// Publishes, never applies: the caller is the worker, so `settle` defers to
+    /// that worker's next boundary by construction and no foreign thread binds
+    /// the model's context. The peer is not settled either; the promote path
+    /// asks it for card space itself (`requestRoom`) if the raise needs bytes it
+    /// is still holding.
+    pub fn pollLlmGrowth(self: *Arbiter) bool {
+        const q = self.llm orelse return false;
+        if (!q.busy()) return false; // idle: `rebalance` owns the steady state
+        const p = self.plan() orelse return false;
+        const cur = q.control.budgetTarget() orelse q.usage();
+        if (p.llm <= cur) return false;
+        std.log.info("[vram] mid-turn: LLM ceiling {d} -> {d} MiB (plan {t}); its worker promotes at the next boundary", .{
+            cur >> 20, p.llm >> 20, p.arm,
+        });
+        _ = q.settle(p.llm);
+        return true;
+    }
+
     /// Diffusion queue started (`true`) / drained (`false`). Triggers a rebalance
     /// so the LLM starts yielding immediately, before the image model loads.
     pub fn setDiffusionActive(self: *Arbiter, active: bool) void {
@@ -744,9 +804,70 @@ pub const Arbiter = struct {
         const target = @max(used -| bytes, @max(peer.floor(), 1));
         if (target >= used) return 0;
         peer.vtable.applyBudget(peer.ctx, target);
-        const freed = used -| peer.usage();
+        var freed = used -| peer.usage();
         std.log.info("[vram] {t} asked for {d} MiB: peer yielded {d} MiB ({d}→{d} MiB resident)", .{
             side, bytes >> 20, freed >> 20, used >> 20, peer.usage() >> 20,
+        });
+        if (freed < bytes) freed += self.releasePeer(peer, side, bytes - freed);
+        return freed;
+    }
+
+    /// Last rung of `requestRoom`: the incremental yield came up short, so ask an
+    /// idle peer to drop its residency ENTIRELY (`VTable.releaseAll`).
+    ///
+    /// This is the difference between "the image model gave back what it could"
+    /// and "the LLM fits". `applyBudget` bottoms out at the peer's irreducible
+    /// footprint — context, workspaces, activation scratch — which is exactly the
+    /// GiB or two that leaves the last layers of a large LLM stranded on the CPU,
+    /// running at a fraction of device speed beside VRAM that nothing is using.
+    ///
+    /// Three conditions, and each one is load-bearing:
+    ///   still short   an asker that got what it needed never pays this.
+    ///   not busy      mid-image eviction is what soft residency exists to avoid.
+    ///   queue IDLE    `busy` is only "generating right now". Releasing between two
+    ///                 queued images would hand back VRAM the next one reloads
+    ///                 seconds later, which is the bouncing this system is built to
+    ///                 prevent. A contended queue is what the split handle decides.
+    fn releasePeer(self: *Arbiter, peer: Participant, side: Side, still_short: u64) u64 {
+        const rel = peer.vtable.releaseAll orelse return 0;
+        // The ASKER has to be working. `promoteBack` also runs on an IDLE model —
+        // every image that finishes rebalances, which hands the idle LLM a big
+        // ceiling that it then applies on the spot — and that ask is speculative:
+        // it is filling a ceiling it has no work for. Honouring it here threw away
+        // the image model's entire pipeline between two images, which the next
+        // image reloaded from disk seconds later. A model that is actually
+        // generating asks again at its next boundary, and THAT is the ask worth a
+        // peer's whole residency.
+        const asker = (switch (side) {
+            .llm => self.llm,
+            .diffusion => self.diffusion,
+        }) orelse return 0;
+        if (!asker.busy()) {
+            std.log.debug("[vram] {t} is idle: promoting speculatively, not releasing the peer", .{side});
+            return 0;
+        }
+        const peer_queued = switch (side) {
+            .llm => self.diff_active, // the peer IS diffusion
+            .diffusion => false, // an LLM turn shows up as `busy`
+        };
+        if (peer_queued or peer.busy()) return 0;
+        const used = peer.usage();
+        if (used == 0) return 0;
+        rel(peer.ctx);
+        const freed = used -| peer.usage();
+        // A peer may enact this on its OWN thread at its own safe point rather
+        // than here (diffusion does: its session pointer has one writer, so the
+        // free belongs to the UI thread). Then nothing is free yet and the asker
+        // must not act as though it were — it picks the room up at its next
+        // boundary poll, which is a frame away, not a turn away.
+        if (freed == 0) {
+            std.log.info("[vram] {t} still {d} MiB short: asked the peer to release its {d} MiB residency; it drops at its next safe point", .{
+                side, still_short >> 20, used >> 20,
+            });
+            return 0;
+        }
+        std.log.info("[vram] {t} still {d} MiB short: peer RELEASED its whole residency, {d} MiB ({d}→{d} MiB) — it reloads on its next job", .{
+            side, still_short >> 20, freed >> 20, used >> 20, peer.usage() >> 20,
         });
         return freed;
     }
@@ -796,7 +917,7 @@ fn expectMiB(expected: u64, actual: u64) !void {
     }
 }
 
-test "vram.resolve: the reserve is a max, so an under-read of foreign cannot inflate the cap" {
+test "vram.resolve: other processes count towards the reserve, so the handle stops binding" {
     const total: u64 = 24101 << 20;
     // The measured case: 2064 MiB of desktop, 1104 MiB of our own untracked VRAM.
     const r = resolve(.{ .fraction = 0.985 }, .{
@@ -806,13 +927,29 @@ test "vram.resolve: the reserve is a max, so an under-read of foreign cannot inf
         .ours_tracked = 20533 << 20,
     }, 0);
     try expectMiB(361, r.requested); // 1.5% of the card
-    try expectMiB(2064, r.bytes); // foreign wins the max
+    try expectMiB(2064, r.bytes); // foreign already keeps more than the request out
     try expectMiB(1104, r.untracked);
     try expectMiB(22037, r.ours);
     try expectMiB(20933, r.tracked);
     // The whole point: ours + reserve never exceeds the card.
     try std.testing.expect(r.ours + r.bytes <= total);
     try std.testing.expect(r.tracked + r.untracked + r.bytes <= total);
+}
+
+test "vram.resolve: an under-read of foreign still cannot inflate the cap past the request" {
+    const total: u64 = 24101 << 20;
+    // foreign reads as 0 (the cold case, before anything else has allocated).
+    // The user's figure has to remain the floor, which is why the request is a
+    // term in the sum rather than something foreign can wash out.
+    const r = resolve(.{ .fraction = 0.985 }, .{
+        .total = total,
+        .foreign = 0,
+        .ours_total = 0,
+        .ours_tracked = 0,
+    }, 0);
+    try expectMiB(361, r.requested);
+    try expectMiB(361, r.bytes); // degrades to the user's figure, never below it
+    try std.testing.expect(r.bytes >= r.requested);
 }
 
 test "vram.resolve: the user's reserve wins when other processes are small" {
@@ -842,6 +979,15 @@ test "vram.resolve: the untracked high-water floor cannot be re-inflated by a co
     }, 1104 << 20);
     try expectMiB(1104, cold.untracked);
     try expectMiB(20933, cold.tracked);
+    // The property under test, independent of the arithmetic: a cold read must
+    // land on the SAME cap as a warm one, not a more generous one.
+    const warm = resolve(.{ .fraction = 0.985 }, .{
+        .total = total,
+        .foreign = 2064 << 20,
+        .ours_total = 21637 << 20,
+        .ours_tracked = 20533 << 20,
+    }, 0);
+    try std.testing.expectEqual(warm.tracked, cold.tracked);
 }
 
 test "vram.resolve: no NVML degrades to the residual, and never overcommits" {
@@ -878,6 +1024,19 @@ const MockModel = struct {
     /// Refuse `applyBudget` outright, standing in for `giveUpToBudget`'s tryLock
     /// decline. The target is recorded but residency does not move.
     declines: bool = false,
+    /// Residency `applyBudget` CANNOT reach, however low the target: the image
+    /// pipeline's context, library workspaces and activation scratch, none of
+    /// which live in the weight cache it evicts from. Distinct from `floor_b`,
+    /// which is what the model REPORTS as un-evictable; this is what it actually
+    /// bottoms out at, and the gap between the two is the whole reason
+    /// `releaseAll` exists.
+    irreducible: u64 = 0,
+    /// Set when the `releaseAll` rung fired.
+    released: bool = false,
+    /// Enact `releaseAll` LATER, on the model's own thread, as diffusion does
+    /// (its session pointer has one writer, so the free belongs to the UI thread).
+    /// Nothing is free when the rung returns.
+    release_defers: bool = false,
     is_busy: bool = false,
     applied: ?u64 = null, // last applyBudget target (null = never applied directly)
     /// applyBudget targets in call order across ALL mocks, for ordering asserts.
@@ -910,7 +1069,16 @@ const MockModel = struct {
         if (m.declines) return; // the target was seen and ignored, as a tryLock decline is
         // Real participants only ever move toward the target: shrink to it, or
         // grow up to their demand. Mirror that so `used` stays believable.
-        if (target < m.used) m.used = @max(target, m.floor_b) else m.used = @min(target, @max(m.want, m.used));
+        if (target < m.used)
+            m.used = @max(@max(target, m.floor_b), m.irreducible)
+        else
+            m.used = @min(target, @max(m.want, m.used));
+    }
+    fn releaseFn(ctx: *anyopaque) void {
+        const m = mock(ctx);
+        m.released = true;
+        if (m.declines or m.release_defers) return;
+        m.used = 0; // the whole pipeline goes, irreducible part included
     }
     fn mock(ctx: *anyopaque) *MockModel {
         return @ptrCast(@alignCast(ctx));
@@ -925,6 +1093,20 @@ const MockModel = struct {
     };
     fn participant(self: *MockModel) Participant {
         return .{ .ctx = self, .control = &self.cp, .vtable = &vtable };
+    }
+    /// A participant that also exposes the drop-everything rung, as diffusion
+    /// does and the LLM deliberately does not.
+    const vtable_rel: Participant.VTable = .{
+        .usage = usageFn,
+        .demand = demandFn,
+        .headroom = headroomFn,
+        .floor = floorFn,
+        .busy = busyFn,
+        .applyBudget = applyFn,
+        .releaseAll = releaseFn,
+    };
+    fn releasable(self: *MockModel) Participant {
+        return .{ .ctx = self, .control = &self.cp, .vtable = &vtable_rel };
     }
 };
 
@@ -1391,6 +1573,180 @@ test "Arbiter: a busy LLM still yields (via its control point, not a direct appl
     try std.testing.expectEqual(@as(?u64, null), m.applied);
     // ...but the target is published, so the LLM worker yields at its next token.
     try std.testing.expectEqual(@as(?u64, 6 << 30), m.cp.budgetTarget());
+}
+
+test "Arbiter.requestRoom: a DEFERRED release reports only what is actually free" {
+    // Diffusion enacts the rung on its own thread (the UI thread owns its session
+    // pointer), so when `requestRoom` returns, nothing has been freed yet. It must
+    // report 0 rather than the bytes the peer intends to give: `promoteBack` sizes
+    // its next promote against what it can SEE, and a phantom credit here would
+    // have it allocate into VRAM that is still occupied.
+    var llm: MockModel = .{ .used = 6 << 30, .want = 20 << 30, .is_busy = true };
+    var diff: MockModel = .{ .used = 8 << 30, .want = 8 << 30, .irreducible = 3 << 30, .release_defers = true };
+    var arb: Arbiter = .{
+        .llm = llm.participant(),
+        .diffusion = diff.releasable(),
+        .limit = 22 << 30,
+        .llm_share = 6 << 30,
+    };
+    // 5 GiB of weight cache trimmed now; the pipeline itself drops a frame later.
+    try std.testing.expectEqual(@as(u64, 5 << 30), arb.requestRoom(.llm, 8 << 30));
+    try std.testing.expect(diff.released); // asked
+    try std.testing.expectEqual(@as(u64, 3 << 30), diff.used); // not yet enacted
+}
+
+test "Arbiter.requestRoom: an IDLE asker never releases the peer" {
+    // Regression: the image model was unloading between images with nothing else
+    // running. Each drained queue rebalances, the idle LLM is handed a big ceiling
+    // and applies it on the spot, and `promoteBack` then asks for card room to
+    // fill it. That ask is speculative — no turn is running — but it was reaching
+    // the release rung and dropping the whole pipeline, which the next image
+    // reloaded from disk.
+    var llm: MockModel = .{ .used = 6 << 30, .want = 20 << 30, .is_busy = false };
+    var diff: MockModel = .{ .used = 8 << 30, .want = 8 << 30, .irreducible = 3 << 30 };
+    var arb: Arbiter = .{
+        .llm = llm.participant(),
+        .diffusion = diff.releasable(),
+        .limit = 22 << 30,
+        .llm_share = 6 << 30,
+    };
+    _ = arb.requestRoom(.llm, 6 << 30);
+    try std.testing.expect(!diff.released);
+    try std.testing.expectEqual(@as(u64, 3 << 30), diff.used); // trimmed, still loaded
+
+    // The same ask from a RUNNING turn is the one worth the peer's residency.
+    llm.is_busy = true;
+    _ = arb.requestRoom(.llm, 6 << 30);
+    try std.testing.expect(diff.released);
+    try std.testing.expectEqual(@as(u64, 0), diff.used);
+}
+
+test "Arbiter.requestRoom: an idle image model is RELEASED when trimming it is not enough" {
+    // The reported symptom: the LLM ends up running layers on the CPU beside an
+    // idle image model that "already yielded". It had — of its weight cache. The
+    // 3 GiB underneath (pipeline context, workspaces, activation scratch) is not
+    // cache, no budget target reaches it, and `promoteBack` just breaks and
+    // leaves the rest of the model on the host.
+    var llm: MockModel = .{ .used = 6 << 30, .want = 20 << 30, .is_busy = true }; // a turn is running
+    var diff: MockModel = .{ .used = 8 << 30, .want = 8 << 30, .irreducible = 3 << 30 };
+    var arb: Arbiter = .{
+        .llm = llm.participant(),
+        .diffusion = diff.releasable(),
+        .limit = 22 << 30,
+        .llm_share = 6 << 30,
+    };
+
+    const freed = arb.requestRoom(.llm, 6 << 30);
+    try std.testing.expect(diff.released);
+    try std.testing.expectEqual(@as(u64, 8 << 30), freed); // everything, not the 5 GiB of cache
+    try std.testing.expectEqual(@as(u64, 0), diff.used);
+}
+
+test "Arbiter.requestRoom: the release rung is a LAST resort, not a default" {
+    // Satisfied by the incremental yield: the pipeline stays, because reloading it
+    // for the next image costs seconds and nothing needed those bytes.
+    {
+        var llm: MockModel = .{ .used = 6 << 30, .want = 20 << 30, .is_busy = true };
+        var diff: MockModel = .{ .used = 8 << 30, .want = 8 << 30, .irreducible = 1 << 30 };
+        var arb: Arbiter = .{ .llm = llm.participant(), .diffusion = diff.releasable(), .limit = 22 << 30 };
+        try std.testing.expectEqual(@as(u64, 2 << 30), arb.requestRoom(.llm, 2 << 30));
+        try std.testing.expect(!diff.released);
+        try std.testing.expectEqual(@as(u64, 6 << 30), diff.used);
+    }
+    // Images QUEUED (not generating this instant): releasing here hands back VRAM
+    // the next image reloads seconds later, the bouncing this system exists to
+    // prevent. Contention between two working models is the split handle's call.
+    {
+        var llm: MockModel = .{ .used = 6 << 30, .want = 20 << 30, .is_busy = true };
+        var diff: MockModel = .{ .used = 8 << 30, .want = 8 << 30, .irreducible = 3 << 30 };
+        var arb: Arbiter = .{
+            .llm = llm.participant(),
+            .diffusion = diff.releasable(),
+            .limit = 22 << 30,
+            .diff_active = true,
+        };
+        _ = arb.requestRoom(.llm, 6 << 30);
+        try std.testing.expect(!diff.released);
+        try std.testing.expectEqual(@as(u64, 3 << 30), diff.used); // trimmed only
+    }
+    // A peer with no such rung (the LLM: pinned weights, migration is its yield)
+    // is asked and left alone.
+    {
+        var llm: MockModel = .{ .used = 8 << 30, .want = 8 << 30, .irreducible = 3 << 30 };
+        var diff: MockModel = .{ .used = 2 << 30, .want = 8 << 30, .is_busy = true }; // an image is generating
+        var arb: Arbiter = .{ .llm = llm.participant(), .diffusion = diff.participant(), .limit = 22 << 30 };
+        _ = arb.requestRoom(.diffusion, 6 << 30);
+        try std.testing.expect(!llm.released);
+        try std.testing.expectEqual(@as(u64, 3 << 30), llm.used);
+    }
+}
+
+test "Arbiter.pollLlmGrowth: a mid-turn poll raises a ceiling the edges left stale" {
+    // The turn starts with an image queued, so the split handle pins the LLM to
+    // its share and its prefill runs with layers on the host. Then the peer stops
+    // holding VRAM without an edge reaching the arbiter: the image model is
+    // cleared (`freeDiffuser` retracts the participant and clears `diff_active`
+    // without re-planning), or the queue drained while the UI thread, the only
+    // caller of `retryUnsettled`, was asleep behind a prefill that emits no
+    // frames. Nothing re-plans until the turn ENDS, so the whole slow half runs
+    // squeezed against VRAM nobody holds.
+    var llm: MockModel = .{ .used = 6 << 30, .want = 20 << 30, .floor_b = 2 << 30, .is_busy = true };
+    var diff: MockModel = .{ .used = 8 << 30, .want = 8 << 30, .floor_b = 0 };
+    var arb: Arbiter = .{
+        .llm = llm.participant(),
+        .diffusion = diff.participant(),
+        .limit = 22 << 30,
+        .llm_share = 6 << 30,
+    };
+    arb.setDiffusionActive(true); // an image is queued: arm (2), both working
+    try std.testing.expectEqual(@as(?u64, 6 << 30), llm.cp.budgetTarget());
+
+    // Mid-prefill with the image still running: no raise, and no shrink either.
+    try std.testing.expect(!arb.pollLlmGrowth());
+    try std.testing.expectEqual(@as(?u64, 6 << 30), llm.cp.budgetTarget());
+
+    // The image model goes away mid-prefill, edge-less.
+    arb.diffusion = null;
+    arb.diff_active = false;
+    try std.testing.expect(arb.pollLlmGrowth());
+    try std.testing.expectEqual(@as(?u64, 22 << 30), llm.cp.budgetTarget());
+    // Published, not applied: the worker owns its own device context.
+    try std.testing.expectEqual(@as(?u64, null), llm.applied);
+    llm.participant().pollAndApply();
+    try std.testing.expectEqual(@as(?u64, 22 << 30), llm.applied);
+}
+
+test "Arbiter.pollLlmGrowth: never shrinks a running turn, and no-ops when idle" {
+    // Growth only. Mid-forward `usage` carries the pass's transient buffers, so a
+    // plan taken from here reads the LLM as fatter than it is; acting on that would
+    // migrate layers to the HOST in the middle of the prefill this speeds up.
+    var llm: MockModel = .{ .used = 20 << 30, .want = 20 << 30, .floor_b = 2 << 30, .is_busy = true };
+    var diff: MockModel = .{ .used = 2 << 30, .floor_b = 0 };
+    var arb: Arbiter = .{
+        .llm = llm.participant(),
+        .diffusion = diff.participant(),
+        .limit = 22 << 30,
+        .llm_share = 6 << 30,
+    };
+    arb.rebalance();
+    const settled = llm.cp.budgetTarget();
+
+    // The peer grows (a queued image loading): the plan now wants the LLM smaller.
+    diff.used = 10 << 30;
+    diff.want = 10 << 30;
+    try std.testing.expect(!arb.pollLlmGrowth());
+    try std.testing.expectEqual(settled, llm.cp.budgetTarget()); // untouched
+    // Shrinking still happens, on the edge that owns it.
+    arb.setDiffusionActive(true);
+    try std.testing.expectEqual(@as(?u64, 6 << 30), llm.cp.budgetTarget());
+
+    // Idle LLM: `rebalance` owns the steady state, so the poll declines outright
+    // (it would otherwise apply on the CALLING thread, which is the whole reason
+    // settle distinguishes the two).
+    llm.is_busy = false;
+    diff.used = 0;
+    diff.want = 0;
+    try std.testing.expect(!arb.pollLlmGrowth());
 }
 
 test "Arbiter.diffusionBudget: uninitialized budgets mean auto (0), not the 256 MiB floor" {

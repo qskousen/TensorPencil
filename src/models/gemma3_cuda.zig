@@ -25,6 +25,7 @@ const ops = @import("tp_ops");
 const kvmod = @import("tp_core").kv_cache;
 const sample = @import("tp_core").sample;
 const residency = @import("tp_runtime").residency;
+const bnd = @import("tp_runtime").boundary;
 const transformer = @import("transformer.zig");
 const transformer_gpu = @import("transformer_gpu.zig");
 
@@ -62,12 +63,34 @@ const max_batch = @max(prefill_chunk, max_image_tokens);
 /// Activation-buffer height. opMatmulQuant pads its output rows up to a
 /// multiple of 128, so GEMM-output buffers must reserve the padded height.
 const buf_rows = std.mem.alignForward(usize, max_batch, 128);
+/// Activation-buffer height for a session that has not seen an image. A text
+/// prefill never batches more than `prefill_chunk`, so this is all a text-only
+/// conversation can use; `ensureBufRows` grows to `buf_rows` when an image block
+/// actually arrives. Having a vision tower CONFIGURED is not the same as using
+/// it, and the buffers cannot tell the difference at load.
+const text_buf_rows = std.mem.alignForward(usize, prefill_chunk, 128);
 
-/// Rows a LOCAL (sliding-window) layer's KV ring holds: window + one max-batch
-/// of slack (see gemma4_cuda for the aliasing rationale). LOCAL caches are
-/// fixed at this size and never grow (TODO lever 1).
+/// Rows a LOCAL (sliding-window) layer's KV ring holds once the conversation is
+/// longer than the window: window + one max-batch of slack (see gemma4_cuda for
+/// the aliasing rationale). This is the ring's CEILING, not what it commits.
 fn localRingRows(cfg: gemma3.Config) usize {
     return cfg.sliding_window + max_batch;
+}
+
+/// Bytes a LOCAL ring commits to cover `rows` positions.
+///
+/// The ring maps position p to row `p % ring`, so while `len <= ring` only rows
+/// [0, len) are ever addressed (`ringSegments` never reaches past `len`): a
+/// committed PREFIX is enough, and the buffer grows with the conversation
+/// exactly like a GLOBAL layer's. It stops at the ring size, past which it wraps
+/// and needs all of it.
+///
+/// These used to commit the whole ring at load. With Gemma's 5:1 local:global
+/// pattern that is most of the model's K/V allocated up front for a window the
+/// conversation has not reached, and on a card this size it was the difference
+/// between fitting and offloading layers on the first forward.
+fn ringBytes(cfg: gemma3.Config, dt: kvmod.KvDtype, rows: usize) usize {
+    return dt.sizeBytes(@min(rows, localRingRows(cfg)) * cfg.kvDim());
 }
 
 /// Kill-switch for the LOCAL-layer sliding-window ring cache (A/B validation).
@@ -127,6 +150,9 @@ pub const CudaLM = struct {
     /// Set for the duration of a bidirectional image-block prefill: the
     /// `attention` stepper (device + host-split) reads it and lets every query
     /// in the batch attend the whole block forward (image spans are non-causal).
+    /// Rows the activation buffers are currently allocated for. Starts at the
+    /// text prefill chunk and grows once, to `buf_rows`, on the first image.
+    buf_rows: usize = 0,
     bidir_prefill: bool = false,
     /// Io for the host matmuls of a hybrid split's CPU-resident layers; set
     /// by the step entry points, or seeded by the session owner BEFORE the
@@ -138,13 +164,17 @@ pub const CudaLM = struct {
     /// offload migrates more to the host as the KV cache grows). null = fully
     /// device-resident. Forces the per-op path (already the gemma3 default).
     split: ?Split = null,
-    /// Coordinator-published residency target, polled between prefill chunks so
-    /// a ceiling raised mid-turn takes effect DURING the prefill it was raised
-    /// for rather than after it. The decode loop polls the same target through
-    /// `engine.checkpoint`; prefill never reaches that call. null on the CLI.
-    residency_poll: ?residency.Poll = null,
+    /// The frontend's turn hook, run between prefill chunks: enact a
+    /// coordinator-published residency ceiling, park on a pause, stop on a
+    /// cancel. The decode loop reaches the same three through
+    /// `engine.checkpoint`; prefill never does, so without this a turn's slow
+    /// half runs uncoordinated and unstoppable. null on the CLI.
+    boundary: ?bnd.Hook = null,
     /// half = head_dim/2; the sin table starts at cap.max*half in each freqs
     /// buffer (baked capacity-independent, like qwen3_cuda).
+    /// Rows the RoPE tables cover; the sin offset is derived from it, so the two
+    /// move together or every rotation past the old count reads cos as sin.
+    rope_rows: usize = 0,
     sin_off: usize,
     /// Global-layer (theta 1e6, scale 1/8) and local-layer (theta 1e4) RoPE
     /// tables; [2 * cap.max * half] f32 (cos then sin) each.
@@ -212,14 +242,21 @@ pub const CudaLM = struct {
         self.len = 0;
         self.split = null;
         self.io = null; // field defaults do not apply to `undefined`-built structs
-        self.sin_off = cap.max * (cfg.head_dim / 2);
+        // RoPE tables cover the COMMITTED capacity and grow with it (`growRope`).
+        // Sized at `cap.max` they were the largest activation allocation on a
+        // long-context model, held up front for context a conversation will
+        // almost never reach, beside a K/V cache that grows lazily. The table is
+        // DERIVED from position, so rebuilding costs only the upload.
+        self.rope_rows = cap.initial;
+        self.sin_off = cap.initial * (cfg.head_dim / 2);
 
-        self.freqs_global = try uploadFreqs(be, gpa, cap.max, cfg.head_dim, cfg.rope_theta, cfg.rope_freq_scale);
+        self.freqs_global = try uploadFreqs(be, gpa, cap.initial, cfg.head_dim, cfg.rope_theta, cfg.rope_freq_scale);
         errdefer be.tensorDestroy(&self.freqs_global);
-        self.freqs_local = try uploadFreqs(be, gpa, cap.max, cfg.head_dim, cfg.rope_theta_local, 1.0);
+        self.freqs_local = try uploadFreqs(be, gpa, cap.initial, cfg.head_dim, cfg.rope_theta_local, 1.0);
         errdefer be.tensorDestroy(&self.freqs_local);
 
-        self.bufs = try Bufs.init(be, cfg);
+        self.buf_rows = text_buf_rows;
+        self.bufs = try Bufs.init(be, cfg, self.buf_rows);
 
         self.k_cache = try alloc.alloc(Growable, cfg.n_layers);
         self.v_cache = try alloc.alloc(Growable, cfg.n_layers);
@@ -255,9 +292,10 @@ pub const CudaLM = struct {
         for (self.k_cache, self.v_cache, 0..) |*kb, *vb, l| {
             if (self.split) |*sp| if (!sp.on_gpu[l]) continue;
             if (usesRing(cfg, l)) {
-                const bytes = dt.sizeBytes(localRingRows(cfg) * cfg.kvDim());
-                kb.* = try be.growableCreate(bytes, bytes);
-                vb.* = try be.growableCreate(bytes, bytes);
+                const init_b = ringBytes(cfg, dt, self.initial_capacity);
+                const max_b = ringBytes(cfg, dt, std.math.maxInt(usize));
+                kb.* = try be.growableCreate(init_b, max_b);
+                vb.* = try be.growableCreate(init_b, max_b);
             } else {
                 kb.* = try be.growableCreate(dt.sizeBytes(self.initial_capacity * cfg.kvDim()), dt.sizeBytes(self.max_capacity * cfg.kvDim()));
                 vb.* = try be.growableCreate(dt.sizeBytes(self.initial_capacity * cfg.kvDim()), dt.sizeBytes(self.max_capacity * cfg.kvDim()));
@@ -569,9 +607,10 @@ pub const CudaLM = struct {
         const kvd = cfg.kvDim();
         const dt = self.kv_dtype;
         if (usesRing(cfg, l)) {
-            const bytes = dt.sizeBytes(localRingRows(cfg) * kvd);
-            self.k_cache[l] = try self.be.growableCreate(bytes, bytes);
-            self.v_cache[l] = try self.be.growableCreate(bytes, bytes);
+            const init_b = ringBytes(cfg, dt, self.capacity);
+            const max_b = ringBytes(cfg, dt, std.math.maxInt(usize));
+            self.k_cache[l] = try self.be.growableCreate(init_b, max_b);
+            self.v_cache[l] = try self.be.growableCreate(init_b, max_b);
         } else {
             self.k_cache[l] = try self.be.growableCreate(dt.sizeBytes(self.capacity * kvd), dt.sizeBytes(self.max_capacity * kvd));
             self.v_cache[l] = try self.be.growableCreate(dt.sizeBytes(self.capacity * kvd), dt.sizeBytes(self.max_capacity * kvd));
@@ -722,6 +761,23 @@ pub const CudaLM = struct {
         for (order[0..n_cpu]) |l| try self.migrateLayer(l);
     }
 
+    /// Rebuild the device RoPE tables to cover `rows`. Pure function of position,
+    /// so this reuploads rather than preserving anything. Both tables and the sin
+    /// offset move together (see `rope_rows`).
+    fn growRope(self: *CudaLM, rows: usize) !void {
+        if (rows <= self.rope_rows) return;
+        const cfg = self.cfg;
+        var g = try uploadFreqs(self.be, self.gpa, rows, cfg.head_dim, cfg.rope_theta, cfg.rope_freq_scale);
+        errdefer self.be.tensorDestroy(&g);
+        const l = try uploadFreqs(self.be, self.gpa, rows, cfg.head_dim, cfg.rope_theta_local, 1.0);
+        self.be.tensorDestroy(&self.freqs_global);
+        self.be.tensorDestroy(&self.freqs_local);
+        self.freqs_global = g;
+        self.freqs_local = l;
+        self.rope_rows = rows;
+        self.sin_off = rows * (cfg.head_dim / 2);
+    }
+
     pub fn ensureCapacity(self: *CudaLM, min_rows: usize) !void {
         const target = (try kvmod.growPlan(self.capacity, self.max_capacity, min_rows)) orelse return;
         // Byte size MUST match how the buffers were created (kv_dtype block
@@ -734,17 +790,39 @@ pub const CudaLM = struct {
         // the device KV, instead of streaming weights (the cliff). Each migrated
         // layer frees its device KV + weight VRAM. Mirrors qwen35_cuda.
         if (self.split) |*sp| if (sp.dynamic) {
-            const add = self.kv_dtype.sizeBytes((target - self.capacity) * self.cfg.kvDim());
+            // Per layer, not `liveSlots() * add`: with Gemma's 5:1 local:global
+            // pattern most layers are rings that stop growing at the window, so
+            // charging every one the global increment overstates the need by
+            // ~the pattern and migrates layers to the host to make room for
+            // bytes the grow was never going to ask for.
+            var add: u64 = 0;
+            for (0..self.cfg.n_layers) |l| {
+                if (!sp.on_gpu[l]) continue;
+                const from = if (usesRing(self.cfg, l)) ringBytes(self.cfg, self.kv_dtype, self.capacity) else self.kv_dtype.sizeBytes(self.capacity * self.cfg.kvDim());
+                const to = if (usesRing(self.cfg, l)) ringBytes(self.cfg, self.kv_dtype, target) else bytes;
+                add += 2 * (to -| from); // K and V
+            }
             while (true) {
-                const need = self.liveSlots() * 2 * add + (32 << 20); // + margin
+                // The margin must cover the forward's LARGEST single
+                // allocation, not a flat guess. `promoteBack` already reserves
+                // exactly this before bringing a layer back, for exactly this
+                // reason; growing the K/V into the same budget without it is the
+                // same mistake on the other path. The card is allowed to fill to
+                // zero free once other processes satisfy the reserve (that is
+                // what the reserve MEANS), so nothing above us is keeping the
+                // forward's scratch any room -- this is where it has to come
+                // from. A flat 32 MiB let the grow land 13 MiB short of a 220 MiB
+                // dequant buffer, which the OOM handler then paid for by dumping
+                // four layers to the host.
+                const need = add + residency.promoteReserve(self);
                 const free = @min(sp.budget -| self.be.deviceUsed(), self.be.headroom());
                 if (free >= need) break;
                 if (!(try residency.migrateNext(self))) break; // nothing left; fall through
             }
         };
 
-        // Grow device KV of the layers still on the GPU (LOCAL ring layers are
-        // fixed-size, never grow them). Physical VRAM can be exhausted even when
+        // Grow device KV of the layers still on the GPU (LOCAL rings grow too,
+        // capped at the ring). Physical VRAM can be exhausted even when
         // the proactive migration above thought there was room: a resident image
         // model on another CUDA context may grab it between the headroom check and
         // this commit. On a real OOM, offload one more layer to the CPU and retry
@@ -753,10 +831,12 @@ pub const CudaLM = struct {
         // host. growableEnsure is idempotent, so re-running the loop is cheap.
         grow: while (true) {
             for (0..self.cfg.n_layers) |l| {
-                if (usesRing(self.cfg, l)) continue;
                 if (self.split) |*sp| if (!sp.on_gpu[l]) continue;
+                // A LOCAL ring grows like a GLOBAL layer until it reaches the
+                // window, then stops: past that it wraps and is already whole.
+                const want = if (usesRing(self.cfg, l)) ringBytes(self.cfg, self.kv_dtype, target) else bytes;
                 for ([2]*Growable{ &self.k_cache[l], &self.v_cache[l] }) |b| {
-                    self.be.growableEnsure(b, bytes) catch |err| switch (err) {
+                    self.be.growableEnsure(b, want) catch |err| switch (err) {
                         error.DeviceOutOfMemory, error.OutOfMemory => {
                             if (self.split != null and try residency.migrateNext(self)) continue :grow;
                             return error.ContextFull;
@@ -767,6 +847,9 @@ pub const CudaLM = struct {
             }
             break;
         }
+        // The device RoPE tables cover `capacity`, so they grow with it.
+        try self.growRope(target);
+
         // A hybrid split keeps host KV/RoPE for its CPU layers; grow them in
         // lockstep so host positions stay aligned with the device len.
         if (self.split) |*sp| {
@@ -860,7 +943,7 @@ pub const CudaLM = struct {
     pub fn prefill(self: *CudaLM, ids: []const u32) !void {
         var off: usize = 0;
         while (off < ids.len) {
-            residency.pollBoundary(self);
+            try bnd.check(self);
             const n: usize = @min(prefill_chunk, ids.len - off);
             try self.embedChunk(ids[off..][0..n], false, null);
             off += n;
@@ -870,6 +953,26 @@ pub const CudaLM = struct {
     /// Prefill one image's projected embeddings ([grid_w*grid_h][hidden],
     /// injected UNSCALED) at the next sequential positions. grid dims are
     /// carried for interface parity (gemma is always 16x16 = 256).
+    /// Grow the activation buffers to hold `rows` in one batch. No-op once big
+    /// enough, so only the first image in a session pays a reallocation.
+    ///
+    /// Safe between forwards because these are pure per-forward scratch, unlike
+    /// the K/V caches: nothing carries across a call. The batch must not be open
+    /// (called before `beginBatch`), or queued kernels would still reference the
+    /// freed buffers. This stepper captures no decode graph, so there are no
+    /// baked-in pointers to invalidate; a stepper that gains one must drop it
+    /// here.
+    fn ensureBufRows(self: *CudaLM, rows: usize) !void {
+        const want = std.mem.alignForward(usize, rows, 128);
+        if (want <= self.buf_rows) return;
+        std.debug.assert(!self.be.batching());
+        _ = self.be.ctx.api.cuStreamSynchronize(self.be.ctx.stream);
+        self.bufs.deinit(self.be);
+        self.bufs = try Bufs.init(self.be, self.cfg, want);
+        self.buf_rows = want;
+        std.log.info("[vram] activation buffers grown to {d} rows for a {d}-token image block", .{ want, rows });
+    }
+
     pub fn prefillImage(self: *CudaLM, embeds: []const f32, grid_w: usize, grid_h: usize) !void {
         _ = grid_w;
         _ = grid_h;
@@ -879,6 +982,8 @@ pub const CudaLM = struct {
         // A bidirectional image block must be one batch (a later chunk's KV is
         // not committed when an earlier chunk runs); it fits in max_batch rows.
         std.debug.assert(total <= max_batch);
+        // First image in this session: the buffers were sized for text.
+        try self.ensureBufRows(total);
         self.bidir_prefill = true;
         defer self.bidir_prefill = false;
         try self.forwardRows(embeds, false, null);
@@ -1006,7 +1111,7 @@ pub const CudaLM = struct {
         const n = x_host.len / cfg.hidden;
         const eps = cfg.rms_eps;
         const pos0 = self.len;
-        std.debug.assert(n >= 1 and n <= max_batch and n <= self.remaining());
+        std.debug.assert(n >= 1 and n <= self.buf_rows and n <= self.remaining());
 
         try be.tensorUpload(offsetBufSized(b.x, 0, n * cfg.hidden * 4), std.mem.sliceAsBytes(x_host));
 
@@ -1124,10 +1229,10 @@ const Bufs = struct {
     topk_v: Buf,
     topk_i: Buf,
 
-    fn init(be: *Backend, cfg: gemma3.Config) !Bufs {
-        // Height for the largest single batch (text chunk or whole image block),
-        // rounded up to the GEMM's 128-row output padding.
-        const pc = buf_rows;
+    fn init(be: *Backend, cfg: gemma3.Config, rows: usize) !Bufs {
+        // Height in rows, already 128-aligned by the caller (opMatmulQuant pads
+        // its output rows to a multiple of 128).
+        const pc = rows;
         const hd = cfg.head_dim;
         var self: Bufs = undefined;
         var created: usize = 0;
@@ -1153,6 +1258,7 @@ const Bufs = struct {
             cuda.backend.topk_lanes * cuda.backend.topk_m, // topk_i
         };
         inline for (@typeInfo(Bufs).@"struct".fields, 0..) |f, i| {
+            be.noteBuf(f.name, sizes[i] * 4);
             @field(self, f.name) = try be.tensorCreate(sizes[i] * 4);
             created = i + 1;
         }

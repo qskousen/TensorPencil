@@ -88,9 +88,13 @@ const Sample = struct {
     ctx_kv: u64 = 0,
     layers_gpu: usize = 0,
     layers_cpu: usize = 0,
+    /// Layer weights running on the CPU instead of the GPU.
+    llm_host: u64 = 0,
     diffusing: bool = false,
     /// Resident diffusion VRAM, per component (sums to the backend's device_used).
     diff: diffuser.VramBreakdown = .{},
+    /// Pipeline bytes streaming from host RAM rather than resident in VRAM.
+    diff_off: u64 = 0,
     limit: u64 = 0,
     /// Smoothed residuals: ours-but-untracked, and other processes'.
     parts: vram_split.Parts = .{},
@@ -105,7 +109,7 @@ pub fn deinit() void {
 
 /// Take a fresh sample of every meter into `cur` and push the time-series rings.
 /// Called on the timer cadence, not per frame.
-fn sampleInto(s: ?*chat.Session, loading: bool, diff_busy: bool, diff: diffuser.VramBreakdown) void {
+fn sampleInto(s: ?*chat.Session, loading: bool, diff_busy: bool, diff: diffuser.VramBreakdown, diff_off: u64) void {
     var n: Sample = .{};
     n.cpu = cpu_meter.sample();
     n.cpu_mhz = sysmon.cpuFreqMhz();
@@ -123,6 +127,7 @@ fn sampleInto(s: ?*chat.Session, loading: bool, diff_busy: bool, diff: diffuser.
     // Diffusion state comes from the app-level engine (not the session).
     n.diffusing = diff_busy;
     n.diff = diff; // MEASURED per-component resident diffusion VRAM
+    n.diff_off = diff_off;
     if (s) |sess| {
         n.has_session = true;
         n.llm_used = sess.be.deviceUsed();
@@ -132,6 +137,7 @@ fn sampleInto(s: ?*chat.Session, loading: bool, diff_busy: bool, diff: diffuser.
         const res = sess.llmResidency();
         n.layers_gpu = res.gpu;
         n.layers_cpu = res.cpu;
+        n.llm_host = res.host_bytes;
         if (n.vram_total == 0) {
             const mi = sess.be.ctx.memGetInfo();
             n.vram_total = mi.total;
@@ -161,6 +167,25 @@ fn sampleInto(s: ?*chat.Session, loading: bool, diff_busy: bool, diff: diffuser.
             n.parts.system >> 20,                n.parts.loading >> 20,
         },
     );
+    // The split, from BOTH sources. `host_w` walks the per-layer weights and
+    // `cpu` is the stepper's own counter, so they must move together: host bytes
+    // with no host layers means the two disagree about which layers were
+    // migrated, while host layers whose bytes are still inside `llm` above means
+    // the migration marked them and never reclaimed the VRAM.
+    if (n.has_session and std.c.getenv("TP_DUMP_VRAM") != null) {
+        std.debug.print(
+            "[vram-dbg] split: cpu={d}/{d} host_w={d} MiB · llm dev={d} MiB (of which kv {d})\n",
+            .{ n.layers_cpu, n.layers_cpu + n.layers_gpu, n.llm_host >> 20, n.llm_used >> 20, n.ctx_kv >> 20 },
+        );
+        // Live per-component attribution, so a buffer that grows mid-run (dequant
+        // staging sizing to the widest GEMM, K/V committing as the context fills)
+        // is visible moving rather than only in the load-time snapshot.
+        if (s) |sess| {
+            var tb: [320]u8 = undefined;
+            const line = sess.memTagLine(&tb);
+            std.debug.print("[vram-dbg] tags: {s}unattributed {d} MiB\n", .{ line.text, (n.llm_used -| line.named) >> 20 });
+        }
+    }
     const totf: f32 = if (n.vram_total > 0) @floatFromInt(n.vram_total) else 0;
     h_cpu.push(n.cpu);
     h_gpu.push(n.gpu_util);
@@ -171,7 +196,7 @@ fn sampleInto(s: ?*chat.Session, loading: bool, diff_busy: bool, diff: diffuser.
 /// Draw the bar. `s` is the live session (null before a model loads, the bar
 /// still shows CPU/GPU/total VRAM). `diff_busy`/`diff_used` come from the
 /// app-level diffusion engine.
-pub fn render(s: ?*chat.Session, loading: bool, diff_busy: bool, diff: diffuser.VramBreakdown, split: *f32, limit: *f32, llm_armed: bool, diff_armed: bool, llm_paused: bool, diff_paused: bool, acts: meter.Actions) void {
+pub fn render(s: ?*chat.Session, loading: bool, diff_busy: bool, diff: diffuser.VramBreakdown, diff_off: u64, split: *f32, limit: *f32, llm_armed: bool, diff_armed: bool, llm_paused: bool, diff_paused: bool, acts: meter.Actions) void {
     _ = sysmon.nvml(); // opens on first use
 
     var bar = dvui.box(@src(), .{ .dir = .horizontal }, .{
@@ -190,7 +215,7 @@ pub fn render(s: ?*chat.Session, loading: bool, diff_busy: bool, diff: diffuser.
     // footprint, per-component residency) is taken here, in one pass, and the
     // meter renders that snapshot, never a mix of sampled and live reads.
     if (dvui.timerDoneOrNone(bar.data().id)) {
-        sampleInto(s, loading, diff_busy, diff);
+        sampleInto(s, loading, diff_busy, diff, diff_off);
         dvui.timer(bar.data().id, if (diff_busy) sample_interval_busy_us else sample_interval_us);
     }
 
@@ -248,6 +273,12 @@ fn renderMeter(s: ?*chat.Session, diff: diffuser.VramBreakdown, split: *f32, lim
         .llm_w = (cur.llm_used -| ctx_b) + cur.parts.loading,
         .llm_ctx = ctx_b,
         .ctx_tokens = cur.ctx_tokens,
+        // Not on the card: LLM layers computing on the CPU, pipeline weights
+        // streaming in from host RAM. Sampled with every other byte count above.
+        .llm_host = cur.llm_host,
+        .llm_host_layers = cur.layers_cpu,
+        .llm_layers = cur.layers_cpu + cur.layers_gpu,
+        .diff_off = cur.diff_off,
         // MEASURED per-component diffusion breakdown (see pipeline.vramBreakdown).
         .te = cur.diff.te,
         .dit = cur.diff.dit,

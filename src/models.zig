@@ -2,6 +2,10 @@
 
 pub const loader = @import("models/loader.zig");
 pub const residency = @import("tp_runtime").residency;
+/// The turn hook a frontend installs on a stepper (`model.boundary`), so a
+/// prefill chunk loop reaches the same residency/pause/cancel intents the decode
+/// loop polls between tokens.
+pub const boundary = @import("tp_runtime").boundary;
 pub const transformer = @import("models/transformer.zig");
 pub const transformer_gpu = @import("models/transformer_gpu.zig");
 pub const wan_vae = @import("models/wan_vae.zig");

@@ -783,6 +783,9 @@ pub const Diffuser = struct {
     /// Architecture of the resident pipeline, for the UI (`@intFromEnum` + 1;
     /// 0 = nothing loaded). Detected by the pipeline from the checkpoint itself.
     loaded_family: std.atomic.Value(u8) = .init(0),
+    /// A foreign thread has asked for the pipeline to be dropped
+    /// (`requestRelease`); the UI thread enacts it in `fulfillRelease`.
+    release_req: std.atomic.Value(bool) = .init(false),
 
     /// Build the engine from a `DiffConfig`. `wake` repaints the UI on progress;
     /// `vram` is the injected VRAM coordinator (LLM eviction, or `.none`). The
@@ -1082,6 +1085,47 @@ pub const Diffuser = struct {
     pub fn freeSession(self: *Diffuser) void {
         self.res_mu.lockUncancelable(self.io);
         defer self.res_mu.unlock(self.io);
+        self.freeSessionLocked();
+    }
+
+    /// Ask for the resident pipeline to be dropped (the arbiter's release rung,
+    /// `vram.Participant.VTable.releaseAll`). Callable from any thread; the free
+    /// itself happens in `fulfillRelease` on the UI thread.
+    ///
+    /// It is a REQUEST and not the free itself because `session` has exactly one
+    /// writer by design, and every reader — the status bar's `vramBytes` and
+    /// `vramBreakdown` on the frame path, the participant thunks — loads it
+    /// unlocked. Freeing it from the LLM worker made all seven of those reads a
+    /// use-after-free, and the meter found it within a frame: a SIGSEGV in
+    /// `deviceUsed` under `residentLabel`. Locking the readers instead would put a
+    /// blocking mutex on every frame, held across a multi-GiB teardown.
+    pub fn requestRelease(self: *Diffuser) void {
+        if (self.busy.load(.acquire)) return;
+        if (self.session.load(.acquire) == null) return;
+        self.release_req.store(true, .release);
+        self.wake(); // a request made behind a prefill must not wait for a token
+    }
+
+    pub fn releaseRequested(self: *const Diffuser) bool {
+        return self.release_req.load(.acquire);
+    }
+
+    /// Enact a pending `requestRelease`, on the UI thread. The caller holds
+    /// whatever guards foreign readers of this engine (the app takes `g_diff_mu`,
+    /// which is what the LLM worker holds while it reads the participant).
+    /// Re-checks everything: the queue may have moved on since the ask.
+    pub fn fulfillRelease(self: *Diffuser) u64 {
+        if (!self.release_req.swap(false, .acq_rel)) return 0;
+        if (self.busyNow() or self.nextPending() != null) return 0; // work arrived; keep it loaded
+        const before = if (self.session.load(.acquire)) |s| s.deviceUsed() else return 0;
+        self.freeSession();
+        std.log.info("[vram] diffusion released: {d} MiB returned (pipeline unloaded; the next image reloads it)", .{before >> 20});
+        return before;
+    }
+
+    /// The teardown itself. Callers hold `res_mu`; see `freeSession` for why the
+    /// lock belongs on the primitive rather than on each call site.
+    fn freeSessionLocked(self: *Diffuser) void {
         if (self.session.load(.acquire)) |s| {
             s.deinit();
             self.session.store(null, .release);
@@ -1145,6 +1189,23 @@ pub const Diffuser = struct {
         // only in `vramBytes` left the figure at its pre-load 0.
         self.notePeak(b.total());
         return b;
+    }
+
+    /// Pipeline bytes NOT on the card: what this model held when it last ran
+    /// unconstrained, minus what it holds now. Those weights live in host RAM and
+    /// re-upload over PCIe as each step touches them, which is what makes a
+    /// squeezed image model slow. 0 while fully resident, and 0 before the first
+    /// image (nothing has been measured to compare against).
+    ///
+    /// Deliberately the same two numbers the arbiter plans with (`vpDemand` minus
+    /// `vpUsage`), not a second estimate: the bar then shows what the policy
+    /// believes, so a figure that looks wrong on screen is the planner being
+    /// wrong, not the display disagreeing with it. Inherits `vpDemand`'s limit,
+    /// the peak is a high-water, so an image model that has ONLY ever run
+    /// squeezed reads 0 until a roomier image teaches it better.
+    pub fn offloadBytes(self: *Diffuser) u64 {
+        if (self.session.load(.acquire) == null) return 0; // unloaded, not offloaded
+        return self.peak_resident.load(.monotonic) -| self.vramBytes();
     }
 
     /// High-water the measured resident footprint. Called from every residency
@@ -1243,6 +1304,14 @@ pub const Diffuser = struct {
     fn vpApply(ctx: *anyopaque, target: u64) void {
         _ = fromCtx(ctx).giveUpToBudget(target);
     }
+    /// The arbiter's last rung. `giveUpToBudget` only evicts the weight LRU; the
+    /// pipeline underneath it (context, cuBLASLt/cuDNN workspaces, activation and
+    /// latent scratch) is not cache and no target reaches it. For an IDLE image
+    /// model all of that is recoverable — the next image rebuilds it — so when an
+    /// LLM is otherwise going to run layers on the CPU, this hands it back.
+    fn vpReleaseAll(ctx: *anyopaque) void {
+        fromCtx(ctx).requestRelease();
+    }
     fn fromCtx(ctx: *anyopaque) *Diffuser {
         return @ptrCast(@alignCast(ctx));
     }
@@ -1253,6 +1322,7 @@ pub const Diffuser = struct {
         .floor = vpFloor,
         .busy = vpBusy,
         .applyBudget = vpApply,
+        .releaseAll = vpReleaseAll,
     };
 
     /// This image model as a `tp.vram.Participant` the app-level arbiter can drive.

@@ -604,7 +604,10 @@ const FillPool = struct {
     /// granularity multiples) inside a vmmReserve'd range. Returns the
     /// allocation handle (needed for release at teardown). OOM is returned
     /// distinctly so the backend can evict cached weights and retry.
-    pub fn vmmCommit(self: *Context, base: cu.CUdeviceptr, offset: usize, size: usize) Error!cu.CUmemGenericAllocationHandle {
+    /// `tag` is carried by the caller (on the GrowableTensor) rather than read
+    /// from `self.mem_tag`, because a buffer grows long after it was created and
+    /// whatever phase happens to be current then is not what owns these bytes.
+    pub fn vmmCommit(self: *Context, base: cu.CUdeviceptr, offset: usize, size: usize, tag: MemTag) Error!cu.CUmemGenericAllocationHandle {
         const prop = self.vmmProp();
         var h: cu.CUmemGenericAllocationHandle = 0;
         const r = self.api.cuMemCreate.?(&h, size, &prop, 0);
@@ -619,17 +622,22 @@ const FillPool = struct {
         }};
         try self.check(self.api.cuMemSetAccess.?(base + offset, size, &desc, 1), "cuMemSetAccess");
         self.device_used += size;
+        // Without this the KV cache is the one big allocation NOT in the tag
+        // breakdown: it bypasses `alloc`, so its bytes would sit inside
+        // `device_used` under no tag at all and read as unattributed overhead.
+        if (self.track_tags) self.mem_tag_used[@intFromEnum(tag)] += size;
         return h;
     }
 
     /// Unmap and release a growable buffer's committed prefix and handles,
     /// then free the VA reservation. All device work reading the range must
     /// have completed (callers sync the stream first).
-    pub fn vmmFree(self: *Context, base: cu.CUdeviceptr, va_size: usize, committed: usize, handles: []const cu.CUmemGenericAllocationHandle) void {
+    pub fn vmmFree(self: *Context, base: cu.CUdeviceptr, va_size: usize, committed: usize, handles: []const cu.CUmemGenericAllocationHandle, tag: MemTag) void {
         if (committed != 0) _ = self.api.cuMemUnmap.?(base, committed);
         for (handles) |h| _ = self.api.cuMemRelease.?(h);
         _ = self.api.cuMemAddressFree.?(base, va_size);
         self.device_used -|= committed;
+        if (self.track_tags) self.mem_tag_used[@intFromEnum(tag)] -|= committed;
     }
 
     pub fn upload(self: *Context, buf: Buffer, data: []const u8) Error!void {

@@ -67,9 +67,16 @@ pub const Config = struct {
     /// Largest single bidirectional image block, in soft-image tokens, sizes the
     /// prefill activation scratch and the LOCAL KV ring slack (a whole image
     /// block is prefilled in ONE pass). Set from the gemma4v vision token budget
-    /// at load (`gemma4v_vit.Budget`); `detect` defaults it to `high` (280) so a
-    /// text-only or default session is unchanged. Bigger budgets grow these
-    /// buffers (more VRAM); must be fixed for a session (KV rings depend on it).
+    /// at load (`gemma4v_vit.Budget`); `detect` defaults it to `high` (280).
+    /// Bigger budgets grow these buffers (more VRAM); must be fixed for a session
+    /// (KV rings depend on it).
+    ///
+    /// A CEILING, not an allocation. The activation buffers start at the text
+    /// prefill chunk and grow to this only when an image block actually arrives
+    /// (`gemma4_cuda.ensureBufRows`), so a conversation with no images pays
+    /// nothing for it. The LOCAL KV ring does reserve its slack from this up
+    /// front, because the ring modulus is baked into position addressing
+    /// (`p % ring`) and cannot be resized once positions are stored.
     image_budget: usize = 280,
 
     /// Largest single prefill batch: a text chunk (`prefill_chunk`) or a whole
@@ -716,4 +723,20 @@ test "finalizeCandidatesRaw matches the full-vocab finalize + penalties path" {
     var scratch: [sample.max_penalty_window]sample.PenaltyEntry = undefined;
     finalizeCandidatesRaw(softcap, &suppress, ids, got, sample.collectPenalties(&recent, sp, &scratch), sp);
     try std.testing.expectEqualSlices(f32, ref, got);
+}
+
+test "maxBatch: the image budget only ever raises the batch, never lowers it" {
+    // maxBatch is the CEILING an image block may reach. What a text-only session
+    // actually allocates is `textBufRows` in the stepper; this pins the other
+    // half, that a budget below the text chunk cannot shrink the batch under it.
+    var cfg: Config = undefined;
+    cfg.image_budget = 0;
+    try std.testing.expectEqual(prefill_chunk, cfg.maxBatch());
+
+    // A tower's budget wins only when it exceeds the text chunk; a small one
+    // must not SHRINK the batch below what text prefill already needs.
+    cfg.image_budget = 70;
+    try std.testing.expectEqual(prefill_chunk, cfg.maxBatch());
+    cfg.image_budget = 1120;
+    try std.testing.expectEqual(@as(usize, 1120), cfg.maxBatch());
 }

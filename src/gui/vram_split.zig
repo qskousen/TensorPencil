@@ -251,3 +251,72 @@ test "a load that outgrows the card still fits the bar" {
     );
     try std.testing.expect(2 * gib + p.loading + p.overhead + p.system <= 24 * gib);
 }
+
+// ------------------------------------------------ the meter's total readouts
+
+fn toGib(v: u64) f64 {
+    return @as(f64, @floatFromInt(v)) / (1 << 30);
+}
+
+/// A side's total, with what that side is NOT holding on the card appended:
+/// `LLM 11.1G · 2.4G cpu (4/48)`, `DIFFUSION 9.1G · 1.8G stream`.
+///
+/// The suffix appears only when `off` is nonzero, so a fully resident model says
+/// nothing extra and the absence of a suffix IS the "all of it is in VRAM"
+/// signal. Both numbers are in the card's units but only the first is on its
+/// scale: `off` counts bytes sitting in host RAM, which is why it is text here
+/// rather than a length on the bar (two sides can want more than the card holds,
+/// and lengths for that would have to overlap).
+///
+/// `layers` (host, total) is printed where the side has them. The count and the
+/// byte figure are read from DIFFERENT places -- the stepper's own counter vs a
+/// walk over the per-layer weights -- so showing both is what makes a
+/// disagreement between them visible instead of leaving one silently wrong.
+///
+/// Rounded to 0.1 G like every other figure in the legend, so an offload smaller
+/// than that reads `0.0G` rather than being hidden: a split is armed either way,
+/// and "armed but tiny" is a different state from "not armed".
+///
+/// Lives here rather than in `meter.zig` because this module is the meter's math
+/// with no dvui in it, which is what lets `zig build gui-test` compile it at all.
+pub fn totalText(buf: []u8, name: []const u8, bytes: u64, off: u64, off_label: []const u8, layers: ?[2]usize) []const u8 {
+    if (off == 0) return std.fmt.bufPrint(buf, "{s} {d:.1}G", .{ name, toGib(bytes) }) catch name;
+    if (layers) |l| return std.fmt.bufPrint(buf, "{s} {d:.1}G · {d:.1}G {s} ({d}/{d})", .{
+        name, toGib(bytes), toGib(off), off_label, l[0], l[1],
+    }) catch name;
+    return std.fmt.bufPrint(buf, "{s} {d:.1}G · {d:.1}G {s}", .{ name, toGib(bytes), toGib(off), off_label }) catch name;
+}
+
+test "a fully resident side's total carries no offload suffix" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("LLM 11.1G", totalText(&buf, "LLM", 11_918_939_914, 0, "cpu", .{ 0, 48 }));
+}
+
+test "offloaded bytes and the layer count are appended to the side's total" {
+    var buf: [64]u8 = undefined;
+    const gb: u64 = 1 << 30;
+    try std.testing.expectEqualStrings(
+        "LLM 20.8G · 1.4G cpu (4/48)",
+        totalText(&buf, "LLM", 20 * gb + gb * 8 / 10, gb + gb * 4 / 10, "cpu", .{ 4, 48 }),
+    );
+    // Diffusion has no layers to report; the count is omitted, not faked.
+    try std.testing.expectEqualStrings(
+        "DIFFUSION 9.0G · 4.7G stream",
+        totalText(&buf, "DIFFUSION", 9 * gb, 4 * gb + gb * 7 / 10, "stream", null),
+    );
+}
+
+test "an offload too small to round to 0.1G still shows: armed is not resident" {
+    var buf: [64]u8 = undefined;
+    const s = totalText(&buf, "LLM", 11 << 30, 4 << 20, "cpu", .{ 1, 48 });
+    errdefer std.debug.print("got: {s}\n", .{s});
+    try std.testing.expectEqualStrings("LLM 11.0G · 0.0G cpu (1/48)", s);
+}
+
+test "the widest plausible total fits the legend's buffer" {
+    var buf: [64]u8 = undefined;
+    const s = totalText(&buf, "DIFFUSION", 999 << 30, 999 << 30, "stream", .{ 999, 999 });
+    errdefer std.debug.print("got: {s}\n", .{s});
+    try std.testing.expect(s.len < buf.len);
+    try std.testing.expect(!std.mem.eql(u8, s, "DIFFUSION")); // not the bufPrint fallback
+}

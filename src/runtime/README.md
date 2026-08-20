@@ -14,6 +14,7 @@ Root: `runtime.zig`.
 |---|---|
 | `vram` | the VRAM `Arbiter` — split/limit budgeting across resident models |
 | `residency` | CPU/GPU layer-split planning (`growPlan`, offload grow steps) |
+| `boundary` | the turn hook a frontend installs on a stepper, so a prefill chunk loop reaches the residency/pause/cancel intents the decode loop polls between tokens |
 
 ## Dependencies
 

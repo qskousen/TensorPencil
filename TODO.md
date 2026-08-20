@@ -1,11 +1,10 @@
 - begin filling in holes in the capabilities grid (BACKEND.md)
 - add more sampling methods
-- make integration tests shorter?
 - gui: studio (image_view) still uses its own form layout; bring the parameter form onto the shared chip/section primitives
-- prefill (at least on cpu) isn't cancellable between tokens
-- prefill doesn't try to resize when more ram is available
+- the CPU steppers' `prefill()` is still one un-chunked forward over the whole
+  tail, so it has no boundary to stop or re-plan at. Inert today (the GUI is
+  CUDA-only and the CLI arms no cancel), but any CPU-backed frontend needs it
 - even a tiny bit of offloading of gemma4 31b is extremely slow
-- let's evict the whole diffusion model if needed to fit the llm on the gpu when there's no contention
 - diffusion model weights are "bouncing" during steps, vram-wise
 - there's no good visiblity of "how much of the model is in vram" for either side
 - llm: reasoning markers come from `chat.reasoningFor(family)`, a static guess per

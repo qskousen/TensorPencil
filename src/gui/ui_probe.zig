@@ -307,6 +307,12 @@ const VramState = struct {
     lat: u64,
     llm_loaded: bool = true,
     limit: f32 = 0.93,
+    /// Bytes NOT on the card: LLM layer weights running on the CPU, pipeline
+    /// weights streaming from host RAM. 0 = that side is fully resident.
+    llm_host: u64 = 0,
+    llm_host_layers: usize = 0,
+    llm_layers: usize = 0,
+    diff_off: u64 = 0,
 };
 
 const gb: u64 = 1 << 30;
@@ -361,6 +367,27 @@ const states = [_]VramState{
         .dit = g(10.8),
         .vae = g(1.0),
         .lat = g(0.3),
+    },
+    .{
+        // Both sides squeezed: the bar looks the same as a healthy card (it can
+        // only ever show what IS resident), and the totals are the only place the
+        // difference shows. That is the case this state exists to check.
+        .label = "CHAT · BOTH PARTLY OFFLOADED",
+        .gpu = 0.71,
+        .cpu = 0.64,
+        .sys = g(2.4),
+        .llm_w = g(6.2),
+        .llm_ctx = g(1.4),
+        .ctx_tokens = 12000,
+        .ovh = g(0.4),
+        .te = 0,
+        .dit = g(5.9),
+        .vae = g(0.8),
+        .lat = g(0.2),
+        .llm_host = g(2.4),
+        .llm_host_layers = 9,
+        .llm_layers = 48,
+        .diff_off = g(4.7),
     },
 };
 
@@ -422,6 +449,10 @@ fn statusBar(st: VramState, id: usize) void {
         .llm_w = st.llm_w,
         .llm_ctx = st.llm_ctx,
         .ctx_tokens = st.ctx_tokens,
+        .llm_host = st.llm_host,
+        .llm_host_layers = st.llm_host_layers,
+        .llm_layers = st.llm_layers,
+        .diff_off = st.diff_off,
         .te = st.te,
         .dit = st.dit,
         .latent = st.lat,
@@ -483,7 +514,8 @@ pub fn main(init: std.process.Init) !void {
     }
     // The mockups' own canvases, so a screenshot can be held next to them.
     const w: u32 = dims[0] orelse 1200;
-    const h: u32 = dims[1] orelse (if (states_mode) @as(u32, 340) else 705);
+    // The state sheet's height follows the number of states (head + bar each).
+    const h: u32 = dims[1] orelse (if (states_mode) @as(u32, 126 * states.len) else 705);
 
     var back = try Backend.initWindow(.{
         .io = init.io,

@@ -11,11 +11,12 @@
 //! `sys` is other processes, pinned far left and hatched: not ours to reclaim.
 //! The two handles are the live VRAM policy, and they match `vram.resolve`:
 //!
-//!   limit -> the RESERVE the user asks to keep free, measured from the LEFT.
-//!            The effective reserve is `max(requested, sys)`, so our block
-//!            starts at whichever is further right. When other programs hold
-//!            more than the request, the handle sits left of the block's real
-//!            edge, which is the meter SHOWING why the handle stopped binding.
+//!   limit -> how much of the card must NOT be ours, measured from the LEFT.
+//!            Other programs count TOWARDS it, so the effective reserve is
+//!            `max(requested, sys)` and our block starts at whichever is further
+//!            right. When they hold more than the request the handle sits left of
+//!            the block's real edge, which is the meter SHOWING why the handle
+//!            stopped binding.
 //!   split -> the LLM's guaranteed share under contention. It sits in the free
 //!            gap, which is exactly where the two sides meet.
 //!
@@ -26,6 +27,7 @@ const dvui = @import("dvui");
 const style = @import("style.zig");
 const fonts = @import("fonts.zig");
 const hint = @import("hint.zig");
+const vram_split = @import("vram_split.zig");
 
 const C = dvui.Color;
 const P = style.C;
@@ -43,6 +45,20 @@ pub const Model = struct {
     llm_ctx: u64,
     /// Tokens currently in the KV cache, for the `ctx 0.8G · 6k` legend entry.
     ctx_tokens: usize = 0,
+    /// NOT on the card. Layer weights the LLM is running on the CPU, and pipeline
+    /// weights diffusion streams in from host RAM per step. Both are 0 when that
+    /// side is fully resident, which is the common case and prints nothing.
+    ///
+    /// These are the only figures here that are not positions on the bar: they
+    /// describe bytes that have no place on a scale of card capacity, which is why
+    /// they live in the totals and nowhere in the geometry.
+    llm_host: u64 = 0,
+    /// Layers on the host and layers in total, shown beside `llm_host`. The byte
+    /// figure and this count come from DIFFERENT places (a per-layer walk vs the
+    /// stepper's own counter), so printing both is what catches them disagreeing.
+    llm_host_layers: usize = 0,
+    llm_layers: usize = 0,
+    diff_off: u64 = 0,
     te: u64,
     dit: u64,
     latent: u64,
@@ -313,11 +329,11 @@ fn legend(src: std.builtin.SourceLocation, m: *Model, a: Actions) void {
         entry(&bufs[7], P.vram_lat, "lat", m.latent, m.diff_loaded, null, 1),
     };
 
-    var tbuf: [40]u8 = undefined;
-    var dbuf: [40]u8 = undefined;
+    var tbuf: [64]u8 = undefined;
+    var dbuf: [64]u8 = undefined;
     var fbuf: [24]u8 = undefined;
-    const llm_total = std.fmt.bufPrint(&tbuf, "LLM {d:.1}G", .{gib(m.llmTotal())}) catch "LLM";
-    const dif_total = std.fmt.bufPrint(&dbuf, "DIFFUSION {d:.1}G", .{gib(m.difTotal())}) catch "DIFFUSION";
+    const llm_total = vram_split.totalText(&tbuf, "LLM", m.llmTotal(), m.llm_host, "cpu", .{ m.llm_host_layers, m.llm_layers });
+    const dif_total = vram_split.totalText(&dbuf, "DIFFUSION", m.difTotal(), m.diff_off, "stream", null);
     const free_b = m.freeBytes();
     const free_txt = std.fmt.bufPrint(&fbuf, "{d:.1}G free", .{gib(free_b)}) catch "";
 
@@ -669,3 +685,4 @@ test "dragging the reserve handle right shrinks the ceiling" {
     dragBy(&m, 10);
     try std.testing.expectApproxEqAbs(limit_min, limit, 0.001);
 }
+

@@ -26,32 +26,6 @@
 const std = @import("std");
 const vram = @import("vram.zig");
 
-/// A stepper's poll of a residency target a coordinator published while it was
-/// mid-turn (`vram.ControlPoint` -> `vram.Participant.pollAndApply`).
-///
-/// The decode loop polls through `engine.checkpoint`, but PREFILL does not reach
-/// it: the steppers chunk internally and the frontends call `prefill(ids)` once.
-/// So an arbiter that raised the LLM's ceiling because an image model just went
-/// idle had it take effect only AFTER the prefill it was raised for, which on a
-/// vision turn is the entire slow part, run on the CPU. `pollBoundary` is the
-/// chunk-loop end of the same handshake; the coordinator still never touches the
-/// device, the stepper enacts on its own thread.
-pub const Poll = struct {
-    ctx: *anyopaque,
-    apply: *const fn (ctx: *anyopaque) void,
-};
-
-/// Enact any published residency target, at a stepper's own safe boundary.
-/// A chunk boundary qualifies: no batch is open and the split's host shadow is
-/// committed, exactly as between decoded tokens. No-op without a coordinator
-/// (the CLI, tp-llm) or a hook-less stepper.
-pub fn pollBoundary(st: anytype) void {
-    const M = @typeInfo(@TypeOf(st)).pointer.child;
-    if (!@hasField(M, "residency_poll")) return;
-    const p = st.residency_poll orelse return;
-    p.apply(p.ctx);
-}
-
 /// A point-in-time view of a stepper's CPU/GPU residency split + the card's free
 /// VRAM, for the GUI's offload telemetry (logged whenever residency changes).
 /// `n_cpu`/`n_layers` count the layers migrated to the host vs the total; the
@@ -181,6 +155,23 @@ pub fn splitHostCount(st: anytype, budget: u64, reserve: u64, dynamic: bool, per
     return n_cpu;
 }
 
+/// Layer weight bytes living on the HOST, i.e. the parameters this model is
+/// running on the CPU instead of the GPU. 0 when nothing is offloaded.
+///
+/// Weights only, not the K/V those layers carry with them: this is the figure the
+/// status bar reports as the cost of the split, and a layer's K/V grows with the
+/// conversation, which would make the number drift while the residency it is
+/// describing sits still.
+pub fn hostWeightBytes(st: anytype) u64 {
+    if (st.split == null) return 0;
+    var b: u64 = 0;
+    for (0..st.cfg.n_layers) |l| {
+        if (onDevice(st, l)) continue;
+        b += st.layerWeightBytes(l);
+    }
+    return b;
+}
+
 /// Is layer `l`'s K/V still on the device? (Everything is, without a split.)
 fn onDevice(st: anytype, l: usize) bool {
     const sp = if (st.split) |*s| s else return true;
@@ -249,6 +240,32 @@ fn nonLayerBytes(st: anytype) u64 {
     const M = @typeInfo(@TypeOf(st)).pointer.child;
     if (!@hasDecl(M, "nonLayerDeviceBytes")) return 0;
     return st.nonLayerDeviceBytes();
+}
+
+/// Device bytes this model cannot give up however small a budget it is handed:
+/// what is left once every layer still on the device has been migrated to the
+/// host. In practice the token embeddings, the LM head and the activation
+/// scratch — none of which migrate.
+///
+/// The committed KV is deliberately NOT in here, and that is the whole point:
+/// `migrateLayer` carries a layer's K/V to the host shadow along with its
+/// weights, so offloading costs speed, not context. Reporting the committed
+/// context as un-evictable (a formula over context length × every layer's dims)
+/// keeps reserving the K/V of layers that are ALREADY on the host — VRAM nobody
+/// is holding, subtracted from what a working image model is allowed to have.
+/// Measured, so it falls as layers migrate and the next plan can hand over what
+/// the last one freed.
+///
+/// A stepper with no split has nothing to migrate, so its floor is everything it
+/// holds; `onDevice` reports true for every layer there, which gives exactly that
+/// once the layer terms are subtracted.
+pub fn evictionFloor(st: anytype) u64 {
+    var evictable: u64 = 0;
+    for (0..st.cfg.n_layers) |l| {
+        if (!onDevice(st, l)) continue;
+        evictable += st.layerWeightBytes(l) + layerKvBytes(st, l);
+    }
+    return st.be.deviceUsed() -| evictable;
 }
 
 /// Snapshot `st`'s residency. Must run on the thread that bound this model's
@@ -631,6 +648,45 @@ const SplitCase = struct {
     }
 };
 
+test "residency.evictionFloor: only the bytes that cannot migrate" {
+    // The reported symptom, from the other side: an image model squeezed by an
+    // idle LLM. The floor is what the arbiter refuses to take, so anything in it
+    // that CAN be given up is VRAM a working image model never gets offered.
+    var buf: [8]usize = undefined;
+    var st = MockLm.init(mockOrder(&buf), .{});
+    const foot = MockLm.weight_bytes + MockLm.kv_bytes;
+    const residue: u64 = 900 << 20; // embeddings + LM head + scratch
+    // Fully resident: 8 layers on the card plus the residue.
+    st.split.?.next = 0;
+    st.split.?.n_cpu = 0;
+    st.be.used = 8 * foot + residue;
+    try std.testing.expectEqual(residue, evictionFloor(&st));
+
+    // Five layers migrate to the host: their weights AND their K/V go with them,
+    // so the floor must not follow the conversation, only the residue stays.
+    st.split.?.next = 5;
+    st.split.?.n_cpu = 5;
+    st.be.used = 3 * foot + residue;
+    try std.testing.expectEqual(residue, evictionFloor(&st));
+
+    // Everything on the host: nothing left to give.
+    st.split.?.next = 8;
+    st.split.?.n_cpu = 8;
+    st.be.used = residue;
+    try std.testing.expectEqual(residue, evictionFloor(&st));
+}
+
+test "residency.evictionFloor: no split means nothing migrates" {
+    // A stepper with no split has no host shadow to move layers into, so
+    // everything it holds is its floor. (`onDevice` reports true for every layer
+    // there, and the layer terms then cancel what it is holding.)
+    var st = MockLm.init(&.{}, .{});
+    st.split = null;
+    st.cfg.n_layers = 0;
+    st.be.used = 4 << 30;
+    try std.testing.expectEqual(@as(u64, 4 << 30), evictionFloor(&st));
+}
+
 test "residency.splitHostCount: weights already on the card are not charged twice" {
     // The reported failure: a 31B loads, its weights upload, and the split
     // planner then reads `deviceUsed()` ~18 GiB and concludes there is no room
@@ -678,4 +734,36 @@ test "residency.splitHostCount: a dynamic plan leaves the forward's transient fr
     // capacity plus its own slack instead, so charging the transient on top
     // would offload twice for the same bytes.
     try std.testing.expectEqual(@as(usize, 0), splitHostCount(&c.st, snug, SplitCase.head, false, &c.per, &c.order));
+}
+
+test "residency.hostWeightBytes counts the layers actually migrated, not the plan" {
+    var buf: [8]usize = undefined;
+    var st = MockLm.init(mockOrder(&buf), .{});
+
+    // Every layer on the host.
+    try std.testing.expectEqual(8 * MockLm.weight_bytes, hostWeightBytes(&st));
+
+    // A dynamic split part-way through: `next` is how far migration has actually
+    // got, and that -- not the planned `n_cpu` -- is what the bar must report, or
+    // it claims weights are on the CPU before they have moved.
+    st.split.?.next = 3;
+    try std.testing.expectEqual(3 * MockLm.weight_bytes, hostWeightBytes(&st));
+
+    st.split.?.next = 0;
+    try std.testing.expectEqual(@as(u64, 0), hostWeightBytes(&st));
+
+    // No split armed at all: fully resident, and no per-layer walk to get it wrong.
+    st.split = null;
+    try std.testing.expectEqual(@as(u64, 0), hostWeightBytes(&st));
+}
+
+test "residency.hostWeightBytes is the weights only, not the K/V they carry" {
+    var buf: [4]usize = undefined;
+    var st = MockLm.init(mockOrder(&buf), .{});
+    // `measured`/`need` fold K/V in; this figure deliberately does not, so it
+    // holds still while a conversation grows.
+    const host = hostWeightBytes(&st);
+    errdefer std.debug.print("host={d} weights={d} kv={d}\n", .{ host, MockLm.weight_bytes, MockLm.kv_bytes });
+    try std.testing.expectEqual(4 * MockLm.weight_bytes, host);
+    try std.testing.expect(host < 4 * (MockLm.weight_bytes + MockLm.kv_bytes));
 }

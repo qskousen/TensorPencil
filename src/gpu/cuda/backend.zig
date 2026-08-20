@@ -287,6 +287,10 @@ pub const Backend = struct {
     pin_budget: u64 = 0,
     /// Bytes currently claimed against pin_budget.
     pinned_bytes: u64 = 0,
+    /// Tag charged to weight-cache allocations, and the flag for "this is an LLM
+    /// backend" that `lmTagScope` reads. Null on the diffusion backend, where the
+    /// live phase tag is already the right answer. See `enableLlmMemTags`.
+    weight_tag: ?ctxmod.MemTag = null,
     /// Largest single `tensorCreate` request seen (see `largestAllocation`).
     max_alloc_bytes: u64 = 0,
     /// Live-VRAM floor kept free by first-touch pinning (pinNew) and prefetch
@@ -653,17 +657,35 @@ pub const Backend = struct {
         if (lt.cublasLtCreate(&lt_h) != cublaslt.SUCCESS) return error.CudaError;
         errdefer _ = lt.cublasLtDestroy(lt_h);
 
+        // The library is LOADED here but its handle is NOT created: `cudnnCreate`
+        // allocates cuDNN's internal device state, and an LLM session never
+        // reaches it (attention goes through `opAttnDecode`; the cuDNN paths are
+        // conv, SDPA and the dormant fused int8 matmul, all diffusion). Creating
+        // it regardless was pure footprint on every chat session. See `dnnHandle`.
         var dnn = cudnn.Api.load() catch return error.CudaError;
         errdefer dnn.deinit();
-        var dnn_h: cudnn.Handle = null;
-        if (dnn.cudnnCreate(&dnn_h) != cudnn.SUCCESS) return error.CudaError;
-        errdefer _ = dnn.cudnnDestroy(dnn_h);
-        _ = dnn.cudnnSetStream(dnn_h, self.ctx.stream);
 
         const ws = try self.ctx.alloc(lt_workspace_bytes);
 
-        self.libs = .{ .lt = lt, .lt_handle = lt_h, .dnn = dnn, .dnn_handle = dnn_h, .workspace = ws };
+        self.libs = .{ .lt = lt, .lt_handle = lt_h, .dnn = dnn, .dnn_handle = null, .workspace = ws };
         return self;
+    }
+
+    /// The cuDNN handle, created on first use. `cudnnCreate` allocates device
+    /// memory for cuDNN's internal state, so a session that never runs a conv,
+    /// an SDPA plan or the fused int8 matmul never pays for it -- which is every
+    /// LLM session, since attention there goes through `opAttnDecode`.
+    ///
+    /// Callers must go through this rather than reading `libs.dnn_handle`, or the
+    /// first cuDNN call of a session gets a null handle.
+    fn dnnHandle(self: *Backend) Error!cudnn.Handle {
+        const L = &(self.libs orelse return error.CudaError);
+        if (L.dnn_handle) |h| return h;
+        var h: cudnn.Handle = null;
+        if (L.dnn.cudnnCreate(&h) != cudnn.SUCCESS) return error.CudaError;
+        _ = L.dnn.cudnnSetStream(h, self.ctx.stream);
+        L.dnn_handle = h;
+        return h;
     }
 
     pub fn deinit(self: *Backend) void {
@@ -1103,6 +1125,81 @@ pub const Backend = struct {
         self.ctx.track_tags = true;
     }
 
+    /// Turn on attribution for an LLM session. Unlike the diffusion pipeline,
+    /// which brackets each stage and so names every allocation as it makes it,
+    /// an LLM has no phases: it allocates its activation buffers once and then
+    /// runs. So the standing tag is `lm_act` and the paths that are NOT
+    /// activations (the weight cache, K/V, dequant staging) override it locally.
+    /// `lm_act` therefore reads as "everything the stepper allocated that isn't
+    /// one of the named three", which is exactly the residual worth seeing.
+    ///
+    /// Call before the MODEL allocates anything. Whatever the backend itself
+    /// already holds (`initLibs` takes the cuBLASLt workspace) is seeded into
+    /// `other` rather than asserted away: tagging is skipped at alloc time while
+    /// it is off but applied at free time regardless, so those buffers would
+    /// decrement a counter they never incremented, saturate it at zero, and leave
+    /// the partition permanently short of `deviceUsed`.
+    pub fn enableLlmMemTags(self: *Backend) void {
+        self.ctx.track_tags = true;
+        self.weight_tag = .lm_weights;
+        self.ctx.mem_tag_used[@intFromEnum(ctxmod.MemTag.other)] = self.ctx.device_used;
+        self.ctx.mem_tag = .lm_act;
+    }
+
+    /// Attribute allocations made until `end()` to `tag`, restoring whatever was
+    /// current before. Saving and restoring rather than setting back to `.other`
+    /// is what lets these nest: a weight upload triggered from inside a tagged
+    /// phase must not silently retag the rest of that phase.
+    const TagScope = struct {
+        ctx: *ctxmod.Context,
+        prev: ctxmod.MemTag,
+        fn end(self: TagScope) void {
+            self.ctx.mem_tag = self.prev;
+        }
+    };
+    fn tagScope(self: *Backend, tag: ctxmod.MemTag) TagScope {
+        const s: TagScope = .{ .ctx = self.ctx, .prev = self.ctx.mem_tag };
+        self.ctx.mem_tag = tag;
+        return s;
+    }
+
+    /// A tag scope that applies ONLY on an LLM backend. Null on the diffusion
+    /// one, whose phase brackets (`te`/`dit`/`vae`) already own these bytes: a
+    /// weight uploaded or a staging buffer allocated mid-DiT belongs to the DiT,
+    /// and retagging it would move it out of the segment it was measured for.
+    fn lmTagScope(self: *Backend, tag: ctxmod.MemTag) ?TagScope {
+        if (self.weight_tag == null) return null;
+        return self.tagScope(tag);
+    }
+
+    /// Live device bytes per tag, indexed by `@intFromEnum`. Sums to
+    /// `deviceUsed()` once every allocation path attributes its bytes; the
+    /// difference is what nothing has claimed, which is the number worth looking
+    /// at rather than one hidden inside a component.
+    pub fn memTagBreakdown(self: *Backend) [ctxmod.MemTag.count]u64 {
+        var out: [ctxmod.MemTag.count]u64 = @splat(0);
+        for (&out, 0..) |*v, i| v.* = self.ctx.memTagUsed(@enumFromInt(i));
+        return out;
+    }
+
+    /// Report one named activation buffer as it is created (TP_DUMP_VRAM only).
+    /// The tag totals say how big `lm_act` is; this says WHICH buffer it is,
+    /// which is the next question every time and is otherwise a rebuild away.
+    /// Callers pass the struct field name, so the list follows the buffer table
+    /// rather than being a second copy of it that can drift.
+    pub fn noteBuf(_: *Backend, name: []const u8, size: u64) void {
+        if (std.c.getenv("TP_DUMP_VRAM") == null) return;
+        std.debug.print("[vram-dbg] buf {s: <14} {d: >6} KiB\n", .{ name, size >> 10 });
+    }
+
+    /// How many PTX modules the driver has JIT'd, and the wall time it spent.
+    /// Their cubins live in device memory the allocator never sees, so this is a
+    /// standing suspect for the gap between our counters and the driver's
+    /// per-process figure.
+    pub fn jitStats(self: *Backend) struct { count: u64, ns: u64 } {
+        return .{ .count = self.ctx.jit_count, .ns = self.ctx.jit_ns };
+    }
+
     /// Free resident weights so the footprint fits `budget` (the GUI VRAM limit
     /// lowered while idle). Coarse: if over budget, drop the whole weight cache,
     /// the next generate() re-uploads what fits its (new) pin budget. Caller must
@@ -1339,6 +1436,8 @@ pub const Backend = struct {
             if (pinned) self.streamed_bytes -|= size; // leaves streamed circulation
             return db;
         }
+        const ts = if (self.weight_tag) |t| self.tagScope(t) else null;
+        defer if (ts) |s| s.end();
         const db = try self.tensorCreate(size);
         if (!pinned) self.streamed_bytes += size;
         return db;
@@ -1435,8 +1534,15 @@ pub const Backend = struct {
         handles: std.ArrayListUnmanaged(cu.CUmemGenericAllocationHandle) = .empty,
     };
 
+    /// Every growable buffer in the engine is a K/V cache (or recurrent state),
+    /// so the tag is set here rather than asked of each stepper: five callers
+    /// bracketing their own allocations is five places for one to be missed, and
+    /// a missed one shows up as unattributed VRAM, which is the exact thing this
+    /// accounting exists to rule out.
     pub fn growableCreate(self: *Backend, initial: u64, max: u64) Error!GrowableTensor {
         std.debug.assert(initial <= max and max > 0);
+        const ts = self.lmTagScope(.lm_kv);
+        defer if (ts) |s| s.end();
         if (initial == max or !self.ctx.vmmAvailable()) {
             return .{ .buf = try self.tensorCreate(max) };
         }
@@ -1444,6 +1550,9 @@ pub const Backend = struct {
         const va = (max + gran - 1) / gran * gran;
         const base = self.ctx.vmmReserve(@intCast(va)) catch return error.CudaError;
         var gt: GrowableTensor = .{ .buf = dbFromPtr(base, 0), .va_size = va };
+        // Carried on the buffer, not re-read at grow/free time: a K/V cache grows
+        // during a forward, long after whatever phase created it.
+        gt.buf.tag = self.ctx.mem_tag;
         errdefer self.growableDestroy(&gt);
         try self.growableEnsure(&gt, initial);
         return gt;
@@ -1461,7 +1570,7 @@ pub const Backend = struct {
         const delta = target - gt.buf.size; // committed size stays gran-aligned
         try gt.handles.ensureUnusedCapacity(self.gpa, 1);
         while (true) {
-            const h = self.ctx.vmmCommit(gt.buf.ptr(), @intCast(gt.buf.size), @intCast(delta)) catch |err| {
+            const h = self.ctx.vmmCommit(gt.buf.ptr(), @intCast(gt.buf.size), @intCast(delta), gt.buf.tag) catch |err| {
                 if (err != error.DeviceOutOfMemory) return error.CudaError;
                 self.reclaimPending();
                 if (self.blockOldestPending()) continue;
@@ -1479,7 +1588,7 @@ pub const Backend = struct {
         if (gt.va_size != 0) {
             // In-flight kernels may still read the range; unmap is immediate.
             _ = self.ctx.api.cuStreamSynchronize(self.ctx.stream);
-            self.ctx.vmmFree(gt.buf.ptr(), @intCast(gt.va_size), @intCast(gt.buf.size), gt.handles.items);
+            self.ctx.vmmFree(gt.buf.ptr(), @intCast(gt.va_size), @intCast(gt.buf.size), gt.handles.items, gt.buf.tag);
             gt.handles.deinit(self.gpa);
         } else if (gt.buf.buf != .null_handle) {
             self.tensorDestroy(&gt.buf);
@@ -1497,6 +1606,13 @@ pub const Backend = struct {
         // the sync is cheap.
         if (db.buf != .null_handle) _ = self.ctx.api.cuStreamSynchronize(self.ctx.stream);
         self.tensorDestroy(db);
+        // The two dequant staging buffers are attributed here, by identity,
+        // rather than at their half-dozen call sites: they are grown from
+        // whichever quantized GEMM happens to be widest, and a bracket missed at
+        // one of those sites would silently charge the biggest one to `lm_act`.
+        const staging = db == &self.fp8_w16 or db == &self.fp8_a16;
+        const ts = if (staging) self.lmTagScope(.lm_dequant) else null;
+        defer if (ts) |s| s.end();
         db.* = try self.tensorCreate(size);
     }
 
@@ -3268,12 +3384,12 @@ pub const Backend = struct {
         const L = &self.libs.?;
         const ckey: ConvKey = .{ .h = h, .w = w, .ci = ci, .co = co };
         const plan = self.conv_plans.get(ckey) orelse blk: {
-            const p = cudnn.ConvPlan.build(&L.dnn, L.dnn_handle, h, w, ci, co) catch return error.CudaError;
+            const p = cudnn.ConvPlan.build(&L.dnn, try self.dnnHandle(), h, w, ci, co) catch return error.CudaError;
             self.conv_plans.put(self.gpa, ckey, p) catch return error.OutOfMemory;
             break :blk p;
         };
         if (plan.workspace_bytes > 0) try self.ensureDeviceBuffer(&self.cudnn_ws, plan.workspace_bytes);
-        plan.execute(&L.dnn, L.dnn_handle, x16.ptr(), self.conv_w16.ptr(), self.conv_c.ptr(), self.cudnn_ws.ptr()) catch return error.CudaError;
+        plan.execute(&L.dnn, try self.dnnHandle(), x16.ptr(), self.conv_w16.ptr(), self.conv_c.ptr(), self.cudnn_ws.ptr()) catch return error.CudaError;
         const f_bias = if (dst_f16)
             try self.eltFn(elt.bias_add_h16_ptx, "bias_add_h16")
         else
@@ -3531,7 +3647,7 @@ pub const Backend = struct {
         const key: u64 = (@as(u64, m) << 43) | (@as(u64, n) << 22) | (@as(u64, k) << 1) | @intFromBool(d_f16);
         if (self.mdq_plans.get(key)) |p| return p;
         const L = &self.libs.?;
-        const p = cudnn.MatmulDequantPlan.build(&L.dnn, L.dnn_handle, m, n, k, d_f16) catch return error.CudaError;
+        const p = cudnn.MatmulDequantPlan.build(&L.dnn, try self.dnnHandle(), m, n, k, d_f16) catch return error.CudaError;
         self.mdq_plans.put(self.gpa, key, p) catch return error.OutOfMemory;
         return p;
     }
@@ -3546,7 +3662,7 @@ pub const Backend = struct {
             const plan = try self.mdqPlan(m, rows, k, c_h16);
             if (plan.workspace_bytes > 0) try self.ensureDeviceBuffer(&self.cudnn_ws, plan.workspace_bytes);
             const L = &self.libs.?;
-            plan.execute(&L.dnn, L.dnn_handle, self.i8_x.ptr(), w_db.ptr(), self.i8_scale.ptr(), ws_db.ptr(), y.ptr(), self.cudnn_ws.ptr()) catch return error.CudaError;
+            plan.execute(&L.dnn, try self.dnnHandle(), self.i8_x.ptr(), w_db.ptr(), self.i8_scale.ptr(), ws_db.ptr(), y.ptr(), self.cudnn_ws.ptr()) catch return error.CudaError;
             return;
         }
         try self.ensureDeviceBuffer(&self.i8_acc, m * rows * 4);
@@ -4617,7 +4733,7 @@ pub const Backend = struct {
         if (self.sdpa_plans.get(key)) |p| return p;
         const L = &self.libs.?;
         const sdpa_t0 = ctxmod.monoNs();
-        const p = cudnn.SdpaPlan.build(&L.dnn, L.dnn_handle, 1, n_heads, kv_heads, seq_q, seq_kv, hd) catch return error.CudaError;
+        const p = cudnn.SdpaPlan.build(&L.dnn, try self.dnnHandle(), 1, n_heads, kv_heads, seq_q, seq_kv, hd) catch return error.CudaError;
         self.sdpa_ns += ctxmod.monoNs() -% sdpa_t0;
         self.sdpa_count += 1;
         self.sdpa_plans.put(self.gpa, key, p) catch return error.OutOfMemory;
@@ -4659,7 +4775,7 @@ pub const Backend = struct {
         if (plan.workspace_bytes > 0) try self.ensureDeviceBuffer(&self.cudnn_ws, plan.workspace_bytes);
         var sc = scale;
         const L = &self.libs.?;
-        plan.execute(&L.dnn, L.dnn_handle, q16.ptr(), k16.ptr(), v16.ptr(), o16.ptr(), &sc, self.cudnn_ws.ptr()) catch return error.CudaError;
+        plan.execute(&L.dnn, try self.dnnHandle(), q16.ptr(), k16.ptr(), v16.ptr(), o16.ptr(), &sc, self.cudnn_ws.ptr()) catch return error.CudaError;
         if (io_f16) return;
         const f_back = try self.eltFn(elt.f16_to_f32_ptx, "f16_to_f32");
         try self.eltLaunch(f_back, o16, out, null, null, .{ @intCast(qn), @intCast(qn), 0, 0, 0, 0 }, .{ 0, 0 }, qn);

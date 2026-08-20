@@ -631,6 +631,13 @@ test, because getting either wrong is invisible until you look at the screen.
 A useful accident: two faces at the same dvui size have the same cap height, so
 the cross-face normalization §12.4 asks for is free.
 
+The mono scale is **two roles, not one**, and the split is by how the text is
+used rather than by what it contains. `F.mono` (10.5, single-spaced) is for
+scanning: chips, one-line captions, figures compared against each other.
+`F.code` (12, leading 1.45) is for monospaced text that is read left to right —
+a tool call's body, an image card's prompt. Both had been `F.mono`, which is a
+size you can see but not read once it wraps to a second line.
+
 ### Marks (§12.2 tier 4)
 
 `▾ ▸ ✕` are missing from **every** face we bundle, and Plex has none of
@@ -724,12 +731,35 @@ three things you have to read the label of. VRAM keeps its threshold
 escalation to amber at 80% and danger above 95%, since it is the only one of
 the three that actually fails.
 
-**The limit handle is on the LEFT.** It marks the RESERVE the user asks to keep
-free, which is what `vram.resolve` means by it: the effective reserve is
-`max(requested, sys)`, so our block starts at whichever is further right. When
-other programs hold more than the request, the handle sits left of the block's
-real edge — the meter showing why the handle has stopped binding. The split
-handle sits in the free gap, where the two engines actually meet.
+**What is NOT on the card is text, never a length.** Each side's total carries
+what that side is holding in host RAM instead of VRAM — `LLM 11.1G · 2.4G cpu`
+(layer weights computing on the CPU), `DIFFUSION 9.1G · 4.7G stream` (pipeline
+weights re-uploading over PCIe each step). The suffix appears only when the
+figure is nonzero, so a fully resident model says nothing extra and the absence
+of a suffix is the "all of it is in VRAM" signal.
+
+Those bytes get no geometry, and the reason is arithmetic rather than taste: the
+track's x-axis is card capacity, so everything drawn on it sums to at most the
+total by construction. Two models can each want more than the whole card, so
+drawing their shortfalls to scale would have to overlap, and any rule that fixes
+the overlap either rescales (lengths stop being bytes on a bar where every other
+length is bytes) or clamps (understates, exactly when things are worst).
+
+The diffusion figure is the same pair the arbiter plans with — `vpDemand` minus
+`vpUsage`, the measured high-water minus live usage — deliberately not a second
+estimate, so a number that looks wrong on screen means the planner is wrong
+rather than the display disagreeing with it. It inherits that pair's limit: an
+image model that has only ever run squeezed reads 0 until a roomier image
+teaches it better.
+
+**The limit handle is on the LEFT.** It marks how much of the card must NOT be
+ours, which is what `vram.resolve` means by it: other programs count TOWARDS the
+reserve, so the effective one is `max(requested, sys)` and our block starts at
+whichever is further right. When other programs hold more than the request, the
+handle sits left of the block's real edge — the meter showing why the handle has
+stopped binding. It bounds RESIDENCY, not a forward's transient scratch; that
+room is kept by the growth paths themselves. The split handle sits in the free
+gap, where the two engines actually meet.
 
 ### A trap: text layouts paint their own background
 

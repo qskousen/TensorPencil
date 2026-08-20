@@ -65,9 +65,15 @@ from a checkpoint, match what ComfyUI does.
 - `zig build test` — fast CPU unit suite (~15s). Integration tests are gated OFF.
 - `zig build test -Dintegration` — everything, including GPU device tests and real-model
   parity tests (~11 min; needs a device and the `models/` checkpoints). Individual tests
-  self-skip when their device or file is absent.
+  self-skip when their device or file is absent. **`-Dintegration` defaults the build to
+  ReleaseSafe** (Debug makes it ~6x slower and buys nothing: these tests are real models
+  and real kernels, and ReleaseSafe keeps every assert). An explicit `-Doptimize=` wins.
 - `zig build test -Dtest-filter="<substring>"` — one test. **The `=` is required**, and
   only one filter substring per run.
+- `zig build test -Dintegration -Dtest-timing` — same suite through
+  `tools/test_timing_runner.zig`, which reports per-test wall time, slowest first. Reach
+  for it before "the tests are slow": the gated suite's cost is ~9 real-model GPU tests,
+  not the other 600.
 - `zig build gui-test` — tp-gui unit tests (config, fonts, style, history, framing,
   markdown, meter math; not part of `test`)
 - `zig build ui-probe -- out.png [w h] [--states]` — render the whole chat workspace
@@ -96,7 +102,7 @@ depend on one tier. `LIBRARY.md` has the detail.
 | `tp_core` | `src/core/core.zig` | tensors, dtypes, containers (safetensors/GGUF), tokenizers, samplers, schedules, RNG, image |
 | `tp_ops` | `src/ops.zig` | CPU numeric kernels (GEMM, attention, conv, norms, quant decode) |
 | `tp_gpu` | `src/gpu.zig` | Vulkan (Zig→SPIR-V) and CUDA (driver-API PTX + cuBLASLt/cuDNN) backends |
-| `tp_runtime` | `src/runtime/runtime.zig` | VRAM arbiter and residency planner; pure std |
+| `tp_runtime` | `src/runtime/runtime.zig` | VRAM arbiter, residency planner, stepper `boundary` hook; pure std |
 | `tp_models` | `src/tp_models.zig` | model architectures (`src/models/`) and LLM generation (`src/llm/`) |
 | `TensorPencil` | `src/root.zig` | the umbrella module; anything public must be re-exported here |
 

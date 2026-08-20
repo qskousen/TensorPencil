@@ -27,6 +27,7 @@ const sample = @import("tp_core").sample;
 const transformer = @import("transformer.zig");
 const transformer_gpu = @import("transformer_gpu.zig");
 const residency = @import("tp_runtime").residency;
+const bnd = @import("tp_runtime").boundary;
 
 const Backend = cuda.Backend;
 const Buf = cuda.backend.DeviceBuffer;
@@ -302,11 +303,12 @@ pub const CudaLM = struct {
     /// layer disables the captured decode graph (migrateLayer drops it; the
     /// step dispatch re-checks per token).
     split: ?Split = null,
-    /// Coordinator-published residency target, polled between prefill chunks so
-    /// a ceiling raised mid-turn takes effect DURING the prefill it was raised
-    /// for rather than after it. The decode loop polls the same target through
-    /// `engine.checkpoint`; prefill never reaches that call. null on the CLI.
-    residency_poll: ?residency.Poll = null,
+    /// The frontend's turn hook, run between prefill chunks: enact a
+    /// coordinator-published residency ceiling, park on a pause, stop on a
+    /// cancel. The decode loop reaches the same three through
+    /// `engine.checkpoint`; prefill never does, so without this a turn's slow
+    /// half runs uncoordinated and unstoppable. null on the CLI.
+    boundary: ?bnd.Hook = null,
     /// Io for the host matmuls of a hybrid split's CPU-resident layers; set
     /// by the step entry points, or seeded by the session owner BEFORE the
     /// first forward (tp-gui prefills before any step). null fails the host
@@ -632,7 +634,7 @@ pub const CudaLM = struct {
     pub fn prefill(self: *CudaLM, ids: []const u32) !void {
         var off: usize = 0;
         while (off < ids.len) {
-            residency.pollBoundary(self);
+            try bnd.check(self);
             const n = @min(self.max_rows, ids.len - off);
             try self.stepChunk(ids[off..][0..n], null);
             off += n;
@@ -1735,6 +1737,7 @@ const LmBufs = struct {
             cuda.backend.topk_lanes * cuda.backend.topk_m * 4, // topk_i
         };
         inline for (fields, sizes) |name, size| {
+            be.noteBuf(name, size);
             @field(self, name) = try be.tensorCreate(size);
             created += 1;
         }
@@ -1772,6 +1775,7 @@ const TreeBufs = struct {
             3 * m * c.hidden * 4, // taps
         };
         inline for (fields, sizes) |name, size| {
+            be.noteBuf(name, size);
             @field(self, name) = try be.tensorCreate(size);
             created += 1;
         }
@@ -2103,6 +2107,7 @@ const Bufs = struct {
             tap_count * seq * c.hidden * 4, // out
         };
         inline for (fields, sizes) |name, size| {
+            be.noteBuf(name, size);
             @field(self, name) = try be.tensorCreate(size);
             created += 1;
         }

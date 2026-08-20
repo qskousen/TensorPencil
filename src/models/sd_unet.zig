@@ -1449,9 +1449,22 @@ test "the y micro-conditioning vector matches ComfyUI's encode_adm" {
         const w = want[p * adm_len ..][0..adm_len];
         const rel = relL2(w, got);
         errdefer std.debug.print("adm prompt {d}: rel L2 {e:.4}\n", .{ p, rel });
-        // The pooled prefix is copied verbatim and the sinusoids are computed in f64
-        // here against the reference's f32, so this is tight.
-        try testing.expect(rel < 1e-6);
+        // Bounded by the REFERENCE's rounding, not ours. The pooled prefix is copied
+        // verbatim (exact) and the crop blocks are sinusoids of 0 (exact); all the
+        // disagreement is in the four 512-valued blocks, where the reference builds
+        // `freq` in f32. At i=19 that is 130.4727783 against the true 130.4727935, and
+        // cos moves by the same 1.5e-5 — which is the f32 ulp of 512 amplified by the
+        // argument, exactly what `timestepEmbedding`'s own note describes. Computing
+        // in f64 does not make this tighter, it makes the gap EQUAL the reference's
+        // error instead of stacking two. A block-order error is O(1) here (0.5
+        // measured), so 1e-5 leaves the ordering check its full margin.
+        //
+        // What this fixture CANNOT catch: it was generated square and uncropped, so
+        // height == width == target_height == target_width and both crops are 0. Only
+        // a swap ACROSS those two value groups moves the result; h<->w and
+        // target_h<->target_w are invisible. Regenerating at a non-square cropped
+        // size is what would pin the full order.
+        try testing.expect(rel < 1e-5);
     }
 }
 

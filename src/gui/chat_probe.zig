@@ -70,7 +70,7 @@ pub fn main(init: std.process.Init) !void {
 
     for (0..repeat) |rep| {
         if (rep > 0) {
-            s.reset();
+            _ = s.reset(); // idle between repeats, so it always takes
             s.reseed(seed);
         }
         for (messages.items, 1..) |message, turn| {

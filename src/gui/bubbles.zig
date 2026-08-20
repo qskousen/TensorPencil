@@ -204,11 +204,11 @@ pub fn toolCard(src: std.builtin.SourceLocation, tc: ToolCall, cb: ToolActions) 
             .expand = .horizontal,
             .background = false,
             .padding = .{},
-            .font = F.mono,
+            .font = F.code,
             .color_text = C.text_dim,
         });
         defer tl.deinit();
-        fonts.addStyled(tl, tc.prompt, .{}, .{ .font = F.mono, .color_text = C.text_dim });
+        fonts.addStyled(tl, tc.prompt, .{}, .{ .font = F.code, .color_text = C.text_dim });
     }
 
     // ---- tiles

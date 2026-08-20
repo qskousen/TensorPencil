@@ -33,6 +33,7 @@ const ops = @import("tp_ops");
 const kvmod = @import("tp_core").kv_cache;
 const sample = @import("tp_core").sample;
 const residency = @import("tp_runtime").residency;
+const bnd = @import("tp_runtime").boundary;
 const transformer = @import("transformer.zig");
 const transformer_gpu = @import("transformer_gpu.zig");
 
@@ -71,12 +72,67 @@ fn bufRows(cfg: gemma4.Config) usize {
     return std.mem.alignForward(usize, cfg.maxBatch(), 128);
 }
 
+/// Activation-buffer height for a session that has not seen an image. A text
+/// prefill never batches more than `prefill_chunk`, so this is all a text-only
+/// conversation can use, and `ensureBufRows` grows to `bufRows` the first time an
+/// image block actually arrives.
+///
+/// Sizing for the image block up front cost a text-only chat the whole
+/// difference: at the `max` vision budget that is a 1152-row buffer set against a
+/// 256-row one, ~800 MiB of activation scratch held for a picture nobody sent.
+/// Having a tower CONFIGURED is not the same as using it, and the buffers cannot
+/// tell the difference at load, which is why this is decided at the image
+/// instead.
+fn textBufRows() usize {
+    return std.mem.alignForward(usize, prefill_chunk, 128);
+}
+
 /// Rows a LOCAL (sliding-window) layer's KV ring holds: the window plus one
 /// max-batch of slack, so within a single prefill batch (queries span
 /// `window + seq - 1` positions) the ring can't alias a still-needed key
 /// against a freshly-written one. Fixed for the session (never grows).
-fn localRingRows(cfg: gemma4.Config) usize {
+/// CEILING for the ring: the window plus the largest batch a session could ever
+/// prefill in one pass. Only reached once an image block actually arrives.
+fn localRingMax(cfg: gemma4.Config) usize {
     return cfg.sliding_window + cfg.maxBatch();
+}
+
+/// Ring size for a session that has not seen an image: the window plus the text
+/// prefill chunk, which is the largest batch text alone can produce.
+///
+/// The slack exists because within ONE batch the queries span
+/// `window + seq - 1` positions, so the ring must hold that many rows without
+/// aliasing a still-needed key against a freshly-written one. Sizing it for the
+/// vision budget regardless cost a text-only conversation the whole difference:
+/// against llama.cpp, which uses the identical formula with its `n_ubatch`, ours
+/// was 2144 rows to its 1536. With the text chunk it is 1280 -- smaller than
+/// llama.cpp's.
+fn localRingText(cfg: gemma4.Config) usize {
+    return cfg.sliding_window + prefill_chunk;
+}
+
+/// Bytes a LOCAL ring commits to cover `rows` positions, for layer `l`.
+///
+/// Position p lives at ring row `p % ring`, so while `len <= ring` only rows
+/// [0, len) are ever addressed: a committed PREFIX is enough and the buffer
+/// grows with the conversation, exactly like a GLOBAL layer's. It stops at the
+/// ring, past which it wraps and needs all of it.
+///
+/// These used to commit the whole ring at load. Gemma's pattern makes most
+/// layers local, so that is the bulk of the model's K/V allocated up front for a
+/// window the conversation has not reached.
+fn ringBytes(cfg: gemma4.Config, dt: kvmod.KvDtype, l: usize, ring: usize, rows: usize) usize {
+    return dt.sizeBytes(@min(rows, ring) * cfg.kvDim(l));
+}
+
+/// Live ring rows for layer `l` at length `len`: what migrate/promote actually
+/// need to copy. A position past `len` has never been written, so copying the
+/// whole ring moved uninitialized bytes; now that the ring commits lazily those
+/// rows may not be mapped at all, which would fault. The host shadow is sized at
+/// the full ring either way (`hostShadowCache`), so the destination is always in
+/// bounds; it is the device side that shrank.
+fn liveRingRows(ring: usize, len: usize) usize {
+    return @min(len, ring);
 }
 
 /// Kill-switch for the LOCAL-layer sliding-window ring cache (TODO lever 1).
@@ -110,11 +166,24 @@ pub const CudaLM = struct {
     /// variant and the per-element byte stride of k_cache/v_cache.
     kv_dtype: kvmod.KvDtype,
     len: usize,
+    /// Rows each LOCAL sliding-window ring holds. Starts at `localRingText` and
+    /// grows once, to `localRingMax`, when the first image block arrives
+    /// (`growLocalRing`). The ring MODULUS is baked into position addressing
+    /// (`p % ring`), so growing it is a remap of every live row, not a resize.
+    ring_rows: usize = 0,
+    /// Rows the activation buffers are currently allocated for. Starts at the
+    /// text prefill chunk and grows once, to `bufRows`, when the first image
+    /// block arrives (`ensureBufRows`).
+    buf_rows: usize = 0,
     /// Set for the duration of a bidirectional image-block prefill: the
     /// `attention` stepper reads it and lets every query in the batch attend
     /// the whole block forward (llama.cpp marks image spans non-causal).
     bidir_prefill: bool = false,
-    /// sin-table offsets within each freqs buffer (= cap.max * half).
+    /// Rows the RoPE tables currently cover. Grows with `capacity`; the sin
+    /// offsets below are derived from it, so the two move together or every
+    /// rotation past the old row count reads the wrong half of the buffer.
+    rope_rows: usize = 0,
+    /// sin-table offsets within each freqs buffer (= rope_rows * half).
     sin_off_global: usize,
     sin_off_local: usize,
     /// Global-layer (theta 1e6 + proportional rope_freqs) and local-layer
@@ -141,11 +210,12 @@ pub const CudaLM = struct {
     /// offload migrates more to the host as the KV cache grows). null = fully
     /// device-resident (gemma4 is per-op already, so nothing else changes).
     split: ?Split = null,
-    /// Coordinator-published residency target, polled between prefill chunks so
-    /// a ceiling raised mid-turn takes effect DURING the prefill it was raised
-    /// for rather than after it. The decode loop polls the same target through
-    /// `engine.checkpoint`; prefill never reaches that call. null on the CLI.
-    residency_poll: ?residency.Poll = null,
+    /// The frontend's turn hook, run between prefill chunks: enact a
+    /// coordinator-published residency ceiling, park on a pause, stop on a
+    /// cancel. The decode loop reaches the same three through
+    /// `engine.checkpoint`; prefill never does, so without this a turn's slow
+    /// half runs uncoordinated and unstoppable. null on the CLI.
+    boundary: ?bnd.Hook = null,
 
     /// Which layers a hybrid CPU/GPU split pushes to the host. Gemma4 is
     /// uniform attention (no recurrent layers), so both policies reduce to a
@@ -208,12 +278,20 @@ pub const CudaLM = struct {
         self.max_capacity = cap.max;
         self.kv_dtype = cap.kv_dtype;
         self.len = 0;
-        self.sin_off_global = cap.max * (cfg.head_dim_global / 2);
-        self.sin_off_local = cap.max * (cfg.head_dim_local / 2);
+        // RoPE tables cover the COMMITTED capacity, not `cap.max`, and grow with
+        // it in `growRope`. Sized at `cap.max` they were the single largest
+        // activation allocation on a long-context model: at the GUI's 128k
+        // ceiling, 256 MiB (global, head_dim 512) + 128 MiB (local, 256) held up
+        // front for context a conversation will almost never reach, while the K/V
+        // they sit beside grows lazily. The table is DERIVED from position, so
+        // rebuilding it costs nothing but the upload.
+        self.rope_rows = cap.initial;
+        self.sin_off_global = cap.initial * (cfg.head_dim_global / 2);
+        self.sin_off_local = cap.initial * (cfg.head_dim_local / 2);
 
-        self.freqs_global = try uploadFreqs(be, gpa, cap.max, cfg.head_dim_global, cfg.rope_theta, 1.0, lm.rope_freqs);
+        self.freqs_global = try uploadFreqs(be, gpa, cap.initial, cfg.head_dim_global, cfg.rope_theta, 1.0, lm.rope_freqs);
         errdefer be.tensorDestroy(&self.freqs_global);
-        self.freqs_local = try uploadFreqs(be, gpa, cap.max, cfg.head_dim_local, cfg.rope_theta_local, 1.0, null);
+        self.freqs_local = try uploadFreqs(be, gpa, cap.initial, cfg.head_dim_local, cfg.rope_theta_local, 1.0, null);
         errdefer be.tensorDestroy(&self.freqs_local);
 
         const ones_host = try gpa.alloc(f32, cfg.head_dim_global);
@@ -221,7 +299,9 @@ pub const CudaLM = struct {
         @memset(ones_host, 1.0);
         self.ones = .{ .buf = try be.smallBuffer(std.mem.sliceAsBytes(ones_host)), .mem = .null_handle, .size = 0 };
 
-        self.bufs = try Bufs.init(be, cfg);
+        self.ring_rows = localRingText(cfg);
+        self.buf_rows = textBufRows();
+        self.bufs = try Bufs.init(be, cfg, self.buf_rows);
 
         self.k_cache = try alloc.alloc(Growable, cfg.n_layers);
         self.v_cache = try alloc.alloc(Growable, cfg.n_layers);
@@ -250,9 +330,8 @@ pub const CudaLM = struct {
             if (self.split) |*sp| if (!sp.on_gpu[l]) continue;
             const kvd = cfg.kvDim(l);
             if (usesRing(cfg, l)) {
-                const bytes = dt.sizeBytes(localRingRows(cfg) * kvd);
-                kb.* = try be.growableCreate(bytes, bytes);
-                vb.* = try be.growableCreate(bytes, bytes);
+                kb.* = try be.growableCreate(ringBytes(cfg, dt, l, self.ring_rows, self.initial_capacity), ringBytes(cfg, dt, l, self.ring_rows, std.math.maxInt(usize)));
+                vb.* = try be.growableCreate(ringBytes(cfg, dt, l, self.ring_rows, self.initial_capacity), ringBytes(cfg, dt, l, self.ring_rows, std.math.maxInt(usize)));
             } else {
                 kb.* = try be.growableCreate(dt.sizeBytes(self.initial_capacity * kvd), dt.sizeBytes(self.max_capacity * kvd));
                 vb.* = try be.growableCreate(dt.sizeBytes(self.initial_capacity * kvd), dt.sizeBytes(self.max_capacity * kvd));
@@ -284,15 +363,22 @@ pub const CudaLM = struct {
     }
 
     /// Build the split's host K/V shadow: per-layer dims, LOCAL layers with the
-    /// SAME fixed ring layout as the device rings (localRingRows), full-context
+    /// SAME ring layout as the device rings (`ring_rows`), full-context
     /// linear rows for GLOBAL layers, at the current `self.capacity`.
     fn hostShadowCache(self: *CudaLM, dtype: kvmod.KvDtype) !kvmod.PerLayerKvCache {
+        return self.hostShadowCacheAt(self.ring_rows, dtype);
+    }
+
+    /// The shadow mirrors the DEVICE ring layout, so its ring size is a parameter
+    /// rather than read from `ring_rows`: `growLocalRing` builds the replacement
+    /// at the new size while the old one is still live and being read from.
+    fn hostShadowCacheAt(self: *CudaLM, ring: usize, dtype: kvmod.KvDtype) !kvmod.PerLayerKvCache {
         const cfg = self.cfg;
         const dims = try cfg.kvDims(self.gpa);
         defer self.gpa.free(dims);
         const rings = try self.gpa.alloc(usize, cfg.n_layers);
         defer self.gpa.free(rings);
-        for (rings, 0..) |*r, l| r.* = if (usesRing(cfg, l)) localRingRows(cfg) else 0;
+        for (rings, 0..) |*r, l| r.* = if (usesRing(cfg, l)) ring else 0;
         return kvmod.PerLayerKvCache.init(self.gpa, self.capacity, dims, rings, dtype);
     }
 
@@ -383,7 +469,7 @@ pub const CudaLM = struct {
         const dt = self.kv_dtype;
         var total: usize = 0;
         for (0..cfg.n_layers) |l| {
-            if (usesRing(cfg, l)) total += 2 * dt.sizeBytes(localRingRows(cfg) * cfg.kvDim(l));
+            if (usesRing(cfg, l)) total += 2 * dt.sizeBytes(self.ring_rows * cfg.kvDim(l));
         }
         return total;
     }
@@ -421,7 +507,7 @@ pub const CudaLM = struct {
     /// a raw memcpy of the shadow's identical ring block.
     fn checkpointRings(self: *CudaLM, comptime dir: CheckpointDir, buf: if (dir == .save) []u8 else []const u8) !void {
         const cfg = self.cfg;
-        const ring = localRingRows(cfg);
+        const ring = self.ring_rows;
         const dt = self.kv_dtype;
         var off: usize = 0;
         for (0..cfg.n_layers) |l| {
@@ -476,7 +562,7 @@ pub const CudaLM = struct {
         const kvd = cfg.kvDim(l);
         const dt = self.kv_dtype;
         if (self.len > 0) {
-            const rows = if (usesRing(cfg, l)) localRingRows(cfg) else self.len;
+            const rows = if (usesRing(cfg, l)) liveRingRows(self.ring_rows, self.len) else self.len;
             try self.be.tensorDownload(offsetBufSized(self.k_cache[l].buf, 0, dt.sizeBytes(rows * kvd)), sp.cache.kRowBytes(l, 0, rows));
             try self.be.tensorDownload(offsetBufSized(self.v_cache[l].buf, 0, dt.sizeBytes(rows * kvd)), sp.cache.vRowBytes(l, 0, rows));
         }
@@ -560,7 +646,7 @@ pub const CudaLM = struct {
     /// current capacity for GLOBAL), plus slack.
     pub fn promoteCost(self: *CudaLM, l: usize) usize {
         const cfg = self.cfg;
-        const rows = if (usesRing(cfg, l)) localRingRows(cfg) else self.capacity;
+        const rows = if (usesRing(cfg, l)) self.ring_rows else self.capacity;
         const kv = 2 * self.kv_dtype.sizeBytes(rows * cfg.kvDim(l));
         return layerDeviceBytes(&self.lm.layers[l]) + kv + residency.promote_slack;
     }
@@ -575,15 +661,14 @@ pub const CudaLM = struct {
         const kvd = cfg.kvDim(l);
         const dt = self.kv_dtype;
         if (usesRing(cfg, l)) {
-            const bytes = dt.sizeBytes(localRingRows(cfg) * kvd);
-            self.k_cache[l] = try self.be.growableCreate(bytes, bytes);
-            self.v_cache[l] = try self.be.growableCreate(bytes, bytes);
+            self.k_cache[l] = try self.be.growableCreate(ringBytes(cfg, dt, l, self.ring_rows, self.capacity), ringBytes(cfg, dt, l, self.ring_rows, std.math.maxInt(usize)));
+            self.v_cache[l] = try self.be.growableCreate(ringBytes(cfg, dt, l, self.ring_rows, self.capacity), ringBytes(cfg, dt, l, self.ring_rows, std.math.maxInt(usize)));
         } else {
             self.k_cache[l] = try self.be.growableCreate(dt.sizeBytes(self.capacity * kvd), dt.sizeBytes(self.max_capacity * kvd));
             self.v_cache[l] = try self.be.growableCreate(dt.sizeBytes(self.capacity * kvd), dt.sizeBytes(self.max_capacity * kvd));
         }
         if (self.len > 0) {
-            const rows = if (usesRing(cfg, l)) localRingRows(cfg) else self.len;
+            const rows = if (usesRing(cfg, l)) liveRingRows(self.ring_rows, self.len) else self.len;
             try self.be.tensorUpload(offsetBufSized(self.k_cache[l].buf, 0, dt.sizeBytes(rows * kvd)), sp.cache.kRowBytes(l, 0, rows));
             try self.be.tensorUpload(offsetBufSized(self.v_cache[l].buf, 0, dt.sizeBytes(rows * kvd)), sp.cache.vRowBytes(l, 0, rows));
         }
@@ -685,10 +770,10 @@ pub const CudaLM = struct {
         for (self.lm.layers, 0..) |*layer, l| per[l] = layerDeviceBytes(layer);
 
         // Device memory that must stay resident: KV + LM head + slack. Per-layer
-        // KV widths; LOCAL ring layers hold only localRingRows.
+        // KV widths; LOCAL ring layers hold only `ring_rows`.
         var kv_bytes: usize = 0;
         for (0..n) |l| {
-            const rows = if (usesRing(cfg, l)) localRingRows(cfg) else self.capacity;
+            const rows = if (usesRing(cfg, l)) self.ring_rows else self.capacity;
             kv_bytes += 2 * self.kv_dtype.sizeBytes(rows * cfg.kvDim(l));
         }
         const reserve = if (dynamic)
@@ -759,13 +844,39 @@ pub const CudaLM = struct {
     /// Device bytes a grow to `target` rows would commit across the still
     /// on-GPU, growable (non-ring GLOBAL) layers, per-layer KV widths summed
     /// (gemma3's uniform `liveSlots * add` doesn't apply here).
+    /// Rebuild the device RoPE tables to cover `rows`. The table is a pure
+    /// function of position, so this reuploads rather than preserving anything.
+    ///
+    /// Both tables and BOTH sin offsets move together: the offset is where the
+    /// sin half starts inside the buffer, so a table grown without its offset
+    /// updated sends every rotation past the old row count reading cos as sin.
+    fn growRope(self: *CudaLM, rows: usize) !void {
+        if (rows <= self.rope_rows) return;
+        const cfg = self.cfg;
+        var g = try uploadFreqs(self.be, self.gpa, rows, cfg.head_dim_global, cfg.rope_theta, 1.0, self.lm.rope_freqs);
+        errdefer self.be.tensorDestroy(&g);
+        const l = try uploadFreqs(self.be, self.gpa, rows, cfg.head_dim_local, cfg.rope_theta_local, 1.0, null);
+        self.be.tensorDestroy(&self.freqs_global);
+        self.be.tensorDestroy(&self.freqs_local);
+        self.freqs_global = g;
+        self.freqs_local = l;
+        self.rope_rows = rows;
+        self.sin_off_global = rows * (cfg.head_dim_global / 2);
+        self.sin_off_local = rows * (cfg.head_dim_local / 2);
+    }
+
     fn growBytes(self: *CudaLM, target: usize) u64 {
         const add = target - self.capacity;
         var need: u64 = 0;
         for (0..self.cfg.n_layers) |l| {
-            if (usesRing(self.cfg, l)) continue;
             if (self.split) |*sp| if (!sp.on_gpu[l]) continue;
-            need += 2 * self.kv_dtype.sizeBytes(add * self.cfg.kvDim(l));
+            // A ring's increment is capped at the window, so it contributes only
+            // until it is whole; charging it the global increment forever is what
+            // made this over-reserve and migrate layers it did not need to.
+            need += if (usesRing(self.cfg, l))
+                2 * (ringBytes(self.cfg, self.kv_dtype, l, self.ring_rows, target) -| ringBytes(self.cfg, self.kv_dtype, l, self.ring_rows, self.capacity))
+            else
+                2 * self.kv_dtype.sizeBytes(add * self.cfg.kvDim(l));
         }
         return need;
     }
@@ -779,15 +890,26 @@ pub const CudaLM = struct {
         // recompute per iteration). Mirrors gemma3_cuda.
         if (self.split) |*sp| if (sp.dynamic) {
             while (true) {
-                const need = self.growBytes(target) + (32 << 20); // + margin
+                // The margin must cover the forward's LARGEST single
+                // allocation, not a flat guess. `promoteBack` already reserves
+                // exactly this before bringing a layer back, for exactly this
+                // reason; growing the K/V into the same budget without it is the
+                // same mistake on the other path. The card is allowed to fill to
+                // zero free once other processes satisfy the reserve (that is
+                // what the reserve MEANS), so nothing above us is keeping the
+                // forward's scratch any room -- this is where it has to come
+                // from. A flat 32 MiB let the grow land 13 MiB short of a 220 MiB
+                // dequant buffer, which the OOM handler then paid for by dumping
+                // four layers to the host.
+                const need = self.growBytes(target) + residency.promoteReserve(self);
                 const free = @min(sp.budget -| self.be.deviceUsed(), self.be.headroom());
                 if (free >= need) break;
                 if (!(try residency.migrateNext(self))) break; // nothing left; fall through
             }
         };
 
-        // Grow device KV of the GLOBAL layers still on the GPU (LOCAL ring
-        // layers are fixed-size, never grow them). Physical VRAM can be
+        // Grow device KV of the layers still on the GPU (LOCAL rings grow too,
+        // capped at the ring). Physical VRAM can be
         // exhausted even when the proactive migration above thought there was
         // room: a resident image model on another CUDA context may grab it
         // between the headroom check and this commit. On a real OOM, offload
@@ -796,14 +918,16 @@ pub const CudaLM = struct {
         // idempotent, so re-running the loop is cheap.
         grow: while (true) {
             for (0..self.cfg.n_layers) |l| {
-                if (usesRing(self.cfg, l)) continue;
                 if (self.split) |*sp| if (!sp.on_gpu[l]) continue;
                 // Byte size MUST match how the buffers were created (kv_dtype
                 // block math), or an f16/q8_0 cache requests f32-sized growth,
                 // overshoots its VA reservation, and growableEnsure fails with
                 // DeviceOutOfMemory -> ContextFull once the window grows past
                 // ~max_capacity/2.
-                const bytes = self.kv_dtype.sizeBytes(target * self.cfg.kvDim(l));
+                const bytes = if (usesRing(self.cfg, l))
+                    ringBytes(self.cfg, self.kv_dtype, l, self.ring_rows, target)
+                else
+                    self.kv_dtype.sizeBytes(target * self.cfg.kvDim(l));
                 for ([2]*Growable{ &self.k_cache[l], &self.v_cache[l] }) |b| {
                     self.be.growableEnsure(b, bytes) catch |err| switch (err) {
                         error.DeviceOutOfMemory, error.OutOfMemory => {
@@ -820,6 +944,9 @@ pub const CudaLM = struct {
             }
             break;
         }
+        // The device RoPE tables cover `capacity`, so they grow with it.
+        try self.growRope(target);
+
         // A hybrid split keeps host KV/RoPE for its CPU layers; grow them in
         // lockstep so host positions stay aligned with the device len.
         if (self.split) |*sp| {
@@ -942,7 +1069,7 @@ pub const CudaLM = struct {
     pub fn prefill(self: *CudaLM, ids: []const u32) !void {
         var off: usize = 0;
         while (off < ids.len) {
-            residency.pollBoundary(self);
+            try bnd.check(self);
             const n: usize = @min(prefill_chunk, ids.len - off);
             try self.embedChunk(ids[off..][0..n], .none);
             off += n;
@@ -951,6 +1078,138 @@ pub const CudaLM = struct {
 
     /// Prefill one image's projected embeddings ([n*hidden], injected UNSCALED)
     /// at the next sequential positions. grid dims carried for interface parity.
+    /// Grow every LOCAL sliding-window ring to `new_ring` rows, preserving the
+    /// live window. No-op once big enough, so only the first image in a session
+    /// pays for it.
+    ///
+    /// This is a REMAP, not a resize: a ring stores position p at row
+    /// `p % ring`, so changing the modulus moves almost every live row. The live
+    /// window is read out by ABSOLUTE position through the old ring
+    /// (`kvmod.ringSegments`) and written back through the new one, which visits
+    /// each position exactly once in both directions.
+    ///
+    /// It stages through host memory rather than copying device-to-device
+    /// because the K/V element type is f32/f16/q8_0 and only the BYTE layout is
+    /// common to all three; `dt.sizeBytes` is the single width contract, and a
+    /// host round trip speaks bytes. It is one transfer of `window` rows per
+    /// local layer, once per session.
+    ///
+    /// Host-resident layers of an armed split are remapped in `split.cache`
+    /// (which mirrors the device ring layout) by the same mapping, or a promote
+    /// would restore rows the device now addresses differently.
+    fn growLocalRing(self: *CudaLM, new_ring: usize) !void {
+        if (new_ring <= self.ring_rows) return;
+        const cfg = self.cfg;
+        const dt = self.kv_dtype;
+        const old_ring = self.ring_rows;
+        const live = liveRingRows(old_ring, self.len);
+
+        // Absolute-position staging for one layer's K and V.
+        const widest = cfg.maxKvDim();
+        const stage = try self.gpa.alloc(u8, 2 * dt.sizeBytes(live * widest));
+        defer self.gpa.free(stage);
+
+        // An armed split's host shadow mirrors the ring layout, so it is rebuilt
+        // at the new geometry and every host-resident layer is carried across:
+        // LOCAL ones through the same remap, GLOBAL ones linearly. Built before
+        // the loop because the old one is still being read from.
+        var new_cache: ?kvmod.PerLayerKvCache = null;
+        errdefer if (new_cache) |*c| c.deinit(self.gpa);
+        if (self.split != null) {
+            new_cache = try self.hostShadowCacheAt(new_ring, dt);
+            new_cache.?.len = self.len;
+            const sp = &self.split.?;
+            for (0..cfg.n_layers) |l| {
+                if (usesRing(cfg, l) or sp.on_gpu[l] or self.len == 0) continue;
+                // GLOBAL host layer: linear rows, straight copy.
+                @memcpy(new_cache.?.kRowBytes(l, 0, self.len), sp.cache.kRowBytes(l, 0, self.len));
+                @memcpy(new_cache.?.vRowBytes(l, 0, self.len), sp.cache.vRowBytes(l, 0, self.len));
+            }
+        }
+
+        for (0..cfg.n_layers) |l| {
+            if (!usesRing(cfg, l)) continue;
+            const kvd = cfg.kvDim(l);
+            const row = dt.sizeBytes(kvd);
+            const half = dt.sizeBytes(live * kvd);
+            const ks = stage[0..half];
+            const vs = stage[half..][0..half];
+            const on_dev = if (self.split) |*sp| sp.on_gpu[l] else true;
+
+            if (live > 0) {
+                // Read by absolute position through the OLD ring.
+                for (kvmod.ringSegments(self.len, old_ring)) |sg| {
+                    if (sg.n == 0) continue;
+                    const at = (sg.abs - (self.len - live)) * row;
+                    if (on_dev) {
+                        try self.be.tensorDownload(offsetBufSized(self.k_cache[l].buf, sg.dev * row, sg.n * row), ks[at..][0 .. sg.n * row]);
+                        try self.be.tensorDownload(offsetBufSized(self.v_cache[l].buf, sg.dev * row, sg.n * row), vs[at..][0 .. sg.n * row]);
+                    } else {
+                        const sp = &self.split.?;
+                        @memcpy(ks[at..][0 .. sg.n * row], sp.cache.kRowBytes(l, sg.dev, sg.n));
+                        @memcpy(vs[at..][0 .. sg.n * row], sp.cache.vRowBytes(l, sg.dev, sg.n));
+                    }
+                }
+            }
+
+            if (on_dev) {
+                self.be.growableDestroy(&self.k_cache[l]);
+                self.be.growableDestroy(&self.v_cache[l]);
+                const max_b = dt.sizeBytes(new_ring * kvd);
+                const init_b = dt.sizeBytes(@min(self.capacity, new_ring) * kvd);
+                self.k_cache[l] = try self.be.growableCreate(init_b, max_b);
+                self.v_cache[l] = try self.be.growableCreate(init_b, max_b);
+            }
+
+            if (live == 0) continue;
+            // Write by absolute position through the NEW ring.
+            for (kvmod.ringSegments(self.len, new_ring)) |sg| {
+                if (sg.n == 0) continue;
+                // The new window is a superset of the old (new_ring > old_ring),
+                // so clip to the positions actually staged.
+                const first = @max(sg.abs, self.len - live);
+                const n = (sg.abs + sg.n) -| first;
+                if (n == 0) continue;
+                const at = (first - (self.len - live)) * row;
+                const dev = (sg.dev + (first - sg.abs)) * row;
+                if (on_dev) {
+                    try self.be.tensorUpload(offsetBufSized(self.k_cache[l].buf, dev, n * row), ks[at..][0 .. n * row]);
+                    try self.be.tensorUpload(offsetBufSized(self.v_cache[l].buf, dev, n * row), vs[at..][0 .. n * row]);
+                } else {
+                    @memcpy(new_cache.?.kRowBytes(l, dev / row, n), ks[at..][0 .. n * row]);
+                    @memcpy(new_cache.?.vRowBytes(l, dev / row, n), vs[at..][0 .. n * row]);
+                }
+            }
+        }
+        if (new_cache) |c| {
+            const sp = &self.split.?;
+            sp.cache.deinit(self.gpa);
+            sp.cache = c;
+            new_cache = null;
+        }
+        self.ring_rows = new_ring;
+        std.log.info("[vram] LOCAL K/V rings grown {d} -> {d} rows for a {d}-token image block", .{ old_ring, new_ring, new_ring - cfg.sliding_window });
+    }
+
+    /// Grow the activation buffers to hold `rows` in one batch. No-op once big
+    /// enough, so the first image in a session pays one reallocation and the
+    /// rest pay nothing.
+    ///
+    /// Safe to reallocate between forwards because these are pure per-forward
+    /// scratch: nothing carries across a call, unlike the K/V caches. The
+    /// batch must not be open (this is called before `beginBatch`), or the
+    /// queued kernels would still reference the freed buffers.
+    fn ensureBufRows(self: *CudaLM, rows: usize) !void {
+        const want = std.mem.alignForward(usize, rows, 128);
+        if (want <= self.buf_rows) return;
+        std.debug.assert(!self.be.batching());
+        _ = self.be.ctx.api.cuStreamSynchronize(self.be.ctx.stream);
+        self.bufs.deinit(self.be);
+        self.bufs = try Bufs.init(self.be, self.cfg, want);
+        self.buf_rows = want;
+        std.log.info("[vram] activation buffers grown to {d} rows for a {d}-token image block", .{ want, rows });
+    }
+
     pub fn prefillImage(self: *CudaLM, embeds: []const f32, grid_w: usize, grid_h: usize) !void {
         _ = grid_w;
         _ = grid_h;
@@ -959,6 +1218,12 @@ pub const CudaLM = struct {
         // A bidirectional image block must be one batch (a later chunk's KV is
         // not committed when an earlier chunk runs); it fits in maxBatch rows.
         std.debug.assert(total <= cfg.maxBatch());
+        // First image in this session: the buffers and the LOCAL rings were both
+        // sized for text. Rings first -- it reallocates K/V, and doing it after
+        // the buffers would leave a wider activation set alive across the churn
+        // for no reason.
+        try self.growLocalRing(localRingMax(cfg));
+        try self.ensureBufRows(total);
         self.bidir_prefill = true;
         defer self.bidir_prefill = false;
         try self.forwardRows(embeds, .none);
@@ -1052,7 +1317,7 @@ pub const CudaLM = struct {
         // LOCAL layer: write into the ring at row pos0%ring, splitting the copy
         // when it wraps the ring boundary (seq <= max_batch < ring, so at most
         // one wrap).
-        const ring = localRingRows(cfg);
+        const ring = self.ring_rows;
         const start = pos0 % ring;
         const first = @min(seq, ring - start);
         try self.storeKv(self.k_cache[l].buf, start * kv_dim, b.k, 0, first * kv_dim);
@@ -1068,7 +1333,7 @@ pub const CudaLM = struct {
         const b = &self.bufs;
         const ns: usize = if (seq == 1) nsplit else nsplit_prefill;
         const window: usize = if (cfg.isGlobal(l)) 0 else cfg.sliding_window;
-        const ring: usize = if (usesRing(cfg, l)) localRingRows(cfg) else 0;
+        const ring: usize = if (usesRing(cfg, l)) self.ring_rows else 0;
         // TP_DUMP_ATTN: the exact shape of every attention call. Two callers
         // that disagree on the result must first be asked whether they are even
         // making the same call.
@@ -1151,7 +1416,7 @@ pub const CudaLM = struct {
         const n = x_host.len / cfg.hidden;
         const eps = cfg.rms_eps;
         const pos0 = self.len;
-        std.debug.assert(n >= 1 and n <= cfg.maxBatch() and n <= self.remaining());
+        std.debug.assert(n >= 1 and n <= self.buf_rows and n <= self.remaining());
 
         try be.tensorUpload(offsetBufSized(b.x, 0, n * cfg.hidden * 4), std.mem.sliceAsBytes(x_host));
 
@@ -1290,10 +1555,11 @@ const Bufs = struct {
     topk_v: Buf,
     topk_i: Buf,
 
-    fn init(be: *Backend, cfg: gemma4.Config) !Bufs {
-        // Height for the largest single batch (text chunk or whole image block),
-        // rounded up to the GEMM's 128-row output padding.
-        const pc = bufRows(cfg);
+    fn init(be: *Backend, cfg: gemma4.Config, rows: usize) !Bufs {
+        // Height in rows, already 128-aligned by the caller (opMatmulQuant pads
+        // its output rows to a multiple of 128, so GEMM-output buffers must
+        // reserve the padded height).
+        const pc = rows;
         // The flash-split scratch row is (hd+4) f32; size it for the larger
         // (global) head_dim so both local and global attention fit.
         const hd_max = @max(cfg.head_dim_global, cfg.head_dim_local);
@@ -1321,6 +1587,7 @@ const Bufs = struct {
             cuda.backend.topk_lanes * cuda.backend.topk_m, // topk_i
         };
         inline for (@typeInfo(Bufs).@"struct".fields, 0..) |f, i| {
+            be.noteBuf(f.name, sizes[i] * 4);
             @field(self, f.name) = try be.tensorCreate(sizes[i] * 4);
             created = i + 1;
         }
@@ -1357,7 +1624,7 @@ test "checkpoint restore regenerates token-identical on the real model" {
     var lm = try gemma4.Model.load(gpa, &g);
     defer lm.deinit();
 
-    const ring = localRingRows(lm.cfg);
+    const ring = localRingText(lm.cfg); // the session's ring until an image arrives
     const prompt_len = ring + 64;
     const n_gen = (ring - lm.cfg.sliding_window) + 64;
     const total = prompt_len + n_gen + 8;
@@ -1588,4 +1855,112 @@ test "cpu split prefill before any step needs a seeded io" {
     try std.testing.expectEqual(prompt.len - 1, model.cached());
     const next = try model.stepArgmax(io, prompt[prompt.len - 1 ..]);
     try std.testing.expect(next < lm.cfg.vocab);
+}
+
+
+/// One text prefill + one image block + a step, on a fresh model, returning the
+/// final RAW logits. `pregrow` sizes the activation buffers for the image block
+/// BEFORE any forward, i.e. the way they were sized unconditionally before
+/// `ensureBufRows` existed. Also reports the buffer height before and after the
+/// image, so the caller can assert the grow actually happened.
+const ImageRun = struct { rows_before: usize, rows_after: usize, ring_after: usize };
+
+fn imageRunForTest(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    be: *Backend,
+    lm: *const gemma4.Model,
+    pregrow: bool,
+    prompt_len: usize,
+    logits: []f32,
+) !ImageRun {
+    const cfg = lm.cfg;
+    const n_img = cfg.image_budget;
+    const total = prompt_len + n_img + 8;
+    std.debug.assert(prompt_len > localRingText(cfg)); // the ring must have wrapped
+    var model = try CudaLM.init(gpa, be, lm, .{ .initial = total, .max = total });
+    defer model.deinit();
+    if (pregrow) {
+        // How the session looked before either lazy path existed: rings and
+        // buffers sized for the image block from the very first token.
+        try model.growLocalRing(localRingMax(cfg));
+        try model.ensureBufRows(bufRows(cfg));
+    }
+
+    const prompt = try gpa.alloc(u32, prompt_len);
+    defer gpa.free(prompt);
+    for (prompt, 0..) |*t, i| t.* = @intCast(1000 + (i * 37) % 50000);
+    try model.prefill(prompt);
+    const rows_before = model.buf_rows;
+
+    // Synthetic embeddings: the tower is irrelevant here, what is under test is
+    // the stepper's buffer sizing, and a deterministic block isolates it.
+    const embeds = try gpa.alloc(f32, n_img * cfg.hidden);
+    defer gpa.free(embeds);
+    for (embeds, 0..) |*e, i| e.* = @sin(@as(f32, @floatFromInt(i % 977)) * 0.031) * 0.5;
+    try model.prefillImage(embeds, 16, 16);
+
+    try model.step(io, &.{prompt[prompt.len - 1]}, logits);
+    return .{ .rows_before = rows_before, .rows_after = model.buf_rows, .ring_after = model.ring_rows };
+}
+
+// Gated on -Dintegration + a CUDA device + the real 12B checkpoint: an image
+// block arriving in a session that started TEXT-ONLY must produce exactly the
+// logits it would have produced had the activation buffers been sized for the
+// image all along.
+//
+// The buffers now start at the text prefill chunk and `ensureBufRows`
+// reallocates them on the first image, which is what lets a conversation with no
+// images avoid carrying the vision budget. That reallocation is the ONLY
+// difference between the two runs, so any divergence is the reallocation: a
+// stale pointer, a batch left open across the free, or a height that did not
+// grow.
+//
+// Compares LOGITS, not sampled tokens. A whole image block dominates a short
+// prompt, so the argmax is the same under perturbations the logits catch easily
+// -- an earlier version of this test compared tokens and passed with a
+// deliberately corrupted prompt.
+test "an image block after a text-only start matches buffers sized for it up front" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const test_gate = @import("../test_gate.zig");
+    const Gguf = @import("tp_core").gguf.Gguf;
+    const path = "/home/qt/genai/lmstudio/models/gemma-4-12b-it-qat-q4_0.gguf";
+    try test_gate.requireModelFile(io, path);
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+
+    var g = try Gguf.open(gpa, io, path);
+    defer g.deinit();
+    var lm = try gemma4.Model.load(gpa, &g);
+    defer lm.deinit();
+
+    // The image block must exceed the text height, or this exercises no grow.
+    try std.testing.expect(bufRows(lm.cfg) > textBufRows());
+
+    const lazy = try gpa.alloc(f32, lm.cfg.vocab);
+    defer gpa.free(lazy);
+    const eager = try gpa.alloc(f32, lm.cfg.vocab);
+    defer gpa.free(eager);
+
+    // Sequentially, not side by side: two of these models do not fit on the card.
+    // Prompt longer than the TEXT ring, so it has already wrapped when the image
+    // arrives: that is the case `growLocalRing` exists for, and the one a plain
+    // block copy would get wrong.
+    const prompt_len = localRingText(lm.cfg) + 300;
+    const a = try imageRunForTest(gpa, io, be, &lm, false, prompt_len, lazy);
+    const b = try imageRunForTest(gpa, io, be, &lm, true, prompt_len, eager);
+
+    // The rings grew to the image size on the lazy run, and the eager run
+    // started there.
+    try std.testing.expectEqual(localRingMax(lm.cfg), a.ring_after);
+    try std.testing.expectEqual(localRingMax(lm.cfg), b.ring_after);
+    // The mechanism fired: text height before the image, image height after.
+    try std.testing.expectEqual(textBufRows(), a.rows_before);
+    try std.testing.expectEqual(bufRows(lm.cfg), a.rows_after);
+    // And the eager run never grew, because it started big.
+    try std.testing.expectEqual(bufRows(lm.cfg), b.rows_before);
+    try std.testing.expectEqual(b.rows_before, b.rows_after);
+
+    try std.testing.expectEqualSlices(f32, eager, lazy);
 }

@@ -70,7 +70,21 @@ pub const Capacity = struct {
 };
 
 /// Default committed rows for a dynamic session (the growth floor): sessions
-/// start here and grow toward --max-context as the conversation fills.
+/// start here and grow toward --max-context as the conversation fills. A longer
+/// prompt overrides it (callers take `max(prompt + 1, this)`), so this only sets
+/// what an EMPTY chat commits before it has any context to hold.
+///
+/// EVERY caller must use this rather than its own literal. The GUI kept a
+/// separate hardcoded 4096, so tuning this moved the CLI and left the GUI, where
+/// the VRAM pressure actually is, untouched.
+///
+/// Lowering it only shrinks the GLOBAL layers' caches; sliding-window rings are
+/// sized by the window, not by capacity, so on an architecture that is mostly
+/// local layers the saving is a small fraction of the K/V. It also shrinks
+/// `residency.need` (which sizes K/V at the CURRENT capacity), and the arbiter
+/// turns that into the model's ceiling, so under contention a lower floor buys
+/// VRAM now at the cost of a ceiling the model then grows through. Measure both
+/// before moving it.
 pub const initial_context = 4096;
 
 /// Minimum growth increment (rows).
@@ -96,6 +110,75 @@ pub fn growPlan(cur: usize, max: usize, min_rows: usize) error{ContextFull}!?usi
     if (min_rows <= cur) return null;
     if (min_rows > max) return error.ContextFull;
     return growTarget(cur, min_rows, max);
+}
+
+/// One contiguous run of a sliding-window ring: `n` rows starting at absolute
+/// position `abs`, living at ring row `dev`.
+pub const RingSeg = struct { abs: usize, dev: usize, n: usize };
+
+/// The (up to two) segments covering the live positions `[max(0,len-ring), len)`
+/// of a ring, split where the ring wraps. A ring stores position p at row
+/// `p % ring`, so the live window is contiguous except across that one seam.
+///
+/// Used to translate a LOCAL layer's K/V between a device ring and a linear
+/// host shadow, and to REMAP a ring onto a different size: run this for the old
+/// ring to read by absolute position, and again for the new one to write.
+pub fn ringSegments(len: usize, ring: usize) [2]RingSeg {
+    const start = if (len > ring) len - ring else 0;
+    const total = len - start; // <= ring
+    const first_dev = start % ring;
+    const n1 = @min(total, ring - first_dev);
+    return .{
+        .{ .abs = start, .dev = first_dev, .n = n1 },
+        .{ .abs = start + n1, .dev = 0, .n = total - n1 },
+    };
+}
+
+test "ringSegments covers the live window exactly once, wrapped or not" {
+    // Not yet wrapped: one segment from row 0.
+    var s = ringSegments(100, 256);
+    try std.testing.expectEqual(@as(usize, 0), s[0].abs);
+    try std.testing.expectEqual(@as(usize, 0), s[0].dev);
+    try std.testing.expectEqual(@as(usize, 100), s[0].n);
+    try std.testing.expectEqual(@as(usize, 0), s[1].n);
+
+    // Wrapped: two segments, together exactly `ring` rows, each row once.
+    s = ringSegments(300, 256);
+    try std.testing.expectEqual(@as(usize, 44), s[0].abs); // 300 - 256
+    try std.testing.expectEqual(@as(usize, 44), s[0].dev); // 44 % 256
+    try std.testing.expectEqual(@as(usize, 256), s[0].n + s[1].n);
+    try std.testing.expectEqual(@as(usize, 0), s[1].dev);
+    // Absolute positions are contiguous across the seam.
+    try std.testing.expectEqual(s[0].abs + s[0].n, s[1].abs);
+
+    // Exactly at the ring size: still a single unwrapped run.
+    s = ringSegments(256, 256);
+    try std.testing.expectEqual(@as(usize, 256), s[0].n);
+    try std.testing.expectEqual(@as(usize, 0), s[1].n);
+}
+
+test "a ring remap moves every live position to its new row" {
+    // What `growLocalRing` relies on: reading by absolute position through the
+    // OLD ring and writing through the NEW one visits each live position once,
+    // and the two agree on which positions are live.
+    const old_ring: usize = 1280;
+    const new_ring: usize = 2144;
+    const len: usize = 5000; // long past both, so the old ring has wrapped
+    var seen = std.AutoHashMap(usize, void).init(std.testing.allocator);
+    defer seen.deinit();
+    for (ringSegments(len, old_ring)) |sg| {
+        for (0..sg.n) |i| try seen.put(sg.abs + i, {});
+    }
+    try std.testing.expectEqual(old_ring, seen.count());
+    // Every position the OLD ring holds must be addressable in the NEW one,
+    // which is larger, so the new window is a superset of the old.
+    var covered: usize = 0;
+    for (ringSegments(len, new_ring)) |sg| {
+        for (0..sg.n) |i| if (seen.contains(sg.abs + i)) {
+            covered += 1;
+        };
+    }
+    try std.testing.expectEqual(old_ring, covered);
 }
 
 /// Non-f32 storage on the CPU packs the device byte layout into the f32
