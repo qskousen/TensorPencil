@@ -72,6 +72,38 @@ const nsplit_prefill = 8;
 /// GDN uses to place `beta` after `alpha` in `Bufs.ab_n`.
 const pad_rows = std.mem.alignForward(usize, prefill_chunk, 128);
 
+/// How a GDN prefill chunk routes. Two independent choices, and keeping them
+/// independent is the point: the recurrence and the gates/conv/L2 read f32 and
+/// care only about the head dim, so a checkpoint whose alpha/beta dtype has no
+/// batched GEMV still gets the whole-chunk recurrence, which is the expensive
+/// half. Folding both into one gate left every non-Bonsai quant on the per-token
+/// path.
+const GdnRoute = struct {
+    /// Batch the gates, conv, L2 norm and the state recurrence over the chunk.
+    chunk: bool,
+    /// How alpha/beta (`[heads, hidden]`) are produced for all `n` tokens. At 48
+    /// rows they are far below one GEMM tile, so unless they are stacked and
+    /// row-padded into one this is a GEMV question: one launch for the chunk, 8
+    /// tokens per launch, or one per token.
+    ab: enum { stacked, batch, grouped, per_token },
+};
+
+fn gdnRoute(alpha: ops.matmul.Weight, beta: ops.matmul.Weight, heads: usize, d: usize, n: usize, stacked: bool) GdnRoute {
+    // Both GEMV kernels tile 256 columns and 8 rows, and both read one staging.
+    const shape_ok = beta.dtype == alpha.dtype and alpha.cols % 256 == 0 and heads % 8 == 0;
+    return .{
+        .chunk = n > 1 and d % 32 == 0 and d <= 256, // opGdnDeltaChunk's limits
+        .ab = if (stacked)
+            .stacked
+        else if (shape_ok and Backend.quantQ8BatchSupported(alpha.dtype))
+            .batch
+        else if (shape_ok and Backend.quantQ8NSupported(alpha.dtype))
+            .grouped
+        else
+            .per_token,
+    };
+}
+
 /// Which layers a hybrid CPU/GPU split pushes to the host, once the count is
 /// fixed by the VRAM budget. `tail` keeps a contiguous device prefix (the
 /// last N layers go to CPU); `attn` evicts the KV-growing attention layers
@@ -122,6 +154,11 @@ pub const CudaLM = struct {
     /// Per-linear-layer [a(heads) | dt(heads)] host constants (arena of the
     /// stepper), uploaded via the small-buffer cache.
     a_dt: [][]f32,
+    /// Per linear layer, `alpha` and `beta` stacked into one weight padded to the
+    /// MMQ row tile: rows 0..v_heads-1 alpha, v_heads..2*v_heads-1 beta, the rest
+    /// zero blocks. Null when the dtype has no MMQ kernel or the shape does not
+    /// divide. See `ab_stride` for why this exists.
+    ab_cat: []?ops.matmul.Weight,
     /// TP_DEBUG_BATCH: per-layer hidden-state dump of the last processed row
     /// ([n_layers][hidden]), filled by stepHidden/stepBatch when set.
     layer_dump: ?[]f32 = null,
@@ -260,6 +297,7 @@ pub const CudaLM = struct {
 
         // Concatenated [a | dt_bias] per linear layer for gdn_gates.
         self.a_dt = try alloc.alloc([]f32, n_lin);
+        self.ab_cat = try alloc.alloc(?ops.matmul.Weight, n_lin);
         var lin_idx: usize = 0;
         for (lm.layers) |*layer| {
             switch (layer.*) {
@@ -268,6 +306,27 @@ pub const CudaLM = struct {
                     @memcpy(buf[0..cfg.lin_v_heads], ll.a);
                     @memcpy(buf[cfg.lin_v_heads..], ll.dt_bias);
                     self.a_dt[lin_idx] = buf;
+                    self.ab_cat[lin_idx] = null;
+                    // Stack alpha over beta and pad to the MMQ row tile. At 48 rows
+                    // each these are far below one GEMM tile, so the alternative is
+                    // `n/8` grouped-GEMV launches of a SIX-block grid, which on an
+                    // 82-SM card is all latency and no occupancy: MEASURED 26 us per
+                    // launch and 16% of prefill, against ~0 for one launch.
+                    // Rows past 2*v_heads are all-zero blocks, which every k-quant
+                    // dequantizes to 0, so they contribute nothing.
+                    const ab_rows = Backend.mmq_pipe_tile;
+                    if (ll.alpha.dtype == ll.beta.dtype and ll.alpha.scale == ll.beta.scale and
+                        ll.alpha.row_scale == null and ll.beta.row_scale == null and
+                        2 * cfg.lin_v_heads <= ab_rows and
+                        Backend.mmqPipeFaster(ll.alpha.dtype, ab_rows, cfg.hidden))
+                    {
+                        const row_bytes = ll.alpha.dtype.storageBytes(cfg.hidden);
+                        const cat = try alloc.alloc(u8, ab_rows * row_bytes);
+                        @memset(cat, 0);
+                        @memcpy(cat[0 .. cfg.lin_v_heads * row_bytes], ll.alpha.bytes[0 .. cfg.lin_v_heads * row_bytes]);
+                        @memcpy(cat[cfg.lin_v_heads * row_bytes ..][0 .. cfg.lin_v_heads * row_bytes], ll.beta.bytes[0 .. cfg.lin_v_heads * row_bytes]);
+                        self.ab_cat[lin_idx] = .{ .bytes = cat, .dtype = ll.alpha.dtype, .rows = ab_rows, .cols = cfg.hidden, .scale = ll.alpha.scale };
+                    }
                     lin_idx += 1;
                 },
                 .attn => {},
@@ -1189,15 +1248,54 @@ pub const CudaLM = struct {
                     // genuinely sequential, the conv is a convolution, and the
                     // gates / L2-norm / alpha / beta are per-token independent.
                     // Batching the other six is worth 333 -> 411 tok/s.
-                    const batched = skipMask() & 4 == 0 and n > 1 and Backend.quantQ8BatchSupported(ll.alpha.dtype) and
-                        ll.alpha.cols % 256 == 0 and heads % 8 == 0;
+                    //
+                    // alpha/beta are the one piece whose batching depends on the
+                    // weight DTYPE, hence `gdnRoute` gating them separately from
+                    // the recurrence rather than one gate over the whole block.
+                    const route = gdnRoute(ll.alpha, ll.beta, heads, d, n, n > 1 and self.ab_cat[lin_idx] != null);
+                    const batched = skipMask() & 4 == 0 and !noGdnChunk() and route.chunk;
                     if (batched) {
-                        try self.quantizeX(b.normed, n * cfg.hidden);
-                        const alpha_n = offsetBufSized(b.ab_n, 0, n * heads * 4);
-                        const beta_n = offsetBufSized(b.ab_n, pad_rows * heads * 4, n * heads * 4);
-                        try be.opGemvQuantQ8Batch(ll.alpha.dtype, alpha_n, ll.alpha.bytes, ll.alpha.scale, heads, ll.alpha.cols, n);
-                        try be.opGemvQuantQ8Batch(ll.beta.dtype, beta_n, ll.beta.bytes, ll.beta.scale, heads, ll.beta.cols, n);
-                        try be.opGdnGatesBatch(alpha_n, beta_n, try nbuf(be, self.a_dt[lin_idx]), b.gates, heads, n);
+                        // One GEMM over the stacked [alpha | beta] weight when it
+                        // exists, so the gates read two views of ONE padded output
+                        // instead of two tight buffers; see `ab_cat`.
+                        const cat = if (route.ab == .stacked) self.ab_cat[lin_idx].? else undefined;
+                        const ab_pitch: usize = if (route.ab == .stacked) cat.rows else heads;
+                        const alpha_n = if (route.ab == .stacked)
+                            offsetBufSized(b.ab_n, 0, n * ab_pitch * 4)
+                        else
+                            offsetBufSized(b.ab_n, 0, n * heads * 4);
+                        const beta_n = if (route.ab == .stacked)
+                            offsetBufSized(b.ab_n, heads * 4, n * ab_pitch * 4 - heads * 4)
+                        else
+                            offsetBufSized(b.ab_n, pad_rows * heads * 4, n * heads * 4);
+                        switch (route.ab) {
+                            .stacked => try self.gemm(b.ab_n, b.normed, cat, n),
+                            .batch => {
+                                try self.quantizeX(b.normed, n * cfg.hidden);
+                                try be.opGemvQuantQ8Batch(ll.alpha.dtype, alpha_n, ll.alpha.bytes, ll.alpha.scale, heads, ll.alpha.cols, n);
+                                try be.opGemvQuantQ8Batch(ll.beta.dtype, beta_n, ll.beta.bytes, ll.beta.scale, heads, ll.beta.cols, n);
+                            },
+                            .grouped => {
+                                try self.quantizeX(b.normed, n * cfg.hidden);
+                                var off: usize = 0;
+                                while (off < n) : (off += 8) {
+                                    const ng: usize = @min(8, n - off); // usize: @min range-narrows
+                                    const ab_off = off * heads * 4;
+                                    const ab_len = ng * heads * 4;
+                                    try be.opGemvQuantQ8N(ll.alpha.dtype, offsetBufSized(alpha_n, ab_off, ab_len), ll.alpha.bytes, ll.alpha.scale, heads, ll.alpha.cols, ng, off, n);
+                                    try be.opGemvQuantQ8N(ll.beta.dtype, offsetBufSized(beta_n, ab_off, ab_len), ll.beta.bytes, ll.beta.scale, heads, ll.beta.cols, ng, off, n);
+                                }
+                            },
+                            .per_token => for (0..n) |t| {
+                                const normed_t = offsetBufSized(b.normed, t * cfg.hidden * 4, cfg.hidden * 4);
+                                // Only gemv()'s dp4a arm reads the q8 staging; for
+                                // any other dtype nobody reads what it writes.
+                                if (dp4aGemvOk(ll.alpha) or dp4aGemvOk(ll.beta)) try self.quantizeX(normed_t, cfg.hidden);
+                                try self.gemv(offsetBufSized(alpha_n, t * heads * 4, heads * 4), normed_t, ll.alpha);
+                                try self.gemv(offsetBufSized(beta_n, t * heads * 4, heads * 4), normed_t, ll.beta);
+                            },
+                        }
+                        try be.opGdnGatesBatch(alpha_n, beta_n, try nbuf(be, self.a_dt[lin_idx]), b.gates, heads, n, ab_pitch);
                         try be.opGdnConvBatch(conv_state, b.lin_qkv, try nbuf(be, ll.conv_w), b.lin_conv, channels, n);
                         // The q/k slice is NOT contiguous across tokens (the v part
                         // sits between them), hence the grouped form.
@@ -1217,8 +1315,8 @@ pub const CudaLM = struct {
                             1.0 / @sqrt(@as(f32, @floatFromInt(d))),
                         );
                     }
-                    // Unbatched fallback: a dtype with no batched skinny GEMV, or
-                    // n == 1 (decode). Same math, one token per launch set.
+                    // Unbatched fallback: n == 1 (decode), or a head dim the chunk
+                    // kernel cannot take. Same math, one token per launch set.
                     for (0..if (batched or skipMask() & 4 != 0) 0 else n) |t| {
                         const normed_t = offsetBufSized(b.normed, t * cfg.hidden * 4, cfg.hidden * 4);
                         try self.quantizeX(normed_t, cfg.hidden);
@@ -1349,6 +1447,17 @@ pub const CudaLM = struct {
         return v;
     }
     var skip_cache: ?u32 = null;
+
+    /// Force the per-token GDN fallback even where the chunk recurrence applies.
+    /// The two are meant to be bit-identical, and this is the only way to check
+    /// that on a real checkpoint: same binary, same prompt, greedy, diff.
+    fn noGdnChunk() bool {
+        if (no_chunk_cache) |v| return v;
+        const v = getenv("TP_NO_GDN_CHUNK") != null;
+        no_chunk_cache = v;
+        return v;
+    }
+    var no_chunk_cache: ?bool = null;
 
     /// Debug escape hatches for bisecting the batched-prefill path.
     const debug_gemv_prefill = false;
@@ -1687,10 +1796,12 @@ const Bufs = struct {
     lin_o: Buf,
     ab: Buf,
     gates: Buf,
-    /// Batched prefill's alpha/beta: `alpha[n][heads]` at offset 0, `beta[n][heads]`
-    /// at `pad_rows*heads`. Separate from `ab` because the decode path's single
-    /// fused GEMV writes `[alpha|beta]` contiguously per token, a layout the two
-    /// independent batched GEMVs cannot produce.
+    /// Batched prefill's alpha/beta. Two layouts: from two GEMVs, `alpha[n][heads]`
+    /// at offset 0 and `beta[n][heads]` at `pad_rows*heads`; from one stacked GEMM
+    /// (`ab_cat`), `[n][mmq_pipe_tile]` with alpha at column 0 and beta at column
+    /// `heads`, which is why it is sized for the wider of the two. Separate from
+    /// `ab` because the decode path's single fused GEMV writes `[alpha|beta]`
+    /// contiguously per token, which neither batched layout matches.
     ab_n: Buf,
     mlp_gate: Buf,
     mlp_up: Buf,
@@ -1721,7 +1832,7 @@ const Bufs = struct {
             pc * cfg.linVDim(), // lin_o
             2 * cfg.lin_v_heads, // ab (decode: [alpha|beta] from one fused GEMV)
             pc * 2 * cfg.lin_v_heads, // gates ([decay|beta] per token)
-            2 * pc * cfg.lin_v_heads, // ab_n (batched: alpha[n][h] then beta[n][h])
+            @max(2 * pc * cfg.lin_v_heads, pc * Backend.mmq_pipe_tile), // ab_n, see the field
             pc * cfg.intermediate, // mlp_gate
             pc * cfg.intermediate, // mlp_up
             cfg.vocab, // logits
@@ -1936,4 +2047,53 @@ test "cpu split prefill before any step needs a seeded io" {
     try std.testing.expectEqual(prompt.len - 1, model.cached());
     const next = try model.stepArgmax(io, prompt[prompt.len - 1 ..]);
     try std.testing.expect(next < lm.cfg.vocab);
+}
+
+test "the GDN chunk recurrence is not gated on the alpha/beta weight dtype" {
+    // The shape of the real checkpoints: 48 v-heads, hidden 5120, head dim 128.
+    const w = struct {
+        fn mk(dt: @import("tp_core").dtype.DType) ops.matmul.Weight {
+            return .{ .bytes = &.{}, .dtype = dt, .rows = 48, .cols = 5120 };
+        }
+    };
+    const n = 512;
+
+    // q1_0/q2_0 (Bonsai): one GEMV launch for the whole chunk.
+    const q1 = gdnRoute(w.mk(.q1_0), w.mk(.q1_0), 48, 128, n, false);
+    try std.testing.expect(q1.chunk);
+    try std.testing.expectEqual(.batch, q1.ab);
+
+    // q4_k/q5_k/q6_k have no batched GEMV, only the grouped one. The regression
+    // this pins: they must STILL take the chunk recurrence, which is what one
+    // combined gate cost every non-Bonsai checkpoint.
+    for ([_]@import("tp_core").dtype.DType{ .q4_k, .q5_k, .q6_k }) |dt| {
+        const r = gdnRoute(w.mk(dt), w.mk(dt), 48, 128, n, false);
+        errdefer std.debug.print("dtype {t}: {any}\n", .{ dt, r });
+        try std.testing.expect(r.chunk);
+        try std.testing.expectEqual(.grouped, r.ab);
+    }
+
+    // Stacking wins over every GEMV route when it is available: one GEMM launch
+    // for the chunk against n/8 launches of a six-block grid.
+    try std.testing.expectEqual(.stacked, gdnRoute(w.mk(.q4_k), w.mk(.q4_k), 48, 128, n, true).ab);
+    try std.testing.expectEqual(.stacked, gdnRoute(w.mk(.q1_0), w.mk(.q1_0), 48, 128, n, true).ab);
+
+    // A dtype with neither kernel falls all the way back, and still chunks.
+    const bf = gdnRoute(w.mk(.bf16), w.mk(.bf16), 48, 128, n, false);
+    try std.testing.expect(bf.chunk);
+    try std.testing.expectEqual(.per_token, bf.ab);
+
+    // Decode, and a head dim the chunk kernel cannot take, drop `chunk` only.
+    try std.testing.expect(!gdnRoute(w.mk(.q1_0), w.mk(.q1_0), 48, 128, 1, false).chunk);
+    try std.testing.expect(!gdnRoute(w.mk(.q1_0), w.mk(.q1_0), 48, 48, n, false).chunk);
+    try std.testing.expect(!gdnRoute(w.mk(.q1_0), w.mk(.q1_0), 48, 512, n, false).chunk);
+    try std.testing.expectEqual(.batch, gdnRoute(w.mk(.q1_0), w.mk(.q1_0), 48, 48, n, false).ab);
+
+    // Both GEMV kernels tile 256 columns / 8 rows, and mixed dtypes would trip
+    // the second call's assert, so any of those sends alpha/beta per token.
+    try std.testing.expectEqual(.per_token, gdnRoute(w.mk(.q4_k), w.mk(.q5_k), 48, 128, n, false).ab);
+    var odd = w.mk(.q4_k);
+    odd.cols = 5120 + 128;
+    try std.testing.expectEqual(.per_token, gdnRoute(odd, odd, 48, 128, n, false).ab);
+    try std.testing.expectEqual(.per_token, gdnRoute(w.mk(.q4_k), w.mk(.q4_k), 44, 128, n, false).ab);
 }

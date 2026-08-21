@@ -4997,9 +4997,14 @@ pub const gdn_gates_batch_ptx: [:0]const u8 =
     \\  ld.param.u32 %r6,[u1];                 // heads
     \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2]; ld.param.u64 %rd4,[p3];
     \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3; cvta.to.global.u64 %rd4,%rd4;
+    \\  ld.param.u32 %r12,[u2];                // alpha/beta row stride (0 = heads)
+    \\  setp.ne.u32 %p3,%r12,0; @%p3 bra HAVES;
+    \\  mov.u32 %r12,%r6;
+    \\HAVES:
     \\  div.u32 %r7,%r4,%r6;                   // t
     \\  mul.lo.s32 %r8,%r7,%r6; sub.s32 %r9,%r4,%r8;       // h
-    \\  mul.wide.u32 %rd5,%r4,4;
+    \\  mad.lo.s32 %r13,%r7,%r12,%r9;          // t*stride + h
+    \\  mul.wide.u32 %rd5,%r13,4;
     \\  add.s64 %rd6,%rd1,%rd5; ld.global.f32 %f1,[%rd6];  // alpha[t][h]
     \\  add.s64 %rd7,%rd2,%rd5; ld.global.f32 %f2,[%rd7];  // beta[t][h]
     \\  mul.wide.u32 %rd8,%r9,4; add.s64 %rd9,%rd3,%rd8; ld.global.f32 %f3,[%rd9];  // a[h]

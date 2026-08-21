@@ -709,10 +709,10 @@ path; GGUF `q*` are the **LLM** path.
 | **nvfp4** (E2M1) | ✅ | ✅ | ✅ | ✅ | 4-bit E2M1 + fp8 per-16-block scale + per-tensor scale; stays packed, decodes to **bf16** per GEMM then the existing bf16 tensor-core GEMM. Weight-only; the native W4A4-fp4 GEMM is sm_100+. `ops/nvfp4.zig` |
 | **GGUF q4_0** | ✅ ggml | ❌ | ✅ `gemv_q4_0(_q8n)` | ⤷ dequant→f16 | |
 | **GGUF q8_0** | ✅ ggml | ✅ `gemv_q8_0{,_t}` (scalar) | ✅ `gemv_q8_0(_q8n)` | ⤷ dequant→f16 | |
-| **GGUF q4_k / q5_k / q6_k** | ✅ ggml | ✅ scalar `gemv_*{,_t}` | ✅ `gemv_*(_q8/_q8n)` + MMQ | ⤷ dequant→f16 | |
+| **GGUF q4_k / q5_k / q6_k** | ✅ ggml | ✅ scalar `gemv_*{,_t}` | ✅ `gemv_*(_q8/_q8n)`; MMQ `mmq_pipe_q{4,5,6}_k` | ⤷ dequant→f16 | q6_k's MMQ is correct but loses to dequant+f16, so `mmqPipeFaster` routes only q4_k/q5_k on. `TP_NO_MMQ5` / `TP_NO_MMQ_IQ4` A/B the routing, `TP_MMQ_NOSTAGE` isolates A-staging cost (garbage output, valid timing) |
 | **GGUF q2_k** | ✅ ggml | ❌ | ✅ decode→int8/int4 convrot (`buildPrep`) | ✅ ditto | 256 elems / 84 B; 2-bit codes, 4-bit scale+min per 16, f16 d/dmin at the block TAIL. Diffusion only so far: no GEMV, so no LLM decode path |
 | **GGUF iq4_nl** | ✅ ggml | ✅ scalar (module-const LUT) | ✅ shared-mem LUT | ⤷ dequant→f16 | 32 elems / 18 B, non-linear `kvalues_iq4nl` |
-| **GGUF iq4_xs** | ✅ ggml | ❌ | ✅ `gemv_iq4_xs` (shared-mem LUT), `embed_gather_iq4_xs` | ⤷ dequant→f16 | 256 elems / 136 B; `kvalues_iq4nl` over a k-quant super-block, 6-bit sub-block scale split across `scales_h`/`scales_l`, biased −32. No dp4a/MMQ path |
+| **GGUF iq4_xs** | ✅ ggml | ❌ | ✅ `gemv_iq4_xs` (shared-mem LUT), `embed_gather_iq4_xs`, `mmq_pipe_iq4_xs` | ⤷ dequant→f16 | 256 elems / 136 B; `kvalues_iq4nl` over a k-quant super-block, 6-bit sub-block scale split across `scales_h`/`scales_l`, biased −32. No dp4a GEMV. Its 136-byte block leaves odd super-blocks only 8-byte aligned, so staging loads are `v2` |
 | **GGUF q1_0** | ✅ ggml | ❌ | ✅ `gemv_q1_0{,_q8}`, `mmq_pipe_q1_0` | ⤷ dequant→f16 | 128 elems / 18 B; **1 sign bit per weight**, `v = bit ? d : -d`, `d = mean\|x\|` |
 | **GGUF q2_0 g128** | ✅ **native** `dotQ2_0G128` (not ggml) | ❌ | ✅ `gemv_q2_0_g128{,_q8}`, `mmq_pipe_q2_0` | ⤷ dequant→f16 | 128 elems / 34 B; 2 bits/weight, `v = (code − 1)·d`, codes → {−1, 0, +1, +2} |
 | **GGUF q2_0 g64** | ✅ ggml | ❌ | ✅ built, ⚠️ **never executed** (no g64 file here) | ⤷ dequant→f16 | 64 elems / 18 B, ggml's own `QK2_0` |

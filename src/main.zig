@@ -4124,13 +4124,13 @@ fn cudaStreamTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []
 /// Needs no device: these builders are pure string generation.
 fn dumpPtx(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, which: []const u8, out_path: []const u8) !void {
     const kern = TensorPencil.gpu.cuda.kernels;
-    const known = "mmq_pipe_q4_k | mmq_pipe_q6_k | mmq_pipe_q1_0 | mmq_pipe_q8_0 | mmq_q4_k | igemm_pipe_fused | hgemm";
+    const known = "mmq_pipe_q4_k | mmq_pipe_q5_k | mmq_pipe_q6_k | mmq_pipe_q1_0 | mmq_pipe_q8_0 | mmq_q4_k | igemm_pipe_fused | hgemm";
     if (which.len == 0 or out_path.len == 0) {
         try stdout.print("usage: dump-ptx <kernel> <out.ptx>\n  kernels: {s}\n", .{known});
         return;
     }
     const eq = std.mem.eql;
-    const ptx = if (eq(u8, which, "mmq_pipe_q4_k")) try kern.buildMmqPipeQ4K(arena) else if (eq(u8, which, "mmq_pipe_q6_k")) try kern.buildMmqPipeQ6K(arena) else if (eq(u8, which, "mmq_pipe_q1_0")) try kern.buildMmqPipeQ1_0(arena) else if (eq(u8, which, "mmq_pipe_q8_0")) try kern.buildMmqPipeQ8_0(arena) else if (eq(u8, which, "mmq_q4_k")) try kern.buildMmqQ4K(arena, 16, 4) else if (eq(u8, which, "igemm_pipe_fused")) try kern.buildIgemmPipe(arena, 64, true, 8, true) else if (eq(u8, which, "hgemm")) try kern.buildHgemm(arena, false, false, false, false, true, false) else {
+    const ptx = if (eq(u8, which, "mmq_pipe_q4_k")) try kern.buildMmqPipeQ4K(arena, .q4_k) else if (eq(u8, which, "mmq_pipe_q5_k")) try kern.buildMmqPipeQ4K(arena, .q5_k) else if (eq(u8, which, "mmq_pipe_q6_k")) try kern.buildMmqPipeQ6K(arena) else if (eq(u8, which, "mmq_pipe_q1_0")) try kern.buildMmqPipeQ1_0(arena) else if (eq(u8, which, "mmq_pipe_q8_0")) try kern.buildMmqPipeQ8_0(arena) else if (eq(u8, which, "mmq_q4_k")) try kern.buildMmqQ4K(arena, 16, 4) else if (eq(u8, which, "igemm_pipe_fused")) try kern.buildIgemmPipe(arena, 64, true, 8, true) else if (eq(u8, which, "hgemm")) try kern.buildHgemm(arena, false, false, false, false, true, false) else {
         try stdout.print("unknown kernel '{s}'\n  kernels: {s}\n", .{ which, known });
         return;
     };

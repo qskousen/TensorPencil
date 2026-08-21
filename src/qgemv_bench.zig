@@ -47,6 +47,7 @@ const kinds = [_]Kind{
     .{ .dt = .q4_k, .g = c.GGML_TYPE_Q4_K, .name = "q4_k" },
     .{ .dt = .q5_k, .g = c.GGML_TYPE_Q5_K, .name = "q5_k" },
     .{ .dt = .q6_k, .g = c.GGML_TYPE_Q6_K, .name = "q6_k" },
+    .{ .dt = .iq4_xs, .g = c.GGML_TYPE_IQ4_XS, .name = "iq4_xs" },
     .{ .dt = .q8_0, .g = c.GGML_TYPE_Q8_0, .name = "q8_0" },
     .{ .dt = .q1_0, .g = c.GGML_TYPE_Q1_0, .name = "q1_0" },
 };
@@ -55,7 +56,7 @@ const kinds = [_]Kind{
 /// grouped GEMV, it went straight to MMQ for prefill, so the grouped column is
 /// skipped rather than panicking.
 fn hasGroupedKernel(dt: tp.DType) bool {
-    return dt != .q1_0;
+    return dt != .q1_0 and dt != .iq4_xs;
 }
 
 /// Int8 tensor-core MACs for one GEMM, as TOPS given a millisecond timing,

@@ -4014,7 +4014,64 @@ pub fn buildMmqQ4K(alloc: std.mem.Allocator, nt: usize, warps: usize) ![:0]u8 {
 ///
 /// Requires cols % 256 == 0, rows % 128 == 0, and `n` padded to a multiple of 128
 /// with the padding zero-filled (see `opMatmulQuantMmq`). Entry `mmq_pipe_q4_k`.
-pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
+///
+/// `kq` also builds the q5_k form, entry `mmq_pipe_q5_k`. q5_k IS q4_k plus a
+/// 32-byte plane holding every element's 5th bit, with the same header, the same
+/// 12-byte packed scales and the same `get_scale_min_k4` decode, so it is this
+/// kernel with three changes: 176-byte blocks, qs at +48 instead of +16, and the
+/// staged A row carrying `qh` beside the nibbles (see the stage-A note). Values
+/// become 0..31, still s8.
+pub const KQuant = enum {
+    q4_k,
+    q5_k,
+    iq4_xs,
+
+    /// Bytes per 256-element super-block, and where its quants start.
+    fn blockBytes(kq: KQuant) usize {
+        return switch (kq) {
+            .q4_k => 144, // d,dmin,scales[12] | qs[128]
+            .q5_k => 176, // d,dmin,scales[12] | qh[32] | qs[128]
+            .iq4_xs => 136, // d,scales_h,scales_l[4] | qs[128]
+        };
+    }
+    fn qsOffset(kq: KQuant) usize {
+        return switch (kq) {
+            .q4_k => 16,
+            .q5_k => 48,
+            .iq4_xs => 8,
+        };
+    }
+    /// Whether the format carries a per-sub-block MIN alongside the scale, i.e.
+    /// whether the fold needs its `-(dmin*m)*da*sum(qa)` half at all.
+    fn hasMin(kq: KQuant) bool {
+        return kq != .iq4_xs;
+    }
+    fn entry(kq: KQuant) [:0]const u8 {
+        return switch (kq) {
+            .q4_k => "mmq_pipe_q4_k",
+            .q5_k => "mmq_pipe_q5_k",
+            .iq4_xs => "mmq_pipe_iq4_xs",
+        };
+    }
+};
+
+/// `kvalues_iq4nl`, the 16-entry signed codebook iq4_xs nibbles index, as the four
+/// words a `prmt` pair reads. Same table as `elt.gemv_iq4_nl_ptx` loads into shared.
+const iq4nl_words = [4]u32{ 0xBFAD9881, 0xF6EADDCF, 0x26190D01, 0x71594535 };
+
+pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator, kq: KQuant) ![:0]u8 {
+    const five = kq == .q5_k;
+    const iq4 = kq == .iq4_xs;
+    // Both non-q4_k formats stage PLAIN s8 rather than raw nibbles: q5_k because a
+    // 5-bit value has no word carrying both substeps, iq4_xs because its nibble is
+    // an index into a codebook, not the value. Either way the fragment loads and
+    // the inner loop are then identical to q8_0's, and the format only shows up in
+    // stage A. `unpacked` is that shared property.
+    const unpacked = five or iq4;
+    const has_min = kq.hasMin();
+    const BLK = kq.blockBytes();
+    const QS_OFF = kq.qsOffset();
+    const QH_OFF = 16; // q5_k only, immediately after the header
     // Opt-in for the rank-1 min-term fold, which is FEWER instructions and MEASURED
     // SLOWER. See the fold site. Kept switchable because "this kernel does not want
     // less arithmetic" is the sort of thing that gets re-litigated.
@@ -4033,8 +4090,13 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
     // fragments at load time. `kstep` is 64 = one q4_k 32-byte group, whose low nibbles
     // are sub-block 2*grp (substep 0) and high nibbles 2*grp+1 (substep 1), so both
     // substeps read the SAME 32 bytes and the tile is half the size.
-    const APACK = kstep / 2; // staged bytes per A row
-    const GPS = 256 / kstep; // slabs per q4_k superblock (256 elements)
+    const APACK = kstep / 2; // staged nibble bytes per A row
+    // q5_k stages the slab's 32 `qh` bytes after the nibbles, pre-shifted so the
+    // two bits this slab needs sit at positions 0 and 1 of each byte. `kstep` 64
+    // makes a slab exactly one 32-byte nibble group, which is what lets the whole
+    // plane be one shift: substep `ks` wants bit `ks`.
+    const AROW: usize = if (unpacked) APACK * 2 else APACK; // staged bytes per A row
+    const GPS = 256 / kstep; // slabs per superblock (256 elements)
     const LG_GPS = std.math.log2_int(usize, GPS);
     // Shared rows are padded 16 bytes so the fragment loads are conflict-free, and this
     // is the single biggest thing in the kernel. The eight lanes of a `gid` group read
@@ -4047,7 +4109,11 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
     // spends shared memory, which this kernel has spare (its 255 registers cap
     // occupancy), where the XOR-swizzle alternative would spend registers, which it
     // has none of.
-    const ASTRIDE = APACK + 16;
+    //
+    // q4_k lands on 48 bytes (12 words) and q5_k on 80 (20), and 20 is the stride
+    // stage B already uses: 20*gid mod 32 over gid 0..7 is 0,20,8,28,16,4,24,12,
+    // eight distinct banks.
+    const ASTRIDE = AROW + 16;
     const BSTRIDE = kstep + 16;
     const ATILE = BM * ASTRIDE;
     const BTILE = BN * BSTRIDE;
@@ -4067,7 +4133,7 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
     // load, and 168 bytes of spill against 16. `igemm_pipe_fused` pairs ldmatrix with
     // an XOR swizzle; this kernel gets its conflict-freedom from padded row strides
     // instead, and the two do not appear to compose.
-    const use_ldmatrix = envSet("TP_MMQ_LDMATRIX");
+    const use_ldmatrix = envSet("TP_MMQ_LDMATRIX") and !unpacked; // only the packed A row
     const ASC = BM * KS * 2 * 4; // (d*sc, dmin*m) f32 pair per row per substep
     const BSC = BN * KS * 2 * 4; // (da, sum qa) f32 pair per col per substep
     const B_OFF = ATILE;
@@ -4088,6 +4154,7 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
     const zq = try b.regs(.b32, 4); // permanently zero (mma's C operand)
     const rsc = try b.regs(.f32, MT * 4); // per-mi: (dsc,dm) for rows gid and gid+8
     const csc = try b.regs(.f32, 4); // per-nj: (da,sa) for cols tf*2 and tf*2+1
+    const r_lut = if (iq4) try b.regs(.b32, 4) else &[_][]const u8{}; // kvalues_iq4nl
 
     const rd_w = try b.reg(.b64);
     const rd_x = try b.reg(.b64);
@@ -4136,7 +4203,7 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
     try b.linef("mov.u32 {s}, %ctaid.x;", .{r_col0});
     try b.linef("shl.b32 {s}, {s}, 7;", .{ r_col0, r_col0 });
     try b.linef("shr.u32 {s}, {s}, 8;", .{ r_nsb, r_cols });
-    try b.linef("mul.lo.u32 {s}, {s}, 144;", .{ r_rb, r_nsb });
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ r_rb, r_nsb, BLK });
     try b.linef("shr.u32 {s}, {s}, 5;", .{ r_bpt, r_cols });
 
     // Activation regions: qs at n*bpt*4, sums a further n*cols on.
@@ -4240,6 +4307,7 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
     try b.linef("add.u32 {s}, {s}, {s};", .{ r_bscr, r_bscr, r_smem });
     try b.linef("add.u32 {s}, {s}, {d};", .{ r_bscr, r_bscr, BSC_OFF });
 
+    if (iq4) for (r_lut, iq4nl_words) |r, w| try b.linef("mov.u32 {s}, 0x{X:0>8};", .{ r, w });
     for (acc) |r| try b.linef("mov.f32 {s}, 0f00000000;", .{r});
     for (zq) |r| try b.linef("mov.u32 {s}, 0;", .{r});
 
@@ -4269,6 +4337,14 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
     // second set of tiles, an extra loop pass and per-slab buffer arithmetic.
     const hh = try b.regs(.b32, 4);
     const qw = try b.regs(.b32, APACK / 4);
+    // q5_k's fifth-bit plane, staged beside the nibbles. Its own array for the
+    // reason `bstg` has one: sharing `qw` is how a load count outgrows its
+    // declaration unnoticed.
+    const qhw = if (unpacked) try b.regs(.b32, 8) else &[_][]const u8{};
+    const r_qhsh = if (five) try b.reg(.b32) else "";
+    const r_ust = if (unpacked) try b.reg(.b32) else "";
+    const r_ust2 = if (unpacked) try b.reg(.b32) else "";
+    const r_ust3 = if (iq4) try b.reg(.b32) else "";
     // Stage B's activation staging, below: `kstep` int8 per thread, all held at once
     // so the loads issue before the first store. Interleaving load/store/load/store
     // makes the second pair wait on the first pair's registers, serializing two
@@ -4279,16 +4355,110 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
     const bstg = try b.regs(.b32, kstep / 4);
     try b.linef("shr.u32 {s}, {s}, {d};", .{ tm[0], r_i, LG_GPS }); // sb = i/GPS
     try b.linef("and.b32 {s}, {s}, {d};", .{ tm[1], r_i, GPS - 1 }); // grp = i%GPS
-    try b.linef("mul.lo.u32 {s}, {s}, 144;", .{ tm[2], tm[0] });
+    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ tm[2], tm[0], BLK });
     try b.linef("cvt.u64.u32 {s}, {s};", .{ rdt[0], tm[2] });
     try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[1], rd_wrow, rdt[0] });
-    try b.linef("ld.global.v4.u32 {{{s}, {s}, {s}, {s}}}, [{s}];", .{ hh[0], hh[1], hh[2], hh[3], rdt[1] });
+    if (iq4)
+        // d | scales_h, then scales_l[0..3]; the whole header is 8 bytes.
+        try b.linef("ld.global.v2.u32 {{{s}, {s}}}, [{s}];", .{ hh[0], hh[1], rdt[1] })
+    else
+        try b.linef("ld.global.v4.u32 {{{s}, {s}, {s}, {s}}}, [{s}];", .{ hh[0], hh[1], hh[2], hh[3], rdt[1] });
     try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ tm[3], tm[1], APACK }); // grp*APACK
-    try b.linef("add.u32 {s}, {s}, 16;", .{ tm[3], tm[3] }); // qs follows the 16 B header
+    try b.linef("add.u32 {s}, {s}, {d};", .{ tm[3], tm[3], QS_OFF }); // qs follows the header (and q5_k's qh)
     try b.linef("cvt.u64.u32 {s}, {s};", .{ rdt[0], tm[3] });
     try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[2], rdt[1], rdt[0] });
-    for (0..APACK / 16) |v| try b.linef("ld.global.v4.u32 {{{s}, {s}, {s}, {s}}}, [{s}+{d}];", .{ qw[v * 4], qw[v * 4 + 1], qw[v * 4 + 2], qw[v * 4 + 3], rdt[2], v * 16 });
-    for (0..APACK / 16) |v| try b.linef("st.shared.v4.u32 [{s}+{d}], {{{s}, {s}, {s}, {s}}};", .{ r_adst, v * 16, qw[v * 4], qw[v * 4 + 1], qw[v * 4 + 2], qw[v * 4 + 3] });
+    // Isolation, not a feature: drop the A tile's global loads, decode and shared
+    // stores, leaving the mmas to read whatever is in shared. Output is garbage;
+    // the gap to the real kernel is the staging's EXPOSED cost, which is the
+    // measurement that justified `buildMmqPipeQ1_0`'s software pipeline.
+    const nostage = envSet("TP_MMQ_NOSTAGE");
+    if (!nostage) {
+        // v2, not v4, for iq4_xs: its 136-byte block leaves every odd super-block only
+        // 8-byte aligned, and a misaligned v4 is undefined rather than slow.
+        if (iq4) {
+            for (0..APACK / 8) |v| try b.linef("ld.global.v2.u32 {{{s}, {s}}}, [{s}+{d}];", .{ qw[v * 2], qw[v * 2 + 1], rdt[2], v * 8 });
+        } else {
+            for (0..APACK / 16) |v| try b.linef("ld.global.v4.u32 {{{s}, {s}, {s}, {s}}}, [{s}+{d}];", .{ qw[v * 4], qw[v * 4 + 1], qw[v * 4 + 2], qw[v * 4 + 3], rdt[2], v * 16 });
+        }
+        // qh is 32 bytes for the WHOLE super-block and every slab re-reads it, which is
+        // 4x the loads of a per-slab plane but no extra DRAM (L1 holds it, and this
+        // kernel runs at 6% of bandwidth). Shifting here rather than per fragment load
+        // costs 8 ops once instead of 32 per mma group: byte j keeps bit 2*grp+ks at
+        // position ks, so a substep is one mask.
+        if (iq4) {
+            // A nibble here is an INDEX into `kvalues_iq4nl`, so the unpack is a
+            // 16-entry byte lookup. Four at a time via `prmt`: compact the four indices
+            // into prmt's four selector nibbles, read both halves of the table, and pick
+            // per byte on the index's bit 3. A shared table would be four `ld.shared.s8`
+            // per word instead, and shared traffic is what this kernel is short of,
+            // where the q4_k header measures ALU as slack.
+            //
+            // Within a sub-block iq4_xs splits its 16 qs bytes as low nibbles ->
+            // elements 0..15 and high nibbles -> 16..31, so ONE substep needs both
+            // planes of the same 16 bytes. Hence two passes of four words, pass p being
+            // substep p, rather than eight words of one plane.
+            for (0..2) |pass| {
+                for (0..4) |w| {
+                    const src = qw[pass * 4 + w];
+                    for ([2]usize{ 0, 4 }) |half| {
+                        const dst = qhw[w + half];
+                        if (half == 0) {
+                            try b.linef("and.b32 {s}, {s}, 0x0f0f0f0f;", .{ r_ust, src });
+                        } else {
+                            try b.linef("shr.u32 {s}, {s}, 4;", .{ r_ust, src });
+                            try b.linef("and.b32 {s}, {s}, 0x0f0f0f0f;", .{ r_ust, r_ust });
+                        }
+                        // Four indices, one per byte -> four selector nibbles.
+                        try b.linef("shr.u32 {s}, {s}, 4;", .{ r_ust2, r_ust });
+                        try b.linef("or.b32 {s}, {s}, {s};", .{ r_ust2, r_ust, r_ust2 });
+                        try b.linef("prmt.b32 {s}, {s}, {s}, 0x0020;", .{ r_ust2, r_ust2, r_ust2 });
+                        // Bit 3 of a prmt selector nibble means "replicate this byte's
+                        // sign", not "byte 8", so it must leave the selector and drive
+                        // the choice of table half instead.
+                        try b.linef("and.b32 {s}, {s}, 0x7777;", .{ r_ust2, r_ust2 });
+                        try b.linef("prmt.b32 {s}, {s}, {s}, {s};", .{ r_ust3, r_lut[0], r_lut[1], r_ust2 });
+                        try b.linef("prmt.b32 {s}, {s}, {s}, {s};", .{ r_ust2, r_lut[2], r_lut[3], r_ust2 });
+                        try b.linef("shl.b32 {s}, {s}, 4;", .{ dst, r_ust });
+                        try b.linef("prmt.b32 {s}, {s}, {s}, 0xBA98;", .{ dst, dst, dst });
+                        // (high table & mask) | (low table & ~mask)
+                        try b.linef("lop3.b32 {s}, {s}, {s}, {s}, 0xd8;", .{ dst, r_ust3, r_ust2, dst });
+                    }
+                }
+                for (0..2) |v| try b.linef("st.shared.v4.u32 [{s}+{d}], {{{s}, {s}, {s}, {s}}};", .{ r_adst, pass * 32 + v * 16, qhw[v * 4], qhw[v * 4 + 1], qhw[v * 4 + 2], qhw[v * 4 + 3] });
+            }
+        } else if (five) {
+            for (0..2) |v| try b.linef("ld.global.v4.u32 {{{s}, {s}, {s}, {s}}}, [{s}+{d}];", .{ qhw[v * 4], qhw[v * 4 + 1], qhw[v * 4 + 2], qhw[v * 4 + 3], rdt[1], QH_OFF + v * 16 });
+            // Unpack HERE, to plain s8, unlike q4_k which stages raw nibbles and masks
+            // per fragment load. q4_k can pack because one 4-byte word carries both
+            // substeps, so re-reading it twice still moves the minimum. A 5-bit value
+            // has no such word, and carrying the fifth bits beside the nibbles doubles
+            // the A tile's shared traffic, which is what this kernel is bound by:
+            // MEASURED 32 TOPS against q4_k's 72.5 at the same shape (`qgemv-bench`).
+            // Unpacked, each byte is read once per substep and the traffic is q4_k's
+            // exactly, at the price of ~70 staging ops per row per slab and a tile that
+            // holds 64 bytes instead of 32. The inner loop then needs no unpack at all.
+            try b.linef("shl.b32 {s}, {s}, 1;", .{ r_qhsh, tm[1] }); // 2*grp
+            for (qhw) |r| try b.linef("shr.u32 {s}, {s}, {s};", .{ r, r, r_qhsh });
+            // qhw[w] becomes substep 0's bytes and qw[w] substep 1's, so the two v4
+            // groups below are already in place with one temp between them.
+            for (0..8) |w| {
+                try b.linef("and.b32 {s}, {s}, 0x0f0f0f0f;", .{ r_ust, qw[w] });
+                try b.linef("shl.b32 {s}, {s}, 4;", .{ r_ust2, qhw[w] });
+                try b.linef("and.b32 {s}, {s}, 0x10101010;", .{ r_ust2, r_ust2 });
+                try b.linef("or.b32 {s}, {s}, {s};", .{ r_ust, r_ust, r_ust2 });
+                try b.linef("shl.b32 {s}, {s}, 3;", .{ qhw[w], qhw[w] });
+                try b.linef("and.b32 {s}, {s}, 0x10101010;", .{ qhw[w], qhw[w] });
+                try b.linef("shr.u32 {s}, {s}, 4;", .{ qw[w], qw[w] });
+                try b.linef("and.b32 {s}, {s}, 0x0f0f0f0f;", .{ qw[w], qw[w] });
+                try b.linef("or.b32 {s}, {s}, {s};", .{ qw[w], qw[w], qhw[w] }); // substep 1
+                try b.linef("mov.b32 {s}, {s};", .{ qhw[w], r_ust }); // substep 0
+            }
+            for (0..2) |v| try b.linef("st.shared.v4.u32 [{s}+{d}], {{{s}, {s}, {s}, {s}}};", .{ r_adst, v * 16, qhw[v * 4], qhw[v * 4 + 1], qhw[v * 4 + 2], qhw[v * 4 + 3] });
+            for (0..2) |v| try b.linef("st.shared.v4.u32 [{s}+{d}], {{{s}, {s}, {s}, {s}}};", .{ r_adst, 32 + v * 16, qw[v * 4], qw[v * 4 + 1], qw[v * 4 + 2], qw[v * 4 + 3] });
+        } else {
+            for (0..APACK / 16) |v| try b.linef("st.shared.v4.u32 [{s}+{d}], {{{s}, {s}, {s}, {s}}};", .{ r_adst, v * 16, qw[v * 4], qw[v * 4 + 1], qw[v * 4 + 2], qw[v * 4 + 3] });
+        }
+    }
 
     // -- stage A scales: (d*sc, dmin*m) for sub-blocks grp*KS .. grp*KS+KS-1 --
     // Runtime `is` here (grp comes from the slab index), so this is ggml's
@@ -4302,51 +4472,80 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
     const fd = try b.reg(.f32);
     const fdm = try b.reg(.f32);
     const fs = try b.regs(.f32, if (KS * 2 > 4) KS * 2 else 4);
-    try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ tm[4], tm[1], KS }); // is0 = grp*KS
-    try b.linef("shl.b32 {s}, {s}, 3;", .{ tm[5], tm[4] }); // is0*8
-    try b.linef("setp.ge.u32 {s}, {s}, 4;", .{ pr[0], tm[4] });
-    try b.linef("@{s} bra {s};", .{ pr[0], hi_lbl });
-    try b.linef("mov.u32 {s}, {s};", .{ tm[6], tm[5] });
-    for (0..KS) |j| {
-        if (j != 0) try b.linef("add.u32 {s}, {s}, 8;", .{ tm[6], tm[6] });
-        try b.linef("shr.u32 {s}, {s}, {s};", .{ scr[j], hh[1], tm[6] });
-        try b.linef("and.b32 {s}, {s}, 63;", .{ scr[j], scr[j] });
-        try b.linef("shr.u32 {s}, {s}, {s};", .{ mnr[j], hh[2], tm[6] });
-        try b.linef("and.b32 {s}, {s}, 63;", .{ mnr[j], mnr[j] });
+    if (iq4) {
+        // ls = scales_l nibble (2 per byte, byte = ib/2) | high 2 bits from
+        // scales_h (2 bits per ib), then biased by -32. A slab is ib = 2*grp and
+        // 2*grp+1, so both nibbles are in scales_l byte `grp` and both bit pairs
+        // in one nibble of scales_h: no branch, unlike get_scale_min_k4.
+        try b.linef("shl.b32 {s}, {s}, 3;", .{ tm[5], tm[1] }); // grp*8
+        try b.linef("shr.u32 {s}, {s}, 16;", .{ tm[6], hh[0] }); // scales_h
+        try b.linef("shl.b32 {s}, {s}, 2;", .{ tm[7], tm[1] }); // grp*4
+        try b.linef("mov.b32 {{{s}, {s}}}, {s};", .{ h16[0], h16[1], hh[0] });
+        try b.linef("cvt.f32.f16 {s}, {s};", .{ fd, h16[0] });
+        for (0..KS) |j| {
+            try b.linef("shr.u32 {s}, {s}, {s};", .{ scr[j], hh[1], tm[5] });
+            if (j != 0) try b.linef("shr.u32 {s}, {s}, {d};", .{ scr[j], scr[j], j * 4 });
+            try b.linef("and.b32 {s}, {s}, 15;", .{ scr[j], scr[j] });
+            try b.linef("shr.u32 {s}, {s}, {s};", .{ mnr[j], tm[6], tm[7] });
+            if (j != 0) try b.linef("shr.u32 {s}, {s}, {d};", .{ mnr[j], mnr[j], j * 2 });
+            try b.linef("and.b32 {s}, {s}, 3;", .{ mnr[j], mnr[j] });
+            try b.linef("shl.b32 {s}, {s}, 4;", .{ mnr[j], mnr[j] });
+            try b.linef("or.b32 {s}, {s}, {s};", .{ scr[j], scr[j], mnr[j] });
+            try b.linef("add.s32 {s}, {s}, -32;", .{ scr[j], scr[j] });
+            try b.linef("cvt.rn.f32.s32 {s}, {s};", .{ fs[j * 2], scr[j] });
+            try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[j * 2], fs[j * 2], fd });
+            // The min slot stays in the layout so the compute loop's v2 reads and
+            // its scale addressing are shared with the k-quants; the fold drops it.
+            try b.linef("mov.f32 {s}, 0f00000000;", .{fs[j * 2 + 1]});
+        }
+        for (0..KS / 2) |v| try b.linef("st.shared.v4.f32 [{s}+{d}], {{{s}, {s}, {s}, {s}}};", .{ r_ascd, v * 16, fs[v * 4], fs[v * 4 + 1], fs[v * 4 + 2], fs[v * 4 + 3] });
+    } else {
+        try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ tm[4], tm[1], KS }); // is0 = grp*KS
+        try b.linef("shl.b32 {s}, {s}, 3;", .{ tm[5], tm[4] }); // is0*8
+        try b.linef("setp.ge.u32 {s}, {s}, 4;", .{ pr[0], tm[4] });
+        try b.linef("@{s} bra {s};", .{ pr[0], hi_lbl });
+        try b.linef("mov.u32 {s}, {s};", .{ tm[6], tm[5] });
+        for (0..KS) |j| {
+            if (j != 0) try b.linef("add.u32 {s}, {s}, 8;", .{ tm[6], tm[6] });
+            try b.linef("shr.u32 {s}, {s}, {s};", .{ scr[j], hh[1], tm[6] });
+            try b.linef("and.b32 {s}, {s}, 63;", .{ scr[j], scr[j] });
+            try b.linef("shr.u32 {s}, {s}, {s};", .{ mnr[j], hh[2], tm[6] });
+            try b.linef("and.b32 {s}, {s}, 63;", .{ mnr[j], mnr[j] });
+        }
+        try b.linef("bra {s};", .{sd_lbl});
+        try b.label(hi_lbl);
+        try b.linef("add.u32 {s}, {s}, -32;", .{ tm[6], tm[5] }); // (is0-4)*8
+        for (0..KS) |j| {
+            const sc = scr[j];
+            const mn = mnr[j];
+            if (j != 0) try b.linef("add.u32 {s}, {s}, 8;", .{ tm[6], tm[6] });
+            try b.linef("shr.u32 {s}, {s}, {s};", .{ tm[7], hh[3], tm[6] });
+            try b.linef("and.b32 {s}, {s}, 15;", .{ sc, tm[7] });
+            try b.linef("shr.u32 {s}, {s}, 4;", .{ mn, tm[7] });
+            try b.linef("and.b32 {s}, {s}, 15;", .{ mn, mn });
+            try b.linef("shr.u32 {s}, {s}, {s};", .{ tm[7], hh[1], tm[6] });
+            try b.linef("shr.u32 {s}, {s}, 6;", .{ tm[7], tm[7] });
+            try b.linef("and.b32 {s}, {s}, 3;", .{ tm[7], tm[7] });
+            try b.linef("shl.b32 {s}, {s}, 4;", .{ tm[7], tm[7] });
+            try b.linef("or.b32 {s}, {s}, {s};", .{ sc, sc, tm[7] });
+            try b.linef("shr.u32 {s}, {s}, {s};", .{ tm[7], hh[2], tm[6] });
+            try b.linef("shr.u32 {s}, {s}, 6;", .{ tm[7], tm[7] });
+            try b.linef("and.b32 {s}, {s}, 3;", .{ tm[7], tm[7] });
+            try b.linef("shl.b32 {s}, {s}, 4;", .{ tm[7], tm[7] });
+            try b.linef("or.b32 {s}, {s}, {s};", .{ mn, mn, tm[7] });
+        }
+        try b.label(sd_lbl);
+        try b.linef("mov.b32 {{{s}, {s}}}, {s};", .{ h16[0], h16[1], hh[0] });
+        try b.linef("cvt.f32.f16 {s}, {s};", .{ fd, h16[0] });
+        try b.linef("cvt.f32.f16 {s}, {s};", .{ fdm, h16[1] });
+        for (0..KS) |j| {
+            try b.linef("cvt.rn.f32.u32 {s}, {s};", .{ fs[j * 2], scr[j] });
+            try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[j * 2], fs[j * 2], fd });
+            try b.linef("cvt.rn.f32.u32 {s}, {s};", .{ fs[j * 2 + 1], mnr[j] });
+            try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[j * 2 + 1], fs[j * 2 + 1], fdm });
+        }
+        for (0..KS / 2) |v| try b.linef("st.shared.v4.f32 [{s}+{d}], {{{s}, {s}, {s}, {s}}};", .{ r_ascd, v * 16, fs[v * 4], fs[v * 4 + 1], fs[v * 4 + 2], fs[v * 4 + 3] });
     }
-    try b.linef("bra {s};", .{sd_lbl});
-    try b.label(hi_lbl);
-    try b.linef("add.u32 {s}, {s}, -32;", .{ tm[6], tm[5] }); // (is0-4)*8
-    for (0..KS) |j| {
-        const sc = scr[j];
-        const mn = mnr[j];
-        if (j != 0) try b.linef("add.u32 {s}, {s}, 8;", .{ tm[6], tm[6] });
-        try b.linef("shr.u32 {s}, {s}, {s};", .{ tm[7], hh[3], tm[6] });
-        try b.linef("and.b32 {s}, {s}, 15;", .{ sc, tm[7] });
-        try b.linef("shr.u32 {s}, {s}, 4;", .{ mn, tm[7] });
-        try b.linef("and.b32 {s}, {s}, 15;", .{ mn, mn });
-        try b.linef("shr.u32 {s}, {s}, {s};", .{ tm[7], hh[1], tm[6] });
-        try b.linef("shr.u32 {s}, {s}, 6;", .{ tm[7], tm[7] });
-        try b.linef("and.b32 {s}, {s}, 3;", .{ tm[7], tm[7] });
-        try b.linef("shl.b32 {s}, {s}, 4;", .{ tm[7], tm[7] });
-        try b.linef("or.b32 {s}, {s}, {s};", .{ sc, sc, tm[7] });
-        try b.linef("shr.u32 {s}, {s}, {s};", .{ tm[7], hh[2], tm[6] });
-        try b.linef("shr.u32 {s}, {s}, 6;", .{ tm[7], tm[7] });
-        try b.linef("and.b32 {s}, {s}, 3;", .{ tm[7], tm[7] });
-        try b.linef("shl.b32 {s}, {s}, 4;", .{ tm[7], tm[7] });
-        try b.linef("or.b32 {s}, {s}, {s};", .{ mn, mn, tm[7] });
-    }
-    try b.label(sd_lbl);
-    try b.linef("mov.b32 {{{s}, {s}}}, {s};", .{ h16[0], h16[1], hh[0] });
-    try b.linef("cvt.f32.f16 {s}, {s};", .{ fd, h16[0] });
-    try b.linef("cvt.f32.f16 {s}, {s};", .{ fdm, h16[1] });
-    for (0..KS) |j| {
-        try b.linef("cvt.rn.f32.u32 {s}, {s};", .{ fs[j * 2], scr[j] });
-        try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[j * 2], fs[j * 2], fd });
-        try b.linef("cvt.rn.f32.u32 {s}, {s};", .{ fs[j * 2 + 1], mnr[j] });
-        try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[j * 2 + 1], fs[j * 2 + 1], fdm });
-    }
-    for (0..KS / 2) |v| try b.linef("st.shared.v4.f32 [{s}+{d}], {{{s}, {s}, {s}, {s}}};", .{ r_ascd, v * 16, fs[v * 4], fs[v * 4 + 1], fs[v * 4 + 2], fs[v * 4 + 3] });
 
     // -- stage B: activation int8 (already in the right layout) + its scales --
     try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ tm[0], r_i, kstep });
@@ -4379,7 +4578,9 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
             // nibbles when odd. So consecutive substep PAIRS read the same words. The
             // nibbles are unsigned 0..15, already the s8 value the mma wants, so the
             // unpack is one mask (plus a shift for the high half) and no sign handling.
-            const o = mi * 16 * ASTRIDE + (ks / 2) * 32;
+            // q4_k's two substeps share one packed word (hence ks/2); an unpacked
+            // row's are 32 s8 apart.
+            const o = mi * 16 * ASTRIDE + (if (unpacked) ks else ks / 2) * 32;
             if (use_ldmatrix) {
                 // One warp-cooperative load pulls the whole 16x32 A fragment into the
                 // exact {a0,a1,a2,a3} layout the mma wants, still packed two k per
@@ -4394,14 +4595,27 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
                 try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ af[mi * 4 + 2], r_asl, o + 16 });
                 try b.linef("ld.shared.u32 {s}, [{s}+{d}];", .{ af[mi * 4 + 3], r_asl, o + 8 * ASTRIDE + 16 });
             }
-            for (0..4) |j| {
+            // q5_k: the same four words of the staged qh plane, one per A word, and
+            // the bit this substep wants is already at position `ks` (stage A did
+            // the shift). Loading all four before the ORs keeps the shared loads
+            // issued back to back.
+            if (!unpacked) for (0..4) |j| {
                 if (ks % 2 == 1) try b.linef("shr.u32 {s}, {s}, 4;", .{ af[mi * 4 + j], af[mi * 4 + j] });
                 try b.linef("and.b32 {s}, {s}, 0x0f0f0f0f;", .{ af[mi * 4 + j], af[mi * 4 + j] });
-            }
+            };
             // Row scale pairs for this mi: rows (mi*16+gid) and (mi*16+gid+8).
+            // Scale traffic dominates this loop: 24 pair-loads per substep against
+            // 8 A-word and 16 B-word loads, and shared bytes are what the kernel is
+            // short of. A format with no min has nothing in the second half of each
+            // pair, so it reads f32 instead of v2 and halves that.
             const so = mi * 16 * KS * 8 + ks * 8;
-            try b.linef("ld.shared.v2.f32 {{{s}, {s}}}, [{s}+{d}];", .{ rsc[mi * 4 + 0], rsc[mi * 4 + 1], r_ascr, so });
-            try b.linef("ld.shared.v2.f32 {{{s}, {s}}}, [{s}+{d}];", .{ rsc[mi * 4 + 2], rsc[mi * 4 + 3], r_ascr, so + 8 * KS * 8 });
+            if (has_min) {
+                try b.linef("ld.shared.v2.f32 {{{s}, {s}}}, [{s}+{d}];", .{ rsc[mi * 4 + 0], rsc[mi * 4 + 1], r_ascr, so });
+                try b.linef("ld.shared.v2.f32 {{{s}, {s}}}, [{s}+{d}];", .{ rsc[mi * 4 + 2], rsc[mi * 4 + 3], r_ascr, so + 8 * KS * 8 });
+            } else {
+                try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ rsc[mi * 4 + 0], r_ascr, so });
+                try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ rsc[mi * 4 + 2], r_ascr, so + 8 * KS * 8 });
+            }
         }
         var nj: usize = 0;
         while (nj < NT) : (nj += 1) {
@@ -4420,8 +4634,13 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
         while (nj < NT) : (nj += 1) {
             // Column scale pairs for this nj: cols (nj*8+tf*2) and +1.
             const co = nj * 8 * KS * 8 + ks * 8;
-            try b.linef("ld.shared.v2.f32 {{{s}, {s}}}, [{s}+{d}];", .{ csc[0], csc[1], r_bscr, co });
-            try b.linef("ld.shared.v2.f32 {{{s}, {s}}}, [{s}+{d}];", .{ csc[2], csc[3], r_bscr, co + KS * 8 });
+            if (has_min) {
+                try b.linef("ld.shared.v2.f32 {{{s}, {s}}}, [{s}+{d}];", .{ csc[0], csc[1], r_bscr, co });
+                try b.linef("ld.shared.v2.f32 {{{s}, {s}}}, [{s}+{d}];", .{ csc[2], csc[3], r_bscr, co + KS * 8 });
+            } else {
+                try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ csc[0], r_bscr, co });
+                try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ csc[2], r_bscr, co + KS * 8 });
+            }
             // The min term `-(dmin*m)*da*Σq` never touches the mma result, so folding it
             // as a rank-1 update cuts the per-accumulator cost from three ops to one fma,
             // a third of the inner loop's f32 work. MEASURED SLOWER, 493 vs 434 ms: the
@@ -4431,7 +4650,7 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
             // Not register-bound either: deleting the min term outright, which removes
             // half the fold AND all the spill, buys 4% (369.7 -> 355.0). The f32 work is
             // not what this kernel waits on, see the ASTRIDE bank-conflict note.
-            if (fold_min_rank1) for (0..2) |c| {
+            if (has_min and fold_min_rank1) for (0..2) |c| {
                 try b.linef("mul.f32 {s}, {s}, {s};", .{ csc[c * 2 + 1], csc[c * 2], csc[c * 2 + 1] });
                 try b.linef("neg.f32 {s}, {s};", .{ csc[c * 2 + 1], csc[c * 2 + 1] });
             };
@@ -4440,8 +4659,8 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
                 try b.linef("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {{{s},{s},{s},{s}}}, {{{s},{s},{s},{s}}}, {{{s},{s}}}, {{{s},{s},{s},{s}}};", .{
                     ct[0],          ct[1],          ct[2],          ct[3],
                     af[mi * 4 + 0], af[mi * 4 + 1], af[mi * 4 + 2], af[mi * 4 + 3],
-                    bf[nj * 2 + 0], bf[nj * 2 + 1],
-                    zq[0],          zq[1],          zq[2],          zq[3],
+                    bf[nj * 2 + 0], bf[nj * 2 + 1], zq[0],          zq[1],
+                    zq[2],          zq[3],
                 });
                 // c0=(row gid,col tf*2) c1=(gid,tf*2+1) c2=(gid+8,tf*2) c3=(gid+8,+1)
                 const a = acc[(mi * NT + nj) * 4 ..][0..4];
@@ -4449,7 +4668,7 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
                 const cols2 = [_]usize{ 0, 2, 0, 2 }; // index into csc for col 0/1
                 for (0..4) |ci| {
                     const dsc = rsc[mi * 4 + rows2[ci]];
-                    const dm = rsc[mi * 4 + rows2[ci] + 1];
+                    const dm = if (has_min) rsc[mi * 4 + rows2[ci] + 1] else "";
                     const da = csc[cols2[ci]];
                     // Not worth replacing with the magic-number bitcast (add
                     // 1.5*2^23, reinterpret, subtract), which is bit-exact here since
@@ -4460,7 +4679,10 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
                     try b.linef("cvt.rn.f32.s32 {s}, {s};", .{ fs[0], ct[ci] });
                     try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[1], dsc, da });
                     try b.linef("fma.rn.f32 {s}, {s}, {s}, {s};", .{ a[ci], fs[1], fs[0], a[ci] });
-                    if (fold_min_rank1) {
+                    if (!has_min) {
+                        // iq4_xs has no per-sub-block min, so this whole half goes
+                        // away; the q4_k header measures it at ~4% of the kernel.
+                    } else if (fold_min_rank1) {
                         try b.linef("fma.rn.f32 {s}, {s}, {s}, {s};", .{ a[ci], dm, csc[cols2[ci] + 1], a[ci] });
                     } else {
                         try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[1], dm, da });
@@ -4508,7 +4730,7 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator) ![:0]u8 {
     const shared_decl = try std.fmt.allocPrint(alloc, ".shared .align 16 .b8 smem[{d}];", .{SH});
     defer alloc.free(shared_decl);
     return b.build(
-        "mmq_pipe_q4_k",
+        kq.entry(),
         "    .param .u64 p_w,\n    .param .u64 p_x,\n    .param .u64 p_y,\n    .param .u32 p_rows,\n    .param .u32 p_cols,\n    .param .u32 p_n,\n    .param .f32 p_scale",
         shared_decl,
     );

@@ -511,6 +511,10 @@ pub const Backend = struct {
     mmq_q4k_fn: cu.CUfunction = null,
     mmq_pipe_mod: ?ctxmod.Module = null,
     mmq_pipe_fn: cu.CUfunction = null,
+    mmq_pipe5_mod: ?ctxmod.Module = null,
+    mmq_pipe5_fn: cu.CUfunction = null,
+    mmq_pipe_iq4_mod: ?ctxmod.Module = null,
+    mmq_pipe_iq4_fn: cu.CUfunction = null,
     mmq_pipe6_mod: ?ctxmod.Module = null,
     mmq_pipe6_fn: cu.CUfunction = null,
     mmq_pipe1_mod: ?ctxmod.Module = null,
@@ -769,6 +773,8 @@ pub const Backend = struct {
         if (self.hgemm_mod) |m| m.unload(self.ctx);
         if (self.mmq_q4k_mod) |m| m.unload(self.ctx);
         if (self.mmq_pipe_mod) |m| m.unload(self.ctx);
+        if (self.mmq_pipe5_mod) |m| m.unload(self.ctx);
+        if (self.mmq_pipe_iq4_mod) |m| m.unload(self.ctx);
         if (self.mmq_pipe6_mod) |m| m.unload(self.ctx);
         if (self.mmq_pipe1_mod) |m| m.unload(self.ctx);
         if (self.mmq_pipe8_mod) |m| m.unload(self.ctx);
@@ -2323,6 +2329,12 @@ pub const Backend = struct {
         return dt == .q1_0 or dt == .q2_0_g64 or dt == .q2_0_g128;
     }
 
+    /// Whether `opGemvQuantQ8N` has a kernel for this dtype. Wider coverage than
+    /// `quantQ8BatchSupported`, at 8 tokens per launch instead of all of them.
+    pub fn quantQ8NSupported(dt: dtypes.DType) bool {
+        return dt == .q4_0 or dt == .q8_0 or dt == .q4_k or dt == .q5_k or dt == .q6_k;
+    }
+
     /// Batched dp4a GEMV: `y[n][rows] = scale * (W @ x_t)` for all `n` tokens in
     /// ONE launch (grid.y = token), against the q8 activation written by a single
     /// `opGemvQuantizeX(x, n*cols)`.
@@ -2358,6 +2370,7 @@ pub const Backend = struct {
         defer self.ptoc(.matmul);
         std.debug.assert(cols % 256 == 0 and rows % 8 == 0);
         std.debug.assert(ng >= 1 and ng <= 8 and row_off + ng <= n_total);
+        std.debug.assert(quantQ8NSupported(dt));
         std.debug.assert(self.q8_act.size >= n_total * cols / 32 * 4 + n_total * cols);
         const w_db = try self.cachedWeight(w_bytes);
         const f = switch (dt) {
@@ -2396,13 +2409,35 @@ pub const Backend = struct {
 
     fn mmqPipeFn(self: *Backend) Error!cu.CUfunction {
         if (self.mmq_pipe_mod != null) return self.mmq_pipe_fn;
-        const ptx = kernels.buildMmqPipeQ4K(self.gpa) catch return error.OutOfMemory;
+        const ptx = kernels.buildMmqPipeQ4K(self.gpa, .q4_k) catch return error.OutOfMemory;
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         self.mmq_pipe_fn = mod.getFunction(self.ctx, "mmq_pipe_q4_k") catch return error.CudaError;
         self.mmq_pipe_mod = mod;
         self.logOccupancy("mmq_pipe_q4_k", self.mmq_pipe_fn, mmq_pipe_threads);
         return self.mmq_pipe_fn;
+    }
+
+    fn mmqPipe5Fn(self: *Backend) Error!cu.CUfunction {
+        if (self.mmq_pipe5_mod != null) return self.mmq_pipe5_fn;
+        const ptx = kernels.buildMmqPipeQ4K(self.gpa, .q5_k) catch return error.OutOfMemory;
+        defer self.gpa.free(ptx);
+        var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
+        self.mmq_pipe5_fn = mod.getFunction(self.ctx, "mmq_pipe_q5_k") catch return error.CudaError;
+        self.mmq_pipe5_mod = mod;
+        self.logOccupancy("mmq_pipe_q5_k", self.mmq_pipe5_fn, mmq_pipe_threads);
+        return self.mmq_pipe5_fn;
+    }
+
+    fn mmqPipeIq4Fn(self: *Backend) Error!cu.CUfunction {
+        if (self.mmq_pipe_iq4_mod != null) return self.mmq_pipe_iq4_fn;
+        const ptx = kernels.buildMmqPipeQ4K(self.gpa, .iq4_xs) catch return error.OutOfMemory;
+        defer self.gpa.free(ptx);
+        var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
+        self.mmq_pipe_iq4_fn = mod.getFunction(self.ctx, "mmq_pipe_iq4_xs") catch return error.CudaError;
+        self.mmq_pipe_iq4_mod = mod;
+        self.logOccupancy("mmq_pipe_iq4_xs", self.mmq_pipe_iq4_fn, mmq_pipe_threads);
+        return self.mmq_pipe_iq4_fn;
     }
 
     fn mmqPipe8Fn(self: *Backend) Error!cu.CUfunction {
@@ -2423,6 +2458,7 @@ pub const Backend = struct {
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         self.mmq_pipe6_fn = mod.getFunction(self.ctx, "mmq_pipe_q6_k") catch return error.CudaError;
         self.mmq_pipe6_mod = mod;
+        self.logOccupancy("mmq_pipe_q6_k", self.mmq_pipe6_fn, mmq_pipe_threads);
         return self.mmq_pipe6_fn;
     }
 
@@ -2447,6 +2483,7 @@ pub const Backend = struct {
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         self.mmq_pipe1_fn = mod.getFunction(self.ctx, "mmq_pipe_q1_0") catch return error.CudaError;
         self.mmq_pipe1_mod = mod;
+        self.logOccupancy("mmq_pipe_q1_0", self.mmq_pipe1_fn, mmq_pipe_threads);
         return self.mmq_pipe1_fn;
     }
 
@@ -2472,15 +2509,16 @@ pub const Backend = struct {
     /// but loses to dequant+f16 on real shapes (see `buildMmqPipeQ6K`), so the
     /// decision of what to actually call belongs to the caller.
     pub fn mmqPipeSupported(dt: dtypes.DType, rows: usize, cols: usize) bool {
-        return (dt == .q4_k or dt == .q6_k or dt == .q1_0 or dt == .q8_0 or dt == .q2_0_g64 or dt == .q2_0_g128) and
+        return (dt == .q4_k or dt == .q5_k or dt == .q6_k or dt == .iq4_xs or dt == .q1_0 or
+            dt == .q8_0 or dt == .q2_0_g64 or dt == .q2_0_g128) and
             cols % 256 == 0 and rows % mmq_pipe_tile == 0;
     }
 
     /// Whether a pipe-MMQ kernel exists for this dtype at all, shape aside. For a caller
     /// that picks a route before it knows the shapes; `mmqPipeSupported` is the full check.
     pub fn mmqPipeDtype(dt: dtypes.DType) bool {
-        return dt == .q4_k or dt == .q6_k or dt == .q1_0 or dt == .q8_0 or
-            dt == .q2_0_g64 or dt == .q2_0_g128;
+        return dt == .q4_k or dt == .q5_k or dt == .q6_k or dt == .iq4_xs or dt == .q1_0 or
+            dt == .q8_0 or dt == .q2_0_g64 or dt == .q2_0_g128;
     }
 
     /// Whether MMQ is a WIN for this dtype, i.e. what a model should route on.
@@ -2495,6 +2533,13 @@ pub const Backend = struct {
         // prompt, interleaved same-binary A/B) with decode unchanged. `TP_NO_MMQ2`
         // keeps the dequant+f16 path reachable for future A/B from one build.
         if (dt == .q2_0_g64 or dt == .q2_0_g128) return !envSet("TP_NO_MMQ2");
+        // q5_k reads the same nibbles as q4_k plus a 32-byte fifth-bit plane, so it
+        // moves 176/144 of q4_k's bytes against a dequant+f16 fallback that expands
+        // 5.5 bpw to 16. `TP_NO_MMQ5` keeps that fallback reachable from one build.
+        if (dt == .q5_k) return !envSet("TP_NO_MMQ5");
+        // iq4_xs is the widest margin of the k-quant family: 4.25 bpw expanded to
+        // 16 by the fallback, and no min term to fold. `TP_NO_MMQ_IQ4` A/Bs it.
+        if (dt == .iq4_xs) return !envSet("TP_NO_MMQ_IQ4");
         return dt == .q4_k or dt == .q1_0;
     }
 
@@ -2531,6 +2576,8 @@ pub const Backend = struct {
         defer self.ptoc(.matmul);
         const w_db = try self.cachedWeight(w_bytes);
         const f = switch (dt) {
+            .q5_k => try self.mmqPipe5Fn(),
+            .iq4_xs => try self.mmqPipeIq4Fn(),
             .q6_k => try self.mmqPipe6Fn(),
             .q1_0 => try self.mmqPipe1Fn(),
             .q8_0 => try self.mmqPipe8Fn(),
@@ -2940,14 +2987,18 @@ pub const Backend = struct {
         try self.eltLaunch(fs, conv_state, x, null, null, .{ @intCast(channels), @intCast(n), 0, 0, 0, 0 }, .{ 0, 0 }, channels);
     }
 
-    /// Batched delta-net gates: `n` tokens in one launch. `alpha`/`beta` are
-    /// separate [n][heads] buffers (two batched GEMVs), `out` is per token
+    /// Batched delta-net gates: `n` tokens in one launch. `out` is per token
     /// `[decay(heads) | beta(heads)]`, the layout `opGdnDeltaStep` reads.
-    pub fn opGdnGatesBatch(self: *Backend, alpha: DeviceBuffer, beta: DeviceBuffer, a_dt: DeviceBuffer, out: DeviceBuffer, heads: usize, n: usize) Error!void {
+    ///
+    /// `stride` is the row pitch of `alpha` and `beta` in f32 elements, 0 meaning
+    /// `heads` (two tight [n][heads] buffers from two GEMVs). A caller that gets
+    /// both out of ONE row-padded GEMM passes that GEMM's row width and two views
+    /// into its output.
+    pub fn opGdnGatesBatch(self: *Backend, alpha: DeviceBuffer, beta: DeviceBuffer, a_dt: DeviceBuffer, out: DeviceBuffer, heads: usize, n: usize, stride: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
         const f = try self.eltFn(elt.gdn_gates_batch_ptx, "gdn_gates_batch");
-        try self.eltLaunch(f, alpha, beta, a_dt, out, .{ @intCast(n * heads), @intCast(heads), 0, 0, 0, 0 }, .{ 0, 0 }, n * heads);
+        try self.eltLaunch(f, alpha, beta, a_dt, out, .{ @intCast(n * heads), @intCast(heads), @intCast(stride), 0, 0, 0 }, .{ 0, 0 }, n * heads);
     }
 
     fn gdnChunkFn(self: *Backend, d: usize) Error!cu.CUfunction {
@@ -5896,6 +5947,260 @@ test "the q8_0 pipe MMQ matches an exact f64 reference" {
             };
         }
     }
+}
+
+// Gated on a CUDA device: the q5_k pipe MMQ against `quants.dequantSlice` (ggml, itself
+// golden-tested) as the weight reference. What it pins is the part q5_k does NOT share
+// with q4_k: the 176-byte block stride, qs at +48, and the 32-byte `qh` plane whose bit
+// 2*grp+ks supplies element (grp,ks)'s fifth bit. Every one of those is a silent wrong
+// answer, not a crash: read the plane at the wrong offset and the values are still
+// 0..31, still in range, still plausible.
+//
+// The activation is integers with abs-max exactly 127 per 32-block, so the kernel's
+// internal q8_1 quantize is exact and the only difference from the f64 sum is the
+// summation order.
+test "the q5_k pipe MMQ matches a ggml-dequantized weight" {
+    const quants = @import("tp_core").quants;
+    const gpa = std.testing.allocator;
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+
+    const rows = 128; // % mmq_pipe_tile
+    const cols = 512; // % 256, two super-blocks per row so the block stride is exercised
+    const m = 8;
+    const nsb = cols / 256;
+    const npad = std.mem.alignForward(usize, m, 128);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(0x5CAFE);
+    const rnd = prng.random();
+
+    // Random q5_k super-blocks: d, dmin, 12 packed 6-bit scale/min pairs, 32 qh, 128 qs.
+    const wbytes = try alloc.alloc(u8, rows * nsb * 176);
+    for (0..rows * nsb) |sb| {
+        const blk = wbytes[sb * 176 ..][0..176];
+        const d: f16 = @floatCast(0.002 + 0.0005 * @as(f32, @floatFromInt(sb % 7)));
+        const dmin: f16 = @floatCast(0.001 + 0.0003 * @as(f32, @floatFromInt(sb % 5)));
+        std.mem.writeInt(u16, blk[0..2], @bitCast(d), .little);
+        std.mem.writeInt(u16, blk[2..4], @bitCast(dmin), .little);
+        for (blk[4..]) |*byte| byte.* = rnd.int(u8);
+    }
+
+    const wdeq = try alloc.alloc(f32, rows * cols);
+    for (0..rows) |r|
+        quants.dequantSlice(.q5_k, wbytes[r * nsb * 176 ..][0 .. nsb * 176], 0, cols, wdeq[r * cols ..][0..cols]);
+
+    const x = try alloc.alloc(f32, npad * cols);
+    @memset(x, 0);
+    for (0..m) |i| for (0..cols / 32) |kb| for (0..32) |e| {
+        const v: i32 = if (e == 0) 127 else rnd.intRangeAtMost(i32, -126, 126);
+        x[i * cols + kb * 32 + e] = @floatFromInt(v);
+    };
+
+    const x_d = try be.tensorCreate(x.len * 4);
+    try be.tensorUpload(x_d, std.mem.sliceAsBytes(x));
+    const y_d = try be.tensorCreate(npad * rows * 4);
+    try be.opMatmulQuantMmqPipe(.q5_k, y_d, x_d, m, wbytes, rows, cols);
+    const y = try alloc.alloc(f32, npad * rows);
+    try be.tensorDownload(y_d, std.mem.sliceAsBytes(y));
+
+    // The route MMQ replaces, on the same inputs. Enabling MMQ for q5_k changes a
+    // model's tokens, so which of the two is nearer the truth is a fact worth
+    // holding: MMQ dots exact s8 in s32, the fallback rounds every weight to f16.
+    const yf_d = try be.tensorCreate(npad * rows * 4);
+    try be.opMatmulQuant(.q5_k, yf_d, x_d, m, wbytes, rows, cols);
+    const yf = try alloc.alloc(f32, npad * rows);
+    try be.tensorDownload(yf_d, std.mem.sliceAsBytes(yf));
+    var mmq_err: f64 = 0;
+    var f16_err: f64 = 0;
+
+    for (0..m) |i| {
+        for (0..rows) |j| {
+            var want: f64 = 0;
+            var mag: f64 = 0;
+            for (0..cols) |c| {
+                const term = @as(f64, wdeq[j * cols + c]) * @as(f64, x[i * cols + c]);
+                want += term;
+                mag += @abs(term);
+            }
+            const got = y[i * rows + j];
+            mmq_err = @max(mmq_err, @abs(@as(f64, got) - want) / mag);
+            f16_err = @max(f16_err, @abs(@as(f64, yf[i * rows + j]) - want) / mag);
+            // Relative to the summed magnitude: `want` itself cancels to near zero.
+            const tol: f32 = @floatCast(1e-5 * mag + 0.01);
+            std.testing.expect(@abs(got - @as(f32, @floatCast(want))) <= tol) catch |e| {
+                std.debug.print("q5_k mmq mismatch at token {d} row {d}: got {d}, want {d} (tol {d})\n", .{ i, j, got, want, tol });
+                return e;
+            };
+        }
+    }
+    errdefer std.debug.print("q5_k rel err: mmq {d}, dequant+f16 {d}\n", .{ mmq_err, f16_err });
+    try std.testing.expect(mmq_err < f16_err);
+}
+
+// The same, for iq4_xs. What it pins here is the codebook: a nibble is an INDEX into
+// `kvalues_iq4nl`, mapped four at a time by a `prmt` pair whose selector must have bit 3
+// cleared (prmt reads that bit as "replicate sign", not "byte 8"). Also the 6-bit scale
+// split across scales_l/scales_h and biased -32, and the fact that low nibbles are
+// elements 0..15 of a SUB-BLOCK where q4_k's are a whole sub-block of their own.
+test "the iq4_xs pipe MMQ matches a ggml-dequantized weight" {
+    const quants = @import("tp_core").quants;
+    const gpa = std.testing.allocator;
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+
+    const rows = 128; // % mmq_pipe_tile
+    const cols = 512; // % 256, two super-blocks per row so the block stride is exercised
+    const m = 8;
+    const nsb = cols / 256;
+    const npad = std.mem.alignForward(usize, m, 128);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(0x14F5);
+    const rnd = prng.random();
+
+    // Random iq4_xs super-blocks: d, then scales_h/scales_l/qs all random bytes.
+    const wbytes = try alloc.alloc(u8, rows * nsb * 136);
+    for (0..rows * nsb) |sb| {
+        const blk = wbytes[sb * 136 ..][0..136];
+        const d: f16 = @floatCast(0.002 + 0.0005 * @as(f32, @floatFromInt(sb % 7)));
+        std.mem.writeInt(u16, blk[0..2], @bitCast(d), .little);
+        for (blk[2..]) |*byte| byte.* = rnd.int(u8);
+    }
+
+    const wdeq = try alloc.alloc(f32, rows * cols);
+    for (0..rows) |r|
+        quants.dequantSlice(.iq4_xs, wbytes[r * nsb * 136 ..][0 .. nsb * 136], 0, cols, wdeq[r * cols ..][0..cols]);
+
+    const x = try alloc.alloc(f32, npad * cols);
+    @memset(x, 0);
+    for (0..m) |i| for (0..cols / 32) |kb| for (0..32) |e| {
+        const v: i32 = if (e == 0) 127 else rnd.intRangeAtMost(i32, -126, 126);
+        x[i * cols + kb * 32 + e] = @floatFromInt(v);
+    };
+
+    const x_d = try be.tensorCreate(x.len * 4);
+    try be.tensorUpload(x_d, std.mem.sliceAsBytes(x));
+    const y_d = try be.tensorCreate(npad * rows * 4);
+    try be.opMatmulQuantMmqPipe(.iq4_xs, y_d, x_d, m, wbytes, rows, cols);
+    const y = try alloc.alloc(f32, npad * rows);
+    try be.tensorDownload(y_d, std.mem.sliceAsBytes(y));
+
+    // The route MMQ replaces, on the same inputs. Enabling MMQ for q5_k changes a
+    // model's tokens, so which of the two is nearer the truth is a fact worth
+    // holding: MMQ dots exact s8 in s32, the fallback rounds every weight to f16.
+    const yf_d = try be.tensorCreate(npad * rows * 4);
+    try be.opMatmulQuant(.iq4_xs, yf_d, x_d, m, wbytes, rows, cols);
+    const yf = try alloc.alloc(f32, npad * rows);
+    try be.tensorDownload(yf_d, std.mem.sliceAsBytes(yf));
+    var mmq_err: f64 = 0;
+    var f16_err: f64 = 0;
+
+    for (0..m) |i| {
+        for (0..rows) |j| {
+            var want: f64 = 0;
+            var mag: f64 = 0;
+            for (0..cols) |c| {
+                const term = @as(f64, wdeq[j * cols + c]) * @as(f64, x[i * cols + c]);
+                want += term;
+                mag += @abs(term);
+            }
+            const got = y[i * rows + j];
+            mmq_err = @max(mmq_err, @abs(@as(f64, got) - want) / mag);
+            f16_err = @max(f16_err, @abs(@as(f64, yf[i * rows + j]) - want) / mag);
+            // Relative to the summed magnitude: `want` itself cancels to near zero.
+            const tol: f32 = @floatCast(1e-5 * mag + 0.01);
+            std.testing.expect(@abs(got - @as(f32, @floatCast(want))) <= tol) catch |e| {
+                std.debug.print("iq4_xs mmq mismatch at token {d} row {d}: got {d}, want {d} (tol {d})\n", .{ i, j, got, want, tol });
+                return e;
+            };
+        }
+    }
+    errdefer std.debug.print("iq4_xs rel err: mmq {d}, dequant+f16 {d}\n", .{ mmq_err, f16_err });
+    try std.testing.expect(mmq_err < f16_err);
+}
+
+// Gated on a CUDA device: two skinny weights STACKED into one row-padded weight and
+// run through the pipe MMQ give, per token, exactly what running each through the
+// grouped GEMV gives. This is what qwen35's `ab_cat` does to turn n/8 launches of a
+// six-block grid into one GEMM, and every part of it is a silent wrong answer: rows
+// landing at the wrong offset, the zero pad rows contributing, or the reader taking
+// the padded row pitch for the head count.
+test "stacked skinny weights through the pipe MMQ match per-weight grouped GEMVs" {
+    const gpa = std.testing.allocator;
+    const be = Backend.init(gpa) catch return error.SkipZigTest;
+    defer be.deinit();
+
+    const heads = 48; // qwen35's lin_v_heads: below one GEMM tile, hence the stacking
+    const tile = Backend.mmq_pipe_tile;
+    const cols = 5120;
+    const m = 96; // not a multiple of the tile, so the pad rows are live
+    const nsb = cols / 256;
+    const npad = std.mem.alignForward(usize, m, tile);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(0xAB0);
+    const rnd = prng.random();
+
+    // Two independent q4_k weights, and the stacked form the model builds.
+    const wa = try alloc.alloc(u8, heads * nsb * 144);
+    const wb = try alloc.alloc(u8, heads * nsb * 144);
+    for ([_][]u8{ wa, wb }) |w| for (0..w.len / 144) |sb| {
+        const blk = w[sb * 144 ..][0..144];
+        const d: f16 = @floatCast(0.003 + 0.0007 * @as(f32, @floatFromInt(sb % 6)));
+        const dmin: f16 = @floatCast(0.001 + 0.0002 * @as(f32, @floatFromInt(sb % 4)));
+        std.mem.writeInt(u16, blk[0..2], @bitCast(d), .little);
+        std.mem.writeInt(u16, blk[2..4], @bitCast(dmin), .little);
+        for (blk[4..]) |*byte| byte.* = rnd.int(u8);
+    };
+    const cat = try alloc.alloc(u8, tile * nsb * 144);
+    @memset(cat, 0); // pad rows are all-zero blocks, which dequantize to 0
+    @memcpy(cat[0..wa.len], wa);
+    @memcpy(cat[wa.len..][0..wb.len], wb);
+
+    const x = try alloc.alloc(f32, npad * cols);
+    @memset(x, 0);
+    for (0..m * cols) |i| x[i] = @floatFromInt(rnd.intRangeAtMost(i32, -100, 100));
+    const x_d = try be.tensorCreate(x.len * 4);
+    try be.tensorUpload(x_d, std.mem.sliceAsBytes(x));
+
+    // Stacked: ONE GEMM, output [token][tile] with a at column 0 and b at `heads`.
+    const ys_d = try be.tensorCreate(npad * tile * 4);
+    try be.opMatmulQuantMmqPipe(.q4_k, ys_d, x_d, m, cat, tile, cols);
+    const ys = try alloc.alloc(f32, npad * tile);
+    try be.tensorDownload(ys_d, std.mem.sliceAsBytes(ys));
+
+    // Per weight: the grouped GEMV, 8 tokens per launch, output [token][heads].
+    const yg_d = try be.tensorCreate(m * heads * 4);
+    const yg = try alloc.alloc(f32, m * heads);
+    try be.opGemvQuantizeX(x_d, m * cols);
+    for ([_][]const u8{ wa, wb }, 0..) |w, wi| {
+        var off: usize = 0;
+        while (off < m) : (off += 8) {
+            const ng: usize = @min(8, m - off);
+            try be.opGemvQuantQ8N(.q4_k, offsetBufSizedTest(yg_d, off * heads * 4, ng * heads * 4), w, 1.0, heads, cols, ng, off, m);
+        }
+        try be.tensorDownload(yg_d, std.mem.sliceAsBytes(yg));
+        for (0..m) |t| for (0..heads) |h| {
+            const want = yg[t * heads + h];
+            const got = ys[t * tile + wi * heads + h];
+            // Different summation orders over 5120 terms; scale the tolerance to
+            // the magnitude, which for random weights is far from the sum.
+            const tol = 2e-3 * @abs(want) + 0.5;
+            std.testing.expect(@abs(got - want) <= tol) catch |e| {
+                std.debug.print("stacked mismatch w{d} token {d} head {d}: got {d}, want {d}\n", .{ wi, t, h, got, want });
+                return e;
+            };
+        };
+    }
+    // The pad rows must contribute nothing of their own.
+    for (0..m) |t| for (2 * heads..tile) |r| try std.testing.expectEqual(@as(f32, 0), ys[t * tile + r]);
 }
 
 // Gated on a CUDA device: the block-quant convrot decode (`opI8GemmBlockQ`) against the
