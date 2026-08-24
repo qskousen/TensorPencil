@@ -712,6 +712,61 @@ The chip menu is hand-rolled rather than `dvui.dropdown`, which hardcodes
 `.avoid = .none` and so always opens downward — off the bottom of the window,
 since the composer sits at the window foot.
 
+**Weight noise sits INSIDE the input frame**, left of "+ reference"/Send, as
+four pieces: a toggle that reads as on by *filling* (a caption change is
+unreadable at chip size), a sparkline of the active shape, a dropdown naming which
+saved shape is live, and the amount. It is there rather than in the quick-settings
+row above because it is a per-message reach, like Send.
+
+**Shape and amount are split, and only the amount is typed here.** The expression
+is the shape (`a*(1-t)^2`); the field beside it is the `a`. A shape worth using
+looks like `max(0, a*(1-t/0.4))`, which is not something to retype into a composer
+chip, but "how much" is exactly the thing you reach for mid-conversation — which is
+why the first cut of this, a single expression field with the amplitude baked into
+it, was wrong: picking a shape from a list meant losing the amount knob. Writing
+shapes is a Settings job: a wide field, an Amount row, a 480px preview, and a
+Load/name/Save/Delete row, the third instance of the pattern sampling presets and
+saved system prompts already use.
+
+A shape with a literal amplitude (`0.25*(1-t)^2`) ignores the amount. The composer
+dims the field and the Settings readout appends "(fixed: this shape ignores
+Amount)", because a knob that silently does nothing is worse than one that is
+visibly absent.
+
+**Both the composer controls and the whole Settings section are gated on
+CAPABILITY, not on a live session** (`app.noiseAvailable`). Two mistakes are worth
+recording, because the first version made both:
+
+Gating on `g_session != null` looked right and was wrong twice over. tp-gui loads
+the LLM lazily, on the first message, so the controls were hidden during exactly
+the window someone wants to set them up in — you had to send a message before you
+could choose how the reply would be perturbed. And a loaded session proves nothing
+about capability: only gemma4 publishes a per-layer sigma, so a Qwen or a Gemma 3
+got a toggle that lit up and did nothing.
+
+The fix is the shape `visionAvailable` and `configuredSupportsThinking` already
+use: ask the live session when there is one, otherwise probe the configured GGUF
+header (memoized on the path). The answer has two halves, both real —
+`llm.session.archSupportsWeightNoise` (does any stepper publish a layer index) and
+`cuda.Backend.weightNoiseSupported` (are this file's linears in a dtype whose
+kernels read sigma). The second half is not theoretical: a Gemma 4 **12B QAT**
+checkpoint is q4_0, which has no noised kernels, so it is the right arch and still
+cannot be perturbed.
+
+The dropdown names the live curve by **matching its expression** against the
+library rather than storing an "active name" — two fields for one fact desync,
+and this one would desync every time a curve was edited in Settings. When nothing
+matches, a trailing `custom` entry names the typed-in curve; selecting it is a
+no-op, since it describes rather than sets.
+
+Three states have to be legible and all three are checkable with
+`zig build ui-probe -- out.png 1200 2600 --settings`: valid (blue, peak and
+head values), gated (adds "zero past 40%"), malformed (amber expression, amber
+flat line, "does not parse, so noise is off" — a half-typed curve is noise OFF
+and nothing else on screen would say so). `style.sparkline` draws BARS, so the
+Settings preview is width-capped: 48 bars stretched across the form is a solid
+block you cannot read a shape off.
+
 ### VRAM meter (§9)
 
 The bar keeps its two draggable handles and its eject/pause buttons, which the

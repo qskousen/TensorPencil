@@ -16,6 +16,7 @@ const elt = @import("elt.zig");
 const cublaslt = @import("cublaslt.zig");
 const cudnn = @import("cudnn.zig");
 const dtypes = @import("tp_core").dtype;
+const noise_curve = @import("tp_core").noise_curve;
 const sample = @import("tp_core").sample;
 
 const Context = ctxmod.Context;
@@ -197,6 +198,14 @@ pub const Elt = enum {
 const WeightEntry = struct {
     db: DeviceBuffer,
     last_use: u64 = 0,
+    /// Identity for weight noise: what separates one weight's perturbation from
+    /// another's when the jitter keys on a block's offset WITHIN its weight (an
+    /// absolute device address is not stable across runs, so a sweep keyed on one
+    /// cannot be reproduced). Assigned in first-touch order, which is layer order,
+    /// so the same session shape reassigns the same ids. A weight evicted and
+    /// re-uploaded gets a new id and so a new perturbation; LLM weights are pinned
+    /// and never stream, which is the only path this matters on.
+    noise_id: u32 = 0,
     /// Pinned entries (first-touch, up to pin_budget) are immune to eviction.
     pinned: bool = false,
     /// Cached while a weight scope was open (weightScopeBegin): released as
@@ -242,9 +251,141 @@ const PendingFree = struct { db: DeviceBuffer, ev: cu.CUevent };
 const BqScaleKey = struct { ptr: usize, bits: u8 };
 
 
+/// Weight noise: the two values every block-quant GEMM/GEMV kernel reads out of
+/// the parameter slots the ABI already carried unused. See `cuda/wnoise.zig` for
+/// what the kernels do with them, and BACKEND.md for which kernels honor them.
+///
+/// Sigma is a FUNCTION OF DEPTH, not a constant: `core/noise_curve.zig` evaluates
+/// the user's expression once per layer into `table`, and a launch reads the slot
+/// for the layer it belongs to. That is what lets a curve perturb the early stack
+/// hard while leaving the last layers and the LM head almost untouched, which is
+/// the difference between a differently-reasoned answer and gibberish.
+///
+/// `table` is written whole by whoever owns the curve (a UI thread) and read one
+/// slot at a time by the worker at every launch, hence atomic per slot. A publish
+/// that lands mid-forward shows a mix of two curves for one token and is coherent
+/// again on the next, which for a noise knob is not worth a lock. `depth_i` is
+/// worker-only: the model sets it as it walks the stack.
+pub const WeightNoise = struct {
+    /// Longest stack this can describe. Slot `l` is decoder layer `l`; the slot at
+    /// the live `depth` is the LM head.
+    pub const max_depth = 256;
+    /// Longest curve expression kept. Generous for `0.08*(1-t)^2`.
+    pub const max_expr = 192;
+
+    table: [max_depth]std.atomic.Value(u32) = @splat(.init(0)),
+    /// Any slot nonzero, so the per-launch key lookup can be skipped outright.
+    any: std.atomic.Value(bool) = .init(false),
+    /// Decoder layer count, from the model at init. 0 until then.
+    depth: u32 = 0,
+    /// Which slot the launches now belong to.
+    depth_i: u32 = 0,
+    /// Advanced once per forward so each one draws a fresh perturbation.
+    seq: u32 = 0,
+    /// Base of the whole run's noise stream. Same seed + same curve + same prompt
+    /// reproduces a generation exactly, which is what makes a sweep readable:
+    /// without it every setting is one sample of an unrepeatable draw.
+    seed: u32 = 0,
+
+    /// The curve itself. Unlocked, because nothing shares it: `setDepth` is called
+    /// exactly once from the model's init, and `setCurve` only from whichever
+    /// thread owns the curve (the CLI at bring-up, a GUI's UI thread once loading
+    /// has finished). What DOES cross threads is `table`, and that is atomic per
+    /// slot. Calling `setDepth` from a worker while a UI edits the curve would
+    /// break that reasoning, so don't: it is an init-time call.
+    expr_buf: [max_expr]u8 = @splat(0),
+    expr_len: usize = 0,
+    /// The curve's `a`: how MUCH, kept apart from the curve's WHERE so the amount
+    /// can be a knob nobody has to edit an expression to turn. 1 leaves a curve
+    /// written with literal amplitudes meaning exactly what it says.
+    amount: f32 = 1,
+
+    /// Set the curve (any `noise_curve` expression; a bare number is a flat one).
+    /// An empty or malformed curve is off. Re-evaluates the table if the layer
+    /// count is already known.
+    pub fn setCurve(self: *WeightNoise, expr: []const u8) void {
+        self.expr_len = @min(expr.len, max_expr);
+        @memcpy(self.expr_buf[0..self.expr_len], expr[0..self.expr_len]);
+        self.refill();
+    }
+
+    /// Set the amount the curve's `a` reads. Non-finite and negative clamp to 0
+    /// (off): this is fed straight from a text box.
+    pub fn setAmount(self: *WeightNoise, v: f32) void {
+        self.amount = if (std.math.isFinite(v) and v > 0) v else 0;
+        self.refill();
+    }
+
+    /// Tell it how deep the stack is. Init-time only; see `expr_buf`.
+    pub fn setDepth(self: *WeightNoise, n_layers: usize) void {
+        self.depth = @intCast(@min(n_layers, max_depth - 1));
+        self.refill();
+    }
+
+    fn refill(self: *WeightNoise) void {
+        const expr = self.expr_buf[0..self.expr_len];
+        var any = false;
+        for (&self.table, 0..) |*slot, i| {
+            var v: f32 = 0;
+            if (self.depth != 0 and i <= self.depth and expr.len != 0) {
+                // t spans 0 at the first layer to exactly 1 at the head slot, so a
+                // curve decaying in t protects the head without being asked to.
+                const l: f32 = @floatFromInt(i);
+                const n: f32 = @floatFromInt(self.depth);
+                v = noise_curve.sanitize(noise_curve.eval(expr, .{ .t = l / n, .l = l, .n = n, .a = self.amount }) catch 0);
+            }
+            slot.store(@bitCast(v), .monotonic);
+            if (v != 0) any = true;
+        }
+        self.any.store(any, .release);
+    }
+
+    /// Sigma for the layer the launches now belong to.
+    pub fn sigma(self: *const WeightNoise) f32 {
+        return @bitCast(self.table[@min(self.depth_i, max_depth - 1)].load(.monotonic));
+    }
+
+    /// Whether the curve is nonzero ANYWHERE. A per-launch gate would have to be
+    /// per-layer, but this only guards the key lookup, which is free to happen on
+    /// a layer whose own sigma is 0.
+    pub fn on(self: *const WeightNoise) bool {
+        return self.any.load(.acquire);
+    }
+
+    /// Point the following launches at a decoder layer, or at the LM head.
+    pub fn atLayer(self: *WeightNoise, l: usize) void {
+        self.depth_i = @intCast(@min(l, max_depth - 1));
+    }
+
+    pub fn atHead(self: *WeightNoise) void {
+        self.depth_i = self.depth;
+    }
+
+    /// Draw the next perturbation. One call per forward.
+    pub fn tick(self: *WeightNoise) void {
+        self.seq +%= 1;
+    }
+
+    /// The per-launch key: everything that identifies "this weight, this forward"
+    /// folded host-side, so the kernel spends one parameter slot instead of three
+    /// and only has to mix in the block's own offset.
+    pub fn key(self: *const WeightNoise, weight_id: u32) u32 {
+        var h = self.seed ^ (self.seq *% 0x9E3779B1) ^ (weight_id *% 0x85EBCA6B);
+        h ^= h >> 16;
+        h *%= 0x7FEB352D;
+        h ^= h >> 15;
+        return h;
+    }
+};
+
 pub const Backend = struct {
     ctx: *Context,
     gpa: std.mem.Allocator,
+    /// Live weight-noise state, read by every block-quant kernel launch below.
+    /// An all-zero curve leaves those kernels bit-identical.
+    weight_noise: WeightNoise = .{},
+    /// First-touch counter behind `WeightEntry.noise_id`.
+    noise_id_next: u32 = 0,
 
     // capability booleans read in dit_gpu's hot gate expressions. Start all
     // false (the opMatmul + f32-eltwise parity path); light up as kernels land.
@@ -949,7 +1090,7 @@ pub const Backend = struct {
         self.pf_ring[head % pf_ring_sz] = .{ .bytes = bytes, .db = db, .ev = ev, .gen = gen };
         self.pf_head.store(head + 1, .release); // publish the slot to the thread
         self.pfWakeWorker(); // unpark the prefetch thread if it was blocked on an empty ring
-        self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .pinned = pin, .scoped = self.weight_scope, .awaiting_use = true, .upload_ev = ev, .pf_gen = gen }) catch {};
+        self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .pinned = pin, .scoped = self.weight_scope, .noise_id = self.nextNoiseId(), .awaiting_use = true, .upload_ev = ev, .pf_gen = gen }) catch {};
     }
 
     // ---- buffers ------------------------------------------------------------
@@ -1785,6 +1926,22 @@ pub const Backend = struct {
         return db;
     }
 
+    fn nextNoiseId(self: *Backend) u32 {
+        self.noise_id_next +%= 1;
+        return self.noise_id_next;
+    }
+
+    /// Weight-noise key for a launch against `bytes`. One extra hashmap lookup
+    /// per GEMM (nanoseconds against a millisecond kernel) buys every op the same
+    /// signature it had before: the identity rides in a parameter slot the ABI
+    /// already carried unused. Returns 0 when noise is off, and for an uncached
+    /// weight, where the caller is about to upload it anyway.
+    fn noiseKey(self: *Backend, bytes: []const u8) u32 {
+        if (!self.weight_noise.on()) return 0;
+        const e = self.weights.getPtr(@intFromPtr(bytes.ptr)) orelse return 0;
+        return self.weight_noise.key(e.noise_id);
+    }
+
     fn cachedWeight(self: *Backend, bytes: []const u8) Error!DeviceBuffer {
         const key = @intFromPtr(bytes.ptr);
         self.use_counter += 1;
@@ -1841,7 +1998,7 @@ pub const Backend = struct {
             const cb = ctxmod.Buffer{ .ptr = db.ptr(), .bytes = @intCast(db.size) };
             self.ctx.uploadWeight(cb, bytes) catch return error.CudaError;
         }
-        try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .pinned = pin, .scoped = self.weight_scope });
+        try self.weights.put(self.gpa, key, .{ .db = db, .last_use = self.use_counter, .pinned = pin, .scoped = self.weight_scope, .noise_id = self.nextNoiseId() });
         return db;
     }
 
@@ -2248,7 +2405,7 @@ pub const Backend = struct {
         // idle, round the grid UP so every row is covered.
         const warp_per_row = dt == .q5_k or dt == .q6_k or dt == .iq4_nl or dt == .q1_0 or dt == .q2_0_g64 or dt == .q2_0_g128;
         const grid = if (warp_per_row) (rows + 7) / 8 else rows;
-        try self.rowLaunch(f, w_db, x, y, null, .{ @intCast(rows), @intCast(cols), 0, 0, 0, 0 }, .{ scale, 0 }, grid);
+        try self.rowLaunch(f, w_db, x, y, null, .{ @intCast(rows), @intCast(cols), 0, 0, 0, self.noiseKey(w_bytes) }, .{ scale, self.weight_noise.sigma() }, grid);
     }
 
     /// Quantize a decode activation vector x (f32[cols]) into the shared q8
@@ -2320,13 +2477,22 @@ pub const Backend = struct {
             else => unreachable,
         };
         const nt: u32 = if (quantQ8BatchSupported(dt)) 1 else 0;
-        try self.rowLaunch(f, w_db, self.q8_act, y, null, .{ @intCast(rows), @intCast(cols), nt, 0, 0, 0 }, .{ scale, 0 }, if (x2) rows / 16 else rows / 8);
+        try self.rowLaunch(f, w_db, self.q8_act, y, null, .{ @intCast(rows), @intCast(cols), nt, 0, 0, self.noiseKey(w_bytes) }, .{ scale, self.weight_noise.sigma() }, if (x2) rows / 16 else rows / 8);
     }
 
     /// Whether `opGemvQuantQ8Batch` has a kernel for this dtype, i.e. whether its
     /// dp4a GEMV carries the token dimension in grid.y.
     pub fn quantQ8BatchSupported(dt: dtypes.DType) bool {
         return dt == .q1_0 or dt == .q2_0_g64 or dt == .q2_0_g128;
+    }
+
+    /// Whether this dtype's GEMM/GEMV kernels honor `weight_noise`. The authority
+    /// for it, because it is a property of which kernels were actually wired (see
+    /// BACKEND.md 6): a weight in any other dtype passes through untouched, so a UI
+    /// offering the knob for such a checkpoint would be lying. Notably NOT here:
+    /// q4_0, the Gemma 4 12B QAT format, and the fp8/bf16/int8-convrot paths.
+    pub fn weightNoiseSupported(dt: dtypes.DType) bool {
+        return dt == .q4_k or dt == .q5_k or dt == .q6_k or dt == .iq4_xs;
     }
 
     /// Whether `opGemvQuantQ8N` has a kernel for this dtype. Wider coverage than
@@ -2381,7 +2547,7 @@ pub const Backend = struct {
             .q6_k => try self.eltFn(elt.gemv_q6_k_q8n_ptx, "gemv_q6_k_q8n"),
             else => unreachable,
         };
-        try self.rowLaunch(f, w_db, self.q8_act, y, null, .{ @intCast(rows), @intCast(cols), @intCast(ng), @intCast(row_off), @intCast(n_total * cols / 32), 0 }, .{ scale, 0 }, rows / 8);
+        try self.rowLaunch(f, w_db, self.q8_act, y, null, .{ @intCast(rows), @intCast(cols), @intCast(ng), @intCast(row_off), @intCast(n_total * cols / 32), self.noiseKey(w_bytes) }, .{ scale, self.weight_noise.sigma() }, rows / 8);
     }
 
     /// ggml block-quant GEMM (prefill): the opMatmulFp8 shape, dequant the
@@ -2591,9 +2757,12 @@ pub const Backend = struct {
         var pcols: u32 = @intCast(cols);
         var pn: u32 = @intCast(npad);
         var pscale: f32 = 1.0;
+        var pnsig: f32 = self.weight_noise.sigma();
+        var pnseq: u32 = self.noiseKey(w_bytes);
         var params = [_]?*anyopaque{
             @ptrCast(&pw),    @ptrCast(&px),    @ptrCast(&py),
-            @ptrCast(&prows), @ptrCast(&pcols), @ptrCast(&pn), @ptrCast(&pscale),
+            @ptrCast(&prows), @ptrCast(&pcols), @ptrCast(&pn),    @ptrCast(&pscale),
+            @ptrCast(&pnsig), @ptrCast(&pnseq),
         };
         self.ctx.launch(f, .{ @intCast(npad / mmq_pipe_tile), @intCast(rows / mmq_pipe_tile), 1 }, .{ 128, 1, 1 }, 0, &params) catch return error.CudaError;
     }
@@ -2627,9 +2796,12 @@ pub const Backend = struct {
         var pcols: u32 = @intCast(cols);
         var pn: u32 = @intCast(m);
         var pscale: f32 = 1.0;
+        var pnsig: f32 = self.weight_noise.sigma();
+        var pnseq: u32 = self.noiseKey(w_bytes);
         var params = [_]?*anyopaque{
             @ptrCast(&pw),    @ptrCast(&px),    @ptrCast(&py),
-            @ptrCast(&prows), @ptrCast(&pcols), @ptrCast(&pn), @ptrCast(&pscale),
+            @ptrCast(&prows), @ptrCast(&pcols), @ptrCast(&pn),    @ptrCast(&pscale),
+            @ptrCast(&pnsig), @ptrCast(&pnseq),
         };
         const gx: u32 = @intCast((m + mmq_tile_n - 1) / mmq_tile_n);
         const gy: u32 = @intCast(rows / mmq_tile_rows);

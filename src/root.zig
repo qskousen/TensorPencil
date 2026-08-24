@@ -30,6 +30,7 @@ pub const sampler = @import("tp_core").sampler;
 /// Philox one A1111 draws with. Public because a consumer reproducing either
 /// ecosystem's seeds needs to name the source, not just the seed.
 pub const noise = @import("tp_core").noise;
+pub const noise_curve = @import("tp_core").noise_curve;
 pub const pipeline = @import("pipeline.zig");
 pub const vram = @import("tp_runtime").vram;
 /// CPU<->GPU layer-offload scheduling (shared by the CLI and the GUI, so the

@@ -172,8 +172,10 @@ pub const Viewer = struct {
             if (e.handled or e.evt != .key) continue;
             const ke = e.evt.key;
             if (ke.action != .down and ke.action != .repeat) continue;
-            // Ctrl/Cmd+C copies the current image to the clipboard as a PNG.
-            if (ke.code == .c and ke.action == .down and (ke.mod.control() or ke.mod.command())) {
+            // Copy the current image to the clipboard as a PNG. dvui's own bind,
+            // so every chord that copies text here copies the image: Ctrl+C,
+            // Cmd+C, Ctrl+Insert.
+            if (ke.action == .down and ke.matchBind("copy")) {
                 e.handled = true;
                 clipboard.copyImage(self.cur);
                 continue;

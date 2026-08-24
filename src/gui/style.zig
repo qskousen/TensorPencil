@@ -345,6 +345,11 @@ pub const ChipOpts = struct {
     id_extra: usize = 0,
     /// Left gap, for chips laid out in a row.
     margin_x: f32 = 0,
+    /// `chipInput` only: the EDITABLE text's color. Separate from `text`, which
+    /// colors a chip's label: a typed value wants full contrast where a label
+    /// wants less, so null keeps the bright default and a caller overrides it
+    /// only to show the field is inert.
+    text_input: ?Color = null,
 };
 
 /// A small bordered pill: model names in the title bar, quick settings in the
@@ -491,7 +496,7 @@ pub fn chipInput(src: std.builtin.SourceLocation, buf: []u8, suffix: []const u8,
         .min_size_content = .{ .w = width },
         .max_size_content = .width(width),
         .font = o.font,
-        .color_text = C.text_hi,
+        .color_text = o.text_input orelse C.text_hi,
         .gravity_y = 0.5,
         .theme = noFocusTheme(),
     });

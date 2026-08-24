@@ -9,6 +9,7 @@
 const std = @import("std");
 const dvui = @import("dvui");
 const config = @import("config.zig");
+const noise_curve = @import("TensorPencil").noise_curve;
 const style = @import("style.zig");
 const bubbles = @import("bubbles.zig");
 const diffuser = @import("diffuser.zig");
@@ -123,6 +124,7 @@ pub fn reseed() void {
 }
 var steps_buf: [16]u8 = [_]u8{0} ** 16;
 var regen_buf: [16]u8 = [_]u8{0} ** 16;
+var noise_amt_buf: [16]u8 = [_]u8{0} ** 16;
 // Per-reply token cap. Sits in the sampling SECTION but is committed with the
 // other plain integers (commitNumbers), not with commitSampling: it is not part
 // of a preset, see config.Config.max_new_tokens.
@@ -159,6 +161,7 @@ pub fn open() void {
 fn seed(cfg: *const config.Config) void {
     _ = std.fmt.bufPrintZ(&steps_buf, "{d}", .{cfg.steps}) catch {};
     _ = std.fmt.bufPrintZ(&regen_buf, "{d}", .{cfg.regen_cache_mb}) catch {};
+    _ = std.fmt.bufPrintZ(&noise_amt_buf, "{d}", .{cfg.weight_noise_amount}) catch {};
     _ = std.fmt.bufPrintZ(&maxnew_buf, "{d}", .{cfg.max_new_tokens}) catch {};
     seedSampling(cfg);
     seeded = true;
@@ -199,6 +202,10 @@ fn commitNumbers(cfg: *config.Config) void {
     cfg.steps = std.math.clamp(parseNum(&steps_buf, cfg.steps), 1, 100);
     // Regen (checkpoint) cache: host RAM, capped at 64 GB to catch typos.
     cfg.regen_cache_mb = @min(parseNum(&regen_buf, cfg.regen_cache_mb), 64 << 10);
+    // Weight-noise amount. Clamped to [0,1]: past ~0.8 a front-loaded shape only
+    // produces fluent nonsense, and beyond 1 a scale multiplier stops meaning
+    // anything, but seeing the top of the range is the point of exposing it.
+    cfg.weight_noise_amount = std.math.clamp(parseFloatBuf(&noise_amt_buf, cfg.weight_noise_amount), 0, 1);
     // Max response: 0 keeps its "no explicit cap" meaning, so this only bounds
     // typos at the top end, the real limit is the context window either way.
     cfg.max_new_tokens = @min(parseNum(&maxnew_buf, cfg.max_new_tokens), 1 << 20);
@@ -451,6 +458,12 @@ pub fn render(cfg: *config.Config, cb: Callbacks) void {
     numRow("Presence penalty (0 = off)", &ppen_buf);
     numRow("Frequency penalty (0 = off)", &fpen_buf);
 
+    // Hidden outright for a checkpoint that cannot honor it, on the same
+    // capability answer the composer uses (`app.noiseAvailable`, pushed here
+    // because this view is handed a config, not a session). A greyed-out section
+    // would still invite the question; an absent one does not.
+    if (g_noise_supported) noiseSection(cfg);
+
     section("VRAM & performance");
     help("VRAM sharing between the chat model and image generation is controlled " ++
         "live from the meter in the status bar: drag the split handle to set each " ++
@@ -563,6 +576,174 @@ fn presetRow(cfg: *config.Config) void {
     if (dvui.button(@src(), "Delete", .{}, .{ .gravity_y = 0.5 })) {
         _ = cfg.removePresetNamed(std.mem.sliceTo(&preset_name_buf, 0));
     }
+}
+
+/// Whether the configured/loaded LLM honors weight noise. Set by the app each
+/// frame before `render`; this view has no session to ask.
+pub var g_noise_supported: bool = false;
+
+/// The whole weight-noise section, hidden when nothing can honor it.
+fn noiseSection(cfg: *config.Config) void {
+    section("Weight noise");
+    help("Perturbs the chat model's quantized weights WHILE it generates, so the " ++
+        "model itself wobbles rather than the sampler: every 256-weight block's " ++
+        "scale is scaled by 1 +- sigma, redrawn each forward pass. Temperature can " ++
+        "only reweight the choices the weights already produced; this samples a " ++
+        "nearby model, so the wording changes and stays grammatical. Off is exact. " ++
+        "CUDA backends only, and today only Gemma 4 honors it.");
+    help("Sigma is a CURVE over depth, written as an expression in t: 0 at the " ++
+        "first layer, 1 at the LM head. WHERE the noise sits matters more than how " ++
+        "much. The same amount late corrupts spelling; early it changes what the " ++
+        "model is reasoning about and stays fluent, so a front-loaded curve takes " ++
+        "roughly ten times the sigma a flat one survives. Push it far enough and " ++
+        "the failure is structural, not lexical: clean sentences, broken plan. " ++
+        "Available: t, l, n, abs sqrt exp log sin cos min max clamp pow, pi. There " ++
+        "is no if; max() and clamp() gate instead. A bare number is a flat curve.");
+    noiseCurveRow(cfg);
+    curveField(cfg);
+    numRow("Amount (the shape's a)", &noise_amt_buf);
+    help("How much noise the shape carries, kept separate from the shape itself so " ++
+        "the composer can adjust it without anyone editing an expression. 0.03 " ++
+        "rephrases, 0.08 clearly rewords, 0.4 gives a different answer in clean " ++
+        "prose, past ~0.8 a front-loaded shape breaks structurally. A shape written " ++
+        "with a literal amplitude instead of `a` ignores this.");
+    curvePreview(cfg);
+}
+
+var curve_name_buf: [config.max_preset_name]u8 = [_]u8{0} ** config.max_preset_name;
+
+/// The noise-curve library row: load a saved curve into the active one, and
+/// save/delete under a name. Mirrors `presetRow`.
+fn noiseCurveRow(cfg: *config.Config) void {
+    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 3 } });
+    defer row.deinit();
+
+    dvui.label(@src(), "Curve", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
+    {
+        var dd: dvui.DropdownWidget = undefined;
+        dd.init(@src(), .{ .label = if (cfg.noise_curves.count == 0) "none saved" else "Load…" }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 140 } });
+        defer dd.deinit();
+        if (dd.dropped()) {
+            for (cfg.noise_curves.slice()) |*c| {
+                if (dd.addChoiceLabel(c.name.slice())) {
+                    cfg.weight_noise_curve = c.curve;
+                    _ = std.fmt.bufPrintZ(&curve_name_buf, "{s}", .{c.name.slice()}) catch {};
+                }
+            }
+        }
+    }
+
+    var te = dvui.textEntry(@src(), .{
+        .text = .{ .buffer = &curve_name_buf },
+        .placeholder = "curve name",
+    }, .{ .expand = .horizontal, .gravity_y = 0.5, .margin = .{ .x = 4 } });
+    te.deinit();
+
+    if (dvui.button(@src(), "Save", .{}, .{ .gravity_y = 0.5, .margin = .{ .x = 4 } }))
+        _ = cfg.upsertNoiseCurve(std.mem.sliceTo(&curve_name_buf, 0), cfg.weight_noise_curve.slice());
+    if (dvui.button(@src(), "Delete", .{}, .{ .gravity_y = 0.5 }))
+        _ = cfg.removeNoiseCurveNamed(std.mem.sliceTo(&curve_name_buf, 0));
+}
+
+/// The expression itself, bound straight to the config's own buffer (like the
+/// path rows), and the on/off switch beside it. Full width, because this is the
+/// one place a curve is meant to be written.
+fn curveField(cfg: *config.Config) void {
+    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 3 } });
+    defer row.deinit();
+    dvui.label(@src(), "Enabled", .{}, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 150 } });
+    _ = dvui.checkbox(@src(), &cfg.weight_noise, null, .{ .gravity_y = 0.5, .margin = .{ .w = 12 } });
+    var te = dvui.textEntry(@src(), .{
+        .text = .{ .buffer = &cfg.weight_noise_curve.data },
+        .placeholder = "0.08*(1-t)^2",
+    }, .{
+        .expand = .horizontal,
+        .gravity_y = 0.5,
+        .font = style.F.mono,
+        // Amber while it does not parse: an unparseable curve is noise OFF, and
+        // nothing else on screen would say so.
+        .color_text = if (noise_curve.validate(cfg.weight_noise_curve.slice())) style.C.text_hi else |_| style.C.amber,
+    });
+    te.deinit();
+}
+
+/// The curve, drawn first-layer-to-LM-head, with the numbers that decide whether
+/// it is the shape you meant: the peak, what reaches the head, and where it dies.
+fn curvePreview(cfg: *config.Config) void {
+    var col = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 2, .w = 4, .h = 8 } });
+    defer col.deinit();
+
+    const expr = cfg.weight_noise_curve.slice();
+    const n = 48;
+    var vals: [n]f32 = @splat(0);
+    var peak: f32 = 0;
+    var peak_at: usize = 0;
+    var zero_from: ?usize = null;
+    const ok = expr.len != 0 and blk: {
+        noise_curve.validate(expr) catch break :blk false;
+        break :blk true;
+    };
+    if (ok) for (&vals, 0..) |*v, i| {
+        const t = @as(f32, @floatFromInt(i)) / @as(f32, n - 1);
+        v.* = noise_curve.sanitize(noise_curve.eval(expr, .{ .t = t, .a = cfg.weight_noise_amount }) catch 0);
+        if (v.* > peak) {
+            peak = v.*;
+            peak_at = i;
+        }
+        if (v.* == 0 and peak > 0 and zero_from == null) zero_from = i;
+        if (v.* != 0) zero_from = null; // only a FINAL run of zeros counts
+    };
+    // A decaying curve reaching 0 exactly at the head is the ordinary case, and
+    // "zero past 100%" says nothing; only a cutoff with real stack after it is
+    // worth a line.
+    if (zero_from) |z| if (z * 100 / (n - 1) > 95) {
+        zero_from = null;
+    };
+
+    var norm = vals;
+    if (peak > 0) for (&norm) |*v| {
+        v.* /= peak;
+    };
+    // Bounded width, not full width: `sparkline` draws BARS, and 48 of them across
+    // the whole form is a solid block you cannot read a shape off. At ~480px they
+    // are thin enough to read as a curve.
+    {
+        var well = dvui.box(@src(), .{ .dir = .horizontal }, .{
+            .min_size_content = .{ .w = 480 },
+            .max_size_content = .width(480),
+        });
+        defer well.deinit();
+        style.sparkline(@src(), &norm, if (!ok) style.C.amber else if (cfg.weight_noise) style.C.blue else style.C.text_ghost, 40);
+    }
+    {
+        var axis = dvui.box(@src(), .{ .dir = .horizontal }, .{
+            .min_size_content = .{ .w = 480 },
+            .max_size_content = .width(480),
+        });
+        defer axis.deinit();
+        dvui.labelNoFmt(@src(), "layer 0", .{}, .{ .font = style.F.mono_legend, .color_text = style.C.text_faint, .padding = .{} });
+        _ = dvui.spacer(@src(), .{ .expand = .horizontal });
+        dvui.labelNoFmt(@src(), "LM head", .{}, .{ .font = style.F.mono_legend, .color_text = style.C.text_faint, .padding = .{} });
+    }
+
+    var buf: [192]u8 = undefined;
+    const pct = @as(usize, @intFromFloat(@round(@as(f32, @floatFromInt(peak_at)) / @as(f32, n - 1) * 100)));
+    const txt = if (!ok)
+        "does not parse, so noise is off"
+    else if (peak == 0)
+        "zero everywhere, so noise is off"
+    else if (zero_from) |z| std.fmt.bufPrint(&buf, "peak {d:.3} at {d}% of the stack, zero past {d}%, {d:.3} at the LM head", .{
+        peak, pct, @as(usize, @intFromFloat(@round(@as(f32, @floatFromInt(z)) / @as(f32, n - 1) * 100))), vals[n - 1],
+    }) catch ""
+    else if (!noise_curve.respondsToAmount(expr))
+        std.fmt.bufPrint(&buf, "peak {d:.3} at {d}% of the stack, {d:.3} at the LM head (fixed: this shape ignores Amount)", .{ peak, pct, vals[n - 1] }) catch ""
+    else
+        std.fmt.bufPrint(&buf, "peak {d:.3} at {d}% of the stack, {d:.3} at the LM head", .{ peak, pct, vals[n - 1] }) catch "";
+    dvui.labelNoFmt(@src(), txt, .{}, .{
+        .font = style.F.mono_legend,
+        .color_text = if (!ok) style.C.amber else style.C.text_faint,
+        .padding = .{ .y = 4 },
+    });
 }
 
 /// Enum dropdown for the TAESD preview size. Unlike `dvui.dropdownEnum` (which

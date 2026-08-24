@@ -68,6 +68,13 @@ var g_think_probe_path: [config.max_path]u8 = undefined;
 var g_think_probe_len: usize = 0;
 var g_think_probe_result: bool = false;
 var g_think_probe_valid: bool = false;
+/// Same memo for the weight-noise capability probe. Separate from the thinking
+/// one because the two answers come from different things (a chat template vs.
+/// which kernels were wired) and a model can support either without the other.
+var g_noise_probe_path: [config.max_path]u8 = undefined;
+var g_noise_probe_len: usize = 0;
+var g_noise_probe_result: bool = false;
+var g_noise_probe_valid: bool = false;
 
 // The diffusion engine, APP-LEVEL and persistent (survives chat<->image mode
 // switches, so the image model isn't reloaded each way). It owns the single
@@ -128,6 +135,11 @@ var g_session_mu: std.Io.Mutex = std.Io.Mutex.init;
 // while it is busy. `Diffuser.res_mu` sits below both and is only ever tryLock'd
 // from a foreign thread, so it cannot participate in a cycle either.
 var g_diff_mu: std.Io.Mutex = std.Io.Mutex.init;
+
+/// The thread running the frame loop. A few cross-model paths are reachable from
+/// both the UI thread and a worker, and may only WAIT on the UI thread's own
+/// work from a worker (see `awaitDeferredRelease`).
+var g_ui_thread: std.Thread.Id = 0;
 
 /// on_change: fired every drag-motion frame. The meter already mutated
 /// g_split/g_limit in place; motion repaints on its own, so this is a no-op (we
@@ -553,6 +565,7 @@ pub fn run(init: std.process.Init) !void {
     g_gpa = std.heap.smp_allocator;
     g_io = init.io;
     g_environ = init.environ_map;
+    g_ui_thread = std.Thread.getCurrentId();
 
     // Parse CLI. `--config <path>` overrides the settings-file location (handy
     // for testing without touching the user's real config); `--model <path>`
@@ -896,6 +909,44 @@ fn configuredSupportsThinking() bool {
     return g_think_probe_result;
 }
 
+/// Whether the weight-noise controls should be offered at all: the loaded model's
+/// answer when there is one, otherwise the CONFIGURED file's.
+///
+/// The pre-load half is the point. tp-gui loads the LLM lazily, on the first
+/// message, so gating on a live session hid the controls during exactly the window
+/// someone wants to set them up in — you had to send a message before you could
+/// choose how the reply would be perturbed. Same shape as `visionAvailable` and
+/// `configuredSupportsThinking`, for the same reason.
+fn noiseAvailable() bool {
+    if (!g_loading.load(.acquire)) if (g_session) |s| return s.weightNoiseSupported();
+    return configuredSupportsWeightNoise();
+}
+
+/// Whether the *configured* checkpoint would honor weight noise, by reading its
+/// header. Re-probed whenever the configured path changes.
+fn configuredSupportsWeightNoise() bool {
+    const path = g_config.llm_model.opt() orelse {
+        g_noise_probe_valid = false;
+        g_noise_probe_len = 0;
+        return false;
+    };
+    if (!(g_noise_probe_valid and g_noise_probe_len == path.len and
+        std.mem.eql(u8, g_noise_probe_path[0..g_noise_probe_len], path)))
+    {
+        g_noise_probe_result = probeWeightNoise(path);
+        @memcpy(g_noise_probe_path[0..path.len], path);
+        g_noise_probe_len = path.len;
+        g_noise_probe_valid = true;
+    }
+    return g_noise_probe_result;
+}
+
+fn probeWeightNoise(path: []const u8) bool {
+    var gg = tp.Gguf.open(g_gpa, g_io, path) catch return false;
+    defer gg.deinit();
+    return tp.llm.session.weightNoiseSupported(&gg);
+}
+
 /// TP_AUTO_MESSAGE: send one message through the REAL app path as soon as a
 /// session exists, then exit once it finishes. `chat-probe` drives the session
 /// directly and so misses everything the app wraps around it (the diffuser, the
@@ -1023,6 +1074,9 @@ fn frame() void {
     // Settings is the one view that takes the whole window: it is a mode, not a
     // place in the workspace, and it has its own way back.
     if (g_view == .config) {
+        // The view is handed a config, not a session, so the capability answer is
+        // pushed rather than asked for. Same answer the composer gates on.
+        config_view.g_noise_supported = noiseAvailable();
         config_view.render(&g_config, .{ .apply = applyConfig, .cancel = cancelConfig });
         return;
     }
@@ -1769,6 +1823,127 @@ fn applyFraming() void {
     g_config.save(g_io, g_gpa, g_environ, g_config_path) catch |err| std.log.err("save settings failed: {t}", .{err});
 }
 
+/// The weight-noise curve's shape preview: the curve sampled first-layer-to-head
+/// and normalized to its own peak, plus whether it parsed. Recomputed only when
+/// the expression text changes, not every frame — `noise_curve` re-parses on each
+/// evaluation and says not to call it from a hot path.
+var g_noise_shape: [20]f32 = @splat(0);
+var g_noise_shape_src: [config.max_noise_curve]u8 = @splat(0);
+var g_noise_valid: bool = true;
+/// Whether the active shape reads `a`, so the composer can dim an amount field
+/// that would do nothing. Recomputed with the shape.
+var g_noise_amount_live: bool = true;
+
+fn noiseShape() []const f32 {
+    const cur = g_config.weight_noise_curve.slice();
+    if (std.mem.eql(u8, std.mem.sliceTo(&g_noise_shape_src, 0), cur)) return &g_noise_shape;
+    @memset(&g_noise_shape_src, 0);
+    @memcpy(g_noise_shape_src[0..cur.len], cur);
+
+    g_noise_valid = cur.len != 0 and blk: {
+        tp.noise_curve.validate(cur) catch break :blk false;
+        break :blk true;
+    };
+    g_noise_amount_live = g_noise_valid and tp.noise_curve.respondsToAmount(cur);
+    @memset(&g_noise_shape, 0);
+    if (!g_noise_valid) return &g_noise_shape;
+
+    const n: f32 = @floatFromInt(g_noise_shape.len - 1);
+    var peak: f32 = 0;
+    for (&g_noise_shape, 0..) |*o, i| {
+        const t = @as(f32, @floatFromInt(i)) / n;
+        // a = 1: the preview is normalized to its own peak anyway, so it draws the
+        // SHAPE, which is what the amount field is not telling you.
+        o.* = tp.noise_curve.sanitize(tp.noise_curve.eval(cur, .{ .t = t, .a = 1 }) catch 0);
+        peak = @max(peak, o.*);
+    }
+    // Normalized, so a 0.005 curve and a 0.05 one of the same shape draw the same
+    // picture. The amplitude is already legible as the leading coefficient.
+    if (peak > 0) for (&g_noise_shape) |*o| {
+        o.* /= peak;
+    };
+    return &g_noise_shape;
+}
+
+/// Push the configured weight noise to the live backend, and persist.
+///
+/// Applied LIVE rather than at a turn boundary: the curve lands in a table the
+/// decode kernels re-read at every launch, so turning the knob mid-reply takes
+/// effect on the next token. Gated on `g_loading` for the same reason every other
+/// `g_session` touch is: the session is being torn down and rebuilt under us.
+fn applyWeightNoise() void {
+    if (!g_loading.load(.acquire)) {
+        if (g_session) |s| {
+            s.be.weight_noise.amount = g_config.weight_noise_amount;
+            s.be.weight_noise.setCurve(
+                if (g_config.weight_noise) g_config.weight_noise_curve.slice() else "",
+            );
+        }
+    }
+    g_config.save(g_io, g_gpa, g_environ, g_config_path) catch |err| std.log.err("save settings failed: {t}", .{err});
+}
+
+fn composerNoiseToggle(_: *anyopaque) void {
+    g_config.weight_noise = !g_config.weight_noise;
+    g_config_baseline.weight_noise = g_config.weight_noise;
+    applyWeightNoise();
+}
+
+/// Which library entry the composer dropdown has selected. Resynced from the
+/// active curve every frame by `noiseNames`, so editing the expression in Settings
+/// moves the composer's label without the two needing to talk.
+var g_noise_sel: usize = 0;
+var g_noise_names: [config.max_noise_curves + 1][]const u8 = undefined;
+
+/// The dropdown's entries: the saved library, plus a trailing "custom" when the
+/// active curve is not one of them (typed in Settings). Selecting that entry is a
+/// no-op, it exists so the chip can name what is actually live.
+fn noiseNames() []const []const u8 {
+    const cur = g_config.weight_noise_curve.slice();
+    const saved = g_config.noise_curves.slice();
+    for (saved, 0..) |*c, i| g_noise_names[i] = c.name.slice();
+    if (g_config.noiseCurveMatching(cur)) |i| {
+        g_noise_sel = i;
+        return g_noise_names[0..saved.len];
+    }
+    g_noise_names[saved.len] = "custom";
+    g_noise_sel = saved.len;
+    return g_noise_names[0 .. saved.len + 1];
+}
+
+/// The amount field's text, held across frames like `g_mp_buf`.
+var g_noise_amt_buf: [16]u8 = [_]u8{0} ** 16;
+
+/// The amount was committed. Clamped generously: past ~0.8 a front-loaded curve
+/// only produces fluent nonsense, but watching that happen is the point of the
+/// knob being exposed.
+fn composerNoiseAmount(_: *anyopaque) void {
+    const typed = std.mem.trim(u8, std.mem.sliceTo(&g_noise_amt_buf, 0), " \t");
+    const v = std.fmt.parseFloat(f32, typed) catch return;
+    const clamped = std.math.clamp(v, 0, 1.0);
+    g_config.weight_noise_amount = clamped;
+    g_config_baseline.weight_noise_amount = clamped;
+    // Applied even when the value did not change. An early return on
+    // `clamped == g_config.weight_noise_amount` reads as a harmless optimization
+    // and is not: it assumes the backend already holds what the config says, and
+    // the one situation where a user retypes the number they can already see is
+    // exactly the situation where that has stopped being true. It made a session
+    // whose backend had drifted impossible to correct from the composer at all.
+    applyWeightNoise();
+}
+
+/// A saved curve was picked: it becomes the active one.
+fn composerNoisePick(_: *anyopaque) void {
+    const saved = g_config.noise_curves.slice();
+    if (g_noise_sel >= saved.len) return; // the "custom" entry names, it does not set
+    g_config.weight_noise_curve = saved[g_noise_sel].curve;
+    g_config_baseline.weight_noise_curve = g_config.weight_noise_curve;
+    // Picking a curve turns the noise ON: reaching for a shape is asking for it.
+    g_config.weight_noise = true;
+    g_config_baseline.weight_noise = true;
+    applyWeightNoise();
+}
+
 fn composerQuick(_: *anyopaque, _: usize) void {
     openSettings();
 }
@@ -1994,9 +2169,81 @@ fn appCoordinator() diffuser.VramCoordinator {
 // underneath its own worker (every teardown path joins the worker first), and
 // taking it here would invert that order.
 fn llmForeignReclaim(_: *anyopaque, needed: u64) u64 {
+    var got: u64 = 0;
+    {
+        g_diff_mu.lockUncancelable(g_io);
+        defer g_diff_mu.unlock(g_io);
+        got = g_arbiter.requestRoom(.llm, needed);
+    }
+    if (got != 0) return got;
+    // The lock is DROPPED before waiting, and that is the whole point: the
+    // release below is enacted by the UI thread, which needs `g_diff_mu` to do
+    // it. Waiting while holding it deadlocks until the timeout.
+    return awaitDeferredRelease(needed);
+}
+
+/// The rung between "the image model accepted a release" and "the allocation
+/// fails": wait for a release the arbiter asked for to actually be enacted, and
+/// report the bytes it returned.
+///
+/// `Diffuser.requestRelease` is a REQUEST — the free happens in `fulfillRelease`
+/// on the UI thread, because the session pointer has one writer and its readers
+/// load it unlocked. So `Arbiter.requestRoom` returns 0 for a release that was
+/// accepted and is about to happen, which is indistinguishable, to the caller,
+/// from a peer that had nothing to give. For `residency.promoteBack` that is
+/// fine: it allocated nothing and picks the room up at its next boundary poll.
+/// For the OOM ladder it is not — there is no next poll, the allocation fails
+/// now, and the turn dies. It died for 16 MiB that the log shows arriving in the
+/// very next line.
+///
+/// Only ever from a WORKER. On the UI thread this would wait on work only that
+/// same thread can do; its caller there (`promoteBack` under `applyMeterPolicy`)
+/// is the one that already has a next poll.
+fn awaitDeferredRelease(needed: u64) u64 {
+    if (std.Thread.getCurrentId() == g_ui_thread) return 0;
+
+    // Reads under `g_diff_mu`, which `maybeReleaseDiffuser` holds across BOTH
+    // clearing the request flag and the teardown. So every observation here is
+    // of a settled state — release pending, or release done — never of the
+    // half-torn-down middle.
+    const before = pendingReleaseUsage() orelse return 0;
+    const deadline = std.Io.Clock.real.now(g_io).nanoseconds + release_wait_ns;
+    while (std.Io.Clock.real.now(g_io).nanoseconds < deadline) {
+        std.Io.sleep(g_io, .{ .nanoseconds = std.time.ns_per_ms }, .real) catch {};
+        if (pendingReleaseUsage() != null) continue; // still queued for the UI thread
+        const freed = before -| diffusionUsage();
+        std.log.info("[vram] llm waited for the peer's release: {d} MiB returned (needed {d} MiB)", .{
+            freed >> 20, needed >> 20,
+        });
+        return freed;
+    }
+    std.log.warn("[vram] llm waited {d} ms for the peer's release and it never landed; the allocation will fail", .{
+        release_wait_ns / std.time.ns_per_ms,
+    });
+    return 0;
+}
+
+/// How long a worker waits for the UI thread to enact a release. Generous
+/// against the work involved (freeing a multi-GiB pipeline, behind at most one
+/// frame, since `requestRelease` wakes the loop) and it is not a poll interval:
+/// the wait ends the moment the release lands, and the only way to reach the
+/// deadline is a UI thread that has stopped servicing frames, in which case
+/// failing the allocation is the right answer.
+const release_wait_ns: i96 = 2 * std.time.ns_per_s;
+
+/// The image model's residency if a release is pending for it, else null (which
+/// covers "no engine" too: nothing is coming, so there is nothing to wait for).
+fn pendingReleaseUsage() ?u64 {
     g_diff_mu.lockUncancelable(g_io);
     defer g_diff_mu.unlock(g_io);
-    return g_arbiter.requestRoom(.llm, needed);
+    return g_arbiter.pendingRelease(.llm);
+}
+
+fn diffusionUsage() u64 {
+    g_diff_mu.lockUncancelable(g_io);
+    defer g_diff_mu.unlock(g_io);
+    const p = g_arbiter.diffusion orelse return 0;
+    return p.usage();
 }
 
 /// Main-loop hook: enact a release the LLM asked for through the arbiter's rung
@@ -3438,14 +3685,20 @@ fn renderInput(s: ?*chat.Session) void {
     // the multiline entry turns it into a newline; Shift+Enter falls through as
     // a newline. Disabled while generating so the box stays editable.
     if (!busy) {
-        // Paste (Ctrl/Cmd+V) an image from the clipboard: intercept before the
-        // text entry so an image on the clipboard attaches instead of a bogus
-        // text paste. Text-only clipboards fall through untouched. Handled
-        // regardless of focus so it works right after clicking into chat.
+        // Paste an image from the clipboard: intercept before the text entry so
+        // an image on the clipboard attaches instead of a bogus text paste.
+        // Text-only clipboards fall through untouched. Handled regardless of
+        // focus so it works right after clicking into chat.
+        //
+        // Matched against dvui's own "paste" bind rather than a literal Ctrl+V,
+        // so every chord the text entry pastes on also attaches an image:
+        // Ctrl+V, Cmd+V, and Shift+Insert. Spelling the chord out here meant
+        // Shift+Insert reached the entry, which pasted the clipboard's TEXT (so
+        // an image clipboard did nothing at all).
         for (dvui.events()) |*e| {
             if (e.handled or e.evt != .key) continue;
             const k = e.evt.key;
-            if (k.code == .v and k.action == .down and (k.mod.control() or k.mod.command())) {
+            if (k.action == .down and k.matchBind("paste")) {
                 if (tryPasteClipboardImage()) e.handled = true;
             }
         }
@@ -3512,11 +3765,29 @@ fn renderInput(s: ?*chat.Session) void {
     const pressed = bubbles.inputEnd(&frame_box, .{
         .busy = busy,
         .can_attach = visionAvailable(),
+        // Gated on CAPABILITY, not on a live session: the model is lazy-loaded, so
+        // requiring one hid these controls until after the first message. Only a
+        // checkpoint whose arch publishes a layer index and whose linears are in a
+        // wired dtype gets them, so the affordance never promises an effect it
+        // cannot have (see `noiseAvailable`).
+        .noise = if (noiseAvailable()) .{
+            .on = g_config.weight_noise,
+            .shape = noiseShape(),
+            .valid = g_noise_valid,
+            .names = noiseNames(),
+            .sel = &g_noise_sel,
+            .amount_buf = &g_noise_amt_buf,
+            .amount = g_config.weight_noise_amount,
+            .amount_live = g_noise_amount_live,
+        } else null,
     }, .{
         .ctx = @ptrCast(&g_composer_ctx),
         .on_quick = composerQuick,
         .on_all_settings = composerAllSettings,
         .on_reference = composerReference,
+        .on_noise_toggle = composerNoiseToggle,
+        .on_noise_pick = composerNoisePick,
+        .on_noise_amount = composerNoiseAmount,
     });
     if (pressed) {
         if (busy) {

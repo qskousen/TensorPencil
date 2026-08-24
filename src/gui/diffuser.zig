@@ -1312,6 +1312,9 @@ pub const Diffuser = struct {
     fn vpReleaseAll(ctx: *anyopaque) void {
         fromCtx(ctx).requestRelease();
     }
+    fn vpReleasePending(ctx: *anyopaque) bool {
+        return fromCtx(ctx).releaseRequested();
+    }
     fn fromCtx(ctx: *anyopaque) *Diffuser {
         return @ptrCast(@alignCast(ctx));
     }
@@ -1323,6 +1326,7 @@ pub const Diffuser = struct {
         .busy = vpBusy,
         .applyBudget = vpApply,
         .releaseAll = vpReleaseAll,
+        .releasePending = vpReleasePending,
     };
 
     /// This image model as a `tp.vram.Participant` the app-level arbiter can drive.

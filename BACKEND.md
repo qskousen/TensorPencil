@@ -616,6 +616,7 @@ half-computed state), while cancel unwinds between layers via `engine.publishCan
 | Embedding gather | model | ⚠️ host-side | on-device `opEmbedGather*` | ↤ |
 | **Sampling** (argmax/temp/top-k/top-p/min-p + penalties) | ✅ `llm/sample.zig` | ✅ argmax/top-k select (qwen3) | ✅ (qwen3/qwen35/gemma3/gemma4) | ↤ |
 | **Turn-boundary checkpoint / rollback** | ❌ | ❌ | ✅ qwen3/qwen35/gemma3/gemma4 | ↤ |
+| **Weight noise** (`--weight-noise`, per-layer curve) | ❌ | ❌ | ✅ gemma4, q4_k/q5_k/q6_k/iq4_xs | ↤ |
 
 **GPU sampling is a candidate select, not a full sampler.** The device runs argmax or a top-k
 reduce (`stepArgmax`/`stepSelect`) and downloads only the candidates; the CPU tail (temperature
@@ -636,6 +637,98 @@ a pure `truncate(q)`); **qwen35** the DeltaNet conv/ssm state + M-RoPE position 
 rows, so `len` rollback alone cannot rewind past the ring slack). Snapshot and restore are
 residency-aware — layers may migrate between the two. Steppers without the API fall back to a
 full transcript re-prefill.
+
+### Weight noise (`--weight-noise`, tp-gui's composer toggle)
+
+Perturbs the block-quant weights while generating: each super-block's `d` (and `dmin`) is
+multiplied by `1 + sigma*u`, u uniform in [-1,1], redrawn every forward pass. One draw covers
+a block's 256 weights, so it moves the model's FUNCTION rather than its logits, and the token
+ranking itself can change while grammar stays intact. `cuda/wnoise.zig` holds the one hash and
+the PTX snippet every kernel below shares.
+
+**Shape and amount are separate knobs.** A curve may read `a`, which
+`--weight-noise-amount` (default 1) and tp-gui's composer field set, so the
+expression says WHERE the noise goes and one number says HOW MUCH — nobody should
+have to edit an expression to turn the amount down. `a*(1-t)^2` at amount 0.4 is
+bit-identical to the literal `0.4*(1-t)^2` (verified: same greedy output). A curve
+that never mentions `a` ignores the knob, which `noise_curve.respondsToAmount`
+detects by MEASUREMENT (evaluating at two amounts) rather than by scanning for the
+token, so the UI can dim an inert field instead of letting it do nothing quietly.
+
+In tp-gui the shapes are a saved library: the composer carries a toggle, a shape
+sparkline, a dropdown of named shapes and the amount field, while the expression
+itself is written in Settings (UI.md 13). `--weight-noise` takes the same
+expression, so the CLI and the GUI describe schedules identically.
+
+**Sigma is a curve over depth, not a constant.** `core/noise_curve.zig` evaluates an
+expression in `t` (0 at the first decoder layer, exactly 1 at the LM head) once per layer into
+`WeightNoise.table`; a launch reads the slot for the layer it belongs to, published by
+`transformer_gpu.decoderLayer*` via the duck-typed `noiseAtLayer`, and `lmHead` selects the
+head slot. A bare number is a flat curve.
+
+**MEASURED, gemma4 31B q4_k, greedy, matched noise budget** (mirror-image curves: same peak,
+same total, opposite placement):
+
+| shape / amount | result |
+|---|---|
+| `a*t^2` @ 0.2 (back-loaded) | token corruption: `ownS-white`, `thePLC aingSL {L de gloom` |
+| `a*(1-t)^2` @ 0.2 (front-loaded) | fluent, and rewords vs the control |
+| `a*(1-t)^2` @ 0.03 | indistinguishable from the control on this prompt |
+| `a*(1-t)^2` @ 0.4 | a materially different answer, still clean prose |
+| `max(0, a*(1-t/0.4))` @ 0.6 | coherent with noise on the first 40% of the stack only |
+| `a*(1-t)^2` @ 0.8 | collapses to token salad |
+| `a*(1-t)^3` @ 0.8 | breaks STRUCTURALLY instead: fluent fragments in a loop |
+
+So placement dominates amplitude, and the two failure modes are distinct: noise near the head
+lands on token selection and corrupts glyphs, while noise early destroys the plan and the late
+layers faithfully render the wreckage. A front-loaded curve therefore takes a peak sigma
+~10x what a flat one tolerates (~0.4-0.6 vs ~0.05), which is the reason the knob is a curve.
+
+sigma 0 everywhere leaves `d * 1.0`, so off is bit-identical (verified token-identical against
+the pre-change kernels on a 31B q4_k greedy run), and neither the off nor the on path costs
+measurable throughput: sigma 0 and sigma 0.02 interleave inside run-to-run scatter against the
+pre-change build (pp ~270 tok/s, tg ~25 tok/s, 1824-token prompt, RTX 3090). No separate
+noise-free kernel variant is warranted.
+
+The draw keys on the block's byte offset WITHIN its weight plus a host-folded
+(seed, forward index, weight id), NOT an absolute device address: `cuMemAlloc` shuffles
+addresses per process, and an address-keyed sweep produces a fresh unrepeatable model at every
+sigma. `--weight-noise-seed` makes a run reproducible.
+
+**Two predicates answer "would this do anything", and callers must use both.**
+`cuda.Backend.weightNoiseSupported(dt)` is the dtype half and lives with the
+kernels, because that is exactly what it describes: which kernels were wired.
+`llm.session.archSupportsWeightNoise(arch)` is the arch half — a stepper honors
+noise only if it declares `noiseAtLayer` (so `transformer_gpu.decoderLayer*` can
+tell it which layer is launching) and ticks the stream in its forward.
+`llm.session.weightNoiseSupported(gguf)` combines them, taking a majority over the
+block-quant weights under `layers.` rather than probing one tensor, since a mixed
+file is normal (this repo's 31B q4_k carries 11 q5_k tensors). tp-gui hides the
+controls when it is false; tp-llm warns. A test in `gui/chat.zig` fails if the arch
+list and the steppers' `noiseAtLayer` declarations disagree in either direction.
+
+⚠️ `Gguf.names()` returns CANONICAL names, so per-layer tensors are `layers.N.…`,
+not the file's own `blk.N.…`. Scanning for the raw spelling matches nothing and
+reports every checkpoint unsupported.
+
+Honoring it today:
+
+| kernel | path | dtypes |
+|---|---|---|
+| `gemv_q4_k_q8n`, `gemv_q5_k_q8n` | decode + grouped prefill | q4_k, q5_k |
+| `gemv_q5_k_q8` | decode | q5_k |
+| `gemv_q6_k` | LM head (tied `token_embd`) | q6_k |
+| `buildMmqPipeQ4K` | batched prefill MMQ | q4_k, q5_k, iq4_xs |
+
+Every MMQ entry declares the two parameters (`mmq_params`, so one launcher fits all), but only
+`buildMmqPipeQ4K` reads them: the q6_k / q8_0 / q1_0 / q2_0 pipes and the older
+`buildMmqQ4K` ignore sigma, as do the dequant-to-f16 fallback, the fp8/bf16/int8-convrot GEMMs,
+and every non-gemma4 stepper (only `gemma4_cuda.forwardRows` ticks the stream, and only
+`gemma4_cuda` declares `noiseAtLayer`). The embedding GATHER is a separate kernel from
+`gemv_q6_k` — gemma4 embeds host-side entirely — so a tied `token_embd` is perturbed as the LM
+head and left alone as the embedding table. ⚠️ Noise on `attn_k`/`attn_v` enters the KV cache
+and persists for the rest of the sequence, so those two drift cumulatively while everything
+else is resampled per forward.
 
 ### Speculative decoding (qwen3 only)
 

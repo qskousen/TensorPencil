@@ -28,6 +28,8 @@ const usage =
     \\              [--repeat-penalty <r>] [--repeat-last-n <n>]
     \\              [--presence-penalty <p>] [--frequency-penalty <p>]
     \\              [--seed <n>] [--greedy] [--no-think] [--canonical-template]
+    \\              [--weight-noise <curve>] [--weight-noise-amount <a>]
+    \\              [--weight-noise-seed <n>]
     \\              [--spec-k <n>] [--draft-model <qwen3.safetensors>]
     \\              [--eagle <eagle3.safetensors>] [--tree <nodes>]
     \\              [--vram-budget <GiB>] [--cpu-layers tail|attn] [--offload-grow]
@@ -63,6 +65,33 @@ const usage =
     \\the model emits a thought block before its answer. --no-think disables it
     \\(the turn is primed with an empty thought so the model answers directly);
     \\--think forces it on. No effect on non-reasoning models (e.g. Gemma 3).
+    \\--weight-noise perturbs the block-quant weights DURING generation: every
+    \\256-weight super-block's scale is multiplied by 1 + sigma*u, u uniform in
+    \\[-1,1], redrawn on every forward pass. Unlike temperature, which can only
+    \\reweight the distribution the weights already produced, this samples a
+    \\nearby MODEL, so the token ranking itself moves while grammar stays intact.
+    \\The argument is a CURVE, not a constant: an expression in `t`, the
+    \\normalized layer depth, 0 at the first decoder layer and exactly 1 at the
+    \\LM head (`l` and `n` give absolute positions; abs sqrt exp log sin cos min
+    \\max clamp pow and pi are available; there is no conditional, use max/clamp
+    \\to gate). A bare number is a flat curve.
+    \\WHERE the noise sits matters more than how much. At a matched budget, late
+    \\noise corrupts tokens (glyph salad) while early noise of the same size
+    \\leaves prose fluent and changes what the model is reasoning about, so a
+    \\front-loaded curve takes a far bigger amplitude than a flat one:
+    \\  0.03                     flat, mild rephrasing
+    \\  0.08*(1-t)^2             front-loaded, clearly different wording
+    \\  0.4*(1-t)^2              a different answer, still clean prose
+    \\  max(0, 0.6*(1-t/0.4))    noise on the first 40% of the stack only
+    \\A curve may also read `a`, which --weight-noise-amount sets (default 1), so
+    \\the shape and the amount stay separate knobs: --weight-noise "a*(1-t)^2"
+    \\--weight-noise-amount 0.4 is the third line above. A curve that never
+    \\mentions `a` simply ignores the amount.
+    \\Pushed too far the failure mode is structural, not lexical: fluent
+    \\sentences with a broken plan (0.8*(1-t)^3 loops). 0 or "" = off, and off
+    \\is bit-identical. CUDA backends only, on the kernels BACKEND.md lists.
+    \\--weight-noise-seed bases the stream: the same seed, curve and prompt
+    \\reproduce a generation exactly, which is what makes a sweep readable.
     \\--canonical-template ignores the model's own embedded chat template and
     \\renders a known-good one instead: Google's upstream template for Gemma 4,
     \\froggeric's fixed template for Qwen 3.5/3.6/3.8. For finetunes and
@@ -218,6 +247,20 @@ pub fn main(init: std.process.Init) !void {
                 try stdout.flush();
                 return error.InvalidArgument;
             };
+        } else if (std.mem.eql(u8, a, "--weight-noise")) {
+            const expr = try nextArg(args, &i);
+            TensorPencil.noise_curve.validate(expr) catch {
+                try stdout.print("--weight-noise: not a valid curve: {s}\n", .{expr});
+                try stdout.print("  a number (0.03) or an expression in t, 0 at the first layer to 1 at the LM head,\n", .{});
+                try stdout.print("  e.g. 0.08*(1-t)^2 . abs sqrt exp log sin cos min max clamp pow, pi, and l/n.\n", .{});
+                try stdout.flush();
+                return error.InvalidArgument;
+            };
+            llm.session.weight_noise_curve = expr;
+        } else if (std.mem.eql(u8, a, "--weight-noise-amount")) {
+            llm.session.weight_noise_amount = try std.fmt.parseFloat(f32, try nextArg(args, &i));
+        } else if (std.mem.eql(u8, a, "--weight-noise-seed")) {
+            llm.session.weight_noise_seed = try std.fmt.parseInt(u32, try nextArg(args, &i), 10);
         } else if (std.mem.eql(u8, a, "--canonical-template")) {
             g_canonical_template = true;
         } else if (std.mem.eql(u8, a, "--spec-k")) {
@@ -302,6 +345,21 @@ pub fn main(init: std.process.Init) !void {
     const fixed_session = opts.spec_k > 0 or opts.tree_nodes > 0 or draft_path != null or eagle_path != null;
     opts.max_context = max_context_arg orelse
         (if (fixed_session or backend == .vulkan) 4096 else @min(trainedContext(&st), auto_context_cap));
+
+    // --weight-noise on a checkpoint nothing will read it from is a silent no-op,
+    // which for a knob whose whole purpose is measuring an effect is the worst
+    // failure. Warn rather than refuse: it costs nothing to run without it, and the
+    // reason is worth saying out loud (see BACKEND.md 6).
+    if (llm.session.weight_noise_curve.len != 0 and st == .gguf and
+        !llm.session.weightNoiseSupported(&st.gguf))
+    {
+        const arch = st.gguf.getStr("general.architecture") orelse "?";
+        if (!llm.session.archSupportsWeightNoise(arch))
+            try stdout.print("[warn] --weight-noise is ignored: no {s} stepper publishes a per-layer sigma (only gemma4 does today)\n", .{arch})
+        else
+            try stdout.print("[warn] --weight-noise is ignored: this {s} checkpoint's linears are in a dtype with no noised kernels (q4_k/q5_k/q6_k/iq4_xs are wired; a QAT q4_0 file is not)\n", .{arch});
+        try stdout.flush();
+    }
 
     // Architecture dispatch: qwen35 (hybrid DeltaNet) has its own model and
     // steppers (cpu / zig-cuda / cuda), and no speculative decoding (the

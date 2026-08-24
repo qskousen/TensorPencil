@@ -65,6 +65,16 @@ pub const Activation = transformer.Activation;
 /// One decoder layer, driven by the arch `spec`, over the stepper's buffers.
 /// `l` is the layer index (into the KV cache), `seq` the rows this call
 /// forwards, `pos0` the absolute base position for rope / cache append.
+/// Tell a stepper's backend which layer the coming launches belong to, so a
+/// depth-dependent weight-noise curve reads the right sigma (see
+/// `cuda/backend.WeightNoise`). Set in BOTH halves rather than in `decoderLayer`,
+/// because the Vulkan bidirectional image prefill drives the halves directly and
+/// would otherwise leave the index on whatever layer ran last. Duck-typed: the
+/// steppers that have no such backend simply do not declare it.
+fn noiseAtLayer(st: anytype, l: usize) void {
+    if (comptime @hasDecl(@TypeOf(st.*), "noiseAtLayer")) st.noiseAtLayer(l);
+}
+
 pub fn decoderLayer(comptime spec: LayerSpec, st: anytype, layer: anytype, l: usize, seq: usize, pos0: usize) !void {
     const trace = (comptime tracedStepper(@TypeOf(st.*))) and traceOn();
     // Layer 0's "before" is the embedding, so a divergence visible there is
@@ -84,6 +94,7 @@ pub fn decoderLayer(comptime spec: LayerSpec, st: anytype, layer: anytype, l: us
 /// single-query kernel can't see forward within a batch otherwise. `st.q` holds
 /// the rope'd Q on return.
 pub fn decoderLayerQKV(comptime spec: LayerSpec, st: anytype, layer: anytype, l: usize, seq: usize, pos0: usize) !void {
+    noiseAtLayer(st, l);
     // The geometry-sensitive ops (q/k/v projections, q/k/v norms) take `l`
     // because per-layer-geometry archs (gemma4) vary head_dim / KV width by
     // layer; uniform archs ignore it.
@@ -109,6 +120,7 @@ pub fn decoderLayerQKV(comptime spec: LayerSpec, st: anytype, layer: anytype, l:
 /// projection, residual, and the MLP block. Expects `decoderLayerQKV` to have
 /// run (K/V committed, `st.q` = rope'd Q).
 pub fn decoderLayerAttnMlp(comptime spec: LayerSpec, st: anytype, layer: anytype, l: usize, seq: usize, pos0: usize) !void {
+    noiseAtLayer(st, l);
     // --- Attention ---
     const trace = (comptime tracedStepper(@TypeOf(st.*))) and l == 0 and traceOn();
     try st.attention(l, seq, pos0);

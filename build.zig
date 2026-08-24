@@ -426,10 +426,13 @@ pub fn build(b: *std.Build) void {
             if (b.args) |args| run_md_probe.addArgs(args);
             md_probe_step.dependOn(&run_md_probe.step);
 
-            // ui-probe: renders the whole chat workspace from canned data to a
-            // PNG (`zig build ui-probe -- out.png [w h]`). No model, no GPU, no
-            // engine — the failure modes of this screen are all visual, and
-            // driving the real app to see them needs a loaded checkpoint.
+            // ui-probe: renders the whole chat workspace (or, with --settings, the
+            // settings form) from canned data to a PNG
+            // (`zig build ui-probe -- out.png [w h] [--states|--settings]`). No
+            // model, no GPU, no engine — the failure modes of this screen are all
+            // visual, and driving the real app to see them needs a loaded
+            // checkpoint. It LINKS TensorPencil (the settings form inspects
+            // checkpoints and evaluates noise curves) but starts nothing.
             const ui_probe_step = b.step("ui-probe", "Render the chat workspace to a PNG from canned data");
             const ui_probe_exe = b.addExecutable(.{
                 .name = "ui-probe",
@@ -442,6 +445,7 @@ pub fn build(b: *std.Build) void {
                     .imports = &.{
                         .{ .name = "dvui", .module = dvui_dep.module("dvui_sdl3") },
                         .{ .name = "backend", .module = dvui_dep.module("sdl3") },
+                        .{ .name = "TensorPencil", .module = mod },
                     },
                 }),
             });

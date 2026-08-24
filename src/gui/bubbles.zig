@@ -401,6 +401,41 @@ pub const Composer = struct {
     busy: bool = false,
     /// Hides the reference affordance when the model cannot see images.
     can_attach: bool = true,
+    /// Weight-noise controls, beside the entry. Absent when the loaded model
+    /// cannot take it (no CUDA backend), so the affordance never lies about
+    /// having an effect.
+    noise: ?Noise = null,
+};
+
+/// The composer's weight-noise controls: a lit/unlit toggle, a preview of the
+/// active curve's shape, and a dropdown to pick one from the saved library.
+///
+/// Editing an expression lives in Settings, not here. A curve worth using is
+/// something like `max(0, 0.6*(1-t/0.4))`, which is not a thing to retype in a
+/// composer chip; what belongs here is flipping between the ones you keep, which
+/// is a per-message decision.
+///
+/// `shape` is the active curve sampled first-layer-to-LM-head and normalized to
+/// its own peak, so the preview answers "what shape" and the name answers "which
+/// one". `names` is the library plus, when the active curve matches none of it, a
+/// trailing entry for the typed-in one; `sel` indexes it and is mutated in place.
+pub const Noise = struct {
+    on: bool,
+    shape: []const f32,
+    /// The active curve parses. A malformed one is noise OFF, which is invisible
+    /// without saying so: a half-typed expression looks exactly like a flat 0.
+    valid: bool,
+    names: []const []const u8,
+    sel: *usize,
+    /// The amount field's text, held across frames because it is typed into, and
+    /// `amount` is what the config holds, redisplayed whenever it is not being
+    /// edited. Shape says where the noise goes, this says how much.
+    amount_buf: []u8,
+    amount: f32,
+    /// The active shape actually reads `a`. A curve with its amplitude baked in
+    /// ignores the field, so the field says so by dimming rather than by quietly
+    /// doing nothing.
+    amount_live: bool,
 };
 
 pub const ComposerActions = struct {
@@ -408,7 +443,15 @@ pub const ComposerActions = struct {
     on_quick: *const fn (*anyopaque, usize) void,
     on_all_settings: *const fn (*anyopaque) void,
     on_reference: *const fn (*anyopaque) void,
+    /// The noise toggle was clicked.
+    on_noise_toggle: *const fn (*anyopaque) void = noopCtx,
+    /// A different saved curve was picked from the dropdown.
+    on_noise_pick: *const fn (*anyopaque) void = noopCtx,
+    /// The amount field was committed (Enter, or focus left it).
+    on_noise_amount: *const fn (*anyopaque) void = noopCtx,
 };
+
+fn noopCtx(_: *anyopaque) void {}
 
 /// The quick-settings row. These three are the only knobs a beginner needs;
 /// everything else lives in Studio, and the link says so.
@@ -481,8 +524,73 @@ pub fn inputBegin(src: std.builtin.SourceLocation, focused: bool) InputFrame {
     }) };
 }
 
+/// The weight-noise pair inside the input frame: a toggle that reads as ON by
+/// filling (not by a caption change, which is unreadable at chip size), and the
+/// strength field beside it, dimmed while off so it is visibly inert rather than
+/// missing. Deliberately here and not in the quick-settings row above: this is a
+/// knob you reach for mid-conversation, per message, the way you reach for Send.
+fn noiseControls(src: std.builtin.SourceLocation, nz: Noise, cb: ComposerActions) void {
+    var row = dvui.box(src, .{ .dir = .horizontal }, .{ .gravity_y = 0.5, .margin = .{ .w = 8 } });
+    defer row.deinit();
+
+    if (style.chip(@src(), "noise", .{
+        .fill = if (nz.on) C.blue else C.chip,
+        .text = if (nz.on) C.text_hi else C.text_ghost,
+        .border = if (nz.on) C.blue else style.hairline,
+        .font = F.mono,
+    })) cb.on_noise_toggle(cb.ctx);
+
+    _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 4 } });
+
+    // The shape preview goes BEFORE the field, so the curve reads left to right
+    // as picture-then-formula and the field stays adjacent to the entry it edits.
+    {
+        var well = dvui.box(@src(), .{ .dir = .horizontal }, .{
+            .min_size_content = .{ .w = 46 },
+            .max_size_content = .width(46),
+            .gravity_y = 0.5,
+            .margin = .{ .w = 4 },
+        });
+        defer well.deinit();
+        style.sparkline(@src(), nz.shape, if (!nz.valid) C.amber else if (nz.on) C.blue else C.text_ghost, 20);
+    }
+
+    if (nz.names.len != 0) {
+        if (style.chipDropdown(@src(), nz.names, nz.sel, .{
+            .text = if (!nz.valid) C.amber else if (nz.on) C.text_hi else C.text_ghost,
+            .border = if (!nz.valid) C.amber else style.hairline,
+            .font = F.mono,
+        })) cb.on_noise_pick(cb.ctx);
+    }
+
+    _ = dvui.spacer(@src(), .{ .min_size_content = .{ .w = 4 } });
+
+    // How much, beside where. A single number is the one thing about this worth
+    // reaching for mid-conversation, which is why it is a field here and the
+    // expression is not.
+    const live = nz.on and nz.valid and nz.amount_live;
+    const res = style.chipInput(@src(), nz.amount_buf, "", 34, .{
+        .text_input = if (live) C.text_hi else C.text_ghost,
+        .border = style.hairline,
+        .font = F.mono,
+    });
+    // COMMIT BEFORE SYNC: on the frame focus leaves, the field has just committed
+    // and is no longer being edited, so syncing first would overwrite the typed
+    // text with the old value and then parse that.
+    if (res.committed) cb.on_noise_amount(cb.ctx);
+    if (!res.editing) {
+        var tmp: [16]u8 = undefined;
+        const want = std.fmt.bufPrint(&tmp, "{d}", .{nz.amount}) catch "";
+        if (!std.mem.eql(u8, std.mem.sliceTo(nz.amount_buf, 0), want)) {
+            @memset(nz.amount_buf, 0);
+            @memcpy(nz.amount_buf[0..@min(want.len, nz.amount_buf.len - 1)], want);
+        }
+    }
+}
+
 /// Returns true when Send was pressed. `busy` swaps it for Stop.
 pub fn inputEnd(f: *InputFrame, m: Composer, cb: ComposerActions) bool {
+    if (m.noise) |nz| noiseControls(@src(), nz, cb);
     if (m.can_attach) {
         var ref: dvui.ButtonWidget = undefined;
         ref.init(@src(), .{}, .{

@@ -258,6 +258,9 @@ pub const CudaLM = struct {
 
     pub fn init(gpa: std.mem.Allocator, be: *Backend, lm: *const gemma4.Model, cap: kvmod.Capacity) !CudaLM {
         const cfg = lm.cfg;
+        // The weight-noise curve is written in normalized depth, so it cannot be
+        // evaluated until something says how deep the stack is.
+        be.weight_noise.setDepth(cfg.n_layers);
         switch (lm.embed.dtype) {
             .bf16, .q4_0, .q8_0, .q4_k, .q5_k, .q6_k => {},
             else => return error.UnsupportedModelConfig,
@@ -1392,6 +1395,13 @@ pub const CudaLM = struct {
     /// OOM round moves a few layers to bound the retries; if nothing is left to
     /// migrate, the request genuinely can't fit and the OOM propagates.
     fn forwardRows(self: *CudaLM, x_host: []const f32, out: LogitsOut) !void {
+        // Draw the batch's weight perturbation here rather than in each of the
+        // three drivers above (step / forwardDeviceLogits / prefill) or in
+        // prefillImage: this is the one point every one of them funnels through,
+        // so a driver added later cannot silently skip it. Outside the retry loop,
+        // so an OOM retry re-runs the batch against the SAME perturbed weights.
+        // No-op while sigma is 0. See cuda/wnoise.zig.
+        self.be.weight_noise.tick();
         while (true) {
             return self.forwardRowsOnce(x_host, out) catch |err| switch (err) {
                 error.DeviceOutOfMemory, error.OutOfMemory => {
@@ -1478,8 +1488,18 @@ pub const CudaLM = struct {
         }
     }
 
+    /// Which layer the coming launches belong to, for the weight-noise curve.
+    /// Called by `transformer_gpu.decoderLayer*`.
+    pub fn noiseAtLayer(self: *CudaLM, l: usize) void {
+        self.be.weight_noise.atLayer(l);
+    }
+
     fn lmHead(self: *CudaLM, y: Buf, x: Buf) !void {
         const head = self.lm.head;
+        // The head is the far end of the curve (t = 1), so a curve that decays in
+        // depth leaves token selection alone, which is what keeps a heavily
+        // perturbed model fluent instead of gibbering.
+        self.be.weight_noise.atHead();
         try self.be.opGemvQuant(head.dtype, y, x, head.bytes, head.scale, self.cfg.vocab, self.cfg.hidden);
     }
 

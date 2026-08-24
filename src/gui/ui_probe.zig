@@ -18,6 +18,8 @@ const Backend = @import("backend");
 const style = @import("style.zig");
 const fonts = @import("fonts.zig");
 const shell = @import("shell.zig");
+const config = @import("config.zig");
+const config_view = @import("config_view.zig");
 const bubbles = @import("bubbles.zig");
 const queue_rail = @import("queue_rail.zig");
 const meter = @import("meter.zig");
@@ -36,6 +38,13 @@ var g_rail_tab: queue_rail.Tab = .queue;
 var g_expanded: bool = true;
 var g_selected_tile: ?usize = null;
 var g_input: [256]u8 = [_]u8{0} ** 256;
+var g_noise_sel: usize = 1;
+var g_noise_amt: [16]u8 = [_]u8{0} ** 16;
+const noise_names = [_][]const u8{ "flat", "front", "front steep", "first 40%", "bell", "late (corrupts)" };
+/// The front-loaded curve the field shows, sampled for the preview: high at the
+/// first layer, zero at the LM head. Hardcoded rather than evaluated so the probe
+/// stays a pure renderer.
+const noise_shape = [_]f32{ 1.00, 0.90, 0.81, 0.72, 0.64, 0.56, 0.49, 0.42, 0.36, 0.30, 0.25, 0.20, 0.16, 0.12, 0.09, 0.06, 0.04, 0.02, 0.01, 0.00 };
 
 const conv_today = [_]shell.ConvRow{
     .{ .id = 1, .title = "Lighthouse in fog, 4 looks", .sub = "2 studio edits" },
@@ -252,7 +261,21 @@ fn composer(h: f32) void {
     });
     defer box.deinit();
 
-    const cm: bubbles.Composer = .{ .quick = &quick };
+    // Noise controls ON, so the probe shows the lit state: the toggle's whole job
+    // is to be legible as on-vs-off at chip size, which is only checkable here.
+    const cm: bubbles.Composer = .{
+        .quick = &quick,
+        .noise = .{
+            .on = true,
+            .shape = &noise_shape,
+            .valid = true,
+            .names = &noise_names,
+            .sel = &g_noise_sel,
+            .amount_buf = &g_noise_amt,
+            .amount = 0.4,
+            .amount_live = true,
+        },
+    };
     const cb: bubbles.ComposerActions = .{
         .ctx = @ptrCast(&g_ctx),
         .on_quick = noopCtxIdx,
@@ -488,6 +511,27 @@ fn statesFrame() void {
     }
 }
 
+/// The settings view over a DEFAULT config, so every section renders with the
+/// values a fresh install ships. Settings is the one screen with computed
+/// readouts in it (the noise curve's peak / head / cutoff line), and those are
+/// exactly the kind of thing that reads wrong without being checked.
+var probe_cfg: config.Config = blk: {
+    var c: config.Config = .{};
+    // Noise ENABLED, unlike a fresh install: it puts the curve preview in its lit
+    // state, which is the drawing worth watching. Its two other states are one
+    // edit away — a malformed expression goes amber, and a gated curve
+    // (`max(0, 0.6*(1-t/0.4))`) adds the cutoff clause to the readout.
+    c.weight_noise = true;
+    break :blk c;
+};
+
+fn settingsFrame() void {
+    // The app pushes this from a live capability probe; the probe has no model, so
+    // it asserts the supported case, which is the one with a section to look at.
+    config_view.g_noise_supported = true;
+    config_view.render(&probe_cfg, .{ .apply = noop, .cancel = noop });
+}
+
 // --------------------------------------------------------------------- main
 
 pub fn main(init: std.process.Init) !void {
@@ -498,11 +542,14 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
     var out_path: []const u8 = "ui_probe.png";
     var states_mode = false;
+    var settings_mode = false;
     var dims: [2]?u32 = .{ null, null };
     var seen_out = false;
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--states")) {
             states_mode = true;
+        } else if (std.mem.eql(u8, arg, "--settings")) {
+            settings_mode = true;
         } else if (std.fmt.parseInt(u32, arg, 10)) |n| {
             if (dims[0] == null) dims[0] = n else dims[1] = n;
         } else |_| {
@@ -515,7 +562,10 @@ pub fn main(init: std.process.Init) !void {
     // The mockups' own canvases, so a screenshot can be held next to them.
     const w: u32 = dims[0] orelse 1200;
     // The state sheet's height follows the number of states (head + bar each).
-    const h: u32 = dims[1] orelse (if (states_mode) @as(u32, 126 * states.len) else 705);
+    // Settings is a tall scrolled form; give it a canvas the whole thing fits on
+    // so a capture shows every section rather than whatever the scroll happens to
+    // be resting on.
+    const h: u32 = dims[1] orelse (if (states_mode) @as(u32, 126 * states.len) else if (settings_mode) @as(u32, 2600) else 705);
 
     var back = try Backend.initWindow(.{
         .io = init.io,
@@ -546,7 +596,7 @@ pub fn main(init: std.process.Init) !void {
         try win.begin(win.frame_time_ns + @as(i128, @intCast(i + 1)) * 16 * std.time.ns_per_ms);
         _ = try win.addEventMouseMotion(.{ .pt = hover_pt });
         style.install();
-        if (states_mode) statesFrame() else frame();
+        if (states_mode) statesFrame() else if (settings_mode) settingsFrame() else frame();
         _ = try win.end(.{});
     }
 
@@ -554,7 +604,7 @@ pub fn main(init: std.process.Init) !void {
     _ = try win.addEventMouseMotion(.{ .pt = hover_pt });
     style.install();
     var pic = dvui.Picture.start(dvui.windowRectPixels()) orelse return error.CaptureUnsupported;
-    if (states_mode) statesFrame() else frame();
+    if (states_mode) statesFrame() else if (settings_mode) settingsFrame() else frame();
     _ = dvui.currentWindow().endRendering(.{});
     pic.stop();
     var aw: std.Io.Writer.Allocating = try .initCapacity(gpa, 1 << 20);

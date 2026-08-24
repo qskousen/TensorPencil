@@ -22,6 +22,7 @@ pub const torch_rng = @import("torch_rng.zig");
 pub const philox_rng = @import("philox_rng.zig");
 /// Which of the two the noise comes from; both consumers dispatch through here.
 pub const noise = @import("noise.zig");
+pub const noise_curve = @import("noise_curve.zig");
 /// `numpy.random.SeedSequence`, for the Brownian-tree noise sampler below.
 pub const seed_seq = @import("seed_seq.zig");
 /// torchsde's Brownian tree, the noise source ComfyUI's SDE samplers draw from.
@@ -62,6 +63,7 @@ test {
     _ = torch_rng;
     _ = philox_rng;
     _ = noise;
+    _ = noise_curve;
     _ = seed_seq;
     _ = brownian;
     _ = tokenizer;

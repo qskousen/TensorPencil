@@ -361,6 +361,17 @@ pub const Participant = struct {
         /// such rung (its weights are pinned and its yield is layer migration,
         /// which `applyBudget` already does), so it leaves this null.
         releaseAll: ?*const fn (ctx: *anyopaque) void = null,
+        /// Has a `releaseAll` been accepted but not yet enacted? Optional: null
+        /// means this model always frees inside the `releaseAll` call, so there
+        /// is never anything to wait for.
+        ///
+        /// A model whose residency has one writer (diffusion: the UI thread owns
+        /// the session pointer, every reader loads it unlocked) cannot free from
+        /// the asker's thread, so `releaseAll` queues the work and returns with
+        /// nothing freed. Without this hook the asker cannot tell that apart from
+        /// a peer that had nothing to give, and an asker that is ABOUT TO
+        /// ALLOCATE has to treat both as failure. See `pendingRelease`.
+        releasePending: ?*const fn (ctx: *anyopaque) bool = null,
     };
 
     pub fn usage(self: Participant) u64 {
@@ -872,6 +883,31 @@ pub const Arbiter = struct {
         return freed;
     }
 
+    /// `side`'s peer is sitting on a release it accepted and has not enacted yet:
+    /// its current residency, i.e. the bytes about to come back. Null when
+    /// nothing is pending, so there is nothing to wait for.
+    ///
+    /// This is the other half of `requestRoom` for a caller that is about to
+    /// allocate. `requestRoom` reports the bytes freed BY THE TIME IT RETURNS,
+    /// which for a deferred release is zero — and a zero that means "any moment
+    /// now" is not the same answer as a zero that means "the peer has nothing",
+    /// though it reads identically. `residency.promoteBack` can conflate them
+    /// safely (it allocated nothing and re-asks at its next boundary); an OOM
+    /// ladder cannot, because for it the next step is failing the caller's turn.
+    ///
+    /// Deliberately a QUERY and not a wait: the enacting thread may need a lock
+    /// the asker is holding to reach this arbiter at all, so only the caller can
+    /// know where it is safe to block. See `app.awaitDeferredRelease`.
+    pub fn pendingRelease(self: *const Arbiter, side: Side) ?u64 {
+        const peer = (switch (side) {
+            .llm => self.diffusion,
+            .diffusion => self.llm,
+        }) orelse return null;
+        const p = peer.vtable.releasePending orelse return null;
+        if (!p(peer.ctx)) return null;
+        return peer.usage();
+    }
+
     /// The resident-weight budget the next image may pin: the room the plan
     /// leaves once the LLM is at its planned target, so it agrees with what
     /// `rebalance` is driving the LLM toward. One formula, not two: reading the LLM's
@@ -1037,6 +1073,10 @@ const MockModel = struct {
     /// (its session pointer has one writer, so the free belongs to the UI thread).
     /// Nothing is free when the rung returns.
     release_defers: bool = false,
+    /// A deferred release has been accepted and not yet enacted, the flag the
+    /// real participant reports through `VTable.releasePending`. `enactRelease`
+    /// is the mock's stand-in for the UI thread getting to it.
+    release_pending: bool = false,
     is_busy: bool = false,
     applied: ?u64 = null, // last applyBudget target (null = never applied directly)
     /// applyBudget targets in call order across ALL mocks, for ordering asserts.
@@ -1077,8 +1117,20 @@ const MockModel = struct {
     fn releaseFn(ctx: *anyopaque) void {
         const m = mock(ctx);
         m.released = true;
-        if (m.declines or m.release_defers) return;
+        if (m.declines) return;
+        if (m.release_defers) {
+            m.release_pending = true;
+            return;
+        }
         m.used = 0; // the whole pipeline goes, irreducible part included
+    }
+    fn releasePendingFn(ctx: *anyopaque) bool {
+        return mock(ctx).release_pending;
+    }
+    /// The deferred free finally happening on the model's own thread.
+    fn enactRelease(self: *MockModel) void {
+        self.release_pending = false;
+        self.used = 0;
     }
     fn mock(ctx: *anyopaque) *MockModel {
         return @ptrCast(@alignCast(ctx));
@@ -1104,6 +1156,7 @@ const MockModel = struct {
         .busy = busyFn,
         .applyBudget = applyFn,
         .releaseAll = releaseFn,
+        .releasePending = releasePendingFn,
     };
     fn releasable(self: *MockModel) Participant {
         return .{ .ctx = self, .control = &self.cp, .vtable = &vtable_rel };
@@ -1593,6 +1646,49 @@ test "Arbiter.requestRoom: a DEFERRED release reports only what is actually free
     try std.testing.expectEqual(@as(u64, 5 << 30), arb.requestRoom(.llm, 8 << 30));
     try std.testing.expect(diff.released); // asked
     try std.testing.expectEqual(@as(u64, 3 << 30), diff.used); // not yet enacted
+}
+
+test "Arbiter.pendingRelease: a deferred release is distinguishable from an empty peer" {
+    // The 0 above is why this exists. A caller that is about to ALLOCATE has to
+    // know whether that 0 means "nothing is coming" or "3 GiB, in a moment": one
+    // is a failed turn, the other is a turn that waits a frame and succeeds. On a
+    // 31B beside an idle krea2 the difference was a DeviceOutOfMemory on a 16 MiB
+    // buffer, with the peer's 1444 MiB landing in the next log line.
+    var llm: MockModel = .{ .used = 6 << 30, .want = 20 << 30, .is_busy = true };
+    var diff: MockModel = .{ .used = 8 << 30, .want = 8 << 30, .irreducible = 3 << 30, .release_defers = true };
+    var arb: Arbiter = .{
+        .llm = llm.participant(),
+        .diffusion = diff.releasable(),
+        .limit = 22 << 30,
+        .llm_share = 6 << 30,
+    };
+    try std.testing.expectEqual(@as(?u64, null), arb.pendingRelease(.llm)); // nothing asked yet
+    _ = arb.requestRoom(.llm, 8 << 30);
+    // Pending, and worth the bytes the peer is still holding.
+    try std.testing.expectEqual(@as(?u64, 3 << 30), arb.pendingRelease(.llm));
+    diff.enactRelease();
+    try std.testing.expectEqual(@as(?u64, null), arb.pendingRelease(.llm)); // landed: stop waiting
+    try std.testing.expectEqual(@as(u64, 0), diff.used);
+}
+
+test "Arbiter.pendingRelease: null for a peer that frees inside the rung, and with no peer" {
+    // A participant that enacts `releaseAll` synchronously (and the LLM, which has
+    // no such rung at all) leaves `releasePending` null, so a waiting caller must
+    // not wait: the bytes it was going to wait for are already in hand.
+    var llm: MockModel = .{ .used = 6 << 30, .want = 20 << 30, .is_busy = true };
+    var diff: MockModel = .{ .used = 8 << 30, .want = 8 << 30, .irreducible = 3 << 30 };
+    var arb: Arbiter = .{
+        .llm = llm.participant(),
+        .diffusion = diff.releasable(),
+        .limit = 22 << 30,
+        .llm_share = 6 << 30,
+    };
+    _ = arb.requestRoom(.llm, 8 << 30);
+    try std.testing.expect(diff.released);
+    try std.testing.expectEqual(@as(u64, 0), diff.used); // freed inside the rung
+    try std.testing.expectEqual(@as(?u64, null), arb.pendingRelease(.llm));
+    // The other direction has no `releaseAll` (nor `releasePending`) to report.
+    try std.testing.expectEqual(@as(?u64, null), arb.pendingRelease(.diffusion));
 }
 
 test "Arbiter.requestRoom: an IDLE asker never releases the peer" {

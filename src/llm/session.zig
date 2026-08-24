@@ -133,6 +133,65 @@ pub const RunResult = struct {
     timing: engine.Timing = .{},
 };
 
+/// Weight-noise CURVE for every GPU session brought up from here on: a
+/// `core/noise_curve.zig` expression in the normalized layer depth `t` (a bare
+/// number is a flat curve). A global because it is a process-wide CLI choice
+/// (`--weight-noise`) that has to reach four separate `bringUpCuda` call sites,
+/// exactly like `safetensors.read_mode`. A GUI sets `backend.weight_noise`
+/// directly and ignores this.
+pub var weight_noise_curve: []const u8 = "";
+
+/// The curve's `a` (`--weight-noise-amount`). 1 by default, so a curve written with
+/// literal amplitudes means what it says and only a curve that mentions `a` cares.
+pub var weight_noise_amount: f32 = 1;
+
+/// Base of the weight-noise stream (`--weight-noise-seed`). Same seed, curve and
+/// prompt reproduce a generation exactly.
+pub var weight_noise_seed: u32 = 0;
+
+/// Whether an architecture publishes a per-layer sigma, which is what makes weight
+/// noise reach its GEMMs at all. Today exactly one does.
+///
+/// The coupling is concrete: a stepper honors noise iff it declares `noiseAtLayer`
+/// (so `transformer_gpu.decoderLayer*` can tell it which layer is launching) AND
+/// ticks the stream in its forward. Extend this list in the same commit that adds
+/// the second one, or the GUI will offer the knob for a model that ignores it.
+/// `weight noise arch list matches the steppers` in `gui/chat.zig` fails if the two
+/// drift.
+pub fn archSupportsWeightNoise(arch: []const u8) bool {
+    return std.mem.eql(u8, arch, "gemma4");
+}
+
+/// Whether weight noise would actually do anything to this checkpoint. Both halves
+/// are real and independent: a stepper that never publishes a layer index leaves
+/// every sigma at slot 0, and a checkpoint whose linears are in an unwired dtype
+/// (a Gemma 4 12B QAT file is q4_0) flows through kernels that never read sigma.
+///
+/// The dtype test is a majority over the block-quant weights under `blk.`, not a
+/// single probe tensor: a mixed file is normal (this repo's 31B q4_k carries 11
+/// q5_k tensors), and one supported tensor in an otherwise unsupported model would
+/// answer yes to a question the user is really asking about the whole model.
+pub fn weightNoiseSupported(gg: *const gguf_mod.Gguf) bool {
+    const arch = gg.getStr("general.architecture") orelse return false;
+    if (!archSupportsWeightNoise(arch)) return false;
+    var quant: usize = 0;
+    var wired: usize = 0;
+    for (gg.names()) |name| {
+        // `Gguf` hands out CANONICAL names, so per-layer tensors are `layers.N.…`,
+        // not the file's own `blk.N.…`. Matching the raw spelling counted zero
+        // quantized weights and reported every checkpoint unsupported, including
+        // the q4_k one this was developed against. Both are accepted so a caller
+        // holding raw names is not silently wrong either.
+        if (!std.mem.startsWith(u8, name, "layers.") and !std.mem.startsWith(u8, name, "blk.")) continue;
+        if (!std.mem.endsWith(u8, name, ".weight")) continue;
+        const dt = (gg.get(name) orelse continue).info.dtype;
+        if (!dt.isBlockQuant()) continue; // norms are f32 and cannot carry noise
+        quant += 1;
+        if (cuda.Backend.weightNoiseSupported(dt)) wired += 1;
+    }
+    return quant != 0 and wired * 2 >= quant;
+}
+
 /// Bring up the CUDA backend for a GPU session: `initLibs` (--backend cuda) or
 /// `init` (--backend zig-cuda), set profiling, and pin every weight resident
 /// (LLM weights never stream; see the note at the top of this file).
@@ -147,6 +206,11 @@ pub fn bringUpCuda(arena: std.mem.Allocator, backend: BackendKind, profile: bool
         b.profile = profile;
         b.pinAllWeights();
         b.enableLlmMemTags(); // before any allocation; see enableLlmMemTags
+        b.weight_noise.seed = weight_noise_seed;
+        // The curve needs the layer count to evaluate; the model supplies that in
+        // its own init (`setDepth`), which re-evaluates whatever is set here.
+        b.weight_noise.amount = weight_noise_amount;
+        b.weight_noise.setCurve(weight_noise_curve);
     }
     return be;
 }
@@ -433,4 +497,64 @@ test "run cpu arm: build → prefill → drive, returns driver's token count" {
     );
     try std.testing.expectEqual(@as(usize, 7), res.n);
     try std.testing.expectEqual(@as(usize, 1), calls); // prefiller ran once
+}
+
+/// Build a minimal in-memory GGUF: `arch`, and `n` per-layer weights of `type_id`
+/// plus one f32 norm (which must not be counted as a noisable weight).
+fn testGguf(gpa: std.mem.Allocator, arch: []const u8, type_id: u32, n: usize) ![]u8 {
+    var b = try gguf_mod.TestBuilder.init(gpa, 3, n + 1, 1);
+    errdefer b.deinit();
+    try b.kvStr("general.architecture", arch);
+    var buf: [64]u8 = undefined;
+    for (0..n) |i| {
+        const name = try std.fmt.bufPrint(&buf, "blk.{d}.ffn_down.weight", .{i});
+        try b.tensor(name, &.{ 256, 2 }, type_id, 0);
+    }
+    try b.tensor("blk.0.ffn_norm.weight", &.{256}, 0, 0); // f32
+    // One 256x2 q4_k row pair is 2 blocks of 144 bytes; the f32 norm is 1 KiB.
+    // Oversized payload is fine, the reader only needs the ranges to fit.
+    const payload = try gpa.alloc(u8, 1 << 16);
+    defer gpa.free(payload);
+    @memset(payload, 0);
+    return b.finish(payload);
+}
+
+test "weightNoiseSupported gates on both the arch and the weight dtype" {
+    const gpa = std.testing.allocator;
+
+    // gemma4 + q4_k: the case this was built for.
+    {
+        const bytes = try testGguf(gpa, "gemma4", 12, 4); // 12 = q4_k
+        defer gpa.free(bytes);
+        var gg = try gguf_mod.Gguf.initFromSlice(gpa, bytes);
+        defer gg.deinit();
+        // Guards the bug this test exists for: `Gguf` canonicalizes `blk.N.…` to
+        // `layers.N.…`, and scanning for the raw spelling found nothing at all.
+        try std.testing.expect(weightNoiseSupported(&gg));
+    }
+    // gemma4 + q4_0 (the 12B QAT format): right arch, unwired kernels.
+    {
+        const bytes = try testGguf(gpa, "gemma4", 2, 4); // 2 = q4_0
+        defer gpa.free(bytes);
+        var gg = try gguf_mod.Gguf.initFromSlice(gpa, bytes);
+        defer gg.deinit();
+        try std.testing.expect(!weightNoiseSupported(&gg));
+    }
+    // Right dtype, wrong arch: no stepper publishes a layer index.
+    {
+        const bytes = try testGguf(gpa, "qwen35", 12, 4);
+        defer gpa.free(bytes);
+        var gg = try gguf_mod.Gguf.initFromSlice(gpa, bytes);
+        defer gg.deinit();
+        try std.testing.expect(!weightNoiseSupported(&gg));
+    }
+    // A checkpoint with no quantized layer weights at all cannot be perturbed,
+    // and must not divide by a zero count.
+    {
+        const bytes = try testGguf(gpa, "gemma4", 0, 0); // f32 only
+        defer gpa.free(bytes);
+        var gg = try gguf_mod.Gguf.initFromSlice(gpa, bytes);
+        defer gg.deinit();
+        try std.testing.expect(!weightNoiseSupported(&gg));
+    }
 }

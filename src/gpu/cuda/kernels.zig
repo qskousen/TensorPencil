@@ -6,7 +6,7 @@
 const std = @import("std");
 const cu = @import("cu.zig");
 const ctxmod = @import("context.zig");
-const elt = @import("elt.zig"); // KvFmt only (elt imports nothing local, so no cycle)
+const elt = @import("elt.zig"); // KvFmt only (elt reaches no further than wnoise/ptx, so no cycle)
 const Context = ctxmod.Context;
 
 /// Whether an environment variable is set, for the kernel-shape A/B switches. Its own
@@ -331,6 +331,14 @@ pub const i4gemm_v0_ptx: [:0]const u8 =
 ;
 
 const ptx = @import("ptx.zig");
+const wnoise = @import("wnoise.zig");
+
+/// The one parameter list every MMQ entry declares, so `opMatmulQuantMmq*` can
+/// launch any of them with one param array. `p_nsig`/`p_nseq` are the weight-noise
+/// sigma and stream index; only the kernels listed in BACKEND.md read them, the
+/// rest declare them so the ABI stays one shape.
+const mmq_params = "    .param .u64 p_w,\n    .param .u64 p_x,\n    .param .u64 p_y,\n    .param .u32 p_rows,\n    .param .u32 p_cols,\n    .param .u32 p_n,\n    .param .f32 p_scale,\n    .param .f32 p_nsig,\n    .param .u32 p_nseq";
+
 
 /// v1, shared-memory register-tiled IMMA GEMM. 128x128 block tile, 4 warps
 /// (2x2 grid of 64x64 warp tiles), 128 s32 accumulators/thread, K_STEP=64.
@@ -3960,7 +3968,7 @@ pub fn buildMmqQ4K(alloc: std.mem.Allocator, nt: usize, warps: usize) ![:0]u8 {
     defer alloc.free(shared_decl);
     return b.build(
         "mmq_q4_k",
-        "    .param .u64 p_w,\n    .param .u64 p_x,\n    .param .u64 p_y,\n    .param .u32 p_rows,\n    .param .u32 p_cols,\n    .param .u32 p_n,\n    .param .f32 p_scale",
+        mmq_params,
         shared_decl,
     );
 }
@@ -4170,6 +4178,7 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator, kq: KQuant) ![:0]u8 {
     try b.linef("ld.param.u32 {s}, [p_cols];", .{r_cols});
     try b.linef("ld.param.u32 {s}, [p_n];", .{r_n});
     try b.linef("ld.param.f32 {s}, [p_scale];", .{f_scale});
+    const nz = try wnoise.Scratch.init(&b, "p_nsig", "p_nseq");
     try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_w, rd_w });
     try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_x, rd_x });
     try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_y, rd_y });
@@ -4358,6 +4367,10 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator, kq: KQuant) ![:0]u8 {
     try b.linef("mul.lo.u32 {s}, {s}, {d};", .{ tm[2], tm[0], BLK });
     try b.linef("cvt.u64.u32 {s}, {s};", .{ rdt[0], tm[2] });
     try b.linef("add.s64 {s}, {s}, {s};", .{ rdt[1], rd_wrow, rdt[0] });
+    // The jitter keys on the super-block address; `rdt` is shared scratch that
+    // stage B overwrites, so pin it here rather than re-reading rdt[1] below.
+    const rd_blk = try b.reg(.b64);
+    try b.linef("mov.b64 {s}, {s};", .{ rd_blk, rdt[1] });
     if (iq4)
         // d | scales_h, then scales_l[0..3]; the whole header is 8 bytes.
         try b.linef("ld.global.v2.u32 {{{s}, {s}}}, [{s}];", .{ hh[0], hh[1], rdt[1] })
@@ -4482,6 +4495,7 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator, kq: KQuant) ![:0]u8 {
         try b.linef("shl.b32 {s}, {s}, 2;", .{ tm[7], tm[1] }); // grp*4
         try b.linef("mov.b32 {{{s}, {s}}}, {s};", .{ h16[0], h16[1], hh[0] });
         try b.linef("cvt.f32.f16 {s}, {s};", .{ fd, h16[0] });
+        try wnoise.emitJitter(&b, nz, fd, rd_blk, rd_w, .d);
         for (0..KS) |j| {
             try b.linef("shr.u32 {s}, {s}, {s};", .{ scr[j], hh[1], tm[5] });
             if (j != 0) try b.linef("shr.u32 {s}, {s}, {d};", .{ scr[j], scr[j], j * 4 });
@@ -4538,6 +4552,8 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator, kq: KQuant) ![:0]u8 {
         try b.linef("mov.b32 {{{s}, {s}}}, {s};", .{ h16[0], h16[1], hh[0] });
         try b.linef("cvt.f32.f16 {s}, {s};", .{ fd, h16[0] });
         try b.linef("cvt.f32.f16 {s}, {s};", .{ fdm, h16[1] });
+        try wnoise.emitJitter(&b, nz, fd, rd_blk, rd_w, .d);
+        try wnoise.emitJitter(&b, nz, fdm, rd_blk, rd_w, .dmin);
         for (0..KS) |j| {
             try b.linef("cvt.rn.f32.u32 {s}, {s};", .{ fs[j * 2], scr[j] });
             try b.linef("mul.f32 {s}, {s}, {s};", .{ fs[j * 2], fs[j * 2], fd });
@@ -4731,7 +4747,7 @@ pub fn buildMmqPipeQ4K(alloc: std.mem.Allocator, kq: KQuant) ![:0]u8 {
     defer alloc.free(shared_decl);
     return b.build(
         kq.entry(),
-        "    .param .u64 p_w,\n    .param .u64 p_x,\n    .param .u64 p_y,\n    .param .u32 p_rows,\n    .param .u32 p_cols,\n    .param .u32 p_n,\n    .param .f32 p_scale",
+        mmq_params,
         shared_decl,
     );
 }
@@ -5056,7 +5072,7 @@ pub fn buildMmqPipeQ8_0(alloc: std.mem.Allocator) ![:0]u8 {
     defer alloc.free(shared_decl);
     return b.build(
         "mmq_pipe_q8_0",
-        "    .param .u64 p_w,\n    .param .u64 p_x,\n    .param .u64 p_y,\n    .param .u32 p_rows,\n    .param .u32 p_cols,\n    .param .u32 p_n,\n    .param .f32 p_scale",
+        mmq_params,
         shared_decl,
     );
 }
@@ -5428,7 +5444,7 @@ pub fn buildMmqPipeQ6K(alloc: std.mem.Allocator) ![:0]u8 {
     defer alloc.free(shared_decl);
     return b.build(
         "mmq_pipe_q6_k",
-        "    .param .u64 p_w,\n    .param .u64 p_x,\n    .param .u64 p_y,\n    .param .u32 p_rows,\n    .param .u32 p_cols,\n    .param .u32 p_n,\n    .param .f32 p_scale",
+        mmq_params,
         shared_decl,
     );
 }
@@ -6337,7 +6353,7 @@ pub fn buildMmqPipeQ2_0(alloc: std.mem.Allocator, g: elt.Q2Geom) ![:0]u8 {
     defer alloc.free(shared_decl);
     return b.build(
         entry_name,
-        "    .param .u64 p_w,\n    .param .u64 p_x,\n    .param .u64 p_y,\n    .param .u32 p_rows,\n    .param .u32 p_cols,\n    .param .u32 p_n,\n    .param .f32 p_scale",
+        mmq_params,
         shared_decl,
     );
 }
@@ -6739,7 +6755,7 @@ pub fn buildMmqPipeQ1_0(alloc: std.mem.Allocator) ![:0]u8 {
     defer alloc.free(shared_decl);
     return b.build(
         "mmq_pipe_q1_0",
-        "    .param .u64 p_w,\n    .param .u64 p_x,\n    .param .u64 p_y,\n    .param .u32 p_rows,\n    .param .u32 p_cols,\n    .param .u32 p_n,\n    .param .f32 p_scale",
+        mmq_params,
         shared_decl,
     );
 }

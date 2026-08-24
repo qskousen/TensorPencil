@@ -382,6 +382,21 @@ pub const Options = struct {
     /// Compute backend for the chat LLM. Only the CUDA variants are supported
     /// today; `.cpu`/`.vulkan` fail init with `error.UnsupportedLlmBackend`.
     backend: pipeline.Backend = .zig_cuda,
+    /// Weight-noise curve at load ("" = off), a `noise_curve` expression in the
+    /// normalized layer depth. Applied to the backend in `init` rather than by the
+    /// app, so a headless driver gets it too. Changing it later goes straight to
+    /// `be.weight_noise`, whose table the decode kernels re-read per launch, which
+    /// is why there is no staged/pending twin here.
+    weight_noise_curve: []const u8 = "",
+    /// The shape's `a`: how much. Separate from the shape for the same reason the
+    /// composer has a field for it, and carried HERE rather than only in the app
+    /// because a headless driver builds its session from `sessionOptions` too —
+    /// leaving it out left every non-app session running the shape at a = 1, which
+    /// for `a*(1-t)^2` is a peak sigma of 1.0 and pure salad.
+    weight_noise_amount: f32 = 1,
+    /// Base of this session's weight-noise stream, so two sessions perturb
+    /// differently while one stays reproducible from its seed.
+    weight_noise_seed: u32 = 0,
     /// Whether the image tool is available (a diffusion model is configured, so
     /// the app-level engine can render `<image>` calls). Gates the tool prompt.
     images_enabled: bool = false,
@@ -459,6 +474,9 @@ pub fn sessionOptions(arena: std.mem.Allocator, cfg: *const config.Config, seed:
         .seed = seed,
         .sampling = samplingParams(cfg),
         .backend = diffuser.toPipelineBackend(cfg.llm_backend),
+        .weight_noise_curve = if (cfg.weight_noise) try arena.dupe(u8, cfg.weight_noise_curve.slice()) else "",
+        .weight_noise_amount = cfg.weight_noise_amount,
+        .weight_noise_seed = @truncate(seed),
         .images_enabled = cfg.diffusion_model.opt() != null,
         .mmproj_path = if (cfg.vision_tower.opt()) |m| try arena.dupe(u8, m) else null,
         .vram_split = cfg.vram_split,
@@ -744,6 +762,12 @@ pub const Session = struct {
             .cpu, .vulkan => return error.UnsupportedLlmBackend,
         };
         errdefer self.be.deinit();
+        // Weight noise from the config, here rather than in the app so a headless
+        // driver (chat-probe) perturbs identically. Live changes go straight to
+        // this atomic from the UI thread; see app.applyWeightNoise.
+        self.be.weight_noise.seed = cfg.weight_noise_seed;
+        self.be.weight_noise.amount = cfg.weight_noise_amount;
+        self.be.weight_noise.setCurve(cfg.weight_noise_curve);
         // LLM weights pin resident on first touch and NEVER stream: without
         // this, weights sit in the backend's evictable LRU cache, and once the
         // working set is within ~a layer of the card, per-token allocations
@@ -1626,6 +1650,14 @@ pub const Session = struct {
 
     pub fn visionEnabled(self: *const Session) bool {
         return self.hasVit();
+    }
+
+    /// Whether weight noise would do anything to the model that is actually loaded
+    /// (see `llm.session.weightNoiseSupported`). The GUI asks rather than assuming:
+    /// the controls otherwise light up for a Qwen, or for a QAT Gemma 4 whose q4_0
+    /// linears have no noised kernels, and silently do nothing.
+    pub fn weightNoiseSupported(self: *const Session) bool {
+        return session.weightNoiseSupported(&self.gguf);
     }
 
     /// Current context length in tokens (KV rows used).
@@ -3133,4 +3165,28 @@ test "Message variants: regenerate bookkeeping keeps older takes" {
     m.cur = 0;
     try std.testing.expectEqualStrings("first take", m.active().text.items);
     try std.testing.expect(m.active().images_scanned);
+}
+
+// The arch list in `llm/session.zig` and the steppers that actually publish a
+// layer index are two halves of one fact, in different modules, and nothing but
+// this connects them. `noiseAtLayer` is what `transformer_gpu.decoderLayer*` calls;
+// a stepper without it leaves every sigma at slot 0, so listing its arch would make
+// the GUI offer a knob that does nothing, and NOT listing a stepper that has it
+// hides a working feature.
+test "weight noise arch list matches the steppers that publish a layer index" {
+    const cases = .{
+        .{ "qwen3", qwen3_cuda.CudaLM },
+        .{ "qwen35", qwen35_cuda.CudaLM },
+        .{ "gemma3", gemma3_cuda.CudaLM },
+        .{ "gemma4", gemma4_cuda.CudaLM },
+    };
+    inline for (cases) |c| {
+        const listed = session.archSupportsWeightNoise(c[0]);
+        const publishes = @hasDecl(c[1], "noiseAtLayer");
+        errdefer std.debug.print(
+            "{s}: session.archSupportsWeightNoise says {}, but the stepper {s} noiseAtLayer\n",
+            .{ c[0], listed, if (publishes) "HAS" else "does NOT have" },
+        );
+        try std.testing.expectEqual(publishes, listed);
+    }
 }

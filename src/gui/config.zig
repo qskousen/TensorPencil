@@ -377,6 +377,9 @@ pub const Sampling = struct {
 /// line each, `name|temperature|top_k|top_p|min_p|repeat_penalty|repeat_last_n|
 /// presence|frequency`). Fixed-capacity so the Config stays a plain value type.
 pub const max_presets = 16;
+/// Longest weight-noise curve expression. Matches `cuda.WeightNoise.max_expr`.
+pub const max_noise_curve = 192;
+
 pub const max_preset_name = 48;
 
 pub const Preset = struct {
@@ -394,6 +397,47 @@ pub const SysPrompt = struct {
     name: TextBuf(max_sys_prompt_name) = .{},
     text: TextBuf(max_prompt) = .{},
 };
+
+/// Saved named weight-noise curves (`noise_curves.slice()`). The *active* curve is
+/// `Config.weight_noise_curve`; these are a library to flip between, exactly like
+/// `presets` and `sys_prompts`. The composer's dropdown reads this list.
+pub const max_noise_curves = 16;
+
+pub const NoiseCurve = struct {
+    name: TextBuf(max_preset_name) = .{},
+    curve: TextBuf(max_noise_curve) = .{},
+};
+
+/// The SHAPES a fresh config ships with, so the dropdown is useful before anyone
+/// has written an expression. All of them are written in `a` so the amount knob
+/// governs them; the amplitude is not baked in, which is what collapses what used
+/// to be "front" and "front-hard" into one shape at two amounts.
+///
+/// `late (corrupts)` is here on purpose: it is the counter-example that makes the
+/// measured result (BACKEND.md 6) legible — at a matched amount it corrupts tokens
+/// where the front-loaded shapes stay fluent.
+///
+/// The same five strings are `noise_curve.documented_shapes` (which is where they
+/// are checked to parse, this file having no evaluator) and appear in tp-llm's
+/// `--weight-noise` help. Keep the three in step.
+const builtin_curves = [_]struct { []const u8, []const u8 }{
+    .{ "flat", "a" },
+    .{ "front", "a*(1-t)^2" },
+    .{ "front steep", "a*(1-t)^4" },
+    .{ "first 40%", "max(0, a*(1-t/0.4))" },
+    .{ "bell", "a*sin(pi*t)^2" },
+    .{ "late (corrupts)", "a*t^2" },
+};
+
+fn defaultNoiseCurves() NoiseCurveList {
+    var list: NoiseCurveList = .{};
+    for (builtin_curves) |c| {
+        list.items[list.count].name.set(c[0]);
+        list.items[list.count].curve.set(c[1]);
+        list.count += 1;
+    }
+    return list;
+}
 
 /// A fixed-capacity list (`items[0..count]`). Kept as a value type (no
 /// allocation) so `Config` stays a plain copyable value, but (de)serializes as
@@ -439,6 +483,7 @@ pub fn FixedList(comptime T: type, comptime cap: usize) type {
 
 pub const PresetList = FixedList(Preset, max_presets);
 pub const SysPromptList = FixedList(SysPrompt, max_sys_prompts);
+pub const NoiseCurveList = FixedList(NoiseCurve, max_noise_curves);
 
 /// A fixed-capacity, nul-terminated text buffer. `data` is handed directly to
 /// dvui's `textEntry` as its backing store, so the buffer is the single source
@@ -642,6 +687,28 @@ pub const Config = struct {
     /// no template at all. No effect on non-qwen35 models. Load-time (see
     /// `llmReloadEql`): a toggle triggers a transcript-preserving reload.
     qwen35_fixed_template: bool = true,
+    /// Weight noise: perturb the quantized weights while generating, so the model
+    /// itself wobbles instead of the sampler (see `cuda/wnoise.zig`). Live and
+    /// load-neutral: it reaches the backend immediately. CUDA backends only; the
+    /// CPU and Vulkan arms ignore it.
+    weight_noise: bool = false,
+    /// Weight-noise SHAPE: a `core/noise_curve.zig` expression in `t`, the
+    /// normalized layer depth, 0 at the first decoder layer and 1 at the LM head.
+    /// Front-loading it is what keeps a heavily perturbed model fluent: the same
+    /// amount applied flat lands on token selection and comes out as gibberish.
+    ///
+    /// The shipped shapes are written in `a`, so this says WHERE the noise goes and
+    /// `weight_noise_amount` says HOW MUCH — the composer needs a quick amount knob
+    /// and nobody should have to edit an expression to turn one. A curve is free to
+    /// use literal amplitudes instead and ignore the knob.
+    weight_noise_curve: TextBuf(max_noise_curve) = TextBuf(max_noise_curve).lit("a*(1-t)^2"),
+    /// Weight-noise amount, the `a` the shape reads. Measured on a 31B q4_k: 0.03
+    /// rephrases, 0.08 clearly rewords, 0.4 gives a different answer in clean prose,
+    /// and past ~0.8 a front-loaded curve breaks structurally (fluent, no plan).
+    weight_noise_amount: f32 = 0.08,
+    /// Saved curve library (`noise_curves.slice()`). Pure data the settings view
+    /// and the composer dropdown read; the ACTIVE curve is `weight_noise_curve`.
+    noise_curves: NoiseCurveList = defaultNoiseCurves(),
     /// KV-cache element storage type (f32 default; f16 halves the KV VRAM
     /// footprint, lossy). Changing it rebuilds the KV context, the weights stay
     /// resident (see `ctxReloadEql`), not a full model reload.
@@ -775,6 +842,52 @@ pub const Config = struct {
         std.mem.copyForwards(Preset, self.presets.items[i .. self.presets.count - 1], self.presets.items[i + 1 .. self.presets.count]);
         self.presets.count -= 1;
         self.presets.items[self.presets.count] = .{};
+        return true;
+    }
+
+    /// Find a saved noise curve by name (cleaned like `upsertNoiseCurve`).
+    pub fn findNoiseCurve(self: *const Config, raw_name: []const u8) ?usize {
+        var buf: [max_preset_name]u8 = undefined;
+        const name = cleanName(raw_name, buf[0..]) orelse return null;
+        for (self.noise_curves.slice(), 0..) |*c, i| {
+            if (std.mem.eql(u8, c.name.slice(), name)) return i;
+        }
+        return null;
+    }
+
+    /// The saved curve whose EXPRESSION matches `expr`, so the composer can show
+    /// which library entry is live without storing a second, desyncable "active
+    /// name" field. Null means the active curve was typed, not picked.
+    pub fn noiseCurveMatching(self: *const Config, expr: []const u8) ?usize {
+        for (self.noise_curves.slice(), 0..) |*c, i| {
+            if (std.mem.eql(u8, c.curve.slice(), expr)) return i;
+        }
+        return null;
+    }
+
+    /// Save `expr` under `raw_name`, replacing an existing curve of that name.
+    /// Returns false when the name is empty after cleaning or the table is full.
+    pub fn upsertNoiseCurve(self: *Config, raw_name: []const u8, expr: []const u8) bool {
+        var buf: [max_preset_name]u8 = undefined;
+        const name = cleanName(raw_name, buf[0..]) orelse return false;
+        if (self.findNoiseCurve(name)) |i| {
+            self.noise_curves.items[i].curve.set(expr);
+            return true;
+        }
+        if (self.noise_curves.count >= max_noise_curves) return false;
+        self.noise_curves.items[self.noise_curves.count] = .{};
+        self.noise_curves.items[self.noise_curves.count].name.set(name);
+        self.noise_curves.items[self.noise_curves.count].curve.set(expr);
+        self.noise_curves.count += 1;
+        return true;
+    }
+
+    /// Remove the curve named `raw_name`. Returns whether one was removed.
+    pub fn removeNoiseCurveNamed(self: *Config, raw_name: []const u8) bool {
+        const i = self.findNoiseCurve(raw_name) orelse return false;
+        std.mem.copyForwards(NoiseCurve, self.noise_curves.items[i .. self.noise_curves.count - 1], self.noise_curves.items[i + 1 .. self.noise_curves.count]);
+        self.noise_curves.count -= 1;
+        self.noise_curves.items[self.noise_curves.count] = .{};
         return true;
     }
 
@@ -1269,6 +1382,90 @@ test "regen_cache_mb: default, apply, junk tolerance, save/load, live-only" {
     try cfg.save(io, gpa, &environ, file);
     const back = Config.load(io, gpa, &environ, file);
     try std.testing.expectEqual(@as(usize, 512), back.regen_cache_mb);
+}
+
+test "noise curve library: built-ins, upsert, delete, match-by-expression" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var cfg: Config = .{};
+    // A fresh config ships a usable library, so the composer dropdown is not
+    // empty before anyone has written an expression.
+    try std.testing.expect(cfg.noise_curves.count >= 4);
+    const front = cfg.findNoiseCurve("front") orelse return error.MissingBuiltin;
+    try std.testing.expectEqualStrings("a*(1-t)^2", cfg.noise_curves.items[front].curve.slice());
+    // That they PARSE is asserted in core, next to the evaluator: this file
+    // deliberately imports nothing but std + known-folders (see build.zig), so it
+    // cannot evaluate a curve. `noise_curve`'s "documented shapes" test covers the
+    // same five strings.
+
+    // The composer names the live curve by matching its EXPRESSION, so that a
+    // curve edited in Settings stops claiming to be the preset it came from.
+    try std.testing.expectEqual(cfg.noiseCurveMatching("a*(1-t)^2"), front);
+    try std.testing.expectEqual(@as(?usize, null), cfg.noiseCurveMatching("0.123*t"));
+
+    const n0 = cfg.noise_curves.count;
+    try std.testing.expect(cfg.upsertNoiseCurve("  mine  ", "0.5*(1-t)^3"));
+    try std.testing.expectEqual(n0 + 1, cfg.noise_curves.count);
+    const mine = cfg.findNoiseCurve("mine") orelse return error.NotSaved;
+    try std.testing.expectEqualStrings("mine", cfg.noise_curves.items[mine].name.slice()); // trimmed
+    // Same name replaces rather than duplicating.
+    try std.testing.expect(cfg.upsertNoiseCurve("mine", "0.9*(1-t)"));
+    try std.testing.expectEqual(n0 + 1, cfg.noise_curves.count);
+    try std.testing.expectEqualStrings("0.9*(1-t)", cfg.noise_curves.items[mine].curve.slice());
+    // An unnameable entry is refused rather than saved blank.
+    try std.testing.expect(!cfg.upsertNoiseCurve("   ", "0.1"));
+
+    var fbuf: [64]u8 = undefined;
+    const file = testFile(&fbuf, "ncurves");
+    defer std.Io.Dir.cwd().deleteFile(io, file) catch {};
+    var environ: Environ = .init(gpa);
+    defer environ.deinit();
+    try cfg.save(io, gpa, &environ, file);
+    const back = Config.load(io, gpa, &environ, file);
+    try std.testing.expectEqual(cfg.noise_curves.count, back.noise_curves.count);
+    const mine_back = back.findNoiseCurve("mine") orelse return error.LostOnReload;
+    try std.testing.expectEqualStrings("0.9*(1-t)", back.noise_curves.items[mine_back].curve.slice());
+
+    // Delete removes exactly one and keeps the rest in order.
+    var cfg2 = cfg;
+    try std.testing.expect(cfg2.removeNoiseCurveNamed("mine"));
+    try std.testing.expectEqual(n0, cfg2.noise_curves.count);
+    try std.testing.expectEqual(@as(?usize, null), cfg2.findNoiseCurve("mine"));
+    try std.testing.expect(cfg2.findNoiseCurve("front") != null);
+    try std.testing.expect(!cfg2.removeNoiseCurveNamed("mine")); // already gone
+}
+
+test "weight_noise: defaults, save/load, live-only" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var cfg: Config = .{};
+    try std.testing.expect(!cfg.weight_noise); // off unless asked for
+    try std.testing.expectEqualStrings("a*(1-t)^2", cfg.weight_noise_curve.slice());
+    try std.testing.expectEqual(@as(f32, 0.08), cfg.weight_noise_amount);
+
+    cfg.weight_noise = true;
+    cfg.weight_noise_curve.set("max(0, a*(1-t/0.5))");
+    cfg.weight_noise_amount = 0.35;
+
+    // Neither a load nor a context change: sigma is an atomic the decode kernels
+    // re-read per launch, so the composer toggle takes effect without touching
+    // the resident weights or the KV cache.
+    const base: Config = .{};
+    try std.testing.expect(cfg.llmReloadEql(&base));
+    try std.testing.expect(cfg.ctxReloadEql(&base));
+
+    var fbuf: [64]u8 = undefined;
+    const file = testFile(&fbuf, "wnoise");
+    defer std.Io.Dir.cwd().deleteFile(io, file) catch {};
+    var environ: Environ = .init(gpa);
+    defer environ.deinit();
+    try cfg.save(io, gpa, &environ, file);
+    const back = Config.load(io, gpa, &environ, file);
+    try std.testing.expect(back.weight_noise);
+    try std.testing.expectEqualStrings("max(0, a*(1-t/0.5))", back.weight_noise_curve.slice());
+    try std.testing.expectEqual(@as(f32, 0.35), back.weight_noise_amount);
 }
 
 test "max_new_tokens: default, apply, junk tolerance, save/load, live-only" {

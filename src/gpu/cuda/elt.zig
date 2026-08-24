@@ -12,6 +12,7 @@
 /// 6144-long serial reduction). Same math/order-independent result. b0=x, b1=out,
 /// b2=mod. u0=rows, u1=dim, u2=premul_off, u3=shift_off, f0=eps. grid=(rows,1,1).
 const std = @import("std");
+const wnoise = @import("wnoise.zig");
 
 pub const rms_mod_par_ptx: [:0]const u8 =
     \\.version 8.0
@@ -1965,13 +1966,46 @@ pub const gemv_q5_k_ptx: [:0]const u8 =
     \\}
 ;
 
+/// Scratch for the `wnoise` scale jitter in one of the hand-authored k-quant
+/// GEMVs, which name their own registers. The numbers differ per kernel only
+/// because the register files do; every one of these kernels holds the
+/// super-block base in `%rd10` and d/dmin in `%f24`/`%f25`, which is what lets
+/// one snippet serve all of them. Widen the kernel's `.reg` declarations to
+/// cover whatever is named here.
+///
+/// Both extra parameters are slots the 12-parameter signature already carried
+/// unused: `f1` is sigma, `u5` the per-forward stream index.
+const NoiseRegs = struct {
+    sig: []const u8, // f32, sigma
+    key: []const u8, // b32, per-launch key (seed, forward, weight id)
+    h: []const u8, // b32 scratch
+    t: []const u8, // b32 scratch
+    u: []const u8, // f32 scratch
+
+    fn prologue(comptime n: NoiseRegs) []const u8 {
+        return wnoise.prologueAt(n.sig, n.key, "f1", "u5");
+    }
+
+    /// `%rd10` is the super-block base and `%rd1` the weight base in every one of
+    /// these kernels, which is what lets one snippet serve all of them.
+    fn jitter(comptime n: NoiseRegs, comptime has_dmin: bool) []const u8 {
+        const j = wnoise.jitterAt("%f24", "%rd10", "%rd1", .d, n.h, n.t, n.u, n.sig, n.key);
+        if (!has_dmin) return j;
+        return j ++ wnoise.jitterAt("%f25", "%rd10", "%rd1", .dmin, n.h, n.t, n.u, n.sig, n.key);
+    }
+};
+
 /// ggml q6_k GEMV, warp-per-row (8 rows per 256-thread block): each lane
 /// walks 16-elem units (4 consecutive l-bytes of one half: 4 ql+4 ql32+4 qh
 /// bytes decode 4 elems in each of the 4 y-groups) strided 32, i8 sub-block
 /// scales read inline; butterfly-shuffle reduction. Every ql/qh byte read
 /// once. cols % 256 == 0, rows % 8 == 0. b0=W, b1=x, b2=y. u0=rows,
-/// u1=cols, f0=scale.
-pub const gemv_q6_k_ptx: [:0]const u8 =
+/// u1=cols, f0=scale, f1=weight-noise sigma, u5=noise stream.
+pub const gemv_q6_k_ptx: [:0]const u8 = q6k_a ++ q6k_noise.prologue() ++ q6k_b ++ q6k_noise.jitter(false) ++ q6k_c;
+
+const q6k_noise: NoiseRegs = .{ .sig = "%f40", .key = "%r48", .h = "%r49", .t = "%r50", .u = "%f41" };
+
+const q6k_a =
     \\.version 8.0
     \\.target sm_86
     \\.address_size 64
@@ -1980,8 +2014,8 @@ pub const gemv_q6_k_ptx: [:0]const u8 =
     \\{
     \\  .reg .pred %p<8>;
     \\  .reg .b16 %h<2>;
-    \\  .reg .b32 %r<48>;
-    \\  .reg .f32 %f<40>;
+    \\  .reg .b32 %r<51>;
+    \\  .reg .f32 %f<42>;
     \\  .reg .b64 %rd<24>;
     \\  mov.u32 %r1,%ctaid.x; mov.u32 %r3,%tid.x;
     \\  shr.u32 %r5,%r3,5;                     // warp
@@ -1990,6 +2024,10 @@ pub const gemv_q6_k_ptx: [:0]const u8 =
     \\  ld.param.u32 %r2,[u0]; setp.ge.u32 %p1,%r7,%r2; @%p1 bra END;
     \\  ld.param.u32 %r4,[u1];                 // cols
     \\  ld.param.f32 %f1,[f0];                 // scale
+    \\
+;
+
+const q6k_b =
     \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
     \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
     \\  shr.u32 %r9,%r4,8; mul.lo.u32 %r10,%r9,210;        // row bytes
@@ -2019,6 +2057,10 @@ pub const gemv_q6_k_ptx: [:0]const u8 =
     \\  ld.global.u16 %r21,[%rd17+128]; ld.global.u16 %r22,[%rd17+130];
     \\  shl.b32 %r22,%r22,16; or.b32 %r21,%r21,%r22;       // w_h
     \\  ld.global.b16 %h0,[%rd10+208]; cvt.f32.f16 %f24,%h0; // d
+    \\
+;
+
+const q6k_c =
     \\  // i8 scales at +192 + half*8 + lb/16 (+2 per group)
     \\  shl.b32 %r23,%r12,3; shr.u32 %r25,%r13,4; add.u32 %r23,%r23,%r25;
     \\  cvt.u64.u32 %rd14,%r23; add.s64 %rd15,%rd10,%rd14;
@@ -2170,7 +2212,11 @@ pub const quantize_q8_1_ptx: [:0]const u8 =
 /// bound, so every 32-bit scalar load matters more than ALU here.
 /// cols % 256 == 0, rows % 8 == 0. b0=W, b1=xq (SoA: f32 d[cols/32] then
 /// i8 qs[cols]), b2=y. u0=rows, u1=cols, f0=scale.
-pub const gemv_q5_k_q8_ptx: [:0]const u8 =
+pub const gemv_q5_k_q8_ptx: [:0]const u8 = q5kq8_a ++ q5kq8_noise.prologue() ++ q5kq8_b ++ q5kq8_noise.jitter(true) ++ q5kq8_c;
+
+const q5kq8_noise: NoiseRegs = .{ .sig = "%f32", .key = "%r64", .h = "%r65", .t = "%r66", .u = "%f33" };
+
+const q5kq8_a =
     \\.version 8.0
     \\.target sm_86
     \\.address_size 64
@@ -2179,8 +2225,8 @@ pub const gemv_q5_k_q8_ptx: [:0]const u8 =
     \\{
     \\  .reg .pred %p<8>;
     \\  .reg .b16 %h<4>;
-    \\  .reg .b32 %r<64>;
-    \\  .reg .f32 %f<32>;
+    \\  .reg .b32 %r<67>;
+    \\  .reg .f32 %f<34>;
     \\  .reg .b64 %rd<24>;
     \\  mov.u32 %r1,%ctaid.x; mov.u32 %r3,%tid.x;
     \\  shr.u32 %r5,%r3,5;                     // warp
@@ -2189,6 +2235,10 @@ pub const gemv_q5_k_q8_ptx: [:0]const u8 =
     \\  ld.param.u32 %r2,[u0]; setp.ge.u32 %p1,%r7,%r2; @%p1 bra END;
     \\  ld.param.u32 %r4,[u1];                 // cols
     \\  ld.param.f32 %f1,[f0];                 // scale
+    \\
+;
+
+const q5kq8_b =
     \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
     \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
     \\  shr.u32 %r9,%r4,8; mul.lo.u32 %r10,%r9,176;        // row bytes
@@ -2215,6 +2265,10 @@ pub const gemv_q5_k_q8_ptx: [:0]const u8 =
     \\  mov.b32 {%h0,%h1},%r35;
     \\  cvt.f32.f16 %f24,%h0;                  // d
     \\  cvt.f32.f16 %f25,%h1;                  // dmin
+    \\
+;
+
+const q5kq8_c =
     \\  shl.b32 %r22,%r12,1;                   // is0 = grp*2
     \\  shl.b32 %r39,%r22,3;                   // is0*8
     \\  setp.ge.u32 %p5,%r22,4; @%p5 bra SHI;
@@ -2417,7 +2471,11 @@ pub const gemv_q6_k_q8_ptx: [:0]const u8 =
 /// u4=nblk_total (n*cols/32). f0=scale.
 pub const gemv_q5_k_q8n_ptx: [:0]const u8 = q5n_head ++ q8nInputs(q5nInput) ++ q8n_step ++ q8n_epi_head ++ q8nInputs(q8nEpilogue) ++ q8n_tail;
 
-const q5n_head =
+const q5n_head = q5n_a ++ q5n_noise.prologue() ++ q5n_b ++ q5n_noise.jitter(true) ++ q5n_c;
+
+const q5n_noise: NoiseRegs = .{ .sig = "%f48", .key = "%r64", .h = "%r65", .t = "%r66", .u = "%f49" };
+
+const q5n_a =
     \\.version 8.0
     \\.target sm_86
     \\.address_size 64
@@ -2426,8 +2484,8 @@ const q5n_head =
     \\{
     \\  .reg .pred %p<8>;
     \\  .reg .b16 %h<4>;
-    \\  .reg .b32 %r<64>;
-    \\  .reg .f32 %f<48>;
+    \\  .reg .b32 %r<67>;
+    \\  .reg .f32 %f<50>;
     \\  .reg .b64 %rd<28>;
     \\  mov.u32 %r1,%ctaid.x; mov.u32 %r3,%tid.x;
     \\  shr.u32 %r5,%r3,5;                     // warp
@@ -2439,6 +2497,10 @@ const q5n_head =
     \\  ld.param.u32 %r62,[u3];                // row_off
     \\  ld.param.u32 %r63,[u4];                // nblk_total
     \\  ld.param.f32 %f1,[f0];                 // scale
+    \\
+;
+
+const q5n_b =
     \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
     \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
     \\  shr.u32 %r9,%r4,8; mul.lo.u32 %r10,%r9,176;        // row bytes
@@ -2470,6 +2532,10 @@ const q5n_head =
     \\  mov.b32 {%h0,%h1},%r35;
     \\  cvt.f32.f16 %f24,%h0;                  // d
     \\  cvt.f32.f16 %f25,%h1;                  // dmin
+    \\
+;
+
+const q5n_c =
     \\  neg.f32 %f12,%f25;
     \\  shl.b32 %r22,%r12,1;                   // is0 = grp*2
     \\  shl.b32 %r39,%r22,3;                   // is0*8
@@ -2722,7 +2788,11 @@ fn q6nInput(comptime i: u32) []const u8 {
 /// only touches the shared v words, which q4n_head builds without the qh OR.
 pub const gemv_q4_k_q8n_ptx: [:0]const u8 = q4n_head ++ q8nInputs(q5nInput) ++ q8n_step ++ q8n_epi_head ++ q8nInputs(q8nEpilogue) ++ q8n_tail;
 
-const q4n_head =
+const q4n_head = q4n_a ++ q4n_noise.prologue() ++ q4n_b ++ q4n_noise.jitter(true) ++ q4n_c;
+
+const q4n_noise: NoiseRegs = .{ .sig = "%f48", .key = "%r64", .h = "%r65", .t = "%r66", .u = "%f49" };
+
+const q4n_a =
     \\.version 8.0
     \\.target sm_86
     \\.address_size 64
@@ -2731,8 +2801,8 @@ const q4n_head =
     \\{
     \\  .reg .pred %p<8>;
     \\  .reg .b16 %h<4>;
-    \\  .reg .b32 %r<64>;
-    \\  .reg .f32 %f<48>;
+    \\  .reg .b32 %r<67>;
+    \\  .reg .f32 %f<50>;
     \\  .reg .b64 %rd<28>;
     \\  mov.u32 %r1,%ctaid.x; mov.u32 %r3,%tid.x;
     \\  shr.u32 %r5,%r3,5;                     // warp
@@ -2744,6 +2814,10 @@ const q4n_head =
     \\  ld.param.u32 %r62,[u3];                // row_off
     \\  ld.param.u32 %r63,[u4];                // nblk_total
     \\  ld.param.f32 %f1,[f0];                 // scale
+    \\
+;
+
+const q4n_b =
     \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
     \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
     \\  shr.u32 %r9,%r4,8; mul.lo.u32 %r10,%r9,144;        // row bytes
@@ -2773,6 +2847,10 @@ const q4n_head =
     \\  mov.b32 {%h0,%h1},%r35;
     \\  cvt.f32.f16 %f24,%h0;                  // d
     \\  cvt.f32.f16 %f25,%h1;                  // dmin
+    \\
+;
+
+const q4n_c =
     \\  neg.f32 %f12,%f25;
     \\  shl.b32 %r22,%r12,1;                   // is0 = grp*2
     \\  shl.b32 %r39,%r22,3;                   // is0*8
@@ -8770,6 +8848,55 @@ test "every PTX kernel string is ASCII" {
             errdefer std.debug.print("{s}: non-ASCII 0x{X} at byte {d}\n", .{ d.name, c, i });
             try std.testing.expect(c < 0x80);
         }
+    }
+}
+
+// A register index at or above its `.reg` declaration is another whole-module
+// ptxas rejection that only shows up on a GPU box at JIT time, and it is the
+// easy mistake to make when adding an instruction to a hand-authored kernel: the
+// declarations sit a hundred lines above the edit. Same walk as the ASCII test,
+// same reason.
+test "every PTX kernel stays inside its register declarations" {
+    @setEvalBranchQuota(200_000);
+    const self = @This();
+    inline for (@typeInfo(self).@"struct".decls) |d| {
+        if (comptime !std.mem.endsWith(u8, d.name, "_ptx")) continue;
+        try checkRegisterBounds(d.name, @field(self, d.name));
+    }
+}
+
+/// Every `%<name><digits>` in `src` must be below the count declared for
+/// `%<name>` by a `.reg ... %<name><N>;` line.
+fn checkRegisterBounds(name: []const u8, src: []const u8) !void {
+    // Declared counts, keyed by register prefix ("r", "f", "rd", "p", "h", "rs").
+    var decls: std.StringHashMapUnmanaged(u32) = .empty;
+    defer decls.deinit(std.testing.allocator);
+
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, src, i, "%")) |at| {
+        i = at + 1;
+        var j = i;
+        while (j < src.len and std.ascii.isAlphabetic(src[j])) j += 1;
+        const prefix = src[i..j];
+        if (prefix.len == 0 or j == src.len) continue;
+        if (src[j] == '<') { // a declaration: %r<64>
+            const close = std.mem.indexOfScalarPos(u8, src, j, '>') orelse continue;
+            const n = std.fmt.parseInt(u32, src[j + 1 .. close], 10) catch continue;
+            try decls.put(std.testing.allocator, prefix, n);
+            i = close;
+            continue;
+        }
+        var k = j;
+        while (k < src.len and std.ascii.isDigit(src[k])) k += 1;
+        if (k == j) continue; // %tid.x and friends
+        const idx = std.fmt.parseInt(u32, src[j..k], 10) catch continue;
+        const declared = decls.get(prefix) orelse continue;
+        errdefer std.debug.print(
+            "{s}: %{s}{d} used but only %{s}<{d}> declared\n",
+            .{ name, prefix, idx, prefix, declared },
+        );
+        try std.testing.expect(idx < declared);
+        i = k;
     }
 }
 
