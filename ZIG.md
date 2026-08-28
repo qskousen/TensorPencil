@@ -460,3 +460,191 @@ under `setarch -R`, which is the signature of an uninitialised SCALAR.
 Use `core/init_defaults.zig` (`tp_core.init_defaults`): `var self: T = init_defaults.of(T)` applies every
 declared default and leaves the rest undefined, so an init keeps its
 field-by-field shape without the class of bug.
+
+## A slice of an inline array in a by-value return dangles at the `return`
+
+`WeightStore.get` hands back a `TensorView` **by value**, and `view.info.shape`
+holds its dims in an inline `[8]usize`. So `view.info.shape.slice()` points into
+that temporary. Using it while the view is still in scope is fine, which is what
+every model loader does:
+
+```zig
+const view = store.get(name) orelse return error.MissingTensor;
+const shape = view.info.shape.slice();   // fine: `view` outlives `shape`
+```
+
+Wrapping the same two lines in a helper that returns the slice does not:
+
+```zig
+fn shapeOf(store: WeightStore, name: []const u8) ![]const usize {
+    const view = store.get(name) orelse return error.MissingTensor;
+    return view.info.shape.slice();      // `view` dies HERE
+}
+```
+
+The read-back is `0x5555555555555555` (6148914691236517205), not a segfault, so
+it surfaces as a nonsense dimension somewhere downstream rather than at the bad
+access. It is also position-dependent: the first few callers happened to read
+intact stack, and only a value captured early and used late came back garbage.
+
+Copy the dims out instead of borrowing them. Applies to any accessor returning a
+slice of a field of a by-value struct, not just `Shape`.
+
+## `Dir.makePath` → `Dir.createDirPath`
+
+`std.Io.Dir` spells the recursive-mkdir as `createDirPath(dir, io, sub_path)`.
+The single-level form is `createDir(dir, io, sub_path, permissions)`. There is no
+`makePath` / `makeDir` any more, so the old names fail to compile rather than
+silently doing nothing.
+
+## `{e}` is the scientific-notation specifier, not `{d:.3e}`
+
+`std.fmt` rejects `{d:.3e}` with "extraneous trailing character 'e'". Use `{e}`
+for scientific notation (precision is not settable the same way) or `{d}` /
+`{d:.3}` for decimal.
+
+## A truncating integer divide in emitted kernel code is silent, not fatal
+
+`buildPrep` sized its FWHT work as `ngroups * 64 / 256` butterflies per thread.
+Where that divides exactly the kernel is correct; where it does not, the emitted
+loop simply runs one iteration short and the tail of every row keeps its
+unrotated basis. No error, no assert, no NaN — just a GEMM in the wrong basis,
+22% off, on one model and not the others.
+
+The file already guarded the `== 0` case ("would silently skip the rotation
+entirely") and reasoned about exactly this hazard, but only at the boundary. A
+truncated non-zero count is the same bug with a smaller blast radius, which is
+what made it survive.
+
+When emitting code, any `a / b` that decides HOW MUCH WORK a thread does needs
+`(a + b - 1) / b` plus a tail guard, or an explicit refusal. Prefer exposing the
+count as a plain function and testing the covering property without a device —
+`prepButterflyIters` and its test are the pattern.
+
+## A reference's "tiling" flag can be semantic, not an optimization
+
+MiniMax H3's video VAE defaults to `tiling = True`, and its decode entry point
+therefore ALWAYS goes through the tiled path: 256 px tiles, >=64 px overlap,
+blended. That is not a memory bound to be skipped on a big GPU — the transformer
+inside never sees more than `tile / patch` tokens per axis, and running it on a
+whole frame produces per-patch incoherence (a visible grid wherever the image has
+detail).
+
+It hid because a frame at or below the tile size is exactly ONE tile, so the
+small shapes every fixture used were identical either way, and the fixture
+generator had set `tiling = False` to "simplify".
+
+Before treating a reference's tiling/chunking as an optimization, check what its
+own default entry point calls, and make at least one fixture LARGER than the tile.
+
+## MP4 drops unknown metadata keys, silently
+
+`av_dict_set(&fc->metadata, "parameters", ...)` then `avformat_write_header` writes
+NOTHING for an MP4: isom keeps only the handful of keys it defines, and an
+unrecognized one is discarded with no error and no warning. Pass the muxer option
+`movflags = use_metadata_tags` to `avformat_write_header` and unknown keys go into
+a udta atom instead.
+
+Check a metadata write actually landed (`ffprobe -show_entries format_tags`)
+rather than trusting the return code — it is 0 either way.
+
+## cuBLASLt's `beta` is a free accumulate, and it matters more than the GEMM
+
+`cublasLtMatmul` takes C and D separately, but our `ltRun` already hands it the
+same buffer and layout for both, so `beta = 1` turns any GEMM into
+`D += alpha * (A @ B)` at no cost beyond reading D. The plan cache is keyed on
+shape, not on beta, so an existing cached plan serves both.
+
+The reason to reach for it: a GEMM followed by a separate scaled-add kernel is
+three extra passes over the f32 output plane (write the scratch, read it,
+read-modify-write the destination) on top of the GEMM's own write. For the LoRA
+sidecar at MiniMax H3's widths that was ~70 GB of DRAM traffic per step, measured
+at roughly TWICE the two GEMMs it served. It also means a scratch plane that does
+not need to exist (205 MB at H3's native canvas).
+
+Two traps around measuring this:
+
+- A FLOP count cannot see it. The estimate that motivated the sidecar said 3-4%
+  of a step; the GEMMs alone were +7% and the unfused accumulate another +19%.
+- The hand-PTX `hgemm` writes its C tiles unconditionally, so the `zig-cuda` arm
+  has no equivalent. `opGemmBf16Acc` returns `error.UnsupportedKernelArm` there
+  rather than overwriting, because silently overwriting would drop the base GEMM's
+  output — a plausible wrong render.
+
+## A whole-render wall clock measures the page cache, not the change
+
+Timing a multi-GB-model render end to end on a box whose free RAM is smaller than
+the checkpoint gives a number dominated by first-touch reads. Observed: the SAME
+1-step configuration took 42 s and 131 s in two runs an hour apart, and a 24-step
+render came out FASTER than an 8-step one.
+
+Difference step counts, or better, instrument the loop and print the per-step time
+(`generateClip` now does). Even then, interleave the A and B configurations within
+a round and repeat: this 3090's steady-state step time drifts ±30% between rounds
+while a no-LoRA baseline held 0.78-0.81 s, so only within-round pairs compare.
+
+## cuBLASLt has no f32 arm until you add one, and TF32 is not it
+
+`ltPlan` in `gpu/cuda/backend.zig` had `LtKind = { i8, f16, bf16 }`, so the only
+f32-precision GEMM available was a one-thread-per-output kernel. Adding an `.f32`
+arm is four lines (`R_32F` for A/B and D, `COMPUTE_32F`, `R_32F` scale) and gives a
+properly tiled f32 GEMM.
+
+Use `CUBLAS_COMPUTE_32F`, **not** `CUBLAS_COMPUTE_32F_FAST_TF32`. TF32 keeps 10
+mantissa bits, which is the same precision as the f16 path an f32 arm exists to
+avoid; the point is the other 13 bits, not the tensor cores.
+
+Measured on MiniMax H3's BigVGAN vocoder (`minimax-h3-audio-cuda-test`), device
+against the f32 CPU reference:
+
+| conv GEMM | rel L2 | worst sample | time at 37 latent frames |
+|---|---|---|---|
+| f16 tensor cores | 2.4e-3 | 8.3e-3 | 82 ms |
+| f32 cuBLASLt | 9.5e-6 | 2.8e-5 | **75 ms** |
+| f32 naive kernel | 9.5e-6 | 2.8e-5 | 518 ms |
+
+Two things worth carrying: for a VOCODER, -42 dB with 74% of samples past 1e-4 is
+an audible noise floor, not "close enough"; and the tensor-core path was **not
+faster** at these widths, because the per-conv weight-pad and activation-convert
+passes cost more than the MMA wins. Reaching for f16 because it is the fast option
+was wrong on both axes.
+
+## A 1-D conv's replicate padding and slicing vanish if you write it as a gather
+
+BigVGAN's anti-aliased activation is seven ops in the reference: pad, stride-2
+transposed conv, slice, scale by the ratio, snake, pad, stride-2 conv. Written as a
+gather over the OUTPUT index it is two kernels with one intermediate: replicate
+padding becomes `max(0, min(len-1, i))` on the source index, the slice becomes a
+constant added to it, and a transposed conv's contributing taps at output `t` are
+exactly `j == (t + pad) mod stride`, i.e. `k / stride` of them.
+
+The same trick removes the atomics a scattered transposed conv would need. And
+device signals want to be CHANNEL-LAST for it: a warp then covers consecutive
+channels at one time step, which is consecutive memory, and it removes the
+transpose an im2col GEMM otherwise pays on both sides. The conv weight has to be
+permuted to match the patch matrix's column order (`(tap, in_ch)`), which is a
+load-time pass, not a kernel.
+
+## A conditioned output's level is not a bug until the conditioning is swept
+
+MiniMax H3's audio came out at -52 dBFS and I spent a round concluding the sampler's
+audio carry was wrong: swept the flow shifts, instrumented the latent handed to the
+vocoder, checked the carry against the reference line by line. All of it held up,
+which should have been the signal.
+
+The level is conditioned by the PROMPT. The same seed and shifts with an explicit
+`overall_soundscape:` section render at -17.7 dBFS instead of -52.4 — **35 dB from
+the text alone**. The prompt I had been using for every render in the session
+described a fox in snow and no sound at all.
+
+Two transferable mistakes:
+
+- **I swept an axis the quantity does not ride** (the shifts) while holding fixed the
+  axis it does (the prompt), and read the resulting flatness as evidence of a defect.
+  A flat sweep is evidence the axis is wrong, not that the code is.
+- **I measured a proxy and treated it as the quantity.** The audio latent's rms moves
+  0.327 -> 0.395 across that 35 dB output swing, so it could never have answered the
+  question I was asking it.
+
+Before calling a generative model's output level, colour, or sharpness a defect,
+vary the conditioning first, and measure the output rather than an intermediate.

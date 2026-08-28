@@ -47,6 +47,7 @@ const tokenizer_mod = @import("tp_core").tokenizer;
 const t5_tokenizer = @import("tp_core").t5_tokenizer;
 const noise_mod = @import("tp_core").noise;
 const safetensors = @import("tp_core").safetensors;
+const audio_file = @import("tp_core").audio;
 const gguf_mod = @import("tp_core").gguf;
 const weights_mod = @import("tp_core").weights;
 const sampler = @import("tp_core").sampler;
@@ -62,6 +63,19 @@ const zimage_cuda = @import("tp_models").models.zimage_cuda;
 const anima_gpu = @import("tp_models").models.anima_gpu;
 const anima_cuda = @import("tp_models").models.anima_cuda;
 const anima = @import("tp_models").models.anima;
+const minimax_h3 = @import("tp_models").models.minimax_h3;
+const minimax_h3_vae = @import("tp_models").models.minimax_h3_vae;
+const minimax_h3_audio = @import("tp_models").models.minimax_h3_audio;
+const minimax_h3_audio_cuda = @import("tp_models").models.minimax_h3_audio_cuda;
+const minimax_h3_present = @import("tp_models").models.minimax_h3_present;
+const minimax_h3_vit = @import("tp_models").models.minimax_h3_vit;
+const minimax_h3_vae_encode = @import("tp_models").models.minimax_h3_vae_encode;
+const minimax_h3_vae_encode_cuda = @import("tp_models").models.minimax_h3_vae_encode_cuda;
+const minimax_h3_audio_encode = @import("tp_models").models.minimax_h3_audio_encode;
+const minimax_h3_audio_encode_cuda = @import("tp_models").models.minimax_h3_audio_encode_cuda;
+const minimax_h3_cuda = @import("tp_models").models.minimax_h3_cuda;
+const lora_mod = @import("tp_models").models.lora;
+const minimax_h3_vae_cuda = @import("tp_models").models.minimax_h3_vae_cuda;
 const dit_gpu = @import("tp_models").models.dit_gpu;
 const dit_cuda = @import("tp_models").models.dit_cuda;
 const qwen3_cuda = @import("tp_models").models.qwen3_cuda;
@@ -261,6 +275,20 @@ pub const Options = struct {
     explicit_text_encoder: bool = false,
     explicit_text_encoder_2: bool = false,
     explicit_vae: bool = false,
+    /// MiniMax H3's AUDIO VAE. A second decoder is not a variant of the first:
+    /// they resolve independently, so this has its own path and its own flag.
+    vae_2_path: []const u8 = "",
+    explicit_vae_2: bool = false,
+    /// Optional denoiser LoRA, applied as a runtime low-rank sidecar rather than
+    /// merged (`models/lora.zig`). Empty means none.
+    ///
+    /// Not a resolvable `Component`: a LoRA never ships inside the checkpoint it
+    /// patches, so there is nothing for `resolveComponent` to prefer, and a
+    /// defaulted path would silently apply a LoRA nobody asked for.
+    lora_path: []const u8 = "",
+    /// Multiplies every factor's `alpha / rank`. Folded in at load, so changing
+    /// it means reloading the sidecar.
+    lora_strength: f32 = 1.0,
     /// Optional per-step progress hook (see `Progress`).
     on_step: ?Progress = null,
     /// Compute a latent2rgb preview each step and pass it to `on_step`.
@@ -326,6 +354,141 @@ pub const Reclaim = struct {
     call: *const fn (ctx: *anyopaque, needed: u64) u64,
 };
 
+/// The scheduler a family samples with when the caller did not choose one. Mirrors
+/// `schedule.Scheduler.defaultFor`, which takes a sigma table rather than a family.
+pub fn defaultSchedulerFor(fam: Family) sampler.Scheduler {
+    return switch (fam) {
+        // Every flow-matching family; `simple` is what ComfyUI's own templates
+        // select for each, including Anima's `image_anima_base_v1`, which pairs it
+        // with 30 steps and cfg 4. H3 belongs here structurally rather than by
+        // template: `schedule.Scheduler.defaultFor` keys on the sigma TABLE, and
+        // H3's is `discrete_flow`, the same arm that already answers `simple`.
+        .krea2, .zimage, .anima, .minimax_h3 => .simple,
+        .sd15, .sdxl => .normal,
+    };
+}
+
+/// Build an AUTOMATIC1111-style `parameters` metadata string. Format:
+///
+///     <prompt>
+///     Negative prompt: <negative>            (omitted when empty)
+///     Steps: N, Sampler: Euler, Schedule type: S, CFG scale: C, Seed: S, Size: WxH, Model: <name>, Prompt syntax: X
+///
+/// `model_name` is the diffusion checkpoint's file stem; `fam` names the schedule
+/// (the "Schedule type" field is dropped when it is null). Caller frees.
+///
+/// `Prompt syntax` is not decoration, and the block is wrong without it. A reader
+/// (including ComfyUI's own metadata importer) re-renders from these fields, and the very
+/// same prompt text means a DIFFERENT image in the two dialects, `(x:1.2)` multiplies in
+/// one and replaces in the other, `[x]` is de-emphasis in one and literal text in the
+/// other. A1111's own format has no field for this because A1111 only ever has one
+/// dialect; here it has to be recorded, on the same reasoning that made `Sampler` and
+/// `Schedule type` stop being hardcoded. `Emphasis` rides along only when it can matter.
+///
+/// `Compat` is the same argument again, and for a bigger effect. It selects whose
+/// *sampling* conventions ran, including which RNG drew the noise, which decides whether
+/// a seed means the same starting latent at all. `RNG`/`SGM noise multiplier` appear only
+/// when they were overridden away from that compat's own defaults, so an ordinary ComfyUI
+/// render's block carries neither. `RNG` keeps A1111's
+/// own spelling of the field and its values, since that is what a reader will recognize.
+pub fn buildA1111Params(
+    gpa: std.mem.Allocator,
+    prompt: []const u8,
+    negative: []const u8,
+    steps: usize,
+    cfg: f32,
+    seed: u64,
+    width: usize,
+    height: usize,
+    model_name: []const u8,
+    fam: ?Family,
+    samp: sampler.Kind,
+    sched: ?sampler.Scheduler,
+    syntax: PromptSyntax,
+    emphasis: Emphasis,
+    compat: Compat,
+    /// The resolved form, compared against `compat`'s own defaults to decide which
+    /// overrides need recording.
+    cc: CompatConfig,
+) ![]u8 {
+    const neg_line = if (negative.len > 0)
+        try std.fmt.allocPrint(gpa, "Negative prompt: {s}\n", .{negative})
+    else
+        try gpa.dupe(u8, "");
+    defer gpa.free(neg_line);
+    // The scheduler actually used, not a guess from the architecture. Deriving it
+    // from the family is right only while the scheduler is not selectable, and a
+    // reader (including ComfyUI's own metadata importer) re-renders from this field.
+    // An explicit choice wins; otherwise name the
+    // family's default, and drop the field entirely when even that is unknown.
+    const sched_line = if (sched) |sc|
+        try std.fmt.allocPrint(gpa, "Schedule type: {s}, ", .{sc.a1111Name()})
+    else if (fam) |f|
+        try std.fmt.allocPrint(gpa, "Schedule type: {s}, ", .{defaultSchedulerFor(f).a1111Name()})
+    else
+        try gpa.dupe(u8, "");
+    defer gpa.free(sched_line);
+    const syntax_name: []const u8 = switch (syntax) {
+        .comfy => "ComfyUI",
+        .a1111 => "A1111",
+    };
+    // Only under `.a1111`, under `.comfy` there is exactly one weighting form, so the
+    // field would imply a choice that does not exist.
+    const emph_line = if (syntax == .a1111)
+        try std.fmt.allocPrint(gpa, ", Emphasis: {s}", .{switch (emphasis) {
+            .original => "Original",
+            .no_norm => "No norm",
+            .ignore => "Ignore",
+        }})
+    else
+        try gpa.dupe(u8, "");
+    defer gpa.free(emph_line);
+
+    const compat_line = if (compat == .comfy)
+        try gpa.dupe(u8, "")
+    else
+        try gpa.dupe(u8, ", Compat: A1111");
+    defer gpa.free(compat_line);
+
+    // Only the knobs that were actually overridden, so the common block is unchanged.
+    const base: CompatConfig = .of(compat);
+    var extra: std.ArrayList(u8) = .empty;
+    defer extra.deinit(gpa);
+    if (cc.noise_src != base.noise_src) try extra.print(gpa, ", RNG: {s}", .{switch (cc.noise_src) {
+        .torch_cpu => "CPU",
+        .nv_philox => "NV",
+    }});
+    if (cc.sgm_noise_multiplier != base.sgm_noise_multiplier) {
+        try extra.print(gpa, ", SGM noise multiplier: {s}", .{if (cc.sgm_noise_multiplier) "True" else "False"});
+    }
+    if (cc.quantize_timestep != base.quantize_timestep) {
+        try extra.print(gpa, ", Quantize timesteps: {s}", .{if (cc.quantize_timestep) "True" else "False"});
+    }
+
+    return std.fmt.allocPrint(
+        gpa,
+        "{s}\n{s}Steps: {d}, Sampler: {s}, {s}CFG scale: {d:.1}, Seed: {d}, Size: {d}x{d}, Model: {s}, Prompt syntax: {s}{s}{s}{s}",
+        .{ prompt, neg_line, steps, samp.a1111Name(), sched_line, cfg, seed, width, height, model_name, syntax_name, emph_line, compat_line, extra.items },
+    );
+}
+
+/// Append a clip's flow shifts to a `buildA1111Params` block, freeing `base`.
+///
+/// A separate function rather than two more parameters on the builder, which
+/// already has fourteen and sixteen call sites. It is not a second copy of the
+/// format: it lives beside the builder and extends the same trailing
+/// comma-separated tail, so the image path's output stays byte-identical and a
+/// reader parses one grammar.
+///
+/// These belong in the block for the reason every other field does: a reader
+/// re-renders from it, and H3's two shifts change both the video schedule AND the
+/// audio level. Recording only the video one, or neither, hands back a different
+/// clip.
+pub fn appendClipParams(gpa: std.mem.Allocator, base: []u8, shifts: minimax_h3.Shifts) ![]u8 {
+    defer gpa.free(base);
+    return std.fmt.allocPrint(gpa, "{s}, Shift: {d:.4}, Audio shift: {d:.4}", .{ base, shifts.video, shifts.audio });
+}
+
 pub const Image = struct {
     /// Interleaved RGB, [height][width][3].
     rgb: []u8,
@@ -338,12 +501,170 @@ pub const Image = struct {
     }
 };
 
+/// What a sampling run is shaped like: the latent's dims, and for the families
+/// whose latent is a *pair* of streams, the second one too.
+///
+/// This replaced a `(lat_h, lat_w)` pair threaded through the stage API. The
+/// still-image families are `t == 1, audio == null`, which is why they read the
+/// same as before; a video family sets `t`, and MiniMax H3 additionally carries
+/// an audio stream that is denoised in the same pass.
+///
+/// A flat latent buffer is the visual stream followed by the audio stream, which
+/// is the layout ComfyUI packs too (its audio slice starts at `prod(visual)`).
+/// `audioOffset` is that split.
+pub const LatentShape = struct {
+    /// The audio stream of an audio-video latent: `[channels][streams][t]`,
+    /// stereo packed as two whole time axes rather than interleaved.
+    pub const Audio = struct {
+        channels: usize,
+        /// Stereo is 2. Named `streams` rather than `channels` because
+        /// `channels` above is the latent's feature count, not the speaker count.
+        streams: usize,
+        t: usize,
+
+        pub fn elems(self: Audio) usize {
+            return self.channels * self.streams * self.t;
+        }
+    };
+
+    channels: usize,
+    /// Latent frames. 1 for every still-image family.
+    t: usize = 1,
+    h: usize,
+    w: usize,
+    /// Null for every family whose latent is a single stream.
+    audio: ?Audio = null,
+
+    pub fn plane(self: LatentShape) usize {
+        return self.h * self.w;
+    }
+
+    /// Elements in the visual stream: image or video, whichever this is.
+    pub fn visualElems(self: LatentShape) usize {
+        return self.channels * self.t * self.plane();
+    }
+
+    pub fn audioElems(self: LatentShape) usize {
+        return if (self.audio) |a| a.elems() else 0;
+    }
+
+    /// Total elements of the packed flat latent.
+    pub fn elems(self: LatentShape) usize {
+        return self.visualElems() + self.audioElems();
+    }
+
+    /// Where the audio stream starts in a packed flat latent.
+    pub fn audioOffset(self: LatentShape) usize {
+        return self.visualElems();
+    }
+
+    /// Whether this is a moving picture rather than a still. Not the same
+    /// question as whether the family CAN do video: a one-frame render of a
+    /// video family is still a still.
+    pub fn isVideo(self: LatentShape) bool {
+        return self.t > 1;
+    }
+
+    pub fn eql(a: LatentShape, b: LatentShape) bool {
+        if (a.channels != b.channels or a.t != b.t or a.h != b.h or a.w != b.w) return false;
+        if ((a.audio == null) != (b.audio == null)) return false;
+        if (a.audio) |aa| {
+            const bb = b.audio.?;
+            if (aa.channels != bb.channels or aa.streams != bb.streams or aa.t != bb.t) return false;
+        }
+        return true;
+    }
+};
+
+/// A decoded clip: frames plus the soundtrack the same run produced.
+///
+/// Plain data on purpose. Muxing lives in the driver (`src/av.zig`, libav,
+/// linked into the executables only) so the library tier stays pure Zig, the
+/// same split the libvips image decode already uses.
+pub const Clip = struct {
+    /// Interleaved RGB for every frame back to back, [frames][height][width][3],
+    /// one allocation.
+    rgb: []u8,
+    frames: usize,
+    width: usize,
+    height: usize,
+    /// Frame rate as an exact rational, because a container needs one and 24/1
+    /// is not the only rate a family might use.
+    fps_num: u32,
+    fps_den: u32 = 1,
+    /// Interleaved samples in [-1, 1], [samples][audio_channels]. Empty when the
+    /// family produces no audio.
+    audio: []f32 = &.{},
+    audio_channels: usize = 0,
+    audio_sample_rate: u32 = 0,
+
+    pub fn frameBytes(self: Clip) usize {
+        return self.width * self.height * 3;
+    }
+
+    pub fn frame(self: Clip, i: usize) []u8 {
+        const n = self.frameBytes();
+        return self.rgb[i * n ..][0..n];
+    }
+
+    pub fn hasAudio(self: Clip) bool {
+        return self.audio.len > 0;
+    }
+
+    /// Samples per audio channel.
+    pub fn audioFrames(self: Clip) usize {
+        return if (self.audio_channels == 0) 0 else self.audio.len / self.audio_channels;
+    }
+
+    pub fn deinit(self: *Clip, gpa: std.mem.Allocator) void {
+        gpa.free(self.rgb);
+        if (self.audio.len > 0) gpa.free(self.audio);
+        self.* = undefined;
+    }
+};
+
 /// Stripped conditioning: [seq][12][2560] plus its length. Produced by
 /// `Session.encode`, consumed by `Session.denoiser` / `Session.predict`; the
 /// caller owns `data`.
+/// A MiniMax H3 prompt's reference payload: the layout shapes, the DiT's
+/// condition rows and the text region's VIDEO-tagged spans, all derived from the
+/// same pass over the pictures.
+pub const H3Refs = struct {
+    /// Keyframe layout shapes. They come FIRST in the packed layout, before the
+    /// references, so `cond_video` concatenates them in that order too.
+    keyframes: []minimax_h3.Keyframe,
+    /// Per-reference layout shapes, in request order.
+    refs: []minimax_h3.Ref,
+    /// Patchified condition rows for every reference, concatenated in layout
+    /// order. `[total_video_cond_rows][videoPatchDim]`.
+    cond_video: []f32,
+    /// The same for the AUDIO condition rows, concatenated in the same layout
+    /// order. `[total_audio_cond_rows][audio_latent_channels]`, and empty when no
+    /// reference carries a soundtrack.
+    cond_audio: []f32,
+    /// One per spliced vision block, widened by one on each side.
+    tag_spans: []minimax_h3.VisionSpan,
+
+    pub fn deinit(self: *H3Refs, gpa: std.mem.Allocator) void {
+        gpa.free(self.keyframes);
+        gpa.free(self.refs);
+        gpa.free(self.cond_video);
+        gpa.free(self.cond_audio);
+        gpa.free(self.tag_spans);
+        self.* = undefined;
+    }
+};
+
 pub const Cond = struct {
     data: []f32,
     seq: usize,
+    /// MiniMax H3 only: what the references contribute to the DIT, produced by
+    /// `encode` because that is where the pictures were processed.
+    ///
+    /// It rides on the conditioning for the same reason SDXL's pooled vector does:
+    /// the layout and the payload need it, and deriving it again from a
+    /// re-tokenized prompt is how the two would drift apart.
+    h3: ?H3Refs = null,
     /// SDXL's pooled CLIP-G vector (1280). Null for the families that do not use one.
     ///
     /// It rides on the conditioning rather than being folded into it because the vector
@@ -393,6 +714,7 @@ pub const Cond = struct {
     pub fn deinit(self: *Cond, gpa: std.mem.Allocator) void {
         gpa.free(self.data);
         if (self.pooled) |p| gpa.free(p);
+        if (self.h3) |*r| r.deinit(gpa);
         if (self.sched) |s| {
             // The extras are plain Conds with no schedule of their own, so this recurses
             // exactly one level.
@@ -419,6 +741,31 @@ pub const EncodeOptions = struct {
     /// caller that is not rendering a schedule wants.
     steps: usize = 0,
     cancel: ?*std.atomic.Value(bool) = null,
+    /// MiniMax H3 reference pictures, in REQUEST order. Empty is t2va, which is
+    /// exactly the tokenized prompt. Ignored by every other family.
+    ///
+    /// Pixels rather than shapes: `encode` runs both towers itself, because the
+    /// LLM's features and the DiT's condition rows have to describe the same
+    /// resized image and only one place should decide that.
+    h3_ref_images: []const Session.RefImage = &.{},
+    /// Pixel-area cap for the reference resize (the reference's `ref_image_size`
+    /// policy). 0 takes the `max` behaviour, a 2048 px short edge.
+    h3_ref_area: usize = 0,
+    /// MiniMax H3 reference VIDEOS, after the images: that is the reference's own
+    /// presentation order, and the `<Video k>` ordinals count within it.
+    h3_ref_videos: []const Session.RefVideo = &.{},
+    /// Standalone MiniMax H3 reference SOUNDTRACKS, after the videos. A reference
+    /// video's own soundtrack rides on the video instead, and is labelled where
+    /// the video is.
+    h3_ref_audios: []const Session.RefAudio = &.{},
+    /// Target clip length in frames, which caps how much of a reference video is
+    /// used. 0 means no cap.
+    h3_target_frames: usize = 0,
+    /// MiniMax H3 keyframes, anchored at a pixel frame. Resized to the canvas
+    /// below, which a keyframe shares with the target unlike a reference.
+    h3_keyframes: []const Session.KeyframeReq = &.{},
+    h3_canvas_h: usize = 0,
+    h3_canvas_w: usize = 0,
 };
 
 /// Which prompt dialect to parse. The two are NOT variations on a theme: see
@@ -1363,7 +1710,10 @@ fn channelLastToPlanar(dst: []f32, src: []const f32, ch: usize, plane: usize) vo
 /// `conditioner2` exists only for SDXL, which conditions on two text towers whose
 /// outputs are concatenated. Asking any other family for it is a programming error
 /// (`error.NoSuchComponent`), not a missing-weights condition.
-pub const Component = enum { denoiser, conditioner, conditioner2, decoder };
+/// `decoder2` exists only for MiniMax H3, whose latent is a pair of streams and
+/// which therefore has a second VAE (the audio one). Asking any other family for
+/// it is `error.NoSuchComponent`, the same as `conditioner2`.
+pub const Component = enum { denoiser, conditioner, conditioner2, decoder, decoder2 };
 
 /// Where a component's weights were found: a store in which it sits at the root
 /// (wrapped in a `weights.Prefixed` view when it was nested), plus the file it came
@@ -1395,6 +1745,16 @@ const Resolved = struct {
 /// checkpoint as Anima and then fail on ~100 missing adapter weights.
 pub const anima_probe = "llm_adapter.blocks.0.cross_attn.q_proj.weight";
 
+/// The tensor PAIR that says "this is a MiniMax H3 denoiser", used by both
+/// `detectFamily` and `componentSpec`, the same sharing the Anima probe exists for.
+///
+/// ComfyUI's own test is BOTH tensors, and both is what identifies it: a patch
+/// projection for each of the two streams is exactly what makes H3 a joint
+/// audio-video model rather than a video one. `componentSpec`'s probe list is
+/// OR'd (any hit resolves the component), so the AND lives in `detectFamily`.
+pub const minimax_h3_video_probe = "video_patch_proj.weight";
+pub const minimax_h3_audio_probe = "audio_patch_proj.weight";
+
 pub const ComponentSpec = struct { prefixes: []const []const u8, probes: []const []const u8 };
 
 pub fn componentSpec(fam: Family, comp: Component) error{NoSuchComponent}!ComponentSpec {
@@ -1403,7 +1763,7 @@ pub fn componentSpec(fam: Family, comp: Component) error{NoSuchComponent}!Compon
             .denoiser => .{ .prefixes = &.{ "model.diffusion_model.", "" }, .probes = &.{"blocks.0.attn.wq.weight"} },
             .conditioner => .{ .prefixes = &.{ "text_encoders.", "" }, .probes = &.{ "model.language_model.embed_tokens.weight", "embed_tokens.weight" } },
             .decoder => .{ .prefixes = &.{ "first_stage_model.", "vae.", "" }, .probes = &.{"decoder.conv1.weight"} },
-            .conditioner2 => error.NoSuchComponent,
+            .conditioner2, .decoder2 => error.NoSuchComponent,
         },
         .sd15 => switch (comp) {
             .denoiser => .{ .prefixes = &.{ "model.diffusion_model.", "" }, .probes = &.{"input_blocks.0.0.weight"} },
@@ -1413,7 +1773,7 @@ pub fn componentSpec(fam: Family, comp: Component) error{NoSuchComponent}!Compon
                 .probes = &.{"final_layer_norm.weight"},
             },
             .decoder => .{ .prefixes = &.{ "first_stage_model.", "" }, .probes = &.{"decoder.conv_in.weight"} },
-            .conditioner2 => error.NoSuchComponent,
+            .conditioner2, .decoder2 => error.NoSuchComponent,
         },
         // Z-Image ships as three separate files in the official layout, but the
         // resolver is the same: each component is looked for in the primary
@@ -1428,7 +1788,7 @@ pub fn componentSpec(fam: Family, comp: Component) error{NoSuchComponent}!Compon
             .denoiser => .{ .prefixes = &.{ "model.diffusion_model.", "" }, .probes = &.{"cap_embedder.1.weight"} },
             .conditioner => .{ .prefixes = &.{ "text_encoders.", "" }, .probes = &.{ "model.embed_tokens.weight", "embed_tokens.weight" } },
             .decoder => .{ .prefixes = &.{ "first_stage_model.", "vae.", "" }, .probes = &.{"decoder.conv_in.weight"} },
-            .conditioner2 => error.NoSuchComponent,
+            .conditioner2, .decoder2 => error.NoSuchComponent,
         },
         // Anima normally BUNDLES its VAE (a single-file checkpoint carrying
         // `first_stage_model.*` alongside `model.diffusion_model.*`) and ships its
@@ -1451,6 +1811,40 @@ pub fn componentSpec(fam: Family, comp: Component) error{NoSuchComponent}!Compon
             .denoiser => .{ .prefixes = &.{ "model.diffusion_model.", "net.", "" }, .probes = &.{anima_probe} },
             .conditioner => .{ .prefixes = &.{ "text_encoders.", "" }, .probes = &.{ "model.embed_tokens.weight", "embed_tokens.weight" } },
             .decoder => .{ .prefixes = &.{ "first_stage_model.", "vae.", "" }, .probes = &.{"decoder.conv1.weight"} },
+            .conditioner2, .decoder2 => error.NoSuchComponent,
+        },
+        // MiniMax H3 is the one family with two decoders, so it is the only one
+        // that answers `decoder2` (its audio VAE). Both VAEs normally ship as
+        // side files, and the DiT alone is 21 GB, so a bundled H3 is unlikely,
+        // but the resolver decides per component and does not care.
+        //
+        // The conditioner probe is Z-Image's `model.embed_tokens.weight`, not
+        // krea2's `model.language_model.embed_tokens.weight`: H3's Qwen3-VL-32B
+        // export puts its language model at `model.` with the vision tower
+        // beside it at `visual.`, where krea2's Qwen3-VL nests it a level deeper.
+        //
+        // The two decoders are told apart by their own tensor names, and neither
+        // probe can match the other file: the video VAE is the 3D CNN encoder
+        // plus a ViT3D decoder (`decoder.transformer_blocks.*`), the audio VAE a
+        // DAC encoder plus BigVGAN (`decoder.conv_pre.weight`). Handing one to
+        // the other's slot resolves to nothing and says so.
+        .minimax_h3 => switch (comp) {
+            .denoiser => .{
+                .prefixes = &.{ "model.diffusion_model.", "" },
+                .probes = &.{minimax_h3_video_probe},
+            },
+            .conditioner => .{
+                .prefixes = &.{ "text_encoders.", "" },
+                .probes = &.{ "model.embed_tokens.weight", "embed_tokens.weight" },
+            },
+            .decoder => .{
+                .prefixes = &.{ "first_stage_model.", "vae.", "" },
+                .probes = &.{"decoder.transformer_blocks.0.attn.to_qkv.weight"},
+            },
+            .decoder2 => .{
+                .prefixes = &.{ "audio_vae.", "vae.", "" },
+                .probes = &.{"decoder.conv_pre.weight"},
+            },
             .conditioner2 => error.NoSuchComponent,
         },
         // SDXL bundles its two towers under `conditioner.embedders.{0,1}`, and the two
@@ -1467,6 +1861,7 @@ pub fn componentSpec(fam: Family, comp: Component) error{NoSuchComponent}!Compon
                 .probes = &.{"ln_final.weight"},
             },
             .decoder => .{ .prefixes = &.{ "first_stage_model.", "" }, .probes = &.{"decoder.conv_in.weight"} },
+            .decoder2 => error.NoSuchComponent,
         },
     };
 }
@@ -1591,6 +1986,13 @@ pub const Family = enum {
     /// bit-identical to Z-Image's, but the timestep handed to the model is the sigma
     /// itself rather than `(1 - sigma) * 1000`. See `models/anima.zig`.
     anima,
+    /// MiniMax H3, the first family that is not a still-image model: video and
+    /// stereo audio denoised JOINTLY in one packed token sequence, on two
+    /// different sigma schedules. Its latent is a pair of streams, its text
+    /// encoder is a Qwen3-VL-32B truncated to 50 layers, and it has two decoders
+    /// (a ViT3D video VAE and a BigVGAN audio VAE) rather than one. See
+    /// `models/minimax_h3.zig` and VIDEO_PLAN.md.
+    minimax_h3,
 
     /// Whether this family runs the `sd_unet` / `sd_vae` / CLIP stack, i.e. whether
     /// `Session.sd()` returns a model set. SD1.5 and SDXL differ only in configuration
@@ -1599,12 +2001,30 @@ pub const Family = enum {
         return self == .sd15 or self == .sdxl;
     }
 
-    /// The patch-2 denoisers (krea2, Z-Image, Anima) fold 2x2 latent cells into one
-    /// token, so their latent has to be even; the SD UNets take any latent size.
+    /// The patch-2 denoisers (krea2, Z-Image, Anima, H3) fold 2x2 latent cells into
+    /// one token, so their latent has to be even; the SD UNets take any latent size.
     pub fn latentMustBeEven(self: Family) bool {
         return switch (self) {
-            .krea2, .zimage, .anima => true,
+            .krea2, .zimage, .anima, .minimax_h3 => true,
             .sd15, .sdxl => false,
+        };
+    }
+
+    /// Whether a render is a clip rather than a single image, i.e. whether the
+    /// caller gets a `Clip` out of `decode` instead of an `Image`.
+    pub fn isVideo(self: Family) bool {
+        return switch (self) {
+            .minimax_h3 => true,
+            .krea2, .zimage, .anima, .sd15, .sdxl => false,
+        };
+    }
+
+    /// Whether the latent carries an audio stream alongside the visual one, so
+    /// the sampler steps both and `decode` produces a soundtrack.
+    pub fn hasAudio(self: Family) bool {
+        return switch (self) {
+            .minimax_h3 => true,
+            .krea2, .zimage, .anima, .sd15, .sdxl => false,
         };
     }
 };
@@ -1705,6 +2125,56 @@ pub const AnimaModels = struct {
     vae_view: ?*weights_mod.Prefixed,
 };
 
+/// MiniMax H3: a 21 GB int8 DiT, a Qwen3-VL-32B encoder truncated to 50 layers,
+/// and TWO decoders, because the latent is a pair of streams.
+///
+/// Being built out; see VIDEO_PLAN.md for the staging. Today this carries only
+/// what the denoiser checkpoint states about itself, which is what
+/// `Session.latentShape` needs to size a render. The trunk, the encoder and the
+/// two VAEs land on top of it.
+pub const MiniMaxH3Models = struct {
+    /// Qwen2 BPE, the same vocabulary krea2 and Z-Image use. H3's presentation is
+    /// NOT chat-templated: raw prompt text with vision blocks spliced in.
+    tok: tokenizer_mod.Tokenizer,
+    /// Null when that component came out of the primary checkpoint.
+    enc_st: ?Container,
+    enc: qwen3.TextEncoder,
+    dit_st: Container,
+    dit: minimax_h3.DiT,
+    /// The two decoders. Both normally ship as side files; the DiT alone is
+    /// 21 GB, so a bundled H3 is unlikely but the resolver does not care.
+    vae_st: ?Container,
+    vae: minimax_h3_vae.VideoDecoder,
+    audio_st: ?Container,
+    audio: minimax_h3_audio.AudioDecoder,
+    /// The BigVGAN's permuted device weights, built on first device decode. 135 MB
+    /// of host memory, so a render that never reaches the audio stage skips it.
+    audio_cu: ?minimax_h3_audio_cuda.Session = null,
+    /// The Qwen3-VL vision tower, from the text encoder's own `visual.` prefix.
+    /// Loaded only when a render actually references a picture: it is ~350 MB of
+    /// the 27 GB encoder file and t2va never touches it.
+    vit: ?minimax_h3_vit.Vit = null,
+    /// The video VAE's ENCODE side, from the VAE store. Same reasoning: only a
+    /// reference or a keyframe needs it.
+    venc: ?minimax_h3_vae_encode.VideoEncoder = null,
+    /// The audio VAE's ENCODE side, from the audio store. Only a reference
+    /// soundtrack needs it, and it is loaded separately from `venc` because a
+    /// silent reference video needs one and not the other.
+    aenc: ?minimax_h3_audio_encode.AudioEncoder = null,
+    /// The audio encoder's permuted device weights, built on first device encode.
+    aenc_cu: ?minimax_h3_audio_encode_cuda.Session = null,
+    /// The same for the video encoder.
+    venc_cu: ?minimax_h3_vae_encode_cuda.Session = null,
+    enc_view: ?*weights_mod.Prefixed,
+    vae_view: ?*weights_mod.Prefixed,
+    audio_view: ?*weights_mod.Prefixed,
+    /// Optional turbo/style LoRA, attached to `dit`'s linears. The container
+    /// must outlive the sidecar, which holds views into its mapping, and the
+    /// sidecar must outlive the DiT, which holds pointers into it.
+    lora_st: ?Container = null,
+    lora: ?lora_mod.Sidecar = null,
+};
+
 /// The loaded model set, tagged by family. A named type rather than an anonymous
 /// union in the field: an inline `union(Family)` there makes the compiler derive its
 /// name from the first field's type and then report a dependency loop.
@@ -1714,6 +2184,7 @@ pub const Models = union(Family) {
     sdxl: SdModels,
     zimage: ZImageModels,
     anima: AnimaModels,
+    minimax_h3: MiniMaxH3Models,
 };
 
 /// Which family a denoiser checkpoint belongs to, from its tensor names alone.
@@ -1766,6 +2237,18 @@ pub fn detectFamily(store: weights_mod.WeightStore) !Family {
         const ad = std.fmt.bufPrint(&b1, "{s}" ++ anima_probe, .{pfx}) catch continue;
         if (store.get(ad) != null) return .anima;
     }
+    // MiniMax H3, and this is ComfyUI's own test: BOTH patch projections. One
+    // projection per stream is what makes it a joint audio-video model, and
+    // either name alone is a weaker claim than the pair. `componentSpec`'s probe
+    // list cannot express the AND (its probes are OR'd), which is why the pair
+    // lives here and the prefix list is still shared with it.
+    for ((componentSpec(.minimax_h3, .denoiser) catch unreachable).prefixes) |pfx| {
+        var b1: [96]u8 = undefined;
+        var b2: [96]u8 = undefined;
+        const vid = std.fmt.bufPrint(&b1, "{s}" ++ minimax_h3_video_probe, .{pfx}) catch continue;
+        const aud = std.fmt.bufPrint(&b2, "{s}" ++ minimax_h3_audio_probe, .{pfx}) catch continue;
+        if (store.get(vid) != null and store.get(aud) != null) return .minimax_h3;
+    }
     return error.UnknownArchitecture;
 }
 
@@ -1774,7 +2257,7 @@ fn sdConfigs(fam: Family) struct { unet: sd_unet.Config, vae: sd_vae.Config, cli
     return switch (fam) {
         .sd15 => .{ .unet = sd_unet.sd15, .vae = sd_vae.sd15, .clip = clip_text.clip_l },
         .sdxl => .{ .unet = sd_unet.sdxl, .vae = sd_vae.sdxl, .clip = clip_text.clip_l },
-        .krea2, .zimage, .anima => unreachable,
+        .krea2, .zimage, .anima, .minimax_h3 => unreachable,
     };
 }
 
@@ -1831,6 +2314,10 @@ pub fn defaultShift(fam: Family) f32 {
         // different reasons and a future retrain of either must be able to move
         // independently.
         .anima => anima.shift,
+        // The VIDEO shift. H3 has two, and this one drives the sampler's sigma
+        // schedule; the audio stream's is derived from it in closed form inside
+        // the model (`minimax_h3.timeShiftSigma`), so it is not a schedule knob.
+        .minimax_h3 => minimax_h3.shift_video,
         .sd15, .sdxl => sampler.default_shift,
     };
 }
@@ -1840,7 +2327,11 @@ pub fn supportsPromptWeights(fam: Family) bool {
         // Z-Image conditions on a Qwen3 hidden state exactly as krea2 does, so it
         // inherits the same answer from the same encoder type, and for the same
         // structural reason, not by analogy.
-        .krea2, .zimage => qwen3.TextEncoder.supports_prompt_weights,
+        // H3 is here for the same structural reason: it conditions on a Qwen3-VL
+        // hidden state, so there is no fixed token window to interpolate a weight
+        // in. Its presentation is not even chat-templated, it is raw prompt text
+        // with vision blocks spliced in, so there is nothing to anchor against.
+        .krea2, .zimage, .minimax_h3 => qwen3.TextEncoder.supports_prompt_weights,
         // True, where the other Qwen3-conditioned families are false, and the
         // difference is structural rather than a judgement call. krea2 and Z-Image
         // weight the *encoder's* tap states, which have no fixed token window to
@@ -1900,7 +2391,7 @@ pub const Session = struct {
     /// type, so every shared stage binds this once and needs no further family test.
     pub fn sd(self: *Session) ?*SdModels {
         return switch (self.models) {
-            .krea2, .zimage, .anima => null,
+            .krea2, .zimage, .anima, .minimax_h3 => null,
             .sd15 => |*m| m,
             .sdxl => |*m| m,
         };
@@ -1914,6 +2405,7 @@ pub const Session = struct {
             .krea2 => |*m| m.dit_st.store(),
             .zimage => |*m| m.dit_st.store(),
             .anima => |*m| m.dit_st.store(),
+            .minimax_h3 => |*m| m.dit_st.store(),
             .sd15, .sdxl => |*m| m.unet_st.store(),
         };
     }
@@ -1924,6 +2416,7 @@ pub const Session = struct {
             .krea2 => |*m| m.dit_st.payloadLen(),
             .zimage => |*m| m.dit_st.payloadLen(),
             .anima => |*m| m.dit_st.payloadLen(),
+            .minimax_h3 => |*m| m.dit_st.payloadLen(),
             .sd15, .sdxl => |*m| m.unet_st.payloadLen(),
         };
     }
@@ -2143,6 +2636,91 @@ pub const Session = struct {
                 t2 = std.Io.Clock.real.now(io).nanoseconds;
                 self.models = .{ .anima = m };
             },
+            // Four components, not three: the trunk plus a text encoder, a ViT3D
+            // video decoder and a BigVGAN audio decoder, resolved independently.
+            // `generate` is not the entry point here, `generateClip` is (a still
+            // image is not a thing this family produces), so `Session.generate`
+            // reports `error.FamilyNotImplemented`.
+            .minimax_h3 => {
+                var m: MiniMaxH3Models = .{
+                    .tok = undefined,
+                    .enc_st = null,
+                    .enc = undefined,
+                    .dit_st = den_st,
+                    .dit = undefined,
+                    .vae_st = null,
+                    .vae = undefined,
+                    .audio_st = null,
+                    .audio = undefined,
+                    .enc_view = null,
+                    .vae_view = null,
+                    .audio_view = null,
+                };
+                const den = try reportResolve(gpa, fam, .denoiser, m.dit_st.store(), null, false, opts.dit_path);
+                m.dit = try minimax_h3.DiT.load(gpa, den.store);
+                errdefer m.dit.deinit();
+                if (den.view) |v| {
+                    v.deinit(gpa);
+                    gpa.destroy(v);
+                }
+                t1 = std.Io.Clock.real.now(io).nanoseconds;
+
+                try note(progress, "loading text encoder...\n", .{});
+                m.tok = try tokenizer_mod.Tokenizer.init(gpa);
+                errdefer m.tok.deinit();
+                m.enc_st = try openIfGiven(gpa, io, opts.text_encoder_path, opts.explicit_text_encoder);
+                errdefer if (m.enc_st) |*st| st.deinit();
+                const enc_r = try reportResolve(gpa, fam, .conditioner, m.dit_st.store(), storeOf(&m.enc_st), opts.explicit_text_encoder, opts.text_encoder_path);
+                m.enc_view = enc_r.view;
+                m.enc = try qwen3.TextEncoder.loadVariant(gpa, enc_r.store, .minimax_h3);
+                errdefer m.enc.deinit();
+
+                // Two decoders, resolved independently: the video VAE is a ViT3D
+                // and the audio one a BigVGAN, and neither probe can match the
+                // other's file.
+                m.vae_st = try openIfGiven(gpa, io, opts.vae_path, opts.explicit_vae);
+                errdefer if (m.vae_st) |*st| st.deinit();
+                const vae_r = try reportResolve(gpa, fam, .decoder, m.dit_st.store(), storeOf(&m.vae_st), opts.explicit_vae, opts.vae_path);
+                m.vae_view = vae_r.view;
+                m.vae = try minimax_h3_vae.VideoDecoder.load(gpa, vae_r.store);
+                errdefer m.vae.deinit();
+
+                m.audio_st = try openIfGiven(gpa, io, opts.vae_2_path, opts.explicit_vae_2);
+                errdefer if (m.audio_st) |*st| st.deinit();
+                const aud_r = try reportResolve(gpa, fam, .decoder2, m.dit_st.store(), storeOf(&m.audio_st), opts.explicit_vae_2, opts.vae_2_path);
+                m.audio_view = aud_r.view;
+                m.audio = try minimax_h3_audio.AudioDecoder.load(gpa, aud_r.store);
+                errdefer m.audio.deinit();
+
+                t2 = std.Io.Clock.real.now(io).nanoseconds;
+                self.models = .{ .minimax_h3 = m };
+
+                // The LoRA goes on last, after every base weight exists, and
+                // through `self.models` rather than the local `m`: the DiT holds
+                // POINTERS into the sidecar, so attaching before the struct is
+                // moved into place would mean reasoning about whether the move
+                // kept them valid. It also has to happen before any device
+                // workspace is sized, since the sidecar scratch comes from what
+                // is attached; the denoiser builds those per render, well after.
+                if (opts.lora_path.len > 0) {
+                    const h3m = &self.models.minimax_h3;
+                    try note(progress, "loading lora...\n", .{});
+                    h3m.lora_st = try Container.open(gpa, io, opts.lora_path);
+                    errdefer if (h3m.lora_st) |*st| st.deinit();
+                    h3m.lora = try lora_mod.Sidecar.load(gpa, h3m.lora_st.?.store(), opts.lora_strength);
+                    errdefer if (h3m.lora) |*s| s.deinit();
+                    const side = &h3m.lora.?;
+                    if (side.unclaimed > 0) {
+                        std.log.warn("lora: {d} denoiser keys in {s} use a spelling this loader does not know", .{ side.unclaimed, opts.lora_path });
+                    }
+                    const n = try h3m.dit.attachLora(side);
+                    if (n == 0) {
+                        std.log.err("lora: {s} patches none of this checkpoint's linears ({d} targets in the file)", .{ opts.lora_path, side.count() });
+                        return error.ComponentNotInCheckpoint;
+                    }
+                    try note(progress, "  lora: {d} linears, {d} MB, strength {d:.2}\n", .{ n, side.bytes() >> 20, opts.lora_strength });
+                }
+            },
             .sd15, .sdxl => {
                 const cfgs = sdConfigs(fam);
 
@@ -2211,7 +2789,7 @@ pub const Session = struct {
                 self.models = switch (fam) {
                     .sd15 => .{ .sd15 = m },
                     .sdxl => .{ .sdxl = m },
-                    .krea2, .zimage, .anima => unreachable,
+                    .krea2, .zimage, .anima, .minimax_h3 => unreachable,
                 };
             },
         }
@@ -2496,6 +3074,31 @@ pub const Session = struct {
                 m.t5.deinit();
                 m.tok.deinit();
             },
+            .minimax_h3 => |*m| {
+                m.audio.deinit();
+                m.vae.deinit();
+                // The DiT points into the sidecar, which points into its
+                // container, so they unwind in that order.
+                m.dit.deinit();
+                if (m.vit) |*v| v.deinit();
+                if (m.venc) |*v| v.deinit();
+                if (m.aenc) |*v| v.deinit();
+                if (m.aenc_cu) |*v| v.deinit();
+                if (m.venc_cu) |*v| v.deinit();
+                if (m.audio_cu) |*s| s.deinit();
+                if (m.lora) |*s| s.deinit();
+                if (m.lora_st) |*st| st.deinit();
+                m.enc.deinit();
+                inline for (.{ &m.enc_view, &m.vae_view, &m.audio_view }) |slot| if (slot.*) |v| {
+                    v.deinit(gpa);
+                    gpa.destroy(v);
+                };
+                if (m.enc_st) |*st| st.deinit();
+                if (m.vae_st) |*st| st.deinit();
+                if (m.audio_st) |*st| st.deinit();
+                m.dit_st.deinit();
+                m.tok.deinit();
+            },
             .sd15, .sdxl => |*m| {
                 gpa.free(m.sigma_ladder);
                 if (m.empty_ref) |e| gpa.free(e);
@@ -2536,6 +3139,11 @@ pub const Session = struct {
             // `ModelSamplingDiscreteFlow` at multiplier 1.0. What differs is the
             // argument the DiT is then conditioned on, see `predictAnima`.
             .anima => .{ .discrete_flow = shift },
+            // Also `ModelSamplingDiscreteFlow`, which is what `ModelSamplingAV`
+            // extends. The audio stream does NOT get its own table: the sampler
+            // carries the audio latent scaled onto this schedule and the model
+            // converts, so there is one table for the pack.
+            .minimax_h3 => .{ .discrete_flow = shift },
             .sd15, .sdxl => |*m| .{ .discrete = m.sigma_ladder },
         };
     }
@@ -2593,7 +3201,7 @@ pub const Session = struct {
             // All three flow-matching families: a multiply by `sigma0`, which for
             // each of them is exactly 1.0 at the top of the schedule (Z-Image's and
             // Anima's `time_snr_shift(3, 1)` is 3/3), so it is a bit-identical no-op.
-            .krea2, .zimage, .anima => sampler.scaleInitialNoise(x, sigma0),
+            .krea2, .zimage, .anima, .minimax_h3 => sampler.scaleInitialNoise(x, sigma0),
             // Under `--compat a1111` this is the BARE sigma: A1111's
             // `sgm_noise_multiplier` defaults to False, and its own description of the
             // option ("match initial noise to official SDXL implementation - only useful
@@ -2613,7 +3221,7 @@ pub const Session = struct {
     /// wrong ODE. See `sampler.Parameterization`.
     pub fn parameterization(self: *const Session) sampler.Parameterization {
         return switch (self.models) {
-            .krea2, .zimage, .anima => .flow,
+            .krea2, .zimage, .anima, .minimax_h3 => .flow,
             .sd15, .sdxl => .eps,
         };
     }
@@ -2627,6 +3235,9 @@ pub const Session = struct {
             // Anima uses krea2's Wan VAE, so it is the same 16-channel latent in the
             // same normalization, see `latentPreviewInto` and `decodePlanar`.
             .anima => anima.latent_channels,
+            // The VISUAL stream's channels. H3's audio stream has its own count
+            // (32) and is not part of this answer; `LatentShape` carries both.
+            .minimax_h3 => minimax_h3.latent_channels,
             .sd15, .sdxl => |*m| m.unet.cfg.channels,
         };
     }
@@ -2636,18 +3247,84 @@ pub const Session = struct {
     /// has its own matrix over its own channel count (16 for krea2's Wan latent, 4 for
     /// SD's, with different factors for SD1.5 and SDXL); the wrong one is either an
     /// out-of-bounds read or a preview with plausible structure and wrong colours.
-    pub fn latentPreviewInto(self: *const Session, rgb_out: []u8, z: []const f32, lat_h: usize, lat_w: usize) void {
+    /// Spatial downscale of this family's VAE: a latent dimension times this is
+    /// the pixel dimension. 8 for every still-image family here, which is why
+    /// `/ 8` used to be hardcoded at the call sites; H3's video VAE is 16.
+    pub fn spatialDownscale(self: *const Session) usize {
+        return switch (self.models) {
+            .krea2, .anima => wan_vae.spatial_scale,
+            .zimage => zimage.spatial_scale,
+            .sd15, .sdxl => sd_vae.spatial_scale,
+            .minimax_h3 => minimax_h3.spatial_downscale,
+        };
+    }
+
+    /// The latent shape a render of `width` x `height` pixels and `frames` pixel
+    /// frames has, for this family.
+    ///
+    /// Frame counts SNAP: H3 only accepts `17k + 5` frames at 24 fps, so ask the
+    /// returned shape (via `pixelFrames`) rather than assuming the requested
+    /// count survived. Asking a still-image family for more than one frame is a
+    /// programming error, not a silently-ignored argument.
+    pub fn latentShape(self: *const Session, width: usize, height: usize, frames: usize) !LatentShape {
+        const ds = self.spatialDownscale();
+        if (width < ds or height < ds) return error.ResolutionTooSmall;
+        const h = height / ds;
+        const w = width / ds;
         switch (self.models) {
-            .krea2 => wan_vae.latentPreviewInto(rgb_out, z, lat_h, lat_w),
+            .minimax_h3 => {
+                const ts = minimax_h3.temporalShape(frames);
+                return .{
+                    .channels = minimax_h3.latent_channels,
+                    .t = ts.latent_t,
+                    .h = h,
+                    .w = w,
+                    .audio = .{
+                        .channels = minimax_h3.audio_latent_channels,
+                        .streams = minimax_h3.audio_channels,
+                        .t = ts.audio_t,
+                    },
+                };
+            },
+            else => {
+                if (frames > 1) return error.FamilyIsNotVideo;
+                return .{ .channels = self.latentChannels(), .h = h, .w = w };
+            },
+        }
+    }
+
+    /// Pixel frames the visual stream of `shape` decodes to. 1 for the
+    /// still-image families; for H3 the frame count is not `t` times anything,
+    /// because its video tokens cover 1 or 4 frames depending on their position.
+    pub fn pixelFrames(self: *const Session, shape: LatentShape) usize {
+        return switch (self.models) {
+            .minimax_h3 => minimax_h3.framesForLatentT(shape.t),
+            else => 1,
+        };
+    }
+
+    /// `frame` selects which latent frame to preview, and is ignored by the
+    /// still-image families (whose `shape.t` is 1). It matters because a video
+    /// latent's per-channel stride is `t * h * w`: previewing one with an image
+    /// family's `h * w` stride shows channel 0 of several frames as if they were
+    /// several channels of one.
+    pub fn latentPreviewInto(self: *const Session, rgb_out: []u8, z: []const f32, shape: LatentShape, frame: usize) void {
+        const h = shape.h;
+        const w = shape.w;
+        switch (self.models) {
+            .krea2 => wan_vae.latentPreviewInto(rgb_out, z, h, w),
             // Also 16 channels, but the Flux matrix and a non-zero bias, a
             // different picture from krea2's Wan matrix, not a shared one.
-            .zimage => zimage.latentPreviewInto(rgb_out, z, lat_h, lat_w),
+            .zimage => zimage.latentPreviewInto(rgb_out, z, h, w),
             // krea2's Wan matrix, NOT Z-Image's Flux one, even though both are
             // 16-channel: Anima's `latent_format` is `Wan21`. The wrong matrix is not
             // a crash, just a preview with plausible structure and wrong colours.
-            .anima => wan_vae.latentPreviewInto(rgb_out, z, lat_h, lat_w),
-            .sd15 => sd_vae.latentPreviewInto(rgb_out, z, lat_h, lat_w, &sd_vae.latent_rgb_factors_sd15, sd_vae.latent_rgb_bias_sd15),
-            .sdxl => sd_vae.latentPreviewInto(rgb_out, z, lat_h, lat_w, &sd_vae.latent_rgb_factors_sdxl, sd_vae.latent_rgb_bias_sdxl),
+            .anima => wan_vae.latentPreviewInto(rgb_out, z, h, w),
+            // The only arm that reads `shape.t`, and the only one for which
+            // `frame` is not ignored.
+            .minimax_h3 => minimax_h3.latentPreviewInto(rgb_out, z, shape.t, h, w, frame),
+            .sd15 => sd_vae.latentPreviewInto(rgb_out, z, h, w, &sd_vae.latent_rgb_factors_sd15, sd_vae.latent_rgb_bias_sd15),
+            .sdxl => sd_vae.latentPreviewInto(rgb_out, z, h, w, &sd_vae.latent_rgb_factors_sdxl, sd_vae.latent_rgb_bias_sdxl),
         }
     }
 
@@ -2720,6 +3397,246 @@ pub const Session = struct {
             );
         }
         switch (self.models) {
+            // H3's presentation is NOT chat-templated and takes no special
+            // tokens: the ids are the raw prompt text. (fl2va / ref2va splice
+            // vision blocks and `<Picture i>:` labels in, which needs the ViT and
+            // is not wired yet; a text-only prompt is the whole presentation for
+            // t2va.) The conditioning is the UNNORMALIZED state after layer 50,
+            // which `Variant.minimax_h3` is what selects.
+            .minimax_h3 => |*m| {
+                // Every reference through both towers FIRST: the presentation
+                // needs each one's patch grid to size its vision block, and the
+                // grid is what the resize produced.
+                // Keyframes FIRST, then references: that is the order the packed
+                // layout puts their rows in, and `cond_video` is concatenated in
+                // layout order. Presenting them the other way round would label
+                // the wrong picture `<Picture 1>`.
+                const n_kf = o.h3_keyframes.len;
+                const refs = try gpa.alloc(EncodedRef, n_kf + o.h3_ref_images.len);
+                var n_done: usize = 0;
+                defer {
+                    for (refs[0..n_done]) |*r| r.deinit(gpa);
+                    gpa.free(refs);
+                }
+                for (o.h3_keyframes, refs[0..n_kf]) |kf, *out| {
+                    out.* = try self.h3EncodeKeyframe(gpa, m, kf, o.h3_canvas_h, o.h3_canvas_w);
+                    n_done += 1;
+                }
+                const area = if (o.h3_ref_area > 0) o.h3_ref_area else 2048 * 2048;
+                for (o.h3_ref_images, refs[n_kf..]) |img, *out| {
+                    out.* = try self.h3EncodeRef(gpa, m, img, area);
+                    n_done += 1;
+                }
+
+                // Reference VIDEOS come after the images, which is the node's own
+                // presentation order and what the `<Video k>` ordinals count in.
+                // A video is SEVERAL vision blocks (one temporal pair each) against
+                // ONE layout entry, so it cannot share the flat per-picture array.
+                const vids = try gpa.alloc(EncodedVideo, o.h3_ref_videos.len);
+                var v_done: usize = 0;
+                defer {
+                    for (vids[0..v_done]) |*v| v.deinit(gpa);
+                    gpa.free(vids);
+                }
+                const tgt = if (o.h3_target_frames > 0) o.h3_target_frames else std.math.maxInt(usize);
+                for (o.h3_ref_videos, vids) |rv, *out| {
+                    out.* = try self.h3EncodeRefVideo(gpa, m, rv, tgt);
+                    v_done += 1;
+                }
+
+                // Standalone reference AUDIO comes last, after the videos, which
+                // is the node's order and what the `<Audio j>` ordinals count in
+                // (a video's own soundtrack is labelled where the video is).
+                const auds = try gpa.alloc(EncodedAudio, o.h3_ref_audios.len);
+                var a_done: usize = 0;
+                defer {
+                    for (auds[0..a_done]) |*au| au.deinit(gpa);
+                    gpa.free(auds);
+                }
+                for (o.h3_ref_audios, auds) |ra, *out| {
+                    out.* = try self.h3EncodeRefAudio(gpa, m, ra);
+                    a_done += 1;
+                }
+
+                var n_blocks: usize = refs.len;
+                for (vids) |v| n_blocks += v.merged.len;
+
+                // One item per picture, then per video, then per standalone
+                // soundtrack. A reference video's OWN soundtrack is the video
+                // item's `soundtrack` flag, not a separate item: the presentation
+                // emits its `<Audio j>` label ahead of the `<Video k>` one, which
+                // is the order the DiT packs their rows in.
+                const items = try gpa.alloc(minimax_h3_present.Item, refs.len + vids.len + auds.len);
+                defer gpa.free(items);
+                for (refs, items[0..refs.len]) |r, *it| {
+                    it.* = .{ .image = .{ .h = r.grid_h, .w = r.grid_w } };
+                }
+                for (vids, items[refs.len..][0..vids.len]) |v, *it| {
+                    it.* = .{ .video = .{
+                        .grid = .{ .h = v.grid_h, .w = v.grid_w },
+                        .blocks = v.merged.len,
+                        .timestamps = v.timestamps,
+                        .soundtrack = v.audio != null,
+                    } };
+                }
+                for (items[refs.len + vids.len ..]) |*it| it.* = .audio;
+
+                // Through the presentation builder even with no references: it is
+                // the one place the labels, the vision blocks and the three span
+                // kinds are derived, and a t2va prompt is exactly the tokenized
+                // text (plus the reference's one-pad-token rule for an empty one).
+                var p = try minimax_h3_present.build(gpa, &m.tok, text, items);
+                defer p.deinit();
+
+                var vision: qwen3.TextEncoder.Vision = .{};
+                var pos: []f32 = &.{};
+                defer if (pos.len > 0) gpa.free(pos);
+                var blocks: []qwen3.TextEncoder.Vision.Block = &.{};
+                defer if (blocks.len > 0) gpa.free(blocks);
+                var ds: [][]f32 = &.{};
+                defer if (ds.len > 0) gpa.free(ds);
+
+                if (p.blocks.len > 0) {
+                    std.debug.assert(p.blocks.len == n_blocks);
+                    vision.inject = try p.injectSpans(gpa, qwen3.TextEncoder.Vision.Span);
+
+                    // Presentation order: every picture's single block, then each
+                    // video's blocks in temporal order. `flatMerged` walks the two
+                    // sources as one list so the tower rows, the deepstack
+                    // concatenation and the injection spans cannot disagree.
+                    blocks = try gpa.alloc(qwen3.TextEncoder.Vision.Block, n_blocks);
+                    {
+                        var bi: usize = 0;
+                        for (refs) |r| {
+                            blocks[bi] = .{ .at = p.blocks[bi].index, .rows = r.merged };
+                            bi += 1;
+                        }
+                        for (vids) |v| {
+                            for (v.merged) |mg| {
+                                blocks[bi] = .{ .at = p.blocks[bi].index, .rows = mg };
+                                bi += 1;
+                            }
+                        }
+                        std.debug.assert(bi == n_blocks);
+                    }
+                    vision.blocks = blocks;
+
+                    // DeepStack features are CONCATENATED across blocks per layer,
+                    // in the same order, and the injection spans select them in
+                    // sequence order. The two agree because both walk pictures then
+                    // videos.
+                    const n_ds = if (refs.len > 0) refs[0].deepstack.len else vids[0].deepstack[0].len;
+                    ds = try gpa.alloc([]f32, n_ds);
+                    var built: usize = 0;
+                    errdefer for (ds[0..built]) |d| gpa.free(d);
+                    const eh = m.enc.cfg.hidden;
+                    const total = vision.injectRows(); // sum, not a range
+                    for (ds, 0..) |*d, li| {
+                        d.* = try gpa.alloc(f32, total * eh);
+                        built += 1;
+                        var row: usize = 0;
+                        for (refs) |r| {
+                            const src = r.deepstack[li];
+                            @memcpy(d.*[row * eh ..][0..src.len], src);
+                            row += src.len / eh;
+                        }
+                        for (vids) |v| {
+                            for (v.deepstack) |per_block| {
+                                const src = per_block[li];
+                                @memcpy(d.*[row * eh ..][0..src.len], src);
+                                row += src.len / eh;
+                            }
+                        }
+                    }
+                    vision.deepstack = ds;
+
+                    // Multimodal rope, which only exists once there is an image.
+                    const spans = try p.imageSpans(gpa);
+                    defer gpa.free(spans);
+                    pos = try gpa.alloc(f32, 3 * p.ids.len);
+                    try minimax_h3_vit.mropePositions(pos, p.ids.len, spans);
+                    vision.positions = pos;
+                    vision.rope_dims = m.enc.cfg.rope_dims;
+                }
+
+                const data = try self.runQwen3Vision(gpa, &m.enc, p.ids, vision, o);
+                errdefer gpa.free(data);
+
+                // What the DiT needs, assembled once.
+                var h3: ?H3Refs = null;
+                if (refs.len > 0 or vids.len > 0 or auds.len > 0) {
+                    const kfs = try gpa.alloc(minimax_h3.Keyframe, n_kf);
+                    errdefer gpa.free(kfs);
+                    for (o.h3_keyframes, refs[0..n_kf], kfs) |req, r, *lk| {
+                        _ = r;
+                        lk.* = .{ .frame_index = req.frame_index, .latent_t = 1 };
+                    }
+                    const n_img = refs.len - n_kf;
+                    const layout_refs = try gpa.alloc(minimax_h3.Ref, n_img + vids.len + auds.len);
+                    errdefer gpa.free(layout_refs);
+                    var cond_len: usize = 0;
+                    var audio_len: usize = 0;
+                    for (refs[0..n_kf]) |r| cond_len += r.cond_rows.len;
+                    for (refs[n_kf..], layout_refs[0..n_img]) |r, *lr| {
+                        lr.* = .{ .kind = .image, .latent_t = 1, .latent_h = r.lat_h, .latent_w = r.lat_w };
+                        cond_len += r.cond_rows.len;
+                    }
+                    for (vids, layout_refs[n_img..][0..vids.len]) |v, *lr| {
+                        lr.* = .{
+                            .kind = .video,
+                            .latent_t = v.latent_t,
+                            .latent_h = v.lat_h,
+                            .latent_w = v.lat_w,
+                            .audio_t = if (v.audio) |au| au.audio_t else 0,
+                        };
+                        cond_len += v.cond_rows.len;
+                        if (v.audio) |au| audio_len += au.rows.len;
+                    }
+                    for (auds, layout_refs[n_img + vids.len ..]) |au, *lr| {
+                        lr.* = .{ .kind = .audio, .audio_t = au.audio_t };
+                        audio_len += au.rows.len;
+                    }
+                    const cond = try gpa.alloc(f32, cond_len);
+                    errdefer gpa.free(cond);
+                    var at: usize = 0;
+                    for (refs) |r| {
+                        @memcpy(cond[at..][0..r.cond_rows.len], r.cond_rows);
+                        at += r.cond_rows.len;
+                    }
+                    for (vids) |v| {
+                        @memcpy(cond[at..][0..v.cond_rows.len], v.cond_rows);
+                        at += v.cond_rows.len;
+                    }
+
+                    // Audio rows in the SAME layout order: each reference video's
+                    // soundtrack where the video sits, then the standalone ones.
+                    // (Keyframe audio would come first; the caller cannot request
+                    // it yet.)
+                    const cond_au = try gpa.alloc(f32, audio_len);
+                    errdefer gpa.free(cond_au);
+                    var aat: usize = 0;
+                    for (vids) |v| {
+                        if (v.audio) |au| {
+                            @memcpy(cond_au[aat..][0..au.rows.len], au.rows);
+                            aat += au.rows.len;
+                        }
+                    }
+                    for (auds) |au| {
+                        @memcpy(cond_au[aat..][0..au.rows.len], au.rows);
+                        aat += au.rows.len;
+                    }
+                    std.debug.assert(aat == audio_len);
+
+                    h3 = .{
+                        .keyframes = kfs,
+                        .refs = layout_refs,
+                        .cond_video = cond,
+                        .cond_audio = cond_au,
+                        .tag_spans = try p.tagSpans(gpa),
+                    };
+                }
+                return .{ .data = data, .seq = p.ids.len, .h3 = h3 };
+            },
             .krea2 => |*m| {
                 var ids: std.ArrayList(u32) = .empty;
                 defer ids.deinit(gpa);
@@ -2819,12 +3736,52 @@ pub const Session = struct {
     /// Shared by krea2's `encodePrompt` and Z-Image's arm above, the difference
     /// between the two families is the tap list and the template, both of which are
     /// already decided by the time this runs.
+    /// `runQwen3` for a vision-conditioned encode.
+    ///
+    /// An empty payload takes the normal dispatch unchanged, so the text-only path
+    /// keeps its CUDA/Vulkan arms. A non-empty one is CPU-ONLY and says so: the
+    /// device encoders have neither the deepstack injection nor multimodal rope,
+    /// and running them would silently produce a conditioning with no vision in it
+    /// rather than a slow correct one.
+    fn runQwen3Vision(
+        self: *Session,
+        gpa: std.mem.Allocator,
+        enc: *const qwen3.TextEncoder,
+        ids: []const u32,
+        vision: qwen3.TextEncoder.Vision,
+        o: EncodeOptions,
+    ) ![]f32 {
+        if (vision.blocks.len == 0 and vision.deepstack.len == 0 and vision.positions == null) {
+            return self.runQwen3(gpa, enc, ids, o);
+        }
+        if (self.cu_be) |b| {
+            // Same weight gate as the text-only path: the CUDA encode's GEMM is
+            // `opMatmulFp8` unconditionally, so anything else would be read as fp8
+            // bytes and turn into noise rather than fail.
+            if (qwen3_cuda.supportsWeightsOn(b, enc)) {
+                return qwen3_cuda.encodeVision(enc, b, self.io, gpa, ids, vision, o.cancel) catch |err| {
+                    if (err == error.Canceled) return err;
+                    std.log.warn("cuda vision-conditioned encode failed ({t}); falling back to CPU (slow)", .{err});
+                    return enc.encodeVision(self.io, gpa, ids, vision, o.cancel);
+                };
+            }
+        }
+        // Vulkan still has no deepstack or mrope path, so say so rather than
+        // silently producing a conditioning with no vision in it.
+        std.log.warn(
+            "minimax_h3: a vision-conditioned encode runs on the CPU ({d} blocks); " ++
+                "only the CUDA encoder has a deepstack/mrope path",
+            .{vision.blocks.len},
+        );
+        return enc.encodeVision(self.io, gpa, ids, vision, o.cancel);
+    }
+
     fn runQwen3(self: *Session, gpa: std.mem.Allocator, enc: *const qwen3.TextEncoder, ids: []const u32, o: EncodeOptions) ![]f32 {
         if (self.cu_be) |b| {
             // Only when the CUDA arm can actually run these weights: its encode
             // GEMM is `opMatmulFp8` unconditionally, and Z-Image's Qwen3-4B ships
             // bf16, which it would read as fp8 bytes and turn into noise.
-            if (qwen3_cuda.supportsWeights(enc)) {
+            if (qwen3_cuda.supportsWeightsOn(b, enc)) {
                 return qwen3_cuda.encode(enc, b, self.io, gpa, ids, o.cancel) catch |err| {
                     if (err == error.Canceled) return err;
                     std.log.warn("cuda text encode failed ({t}); falling back to CPU (slow)", .{err});
@@ -3077,6 +4034,12 @@ pub const Session = struct {
     ) !Denoiser {
         const use_cfg = cfg != 1.0;
         if (use_cfg and cond_neg == null) return error.CfgNeedsNegativeCond;
+        // Not built yet (VIDEO_PLAN.md): H3's sampler steps a TWO-STREAM latent
+        // (video and audio together, on schedules related by the audio carry),
+        // and nothing allocates or steps one. Refuse by name here, because the
+        // arms below end in a krea2 fallthrough that would otherwise reach
+        // `self.k()` and panic with "access of union field 'krea2'".
+        if (self.family() == .minimax_h3) return error.FamilyNotImplemented;
 
         var d: Denoiser = .{
             .sess = self,
@@ -3310,6 +4273,1440 @@ pub const Session = struct {
     /// through the adaptive whole-image -> GPU-tiled -> CPU-tiled ladder (see
     /// `VaeDecode`), then interleave to RGB8. `latent` is `[16][lat_h][lat_w]`
     /// planar and is NOT modified. The image comes back at `lat_w*8 x lat_h*8`.
+    /// Options for `generateClip`. A subset of `Options`: the knobs that do not
+    /// apply to a clip (tiling modes, prompt weighting, CFG) are absent rather
+    /// than accepted and ignored.
+    pub const ClipOptions = struct {
+        prompt: []const u8,
+        width: usize = 1344,
+        height: usize = 768,
+        /// Pixel frames at 24 fps. SNAPS to the family's grid; read the result
+        /// back from the returned clip rather than assuming this survived.
+        length: usize = 124,
+        steps: usize = 30,
+        seed: u64 = 0,
+        /// The VIDEO shift, which drives the sigma schedule. Null takes the
+        /// family's own.
+        shift: ?f32 = null,
+        /// The AUDIO shift. Null takes the family's own.
+        ///
+        /// A separate knob because the reference has two independent parameters
+        /// and only their RATIO sets the sampler's audio carry. Moving `shift`
+        /// alone therefore rescales the audio stream as a side effect, which is
+        /// how the same prompt renders silent at shift 12 and clipped at shift 1.
+        shift_audio: ?f32 = null,
+        /// Reference pictures, in REQUEST order: the `<Picture i>` ordinals count
+        /// in the order they arrive.
+        refs: []const RefImage = &.{},
+        /// Pixel-area cap for the reference resize. 0 takes the reference's `max`
+        /// policy (a 2048 px short edge); passing the render's own area is its
+        /// `match` policy, which keeps a reference no more expensive than a frame.
+        /// Reference tokens ride through EVERY sampling step.
+        ref_area: usize = 0,
+        /// Keyframes, anchored at a pixel frame of the target. `generateClip`
+        /// resolves their indices against the SNAPPED frame count, not `length`.
+        keyframes: []const KeyframeReq = &.{},
+        /// Reference videos, after the images in the presentation.
+        ref_videos: []const RefVideo = &.{},
+        /// Standalone reference soundtracks, after the videos. A reference video's
+        /// own soundtrack goes on the `RefVideo` instead.
+        ref_audios: []const RefAudio = &.{},
+        /// Continue a clip: hold the source's opening fixed and generate the rest.
+        /// Not conditioning -- see `ContinueFrom`.
+        continue_from: ?ContinueFrom = null,
+    };
+
+    /// Text prompt to a decoded clip, composed from the public stages.
+    ///
+    /// Euler over the packed two-stream latent. There is no CFG branch: every H3
+    /// conditioning node emits ONE conditioning and takes no negative, so there
+    /// is nothing to guide against.
+    pub fn generateClip(self: *Session, gpa: std.mem.Allocator, o: ClipOptions, progress: ?*std.Io.Writer) !Clip {
+        if (self.family() != .minimax_h3) return error.FamilyIsNotVideo;
+        const shifts = self.clipShifts(o);
+
+        const shape = try self.latentShape(o.width, o.height, o.length);
+        var cond = try self.encode(gpa, o.prompt, .{
+            .h3_ref_images = o.refs,
+            .h3_ref_area = o.ref_area,
+            .h3_keyframes = o.keyframes,
+            // A keyframe shares the TARGET's grid, so it resizes to the latent
+            // canvas the shape actually settled on, not to `o.width/height` --
+            // those snap.
+            .h3_canvas_h = shape.h * self.spatialDownscale(),
+            .h3_canvas_w = shape.w * self.spatialDownscale(),
+            .h3_ref_videos = o.ref_videos,
+            .h3_ref_audios = o.ref_audios,
+            // Against the SNAPPED count: a reference video is cropped to the
+            // target clip's real length, not the requested one.
+            .h3_target_frames = self.pixelFrames(shape),
+        });
+        defer cond.deinit(gpa);
+
+        const sigmas = try self.schedule(gpa, o.steps, shifts.video);
+        defer gpa.free(sigmas);
+
+        // A continuation is prepared BEFORE the denoiser, because its masks change
+        // the layout's timestep labels and the denoiser reads them per step.
+        var cont: ?Continuation = null;
+        defer if (cont) |*c| c.deinit(gpa);
+        if (o.continue_from) |cf| {
+            cont = try self.h3EncodeContinuation(gpa, &self.models.minimax_h3, cf, shape, shifts);
+            try note(progress, "continuing from {d} frames ({d}/{d} video latent frames, {d}/{d} audio)\n", .{
+                cont.?.frames, cont.?.latent_t, shape.t, cont.?.audio_t, shape.audio.?.t,
+            });
+        }
+
+        var den = try self.clipDenoiser(gpa, cond, shape, shifts);
+        defer den.deinit(gpa);
+        if (cont) |c| {
+            den.video_mask = c.video_mask;
+            den.audio_mask = c.audio_mask;
+        }
+
+        // The sampler's latent starts as pure noise. Its audio half lives in the
+        // carried space from here until `processLatentOut` below.
+        const x = try gpa.alloc(f32, shape.elems());
+        defer gpa.free(x);
+        sampler.fillNoiseFrom(x, o.seed, self.compat.noise_src);
+
+        // The initial noise is kept when continuing: a preserved row rides the
+        // straight line `sigma * noise + (1 - sigma) * ref`, which is where the
+        // reference's `scale_latent_inpaint` (flow noise-scaling) puts it, and that
+        // needs the ORIGINAL draw at every step rather than the current `x`.
+        var noise0: []f32 = &.{};
+        defer if (noise0.len > 0) gpa.free(noise0);
+        if (cont != null) noise0 = try gpa.dupe(f32, x);
+
+        const v = try gpa.alloc(f32, shape.elems());
+        defer gpa.free(v);
+
+        const n_steps = sigmas.len - 1;
+        // Per-step and total sampling time, reported rather than inferred. A whole
+        // render's wall clock here is dominated by paging in a 21 GB checkpoint,
+        // and that floor moves by 3x between runs, so differencing two wall times
+        // measures the page cache and not the change under test.
+        const samp_start = std.Io.Clock.real.now(self.io);
+        var step_start = samp_start;
+        for (0..n_steps) |i| {
+            // Preserved rows are placed ANALYTICALLY at this sigma rather than
+            // stepped. The reference sets the velocity instead (`v = noise - ref`,
+            // independent of sigma, which is the same straight line); placing `x`
+            // reaches the same trajectory without having to express it in the
+            // sampler's carried audio space, where the velocity picks up the
+            // carry's own sigma dependence.
+            if (cont) |c| placePreserved(x, noise0, c.ref, shape, c, sigmas[i]);
+            try den.predict(gpa, v, x, sigmas[i]);
+            // Euler for flow matching: the trajectory derivative IS the velocity.
+            const dt = sigmas[i + 1] - sigmas[i];
+            for (x, v) |*xi, vi| xi.* += dt * vi;
+            const now = std.Io.Clock.real.now(self.io);
+            try note(progress, "step {d}/{d} (sigma {d:.4}) {d:.2}s\n", .{
+                i + 1, n_steps, sigmas[i],
+                @as(f64, @floatFromInt(now.nanoseconds - step_start.nanoseconds)) / 1e9,
+            });
+            step_start = now;
+        }
+        try note(progress, "sampled {d} steps in {d:.1}s\n", .{
+            n_steps,
+            @as(f64, @floatFromInt(std.Io.Clock.real.now(self.io).nanoseconds - samp_start.nanoseconds)) / 1e9,
+        });
+
+        // ...and once more at the final sigma, because the last Euler step moved
+        // the preserved rows off their line and nothing re-places them after it.
+        if (cont) |c| placePreserved(x, noise0, c.ref, shape, c, sigmas[n_steps]);
+
+        self.processLatentOut(x, shape, shifts);
+        return self.decodeClip(gpa, x, shape, progress);
+    }
+
+    /// Place the preserved rows of a continuation on their flow trajectory at
+    /// `sigma`: `x = sigma * noise + (1 - sigma) * ref`.
+    ///
+    /// Both halves are planar and the preserved part is a temporal PREFIX of each
+    /// channel, not a prefix of the buffer, so this walks channels rather than
+    /// masking elementwise.
+    pub fn placePreserved(
+        x: []f32,
+        noise: []const f32,
+        ref: []const f32,
+        shape: LatentShape,
+        cont: Continuation,
+        sigma: f32,
+    ) void {
+        const hw = shape.h * shape.w;
+        const blend = struct {
+            fn go(dst: []f32, nz: []const f32, rf: []const f32, s: f32) void {
+                const one_minus = 1.0 - s;
+                for (dst, nz, rf) |*d, n, r| d.* = s * n + one_minus * r;
+            }
+        }.go;
+
+        for (0..minimax_h3.latent_channels) |c| {
+            const off = c * shape.t * hw;
+            const n = cont.latent_t * hw;
+            blend(x[off..][0..n], noise[off..][0..n], ref[off..][0..n], sigma);
+        }
+        if (cont.audio_t == 0) return;
+        const audio = shape.audio.?;
+        const base = shape.audioOffset();
+        for (0..minimax_h3.audio_latent_channels) |c| {
+            for (0..minimax_h3.audio_channels) |s| {
+                const off = base + (c * minimax_h3.audio_channels + s) * audio.t;
+                blend(x[off..][0..cont.audio_t], noise[off..][0..cont.audio_t], ref[off..][0..cont.audio_t], sigma);
+            }
+        }
+    }
+
+    /// Put a latent INTO the sampler's carried space, in place: the mirror of
+    /// `processLatentOut` and of ComfyUI's `process_latent_in`. Needed by anything
+    /// that hands the sampler a latent it did not draw itself.
+    pub fn processLatentIn(self: *const Session, latent: []f32, shape: LatentShape, shifts: minimax_h3.Shifts) void {
+        const scale = self.audioScale(shifts);
+        if (scale == 1.0) return;
+        for (latent[shape.audioOffset()..]) |*a| a.* *= scale;
+    }
+
+    /// Undo the sampler's audio carry, in place: the pack's audio half is scaled
+    /// onto the video schedule while sampling and has to come back before the
+    /// audio VAE sees it. The mirror of ComfyUI's `process_latent_out`.
+    pub fn processLatentOut(self: *const Session, latent: []f32, shape: LatentShape, shifts: minimax_h3.Shifts) void {
+        const scale = self.audioScale(shifts);
+        if (scale == 1.0) return;
+        const inv = 1.0 / scale;
+        for (latent[shape.audioOffset()..]) |*a| a.* *= inv;
+    }
+
+    /// The scale the sampler carries H3's audio stream at, `shift_video /
+    /// shift_audio`.
+    ///
+    /// Carrying the audio latent scaled onto the video schedule makes the pack an
+    /// ordinary single-schedule flow latent, which is what lets a stock sampler
+    /// step it. `ClipDenoiser.predict` undoes the scale before the network sees
+    /// it and converts the velocity back afterwards.
+    pub fn audioScale(self: *const Session, shifts: minimax_h3.Shifts) f32 {
+        if (self.family() != .minimax_h3) return 1.0;
+        return shifts.carryScale();
+    }
+
+    /// The shift pair a `ClipOptions` selects, each field falling back to the
+    /// family's own default.
+    ///
+    /// One place, so the schedule, the timestep labels, the per-step carry and
+    /// the final unscale cannot end up reading different pairs.
+    pub fn clipShifts(self: *const Session, o: ClipOptions) minimax_h3.Shifts {
+        return .{
+            .video = o.shift orelse defaultShift(self.family()),
+            .audio = o.shift_audio orelse minimax_h3.shift_audio,
+        };
+    }
+
+    /// Per-render state for a video family: the packed layout, the trunk
+    /// workspace, and the refined text. All three depend only on the shape and
+    /// the prompt, so they are built once per render rather than per step.
+    ///
+    /// The still-image `Denoiser` cannot serve here: its latent is one stream and
+    /// its per-backend sessions are bound to `(lat_h, lat_w)`.
+    pub const ClipDenoiser = struct {
+        sess: *Session,
+        shape: LatentShape,
+        layout: minimax_h3.PackedLayout,
+        /// The host trunk's scratch. Allocated only when the trunk actually runs
+        /// on the host: at the default render it is over 4 GB, which is not
+        /// something to reserve for a device path that never touches it.
+        ws: ?minimax_h3.Workspace = null,
+        /// The CUDA trunk, when this checkpoint and backend support it.
+        cu: ?minimax_h3_cuda.Session = null,
+        cu_ws: ?minimax_h3_cuda.Workspace = null,
+        /// `[text_len][hidden]`, through `condition_proj` and the token refiner.
+        text: []f32,
+        /// Patchified reference condition rows, BORROWED from the conditioning
+        /// (which must outlive this denoiser, as the doc on `Denoiser` says of
+        /// every conditioning). Re-injected every step and never denoised.
+        cond_video: []const f32 = &.{},
+        /// The audio half of the same thing, empty when no reference carries a
+        /// soundtrack.
+        cond_audio: []const f32 = &.{},
+        /// Denoise masks for the two target segments, 1 = generate. BORROWED, like
+        /// the condition rows, and reduced once per render rather than per step.
+        video_mask: []const f32 = &.{},
+        audio_mask: []const f32 = &.{},
+        /// Both stream shifts. The video one drives the sigma schedule; the pair
+        /// sets the audio carry.
+        shifts: minimax_h3.Shifts,
+
+        pub fn deinit(self: *ClipDenoiser, gpa: std.mem.Allocator) void {
+            if (self.sess.cu_be) |b| {
+                if (self.cu_ws) |*w| w.deinit(b);
+                if (self.cu) |*c| c.deinit(b);
+            }
+            // `.{}` until `refineText` runs, so an early failure frees nothing.
+            if (self.text.len > 0) gpa.free(self.text);
+            if (self.ws) |*w| w.deinit(gpa);
+            self.layout.deinit();
+            self.* = undefined;
+        }
+
+        /// Whether the trunk runs on the device for this render.
+        pub fn onDevice(self: *const ClipDenoiser) bool {
+            return self.cu != null;
+        }
+
+        /// One denoiser step over the packed latent.
+        ///
+        /// `latent` and `v_out` are both the flat pack (visual then audio), and
+        /// the audio half of BOTH is in the sampler's carried space: scaled onto
+        /// the video schedule. The conversion in and out of the network's own
+        /// space happens here, so a sampler never has to know about it.
+        pub fn predict(self: *ClipDenoiser, gpa: std.mem.Allocator, v_out: []f32, latent: []const f32, sigma: f32) !void {
+            const sh = self.shape;
+            std.debug.assert(latent.len == sh.elems() and v_out.len == sh.elems());
+            const m = &self.sess.models.minimax_h3;
+            const n_v = sh.audioOffset();
+            const n_a = sh.audioElems();
+
+            // The reference clamps the video sigma before dividing by it.
+            const sigma_v = @max(sigma, 1e-6);
+            const sigma_a = self.shifts.audioSigma(sigma_v);
+            const carry = sigma_a / sigma_v;
+            const scale = self.sess.audioScale(self.shifts);
+
+            // Undo the carry: the network only ever sees a stream's own latent.
+            const audio_in = try gpa.alloc(f32, n_a);
+            defer gpa.free(audio_in);
+            for (audio_in, latent[n_v..]) |*o, x| o.* = x * carry;
+
+            const in: minimax_h3.Inputs = .{
+                .video = latent[0..n_v],
+                .audio = audio_in,
+                .text = self.text,
+                .sigma = sigma_v,
+                .shifts = self.shifts,
+                // Condition rows go in every step: they are pinned at the cond
+                // timestep rather than denoised.
+                .cond_video = self.cond_video,
+                .cond_audio = self.cond_audio,
+                .video_mask = self.video_mask,
+                .audio_mask = self.audio_mask,
+            };
+            if (self.cu) |*cu| {
+                try minimax_h3_cuda.forward(
+                    &m.dit,
+                    self.sess.cu_be.?,
+                    cu,
+                    &self.cu_ws.?,
+                    self.sess.io,
+                    gpa,
+                    &self.layout,
+                    v_out[0..n_v],
+                    v_out[n_v..],
+                    in,
+                    null,
+                );
+            } else {
+                try minimax_h3.forward(&m.dit, self.sess.io, gpa, &self.ws.?, &self.layout, v_out[0..n_v], v_out[n_v..], in);
+            }
+
+            // ...and convert the audio velocity back to the carried variable.
+            // The first term is proportional to the LATENT, not to a velocity:
+            // it is the chain rule for a variable whose scale moves with sigma.
+            const dk = 1.0 + (scale - 1.0) * sigma_a;
+            for (v_out[n_v..], latent[n_v..]) |*v, x| {
+                v.* = (1.0 - scale) * (x * carry) + dk * v.*;
+            }
+        }
+    };
+
+    /// Build the per-render state for a clip.
+    pub fn clipDenoiser(self: *Session, gpa: std.mem.Allocator, cond: Cond, shape: LatentShape, shifts: minimax_h3.Shifts) !ClipDenoiser {
+        if (self.family() != .minimax_h3) return error.FamilyIsNotVideo;
+        const m = &self.models.minimax_h3;
+        const audio = shape.audio orelse return error.FamilyIsNotVideo;
+
+        // The DiT folds 2x2 latent cells into one token, so the grid it packs is
+        // the latent rounded UP to that patch.
+        var layout = try minimax_h3.PackedLayout.build(gpa, .{
+            .text_len = cond.seq,
+            .latent_t = shape.t,
+            .latent_h = (shape.h + 1) / 2 * 2,
+            .latent_w = (shape.w + 1) / 2 * 2,
+            .audio_t = audio.t,
+            // The references and the text region's VIDEO-tagged spans both come
+            // from `encode`, the only thing that processed the pictures.
+        }, if (cond.h3) |r| r.keyframes else &.{}, if (cond.h3) |r| r.refs else &.{}, if (cond.h3) |r| r.tag_spans else &.{});
+        errdefer layout.deinit();
+
+        var d: ClipDenoiser = .{
+            .sess = self,
+            .shape = shape,
+            .layout = layout,
+            .text = &.{},
+            .cond_video = if (cond.h3) |r| r.cond_video else &.{},
+            .cond_audio = if (cond.h3) |r| r.cond_audio else &.{},
+            .shifts = shifts,
+        };
+        errdefer d.deinit(gpa);
+
+        // Device first: the host trunk's workspace is over 4 GB at the default
+        // render, so only allocate it when the trunk really runs there.
+        if (self.cu_be) |b| {
+            if (minimax_h3_cuda.supported(&m.dit)) {
+                self.setMemTag(.dit);
+                d.cu = try minimax_h3_cuda.Session.init(b, gpa, &m.dit, &layout);
+                d.cu_ws = try minimax_h3_cuda.Workspace.init(b, &m.dit, layout.seq_len);
+            } else {
+                std.log.warn("MiniMax H3: this checkpoint's trunk weights have no CUDA path " ++
+                    "(int8 convrot only); the trunk runs on the CPU. Expect CPU sampling speed.", .{});
+            }
+        }
+        if (d.cu == null) d.ws = try minimax_h3.Workspace.init(gpa, m.dit.cfg, &layout);
+
+        // `condition_proj` + the token refiner, once per render rather than per
+        // step: the reference does the same in `extra_conds`.
+        d.text = try gpa.alloc(f32, cond.seq * m.dit.cfg.hidden);
+        try minimax_h3.refineText(&m.dit, self.io, gpa, d.text, cond.data, cond.seq);
+        return d;
+    }
+
+    /// The video VAE's device window decode, as a `minimax_h3_vae.Volume`.
+    ///
+    /// Its session and scratch are per WINDOW SHAPE, and the chunking decodes
+    /// every window at one shape, so both are built once per clip.
+    const DeviceVolume = struct {
+        be: *cuda.Backend,
+        dec: *const minimax_h3_vae.VideoDecoder,
+        sess: minimax_h3_vae_cuda.Session,
+        ws: minimax_h3_vae_cuda.Workspace,
+
+        fn init(be: *cuda.Backend, gpa: std.mem.Allocator, dec: *const minimax_h3_vae.VideoDecoder, t: usize, h: usize, w: usize) !DeviceVolume {
+            var sess = try minimax_h3_vae_cuda.Session.init(be, gpa, dec, t, h, w);
+            errdefer sess.deinit(be);
+            const ws = try minimax_h3_vae_cuda.Workspace.init(be, dec, sess.seq, sess.grid);
+            return .{ .be = be, .dec = dec, .sess = sess, .ws = ws };
+        }
+
+        fn deinit(self: *DeviceVolume) void {
+            self.ws.deinit(self.be);
+            self.sess.deinit(self.be);
+        }
+
+        fn volume(self: *DeviceVolume) minimax_h3_vae.Volume {
+            return .{ .ctx = self, .call = call };
+        }
+
+        fn call(ctx: *anyopaque, io: std.Io, gpa: std.mem.Allocator, out: []f32, z: []const f32, t: usize, h: usize, w: usize) anyerror!void {
+            const self: *DeviceVolume = @ptrCast(@alignCast(ctx));
+            // The last window can be SHORTER than the session's shape, and the
+            // rope table is sized for that shape. Fall back rather than index a
+            // table built for a different grid.
+            if (t * h * w + self.dec.cfg.n_register + 1 != self.sess.seq) {
+                return minimax_h3_vae.decodeVolume(self.dec, io, gpa, out, z, t, h, w);
+            }
+            return minimax_h3_vae_cuda.decodeVolume(self.dec, self.be, &self.sess, &self.ws, io, gpa, out, z, t, h, w);
+        }
+    };
+
+    /// Decode a packed two-stream latent to a clip: frames plus the soundtrack
+    /// the same run produced.
+    ///
+    /// The `decode` sibling for the still-image families returns an `Image`; a
+    /// video family cannot, because its result has a second modality and a frame
+    /// rate. Both decoders run here, so a caller gets one coherent result rather
+    /// than having to pair them itself.
+    ///
+    /// `latent` is the flat pack: the visual stream followed by the audio one,
+    /// split at `shape.audioOffset()`. It is NOT modified.
+    /// A reference picture, as a caller hands it in: planar `[3][h][w]` f32 in
+    /// [0, 1]. The CLI decodes a PNG into this; the GUI would hand over a frame.
+    pub const RefImage = struct {
+        rgb: []const f32,
+        width: usize,
+        height: usize,
+    };
+
+    /// A reference SOUNDTRACK, as a caller hands it in: interleaved f32 in
+    /// [-1, 1] at whatever rate the file had. The pipeline resamples to the audio
+    /// VAE's 32 kHz, because the resampling FILTER is part of the reference
+    /// implementation and not something a caller should have to reproduce.
+    pub const RefAudio = struct {
+        /// `[frames][channels]`, interleaved.
+        samples: []const f32,
+        channels: usize,
+        sample_rate: u32,
+    };
+
+    /// A reference VIDEO: frames at 24 fps, planar `[3][h][w]` each, all the same
+    /// size.
+    pub const RefVideo = struct {
+        /// One entry per frame, in order.
+        frames: []const RefImage,
+        /// The video's own soundtrack. A reference video WITH audio is one block
+        /// carrying both streams; the node spells that as a separate kind
+        /// ("video_audio") but the layout treats it as a video whose `audio_t` is
+        /// nonzero.
+        soundtrack: ?RefAudio = null,
+    };
+
+    /// A clip to CONTINUE from: hold its opening fixed and generate the rest.
+    ///
+    /// Unlike a reference, this is not conditioning: the source's latent goes into
+    /// the sampler's own buffer and the preserved rows are held on their exact flow
+    /// trajectory at every step, while a denoise mask tells the trunk those rows are
+    /// already clean. A reference sits outside the timeline; this IS the timeline's
+    /// first frames.
+    pub const ContinueFrom = struct {
+        /// Source frames in order, any size: they are resized to the target canvas.
+        frames: []const RefImage,
+        /// The source's soundtrack. Without it the audio restarts from noise while
+        /// the video continues, which is audible.
+        audio: ?RefAudio = null,
+        /// PIXEL frames held fixed from the start. Snapped DOWN to a legal clip
+        /// length, because the VAE's temporal chunking only lands on that grid; the
+        /// snapped count is what actually gets preserved and is reported.
+        preserve_frames: usize,
+    };
+
+    /// A continuation, prepared: the sampler's own reference latent plus the two
+    /// denoise masks that tell the trunk which rows it is.
+    pub const Continuation = struct {
+        /// The packed latent (visual then audio) with the preserved rows filled in
+        /// and the rest zero, already in the sampler's CARRIED space so it can be
+        /// blended into `x` directly.
+        ref: []f32,
+        /// Per-2x2-patch-row values for the video target segment, 0 = preserve.
+        video_mask: []f32,
+        /// Per-row values for the audio target segment, empty when the source had
+        /// no soundtrack.
+        audio_mask: []f32,
+        /// What was actually preserved, after snapping.
+        frames: usize,
+        latent_t: usize,
+        audio_t: usize,
+
+        pub fn deinit(self: *Continuation, gpa: std.mem.Allocator) void {
+            gpa.free(self.ref);
+            gpa.free(self.video_mask);
+            if (self.audio_mask.len > 0) gpa.free(self.audio_mask);
+            self.* = undefined;
+        }
+    };
+
+    /// A reference soundtrack, encoded: the DiT's `ref_audio` condition rows.
+    ///
+    /// Audio never reaches the vision tower, so unlike a picture this has only one
+    /// half. The prompt gets an `<Audio j>` LABEL and no block.
+    pub const EncodedAudio = struct {
+        /// `[2 * audio_t][audio_latent_channels]`, channel-major (see
+        /// `minimax_h3.packAudio`).
+        rows: []f32,
+        audio_t: usize,
+
+        pub fn deinit(self: *EncodedAudio, gpa: std.mem.Allocator) void {
+            gpa.free(self.rows);
+            self.* = undefined;
+        }
+    };
+
+    /// A reference video, encoded. Several vision blocks (one per temporal pair at
+    /// 2 fps) against ONE set of condition rows spanning several latent frames.
+    pub const EncodedVideo = struct {
+        /// `blocks.len` tower outputs, each `[tokens][enc_hidden]`.
+        merged: [][]f32,
+        /// `[block][deepstack_index]`, each `[tokens][enc_hidden]`.
+        deepstack: [][][]f32,
+        grid_h: usize,
+        grid_w: usize,
+        /// Midpoint seconds per block, for the `<T.T seconds>` labels.
+        timestamps: []f32,
+        cond_rows: []f32,
+        latent_t: usize,
+        lat_h: usize,
+        lat_w: usize,
+        /// The soundtrack's rows, empty when the reference video is silent. They
+        /// pack immediately BEFORE the video's own rows and share its cursor
+        /// origin, which is why they belong to the same encoded block.
+        audio: ?EncodedAudio = null,
+
+        pub fn deinit(self: *EncodedVideo, gpa: std.mem.Allocator) void {
+            for (self.merged) |m| gpa.free(m);
+            gpa.free(self.merged);
+            for (self.deepstack) |per_block| {
+                for (per_block) |d| gpa.free(d);
+                gpa.free(per_block);
+            }
+            gpa.free(self.deepstack);
+            gpa.free(self.timestamps);
+            gpa.free(self.cond_rows);
+            if (self.audio) |*au| au.deinit(gpa);
+            self.* = undefined;
+        }
+    };
+
+    /// A keyframe request: a picture anchored at a PIXEL FRAME of the target
+    /// video, as opposed to a reference, which sits outside the timeline.
+    ///
+    /// Three things differ from a reference and all three come from the node:
+    /// a keyframe is resized to the GENERATION's canvas (so it shares the
+    /// target's latent grid) rather than to a grid of its own; the FIRST frame is
+    /// a plain stretch while a LAST frame is an aspect-preserving cover crop (the
+    /// node calls them "geometry anchor" and "follower"); and it carries a frame
+    /// index, which is what places it on the shared timeline.
+    pub const KeyframeReq = struct {
+        img: RefImage,
+        frame_index: usize,
+        /// True for a last/interior frame, false for the first.
+        cover_crop: bool,
+    };
+
+    /// Everything the model needs from one reference picture, produced together.
+    ///
+    /// The two halves go to different places -- the tower's features into the LLM's
+    /// token stream, the VAE latent into the DiT's condition rows -- and they have
+    /// to describe the SAME resized image or the prompt refers to one picture while
+    /// the trunk conditions on another. Producing both here is what keeps the two
+    /// resize policies from drifting apart.
+    pub const EncodedRef = struct {
+        /// `[tokens][enc_hidden]`, the tower's merged output.
+        merged: []f32,
+        /// One per deepstack index, each `[tokens][enc_hidden]`.
+        deepstack: [][]f32,
+        /// PRE-merge patch grid, which the presentation and mrope both need.
+        grid_h: usize,
+        grid_w: usize,
+        /// Patchified condition rows, `[(lat_h/2)*(lat_w/2)][videoPatchDim]`.
+        cond_rows: []f32,
+        lat_h: usize,
+        lat_w: usize,
+
+        pub fn deinit(self: *EncodedRef, gpa: std.mem.Allocator) void {
+            gpa.free(self.merged);
+            for (self.deepstack) |d| gpa.free(d);
+            gpa.free(self.deepstack);
+            gpa.free(self.cond_rows);
+            self.* = undefined;
+        }
+    };
+
+    /// Aspect-preserving cover crop to `(dh, dw)`: scale so the shorter relative
+    /// axis fills, then take the centre. The node's `"center"` policy, used for a
+    /// LAST keyframe; a first keyframe stretches instead, because it is the
+    /// geometry the rest of the clip is built on.
+    fn coverCrop(gpa: std.mem.Allocator, img: RefImage, dh: usize, dw: usize) ![]f32 {
+        const sh = img.height;
+        const sw = img.width;
+        // The source rectangle that has the destination's aspect ratio.
+        const want = @as(f64, @floatFromInt(dw)) / @as(f64, @floatFromInt(dh));
+        var cw = sw;
+        var ch = sh;
+        if (@as(f64, @floatFromInt(sw)) / @as(f64, @floatFromInt(sh)) > want) {
+            cw = @intFromFloat(@round(@as(f64, @floatFromInt(sh)) * want));
+        } else {
+            ch = @intFromFloat(@round(@as(f64, @floatFromInt(sw)) / want));
+        }
+        cw = @max(1, @min(cw, sw));
+        ch = @max(1, @min(ch, sh));
+        const y0 = (sh - ch) / 2;
+        const x0 = (sw - cw) / 2;
+
+        const crop = try gpa.alloc(f32, 3 * ch * cw);
+        defer gpa.free(crop);
+        for (0..3) |c| {
+            for (0..ch) |y| {
+                const src = img.rgb[c * sh * sw + (y0 + y) * sw + x0 ..][0..cw];
+                @memcpy(crop[c * ch * cw + y * cw ..][0..cw], src);
+            }
+        }
+        const out = try gpa.alloc(f32, 3 * dh * dw);
+        errdefer gpa.free(out);
+        minimax_h3_vit.resizeBilinear(out, crop, ch, cw, dh, dw);
+        return out;
+    }
+
+    /// One keyframe through both towers, at the GENERATION's canvas.
+    fn h3EncodeKeyframe(
+        self: *Session,
+        gpa: std.mem.Allocator,
+        m: *MiniMaxH3Models,
+        kf: KeyframeReq,
+        canvas_h: usize,
+        canvas_w: usize,
+    ) !EncodedRef {
+        try self.h3EnsureRefModels(gpa, m);
+        const vit = &m.vit.?;
+        const venc = &m.venc.?;
+
+        // The canvas, not a grid of its own: a keyframe shares the target's
+        // spatial grid, which is what lets its rows sit in the same patch layout.
+        const pix = if (kf.cover_crop)
+            try coverCrop(gpa, kf.img, canvas_h, canvas_w)
+        else blk: {
+            const o = try gpa.alloc(f32, 3 * canvas_h * canvas_w);
+            minimax_h3_vit.resizeBilinear(o, kf.img.rgb, kf.img.height, kf.img.width, canvas_h, canvas_w);
+            break :blk o;
+        };
+        defer gpa.free(pix);
+
+        // The ViT still wants its own 32 px grid, so it re-resizes the canvas
+        // image; the VAE takes the canvas directly.
+        var prep = try minimax_h3_vit.preprocessStill(gpa, vit.cfg, pix, canvas_h, canvas_w, 3136, canvas_h * canvas_w);
+        defer prep.deinit(gpa);
+        var enc = try minimax_h3_vit.encode(vit, self.io, gpa, prep.patches, prep.grid_h, prep.grid_w);
+        errdefer enc.deinit(gpa);
+
+        const vae_in = try gpa.alloc(f32, 3 * canvas_h * canvas_w);
+        defer gpa.free(vae_in);
+        for (vae_in, pix) |*d, v| d.* = v * 2.0 - 1.0;
+        const sp: minimax_h3_vae.Spatial = .{ .ratio = minimax_h3.spatial_downscale };
+        var vdev = try self.h3VencDevice(gpa, m);
+        defer if (vdev) |*d| d.deinit();
+        const dev_moments = if (vdev) |*d| d.moments() else null;
+        const lat = try minimax_h3_vae_encode.encode(venc, self.io, gpa, .{
+            .d = @constCast(vae_in),
+            .ch = 3,
+            .t = 1,
+            .h = canvas_h,
+            .w = canvas_w,
+        }, sp, dev_moments);
+        defer gpa.free(lat.d);
+
+        const frame_rows = (lat.h / minimax_h3.patch_h) * (lat.w / minimax_h3.patch_w);
+        const cond_rows = try gpa.alloc(f32, frame_rows * m.dit.cfg.videoPatchDim());
+        errdefer gpa.free(cond_rows);
+        minimax_h3.patchifyVideo(cond_rows, lat.d, lat.t, lat.h, lat.w);
+
+        return .{
+            .merged = enc.merged,
+            .deepstack = enc.deepstack,
+            .grid_h = prep.grid_h,
+            .grid_w = prep.grid_w,
+            .cond_rows = cond_rows,
+            .lat_h = lat.h,
+            .lat_w = lat.w,
+        };
+    }
+
+    /// One reference video through both towers.
+    ///
+    /// The two halves see the clip DIFFERENTLY and that is the point:
+    ///
+    /// - the VAE encodes EVERY frame, so the DiT's condition rows carry the whole
+    ///   motion;
+    /// - the tower sees it at 2 fps in temporal PAIRS, each labelled with its
+    ///   midpoint timestamp, so a 5 s clip costs ten vision blocks rather than 120.
+    ///   Those tokens ride through every sampling step.
+    fn h3EncodeRefVideo(
+        self: *Session,
+        gpa: std.mem.Allocator,
+        m: *MiniMaxH3Models,
+        vid: RefVideo,
+        target_frames: usize,
+    ) !EncodedVideo {
+        try self.h3EnsureRefModels(gpa, m);
+        const vit = &m.vit.?;
+        const venc = &m.venc.?;
+        if (vid.frames.len == 0) return error.RefVideoTooShort;
+
+        // Crop DOWN to a legal clip length; never pad up, which would invent
+        // motion the reference does not have.
+        const n = try minimax_h3.refVideoFrames(vid.frames.len, target_frames);
+        const src_w = vid.frames[0].width;
+        const src_h = vid.frames[0].height;
+        for (vid.frames[0..n]) |f| {
+            if (f.width != src_w or f.height != src_h) return error.RefVideoRagged;
+        }
+
+        // The reference video's OWN canvas: a 768 px short edge, not the
+        // generation's size and not the clip's own.
+        const canvas = minimax_h3.adaptCanvas(src_w, src_h);
+        const cw = canvas.w;
+        const ch = canvas.h;
+
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        // What the VAE encode will actually peak at, reported before doing it.
+        // ⚠️ The clip chunking pads a short reference UP to `clip_length` (17), so
+        // a 5-frame reference costs the same as a 17-frame one; the frame count
+        // you passed is not what sets the peak.
+        const peak = minimax_h3_vae_encode.peakBytesFor(venc.cfg, venc.cfg.clip_length, ch, cw);
+        std.log.info("minimax_h3: reference video {d} frames at {d}x{d}, VAE encode HOST peak {d} MB", .{ n, cw, ch, peak >> 20 });
+
+        // Every frame at the canvas, planar, once: both halves read these.
+        const scaled = try a.alloc([]f32, n);
+        for (vid.frames[0..n], scaled) |f, *dst| {
+            dst.* = try a.alloc(f32, 3 * ch * cw);
+            minimax_h3_vit.resizeBilinear(dst.*, f.rgb, f.height, f.width, ch, cw);
+        }
+
+        // --- the tower's half: 2 fps, in pairs --------------------------------
+        const stride = minimax_h3.refVideoSampleStride();
+        var sampled: std.ArrayList(usize) = .empty;
+        var fi: usize = 0;
+        while (fi < n) : (fi += stride) try sampled.append(a, fi);
+        // An odd count repeat-pads its LAST frame to fill the temporal patch.
+        if (sampled.items.len % 2 == 1) try sampled.append(a, sampled.items[sampled.items.len - 1]);
+        const n_blocks = sampled.items.len / 2;
+
+        const merged = try gpa.alloc([]f32, n_blocks);
+        var m_done: usize = 0;
+        errdefer {
+            for (merged[0..m_done]) |x| gpa.free(x);
+            gpa.free(merged);
+        }
+        const ds = try gpa.alloc([][]f32, n_blocks);
+        var d_done: usize = 0;
+        errdefer {
+            for (ds[0..d_done]) |per| {
+                for (per) |x| gpa.free(x);
+                gpa.free(per);
+            }
+            gpa.free(ds);
+        }
+        const timestamps = try gpa.alloc(f32, n_blocks);
+        errdefer gpa.free(timestamps);
+
+        var grid_h: usize = 0;
+        var grid_w: usize = 0;
+        for (0..n_blocks) |bi| {
+            const fa = sampled.items[2 * bi];
+            const fb = sampled.items[2 * bi + 1];
+            var prep = try minimax_h3_vit.preprocessPair(gpa, vit.cfg, scaled[fa], scaled[fb], ch, cw, 3136, ch * cw);
+            defer prep.deinit(gpa);
+            grid_h = prep.grid_h;
+            grid_w = prep.grid_w;
+            const enc = try minimax_h3_vit.encode(vit, self.io, gpa, prep.patches, prep.grid_h, prep.grid_w);
+            merged[bi] = enc.merged;
+            m_done += 1;
+            ds[bi] = enc.deepstack;
+            d_done += 1;
+            // The label is the PAIR's midpoint in the tower's 2 fps timeline, so
+            // block b covers samples 2b and 2b+1 at 0.5 s apart.
+            timestamps[bi] = (@as(f32, @floatFromInt(2 * bi)) + @as(f32, @floatFromInt(2 * bi + 1))) / 2.0 / 2.0;
+        }
+
+        // --- the DiT's half: every frame through the VAE ----------------------
+        const vol = try a.alloc(f32, 3 * n * ch * cw);
+        const plane = ch * cw;
+        for (0..3) |c| {
+            for (0..n) |t| {
+                const src = scaled[t][c * plane ..][0..plane];
+                const dst = vol[(c * n + t) * plane ..][0..plane];
+                for (dst, src) |*d, v| d.* = v * 2.0 - 1.0;
+            }
+        }
+        const sp: minimax_h3_vae.Spatial = .{ .ratio = minimax_h3.spatial_downscale };
+        var vdev = try self.h3VencDevice(gpa, m);
+        defer if (vdev) |*d| d.deinit();
+        const dev_moments = if (vdev) |*d| d.moments() else null;
+        const lat = try minimax_h3_vae_encode.encode(venc, self.io, gpa, .{
+            .d = vol,
+            .ch = 3,
+            .t = n,
+            .h = ch,
+            .w = cw,
+        }, sp, dev_moments);
+        defer gpa.free(lat.d);
+
+        const frame_rows = (lat.h / minimax_h3.patch_h) * (lat.w / minimax_h3.patch_w);
+        const cond_rows = try gpa.alloc(f32, lat.t * frame_rows * m.dit.cfg.videoPatchDim());
+        errdefer gpa.free(cond_rows);
+        minimax_h3.patchifyVideo(cond_rows, lat.d, lat.t, lat.h, lat.w);
+
+        // --- the soundtrack, if there is one ----------------------------------
+        // ⚠️ The reference encodes the WHOLE soundtrack even though it cropped the
+        // frames down to a legal clip length, so a reference video's audio can be
+        // longer than its video. The layout already handles that (a block's time
+        // span is the max of its two streams), and matching the reference matters
+        // more than tidying it, but a large mismatch is worth saying out loud.
+        var enc_audio: ?EncodedAudio = null;
+        errdefer if (enc_audio) |*au| au.deinit(gpa);
+        if (vid.soundtrack) |snd| {
+            enc_audio = try self.h3EncodeRefAudio(gpa, m, snd);
+            const av_t = minimax_h3.audioLatentT(n);
+            const got = enc_audio.?.audio_t;
+            if (got > av_t + 4 or got + 4 < av_t) std.log.warn(
+                "minimax_h3: reference video kept {d} frames ({d} audio latent frames) but its " ++
+                    "soundtrack encodes to {d}; the reference implementation does not trim " ++
+                    "either to match, so the block spans the longer of the two",
+                .{ n, av_t, got },
+            );
+        }
+
+        return .{
+            .merged = merged,
+            .deepstack = ds,
+            .grid_h = grid_h,
+            .grid_w = grid_w,
+            .timestamps = timestamps,
+            .cond_rows = cond_rows,
+            .latent_t = lat.t,
+            .lat_h = lat.h,
+            .lat_w = lat.w,
+            .audio = enc_audio,
+        };
+    }
+
+    /// Encode a continuation source into the sampler's own latent plus its masks.
+    ///
+    /// The source is resized to the TARGET's canvas and its preserved prefix run
+    /// through both VAE encoders, so the result lines up row for row with the
+    /// latent being sampled. Everything past the preserved prefix is left zero and
+    /// masked to 1 (generate), so it never reaches the trunk as content.
+    fn h3EncodeContinuation(
+        self: *Session,
+        gpa: std.mem.Allocator,
+        m: *MiniMaxH3Models,
+        cf: ContinueFrom,
+        shape: LatentShape,
+        shifts: minimax_h3.Shifts,
+    ) !Continuation {
+        try self.h3EnsureRefModels(gpa, m);
+        const venc = &m.venc.?;
+        const audio = shape.audio orelse return error.FamilyIsNotVideo;
+        if (cf.frames.len == 0) return error.RefVideoTooShort;
+
+        const target_frames = self.pixelFrames(shape);
+        // Snapped DOWN to the VAE's temporal grid, and never past either the
+        // source's own length or the target's.
+        const n = try minimax_h3.refVideoFrames(@min(cf.frames.len, cf.preserve_frames), target_frames);
+        const lat_t_pre = minimax_h3.videoLatentT(n);
+        if (lat_t_pre > shape.t) return error.RefVideoTooShort;
+        const at_pre = @min(minimax_h3.audioLatentT(n), audio.t);
+
+        const ds = self.spatialDownscale();
+        const ch = shape.h * ds;
+        const cw = shape.w * ds;
+
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+
+        const peak = minimax_h3_vae_encode.peakBytesFor(venc.cfg, venc.cfg.clip_length, ch, cw);
+        std.log.info(
+            "minimax_h3: continuing from {d} frames at {d}x{d} ({d} of {d} video latent frames, " ++
+                "{d} of {d} audio), VAE encode HOST peak {d} MB",
+            .{ n, cw, ch, lat_t_pre, shape.t, at_pre, audio.t, peak >> 20 },
+        );
+
+        // Every preserved frame at the target canvas, in the VAE's [-1, 1].
+        const plane = ch * cw;
+        const vol = try a.alloc(f32, 3 * n * plane);
+        {
+            const scaled = try a.alloc(f32, 3 * plane);
+            for (cf.frames[0..n], 0..) |f, t| {
+                minimax_h3_vit.resizeBilinear(scaled, f.rgb, f.height, f.width, ch, cw);
+                for (0..3) |c| {
+                    const src = scaled[c * plane ..][0..plane];
+                    const dst = vol[(c * n + t) * plane ..][0..plane];
+                    for (dst, src) |*d, vv| d.* = vv * 2.0 - 1.0;
+                }
+            }
+        }
+        const sp: minimax_h3_vae.Spatial = .{ .ratio = minimax_h3.spatial_downscale };
+        var vdev = try self.h3VencDevice(gpa, m);
+        defer if (vdev) |*d| d.deinit();
+        const dev_moments = if (vdev) |*d| d.moments() else null;
+        const lat = try minimax_h3_vae_encode.encode(venc, self.io, gpa, .{
+            .d = vol,
+            .ch = 3,
+            .t = n,
+            .h = ch,
+            .w = cw,
+        }, sp, dev_moments);
+        defer gpa.free(lat.d);
+        if (lat.t != lat_t_pre or lat.h != shape.h or lat.w != shape.w) {
+            std.log.err(
+                "minimax_h3: the continuation encoded to [{d}][{d}][{d}] but the render is " ++
+                    "[{d}][{d}][{d}]; they must line up row for row",
+                .{ lat.t, lat.h, lat.w, shape.t, shape.h, shape.w },
+            );
+            return error.ShapeMismatch;
+        }
+
+        // --- the sampler's reference latent ----------------------------------
+        const ref = try gpa.alloc(f32, shape.elems());
+        errdefer gpa.free(ref);
+        @memset(ref, 0);
+        const n_v = shape.audioOffset();
+        // Video is planar [24][t][h][w]; copy the preserved temporal prefix of
+        // every channel.
+        const c_v = minimax_h3.latent_channels;
+        const hw = shape.h * shape.w;
+        for (0..c_v) |c| {
+            const src = lat.d[c * lat.t * hw ..][0 .. lat_t_pre * hw];
+            @memcpy(ref[c * shape.t * hw ..][0 .. lat_t_pre * hw], src);
+        }
+
+        var audio_mask: []f32 = &.{};
+        errdefer if (audio_mask.len > 0) gpa.free(audio_mask);
+        if (cf.audio) |snd| {
+            var enc_a = try self.h3EncodeRefAudio(gpa, m, snd);
+            defer enc_a.deinit(gpa);
+            const have = @min(at_pre, enc_a.audio_t);
+            // The rows come back channel-major; unpack the prefix straight into the
+            // planar audio half.
+            const c_a = minimax_h3.audio_latent_channels;
+            for (0..minimax_h3.audio_channels) |s| {
+                for (0..have) |i| {
+                    const row = enc_a.rows[(s * enc_a.audio_t + i) * c_a ..][0..c_a];
+                    for (0..c_a) |c| {
+                        ref[n_v + (c * minimax_h3.audio_channels + s) * audio.t + i] = row[c];
+                    }
+                }
+            }
+            audio_mask = try gpa.alloc(f32, minimax_h3.audio_channels * audio.t);
+            for (audio_mask, 0..) |*mk, j| {
+                const i = j % audio.t;
+                mk.* = if (i < have) 0.0 else 1.0;
+            }
+            if (have < at_pre) std.log.warn(
+                "minimax_h3: the continuation's soundtrack covers only {d} of the {d} audio " ++
+                    "latent frames its video does; the rest regenerates",
+                .{ have, at_pre },
+            );
+        }
+
+        // The audio half of the reference has to be in the CARRIED space, because
+        // that is the space `x` is in for the whole sampling run.
+        self.processLatentIn(ref, shape, shifts);
+
+        // --- the video mask ---------------------------------------------------
+        // Built as a per-CELL mask and reduced by `maskRowValues`, so the
+        // patch-row reduction is the one the reference does rather than a second
+        // implementation of it here.
+        const cells = try a.alloc(f32, shape.t * shape.h * shape.w);
+        for (0..shape.t) |t| {
+            const v: f32 = if (t < lat_t_pre) 0.0 else 1.0;
+            @memset(cells[t * shape.h * shape.w ..][0 .. shape.h * shape.w], v);
+        }
+        // The DiT patches a latent rounded UP to 2x2, which is the grid the mask
+        // rows are counted on.
+        const grid_h = (shape.h + 1) / 2 * 2;
+        const grid_w = (shape.w + 1) / 2 * 2;
+        const video_mask = (try minimax_h3.maskRowValues(gpa, cells, shape.t, shape.h, shape.w, grid_h, grid_w)) orelse {
+            // Every row generates, i.e. nothing was preserved after snapping.
+            std.log.err("minimax_h3: --preserve-frames {d} snapped to nothing to preserve", .{cf.preserve_frames});
+            return error.RefVideoTooShort;
+        };
+        return .{
+            .ref = ref,
+            .video_mask = video_mask,
+            .audio_mask = audio_mask,
+            .frames = n,
+            .latent_t = lat_t_pre,
+            .audio_t = if (audio_mask.len > 0) at_pre else 0,
+        };
+    }
+
+    /// The video VAE encoder's device hook, or null when this backend or checkpoint
+    /// has no path for it.
+    ///
+    /// Per CALL SITE rather than per render, because the `Ctx` owns a device
+    /// workspace and there is no reason to keep one alive between references. The
+    /// permuted weights DO persist, on the model bundle.
+    fn h3VencDevice(self: *Session, gpa: std.mem.Allocator, m: *MiniMaxH3Models) !?minimax_h3_vae_encode_cuda.Ctx {
+        const be = self.cu_be orelse return null;
+        const venc = &m.venc.?;
+        if (!minimax_h3_vae_encode_cuda.supported(venc)) return null;
+        if (m.venc_cu == null) {
+            m.venc_cu = minimax_h3_vae_encode_cuda.Session.init(gpa, venc) catch |err| {
+                std.log.warn("minimax_h3: the video encoder has no device path ({t}); encoding on the CPU", .{err});
+                return null;
+            };
+            // Said once, because the host-peak figures the callers report above are
+            // then not what the run actually costs: at 17 frames of 256x256 the
+            // host peak is 4.35 GB and 48 s, the device 1.8 GB of VRAM and 1.1 s.
+            std.log.info("minimax_h3: the video VAE encode runs on the device", .{});
+        }
+        self.setMemTag(.vae);
+        return .{ .enc = venc, .sess = &m.venc_cu.?, .be = be, .gpa = gpa };
+    }
+
+    /// The audio encode on the device, if this backend and checkpoint allow it.
+    ///
+    /// Returns false when it did not run, so the caller falls back rather than
+    /// failing: an unsupported shape or a missing device is a slower render, not a
+    /// broken one. Worth having on the device for both reasons at once -- 16-22x at
+    /// a realistic reference length on the vendor-library arm, and the host peak
+    /// (297 MB for six seconds) moves to VRAM that is free at this point in a
+    /// render. On the hand-PTX arm it is correct and about even, because that arm
+    /// has no tiled f32 GEMM.
+    fn h3AudioEncodeDevice(
+        self: *Session,
+        gpa: std.mem.Allocator,
+        m: *MiniMaxH3Models,
+        out: []f32,
+        wav: []const f32,
+        frames: usize,
+        chans: usize,
+    ) !bool {
+        const be = self.cu_be orelse return false;
+        const enc = &m.aenc.?;
+        if (!minimax_h3_audio_encode_cuda.supported(enc)) return false;
+        if (m.aenc_cu == null) {
+            m.aenc_cu = minimax_h3_audio_encode_cuda.Session.init(gpa, enc) catch |err| {
+                std.log.warn("minimax_h3: the audio encoder has no device path ({t}); encoding on the CPU", .{err});
+                return false;
+            };
+        }
+        self.setMemTag(.vae);
+        var ws = try minimax_h3_audio_encode_cuda.Workspace.init(be, enc, frames);
+        defer ws.deinit(be);
+        try minimax_h3_audio_encode_cuda.encode(enc, &m.aenc_cu.?, be, &ws, gpa, out, wav, frames, chans);
+        return true;
+    }
+
+    /// Load the audio VAE's encode side, once, on first soundtrack use.
+    ///
+    /// Separate from `h3EnsureRefModels` because a reference SOUNDTRACK needs
+    /// neither the vision tower nor the video encoder, and a silent reference
+    /// video needs this one not at all.
+    fn h3EnsureAudioEncoder(gpa: std.mem.Allocator, m: *MiniMaxH3Models) !void {
+        if (m.aenc != null) return;
+        const store = if (m.audio_st) |*st| st.store() else if (m.audio_view) |v| v.base else m.dit_st.store();
+        m.aenc = minimax_h3_audio_encode.AudioEncoder.load(gpa, store, .{}) catch |err| {
+            std.log.err("minimax_h3: this audio VAE carries no usable encoder ({t}); reference audio needs one", .{err});
+            return error.ComponentNotInCheckpoint;
+        };
+    }
+
+    /// One reference soundtrack: resample to 32 kHz, encode, patchify.
+    ///
+    /// ⚠️ **The reference NODE transposes the waveform before handing it to the
+    /// VAE** (`waveform[:1].movedim(1, -1)` on a `[B, C, L]` tensor), which feeds
+    /// `encode` a `[1, L, C]` and makes it read the sample count as the stereo
+    /// width. `MiniMaxH3AudioVAE.encode`'s own contract is `[B, 2, L]`, and that is
+    /// what is followed here: the node's transpose cannot be what the model was
+    /// trained on, since it would encode two samples across L "channels".
+    fn h3EncodeRefAudio(
+        self: *Session,
+        gpa: std.mem.Allocator,
+        m: *MiniMaxH3Models,
+        au: RefAudio,
+    ) !EncodedAudio {
+        try h3EnsureAudioEncoder(gpa, m);
+        const enc = &m.aenc.?;
+        if (au.channels == 0 or au.samples.len < au.channels) return error.RefAudioEmpty;
+
+        var w: audio_file.Wave = .{
+            .samples = try gpa.dupe(f32, au.samples),
+            .channels = au.channels,
+            .sample_rate = au.sample_rate,
+        };
+        defer w.deinit(gpa);
+        if (w.sample_rate != minimax_h3_audio.sample_rate) {
+            const rs = try audio_file.resample(gpa, w, minimax_h3_audio.sample_rate, .{});
+            w.deinit(gpa);
+            w = rs;
+        }
+
+        // More than two channels are mixed down to the first two rather than
+        // refused: the model has exactly one stereo pair and a caller handing over
+        // a 5.1 file means "use this audio".
+        const chans = @min(w.channels, minimax_h3.audio_channels);
+        const frames = w.frames();
+        const packed_wav = if (w.channels == chans) w.samples else blk: {
+            const out = try gpa.alloc(f32, frames * chans);
+            for (0..frames) |i| {
+                for (0..chans) |c| out[i * chans + c] = w.samples[i * w.channels + c];
+            }
+            break :blk out;
+        };
+        defer if (packed_wav.ptr != w.samples.ptr) gpa.free(packed_wav);
+
+        const at = enc.latentFrames(frames);
+        if (at == 0) return error.RefAudioEmpty;
+        std.log.info(
+            "minimax_h3: reference audio {d:.2} s at {d} Hz -> {d} latent frames, encode HOST peak {d} MB",
+            .{ w.seconds(), w.sample_rate, at, enc.peakBytesFor(frames) >> 20 },
+        );
+
+        const c_lat = enc.latentChannels();
+        const z = try gpa.alloc(f32, c_lat * minimax_h3.audio_channels * at);
+        defer gpa.free(z);
+        if (try self.h3AudioEncodeDevice(gpa, m, z, packed_wav, frames, chans)) {
+            // done on the device
+        } else {
+            try minimax_h3_audio_encode.encode(enc, self.io, gpa, z, packed_wav, frames, chans);
+        }
+
+        const rows = try gpa.alloc(f32, minimax_h3.audio_channels * at * minimax_h3.audio_latent_channels);
+        errdefer gpa.free(rows);
+        minimax_h3.packAudio(rows, z, at);
+        return .{ .rows = rows, .audio_t = at };
+    }
+
+    /// Load the vision tower and the VAE encoder, once, on first reference use.
+    ///
+    /// Lazy because between them they are ~350 MB of host memory that a t2va
+    /// render never reads. The tower comes out of the TEXT ENCODER's store under
+    /// `visual.`, not a file of its own: this export puts it beside the language
+    /// model.
+    fn h3EnsureRefModels(self: *Session, gpa: std.mem.Allocator, m: *MiniMaxH3Models) !void {
+        if (m.vit == null) {
+            // The tower lives beside the language model in the TEXT ENCODER's own
+            // file when there is one, and only inside the primary checkpoint when
+            // the encoder was bundled. `enc_view` is null in the common
+            // (separate-file) case, so falling back to the DiT store there looks
+            // for `visual.` in the wrong file entirely.
+            const enc_store = if (m.enc_st) |*st| st.store() else if (m.enc_view) |v| v.base else m.dit_st.store();
+            var pfx = try weights_mod.Prefixed.init(gpa, enc_store, "visual.");
+            defer pfx.deinit(gpa);
+            m.vit = minimax_h3_vit.Vit.load(gpa, pfx.store(), minimax_h3_vit.Config.qwen3vl_32b) catch |err| {
+                std.log.err("minimax_h3: this text encoder carries no usable `visual.` vision tower ({t}); references need one", .{err});
+                return error.ComponentNotInCheckpoint;
+            };
+        }
+        if (m.venc == null) {
+            const vae_store = if (m.vae_st) |*st| st.store() else if (m.vae_view) |v| v.base else m.dit_st.store();
+            m.venc = minimax_h3_vae_encode.VideoEncoder.load(gpa, vae_store, null) catch |err| {
+                std.log.err("minimax_h3: this VAE carries no usable encoder ({t}); references need one", .{err});
+                return error.ComponentNotInCheckpoint;
+            };
+        }
+        _ = self;
+    }
+
+    /// One reference picture through both towers.
+    ///
+    /// `area_cap` is the pixel budget the ViT resize clamps to, which is the
+    /// reference's `ref_image_size` policy: `match` passes the generation's own
+    /// area so a reference costs no more than a frame, `max` passes a much larger
+    /// cap for identity fidelity. Reference tokens ride through EVERY sampling
+    /// step, so the choice is a real cost.
+    fn h3EncodeRef(
+        self: *Session,
+        gpa: std.mem.Allocator,
+        m: *MiniMaxH3Models,
+        img: RefImage,
+        area_cap: usize,
+    ) !EncodedRef {
+        try self.h3EnsureRefModels(gpa, m);
+        const vit = &m.vit.?;
+        const venc = &m.venc.?;
+
+        // --- the LLM's half: resize, patchify, run the tower ------------------
+        var prep = try minimax_h3_vit.preprocessStill(gpa, vit.cfg, img.rgb, img.height, img.width, 3136, area_cap);
+        defer prep.deinit(gpa);
+        var enc = try minimax_h3_vit.encode(vit, self.io, gpa, prep.patches, prep.grid_h, prep.grid_w);
+        errdefer enc.deinit(gpa);
+
+        // --- the DiT's half: the SAME resized extent through the VAE ----------
+        // The tower's grid fixes the resized pixel size, so the VAE sees exactly
+        // the picture the prompt is describing. Resizing twice, independently, is
+        // how the two would end up looking at different crops.
+        const px_h = prep.grid_h * vit.cfg.patch;
+        const px_w = prep.grid_w * vit.cfg.patch;
+        // The VAE's own 16x grid has to divide it, and the ViT's 32 px unit
+        // guarantees that.
+        std.debug.assert(px_h % minimax_h3.spatial_downscale == 0 and px_w % minimax_h3.spatial_downscale == 0);
+        const resized = try gpa.alloc(f32, 3 * px_h * px_w);
+        defer gpa.free(resized);
+        minimax_h3_vit.resizeBilinear(resized, img.rgb, img.height, img.width, px_h, px_w);
+        // The VAE takes [-1, 1]; the caller hands over [0, 1].
+        for (resized) |*v| v.* = v.* * 2.0 - 1.0;
+
+        const sp: minimax_h3_vae.Spatial = .{ .ratio = minimax_h3.spatial_downscale };
+        var vdev = try self.h3VencDevice(gpa, m);
+        defer if (vdev) |*d| d.deinit();
+        const dev_moments = if (vdev) |*d| d.moments() else null;
+        const lat = try minimax_h3_vae_encode.encode(venc, self.io, gpa, .{
+            .d = @constCast(resized),
+            .ch = 3,
+            .t = 1,
+            .h = px_h,
+            .w = px_w,
+        }, sp, dev_moments);
+        defer gpa.free(lat.d);
+
+        const frame_rows = (lat.h / minimax_h3.patch_h) * (lat.w / minimax_h3.patch_w);
+        const cond_rows = try gpa.alloc(f32, frame_rows * m.dit.cfg.videoPatchDim());
+        errdefer gpa.free(cond_rows);
+        minimax_h3.patchifyVideo(cond_rows, lat.d, lat.t, lat.h, lat.w);
+
+        return .{
+            .merged = enc.merged,
+            .deepstack = enc.deepstack,
+            .grid_h = prep.grid_h,
+            .grid_w = prep.grid_w,
+            .cond_rows = cond_rows,
+            .lat_h = lat.h,
+            .lat_w = lat.w,
+        };
+    }
+
+    /// The BigVGAN decode on the device, or false when this backend or checkpoint
+    /// cannot take it and the caller should run the host reference.
+    ///
+    /// The permuted-weight session is built LAZILY and cached: it is 135 MB of
+    /// host memory and a pass over ~250 MB of f32 conv weights, which a render
+    /// that never reaches the audio stage should not pay. The per-shape workspace
+    /// is small (a few MB) and is built per decode.
+    ///
+    /// A device failure other than cancellation falls back rather than
+    /// propagating: the host reference is pinned against ComfyUI and produces the
+    /// same audio, just slower. Cancellation is the caller's own stop and must
+    /// unwind.
+    fn decodeAudioOnDevice(
+        self: *Session,
+        gpa: std.mem.Allocator,
+        m: *MiniMaxH3Models,
+        out: []f32,
+        z: []const f32,
+        t: usize,
+    ) !bool {
+        const be = self.cu_be orelse return false;
+        if (std.c.getenv("TP_AUDIO_CPU") != null) return false;
+        if (!minimax_h3_audio_cuda.supported(&m.audio)) return false;
+        if (m.audio_cu == null) {
+            m.audio_cu = minimax_h3_audio_cuda.Session.init(gpa, &m.audio) catch |err| {
+                std.log.warn("minimax_h3_audio_cuda: session build failed ({t}), decoding on the CPU", .{err});
+                return false;
+            };
+        }
+        var ws = minimax_h3_audio_cuda.Workspace.init(be, &m.audio, t) catch |err| {
+            std.log.warn("minimax_h3_audio_cuda: workspace ({d} MB) failed ({t}), decoding on the CPU", .{
+                minimax_h3_audio_cuda.Workspace.bytesFor(&m.audio, t) >> 20, err,
+            });
+            return false;
+        };
+        defer ws.deinit(be);
+        // No cancel handle: `decodeClip` is a stage API and takes none, so the
+        // video decode beside this one is uncancellable too. The audio decode is
+        // now ~75 ms, so it is the video side that would be worth wiring.
+        minimax_h3_audio_cuda.decode(&m.audio, &m.audio_cu.?, be, &ws, gpa, out, z, t, null) catch |err| {
+            if (err == error.Canceled) return err;
+            std.log.warn("minimax_h3_audio_cuda: decode failed ({t}), decoding on the CPU", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    pub fn decodeClip(
+        self: *Session,
+        gpa: std.mem.Allocator,
+        latent: []const f32,
+        shape: LatentShape,
+        progress: ?*std.Io.Writer,
+    ) !Clip {
+        const io = self.io;
+        if (self.family() != .minimax_h3) return error.FamilyIsNotVideo;
+        const m = &self.models.minimax_h3;
+        const audio_shape = shape.audio orelse return error.FamilyIsNotVideo;
+        if (latent.len != shape.elems()) return error.LatentSizeMismatch;
+
+        const vcfg = m.vae.cfg;
+        // The VAE's spatial patch and the DiT's latent grid have to agree, or the
+        // clip decodes at a resolution the denoiser never sampled.
+        if (shape.channels != vcfg.in_channels) return error.LatentSizeMismatch;
+
+        self.setMemTag(.vae);
+        try note(progress, "decoding video...\n", .{});
+        const t0 = std.Io.Clock.real.now(io).nanoseconds;
+
+        // The TEMPORALLY CHUNKED decode, not a whole-volume one: 2 latent frames
+        // are 5 pixel frames, not 8, and the windows are blended. A whole-volume
+        // decode would hand back a clip of the wrong length.
+        const tp: minimax_h3_vae.Temporal = .{ .ratio_t = vcfg.patch_t };
+        const out_shape = minimax_h3_vae.outputShape(vcfg, shape.t, shape.h, shape.w);
+        const frames = tp.outputFrames(shape.t);
+
+        // The device window decode, when this backend and VAE support it. Once
+        // the trunk moved to the device this WAS the render: 420 s of a 460 s
+        // decode at 256x256.
+        var dev: ?DeviceVolume = null;
+        defer if (dev) |*d| d.deinit();
+        if (self.cu_be) |b| {
+            if (std.c.getenv("TP_VAE_NAIVE") != null) minimax_h3_vae_cuda.force_naive_attn = true;
+            if (std.c.getenv("TP_VAE_MAG") != null) minimax_h3_vae_cuda.dbg_mag = true;
+            if (minimax_h3_vae_cuda.supported(&m.vae)) {
+                // Sized for one TILE, not one window: the spatial tiling is what
+                // the volume decode actually sees, and every tile is
+                // `tile / patch` latent cells per axis (or the whole axis when
+                // it is smaller than a tile). Sizing for the window instead
+                // makes every tile miss the session's shape and fall back to the
+                // host, which is a silent 100x.
+                const sp: minimax_h3_vae.Spatial = .{ .ratio = vcfg.patch };
+                const cells = sp.tile / sp.ratio;
+                const win = @min(tp.chunkSize() + tp.tokenOverlap(), shape.t + tp.plan(shape.t).pad_tokens);
+                dev = try DeviceVolume.init(b, gpa, &m.vae, win, @min(shape.h, cells), @min(shape.w, cells));
+            }
+        }
+        // The VAE and the DiT compute the clip length independently; if they ever
+        // disagree the render has more or fewer frames than the model generated.
+        std.debug.assert(frames == self.pixelFrames(shape));
+        const planar = try gpa.alloc(f32, vcfg.out_channels * frames * out_shape.height * out_shape.width);
+        defer gpa.free(planar);
+        try minimax_h3_vae.decodeTemporalWith(
+            &m.vae,
+            io,
+            gpa,
+            tp,
+            planar,
+            latent[0..shape.audioOffset()],
+            shape.t,
+            shape.h,
+            shape.w,
+            if (dev) |*d| d.volume() else null,
+        );
+
+        const t_vid = std.Io.Clock.real.now(io).nanoseconds;
+        try note(progress, "video decoded in {d:.1}s, decoding audio...\n", .{
+            @as(f64, @floatFromInt(t_vid - t0)) / 1e9,
+        });
+        const samples = audio_shape.t * m.audio.upsampleFactor();
+        const audio = try gpa.alloc(f32, samples * minimax_h3_audio.stereo);
+        errdefer gpa.free(audio);
+        const zaudio = latent[shape.audioOffset()..];
+        if (std.c.getenv("TP_AUDIO_MAG") != null) {
+            // Whether the vocoder's INPUT is sane, and nothing more. It is a bad
+            // proxy for the audio LEVEL: this moves 0.327 -> 0.395 across a 35 dB
+            // swing in the rendered output, because the level is conditioned by
+            // the prompt's audio description rather than by the latent's norm.
+            var acc: f64 = 0;
+            var peak: f64 = 0;
+            for (zaudio) |v| {
+                acc += @as(f64, v) * v;
+                peak = @max(peak, @abs(@as(f64, v)));
+            }
+            try note(progress, "[audio] latent rms {d:.4} peak {d:.4} over {d} elems\n", .{
+                @sqrt(acc / @as(f64, @floatFromInt(zaudio.len))), peak, zaudio.len,
+            });
+        }
+        if (!try self.decodeAudioOnDevice(gpa, m, audio, zaudio, audio_shape.t)) {
+            try minimax_h3_audio.decode(&m.audio, io, gpa, audio, zaudio, audio_shape.t);
+        }
+
+        try note(progress, "decoded in {d:.1}s\n", .{
+            @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0)) / 1e9,
+        });
+
+        // Planar f32 in [0, 1] -> interleaved RGB8, frames back to back.
+        const plane = out_shape.height * out_shape.width;
+        const rgb = try gpa.alloc(u8, frames * plane * 3);
+        errdefer gpa.free(rgb);
+        for (0..frames) |f| {
+            for (0..plane) |i| {
+                inline for (0..3) |c| {
+                    const v = planar[(c * frames + f) * plane + i];
+                    rgb[(f * plane + i) * 3 + c] = @intFromFloat(@round(std.math.clamp(v, 0.0, 1.0) * 255.0));
+                }
+            }
+        }
+
+        return .{
+            .rgb = rgb,
+            .frames = frames,
+            .width = out_shape.width,
+            .height = out_shape.height,
+            .fps_num = minimax_h3.fps,
+            .audio = audio,
+            .audio_channels = minimax_h3_audio.stereo,
+            .audio_sample_rate = minimax_h3_audio.sample_rate,
+        };
+    }
+
     pub fn decode(
         self: *Session,
         latent: []const f32,
@@ -3320,6 +5717,12 @@ pub const Session = struct {
     ) !Image {
         const gpa = self.gpa;
         const io = self.io;
+
+        // Not built yet (VIDEO_PLAN.md): H3 decodes through TWO VAEs, a ViT3D
+        // video one and a BigVGAN audio one, and returns a `Clip` rather than an
+        // `Image`. Neither is loaded, so refuse by name rather than fall through
+        // to a decoder that would read this latent as a still.
+        if (self.family() == .minimax_h3) return error.FamilyNotImplemented;
 
         // The SD family differs from krea2 only in its normalization, its
         // AutoencoderKL takes `z / scaling_factor`, where Wan's is per-channel
@@ -4063,7 +6466,7 @@ pub const Session = struct {
                             pv = .{ .rgb = rgb, .width = tw * taehv_mod.spatial_scale, .height = th * taehv_mod.spatial_scale };
                         };
                         if (pv == null) if (preview_scratch) |ps| {
-                            self.latentPreviewInto(ps, x0, lat_h, lat_w);
+                            self.latentPreviewInto(ps, x0, .{ .channels = self.latentChannels(), .h = lat_h, .w = lat_w }, 0);
                             pv = .{ .rgb = ps, .width = lat_w, .height = lat_h };
                         };
                     }
@@ -4156,19 +6559,21 @@ test "the live preview follows the family's own latent format" {
     defer gpa.free(rgb);
 
     var sess: Session = init_defaults.of(Session);
-    var prev: [5][]u8 = undefined;
-    inline for (.{ Family.krea2, Family.sd15, Family.sdxl, Family.zimage, Family.anima }, 0..) |fam, fi| {
+    var prev: [6][]u8 = undefined;
+    inline for (.{ Family.krea2, Family.sd15, Family.sdxl, Family.zimage, Family.anima, Family.minimax_h3 }, 0..) |fam, fi| {
         sess.models = switch (fam) {
             .krea2 => .{ .krea2 = undefined },
             .sd15 => .{ .sd15 = undefined },
             .sdxl => .{ .sdxl = undefined },
             .zimage => .{ .zimage = undefined },
             .anima => .{ .anima = undefined },
+            .minimax_h3 => .{ .minimax_h3 = undefined },
         };
         const ch: usize = switch (fam) {
             .krea2 => wan_vae.latent_channels,
             .zimage => zimage.latent_channels,
             .anima => anima.latent_channels,
+            .minimax_h3 => minimax_h3.latent_channels,
             .sd15, .sdxl => sd_vae.latent_channels,
         };
         // Exactly the family's channel count, a read one plane past the end is an
@@ -4176,7 +6581,7 @@ test "the live preview follows the family's own latent format" {
         const z = try gpa.alloc(f32, ch * lat_h * lat_w);
         defer gpa.free(z);
         for (z, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 7)) * 0.1 - 0.3;
-        sess.latentPreviewInto(rgb, z, lat_h, lat_w);
+        sess.latentPreviewInto(rgb, z, .{ .channels = ch, .h = lat_h, .w = lat_w }, 0);
         prev[fi] = try gpa.dupe(u8, rgb);
     }
     defer for (prev) |p| gpa.free(p);
@@ -4533,6 +6938,11 @@ test "family detection reads the denoiser's own tensor names" {
         // adapter is what decides (the negative case below is the other half).
         .{ .names = &.{ "model.diffusion_model.blocks.0.mlp.layer1.weight", "model.diffusion_model.llm_adapter.blocks.0.cross_attn.q_proj.weight" }, .want = .anima },
         .{ .names = &.{ "blocks.0.mlp.layer1.weight", "llm_adapter.blocks.0.cross_attn.q_proj.weight" }, .want = .anima },
+        // MiniMax H3 needs BOTH patch projections, ComfyUI's own test: one
+        // projection per stream is what makes it a joint audio-video model. The
+        // negative case below pins that the video one alone is not enough.
+        .{ .names = &.{ "model.diffusion_model.video_patch_proj.weight", "model.diffusion_model.audio_patch_proj.weight" }, .want = .minimax_h3 },
+        .{ .names = &.{ "video_patch_proj.weight", "audio_patch_proj.weight" }, .want = .minimax_h3 },
     };
     for (cases) |c| {
         var buf: [512]u8 = undefined;
@@ -4582,6 +6992,20 @@ test "family detection reads the denoiser's own tensor names" {
     // without it, a single-tensor test would pass either way.
     {
         const header = "{\"cap_embedder.1.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}}";
+        var file: [8 + header.len + 8]u8 = undefined;
+        std.mem.writeInt(u64, file[0..8], header.len, .little);
+        @memcpy(file[8..][0..header.len], header);
+        @memset(file[8 + header.len ..], 0);
+        var st = try safetensors.SafeTensors.initFromSlice(gpa, &file);
+        defer st.deinit();
+        try std.testing.expectError(error.UnknownArchitecture, detectFamily(.{ .safetensors = &st }));
+    }
+
+    // H3's video patch projection ALONE is not H3. Without this the two-tensor
+    // probe has no teeth: a single-tensor test would pass either way, and the
+    // pair is precisely what says both streams are denoised together.
+    {
+        const header = "{\"video_patch_proj.weight\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}}";
         var file: [8 + header.len + 8]u8 = undefined;
         std.mem.writeInt(u64, file[0..8], header.len, .little);
         @memcpy(file[8..][0..header.len], header);
@@ -4643,6 +7067,16 @@ test "each family's schedule shift and defaulted component paths are its own" {
     try std.testing.expectEqual(@as(f32, 3.0), defaultShift(.anima));
     sess.models = .{ .anima = undefined };
     try std.testing.expectEqual(@as(f32, 3.0), sess.resolvedShift(.{ .prompt = "" }));
+
+    // --- MiniMax H3 -------------------------------------------------------
+    // 12.0, four times any other family's, and it is the VIDEO shift: the audio
+    // stream's 3.0 is derived from it inside the model rather than being a second
+    // schedule. Sampling H3 on krea2's 1.15 is a valid schedule with the steps in
+    // entirely the wrong places.
+    try std.testing.expectEqual(@as(f32, 12.0), defaultShift(.minimax_h3));
+    try std.testing.expect(defaultShift(.minimax_h3) != defaultShift(.anima));
+    sess.models = .{ .minimax_h3 = undefined };
+    try std.testing.expectEqual(@as(f32, 12.0), sess.resolvedShift(.{ .prompt = "" }));
 
     // Anima names a default ENCODER but deliberately no default decoder: its
     // VAE is normally bundled in the denoiser checkpoint, and naming a path here would
@@ -4990,4 +7424,383 @@ test "an unweightable prompt is reported as such, never refused" {
         try std.testing.expectEqual(@as(usize, 2), plan.texts.len); // it really did schedule
         for (plan.texts) |t| try std.testing.expect(!try Session.weightsWouldBeDropped(gpa, t, o));
     }
+}
+
+test "a still latent shape is a one-frame single-stream video shape" {
+    // Every image family goes through the same descriptor: t defaults to 1 and
+    // there is no second stream, so the element count is the old
+    // channels * h * w and nothing else changes for them.
+    const still: LatentShape = .{ .channels = 16, .h = 96, .w = 64 };
+    try std.testing.expectEqual(@as(usize, 1), still.t);
+    try std.testing.expectEqual(@as(usize, 96 * 64), still.plane());
+    try std.testing.expectEqual(@as(usize, 16 * 96 * 64), still.visualElems());
+    try std.testing.expectEqual(@as(usize, 0), still.audioElems());
+    try std.testing.expectEqual(still.visualElems(), still.elems());
+    try std.testing.expect(!still.isVideo());
+    // with no audio stream the split sits at the very end
+    try std.testing.expectEqual(still.elems(), still.audioOffset());
+}
+
+test "an audio-video latent packs the audio stream after the visual one" {
+    // MiniMax H3's development shape: 256x256, 5 frames
+    const av: LatentShape = .{
+        .channels = 24,
+        .t = 2,
+        .h = 16,
+        .w = 16,
+        .audio = .{ .channels = 32, .streams = 2, .t = 8 },
+    };
+    try std.testing.expect(av.isVideo());
+    try std.testing.expectEqual(@as(usize, 24 * 2 * 256), av.visualElems());
+    try std.testing.expectEqual(@as(usize, 32 * 2 * 8), av.audioElems());
+    try std.testing.expectEqual(av.visualElems() + av.audioElems(), av.elems());
+    // the audio slice of a packed buffer starts where the visual stream ends,
+    // which is the split ComfyUI's own latent scaling keys on
+    try std.testing.expectEqual(av.visualElems(), av.audioOffset());
+    try std.testing.expectEqual(av.audioElems(), av.elems() - av.audioOffset());
+}
+
+test "latent shape equality distinguishes the audio stream" {
+    const a: LatentShape = .{ .channels = 24, .t = 2, .h = 16, .w = 16 };
+    var b = a;
+    try std.testing.expect(a.eql(b));
+
+    // a differing frame count is a different shape, which is what makes a
+    // cached per-resolution workspace safe to reuse or not
+    b.t = 3;
+    try std.testing.expect(!a.eql(b));
+
+    // and so is gaining or losing the second stream, even at equal visual dims
+    b = a;
+    b.audio = .{ .channels = 32, .streams = 2, .t = 8 };
+    try std.testing.expect(!a.eql(b));
+    try std.testing.expect(!b.eql(a));
+
+    var c = b;
+    c.audio.?.t = 9;
+    try std.testing.expect(!b.eql(c));
+}
+
+test "clip indexes frames and reports its audio length per channel" {
+    const gpa = std.testing.allocator;
+    const w = 4;
+    const h = 2;
+    const frames = 3;
+    var clip: Clip = .{
+        .rgb = try gpa.alloc(u8, frames * h * w * 3),
+        .frames = frames,
+        .width = w,
+        .height = h,
+        .fps_num = 24,
+        .audio = try gpa.alloc(f32, 10 * 2),
+        .audio_channels = 2,
+        .audio_sample_rate = 32000,
+    };
+    defer clip.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, h * w * 3), clip.frameBytes());
+    // frames are back to back in one allocation, so frame i is a plain slice
+    for (0..frames) |i| {
+        @memset(clip.frame(i), @intCast(i + 1));
+    }
+    try std.testing.expectEqual(@as(u8, 1), clip.rgb[0]);
+    try std.testing.expectEqual(@as(u8, 3), clip.rgb[clip.rgb.len - 1]);
+
+    try std.testing.expect(clip.hasAudio());
+    // interleaved, so the per-channel length is half the buffer
+    try std.testing.expectEqual(@as(usize, 10), clip.audioFrames());
+}
+
+test "a silent clip carries no audio buffer" {
+    const gpa = std.testing.allocator;
+    var clip: Clip = .{
+        .rgb = try gpa.alloc(u8, 3),
+        .frames = 1,
+        .width = 1,
+        .height = 1,
+        .fps_num = 24,
+    };
+    defer clip.deinit(gpa);
+    try std.testing.expect(!clip.hasAudio());
+    try std.testing.expectEqual(@as(usize, 0), clip.audioFrames());
+    try std.testing.expectEqual(@as(u32, 1), clip.fps_den);
+}
+
+test "the two clip shifts fall back independently" {
+    // `--shift` used to move BOTH the video schedule and the audio carry ratio,
+    // because the audio shift was a module constant the video one was divided
+    // into. That is how the same prompt rendered near-silent at shift 12 and
+    // hard-clipped at shift 1. Overriding one must leave the other alone.
+    var sess: Session = init_defaults.of(Session);
+    sess.models = .{ .minimax_h3 = undefined };
+
+    const both_default = sess.clipShifts(.{ .prompt = "" });
+    try std.testing.expectEqual(minimax_h3.shift_video, both_default.video);
+    try std.testing.expectEqual(minimax_h3.shift_audio, both_default.audio);
+
+    const video_only = sess.clipShifts(.{ .prompt = "", .shift = 1.0 });
+    try std.testing.expectEqual(@as(f32, 1.0), video_only.video);
+    try std.testing.expectEqual(minimax_h3.shift_audio, video_only.audio);
+
+    const audio_only = sess.clipShifts(.{ .prompt = "", .shift_audio = 0.25 });
+    try std.testing.expectEqual(minimax_h3.shift_video, audio_only.video);
+    try std.testing.expectEqual(@as(f32, 0.25), audio_only.audio);
+
+    // The pair the ratio makes recoverable: moving both by the same factor keeps
+    // the audio carry identical while the video schedule changes completely.
+    const scaled = sess.clipShifts(.{ .prompt = "", .shift = 1.0, .shift_audio = 0.25 });
+    try std.testing.expectApproxEqRel(both_default.carryScale(), scaled.carryScale(), 1e-6);
+    try std.testing.expect(scaled.video != both_default.video);
+
+    // `audioScale` reads the pair, and is 1.0 for a family without an audio
+    // stream no matter what is passed.
+    try std.testing.expectApproxEqRel(@as(f32, 4.0), sess.audioScale(both_default), 1e-6);
+    sess.models = .{ .krea2 = undefined };
+    try std.testing.expectEqual(@as(f32, 1.0), sess.audioScale(both_default));
+}
+
+test "a clip's parameters block records both shifts" {
+    // A reader re-renders from this block, and H3's two shifts change the video
+    // schedule AND the audio level, so recording only one is a wrong answer in
+    // exactly the way a hardcoded field there would be.
+    const gpa = std.testing.allocator;
+    const base = try gpa.dupe(u8, "prompt\nSteps: 4, Sampler: Euler, Seed: 0");
+    const out = try appendClipParams(gpa, base, .{ .video = 1.0, .audio = 0.25 });
+    defer gpa.free(out);
+    try std.testing.expect(std.mem.startsWith(u8, out, "prompt\nSteps: 4"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "Shift: 1.0000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Audio shift: 0.2500") != null);
+    // The image path must be untouched: this only ever appends.
+    try std.testing.expect(std.mem.indexOf(u8, out, "Audio shift").? > std.mem.indexOf(u8, out, "Shift:").?);
+}
+
+test "latent shape is the family's own, spatial downscale included" {
+    var sess: Session = init_defaults.of(Session);
+
+    // Every still-image family here is an 8x VAE, which is why `/ 8` used to be
+    // hardcoded at the call sites.
+    sess.models = .{ .krea2 = undefined };
+    try std.testing.expectEqual(@as(usize, 8), sess.spatialDownscale());
+    const still = try sess.latentShape(1024, 768, 1);
+    try std.testing.expectEqual(@as(usize, 96), still.h);
+    try std.testing.expectEqual(@as(usize, 128), still.w);
+    try std.testing.expectEqual(@as(usize, 1), still.t);
+    try std.testing.expect(still.audio == null);
+    try std.testing.expectEqual(@as(usize, 1), sess.pixelFrames(still));
+
+    // A still family asked for a clip is a programming error, not an argument
+    // quietly ignored.
+    try std.testing.expectError(error.FamilyIsNotVideo, sess.latentShape(1024, 768, 24));
+
+    // H3's video VAE is 16x, so the SAME pixel size is a different latent. This
+    // is the one that would have been silently wrong under the old hardcode.
+    sess.models = .{ .minimax_h3 = undefined };
+    try std.testing.expectEqual(@as(usize, 16), sess.spatialDownscale());
+    const clip = try sess.latentShape(1344, 768, 124);
+    try std.testing.expectEqual(@as(usize, 48), clip.h);
+    try std.testing.expectEqual(@as(usize, 84), clip.w);
+    try std.testing.expectEqual(@as(usize, 24), clip.channels);
+    // the default ~5s render
+    try std.testing.expectEqual(@as(usize, 37), clip.t);
+    try std.testing.expectEqual(@as(usize, 124), sess.pixelFrames(clip));
+    // and it carries an audio stream, sized off the same frame count
+    try std.testing.expectEqual(@as(usize, 207), clip.audio.?.t);
+    try std.testing.expectEqual(@as(usize, 2), clip.audio.?.streams);
+    try std.testing.expectEqual(@as(usize, 32), clip.audio.?.channels);
+}
+
+test "a requested frame count snaps to the family's grid" {
+    var sess: Session = init_defaults.of(Session);
+    sess.models = .{ .minimax_h3 = undefined };
+
+    // H3 only accepts 17k + 5 frames, so a caller must read the result back
+    // rather than assume its request survived. 100 is not on the grid; 107 is.
+    const asked = try sess.latentShape(512, 512, 100);
+    try std.testing.expectEqual(@as(usize, 107), sess.pixelFrames(asked));
+    try std.testing.expect(sess.pixelFrames(asked) != 100);
+
+    // an on-grid request is left alone
+    const exact = try sess.latentShape(512, 512, 124);
+    try std.testing.expectEqual(@as(usize, 124), sess.pixelFrames(exact));
+
+    // and the shortest clip is 5 frames, whatever was asked for
+    const tiny = try sess.latentShape(512, 512, 1);
+    try std.testing.expectEqual(@as(usize, 5), sess.pixelFrames(tiny));
+    try std.testing.expectEqual(@as(usize, 2), tiny.t);
+}
+
+test "a continuation's preserved rows ride the flow line between noise and source" {
+    // `placePreserved` is the whole user-facing half of a denoise mask: the trunk is
+    // told those rows are clean, and this is what makes them BE the source. At sigma
+    // 1 they are the initial noise, at sigma 0 the source exactly, and in between
+    // the straight line -- which is where the reference's `scale_latent_inpaint`
+    // (inherited flow noise-scaling) puts them.
+    const gpa = std.testing.allocator;
+    const shape: LatentShape = .{
+        .channels = minimax_h3.latent_channels,
+        .t = 4,
+        .h = 2,
+        .w = 3,
+        .audio = .{ .channels = minimax_h3.audio_latent_channels, .streams = 2, .t = 6 },
+    };
+    const cont: Session.Continuation = .{
+        .ref = &.{},
+        .video_mask = &.{},
+        .audio_mask = &.{},
+        .frames = 5,
+        .latent_t = 2, // a temporal PREFIX, not the whole thing
+        .audio_t = 3,
+    };
+
+    const n = shape.elems();
+    const noise = try gpa.alloc(f32, n);
+    defer gpa.free(noise);
+    const ref = try gpa.alloc(f32, n);
+    defer gpa.free(ref);
+    const x = try gpa.alloc(f32, n);
+    defer gpa.free(x);
+    for (noise, 0..) |*q, i| q.* = @floatFromInt(i % 97);
+    for (ref, 0..) |*q, i| q.* = -@as(f32, @floatFromInt(i % 31));
+
+    // sigma 0: the preserved prefix is the source, the rest is untouched.
+    @memset(x, 12345.0);
+    Session.placePreserved(x, noise, ref, shape, cont, 0.0);
+    const hw = shape.h * shape.w;
+    for (0..minimax_h3.latent_channels) |c| {
+        const off = c * shape.t * hw;
+        for (0..shape.t * hw) |j| {
+            if (j < cont.latent_t * hw) {
+                try std.testing.expectEqual(ref[off + j], x[off + j]);
+            } else {
+                // Past the prefix nothing was written, or a continuation would be
+                // silently overwriting the rows it is supposed to generate.
+                try std.testing.expectEqual(@as(f32, 12345.0), x[off + j]);
+            }
+        }
+    }
+    // ...and the audio half, whose prefix is per stereo channel, not per buffer.
+    const base = shape.audioOffset();
+    const at = shape.audio.?.t;
+    for (0..minimax_h3.audio_latent_channels) |c| {
+        for (0..2) |sc| {
+            const off = base + (c * 2 + sc) * at;
+            for (0..at) |i| {
+                if (i < cont.audio_t) {
+                    try std.testing.expectEqual(ref[off + i], x[off + i]);
+                } else {
+                    try std.testing.expectEqual(@as(f32, 12345.0), x[off + i]);
+                }
+            }
+        }
+    }
+
+    // sigma 1: the initial noise.
+    @memset(x, 0);
+    Session.placePreserved(x, noise, ref, shape, cont, 1.0);
+    for (0..cont.latent_t * hw) |j| try std.testing.expectEqual(noise[j], x[j]);
+
+    // ...and the midpoint is the average, i.e. a straight line.
+    @memset(x, 0);
+    Session.placePreserved(x, noise, ref, shape, cont, 0.5);
+    for (0..cont.latent_t * hw) |j| {
+        try std.testing.expectApproxEqAbs(0.5 * (noise[j] + ref[j]), x[j], 1e-5);
+    }
+
+    // An audio-less continuation touches only the video half.
+    var no_audio = cont;
+    no_audio.audio_t = 0;
+    @memset(x, 7.0);
+    Session.placePreserved(x, noise, ref, shape, no_audio, 0.0);
+    for (x[base..]) |q| try std.testing.expectEqual(@as(f32, 7.0), q);
+}
+
+test "a video latent's preview reads the temporal stride, not the plane" {
+    // The trap: a video latent is planar [c][t][h][w], so channel c's frame f
+    // starts at (c*t + f)*plane. Reading it with an image family's `c*plane`
+    // stride previews channel 0 of several FRAMES as if they were several
+    // CHANNELS of one, which has plausible structure and wrong colours.
+    const gpa = std.testing.allocator;
+    var sess: Session = init_defaults.of(Session);
+    sess.models = .{ .minimax_h3 = undefined };
+
+    const h = 4;
+    const w = 4;
+    const t = 3;
+    const plane = h * w;
+    const z = try gpa.alloc(f32, minimax_h3.latent_channels * t * plane);
+    defer gpa.free(z);
+    // make each frame distinct, and constant within itself
+    for (0..minimax_h3.latent_channels) |c| {
+        for (0..t) |f| {
+            const v = @as(f32, @floatFromInt(f)) * 0.25 - 0.25;
+            @memset(z[(c * t + f) * plane ..][0..plane], v);
+        }
+    }
+
+    const shape: LatentShape = .{ .channels = minimax_h3.latent_channels, .t = t, .h = h, .w = w };
+    var per_frame: [t][]u8 = undefined;
+    for (0..t) |f| {
+        const rgb = try gpa.alloc(u8, plane * 3);
+        sess.latentPreviewInto(rgb, z, shape, f);
+        per_frame[f] = rgb;
+    }
+    defer for (per_frame) |b| gpa.free(b);
+
+    // each frame previews differently, so `frame` is genuinely being honoured
+    try std.testing.expect(!std.mem.eql(u8, per_frame[0], per_frame[1]));
+    try std.testing.expect(!std.mem.eql(u8, per_frame[1], per_frame[2]));
+    // and a frame is constant across its pixels, because its latent is
+    for (per_frame) |b| {
+        for (0..plane) |p| {
+            try std.testing.expectEqualSlices(u8, b[0..3], b[p * 3 ..][0..3]);
+        }
+    }
+}
+
+/// The real MiniMax H3 denoiser. Named here rather than reusing
+/// `minimax_h3.zig`'s copy because this is the *resolver's* view of it: the
+/// question is whether `detectFamily` and `resolveComponent` agree with the file
+/// on disk, which synthetic headers cannot answer.
+const h3_dit_path = "/home/qt/genai/comfyui/models/diffusion_models/h3/10erosMaxInt8Ref2va_v10Beta.safetensors";
+
+test "the real H3 checkpoint detects and resolves as MiniMax H3" {
+    // The synthetic-header cases above pin the detection RULES; this pins that
+    // the rules match a real file. A probe naming a tensor the checkpoint spells
+    // differently passes every synthetic test and reports
+    // `UnknownArchitecture` on the only file that matters.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    try test_gate.requireModelFile(io, h3_dit_path);
+
+    var st = try safetensors.SafeTensors.open(gpa, io, h3_dit_path);
+    defer st.deinit();
+    const store: weights_mod.WeightStore = .{ .safetensors = &st };
+
+    try std.testing.expectEqual(Family.minimax_h3, try detectFamily(store));
+
+    // and the denoiser resolves out of it, at the root (this checkpoint carries
+    // no container prefix), so a loader never sees the spelling
+    var r = try resolveComponent(gpa, .minimax_h3, .denoiser, store, null, false);
+    defer if (r.view) |v| {
+        v.deinit(gpa);
+        gpa.destroy(v);
+    };
+    try std.testing.expect(r.store.get(minimax_h3_video_probe) != null);
+    try std.testing.expect(r.store.get(minimax_h3_audio_probe) != null);
+
+    // H3 is the one family with a second decoder, and this checkpoint is the DiT
+    // alone: neither VAE is bundled, so both must report rather than resolve to
+    // some other tensor that happens to match.
+    try std.testing.expectError(
+        error.ComponentNotInCheckpoint,
+        resolveComponent(gpa, .minimax_h3, .decoder, store, null, false),
+    );
+    try std.testing.expectError(
+        error.ComponentNotInCheckpoint,
+        resolveComponent(gpa, .minimax_h3, .decoder2, store, null, false),
+    );
+    // ...and it is not an SDXL-style two-tower family, so there is no second
+    // conditioner to ask for at all. A different error from the one above: this
+    // is a programming error, not a missing file.
+    try std.testing.expectError(error.NoSuchComponent, componentSpec(.minimax_h3, .conditioner2));
 }

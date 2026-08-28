@@ -228,6 +228,134 @@ falls back to a 3-pass prep that round-trips a full f32 activation copy through 
 | `pmdplane` (push word 7) | `coopmat.buildFlashAttn` | lets the flash kernel run **rectangular** q × kv. `s_stride` was K's row stride, the j loop bound *and* the MD plane stride at once, and the MD table is indexed by QUERY row. **0 means "= s_stride"**, so pre-existing callers are unchanged by construction |
 | `opAttnTCRect` | `cuda/backend.zig` | `opAttnTCBatched` with the two sequence lengths pulled apart |
 
+### 2E. MiniMax H3 (joint audio-video DiT)
+
+The first family that is not a still image: video and stereo audio are denoised in
+ONE packed token sequence, on two sigma schedules. See VIDEO_PLAN.md.
+
+| Stage | cpu | vulkan | zig-cuda | cuda | Files |
+|---|---|---|---|---|---|
+| **Text encoder** (Qwen3-VL-32B, 50 layers, UNNORMALIZED last state) | ✅ int8-convrot | — | ✅ | ✅ | `qwen3{,_cuda}.zig`, `Variant.minimax_h3`. The device arms have the int8 GEMM and the vision path, and are **60x** where the weights fit (25 layers: 7421 -> 124 ms). ⚠️ They do not fit a 3090: 23250 MB of weights against 21451 MB free, and past that the per-layer re-upload makes it SLOWER than the CPU (50 layers: 20840 ms vs 18384 ms). `supportsWeightsOn` gates on measured free VRAM, so this encoder runs on the CPU here |
+| **DiT trunk** (50 blocks, 5376, 56x128) | ✅ int8 | — | ✅ int8 | ✅ int8 | `minimax_h3{,_cuda}.zig` |
+| **Video VAE decode** (ViT3D, 36 blocks, temporal chunking) | ✅ | — | ✅ | ✅ | `minimax_h3_vae{,_cuda}.zig` |
+| **Audio VAE decode** (BigVGAN, 32 kHz stereo) | ✅ | — | ✅ f32 | ✅ f32 | `minimax_h3_audio{,_cuda}.zig` |
+| **Video VAE encode** (3-D causal CNN, banded im2col) | ✅ | — | ✅ | ✅ | `minimax_h3_vae_encode{,_cuda}.zig`, references and keyframes |
+| **Audio VAE encode** (DAC + causal-attention posterior head) | ✅ | — | ✅ | ✅ | `minimax_h3_audio_encode{,_cuda}.zig`, reference soundtracks |
+| **Vision blocks** (fl2va / ref2va conditioning) | ✅ | — | ✅ | ✅ | `minimax_h3_vit.zig` + `qwen3{,_cuda}.encodeVision`. Vulkan has no deepstack/mrope path and falls back to the CPU, loudly |
+| **Denoise masks** (per-row timesteps) | ✅ | — | ✅ | ✅ | `Timesteps.initMasked`; the device path adds a per-row index buffer to `rms_mod_par` / `gated_add` |
+| **Spatial VAE tiling** | ✅ | — | ✅ | ✅ | load-bearing, not a memory bound |
+| **MP4 muxing** (H.264 + AAC, `parameters` tag) | ✅ | ✅ | ✅ | ✅ | `lib/video/av_helper.c`, `src/av.zig` (exe only) |
+| **LoRA sidecar** (`--lora`, never merged) | ✅ any dtype | — | ✅ bf16 | ✅ bf16 | `lora{,_cuda}.zig`, architecture-independent |
+
+Both VAE ENCODE sides are now on the device, validated by
+`minimax-h3-vae-encode-cuda-test` and `minimax-h3-audio-encode-cuda-test` against
+their CPU references on real weights (rel L2 ~2e-6 in both cases). Measured on a
+3090 with the vendor-library arm:
+
+| | CPU | device | | host peak | device peak |
+|---|---|---|---|---|---|
+| video, 17 frames @ 256px | 47.9 s | **1.11 s** | 43x | 4352 MB | 1824 MB |
+| video, 17 frames @ 128px | 10.1 s | 0.33 s | 31x | 1088 MB | 573 MB |
+| audio, 6 s stereo | 4.22 s | 0.20 s | 22x | 297 MB | 260 MB |
+| audio, 2 s stereo | 1.42 s | 0.09 s | 16x | 109 MB | 129 MB |
+
+`qwen3_cuda.encodeVision` is the device vision path: the block rows are pasted
+before the upload, mrope replaces the 1-D rope table, and DeepStack is added per
+span with an offset `opAdd` (an injection span is a contiguous row run, so it needs
+no kernel). Validated by `te-test` with `TP_TE_VISION=1` on a real block-quant
+encoder: **1.44e-4** device-vs-CPU against a 1.29e-4 text-only control, 5.7x faster,
+with the payload moving the conditioning by 0.119. Teeth confirmed by disabling the
+device injection, which fails at 4.19e-2.
+
+**The int8 activation prep no longer has a width ceiling.** It stages the row in
+dynamic SHARED memory where that fits and in a GLOBAL buffer where it does not
+(`buildPrep`'s `stage_global`, chosen by `kernels.prepNeedsGlobalStage` against the
+device's opt-in shared limit). Same algorithm, same arithmetic, same instruction
+order -- only the address space of the row accesses changes. The isolation is
+`minimax-h3-cuda-test TP_H3_GLOBAL_PREP=1`, which forces the global path at a width
+that fits and requires the two to agree **to the last bit**: measured rel L2 exactly
+0. `Backend.force_global_prep` is the flag.
+
+Before this, a reduction wider than 25024 columns on sm_86 could not run at all: the
+prep needs `cols * 4 + 1280` bytes of shared and the limit is 101376, so MiniMax
+H3's 25600-wide `down_proj` missed by exactly one 256-wide convrot group.
+
+⚠️ **Both are about EVEN on the hand-PTX arm**, which has no tiled f32 GEMM and
+falls back to a one-thread-per-output kernel. They stay in f32 there rather than
+dropping to f16: the decode side measured f16 at about -42 dB, and a latent's error
+rides through every sampling step as conditioning. `--backend cuda` (vendor
+libraries) is what the speedups above need.
+
+The video port replaces only `encodeMoments`; the temporal clip chunking and the
+spatial tiling above it are shared with the CPU path through a `Moments` hook, so
+the intricate part exists once. Its workspace GROWS per call rather than being sized
+for the untiled extent, because tiling and chunking both hand it something smaller.
+
+The CUDA trunk keeps the host-cheap paths on the CPU (patch projections, the adaLN
+projection, the token refiner, the output heads): several have shapes the device
+GEMMs refuse, and together they are under 0.01% of a step. Measured 129x over the
+CPU trunk at 150 packed rows.
+
+Measured end to end, 256x256 / 5 frames / 8 steps on a 3090, as each piece moved:
+
+| | CPU everything | + CUDA trunk | + CUDA video VAE |
+|---|---|---|---|
+| video decode | — | 420 s | **4.9 s** |
+| whole render | ~13 min (1 step) | 10 min | **2 min 21 s** |
+
+The audio VAE (BigVGAN) is now on the device too: **47.8x** at 37 latent frames
+(3591 ms -> 75 ms), which takes a 22-frame clip's audio decode from ~9 s to ~0.2 s.
+Four new kernels, all in `elt.zig`: `im2col1d`, `aa_up_snake`, `aa_down` and
+`convt1d_ca`. Signals are CHANNEL-LAST there, unlike the CPU reference's planar
+layout — that is what makes every kernel coalesced (a warp covers consecutive
+channels at one time step) and removes the transpose the CPU im2col pays on both
+sides of its GEMM. The conv weights are permuted once per session to match.
+
+⚠️ **Its GEMMs run in f32, not on tensor cores, and that is measured.** Against the
+f32 CPU reference on the real vocoder, the f16 tensor-core route is 2.4e-3
+relative with a 8.3e-3 worst sample — about -42 dB, with 74% of samples past 1e-4,
+which for a VOCODER is an audible noise floor. Plain f32 through cuBLASLt
+(`opMatmulF32Lt`, `COMPUTE_32F`, deliberately not `_FAST_TF32`) is 9.5e-6 / 2.8e-5,
+under 16-bit PCM's own quantum. At the real shape f16 was also **not faster**
+(82 ms against 75 ms): the per-conv weight-pad and activation-convert passes cost
+more than the tensor cores win at these widths. `TP_H3_AUDIO_F16=1` on
+`minimax-h3-audio-cuda-test` reproduces both numbers. `zig-cuda` has no tiled f32
+GEMM, so it keeps the one-thread-per-output kernel: correct, 6.9x instead of 47.8x.
+
+The video VAE's device path needs two things the DiT's did not: `opDeinterleave3` (its
+`to_qkv` is fused PER HEAD, so the planes are not row ranges) and the SD family's
+head padding (`opAttnTC`'s P@V GEMM tiles at 128 and this VAE is 32 heads of
+**64**, which launches a zero-sized grid rather than computing a wrong answer).
+
+The LoRA sidecar goes through `opGemmBf16` twice per output range (A then B) plus a
+scaled accumulate, so its factors sit in the same pointer-keyed device weight cache
+as the trunk's own and the VRAM arbiter sees them. That fixes the shape limits: the
+factor's output width must be a multiple of 128 and its contracted width a multiple
+of 32, which every real rank (128, 384) clears. `lora_cuda.supported` refuses
+anything else by name, and the whole trunk then falls back rather than running the
+base GEMM alone — a sidecar applied nowhere is a different model, silently.
+
+Device residual against the f32 host apply is **2.3e-3** relative, entirely
+explained: 1.66e-3 from rounding the activation to bf16 for each of the two GEMMs,
+in quadrature. That is under the int8 base path's own ~4e-3.
+
+The accumulate onto the base GEMM's output is folded into cuBLASLt's epilogue
+(`opGemmBf16Acc`, `beta = 1` with `C == D`), because materializing the delta and
+adding it separately cost MORE than the two GEMMs it served: at 512x512 the two
+GEMMs are +7% of a step and an unfused accumulate another +19%, against +9% fused.
+`zig-cuda` keeps the unfused route, since the hand-PTX `hgemm` writes its C tiles
+unconditionally; `Workspace.fused` decides once per session.
+
+⚠️ **The activation prep's rotation used to truncate.** `buildPrep` computed its
+FWHT butterflies per thread as `ngroups * 64 / 256`, which rounds DOWN whenever
+`cols % 1024 != 0`, leaving the tail of every row in its unrotated basis: no
+error, no assert, a GEMM in the wrong basis. Every width in the engine happened to
+be a multiple of 1024 until H3's 5376-wide hidden (21 groups, needing 5.25
+iterations and getting 5), which was 22% wrong on every linear reading that width.
+Fixed by rounding up and guarding the tail; `prepButterflyIters` is the exposed
+form and a device-free test pins it. Any future model whose hidden width is not a
+multiple of 1024 would have hit the same thing.
+
 ### 2E. Diffusion speed snapshot
 
 RTX 3090, ReleaseFast. Read a PSNR against its model's own precision floor, not in

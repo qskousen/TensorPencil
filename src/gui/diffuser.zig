@@ -486,121 +486,15 @@ pub fn nowNs(io: std.Io) i64 {
 /// to "Karras"). Stamping every render "Simple" would tell anyone reproducing an
 /// SDXL image to use the wrong discretization. Null when the architecture is not
 /// known, and then the field is omitted rather than guessed.
-/// The scheduler a family samples with when the caller did not choose one. Mirrors
-/// `schedule.Scheduler.defaultFor`, which takes a sigma table rather than a family.
-fn defaultSchedulerFor(fam: pipeline.Family) tp.sampler.Scheduler {
-    return switch (fam) {
-        // All three flow-matching families; `simple` is what ComfyUI's own templates
-        // select for each, including Anima's `image_anima_base_v1`, which pairs it
-        // with 30 steps and cfg 4.
-        .krea2, .zimage, .anima => .simple,
-        .sd15, .sdxl => .normal,
-    };
-}
+/// Moved to the library alongside `buildA1111Params`, which is its only caller.
+const defaultSchedulerFor = pipeline.defaultSchedulerFor;
 
-/// Build an AUTOMATIC1111-style `parameters` metadata string. Format:
-///
-///     <prompt>
-///     Negative prompt: <negative>            (omitted when empty)
-///     Steps: N, Sampler: Euler, Schedule type: S, CFG scale: C, Seed: S, Size: WxH, Model: <name>, Prompt syntax: X
-///
-/// `model_name` is the diffusion checkpoint's file stem; `fam` names the schedule
-/// (the "Schedule type" field is dropped when it is null). Caller frees.
-///
-/// `Prompt syntax` is not decoration, and the block is wrong without it. A reader
-/// (including ComfyUI's own metadata importer) re-renders from these fields, and the very
-/// same prompt text means a DIFFERENT image in the two dialects, `(x:1.2)` multiplies in
-/// one and replaces in the other, `[x]` is de-emphasis in one and literal text in the
-/// other. A1111's own format has no field for this because A1111 only ever has one
-/// dialect; here it has to be recorded, on the same reasoning that made `Sampler` and
-/// `Schedule type` stop being hardcoded. `Emphasis` rides along only when it can matter.
-///
-/// `Compat` is the same argument again, and for a bigger effect. It selects whose
-/// *sampling* conventions ran, including which RNG drew the noise, which decides whether
-/// a seed means the same starting latent at all. `RNG`/`SGM noise multiplier` appear only
-/// when they were overridden away from that compat's own defaults, so an ordinary ComfyUI
-/// render's block carries neither. `RNG` keeps A1111's
-/// own spelling of the field and its values, since that is what a reader will recognize.
-pub fn buildA1111Params(
-    gpa: std.mem.Allocator,
-    prompt: []const u8,
-    negative: []const u8,
-    steps: usize,
-    cfg: f32,
-    seed: u64,
-    width: usize,
-    height: usize,
-    model_name: []const u8,
-    fam: ?pipeline.Family,
-    samp: tp.sampler.Kind,
-    sched: ?tp.sampler.Scheduler,
-    syntax: pipeline.PromptSyntax,
-    emphasis: pipeline.Emphasis,
-    compat: pipeline.Compat,
-    /// The resolved form, compared against `compat`'s own defaults to decide which
-    /// overrides need recording.
-    cc: pipeline.CompatConfig,
-) ![]u8 {
-    const neg_line = if (negative.len > 0)
-        try std.fmt.allocPrint(gpa, "Negative prompt: {s}\n", .{negative})
-    else
-        try gpa.dupe(u8, "");
-    defer gpa.free(neg_line);
-    // The scheduler actually used, not a guess from the architecture. Deriving it
-    // from the family is right only while the scheduler is not selectable, and a
-    // reader (including ComfyUI's own metadata importer) re-renders from this field.
-    // An explicit choice wins; otherwise name the
-    // family's default, and drop the field entirely when even that is unknown.
-    const sched_line = if (sched) |sc|
-        try std.fmt.allocPrint(gpa, "Schedule type: {s}, ", .{sc.a1111Name()})
-    else if (fam) |f|
-        try std.fmt.allocPrint(gpa, "Schedule type: {s}, ", .{defaultSchedulerFor(f).a1111Name()})
-    else
-        try gpa.dupe(u8, "");
-    defer gpa.free(sched_line);
-    const syntax_name: []const u8 = switch (syntax) {
-        .comfy => "ComfyUI",
-        .a1111 => "A1111",
-    };
-    // Only under `.a1111`, under `.comfy` there is exactly one weighting form, so the
-    // field would imply a choice that does not exist.
-    const emph_line = if (syntax == .a1111)
-        try std.fmt.allocPrint(gpa, ", Emphasis: {s}", .{switch (emphasis) {
-            .original => "Original",
-            .no_norm => "No norm",
-            .ignore => "Ignore",
-        }})
-    else
-        try gpa.dupe(u8, "");
-    defer gpa.free(emph_line);
-
-    const compat_line = if (compat == .comfy)
-        try gpa.dupe(u8, "")
-    else
-        try gpa.dupe(u8, ", Compat: A1111");
-    defer gpa.free(compat_line);
-
-    // Only the knobs that were actually overridden, so the common block is unchanged.
-    const base: pipeline.CompatConfig = .of(compat);
-    var extra: std.ArrayList(u8) = .empty;
-    defer extra.deinit(gpa);
-    if (cc.noise_src != base.noise_src) try extra.print(gpa, ", RNG: {s}", .{switch (cc.noise_src) {
-        .torch_cpu => "CPU",
-        .nv_philox => "NV",
-    }});
-    if (cc.sgm_noise_multiplier != base.sgm_noise_multiplier) {
-        try extra.print(gpa, ", SGM noise multiplier: {s}", .{if (cc.sgm_noise_multiplier) "True" else "False"});
-    }
-    if (cc.quantize_timestep != base.quantize_timestep) {
-        try extra.print(gpa, ", Quantize timesteps: {s}", .{if (cc.quantize_timestep) "True" else "False"});
-    }
-
-    return std.fmt.allocPrint(
-        gpa,
-        "{s}\n{s}Steps: {d}, Sampler: {s}, {s}CFG scale: {d:.1}, Seed: {d}, Size: {d}x{d}, Model: {s}, Prompt syntax: {s}{s}{s}{s}",
-        .{ prompt, neg_line, steps, samp.a1111Name(), sched_line, cfg, seed, width, height, model_name, syntax_name, emph_line, compat_line, extra.items },
-    );
-}
+/// The AUTOMATIC1111 `parameters` block builder, which now lives in the library
+/// (`pipeline.buildA1111Params`) so the CLI's clip muxer writes the SAME format
+/// into an MP4 metadata tag that this writes into a PNG text chunk. Two copies of
+/// a format whose whole purpose is round-tripping is exactly the drift that makes
+/// a reader re-render the wrong image.
+pub const buildA1111Params = pipeline.buildA1111Params;
 
 /// The fields of an AUTOMATIC1111 `parameters` block that describe a REQUEST,
 /// as read back off a saved PNG. Slices borrow the input.

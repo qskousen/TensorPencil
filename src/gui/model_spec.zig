@@ -47,6 +47,10 @@ pub const Contents = struct {
     conditioner: bool = false,
     conditioner2: bool = false,
     decoder: bool = false,
+    /// MiniMax H3's audio VAE. Modelled like `conditioner2` and for the same
+    /// reason: it resolves independently, so a checkpoint can carry one decoder
+    /// and not the other.
+    decoder2: bool = false,
 
     pub fn has(self: Contents, comp: Component) bool {
         return switch (comp) {
@@ -54,6 +58,7 @@ pub const Contents = struct {
             .conditioner => self.conditioner,
             .conditioner2 => self.conditioner2,
             .decoder => self.decoder,
+            .decoder2 => self.decoder2,
         };
     }
 };
@@ -67,9 +72,11 @@ pub const Info = struct {
     /// case), the GUI needs no side paths at all. Family-aware, because "every
     /// component" means one more thing for SDXL than for the others.
     pub fn isComplete(self: Info) bool {
-        const need2 = traits(self.family).dual_conditioner;
+        const t = traits(self.family);
         return self.contents.denoiser and self.contents.conditioner and
-            self.contents.decoder and (!need2 or self.contents.conditioner2);
+            self.contents.decoder and
+            (!t.dual_conditioner or self.contents.conditioner2) and
+            (!t.dual_decoder or self.contents.decoder2);
     }
 };
 
@@ -112,6 +119,7 @@ pub fn scan(store: tp.weights.WeightStore, fam: Family) Contents {
         .conditioner = storeHas(store, fam, .conditioner),
         .conditioner2 = storeHas(store, fam, .conditioner2),
         .decoder = storeHas(store, fam, .decoder),
+        .decoder2 = storeHas(store, fam, .decoder2),
     };
 }
 
@@ -136,6 +144,13 @@ pub const Traits = struct {
     /// Drives the extra path row and the readiness check; the pipeline resolves
     /// `conditioner2` independently of `conditioner`.
     dual_conditioner: bool = false,
+    /// Whether this architecture has a SECOND decoder (H3's audio VAE), which
+    /// resolves independently of the first.
+    dual_decoder: bool = false,
+    /// Default pixel frame count. 1 for every still-image family; a video family
+    /// SNAPS this to its own grid, so read the shape back from
+    /// `Session.latentShape` rather than trusting it.
+    frames: usize = 1,
     /// Default generation parameters. These are NOT interchangeable between
     /// families: SD at krea2's CFG 1.0 has no classifier-free guidance at all, and
     /// krea2 at SD1.5's 512² is below the resolution it was trained for.
@@ -183,6 +198,26 @@ pub fn traits(fam: Family) Traits {
             .steps = 30,
             .cfg = 4.0,
         },
+        // The node defaults from `comfy_extras/nodes_minimax_h3.py`: 1344x768 and
+        // 124 frames (~5s at 24 fps, the bottom of its trained 124-362 range).
+        //
+        // cfg 1.0 is read off the node signatures, not guessed: every H3
+        // conditioning node outputs ONE conditioning (`positive`) and takes no
+        // negative, so there is no branch to guide against. No workflow template
+        // for it ships locally, so the STEP count is the one value here with no
+        // upstream source; the 4-step turbo LoRA is the intended fast path.
+        .minimax_h3 => .{
+            .label = "MiniMax H3 (joint audio-video DiT)",
+            // CPU only until the trunk exists at all, let alone its GPU twins.
+            // Offering a device with no kernels reads as a hang, not a fallback.
+            .backends = &.{.cpu},
+            .dual_decoder = true,
+            .width = 1344,
+            .height = 768,
+            .frames = 124,
+            .steps = 30,
+            .cfg = 1.0,
+        },
         .sd15 => .{
             .label = "SD1.5 (UNet)",
             .backends = &all_backends,
@@ -215,6 +250,7 @@ pub const Overrides = struct {
     conditioner: bool = false,
     conditioner2: bool = false,
     decoder: bool = false,
+    decoder2: bool = false,
 };
 
 /// Which components nothing supplies. The GUI shows these; the pipeline is what
@@ -223,9 +259,10 @@ pub const Missing = struct {
     conditioner: bool = false,
     conditioner2: bool = false,
     decoder: bool = false,
+    decoder2: bool = false,
 
     pub fn any(self: Missing) bool {
-        return self.conditioner or self.conditioner2 or self.decoder;
+        return self.conditioner or self.conditioner2 or self.decoder or self.decoder2;
     }
 };
 
@@ -239,11 +276,12 @@ pub const Missing = struct {
 /// `conditioner2` can only be missing for an architecture that has one, for
 /// everything else the pipeline never asks for it.
 pub fn missing(info: Info, have: Overrides) Missing {
-    const need2 = traits(info.family).dual_conditioner;
+    const t = traits(info.family);
     return .{
         .conditioner = !info.contents.conditioner and !have.conditioner,
-        .conditioner2 = need2 and !info.contents.conditioner2 and !have.conditioner2,
+        .conditioner2 = t.dual_conditioner and !info.contents.conditioner2 and !have.conditioner2,
         .decoder = !info.contents.decoder and !have.decoder,
+        .decoder2 = t.dual_decoder and !info.contents.decoder2 and !have.decoder2,
     };
 }
 
@@ -359,12 +397,16 @@ test "traits: every family runs on the CPU, and the GPU list is per family" {
     // mechanism is unchanged: the GUI hides backends a family has no kernels for, so
     // a too-generous list here is an offered backend that then fails at render time.
     //
-    // Every family now has all four arms. A CPU-first arrival gets NARROWED here
-    // rather than having its traits entry over-promise, that is what the note on
-    // `backends` prescribes, and the opposite of what makes the GUI offer a backend
-    // that then fails at render time. Anima was the last one and both its arms have
-    // since landed, so the set is empty; add to it, do not edit the loop.
-    const cpu_only = std.EnumSet(Family).initEmpty();
+    // A CPU-first arrival gets NARROWED here rather than having its traits entry
+    // over-promise, that is what the note on `backends` prescribes, and the
+    // opposite of what makes the GUI offer a backend that then fails at render
+    // time. Add to this set, do not edit the loop.
+    //
+    // MiniMax H3 is the current CPU-first arrival, and for a stronger reason than
+    // Anima and Z-Image were: it has no trunk at all yet, on any backend. Remove
+    // it here when `minimax_h3_cuda` / `minimax_h3_gpu` land.
+    var cpu_only = std.EnumSet(Family).initEmpty();
+    cpu_only.insert(.minimax_h3);
     inline for (@typeInfo(Family).@"enum".fields) |f| {
         const fam: Family = @enumFromInt(f.value);
         const t = traits(fam);
@@ -512,7 +554,8 @@ test "Contents.has covers every component" {
         const comp: Component = @enumFromInt(f.value);
         const want = switch (comp) {
             .denoiser, .decoder, .conditioner2 => true,
-            .conditioner => false,
+            // both left false above, so a `has` that ignored its argument fails
+            .conditioner, .decoder2 => false,
         };
         try std.testing.expectEqual(want, c.has(comp));
     }

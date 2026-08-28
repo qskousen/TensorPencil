@@ -274,6 +274,23 @@ pub fn build(b: *std.Build) void {
     // install prefix when running `zig build` (i.e. when executing the default
     // step). By default the install prefix is `zig-out/` but can be overridden
     // by passing `--prefix` or `-p`.
+    // Clip MUXING (H.264 + AAC) behind a tiny C shim over libav*, the sibling of
+    // the libvips decode shim. Linked into the diffusion EXECUTABLE only — the
+    // TensorPencil library module stays pure Zig, so the engine hands back a
+    // `Clip` of plain data and this writes the container. Building needs
+    // libavformat/libavcodec/libavutil/libswscale/libswresample + pkg-config.
+    const av_libs = [_][]const u8{ "avformat", "avcodec", "avutil", "swscale", "swresample" };
+    const av_module = b.createModule(.{
+        .root_source_file = b.path("src/av.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    av_module.addCSourceFile(.{ .file = b.path("lib/video/av_helper.c"), .flags = &.{} });
+    av_module.addIncludePath(b.path("lib/video"));
+    for (av_libs) |lib| av_module.linkSystemLibrary(lib, .{});
+    exe.root_module.addImport("av", av_module);
+
     b.installArtifact(exe);
 
     // This creates a top level step. Top level steps have a name and can be

@@ -525,6 +525,18 @@ fn readF32File(gpa: std.mem.Allocator, io: std.Io, path: []const u8, n: usize) !
     return out;
 }
 
+/// Best-effort dump of a failing decode for offline comparison. Every step is
+/// swallowed: a diagnostic that fails must not replace the parity failure that
+/// triggered it.
+fn dumpDecodeOutput(io: std.Io, out: []const f32) void {
+    const dir = std.Io.Dir.cwd();
+    dir.createDirPath(io, "scratch_out") catch {};
+    dir.writeFile(io, .{
+        .sub_path = "scratch_out/vae_out_zig.bin",
+        .data = std.mem.sliceAsBytes(out),
+    }) catch {};
+}
+
 // Parity against ComfyUI's WanVAE on the real checkpoint. Fixtures come from
 // tools/dump_vae_fixture.py; skipped when the model or fixtures are absent.
 test "decode matches comfyui reference" {
@@ -547,8 +559,11 @@ test "decode matches comfyui reference" {
     const out = try dec.decode(io, gpa, z, 8, 8, null);
     defer gpa.free(out);
 
-    // Keep the raw output around for offline analysis of parity failures.
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = "testdata/vae_out_zig.bin", .data = std.mem.sliceAsBytes(out) }) catch {};
+    // Dump the raw output for offline analysis, but only when parity actually
+    // fails, and into the git-ignored scratch dir. Writing unconditionally into
+    // testdata/ rewrote a TRACKED file on every run, so any `zig build test`
+    // left the tree dirty. Declared after the free above so it runs first.
+    errdefer dumpDecodeOutput(io, out);
 
     var max_err: f32 = 0;
     var sum_err: f64 = 0;

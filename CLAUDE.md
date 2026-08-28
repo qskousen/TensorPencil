@@ -50,7 +50,7 @@ from a checkpoint, match what ComfyUI does.
 | `ZIG.md` | Zig 0.16.0 breaking changes and gotchas. Read first; add to it. |
 | `BACKEND.md` | backend × feature × dtype support grid. Update when you add a kernel or format. |
 | `LIBRARY.md` | the layered module split, for external consumers |
-| `PLAN.md`, `LLM_PLAN.md` | diffusion and LLM roadmaps |
+| `VIDEO_PLAN.md` | the video/audio roadmap, MiniMax H3 first. Its "silent wrong answers" list is the reason to read it before touching any of that code |
 | `DIFFKEEP.md`, `DIFFKEEP_INTEGRATION.md` | the embedding encoders for the DiffKeep consumer |
 | `UI.md` | the tp-gui design spec; §13 records what shipped and where it diverges |
 | `VULKAN_MEMORY.md` | Vulkan subgroup/shared-memory rework notes |
@@ -89,8 +89,9 @@ test builds when it is off, and heavy tests call `test_gate.requireModelFile` /
 CUDA context. Each checks kernels against their CPU ops and then a whole forward against the
 CPU forward, exiting non-zero on failure: `sd-cuda-test`, `cuda-dit-test`, `cuda-bqdec-test`
 (each block-quant weight decode against its CPU replica), `cuda-vae-test`,
-`zimage-cuda-test`, `anima-cuda-test`, `te-test`, plus the `*-bench` commands
-(`anima-cuda-bench`, `anima-vk-bench`, `vk-norm-bench`, `zimage-cuda-bench`).
+`zimage-cuda-test`, `anima-cuda-test`, `te-test`, `minimax-h3-cuda-test`,
+`minimax-h3-vae-cuda-test`, `minimax-h3-audio-cuda-test`, `lora-cuda-test` (needs no
+checkpoint), plus the `*-bench` commands (`anima-cuda-bench`, `anima-vk-bench`, `vk-norm-bench`, `zimage-cuda-bench`).
 
 ## Architecture
 
@@ -228,6 +229,11 @@ they support** — a new reader belongs in that shared module the day it is writ
   *weight*; int8 and W4A8 share one prep.
 - ⚠️ **Weight storage must gate every GEMM call site, not just the main one.** Fast paths
   that key on "not int8 and not bf16" happily read a packed 4-bit weight as fp8 bytes.
+- **A LoRA is a runtime sidecar, never a merge**: `models/lora.zig` (loader + host apply)
+  and `models/lora_cuda.zig` (device), keyed on `Weight.tag`, so it is
+  architecture-independent. `y = W x + s B (A x)` leaves an int8 base untouched and
+  `strength` a runtime dial. Same call-site hazard as above, and `minimax_h3.Lin` is the
+  answer to it: the weight is reachable only as `.w`, so the sidecar is in every grep.
 - ⚠️ **f16's 65504 ceiling is a real limit on real checkpoints**, met three times here
   (SDXL's VAE residual stream, the Flux/Z-Image VAE's attention logits, Z-Image's trunk
   activations). Symptom is a solid white image with no error. Fixes in use: bf16 instead of

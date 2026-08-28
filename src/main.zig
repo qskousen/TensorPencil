@@ -18,6 +18,11 @@ pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const stdout = &stdout_file_writer.interface;
+    // Flush on the ERROR path too. The `flush` at the bottom of this function is
+    // never reached when a subcommand returns, so every "print a diagnostic then
+    // return the error" site printed into a buffer that was thrown away, and the
+    // user saw a bare stack trace instead of the sentence explaining it.
+    defer stdout.flush() catch {};
 
     if (args.len >= 2 and std.mem.eql(u8, args[1], "gpu-test")) {
         // Survey cooperative-matrix configs (incl. int8 tensor cores) on init.
@@ -106,6 +111,10 @@ pub fn main(init: std.process.Init) !void {
                 // `ShapeMismatch` at load rather than a wrong answer. This flag is how
                 // Anima's encoder gets checked on every backend.
                 variant = .anima;
+            } else if (std.mem.eql(u8, args[i], "--minimax-h3")) {
+                // 50 layers, hidden 5120, theta 5e6 and NO final norm. Pair with
+                // `TP_TE_VISION=1` to compare the deepstack/mrope path too.
+                variant = .minimax_h3;
             } else path = args[i];
         }
         try teTest(arena, io, stdout, path, ref, variant);
@@ -194,6 +203,35 @@ pub fn main(init: std.process.Init) !void {
         try cudaStreamTest(arena, io, stdout, path, lat, budget_gib);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "generate")) {
         try generate(arena, io, stdout, args[2..]);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "generate-clip")) {
+        try generateClip(arena, io, stdout, args[2..]);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "minimax-h3-vae-encode-cuda-test")) {
+        const ck = if (args.len >= 3 and !std.mem.eql(u8, args[2], "libs")) args[2] else "/home/qt/genai/comfyui/models/vae/minimax_h3_video_vae_fp16.safetensors";
+        const libs = for (args[2..]) |a| {
+            if (std.mem.eql(u8, a, "libs")) break true;
+        } else false;
+        try minimaxH3VaeEncodeCudaTest(arena, io, stdout, ck, libs);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "minimax-h3-audio-encode-cuda-test")) {
+        const ck = if (args.len >= 3 and !std.mem.eql(u8, args[2], "libs")) args[2] else "/home/qt/genai/comfyui/models/vae/minimax_h3_audio_vae_fp32.safetensors";
+        const libs = for (args[2..]) |a| {
+            if (std.mem.eql(u8, a, "libs")) break true;
+        } else false;
+        try minimaxH3AudioEncodeCudaTest(arena, io, stdout, ck, libs);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "minimax-h3-audio-cuda-test")) {
+        const ck = if (args.len >= 3 and !std.mem.eql(u8, args[2], "libs")) args[2] else "/home/qt/genai/comfyui/models/vae/minimax_h3_audio_vae_fp32.safetensors";
+        var libs = false;
+        for (args[2..]) |a| if (std.mem.eql(u8, a, "libs")) {
+            libs = true;
+        };
+        try minimaxH3AudioCudaTest(arena, io, stdout, ck, libs);
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "lora-cuda-test")) {
+        try loraCudaTest(arena, io, stdout, args.len >= 3 and std.mem.eql(u8, args[2], "libs"));
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "minimax-h3-vae-cuda-test")) {
+        try minimaxH3VaeCudaTest(arena, io, stdout, args.len >= 3 and std.mem.eql(u8, args[2], "libs"));
+    } else if (args.len >= 2 and std.mem.eql(u8, args[1], "minimax-h3-cuda-test")) {
+        const ck = if (args.len >= 3) args[2] else "/home/qt/genai/comfyui/models/diffusion_models/h3/10erosMaxInt8Ref2va_v10Beta.safetensors";
+        const libs = args.len >= 4 and std.mem.eql(u8, args[3], "libs");
+        try minimaxH3CudaTest(arena, io, stdout, ck, libs);
     } else if (args.len >= 6 and std.mem.eql(u8, args[1], "decode-latent")) {
         try decodeLatent(arena, io, stdout, args[2], args[3], args[4], args[5]);
     } else if (args.len >= 2 and std.mem.eql(u8, args[1], "bench-matmul")) {
@@ -1836,7 +1874,7 @@ fn sdCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []cons
             },
             // This command is the SD-family kernel gate; other architectures have
             // their own text towers and are not exercised here.
-            .krea2, .zimage, .anima => &.{},
+            .krea2, .zimage, .anima, .minimax_h3 => &.{},
         };
         for (towers) |tw| {
             var enc = clip_text.TextEncoder.load(arena, store, tw.cfg, tw.prefix) catch |err| {
@@ -2031,16 +2069,115 @@ fn teTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []const u8
 
     var ct = try TensorPencil.pipeline.Container.open(arena, io, path);
     defer ct.deinit();
-    var enc = try qwen3.TextEncoder.loadVariant(arena, ct.store(), variant);
+    // `TP_TE_TAP=n` truncates the encode to n layers. The ISOLATION for a
+    // device-vs-CPU number that looks large: if the divergence grows smoothly with
+    // depth it is int8 accumulation, and if it jumps at a particular depth it is a
+    // defect in one layer's arithmetic. A single figure at the full depth cannot
+    // tell those apart.
+    var enc = if (std.c.getenv("TP_TE_TAP")) |v| blk: {
+        const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch variant.config().n_layers;
+        const taps = try arena.alloc(usize, 1);
+        taps[0] = n;
+        var cfg = variant.config();
+        cfg.n_layers = n;
+        try stdout.print("(diagnostic: truncated to {d} layers)\n", .{n});
+        break :blk try qwen3.TextEncoder.loadVariantOverride(arena, ct.store(), variant, .{ .cfg = cfg, .taps = taps });
+    } else try qwen3.TextEncoder.loadVariant(arena, ct.store(), variant);
     defer enc.deinit();
     try stdout.print("== te-test ==\nencoder : {s}\n          {d} layers, hidden {d}, rope_theta {d:.0}, q dtype {t}, {d} tokens\n", .{
         path, enc.cfg.n_layers, enc.cfg.hidden, enc.cfg.rope_theta, enc.layers[0].q.dtype, ids.items.len,
     });
 
+    // `TP_TE_VISION=1` adds a spliced vision payload: pre-embedded block rows over
+    // the placeholder tokens, multimodal rope, and DeepStack features. That is the
+    // fl2va/ref2va path, and it exercises three things the text-only compare cannot
+    // -- the row splice, the mrope table, and the per-layer injection at image rows.
+    //
+    // Synthetic rather than from a real ViT on purpose: this compares the DEVICE
+    // encode against the HOST one on the same payload, so where the rows came from
+    // is irrelevant, and a real tower would drag a 27 GB vision load in.
+    var vision: qwen3.TextEncoder.Vision = .{};
+    const want_vision = std.c.getenv("TP_TE_VISION") != null;
+    if (want_vision) {
+        const h = enc.cfg.hidden;
+        const at: usize = @min(4, ids.items.len - 1);
+        const n_rows: usize = @min(16, ids.items.len - at);
+        var prng = std.Random.DefaultPrng.init(0x7e5100);
+        const rnd = prng.random();
+
+        const rows = try arena.alloc(f32, n_rows * h);
+        for (rows) |*v| v.* = rnd.floatNorm(f32) * 0.5;
+        const blocks = try arena.alloc(qwen3.TextEncoder.Vision.Block, 1);
+        blocks[0] = .{ .at = at, .rows = rows };
+
+        const spans = try arena.alloc(qwen3.TextEncoder.Vision.Span, 1);
+        spans[0] = .{ .start = at, .len = n_rows };
+
+        // Three features, the real DeepStack count, injected into layers 0/1/2.
+        const n_ds: usize = 3;
+        const ds = try arena.alloc([]const f32, n_ds);
+        for (ds) |*d| {
+            const buf = try arena.alloc(f32, n_rows * h);
+            for (buf) |*v| v.* = rnd.floatNorm(f32) * 0.3;
+            d.* = buf;
+        }
+
+        // mrope positions for one block, from the same builder the pipeline uses.
+        const pos = try arena.alloc(f32, 3 * ids.items.len);
+        // A square merged grid covering the block, which is what a real reference
+        // image of this token count would have produced.
+        var g: usize = 1;
+        while (g * g < n_rows) g += 1;
+        const img = [_]TensorPencil.models.minimax_h3_vit.ImageSpan{.{
+            .index = at,
+            .size = n_rows,
+            .grid_h = 2 * g,
+            .grid_w = 2 * g,
+        }};
+        try TensorPencil.models.minimax_h3_vit.mropePositions(pos, ids.items.len, &img);
+
+        vision = .{
+            .blocks = blocks,
+            .positions = pos,
+            .rope_dims = enc.cfg.rope_dims,
+            .deepstack = ds,
+            .inject = spans,
+        };
+        try stdout.print("vision  : 1 block of {d} rows at {d}, {d} deepstack features, mrope on\n", .{ n_rows, at, n_ds });
+    }
+
     var t0 = std.Io.Clock.real.now(io);
-    const want = try enc.encode(io, arena, ids.items, null);
+    const want = try enc.encodeVision(io, arena, ids.items, vision, null);
     var ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0.nanoseconds)) / 1e6;
     try stdout.print("\ncpu       {d:8.0} ms   (reference)\n", .{ms});
+
+    // The payload must not be inert, or the device compare below proves only that
+    // the text path runs twice.
+    if (want_vision) {
+        const plain = try enc.encode(io, arena, ids.items, null);
+        var num: f64 = 0;
+        var den: f64 = 0;
+        for (want, plain) |e, g| {
+            num += (@as(f64, e) - g) * (@as(f64, e) - g);
+            den += @as(f64, e) * e;
+        }
+        const d = if (den == 0) 0 else @sqrt(num / den);
+        try stdout.print("          vision payload moves the conditioning by {d:.4}\n", .{d});
+        if (!(d > 0.05)) {
+            try stdout.print("FAILED: the vision payload is inert\n", .{});
+            return error.GpuMismatch;
+        }
+    }
+
+    // int8's device-vs-CPU floor is far above fp8's or a block quant's, and it is
+    // MEASURED, not assumed: one isolated int8 GEMM is 0.0088 in
+    // `minimax-h3-cuda-test`, one encoder layer here is 0.0065, and 50 layers
+    // saturate at 0.018. fp8 and block-quant encoders land at 1.3e-4. One tolerance
+    // for both would either pass a broken int8 path or fail a correct one.
+    const tol: f64 = if (enc.layers[0].q.dtype == .i8) 3e-2 else 5e-3;
+    if (enc.layers[0].q.dtype == .i8) {
+        try stdout.print("tolerance: {d:.4} (int8's own floor; fp8/block-quant use 0.005)\n", .{tol});
+    }
 
     var failures: usize = 0;
     const R = struct {
@@ -2066,16 +2203,16 @@ fn teTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []const u8
         if (be) |b| {
             defer b.deinit();
             const name = if (libs) "cuda" else "zig-cuda";
-            if (!qwen3_cuda.supportsWeights(&enc)) {
+            if (!qwen3_cuda.supportsWeightsOn(b, &enc)) {
                 try stdout.print("{s:<9} REFUSED (supportsWeights false — would fall back to CPU)\n", .{name});
                 failures += 1;
             } else {
-                _ = try qwen3_cuda.encode(&enc, b, io, arena, ids.items, null); // warm
+                _ = try qwen3_cuda.encodeVision(&enc, b, io, arena, ids.items, vision, null); // warm
                 t0 = std.Io.Clock.real.now(io);
-                const got = try qwen3_cuda.encode(&enc, b, io, arena, ids.items, null);
+                const got = try qwen3_cuda.encodeVision(&enc, b, io, arena, ids.items, vision, null);
                 ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0.nanoseconds)) / 1e6;
                 const r = R.rel(want, got);
-                const ok = R.finite(got) and r < 5e-3;
+                const ok = R.finite(got) and r < tol;
                 if (!ok) failures += 1;
                 try stdout.print("{s:<9} {d:8.0} ms   rel L2 {e:.4}  {s}\n", .{ name, ms, r, if (ok) "ok" else "FAILED" });
             }
@@ -2083,7 +2220,9 @@ fn teTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []const u8
             try stdout.print("{s:<9} unavailable\n", .{if (libs) "cuda" else "zig-cuda"});
         }
     }
-    if (TensorPencil.gpu.Context.init(arena, io)) |gc| {
+    if (want_vision) {
+        try stdout.print("{s:<9} skipped (no deepstack/mrope path; the pipeline falls back to CPU)\n", .{"vulkan"});
+    } else if (TensorPencil.gpu.Context.init(arena, io)) |gc| {
         defer gc.deinit();
         if (!qwen3_gpu.supportsWeights(gc, &enc)) {
             try stdout.print("{s:<9} REFUSED (supportsWeights false — would fall back to CPU)\n", .{"vulkan"});
@@ -2094,7 +2233,7 @@ fn teTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []const u8
             const got = try qwen3_gpu.encode(&enc, gc, io, arena, ids.items, false, null);
             ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0.nanoseconds)) / 1e6;
             const r = R.rel(want, got);
-            const ok = R.finite(got) and r < 5e-3;
+            const ok = R.finite(got) and r < tol;
             if (!ok) failures += 1;
             try stdout.print("{s:<9} {d:8.0} ms   rel L2 {e:.4}  {s}\n", .{ "vulkan", ms, r, if (ok) "ok" else "FAILED" });
         }
@@ -4018,7 +4157,7 @@ fn cudaStreamTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []
         return;
     }
     const seq_txt: usize = 8;
-    const sigma: f32 = 0.7;
+    const sigma: f32 = if (std.c.getenv("TP_H3_SIGMA")) |v| (std.fmt.parseFloat(f32, std.mem.span(v)) catch 0.7) else 0.7;
     var prng = std.Random.DefaultPrng.init(1234);
     const rand = prng.random();
     const cond = try arena.alloc(f32, seq_txt * dit_mod.txt_layers * dit_mod.txt_dim);
@@ -4162,7 +4301,7 @@ fn cudaDitTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, path: []con
     const qtag: []const u8 = @tagName(wqt);
 
     const seq_txt: usize = 8;
-    const sigma: f32 = 0.7;
+    const sigma: f32 = if (std.c.getenv("TP_H3_SIGMA")) |v| (std.fmt.parseFloat(f32, std.mem.span(v)) catch 0.7) else 0.7;
     // CPU reference is O(seq^2) and unusably slow past ~256px; gate the rel check.
     const check_cpu = lat <= 32;
     try stdout.print("== cuda-dit-test lat={d} ({d}px), seq~{d} ==\n", .{ lat, lat * 8, seq_txt + (lat / 2) * (lat / 2) });
@@ -4618,4 +4757,1452 @@ fn benchMatmul(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
 
 test "library module is reachable" {
     try std.testing.expectEqual(@as(usize, 4), TensorPencil.DType.f32.byteSize());
+}
+
+/// `generate-clip`: a MiniMax H3 render, video plus its soundtrack.
+///
+/// Separate from `generate` rather than a flag on it, because the result is a
+/// different thing: a clip has frames, a frame rate and audio, and no single
+/// image to write. The default output is a muxed MP4 (`src/av.zig`); `--frames`
+/// writes a PNG sequence plus a WAV instead, for inspecting individual frames.
+fn generateClip(gpa: std.mem.Allocator, io: std.Io, stdout: *std.Io.Writer, args: []const []const u8) !void {
+    const pipeline = TensorPencil.pipeline;
+    const av = @import("av");
+    var opts: pipeline.Options = .{ .prompt = "" };
+    var clip_opts: pipeline.Session.ClipOptions = .{ .prompt = "" };
+    var out_dir: []const u8 = "scratch_out/clip";
+    // Default is an MP4; `--frames` writes a PNG sequence + WAV instead, which is
+    // what you want when inspecting individual frames.
+    var frames_only = false;
+    // Reference pictures, in REQUEST order: the presentation's `<Picture i>`
+    // ordinals count in the order they arrive on the command line.
+    var ref_paths: std.ArrayList([]const u8) = .empty;
+    defer ref_paths.deinit(gpa);
+    // The reference's `ref_image_size` policy. `match` keeps a reference no more
+    // expensive than a frame; `max` spends a 2048 px short edge on identity
+    // fidelity. Reference tokens ride through EVERY sampling step, so `max` can be
+    // several times slower.
+    var ref_match = true;
+    // Keyframes, which are NOT references: they anchor at a pixel frame of the
+    // target and share its canvas. The first frame is a plain stretch (the
+    // geometry the clip is built on); a last frame is a cover crop.
+    var first_frame: ?[]const u8 = null;
+    var last_frame: ?[]const u8 = null;
+    // Reference videos, each a DIRECTORY of `frame_NNNNN.png`, which is exactly
+    // the layout `--frames` writes: a rendered clip round-trips as a reference.
+    var ref_video_dirs: std.ArrayList([]const u8) = .empty;
+    defer ref_video_dirs.deinit(gpa);
+    // One entry per `--ref-video`, null unless a `--ref-video-audio` followed it.
+    var ref_video_audio: std.ArrayList(?[]const u8) = .empty;
+    defer ref_video_audio.deinit(gpa);
+    var ref_audio_paths: std.ArrayList([]const u8) = .empty;
+    defer ref_audio_paths.deinit(gpa);
+    // Continuation: a frames directory (plus its audio.wav if present) and how much
+    // of it to hold fixed.
+    var continue_dir: ?[]const u8 = null;
+    var preserve_frames: usize = 0;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const flag = args[i];
+        const val: ?[]const u8 = if (i + 1 < args.len) args[i + 1] else null;
+        if (std.mem.eql(u8, flag, "--prompt")) {
+            clip_opts.prompt = val orelse return error.MissingValue;
+            i += 1;
+        } else if (std.mem.eql(u8, flag, "--dit")) {
+            opts.dit_path = val orelse return error.MissingValue;
+            i += 1;
+        } else if (std.mem.eql(u8, flag, "--text-encoder")) {
+            opts.text_encoder_path = val orelse return error.MissingValue;
+            opts.explicit_text_encoder = true;
+            i += 1;
+        } else if (std.mem.eql(u8, flag, "--vae")) {
+            opts.vae_path = val orelse return error.MissingValue;
+            opts.explicit_vae = true;
+            i += 1;
+        } else if (std.mem.eql(u8, flag, "--audio-vae")) {
+            opts.vae_2_path = val orelse return error.MissingValue;
+            opts.explicit_vae_2 = true;
+            i += 1;
+        } else if (std.mem.eql(u8, flag, "--ref-video")) {
+            try ref_video_dirs.append(gpa, val orelse return error.MissingValue);
+            try ref_video_audio.append(gpa, null);
+            i += 1;
+        } else if (std.mem.eql(u8, flag, "--ref-video-audio")) {
+            // Attaches to the MOST RECENT --ref-video, so the two are paired
+            // positionally rather than by a name the caller has to invent.
+            if (ref_video_dirs.items.len == 0) {
+                try stdout.print("--ref-video-audio must follow a --ref-video\n", .{});
+                return error.BadArgs;
+            }
+            ref_video_audio.items[ref_video_audio.items.len - 1] = val orelse return error.MissingValue;
+            i += 1;
+        } else if (std.mem.eql(u8, flag, "--continue-from")) {
+            continue_dir = val orelse return error.MissingValue;
+            i += 1;
+        } else if (std.mem.eql(u8, flag, "--preserve-frames")) {
+            preserve_frames = std.fmt.parseInt(usize, val orelse return error.MissingValue, 10) catch return error.BadArgs;
+            i += 1;
+        } else if (std.mem.eql(u8, flag, "--ref-audio")) {
+            try ref_audio_paths.append(gpa, val orelse return error.MissingValue);
+            i += 1;
+        } else if (std.mem.eql(u8, flag, "--first-frame")) {
+            first_frame = val orelse return error.MissingValue;
+            i += 1;
+        } else if (std.mem.eql(u8, flag, "--last-frame")) {
+            last_frame = val orelse return error.MissingValue;
+            i += 1;
+        } else if (std.mem.eql(u8, flag, "--ref-image")) {
+            try ref_paths.append(gpa, val orelse return error.MissingValue);
+            i += 1;
+        } else if (std.mem.eql(u8, flag, "--ref-size")) {
+            const v = val orelse return error.MissingValue;
+            if (std.mem.eql(u8, v, "match")) {
+                ref_match = true;
+            } else if (std.mem.eql(u8, v, "max")) {
+                ref_match = false;
+            } else return error.BadArgs;
+            i += 1;
+        } else if (std.mem.eql(u8, flag, "--lora")) {
+            opts.lora_path = val orelse return error.MissingValue;
+            i += 1;
+        } else if (std.mem.eql(u8, flag, "--lora-strength")) {
+            opts.lora_strength = try std.fmt.parseFloat(f32, val orelse return error.MissingValue);
+            i += 1;
+        } else if (std.mem.eql(u8, flag, "--width")) {
+            clip_opts.width = try std.fmt.parseInt(usize, val orelse return error.MissingValue, 10);
+            i += 1;
+        } else if (std.mem.eql(u8, flag, "--height")) {
+            clip_opts.height = try std.fmt.parseInt(usize, val orelse return error.MissingValue, 10);
+            i += 1;
+        } else if (std.mem.eql(u8, flag, "--length")) {
+            clip_opts.length = try std.fmt.parseInt(usize, val orelse return error.MissingValue, 10);
+            i += 1;
+        } else if (std.mem.eql(u8, flag, "--steps")) {
+            clip_opts.steps = try std.fmt.parseInt(usize, val orelse return error.MissingValue, 10);
+            i += 1;
+        } else if (std.mem.eql(u8, flag, "--seed")) {
+            clip_opts.seed = try std.fmt.parseInt(u64, val orelse return error.MissingValue, 10);
+            i += 1;
+        } else if (std.mem.eql(u8, flag, "--shift")) {
+            clip_opts.shift = try std.fmt.parseFloat(f32, val orelse return error.MissingValue);
+            i += 1;
+        } else if (std.mem.eql(u8, flag, "--shift-audio")) {
+            clip_opts.shift_audio = try std.fmt.parseFloat(f32, val orelse return error.MissingValue);
+            i += 1;
+        } else if (std.mem.eql(u8, flag, "--backend")) {
+            opts.backend = std.meta.stringToEnum(@TypeOf(opts.backend), val orelse return error.MissingValue) orelse return error.BadBackend;
+            i += 1;
+        } else if (std.mem.eql(u8, flag, "--frames")) {
+            frames_only = true;
+        } else if (std.mem.eql(u8, flag, "--out")) {
+            out_dir = val orelse return error.MissingValue;
+            i += 1;
+        } else {
+            try stdout.print("unknown flag: {s}\n", .{flag});
+            return error.BadArgs;
+        }
+    }
+    opts.prompt = clip_opts.prompt;
+
+    if (std.c.getenv("TP_LORA_NO_FUSE") != null) {
+        TensorPencil.models.lora_cuda.bench_no_fuse = true;
+        try stdout.print("(A/B: sidecar accumulate NOT fused into the B GEMM)\n", .{});
+    }
+    if (std.c.getenv("TP_LORA_SKIP_ADD") != null) {
+        TensorPencil.models.lora_cuda.bench_skip_add = true;
+        try stdout.print("(DIAGNOSTIC: sidecar accumulate skipped, this render is WRONG)\n", .{});
+    }
+
+    // PNG only, through the engine's own decoder: the diffusion executable links
+    // libav for muxing but not libvips, so there is no general image decode here.
+    // PNG is what this CLI's own `--frames` output writes, so a rendered frame
+    // round-trips as a reference.
+    const loadPng = struct {
+        fn go(a: std.mem.Allocator, ioo: Io, path: []const u8) !pipeline.Session.RefImage {
+            const bytes = try std.Io.Dir.cwd().readFileAlloc(ioo, path, a, .limited(64 << 20));
+            defer a.free(bytes);
+            const png = try TensorPencil.image.decodePngRgb(a, bytes);
+            defer a.free(png.pixels);
+            const rgb = try a.alloc(f32, 3 * png.height * png.width);
+            for (0..png.height) |y| {
+                for (0..png.width) |x| {
+                    for (0..3) |c| {
+                        rgb[c * png.height * png.width + y * png.width + x] =
+                            @as(f32, @floatFromInt(png.pixels[(y * png.width + x) * 3 + c])) / 255.0;
+                    }
+                }
+            }
+            return .{ .rgb = rgb, .width = png.width, .height = png.height };
+        }
+    }.go;
+
+    const refs = try gpa.alloc(pipeline.Session.RefImage, ref_paths.items.len);
+    defer {
+        for (refs) |r| gpa.free(@constCast(r.rgb));
+        gpa.free(refs);
+    }
+    for (ref_paths.items, refs, 0..) |path, *out, ri| {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 << 20));
+        defer gpa.free(bytes);
+        const png = TensorPencil.image.decodePngRgb(gpa, bytes) catch |err| {
+            try stdout.print("reference {d} ({s}) is not a PNG this build can read: {t}\n", .{ ri + 1, path, err });
+            return err;
+        };
+        defer gpa.free(png.pixels);
+        // Planar f32 in [0, 1], which is what both towers take.
+        const rgb = try gpa.alloc(f32, 3 * png.height * png.width);
+        for (0..png.height) |y| {
+            for (0..png.width) |x| {
+                for (0..3) |c| {
+                    rgb[c * png.height * png.width + y * png.width + x] =
+                        @as(f32, @floatFromInt(png.pixels[(y * png.width + x) * 3 + c])) / 255.0;
+                }
+            }
+        }
+        out.* = .{ .rgb = rgb, .width = png.width, .height = png.height };
+        try stdout.print("reference {d}: {s} ({d}x{d})\n", .{ ri + 1, path, png.width, png.height });
+    }
+    clip_opts.refs = refs;
+    clip_opts.ref_area = if (ref_match) clip_opts.width * clip_opts.height else 0;
+
+    // Keyframes. The LAST frame's index is the SNAPPED frame count minus one, not
+    // `--length - 1`: the request snaps up to the model's 17k+5 grid, so an index
+    // taken from the request would land short of the clip's real end.
+    const snapped = TensorPencil.models.minimax_h3.alignFrameCount(@max(5, clip_opts.length));
+    var kfs: std.ArrayList(pipeline.Session.KeyframeReq) = .empty;
+    defer {
+        for (kfs.items) |k| gpa.free(@constCast(k.img.rgb));
+        kfs.deinit(gpa);
+    }
+    if (first_frame) |path| {
+        const img = try loadPng(gpa, io, path);
+        try kfs.append(gpa, .{ .img = img, .frame_index = 0, .cover_crop = false });
+        try stdout.print("first frame: {s} ({d}x{d})\n", .{ path, img.width, img.height });
+    }
+    if (last_frame) |path| {
+        const img = try loadPng(gpa, io, path);
+        try kfs.append(gpa, .{ .img = img, .frame_index = snapped - 1, .cover_crop = true });
+        try stdout.print("last frame: {s} ({d}x{d}), anchored at frame {d}\n", .{ path, img.width, img.height, snapped - 1 });
+    }
+    clip_opts.keyframes = kfs.items;
+
+    // WAV only, through the engine's own reader: this executable links libav for
+    // muxing but decoding an arbitrary container here would mean a second
+    // dependency. `--frames` writes a WAV beside the frames, so a rendered clip's
+    // soundtrack round-trips as a reference.
+    const loadWav = struct {
+        fn go(a: std.mem.Allocator, ioo: Io, path: []const u8) !TensorPencil.audio.Wave {
+            const bytes = try std.Io.Dir.cwd().readFileAlloc(ioo, path, a, .limited(512 << 20));
+            defer a.free(bytes);
+            return TensorPencil.audio.decodeWav(a, bytes);
+        }
+    }.go;
+
+    // Reference videos, each with its optional soundtrack.
+    const vid_waves = try gpa.alloc(?TensorPencil.audio.Wave, ref_video_dirs.items.len);
+    @memset(vid_waves, null);
+    defer {
+        for (vid_waves) |*w| if (w.*) |*ww| ww.deinit(gpa);
+        gpa.free(vid_waves);
+    }
+    const vids = try gpa.alloc(pipeline.Session.RefVideo, ref_video_dirs.items.len);
+    defer {
+        for (vids) |v| {
+            for (v.frames) |f| gpa.free(@constCast(f.rgb));
+            gpa.free(@constCast(v.frames));
+        }
+        gpa.free(vids);
+    }
+    for (ref_video_dirs.items, vids, 0..) |dir_path, *out, vi| {
+        var frames: std.ArrayList(pipeline.Session.RefImage) = .empty;
+        errdefer {
+            for (frames.items) |f| gpa.free(@constCast(f.rgb));
+            frames.deinit(gpa);
+        }
+        // Sequential, not a directory listing: `frame_00010` must follow
+        // `frame_00009`, and a listing's order is the filesystem's, not the
+        // clip's. Stops at the first gap.
+        var fi: usize = 0;
+        while (true) : (fi += 1) {
+            var nb: [512]u8 = undefined;
+            const fp = try std.fmt.bufPrint(&nb, "{s}/frame_{d:0>5}.png", .{ dir_path, fi });
+            const img = loadPng(gpa, io, fp) catch break;
+            try frames.append(gpa, img);
+        }
+        if (frames.items.len == 0) {
+            try stdout.print("reference video {d} ({s}) has no frame_NNNNN.png files\n", .{ vi + 1, dir_path });
+            return error.BadArgs;
+        }
+        try stdout.print("reference video {d}: {s} ({d} frames, {d}x{d})\n", .{
+            vi + 1, dir_path, frames.items.len, frames.items[0].width, frames.items[0].height,
+        });
+        out.* = .{ .frames = try frames.toOwnedSlice(gpa) };
+        if (ref_video_audio.items[vi]) |wav_path| {
+            const w = loadWav(gpa, io, wav_path) catch |err| {
+                try stdout.print("reference video {d}'s soundtrack ({s}) is not a WAV this build can read: {t}\n", .{ vi + 1, wav_path, err });
+                return err;
+            };
+            vid_waves[vi] = w;
+            out.soundtrack = .{ .samples = w.samples, .channels = w.channels, .sample_rate = w.sample_rate };
+            try stdout.print("  soundtrack: {s} ({d:.2} s, {d} ch @ {d} Hz)\n", .{
+                wav_path, w.seconds(), w.channels, w.sample_rate,
+            });
+        }
+    }
+    clip_opts.ref_videos = vids;
+
+    // Standalone reference soundtracks.
+    const aud_waves = try gpa.alloc(TensorPencil.audio.Wave, ref_audio_paths.items.len);
+    var aud_done: usize = 0;
+    defer {
+        for (aud_waves[0..aud_done]) |*w| w.deinit(gpa);
+        gpa.free(aud_waves);
+    }
+    const auds = try gpa.alloc(pipeline.Session.RefAudio, ref_audio_paths.items.len);
+    defer gpa.free(auds);
+    for (ref_audio_paths.items, aud_waves, auds, 0..) |path, *w, *out, ai| {
+        w.* = loadWav(gpa, io, path) catch |err| {
+            try stdout.print("reference audio {d} ({s}) is not a WAV this build can read: {t}\n", .{ ai + 1, path, err });
+            return err;
+        };
+        aud_done += 1;
+        out.* = .{ .samples = w.samples, .channels = w.channels, .sample_rate = w.sample_rate };
+        try stdout.print("reference audio {d}: {s} ({d:.2} s, {d} ch @ {d} Hz)\n", .{
+            ai + 1, path, w.seconds(), w.channels, w.sample_rate,
+        });
+    }
+    clip_opts.ref_audios = auds;
+
+    // A continuation source: the same `frame_NNNNN.png` layout `--frames` writes,
+    // plus the `audio.wav` beside it when there is one, so a rendered clip
+    // continues itself.
+    var cont_frames: std.ArrayList(pipeline.Session.RefImage) = .empty;
+    defer {
+        for (cont_frames.items) |f| gpa.free(@constCast(f.rgb));
+        cont_frames.deinit(gpa);
+    }
+    var cont_wave: ?TensorPencil.audio.Wave = null;
+    defer if (cont_wave) |*w| w.deinit(gpa);
+    if (continue_dir) |dir_path| {
+        if (preserve_frames == 0) {
+            try stdout.print("--continue-from needs --preserve-frames N (how much to hold fixed)\n", .{});
+            return error.BadArgs;
+        }
+        var fi: usize = 0;
+        while (true) : (fi += 1) {
+            var nb: [512]u8 = undefined;
+            const fp = try std.fmt.bufPrint(&nb, "{s}/frame_{d:0>5}.png", .{ dir_path, fi });
+            const img = loadPng(gpa, io, fp) catch break;
+            try cont_frames.append(gpa, img);
+        }
+        if (cont_frames.items.len == 0) {
+            try stdout.print("--continue-from {s} has no frame_NNNNN.png files\n", .{dir_path});
+            return error.BadArgs;
+        }
+        var ab: [512]u8 = undefined;
+        const ap = try std.fmt.bufPrint(&ab, "{s}/audio.wav", .{dir_path});
+        cont_wave = loadWav(gpa, io, ap) catch null;
+        try stdout.print("continue from: {s} ({d} frames, {d}x{d}{s}), preserving {d}\n", .{
+            dir_path,           cont_frames.items.len, cont_frames.items[0].width,
+            cont_frames.items[0].height, if (cont_wave != null) ", with audio" else ", no audio.wav",
+            preserve_frames,
+        });
+        clip_opts.continue_from = .{
+            .frames = cont_frames.items,
+            .audio = if (cont_wave) |w| .{
+                .samples = w.samples,
+                .channels = w.channels,
+                .sample_rate = w.sample_rate,
+            } else null,
+            .preserve_frames = preserve_frames,
+        };
+    }
+
+    var sess = try pipeline.Session.init(io, gpa, opts, stdout);
+    defer sess.deinit();
+
+    var clip = try sess.generateClip(gpa, clip_opts, stdout);
+    defer clip.deinit(gpa);
+
+    try stdout.print("clip: {d} frames {d}x{d} @ {d} fps, {d} audio samples @ {d} Hz\n", .{
+        clip.frames, clip.width, clip.height, clip.fps_num, clip.audioFrames(), clip.audio_sample_rate,
+    });
+
+    // `--out` names the clip, with or without the extension: MP4 mode appends
+    // `.mp4` if it is not already there, frames mode strips it and uses the rest
+    // as a directory. Blindly appending gave `fox.mp4.mp4`, and creating the
+    // directory unconditionally left an empty one beside every MP4.
+    const dir = std.Io.Dir.cwd();
+    const out_stem = if (std.mem.endsWith(u8, out_dir, ".mp4")) out_dir[0 .. out_dir.len - 4] else out_dir;
+    // Frames mode writes INTO `out_stem`; MP4 mode writes a file beside it, so it
+    // needs the PARENT. Creating neither is how a finished render died at the mux
+    // with `MuxOpenFailed`, having done all the work.
+    if (frames_only) {
+        try dir.createDirPath(io, out_stem);
+    } else if (std.fs.path.dirname(out_stem)) |parent| {
+        try dir.createDirPath(io, parent);
+    }
+    var buf: [512]u8 = undefined;
+
+    // The AUTOMATIC1111 `parameters` block, in the container's own metadata. The
+    // same builder the GUI writes into a PNG text chunk, because a reader
+    // re-renders from it and two copies of the format would drift.
+    const model_name = std.fs.path.stem(opts.dit_path);
+    const params_base = try pipeline.buildA1111Params(
+        gpa,
+        clip_opts.prompt,
+        "",
+        clip_opts.steps,
+        1.0, // no CFG branch: every H3 conditioning node emits one conditioning
+        clip_opts.seed,
+        clip.width,
+        clip.height,
+        model_name,
+        sess.family(),
+        .euler,
+        null,
+        opts.prompt_syntax,
+        opts.emphasis,
+        opts.compat,
+        opts.compatConfig(),
+    );
+    const params = try pipeline.appendClipParams(gpa, params_base, sess.clipShifts(clip_opts));
+    defer gpa.free(params);
+    const params_z = try gpa.dupeZ(u8, params);
+    defer gpa.free(params_z);
+
+    if (!frames_only) {
+        const mp4 = try std.fmt.bufPrintZ(&buf, "{s}.mp4", .{out_stem});
+        var mux = av.Muxer.open(mp4, .{
+            .width = clip.width,
+            .height = clip.height,
+            .fps_num = clip.fps_num,
+            .fps_den = clip.fps_den,
+            .audio_channels = clip.audio_channels,
+            .audio_sample_rate = clip.audio_sample_rate,
+            .meta_key = "parameters",
+            .meta_value = params_z,
+        }) catch |err| {
+            try stdout.print("mux open failed ({t}): {s}\n", .{ err, av.lastError() });
+            return err;
+        };
+        errdefer mux.abort();
+        for (0..clip.frames) |f| try mux.writeFrame(clip.frame(f));
+        if (clip.hasAudio()) try mux.writeAudio(clip.audio, clip.audioFrames());
+        try mux.finish();
+        try stdout.print("wrote {s}\n", .{mp4});
+        try stdout.flush();
+        return;
+    }
+
+    for (0..clip.frames) |f| {
+        var png: std.ArrayList(u8) = .empty;
+        defer png.deinit(gpa);
+        try TensorPencil.image.encodePngRgbText(gpa, &png, clip.frame(f), clip.width, clip.height, &.{
+            .{ .keyword = "parameters", .text = params },
+        });
+        const path = try std.fmt.bufPrint(&buf, "{s}/frame_{d:0>5}.png", .{ out_stem, f });
+        try dir.writeFile(io, .{ .sub_path = path, .data = png.items });
+    }
+    if (clip.hasAudio()) {
+        const wav = try TensorPencil.audio.encodeWavPcm16(gpa, clip.audio, clip.audio_channels, clip.audio_sample_rate);
+        defer gpa.free(wav);
+        const path = try std.fmt.bufPrint(&buf, "{s}/audio.wav", .{out_stem});
+        try dir.writeFile(io, .{ .sub_path = path, .data = wav });
+    }
+    try stdout.print("wrote {s}/\n", .{out_stem});
+    try stdout.flush();
+}
+
+/// `minimax-h3-audio-cuda-test`: the BigVGAN audio decode on the device against
+/// its CPU reference, on real weights. Non-zero exit if it disagrees.
+///
+/// Reports a per-sample maximum alongside the relative L2, because this is a
+/// VOCODER: a norm can look fine while a handful of samples clip or click, and
+/// the device path runs its GEMMs through f16 where the reference is f32.
+/// `minimax-h3-vae-encode-cuda-test`: the video VAE's 3-D causal ENCODER on the
+/// device against its CPU reference, on real weights. Non-zero exit if it
+/// disagrees.
+///
+/// A CLIP by default, not a single frame: GroupNorm statistics are per FRAME, and a
+/// one-frame encode is blind to that axis, so a single-frame check would pass with
+/// the statistics taken over the whole volume.
+fn minimaxH3VaeEncodeCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []const u8, libs: bool) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    const ve = TensorPencil.models.minimax_h3_vae_encode;
+    const ve_cuda = TensorPencil.models.minimax_h3_vae_encode_cuda;
+    const h3vae = TensorPencil.models.minimax_h3_vae;
+    const h3 = TensorPencil.models.minimax_h3;
+    const safetensors = TensorPencil.SafeTensors;
+
+    var be = (if (libs) cuda.Backend.initLibs(arena) else cuda.Backend.init(arena)) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    try stdout.print("== minimax-h3-vae-encode-cuda-test ==\ncuda device: {s} (kernels: {t})\n", .{ be.deviceName(), be.kernels });
+
+    std.Io.Dir.cwd().access(io, ckpt, .{}) catch {
+        try stdout.print("checkpoint not found: {s}\n", .{ckpt});
+        return;
+    };
+    var st = try safetensors.open(arena, io, ckpt);
+    defer st.deinit();
+    var enc = ve.VideoEncoder.load(arena, .{ .safetensors = &st }, null) catch |err| {
+        try stdout.print("this VAE carries no usable encoder: {t}\n", .{err});
+        return;
+    };
+    defer enc.deinit();
+    try stdout.print("encoder: {d} levels, {d} norm groups, {d} -> {d} ch\n", .{
+        enc.levels.len, enc.cfg.norm_groups, enc.conv_in.in_ch, enc.cfg.embed_dim,
+    });
+    if (!ve_cuda.supported(&enc)) {
+        try stdout.print("FAIL: this encoder's shapes have no device path here\n", .{});
+        return error.UnsupportedCheckpoint;
+    }
+
+    // Small by default. The CPU reference is the slow side and every convention
+    // (causal temporal padding, reflect spatial padding, the asymmetric downsample
+    // pad, per-frame statistics) runs at any extent.
+    const px: usize = if (std.c.getenv("TP_H3_VENC_PX")) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 64) else 64;
+    const frames: usize = if (std.c.getenv("TP_H3_VENC_T")) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 5) else 5;
+    try stdout.print("{d} frames at {d}x{d}\n", .{ frames, px, px });
+
+    var prng = std.Random.DefaultPrng.init(0x7e3c0);
+    const rnd = prng.random();
+    const pix = try arena.alloc(f32, 3 * frames * px * px);
+    for (pix) |*v| v.* = rnd.floatNorm(f32) * 0.5;
+
+    const sp: h3vae.Spatial = .{ .ratio = h3.spatial_downscale };
+    const vol: ve.Vol = .{ .d = pix, .ch = 3, .t = frames, .h = px, .w = px };
+
+    var sess = try ve_cuda.Session.init(arena, &enc);
+    defer sess.deinit();
+
+    {
+        const sh = ve_cuda.Shapes.of(&enc, @min(frames, enc.cfg.clip_length), px, px);
+        try stdout.print("shapes: vol {d}, patch {d}, gemm {d} -> {d} MB\n", .{
+            sh.vol, sh.patch, sh.gemm, sh.deviceBytes() >> 20,
+        });
+        try stdout.flush();
+    }
+
+    const t0 = std.Io.Clock.real.now(io).nanoseconds;
+    const want = try ve.encode(&enc, io, arena, vol, sp, null);
+    const t1 = std.Io.Clock.real.now(io).nanoseconds;
+    try stdout.print("host encode done\n", .{});
+    try stdout.flush();
+    var ctx: ve_cuda.Ctx = .{ .enc = &enc, .sess = &sess, .be = be, .gpa = arena };
+    defer ctx.deinit();
+    const got = try ve.encode(&enc, io, arena, vol, sp, ctx.moments());
+    const t2 = std.Io.Clock.real.now(io).nanoseconds;
+
+    if (want.ch != got.ch or want.t != got.t or want.h != got.h or want.w != got.w) {
+        try stdout.print("FAIL: shapes differ, host [{d}][{d}][{d}][{d}] device [{d}][{d}][{d}][{d}]\n", .{
+            want.ch, want.t, want.h, want.w, got.ch, got.t, got.h, got.w,
+        });
+        return error.GpuMismatch;
+    }
+    try stdout.print("latent [{d}][{d}][{d}][{d}]\n", .{ got.ch, got.t, got.h, got.w });
+    try stdout.print("device workspace peak {d} MB (host peak would be {d} MB)\n", .{
+        ctx.peak.deviceBytes() >> 20, ve.peakBytesFor(enc.cfg, @min(frames, enc.cfg.clip_length), px, px) >> 20,
+    });
+
+    var l2_ref: f64 = 0;
+    var l2_err: f64 = 0;
+    var max_abs: f64 = 0;
+    for (want.d[0..want.elems()], got.d[0..got.elems()]) |e, a| {
+        l2_ref += @as(f64, e) * e;
+        l2_err += @as(f64, e - a) * (e - a);
+        max_abs = @max(max_abs, @abs(@as(f64, e - a)));
+    }
+    const rel = if (l2_ref > 0) @sqrt(l2_err / l2_ref) else @sqrt(l2_err);
+    for (got.d[0..got.elems()]) |a| if (!std.math.isFinite(a)) {
+        try stdout.print("FAIL: the device latent is not finite\n", .{});
+        return error.GpuMismatch;
+    };
+
+    const cpu_ms = @as(f64, @floatFromInt(t1 - t0)) / 1e6;
+    const dev_ms = @as(f64, @floatFromInt(t2 - t1)) / 1e6;
+    try stdout.print("cpu {d:.0} ms, device {d:.0} ms ({d:.1}x)\n", .{ cpu_ms, dev_ms, cpu_ms / @max(dev_ms, 1e-9) });
+
+    // The frames must genuinely differ, or a device path that took its statistics
+    // over the whole volume (or encoded one frame and copied it) would pass.
+    var t_diff: f64 = 0;
+    var t_ref: f64 = 0;
+    if (got.t > 1) {
+        const plane = got.h * got.w;
+        for (0..got.ch) |c| {
+            for (0..plane) |i| {
+                const a0 = got.d[(c * got.t + 0) * plane + i];
+                const a1 = got.d[(c * got.t + 1) * plane + i];
+                t_diff += @as(f64, a0 - a1) * (a0 - a1);
+                t_ref += @as(f64, a0) * a0;
+            }
+        }
+    }
+    const t_rel = if (t_ref > 0) @sqrt(t_diff / t_ref) else 1.0;
+
+    const tol = 2e-3;
+    const ok = rel < tol and t_rel > 0.05;
+    try stdout.print("latent rel L2 {d:.6}  max |dz| {d:.6}  (tol {d:.4})  frame split {d:.3}  {s}\n", .{
+        rel, max_abs, tol, t_rel, if (ok) "ok" else "FAIL",
+    });
+    if (!ok) return error.GpuMismatch;
+}
+
+/// `minimax-h3-audio-encode-cuda-test`: the DAC audio ENCODER on the device
+/// against its CPU reference, on real weights. Non-zero exit if it disagrees.
+///
+/// Reports the latent's relative L2 and a per-element maximum. The tolerance is
+/// tighter than the decode side's because a latent is not a waveform: an error
+/// here rides through every sampling step as conditioning.
+fn minimaxH3AudioEncodeCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []const u8, libs: bool) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    const ae = TensorPencil.models.minimax_h3_audio_encode;
+    const ae_cuda = TensorPencil.models.minimax_h3_audio_encode_cuda;
+    const av = TensorPencil.models.minimax_h3_audio;
+    const safetensors = TensorPencil.SafeTensors;
+
+    var be = (if (libs) cuda.Backend.initLibs(arena) else cuda.Backend.init(arena)) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    try stdout.print("== minimax-h3-audio-encode-cuda-test ==\ncuda device: {s} (kernels: {t})\n", .{ be.deviceName(), be.kernels });
+
+    std.Io.Dir.cwd().access(io, ckpt, .{}) catch {
+        try stdout.print("checkpoint not found: {s}\n", .{ckpt});
+        return;
+    };
+    var st = try safetensors.open(arena, io, ckpt);
+    defer st.deinit();
+    var enc = try ae.AudioEncoder.load(arena, .{ .safetensors = &st }, .{});
+    defer enc.deinit();
+    try stdout.print("encoder: {d} stages, hop {d}, latent {d} ch, head {d} wide / {d} heads\n", .{
+        enc.stages.len, enc.hop(), enc.latentChannels(), enc.head.in_dim, enc.head.heads,
+    });
+    if (!ae_cuda.supported(&enc)) {
+        try stdout.print("FAIL: this encoder's shapes have no device path here\n", .{});
+        return error.UnsupportedCheckpoint;
+    }
+
+    // A quarter second by default: the CPU reference is the slow side, and every
+    // code path (all five stages, both padding relations, the causal attention)
+    // runs at any length. The attention is O(t^2), so a long clip is the device's
+    // advantage rather than a different test.
+    const ms: usize = if (std.c.getenv("TP_H3_AUDIO_MS")) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 250) else 250;
+    const len = av.sample_rate * ms / 1000;
+    const t = enc.latentFrames(len);
+    try stdout.print("{d} ms -> {d} samples per channel -> {d} latent frames\n", .{ ms, len, t });
+
+    var prng = std.Random.DefaultPrng.init(0xae1c0);
+    const rnd = prng.random();
+    const wav = try arena.alloc(f32, len * av.stereo);
+    // A tone per channel plus noise: the two stereo halves must differ, and a tone
+    // is what makes a pitch error visible if anyone plots the disagreement.
+    for (0..len) |i| {
+        const tt = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(av.sample_rate));
+        wav[i * 2 + 0] = 0.5 * @sin(2.0 * std.math.pi * 220.0 * tt) + 0.05 * rnd.floatNorm(f32);
+        wav[i * 2 + 1] = 0.5 * @sin(2.0 * std.math.pi * 660.0 * tt) + 0.05 * rnd.floatNorm(f32);
+    }
+
+    // ISOLATION: `TP_H3_AUDIO_BAND=<elems>` sets the im2col band. Setting it huge
+    // removes banding entirely, which is the one thing that turns on with LENGTH --
+    // so if a long clip disagrees and an unbanded one does not, the band arithmetic
+    // is the cause and not the GEMM or the kernels.
+    if (std.c.getenv("TP_H3_AUDIO_BAND")) |v| {
+        ae_cuda.patch_band = std.fmt.parseInt(usize, std.mem.span(v), 10) catch ae_cuda.patch_band;
+        try stdout.print("(diagnostic: im2col band {d} elements)\n", .{ae_cuda.patch_band});
+    }
+
+    var sess = try ae_cuda.Session.init(arena, &enc);
+    defer sess.deinit();
+    var ws = try ae_cuda.Workspace.init(be, &enc, len);
+    defer ws.deinit(be);
+    try stdout.print("workspace: {d} MB of device buffers (host peak would be {d} MB)\n", .{
+        ws.shapes.deviceBytes() >> 20, enc.peakBytesFor(len) >> 20,
+    });
+
+    const n = enc.latentChannels() * av.stereo * t;
+    const want = try arena.alloc(f32, n);
+    const got = try arena.alloc(f32, n);
+
+    const t0 = std.Io.Clock.real.now(io).nanoseconds;
+    try ae.encode(&enc, io, arena, want, wav, len, av.stereo);
+    const t1 = std.Io.Clock.real.now(io).nanoseconds;
+    try ae_cuda.encode(&enc, &sess, be, &ws, arena, got, wav, len, av.stereo);
+    const t2 = std.Io.Clock.real.now(io).nanoseconds;
+
+    var l2_ref: f64 = 0;
+    var l2_err: f64 = 0;
+    var max_abs: f64 = 0;
+    for (want, got) |e, a| {
+        l2_ref += @as(f64, e) * e;
+        l2_err += @as(f64, e - a) * (e - a);
+        max_abs = @max(max_abs, @abs(@as(f64, e - a)));
+    }
+    const rel = if (l2_ref > 0) @sqrt(l2_err / l2_ref) else @sqrt(l2_err);
+    for (got) |a| if (!std.math.isFinite(a)) {
+        try stdout.print("FAIL: the device latent is not finite\n", .{});
+        return error.GpuMismatch;
+    };
+
+    const cpu_ms = @as(f64, @floatFromInt(t1 - t0)) / 1e6;
+    const dev_ms = @as(f64, @floatFromInt(t2 - t1)) / 1e6;
+    try stdout.print("cpu {d:.0} ms, device {d:.0} ms ({d:.1}x)\n", .{ cpu_ms, dev_ms, cpu_ms / @max(dev_ms, 1e-9) });
+
+    // The two stereo halves must genuinely differ, or a device path that encoded
+    // one and copied it would pass every norm above.
+    var ch_diff: f64 = 0;
+    var ch_ref: f64 = 0;
+    for (0..enc.latentChannels()) |c| {
+        for (0..t) |i| {
+            const l = got[(c * av.stereo + 0) * t + i];
+            const r = got[(c * av.stereo + 1) * t + i];
+            ch_diff += @as(f64, l - r) * (l - r);
+            ch_ref += @as(f64, l) * l;
+        }
+    }
+    const ch_rel = if (ch_ref > 0) @sqrt(ch_diff / ch_ref) else 0;
+
+    const tol = 2e-3;
+    const ok = rel < tol and ch_rel > 0.1;
+    try stdout.print("latent rel L2 {d:.6}  max |dz| {d:.6}  (tol {d:.4})  stereo split {d:.3}  {s}\n", .{
+        rel, max_abs, tol, ch_rel, if (ok) "ok" else "FAIL",
+    });
+    if (!ok) return error.GpuMismatch;
+}
+
+fn minimaxH3AudioCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []const u8, libs: bool) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    const av = TensorPencil.models.minimax_h3_audio;
+    const av_cuda = TensorPencil.models.minimax_h3_audio_cuda;
+    const safetensors = TensorPencil.SafeTensors;
+
+    var be = (if (libs) cuda.Backend.initLibs(arena) else cuda.Backend.init(arena)) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    try stdout.print("== minimax-h3-audio-cuda-test ==\ncuda device: {s} (kernels: {t})\n", .{ be.deviceName(), be.kernels });
+
+    std.Io.Dir.cwd().access(io, ckpt, .{}) catch {
+        try stdout.print("checkpoint not found: {s}\n", .{ckpt});
+        return;
+    };
+    var st = try safetensors.open(arena, io, ckpt);
+    defer st.deinit();
+    var dec = try av.AudioDecoder.load(arena, .{ .safetensors = &st });
+    defer dec.deinit();
+    try stdout.print("vocoder: {d} stages, {d} kernels, x{d}, latent {d} -> {d} ch\n", .{
+        dec.nStages(), dec.n_kernels, dec.upsampleFactor(), dec.dec_in.in_ch, dec.dec_in.out_ch,
+    });
+    if (!av_cuda.supported(&dec)) {
+        try stdout.print("FAIL: this decoder's shapes have no device path here\n", .{});
+        return error.UnsupportedCheckpoint;
+    }
+
+    // Latent frames. Small by default: the CPU reference is the slow side, and
+    // every code path (all seven stages, both kernel/rate pairings, the temporal
+    // extent of the kaiser filters) runs at any length.
+    const t: usize = if (std.c.getenv("TP_H3_AUDIO_T")) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 4) else 4;
+    const samples = t * dec.upsampleFactor();
+    try stdout.print("t = {d} latent frames -> {d} samples per channel\n", .{ t, samples });
+
+    if (std.c.getenv("TP_H3_AUDIO_F16") != null) {
+        av_cuda.f16_gemm = true;
+        try stdout.print("(diagnostic: conv GEMMs on tensor cores through f16)\n", .{});
+    }
+
+    var prng = std.Random.DefaultPrng.init(0xa0d10);
+    const rnd = prng.random();
+    const z = try arena.alloc(f32, av.latent_channels * av.stereo * t);
+    for (z) |*v| v.* = rnd.floatNorm(f32);
+
+    var sess = try av_cuda.Session.init(arena, &dec);
+    defer sess.deinit();
+    try stdout.print("session: {d} MB of permuted weights\n", .{sess.bytes() >> 20});
+    var ws = try av_cuda.Workspace.init(be, &dec, t);
+    defer ws.deinit(be);
+    try stdout.print("workspace: {d} MB\n", .{av_cuda.Workspace.bytesFor(&dec, t) >> 20});
+
+    const want = try arena.alloc(f32, samples * av.stereo);
+    const got = try arena.alloc(f32, samples * av.stereo);
+
+    const t0 = std.Io.Clock.real.now(io).nanoseconds;
+    try av.decode(&dec, io, arena, want, z, t);
+    const t1 = std.Io.Clock.real.now(io).nanoseconds;
+    try av_cuda.decode(&dec, &sess, be, &ws, arena, got, z, t, null);
+    const t2 = std.Io.Clock.real.now(io).nanoseconds;
+
+    var l2_ref: f64 = 0;
+    var l2_err: f64 = 0;
+    var max_abs: f64 = 0;
+    var max_at: usize = 0;
+    for (want, got, 0..) |e, a, i| {
+        l2_ref += @as(f64, e) * e;
+        l2_err += @as(f64, e - a) * (e - a);
+        const d = @abs(@as(f64, e - a));
+        if (d > max_abs) {
+            max_abs = d;
+            max_at = i;
+        }
+    }
+    const rel = if (l2_ref > 0) @sqrt(l2_err / l2_ref) else @sqrt(l2_err);
+    var peak: f64 = 0;
+    for (want) |e| peak = @max(peak, @abs(@as(f64, e)));
+
+    const cpu_ns: u64 = @intCast(t1 - t0);
+    const dev_ns: u64 = @intCast(t2 - t1);
+    try stdout.print("cpu {d} ms, device {d} ms ({d:.1}x)\n", .{
+        cpu_ns / std.time.ns_per_ms,
+        dev_ns / std.time.ns_per_ms,
+        @as(f64, @floatFromInt(cpu_ns)) / @as(f64, @floatFromInt(@max(dev_ns, 1))),
+    });
+    try stdout.print("rel L2 {e}  max |dv| {e} at sample {d}  (reference peak {e})\n", .{ rel, max_abs, max_at, peak });
+    // The two stereo channels must genuinely differ, or a device path that
+    // decoded one and copied it would pass everything above.
+    var ch_l2_ref: f64 = 0;
+    var ch_l2_err: f64 = 0;
+    for (0..samples) |i| {
+        const l = @as(f64, got[i * av.stereo]);
+        const r = @as(f64, got[i * av.stereo + 1]);
+        ch_l2_ref += l * l;
+        ch_l2_err += (l - r) * (l - r);
+    }
+    const ch_rel = if (ch_l2_ref > 0) @sqrt(ch_l2_err / ch_l2_ref) else 0;
+    try stdout.print("stereo channels differ by rel {d:.4}\n", .{ch_rel});
+
+    // Concentrated or spread? A single spike is a boundary bug; a broad tail is
+    // precision. A max alone cannot tell them apart.
+    for ([_]f64{ 1e-4, 3e-4, 1e-3, 3e-3 }) |thr| {
+        var n: usize = 0;
+        for (want, got) |e, a| if (@abs(@as(f64, e - a)) > thr) {
+            n += 1;
+        };
+        try stdout.print("  |dv| > {e}: {d} of {d} ({d:.2}%)\n", .{
+            thr, n, want.len, 100.0 * @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(want.len)),
+        });
+    }
+
+    // A vocoder's error budget is per sample, not per norm: 16-bit PCM's own
+    // quantum is 3e-5, so anything under ~1e-3 absolute is inaudible.
+    if (rel > 5e-3 or max_abs > 2e-3 or ch_rel < 0.05) {
+        try stdout.print("FAIL\n", .{});
+        // Flush before unwinding: returning an error skips main's own flush, and
+        // a failure whose numbers never reach the terminal is not a diagnostic.
+        stdout.flush() catch {};
+        return error.Unsupported;
+    }
+    try stdout.print("OK\n", .{});
+}
+
+/// `lora-cuda-test`: the device LoRA sidecar against its host twin, at the real
+/// H3 factor shapes. Non-zero exit if they disagree.
+///
+/// Isolates exactly the sidecar: the factors are synthetic bf16 and there is no
+/// checkpoint, no trunk and no int8, so a disagreement here is `lora_cuda` and
+/// nothing else. `lora.zig`'s unit tests already pin the host path against
+/// ComfyUI's merged LoRA, so host-agrees-with-device closes the loop.
+fn loraCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, libs: bool) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    const lora = TensorPencil.models.lora;
+    const lora_cuda = TensorPencil.models.lora_cuda;
+    const Weight = TensorPencil.ops.matmul.Weight;
+
+    var be = (if (libs) cuda.Backend.initLibs(arena) else cuda.Backend.init(arena)) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    try stdout.print("== lora-cuda-test ==\ncuda device: {s} (kernels: {t})\n", .{ be.deviceName(), be.kernels });
+
+    // The real turbo LoRA's shapes, plus the fused qkv split into its three
+    // block-diagonal factors. `m` is deliberately not 128-aligned: `opGemmBf16`
+    // pads m internally, and a case that only ever ran aligned would not show a
+    // pad row leaking into the accumulate.
+    const hidden: usize = 5376;
+    const inner: usize = 7168;
+    const ffn: usize = 14336;
+    const cases = [_]struct { name: []const u8, in_dim: usize, out: usize, rank: usize, groups: usize }{
+        .{ .name = "attn.qkv_proj", .in_dim = hidden, .out = 3 * inner, .rank = 384, .groups = 3 },
+        .{ .name = "attn.out_proj", .in_dim = inner, .out = hidden, .rank = 128, .groups = 1 },
+        .{ .name = "mlp.fc1", .in_dim = hidden, .out = 2 * ffn, .rank = 128, .groups = 1 },
+        .{ .name = "mlp.fc2", .in_dim = ffn, .out = hidden, .rank = 128, .groups = 1 },
+    };
+    const m: usize = 150;
+    const scale: f32 = 0.0625;
+
+    var prng = std.Random.DefaultPrng.init(0x10ca);
+    const rnd = prng.random();
+
+    var worst: f64 = 0;
+    for (cases) |c| {
+        // Per-group factors, contiguous, exactly as `lora.loadTarget` leaves
+        // them after a block-diagonal split.
+        const gr = c.rank / c.groups;
+        const go = c.out / c.groups;
+        const factors = try arena.alloc(lora.Factor, c.groups);
+        for (factors, 0..) |*f, g| {
+            const a_b = try arena.alloc(u8, gr * c.in_dim * 2);
+            const b_b = try arena.alloc(u8, go * gr * 2);
+            for (0..a_b.len / 2) |k| std.mem.writeInt(u16, a_b[k * 2 ..][0..2], f32ToBf16(rnd.floatNorm(f32) * 0.02), .little);
+            for (0..b_b.len / 2) |k| std.mem.writeInt(u16, b_b[k * 2 ..][0..2], f32ToBf16(rnd.floatNorm(f32) * 0.02), .little);
+            f.* = .{
+                .a = Weight.init(a_b, .bf16, gr, c.in_dim),
+                .b = Weight.init(b_b, .bf16, go, gr),
+                .out_off = g * go,
+                .scale = scale,
+            };
+        }
+        const t: lora.Target = .{ .factors = factors, .in_dim = c.in_dim, .out_dim = c.out, .tag = c.name };
+        if (!lora_cuda.supported(&t)) {
+            try stdout.print("FAIL: {s} shapes have no device path\n", .{c.name});
+            return error.Unsupported;
+        }
+
+        const x = try arena.alloc(f32, m * c.in_dim);
+        for (x) |*v| v.* = rnd.floatNorm(f32);
+
+        // The ranges the trunk actually asks for: qkv splits three ways, fc1
+        // two, the rest whole. Same list as `minimax_h3_cuda.forward`.
+        const ranges: []const struct { off: usize, n: usize } = switch (c.groups) {
+            3 => &.{ .{ .off = 0, .n = inner }, .{ .off = inner, .n = inner }, .{ .off = 2 * inner, .n = inner } },
+            else => if (c.out == 2 * ffn)
+                &.{ .{ .off = 0, .n = ffn }, .{ .off = ffn, .n = ffn } }
+            else
+                &.{.{ .off = 0, .n = c.out }},
+        };
+
+        // Host: the full delta, then read the same ranges out of it.
+        const want = try arena.alloc(f32, m * c.out);
+        @memset(want, 0);
+        try t.applyHost(io, arena, want, c.out, x, m);
+
+        // The control row. The device GEMM rounds the activation to bf16 before
+        // multiplying, so a residual of about bf16's own 2^-9 is the FLOOR, not a
+        // defect. Running the host path on a pre-rounded activation says how much
+        // of the residual that accounts for; without this the number below is
+        // uninterpretable.
+        const x_bf = try arena.alloc(f32, m * c.in_dim);
+        for (x_bf, x) |*d, v| d.* = @bitCast(@as(u32, f32ToBf16(v)) << 16);
+        const floor_ref = try arena.alloc(f32, m * c.out);
+        @memset(floor_ref, 0);
+        try t.applyHost(io, arena, floor_ref, c.out, x_bf, m);
+
+        var ws = try lora_cuda.Workspace.init(be, m * c.rank, m * c.out);
+        defer ws.deinit(be);
+        const mpad = std.mem.alignForward(usize, m, 128);
+        var xd = try be.tensorCreate(mpad * c.in_dim * 4);
+        defer be.tensorDestroy(&xd);
+        const xpad = try arena.alloc(f32, mpad * c.in_dim);
+        @memset(xpad, 0);
+        @memcpy(xpad[0 .. m * c.in_dim], x);
+        try be.tensorUpload(xd, std.mem.sliceAsBytes(xpad));
+
+        for (ranges) |r| {
+            var yd = try be.tensorCreate(mpad * r.n * 4);
+            defer be.tensorDestroy(&yd);
+            // Start from zero, so what comes back IS the sidecar's contribution.
+            const zeros = try arena.alloc(f32, mpad * r.n);
+            @memset(zeros, 0);
+            try be.tensorUpload(yd, std.mem.sliceAsBytes(zeros));
+
+            try be.beginBatch();
+            errdefer if (be.batching()) be.abortBatch();
+            try lora_cuda.applyRange(be, &ws, yd, xd, m, &t, r.off, r.n);
+            try be.endBatch();
+
+            const got = try arena.alloc(f32, m * r.n);
+            try be.tensorDownload(yd, std.mem.sliceAsBytes(got));
+
+            var l2_ref: f64 = 0;
+            var l2_err: f64 = 0;
+            var l2_floor: f64 = 0;
+            for (0..m) |i| {
+                for (0..r.n) |j| {
+                    const e = want[i * c.out + r.off + j];
+                    const a = got[i * r.n + j];
+                    const fl = floor_ref[i * c.out + r.off + j];
+                    l2_ref += @as(f64, e) * e;
+                    l2_err += @as(f64, e - a) * (e - a);
+                    l2_floor += @as(f64, e - fl) * (e - fl);
+                }
+            }
+            const rel = if (l2_ref > 0) @sqrt(l2_err / l2_ref) else @sqrt(l2_err);
+            const floor = if (l2_ref > 0) @sqrt(l2_floor / l2_ref) else @sqrt(l2_floor);
+            worst = @max(worst, rel);
+            try stdout.print("  {s:<14} rows [{d:>5},{d:>5})  rel {e}  (bf16 activation floor {e})\n", .{ c.name, r.off, r.off + r.n, rel, floor });
+            // The delta must be nonzero, or the comparison proves nothing.
+            if (l2_ref == 0) {
+                try stdout.print("FAIL: {s} produced a zero delta\n", .{c.name});
+                return error.Unsupported;
+            }
+        }
+    }
+
+    // bf16 factors against an f32 host reference: the tolerance is the bf16
+    // GEMM's own, ~1e-3 relative at these widths, not an exactness claim.
+    try stdout.print("worst rel {e}\n", .{worst});
+    if (worst > 5e-3) {
+        try stdout.print("FAIL: the device sidecar disagrees with the host one\n", .{});
+        return error.Unsupported;
+    }
+    try stdout.print("OK\n", .{});
+}
+
+/// Round to bf16 (ties to even), the same rounding the CUDA converts use.
+fn f32ToBf16(v: f32) u16 {
+    const bits: u32 = @bitCast(v);
+    const lsb = (bits >> 16) & 1;
+    const rounded = bits + 0x7fff + lsb;
+    return @truncate(rounded >> 16);
+}
+
+/// `minimax-h3-cuda-test`: the H3 trunk on the device against its CPU reference,
+/// on real weights. Non-zero exit if it disagrees.
+///
+/// A CLI command rather than a unit test because the test binary brings up no
+/// CUDA context (see CLAUDE.md). It runs at the DEVELOPMENT shape: 147 packed
+/// rows, which exercises every code path the full render does and costs seconds
+/// rather than the ~20 minutes a full-resolution CPU reference would.
+fn minimaxH3CudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, ckpt: []const u8, libs: bool) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    const h3 = TensorPencil.models.minimax_h3;
+    const h3_cuda = TensorPencil.models.minimax_h3_cuda;
+    const safetensors = TensorPencil.SafeTensors;
+
+    var be = (if (libs) cuda.Backend.initLibs(arena) else cuda.Backend.init(arena)) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    try stdout.print("== minimax-h3-cuda-test ==\ncuda device: {s} (kernels: {t})\n", .{ be.deviceName(), be.kernels });
+
+    std.Io.Dir.cwd().access(io, ckpt, .{}) catch {
+        try stdout.print("checkpoint not found: {s}\n", .{ckpt});
+        return;
+    };
+    var st = try safetensors.open(arena, io, ckpt);
+    defer st.deinit();
+    var dit = try h3.DiT.load(arena, .{ .safetensors = &st });
+    defer dit.deinit();
+    try stdout.print("dit: {d} blocks, hidden {d}, {d}x{d} heads\n", .{
+        dit.cfg.n_layers, dit.cfg.hidden, dit.cfg.n_heads, dit.cfg.head_dim,
+    });
+    if (std.c.getenv("TP_H3_NAIVE") != null) {
+        h3_cuda.force_naive_attn = true;
+        try stdout.print("(naive attention)\n", .{});
+    }
+    {
+        const off = if (std.c.getenv("TP_H3_BLOCK_OFF")) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0) else 0;
+        const n = if (std.c.getenv("TP_H3_BLOCKS")) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch dit.blocks.len) else dit.blocks.len;
+        if (off != 0 or n != dit.blocks.len) {
+            const lo = @min(off, dit.blocks.len);
+            dit.blocks = dit.blocks[lo..@min(lo + n, dit.blocks.len)];
+            try stdout.print("(blocks [{d},{d}))\n", .{ lo, lo + dit.blocks.len });
+        }
+    }
+    if (!h3_cuda.supported(&dit)) {
+        try stdout.print("FAIL: this checkpoint's weights have no device path here\n", .{});
+        return error.UnsupportedCheckpoint;
+    }
+
+    // The development shape: 256x256, 5 frames.
+    const text_len: usize = if (std.c.getenv("TP_H3_TEXT")) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 6) else 6;
+    const lat_t: usize = 2;
+    const lat_h: usize = if (std.c.getenv("TP_H3_LH")) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 16) else 16;
+    const lat_w: usize = if (std.c.getenv("TP_H3_LW")) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 16) else 16;
+    const audio_t: usize = 8;
+    const sigma: f32 = if (std.c.getenv("TP_H3_SIGMA")) |v| (std.fmt.parseFloat(f32, std.mem.span(v)) catch 0.7) else 0.7;
+
+    var layout = try h3.PackedLayout.build(arena, .{
+        .text_len = text_len,
+        .latent_t = lat_t,
+        .latent_h = lat_h,
+        .latent_w = lat_w,
+        .audio_t = audio_t,
+    }, &.{}, &.{}, &.{});
+    defer layout.deinit();
+    try stdout.print("packed sequence: {d} rows\n", .{layout.seq_len});
+
+    var prng = std.Random.DefaultPrng.init(0x431a);
+    const rnd = prng.random();
+    const video = try arena.alloc(f32, h3.latent_channels * lat_t * lat_h * lat_w);
+    for (video) |*v| v.* = rnd.floatNorm(f32);
+    const audio = try arena.alloc(f32, h3.audio_latent_channels * h3.audio_channels * audio_t);
+    for (audio) |*v| v.* = rnd.floatNorm(f32);
+    const text = try arena.alloc(f32, text_len * dit.cfg.hidden);
+    for (text) |*v| v.* = rnd.floatNorm(f32) * 0.5;
+
+    // A DENOISE MASK when asked for, because it is the one thing that makes the two
+    // target segments modulate PER ROW rather than once per segment, and the device
+    // path reaches that through a different kernel argument (an index buffer) than
+    // the host does. `TP_H3_MASK=binary` is the video-continuation shape;
+    // `graded` adds timestep labels of its own, which is what stresses the index
+    // stride; `spatial` alternates row by row, the case a run-length split could
+    // not have served.
+    const frame_rows = (lat_h / h3.patch_h) * (lat_w / h3.patch_w);
+    var video_mask: []f32 = &.{};
+    var audio_mask: []f32 = &.{};
+    if (std.c.getenv("TP_H3_MASK")) |v| {
+        const mode = std.mem.span(v);
+        video_mask = try arena.alloc(f32, lat_t * frame_rows);
+        audio_mask = try arena.alloc(f32, h3.audio_channels * audio_t);
+        for (video_mask, 0..) |*m, i| m.* = if (std.mem.eql(u8, mode, "binary"))
+            (if (i < frame_rows) 0.0 else 1.0)
+        else if (std.mem.eql(u8, mode, "spatial"))
+            (if (i % 2 == 0) 0.0 else 1.0)
+        else
+            @as(f32, @floatFromInt(i % 5)) / 4.0;
+        // The audio stream masked too, so its own sigma and pin are exercised.
+        for (audio_mask, 0..) |*m, i| m.* = if (i < audio_t) 0.0 else 1.0;
+        try stdout.print("denoise mask: {s} ({d} video rows, {d} audio rows)\n", .{
+            mode, video_mask.len, audio_mask.len,
+        });
+    }
+
+    // `TP_H3_MASK=uniform` is the ISOLATION for the device's per-row index
+    // arithmetic: a mask whose rows all agree normally COLLAPSES to a scalar
+    // modulation offset, and forcing the per-row table instead must give the same
+    // answer to the last bit. Device against device, so no int8 or CPU error is in
+    // the way -- unlike the masked device-vs-CPU figures, where a pinned row's
+    // larger modulation genuinely amplifies the existing divergence.
+    if (video_mask.len > 0 and std.mem.eql(u8, std.mem.span(std.c.getenv("TP_H3_MASK").?), "uniform")) {
+        for (video_mask) |*m| m.* = 0.5;
+        for (audio_mask) |*m| m.* = 0.5;
+        const in_u: h3.Inputs = .{
+            .video = video,
+            .audio = audio,
+            .text = text,
+            .sigma = sigma,
+            .video_mask = video_mask,
+            .audio_mask = audio_mask,
+        };
+        var sess_u = try h3_cuda.Session.init(be, arena, &dit, &layout);
+        defer sess_u.deinit(be);
+        var dws_u = try h3_cuda.Workspace.init(be, &dit, layout.seq_len);
+        defer dws_u.deinit(be);
+
+        const n_v = h3.latent_channels * lat_t * lat_h * lat_w;
+        const n_a = h3.audio_latent_channels * h3.audio_channels * audio_t;
+        const scalar_v = try arena.alloc(f32, n_v);
+        const scalar_a = try arena.alloc(f32, n_a);
+        const rows_v = try arena.alloc(f32, n_v);
+        const rows_a = try arena.alloc(f32, n_a);
+
+        h3.force_row_labels = false;
+        try h3_cuda.forward(&dit, be, &sess_u, &dws_u, io, arena, &layout, scalar_v, scalar_a, in_u, null);
+        h3.force_row_labels = true;
+        try h3_cuda.forward(&dit, be, &sess_u, &dws_u, io, arena, &layout, rows_v, rows_a, in_u, null);
+        h3.force_row_labels = false;
+
+        const relOf = struct {
+            fn go(want: []const f32, got: []const f32) f64 {
+                var l2_ref: f64 = 0;
+                var l2_err: f64 = 0;
+                for (want, got) |e, g| {
+                    l2_ref += @as(f64, e) * e;
+                    l2_err += @as(f64, e - g) * (e - g);
+                }
+                return if (l2_ref > 0) @sqrt(l2_err / l2_ref) else @sqrt(l2_err);
+            }
+        }.go;
+        const dev = @max(relOf(scalar_v, rows_v), relOf(scalar_a, rows_a));
+
+        // The same comparison on the HOST forward, which bisects the two: the
+        // per-row modulation is shared logic in `Timesteps` and separate code in
+        // the kernels, and only running both says which one moved.
+        const cs_v = try arena.alloc(f32, n_v);
+        const cs_a = try arena.alloc(f32, n_a);
+        const cr_v = try arena.alloc(f32, n_v);
+        const cr_a = try arena.alloc(f32, n_a);
+        var ws_u = try h3.Workspace.init(arena, dit.cfg, &layout);
+        defer ws_u.deinit(arena);
+        h3.force_row_labels = false;
+        try h3.forward(&dit, io, arena, &ws_u, &layout, cs_v, cs_a, in_u);
+        h3.force_row_labels = true;
+        try h3.forward(&dit, io, arena, &ws_u, &layout, cr_v, cr_a, in_u);
+        h3.force_row_labels = false;
+        const host = @max(relOf(cs_v, cr_v), relOf(cs_a, cr_a));
+
+        try stdout.print("per-row vs scalar modulation, same labels:\n", .{});
+        try stdout.print("  host   rel L2 {e}  {s}\n", .{ host, if (host < 1e-6) "ok" else "FAIL" });
+        try stdout.print("  device rel L2 {e}  {s}\n", .{ dev, if (dev < 1e-6) "ok" else "FAIL" });
+        if (!(host < 1e-6) or !(dev < 1e-6)) return error.GpuMismatch;
+        return;
+    }
+
+    // `TP_H3_GLOBAL_PREP=1` is the ISOLATION for the int8 prep's global row staging.
+    //
+    // Every reduction in this DiT fits in shared memory, so forcing the global path
+    // runs the same arithmetic in the same order on the same data and must agree to
+    // the LAST BIT. A device-vs-CPU tolerance cannot see a defect here: int8 over 50
+    // blocks has a ~1e-2 floor, and the address rewrite this validates is exactly
+    // the kind of thing that hides under it.
+    if (std.c.getenv("TP_H3_GLOBAL_PREP") != null) {
+        const n_v = h3.latent_channels * lat_t * lat_h * lat_w;
+        const n_a = h3.audio_latent_channels * h3.audio_channels * audio_t;
+        const sh_v = try arena.alloc(f32, n_v);
+        const sh_a = try arena.alloc(f32, n_a);
+        const gl_v = try arena.alloc(f32, n_v);
+        const gl_a = try arena.alloc(f32, n_a);
+
+        var sess_p = try h3_cuda.Session.init(be, arena, &dit, &layout);
+        defer sess_p.deinit(be);
+        var dws_p = try h3_cuda.Workspace.init(be, &dit, layout.seq_len);
+        defer dws_p.deinit(be);
+
+        // A local `Inputs`, since this runs before the shared one is built.
+        const in_p: h3.Inputs = .{ .video = video, .audio = audio, .text = text, .sigma = sigma };
+
+        try stdout.print("shared-staging ceiling on this device: {d} columns\n", .{be.i8PrepMaxSharedCols()});
+        cuda.Backend.force_global_prep = false;
+        try h3_cuda.forward(&dit, be, &sess_p, &dws_p, io, arena, &layout, sh_v, sh_a, in_p, null);
+        cuda.Backend.force_global_prep = true;
+        try h3_cuda.forward(&dit, be, &sess_p, &dws_p, io, arena, &layout, gl_v, gl_a, in_p, null);
+        cuda.Backend.force_global_prep = false;
+
+        var worst: f64 = 0;
+        for ([_][2][]const f32{ .{ sh_v, gl_v }, .{ sh_a, gl_a } }) |pair| {
+            var l2_ref: f64 = 0;
+            var l2_err: f64 = 0;
+            for (pair[0], pair[1]) |e, g| {
+                l2_ref += @as(f64, e) * e;
+                l2_err += @as(f64, e - g) * (e - g);
+            }
+            worst = @max(worst, if (l2_ref > 0) @sqrt(l2_err / l2_ref) else @sqrt(l2_err));
+        }
+        try stdout.print("int8 prep, global vs shared row staging: rel L2 {e}  {s}\n", .{
+            worst, if (worst == 0) "ok (bit-identical)" else "FAIL",
+        });
+        if (worst != 0) return error.GpuMismatch;
+        return;
+    }
+
+
+    const in: h3.Inputs = .{
+        .video = video,
+        .audio = audio,
+        .text = text,
+        .sigma = sigma,
+        .video_mask = video_mask,
+        .audio_mask = audio_mask,
+    };
+
+    // --- isolation: ONE int8 GEMM, device against host ----------------------
+    // The whole-forward figure cannot say whether a 10% error is the GEMM, the
+    // norm, the rope or the attention. This removes exactly one component.
+    for ([_]usize{ 128, 150, 256 }) |m| {
+        const h = dit.cfg.hidden;
+        const x = try arena.alloc(f32, m * h);
+        for (x) |*v| v.* = rnd.floatNorm(f32);
+        const w = dit.blocks[0].attn.qkv.w;
+
+        const want = try arena.alloc(f32, m * w.rows);
+        try TensorPencil.ops.matmul.matmul(io, arena, want, x, m, w, null);
+
+        const mpad = std.mem.alignForward(usize, m, 128);
+        var xd = try be.tensorCreate(mpad * h * 4);
+        defer be.tensorDestroy(&xd);
+        var yd = try be.tensorCreate(mpad * w.rows * 4);
+        defer be.tensorDestroy(&yd);
+        const xpad = try arena.alloc(f32, mpad * h);
+        @memset(xpad, 0);
+        @memcpy(xpad[0 .. m * h], x);
+        try be.beginBatch();
+        try be.tensorUpload(xd, std.mem.sliceAsBytes(xpad));
+        try be.opI8Prep(xd, m, h, false);
+        try be.opI8Gemm(yd, w.bytes, w.row_scale.?, w.rows, false);
+        try be.endBatch();
+        const got = try arena.alloc(f32, mpad * w.rows);
+        try be.tensorDownload(yd, std.mem.sliceAsBytes(got));
+
+        var l2_ref: f64 = 0;
+        var l2_err: f64 = 0;
+        for (want, got[0 .. m * w.rows]) |e, a| {
+            l2_ref += @as(f64, e) * e;
+            l2_err += @as(f64, e - a) * (e - a);
+        }
+        const rel = @sqrt(l2_err / l2_ref);
+        try stdout.print("qkv GEMM [{d}x{d}] x [{d}]  rel L2 {d:.5}\n", .{ w.rows, w.cols, m, rel });
+    }
+
+    // --- the CPU reference --------------------------------------------------
+    var ws = try h3.Workspace.init(arena, dit.cfg, &layout);
+    defer ws.deinit(arena);
+    const cpu_v = try arena.alloc(f32, video.len);
+    const cpu_a = try arena.alloc(f32, audio.len);
+    var t0 = std.Io.Clock.real.now(io).nanoseconds;
+    try h3.forward(&dit, io, arena, &ws, &layout, cpu_v, cpu_a, in);
+    const cpu_ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0)) / 1e6;
+
+    // --- the device path ----------------------------------------------------
+    var sess = try h3_cuda.Session.init(be, arena, &dit, &layout);
+    defer sess.deinit(be);
+    var dws = try h3_cuda.Workspace.init(be, &dit, layout.seq_len);
+    defer dws.deinit(be);
+    const gpu_v = try arena.alloc(f32, video.len);
+    const gpu_a = try arena.alloc(f32, audio.len);
+    t0 = std.Io.Clock.real.now(io).nanoseconds;
+    try h3_cuda.forward(&dit, be, &sess, &dws, io, arena, &layout, gpu_v, gpu_a, in, null);
+    const gpu_ms = @as(f64, @floatFromInt(std.Io.Clock.real.now(io).nanoseconds - t0)) / 1e6;
+
+    // --- localize: compare the TRUNK output per segment ---------------------
+    // `ws.h` still holds the CPU trunk after `forward` (the heads use their own
+    // scratch), and `dws.x_d` is the device's. Comparing per segment says which
+    // rows diverge, which a single output figure cannot.
+    {
+        const dev_trunk = try arena.alloc(f32, layout.seq_len * dit.cfg.hidden);
+        try be.tensorDownload(dws.x_d, std.mem.sliceAsBytes(dev_trunk));
+        try stdout.print("\n-- trunk, per segment --\n", .{});
+        for (layout.segments) |sg| {
+            const n = sg.len() * dit.cfg.hidden;
+            const off = sg.start * dit.cfg.hidden;
+            var l2_ref: f64 = 0;
+            var l2_err: f64 = 0;
+            for (ws.h[off..][0..n], dev_trunk[off..][0..n]) |e, a| {
+                l2_ref += @as(f64, e) * e;
+                l2_err += @as(f64, e - a) * (e - a);
+            }
+            const rel = if (l2_ref > 0) @sqrt(l2_err / l2_ref) else @sqrt(l2_err);
+            try stdout.print("  {s:<10} rows [{d:>5},{d:>5})  rel L2 {d:.5}\n", .{ @tagName(sg.kind), sg.start, sg.stop, rel });
+        }
+    }
+
+    // --- compare ------------------------------------------------------------
+    // Relative L2, not a per-element bound: the device path quantizes activations
+    // to int8 and approximates the softmax, so individual elements move while the
+    // field as a whole must not.
+    var failures: usize = 0;
+    for ([_]struct { name: []const u8, want: []const f32, got: []const f32 }{
+        .{ .name = "video", .want = cpu_v, .got = gpu_v },
+        .{ .name = "audio", .want = cpu_a, .got = gpu_a },
+    }) |c| {
+        var l2_ref: f64 = 0;
+        var l2_err: f64 = 0;
+        var max_abs: f64 = 0;
+        for (c.want, c.got) |e, a| {
+            l2_ref += @as(f64, e) * e;
+            l2_err += @as(f64, e - a) * (e - a);
+            max_abs = @max(max_abs, @abs(@as(f64, e - a)));
+        }
+        const rel = if (l2_ref > 0) @sqrt(l2_err / l2_ref) else @sqrt(l2_err);
+        // Depth-scaled, the same form `anima-cuda-test` uses and for the same
+        // reason: the device path is W8A8 where this reference is W8A32 (exact
+        // weights, f32 activations), so the two diverge with depth by design.
+        //
+        // The base is 1.5e-2 against anima's 6e-3, and that is a MEASURED
+        // allowance, not a guess. At 150 packed rows the curve is flat at 0.003
+        // through 45 blocks and then jumps: 0.005 at 48 and 0.009 video / 0.061
+        // audio at 50. Isolations that rule out a defect: one qkv GEMM alone is
+        // 0.0088 (the expected W8A8 level), and swapping the tensor-core
+        // attention for the naive kernel moves the total by under 6%. What is
+        // left is the last block, whose `fc2` scales average 3x smaller than
+        // every other block's, so its contribution to the velocity is small in
+        // magnitude and a fixed absolute quantization error there shows up as a
+        // large RELATIVE one in the output.
+        //
+        // This bound says "no defect", not "matches the reference render". The
+        // acceptance test is a render compared against ComfyUI, which itself runs
+        // this checkpoint W8A8 and so may agree with the device path more closely
+        // than this f32 host reference does. That comparison is owed.
+        const tol = 1.5e-2 * (1.0 + @as(f64, @floatFromInt(dit.blocks.len)) / 8.0);
+        const ok = rel < tol and std.math.isFinite(rel);
+        if (!ok) failures += 1;
+        try stdout.print("{s:<8} rel L2 {d:.5}  max |dv| {d:.5}  (tol {d:.4})  {s}\n", .{
+            c.name, rel, max_abs, tol, if (ok) "ok" else "FAIL",
+        });
+    }
+    try stdout.print("\ncpu {d:.0} ms, device {d:.0} ms ({d:.1}x)\n", .{ cpu_ms, gpu_ms, cpu_ms / gpu_ms });
+    try stdout.flush();
+    if (failures != 0) return error.DeviceMismatch;
+}
+
+/// `minimax-h3-vae-cuda-test`: the video VAE's ViT3D on the device against its
+/// CPU reference.
+///
+/// Runs on the toy-width FIXTURE the CPU path is pinned with, not the real 5.2 GB
+/// VAE: the fixture is f32 with the real head_dim and patch geometry, so it
+/// exercises every device path at a size where the CPU side is instant. A real
+/// checkpoint arm would add a 7-minute CPU reference for no extra coverage.
+fn minimaxH3VaeCudaTest(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, libs: bool) !void {
+    const cuda = TensorPencil.gpu.cuda;
+    const h3vae = TensorPencil.models.minimax_h3_vae;
+    const h3vae_cuda = TensorPencil.models.minimax_h3_vae_cuda;
+    const safetensors = TensorPencil.SafeTensors;
+
+    var be = (if (libs) cuda.Backend.initLibs(arena) else cuda.Backend.init(arena)) catch |err| {
+        try stdout.print("cuda unavailable: {t}\n", .{err});
+        return;
+    };
+    defer be.deinit();
+    try stdout.print("== minimax-h3-vae-cuda-test ==\ncuda device: {s} (kernels: {t})\n", .{ be.deviceName(), be.kernels });
+
+    const fixture = @embedFile("models/assets/minimax_h3_vae.safetensors");
+    var st = try safetensors.initFromSlice(arena, fixture);
+    defer st.deinit();
+    var dec = try h3vae.VideoDecoder.load(arena, .{ .safetensors = &st });
+    defer dec.deinit();
+    if (!h3vae_cuda.supported(&dec)) {
+        try stdout.print("FAIL: this VAE's weights have no device path here\n", .{});
+        return error.UnsupportedCheckpoint;
+    }
+    try stdout.print("vae: {d} blocks, dim {d}, {d}x{d} heads, patch {d}x{d}\n", .{
+        dec.cfg.n_layers, dec.cfg.dim, dec.cfg.heads, dec.cfg.head_dim, dec.cfg.patch_t, dec.cfg.patch,
+    });
+
+    // Shape override: the 512x512 render showed patch-grid artifacts the tiny
+    // default shape does not, so the same sequence length has to be reachable
+    // here. `in.z` is regenerated as noise when the shape is not the fixture's.
+    const t: usize = if (std.c.getenv("TP_VAE_T")) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 2) else 2;
+    const h: usize = if (std.c.getenv("TP_VAE_H")) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 3) else 3;
+    const w: usize = if (std.c.getenv("TP_VAE_W")) |v| (std.fmt.parseInt(usize, std.mem.span(v), 10) catch 4) else 4;
+    const z = if (t == 2 and h == 3 and w == 4)
+        try (try st.require("in.z")).toF32Alloc(arena)
+    else blk: {
+        var prng = std.Random.DefaultPrng.init(0x5ae);
+        const rr = prng.random();
+        const zz = try arena.alloc(f32, dec.cfg.in_channels * t * h * w);
+        for (zz) |*v| v.* = rr.floatNorm(f32);
+        break :blk zz;
+    };
+    try stdout.print("shape t={d} h={d} w={d} -> {d} grid tokens, seq {d}\n", .{
+        t, h, w, t * h * w, t * h * w + dec.cfg.n_register + 1,
+    });
+
+    const s = h3vae.outputShape(dec.cfg, t, h, w);
+    const n = dec.cfg.out_channels * s.frames * s.height * s.width;
+    const want = try arena.alloc(f32, n);
+    const got = try arena.alloc(f32, n);
+
+    // RAW volumes on both sides: the ImageNet finalize clamps, and a clamp hides
+    // exactly the disagreement this is looking for.
+    try h3vae.decodeVolume(&dec, io, arena, want, z, t, h, w);
+
+    var sess = try h3vae_cuda.Session.init(be, arena, &dec, t, h, w);
+    defer sess.deinit(be);
+    var ws = try h3vae_cuda.Workspace.init(be, &dec, sess.seq, sess.grid);
+    defer ws.deinit(be);
+    try h3vae_cuda.decodeVolume(&dec, be, &sess, &ws, io, arena, got, z, t, h, w);
+
+    var l2_ref: f64 = 0;
+    var l2_err: f64 = 0;
+    var max_abs: f64 = 0;
+    var nonfinite: usize = 0;
+    for (want, got) |e, aa| {
+        if (!std.math.isFinite(aa)) nonfinite += 1;
+        l2_ref += @as(f64, e) * e;
+        l2_err += @as(f64, e - aa) * (e - aa);
+        max_abs = @max(max_abs, @abs(@as(f64, e - aa)));
+    }
+    const rel = @sqrt(l2_err / l2_ref);
+    // Dense f16/f32 GEMMs and an approximated softmax, no activation
+    // quantization anywhere, so this is a much tighter regime than the int8 trunk.
+    const ok = nonfinite == 0 and rel < 2e-3;
+    try stdout.print("volume decode  rel L2 {d:.6}  max |dv| {d:.6}  {s}\n", .{ rel, max_abs, if (ok) "ok" else "FAIL" });
+    try stdout.flush();
+    if (!ok) return error.DeviceMismatch;
 }

@@ -92,6 +92,57 @@ pub fn rotateHalfFreqs(gpa: std.mem.Allocator, seq: usize, head_dim: usize, thet
     return rotateHalfFreqsScaled(gpa, seq, head_dim, theta, 1.0);
 }
 
+/// Qwen3-VL's INTERLEAVED multimodal rope: three position axes sharing one
+/// `head_dim / 2` frequency ladder, assigned round-robin rather than in
+/// contiguous sections.
+///
+/// `positions` is `[3][seq]` (T, H, W) and `dims` the per-axis slot counts,
+/// summing to `head_dim / 2` (Qwen3-VL: `{24, 20, 20}` over 64). The assignment
+/// is the reference's "T-freqs by default, H/W replace every 3rd dim":
+///
+///     slot k < 3 * dims[1]  ->  axis (k % 3)
+///     slot k otherwise      ->  axis 0
+///
+/// So with `{24, 20, 20}`, slots 1,4,..,58 take H, slots 2,5,..,59 take W, and
+/// axis 0 keeps 0,3,..,57 PLUS the tail 60..63. That tail is the part to be
+/// careful with: the naive reading of "24/20/20" is three contiguous blocks, and
+/// `mropeSectionFreqs` below is that other convention. Interleaved and sectioned
+/// give the same answer only when all three axes carry the same position, i.e.
+/// for text-only prompts -- which is exactly when nothing would notice.
+pub fn mropeInterleavedFreqs(
+    gpa: std.mem.Allocator,
+    positions: []const f32,
+    seq: usize,
+    head_dim: usize,
+    dims: [3]usize,
+    theta: f64,
+) !Freqs {
+    const half = head_dim / 2;
+    std.debug.assert(dims[0] + dims[1] + dims[2] == half);
+    std.debug.assert(positions.len == 3 * seq);
+    const cos = try gpa.alloc(f32, seq * half);
+    errdefer gpa.free(cos);
+    const sin = try gpa.alloc(f32, seq * half);
+    errdefer gpa.free(sin);
+
+    // The reference replaces `slice(offset, dims[axis] * 3, 3)` for axes 1 and 2,
+    // and both lengths are the same in every shipped config; using dims[1] for
+    // the cutoff matches it and asserts the assumption rather than hiding it.
+    std.debug.assert(dims[1] == dims[2]);
+    const interleaved_end = 3 * dims[1];
+
+    for (0..half) |k| {
+        const axis: usize = if (k < interleaved_end) k % 3 else 0;
+        const inv = 1.0 / std.math.pow(f64, theta, @as(f64, @floatFromInt(2 * k)) / @as(f64, @floatFromInt(head_dim)));
+        for (0..seq) |t| {
+            const angle = @as(f64, positions[axis * seq + t]) * inv;
+            cos[t * half + k] = @floatCast(@cos(angle));
+            sin[t * half + k] = @floatCast(@sin(angle));
+        }
+    }
+    return .{ .cos = cos, .sin = sin, .half = half };
+}
+
 /// rotateHalfFreqs with a linear position scale (llama.cpp `freq_scale` /
 /// HF "linear" rope scaling): the effective position is `p * freq_scale`
 /// (position interpolation). `freq_scale == 1.0` reproduces rotateHalfFreqs.

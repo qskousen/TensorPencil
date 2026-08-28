@@ -22,9 +22,9 @@ pub const rms_mod_par_ptx: [:0]const u8 =
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
     \\  .reg .pred %p<4>;
-    \\  .reg .b32 %r<16>;
+    \\  .reg .b32 %r<20>;
     \\  .reg .f32 %f<12>;
-    \\  .reg .b64 %rd<16>;
+    \\  .reg .b64 %rd<20>;
     \\  .shared .align 4 .b8 red[1024];       // 256 f32 partials
     \\  mov.u32 %r1,%ctaid.x;                  // row
     \\  ld.param.u32 %r2,[u0]; setp.ge.u32 %p1,%r1,%r2; @%p1 bra END;
@@ -35,6 +35,14 @@ pub const rms_mod_par_ptx: [:0]const u8 =
     \\  ld.param.f32 %f1,[f0];                 // eps
     \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
     \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
+    \\  ld.param.u64 %rd14,[p3];               // optional per-row mod index (u32)
+    \\  setp.eq.s64 %p1,%rd14,0; @%p1 bra NOIX;
+    \\  cvta.to.global.u64 %rd14,%rd14;
+    \\  mul.wide.u32 %rd15,%r1,4; add.s64 %rd14,%rd14,%rd15;
+    \\  ld.global.u32 %r15,[%rd14]; ld.param.u32 %r16,[u4];
+    \\  mul.lo.s32 %r15,%r15,%r16;             // label index * label stride
+    \\  add.s32 %r5,%r5,%r15; add.s32 %r6,%r6,%r15;
+    \\NOIX:
     \\  mul.lo.s32 %r7,%r1,%r4;                // base = row*dim
     \\  mul.wide.u32 %rd4,%r7,4; add.s64 %rd5,%rd1,%rd4;   // x row ptr
     \\  add.s64 %rd6,%rd2,%rd4;                // out row ptr
@@ -4757,6 +4765,49 @@ pub const rope_vision_gemma4_ptx: [:0]const u8 =
 /// Deinterleave the qwen35 attention q projection: per 2*hd-wide head slot,
 /// q[h*hd+d] = qg[h*2*hd + d], gate[h*hd+d] = qg[h*2*hd + hd + d].
 /// b0=qg, b1=q, b2=gate. u0=total q elems (n_heads*hd), u1=hd.
+/// Split a PER-HEAD fused qkv into three planar buffers.
+///
+/// A token's row is `[h0 q | h0 k | h0 v | h1 q | ...]`, so for output index
+/// `i` (over `[tokens*heads][hd]`) the source is `(i/hd)*3*hd + i%hd` and the
+/// three components are `hd` apart. This is the MiniMax H3 video VAE's layout;
+/// the same checkpoint family's DiT fuses the other way (`[all q|all k|all v]`),
+/// which needs no kernel at all because those are contiguous row ranges.
+///
+/// b0=src, b1=q, b2=k, b3=v. u0=total (tokens*heads*hd), u1=hd.
+pub const deinterleave3_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry deinterleave3(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<2>;
+    \\  .reg .b32 %r<12>;
+    \\  .reg .f32 %f<4>;
+    \\  .reg .b64 %rd<16>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1];               // hd
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2]; ld.param.u64 %rd4,[p3];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2;
+    \\  cvta.to.global.u64 %rd3,%rd3; cvta.to.global.u64 %rd4,%rd4;
+    \\  div.u32 %r7,%r4,%r6;                  // (token, head) pair
+    \\  rem.u32 %r8,%r4,%r6;                  // d
+    \\  mul.lo.s32 %r9,%r6,3; mad.lo.s32 %r10,%r7,%r9,%r8;  // src q idx = pair*3*hd + d
+    \\  mul.wide.u32 %rd5,%r10,4; add.s64 %rd6,%rd1,%rd5; ld.global.f32 %f1,[%rd6];
+    \\  mul.wide.u32 %rd7,%r4,4;
+    \\  add.s64 %rd8,%rd2,%rd7; st.global.f32 [%rd8],%f1;
+    \\  add.u32 %r11,%r10,%r6;                // + hd -> k
+    \\  mul.wide.u32 %rd9,%r11,4; add.s64 %rd10,%rd1,%rd9; ld.global.f32 %f2,[%rd10];
+    \\  add.s64 %rd11,%rd3,%rd7; st.global.f32 [%rd11],%f2;
+    \\  add.u32 %r11,%r11,%r6;                // + hd -> v
+    \\  mul.wide.u32 %rd12,%r11,4; add.s64 %rd13,%rd1,%rd12; ld.global.f32 %f3,[%rd13];
+    \\  add.s64 %rd14,%rd4,%rd7; st.global.f32 [%rd14],%f3;
+    \\END:
+    \\  ret;
+    \\}
+;
+
 pub const deinterleave2_ptx: [:0]const u8 =
     \\.version 8.0
     \\.target sm_86
@@ -5607,6 +5658,35 @@ pub const add_ptx: [:0]const u8 =
     \\}
 ;
 
+/// a[idx] += f0 * b[idx], in place. b0=a, b1=b. u0=total, f0=scale.
+///
+/// The plain `add` with the scale folded into a weight would work only for a
+/// power-of-two scale; a LoRA sidecar's `strength * alpha / rank` is a runtime
+/// dial, and folding it means rounding the factor again in bf16 every time it
+/// moves. Keeping it here leaves `strength` free.
+pub const add_scaled_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry add_scaled(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<2>;
+    \\  .reg .b32 %r<8>;
+    \\  .reg .f32 %f<5>;
+    \\  .reg .b64 %rd<8>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1];
+    \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2;
+    \\  ld.param.f32 %f3,[f0];
+    \\  mul.wide.u32 %rd3,%r4,4; add.s64 %rd4,%rd1,%rd3; add.s64 %rd5,%rd2,%rd3;
+    \\  ld.global.f32 %f1,[%rd4]; ld.global.f32 %f2,[%rd5]; fma.rn.f32 %f1,%f2,%f3,%f1; st.global.f32 [%rd4],%f1;
+    \\END:
+    \\  ret;
+    \\}
+;
+
 /// ReLU in place: a[idx] = max(0, a[idx]). b0=a. u0=total.
 pub const relu_ptx: [:0]const u8 =
     \\.version 8.0
@@ -6059,16 +6139,24 @@ pub const gated_add_ptx: [:0]const u8 =
     \\.visible .entry gated_add(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
     \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
     \\{
-    \\  .reg .pred %p<2>;
-    \\  .reg .b32 %r<12>;
+    \\  .reg .pred %p<3>;
+    \\  .reg .b32 %r<16>;
     \\  .reg .f32 %f<6>;
-    \\  .reg .b64 %rd<12>;
+    \\  .reg .b64 %rd<16>;
     \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
     \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
     \\  ld.param.u32 %r6,[u1]; ld.param.u32 %r7,[u2];
     \\  ld.param.u64 %rd1,[p0]; ld.param.u64 %rd2,[p1]; ld.param.u64 %rd3,[p2];
     \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2; cvta.to.global.u64 %rd3,%rd3;
     \\  rem.u32 %r8,%r4,%r6; add.s32 %r9,%r8,%r7;           // gate col = u2 + idx%u1
+    \\  ld.param.u64 %rd9,[p3];                // optional per-row mod index (u32)
+    \\  setp.eq.s64 %p2,%rd9,0; @%p2 bra NOIXG;
+    \\  cvta.to.global.u64 %rd9,%rd9;
+    \\  div.u32 %r10,%r4,%r6;                  // row = flat / dim
+    \\  mul.wide.u32 %rd10,%r10,4; add.s64 %rd9,%rd9,%rd10;
+    \\  ld.global.u32 %r11,[%rd9]; ld.param.u32 %r12,[u3];
+    \\  mad.lo.s32 %r9,%r11,%r12,%r9;          // + label index * label stride
+    \\NOIXG:
     \\  mul.wide.u32 %rd4,%r4,4; add.s64 %rd5,%rd1,%rd4; add.s64 %rd6,%rd2,%rd4;
     \\  mul.wide.u32 %rd7,%r9,4; add.s64 %rd8,%rd3,%rd7;
     \\  ld.global.f32 %f1,[%rd5]; ld.global.f32 %f2,[%rd6]; ld.global.f32 %f3,[%rd8];
@@ -9131,6 +9219,446 @@ pub const copy_off_h16_ptx: [:0]const u8 =
     \\  cvta.to.global.u64 %rd1,%rd1; cvta.to.global.u64 %rd2,%rd2;
     \\  add.u32 %r8,%r4,%r7; mul.wide.u32 %rd3,%r8,2; add.s64 %rd4,%rd1,%rd3; ld.global.b16 %rs1,[%rd4];
     \\  add.u32 %r9,%r4,%r6; mul.wide.u32 %rd5,%r9,2; add.s64 %rd6,%rd2,%rd5; st.global.b16 [%rd6],%rs1;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+// --- 1-D convolution (MiniMax H3's BigVGAN audio VAE) ----------------------
+//
+// Signals here are CHANNEL-LAST `[len][ch]`, not the planar `[ch][len]` the CPU
+// reference uses. That is what makes every one of these kernels coalesced: a
+// warp covers consecutive channels at one time step, which is consecutive
+// memory. It also removes the transpose the CPU im2col path needs on both sides
+// of its GEMM. The conv weights are permuted to match at session build time; see
+// `minimax_h3_audio_cuda.Session`.
+
+/// im2col for a stride-1 dilated 1-D convolution over channel-last
+/// `[in_len][ci]`, producing `patch[out_len][k*ci]` so the conv is a GEMM.
+///
+/// Column order is `(tap, in_ch)`, NOT the `(in_ch, tap)` the PyTorch weight
+/// layout implies. That is deliberate: with the tap outer, consecutive columns
+/// are consecutive channels of one source sample, so a warp's loads coalesce.
+/// The weight is permuted once to `[out_ch][k][in_ch]` to match. Pairing the two
+/// orders the wrong way silently convolves each tap with the wrong channel.
+///
+/// Out of range is ZERO (the reference's convs are zero-padded; the replicate
+/// padding in this decoder belongs to the anti-aliased activation, which folds
+/// its own).
+/// b0=src, b1=patch. u0=out_len*plen, u1=plen(k*ci), u2=ci, u3=in_len,
+/// u4=dilation, u5=padding.
+pub const im2col1d_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry im2col1d(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<4>;
+    \\  .reg .b32 %r<24>;
+    \\  .reg .f32 %f<4>;
+    \\  .reg .b64 %rd<8>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1]; ld.param.u32 %r7,[u2]; ld.param.u32 %r8,[u3];
+    \\  ld.param.u32 %r9,[u4]; ld.param.u32 %r10,[u5];
+    \\  div.u32 %r11,%r4,%r6; rem.u32 %r12,%r4,%r6;        // t, col
+    \\  div.u32 %r13,%r12,%r7; rem.u32 %r14,%r12,%r7;      // tap, cc
+    \\  ld.param.f32 %f2,[f0]; cvt.rzi.u32.f32 %r17,%f2;   // stride, via the f slot
+    \\  ld.param.f32 %f3,[f1]; cvt.rzi.u32.f32 %r19,%f3;   // first output row of this band
+    \\  add.s32 %r11,%r11,%r19;
+    \\  mul.lo.s32 %r18,%r11,%r17;
+    \\  mad.lo.s32 %r15,%r13,%r9,%r18; sub.s32 %r15,%r15,%r10; // s = t*stride - pad + tap*dil
+    \\  mov.f32 %f1,0f00000000;
+    \\  setp.lt.s32 %p2,%r15,0; @%p2 bra STORE;
+    \\  setp.ge.s32 %p2,%r15,%r8; @%p2 bra STORE;
+    \\  mad.lo.s32 %r16,%r15,%r7,%r14;                      // s*ci + cc
+    \\  ld.param.u64 %rd1,[p0]; cvta.to.global.u64 %rd1,%rd1;
+    \\  mul.wide.s32 %rd2,%r16,4; add.s64 %rd3,%rd1,%rd2; ld.global.f32 %f1,[%rd3];
+    \\STORE:
+    \\  ld.param.u64 %rd4,[p1]; cvta.to.global.u64 %rd4,%rd4;
+    \\  mul.wide.u32 %rd5,%r4,4; add.s64 %rd6,%rd4,%rd5; st.global.f32 [%rd6],%f1;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// The first half of BigVGAN's anti-aliased activation, fused: replicate-pad,
+/// kaiser-sinc upsample x2, and SnakeBeta, over channel-last `[len][ch]`.
+///
+/// The reference is pad -> stride-2 transposed conv -> slice -> scale by the
+/// ratio -> snake. Written as a GATHER, all of that collapses into one pass with
+/// no intermediate: output `t` reads the transposed conv's position
+/// `P = t + pad_left`, whose contributing taps are exactly those with
+/// `j == P (mod 2)`, and the replicate padding becomes an index clamp.
+///
+/// Alpha and beta arrive ALREADY EXPONENTIATED, interleaved as
+/// `(exp(alpha), 1 / (exp(beta) + 1e-9))` per channel. The checkpoint stores them
+/// in log scale; doing the exp on the host keeps it out of the inner loop and out
+/// of `ex2.approx`.
+/// b0=src, b1=out, b2=filter[k], b3=snake params[2*ch].
+/// u0=2*len*ch, u1=ch, u2=len, u3=k, u4=pad, u5=pad_left.
+pub const aa_up_snake_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry aa_up_snake(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<8>;
+    \\  .reg .b32 %r<28>;
+    \\  .reg .f32 %f<12>;
+    \\  .reg .b64 %rd<16>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1]; ld.param.u32 %r7,[u2]; ld.param.u32 %r8,[u3];
+    \\  ld.param.u32 %r9,[u4]; ld.param.u32 %r10,[u5];
+    \\  ld.param.u64 %rd1,[p0]; cvta.to.global.u64 %rd1,%rd1;   // src
+    \\  ld.param.u64 %rd2,[p2]; cvta.to.global.u64 %rd2,%rd2;   // filter
+    \\  div.u32 %r11,%r4,%r6; rem.u32 %r12,%r4,%r6;             // t, c
+    \\  add.s32 %r13,%r11,%r10;                                 // P = t + pad_left
+    \\  and.b32 %r14,%r13,1;                                    // phase = P & 1
+    \\  shl.b32 %r15,%r9,1; add.s32 %r15,%r15,%r7;              // padded_len = len + 2*pad
+    \\  sub.s32 %r16,%r7,1;                                     // len - 1
+    \\  mov.f32 %f1,0f00000000;                                 // acc
+    \\  mov.u32 %r17,%r14;                                      // j = phase
+    \\LOOP:
+    \\  setp.ge.s32 %p2,%r17,%r8; @%p2 bra DONE;
+    \\  sub.s32 %r18,%r13,%r17;                                 // P - j
+    \\  setp.lt.s32 %p3,%r18,0; @%p3 bra NEXT;
+    \\  shr.s32 %r19,%r18,1;                                    // s = (P - j) / 2
+    \\  setp.ge.s32 %p4,%r19,%r15; @%p4 bra NEXT;
+    \\  sub.s32 %r20,%r19,%r9;                                  // sp = s - pad
+    \\  max.s32 %r20,%r20,0; min.s32 %r20,%r20,%r16;            // replicate clamp
+    \\  mad.lo.s32 %r21,%r20,%r6,%r12;                          // sp*ch + c
+    \\  mul.wide.s32 %rd3,%r21,4; add.s64 %rd4,%rd1,%rd3; ld.global.f32 %f2,[%rd4];
+    \\  mul.wide.s32 %rd5,%r17,4; add.s64 %rd6,%rd2,%rd5; ld.global.f32 %f3,[%rd6];
+    \\  fma.rn.f32 %f1,%f2,%f3,%f1;
+    \\NEXT:
+    \\  add.s32 %r17,%r17,2; bra LOOP;
+    \\DONE:
+    \\  add.f32 %f1,%f1,%f1;                                    // * ratio (2)
+    \\  ld.param.u64 %rd7,[p3]; cvta.to.global.u64 %rd7,%rd7;   // snake params
+    \\  shl.b32 %r22,%r12,1; mul.wide.u32 %rd8,%r22,4; add.s64 %rd9,%rd7,%rd8;
+    \\  ld.global.f32 %f4,[%rd9]; ld.global.f32 %f5,[%rd9+4];   // exp(a), 1/(exp(b)+eps)
+    \\  mul.f32 %f6,%f1,%f4; sin.approx.f32 %f7,%f6;
+    \\  mul.f32 %f8,%f7,%f7; fma.rn.f32 %f1,%f8,%f5,%f1;
+    \\  ld.param.u64 %rd10,[p1]; cvta.to.global.u64 %rd10,%rd10;
+    \\  mul.wide.u32 %rd11,%r4,4; add.s64 %rd12,%rd10,%rd11; st.global.f32 [%rd12],%f1;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// The second half: replicate-pad and kaiser-sinc downsample x2, channel-last.
+///
+/// The padding is ASYMMETRIC (`k/2 - 1` left for an even kernel, `k/2` right),
+/// which is what makes the round trip length-preserving; a symmetric guess shifts
+/// the whole signal by a sample, which is inaudible in a spectrum and wrong
+/// everywhere. Only the left constant is passed, since the right one never
+/// affects an in-range read.
+/// b0=up, b1=out, b2=filter[k]. u0=out_len*ch, u1=ch, u2=up_len, u3=k, u4=pad_left.
+pub const aa_down_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry aa_down(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<4>;
+    \\  .reg .b32 %r<20>;
+    \\  .reg .f32 %f<6>;
+    \\  .reg .b64 %rd<12>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1]; ld.param.u32 %r7,[u2]; ld.param.u32 %r8,[u3]; ld.param.u32 %r9,[u4];
+    \\  ld.param.u64 %rd1,[p0]; cvta.to.global.u64 %rd1,%rd1;
+    \\  ld.param.u64 %rd2,[p2]; cvta.to.global.u64 %rd2,%rd2;
+    \\  div.u32 %r10,%r4,%r6; rem.u32 %r11,%r4,%r6;         // t, c
+    \\  shl.b32 %r12,%r10,1; sub.s32 %r12,%r12,%r9;         // 2t - pad_left
+    \\  sub.s32 %r13,%r7,1;                                 // up_len - 1
+    \\  mov.f32 %f1,0f00000000;
+    \\  mov.u32 %r14,0;
+    \\LOOP:
+    \\  setp.ge.s32 %p2,%r14,%r8; @%p2 bra DONE;
+    \\  add.s32 %r15,%r12,%r14;                             // p = 2t - pad_left + j
+    \\  max.s32 %r15,%r15,0; min.s32 %r15,%r15,%r13;        // replicate clamp
+    \\  mad.lo.s32 %r16,%r15,%r6,%r11;                      // p*ch + c
+    \\  mul.wide.s32 %rd3,%r16,4; add.s64 %rd4,%rd1,%rd3; ld.global.f32 %f2,[%rd4];
+    \\  mul.wide.s32 %rd5,%r14,4; add.s64 %rd6,%rd2,%rd5; ld.global.f32 %f3,[%rd6];
+    \\  fma.rn.f32 %f1,%f2,%f3,%f1;
+    \\  add.s32 %r14,%r14,1; bra LOOP;
+    \\DONE:
+    \\  ld.param.u64 %rd7,[p1]; cvta.to.global.u64 %rd7,%rd7;
+    \\  mul.wide.u32 %rd8,%r4,4; add.s64 %rd9,%rd7,%rd8; st.global.f32 [%rd9],%f1;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// Ungrouped 1-D transposed convolution, channel-last, one thread per output.
+///
+/// Written as a gather rather than the reference's scatter: output `t` reads the
+/// transposed conv's position `P = t + pad`, and the taps that reach it are
+/// exactly `j == P (mod stride)`, so the inner loop is `k / stride` taps (2 for
+/// every stage of this vocoder) over `in_ch`. A scatter would need atomics.
+///
+/// The weight is permuted to `[k][in_ch][out_ch]` at session build time, so
+/// consecutive threads (consecutive `out_ch`) read consecutive weights and the
+/// activation load broadcasts across the warp. PyTorch stores it
+/// `[in_ch][out_ch][k]`.
+/// b0=x, b1=out, b2=w, b3=bias. u0=out_len*out_ch, u1=out_ch, u2=in_ch,
+/// u3=in_len, u4=k, u5=stride, f0=padding.
+pub const convt1d_ca_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry convt1d_ca(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<8>;
+    \\  .reg .b32 %r<32>;
+    \\  .reg .f32 %f<8>;
+    \\  .reg .b64 %rd<20>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1]; ld.param.u32 %r7,[u2]; ld.param.u32 %r8,[u3];
+    \\  ld.param.u32 %r9,[u4]; ld.param.u32 %r10,[u5];
+    \\  ld.param.f32 %f1,[f0]; cvt.rzi.s32.f32 %r11,%f1;        // padding
+    \\  ld.param.u64 %rd1,[p0]; cvta.to.global.u64 %rd1,%rd1;   // x
+    \\  ld.param.u64 %rd2,[p2]; cvta.to.global.u64 %rd2,%rd2;   // w
+    \\  div.u32 %r12,%r4,%r6; rem.u32 %r13,%r4,%r6;             // t, oc
+    \\  add.s32 %r14,%r12,%r11;                                 // P = t + pad
+    \\  rem.u32 %r15,%r14,%r10;                                 // phase = P % stride
+    \\  ld.param.u64 %rd3,[p3]; cvta.to.global.u64 %rd3,%rd3;   // bias
+    \\  mul.wide.u32 %rd4,%r13,4; add.s64 %rd5,%rd3,%rd4; ld.global.f32 %f2,[%rd5];
+    \\  mul.wide.u32 %rd14,%r6,4;                               // out_ch * 4, the w row stride
+    \\  mov.u32 %r16,%r15;                                      // j = phase
+    \\JLOOP:
+    \\  setp.ge.s32 %p2,%r16,%r9; @%p2 bra JDONE;
+    \\  sub.s32 %r17,%r14,%r16;                                 // P - j
+    \\  setp.lt.s32 %p3,%r17,0; @%p3 bra JNEXT;
+    \\  div.u32 %r18,%r17,%r10;                                 // s = (P - j) / stride
+    \\  setp.ge.s32 %p4,%r18,%r8; @%p4 bra JNEXT;
+    \\  mul.lo.s32 %r19,%r16,%r7; mad.lo.s32 %r19,%r19,%r6,%r13; // (j*in_ch)*out_ch + oc
+    \\  mul.lo.s32 %r20,%r18,%r7;                               // s*in_ch
+    \\  mul.wide.s32 %rd6,%r19,4; add.s64 %rd7,%rd2,%rd6;       // &w[...]
+    \\  mul.wide.s32 %rd8,%r20,4; add.s64 %rd9,%rd1,%rd8;       // &x[s*in_ch]
+    \\  mov.u32 %r21,0;
+    \\ILOOP:
+    \\  setp.ge.s32 %p5,%r21,%r7; @%p5 bra JNEXT;
+    \\  ld.global.f32 %f3,[%rd7]; ld.global.f32 %f4,[%rd9];
+    \\  fma.rn.f32 %f2,%f3,%f4,%f2;
+    \\  add.s64 %rd7,%rd7,%rd14;
+    \\  add.s64 %rd9,%rd9,4;
+    \\  add.s32 %r21,%r21,1; bra ILOOP;
+    \\JNEXT:
+    \\  add.s32 %r16,%r16,%r10; bra JLOOP;
+    \\JDONE:
+    \\  ld.param.u64 %rd11,[p1]; cvta.to.global.u64 %rd11,%rd11;
+    \\  mul.wide.u32 %rd12,%r4,4; add.s64 %rd13,%rd11,%rd12; st.global.f32 [%rd13],%f2;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// The ENCODER's `Snake1d`, channel-last and in place: `x += sin(a*x)^2 / (a+1e-9)`
+/// with `a = alpha[ch]` used as BOTH alpha and beta.
+///
+/// Not `aa_up_snake`'s activation: that one is `SnakeBeta`, whose two parameters are
+/// stored in LOG scale and pre-exponentiated on the host. This one's alpha is linear
+/// and does double duty, so it is passed through as it was stored.
+///
+/// b0 = x (in/out), b1 = alpha[ch]. u0 = total, u1 = ch.
+pub const snake1d_ca_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry snake1d_ca(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<2>;
+    \\  .reg .b32 %r<8>;
+    \\  .reg .f32 %f<8>;
+    \\  .reg .b64 %rd<8>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1]; rem.u32 %r7,%r4,%r6;        // ch
+    \\  ld.param.u64 %rd1,[p0]; cvta.to.global.u64 %rd1,%rd1;
+    \\  ld.param.u64 %rd2,[p1]; cvta.to.global.u64 %rd2,%rd2;
+    \\  mul.wide.u32 %rd3,%r4,4; add.s64 %rd4,%rd1,%rd3; ld.global.f32 %f1,[%rd4];
+    \\  mul.wide.u32 %rd5,%r7,4; add.s64 %rd6,%rd2,%rd5; ld.global.f32 %f2,[%rd6];
+    \\  mul.f32 %f3,%f2,%f1; sin.approx.f32 %f4,%f3;
+    \\  mov.f32 %f5,0f322BCC77;                            // 1e-9, the reference's guard
+    \\  add.f32 %f6,%f2,%f5; rcp.approx.f32 %f6,%f6;
+    \\  mul.f32 %f4,%f4,%f4; fma.rn.f32 %f7,%f4,%f6,%f1;
+    \\  st.global.f32 [%rd4],%f7;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// The posterior head's pooling: MEAN over attention heads, then
+/// `adaptive_avg_pool1d` along the FEATURE axis down to `out_dim`.
+///
+/// One kernel because both are linear, so the two divisions fold into one: bin `o`
+/// of row `r` is the mean of `src[r][h][i]` over every head `h` and every
+/// `i` in `[floor(o*hd/out), ceil((o+1)*hd/out))`. Pooling the TIME axis instead is
+/// the plausible misreading and produces a valid shape.
+///
+/// b0 = src `[rows][heads*hd]`, b1 = out `[rows][out_dim]`.
+/// u0 = rows*out_dim, u1 = out_dim, u2 = heads, u3 = hd.
+pub const mean_heads_pool_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry mean_heads_pool(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<4>;
+    \\  .reg .b32 %r<24>;
+    \\  .reg .f32 %f<8>;
+    \\  .reg .b64 %rd<12>;
+    \\  mov.u32 %r1,%ctaid.x; mov.u32 %r2,%ntid.x; mov.u32 %r3,%tid.x; mad.lo.s32 %r4,%r1,%r2,%r3;
+    \\  ld.param.u32 %r5,[u0]; setp.ge.u32 %p1,%r4,%r5; @%p1 bra END;
+    \\  ld.param.u32 %r6,[u1]; ld.param.u32 %r7,[u2]; ld.param.u32 %r8,[u3];
+    \\  div.u32 %r9,%r4,%r6; rem.u32 %r10,%r4,%r6;         // row, o
+    \\  mul.lo.s32 %r11,%r10,%r8; div.u32 %r11,%r11,%r6;   // start = o*hd/out
+    \\  add.s32 %r12,%r10,1; mul.lo.s32 %r12,%r12,%r8;
+    \\  add.s32 %r12,%r12,%r6; sub.s32 %r12,%r12,1; div.u32 %r12,%r12,%r6; // end = ceil((o+1)*hd/out)
+    \\  ld.param.u64 %rd1,[p0]; cvta.to.global.u64 %rd1,%rd1;
+    \\  mul.lo.s32 %r13,%r7,%r8; mul.lo.s32 %r13,%r13,%r9; // row base = row*heads*hd
+    \\  mov.f32 %f1,0f00000000;
+    \\  mov.u32 %r14,0;                                    // h
+    \\HLOOP:
+    \\  setp.ge.u32 %p2,%r14,%r7; @%p2 bra HDONE;
+    \\  mad.lo.s32 %r15,%r14,%r8,%r13;                     // + h*hd
+    \\  mov.u32 %r16,%r11;                                 // i = start
+    \\ILOOP:
+    \\  setp.ge.u32 %p3,%r16,%r12; @%p3 bra IDONE;
+    \\  add.s32 %r17,%r15,%r16; mul.wide.u32 %rd2,%r17,4;
+    \\  add.s64 %rd3,%rd1,%rd2; ld.global.f32 %f2,[%rd3]; add.f32 %f1,%f1,%f2;
+    \\  add.u32 %r16,%r16,1; bra ILOOP;
+    \\IDONE:
+    \\  add.u32 %r14,%r14,1; bra HLOOP;
+    \\HDONE:
+    \\  sub.s32 %r18,%r12,%r11; mul.lo.s32 %r18,%r18,%r7;  // (end-start)*heads
+    \\  cvt.rn.f32.u32 %f3,%r18; div.rn.f32 %f1,%f1,%f3;
+    \\  ld.param.u64 %rd4,[p1]; cvta.to.global.u64 %rd4,%rd4;
+    \\  mul.wide.u32 %rd5,%r4,4; add.s64 %rd6,%rd4,%rd5; st.global.f32 [%rd6],%f1;
+    \\END:
+    \\  ret;
+    \\}
+;
+
+/// Channel-last 3-D im2col with REFLECT spatial padding and CAUSAL temporal
+/// padding, banded: `patch[row][kt][kh][kw][in_ch]` from `src[t][h][w][in_ch]`.
+///
+/// Three things are folded in that would otherwise be separate passes:
+///
+///  - the temporal pad is `front` zero frames at the FRONT only, never the back,
+///    and a tap landing outside the input contributes nothing. That is one formula
+///    for both the multi-frame and the single-frame case; giving the latter its own
+///    length rule yields zero output frames.
+///  - the spatial pads are REFLECT (excluding the edge, unlike replicate) and
+///    ASYMMETRIC: `pad_lo` on the low side and whatever the output extent implies
+///    on the high side. `Downsample3D`'s `(0, 1, 0, 1)` pre-pad is exactly that, so
+///    it needs no pass of its own.
+///  - `t0` is the first output row of this band, so the patch matrix stays bounded
+///    however large the volume is.
+///
+/// The parameter list is too long for the launch's six u32 slots, so it arrives as
+/// a device u32[16] and is staged into shared memory once per block: read straight
+/// from global it would be 16 broadcast loads against the one useful coalesced one.
+///
+/// b0 = src, b1 = patch, b2 = params. u0 = rows * cols.
+/// params: cols, in_ch, kt, kh, kw, out_h, out_w, x_t, x_h, x_w, stride_t,
+///         stride_s, front, pad_h_lo, pad_w_lo, t0.
+pub const im2col3d_ptx: [:0]const u8 =
+    \\.version 8.0
+    \\.target sm_86
+    \\.address_size 64
+    \\.visible .entry im2col3d(.param .u64 p0,.param .u64 p1,.param .u64 p2,.param .u64 p3,
+    \\  .param .u32 u0,.param .u32 u1,.param .u32 u2,.param .u32 u3,.param .u32 u4,.param .u32 u5,.param .f32 f0,.param .f32 f1)
+    \\{
+    \\  .reg .pred %p<8>;
+    \\  .reg .b32 %r<48>;
+    \\  .reg .f32 %f<4>;
+    \\  .reg .b64 %rd<16>;
+    \\  .shared .align 4 .b8 prm[64];
+    \\  mov.u32 %r1,%tid.x; mov.u32 %r40,prm;
+    \\  setp.ge.u32 %p1,%r1,16; @%p1 bra STAGED;
+    \\  ld.param.u64 %rd1,[p2]; cvta.to.global.u64 %rd1,%rd1;
+    \\  mul.wide.u32 %rd2,%r1,4; add.s64 %rd3,%rd1,%rd2; ld.global.u32 %r2,[%rd3];
+    \\  shl.b32 %r3,%r1,2; add.u32 %r3,%r3,%r40; st.shared.u32 [%r3],%r2;
+    \\STAGED:
+    \\  bar.sync 0;
+    \\  mov.u32 %r4,%ctaid.x; mov.u32 %r5,%ntid.x; mad.lo.s32 %r6,%r4,%r5,%r1;
+    \\  ld.param.u32 %r7,[u0]; setp.ge.u32 %p1,%r6,%r7; @%p1 bra END;
+    \\  ld.shared.u32 %r8,[%r40+0];       // cols
+    \\  ld.shared.u32 %r9,[%r40+4];       // in_ch
+    \\  ld.shared.u32 %r10,[%r40+8];      // kt
+    \\  ld.shared.u32 %r11,[%r40+12];     // kh
+    \\  ld.shared.u32 %r12,[%r40+16];     // kw
+    \\  ld.shared.u32 %r13,[%r40+20];     // out_h
+    \\  ld.shared.u32 %r14,[%r40+24];     // out_w
+    \\  ld.shared.u32 %r15,[%r40+28];     // x_t
+    \\  ld.shared.u32 %r16,[%r40+32];     // x_h
+    \\  ld.shared.u32 %r17,[%r40+36];     // x_w
+    \\  ld.shared.u32 %r18,[%r40+40];     // stride_t
+    \\  ld.shared.u32 %r19,[%r40+44];     // stride_s
+    \\  ld.shared.u32 %r20,[%r40+48];     // front
+    \\  ld.shared.u32 %r21,[%r40+52];     // pad_h_lo
+    \\  ld.shared.u32 %r22,[%r40+56];     // pad_w_lo
+    \\  ld.shared.u32 %r23,[%r40+60];     // t0
+    \\  div.u32 %r24,%r6,%r8; rem.u32 %r25,%r6,%r8;        // band row, col
+    \\  add.s32 %r24,%r24,%r23;                            // absolute output row
+    \\  rem.u32 %r26,%r24,%r14;                            // ow
+    \\  div.u32 %r27,%r24,%r14; rem.u32 %r28,%r27,%r13;    // oh
+    \\  div.u32 %r29,%r27,%r13;                            // ot
+    \\  rem.u32 %r30,%r25,%r9;                             // ic
+    \\  div.u32 %r31,%r25,%r9;
+    \\  rem.u32 %r32,%r31,%r12;                            // kw index
+    \\  div.u32 %r31,%r31,%r12;
+    \\  rem.u32 %r33,%r31,%r11;                            // kh index
+    \\  div.u32 %r34,%r31,%r11;                            // kt index
+    \\  mov.f32 %f1,0f00000000;
+    \\  mad.lo.s32 %r35,%r29,%r18,%r34; sub.s32 %r35,%r35,%r20;  // p_t
+    \\  setp.lt.s32 %p2,%r35,0; @%p2 bra STORE;
+    \\  setp.ge.s32 %p2,%r35,%r15; @%p2 bra STORE;
+    \\  mad.lo.s32 %r36,%r28,%r19,%r33; sub.s32 %r36,%r36,%r21;  // h before reflect
+    \\  mov.u32 %r41,%r16;
+    \\RH:
+    \\  setp.eq.u32 %p3,%r41,1; @%p3 bra RH0;
+    \\  setp.lt.s32 %p3,%r36,0; @!%p3 bra RH1;
+    \\  sub.s32 %r36,0,%r36;
+    \\RH1:
+    \\  setp.ge.s32 %p3,%r36,%r41; @!%p3 bra RHD;
+    \\  sub.s32 %r42,%r41,1; shl.b32 %r42,%r42,1; sub.s32 %r36,%r42,%r36;
+    \\  bra RH;
+    \\RH0:
+    \\  mov.u32 %r36,0;
+    \\RHD:
+    \\  mad.lo.s32 %r37,%r26,%r19,%r32; sub.s32 %r37,%r37,%r22;  // w before reflect
+    \\  mov.u32 %r43,%r17;
+    \\RW:
+    \\  setp.eq.u32 %p4,%r43,1; @%p4 bra RW0;
+    \\  setp.lt.s32 %p4,%r37,0; @!%p4 bra RW1;
+    \\  sub.s32 %r37,0,%r37;
+    \\RW1:
+    \\  setp.ge.s32 %p4,%r37,%r43; @!%p4 bra RWD;
+    \\  sub.s32 %r44,%r43,1; shl.b32 %r44,%r44,1; sub.s32 %r37,%r44,%r37;
+    \\  bra RW;
+    \\RW0:
+    \\  mov.u32 %r37,0;
+    \\RWD:
+    \\  mad.lo.s32 %r38,%r35,%r16,%r36; mad.lo.s32 %r38,%r38,%r17,%r37;
+    \\  mad.lo.s32 %r38,%r38,%r9,%r30;                     // ((p_t*h + sh)*w + sw)*ic_n + ic
+    \\  ld.param.u64 %rd4,[p0]; cvta.to.global.u64 %rd4,%rd4;
+    \\  mul.wide.s32 %rd5,%r38,4; add.s64 %rd6,%rd4,%rd5; ld.global.f32 %f1,[%rd6];
+    \\STORE:
+    \\  ld.param.u64 %rd7,[p1]; cvta.to.global.u64 %rd7,%rd7;
+    \\  mul.wide.u32 %rd8,%r6,4; add.s64 %rd9,%rd7,%rd8; st.global.f32 [%rd9],%f1;
     \\END:
     \\  ret;
     \\}

@@ -23,6 +23,8 @@ pub const tokenizer = @import("tp_core").tokenizer;
 /// needs `Prompt` to reach `clip_text.TextEncoder.encodePrompt`.
 pub const clip_tokenizer = @import("tp_core").clip_tokenizer;
 pub const image = @import("tp_core").image;
+/// Waveform container I/O (WAV) and torchaudio-compatible rate conversion.
+pub const audio = @import("tp_core").audio;
 pub const models = @import("tp_models").models;
 pub const embed = @import("embed.zig");
 pub const sampler = @import("tp_core").sampler;

@@ -73,8 +73,44 @@ pub const zimage_cuda = @import("models/zimage_cuda.zig");
 pub const anima = @import("models/anima.zig");
 pub const anima_gpu = @import("models/anima_gpu.zig");
 pub const anima_cuda = @import("models/anima_cuda.zig");
+/// MiniMax H3, a joint audio-video DiT: video and stereo audio denoised in one
+/// packed token sequence, on two different sigma schedules. See VIDEO_PLAN.md.
+pub const minimax_h3 = @import("models/minimax_h3.zig");
+/// H3's video VAE decode side: a ViT3D over the latent grid, not a CNN.
+pub const minimax_h3_vae = @import("models/minimax_h3_vae.zig");
+/// H3's video VAE ENCODE side: a 3-D causal CNN, a different architecture from
+/// the ViT3D decoder it shares a checkpoint with. The gate on fl2va and ref2va.
+pub const minimax_h3_vae_encode = @import("models/minimax_h3_vae_encode.zig");
+pub const minimax_h3_vae_encode_cuda = @import("models/minimax_h3_vae_encode_cuda.zig");
+/// H3's vision tower: Qwen3-VL-32B's ViT with DeepStack. NOT `vit35.zig`, which
+/// is the same tower from llama.cpp's lineage and diverges in two conventions.
+pub const minimax_h3_vit = @import("models/minimax_h3_vit.zig");
+/// H3's prompt presentation: reference labels and spliced vision blocks, and the
+/// one place the tag / injection / mrope spans are derived from.
+pub const minimax_h3_present = @import("models/minimax_h3_present.zig");
+/// H3's audio VAE decode side: a BigVGAN vocoder, the only 1-D convolution here.
+pub const minimax_h3_audio = @import("models/minimax_h3_audio.zig");
+/// H3's audio VAE encode side: the DAC down-sampler that turns a reference
+/// soundtrack into `ref_audio` rows. Shares only `Conv1d` with the decode side.
+pub const minimax_h3_audio_encode = @import("models/minimax_h3_audio_encode.zig");
+pub const minimax_h3_audio_encode_cuda = @import("models/minimax_h3_audio_encode_cuda.zig");
+pub const minimax_h3_cuda = @import("models/minimax_h3_cuda.zig");
+pub const minimax_h3_vae_cuda = @import("models/minimax_h3_vae_cuda.zig");
+pub const minimax_h3_audio_cuda = @import("models/minimax_h3_audio_cuda.zig");
+/// Runtime low-rank sidecars (LoRA), applied beside a GEMM rather than merged
+/// into the weight. Architecture-independent: it keys on `Weight.tag`.
+pub const lora = @import("models/lora.zig");
+pub const lora_cuda = @import("models/lora_cuda.zig");
 
 test {
+    _ = lora;
+    _ = lora_cuda;
+    _ = minimax_h3_audio_cuda;
+    _ = minimax_h3_audio_encode_cuda;
+    _ = minimax_h3_vae_encode;
+    _ = minimax_h3_vae_encode_cuda;
+    _ = minimax_h3_vit;
+    _ = minimax_h3_present;
     _ = quant_weight;
     _ = loader;
     _ = clip_text;
@@ -136,6 +172,12 @@ test {
     _ = anima;
     _ = anima_gpu;
     _ = anima_cuda;
+    _ = minimax_h3;
+    _ = minimax_h3_vae;
+    _ = minimax_h3_audio;
+    _ = minimax_h3_audio_encode;
+    _ = minimax_h3_cuda;
+    _ = minimax_h3_vae_cuda;
     // Device test relocated out of the gpu backend (it needs both tp_gpu and a
     // model CPU reference); lives here in the model tier.
     _ = @import("models/vit35_gpu_test.zig");

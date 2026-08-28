@@ -93,6 +93,18 @@ fn wgemm(be: *Backend, y: Buf, x: Buf, m: usize, w: ops.matmul.Weight, co: usize
         return be.opMatmulQuant(w.dtype, y, x, m, w.bytes, co, k);
     }
     switch (w.dtype) {
+        // int8 convrot. The activation prep is a SEPARATE call (`wprep`) because
+        // one prep serves every GEMM reading the same activation, which is what
+        // lets q/k/v share one; see the note there.
+        //
+        // H3's 25600-wide `down_proj` is past what the prep can stage in shared, so
+        // it takes the prep's global-staging path; `supportsWeightsOn` no longer
+        // refuses on width.
+        .i8 => {
+            std.debug.assert(w.rows % 128 == 0);
+            std.debug.assert(w.rows == co and w.cols == k);
+            try be.opI8Gemm(y, w.bytes, w.row_scale orelse return error.UnsupportedDType, w.rows, false);
+        },
         .f8_e4m3 => try be.opMatmulFp8(y, x, m, w.bytes, w.scale, co, k),
         .bf16 => if (be.ctx.cc_major >= 8 and co % 128 == 0 and k % 32 == 0)
             try be.opGemmBf16(y, x, m, w.bytes, co, k, null)
@@ -104,6 +116,35 @@ fn wgemm(be: *Backend, y: Buf, x: Buf, m: usize, w: ops.matmul.Weight, co: usize
 }
 
 pub fn encode(enc: *const qwen3.TextEncoder, be: *Backend, io: std.Io, gpa: std.mem.Allocator, ids: []const u32, cancel: ?*std.atomic.Value(bool)) ![]f32 {
+    return encodeVision(enc, be, io, gpa, ids, .{}, cancel);
+}
+
+/// `encode` with a spliced vision payload: pre-embedded rows over the placeholder
+/// tokens, multimodal rope, and DeepStack features added at the image rows.
+///
+/// Three things the plain path does not do, and each is why H3's reference renders
+/// were forced to the CPU until this existed:
+///
+/// 1. **The block rows are pasted before the upload**, on the host, because the
+///    embedding gather already runs there.
+/// 2. **mrope replaces the 1-D rope table** -- and only when there are positions,
+///    matching the reference, which emits none without an image. The two tables have
+///    the same `[seq][half]` cos-then-sin shape, so nothing downstream changes.
+/// 3. ⚠️ **DeepStack needs no kernel.** An injection span is a CONTIGUOUS row run,
+///    so adding a feature to it is `opAdd` on an offset view of both buffers. A
+///    per-row kernel would be the obvious reach and buys nothing.
+///
+/// ⚠️ `l` indexes the LLM's layers, not the tower's: features are collected from
+/// deep ViT blocks and injected into the FIRST few decoder layers.
+pub fn encodeVision(
+    enc: *const qwen3.TextEncoder,
+    be: *Backend,
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    ids: []const u32,
+    vision: qwen3.TextEncoder.Vision,
+    cancel: ?*std.atomic.Value(bool),
+) ![]f32 {
     _ = io;
     const seq = ids.len;
     std.debug.assert(seq > 0);
@@ -126,7 +167,29 @@ pub fn encode(enc: *const qwen3.TextEncoder, be: *Backend, io: std.Io, gpa: std.
     const x = try gpa.alloc(f32, seq * hidden);
     defer gpa.free(x);
     try qwen3.embedTokens(enc.embed, ids, x);
-    var freqs = try ops.rope.rotateHalfFreqs(gpa, seq, hd, enc.cfg.rope_theta);
+
+    // Spliced vision blocks replace the placeholder tokens' embeddings. The ids
+    // under a block are real pad ids, so the gather above already succeeded.
+    for (vision.blocks) |b| {
+        if (b.rows.len % hidden != 0) return error.ShapeMismatch;
+        const n = b.rows.len / hidden;
+        if (b.at + n > seq) return error.ShapeMismatch;
+        @memcpy(x[b.at * hidden ..][0..b.rows.len], b.rows);
+    }
+    const inject_rows = vision.injectRows();
+    if (vision.deepstack.len > 0) {
+        if (inject_rows == 0) return error.ShapeMismatch;
+        for (vision.deepstack) |d| if (d.len != inject_rows * hidden) return error.ShapeMismatch;
+        for (vision.inject) |sp| if (sp.start + sp.len > seq) return error.ShapeMismatch;
+    }
+
+    // Multimodal rope only when there are images, matching the reference: without
+    // them it emits no position ids, and the plain 1-D sequence is not an
+    // approximation of mrope but the same thing when all three axes agree.
+    var freqs = if (vision.positions) |pos|
+        try ops.rope.mropeInterleavedFreqs(gpa, pos, seq, hd, vision.rope_dims, enc.cfg.rope_theta)
+    else
+        try ops.rope.rotateHalfFreqs(gpa, seq, hd, enc.cfg.rope_theta);
     defer freqs.deinit(gpa);
     const fp = try gpa.alloc(f32, 2 * seq * half);
     defer gpa.free(fp);
@@ -136,6 +199,24 @@ pub fn encode(enc: *const qwen3.TextEncoder, be: *Backend, io: std.Io, gpa: std.
 
     var bufs = try Bufs.init(be, c, seq, seq_pad, tap_count);
     defer bufs.deinit(be);
+
+    // The DeepStack features, one contiguous device buffer per LLM layer that takes
+    // one. Uploaded once, before the batch opens, so the host slices they come from
+    // do not have to outlive it.
+    var ds_d: []Buf = &.{};
+    var ds_done: usize = 0;
+    defer {
+        for (ds_d[0..ds_done]) |*b| be.tensorDestroy(b);
+        if (ds_d.len > 0) gpa.free(ds_d);
+    }
+    if (vision.deepstack.len > 0) {
+        ds_d = try gpa.alloc(Buf, vision.deepstack.len);
+        for (vision.deepstack, ds_d) |feat, *b| {
+            b.* = try be.tensorCreate(feat.len * 4);
+            ds_done += 1;
+            try be.tensorUpload(b.*, std.mem.sliceAsBytes(feat));
+        }
+    }
     var freqs_d = try be.tensorCreate(fp.len * 4);
     defer be.tensorDestroy(&freqs_d);
     try be.tensorUpload(freqs_d, std.mem.sliceAsBytes(fp));
@@ -182,6 +263,7 @@ pub fn encode(enc: *const qwen3.TextEncoder, be: *Backend, io: std.Io, gpa: std.
 
         // --- Attention ---
         try be.qkNorm(x_d, nd, try nbuf(be, layer.input_norm), seq, hidden, eps);
+        try wprep(be, nd, seq, hidden, layer.q);
         try wgemm(be, q_d, nd, seq, layer.q, q_dim, hidden);
         try wgemm(be, k_d, nd, seq, layer.k, kv_dim, hidden);
         try wgemm(be, v_d, nd, seq, layer.v, kv_dim, hidden);
@@ -190,16 +272,36 @@ pub fn encode(enc: *const qwen3.TextEncoder, be: *Backend, io: std.Io, gpa: std.
         try be.ropeHalf(q_d, freqs_d, seq, n_heads, half, sin_off, 0);
         try be.ropeHalf(k_d, freqs_d, seq, kv_heads, half, sin_off, 0);
         try be.attn(q_d, k_d, v_d, attn_d, seq, seq, n_heads, kv_heads, hd, attn_scale, true);
+        try wprep(be, attn_d, seq, q_dim, layer.o);
         try wgemm(be, t_d, attn_d, seq, layer.o, hidden, q_dim);
         try be.opAdd(x_d, t_d, seq * hidden);
 
         // --- MLP (SwiGLU) ---
         try be.qkNorm(x_d, nd, try nbuf(be, layer.post_norm), seq, hidden, eps);
+        try wprep(be, nd, seq, hidden, layer.gate);
         try wgemm(be, g_d, nd, seq, layer.gate, intermediate, hidden);
         try wgemm(be, u_d, nd, seq, layer.up, intermediate, hidden);
         try be.siluMul(g_d, u_d, seq * intermediate);
+        try wprep(be, g_d, seq, intermediate, layer.down);
         try wgemm(be, t_d, g_d, seq, layer.down, hidden, intermediate);
         try be.opAdd(x_d, t_d, seq * hidden);
+
+        // DeepStack, added at the image rows AFTER this layer. Each injection span
+        // is a contiguous row run in both the sequence and the feature, so the whole
+        // thing is one offset `opAdd` per span.
+        if (l < ds_d.len) {
+            var row: usize = 0;
+            for (vision.inject) |sp| {
+                const n = sp.len * hidden;
+                try be.opAdd(
+                    offsetBufSized(x_d, sp.start * hidden * 4, n * 4),
+                    offsetBufSized(ds_d[l], row * hidden * 4, n * 4),
+                    n,
+                );
+                row += sp.len;
+            }
+            std.debug.assert(row == inject_rows);
+        }
     }
     std.debug.assert(tap_idx == tap_count);
     try be.endBatch();
@@ -219,13 +321,90 @@ pub fn encode(enc: *const qwen3.TextEncoder, be: *Backend, io: std.Io, gpa: std.
     return out;
 }
 
+/// The activation prep an int8 weight needs; a no-op for every other dtype.
+///
+/// ⚠️ **The prep is BACKEND STATE, not a value.** One call serves every following
+/// `opI8Gemm` that reads the same activation, which is what lets q/k/v share one
+/// prep of the normed hidden state. Putting a second prep between a prep and its
+/// GEMM silently feeds the second activation to the first weight, with no error.
+///
+/// Every width here is a multiple of the 256-wide convrot group (H3's are 5120,
+/// 8192 and 25600), which `supportsWeights` is what checks.
+fn wprep(be: *Backend, x: Buf, m: usize, k: usize, w: ops.matmul.Weight) !void {
+    if (w.dtype == .i8) try be.opI8Prep(x, m, k, false);
+}
+
 /// Whether this backend's `encode` has a GEMM path for the encoder's weights.
 /// It calls `opMatmulFp8` unconditionally, so anything else would be read as fp8
 /// bytes and produce noise rather than an error. Exposed so the pipeline can fall
 /// back to the CPU encode instead of finding out from the image.
 pub fn supportsWeights(enc: *const qwen3.TextEncoder) bool {
+    return supportsWeightsOn(null, enc);
+}
+
+/// `supportsWeights` with the device in hand, which the int8 path needs: the
+/// activation prep's width ceiling is the GPU's shared-memory limit.
+pub fn supportsWeightsOn(be: ?*Backend, enc: *const qwen3.TextEncoder) bool {
     if (enc.layers.len == 0) return false;
     return switch (enc.layers[0].q.dtype) {
+        // int8 convrot, which is what MiniMax H3's conditioning encoder ships.
+        // Every projection must carry its per-ROW scale and the 256-wide rotation,
+        // and every reduction width must be a multiple of that group: the prep's
+        // FWHT works in 256-wide groups, and a width that is not a multiple leaves
+        // a row tail in the unrotated basis -- a wrong GEMM with no error.
+        .i8 => blk: {
+            const cols = [_]usize{ enc.cfg.hidden, enc.cfg.qDim(), enc.cfg.intermediate };
+            for (cols) |cc| if (cc % ops.convrot.group_size != 0) break :blk false;
+            // The prep stages the row in shared where it fits and in global memory
+            // where it does not, so width is no longer a support question -- only a
+            // slower prep past `i8PrepMaxSharedCols`, which H3's 25600-wide
+            // `down_proj` is (by exactly one convrot group on sm_86).
+            //
+            // ⚠️ **VRAM is the real gate, and it is MEASURED.** An int8 encoder whose
+            // weights do not fit re-uploads them per layer, and the cliff is brutal:
+            // on a 3090 the 27 GB H3 encoder runs 25 layers in 99 ms and 50 in
+            // 20840 ms, which is SLOWER than the 18384 ms CPU encode. Below the
+            // cliff it is ~90x. So the device path is taken only when the weights
+            // fit, and that is a property of the card, not of the checkpoint.
+            if (be) |b| {
+                var bytes: usize = 0;
+                for (enc.layers) |l| {
+                    inline for (.{ l.q, l.k, l.v, l.o, l.gate, l.up, l.down }) |w| bytes += w.bytes.len;
+                }
+                const mem = b.ctx.memGetInfo();
+                // Four fifths of what is free right now: the activations, the prep
+                // scratch and the global row staging all come out of the same pool.
+                const budget = mem.free / 5 * 4;
+                if (mem.free == 0 or bytes > budget) {
+                    std.log.warn(
+                        "qwen3 cuda: this int8 encoder's {d} MB of weights does not fit the {d} MB " ++
+                            "of free VRAM; encoding on the CPU, which is faster than re-uploading " ++
+                            "them per layer",
+                        .{ bytes >> 20, mem.free >> 20 },
+                    );
+                    break :blk false;
+                }
+                const shared_cols = b.i8PrepMaxSharedCols();
+                for (cols) |cc| if (cc > shared_cols) {
+                    std.log.info(
+                        "qwen3 cuda: the {d}-wide reduction stages its int8 prep in global " ++
+                            "memory ({d} columns is this device's shared limit)",
+                        .{ cc, shared_cols },
+                    );
+                    break;
+                };
+            }
+            for (enc.layers) |l| {
+                inline for (.{ l.q, l.k, l.v, l.o, l.gate, l.up, l.down }) |w| {
+                    if (w.dtype != .i8) break :blk false;
+                    if (w.row_scale == null) break :blk false;
+                    if (w.convrot != ops.convrot.group_size) break :blk false;
+                    // `opI8Gemm` launches `grid.y = rows / 128`.
+                    if (w.rows % 128 != 0) break :blk false;
+                }
+            }
+            break :blk true;
+        },
         .f8_e4m3 => true,
         // Native bf16 tensor cores are Ampere+; older cards take the f16 route,
         // which `wgemm` falls back to, so both are supported either way.

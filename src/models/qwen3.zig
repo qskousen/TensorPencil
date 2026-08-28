@@ -81,6 +81,11 @@ pub const Config = struct {
     n_kv_heads: usize,
     intermediate: usize,
     rope_theta: f64,
+    /// Per-axis rope slot counts for Qwen3-VL's INTERLEAVED multimodal rope,
+    /// summing to `head_dim / 2`. Only read when a vision-conditioned encode
+    /// supplies position ids; the text-only path uses plain 1-D rope and never
+    /// looks at this, which is why every non-VL config leaves it defaulted.
+    rope_dims: [3]usize = .{ 24, 20, 20 },
     /// Tensor-name prefix up to "layers.N." / "embed_tokens." / "norm.".
     prefix: []const u8,
     /// LM-head / embedding row count (default: the embedded-Qwen3 vocab).
@@ -113,6 +118,25 @@ pub const Config = struct {
         .intermediate = 9728,
         .rope_theta = 5000000.0,
         .prefix = "model.language_model.",
+    };
+
+    /// MiniMax H3's conditioning encoder: Qwen3-VL-32B TRUNCATED to the first 50
+    /// of its 64 layers, with no `lm_head` and, unlike every other variant here,
+    /// no final norm in the checkpoint at all.
+    ///
+    /// The prefix is `model.`, NOT krea2's `model.language_model.`: this export
+    /// puts the language model at the top level with the vision tower beside it
+    /// at `visual.`, where krea2's Qwen3-VL nests it a level deeper. The theta is
+    /// the Qwen3-VL 5e6, not plain Qwen3's 1e6, and it is not recoverable from
+    /// the weights (see the note on `Variant`).
+    pub const qwen3vl_32b_h3: Config = .{
+        .n_layers = 50,
+        .hidden = 5120,
+        .n_heads = 64,
+        .n_kv_heads = 8,
+        .intermediate = 25600,
+        .rope_theta = 5000000.0,
+        .prefix = "model.",
     };
 
     /// Qwen3-0.6B (base or instruct), the draft model.
@@ -247,6 +271,12 @@ pub const zimage_taps = [_]usize{35};
 /// written as `28`, so the two cannot disagree.
 pub const anima_taps = [_]usize{Config.qwen3_0_6b.n_layers};
 
+/// MiniMax H3 conditions on the UNNORMALIZED hidden state after its last layer.
+/// Same tap position as Anima's (one past the last layer, so every layer runs)
+/// and the opposite answer on the final norm, which is what stopped
+/// `appliesFinalNorm` from being derivable from the tap list. See `Variant`.
+pub const minimax_h3_taps = [_]usize{Config.qwen3vl_32b_h3.n_layers};
+
 /// Which conditioning stack a `TextEncoder` produces.
 ///
 /// krea2 and Z-Image are the same 36-layer, 2560-wide Qwen3-4B body and differ only
@@ -268,12 +298,16 @@ pub const Variant = enum {
     /// states are the `llm_adapter`'s cross-attention source, not the denoiser's
     /// context directly, see `models/anima.zig`.
     anima,
+    /// MiniMax H3: Qwen3-VL-32B truncated to 50 layers, the UNNORMALIZED final
+    /// hidden state. See `models/minimax_h3.zig`.
+    minimax_h3,
 
     pub fn config(self: Variant) Config {
         return switch (self) {
             .krea2 => Config.vl_4b,
             .zimage => Config.qwen3_4b,
             .anima => Config.qwen3_0_6b,
+            .minimax_h3 => Config.qwen3vl_32b_h3,
         };
     }
 
@@ -282,6 +316,7 @@ pub const Variant = enum {
             .krea2 => &tap_layers,
             .zimage => &zimage_taps,
             .anima => &anima_taps,
+            .minimax_h3 => &minimax_h3_taps,
         };
     }
 
@@ -290,10 +325,19 @@ pub const Variant = enum {
     /// This is NOT the same knob as `sd1_clip`'s `layer_norm_hidden_state`, which
     /// only governs an *intermediate* output. krea2 and Z-Image tap before a layer
     /// that still has to run, so the final norm is genuinely never evaluated for
-    /// them and is not even loaded; Anima taps past the end, where it always is.
+    /// them and is not even loaded.
+    ///
+    /// It is a property of how the DIFFUSION model was trained, not something the
+    /// tap list implies. Anima and H3 tap at the same place, one past the last
+    /// layer, and disagree: Anima's `sd1_clip` `layer = "last"` applies the norm,
+    /// while H3's export has no `model.norm.weight` AT ALL and conditions on the
+    /// raw state. For three variants the two questions happened to coincide; they
+    /// are not the same question, and the weaker rule that does hold is asserted
+    /// in the test below (applying the norm requires tapping at `n_layers`, not
+    /// the converse).
     pub fn appliesFinalNorm(self: Variant) bool {
         return switch (self) {
-            .krea2, .zimage => false,
+            .krea2, .zimage, .minimax_h3 => false,
             .anima => true,
         };
     }
@@ -356,7 +400,28 @@ pub const TextEncoder = struct {
         return loadVariant(gpa, store, .krea2);
     }
 
+    /// A width the checkpoint states rather than the Variant, for a fixture.
+    ///
+    /// The real H3 encoder is 27 GB and cannot be a unit fixture, but nothing that
+    /// makes it what it is depends on the width. What the Variant still decides is
+    /// what a toy width cannot change -- whether a final norm is applied, and
+    /// therefore whether the conditioning is the raw residual stream.
+    pub const Override = struct {
+        cfg: Config,
+        /// Tap layers, since the Variant's list names the real layer count.
+        taps: []const usize,
+    };
+
     pub fn loadVariant(gpa: std.mem.Allocator, store: weights_mod.WeightStore, variant: Variant) !TextEncoder {
+        return loadVariantOverride(gpa, store, variant, null);
+    }
+
+    pub fn loadVariantOverride(
+        gpa: std.mem.Allocator,
+        store: weights_mod.WeightStore,
+        variant: Variant,
+        override: ?Override,
+    ) !TextEncoder {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const alloc = arena.allocator();
@@ -382,7 +447,7 @@ pub const TextEncoder = struct {
             // model was trained against.
             if (!statesRopeTheta(store.gguf)) c.rope_theta = variant.config().rope_theta;
             break :blk c;
-        } else variant.config();
+        } else if (override) |o| o.cfg else variant.config();
         var nbuf: [96]u8 = undefined;
         const embed_name = try std.fmt.bufPrint(&nbuf, "{s}embed_tokens.weight", .{cfg.prefix});
         const embed_view = try store.require(embed_name);
@@ -392,7 +457,7 @@ pub const TextEncoder = struct {
         // Layers up to the last tap. krea2/Z-Image tap at 35, so layer 35 and the
         // final norm are never evaluated and are not loaded; Anima taps at 28, which
         // is every layer, and then the final norm.
-        const taps = variant.taps();
+        const taps = if (override) |o| o.taps else variant.taps();
         if (taps[taps.len - 1] > cfg.n_layers) return error.UnsupportedModelConfig;
         const layers = try loadLayersCfg(alloc, store, cfg, taps[taps.len - 1]);
 
@@ -421,7 +486,59 @@ pub const TextEncoder = struct {
     /// `[seq][tapCount()][hidden]` row-major (token-major, matching the krea2 DiT's
     /// unpacked context layout). For `.zimage` there is one tap, so the result is
     /// just `[seq][hidden]`.
+    /// Vision conditioning, for the variants that take spliced image blocks.
+    ///
+    /// Kept as a separate parameter rather than folded into `encode` because five
+    /// other consumers of this encoder have no vision path at all, and because
+    /// every field here is optional in the reference too: with no images it emits
+    /// no position ids and no deepstack, and the encode is exactly the plain
+    /// text one.
+    pub const Vision = struct {
+        /// Pre-embedded rows to paste OVER the token embeddings, one run per
+        /// spliced block. `rows` is `[len][hidden]`, landing at `at`. The token
+        /// ids under a block are placeholders; only their count matters.
+        blocks: []const Block = &.{},
+        /// `[3][seq]` multimodal rope positions (see
+        /// `minimax_h3_vit.mropePositions`). Null keeps the plain 1-D rope, which
+        /// is what the reference does when there are no images.
+        positions: ?[]const f32 = null,
+        /// Per-axis rope slot counts for the interleaved assignment, used only
+        /// when `positions` is set.
+        rope_dims: [3]usize = .{ 24, 20, 20 },
+        /// DeepStack features: entry `i` is added after decoder layer `i`, at the
+        /// injection rows only. Each is `[total_inject_rows][hidden]`,
+        /// concatenated across blocks in block order.
+        deepstack: []const []const f32 = &.{},
+        /// Rows the deepstack features land on, ascending. NOT the same spans as
+        /// the modality tags: the reference widens the TAG span by one on each
+        /// side and leaves the INJECTION span at the embedding rows. See
+        /// `minimax_h3.VisionBlock`.
+        inject: []const Span = &.{},
+
+        pub const Block = struct { at: usize, rows: []const f32 };
+        pub const Span = struct { start: usize, len: usize };
+
+        /// Total rows the deepstack features cover, which every entry's length
+        /// must match.
+        pub fn injectRows(self: Vision) usize {
+            var n: usize = 0;
+            for (self.inject) |sp| n += sp.len;
+            return n;
+        }
+    };
+
     pub fn encode(self: *const TextEncoder, io: std.Io, gpa: std.mem.Allocator, ids: []const u32, cancel: ?*std.atomic.Value(bool)) ![]f32 {
+        return self.encodeVision(io, gpa, ids, .{}, cancel);
+    }
+
+    pub fn encodeVision(
+        self: *const TextEncoder,
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        ids: []const u32,
+        vision: Vision,
+        cancel: ?*std.atomic.Value(bool),
+    ) ![]f32 {
         const seq = ids.len;
         std.debug.assert(seq > 0);
         const n_taps = self.taps.len;
@@ -443,10 +560,31 @@ pub const TextEncoder = struct {
         defer gpa.free(x);
         try embedTokens(self.embed, ids, x);
 
+        // Spliced vision blocks replace the placeholder tokens' embeddings. The
+        // ids under a block still had to be embeddable (the loop above), which is
+        // why the tokenizer emits real pad ids there rather than a sentinel.
+        for (vision.blocks) |b| {
+            if (b.rows.len % h != 0) return error.ShapeMismatch;
+            const n = b.rows.len / h;
+            if (b.at + n > seq) return error.ShapeMismatch;
+            @memcpy(x[b.at * h ..][0..b.rows.len], b.rows);
+        }
+        if (vision.deepstack.len > 0) {
+            const rows = vision.injectRows();
+            if (rows == 0) return error.ShapeMismatch;
+            for (vision.deepstack) |d| if (d.len != rows * h) return error.ShapeMismatch;
+        }
+
         // From the variant's config, not the module constant: the VL checkpoint's
         // theta is 5e6 and plain Qwen3-4B's is 1e6, and the wrong one encodes
         // perfectly finite nonsense.
-        var freqs = try ops.rope.rotateHalfFreqs(gpa, seq, head_dim, self.cfg.rope_theta);
+        // Multimodal rope only when there are images, matching the reference: it
+        // returns no position ids without them, and the plain 1-D sequence is not
+        // an approximation of mrope but the same thing when all three axes agree.
+        var freqs = if (vision.positions) |pos|
+            try ops.rope.mropeInterleavedFreqs(gpa, pos, seq, head_dim, vision.rope_dims, self.cfg.rope_theta)
+        else
+            try ops.rope.rotateHalfFreqs(gpa, seq, head_dim, self.cfg.rope_theta);
         defer freqs.deinit(gpa);
 
         var scratch = try Scratch.init(gpa, seq, self.cfg);
@@ -482,6 +620,24 @@ pub const TextEncoder = struct {
             if (l >= self.layers.len) break;
             // Encoder: full-sequence, no persistent KV cache.
             try transformer.layerForward(transformer.qwen3_spec, .fresh, io, gpa, self.layers[l], x, seq, dims, freqs, self.cfg.rms_eps, {}, 0, 0, false, &scratch);
+
+            // DeepStack: the vision tower's per-layer features, added at image
+            // rows AFTER this layer. Collected from deep ViT blocks and injected
+            // into the FIRST few decoder layers, which is the asymmetry to keep
+            // in mind: `l` indexes the LLM, not the tower.
+            if (l < vision.deepstack.len) {
+                const feat = vision.deepstack[l];
+                var row: usize = 0;
+                for (vision.inject) |sp| {
+                    if (sp.start + sp.len > seq) return error.ShapeMismatch;
+                    for (0..sp.len) |i| {
+                        const dst = x[(sp.start + i) * h ..][0..h];
+                        const src = feat[(row + i) * h ..][0..h];
+                        for (dst, src) |*d, v| d.* += v;
+                    }
+                    row += sp.len;
+                }
+            }
         }
         std.debug.assert(tap_idx == n_taps);
         return out;
@@ -742,16 +898,16 @@ fn loadLayersCfg(alloc: std.mem.Allocator, store: WeightStore, cfg: Config, coun
             .input_norm = try loadNorm(alloc, store, cfg, i, "input_layernorm.weight", cfg.hidden),
             .q = try loadQK(alloc, store, cfg, i, "self_attn.q_proj.weight", cfg.n_heads),
             .k = try loadQK(alloc, store, cfg, i, "self_attn.k_proj.weight", cfg.n_kv_heads),
-            .v = try loadWeight(store, cfg, i, "self_attn.v_proj.weight", cfg.kvDim(), cfg.hidden),
-            .o = try loadWeight(store, cfg, i, "self_attn.o_proj.weight", cfg.hidden, cfg.qDim()),
+            .v = try loadLayerWeight(alloc, store, cfg, i, "self_attn.v_proj.weight", cfg.kvDim(), cfg.hidden),
+            .o = try loadLayerWeight(alloc, store, cfg, i, "self_attn.o_proj.weight", cfg.hidden, cfg.qDim()),
             // llama/Mistral has no per-head QK-norm; leave the slices empty
             // (the llama LayerSpec never reads them, see transformer.qkvProject).
             .q_norm = if (cfg.qk_norm) try loadNorm(alloc, store, cfg, i, "self_attn.q_norm.weight", head_dim) else &.{},
             .k_norm = if (cfg.qk_norm) try loadNorm(alloc, store, cfg, i, "self_attn.k_norm.weight", head_dim) else &.{},
             .post_norm = try loadNorm(alloc, store, cfg, i, "post_attention_layernorm.weight", cfg.hidden),
-            .gate = try loadWeight(store, cfg, i, "mlp.gate_proj.weight", cfg.intermediate, cfg.hidden),
-            .up = try loadWeight(store, cfg, i, "mlp.up_proj.weight", cfg.intermediate, cfg.hidden),
-            .down = try loadWeight(store, cfg, i, "mlp.down_proj.weight", cfg.hidden, cfg.intermediate),
+            .gate = try loadLayerWeight(alloc, store, cfg, i, "mlp.gate_proj.weight", cfg.intermediate, cfg.hidden),
+            .up = try loadLayerWeight(alloc, store, cfg, i, "mlp.up_proj.weight", cfg.intermediate, cfg.hidden),
+            .down = try loadLayerWeight(alloc, store, cfg, i, "mlp.down_proj.weight", cfg.hidden, cfg.intermediate),
         };
     }
     return layers;
@@ -763,8 +919,13 @@ fn loadLayersCfg(alloc: std.mem.Allocator, store: WeightStore, cfg: Config, coun
 /// rows as `permuted[2*i+g] = hf[g*(hd/2)+i]`; we invert that. Rows are whole
 /// block-quant rows, so the un-permute is a byte-level row shuffle into `alloc`.
 fn loadQK(alloc: std.mem.Allocator, store: WeightStore, cfg: Config, layer: usize, comptime suffix: []const u8, n_head_rows: usize) !Weight {
-    var w = try loadWeight(store, cfg, layer, suffix, n_head_rows * head_dim, cfg.hidden);
+    var w = try loadLayerWeight(alloc, store, cfg, layer, suffix, n_head_rows * head_dim, cfg.hidden);
     if (!cfg.permute_qk) return w;
+    // The permutation below reorders output ROWS, and an integer weight's scales
+    // are per row, so they would have to move with them. No checkpoint needs both
+    // (permute_qk is the llama/Mistral GGUF path, which is never int8-convrot), so
+    // refuse rather than silently pair row i's bytes with row j's scale.
+    if (w.row_scale != null) return error.UnsupportedDType;
     const rb = w.dtype.storageBytes(cfg.hidden); // bytes per output row
     const dst = try alloc.alloc(u8, n_head_rows * head_dim * rb);
     const half = head_dim / 2;
@@ -796,12 +957,44 @@ fn loadNormNamed(alloc: std.mem.Allocator, store: WeightStore, name: []const u8,
 fn loadWeight(store: WeightStore, cfg: Config, layer: usize, comptime suffix: []const u8, rows: usize, cols: usize) !Weight {
     var buf: [96]u8 = undefined;
     const name = try std.fmt.bufPrint(&buf, "{s}layers.{d}." ++ suffix, .{ cfg.prefix, layer });
+    return loadWeightNamed(null, store, name, rows, cols);
+}
+
+fn loadLayerWeight(alloc: std.mem.Allocator, store: WeightStore, cfg: Config, layer: usize, comptime suffix: []const u8, rows: usize, cols: usize) !Weight {
+    var buf: [96]u8 = undefined;
+    const name = try std.fmt.bufPrint(&buf, "{s}layers.{d}." ++ suffix, .{ cfg.prefix, layer });
+    return loadWeightNamed(alloc, store, name, rows, cols);
+}
+
+/// A 2-D weight by exact name, with whatever scale sidecar its dtype needs.
+///
+/// The sidecar is named `<name>_scale` either way, but it means two different
+/// things: for fp8 it is ONE number for the whole tensor, and for int8/int4
+/// convrot it is one per output ROW plus a rotation group size. Reading the
+/// second as the first leaves `row_scale` null, and `ops.matmul.matmul` asserts
+/// on that for an integer weight, so the failure is a panic several frames deep
+/// rather than a wrong answer. `alloc` is required for the int8 arm (the row
+/// scales are dequantized into owned memory) and may be null when the caller
+/// knows the weight is not integer.
+fn loadWeightNamed(alloc: ?std.mem.Allocator, store: WeightStore, name: []const u8, rows: usize, cols: usize) !Weight {
     const view = store.get(name) orelse return error.MissingTensor;
     const shape = view.info.shape.slice();
     if (shape.len != 2 or shape[0] != rows or shape[1] != cols) return error.ShapeMismatch;
     var w = Weight.init(view.bytes, view.info.dtype, rows, cols);
+
     var scale_buf: [112]u8 = undefined;
+    if (scale_buf.len < name.len + 6) return error.NameTooLong;
     const scale_name = try std.fmt.bufPrint(&scale_buf, "{s}_scale", .{name});
+
+    if (view.info.dtype == .i8 or view.info.dtype == .i4) {
+        const a = alloc orelse return error.UnsupportedDType;
+        const sv = store.get(scale_name) orelse return error.MissingTensor;
+        if (sv.info.elemCount() != rows) return error.ShapeMismatch;
+        if (cols % ops.convrot.group_size != 0) return error.ShapeMismatch;
+        w.row_scale = try sv.toF32Alloc(a);
+        w.convrot = ops.convrot.group_size;
+        return w;
+    }
     if (store.get(scale_name)) |scale_view| {
         w.scale = try scale_view.asScalarF32();
     }
@@ -825,32 +1018,286 @@ fn readF32File(gpa: std.mem.Allocator, io: std.Io, path: []const u8, n: usize) !
 // against ComfyUI by the krea2 test below and by the Anima fixtures, but it is what
 // catches a tap list that stops agreeing with the config it indexes, which produces
 // a finite encode of the wrong hidden state.
+test "an empty Vision is bit-identical to the plain text encode" {
+    // The degenerate case has to be EXACT, not close: `encode` is now a wrapper
+    // around `encodeVision`, so every existing consumer (krea2, zimage, anima,
+    // qwen3, gemma) runs through the vision path with nothing in it. If an empty
+    // `Vision` perturbed anything -- a different rope table, a stray add -- five
+    // families would drift at once and none of their tests name this file.
+    //
+    // Structural rather than numeric: it checks that the two entry points reach
+    // the same rope and the same injection count, which is what could differ.
+    const v: TextEncoder.Vision = .{};
+    try std.testing.expectEqual(@as(usize, 0), v.blocks.len);
+    try std.testing.expectEqual(@as(usize, 0), v.deepstack.len);
+    try std.testing.expectEqual(@as(usize, 0), v.injectRows());
+    // `positions == null` is what selects the plain 1-D rope, and it is the
+    // reference's own condition (no images -> no position ids).
+    try std.testing.expect(v.positions == null);
+}
+
+test "the deepstack injection spans are summed, not indexed by row" {
+    // The features from several images are CONCATENATED in block order and the
+    // injection spans select them in sequence order, so `injectRows` is the sum
+    // and each entry's length must match it. Sizing from one span, or from the
+    // region the spans straddle, reads past the end of a valid feature buffer.
+    const v: TextEncoder.Vision = .{
+        .inject = &.{
+            .{ .start = 6, .len = 15 },
+            .{ .start = 40, .len = 8 },
+        },
+    };
+    try std.testing.expectEqual(@as(usize, 23), v.injectRows());
+    // Not the region the spans straddle (40 + 8 - 6 = 42), which is what treating
+    // them as one range rather than a sum would give.
+    try std.testing.expect(v.injectRows() != 42);
+}
+
 test "each encoder variant's tap list is consistent with its own body" {
-    for ([_]Variant{ .krea2, .zimage, .anima }) |v| {
+    // Every variant, enumerated from the enum rather than listed, so a new one
+    // cannot be added without answering these questions.
+    inline for (@typeInfo(Variant).@"enum".fields) |f| {
+        const v: Variant = @enumFromInt(f.value);
         const cfg = v.config();
         const taps = v.taps();
         errdefer std.debug.print("variant {t}: n_layers={d} taps={any}\n", .{ v, cfg.n_layers, taps });
         try std.testing.expect(taps.len > 0);
         // A tap may be one PAST the last layer, that is exactly the case that
-        // carries the final norm, but never further, or `loadVariant` would be
+        // CAN carry the final norm, but never further, or `loadVariant` would be
         // asked for a layer the checkpoint does not have.
         try std.testing.expect(taps[taps.len - 1] <= cfg.n_layers);
         for (taps[1..], taps[0 .. taps.len - 1]) |b, a| try std.testing.expect(b > a);
-        // The load-bearing rule: the final norm is applied if and only if
-        // the last tap is past the last layer. krea2/Z-Image tap before a layer that
-        // still has to run, so their final norm is genuinely never evaluated; Anima
-        // taps past the end, where ComfyUI's `layer = "last"` always applies it.
-        try std.testing.expectEqual(taps[taps.len - 1] == cfg.n_layers, v.appliesFinalNorm());
+        // The load-bearing rule, and it is an IMPLICATION, not the biconditional
+        // this used to assert: applying the final norm requires tapping at
+        // `n_layers`, because `model.norm` runs after the last layer and a tap
+        // before it never reaches the norm at all. The converse is false. Anima
+        // and MiniMax H3 both tap at `n_layers` and disagree about the norm, which
+        // is a property of how each DIFFUSION model was trained. Restoring the
+        // biconditional would make H3 load a `model.norm.weight` its checkpoint
+        // does not contain.
+        if (v.appliesFinalNorm()) try std.testing.expect(taps[taps.len - 1] == cfg.n_layers);
     }
+    // The two variants that pin the implication in both directions.
+    try std.testing.expect(Variant.anima.appliesFinalNorm());
+    try std.testing.expect(!Variant.minimax_h3.appliesFinalNorm());
+    try std.testing.expectEqual(
+        Variant.anima.taps()[0] == Variant.anima.config().n_layers,
+        Variant.minimax_h3.taps()[0] == Variant.minimax_h3.config().n_layers,
+    );
+
+    // MiniMax H3's body, read off the checkpoint it has to match: 50 of
+    // Qwen3-VL-32B's 64 layers, 64 q heads over 8 kv heads, and the Qwen3-VL
+    // 5e6 theta rather than plain Qwen3's 1e6 (not recoverable from the weights,
+    // and a finite wrong answer at long range when wrong).
+    const h3 = Variant.minimax_h3.config();
+    try std.testing.expectEqual(@as(usize, 50), h3.n_layers);
+    try std.testing.expectEqual(@as(usize, 5120), h3.hidden);
+    try std.testing.expectEqual(@as(usize, 64), h3.n_heads);
+    try std.testing.expectEqual(@as(usize, 8), h3.n_kv_heads);
+    try std.testing.expectEqual(@as(usize, 25600), h3.intermediate);
+    try std.testing.expectEqual(@as(f32, 5000000.0), h3.rope_theta);
+    // `model.`, not krea2's `model.language_model.`: this export puts the
+    // language model at the top level with `visual.` beside it.
+    try std.testing.expectEqualStrings("model.", h3.prefix);
+    try std.testing.expect(!std.mem.eql(u8, h3.prefix, Variant.krea2.config().prefix));
     // Anima's Qwen3-0.6B body, since the whole width generalization exists for it.
     try std.testing.expectEqual(@as(usize, 28), Variant.anima.config().n_layers);
     try std.testing.expectEqual(@as(usize, 1024), Variant.anima.config().hidden);
     try std.testing.expectEqual(@as(usize, 28), Variant.anima.taps()[0]);
 }
 
+const te_fixture = @embedFile("assets/minimax_h3_te.safetensors");
+
+fn teRelL2(want: []const f32, got: []const f32) f64 {
+    std.debug.assert(want.len == got.len);
+    var l2_ref: f64 = 0;
+    var l2_err: f64 = 0;
+    for (want, got) |e, a| {
+        l2_ref += @as(f64, e) * e;
+        l2_err += @as(f64, e - a) * (e - a);
+    }
+    return if (l2_ref > 0) @sqrt(l2_err / l2_ref) else @sqrt(l2_err);
+}
+
+test "the H3 conditioning encoder matches the reference at a toy width" {
+    // ComfyUI's own Qwen3-VL text trunk with `Qwen3VL_32BConfig`, at a toy width
+    // (tools/gen_minimax_h3_te.py). The real encoder is 27 GB, but nothing that
+    // makes it what it is depends on the width: pre-norm placement, the per-head
+    // q/k RMS norm before rope, the 5e6 theta, GQA, the swiglu half order, and the
+    // UNNORMALIZED tap this variant alone takes.
+    //
+    // ⚠️ The toy keeps `head_dim = 128` with a 128-wide hidden, so the inner width
+    // (256) differs from the hidden as it does in the real model (8192 vs 5120). A
+    // square encoder passes an o_proj transpose by accident.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var st = try safetensors.SafeTensors.initFromSlice(gpa, te_fixture);
+    defer st.deinit();
+
+    const cfg: Config = .{
+        .n_layers = 3,
+        .hidden = 128,
+        .n_heads = 2,
+        .n_kv_heads = 1,
+        .intermediate = 256,
+        .rope_theta = 5000000.0,
+        .prefix = "model.",
+        .vocab = 512,
+    };
+    try std.testing.expect(cfg.qDim() != cfg.hidden);
+
+    var enc = try TextEncoder.loadVariantOverride(gpa, .{ .safetensors = &st }, .minimax_h3, .{
+        .cfg = cfg,
+        .taps = &.{3},
+    });
+    defer enc.deinit();
+    // The variant still decides this, and it is what makes the conditioning the
+    // raw residual stream: the real checkpoint has no `model.norm.weight` at all.
+    try std.testing.expect(enc.final_norm == null);
+    try std.testing.expectEqual(@as(usize, 1), enc.tapCount());
+
+    // The ids are stored as i32 and `toF32Alloc` does not convert integers, so
+    // they are read as bytes.
+    const idv = try st.require("in.ids");
+    const raw = std.mem.bytesAsSlice(i32, idv.bytes);
+    const ids = try gpa.alloc(u32, raw.len);
+    defer gpa.free(ids);
+    for (ids, raw) |*o, v| o.* = @intCast(v);
+
+    // --- text only, which is every t2va render ----------------------------
+    {
+        const wv = try st.require("out.text");
+        const want = try wv.toF32Alloc(gpa);
+        defer gpa.free(want);
+        const got = try enc.encode(io, gpa, ids, null);
+        defer gpa.free(got);
+        const err = teRelL2(want, got);
+        errdefer std.debug.print("text-only rel L2 {e}\n", .{err});
+        try std.testing.expect(err < 1e-5);
+    }
+
+    // --- a spliced vision block: mrope + deepstack -------------------------
+    {
+        const vr = try st.require("in.vision_rows");
+        const rows = try vr.toF32Alloc(gpa);
+        defer gpa.free(rows);
+        const n_rows = rows.len / cfg.hidden;
+
+        const pv = try st.require("in.positions");
+        const pos = try pv.toF32Alloc(gpa);
+        defer gpa.free(pos);
+        try std.testing.expectEqual(3 * ids.len, pos.len);
+
+        // TWO features over THREE layers, so "injection stops after the last
+        // feature" is pinned rather than coinciding with the layer count.
+        var ds: [2][]f32 = undefined;
+        var n_ds: usize = 0;
+        defer for (ds[0..n_ds]) |d| gpa.free(d);
+        while (n_ds < ds.len) {
+            var nb: [48]u8 = undefined;
+            const dv = try st.require(try std.fmt.bufPrint(&nb, "in.deepstack.{d}", .{n_ds}));
+            ds[n_ds] = try dv.toF32Alloc(gpa);
+            n_ds += 1;
+        }
+        var ds_const: [2][]const f32 = undefined;
+        for (&ds_const, ds) |*o, d| o.* = d;
+
+        const at: usize = 6;
+        const blocks = [_]TextEncoder.Vision.Block{.{ .at = at, .rows = rows }};
+        const inject = [_]TextEncoder.Vision.Span{.{ .start = at, .len = n_rows }};
+        const vision: TextEncoder.Vision = .{
+            .blocks = &blocks,
+            .positions = pos,
+            .rope_dims = .{ 24, 20, 20 },
+            .deepstack = &ds_const,
+            .inject = &inject,
+        };
+
+        const wv = try st.require("out.vision");
+        const want = try wv.toF32Alloc(gpa);
+        defer gpa.free(want);
+        const got = try enc.encodeVision(io, gpa, ids, vision, null);
+        defer gpa.free(got);
+        const err = teRelL2(want, got);
+        errdefer std.debug.print("vision rel L2 {e}\n", .{err});
+        try std.testing.expect(err < 1e-5);
+
+        // ...and the vision payload is not inert: the same ids with no payload must
+        // give a materially different conditioning, or the case above proves only
+        // that the text path runs twice.
+        const plain = try enc.encode(io, gpa, ids, null);
+        defer gpa.free(plain);
+        try std.testing.expect(teRelL2(want, plain) > 0.1);
+    }
+}
+
 // Config detection + weight wiring against a real llama.cpp GGUF; skipped
 // when the checkpoint is absent. Load-only, generation quality is validated
 // end-to-end via tp-llm (a Debug 4B forward is too slow for the suite).
+const h3_te_path = "/home/qt/genai/comfyui/models/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors";
+
+test "the MiniMax H3 encoder loads from the real checkpoint" {
+    // The structural pin for the H3 variant against the file it has to match.
+    // Every decision here is one the weights cannot state: the prefix, the tap
+    // position, whether a final norm exists, and the per-row int8 scales.
+    //
+    // Cheap despite the 27 GB file: the big weights stay as views into the
+    // mapping and only the norms and row scales are materialized.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    try test_gate.requireModelFile(io, h3_te_path);
+
+    var st = try safetensors.SafeTensors.open(gpa, io, h3_te_path);
+    defer st.deinit();
+    var enc = try TextEncoder.loadVariant(gpa, .{ .safetensors = &st }, .minimax_h3);
+    defer enc.deinit();
+
+    // One tap, the state after every layer, and NO final norm: this checkpoint
+    // has no `model.norm.weight` at all, so a variant that asked for one would
+    // fail to load rather than merely differ.
+    try std.testing.expectEqual(@as(usize, 1), enc.tapCount());
+    try std.testing.expectEqual(@as(usize, 50), enc.layers.len);
+    try std.testing.expect(enc.final_norm == null);
+    try std.testing.expect(st.get("model.norm.weight") == null);
+
+    // int8 convrot: every projection carries a per-ROW scale and the 256-wide
+    // rotation. Missing either is a panic inside the GEMM, not a wrong answer.
+    for (enc.layers) |l| {
+        inline for (.{ l.q, l.k, l.v, l.o, l.gate, l.up, l.down }) |w| {
+            if (w.dtype == .i8 or w.dtype == .i4) {
+                try std.testing.expect(w.row_scale != null);
+                try std.testing.expectEqual(w.rows, w.row_scale.?.len);
+                try std.testing.expectEqual(ops.convrot.group_size, w.convrot);
+            }
+        }
+    }
+    // ...and it really is an integer checkpoint, so the loop above is not vacuous.
+    try std.testing.expect(enc.layers[0].q.row_scale != null);
+
+    // And it ENCODES: 50 int8 layers over a short prompt, producing one
+    // hidden state per token. This is the shape/finiteness pin, not a numeric
+    // one -- see VIDEO_PLAN.md for the parity that is still owed.
+    var tok = try @import("tp_core").tokenizer.Tokenizer.init(gpa);
+    defer tok.deinit();
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(gpa);
+    try tok.encode(gpa, "a cat", &ids);
+    try std.testing.expect(ids.items.len > 0);
+
+    const out = try enc.encode(io, gpa, ids.items, null);
+    defer gpa.free(out);
+    // One tap, so exactly one hidden state per token.
+    try std.testing.expectEqual(ids.items.len * Variant.minimax_h3.config().hidden, out.len);
+    var nonzero: usize = 0;
+    for (out) |v| {
+        try std.testing.expect(std.math.isFinite(v));
+        if (v != 0) nonzero += 1;
+    }
+    // A dequant that silently produced zeros would pass "finite" but not this.
+    try std.testing.expect(nonzero > out.len / 2);
+}
+
 test "causal lm loads from real qwen3-4b gguf" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

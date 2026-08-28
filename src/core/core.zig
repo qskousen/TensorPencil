@@ -43,6 +43,8 @@ pub const prompt_a1111 = @import("prompt_a1111.zig");
 pub const jinja = @import("jinja.zig");
 pub const unicode_tables = @import("unicode_tables.zig");
 pub const image = @import("image.zig");
+/// Waveform container I/O (WAV) and torchaudio-compatible rate conversion.
+pub const audio = @import("audio.zig");
 pub const kv_cache = @import("kv_cache.zig");
 pub const sample = @import("sample.zig");
 /// Diffusion sigma SCHEDULES (where the steps go), all nine ComfyUI schedulers.
@@ -74,6 +76,7 @@ test {
     _ = jinja;
     _ = unicode_tables;
     _ = image;
+    _ = audio;
     _ = kv_cache;
     _ = sample;
     _ = schedule;

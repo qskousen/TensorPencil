@@ -1044,7 +1044,19 @@ pub const PrepBlock = enum {
 /// Turning it off is only sound if BOTH sides skip it: the rotation is orthogonal and
 /// cancels between weight and activation, so dropping it from both is exact arithmetic,
 /// just a worse grid fit.
-pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: bool, block: PrepBlock, chunk: usize, rotate: bool) ![:0]u8 {
+/// FWHT butterfly iterations each of the 256 threads runs per pass, for a
+/// `cols`-wide activation row.
+///
+/// Rounded UP. Truncating here does not fail, it silently leaves the tail of
+/// every row in its UNROTATED basis, which is a wrong GEMM with no error and no
+/// assert; see the note at the call site. Exposed so the property can be tested
+/// without a device.
+pub fn prepButterflyIters(cols: usize) usize {
+    const nbut = (cols / 256) * 64;
+    return (nbut + 255) / 256;
+}
+
+pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: bool, block: PrepBlock, chunk: usize, rotate: bool, stage_global: bool) ![:0]u8 {
     const bq = block != .none; // a packed weight input, whatever its format
     std.debug.assert(bits == 8 or bits == 4);
     std.debug.assert(!bq or !in_f16);
@@ -1062,7 +1074,20 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: boo
     const elt_mask: u32 = (@as(u32, 1) << @intCast(bits)) - 1; // 0xFF / 0xF
     const maxq_hex: u32 = @bitCast(@as(f32, @floatFromInt(maxq))); // 127.0 / 7.0 bits
     const ngroups = work / 256;
-    const nbf = ngroups * 64 / 256; // butterflies/thread/pass (all 256 threads busy)
+    // Butterflies per FWHT pass, and how many each of the 256 threads takes,
+    // ROUNDED UP.
+    //
+    // This used to be `ngroups * 64 / 256`, which truncates whenever `ngroups`
+    // is not a multiple of 4, i.e. whenever `cols % 1024 != 0`. The rotation
+    // then covered only part of the row and the rest kept its unrotated basis:
+    // no error, no assert, just a wrong GEMM. MiniMax H3's 5376-wide hidden is
+    // 21 groups, which gave 5 butterflies where 5.25 were needed and a 22%
+    // relative error on every linear reading that width. Every previously
+    // working width has `nbut % 256 == 0`, so their kernels are unchanged
+    // apart from one predicated branch.
+    const nbut = ngroups * 64;
+    const nbf = prepButterflyIters(work);
+    const guard_bf = nbut % 256 != 0;
     const load_iters = work / 256;
     // Packed u32 output words for the whole row, and how many each of the 256 threads
     // takes. Writing it as `cols / (per_word * 256)` truncates to ZERO and silently
@@ -1080,14 +1105,34 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: boo
     // every case that worked before) the guard is always true, so those kernels are
     // unchanged instruction-for-instruction apart from one predicated branch.
     const guard_words = total_words % 256 != 0;
-    // The FWHT below gives each thread `nbf` butterflies per pass and has the same
-    // truncation hazard: `nbf` is `cols / 1024`, so anything narrower than one full
-    // rotation group per thread would silently skip the rotation entirely. No linear here
-    // is that narrow (the smallest is cross-attention's 1024), and a wrong basis is not
-    // something to guess at, so refuse rather than emit a kernel that does not rotate.
+    // A row with no whole rotation group cannot be rotated at all, and a wrong
+    // basis is not something to guess at: refuse rather than emit a kernel that
+    // silently does not rotate.
     if (nbf == 0) return error.UnsupportedWidth;
-    const SMAX_OFF = work * 4; // smax[256] f32 region
+    // ⚠️ **Where the row is staged.** Normally in dynamic SHARED memory, which caps
+    // the reduction width at the device's opt-in shared limit: `work * 4` bytes plus
+    // 1280 for the scratch, i.e. 25024 columns on sm_86. MiniMax H3's conditioning
+    // encoder has a 25600-wide `down_proj` and misses by exactly one 256-wide
+    // convrot group, and no kernel can stage 25600 f32 in 101376 bytes.
+    //
+    // With `stage_global` the row lives in a caller-supplied GLOBAL buffer instead
+    // and only the 1280-byte scratch stays in shared. Same algorithm, same
+    // arithmetic, same instruction ORDER -- the only difference is the address space
+    // of the row accesses and the width of the registers holding their addresses.
+    // Slower (the FWHT's four passes go to L2 rather than shared), and that is fine:
+    // the prep is a small fraction of a GEMM and this path only exists for widths
+    // that otherwise cannot run at all.
+    //
+    // Chunking is block-quant-only and those widths are small, so the two never
+    // combine; asserting it keeps the (row, chunk) split out of the global
+    // addressing below.
+    std.debug.assert(!(stage_global and chunk != 0));
+    const SMAX_OFF = if (stage_global) 0 else work * 4; // smax[256] f32 region
     const SCALE_OFF = SMAX_OFF + 256 * 4; // scale broadcast slot
+    // Row accesses: shared with 32-bit addresses, or global with 64-bit ones.
+    const row_ld = if (stage_global) "ld.global.f32" else "ld.shared.f32";
+    const row_st = if (stage_global) "st.global.f32" else "st.shared.f32";
+    const row_rc: ptx.RegClass = if (stage_global) .b64 else .b32;
 
     var b = ptx.Builder.init(alloc);
     defer b.deinit();
@@ -1101,6 +1146,11 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: boo
     try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_x, rd_x });
     try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_q, rd_q });
     try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_s, rd_s });
+    const rd_rot = if (stage_global) try b.reg(.b64) else "";
+    if (stage_global) {
+        try b.linef("ld.param.u64 {s}, [p_rot];", .{rd_rot});
+        try b.linef("cvta.to.global.u64 {s}, {s};", .{ rd_rot, rd_rot });
+    }
 
     const r_t = try b.reg(.b32);
     const r_row = try b.reg(.b32);
@@ -1129,11 +1179,23 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: boo
     }
 
     // ---- load x[row] -> shared f32 (rotation runs in f32 regardless of input) ----
-    const r_sh = try b.reg(.b32); // smem + t*4
+    // The row's per-thread base: `smem + t*4`, or `p_rot + row*work*4 + t*4`.
+    const r_sh = try b.reg(row_rc);
     const rd_g = try b.reg(.b64);
     const r_ftmp = try b.reg(.f32);
-    try b.linef("shl.b32 {s}, {s}, 2;", .{ r_sh, r_t });
-    try b.linef("add.u32 {s}, {s}, {s};", .{ r_sh, r_sh, r_smem });
+    // The row's own base, which the FWHT and quantize bases below are relative to.
+    // A register of its own rather than reusing `rd_g`, which the block-quant load
+    // branches take for the packed input pointer.
+    const rd_rowbase = if (stage_global) try b.reg(.b64) else "";
+    if (stage_global) {
+        try b.linef("mul.wide.u32 {s}, {s}, {d};", .{ rd_rowbase, r_row, work * 4 });
+        try b.linef("add.s64 {s}, {s}, {s};", .{ rd_rowbase, rd_rot, rd_rowbase });
+        try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ r_sh, r_t });
+        try b.linef("add.s64 {s}, {s}, {s};", .{ r_sh, rd_rowbase, r_sh });
+    } else {
+        try b.linef("shl.b32 {s}, {s}, 2;", .{ r_sh, r_t });
+        try b.linef("add.u32 {s}, {s}, {s};", .{ r_sh, r_sh, r_smem });
+    }
     if (block == .q8_0) {
         // A 256-column group is 8 blocks of 34 B. Thread `t` reads element `t` of every
         // group, so its block (t/32) and its element in that block (t%32) are constants:
@@ -1324,7 +1386,7 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: boo
             } else {
                 try b.linef("ld.global.f32 {s}, [{s}+{d}];", .{ r_ftmp, rd_g, i * 256 * 4 });
             }
-            try b.linef("st.shared.f32 [{s}+{d}], {s};", .{ r_sh, i * 256 * 4, r_ftmp });
+            try b.linef("{s} [{s}+{d}], {s};", .{ row_st, r_sh, i * 256 * 4, r_ftmp });
         }
     }
     }
@@ -1337,7 +1399,7 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: boo
     const r_grp = try b.reg(.b32);
     const r_bw = try b.reg(.b32);
     const r_p = try b.reg(.b32);
-    const r_sha = try b.reg(.b32); // smem + p*4
+    const r_sha = try b.reg(row_rc); // the butterfly base: smem + p*4, or rowbase + p*4
     const fa = try b.reg(.f32);
     const fb = try b.reg(.f32);
     const fc = try b.reg(.f32);
@@ -1349,6 +1411,14 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: boo
         var bi: usize = 0;
         while (bi < nbf) : (bi += 1) {
             try b.linef("add.u32 {s}, {s}, {d};", .{ r_bidx, r_t, bi * 256 });
+            // Threads past the butterfly count must not touch shared memory:
+            // their `p` would index another group's data and corrupt it.
+            const lbl_bsk = if (guard_bf) try b.newLabel("bsk") else "";
+            if (guard_bf) {
+                const p_b = try b.reg(.pred);
+                try b.linef("setp.ge.u32 {s}, {s}, {d};", .{ p_b, r_bidx, nbut });
+                try b.linef("@{s} bra {s};", .{ p_b, lbl_bsk });
+            }
             try b.linef("shr.u32 {s}, {s}, 6;", .{ r_grp, r_bidx }); // group
             try b.linef("and.b32 {s}, {s}, 63;", .{ r_bw, r_bidx }); // bwithin
             // p_in = (bw>>logs)<<(logs+2) + (bw & (s-1))
@@ -1363,34 +1433,42 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: boo
             // p += group*256
             try b.linef("shl.b32 {s}, {s}, 8;", .{ r_grp, r_grp });
             try b.linef("add.u32 {s}, {s}, {s};", .{ r_p, r_p, r_grp });
-            // sha = smem + p*4
-            try b.linef("shl.b32 {s}, {s}, 2;", .{ r_sha, r_p });
-            try b.linef("add.u32 {s}, {s}, {s};", .{ r_sha, r_sha, r_smem });
+            // sha = smem + p*4, or rowbase + p*4
+            if (stage_global) {
+                try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ r_sha, r_p });
+                try b.linef("add.s64 {s}, {s}, {s};", .{ r_sha, rd_rowbase, r_sha });
+            } else {
+                try b.linef("shl.b32 {s}, {s}, 2;", .{ r_sha, r_p });
+                try b.linef("add.u32 {s}, {s}, {s};", .{ r_sha, r_sha, r_smem });
+            }
             // load a,b,c,d at sha, +s*4, +2s*4, +3s*4
-            try b.linef("ld.shared.f32 {s}, [{s}];", .{ fa, r_sha });
-            try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ fb, r_sha, s * 4 });
-            try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ fc, r_sha, s * 8 });
-            try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ fd, r_sha, s * 12 });
+            try b.linef("{s} {s}, [{s}];", .{ row_ld, fa, r_sha });
+            try b.linef("{s} {s}, [{s}+{d}];", .{ row_ld, fb, r_sha, s * 4 });
+            try b.linef("{s} {s}, [{s}+{d}];", .{ row_ld, fc, r_sha, s * 8 });
+            try b.linef("{s} {s}, [{s}+{d}];", .{ row_ld, fd, r_sha, s * 12 });
             // out0 = a+b+c-d
             try b.linef("add.f32 {s}, {s}, {s};", .{ fo, fa, fb });
             try b.linef("add.f32 {s}, {s}, {s};", .{ fo, fo, fc });
             try b.linef("sub.f32 {s}, {s}, {s};", .{ fo, fo, fd });
-            try b.linef("st.shared.f32 [{s}], {s};", .{ r_sha, fo });
+            try b.linef("{s} [{s}], {s};", .{ row_st, r_sha, fo });
             // out1 = a+b-c+d
             try b.linef("add.f32 {s}, {s}, {s};", .{ fo, fa, fb });
             try b.linef("sub.f32 {s}, {s}, {s};", .{ fo, fo, fc });
             try b.linef("add.f32 {s}, {s}, {s};", .{ fo, fo, fd });
-            try b.linef("st.shared.f32 [{s}+{d}], {s};", .{ r_sha, s * 4, fo });
+            try b.linef("{s} [{s}+{d}], {s};", .{ row_st, r_sha, s * 4, fo });
             // out2 = a-b+c+d
             try b.linef("sub.f32 {s}, {s}, {s};", .{ fo, fa, fb });
             try b.linef("add.f32 {s}, {s}, {s};", .{ fo, fo, fc });
             try b.linef("add.f32 {s}, {s}, {s};", .{ fo, fo, fd });
-            try b.linef("st.shared.f32 [{s}+{d}], {s};", .{ r_sha, s * 8, fo });
+            try b.linef("{s} [{s}+{d}], {s};", .{ row_st, r_sha, s * 8, fo });
             // out3 = -a+b+c+d  = (b+c+d) - a
             try b.linef("add.f32 {s}, {s}, {s};", .{ fo, fb, fc });
             try b.linef("add.f32 {s}, {s}, {s};", .{ fo, fo, fd });
             try b.linef("sub.f32 {s}, {s}, {s};", .{ fo, fo, fa });
-            try b.linef("st.shared.f32 [{s}+{d}], {s};", .{ r_sha, s * 12, fo });
+            try b.linef("{s} [{s}+{d}], {s};", .{ row_st, r_sha, s * 12, fo });
+            // The skipped threads rejoin HERE, before the barrier: a `bar.sync`
+            // that only some threads of a block reach is undefined.
+            if (guard_bf) try b.label(lbl_bsk);
         }
         try b.line("bar.sync 0;");
     }
@@ -1406,10 +1484,10 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: boo
         {
             var i: usize = 0;
             while (i < load_iters) : (i += 1) {
-                try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ fo, r_sh, i * 256 * 4 });
+                try b.linef("{s} {s}, [{s}+{d}];", .{ row_ld, fo, r_sh, i * 256 * 4 });
                 // The 1/16 is the FWHT's gain, so it only applies when it ran.
                 if (rotate) try b.linef("mul.f32 {s}, {s}, 0f3D800000;", .{ fo, fo });
-                try b.linef("st.shared.f32 [{s}+{d}], {s};", .{ r_sh, i * 256 * 4, fo });
+                try b.linef("{s} [{s}+{d}], {s};", .{ row_st, r_sh, i * 256 * 4, fo });
                 try b.linef("abs.f32 {s}, {s};", .{ fav, fo });
                 try b.linef("max.f32 {s}, {s}, {s};", .{ famax, famax, fav });
             }
@@ -1475,7 +1553,7 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: boo
     const fh = try b.reg(.f32);
     const rd_qrow = try b.reg(.b64);
     const r_ecol = try b.reg(.b32);
-    const r_esha = try b.reg(.b32);
+    const r_esha = try b.reg(row_rc);
     // scale broadcast
     try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ fsc, r_smem, SCALE_OFF });
     // q row base = p_q + row*(cols/per_word)*4 bytes  (= row*cols for s8, row*cols/2 for s4)
@@ -1500,11 +1578,16 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: boo
             try b.linef("mov.u32 {s}, 0;", .{r_out});
             // element base col = word*per_word ; shared byte = smem + col*4
             try b.linef("shl.b32 {s}, {s}, {d};", .{ r_ecol, r_word, per_word_log2 });
-            try b.linef("shl.b32 {s}, {s}, 2;", .{ r_esha, r_ecol }); // byte = col*4
-            try b.linef("add.u32 {s}, {s}, {s};", .{ r_esha, r_esha, r_smem });
+            if (stage_global) {
+                try b.linef("mul.wide.u32 {s}, {s}, 4;", .{ r_esha, r_ecol }); // byte = col*4
+                try b.linef("add.s64 {s}, {s}, {s};", .{ r_esha, rd_rowbase, r_esha });
+            } else {
+                try b.linef("shl.b32 {s}, {s}, 2;", .{ r_esha, r_ecol }); // byte = col*4
+                try b.linef("add.u32 {s}, {s}, {s};", .{ r_esha, r_esha, r_smem });
+            }
             var kk: usize = 0;
             while (kk < per_word) : (kk += 1) {
-                try b.linef("ld.shared.f32 {s}, [{s}+{d}];", .{ fv, r_esha, kk * 4 });
+                try b.linef("{s} {s}, [{s}+{d}];", .{ row_ld, fv, r_esha, kk * 4 });
                 try b.linef("div.rn.f32 {s}, {s}, {s};", .{ fr, fv, fsc });
                 try b.linef("copysign.f32 {s}, {s}, 0f3F000000;", .{ fh, fr }); // copysign(0.5, r)
                 try b.linef("add.f32 {s}, {s}, {s};", .{ fr, fr, fh });
@@ -1533,15 +1616,26 @@ pub fn buildPrep(alloc: std.mem.Allocator, cols: usize, bits: usize, in_f16: boo
         else if (bq)
             (if (bits == 4) (if (rotate) "bqprep4" else "bqprep4_nr") else if (rotate) "bqprep" else "bqprep_nr")
         else if (bits == 8) (if (rotate) "iprep" else "iprep_nr") else "i4prep",
-        "    .param .u64 p_x,\n    .param .u64 p_q,\n    .param .u64 p_s",
+        if (stage_global)
+            "    .param .u64 p_x,\n    .param .u64 p_q,\n    .param .u64 p_s,\n    .param .u64 p_rot"
+        else
+            "    .param .u64 p_x,\n    .param .u64 p_q,\n    .param .u64 p_s",
         ".extern .shared .align 16 .b8 smem[];",
     );
 }
 
 /// dynamic-shared byte requirement for a prep launch (bit-width-independent:
 /// the FWHT runs on the f32 activations in shared regardless of output bits).
-pub fn prepSharedBytes(cols: usize) usize {
-    return cols * 4 + 256 * 4 + 256;
+pub fn prepSharedBytes(cols: usize, stage_global: bool) usize {
+    // With the row in global memory only the 256-float abs-max reduction and the
+    // one-slot scale broadcast stay in shared, so the width stops mattering.
+    return (if (stage_global) 0 else cols * 4) + 256 * 4 + 256;
+}
+
+/// Whether a `cols`-wide prep has to stage its row in global memory, given the
+/// device's opt-in dynamic-shared limit.
+pub fn prepNeedsGlobalStage(cols: usize, shared_limit: usize) bool {
+    return prepSharedBytes(cols, false) > shared_limit;
 }
 
 /// int8 rescale: y[i][j] = f32(acc_s32[i][j]) * act_scale[i] * weight_scale[j].
@@ -2809,12 +2903,12 @@ pub fn i4LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         const rows = c.rows;
         const cols = c.cols;
 
-        const prep_ptx = try buildPrep(gpa, cols, 4, false, .none, 0, true);
+        const prep_ptx = try buildPrep(gpa, cols, 4, false, .none, 0, true, false);
         defer gpa.free(prep_ptx);
         var pmod = try ctx.loadModule(prep_ptx);
         defer pmod.unload(ctx);
         const f_prep = try pmod.getFunction(ctx, "i4prep");
-        const shb = prepSharedBytes(cols);
+        const shb = prepSharedBytes(cols, false);
         try ctx.setMaxDynamicShared(f_prep, shb);
 
         const xf = try gpa.alloc(f32, m * cols);
@@ -2956,12 +3050,12 @@ pub fn i8LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         const rows = c.rows;
         const cols = c.cols;
 
-        const prep_ptx = try buildPrep(gpa, cols, 8, false, .none, 0, true);
+        const prep_ptx = try buildPrep(gpa, cols, 8, false, .none, 0, true, false);
         defer gpa.free(prep_ptx);
         var pmod = try ctx.loadModule(prep_ptx);
         defer pmod.unload(ctx);
         const f_prep = try pmod.getFunction(ctx, "iprep");
-        const shb = prepSharedBytes(cols);
+        const shb = prepSharedBytes(cols, false);
         try ctx.setMaxDynamicShared(f_prep, shb);
 
         const xf = try gpa.alloc(f32, m * cols);
@@ -3101,12 +3195,12 @@ pub fn i8LinearTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         const m = c.m;
         const rows = c.rows;
         const cols = c.cols;
-        const prep_ptx = try buildPrep(gpa, cols, 8, false, .none, 0, true);
+        const prep_ptx = try buildPrep(gpa, cols, 8, false, .none, 0, true, false);
         defer gpa.free(prep_ptx);
         var pmod = try ctx.loadModule(prep_ptx);
         defer pmod.unload(ctx);
         const f_prep = try pmod.getFunction(ctx, "iprep");
-        const shb = prepSharedBytes(cols);
+        const shb = prepSharedBytes(cols, false);
         try ctx.setMaxDynamicShared(f_prep, shb);
 
         var x_d = try ctx.alloc(m * cols * 4);
@@ -6818,27 +6912,27 @@ pub fn blockQDecodeTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         var ds = try ctx.alloc(c.rows * 4);
         defer ctx.free(&ds);
 
-        const shb = prepSharedBytes(c.cols);
-        const prep_ptx = try buildPrep(gpa, c.cols, c.bits, false, c.blk, 0, true);
+        const shb = prepSharedBytes(c.cols, false);
+        const prep_ptx = try buildPrep(gpa, c.cols, c.bits, false, c.blk, 0, true, false);
         defer gpa.free(prep_ptx);
         var pmod = try ctx.loadModule(prep_ptx);
         defer pmod.unload(ctx);
         const f_prep = try pmod.getFunction(ctx, if (c.bits == 4) "bqprep4" else "bqprep");
         try ctx.setMaxDynamicShared(f_prep, shb);
 
-        const dec_ptx = try buildPrep(gpa, c.cols, c.bits, false, c.blk, chunk, true);
+        const dec_ptx = try buildPrep(gpa, c.cols, c.bits, false, c.blk, chunk, true, false);
         defer gpa.free(dec_ptx);
         var dmod = try ctx.loadModule(dec_ptx);
         defer dmod.unload(ctx);
         const f_dec = try dmod.getFunction(ctx, if (c.bits == 4) "bqdec4" else "bqdec");
-        try ctx.setMaxDynamicShared(f_dec, prepSharedBytes(chunk));
+        try ctx.setMaxDynamicShared(f_dec, prepSharedBytes(chunk, false));
 
         var pw = dw.ptr;
         var pq = dq.ptr;
         var ps = ds.ptr;
         var params = [_]?*anyopaque{ @ptrCast(&pw), @ptrCast(&pq), @ptrCast(&ps) };
         try ctx.launch(f_prep, .{ @intCast(c.rows), 1, 1 }, .{ 256, 1, 1 }, @intCast(shb), &params);
-        try ctx.launch(f_dec, .{ @intCast(c.rows * (c.cols / chunk)), 1, 1 }, .{ 256, 1, 1 }, @intCast(prepSharedBytes(chunk)), &params);
+        try ctx.launch(f_dec, .{ @intCast(c.rows * (c.cols / chunk)), 1, 1 }, .{ 256, 1, 1 }, @intCast(prepSharedBytes(chunk, false)), &params);
 
         const sg = try gpa.alloc(u8, c.rows * 4);
         defer gpa.free(sg);
@@ -6889,4 +6983,86 @@ pub fn blockQDecodeTest(ctx: *Context, io: anytype, stdout: anytype) !void {
         if (bad_scale != 0 or worse != 0 or off_by_one * 1000 > total) return error.CudaError;
     }
     try stdout.print("block-quant decode OK\n", .{});
+}
+
+test "the activation prep's rotation covers every group" {
+    // The FWHT gives each of 256 threads `prepButterflyIters` butterflies per
+    // pass, and there are `(cols / 256) * 64` to do. Rounding DOWN leaves part of
+    // the row unrotated: no error, no assert, just a GEMM in the wrong basis.
+    //
+    // This was live: `ngroups * 64 / 256` truncates whenever `cols % 1024 != 0`.
+    // Every width in the engine at the time happened to be a multiple of 1024, so
+    // nothing caught it until MiniMax H3's 5376-wide hidden, where 21 groups
+    // needed 5.25 iterations, got 5, and every linear reading that width was 22%
+    // wrong.
+    const widths = [_]usize{
+        1024, 2048, 2560, 3072, 5120, 6144, 8192, 14336, 16384, 25600,
+        5376, // MiniMax H3's hidden: 21 groups, the case that was broken
+        7168, // its attention inner width
+        28672,
+    };
+    for (widths) |cols| {
+        const groups = cols / 256;
+        const needed = groups * 64;
+        const iters = prepButterflyIters(cols);
+        errdefer std.debug.print("cols={d} groups={d} needed={d} iters={d}\n", .{ cols, groups, needed, iters });
+        // Every butterfly must be reachable by some thread on some iteration.
+        try std.testing.expect(iters * 256 >= needed);
+        // ...and not wastefully many: one extra iteration at most.
+        try std.testing.expect((iters - 1) * 256 < needed);
+    }
+    // The specific case, spelled out: truncation would have given 5.
+    try std.testing.expectEqual(@as(usize, 6), prepButterflyIters(5376));
+    try std.testing.expectEqual(@as(usize, 24 * 64 / 256), prepButterflyIters(6144));
+}
+
+
+test "the prep's global row staging is a drop-in for the shared one" {
+    // Structural, because the two must differ in exactly one way: where the row
+    // lives. The numeric equivalence is checked on the device by
+    // `minimax-h3-cuda-test TP_H3_GLOBAL_PREP=1`, which runs a width that FITS in
+    // shared both ways and requires the two to agree to the last bit.
+    const ta = std.testing.allocator;
+
+    // Only the fixed 1280-byte scratch stays in shared, whatever the width -- which
+    // is the whole point: H3's 25600-wide `down_proj` needs 102400 bytes of row and
+    // sm_86 allows 101376 in total.
+    try std.testing.expectEqual(@as(usize, 1280), prepSharedBytes(25600, true));
+    try std.testing.expectEqual(@as(usize, 25600 * 4 + 1280), prepSharedBytes(25600, false));
+    try std.testing.expect(prepNeedsGlobalStage(25600, 101376));
+    try std.testing.expect(!prepNeedsGlobalStage(25024, 101376));
+
+    var fixed_shared: ?usize = null;
+    var prev_shared: usize = 0;
+    for ([_]usize{ 1024, 5120, 8192, 25600 }) |cols| {
+        errdefer std.debug.print("cols {d}\n", .{cols});
+        const shared = try buildPrep(ta, cols, 8, false, .none, 0, true, false);
+        defer ta.free(shared);
+        const global = try buildPrep(ta, cols, 8, false, .none, 0, true, true);
+        defer ta.free(global);
+
+        // The extra parameter exists on one and not the other.
+        try std.testing.expect(std.mem.indexOf(u8, global, "p_rot") != null);
+        try std.testing.expect(std.mem.indexOf(u8, shared, "p_rot") == null);
+
+        // The claim that matters: the global variant's SHARED traffic does not grow
+        // with the width, because the only thing left there is the fixed 256-float
+        // abs-max reduction and the scale slot. The shared variant's does, since
+        // every row access is one. Counting instructions rather than naming a number
+        // states the property instead of a snapshot of it.
+        const g_sh = std.mem.count(u8, global, "shared.f32");
+        const s_sh = std.mem.count(u8, shared, "shared.f32");
+        try std.testing.expect(g_sh < s_sh);
+        if (fixed_shared) |n| {
+            try std.testing.expectEqual(n, g_sh);
+        } else fixed_shared = g_sh;
+        try std.testing.expect(s_sh > prev_shared);
+        prev_shared = s_sh;
+
+        // ...and the row traffic the shared one did in shared, the global one does
+        // in global: the difference in shared accesses shows up as global ones.
+        const g_gl = std.mem.count(u8, global, "global.f32");
+        const s_gl = std.mem.count(u8, shared, "global.f32");
+        try std.testing.expectEqual(s_sh - g_sh, g_gl - s_gl);
+    }
 }

@@ -21,7 +21,7 @@ const sample = @import("tp_core").sample;
 
 const Context = ctxmod.Context;
 
-pub const Error = error{ CudaError, OutOfMemory, NoSuitableDevice, DeviceOutOfMemory, UnsupportedWidth, UnsupportedDtype };
+pub const Error = error{ CudaError, OutOfMemory, NoSuitableDevice, DeviceOutOfMemory, UnsupportedWidth, UnsupportedDtype, UnsupportedKernelArm };
 
 /// Coordinator hook for freeing VRAM held by a DIFFERENT device context on the
 /// same card (see `Backend.foreign_reclaim`). Returns the bytes actually freed;
@@ -89,7 +89,7 @@ pub var bench_gemm_only: bool = false;
 /// Numeric kind of a cuBLASLt matmul plan: int8 A/B -> s32 D (32I compute) or
 /// f16 A/B -> f32 D (32F compute, HMMA). Both are the TN case with the same
 /// layout mapping; only the data/compute/scale types differ.
-const LtKind = enum { i8, f16, bf16 };
+const LtKind = enum { i8, f16, bf16, f32 };
 
 /// One cuBLASLt plan is valid for exactly one of these shapes. A struct rather
 /// than packed bits: `m` is a pixel count and reaches millions at high resolution,
@@ -551,6 +551,9 @@ pub const Backend = struct {
     // int8 prep state (opI8Prep -> opI8Gemm contract).
     i8_x: DeviceBuffer = .{},
     i8_scale: DeviceBuffer = .{},
+    /// The prep's ROW staging, only for reductions too wide for shared memory
+    /// (`kernels.prepNeedsGlobalStage`). Never allocated otherwise.
+    i8_rot: DeviceBuffer = .{},
     i8_m: usize = 0,
     i8_mpad: usize = 0,
     i8_cols: usize = 0,
@@ -939,6 +942,7 @@ pub const Backend = struct {
         self.tensorDestroy(&self.conv_a16);
         self.tensorDestroy(&self.conv_c);
         self.tensorDestroy(&self.i8_x);
+        self.tensorDestroy(&self.i8_rot);
         self.tensorDestroy(&self.i8_scale);
         self.tensorDestroy(&self.i8_acc);
         self.tensorDestroy(&self.w4a8_i8);
@@ -2041,15 +2045,16 @@ pub const Backend = struct {
 
     // ---- int8 GEMM pair -----------------------------------------------------
 
-    fn prepFn(self: *Backend, cols: usize, in_f16: bool, rotate: bool) Error!cu.CUfunction {
+    fn prepFn(self: *Backend, cols: usize, in_f16: bool, rotate: bool, stage_global: bool) Error!cu.CUfunction {
         const key = cols | (if (in_f16) @as(usize, 1) << 40 else 0) |
-            (if (rotate) @as(usize, 0) else @as(usize, 1) << 41); // variants keyed separately
+            (if (rotate) @as(usize, 0) else @as(usize, 1) << 41) |
+            (if (stage_global) @as(usize, 1) << 42 else 0); // variants keyed separately
         if (self.prep_mods.get(key)) |f| return f;
         // Distinguish the two failures: `UnsupportedWidth` means the FWHT would give
         // each thread zero butterflies (cols < 1024), which is a silent non-rotation the
         // generator now refuses, reporting it as OutOfMemory would send a reader after
         // memory. No live linear is that narrow (the narrowest here is 1024).
-        const ptx = kernels.buildPrep(self.gpa, cols, 8, in_f16, .none, 0, rotate) catch |e| switch (e) {
+        const ptx = kernels.buildPrep(self.gpa, cols, 8, in_f16, .none, 0, rotate, stage_global) catch |e| switch (e) {
             error.UnsupportedWidth => {
                 std.log.err("prep: {d}-wide reduction is narrower than one convrot group per thread", .{cols});
                 return error.UnsupportedWidth;
@@ -2059,7 +2064,7 @@ pub const Backend = struct {
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         const f = mod.getFunction(self.ctx, if (rotate) "iprep" else "iprep_nr") catch return error.CudaError;
-        self.ctx.setMaxDynamicShared(f, kernels.prepSharedBytes(cols)) catch return error.CudaError;
+        self.ctx.setMaxDynamicShared(f, kernels.prepSharedBytes(cols, stage_global)) catch return error.CudaError;
         self.prep_owned.append(self.gpa, mod) catch return error.OutOfMemory;
         self.prep_mods.put(self.gpa, key, f) catch return error.OutOfMemory;
         return f;
@@ -3098,6 +3103,15 @@ pub const Backend = struct {
 
     /// Deinterleave the qwen35 attention q projection into query and gate
     /// ([q(hd) gate(hd)] per 2*hd-wide head slot).
+    /// Split a PER-HEAD fused qkv (`[h0 q|h0 k|h0 v|h1 q|...]` per token) into
+    /// three planar `[tokens][heads][hd]` buffers. `total` is `tokens*heads*hd`.
+    pub fn opDeinterleave3(self: *Backend, src: DeviceBuffer, q: DeviceBuffer, k: DeviceBuffer, v: DeviceBuffer, total: usize, hd: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const f = try self.eltFn(elt.deinterleave3_ptx, "deinterleave3");
+        try self.eltLaunch(f, src, q, k, v, .{ @intCast(total), @intCast(hd), 0, 0, 0, 0 }, .{ 0, 0 }, total);
+    }
+
     pub fn opDeinterleave2(self: *Backend, qg: DeviceBuffer, q: DeviceBuffer, gate: DeviceBuffer, total: usize, hd: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
@@ -3480,6 +3494,34 @@ pub const Backend = struct {
         try self.eltLaunch(f_bc, self.conv_c, b_db, dst, null, .{ @intCast(m * co), @intCast(co), @intCast(co), 0, 0, 0 }, .{ 1.0, 0 }, m * co);
     }
 
+    /// `dst[m][co] += scale * (src[m][k] @ Wᵀ)`, W bf16 `[co][k]` straight from
+    /// the mapping, accumulating into `dst` rather than overwriting it.
+    ///
+    /// This exists because the obvious spelling is much more expensive than it
+    /// looks: `opGemmBf16` into a scratch plane followed by `opAddScaled` adds
+    /// three more passes over an f32 `[m][co]` plane (write the scratch, read it,
+    /// read-modify-write dst) on top of the GEMM's own output write. Measured on
+    /// the H3 LoRA sidecar at 512x512, the separate accumulate cost ~2x the two
+    /// GEMMs it served: 0.83 -> 0.89 s/step for the GEMMs, 0.89 -> 1.00 for the
+    /// accumulate. Folding it into the epilogue removes all three passes.
+    ///
+    /// `libs` only. cuBLASLt's beta is what makes it free; the hand-PTX `hgemm`
+    /// writes its C tiles unconditionally, so a caller on that arm keeps the
+    /// scratch-plus-add route. Returns `error.Unsupported` there rather than
+    /// silently overwriting, which would drop the base GEMM's output.
+    pub fn opGemmBf16Acc(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize, scale: f32) Error!void {
+        if (self.kernels != .libs) return error.UnsupportedKernelArm;
+        self.ptic();
+        defer self.ptoc(.matmul);
+        std.debug.assert(w_bytes.len == co * k * 2);
+        std.debug.assert(co % 128 == 0 and k % 32 == 0);
+        const w_direct = try self.cachedWeight(w_bytes);
+        try self.ensureDeviceBuffer(&self.conv_a16, m * k * 2);
+        const f_a = try self.eltFn(elt.f32_to_bf16_pad2d_ptx, "f32_to_bf16_pad2d");
+        try self.eltLaunch(f_a, src, self.conv_a16, null, null, .{ @intCast(m * k), @intCast(k), @intCast(m), @intCast(k), 0, 0 }, .{ 0, 0 }, m * k);
+        try self.ltMatmulBf16Scaled(dst, w_direct, self.conv_a16, co, m, k, scale, 1.0);
+    }
+
     /// opConvF16's bf16-weight twin (ViT GEMMs over the mmproj's bf16
     /// tensors): dst[m][co] f32 = src[m][k] f32 @ Wᵀ + bias, W bf16 [co][k]
     /// straight from the GGUF mmap. Weight and activation convert to f16
@@ -3664,20 +3706,25 @@ pub const Backend = struct {
             .i8 => cublaslt.R_8I,
             .f16 => cublaslt.R_16F,
             .bf16 => cublaslt.R_16BF,
+            .f32 => cublaslt.R_32F,
         };
         const d_type: c_int = switch (kind) {
             .i8 => cublaslt.R_32I,
             // f16 D halves the GEMM's output traffic and lands straight in an f16
             // activation buffer; the accumulator is f32 either way (COMPUTE_32F).
             .f16, .bf16 => if (d_f16) cublaslt.R_16F else cublaslt.R_32F,
+            .f32 => cublaslt.R_32F,
         };
         const compute: c_int = switch (kind) {
             .i8 => cublaslt.COMPUTE_32I,
-            .f16, .bf16 => cublaslt.COMPUTE_32F,
+            // Plain COMPUTE_32F, NOT the _FAST_TF32 variant. TF32 keeps only 10
+            // mantissa bits, i.e. the same precision as the f16 path this exists
+            // to avoid; the whole point of an f32 arm is the other 13.
+            .f16, .bf16, .f32 => cublaslt.COMPUTE_32F,
         };
         const scale: c_int = switch (kind) {
             .i8 => cublaslt.R_32I,
-            .f16, .bf16 => cublaslt.R_32F,
+            .f16, .bf16, .f32 => cublaslt.R_32F,
         };
 
         const L = &self.libs.?;
@@ -3859,9 +3906,45 @@ pub const Backend = struct {
     /// bf16 twin of ltMatmulF16 (native bf16 GEMM, f32 accumulate): W and A are
     /// raw bf16, D is f32.
     pub fn ltMatmulBf16(self: *Backend, d: DeviceBuffer, w: DeviceBuffer, a: DeviceBuffer, n: usize, m: usize, k: usize) Error!void {
-        const plan = try self.ltPlan(.bf16, n, m, k, 0, false);
+        try self.ltMatmulBf16Scaled(d, w, a, n, m, k, 1, 0);
+    }
+
+    /// `dst[m][co] f32 = src[m][k] f32 @ Wᵀ + bias`, W f32 `[co][k]`, on cuBLASLt
+    /// in TRUE f32 (FFMA, not TF32 and not tensor cores).
+    ///
+    /// This exists because the f16 tensor-core path is not always accurate enough
+    /// and the fallback was a one-thread-per-output kernel. Measured on the H3
+    /// BigVGAN vocoder against its f32 CPU reference: the f16 route is 2.4e-3
+    /// relative with a 8.3e-3 worst sample, about -42 dB, which for a VOCODER is
+    /// an audible noise floor; f32 is 9.5e-6 / 2.8e-5, under 16-bit PCM's own
+    /// quantum. The naive kernel gets the same numbers at a third of the speed,
+    /// so this is the arm that makes precision affordable.
+    ///
+    /// `libs` only, and the caller must have a fallback: `error.UnsupportedKernelArm`
+    /// on the hand-PTX arm, which has no tiled f32 GEMM.
+    pub fn opMatmulF32Lt(self: *Backend, dst: DeviceBuffer, src: DeviceBuffer, m: usize, w_bytes: []const u8, co: usize, k: usize, bias: ?[]const f32) Error!void {
+        if (self.kernels != .libs) return error.UnsupportedKernelArm;
+        self.ptic();
+        defer self.ptoc(.matmul);
+        std.debug.assert(w_bytes.len == co * k * 4);
+        const w_db = try self.cachedWeight(w_bytes);
+        const plan = try self.ltPlan(.f32, co, m, k, 0, false);
         var alpha: f32 = 1;
         var beta: f32 = 0;
+        try self.ltRun(plan, dst, w_db, src, @ptrCast(&alpha), @ptrCast(&beta), 0);
+        if (bias) |bb| {
+            const b_db = try self.cachedWeight(std.mem.sliceAsBytes(bb));
+            try self.opAddBiasRows(dst, b_db, m, co, 0, false);
+        }
+    }
+
+    /// `d = alpha * (Wᵀ @ A) + beta * d`. `beta != 0` accumulates IN PLACE, which
+    /// is free here because `ltRun` already hands cuBLASLt the same buffer and
+    /// layout for C and D; the plan cache is keyed on shape, not on beta.
+    pub fn ltMatmulBf16Scaled(self: *Backend, d: DeviceBuffer, w: DeviceBuffer, a: DeviceBuffer, n: usize, m: usize, k: usize, alpha_v: f32, beta_v: f32) Error!void {
+        const plan = try self.ltPlan(.bf16, n, m, k, 0, false);
+        var alpha = alpha_v;
+        var beta = beta_v;
         try self.ltRun(plan, d, w, a, @ptrCast(&alpha), @ptrCast(&beta), 0);
     }
 
@@ -3912,6 +3995,29 @@ pub const Backend = struct {
     /// `opI8Prep` with the convrot rotation selectable. Only the block-quant path passes
     /// false, and only together with an unrotated weight decode, see `buildPrep`'s
     /// `rotate`.
+    /// The widest reduction `opI8Prep` can stage in SHARED memory on this device.
+    ///
+    /// Past it the prep switches to a global-memory row buffer (see `buildPrep`'s
+    /// `stage_global`), so this is no longer a support ceiling -- it is the point
+    /// where the prep gets slower. Kept public because it is the one number that
+    /// explains why: on sm_86 the opt-in shared limit is 101376 bytes, i.e. 25024
+    /// columns after the 1280-byte reduction scratch, and MiniMax H3's 25600-wide
+    /// `down_proj` misses by exactly one 256-wide convrot group.
+    pub fn i8PrepMaxSharedCols(self: *const Backend) usize {
+        const limit: usize = @intCast(@max(self.ctx.shared_optin_max, 0));
+        const fixed = kernels.prepSharedBytes(0, false);
+        if (limit <= fixed) return 0;
+        return (limit - fixed) / 4;
+    }
+
+    /// DIAGNOSTIC: stage every int8 prep row in global memory, whatever its width.
+    ///
+    /// The isolation for the global path: at a width that FITS in shared, the two
+    /// stagings run the same arithmetic in the same order and must agree to the last
+    /// bit. Anything else means the address rewrite is wrong, and a tolerance-based
+    /// device-vs-CPU check cannot see it (int8 over 50 layers has a ~1e-4 floor).
+    pub var force_global_prep: bool = false;
+
     pub fn opI8PrepR(self: *Backend, x: DeviceBuffer, m: usize, cols: usize, in_f16: bool, rotate: bool) Error!void {
         self.ptic();
         defer self.ptoc(.prep);
@@ -3929,12 +4035,21 @@ pub const Backend = struct {
             self.ctx.memsetD8Async(.{ .ptr = self.i8_x.ptr() + @as(u64, @intCast(m * cols)), .bytes = @intCast(pad * cols) }, 0, pad * cols) catch return error.CudaError;
             self.ctx.memsetD32Async(.{ .ptr = self.i8_scale.ptr() + @as(u64, @intCast(m * 4)), .bytes = @intCast(pad * 4) }, 0, pad) catch return error.CudaError;
         }
-        const f = try self.prepFn(cols, in_f16, rotate);
+        // Shared where it fits, global where it does not. `i8_rot` is only ever
+        // allocated on the global path, so a render that never reaches a wide
+        // reduction pays nothing for its existence.
+        const stage_global = force_global_prep or
+            kernels.prepNeedsGlobalStage(cols, @intCast(@max(self.ctx.shared_optin_max, 0)));
+        if (stage_global) try self.ensureDeviceBuffer(&self.i8_rot, mpad * cols * 4);
+        const f = try self.prepFn(cols, in_f16, rotate, stage_global);
         var px = x.ptr();
         var pq = self.i8_x.ptr();
         var pas = self.i8_scale.ptr();
-        var pp = [_]?*anyopaque{ @ptrCast(&px), @ptrCast(&pq), @ptrCast(&pas) };
-        self.ctx.launch(f, .{ @intCast(m), 1, 1 }, .{ 256, 1, 1 }, @intCast(kernels.prepSharedBytes(cols)), &pp) catch return error.CudaError;
+        var prot = if (stage_global) self.i8_rot.ptr() else 0;
+        var pp3 = [_]?*anyopaque{ @ptrCast(&px), @ptrCast(&pq), @ptrCast(&pas) };
+        var pp4 = [_]?*anyopaque{ @ptrCast(&px), @ptrCast(&pq), @ptrCast(&pas), @ptrCast(&prot) };
+        const pp: []?*anyopaque = if (stage_global) pp4[0..] else pp3[0..];
+        self.ctx.launch(f, .{ @intCast(m), 1, 1 }, .{ 256, 1, 1 }, @intCast(kernels.prepSharedBytes(cols, stage_global)), pp) catch return error.CudaError;
         self.i8_m = m;
         self.i8_mpad = mpad;
         self.i8_cols = cols;
@@ -3963,7 +4078,7 @@ pub const Backend = struct {
     fn bqPrepFn(self: *Backend, cols: usize, block: kernels.PrepBlock, rotate: bool, bits: usize) Error!cu.CUfunction {
         const ck = bqKey(cols, block, rotate, bits);
         if (self.bq_prep_mods.get(ck)) |f| return f;
-        const ptx = kernels.buildPrep(self.gpa, cols, bits, false, block, 0, rotate) catch |e| switch (e) {
+        const ptx = kernels.buildPrep(self.gpa, cols, bits, false, block, 0, rotate, false) catch |e| switch (e) {
             error.UnsupportedWidth => {
                 std.log.err("block-quant prep: {d}-wide reduction is narrower than one convrot group per thread", .{cols});
                 return error.UnsupportedWidth;
@@ -3976,7 +4091,7 @@ pub const Backend = struct {
             (if (rotate) "bqprep4" else "bqprep4_nr")
         else if (rotate) "bqprep" else "bqprep_nr";
         const f = mod.getFunction(self.ctx, nm) catch return error.CudaError;
-        self.ctx.setMaxDynamicShared(f, kernels.prepSharedBytes(cols)) catch return error.CudaError;
+        self.ctx.setMaxDynamicShared(f, kernels.prepSharedBytes(cols, false)) catch return error.CudaError;
         self.bq_mods_owned.append(self.gpa, mod) catch return error.OutOfMemory;
         self.bq_prep_mods.put(self.gpa, ck, f) catch return error.OutOfMemory;
         return f;
@@ -3996,14 +4111,14 @@ pub const Backend = struct {
     fn bqDecFn(self: *Backend, cols: usize, block: kernels.PrepBlock, rotate: bool, bits: usize) Error!cu.CUfunction {
         const ck = bqKey(cols, block, rotate, bits);
         if (self.bq_dec_mods.get(ck)) |f| return f;
-        const ptx = kernels.buildPrep(self.gpa, cols, bits, false, block, bqChunk(cols), rotate) catch return error.OutOfMemory;
+        const ptx = kernels.buildPrep(self.gpa, cols, bits, false, block, bqChunk(cols), rotate, false) catch return error.OutOfMemory;
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         const nm = if (bits == 4)
             (if (rotate) "bqdec4" else "bqdec4_nr")
         else if (rotate) "bqdec" else "bqdec_nr";
         const f = mod.getFunction(self.ctx, nm) catch return error.CudaError;
-        self.ctx.setMaxDynamicShared(f, kernels.prepSharedBytes(bqChunk(cols))) catch return error.CudaError;
+        self.ctx.setMaxDynamicShared(f, kernels.prepSharedBytes(bqChunk(cols), false)) catch return error.CudaError;
         self.bq_mods_owned.append(self.gpa, mod) catch return error.OutOfMemory;
         self.bq_dec_mods.put(self.gpa, ck, f) catch return error.OutOfMemory;
         return f;
@@ -4022,7 +4137,7 @@ pub const Backend = struct {
         var pq = self.bq_i8.ptr();
         var pas = bfr.ptr();
         var pp = [_]?*anyopaque{ @ptrCast(&px), @ptrCast(&pq), @ptrCast(&pas) };
-        self.ctx.launch(f, .{ @intCast(rows), 1, 1 }, .{ 256, 1, 1 }, @intCast(kernels.prepSharedBytes(cols)), &pp) catch return error.CudaError;
+        self.ctx.launch(f, .{ @intCast(rows), 1, 1 }, .{ 256, 1, 1 }, @intCast(kernels.prepSharedBytes(cols, false)), &pp) catch return error.CudaError;
         self.bq_scales.put(self.gpa, key, bfr) catch return error.OutOfMemory;
         return bfr;
     }
@@ -4062,7 +4177,7 @@ pub const Backend = struct {
             var pas = ws.ptr();
             var pp = [_]?*anyopaque{ @ptrCast(&px), @ptrCast(&pq), @ptrCast(&pas) };
             const nblk: u32 = @intCast(rows * (cols / bqChunk(cols)));
-            self.ctx.launch(f, .{ nblk, 1, 1 }, .{ 256, 1, 1 }, @intCast(kernels.prepSharedBytes(bqChunk(cols))), &pp) catch return error.CudaError;
+            self.ctx.launch(f, .{ nblk, 1, 1 }, .{ 256, 1, 1 }, @intCast(kernels.prepSharedBytes(bqChunk(cols), false)), &pp) catch return error.CudaError;
         }
         return self.opI8GemmDevWs(y, self.bq_i8, ws, rows, c_h16);
     }
@@ -4089,7 +4204,7 @@ pub const Backend = struct {
             var pas = ws.ptr();
             var pp = [_]?*anyopaque{ @ptrCast(&px), @ptrCast(&pq), @ptrCast(&pas) };
             const nblk: u32 = @intCast(rows * (cols / bqChunk(cols)));
-            self.ctx.launch(f, .{ nblk, 1, 1 }, .{ 256, 1, 1 }, @intCast(kernels.prepSharedBytes(bqChunk(cols))), &pp) catch return error.CudaError;
+            self.ctx.launch(f, .{ nblk, 1, 1 }, .{ 256, 1, 1 }, @intCast(kernels.prepSharedBytes(bqChunk(cols), false)), &pp) catch return error.CudaError;
         }
         return self.opI4GemmDevWs(y, self.bq_i8, ws, rows);
     }
@@ -4208,7 +4323,7 @@ pub const Backend = struct {
         // each thread zero butterflies (cols < 1024), which is a silent non-rotation the
         // generator now refuses, reporting it as OutOfMemory would send a reader after
         // memory. No live linear is that narrow (the narrowest here is 1024).
-        const ptx = kernels.buildPrep(self.gpa, cols, 4, false, .none, 0, true) catch |e| switch (e) {
+        const ptx = kernels.buildPrep(self.gpa, cols, 4, false, .none, 0, true, false) catch |e| switch (e) {
             error.UnsupportedWidth => {
                 std.log.err("prep: {d}-wide reduction is narrower than one convrot group per thread", .{cols});
                 return error.UnsupportedWidth;
@@ -4218,7 +4333,7 @@ pub const Backend = struct {
         defer self.gpa.free(ptx);
         var mod = self.ctx.loadModule(ptx) catch return error.CudaError;
         const f = mod.getFunction(self.ctx, "i4prep") catch return error.CudaError;
-        self.ctx.setMaxDynamicShared(f, kernels.prepSharedBytes(cols)) catch return error.CudaError;
+        self.ctx.setMaxDynamicShared(f, kernels.prepSharedBytes(cols, false)) catch return error.CudaError;
         self.i4_prep_owned.append(self.gpa, mod) catch return error.OutOfMemory;
         self.i4_prep_mods.put(self.gpa, cols, f) catch return error.OutOfMemory;
         return f;
@@ -4256,7 +4371,7 @@ pub const Backend = struct {
         var pq = self.i8_x.ptr();
         var pas = self.i8_scale.ptr();
         var pp = [_]?*anyopaque{ @ptrCast(&px), @ptrCast(&pq), @ptrCast(&pas) };
-        self.ctx.launch(f, .{ @intCast(m), 1, 1 }, .{ 256, 1, 1 }, @intCast(kernels.prepSharedBytes(cols)), &pp) catch return error.CudaError;
+        self.ctx.launch(f, .{ @intCast(m), 1, 1 }, .{ 256, 1, 1 }, @intCast(kernels.prepSharedBytes(cols, false)), &pp) catch return error.CudaError;
         self.i8_m = m;
         self.i8_mpad = mpad;
         self.i8_cols = cols;
@@ -4397,6 +4512,97 @@ pub const Backend = struct {
         try self.eltLaunch(f, src, dst, null, null, .{ @intCast(count), @intCast(stride), @intCast(base), 0, 0, 0 }, .{ 0, 0 }, count);
     }
 
+    /// im2col for a stride-1 dilated 1-D conv over channel-last `[in_len][ci]`:
+    /// `patch[out_len][k*ci]`, column order `(tap, in_ch)`. See `elt.im2col1d_ptx`
+    /// for why that order and not the weight's own.
+    ///
+    /// Stride 1 only. Every ungrouped conv in the BigVGAN decoder is stride 1; the
+    /// strided ones are the transposed convs and the per-channel kaiser filters,
+    /// which have their own kernels.
+    /// Channel-last 1-D im2col: `patch[t][tap][ci]` from `src[len][ci]`, zero
+    /// outside. `stride` and `t0` ride in the f32 slots because all six u32 slots
+    /// are taken; stride is 1 for every length-preserving conv and `2 * stride == k`
+    /// for the audio encoder's downsampling ones.
+    ///
+    /// `t0` is the first OUTPUT row this call fills, so a caller can band the patch
+    /// matrix. Banding cannot be done by shifting `src` instead: the left padding is
+    /// an index clamp against the real input start, and a shifted pointer would
+    /// zero-pad in the middle of the signal.
+    pub fn opIm2col1d(self: *Backend, src: DeviceBuffer, patch: DeviceBuffer, t0: usize, out_len: usize, k: usize, ci: usize, in_len: usize, dilation: usize, padding: usize, stride: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        std.debug.assert(stride >= 1);
+        const f = try self.eltFn(elt.im2col1d_ptx, "im2col1d");
+        const plen = k * ci;
+        const total = out_len * plen;
+        try self.eltLaunch(f, src, patch, null, null, .{ @intCast(total), @intCast(plen), @intCast(ci), @intCast(in_len), @intCast(dilation), @intCast(padding) }, .{ @floatFromInt(stride), @floatFromInt(t0) }, total);
+    }
+
+    /// Channel-last 3-D im2col with reflect spatial and causal temporal padding.
+    /// `params` is a device u32[16]; see `elt.im2col3d_ptx` for the layout, which
+    /// the caller builds with `im2col3dParams`.
+    pub fn opIm2col3d(self: *Backend, src: DeviceBuffer, patch: DeviceBuffer, params: DeviceBuffer, rows: usize, cols: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const f = try self.eltFn(elt.im2col3d_ptx, "im2col3d");
+        const total = rows * cols;
+        try self.eltLaunch(f, src, patch, params, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+    }
+
+    /// The audio ENCODER's `Snake1d`, channel-last and in place: `x += sin(a*x)^2 /
+    /// (a + 1e-9)` with alpha doing double duty as beta. Distinct from
+    /// `opAaUpSnake`'s `SnakeBeta`, whose parameters are log-scale and separate.
+    pub fn opSnake1dCa(self: *Backend, x: DeviceBuffer, alpha: DeviceBuffer, len: usize, ch: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const f = try self.eltFn(elt.snake1d_ca_ptx, "snake1d_ca");
+        const total = len * ch;
+        try self.eltLaunch(f, x, alpha, null, null, .{ @intCast(total), @intCast(ch), 0, 0, 0, 0 }, .{ 0, 0 }, total);
+    }
+
+    /// Mean over attention heads, then `adaptive_avg_pool1d` along the FEATURE axis
+    /// to `out_dim`. `src` is `[rows][heads * hd]`, `out` is `[rows][out_dim]`.
+    pub fn opMeanHeadsPool(self: *Backend, src: DeviceBuffer, out: DeviceBuffer, rows: usize, heads: usize, hd: usize, out_dim: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        std.debug.assert(out_dim > 0 and hd >= out_dim);
+        const f = try self.eltFn(elt.mean_heads_pool_ptx, "mean_heads_pool");
+        const total = rows * out_dim;
+        try self.eltLaunch(f, src, out, null, null, .{ @intCast(total), @intCast(out_dim), @intCast(heads), @intCast(hd), 0, 0 }, .{ 0, 0 }, total);
+    }
+
+    /// BigVGAN's anti-aliased activation, first half: replicate-pad + kaiser-sinc
+    /// upsample x2 + SnakeBeta, fused, channel-last. `snake` is
+    /// `(exp(alpha), 1/(exp(beta)+1e-9))` interleaved per channel — already
+    /// exponentiated, since the checkpoint stores log scale.
+    pub fn opAaUpSnake(self: *Backend, src: DeviceBuffer, out: DeviceBuffer, filter: DeviceBuffer, snake: DeviceBuffer, len: usize, ch: usize, k: usize, pad: usize, pad_left: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const f = try self.eltFn(elt.aa_up_snake_ptx, "aa_up_snake");
+        const total = 2 * len * ch;
+        try self.eltLaunch(f, src, out, filter, snake, .{ @intCast(total), @intCast(ch), @intCast(len), @intCast(k), @intCast(pad), @intCast(pad_left) }, .{ 0, 0 }, total);
+    }
+
+    /// Second half: replicate-pad + kaiser-sinc downsample x2, channel-last.
+    /// `pad_left` is the ASYMMETRIC left constant (`k/2 - 1` for an even kernel).
+    pub fn opAaDown(self: *Backend, up: DeviceBuffer, out: DeviceBuffer, filter: DeviceBuffer, out_len: usize, up_len: usize, ch: usize, k: usize, pad_left: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const f = try self.eltFn(elt.aa_down_ptx, "aa_down");
+        const total = out_len * ch;
+        try self.eltLaunch(f, up, out, filter, null, .{ @intCast(total), @intCast(ch), @intCast(up_len), @intCast(k), @intCast(pad_left), 0 }, .{ 0, 0 }, total);
+    }
+
+    /// Ungrouped 1-D transposed convolution, channel-last. `w` is permuted to
+    /// `[k][in_ch][out_ch]` (PyTorch stores `[in_ch][out_ch][k]`).
+    pub fn opConvT1dCa(self: *Backend, x: DeviceBuffer, out: DeviceBuffer, w: DeviceBuffer, bias: DeviceBuffer, out_len: usize, out_ch: usize, in_ch: usize, in_len: usize, k: usize, stride: usize, padding: usize) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const f = try self.eltFn(elt.convt1d_ca_ptx, "convt1d_ca");
+        const total = out_len * out_ch;
+        try self.eltLaunch(f, x, out, w, bias, .{ @intCast(total), @intCast(out_ch), @intCast(in_ch), @intCast(in_len), @intCast(k), @intCast(stride) }, .{ @floatFromInt(padding), 0 }, total);
+    }
+
     /// dst[dst_off + i] = src[src_off + i] as a kernel, usable inside
     /// recorded batches and graph captures (unlike the null-stream memcpy).
     pub fn opCopyOff(self: *Backend, dst: DeviceBuffer, dst_off_elems: usize, src: DeviceBuffer, src_off_elems: usize, count: usize, h16: bool) Error!void {
@@ -4457,6 +4663,18 @@ pub const Backend = struct {
     /// out = x*inv*mod[premul+c] + mod[shift+c], inv=1/sqrt(mean(x^2)+eps). Fused
     /// rmsnorm + AdaLN modulation, one thread per row.
     pub fn rmsMod(self: *Backend, x: DeviceBuffer, out: DeviceBuffer, mod: DeviceBuffer, rows: usize, dim: usize, premul_off: usize, shift_off: usize, eps: f32) Error!void {
+        return self.rmsModRows(x, out, mod, rows, dim, premul_off, shift_off, eps, null, 0);
+    }
+
+    /// `rmsMod` with a PER-ROW modulation row: `idx` is `rows` u32 label indices and
+    /// each row's offsets become `off + idx[row] * idx_stride`. This is what a
+    /// denoise mask needs -- it relabels rows inside one segment, so a scalar
+    /// offset per launch would mean one launch per run of equal labels, which for a
+    /// spatial mask is thousands of launches of a few rows each.
+    ///
+    /// `idx == null` is the ordinary uniform-segment path and costs one predicated
+    /// branch per block.
+    pub fn rmsModRows(self: *Backend, x: DeviceBuffer, out: DeviceBuffer, mod: DeviceBuffer, rows: usize, dim: usize, premul_off: usize, shift_off: usize, eps: f32, idx: ?DeviceBuffer, idx_stride: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
         // one block (256 threads) per row, parallel shared reduction.
@@ -4464,8 +4682,8 @@ pub const Backend = struct {
         var p0 = x.ptr();
         var p1 = out.ptr();
         var p2 = mod.ptr();
-        var p3: cu.CUdeviceptr = 0;
-        var uu = [_]u32{ @intCast(rows), @intCast(dim), @intCast(premul_off), @intCast(shift_off), 0, 0 };
+        var p3: cu.CUdeviceptr = if (idx) |b| b.ptr() else 0;
+        var uu = [_]u32{ @intCast(rows), @intCast(dim), @intCast(premul_off), @intCast(shift_off), @intCast(idx_stride), 0 };
         var ff = [_]f32{ eps, 0 };
         var params = [_]?*anyopaque{
             @ptrCast(&p0),    @ptrCast(&p1),    @ptrCast(&p2),    @ptrCast(&p3),
@@ -4580,6 +4798,15 @@ pub const Backend = struct {
         defer self.ptoc(.elt);
         const f = try self.eltFn(elt.add_ptx, "add");
         try self.eltLaunch(f, a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ 0, 0 }, total);
+    }
+
+    /// a += scale * b, in place. The LoRA sidecar's accumulate, where `scale`
+    /// is a runtime dial that must not be baked into a weight.
+    pub fn opAddScaled(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, total: usize, scale: f32) Error!void {
+        self.ptic();
+        defer self.ptoc(.elt);
+        const f = try self.eltFn(elt.add_scaled_ptx, "add_scaled");
+        try self.eltLaunch(f, a, b, null, null, .{ @intCast(total), 0, 0, 0, 0, 0 }, .{ scale, 0 }, total);
     }
 
     /// In-place scalar multiply: a[i] *= scalar (Gemma 4 per-layer out_scale).
@@ -5468,10 +5695,16 @@ pub const Backend = struct {
 
     /// a += mod[gate_off + col] * b, in place (residual with gate). total=rows*dim.
     pub fn gatedAdd(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, mod: DeviceBuffer, total: usize, dim: usize, gate_off: usize) Error!void {
+        return self.gatedAddRows(a, b, mod, total, dim, gate_off, null, 0);
+    }
+
+    /// `gatedAdd` with a per-ROW modulation row; see `rmsModRows`. `idx` is one u32
+    /// per row, i.e. `total / dim` entries.
+    pub fn gatedAddRows(self: *Backend, a: DeviceBuffer, b: DeviceBuffer, mod: DeviceBuffer, total: usize, dim: usize, gate_off: usize, idx: ?DeviceBuffer, idx_stride: usize) Error!void {
         self.ptic();
         defer self.ptoc(.elt);
         const f = try self.eltFn(elt.gated_add_ptx, "gated_add");
-        try self.eltLaunch(f, a, b, mod, null, .{ @intCast(total), @intCast(dim), @intCast(gate_off), 0, 0, 0 }, .{ 0, 0 }, total);
+        try self.eltLaunch(f, a, b, mod, idx, .{ @intCast(total), @intCast(dim), @intCast(gate_off), @intCast(idx_stride), 0, 0 }, .{ 0, 0 }, total);
     }
 };
 
