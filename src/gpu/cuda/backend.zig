@@ -3992,9 +3992,10 @@ pub const Backend = struct {
         return self.opI8PrepR(x, m, cols, in_f16, true);
     }
 
-    /// `opI8Prep` with the convrot rotation selectable. Only the block-quant path passes
-    /// false, and only together with an unrotated weight decode, see `buildPrep`'s
-    /// `rotate`.
+    /// `opI8Prep` with the convrot rotation selectable. False belongs with an unrotated
+    /// weight and only with one: a ComfyUI `int8_tensorwise` checkpoint that carries one
+    /// scale per tensor, or a block-quant decode that skipped the rotation. See
+    /// `buildPrep`'s `rotate`.
     /// The widest reduction `opI8Prep` can stage in SHARED memory on this device.
     ///
     /// Past it the prep switches to a global-memory row buffer (see `buildPrep`'s

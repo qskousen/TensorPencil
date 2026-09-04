@@ -107,13 +107,16 @@ pub fn activationIs4Bit(dt: DType) bool {
 /// Prep the shared linear input. int8/int4 rotate+quantize `x` in place (all the
 /// block's GEMMs then read that internal state); bf16/fp8 GEMMs consume the f32
 /// `x` directly, so no prep is needed.
-fn linPrep(be: *Backend, kind: LinKind, x: DeviceBuffer, m: usize, cols: usize) !void {
+///
+/// `rot` is the checkpoint's own convrot state (`dit.i8Convrot`), not a choice: an
+/// unrotated `int8_tensorwise` weight needs an unrotated activation and vice versa.
+fn linPrep(be: *Backend, kind: LinKind, rot: bool, x: DeviceBuffer, m: usize, cols: usize) !void {
     switch (kind) {
         .i4 => try be.opI4Prep(x, m, cols),
         // W4A8's activation prep IS int8's: the "A8" in the name is exactly that the
         // activation stays 8-bit, so only the WEIGHT's storage differs. That is also
         // what lets a mixed int8/W4A8 checkpoint share one prep per group.
-        .i8, .w4a8 => try be.opI8Prep(x, m, cols, false),
+        .i8, .w4a8 => try be.opI8PrepR(x, m, cols, false, rot),
         // A block quant's activation prep IS int8's, because its weights are decoded to
         // convrot int8 per GEMM (`opI8GemmBlockQ`) and fed to the same vendor kernel.
         // The rotation has to match on both sides, so there is nothing format-specific
@@ -321,11 +324,16 @@ pub var blockq_rotate: bool = true;
 // to f32 once and fed through the f32 `opMatmul` (no int GEMM applies here); the
 // block is the plain (no modulation, no RoPE) variant of the sampling block.
 
-/// f32 weight bytes for `opMatmul`: BF16 weights dequant into `arena` (kept alive
-/// for the whole fusion so the backend's pointer-keyed weight cache stays valid);
-/// F32 weights (projector, txtmlp) pass through their mmap bytes unchanged.
+/// f32 weight bytes for `opMatmul`: BF16 and int8 weights dequant into `arena` (kept
+/// alive for the whole fusion so the backend's pointer-keyed weight cache stays valid);
+/// F32 weights pass through their mmap bytes unchanged.
+///
+/// int8 reaches here because a `int8_tensorwise` checkpoint may quantize the fusion
+/// stack, which the convrot ones leave dense. There is no int GEMM on this path (the
+/// widths are small and the prep would not pay), so it dequantizes like bf16 does.
 fn txtF32(arena: std.mem.Allocator, w: anytype) ![]const u8 {
     if (w.dtype == .f32) return w.bytes;
+    if (w.dtype == .i8) return (try ops.matmul.materializeF32(arena, w)).bytes;
     const out = try arena.alloc(f32, w.rows * w.cols);
     try safetensors.convertToF32(w.dtype, w.bytes, out);
     return std.mem.sliceAsBytes(out);
@@ -673,6 +681,20 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
         .f8_e4m3 => .fp8,
         else => blockQKind(wqt), // a block quant; anything else was gated above
     };
+    // Whether the int8 activation prep rotates. A property of the checkpoint, not a
+    // tuning knob: ComfyUI's `int8_tensorwise` ships rotated (scale per row) and
+    // unrotated (one scale per tensor), and the prep has to match the weight it feeds.
+    const i8_rot = dit.i8Convrot(model) orelse {
+        std.log.err("dit cuda: this checkpoint mixes convrot and plain int8 block linears; " ++
+            "one activation prep serves a whole block, so there is no correct one", .{});
+        return error.UnsupportedCheckpoint;
+    };
+    // `opI4Prep` always rotates and has no unrotated build, so an unrotated int4 weight
+    // would be multiplied in a basis it was never quantized in.
+    if (kind == .i4 and !i8_rot) {
+        std.log.err("dit cuda: int4 block linears without convrot are not supported", .{});
+        return error.UnsupportedCheckpoint;
+    }
     if (kind == .blockq_i8 or kind == .blockq_i4 or kind == .blockq_f16 or kind == .blockq_mmq) {
         // Refuse a shape or format the chosen decode cannot cover here rather than at the
         // launch. krea2's widths (6144, 1536, 16384) clear the int8 arm's floor.
@@ -723,7 +745,7 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
         const mb = b * 6 * F;
         // --- attention ---
         try be.rmsMod(x_d, t1_d, mv_d, seq, F, mb + 0 * F, mb + 1 * F, eps);
-        try linPrep(be, kind, t1_d, seq, F);
+        try linPrep(be, kind, i8_rot, t1_d, seq, F);
         try lin(be, kind, q_d, t1_d, seq, blk.attn.wq, zeros);
         try lin(be, kind, k_d, t1_d, seq, blk.attn.wk, zeros);
         try lin(be, kind, v_d, t1_d, seq, blk.attn.wv, zeros);
@@ -739,7 +761,7 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
         else
             try be.attn(q_d, k_d, v_d, attn_d, seq, seq, heads, kv_heads, hd, attn_scale, false);
         try be.sigmoidMul(attn_d, g_d, seq * F);
-        try linPrep(be, kind, attn_d, seq, blk.attn.wo.cols);
+        try linPrep(be, kind, i8_rot, attn_d, seq, blk.attn.wo.cols);
         try lin(be, kind, t1_d, attn_d, seq, blk.attn.wo, zeros);
         try be.gatedAdd(x_d, t1_d, mv_d, seq * F, F, mb + 2 * F);
         // --- mlp (sequence-tiled: mg/mu are [tile][mlp_dim]; each row-chunk is
@@ -749,19 +771,19 @@ pub fn forward(model: *const DiT, be: *Backend, sess: *const Session, ws: *const
             const tile: usize = @min(mlp_tile, seq - c0);
             const xo = offsetBuf(x_d, c0 * F * 4);
             try be.rmsMod(xo, t1_d, mv_d, tile, F, mb + 3 * F, mb + 4 * F, eps);
-            try linPrep(be, kind, t1_d, tile, F);
+            try linPrep(be, kind, i8_rot, t1_d, tile, F);
             if (mlp_f16) {
                 // gate/up GEMMs emit f16 (irescale_h16); silu_mul_h16 reads/writes
                 // f16; the down prep reads f16, halving the 16384-dim traffic.
                 try i8GemmW(be, mg_d, blk.mlp.gate, true);
                 try i8GemmW(be, mu_d, blk.mlp.up, true);
                 try be.siluMul16(mg_d, mu_d, tile * mlp_dim);
-                try be.opI8Prep(mg_d, tile, blk.mlp.down.cols, true);
+                try be.opI8PrepR(mg_d, tile, blk.mlp.down.cols, true, i8_rot);
             } else {
                 try lin(be, kind, mg_d, t1_d, tile, blk.mlp.gate, zeros);
                 try lin(be, kind, mu_d, t1_d, tile, blk.mlp.up, zeros);
                 try be.siluMul(mg_d, mu_d, tile * mlp_dim);
-                try linPrep(be, kind, mg_d, tile, blk.mlp.down.cols);
+                try linPrep(be, kind, i8_rot, mg_d, tile, blk.mlp.down.cols);
             }
             try lin(be, kind, t1_d, mg_d, tile, blk.mlp.down, zeros); // down -> f32 t1_d for gatedAdd
             try be.gatedAdd(xo, t1_d, mv_d, tile * F, F, mb + 5 * F);

@@ -12,6 +12,10 @@
 //! one family's loader is worse than unsupported: W4A8 and NVFP4 both store
 //! `I8 [rows, cols/2]`, which is exactly the int4-convrot signature, so a loader that
 //! has not heard of them reads their nibbles as signed int4 times a per-row scale.
+//!
+//! `int8Scale` is here for the same reason one step on: `int8_tensorwise` ships rotated
+//! and unrotated, only the `comfy_quant` blob and the scale's shape tell them apart, and
+//! the three families that read it had three copies of the half that handles one of them.
 
 const std = @import("std");
 const weights_mod = @import("tp_core").weights;
@@ -104,6 +108,157 @@ pub fn nvfp4(
 fn quantConfName(buf: []u8, name: []const u8) ![]u8 {
     const base = if (std.mem.endsWith(u8, name, ".weight")) name[0 .. name.len - ".weight".len] else name;
     return std.fmt.bufPrint(buf, "{s}.comfy_quant", .{base});
+}
+
+/// The dequant metadata of a ComfyUI `int8_tensorwise` layer: a scale per output row and
+/// the rotation group, 0 when the weight is not rotated.
+pub const Int8Meta = struct {
+    row_scale: []f32,
+    convrot: u32,
+};
+
+/// The fields of `comfy_quant` this reader uses.
+///
+/// Both keys may sit at the top level or nested under `params`, and ComfyUI's loader
+/// reads them in that order, so this does too. Optional rather than defaulted, because
+/// "absent" and "present and false" resolve differently per format below.
+const Int8Conf = struct {
+    format: []const u8 = "",
+    convrot: ?bool = null,
+    convrot_groupsize: ?usize = null,
+    params: Nested = .{},
+
+    const Nested = struct {
+        convrot: ?bool = null,
+        convrot_groupsize: ?usize = null,
+    };
+};
+
+/// Formats with a reader of their own, all of which run BEFORE this one. Seeing one on a
+/// weight that reached the int8 arm means the sidecars and the metadata disagree, and
+/// reading those bytes as int8 gives finite, plausible, wrong numbers.
+const foreign_formats = [_][]const u8{
+    "nvfp4", "asym_w4a8_int8", "float8_e4m3fn", "float8_e5m2", "mxfp8",
+};
+
+/// ComfyUI's writer emits `convrot` only when it is true, so for `int8_tensorwise` an
+/// absent key means unrotated.
+const tensorwise_format = "int8_tensorwise";
+
+/// ...but `convrot_w4a4` is ALWAYS rotated and therefore never writes the key at all.
+/// Reading its absence as false would unrotate every int4 checkpoint.
+const always_rot_format = "convrot_w4a4";
+
+/// Read the `weight_scale` and `comfy_quant` sidecars of a ComfyUI `int8_tensorwise`
+/// weight. `name` is the weight tensor's full name; `rows`/`cols` are the LOGICAL dims.
+///
+/// Two variants ship, and they are different arithmetic, not two spellings of one thing:
+///
+///   - `weight_scale` `[rows, 1]` with `"convrot": true`. The weight was quantized after
+///     a size-256 group Hadamard, so the activation has to be rotated to match; the
+///     rotation then cancels across the GEMM.
+///   - `weight_scale` a SCALAR with no `convrot`. One scale for the whole tensor and no
+///     rotation on either side. Broadcast per row here so every consumer sees the same
+///     `row_scale` and only `convrot` distinguishes the two.
+///
+/// `int8Rotation` decides which, and is where the metadata's edge cases live.
+pub fn int8Scale(
+    alloc: std.mem.Allocator,
+    store: WeightStore,
+    name: []const u8,
+    rows: usize,
+    cols: usize,
+) !Int8Meta {
+    var buf: [256]u8 = undefined;
+    const s_name = try std.fmt.bufPrint(&buf, "{s}_scale", .{name});
+    const sv = store.get(s_name) orelse {
+        std.log.err("int8: {s} is int8 but has no {s}", .{ name, s_name });
+        return error.MissingTensor;
+    };
+    const n = sv.info.elemCount();
+    var nbuf: [256]u8 = undefined;
+    const conf_json: ?[]const u8 = if (store.get(try quantConfName(&nbuf, name))) |qv| qv.bytes else null;
+
+    const rot = int8Rotation(alloc, n, rows, cols, conf_json) catch |e| {
+        std.log.err("int8: {s} cannot be decoded ({t}): {d} rows, {d} columns, {s} " ++
+            "has {d} entries, comfy_quant {?s}", .{ name, e, rows, cols, s_name, n, conf_json });
+        return e;
+    };
+
+    const row_scale = if (n == rows) try sv.toF32Alloc(alloc) else blk: {
+        const s = try sv.asScalarF32();
+        const out = try alloc.alloc(f32, rows);
+        @memset(out, s);
+        break :blk out;
+    };
+    return .{ .row_scale = row_scale, .convrot = rot };
+}
+
+/// `int8Scale` for a family whose activation prep always rotates (Anima, MiniMax H3):
+/// an unrotated weight there would be multiplied in a basis it was never quantized in,
+/// so refuse it where it is read rather than render noise. `who` names the family in the
+/// diagnostic. Drop this in favour of `int8Scale` the day that family's prep can skip
+/// the rotation, as krea2's can.
+pub fn int8ScaleConvrot(
+    alloc: std.mem.Allocator,
+    store: WeightStore,
+    name: []const u8,
+    rows: usize,
+    cols: usize,
+    who: []const u8,
+) !Int8Meta {
+    const meta = try int8Scale(alloc, store, name, rows, cols);
+    if (meta.convrot == 0) {
+        std.log.err("{s}: {s} is int8 with no convrot rotation, which this model's " ++
+            "activation prep cannot pair with", .{ who, name });
+        return error.UnsupportedCheckpoint;
+    }
+    return meta;
+}
+
+/// The rotation group an `int8_tensorwise` layer decodes with (0 = unrotated), from its
+/// `weight_scale`'s element count and its `comfy_quant` bytes, or an error when the two
+/// describe a weight this cannot read.
+///
+/// Separate from `int8Scale` and free of the container so every refusal is reachable
+/// from a plain test: each one of them is a file that would otherwise decode to finite,
+/// plausible, wrong numbers. `int8Scale` owns the diagnostic, so nothing here logs.
+fn int8Rotation(
+    alloc: std.mem.Allocator,
+    scale_elems: usize,
+    rows: usize,
+    cols: usize,
+    conf_json: ?[]const u8,
+) !u32 {
+    if (scale_elems != rows and scale_elems != 1) return error.ShapeMismatch;
+
+    // What an ABSENT `convrot` key means. With no blob at all, or a format spelling we do
+    // not know (converters invent private ones), the scale's own shape answers, which is
+    // sound rather than a guess: ComfyUI refuses convrot unless the scale is per channel.
+    var rot = scale_elems == rows;
+    var group: usize = ops.convrot.group_size;
+    if (conf_json) |bytes| {
+        const conf = std.json.parseFromSliceLeaky(Int8Conf, alloc, bytes, .{
+            .ignore_unknown_fields = true,
+        }) catch return error.UnsupportedCheckpoint;
+        for (foreign_formats) |f| {
+            if (std.mem.eql(u8, conf.format, f)) return error.UnsupportedCheckpoint;
+        }
+        if (std.mem.eql(u8, conf.format, tensorwise_format)) rot = false;
+        if (std.mem.eql(u8, conf.format, always_rot_format)) rot = true;
+        rot = conf.convrot orelse conf.params.convrot orelse rot;
+        group = conf.convrot_groupsize orelse conf.params.convrot_groupsize orelse ops.convrot.group_size;
+    }
+    if (!rot) return 0;
+
+    // ComfyUI's own quantizer rejects convrot on a per-tensor scale, so a file carrying
+    // it was built by something else and there is no telling which of the two it meant.
+    if (scale_elems != rows) return error.ShapeMismatch;
+    // `ops.convrot` implements the size-256 Hadamard only (a comptime table and a
+    // radix-4 FWHT over 4 base-4 digits); rotating by another basis is silent noise.
+    if (group != ops.convrot.group_size) return error.UnsupportedCheckpoint;
+    if (cols % ops.convrot.group_size != 0) return error.ShapeMismatch;
+    return ops.convrot.group_size;
 }
 
 /// Build a `Weight` for a ComfyUI `asym_w4a8_int8` layer, or null when `name` is not one.
@@ -351,4 +506,185 @@ test "nvfp4 returns null for a layer that is not nvfp4, and errors on a broken o
     var st = try safetensors.SafeTensors.initFromSlice(gpa, buf.items);
     defer st.deinit();
     try std.testing.expectEqual(@as(?Weight, null), try nvfp4(gpa, .{ .safetensors = &st }, "w", 2, 2));
+}
+
+/// A one-layer store: `w.weight` I8 [rows, cols], its `weight_scale` (per-row when
+/// `scales.len == rows`, per tensor when 1) and an optional `comfy_quant` blob.
+///
+/// The bytes are built by hand rather than through a writer so the header is exactly
+/// what a ComfyUI file's is, which is the thing under test.
+fn int8Store(
+    gpa: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    rows: usize,
+    cols: usize,
+    scales: []const f32,
+    conf: ?[]const u8,
+) !void {
+    const wbytes = rows * cols;
+    const sbytes = scales.len * 4;
+    var hdr: std.Io.Writer.Allocating = .init(gpa);
+    defer hdr.deinit();
+    const w = &hdr.writer;
+    try w.print(
+        \\{{"w.weight":{{"dtype":"I8","shape":[{d},{d}],"data_offsets":[0,{d}]}},
+    , .{ rows, cols, wbytes });
+    // A per-tensor scale is a rank-0 tensor, which is exactly what distinguishes the
+    // two variants on disk.
+    if (scales.len == 1) {
+        try w.print(
+            \\"w.weight_scale":{{"dtype":"F32","shape":[],"data_offsets":[{d},{d}]}}
+        , .{ wbytes, wbytes + sbytes });
+    } else {
+        try w.print(
+            \\"w.weight_scale":{{"dtype":"F32","shape":[{d},1],"data_offsets":[{d},{d}]}}
+        , .{ scales.len, wbytes, wbytes + sbytes });
+    }
+    if (conf) |c| try w.print(
+        \\,"w.comfy_quant":{{"dtype":"U8","shape":[{d}],"data_offsets":[{d},{d}]}}
+    , .{ c.len, wbytes + sbytes, wbytes + sbytes + c.len });
+    try w.writeAll("}");
+
+    const hb = hdr.written();
+    try buf.appendSlice(gpa, &std.mem.toBytes(@as(u64, hb.len)));
+    try buf.appendSlice(gpa, hb);
+    try buf.appendNTimes(gpa, 0, wbytes);
+    try buf.appendSlice(gpa, std.mem.sliceAsBytes(scales));
+    if (conf) |c| try buf.appendSlice(gpa, c);
+}
+
+test "int8Scale reads both int8_tensorwise variants" {
+    const gpa = std.testing.allocator;
+    const safetensors = @import("tp_core").safetensors;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Rotated: a scale per output row, and the rotation group reported so the
+    // activation prep matches the weight.
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try int8Store(gpa, &buf, 4, 256, &.{ 1, 2, 3, 4 },
+            \\{"format": "int8_tensorwise", "convrot": true, "convrot_groupsize": 256, "per_row": true}
+        );
+        var st = try safetensors.SafeTensors.initFromSlice(gpa, buf.items);
+        defer st.deinit();
+        const m = try int8Scale(alloc, .{ .safetensors = &st }, "w.weight", 4, 256);
+        try std.testing.expectEqual(@as(u32, ops.convrot.group_size), m.convrot);
+        try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, m.row_scale);
+    }
+
+    // Unrotated: one scale for the whole tensor, broadcast per row so every consumer
+    // reads the same `row_scale` and only `convrot` tells the two apart. `cols` is not
+    // a multiple of 256 here, which the rotated variant would refuse.
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try int8Store(gpa, &buf, 3, 64, &.{0.5},
+            \\{"format": "int8_tensorwise"}
+        );
+        var st = try safetensors.SafeTensors.initFromSlice(gpa, buf.items);
+        defer st.deinit();
+        const m = try int8Scale(alloc, .{ .safetensors = &st }, "w.weight", 3, 64);
+        try std.testing.expectEqual(@as(u32, 0), m.convrot);
+        try std.testing.expectEqualSlices(f32, &.{ 0.5, 0.5, 0.5 }, m.row_scale);
+    }
+
+    // No `comfy_quant` at all: the scale's own shape answers, because ComfyUI refuses
+    // convrot unless the scale is per channel. Both directions.
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try int8Store(gpa, &buf, 4, 256, &.{ 1, 1, 1, 1 }, null);
+        var st = try safetensors.SafeTensors.initFromSlice(gpa, buf.items);
+        defer st.deinit();
+        const m = try int8Scale(alloc, .{ .safetensors = &st }, "w.weight", 4, 256);
+        try std.testing.expectEqual(@as(u32, ops.convrot.group_size), m.convrot);
+    }
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try int8Store(gpa, &buf, 4, 256, &.{1}, null);
+        var st = try safetensors.SafeTensors.initFromSlice(gpa, buf.items);
+        defer st.deinit();
+        const m = try int8Scale(alloc, .{ .safetensors = &st }, "w.weight", 4, 256);
+        try std.testing.expectEqual(@as(u32, 0), m.convrot);
+    }
+}
+
+test "int8Rotation refuses metadata it cannot honour" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const Case = struct {
+        scale_elems: usize,
+        cols: usize,
+        conf: ?[]const u8,
+        want: anyerror,
+    };
+    const rows = 4;
+    // Each of these is a file that would otherwise decode to finite, plausible, wrong
+    // numbers rather than fail.
+    for ([_]Case{
+        // convrot on a per-tensor scale: ComfyUI's quantizer cannot emit this, so
+        // which of the two the renderer meant is unknowable.
+        .{ .scale_elems = 1, .cols = 256, .conf =
+            \\{"format": "int8_tensorwise", "convrot": true}
+        , .want = error.ShapeMismatch },
+        // A rotation group we have no Hadamard for.
+        .{ .scale_elems = rows, .cols = 256, .conf =
+            \\{"format": "int8_tensorwise", "convrot": true, "convrot_groupsize": 128}
+        , .want = error.UnsupportedCheckpoint },
+        // Rotated, but the columns do not tile the group.
+        .{ .scale_elems = rows, .cols = 192, .conf =
+            \\{"format": "int8_tensorwise", "convrot": true}
+        , .want = error.ShapeMismatch },
+        // A scale that is neither per row nor per tensor.
+        .{ .scale_elems = 2, .cols = 256, .conf = null, .want = error.ShapeMismatch },
+        // A format whose bytes this reader would misread (its own reader runs first).
+        .{ .scale_elems = rows, .cols = 256, .conf =
+            \\{"format": "asym_w4a8_int8"}
+        , .want = error.UnsupportedCheckpoint },
+        .{ .scale_elems = rows, .cols = 256, .conf = "not json", .want = error.UnsupportedCheckpoint },
+    }) |c| {
+        errdefer std.debug.print("case conf={?s} scale_elems={d} cols={d}\n", .{ c.conf, c.scale_elems, c.cols });
+        try std.testing.expectError(c.want, int8Rotation(alloc, c.scale_elems, rows, c.cols, c.conf));
+    }
+
+    // And the unrotated variant is not merely tolerated: a scalar scale over columns the
+    // rotation could never tile is exactly what this checkpoint class looks like.
+    try std.testing.expectEqual(@as(u32, 0), try int8Rotation(alloc, 1, rows, 64, null));
+
+    // `convrot_w4a4` is always rotated and so writes no `convrot` key; reading its
+    // absence as false would unrotate every int4 checkpoint.
+    try std.testing.expectEqual(@as(u32, ops.convrot.group_size), try int8Rotation(alloc, rows, rows, 256,
+        \\{"format": "convrot_w4a4", "convrot_groupsize": 256}
+    ));
+
+    // ComfyUI's loader reads both keys at the top level OR under `params`, in that
+    // order, so a file written the nested way must not read as unrotated.
+    try std.testing.expectEqual(@as(u32, ops.convrot.group_size), try int8Rotation(alloc, rows, rows, 256,
+        \\{"format": "int8_tensorwise", "params": {"convrot": true, "convrot_groupsize": 256}}
+    ));
+    try std.testing.expectError(error.UnsupportedCheckpoint, int8Rotation(alloc, rows, rows, 256,
+        \\{"format": "int8_tensorwise", "params": {"convrot": true, "convrot_groupsize": 128}}
+    ));
+    // An explicit false beats the format's own default and the scale's shape.
+    try std.testing.expectEqual(@as(u32, 0), try int8Rotation(alloc, rows, rows, 256,
+        \\{"format": "int8_tensorwise", "convrot": false}
+    ));
+
+    // A format spelling this does not know is not an error: a converter may write its
+    // own, and the scale's shape still answers. Only the formats with a reader of their
+    // own are refused, because reaching this arm with one means the file disagrees with
+    // itself.
+    try std.testing.expectEqual(@as(u32, ops.convrot.group_size), try int8Rotation(alloc, rows, rows, 256,
+        \\{"format": "some_converters_private_name"}
+    ));
+    try std.testing.expectEqual(@as(u32, 0), try int8Rotation(alloc, 1, rows, 256,
+        \\{"format": "some_converters_private_name"}
+    ));
 }

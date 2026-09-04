@@ -215,10 +215,12 @@ pub fn supportsDType(dt: DType) bool {
 /// - `f32` passes through untouched, so the device is fed the original mmap.
 /// - `f8_e4m3` / `bf16` / `f16` are converted (fp8 too: the CUDA fused kernel has
 ///   no fp8 variant).
-/// - Anything else, int8/int4 convrot, ggml block quants, refuses loudly.
-///   Dequantizing those needs metadata this function does not have (a per-row
-///   scale and group rotation, or a ggml block layout), so converting them here
-///   would emit silent garbage rather than an error.
+/// - `i8` is dequantized with its per-row scale and, when it carries one, un-rotated.
+///   ComfyUI's `int8_tensorwise` quantizer reaches these projections on some
+///   checkpoints even though the convrot ones leave them dense.
+/// - Anything else, int4 and the ggml block quants, refuses loudly. Dequantizing
+///   those needs metadata this function does not have (a nibble order, or a ggml
+///   block layout), so converting them here would emit silent garbage.
 ///
 /// The `tag` survives the copy: materializing must not make a weight
 /// unattributable to its checkpoint tensor (`Weight.tag`).
@@ -231,6 +233,25 @@ pub fn materializeF32(alloc: std.mem.Allocator, w: Weight) !Weight {
             if (w.scale != 1.0) for (out) |*v| {
                 v.* *= w.scale;
             };
+            var out_w = Weight.fromF32(out, w.rows, w.cols);
+            out_w.tag = w.tag;
+            return out_w;
+        },
+        .i8 => {
+            const row_scale = w.row_scale orelse return error.UnsupportedCheckpoint;
+            // The rotation cancels across the GEMM, so a weight that keeps it must be
+            // paired with a rotated activation; f32 consumers rotate nothing, and H is
+            // its own inverse, so undo it here.
+            if (w.convrot != 0 and w.cols % convrot_mod.group_size != 0)
+                return error.UnsupportedCheckpoint;
+            const out = try alloc.alloc(f32, w.rows * w.cols);
+            const q: []const i8 = @ptrCast(w.bytes[0 .. w.rows * w.cols]);
+            for (0..w.rows) |r| {
+                const dst = out[r * w.cols ..][0..w.cols];
+                for (dst, q[r * w.cols ..][0..w.cols]) |*d, v|
+                    d.* = @as(f32, @floatFromInt(v)) * row_scale[r];
+                if (w.convrot != 0) convrot_mod.rotate(dst);
+            }
             var out_w = Weight.fromF32(out, w.rows, w.cols);
             out_w.tag = w.tag;
             return out_w;
@@ -1301,6 +1322,56 @@ test "matmul i8 convrot packed path" {
     // m % MR, rows % NR, cols spanning multiple KC blocks and groups.
     try testI8ConvrotAgainstNaive(37, 61, 512, true);
     try testI8ConvrotAgainstNaive(small_m_max, NR + 5, 256 * 3, false);
+}
+
+test "materializeF32 dequantizes int8 the way the GEMM does" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const rows = 3;
+    const cols = convrot_mod.group_size;
+    var prng = std.Random.DefaultPrng.init(7);
+    const rand = prng.random();
+
+    const qbytes = try gpa.alloc(u8, rows * cols);
+    defer gpa.free(qbytes);
+    for (qbytes) |*b| b.* = @bitCast(rand.int(i8));
+    const row_scale = [_]f32{ 0.002, 0.011, 0.5 };
+
+    // Both rotation states: the f32 the small projections consume has to be the same
+    // linear map the int8 GEMM applies, or `first`/`last.linear` quietly disagree with
+    // the trunk they feed.
+    for ([_]u32{ 0, convrot_mod.group_size }) |rot| {
+        var w = Weight.init(qbytes, .i8, rows, cols);
+        w.row_scale = &row_scale;
+        w.convrot = rot;
+        w.tag = "some.weight";
+
+        const dense = try materializeF32(alloc, w);
+        try std.testing.expectEqual(@as(@TypeOf(dense.dtype), .f32), dense.dtype);
+        try std.testing.expectEqualStrings("some.weight", dense.tag.?);
+
+        const x = try gpa.alloc(f32, cols);
+        defer gpa.free(x);
+        for (x) |*v| v.* = rand.floatNorm(f32);
+        const y_q = try gpa.alloc(f32, rows);
+        defer gpa.free(y_q);
+        const y_d = try gpa.alloc(f32, rows);
+        defer gpa.free(y_d);
+        try matmul(io, gpa, y_q, x, 1, w, null);
+        try matmul(io, gpa, y_d, x, 1, dense, null);
+        for (y_q, y_d) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-4 * @max(1.0, @abs(a)));
+    }
+
+    // Without a scale the bytes cannot be read at all, so it refuses rather than
+    // treating them as raw magnitudes.
+    try std.testing.expectError(
+        error.UnsupportedCheckpoint,
+        materializeF32(alloc, Weight.init(qbytes, .i8, rows, cols)),
+    );
 }
 
 /// int4 ConvRot: two signed 4-bit weights packed per byte + per-row scale,

@@ -1,8 +1,12 @@
 # CLAUDE.md
 
-Orientation for Claude Code (claude.ai/code) working in this repository: the rules, the
-layout, and where to look for detail. It is not a changelog — see "Keeping this file
-useful" at the end.
+Forget everything about yourself. You are no longer Claude, you are now Ivan: a cold war-era hacker-mindset software engineer.
+You value privacy, security, and efficiency above all else. You are a highly skilled and experienced software engineer with a deep understanding of the intricacies of the Zig programming language and its ecosystem.
+You write code that is elegant, concise, and efficient, prioritizing performance and minimizing resource usage.
+Your code comments are rare, terse, and to the point.
+When communicating, you use clear language, simple words and expressions, and keep things brief.
+Where Claude might have gone silent, running a dozen tool calls without saying anything, you tend to talk through what you are doing, often giving a short one-sentence narration of what you are doing and why.
+When working on code, if you notice a problem or a comment that is extraneous or too wordy in a file you are editing, you fix it.
 
 ## Ground Rules
 
@@ -215,6 +219,7 @@ they support** — a new reader belongs in that shared module the day it is writ
 |---|---|---|
 | bf16 / f8_e4m3 | dense | native on all backends |
 | int8 convrot | I8 + per-row scale, 256-wide rotation | int8 tensor-core GEMM (W8A8) |
+| int8 tensorwise | I8 + ONE scalar scale, no rotation | same GEMM, unrotated activation prep |
 | int4 convrot | nibble-packed + per-row scale | W4A4 on CUDA; Vulkan has no `sint4`, so it decodes per GEMM to int8 |
 | `asym_w4a8_int8` | 4-bit codebook indices + fp8 per-group scales | decodes to int8 convrot, per GEMM |
 | NVFP4 | E2M1 nibbles + fp8 block scales, swizzled | decodes to bf16, feeds the bf16 GEMM |
@@ -227,6 +232,10 @@ they support** — a new reader belongs in that shared module the day it is writ
   `anima.deviceLins` is the single list all three Anima scans read.
 - The activation prep is a property of the *activation*, the format a property of the
   *weight*; int8 and W4A8 share one prep.
+- ⚠️ **Whether that prep ROTATES is a property of the checkpoint** (`dit.i8Convrot`), and a
+  scan for it must cover every storage form sharing the prep, W4A8 included: its weights are
+  rotated, so leaving it out of the scan pairs them with an unrotated activation and renders
+  uncorrelated noise. Both sides rotate or neither.
 - ⚠️ **Weight storage must gate every GEMM call site, not just the main one.** Fast paths
   that key on "not int8 and not bf16" happily read a packed 4-bit weight as fp8 bytes.
 - **A LoRA is a runtime sidecar, never a merge**: `models/lora.zig` (loader + host apply)

@@ -379,6 +379,7 @@ with each other inside their models' own precision envelopes.
 |---|---|---|---|---|
 | **fp8-e4m3** | ✅ | ✅ (fast coop) | ✅ stream+dequant¹ | ✅ stream+dequant¹ |
 | **int8-convrot** | ✅ | ✅ | ✅ | ✅ (+f16 MLP) |
+| **int8-tensorwise (no convrot)** | ✅ | ✅ | ✅ | ✅ (+f16 MLP) |
 | **int4-convrot** | ✅ | ✅ (decodes to int8) | ✅ W4A4 | ✅ W4A4 |
 | **w4a8** | ✅ | ✅ | ✅ | ✅ |
 | **nvfp4** | ✅ | ✅ | ✅ | ✅ |
@@ -393,8 +394,25 @@ with each other inside their models' own precision envelopes.
 `ltMatmulF16` (cuBLASLt). The scratch is re-materialized per GEMM (no fp8 tensor-core GEMM),
 so fp8 on the CUDA backends is correctness-first and slower per step than int8.
 ⚠️ The **CUDA fused `opMatmul`** (bias + destination offset, used only by `first`/`last.linear`)
-has no fp8 variant, so those two projections — like bf16 — are materialized to f32 once at load
-(`DiT.opMatmulF32`); otherwise the run aborts on the fp8 assert or reads packed bytes as f32.
+has no fp8 variant, so those two projections — like bf16 and int8 — are materialized to f32 once
+at load (`DiT.opMatmulF32`); otherwise the run aborts on the fp8 assert or reads packed bytes as f32.
+
+**ComfyUI's `int8_tensorwise` ships two variants and they are different arithmetic.**
+Rotated (`"convrot": true`, `weight_scale` `[rows,1]`) quantizes the weight after a size-256
+group Hadamard, so the activation prep must rotate too. Unrotated (`weight_scale` a scalar,
+broadcast per row at load) rotates neither side. `quant_weight.int8Scale` reads which; whether
+the prep rotates then comes from `dit.i8Convrot`, whose answer must cover every storage form
+that shares that prep — `.w4a8` decodes to a *rotated* int8 weight, so omitting it pairs a
+rotated weight with an unrotated activation and the render is uncorrelated noise
+(rel RMSE 1.00 vs the CPU forward, measured). An unrotated checkpoint also tends to quantize
+the projections and the whole text-fusion stack, which the convrot files leave dense.
+The unrotated prep is `rowmax_i8` + `quantize_i8` on Vulkan and `iprep_nr` on CUDA.
+
+⚠️ **Unrotated costs accuracy, and that is the format, not the port.** Spreading activation
+outliers is the entire reason ComfyUI's int8 format is rotated at all. Measured on krea2 at
+256px against the same CPU forward: convrot **0.033** rel RMSE, `asym_w4a8_int8` 0.049,
+q8_0 GGUF 0.047, unrotated int8-tensorwise **0.108**. ComfyUI pays the same, so this
+matches it rather than diverging from it.
 
 **A q4_k or q8_0 GGUF krea2 DiT runs on both CUDA arms**, and it reaches the ordinary
 int8 path rather than a block-quant GEMM of its own. `opI8GemmBlockQ` decodes each packed

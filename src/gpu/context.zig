@@ -3377,7 +3377,20 @@ pub const Context = struct {
     /// (the DiT shares one prepped activation across wq/wk/wv/gate and mlp
     /// gate/up). `cols` a multiple of 256.
     pub fn opI8Prep(self: *Context, x: DeviceBuffer, m: usize, cols: usize) Error!void {
-        std.debug.assert(cols % convrot.group_size == 0);
+        return self.opI8PrepR(x, m, cols, true);
+    }
+
+    /// `opI8Prep` with the group rotation selectable, matching the weight it will feed:
+    /// ComfyUI's `int8_tensorwise` ships rotated (a scale per output row) and unrotated
+    /// (one scale per tensor), and the rotation cancels across the GEMM only when both
+    /// sides apply it. `cols` a multiple of 256 when rotating, of 4 otherwise (the
+    /// quantize kernel packs four int8 per word).
+    ///
+    /// The unrotated path reads `x` straight through `rowmax_i8` + `quantize_i8`: no
+    /// FWHT, and no `i8_xr` round trip either, since there is no rotated copy to stage.
+    pub fn opI8PrepR(self: *Context, x: DeviceBuffer, m: usize, cols: usize, rotate: bool) Error!void {
+        const align_cols: usize = if (rotate) convrot.group_size else 4;
+        std.debug.assert(cols % align_cols == 0);
         const ng = cols / convrot.group_size;
         // Pad to 128 rows when the shared-mem GEMM is enabled (its wg tile is
         // 128x128); still a multiple of the register kernel's 64-row tile.
@@ -3388,6 +3401,19 @@ pub const Context = struct {
         self.i8_mpad = m_pad;
         try self.ensureDeviceBuffer(&self.i8_scale, m * 4);
         try self.ensureDeviceBuffer(&self.i8_x, m_pad * cols); // 1 byte/elem
+
+        if (!rotate) {
+            try self.opElt(.rowmax_i8, x, self.i8_scale, null, null, .{
+                .u0 = @intCast(m),
+                .u1 = @intCast(cols),
+            }, m, 1, 1);
+            try self.opElt(.quantize_i8, x, self.i8_x, null, self.i8_scale, .{
+                .u0 = @intCast(m_pad * cols / 4),
+                .u1 = @intCast(cols),
+                .u2 = @intCast(m * cols),
+            }, m_pad * cols / 4, 1, 1);
+            return;
+        }
 
         // Stage B: one fused kernel (rotate FWHT + rowmax + quantize in f16
         // shared) replaces the 3-pass chain + its xr round-trip. One build per

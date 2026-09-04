@@ -305,8 +305,8 @@ pub fn main(init: std.process.Init) !void {
             \\                         pipeline on the pure-Zig hand-PTX CUDA
             \\                         backend; cuda runs it on NVIDIA's dlopen'd
             \\                         cuBLASLt/cuDNN kernels (both take an fp8 /
-            \\                         int8|int4 convrot / w4a8 / dense bf16
-            \\                         --dit ckpt)
+            \\                         int8 (convrot or tensorwise) / int4 convrot
+            \\                         / w4a8 / dense bf16 --dit ckpt)
             \\      --vram-budget 0    GiB of device memory to use (0 = ask the
             \\                         driver); weights past it stream per step.
             \\                         "min" holds only the in-flight weights
@@ -335,8 +335,9 @@ pub fn main(init: std.process.Init) !void {
             \\                         (on/off). VULKAN and krea2 ONLY: it sets
             \\                         models.dit_gpu.force_f32, so it is a no-op on
             \\                         the CUDA backends and on every other family
-            \\      --dit <path>       diffusion checkpoint (fp8 / int8 / int4
-            \\                         convrot / asym_w4a8_int8 / nvfp4 / dense
+            \\      --dit <path>       diffusion checkpoint (fp8 / int8 convrot
+            \\                         or tensorwise / int4 convrot /
+            \\                         asym_w4a8_int8 / nvfp4 / dense
             \\                         bf16 / GGUF; auto-detected). w4a8 and nvfp4
             \\                         keep 4-bit weights resident and decode per
             \\                         GEMM (w4a8 -> int8, nvfp4 -> f16, so nvfp4

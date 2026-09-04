@@ -41,6 +41,7 @@ const tp_core = @import("tp_core");
 const weights_mod = tp_core.weights;
 const ops = @import("tp_ops");
 const lora_mod = @import("lora.zig");
+const quant_weight = @import("quant_weight.zig");
 
 const WeightStore = weights_mod.WeightStore;
 const Weight = ops.matmul.Weight;
@@ -1163,22 +1164,9 @@ const Loader = struct {
         w.tag = try l.alloc.dupe(u8, nm);
 
         if (dt == .i8 or dt == .i4) {
-            var sbuf: [200]u8 = undefined;
-            const sname = try l.name(&sbuf, fmt, args, "_scale");
-            const sv = l.store.get(sname) orelse {
-                std.log.err("minimax_h3: {s} is {t} but {s} is missing (int8/int4 convrot needs a per-row scale)", .{ nm, dt, sname });
-                return error.MissingTensor;
-            };
-            if (sv.info.elemCount() != rows) {
-                std.log.err("minimax_h3: {s} has {d} entries, expected {d} (one per output row)", .{ sname, sv.info.elemCount(), rows });
-                return error.ShapeMismatch;
-            }
-            if (cols % ops.convrot.group_size != 0) {
-                std.log.err("minimax_h3: {s} has {d} columns, not a multiple of the {d}-wide convrot group", .{ nm, cols, ops.convrot.group_size });
-                return error.ShapeMismatch;
-            }
-            w.row_scale = try sv.toF32Alloc(l.alloc);
-            w.convrot = ops.convrot.group_size;
+            const meta = try quant_weight.int8ScaleConvrot(l.alloc, l.store, nm, rows, cols, "minimax_h3");
+            w.row_scale = meta.row_scale;
+            w.convrot = meta.convrot;
         }
         return w;
     }

@@ -1361,30 +1361,15 @@ const Loader = struct {
         // (ops.matmul.probe, profiling, error messages).
         w.tag = try l.alloc.dupe(u8, nm);
 
-        // int8/int4 "convrot" needs its per-row scale and rotation metadata wired
-        // here, and omitting it is a PANIC rather than a wrong answer:
-        // `ops.matmul.matmul` asserts `row_scale != null` for an integer weight. That is
-        // exactly what a `-INT8_CONVROT-MIXED` Anima checkpoint hit, the loader accepted
-        // the I8 tensor (`supportsDType(.i8)` is true) and the assert fired 5 frames
-        // deep, in `crossKv`. The companion tensor is `<name>_scale`, i.e.
-        // `...q_proj.weight_scale`, with one entry per output row.
+        // Leaving an integer weight without its scale is a PANIC rather than a wrong
+        // answer: `ops.matmul.matmul` asserts `row_scale != null`. A `-INT8_CONVROT-MIXED`
+        // Anima checkpoint hit exactly that, the loader accepted the I8 tensor
+        // (`supportsDType(.i8)` is true) and the assert fired 5 frames deep in `crossKv`.
+        // Anima's prep always rotates, hence the convrot-only reader.
         if (wdt == .i8 or wdt == .i4) {
-            var sbuf: [200]u8 = undefined;
-            const sname = try l.name(&sbuf, fmt, args, "_scale");
-            const sv = l.store.get(sname) orelse {
-                std.log.err("anima: {s} is {t} but {s} is missing (int8/int4 convrot needs a per-row scale)", .{ nm, dt, sname });
-                return error.MissingTensor;
-            };
-            if (sv.info.elemCount() != rows) {
-                std.log.err("anima: {s} has {d} entries, expected {d} (one per output row)", .{ sname, sv.info.elemCount(), rows });
-                return error.ShapeMismatch;
-            }
-            if (cols % ops.convrot.group_size != 0) {
-                std.log.err("anima: {s} has {d} columns, not a multiple of the {d}-wide convrot group", .{ nm, cols, ops.convrot.group_size });
-                return error.ShapeMismatch;
-            }
-            w.row_scale = try sv.toF32Alloc(l.alloc);
-            w.convrot = ops.convrot.group_size;
+            const meta = try quant_weight.int8ScaleConvrot(l.alloc, l.store, nm, rows, cols, "anima");
+            w.row_scale = meta.row_scale;
+            w.convrot = meta.convrot;
         }
         return w;
     }

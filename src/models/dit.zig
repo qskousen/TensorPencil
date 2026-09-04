@@ -168,7 +168,10 @@ pub const DiT = struct {
         const tmlp0 = try l.loadLinear("tmlp.0", features, tdim, true);
         const tmlp2 = try l.loadLinear("tmlp.2", features, features, true);
         const tproj1 = try l.loadLinear("tproj.1", 6 * features, features, true);
-        const txt_projector = try l.mat("txtfusion.projector.weight", .{}, 1, txt_layers);
+        // Both consumers (CPU and CUDA) read the projector through `convertToF32`,
+        // which has no int8 arm. It is 12 values, so normalize it here with the other
+        // two rather than teaching each caller the dequant.
+        const txt_projector = try opMatmulF32(alloc, try l.mat("txtfusion.projector.weight", .{}, 1, txt_layers));
         const txtmlp_norm = try l.normScale("txtmlp.0.scale", .{}, txt_dim);
         const txtmlp1 = try l.loadLinear("txtmlp.1", features, txt_dim, true);
         const txtmlp3 = try l.loadLinear("txtmlp.3", features, features, true);
@@ -719,6 +722,37 @@ pub fn w4a8SmallGroup(model: *const DiT) ?[]const u8 {
     return null;
 }
 
+/// Whether the block linears that share the int8 activation prep carry the convrot
+/// rotation, or null when they disagree with each other.
+///
+/// ComfyUI's `int8_tensorwise` ships both ways: rotated with a scale per output row, or
+/// unrotated with one scale for the whole tensor. The rotation cancels across the GEMM
+/// only when BOTH sides apply it, and one activation prep serves every GEMM in a block,
+/// so a block that mixes the two has no prep that is right for all of them. Answering
+/// null lets the caller refuse instead of picking one and computing the rest in a basis
+/// their weights were never quantized in.
+///
+/// ⚠️ Every storage form that runs on that prep has to be counted here, not just the
+/// plain int8 one: `.w4a8` decodes to a rotated int8 weight and takes int8's prep, so
+/// leaving it out reports "unrotated" for a W4A8 checkpoint and pairs a rotated weight
+/// with an unrotated activation. That renders noise, not a slightly worse image.
+///
+/// Scans every block for the reason `anyW4A8` does: a ComfyUI checkpoint quantizes per
+/// layer, so one weight is an answer about one weight.
+pub fn i8Convrot(model: *const DiT) ?bool {
+    var seen: ?bool = null;
+    for (model.blocks) |*b| {
+        for ([_]Weight{ b.attn.wq, b.attn.wk, b.attn.wv, b.attn.wo, b.attn.gate, b.mlp.gate, b.mlp.up, b.mlp.down }) |w| {
+            if (w.dtype != .i8 and w.dtype != .i4 and w.dtype != .w4a8) continue;
+            const rot = w.convrot != 0;
+            if (seen) |s| {
+                if (s != rot) return null;
+            } else seen = rot;
+        }
+    }
+    return seen orelse false;
+}
+
 /// Whether any block linear is stored in ComfyUI's packed NVFP4 form. Scans every block
 /// for the reason `anyW4A8` does: a real ComfyUI mixed checkpoint quantizes per block.
 pub fn anyNvfp4(model: *const DiT) bool {
@@ -840,15 +874,11 @@ const Loader = struct {
         // per model.
         w.tag = try l.alloc.dupe(u8, nm);
         if (wdt == .i8 or wdt == .i4) {
-            // int8/int4 "convrot": per-output-row `weight_scale` and a size-256
-            // group rotation folded out at dequant time.
-            var sbuf: [168]u8 = undefined;
-            const sname = try l.name(&sbuf, fmt, args, "_scale");
-            const sv = l.store.get(sname) orelse return error.MissingTensor;
-            if (sv.info.elemCount() != rows) return error.ShapeMismatch;
-            if (cols % ops.convrot.group_size != 0) return error.ShapeMismatch;
-            w.row_scale = try sv.toF32Alloc(l.alloc);
-            w.convrot = ops.convrot.group_size;
+            // A per-output-row `weight_scale` with the size-256 group rotation folded
+            // out at dequant time, or one scalar scale and no rotation at all.
+            const meta = try quant_weight.int8Scale(l.alloc, l.store, nm, rows, cols);
+            w.row_scale = meta.row_scale;
+            w.convrot = meta.convrot;
         }
         return w;
     }
@@ -984,6 +1014,43 @@ test "int8 convrot checkpoint loads with per-row scale + rotation metadata" {
     // Non-quantized tensors stay full precision (F32 here), no per-row scale.
     try std.testing.expect(model.first.w.dtype == .f32);
     try std.testing.expect(model.first.w.row_scale == null);
+
+    try std.testing.expectEqual(@as(?bool, true), i8Convrot(&model));
+}
+
+test "an unrotated int8_tensorwise checkpoint loads with a broadcast scale" {
+    // The other `int8_tensorwise` variant: one scale for the whole tensor and no
+    // rotation, which ComfyUI runs as W8A8 with an unrotated activation. It also
+    // quantizes the projections and the text-fusion stack, which the convrot files
+    // leave dense, so this pins that those still arrive as f32 for the backends
+    // that have no int GEMM on that path.
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "models/diffusion_model/rayArtshoot_krea2NSFWV4.safetensors";
+    std.Io.Dir.cwd().access(io, path, .{}) catch return error.SkipZigTest;
+
+    var st = try SafeTensors.open(gpa, io, path);
+    defer st.deinit();
+    var model = try DiT.load(gpa, .{ .safetensors = &st });
+    defer model.deinit();
+
+    const attn = model.blocks[0].attn;
+    for ([_]Weight{ attn.wq, attn.wk, attn.wv, attn.wo, attn.gate }) |w| {
+        try std.testing.expect(w.dtype == .i8);
+        try std.testing.expectEqual(@as(u32, 0), w.convrot);
+        // Broadcast per row, so every consumer indexes the scale the same way whether
+        // the checkpoint stored one value or `rows` of them.
+        try std.testing.expectEqual(w.rows, w.row_scale.?.len);
+        for (w.row_scale.?) |s| try std.testing.expectEqual(w.row_scale.?[0], s);
+    }
+    try std.testing.expectEqual(@as(?bool, false), i8Convrot(&model));
+
+    // `first`, `last.linear` and the projector are int8 in this file and are the three
+    // the GPU backends hand to an f32-only path.
+    for ([_]Weight{ model.first.w, model.last_linear.w, model.txt_projector }) |w| {
+        try std.testing.expect(w.dtype == .f32);
+        try std.testing.expect(w.row_scale == null);
+    }
 }
 
 test "every loaded weight carries its checkpoint tensor name as a tag" {

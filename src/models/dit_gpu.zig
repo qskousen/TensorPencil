@@ -326,6 +326,20 @@ pub fn forward(
     // image this gate already exists for. `is_i8` covers it now, but keep the explicit
     // refusal so a future storage form cannot reach that arm by default.
     if (!ctx.hasW4A8Decode() and dit.anyW4A8(model)) return error.UnsupportedCheckpoint;
+    // Whether the int8 activation prep rotates. A property of the checkpoint, not a
+    // tuning knob: ComfyUI's `int8_tensorwise` ships rotated (scale per row) and
+    // unrotated (one scale per tensor), and the prep has to match the weight it feeds.
+    const i8_rot = dit.i8Convrot(model) orelse {
+        std.log.err("dit vulkan: this checkpoint mixes convrot and plain int8 block linears; " ++
+            "one activation prep serves a whole block, so there is no correct one", .{});
+        return error.UnsupportedCheckpoint;
+    };
+    // The int4 GEMM decodes a nibble-packed weight that was quantized after the
+    // rotation, and there is no unrotated build of that decode.
+    if (model.blocks[0].attn.wq.dtype == .i4 and !i8_rot) {
+        std.log.err("dit vulkan: int4 block linears without convrot are not supported", .{});
+        return error.UnsupportedCheckpoint;
+    }
     if (!ctx.hasNvfp4Decode() and dit.anyNvfp4(model)) return error.UnsupportedCheckpoint;
     if (dit.anyNvfp4(model))
         try ctx.ensureDeviceBuffer(&ctx.nvfp4_w16, dit.maxNvfp4Scratch(model, gpu.Context.nvfp4ScratchBytes));
@@ -618,7 +632,7 @@ pub fn forward(
                 // (Overlapping them via distinct accs was measured neutral on
                 // this driver, the register-tiled GEMM is the bottleneck, not
                 // serialization, so keep the single-acc path to save VRAM.)
-                try ctx.opI8Prep(t1_d, seq, F);
+                try ctx.opI8PrepR(t1_d, seq, F, i8_rot);
                 mark(io, &t_mark, &prof.prep_ns);
                 // i8_f16: q/k/v come out f16 (v lands in the P@V layout v16_d)
                 // for the att16 chain; gate stays f32 (downstream unchanged).
@@ -888,7 +902,7 @@ pub fn forward(
             try ctx.opElt(.sigmoid_mul, attn_d, g_d, null, null, .{ .u0 = @intCast(seq * F) }, seq * F, 1, 1);
             mark(io, &t_mark, &prof.elt_ns);
             if (is_i8) {
-                try ctx.opI8Prep(attn_d, seq, blk.attn.wo.cols);
+                try ctx.opI8PrepR(attn_d, seq, blk.attn.wo.cols, i8_rot);
                 mark(io, &t_mark, &prof.prep_ns);
                 try i8GemmW(io, &prof, &t_mark, ctx, t1_d, blk.attn.wo, false);
             } else {
@@ -949,7 +963,7 @@ pub fn forward(
             }, seq * F, 1, 1);
             mark(io, &t_mark, &prof.elt_ns);
             if (is_i8) {
-                try ctx.opI8Prep(t1_d, seq, F);
+                try ctx.opI8PrepR(t1_d, seq, F, i8_rot);
                 mark(io, &t_mark, &prof.prep_ns);
                 try i8GemmW(io, &prof, &t_mark, ctx, mg_d, blk.mlp.gate, false);
                 mark(io, &t_mark, &prof.matmul_ns);
@@ -981,7 +995,7 @@ pub fn forward(
             try ctx.opElt(.silu_mul, mg_d, mu_d, null, null, .{ .u0 = @intCast(seq * dit.mlp_dim) }, seq * dit.mlp_dim, 1, 1);
             mark(io, &t_mark, &prof.elt_ns);
             if (is_i8) {
-                try ctx.opI8Prep(mg_d, seq, blk.mlp.down.cols);
+                try ctx.opI8PrepR(mg_d, seq, blk.mlp.down.cols, i8_rot);
                 mark(io, &t_mark, &prof.prep_ns);
                 try i8GemmW(io, &prof, &t_mark, ctx, t1_d, blk.mlp.down, false);
             } else {
